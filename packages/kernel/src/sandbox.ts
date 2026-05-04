@@ -23,7 +23,7 @@ import type { RunResult } from './run-result.js';
 import type { PlatformAdapter } from './platform/adapter.js';
 import type { Process } from './process/handle.js';
 import type { ProcessMode } from './process/handle.js';
-import { INIT_PID, ProcessKernel, type SpawnRequest } from './process/kernel.js';
+import { INIT_PID, ProcessKernel, ROOT_UID, type ProcessCredentials, type SpawnRequest } from './process/kernel.js';
 import { loadProcess, type LoaderContext } from './process/loader.js';
 import type { DirEntry, StatResult } from './vfs/inode.js';
 import { NetworkGateway } from './network/gateway.js';
@@ -869,7 +869,15 @@ export class Sandbox {
               kernel.releaseProcess(childPid, 126);
               return childPid;
             }
-            const argv = Sandbox.argvForSpawn(vfs, req);
+            let argv: string[];
+            try {
+              argv = Sandbox.argvForSpawn(vfs, req, kernel.getCredentials(pid));
+            } catch (e) {
+              const msg = e instanceof Error ? e.message : String(e);
+              Sandbox.writeToFdTarget(kernel.getFdTarget(childPid, 2), `${req.prog}: ${msg}\n`);
+              kernel.releaseProcess(childPid, msg.includes('EACCES') ? 126 : 127);
+              return childPid;
+            }
             const childCtx = makeContextWithAllocator(() => childPid);
             const promise = loadProcess(childCtx, {
               argv,
@@ -901,11 +909,49 @@ export class Sandbox {
     return makeContextWithAllocator((argv) => kernel.allocPid(INIT_PID, argv[0]));
   }
 
-  private static argvForSpawn(vfs: VFS, req: SpawnRequest): string[] {
+  private static argvForSpawn(vfs: VFS, req: SpawnRequest, credentials: ProcessCredentials): string[] {
     const prog = req.prog.includes('/')
-      ? req.prog
+      ? Sandbox.resolveSpawnPath(req.prog, req.cwd || '/')
       : Sandbox.resolveExecutablePathForVfs(vfs, req.prog);
+    Sandbox.assertExecutableForSpawn(vfs, prog, credentials);
     return [prog, ...req.args];
+  }
+
+  private static resolveSpawnPath(path: string, cwd: string): string {
+    return Sandbox.normalizeVfsPath(path.startsWith('/') ? path : `${cwd}/${path}`);
+  }
+
+  private static normalizeVfsPath(path: string): string {
+    const parts: string[] = [];
+    for (const part of path.split('/')) {
+      if (!part || part === '.') continue;
+      if (part === '..') {
+        parts.pop();
+      } else {
+        parts.push(part);
+      }
+    }
+    return `/${parts.join('/')}`;
+  }
+
+  private static assertExecutableForSpawn(vfs: VFS, path: string, credentials: ProcessCredentials): void {
+    let st: StatResult;
+    try {
+      st = vfs.stat(path);
+    } catch {
+      return;
+    }
+    if (st.type !== 'file' || !Sandbox.canExecute(st, credentials)) {
+      throw new Error(`EACCES: permission denied: ${path}`);
+    }
+  }
+
+  private static canExecute(st: StatResult, credentials: ProcessCredentials): boolean {
+    if (credentials.euid === ROOT_UID) return true;
+    const mode = st.permissions;
+    if (st.uid === credentials.euid) return (mode & 0o100) !== 0;
+    if (st.gid === credentials.egid) return (mode & 0o010) !== 0;
+    return (mode & 0o001) !== 0;
   }
 
   private static resolveExecutablePathForVfs(vfs: VFS, prog: string): string {

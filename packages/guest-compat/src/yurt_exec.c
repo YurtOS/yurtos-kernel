@@ -36,6 +36,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -57,6 +59,16 @@ static int exec_via_spawn(const char *prog, char *const argv[], char *const envp
   if (!prog || !argv) {
     errno = EFAULT;
     return -1;
+  }
+  if (strchr(prog, '/') != NULL) {
+    struct stat st;
+    if (stat(prog, &st) != 0) {
+      return -1;
+    }
+    if (S_ISDIR(st.st_mode) || (st.st_mode & 0111) == 0) {
+      errno = EACCES;
+      return -1;
+    }
   }
   pid_t child = -1;
   int rc = posix_spawnp(&child, prog, /*file_actions=*/NULL, /*attrp=*/NULL,

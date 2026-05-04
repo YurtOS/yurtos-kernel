@@ -917,6 +917,20 @@ describe('Guest compatibility canaries', () => {
     expect(result.stdout.trim()).toBe('1\n2\n3');
   });
 
+  it('preserves exec permission failures for non-executable VFS files', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('exec-canary execv_eacces');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      '{"case":"execv_eacces","exit":0,"errno":2}',
+    );
+  });
+
   it('spawns a tool via a VFS symlink to a tool stub', async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
