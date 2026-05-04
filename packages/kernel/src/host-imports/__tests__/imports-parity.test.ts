@@ -47,6 +47,7 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_native_invoke",
   "host_setjmp",
   "host_longjmp",
+  "host_fork",
   "host_yield",
   "host_run_command",
   "host_stat",

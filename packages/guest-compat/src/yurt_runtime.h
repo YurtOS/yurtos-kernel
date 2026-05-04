@@ -146,6 +146,9 @@ int yurt_host_wait_any(int out_ptr, int out_cap);
 __attribute__((import_module("yurt"), import_name("host_wait_any_nohang")))
 int yurt_host_wait_any_nohang(int out_ptr, int out_cap);
 
+__attribute__((import_module("yurt"), import_name("host_fork")))
+int yurt_host_fork(void);
+
 __attribute__((import_module("yurt"), import_name("host_thread_spawn")))
 int yurt_host_thread_spawn(int fn_ptr, int arg);
 

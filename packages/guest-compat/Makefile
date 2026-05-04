@@ -46,8 +46,9 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_unistd.o \
   $(BUILD_DIR)/yurt_version.o
 
-CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime signal setjmp pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
+CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
+FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 
 .PHONY: all lib canaries copy-fixtures clean ensure-toolchain
 
@@ -72,7 +73,8 @@ $(BUILD_DIR)/%.o: src/%.c $(wildcard include/*.h) src/yurt_runtime.h src/yurt_ma
 lib: $(LIB)
 
 SETJMP_OBJS := \
-  $(BUILD_DIR)/yurt_setjmp.o
+  $(BUILD_DIR)/yurt_setjmp.o \
+  $(BUILD_DIR)/yurt_fork.o
 
 $(LIB): $(LIB_OBJS) | $(BUILD_DIR) ensure-toolchain
 	$(YURT_AR) rcs $@ $(LIB_OBJS)
@@ -88,16 +90,31 @@ $(BUILD_DIR)/setjmp-canary.wasm: $(CANARY_DIR)/setjmp-canary.c $(wildcard includ
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/setjmp-canary.pre-opt.wasm \
 	$(YURT_CC) $< -o $@
 
+$(BUILD_DIR)/fork-canary.wasm: $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) $(SETJMP_LIB) | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_SETJMP_ARCHIVE=$(abspath $(SETJMP_LIB)) \
+	YURT_CC_USE_SETJMP=1 \
+	YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/fork-canary.pre-opt.wasm \
+	$(YURT_CC) $< -o $@
+
+$(FORK_DEFAULT_CANARY): $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/fork-default-canary.pre-opt.wasm \
+	$(YURT_CC) $< -o $@
+
 $(BUILD_DIR)/%-canary.wasm: $(CANARY_DIR)/%-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/$*-canary.pre-opt.wasm \
 	$(YURT_CC) $< -o $@
 
-canaries: $(CANARIES)
+canaries: $(CANARIES) $(FORK_DEFAULT_CANARY)
 
 copy-fixtures: canaries
 	@for n in $(CANARY_NAMES); do cp $(BUILD_DIR)/$$n-canary.wasm $(FIXTURES)/$$n-canary.wasm; done
+	@cp $(FORK_DEFAULT_CANARY) $(FIXTURES)/fork-default-canary.wasm
 
 clean:
 	rm -rf $(BUILD_DIR)

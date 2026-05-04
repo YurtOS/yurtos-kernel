@@ -133,6 +133,13 @@ export class ProcessKernel {
     fdTable.set(fd, target);
   }
 
+  replaceFdTarget(pid: number, fd: number, target: FdTarget): void {
+    const fdTable = this.getFdTable(pid);
+    const existing = fdTable.get(fd);
+    if (existing) this.closeTarget(existing);
+    fdTable.set(fd, target);
+  }
+
   allocFd(pid: number, target: FdTarget): number {
     let fdTable = this.fdTables.get(pid);
     if (!fdTable) {
@@ -316,6 +323,21 @@ export class ProcessKernel {
     return newFdTable;
   }
 
+  buildFdTableForFork(parentPid: number): Map<number, FdTarget> {
+    const parentFdTable = this.fdTables.get(parentPid);
+    if (!parentFdTable) throw new Error(`No fd table for parent pid ${parentPid}`);
+    const childFdTable = new Map<number, FdTarget>();
+    for (const [fd, target] of parentFdTable) {
+      if (target.type === 'pipe_read' || target.type === 'pipe_write') {
+        target.pipe.addRef();
+      } else if (target.type === 'vfs_file' || target.type === 'socket') {
+        target.refs++;
+      }
+      childFdTable.set(fd, target);
+    }
+    return childFdTable;
+  }
+
   /** Pre-register a process entry so waitpid can find it before async instantiation completes. */
   registerPending(pid: number, command?: string, ppid: number = INIT_PID): void {
     this.parentPids.set(pid, ppid);
@@ -413,6 +435,16 @@ export class ProcessKernel {
     this.cleanupFds(pid);
   }
 
+  discardProcess(pid: number): void {
+    this.cleanupFds(pid);
+    this.reapProcess(pid);
+  }
+
+  releaseFdTable(fdTable: Map<number, FdTarget>): void {
+    for (const target of fdTable.values()) this.closeTarget(target);
+    fdTable.clear();
+  }
+
   /** Register a process as already exited (used for synchronous spawn). */
   registerExited(pid: number, exitCode: number, ppid?: number): void {
     if (ppid !== undefined) this.parentPids.set(pid, ppid);
@@ -443,14 +475,27 @@ export class ProcessKernel {
   async waitpid(pid: number): Promise<number> {
     const entry = this.processTable.get(pid);
     if (!entry) return -1;
-    if (entry.state === 'exited') return entry.exitCode;
-    return new Promise<number>((resolve) => { entry.waiters.push(resolve); });
+    if (entry.state === 'exited') {
+      const exitCode = entry.exitCode;
+      this.reapProcess(pid);
+      return exitCode;
+    }
+    return new Promise<number>((resolve) => {
+      entry.waiters.push((exitCode) => {
+        this.reapProcess(pid);
+        resolve(exitCode);
+      });
+    });
   }
 
   waitpidNohang(pid: number): number {
     const entry = this.processTable.get(pid);
     if (!entry) return -1;
-    if (entry.state === 'exited') return entry.exitCode;
+    if (entry.state === 'exited') {
+      const exitCode = entry.exitCode;
+      this.reapProcess(pid);
+      return exitCode;
+    }
     return -1;
   }
 
@@ -631,6 +676,20 @@ export class ProcessKernel {
         }
       }
     }
+  }
+
+  private reapProcess(pid: number): void {
+    if (pid === INIT_PID) return;
+    this.cleanupFds(pid);
+    const parentPid = this.parentPids.get(pid);
+    if (parentPid !== undefined) {
+      this.children.get(parentPid)?.delete(pid);
+    }
+    this.processTable.delete(pid);
+    this.fdTables.delete(pid);
+    this.nextFds.delete(pid);
+    this.parentPids.delete(pid);
+    this.children.delete(pid);
   }
 
   initProcess(pid: number): void {

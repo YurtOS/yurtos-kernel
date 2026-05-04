@@ -918,6 +918,15 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       throw new Error('longjmp without matching setjmp (Asyncify-based sjlj is Phase 2)');
     },
 
+    // host_fork() -> i32
+    // The process loader replaces this with the Asyncify continuation
+    // implementation for binaries linked with YURT_CC_USE_SETJMP=1.
+    // Generic import creation cannot split a wasm continuation, so it
+    // reports ENOSYS instead of pretending fork succeeded.
+    host_fork(): number {
+      return -38;
+    },
+
     // host_yield() -> void
     // Async — yields to the JS microtask queue, allowing other WASM stacks to run.
     // This is the cooperative scheduling primitive: sleep(0).

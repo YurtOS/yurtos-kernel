@@ -220,6 +220,22 @@ describe('Guest compatibility canaries', () => {
     });
   });
 
+  describe('fork-canary', () => {
+    it('keeps plain fork as ENOSYS outside continuation builds', async () => {
+      sandbox = await Sandbox.create({ wasmDir: FIXTURES, adapter: new NodeAdapter() });
+      const r = await sandbox.run('fork-default-canary --case default-enosys');
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toBe('fork-default-enosys');
+    });
+
+    it('splits parent and child under the asyncify continuation runtime', async () => {
+      sandbox = await Sandbox.create({ wasmDir: FIXTURES, adapter: new NodeAdapter() });
+      const r = await sandbox.run('fork-canary --case continuation-split');
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toMatch(/^fork-ok child=\d+ parent=\d+$/);
+    });
+  });
+
   it('routes stderr through stdout after dup2(1, 2)', async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,

@@ -84,10 +84,19 @@ export interface WasiHostOptions {
   canSuspendPipeReads?: boolean;
 }
 
-interface PreopenEntry {
+export interface PreopenEntry {
   vfsPath: string;
   label: string;
   fd: number;
+}
+
+export interface WasiHostForkSnapshot {
+  fdTable: FdTable;
+  dirFds: Map<number, string>;
+  preopens: PreopenEntry[];
+  cwd: string;
+  canSuspendPipeReads: boolean;
+  nextDirFdCounter: number;
 }
 
 function bytesToBase64(data: Uint8Array): string {
@@ -318,6 +327,34 @@ export class WasiHost {
   /** Expose the I/O fd table for external inspection / manipulation. */
   getIoFds(): Map<number, FdTarget> {
     return this.ioFds;
+  }
+
+  snapshotForFork(): WasiHostForkSnapshot {
+    return {
+      fdTable: this.fdTable.clone(),
+      dirFds: new Map(this.dirFds),
+      preopens: this.preopens.map((entry) => ({ ...entry })),
+      cwd: this.cwd,
+      canSuspendPipeReads: this.canSuspendPipeReads,
+      nextDirFdCounter: this._nextDirFdCounter,
+    };
+  }
+
+  restoreForkSnapshot(snapshot: WasiHostForkSnapshot): void {
+    this.fdTable = snapshot.fdTable;
+    this.dirFds = new Map(snapshot.dirFds);
+    this.preopens = snapshot.preopens.map((entry) => ({ ...entry }));
+    this.cwd = snapshot.cwd;
+    this.canSuspendPipeReads = snapshot.canSuspendPipeReads;
+    this._nextDirFdCounter = snapshot.nextDirFdCounter;
+  }
+
+  bindKernelFileTargets(): void {
+    if (!this.kernel || this.pid === undefined) return;
+    for (const fd of this.fdTable.openFds()) {
+      if (this.dirFds.has(fd)) continue;
+      this.kernel.replaceFdTarget(this.pid, fd, createVfsFileTarget(this.fdTable, fd));
+    }
   }
 
   setCanSuspendPipeReads(enabled: boolean): void {
