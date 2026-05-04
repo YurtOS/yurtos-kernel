@@ -4,6 +4,8 @@ export type InodeType = 'file' | 'dir' | 'symlink';
 
 export interface InodeMetadata {
   permissions: number;
+  uid: number;
+  gid: number;
   mtime: Date;
   ctime: Date;
   atime: Date;
@@ -45,6 +47,8 @@ export interface StatResult {
   type: InodeType;
   size: number;
   permissions: number;
+  uid: number;
+  gid: number;
   mtime: Date;
   ctime: Date;
   atime: Date;
@@ -55,31 +59,31 @@ export interface DirEntry {
   type: InodeType;
 }
 
-function createMetadata(permissions: number): InodeMetadata {
+function createMetadata(permissions: number, uid: number, gid: number): InodeMetadata {
   const now = new Date();
-  return { permissions, mtime: now, ctime: now, atime: now };
+  return { permissions, uid, gid, mtime: now, ctime: now, atime: now };
 }
 
-export function createDirInode(permissions = 0o755): DirInode {
+export function createDirInode(permissions = 0o755, uid = 1000, gid = 1000): DirInode {
   return {
     type: 'dir',
-    metadata: createMetadata(permissions),
+    metadata: createMetadata(permissions, uid, gid),
     children: new Map(),
   };
 }
 
-export function createFileInode(content: Uint8Array, permissions = 0o644): FileInode {
+export function createFileInode(content: Uint8Array, permissions = 0o644, uid = 1000, gid = 1000): FileInode {
   return {
     type: 'file',
-    metadata: createMetadata(permissions),
+    metadata: createMetadata(permissions, uid, gid),
     content,
   };
 }
 
-export function createSymlinkInode(target: string): SymlinkInode {
+export function createSymlinkInode(target: string, uid = 1000, gid = 1000): SymlinkInode {
   return {
     type: 'symlink',
-    metadata: createMetadata(0o777),
+    metadata: createMetadata(0o777, uid, gid),
     target,
   };
 }

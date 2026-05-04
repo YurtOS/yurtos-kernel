@@ -299,14 +299,45 @@ describe('mode-bit enforcement', () => {
     expect(vfs.stat('/home/user/f.txt').permissions).toBe(0o444);
   });
 
-  it('chmod in 0o555 dir → EACCES', () => {
+  it('chmod owner-owned file succeeds even when parent dir is not writable', () => {
     const vfs = new VFS();
-    // /bin is 0o555, so chmod on any child is denied
+    vfs.mkdir('/tmp/owned-dir');
+    vfs.writeFile('/tmp/owned-dir/file.txt', new Uint8Array(1));
     vfs.withWriteAccess(() => {
-      vfs.writeFile('/bin/tool', new Uint8Array(1));
+      vfs.chmod('/tmp/owned-dir', 0o555);
     });
+    vfs.chmod('/tmp/owned-dir/file.txt', 0o444);
+    expect(vfs.stat('/tmp/owned-dir/file.txt').permissions).toBe(0o444);
+  });
+
+  it('uses group write bit when uid differs but gid matches', () => {
+    const owner = new VFS({ uid: 2000, gid: 1000 });
+    owner.writeFile('/tmp/group-writable.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/group-writable.txt', 0o660);
+
+    const groupPeer = owner.cowClone({ uid: 3000, gid: 1000 });
+    groupPeer.writeFile('/tmp/group-writable.txt', new Uint8Array([2]));
+    expect(groupPeer.readFile('/tmp/group-writable.txt')).toEqual(new Uint8Array([2]));
+  });
+
+  it('uses other write bit when neither uid nor gid matches', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.writeFile('/tmp/world-writable.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/world-writable.txt', 0o606);
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+    other.writeFile('/tmp/world-writable.txt', new Uint8Array([2]));
+    expect(other.readFile('/tmp/world-writable.txt')).toEqual(new Uint8Array([2]));
+  });
+
+  it('denies write when uid, gid, and other write bits do not grant access', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.writeFile('/tmp/private.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/private.txt', 0o640);
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
     expect(() => {
-      vfs.chmod('/bin/tool', 0o777);
+      other.writeFile('/tmp/private.txt', new Uint8Array([2]));
     }).toThrow(/EACCES/);
   });
 

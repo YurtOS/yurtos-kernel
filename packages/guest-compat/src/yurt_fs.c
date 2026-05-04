@@ -85,7 +85,7 @@ int chmod(const char *path, mode_t mode) {
   }
   int rc = yurt_host_chmod((int)(intptr_t)path, (int)strlen(path), (int)mode);
   if (rc == 0) return 0;
-  errno = (rc == -1) ? ENOENT : EIO;
+  errno = (rc == -1) ? ENOENT : (rc == -2) ? EPERM : EIO;
   return -1;
 }
 

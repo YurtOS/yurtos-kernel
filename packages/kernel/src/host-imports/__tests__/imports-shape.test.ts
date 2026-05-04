@@ -1,6 +1,7 @@
 import { assertEquals } from "jsr:@std/assert@^1.0.19";
 import { createKernelImports } from "../kernel-imports.ts";
 import { readString } from "../common.ts";
+import { VFS } from "../../vfs/vfs.ts";
 
 const encoder = new TextEncoder();
 
@@ -49,4 +50,23 @@ Deno.test("kernel host_spawn preserves shell's legacy synchronous result ABI", (
     stdout: "hello\n",
     stderr: "",
   });
+});
+
+Deno.test("host_chmod allows the file owner and denies non-owners", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.writeFile("/tmp/user-owned.txt", new Uint8Array(1));
+  vfs.withWriteAccess(() => {
+    vfs.writeFile("/tmp/root-owned.txt", new Uint8Array(1));
+  });
+
+  const imports = createKernelImports({ memory, vfs, callerUid: 1000, callerGid: 1000 });
+
+  let pathLen = writeString(memory, 0, "/tmp/user-owned.txt");
+  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o444), 0);
+  assertEquals(vfs.stat("/tmp/user-owned.txt").permissions, 0o444);
+
+  pathLen = writeString(memory, 0, "/tmp/root-owned.txt");
+  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777), -2);
+  assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
 });

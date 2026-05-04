@@ -40,6 +40,9 @@ export interface KernelImportsOptions {
 
   /** PID of the calling process (used for fd table lookups). */
   callerPid?: number;
+  /** Effective uid/gid of the calling guest process. Defaults to the sandbox user. */
+  callerUid?: number;
+  callerGid?: number;
 
   /** Process kernel for pipe/spawn/waitpid/close_fd. Optional until Task 8. */
   kernel?: ProcessKernel;
@@ -115,7 +118,10 @@ export interface KernelImportsOptions {
 }
 
 const ERR_NOT_FOUND = -1;
+const ERR_PERMISSION = -2;
 const ERR_IO = -3;
+const ROOT_UID = 0;
+const USER_UID = 1000;
 
 function globToRegExp(pattern: string): RegExp {
   let re = '';
@@ -202,6 +208,7 @@ function globMatch(vfs: VfsLike, pattern: string): string[] {
 export function createKernelImports(opts: KernelImportsOptions): Record<string, WebAssembly.ImportValue> {
   const { memory } = opts;
   const callerPid = opts.callerPid ?? 0;
+  const callerUid = opts.callerUid ?? USER_UID;
   const bridgeSocketBackend = opts.networkBridge ? createNetworkBridgeSocketBackend(opts.networkBridge) : undefined;
   const socketBackend = opts.socketBackend ??
     (opts.serverSockets?.allowLoopback === true
@@ -1338,11 +1345,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (!opts.vfs) return ERR_IO;
       const path = readString(memory, pathPtr, pathLen);
       try {
+        const stat = opts.vfs.stat(path);
+        if (callerUid !== ROOT_UID && stat.uid !== callerUid) {
+          return ERR_PERMISSION;
+        }
         opts.vfs.chmod(path, mode);
         return 0;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : '';
         if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
         return ERR_IO;
       }
     },
