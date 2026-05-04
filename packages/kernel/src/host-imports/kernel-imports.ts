@@ -23,6 +23,7 @@ import { createLoopbackSocketBackend, createNetworkBridgeSocketBackend } from '.
 import type { ExtensionRegistry } from '../extension/registry.js';
 import type { NativeModuleRegistry } from '../process/native-modules.js';
 import type { ProcessCredentials, ProcessKernel, SpawnRequest } from '../process/kernel.js';
+import { normalizeNice, unsupportedRuntimeEngineBackend, type RuntimeEngineBackend } from '../engine/backend.js';
 import type { ProcessManager } from '../process/manager.js';
 import type { WasiHost } from '../wasi/wasi-host.js';
 import type { ThreadsBackend } from '../process/threads/backend.js';
@@ -113,6 +114,9 @@ export interface KernelImportsOptions {
   /** Backend for guest pthread/std::thread host imports. */
   threadsBackend?: ThreadsBackend;
 
+  /** Engine-specific runtime capabilities selected once when the sandbox starts. */
+  runtimeBackend?: RuntimeEngineBackend;
+
   /** Process manager for tool registry (host_has_tool, host_register_tool). */
   mgr?: ProcessManager;
 }
@@ -121,9 +125,13 @@ const ERR_NOT_FOUND = -1;
 const ERR_PERMISSION = -2;
 const ERR_IO = -3;
 const ERR_NOT_DIR = -4;
+const ERR_UNSUPPORTED = -38;
+const ERR_INVALID = -22;
+const ERR_PRIORITY_NOT_FOUND = -1001;
 const ROOT_UID = 0;
 const USER_UID = 1000;
 const USER_GID = 1000;
+const PRIO_PROCESS = 0;
 
 function globToRegExp(pattern: string): RegExp {
   let re = '';
@@ -231,6 +239,8 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   const callerPid = opts.callerPid ?? 0;
   const fallbackUid = opts.callerUid ?? USER_UID;
   const fallbackGid = opts.callerGid ?? USER_GID;
+  const runtimeBackend = opts.runtimeBackend ?? unsupportedRuntimeEngineBackend;
+  const schedulerBackend = runtimeBackend.scheduler;
   const bridgeSocketBackend = opts.networkBridge ? createNetworkBridgeSocketBackend(opts.networkBridge) : undefined;
   const socketBackend = opts.socketBackend ??
     (opts.serverSockets?.allowLoopback === true
@@ -273,6 +283,24 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   function setCallerCwd(cwd: string): void {
     opts.kernel?.setCwd(callerPid, cwd);
     opts.wasiHost?.setCwd(cwd);
+  }
+
+  function priorityTargetPid(which: number, who: number): number {
+    if (which !== PRIO_PROCESS) return ERR_INVALID;
+    if (who === 0) return callerPid;
+    if (!opts.kernel?.hasProcess(who)) return ERR_NOT_FOUND;
+    return who;
+  }
+
+  function authorizeSetPriority(targetPid: number, nice: number): number {
+    const caller = getCallerCredentials();
+    const currentNice = opts.kernel?.getPriority(targetPid) ?? 0;
+    if (targetPid !== callerPid && caller.euid !== ROOT_UID) {
+      const target = opts.kernel?.getCredentials(targetPid);
+      if (!target || target.uid !== caller.euid) return ERR_PERMISSION;
+    }
+    if (nice < currentNice && caller.euid !== ROOT_UID) return ERR_PERMISSION;
+    return 0;
   }
 
   function bytesToBase64(data: Uint8Array): string {
@@ -398,6 +426,9 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       }
 
       const req = JSON.parse(reqJson) as SpawnRequest;
+      const requestedNice = normalizeNice(req.nice ?? 0);
+      if (requestedNice > 0 && !schedulerBackend) return ERR_UNSUPPORTED;
+      if (req.nice !== undefined) req.nice = requestedNice;
       if (opts.spawnProcess && opts.kernel) {
         const fdTable = opts.kernel.buildFdTableForSpawn(callerPid, req);
         // If stdin_data is provided, override fd 0 with a static target
@@ -447,6 +478,32 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     host_setresgid(rgid: number, egid: number, sgid: number): number {
       if (!opts.kernel) return setFallbackGid(rgid, egid, sgid);
       return opts.kernel.setresgid(callerPid, rgid, egid, sgid) ? 0 : ERR_PERMISSION;
+    },
+
+    host_getpriority(which: number, who: number): number {
+      const targetPid = priorityTargetPid(which, who);
+      if (targetPid === ERR_NOT_FOUND) return ERR_PRIORITY_NOT_FOUND;
+      if (targetPid < 0) return targetPid;
+      return opts.kernel?.getPriority(targetPid) ?? 0;
+    },
+
+    host_setpriority(which: number, who: number, niceRaw: number): number {
+      const targetPid = priorityTargetPid(which, who);
+      if (targetPid < 0) return targetPid;
+      const nice = normalizeNice(niceRaw);
+      const auth = authorizeSetPriority(targetPid, nice);
+      if (auth !== 0) return auth;
+      if (!schedulerBackend) return nice === (opts.kernel?.getPriority(targetPid) ?? 0) ? 0 : ERR_UNSUPPORTED;
+      const result = schedulerBackend.setPriority({ callerPid, targetPid, nice });
+      if (result.ok) {
+        opts.kernel?.setPriority(targetPid, nice);
+        return 0;
+      }
+      if (result.error === 'unsupported') return ERR_UNSUPPORTED;
+      if (result.error === 'permission') return ERR_PERMISSION;
+      if (result.error === 'invalid') return ERR_INVALID;
+      if (result.error === 'not_found') return ERR_NOT_FOUND;
+      return ERR_IO;
     },
 
     host_getcwd(outPtr: number, outCap: number): number {

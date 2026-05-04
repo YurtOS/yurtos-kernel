@@ -51,6 +51,7 @@ import { createKernelImports } from './host-imports/kernel-imports.js';
 import { WasiHost } from './wasi/wasi-host.js';
 import { bufferToString, createBufferTarget, TtyHandle, type FdTarget } from './wasi/fd-target.js';
 import type { RunCommandHandler } from './run-command.js';
+import { normalizeNice, unsupportedRuntimeEngineBackend, type RuntimeEngineBackend } from './engine/backend.js';
 
 /** Describes a set of host-provided files to mount into the VFS. */
 export interface MountConfig {
@@ -89,6 +90,8 @@ export interface SandboxOptions {
   socketBackend?: SocketBackend;
   /** Prepared policy surface for future bind/listen/accept support. */
   serverSockets?: SocketListenPolicy;
+  /** Engine-specific runtime capabilities. Selected once and reused by process imports. */
+  runtimeBackend?: RuntimeEngineBackend;
   /** Security policy and limits. */
   security?: SecurityOptions;
   /** Persistence configuration. Default mode is 'ephemeral' (no persistence). */
@@ -133,6 +136,7 @@ interface SandboxParts {
   bridge?: NetworkBridgeLike;
   socketBackend?: SocketBackend;
   serverSockets?: SocketListenPolicy;
+  runtimeBackend: RuntimeEngineBackend;
   networkPolicy?: NetworkPolicy;
   security?: SecurityOptions;
   workerExecutor?: WorkerExecutor;
@@ -162,6 +166,7 @@ export class Sandbox {
   private bridge: NetworkBridgeLike | null = null;
   private socketBackend: SocketBackend | undefined;
   private serverSockets: SocketListenPolicy | undefined;
+  private runtimeBackend: RuntimeEngineBackend;
   private networkPolicy: NetworkPolicy | undefined;
   private security: SecurityOptions | undefined;
   readonly sessionId: string;
@@ -189,6 +194,7 @@ export class Sandbox {
     this.bridge = parts.bridge ?? null;
     this.socketBackend = parts.socketBackend;
     this.serverSockets = parts.serverSockets;
+    this.runtimeBackend = parts.runtimeBackend;
     this.networkPolicy = parts.networkPolicy;
     this.security = parts.security;
     this.sessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
@@ -228,6 +234,7 @@ export class Sandbox {
       : await Sandbox.createNetworkBridge(options.network);
     const mgr = new ProcessManager(vfs, adapter, bridge, options.security?.toolAllowlist);
     const tools = await Sandbox.registerTools(mgr, adapter, options.wasmDir, vfs);
+    const runtimeBackend = options.runtimeBackend ?? unsupportedRuntimeEngineBackend;
     await Sandbox.installCpythonStdlib(vfs, adapter, options.wasmDir, tools);
 
     // Register optional WASM tools from ToolRegistry before preloadModules()
@@ -298,6 +305,7 @@ export class Sandbox {
       bridge,
       socketBackend: options.socketBackend,
       serverSockets: options.serverSockets,
+      runtimeBackend,
       extensionRegistry,
       runCommandHandler: options.runCommandHandler,
       getSandbox: () => sandboxRef,
@@ -511,6 +519,7 @@ export class Sandbox {
       mgr, bridge, networkPolicy: options.network,
       socketBackend: options.socketBackend,
       serverSockets: options.serverSockets,
+      runtimeBackend,
       security: options.security, workerExecutor,
       extensionRegistry, storage: options.storage,
       bootArgv, bootImports: options.bootImports,
@@ -723,6 +732,7 @@ export class Sandbox {
     bridge?: NetworkBridgeLike;
     socketBackend?: SocketBackend;
     serverSockets?: SocketListenPolicy;
+    runtimeBackend: RuntimeEngineBackend;
     extensionRegistry: ExtensionRegistry;
     runCommandHandler?: RunCommandHandler;
     getSandbox: () => Sandbox | undefined;
@@ -741,6 +751,7 @@ export class Sandbox {
       bridge,
       socketBackend,
       serverSockets,
+      runtimeBackend,
       extensionRegistry,
       runCommandHandler,
       getSandbox,
@@ -798,6 +809,7 @@ export class Sandbox {
           networkBridge: bridge,
           socketBackend,
           serverSockets,
+          runtimeBackend,
           extensionRegistry,
           mgr,
           nativeModules: mgr.nativeModules,
@@ -833,6 +845,19 @@ export class Sandbox {
             kernel.setCwd(childPid, childCwd);
             kernel.registerPending(childPid, req.prog);
             kernel.adoptFdTable(childPid, fdTable);
+            const childNice = normalizeNice(req.nice ?? kernel.getPriority(pid));
+            if (childNice > 0) {
+              const priorityResult = runtimeBackend.scheduler?.setPriority({
+                callerPid: pid,
+                targetPid: childPid,
+                nice: childNice,
+              }) ?? { ok: false as const, error: 'unsupported' as const };
+              if (!priorityResult.ok) {
+                kernel.releaseProcess(childPid, priorityResult.error === 'permission' ? 126 : 127);
+                return priorityResult.error === 'permission' ? -2 : -38;
+              }
+              kernel.setPriority(childPid, childNice);
+            }
             const commandName = req.prog.includes('/')
               ? req.prog.split('/').pop() ?? req.prog
               : req.prog;
@@ -1199,6 +1224,7 @@ export class Sandbox {
       bridge: this.bridge ?? undefined,
       socketBackend: this.socketBackend,
       serverSockets: this.serverSockets,
+      runtimeBackend: this.runtimeBackend,
       extensionRegistry: this.extensionRegistry ?? new ExtensionRegistry(),
       runCommandHandler: this.runCommandHandler,
       getSandbox: () => this,
@@ -1408,6 +1434,7 @@ export class Sandbox {
       bridge,
       socketBackend: this.socketBackend,
       serverSockets: this.serverSockets,
+      runtimeBackend: this.runtimeBackend,
       extensionRegistry: this.extensionRegistry ?? new ExtensionRegistry(),
       runCommandHandler: this.runCommandHandler,
       getSandbox: () => childRef,
@@ -1453,6 +1480,7 @@ export class Sandbox {
       mgr: childMgr, bridge, networkPolicy: this.networkPolicy,
       socketBackend: this.socketBackend,
       serverSockets: this.serverSockets,
+      runtimeBackend: this.runtimeBackend,
       security: this.security, workerExecutor: childWorkerExecutor,
       extensionRegistry: this.extensionRegistry ?? undefined,
       storage: this.storage ?? undefined,

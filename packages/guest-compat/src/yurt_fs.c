@@ -4,9 +4,9 @@
  * compiling its own replacement copies — which would otherwise
  * collide with our compat headers' inline versions.
  *
- * Sandbox semantics: file ownership mutators route through the
- * host/kernel authorization boundary; process priorities still
- * accept-and-no-op because yurt does not schedule by priority.
+ * Sandbox semantics: file ownership and process priority mutators route
+ * through the host/kernel authorization boundary. Priority changes only
+ * succeed when the selected engine backend can apply them.
  */
 
 #include "yurt_markers.h"
@@ -145,14 +145,22 @@ char *getcwd(char *buf, size_t size) {
 
 int getpriority(int which, id_t who) {
   YURT_MARKER_CALL(getpriority);
-  (void)which; (void)who;
-  return 0;
+  int rc = yurt_host_getpriority(which, (int)who);
+  if (rc >= -20 && rc <= 19) return rc;
+  errno = (rc == -22) ? EINVAL : (rc == -1001) ? ESRCH : EIO;
+  return -1;
 }
 
 int setpriority(int which, id_t who, int prio) {
   YURT_MARKER_CALL(setpriority);
-  (void)which; (void)who; (void)prio;
-  return 0;
+  int rc = yurt_host_setpriority(which, (int)who, prio);
+  if (rc == 0) return 0;
+  errno = (rc == -38) ? ENOSYS
+    : (rc == -22) ? EINVAL
+    : (rc == -1) ? ESRCH
+    : (rc == -2) ? EPERM
+    : EIO;
+  return -1;
 }
 
 int nice(int inc) {

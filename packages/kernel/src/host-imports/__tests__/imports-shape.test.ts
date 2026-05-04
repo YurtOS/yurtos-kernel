@@ -5,6 +5,7 @@ import { VFS } from "../../vfs/vfs.ts";
 import { ProcessKernel } from "../../process/kernel.ts";
 import { FdTable } from "../../vfs/fd-table.ts";
 import { createVfsFileTarget } from "../../wasi/fd-target.ts";
+import type { RuntimeEngineBackend } from "../../engine/backend.ts";
 
 const encoder = new TextEncoder();
 
@@ -203,4 +204,67 @@ Deno.test("host_getcwd writes the caller cwd and reports required size", () => {
   assertEquals((imports.host_getcwd as (...args: number[]) => number)(0, 32), 10);
   assertEquals(new TextDecoder().decode(new Uint8Array(memory.buffer, 0, 9)), "/tmp/work");
   assertEquals(new Uint8Array(memory.buffer)[9], 0);
+});
+
+Deno.test("host_setpriority reports unsupported when no scheduler backend can apply the change", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals((imports.host_getpriority as (...args: number[]) => number)(0, 0), 0);
+  assertEquals((imports.host_setpriority as (...args: number[]) => number)(0, 0, 5), -38);
+  assertEquals(kernel.getPriority(pid), 0);
+});
+
+Deno.test("host_setpriority applies through an explicit scheduler backend", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  const calls: Array<{ pid: number; nice: number }> = [];
+  const runtimeBackend: RuntimeEngineBackend = {
+    scheduler: {
+      setPriority(request) {
+        calls.push({ pid: request.targetPid, nice: request.nice });
+        return { ok: true };
+      },
+    },
+  };
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    runtimeBackend,
+  });
+
+  assertEquals((imports.host_setpriority as (...args: number[]) => number)(0, 0, 7), 0);
+  assertEquals((imports.host_getpriority as (...args: number[]) => number)(0, 0), 7);
+  assertEquals(calls, [{ pid, nice: 7 }]);
+});
+
+Deno.test("host_spawn rejects nonzero nice when the engine has no scheduler backend", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const request = JSON.stringify({
+    prog: "echo",
+    args: ["hello"],
+    env: [],
+    cwd: "/",
+    stdin_fd: 0,
+    stdout_fd: 1,
+    stderr_fd: 2,
+    nice: 5,
+  });
+  const reqLen = writeString(memory, 0, request);
+  const kernel = new ProcessKernel();
+  const parentPid = kernel.allocPid(1, "parent");
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: parentPid,
+    spawnProcess: () => {
+      throw new Error("spawnProcess should not run when scheduler support is absent");
+    },
+  });
+
+  assertEquals((imports.host_spawn as (...args: number[]) => number)(0, reqLen), -38);
 });

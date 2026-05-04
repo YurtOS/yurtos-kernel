@@ -1,5 +1,6 @@
 import type { FdTarget, TtyState } from '../wasi/fd-target.js';
 import { createTtyState, createTtySlaveTarget } from '../wasi/fd-target.js';
+import { normalizeNice } from '../engine/backend.js';
 import { createAsyncPipe } from '../vfs/pipe.js';
 import type { WasiHost } from '../wasi/wasi-host.js';
 
@@ -28,6 +29,7 @@ export interface SpawnRequest {
   args: string[];
   env: [string, string][];
   cwd: string;
+  nice?: number;
   // snake_case to match JSON from Rust's serde_json
   stdin_fd: number;
   stdout_fd: number;
@@ -48,6 +50,7 @@ export interface ProcessEntry {
   controllingTtyId: number | null;
   credentials: ProcessCredentials;
   cwd: string;
+  nice: number;
 }
 
 interface FileLockState {
@@ -76,6 +79,7 @@ export class ProcessKernel {
       pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
       credentials: rootCredentials(),
       cwd: '/',
+      nice: 0,
     });
     this.parentPids.set(INIT_PID, 0);
     this.children.set(INIT_PID, new Set());
@@ -140,6 +144,17 @@ export class ProcessKernel {
     if (entry) entry.cwd = normalizeKernelPath(cwd);
   }
 
+  getPriority(pid: number): number {
+    return this.processTable.get(pid)?.nice ?? 0;
+  }
+
+  setPriority(pid: number, nice: number): boolean {
+    const entry = this.processTable.get(pid);
+    if (!entry) return false;
+    entry.nice = normalizeNice(nice);
+    return true;
+  }
+
   setresuid(pid: number, ruid: number, euid: number, suid: number): boolean {
     const entry = this.processTable.get(pid);
     if (!entry) return false;
@@ -188,6 +203,10 @@ export class ProcessKernel {
     return this.processTable.get(ppid)?.cwd ?? '/';
   }
 
+  private priorityForChild(ppid: number): number {
+    return this.processTable.get(ppid)?.nice ?? 0;
+  }
+
   buildFdTableForSpawn(callerPid: number, req: SpawnRequest): Map<number, FdTarget> {
     const callerFdTable = this.fdTables.get(callerPid);
     if (!callerFdTable) throw new Error(`No fd table for caller pid ${callerPid}`);
@@ -227,6 +246,7 @@ export class ProcessKernel {
         controllingTtyId: null,
         credentials: this.credentialsForChild(ppid),
         cwd: this.cwdForChild(ppid),
+        nice: this.priorityForChild(ppid),
       });
     }
   }
@@ -255,6 +275,7 @@ export class ProcessKernel {
       pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
       credentials: userCredentials(),
       cwd: '/',
+      nice: 0,
     });
     const onExit = () => {
       const entry = this.processTable.get(pid);
@@ -316,6 +337,7 @@ export class ProcessKernel {
         pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
         credentials: this.credentialsForChild(ppid ?? INIT_PID),
         cwd: this.cwdForChild(ppid ?? INIT_PID),
+        nice: this.priorityForChild(ppid ?? INIT_PID),
       });
     }
   }

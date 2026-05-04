@@ -18,6 +18,8 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_getcwd",
   "host_chdir",
   "host_fchdir",
+  "host_getpriority",
+  "host_setpriority",
   "host_kill",
   "host_list_processes",
   "host_read_fd",

@@ -1,0 +1,9 @@
+canary = "posix-runtime-canary"
+symbol = "setpriority"
+
+[[cases]]
+name = "priority_unsupported"
+inputs = "getpriority(PRIO_PROCESS, 0), setpriority(PRIO_PROCESS, 0, 5), nice(1)"
+expected.exit = 0
+expected.stdout = "priority_unsupported:ok"
+expected.note = "getpriority reports kernel metadata; priority changes return ENOSYS without an engine scheduler backend"

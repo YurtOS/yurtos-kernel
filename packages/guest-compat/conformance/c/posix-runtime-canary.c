@@ -3,6 +3,7 @@
 #include <net/if.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
 #include <unistd.h>
@@ -286,6 +287,30 @@ static int case_cwd_backend(void) {
   return 0;
 }
 
+static int case_priority_unsupported(void) {
+  errno = 0;
+  int prio = getpriority(PRIO_PROCESS, 0);
+  if (prio != 0 || errno != 0) {
+    emit("priority_unsupported", 1, "priority_unsupported:getpriority_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (setpriority(PRIO_PROCESS, 0, 5) != -1 || errno != ENOSYS) {
+    emit("priority_unsupported", 1, "priority_unsupported:setpriority_not_enosys", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (nice(1) != -1 || errno != ENOSYS) {
+    emit("priority_unsupported", 1, "priority_unsupported:nice_not_enosys", 1, errno);
+    return 1;
+  }
+
+  emit("priority_unsupported", 0, "priority_unsupported:ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "hostname") == 0) return case_hostname();
   if (strcmp(name, "hostname_too_small") == 0) return case_hostname_too_small();
@@ -299,6 +324,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "chown_denied") == 0) return case_chown_denied();
   if (strcmp(name, "identity_kernel") == 0) return case_identity_kernel();
   if (strcmp(name, "cwd_backend") == 0) return case_cwd_backend();
+  if (strcmp(name, "priority_unsupported") == 0) return case_priority_unsupported();
   fprintf(stderr, "posix-runtime-canary: unknown case %s\n", name);
   return 2;
 }
@@ -316,6 +342,7 @@ static int list_cases(void) {
   puts("chown_denied");
   puts("identity_kernel");
   puts("cwd_backend");
+  puts("priority_unsupported");
   return 0;
 }
 

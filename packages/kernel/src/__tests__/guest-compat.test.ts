@@ -144,6 +144,18 @@ describe('Guest compatibility canaries', () => {
     expect(result.stdout.trim()).toBe('affinity:get=1,set0=0,set1=einval');
   });
 
+  it('reports priority changes as unsupported without an engine scheduler backend', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('posix-runtime-canary --case priority_unsupported');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('{"case":"priority_unsupported","exit":0,"stdout":"priority_unsupported:ok"}');
+  });
+
   // ──────────────────────────────────────────────────────────────────────
   // setjmp/longjmp — POSIX exception-style control flow over Asyncify.
   //
