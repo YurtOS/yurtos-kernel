@@ -928,7 +928,7 @@ export class Sandbox {
                 nice: childNice,
               }) ?? { ok: false as const, error: 'unsupported' as const };
               if (!priorityResult.ok) {
-                kernel.releaseProcess(childPid, priorityResult.error === 'permission' ? 126 : 127);
+                kernel.discardProcess(childPid);
                 return priorityResult.error === 'permission' ? -2 : -38;
               }
               kernel.setPriority(childPid, childNice);
@@ -948,10 +948,8 @@ export class Sandbox {
             try {
               argv = Sandbox.argvForSpawn(vfs, req, kernel.getCredentials(pid));
             } catch (e) {
-              const msg = e instanceof Error ? e.message : String(e);
-              Sandbox.writeToFdTarget(kernel.getFdTarget(childPid, 2), `${req.prog}: ${msg}\n`);
-              kernel.releaseProcess(childPid, msg.includes('EACCES') ? 126 : 127);
-              return childPid;
+              kernel.discardProcess(childPid);
+              throw e;
             }
             const childCtx = makeContextWithAllocator(() => childPid);
             const promise = loadProcess(childCtx, {
@@ -1016,7 +1014,7 @@ export class Sandbox {
     try {
       st = vfs.stat(path);
     } catch {
-      return;
+      throw new Error(`ENOENT: no such file or directory: ${path}`);
     }
     if (st.type !== 'file' || !Sandbox.canExecute(st, credentials)) {
       throw new Error(`EACCES: permission denied: ${path}`);
@@ -1380,8 +1378,20 @@ export class Sandbox {
         this.security?.limits?.stdoutBytes,
         this.security?.limits?.stderrBytes,
       );
+      this.processes.set(proc.pid, proc);
+    } else {
+      const captured = {
+        1: proc.fdReadAndClear(1),
+        2: proc.fdReadAndClear(2),
+      };
+      proc.__setFdReadAndClear((fd) => {
+        const result = captured[fd];
+        captured[fd] = { data: '', truncated: false };
+        return result;
+      });
+      await proc.terminate();
+      await this.kernel.waitpid(proc.pid);
     }
-    this.processes.set(proc.pid, proc);
     return proc;
   }
 
