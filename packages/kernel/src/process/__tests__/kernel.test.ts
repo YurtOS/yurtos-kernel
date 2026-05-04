@@ -125,6 +125,15 @@ describe('ProcessKernel', () => {
     kernel.dispose();
   });
 
+  it('registerPending preserves an already allocated parent when ppid is omitted', () => {
+    const kernel = new ProcessKernel();
+    const parent = kernel.allocPid();
+    const child = kernel.allocPid(parent);
+    kernel.registerPending(child, 'cat');
+    expect(kernel.getPpid(child)).toBe(parent);
+    kernel.dispose();
+  });
+
   it('records ppid through registerExited (fresh entry)', () => {
     const kernel = new ProcessKernel();
     const parent = kernel.allocPid();

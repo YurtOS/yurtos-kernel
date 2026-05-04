@@ -4,7 +4,7 @@
  * Used by WasiHost, ProcessManager, and worker-side process runners so they can
  * accept either the real VFS (main thread) or VfsProxy (Worker thread).
  */
-import type { DirEntry, StatResult } from './inode.js';
+import type { DirEntry, FsCredential, StatResult } from './inode.js';
 import type { OverlayState } from './overlay-vfs.js';
 import type { ProcessInfo } from './proc-provider.js';
 import type { MountEntry, VirtualProvider } from './provider.js';
@@ -33,6 +33,7 @@ export interface VfsLike {
   readlink(path: string): string;
   chmod(path: string, mode: number): void;
   chown(path: string, uid: number, gid: number, followSymlinks?: boolean): void;
+  withCredential?<T>(credential: FsCredential, fn: () => T): T;
   withWriteAccess(fn: () => void): void;
   /**
    * Optional: detect a streaming-capable provider entry (e.g.

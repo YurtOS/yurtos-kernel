@@ -84,7 +84,7 @@ function canWrite(stat: StatResult, credential: FsCredential): boolean {
 export class OverlayVFS implements VfsLike {
   private readonly whiteouts = new Set<string>();
   private readonly overlaySnapshots = new Map<string, string[]>();
-  private readonly credential: FsCredential;
+  private credential: FsCredential;
   private onChange: (() => void) | null = null;
   private notificationDepth = 0;
   private privileged = false;
@@ -369,6 +369,16 @@ export class OverlayVFS implements VfsLike {
       this.options.upper.chown(path, uid, gid);
     }
     this.notifyChange();
+  }
+
+  withCredential<T>(credential: FsCredential, fn: () => T): T {
+    const previous = this.credential;
+    this.credential = credential;
+    try {
+      return fn();
+    } finally {
+      this.credential = previous;
+    }
   }
 
   withWriteAccess(fn: () => void): void {

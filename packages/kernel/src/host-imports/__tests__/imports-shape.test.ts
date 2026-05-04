@@ -2,6 +2,8 @@ import { assertEquals } from "jsr:@std/assert@^1.0.19";
 import { createKernelImports } from "../kernel-imports.ts";
 import { readString } from "../common.ts";
 import { VFS } from "../../vfs/vfs.ts";
+import { OverlayVFS } from "../../vfs/overlay-vfs.ts";
+import { MemoryRoot } from "../../vfs/__tests__/helpers.ts";
 import { ProcessKernel } from "../../process/kernel.ts";
 import { FdTable } from "../../vfs/fd-table.ts";
 import { createVfsFileTarget } from "../../wasi/fd-target.ts";
@@ -294,6 +296,29 @@ Deno.test("host_chmod trusts kernel credentials over caller-supplied uid", () =>
   const pathLen = writeString(memory, 0, "/tmp/root-owned.txt");
   assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777), -2);
   assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
+});
+
+Deno.test("host_chmod and host_chown apply root kernel credentials to overlay VFS", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const base = new MemoryRoot();
+  base.addDir("/etc", { uid: 0, gid: 0, permissions: 0o755 });
+  base.addFile("/etc/root.conf", "root", { uid: 0, gid: 0, permissions: 0o644 });
+  const vfs = new OverlayVFS({ base, upper: new VFS() });
+  const kernel = new ProcessKernel();
+  const rootPid = 1;
+  const imports = createKernelImports({ memory, vfs, kernel, callerPid: rootPid });
+
+  let pathLen = writeString(memory, 0, "/etc/root.conf");
+  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o600), 0);
+  pathLen = writeString(memory, 0, "/etc/root.conf");
+  assertEquals((imports.host_chown as (...args: number[]) => number)(0, pathLen, 1000, 1000, 1), 0);
+
+  assertEquals(vfs.stat("/etc/root.conf").permissions, 0o600);
+  assertEquals(vfs.stat("/etc/root.conf").uid, 1000);
+  assertEquals(vfs.stat("/etc/root.conf").gid, 1000);
+  assertEquals(base.stat("/etc/root.conf").uid, 0);
+  assertEquals(base.stat("/etc/root.conf").permissions, 0o644);
+  kernel.dispose();
 });
 
 Deno.test("host_chown is root-only and mutates inode ownership", () => {

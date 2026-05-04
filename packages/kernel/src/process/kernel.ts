@@ -390,26 +390,27 @@ export class ProcessKernel {
   }
 
   /** Pre-register a process entry so waitpid can find it before async instantiation completes. */
-  registerPending(pid: number, command?: string, ppid: number = INIT_PID): void {
+  registerPending(pid: number, command?: string, ppid?: number): void {
+    const parentPid = ppid ?? this.parentPids.get(pid) ?? INIT_PID;
     this.reservePid(pid);
-    this.setParentPid(pid, ppid);
+    this.setParentPid(pid, parentPid);
     this.initProcess(pid);
     if (!this.processTable.has(pid)) {
-      const parentEntry = this.processTable.get(ppid);
-      const scheduler = this.schedulerForChild(ppid);
+      const parentEntry = this.processTable.get(parentPid);
+      const scheduler = this.schedulerForChild(parentPid);
       this.processTable.set(pid, {
         pid, promise: null, exitCode: -1, state: 'running', wasiHost: null, waiters: [],
         command,
         pgid: parentEntry?.pgid ?? INIT_PID,
         sid: parentEntry?.sid ?? INIT_PID,
         controllingTtyId: null,
-        credentials: this.credentialsForChild(ppid),
-        cwd: this.cwdForChild(ppid),
-        nice: this.priorityForChild(ppid),
+        credentials: this.credentialsForChild(parentPid),
+        cwd: this.cwdForChild(parentPid),
+        nice: this.priorityForChild(parentPid),
         schedulerPolicy: scheduler.policy,
         schedulerPriority: scheduler.priority,
-        umask: this.umaskForChild(ppid),
-        resourceLimits: this.resourceLimitsForChild(ppid),
+        umask: this.umaskForChild(parentPid),
+        resourceLimits: this.resourceLimitsForChild(parentPid),
       });
     }
   }

@@ -267,6 +267,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     };
   }
 
+  function withVfsCallerCredentials<T>(fn: () => T): T {
+    const credentials = getCallerCredentials();
+    const vfsWithCredential = opts.vfs as (VfsLike & {
+      withCredential?: <U>(credential: { uid: number; gid: number }, inner: () => U) => U;
+    }) | undefined;
+    return vfsWithCredential?.withCredential
+      ? vfsWithCredential.withCredential({ uid: credentials.euid, gid: credentials.egid }, fn)
+      : fn();
+  }
+
   function setFallbackUid(ruid: number, euid: number, suid: number): number {
     const current = new Set([fallbackUid]);
     for (const value of [ruid, euid, suid]) {
@@ -1689,7 +1699,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         if (credentials.euid !== ROOT_UID && stat.uid !== credentials.euid) {
           return ERR_PERMISSION;
         }
-        opts.vfs.chmod(path, mode);
+        withVfsCallerCredentials(() => opts.vfs!.chmod(path, mode));
         return 0;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : '';
@@ -1705,7 +1715,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       try {
         opts.vfs.stat(path);
         if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
-        opts.vfs.chown(path, uid, gid, followSymlinks !== 0);
+        withVfsCallerCredentials(() => opts.vfs!.chown(path, uid, gid, followSymlinks !== 0));
         return 0;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : '';
@@ -1723,7 +1733,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (!path) return ERR_NOT_FOUND;
       if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
       try {
-        opts.vfs.chown(path, uid, gid);
+        withVfsCallerCredentials(() => opts.vfs!.chown(path, uid, gid));
         return 0;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : '';
