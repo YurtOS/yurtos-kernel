@@ -2,6 +2,7 @@ import { assertEquals } from "jsr:@std/assert@^1.0.19";
 import { createKernelImports } from "../kernel-imports.ts";
 import { readString } from "../common.ts";
 import { VFS } from "../../vfs/vfs.ts";
+import { ProcessKernel } from "../../process/kernel.ts";
 
 const encoder = new TextEncoder();
 
@@ -67,6 +68,21 @@ Deno.test("host_chmod allows the file owner and denies non-owners", () => {
   assertEquals(vfs.stat("/tmp/user-owned.txt").permissions, 0o444);
 
   pathLen = writeString(memory, 0, "/tmp/root-owned.txt");
+  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777), -2);
+  assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
+});
+
+Deno.test("host_chmod trusts kernel credentials over caller-supplied uid", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.withWriteAccess(() => {
+    vfs.writeFile("/tmp/root-owned.txt", new Uint8Array(1));
+  });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  const imports = createKernelImports({ memory, vfs, kernel, callerPid: pid, callerUid: 0 });
+
+  const pathLen = writeString(memory, 0, "/tmp/root-owned.txt");
   assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777), -2);
   assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
 });

@@ -9,6 +9,15 @@ import type { WasiHost } from '../wasi/wasi-host.js';
 export const KERNEL_FD_BASE = 1024;
 export const NO_PARENT_PID = 0;
 export const INIT_PID = 1;
+export const ROOT_UID = 0;
+export const ROOT_GID = 0;
+export const USER_UID = 1000;
+export const USER_GID = 1000;
+
+export interface ProcessCredentials {
+  uid: number;
+  gid: number;
+}
 
 export interface SpawnRequest {
   prog: string;
@@ -33,6 +42,7 @@ export interface ProcessEntry {
   pgid: number;
   sid: number;
   controllingTtyId: number | null;
+  credentials: ProcessCredentials;
 }
 
 interface FileLockState {
@@ -59,6 +69,7 @@ export class ProcessKernel {
       pid: INIT_PID, promise: null, exitCode: -1, state: 'running',
       wasiHost: null, waiters: [], command: 'init',
       pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
+      credentials: { uid: ROOT_UID, gid: ROOT_GID },
     });
     this.parentPids.set(INIT_PID, 0);
     this.children.set(INIT_PID, new Set());
@@ -110,6 +121,16 @@ export class ProcessKernel {
     return nextFd;
   }
 
+  getCredentials(pid: number): ProcessCredentials {
+    return this.processTable.get(pid)?.credentials ?? { uid: USER_UID, gid: USER_GID };
+  }
+
+  private credentialsForChild(ppid: number): ProcessCredentials {
+    const parent = this.processTable.get(ppid);
+    if (!parent || ppid === INIT_PID) return { uid: USER_UID, gid: USER_GID };
+    return { ...parent.credentials };
+  }
+
   buildFdTableForSpawn(callerPid: number, req: SpawnRequest): Map<number, FdTarget> {
     const callerFdTable = this.fdTables.get(callerPid);
     if (!callerFdTable) throw new Error(`No fd table for caller pid ${callerPid}`);
@@ -147,6 +168,7 @@ export class ProcessKernel {
         pgid: parentEntry?.pgid ?? INIT_PID,
         sid: parentEntry?.sid ?? INIT_PID,
         controllingTtyId: null,
+        credentials: this.credentialsForChild(ppid),
       });
     }
   }
@@ -173,6 +195,7 @@ export class ProcessKernel {
     this.processTable.set(pid, {
       pid, promise, exitCode: -1, state: 'running', wasiHost, waiters: [],
       pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
+      credentials: { uid: USER_UID, gid: USER_GID },
     });
     const onExit = () => {
       const entry = this.processTable.get(pid);
@@ -232,6 +255,7 @@ export class ProcessKernel {
       this.processTable.set(pid, {
         pid, promise: Promise.resolve(), exitCode, state: 'exited', wasiHost: null, waiters: [],
         pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
+        credentials: this.credentialsForChild(ppid ?? INIT_PID),
       });
     }
   }

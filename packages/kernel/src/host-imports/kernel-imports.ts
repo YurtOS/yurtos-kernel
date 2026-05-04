@@ -22,7 +22,7 @@ import type { SocketBackend, SocketListenPolicy, SocketPortMapping } from '../ne
 import { createLoopbackSocketBackend, createNetworkBridgeSocketBackend } from '../network/socket-backend.js';
 import type { ExtensionRegistry } from '../extension/registry.js';
 import type { NativeModuleRegistry } from '../process/native-modules.js';
-import type { ProcessKernel, SpawnRequest } from '../process/kernel.js';
+import type { ProcessCredentials, ProcessKernel, SpawnRequest } from '../process/kernel.js';
 import type { ProcessManager } from '../process/manager.js';
 import type { WasiHost } from '../wasi/wasi-host.js';
 import type { ThreadsBackend } from '../process/threads/backend.js';
@@ -122,6 +122,7 @@ const ERR_PERMISSION = -2;
 const ERR_IO = -3;
 const ROOT_UID = 0;
 const USER_UID = 1000;
+const USER_GID = 1000;
 
 function globToRegExp(pattern: string): RegExp {
   let re = '';
@@ -208,7 +209,10 @@ function globMatch(vfs: VfsLike, pattern: string): string[] {
 export function createKernelImports(opts: KernelImportsOptions): Record<string, WebAssembly.ImportValue> {
   const { memory } = opts;
   const callerPid = opts.callerPid ?? 0;
-  const callerUid = opts.callerUid ?? USER_UID;
+  const callerCredentials: ProcessCredentials = opts.kernel?.getCredentials(callerPid) ?? {
+    uid: opts.callerUid ?? USER_UID,
+    gid: opts.callerGid ?? USER_GID,
+  };
   const bridgeSocketBackend = opts.networkBridge ? createNetworkBridgeSocketBackend(opts.networkBridge) : undefined;
   const socketBackend = opts.socketBackend ??
     (opts.serverSockets?.allowLoopback === true
@@ -1346,7 +1350,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       const path = readString(memory, pathPtr, pathLen);
       try {
         const stat = opts.vfs.stat(path);
-        if (callerUid !== ROOT_UID && stat.uid !== callerUid) {
+        if (callerCredentials.uid !== ROOT_UID && stat.uid !== callerCredentials.uid) {
           return ERR_PERMISSION;
         }
         opts.vfs.chmod(path, mode);
