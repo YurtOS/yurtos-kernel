@@ -77,6 +77,14 @@ static int exec_via_spawn(const char *prog, char *const argv[], char *const envp
     errno = ENOENT;
     return -1;
   }
+  /* This process image is supposed to disappear after a successful exec.
+   * Our spawn+wait emulation keeps it alive as a small waiter, so drop any
+   * inherited non-stdio descriptors now.  The spawned replacement already has
+   * its stdin/stdout/stderr refs; keeping extra pipe ends here can suppress EOF
+   * in shell pipelines. */
+  for (int fd = 3; fd < 2048; ++fd) {
+    close(fd);
+  }
   int status = 0;
   if (waitpid(child, &status, 0) != child) {
     /* Child spawned but couldn't be reaped — surface as a generic

@@ -34,14 +34,20 @@ describe('OverlayVFS', () => {
     const base = new MemoryRoot();
     base.addDir('/bin', { uid: 0, gid: 0, permissions: 0o755 });
     base.addFile('/bin/python', 'base', { uid: 0, gid: 0, permissions: 0o755 });
+    base.addDir('/etc', { uid: 0, gid: 0, permissions: 0o755 });
+    base.addFile('/etc/yurt.conf', 'config', { uid: 0, gid: 0, permissions: 0o644 });
     const upper = new VFS();
     const vfs = new OverlayVFS({ base, upper });
 
     expect(() => vfs.writeFile('/bin/python', enc.encode('shadow'))).toThrow(/EACCES/);
     expect(() => vfs.unlink('/bin/python')).toThrow(/EACCES/);
     expect(() => vfs.symlink('/tmp/fake-python', '/bin/python')).toThrow(/EACCES/);
+    expect(() => vfs.writeFile('/etc/yurt.conf', enc.encode('shadow'))).toThrow(/EACCES/);
+    expect(() => vfs.mkdir('/etc/backdoor.d')).toThrow(/EACCES/);
     expect(() => upper.readFile('/bin/python')).toThrow(/ENOENT/);
+    expect(() => upper.readFile('/etc/yurt.conf')).toThrow(/ENOENT/);
     expect(dec.decode(vfs.readFile('/bin/python'))).toBe('base');
+    expect(dec.decode(vfs.readFile('/etc/yurt.conf'))).toBe('config');
   });
 
   it('copies up writable user-owned base files and leaves base unchanged', () => {
@@ -311,6 +317,23 @@ describe('OverlayVFS', () => {
     expect(() => vfs.unlink('/locked/user-owned.txt')).toThrow(/EACCES/);
   });
 
+  it('rename permission depends on source and destination parents', () => {
+    const base = new MemoryRoot();
+    base.addDir('/bin', { uid: 0, gid: 0, permissions: 0o755 });
+    base.addFile('/bin/tool', 'tool', { uid: 0, gid: 0, permissions: 0o755 });
+    base.addDir('/etc', { uid: 0, gid: 0, permissions: 0o755 });
+    const vfs = new OverlayVFS({ base, upper: new VFS() });
+
+    vfs.writeFile('/tmp/payload', enc.encode('payload'));
+
+    expect(() => vfs.rename('/bin/tool', '/tmp/tool')).toThrow(/EACCES/);
+    expect(() => vfs.rename('/tmp/payload', '/etc/payload')).toThrow(/EACCES/);
+    expect(dec.decode(vfs.readFile('/bin/tool'))).toBe('tool');
+    expect(dec.decode(vfs.readFile('/tmp/payload'))).toBe('payload');
+    expect(() => vfs.readFile('/tmp/tool')).toThrow(/ENOENT/);
+    expect(() => vfs.readFile('/etc/payload')).toThrow(/ENOENT/);
+  });
+
   it('preserves POSIX directory deletion semantics for base directories', () => {
     const base = new MemoryRoot();
     base.addDir('/base-dir', { uid: 1000, gid: 1000, permissions: 0o755 });
@@ -329,6 +352,26 @@ describe('OverlayVFS', () => {
     vfs.chmod('/user-dir', 0o755);
 
     expect(vfs.stat('/user-dir').permissions).toBe(0o755);
+  });
+
+  it('chmod and chown on root-owned base entries require ownership or root', () => {
+    const base = new MemoryRoot();
+    base.addDir('/etc', { uid: 0, gid: 0, permissions: 0o755 });
+    base.addFile('/etc/root.conf', 'root', { uid: 0, gid: 0, permissions: 0o644 });
+    const userVfs = new OverlayVFS({ base, upper: new VFS() });
+    const rootVfs = new OverlayVFS({ base, upper: new VFS(), credential: { uid: 0, gid: 0 } });
+
+    expect(() => userVfs.chmod('/etc/root.conf', 0o666)).toThrow(/EACCES/);
+    expect(() => userVfs.chown('/etc/root.conf', 1000, 1000)).toThrow(/EACCES/);
+
+    rootVfs.chmod('/etc/root.conf', 0o600);
+    rootVfs.chown('/etc/root.conf', 1000, 1000);
+
+    expect(rootVfs.stat('/etc/root.conf').permissions).toBe(0o600);
+    expect(rootVfs.stat('/etc/root.conf').uid).toBe(1000);
+    expect(rootVfs.stat('/etc/root.conf').gid).toBe(1000);
+    expect(base.stat('/etc/root.conf').uid).toBe(0);
+    expect(base.stat('/etc/root.conf').permissions).toBe(0o644);
   });
 
   it('can clone the upper layer while sharing the same base', () => {

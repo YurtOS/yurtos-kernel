@@ -473,12 +473,20 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (requestedNice > 0 && !schedulerBackend) return ERR_UNSUPPORTED;
       if (req.nice !== undefined) req.nice = requestedNice;
       if (opts.spawnProcess && opts.kernel) {
+        if (!opts.kernel.canReserveProcessSlot()) return -1;
         const fdTable = opts.kernel.buildFdTableForSpawn(callerPid, req);
         // If stdin_data is provided, override fd 0 with a static target
         if (req.stdin_data) {
+          const previousStdin = fdTable.get(0);
+          if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
           fdTable.set(0, createStaticTarget(new TextEncoder().encode(req.stdin_data)));
         }
-        return opts.spawnProcess(req, fdTable, callerPid);
+        try {
+          return opts.spawnProcess(req, fdTable, callerPid);
+        } catch {
+          opts.kernel.releaseFdTable(fdTable);
+          return -1;
+        }
       }
       return -1;
     },
@@ -798,13 +806,21 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
     // host_waitpid(pid, out_ptr, out_cap) -> i32
     // Async — must be wrapped with WebAssembly.Suspending for JSPI.
-    // Waits for the child process to exit and writes { exit_code } to the output buffer.
+    // Waits for a child process to exit and writes { pid, exit_code } to the output buffer.
     async host_waitpid(pid: number, outPtr: number, outCap: number): Promise<number> {
       if (!opts.kernel) {
         return writeJson(memory, outPtr, outCap, { exit_code: -1 });
       }
-      const exitCode = await opts.kernel.waitpid(pid);
-      return writeJson(memory, outPtr, outCap, { exit_code: exitCode });
+      if (pid <= 0) {
+        const result = await opts.kernel.waitAnyChild(callerPid);
+        if (!result) return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
+        return writeJson(memory, outPtr, outCap, {
+          pid: result.pid,
+          exit_code: result.exitCode,
+        });
+      }
+      const exitCode = await opts.kernel.waitpid(pid, callerPid);
+      return writeJson(memory, outPtr, outCap, { pid, exit_code: exitCode });
     },
 
     // host_close_fd(fd) -> i32
@@ -878,14 +894,17 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // host_dup2(src_fd, dst_fd) -> i32
     // Makes dst_fd point to the same target as src_fd.
     host_dup2(srcFd: number, dstFd: number): number {
-      let wasiResult = 0;
-      if (opts.wasiHost) {
-        wasiResult = opts.wasiHost.renumberFd(srcFd, dstFd) === 0 ? 0 : -1;
-      }
-      if (!opts.kernel) return wasiResult;
       try {
-        opts.kernel.dup2(callerPid, srcFd, dstFd);
-        return wasiResult === -1 ? -1 : 0;
+        if (opts.kernel) {
+          opts.kernel.dup2(callerPid, srcFd, dstFd);
+        }
+        if (opts.wasiHost) {
+          const ioFds = opts.wasiHost.getIoFds();
+          const target = ioFds.get(srcFd);
+          if (target) ioFds.set(dstFd, target);
+          else if (!opts.kernel) return -1;
+        }
+        return 0;
       } catch { return -1; }
     },
 
@@ -934,11 +953,28 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       await Promise.resolve();
     },
 
-    // host_waitpid_nohang(pid) -> i32
-    // Non-blocking: returns exit code if process exited, -1 if still running.
-    host_waitpid_nohang(pid: number): number {
+    // host_waitpid_nohang(pid, out_ptr?, out_cap?) -> i32
+    // Non-blocking JSON ABI: returns bytes for an exited child, -1 if still running,
+    // and -2 for ECHILD. The legacy one-argument form returns just the exit code.
+    host_waitpid_nohang(pid: number, outPtr?: number, outCap?: number): number {
       if (!opts.kernel) return -1;
-      return opts.kernel.waitpidNohang(pid);
+      if (typeof outPtr !== 'number' || typeof outCap !== 'number') {
+        return opts.kernel.waitpidNohang(pid, callerPid);
+      }
+
+      if (pid <= 0) {
+        const result = opts.kernel.waitAnyChildNohang(callerPid);
+        if (result.state === 'running') return -1;
+        if (result.state === 'none') return -2;
+        return writeJson(memory, outPtr, outCap, {
+          pid: result.pid,
+          exit_code: result.exitCode,
+        });
+      }
+
+      const exitCode = opts.kernel.waitpidNohang(pid, callerPid);
+      if (exitCode < 0) return exitCode;
+      return writeJson(memory, outPtr, outCap, { pid, exit_code: exitCode });
     },
 
     // host_wait_any(out_ptr, out_cap) -> i32 (async/JSPI)
@@ -956,9 +992,14 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // { pid: 0 } if no child is ready yet. pid=-1 means no children exist.
     // Used by waitpid(-1, ..., WNOHANG).
     host_wait_any_nohang(outPtr: number, outCap: number): number {
-      if (!opts.kernel) return writeJson(memory, outPtr, outCap, { pid: 0, exit_code: -1 });
+      if (!opts.kernel) return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
       const result = opts.kernel.waitAnyNohang(callerPid);
-      if (!result) return writeJson(memory, outPtr, outCap, { pid: 0, exit_code: -1 });
+      if (result.state === 'running') {
+        return writeJson(memory, outPtr, outCap, { pid: 0, exit_code: -1 });
+      }
+      if (result.state === 'none') {
+        return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
+      }
       return writeJson(memory, outPtr, outCap, { pid: result.pid, exit_code: result.exitCode });
     },
 

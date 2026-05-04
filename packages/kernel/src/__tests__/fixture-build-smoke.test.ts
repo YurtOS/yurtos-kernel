@@ -73,4 +73,33 @@ describe('source-built fixture smoke tests', () => {
     expect(seq.exitCode).toBe(0);
     expect(seq.stdout).toBe('1\n2\n3\n');
   });
+
+  it('runs BusyBox ash as /usr/bin/sh', async () => {
+    for (const name of ['busybox.wasm', 'busybox.manifest.json']) {
+      expect(existsSync(resolve(FIXTURES, name))).toBe(true);
+    }
+
+    sandbox = await Sandbox.create({ wasmDir: FIXTURES, adapter: new NodeAdapter() });
+
+    const binSh = await sandbox.run('readlink /bin/sh');
+    expect(binSh.exitCode).toBe(0);
+    expect(binSh.stdout.trim()).toBe('/usr/bin/busybox');
+
+    const shell = await sandbox.run("sh -c 'x=3; echo ash:$((x + 2)); echo payload > /tmp/ash.txt'");
+    expect(shell.exitCode).toBe(0);
+    expect(shell.stdout.trim()).toBe('ash:5');
+    expect(new TextDecoder().decode(sandbox.readFile('/tmp/ash.txt')).trim()).toBe('payload');
+
+    const direct = await sandbox.run("busybox ash -c 'printf direct-ash'");
+    expect(direct.exitCode).toBe(0);
+    expect(direct.stdout).toBe('direct-ash');
+
+    const pipeline = await sandbox.run("ash -c 'seq 3 | wc -l'");
+    expect(pipeline.exitCode).toBe(0);
+    expect(pipeline.stdout.trim()).toBe('3');
+
+    const redirected = await sandbox.run("ash -c 'seq 3 > /tmp/seq.out; wc -l /tmp/seq.out'");
+    expect(redirected.exitCode).toBe(0);
+    expect(redirected.stdout.trim()).toBe('3 /tmp/seq.out');
+  });
 });

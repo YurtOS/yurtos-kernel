@@ -28,6 +28,7 @@ export interface WorkerConfig {
   stderrBytes?: number;
   toolAllowlist?: string[];
   memoryBytes?: number;
+  processes?: number;
   bridgeSab?: SharedArrayBuffer;
   networkPolicy?: { allowedHosts?: string[]; blockedHosts?: string[] };
   extensionRegistry?: ExtensionRegistry;
@@ -218,6 +219,7 @@ export class WorkerExecutor {
       stderrBytes: this.config.stderrBytes,
       toolAllowlist: this.config.toolAllowlist,
       memoryBytes: this.config.memoryBytes,
+      processes: this.config.processes,
       bridgeSab: this.config.bridgeSab,
       networkPolicy: this.config.networkPolicy,
       hasExtensions: this.config.extensionRegistry != null,

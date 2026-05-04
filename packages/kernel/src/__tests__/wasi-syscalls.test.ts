@@ -7,11 +7,12 @@
  */
 import { describe, it, afterEach } from '@std/testing/bdd';
 import { expect } from '@std/expect';
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { Sandbox } from '../sandbox.js';
 import { NodeAdapter } from '../platform/node-adapter.js';
 
-const WASM_DIR = resolve(import.meta.dirname, '../platform/__tests__/fixtures');
+const WASM_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../platform/__tests__/fixtures');
 
 describe('WASI syscalls', { sanitizeResources: false, sanitizeOps: false }, () => {
   let sandbox: Sandbox;

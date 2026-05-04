@@ -92,6 +92,55 @@ static int yurt_parse_service(const char *service, int socktype, uint16_t *port_
     return EAI_SERVICE;
 }
 
+#define YURT_ADDRMAP_SIZE 32
+
+static struct {
+    uint32_t addr_be;
+    char host[256];
+} yurt_addrmap[YURT_ADDRMAP_SIZE];
+static int yurt_addrmap_count = 0;
+static int yurt_addrmap_cursor = 0;
+
+static void yurt_addrmap_store(const char *host, uint32_t addr_be) {
+    if (!host || !*host || addr_be == 0) return;
+    struct in_addr numeric;
+    if (inet_pton(AF_INET, host, &numeric) == 1) return;
+    for (int i = 0; i < yurt_addrmap_count; i++) {
+        if (yurt_addrmap[i].addr_be == addr_be &&
+            strcmp(yurt_addrmap[i].host, host) == 0) {
+            return;
+        }
+    }
+    int slot;
+    if (yurt_addrmap_count < YURT_ADDRMAP_SIZE) {
+        slot = yurt_addrmap_count++;
+    } else {
+        slot = yurt_addrmap_cursor;
+        yurt_addrmap_cursor = (yurt_addrmap_cursor + 1) % YURT_ADDRMAP_SIZE;
+    }
+    snprintf(yurt_addrmap[slot].host, sizeof(yurt_addrmap[slot].host), "%s", host);
+    yurt_addrmap[slot].addr_be = addr_be;
+}
+
+static uint32_t yurt_addrmap_lookup_host(const char *host) {
+    if (!host || !*host) return 0;
+    for (int i = 0; i < yurt_addrmap_count; i++) {
+        if (strcmp(yurt_addrmap[i].host, host) == 0) {
+            return yurt_addrmap[i].addr_be;
+        }
+    }
+    return 0;
+}
+
+static const char *yurt_addrmap_lookup_addr(uint32_t addr_be) {
+    for (int i = 0; i < yurt_addrmap_count; i++) {
+        if (yurt_addrmap[i].addr_be == addr_be) {
+            return yurt_addrmap[i].host;
+        }
+    }
+    return NULL;
+}
+
 static int yurt_resolve_ipv4(const char *node, int flags, uint32_t *addr_out) {
     if (!node || !*node) {
         *addr_out = htonl((flags & AI_PASSIVE) ? INADDR_ANY : INADDR_LOOPBACK);
@@ -155,6 +204,7 @@ struct hostent *gethostbyname(const char *name) {
     }
 
     addr = resolved;
+    yurt_addrmap_store(name, addr);
     if (name && *name) {
         size_t n = strlen(name);
         if (n >= sizeof(canon)) n = sizeof(canon) - 1;
@@ -254,6 +304,7 @@ int getaddrinfo(const char *node, const char *service,
     uint32_t addr = 0;
     rc = yurt_resolve_ipv4(node, flags, &addr);
     if (rc != 0) return rc;
+    if (node && *node) yurt_addrmap_store(node, addr);
 
     struct addrinfo *ai = calloc(1, sizeof(*ai));
     struct sockaddr_in *sa = calloc(1, sizeof(*sa));
@@ -312,7 +363,6 @@ int getnameinfo(const struct sockaddr *addr, socklen_t addrlen,
                 char *host, socklen_t hostlen,
                 char *serv, socklen_t servlen, int flags) {
     YURT_MARKER_CALL(getnameinfo);
-    if (flags & NI_NAMEREQD) return EAI_NONAME;
     if (!addr || addrlen < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) {
         return EAI_FAMILY;
     }
@@ -320,10 +370,18 @@ int getnameinfo(const struct sockaddr *addr, socklen_t addrlen,
     const struct sockaddr_in *sa = (const struct sockaddr_in *)addr;
     if (host && hostlen > 0) {
         char tmp[INET_ADDRSTRLEN];
-        if (!inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) return EAI_SYSTEM;
-        size_t n = strlen(tmp) + 1;
+        const char *name = NULL;
+        if (!(flags & NI_NUMERICHOST)) {
+            name = yurt_addrmap_lookup_addr(sa->sin_addr.s_addr);
+        }
+        if (!name) {
+            if (flags & NI_NAMEREQD) return EAI_NONAME;
+            if (!inet_ntop(AF_INET, &sa->sin_addr, tmp, sizeof(tmp))) return EAI_SYSTEM;
+            name = tmp;
+        }
+        size_t n = strlen(name) + 1;
         if (n > hostlen) return EAI_OVERFLOW;
-        memcpy(host, tmp, n);
+        memcpy(host, name, n);
     }
     if (serv && servlen > 0) {
         char tmp[16];
@@ -336,17 +394,24 @@ int getnameinfo(const struct sockaddr *addr, socklen_t addrlen,
 }
 
 /* yurt_netdb_host_for_addr — reverse lookup.
- * Returns NULL; the socket layer falls back to inet_ntop() for the raw IP. */
+ * Returns a prior hostname when getaddrinfo/gethostbyname resolved this
+ * address; the socket layer falls back to inet_ntop() for unmapped raw IPs. */
 #include <stdint.h>
 const char *yurt_netdb_host_for_addr(uint32_t addr_be) {
-    (void)addr_be;
-    return NULL;
+    return yurt_addrmap_lookup_addr(addr_be);
 }
 
 /* yurt_netdb_addr_for_host — forward lookup via host_dns_resolve (JSPI async).
  * Returns the IPv4 address in network byte order, or 0 on failure. */
 uint32_t yurt_netdb_addr_for_host(const char *host) {
     if (!host || !*host) return 0;
+    if (strcmp(host, "localhost") == 0) {
+        uint32_t loopback = htonl(INADDR_LOOPBACK);
+        yurt_addrmap_store(host, loopback);
+        return loopback;
+    }
+    uint32_t cached = yurt_addrmap_lookup_host(host);
+    if (cached != 0) return cached;
     char buf[16]; /* "255.255.255.255\0" */
     int rc = yurt_host_dns_resolve(
         (int)(intptr_t)host, (int)__builtin_strlen(host),
@@ -356,6 +421,7 @@ uint32_t yurt_netdb_addr_for_host(const char *host) {
     buf[rc] = '\0';
     struct in_addr a;
     if (inet_pton(AF_INET, buf, &a) != 1) return 0;
+    yurt_addrmap_store(host, a.s_addr);
     return a.s_addr;
 }
 

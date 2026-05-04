@@ -618,12 +618,12 @@ export class VFS {
 
   mkdir(path: string, mode = 0o755): void {
     const { parent, name } = this.resolveParent(path);
-    this.assertDirectoryMutationPermission(parent);
 
     if (parent.children.has(name)) {
       throw new VfsError('EEXIST', `file exists: ${path}`);
     }
 
+    this.assertDirectoryMutationPermission(parent);
     this.assertFileCountLimit();
     const owner = this.currentOwner();
     parent.children.set(name, createDirInode(normalizeMode(mode), owner.uid, owner.gid));

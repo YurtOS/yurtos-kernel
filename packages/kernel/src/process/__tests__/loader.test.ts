@@ -1,12 +1,18 @@
-import { assert, assertEquals } from "jsr:@std/assert@^1.0.19";
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@^1.0.19";
 import { resolve } from "node:path";
 import { createKernelImports } from "../../host-imports/kernel-imports.ts";
+import type { PlatformAdapter } from "../../platform/adapter.ts";
 import { NodeAdapter } from "../../platform/node-adapter.ts";
 import { VFS } from "../../vfs/vfs.ts";
-import { bufferToString, type FdTarget } from "../../wasi/fd-target.ts";
+import {
+  bufferToString,
+  createBufferTarget,
+  createNullTarget,
+  type FdTarget,
+} from "../../wasi/fd-target.ts";
 import { WasiHost } from "../../wasi/wasi-host.ts";
 import { INIT_PID, ProcessKernel } from "../kernel.ts";
-import { loadProcess } from "../loader.ts";
+import { loadProcess, type LoaderContext } from "../loader.ts";
 import { Sandbox } from "../../sandbox.ts";
 
 const WASM_DIR = resolve(
@@ -14,10 +20,12 @@ const WASM_DIR = resolve(
   "../../platform/__tests__/fixtures",
 );
 
-async function makeLoaderContext() {
+async function makeLoaderContext(
+  options: Partial<LoaderContext> & { maxProcesses?: number } = {},
+): Promise<LoaderContext> {
   const vfs = new VFS();
   const adapter = new NodeAdapter();
-  const kernel = new ProcessKernel();
+  const kernel = new ProcessKernel({ maxProcesses: options.maxProcesses });
   const bytes = await adapter.readBytes(`${WASM_DIR}/true-cmd.wasm`);
 
   vfs.withWriteAccess(() => {
@@ -76,6 +84,16 @@ async function makeLoaderContext() {
       target.truncated = false;
       return { data, truncated };
     },
+    ...options,
+  };
+}
+
+function throwingInstantiateAdapter(base: PlatformAdapter): PlatformAdapter {
+  return {
+    ...base,
+    instantiate: () => {
+      throw new Error("instantiate failed");
+    },
   };
 }
 
@@ -92,6 +110,63 @@ Deno.test("loadProcess instantiates a CLI wasm at a VFS path and returns a Proce
 
   await proc.terminate();
   assertEquals(await ctx.kernel.waitpid(proc.pid), 0);
+});
+
+Deno.test("loadProcess rolls back pid and fd state when instantiation fails", async () => {
+  const ctx = await makeLoaderContext({ maxProcesses: 1 });
+  const adapter = throwingInstantiateAdapter(ctx.adapter);
+
+  await assertRejects(
+    () =>
+      loadProcess({ ...ctx, adapter }, {
+        argv: ["/bin/true"],
+        mode: "cli",
+      }),
+    Error,
+    "instantiate failed",
+  );
+
+  assertEquals(ctx.kernel.getReservedProcessCount(), 0);
+  assertEquals(ctx.kernel.canReserveProcessSlot(), true);
+  assertEquals(ctx.kernel.getFdTarget(2, 0), null);
+});
+
+Deno.test("loadProcess can preserve pre-registered child state when caller owns rollback", async () => {
+  const ctx = await makeLoaderContext();
+  const parentPid = ctx.kernel.allocPid(INIT_PID, "parent");
+  const childPid = ctx.kernel.allocPid(parentPid, "/bin/true");
+  const stderrTarget = createBufferTarget(Infinity);
+  ctx.kernel.registerPending(childPid, "/bin/true", parentPid);
+  ctx.kernel.adoptFdTable(
+    childPid,
+    new Map<number, FdTarget>([
+      [0, createNullTarget()],
+      [1, createBufferTarget(Infinity)],
+      [2, stderrTarget],
+    ]),
+  );
+  const adapter = throwingInstantiateAdapter(ctx.adapter);
+
+  await assertRejects(
+    () =>
+      loadProcess({
+        ...ctx,
+        adapter,
+        allocatePid: () => childPid,
+      }, {
+        argv: ["/bin/true"],
+        mode: "cli",
+        rollbackOnFailure: false,
+      }),
+    Error,
+    "instantiate failed",
+  );
+
+  assertEquals(ctx.kernel.getReservedProcessCount(), 2);
+  assertEquals(ctx.kernel.getFdTarget(childPid, 2), stderrTarget);
+  ctx.kernel.releaseProcess(childPid, 127);
+  assertEquals(await ctx.kernel.waitpid(childPid, parentPid), 127);
+  ctx.kernel.discardProcess(parentPid);
 });
 
 Deno.test("loader-backed resident shell supports Asyncify fallback without JSPI", async () => {

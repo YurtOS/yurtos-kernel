@@ -16,6 +16,21 @@ export const USER_UID = 1000;
 export const USER_GID = 1000;
 export const RLIMIT_NOFILE = 7;
 export const RLIM_INFINITY_U32 = 0xffffffff;
+export const DEFAULT_MAX_PROCESSES = 64;
+
+export class ProcessLimitError extends Error {
+  readonly code = 'EAGAIN';
+  readonly errno = 11;
+
+  constructor(readonly maxProcesses: number) {
+    super(`process limit exceeded: max ${maxProcesses}`);
+    this.name = 'ProcessLimitError';
+  }
+}
+
+export interface ProcessKernelOptions {
+  maxProcesses?: number;
+}
 
 export interface ResourceLimit {
   soft: number;
@@ -72,6 +87,7 @@ interface FileLockState {
 export class ProcessKernel {
   private processTable = new Map<number, ProcessEntry>();
   private nextPid = 2;   // PID 1 is pre-allocated for init
+  private allocatedPids = new Set<number>();
   private parentPids = new Map<number, number>();
   private children = new Map<number, Set<number>>();
   private fdTables = new Map<number, Map<number, FdTarget>>();
@@ -79,8 +95,14 @@ export class ProcessKernel {
   private fileLocks = new Map<string, FileLockState>();
   private ttyTable = new Map<number, TtyState>();
   private nextTtyId = 1;
+  readonly maxProcesses: number;
 
-  constructor() {
+  constructor(options: ProcessKernelOptions = {}) {
+    const maxProcesses = options.maxProcesses ?? DEFAULT_MAX_PROCESSES;
+    if (!Number.isInteger(maxProcesses) || maxProcesses < 1) {
+      throw new Error(`ProcessKernel maxProcesses must be an integer >= 1, got ${maxProcesses}`);
+    }
+    this.maxProcesses = maxProcesses;
     // Pre-create init (PID 1): the system ancestor.  It has no controlling
     // terminal, no WASM instance, and never exits.  All top-level processes
     // become children of PID 1; orphaned children are reparented here.
@@ -100,6 +122,35 @@ export class ProcessKernel {
     this.children.set(INIT_PID, new Set());
     this.fdTables.set(INIT_PID, new Map());
     this.nextFds.set(INIT_PID, KERNEL_FD_BASE);
+  }
+
+  getReservedProcessCount(): number {
+    return this.allocatedPids.size;
+  }
+
+  canReserveProcessSlot(): boolean {
+    return this.allocatedPids.size < this.maxProcesses;
+  }
+
+  private reservePid(pid: number): void {
+    if (pid === INIT_PID || this.allocatedPids.has(pid)) return;
+    if (!this.canReserveProcessSlot()) {
+      throw new ProcessLimitError(this.maxProcesses);
+    }
+    this.allocatedPids.add(pid);
+  }
+
+  private setParentPid(pid: number, ppid: number): void {
+    const previousParent = this.parentPids.get(pid);
+    if (previousParent !== undefined && previousParent !== ppid) {
+      this.children.get(previousParent)?.delete(pid);
+    }
+    this.parentPids.set(pid, ppid);
+    if (pid !== INIT_PID) {
+      let siblings = this.children.get(ppid);
+      if (!siblings) { siblings = new Set(); this.children.set(ppid, siblings); }
+      siblings.add(pid);
+    }
   }
 
   createPipe(callerPid: number): { readFd: number; writeFd: number } {
@@ -340,7 +391,8 @@ export class ProcessKernel {
 
   /** Pre-register a process entry so waitpid can find it before async instantiation completes. */
   registerPending(pid: number, command?: string, ppid: number = INIT_PID): void {
-    this.parentPids.set(pid, ppid);
+    this.reservePid(pid);
+    this.setParentPid(pid, ppid);
     this.initProcess(pid);
     if (!this.processTable.has(pid)) {
       const parentEntry = this.processTable.get(ppid);
@@ -381,6 +433,7 @@ export class ProcessKernel {
   }
 
   registerProcess(pid: number, promise: Promise<void>, wasiHost: WasiHost): void {
+    this.reservePid(pid);
     this.processTable.set(pid, {
       pid, promise, exitCode: -1, state: 'running', wasiHost, waiters: [],
       pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
@@ -398,6 +451,7 @@ export class ProcessKernel {
         entry.state = 'exited';
         entry.exitCode = wasiHost.getExitCode() ?? 0;
         this._reparentChildren(pid);
+        this.cleanupFds(pid);
         for (const waiter of entry.waiters) waiter(entry.exitCode);
         entry.waiters.length = 0;
       }
@@ -406,11 +460,10 @@ export class ProcessKernel {
   }
 
   allocPid(ppid: number = INIT_PID, command?: string): number {
+    while (this.allocatedPids.has(this.nextPid)) this.nextPid++;
+    this.reservePid(this.nextPid);
     const pid = this.nextPid++;
-    this.parentPids.set(pid, ppid);
-    let siblings = this.children.get(ppid);
-    if (!siblings) { siblings = new Set(); this.children.set(ppid, siblings); }
-    siblings.add(pid);
+    this.setParentPid(pid, ppid);
     this.initProcess(pid);
     if (command) this.registerPending(pid, command, ppid);
     return pid;
@@ -420,6 +473,10 @@ export class ProcessKernel {
     // Returns 0 for init itself (ppid=0 is set explicitly in constructor)
     // and for any pid not in the table (bookkeeping-only / host-side entries).
     return this.parentPids.get(pid) ?? NO_PARENT_PID;
+  }
+
+  isChildOf(pid: number, parentPid: number): boolean {
+    return this.parentPids.get(pid) === parentPid;
   }
 
   attachWasiHost(pid: number, wasiHost: WasiHost): void {
@@ -436,9 +493,9 @@ export class ProcessKernel {
   }
 
   releaseProcess(pid: number, exitCode: number): void {
-    this.registerExited(pid, exitCode);
     this._reparentChildren(pid);
     this.cleanupFds(pid);
+    this.registerExited(pid, exitCode);
   }
 
   discardProcess(pid: number): void {
@@ -453,7 +510,8 @@ export class ProcessKernel {
 
   /** Register a process as already exited (used for synchronous spawn). */
   registerExited(pid: number, exitCode: number, ppid?: number): void {
-    if (ppid !== undefined) this.parentPids.set(pid, ppid);
+    this.reservePid(pid);
+    if (ppid !== undefined) this.setParentPid(pid, ppid);
     this.initProcess(pid);
     const existing = this.processTable.get(pid);
     if (existing) {
@@ -478,7 +536,8 @@ export class ProcessKernel {
     }
   }
 
-  async waitpid(pid: number): Promise<number> {
+  async waitpid(pid: number, parentPid?: number): Promise<number> {
+    if (parentPid !== undefined && !this.isChildOf(pid, parentPid)) return -1;
     const entry = this.processTable.get(pid);
     if (!entry) return -1;
     if (entry.state === 'exited') {
@@ -494,9 +553,10 @@ export class ProcessKernel {
     });
   }
 
-  waitpidNohang(pid: number): number {
+  waitpidNohang(pid: number, parentPid?: number): number {
+    if (parentPid !== undefined && !this.isChildOf(pid, parentPid)) return -2;
     const entry = this.processTable.get(pid);
-    if (!entry) return -1;
+    if (!entry) return parentPid === undefined ? -1 : -2;
     if (entry.state === 'exited') {
       const exitCode = entry.exitCode;
       this.reapProcess(pid);
@@ -509,11 +569,12 @@ export class ProcessKernel {
     return this.processTable.has(pid);
   }
 
-  listProcesses(): { pid: number; state: string; exit_code: number; command: string }[] {
-    const result: { pid: number; state: string; exit_code: number; command: string }[] = [];
+  listProcesses(): { pid: number; ppid: number; state: string; exit_code: number; command: string }[] {
+    const result: { pid: number; ppid: number; state: string; exit_code: number; command: string }[] = [];
     for (const [pid, entry] of this.processTable) {
       result.push({
         pid,
+        ppid: this.parentPids.get(pid) ?? 0,
         state: entry.state,
         exit_code: entry.exitCode,
         command: entry.command ?? '',
@@ -547,6 +608,7 @@ export class ProcessKernel {
     if (!srcTarget) throw new Error(`dup2: src fd ${srcFd} not found`);
     // If dst already exists, close it first (decrement pipe refcount)
     const existing = fdTable.get(dstFd);
+    if (existing === srcTarget) return;
     if (existing) {
       this.closeTarget(existing);
     }
@@ -692,6 +754,7 @@ export class ProcessKernel {
       this.children.get(parentPid)?.delete(pid);
     }
     this.processTable.delete(pid);
+    this.allocatedPids.delete(pid);
     this.fdTables.delete(pid);
     this.nextFds.delete(pid);
     this.parentPids.delete(pid);
@@ -716,56 +779,83 @@ export class ProcessKernel {
 
   // ── waitpid(-1) / wait-any ──
 
-  /** Non-blocking: reap the first already-exited child of ppid, or null if none ready. */
-  waitAnyNohang(ppid: number): { pid: number; exitCode: number } | null {
-    const kids = this.children.get(ppid);
-    if (!kids || kids.size === 0) return null;
-    for (const childPid of kids) {
-      const child = this.processTable.get(childPid);
-      if (child?.state === 'exited') {
-        const exitCode = child.exitCode;
-        this.processTable.delete(childPid);
-        this.fdTables.delete(childPid);
-        this.nextFds.delete(childPid);
-        this.parentPids.delete(childPid);
-        this.children.delete(childPid);
-        kids.delete(childPid);
-        return { pid: childPid, exitCode };
-      }
-    }
-    return null;
+  /** Non-blocking: reap the first exited child, or distinguish running children from ECHILD. */
+  waitAnyNohang(ppid: number):
+    | { state: 'exited'; pid: number; exitCode: number }
+    | { state: 'running' }
+    | { state: 'none' } {
+    return this.waitAnyChildNohang(ppid);
   }
 
   /** Async: wait for the first child of ppid to exit and reap it.
    *  Returns { pid: -1 } if there are no children. */
   async waitAny(ppid: number): Promise<{ pid: number; exitCode: number }> {
-    const kids = this.children.get(ppid);
-    if (!kids || kids.size === 0) return { pid: -1, exitCode: -1 };
-    // Check for already-exited children first.
-    const immediate = this.waitAnyNohang(ppid);
-    if (immediate) return immediate;
-    // Register a one-shot waiter on every running child; first to fire wins.
+    const result = await this.waitAnyChild(ppid);
+    return result ?? { pid: -1, exitCode: -1 };
+  }
+
+  async waitAnyChild(parentPid: number): Promise<{ pid: number; exitCode: number } | null> {
+    const exited = this.findExitedChild(parentPid);
+    if (exited) {
+      this.reapProcess(exited.pid);
+      return { pid: exited.pid, exitCode: exited.exitCode };
+    }
+
+    const running = this.findRunningChildren(parentPid);
+    if (running.length === 0) return null;
+
     return new Promise((resolve) => {
-      let resolved = false;
-      for (const childPid of [...kids]) {
-        const child = this.processTable.get(childPid);
-        if (!child || child.state !== 'running') continue;
-        child.waiters.push((exitCode) => {
-          if (resolved) return;
-          resolved = true;
-          this.processTable.delete(childPid);
-          this.fdTables.delete(childPid);
-          this.nextFds.delete(childPid);
-          this.parentPids.delete(childPid);
-          this.children.delete(childPid);
-          kids.delete(childPid);
-          resolve({ pid: childPid, exitCode });
+      let settled = false;
+      const settle = (result: { pid: number; exitCode: number } | null) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+      for (const [pid, entry] of running) {
+        entry.waiters.push((exitCode) => {
+          if (settled) return;
+          if (!this.processTable.has(pid)) {
+            // Another waiter may have reaped the entry first. The exit event
+            // still belongs to this waiter; resolve it instead of hanging.
+            settle({ pid, exitCode });
+            return;
+          }
+          this.reapProcess(pid);
+          settle({ pid, exitCode });
         });
       }
-      // If every child was already exited between our scan and here (impossible
-      // in single-threaded JS, but guard anyway), resolve with ECHILD.
-      if (!resolved) resolve({ pid: -1, exitCode: -1 });
     });
+  }
+
+  waitAnyChildNohang(parentPid: number):
+    | { state: 'exited'; pid: number; exitCode: number }
+    | { state: 'running' }
+    | { state: 'none' } {
+    const exited = this.findExitedChild(parentPid);
+    if (exited) {
+      this.reapProcess(exited.pid);
+      return { state: 'exited', pid: exited.pid, exitCode: exited.exitCode };
+    }
+    return this.findRunningChildren(parentPid).length > 0
+      ? { state: 'running' }
+      : { state: 'none' };
+  }
+
+  private findExitedChild(parentPid: number): { pid: number; exitCode: number } | null {
+    for (const [pid, entry] of this.processTable) {
+      if (this.parentPids.get(pid) !== parentPid) continue;
+      if (entry.state === 'exited') return { pid, exitCode: entry.exitCode };
+    }
+    return null;
+  }
+
+  private findRunningChildren(parentPid: number): Array<[number, ProcessEntry]> {
+    const result: Array<[number, ProcessEntry]> = [];
+    for (const [pid, entry] of this.processTable) {
+      if (this.parentPids.get(pid) !== parentPid) continue;
+      if (entry.state !== 'exited') result.push([pid, entry]);
+    }
+    return result;
   }
 
   // ── TTY ──
@@ -862,6 +952,7 @@ export class ProcessKernel {
     }
     this.fdTables.clear();
     this.processTable.clear();
+    this.allocatedPids.clear();
     this.parentPids.clear();
     this.fileLocks.clear();
     this.ttyTable.clear();

@@ -62,6 +62,12 @@ export interface LoadProcessOptions {
     memory: WebAssembly.Memory,
     wasiHost: WasiHost,
   ) => Record<string, WebAssembly.ImportValue>;
+  /**
+   * True when loadProcess owns the PID reservation. Async host_spawn callers
+   * return the child PID before this promise settles, so they keep ownership
+   * and release/register the child in their catch path.
+   */
+  rollbackOnFailure?: boolean;
 }
 
 export async function loadProcess(
@@ -95,7 +101,11 @@ export async function loadProcess(
   }
   const env = opts.env ?? {};
   const cwd = opts.cwd ?? "/";
+  const rollbackOnFailure = opts.rollbackOnFailure ?? true;
   const pid = ctx.allocatePid(argv);
+  const rollback = () => {
+    if (rollbackOnFailure) ctx.kernel.discardProcess(pid);
+  };
 
   ctx.kernel.initProcess(pid);
   ctx.kernel.setCwd(pid, cwd);
@@ -162,10 +172,16 @@ export async function loadProcess(
     asyncifyBridge,
   );
 
-  const instance = await ctx.adapter.instantiate(module, {
-    wasi_snapshot_preview1: wasiImports,
-    yurt: yurtImports,
-  });
+  let instance: WebAssembly.Instance;
+  try {
+    instance = await ctx.adapter.instantiate(module, {
+      wasi_snapshot_preview1: wasiImports,
+      yurt: yurtImports,
+    });
+  } catch (e) {
+    rollback();
+    throw e;
+  }
   const table = instance.exports.__indirect_function_table;
   if (table instanceof WebAssembly.Table) {
     const promising =
@@ -179,6 +195,7 @@ export async function loadProcess(
 
   memoryRef = instance.exports.memory as WebAssembly.Memory;
   if (opts.memoryBytes !== undefined && memoryRef.buffer.byteLength > opts.memoryBytes) {
+    rollback();
     throw new Error(`memory limit exceeded: ${memoryRef.buffer.byteLength} > ${opts.memoryBytes}`);
   }
   proc.__setMemory(memoryRef);
@@ -191,9 +208,15 @@ export async function loadProcess(
     );
   });
 
-  const asyncifyInitialized = asyncifyBridge
-    ? initAsyncifyBridge(asyncifyBridge, instance)
-    : false;
+  let asyncifyInitialized: boolean;
+  try {
+    asyncifyInitialized = asyncifyBridge
+      ? initAsyncifyBridge(asyncifyBridge, instance)
+      : false;
+  } catch (e) {
+    rollback();
+    throw e;
+  }
   // Async pipe reads are a suspension capability, not a setjmp feature:
   // JSPI supports them for every module; non-JSPI runtimes need the current
   // module to be Asyncify-instrumented.
@@ -210,6 +233,7 @@ export async function loadProcess(
   ): number => {
     if (!asyncifyBridge || !asyncifyInitialized) return -38; // ENOSYS
     if (memoryRef?.buffer instanceof SharedArrayBuffer) return -11; // EAGAIN
+    if (!ctx.kernel.canReserveProcessSlot()) return -11; // EAGAIN
 
     const childPid = ctx.kernel.allocPid(parentPid, path);
     const childFdTable = ctx.kernel.buildFdTableForFork(parentPid);
@@ -330,6 +354,7 @@ export async function loadProcess(
   try {
     exitCode = await wasi.startAsync(instance, startFn);
   } catch (e) {
+    rollback();
     const stderr = proc.fdReadAndClear(2).data.trimEnd();
     if (stderr) {
       const message = e instanceof Error ? e.message : String(e);

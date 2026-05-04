@@ -311,6 +311,45 @@ static int case_priority_unsupported(void) {
   return 0;
 }
 
+static int case_fcntl_pipe_status_flags(void) {
+  int fds[2];
+  if (pipe(fds) != 0) {
+    emit("fcntl_pipe_status_flags", 1, "fcntl_pipe_status_flags:pipe_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  int flags = fcntl(fds[0], F_GETFL);
+  if (flags < 0) {
+    int e = errno;
+    close(fds[0]);
+    close(fds[1]);
+    emit("fcntl_pipe_status_flags", 1, "fcntl_pipe_status_flags:getfl_failed", 1, e);
+    return 1;
+  }
+
+  errno = 0;
+  if (fcntl(fds[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+    int e = errno;
+    close(fds[0]);
+    close(fds[1]);
+    emit("fcntl_pipe_status_flags", 1, "fcntl_pipe_status_flags:setfl_failed", 1, e);
+    return 1;
+  }
+
+  errno = 0;
+  int updated = fcntl(fds[0], F_GETFL);
+  close(fds[0]);
+  close(fds[1]);
+  if (updated < 0 || (updated & O_NONBLOCK) == 0) {
+    emit("fcntl_pipe_status_flags", 1, "fcntl_pipe_status_flags:nonblock_missing", updated < 0, errno);
+    return 1;
+  }
+
+  emit("fcntl_pipe_status_flags", 0, "fcntl_pipe_status_flags:ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "hostname") == 0) return case_hostname();
   if (strcmp(name, "hostname_too_small") == 0) return case_hostname_too_small();
@@ -325,6 +364,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "identity_kernel") == 0) return case_identity_kernel();
   if (strcmp(name, "cwd_backend") == 0) return case_cwd_backend();
   if (strcmp(name, "priority_unsupported") == 0) return case_priority_unsupported();
+  if (strcmp(name, "fcntl_pipe_status_flags") == 0) return case_fcntl_pipe_status_flags();
   fprintf(stderr, "posix-runtime-canary: unknown case %s\n", name);
   return 2;
 }
@@ -343,6 +383,7 @@ static int list_cases(void) {
   puts("identity_kernel");
   puts("cwd_backend");
   puts("priority_unsupported");
+  puts("fcntl_pipe_status_flags");
   return 0;
 }
 

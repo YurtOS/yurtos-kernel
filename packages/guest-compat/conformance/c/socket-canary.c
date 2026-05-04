@@ -41,6 +41,18 @@ int main(void) {
     freeaddrinfo(res);
     return 1;
   }
+  {
+    char host_buf[NI_MAXHOST];
+    char serv_buf[NI_MAXSERV];
+    if (getnameinfo(res->ai_addr, res->ai_addrlen,
+                    host_buf, sizeof(host_buf), serv_buf, sizeof(serv_buf), 0) != 0 ||
+        strcmp(host_buf, "localhost") != 0 ||
+        strcmp(serv_buf, "80") != 0) {
+      emit("getnameinfo_hostname_mapping", 1);
+      freeaddrinfo(res);
+      return 1;
+    }
+  }
 
   struct hostent *host = gethostbyname("localhost");
   if (!host || host->h_addrtype != AF_INET || host->h_length != 4 ||

@@ -19,6 +19,7 @@ import { createBufferTarget, createStaticTarget, createNullTarget, createVfsFile
 import {
   WASI_EBADF,
   WASI_EAGAIN,
+  WASI_EEXIST,
   WASI_EIO,
   WASI_EINVAL,
   WASI_ENOSYS,
@@ -508,8 +509,8 @@ export class WasiHost {
         fd_fdstat_set_flags: this.fdFdstatSetFlags.bind(this),
         fd_fdstat_set_rights: this.fdNoOp.bind(this),
         fd_filestat_set_size: this.fdFilestatSetSize.bind(this),
-        fd_filestat_set_times: this.fdNoOp.bind(this),
-        path_filestat_set_times: this.fdNoOp.bind(this),
+        fd_filestat_set_times: this.fdFilestatSetTimes.bind(this),
+        path_filestat_set_times: this.pathFilestatSetTimes.bind(this),
         fd_pread: this.fdPread.bind(this),
         fd_pwrite: this.fdPwrite.bind(this),
         // Stubs that must remain ENOSYS (masking bugs or unimplemented semantics)
@@ -557,11 +558,11 @@ export class WasiHost {
     }
 
     if (dirPath !== '/') {
-      return joinVfsPath(dirPath, relativePath);
+      return this.resolveProcSelf(joinVfsPath(dirPath, relativePath));
     }
     const cwd = this.currentCwd();
     if (cwd === '/' || relativePath.startsWith('/')) {
-      return joinVfsPath('/', relativePath);
+      return this.resolveProcSelf(joinVfsPath('/', relativePath));
     }
     if (relativePath === '' || relativePath === '.') {
       return cwd;
@@ -572,7 +573,13 @@ export class WasiHost {
     if (this.pathExists(cwdCandidate)) return cwdCandidate;
     if (this.pathExists(rootCandidate)) return rootCandidate;
     if (this.pathExists(parentPath(cwdCandidate))) return cwdCandidate;
-    return rootCandidate;
+    return this.resolveProcSelf(rootCandidate);
+  }
+
+  private resolveProcSelf(path: string): string {
+    if (path === '/proc/self') return `/proc/${this.pid}`;
+    if (path.startsWith('/proc/self/')) return `/proc/${this.pid}${path.slice('/proc/self'.length)}`;
+    return path;
   }
 
   private pathExists(path: string): boolean {
@@ -1371,6 +1378,7 @@ export class WasiHost {
     try {
       const relativePath = this.readString(pathPtr, pathLen);
       const absPath = this.resolvePath(dirFd, relativePath);
+      if (absPath === '/') return WASI_EEXIST;
       this.vfs.mkdir(absPath, this.creationMode(0o777));
       return WASI_ESUCCESS;
     } catch (err) {
@@ -1490,6 +1498,15 @@ export class WasiHost {
     try {
       const relativePath = this.readString(pathPtr, pathLen);
       const absPath = this.resolvePath(dirFd, relativePath);
+      if (absPath === `/proc/${this.pid}`) {
+        const encoded = this.encoder.encode(String(this.pid));
+        const bytes = this.getBytes();
+        const view = this.getView();
+        const written = Math.min(encoded.length, bufLen);
+        bytes.set(encoded.subarray(0, written), bufPtr);
+        view.setUint32(bufUsedPtr, written, true);
+        return WASI_ESUCCESS;
+      }
       const target = this.vfs.readlink(absPath);
       const encoded = this.encoder.encode(target);
       const bytes = this.getBytes();
@@ -1608,6 +1625,36 @@ export class WasiHost {
     }
   }
 
+  private fdFilestatSetTimes(fd: number): number {
+    this.checkDeadline();
+    try {
+      if (this.dirFds.has(fd)) return WASI_ESUCCESS;
+      return this.fdTable.isOpen(fd) ? WASI_ESUCCESS : WASI_EBADF;
+    } catch (err) {
+      return fdErrorToWasi(err);
+    }
+  }
+
+  private pathFilestatSetTimes(
+    dirFd: number,
+    _flags: number,
+    pathPtr: number,
+    pathLen: number,
+  ): number {
+    this.checkDeadline();
+    try {
+      const relativePath = this.readString(pathPtr, pathLen);
+      const absPath = this.resolvePath(dirFd, relativePath);
+      this.vfs.stat(absPath);
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
   private clockResGet(clockId: number, resPtr: number): number {
     const view = this.getView();
     switch (clockId) {
@@ -1621,8 +1668,36 @@ export class WasiHost {
     }
   }
 
-  private pathLink(): number {
-    return WASI_ENOTSUP;
+  /**
+   * path_link — POSIX hard link via VFS.link(). Both paths are resolved
+   * against their WASI directory fds; authorization stays in the VFS.
+   */
+  private pathLink(
+    oldDirFd: number,
+    _oldFlags: number,
+    oldPathPtr: number,
+    oldPathLen: number,
+    newDirFd: number,
+    newPathPtr: number,
+    newPathLen: number,
+  ): number {
+    this.checkDeadline();
+    try {
+      const oldRelative = this.readString(oldPathPtr, oldPathLen);
+      const newRelative = this.readString(newPathPtr, newPathLen);
+      const oldAbs = this.resolvePath(oldDirFd, oldRelative);
+      const newAbs = this.resolvePath(newDirFd, newRelative);
+      if (typeof this.vfs.link !== 'function') {
+        return WASI_ENOTSUP;
+      }
+      this.vfs.link(oldAbs, newAbs);
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
   }
 
   private sockShutdown(fd: number, flags: number): number {
@@ -1660,14 +1735,17 @@ export class WasiHost {
   private fdRenumber(fromFd: number, toFd: number): number {
     const ioTarget = this.ioFds.get(fromFd);
     if (ioTarget) {
-      this.ioFds.set(toFd, ioTarget);
+      if (fromFd === toFd) return WASI_ESUCCESS;
       if (this.kernel && this.pid !== undefined) {
         try {
           this.kernel.dup2(this.pid, fromFd, toFd);
+          this.kernel.closeFd(this.pid, fromFd);
         } catch {
           // The local ioFds map is authoritative for this WasiHost.
         }
       }
+      this.ioFds.delete(fromFd);
+      this.ioFds.set(toFd, ioTarget);
       return WASI_ESUCCESS;
     }
 

@@ -126,13 +126,11 @@ int yurt_host_spawn(int req_ptr, int req_len);
 __attribute__((import_module("yurt"), import_name("host_waitpid")))
 int yurt_host_waitpid(int pid, int out_ptr, int out_cap);
 
-/* host_waitpid_nohang is the synchronous non-blocking variant —
- * returns the child's exit code if the process has already exited,
- * or -1 if it's still running.  Used internally by guest-side
- * helpers; not a real waitpid(WNOHANG) replacement because it
- * doesn't unblock signal-style notifications. */
+/* host_waitpid_nohang is the synchronous non-blocking variant.
+ * It writes {"pid":N,"exit_code":M} and returns the byte count when
+ * a child was reaped, -1 when no child has exited, and -2 for ECHILD. */
 __attribute__((import_module("yurt"), import_name("host_waitpid_nohang")))
-int yurt_host_waitpid_nohang(int pid);
+int yurt_host_waitpid_nohang(int pid, int out_ptr, int out_cap);
 
 /* host_wait_any writes { pid, exit_code } JSON into the output buffer and
  * suspends (JSPI) until a child exits.  Returns bytes written or -1.

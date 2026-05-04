@@ -13,14 +13,18 @@
 #include "yurt_runtime.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <wasi/libc.h>
+#include <wasi/libc-nocwd.h>
 
 YURT_DECLARE_MARKER(chown);
 YURT_DECLARE_MARKER(lchown);
@@ -43,6 +47,35 @@ YURT_DEFINE_MARKER(setpriority, 0x73707269u) /* "spri" */
  * to define it here too but that produces a duplicate-symbol link
  * error.  The wasi-emulated impl zero-fills the rusage struct,
  * which is what we want anyway. */
+
+static int yurt_apply_stat_permissions(int rc, struct stat *buf) {
+  if (rc != 0 || !buf) return rc;
+
+  /* WASI Preview 1 filestat has file type but no POSIX permission mode.
+   * The Yurt host writes VFS permission bits into filestat.dev; translate
+   * that side channel back into st_mode while preserving the file type.
+   */
+  buf->st_mode = (buf->st_mode & S_IFMT) | ((mode_t)buf->st_dev & 07777);
+  return rc;
+}
+
+int stat(const char *restrict path, struct stat *restrict buf) {
+  return yurt_apply_stat_permissions(__wasilibc_stat(path, buf, 0), buf);
+}
+
+int lstat(const char *restrict path, struct stat *restrict buf) {
+  return yurt_apply_stat_permissions(
+    __wasilibc_stat(path, buf, AT_SYMLINK_NOFOLLOW),
+    buf
+  );
+}
+
+int fstatat(int fd, const char *restrict path, struct stat *restrict buf, int flags) {
+  int rc = fd == AT_FDCWD
+    ? __wasilibc_stat(path, buf, flags)
+    : __wasilibc_nocwd_fstatat(fd, path, buf, flags);
+  return yurt_apply_stat_permissions(rc, buf);
+}
 
 int chown(const char *path, uid_t owner, gid_t group) {
   YURT_MARKER_CALL(chown);

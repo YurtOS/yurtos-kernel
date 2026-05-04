@@ -22,11 +22,11 @@
 - Modify: `packages/kernel/src/vfs/vfs-like.ts`
 - Modify: `packages/kernel/src/vfs/inode.ts`
 
-- [ ] Import Codepod root-provider and overlay sources.
-- [ ] Rename Codepod-specific identifiers to Yurt.
-- [ ] Adapt `FsCredential`/`StatResult` to Yurt's current inode types.
-- [ ] Run: `/Users/sunny/.deno/bin/deno test --no-check --allow-read --allow-write --allow-env packages/kernel/src/vfs/__tests__/overlay-vfs.test.ts packages/kernel/src/vfs/__tests__/root-provider.test.ts`
-- [ ] Commit: `feat(vfs): add overlay root filesystem`
+- [x] Import Codepod root-provider and overlay sources.
+- [x] Rename Codepod-specific identifiers to Yurt.
+- [x] Adapt `FsCredential`/`StatResult` to Yurt's current inode types.
+- [x] Run: `/Users/sunny/.deno/bin/deno test --no-check --allow-read --allow-write --allow-env packages/kernel/src/vfs/__tests__/overlay-vfs.test.ts packages/kernel/src/vfs/__tests__/root-provider.test.ts`
+- [x] Commit: `feat(vfs): add overlay root filesystem`
 
 ### Task 2: Persistence Support
 
@@ -35,11 +35,11 @@
 - Modify: `packages/kernel/src/persistence/types.ts`
 - Test: `packages/kernel/src/vfs/__tests__/overlay-vfs.test.ts`
 
-- [ ] Extend exported state with overlay metadata `{ baseId, whiteouts }`.
-- [ ] Restore overlay state only when the VFS supports overlay import.
-- [ ] Reject mismatched base ids.
-- [ ] Run overlay persistence tests.
-- [ ] Commit: `feat(vfs): persist overlay upper state`
+- [x] Extend exported state with overlay metadata `{ baseId, whiteouts }`.
+- [x] Restore overlay state only when the VFS supports overlay import.
+- [x] Reject mismatched base ids.
+- [x] Run overlay persistence tests.
+- [x] Commit: `feat(vfs): persist overlay upper state`
 
 ### Task 3: Sandbox Base Root Integration
 
@@ -48,12 +48,12 @@
 - Modify: `packages/kernel/src/index.ts`
 - Create or modify: `packages/kernel/src/__tests__/sandbox-base-root.test.ts`
 
-- [ ] Add `SandboxOptions.baseRoot`.
-- [ ] Build `NodeDirectoryRootProvider` from the base root path and manifest metadata.
-- [ ] Register base-root tools from manifest without mutating the base.
-- [ ] Ensure fork reuses the same base and clones only upper state.
-- [ ] Run sandbox base-root tests.
-- [ ] Commit: `feat(kernel): boot sandbox from read-only base root`
+- [x] Add `SandboxOptions.baseRoot`.
+- [x] Build `NodeDirectoryRootProvider` from the base root path and manifest metadata.
+- [x] Register base-root tools from manifest without mutating the base.
+- [x] Ensure fork reuses the same base and clones only upper state.
+- [x] Run sandbox base-root tests.
+- [x] Commit: `feat(kernel): boot sandbox from read-only base root`
 
 ### Task 4: Security And Regression Coverage
 
@@ -62,8 +62,8 @@
 - Modify: `packages/kernel/src/vfs/__tests__/vfs.test.ts`
 - Modify: `.github/workflows/guest-compat.yml`
 
-- [ ] Add root-owned base shadowing denial tests for `/bin` and `/etc`.
-- [ ] Add rename/unlink/chmod/chown overlay permission regressions.
-- [ ] Add base-root tests to CI.
-- [ ] Run VFS, sandbox base-root, fixture smoke, module cache, and adversarial tests.
-- [ ] Commit: `test(vfs): cover overlay base root security`
+- [x] Add root-owned base shadowing denial tests for `/bin` and `/etc`.
+- [x] Add rename/unlink/chmod/chown overlay permission regressions.
+- [x] Add base-root tests to CI.
+- [x] Run VFS, sandbox base-root, fixture smoke, module cache, and adversarial tests.
+- [x] Commit: `test(vfs): cover overlay base root security`

@@ -2,7 +2,7 @@
   "name": "busybox",
   "multicall": {
     "applets": [
-      "arch", "awk", "base32", "base64", "basename",
+      "arch", "ash", "awk", "base32", "base64", "basename",
       "bc", "cal", "cat", "chgrp", "chown",
       "cksum", "cmp", "comm", "cp", "cut",
       "dc", "dd", "df", "diff", "dirname",
@@ -14,7 +14,7 @@
       "nice", "nl", "nohup", "nproc", "od",
       "paste", "patch", "printenv", "printf", "readlink",
       "realpath", "rev", "rm", "rmdir", "sed",
-      "seq", "sha1sum", "sha256sum", "sha512sum", "shuf",
+      "seq", "sh", "sha1sum", "sha256sum", "sha512sum", "shuf",
       "sleep", "sort", "split", "stat", "strings",
       "sum", "tac", "tail", "tar", "tee",
       "timeout", "touch", "tr", "tree", "true",

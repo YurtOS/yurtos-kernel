@@ -303,6 +303,20 @@ describe('Guest compatibility canaries', () => {
         '{"case":"sendfile_bad_fd","exit":0,"stdout":"sendfile_bad_fd:-1","errno":8}',
       );
     });
+
+    it('preserves fcntl status flags on pipe descriptors', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run('posix-runtime-canary --case fcntl_pipe_status_flags');
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"fcntl_pipe_status_flags","exit":0,"stdout":"fcntl_pipe_status_flags:ok"}',
+      );
+    });
   });
 
   it('exposes the narrow signal compatibility header surface', async () => {
