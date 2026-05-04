@@ -216,6 +216,11 @@ int yurt_host_socket_close(int req_ptr, int req_len);
 __attribute__((import_module("yurt"), import_name("host_dns_resolve")))
 int yurt_host_dns_resolve(int host_ptr, int host_len, int out_ptr, int out_cap);
 
+/* host_get_local_addr writes the sandbox-local IPv4 address string
+ * (for example "10.0.2.15") to [out_ptr, out_cap). */
+__attribute__((import_module("yurt"), import_name("host_get_local_addr")))
+int yurt_host_get_local_addr(int out_ptr, int out_cap);
+
 const char *yurt_netdb_host_for_addr(uint32_t addr_be);
 uint32_t yurt_netdb_addr_for_host(const char *host);
 

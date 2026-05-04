@@ -1115,6 +1115,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(addr));
     },
 
+    // host_get_local_addr(out_ptr, out_cap) -> i32
+    // Writes the kernel-configured sandbox local IPv4 address to out_ptr.
+    host_get_local_addr(outPtr: number, outCap: number): number {
+      return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(socketLocalHost));
+    },
+
     // ── Sockets (full mode only) ──
 
     // host_socket_open(domain, type, protocol) -> fd

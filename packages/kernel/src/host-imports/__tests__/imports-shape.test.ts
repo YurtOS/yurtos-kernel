@@ -247,6 +247,21 @@ Deno.test("kernel host_waitpid_nohang returns ECHILD for wait-any when no childr
   kernel.dispose();
 });
 
+Deno.test("kernel host_get_local_addr reports configured sandbox address", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const imports = createKernelImports({
+    memory,
+    socketLocalHost: "10.8.0.42",
+  });
+
+  const written = (imports.host_get_local_addr as (outPtr: number, outCap: number) => number)(
+    4096,
+    1024,
+  );
+
+  assertEquals(readString(memory, 4096, written), "10.8.0.42");
+});
+
 Deno.test("host_chmod allows the file owner and denies non-owners", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const vfs = new VFS({ uid: 1000, gid: 1000 });

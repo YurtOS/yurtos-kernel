@@ -88,6 +88,7 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_tiocsctty",
   // DNS
   "host_dns_resolve",
+  "host_get_local_addr",
 ];
 
 Deno.test("kernel-imports baseline export names", () => {
