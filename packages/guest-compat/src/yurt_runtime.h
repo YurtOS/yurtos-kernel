@@ -56,6 +56,15 @@ int yurt_host_setresuid(int ruid, int euid, int suid);
 __attribute__((import_module("yurt"), import_name("host_setresgid")))
 int yurt_host_setresgid(int rgid, int egid, int sgid);
 
+__attribute__((import_module("yurt"), import_name("host_getcwd")))
+int yurt_host_getcwd(int out_ptr, int out_cap);
+
+__attribute__((import_module("yurt"), import_name("host_chdir")))
+int yurt_host_chdir(int path_ptr, int path_len);
+
+__attribute__((import_module("yurt"), import_name("host_fchdir")))
+int yurt_host_fchdir(int fd);
+
 /* host_kill returns 0 on success, -1 with kill(2)-style ESRCH (no such
  * process) on failure.  sig=0 is the existence probe (no signal sent). */
 __attribute__((import_module("yurt"), import_name("host_kill")))

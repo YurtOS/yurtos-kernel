@@ -789,7 +789,7 @@ export class Sandbox {
           deadlineMs: getDeadlineMs?.(),
         });
       },
-      buildKernelImports: (pid, memory, _wasi, threadsBackend) => {
+      buildKernelImports: (pid, memory, _wasiHost, threadsBackend) => {
         const kernelImports = createKernelImports({
           memory,
           callerPid: pid,
@@ -829,6 +829,8 @@ export class Sandbox {
           },
           spawnProcess: (req, fdTable) => {
             const childPid = kernel.allocPid(pid, req.prog);
+            const childCwd = req.cwd || kernel.getCwd(pid);
+            kernel.setCwd(childPid, childCwd);
             kernel.registerPending(childPid, req.prog);
             kernel.adoptFdTable(childPid, fdTable);
             const commandName = req.prog.includes('/')
@@ -848,7 +850,7 @@ export class Sandbox {
               argv,
               mode: 'cli',
               env: Object.fromEntries(req.env),
-              cwd: req.cwd || '/',
+              cwd: childCwd,
               memoryBytes,
               stdoutLimit,
               stderrLimit,

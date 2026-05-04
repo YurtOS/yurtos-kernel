@@ -167,3 +167,40 @@ Deno.test("root process can change effective credentials for future authorizatio
   assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777), -2);
   assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
 });
+
+Deno.test("host_chdir stores cwd in kernel process state and validates directories", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.mkdir("/tmp/cwd-target");
+  vfs.writeFile("/tmp/not-a-dir.txt", new Uint8Array(0));
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  const imports = createKernelImports({ memory, vfs, kernel, callerPid: pid });
+
+  const dirLen = writeString(memory, 0, "/tmp/cwd-target");
+  assertEquals((imports.host_chdir as (...args: number[]) => number)(0, dirLen), 0);
+  assertEquals(kernel.getCwd(pid), "/tmp/cwd-target");
+
+  const childPid = kernel.allocPid(pid, "child");
+  assertEquals(kernel.getCwd(childPid), "/tmp/cwd-target");
+
+  const fileLen = writeString(memory, 64, "/tmp/not-a-dir.txt");
+  assertEquals((imports.host_chdir as (...args: number[]) => number)(64, fileLen), -4);
+  assertEquals(kernel.getCwd(pid), "/tmp/cwd-target");
+
+  const missingLen = writeString(memory, 128, "/tmp/missing-dir");
+  assertEquals((imports.host_chdir as (...args: number[]) => number)(128, missingLen), -1);
+});
+
+Deno.test("host_getcwd writes the caller cwd and reports required size", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  kernel.setCwd(pid, "/tmp/work");
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals((imports.host_getcwd as (...args: number[]) => number)(0, 5), 10);
+  assertEquals((imports.host_getcwd as (...args: number[]) => number)(0, 32), 10);
+  assertEquals(new TextDecoder().decode(new Uint8Array(memory.buffer, 0, 9)), "/tmp/work");
+  assertEquals(new Uint8Array(memory.buffer)[9], 0);
+});

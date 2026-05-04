@@ -247,14 +247,16 @@ class WorkerResidentRunner {
           kernel,
           pid,
         }),
-      buildKernelImports: (pid, memory) =>
+      buildKernelImports: (pid, memory, _wasiHost, threadsBackend) =>
         createKernelImports({
           memory,
           callerPid: pid,
           kernel,
+          vfs,
           networkBridge: this.networkBridge,
           extensionHandler: this.extensionHandler,
           nativeModules: mgr.nativeModules,
+          threadsBackend,
           runCommand: async (cmd, stdin) => {
             const result = await this.runInFreshBootProcess(
               cmd,
@@ -264,6 +266,8 @@ class WorkerResidentRunner {
           },
           spawnProcess: (req, fdTable) => {
             const childPid = kernel.allocPid(pid, req.prog);
+            const childCwd = req.cwd || kernel.getCwd(pid);
+            kernel.setCwd(childPid, childCwd);
             kernel.registerPending(childPid, req.prog);
             kernel.adoptFdTable(childPid, fdTable);
             const argv = argvForSpawn(req);
@@ -272,7 +276,7 @@ class WorkerResidentRunner {
               argv,
               mode: 'cli',
               env: Object.fromEntries(req.env),
-              cwd: req.cwd || '/',
+              cwd: childCwd,
               stdoutLimit: this.stdoutLimit,
               stderrLimit: this.stderrLimit,
             }).then(async (proc) => {

@@ -15,7 +15,7 @@ import type { InodeType } from '../vfs/inode.js';
 import type { VfsLike } from '../vfs/vfs-like.js';
 import { fdErrorToWasi, vfsErrnoToWasi } from './errors.js';
 import type { FdTarget } from './fd-target.js';
-import { createBufferTarget, createStaticTarget, createNullTarget, createVfsFileTarget, bufferToString } from './fd-target.js';
+import { createBufferTarget, createStaticTarget, createNullTarget, createVfsFileTarget, createVfsDirTarget, bufferToString } from './fd-target.js';
 import {
   WASI_EBADF,
   WASI_EAGAIN,
@@ -249,6 +249,9 @@ export class WasiHost {
         const fd = this.fdTable.open(sentinelPath, 'r');
         this.preopens.push({ vfsPath, label, fd });
         this.dirFds.set(fd, vfsPath);
+        if (this.kernel && this.pid !== undefined) {
+          this.kernel.setFdTarget(this.pid, fd, createVfsDirTarget(vfsPath));
+        }
       }
 
       this.vfs.unlink(sentinelPath);
@@ -257,6 +260,18 @@ export class WasiHost {
 
   setMemory(memory: WebAssembly.Memory): void {
     this.memory = memory;
+  }
+
+  getCwd(): string {
+    return this.cwd;
+  }
+
+  setCwd(cwd: string): void {
+    this.cwd = normalizeVfsPath(cwd);
+  }
+
+  getDirectoryFdPath(fd: number): string | null {
+    return this.dirFds.get(fd) ?? null;
   }
 
   getStdout(): string {
@@ -479,14 +494,15 @@ export class WasiHost {
     if (dirPath !== '/') {
       return joinVfsPath(dirPath, relativePath);
     }
-    if (this.cwd === '/' || relativePath.startsWith('/')) {
+    const cwd = this.currentCwd();
+    if (cwd === '/' || relativePath.startsWith('/')) {
       return joinVfsPath('/', relativePath);
     }
     if (relativePath === '' || relativePath === '.') {
-      return this.cwd;
+      return cwd;
     }
 
-    const cwdCandidate = joinVfsPath(this.cwd, relativePath);
+    const cwdCandidate = joinVfsPath(cwd, relativePath);
     const rootCandidate = joinVfsPath('/', relativePath);
     if (this.pathExists(cwdCandidate)) return cwdCandidate;
     if (this.pathExists(rootCandidate)) return rootCandidate;
@@ -501,6 +517,10 @@ export class WasiHost {
     } catch {
       return false;
     }
+  }
+
+  private currentCwd(): string {
+    return this.kernel && this.pid !== undefined ? this.kernel.getCwd(this.pid) : this.cwd;
   }
 
   // ---- Syscall implementations ----
@@ -932,6 +952,15 @@ export class WasiHost {
       const target = this.kernel.getFdTarget(this.pid, fd);
       if (target?.type === 'vfs_file') {
         try {
+          return this.kernel.closeFd(this.pid, fd) ? WASI_ESUCCESS : WASI_EBADF;
+        } catch (err) {
+          return fdErrorToWasi(err);
+        }
+      }
+      if (target?.type === 'vfs_dir') {
+        this.dirFds.delete(fd);
+        try {
+          if (this.fdTable.isOpen(fd)) this.fdTable.close(fd);
           return this.kernel.closeFd(this.pid, fd) ? WASI_ESUCCESS : WASI_EBADF;
         } catch (err) {
           return fdErrorToWasi(err);
@@ -1817,6 +1846,9 @@ export class WasiHost {
     // Simpler: just use a counter that we maintain.
     const fd = this.nextDirFd();
     this.dirFds.set(fd, absPath);
+    if (this.kernel && this.pid !== undefined) {
+      this.kernel.setFdTarget(this.pid, fd, createVfsDirTarget(absPath));
+    }
     return fd;
   }
 

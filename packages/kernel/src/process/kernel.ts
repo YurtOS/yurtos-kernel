@@ -47,6 +47,7 @@ export interface ProcessEntry {
   sid: number;
   controllingTtyId: number | null;
   credentials: ProcessCredentials;
+  cwd: string;
 }
 
 interface FileLockState {
@@ -74,6 +75,7 @@ export class ProcessKernel {
       wasiHost: null, waiters: [], command: 'init',
       pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
       credentials: rootCredentials(),
+      cwd: '/',
     });
     this.parentPids.set(INIT_PID, 0);
     this.children.set(INIT_PID, new Set());
@@ -129,6 +131,15 @@ export class ProcessKernel {
     return this.processTable.get(pid)?.credentials ?? userCredentials();
   }
 
+  getCwd(pid: number): string {
+    return this.processTable.get(pid)?.cwd ?? '/';
+  }
+
+  setCwd(pid: number, cwd: string): void {
+    const entry = this.processTable.get(pid);
+    if (entry) entry.cwd = normalizeKernelPath(cwd);
+  }
+
   setresuid(pid: number, ruid: number, euid: number, suid: number): boolean {
     const entry = this.processTable.get(pid);
     if (!entry) return false;
@@ -173,6 +184,10 @@ export class ProcessKernel {
     return { ...parent.credentials };
   }
 
+  private cwdForChild(ppid: number): string {
+    return this.processTable.get(ppid)?.cwd ?? '/';
+  }
+
   buildFdTableForSpawn(callerPid: number, req: SpawnRequest): Map<number, FdTarget> {
     const callerFdTable = this.fdTables.get(callerPid);
     if (!callerFdTable) throw new Error(`No fd table for caller pid ${callerPid}`);
@@ -211,6 +226,7 @@ export class ProcessKernel {
         sid: parentEntry?.sid ?? INIT_PID,
         controllingTtyId: null,
         credentials: this.credentialsForChild(ppid),
+        cwd: this.cwdForChild(ppid),
       });
     }
   }
@@ -238,6 +254,7 @@ export class ProcessKernel {
       pid, promise, exitCode: -1, state: 'running', wasiHost, waiters: [],
       pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
       credentials: userCredentials(),
+      cwd: '/',
     });
     const onExit = () => {
       const entry = this.processTable.get(pid);
@@ -298,6 +315,7 @@ export class ProcessKernel {
         pid, promise: Promise.resolve(), exitCode, state: 'exited', wasiHost: null, waiters: [],
         pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
         credentials: this.credentialsForChild(ppid ?? INIT_PID),
+        cwd: this.cwdForChild(ppid ?? INIT_PID),
       });
     }
   }
@@ -671,4 +689,17 @@ function rootCredentials(): ProcessCredentials {
 
 function userCredentials(): ProcessCredentials {
   return { uid: USER_UID, gid: USER_GID, euid: USER_UID, egid: USER_GID, suid: USER_UID, sgid: USER_GID };
+}
+
+function normalizeKernelPath(path: string): string {
+  const parts: string[] = [];
+  for (const part of path.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return '/' + parts.join('/');
 }

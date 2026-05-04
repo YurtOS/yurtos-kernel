@@ -83,6 +83,7 @@ export async function loadProcess(
   const pid = ctx.allocatePid(argv);
 
   ctx.kernel.initProcess(pid);
+  ctx.kernel.setCwd(pid, cwd);
   if (!ctx.kernel.getFdTarget(pid, 0)) {
     ctx.kernel.setFdTarget(pid, 0, createNullTarget());
   }

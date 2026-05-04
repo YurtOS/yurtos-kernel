@@ -120,6 +120,7 @@ export interface KernelImportsOptions {
 const ERR_NOT_FOUND = -1;
 const ERR_PERMISSION = -2;
 const ERR_IO = -3;
+const ERR_NOT_DIR = -4;
 const ROOT_UID = 0;
 const USER_UID = 1000;
 const USER_GID = 1000;
@@ -206,6 +207,25 @@ function globMatch(vfs: VfsLike, pattern: string): string[] {
   return matches;
 }
 
+function normalizeImportPath(path: string): string {
+  const parts: string[] = [];
+  for (const part of path.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return '/' + parts.join('/');
+}
+
+function resolveCwdPath(cwd: string, path: string): string {
+  if (path.startsWith('/')) return normalizeImportPath(path);
+  if (path === '' || path === '.') return normalizeImportPath(cwd);
+  return normalizeImportPath(cwd === '/' ? `/${path}` : `${cwd}/${path}`);
+}
+
 export function createKernelImports(opts: KernelImportsOptions): Record<string, WebAssembly.ImportValue> {
   const { memory } = opts;
   const callerPid = opts.callerPid ?? 0;
@@ -244,6 +264,15 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (value !== -1 && !current.has(value)) return ERR_PERMISSION;
     }
     return 0;
+  }
+
+  function getCallerCwd(): string {
+    return opts.kernel?.getCwd(callerPid) ?? opts.wasiHost?.getCwd() ?? '/';
+  }
+
+  function setCallerCwd(cwd: string): void {
+    opts.kernel?.setCwd(callerPid, cwd);
+    opts.wasiHost?.setCwd(cwd);
   }
 
   function bytesToBase64(data: Uint8Array): string {
@@ -418,6 +447,58 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     host_setresgid(rgid: number, egid: number, sgid: number): number {
       if (!opts.kernel) return setFallbackGid(rgid, egid, sgid);
       return opts.kernel.setresgid(callerPid, rgid, egid, sgid) ? 0 : ERR_PERMISSION;
+    },
+
+    host_getcwd(outPtr: number, outCap: number): number {
+      const cwd = getCallerCwd();
+      const bytes = new TextEncoder().encode(cwd);
+      const required = bytes.byteLength + 1;
+      if (outCap < required) return required;
+      new Uint8Array(memory.buffer, outPtr, bytes.byteLength).set(bytes);
+      new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
+      return required;
+    },
+
+    host_chdir(pathPtr: number, pathLen: number): number {
+      if (!opts.vfs) return ERR_IO;
+      const rawPath = readString(memory, pathPtr, pathLen);
+      const path = resolveCwdPath(getCallerCwd(), rawPath);
+      try {
+        const stat = opts.vfs.stat(path);
+        if (stat.type !== 'dir') return ERR_NOT_DIR;
+        setCallerCwd(path);
+        return 0;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : '';
+        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        return ERR_IO;
+      }
+    },
+
+    host_fchdir(fd: number): number {
+      if (!opts.vfs) return ERR_IO;
+      let path = opts.wasiHost?.getDirectoryFdPath(fd) ?? null;
+      if (path === null && opts.kernel) {
+        const target = opts.kernel.getFdTarget(callerPid, fd);
+        if (target?.type === 'vfs_dir') {
+          path = target.path;
+        } else if (target?.type === 'vfs_file') {
+          path = target.fdTable.getPath(target.fd) ?? null;
+        }
+      }
+      if (path === null) return ERR_NOT_FOUND;
+      try {
+        const stat = opts.vfs.stat(path);
+        if (stat.type !== 'dir') return ERR_NOT_DIR;
+        setCallerCwd(path);
+        return 0;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : '';
+        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        return ERR_IO;
+      }
     },
 
     // host_kill(pid, sig) -> i32

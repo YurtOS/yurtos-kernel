@@ -405,8 +405,11 @@ static int do_posix_spawn(pid_t *pid_out, const char *prog,
       written++;
     }
   }
-  if (json_emit_lit(json, cap, &pos, "],\"cwd\":") != 0) goto fail_json;
-  if (json_emit_string(json, cap, &pos, cwd ? cwd : "/") != 0) goto fail_json;
+  if (json_emit_lit(json, cap, &pos, "]") != 0) goto fail_json;
+  if (cwd) {
+    if (json_emit_lit(json, cap, &pos, ",\"cwd\":") != 0) goto fail_json;
+    if (json_emit_string(json, cap, &pos, cwd) != 0) goto fail_json;
+  }
   if (json_emit_lit(json, cap, &pos, ",\"stdin_fd\":") != 0) goto fail_json;
   if (json_emit_int(json, cap, &pos, stdin_fd) != 0) goto fail_json;
   if (json_emit_lit(json, cap, &pos, ",\"stdout_fd\":") != 0) goto fail_json;

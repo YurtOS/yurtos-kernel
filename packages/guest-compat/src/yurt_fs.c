@@ -78,8 +78,9 @@ int fchown(int fd, uid_t owner, gid_t group) {
 
 int fchdir(int fd) {
   YURT_MARKER_CALL(fchdir);
-  (void)fd;
-  errno = ENOSYS;
+  int rc = yurt_host_fchdir(fd);
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? EBADF : (rc == -2) ? EACCES : (rc == -4) ? ENOTDIR : EIO;
   return -1;
 }
 
@@ -100,6 +101,46 @@ int chmod(const char *path, mode_t mode) {
   if (rc == 0) return 0;
   errno = (rc == -1) ? ENOENT : (rc == -2) ? EPERM : EIO;
   return -1;
+}
+
+int chdir(const char *path) {
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  int rc = yurt_host_chdir((int)(intptr_t)path, (int)strlen(path));
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? ENOENT : (rc == -2) ? EACCES : (rc == -4) ? ENOTDIR : EIO;
+  return -1;
+}
+
+char *getcwd(char *buf, size_t size) {
+  if (buf && size == 0) {
+    errno = EINVAL;
+    return NULL;
+  }
+  if (!buf) {
+    int required = yurt_host_getcwd(0, 0);
+    if (required <= 0) {
+      errno = EIO;
+      return NULL;
+    }
+    size_t alloc_size = size == 0 ? (size_t)required : size;
+    buf = (char *)malloc(alloc_size);
+    if (!buf) {
+      errno = ENOMEM;
+      return NULL;
+    }
+    int rc = yurt_host_getcwd((int)(intptr_t)buf, (int)alloc_size);
+    if (rc > 0 && (size_t)rc <= alloc_size) return buf;
+    free(buf);
+    errno = ERANGE;
+    return NULL;
+  }
+  int rc = yurt_host_getcwd((int)(intptr_t)buf, (int)size);
+  if (rc > 0 && (size_t)rc <= size) return buf;
+  errno = ERANGE;
+  return NULL;
 }
 
 int getpriority(int which, id_t who) {

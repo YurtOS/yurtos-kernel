@@ -225,6 +225,67 @@ static int case_identity_kernel(void) {
   return 0;
 }
 
+static int case_cwd_backend(void) {
+  const char *base = "/tmp/yurt-cwd-canary";
+  const char *sub = "/tmp/yurt-cwd-canary/sub";
+  mkdir(base, 0755);
+  mkdir(sub, 0755);
+
+  char cwd[128];
+  errno = 0;
+  if (chdir(base) != 0) {
+    emit("cwd_backend", 1, "cwd_backend:chdir_base_failed", 1, errno);
+    return 1;
+  }
+  if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, base) != 0) {
+    emit("cwd_backend", 1, "cwd_backend:getcwd_base_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (chdir("sub") != 0) {
+    emit("cwd_backend", 1, "cwd_backend:relative_chdir_failed", 1, errno);
+    return 1;
+  }
+  if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, sub) != 0) {
+    emit("cwd_backend", 1, "cwd_backend:getcwd_sub_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (getcwd(cwd, 4) != NULL || errno != ERANGE) {
+    emit("cwd_backend", 1, "cwd_backend:getcwd_small_not_erange", 1, errno);
+    return 1;
+  }
+
+  int fd = open(base, O_RDONLY | O_DIRECTORY);
+  if (fd < 0) {
+    emit("cwd_backend", 1, "cwd_backend:open_dir_failed", 1, errno);
+    return 1;
+  }
+  errno = 0;
+  if (fchdir(fd) != 0) {
+    int e = errno;
+    close(fd);
+    emit("cwd_backend", 1, "cwd_backend:fchdir_failed", 1, e);
+    return 1;
+  }
+  close(fd);
+  if (!getcwd(cwd, sizeof(cwd)) || strcmp(cwd, base) != 0) {
+    emit("cwd_backend", 1, "cwd_backend:getcwd_after_fchdir_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (chdir("/tmp/yurt-cwd-missing") != -1 || errno != ENOENT) {
+    emit("cwd_backend", 1, "cwd_backend:missing_not_enoent", 1, errno);
+    return 1;
+  }
+
+  emit("cwd_backend", 0, "cwd_backend:ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "hostname") == 0) return case_hostname();
   if (strcmp(name, "hostname_too_small") == 0) return case_hostname_too_small();
@@ -237,6 +298,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "chmod_readonly") == 0) return case_chmod_readonly();
   if (strcmp(name, "chown_denied") == 0) return case_chown_denied();
   if (strcmp(name, "identity_kernel") == 0) return case_identity_kernel();
+  if (strcmp(name, "cwd_backend") == 0) return case_cwd_backend();
   fprintf(stderr, "posix-runtime-canary: unknown case %s\n", name);
   return 2;
 }
@@ -253,6 +315,7 @@ static int list_cases(void) {
   puts("chmod_readonly");
   puts("chown_denied");
   puts("identity_kernel");
+  puts("cwd_backend");
   return 0;
 }
 
