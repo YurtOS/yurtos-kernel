@@ -156,6 +156,18 @@ describe('Guest compatibility canaries', () => {
     expect(result.stdout.trim()).toBe('{"case":"priority_unsupported","exit":0,"stdout":"priority_unsupported:ok"}');
   });
 
+  it('routes scheduler policy metadata through the process kernel', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('affinity-canary --case scheduler_policy_metadata');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('{"case":"scheduler_policy_metadata","exit":0,"stdout":"scheduler:policy=other,param=0"}');
+  });
+
   // ──────────────────────────────────────────────────────────────────────
   // setjmp/longjmp — POSIX exception-style control flow over Asyncify.
   //

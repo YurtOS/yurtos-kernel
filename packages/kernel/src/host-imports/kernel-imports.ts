@@ -23,7 +23,13 @@ import { createLoopbackSocketBackend, createNetworkBridgeSocketBackend } from '.
 import type { ExtensionRegistry } from '../extension/registry.js';
 import type { NativeModuleRegistry } from '../process/native-modules.js';
 import type { ProcessCredentials, ProcessKernel, SpawnRequest } from '../process/kernel.js';
-import { normalizeNice, unsupportedRuntimeEngineBackend, type RuntimeEngineBackend } from '../engine/backend.js';
+import {
+  normalizeNice,
+  normalizeSchedulerPolicy,
+  normalizeSchedulerPriority,
+  unsupportedRuntimeEngineBackend,
+  type RuntimeEngineBackend,
+} from '../engine/backend.js';
 import type { ProcessManager } from '../process/manager.js';
 import type { WasiHost } from '../wasi/wasi-host.js';
 import type { ThreadsBackend } from '../process/threads/backend.js';
@@ -304,6 +310,42 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     return 0;
   }
 
+  function schedulerTargetPid(pidRaw: number): number {
+    const targetPid = Math.trunc(pidRaw) === 0 ? callerPid : Math.trunc(pidRaw);
+    if (targetPid < 0) return ERR_INVALID;
+    if (opts.kernel && !opts.kernel.hasProcess(targetPid)) return ERR_NOT_FOUND;
+    if (!opts.kernel && targetPid !== callerPid) return ERR_NOT_FOUND;
+    return targetPid;
+  }
+
+  function setSchedulerForTarget(targetPid: number, policyRaw: number, priorityRaw: number): number {
+    const policy = normalizeSchedulerPolicy(policyRaw);
+    const priority = normalizeSchedulerPriority(policy, priorityRaw);
+    if (policy < 0 || priority < 0) return ERR_INVALID;
+
+    const current = opts.kernel?.getScheduler(targetPid) ?? { policy: 0, priority: 0 };
+    const noOp = current.policy === policy && current.priority === priority;
+    if (!noOp) {
+      const caller = getCallerCredentials();
+      if (targetPid !== callerPid && caller.euid !== ROOT_UID) return ERR_PERMISSION;
+      if ((policy === 1 || policy === 2 || current.policy === 1 || current.policy === 2) && caller.euid !== ROOT_UID) {
+        return ERR_PERMISSION;
+      }
+      if (!schedulerBackend?.setScheduler) return ERR_UNSUPPORTED;
+      const result = schedulerBackend.setScheduler({ callerPid, targetPid, policy, priority });
+      if (!result.ok) {
+        if (result.error === 'unsupported') return ERR_UNSUPPORTED;
+        if (result.error === 'permission') return ERR_PERMISSION;
+        if (result.error === 'invalid') return ERR_INVALID;
+        if (result.error === 'not_found') return ERR_NOT_FOUND;
+        return ERR_IO;
+      }
+    }
+
+    opts.kernel?.setScheduler(targetPid, policy, priority);
+    return 0;
+  }
+
   function bytesToBase64(data: Uint8Array): string {
     let binary = '';
     for (let i = 0; i < data.byteLength; i++) {
@@ -512,6 +554,31 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (result.error === 'invalid') return ERR_INVALID;
       if (result.error === 'not_found') return ERR_NOT_FOUND;
       return ERR_IO;
+    },
+
+    host_sched_getscheduler(pidRaw: number): number {
+      const targetPid = schedulerTargetPid(pidRaw);
+      if (targetPid < 0) return targetPid;
+      return opts.kernel?.getScheduler(targetPid).policy ?? 0;
+    },
+
+    host_sched_getparam(pidRaw: number): number {
+      const targetPid = schedulerTargetPid(pidRaw);
+      if (targetPid < 0) return targetPid;
+      return opts.kernel?.getScheduler(targetPid).priority ?? 0;
+    },
+
+    host_sched_setscheduler(pidRaw: number, policyRaw: number, priorityRaw: number): number {
+      const targetPid = schedulerTargetPid(pidRaw);
+      if (targetPid < 0) return targetPid;
+      return setSchedulerForTarget(targetPid, policyRaw, priorityRaw);
+    },
+
+    host_sched_setparam(pidRaw: number, priorityRaw: number): number {
+      const targetPid = schedulerTargetPid(pidRaw);
+      if (targetPid < 0) return targetPid;
+      const current = opts.kernel?.getScheduler(targetPid) ?? { policy: 0, priority: 0 };
+      return setSchedulerForTarget(targetPid, current.policy, priorityRaw);
     },
 
     host_getcwd(outPtr: number, outCap: number): number {

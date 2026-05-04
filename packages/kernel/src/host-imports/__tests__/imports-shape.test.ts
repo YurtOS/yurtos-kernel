@@ -259,6 +259,55 @@ Deno.test("host_setpriority applies through an explicit scheduler backend", () =
   assertEquals(calls, [{ pid, nice: 7 }]);
 });
 
+Deno.test("host scheduler policy reports metadata and rejects unsupported changes", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals((imports.host_sched_getscheduler as (...args: number[]) => number)(0), 0);
+  assertEquals((imports.host_sched_getparam as (...args: number[]) => number)(0), 0);
+  assertEquals((imports.host_sched_setscheduler as (...args: number[]) => number)(0, 0, 0), 0);
+  assertEquals((imports.host_sched_setparam as (...args: number[]) => number)(0, 0), 0);
+  assertEquals((imports.host_sched_setscheduler as (...args: number[]) => number)(0, 1, 1), -2);
+  const rootImports = createKernelImports({ memory, kernel, callerPid: 1 });
+  assertEquals((rootImports.host_sched_setscheduler as (...args: number[]) => number)(1, 1, 1), -38);
+  assertEquals(kernel.getScheduler(pid), { policy: 0, priority: 0 });
+});
+
+Deno.test("host scheduler policy applies through an explicit scheduler backend", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const calls: Array<{ pid: number; policy: number; priority: number }> = [];
+  const runtimeBackend: RuntimeEngineBackend = {
+    scheduler: {
+      setPriority() {
+        return { ok: true };
+      },
+      setScheduler(request) {
+        calls.push({ pid: request.targetPid, policy: request.policy, priority: request.priority });
+        return { ok: true };
+      },
+    },
+  };
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: 1,
+    runtimeBackend,
+  });
+
+  assertEquals((imports.host_sched_setscheduler as (...args: number[]) => number)(1, 1, 4), 0);
+  assertEquals((imports.host_sched_getscheduler as (...args: number[]) => number)(1), 1);
+  assertEquals((imports.host_sched_getparam as (...args: number[]) => number)(1), 4);
+  assertEquals((imports.host_sched_setparam as (...args: number[]) => number)(1, 5), 0);
+  assertEquals(kernel.getScheduler(1), { policy: 1, priority: 5 });
+  assertEquals(calls, [
+    { pid: 1, policy: 1, priority: 4 },
+    { pid: 1, policy: 1, priority: 5 },
+  ]);
+});
+
 Deno.test("host_spawn rejects nonzero nice when the engine has no scheduler backend", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const request = JSON.stringify({

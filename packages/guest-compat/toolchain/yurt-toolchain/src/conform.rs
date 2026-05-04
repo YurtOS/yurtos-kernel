@@ -74,7 +74,15 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
         ("spawn-wait-canary", &["wait", "waitpid"]),
         (
             "affinity-canary",
-            &["sched_getaffinity", "sched_setaffinity", "sched_getcpu"],
+            &[
+                "sched_getaffinity",
+                "sched_setaffinity",
+                "sched_getcpu",
+                "sched_getscheduler",
+                "sched_setscheduler",
+                "sched_getparam",
+                "sched_setparam",
+            ],
         ),
         (
             "signal-canary",

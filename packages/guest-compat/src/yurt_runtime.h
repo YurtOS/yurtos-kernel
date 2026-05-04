@@ -74,6 +74,18 @@ int yurt_host_getpriority(int which, int who);
 __attribute__((import_module("yurt"), import_name("host_setpriority")))
 int yurt_host_setpriority(int which, int who, int prio);
 
+__attribute__((import_module("yurt"), import_name("host_sched_getscheduler")))
+int yurt_host_sched_getscheduler(int pid);
+
+__attribute__((import_module("yurt"), import_name("host_sched_getparam")))
+int yurt_host_sched_getparam(int pid);
+
+__attribute__((import_module("yurt"), import_name("host_sched_setscheduler")))
+int yurt_host_sched_setscheduler(int pid, int policy, int priority);
+
+__attribute__((import_module("yurt"), import_name("host_sched_setparam")))
+int yurt_host_sched_setparam(int pid, int priority);
+
 /* host_kill returns 0 on success, -1 with kill(2)-style ESRCH (no such
  * process) on failure.  sig=0 is the existence probe (no signal sent). */
 __attribute__((import_module("yurt"), import_name("host_kill")))

@@ -1,6 +1,6 @@
 import type { FdTarget, TtyState } from '../wasi/fd-target.js';
 import { createTtyState, createTtySlaveTarget } from '../wasi/fd-target.js';
-import { normalizeNice } from '../engine/backend.js';
+import { normalizeNice, normalizeSchedulerPolicy, normalizeSchedulerPriority } from '../engine/backend.js';
 import { createAsyncPipe } from '../vfs/pipe.js';
 import type { WasiHost } from '../wasi/wasi-host.js';
 
@@ -51,6 +51,8 @@ export interface ProcessEntry {
   credentials: ProcessCredentials;
   cwd: string;
   nice: number;
+  schedulerPolicy: number;
+  schedulerPriority: number;
   umask: number;
 }
 
@@ -81,6 +83,8 @@ export class ProcessKernel {
       credentials: rootCredentials(),
       cwd: '/',
       nice: 0,
+      schedulerPolicy: 0,
+      schedulerPriority: 0,
       umask: 0o022,
     });
     this.parentPids.set(INIT_PID, 0);
@@ -157,6 +161,25 @@ export class ProcessKernel {
     return true;
   }
 
+  getScheduler(pid: number): { policy: number; priority: number } {
+    const entry = this.processTable.get(pid);
+    return {
+      policy: entry?.schedulerPolicy ?? 0,
+      priority: entry?.schedulerPriority ?? 0,
+    };
+  }
+
+  setScheduler(pid: number, policyRaw: number, priorityRaw: number): boolean {
+    const entry = this.processTable.get(pid);
+    if (!entry) return false;
+    const policy = normalizeSchedulerPolicy(policyRaw);
+    const priority = normalizeSchedulerPriority(policy, priorityRaw);
+    if (policy < 0 || priority < 0) return false;
+    entry.schedulerPolicy = policy;
+    entry.schedulerPriority = priority;
+    return true;
+  }
+
   getUmask(pid: number): number {
     return this.processTable.get(pid)?.umask ?? 0o022;
   }
@@ -221,6 +244,14 @@ export class ProcessKernel {
     return this.processTable.get(ppid)?.nice ?? 0;
   }
 
+  private schedulerForChild(ppid: number): { policy: number; priority: number } {
+    const parent = this.processTable.get(ppid);
+    return {
+      policy: parent?.schedulerPolicy ?? 0,
+      priority: parent?.schedulerPriority ?? 0,
+    };
+  }
+
   private umaskForChild(ppid: number): number {
     return this.processTable.get(ppid)?.umask ?? 0o022;
   }
@@ -256,6 +287,7 @@ export class ProcessKernel {
     this.initProcess(pid);
     if (!this.processTable.has(pid)) {
       const parentEntry = this.processTable.get(ppid);
+      const scheduler = this.schedulerForChild(ppid);
       this.processTable.set(pid, {
         pid, promise: null, exitCode: -1, state: 'running', wasiHost: null, waiters: [],
         command,
@@ -265,6 +297,8 @@ export class ProcessKernel {
         credentials: this.credentialsForChild(ppid),
         cwd: this.cwdForChild(ppid),
         nice: this.priorityForChild(ppid),
+        schedulerPolicy: scheduler.policy,
+        schedulerPriority: scheduler.priority,
         umask: this.umaskForChild(ppid),
       });
     }
@@ -295,6 +329,8 @@ export class ProcessKernel {
       credentials: userCredentials(),
       cwd: '/',
       nice: 0,
+      schedulerPolicy: 0,
+      schedulerPriority: 0,
       umask: 0o022,
     });
     const onExit = () => {
@@ -352,12 +388,15 @@ export class ProcessKernel {
       for (const waiter of existing.waiters) waiter(exitCode);
       existing.waiters.length = 0;
     } else {
+      const scheduler = this.schedulerForChild(ppid ?? INIT_PID);
       this.processTable.set(pid, {
         pid, promise: Promise.resolve(), exitCode, state: 'exited', wasiHost: null, waiters: [],
         pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
         credentials: this.credentialsForChild(ppid ?? INIT_PID),
         cwd: this.cwdForChild(ppid ?? INIT_PID),
         nice: this.priorityForChild(ppid ?? INIT_PID),
+        schedulerPolicy: scheduler.policy,
+        schedulerPriority: scheduler.priority,
         umask: this.umaskForChild(ppid ?? INIT_PID),
       });
     }

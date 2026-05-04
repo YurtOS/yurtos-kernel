@@ -1,0 +1,9 @@
+canary = "affinity-canary"
+summary = "Route scheduler parameter changes through the host scheduler backend."
+
+[[case]]
+name = "scheduler_policy_metadata"
+inputs = "sched_getscheduler(0), sched_getparam(0), SCHED_OTHER no-op updates, rejected FIFO update"
+expected.exit = 0
+expected.stdout = "scheduler:policy=other,param=0"
+expected.note = "SCHED_OTHER only accepts priority zero; nonzero priority maps to EINVAL"
