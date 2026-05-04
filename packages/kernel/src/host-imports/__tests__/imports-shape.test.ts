@@ -308,6 +308,26 @@ Deno.test("host scheduler policy applies through an explicit scheduler backend",
   ]);
 });
 
+Deno.test("host rlimit stores process-local limits inherited by children", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const view = new DataView(memory.buffer);
+  const kernel = new ProcessKernel();
+  const parentPid = kernel.allocPid(1, "parent");
+  const imports = createKernelImports({ memory, kernel, callerPid: parentPid });
+
+  assertEquals((imports.host_getrlimit as (...args: number[]) => number)(7, 64), 0);
+  assertEquals(view.getUint32(64, true), 1024);
+  assertEquals(view.getUint32(68, true), 1024);
+
+  assertEquals((imports.host_setrlimit as (...args: number[]) => number)(7, 4, 1024), 0);
+  assertEquals((imports.host_getrlimit as (...args: number[]) => number)(7, 64), 0);
+  assertEquals(view.getUint32(64, true), 4);
+  assertEquals(view.getUint32(68, true), 1024);
+
+  const childPid = kernel.allocPid(parentPid, "child");
+  assertEquals(kernel.getResourceLimit(childPid, 7), { soft: 4, hard: 1024 });
+});
+
 Deno.test("host_spawn rejects nonzero nice when the engine has no scheduler backend", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const request = JSON.stringify({

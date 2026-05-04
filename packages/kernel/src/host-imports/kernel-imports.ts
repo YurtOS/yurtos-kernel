@@ -581,6 +581,21 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       return setSchedulerForTarget(targetPid, current.policy, priorityRaw);
     },
 
+    host_getrlimit(resourceRaw: number, outPtr: number): number {
+      const limit = opts.kernel?.getResourceLimit(callerPid, Math.trunc(resourceRaw)) ?? defaultImportResourceLimit(Math.trunc(resourceRaw));
+      if (!limit) return ERR_INVALID;
+      const view = new DataView(memory.buffer);
+      view.setUint32(outPtr, limit.soft, true);
+      view.setUint32(outPtr + 4, limit.hard, true);
+      return 0;
+    },
+
+    host_setrlimit(resourceRaw: number, softRaw: number, hardRaw: number): number {
+      const resource = Math.trunc(resourceRaw);
+      if (!opts.kernel) return defaultImportResourceLimit(resource) ? 0 : ERR_INVALID;
+      return opts.kernel.setResourceLimit(callerPid, resource, softRaw, hardRaw) ? 0 : ERR_INVALID;
+    },
+
     host_getcwd(outPtr: number, outCap: number): number {
       const cwd = getCallerCwd();
       const bytes = new TextEncoder().encode(cwd);
@@ -1760,4 +1775,24 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   }
 
   return imports;
+}
+
+function defaultImportResourceLimit(resource: number): { soft: number; hard: number } | null {
+  switch (resource) {
+    case 0:
+    case 1:
+      return { soft: 0xffffffff, hard: 0xffffffff };
+    case 2:
+    case 5:
+      return { soft: 64 * 1024 * 1024, hard: 64 * 1024 * 1024 };
+    case 3:
+      return { soft: 1024 * 1024, hard: 1024 * 1024 };
+    case 4:
+      return { soft: 0, hard: 0 };
+    case 6:
+    case 7:
+      return { soft: 1024, hard: 1024 };
+    default:
+      return null;
+  }
 }

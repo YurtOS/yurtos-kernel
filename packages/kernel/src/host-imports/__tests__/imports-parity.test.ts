@@ -25,6 +25,8 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_sched_getparam",
   "host_sched_setscheduler",
   "host_sched_setparam",
+  "host_getrlimit",
+  "host_setrlimit",
   "host_kill",
   "host_list_processes",
   "host_read_fd",

@@ -24,6 +24,7 @@ import {
   WASI_ENOSYS,
   WASI_ENOTSOCK,
   WASI_ENOTSUP,
+  WASI_EMFILE,
   WASI_EPIPE,
   WASI_ESUCCESS,
   WASI_CLOCK_REALTIME,
@@ -1257,6 +1258,9 @@ export class WasiHost {
         }
       }
 
+      if (this.openFdCount() >= this.nofileSoftLimit()) {
+        return WASI_EMFILE;
+      }
       const fd = this.fdTable.open(absPath, mode);
       if (this.kernel && this.pid !== undefined) {
         this.kernel.setFdTarget(this.pid, fd, createVfsFileTarget(this.fdTable, fd));
@@ -1316,6 +1320,15 @@ export class WasiHost {
   private creationMode(baseMode: number): number {
     const mask = this.kernel && this.pid !== undefined ? this.kernel.getUmask(this.pid) : 0o022;
     return Math.trunc(baseMode) & ~mask & 0o777;
+  }
+
+  private openFdCount(): number {
+    return this.ioFds.size + this.dirFds.size + this.fdTable.countOpen();
+  }
+
+  private nofileSoftLimit(): number {
+    if (!this.kernel || this.pid === undefined) return Infinity;
+    return this.kernel.getResourceLimit(this.pid, 7)?.soft ?? Infinity;
   }
 
   private pathRemoveDirectory(

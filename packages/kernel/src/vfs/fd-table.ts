@@ -236,6 +236,10 @@ export class FdTable {
     return this.entries.has(fd);
   }
 
+  countOpen(): number {
+    return this.entries.size;
+  }
+
   /** Move an fd entry from one number to another. Closes toFd if open. */
   renumber(fromFd: number, toFd: number): void {
     const entry = this.entries.get(fromFd);

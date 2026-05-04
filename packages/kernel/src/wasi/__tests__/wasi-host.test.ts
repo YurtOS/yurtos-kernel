@@ -5,6 +5,7 @@ import { VFS } from '../../vfs/vfs.js';
 import { ProcessKernel } from '../../process/kernel.js';
 import {
   WASI_EBADF,
+  WASI_EMFILE,
   WASI_ENOENT,
   WASI_ENOSYS,
   WASI_ESUCCESS,
@@ -378,6 +379,29 @@ describe('WasiHost', () => {
       const errno = wasi.path_open(3, 0, 500, pathStr.length, 9, BigInt(0), BigInt(0), 0, 400);
       expect(errno).toBe(WASI_ESUCCESS);
       expect(vfs.stat('/tmp/umask-created.txt').permissions).toBe(0o600);
+    });
+
+    it('enforces RLIMIT_NOFILE from the kernel process state', () => {
+      const kernel = new ProcessKernel();
+      const pid = kernel.allocPid(1, 'guest');
+      kernel.setResourceLimit(pid, 7, 4, 1024);
+      host = new WasiHost({
+        vfs,
+        args: ['program'],
+        env: {},
+        preopens: { '/': '/' },
+        kernel,
+        pid,
+      });
+      host.setMemory(memory);
+      vfs.writeFile('/tmp/limit.txt', new TextEncoder().encode('content'));
+      const { wasi, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = 'tmp/limit.txt';
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+
+      const errno = wasi.path_open(3, 0, 500, pathStr.length, 0, BigInt(0), BigInt(0), 0, 400);
+      expect(errno).toBe(WASI_EMFILE);
     });
 
     it('returns ENOENT for non-existent file without CREAT', () => {

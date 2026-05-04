@@ -86,6 +86,12 @@ int yurt_host_sched_setscheduler(int pid, int policy, int priority);
 __attribute__((import_module("yurt"), import_name("host_sched_setparam")))
 int yurt_host_sched_setparam(int pid, int priority);
 
+__attribute__((import_module("yurt"), import_name("host_getrlimit")))
+int yurt_host_getrlimit(int resource, void *out);
+
+__attribute__((import_module("yurt"), import_name("host_setrlimit")))
+int yurt_host_setrlimit(int resource, unsigned int soft, unsigned int hard);
+
 /* host_kill returns 0 on success, -1 with kill(2)-style ESRCH (no such
  * process) on failure.  sig=0 is the existence probe (no signal sent). */
 __attribute__((import_module("yurt"), import_name("host_kill")))

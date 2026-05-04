@@ -14,6 +14,13 @@ export const ROOT_UID = 0;
 export const ROOT_GID = 0;
 export const USER_UID = 1000;
 export const USER_GID = 1000;
+export const RLIMIT_NOFILE = 7;
+export const RLIM_INFINITY_U32 = 0xffffffff;
+
+export interface ResourceLimit {
+  soft: number;
+  hard: number;
+}
 
 export interface ProcessCredentials {
   uid: number;
@@ -54,6 +61,7 @@ export interface ProcessEntry {
   schedulerPolicy: number;
   schedulerPriority: number;
   umask: number;
+  resourceLimits: Map<number, ResourceLimit>;
 }
 
 interface FileLockState {
@@ -86,6 +94,7 @@ export class ProcessKernel {
       schedulerPolicy: 0,
       schedulerPriority: 0,
       umask: 0o022,
+      resourceLimits: defaultResourceLimits(),
     });
     this.parentPids.set(INIT_PID, 0);
     this.children.set(INIT_PID, new Set());
@@ -192,6 +201,27 @@ export class ProcessKernel {
     return prev;
   }
 
+  getResourceLimit(pid: number, resource: number): ResourceLimit | null {
+    const entry = this.processTable.get(pid);
+    const limits = entry?.resourceLimits ?? defaultResourceLimits();
+    const limit = limits.get(resource);
+    return limit ? { ...limit } : null;
+  }
+
+  setResourceLimit(pid: number, resource: number, softRaw: number, hardRaw: number): boolean {
+    const entry = this.processTable.get(pid);
+    if (!entry) return false;
+    const current = entry.resourceLimits.get(resource);
+    if (!current) return false;
+    const soft = normalizeLimit(softRaw);
+    const hard = normalizeLimit(hardRaw);
+    if (soft < 0 || hard < 0 || soft > hard) return false;
+    if (entry.credentials.euid !== ROOT_UID && hard > current.hard) return false;
+    if (entry.credentials.euid !== ROOT_UID && soft > current.hard) return false;
+    entry.resourceLimits.set(resource, { soft, hard });
+    return true;
+  }
+
   setresuid(pid: number, ruid: number, euid: number, suid: number): boolean {
     const entry = this.processTable.get(pid);
     if (!entry) return false;
@@ -256,6 +286,11 @@ export class ProcessKernel {
     return this.processTable.get(ppid)?.umask ?? 0o022;
   }
 
+  private resourceLimitsForChild(ppid: number): Map<number, ResourceLimit> {
+    const parent = this.processTable.get(ppid);
+    return cloneResourceLimits(parent?.resourceLimits ?? defaultResourceLimits());
+  }
+
   buildFdTableForSpawn(callerPid: number, req: SpawnRequest): Map<number, FdTarget> {
     const callerFdTable = this.fdTables.get(callerPid);
     if (!callerFdTable) throw new Error(`No fd table for caller pid ${callerPid}`);
@@ -300,6 +335,7 @@ export class ProcessKernel {
         schedulerPolicy: scheduler.policy,
         schedulerPriority: scheduler.priority,
         umask: this.umaskForChild(ppid),
+        resourceLimits: this.resourceLimitsForChild(ppid),
       });
     }
   }
@@ -332,6 +368,7 @@ export class ProcessKernel {
       schedulerPolicy: 0,
       schedulerPriority: 0,
       umask: 0o022,
+      resourceLimits: defaultResourceLimits(),
     });
     const onExit = () => {
       const entry = this.processTable.get(pid);
@@ -398,6 +435,7 @@ export class ProcessKernel {
         schedulerPolicy: scheduler.policy,
         schedulerPriority: scheduler.priority,
         umask: this.umaskForChild(ppid ?? INIT_PID),
+        resourceLimits: this.resourceLimitsForChild(ppid ?? INIT_PID),
       });
     }
   }
@@ -788,4 +826,30 @@ function normalizeKernelPath(path: string): string {
 
 function normalizeUmask(mask: number): number {
   return Math.trunc(mask) & 0o777;
+}
+
+function normalizeLimit(limit: number): number {
+  if (!Number.isFinite(limit)) return -1;
+  return Math.max(0, Math.min(RLIM_INFINITY_U32, Math.trunc(limit)));
+}
+
+function defaultResourceLimits(): Map<number, ResourceLimit> {
+  return new Map([
+    [0, { soft: RLIM_INFINITY_U32, hard: RLIM_INFINITY_U32 }],
+    [1, { soft: RLIM_INFINITY_U32, hard: RLIM_INFINITY_U32 }],
+    [2, { soft: 64 * 1024 * 1024, hard: 64 * 1024 * 1024 }],
+    [3, { soft: 1024 * 1024, hard: 1024 * 1024 }],
+    [4, { soft: 0, hard: 0 }],
+    [5, { soft: 64 * 1024 * 1024, hard: 64 * 1024 * 1024 }],
+    [6, { soft: 1024, hard: 1024 }],
+    [RLIMIT_NOFILE, { soft: 1024, hard: 1024 }],
+  ]);
+}
+
+function cloneResourceLimits(limits: Map<number, ResourceLimit>): Map<number, ResourceLimit> {
+  const cloned = new Map<number, ResourceLimit>();
+  for (const [resource, limit] of limits) {
+    cloned.set(resource, { ...limit });
+  }
+  return cloned;
 }
