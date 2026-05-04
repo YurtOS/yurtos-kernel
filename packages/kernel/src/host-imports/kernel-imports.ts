@@ -1363,6 +1363,40 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       }
     },
 
+    host_chown(pathPtr: number, pathLen: number, uid: number, gid: number, followSymlinks: number): number {
+      if (!opts.vfs) return ERR_IO;
+      const path = readString(memory, pathPtr, pathLen);
+      try {
+        opts.vfs.stat(path);
+        if (callerCredentials.uid !== ROOT_UID) return ERR_PERMISSION;
+        opts.vfs.chown(path, uid, gid, followSymlinks !== 0);
+        return 0;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : '';
+        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        return ERR_IO;
+      }
+    },
+
+    host_fchown(fd: number, uid: number, gid: number): number {
+      if (!opts.vfs || !opts.kernel) return ERR_IO;
+      const target = opts.kernel.getFdTarget(callerPid, fd);
+      if (!target || target.type !== 'vfs_file') return ERR_NOT_FOUND;
+      const path = target.fdTable.getPath(target.fd);
+      if (!path) return ERR_NOT_FOUND;
+      if (callerCredentials.uid !== ROOT_UID) return ERR_PERMISSION;
+      try {
+        opts.vfs.chown(path, uid, gid);
+        return 0;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : '';
+        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        return ERR_IO;
+      }
+    },
+
     host_glob(patternPtr: number, patternLen: number, outPtr: number, outCap: number): number {
       if (!opts.vfs) return writeJson(memory, outPtr, outCap, []);
       const pattern = readString(memory, patternPtr, patternLen);

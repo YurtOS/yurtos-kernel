@@ -122,6 +122,57 @@ static int case_chmod_readonly(void) {
   return 0;
 }
 
+static int case_chown_denied(void) {
+  const char *path = "/tmp/yurt-chown-canary.txt";
+  unlink(path);
+
+  int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0644);
+  if (fd < 0) {
+    emit("chown_denied", 1, "chown_denied:create_failed", 1, errno);
+    return 1;
+  }
+  if (write(fd, "x", 1) != 1) {
+    int e = errno;
+    close(fd);
+    emit("chown_denied", 1, "chown_denied:write_failed", 1, e);
+    return 1;
+  }
+
+  errno = 0;
+  if (chown(path, 1000, 1000) != -1 || errno != EPERM) {
+    int e = errno;
+    close(fd);
+    emit("chown_denied", 1, "chown_denied:chown_not_eperm", 1, e);
+    return 1;
+  }
+
+  errno = 0;
+  if (lchown(path, 1000, 1000) != -1 || errno != EPERM) {
+    int e = errno;
+    close(fd);
+    emit("chown_denied", 1, "chown_denied:lchown_not_eperm", 1, e);
+    return 1;
+  }
+
+  errno = 0;
+  if (fchown(fd, 1000, 1000) != -1 || errno != EPERM) {
+    int e = errno;
+    close(fd);
+    emit("chown_denied", 1, "chown_denied:fchown_not_eperm", 1, e);
+    return 1;
+  }
+  close(fd);
+
+  errno = 0;
+  if (chown("/tmp/yurt-chown-missing.txt", 1000, 1000) != -1 || errno != ENOENT) {
+    emit("chown_denied", 1, "chown_denied:missing_not_enoent", 1, errno);
+    return 1;
+  }
+
+  emit("chown_denied", 0, "chown_denied:ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "hostname") == 0) return case_hostname();
   if (strcmp(name, "hostname_too_small") == 0) return case_hostname_too_small();
@@ -132,6 +183,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "sendfile_zero_count") == 0) return case_sendfile_zero_count();
   if (strcmp(name, "sendfile_bad_fd") == 0) return case_sendfile_bad_fd();
   if (strcmp(name, "chmod_readonly") == 0) return case_chmod_readonly();
+  if (strcmp(name, "chown_denied") == 0) return case_chown_denied();
   fprintf(stderr, "posix-runtime-canary: unknown case %s\n", name);
   return 2;
 }
@@ -146,6 +198,7 @@ static int list_cases(void) {
   puts("sendfile_zero_count");
   puts("sendfile_bad_fd");
   puts("chmod_readonly");
+  puts("chown_denied");
   return 0;
 }
 

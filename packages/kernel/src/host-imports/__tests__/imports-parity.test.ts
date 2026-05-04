@@ -38,6 +38,8 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_mkdir",
   "host_remove",
   "host_chmod",
+  "host_chown",
+  "host_fchown",
   "host_glob",
   "host_rename",
   "host_symlink",

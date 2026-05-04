@@ -763,6 +763,14 @@ export class VFS {
     this.notifyChange();
   }
 
+  chown(path: string, uid: number, gid: number, followSymlinks = true): void {
+    const inode = this.resolve(path, followSymlinks);
+    inode.metadata.uid = uid;
+    inode.metadata.gid = gid;
+    inode.metadata.ctime = new Date();
+    this.notifyChange();
+  }
+
   readlink(path: string): string {
     const inode = this.resolve(path, false);
 

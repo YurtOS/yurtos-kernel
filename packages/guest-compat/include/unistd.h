@@ -56,8 +56,8 @@ int gethostname(char *name, size_t len);
  * collide with gnulib's replacement at compile time, so we ship real
  * symbols in libyurt_guest_compat.a (yurt_fs.c) — gnulib then
  * accepts ours and skips its own.  Sandbox semantics: chown family
- * accepts silently (we don't model file ownership), fchdir/chroot
- * return ENOSYS. */
+ * routes through the host/kernel ownership checks; fchdir/chroot return
+ * ENOSYS. */
 int chown(const char *path, uid_t owner, gid_t group);
 int lchown(const char *path, uid_t owner, gid_t group);
 int fchown(int fd, uid_t owner, gid_t group);

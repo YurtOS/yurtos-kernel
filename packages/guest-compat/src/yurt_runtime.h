@@ -19,6 +19,12 @@ int yurt_host_file_lock(int fd, int operation);
 __attribute__((import_module("yurt"), import_name("host_chmod")))
 int yurt_host_chmod(int path_ptr, int path_len, int mode);
 
+__attribute__((import_module("yurt"), import_name("host_chown")))
+int yurt_host_chown(int path_ptr, int path_len, int uid, int gid, int follow_symlinks);
+
+__attribute__((import_module("yurt"), import_name("host_fchown")))
+int yurt_host_fchown(int fd, int uid, int gid);
+
 __attribute__((import_module("yurt"), import_name("host_network_fetch")))
 int yurt_host_network_fetch(int req_ptr, int req_len, int out_ptr, int out_cap);
 

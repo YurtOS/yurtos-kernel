@@ -3,6 +3,8 @@ import { createKernelImports } from "../kernel-imports.ts";
 import { readString } from "../common.ts";
 import { VFS } from "../../vfs/vfs.ts";
 import { ProcessKernel } from "../../process/kernel.ts";
+import { FdTable } from "../../vfs/fd-table.ts";
+import { createVfsFileTarget } from "../../wasi/fd-target.ts";
 
 const encoder = new TextEncoder();
 
@@ -85,4 +87,41 @@ Deno.test("host_chmod trusts kernel credentials over caller-supplied uid", () =>
   const pathLen = writeString(memory, 0, "/tmp/root-owned.txt");
   assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777), -2);
   assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
+});
+
+Deno.test("host_chown is root-only and mutates inode ownership", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.writeFile("/tmp/owned.txt", new Uint8Array(1));
+
+  let pathLen = writeString(memory, 0, "/tmp/owned.txt");
+  const userImports = createKernelImports({ memory, vfs, callerUid: 1000, callerGid: 1000 });
+  assertEquals((userImports.host_chown as (...args: number[]) => number)(0, pathLen, 2000, 2000, 1), -2);
+  assertEquals(vfs.stat("/tmp/owned.txt").uid, 1000);
+
+  pathLen = writeString(memory, 0, "/tmp/owned.txt");
+  const rootImports = createKernelImports({ memory, vfs, callerUid: 0, callerGid: 0 });
+  assertEquals((rootImports.host_chown as (...args: number[]) => number)(0, pathLen, 2000, 2000, 1), 0);
+  assertEquals(vfs.stat("/tmp/owned.txt").uid, 2000);
+  assertEquals(vfs.stat("/tmp/owned.txt").gid, 2000);
+});
+
+Deno.test("host_fchown resolves vfs file descriptors through the kernel", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.writeFile("/tmp/fd-owned.txt", new Uint8Array(1));
+  const fdTable = new FdTable(vfs);
+  const fd = fdTable.open("/tmp/fd-owned.txt", "rw");
+  const kernel = new ProcessKernel();
+  const userPid = kernel.allocPid(1, "guest");
+  kernel.setFdTarget(1, fd, createVfsFileTarget(fdTable, fd));
+  kernel.setFdTarget(userPid, fd, createVfsFileTarget(fdTable, fd));
+
+  const userImports = createKernelImports({ memory, vfs, kernel, callerPid: userPid, callerUid: 0 });
+  assertEquals((userImports.host_fchown as (...args: number[]) => number)(fd, 2000, 2000), -2);
+
+  const rootImports = createKernelImports({ memory, vfs, kernel, callerPid: 1 });
+  assertEquals((rootImports.host_fchown as (...args: number[]) => number)(fd, 2000, 2000), 0);
+  assertEquals(vfs.stat("/tmp/fd-owned.txt").uid, 2000);
+  assertEquals(vfs.stat("/tmp/fd-owned.txt").gid, 2000);
 });

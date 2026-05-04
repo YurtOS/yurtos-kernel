@@ -179,6 +179,10 @@ export class VfsProxy {
     this.call('chmod', { path, mode });
   }
 
+  chown(path: string, uid: number, gid: number, followSymlinks = true): void {
+    this.call('chown', { path, uid, gid, followSymlinks });
+  }
+
   symlink(target: string, path: string): void {
     this.call('symlink', { target, path });
   }

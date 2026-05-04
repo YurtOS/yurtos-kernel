@@ -4,10 +4,9 @@
  * compiling its own replacement copies — which would otherwise
  * collide with our compat headers' inline versions.
  *
- * Sandbox semantics: yurt doesn't model file ownership or
- * process priorities, so the calls accept-and-no-op (or return
- * sensible defaults) rather than fail.  Programs that actually
- * care about ownership round-tripping are out of scope.
+ * Sandbox semantics: file ownership mutators route through the
+ * host/kernel authorization boundary; process priorities still
+ * accept-and-no-op because yurt does not schedule by priority.
  */
 
 #include "yurt_markers.h"
@@ -47,20 +46,34 @@ YURT_DEFINE_MARKER(setpriority, 0x73707269u) /* "spri" */
 
 int chown(const char *path, uid_t owner, gid_t group) {
   YURT_MARKER_CALL(chown);
-  (void)path; (void)owner; (void)group;
-  return 0;
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  int rc = yurt_host_chown((int)(intptr_t)path, (int)strlen(path), (int)owner, (int)group, 1);
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? ENOENT : (rc == -2) ? EPERM : EIO;
+  return -1;
 }
 
 int lchown(const char *path, uid_t owner, gid_t group) {
   YURT_MARKER_CALL(lchown);
-  (void)path; (void)owner; (void)group;
-  return 0;
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  int rc = yurt_host_chown((int)(intptr_t)path, (int)strlen(path), (int)owner, (int)group, 0);
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? ENOENT : (rc == -2) ? EPERM : EIO;
+  return -1;
 }
 
 int fchown(int fd, uid_t owner, gid_t group) {
   YURT_MARKER_CALL(fchown);
-  (void)fd; (void)owner; (void)group;
-  return 0;
+  int rc = yurt_host_fchown(fd, (int)owner, (int)group);
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? EBADF : (rc == -2) ? EPERM : EIO;
+  return -1;
 }
 
 int fchdir(int fd) {

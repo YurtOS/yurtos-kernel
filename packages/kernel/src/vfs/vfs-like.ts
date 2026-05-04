@@ -29,6 +29,7 @@ export interface VfsLike {
   link?(oldPath: string, newPath: string): void;
   readlink(path: string): string;
   chmod(path: string, mode: number): void;
+  chown(path: string, uid: number, gid: number, followSymlinks?: boolean): void;
   withWriteAccess(fn: () => void): void;
   /**
    * Optional: detect a streaming-capable provider entry (e.g.

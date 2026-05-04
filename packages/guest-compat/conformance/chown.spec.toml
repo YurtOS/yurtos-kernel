@@ -1,0 +1,9 @@
+canary = "posix-runtime-canary"
+symbol = "chown"
+
+[[cases]]
+name = "chown_denied"
+inputs = "create /tmp/yurt-chown-canary.txt, chown/lchown/fchown as uid 1000"
+expected.exit = 0
+expected.stdout = "chown_denied:ok"
+expected.note = "ownership changes are host/kernel authorized; the non-root sandbox user gets EPERM, missing paths map to ENOENT"
