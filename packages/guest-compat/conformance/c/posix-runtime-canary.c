@@ -3,6 +3,7 @@
 #include <net/if.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/sendfile.h>
 #include <unistd.h>
 
@@ -89,6 +90,38 @@ static int case_sendfile_bad_fd(void) {
   return n == -1 ? 0 : 1;
 }
 
+static int case_chmod_readonly(void) {
+  const char *path = "/tmp/yurt-chmod-canary.txt";
+  unlink(path);
+
+  int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  if (fd < 0) {
+    emit("chmod_readonly", 1, "chmod_readonly:create_failed", 1, errno);
+    return 1;
+  }
+  if (write(fd, "x", 1) != 1) {
+    int e = errno;
+    close(fd);
+    emit("chmod_readonly", 1, "chmod_readonly:write_failed", 1, e);
+    return 1;
+  }
+  close(fd);
+
+  errno = 0;
+  if (chmod(path, 0444) != 0) {
+    emit("chmod_readonly", 1, "chmod_readonly:chmod_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (chmod("/tmp/yurt-chmod-missing.txt", 0644) != -1 || errno != ENOENT) {
+    emit("chmod_readonly", 1, "chmod_readonly:missing_not_enoent", 1, errno);
+    return 1;
+  }
+  emit("chmod_readonly", 0, "chmod_readonly:ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "hostname") == 0) return case_hostname();
   if (strcmp(name, "hostname_too_small") == 0) return case_hostname_too_small();
@@ -98,6 +131,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "missing_index") == 0) return case_missing_index();
   if (strcmp(name, "sendfile_zero_count") == 0) return case_sendfile_zero_count();
   if (strcmp(name, "sendfile_bad_fd") == 0) return case_sendfile_bad_fd();
+  if (strcmp(name, "chmod_readonly") == 0) return case_chmod_readonly();
   fprintf(stderr, "posix-runtime-canary: unknown case %s\n", name);
   return 2;
 }
@@ -111,6 +145,7 @@ static int list_cases(void) {
   puts("missing_index");
   puts("sendfile_zero_count");
   puts("sendfile_bad_fd");
+  puts("chmod_readonly");
   return 0;
 }
 

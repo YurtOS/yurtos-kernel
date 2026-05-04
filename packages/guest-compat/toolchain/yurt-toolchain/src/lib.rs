@@ -18,6 +18,7 @@ pub mod wasm_opt;
 pub const TIER1: &[&str] = &[
     "chown",
     "chroot",
+    "chmod",
     "flockfile",
     "ftrylockfile",
     "funlockfile",

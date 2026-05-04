@@ -28,6 +28,7 @@ YURT_DECLARE_MARKER(lchown);
 YURT_DECLARE_MARKER(fchown);
 YURT_DECLARE_MARKER(fchdir);
 YURT_DECLARE_MARKER(chroot);
+YURT_DECLARE_MARKER(chmod);
 YURT_DECLARE_MARKER(getpriority);
 YURT_DECLARE_MARKER(setpriority);
 
@@ -36,6 +37,7 @@ YURT_DEFINE_MARKER(lchown,      0x6c63686fu) /* "lcho" */
 YURT_DEFINE_MARKER(fchown,      0x6663686fu) /* "fcho" */
 YURT_DEFINE_MARKER(fchdir,      0x66636864u) /* "fchd" */
 YURT_DEFINE_MARKER(chroot,      0x6368726fu) /* "chro" */
+YURT_DEFINE_MARKER(chmod,       0x63686d6fu) /* "chmo" */
 YURT_DEFINE_MARKER(getpriority, 0x67707269u) /* "gpri" */
 YURT_DEFINE_MARKER(setpriority, 0x73707269u) /* "spri" */
 /* getrusage is provided by libwasi-emulated-process-clocks; we used
@@ -72,6 +74,18 @@ int chroot(const char *path) {
   YURT_MARKER_CALL(chroot);
   (void)path;
   errno = ENOSYS;
+  return -1;
+}
+
+int chmod(const char *path, mode_t mode) {
+  YURT_MARKER_CALL(chmod);
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  int rc = yurt_host_chmod((int)(intptr_t)path, (int)strlen(path), (int)mode);
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? ENOENT : EIO;
   return -1;
 }
 

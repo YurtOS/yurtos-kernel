@@ -1,0 +1,9 @@
+canary = "posix-runtime-canary"
+summary = "Route chmod through the Yurt VFS permission backend."
+
+[[case]]
+name = "chmod_readonly"
+inputs = "create /tmp/yurt-chmod-canary.txt, chmod(path, 0444), chmod(missing, 0644)"
+expected.exit = 0
+expected.stdout = "chmod_readonly:ok"
+expected.note = "existing chmod succeeds through host_chmod; missing paths map to ENOENT"

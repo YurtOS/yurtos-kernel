@@ -18,6 +18,7 @@ extern "C" {
 #endif
 
 mode_t umask(mode_t mask);
+int chmod(const char *path, mode_t mode);
 
 /* mknod — creating device nodes is not supported in the WASI sandbox;
  * callers (tar, cp) silently fall back when EPERM is returned. */

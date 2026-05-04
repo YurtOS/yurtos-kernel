@@ -32,6 +32,7 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
             "resource-canary",
             &[
                 "chown",
+                "chmod",
                 "chroot",
                 "fchdir",
                 "fchown",

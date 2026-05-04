@@ -72,6 +72,7 @@ fn main() {
 const TIER1: &[&str] = &[
     "chown",
     "chroot",
+    "chmod",
     "flockfile",
     "ftrylockfile",
     "funlockfile",
