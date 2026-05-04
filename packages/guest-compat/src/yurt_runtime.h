@@ -38,6 +38,24 @@ int yurt_host_getpid(void);
 __attribute__((import_module("yurt"), import_name("host_getppid")))
 int yurt_host_getppid(void);
 
+__attribute__((import_module("yurt"), import_name("host_getuid")))
+int yurt_host_getuid(void);
+
+__attribute__((import_module("yurt"), import_name("host_geteuid")))
+int yurt_host_geteuid(void);
+
+__attribute__((import_module("yurt"), import_name("host_getgid")))
+int yurt_host_getgid(void);
+
+__attribute__((import_module("yurt"), import_name("host_getegid")))
+int yurt_host_getegid(void);
+
+__attribute__((import_module("yurt"), import_name("host_setresuid")))
+int yurt_host_setresuid(int ruid, int euid, int suid);
+
+__attribute__((import_module("yurt"), import_name("host_setresgid")))
+int yurt_host_setresgid(int rgid, int egid, int sgid);
+
 /* host_kill returns 0 on success, -1 with kill(2)-style ESRCH (no such
  * process) on failure.  sig=0 is the existence probe (no signal sent). */
 __attribute__((import_module("yurt"), import_name("host_kill")))

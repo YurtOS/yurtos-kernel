@@ -125,3 +125,45 @@ Deno.test("host_fchown resolves vfs file descriptors through the kernel", () => 
   assertEquals(vfs.stat("/tmp/fd-owned.txt").uid, 2000);
   assertEquals(vfs.stat("/tmp/fd-owned.txt").gid, 2000);
 });
+
+Deno.test("host uid/gid imports are backed by kernel credentials", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  const imports = createKernelImports({ memory, kernel, callerPid: pid, callerUid: 0 });
+
+  assertEquals((imports.host_getuid as () => number)(), 1000);
+  assertEquals((imports.host_geteuid as () => number)(), 1000);
+  assertEquals((imports.host_getgid as () => number)(), 1000);
+  assertEquals((imports.host_getegid as () => number)(), 1000);
+});
+
+Deno.test("host_setresuid and host_setresgid deny unprivileged root escalation but allow no-op transitions", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals((imports.host_setresuid as (...args: number[]) => number)(1000, 1000, 1000), 0);
+  assertEquals((imports.host_setresuid as (...args: number[]) => number)(-1, -1, -1), 0);
+  assertEquals((imports.host_setresuid as (...args: number[]) => number)(0, 0, 0), -2);
+  assertEquals((imports.host_setresgid as (...args: number[]) => number)(1000, 1000, 1000), 0);
+  assertEquals((imports.host_setresgid as (...args: number[]) => number)(-1, -1, -1), 0);
+  assertEquals((imports.host_setresgid as (...args: number[]) => number)(0, 0, 0), -2);
+  assertEquals(kernel.getCredentials(pid), { uid: 1000, gid: 1000, euid: 1000, egid: 1000, suid: 1000, sgid: 1000 });
+});
+
+Deno.test("root process can change effective credentials for future authorization", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.withWriteAccess(() => {
+    vfs.writeFile("/tmp/root-owned.txt", new Uint8Array(1));
+  });
+  const kernel = new ProcessKernel();
+  const imports = createKernelImports({ memory, vfs, kernel, callerPid: 1 });
+
+  assertEquals((imports.host_setresuid as (...args: number[]) => number)(1000, 1000, 1000), 0);
+  const pathLen = writeString(memory, 0, "/tmp/root-owned.txt");
+  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777), -2);
+  assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
+});

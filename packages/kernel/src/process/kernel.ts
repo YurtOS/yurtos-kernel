@@ -17,6 +17,10 @@ export const USER_GID = 1000;
 export interface ProcessCredentials {
   uid: number;
   gid: number;
+  euid: number;
+  egid: number;
+  suid: number;
+  sgid: number;
 }
 
 export interface SpawnRequest {
@@ -69,7 +73,7 @@ export class ProcessKernel {
       pid: INIT_PID, promise: null, exitCode: -1, state: 'running',
       wasiHost: null, waiters: [], command: 'init',
       pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
-      credentials: { uid: ROOT_UID, gid: ROOT_GID },
+      credentials: rootCredentials(),
     });
     this.parentPids.set(INIT_PID, 0);
     this.children.set(INIT_PID, new Set());
@@ -122,12 +126,50 @@ export class ProcessKernel {
   }
 
   getCredentials(pid: number): ProcessCredentials {
-    return this.processTable.get(pid)?.credentials ?? { uid: USER_UID, gid: USER_GID };
+    return this.processTable.get(pid)?.credentials ?? userCredentials();
+  }
+
+  setresuid(pid: number, ruid: number, euid: number, suid: number): boolean {
+    const entry = this.processTable.get(pid);
+    if (!entry) return false;
+    const current = entry.credentials;
+    const allowed = new Set([current.uid, current.euid, current.suid]);
+    if (current.euid !== ROOT_UID) {
+      for (const value of [ruid, euid, suid]) {
+        if (value !== -1 && !allowed.has(value)) return false;
+      }
+    }
+    entry.credentials = {
+      ...current,
+      uid: ruid === -1 ? current.uid : ruid,
+      euid: euid === -1 ? current.euid : euid,
+      suid: suid === -1 ? current.suid : suid,
+    };
+    return true;
+  }
+
+  setresgid(pid: number, rgid: number, egid: number, sgid: number): boolean {
+    const entry = this.processTable.get(pid);
+    if (!entry) return false;
+    const current = entry.credentials;
+    const allowed = new Set([current.gid, current.egid, current.sgid]);
+    if (current.euid !== ROOT_UID) {
+      for (const value of [rgid, egid, sgid]) {
+        if (value !== -1 && !allowed.has(value)) return false;
+      }
+    }
+    entry.credentials = {
+      ...current,
+      gid: rgid === -1 ? current.gid : rgid,
+      egid: egid === -1 ? current.egid : egid,
+      sgid: sgid === -1 ? current.sgid : sgid,
+    };
+    return true;
   }
 
   private credentialsForChild(ppid: number): ProcessCredentials {
     const parent = this.processTable.get(ppid);
-    if (!parent || ppid === INIT_PID) return { uid: USER_UID, gid: USER_GID };
+    if (!parent || ppid === INIT_PID) return userCredentials();
     return { ...parent.credentials };
   }
 
@@ -195,7 +237,7 @@ export class ProcessKernel {
     this.processTable.set(pid, {
       pid, promise, exitCode: -1, state: 'running', wasiHost, waiters: [],
       pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
-      credentials: { uid: USER_UID, gid: USER_GID },
+      credentials: userCredentials(),
     });
     const onExit = () => {
       const entry = this.processTable.get(pid);
@@ -621,4 +663,12 @@ export class ProcessKernel {
     this.fileLocks.clear();
     this.ttyTable.clear();
   }
+}
+
+function rootCredentials(): ProcessCredentials {
+  return { uid: ROOT_UID, gid: ROOT_GID, euid: ROOT_UID, egid: ROOT_GID, suid: ROOT_UID, sgid: ROOT_GID };
+}
+
+function userCredentials(): ProcessCredentials {
+  return { uid: USER_UID, gid: USER_GID, euid: USER_UID, egid: USER_GID, suid: USER_UID, sgid: USER_GID };
 }

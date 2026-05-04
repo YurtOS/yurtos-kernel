@@ -209,10 +209,8 @@ function globMatch(vfs: VfsLike, pattern: string): string[] {
 export function createKernelImports(opts: KernelImportsOptions): Record<string, WebAssembly.ImportValue> {
   const { memory } = opts;
   const callerPid = opts.callerPid ?? 0;
-  const callerCredentials: ProcessCredentials = opts.kernel?.getCredentials(callerPid) ?? {
-    uid: opts.callerUid ?? USER_UID,
-    gid: opts.callerGid ?? USER_GID,
-  };
+  const fallbackUid = opts.callerUid ?? USER_UID;
+  const fallbackGid = opts.callerGid ?? USER_GID;
   const bridgeSocketBackend = opts.networkBridge ? createNetworkBridgeSocketBackend(opts.networkBridge) : undefined;
   const socketBackend = opts.socketBackend ??
     (opts.serverSockets?.allowLoopback === true
@@ -220,6 +218,33 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       : bridgeSocketBackend);
   const socketLocalHost = opts.socketLocalHost ?? '10.0.2.15';
   const socketLocalPortForFd = (fd: number) => 49152 + (Math.max(0, fd - 3) % 16384);
+
+  function getCallerCredentials(): ProcessCredentials {
+    return opts.kernel?.getCredentials(callerPid) ?? {
+      uid: fallbackUid,
+      gid: fallbackGid,
+      euid: fallbackUid,
+      egid: fallbackGid,
+      suid: fallbackUid,
+      sgid: fallbackGid,
+    };
+  }
+
+  function setFallbackUid(ruid: number, euid: number, suid: number): number {
+    const current = new Set([fallbackUid]);
+    for (const value of [ruid, euid, suid]) {
+      if (value !== -1 && !current.has(value)) return ERR_PERMISSION;
+    }
+    return 0;
+  }
+
+  function setFallbackGid(rgid: number, egid: number, sgid: number): number {
+    const current = new Set([fallbackGid]);
+    for (const value of [rgid, egid, sgid]) {
+      if (value !== -1 && !current.has(value)) return ERR_PERMISSION;
+    }
+    return 0;
+  }
 
   function bytesToBase64(data: Uint8Array): string {
     let binary = '';
@@ -367,6 +392,32 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // sees getppid() == 0, mirroring Linux init).
     host_getppid(): number {
       return opts.kernel ? opts.kernel.getPpid(callerPid) : 0;
+    },
+
+    host_getuid(): number {
+      return getCallerCredentials().uid;
+    },
+
+    host_geteuid(): number {
+      return getCallerCredentials().euid;
+    },
+
+    host_getgid(): number {
+      return getCallerCredentials().gid;
+    },
+
+    host_getegid(): number {
+      return getCallerCredentials().egid;
+    },
+
+    host_setresuid(ruid: number, euid: number, suid: number): number {
+      if (!opts.kernel) return setFallbackUid(ruid, euid, suid);
+      return opts.kernel.setresuid(callerPid, ruid, euid, suid) ? 0 : ERR_PERMISSION;
+    },
+
+    host_setresgid(rgid: number, egid: number, sgid: number): number {
+      if (!opts.kernel) return setFallbackGid(rgid, egid, sgid);
+      return opts.kernel.setresgid(callerPid, rgid, egid, sgid) ? 0 : ERR_PERMISSION;
     },
 
     // host_kill(pid, sig) -> i32
@@ -1350,7 +1401,8 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       const path = readString(memory, pathPtr, pathLen);
       try {
         const stat = opts.vfs.stat(path);
-        if (callerCredentials.uid !== ROOT_UID && stat.uid !== callerCredentials.uid) {
+        const credentials = getCallerCredentials();
+        if (credentials.euid !== ROOT_UID && stat.uid !== credentials.euid) {
           return ERR_PERMISSION;
         }
         opts.vfs.chmod(path, mode);
@@ -1368,7 +1420,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       const path = readString(memory, pathPtr, pathLen);
       try {
         opts.vfs.stat(path);
-        if (callerCredentials.uid !== ROOT_UID) return ERR_PERMISSION;
+        if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
         opts.vfs.chown(path, uid, gid, followSymlinks !== 0);
         return 0;
       } catch (e: unknown) {
@@ -1385,7 +1437,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (!target || target.type !== 'vfs_file') return ERR_NOT_FOUND;
       const path = target.fdTable.getPath(target.fd);
       if (!path) return ERR_NOT_FOUND;
-      if (callerCredentials.uid !== ROOT_UID) return ERR_PERMISSION;
+      if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
       try {
         opts.vfs.chown(path, uid, gid);
         return 0;

@@ -1,0 +1,9 @@
+canary = "posix-runtime-canary"
+symbol = "setresuid"
+
+[[cases]]
+name = "identity_kernel"
+inputs = "read uid/gid, no-op setresuid/setresgid, attempt root escalation"
+expected.exit = 0
+expected.stdout = "identity_kernel:ok"
+expected.note = "process identity is backed by kernel credentials; uid 1000 cannot become root"

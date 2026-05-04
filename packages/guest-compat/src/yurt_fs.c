@@ -183,23 +183,59 @@ void qsort_r(void *base, size_t nmemb, size_t size,
   qsort_r_arg = NULL;
 }
 
-/* ── setresuid / setresgid — Linux extensions ──
- * Sandbox is single-user (uid=gid=1000); accept-and-ignore.  Required
- * for gnulib's lib/spawni.c which is dead code for us anyway, but
- * still needs to link. */
+/* ── uid/gid accessors and mutators ──
+ * Credentials live in the yurt process kernel.  Userland can request
+ * transitions, but the host import enforces POSIX-style authorization
+ * against the caller's effective uid/gid. */
 YURT_DECLARE_MARKER(setresuid);
 YURT_DECLARE_MARKER(setresgid);
 YURT_DEFINE_MARKER(setresuid, 0x73727569u) /* "srui" */
 YURT_DEFINE_MARKER(setresgid, 0x73726769u) /* "srgi" */
 
+uid_t getuid(void) {
+  return (uid_t)yurt_host_getuid();
+}
+
+uid_t geteuid(void) {
+  return (uid_t)yurt_host_geteuid();
+}
+
+gid_t getgid(void) {
+  return (gid_t)yurt_host_getgid();
+}
+
+gid_t getegid(void) {
+  return (gid_t)yurt_host_getegid();
+}
+
 int setresuid(uid_t r, uid_t e, uid_t s) {
   YURT_MARKER_CALL(setresuid);
-  (void)r; (void)e; (void)s;
-  return 0;
+  int rc = yurt_host_setresuid((int)r, (int)e, (int)s);
+  if (rc == 0) return 0;
+  errno = EPERM;
+  return -1;
 }
 
 int setresgid(gid_t r, gid_t e, gid_t s) {
   YURT_MARKER_CALL(setresgid);
-  (void)r; (void)e; (void)s;
-  return 0;
+  int rc = yurt_host_setresgid((int)r, (int)e, (int)s);
+  if (rc == 0) return 0;
+  errno = EPERM;
+  return -1;
+}
+
+int setuid(uid_t uid) {
+  return setresuid(uid, uid, uid);
+}
+
+int seteuid(uid_t uid) {
+  return setresuid((uid_t)-1, uid, (uid_t)-1);
+}
+
+int setgid(gid_t gid) {
+  return setresgid(gid, gid, gid);
+}
+
+int setegid(gid_t gid) {
+  return setresgid((gid_t)-1, gid, (gid_t)-1);
 }

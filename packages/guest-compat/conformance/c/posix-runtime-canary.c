@@ -173,6 +173,58 @@ static int case_chown_denied(void) {
   return 0;
 }
 
+static int case_identity_kernel(void) {
+  if (getuid() != 1000 || geteuid() != 1000 || getgid() != 1000 || getegid() != 1000) {
+    emit("identity_kernel", 1, "identity_kernel:unexpected_ids", 0, 0);
+    return 1;
+  }
+
+  errno = 0;
+  if (setresuid(1000, 1000, 1000) != 0) {
+    emit("identity_kernel", 1, "identity_kernel:setresuid_noop_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (setresuid((uid_t)-1, (uid_t)-1, (uid_t)-1) != 0) {
+    emit("identity_kernel", 1, "identity_kernel:setresuid_keep_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (setresuid(0, 0, 0) != -1 || errno != EPERM) {
+    emit("identity_kernel", 1, "identity_kernel:setresuid_root_not_eperm", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (seteuid(0) != -1 || errno != EPERM) {
+    emit("identity_kernel", 1, "identity_kernel:seteuid_root_not_eperm", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (setresgid(1000, 1000, 1000) != 0) {
+    emit("identity_kernel", 1, "identity_kernel:setresgid_noop_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (setresgid(0, 0, 0) != -1 || errno != EPERM) {
+    emit("identity_kernel", 1, "identity_kernel:setresgid_root_not_eperm", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (setegid(0) != -1 || errno != EPERM) {
+    emit("identity_kernel", 1, "identity_kernel:setegid_root_not_eperm", 1, errno);
+    return 1;
+  }
+
+  emit("identity_kernel", 0, "identity_kernel:ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "hostname") == 0) return case_hostname();
   if (strcmp(name, "hostname_too_small") == 0) return case_hostname_too_small();
@@ -184,6 +236,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "sendfile_bad_fd") == 0) return case_sendfile_bad_fd();
   if (strcmp(name, "chmod_readonly") == 0) return case_chmod_readonly();
   if (strcmp(name, "chown_denied") == 0) return case_chown_denied();
+  if (strcmp(name, "identity_kernel") == 0) return case_identity_kernel();
   fprintf(stderr, "posix-runtime-canary: unknown case %s\n", name);
   return 2;
 }
@@ -199,6 +252,7 @@ static int list_cases(void) {
   puts("sendfile_bad_fd");
   puts("chmod_readonly");
   puts("chown_denied");
+  puts("identity_kernel");
   return 0;
 }
 

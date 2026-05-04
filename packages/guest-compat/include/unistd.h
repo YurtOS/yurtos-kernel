@@ -157,8 +157,17 @@ pid_t setpgrp(void);
 pid_t tcgetpgrp(int fd);
 int   tcsetpgrp(int fd, pid_t pgrp);
 
-/* setresuid / setresgid — Linux extensions, gated in wasi-libc.
- * Sandbox is single-user; impls in yurt_fs.c are no-ops. */
+/* uid/gid accessors and mutators — real symbols in libyurt_guest_compat.a
+ * (yurt_fs.c).  The yurt process kernel owns credentials and authorization
+ * checks use the caller's effective uid/gid at the host boundary. */
+uid_t getuid(void);
+uid_t geteuid(void);
+gid_t getgid(void);
+gid_t getegid(void);
+int setuid(uid_t uid);
+int seteuid(uid_t uid);
+int setgid(gid_t gid);
+int setegid(gid_t gid);
 int setresuid(uid_t r, uid_t e, uid_t s);
 int setresgid(gid_t r, gid_t e, gid_t s);
 
@@ -202,39 +211,9 @@ static inline int sethostname(const char *name, size_t len) {
 extern int kill(pid_t pid, int sig);
 extern int killpg(pid_t pgrp, int sig);
 
-/* uid/gid accessors — sandbox is single-user.  Report a regular,
- * non-privileged user (1000) rather than root (0): many tools take
- * different code paths under euid==0 (skip permission checks, refuse
- * to run, attempt privileged ops), and we are NOT a privileged
- * environment.  The value matches the yurt `id` applet output
- * (uid=1000(user) gid=1000(user)) so guest and sandbox agree.
- *
- * set*uid/set*gid silently succeed when the caller asks for the
- * current id (POSIX-conformant; setuid(geteuid()) is a no-op) and
- * fail with EPERM otherwise — we cannot actually change identity. */
+/* Default guest user exposed by the kernel for normal processes. */
 #define YURT_DEFAULT_UID ((uid_t)1000)
 #define YURT_DEFAULT_GID ((gid_t)1000)
-
-static inline uid_t getuid(void) { return YURT_DEFAULT_UID; }
-static inline uid_t geteuid(void) { return YURT_DEFAULT_UID; }
-static inline gid_t getgid(void) { return YURT_DEFAULT_GID; }
-static inline gid_t getegid(void) { return YURT_DEFAULT_GID; }
-static inline int setuid(uid_t uid) {
-    if (uid == YURT_DEFAULT_UID) return 0;
-    errno = EPERM; return -1;
-}
-static inline int seteuid(uid_t uid) {
-    if (uid == YURT_DEFAULT_UID) return 0;
-    errno = EPERM; return -1;
-}
-static inline int setgid(gid_t gid) {
-    if (gid == YURT_DEFAULT_GID) return 0;
-    errno = EPERM; return -1;
-}
-static inline int setegid(gid_t gid) {
-    if (gid == YURT_DEFAULT_GID) return 0;
-    errno = EPERM; return -1;
-}
 
 /* waitpid/wait: stubbed in sys/wait.h. */
 
