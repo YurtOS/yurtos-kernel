@@ -291,17 +291,47 @@ export class VFS {
     return { uid: this.uid, gid: this.gid };
   }
 
-  private canWrite(inode: Inode): boolean {
+  private canAccess(inode: Inode, ownerBit: number, groupBit: number, otherBit: number): boolean {
     if (this.initializing || this.uid === ROOT_UID) return true;
     const mode = inode.metadata.permissions;
-    if (inode.metadata.uid === this.uid) return (mode & 0o200) !== 0;
-    if (inode.metadata.gid === this.gid) return (mode & 0o020) !== 0;
-    return (mode & 0o002) !== 0;
+    if (inode.metadata.uid === this.uid) return (mode & ownerBit) !== 0;
+    if (inode.metadata.gid === this.gid) return (mode & groupBit) !== 0;
+    return (mode & otherBit) !== 0;
+  }
+
+  private canRead(inode: Inode): boolean {
+    return this.canAccess(inode, 0o400, 0o040, 0o004);
+  }
+
+  private canWrite(inode: Inode): boolean {
+    return this.canAccess(inode, 0o200, 0o020, 0o002);
+  }
+
+  private canExecute(inode: Inode): boolean {
+    return this.canAccess(inode, 0o100, 0o010, 0o001);
+  }
+
+  private assertReadPermission(inode: Inode): void {
+    if (!this.canRead(inode)) {
+      throw new VfsError('EACCES', 'permission denied');
+    }
   }
 
   /** Throw EACCES if the effective user cannot write the inode. Bypassed during init/withWriteAccess. */
   private assertWritePermission(inode: Inode): void {
     if (!this.canWrite(inode)) {
+      throw new VfsError('EACCES', 'permission denied');
+    }
+  }
+
+  private assertSearchPermission(inode: Inode): void {
+    if (!this.canExecute(inode)) {
+      throw new VfsError('EACCES', 'permission denied');
+    }
+  }
+
+  private assertDirectoryMutationPermission(inode: Inode): void {
+    if (!this.canWrite(inode) || !this.canExecute(inode)) {
       throw new VfsError('EACCES', 'permission denied');
     }
   }
@@ -364,6 +394,7 @@ export class VFS {
       if (current.type !== 'dir') {
         throw new VfsError('ENOTDIR', `not a directory: ${path}`);
       }
+      this.assertSearchPermission(current);
 
       const child = current.children.get(segments[i]);
       if (child === undefined) {
@@ -413,6 +444,7 @@ export class VFS {
       if (current.type !== 'dir') {
         throw new VfsError('ENOTDIR', `not a directory: ${path}`);
       }
+      this.assertSearchPermission(current);
       const child = current.children.get(segment);
       if (child === undefined) {
         throw new VfsError('ENOENT', `no such file or directory: ${path}`);
@@ -429,6 +461,7 @@ export class VFS {
     if (current.type !== 'dir') {
       throw new VfsError('ENOTDIR', `not a directory: ${path}`);
     }
+    this.assertSearchPermission(current);
 
     return { parent: current, name };
   }
@@ -520,6 +553,7 @@ export class VFS {
       // Should not happen after resolve with followSymlinks, but guard anyway
       return this.readFile(inode.target);
     }
+    this.assertReadPermission(inode);
 
     inode.metadata.atime = new Date();
     return inode.content;
@@ -558,7 +592,7 @@ export class VFS {
     if (existing !== undefined && existing.type === 'file') {
       this.assertWritePermission(existing);
     } else {
-      this.assertWritePermission(parent);
+      this.assertDirectoryMutationPermission(parent);
     }
 
     const oldSize = (existing !== undefined && existing.type === 'file') ? existing.content.byteLength : 0;
@@ -584,7 +618,7 @@ export class VFS {
 
   mkdir(path: string, mode = 0o755): void {
     const { parent, name } = this.resolveParent(path);
-    this.assertWritePermission(parent);
+    this.assertDirectoryMutationPermission(parent);
 
     if (parent.children.has(name)) {
       throw new VfsError('EEXIST', `file exists: ${path}`);
@@ -612,7 +646,7 @@ export class VFS {
         }
         current = existing;
       } else {
-        this.assertWritePermission(current);
+        this.assertDirectoryMutationPermission(current);
         this.assertFileCountLimit();
         const owner = this.currentOwner();
         const newDir = createDirInode(0o755, owner.uid, owner.gid);
@@ -635,6 +669,7 @@ export class VFS {
     if (inode.type !== 'dir') {
       throw new VfsError('ENOTDIR', `not a directory: ${path}`);
     }
+    this.assertReadPermission(inode);
 
     inode.metadata.atime = new Date();
     const entries: DirEntry[] = [];
@@ -648,7 +683,7 @@ export class VFS {
 
   unlink(path: string): void {
     const { parent, name } = this.resolveParent(path);
-    this.assertWritePermission(parent);
+    this.assertDirectoryMutationPermission(parent);
     const child = parent.children.get(name);
 
     if (child === undefined) {
@@ -668,7 +703,7 @@ export class VFS {
 
   rmdir(path: string): void {
     const { parent, name } = this.resolveParent(path);
-    this.assertWritePermission(parent);
+    this.assertDirectoryMutationPermission(parent);
     const child = parent.children.get(name);
 
     if (child === undefined) {
@@ -688,7 +723,7 @@ export class VFS {
 
   rename(oldPath: string, newPath: string): void {
     const { parent: oldParent, name: oldName } = this.resolveParent(oldPath);
-    this.assertWritePermission(oldParent);
+    this.assertDirectoryMutationPermission(oldParent);
     const child = oldParent.children.get(oldName);
 
     if (child === undefined) {
@@ -696,7 +731,7 @@ export class VFS {
     }
 
     const { parent: newParent, name: newName } = this.resolveParent(newPath);
-    this.assertWritePermission(newParent);
+    this.assertDirectoryMutationPermission(newParent);
 
     oldParent.children.delete(oldName);
     newParent.children.set(newName, child);
@@ -718,7 +753,7 @@ export class VFS {
    */
   link(oldPath: string, newPath: string): void {
     const { parent: newParent, name: newName } = this.resolveParent(newPath);
-    this.assertWritePermission(newParent);
+    this.assertDirectoryMutationPermission(newParent);
     if (newParent.children.has(newName)) {
       throw new VfsError('EEXIST', `file exists: ${newPath}`);
     }
@@ -743,7 +778,7 @@ export class VFS {
 
   symlink(target: string, path: string): void {
     const { parent, name } = this.resolveParent(path);
-    this.assertWritePermission(parent);
+    this.assertDirectoryMutationPermission(parent);
 
     if (parent.children.has(name)) {
       throw new VfsError('EEXIST', `file exists: ${path}`);

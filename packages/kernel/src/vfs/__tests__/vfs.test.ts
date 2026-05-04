@@ -341,6 +341,59 @@ describe('mode-bit enforcement', () => {
     }).toThrow(/EACCES/);
   });
 
+  it('readFile uses owner, group, and other read bits', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.writeFile('/tmp/private.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/private.txt', 0o640);
+
+    const groupPeer = owner.cowClone({ uid: 3000, gid: 2000 });
+    expect(groupPeer.readFile('/tmp/private.txt')).toEqual(new Uint8Array([1]));
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+    expect(() => other.readFile('/tmp/private.txt')).toThrow(/EACCES/);
+
+    const root = owner.cowClone({ uid: 0, gid: 0 });
+    expect(root.readFile('/tmp/private.txt')).toEqual(new Uint8Array([1]));
+  });
+
+  it('directory search requires execute permission on every traversed directory', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.mkdir('/tmp/private-dir');
+    owner.writeFile('/tmp/private-dir/file.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/private-dir', 0o600);
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+    expect(() => other.stat('/tmp/private-dir/file.txt')).toThrow(/EACCES/);
+    expect(() => other.readFile('/tmp/private-dir/file.txt')).toThrow(/EACCES/);
+  });
+
+  it('directory listing requires read permission on the directory', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.mkdir('/tmp/listable');
+    owner.writeFile('/tmp/listable/file.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/listable', 0o711);
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+    expect(() => other.readdir('/tmp/listable')).toThrow(/EACCES/);
+    expect(other.stat('/tmp/listable/file.txt').type).toBe('file');
+  });
+
+  it('creating entries in a directory requires write and execute permission', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.mkdir('/tmp/dropbox');
+    owner.chmod('/tmp/dropbox', 0o622);
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+    expect(() => {
+      other.writeFile('/tmp/dropbox/new.txt', new Uint8Array([1]));
+    }).toThrow(/EACCES/);
+
+    owner.chmod('/tmp/dropbox', 0o733);
+    const searchableOther = owner.cowClone({ uid: 3000, gid: 3000 });
+    searchableOther.writeFile('/tmp/dropbox/new.txt', new Uint8Array([1]));
+    expect(searchableOther.stat('/tmp/dropbox/new.txt').type).toBe('file');
+  });
+
   it('mkdir in 0o555 dir → EACCES', () => {
     const vfs = new VFS();
     expect(() => {
