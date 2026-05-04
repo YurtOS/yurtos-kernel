@@ -16,6 +16,7 @@ import {
 import { CooperativeSerialBackend } from "./threads/cooperative-serial.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
 import type { ThreadsBackend } from "./threads/backend.js";
+import { defaultWasmModuleCache, sha256Hex, type WasmModuleCache } from "./module-cache.js";
 
 function bindSignalDeliverer(wasi: WasiHost, instance: WebAssembly.Instance): void {
   const deliverSignal = instance.exports.yurt_deliver_signal;
@@ -46,6 +47,7 @@ export interface LoaderContext {
   makeFdReadAndClear(
     pid: number,
   ): (fd: 1 | 2) => { data: string; truncated: boolean };
+  moduleCache?: WasmModuleCache;
 }
 
 export interface LoadProcessOptions {
@@ -78,7 +80,9 @@ export async function loadProcess(
     throw new Error(`loadProcess: ${path} is not a wasm binary`);
   }
 
-  const module = await WebAssembly.compile(bytes as BufferSource);
+  const digest = await sha256Hex(bytes);
+  const module = await (ctx.moduleCache ?? defaultWasmModuleCache)
+    .getOrCompile(digest, bytes);
   const importsSetjmp = moduleImportsSetjmp(module);
   const setjmpMarked = moduleHasYurtFeature(module, "setjmp");
   if (importsSetjmp && !setjmpMarked) {

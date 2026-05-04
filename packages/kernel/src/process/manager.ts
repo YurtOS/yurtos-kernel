@@ -15,12 +15,14 @@ import { AsyncifyAsyncBridge } from '../async-bridge.js';
 
 import type { SpawnOptions, SpawnResult } from './process.js';
 import { NativeModuleRegistry } from './native-modules.js';
+import { defaultWasmModuleCache, sha256Hex, type WasmModuleCache } from './module-cache.js';
 
 export class ProcessManager {
   private vfs: VfsLike;
   private adapter: PlatformAdapter;
   private registry: Map<string, string> = new Map();
   private moduleCache: Map<string, WebAssembly.Module> = new Map();
+  private wasmModuleCache: WasmModuleCache;
   private networkBridge: NetworkBridgeLike | null;
   private currentHost: WasiHost | null = null;
   private toolAllowlist: Set<string> | null = null;
@@ -29,9 +31,16 @@ export class ProcessManager {
   /** Registry for dynamically loaded native Python module WASMs. */
   readonly nativeModules: NativeModuleRegistry;
 
-  constructor(vfs: VfsLike, adapter: PlatformAdapter, networkBridge?: NetworkBridgeLike, toolAllowlist?: string[]) {
+  constructor(
+    vfs: VfsLike,
+    adapter: PlatformAdapter,
+    networkBridge?: NetworkBridgeLike,
+    toolAllowlist?: string[],
+    wasmModuleCache: WasmModuleCache = defaultWasmModuleCache,
+  ) {
     this.vfs = vfs;
     this.adapter = adapter;
+    this.wasmModuleCache = wasmModuleCache;
     this.networkBridge = networkBridge ?? null;
     this.toolAllowlist = toolAllowlist ? new Set(toolAllowlist) : null;
     this.nativeModules = new NativeModuleRegistry();
@@ -76,7 +85,7 @@ export class ProcessManager {
     this.registerTool(name, wasmPath);
     // Load WASM bytes from VFS and compile directly (not from host filesystem)
     const wasmBytes = this.vfs.readFile(wasmPath);
-    const module = await WebAssembly.compile(wasmBytes as BufferSource);
+    const module = await this.compileBytes(wasmBytes);
     this.moduleCache.set(wasmPath, module);
   }
 
@@ -289,9 +298,15 @@ export class ProcessManager {
       return cached;
     }
 
-    const module = await this.adapter.loadModule(wasmPath);
+    const bytes = await this.adapter.readBytes(wasmPath);
+    const module = await this.compileBytes(bytes);
     this.moduleCache.set(wasmPath, module);
     return module;
+  }
+
+  private async compileBytes(bytes: Uint8Array): Promise<WebAssembly.Module> {
+    const digest = await sha256Hex(bytes);
+    return await this.wasmModuleCache.getOrCompile(digest, bytes);
   }
 
   /**
