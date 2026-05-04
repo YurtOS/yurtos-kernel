@@ -15,6 +15,7 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_getegid",
   "host_setresuid",
   "host_setresgid",
+  "host_umask",
   "host_getcwd",
   "host_chdir",
   "host_fchdir",

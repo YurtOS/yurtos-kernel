@@ -540,7 +540,7 @@ export class VFS {
     }
   }
 
-  writeFile(path: string, data: Uint8Array): void {
+  writeFile(path: string, data: Uint8Array, mode = 0o644): void {
     const match = this.matchProvider(path);
     if (match) {
       match.provider.writeFile(match.subpath, data);
@@ -575,14 +575,14 @@ export class VFS {
     } else {
       this.assertFileCountLimit();
       const owner = this.currentOwner();
-      parent.children.set(name, createFileInode(data, 0o644, owner.uid, owner.gid));
+      parent.children.set(name, createFileInode(data, normalizeMode(mode), owner.uid, owner.gid));
       this.currentFileCount++;
     }
     this.totalBytes += delta;
     this.notifyChange();
   }
 
-  mkdir(path: string): void {
+  mkdir(path: string, mode = 0o755): void {
     const { parent, name } = this.resolveParent(path);
     this.assertWritePermission(parent);
 
@@ -592,7 +592,7 @@ export class VFS {
 
     this.assertFileCountLimit();
     const owner = this.currentOwner();
-    parent.children.set(name, createDirInode(0o755, owner.uid, owner.gid));
+    parent.children.set(name, createDirInode(normalizeMode(mode), owner.uid, owner.gid));
     this.currentFileCount++;
     this.notifyChange();
   }
@@ -852,4 +852,8 @@ export class VFS {
       providers: this.providers,
     });
   }
+}
+
+function normalizeMode(mode: number): number {
+  return Math.trunc(mode) & 0o777;
 }

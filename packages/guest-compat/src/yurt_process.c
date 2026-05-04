@@ -206,10 +206,9 @@ pid_t wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage) {
  * `__wasilibc_unmodified_upstream` is set, so on wasm32-wasip1 they
  * compile out entirely.  Yurt is a single-process-group, single-
  * session sandbox; the natural answers are:
- *   - umask: track a process-wide mask, default 022 (POSIX).  We
- *     don't actually apply it in the VFS today, but tools that
- *     read/write the mask roundtrip cleanly so they get the
- *     defensive behaviour they asked for.
+ *   - umask: route the process-wide mask to the host kernel.  The
+ *     kernel owns inheritance and the WASI/VFS creation path applies
+ *     it to newly-created files and directories.
  *   - getpgrp/getpgid/setpgid/setsid/getsid: report PID 1 as
  *     everyone's pgroup/session, accept setpgid silently.  Mirrors
  *     a single-init-style system.
@@ -243,13 +242,9 @@ YURT_DEFINE_MARKER(setsid,    0x73736964u) /* "ssid" */
 YURT_DEFINE_MARKER(tcgetpgrp, 0x74636770u) /* "tcgp" */
 YURT_DEFINE_MARKER(tcsetpgrp, 0x74637370u) /* "tcsp" */
 
-static mode_t yurt_umask_state = 022;
-
 mode_t umask(mode_t mask) {
     YURT_MARKER_CALL(umask);
-    mode_t prev = yurt_umask_state;
-    yurt_umask_state = mask & 0777;
-    return prev;
+    return (mode_t)yurt_host_umask((int)mask);
 }
 
 pid_t getpgrp(void) {

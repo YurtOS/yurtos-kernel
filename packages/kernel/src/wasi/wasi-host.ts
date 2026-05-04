@@ -1242,7 +1242,7 @@ export class WasiHost {
         try {
           this.vfs.stat(absPath);
         } catch {
-          this.vfs.writeFile(absPath, new Uint8Array(0));
+          this.vfs.writeFile(absPath, new Uint8Array(0), this.creationMode(0o666));
         }
       } else {
         mode = 'r';
@@ -1253,7 +1253,7 @@ export class WasiHost {
         try {
           this.vfs.stat(absPath);
         } catch {
-          this.vfs.writeFile(absPath, new Uint8Array(0));
+          this.vfs.writeFile(absPath, new Uint8Array(0), this.creationMode(0o666));
         }
       }
 
@@ -1303,7 +1303,7 @@ export class WasiHost {
     try {
       const relativePath = this.readString(pathPtr, pathLen);
       const absPath = this.resolvePath(dirFd, relativePath);
-      this.vfs.mkdir(absPath);
+      this.vfs.mkdir(absPath, this.creationMode(0o777));
       return WASI_ESUCCESS;
     } catch (err) {
       if (err instanceof VfsError) {
@@ -1311,6 +1311,11 @@ export class WasiHost {
       }
       return fdErrorToWasi(err);
     }
+  }
+
+  private creationMode(baseMode: number): number {
+    const mask = this.kernel && this.pid !== undefined ? this.kernel.getUmask(this.pid) : 0o022;
+    return Math.trunc(baseMode) & ~mask & 0o777;
   }
 
   private pathRemoveDirectory(

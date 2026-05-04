@@ -169,6 +169,23 @@ Deno.test("root process can change effective credentials for future authorizatio
   assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
 });
 
+Deno.test("host_umask stores process-local mask inherited by children", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const parentPid = kernel.allocPid(1, "parent");
+  const imports = createKernelImports({ memory, kernel, callerPid: parentPid });
+
+  assertEquals((imports.host_umask as (mask: number) => number)(0o077), 0o022);
+  assertEquals(kernel.getUmask(parentPid), 0o077);
+
+  const childPid = kernel.allocPid(parentPid, "child");
+  assertEquals(kernel.getUmask(childPid), 0o077);
+
+  assertEquals((imports.host_umask as (mask: number) => number)(0o002), 0o077);
+  assertEquals(kernel.getUmask(parentPid), 0o002);
+  assertEquals(kernel.getUmask(childPid), 0o077);
+});
+
 Deno.test("host_chdir stores cwd in kernel process state and validates directories", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const vfs = new VFS({ uid: 1000, gid: 1000 });

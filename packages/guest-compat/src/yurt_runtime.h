@@ -56,6 +56,9 @@ int yurt_host_setresuid(int ruid, int euid, int suid);
 __attribute__((import_module("yurt"), import_name("host_setresgid")))
 int yurt_host_setresgid(int rgid, int egid, int sgid);
 
+__attribute__((import_module("yurt"), import_name("host_umask")))
+int yurt_host_umask(int mask);
+
 __attribute__((import_module("yurt"), import_name("host_getcwd")))
 int yurt_host_getcwd(int out_ptr, int out_cap);
 

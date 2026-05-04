@@ -51,6 +51,7 @@ export interface ProcessEntry {
   credentials: ProcessCredentials;
   cwd: string;
   nice: number;
+  umask: number;
 }
 
 interface FileLockState {
@@ -80,6 +81,7 @@ export class ProcessKernel {
       credentials: rootCredentials(),
       cwd: '/',
       nice: 0,
+      umask: 0o022,
     });
     this.parentPids.set(INIT_PID, 0);
     this.children.set(INIT_PID, new Set());
@@ -155,6 +157,18 @@ export class ProcessKernel {
     return true;
   }
 
+  getUmask(pid: number): number {
+    return this.processTable.get(pid)?.umask ?? 0o022;
+  }
+
+  setUmask(pid: number, mask: number): number {
+    const entry = this.processTable.get(pid);
+    if (!entry) return 0o022;
+    const prev = entry.umask;
+    entry.umask = normalizeUmask(mask);
+    return prev;
+  }
+
   setresuid(pid: number, ruid: number, euid: number, suid: number): boolean {
     const entry = this.processTable.get(pid);
     if (!entry) return false;
@@ -207,6 +221,10 @@ export class ProcessKernel {
     return this.processTable.get(ppid)?.nice ?? 0;
   }
 
+  private umaskForChild(ppid: number): number {
+    return this.processTable.get(ppid)?.umask ?? 0o022;
+  }
+
   buildFdTableForSpawn(callerPid: number, req: SpawnRequest): Map<number, FdTarget> {
     const callerFdTable = this.fdTables.get(callerPid);
     if (!callerFdTable) throw new Error(`No fd table for caller pid ${callerPid}`);
@@ -247,6 +265,7 @@ export class ProcessKernel {
         credentials: this.credentialsForChild(ppid),
         cwd: this.cwdForChild(ppid),
         nice: this.priorityForChild(ppid),
+        umask: this.umaskForChild(ppid),
       });
     }
   }
@@ -276,6 +295,7 @@ export class ProcessKernel {
       credentials: userCredentials(),
       cwd: '/',
       nice: 0,
+      umask: 0o022,
     });
     const onExit = () => {
       const entry = this.processTable.get(pid);
@@ -338,6 +358,7 @@ export class ProcessKernel {
         credentials: this.credentialsForChild(ppid ?? INIT_PID),
         cwd: this.cwdForChild(ppid ?? INIT_PID),
         nice: this.priorityForChild(ppid ?? INIT_PID),
+        umask: this.umaskForChild(ppid ?? INIT_PID),
       });
     }
   }
@@ -724,4 +745,8 @@ function normalizeKernelPath(path: string): string {
     parts.push(part);
   }
   return '/' + parts.join('/');
+}
+
+function normalizeUmask(mask: number): number {
+  return Math.trunc(mask) & 0o777;
 }

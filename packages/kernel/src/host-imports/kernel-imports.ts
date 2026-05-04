@@ -241,6 +241,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   const fallbackGid = opts.callerGid ?? USER_GID;
   const runtimeBackend = opts.runtimeBackend ?? unsupportedRuntimeEngineBackend;
   const schedulerBackend = runtimeBackend.scheduler;
+  let fallbackUmask = 0o022;
   const bridgeSocketBackend = opts.networkBridge ? createNetworkBridgeSocketBackend(opts.networkBridge) : undefined;
   const socketBackend = opts.socketBackend ??
     (opts.serverSockets?.allowLoopback === true
@@ -478,6 +479,13 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     host_setresgid(rgid: number, egid: number, sgid: number): number {
       if (!opts.kernel) return setFallbackGid(rgid, egid, sgid);
       return opts.kernel.setresgid(callerPid, rgid, egid, sgid) ? 0 : ERR_PERMISSION;
+    },
+
+    host_umask(mask: number): number {
+      if (opts.kernel) return opts.kernel.setUmask(callerPid, mask);
+      const prev = fallbackUmask;
+      fallbackUmask = Math.trunc(mask) & 0o777;
+      return prev;
     },
 
     host_getpriority(which: number, who: number): number {

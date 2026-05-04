@@ -8,11 +8,11 @@ import type { DirEntry, StatResult } from './inode.js';
 
 export interface VfsLike {
   readFile(path: string): Uint8Array;
-  writeFile(path: string, data: Uint8Array): void;
+  writeFile(path: string, data: Uint8Array, mode?: number): void;
   stat(path: string): StatResult;
   lstat(path: string): StatResult;
   readdir(path: string): DirEntry[];
-  mkdir(path: string): void;
+  mkdir(path: string, mode?: number): void;
   mkdirp(path: string): void;
   unlink(path: string): void;
   rmdir(path: string): void;
