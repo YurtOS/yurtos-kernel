@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "Install a signal handler the legacy way (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "signal_install"
+inputs = "signal(SIGINT, handler)"
+expected.exit = 0
+expected.stdout = "signal:installed"
+expected.note = "returns SIG_DFL the first time, never SIG_ERR"

@@ -1,0 +1,11 @@
+[package]
+name = "signal-canary"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "signal-canary"
+path = "src/main.rs"
+
+[dependencies]

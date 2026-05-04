@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "Round-trip the guest-local signal mask (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "sigprocmask_roundtrip"
+inputs = "SIG_SETMASK(SIGUSR1) then SIG_SETMASK(NULL, &old)"
+expected.exit = 0
+expected.stdout = "sigprocmask:roundtrip"
+expected.note = "guest-local mask only; no observation of external signals"

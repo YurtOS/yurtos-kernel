@@ -1,0 +1,8 @@
+[package]
+name = "false-cmd-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "false-cmd-wasm"
+path = "src/main.rs"

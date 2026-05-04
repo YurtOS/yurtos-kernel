@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "sigsuspend interaction with raise() (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "sigsuspend_resumes_on_raise"
+inputs = "install handler; raise(SIGUSR2) — handler runs synchronously"
+expected.exit = 0
+expected.stdout = "sigsuspend:handled"
+expected.note = "yurt dispatches on raise() rather than blocking"

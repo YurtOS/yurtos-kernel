@@ -1,0 +1,7 @@
+[package]
+name = "yurt-process"
+version = "0.1.0"
+edition = "2021"
+description = "Process-spawning helpers for yurt coreutils (wraps host_spawn_async / host_waitpid)"
+
+[dependencies]

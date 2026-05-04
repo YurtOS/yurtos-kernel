@@ -1,0 +1,802 @@
+/**
+ * In-memory VFS with POSIX semantics.
+ *
+ * Provides a tree of inodes (files, directories, symlinks) that can back
+ * WASI syscalls and Pyodide's filesystem. Designed to be snapshotable
+ * (for fork simulation) and extensible with pipes (for shell pipelines).
+ */
+
+import type { DirEntry, DirInode, Inode, StatResult } from './inode.js';
+import {
+  VfsError,
+  createDirInode,
+  createFileInode,
+  createSymlinkInode,
+} from './inode.js';
+import { deepCloneRoot } from './snapshot.js';
+import type { MountEntry, VirtualProvider } from './provider.js';
+import type { ProcessInfo } from './proc-provider.js';
+import { DevProvider } from './dev-provider.js';
+import { ProcProvider } from './proc-provider.js';
+
+const MAX_SYMLINK_DEPTH = 40;
+
+export interface VfsOptions {
+  /** Maximum total bytes stored in the VFS. Undefined = no limit. */
+  fsLimitBytes?: number;
+  /** Maximum number of files/directories. Undefined = no limit. */
+  fileCount?: number;
+}
+
+/**
+ * Split an absolute path into its component segments,
+ * resolving '.' and '..' along the way.
+ */
+function parsePath(path: string): string[] {
+  if (!path.startsWith('/')) {
+    throw new VfsError('ENOENT', `not an absolute path: ${path}`);
+  }
+
+  const segments: string[] = [];
+
+  for (const part of path.split('/')) {
+    if (part === '' || part === '.') {
+      continue;
+    }
+    if (part === '..') {
+      segments.pop();
+    } else {
+      segments.push(part);
+    }
+  }
+
+  return segments;
+}
+
+export class VFS {
+  private root: DirInode;
+  private snapshots: Map<string, DirInode> = new Map();
+  private nextSnapId = 1;
+  private totalBytes = 0;
+  private fsLimitBytes: number | undefined;
+  private fileCountLimit: number | undefined;
+  private currentFileCount = 0;
+  /** When true, bypass mode-bit permission checks (used during init and withWriteAccess). */
+  private initializing = false;
+  /** Mounted virtual providers keyed by mount path (e.g. '/dev', '/proc'). */
+  private providers: Map<string, VirtualProvider> = new Map();
+  /** Optional callback invoked after mutating VFS operations. */
+  private onChangeCallback: (() => void) | null = null;
+  /**
+   * Source for /proc/<pid>/* entries.  The VFS itself doesn't own
+   * a process kernel — the sandbox process runtime does — so this is a
+   * callback set externally after the kernel is wired up.  Falls
+   * back to an empty list if unset (e.g., during construction or
+   * for raw VFS instances used in unit tests).
+   */
+  private processListProvider: (() => ProcessInfo[]) | null = null;
+
+  constructor(options?: VfsOptions) {
+    this.root = createDirInode(0o555);
+    this.fsLimitBytes = options?.fsLimitBytes;
+    this.fileCountLimit = options?.fileCount;
+    this.initializing = true;
+    this.initDefaultLayout();
+    this.initializing = false;
+    this.registerProvider('/dev', new DevProvider());
+    this.registerProvider(
+      '/proc',
+      new ProcProvider(
+        () => this.getStorageStats(),
+        () => this.getMountList(),
+        () => this.processListProvider?.() ?? [],
+      ),
+    );
+  }
+
+  /** Create a VFS from an already-populated root (used by cowClone). */
+  private static fromRoot(root: DirInode, options?: {
+    fsLimitBytes?: number;
+    totalBytes?: number;
+    fileCountLimit?: number;
+    currentFileCount?: number;
+    providers?: Map<string, VirtualProvider>;
+  }): VFS {
+    const vfs = Object.create(VFS.prototype) as VFS;
+    vfs.root = root;
+    vfs.snapshots = new Map();
+    vfs.nextSnapId = 1;
+    vfs.totalBytes = options?.totalBytes ?? 0;
+    vfs.fsLimitBytes = options?.fsLimitBytes;
+    vfs.fileCountLimit = options?.fileCountLimit;
+    vfs.currentFileCount = options?.currentFileCount ?? 0;
+    vfs.initializing = false;
+    vfs.onChangeCallback = null;
+    // Re-create built-in providers (fresh instances for independent state).
+    // User-mounted providers are shared by reference (safe for read-only mounts).
+    vfs.providers = new Map();
+    if (options?.providers) {
+      for (const [mount, provider] of options.providers) {
+        if (mount === '/dev') {
+          vfs.providers.set(mount, new DevProvider());
+        } else if (mount === '/proc') {
+          vfs.providers.set(mount, new ProcProvider(
+            () => vfs.getStorageStats(),
+            () => vfs.getMountList(),
+            () => vfs.processListProvider?.() ?? [],
+          ));
+        } else {
+          // User mounts: share the provider instance
+          vfs.providers.set(mount, provider);
+        }
+      }
+    }
+    return vfs;
+  }
+
+  /** Populate the default directory tree with explicit mode bits. */
+  private initDefaultLayout(): void {
+    const dirs: Array<[string, number]> = [
+      ['/home', 0o755],
+      ['/home/user', 0o755],
+      ['/tmp', 0o777],
+      ['/bin', 0o555],
+      ['/usr', 0o555],
+      ['/usr/bin', 0o555],
+      ['/usr/lib', 0o555],
+      ['/usr/lib/python', 0o755],
+      ['/etc', 0o555],
+      ['/etc/yurt', 0o555],
+      ['/usr/share', 0o555],
+      ['/usr/share/pkg', 0o755],
+      ['/mnt', 0o555],
+    ];
+    for (const [dir, mode] of dirs) {
+      this.mkdirInternal(dir, mode);
+    }
+  }
+
+  /** Register a virtual provider at the given mount path. */
+  registerProvider(mountPath: string, provider: VirtualProvider): void {
+    this.providers.set(mountPath, provider);
+  }
+
+  /**
+   * Mount a virtual provider at the given path, creating the directory node
+   * in the inode tree so the mount point appears in parent listings (e.g. `ls /mnt`).
+   */
+  mount(mountPath: string, provider: VirtualProvider): void {
+    // Ensure parent dirs exist and create the mount-point dir node
+    this.withWriteAccess(() => {
+      this.mkdirInternal(mountPath);
+    });
+    this.providers.set(mountPath, provider);
+  }
+
+  /** Return all provider mount paths (e.g. ['/dev', '/proc', '/mnt/tools']). */
+  getProviderPaths(): string[] {
+    return Array.from(this.providers.keys());
+  }
+
+  /**
+   * Build the live mount table — the structured form of /proc/mounts.
+   * The root inode tree shows up as 'yurtfs / yurtfs ...'; each
+   * registered provider contributes a row using its declared fsType
+   * (defaulting to 'virtfs' for legacy providers without one).
+   *
+   * Mount options follow the kernel conventions: 'ro' on read-only
+   * mounts, otherwise 'rw'.  We don't track per-mount options beyond
+   * read/write today; if more granularity is needed (nosuid, nodev)
+   * the providers can carry their own options string.
+   */
+  getMountList(): MountEntry[] {
+    const entries: MountEntry[] = [
+      { fsname: 'yurtfs', mountPath: '/', fsType: 'yurtfs', options: 'rw,relatime' },
+    ];
+    for (const [mountPath, provider] of this.providers) {
+      const fsType = provider.fsType ?? 'virtfs';
+      // Mount options reflect what the provider permits.  We don't
+      // expose a writable flag generically yet, so use a sane default
+      // per-fstype (proc/devtmpfs are conventionally rw).
+      const options = (fsType === 'proc' || fsType === 'devtmpfs')
+        ? 'rw,nosuid,nodev,relatime'
+        : 'rw,relatime';
+      entries.push({ fsname: fsType, mountPath, fsType, options });
+    }
+    return entries;
+  }
+
+  /** Set a callback to be invoked after mutating VFS operations. */
+  setOnChange(cb: (() => void) | null): void {
+    this.onChangeCallback = cb;
+  }
+
+  /**
+   * Wire the source of /proc/<pid>/* entries.  Called by the
+   * sandbox once its ProcessKernel exists; the ProcProvider
+   * built at VFS-construction time queries through this on every
+   * read so newly-spawned processes appear without re-registration.
+   */
+  setProcessListProvider(fn: (() => ProcessInfo[]) | null): void {
+    this.processListProvider = fn;
+  }
+
+  /**
+   * If `path` resolves to a streaming provider entry — one whose
+   * provider implements streamRead/streamWrite — return a pair of
+   * functions that the FdTable can call per syscall.  Otherwise
+   * return null and the caller falls back to the static
+   * load-and-slice path through readFile/writeFile.
+   *
+   * Used by FdTable.open: streaming files don't materialize a
+   * buffer at open time, so /dev/urandom can be read forever
+   * without holding any backing memory.
+   */
+  streamFile(path: string): {
+    read?: (length: number) => Uint8Array;
+    write?: (data: Uint8Array) => number;
+  } | null {
+    const match = this.matchProvider(path);
+    if (!match) return null;
+    const { provider, subpath } = match;
+    if (!provider.streamRead && !provider.streamWrite) return null;
+    return {
+      read: provider.streamRead ? (n: number) => provider.streamRead!(subpath, n) : undefined,
+      write: provider.streamWrite ? (d: Uint8Array) => provider.streamWrite!(subpath, d) : undefined,
+    };
+  }
+
+  /** Notify the onChange callback if set and not during init/restore. */
+  private notifyChange(): void {
+    if (!this.initializing && this.onChangeCallback) {
+      this.onChangeCallback();
+    }
+  }
+
+  /**
+   * Match a path against mounted providers.
+   * Returns the provider and the subpath relative to the mount point,
+   * or undefined if no provider matches.
+   */
+  private matchProvider(path: string): { provider: VirtualProvider; subpath: string } | undefined {
+    const normalized = '/' + parsePath(path).join('/');
+    for (const [mount, provider] of this.providers) {
+      if (normalized === mount) {
+        return { provider, subpath: '' };
+      }
+      if (normalized.startsWith(mount + '/')) {
+        return { provider, subpath: normalized.slice(mount.length + 1) };
+      }
+    }
+    return undefined;
+  }
+
+  /** Throw EACCES if the inode's owner write bit is not set. Bypassed during init/withWriteAccess. */
+  private assertWritePermission(inode: Inode): void {
+    if (this.initializing) return;
+    if (!(inode.metadata.permissions & 0o200)) {
+      throw new VfsError('EACCES', 'permission denied');
+    }
+  }
+
+  /** Throw ENOSPC if the file-count limit has been reached. */
+  private assertFileCountLimit(): void {
+    if (this.fileCountLimit !== undefined && this.currentFileCount >= this.fileCountLimit) {
+      throw new VfsError('ENOSPC', 'file count limit exceeded');
+    }
+  }
+
+  /** Internal mkdir that silently skips existing directories. Used during init. */
+  private mkdirInternal(path: string, mode?: number): void {
+    const segments = parsePath(path);
+    let current: DirInode = this.root;
+
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      const existing = current.children.get(segment);
+      if (existing !== undefined) {
+        if (existing.type !== 'dir') {
+          throw new VfsError('ENOTDIR', `not a directory: ${path}`);
+        }
+        current = existing;
+      } else {
+        // Apply specified mode only to the final segment
+        const dirMode = (mode !== undefined && i === segments.length - 1) ? mode : undefined;
+        const newDir = createDirInode(dirMode);
+        current.children.set(segment, newDir);
+        this.currentFileCount++;
+        current = newDir;
+      }
+    }
+  }
+
+  /**
+   * Walk the inode tree to resolve a path.
+   * Returns the parent directory and the final segment name,
+   * or the resolved inode when `resolveLeaf` is true.
+   */
+  private resolve(path: string, followSymlinks = true, depth = 0): Inode {
+    const segments = parsePath(path);
+
+    if (segments.length === 0) {
+      return this.root;
+    }
+
+    let current: Inode = this.root;
+
+    for (let i = 0; i < segments.length; i++) {
+      // Follow symlinks for intermediate path components (and leaf if requested)
+      if (current.type === 'symlink') {
+        if (depth >= MAX_SYMLINK_DEPTH) {
+          throw new VfsError('ENOENT', `too many symlinks: ${path}`);
+        }
+        depth++;
+        current = this.resolve(current.target, true, depth);
+      }
+
+      if (current.type !== 'dir') {
+        throw new VfsError('ENOTDIR', `not a directory: ${path}`);
+      }
+
+      const child = current.children.get(segments[i]);
+      if (child === undefined) {
+        throw new VfsError('ENOENT', `no such file or directory: ${path}`);
+      }
+
+      current = child;
+    }
+
+    // Optionally follow symlink at the leaf
+    if (followSymlinks && current.type === 'symlink') {
+      if (depth >= MAX_SYMLINK_DEPTH) {
+        throw new VfsError('ENOENT', `too many symlinks: ${path}`);
+      }
+      depth++;
+      current = this.resolve(current.target, true, depth);
+    }
+
+    return current;
+  }
+
+  /**
+   * Resolve the parent directory and return it along with the leaf name.
+   * Throws if the parent does not exist or is not a directory.
+   */
+  private resolveParent(path: string): { parent: DirInode; name: string } {
+    const segments = parsePath(path);
+
+    if (segments.length === 0) {
+      throw new VfsError('EEXIST', `cannot operate on root: ${path}`);
+    }
+
+    const name = segments[segments.length - 1];
+    const parentSegments = segments.slice(0, -1);
+
+    let current: Inode = this.root;
+    let depth = 0;
+
+    for (const segment of parentSegments) {
+      if (current.type === 'symlink') {
+        if (depth >= MAX_SYMLINK_DEPTH) {
+          throw new VfsError('ENOENT', `too many symlinks: ${path}`);
+        }
+        current = this.resolve(current.target, true, depth + 1);
+        depth++;
+      }
+      if (current.type !== 'dir') {
+        throw new VfsError('ENOTDIR', `not a directory: ${path}`);
+      }
+      const child = current.children.get(segment);
+      if (child === undefined) {
+        throw new VfsError('ENOENT', `no such file or directory: ${path}`);
+      }
+      current = child;
+    }
+
+    if (current.type === 'symlink') {
+      if (depth >= MAX_SYMLINK_DEPTH) {
+        throw new VfsError('ENOENT', `too many symlinks: ${path}`);
+      }
+      current = this.resolve(current.target, true, depth + 1);
+    }
+    if (current.type !== 'dir') {
+      throw new VfsError('ENOTDIR', `not a directory: ${path}`);
+    }
+
+    return { parent: current, name };
+  }
+
+  stat(path: string): StatResult {
+    const match = this.matchProvider(path);
+    if (match) {
+      const ps = match.provider.stat(match.subpath);
+      const now = new Date();
+      return {
+        type: ps.type,
+        size: ps.size,
+        permissions: ps.type === 'dir' ? 0o755 : 0o444,
+        mtime: now,
+        ctime: now,
+        atime: now,
+      };
+    }
+
+    const inode = this.resolve(path);
+    const { metadata } = inode;
+
+    let size: number;
+    if (inode.type === 'file') {
+      size = inode.content.byteLength;
+    } else if (inode.type === 'dir') {
+      size = inode.children.size;
+    } else {
+      size = inode.target.length;
+    }
+
+    return {
+      type: inode.type,
+      size,
+      permissions: metadata.permissions,
+      mtime: metadata.mtime,
+      ctime: metadata.ctime,
+      atime: metadata.atime,
+    };
+  }
+
+  /** Like stat but does not follow symlinks at the leaf. */
+  lstat(path: string): StatResult {
+    const match = this.matchProvider(path);
+    if (match) {
+      return this.stat(path);
+    }
+
+    const inode = this.resolve(path, false);
+    const { metadata } = inode;
+
+    let size: number;
+    if (inode.type === 'file') {
+      size = inode.content.byteLength;
+    } else if (inode.type === 'dir') {
+      size = inode.children.size;
+    } else {
+      size = inode.target.length;
+    }
+
+    return {
+      type: inode.type,
+      size,
+      permissions: metadata.permissions,
+      mtime: metadata.mtime,
+      ctime: metadata.ctime,
+      atime: metadata.atime,
+    };
+  }
+
+  readFile(path: string): Uint8Array {
+    const match = this.matchProvider(path);
+    if (match) {
+      return match.provider.readFile(match.subpath);
+    }
+
+    const inode = this.resolve(path);
+
+    if (inode.type === 'dir') {
+      throw new VfsError('EISDIR', `is a directory: ${path}`);
+    }
+    if (inode.type === 'symlink') {
+      // Should not happen after resolve with followSymlinks, but guard anyway
+      return this.readFile(inode.target);
+    }
+
+    inode.metadata.atime = new Date();
+    return inode.content;
+  }
+
+  /** Run a callback with mode-bit permission checks disabled (root mode). */
+  withWriteAccess(fn: () => void): void {
+    const prev = this.initializing;
+    this.initializing = true;
+    try { fn(); } finally { this.initializing = prev; }
+  }
+
+  writeFile(path: string, data: Uint8Array): void {
+    const match = this.matchProvider(path);
+    if (match) {
+      match.provider.writeFile(match.subpath, data);
+      return;
+    }
+
+    const { parent, name } = this.resolveParent(path);
+    const existing = parent.children.get(name);
+
+    if (existing !== undefined && existing.type === 'dir') {
+      throw new VfsError('EISDIR', `is a directory: ${path}`);
+    }
+
+    // New file → check parent dir write bit; overwrite → check file write bit
+    if (existing !== undefined && existing.type === 'file') {
+      this.assertWritePermission(existing);
+    } else {
+      this.assertWritePermission(parent);
+    }
+
+    const oldSize = (existing !== undefined && existing.type === 'file') ? existing.content.byteLength : 0;
+    const newSize = data.byteLength;
+    const delta = newSize - oldSize;
+
+    if (this.fsLimitBytes !== undefined && this.totalBytes + delta > this.fsLimitBytes) {
+      throw new VfsError('ENOSPC', `no space left on device (limit: ${this.fsLimitBytes} bytes)`);
+    }
+
+    if (existing !== undefined && existing.type === 'file') {
+      existing.content = data;
+      existing.metadata.mtime = new Date();
+    } else {
+      this.assertFileCountLimit();
+      parent.children.set(name, createFileInode(data));
+      this.currentFileCount++;
+    }
+    this.totalBytes += delta;
+    this.notifyChange();
+  }
+
+  mkdir(path: string): void {
+    const { parent, name } = this.resolveParent(path);
+    this.assertWritePermission(parent);
+
+    if (parent.children.has(name)) {
+      throw new VfsError('EEXIST', `file exists: ${path}`);
+    }
+
+    this.assertFileCountLimit();
+    parent.children.set(name, createDirInode());
+    this.currentFileCount++;
+    this.notifyChange();
+  }
+
+  mkdirp(path: string): void {
+    const segments = parsePath(path);
+    let current: DirInode = this.root;
+
+    for (let i = 0; i < segments.length; i++) {
+      const segment = segments[i];
+      const existing = current.children.get(segment);
+
+      if (existing !== undefined) {
+        if (existing.type !== 'dir') {
+          const partial = '/' + segments.slice(0, i + 1).join('/');
+          throw new VfsError('ENOTDIR', `not a directory: ${partial}`);
+        }
+        current = existing;
+      } else {
+        this.assertWritePermission(current);
+        this.assertFileCountLimit();
+        const newDir = createDirInode();
+        current.children.set(segment, newDir);
+        this.currentFileCount++;
+        current = newDir;
+      }
+    }
+    this.notifyChange();
+  }
+
+  readdir(path: string): DirEntry[] {
+    const match = this.matchProvider(path);
+    if (match) {
+      return match.provider.readdir(match.subpath);
+    }
+
+    const inode = this.resolve(path);
+
+    if (inode.type !== 'dir') {
+      throw new VfsError('ENOTDIR', `not a directory: ${path}`);
+    }
+
+    inode.metadata.atime = new Date();
+    const entries: DirEntry[] = [];
+
+    for (const [name, child] of inode.children) {
+      entries.push({ name, type: child.type });
+    }
+
+    return entries;
+  }
+
+  unlink(path: string): void {
+    const { parent, name } = this.resolveParent(path);
+    this.assertWritePermission(parent);
+    const child = parent.children.get(name);
+
+    if (child === undefined) {
+      throw new VfsError('ENOENT', `no such file or directory: ${path}`);
+    }
+    if (child.type === 'dir') {
+      throw new VfsError('EISDIR', `is a directory: ${path}`);
+    }
+
+    if (child.type === 'file') {
+      this.totalBytes -= child.content.byteLength;
+    }
+    parent.children.delete(name);
+    this.currentFileCount--;
+    this.notifyChange();
+  }
+
+  rmdir(path: string): void {
+    const { parent, name } = this.resolveParent(path);
+    this.assertWritePermission(parent);
+    const child = parent.children.get(name);
+
+    if (child === undefined) {
+      throw new VfsError('ENOENT', `no such file or directory: ${path}`);
+    }
+    if (child.type !== 'dir') {
+      throw new VfsError('ENOTDIR', `not a directory: ${path}`);
+    }
+    if (child.children.size > 0) {
+      throw new VfsError('ENOTEMPTY', `directory not empty: ${path}`);
+    }
+
+    parent.children.delete(name);
+    this.currentFileCount--;
+    this.notifyChange();
+  }
+
+  rename(oldPath: string, newPath: string): void {
+    const { parent: oldParent, name: oldName } = this.resolveParent(oldPath);
+    this.assertWritePermission(oldParent);
+    const child = oldParent.children.get(oldName);
+
+    if (child === undefined) {
+      throw new VfsError('ENOENT', `no such file or directory: ${oldPath}`);
+    }
+
+    const { parent: newParent, name: newName } = this.resolveParent(newPath);
+    this.assertWritePermission(newParent);
+
+    oldParent.children.delete(oldName);
+    newParent.children.set(newName, child);
+    this.notifyChange();
+  }
+
+  /**
+   * POSIX hard link — make `newPath` an alias for `oldPath`'s
+   * underlying inode.  Both names index the same FileInode, so a
+   * write through either appears in both.  Linux semantics:
+   *   - oldPath must exist
+   *   - newPath must not exist (EEXIST otherwise)
+   *   - oldPath must be a regular file (EPERM on directories;
+   *     symlink target follows the conventional behavior of
+   *     linking the symlink's referent, not the symlink itself)
+   * Wired to the WASI path_link syscall in wasi-host so guest
+   * binaries that call link(2) (BusyBox `ln` without -s, etc.)
+   * see the new path immediately.
+   */
+  link(oldPath: string, newPath: string): void {
+    const { parent: newParent, name: newName } = this.resolveParent(newPath);
+    this.assertWritePermission(newParent);
+    if (newParent.children.has(newName)) {
+      throw new VfsError('EEXIST', `file exists: ${newPath}`);
+    }
+
+    // Resolve oldPath following symlinks to the underlying file.
+    let inode = this.resolve(oldPath);
+    if (inode.type === 'symlink') {
+      // Conventional: hard-link the symlink's target, not the
+      // symlink itself.  resolve() doesn't auto-follow at the
+      // leaf, so do it here.
+      inode = this.resolve(inode.target);
+    }
+    if (inode.type === 'dir') {
+      throw new VfsError('EACCES', `hard link not allowed for directory: ${oldPath}`);
+    }
+
+    this.assertFileCountLimit();
+    newParent.children.set(newName, inode);
+    this.currentFileCount++;
+    this.notifyChange();
+  }
+
+  symlink(target: string, path: string): void {
+    const { parent, name } = this.resolveParent(path);
+    this.assertWritePermission(parent);
+
+    if (parent.children.has(name)) {
+      throw new VfsError('EEXIST', `file exists: ${path}`);
+    }
+
+    this.assertFileCountLimit();
+    parent.children.set(name, createSymlinkInode(target));
+    this.currentFileCount++;
+    this.notifyChange();
+  }
+
+  chmod(path: string, mode: number): void {
+    const { parent } = this.resolveParent(path);
+    this.assertWritePermission(parent);
+    const inode = this.resolve(path);
+    inode.metadata.permissions = mode;
+    inode.metadata.ctime = new Date();
+    this.notifyChange();
+  }
+
+  readlink(path: string): string {
+    const inode = this.resolve(path, false);
+
+    if (inode.type !== 'symlink') {
+      throw new VfsError('ENOENT', `not a symlink: ${path}`);
+    }
+
+    return inode.target;
+  }
+
+  /**
+   * Capture a snapshot of the current filesystem state.
+   * Returns a snapshot ID that can be passed to restore().
+   */
+  snapshot(): string {
+    const id = String(this.nextSnapId++);
+    this.snapshots.set(id, deepCloneRoot(this.root));
+    return id;
+  }
+
+  /**
+   * Restore the filesystem to a previously captured snapshot.
+   * The snapshot remains available for future restores.
+   */
+  restore(id: string): void {
+    const saved = this.snapshots.get(id);
+    if (saved === undefined) {
+      throw new Error(`no such snapshot: ${id}`);
+    }
+    this.root = deepCloneRoot(saved);
+    this.notifyChange();
+  }
+
+  /**
+   * Create an independent copy-on-write clone of this VFS.
+   *
+   * The clone shares file content by reference but has its own
+   * directory structure. Since writeFile replaces (rather than
+   * mutates) content arrays, writes in either VFS are invisible
+   * to the other — natural COW semantics.
+   */
+  getStorageStats(): {
+    totalBytes: number;
+    limitBytes: number | undefined;
+    fileCount: number;
+    fileCountLimit: number | undefined;
+  } {
+    return {
+      totalBytes: this.totalBytes,
+      limitBytes: this.fsLimitBytes,
+      fileCount: this.currentFileCount,
+      fileCountLimit: this.fileCountLimit,
+    };
+  }
+
+  /** Clear all file content buffers to free memory. Directory structure and metadata are preserved. */
+  clearFileContents(): void {
+    const walk = (node: DirInode): void => {
+      for (const child of node.children.values()) {
+        if (child.type === 'file') {
+          this.totalBytes -= child.content.byteLength;
+          child.content = new Uint8Array(0);
+        } else if (child.type === 'dir') {
+          walk(child);
+        }
+      }
+    };
+    walk(this.root);
+  }
+
+  cowClone(): VFS {
+    return VFS.fromRoot(deepCloneRoot(this.root), {
+      fsLimitBytes: this.fsLimitBytes,
+      totalBytes: this.totalBytes,
+      fileCountLimit: this.fileCountLimit,
+      currentFileCount: this.currentFileCount,
+      providers: this.providers,
+    });
+  }
+}

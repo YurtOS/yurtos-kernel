@@ -1,0 +1,73 @@
+[package]
+name = "cpcc-toolchain"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Clang wrapper and companion tooling for the yurt guest compatibility runtime."
+
+# Short-form binary names (yurt convention).
+[[bin]]
+name = "cpcc"
+path = "src/main.rs"
+
+[[bin]]
+name = "cpar"
+path = "src/bin/cpar.rs"
+
+[[bin]]
+name = "cpranlib"
+path = "src/bin/cpranlib.rs"
+
+[[bin]]
+name = "cpcheck"
+path = "src/bin/cpcheck.rs"
+
+[[bin]]
+name = "cpconf"
+path = "src/bin/cpconf.rs"
+
+# Long-form binary names (§Toolchain Integration spec canonicals). Each
+# long-name binary compiles the same source as its short-name counterpart;
+# the two names are interchangeable entry points.
+[[bin]]
+name = "yurt-cc"
+path = "src/main.rs"
+
+[[bin]]
+name = "yurt-ar"
+path = "src/bin/cpar.rs"
+
+[[bin]]
+name = "yurt-ranlib"
+path = "src/bin/cpranlib.rs"
+
+[[bin]]
+name = "yurt-check"
+path = "src/bin/cpcheck.rs"
+
+[[bin]]
+name = "yurt-conf"
+path = "src/bin/cpconf.rs"
+
+[[bin]]
+name = "cargo-yurt"
+path = "src/bin/cargo-yurt.rs"
+
+[[bin]]
+name = "maturin-yurt"
+path = "src/bin/maturin-yurt.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+which = "6"
+wasmparser = "0.247.0"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

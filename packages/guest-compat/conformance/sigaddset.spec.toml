@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "Add a signal to a sigset_t (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "sigaddset_adds"
+inputs = "sigemptyset(&s); sigaddset(&s, SIGINT)"
+expected.exit = 0
+expected.stdout = "sigset:add"
+expected.note = "SIGINT is now a member; SIGTERM is not"

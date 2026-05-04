@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "alarm() cancellation semantics (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "alarm_returns_zero"
+inputs = "alarm(0)"
+expected.exit = 0
+expected.stdout = "alarm:0"
+expected.note = "no prior alarm was pending; return value is 0"

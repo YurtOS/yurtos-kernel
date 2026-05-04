@@ -1,0 +1,16 @@
+canary = "affinity-canary"
+summary = "Set the guest's CPU mask (§Runtime Semantics > Affinity)."
+
+[[case]]
+name = "set_cpu0_succeeds"
+inputs = "sched_setaffinity(0, sizeof(mask), &{CPU 0})"
+expected.exit = 0
+expected.stdout = "affinity:set0=ok"
+expected.note = "the only mask the guest accepts"
+
+[[case]]
+name = "set_cpu1_einval"
+inputs = "sched_setaffinity(0, sizeof(mask), &{CPU 1})"
+expected.exit = 1
+expected.errno = 28
+expected.note = "EINVAL (WASI value); any non-CPU0 mask must be rejected"

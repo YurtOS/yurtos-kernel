@@ -1,0 +1,11 @@
+[package]
+name = "dup2-canary"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "dup2-canary"
+path = "src/main.rs"
+
+[dependencies]

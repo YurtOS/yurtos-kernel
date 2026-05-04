@@ -1,0 +1,9 @@
+canary = "affinity-canary"
+summary = "Report the guest's visible CPU mask (§Runtime Semantics > Affinity)."
+
+[[case]]
+name = "get_reports_one_cpu"
+inputs = "sched_getaffinity(0, sizeof(mask), &mask) on guest with one visible CPU"
+expected.exit = 0
+expected.stdout = "affinity:get=1"
+expected.note = "exactly one CPU bit set, namely CPU 0"

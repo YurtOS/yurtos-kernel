@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "Test sigset_t membership (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "sigismember_reports"
+inputs = "sigemptyset(&s); sigaddset(&s, SIGINT); sigismember(&s, SIGINT|SIGTERM)"
+expected.exit = 0
+expected.stdout = "sigset:ismember"
+expected.note = "1 for added signal, 0 for absent"

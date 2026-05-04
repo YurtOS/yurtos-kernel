@@ -1,0 +1,23 @@
+# yurt-wasi-shims — runtime library providing wasi-aware replacements
+# for Rust stdlib functions that panic on wasip1. Each replacement has a
+# stable `#[export_name = "__yurt_wasi_shim_*"]` identifier.
+#
+# Consumers add this crate as a direct runtime dependency; the
+# replacements land in their final wasm with known symbol names.
+# The `yurt-wasi-postlink` binary then rewrites stdlib function
+# bodies to tail-call our shims (matching wasm type signatures).
+#
+# This is the Phase A answer to Rust's wasip1 stdlib defects. Upstream
+# Rust should eventually fix `env::temp_dir()` and friends directly;
+# until then, the pair of (yurt-wasi-shims, yurt-wasi-postlink)
+# is the single tooling primitive consumers use.
+
+[package]
+name = "yurt-wasi-shims"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Runtime-library replacements for wasip1 stdlib-panic functions."
+
+[lib]
+path = "src/lib.rs"

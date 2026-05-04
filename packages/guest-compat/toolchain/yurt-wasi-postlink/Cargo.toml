@@ -1,0 +1,34 @@
+# yurt-wasi-postlink — host CLI binary that rewrites panicky Rust
+# stdlib functions in a .wasm after link.
+#
+# Input: a .wasm file produced by `rustc --target=wasm32-wasip1` that
+# still contains its `name` custom section (i.e. built with
+# `strip=none`).
+# Output: the same .wasm with each listed stdlib function's body
+# replaced by a tail-call to the yurt-wasi-shims counterpart.
+#
+# Design: walrus loads the module, we find the target function by a
+# legacy-mangling PREFIX (the rustc hash varies per build, so we match
+# the stable `_ZN...temp_dirE` prefix), find the shim function by its
+# stable `__yurt_wasi_shim_*` export, verify type signatures match,
+# and replace the body with `local.get 0; ...; call $shim; end`.
+#
+# This is the runtime-independent fix for Rust's wasip1 stdlib defects
+# (see packages/guest-compat/rust/yurt-wasi-shims/Cargo.toml for
+# the user-facing half of the story).
+
+[package]
+name = "yurt-wasi-postlink"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Post-link .wasm rewriter for wasip1 stdlib-panic workarounds."
+
+[[bin]]
+name = "yurt-wasi-postlink"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+walrus = "0.24"

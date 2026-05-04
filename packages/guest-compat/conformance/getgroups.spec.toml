@@ -1,0 +1,16 @@
+canary = "getgroups-canary"
+summary = "Report the single visible guest group (§Runtime Semantics > Identity)."
+
+[[case]]
+name = "count_only"
+inputs = "getgroups(0, NULL)"
+expected.exit = 0
+expected.stdout = "getgroups:1"
+expected.note = "size=0 path returns the count without writing the buffer"
+
+[[case]]
+name = "fetch_one"
+inputs = "getgroups(1, buf)"
+expected.exit = 0
+expected.stdout = "getgroups:1:1000"
+expected.note = "single visible group id is 1000 (matches getegid() / `id` output for the yurt sandbox user)"

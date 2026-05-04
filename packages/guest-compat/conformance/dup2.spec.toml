@@ -1,0 +1,16 @@
+canary = "dup2-canary"
+summary = "Renumber a guest-visible file descriptor (§Runtime Semantics > File Descriptors)."
+
+[[case]]
+name = "happy_path"
+inputs = "dup2(1, 2) — redirect stderr to stdout"
+expected.exit = 0
+expected.stdout = "dup2-ok"
+expected.note = "stderr now writes to stdout's target"
+
+[[case]]
+name = "invalid_fd"
+inputs = "dup2(999, 2) — source fd is not open"
+expected.exit = 1
+expected.errno = 8
+expected.note = "EBADF (WASI value)"

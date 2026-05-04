@@ -1,0 +1,14 @@
+{
+  "unstable": ["sloppy-imports"],
+  "nodeModulesDir": "auto",
+  "imports": {
+    "@yurt/kernel": "./packages/kernel/src/index.ts",
+    "@std/testing": "jsr:@std/testing@^1",
+    "@std/expect": "jsr:@std/expect@^1",
+    "@std/assert": "jsr:@std/assert@^1",
+    "path": "node:path",
+    "fs": "node:fs",
+    "fs/promises": "node:fs/promises",
+    "os": "node:os"
+  }
+}

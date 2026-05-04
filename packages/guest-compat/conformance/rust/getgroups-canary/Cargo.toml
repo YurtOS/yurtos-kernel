@@ -1,0 +1,11 @@
+[package]
+name = "getgroups-canary"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "getgroups-canary"
+path = "src/main.rs"
+
+[dependencies]

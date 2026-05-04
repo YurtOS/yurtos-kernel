@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "Clear a sigset_t (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "sigemptyset_clears"
+inputs = "sigfillset(&s); sigemptyset(&s); sigismember(&s, SIGINT)"
+expected.exit = 0
+expected.stdout = "sigset:empty"
+expected.note = "post-empty, no signal is a member"

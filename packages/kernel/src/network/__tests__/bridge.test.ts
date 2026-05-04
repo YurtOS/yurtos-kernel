@@ -1,0 +1,241 @@
+import { describe, it, afterEach, beforeAll, afterAll } from '@std/testing/bdd';
+import { expect } from '@std/expect';
+import { NetworkBridge } from '../bridge.js';
+import { NetworkGateway } from '../gateway.js';
+import { createNetworkBridgeSocketBackend } from '../socket-backend.js';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { Buffer } from 'node:buffer';
+
+/**
+ * These tests spin up an HTTP server in a CHILD PROCESS so that
+ * the Worker's real fetch() can hit a controlled endpoint without
+ * deadlocking.
+ *
+ * The deadlock occurs when the HTTP server runs on the main thread:
+ * fetchSync() calls Atomics.wait() which blocks the main thread event
+ * loop, preventing the same-process HTTP server from responding.
+ * Running the server in a child process avoids this.
+ */
+
+describe('NetworkBridge', { sanitizeOps: false, sanitizeResources: false }, () => {
+  let serverProcess: ChildProcess;
+  let baseUrl: string;
+  let bridge: NetworkBridge;
+
+  beforeAll(async () => {
+    const serverScript = `
+    const http = require('node:http');
+    const server = http.createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://localhost');
+
+      if (url.pathname === '/data') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('bridge response');
+        return;
+      }
+
+      if (url.pathname === '/redirect') {
+        res.writeHead(302, { Location: '/data' });
+        res.end('redirect body');
+        return;
+      }
+
+      if (url.pathname === '/echo-headers') {
+        const headers = {};
+        for (const [k, v] of Object.entries(req.headers)) {
+          if (typeof v === 'string') headers[k] = v;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(headers));
+        return;
+      }
+
+      if (url.pathname === '/binary') {
+        // Return known binary data (bytes 0-255) that would be corrupted by UTF-8 lossy
+        const buf = Buffer.alloc(256);
+        for (let i = 0; i < 256; i++) buf[i] = i;
+        res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+        res.end(buf);
+        return;
+      }
+
+      if (url.pathname === '/error') {
+        req.socket.destroy();
+        return;
+      }
+
+      res.writeHead(404);
+      res.end('not found');
+    });
+
+    server.listen(0, '127.0.0.1', () => {
+      const addr = server.address();
+      process.stdout.write(JSON.stringify({ port: addr.port }) + '\\n');
+    });
+  `;
+
+    serverProcess = spawn(process.execPath, ['-e', serverScript], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    // Wait for the server to print its port
+    const port = await new Promise<number>((resolve, reject) => {
+      let output = '';
+      serverProcess.stdout!.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+        const lines = output.split('\n');
+        for (const line of lines) {
+          if (line.trim()) {
+            try {
+              const info = JSON.parse(line.trim());
+              if (info.port) {
+                resolve(info.port);
+                return;
+              }
+            } catch {
+              // not yet complete JSON
+            }
+          }
+        }
+      });
+      serverProcess.on('error', reject);
+      serverProcess.on('exit', (code) => {
+        reject(new Error(`Server process exited with code ${code}`));
+      });
+      setTimeout(() => reject(new Error('Timeout waiting for server')), 5000);
+    });
+
+    baseUrl = `http://127.0.0.1:${port}`;
+  });
+
+  afterAll(() => {
+    if (serverProcess) {
+      serverProcess.kill();
+    }
+  });
+
+  afterEach(() => {
+    bridge?.dispose();
+  });
+
+  it('performs a synchronous fetch via the bridge', async () => {
+    const gateway = new NetworkGateway({ allowedHosts: ['127.0.0.1'] });
+    bridge = new NetworkBridge(gateway);
+    await bridge.start();
+
+    const result = bridge.fetchSync(`${baseUrl}/data`, 'GET', {});
+    expect(result.status).toBe(200);
+    expect(result.body).toBe('bridge response');
+  });
+
+  it('returns body_base64 for lossless binary transfer', async () => {
+    const gateway = new NetworkGateway({ allowedHosts: ['127.0.0.1'] });
+    bridge = new NetworkBridge(gateway);
+    await bridge.start();
+
+    const result = bridge.fetchSync(`${baseUrl}/binary`, 'GET', {});
+    expect(result.status).toBe(200);
+    expect(result.body_base64).toBeTruthy();
+
+    // Decode base64 and verify all 256 bytes survived
+    const binary = atob(result.body_base64!);
+    expect(binary.length).toBe(256);
+    for (let i = 0; i < 256; i++) {
+      expect(binary.charCodeAt(i)).toBe(i);
+    }
+  });
+
+  it('text body still works for UTF-8 content', async () => {
+    const gateway = new NetworkGateway({ allowedHosts: ['127.0.0.1'] });
+    bridge = new NetworkBridge(gateway);
+    await bridge.start();
+
+    const result = bridge.fetchSync(`${baseUrl}/data`, 'GET', {});
+    expect(result.status).toBe(200);
+    expect(result.body).toBe('bridge response');
+    // body_base64 should also be present and decode to the same text
+    expect(result.body_base64).toBeTruthy();
+    const decoded = new TextDecoder().decode(
+      Uint8Array.from(atob(result.body_base64!), c => c.charCodeAt(0))
+    );
+    expect(decoded).toBe('bridge response');
+  });
+
+  it('can return manual redirects without following them', async () => {
+    const gateway = new NetworkGateway({ allowedHosts: ['127.0.0.1'] });
+    bridge = new NetworkBridge(gateway);
+    await bridge.start();
+
+    const result = bridge.fetchSync(`${baseUrl}/redirect`, 'GET', {}, undefined, 'manual');
+    expect(result.status).toBe(302);
+    expect(result.headers.location).toBe('/data');
+    expect(result.body).toBe('redirect body');
+  });
+
+  it('returns error for blocked hosts', async () => {
+    const gateway = new NetworkGateway({ blockedHosts: ['evil.com'] });
+    bridge = new NetworkBridge(gateway);
+    await bridge.start();
+
+    const result = bridge.fetchSync('https://evil.com', 'GET', {});
+    expect(result.status).toBeGreaterThanOrEqual(400);
+    expect(result.error).toBeTruthy();
+  });
+
+  it('disposes worker cleanly', async () => {
+    const gateway = new NetworkGateway({ allowedHosts: ['127.0.0.1'] });
+    bridge = new NetworkBridge(gateway);
+    await bridge.start();
+    bridge.dispose();
+    bridge.dispose(); // double dispose should not throw
+  });
+
+  it('routes sandbox loopback connect to a backend listener', async () => {
+    const gateway = new NetworkGateway({ allowedHosts: ['127.0.0.1', 'localhost'] });
+    bridge = new NetworkBridge(gateway);
+    await bridge.start();
+
+    const backend = createNetworkBridgeSocketBackend(bridge);
+    const listen = backend.listen!({ host: '127.0.0.1', port: 18081, backlog: 8 });
+    expect(listen.ok).toBe(true);
+    if (!listen.ok) throw new Error(listen.error);
+
+    const emptyAccept = backend.accept!(listen.listener);
+    expect(emptyAccept).toEqual({ ok: false, wouldBlock: true, error: 'accept would block' });
+
+    const client = backend.connect({ host: '127.0.0.1', port: 18081, tls: false });
+    expect(client.ok).toBe(true);
+    if (!client.ok) throw new Error(client.error);
+    const accepted = backend.accept!(listen.listener);
+    expect(accepted.ok).toBe(true);
+    if (!accepted.ok) throw new Error(accepted.error);
+
+    expect(backend.send(client.socket, btoa('ping'))).toEqual({ ok: true, bytes_sent: 4 });
+    expect(backend.recv(accepted.socket, 4)).toEqual({ ok: true, data_b64: btoa('ping') });
+    expect(backend.send(accepted.socket, btoa('pong'))).toEqual({ ok: true, bytes_sent: 4 });
+    expect(backend.recv(client.socket, 4)).toEqual({ ok: true, data_b64: btoa('pong') });
+
+    backend.close(client.socket);
+    backend.close(accepted.socket);
+    backend.closeListener!(listen.listener);
+  });
+
+  it('binds mapped 0.0.0.0 sandbox listeners to configured host port', async () => {
+    const gateway = new NetworkGateway({ allowedHosts: ['127.0.0.1', 'localhost'] });
+    bridge = new NetworkBridge(gateway);
+    await bridge.start();
+
+    const backend = createNetworkBridgeSocketBackend(bridge);
+    const listen = backend.listen!({
+      host: '0.0.0.0',
+      port: 8080,
+      backlog: 8,
+      mapping: { sandboxHost: '0.0.0.0', sandboxPort: 8080, hostPort: 0 },
+    });
+
+    expect(listen.ok).toBe(true);
+    if (!listen.ok) throw new Error(listen.error);
+    expect(listen.port).toBe(8080);
+    backend.closeListener!(listen.listener);
+  });
+});

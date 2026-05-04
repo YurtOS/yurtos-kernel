@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "Synchronously dispatch a signal handler (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "raise_invokes_handler"
+inputs = "sigaction(SIGTERM, &sa); raise(SIGTERM)"
+expected.exit = 0
+expected.stdout = "raise:sigterm"
+expected.note = "raise() returns 0 and the handler observes the signal"

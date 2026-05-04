@@ -1,0 +1,9 @@
+canary = "affinity-canary"
+summary = "Report the running CPU (§Runtime Semantics > Affinity)."
+
+[[case]]
+name = "getcpu_zero"
+inputs = "sched_getcpu()"
+expected.exit = 0
+expected.stdout = "affinity:cpu=0"
+expected.note = "the guest sees exactly one CPU and is always running on it"

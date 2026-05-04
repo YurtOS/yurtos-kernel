@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "Fill a sigset_t (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "sigfillset_fills"
+inputs = "sigfillset(&s); sigismember(&s, SIGINT|SIGTERM)"
+expected.exit = 0
+expected.stdout = "sigset:full"
+expected.note = "all common signals report as members"

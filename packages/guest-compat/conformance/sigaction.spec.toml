@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "Install a signal handler via sigaction (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "sigaction_raise"
+inputs = "sigaction(SIGINT, &sa, NULL); raise(SIGINT)"
+expected.exit = 0
+expected.stdout = "signal-ok"
+expected.note = "handler runs synchronously"

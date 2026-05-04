@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "Remove a signal from a sigset_t (§Runtime Semantics > Signals)."
+
+[[case]]
+name = "sigdelset_removes"
+inputs = "sigfillset(&s); sigdelset(&s, SIGINT)"
+expected.exit = 0
+expected.stdout = "sigset:del"
+expected.note = "SIGINT is no longer a member; SIGTERM still is"
