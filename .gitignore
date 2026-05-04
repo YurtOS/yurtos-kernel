@@ -4,5 +4,6 @@ dist/
 *.wasm.d.ts
 .deno/
 .worktrees/
+packages/kernel/src/platform/__tests__/fixtures/*-canary.wasm
 packages/kernel/src/platform/__tests__/fixtures/busybox.manifest.json
 packages/kernel/src/platform/__tests__/fixtures/busybox.wasm
