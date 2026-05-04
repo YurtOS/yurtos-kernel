@@ -62,7 +62,7 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 #define YURT_SOCKET_RECV_MAX_RAW 3000
 
 /* wasi-libc already ships strong definitions for some POSIX socket names.
- * cpcc/cargo-yurt pass --wrap for the duplicate-owned symbols we implement
+ * yurt-cc/cargo-yurt pass --wrap for the duplicate-owned symbols we implement
  * here (`accept`, `send`, `recv`, `getsockopt`) so Rust and C guests both route
  * through libyurt without using yurt-specific symbol names. */
 

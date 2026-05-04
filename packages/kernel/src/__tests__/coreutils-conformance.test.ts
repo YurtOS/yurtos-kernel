@@ -1,6 +1,6 @@
 /**
  * GNU coreutils conformance tests.  Six tools ported from upstream
- * coreutils v9.11 via cpcc (packages/c-ports/coreutils/):
+ * coreutils v9.11 via yurt-cc (packages/c-ports/coreutils/):
  *   csplit, fmt, join, numfmt, sha224sum, sha384sum.
  */
 import { describe, it, afterEach } from '@std/testing/bdd';

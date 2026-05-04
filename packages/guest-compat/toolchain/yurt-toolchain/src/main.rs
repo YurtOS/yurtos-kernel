@@ -3,10 +3,12 @@ use clap::Parser;
 use std::ffi::OsString;
 use std::process::{Command, ExitCode};
 
-use cpcc_toolchain::{archive, env, features, preserve, wasi_sdk, wasm_opt, TIER1, WRAPPED_WASI_LIBC_SYMBOLS};
+use yurt_toolchain::{
+    archive, env, features, preserve, wasi_sdk, wasm_opt, TIER1, WRAPPED_WASI_LIBC_SYMBOLS,
+};
 
 #[derive(Parser, Debug)]
-#[command(name = "cpcc", version, about = "Clang wrapper for the yurt guest compatibility runtime", long_about = None)]
+#[command(name = "yurt-cc", version, about = "Clang wrapper for the yurt guest compatibility runtime", long_about = None)]
 struct Cli {
     #[arg(long)]
     dry_run: bool,
@@ -65,12 +67,12 @@ fn build_clang_invocation(
     //
     // When the archive is present:
     // - Pass --no-wasm-opt so that clang's automatic wasm-opt invocation
-    //   is suppressed. cpcc captures the linker output as the "pre-opt"
+    //   is suppressed. yurt-cc captures the linker output as the "pre-opt"
     //   artifact (§Verifying Precedence) and runs wasm-opt separately via
-    //   CPCC_WASM_OPT_FLAGS / CPCC_NO_WASM_OPT. Without this flag the
-    //   clang driver runs wasm-opt itself before cpcc can preserve the
-    //   pre-opt wasm, which makes stage 3 of cpcheck unverifiable.
-    // - Export each Tier 1 symbol and its marker so that cpcheck's
+    //   YURT_CC_WASM_OPT_FLAGS / YURT_CC_NO_WASM_OPT. Without this flag the
+    //   clang driver runs wasm-opt itself before yurt-cc can preserve the
+    //   pre-opt wasm, which makes stage 3 of yurt-check unverifiable.
+    // - Export each Tier 1 symbol and its marker so that yurt-check's
     //   §Verifying Precedence stages 2 and 3 can locate them by name in
     //   the export section of the pre-opt .wasm.
     if let Some(archive) = env.archive.as_ref() {
@@ -99,11 +101,9 @@ fn build_clang_invocation(
                 argv.push(format!("-Wl,--export={sym}").into());
                 if env.markers_enabled {
                     // Instrumented mode also force-exports the marker
-                    // function so cpcheck's --mode=markers can locate
+                    // function so yurt-check's --mode=markers can locate
                     // it in stage 2.
-                    argv.push(
-                        format!("-Wl,--export=__yurt_guest_compat_marker_{sym}").into(),
-                    );
+                    argv.push(format!("-Wl,--export=__yurt_guest_compat_marker_{sym}").into());
                 }
             }
         }

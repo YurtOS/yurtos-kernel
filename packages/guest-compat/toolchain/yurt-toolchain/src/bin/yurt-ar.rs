@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use cpcc_toolchain::wasi_sdk;
 use std::process::{Command, ExitCode};
+use yurt_toolchain::wasi_sdk;
 
 fn main() -> Result<ExitCode> {
     let sdk = wasi_sdk::discover().context("locating wasi-sdk")?;

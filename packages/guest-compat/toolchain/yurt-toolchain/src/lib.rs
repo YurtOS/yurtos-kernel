@@ -12,8 +12,8 @@ pub mod trace;
 pub mod wasi_sdk;
 pub mod wasm_opt;
 
-/// Tier 1 symbols from §Compatibility Tiers. Consumed by `cpcc` (to
-/// force-export each symbol + its marker at link time) and `cpcheck`
+/// Tier 1 symbols from §Compatibility Tiers. Consumed by `yurt-cc` (to
+/// force-export each symbol + its marker at link time) and `yurt-check`
 /// (as the default list for §Verifying Precedence).
 pub const TIER1: &[&str] = &[
     "chown",

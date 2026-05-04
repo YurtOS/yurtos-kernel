@@ -47,7 +47,7 @@ pub struct InvocationPlan {
 }
 
 /// Compute the cargo invocation for `sub` plus `forwarded` user args.
-/// Reads CPCC_ARCHIVE / CPCC_INCLUDE / CPCC_PRESERVE_PRE_OPT etc. from the
+/// Reads YURT_CC_ARCHIVE / YURT_CC_INCLUDE / YURT_CC_PRESERVE_PRE_OPT etc. from the
 /// process environment via the existing `crate::env::Env`. RUSTFLAGS is only
 /// injected when an archive is present — bare `cargo yurt build` with no
 /// archive surfaces "missing archive" instead of a confusing link error.
@@ -73,16 +73,17 @@ pub fn plan_invocation_with_sdk(
         plan.cargo_args.push(arg.clone());
     }
 
-    plan.env.push(("YURT_LINK_INJECTED".to_string(), "1".to_string()));
+    plan.env
+        .push(("YURT_LINK_INJECTED".to_string(), "1".to_string()));
 
-    // CPCC_NO_CLANG_LINKER skips the wasi-sdk clang linker injection so rust's
+    // YURT_CC_NO_CLANG_LINKER skips the wasi-sdk clang linker injection so rust's
     // default rust-lld handles the link. Needed for ports whose dep tree
     // includes cdylib targets with wasm-bindgen (e.g. grex's wasm browser
     // entry point) — wasi-sdk's lld rejects these because `_initialize`
     // isn't defined. --whole-archive + --export flags injected via RUSTFLAGS
     // work identically under rust-lld and wasi-sdk's lld, so precedence
     // semantics (§Override And Link Precedence) are preserved either way.
-    let skip_clang_linker = std::env::var_os("CPCC_NO_CLANG_LINKER").is_some();
+    let skip_clang_linker = std::env::var_os("YURT_CC_NO_CLANG_LINKER").is_some();
     if let Some(c) = clang {
         if !skip_clang_linker {
             plan.env.push((
@@ -108,7 +109,7 @@ pub fn plan_invocation_with_sdk(
         //
         // When wasi-sdk clang is the linker, flags must be wrapped with
         // `-Wl,` so clang passes them through to lld. When rust-lld is used
-        // directly (CPCC_NO_CLANG_LINKER=1), the `-Wl,` prefix must be
+        // directly (YURT_CC_NO_CLANG_LINKER=1), the `-Wl,` prefix must be
         // omitted — rust-lld receives -C link-arg values verbatim and doesn't
         // understand `-Wl,` itself.
         let (wa_open, wa_close, linker_flag_prefix, export_flag_prefix) = if skip_clang_linker {
@@ -168,9 +169,7 @@ pub fn locate_outputs(target_dir: &Path, profile: &str) -> Vec<PathBuf> {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("wasm")
-            && path.is_file()
-        {
+        if path.extension().and_then(|e| e.to_str()) == Some("wasm") && path.is_file() {
             out.push(path);
         }
     }

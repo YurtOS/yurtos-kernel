@@ -9,11 +9,11 @@ fn repo_root() -> PathBuf {
 }
 
 fn check_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_cpcheck")
+    env!("CARGO_BIN_EXE_yurt-check")
 }
 
 #[test]
-fn signature_check_passes_on_canary_built_via_cpcc() {
+fn signature_check_passes_on_canary_built_via_yurt_cc() {
     if std::env::var_os("WASI_SDK_PATH").is_none() {
         eprintln!("skip — WASI_SDK_PATH not set");
         return;
@@ -32,19 +32,22 @@ fn signature_check_passes_on_canary_built_via_cpcc() {
     let out_wasm = tmp.path().join("dup2-canary.wasm");
     let preserved = tmp.path().join("dup2-canary.pre-opt.wasm");
 
-    // Build dup2 canary via cpcc with preservation.
-    let cc = env!("CARGO_BIN_EXE_cpcc");
+    // Build dup2 canary via yurt-cc with preservation.
+    let cc = env!("CARGO_BIN_EXE_yurt-cc");
     let st = Command::new(cc)
-        .env("CPCC_ARCHIVE", &archive)
-        .env("CPCC_INCLUDE", root.join("packages/guest-compat/include"))
-        .env("CPCC_PRESERVE_PRE_OPT", &preserved)
-        .env("CPCC_NO_WASM_OPT", "1")
+        .env("YURT_CC_ARCHIVE", &archive)
+        .env(
+            "YURT_CC_INCLUDE",
+            root.join("packages/guest-compat/include"),
+        )
+        .env("YURT_CC_PRESERVE_PRE_OPT", &preserved)
+        .env("YURT_CC_NO_WASM_OPT", "1")
         .arg(root.join("packages/guest-compat/conformance/c/dup2-canary.c"))
         .arg("-o")
         .arg(&out_wasm)
         .status()
         .unwrap();
-    assert!(st.success(), "cpcc failed");
+    assert!(st.success(), "yurt-cc failed");
 
     // Run the check.
     let st = Command::new(check_bin())
@@ -77,10 +80,10 @@ fn signature_check_fails_when_symbol_body_does_not_call_marker() {
     .unwrap();
     let out_wasm = tmp.path().join("stub.wasm");
 
-    let cc = env!("CARGO_BIN_EXE_cpcc");
+    let cc = env!("CARGO_BIN_EXE_yurt-cc");
     let st = Command::new(cc)
-        .env("CPCC_NO_WASM_OPT", "1")
-        .env("CPCC_PRESERVE_PRE_OPT", &out_wasm)
+        .env("YURT_CC_NO_WASM_OPT", "1")
+        .env("YURT_CC_PRESERVE_PRE_OPT", &out_wasm)
         .arg(&stub_src)
         .arg("-o")
         .arg(tmp.path().join("stub.out.wasm"))

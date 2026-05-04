@@ -1,4 +1,4 @@
-use cpcc_toolchain::spec::{Expected, Spec};
+use yurt_toolchain::spec::Spec;
 
 #[test]
 fn parses_minimal_spec_with_one_case() {
@@ -44,8 +44,10 @@ name = "happy_path"
 expected.something_made_up = 42
 "#;
     let err = Spec::from_str(text).unwrap_err().to_string();
-    assert!(err.contains("unknown field") || err.contains("something_made_up"),
-            "expected closed-schema error, got: {err}");
+    assert!(
+        err.contains("unknown field") || err.contains("something_made_up"),
+        "expected closed-schema error, got: {err}"
+    );
 }
 
 #[test]
@@ -57,8 +59,10 @@ canary = "dup2-canary"
 name = "empty"
 "#;
     let err = Spec::from_str(text).unwrap_err().to_string();
-    assert!(err.contains("at least one expected"),
-            "expected at-least-one-expected error, got: {err}");
+    assert!(
+        err.contains("at least one expected"),
+        "expected at-least-one-expected error, got: {err}"
+    );
 }
 
 #[test]
@@ -75,8 +79,10 @@ name = "happy_path"
 expected.exit = 1
 "#;
     let err = Spec::from_str(text).unwrap_err().to_string();
-    assert!(err.contains("duplicate"),
-            "expected duplicate-name error, got: {err}");
+    assert!(
+        err.contains("duplicate"),
+        "expected duplicate-name error, got: {err}"
+    );
 }
 
 #[test]
@@ -89,8 +95,10 @@ name = "Bad-Name!"
 expected.exit = 0
 "#;
     let err = Spec::from_str(text).unwrap_err().to_string();
-    assert!(err.contains("invalid case name") || err.contains("Bad-Name"),
-            "expected invalid-name error, got: {err}");
+    assert!(
+        err.contains("invalid case name") || err.contains("Bad-Name"),
+        "expected invalid-name error, got: {err}"
+    );
 }
 
 #[test]
@@ -112,18 +120,26 @@ expected.note = "renumber"
 #[test]
 fn loads_from_directory() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("dup2.spec.toml"), r#"
+    std::fs::write(
+        dir.path().join("dup2.spec.toml"),
+        r#"
 canary = "dup2-canary"
 [[case]]
 name = "happy_path"
 expected.exit = 0
-"#).unwrap();
-    std::fs::write(dir.path().join("getgroups.spec.toml"), r#"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("getgroups.spec.toml"),
+        r#"
 canary = "getgroups-canary"
 [[case]]
 name = "count_only"
 expected.exit = 0
-"#).unwrap();
+"#,
+    )
+    .unwrap();
     let specs = Spec::load_dir(dir.path()).unwrap();
     assert_eq!(specs.len(), 2);
     let dup2 = specs.iter().find(|s| s.symbol == "dup2").unwrap();

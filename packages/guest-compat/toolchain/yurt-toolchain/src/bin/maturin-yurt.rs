@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use cpcc_toolchain::maturin_yurt::plan_invocation;
 use std::process::{Command, ExitCode};
+use yurt_toolchain::maturin_yurt::plan_invocation;
 
 fn main() -> Result<ExitCode> {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();

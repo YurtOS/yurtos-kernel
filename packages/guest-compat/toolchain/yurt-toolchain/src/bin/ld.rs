@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use cpcc_toolchain::wasi_sdk;
 use std::process::{Command, ExitCode};
+use yurt_toolchain::wasi_sdk;
 
 // Flags that are compiler-driver conventions but have no meaning for wasm-ld.
 const STRIP_FLAGS: &[&str] = &["-nostdlib", "-nostartfiles", "-nodefaultlibs"];

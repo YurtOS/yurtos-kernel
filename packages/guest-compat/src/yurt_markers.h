@@ -10,17 +10,17 @@
  *
  * - **Production / default** (no `-DYURT_GUEST_COMPAT_MARKERS`):
  *   The macros below compile to nothing.  No marker functions are
- *   emitted, no extra exports are forced.  cpcheck verifies link
+ *   emitted, no extra exports are forced.  yurt-check verifies link
  *   precedence *structurally*: every Tier 1 symbol must be exported
  *   from the wasm, and *none* of them may appear in the import
  *   section (which would mean a wasi syscall stub won the link).
- *   This works because cpcc `--whole-archive`-links our compat lib,
+ *   This works because yurt-cc `--whole-archive`-links our compat lib,
  *   so our symbol is structurally present and wins by link order.
  *
  * - **Debug / instrumented** (`-DYURT_GUEST_COMPAT_MARKERS=1`):
  *   Each Tier 1 symbol's body emits a side-effecting call to a
  *   companion marker function returning a distinct magic constant.
- *   cpcheck's `--mode=markers` then verifies the body in the
+ *   yurt-check's `--mode=markers` then verifies the body in the
  *   pre-opt wasm contains that call — proving the bytes that ran
  *   came from our compat source, not a wasi-libc stub of the same
  *   name.  Useful while iterating on the compat layer; brittle for
@@ -66,7 +66,7 @@
 
 #else /* !YURT_GUEST_COMPAT_MARKERS — production / default */
 
-/* Production: no marker plumbing.  cpcheck switches to structural
+/* Production: no marker plumbing.  yurt-check switches to structural
  * verification (no Tier 1 symbol may appear in the wasm imports,
  * meaning our --whole-archive'd compat impl wins by link order). */
 #define YURT_DEFINE_MARKER(sym, magic) /* nothing */

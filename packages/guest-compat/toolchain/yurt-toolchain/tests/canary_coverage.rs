@@ -1,5 +1,5 @@
-use cpcc_toolchain::conform::canary_symbol_map;
-use cpcc_toolchain::TIER1;
+use yurt_toolchain::conform::canary_symbol_map;
+use yurt_toolchain::TIER1;
 
 #[test]
 fn every_tier1_symbol_is_covered_by_some_canary() {
@@ -10,5 +10,8 @@ fn every_tier1_symbol_is_covered_by_some_canary() {
         }
     }
     let missing: Vec<&&str> = TIER1.iter().filter(|s| !covered.contains(*s)).collect();
-    assert!(missing.is_empty(), "Tier 1 symbols not covered by any canary: {missing:?}");
+    assert!(
+        missing.is_empty(),
+        "Tier 1 symbols not covered by any canary: {missing:?}"
+    );
 }

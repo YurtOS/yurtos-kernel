@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
-use cpcc_toolchain::cargo_yurt::{plan_invocation_with_sdk, Subcommand};
-use cpcc_toolchain::{archive, env as cpcc_env, wasi_sdk};
 use std::process::{Command, ExitCode};
+use yurt_toolchain::cargo_yurt::{plan_invocation_with_sdk, Subcommand};
+use yurt_toolchain::{archive, env as yurt_cc_env, wasi_sdk};
 
 fn main() -> Result<ExitCode> {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
@@ -17,7 +17,7 @@ fn main() -> Result<ExitCode> {
     let sub = Subcommand::parse(&sub_name)?;
 
     if sub == Subcommand::DownloadToolchain {
-        let msg = cpcc_toolchain::cargo_yurt::download_toolchain()?;
+        let msg = yurt_toolchain::cargo_yurt::download_toolchain()?;
         println!("cargo-yurt: {msg}");
         return Ok(ExitCode::SUCCESS);
     }
@@ -33,7 +33,7 @@ fn main() -> Result<ExitCode> {
     });
 
     let sdk = wasi_sdk::discover().context("locating wasi-sdk")?;
-    let process_env = cpcc_env::Env::from_process();
+    let process_env = yurt_cc_env::Env::from_process();
 
     // §Versioning: the version check runs against the same llvm-nm the C
     // wrapper uses. It is presence-only at Step 1; future tightening to an
@@ -78,8 +78,8 @@ fn main() -> Result<ExitCode> {
     // §Verifying Precedence: preserve a pre-opt copy of every produced
     // .wasm so the signature check has an unoptimized artifact, then run
     // wasm-opt on the original.
-    use cpcc_toolchain::cargo_yurt::{locate_outputs, profile_from_args};
-    use cpcc_toolchain::{preserve, wasm_opt};
+    use yurt_toolchain::cargo_yurt::{locate_outputs, profile_from_args};
+    use yurt_toolchain::{preserve, wasm_opt};
 
     let target_dir = std::env::var_os("CARGO_TARGET_DIR")
         .map(std::path::PathBuf::from)
@@ -92,7 +92,7 @@ fn main() -> Result<ExitCode> {
             let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
             // If the user pointed at an existing directory, or there are
             // multiple outputs, treat the env var as a directory; otherwise
-            // treat it as a single-file destination (cpcc's behavior).
+            // treat it as a single-file destination (yurt-cc's behavior).
             let dst = if preserve_path.is_dir() || outputs.len() > 1 {
                 preserve_path.join(format!("{stem}.pre-opt.wasm"))
             } else {

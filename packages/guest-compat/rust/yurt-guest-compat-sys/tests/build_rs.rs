@@ -33,49 +33,69 @@ fn build_rs_binary() -> PathBuf {
 #[test]
 fn host_target_is_noop_regardless_of_env() {
     let bin = build_rs_binary();
-    if !bin.exists() { return; }
+    if !bin.exists() {
+        return;
+    }
     // Host target = current platform triple; pick something obviously non-wasi.
     // This is the load-bearing test for preserving root `cargo build`.
     let out = Command::new(&bin)
         .env("TARGET", "x86_64-unknown-linux-gnu")
         .env_remove("YURT_LINK_INJECTED")
-        .env_remove("CPCC_ARCHIVE")
+        .env_remove("YURT_CC_ARCHIVE")
         .env_remove("YURT_GUEST_COMPAT_LIBDIR")
         .output()
         .unwrap();
-    assert!(out.status.success(),
-            "host build.rs must not fail even with no env: {}",
-            String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "host build.rs must not fail even with no env: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!stdout.contains("rustc-link-lib=static"),
-            "host build must not emit link-lib; got: {stdout}");
-    assert!(!stdout.contains("rustc-link-arg="),
-            "host build must not emit link-arg; got: {stdout}");
+    assert!(
+        !stdout.contains("rustc-link-lib=static"),
+        "host build must not emit link-lib; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("rustc-link-arg="),
+        "host build must not emit link-arg; got: {stdout}"
+    );
 }
 
 #[test]
 fn wasip1_target_skips_when_yurt_link_injected_set() {
     let bin = build_rs_binary();
-    if !bin.exists() { return; }
+    if !bin.exists() {
+        return;
+    }
     let out = Command::new(&bin)
         .env("TARGET", "wasm32-wasip1")
         .env("YURT_LINK_INJECTED", "1")
-        .env_remove("CPCC_ARCHIVE")
+        .env_remove("YURT_CC_ARCHIVE")
         .env_remove("YURT_GUEST_COMPAT_LIBDIR")
         .output()
         .unwrap();
-    assert!(out.status.success(), "build.rs failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "build.rs failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!stdout.contains("rustc-link-lib=static"),
-            "should not emit link-lib when YURT_LINK_INJECTED is set; got: {stdout}");
-    assert!(stdout.contains("YURT_LINK_INJECTED set, skipping"),
-            "should warn about skipping; got: {stdout}");
+    assert!(
+        !stdout.contains("rustc-link-lib=static"),
+        "should not emit link-lib when YURT_LINK_INJECTED is set; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("YURT_LINK_INJECTED set, skipping"),
+        "should warn about skipping; got: {stdout}"
+    );
 }
 
 #[test]
 fn wasip1_target_emits_link_directives_when_archive_provided() {
     let bin = build_rs_binary();
-    if !bin.exists() { return; }
+    if !bin.exists() {
+        return;
+    }
     // Create a fake archive file so the path-based check passes; skip the
     // version check via env var to avoid llvm-nm dependency in tests.
     let dir = tempfile::tempdir().unwrap();
@@ -84,34 +104,51 @@ fn wasip1_target_emits_link_directives_when_archive_provided() {
     let out = Command::new(&bin)
         .env("TARGET", "wasm32-wasip1")
         .env_remove("YURT_LINK_INJECTED")
-        .env("CPCC_ARCHIVE", &archive)
-        .env("CPCC_SKIP_VERSION_CHECK", "1")
+        .env("YURT_CC_ARCHIVE", &archive)
+        .env("YURT_CC_SKIP_VERSION_CHECK", "1")
         .output()
         .unwrap();
-    assert!(out.status.success(), "build.rs failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "build.rs failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("rustc-link-search=native="), "missing link-search: {stdout}");
-    assert!(stdout.contains("rustc-link-lib=static:+whole-archive+bundle=yurt_guest_compat"),
-            "missing whole-archive lib directive: {stdout}");
-    // 16 Tier 1 symbols × 2 exports each = 32 export flags.
+    assert!(
+        stdout.contains("rustc-link-search=native="),
+        "missing link-search: {stdout}"
+    );
+    assert!(
+        stdout.contains("rustc-link-lib=static:+whole-archive+bundle=yurt_guest_compat"),
+        "missing whole-archive lib directive: {stdout}"
+    );
     let export_count = stdout.matches("rustc-link-arg=-Wl,--export=").count();
-    assert_eq!(export_count, 32, "expected 32 export flags, got {export_count}: {stdout}");
+    assert_eq!(
+        export_count, 146,
+        "expected 146 export flags, got {export_count}: {stdout}"
+    );
 }
 
 #[test]
 fn wasip1_target_panics_when_neither_archive_env_set_and_not_injected() {
     let bin = build_rs_binary();
-    if !bin.exists() { return; }
+    if !bin.exists() {
+        return;
+    }
     let out = Command::new(&bin)
         .env("TARGET", "wasm32-wasip1")
         .env_remove("YURT_LINK_INJECTED")
-        .env_remove("CPCC_ARCHIVE")
+        .env_remove("YURT_CC_ARCHIVE")
         .env_remove("YURT_GUEST_COMPAT_LIBDIR")
         .output()
         .unwrap();
-    assert!(!out.status.success(),
-            "wasm32-wasip1 build.rs should fail when archive env is missing");
+    assert!(
+        !out.status.success(),
+        "wasm32-wasip1 build.rs should fail when archive env is missing"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("YURT_GUEST_COMPAT_LIBDIR") || stderr.contains("CPCC_ARCHIVE"),
-            "panic message should mention env vars: {stderr}");
+    assert!(
+        stderr.contains("YURT_GUEST_COMPAT_LIBDIR") || stderr.contains("YURT_CC_ARCHIVE"),
+        "panic message should mention env vars: {stderr}"
+    );
 }

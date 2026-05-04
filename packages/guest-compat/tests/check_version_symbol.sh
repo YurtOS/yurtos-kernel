@@ -3,11 +3,11 @@ set -euo pipefail
 
 # Verify the version sentinel symbol is defined in the built object, and
 # that the header exposes the corresponding compile-time major/minor
-# macros (so cpcc and header stay in sync textually). This is presence-
+# macros (so yurt-cc and header stay in sync textually). This is presence-
 # only — extracting the encoded uint32_t out of the archive to value-
 # match against the header constants requires parsing the wasm object
 # format and is deferred to Step 3 (see §Versioning and the Self-Review
-# note). Task 7's cpcc archive check likewise enforces presence only at
+# note). Task 7's yurt-cc archive check likewise enforces presence only at
 # Step 1.
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 BUILD_DIR="$REPO_ROOT/packages/guest-compat/build"
@@ -16,14 +16,14 @@ HDR="$REPO_ROOT/packages/guest-compat/include/yurt_compat.h"
 
 # These test shell scripts require a wasi-sdk install located via the
 # standard WASI_SDK_PATH env var. After Task 6, use:
-#   WASI_SDK_PATH="$("$REPO_ROOT/target/release/cpcc" --print-sdk-path)"
-# For Tasks 2–4 (before cpcc is built), require the caller to set
+#   WASI_SDK_PATH="$("$REPO_ROOT/target/release/yurt-cc" --print-sdk-path)"
+# For Tasks 2–4 (before yurt-cc is built), require the caller to set
 # WASI_SDK_PATH themselves.
 if [ -z "${WASI_SDK_PATH:-}" ]; then
-  if [ -x "$REPO_ROOT/target/release/cpcc" ]; then
-    WASI_SDK_PATH="$("$REPO_ROOT/target/release/cpcc" --print-sdk-path)"
+  if [ -x "$REPO_ROOT/target/release/yurt-cc" ]; then
+    WASI_SDK_PATH="$("$REPO_ROOT/target/release/yurt-cc" --print-sdk-path)"
   else
-    echo "set WASI_SDK_PATH or build cpcc first" >&2
+    echo "set WASI_SDK_PATH or build yurt-cc first" >&2
     exit 1
   fi
 fi

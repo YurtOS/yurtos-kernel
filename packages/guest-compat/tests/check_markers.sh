@@ -4,10 +4,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 BUILD_DIR="$REPO_ROOT/packages/guest-compat/build"
 if [ -z "${WASI_SDK_PATH:-}" ]; then
-  if [ -x "$REPO_ROOT/target/release/cpcc" ]; then
-    WASI_SDK_PATH="$("$REPO_ROOT/target/release/cpcc" --print-sdk-path)"
+  if [ -x "$REPO_ROOT/target/release/yurt-cc" ]; then
+    WASI_SDK_PATH="$("$REPO_ROOT/target/release/yurt-cc" --print-sdk-path)"
   else
-    echo "set WASI_SDK_PATH or build cpcc first" >&2
+    echo "set WASI_SDK_PATH or build yurt-cc first" >&2
     exit 1
   fi
 fi

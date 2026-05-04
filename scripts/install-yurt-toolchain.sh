@@ -40,16 +40,16 @@ if [[ "$DRY_RUN" == "1" ]]; then
 fi
 
 if [[ "$BUILD_PROFILE" == "release" ]]; then
-  cargo build -p cpcc-toolchain --release
+  cargo build -p yurt-toolchain --release
   TARGET_DIR="$ROOT/target/release"
 else
-  cargo build -p cpcc-toolchain
+  cargo build -p yurt-toolchain
   TARGET_DIR="$ROOT/target/debug"
 fi
 
 mkdir -p "$BIN_DIR" "$YURT_HOME/rust-std"
 
-for bin in cargo-yurt maturin-yurt cpcc cpar cpranlib cpcheck cpconf; do
+for bin in cargo-yurt maturin-yurt yurt-cc yurt-ar yurt-ranlib yurt-check yurt-conf; do
   install -m 0755 "$TARGET_DIR/$bin" "$BIN_DIR/$bin"
 done
 

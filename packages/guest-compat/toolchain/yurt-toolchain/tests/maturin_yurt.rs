@@ -1,5 +1,5 @@
-use cpcc_toolchain::maturin_yurt::plan_invocation;
 use std::sync::Mutex;
+use yurt_toolchain::maturin_yurt::plan_invocation;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 

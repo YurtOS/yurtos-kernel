@@ -1,16 +1,16 @@
 use anyhow::Result;
 use clap::Parser;
-use cpcc_toolchain::conform;
 use std::process::{Command, ExitCode};
+use yurt_toolchain::conform;
 
 #[derive(Parser)]
 #[command(
-    name = "cpconf",
+    name = "yurt-conf",
     version,
     about = "Guest compatibility conformance driver (§Conformance Testing)"
 )]
 struct Args {
-    /// Skip rebuilding cpcc/cpar/cpcheck/cargo-yurt (assume up to date).
+    /// Skip rebuilding yurt-cc/yurt-ar/yurt-check/cargo-yurt (assume up to date).
     #[arg(long)]
     skip_toolchain_build: bool,
     /// Skip the kernel behavioral canary suite.
@@ -59,10 +59,7 @@ fn main() -> Result<ExitCode> {
         for r in &results {
             if !r.mismatches.is_empty() {
                 failures += 1;
-                eprintln!(
-                    "FAIL [{}] {}::{}",
-                    r.language, r.spec_symbol, r.case_name
-                );
+                eprintln!("FAIL [{}] {}::{}", r.language, r.spec_symbol, r.case_name);
                 for m in &r.mismatches {
                     eprintln!("  - {m:?}");
                 }
@@ -75,18 +72,24 @@ fn main() -> Result<ExitCode> {
                 results.len()
             ));
         }
-        println!("cpconf: spec/trace diffs OK ({} cases)", results.len());
+        println!("yurt-conf: spec/trace diffs OK ({} cases)", results.len());
 
         // §Conformance Driver: C and Rust traces must match each other for
         // each case. Pair them up and assert equality of stdout/exit/errno.
         if args.include_rust {
-            let mut by_key: std::collections::HashMap<(String, String), Vec<&conform::CaseResult>> = Default::default();
+            let mut by_key: std::collections::HashMap<(String, String), Vec<&conform::CaseResult>> =
+                Default::default();
             for r in &results {
-                by_key.entry((r.spec_symbol.clone(), r.case_name.clone())).or_default().push(r);
+                by_key
+                    .entry((r.spec_symbol.clone(), r.case_name.clone()))
+                    .or_default()
+                    .push(r);
             }
             let mut cross_failures = 0usize;
             for ((sym, case), pair) in &by_key {
-                if pair.len() != 2 { continue; }
+                if pair.len() != 2 {
+                    continue;
+                }
                 let c = pair.iter().find(|p| p.language == "c");
                 let r = pair.iter().find(|p| p.language == "rust");
                 if let (Some(c), Some(r)) = (c, r) {
@@ -99,15 +102,17 @@ fn main() -> Result<ExitCode> {
                 }
             }
             if cross_failures > 0 {
-                return Err(anyhow::anyhow!("{cross_failures} cross-language trace mismatches"));
+                return Err(anyhow::anyhow!(
+                    "{cross_failures} cross-language trace mismatches"
+                ));
             }
-            println!("cpconf: C/Rust trace parity OK");
+            println!("yurt-conf: C/Rust trace parity OK");
         }
     }
 
     if !args.skip_behavioral {
         driver.run_behavioral_suite()?;
     }
-    println!("cpconf: OK");
+    println!("yurt-conf: OK");
     Ok(ExitCode::SUCCESS)
 }

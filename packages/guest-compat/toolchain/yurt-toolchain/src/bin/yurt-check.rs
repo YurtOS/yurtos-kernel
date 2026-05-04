@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use cpcc_toolchain::{precheck, wasi_sdk, TIER1};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use yurt_toolchain::{precheck, wasi_sdk, TIER1};
 
 #[derive(Parser)]
 #[command(about = "§Verifying Precedence: archive + pre-opt wasm implementation-signature check")]
@@ -18,7 +18,7 @@ struct Args {
     ///
     /// `structural` (default): verify each Tier 1 symbol is
     /// exported from the wasm and *not* in the import section.
-    /// Combined with cpcc's `--whole-archive`, this is sufficient
+    /// Combined with yurt-cc's `--whole-archive`, this is sufficient
     /// to know our compat impl wins the link.  Robust to LTO
     /// inlining.
     ///
@@ -26,7 +26,7 @@ struct Args {
     /// emit a `call` instruction to its companion marker function
     /// in the pre-opt wasm.  Requires the compat library to have
     /// been built with `-DYURT_GUEST_COMPAT_MARKERS=1`
-    /// (i.e. `CPCC_MARKERS=1 make -C packages/guest-compat lib`).
+    /// (i.e. `YURT_CC_MARKERS=1 make -C packages/guest-compat lib`).
     #[arg(long, value_enum, default_value_t = Mode::Structural)]
     mode: Mode,
 }

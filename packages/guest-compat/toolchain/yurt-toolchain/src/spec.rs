@@ -80,9 +80,8 @@ impl Spec {
     }
 
     fn from_str_with_symbol(text: &str, symbol: &str, path: PathBuf) -> Result<Self> {
-        let raw: RawSpec = toml::from_str(text).map_err(|e| {
-            anyhow!("parsing spec for {symbol}: {e}")
-        })?;
+        let raw: RawSpec =
+            toml::from_str(text).map_err(|e| anyhow!("parsing spec for {symbol}: {e}"))?;
 
         let mut seen = std::collections::HashSet::new();
         let mut cases = Vec::with_capacity(raw.cases.len());
@@ -103,10 +102,7 @@ impl Spec {
                 errno: exp.errno,
                 note: exp.note,
             };
-            if expected.exit.is_none()
-                && expected.stdout.is_none()
-                && expected.errno.is_none()
-            {
+            if expected.exit.is_none() && expected.stdout.is_none() && expected.errno.is_none() {
                 return Err(anyhow!(
                     "{symbol}: case {:?} requires at least one expected.* field",
                     rc.name
@@ -132,9 +128,7 @@ impl Spec {
     /// symbol name so iteration order is deterministic.
     pub fn load_dir(dir: &Path) -> Result<Vec<Self>> {
         let mut out = Vec::new();
-        for entry in std::fs::read_dir(dir)
-            .with_context(|| format!("reading {}", dir.display()))?
-        {
+        for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();

@@ -2,7 +2,7 @@
 
 Each Tier 1 symbol has a behavioral spec at
 `packages/guest-compat/conformance/<symbol>.spec.toml`. The driver
-(`cpconf` via `cpcc-toolchain`'s `spec` and `trace` modules) reads each
+(`yurt-conf` via `yurt-toolchain`'s `spec` and `trace` modules) reads each
 spec, iterates its cases, runs the named canary once per case as
 `<canary> --case <name>`, captures one JSONL trace line on stdout, and
 diffs the trace against `expected.*` fields.

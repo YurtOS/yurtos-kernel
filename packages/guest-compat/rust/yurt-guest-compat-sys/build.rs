@@ -4,11 +4,11 @@
 //!     framed --whole-archive via RUSTFLAGS; emitting here would link twice).
 //!  3. wasm32-wasip1 without YURT_LINK_INJECTED → emit link-search, whole-
 //!     archive bundle lib, and per-Tier-1-symbol --export flags. Requires
-//!     YURT_GUEST_COMPAT_LIBDIR or CPCC_ARCHIVE; errors with a clear
+//!     YURT_GUEST_COMPAT_LIBDIR or YURT_CC_ARCHIVE; errors with a clear
 //!     message if neither is set.
 //!
 //! Also runs an llvm-nm presence check on the archive in path 3, mirroring
-//! `cpcc`'s `archive::check_version` so plain-cargo consumers get the same
+//! `yurt-cc`'s `archive::check_version` so plain-cargo consumers get the same
 //! version-mismatch surface as cargo-yurt consumers.
 
 use std::env;
@@ -18,8 +18,8 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-env-changed=YURT_LINK_INJECTED");
     println!("cargo:rerun-if-env-changed=YURT_GUEST_COMPAT_LIBDIR");
-    println!("cargo:rerun-if-env-changed=CPCC_ARCHIVE");
-    println!("cargo:rerun-if-env-changed=CPCC_SKIP_VERSION_CHECK");
+    println!("cargo:rerun-if-env-changed=YURT_CC_ARCHIVE");
+    println!("cargo:rerun-if-env-changed=YURT_CC_SKIP_VERSION_CHECK");
 
     // CARGO_CFG_TARGET_OS + CARGO_CFG_TARGET_ARCH are how build.rs scripts
     // learn what cargo is actually targeting. For wasm32-wasip1 these are
@@ -35,7 +35,9 @@ fn main() {
 
     if env::var("YURT_LINK_INJECTED").is_ok() {
         // Path 2: cargo-yurt already injected via RUSTFLAGS.
-        println!("cargo:warning=yurt-guest-compat-sys: YURT_LINK_INJECTED set, skipping link directives");
+        println!(
+            "cargo:warning=yurt-guest-compat-sys: YURT_LINK_INJECTED set, skipping link directives"
+        );
         return;
     }
 
@@ -46,7 +48,7 @@ fn main() {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    if env::var("CPCC_SKIP_VERSION_CHECK").is_err() {
+    if env::var("YURT_CC_SKIP_VERSION_CHECK").is_err() {
         run_version_check(&lib_path);
     }
 
@@ -57,19 +59,60 @@ fn main() {
 
     // Per-Tier-1-symbol --export framing so the implementation-signature
     // check (§Verifying Precedence) finds markers in the pre-opt wasm. Same
-    // 16 symbols as cpcc-toolchain::TIER1 — must stay in sync with
-    // packages/guest-compat/toolchain/cpcc/src/lib.rs TIER1.
+    // symbols as yurt-toolchain::TIER1 — must stay in sync with
+    // packages/guest-compat/toolchain/yurt-toolchain/src/lib.rs TIER1.
     for sym in TIER1 {
         println!("cargo:rustc-link-arg=-Wl,--export={sym}");
         println!("cargo:rustc-link-arg=-Wl,--export=__yurt_guest_compat_marker_{sym}");
     }
 }
 
-/// Must stay in sync with `cpcc_toolchain::TIER1`. A CI parity check
+/// Must stay in sync with `yurt_toolchain::TIER1`. A CI parity check
 /// (Task 18 step 2.5) asserts this at build time.
 const TIER1: &[&str] = &[
+    "chown",
+    "chroot",
+    "flockfile",
+    "ftrylockfile",
+    "funlockfile",
+    "qsort_r",
+    "setresgid",
+    "setresuid",
+    "dup",
     "dup2",
+    "dup3",
+    "execv",
+    "execve",
+    "execvp",
+    "fchdir",
+    "fchown",
+    "fork",
+    "vfork",
     "getgroups",
+    "getpriority",
+    "getrlimit",
+    "getpgid",
+    "getpgrp",
+    "getsid",
+    "lchown",
+    "mkdtemp",
+    "mkostemp",
+    "mkstemp",
+    "mktemp",
+    "setpgid",
+    "setpgrp",
+    "setpriority",
+    "setsid",
+    "tcgetpgrp",
+    "tcsetpgrp",
+    "umask",
+    "pipe",
+    "pipe2",
+    "posix_spawn",
+    "posix_spawnp",
+    "posix_spawn_file_actions_init",
+    "posix_spawnattr_init",
+    "setrlimit",
     "sched_getaffinity",
     "sched_setaffinity",
     "sched_getcpu",
@@ -84,20 +127,36 @@ const TIER1: &[&str] = &[
     "sigismember",
     "sigprocmask",
     "sigsuspend",
+    "tzset",
+    "wait",
+    "waitpid",
+    "pthread_create",
+    "pthread_join",
+    "pthread_detach",
+    "pthread_exit",
+    "pthread_self",
+    "pthread_mutex_lock",
+    "pthread_mutex_unlock",
+    "pthread_cond_wait",
+    "pthread_cond_signal",
+    "pthread_key_create",
+    "pthread_setspecific",
+    "pthread_getspecific",
+    "pthread_once",
 ];
 
 fn locate_archive() -> PathBuf {
     if let Ok(explicit) = env::var("YURT_GUEST_COMPAT_LIBDIR") {
         return PathBuf::from(explicit).join("libyurt_guest_compat.a");
     }
-    if let Ok(explicit) = env::var("CPCC_ARCHIVE") {
+    if let Ok(explicit) = env::var("YURT_CC_ARCHIVE") {
         return PathBuf::from(explicit);
     }
     // Only reachable when TARGET is wasm32-wasip1 AND YURT_LINK_INJECTED
     // is unset — i.e. the "alternate path" for plain cargo. Host builds
     // never see this.
     panic!(
-        "yurt-guest-compat-sys: targeting wasm32-wasip1 with neither YURT_GUEST_COMPAT_LIBDIR nor CPCC_ARCHIVE set. Either set one to point at libyurt_guest_compat.a, or build via cargo-yurt which sets YURT_LINK_INJECTED=1 and frames the archive itself."
+        "yurt-guest-compat-sys: targeting wasm32-wasip1 with neither YURT_GUEST_COMPAT_LIBDIR nor YURT_CC_ARCHIVE set. Either set one to point at libyurt_guest_compat.a, or build via cargo-yurt which sets YURT_LINK_INJECTED=1 and frames the archive itself."
     );
 }
 
@@ -116,12 +175,12 @@ fn run_version_check(archive: &Path) {
         );
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let present = stdout.lines().any(|line| {
-        line.split_whitespace().last() == Some("yurt_guest_compat_version")
-    });
+    let present = stdout
+        .lines()
+        .any(|line| line.split_whitespace().last() == Some("yurt_guest_compat_version"));
     if !present {
         panic!(
-            "archive {} does not define yurt_guest_compat_version (§Versioning); set CPCC_SKIP_VERSION_CHECK=1 to bypass",
+            "archive {} does not define yurt_guest_compat_version (§Versioning); set YURT_CC_SKIP_VERSION_CHECK=1 to bypass",
             archive.display()
         );
     }

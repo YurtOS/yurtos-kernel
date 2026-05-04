@@ -1,6 +1,8 @@
-use cpcc_toolchain::cargo_yurt::{plan_invocation, plan_invocation_with_sdk, profile_from_args, Subcommand};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use yurt_toolchain::cargo_yurt::{
+    plan_invocation, plan_invocation_with_sdk, profile_from_args, Subcommand,
+};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -9,7 +11,10 @@ fn build_subcommand_uses_wasm32_wasip1_target() {
     let _guard = ENV_LOCK.lock().unwrap();
     let plan = plan_invocation(Subcommand::Build, &["--release".into()]).unwrap();
     assert!(plan.cargo_args.iter().any(|a| a == "build"));
-    assert!(plan.cargo_args.iter().any(|a| a == "--target=wasm32-wasip1"));
+    assert!(plan
+        .cargo_args
+        .iter()
+        .any(|a| a == "--target=wasm32-wasip1"));
     assert!(plan.cargo_args.iter().any(|a| a == "--release"));
 }
 
@@ -18,7 +23,10 @@ fn test_subcommand_uses_wasm32_wasip1_target() {
     let _guard = ENV_LOCK.lock().unwrap();
     let plan = plan_invocation(Subcommand::Test, &[]).unwrap();
     assert!(plan.cargo_args.iter().any(|a| a == "test"));
-    assert!(plan.cargo_args.iter().any(|a| a == "--target=wasm32-wasip1"));
+    assert!(plan
+        .cargo_args
+        .iter()
+        .any(|a| a == "--target=wasm32-wasip1"));
 }
 
 #[test]
@@ -26,7 +34,10 @@ fn run_subcommand_uses_wasm32_wasip1_target() {
     let _guard = ENV_LOCK.lock().unwrap();
     let plan = plan_invocation(Subcommand::Run, &["--bin".into(), "foo".into()]).unwrap();
     assert!(plan.cargo_args.iter().any(|a| a == "run"));
-    assert!(plan.cargo_args.iter().any(|a| a == "--target=wasm32-wasip1"));
+    assert!(plan
+        .cargo_args
+        .iter()
+        .any(|a| a == "--target=wasm32-wasip1"));
     assert!(plan.cargo_args.iter().any(|a| a == "--bin"));
     assert!(plan.cargo_args.iter().any(|a| a == "foo"));
 }
@@ -36,7 +47,10 @@ fn injected_env_includes_yurt_link_injected() {
     let _guard = ENV_LOCK.lock().unwrap();
     let plan = plan_invocation(Subcommand::Build, &[]).unwrap();
     assert_eq!(
-        plan.env.iter().find(|(k, _)| k == "YURT_LINK_INJECTED").map(|(_, v)| v.as_str()),
+        plan.env
+            .iter()
+            .find(|(k, _)| k == "YURT_LINK_INJECTED")
+            .map(|(_, v)| v.as_str()),
         Some("1"),
     );
 }
@@ -44,12 +58,18 @@ fn injected_env_includes_yurt_link_injected() {
 #[test]
 fn dry_run_does_not_set_target_specific_env_when_archive_missing() {
     let _guard = ENV_LOCK.lock().unwrap();
-    // Without CPCC_ARCHIVE pointing somewhere real, the linker/RUSTFLAGS env
+    // Without YURT_CC_ARCHIVE pointing somewhere real, the linker/RUSTFLAGS env
     // vars are not set — letting the user diagnose "where's my archive?"
     // before they run a build.
     let plan = plan_invocation(Subcommand::Build, &[]).unwrap();
-    let has_rustflags = plan.env.iter().any(|(k, _)| k == "CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS");
-    assert!(!has_rustflags, "RUSTFLAGS should not be injected when archive is unset");
+    let has_rustflags = plan
+        .env
+        .iter()
+        .any(|(k, _)| k == "CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS");
+    assert!(
+        !has_rustflags,
+        "RUSTFLAGS should not be injected when archive is unset"
+    );
 }
 
 #[test]
@@ -91,11 +111,11 @@ fn profile_debug_when_release_flag_absent() {
 }
 
 #[test]
-fn clang_linker_omitted_when_cpcc_no_clang_linker_set() {
+fn clang_linker_omitted_when_yurt_cc_no_clang_linker_set() {
     let _guard = ENV_LOCK.lock().unwrap();
     // Save and restore to avoid cross-test contamination.
-    let prev = std::env::var_os("CPCC_NO_CLANG_LINKER");
-    std::env::set_var("CPCC_NO_CLANG_LINKER", "1");
+    let prev = std::env::var_os("YURT_CC_NO_CLANG_LINKER");
+    std::env::set_var("YURT_CC_NO_CLANG_LINKER", "1");
     let plan = plan_invocation_with_sdk(
         Subcommand::Build,
         &[],
@@ -103,14 +123,17 @@ fn clang_linker_omitted_when_cpcc_no_clang_linker_set() {
     )
     .unwrap();
     match prev {
-        Some(v) => std::env::set_var("CPCC_NO_CLANG_LINKER", v),
-        None => std::env::remove_var("CPCC_NO_CLANG_LINKER"),
+        Some(v) => std::env::set_var("YURT_CC_NO_CLANG_LINKER", v),
+        None => std::env::remove_var("YURT_CC_NO_CLANG_LINKER"),
     }
     let linker = plan
         .env
         .iter()
         .find(|(k, _)| k == "CARGO_TARGET_WASM32_WASIP1_LINKER");
-    assert!(linker.is_none(), "CPCC_NO_CLANG_LINKER=1 should skip linker injection even when clang is supplied");
+    assert!(
+        linker.is_none(),
+        "YURT_CC_NO_CLANG_LINKER=1 should skip linker injection even when clang is supplied"
+    );
 }
 
 #[test]

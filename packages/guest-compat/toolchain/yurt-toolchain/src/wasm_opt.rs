@@ -36,8 +36,9 @@ pub fn maybe_run(path: &Path, mode: &WasmOptMode, use_setjmp: bool) -> Result<()
         }
         WasmOptMode::Explicit(v) => v.clone(),
     };
-    let wasm_opt = which::which("wasm-opt")
-        .map_err(|_| anyhow!("wasm-opt requested but not on PATH (CPCC_NO_WASM_OPT=1 to skip)"))?;
+    let wasm_opt = which::which("wasm-opt").map_err(|_| {
+        anyhow!("wasm-opt requested but not on PATH (YURT_CC_NO_WASM_OPT=1 to skip)")
+    })?;
     let status = Command::new(wasm_opt)
         .args(&args)
         .arg(path)
@@ -63,7 +64,7 @@ mod tests {
         assert!(args.contains(&"--enable-nontrapping-float-to-int".to_string()));
         assert!(
             !args.contains(&"--asyncify".to_string()),
-            "default cpcc output must not be asyncify/setjmp-tainted",
+            "default yurt-cc output must not be asyncify/setjmp-tainted",
         );
     }
 

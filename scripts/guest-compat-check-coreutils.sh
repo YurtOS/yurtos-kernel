@@ -8,7 +8,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCHIVE="$REPO_ROOT/packages/guest-compat/build/libyurt_guest_compat.a"
 PRE_OPT_DIR="$REPO_ROOT/target/wasm32-wasip1/release/coreutils-pre-opt"
-CPCHECK="$REPO_ROOT/target/release/cpcheck"
+CPCHECK="$REPO_ROOT/target/release/yurt-check"
 
 if [[ ! -d "$PRE_OPT_DIR" ]]; then
   echo "check-coreutils: pre-opt dir missing at $PRE_OPT_DIR" >&2
@@ -20,7 +20,7 @@ if [[ ! -f "$ARCHIVE" ]]; then
   exit 2
 fi
 if [[ ! -x "$CPCHECK" ]]; then
-  echo "check-coreutils: cpcheck missing; run \`cargo build --release -p cpcc-toolchain\`" >&2
+  echo "check-coreutils: yurt-check missing; run \`cargo build --release -p yurt-toolchain\`" >&2
   exit 2
 fi
 
@@ -54,7 +54,7 @@ if [[ "${#TARGETS[@]}" -eq 0 ]]; then
   exit 2
 fi
 
-echo "check-coreutils: running cpcheck over ${#TARGETS[@]} coreutils binaries"
+echo "check-coreutils: running yurt-check over ${#TARGETS[@]} coreutils binaries"
 fail_list=()
 for tool in "${TARGETS[@]}"; do
   wasm="$PRE_OPT_DIR/$tool.pre-opt.wasm"
@@ -67,7 +67,7 @@ for tool in "${TARGETS[@]}"; do
     printf '  [ OK ] %s\n' "$tool"
   else
     printf '  [FAIL] %s\n' "$tool"
-    fail_list+=("$tool:cpcheck-failed")
+    fail_list+=("$tool:yurt-check-failed")
   fi
 done
 

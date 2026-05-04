@@ -1,7 +1,7 @@
 [workspace]
 members = [
   "packages/yurt-process",
-  "packages/guest-compat/toolchain/cpcc",
+  "packages/guest-compat/toolchain/yurt-toolchain",
   "packages/guest-compat/rust/yurt-guest-compat-sys",
   "packages/guest-compat/rust/yurt-guest-compat",
   "packages/guest-compat/rust/yurt-wasi-shims",
@@ -45,7 +45,7 @@ members = [
 # Exclude them from the default native build to avoid link failures on macOS.
 default-members = [
   "packages/yurt-process",
-  "packages/guest-compat/toolchain/cpcc",
+  "packages/guest-compat/toolchain/yurt-toolchain",
   "packages/guest-compat/rust/yurt-guest-compat-sys",
   "packages/guest-compat/rust/yurt-guest-compat",
   "packages/guest-compat/rust/yurt-wasi-shims",

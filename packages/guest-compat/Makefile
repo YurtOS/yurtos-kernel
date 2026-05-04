@@ -1,7 +1,7 @@
 # Build the guest-compat runtime archive + Tier 1 canaries. Every
-# toolchain invocation goes through one of the cp* binaries:
-# objects are compiled with `cpcc -c`, archives assembled with
-# `cpar rcs`, canaries linked with `cpcc` (which --whole-archives
+# toolchain invocation goes through one of the yurt-* binaries:
+# objects are compiled with `yurt-cc -c`, archives assembled with
+# `yurt-ar rcs`, canaries linked with `yurt-cc` (which --whole-archives
 # libyurt_guest_compat.a per §Override And Link Precedence).
 #
 # Targets:
@@ -16,8 +16,8 @@ FIXTURES := $(REPO_ROOT)/packages/kernel/src/platform/__tests__/fixtures
 BUILD_DIR := build
 INCLUDE := $(abspath include)
 CANARY_DIR := conformance/c
-CPCC := $(REPO_ROOT)/target/release/cpcc
-CPAR := $(REPO_ROOT)/target/release/cpar
+YURT_CC := $(REPO_ROOT)/target/release/yurt-cc
+YURT_AR := $(REPO_ROOT)/target/release/yurt-ar
 
 LIB := $(BUILD_DIR)/libyurt_guest_compat.a
 SETJMP_LIB := $(BUILD_DIR)/libyurt_setjmp.a
@@ -54,18 +54,18 @@ all: lib canaries
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-# Always delegate to cargo so edits under toolchain/cpcc/src/ actually
+# Always delegate to cargo so edits under toolchain/yurt-toolchain/src/ actually
 # rebuild. `cargo build` is a near-no-op when everything is up to date;
 # a `test -x` existence guard would silently use stale binaries.
 ensure-toolchain:
-	cd $(REPO_ROOT) && cargo build --release -p cpcc-toolchain
+	cd $(REPO_ROOT) && cargo build --release -p yurt-toolchain
 
-# Objects compile through `cpcc -c`. The compat archive is not yet built
-# when these rules fire and must not be injected; CPCC_ARCHIVE is
-# explicitly unset so cpcc skips link-arg framing. This is safe because
+# Objects compile through `yurt-cc -c`. The compat archive is not yet built
+# when these rules fire and must not be injected; YURT_CC_ARCHIVE is
+# explicitly unset so yurt-cc skips link-arg framing. This is safe because
 # `-c` disables link anyway.
 $(BUILD_DIR)/%.o: src/%.c $(wildcard include/*.h) src/yurt_runtime.h src/yurt_markers.h | $(BUILD_DIR) ensure-toolchain
-	CPCC_ARCHIVE= CPCC_INCLUDE=$(INCLUDE) $(CPCC) -c $< -o $@
+	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) $(YURT_CC) -c $< -o $@
 
 lib: $(LIB)
 
@@ -73,24 +73,24 @@ SETJMP_OBJS := \
   $(BUILD_DIR)/yurt_setjmp.o
 
 $(LIB): $(LIB_OBJS) | $(BUILD_DIR) ensure-toolchain
-	$(CPAR) rcs $@ $(LIB_OBJS)
+	$(YURT_AR) rcs $@ $(LIB_OBJS)
 
 $(SETJMP_LIB): $(SETJMP_OBJS) | $(BUILD_DIR) ensure-toolchain
-	$(CPAR) rcs $@ $(SETJMP_OBJS)
+	$(YURT_AR) rcs $@ $(SETJMP_OBJS)
 
 $(BUILD_DIR)/setjmp-canary.wasm: $(CANARY_DIR)/setjmp-canary.c $(wildcard include/*.h) $(LIB) $(SETJMP_LIB) | $(BUILD_DIR) ensure-toolchain
-	CPCC_ARCHIVE=$(abspath $(LIB)) \
-	CPCC_SETJMP_ARCHIVE=$(abspath $(SETJMP_LIB)) \
-	CPCC_USE_SETJMP=1 \
-	CPCC_INCLUDE=$(INCLUDE) \
-	CPCC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/setjmp-canary.pre-opt.wasm \
-	$(CPCC) $< -o $@
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_SETJMP_ARCHIVE=$(abspath $(SETJMP_LIB)) \
+	YURT_CC_USE_SETJMP=1 \
+	YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/setjmp-canary.pre-opt.wasm \
+	$(YURT_CC) $< -o $@
 
 $(BUILD_DIR)/%-canary.wasm: $(CANARY_DIR)/%-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
-	CPCC_ARCHIVE=$(abspath $(LIB)) \
-	CPCC_INCLUDE=$(INCLUDE) \
-	CPCC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/$*-canary.pre-opt.wasm \
-	$(CPCC) $< -o $@
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/$*-canary.pre-opt.wasm \
+	$(YURT_CC) $< -o $@
 
 canaries: $(CANARIES)
 
@@ -109,9 +109,9 @@ RUST_STD_CANARY_NAMES := std-tempdir std-env-process std-paths std-fs std-file-l
 
 rust-canaries: $(LIB) ensure-toolchain
 	@mkdir -p $(BUILD_DIR)/rust
-	CPCC_ARCHIVE=$(abspath $(LIB)) \
-	CPCC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/rust \
-	CPCC_NO_WASM_OPT=1 \
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/rust \
+	YURT_CC_NO_WASM_OPT=1 \
 	CARGO_TARGET_DIR=$(REPO_ROOT)/target \
 	$(REPO_ROOT)/target/release/cargo-yurt yurt build --release \
 	  -p dup2-canary -p getgroups-canary -p affinity-canary -p signal-canary
@@ -129,9 +129,9 @@ rust-std-canaries: $(LIB) ensure-toolchain
 	fi; \
 	rm -rf $(REPO_ROOT)/target/rust-std-canaries/$$version; \
 	for n in $(RUST_STD_CANARY_NAMES); do \
-	  CPCC_ARCHIVE=$(abspath $(LIB)) \
-	  CPCC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/rust \
-	  CPCC_NO_WASM_OPT=1 \
+	  YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	  YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/rust \
+	  YURT_CC_NO_WASM_OPT=1 \
 	  YURT_RUST_STD="$$std_root" \
 	  CARGO_TARGET_DIR=$(REPO_ROOT)/target/rust-std-canaries/$$version \
 	  $(REPO_ROOT)/target/release/cargo-yurt yurt build --release \

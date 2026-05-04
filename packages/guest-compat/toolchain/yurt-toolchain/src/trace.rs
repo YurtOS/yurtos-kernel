@@ -41,11 +41,26 @@ pub fn parse_trace_line(line: &str) -> Result<TraceLine> {
 
 #[derive(Debug, PartialEq)]
 pub enum Mismatch {
-    CaseName { expected: String, actual: String },
-    Exit { expected: i32, actual: i32 },
-    ProcessTraceExitDisagree { trace: i32, process: i32 },
-    Stdout { expected: String, actual: Option<String> },
-    Errno { expected: i32, actual: Option<i32> },
+    CaseName {
+        expected: String,
+        actual: String,
+    },
+    Exit {
+        expected: i32,
+        actual: i32,
+    },
+    ProcessTraceExitDisagree {
+        trace: i32,
+        process: i32,
+    },
+    Stdout {
+        expected: String,
+        actual: Option<String>,
+    },
+    Errno {
+        expected: i32,
+        actual: Option<i32>,
+    },
 }
 
 /// Compare one trace line against its case spec. The third argument is the

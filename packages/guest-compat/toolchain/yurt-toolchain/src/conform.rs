@@ -12,7 +12,51 @@ use crate::trace::{diff_case, parse_trace_line, Mismatch};
 pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])] {
     &[
         ("dup2-canary", &["dup2"]),
+        ("pipe-canary", &["dup", "dup3", "pipe", "pipe2"]),
         ("getgroups-canary", &["getgroups"]),
+        (
+            "resource-canary",
+            &[
+                "chown",
+                "chroot",
+                "fchdir",
+                "fchown",
+                "getpriority",
+                "getrlimit",
+                "getpgid",
+                "getpgrp",
+                "getsid",
+                "lchown",
+                "setpgid",
+                "setpgrp",
+                "setpriority",
+                "setresgid",
+                "setresuid",
+                "setrlimit",
+                "setsid",
+                "tcgetpgrp",
+                "tcsetpgrp",
+                "umask",
+            ],
+        ),
+        (
+            "stdio-canary",
+            &["flockfile", "ftrylockfile", "funlockfile", "qsort_r"],
+        ),
+        (
+            "exec-canary",
+            &["execv", "execve", "execvp", "fork", "vfork"],
+        ),
+        (
+            "spawn-canary",
+            &[
+                "posix_spawn",
+                "posix_spawnp",
+                "posix_spawn_file_actions_init",
+                "posix_spawnattr_init",
+            ],
+        ),
+        ("spawn-wait-canary", &["wait", "waitpid"]),
         (
             "affinity-canary",
             &["sched_getaffinity", "sched_setaffinity", "sched_getcpu"],
@@ -33,17 +77,27 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
                 "sigsuspend",
             ],
         ),
+        ("sleep-canary", &["tzset"]),
+        (
+            "system-canary",
+            &["mkdtemp", "mkostemp", "mkstemp", "mktemp"],
+        ),
         (
             "pthread-canary",
             &[
                 "pthread_create",
                 "pthread_join",
                 "pthread_self",
+                "pthread_detach",
+                "pthread_exit",
                 "pthread_mutex_lock",
                 "pthread_mutex_unlock",
+                "pthread_cond_wait",
+                "pthread_cond_signal",
                 "pthread_key_create",
                 "pthread_setspecific",
                 "pthread_getspecific",
+                "pthread_once",
             ],
         ),
     ]
@@ -67,14 +121,14 @@ impl Driver {
     }
 
     pub fn ensure_toolchain(&self) -> Result<()> {
-        // `cargo build --release -p cpcc-toolchain` builds every bin in the crate.
+        // `cargo build --release -p yurt-toolchain` builds every bin in the crate.
         let status = Command::new("cargo")
             .current_dir(&self.repo_root)
-            .args(["build", "--release", "-p", "cpcc-toolchain"])
+            .args(["build", "--release", "-p", "yurt-toolchain"])
             .status()
-            .context("spawning cargo build -p cpcc-toolchain")?;
+            .context("spawning cargo build -p yurt-toolchain")?;
         if !status.success() {
-            return Err(anyhow!("cargo build -p cpcc-toolchain failed"));
+            return Err(anyhow!("cargo build -p yurt-toolchain failed"));
         }
         Ok(())
     }
@@ -92,14 +146,14 @@ impl Driver {
     }
 
     pub fn run_signature_checks(&self) -> Result<()> {
-        let cpcheck = self.target_bin("cpcheck");
+        let yurt_check = self.target_bin("yurt-check");
         let archive = self.guest_compat().join("build/libyurt_guest_compat.a");
         let build_dir = self.guest_compat().join("build");
         let mut failed = Vec::new();
         for (canary, symbols) in canary_symbol_map() {
             let pre_opt = build_dir.join(format!("{canary}.pre-opt.wasm"));
             println!("== {canary} ({} symbols) ==", symbols.len());
-            let mut cmd = Command::new(&cpcheck);
+            let mut cmd = Command::new(&yurt_check);
             cmd.arg("--archive").arg(&archive);
             cmd.arg("--pre-opt-wasm").arg(&pre_opt);
             for sym in *symbols {
@@ -107,7 +161,7 @@ impl Driver {
             }
             let status = cmd
                 .status()
-                .with_context(|| format!("running cpcheck on {canary}"))?;
+                .with_context(|| format!("running yurt-check on {canary}"))?;
             if !status.success() {
                 failed.push(*canary);
             }
@@ -200,7 +254,7 @@ impl Driver {
     ///
     /// When `include_rust` is true, missing Rust canary artifacts are a
     /// HARD FAILURE. Soft-skipping would let a broken `make rust-canaries`
-    /// target or a missed copy-step produce a green `cpconf --include-rust`
+    /// target or a missed copy-step produce a green `yurt-conf --include-rust`
     /// that silently verified nothing on the Rust side — the opposite of
     /// what a "Rust parity" CI gate is for.
     pub fn run_spec_traces(&self, include_rust: bool) -> Result<Vec<CaseResult>> {
@@ -237,12 +291,12 @@ impl Driver {
         Ok(results)
     }
 
-    /// Run cpcheck on the Rust pre-opt wasms for the same canary→symbol
+    /// Run yurt-check on the Rust pre-opt wasms for the same canary→symbol
     /// map used by the C side. Every canary in the map MUST have a
     /// pre-opt wasm present — missing artifacts are a hard failure, for
     /// the same reason as `run_spec_traces`.
     pub fn run_rust_signature_checks(&self) -> Result<()> {
-        let cpcheck = self.target_bin("cpcheck");
+        let yurt_check = self.target_bin("yurt-check");
         let archive = self.guest_compat().join("build/libyurt_guest_compat.a");
         let build_dir = self.guest_compat().join("build/rust");
         let mut failed = Vec::new();
@@ -251,7 +305,7 @@ impl Driver {
             if !pre_opt.exists() {
                 return Err(anyhow!(
                     "missing Rust pre-opt wasm {} for canary {}. \
-                     Ensure `make rust-canaries` ran with CPCC_PRESERVE_PRE_OPT set. \
+                     Ensure `make rust-canaries` ran with YURT_CC_PRESERVE_PRE_OPT set. \
                      This must be a hard failure — soft-skipping would leave {} Tier 1 \
                      symbols unverified on the Rust side.",
                     pre_opt.display(),
@@ -260,7 +314,7 @@ impl Driver {
                 ));
             }
             println!("== rust {canary} ({} symbols) ==", symbols.len());
-            let mut cmd = Command::new(&cpcheck);
+            let mut cmd = Command::new(&yurt_check);
             cmd.arg("--archive").arg(&archive);
             cmd.arg("--pre-opt-wasm").arg(&pre_opt);
             for sym in *symbols {
@@ -268,13 +322,16 @@ impl Driver {
             }
             let status = cmd
                 .status()
-                .with_context(|| format!("running cpcheck on rust {canary}"))?;
+                .with_context(|| format!("running yurt-check on rust {canary}"))?;
             if !status.success() {
                 failed.push(*canary);
             }
         }
         if !failed.is_empty() {
-            return Err(anyhow!("rust signature check failed for: {}", failed.join(", ")));
+            return Err(anyhow!(
+                "rust signature check failed for: {}",
+                failed.join(", ")
+            ));
         }
         Ok(())
     }

@@ -2,7 +2,7 @@ use std::fs;
 use std::process::Command;
 
 fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_cpcc")
+    env!("CARGO_BIN_EXE_yurt-cc")
 }
 
 #[test]
@@ -10,14 +10,14 @@ fn help_prints_usage() {
     let out = Command::new(bin())
         .arg("--help")
         .output()
-        .expect("run cpcc --help");
+        .expect("run yurt-cc --help");
     assert!(
         out.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains("cpcc"), "help output: {stdout}");
+    assert!(stdout.contains("yurt-cc"), "help output: {stdout}");
     assert!(stdout.contains("Usage"), "help output: {stdout}");
 }
 
@@ -26,7 +26,7 @@ fn version_prints_version() {
     let out = Command::new(bin())
         .arg("--version")
         .output()
-        .expect("run cpcc --version");
+        .expect("run yurt-cc --version");
     assert!(
         out.status.success(),
         "stderr: {}",
@@ -42,7 +42,7 @@ fn version_prints_version() {
 #[test]
 fn invoking_clang_respects_env_sdk() {
     // Build a fake wasi-sdk layout in a temp dir and point WASI_SDK_PATH at
-    // it. cpcc --dry-run must print the clang path it would exec,
+    // it. yurt-cc --dry-run must print the clang path it would exec,
     // which should be <fake>/bin/clang.
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
@@ -97,9 +97,9 @@ fn dry_run_injects_compat_archive_and_include_first() {
 
     let out = Command::new(bin())
         .env("WASI_SDK_PATH", root)
-        .env("CPCC_ARCHIVE", "/fake/libyurt_guest_compat.a")
-        .env("CPCC_INCLUDE", "/fake/include")
-        .env("CPCC_SKIP_VERSION_CHECK", "1")
+        .env("YURT_CC_ARCHIVE", "/fake/libyurt_guest_compat.a")
+        .env("YURT_CC_INCLUDE", "/fake/include")
+        .env("YURT_CC_SKIP_VERSION_CHECK", "1")
         .arg("--dry-run")
         .arg("foo.c")
         .arg("-o")
@@ -113,18 +113,15 @@ fn dry_run_injects_compat_archive_and_include_first() {
         "compat headers must precede the WASI sysroot headers: {stdout}",
     );
     assert!(stdout.contains("-Wl,--whole-archive"), "{stdout}");
-    assert!(
-        stdout.contains("/fake/libyurt_guest_compat.a"),
-        "{stdout}"
-    );
+    assert!(stdout.contains("/fake/libyurt_guest_compat.a"), "{stdout}");
     assert!(stdout.contains("-Wl,--no-whole-archive"), "{stdout}");
-    // §Verifying Precedence requires the pre-opt .wasm to include marker
-    // calls. Assert the driver flags that make that possible.
+    // Structural verification requires the pre-opt .wasm to expose the
+    // implementation symbol. Marker exports are opt-in via YURT_CC_MARKERS.
     assert!(stdout.contains("--no-wasm-opt"), "{stdout}");
     assert!(stdout.contains("-Wl,--export=dup2"), "{stdout}");
     assert!(
-        stdout.contains("-Wl,--export=__yurt_guest_compat_marker_dup2"),
-        "{stdout}"
+        !stdout.contains("-Wl,--export=__yurt_guest_compat_marker_dup2"),
+        "{stdout}",
     );
     let whole_idx = stdout.find("--whole-archive").unwrap();
     let no_whole_idx = stdout.find("--no-whole-archive").unwrap();
@@ -150,11 +147,11 @@ fn dry_run_marks_setjmp_opt_in_builds() {
 
     let out = Command::new(bin())
         .env("WASI_SDK_PATH", root)
-        .env("CPCC_ARCHIVE", "/fake/libyurt.a")
-        .env("CPCC_SETJMP_ARCHIVE", "/fake/libyurt_setjmp.a")
-        .env("CPCC_INCLUDE", "/fake/include")
-        .env("CPCC_SKIP_VERSION_CHECK", "1")
-        .env("CPCC_USE_SETJMP", "1")
+        .env("YURT_CC_ARCHIVE", "/fake/libyurt.a")
+        .env("YURT_CC_SETJMP_ARCHIVE", "/fake/libyurt_setjmp.a")
+        .env("YURT_CC_INCLUDE", "/fake/include")
+        .env("YURT_CC_SKIP_VERSION_CHECK", "1")
+        .env("YURT_CC_USE_SETJMP", "1")
         .arg("--dry-run")
         .arg("foo.c")
         .arg("-o")
@@ -187,7 +184,7 @@ fn missing_version_sentinel_is_a_hard_error() {
 
     let out = Command::new(bin())
         .env("WASI_SDK_PATH", root)
-        .env("CPCC_ARCHIVE", &archive)
+        .env("YURT_CC_ARCHIVE", &archive)
         .arg("foo.c")
         .arg("-o")
         .arg("foo.wasm")
@@ -215,8 +212,8 @@ fn preserves_pre_opt_artifact_at_stable_path() {
     let preserved = tmp.path().join("hello.pre-opt.wasm");
 
     let st = Command::new(bin())
-        .env("CPCC_PRESERVE_PRE_OPT", &preserved)
-        .env("CPCC_NO_WASM_OPT", "1")
+        .env("YURT_CC_PRESERVE_PRE_OPT", &preserved)
+        .env("YURT_CC_NO_WASM_OPT", "1")
         .arg(&src)
         .arg("-o")
         .arg(&out_wasm)
@@ -232,10 +229,10 @@ fn preserves_pre_opt_artifact_at_stable_path() {
 }
 
 #[test]
-fn cpar_exists_and_forwards_help() {
-    let ar = env!("CARGO_BIN_EXE_cpar");
+fn yurt_ar_exists_and_forwards_help() {
+    let ar = env!("CARGO_BIN_EXE_yurt-ar");
     let out = Command::new(ar).arg("--help").output().unwrap();
     // llvm-ar's --help is not consistent across versions; accept any run
     // that did not fail to spawn.
-    assert!(out.status.code().is_some(), "cpar failed to execute");
+    assert!(out.status.code().is_some(), "yurt-ar failed to execute");
 }

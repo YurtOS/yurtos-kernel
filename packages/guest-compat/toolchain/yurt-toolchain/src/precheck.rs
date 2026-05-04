@@ -59,7 +59,7 @@ fn find_object_for(nm_output: &str, sym: &str) -> Option<String> {
 ///   - none of them appears in the import section (proves no wasi
 ///     stub of the same name won the link).
 ///
-/// Combined with cpcc's `--whole-archive` of libyurt_guest_compat,
+/// Combined with yurt-cc's `--whole-archive` of libyurt_guest_compat,
 /// this is sufficient to know our compat impl is what runs.  Doesn't
 /// need any marker plumbing in the source — robust to LTO inlining.
 pub fn check_wasm_structural(pre_opt: &Path, symbols: &[&str]) -> Result<()> {
@@ -103,7 +103,7 @@ pub fn check_wasm_structural(pre_opt: &Path, symbols: &[&str]) -> Result<()> {
             return Err(anyhow!(
                 "structural check failed: {sym} appears in wasm imports — \
                  a wasi stub of the same name won the link.  Check \
-                 cpcc --whole-archive ordering."
+                 yurt-cc --whole-archive ordering."
             ));
         }
     }
@@ -113,7 +113,7 @@ pub fn check_wasm_structural(pre_opt: &Path, symbols: &[&str]) -> Result<()> {
 /// Stages 2+3 (instrumented mode): inspect the pre-opt `.wasm`. Every
 /// queried symbol's marker must be exported, and the symbol's function
 /// body must call the marker.  Requires `-DYURT_GUEST_COMPAT_MARKERS=1`
-/// at compat-archive build time (cpcc adds it when `CPCC_MARKERS=1`).
+/// at compat-archive build time (yurt-cc adds it when `YURT_CC_MARKERS=1`).
 pub fn check_wasm(pre_opt: &Path, symbols: &[&str]) -> Result<()> {
     let bytes = std::fs::read(pre_opt).with_context(|| format!("reading {}", pre_opt.display()))?;
     let mut exports: std::collections::HashMap<String, u32> = Default::default();

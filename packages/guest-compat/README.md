@@ -14,8 +14,8 @@ Included in this package:
 - narrow header overrides for selected POSIX APIs
 - a private runtime header for host import declarations
 - plain-WASI canaries for stdio/file I/O and sleep behavior
-- a shared host-side toolchain (`cpcc`/`cpar`/`cpranlib`/`cpcheck`/`cpconf`)
-  under `toolchain/cpcc/`, built as workspace release binaries
+- a shared host-side toolchain (`yurt-cc`/`yurt-ar`/`yurt-ranlib`/`yurt-check`/`yurt-conf`)
+  under `toolchain/yurt-cc/`, built as workspace release binaries
 - a Make-driven entrypoint that can build the archive, the canaries, and
   copy canary fixtures into the kernel test directory
 
@@ -47,13 +47,13 @@ Or run the full conformance flow end-to-end (toolchain build, archive,
 canaries, signature checks, kernel behavioral suite):
 
 ```bash
-./target/release/cpconf
+./target/release/yurt-conf
 ```
 
-Phase A C builds are host-side cross-compiles driven by `cpcc`, which
+Phase A C builds are host-side cross-compiles driven by `yurt-cc`, which
 wraps `wasi-sdk`'s clang with the right `--target=wasm32-wasip1` /
 `--sysroot=` / `--whole-archive` framing. Ports such as BusyBox invoke
-`cpcc` / `cpar` / `cpranlib` as `CC` / `AR` / `RANLIB` directly; see
+`yurt-cc` / `yurt-ar` / `yurt-ranlib` as `CC` / `AR` / `RANLIB` directly; see
 `packages/c-ports/busybox/Makefile`.
 
 ## Phase A delivered
@@ -64,8 +64,8 @@ wraps `wasi-sdk`'s clang with the right `--target=wasm32-wasip1` /
 - `popen-canary`
 - `affinity-canary`
 - `dup2-canary`
-- host-side `clang` / `wasi-sdk` driver wrapper via `cpcc` (+ companions
-  `cpar` / `cpranlib` / `cpcheck` / `cpconf`)
+- host-side `clang` / `wasi-sdk` driver wrapper via `yurt-cc` (+ companions
+  `yurt-ar` / `yurt-ranlib` / `yurt-check` / `yurt-conf`)
 - BusyBox pilot recipe scaffolding for `grep`, `head`, and `seq`
 
 ## Compatibility headers

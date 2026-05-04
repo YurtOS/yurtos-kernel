@@ -72,7 +72,7 @@ export async function loadProcess(
   const setjmpMarked = moduleHasYurtFeature(module, "setjmp");
   if (importsSetjmp && !setjmpMarked) {
     throw new Error(
-      "module imports host_setjmp/host_longjmp but lacks yurt.features setjmp marker; rebuild with cpcc CPCC_USE_SETJMP=1",
+      "module imports host_setjmp/host_longjmp but lacks yurt.features setjmp marker; rebuild with yurt-cc YURT_CC_USE_SETJMP=1",
     );
   }
   if (setjmpMarked && !moduleHasAsyncify(module)) {

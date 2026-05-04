@@ -1,4 +1,4 @@
-use cpcc_toolchain::rust_std::{
+use yurt_toolchain::rust_std::{
     discover_built_std, discover_installed_std, discover_repo_std_from_cwd,
     package_metadata_opt_in, rustc_version_key,
 };
