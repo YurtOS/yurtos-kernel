@@ -627,6 +627,23 @@ export class WasiHost {
             totalWritten += result.bytes_sent ?? data.byteLength;
             break;
           }
+          case 'tty_slave': {
+            target.state.toMaster.push(data.slice());
+            for (const w of target.state.toMasterWaiters.splice(0)) w();
+            totalWritten += data.byteLength;
+            break;
+          }
+          case 'tty_master': {
+            if (target.state.masterClosed) {
+              const viewAfter = this.getView();
+              viewAfter.setUint32(nwrittenPtr, totalWritten, true);
+              return WASI_EIO;
+            }
+            target.state.toSlave.push(data.slice());
+            for (const w of target.state.toSlaveWaiters.splice(0)) w();
+            totalWritten += data.byteLength;
+            break;
+          }
           case 'static':
           case 'pipe_read': {
             // Cannot write to a read-only target
@@ -662,15 +679,18 @@ export class WasiHost {
     let totalRead = 0;
     const target = this.ioFds.get(fd);
 
-    // If the target is a pipe_read:
-    //   JSPI path — every module can suspend until data arrives.
-    //   Asyncify path — modules built with Asyncify can also suspend.
-    //   Unwrapped path — read synchronously from buffered data; plain WASM can't await.
-    if (target && target.type === 'pipe_read') {
-      if (this.canSuspendPipeReads || typeof WebAssembly.Suspending === 'function') {
-        return this.fdReadPipe(target, iovecs, nreadPtr);
+    // Async-capable targets (pipe_read, tty_slave): suspend until data arrives when
+    // JSPI or Asyncify is available; otherwise read synchronously from buffered data.
+    if (target && (target.type === 'pipe_read' || target.type === 'tty_slave')) {
+      const canSuspend = this.canSuspendPipeReads || typeof WebAssembly.Suspending === 'function';
+      if (target.type === 'pipe_read') {
+        return canSuspend
+          ? this.fdReadPipe(target, iovecs, nreadPtr)
+          : this.fdReadPipeSync(target, iovecs, nreadPtr);
       }
-      return this.fdReadPipeSync(target, iovecs, nreadPtr);
+      return canSuspend
+        ? this.fdReadTtySlave(target, iovecs, nreadPtr)
+        : this.fdReadTtySlaveSync(target, iovecs, nreadPtr);
     }
 
     for (const iov of iovecs) {
@@ -833,6 +853,63 @@ export class WasiHost {
         // EOF or short read — stop
         break;
       }
+    }
+    const viewAfter = this.getView();
+    viewAfter.setUint32(nreadPtr, totalRead, true);
+    return WASI_ESUCCESS;
+  }
+
+  /** Async TTY slave read — suspends until data arrives in the master→slave queue. */
+  private async fdReadTtySlave(
+    target: Extract<import('./fd-target.js').FdTarget, { type: 'tty_slave' }>,
+    iovecs: Array<{ buf: number; len: number }>,
+    nreadPtr: number,
+  ): Promise<number> {
+    let totalRead = 0;
+    for (const iov of iovecs) {
+      if (iov.len === 0) continue;
+      while (target.state.toSlave.length === 0 && !target.state.masterClosed) {
+        await new Promise<void>(resolve => { target.state.toSlaveWaiters.push(resolve); });
+      }
+      if (target.state.toSlave.length === 0) break; // EOF — master closed
+      const chunk = target.state.toSlave[0];
+      const toRead = Math.min(iov.len, chunk.byteLength);
+      const bytes = this.getBytes();
+      bytes.set(chunk.subarray(0, toRead), iov.buf);
+      totalRead += toRead;
+      if (toRead < chunk.byteLength) {
+        target.state.toSlave[0] = chunk.subarray(toRead);
+      } else {
+        target.state.toSlave.shift();
+      }
+      if (toRead < iov.len) break; // short read
+    }
+    const viewAfter = this.getView();
+    viewAfter.setUint32(nreadPtr, totalRead, true);
+    return WASI_ESUCCESS;
+  }
+
+  /** Sync TTY slave read — returns whatever is already buffered (may be 0 bytes). */
+  private fdReadTtySlaveSync(
+    target: Extract<import('./fd-target.js').FdTarget, { type: 'tty_slave' }>,
+    iovecs: Array<{ buf: number; len: number }>,
+    nreadPtr: number,
+  ): number {
+    let totalRead = 0;
+    for (const iov of iovecs) {
+      if (iov.len === 0) continue;
+      if (target.state.toSlave.length === 0) break;
+      const chunk = target.state.toSlave[0];
+      const toRead = Math.min(iov.len, chunk.byteLength);
+      const bytes = this.getBytes();
+      bytes.set(chunk.subarray(0, toRead), iov.buf);
+      totalRead += toRead;
+      if (toRead < chunk.byteLength) {
+        target.state.toSlave[0] = chunk.subarray(toRead);
+      } else {
+        target.state.toSlave.shift();
+      }
+      if (toRead < iov.len) break;
     }
     const viewAfter = this.getView();
     viewAfter.setUint32(nreadPtr, totalRead, true);
@@ -1577,7 +1654,11 @@ export class WasiHost {
         let nbytes = BigInt(0);
 
         if (target) {
-          if (type === WASI_EVENTTYPE_FD_READ && target.type === 'pipe_read') {
+          if (type === WASI_EVENTTYPE_FD_READ && target.type === 'tty_slave') {
+            ready = target.state.toSlave.length > 0;
+            hangup = target.state.masterClosed;
+            nbytes = ready ? BigInt(target.state.toSlave.reduce((s, c) => s + c.byteLength, 0)) : BigInt(0);
+          } else if (type === WASI_EVENTTYPE_FD_READ && target.type === 'pipe_read') {
             ready = target.pipe.hasData;
             hangup = target.pipe.closed;
           } else if (type === WASI_EVENTTYPE_FD_WRITE && target.type === 'pipe_write') {

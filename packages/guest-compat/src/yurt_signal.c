@@ -222,6 +222,12 @@ int sigsuspend(const sigset_t *mask) {
   return -1;
 }
 
+int pause(void) {
+  sigset_t mask;
+  sigprocmask(SIG_SETMASK, NULL, &mask);
+  return sigsuspend(&mask);
+}
+
 int raise(int sig) {
   YURT_MARKER_CALL(raise);
   sighandler_t handler;

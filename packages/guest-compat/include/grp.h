@@ -78,4 +78,13 @@ static inline int initgroups(const char *user, gid_t group) {
     return 0;
 }
 
+/* setgroups — sandbox has no supplementary groups; silently accept
+ * an empty list, reject anything else with EPERM. */
+static inline int setgroups(int size, const gid_t *list) {
+    (void)list;
+    if (size == 0) return 0;
+    errno = EPERM;
+    return -1;
+}
+
 #endif /* YURT_COMPAT_GRP_H */

@@ -27,6 +27,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_exec.o \
   $(BUILD_DIR)/yurt_fetch.o \
   $(BUILD_DIR)/yurt_fs.o \
+  $(BUILD_DIR)/yurt_ioctl.o \
   $(BUILD_DIR)/yurt_mktemp.o \
   $(BUILD_DIR)/yurt_netdb.o \
   $(BUILD_DIR)/yurt_pipe.o \
@@ -39,6 +40,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_spawn.o \
   $(BUILD_DIR)/yurt_sysinfo.o \
   $(BUILD_DIR)/yurt_time.o \
+  $(BUILD_DIR)/yurt_tty.o \
   $(BUILD_DIR)/yurt_unistd.o \
   $(BUILD_DIR)/yurt_version.o
 

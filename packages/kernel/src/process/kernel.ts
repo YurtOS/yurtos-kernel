@@ -1,5 +1,6 @@
-import type { FdTarget } from '../wasi/fd-target.js';
-import { createAsyncPipe, type AsyncPipeReadEnd, type AsyncPipeWriteEnd } from '../vfs/pipe.js';
+import type { FdTarget, TtyState } from '../wasi/fd-target.js';
+import { createTtyState, createTtySlaveTarget } from '../wasi/fd-target.js';
+import { createAsyncPipe } from '../vfs/pipe.js';
 import type { WasiHost } from '../wasi/wasi-host.js';
 
 // Keep kernel-managed descriptors out of the WASI fd table's low range.
@@ -29,6 +30,9 @@ export interface ProcessEntry {
   wasiHost: WasiHost | null;
   waiters: ((exitCode: number) => void)[];
   command?: string;
+  pgid: number;
+  sid: number;
+  controllingTtyId: number | null;
 }
 
 interface FileLockState {
@@ -44,6 +48,8 @@ export class ProcessKernel {
   private fdTables = new Map<number, Map<number, FdTarget>>();
   private nextFds = new Map<number, number>();
   private fileLocks = new Map<string, FileLockState>();
+  private ttyTable = new Map<number, TtyState>();
+  private nextTtyId = 1;
 
   constructor() {
     // Pre-create init (PID 1): the system ancestor.  It has no controlling
@@ -52,6 +58,7 @@ export class ProcessKernel {
     this.processTable.set(INIT_PID, {
       pid: INIT_PID, promise: null, exitCode: -1, state: 'running',
       wasiHost: null, waiters: [], command: 'init',
+      pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
     });
     this.parentPids.set(INIT_PID, 0);
     this.children.set(INIT_PID, new Set());
@@ -133,9 +140,13 @@ export class ProcessKernel {
     this.parentPids.set(pid, ppid);
     this.initProcess(pid);
     if (!this.processTable.has(pid)) {
+      const parentEntry = this.processTable.get(ppid);
       this.processTable.set(pid, {
         pid, promise: null, exitCode: -1, state: 'running', wasiHost: null, waiters: [],
         command,
+        pgid: parentEntry?.pgid ?? INIT_PID,
+        sid: parentEntry?.sid ?? INIT_PID,
+        controllingTtyId: null,
       });
     }
   }
@@ -161,6 +172,7 @@ export class ProcessKernel {
   registerProcess(pid: number, promise: Promise<void>, wasiHost: WasiHost): void {
     this.processTable.set(pid, {
       pid, promise, exitCode: -1, state: 'running', wasiHost, waiters: [],
+      pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
     });
     const onExit = () => {
       const entry = this.processTable.get(pid);
@@ -219,6 +231,7 @@ export class ProcessKernel {
     } else {
       this.processTable.set(pid, {
         pid, promise: Promise.resolve(), exitCode, state: 'exited', wasiHost: null, waiters: [],
+        pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
       });
     }
   }
@@ -350,6 +363,18 @@ export class ProcessKernel {
         this.children.delete(childPid);
       } else {
         initKids.add(childPid);
+        // Init has no user-space waiter loop; register a kernel-side reaper so
+        // running orphans don't become permanent zombies when they eventually exit.
+        if (child) {
+          child.waiters.push(() => {
+            this.processTable.delete(childPid);
+            this.fdTables.delete(childPid);
+            this.nextFds.delete(childPid);
+            this.parentPids.delete(childPid);
+            this.children.delete(childPid);
+            initKids.delete(childPid);
+          });
+        }
       }
     }
     this.children.delete(pid);
@@ -373,6 +398,14 @@ export class ProcessKernel {
   }
 
   private closeTarget(target: FdTarget): void {
+    if (target.type === 'tty_master') {
+      const { fgPgid } = target.state;
+      target.state.masterClosed = true;
+      for (const w of target.state.toSlaveWaiters.splice(0)) w();
+      // Terminal hangup: deliver SIGHUP to the foreground process group so
+      // processes that don't ignore it (everything except nohup'd daemons) exit.
+      if (fgPgid > 0) this.killpg(fgPgid, 1);
+    }
     if (target.type === 'pipe_write') target.pipe.close();
     if (target.type === 'pipe_read') target.pipe.close();
     if (target.type === 'vfs_file') {
@@ -412,6 +445,146 @@ export class ProcessKernel {
     this.nextFds.set(pid, nextFd);
   }
 
+  // ── waitpid(-1) / wait-any ──
+
+  /** Non-blocking: reap the first already-exited child of ppid, or null if none ready. */
+  waitAnyNohang(ppid: number): { pid: number; exitCode: number } | null {
+    const kids = this.children.get(ppid);
+    if (!kids || kids.size === 0) return null;
+    for (const childPid of kids) {
+      const child = this.processTable.get(childPid);
+      if (child?.state === 'exited') {
+        const exitCode = child.exitCode;
+        this.processTable.delete(childPid);
+        this.fdTables.delete(childPid);
+        this.nextFds.delete(childPid);
+        this.parentPids.delete(childPid);
+        this.children.delete(childPid);
+        kids.delete(childPid);
+        return { pid: childPid, exitCode };
+      }
+    }
+    return null;
+  }
+
+  /** Async: wait for the first child of ppid to exit and reap it.
+   *  Returns { pid: -1 } if there are no children. */
+  async waitAny(ppid: number): Promise<{ pid: number; exitCode: number }> {
+    const kids = this.children.get(ppid);
+    if (!kids || kids.size === 0) return { pid: -1, exitCode: -1 };
+    // Check for already-exited children first.
+    const immediate = this.waitAnyNohang(ppid);
+    if (immediate) return immediate;
+    // Register a one-shot waiter on every running child; first to fire wins.
+    return new Promise((resolve) => {
+      let resolved = false;
+      for (const childPid of [...kids]) {
+        const child = this.processTable.get(childPid);
+        if (!child || child.state !== 'running') continue;
+        child.waiters.push((exitCode) => {
+          if (resolved) return;
+          resolved = true;
+          this.processTable.delete(childPid);
+          this.fdTables.delete(childPid);
+          this.nextFds.delete(childPid);
+          this.parentPids.delete(childPid);
+          this.children.delete(childPid);
+          kids.delete(childPid);
+          resolve({ pid: childPid, exitCode });
+        });
+      }
+      // If every child was already exited between our scan and here (impossible
+      // in single-threaded JS, but guard anyway), resolve with ECHILD.
+      if (!resolved) resolve({ pid: -1, exitCode: -1 });
+    });
+  }
+
+  // ── TTY ──
+
+  createTty(): { ttyId: number; state: TtyState } {
+    const ttyId = this.nextTtyId++;
+    const state = createTtyState(ttyId);
+    this.ttyTable.set(ttyId, state);
+    return { ttyId, state };
+  }
+
+  getTtyState(ttyId: number): TtyState | null {
+    return this.ttyTable.get(ttyId) ?? null;
+  }
+
+  /** Create a TTY pair and wire fds 0/1/2 of pid to the slave side.
+   *  Sets controllingTtyId on the process entry; the returned TtyState is the
+   *  host's handle to the master side (write to toSlave, read from toMaster). */
+  openTtyForProcess(pid: number): TtyState {
+    const { ttyId, state } = this.createTty();
+    const slave = createTtySlaveTarget(state);
+    this.setFdTarget(pid, 0, slave);
+    this.setFdTarget(pid, 1, slave);
+    this.setFdTarget(pid, 2, slave);
+    const entry = this.processTable.get(pid);
+    if (entry) {
+      entry.controllingTtyId = ttyId;
+      state.fgPgid = entry.pgid > 0 ? entry.pgid : pid;
+    }
+    return state;
+  }
+
+  /** Mark ttyId as the controlling terminal of pid (called via TIOCSCTTY). */
+  setControllingTty(pid: number, ttyId: number): number {
+    const entry = this.processTable.get(pid);
+    if (!entry) return -1;
+    entry.controllingTtyId = ttyId;
+    return 0;
+  }
+
+  // ── Process groups / sessions ──
+
+  getpgid(pid: number): number {
+    return this.processTable.get(pid)?.pgid ?? -1;
+  }
+
+  setpgid(pid: number, pgid: number): number {
+    const entry = this.processTable.get(pid);
+    if (!entry || entry.state === 'exited') return -1;
+    entry.pgid = pgid;
+    return 0;
+  }
+
+  getsid(pid: number): number {
+    return this.processTable.get(pid)?.sid ?? -1;
+  }
+
+  setsid(pid: number): number {
+    const entry = this.processTable.get(pid);
+    if (!entry || entry.state === 'exited') return -1;
+    entry.sid = pid;
+    entry.pgid = pid;
+    entry.controllingTtyId = null;
+    return pid;
+  }
+
+  tcgetpgrp(ttyId: number): number {
+    return this.ttyTable.get(ttyId)?.fgPgid ?? -1;
+  }
+
+  tcsetpgrp(ttyId: number, pgid: number): boolean {
+    const state = this.ttyTable.get(ttyId);
+    if (!state) return false;
+    state.fgPgid = pgid;
+    return true;
+  }
+
+  killpg(pgid: number, sig: number): number {
+    let count = 0;
+    for (const entry of this.processTable.values()) {
+      if (entry.pgid === pgid && entry.state !== 'exited' && entry.pid !== INIT_PID) {
+        this.killProcess(entry.pid, sig);
+        count++;
+      }
+    }
+    return count;
+  }
+
   dispose(): void {
     for (const fdTable of this.fdTables.values()) {
       for (const target of fdTable.values()) {
@@ -422,5 +595,6 @@ export class ProcessKernel {
     this.processTable.clear();
     this.parentPids.clear();
     this.fileLocks.clear();
+    this.ttyTable.clear();
   }
 }

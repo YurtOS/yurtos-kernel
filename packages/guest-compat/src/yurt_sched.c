@@ -75,3 +75,31 @@ int sched_getcpu(void) {
   YURT_MARKER_CALL(sched_getcpu);
   return 0;
 }
+
+int sched_get_priority_max(int policy) {
+  return (policy == SCHED_FIFO || policy == SCHED_RR) ? 99 : 0;
+}
+
+int sched_get_priority_min(int policy) {
+  return (policy == SCHED_FIFO || policy == SCHED_RR) ? 1 : 0;
+}
+
+int sched_getscheduler(pid_t pid) {
+  (void)pid; return SCHED_OTHER;
+}
+
+int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param) {
+  (void)pid; (void)policy; (void)param;
+  errno = EPERM; return -1;
+}
+
+int sched_getparam(pid_t pid, struct sched_param *param) {
+  (void)pid;
+  if (param) param->sched_priority = 0;
+  return 0;
+}
+
+int sched_setparam(pid_t pid, const struct sched_param *param) {
+  (void)pid; (void)param;
+  errno = EPERM; return -1;
+}

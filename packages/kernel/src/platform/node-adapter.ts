@@ -28,7 +28,7 @@ export class NodeAdapter implements PlatformAdapter {
     const cached = NodeAdapter.compiledModules.get(path);
     if (cached) return cached;
     const buffer = await readFile(path);
-    const module = await WebAssembly.compile(buffer);
+    const module = await WebAssembly.compile(buffer.buffer as ArrayBuffer);
     NodeAdapter.compiledModules.set(path, module);
     return module;
   }

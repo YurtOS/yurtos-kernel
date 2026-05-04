@@ -78,6 +78,9 @@ impl WasiSdk {
     pub fn nm(&self) -> PathBuf {
         self.root.join("bin/llvm-nm")
     }
+    pub fn wasm_ld(&self) -> PathBuf {
+        self.root.join("bin/wasm-ld")
+    }
     pub fn sysroot(&self) -> PathBuf {
         self.root.join("share/wasi-sysroot")
     }

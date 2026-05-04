@@ -199,11 +199,7 @@ static inline int sethostname(const char *name, size_t len) {
  * libyurt_guest_compat (yurt_process.c). */
 #include <signal.h>
 extern int kill(pid_t pid, int sig);
-static inline int killpg(pid_t pgrp, int sig) {
-    /* Process groups aren't tracked separately; route to kill() and let
-     * it answer ESRCH for unknown pgids. */
-    return kill(-pgrp, sig);
-}
+extern int killpg(pid_t pgrp, int sig);
 
 /* uid/gid accessors — sandbox is single-user.  Report a regular,
  * non-privileged user (1000) rather than root (0): many tools take
@@ -240,6 +236,17 @@ static inline int setegid(gid_t gid) {
 }
 
 /* waitpid/wait: stubbed in sys/wait.h. */
+
+/* sync / syncfs — no-op stubs: WASI has no kernel buffer cache to flush. */
+static inline void sync(void) {}
+static inline int syncfs(int fd) { (void)fd; return 0; }
+
+/* pause() — suspend until a signal is delivered; real impl in yurt_signal.c */
+int pause(void);
+
+/* nice() — adjust process priority; real impl in yurt_fs.c via
+ * getpriority/setpriority. */
+int nice(int inc);
 
 #endif /* !__wasilibc_unmodified_upstream */
 

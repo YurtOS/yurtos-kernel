@@ -1,6 +1,5 @@
-import { assertArrayIncludes, assertEquals } from "jsr:@std/assert@^1.0.19";
+import { assertArrayIncludes } from "jsr:@std/assert@^1.0.19";
 import { createKernelImports } from "../kernel-imports.ts";
-import { createShellImports } from "../shell-imports.ts";
 
 const KERNEL_IMPORTS_BASELINE = [
   "host_pipe",
@@ -32,9 +31,6 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_longjmp",
   "host_yield",
   "host_run_command",
-];
-
-const SHELL_IMPORTS_BASELINE = [
   "host_stat",
   "host_read_file",
   "host_write_file",
@@ -51,13 +47,27 @@ const SHELL_IMPORTS_BASELINE = [
   "host_time",
   "host_read_command",
   "host_write_result",
+  // Process groups / sessions
+  "host_getpgid",
+  "host_setpgid",
+  "host_getsid",
+  "host_setsid",
+  "host_killpg",
+  // TTY
+  "host_isatty",
+  "host_tcgetpgrp",
+  "host_tcsetpgrp",
+  "host_tcgetattr",
+  "host_tcsetattr",
+  "host_winsize",
+  // wait-any (waitpid(-1))
+  "host_wait_any",
+  "host_wait_any_nohang",
+  // TTY controlling terminal
+  "host_tiocsctty",
+  // DNS
+  "host_dns_resolve",
 ];
-
-function shellImports() {
-  return createShellImports({
-    memory: new WebAssembly.Memory({ initial: 1 }),
-  });
-}
 
 Deno.test("kernel-imports baseline export names", () => {
   const imports = createKernelImports({
@@ -68,25 +78,4 @@ Deno.test("kernel-imports baseline export names", () => {
   for (const expected of KERNEL_IMPORTS_BASELINE) {
     assertArrayIncludes(names, [expected]);
   }
-});
-
-Deno.test("shell-imports baseline names", () => {
-  const names = Object.keys(shellImports());
-
-  for (const expected of SHELL_IMPORTS_BASELINE) {
-    assertArrayIncludes(names, [expected]);
-  }
-});
-
-Deno.test("shell-imports and kernel-imports do not overlap", () => {
-  const kernelNames = new Set(
-    Object.keys(
-      createKernelImports({ memory: new WebAssembly.Memory({ initial: 1 }) }),
-    ),
-  );
-  const overlapping = Object.keys(shellImports()).filter((name) =>
-    kernelNames.has(name)
-  );
-
-  assertEquals(overlapping, []);
 });

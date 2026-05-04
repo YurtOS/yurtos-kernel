@@ -1,19 +1,17 @@
 [workspace]
 members = [
-  "packages/shell",
-  "packages/shell-exec",
   "packages/yurt-process",
+  "packages/guest-compat/toolchain/cpcc",
+  "packages/guest-compat/rust/yurt-guest-compat-sys",
+  "packages/guest-compat/rust/yurt-guest-compat",
+  "packages/guest-compat/rust/yurt-wasi-shims",
+  "packages/guest-compat/toolchain/yurt-wasi-postlink",
   "packages/test-fixtures/hello",
   "packages/test-fixtures/echo-args",
   "packages/test-fixtures/cat-stdin",
   "packages/test-fixtures/wc-bytes",
   "packages/test-fixtures/true-cmd",
   "packages/test-fixtures/false-cmd",
-  "packages/guest-compat/toolchain/cpcc",
-  "packages/guest-compat/rust/yurt-guest-compat-sys",
-  "packages/guest-compat/rust/yurt-guest-compat",
-  "packages/guest-compat/rust/yurt-wasi-shims",
-  "packages/guest-compat/toolchain/yurt-wasi-postlink",
   "packages/guest-compat/conformance/rust/dup2-canary",
   "packages/guest-compat/conformance/rust/getgroups-canary",
   "packages/guest-compat/conformance/rust/affinity-canary",
@@ -42,5 +40,15 @@ members = [
   "packages/guest-compat/conformance/rust/std-process-stdio-from-canary",
   "packages/guest-compat/conformance/rust/std-tempdir-canary",
   "packages/guest-compat/conformance/rust/std-thread-canary",
+]
+# Conformance canaries are WASM-only targets — build with --target wasm32-wasip1.
+# Exclude them from the default native build to avoid link failures on macOS.
+default-members = [
+  "packages/yurt-process",
+  "packages/guest-compat/toolchain/cpcc",
+  "packages/guest-compat/rust/yurt-guest-compat-sys",
+  "packages/guest-compat/rust/yurt-guest-compat",
+  "packages/guest-compat/rust/yurt-wasi-shims",
+  "packages/guest-compat/toolchain/yurt-wasi-postlink",
 ]
 resolver = "2"

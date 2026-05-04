@@ -48,9 +48,8 @@ import { ToolRegistry } from './packages/tool-registry.js';
 import { applyManifest, loadManifest } from './packages/manifest.js';
 import { MemoryProxy, type KernelApi } from './kernel-api.js';
 import { createKernelImports } from './host-imports/kernel-imports.js';
-import { createShellImports } from './host-imports/shell-imports.js';
 import { WasiHost } from './wasi/wasi-host.js';
-import { bufferToString, createBufferTarget, type FdTarget } from './wasi/fd-target.js';
+import { bufferToString, createBufferTarget, TtyHandle, type FdTarget } from './wasi/fd-target.js';
 import type { RunCommandHandler } from './run-command.js';
 
 /** Describes a set of host-provided files to mount into the VFS. */
@@ -800,6 +799,7 @@ export class Sandbox {
           socketBackend,
           serverSockets,
           extensionRegistry,
+          mgr,
           nativeModules: mgr.nativeModules,
           threadsBackend,
           runCommand: async (cmd, stdin) => {
@@ -865,7 +865,6 @@ export class Sandbox {
         });
         return {
           ...kernelImports,
-          ...createShellImports({ vfs, mgr, memory }),
           host_spawn_async: kernelImports.host_spawn,
         };
       },
@@ -1230,6 +1229,24 @@ export class Sandbox {
     }
     this.processes.set(proc.pid, proc);
     return proc;
+  }
+
+  /**
+   * Create a TTY pair and wire the boot process's fds 0/1/2 to the slave side.
+   * Returns a `TtyHandle` the host can use to write input and read output.
+   *
+   * Call this once after `Sandbox.create()` when running an interactive shell
+   * (ash/bash in TTY mode). The boot process must already be loaded.
+   *
+   * Writing input: `tty.write(new TextEncoder().encode("ls\n"))`
+   * Reading output: `const chunk = await tty.read()`
+   */
+  openTty(rows = 24, cols = 80): TtyHandle {
+    this.assertAlive();
+    const state = this.kernel.openTtyForProcess(this.bootProcess.pid);
+    state.rows = rows;
+    state.cols = cols;
+    return new TtyHandle(state);
   }
 
   rm(path: string): void {

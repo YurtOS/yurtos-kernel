@@ -57,6 +57,11 @@ extern "C" {
 pid_t wait(int *wstatus);
 pid_t waitpid(pid_t pid, int *wstatus, int options);
 
+/* wait3/wait4 — BSD extensions; real impls in yurt_process.c wrap waitpid. */
+#include <sys/resource.h>
+pid_t wait3(int *wstatus, int options, struct rusage *rusage);
+pid_t wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage);
+
 #ifdef __cplusplus
 }
 #endif

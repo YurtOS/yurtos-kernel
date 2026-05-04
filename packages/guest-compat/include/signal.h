@@ -58,6 +58,10 @@ typedef int sig_atomic_t;
 #define SIGXCPU 24
 #define SIGXFSZ 25
 #define SIGVTALRM 26
+#define SIGWINCH  28
+#define SIGIO     29
+#define SIGPWR    30
+#define SIGSYS    31
 
 /* NSIG / _NSIG: highest-signal-number + 1, used for iteration and for
  * sizing tables.  Linux's 65 (32 classic + 32 RT + 1) reflects RT-

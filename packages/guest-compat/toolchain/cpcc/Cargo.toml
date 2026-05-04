@@ -38,6 +38,10 @@ name = "yurt-ar"
 path = "src/bin/cpar.rs"
 
 [[bin]]
+name = "yurt-ld"
+path = "src/bin/ld.rs"
+
+[[bin]]
 name = "yurt-ranlib"
 path = "src/bin/cpranlib.rs"
 

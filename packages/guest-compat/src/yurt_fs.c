@@ -87,6 +87,14 @@ int setpriority(int which, id_t who, int prio) {
   return 0;
 }
 
+int nice(int inc) {
+  errno = 0;
+  int cur = getpriority(PRIO_PROCESS, 0);
+  if (errno != 0) return -1;
+  if (setpriority(PRIO_PROCESS, 0, cur + inc) != 0) return -1;
+  return getpriority(PRIO_PROCESS, 0);
+}
+
 /* getrusage: see comment above — libwasi-emulated-process-clocks
  * supplies it; defining ours would duplicate the symbol. */
 

@@ -3,3 +3,6 @@ node_modules/
 dist/
 *.wasm.d.ts
 .deno/
+packages/c-ports/busybox
+packages/kernel/src/platform/__tests__/fixtures/busybox.manifest.json
+packages/kernel/src/platform/__tests__/fixtures/busybox.wasm

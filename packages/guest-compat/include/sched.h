@@ -35,5 +35,13 @@ struct sched_param {
 #define SCHED_RR     2
 #define SCHED_BATCH  3
 #define SCHED_IDLE   5
+#define SCHED_RESET_ON_FORK (1 << 30)
+
+int sched_get_priority_max(int policy);
+int sched_get_priority_min(int policy);
+int sched_getscheduler(pid_t pid);
+int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param);
+int sched_getparam(pid_t pid, struct sched_param *param);
+int sched_setparam(pid_t pid, const struct sched_param *param);
 
 #endif

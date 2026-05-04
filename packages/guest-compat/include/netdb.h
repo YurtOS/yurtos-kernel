@@ -87,6 +87,7 @@ struct addrinfo {
 extern int h_errno;
 
 struct hostent *gethostbyname(const char *name);
+struct hostent *gethostbyaddr(const void *addr, socklen_t len, int type);
 struct netent *getnetbyname(const char *name);
 struct netent *getnetbyaddr(uint32_t net, int type);
 struct servent *getservbyname(const char *name, const char *proto);

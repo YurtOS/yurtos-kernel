@@ -6,6 +6,44 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+/* SO_* constants that wasi-sdk defines in upstream mode but may not expose
+ * via the WASI-mode path. */
+#ifndef SO_BROADCAST
+#define SO_BROADCAST 6
+#endif
+#ifndef SO_SNDBUF
+#define SO_SNDBUF    7
+#endif
+#ifndef SO_RCVBUF
+#define SO_RCVBUF    8
+#endif
+#ifndef SO_LINGER
+#define SO_LINGER    13
+#endif
+#ifndef SO_RCVTIMEO
+#define SO_RCVTIMEO  20
+#endif
+#ifndef SO_SNDTIMEO
+#define SO_SNDTIMEO  21
+#endif
+#ifndef SO_BINDTODEVICE
+#define SO_BINDTODEVICE 25
+#endif
+
+/* MSG_* flags — some may be missing from the WASI-mode socket path. */
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0x40
+#endif
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0x4000
+#endif
+#ifndef MSG_MORE
+#define MSG_MORE     0x8000
+#endif
+#ifndef MSG_CMSG_CLOEXEC
+#define MSG_CMSG_CLOEXEC 0x40000000
+#endif
+
 #undef SOL_SOCKET
 #define SOL_SOCKET 0
 
@@ -18,6 +56,24 @@
 #undef SO_ERROR
 #define SO_ERROR 0x1007
 
+/* Socket types that wasi-sysroot defines but may not propagate through
+ * #include_next in all build configurations. */
+#ifndef SOCK_STREAM
+#define SOCK_STREAM    1
+#endif
+#ifndef SOCK_DGRAM
+#define SOCK_DGRAM     2
+#endif
+#ifndef SOCK_RAW
+#define SOCK_RAW       3
+#endif
+#ifndef SOCK_RDM
+#define SOCK_RDM       4
+#endif
+#ifndef SOCK_SEQPACKET
+#define SOCK_SEQPACKET 5
+#endif
+
 #ifndef MSG_PEEK
 #define MSG_PEEK 0x02
 #endif
@@ -25,6 +81,36 @@
 #ifndef SOMAXCONN
 #define SOMAXCONN 128
 #endif
+
+/* struct cmsghdr and CMSG_* macros — wasi-libc's __struct_msghdr.h only
+ * defines struct msghdr, not struct cmsghdr.  Provide them unconditionally
+ * so libbb/udp_io.c and similar files compile. */
+#ifndef _HAVE_STRUCT_CMSGHDR
+#define _HAVE_STRUCT_CMSGHDR
+struct cmsghdr {
+    socklen_t cmsg_len;
+    int       cmsg_level;
+    int       cmsg_type;
+};
+
+#define CMSG_ALIGN(len) (((len) + sizeof(size_t) - 1) & ~(sizeof(size_t) - 1))
+#define CMSG_SPACE(len) (CMSG_ALIGN(sizeof(struct cmsghdr)) + CMSG_ALIGN(len))
+#define CMSG_LEN(len)   (CMSG_ALIGN(sizeof(struct cmsghdr)) + (len))
+#define CMSG_DATA(cmsg) ((unsigned char *)((struct cmsghdr *)(cmsg) + 1))
+#define CMSG_FIRSTHDR(mhdr) \
+    ((size_t)(mhdr)->msg_controllen >= sizeof(struct cmsghdr) \
+     ? (struct cmsghdr *)(mhdr)->msg_control : (struct cmsghdr *)0)
+#define CMSG_NXTHDR(mhdr, cmsg) \
+    (((unsigned char *)(cmsg) + CMSG_ALIGN((cmsg)->cmsg_len) + sizeof(struct cmsghdr) \
+      > (unsigned char *)(mhdr)->msg_control + (mhdr)->msg_controllen) \
+     ? (struct cmsghdr *)0 \
+     : (struct cmsghdr *)((unsigned char *)(cmsg) + CMSG_ALIGN((cmsg)->cmsg_len)))
+#endif /* _HAVE_STRUCT_CMSGHDR */
+
+/* sendmsg/recvmsg — gated behind __wasilibc_unmodified_upstream in wasi-sdk;
+ * expose them unconditionally so BusyBox compiles. */
+ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags);
+ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
 
 int socket(int domain, int type, int protocol);
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);

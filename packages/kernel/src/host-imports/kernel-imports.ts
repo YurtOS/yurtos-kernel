@@ -23,13 +23,15 @@ import { createLoopbackSocketBackend, createNetworkBridgeSocketBackend } from '.
 import type { ExtensionRegistry } from '../extension/registry.js';
 import type { NativeModuleRegistry } from '../process/native-modules.js';
 import type { ProcessKernel, SpawnRequest } from '../process/kernel.js';
+import type { ProcessManager } from '../process/manager.js';
 import type { WasiHost } from '../wasi/wasi-host.js';
 import type { ThreadsBackend } from '../process/threads/backend.js';
 import type { VfsLike } from '../vfs/vfs-like.js';
 import type { FdTarget } from '../wasi/fd-target.js';
 import { createStaticTarget } from '../wasi/fd-target.js';
 import { WASI_FDFLAGS_NONBLOCK } from '../wasi/types.ts';
-import { readString, writeJson } from './common.js';
+import { readString, readBytes, writeJson, writeString, writeBytes } from './common.js';
+import { resolveHostname } from '../platform/dns.js';
 import type { RunCommandHandler, RunRequest } from '../run-command.js';
 import type { Sandbox } from '../sandbox.js';
 
@@ -107,6 +109,94 @@ export interface KernelImportsOptions {
 
   /** Backend for guest pthread/std::thread host imports. */
   threadsBackend?: ThreadsBackend;
+
+  /** Process manager for tool registry (host_has_tool, host_register_tool). */
+  mgr?: ProcessManager;
+}
+
+const ERR_NOT_FOUND = -1;
+const ERR_IO = -3;
+
+function globToRegExp(pattern: string): RegExp {
+  let re = '';
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === '*') {
+      if (pattern[i + 1] === '*') {
+        re += '.*';
+        i += 2;
+        if (pattern[i] === '/') i++;
+      } else {
+        re += '[^/]*';
+        i++;
+      }
+    } else if (ch === '?') {
+      re += '[^/]';
+      i++;
+    } else if (ch === '[') {
+      let j = i + 1;
+      if (j < pattern.length && (pattern[j] === '!' || pattern[j] === '^')) j++;
+      if (j < pattern.length && pattern[j] === ']') j++;
+      while (j < pattern.length && pattern[j] !== ']') j++;
+      if (j >= pattern.length) {
+        re += '\\[';
+        i++;
+      } else {
+        let cls = pattern.slice(i + 1, j);
+        if (cls.startsWith('!')) cls = '^' + cls.slice(1);
+        re += '[' + cls + ']';
+        i = j + 1;
+      }
+    } else if ('.+^${}()|\\'.includes(ch)) {
+      re += '\\' + ch;
+      i++;
+    } else {
+      re += ch;
+      i++;
+    }
+  }
+  return new RegExp('^' + re + '$');
+}
+
+function globBaseDir(pattern: string): string {
+  const parts = pattern.split('/');
+  const base: string[] = [];
+  for (const part of parts) {
+    if (/[*?[\]]/.test(part)) break;
+    base.push(part);
+  }
+  const dir = base.join('/');
+  if (dir === '') return pattern.startsWith('/') ? '/' : '.';
+  return dir;
+}
+
+function walkVfs(vfs: VfsLike, dir: string): string[] {
+  const results: string[] = [];
+  let entries: ReturnType<VfsLike['readdir']>;
+  try {
+    entries = vfs.readdir(dir);
+  } catch {
+    return results;
+  }
+  for (const entry of entries) {
+    const fullPath = dir === '/' ? '/' + entry.name : dir + '/' + entry.name;
+    results.push(fullPath);
+    if (entry.type === 'dir') {
+      results.push(...walkVfs(vfs, fullPath));
+    }
+  }
+  return results;
+}
+
+function globMatch(vfs: VfsLike, pattern: string): string[] {
+  const absPattern = pattern.startsWith('/') ? pattern : '/' + pattern;
+  const baseDir = globBaseDir(absPattern);
+  const regex = globToRegExp(absPattern);
+  const allPaths = walkVfs(vfs, baseDir);
+  const matches = allPaths.filter(p => regex.test(p));
+  matches.sort();
+  return matches;
 }
 
 export function createKernelImports(opts: KernelImportsOptions): Record<string, WebAssembly.ImportValue> {
@@ -198,7 +288,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     //
     // Compatibility: shell-exec also imports a legacy synchronous
     // host_spawn(req_ptr, req_len, out_ptr, out_cap) ABI for tests. Keep
-    // that branch here so shell-imports.ts remains shell-specific.
+    // that branch here for backwards compatibility.
     host_spawn(reqPtr: number, reqLen: number, outPtr?: number, outCap?: number): number {
       const reqJson = readString(memory, reqPtr, reqLen);
       if (typeof outPtr === 'number' && typeof outCap === 'number') {
@@ -283,6 +373,137 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       // sig 0 is the existence probe — POSIX requires no signal sent.
       if (sig === 0) return 0;
       return opts.kernel.killProcess(pid, sig) ? 0 : -1;
+    },
+
+    // host_getpgid(pid) -> i32
+    // Returns the process group id for pid (0 = self). Returns -1 if not found.
+    host_getpgid(pid: number): number {
+      if (!opts.kernel) return -1;
+      return opts.kernel.getpgid(pid === 0 ? callerPid : pid);
+    },
+
+    // host_setpgid(pid, pgid) -> i32
+    // Sets the process group id.  pid=0 means self, pgid=0 means use pid.
+    // Returns 0 on success, -1 on failure.
+    host_setpgid(pid: number, pgid: number): number {
+      if (!opts.kernel) return -1;
+      const targetPid = pid === 0 ? callerPid : pid;
+      const targetPgid = pgid === 0 ? targetPid : pgid;
+      return opts.kernel.setpgid(targetPid, targetPgid);
+    },
+
+    // host_getsid(pid) -> i32
+    // Returns the session id for pid (0 = self). Returns -1 if not found.
+    host_getsid(pid: number): number {
+      if (!opts.kernel) return -1;
+      return opts.kernel.getsid(pid === 0 ? callerPid : pid);
+    },
+
+    // host_setsid() -> i32
+    // Creates a new session for the calling process.
+    // Returns the new session id (= callerPid), or -1 on failure.
+    host_setsid(): number {
+      if (!opts.kernel) return -1;
+      return opts.kernel.setsid(callerPid);
+    },
+
+    // host_killpg(pgid, sig) -> i32
+    // Sends sig to all processes in process group pgid.
+    // Returns 0 if at least one process was signalled, -1 if none found.
+    host_killpg(pgid: number, sig: number): number {
+      if (!opts.kernel) return -1;
+      return opts.kernel.killpg(pgid, sig) > 0 ? 0 : -1;
+    },
+
+    // host_isatty(fd) -> i32
+    // Returns 0 if fd refers to a TTY (tty_slave or tty_master), -1 (ENOTTY) otherwise.
+    host_isatty(fd: number): number {
+      const ioTarget = opts.wasiHost?.getIoFds().get(fd);
+      if (ioTarget?.type === 'tty_slave' || ioTarget?.type === 'tty_master') return 0;
+      const kernelTarget = opts.kernel?.getFdTarget(callerPid, fd);
+      if (kernelTarget?.type === 'tty_slave' || kernelTarget?.type === 'tty_master') return 0;
+      return -1;
+    },
+
+    // host_tcgetpgrp(fd) -> i32
+    // Returns the foreground process group of the terminal on fd, or -1.
+    host_tcgetpgrp(fd: number): number {
+      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
+      if (target?.type === 'tty_slave' || target?.type === 'tty_master') {
+        return target.state.fgPgid;
+      }
+      return -1;
+    },
+
+    // host_tcsetpgrp(fd, pgid) -> i32
+    // Sets the foreground process group of the terminal on fd.
+    // Returns 0 on success, -1 if fd is not a terminal.
+    host_tcsetpgrp(fd: number, pgid: number): number {
+      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
+      if (target?.type === 'tty_slave' || target?.type === 'tty_master') {
+        target.state.fgPgid = pgid;
+        return 0;
+      }
+      return -1;
+    },
+
+    // host_tiocsctty(fd) -> i32
+    // Register fd as the calling process's controlling terminal (TIOCSCTTY).
+    // Returns 0 on success, -1 if fd is not a TTY.
+    host_tiocsctty(fd: number): number {
+      if (!opts.kernel) return -1;
+      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel.getFdTarget(callerPid, fd);
+      if (!target || (target.type !== 'tty_slave' && target.type !== 'tty_master')) return -1;
+      return opts.kernel.setControllingTty(callerPid, target.ttyId);
+    },
+
+    // host_tcgetattr(fd, out_ptr, out_cap) -> i32
+    // Writes a minimal sane termios struct to the output buffer.
+    // Returns bytes written, or -1 if fd is not a terminal.
+    host_tcgetattr(fd: number, outPtr: number, outCap: number): number {
+      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || (target.type !== 'tty_slave' && target.type !== 'tty_master')) return -1;
+      // musl wasm32 termios layout (60 bytes):
+      //   [0]  c_iflag (4) — ICRNL|IXON
+      //   [4]  c_oflag (4) — OPOST|ONLCR
+      //   [8]  c_cflag (4) — CS8|CREAD|CLOCAL|B38400
+      //   [12] c_lflag (4) — ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN
+      //   [16] c_line  (1)
+      //   [17] c_cc[19]    — VINTR=3, VQUIT=28, VERASE=127, VKILL=21, VEOF=4, VMIN=1, VSUSP=26
+      //   [40] c_ispeed (4), [44] c_ospeed (4)
+      const buf = new Uint8Array(60);
+      const view = new DataView(buf.buffer);
+      view.setUint32(0, 0x0600, true);  // c_iflag: ICRNL(0x400)|IXON(0x200)
+      view.setUint32(4, 0x0005, true);  // c_oflag: OPOST(0x01)|ONLCR(0x04)
+      view.setUint32(8, 0x08BF, true);  // c_cflag: CS8|CREAD|CLOCAL|B38400
+      view.setUint32(12, 0x8A3B, true); // c_lflag: ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN
+      buf[17] = 3;   buf[18] = 28;  buf[19] = 127; buf[20] = 21;  // VINTR VQUIT VERASE VKILL
+      buf[21] = 4;   buf[22] = 0;   buf[23] = 1;                  // VEOF VTIME VMIN
+      buf[25] = 17;  buf[26] = 19;  buf[27] = 26;                  // VSTART VSTOP VSUSP
+      view.setUint32(40, 15, true); view.setUint32(44, 15, true);  // B38400
+      return writeBytes(memory, outPtr, outCap, buf);
+    },
+
+    // host_tcsetattr(fd, actions, termios_ptr) -> i32
+    // Accepts terminal attribute changes silently (we don't implement a line discipline).
+    // Returns 0 on success, -1 if fd is not a terminal.
+    host_tcsetattr(fd: number, _actions: number, _termiosPtr: number): number {
+      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || (target.type !== 'tty_slave' && target.type !== 'tty_master')) return -1;
+      return 0;
+    },
+
+    // host_winsize(fd, out_ptr, out_cap) -> i32
+    // Writes a struct winsize { rows, cols, xpixel, ypixel } to the output buffer.
+    // Returns bytes written, or -1 if fd is not a terminal.
+    host_winsize(fd: number, outPtr: number, outCap: number): number {
+      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || (target.type !== 'tty_slave' && target.type !== 'tty_master')) return -1;
+      const buf = new Uint8Array(8);
+      const view = new DataView(buf.buffer);
+      view.setUint16(0, target.state.rows, true);
+      view.setUint16(2, target.state.cols, true);
+      return writeBytes(memory, outPtr, outCap, buf);
     },
 
     // host_waitpid(pid, out_ptr, out_cap) -> i32
@@ -421,6 +642,27 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       return opts.kernel.waitpidNohang(pid);
     },
 
+    // host_wait_any(out_ptr, out_cap) -> i32 (async/JSPI)
+    // Waits for any child of the calling process to exit and reaps it.
+    // Writes { pid, exit_code } to output. pid=-1 means no children exist.
+    // Used by waitpid(-1, ..., 0) — blocking wait-any.
+    async host_wait_any(outPtr: number, outCap: number): Promise<number> {
+      if (!opts.kernel) return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
+      const result = await opts.kernel.waitAny(callerPid);
+      return writeJson(memory, outPtr, outCap, { pid: result.pid, exit_code: result.exitCode });
+    },
+
+    // host_wait_any_nohang(out_ptr, out_cap) -> i32
+    // Non-blocking wait-any: writes { pid, exit_code } if a child exited, or
+    // { pid: 0 } if no child is ready yet. pid=-1 means no children exist.
+    // Used by waitpid(-1, ..., WNOHANG).
+    host_wait_any_nohang(outPtr: number, outCap: number): number {
+      if (!opts.kernel) return writeJson(memory, outPtr, outCap, { pid: 0, exit_code: -1 });
+      const result = opts.kernel.waitAnyNohang(callerPid);
+      if (!result) return writeJson(memory, outPtr, outCap, { pid: 0, exit_code: -1 });
+      return writeJson(memory, outPtr, outCap, { pid: result.pid, exit_code: result.exitCode });
+    },
+
     // host_list_processes(out_ptr, out_cap) -> i32
     // Returns JSON array of all processes.
     host_list_processes(outPtr: number, outCap: number): number {
@@ -509,6 +751,28 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         const msg = e instanceof Error ? e.message : String(e);
         return writeJson(memory, outPtr, outCap, { error: msg });
       }
+    },
+
+    // ── DNS ──
+
+    // host_dns_resolve(host_ptr, host_len, out_ptr, out_cap) -> i32
+    // Resolves a hostname to a dotted-decimal IPv4 address string.
+    // Returns bytes written into out_ptr, or -1 if the name cannot be resolved.
+    // Async (JSPI): used by yurt_netdb_addr_for_host in the guest.
+    async host_dns_resolve(hostPtr: number, hostLen: number, outPtr: number, outCap: number): Promise<number> {
+      const hostname = readString(memory, hostPtr, hostLen);
+      if (!hostname) return -1;
+      // Loopback — always resolved locally regardless of platform.
+      if (hostname === 'localhost' || hostname === '127.0.0.1') {
+        return writeBytes(memory, outPtr, outCap, new TextEncoder().encode('127.0.0.1'));
+      }
+      // Sandbox's own address — matches the configured local IP without a syscall.
+      if (hostname === socketLocalHost) {
+        return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(socketLocalHost));
+      }
+      const addr = await resolveHostname(hostname);
+      if (!addr) return -1;
+      return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(addr));
     },
 
     // ── Sockets (full mode only) ──
@@ -962,6 +1226,196 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
           exit_code: 1, stdout: '', stderr: `${msg}\n`,
         });
       }
+    },
+
+    // ── Filesystem ──
+
+    host_has_tool(namePtr: number, nameLen: number): number {
+      const name = readString(memory, namePtr, nameLen);
+      return opts.mgr?.hasTool(name) ? 1 : 0;
+    },
+
+    host_time(): number {
+      return Date.now() / 1000;
+    },
+
+    host_stat(pathPtr: number, pathLen: number, outPtr: number, outCap: number): number {
+      if (!opts.vfs) return ERR_NOT_FOUND;
+      const path = readString(memory, pathPtr, pathLen);
+      try {
+        const s = opts.vfs.stat(path);
+        return writeJson(memory, outPtr, outCap, {
+          exists: true,
+          is_file: s.type === 'file',
+          is_dir: s.type === 'dir',
+          is_symlink: s.type === 'symlink',
+          size: s.size,
+          mode: s.permissions,
+          mtime_ms: s.mtime ? s.mtime.getTime() : 0,
+        });
+      } catch {
+        return ERR_NOT_FOUND;
+      }
+    },
+
+    host_read_file(pathPtr: number, pathLen: number, outPtr: number, outCap: number): number {
+      if (!opts.vfs) return ERR_NOT_FOUND;
+      const path = readString(memory, pathPtr, pathLen);
+      try {
+        const data = opts.vfs.readFile(path);
+        return writeBytes(memory, outPtr, outCap, data);
+      } catch {
+        return ERR_NOT_FOUND;
+      }
+    },
+
+    host_write_file(pathPtr: number, pathLen: number, dataPtr: number, dataLen: number, mode: number): number {
+      if (!opts.vfs) return ERR_IO;
+      const path = readString(memory, pathPtr, pathLen);
+      const data = readBytes(memory, dataPtr, dataLen);
+      try {
+        if (mode === 1) {
+          try {
+            const existing = opts.vfs.readFile(path);
+            const combined = new Uint8Array(existing.length + data.length);
+            combined.set(existing);
+            combined.set(data, existing.length);
+            opts.vfs.writeFile(path, combined);
+          } catch {
+            opts.vfs.writeFile(path, data);
+          }
+        } else {
+          opts.vfs.writeFile(path, data);
+        }
+        return 0;
+      } catch {
+        return ERR_IO;
+      }
+    },
+
+    host_readdir(pathPtr: number, pathLen: number, outPtr: number, outCap: number): number {
+      if (!opts.vfs) return ERR_NOT_FOUND;
+      const path = readString(memory, pathPtr, pathLen);
+      try {
+        const entries = opts.vfs.readdir(path).map(e => e.name);
+        return writeJson(memory, outPtr, outCap, entries);
+      } catch {
+        return ERR_NOT_FOUND;
+      }
+    },
+
+    host_mkdir(pathPtr: number, pathLen: number): number {
+      if (!opts.vfs) return ERR_IO;
+      const path = readString(memory, pathPtr, pathLen);
+      try {
+        opts.vfs.mkdir(path);
+        return 0;
+      } catch {
+        return ERR_IO;
+      }
+    },
+
+    host_remove(pathPtr: number, pathLen: number, recursive: number): number {
+      if (!opts.vfs) return ERR_NOT_FOUND;
+      const path = readString(memory, pathPtr, pathLen);
+      try {
+        if (recursive) {
+          opts.vfs.rmdir(path);
+        } else {
+          try {
+            opts.vfs.unlink(path);
+          } catch {
+            opts.vfs.rmdir(path);
+          }
+        }
+        return 0;
+      } catch {
+        return ERR_NOT_FOUND;
+      }
+    },
+
+    host_chmod(pathPtr: number, pathLen: number, mode: number): number {
+      if (!opts.vfs) return ERR_IO;
+      const path = readString(memory, pathPtr, pathLen);
+      try {
+        opts.vfs.chmod(path, mode);
+        return 0;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : '';
+        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        return ERR_IO;
+      }
+    },
+
+    host_glob(patternPtr: number, patternLen: number, outPtr: number, outCap: number): number {
+      if (!opts.vfs) return writeJson(memory, outPtr, outCap, []);
+      const pattern = readString(memory, patternPtr, patternLen);
+      try {
+        return writeJson(memory, outPtr, outCap, globMatch(opts.vfs, pattern));
+      } catch {
+        return writeJson(memory, outPtr, outCap, []);
+      }
+    },
+
+    host_rename(fromPtr: number, fromLen: number, toPtr: number, toLen: number): number {
+      if (!opts.vfs) return ERR_IO;
+      const from = readString(memory, fromPtr, fromLen);
+      const to = readString(memory, toPtr, toLen);
+      try {
+        opts.vfs.rename(from, to);
+        return 0;
+      } catch {
+        return ERR_IO;
+      }
+    },
+
+    host_symlink(targetPtr: number, targetLen: number, linkPtr: number, linkLen: number): number {
+      if (!opts.vfs) return ERR_IO;
+      const target = readString(memory, targetPtr, targetLen);
+      const link = readString(memory, linkPtr, linkLen);
+      try {
+        opts.vfs.symlink(target, link);
+        return 0;
+      } catch {
+        return ERR_IO;
+      }
+    },
+
+    host_readlink(pathPtr: number, pathLen: number, outPtr: number, outCap: number): number {
+      if (!opts.vfs) return ERR_NOT_FOUND;
+      const path = readString(memory, pathPtr, pathLen);
+      try {
+        return writeString(memory, outPtr, outCap, opts.vfs.readlink(path));
+      } catch {
+        return ERR_NOT_FOUND;
+      }
+    },
+
+    async host_register_tool(namePtr: number, nameLen: number, pathPtr: number, pathLen: number): Promise<number> {
+      if (!opts.mgr || !opts.vfs) return ERR_IO;
+      const name = readString(memory, namePtr, nameLen);
+      const path = readString(memory, pathPtr, pathLen);
+      try {
+        if (name.startsWith('__native__')) {
+          const moduleName = name.slice('__native__'.length);
+          const wasmBytes = opts.vfs.readFile(path);
+          await opts.mgr.registerNativeModule(moduleName, wasmBytes);
+          return 0;
+        }
+        await opts.mgr.registerAndLoadTool(name, path);
+        return 0;
+      } catch {
+        return ERR_IO;
+      }
+    },
+
+    host_read_command(outPtr: number, outCap: number): number {
+      void outPtr; void outCap;
+      return 0;
+    },
+
+    host_write_result(resultPtr: number, resultLen: number): void {
+      void resultPtr; void resultLen;
     },
 
   };

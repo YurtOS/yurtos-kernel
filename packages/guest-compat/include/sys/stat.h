@@ -19,6 +19,16 @@ extern "C" {
 
 mode_t umask(mode_t mask);
 
+/* mknod — creating device nodes is not supported in the WASI sandbox;
+ * callers (tar, cp) silently fall back when EPERM is returned. */
+#include <errno.h>
+static inline int mknod(const char *p, mode_t m, dev_t d) {
+    (void)p; (void)m; (void)d; errno = EPERM; return -1;
+}
+static inline int mkfifo(const char *p, mode_t m) {
+    (void)p; (void)m; errno = EPERM; return -1;
+}
+
 #ifdef __cplusplus
 }
 #endif

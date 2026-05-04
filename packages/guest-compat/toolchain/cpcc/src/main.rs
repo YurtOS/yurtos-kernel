@@ -3,7 +3,7 @@ use clap::Parser;
 use std::ffi::OsString;
 use std::process::{Command, ExitCode};
 
-use cpcc_toolchain::{archive, env, features, preserve, wasi_sdk, wasm_opt, TIER1};
+use cpcc_toolchain::{archive, env, features, preserve, wasi_sdk, wasm_opt, TIER1, WRAPPED_WASI_LIBC_SYMBOLS};
 
 #[derive(Parser, Debug)]
 #[command(name = "cpcc", version, about = "Clang wrapper for the yurt guest compatibility runtime", long_about = None)]

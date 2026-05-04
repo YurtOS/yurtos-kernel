@@ -87,6 +87,7 @@ int pclose(FILE *stream) {
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 
 YURT_DECLARE_MARKER(wait);
@@ -94,28 +95,36 @@ YURT_DECLARE_MARKER(waitpid);
 YURT_DEFINE_MARKER(wait,    0x77616974u) /* "wait" */
 YURT_DEFINE_MARKER(waitpid, 0x77706964u) /* "wpid" */
 
-/* Pull `"exit_code":N` out of the JSON response. */
-static int waitpid_parse_exit(const char *json, size_t json_len, int *out) {
-    static const char needle[] = "\"exit_code\":";
-    size_t nlen = sizeof(needle) - 1;
-    for (size_t i = 0; i + nlen <= json_len; ++i) {
-        if (memcmp(json + i, needle, nlen) != 0) continue;
-        const char *p = json + i + nlen;
+/* Pull a numeric value for `key` out of a JSON object. */
+static int json_parse_int(const char *json, size_t json_len, const char *key, size_t klen, int *out) {
+    for (size_t i = 0; i + klen <= json_len; ++i) {
+        if (memcmp(json + i, key, klen) != 0) continue;
+        const char *p = json + i + klen;
         const char *end = json + json_len;
         int sign = 1;
         if (p < end && *p == '-') { sign = -1; ++p; }
-        int val = 0;
-        int saw = 0;
-        while (p < end && *p >= '0' && *p <= '9') {
-            val = val * 10 + (*p - '0');
-            saw = 1;
-            ++p;
-        }
+        int val = 0, saw = 0;
+        while (p < end && *p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); saw = 1; ++p; }
         if (!saw) return -1;
         *out = sign * val;
         return 0;
     }
     return -1;
+}
+
+/* Pull `"exit_code":N` out of the JSON response. */
+static int waitpid_parse_exit(const char *json, size_t json_len, int *out) {
+    static const char needle[] = "\"exit_code\":";
+    return json_parse_int(json, json_len, needle, sizeof(needle) - 1, out);
+}
+
+/* Pull `"pid":N` and `"exit_code":M` from a wait_any JSON response. */
+static int waitany_parse(const char *json, size_t json_len, int *pid_out, int *exit_out) {
+    static const char pidkey[]  = "\"pid\":";
+    static const char exitkey[] = "\"exit_code\":";
+    int ok_pid  = json_parse_int(json, json_len, pidkey,  sizeof(pidkey)  - 1, pid_out);
+    int ok_exit = json_parse_int(json, json_len, exitkey, sizeof(exitkey) - 1, exit_out);
+    return (ok_pid == 0 && ok_exit == 0) ? 0 : -1;
 }
 
 /* Pack a kernel exit code into the POSIX wait status encoding so
@@ -134,10 +143,22 @@ static int encode_wait_status(int kernel_exit) {
 pid_t waitpid(pid_t pid, int *wstatus, int options) {
     YURT_MARKER_CALL(waitpid);
     if (pid <= 0) {
-        /* Wait-any (-1) and process-group (0) are not yet routed.
-         * See header note above. */
-        errno = ECHILD;
-        return (pid_t)-1;
+        char buf[64];
+        int child_pid = 0, exit_code = 0;
+        if (options & WNOHANG) {
+            int n = yurt_host_wait_any_nohang((int)(intptr_t)buf, (int)sizeof(buf));
+            if (n <= 0 || (size_t)n > sizeof(buf)) { errno = ECHILD; return (pid_t)-1; }
+            if (waitany_parse(buf, (size_t)n, &child_pid, &exit_code) != 0) { errno = ECHILD; return (pid_t)-1; }
+            if (child_pid == 0) return 0; /* WNOHANG: no child ready yet */
+            if (child_pid < 0) { errno = ECHILD; return (pid_t)-1; }
+        } else {
+            int n = yurt_host_wait_any((int)(intptr_t)buf, (int)sizeof(buf));
+            if (n <= 0 || (size_t)n > sizeof(buf)) { errno = ECHILD; return (pid_t)-1; }
+            if (waitany_parse(buf, (size_t)n, &child_pid, &exit_code) != 0) { errno = ECHILD; return (pid_t)-1; }
+            if (child_pid <= 0) { errno = ECHILD; return (pid_t)-1; }
+        }
+        if (wstatus) *wstatus = encode_wait_status(exit_code);
+        return (pid_t)child_pid;
     }
 
     int exit_code;
@@ -166,14 +187,17 @@ pid_t waitpid(pid_t pid, int *wstatus, int options) {
 
 pid_t wait(int *wstatus) {
     YURT_MARKER_CALL(wait);
-    /* wait() is waitpid(-1, ..., 0) — wait-any.  Not yet supported
-     * because the host has no "wait for any child" primitive and
-     * the guest doesn't track its own spawn list.  Tools that need
-     * to reap a specific posix_spawn'd child should use waitpid(pid)
-     * directly. */
-    (void)wstatus;
-    errno = ECHILD;
-    return (pid_t)-1;
+    return waitpid((pid_t)-1, wstatus, 0);
+}
+
+pid_t wait3(int *wstatus, int options, struct rusage *rusage) {
+    if (rusage) memset(rusage, 0, sizeof(*rusage));
+    return waitpid((pid_t)-1, wstatus, options);
+}
+
+pid_t wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage) {
+    if (rusage) memset(rusage, 0, sizeof(*rusage));
+    return waitpid(pid, wstatus, options);
 }
 
 /* ── Process group / session / file mode mask ──
@@ -230,52 +254,69 @@ mode_t umask(mode_t mask) {
 
 pid_t getpgrp(void) {
     YURT_MARKER_CALL(getpgrp);
-    return 1;
+    return (pid_t)yurt_host_getpgid(0);
 }
 
 pid_t getpgid(pid_t pid) {
     YURT_MARKER_CALL(getpgid);
-    (void)pid;
-    return 1;
+    int rc = yurt_host_getpgid((int)pid);
+    if (rc < 0) { errno = ESRCH; return (pid_t)-1; }
+    return (pid_t)rc;
 }
 
 int setpgid(pid_t pid, pid_t pgid) {
     YURT_MARKER_CALL(setpgid);
-    (void)pid; (void)pgid;
-    /* POSIX allows setpgid to succeed silently when joining the
-     * existing pgroup; yurt has only one. */
+    int rc = yurt_host_setpgid((int)pid, (int)pgid);
+    if (rc < 0) { errno = ESRCH; return -1; }
     return 0;
 }
 
 pid_t setpgrp(void) {
     YURT_MARKER_CALL(setpgrp);
-    return 1;
+    yurt_host_setpgid(0, 0);
+    return (pid_t)yurt_host_getpgid(0);
 }
 
 pid_t getsid(pid_t pid) {
     YURT_MARKER_CALL(getsid);
-    (void)pid;
-    return 1;
+    int rc = yurt_host_getsid((int)pid);
+    if (rc < 0) { errno = ESRCH; return (pid_t)-1; }
+    return (pid_t)rc;
 }
 
 pid_t setsid(void) {
     YURT_MARKER_CALL(setsid);
-    /* No new session to create — return our existing session id. */
-    return 1;
+    int rc = yurt_host_setsid();
+    if (rc < 0) { errno = EPERM; return (pid_t)-1; }
+    return (pid_t)rc;
 }
 
 pid_t tcgetpgrp(int fd) {
     YURT_MARKER_CALL(tcgetpgrp);
-    (void)fd;
-    /* No controlling terminal in the sandbox. */
-    errno = ENOTTY;
-    return (pid_t)-1;
+    int rc = yurt_host_tcgetpgrp(fd);
+    if (rc < 0) { errno = ENOTTY; return (pid_t)-1; }
+    return (pid_t)rc;
 }
 
 int tcsetpgrp(int fd, pid_t pgrp) {
     YURT_MARKER_CALL(tcsetpgrp);
-    (void)fd; (void)pgrp;
-    /* No controlling terminal — accept silently. */
+    int rc = yurt_host_tcsetpgrp(fd, (int)pgrp);
+    if (rc < 0) { errno = ENOTTY; return -1; }
+    return 0;
+}
+
+/* killpg(2) — send signal to a process group.
+ * Routes through host_killpg so the kernel can fan out to all pgroup members. */
+YURT_DECLARE_MARKER(killpg);
+YURT_DEFINE_MARKER(killpg, 0x6b6c7067u) /* "klpg" */
+
+int killpg(pid_t pgrp, int sig) {
+    YURT_MARKER_CALL(killpg);
+    int rc = yurt_host_killpg((int)pgrp, sig);
+    if (rc < 0) {
+        errno = ESRCH;
+        return -1;
+    }
     return 0;
 }
 

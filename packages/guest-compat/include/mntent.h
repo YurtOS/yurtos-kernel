@@ -26,7 +26,9 @@ struct mntent {
 };
 
 #define MOUNTED  "/proc/mounts"
+#ifndef _PATH_MOUNTED
 #define _PATH_MOUNTED "/proc/mounts"
+#endif
 
 static inline FILE *setmntent(const char *filename, const char *type) {
     if (!filename || !type) { errno = EINVAL; return NULL; }
@@ -77,6 +79,32 @@ static inline struct mntent *getmntent(FILE *fp) {
 static inline int endmntent(FILE *fp) {
     if (fp) fclose(fp);
     return 1;  /* glibc convention: always 1 */
+}
+
+/* getmntent_r — reentrant GNU extension; uses caller-supplied buffer.
+ * Delegates to getmntent (which uses its own static buffers), then
+ * copies results into the caller's struct and strbuf. */
+static inline struct mntent *getmntent_r(FILE *fp, struct mntent *result,
+                                          char *buf, int buflen) {
+    struct mntent *e = getmntent(fp);
+    if (!e || !result || !buf || buflen <= 0) return NULL;
+    /* Pack all strings end-to-end into buf; fail if it won't fit. */
+    int need = (int)(strlen(e->mnt_fsname) + strlen(e->mnt_dir) +
+                     strlen(e->mnt_type) + strlen(e->mnt_opts) + 4);
+    if (need > buflen) return NULL;
+    char *p = buf;
+#define _COPY(field) \
+    result->field = p; \
+    while ((*p++ = *e->field++)) {} \
+    e->field -= (p - result->field); /* restore pointer for reuse */
+    _COPY(mnt_fsname)
+    _COPY(mnt_dir)
+    _COPY(mnt_type)
+    _COPY(mnt_opts)
+#undef _COPY
+    result->mnt_freq   = e->mnt_freq;
+    result->mnt_passno = e->mnt_passno;
+    return result;
 }
 
 static inline char *hasmntopt(const struct mntent *mnt, const char *opt) {

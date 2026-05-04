@@ -48,6 +48,15 @@ void qsort_r(void *base, size_t nmemb, size_t size,
              int (*compar)(const void *, const void *, void *),
              void *arg);
 
+/* PTY helpers — wasi-libc has no /dev/ptmx; stubs let callers compile.
+ * grantpt/unlockpt succeed silently; ptsname_r returns ENOSYS. */
+static inline int grantpt(int fd) { (void)fd; return 0; }
+static inline int unlockpt(int fd) { (void)fd; return 0; }
+static inline int ptsname_r(int fd, char *buf, size_t buflen) {
+    (void)fd; (void)buf; (void)buflen;
+    errno = ENOSYS; return -1;
+}
+
 #endif /* !__wasilibc_unmodified_upstream */
 
 #endif /* YURT_COMPAT_STDLIB_H */

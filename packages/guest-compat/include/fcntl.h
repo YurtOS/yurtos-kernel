@@ -18,4 +18,30 @@
 
 #include_next <fcntl.h>
 
+/* POSIX record-locking — wasi-sdk's WASI-mode path (__header_fcntl.h)
+ * does not define these constants.  Provide the standard Linux values. */
+/* O_NDELAY is a historical synonym for O_NONBLOCK (POSIX 1003.1g). */
+#ifndef O_NDELAY
+#define O_NDELAY O_NONBLOCK
+#endif
+
+#ifndef F_RDLCK
+#define F_RDLCK  0
+#endif
+#ifndef F_WRLCK
+#define F_WRLCK  1
+#endif
+#ifndef F_UNLCK
+#define F_UNLCK  2
+#endif
+#ifndef F_GETLK
+#define F_GETLK  5
+#endif
+#ifndef F_SETLK
+#define F_SETLK  6
+#endif
+#ifndef F_SETLKW
+#define F_SETLKW 7
+#endif
+
 #endif

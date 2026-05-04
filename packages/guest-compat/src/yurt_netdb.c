@@ -85,6 +85,32 @@ int getnameinfo(const struct sockaddr *addr, socklen_t addrlen,
     return -2;  /* EAI_NONAME */
 }
 
+/* yurt_netdb_host_for_addr — reverse lookup.
+ * Returns NULL; the socket layer falls back to inet_ntop() for the raw IP. */
+#include <stdint.h>
+const char *yurt_netdb_host_for_addr(uint32_t addr_be) {
+    (void)addr_be;
+    return NULL;
+}
+
+/* yurt_netdb_addr_for_host — forward lookup via host_dns_resolve (JSPI async).
+ * Returns the IPv4 address in network byte order, or 0 on failure. */
+#include <arpa/inet.h>
+#include "yurt_runtime.h"
+uint32_t yurt_netdb_addr_for_host(const char *host) {
+    if (!host || !*host) return 0;
+    char buf[16]; /* "255.255.255.255\0" */
+    int rc = yurt_host_dns_resolve(
+        (int)(intptr_t)host, (int)__builtin_strlen(host),
+        (int)(intptr_t)buf, (int)(sizeof(buf) - 1)
+    );
+    if (rc <= 0 || rc >= (int)sizeof(buf)) return 0;
+    buf[rc] = '\0';
+    struct in_addr a;
+    if (inet_pton(AF_INET, buf, &a) != 1) return 0;
+    return a.s_addr;
+}
+
 /* getlogin_r — POSIX: copy the login name into buf.  We don't track
  * a real login session; report the canonical sandbox identity ("user",
  * matching getuid()==1000 and /etc/passwd entry).  Returns 0 on
