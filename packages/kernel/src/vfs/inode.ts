@@ -59,6 +59,12 @@ export interface DirEntry {
   type: InodeType;
 }
 
+export interface FsCredential {
+  uid: number;
+  gid: number;
+  groups?: number[];
+}
+
 function createMetadata(permissions: number, uid: number, gid: number): InodeMetadata {
   const now = new Date();
   return { permissions, uid, gid, mtime: now, ctime: now, atime: now };

@@ -5,6 +5,7 @@
  * accept either the real VFS (main thread) or VfsProxy (Worker thread).
  */
 import type { DirEntry, StatResult } from './inode.js';
+import type { OverlayState } from './overlay-vfs.js';
 
 export interface VfsLike {
   readFile(path: string): Uint8Array;
@@ -43,4 +44,13 @@ export interface VfsLike {
     read?: (length: number) => Uint8Array;
     write?: (data: Uint8Array) => number;
   } | null;
+  setOnChange?(cb: (() => void) | null): void;
+  snapshot?(): string;
+  restore?(id: string): void;
+  cowClone?(): VfsLike;
+  getProviderPaths?(): string[];
+  clearFileContents?(): void;
+  exportOverlayState?(): OverlayState;
+  importOverlayState?(state: OverlayState): void;
+  exportUpperVfs?(): VfsLike;
 }
