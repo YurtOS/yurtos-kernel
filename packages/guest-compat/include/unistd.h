@@ -33,6 +33,7 @@ int pipe2(int fd[2], int flags);
  * exec, so the flag is ignored. */
 int dup(int oldfd);
 int dup3(int oldfd, int newfd, int flags);
+int gethostname(char *name, size_t len);
 
 /* wasi-libc gates many POSIX entries behind __wasilibc_unmodified_upstream
  * so they are absent on wasm32-wasip1.  The block below restores enough

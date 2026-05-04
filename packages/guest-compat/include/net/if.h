@@ -74,13 +74,10 @@ struct ifreq {
 #define IFF_PROMISC   0x100
 #define IFF_MULTICAST 0x1000
 
-/* if_nametoindex / if_indextoname — stub implementations; no real
- * network interfaces in the sandbox, so these always fail. */
-static inline unsigned int if_nametoindex(const char *ifname) {
-    (void)ifname; return 0;
-}
-static inline char *if_indextoname(unsigned int ifindex, char *ifname) {
-    (void)ifindex; (void)ifname; return 0;
-}
+/* The sandbox exposes one deterministic loopback interface for lookup
+ * compatibility. Real symbols live in libyurt_guest_compat.a so link probes
+ * and yurt-check can verify precedence. */
+unsigned int if_nametoindex(const char *ifname);
+char *if_indextoname(unsigned int ifindex, char *ifname);
 
 #endif /* _NET_IF_H */

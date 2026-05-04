@@ -1,0 +1,17 @@
+canary = "posix-runtime-canary"
+summary = "Report deterministic sandbox hostname (§Runtime Contract > Host identity)."
+
+[[case]]
+name = "hostname"
+inputs = "gethostname(buf, sizeof(buf))"
+expected.exit = 0
+expected.stdout = "hostname:yurt"
+expected.note = "hostname matches uname().nodename and does not leak host identity"
+
+[[case]]
+name = "hostname_too_small"
+inputs = "gethostname(buf, 4)"
+expected.exit = 0
+expected.stdout = "hostname_too_small:-1"
+expected.errno = 37
+expected.note = "buffer must include space for the trailing NUL; ENAMETOOLONG is 37 on wasi-libc"

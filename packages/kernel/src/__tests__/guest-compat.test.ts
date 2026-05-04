@@ -221,6 +221,50 @@ describe('Guest compatibility canaries', () => {
     expect(result.stdout.trim()).toBe('getgroups:1:1000');
   });
 
+  describe('posix-runtime-canary', () => {
+    it('reports deterministic hostname and loopback interface lookups', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const hostname = await sandbox.run('posix-runtime-canary --case hostname');
+      expect(hostname.exitCode).toBe(0);
+      expect(hostname.stdout.trim()).toBe('{"case":"hostname","exit":0,"stdout":"hostname:yurt"}');
+
+      const nameToIndex = await sandbox.run('posix-runtime-canary --case loopback_name_to_index');
+      expect(nameToIndex.exitCode).toBe(0);
+      expect(nameToIndex.stdout.trim()).toBe(
+        '{"case":"loopback_name_to_index","exit":0,"stdout":"if_nametoindex:1"}',
+      );
+
+      const indexToName = await sandbox.run('posix-runtime-canary --case loopback_index_to_name');
+      expect(indexToName.exitCode).toBe(0);
+      expect(indexToName.stdout.trim()).toBe(
+        '{"case":"loopback_index_to_name","exit":0,"stdout":"if_indextoname:lo"}',
+      );
+    });
+
+    it('exercises deterministic sendfile edge behavior', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const zero = await sandbox.run('posix-runtime-canary --case sendfile_zero_count');
+      expect(zero.exitCode).toBe(0);
+      expect(zero.stdout.trim()).toBe(
+        '{"case":"sendfile_zero_count","exit":0,"stdout":"sendfile_zero:0"}',
+      );
+
+      const badFd = await sandbox.run('posix-runtime-canary --case sendfile_bad_fd');
+      expect(badFd.exitCode).toBe(0);
+      expect(badFd.stdout.trim()).toBe(
+        '{"case":"sendfile_bad_fd","exit":0,"stdout":"sendfile_bad_fd:-1","errno":8}',
+      );
+    });
+  });
+
   it('exposes the narrow signal compatibility header surface', async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,

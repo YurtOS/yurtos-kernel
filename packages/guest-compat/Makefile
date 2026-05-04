@@ -30,11 +30,13 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_ioctl.o \
   $(BUILD_DIR)/yurt_mktemp.o \
   $(BUILD_DIR)/yurt_netdb.o \
+  $(BUILD_DIR)/yurt_netif.o \
   $(BUILD_DIR)/yurt_pipe.o \
   $(BUILD_DIR)/yurt_process.o \
   $(BUILD_DIR)/yurt_pthread.o \
   $(BUILD_DIR)/yurt_resource.o \
   $(BUILD_DIR)/yurt_sched.o \
+  $(BUILD_DIR)/yurt_sendfile.o \
   $(BUILD_DIR)/yurt_signal.o \
   $(BUILD_DIR)/yurt_socket.o \
   $(BUILD_DIR)/yurt_spawn.o \
@@ -44,7 +46,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_unistd.o \
   $(BUILD_DIR)/yurt_version.o
 
-CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups signal setjmp pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
+CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime signal setjmp pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
 
 .PHONY: all lib canaries copy-fixtures clean ensure-toolchain

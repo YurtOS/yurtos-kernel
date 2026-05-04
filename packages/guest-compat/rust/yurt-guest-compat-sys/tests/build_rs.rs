@@ -124,8 +124,8 @@ fn wasip1_target_emits_link_directives_when_archive_provided() {
     );
     let export_count = stdout.matches("rustc-link-arg=-Wl,--export=").count();
     assert_eq!(
-        export_count, 146,
-        "expected 146 export flags, got {export_count}: {stdout}"
+        export_count, 154,
+        "expected 154 export flags, got {export_count}: {stdout}"
     );
 }
 
