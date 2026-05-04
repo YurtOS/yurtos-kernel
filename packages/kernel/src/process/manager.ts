@@ -17,10 +17,14 @@ import type { SpawnOptions, SpawnResult } from './process.js';
 import { NativeModuleRegistry } from './native-modules.js';
 import { defaultWasmModuleCache, sha256Hex, type WasmModuleCache } from './module-cache.js';
 
+export type ToolSource =
+  | { kind: 'host'; path: string }
+  | { kind: 'vfs'; path: string };
+
 export class ProcessManager {
   private vfs: VfsLike;
   private adapter: PlatformAdapter;
-  private registry: Map<string, string> = new Map();
+  private registry: Map<string, ToolSource> = new Map();
   private moduleCache: Map<string, WebAssembly.Module> = new Map();
   private wasmModuleCache: WasmModuleCache;
   private networkBridge: NetworkBridgeLike | null;
@@ -52,8 +56,8 @@ export class ProcessManager {
     await this.nativeModules.loadModule(name, wasmBytes);
   }
 
-  registerTool(name: string, wasmPath: string): void {
-    this.registry.set(name, wasmPath);
+  registerTool(name: string, source: string | ToolSource): void {
+    this.registry.set(name, typeof source === 'string' ? { kind: 'host', path: source } : source);
   }
 
   /**
@@ -65,10 +69,11 @@ export class ProcessManager {
    */
   registerMulticallTool(name: string, wasmPath: string, applets: string[]): void {
     this.registerTool(name, wasmPath);
+    const source: ToolSource = { kind: 'host', path: wasmPath };
 
     this.vfs.withWriteAccess(() => {
       for (const applet of applets) {
-        this.registry.set(applet, wasmPath);
+        this.registry.set(applet, source);
         const linkPath = `/usr/bin/${applet}`;
         try {
           this.vfs.unlink(linkPath);
@@ -82,11 +87,12 @@ export class ProcessManager {
 
   /** Register and preload a tool from VFS — for runtime-installed packages. */
   async registerAndLoadTool(name: string, wasmPath: string): Promise<void> {
-    this.registerTool(name, wasmPath);
+    const source: ToolSource = { kind: 'vfs', path: wasmPath };
+    this.registerTool(name, source);
     // Load WASM bytes from VFS and compile directly (not from host filesystem)
     const wasmBytes = this.vfs.readFile(wasmPath);
     const module = await this.compileBytes(wasmBytes);
-    this.moduleCache.set(wasmPath, module);
+    this.moduleCache.set(this.cacheKey(source), module);
   }
 
   /** Return the names of all registered tools. */
@@ -117,8 +123,28 @@ export class ProcessManager {
 
   /** Resolve a tool name to its .wasm path, or throw if not registered. */
   resolveTool(name: string): string {
-    const path = this.registry.get(name);
-    if (path !== undefined) return path;
+    return this.resolveToolSource(name).path;
+  }
+
+  private resolveToolSource(name: string): ToolSource {
+    const direct = this.registry.get(name);
+    if (direct !== undefined) return direct;
+
+    const candidatePaths = name.includes('/')
+      ? [name]
+      : ['/usr/extensions', '/usr/bin', '/bin'].map(dir => `${dir}/${name}`);
+
+    for (const filePath of candidatePaths) {
+      try {
+        const st = this.vfs.stat(filePath);
+        if (st.type === 'file' && (st.permissions & 0o111)) {
+          return { kind: 'vfs', path: filePath };
+        }
+      } catch {
+        // Try the next PATH entry.
+      }
+    }
+
     throw new Error(`Tool not found: ${name}`);
   }
 
@@ -137,13 +163,13 @@ export class ProcessManager {
    * registered or not yet loaded.
    */
   getModule(prog: string): WebAssembly.Module | null {
-    let wasmPath: string;
+    let source: ToolSource;
     try {
-      wasmPath = this.resolveTool(prog);
+      source = this.resolveToolSource(prog);
     } catch {
       return null;
     }
-    return this.moduleCache.get(wasmPath) ?? null;
+    return this.moduleCache.get(this.cacheKey(source)) ?? null;
   }
 
   /**
@@ -160,8 +186,8 @@ export class ProcessManager {
         executionTimeMs: 0,
       };
     }
-    const wasmPath = this.resolveTool(command);
-    const module = await this.loadModule(wasmPath);
+    const source = this.resolveToolSource(command);
+    const module = await this.loadModule(source);
 
     // Collect stdin data: prefer explicit stdinData, otherwise drain the stdin pipe
     let stdinData: Uint8Array | undefined = opts.stdinData;
@@ -292,16 +318,23 @@ export class ProcessManager {
    * The first load for a given path compiles via the platform adapter;
    * subsequent loads reuse the compiled Module.
    */
-  private async loadModule(wasmPath: string): Promise<WebAssembly.Module> {
-    const cached = this.moduleCache.get(wasmPath);
+  private async loadModule(source: ToolSource): Promise<WebAssembly.Module> {
+    const key = this.cacheKey(source);
+    const cached = this.moduleCache.get(key);
     if (cached !== undefined) {
       return cached;
     }
 
-    const bytes = await this.adapter.readBytes(wasmPath);
+    const bytes = source.kind === 'vfs'
+      ? this.vfs.readFile(source.path)
+      : await this.adapter.readBytes(source.path);
     const module = await this.compileBytes(bytes);
-    this.moduleCache.set(wasmPath, module);
+    this.moduleCache.set(key, module);
     return module;
+  }
+
+  private cacheKey(source: ToolSource): string {
+    return source.kind === 'host' ? source.path : `vfs:${source.path}`;
   }
 
   private async compileBytes(bytes: Uint8Array): Promise<WebAssembly.Module> {
@@ -314,8 +347,11 @@ export class ProcessManager {
    * used synchronously by spawnSync().
    */
   async preloadModules(): Promise<void> {
-    const paths = new Set(this.registry.values());
-    await Promise.all(Array.from(paths).map(p => this.loadModule(p)));
+    const sources = new Map<string, ToolSource>();
+    for (const source of this.registry.values()) {
+      sources.set(this.cacheKey(source), source);
+    }
+    await Promise.all(Array.from(sources.values()).map(source => this.loadModule(source)));
   }
 
   /**
@@ -339,14 +375,14 @@ export class ProcessManager {
       };
     }
 
-    let wasmPath: string;
+    let source: ToolSource;
     try {
-      wasmPath = this.resolveTool(command);
+      source = this.resolveToolSource(command);
     } catch {
       return { exit_code: 127, stdout: '', stderr: `${command}: not found\n` };
     }
 
-    const module = this.moduleCache.get(wasmPath);
+    const module = this.moduleCache.get(this.cacheKey(source));
     if (!module) {
       return { exit_code: 127, stdout: '', stderr: `${command}: module not loaded\n` };
     }

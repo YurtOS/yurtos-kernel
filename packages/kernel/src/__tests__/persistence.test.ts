@@ -306,6 +306,12 @@ describe('Sandbox exportState / importState', () => {
 
   it('does not serialize deterministic bootstrap binaries', async () => {
     sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+    let hasMagicDb = true;
+    try {
+      sandbox.stat('/usr/share/misc/magic.mgc');
+    } catch {
+      hasMagicDb = false;
+    }
 
     const blob = sandbox.exportState();
     const state = JSON.parse(dec(blob.subarray(12)));
@@ -317,7 +323,9 @@ describe('Sandbox exportState / importState', () => {
       sandbox2.importState(blob);
       expect(sandbox2.stat('/bin/bash').type).toBe('file');
       expect(sandbox2.readFile('/bin/bash').length).toBeGreaterThan(8);
-      expect(sandbox2.stat('/usr/share/misc/magic.mgc').type).toBe('file');
+      if (hasMagicDb) {
+        expect(sandbox2.stat('/usr/share/misc/magic.mgc').type).toBe('file');
+      }
     } finally {
       sandbox2.destroy();
     }

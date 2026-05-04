@@ -19,9 +19,6 @@
 import type { VfsLike } from '../vfs/vfs-like.js';
 import type { ExportStateOptions, ImportStateOptions, SerializedState } from './types.js';
 
-const S_TOOL = 0o100000;
-
-
 /** Encode bytes to base64 (works in both Node and browser). */
 function toBase64(bytes: Uint8Array): string {
   let binary = '';
@@ -257,7 +254,7 @@ export function importState(
         targetVfs.chown(entry.path, entry.uid ?? 0, entry.gid ?? 0);
       }
       if (entry.permissions !== undefined) {
-        targetVfs.chmod(entry.path, entry.permissions & ~S_TOOL);
+        targetVfs.chmod(entry.path, entry.permissions);
       }
     }
   });

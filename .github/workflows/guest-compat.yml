@@ -61,5 +61,8 @@ jobs:
       - name: Run fixture smoke tests
         run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/fixture-build-smoke.test.ts packages/kernel/src/process/__tests__/module-cache.test.ts
 
+      - name: Run VFS overlay tests
+        run: deno test --no-check --allow-read --allow-write --allow-env packages/kernel/src/vfs/__tests__/overlay-vfs.test.ts packages/kernel/src/vfs/__tests__/root-provider.test.ts packages/kernel/src/__tests__/sandbox-base-root.test.ts
+
       - name: Run adversarial security tests
         run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/security-adversarial.test.ts

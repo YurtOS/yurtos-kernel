@@ -6,6 +6,8 @@
  */
 import type { DirEntry, StatResult } from './inode.js';
 import type { OverlayState } from './overlay-vfs.js';
+import type { ProcessInfo } from './proc-provider.js';
+import type { MountEntry, VirtualProvider } from './provider.js';
 
 export interface VfsLike {
   readFile(path: string): Uint8Array;
@@ -45,6 +47,9 @@ export interface VfsLike {
     write?: (data: Uint8Array) => number;
   } | null;
   setOnChange?(cb: (() => void) | null): void;
+  mount?(mountPath: string, provider: VirtualProvider): void;
+  getMountList?(): MountEntry[];
+  setProcessListProvider?(fn: (() => ProcessInfo[]) | null): void;
   snapshot?(): string;
   restore?(id: string): void;
   cowClone?(): VfsLike;

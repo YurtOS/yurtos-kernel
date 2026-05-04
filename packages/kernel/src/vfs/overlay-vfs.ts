@@ -1,4 +1,6 @@
 import { VfsError, type DirEntry, type FsCredential, type StatResult } from './inode.js';
+import type { ProcessInfo } from './proc-provider.js';
+import type { MountEntry, VirtualProvider } from './provider.js';
 import type { RootProvider } from './root-provider.js';
 import { rootStatToVfsStat } from './root-provider.js';
 import type { VfsLike } from './vfs-like.js';
@@ -411,6 +413,20 @@ export class OverlayVFS implements VfsLike {
   getProviderPaths(): string[] {
     const upper = this.options.upper as VfsLike & { getProviderPaths?: () => string[] };
     return upper.getProviderPaths?.() ?? [];
+  }
+
+  mount(mountPath: string, provider: VirtualProvider): void {
+    if (!this.options.upper.mount) throw new Error('OverlayVFS upper layer does not support mount()');
+    this.options.upper.mount(mountPath, provider);
+    this.notifyChange();
+  }
+
+  getMountList(): MountEntry[] {
+    return this.options.upper.getMountList?.() ?? [];
+  }
+
+  setProcessListProvider(fn: (() => ProcessInfo[]) | null): void {
+    this.options.upper.setProcessListProvider?.(fn);
   }
 
   clearFileContents(): void {

@@ -243,24 +243,25 @@ describe('OverlayVFS', () => {
 
   it('fires one rename notification only after overlay state is consistent', () => {
     const base = new MemoryRoot('base:test');
-    base.addDir('/work', { uid: 1000, gid: 1000, permissions: 0o755 });
-    base.addFile('/work/a.txt', 'a', { uid: 1000, gid: 1000, permissions: 0o644 });
-    base.addFile('/work/b.txt', 'b', { uid: 1000, gid: 1000, permissions: 0o644 });
+    base.addDir('/home', { uid: 0, gid: 0, permissions: 0o755 });
+    base.addDir('/home/user', { uid: 1000, gid: 1000, permissions: 0o755 });
+    base.addFile('/home/user/a.txt', 'a', { uid: 1000, gid: 1000, permissions: 0o644 });
+    base.addFile('/home/user/b.txt', 'b', { uid: 1000, gid: 1000, permissions: 0o644 });
     const vfs = new OverlayVFS({ base, upper: new VFS() });
     const exportedStates: any[] = [];
     vfs.setOnChange(() => {
       exportedStates.push(JSON.parse(dec.decode(exportState(vfs).subarray(12))));
     });
 
-    vfs.rename('/work/a.txt', '/work/b.txt');
+    vfs.rename('/home/user/a.txt', '/home/user/b.txt');
 
     expect(exportedStates.length).toBe(1);
-    expect(exportedStates[0].overlay.whiteouts).toEqual(['/work/a.txt']);
+    expect(exportedStates[0].overlay.whiteouts).toEqual(['/home/user/a.txt']);
 
     const restored = new OverlayVFS({ base, upper: new VFS() });
     importState(restored, exportState(vfs), { allowSystemPaths: true });
-    expect(dec.decode(vfs.readFile('/work/b.txt'))).toBe('a');
-    expect(dec.decode(restored.readFile('/work/b.txt'))).toBe('a');
+    expect(dec.decode(vfs.readFile('/home/user/b.txt'))).toBe('a');
+    expect(dec.decode(restored.readFile('/home/user/b.txt'))).toBe('a');
   });
 
   it('does not fire onChange for clearFileContents', () => {

@@ -6,6 +6,8 @@
  */
 
 import { VFS } from './vfs/vfs.js';
+import { OverlayVFS } from './vfs/overlay-vfs.js';
+import { NodeDirectoryRootProvider } from './vfs/node-directory-root-provider.js';
 import { YURT_VERSION } from './version.js';
 import { ProcessManager } from './process/manager.js';
 /** Streaming callbacks for `Sandbox.run()`. Chunks are decoded UTF-8 strings. */
@@ -26,6 +28,7 @@ import type { ProcessMode } from './process/handle.js';
 import { INIT_PID, ProcessKernel, ROOT_UID, type ProcessCredentials, type SpawnRequest } from './process/kernel.js';
 import { loadProcess, type LoaderContext } from './process/loader.js';
 import type { DirEntry, StatResult } from './vfs/inode.js';
+import type { VfsLike } from './vfs/vfs-like.js';
 import { NetworkGateway } from './network/gateway.js';
 import type { NetworkPolicy } from './network/gateway.js';
 import { NetworkBridge, type NetworkBridgeLike } from './network/bridge.js';
@@ -75,6 +78,8 @@ export interface SandboxOptions {
   timeoutMs?: number;
   /** Max VFS size in bytes. Default 256MB. */
   fsLimitBytes?: number;
+  /** Host directory mounted as the read-only base root layer. Node only. */
+  baseRoot?: string;
   /** Path/URL to the default boot WASM. Defaults to `${wasmDir}/bash.wasm`. */
   bootWasmPath?: string;
   /** Deprecated alias for bootWasmPath. */
@@ -126,7 +131,7 @@ const DEFAULT_FS_LIMIT = 256 * 1024 * 1024; // 256 MB
 
 /** Internal config for the Sandbox constructor. Not part of the public API. */
 interface SandboxParts {
-  vfs: VFS;
+  vfs: VfsLike;
   kernel: ProcessKernel;
   processes: Map<number, Process>;
   bootProcess: Process;
@@ -152,7 +157,7 @@ interface SandboxParts {
 }
 
 export class Sandbox {
-  private vfs: VFS;
+  private vfs: VfsLike;
   private kernel: ProcessKernel;
   private processes: Map<number, Process>;
   private bootProcess: Process;
@@ -232,10 +237,25 @@ export class Sandbox {
     const fsLimitBytes = options.fsLimitBytes ?? DEFAULT_FS_LIMIT;
     const moduleCache = options.moduleCache ?? defaultWasmModuleCache;
 
-    const vfs = new VFS({
+    const upper = new VFS({
       fsLimitBytes,
       fileCount: options.security?.limits?.fileCount,
     });
+    const baseManifest = options.baseRoot
+      ? await Sandbox.readBaseRootManifest(options.baseRoot)
+      : undefined;
+    const vfs: VfsLike = options.baseRoot
+      ? new OverlayVFS({
+        base: new NodeDirectoryRootProvider(options.baseRoot, {
+          id: baseManifest?.id ?? `dir:${options.baseRoot}`,
+          metadata: Object.fromEntries((baseManifest?.files ?? []).map((f) => [
+            f.path,
+            { uid: f.uid, gid: f.gid, mode: f.mode },
+          ])),
+        }),
+        upper,
+      })
+      : upper;
     const { bridge } = options.networkBridge
       ? { bridge: options.networkBridge }
       : await Sandbox.createNetworkBridge(options.network);
@@ -246,9 +266,13 @@ export class Sandbox {
       options.security?.toolAllowlist,
       moduleCache,
     );
-    const tools = await Sandbox.registerTools(mgr, adapter, options.wasmDir, vfs);
+    const tools = options.baseRoot
+      ? Sandbox.registerBaseRootTools(mgr, vfs)
+      : await Sandbox.registerTools(mgr, adapter, options.wasmDir, upper);
     const runtimeBackend = options.runtimeBackend ?? unsupportedRuntimeEngineBackend;
-    await Sandbox.installCpythonStdlib(vfs, adapter, options.wasmDir, tools);
+    if (!options.baseRoot) {
+      await Sandbox.installCpythonStdlib(upper, adapter, options.wasmDir, tools);
+    }
 
     // Register optional WASM tools from ToolRegistry before preloadModules()
     if (options.tools && options.tools.length > 0) {
@@ -284,6 +308,7 @@ export class Sandbox {
     if (options.mounts) {
       for (const mc of options.mounts) {
         const provider = new HostMount(mc.files, { writable: mc.writable });
+        if (!vfs.mount) throw new Error('Configured VFS does not support mounts');
         vfs.mount(mc.path, provider);
       }
     }
@@ -298,7 +323,9 @@ export class Sandbox {
       : baseBootWasmPath;
     const bootArgv = options.bootArgv ?? ['/bin/bash'];
 
-    await Sandbox.installBootProgram(vfs, adapter, bootArgv[0], bootWasmPath);
+    if (!options.baseRoot) {
+      await Sandbox.installBootProgram(upper, adapter, bootArgv[0], bootWasmPath);
+    }
 
     // Pre-load all tool modules so spawnSync can use them synchronously
     await mgr.preloadModules();
@@ -602,6 +629,36 @@ export class Sandbox {
       : undefined;
   }
 
+  private static async readBaseRootManifest(baseRoot: string): Promise<{
+    id?: string;
+    files?: Array<{ path: string; type?: 'file' | 'dir' | 'symlink'; uid: number; gid: number; mode: number }>;
+    tools?: Array<{ name: string; path: string }>;
+  } | undefined> {
+    try {
+      const { readFile } = await import('node:fs/promises');
+      const raw = await readFile(`${baseRoot}/etc/yurt/base-image.json`, 'utf8');
+      return JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private static registerBaseRootTools(mgr: ProcessManager, vfs: VfsLike): Map<string, string> {
+    const tools = new Map<string, string>();
+    try {
+      const manifest = JSON.parse(new TextDecoder().decode(vfs.readFile('/etc/yurt/base-image.json'))) as {
+        tools?: Array<{ name: string; path: string }>;
+      };
+      for (const tool of manifest.tools ?? []) {
+        mgr.registerTool(tool.name, { kind: 'vfs', path: tool.path });
+        tools.set(tool.name, tool.path);
+      }
+    } catch {
+      // Base roots may choose to provide only the boot program.
+    }
+    return tools;
+  }
+
   private static async registerTools(
     mgr: ProcessManager,
     adapter: PlatformAdapter,
@@ -712,7 +769,7 @@ export class Sandbox {
   }
 
   private static createBootImportFactory(
-    vfs: VFS,
+    vfs: VfsLike,
     mgr: ProcessManager,
     bootImports: ((api: KernelApi) => Record<string, WebAssembly.ImportValue>) | undefined,
   ): ((memory: WebAssembly.Memory) => Record<string, WebAssembly.ImportValue>) | undefined {
@@ -738,7 +795,7 @@ export class Sandbox {
   }
 
   private static createLoaderContext(opts: {
-    vfs: VFS;
+    vfs: VfsLike;
     adapter: PlatformAdapter;
     kernel: ProcessKernel;
     mgr: ProcessManager;
@@ -926,7 +983,7 @@ export class Sandbox {
     return makeContextWithAllocator((argv) => kernel.allocPid(INIT_PID, argv[0]));
   }
 
-  private static argvForSpawn(vfs: VFS, req: SpawnRequest, credentials: ProcessCredentials): string[] {
+  private static argvForSpawn(vfs: VfsLike, req: SpawnRequest, credentials: ProcessCredentials): string[] {
     const prog = req.prog.includes('/')
       ? Sandbox.resolveSpawnPath(req.prog, req.cwd || '/')
       : Sandbox.resolveExecutablePathForVfs(vfs, req.prog);
@@ -951,7 +1008,7 @@ export class Sandbox {
     return `/${parts.join('/')}`;
   }
 
-  private static assertExecutableForSpawn(vfs: VFS, path: string, credentials: ProcessCredentials): void {
+  private static assertExecutableForSpawn(vfs: VfsLike, path: string, credentials: ProcessCredentials): void {
     let st: StatResult;
     try {
       st = vfs.stat(path);
@@ -971,7 +1028,7 @@ export class Sandbox {
     return (mode & 0o001) !== 0;
   }
 
-  private static resolveExecutablePathForVfs(vfs: VFS, prog: string): string {
+  private static resolveExecutablePathForVfs(vfs: VfsLike, prog: string): string {
     for (const dir of ['/usr/extensions', '/usr/bin', '/bin']) {
       const path = `${dir}/${prog}`;
       try {
@@ -985,7 +1042,7 @@ export class Sandbox {
   }
 
   private static async createWorkerExecutor(
-    vfs: VFS,
+    vfs: VfsLike,
     wasmDir: string,
     shellExecWasmPath: string,
     tools: Map<string, string>,
@@ -996,6 +1053,7 @@ export class Sandbox {
     extensionRegistry?: ExtensionRegistry,
   ): Promise<WorkerExecutor | undefined> {
     if (!security?.hardKill || !adapter.supportsWorkerExecution) return undefined;
+    if (!(vfs instanceof VFS)) return undefined;
     const { WorkerExecutor: WE } = await import('./execution/worker-executor.js');
     const toolRegistry: [string, string][] = Array.from(tools);
     return new WE({
@@ -1358,6 +1416,7 @@ export class Sandbox {
       typeof (filesOrProvider as VirtualProvider).readFile === 'function'
         ? (filesOrProvider as VirtualProvider)
         : new HostMount(filesOrProvider as Record<string, Uint8Array>);
+    if (!this.vfs.mount) throw new Error('Configured VFS does not support mounts');
     this.vfs.mount(path, provider);
   }
 
@@ -1393,6 +1452,7 @@ export class Sandbox {
 
   snapshot(): string {
     this.assertAlive();
+    if (!this.vfs.snapshot) throw new Error('Configured VFS does not support snapshot');
     const id = this.vfs.snapshot();
     this.envSnapshots.set(id, this.getEnvMap());
     return id;
@@ -1400,6 +1460,7 @@ export class Sandbox {
 
   restore(id: string): void {
     this.assertAlive();
+    if (!this.vfs.restore) throw new Error('Configured VFS does not support restore');
     this.vfs.restore(id);
     const envSnap = this.envSnapshots.get(id);
     if (envSnap) {
@@ -1410,7 +1471,7 @@ export class Sandbox {
   /** Export the entire sandbox state (VFS files + env vars) as a binary blob. */
   exportState(): Uint8Array {
     this.assertAlive();
-    return serializerExportState(this.vfs, this.getEnvMap(), this.vfs.getProviderPaths());
+    return serializerExportState(this.vfs, this.getEnvMap(), this.vfs.getProviderPaths?.());
   }
 
   /** Import a previously exported state blob, restoring files and env vars. */
@@ -1428,8 +1489,9 @@ export class Sandbox {
     if (this.destroyed) throw new Error('Sandbox has been destroyed');
     if (!this.storage) throw new Error('No storage callbacks configured');
     if (this.running) throw new Error('Cannot offload while a command is running');
+    if (!this.vfs.clearFileContents) throw new Error('Configured VFS does not support offload');
 
-    const blob = serializerExportState(this.vfs, this.getEnvMap(), this.vfs.getProviderPaths());
+    const blob = serializerExportState(this.vfs, this.getEnvMap(), this.vfs.getProviderPaths?.());
     await this.storage.save(this.sessionId, blob);
     this.vfs.clearFileContents();
     this.offloaded = true;
@@ -1478,6 +1540,7 @@ export class Sandbox {
 
   async fork(): Promise<Sandbox> {
     this.assertAlive();
+    if (!this.vfs.cowClone) throw new Error('Configured VFS does not support fork');
     const childVfs = this.vfs.cowClone();
     const { bridge } = await Sandbox.createNetworkBridge(this.networkPolicy);
     const childMgr = new ProcessManager(
@@ -1487,7 +1550,9 @@ export class Sandbox {
       this.security?.toolAllowlist,
       this.moduleCache,
     );
-    const tools = await Sandbox.registerTools(childMgr, this.adapter, this.wasmDir, childVfs);
+    const tools = childVfs instanceof OverlayVFS
+      ? Sandbox.registerBaseRootTools(childMgr, childVfs)
+      : await Sandbox.registerTools(childMgr, this.adapter, this.wasmDir, childVfs as VFS);
 
     // Pre-load all tool modules so spawnSync can use them synchronously
     await childMgr.preloadModules();
