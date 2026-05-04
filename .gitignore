@@ -4,6 +4,5 @@ dist/
 *.wasm.d.ts
 .deno/
 .worktrees/
-packages/c-ports/busybox
 packages/kernel/src/platform/__tests__/fixtures/busybox.manifest.json
 packages/kernel/src/platform/__tests__/fixtures/busybox.wasm

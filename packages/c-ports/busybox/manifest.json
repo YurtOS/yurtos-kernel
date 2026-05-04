@@ -1,0 +1,27 @@
+{
+  "name": "busybox",
+  "multicall": {
+    "applets": [
+      "arch", "awk", "base32", "base64", "basename",
+      "bc", "cal", "cat", "chgrp", "chown",
+      "cksum", "cmp", "comm", "cp", "cut",
+      "dc", "dd", "df", "diff", "dirname",
+      "du", "echo", "env", "expand", "expr",
+      "factor", "false", "find", "fold", "grep",
+      "groups", "gzip", "head", "hexdump", "hostid",
+      "hostname", "id", "link", "ln", "logname",
+      "ls", "md5sum", "mkdir", "mktemp", "mv",
+      "nice", "nl", "nohup", "nproc", "od",
+      "paste", "patch", "printenv", "printf", "readlink",
+      "realpath", "rev", "rm", "rmdir", "sed",
+      "seq", "sha1sum", "sha256sum", "sha512sum", "shuf",
+      "sleep", "sort", "split", "stat", "strings",
+      "sum", "tac", "tail", "tar", "tee",
+      "timeout", "touch", "tr", "tree", "true",
+      "truncate", "tsort", "uname", "unexpand", "uniq",
+      "unlink", "unzip", "uptime", "users", "wc",
+      "who", "whoami", "xargs", "xxd", "yes",
+      "zcat"
+    ]
+  }
+}
