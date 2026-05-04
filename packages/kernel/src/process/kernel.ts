@@ -422,9 +422,15 @@ export class ProcessKernel {
     return this.parentPids.get(pid) ?? NO_PARENT_PID;
   }
 
-  killProcess(pid: number, _sig: number): boolean {
+  attachWasiHost(pid: number, wasiHost: WasiHost): void {
+    const entry = this.processTable.get(pid);
+    if (entry) entry.wasiHost = wasiHost;
+  }
+
+  killProcess(pid: number, sig: number): boolean {
     const entry = this.processTable.get(pid);
     if (!entry || entry.state === 'exited') return false;
+    if (entry.wasiHost?.queueSignal(sig)) return true;
     entry.wasiHost?.cancelExecution();
     return true;
   }

@@ -214,6 +214,9 @@ export class WasiHost {
   private kernel?: ProcessKernel;
   private pid?: number;
   private canSuspendPipeReads = false;
+  private signalDeliverer: ((sig: number) => void) | null = null;
+  private pendingSignals: number[] = [];
+  private drainingSignals = false;
 
   constructor(options: WasiHostOptions) {
     this.vfs = options.vfs;
@@ -361,6 +364,29 @@ export class WasiHost {
     this.canSuspendPipeReads = enabled;
   }
 
+  setSignalDeliverer(deliverer: ((sig: number) => void) | null): void {
+    this.signalDeliverer = deliverer;
+  }
+
+  queueSignal(sig: number): boolean {
+    if (!this.signalDeliverer) return false;
+    this.pendingSignals.push(sig);
+    return true;
+  }
+
+  drainPendingSignals(): void {
+    if (!this.signalDeliverer || this.drainingSignals) return;
+    this.drainingSignals = true;
+    try {
+      while (this.pendingSignals.length > 0) {
+        const sig = this.pendingSignals.shift();
+        if (sig !== undefined) this.signalDeliverer(sig);
+      }
+    } finally {
+      this.drainingSignals = false;
+    }
+  }
+
   /** Signal cancellation — next syscall check will throw WasiExitError. */
   cancelExecution(): void {
     this.cancelled = true;
@@ -368,6 +394,7 @@ export class WasiHost {
 
   /** Throw WasiExitError(124) if cancelled or past deadline. */
   private checkDeadline(): void {
+    this.drainPendingSignals();
     if (this.cancelled || Date.now() > this.deadlineMs) {
       throw new WasiExitError(124);
     }

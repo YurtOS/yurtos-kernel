@@ -67,4 +67,25 @@ describe('ProcessKernel', () => {
     expect(kernel.getPpid(999)).toBe(parent);
     kernel.dispose();
   });
+
+  it('queues delivered signals before falling back to cancellation', () => {
+    const kernel = new ProcessKernel();
+    const pid = kernel.allocPid(1, 'signal-target');
+    const queued: number[] = [];
+    let cancelled = false;
+    kernel.attachWasiHost(pid, {
+      queueSignal(sig: number) {
+        queued.push(sig);
+        return true;
+      },
+      cancelExecution() {
+        cancelled = true;
+      },
+    } as unknown as Parameters<ProcessKernel['attachWasiHost']>[1]);
+
+    expect(kernel.killProcess(pid, 10)).toBe(true);
+    expect(queued).toEqual([10]);
+    expect(cancelled).toBe(false);
+    kernel.dispose();
+  });
 });

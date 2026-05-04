@@ -317,6 +317,20 @@ describe('Guest compatibility canaries', () => {
     expect(result.stdout.trim()).toBe('signal-ok');
   });
 
+  it('delivers host-routed kill signals to guest handlers', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('signal-canary --case host_kill_delivers_handler');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      '{"case":"host_kill_delivers_handler","exit":0,"stdout":"kill:handled"}',
+    );
+  });
+
   it('runs the pthread-canary single-thread compatibility test', async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,

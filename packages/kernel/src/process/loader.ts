@@ -17,6 +17,14 @@ import { CooperativeSerialBackend } from "./threads/cooperative-serial.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
 import type { ThreadsBackend } from "./threads/backend.js";
 
+function bindSignalDeliverer(wasi: WasiHost, instance: WebAssembly.Instance): void {
+  const deliverSignal = instance.exports.yurt_deliver_signal;
+  if (typeof deliverSignal !== "function") return;
+  wasi.setSignalDeliverer((sig) => {
+    (deliverSignal as (sig: number) => unknown)(sig);
+  });
+}
+
 export interface LoaderContext {
   vfs: VfsLike;
   adapter: PlatformAdapter;
@@ -188,6 +196,8 @@ export async function loadProcess(
   wasi.setCanSuspendPipeReads(
     typeof WebAssembly.Suspending === "function" || asyncifyInitialized,
   );
+  bindSignalDeliverer(wasi, instance);
+  ctx.kernel.attachWasiHost(pid, wasi);
 
   const forkChildFromSnapshot = (
     parentPid: number,
@@ -256,6 +266,8 @@ export async function loadProcess(
         wasi_snapshot_preview1: childWasiImports,
         yurt: childYurtImports,
       });
+      bindSignalDeliverer(childWasi, childInstance);
+      ctx.kernel.attachWasiHost(childPid, childWasi);
       childMemoryRef = childInstance.exports.memory as WebAssembly.Memory;
       while (childMemoryRef.buffer.byteLength < snapshot.memoryBytes.byteLength) {
         childMemoryRef.grow(1);

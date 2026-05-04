@@ -110,3 +110,5 @@ pub const WRAPPED_WASI_LIBC_SYMBOLS: &[&str] = &[
     "recv",
     "send",
 ];
+
+pub const YURT_INTERNAL_EXPORTS: &[&str] = &["yurt_deliver_signal"];
