@@ -23,12 +23,9 @@ extern "C" {
  * the globals stay at their UTC/"C"-locale defaults. */
 void tzset(void);
 
-/* clock_settime — sandbox cannot set the hardware clock; always EPERM.
- * Declared so date(1) and similar tools compile without implicit-function
- * warnings; they gate the call behind a privilege check anyway. */
-static inline int clock_settime(clockid_t clk, const struct timespec *ts) {
-    (void)clk; (void)ts; errno = EPERM; return -1;
-}
+/* clock_settime — sandbox cannot set the host clock; the compat
+ * implementation returns -1 with errno=ENOSYS. */
+int clock_settime(clockid_t clk, const struct timespec *ts);
 
 /* tzname[0] = standard time abbreviation, tzname[1] = DST.  Both
  * point to "GMT" since the sandbox lives in UTC. */

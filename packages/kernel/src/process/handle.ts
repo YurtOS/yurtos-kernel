@@ -23,6 +23,7 @@ export class Process {
   private fdReadAndClearImpl?: (fd: 1 | 2) => { data: string; truncated: boolean };
   private setStdinImpl?: (data: Uint8Array | undefined) => void;
   private terminateImpl?: () => Promise<void>;
+  private terminated = false;
 
   private constructor(opts: { pid: number; mode: ProcessMode }) {
     this.pid = opts.pid;
@@ -86,6 +87,8 @@ export class Process {
   }
 
   async terminate(): Promise<void> {
+    if (this.terminated) return;
+    this.terminated = true;
     if (this.terminateImpl) await this.terminateImpl();
     this.exitCode ??= 0;
   }
