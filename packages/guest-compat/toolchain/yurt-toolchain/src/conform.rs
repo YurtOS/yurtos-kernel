@@ -19,6 +19,16 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
             &["gethostname", "if_indextoname", "if_nametoindex", "sendfile"],
         ),
         (
+            "socket-canary",
+            &[
+                "getaddrinfo",
+                "freeaddrinfo",
+                "getnameinfo",
+                "gethostbyname",
+                "gethostbyaddr",
+            ],
+        ),
+        (
             "resource-canary",
             &[
                 "chown",

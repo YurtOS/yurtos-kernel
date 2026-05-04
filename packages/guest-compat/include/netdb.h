@@ -1,11 +1,8 @@
 #ifndef YURT_COMPAT_NETDB_H
 #define YURT_COMPAT_NETDB_H
 
-/* wasi-libc has no <netdb.h>.  Yurt doesn't expose DNS to the
- * guest (sandbox networking goes through host_network_fetch, which
- * speaks HTTP/HTTPS, not DNS).  Declarations here; bodies live in
- * libyurt_guest_compat (yurt_netdb.c) and return "host not
- * found" cleanly so callers can degrade gracefully. */
+/* wasi-libc has no <netdb.h>. Yurt provides a narrow AF_INET resolver
+ * backed by the host DNS import used by the socket layer. */
 
 #include <stddef.h>
 #include <sys/socket.h>
@@ -82,6 +79,34 @@ struct addrinfo {
 
 #ifndef HOST_NOT_FOUND
 #define HOST_NOT_FOUND 1
+#endif
+
+#ifndef EAI_BADFLAGS
+#define EAI_BADFLAGS -1
+#endif
+
+#ifndef EAI_NONAME
+#define EAI_NONAME -2
+#endif
+
+#ifndef EAI_FAMILY
+#define EAI_FAMILY -6
+#endif
+
+#ifndef EAI_SERVICE
+#define EAI_SERVICE -8
+#endif
+
+#ifndef EAI_MEMORY
+#define EAI_MEMORY -10
+#endif
+
+#ifndef EAI_SYSTEM
+#define EAI_SYSTEM -11
+#endif
+
+#ifndef EAI_OVERFLOW
+#define EAI_OVERFLOW -12
 #endif
 
 extern int h_errno;

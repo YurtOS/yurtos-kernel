@@ -32,9 +32,40 @@ int main(void) {
   freeaddrinfo(res);
   res = NULL;
 
-  if (getaddrinfo("example.com", "80", &hints, &res) != 0 || !res) {
+  if (getaddrinfo("localhost", "80", &hints, &res) != 0 || !res) {
     emit("getaddrinfo_hostname", 1);
     return 1;
+  }
+  if (res->ai_family != AF_INET || res->ai_addrlen != sizeof(struct sockaddr_in)) {
+    emit("getaddrinfo_hostname_shape", 1);
+    freeaddrinfo(res);
+    return 1;
+  }
+
+  struct hostent *host = gethostbyname("localhost");
+  if (!host || host->h_addrtype != AF_INET || host->h_length != 4 ||
+      !host->h_addr_list || !host->h_addr_list[0]) {
+    emit("gethostbyname", 1);
+    freeaddrinfo(res);
+    return 1;
+  }
+  {
+    char host_buf[NI_MAXHOST];
+    char serv_buf[NI_MAXSERV];
+    struct sockaddr_in loopback;
+    memset(&loopback, 0, sizeof(loopback));
+    loopback.sin_family = AF_INET;
+    loopback.sin_port = htons(443);
+    inet_pton(AF_INET, "127.0.0.1", &loopback.sin_addr);
+    if (getnameinfo((struct sockaddr *)&loopback, sizeof(loopback),
+                    host_buf, sizeof(host_buf), serv_buf, sizeof(serv_buf),
+                    NI_NUMERICHOST | NI_NUMERICSERV) != 0 ||
+        strcmp(host_buf, "127.0.0.1") != 0 ||
+        strcmp(serv_buf, "443") != 0) {
+      emit("getnameinfo", 1);
+      freeaddrinfo(res);
+      return 1;
+    }
   }
 
   int fd = socket(AF_INET, SOCK_STREAM, 0);
