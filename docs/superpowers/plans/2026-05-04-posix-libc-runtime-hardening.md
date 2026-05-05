@@ -9,7 +9,7 @@ behaviorally covered before adding broader APIs.
 
 ## Tasks
 
-- [x] Refresh guest compatibility docs to describe current `yurt-toolchain`,
+- [x] Refresh kernel ABI docs to describe current `yurt-toolchain`,
       partial socket/exec/pthread support, and explicit fork/shared-library
       non-goals.
 - [x] Add real compat symbols for `gethostname`, `if_nametoindex`,

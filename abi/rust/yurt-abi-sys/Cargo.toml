@@ -1,0 +1,15 @@
+[package]
+name = "yurt-abi-sys"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Native bindings to libyurt_abi.a; emits link directives unless cargo-yurt has already injected them."
+links = "yurt_abi"
+
+[lib]
+path = "src/lib.rs"
+
+[build-dependencies]
+
+[dev-dependencies]
+tempfile = "3"

@@ -53,8 +53,8 @@ for bin in cargo-yurt maturin-yurt yurt-cc yurt-ar yurt-ranlib yurt-check yurt-c
   install -m 0755 "$TARGET_DIR/$bin" "$BIN_DIR/$bin"
 done
 
-if [[ -d "$ROOT/packages/guest-compat/build/rust-std" ]]; then
-  for version_dir in "$ROOT"/packages/guest-compat/build/rust-std/*; do
+if [[ -d "$ROOT/abi/build/rust-std" ]]; then
+  for version_dir in "$ROOT"/abi/build/rust-std/*; do
     [[ -d "$version_dir" ]] || continue
     version="$(basename "$version_dir")"
     rm -rf "$YURT_HOME/rust-std/$version"

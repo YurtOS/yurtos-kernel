@@ -1,0 +1,15 @@
+[package]
+name = "yurt-abi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Safe Rust wrappers over the yurt kernel ABI runtime Tier 1 ABI."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+yurt-abi-sys = { path = "../yurt-abi-sys" }
+libc = "0.2"
+
+[dev-dependencies]

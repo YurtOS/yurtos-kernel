@@ -227,7 +227,25 @@ be close to Conda `repodata.json`, but it can start smaller.
 The installer should fetch the index, resolve dependencies, verify artifact
 hashes, and then install packages in dependency order.
 
-## Installer Rules
+## Kernel Fixture Extractor
+
+`yurtos-kernel` only needs a small tar extractor for boot fixtures and tests.
+That extractor applies a prevalidated tar payload to the VFS:
+
+- regular files become VFS files
+- directories are created as needed
+- symlinks and hardlinks are created through the VFS link APIs
+- tar mode, uid, and gid are preserved
+
+It does not resolve dependencies, fetch registries, write package databases, or
+implement `pkg`/`pip` commands. Once an executable is present in the VFS with
+execute bits, the existing process loader should be able to execute it through
+normal path resolution.
+
+## Package-Manager Rules
+
+These rules belong to the future package-manager layer, not to
+`yurtos-kernel`.
 
 The installer must validate archives before mutating the VFS:
 
@@ -240,7 +258,8 @@ The installer must validate archives before mutating the VFS:
 - Reject duplicate archive entries after path normalization.
 - Verify file hashes and sizes from `info/files.json` when present.
 - Preserve tar mode, uid, and gid.
-- Record installed files under a package database in `/usr/share/pkg`.
+- Record installed files in a package-manager-owned database if that layer wants
+  list/info/remove/conflict operations.
 
 Install should be transactional where practical:
 
@@ -248,7 +267,7 @@ Install should be transactional where practical:
 2. Resolve and fetch dependencies.
 3. Check path conflicts against already installed packages.
 4. Extract into the VFS.
-5. Write package database records.
+5. Write package database records outside the kernel abstraction.
 
 If extraction fails, the installer should remove paths it created during that
 attempt before returning an error.
@@ -269,7 +288,9 @@ in the first version.
 
 ## Package Database
 
-Installed package state lives in VFS metadata files, initially under:
+Installed package state is owned by the package-manager layer, not by
+`yurtos-kernel`. A package-manager implementation may choose to persist state
+in VFS metadata files such as:
 
 ```text
 /usr/share/pkg/packages.json
@@ -284,18 +305,21 @@ The database records:
 - installed paths and file ownership
 - package-level hash and size
 
-This supports `pkg list`, `pkg info`, `pkg remove`, and conflict detection.
+Those files support package-manager operations such as list, info, remove, and
+conflict detection. The kernel should not interpret them; it only applies an
+already validated artifact/install plan to the VFS for boot fixtures and tests.
 
 ## Migration From Current Manifests
 
-The current sidecar manifest shape in `packages/kernel/src/packages/manifest.ts`
+The current sidecar manifest shape in `packages/kernel/src/boot/manifest.ts`
 contains file, symlink, and multicall install directives. The new format replaces
 those directives with tar-native filesystem entries.
 
 Migration path:
 
-1. Add a package archive reader and validator.
-2. Teach local boot-time fixtures to install from package archives.
+1. Add package archive reading and validation outside the kernel repo.
+2. Keep the kernel-side fixture extractor limited to applying a prevalidated tar
+   payload to the VFS.
 3. Convert BusyBox from `busybox.wasm` plus `busybox.manifest.json` into a
    `busybox-<version>-<build>.yurtpkg.tar.zst` archive.
 4. Keep legacy sidecar manifests temporarily for existing fixtures.
@@ -304,16 +328,15 @@ Migration path:
 
 ## Testing
 
-Unit tests should cover:
+Kernel unit tests should cover:
 
-- metadata parsing and validation
-- dependency constraint parsing
 - tar path normalization and rejection cases
 - symlink and hardlink extraction
 - uid/gid/mode preservation
-- conflict detection
-- package database writes
-- uninstall behavior
+
+Package-manager tests, in the future sister repository, should cover metadata
+parsing, dependency constraint parsing, conflict detection, package database
+writes, and uninstall behavior.
 
 Integration tests should cover:
 

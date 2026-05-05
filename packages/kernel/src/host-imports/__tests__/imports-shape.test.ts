@@ -6,9 +6,14 @@ import { OverlayVFS } from "../../vfs/overlay-vfs.ts";
 import { MemoryRoot } from "../../vfs/__tests__/helpers.ts";
 import { ProcessKernel } from "../../process/kernel.ts";
 import { FdTable } from "../../vfs/fd-table.ts";
-import { createStaticTarget, createVfsFileTarget, type FdTarget } from "../../wasi/fd-target.ts";
+import {
+  createStaticTarget,
+  createVfsFileTarget,
+  type FdTarget,
+} from "../../wasi/fd-target.ts";
 import { WasiHost } from "../../wasi/wasi-host.ts";
 import type { RuntimeEngineBackend } from "../../engine/backend.ts";
+import type { SocketBackend } from "../../network/socket-backend.ts";
 
 const encoder = new TextEncoder();
 
@@ -163,7 +168,10 @@ Deno.test("kernel host_spawn preserves cloned stdin refs when stdin_data spawn f
     },
   });
 
-  assertEquals((imports.host_spawn as (...args: number[]) => number)(0, reqLen), -1);
+  assertEquals(
+    (imports.host_spawn as (...args: number[]) => number)(0, reqLen),
+    -1,
+  );
   assertEquals(target.refs, 1);
   assertEquals(fdTable.isOpen(fd), true);
   kernel.dispose();
@@ -182,12 +190,17 @@ Deno.test("kernel host_waitpid only reaps children of the caller", async () => {
     kernel,
     callerPid: siblingPid,
   });
-  const deniedLen = await (siblingImports.host_waitpid as (...args: number[]) => Promise<number>)(
+  const deniedLen = await (siblingImports.host_waitpid as (
+    ...args: number[]
+  ) => Promise<number>)(
     childPid,
     4096,
     1024,
   );
-  assertEquals(readJson(memory, 4096, deniedLen), { pid: childPid, exit_code: -1 });
+  assertEquals(readJson(memory, 4096, deniedLen), {
+    pid: childPid,
+    exit_code: -1,
+  });
   assertEquals(kernel.hasProcess(childPid), true);
 
   const parentImports = createKernelImports({
@@ -195,12 +208,17 @@ Deno.test("kernel host_waitpid only reaps children of the caller", async () => {
     kernel,
     callerPid: parentPid,
   });
-  const waitedLen = await (parentImports.host_waitpid as (...args: number[]) => Promise<number>)(
+  const waitedLen = await (parentImports.host_waitpid as (
+    ...args: number[]
+  ) => Promise<number>)(
     childPid,
     4096,
     1024,
   );
-  assertEquals(readJson(memory, 4096, waitedLen), { pid: childPid, exit_code: 5 });
+  assertEquals(readJson(memory, 4096, waitedLen), {
+    pid: childPid,
+    exit_code: 5,
+  });
   assertEquals(kernel.hasProcess(childPid), false);
   kernel.dispose();
 });
@@ -223,9 +241,18 @@ Deno.test("kernel host_waitpid_nohang distinguishes running from ECHILD", () => 
     callerPid: siblingPid,
   });
 
-  assertEquals((parentImports.host_waitpid_nohang as (pid: number) => number)(childPid), -1);
-  assertEquals((siblingImports.host_waitpid_nohang as (pid: number) => number)(childPid), -2);
-  assertEquals((parentImports.host_waitpid_nohang as (pid: number) => number)(999), -2);
+  assertEquals(
+    (parentImports.host_waitpid_nohang as (pid: number) => number)(childPid),
+    -1,
+  );
+  assertEquals(
+    (siblingImports.host_waitpid_nohang as (pid: number) => number)(childPid),
+    -2,
+  );
+  assertEquals(
+    (parentImports.host_waitpid_nohang as (pid: number) => number)(999),
+    -2,
+  );
   kernel.dispose();
 });
 
@@ -243,20 +270,34 @@ Deno.test("kernel host_waitpid_nohang reaps any exited child for pid -1", () => 
     callerPid: parentPid,
   });
 
-  const written = (imports.host_waitpid_nohang as (pid: number, outPtr: number, outCap: number) => number)(
+  const written = (imports.host_waitpid_nohang as (
+    pid: number,
+    outPtr: number,
+    outCap: number,
+  ) => number)(
     -1,
     4096,
     1024,
   );
 
-  assertEquals(readJson(memory, 4096, written), { pid: exitedPid, exit_code: 8 });
+  assertEquals(readJson(memory, 4096, written), {
+    pid: exitedPid,
+    exit_code: 8,
+  });
   assertEquals(kernel.hasProcess(exitedPid), false);
   assertEquals(kernel.hasProcess(runningPid), true);
-  assertEquals((imports.host_waitpid_nohang as (pid: number, outPtr: number, outCap: number) => number)(
+  assertEquals(
+    (imports.host_waitpid_nohang as (
+      pid: number,
+      outPtr: number,
+      outCap: number,
+    ) => number)(
+      -1,
+      4096,
+      1024,
+    ),
     -1,
-    4096,
-    1024,
-  ), -1);
+  );
   kernel.dispose();
 });
 
@@ -273,17 +314,31 @@ Deno.test("kernel host_waitpid_nohang returns ECHILD for wait-any when no childr
     callerPid: parentPid,
   });
 
-  const written = (imports.host_waitpid_nohang as (pid: number, outPtr: number, outCap: number) => number)(
+  const written = (imports.host_waitpid_nohang as (
+    pid: number,
+    outPtr: number,
+    outCap: number,
+  ) => number)(
     -1,
     4096,
     1024,
   );
-  assertEquals(readJson(memory, 4096, written), { pid: childPid, exit_code: 0 });
-  assertEquals((imports.host_waitpid_nohang as (pid: number, outPtr: number, outCap: number) => number)(
-    -1,
-    4096,
-    1024,
-  ), -2);
+  assertEquals(readJson(memory, 4096, written), {
+    pid: childPid,
+    exit_code: 0,
+  });
+  assertEquals(
+    (imports.host_waitpid_nohang as (
+      pid: number,
+      outPtr: number,
+      outCap: number,
+    ) => number)(
+      -1,
+      4096,
+      1024,
+    ),
+    -2,
+  );
   kernel.dispose();
 });
 
@@ -294,12 +349,70 @@ Deno.test("kernel host_get_local_addr reports configured sandbox address", () =>
     socketLocalHost: "10.8.0.42",
   });
 
-  const written = (imports.host_get_local_addr as (outPtr: number, outCap: number) => number)(
-    4096,
-    1024,
-  );
+  const written =
+    (imports.host_get_local_addr as (outPtr: number, outCap: number) => number)(
+      4096,
+      1024,
+    );
 
   assertEquals(readString(memory, 4096, written), "10.8.0.42");
+});
+
+Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local address locally", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const imports = createKernelImports({ memory, socketLocalHost: "10.8.0.42" });
+
+  let hostLen = writeString(memory, 0, "localhost");
+  let written =
+    await (imports.host_dns_resolve as (...args: number[]) => Promise<number>)(
+      0,
+      hostLen,
+      4096,
+      1024,
+    );
+  assertEquals(readString(memory, 4096, written), "127.0.0.1");
+
+  hostLen = writeString(memory, 0, "10.8.0.42");
+  written =
+    await (imports.host_dns_resolve as (...args: number[]) => Promise<number>)(
+      0,
+      hostLen,
+      4096,
+      1024,
+    );
+  assertEquals(readString(memory, 4096, written), "10.8.0.42");
+});
+
+Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for socket-backed guests", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const socketBackend: SocketBackend = {
+    connect: () => ({ ok: false, error: "unused" }),
+    send: () => ({ ok: false, error: "unused" }),
+    recv: () => ({ ok: false, error: "unused" }),
+    close: () => ({ ok: true }),
+  };
+  const imports = createKernelImports({ memory, socketBackend });
+  const hostLen = writeString(memory, 0, "nonexistent-yurt.invalid");
+
+  const firstLen =
+    await (imports.host_dns_resolve as (...args: number[]) => Promise<number>)(
+      0,
+      hostLen,
+      4096,
+      1024,
+    );
+  const first = readString(memory, 4096, firstLen);
+  const secondLen =
+    await (imports.host_dns_resolve as (...args: number[]) => Promise<number>)(
+      0,
+      hostLen,
+      8192,
+      1024,
+    );
+  const second = readString(memory, 8192, secondLen);
+
+  assertEquals(first.startsWith("10.0.2."), true);
+  assertEquals(second, first);
 });
 
 Deno.test("host_chmod allows the file owner and denies non-owners", () => {
@@ -310,14 +423,25 @@ Deno.test("host_chmod allows the file owner and denies non-owners", () => {
     vfs.writeFile("/tmp/root-owned.txt", new Uint8Array(1));
   });
 
-  const imports = createKernelImports({ memory, vfs, callerUid: 1000, callerGid: 1000 });
+  const imports = createKernelImports({
+    memory,
+    vfs,
+    callerUid: 1000,
+    callerGid: 1000,
+  });
 
   let pathLen = writeString(memory, 0, "/tmp/user-owned.txt");
-  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o444), 0);
+  assertEquals(
+    (imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o444),
+    0,
+  );
   assertEquals(vfs.stat("/tmp/user-owned.txt").permissions, 0o444);
 
   pathLen = writeString(memory, 0, "/tmp/root-owned.txt");
-  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777), -2);
+  assertEquals(
+    (imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777),
+    -2,
+  );
   assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
 });
 
@@ -329,10 +453,19 @@ Deno.test("host_chmod trusts kernel credentials over caller-supplied uid", () =>
   });
   const kernel = new ProcessKernel();
   const pid = kernel.allocPid(1, "guest");
-  const imports = createKernelImports({ memory, vfs, kernel, callerPid: pid, callerUid: 0 });
+  const imports = createKernelImports({
+    memory,
+    vfs,
+    kernel,
+    callerPid: pid,
+    callerUid: 0,
+  });
 
   const pathLen = writeString(memory, 0, "/tmp/root-owned.txt");
-  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777), -2);
+  assertEquals(
+    (imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777),
+    -2,
+  );
   assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
 });
 
@@ -345,27 +478,62 @@ Deno.test("host_chmod stats paths using caller credentials", () => {
     vfs.writeFile("/root-only/conf.txt", new Uint8Array(1));
     vfs.chmod("/root-only/conf.txt", 0o644);
   });
-  const imports = createKernelImports({ memory, vfs, callerUid: 0, callerGid: 0 });
+  const imports = createKernelImports({
+    memory,
+    vfs,
+    callerUid: 0,
+    callerGid: 0,
+  });
 
   const pathLen = writeString(memory, 0, "/root-only/conf.txt");
-  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o600), 0);
-  assertEquals(vfs.withCredential({ uid: 0, gid: 0 }, () => vfs.stat("/root-only/conf.txt").permissions), 0o600);
+  assertEquals(
+    (imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o600),
+    0,
+  );
+  assertEquals(
+    vfs.withCredential(
+      { uid: 0, gid: 0 },
+      () => vfs.stat("/root-only/conf.txt").permissions,
+    ),
+    0o600,
+  );
 });
 
 Deno.test("host_chmod and host_chown apply root kernel credentials to overlay VFS", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const base = new MemoryRoot();
   base.addDir("/etc", { uid: 0, gid: 0, permissions: 0o755 });
-  base.addFile("/etc/root.conf", "root", { uid: 0, gid: 0, permissions: 0o644 });
+  base.addFile("/etc/root.conf", "root", {
+    uid: 0,
+    gid: 0,
+    permissions: 0o644,
+  });
   const vfs = new OverlayVFS({ base, upper: new VFS() });
   const kernel = new ProcessKernel();
   const rootPid = 1;
-  const imports = createKernelImports({ memory, vfs, kernel, callerPid: rootPid });
+  const imports = createKernelImports({
+    memory,
+    vfs,
+    kernel,
+    callerPid: rootPid,
+  });
 
   let pathLen = writeString(memory, 0, "/etc/root.conf");
-  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o600), 0);
+  assertEquals(
+    (imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o600),
+    0,
+  );
   pathLen = writeString(memory, 0, "/etc/root.conf");
-  assertEquals((imports.host_chown as (...args: number[]) => number)(0, pathLen, 1000, 1000, 1), 0);
+  assertEquals(
+    (imports.host_chown as (...args: number[]) => number)(
+      0,
+      pathLen,
+      1000,
+      1000,
+      1,
+    ),
+    0,
+  );
 
   assertEquals(vfs.stat("/etc/root.conf").permissions, 0o600);
   assertEquals(vfs.stat("/etc/root.conf").uid, 1000);
@@ -381,13 +549,41 @@ Deno.test("host_chown is root-only and mutates inode ownership", () => {
   vfs.writeFile("/tmp/owned.txt", new Uint8Array(1));
 
   let pathLen = writeString(memory, 0, "/tmp/owned.txt");
-  const userImports = createKernelImports({ memory, vfs, callerUid: 1000, callerGid: 1000 });
-  assertEquals((userImports.host_chown as (...args: number[]) => number)(0, pathLen, 2000, 2000, 1), -2);
+  const userImports = createKernelImports({
+    memory,
+    vfs,
+    callerUid: 1000,
+    callerGid: 1000,
+  });
+  assertEquals(
+    (userImports.host_chown as (...args: number[]) => number)(
+      0,
+      pathLen,
+      2000,
+      2000,
+      1,
+    ),
+    -2,
+  );
   assertEquals(vfs.stat("/tmp/owned.txt").uid, 1000);
 
   pathLen = writeString(memory, 0, "/tmp/owned.txt");
-  const rootImports = createKernelImports({ memory, vfs, callerUid: 0, callerGid: 0 });
-  assertEquals((rootImports.host_chown as (...args: number[]) => number)(0, pathLen, 2000, 2000, 1), 0);
+  const rootImports = createKernelImports({
+    memory,
+    vfs,
+    callerUid: 0,
+    callerGid: 0,
+  });
+  assertEquals(
+    (rootImports.host_chown as (...args: number[]) => number)(
+      0,
+      pathLen,
+      2000,
+      2000,
+      1,
+    ),
+    0,
+  );
   assertEquals(vfs.stat("/tmp/owned.txt").uid, 2000);
   assertEquals(vfs.stat("/tmp/owned.txt").gid, 2000);
 });
@@ -398,12 +594,40 @@ Deno.test("host_chown checks credentials before probing paths and supports dangl
   vfs.symlink("/tmp/missing-target.txt", "/tmp/dangling.txt");
 
   let pathLen = writeString(memory, 0, "/tmp/missing.txt");
-  const userImports = createKernelImports({ memory, vfs, callerUid: 1000, callerGid: 1000 });
-  assertEquals((userImports.host_chown as (...args: number[]) => number)(0, pathLen, 2000, 2000, 1), -2);
+  const userImports = createKernelImports({
+    memory,
+    vfs,
+    callerUid: 1000,
+    callerGid: 1000,
+  });
+  assertEquals(
+    (userImports.host_chown as (...args: number[]) => number)(
+      0,
+      pathLen,
+      2000,
+      2000,
+      1,
+    ),
+    -2,
+  );
 
   pathLen = writeString(memory, 0, "/tmp/dangling.txt");
-  const rootImports = createKernelImports({ memory, vfs, callerUid: 0, callerGid: 0 });
-  assertEquals((rootImports.host_chown as (...args: number[]) => number)(0, pathLen, 2000, 2000, 0), 0);
+  const rootImports = createKernelImports({
+    memory,
+    vfs,
+    callerUid: 0,
+    callerGid: 0,
+  });
+  assertEquals(
+    (rootImports.host_chown as (...args: number[]) => number)(
+      0,
+      pathLen,
+      2000,
+      2000,
+      0,
+    ),
+    0,
+  );
   assertEquals(vfs.lstat("/tmp/dangling.txt").uid, 2000);
 });
 
@@ -418,11 +642,28 @@ Deno.test("host_fchown resolves vfs file descriptors through the kernel", () => 
   kernel.setFdTarget(1, fd, createVfsFileTarget(fdTable, fd));
   kernel.setFdTarget(userPid, fd, createVfsFileTarget(fdTable, fd));
 
-  const userImports = createKernelImports({ memory, vfs, kernel, callerPid: userPid, callerUid: 0 });
-  assertEquals((userImports.host_fchown as (...args: number[]) => number)(fd, 2000, 2000), -2);
+  const userImports = createKernelImports({
+    memory,
+    vfs,
+    kernel,
+    callerPid: userPid,
+    callerUid: 0,
+  });
+  assertEquals(
+    (userImports.host_fchown as (...args: number[]) => number)(fd, 2000, 2000),
+    -2,
+  );
 
-  const rootImports = createKernelImports({ memory, vfs, kernel, callerPid: 1 });
-  assertEquals((rootImports.host_fchown as (...args: number[]) => number)(fd, 2000, 2000), 0);
+  const rootImports = createKernelImports({
+    memory,
+    vfs,
+    kernel,
+    callerPid: 1,
+  });
+  assertEquals(
+    (rootImports.host_fchown as (...args: number[]) => number)(fd, 2000, 2000),
+    0,
+  );
   assertEquals(vfs.stat("/tmp/fd-owned.txt").uid, 2000);
   assertEquals(vfs.stat("/tmp/fd-owned.txt").gid, 2000);
 });
@@ -431,7 +672,12 @@ Deno.test("host uid/gid imports are backed by kernel credentials", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const kernel = new ProcessKernel();
   const pid = kernel.allocPid(1, "guest");
-  const imports = createKernelImports({ memory, kernel, callerPid: pid, callerUid: 0 });
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    callerUid: 0,
+  });
 
   assertEquals((imports.host_getuid as () => number)(), 1000);
   assertEquals((imports.host_geteuid as () => number)(), 1000);
@@ -445,13 +691,38 @@ Deno.test("host_setresuid and host_setresgid deny unprivileged root escalation b
   const pid = kernel.allocPid(1, "guest");
   const imports = createKernelImports({ memory, kernel, callerPid: pid });
 
-  assertEquals((imports.host_setresuid as (...args: number[]) => number)(1000, 1000, 1000), 0);
-  assertEquals((imports.host_setresuid as (...args: number[]) => number)(-1, -1, -1), 0);
-  assertEquals((imports.host_setresuid as (...args: number[]) => number)(0, 0, 0), -2);
-  assertEquals((imports.host_setresgid as (...args: number[]) => number)(1000, 1000, 1000), 0);
-  assertEquals((imports.host_setresgid as (...args: number[]) => number)(-1, -1, -1), 0);
-  assertEquals((imports.host_setresgid as (...args: number[]) => number)(0, 0, 0), -2);
-  assertEquals(kernel.getCredentials(pid), { uid: 1000, gid: 1000, euid: 1000, egid: 1000, suid: 1000, sgid: 1000 });
+  assertEquals(
+    (imports.host_setresuid as (...args: number[]) => number)(1000, 1000, 1000),
+    0,
+  );
+  assertEquals(
+    (imports.host_setresuid as (...args: number[]) => number)(-1, -1, -1),
+    0,
+  );
+  assertEquals(
+    (imports.host_setresuid as (...args: number[]) => number)(0, 0, 0),
+    -2,
+  );
+  assertEquals(
+    (imports.host_setresgid as (...args: number[]) => number)(1000, 1000, 1000),
+    0,
+  );
+  assertEquals(
+    (imports.host_setresgid as (...args: number[]) => number)(-1, -1, -1),
+    0,
+  );
+  assertEquals(
+    (imports.host_setresgid as (...args: number[]) => number)(0, 0, 0),
+    -2,
+  );
+  assertEquals(kernel.getCredentials(pid), {
+    uid: 1000,
+    gid: 1000,
+    euid: 1000,
+    egid: 1000,
+    suid: 1000,
+    sgid: 1000,
+  });
 });
 
 Deno.test("root process can change effective credentials for future authorization", () => {
@@ -463,9 +734,15 @@ Deno.test("root process can change effective credentials for future authorizatio
   const kernel = new ProcessKernel();
   const imports = createKernelImports({ memory, vfs, kernel, callerPid: 1 });
 
-  assertEquals((imports.host_setresuid as (...args: number[]) => number)(1000, 1000, 1000), 0);
+  assertEquals(
+    (imports.host_setresuid as (...args: number[]) => number)(1000, 1000, 1000),
+    0,
+  );
   const pathLen = writeString(memory, 0, "/tmp/root-owned.txt");
-  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777), -2);
+  assertEquals(
+    (imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o777),
+    -2,
+  );
   assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
 });
 
@@ -496,18 +773,27 @@ Deno.test("host_chdir stores cwd in kernel process state and validates directori
   const imports = createKernelImports({ memory, vfs, kernel, callerPid: pid });
 
   const dirLen = writeString(memory, 0, "/tmp/cwd-target");
-  assertEquals((imports.host_chdir as (...args: number[]) => number)(0, dirLen), 0);
+  assertEquals(
+    (imports.host_chdir as (...args: number[]) => number)(0, dirLen),
+    0,
+  );
   assertEquals(kernel.getCwd(pid), "/tmp/cwd-target");
 
   const childPid = kernel.allocPid(pid, "child");
   assertEquals(kernel.getCwd(childPid), "/tmp/cwd-target");
 
   const fileLen = writeString(memory, 64, "/tmp/not-a-dir.txt");
-  assertEquals((imports.host_chdir as (...args: number[]) => number)(64, fileLen), -4);
+  assertEquals(
+    (imports.host_chdir as (...args: number[]) => number)(64, fileLen),
+    -4,
+  );
   assertEquals(kernel.getCwd(pid), "/tmp/cwd-target");
 
   const missingLen = writeString(memory, 128, "/tmp/missing-dir");
-  assertEquals((imports.host_chdir as (...args: number[]) => number)(128, missingLen), -1);
+  assertEquals(
+    (imports.host_chdir as (...args: number[]) => number)(128, missingLen),
+    -1,
+  );
 });
 
 Deno.test("host_getcwd writes the caller cwd and reports required size", () => {
@@ -517,10 +803,104 @@ Deno.test("host_getcwd writes the caller cwd and reports required size", () => {
   kernel.setCwd(pid, "/tmp/work");
   const imports = createKernelImports({ memory, kernel, callerPid: pid });
 
-  assertEquals((imports.host_getcwd as (...args: number[]) => number)(0, 5), 10);
-  assertEquals((imports.host_getcwd as (...args: number[]) => number)(0, 32), 10);
-  assertEquals(new TextDecoder().decode(new Uint8Array(memory.buffer, 0, 9)), "/tmp/work");
+  assertEquals(
+    (imports.host_getcwd as (...args: number[]) => number)(0, 5),
+    10,
+  );
+  assertEquals(
+    (imports.host_getcwd as (...args: number[]) => number)(0, 32),
+    10,
+  );
+  assertEquals(
+    new TextDecoder().decode(new Uint8Array(memory.buffer, 0, 9)),
+    "/tmp/work",
+  );
   assertEquals(new Uint8Array(memory.buffer)[9], 0);
+});
+
+Deno.test("host process-group imports enforce session boundaries", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const parent = kernel.allocPid(1, "parent");
+  const child = kernel.allocPid(parent, "child");
+  const imports = createKernelImports({ memory, kernel, callerPid: child });
+
+  assertEquals((imports.host_getpgid as (pid: number) => number)(0), 1);
+  assertEquals((imports.host_getsid as (pid: number) => number)(0), 1);
+  assertEquals((imports.host_setsid as () => number)(), child);
+  assertEquals((imports.host_getpgid as (pid: number) => number)(0), child);
+  assertEquals((imports.host_getsid as (pid: number) => number)(0), child);
+  assertEquals((imports.host_setsid as () => number)(), -1);
+  assertEquals(
+    (imports.host_setpgid as (pid: number, pgid: number) => number)(0, parent),
+    -1,
+  );
+});
+
+Deno.test("host tcsetpgrp rejects missing and cross-session process groups", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const ttyOwner = kernel.allocPid(1, "tty-owner");
+  assertEquals(kernel.setsid(ttyOwner), ttyOwner);
+  kernel.openTtyForProcess(ttyOwner);
+  const foreground = kernel.allocPid(ttyOwner, "foreground");
+  const otherSession = kernel.allocPid(1, "other-session");
+  const imports = createKernelImports({ memory, kernel, callerPid: ttyOwner });
+
+  assertEquals((imports.host_tiocsctty as (fd: number) => number)(0), 0);
+  assertEquals(
+    (imports.host_setpgid as (pid: number, pgid: number) => number)(
+      foreground,
+      foreground,
+    ),
+    0,
+  );
+  assertEquals(kernel.setsid(otherSession), otherSession);
+
+  assertEquals(
+    (imports.host_tcsetpgrp as (fd: number, pgid: number) => number)(
+      0,
+      foreground,
+    ),
+    0,
+  );
+  assertEquals(
+    (imports.host_tcgetpgrp as (fd: number) => number)(0),
+    foreground,
+  );
+
+  assertEquals(
+    (imports.host_tcsetpgrp as (fd: number, pgid: number) => number)(0, 9999),
+    -1,
+  );
+  assertEquals(
+    (imports.host_tcgetpgrp as (fd: number) => number)(0),
+    foreground,
+  );
+
+  assertEquals(
+    (imports.host_tcsetpgrp as (fd: number, pgid: number) => number)(
+      0,
+      otherSession,
+    ),
+    -1,
+  );
+  assertEquals(
+    (imports.host_tcgetpgrp as (fd: number) => number)(0),
+    foreground,
+  );
+});
+
+Deno.test("host tiocsctty requires a session leader", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  kernel.openTtyForProcess(pid);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals((imports.host_tiocsctty as (fd: number) => number)(0), -1);
+  assertEquals((imports.host_setsid as () => number)(), pid);
+  assertEquals((imports.host_tiocsctty as (fd: number) => number)(0), 0);
 });
 
 Deno.test("host_setpriority reports unsupported when no scheduler backend can apply the change", () => {
@@ -529,8 +909,14 @@ Deno.test("host_setpriority reports unsupported when no scheduler backend can ap
   const pid = kernel.allocPid(1, "guest");
   const imports = createKernelImports({ memory, kernel, callerPid: pid });
 
-  assertEquals((imports.host_getpriority as (...args: number[]) => number)(0, 0), 0);
-  assertEquals((imports.host_setpriority as (...args: number[]) => number)(0, 0, 5), -38);
+  assertEquals(
+    (imports.host_getpriority as (...args: number[]) => number)(0, 0),
+    0,
+  );
+  assertEquals(
+    (imports.host_setpriority as (...args: number[]) => number)(0, 0, 5),
+    -38,
+  );
   assertEquals(kernel.getPriority(pid), 0);
 });
 
@@ -554,8 +940,14 @@ Deno.test("host_setpriority applies through an explicit scheduler backend", () =
     runtimeBackend,
   });
 
-  assertEquals((imports.host_setpriority as (...args: number[]) => number)(0, 0, 7), 0);
-  assertEquals((imports.host_getpriority as (...args: number[]) => number)(0, 0), 7);
+  assertEquals(
+    (imports.host_setpriority as (...args: number[]) => number)(0, 0, 7),
+    0,
+  );
+  assertEquals(
+    (imports.host_getpriority as (...args: number[]) => number)(0, 0),
+    7,
+  );
   assertEquals(calls, [{ pid, nice: 7 }]);
 });
 
@@ -565,13 +957,35 @@ Deno.test("host scheduler policy reports metadata and rejects unsupported change
   const pid = kernel.allocPid(1, "guest");
   const imports = createKernelImports({ memory, kernel, callerPid: pid });
 
-  assertEquals((imports.host_sched_getscheduler as (...args: number[]) => number)(0), 0);
-  assertEquals((imports.host_sched_getparam as (...args: number[]) => number)(0), 0);
-  assertEquals((imports.host_sched_setscheduler as (...args: number[]) => number)(0, 0, 0), 0);
-  assertEquals((imports.host_sched_setparam as (...args: number[]) => number)(0, 0), 0);
-  assertEquals((imports.host_sched_setscheduler as (...args: number[]) => number)(0, 1, 1), -2);
+  assertEquals(
+    (imports.host_sched_getscheduler as (...args: number[]) => number)(0),
+    0,
+  );
+  assertEquals(
+    (imports.host_sched_getparam as (...args: number[]) => number)(0),
+    0,
+  );
+  assertEquals(
+    (imports.host_sched_setscheduler as (...args: number[]) => number)(0, 0, 0),
+    0,
+  );
+  assertEquals(
+    (imports.host_sched_setparam as (...args: number[]) => number)(0, 0),
+    0,
+  );
+  assertEquals(
+    (imports.host_sched_setscheduler as (...args: number[]) => number)(0, 1, 1),
+    -2,
+  );
   const rootImports = createKernelImports({ memory, kernel, callerPid: 1 });
-  assertEquals((rootImports.host_sched_setscheduler as (...args: number[]) => number)(1, 1, 1), -38);
+  assertEquals(
+    (rootImports.host_sched_setscheduler as (...args: number[]) => number)(
+      1,
+      1,
+      1,
+    ),
+    -38,
+  );
   assertEquals(kernel.getScheduler(pid), { policy: 0, priority: 0 });
 });
 
@@ -585,7 +999,11 @@ Deno.test("host scheduler policy applies through an explicit scheduler backend",
         return { ok: true };
       },
       setScheduler(request) {
-        calls.push({ pid: request.targetPid, policy: request.policy, priority: request.priority });
+        calls.push({
+          pid: request.targetPid,
+          policy: request.policy,
+          priority: request.priority,
+        });
         return { ok: true };
       },
     },
@@ -597,10 +1015,22 @@ Deno.test("host scheduler policy applies through an explicit scheduler backend",
     runtimeBackend,
   });
 
-  assertEquals((imports.host_sched_setscheduler as (...args: number[]) => number)(1, 1, 4), 0);
-  assertEquals((imports.host_sched_getscheduler as (...args: number[]) => number)(1), 1);
-  assertEquals((imports.host_sched_getparam as (...args: number[]) => number)(1), 4);
-  assertEquals((imports.host_sched_setparam as (...args: number[]) => number)(1, 5), 0);
+  assertEquals(
+    (imports.host_sched_setscheduler as (...args: number[]) => number)(1, 1, 4),
+    0,
+  );
+  assertEquals(
+    (imports.host_sched_getscheduler as (...args: number[]) => number)(1),
+    1,
+  );
+  assertEquals(
+    (imports.host_sched_getparam as (...args: number[]) => number)(1),
+    4,
+  );
+  assertEquals(
+    (imports.host_sched_setparam as (...args: number[]) => number)(1, 5),
+    0,
+  );
   assertEquals(kernel.getScheduler(1), { policy: 1, priority: 5 });
   assertEquals(calls, [
     { pid: 1, policy: 1, priority: 4 },
@@ -615,12 +1045,21 @@ Deno.test("host rlimit stores process-local limits inherited by children", () =>
   const parentPid = kernel.allocPid(1, "parent");
   const imports = createKernelImports({ memory, kernel, callerPid: parentPid });
 
-  assertEquals((imports.host_getrlimit as (...args: number[]) => number)(7, 64), 0);
+  assertEquals(
+    (imports.host_getrlimit as (...args: number[]) => number)(7, 64),
+    0,
+  );
   assertEquals(view.getBigUint64(64, true), 1024n);
   assertEquals(view.getBigUint64(72, true), 1024n);
 
-  assertEquals((imports.host_setrlimit as (...args: unknown[]) => number)(7, 4n, 1024n), 0);
-  assertEquals((imports.host_getrlimit as (...args: number[]) => number)(7, 64), 0);
+  assertEquals(
+    (imports.host_setrlimit as (...args: unknown[]) => number)(7, 4n, 1024n),
+    0,
+  );
+  assertEquals(
+    (imports.host_getrlimit as (...args: number[]) => number)(7, 64),
+    0,
+  );
   assertEquals(view.getBigUint64(64, true), 4n);
   assertEquals(view.getBigUint64(72, true), 1024n);
 
@@ -637,8 +1076,18 @@ Deno.test("host rlimit preserves 64-bit values and RLIM_INFINITY", () => {
   const fiveGiB = 5n * 1024n * 1024n * 1024n;
   const infinity = 0xffff_ffff_ffff_ffffn;
 
-  assertEquals((imports.host_setrlimit as (...args: unknown[]) => number)(0, fiveGiB, infinity), 0);
-  assertEquals((imports.host_getrlimit as (...args: number[]) => number)(0, 64), 0);
+  assertEquals(
+    (imports.host_setrlimit as (...args: unknown[]) => number)(
+      0,
+      fiveGiB,
+      infinity,
+    ),
+    0,
+  );
+  assertEquals(
+    (imports.host_getrlimit as (...args: number[]) => number)(0, 64),
+    0,
+  );
   assertEquals(view.getBigUint64(64, true), fiveGiB);
   assertEquals(view.getBigUint64(72, true), infinity);
 });
@@ -649,7 +1098,10 @@ Deno.test("host_setrlimit reports EPERM when a user raises the hard limit", () =
   const userPid = kernel.allocPid(1, "user");
   const imports = createKernelImports({ memory, kernel, callerPid: userPid });
 
-  assertEquals((imports.host_setrlimit as (...args: unknown[]) => number)(7, 1024n, 2048n), -2);
+  assertEquals(
+    (imports.host_setrlimit as (...args: unknown[]) => number)(7, 1024n, 2048n),
+    -2,
+  );
   assertEquals(kernel.getResourceLimit(userPid, 7), { soft: 1024, hard: 1024 });
 });
 
@@ -665,7 +1117,13 @@ Deno.test("host_dup2 closes overwritten WasiHost ioFds target", () => {
     [2, oldTarget],
   ]);
   const srcTarget = ioFds.get(1)! as FdTarget & { type: "vfs_file" };
-  const wasiHost = new WasiHost({ vfs, args: [], env: {}, preopens: {}, ioFds });
+  const wasiHost = new WasiHost({
+    vfs,
+    args: [],
+    env: {},
+    preopens: {},
+    ioFds,
+  });
   const imports = createKernelImports({ memory, wasiHost });
 
   assertEquals((imports.host_dup2 as (...args: number[]) => number)(1, 2), 0);
@@ -683,7 +1141,10 @@ Deno.test("host_dup2 does not duplicate refcounts twice when WasiHost uses the k
   const pid = 1;
   vfs.writeFile("/tmp/shared.txt", new Uint8Array(1));
   vfs.writeFile("/tmp/old-shared.txt", new Uint8Array(1));
-  const srcTarget = createVfsFileTarget(fdTable, fdTable.open("/tmp/shared.txt", "r"));
+  const srcTarget = createVfsFileTarget(
+    fdTable,
+    fdTable.open("/tmp/shared.txt", "r"),
+  );
   const oldFd = fdTable.open("/tmp/old-shared.txt", "r");
   const oldTarget = createVfsFileTarget(fdTable, oldFd);
   kernel.setFdTarget(pid, 1, srcTarget);
@@ -697,7 +1158,12 @@ Deno.test("host_dup2 does not duplicate refcounts twice when WasiHost uses the k
     kernel,
     pid,
   });
-  const imports = createKernelImports({ memory, kernel, callerPid: pid, wasiHost });
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    wasiHost,
+  });
 
   assertEquals((imports.host_dup2 as (...args: number[]) => number)(1, 2), 0);
   assertEquals(srcTarget.refs, 2);
@@ -726,9 +1192,14 @@ Deno.test("host_spawn rejects nonzero nice when the engine has no scheduler back
     kernel,
     callerPid: parentPid,
     spawnProcess: () => {
-      throw new Error("spawnProcess should not run when scheduler support is absent");
+      throw new Error(
+        "spawnProcess should not run when scheduler support is absent",
+      );
     },
   });
 
-  assertEquals((imports.host_spawn as (...args: number[]) => number)(0, reqLen), -38);
+  assertEquals(
+    (imports.host_spawn as (...args: number[]) => number)(0, reqLen),
+    -38,
+  );
 });

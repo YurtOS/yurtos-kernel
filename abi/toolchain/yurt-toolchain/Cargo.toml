@@ -1,0 +1,53 @@
+[package]
+name = "yurt-toolchain"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Clang wrapper and companion tooling for the yurt kernel ABI runtime."
+
+[[bin]]
+name = "yurt-cc"
+path = "src/main.rs"
+
+[[bin]]
+name = "yurt-ar"
+path = "src/bin/yurt-ar.rs"
+
+[[bin]]
+name = "yurt-ld"
+path = "src/bin/ld.rs"
+
+[[bin]]
+name = "yurt-ranlib"
+path = "src/bin/yurt-ranlib.rs"
+
+[[bin]]
+name = "yurt-check"
+path = "src/bin/yurt-check.rs"
+
+[[bin]]
+name = "yurt-conf"
+path = "src/bin/yurt-conf.rs"
+
+[[bin]]
+name = "cargo-yurt"
+path = "src/bin/cargo-yurt.rs"
+
+[[bin]]
+name = "maturin-yurt"
+path = "src/bin/maturin-yurt.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+which = "6"
+wasmparser = "0.247.0"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
