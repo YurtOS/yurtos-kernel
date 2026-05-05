@@ -336,6 +336,22 @@ Deno.test("host_chmod trusts kernel credentials over caller-supplied uid", () =>
   assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
 });
 
+Deno.test("host_chmod stats paths using caller credentials", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.withWriteAccess(() => {
+    vfs.mkdirp("/root-only");
+    vfs.chmod("/root-only", 0o700);
+    vfs.writeFile("/root-only/conf.txt", new Uint8Array(1));
+    vfs.chmod("/root-only/conf.txt", 0o644);
+  });
+  const imports = createKernelImports({ memory, vfs, callerUid: 0, callerGid: 0 });
+
+  const pathLen = writeString(memory, 0, "/root-only/conf.txt");
+  assertEquals((imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o600), 0);
+  assertEquals(vfs.withCredential({ uid: 0, gid: 0 }, () => vfs.stat("/root-only/conf.txt").permissions), 0o600);
+});
+
 Deno.test("host_chmod and host_chown apply root kernel credentials to overlay VFS", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const base = new MemoryRoot();

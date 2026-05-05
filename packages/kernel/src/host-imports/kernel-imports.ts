@@ -1759,12 +1759,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (!opts.vfs) return ERR_IO;
       const path = readString(memory, pathPtr, pathLen);
       try {
-        const stat = opts.vfs.stat(path);
         const credentials = getCallerCredentials();
-        if (credentials.euid !== ROOT_UID && stat.uid !== credentials.euid) {
-          return ERR_PERMISSION;
-        }
-        withVfsCallerCredentials(() => opts.vfs!.chmod(path, mode));
+        const authorized = withVfsCallerCredentials(() => {
+          const stat = opts.vfs!.stat(path);
+          if (credentials.euid !== ROOT_UID && stat.uid !== credentials.euid) {
+            return false;
+          }
+          opts.vfs!.chmod(path, mode);
+          return true;
+        });
+        if (!authorized) return ERR_PERMISSION;
         return 0;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : '';
