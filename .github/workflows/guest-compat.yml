@@ -77,3 +77,6 @@ jobs:
 
       - name: Run adversarial security tests
         run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/security-adversarial.test.ts
+
+      - name: Run kernel unit tests
+        run: deno test --no-check --allow-read --allow-env packages/kernel/src/wasi/__tests__/errors.test.ts packages/kernel/src/network/__tests__/host-match.test.ts packages/kernel/src/network/__tests__/gateway.test.ts packages/kernel/src/network/__tests__/gateway-sensitive-headers.test.ts packages/kernel/src/process/threads/__tests__/indirect-call-table.test.ts packages/kernel/src/__tests__/persistence-overlay.test.ts

@@ -4,7 +4,7 @@
 
 Make the currently advertised POSIX/Linux compatibility surface honest,
 specified, and covered before widening it. The first slice targets APIs that are
-small enough to implement inside `libyurt_guest_compat.a` without new kernel
+small enough to implement inside `libyurt_abi.a` without new kernel
 architecture: hostname, loopback interface lookup, `sendfile`, and stale
 documentation around sockets, exec, fork, pthreads, and the renamed toolchain.
 
@@ -46,5 +46,5 @@ documentation around sockets, exec, fork, pthreads, and the renamed toolchain.
 - Keep signature coverage in `canary_symbol_map()` synchronized with new real
   symbols.
 - Run `cargo test -p yurt-toolchain` after conformance/toolchain edits.
-- Run the guest compat build/spec path when the local WASI/wasmtime toolchain is
+- Run the ABI build/spec path when the local WASI/wasmtime toolchain is
   available.
