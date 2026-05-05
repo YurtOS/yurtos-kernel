@@ -42,6 +42,17 @@ const MAX_REDIRECTS = 5;
 /** HTTP status codes that indicate a redirect. */
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
+/** Headers that must not survive a cross-origin redirect. */
+const SENSITIVE_HEADER_NAMES = ['authorization', 'cookie'];
+
+function stripSensitiveHeaders(headers: Record<string, string>): void {
+  for (const key of Object.keys(headers)) {
+    if (SENSITIVE_HEADER_NAMES.includes(key.toLowerCase())) {
+      delete headers[key];
+    }
+  }
+}
+
 export class NetworkGateway {
   private policy: NetworkPolicy;
 
@@ -101,6 +112,8 @@ export class NetworkGateway {
     let currentMethod = options?.method ?? 'GET';
     let currentBody: BodyInit | null | undefined = options?.body;
 
+    const originalHost = this.extractHost(url);
+
     let redirectCount = 0;
 
     for (;;) {
@@ -113,6 +126,16 @@ export class NetworkGateway {
           for (const [k, v] of h) { headers[k] = v; }
         } else {
           Object.assign(headers, h);
+        }
+      }
+
+      // Cross-origin redirect: drop credentials so a redirect target inside
+      // the allow-list cannot harvest tokens meant for the original origin.
+      // Mirrors the Worker bridge in network/bridge.ts.
+      if (redirectCount > 0 && originalHost !== null) {
+        const currentHost = this.extractHost(currentUrl);
+        if (currentHost !== null && currentHost !== originalHost) {
+          stripSensitiveHeaders(headers);
         }
       }
 
@@ -132,6 +155,7 @@ export class NetworkGateway {
 
       const resp = await globalThis.fetch(currentUrl, {
         ...options,
+        headers,
         method: currentMethod,
         body: currentBody,
         redirect: 'manual',
