@@ -1603,12 +1603,16 @@ export class Sandbox {
    */
   openTty(rows = 24, cols = 80): TtyHandle {
     this.assertAlive();
+    const pid = this.bootProcess.pid;
+    if (this.kernel.getsid(pid) !== pid && this.kernel.setsid(pid) !== pid) {
+      throw new Error(`failed to create session for pid ${pid}`);
+    }
     const state = this.kernel.openTtyForProcess(this.bootProcess.pid);
     if (
-      this.kernel.setControllingTty(this.bootProcess.pid, state.ttyId) !== 0
+      this.kernel.setControllingTty(pid, state.ttyId) !== 0
     ) {
       throw new Error(
-        `failed to set controlling terminal for pid ${this.bootProcess.pid}`,
+        `failed to set controlling terminal for pid ${pid}`,
       );
     }
     state.rows = rows;

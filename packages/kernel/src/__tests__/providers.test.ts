@@ -495,6 +495,12 @@ describe('providers via Sandbox.run()', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('null');
   });
+
+  it('openTty creates a controlling terminal for the boot process', async () => {
+    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+
+    expect(() => sandbox.openTty()).not.toThrow();
+  });
 });
 
 describe('providers after snapshot/restore and fork', () => {
