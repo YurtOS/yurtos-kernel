@@ -5,11 +5,11 @@
  * default embedding boots /bin/bash, but the kernel path is not bash-specific.
  */
 
-import { VFS } from './vfs/vfs.js';
-import { OverlayVFS } from './vfs/overlay-vfs.js';
-import { NodeDirectoryRootProvider } from './vfs/node-directory-root-provider.js';
-import { YURT_VERSION } from './version.js';
-import { ProcessManager } from './process/manager.js';
+import { VFS } from "./vfs/vfs.js";
+import { OverlayVFS } from "./vfs/overlay-vfs.js";
+import { NodeDirectoryRootProvider } from "./vfs/node-directory-root-provider.js";
+import { YURT_VERSION } from "./version.js";
+import { ProcessManager } from "./process/manager.js";
 /** Streaming callbacks for `Sandbox.run()`. Chunks are decoded UTF-8 strings. */
 export interface StreamCallbacks {
   onStdout?: (chunk: string) => void;
@@ -21,41 +21,72 @@ export interface StorageCallbacks {
   save: (sandboxId: string, state: Uint8Array) => Promise<void>;
   load: (sandboxId: string) => Promise<Uint8Array>;
 }
-import type { RunResult } from './run-result.js';
-import type { PlatformAdapter } from './platform/adapter.js';
-import type { Process } from './process/handle.js';
-import type { ProcessMode } from './process/handle.js';
-import { INIT_PID, ProcessKernel, ROOT_UID, type ProcessCredentials, type SpawnRequest } from './process/kernel.js';
-import { loadProcess, type LoaderContext } from './process/loader.js';
-import type { DirEntry, StatResult } from './vfs/inode.js';
-import type { VfsLike } from './vfs/vfs-like.js';
-import { NetworkGateway } from './network/gateway.js';
-import type { NetworkPolicy } from './network/gateway.js';
-import { NetworkBridge, type NetworkBridgeLike } from './network/bridge.js';
-import type { SocketBackend, SocketListenPolicy } from './network/socket-backend.js';
-import { getSocketShimSource, getSslShimSource, buildSiteCustomizeSource, getRequestsShimSource } from './network/socket-shim.js';
-import type { SecurityOptions, AuditEventHandler } from './security.js';
-import { CancelledError } from './security.js';
-import type { WorkerExecutor } from './execution/worker-executor.js';
-import { exportState as serializerExportState, importState as serializerImportState } from './persistence/serializer.js';
-import type { PersistenceOptions } from './persistence/types.js';
-import { PersistenceManager } from './persistence/manager.js';
-import { HostMount } from './vfs/host-mount.js';
-import type { VirtualProvider } from './vfs/provider.js';
-import { ExtensionRegistry } from './extension/registry.js';
-import type { ExtensionConfig } from './extension/types.js';
-import { YURT_EXT_SOURCE, generateCommandShim } from './extension/yurt-ext-shim.js';
-import { SUBPROCESS_PY_SOURCE } from './process/subprocess-shim.js';
-import { PackageRegistry } from './packages/registry.js';
-import { ToolRegistry } from './packages/tool-registry.js';
-import { applyManifest, loadManifest } from './packages/manifest.js';
-import { MemoryProxy, type KernelApi } from './kernel-api.js';
-import { createKernelImports } from './host-imports/kernel-imports.js';
-import { WasiHost } from './wasi/wasi-host.js';
-import { bufferToString, createBufferTarget, TtyHandle, type FdTarget } from './wasi/fd-target.js';
-import type { RunCommandHandler } from './run-command.js';
-import { normalizeNice, unsupportedRuntimeEngineBackend, type RuntimeEngineBackend } from './engine/backend.js';
-import { defaultWasmModuleCache, type WasmModuleCache } from './process/module-cache.js';
+import type { RunResult } from "./run-result.js";
+import type { PlatformAdapter } from "./platform/adapter.js";
+import type { Process } from "./process/handle.js";
+import type { ProcessMode } from "./process/handle.js";
+import {
+  INIT_PID,
+  type ProcessCredentials,
+  ProcessKernel,
+  ROOT_UID,
+  type SpawnRequest,
+} from "./process/kernel.js";
+import { type LoaderContext, loadProcess } from "./process/loader.js";
+import type { DirEntry, StatResult } from "./vfs/inode.js";
+import type { VfsLike } from "./vfs/vfs-like.js";
+import { NetworkGateway } from "./network/gateway.js";
+import type { NetworkPolicy } from "./network/gateway.js";
+import { NetworkBridge, type NetworkBridgeLike } from "./network/bridge.js";
+import type {
+  SocketBackend,
+  SocketListenPolicy,
+} from "./network/socket-backend.js";
+import {
+  buildSiteCustomizeSource,
+  getRequestsShimSource,
+  getSocketShimSource,
+  getSslShimSource,
+} from "./network/socket-shim.js";
+import type { AuditEventHandler, SecurityOptions } from "./security.js";
+import { CancelledError } from "./security.js";
+import type { WorkerExecutor } from "./execution/worker-executor.js";
+import {
+  exportState as serializerExportState,
+  importState as serializerImportState,
+} from "./persistence/serializer.js";
+import type { PersistenceOptions } from "./persistence/types.js";
+import { PersistenceManager } from "./persistence/manager.js";
+import { HostMount } from "./vfs/host-mount.js";
+import type { VirtualProvider } from "./vfs/provider.js";
+import { ExtensionRegistry } from "./extension/registry.js";
+import type { ExtensionConfig } from "./extension/types.js";
+import {
+  generateCommandShim,
+  YURT_EXT_SOURCE,
+} from "./extension/yurt-ext-shim.js";
+import { SUBPROCESS_PY_SOURCE } from "./process/subprocess-shim.js";
+import { applyManifest, loadManifest } from "./boot/manifest.js";
+import { ToolRegistry } from "./fixtures/tool-registry.js";
+import { type KernelApi, MemoryProxy } from "./kernel-api.js";
+import { createKernelImports } from "./host-imports/kernel-imports.js";
+import { WasiHost } from "./wasi/wasi-host.js";
+import {
+  bufferToString,
+  createBufferTarget,
+  type FdTarget,
+  TtyHandle,
+} from "./wasi/fd-target.js";
+import type { RunCommandHandler } from "./run-command.js";
+import {
+  normalizeNice,
+  type RuntimeEngineBackend,
+  unsupportedRuntimeEngineBackend,
+} from "./engine/backend.js";
+import {
+  defaultWasmModuleCache,
+  type WasmModuleCache,
+} from "./process/module-cache.js";
 
 /** Describes a set of host-provided files to mount into the VFS. */
 export interface MountConfig {
@@ -110,20 +141,10 @@ export interface SandboxOptions {
   pythonPath?: string[];
   /** Host-provided extensions (custom commands and/or Python packages). */
   extensions?: ExtensionConfig[];
-  /** Sandbox-native packages to install from PackageRegistry (e.g. ['requests', 'pandas']). */
-  packages?: string[];
-  /** Optional WASM tool packages to install from ToolRegistry (e.g. ['pdftotext']). */
+  /** Optional WASM tool bundles to install from ToolRegistry (e.g. ['pdftotext']). */
   tools?: string[];
   /** Callbacks for offloading sandbox state to external storage. */
   storage?: StorageCallbacks;
-  /**
-   * Pre-seed the pip registry cache with a custom index JSON string.
-   * The shell reads this as `/etc/yurt/registry-index.json` on first pip install,
-   * bypassing the remote YURT_REGISTRY fetch. Useful for tests that need a
-   * custom registry without running a local HTTP server (which would be blocked
-   * by Atomics.wait on the main thread when JSPI is active).
-   */
-  _pipRegistryIndex?: string;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -185,7 +206,9 @@ export class Sandbox {
   private persistenceManager: PersistenceManager | null = null;
   private extensionRegistry: ExtensionRegistry | null = null;
   private bootArgv: string[];
-  private bootImports: ((api: KernelApi) => Record<string, WebAssembly.ImportValue>) | undefined;
+  private bootImports:
+    | ((api: KernelApi) => Record<string, WebAssembly.ImportValue>)
+    | undefined;
   private runCommandHandler: RunCommandHandler | undefined;
   private activeDeadlineMs: number | undefined;
   private envNeedsSync = false;
@@ -208,7 +231,7 @@ export class Sandbox {
     this.runtimeBackend = parts.runtimeBackend;
     this.networkPolicy = parts.networkPolicy;
     this.security = parts.security;
-    this.sessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+    this.sessionId = (typeof crypto !== "undefined" && crypto.randomUUID)
       ? crypto.randomUUID()
       : Math.random().toString(36).slice(2) + Date.now().toString(36);
     this.auditHandler = parts.security?.onAuditEvent;
@@ -269,9 +292,15 @@ export class Sandbox {
     const tools = options.baseRoot
       ? Sandbox.registerBaseRootTools(mgr, vfs)
       : await Sandbox.registerTools(mgr, adapter, options.wasmDir, upper);
-    const runtimeBackend = options.runtimeBackend ?? unsupportedRuntimeEngineBackend;
+    const runtimeBackend = options.runtimeBackend ??
+      unsupportedRuntimeEngineBackend;
     if (!options.baseRoot) {
-      await Sandbox.installCpythonStdlib(upper, adapter, options.wasmDir, tools);
+      await Sandbox.installCpythonStdlib(
+        upper,
+        adapter,
+        options.wasmDir,
+        tools,
+      );
     }
 
     // Register optional WASM tools from ToolRegistry before preloadModules()
@@ -294,13 +323,17 @@ export class Sandbox {
         extensionRegistry.registerBuiltinDiscovery();
       }
       vfs.withWriteAccess(() => {
-        vfs.mkdirp('/usr/extensions');
+        vfs.mkdirp("/usr/extensions");
         for (const ext of extensionRegistry.list()) {
           if (ext.command) {
-            try { vfs.symlink('/bin/host-call', `/usr/extensions/${ext.name}`); } catch { /* already exists */ }
+            try {
+              vfs.symlink("/bin/host-call", `/usr/extensions/${ext.name}`);
+            } catch { /* already exists */ }
           }
         }
-        try { vfs.symlink('/bin/host-call', '/usr/extensions/extensions'); } catch { /* already exists */ }
+        try {
+          vfs.symlink("/bin/host-call", "/usr/extensions/extensions");
+        } catch { /* already exists */ }
       });
     }
 
@@ -308,23 +341,31 @@ export class Sandbox {
     if (options.mounts) {
       for (const mc of options.mounts) {
         const provider = new HostMount(mc.files, { writable: mc.writable });
-        if (!vfs.mount) throw new Error('Configured VFS does not support mounts');
+        if (!vfs.mount) {
+          throw new Error("Configured VFS does not support mounts");
+        }
         vfs.mount(mc.path, provider);
       }
     }
 
-    const baseBootWasmPath = options.bootWasmPath ?? options.shellExecWasmPath ??
+    const baseBootWasmPath = options.bootWasmPath ??
+      options.shellExecWasmPath ??
       `${options.wasmDir}/bash.wasm`;
     // When JSPI is unavailable, prefer the asyncify-instrumented variant.
-    const jspiAvailable = typeof WebAssembly.Suspending === 'function';
-    const asyncifyPath = baseBootWasmPath.replace(/\.wasm$/, '-asyncify.wasm');
+    const jspiAvailable = typeof WebAssembly.Suspending === "function";
+    const asyncifyPath = baseBootWasmPath.replace(/\.wasm$/, "-asyncify.wasm");
     const bootWasmPath = !jspiAvailable
       ? await Sandbox.tryPath(adapter, asyncifyPath) ?? baseBootWasmPath
       : baseBootWasmPath;
-    const bootArgv = options.bootArgv ?? ['/bin/bash'];
+    const bootArgv = options.bootArgv ?? ["/bin/bash"];
 
     if (!options.baseRoot) {
-      await Sandbox.installBootProgram(upper, adapter, bootArgv[0], bootWasmPath);
+      await Sandbox.installBootProgram(
+        upper,
+        adapter,
+        bootArgv[0],
+        bootWasmPath,
+      );
     }
 
     // Pre-load all tool modules so spawnSync can use them synchronously
@@ -360,56 +401,57 @@ export class Sandbox {
 
     const bootProcess = await loadProcess(loaderCtx, {
       argv: bootArgv,
-      mode: 'resident',
+      mode: "resident",
       env: Object.fromEntries(env),
       stdoutLimit: secLimits?.stdoutBytes,
       stderrLimit: secLimits?.stderrBytes,
-      extraYurtImports: Sandbox.createBootImportFactory(vfs, mgr, options.bootImports),
+      extraYurtImports: Sandbox.createBootImportFactory(
+        vfs,
+        mgr,
+        options.bootImports,
+      ),
     });
-    Sandbox.applyOutputLimits(kernel, bootProcess.pid, secLimits?.stdoutBytes, secLimits?.stderrBytes);
+    Sandbox.applyOutputLimits(
+      kernel,
+      bootProcess.pid,
+      secLimits?.stdoutBytes,
+      secLimits?.stderrBytes,
+    );
     processes.set(bootProcess.pid, bootProcess);
-
-    // Install sandbox-native package files into VFS
-    if (options.packages && options.packages.length > 0) {
-      const pkgRegistry = new PackageRegistry();
-      const toInstall = new Set<string>();
-      for (const name of options.packages) {
-        for (const dep of pkgRegistry.resolveDeps(name)) {
-          toInstall.add(dep);
-        }
-      }
-      vfs.withWriteAccess(() => {
-        for (const name of toInstall) {
-          const meta = pkgRegistry.get(name);
-          if (!meta) continue;
-          for (const [relPath, content] of Object.entries(meta.pythonFiles)) {
-            const fullPath = `/usr/lib/python/${relPath}`;
-            const dir = fullPath.substring(0, fullPath.lastIndexOf('/'));
-            vfs.mkdirp(dir);
-            vfs.writeFile(fullPath, new TextEncoder().encode(content));
-          }
-        }
-      });
-    }
 
     // Bootstrap subprocess shim and sitecustomize.py (always installed).
     // If networking is enabled, also install socket/ssl/requests shims.
     {
       const enc = new TextEncoder();
       vfs.withWriteAccess(() => {
-        vfs.mkdirp('/usr/lib/python');
-        vfs.writeFile('/usr/lib/python/subprocess.py', enc.encode(SUBPROCESS_PY_SOURCE));
+        vfs.mkdirp("/usr/lib/python");
+        vfs.writeFile(
+          "/usr/lib/python/subprocess.py",
+          enc.encode(SUBPROCESS_PY_SOURCE),
+        );
         // sitecustomize.py pre-loads our shims into sys.modules at interpreter
         // startup, bypassing RustPython's frozen modules which would otherwise
         // take priority over PYTHONPATH files.
-        vfs.writeFile('/usr/lib/python/sitecustomize.py', enc.encode(buildSiteCustomizeSource({ networking: !!bridge })));
+        vfs.writeFile(
+          "/usr/lib/python/sitecustomize.py",
+          enc.encode(buildSiteCustomizeSource({ networking: !!bridge })),
+        );
         if (bridge) {
-          const networkMode = options.network?.mode ?? 'restricted';
-          vfs.writeFile('/usr/lib/python/socket.py', enc.encode(getSocketShimSource(networkMode)));
-          vfs.writeFile('/usr/lib/python/ssl.py', enc.encode(getSslShimSource()));
+          const networkMode = options.network?.mode ?? "restricted";
+          vfs.writeFile(
+            "/usr/lib/python/socket.py",
+            enc.encode(getSocketShimSource(networkMode)),
+          );
+          vfs.writeFile(
+            "/usr/lib/python/ssl.py",
+            enc.encode(getSslShimSource()),
+          );
           // requests module shim — lightweight requests-compatible API that
           // routes through _yurt.fetch() / http.client via the socket shim
-          vfs.writeFile('/usr/lib/python/requests.py', enc.encode(getRequestsShimSource()));
+          vfs.writeFile(
+            "/usr/lib/python/requests.py",
+            enc.encode(getRequestsShimSource()),
+          );
         }
       });
     }
@@ -425,8 +467,11 @@ export class Sandbox {
     if (extWithPython.length > 0) {
       vfs.withWriteAccess(() => {
         const enc = new TextEncoder();
-        vfs.mkdirp('/usr/lib/python');
-        vfs.writeFile('/usr/lib/python/yurt_ext.py', enc.encode(YURT_EXT_SOURCE));
+        vfs.mkdirp("/usr/lib/python");
+        vfs.writeFile(
+          "/usr/lib/python/yurt_ext.py",
+          enc.encode(YURT_EXT_SOURCE),
+        );
         for (const ext of extWithPython) {
           vfs.mkdirp(`/usr/lib/python/${ext.name}`);
           // Auto-generate _shim.py for any extension with a command handler.
@@ -439,11 +484,16 @@ export class Sandbox {
           if (ext.pythonPackage) {
             // Install author-provided package files (may import from ._shim).
             for (const [fp, src] of Object.entries(ext.pythonPackage.files)) {
-              const parts = fp.split('/');
+              const parts = fp.split("/");
               if (parts.length > 1) {
-                vfs.mkdirp(`/usr/lib/python/${ext.name}/${parts.slice(0, -1).join('/')}`);
+                vfs.mkdirp(
+                  `/usr/lib/python/${ext.name}/${parts.slice(0, -1).join("/")}`,
+                );
               }
-              vfs.writeFile(`/usr/lib/python/${ext.name}/${fp}`, enc.encode(src));
+              vfs.writeFile(
+                `/usr/lib/python/${ext.name}/${fp}`,
+                enc.encode(src),
+              );
             }
           } else if (ext.command) {
             // No explicit package: auto-generate __init__.py that re-exports run().
@@ -451,7 +501,7 @@ export class Sandbox {
               `/usr/lib/python/${ext.name}/__init__.py`,
               enc.encode(
                 `"""Auto-generated package for the '${ext.name}' extension command."""\n` +
-                `from ${ext.name}._shim import run\n\n__all__ = ['run']\n`,
+                  `from ${ext.name}._shim import run\n\n__all__ = ['run']\n`,
               ),
             );
           }
@@ -459,122 +509,145 @@ export class Sandbox {
       });
     }
 
-    // Bootstrap VFS config data for Rust virtual commands (curl/wget/pkg/pip)
+    // Bootstrap VFS config data for system identity files and extension metadata.
     {
       const enc = new TextEncoder();
       vfs.withWriteAccess(() => {
         // Standard /etc files expected by many tools and scripts
-        vfs.writeFile('/etc/os-release', enc.encode([
-          'NAME="Yurt"',
-          'ID=yurt',
-          `PRETTY_NAME="Yurt Sandbox ${YURT_VERSION}"`,
-          `VERSION_ID="${YURT_VERSION}"`,
-          'HOME_URL="https://github.com/yurt-sandbox/yurt"',
-        ].join('\n') + '\n'));
-        vfs.writeFile('/etc/hostname', enc.encode('sandbox\n'));
-        vfs.writeFile('/etc/hosts', enc.encode([
-          '127.0.0.1  localhost',
-          '::1        localhost',
-        ].join('\n') + '\n'));
-        vfs.writeFile('/etc/passwd', enc.encode([
-          'root:x:0:0:root:/root:/bin/sh',
-          'user:x:1000:1000:user:/home/user:/bin/sh',
-        ].join('\n') + '\n'));
-        vfs.writeFile('/etc/group', enc.encode([
-          'root:x:0:',
-          'user:x:1000:',
-        ].join('\n') + '\n'));
-        for (const f of ['/etc/os-release', '/etc/hostname', '/etc/hosts', '/etc/passwd', '/etc/group']) {
+        vfs.writeFile(
+          "/etc/os-release",
+          enc.encode(
+            [
+              'NAME="Yurt"',
+              "ID=yurt",
+              `PRETTY_NAME="Yurt Sandbox ${YURT_VERSION}"`,
+              `VERSION_ID="${YURT_VERSION}"`,
+              'HOME_URL="https://github.com/yurt-sandbox/yurt"',
+            ].join("\n") + "\n",
+          ),
+        );
+        vfs.writeFile("/etc/hostname", enc.encode("sandbox\n"));
+        vfs.writeFile(
+          "/etc/hosts",
+          enc.encode(
+            [
+              "127.0.0.1  localhost",
+              "::1        localhost",
+            ].join("\n") + "\n",
+          ),
+        );
+        vfs.writeFile(
+          "/etc/passwd",
+          enc.encode(
+            [
+              "root:x:0:0:root:/root:/bin/sh",
+              "user:x:1000:1000:user:/home/user:/bin/sh",
+            ].join("\n") + "\n",
+          ),
+        );
+        vfs.writeFile(
+          "/etc/group",
+          enc.encode(
+            [
+              "root:x:0:",
+              "user:x:1000:",
+            ].join("\n") + "\n",
+          ),
+        );
+        for (
+          const f of [
+            "/etc/os-release",
+            "/etc/hostname",
+            "/etc/hosts",
+            "/etc/passwd",
+            "/etc/group",
+          ]
+        ) {
           vfs.chmod(f, 0o444);
         }
 
-        vfs.mkdirp('/etc/yurt');
-
-        // pkg policy
-        const pkgPolicy = options.security?.packagePolicy ?? { enabled: false };
-        vfs.writeFile('/etc/yurt/pkg-policy.json', enc.encode(JSON.stringify(pkgPolicy)));
-
-        // pip policy
-        const pipPolicy = options.security?.pipPolicy ?? { enabled: false };
-        vfs.writeFile('/etc/yurt/pip-policy.json', enc.encode(JSON.stringify(pipPolicy)));
-
-        // pip local registry — intentionally empty; the pip command fetches from
-        // the remote yurt-packages registry (YURT_REGISTRY URL) at install
-        // time. Extension packages are pre-installed at startup and don't need
-        // runtime lookup here.
-        vfs.writeFile('/etc/yurt/pip-registry.json', enc.encode('[]'));
-
-        // pip installed state (include pre-installed packages from options.packages)
-        const preInstalled: { name: string; version: string }[] = [];
-        if (options.packages && options.packages.length > 0) {
-          const preReg = new PackageRegistry();
-          const resolved = new Set<string>();
-          for (const name of options.packages) {
-            for (const dep of preReg.resolveDeps(name)) resolved.add(dep);
-          }
-          for (const name of resolved) {
-            const meta = preReg.get(name);
-            if (meta) preInstalled.push({ name: meta.name, version: meta.version });
-          }
-        }
-        vfs.writeFile('/etc/yurt/pip-installed.json', enc.encode(JSON.stringify(preInstalled)));
+        vfs.mkdirp("/etc/yurt");
 
         // extension metadata
-        const extMeta = extensionRegistry.list().map(e => ({
+        const extMeta = extensionRegistry.list().map((e) => ({
           name: e.name,
           description: e.description,
           hasCommand: !!e.command,
           pythonPackage: e.pythonPackage
-            ? { version: e.pythonPackage.version, summary: e.pythonPackage.summary, files: e.pythonPackage.files }
+            ? {
+              version: e.pythonPackage.version,
+              summary: e.pythonPackage.summary,
+              files: e.pythonPackage.files,
+            }
             : null,
         }));
-        vfs.writeFile('/etc/yurt/extensions.json', enc.encode(JSON.stringify(extMeta)));
+        vfs.writeFile(
+          "/etc/yurt/extensions.json",
+          enc.encode(JSON.stringify(extMeta)),
+        );
 
-        // Optional custom registry index cache (for testing / offline use).
-        if (options._pipRegistryIndex) {
-          vfs.writeFile('/etc/yurt/registry-index.json', enc.encode(options._pipRegistryIndex));
-        }
-
-        // Lock down system config files — pip-installed.json stays 0o644 (pkg/pip update it)
-        vfs.chmod('/etc/yurt/pkg-policy.json', 0o444);
-        vfs.chmod('/etc/yurt/pip-policy.json', 0o444);
-        vfs.chmod('/etc/yurt/pip-registry.json', 0o444);
-        vfs.chmod('/etc/yurt/extensions.json', 0o444);
+        vfs.chmod("/etc/yurt/extensions.json", 0o444);
       });
     }
 
     // Set PYTHONPATH: user-provided paths + /usr/lib/python (always included)
-    if (options.pythonPath || bridge || extensionRegistry.getPackageNames().length > 0 || (options.packages && options.packages.length > 0)) {
-      const paths = [...(options.pythonPath ?? []), '/usr/lib/python'];
-      env.set('PYTHONPATH', paths.join(':'));
+    if (
+      options.pythonPath || bridge ||
+      extensionRegistry.getPackageNames().length > 0
+    ) {
+      const paths = [...(options.pythonPath ?? []), "/usr/lib/python"];
+      env.set("PYTHONPATH", paths.join(":"));
     }
 
     // Create WorkerExecutor for hard-kill preemption when enabled.
     const workerExecutor = await Sandbox.createWorkerExecutor(
-      vfs, options.wasmDir, bootWasmPath, tools, adapter,
-      options.security, bridge, options.network, extensionRegistry,
+      vfs,
+      options.wasmDir,
+      bootWasmPath,
+      tools,
+      adapter,
+      options.security,
+      bridge,
+      options.network,
+      extensionRegistry,
     );
 
     const sb = new Sandbox({
-      vfs, kernel, processes, bootProcess, env, timeoutMs, adapter,
-      wasmDir: options.wasmDir, bootWasmPath, moduleCache,
-      mgr, bridge, networkPolicy: options.network,
+      vfs,
+      kernel,
+      processes,
+      bootProcess,
+      env,
+      timeoutMs,
+      adapter,
+      wasmDir: options.wasmDir,
+      bootWasmPath,
+      moduleCache,
+      mgr,
+      bridge,
+      networkPolicy: options.network,
       socketBackend: options.socketBackend,
       serverSockets: options.serverSockets,
       runtimeBackend,
-      security: options.security, workerExecutor,
-      extensionRegistry, storage: options.storage,
-      bootArgv, bootImports: options.bootImports,
+      security: options.security,
+      workerExecutor,
+      extensionRegistry,
+      storage: options.storage,
+      bootArgv,
+      bootImports: options.bootImports,
       runCommandHandler: options.runCommandHandler,
     });
     sandboxRef = sb;
 
     // Wire persistence if configured
-    const pMode = options.persistence?.mode ?? 'ephemeral';
-    if (pMode !== 'ephemeral') {
-      const backend = options.persistence?.backend ?? await Sandbox.detectBackend();
+    const pMode = options.persistence?.mode ?? "ephemeral";
+    if (pMode !== "ephemeral") {
+      const backend = options.persistence?.backend ??
+        await Sandbox.detectBackend();
       const pm = new PersistenceManager(
-        backend, vfs, options.persistence,
+        backend,
+        vfs,
+        options.persistence,
         () => new Map(env),
         (restoredEnv) => {
           env.clear();
@@ -583,7 +656,7 @@ export class Sandbox {
       );
       sb.persistenceManager = pm;
 
-      if (pMode === 'persistent') {
+      if (pMode === "persistent") {
         await pm.load();
         sb.envNeedsSync = true;
         pm.startAutosave(vfs);
@@ -591,25 +664,33 @@ export class Sandbox {
       // 'session' mode: user calls save()/load() explicitly
     }
 
-    sb.audit('sandbox.create');
+    sb.audit("sandbox.create");
     return sb;
   }
 
   private static async detectAdapter(): Promise<PlatformAdapter> {
-    if (typeof globalThis.process !== 'undefined' && globalThis.process.versions?.node) {
-      const { NodeAdapter } = await import('./platform/node-adapter.js');
+    if (
+      typeof globalThis.process !== "undefined" &&
+      globalThis.process.versions?.node
+    ) {
+      const { NodeAdapter } = await import("./platform/node-adapter.js");
       return new NodeAdapter();
     }
-    const { BrowserAdapter } = await import('./platform/browser-adapter.js');
+    const { BrowserAdapter } = await import("./platform/browser-adapter.js");
     return new BrowserAdapter();
   }
 
-  private static async detectBackend(): Promise<import('./persistence/backend.js').PersistenceBackend> {
-    if (typeof globalThis.process !== 'undefined' && globalThis.process.versions?.node) {
-      const { FsBackend } = await import('./persistence/fs-backend.js');
+  private static async detectBackend(): Promise<
+    import("./persistence/backend.js").PersistenceBackend
+  > {
+    if (
+      typeof globalThis.process !== "undefined" &&
+      globalThis.process.versions?.node
+    ) {
+      const { FsBackend } = await import("./persistence/fs-backend.js");
       return new FsBackend();
     }
-    const { IdbBackend } = await import('./persistence/idb-backend.js');
+    const { IdbBackend } = await import("./persistence/idb-backend.js");
     return new IdbBackend();
   }
 
@@ -623,35 +704,57 @@ export class Sandbox {
     return { gateway, bridge };
   }
 
-  private static getBridgeSab(bridge: NetworkBridgeLike | undefined): SharedArrayBuffer | undefined {
-    const bridgeWithSab = bridge as (NetworkBridgeLike & { getSab?: () => SharedArrayBuffer }) | undefined;
-    return typeof bridgeWithSab?.getSab === 'function'
+  private static getBridgeSab(
+    bridge: NetworkBridgeLike | undefined,
+  ): SharedArrayBuffer | undefined {
+    const bridgeWithSab = bridge as
+      | (NetworkBridgeLike & { getSab?: () => SharedArrayBuffer })
+      | undefined;
+    return typeof bridgeWithSab?.getSab === "function"
       ? bridgeWithSab.getSab()
       : undefined;
   }
 
-  private static async readBaseRootManifest(baseRoot: string): Promise<{
-    id?: string;
-    files?: Array<{ path: string; type?: 'file' | 'dir' | 'symlink'; uid: number; gid: number; mode: number }>;
-    tools?: Array<{ name: string; path: string }>;
-  } | undefined> {
+  private static async readBaseRootManifest(baseRoot: string): Promise<
+    {
+      id?: string;
+      files?: Array<
+        {
+          path: string;
+          type?: "file" | "dir" | "symlink";
+          uid: number;
+          gid: number;
+          mode: number;
+        }
+      >;
+      tools?: Array<{ name: string; path: string }>;
+    } | undefined
+  > {
     try {
-      const { readFile } = await import('node:fs/promises');
-      const raw = await readFile(`${baseRoot}/etc/yurt/base-image.json`, 'utf8');
+      const { readFile } = await import("node:fs/promises");
+      const raw = await readFile(
+        `${baseRoot}/etc/yurt/base-image.json`,
+        "utf8",
+      );
       return JSON.parse(raw);
     } catch {
       return undefined;
     }
   }
 
-  private static registerBaseRootTools(mgr: ProcessManager, vfs: VfsLike): Map<string, string> {
+  private static registerBaseRootTools(
+    mgr: ProcessManager,
+    vfs: VfsLike,
+  ): Map<string, string> {
     const tools = new Map<string, string>();
     try {
-      const manifest = JSON.parse(new TextDecoder().decode(vfs.readFile('/etc/yurt/base-image.json'))) as {
+      const manifest = JSON.parse(
+        new TextDecoder().decode(vfs.readFile("/etc/yurt/base-image.json")),
+      ) as {
         tools?: Array<{ name: string; path: string }>;
       };
       for (const tool of manifest.tools ?? []) {
-        mgr.registerTool(tool.name, { kind: 'vfs', path: tool.path });
+        mgr.registerTool(tool.name, { kind: "vfs", path: tool.path });
         tools.set(tool.name, tool.path);
       }
     } catch {
@@ -669,7 +772,12 @@ export class Sandbox {
     const tools = await adapter.scanTools(wasmDir);
     for (const [name, path] of tools) {
       mgr.registerTool(name, path);
-      await Sandbox.installToolExecutable(vfs, adapter, `/usr/bin/${name}`, path);
+      await Sandbox.installToolExecutable(
+        vfs,
+        adapter,
+        `/usr/bin/${name}`,
+        path,
+      );
     }
     for (const [name, path] of tools) {
       const manifest = await loadManifest(adapter, wasmDir, name);
@@ -688,9 +796,11 @@ export class Sandbox {
   ): Promise<void> {
     const bytes = await adapter.readBytes(wasmPath);
     vfs.withWriteAccess(() => {
-      const dir = vfsPath.slice(0, vfsPath.lastIndexOf('/')) || '/';
+      const dir = vfsPath.slice(0, vfsPath.lastIndexOf("/")) || "/";
       vfs.mkdirp(dir);
-      try { vfs.unlink(vfsPath); } catch { /* not present */ }
+      try {
+        vfs.unlink(vfsPath);
+      } catch { /* not present */ }
       vfs.writeFile(vfsPath, bytes);
       vfs.chmod(vfsPath, 0o555);
     });
@@ -704,23 +814,31 @@ export class Sandbox {
   ): Promise<void> {
     // Temporary CPython bring-up shim. This belongs in pkg once package install
     // owns language runtimes and their VFS layouts.
-    if (!tools.has('cpython3') || !adapter.readDataFile) return;
+    if (!tools.has("cpython3") || !adapter.readDataFile) return;
 
-    const manifestBytes = await adapter.readDataFile(wasmDir, 'cpython3-lib-manifest.json');
+    const manifestBytes = await adapter.readDataFile(
+      wasmDir,
+      "cpython3-lib-manifest.json",
+    );
     if (!manifestBytes) return;
 
-    const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as string[];
+    const manifest = JSON.parse(
+      new TextDecoder().decode(manifestBytes),
+    ) as string[];
     for (const relPath of manifest) {
-      if (relPath.startsWith('/') || relPath.includes('..')) {
+      if (relPath.startsWith("/") || relPath.includes("..")) {
         throw new Error(`Invalid CPython stdlib path in manifest: ${relPath}`);
       }
-      const data = await adapter.readDataFile(wasmDir, `cpython3-lib/${relPath}`);
+      const data = await adapter.readDataFile(
+        wasmDir,
+        `cpython3-lib/${relPath}`,
+      );
       if (!data) {
         throw new Error(`Missing CPython stdlib sidecar: ${relPath}`);
       }
       vfs.withWriteAccess(() => {
         const fullPath = `/usr/local/lib/python3.14/${relPath}`;
-        const dir = fullPath.slice(0, fullPath.lastIndexOf('/')) || '/';
+        const dir = fullPath.slice(0, fullPath.lastIndexOf("/")) || "/";
         vfs.mkdirp(dir);
         vfs.writeFile(fullPath, data);
         vfs.chmod(fullPath, 0o444);
@@ -728,8 +846,16 @@ export class Sandbox {
     }
   }
 
-  private static async tryPath(adapter: PlatformAdapter, path: string): Promise<string | null> {
-    try { await adapter.readBytes(path); return path; } catch { return null; }
+  private static async tryPath(
+    adapter: PlatformAdapter,
+    path: string,
+  ): Promise<string | null> {
+    try {
+      await adapter.readBytes(path);
+      return path;
+    } catch {
+      return null;
+    }
   }
 
   private static async installBootProgram(
@@ -738,12 +864,14 @@ export class Sandbox {
     vfsPath: string,
     wasmPath: string,
   ): Promise<void> {
-    if (!vfsPath) throw new Error('bootArgv[0] is required');
+    if (!vfsPath) throw new Error("bootArgv[0] is required");
     const bytes = await adapter.readBytes(wasmPath);
     vfs.withWriteAccess(() => {
-      const dir = vfsPath.slice(0, vfsPath.lastIndexOf('/')) || '/';
+      const dir = vfsPath.slice(0, vfsPath.lastIndexOf("/")) || "/";
       vfs.mkdirp(dir);
-      try { vfs.unlink(vfsPath); } catch { /* not present */ }
+      try {
+        vfs.unlink(vfsPath);
+      } catch { /* not present */ }
       vfs.writeFile(vfsPath, bytes);
       vfs.chmod(vfsPath, 0o555);
     });
@@ -759,12 +887,15 @@ export class Sandbox {
     kernel.setFdTarget(pid, 2, createBufferTarget(stderrLimit ?? Infinity));
   }
 
-  private static writeToFdTarget(target: FdTarget | undefined | null, text: string): void {
+  private static writeToFdTarget(
+    target: FdTarget | undefined | null,
+    text: string,
+  ): void {
     const data = new TextEncoder().encode(text);
-    if (target?.type === 'buffer') {
+    if (target?.type === "buffer") {
       target.buf.push(data);
       target.total += data.byteLength;
-    } else if (target?.type === 'pipe_write') {
+    } else if (target?.type === "pipe_write") {
       target.pipe.write(data);
     }
   }
@@ -772,8 +903,12 @@ export class Sandbox {
   private static createBootImportFactory(
     vfs: VfsLike,
     mgr: ProcessManager,
-    bootImports: ((api: KernelApi) => Record<string, WebAssembly.ImportValue>) | undefined,
-  ): ((memory: WebAssembly.Memory) => Record<string, WebAssembly.ImportValue>) | undefined {
+    bootImports:
+      | ((api: KernelApi) => Record<string, WebAssembly.ImportValue>)
+      | undefined,
+  ):
+    | ((memory: WebAssembly.Memory) => Record<string, WebAssembly.ImportValue>)
+    | undefined {
     if (!bootImports) return undefined;
     return (memory) => {
       const apiMemory = new MemoryProxy();
@@ -782,8 +917,10 @@ export class Sandbox {
         vfs,
         processManager: {
           registerTool: (name, impl) => mgr.registerTool(name, String(impl)),
-          registerAndLoadTool: (name, path) => mgr.registerAndLoadTool(name, path),
-          registerNativeModule: (name, wasmBytes) => mgr.registerNativeModule(name, wasmBytes),
+          registerAndLoadTool: (name, path) =>
+            mgr.registerAndLoadTool(name, path),
+          registerNativeModule: (name, wasmBytes) =>
+            mgr.registerNativeModule(name, wasmBytes),
           hasTool: (name) => mgr.hasTool(name),
         },
         time: {
@@ -839,8 +976,8 @@ export class Sandbox {
 
     const makeFdReadAndClear = (pid: number) => (fd: 1 | 2) => {
       const target = kernel.getFdTarget(pid, fd);
-      if (!target || target.type !== 'buffer') {
-        return { data: '', truncated: false };
+      if (!target || target.type !== "buffer") {
+        return { data: "", truncated: false };
       }
       const data = bufferToString(target);
       const truncated = !!target.truncated;
@@ -866,7 +1003,7 @@ export class Sandbox {
           vfs,
           args: argv,
           env,
-          preopens: { '/': '/' },
+          preopens: { "/": "/" },
           cwd,
           ioFds: kernel.getFdTable(pid),
           kernel,
@@ -892,7 +1029,7 @@ export class Sandbox {
           runCommand: async (cmd, stdin) => {
             const sandbox = getSandbox();
             if (!sandbox) {
-              return { exitCode: 1, stdout: '', stderr: 'sandbox not ready\n' };
+              return { exitCode: 1, stdout: "", stderr: "sandbox not ready\n" };
             }
             if (runCommandHandler) {
               const result = await runCommandHandler(
@@ -920,21 +1057,23 @@ export class Sandbox {
             kernel.setCwd(childPid, childCwd);
             kernel.registerPending(childPid, req.prog, pid);
             kernel.adoptFdTable(childPid, fdTable);
-            const childNice = normalizeNice(req.nice ?? kernel.getPriority(pid));
+            const childNice = normalizeNice(
+              req.nice ?? kernel.getPriority(pid),
+            );
             if (childNice > 0) {
               const priorityResult = runtimeBackend.scheduler?.setPriority({
                 callerPid: pid,
                 targetPid: childPid,
                 nice: childNice,
-              }) ?? { ok: false as const, error: 'unsupported' as const };
+              }) ?? { ok: false as const, error: "unsupported" as const };
               if (!priorityResult.ok) {
                 kernel.discardProcess(childPid);
-                return priorityResult.error === 'permission' ? -2 : -38;
+                return priorityResult.error === "permission" ? -2 : -38;
               }
               kernel.setPriority(childPid, childNice);
             }
-            const commandName = req.prog.includes('/')
-              ? req.prog.split('/').pop() ?? req.prog
+            const commandName = req.prog.includes("/")
+              ? req.prog.split("/").pop() ?? req.prog
               : req.prog;
             if (allowedTools && !allowedTools.has(commandName)) {
               Sandbox.writeToFdTarget(
@@ -954,7 +1093,7 @@ export class Sandbox {
             const childCtx = makeContextWithAllocator(() => childPid);
             const promise = loadProcess(childCtx, {
               argv,
-              mode: 'cli',
+              mode: "cli",
               env: Object.fromEntries(req.env),
               cwd: childCwd,
               memoryBytes,
@@ -966,7 +1105,10 @@ export class Sandbox {
               await proc.terminate();
             }).catch((e) => {
               const msg = e instanceof Error ? e.message : String(e);
-              Sandbox.writeToFdTarget(kernel.getFdTarget(childPid, 2), `${req.prog}: ${msg}\n`);
+              Sandbox.writeToFdTarget(
+                kernel.getFdTarget(childPid, 2),
+                `${req.prog}: ${msg}\n`,
+              );
               kernel.releaseProcess(childPid, 127);
             });
             return childPid;
@@ -981,47 +1123,62 @@ export class Sandbox {
       moduleCache,
     });
 
-    return makeContextWithAllocator((argv) => kernel.allocPid(INIT_PID, argv[0]));
+    return makeContextWithAllocator((argv) =>
+      kernel.allocPid(INIT_PID, argv[0])
+    );
   }
 
-  private static argvForSpawn(vfs: VfsLike, req: SpawnRequest, credentials: ProcessCredentials): string[] {
-    const prog = req.prog.includes('/')
-      ? Sandbox.resolveSpawnPath(req.prog, req.cwd || '/')
+  private static argvForSpawn(
+    vfs: VfsLike,
+    req: SpawnRequest,
+    credentials: ProcessCredentials,
+  ): string[] {
+    const prog = req.prog.includes("/")
+      ? Sandbox.resolveSpawnPath(req.prog, req.cwd || "/")
       : Sandbox.resolveExecutablePathForVfs(vfs, req.prog);
     Sandbox.assertExecutableForSpawn(vfs, prog, credentials);
     return [prog, ...req.args];
   }
 
   private static resolveSpawnPath(path: string, cwd: string): string {
-    return Sandbox.normalizeVfsPath(path.startsWith('/') ? path : `${cwd}/${path}`);
+    return Sandbox.normalizeVfsPath(
+      path.startsWith("/") ? path : `${cwd}/${path}`,
+    );
   }
 
   private static normalizeVfsPath(path: string): string {
     const parts: string[] = [];
-    for (const part of path.split('/')) {
-      if (!part || part === '.') continue;
-      if (part === '..') {
+    for (const part of path.split("/")) {
+      if (!part || part === ".") continue;
+      if (part === "..") {
         parts.pop();
       } else {
         parts.push(part);
       }
     }
-    return `/${parts.join('/')}`;
+    return `/${parts.join("/")}`;
   }
 
-  private static assertExecutableForSpawn(vfs: VfsLike, path: string, credentials: ProcessCredentials): void {
+  private static assertExecutableForSpawn(
+    vfs: VfsLike,
+    path: string,
+    credentials: ProcessCredentials,
+  ): void {
     let st: StatResult;
     try {
       st = vfs.stat(path);
     } catch {
       throw new Error(`ENOENT: no such file or directory: ${path}`);
     }
-    if (st.type !== 'file' || !Sandbox.canExecute(st, credentials)) {
+    if (st.type !== "file" || !Sandbox.canExecute(st, credentials)) {
       throw new Error(`EACCES: permission denied: ${path}`);
     }
   }
 
-  private static canExecute(st: StatResult, credentials: ProcessCredentials): boolean {
+  private static canExecute(
+    st: StatResult,
+    credentials: ProcessCredentials,
+  ): boolean {
     if (credentials.euid === ROOT_UID) return true;
     const mode = st.permissions;
     if (st.uid === credentials.euid) return (mode & 0o100) !== 0;
@@ -1029,12 +1186,15 @@ export class Sandbox {
     return (mode & 0o001) !== 0;
   }
 
-  private static resolveExecutablePathForVfs(vfs: VfsLike, prog: string): string {
-    for (const dir of ['/usr/extensions', '/usr/bin', '/bin']) {
+  private static resolveExecutablePathForVfs(
+    vfs: VfsLike,
+    prog: string,
+  ): string {
+    for (const dir of ["/usr/extensions", "/usr/bin", "/bin"]) {
       const path = `${dir}/${prog}`;
       try {
         const st = vfs.stat(path);
-        if (st.type === 'file' && (st.permissions & 0o111)) return path;
+        if (st.type === "file" && (st.permissions & 0o111)) return path;
       } catch {
         // Try next PATH entry.
       }
@@ -1053,9 +1213,13 @@ export class Sandbox {
     networkPolicy?: NetworkPolicy,
     extensionRegistry?: ExtensionRegistry,
   ): Promise<WorkerExecutor | undefined> {
-    if (!security?.hardKill || !adapter.supportsWorkerExecution) return undefined;
+    if (!security?.hardKill || !adapter.supportsWorkerExecution) {
+      return undefined;
+    }
     if (!(vfs instanceof VFS)) return undefined;
-    const { WorkerExecutor: WE } = await import('./execution/worker-executor.js');
+    const { WorkerExecutor: WE } = await import(
+      "./execution/worker-executor.js"
+    );
     const toolRegistry: [string, string][] = Array.from(tools);
     return new WE({
       vfs,
@@ -1068,130 +1232,136 @@ export class Sandbox {
       memoryBytes: security.limits?.memoryBytes,
       processes: security.limits?.processes,
       bridgeSab: Sandbox.getBridgeSab(bridge),
-      networkPolicy: networkPolicy ? {
-        allowedHosts: networkPolicy.allowedHosts,
-        blockedHosts: networkPolicy.blockedHosts,
-      } : undefined,
-      extensionRegistry: extensionRegistry?.list().length ? extensionRegistry : undefined,
+      networkPolicy: networkPolicy
+        ? {
+          allowedHosts: networkPolicy.allowedHosts,
+          blockedHosts: networkPolicy.blockedHosts,
+        }
+        : undefined,
+      extensionRegistry: extensionRegistry?.list().length
+        ? extensionRegistry
+        : undefined,
     });
   }
 
-  async run(command: string, callbacks?: StreamCallbacks & { stdinData?: Uint8Array }): Promise<RunResult> {
+  async run(
+    command: string,
+    callbacks?: StreamCallbacks & { stdinData?: Uint8Array },
+  ): Promise<RunResult> {
     this.assertAlive();
 
     // Check command size limit
     const commandLimit = this.security?.limits?.commandBytes ?? 65536;
     if (new TextEncoder().encode(command).byteLength > commandLimit) {
-      this.audit('limit.exceeded', { subtype: 'command', command });
+      this.audit("limit.exceeded", { subtype: "command", command });
       return {
         exitCode: 1,
-        stdout: '',
-        stderr: 'command too large\n',
+        stdout: "",
+        stderr: "command too large\n",
         executionTimeMs: 0,
-        errorClass: 'LIMIT_EXCEEDED',
+        errorClass: "LIMIT_EXCEEDED",
       };
     }
 
     this.running = true;
     try {
-      this.audit('command.start', { command });
+      this.audit("command.start", { command });
 
-    // Emit pkg audit events before execution
-    const pkgMatch = command.match(/^pkg\s+install\s+(\S+)/);
-    let pkgHost: string | undefined;
-    if (pkgMatch) {
-      try {
-        const url = new URL(pkgMatch[1]);
-        pkgHost = url.hostname;
-      } catch { /* not a valid URL */ }
-      this.audit('package.install.start', { url: pkgMatch[1], host: pkgHost });
-    }
+      const effectiveTimeout = this.security?.limits?.timeoutMs ??
+        this.timeoutMs;
+      const startTime = performance.now();
+      this.activeDeadlineMs = Number.isFinite(effectiveTimeout)
+        ? Date.now() + effectiveTimeout
+        : undefined;
 
-    const effectiveTimeout = this.security?.limits?.timeoutMs ?? this.timeoutMs;
-    const startTime = performance.now();
-    this.activeDeadlineMs = Number.isFinite(effectiveTimeout)
-      ? Date.now() + effectiveTimeout
-      : undefined;
+      let result: RunResult;
 
-    let result: RunResult;
+      if (this.workerExecutor) {
+        // Worker-based execution (Node) — hard kill on timeout via worker.terminate()
+        if (callbacks?.onStdout || callbacks?.onStderr) {
+          console.warn(
+            "[yurt] Streaming callbacks not supported with worker executor (security.hardKill). Output will be returned in result only.",
+          );
+        }
+        const workerResult = await this.workerExecutor.run(
+          command,
+          this.getEnvMap(),
+          effectiveTimeout,
+        );
 
-    if (this.workerExecutor) {
-      // Worker-based execution (Node) — hard kill on timeout via worker.terminate()
-      if (callbacks?.onStdout || callbacks?.onStderr) {
-        console.warn('[yurt] Streaming callbacks not supported with worker executor (security.hardKill). Output will be returned in result only.');
+        // Sync env changes from Worker back to main-thread runner
+        if (workerResult.env) {
+          this.setEnvMap(new Map(workerResult.env));
+        }
+
+        result = workerResult;
+      } else {
+        // In-process execution: the sandbox facade speaks the resident process
+        // command protocol, but the kernel only sees a generic Process.
+        try {
+          result = await this.runBootCommand(command, {
+            stdinData: callbacks?.stdinData,
+          });
+        } catch (e) {
+          if (e instanceof CancelledError) {
+            const executionTimeMs = performance.now() - startTime;
+            result = {
+              exitCode: 124,
+              stdout: "",
+              stderr: `command ${e.reason.toLowerCase()}\n`,
+              executionTimeMs,
+              errorClass: e.reason,
+            };
+          } else {
+            throw e;
+          }
+        }
       }
-      const workerResult = await this.workerExecutor.run(command, this.getEnvMap(), effectiveTimeout);
 
-      // Sync env changes from Worker back to main-thread runner
-      if (workerResult.env) {
-        this.setEnvMap(new Map(workerResult.env));
+      const executionTimeMs = performance.now() - startTime;
+      result.executionTimeMs = result.executionTimeMs || executionTimeMs;
+      if (
+        this.activeDeadlineMs !== undefined &&
+        Date.now() >= this.activeDeadlineMs
+      ) {
+        result.exitCode = 124;
+        result.errorClass = "TIMEOUT";
+      } else if (result.exitCode === 124 && !result.errorClass) {
+        result.errorClass = "TIMEOUT";
       }
 
-      result = workerResult;
-    } else {
-      // In-process execution: the sandbox facade speaks the resident process
-      // command protocol, but the kernel only sees a generic Process.
-      try {
-        result = await this.runBootCommand(command, {
-          stdinData: callbacks?.stdinData,
+      if (callbacks?.onStdout && result.stdout) {
+        callbacks.onStdout(result.stdout);
+      }
+      if (callbacks?.onStderr && result.stderr) {
+        callbacks.onStderr(result.stderr);
+      }
+      // Post-execution audit
+      if (result.errorClass === "TIMEOUT") {
+        this.audit("command.timeout", { command, executionTimeMs });
+      } else if (result.errorClass === "CANCELLED") {
+        this.audit("command.cancelled", { command, executionTimeMs });
+      } else {
+        if (result.truncated?.stdout) {
+          this.audit("limit.exceeded", { subtype: "stdout", command });
+        }
+        if (result.truncated?.stderr) {
+          this.audit("limit.exceeded", { subtype: "stderr", command });
+        }
+        if (result.stderr?.includes("not allowed by security policy")) {
+          this.audit("capability.denied", {
+            command,
+            reason: result.stderr.trim(),
+          });
+        }
+        this.audit("command.complete", {
+          command,
+          exitCode: result.exitCode,
+          executionTimeMs,
         });
-      } catch (e) {
-        if (e instanceof CancelledError) {
-          const executionTimeMs = performance.now() - startTime;
-          result = {
-            exitCode: 124,
-            stdout: '',
-            stderr: `command ${e.reason.toLowerCase()}\n`,
-            executionTimeMs,
-            errorClass: e.reason,
-          };
-        } else {
-          throw e;
-        }
       }
-    }
 
-    const executionTimeMs = performance.now() - startTime;
-    result.executionTimeMs = result.executionTimeMs || executionTimeMs;
-    if (
-      this.activeDeadlineMs !== undefined &&
-      Date.now() >= this.activeDeadlineMs
-    ) {
-      result.exitCode = 124;
-      result.errorClass = 'TIMEOUT';
-    } else if (result.exitCode === 124 && !result.errorClass) {
-      result.errorClass = 'TIMEOUT';
-    }
-
-    if (callbacks?.onStdout && result.stdout) callbacks.onStdout(result.stdout);
-    if (callbacks?.onStderr && result.stderr) callbacks.onStderr(result.stderr);
-    // Post-execution audit
-    if (result.errorClass === 'TIMEOUT') {
-      this.audit('command.timeout', { command, executionTimeMs });
-    } else if (result.errorClass === 'CANCELLED') {
-      this.audit('command.cancelled', { command, executionTimeMs });
-    } else {
-      if (result.truncated?.stdout) {
-        this.audit('limit.exceeded', { subtype: 'stdout', command });
-      }
-      if (result.truncated?.stderr) {
-        this.audit('limit.exceeded', { subtype: 'stderr', command });
-      }
-      if (result.stderr?.includes('not allowed by security policy')) {
-        this.audit('capability.denied', { command, reason: result.stderr.trim() });
-      }
-      // Emit pkg audit events after execution
-      if (pkgMatch && pkgHost) {
-        if (result.exitCode !== 0 && result.stderr?.includes('not in the allowed hosts')) {
-          this.audit('package.install.denied', { url: pkgMatch[1], host: pkgHost });
-        } else if (result.exitCode === 0) {
-          this.audit('package.install.success', { url: pkgMatch[1], host: pkgHost });
-        }
-      }
-      this.audit('command.complete', { command, exitCode: result.exitCode, executionTimeMs });
-    }
-
-    return result;
+      return result;
     } finally {
       this.activeDeadlineMs = undefined;
       this.running = false;
@@ -1210,7 +1380,7 @@ export class Sandbox {
     options?: { stdinData?: Uint8Array },
   ): Promise<RunResult> {
     const child = await this.spawn(this.bootArgv, {
-      mode: 'resident',
+      mode: "resident",
       env: Object.fromEntries(this.env),
       bootImports: this.bootImports,
     });
@@ -1226,10 +1396,14 @@ export class Sandbox {
     command: string,
     options?: { stdinData?: Uint8Array },
   ): Promise<RunResult> {
-    const alloc = proc.exports.__alloc as ((size: number) => number) | undefined;
-    const dealloc = proc.exports.__dealloc as ((ptr: number, size: number) => void) | undefined;
+    const alloc = proc.exports.__alloc as
+      | ((size: number) => number)
+      | undefined;
+    const dealloc = proc.exports.__dealloc as
+      | ((ptr: number, size: number) => void)
+      | undefined;
     if (!alloc || !dealloc) {
-      throw new Error('boot process does not export __alloc/__dealloc');
+      throw new Error("boot process does not export __alloc/__dealloc");
     }
 
     await this.syncBootEnv(proc);
@@ -1240,21 +1414,35 @@ export class Sandbox {
     const commandPtr = alloc(commandBytes.length);
     const outCap = 1024 * 1024;
     const outPtr = alloc(outCap);
-    let decoded = '';
+    let decoded = "";
     try {
-      new Uint8Array(proc.memory.buffer, commandPtr, commandBytes.length).set(commandBytes);
-      const written = await proc.callExport('__run_command', commandPtr, commandBytes.length, outPtr, outCap);
+      new Uint8Array(proc.memory.buffer, commandPtr, commandBytes.length).set(
+        commandBytes,
+      );
+      const written = await proc.callExport(
+        "__run_command",
+        commandPtr,
+        commandBytes.length,
+        outPtr,
+        outCap,
+      );
       if (written > outCap) {
         throw new Error(`__run_command metadata exceeded ${outCap} bytes`);
       }
-      decoded = new TextDecoder().decode(new Uint8Array(proc.memory.buffer, outPtr, written));
+      decoded = new TextDecoder().decode(
+        new Uint8Array(proc.memory.buffer, outPtr, written),
+      );
     } finally {
       proc.setStdin(undefined);
       dealloc(commandPtr, commandBytes.length);
       dealloc(outPtr, outCap);
     }
 
-    let parsed: { exit_code?: number; execution_time_ms?: number; env?: Record<string, string> };
+    let parsed: {
+      exit_code?: number;
+      execution_time_ms?: number;
+      env?: Record<string, string>;
+    };
     try {
       parsed = JSON.parse(decoded);
     } catch {
@@ -1282,16 +1470,24 @@ export class Sandbox {
 
   private async syncBootEnv(proc: Process): Promise<void> {
     if (!this.envNeedsSync) return;
-    const setEnv = proc.exports.__set_env as ((ptr: number, len: number) => number) | undefined;
-    const alloc = proc.exports.__alloc as ((size: number) => number) | undefined;
-    const dealloc = proc.exports.__dealloc as ((ptr: number, size: number) => void) | undefined;
+    const setEnv = proc.exports.__set_env as
+      | ((ptr: number, len: number) => number)
+      | undefined;
+    const alloc = proc.exports.__alloc as
+      | ((size: number) => number)
+      | undefined;
+    const dealloc = proc.exports.__dealloc as
+      | ((ptr: number, size: number) => void)
+      | undefined;
     if (!setEnv || !alloc || !dealloc) return;
 
-    const bytes = new TextEncoder().encode(JSON.stringify(Object.fromEntries(this.env)));
+    const bytes = new TextEncoder().encode(
+      JSON.stringify(Object.fromEntries(this.env)),
+    );
     const ptr = alloc(bytes.length);
     try {
       new Uint8Array(proc.memory.buffer, ptr, bytes.length).set(bytes);
-      const rc = await proc.callExport('__set_env', ptr, bytes.length);
+      const rc = await proc.callExport("__set_env", ptr, bytes.length);
       if (rc !== 0) {
         throw new Error(`boot process rejected environment sync: ${rc}`);
       }
@@ -1360,9 +1556,9 @@ export class Sandbox {
     });
     const proc = await loadProcess(loaderCtx, {
       argv,
-      mode: opts.mode ?? 'cli',
+      mode: opts.mode ?? "cli",
       env: opts.env ?? Object.fromEntries(this.env),
-      cwd: opts.cwd ?? '/',
+      cwd: opts.cwd ?? "/",
       stdoutLimit: this.security?.limits?.stdoutBytes,
       stderrLimit: this.security?.limits?.stderrBytes,
       extraYurtImports: Sandbox.createBootImportFactory(
@@ -1371,7 +1567,7 @@ export class Sandbox {
         opts.bootImports ?? this.bootImports,
       ),
     });
-    if (proc.mode === 'resident') {
+    if (proc.mode === "resident") {
       Sandbox.applyOutputLimits(
         this.kernel,
         proc.pid,
@@ -1386,7 +1582,7 @@ export class Sandbox {
       };
       proc.__setFdReadAndClear((fd) => {
         const result = captured[fd];
-        captured[fd] = { data: '', truncated: false };
+        captured[fd] = { data: "", truncated: false };
         return result;
       });
       await proc.terminate();
@@ -1407,7 +1603,18 @@ export class Sandbox {
    */
   openTty(rows = 24, cols = 80): TtyHandle {
     this.assertAlive();
+    const pid = this.bootProcess.pid;
+    if (this.kernel.getsid(pid) !== pid && this.kernel.setsid(pid) !== pid) {
+      throw new Error(`failed to create session for pid ${pid}`);
+    }
     const state = this.kernel.openTtyForProcess(this.bootProcess.pid);
+    if (
+      this.kernel.setControllingTty(pid, state.ttyId) !== 0
+    ) {
+      throw new Error(
+        `failed to set controlling terminal for pid ${pid}`,
+      );
+    }
     state.rows = rows;
     state.cols = cols;
     return new TtyHandle(state);
@@ -1424,13 +1631,18 @@ export class Sandbox {
    * Accepts either a flat file map `Record<string, Uint8Array>` (convenient)
    * or a `VirtualProvider` instance (flexible). Duck-types on `readFile` method.
    */
-  mount(path: string, filesOrProvider: Record<string, Uint8Array> | VirtualProvider): void {
+  mount(
+    path: string,
+    filesOrProvider: Record<string, Uint8Array> | VirtualProvider,
+  ): void {
     this.assertAlive();
     const provider: VirtualProvider =
-      typeof (filesOrProvider as VirtualProvider).readFile === 'function'
+      typeof (filesOrProvider as VirtualProvider).readFile === "function"
         ? (filesOrProvider as VirtualProvider)
         : new HostMount(filesOrProvider as Record<string, Uint8Array>);
-    if (!this.vfs.mount) throw new Error('Configured VFS does not support mounts');
+    if (!this.vfs.mount) {
+      throw new Error("Configured VFS does not support mounts");
+    }
     this.vfs.mount(path, provider);
   }
 
@@ -1466,7 +1678,9 @@ export class Sandbox {
 
   snapshot(): string {
     this.assertAlive();
-    if (!this.vfs.snapshot) throw new Error('Configured VFS does not support snapshot');
+    if (!this.vfs.snapshot) {
+      throw new Error("Configured VFS does not support snapshot");
+    }
     const id = this.vfs.snapshot();
     this.envSnapshots.set(id, this.getEnvMap());
     return id;
@@ -1474,7 +1688,9 @@ export class Sandbox {
 
   restore(id: string): void {
     this.assertAlive();
-    if (!this.vfs.restore) throw new Error('Configured VFS does not support restore');
+    if (!this.vfs.restore) {
+      throw new Error("Configured VFS does not support restore");
+    }
     this.vfs.restore(id);
     const envSnap = this.envSnapshots.get(id);
     if (envSnap) {
@@ -1485,7 +1701,11 @@ export class Sandbox {
   /** Export the entire sandbox state (VFS files + env vars) as a binary blob. */
   exportState(): Uint8Array {
     this.assertAlive();
-    return serializerExportState(this.vfs, this.getEnvMap(), this.vfs.getProviderPaths?.());
+    return serializerExportState(
+      this.vfs,
+      this.getEnvMap(),
+      this.vfs.getProviderPaths?.(),
+    );
   }
 
   /** Import a previously exported state blob, restoring files and env vars. */
@@ -1500,12 +1720,20 @@ export class Sandbox {
   /** Offload sandbox state to external storage, freeing VFS file content memory. */
   async offload(): Promise<void> {
     if (this.offloaded) return; // idempotent
-    if (this.destroyed) throw new Error('Sandbox has been destroyed');
-    if (!this.storage) throw new Error('No storage callbacks configured');
-    if (this.running) throw new Error('Cannot offload while a command is running');
-    if (!this.vfs.clearFileContents) throw new Error('Configured VFS does not support offload');
+    if (this.destroyed) throw new Error("Sandbox has been destroyed");
+    if (!this.storage) throw new Error("No storage callbacks configured");
+    if (this.running) {
+      throw new Error("Cannot offload while a command is running");
+    }
+    if (!this.vfs.clearFileContents) {
+      throw new Error("Configured VFS does not support offload");
+    }
 
-    const blob = serializerExportState(this.vfs, this.getEnvMap(), this.vfs.getProviderPaths?.());
+    const blob = serializerExportState(
+      this.vfs,
+      this.getEnvMap(),
+      this.vfs.getProviderPaths?.(),
+    );
     await this.storage.save(this.sessionId, blob);
     this.vfs.clearFileContents();
     this.offloaded = true;
@@ -1514,8 +1742,8 @@ export class Sandbox {
   /** Restore sandbox state from external storage. */
   async rehydrate(): Promise<void> {
     if (!this.offloaded) return; // idempotent
-    if (this.destroyed) throw new Error('Sandbox has been destroyed');
-    if (!this.storage) throw new Error('No storage callbacks configured');
+    if (this.destroyed) throw new Error("Sandbox has been destroyed");
+    if (!this.storage) throw new Error("No storage callbacks configured");
 
     const blob = await this.storage.load(this.sessionId);
     this.offloaded = false; // clear before importState so assertAlive passes
@@ -1529,7 +1757,9 @@ export class Sandbox {
   async saveState(): Promise<void> {
     this.assertAlive();
     if (!this.persistenceManager) {
-      throw new Error('Persistence not configured. Set persistence.mode to "session" or "persistent".');
+      throw new Error(
+        'Persistence not configured. Set persistence.mode to "session" or "persistent".',
+      );
     }
     await this.persistenceManager.save();
   }
@@ -1538,7 +1768,9 @@ export class Sandbox {
   async loadState(): Promise<boolean> {
     this.assertAlive();
     if (!this.persistenceManager) {
-      throw new Error('Persistence not configured. Set persistence.mode to "session" or "persistent".');
+      throw new Error(
+        'Persistence not configured. Set persistence.mode to "session" or "persistent".',
+      );
     }
     return this.persistenceManager.load();
   }
@@ -1547,14 +1779,18 @@ export class Sandbox {
   async clearPersistedState(): Promise<void> {
     this.assertAlive();
     if (!this.persistenceManager) {
-      throw new Error('Persistence not configured. Set persistence.mode to "session" or "persistent".');
+      throw new Error(
+        'Persistence not configured. Set persistence.mode to "session" or "persistent".',
+      );
     }
     await this.persistenceManager.clear();
   }
 
   async fork(): Promise<Sandbox> {
     this.assertAlive();
-    if (!this.vfs.cowClone) throw new Error('Configured VFS does not support fork');
+    if (!this.vfs.cowClone) {
+      throw new Error("Configured VFS does not support fork");
+    }
     const childVfs = this.vfs.cowClone();
     const { bridge } = await Sandbox.createNetworkBridge(this.networkPolicy);
     const childMgr = new ProcessManager(
@@ -1566,12 +1802,19 @@ export class Sandbox {
     );
     const tools = childVfs instanceof OverlayVFS
       ? Sandbox.registerBaseRootTools(childMgr, childVfs)
-      : await Sandbox.registerTools(childMgr, this.adapter, this.wasmDir, childVfs as VFS);
+      : await Sandbox.registerTools(
+        childMgr,
+        this.adapter,
+        this.wasmDir,
+        childVfs as VFS,
+      );
 
     // Pre-load all tool modules so spawnSync can use them synchronously
     await childMgr.preloadModules();
 
-    const childKernel = new ProcessKernel({ maxProcesses: this.security?.limits?.processes });
+    const childKernel = new ProcessKernel({
+      maxProcesses: this.security?.limits?.processes,
+    });
     const childProcesses = new Map<number, Process>();
     let childRef: Sandbox | undefined;
     const childCtx = Sandbox.createLoaderContext({
@@ -1597,11 +1840,15 @@ export class Sandbox {
     const childEnv = this.getEnvMap();
     const childBootProcess = await loadProcess(childCtx, {
       argv: this.bootArgv,
-      mode: 'resident',
+      mode: "resident",
       env: Object.fromEntries(childEnv),
       stdoutLimit: this.security?.limits?.stdoutBytes,
       stderrLimit: this.security?.limits?.stderrBytes,
-      extraYurtImports: Sandbox.createBootImportFactory(childVfs, childMgr, this.bootImports),
+      extraYurtImports: Sandbox.createBootImportFactory(
+        childVfs,
+        childMgr,
+        this.bootImports,
+      ),
     });
     Sandbox.applyOutputLimits(
       childKernel,
@@ -1613,8 +1860,15 @@ export class Sandbox {
 
     // Create WorkerExecutor for the child if parent uses hard-kill
     const childWorkerExecutor = await Sandbox.createWorkerExecutor(
-      childVfs, this.wasmDir, this.bootWasmPath, tools, this.adapter,
-      this.security, bridge, this.networkPolicy, this.extensionRegistry ?? undefined,
+      childVfs,
+      this.wasmDir,
+      this.bootWasmPath,
+      tools,
+      this.adapter,
+      this.security,
+      bridge,
+      this.networkPolicy,
+      this.extensionRegistry ?? undefined,
     );
 
     const child = new Sandbox({
@@ -1627,11 +1881,14 @@ export class Sandbox {
       adapter: this.adapter,
       wasmDir: this.wasmDir,
       bootWasmPath: this.bootWasmPath,
-      mgr: childMgr, bridge, networkPolicy: this.networkPolicy,
+      mgr: childMgr,
+      bridge,
+      networkPolicy: this.networkPolicy,
       socketBackend: this.socketBackend,
       serverSockets: this.serverSockets,
       runtimeBackend: this.runtimeBackend,
-      security: this.security, workerExecutor: childWorkerExecutor,
+      security: this.security,
+      workerExecutor: childWorkerExecutor,
       extensionRegistry: this.extensionRegistry ?? undefined,
       storage: this.storage ?? undefined,
       bootArgv: this.bootArgv,
@@ -1653,13 +1910,15 @@ export class Sandbox {
   }
 
   destroy(): void {
-    this.audit('sandbox.destroy');
+    this.audit("sandbox.destroy");
     this.destroyed = true;
     // Fire-and-forget: dispose is async but destroy is sync
     this.persistenceManager?.dispose().catch(() => {});
     this.workerExecutor?.dispose();
-    const disposableBridge = this.bridge as (NetworkBridgeLike & { dispose?: () => void }) | null;
-    if (typeof disposableBridge?.dispose === 'function') {
+    const disposableBridge = this.bridge as
+      | (NetworkBridgeLike & { dispose?: () => void })
+      | null;
+    if (typeof disposableBridge?.dispose === "function") {
       disposableBridge.dispose();
     }
     this.kernel.dispose();
@@ -1667,10 +1926,10 @@ export class Sandbox {
 
   private assertAlive(): void {
     if (this.destroyed) {
-      throw new Error('Sandbox has been destroyed');
+      throw new Error("Sandbox has been destroyed");
     }
     if (this.offloaded) {
-      throw new Error('Sandbox is offloaded — call rehydrate() first');
+      throw new Error("Sandbox is offloaded — call rehydrate() first");
     }
   }
 }

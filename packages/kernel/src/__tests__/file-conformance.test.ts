@@ -1,6 +1,6 @@
 /**
  * file/libmagic conformance tests.  file.wasm is the upstream
- * file/file 5.47 port built via yurt-cc (packages/c-ports/file/).
+ * file/file 5.47 port built via yurt-cc (test-fixtures/c-ports/file/).
  * magic.mgc is built by a host-side build of the same upstream tree
  * and copied into the VFS at /usr/share/misc/magic.mgc by the
  * sandbox at startup.

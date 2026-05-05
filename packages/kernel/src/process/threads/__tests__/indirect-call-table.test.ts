@@ -1,11 +1,11 @@
-import { describe, it } from '@std/testing/bdd';
-import { expect } from '@std/expect';
+import { describe, it } from "@std/testing/bdd";
+import { expect } from "@std/expect";
 import {
   makeIndirectCallTable,
   NULL_INDIRECT_CALL_TABLE,
-} from '../indirect-call-table.js';
+} from "../indirect-call-table.js";
 
-describe('NULL_INDIRECT_CALL_TABLE', () => {
+describe("NULL_INDIRECT_CALL_TABLE", () => {
   it('rejects with a clear "not yet wired" error', async () => {
     let caught: unknown;
     try {
@@ -18,7 +18,7 @@ describe('NULL_INDIRECT_CALL_TABLE', () => {
   });
 });
 
-describe('makeIndirectCallTable', () => {
+describe("makeIndirectCallTable", () => {
   function fakeTable(entries: Array<unknown>): WebAssembly.Table {
     // Minimal duck-typed stand-in. Only `get` is used.
     return {
@@ -28,10 +28,14 @@ describe('makeIndirectCallTable', () => {
     } as unknown as WebAssembly.Table;
   }
 
-  const passthroughPromising = (fn: unknown) => fn as (arg: number) => Promise<number>;
+  const passthroughPromising = (fn: unknown) =>
+    fn as (arg: number) => Promise<number>;
 
-  it('throws when the slot is not callable', async () => {
-    const table = makeIndirectCallTable(fakeTable([null]), passthroughPromising);
+  it("throws when the slot is not callable", async () => {
+    const table = makeIndirectCallTable(
+      fakeTable([null]),
+      passthroughPromising,
+    );
     let caught: unknown;
     try {
       await table.call(0, 7);
@@ -42,13 +46,16 @@ describe('makeIndirectCallTable', () => {
     expect((caught as Error).message).toMatch(/not a function/);
   });
 
-  it('forwards the argument and returns the wrapped result', async () => {
+  it("forwards the argument and returns the wrapped result", async () => {
     const slot = (x: number) => Promise.resolve(x * 3);
-    const table = makeIndirectCallTable(fakeTable([slot]), passthroughPromising);
+    const table = makeIndirectCallTable(
+      fakeTable([slot]),
+      passthroughPromising,
+    );
     expect(await table.call(0, 5)).toBe(15);
   });
 
-  it('passes the slot function through the supplied promising wrapper', async () => {
+  it("passes the slot function through the supplied promising wrapper", async () => {
     let wrapped = 0;
     const wrapper = (fn: unknown) => {
       wrapped++;

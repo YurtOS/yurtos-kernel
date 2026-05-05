@@ -54,23 +54,23 @@ jobs:
         run: cargo build --release -p yurt-toolchain
 
       - name: Build guest compat canaries
-        run: make -C packages/guest-compat all copy-fixtures
+        run: make -C abi all copy-fixtures
 
       - name: Build Rust std canaries
         run: |
           set -euxo pipefail
           RUST_VERSION="$(rustc --version | awk '{print $2}')"
           scripts/build-rust-std.sh --rust "$RUST_VERSION"
-          make -C packages/guest-compat rust-canaries rust-std-canaries
+          make -C abi rust-canaries rust-std-canaries
 
       - name: Build BusyBox fixture
-        run: make -C packages/c-ports/busybox copy-fixtures
+        run: make -C test-fixtures/c-ports/busybox copy-fixtures
 
       - name: Run fixture smoke tests
         run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/fixture-build-smoke.test.ts packages/kernel/src/process/__tests__/module-cache.test.ts
 
       - name: Run guest compatibility tests
-        run: deno test --no-check --allow-read --allow-env --allow-run packages/kernel/src/__tests__/guest-compat.test.ts
+        run: deno test --no-check --allow-read --allow-env --allow-run packages/kernel/src/__tests__/abi.test.ts
 
       - name: Run VFS overlay tests
         run: deno test --no-check --allow-read --allow-write --allow-env packages/kernel/src/vfs/__tests__/overlay-vfs.test.ts packages/kernel/src/vfs/__tests__/root-provider.test.ts packages/kernel/src/__tests__/sandbox-base-root.test.ts

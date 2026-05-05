@@ -6,7 +6,7 @@
  * builtins (curl, wget) and the WASI socket bridge.
  */
 
-import { matchesHostList } from './host-match.js';
+import { matchesHostList } from "./host-match.js";
 
 export interface NetworkPolicy {
   /** Whitelist mode: only these hosts allowed. Supports wildcards (*.example.com). */
@@ -24,7 +24,7 @@ export interface NetworkPolicy {
    * - `"restricted"` (default): HTTP/HTTPS only via fetch(). Works in browser + Deno.
    * - `"full"`: Real TCP/TLS sockets via host. Any protocol. Deno/Node only.
    */
-  mode?: 'restricted' | 'full';
+  mode?: "restricted" | "full";
   /** Whether to allow listening on ports. Default: false. */
   allowListen?: boolean;
 }
@@ -32,7 +32,7 @@ export interface NetworkPolicy {
 export class NetworkAccessDenied extends Error {
   constructor(url: string, reason: string) {
     super(`Network access denied for ${url}: ${reason}`);
-    this.name = 'NetworkAccessDenied';
+    this.name = "NetworkAccessDenied";
   }
 }
 
@@ -43,7 +43,7 @@ const MAX_REDIRECTS = 5;
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 /** Headers that must not survive a cross-origin redirect. */
-const SENSITIVE_HEADER_NAMES = ['authorization', 'cookie'];
+const SENSITIVE_HEADER_NAMES = ["authorization", "cookie"];
 
 function stripSensitiveHeaders(headers: Record<string, string>): void {
   for (const key of Object.keys(headers)) {
@@ -71,14 +71,17 @@ export class NetworkGateway {
   }
 
   /** Return the network mode. */
-  getMode(): 'restricted' | 'full' {
-    return this.policy.mode ?? 'restricted';
+  getMode(): "restricted" | "full" {
+    return this.policy.mode ?? "restricted";
   }
 
   /** Check whether raw socket operations are allowed to the given host. */
   checkSocketAccess(host: string): { allowed: boolean; reason?: string } {
-    if (this.getMode() !== 'full') {
-      return { allowed: false, reason: 'raw sockets not available in restricted mode' };
+    if (this.getMode() !== "full") {
+      return {
+        allowed: false,
+        reason: "raw sockets not available in restricted mode",
+      };
     }
     return this.checkHostAccess(host);
   }
@@ -91,17 +94,25 @@ export class NetworkGateway {
       return { allowed: false, reason: `host ${host} not in allowedHosts` };
     }
     if (blockedHosts !== undefined) {
-      if (matchesHostList(host, blockedHosts)) return { allowed: false, reason: `host ${host} is in blockedHosts` };
+      if (matchesHostList(host, blockedHosts)) {
+        return { allowed: false, reason: `host ${host} is in blockedHosts` };
+      }
       return { allowed: true };
     }
-    return { allowed: false, reason: 'no network policy configured (default deny)' };
+    return {
+      allowed: false,
+      reason: "no network policy configured (default deny)",
+    };
   }
 
   /** Synchronous check against allow/block lists. */
-  checkAccess(url: string, _method: string): { allowed: boolean; reason?: string } {
+  checkAccess(
+    url: string,
+    _method: string,
+  ): { allowed: boolean; reason?: string } {
     const host = this.extractHost(url);
     if (host === null) {
-      return { allowed: false, reason: 'invalid URL' };
+      return { allowed: false, reason: "invalid URL" };
     }
     return this.checkHostAccess(host);
   }
@@ -109,7 +120,7 @@ export class NetworkGateway {
   /** Fetch with policy enforcement. Throws NetworkAccessDenied on denial. */
   async fetch(url: string, options?: RequestInit): Promise<Response> {
     let currentUrl = url;
-    let currentMethod = options?.method ?? 'GET';
+    let currentMethod = options?.method ?? "GET";
     let currentBody: BodyInit | null | undefined = options?.body;
 
     const originalHost = this.extractHost(url);
@@ -121,9 +132,11 @@ export class NetworkGateway {
       if (options?.headers) {
         const h = options.headers;
         if (h instanceof Headers) {
-          h.forEach((v, k) => { headers[k] = v; });
+          h.forEach((v, k) => {
+            headers[k] = v;
+          });
         } else if (Array.isArray(h)) {
-          for (const [k, v] of h) { headers[k] = v; }
+          for (const [k, v] of h) headers[k] = v;
         } else {
           Object.assign(headers, h);
         }
@@ -154,9 +167,16 @@ export class NetworkGateway {
 
       // Dynamic callback check
       if (this.policy.onRequest) {
-        const allowed = await this.policy.onRequest({ url: currentUrl, method: currentMethod, headers });
+        const allowed = await this.policy.onRequest({
+          url: currentUrl,
+          method: currentMethod,
+          headers,
+        });
         if (!allowed) {
-          throw new NetworkAccessDenied(currentUrl, 'denied by onRequest callback');
+          throw new NetworkAccessDenied(
+            currentUrl,
+            "denied by onRequest callback",
+          );
         }
       }
 
@@ -165,14 +185,14 @@ export class NetworkGateway {
         headers,
         method: currentMethod,
         body: currentBody,
-        redirect: 'manual',
+        redirect: "manual",
       });
 
       if (!REDIRECT_STATUSES.has(resp.status)) {
         return resp;
       }
 
-      const location = resp.headers.get('Location');
+      const location = resp.headers.get("Location");
       if (!location) {
         return resp; // No Location header — return as-is
       }
@@ -182,13 +202,13 @@ export class NetworkGateway {
 
       // 303: change method to GET and drop body (RFC 7231)
       if (resp.status === 303) {
-        currentMethod = 'GET';
+        currentMethod = "GET";
         currentBody = undefined;
       }
 
       redirectCount++;
       if (redirectCount > MAX_REDIRECTS) {
-        throw new NetworkAccessDenied(currentUrl, 'too many redirects');
+        throw new NetworkAccessDenied(currentUrl, "too many redirects");
       }
     }
   }
@@ -197,10 +217,13 @@ export class NetworkGateway {
    * Read response body as text with a size limit.
    * Streams the body and truncates at maxBytes (default 10MB).
    */
-  static async readResponseBody(response: Response, maxBytes = 10 * 1024 * 1024): Promise<string> {
+  static async readResponseBody(
+    response: Response,
+    maxBytes = 10 * 1024 * 1024,
+  ): Promise<string> {
     const reader = response.body?.getReader();
     if (!reader) {
-      return '';
+      return "";
     }
 
     const chunks: Uint8Array[] = [];
@@ -239,7 +262,10 @@ export class NetworkGateway {
    * Read response body as ArrayBuffer with a size limit.
    * Returns null if the body exceeds maxBytes.
    */
-  static async readResponseArrayBuffer(response: Response, maxBytes = 10 * 1024 * 1024): Promise<ArrayBuffer | null> {
+  static async readResponseArrayBuffer(
+    response: Response,
+    maxBytes = 10 * 1024 * 1024,
+  ): Promise<ArrayBuffer | null> {
     const reader = response.body?.getReader();
     if (!reader) {
       return new ArrayBuffer(0);
@@ -278,5 +304,4 @@ export class NetworkGateway {
       return null;
     }
   }
-
 }

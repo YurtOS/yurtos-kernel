@@ -35,7 +35,7 @@ const PROC_PID_FILES = new Set(['stat', 'status', 'cmdline', 'comm']);
 
 /** /proc/version banner.  Sourced from version.ts so a single bump
  *  flows through to both the host-visible /proc and the guest-side
- *  uname (which reads YURT_VERSION_STR from yurt_compat.h —
+ *  uname (which reads YURT_VERSION_STR from yurt_abi.h —
  *  scripts/sync-version.sh keeps the two in lockstep). */
 const VERSION_STRING = `yurt ${YURT_VERSION} (WASI sandbox)\n`;
 
@@ -49,6 +49,8 @@ export interface StorageStats {
 export interface ProcessInfo {
   pid: number;
   ppid: number;
+  pgid?: number;
+  sid?: number;
   state: string;
   exit_code: number;
   command: string;
@@ -211,8 +213,8 @@ export class ProcProvider implements VirtualProvider {
           const comm = this.procComm(proc);
           const state = this.procState(proc);
           const ppid = proc.ppid;
-          const pgrp = proc.pid; // we don't track pgroups; mirror getpgid()=pid
-          const session = proc.pid;
+          const pgrp = proc.pgid ?? proc.pid;
+          const session = proc.sid ?? proc.pid;
           const zeros = Array(40).fill('0').join(' ');
           return `${proc.pid} (${comm}) ${state} ${ppid} ${pgrp} ${session} ${zeros}\n`;
         }

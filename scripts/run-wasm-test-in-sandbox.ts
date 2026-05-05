@@ -1,8 +1,8 @@
 #!/usr/bin/env -S deno run -A
 import { basename, resolve } from 'node:path';
 import { readFileSync } from 'node:fs';
-import { Sandbox } from '../packages/orchestrator/src/sandbox.ts';
-import { NodeAdapter } from '../packages/orchestrator/src/platform/node-adapter.ts';
+import { Sandbox } from '../packages/kernel/src/sandbox.ts';
+import { NodeAdapter } from '../packages/kernel/src/platform/node-adapter.ts';
 
 const [wasmPathArg, ...testArgs] = Deno.args;
 if (!wasmPathArg) {
@@ -11,7 +11,7 @@ if (!wasmPathArg) {
 }
 
 const repoRoot = resolve(import.meta.dirname!, '..');
-const wasmDir = resolve(repoRoot, 'packages/orchestrator/src/platform/__tests__/fixtures');
+const wasmDir = resolve(repoRoot, 'packages/kernel/src/platform/__tests__/fixtures');
 const adapter = new NodeAdapter();
 const sandbox = await Sandbox.create({
   wasmDir,

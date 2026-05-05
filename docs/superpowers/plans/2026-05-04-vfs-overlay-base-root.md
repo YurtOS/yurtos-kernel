@@ -60,7 +60,7 @@
 **Files:**
 - Modify: `packages/kernel/src/__tests__/security-adversarial.test.ts`
 - Modify: `packages/kernel/src/vfs/__tests__/vfs.test.ts`
-- Modify: `.github/workflows/guest-compat.yml`
+- Modify: `.github/workflows/abi.yml`
 
 - [x] Add root-owned base shadowing denial tests for `/bin` and `/etc`.
 - [x] Add rename/unlink/chmod/chown overlay permission regressions.

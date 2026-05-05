@@ -29,10 +29,10 @@ import { NodeAdapter } from '../packages/kernel/src/platform/node-adapter.js';
 
 const REPO_ROOT = resolve(import.meta.dirname, '..');
 const FIXTURES = resolve(REPO_ROOT, 'packages/kernel/src/platform/__tests__/fixtures');
-const BUSYBOX_WASM = resolve(REPO_ROOT, 'packages/c-ports/busybox/build/busybox.wasm');
+const BUSYBOX_WASM = resolve(REPO_ROOT, 'test-fixtures/c-ports/busybox/build/busybox.wasm');
 const BUSYBOX_WASM_FIXTURE = resolve(FIXTURES, 'busybox.wasm');
-const TESTSUITE_DIR = resolve(REPO_ROOT, 'packages/c-ports/busybox/src/testsuite');
-const BUSYBOX_CONFIG = resolve(REPO_ROOT, 'packages/c-ports/busybox/src/.config');
+const TESTSUITE_DIR = resolve(REPO_ROOT, 'test-fixtures/c-ports/busybox/src/testsuite');
+const BUSYBOX_CONFIG = resolve(REPO_ROOT, 'test-fixtures/c-ports/busybox/src/.config');
 const FINDINGS_DIR = resolve(REPO_ROOT, 'docs/superpowers/findings');
 const FINDINGS_FILE = resolve(FINDINGS_DIR, '2026-04-22-busybox-testsuite-on-yurt.md');
 
@@ -51,7 +51,7 @@ const PER_TEST_TIMEOUT_MS = 30_000;
 
 if (!existsSync(BUSYBOX_WASM)) {
   console.log('[busybox-testsuite] busybox.wasm not found at build/, running make...');
-  execSync('make -C packages/c-ports/busybox all', { cwd: REPO_ROOT, stdio: 'inherit' });
+  execSync('make -C test-fixtures/c-ports/busybox all', { cwd: REPO_ROOT, stdio: 'inherit' });
 }
 if (!existsSync(BUSYBOX_WASM_FIXTURE)) {
   console.log('[busybox-testsuite] copying busybox.wasm to fixtures...');
@@ -502,12 +502,12 @@ const doc = `# BusyBox Upstream Testsuite on Yurt — ${new Date().toISOString()
 
 **Runner**: \`scripts/run-busybox-testsuite-in-sandbox.ts\`
 **Elapsed**: ${elapsedSec}s
-**BusyBox binary**: \`packages/c-ports/busybox/build/busybox.wasm\`
+**BusyBox binary**: \`test-fixtures/c-ports/busybox/build/busybox.wasm\`
 **Sandbox fixtures**: \`packages/kernel/src/platform/__tests__/fixtures/\`
 
 ## Important Context: Minimal BusyBox Build
 
-The BusyBox binary in the yurt fixtures is built with a **minimal .config** (only \`grep\`, \`head\`, \`seq\` enabled) as a canary for the guest-compat runtime. The full upstream testsuite has 66+ applet test files; only tests for those 3 applets produce meaningful results. All other applet tests self-SKIP via the CONFIG_ flag checks in the test harness.
+The BusyBox binary in the yurt fixtures is built with a **minimal .config** (only \`grep\`, \`head\`, \`seq\` enabled) as a canary for the kernel ABI runtime. The full upstream testsuite has 66+ applet test files; only tests for those 3 applets produce meaningful results. All other applet tests self-SKIP via the CONFIG_ flag checks in the test harness.
 
 **Follow-up tracked**: Full BusyBox build with all applets enabled is needed for comprehensive upstream testsuite validation. See docs/superpowers/plans/ for Phase B scope.
 
