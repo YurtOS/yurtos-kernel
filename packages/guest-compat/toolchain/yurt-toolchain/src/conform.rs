@@ -15,9 +15,24 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
         ("pipe-canary", &["dup", "dup3", "pipe", "pipe2"]),
         ("getgroups-canary", &["getgroups"]),
         (
+            "posix-runtime-canary",
+            &["gethostname", "if_indextoname", "if_nametoindex", "sendfile"],
+        ),
+        (
+            "socket-canary",
+            &[
+                "getaddrinfo",
+                "freeaddrinfo",
+                "getnameinfo",
+                "gethostbyname",
+                "gethostbyaddr",
+            ],
+        ),
+        (
             "resource-canary",
             &[
                 "chown",
+                "chmod",
                 "chroot",
                 "fchdir",
                 "fchown",
@@ -59,7 +74,15 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
         ("spawn-wait-canary", &["wait", "waitpid"]),
         (
             "affinity-canary",
-            &["sched_getaffinity", "sched_setaffinity", "sched_getcpu"],
+            &[
+                "sched_getaffinity",
+                "sched_setaffinity",
+                "sched_getcpu",
+                "sched_getscheduler",
+                "sched_setscheduler",
+                "sched_getparam",
+                "sched_setparam",
+            ],
         ),
         (
             "signal-canary",

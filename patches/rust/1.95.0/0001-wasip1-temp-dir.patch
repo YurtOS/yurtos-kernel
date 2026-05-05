@@ -1,0 +1,81 @@
+diff --git a/library/std/src/sys/pal/wasi/os.rs b/library/std/src/sys/pal/wasi/os.rs
+--- a/library/std/src/sys/pal/wasi/os.rs
++++ b/library/std/src/sys/pal/wasi/os.rs
+@@ -7,6 +7,8 @@ use crate::sys::helpers::run_path_with_cstr;
+ use crate::sys::unsupported;
+ use crate::{fmt, io};
+
++#[path = "yurt.rs"]
++mod yurt;
+ // Add a few symbols not in upstream `libc` just yet.
+ pub mod libc {
+     pub use libc::*;
+@@ -53,57 +55,57 @@ pub fn chdir(p: &path::Path) -> io::Result<()> {
+     }
+ }
+
+-pub struct SplitPaths<'a>(!, PhantomData<&'a ()>);
++pub struct SplitPaths<'a>(crate::vec::IntoIter<PathBuf>, PhantomData<&'a ()>);
+
+-pub fn split_paths(_unparsed: &OsStr) -> SplitPaths<'_> {
+-    panic!("unsupported")
++pub fn split_paths(unparsed: &OsStr) -> SplitPaths<'_> {
++    SplitPaths(yurt::split_paths(unparsed).into_iter(), PhantomData)
+ }
+
+ impl<'a> Iterator for SplitPaths<'a> {
+     type Item = PathBuf;
+     fn next(&mut self) -> Option<PathBuf> {
+-        self.0
++        self.0.next()
+     }
+ }
+
+ #[derive(Debug)]
+ pub struct JoinPathsError;
+
+-pub fn join_paths<I, T>(_paths: I) -> Result<OsString, JoinPathsError>
++pub fn join_paths<I, T>(paths: I) -> Result<OsString, JoinPathsError>
+ where
+     I: Iterator<Item = T>,
+     T: AsRef<OsStr>,
+ {
+-    Err(JoinPathsError)
++    yurt::join_paths(paths).ok_or(JoinPathsError)
+ }
+
+ impl fmt::Display for JoinPathsError {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        "not supported on wasm yet".fmt(f)
++        "path segment contains separator `:`".fmt(f)
+     }
+ }
+
+ impl crate::error::Error for JoinPathsError {}
+
+ pub fn current_exe() -> io::Result<PathBuf> {
+-    unsupported()
++    yurt::current_exe()
+ }
+
+ #[allow(dead_code)]
+ pub fn page_size() -> usize {
+     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+ }
+
+ pub fn temp_dir() -> PathBuf {
+-    panic!("no filesystem on wasm")
++    yurt::temp_dir()
+ }
+
+ pub fn home_dir() -> Option<PathBuf> {
+-    None
++    yurt::home_dir()
+ }
+
+ pub fn getpid() -> u32 {
+-    panic!("unsupported");
++    yurt::getpid()
+ }
+
+ #[doc(hidden)]

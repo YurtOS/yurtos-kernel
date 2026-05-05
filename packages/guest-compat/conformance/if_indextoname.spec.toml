@@ -1,0 +1,16 @@
+canary = "posix-runtime-canary"
+summary = "Map the single visible loopback interface index to its name."
+
+[[case]]
+name = "loopback_index_to_name"
+inputs = "if_indextoname(1, buf)"
+expected.exit = 0
+expected.stdout = "if_indextoname:lo"
+
+[[case]]
+name = "missing_index"
+inputs = "if_indextoname(2, buf)"
+expected.exit = 0
+expected.stdout = "if_indextoname_missing:null"
+expected.errno = 60
+expected.note = "ENXIO is 60 on wasi-libc"

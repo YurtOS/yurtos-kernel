@@ -64,11 +64,50 @@ static int case_getcpu_zero(void) {
   return 0;
 }
 
+static int case_scheduler_policy_metadata(void) {
+  struct sched_param param;
+  memset(&param, 0, sizeof(param));
+
+  if (sched_getscheduler(0) != SCHED_OTHER) {
+    emit("scheduler_policy_metadata", 1, "scheduler:policy_not_other", 1, errno);
+    return 1;
+  }
+  if (sched_getparam(0, &param) != 0 || param.sched_priority != 0) {
+    emit("scheduler_policy_metadata", 1, "scheduler:getparam_failed", 1, errno);
+    return 1;
+  }
+  if (sched_setscheduler(0, SCHED_OTHER, &param) != 0) {
+    emit("scheduler_policy_metadata", 1, "scheduler:setscheduler_noop_failed", 1, errno);
+    return 1;
+  }
+  if (sched_setparam(0, &param) != 0) {
+    emit("scheduler_policy_metadata", 1, "scheduler:setparam_noop_failed", 1, errno);
+    return 1;
+  }
+
+  param.sched_priority = 1;
+  errno = 0;
+  if (sched_setparam(0, &param) != -1 || errno != EINVAL) {
+    emit("scheduler_policy_metadata", 1, "scheduler:setparam_not_einval", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (sched_setscheduler(0, SCHED_FIFO, &param) != -1 || errno != EPERM) {
+    emit("scheduler_policy_metadata", 1, "scheduler:fifo_not_eperm", 1, errno);
+    return 1;
+  }
+
+  emit("scheduler_policy_metadata", 0, "scheduler:policy=other,param=0", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "get_reports_one_cpu") == 0) return case_get_reports_one_cpu();
   if (strcmp(name, "set_cpu0_succeeds") == 0) return case_set_cpu0_succeeds();
   if (strcmp(name, "set_cpu1_einval") == 0) return case_set_cpu1_einval();
   if (strcmp(name, "getcpu_zero") == 0) return case_getcpu_zero();
+  if (strcmp(name, "scheduler_policy_metadata") == 0) return case_scheduler_policy_metadata();
   fprintf(stderr, "affinity-canary: unknown case %s\n", name);
   return 2;
 }
@@ -78,6 +117,7 @@ static int list_cases(void) {
   puts("set_cpu0_succeeds");
   puts("set_cpu1_einval");
   puts("getcpu_zero");
+  puts("scheduler_policy_metadata");
   return 0;
 }
 

@@ -28,6 +28,7 @@ export interface WorkerConfig {
   stderrBytes?: number;
   toolAllowlist?: string[];
   memoryBytes?: number;
+  processes?: number;
   bridgeSab?: SharedArrayBuffer;
   networkPolicy?: { allowedHosts?: string[]; blockedHosts?: string[] };
   extensionRegistry?: ExtensionRegistry;
@@ -218,6 +219,7 @@ export class WorkerExecutor {
       stderrBytes: this.config.stderrBytes,
       toolAllowlist: this.config.toolAllowlist,
       memoryBytes: this.config.memoryBytes,
+      processes: this.config.processes,
       bridgeSab: this.config.bridgeSab,
       networkPolicy: this.config.networkPolicy,
       hasExtensions: this.config.extensionRegistry != null,
@@ -294,6 +296,8 @@ export class WorkerExecutor {
             type: st.type,
             size: st.size,
             permissions: st.permissions,
+            uid: st.uid,
+            gid: st.gid,
             mtime: st.mtime.toISOString(),
             ctime: st.ctime.toISOString(),
             atime: st.atime.toISOString(),
@@ -307,6 +311,8 @@ export class WorkerExecutor {
             type: lst.type,
             size: lst.size,
             permissions: lst.permissions,
+            uid: lst.uid,
+            gid: lst.gid,
             mtime: lst.mtime.toISOString(),
             ctime: lst.ctime.toISOString(),
             atime: lst.atime.toISOString(),
@@ -352,6 +358,19 @@ export class WorkerExecutor {
         }
         case 'chmod': {
           vfs.chmod(metadata.path as string, metadata.mode as number);
+          encodeResponse(this.sab, { ok: true });
+          Atomics.store(this.int32, 0, STATUS_RESPONSE);
+          break;
+        }
+        case 'chown': {
+          vfs.withWriteAccess(() => {
+            vfs.chown(
+              metadata.path as string,
+              metadata.uid as number,
+              metadata.gid as number,
+              metadata.followSymlinks as boolean | undefined,
+            );
+          });
           encodeResponse(this.sab, { ok: true });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;

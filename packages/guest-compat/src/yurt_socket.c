@@ -277,7 +277,7 @@ int socket(int domain, int type, int protocol) {
 
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   YURT_MARKER_CALL(connect);
-  char host[INET_ADDRSTRLEN];
+  char host[256];
   char req[256];
   char resp[YURT_SOCKET_RESP_CAP];
   int n;

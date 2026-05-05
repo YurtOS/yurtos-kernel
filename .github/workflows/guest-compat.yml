@@ -1,0 +1,79 @@
+name: Guest Compat Fixtures
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - codex/posix-libc-runtime
+
+jobs:
+  build-fixtures:
+    name: Build generated fixtures and run kernel smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-wasip1
+          components: rust-src
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Binaryen
+        run: |
+          set -euxo pipefail
+          BINARYEN_VER=119
+          curl -sSL -o /tmp/binaryen.tar.gz \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VER}/binaryen-version_${BINARYEN_VER}-x86_64-linux.tar.gz"
+          mkdir -p "$HOME/.binaryen"
+          tar -xzf /tmp/binaryen.tar.gz -C "$HOME/.binaryen" --strip-components=1
+          echo "$HOME/.binaryen/bin" >> "$GITHUB_PATH"
+
+      - name: Install WASI SDK
+        run: |
+          set -euxo pipefail
+          WASI_SDK_VER=30.0
+          curl -sSL -o /tmp/wasi-sdk.tar.gz \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VER%%.*}/wasi-sdk-${WASI_SDK_VER}-x86_64-linux.tar.gz"
+          mkdir -p "$HOME/.local/share"
+          tar -xzf /tmp/wasi-sdk.tar.gz -C "$HOME/.local/share"
+          mv "$HOME/.local/share"/wasi-sdk-${WASI_SDK_VER}* "$HOME/.local/share/wasi-sdk"
+          echo "WASI_SDK_PATH=$HOME/.local/share/wasi-sdk" >> "$GITHUB_ENV"
+
+      - name: Build Yurt toolchain
+        run: cargo build --release -p yurt-toolchain
+
+      - name: Build guest compat canaries
+        run: make -C packages/guest-compat all copy-fixtures
+
+      - name: Build Rust std canaries
+        run: |
+          set -euxo pipefail
+          RUST_VERSION="$(rustc --version | awk '{print $2}')"
+          scripts/build-rust-std.sh --rust "$RUST_VERSION"
+          make -C packages/guest-compat rust-canaries rust-std-canaries
+
+      - name: Build BusyBox fixture
+        run: make -C packages/c-ports/busybox copy-fixtures
+
+      - name: Run fixture smoke tests
+        run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/fixture-build-smoke.test.ts packages/kernel/src/process/__tests__/module-cache.test.ts
+
+      - name: Run guest compatibility tests
+        run: deno test --no-check --allow-read --allow-env --allow-run packages/kernel/src/__tests__/guest-compat.test.ts
+
+      - name: Run VFS overlay tests
+        run: deno test --no-check --allow-read --allow-write --allow-env packages/kernel/src/vfs/__tests__/overlay-vfs.test.ts packages/kernel/src/vfs/__tests__/root-provider.test.ts packages/kernel/src/__tests__/sandbox-base-root.test.ts
+
+      - name: Run adversarial security tests
+        run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/security-adversarial.test.ts

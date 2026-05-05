@@ -36,6 +36,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -58,12 +60,30 @@ static int exec_via_spawn(const char *prog, char *const argv[], char *const envp
     errno = EFAULT;
     return -1;
   }
+  if (strchr(prog, '/') != NULL) {
+    struct stat st;
+    if (stat(prog, &st) != 0) {
+      return -1;
+    }
+    if (S_ISDIR(st.st_mode) || (st.st_mode & 0111) == 0) {
+      errno = EACCES;
+      return -1;
+    }
+  }
   pid_t child = -1;
   int rc = posix_spawnp(&child, prog, /*file_actions=*/NULL, /*attrp=*/NULL,
                         argv, envp ? envp : environ);
   if (rc != 0 || child < 0) {
     errno = ENOENT;
     return -1;
+  }
+  /* This process image is supposed to disappear after a successful exec.
+   * Our spawn+wait emulation keeps it alive as a small waiter, so drop any
+   * inherited non-stdio descriptors now.  The spawned replacement already has
+   * its stdin/stdout/stderr refs; keeping extra pipe ends here can suppress EOF
+   * in shell pipelines. */
+  for (int fd = 3; fd < 2048; ++fd) {
+    close(fd);
   }
   int status = 0;
   if (waitpid(child, &status, 0) != child) {

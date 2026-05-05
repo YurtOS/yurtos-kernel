@@ -1,0 +1,9 @@
+canary = "posix-runtime-canary"
+symbol = "fchdir"
+
+[[cases]]
+name = "cwd_backend"
+inputs = "chdir absolute, chdir relative, getcwd, fchdir(open directory fd)"
+expected.exit = 0
+expected.stdout = "cwd_backend:ok"
+expected.note = "cwd is process/kernel state and fchdir resolves a real directory fd"

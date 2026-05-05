@@ -1,0 +1,88 @@
+--- a/library/std/src/sys/process/unsupported.rs
++++ b/library/std/src/sys/process/unsupported.rs
+@@ -30,6 +30,7 @@
+     Inherit,
+     Null,
+     MakePipe,
++    Pipe(ChildPipe),
+     ParentStdout,
+     ParentStderr,
+     #[allow(dead_code)] // This variant exists only for the Debug impl
+@@ -105,46 +106,25 @@
+ }
+
+ pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+-    let stdout_pipe = create_pipe()?;
+-    let stderr_pipe = create_pipe()?;
+-    let mut actions = PosixSpawnFileActions::zeroed();
+-    let actions_ptr = &mut actions as *mut PosixSpawnFileActions;
++    let (mut process, mut pipes) = cmd.spawn(Stdio::MakePipe, false)?;
++    drop(pipes.stdin.take());
+
+-    let spawn_result = unsafe {
+-        cvt_spawn(posix_spawn_file_actions_init(actions_ptr))
+-            .and_then(|_| cvt_spawn(posix_spawn_file_actions_adddup2(actions_ptr, stdout_pipe[1], 1)))
+-            .and_then(|_| cvt_spawn(posix_spawn_file_actions_adddup2(actions_ptr, stderr_pipe[1], 2)))
+-            .and_then(|_| spawn_command(cmd, actions_ptr))
+-    };
+-
+-    unsafe {
+-        posix_spawn_file_actions_destroy(actions_ptr);
++    let mut stdout = Vec::new();
++    let mut stderr = Vec::new();
++    match (pipes.stdout.take(), pipes.stderr.take()) {
++        (None, None) => {}
++        (Some(out), None) => { out.read_to_end(&mut stdout)?; }
++        (None, Some(err)) => { err.read_to_end(&mut stderr)?; }
++        (Some(out), Some(err)) => { read_output(out, &mut stdout, err, &mut stderr)?; }
+     }
+-
+-    close_ignoring_error(stdout_pipe[1]);
+-    close_ignoring_error(stderr_pipe[1]);
+
+-    let mut process = match spawn_result {
+-        Ok((process, _pipes)) => process,
+-        Err(err) => {
+-            close_ignoring_error(stdout_pipe[0]);
+-            close_ignoring_error(stderr_pipe[0]);
+-            return Err(err);
+-        }
+-    };
+-
+     let status = process.wait()?;
+-    let stdout = read_all_fd(stdout_pipe[0]);
+-    let stderr = read_all_fd(stderr_pipe[0]);
+-    close_ignoring_error(stdout_pipe[0]);
+-    close_ignoring_error(stderr_pipe[0]);
+-
+-    Ok((status, stdout?, stderr?))
++    Ok((status, stdout, stderr))
+ }
+
+ impl From<ChildPipe> for Stdio {
+     fn from(pipe: ChildPipe) -> Stdio {
+-        pipe.diverge()
++        Stdio::Pipe(pipe)
+     }
+ }
+
+@@ -474,6 +454,9 @@
+             close_after_spawn.push(pipe[0]);
+             close_on_error.extend_from_slice(&pipe);
+         }
++        Stdio::Pipe(pipe) => {
++            cvt_spawn(unsafe { posix_spawn_file_actions_adddup2(actions, pipe.as_raw_fd(), 0) })?;
++        }
+         Stdio::Null => {}
+         _ => {}
+     }
+@@ -496,6 +479,9 @@
+             close_after_spawn.push(pipe[1]);
+             close_on_error.extend_from_slice(&pipe);
+         }
++        Stdio::Pipe(pipe) => {
++            cvt_spawn(unsafe { posix_spawn_file_actions_adddup2(actions, pipe.as_raw_fd(), child_fd) })?;
++        }
+         Stdio::Null => {}
+         _ => {}
+     }

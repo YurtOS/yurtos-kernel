@@ -7,8 +7,28 @@ import type { PersistenceBackend } from './backend.js';
 /** Serialized representation of the VFS + env state. */
 export interface SerializedState {
   version: number;
-  files: Array<{ path: string; data: string; type: 'file' | 'dir'; permissions?: number }>;
+  files: Array<{
+    path: string;
+    data: string;
+    type: 'file' | 'dir' | 'symlink';
+    permissions?: number;
+    uid?: number;
+    gid?: number;
+  }>;
   env?: [string, string][];
+  includeBase?: boolean;
+  overlay?: {
+    baseId: string;
+    whiteouts: string[];
+  };
+}
+
+export interface ExportStateOptions {
+  includeBase?: boolean;
+}
+
+export interface ImportStateOptions {
+  allowSystemPaths?: boolean;
 }
 
 /** Configuration for sandbox persistence behaviour. */

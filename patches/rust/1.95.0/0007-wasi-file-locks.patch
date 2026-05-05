@@ -1,0 +1,53 @@
+--- a/library/std/src/sys/fs/unix.rs
++++ b/library/std/src/sys/fs/unix.rs
+@@ -1471,7 +1471,7 @@
+         target_vendor = "apple",
+     )))]
+     pub fn lock(&self) -> io::Result<()> {
+-        Err(io::const_error!(io::ErrorKind::Unsupported, "lock() not supported"))
++        yurt_fs::lock(self.as_raw_fd())
+     }
+
+     #[cfg(any(
+@@ -1514,7 +1514,7 @@
+         target_vendor = "apple",
+     )))]
+     pub fn lock_shared(&self) -> io::Result<()> {
+-        Err(io::const_error!(io::ErrorKind::Unsupported, "lock_shared() not supported"))
++        yurt_fs::lock_shared(self.as_raw_fd())
+     }
+
+     #[cfg(any(
+@@ -1573,10 +1573,7 @@
+         target_vendor = "apple",
+     )))]
+     pub fn try_lock(&self) -> Result<(), TryLockError> {
+-        Err(TryLockError::Error(io::const_error!(
+-            io::ErrorKind::Unsupported,
+-            "try_lock() not supported"
+-        )))
++        yurt_fs::try_lock(self.as_raw_fd())
+     }
+
+     #[cfg(any(
+@@ -1635,10 +1632,7 @@
+         target_vendor = "apple",
+     )))]
+     pub fn try_lock_shared(&self) -> Result<(), TryLockError> {
+-        Err(TryLockError::Error(io::const_error!(
+-            io::ErrorKind::Unsupported,
+-            "try_lock_shared() not supported"
+-        )))
++        yurt_fs::try_lock_shared(self.as_raw_fd())
+     }
+
+     #[cfg(any(
+@@ -1681,7 +1675,7 @@
+         target_vendor = "apple",
+     )))]
+     pub fn unlock(&self) -> io::Result<()> {
+-        Err(io::const_error!(io::ErrorKind::Unsupported, "unlock() not supported"))
++        yurt_fs::unlock(self.as_raw_fd())
+     }
+
+     pub fn truncate(&self, size: u64) -> io::Result<()> {

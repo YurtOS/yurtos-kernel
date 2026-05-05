@@ -144,6 +144,30 @@ describe('Guest compatibility canaries', () => {
     expect(result.stdout.trim()).toBe('affinity:get=1,set0=0,set1=einval');
   });
 
+  it('reports priority changes as unsupported without an engine scheduler backend', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('posix-runtime-canary --case priority_unsupported');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('{"case":"priority_unsupported","exit":0,"stdout":"priority_unsupported:ok"}');
+  });
+
+  it('routes scheduler policy metadata through the process kernel', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('affinity-canary --case scheduler_policy_metadata');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe('{"case":"scheduler_policy_metadata","exit":0,"stdout":"scheduler:policy=other,param=0"}');
+  });
+
   // ──────────────────────────────────────────────────────────────────────
   // setjmp/longjmp — POSIX exception-style control flow over Asyncify.
   //
@@ -196,6 +220,22 @@ describe('Guest compatibility canaries', () => {
     });
   });
 
+  describe('fork-canary', () => {
+    it('keeps plain fork as ENOSYS outside continuation builds', async () => {
+      sandbox = await Sandbox.create({ wasmDir: FIXTURES, adapter: new NodeAdapter() });
+      const r = await sandbox.run('fork-default-canary --case default-enosys');
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toBe('fork-default-enosys');
+    });
+
+    it('splits parent and child under the asyncify continuation runtime', async () => {
+      sandbox = await Sandbox.create({ wasmDir: FIXTURES, adapter: new NodeAdapter() });
+      const r = await sandbox.run('fork-canary --case continuation-split');
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toMatch(/^fork-ok child=\d+ parent=\d+$/);
+    });
+  });
+
   it('routes stderr through stdout after dup2(1, 2)', async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
@@ -221,6 +261,90 @@ describe('Guest compatibility canaries', () => {
     expect(result.stdout.trim()).toBe('getgroups:1:1000');
   });
 
+  it('reports EPERM for unprivileged resource hard-limit raises', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('resource-canary');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('{"case":"setrlimit_raise_hard_eperm","exit":0,"v":0}');
+  });
+
+  describe('posix-runtime-canary', () => {
+    it('reports deterministic hostname and loopback interface lookups', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const hostname = await sandbox.run('posix-runtime-canary --case hostname');
+      expect(hostname.exitCode).toBe(0);
+      expect(hostname.stdout.trim()).toBe('{"case":"hostname","exit":0,"stdout":"hostname:yurt"}');
+
+      const nameToIndex = await sandbox.run('posix-runtime-canary --case loopback_name_to_index');
+      expect(nameToIndex.exitCode).toBe(0);
+      expect(nameToIndex.stdout.trim()).toBe(
+        '{"case":"loopback_name_to_index","exit":0,"stdout":"if_nametoindex:1"}',
+      );
+
+      const indexToName = await sandbox.run('posix-runtime-canary --case loopback_index_to_name');
+      expect(indexToName.exitCode).toBe(0);
+      expect(indexToName.stdout.trim()).toBe(
+        '{"case":"loopback_index_to_name","exit":0,"stdout":"if_indextoname:lo"}',
+      );
+    });
+
+    it('exercises deterministic sendfile edge behavior', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const zero = await sandbox.run('posix-runtime-canary --case sendfile_zero_count');
+      expect(zero.exitCode).toBe(0);
+      expect(zero.stdout.trim()).toBe(
+        '{"case":"sendfile_zero_count","exit":0,"stdout":"sendfile_zero:0"}',
+      );
+
+      const badFd = await sandbox.run('posix-runtime-canary --case sendfile_bad_fd');
+      expect(badFd.exitCode).toBe(0);
+      expect(badFd.stdout.trim()).toBe(
+        '{"case":"sendfile_bad_fd","exit":0,"stdout":"sendfile_bad_fd:-1","errno":8}',
+      );
+    });
+
+    it('preserves fcntl status flags on pipe descriptors', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run('posix-runtime-canary --case fcntl_pipe_status_flags');
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"fcntl_pipe_status_flags","exit":0,"stdout":"fcntl_pipe_status_flags:ok"}',
+      );
+    });
+
+    it('does not let F_SETFL change access mode bits', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run('posix-runtime-canary --case fcntl_setfl_masks_access_mode');
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"fcntl_setfl_masks_access_mode","exit":0,"stdout":"fcntl_setfl_masks_access_mode:ok"}',
+      );
+    });
+  });
+
   it('exposes the narrow signal compatibility header surface', async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
@@ -231,6 +355,20 @@ describe('Guest compatibility canaries', () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe('signal-ok');
+  });
+
+  it('delivers host-routed kill signals to guest handlers', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('signal-canary --case host_kill_delivers_handler');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      '{"case":"host_kill_delivers_handler","exit":0,"stdout":"kill:handled"}',
+    );
   });
 
   it('runs the pthread-canary single-thread compatibility test', async () => {
@@ -817,6 +955,20 @@ describe('Guest compatibility canaries', () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe('1\n2\n3');
+  });
+
+  it('preserves exec permission failures for non-executable VFS files', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('exec-canary execv_eacces');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      '{"case":"execv_eacces","exit":0,"errno":2}',
+    );
   });
 
   it('spawns a tool via a VFS symlink to a tool stub', async () => {

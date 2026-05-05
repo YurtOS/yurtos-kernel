@@ -70,6 +70,18 @@ export interface AsyncBridge {
   wrapExport(fn: (...args: number[]) => number): (...args: number[]) => Promise<number>;
 }
 
+export interface AsyncifyForkSnapshot {
+  memoryBytes: Uint8Array;
+  memoryPages: number;
+  dataAddr: number;
+  dataSize: number;
+  jmpBufStates: Array<[number, { savedHigh: number; savedData: Uint8Array }]>;
+}
+
+export interface AsyncifyForkController {
+  forkFromContinuation(snapshot: AsyncifyForkSnapshot): number;
+}
+
 // ── JSPI ──────────────────────────────────────────────────────────────────────
 
 class JspiAsyncBridge implements AsyncBridge {
@@ -125,6 +137,7 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     stopRewind: () => void;
     getState: () => number;
     dataAddr: number;
+    dataSize: number;
   } | null = null;
 
   // The guest's linear memory — needed to read/write the asyncify
@@ -145,7 +158,10 @@ class AsyncifyAsyncBridge implements AsyncBridge {
   // table from env pointer to the saved buffer contents.
   private pendingSetjmp: number | null = null;
   private pendingLongjmp: { envPtr: number; val: number } | null = null;
+  private pendingFork = false;
+  private pendingForkReturn: number | null = null;
   private jmpBufStates: Map<number, { savedHigh: number; savedData: Uint8Array }> = new Map();
+  private forkController: AsyncifyForkController | null = null;
 
   /**
    * Call once after instantiation.
@@ -155,7 +171,7 @@ class AsyncifyAsyncBridge implements AsyncBridge {
    *                  header + stack-save area).  The caller must have already
    *                  written the [start, end] header into WASM memory.
    */
-  initFromInstance(instance: WebAssembly.Instance, dataAddr: number, _dataSize?: number): void {
+  initFromInstance(instance: WebAssembly.Instance, dataAddr: number, dataSize = 0): void {
     const exp = instance.exports;
     this.exports = {
       startUnwind: exp.asyncify_start_unwind as (ptr: number) => void,
@@ -164,8 +180,13 @@ class AsyncifyAsyncBridge implements AsyncBridge {
       stopRewind:  exp.asyncify_stop_rewind  as () => void,
       getState:    exp.asyncify_get_state    as () => number,
       dataAddr,
+      dataSize,
     };
     this.memory = exp.memory as WebAssembly.Memory;
+  }
+
+  setForkController(controller: AsyncifyForkController | null): void {
+    this.forkController = controller;
   }
 
   /**
@@ -234,6 +255,35 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     this.exports.startUnwind(this.exports.dataAddr);
   };
 
+  hostFork = (): number => {
+    if (!this.exports) return -38; // ENOSYS
+    const exps = this.exports;
+    if (exps.getState() === 2 /* REWINDING */) {
+      exps.stopRewind();
+      const value = this.pendingForkReturn ?? -11; // EAGAIN if the controller failed.
+      this.pendingForkReturn = null;
+      return value;
+    }
+    this.pendingFork = true;
+    exps.startUnwind(exps.dataAddr);
+    return 0; // ignored during unwind
+  };
+
+  restoreForkSnapshot(snapshot: AsyncifyForkSnapshot, forkReturn: number): void {
+    this.jmpBufStates = new Map(
+      snapshot.jmpBufStates.map(([ptr, state]) => [
+        ptr,
+        { savedHigh: state.savedHigh, savedData: state.savedData.slice() },
+      ]),
+    );
+    this.pendingForkReturn = forkReturn;
+  }
+
+  startForkRewind(): void {
+    if (!this.exports) throw new Error('fork: bridge not initialized');
+    this.exports.startRewind(this.exports.dataAddr);
+  }
+
   /** Drop a recorded setjmp save-state.  Optional cleanup hook for
    *  callers that know a jmp_buf has gone out of scope. */
   forgetJmpBuf(envPtr: number): void {
@@ -264,6 +314,22 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     new Uint8Array(this.memory.buffer, this.exports.dataAddr + 8, state.savedData.length)
       .set(state.savedData);
     view.setUint32(this.exports.dataAddr, state.savedHigh, true);
+  }
+
+  private snapshotForkContinuation(): AsyncifyForkSnapshot {
+    if (!this.exports || !this.memory) {
+      throw new Error('fork: bridge not initialized');
+    }
+    return {
+      memoryBytes: new Uint8Array(this.memory.buffer).slice(),
+      memoryPages: this.memory.buffer.byteLength / 65536,
+      dataAddr: this.exports.dataAddr,
+      dataSize: this.exports.dataSize,
+      jmpBufStates: Array.from(this.jmpBufStates.entries()).map(([ptr, state]) => [
+        ptr,
+        { savedHigh: state.savedHigh, savedData: state.savedData.slice() },
+      ]),
+    };
   }
 
   /**
@@ -326,7 +392,15 @@ class AsyncifyAsyncBridge implements AsyncBridge {
       let result = fn(...args);
       while (exps.getState() === 1) {
         exps.stopUnwind();
-        if (this.pendingSetjmp !== null) {
+        if (this.pendingFork) {
+          this.pendingFork = false;
+          const childPid = this.forkController
+            ? this.forkController.forkFromContinuation(this.snapshotForkContinuation())
+            : -38; // ENOSYS
+          this.pendingForkReturn = childPid;
+          exps.startRewind(exps.dataAddr);
+          result = fn(...args);
+        } else if (this.pendingSetjmp !== null) {
           const envPtr = this.pendingSetjmp;
           this.pendingSetjmp = null;
           this.captureBuffer(envPtr);

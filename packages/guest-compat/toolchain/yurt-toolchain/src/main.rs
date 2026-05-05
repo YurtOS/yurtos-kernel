@@ -5,6 +5,7 @@ use std::process::{Command, ExitCode};
 
 use yurt_toolchain::{
     archive, env, features, preserve, wasi_sdk, wasm_opt, TIER1, WRAPPED_WASI_LIBC_SYMBOLS,
+    YURT_INTERNAL_EXPORTS,
 };
 
 #[derive(Parser, Debug)]
@@ -105,6 +106,9 @@ fn build_clang_invocation(
                     // it in stage 2.
                     argv.push(format!("-Wl,--export=__yurt_guest_compat_marker_{sym}").into());
                 }
+            }
+            for sym in YURT_INTERNAL_EXPORTS {
+                argv.push(format!("-Wl,--export={sym}").into());
             }
         }
     }

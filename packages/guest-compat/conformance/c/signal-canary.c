@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #ifndef SA_ONSTACK
 #error "SA_ONSTACK must be available for POSIX signal consumers"
@@ -156,6 +157,20 @@ static int case_sigsuspend_resumes_on_raise(void) {
   return 0;
 }
 
+static int case_host_kill_delivers_handler(void) {
+  struct sigaction sa;
+  signal_canary_seen = 0;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = signal_canary_handler;
+  if (sigaction(SIGUSR1, &sa, NULL) != 0) { emit("host_kill_delivers_handler", 1, NULL, 1, errno); return 1; }
+  if (kill(getpid(), SIGUSR1) != 0) { emit("host_kill_delivers_handler", 1, NULL, 1, errno); return 1; }
+  /* Delivery is queued by the host and drained at the next WASI syscall. */
+  (void)write(1, "", 0);
+  if (signal_canary_seen != SIGUSR1) { emit("host_kill_delivers_handler", 1, NULL, 0, 0); return 1; }
+  emit("host_kill_delivers_handler", 0, "kill:handled", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "signal_install") == 0) return case_signal_install();
   if (strcmp(name, "sigaction_raise") == 0) return case_sigaction_raise();
@@ -168,6 +183,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "sigismember_reports") == 0) return case_sigismember_reports();
   if (strcmp(name, "sigprocmask_roundtrip") == 0) return case_sigprocmask_roundtrip();
   if (strcmp(name, "sigsuspend_resumes_on_raise") == 0) return case_sigsuspend_resumes_on_raise();
+  if (strcmp(name, "host_kill_delivers_handler") == 0) return case_host_kill_delivers_handler();
   fprintf(stderr, "signal-canary: unknown case %s\n", name);
   return 2;
 }
@@ -184,6 +200,7 @@ static int list_cases(void) {
   puts("sigismember_reports");
   puts("sigprocmask_roundtrip");
   puts("sigsuspend_resumes_on_raise");
+  puts("host_kill_delivers_handler");
   return 0;
 }
 

@@ -5,10 +5,14 @@ introduced in Step 1 of the guest compatibility runtime migration. See
 [`docs/superpowers/specs/2026-04-19-guest-compat-runtime-design.md`](../../../docs/superpowers/specs/2026-04-19-guest-compat-runtime-design.md),
 §Conformance Testing.
 
-Current contents (Step 1):
+Current contents:
 
-- `c/` — C canaries (migrated from `packages/c-compat/examples/`).
-- `rust/` — placeholder. Rust canaries land in Step 3d.
+- `c/` — C canaries covering compile/link precedence and selected behavior.
+- `rust/` — Rust canaries for the runtime surface that is wired through
+  `cargo-yurt` and the Yurt-built standard library.
+- `*.spec.toml` — behavioral traces for deterministic cases that should be
+  stable across the C and Rust frontends.
 
-Deferred to Step 3a: `<symbol>.spec.toml` behavioral specs that both
-language canaries execute against.
+Specs are intentionally selective. A symbol can be Tier 1 signature-covered
+without a TOML spec when its behavior depends on host process state, networking,
+or follow-up kernel work that is not deterministic enough for the trace harness.

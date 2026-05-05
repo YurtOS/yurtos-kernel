@@ -36,6 +36,7 @@ describe('Persistence serializer', () => {
       const blob = exportState(src);
 
       const dst = new VFS();
+      dst.writeFile('/tmp/partial-owner.txt', enc('old'));
       importState(dst, blob);
 
       // Verify files were restored
@@ -274,6 +275,56 @@ describe('Persistence serializer', () => {
       expect(dst.stat('/tmp/readonly.txt').permissions).toBe(0o444);
       expect(dst.stat('/tmp/restricted').permissions).toBe(0o555);
     });
+
+    it('only restores ownership when both uid and gid are present', () => {
+      const src = new VFS();
+      src.withWriteAccess(() => {
+        src.writeFile('/tmp/partial-owner.txt', enc('data'));
+        src.chown('/tmp/partial-owner.txt', 1000, 1000);
+      });
+      const raw = JSON.parse(dec(exportState(src).subarray(12)));
+      const entry = raw.files.find((file: { path: string }) => file.path === '/tmp/partial-owner.txt');
+      delete entry.uid;
+      entry.gid = 2000;
+
+      const body = enc(JSON.stringify(raw));
+      const blob = new Uint8Array(8 + body.byteLength);
+      blob.set(new Uint8Array([0x57, 0x53, 0x4e, 0x44]), 0);
+      new DataView(blob.buffer).setUint32(4, 1, true);
+      blob.set(body, 8);
+      const dst = new VFS();
+      dst.writeFile('/tmp/partial-owner.txt', enc('old'));
+      importState(dst, blob);
+
+      expect(dst.stat('/tmp/partial-owner.txt').uid).toBe(1000);
+      expect(dst.stat('/tmp/partial-owner.txt').gid).toBe(1000);
+    });
+
+    it('does not import untrusted uid and gid ownership from safe user paths', () => {
+      const raw = {
+        version: 1,
+        files: [{
+          path: '/home/user/owned-by-blob.txt',
+          data: btoa('data'),
+          type: 'file',
+          permissions: 0o644,
+          uid: 0,
+          gid: 0,
+        }],
+      };
+
+      const body = enc(JSON.stringify(raw));
+      const blob = new Uint8Array(8 + body.byteLength);
+      blob.set(new Uint8Array([0x57, 0x53, 0x4e, 0x44]), 0);
+      new DataView(blob.buffer).setUint32(4, 1, true);
+      blob.set(body, 8);
+
+      const dst = new VFS();
+      importState(dst, blob);
+
+      expect(dst.stat('/home/user/owned-by-blob.txt').uid).toBe(1000);
+      expect(dst.stat('/home/user/owned-by-blob.txt').gid).toBe(1000);
+    });
   });
 });
 
@@ -306,6 +357,12 @@ describe('Sandbox exportState / importState', () => {
 
   it('does not serialize deterministic bootstrap binaries', async () => {
     sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+    let hasMagicDb = true;
+    try {
+      sandbox.stat('/usr/share/misc/magic.mgc');
+    } catch {
+      hasMagicDb = false;
+    }
 
     const blob = sandbox.exportState();
     const state = JSON.parse(dec(blob.subarray(12)));
@@ -317,7 +374,9 @@ describe('Sandbox exportState / importState', () => {
       sandbox2.importState(blob);
       expect(sandbox2.stat('/bin/bash').type).toBe('file');
       expect(sandbox2.readFile('/bin/bash').length).toBeGreaterThan(8);
-      expect(sandbox2.stat('/usr/share/misc/magic.mgc').type).toBe('file');
+      if (hasMagicDb) {
+        expect(sandbox2.stat('/usr/share/misc/magic.mgc').type).toBe('file');
+      }
     } finally {
       sandbox2.destroy();
     }

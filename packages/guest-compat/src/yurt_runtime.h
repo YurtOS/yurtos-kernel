@@ -19,6 +19,12 @@ int yurt_host_file_lock(int fd, int operation);
 __attribute__((import_module("yurt"), import_name("host_chmod")))
 int yurt_host_chmod(int path_ptr, int path_len, int mode);
 
+__attribute__((import_module("yurt"), import_name("host_chown")))
+int yurt_host_chown(int path_ptr, int path_len, int uid, int gid, int follow_symlinks);
+
+__attribute__((import_module("yurt"), import_name("host_fchown")))
+int yurt_host_fchown(int fd, int uid, int gid);
+
 __attribute__((import_module("yurt"), import_name("host_network_fetch")))
 int yurt_host_network_fetch(int req_ptr, int req_len, int out_ptr, int out_cap);
 
@@ -31,6 +37,60 @@ int yurt_host_getpid(void);
 
 __attribute__((import_module("yurt"), import_name("host_getppid")))
 int yurt_host_getppid(void);
+
+__attribute__((import_module("yurt"), import_name("host_getuid")))
+int yurt_host_getuid(void);
+
+__attribute__((import_module("yurt"), import_name("host_geteuid")))
+int yurt_host_geteuid(void);
+
+__attribute__((import_module("yurt"), import_name("host_getgid")))
+int yurt_host_getgid(void);
+
+__attribute__((import_module("yurt"), import_name("host_getegid")))
+int yurt_host_getegid(void);
+
+__attribute__((import_module("yurt"), import_name("host_setresuid")))
+int yurt_host_setresuid(int ruid, int euid, int suid);
+
+__attribute__((import_module("yurt"), import_name("host_setresgid")))
+int yurt_host_setresgid(int rgid, int egid, int sgid);
+
+__attribute__((import_module("yurt"), import_name("host_umask")))
+int yurt_host_umask(int mask);
+
+__attribute__((import_module("yurt"), import_name("host_getcwd")))
+int yurt_host_getcwd(int out_ptr, int out_cap);
+
+__attribute__((import_module("yurt"), import_name("host_chdir")))
+int yurt_host_chdir(int path_ptr, int path_len);
+
+__attribute__((import_module("yurt"), import_name("host_fchdir")))
+int yurt_host_fchdir(int fd);
+
+__attribute__((import_module("yurt"), import_name("host_getpriority")))
+int yurt_host_getpriority(int which, int who);
+
+__attribute__((import_module("yurt"), import_name("host_setpriority")))
+int yurt_host_setpriority(int which, int who, int prio);
+
+__attribute__((import_module("yurt"), import_name("host_sched_getscheduler")))
+int yurt_host_sched_getscheduler(int pid);
+
+__attribute__((import_module("yurt"), import_name("host_sched_getparam")))
+int yurt_host_sched_getparam(int pid);
+
+__attribute__((import_module("yurt"), import_name("host_sched_setscheduler")))
+int yurt_host_sched_setscheduler(int pid, int policy, int priority);
+
+__attribute__((import_module("yurt"), import_name("host_sched_setparam")))
+int yurt_host_sched_setparam(int pid, int priority);
+
+__attribute__((import_module("yurt"), import_name("host_getrlimit")))
+int yurt_host_getrlimit(int resource, void *out);
+
+__attribute__((import_module("yurt"), import_name("host_setrlimit")))
+int yurt_host_setrlimit(int resource, uint64_t soft, uint64_t hard);
 
 /* host_kill returns 0 on success, -1 with kill(2)-style ESRCH (no such
  * process) on failure.  sig=0 is the existence probe (no signal sent). */
@@ -66,13 +126,11 @@ int yurt_host_spawn(int req_ptr, int req_len);
 __attribute__((import_module("yurt"), import_name("host_waitpid")))
 int yurt_host_waitpid(int pid, int out_ptr, int out_cap);
 
-/* host_waitpid_nohang is the synchronous non-blocking variant —
- * returns the child's exit code if the process has already exited,
- * or -1 if it's still running.  Used internally by guest-side
- * helpers; not a real waitpid(WNOHANG) replacement because it
- * doesn't unblock signal-style notifications. */
+/* host_waitpid_nohang is the synchronous non-blocking variant.
+ * It writes {"pid":N,"exit_code":M} and returns the byte count when
+ * a child was reaped, -1 when no child has exited, and -2 for ECHILD. */
 __attribute__((import_module("yurt"), import_name("host_waitpid_nohang")))
-int yurt_host_waitpid_nohang(int pid);
+int yurt_host_waitpid_nohang(int pid, int out_ptr, int out_cap);
 
 /* host_wait_any writes { pid, exit_code } JSON into the output buffer and
  * suspends (JSPI) until a child exits.  Returns bytes written or -1.
@@ -85,6 +143,9 @@ int yurt_host_wait_any(int out_ptr, int out_cap);
  * Used by waitpid(-1, ..., WNOHANG). */
 __attribute__((import_module("yurt"), import_name("host_wait_any_nohang")))
 int yurt_host_wait_any_nohang(int out_ptr, int out_cap);
+
+__attribute__((import_module("yurt"), import_name("host_fork")))
+int yurt_host_fork(void);
 
 __attribute__((import_module("yurt"), import_name("host_thread_spawn")))
 int yurt_host_thread_spawn(int fn_ptr, int arg);
@@ -154,6 +215,11 @@ int yurt_host_socket_close(int req_ptr, int req_len);
  * Async (JSPI): the guest blocks until the host DNS lookup completes. */
 __attribute__((import_module("yurt"), import_name("host_dns_resolve")))
 int yurt_host_dns_resolve(int host_ptr, int host_len, int out_ptr, int out_cap);
+
+/* host_get_local_addr writes the sandbox-local IPv4 address string
+ * (for example "10.0.2.15") to [out_ptr, out_cap). */
+__attribute__((import_module("yurt"), import_name("host_get_local_addr")))
+int yurt_host_get_local_addr(int out_ptr, int out_cap);
 
 const char *yurt_netdb_host_for_addr(uint32_t addr_be);
 uint32_t yurt_netdb_addr_for_host(const char *host);

@@ -21,6 +21,7 @@ interface FdEntry {
   buffer: Uint8Array;
   offset: number;
   dirty: boolean;
+  refs: number;
   /**
    * Per-syscall stream callbacks for endless / device-style files
    * (/dev/urandom, /dev/zero, /dev/null, /dev/full).  When present,
@@ -67,6 +68,7 @@ export class FdTable {
         buffer: new Uint8Array(0),
         offset: 0,
         dirty: false,
+        refs: 1,
         streamRead: stream.read,
         streamWrite: stream.write,
       });
@@ -99,6 +101,7 @@ export class FdTable {
       buffer,
       offset,
       dirty: mode === 'w' || mode === 'a',
+      refs: 1,
     });
 
     return fd;
@@ -207,12 +210,13 @@ export class FdTable {
   /** Close an fd, flushing buffered writes to the VFS. */
   close(fd: number): void {
     const entry = this.getEntry(fd);
+    entry.refs--;
+    this.entries.delete(fd);
+    if (entry.refs > 0) return;
 
     if (entry.dirty) {
       this.vfs.writeFile(entry.path, entry.buffer);
     }
-
-    this.entries.delete(fd);
   }
 
   /** Duplicate an fd, returning a new fd with independent offset. */
@@ -226,6 +230,7 @@ export class FdTable {
       buffer: entry.buffer,
       offset: 0,
       dirty: entry.dirty,
+      refs: 1,
     });
 
     return newFd;
@@ -234,6 +239,15 @@ export class FdTable {
   /** Check whether an fd is currently open. */
   isOpen(fd: number): boolean {
     return this.entries.has(fd);
+  }
+
+  countOpen(): number {
+    return this.entries.size;
+  }
+
+  /** Return the currently open fd numbers. */
+  openFds(): number[] {
+    return Array.from(this.entries.keys());
   }
 
   /** Move an fd entry from one number to another. Closes toFd if open. */
@@ -263,19 +277,18 @@ export class FdTable {
     return this.entries.get(fd)?.path;
   }
 
-  /** Clone the entire fd table (for fork simulation). Returns a new independent table. */
+  getMode(fd: number): OpenMode | undefined {
+    return this.entries.get(fd)?.mode;
+  }
+
+  /** Clone the fd table for fork, sharing POSIX open file descriptions. */
   clone(): FdTable {
     const cloned = new FdTable(this.vfs);
     cloned.nextFd = this.nextFd;
 
     for (const [fd, entry] of this.entries) {
-      cloned.entries.set(fd, {
-        path: entry.path,
-        mode: entry.mode,
-        buffer: new Uint8Array(entry.buffer),
-        offset: entry.offset,
-        dirty: entry.dirty,
-      });
+      entry.refs++;
+      cloned.entries.set(fd, entry);
     }
 
     return cloned;

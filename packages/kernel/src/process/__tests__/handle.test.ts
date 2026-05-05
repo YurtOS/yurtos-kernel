@@ -50,3 +50,17 @@ Deno.test('Process.callExport serializes FIFO per process', async () => {
 
   assertEquals(maxInflight, 1, 'FIFO must serialize callExport: at most 1 in flight');
 });
+
+Deno.test('Process.terminate is idempotent', async () => {
+  const p = Process.__forTesting({ pid: 7, mode: 'cli' });
+  let calls = 0;
+  p.__setTerminate(async () => {
+    calls++;
+  });
+
+  await p.terminate();
+  await p.terminate();
+
+  assertEquals(calls, 1);
+  assertEquals(p.exitCode, 0);
+});
