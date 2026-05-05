@@ -71,6 +71,7 @@ done:
     off_t end = lseek(in_fd, 0, SEEK_CUR);
     if (end == (off_t)-1) {
       if (total == 0) return -1;
+      *offset += (off_t)total;
     } else {
       *offset = end;
     }

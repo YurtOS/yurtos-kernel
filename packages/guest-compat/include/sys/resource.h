@@ -17,7 +17,9 @@
 #define PRIO_PGRP    1
 #define PRIO_USER    2
 
-typedef unsigned long rlim_t;
+#include <stdint.h>
+
+typedef uint64_t rlim_t;
 struct rlimit {
     rlim_t rlim_cur;
     rlim_t rlim_max;

@@ -36,6 +36,7 @@ describe('Persistence serializer', () => {
       const blob = exportState(src);
 
       const dst = new VFS();
+      dst.writeFile('/tmp/partial-owner.txt', enc('old'));
       importState(dst, blob);
 
       // Verify files were restored
@@ -273,6 +274,30 @@ describe('Persistence serializer', () => {
 
       expect(dst.stat('/tmp/readonly.txt').permissions).toBe(0o444);
       expect(dst.stat('/tmp/restricted').permissions).toBe(0o555);
+    });
+
+    it('only restores ownership when both uid and gid are present', () => {
+      const src = new VFS();
+      src.withWriteAccess(() => {
+        src.writeFile('/tmp/partial-owner.txt', enc('data'));
+        src.chown('/tmp/partial-owner.txt', 1000, 1000);
+      });
+      const raw = JSON.parse(dec(exportState(src).subarray(12)));
+      const entry = raw.files.find((file: { path: string }) => file.path === '/tmp/partial-owner.txt');
+      delete entry.uid;
+      entry.gid = 2000;
+
+      const body = enc(JSON.stringify(raw));
+      const blob = new Uint8Array(8 + body.byteLength);
+      blob.set(new Uint8Array([0x57, 0x53, 0x4e, 0x44]), 0);
+      new DataView(blob.buffer).setUint32(4, 1, true);
+      blob.set(body, 8);
+      const dst = new VFS();
+      dst.writeFile('/tmp/partial-owner.txt', enc('old'));
+      importState(dst, blob);
+
+      expect(dst.stat('/tmp/partial-owner.txt').uid).toBe(1000);
+      expect(dst.stat('/tmp/partial-owner.txt').gid).toBe(1000);
     });
   });
 });

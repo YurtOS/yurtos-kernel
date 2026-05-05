@@ -90,7 +90,7 @@ __attribute__((import_module("yurt"), import_name("host_getrlimit")))
 int yurt_host_getrlimit(int resource, void *out);
 
 __attribute__((import_module("yurt"), import_name("host_setrlimit")))
-int yurt_host_setrlimit(int resource, unsigned int soft, unsigned int hard);
+int yurt_host_setrlimit(int resource, uint64_t soft, uint64_t hard);
 
 /* host_kill returns 0 on success, -1 with kill(2)-style ESRCH (no such
  * process) on failure.  sig=0 is the existence probe (no signal sent). */

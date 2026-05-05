@@ -15,7 +15,7 @@ export const ROOT_GID = 0;
 export const USER_UID = 1000;
 export const USER_GID = 1000;
 export const RLIMIT_NOFILE = 7;
-export const RLIM_INFINITY_U32 = 0xffffffff;
+export const RLIM_INFINITY_U64 = 0xffff_ffff_ffff_ffffn;
 export const DEFAULT_MAX_PROCESSES = 64;
 
 export class ProcessLimitError extends Error {
@@ -266,7 +266,7 @@ export class ProcessKernel {
     return limit ? { ...limit } : null;
   }
 
-  setResourceLimit(pid: number, resource: number, softRaw: number, hardRaw: number): boolean {
+  setResourceLimit(pid: number, resource: number, softRaw: number | bigint, hardRaw: number | bigint): boolean {
     const entry = this.processTable.get(pid);
     if (!entry) return false;
     const current = entry.resourceLimits.get(resource);
@@ -985,15 +985,21 @@ function normalizeUmask(mask: number): number {
   return Math.trunc(mask) & 0o777;
 }
 
-function normalizeLimit(limit: number): number {
-  if (!Number.isFinite(limit)) return -1;
-  return Math.max(0, Math.min(RLIM_INFINITY_U32, Math.trunc(limit)));
+function normalizeLimit(limit: number | bigint): number {
+  if (typeof limit === 'bigint') {
+    if (limit === RLIM_INFINITY_U64) return Infinity;
+    if (limit < 0n) return -1;
+    if (limit > BigInt(Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER;
+    return Number(limit);
+  }
+  if (!Number.isFinite(limit)) return Infinity;
+  return Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.trunc(limit)));
 }
 
 function defaultResourceLimits(): Map<number, ResourceLimit> {
   return new Map([
-    [0, { soft: RLIM_INFINITY_U32, hard: RLIM_INFINITY_U32 }],
-    [1, { soft: RLIM_INFINITY_U32, hard: RLIM_INFINITY_U32 }],
+    [0, { soft: Infinity, hard: Infinity }],
+    [1, { soft: Infinity, hard: Infinity }],
     [2, { soft: 64 * 1024 * 1024, hard: 64 * 1024 * 1024 }],
     [3, { soft: 1024 * 1024, hard: 1024 * 1024 }],
     [4, { soft: 0, hard: 0 }],

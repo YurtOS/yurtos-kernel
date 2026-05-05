@@ -40,7 +40,7 @@ int setrlimit(int resource, const struct rlimit *rlim) {
     return -1;
   }
 
-  int rc = yurt_host_setrlimit(resource, (unsigned int)rlim->rlim_cur, (unsigned int)rlim->rlim_max);
+  int rc = yurt_host_setrlimit(resource, rlim->rlim_cur, rlim->rlim_max);
   if (rc < 0) {
     errno = EINVAL;
     return -1;

@@ -310,6 +310,30 @@ describe('mode-bit enforcement', () => {
     expect(vfs.stat('/tmp/owned-dir/file.txt').permissions).toBe(0o444);
   });
 
+  it('chmod denies non-owners and masks file type bits from raw st_mode values', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.writeFile('/tmp/mode.txt', new Uint8Array(1));
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+
+    expect(() => other.chmod('/tmp/mode.txt', 0o777)).toThrow(/EACCES/);
+
+    owner.chmod('/tmp/mode.txt', 0o100644);
+    expect(owner.stat('/tmp/mode.txt').permissions).toBe(0o644);
+  });
+
+  it('chown is root-only and lchown mutates the symlink inode', () => {
+    const owner = new VFS({ uid: 1000, gid: 1000 });
+    owner.writeFile('/tmp/target.txt', new Uint8Array(1));
+    owner.symlink('/tmp/target.txt', '/tmp/link.txt');
+
+    expect(() => owner.chown('/tmp/target.txt', 2000, 2000)).toThrow(/EACCES/);
+
+    const root = owner.cowClone({ uid: 0, gid: 0 });
+    root.chown('/tmp/link.txt', 2000, 2000, false);
+    expect(root.lstat('/tmp/link.txt').uid).toBe(2000);
+    expect(root.stat('/tmp/target.txt').uid).toBe(1000);
+  });
+
   it('uses group write bit when uid differs but gid matches', () => {
     const owner = new VFS({ uid: 2000, gid: 1000 });
     owner.writeFile('/tmp/group-writable.txt', new Uint8Array([1]));

@@ -6,7 +6,7 @@
  * (for fork simulation) and extensible with pipes (for shell pipelines).
  */
 
-import type { DirEntry, DirInode, Inode, StatResult } from './inode.js';
+import type { DirEntry, DirInode, FsCredential, Inode, StatResult } from './inode.js';
 import {
   VfsError,
   createDirInode,
@@ -336,6 +336,16 @@ export class VFS {
     }
   }
 
+  private assertChmodPermission(inode: Inode): void {
+    if (this.initializing || this.uid === ROOT_UID || inode.metadata.uid === this.uid) return;
+    throw new VfsError('EACCES', 'permission denied');
+  }
+
+  private assertChownPermission(): void {
+    if (this.initializing || this.uid === ROOT_UID) return;
+    throw new VfsError('EACCES', 'permission denied');
+  }
+
   /** Throw ENOSPC if the file-count limit has been reached. */
   private assertFileCountLimit(): void {
     if (this.fileCountLimit !== undefined && this.currentFileCount >= this.fileCountLimit) {
@@ -574,6 +584,19 @@ export class VFS {
     }
   }
 
+  withCredential<T>(credential: FsCredential, fn: () => T): T {
+    const prevUid = this.uid;
+    const prevGid = this.gid;
+    this.uid = credential.uid;
+    this.gid = credential.gid;
+    try {
+      return fn();
+    } finally {
+      this.uid = prevUid;
+      this.gid = prevGid;
+    }
+  }
+
   writeFile(path: string, data: Uint8Array, mode = 0o644): void {
     const match = this.matchProvider(path);
     if (match) {
@@ -793,13 +816,15 @@ export class VFS {
 
   chmod(path: string, mode: number): void {
     const inode = this.resolve(path);
-    inode.metadata.permissions = mode;
+    this.assertChmodPermission(inode);
+    inode.metadata.permissions = normalizeMode(mode);
     inode.metadata.ctime = new Date();
     this.notifyChange();
   }
 
   chown(path: string, uid: number, gid: number, followSymlinks = true): void {
     const inode = this.resolve(path, followSymlinks);
+    this.assertChownPermission();
     inode.metadata.uid = uid;
     inode.metadata.gid = gid;
     inode.metadata.ctime = new Date();

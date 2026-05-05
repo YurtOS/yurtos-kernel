@@ -277,6 +277,41 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       : fn();
   }
 
+  function limitToBigUint64(limit: number): bigint {
+    if (!Number.isFinite(limit)) return 0xffff_ffff_ffff_ffffn;
+    return BigInt(Math.max(0, Math.trunc(limit)));
+  }
+
+  function closeFdTarget(target: FdTarget): void {
+    if (target.type === 'pipe_write') target.pipe.close();
+    if (target.type === 'pipe_read') target.pipe.close();
+    if (target.type === 'vfs_file') {
+      target.refs--;
+      if (target.refs <= 0) target.fdTable.close(target.fd);
+    }
+    if (target.type === 'socket') {
+      target.refs--;
+      if (target.refs <= 0) {
+        if (target.listener != null && target.closeListener) {
+          target.closeListener(target.listener);
+          target.listener = null;
+        }
+        if (target.socket !== null) {
+          target.close(target.socket);
+          target.socket = null;
+        }
+      }
+    }
+    if (target.type === 'tty_master') {
+      target.state.masterClosed = true;
+      for (const waiter of target.state.toSlaveWaiters.splice(0)) waiter();
+    }
+  }
+
+  function retainFdTarget(target: FdTarget): void {
+    if (target.type === 'vfs_file' || target.type === 'socket') target.refs++;
+  }
+
   function setFallbackUid(ruid: number, euid: number, suid: number): number {
     const current = new Set([fallbackUid]);
     for (const value of [ruid, euid, suid]) {
@@ -485,16 +520,19 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (opts.spawnProcess && opts.kernel) {
         if (!opts.kernel.canReserveProcessSlot()) return -1;
         const fdTable = opts.kernel.buildFdTableForSpawn(callerPid, req);
+        let previousStdin: FdTarget | undefined;
         // If stdin_data is provided, override fd 0 with a static target
         if (req.stdin_data) {
-          const previousStdin = fdTable.get(0);
-          if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
+          previousStdin = fdTable.get(0);
           fdTable.set(0, createStaticTarget(new TextEncoder().encode(req.stdin_data)));
         }
         try {
-          return opts.spawnProcess(req, fdTable, callerPid);
+          const childPid = opts.spawnProcess(req, fdTable, callerPid);
+          if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
+          return childPid;
         } catch {
           opts.kernel.releaseFdTable(fdTable);
+          if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
           return -1;
         }
       }
@@ -603,12 +641,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       const limit = opts.kernel?.getResourceLimit(callerPid, Math.trunc(resourceRaw)) ?? defaultImportResourceLimit(Math.trunc(resourceRaw));
       if (!limit) return ERR_INVALID;
       const view = new DataView(memory.buffer);
-      view.setUint32(outPtr, limit.soft, true);
-      view.setUint32(outPtr + 4, limit.hard, true);
+      view.setBigUint64(outPtr, limitToBigUint64(limit.soft), true);
+      view.setBigUint64(outPtr + 8, limitToBigUint64(limit.hard), true);
       return 0;
     },
 
-    host_setrlimit(resourceRaw: number, softRaw: number, hardRaw: number): number {
+    host_setrlimit(resourceRaw: number, softRaw: number | bigint, hardRaw: number | bigint): number {
       const resource = Math.trunc(resourceRaw);
       if (!opts.kernel) return defaultImportResourceLimit(resource) ? 0 : ERR_INVALID;
       return opts.kernel.setResourceLimit(callerPid, resource, softRaw, hardRaw) ? 0 : ERR_INVALID;
@@ -910,8 +948,15 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         }
         if (opts.wasiHost) {
           const ioFds = opts.wasiHost.getIoFds();
+          if (opts.kernel && ioFds === opts.kernel.getFdTable(callerPid)) return 0;
           const target = ioFds.get(srcFd);
-          if (target) ioFds.set(dstFd, target);
+          if (target) {
+            if (srcFd === dstFd) return 0;
+            const existing = ioFds.get(dstFd);
+            if (existing) closeFdTarget(existing);
+            retainFdTarget(target);
+            ioFds.set(dstFd, target);
+          }
           else if (!opts.kernel) return -1;
         }
         return 0;
@@ -1712,9 +1757,8 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     host_chown(pathPtr: number, pathLen: number, uid: number, gid: number, followSymlinks: number): number {
       if (!opts.vfs) return ERR_IO;
       const path = readString(memory, pathPtr, pathLen);
+      if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
       try {
-        opts.vfs.stat(path);
-        if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
         withVfsCallerCredentials(() => opts.vfs!.chown(path, uid, gid, followSymlinks !== 0));
         return 0;
       } catch (e: unknown) {
@@ -1847,7 +1891,7 @@ function defaultImportResourceLimit(resource: number): { soft: number; hard: num
   switch (resource) {
     case 0:
     case 1:
-      return { soft: 0xffffffff, hard: 0xffffffff };
+      return { soft: Infinity, hard: Infinity };
     case 2:
     case 5:
       return { soft: 64 * 1024 * 1024, hard: 64 * 1024 * 1024 };

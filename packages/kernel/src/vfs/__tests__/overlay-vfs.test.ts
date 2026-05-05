@@ -374,6 +374,23 @@ describe('OverlayVFS', () => {
     expect(base.stat('/etc/root.conf').permissions).toBe(0o644);
   });
 
+  it('forwards lchown to upper symlink metadata instead of the target', () => {
+    const base = new MemoryRoot();
+    base.addDir('/work', { uid: 1000, gid: 1000, permissions: 0o755 });
+    const upper = new VFS();
+    const vfs = new OverlayVFS({ base, upper, credential: { uid: 0, gid: 0 } });
+    vfs.withWriteAccess(() => {
+      vfs.writeFile('/work/target.txt', enc.encode('target'));
+      vfs.chown('/work/target.txt', 1000, 1000);
+      vfs.symlink('/work/target.txt', '/work/link.txt');
+    });
+
+    vfs.chown('/work/link.txt', 2000, 2000, false);
+
+    expect(vfs.lstat('/work/link.txt').uid).toBe(2000);
+    expect(vfs.stat('/work/target.txt').uid).toBe(1000);
+  });
+
   it('can clone the upper layer while sharing the same base', () => {
     const base = new MemoryRoot();
     base.addFile('/base.txt', 'base');

@@ -6,7 +6,8 @@ import { OverlayVFS } from "../../vfs/overlay-vfs.ts";
 import { MemoryRoot } from "../../vfs/__tests__/helpers.ts";
 import { ProcessKernel } from "../../process/kernel.ts";
 import { FdTable } from "../../vfs/fd-table.ts";
-import { createVfsFileTarget } from "../../wasi/fd-target.ts";
+import { createStaticTarget, createVfsFileTarget, type FdTarget } from "../../wasi/fd-target.ts";
+import { WasiHost } from "../../wasi/wasi-host.ts";
 import type { RuntimeEngineBackend } from "../../engine/backend.ts";
 
 const encoder = new TextEncoder();
@@ -128,6 +129,43 @@ Deno.test("kernel host_spawn releases cloned fd refs when spawnProcess fails", (
   assertEquals(target.refs, 1);
   assertEquals(fdTable.isOpen(fd), true);
   assertEquals(kernel.getReservedProcessCount(), 1);
+  kernel.dispose();
+});
+
+Deno.test("kernel host_spawn preserves cloned stdin refs when stdin_data spawn fails", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel({ maxProcesses: 2 });
+  const parentPid = kernel.allocPid();
+  const vfs = new VFS();
+  vfs.writeFile("/tmp/in.txt", new TextEncoder().encode("data"));
+  const fdTable = new FdTable(vfs);
+  const fd = fdTable.open("/tmp/in.txt", "r");
+  const target = createVfsFileTarget(fdTable, fd);
+  kernel.setFdTarget(parentPid, 0, target);
+  const request = JSON.stringify({
+    prog: "/bin/cat",
+    args: [],
+    env: [],
+    cwd: "/",
+    stdin_fd: 0,
+    stdout_fd: 1,
+    stderr_fd: 2,
+    stdin_data: "override",
+  });
+  const reqLen = writeString(memory, 0, request);
+
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: parentPid,
+    spawnProcess: () => {
+      throw new Error("boom");
+    },
+  });
+
+  assertEquals((imports.host_spawn as (...args: number[]) => number)(0, reqLen), -1);
+  assertEquals(target.refs, 1);
+  assertEquals(fdTable.isOpen(fd), true);
   kernel.dispose();
 });
 
@@ -336,6 +374,21 @@ Deno.test("host_chown is root-only and mutates inode ownership", () => {
   assertEquals((rootImports.host_chown as (...args: number[]) => number)(0, pathLen, 2000, 2000, 1), 0);
   assertEquals(vfs.stat("/tmp/owned.txt").uid, 2000);
   assertEquals(vfs.stat("/tmp/owned.txt").gid, 2000);
+});
+
+Deno.test("host_chown checks credentials before probing paths and supports dangling lchown", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.symlink("/tmp/missing-target.txt", "/tmp/dangling.txt");
+
+  let pathLen = writeString(memory, 0, "/tmp/missing.txt");
+  const userImports = createKernelImports({ memory, vfs, callerUid: 1000, callerGid: 1000 });
+  assertEquals((userImports.host_chown as (...args: number[]) => number)(0, pathLen, 2000, 2000, 1), -2);
+
+  pathLen = writeString(memory, 0, "/tmp/dangling.txt");
+  const rootImports = createKernelImports({ memory, vfs, callerUid: 0, callerGid: 0 });
+  assertEquals((rootImports.host_chown as (...args: number[]) => number)(0, pathLen, 2000, 2000, 0), 0);
+  assertEquals(vfs.lstat("/tmp/dangling.txt").uid, 2000);
 });
 
 Deno.test("host_fchown resolves vfs file descriptors through the kernel", () => {
@@ -547,16 +600,84 @@ Deno.test("host rlimit stores process-local limits inherited by children", () =>
   const imports = createKernelImports({ memory, kernel, callerPid: parentPid });
 
   assertEquals((imports.host_getrlimit as (...args: number[]) => number)(7, 64), 0);
-  assertEquals(view.getUint32(64, true), 1024);
-  assertEquals(view.getUint32(68, true), 1024);
+  assertEquals(view.getBigUint64(64, true), 1024n);
+  assertEquals(view.getBigUint64(72, true), 1024n);
 
-  assertEquals((imports.host_setrlimit as (...args: number[]) => number)(7, 4, 1024), 0);
+  assertEquals((imports.host_setrlimit as (...args: unknown[]) => number)(7, 4n, 1024n), 0);
   assertEquals((imports.host_getrlimit as (...args: number[]) => number)(7, 64), 0);
-  assertEquals(view.getUint32(64, true), 4);
-  assertEquals(view.getUint32(68, true), 1024);
+  assertEquals(view.getBigUint64(64, true), 4n);
+  assertEquals(view.getBigUint64(72, true), 1024n);
 
   const childPid = kernel.allocPid(parentPid, "child");
   assertEquals(kernel.getResourceLimit(childPid, 7), { soft: 4, hard: 1024 });
+});
+
+Deno.test("host rlimit preserves 64-bit values and RLIM_INFINITY", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const view = new DataView(memory.buffer);
+  const kernel = new ProcessKernel();
+  const pid = 1;
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+  const fiveGiB = 5n * 1024n * 1024n * 1024n;
+  const infinity = 0xffff_ffff_ffff_ffffn;
+
+  assertEquals((imports.host_setrlimit as (...args: unknown[]) => number)(0, fiveGiB, infinity), 0);
+  assertEquals((imports.host_getrlimit as (...args: number[]) => number)(0, 64), 0);
+  assertEquals(view.getBigUint64(64, true), fiveGiB);
+  assertEquals(view.getBigUint64(72, true), infinity);
+});
+
+Deno.test("host_dup2 closes overwritten WasiHost ioFds target", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS();
+  const fdTable = new FdTable(vfs);
+  vfs.writeFile("/tmp/old.txt", new Uint8Array(1));
+  const oldFd = fdTable.open("/tmp/old.txt", "r");
+  const oldTarget = createVfsFileTarget(fdTable, oldFd);
+  const ioFds = new Map<number, FdTarget>([
+    [1, createVfsFileTarget(fdTable, fdTable.open("/tmp/old.txt", "r"))],
+    [2, oldTarget],
+  ]);
+  const srcTarget = ioFds.get(1)! as FdTarget & { type: "vfs_file" };
+  const wasiHost = new WasiHost({ vfs, args: [], env: {}, preopens: {}, ioFds });
+  const imports = createKernelImports({ memory, wasiHost });
+
+  assertEquals((imports.host_dup2 as (...args: number[]) => number)(1, 2), 0);
+  assertEquals(oldTarget.refs, 0);
+  assertEquals(fdTable.isOpen(oldFd), false);
+  assertEquals(srcTarget.refs, 2);
+  assertEquals(wasiHost.getIoFds().get(2), srcTarget);
+});
+
+Deno.test("host_dup2 does not duplicate refcounts twice when WasiHost uses the kernel fd table", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS();
+  const fdTable = new FdTable(vfs);
+  const kernel = new ProcessKernel();
+  const pid = 1;
+  vfs.writeFile("/tmp/shared.txt", new Uint8Array(1));
+  vfs.writeFile("/tmp/old-shared.txt", new Uint8Array(1));
+  const srcTarget = createVfsFileTarget(fdTable, fdTable.open("/tmp/shared.txt", "r"));
+  const oldFd = fdTable.open("/tmp/old-shared.txt", "r");
+  const oldTarget = createVfsFileTarget(fdTable, oldFd);
+  kernel.setFdTarget(pid, 1, srcTarget);
+  kernel.setFdTarget(pid, 2, oldTarget);
+  const wasiHost = new WasiHost({
+    vfs,
+    args: [],
+    env: {},
+    preopens: {},
+    ioFds: kernel.getFdTable(pid),
+    kernel,
+    pid,
+  });
+  const imports = createKernelImports({ memory, kernel, callerPid: pid, wasiHost });
+
+  assertEquals((imports.host_dup2 as (...args: number[]) => number)(1, 2), 0);
+  assertEquals(srcTarget.refs, 2);
+  assertEquals(oldTarget.refs, 0);
+  assertEquals(fdTable.isOpen(oldFd), false);
+  assertEquals(kernel.getFdTarget(pid, 2), srcTarget);
 });
 
 Deno.test("host_spawn rejects nonzero nice when the engine has no scheduler backend", () => {

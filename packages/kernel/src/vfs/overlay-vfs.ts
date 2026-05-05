@@ -345,28 +345,28 @@ export class OverlayVFS implements VfsLike {
     path = normalizeOverlayPath(path);
     try {
       if (!this.privileged) this.assertCanChmodPath(path);
-      this.options.upper.chmod(path, mode);
+      this.withUpperCredential(() => this.options.upper.chmod(path, mode));
     } catch (e) {
       if (!isEnoent(e)) throw e;
       if (!this.privileged) this.assertCanChmodPath(path);
       this.copyUpMetadataOnly(path);
-      this.options.upper.chmod(path, mode);
+      this.withUpperCredential(() => this.options.upper.chmod(path, mode));
     }
     this.notifyChange();
   }
 
-  chown(path: string, uid: number, gid: number): void {
+  chown(path: string, uid: number, gid: number, followSymlinks = true): void {
     path = normalizeOverlayPath(path);
     if (!this.options.upper.chown) throw new VfsError('EACCES', 'chown unsupported on overlay upper');
     if (!this.privileged && this.credential.uid !== 0) {
       throw new VfsError('EACCES', `permission denied: ${path}`);
     }
     try {
-      this.options.upper.chown(path, uid, gid);
+      this.withUpperCredential(() => this.options.upper.chown!(path, uid, gid, followSymlinks));
     } catch (e) {
       if (!isEnoent(e)) throw e;
       this.copyUpMetadataOnly(path);
-      this.options.upper.chown(path, uid, gid);
+      this.withUpperCredential(() => this.options.upper.chown!(path, uid, gid, followSymlinks));
     }
     this.notifyChange();
   }
@@ -375,7 +375,10 @@ export class OverlayVFS implements VfsLike {
     const previous = this.credential;
     this.credential = credential;
     try {
-      return fn();
+      const upper = this.options.upper as VfsLike & {
+        withCredential?: <U>(credential: FsCredential, inner: () => U) => U;
+      };
+      return upper.withCredential ? upper.withCredential(credential, fn) : fn();
     } finally {
       this.credential = previous;
     }
@@ -460,6 +463,13 @@ export class OverlayVFS implements VfsLike {
     } finally {
       this.notificationDepth--;
     }
+  }
+
+  private withUpperCredential<T>(fn: () => T): T {
+    const upper = this.options.upper as VfsLike & {
+      withCredential?: <U>(credential: FsCredential, inner: () => U) => U;
+    };
+    return upper.withCredential ? upper.withCredential(this.credential, fn) : fn();
   }
 
   private copyUpMetadataOnly(path: string): void {
