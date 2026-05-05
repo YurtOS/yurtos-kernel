@@ -54,14 +54,14 @@ jobs:
         run: cargo build --release -p yurt-toolchain
 
       - name: Build guest compat canaries
-        run: make -C packages/guest-compat all copy-fixtures
+        run: make -C abi all copy-fixtures
 
       - name: Build Rust std canaries
         run: |
           set -euxo pipefail
           RUST_VERSION="$(rustc --version | awk '{print $2}')"
           scripts/build-rust-std.sh --rust "$RUST_VERSION"
-          make -C packages/guest-compat rust-canaries rust-std-canaries
+          make -C abi rust-canaries rust-std-canaries
 
       - name: Build BusyBox fixture
         run: make -C packages/c-ports/busybox copy-fixtures
