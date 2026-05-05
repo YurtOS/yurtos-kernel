@@ -802,10 +802,10 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Sets the foreground process group of the terminal on fd.
     // Returns 0 on success, -1 if fd is not a terminal.
     host_tcsetpgrp(fd: number, pgid: number): number {
+      if (!opts.kernel) return -1;
       const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
       if (target?.type === 'tty_slave' || target?.type === 'tty_master') {
-        target.state.fgPgid = pgid;
-        return 0;
+        return opts.kernel.tcsetpgrp(target.ttyId, pgid, callerPid) ? 0 : -1;
       }
       return -1;
     },

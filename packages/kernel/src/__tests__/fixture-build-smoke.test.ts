@@ -1,7 +1,7 @@
 /**
  * Smoke tests for fixtures that CI builds from source instead of checking in.
  *
- * The broader guest-compat suite also covers these surfaces, but it currently
+ * The broader ABI suite also covers these surfaces, but it currently
  * includes deferred python3 and Rust-std cases. This file is the CI guard that
  * proves source-built fixtures were copied into the kernel fixture directory
  * and are usable by the sandbox.
@@ -34,7 +34,7 @@ describe('source-built fixture smoke tests', () => {
     }
   });
 
-  it('runs representative guest-compat canaries', async () => {
+  it('runs representative ABI canaries', async () => {
     sandbox = await Sandbox.create({ wasmDir: FIXTURES, adapter: new NodeAdapter() });
     sandbox.writeFile('/tmp/in.txt', new TextEncoder().encode('hello fixture\n'));
 

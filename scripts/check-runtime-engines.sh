@@ -39,13 +39,13 @@ echo "==> Bun JS-host smoke"
 YURT_ALLOW_KNOWN_BUN_ASYNC_GAPS=1 bun scripts/smoke-js-engine.mjs
 
 echo "==> Wasmtime WASI smoke"
-wasmtime run packages/orchestrator/src/platform/__tests__/fixtures/true-cmd.wasm
-WASMTIME_OUT="$(wasmtime run packages/orchestrator/src/platform/__tests__/fixtures/hello.wasm)"
+wasmtime run packages/kernel/src/platform/__tests__/fixtures/true-cmd.wasm
+WASMTIME_OUT="$(wasmtime run packages/kernel/src/platform/__tests__/fixtures/hello.wasm)"
 test "$WASMTIME_OUT" = "hello from wasm"
 
 echo "==> Wasmer WASI smoke"
-wasmer run packages/orchestrator/src/platform/__tests__/fixtures/true-cmd.wasm
-WASMER_OUT="$(wasmer run packages/orchestrator/src/platform/__tests__/fixtures/hello.wasm)"
+wasmer run packages/kernel/src/platform/__tests__/fixtures/true-cmd.wasm
+WASMER_OUT="$(wasmer run packages/kernel/src/platform/__tests__/fixtures/hello.wasm)"
 test "$WASMER_OUT" = "hello from wasm"
 
 if [ "${YURT_RUNTIME_FULL:-0}" = "1" ]; then

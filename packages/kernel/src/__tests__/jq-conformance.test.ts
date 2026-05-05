@@ -1,6 +1,6 @@
 /**
  * jq conformance tests.  jq.wasm is the upstream jqlang/jq 1.8.1 port
- * built via yurt-cc (packages/c-ports/jq/).  These tests exercise enough
+ * built via yurt-cc (test-fixtures/c-ports/jq/).  These tests exercise enough
  * of jq's surface to catch a regression in the port's libc/runtime
  * surface — they are not a substitute for jq's own test suite.
  */

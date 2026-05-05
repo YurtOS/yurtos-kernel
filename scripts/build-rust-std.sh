@@ -30,7 +30,7 @@ fi
 PATCH_DIR="$ROOT/patches/rust/$RUST_VERSION"
 YURT_STD_SRC="$ROOT/patches/rust/yurt/yurt.rs"
 YURT_FS_SRC="$ROOT/patches/rust/yurt/fs.rs"
-OUT_DIR="$ROOT/packages/guest-compat/build/rust-std/$RUST_VERSION"
+OUT_DIR="$ROOT/abi/build/rust-std/$RUST_VERSION"
 WORK_DIR="${TMPDIR:-/tmp}/yurt-rust-src-$RUST_VERSION"
 FAKE_SYSROOT="${TMPDIR:-/tmp}/yurt-rust-sysroot-$RUST_VERSION"
 BUILD_CRATE="${TMPDIR:-/tmp}/yurt-rust-std-probe-$RUST_VERSION"

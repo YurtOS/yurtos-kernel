@@ -207,10 +207,20 @@ describe('ProcProvider (/proc)', () => {
   // spawned processes appear without a registration step.  These tests
   // wire a fake list directly on the VFS to keep them independent of
   // the process runtime; the integration is covered through
-  // Sandbox.run() in guest-compat.test.ts.
+  // Sandbox.run() in abi.test.ts.
   // ──────────────────────────────────────────────────────────────────────
   describe('per-PID /proc entries', () => {
-    function vfsWith(procs: { pid: number; ppid: number; state: string; exit_code: number; command: string }[]): VFS {
+    function vfsWith(
+      procs: {
+        pid: number;
+        ppid: number;
+        pgid?: number;
+        sid?: number;
+        state: string;
+        exit_code: number;
+        command: string;
+      }[],
+    ): VFS {
       const vfs = new VFS();
       vfs.setProcessListProvider(() => procs);
       return vfs;
@@ -254,6 +264,16 @@ describe('ProcProvider (/proc)', () => {
       const vfs = vfsWith([{ pid: 7, ppid: 1, state: 'running', exit_code: -1, command: 'awk' }]);
       const text = new TextDecoder().decode(vfs.readFile('/proc/7/stat'));
       expect(text.startsWith('7 (awk) R 1 ')).toBe(true);
+    });
+
+    it('/proc/<pid>/stat reports process group and session ids from the kernel', () => {
+      const vfs = vfsWith([
+        { pid: 7, ppid: 1, pgid: 42, sid: 99, state: 'running', exit_code: -1, command: 'awk' },
+      ]);
+      const text = new TextDecoder().decode(vfs.readFile('/proc/7/stat'));
+      const fields = text.trim().split(/\s+/);
+
+      expect(fields.slice(0, 6)).toEqual(['7', '(awk)', 'R', '1', '42', '99']);
     });
 
     it('exited processes show up as zombies (Z) until reaped', () => {
@@ -474,6 +494,12 @@ describe('providers via Sandbox.run()', () => {
     const result = await sandbox.run('ls /dev');
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain('null');
+  });
+
+  it('openTty creates a controlling terminal for the boot process', async () => {
+    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+
+    expect(() => sandbox.openTty()).not.toThrow();
   });
 });
 

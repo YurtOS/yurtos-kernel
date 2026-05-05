@@ -1,8 +1,12 @@
-import type { FdTarget, TtyState } from '../wasi/fd-target.js';
-import { createTtyState, createTtySlaveTarget } from '../wasi/fd-target.js';
-import { normalizeNice, normalizeSchedulerPolicy, normalizeSchedulerPriority } from '../engine/backend.js';
-import { createAsyncPipe } from '../vfs/pipe.js';
-import type { WasiHost } from '../wasi/wasi-host.js';
+import type { FdTarget, TtyState } from "../wasi/fd-target.js";
+import { createTtySlaveTarget, createTtyState } from "../wasi/fd-target.js";
+import {
+  normalizeNice,
+  normalizeSchedulerPolicy,
+  normalizeSchedulerPriority,
+} from "../engine/backend.js";
+import { createAsyncPipe } from "../vfs/pipe.js";
+import type { WasiHost } from "../wasi/wasi-host.js";
 
 // Keep kernel-managed descriptors out of the WASI fd table's low range.
 // WASI preopens and file opens usually start at 3; pipes/sockets here are
@@ -19,12 +23,12 @@ export const RLIM_INFINITY_U64 = 0xffff_ffff_ffff_ffffn;
 export const DEFAULT_MAX_PROCESSES = 64;
 
 export class ProcessLimitError extends Error {
-  readonly code = 'EAGAIN';
+  readonly code = "EAGAIN";
   readonly errno = 11;
 
   constructor(readonly maxProcesses: number) {
     super(`process limit exceeded: max ${maxProcesses}`);
-    this.name = 'ProcessLimitError';
+    this.name = "ProcessLimitError";
   }
 }
 
@@ -37,7 +41,7 @@ export interface ResourceLimit {
   hard: number;
 }
 
-export type SetResourceLimitResult = 'ok' | 'invalid' | 'permission';
+export type SetResourceLimitResult = "ok" | "invalid" | "permission";
 
 export interface ProcessCredentials {
   uid: number;
@@ -65,7 +69,7 @@ export interface ProcessEntry {
   pid: number;
   promise: Promise<void> | null;
   exitCode: number;
-  state: 'running' | 'exited';
+  state: "running" | "exited";
   wasiHost: WasiHost | null;
   waiters: ((exitCode: number) => void)[];
   command?: string;
@@ -88,7 +92,7 @@ interface FileLockState {
 
 export class ProcessKernel {
   private processTable = new Map<number, ProcessEntry>();
-  private nextPid = 2;   // PID 1 is pre-allocated for init
+  private nextPid = 2; // PID 1 is pre-allocated for init
   private allocatedPids = new Set<number>();
   private parentPids = new Map<number, number>();
   private children = new Map<number, Set<number>>();
@@ -102,18 +106,27 @@ export class ProcessKernel {
   constructor(options: ProcessKernelOptions = {}) {
     const maxProcesses = options.maxProcesses ?? DEFAULT_MAX_PROCESSES;
     if (!Number.isInteger(maxProcesses) || maxProcesses < 1) {
-      throw new Error(`ProcessKernel maxProcesses must be an integer >= 1, got ${maxProcesses}`);
+      throw new Error(
+        `ProcessKernel maxProcesses must be an integer >= 1, got ${maxProcesses}`,
+      );
     }
     this.maxProcesses = maxProcesses;
     // Pre-create init (PID 1): the system ancestor.  It has no controlling
     // terminal, no WASM instance, and never exits.  All top-level processes
     // become children of PID 1; orphaned children are reparented here.
     this.processTable.set(INIT_PID, {
-      pid: INIT_PID, promise: null, exitCode: -1, state: 'running',
-      wasiHost: null, waiters: [], command: 'init',
-      pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
+      pid: INIT_PID,
+      promise: null,
+      exitCode: -1,
+      state: "running",
+      wasiHost: null,
+      waiters: [],
+      command: "init",
+      pgid: INIT_PID,
+      sid: INIT_PID,
+      controllingTtyId: null,
       credentials: rootCredentials(),
-      cwd: '/',
+      cwd: "/",
       nice: 0,
       schedulerPolicy: 0,
       schedulerPriority: 0,
@@ -150,7 +163,10 @@ export class ProcessKernel {
     this.parentPids.set(pid, ppid);
     if (pid !== INIT_PID) {
       let siblings = this.children.get(ppid);
-      if (!siblings) { siblings = new Set(); this.children.set(ppid, siblings); }
+      if (!siblings) {
+        siblings = new Set();
+        this.children.set(ppid, siblings);
+      }
       siblings.add(pid);
     }
   }
@@ -163,8 +179,8 @@ export class ProcessKernel {
     const readFd = nextFd++;
     const writeFd = nextFd++;
     this.nextFds.set(callerPid, nextFd);
-    fdTable.set(readFd, { type: 'pipe_read', pipe: readEnd });
-    fdTable.set(writeFd, { type: 'pipe_write', pipe: writeEnd });
+    fdTable.set(readFd, { type: "pipe_read", pipe: readEnd });
+    fdTable.set(writeFd, { type: "pipe_write", pipe: writeEnd });
     return { readFd, writeFd };
   }
 
@@ -211,7 +227,7 @@ export class ProcessKernel {
   }
 
   getCwd(pid: number): string {
-    return this.processTable.get(pid)?.cwd ?? '/';
+    return this.processTable.get(pid)?.cwd ?? "/";
   }
 
   setCwd(pid: number, cwd: string): void {
@@ -268,18 +284,27 @@ export class ProcessKernel {
     return limit ? { ...limit } : null;
   }
 
-  setResourceLimit(pid: number, resource: number, softRaw: number | bigint, hardRaw: number | bigint): SetResourceLimitResult {
+  setResourceLimit(
+    pid: number,
+    resource: number,
+    softRaw: number | bigint,
+    hardRaw: number | bigint,
+  ): SetResourceLimitResult {
     const entry = this.processTable.get(pid);
-    if (!entry) return 'invalid';
+    if (!entry) return "invalid";
     const current = entry.resourceLimits.get(resource);
-    if (!current) return 'invalid';
+    if (!current) return "invalid";
     const soft = normalizeLimit(softRaw);
     const hard = normalizeLimit(hardRaw);
-    if (soft < 0 || hard < 0 || soft > hard) return 'invalid';
-    if (entry.credentials.euid !== ROOT_UID && hard > current.hard) return 'permission';
-    if (entry.credentials.euid !== ROOT_UID && soft > current.hard) return 'permission';
+    if (soft < 0 || hard < 0 || soft > hard) return "invalid";
+    if (entry.credentials.euid !== ROOT_UID && hard > current.hard) {
+      return "permission";
+    }
+    if (entry.credentials.euid !== ROOT_UID && soft > current.hard) {
+      return "permission";
+    }
     entry.resourceLimits.set(resource, { soft, hard });
-    return 'ok';
+    return "ok";
   }
 
   setresuid(pid: number, ruid: number, euid: number, suid: number): boolean {
@@ -327,14 +352,16 @@ export class ProcessKernel {
   }
 
   private cwdForChild(ppid: number): string {
-    return this.processTable.get(ppid)?.cwd ?? '/';
+    return this.processTable.get(ppid)?.cwd ?? "/";
   }
 
   private priorityForChild(ppid: number): number {
     return this.processTable.get(ppid)?.nice ?? 0;
   }
 
-  private schedulerForChild(ppid: number): { policy: number; priority: number } {
+  private schedulerForChild(
+    ppid: number,
+  ): { policy: number; priority: number } {
     const parent = this.processTable.get(ppid);
     return {
       policy: parent?.schedulerPolicy ?? 0,
@@ -348,29 +375,36 @@ export class ProcessKernel {
 
   private resourceLimitsForChild(ppid: number): Map<number, ResourceLimit> {
     const parent = this.processTable.get(ppid);
-    return cloneResourceLimits(parent?.resourceLimits ?? defaultResourceLimits());
+    return cloneResourceLimits(
+      parent?.resourceLimits ?? defaultResourceLimits(),
+    );
   }
 
-  buildFdTableForSpawn(callerPid: number, req: SpawnRequest): Map<number, FdTarget> {
+  buildFdTableForSpawn(
+    callerPid: number,
+    req: SpawnRequest,
+  ): Map<number, FdTarget> {
     const callerFdTable = this.fdTables.get(callerPid);
-    if (!callerFdTable) throw new Error(`No fd table for caller pid ${callerPid}`);
+    if (!callerFdTable) {
+      throw new Error(`No fd table for caller pid ${callerPid}`);
+    }
     const newFdTable = new Map<number, FdTarget>();
     const stdinTarget = callerFdTable.get(req.stdin_fd);
     if (stdinTarget) {
-      if (stdinTarget.type === 'pipe_read') stdinTarget.pipe.addRef();
-      if (stdinTarget.type === 'vfs_file') stdinTarget.refs++;
+      if (stdinTarget.type === "pipe_read") stdinTarget.pipe.addRef();
+      if (stdinTarget.type === "vfs_file") stdinTarget.refs++;
       newFdTable.set(0, stdinTarget);
     }
     const stdoutTarget = callerFdTable.get(req.stdout_fd);
     if (stdoutTarget) {
-      if (stdoutTarget.type === 'pipe_write') stdoutTarget.pipe.addRef();
-      if (stdoutTarget.type === 'vfs_file') stdoutTarget.refs++;
+      if (stdoutTarget.type === "pipe_write") stdoutTarget.pipe.addRef();
+      if (stdoutTarget.type === "vfs_file") stdoutTarget.refs++;
       newFdTable.set(1, stdoutTarget);
     }
     const stderrTarget = callerFdTable.get(req.stderr_fd);
     if (stderrTarget) {
-      if (stderrTarget.type === 'pipe_write') stderrTarget.pipe.addRef();
-      if (stderrTarget.type === 'vfs_file') stderrTarget.refs++;
+      if (stderrTarget.type === "pipe_write") stderrTarget.pipe.addRef();
+      if (stderrTarget.type === "vfs_file") stderrTarget.refs++;
       newFdTable.set(2, stderrTarget);
     }
     return newFdTable;
@@ -378,12 +412,14 @@ export class ProcessKernel {
 
   buildFdTableForFork(parentPid: number): Map<number, FdTarget> {
     const parentFdTable = this.fdTables.get(parentPid);
-    if (!parentFdTable) throw new Error(`No fd table for parent pid ${parentPid}`);
+    if (!parentFdTable) {
+      throw new Error(`No fd table for parent pid ${parentPid}`);
+    }
     const childFdTable = new Map<number, FdTarget>();
     for (const [fd, target] of parentFdTable) {
-      if (target.type === 'pipe_read' || target.type === 'pipe_write') {
+      if (target.type === "pipe_read" || target.type === "pipe_write") {
         target.pipe.addRef();
-      } else if (target.type === 'vfs_file' || target.type === 'socket') {
+      } else if (target.type === "vfs_file" || target.type === "socket") {
         target.refs++;
       }
       childFdTable.set(fd, target);
@@ -401,7 +437,12 @@ export class ProcessKernel {
       const parentEntry = this.processTable.get(parentPid);
       const scheduler = this.schedulerForChild(parentPid);
       this.processTable.set(pid, {
-        pid, promise: null, exitCode: -1, state: 'running', wasiHost: null, waiters: [],
+        pid,
+        promise: null,
+        exitCode: -1,
+        state: "running",
+        wasiHost: null,
+        waiters: [],
         command,
         pgid: parentEntry?.pgid ?? INIT_PID,
         sid: parentEntry?.sid ?? INIT_PID,
@@ -418,13 +459,17 @@ export class ProcessKernel {
   }
 
   /** Attach a running promise and WasiHost to a previously registered pending process. */
-  attachProcess(pid: number, promise: Promise<void>, wasiHost: WasiHost | null): void {
+  attachProcess(
+    pid: number,
+    promise: Promise<void>,
+    wasiHost: WasiHost | null,
+  ): void {
     const entry = this.processTable.get(pid);
     if (!entry) return;
     entry.promise = promise;
     entry.wasiHost = wasiHost;
     const onExit = () => {
-      entry.state = 'exited';
+      entry.state = "exited";
       entry.exitCode = wasiHost?.getExitCode() ?? 0;
       this._reparentChildren(pid);
       // Close the child's fds (decrements pipe refcounts, signals EOF).
@@ -435,13 +480,24 @@ export class ProcessKernel {
     promise.then(onExit, onExit);
   }
 
-  registerProcess(pid: number, promise: Promise<void>, wasiHost: WasiHost): void {
+  registerProcess(
+    pid: number,
+    promise: Promise<void>,
+    wasiHost: WasiHost,
+  ): void {
     this.reservePid(pid);
     this.processTable.set(pid, {
-      pid, promise, exitCode: -1, state: 'running', wasiHost, waiters: [],
-      pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
+      pid,
+      promise,
+      exitCode: -1,
+      state: "running",
+      wasiHost,
+      waiters: [],
+      pgid: INIT_PID,
+      sid: INIT_PID,
+      controllingTtyId: null,
       credentials: userCredentials(),
-      cwd: '/',
+      cwd: "/",
       nice: 0,
       schedulerPolicy: 0,
       schedulerPriority: 0,
@@ -451,7 +507,7 @@ export class ProcessKernel {
     const onExit = () => {
       const entry = this.processTable.get(pid);
       if (entry) {
-        entry.state = 'exited';
+        entry.state = "exited";
         entry.exitCode = wasiHost.getExitCode() ?? 0;
         this._reparentChildren(pid);
         this.cleanupFds(pid);
@@ -489,7 +545,7 @@ export class ProcessKernel {
 
   killProcess(pid: number, sig: number): boolean {
     const entry = this.processTable.get(pid);
-    if (!entry || entry.state === 'exited') return false;
+    if (!entry || entry.state === "exited") return false;
     if (entry.wasiHost?.queueSignal(sig)) return true;
     entry.wasiHost?.cancelExecution();
     return true;
@@ -518,7 +574,7 @@ export class ProcessKernel {
     this.initProcess(pid);
     const existing = this.processTable.get(pid);
     if (existing) {
-      existing.state = 'exited';
+      existing.state = "exited";
       existing.exitCode = exitCode;
       existing.promise = Promise.resolve();
       for (const waiter of existing.waiters) waiter(exitCode);
@@ -526,8 +582,15 @@ export class ProcessKernel {
     } else {
       const scheduler = this.schedulerForChild(ppid ?? INIT_PID);
       this.processTable.set(pid, {
-        pid, promise: Promise.resolve(), exitCode, state: 'exited', wasiHost: null, waiters: [],
-        pgid: INIT_PID, sid: INIT_PID, controllingTtyId: null,
+        pid,
+        promise: Promise.resolve(),
+        exitCode,
+        state: "exited",
+        wasiHost: null,
+        waiters: [],
+        pgid: INIT_PID,
+        sid: INIT_PID,
+        controllingTtyId: null,
         credentials: this.credentialsForChild(ppid ?? INIT_PID),
         cwd: this.cwdForChild(ppid ?? INIT_PID),
         nice: this.priorityForChild(ppid ?? INIT_PID),
@@ -543,7 +606,7 @@ export class ProcessKernel {
     if (parentPid !== undefined && !this.isChildOf(pid, parentPid)) return -1;
     const entry = this.processTable.get(pid);
     if (!entry) return -1;
-    if (entry.state === 'exited') {
+    if (entry.state === "exited") {
       const exitCode = entry.exitCode;
       this.reapProcess(pid);
       return exitCode;
@@ -560,7 +623,7 @@ export class ProcessKernel {
     if (parentPid !== undefined && !this.isChildOf(pid, parentPid)) return -2;
     const entry = this.processTable.get(pid);
     if (!entry) return parentPid === undefined ? -1 : -2;
-    if (entry.state === 'exited') {
+    if (entry.state === "exited") {
       const exitCode = entry.exitCode;
       this.reapProcess(pid);
       return exitCode;
@@ -572,15 +635,33 @@ export class ProcessKernel {
     return this.processTable.has(pid);
   }
 
-  listProcesses(): { pid: number; ppid: number; state: string; exit_code: number; command: string }[] {
-    const result: { pid: number; ppid: number; state: string; exit_code: number; command: string }[] = [];
+  listProcesses(): {
+    pid: number;
+    ppid: number;
+    pgid: number;
+    sid: number;
+    state: string;
+    exit_code: number;
+    command: string;
+  }[] {
+    const result: {
+      pid: number;
+      ppid: number;
+      pgid: number;
+      sid: number;
+      state: string;
+      exit_code: number;
+      command: string;
+    }[] = [];
     for (const [pid, entry] of this.processTable) {
       result.push({
         pid,
         ppid: this.parentPids.get(pid) ?? 0,
+        pgid: entry.pgid,
+        sid: entry.sid,
         state: entry.state,
         exit_code: entry.exitCode,
-        command: entry.command ?? '',
+        command: entry.command ?? "",
       });
     }
     return result;
@@ -592,10 +673,10 @@ export class ProcessKernel {
     const srcTarget = fdTable.get(fd);
     if (!srcTarget) throw new Error(`dup: fd ${fd} not found`);
     // Add ref for pipes
-    if (srcTarget.type === 'pipe_write') srcTarget.pipe.addRef();
-    if (srcTarget.type === 'pipe_read') srcTarget.pipe.addRef();
-    if (srcTarget.type === 'vfs_file') srcTarget.refs++;
-    if (srcTarget.type === 'socket') srcTarget.refs++;
+    if (srcTarget.type === "pipe_write") srcTarget.pipe.addRef();
+    if (srcTarget.type === "pipe_read") srcTarget.pipe.addRef();
+    if (srcTarget.type === "vfs_file") srcTarget.refs++;
+    if (srcTarget.type === "socket") srcTarget.refs++;
     // Allocate a new fd number
     let nextFd = this.nextFds.get(pid) ?? KERNEL_FD_BASE;
     const newFd = nextFd++;
@@ -616,10 +697,10 @@ export class ProcessKernel {
       this.closeTarget(existing);
     }
     // Point dst to same target as src (add ref for pipes)
-    if (srcTarget.type === 'pipe_write') srcTarget.pipe.addRef();
-    if (srcTarget.type === 'pipe_read') srcTarget.pipe.addRef();
-    if (srcTarget.type === 'vfs_file') srcTarget.refs++;
-    if (srcTarget.type === 'socket') srcTarget.refs++;
+    if (srcTarget.type === "pipe_write") srcTarget.pipe.addRef();
+    if (srcTarget.type === "pipe_read") srcTarget.pipe.addRef();
+    if (srcTarget.type === "vfs_file") srcTarget.refs++;
+    if (srcTarget.type === "socket") srcTarget.refs++;
     fdTable.set(dstFd, srcTarget);
   }
 
@@ -627,7 +708,10 @@ export class ProcessKernel {
     const fdTable = this.fdTables.get(pid);
     if (!fdTable) return false;
     const target = fdTable.get(fd);
-    if (!target) { fdTable.delete(fd); return false; }
+    if (!target) {
+      fdTable.delete(fd);
+      return false;
+    }
     this.unlockFile(pid, fd);
     this.closeTarget(target);
     fdTable.delete(fd);
@@ -641,8 +725,11 @@ export class ProcessKernel {
     const state = this.fileLocks.get(path) ?? { shared: new Set<string>() };
 
     if (exclusive) {
-      const onlyOwnShared = state.shared.size === 0 || (state.shared.size === 1 && state.shared.has(owner));
-      if ((state.exclusive && state.exclusive !== owner) || !onlyOwnShared) return 11; // EWOULDBLOCK
+      const onlyOwnShared = state.shared.size === 0 ||
+        (state.shared.size === 1 && state.shared.has(owner));
+      if ((state.exclusive && state.exclusive !== owner) || !onlyOwnShared) {
+        return 11; // EWOULDBLOCK
+      }
       state.exclusive = owner;
       state.shared.delete(owner);
     } else {
@@ -662,19 +749,24 @@ export class ProcessKernel {
     if (!state) return 0;
     if (state.exclusive === owner) delete state.exclusive;
     state.shared.delete(owner);
-    if (!state.exclusive && state.shared.size === 0) this.fileLocks.delete(path);
+    if (!state.exclusive && state.shared.size === 0) {
+      this.fileLocks.delete(path);
+    }
     return 0;
   }
 
   /** Reparent all children of `pid` to init (PID 1); auto-reap any that already exited. */
   private _reparentChildren(pid: number): void {
     const kids = this.children.get(pid);
-    if (!kids || kids.size === 0) { this.children.delete(pid); return; }
+    if (!kids || kids.size === 0) {
+      this.children.delete(pid);
+      return;
+    }
     const initKids = this.children.get(INIT_PID)!;
     for (const childPid of kids) {
       this.parentPids.set(childPid, INIT_PID);
       const child = this.processTable.get(childPid);
-      if (child?.state === 'exited') {
+      if (child?.state === "exited") {
         // Init auto-reaps already-exited orphans — no zombie accumulation.
         this.processTable.delete(childPid);
         this.fdTables.delete(childPid);
@@ -713,12 +805,12 @@ export class ProcessKernel {
 
   private vfsPathForFd(pid: number, fd: number): string | null {
     const target = this.fdTables.get(pid)?.get(fd);
-    if (!target || target.type !== 'vfs_file') return null;
+    if (!target || target.type !== "vfs_file") return null;
     return target.fdTable.getPath(target.fd) ?? null;
   }
 
   private closeTarget(target: FdTarget): void {
-    if (target.type === 'tty_master') {
+    if (target.type === "tty_master") {
       const { fgPgid } = target.state;
       target.state.masterClosed = true;
       for (const w of target.state.toSlaveWaiters.splice(0)) w();
@@ -726,15 +818,15 @@ export class ProcessKernel {
       // processes that don't ignore it (everything except nohup'd daemons) exit.
       if (fgPgid > 0) this.killpg(fgPgid, 1);
     }
-    if (target.type === 'pipe_write') target.pipe.close();
-    if (target.type === 'pipe_read') target.pipe.close();
-    if (target.type === 'vfs_file') {
+    if (target.type === "pipe_write") target.pipe.close();
+    if (target.type === "pipe_read") target.pipe.close();
+    if (target.type === "vfs_file") {
       target.refs--;
       if (target.refs <= 0) {
         target.fdTable.close(target.fd);
       }
     }
-    if (target.type === 'socket') {
+    if (target.type === "socket") {
       target.refs--;
       if (target.refs <= 0) {
         if (target.listener != null && target.closeListener) {
@@ -784,9 +876,9 @@ export class ProcessKernel {
 
   /** Non-blocking: reap the first exited child, or distinguish running children from ECHILD. */
   waitAnyNohang(ppid: number):
-    | { state: 'exited'; pid: number; exitCode: number }
-    | { state: 'running' }
-    | { state: 'none' } {
+    | { state: "exited"; pid: number; exitCode: number }
+    | { state: "running" }
+    | { state: "none" } {
     return this.waitAnyChildNohang(ppid);
   }
 
@@ -797,7 +889,9 @@ export class ProcessKernel {
     return result ?? { pid: -1, exitCode: -1 };
   }
 
-  async waitAnyChild(parentPid: number): Promise<{ pid: number; exitCode: number } | null> {
+  async waitAnyChild(
+    parentPid: number,
+  ): Promise<{ pid: number; exitCode: number } | null> {
     const exited = this.findExitedChild(parentPid);
     if (exited) {
       this.reapProcess(exited.pid);
@@ -831,32 +925,36 @@ export class ProcessKernel {
   }
 
   waitAnyChildNohang(parentPid: number):
-    | { state: 'exited'; pid: number; exitCode: number }
-    | { state: 'running' }
-    | { state: 'none' } {
+    | { state: "exited"; pid: number; exitCode: number }
+    | { state: "running" }
+    | { state: "none" } {
     const exited = this.findExitedChild(parentPid);
     if (exited) {
       this.reapProcess(exited.pid);
-      return { state: 'exited', pid: exited.pid, exitCode: exited.exitCode };
+      return { state: "exited", pid: exited.pid, exitCode: exited.exitCode };
     }
     return this.findRunningChildren(parentPid).length > 0
-      ? { state: 'running' }
-      : { state: 'none' };
+      ? { state: "running" }
+      : { state: "none" };
   }
 
-  private findExitedChild(parentPid: number): { pid: number; exitCode: number } | null {
+  private findExitedChild(
+    parentPid: number,
+  ): { pid: number; exitCode: number } | null {
     for (const [pid, entry] of this.processTable) {
       if (this.parentPids.get(pid) !== parentPid) continue;
-      if (entry.state === 'exited') return { pid, exitCode: entry.exitCode };
+      if (entry.state === "exited") return { pid, exitCode: entry.exitCode };
     }
     return null;
   }
 
-  private findRunningChildren(parentPid: number): Array<[number, ProcessEntry]> {
+  private findRunningChildren(
+    parentPid: number,
+  ): Array<[number, ProcessEntry]> {
     const result: Array<[number, ProcessEntry]> = [];
     for (const [pid, entry] of this.processTable) {
       if (this.parentPids.get(pid) !== parentPid) continue;
-      if (entry.state !== 'exited') result.push([pid, entry]);
+      if (entry.state !== "exited") result.push([pid, entry]);
     }
     return result;
   }
@@ -874,18 +972,15 @@ export class ProcessKernel {
     return this.ttyTable.get(ttyId) ?? null;
   }
 
-  /** Create a TTY pair and wire fds 0/1/2 of pid to the slave side.
-   *  Sets controllingTtyId on the process entry; the returned TtyState is the
-   *  host's handle to the master side (write to toSlave, read from toMaster). */
+  /** Create a TTY pair and wire fds 0/1/2 of pid to the slave side. */
   openTtyForProcess(pid: number): TtyState {
-    const { ttyId, state } = this.createTty();
+    const { state } = this.createTty();
     const slave = createTtySlaveTarget(state);
     this.setFdTarget(pid, 0, slave);
     this.setFdTarget(pid, 1, slave);
     this.setFdTarget(pid, 2, slave);
     const entry = this.processTable.get(pid);
     if (entry) {
-      entry.controllingTtyId = ttyId;
       state.fgPgid = entry.pgid > 0 ? entry.pgid : pid;
     }
     return state;
@@ -894,9 +989,32 @@ export class ProcessKernel {
   /** Mark ttyId as the controlling terminal of pid (called via TIOCSCTTY). */
   setControllingTty(pid: number, ttyId: number): number {
     const entry = this.processTable.get(pid);
-    if (!entry) return -1;
+    const state = this.ttyTable.get(ttyId);
+    if (!entry || entry.state === "exited" || !state) return -1;
+    if (entry.sid !== pid) return -1;
+    if (entry.controllingTtyId !== null && entry.controllingTtyId !== ttyId) {
+      return -1;
+    }
+    if (state.controllingSid !== null && state.controllingSid !== entry.sid) {
+      return -1;
+    }
+
+    state.controllingSid = entry.sid;
     entry.controllingTtyId = ttyId;
+    state.fgPgid = entry.pgid > 0 ? entry.pgid : pid;
     return 0;
+  }
+
+  getControllingTtyState(pid: number): TtyState | null {
+    const entry = this.processTable.get(pid);
+    if (!entry || entry.state === "exited") return null;
+    if (entry.controllingTtyId !== null) {
+      return this.ttyTable.get(entry.controllingTtyId) ?? null;
+    }
+    for (const state of this.ttyTable.values()) {
+      if (state.controllingSid === entry.sid) return state;
+    }
+    return null;
   }
 
   // ── Process groups / sessions ──
@@ -907,7 +1025,12 @@ export class ProcessKernel {
 
   setpgid(pid: number, pgid: number): number {
     const entry = this.processTable.get(pid);
-    if (!entry || entry.state === 'exited') return -1;
+    if (!entry || entry.state === "exited" || pgid <= 0) return -1;
+    if (entry.sid === pid) return -1;
+    if (pgid !== pid) {
+      const groupSid = this.findProcessGroupSession(pgid);
+      if (groupSid === null || groupSid !== entry.sid) return -1;
+    }
     entry.pgid = pgid;
     return 0;
   }
@@ -918,7 +1041,8 @@ export class ProcessKernel {
 
   setsid(pid: number): number {
     const entry = this.processTable.get(pid);
-    if (!entry || entry.state === 'exited') return -1;
+    if (!entry || entry.state === "exited") return -1;
+    if (this.findProcessGroupSession(pid) !== null) return -1;
     entry.sid = pid;
     entry.pgid = pid;
     entry.controllingTtyId = null;
@@ -929,9 +1053,18 @@ export class ProcessKernel {
     return this.ttyTable.get(ttyId)?.fgPgid ?? -1;
   }
 
-  tcsetpgrp(ttyId: number, pgid: number): boolean {
+  tcsetpgrp(ttyId: number, pgid: number, callerPid?: number): boolean {
     const state = this.ttyTable.get(ttyId);
-    if (!state) return false;
+    if (!state || pgid <= 0) return false;
+    const groupSid = this.findProcessGroupSession(pgid);
+    if (groupSid === null) return false;
+    if (callerPid !== undefined) {
+      const caller = this.processTable.get(callerPid);
+      if (!caller || caller.state === "exited" || caller.sid !== groupSid) {
+        return false;
+      }
+      if (state.controllingSid !== caller.sid) return false;
+    }
     state.fgPgid = pgid;
     return true;
   }
@@ -939,12 +1072,22 @@ export class ProcessKernel {
   killpg(pgid: number, sig: number): number {
     let count = 0;
     for (const entry of this.processTable.values()) {
-      if (entry.pgid === pgid && entry.state !== 'exited' && entry.pid !== INIT_PID) {
+      if (
+        entry.pgid === pgid && entry.state !== "exited" &&
+        entry.pid !== INIT_PID
+      ) {
         this.killProcess(entry.pid, sig);
         count++;
       }
     }
     return count;
+  }
+
+  private findProcessGroupSession(pgid: number): number | null {
+    for (const entry of this.processTable.values()) {
+      if (entry.state !== "exited" && entry.pgid === pgid) return entry.sid;
+    }
+    return null;
   }
 
   dispose(): void {
@@ -963,24 +1106,38 @@ export class ProcessKernel {
 }
 
 function rootCredentials(): ProcessCredentials {
-  return { uid: ROOT_UID, gid: ROOT_GID, euid: ROOT_UID, egid: ROOT_GID, suid: ROOT_UID, sgid: ROOT_GID };
+  return {
+    uid: ROOT_UID,
+    gid: ROOT_GID,
+    euid: ROOT_UID,
+    egid: ROOT_GID,
+    suid: ROOT_UID,
+    sgid: ROOT_GID,
+  };
 }
 
 function userCredentials(): ProcessCredentials {
-  return { uid: USER_UID, gid: USER_GID, euid: USER_UID, egid: USER_GID, suid: USER_UID, sgid: USER_GID };
+  return {
+    uid: USER_UID,
+    gid: USER_GID,
+    euid: USER_UID,
+    egid: USER_GID,
+    suid: USER_UID,
+    sgid: USER_GID,
+  };
 }
 
 function normalizeKernelPath(path: string): string {
   const parts: string[] = [];
-  for (const part of path.split('/')) {
-    if (part === '' || part === '.') continue;
-    if (part === '..') {
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
       parts.pop();
       continue;
     }
     parts.push(part);
   }
-  return '/' + parts.join('/');
+  return "/" + parts.join("/");
 }
 
 function normalizeUmask(mask: number): number {
@@ -988,7 +1145,7 @@ function normalizeUmask(mask: number): number {
 }
 
 function normalizeLimit(limit: number | bigint): number {
-  if (typeof limit === 'bigint') {
+  if (typeof limit === "bigint") {
     if (limit === RLIM_INFINITY_U64) return Infinity;
     if (limit < 0n) return -1;
     if (limit > BigInt(Number.MAX_SAFE_INTEGER)) return Number.MAX_SAFE_INTEGER;
@@ -1011,7 +1168,9 @@ function defaultResourceLimits(): Map<number, ResourceLimit> {
   ]);
 }
 
-function cloneResourceLimits(limits: Map<number, ResourceLimit>): Map<number, ResourceLimit> {
+function cloneResourceLimits(
+  limits: Map<number, ResourceLimit>,
+): Map<number, ResourceLimit> {
   const cloned = new Map<number, ResourceLimit>();
   for (const [resource, limit] of limits) {
     cloned.set(resource, { ...limit });

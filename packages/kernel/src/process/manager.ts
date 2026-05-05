@@ -94,7 +94,7 @@ export class ProcessManager {
     });
   }
 
-  /** Register and preload a tool from VFS — for runtime-installed packages. */
+  /** Register and preload a tool from VFS. */
   async registerAndLoadTool(name: string, wasmPath: string): Promise<void> {
     const source: ToolSource = { kind: 'vfs', path: wasmPath };
     this.registerTool(name, source);
