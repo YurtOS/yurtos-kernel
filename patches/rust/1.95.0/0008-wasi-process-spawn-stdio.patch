@@ -1,0 +1,327 @@
+--- a/library/std/src/sys/pipe/unsupported.rs
++++ b/library/std/src/sys/pipe/unsupported.rs
+@@ -1,7 +1,10 @@
+ use crate::fmt;
+ use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
++use crate::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
++use crate::sys::fd::FileDesc;
++use crate::sys::{FromInner, IntoInner};
+
+-pub struct Pipe(!);
++pub struct Pipe(FileDesc);
+
+ #[inline]
+ pub fn pipe() -> io::Result<(Pipe, Pipe)> {
+@@ -10,92 +13,93 @@
+
+ impl Pipe {
+     pub fn try_clone(&self) -> io::Result<Self> {
+-        self.0
++        Err(io::Error::UNSUPPORTED_PLATFORM)
+     }
+
+-    pub fn read(&self, _buf: &mut [u8]) -> io::Result<usize> {
+-        self.0
++    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
++        self.0.read(buf)
+     }
+
+-    pub fn read_buf(&self, _buf: BorrowedCursor<'_>) -> io::Result<()> {
+-        self.0
++    pub fn read_buf(&self, buf: BorrowedCursor<'_>) -> io::Result<()> {
++        self.0.read_buf(buf)
+     }
+
+-    pub fn read_vectored(&self, _bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+-        self.0
++    pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
++        self.0.read_vectored(bufs)
+     }
+
+     pub fn is_read_vectored(&self) -> bool {
+-        self.0
++        true
+     }
+
+-    pub fn read_to_end(&self, _buf: &mut Vec<u8>) -> io::Result<usize> {
+-        self.0
++    pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
++        let start = buf.len();
++        let mut chunk = [0u8; 8192];
++        loop {
++            let n = self.read(&mut chunk)?;
++            if n == 0 {
++                return Ok(buf.len() - start);
++            }
++            buf.extend_from_slice(&chunk[..n]);
++        }
+     }
+
+-    pub fn write(&self, _buf: &[u8]) -> io::Result<usize> {
+-        self.0
++    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
++        self.0.write(buf)
+     }
+
+-    pub fn write_vectored(&self, _bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+-        self.0
++    pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
++        self.0.write_vectored(bufs)
+     }
+
+     pub fn is_write_vectored(&self) -> bool {
+-        self.0
++        true
+     }
+
+     pub fn diverge(&self) -> ! {
+-        self.0
++        panic!("cannot convert a WASI pipe into process stdio")
+     }
+ }
+
+ impl fmt::Debug for Pipe {
+-    fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        self.0
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("Pipe").field("fd", &self.0.as_raw_fd()).finish()
+     }
+ }
+
+-#[cfg(any(unix, target_os = "hermit", target_os = "wasi"))]
+-mod unix_traits {
+-    use super::Pipe;
+-    use crate::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+-    use crate::sys::{FromInner, IntoInner};
+-
+-    impl AsRawFd for Pipe {
+-        #[inline]
+-        fn as_raw_fd(&self) -> RawFd {
+-            self.0
+-        }
++impl AsRawFd for Pipe {
++    #[inline]
++    fn as_raw_fd(&self) -> RawFd {
++        self.0.as_raw_fd()
+     }
++}
+
+-    impl AsFd for Pipe {
+-        fn as_fd(&self) -> BorrowedFd<'_> {
+-            self.0
+-        }
++impl AsFd for Pipe {
++    fn as_fd(&self) -> BorrowedFd<'_> {
++        self.0.as_fd()
+     }
++}
+
+-    impl IntoRawFd for Pipe {
+-        fn into_raw_fd(self) -> RawFd {
+-            self.0
+-        }
++impl IntoRawFd for Pipe {
++    fn into_raw_fd(self) -> RawFd {
++        self.0.into_raw_fd()
+     }
++}
+
+-    impl FromRawFd for Pipe {
+-        unsafe fn from_raw_fd(_: RawFd) -> Self {
+-            panic!("creating pipe on this platform is unsupported!")
+-        }
++impl FromRawFd for Pipe {
++    unsafe fn from_raw_fd(fd: RawFd) -> Self {
++        Self(FileDesc::from_inner(unsafe { OwnedFd::from_raw_fd(fd) }))
+     }
++}
+
+-    impl FromInner<OwnedFd> for Pipe {
+-        fn from_inner(_: OwnedFd) -> Self {
+-            panic!("creating pipe on this platform is unsupported!")
+-        }
++impl FromInner<OwnedFd> for Pipe {
++    fn from_inner(fd: OwnedFd) -> Self {
++        Self(FileDesc::from_inner(fd))
+     }
++}
+
+-    impl IntoInner<OwnedFd> for Pipe {
+-        fn into_inner(self) -> OwnedFd {
+-            self.0
+-        }
++impl IntoInner<OwnedFd> for Pipe {
++    fn into_inner(self) -> OwnedFd {
++        self.0.into_inner()
+     }
+ }
+--- a/library/std/src/sys/process/unsupported.rs
++++ b/library/std/src/sys/process/unsupported.rs
+@@ -2,6 +2,7 @@
+ pub use crate::ffi::OsString as EnvKey;
+ use crate::ffi::{c_char, c_long, c_void, CString, OsStr, OsString};
+ use crate::os::wasi::prelude::*;
++use crate::os::wasi::io::FromRawFd;
+ use crate::num::NonZero;
+ use crate::path::Path;
+ use crate::process::StdioPipes;
+@@ -99,7 +100,7 @@
+         _default: Stdio,
+         _needs_stdin: bool,
+     ) -> io::Result<(Process, StdioPipes)> {
+-        spawn_command(self, ptr::null())
++        spawn_command_with_stdio(self, _default, _needs_stdin)
+     }
+ }
+
+@@ -384,8 +385,123 @@
+         actions: *mut PosixSpawnFileActions,
+         path: *const c_char,
+     ) -> i32;
++}
++
++fn spawn_command_with_stdio(
++    cmd: &Command,
++    default: Stdio,
++    needs_stdin: bool,
++) -> io::Result<(Process, StdioPipes)> {
++    let mut actions = PosixSpawnFileActions::zeroed();
++    let actions_ptr = &mut actions as *mut PosixSpawnFileActions;
++    unsafe { cvt_spawn(posix_spawn_file_actions_init(actions_ptr))?; }
++
++    let mut parent_stdin = None;
++    let mut parent_stdout = None;
++    let mut parent_stderr = None;
++    let mut close_after_spawn = Vec::new();
++    let mut close_on_error = Vec::new();
++
++    let setup_result = (|| {
++        setup_stdin(
++            cmd.stdin.as_ref().unwrap_or(if needs_stdin { &default } else { &Stdio::Null }),
++            actions_ptr,
++            &mut parent_stdin,
++            &mut close_after_spawn,
++            &mut close_on_error,
++        )?;
++        setup_output(
++            cmd.stdout.as_ref().unwrap_or(&default),
++            actions_ptr,
++            1,
++            &mut parent_stdout,
++            &mut close_after_spawn,
++            &mut close_on_error,
++        )?;
++        setup_output(
++            cmd.stderr.as_ref().unwrap_or(&default),
++            actions_ptr,
++            2,
++            &mut parent_stderr,
++            &mut close_after_spawn,
++            &mut close_on_error,
++        )?;
++        Ok(())
++    })();
++
++    if let Err(err) = setup_result {
++        unsafe { posix_spawn_file_actions_destroy(actions_ptr); }
++        for fd in close_on_error {
++            close_ignoring_error(fd);
++        }
++        return Err(err);
++    }
++
++    let spawn_result = spawn_command(cmd, actions_ptr);
++    unsafe { posix_spawn_file_actions_destroy(actions_ptr); }
++
++    for fd in close_after_spawn {
++        close_ignoring_error(fd);
++    }
++
++    match spawn_result {
++        Ok((process, _)) => Ok((process, StdioPipes {
++            stdin: parent_stdin.map(pipe_from_raw_fd),
++            stdout: parent_stdout.map(pipe_from_raw_fd),
++            stderr: parent_stderr.map(pipe_from_raw_fd),
++        })),
++        Err(err) => {
++            for fd in close_on_error {
++                close_ignoring_error(fd);
++            }
++            Err(err)
++        }
++    }
+ }
+
++fn setup_stdin(
++    stdio: &Stdio,
++    actions: *mut PosixSpawnFileActions,
++    parent_pipe: &mut Option<i32>,
++    close_after_spawn: &mut Vec<i32>,
++    close_on_error: &mut Vec<i32>,
++) -> io::Result<()> {
++    match stdio {
++        Stdio::MakePipe => {
++            let pipe = create_pipe()?;
++            cvt_spawn(unsafe { posix_spawn_file_actions_adddup2(actions, pipe[0], 0) })?;
++            *parent_pipe = Some(pipe[1]);
++            close_after_spawn.push(pipe[0]);
++            close_on_error.extend_from_slice(&pipe);
++        }
++        Stdio::Null => {}
++        _ => {}
++    }
++    Ok(())
++}
++
++fn setup_output(
++    stdio: &Stdio,
++    actions: *mut PosixSpawnFileActions,
++    child_fd: i32,
++    parent_pipe: &mut Option<i32>,
++    close_after_spawn: &mut Vec<i32>,
++    close_on_error: &mut Vec<i32>,
++) -> io::Result<()> {
++    match stdio {
++        Stdio::MakePipe => {
++            let pipe = create_pipe()?;
++            cvt_spawn(unsafe { posix_spawn_file_actions_adddup2(actions, pipe[1], child_fd) })?;
++            *parent_pipe = Some(pipe[0]);
++            close_after_spawn.push(pipe[1]);
++            close_on_error.extend_from_slice(&pipe);
++        }
++        Stdio::Null => {}
++        _ => {}
++    }
++    Ok(())
++}
++
+ fn spawn_command(
+     cmd: &Command,
+     file_actions: *const PosixSpawnFileActions,
+@@ -479,6 +595,10 @@
+     unsafe { close(fd); }
+ }
+
++fn pipe_from_raw_fd(fd: i32) -> ChildPipe {
++    unsafe { ChildPipe::from_raw_fd(fd) }
++}
++
+ fn read_all_fd(fd: i32) -> io::Result<Vec<u8>> {
+     let mut out = Vec::new();
+     let mut buf = [0u8; 8192];
+@@ -552,9 +672,11 @@
+
+ pub fn read_output(
+     out: ChildPipe,
+-    _stdout: &mut Vec<u8>,
+-    _err: ChildPipe,
+-    _stderr: &mut Vec<u8>,
++    stdout: &mut Vec<u8>,
++    err: ChildPipe,
++    stderr: &mut Vec<u8>,
+ ) -> io::Result<()> {
+-    match out.diverge() {}
++    out.read_to_end(stdout)?;
++    err.read_to_end(stderr)?;
++    Ok(())
+ }

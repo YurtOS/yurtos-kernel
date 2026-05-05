@@ -57,6 +57,8 @@ export interface SecurityLimits {
   rpcBytes?: number;
   /** Max WASM linear memory in bytes. Rejects modules that exceed this. */
   memoryBytes?: number;
+  /** Max live guest processes in the kernel. */
+  processes?: number;
 }
 
 /** Error classes returned in RunResult.errorClass. */

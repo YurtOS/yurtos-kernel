@@ -16,6 +16,7 @@ members = [
   "packages/guest-compat/conformance/rust/getgroups-canary",
   "packages/guest-compat/conformance/rust/affinity-canary",
   "packages/guest-compat/conformance/rust/signal-canary",
+  "packages/guest-compat/conformance/rust/socket-rust-canary",
   "packages/guest-compat/conformance/rust/std-env-process-canary",
   "packages/guest-compat/conformance/rust/std-file-lock-canary",
   "packages/guest-compat/conformance/rust/std-fs-canary",

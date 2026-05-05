@@ -18,6 +18,7 @@ pub mod wasm_opt;
 pub const TIER1: &[&str] = &[
     "chown",
     "chroot",
+    "chmod",
     "flockfile",
     "ftrylockfile",
     "funlockfile",
@@ -34,6 +35,12 @@ pub const TIER1: &[&str] = &[
     "fchown",
     "fork",
     "vfork",
+    "gethostname",
+    "getaddrinfo",
+    "freeaddrinfo",
+    "getnameinfo",
+    "gethostbyname",
+    "gethostbyaddr",
     "getgroups",
     "getpriority",
     "getrlimit",
@@ -54,6 +61,9 @@ pub const TIER1: &[&str] = &[
     "umask",
     "pipe",
     "pipe2",
+    "if_indextoname",
+    "if_nametoindex",
+    "sendfile",
     "posix_spawn",
     "posix_spawnp",
     "posix_spawn_file_actions_init",
@@ -100,3 +110,5 @@ pub const WRAPPED_WASI_LIBC_SYMBOLS: &[&str] = &[
     "recv",
     "send",
 ];
+
+pub const YURT_INTERNAL_EXPORTS: &[&str] = &["yurt_deliver_signal"];

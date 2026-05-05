@@ -78,11 +78,9 @@ int pclose(FILE *stream) {
  *
  * waitpid(pid > 0): blocks via host_waitpid until that specific
  *   child exits.  Honors WNOHANG by switching to host_waitpid_nohang.
- * waitpid(-1) / wait(): the host doesn't expose a "wait for any
- *   child" primitive yet, and the guest doesn't track its own spawn
- *   list.  We return ECHILD — POSIX-correct when there are no
- *   children to wait for.  Adding a host_wait_any import is the
- *   natural follow-up; track via yurt_runtime.h. */
+ * waitpid(-1) / wait(): waits for any child owned by the calling
+ *   sandbox process.  The host returns JSON `{"pid":N,"exit_code":M}`
+ *   so wait-any can return the actual reaped child PID. */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -118,13 +116,11 @@ static int waitpid_parse_exit(const char *json, size_t json_len, int *out) {
     return json_parse_int(json, json_len, needle, sizeof(needle) - 1, out);
 }
 
-/* Pull `"pid":N` and `"exit_code":M` from a wait_any JSON response. */
-static int waitany_parse(const char *json, size_t json_len, int *pid_out, int *exit_out) {
-    static const char pidkey[]  = "\"pid\":";
-    static const char exitkey[] = "\"exit_code\":";
-    int ok_pid  = json_parse_int(json, json_len, pidkey,  sizeof(pidkey)  - 1, pid_out);
-    int ok_exit = json_parse_int(json, json_len, exitkey, sizeof(exitkey) - 1, exit_out);
-    return (ok_pid == 0 && ok_exit == 0) ? 0 : -1;
+static int waitpid_parse_pid(const char *json, size_t json_len, int fallback, int *out) {
+    static const char needle[] = "\"pid\":";
+    if (json_parse_int(json, json_len, needle, sizeof(needle) - 1, out) == 0) return 0;
+    *out = fallback;
+    return 0;
 }
 
 /* Pack a kernel exit code into the POSIX wait status encoding so
@@ -142,31 +138,31 @@ static int encode_wait_status(int kernel_exit) {
 
 pid_t waitpid(pid_t pid, int *wstatus, int options) {
     YURT_MARKER_CALL(waitpid);
-    if (pid <= 0) {
-        char buf[64];
-        int child_pid = 0, exit_code = 0;
-        if (options & WNOHANG) {
-            int n = yurt_host_wait_any_nohang((int)(intptr_t)buf, (int)sizeof(buf));
-            if (n <= 0 || (size_t)n > sizeof(buf)) { errno = ECHILD; return (pid_t)-1; }
-            if (waitany_parse(buf, (size_t)n, &child_pid, &exit_code) != 0) { errno = ECHILD; return (pid_t)-1; }
-            if (child_pid == 0) return 0; /* WNOHANG: no child ready yet */
-            if (child_pid < 0) { errno = ECHILD; return (pid_t)-1; }
-        } else {
-            int n = yurt_host_wait_any((int)(intptr_t)buf, (int)sizeof(buf));
-            if (n <= 0 || (size_t)n > sizeof(buf)) { errno = ECHILD; return (pid_t)-1; }
-            if (waitany_parse(buf, (size_t)n, &child_pid, &exit_code) != 0) { errno = ECHILD; return (pid_t)-1; }
-            if (child_pid <= 0) { errno = ECHILD; return (pid_t)-1; }
-        }
-        if (wstatus) *wstatus = encode_wait_status(exit_code);
-        return (pid_t)child_pid;
-    }
 
     int exit_code;
+    int waited_pid = (int)pid;
     if (options & WNOHANG) {
-        exit_code = yurt_host_waitpid_nohang((int)pid);
-        if (exit_code < 0) {
-            /* Still running: WNOHANG returns 0 with status untouched. */
+        char buf[64];
+        int n = yurt_host_waitpid_nohang((int)pid, (int)(intptr_t)buf, (int)sizeof(buf));
+        if (n == -1) {
+            /* No child has exited yet: WNOHANG returns 0 with status untouched. */
             return 0;
+        }
+        if (n <= 0 || (size_t)n > sizeof(buf)) {
+            errno = ECHILD;
+            return (pid_t)-1;
+        }
+        if (waitpid_parse_exit(buf, (size_t)n, &exit_code) != 0) {
+            errno = ECHILD;
+            return (pid_t)-1;
+        }
+        if (exit_code < 0) {
+            errno = ECHILD;
+            return (pid_t)-1;
+        }
+        if (waitpid_parse_pid(buf, (size_t)n, (int)pid, &waited_pid) != 0 || waited_pid < 0) {
+            errno = ECHILD;
+            return (pid_t)-1;
         }
     } else {
         char buf[64];
@@ -179,10 +175,18 @@ pid_t waitpid(pid_t pid, int *wstatus, int options) {
             errno = ECHILD;
             return (pid_t)-1;
         }
+        if (exit_code < 0) {
+            errno = ECHILD;
+            return (pid_t)-1;
+        }
+        if (waitpid_parse_pid(buf, (size_t)n, (int)pid, &waited_pid) != 0 || waited_pid < 0) {
+            errno = ECHILD;
+            return (pid_t)-1;
+        }
     }
 
     if (wstatus) *wstatus = encode_wait_status(exit_code);
-    return pid;
+    return (pid_t)waited_pid;
 }
 
 pid_t wait(int *wstatus) {
@@ -206,10 +210,9 @@ pid_t wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage) {
  * `__wasilibc_unmodified_upstream` is set, so on wasm32-wasip1 they
  * compile out entirely.  Yurt is a single-process-group, single-
  * session sandbox; the natural answers are:
- *   - umask: track a process-wide mask, default 022 (POSIX).  We
- *     don't actually apply it in the VFS today, but tools that
- *     read/write the mask roundtrip cleanly so they get the
- *     defensive behaviour they asked for.
+ *   - umask: route the process-wide mask to the host kernel.  The
+ *     kernel owns inheritance and the WASI/VFS creation path applies
+ *     it to newly-created files and directories.
  *   - getpgrp/getpgid/setpgid/setsid/getsid: report PID 1 as
  *     everyone's pgroup/session, accept setpgid silently.  Mirrors
  *     a single-init-style system.
@@ -243,13 +246,9 @@ YURT_DEFINE_MARKER(setsid,    0x73736964u) /* "ssid" */
 YURT_DEFINE_MARKER(tcgetpgrp, 0x74636770u) /* "tcgp" */
 YURT_DEFINE_MARKER(tcsetpgrp, 0x74637370u) /* "tcsp" */
 
-static mode_t yurt_umask_state = 022;
-
 mode_t umask(mode_t mask) {
     YURT_MARKER_CALL(umask);
-    mode_t prev = yurt_umask_state;
-    yurt_umask_state = mask & 0777;
-    return prev;
+    return (mode_t)yurt_host_umask((int)mask);
 }
 
 pid_t getpgrp(void) {
@@ -329,13 +328,13 @@ YURT_DECLARE_MARKER(vfork);
 YURT_DEFINE_MARKER(fork,  0x666f726bu) /* "fork" */
 YURT_DEFINE_MARKER(vfork, 0x76666f72u) /* "vfor" */
 
-pid_t fork(void) {
+__attribute__((weak)) pid_t fork(void) {
     YURT_MARKER_CALL(fork);
     errno = ENOSYS;
     return (pid_t)-1;
 }
 
-pid_t vfork(void) {
+__attribute__((weak)) pid_t vfork(void) {
     YURT_MARKER_CALL(vfork);
     errno = ENOSYS;
     return (pid_t)-1;

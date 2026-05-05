@@ -11,19 +11,40 @@
 #include "yurt_runtime.h"
 #include "yurt_markers.h"
 
+#define YURT_FCNTL_NO_REMAP
 #include <errno.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <wasi/api.h>
 
 YURT_DECLARE_MARKER(dup);
 YURT_DECLARE_MARKER(dup3);
+YURT_DECLARE_MARKER(fcntl);
 
 YURT_DEFINE_MARKER(dup,  0x64757020u) /* "dup " */
 YURT_DEFINE_MARKER(dup3, 0x64757033u) /* "dup3" */
+YURT_DEFINE_MARKER(fcntl, 0x66636e74u) /* "fcnt" */
+
+static int yurt_fd_status_flags[65536];
+
+static int yurt_fd_get_status_flags(int fd) {
+  if (fd < 0 || fd >= (int)(sizeof(yurt_fd_status_flags) / sizeof(yurt_fd_status_flags[0]))) {
+    return 0;
+  }
+  return yurt_fd_status_flags[fd];
+}
+
+static void yurt_fd_set_status_flags(int fd, int flags) {
+  if (fd < 0 || fd >= (int)(sizeof(yurt_fd_status_flags) / sizeof(yurt_fd_status_flags[0]))) {
+    return;
+  }
+  yurt_fd_status_flags[fd] = flags;
+}
 
 int dup(int oldfd) {
   YURT_MARKER_CALL(dup);
@@ -82,4 +103,127 @@ int dup3(int oldfd, int newfd, int flags) {
   /* O_CLOEXEC is a no-op in yurt (no exec()), so we drop the flag
    * and forward to dup2 — same renumber semantics. */
   return dup2(oldfd, newfd);
+}
+
+static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
+  YURT_MARKER_CALL(fcntl);
+
+  switch (cmd) {
+    case F_DUPFD:
+#ifdef F_DUPFD_CLOEXEC
+    case F_DUPFD_CLOEXEC:
+#endif
+    {
+      int min_fd = va_arg(ap, int);
+      if (fd < 0 || min_fd < 0) {
+        errno = EINVAL;
+        return -1;
+      }
+
+      int new_fd = dup(fd);
+      if (new_fd < 0) return -1;
+      if (new_fd >= min_fd) return new_fd;
+
+      int saved[64];
+      size_t saved_count = 0;
+      while (new_fd >= 0 && new_fd < min_fd) {
+        if (saved_count >= sizeof(saved) / sizeof(saved[0])) {
+          close(new_fd);
+          for (size_t i = 0; i < saved_count; ++i) close(saved[i]);
+          errno = EMFILE;
+          return -1;
+        }
+        saved[saved_count++] = new_fd;
+        new_fd = dup(fd);
+      }
+      int saved_errno = errno;
+      for (size_t i = 0; i < saved_count; ++i) close(saved[i]);
+      if (new_fd < 0) errno = saved_errno;
+      return new_fd;
+    }
+
+    case F_GETFD:
+      if (fd < 0) {
+        errno = EBADF;
+        return -1;
+      }
+      return 0;
+
+    case F_SETFD:
+      (void)va_arg(ap, int);
+      if (fd < 0) {
+        errno = EBADF;
+        return -1;
+      }
+      return 0;
+
+    case F_GETFL: {
+      __wasi_fdstat_t st;
+      __wasi_errno_t rc = __wasi_fd_fdstat_get((__wasi_fd_t)fd, &st);
+      if (rc != __WASI_ERRNO_SUCCESS) {
+        errno = EBADF;
+        return -1;
+      }
+      int flags = 0;
+      int can_read = (st.fs_rights_base & __WASI_RIGHTS_FD_READ) != 0;
+      int can_write = (st.fs_rights_base & __WASI_RIGHTS_FD_WRITE) != 0;
+      if (can_read && can_write) flags |= O_RDWR;
+      else if (can_write) flags |= O_WRONLY;
+      else if (can_read) flags |= O_RDONLY;
+      if ((st.fs_flags & __WASI_FDFLAGS_APPEND) != 0) flags |= O_APPEND;
+      if ((st.fs_flags & __WASI_FDFLAGS_NONBLOCK) != 0) flags |= O_NONBLOCK;
+      flags |= yurt_fd_get_status_flags(fd);
+      return flags;
+    }
+
+    case F_SETFL: {
+      int flags = va_arg(ap, int);
+      __wasi_fdstat_t st;
+      __wasi_errno_t rc = __wasi_fd_fdstat_get((__wasi_fd_t)fd, &st);
+      if (rc != __WASI_ERRNO_SUCCESS) {
+        errno = EBADF;
+        return -1;
+      }
+      __wasi_fdflags_t fdflags = st.fs_flags;
+      if ((flags & O_APPEND) != 0) fdflags |= __WASI_FDFLAGS_APPEND;
+      else fdflags &= ~__WASI_FDFLAGS_APPEND;
+      if ((flags & O_NONBLOCK) != 0) fdflags |= __WASI_FDFLAGS_NONBLOCK;
+      else fdflags &= ~__WASI_FDFLAGS_NONBLOCK;
+      rc = __wasi_fd_fdstat_set_flags((__wasi_fd_t)fd, fdflags);
+      if (rc != __WASI_ERRNO_SUCCESS) {
+        errno = EINVAL;
+        return -1;
+      }
+      yurt_fd_set_status_flags(fd, flags & (O_APPEND | O_NONBLOCK | O_DSYNC | O_SYNC | O_RSYNC));
+      return 0;
+    }
+
+    default:
+      errno = EINVAL;
+      return -1;
+  }
+}
+
+int fcntl(int fd, int cmd, ...) {
+  va_list ap;
+  va_start(ap, cmd);
+  int result = yurt_fcntl_impl(fd, cmd, ap);
+  va_end(ap);
+  return result;
+}
+
+int yurt_fcntl(int fd, int cmd, ...) {
+  va_list ap;
+  va_start(ap, cmd);
+  int result = yurt_fcntl_impl(fd, cmd, ap);
+  va_end(ap);
+  return result;
+}
+
+int __wrap_fcntl(int fd, int cmd, ...) {
+  va_list ap;
+  va_start(ap, cmd);
+  int result = yurt_fcntl_impl(fd, cmd, ap);
+  va_end(ap);
+  return result;
 }

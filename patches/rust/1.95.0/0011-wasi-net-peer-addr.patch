@@ -1,0 +1,44 @@
+--- a/library/std/src/sys/net/connection/wasip1.rs
++++ b/library/std/src/sys/net/connection/wasip1.rs
+@@ -13,6 +13,7 @@
+
+ pub struct TcpStream {
+     inner: Socket,
++    peer_addr: Option<SocketAddr>,
+ }
+
+ impl AsInner<FileDesc> for Socket {
+@@ -125,7 +126,10 @@
+         return Err(err);
+     }
+
+-    Ok(TcpStream { inner: unsafe { Socket::from_raw_fd(fd as RawFd) } })
++    Ok(TcpStream {
++        inner: unsafe { Socket::from_raw_fd(fd as RawFd) },
++        peer_addr: Some(SocketAddr::V4(*addr)),
++    })
+ }
+
+ impl TcpStream {
+@@ -186,7 +190,12 @@
+     }
+
+     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+-        unsupported()
++        self.peer_addr.ok_or_else(|| {
++            io::Error::new(
++                io::ErrorKind::Unsupported,
++                "peer address is not available for this socket",
++            )
++        })
+     }
+
+     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
+@@ -266,7 +275,7 @@
+
+ impl FromInner<Socket> for TcpStream {
+     fn from_inner(socket: Socket) -> TcpStream {
+-        TcpStream { inner: socket }
++        TcpStream { inner: socket, peer_addr: None }
+     }
+ }

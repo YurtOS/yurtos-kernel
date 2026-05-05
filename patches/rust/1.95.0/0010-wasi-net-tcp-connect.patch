@@ -1,0 +1,97 @@
+--- a/library/std/src/sys/net/connection/wasip1.rs
++++ b/library/std/src/sys/net/connection/wasip1.rs
+@@ -1,6 +1,6 @@
+ #![forbid(unsafe_op_in_unsafe_fn)]
+
+-use crate::fmt;
++use crate::{fmt, mem};
+ use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
+ use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, ToSocketAddrs};
+ use crate::os::wasi::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+@@ -59,13 +59,82 @@
+     }
+ }
+
++type YurtSaFamily = u16;
++type YurtInPort = u16;
++type YurtInAddrRaw = u32;
++type YurtSockLen = u32;
++
++const YURT_AF_INET: i32 = 1;
++const YURT_SOCK_STREAM: i32 = 6;
++
++#[repr(C, align(16))]
++struct YurtSockAddr {
++    sa_family: YurtSaFamily,
++    sa_data: [i8; 0],
++}
++
++#[repr(C)]
++struct YurtInAddr {
++    s_addr: YurtInAddrRaw,
++}
++
++#[repr(C, align(16))]
++struct YurtSockAddrIn {
++    sin_family: YurtSaFamily,
++    sin_port: YurtInPort,
++    sin_addr: YurtInAddr,
++}
++
++unsafe extern "C" {
++    fn socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
++    fn connect(fd: i32, addr: *const YurtSockAddr, addr_len: YurtSockLen) -> i32;
++    fn close(fd: i32) -> i32;
++}
++
++fn tcp_connect_addr(addr: &SocketAddr) -> io::Result<TcpStream> {
++    let SocketAddr::V4(addr) = addr else {
++        return Err(io::Error::new(
++            io::ErrorKind::Unsupported,
++            "IPv6 sockets are not supported by Yurt wasm32-wasip1 yet",
++        ));
++    };
++
++    let fd = unsafe { socket(YURT_AF_INET, YURT_SOCK_STREAM, 0) };
++    if fd < 0 {
++        return Err(io::Error::last_os_error());
++    }
++
++    let raw = YurtSockAddrIn {
++        sin_family: YURT_AF_INET as YurtSaFamily,
++        sin_port: addr.port().to_be(),
++        sin_addr: YurtInAddr {
++            s_addr: u32::from_ne_bytes(addr.ip().octets()),
++        },
++    };
++
++    let rc = unsafe {
++        connect(
++            fd,
++            &raw as *const YurtSockAddrIn as *const YurtSockAddr,
++            mem::size_of::<YurtSockAddrIn>() as YurtSockLen,
++        )
++    };
++    if rc != 0 {
++        let err = io::Error::last_os_error();
++        unsafe { close(fd) };
++        return Err(err);
++    }
++
++    Ok(TcpStream { inner: unsafe { Socket::from_raw_fd(fd as RawFd) } })
++}
++
+ impl TcpStream {
+-    pub fn connect<A: ToSocketAddrs>(_: A) -> io::Result<TcpStream> {
+-        unsupported()
++    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
++        super::each_addr(addr, tcp_connect_addr)
+     }
+
+-    pub fn connect_timeout(_: &SocketAddr, _: Duration) -> io::Result<TcpStream> {
+-        unsupported()
++    pub fn connect_timeout(addr: &SocketAddr, _: Duration) -> io::Result<TcpStream> {
++        tcp_connect_addr(addr)
+     }
+
+     pub fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {

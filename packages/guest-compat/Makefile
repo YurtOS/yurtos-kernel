@@ -30,11 +30,13 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_ioctl.o \
   $(BUILD_DIR)/yurt_mktemp.o \
   $(BUILD_DIR)/yurt_netdb.o \
+  $(BUILD_DIR)/yurt_netif.o \
   $(BUILD_DIR)/yurt_pipe.o \
   $(BUILD_DIR)/yurt_process.o \
   $(BUILD_DIR)/yurt_pthread.o \
   $(BUILD_DIR)/yurt_resource.o \
   $(BUILD_DIR)/yurt_sched.o \
+  $(BUILD_DIR)/yurt_sendfile.o \
   $(BUILD_DIR)/yurt_signal.o \
   $(BUILD_DIR)/yurt_socket.o \
   $(BUILD_DIR)/yurt_spawn.o \
@@ -44,8 +46,9 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_unistd.o \
   $(BUILD_DIR)/yurt_version.o
 
-CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups signal setjmp pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
+CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
+FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 
 .PHONY: all lib canaries copy-fixtures clean ensure-toolchain
 
@@ -70,7 +73,8 @@ $(BUILD_DIR)/%.o: src/%.c $(wildcard include/*.h) src/yurt_runtime.h src/yurt_ma
 lib: $(LIB)
 
 SETJMP_OBJS := \
-  $(BUILD_DIR)/yurt_setjmp.o
+  $(BUILD_DIR)/yurt_setjmp.o \
+  $(BUILD_DIR)/yurt_fork.o
 
 $(LIB): $(LIB_OBJS) | $(BUILD_DIR) ensure-toolchain
 	$(YURT_AR) rcs $@ $(LIB_OBJS)
@@ -86,21 +90,36 @@ $(BUILD_DIR)/setjmp-canary.wasm: $(CANARY_DIR)/setjmp-canary.c $(wildcard includ
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/setjmp-canary.pre-opt.wasm \
 	$(YURT_CC) $< -o $@
 
+$(BUILD_DIR)/fork-canary.wasm: $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) $(SETJMP_LIB) | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_SETJMP_ARCHIVE=$(abspath $(SETJMP_LIB)) \
+	YURT_CC_USE_SETJMP=1 \
+	YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/fork-canary.pre-opt.wasm \
+	$(YURT_CC) $< -o $@
+
+$(FORK_DEFAULT_CANARY): $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/fork-default-canary.pre-opt.wasm \
+	$(YURT_CC) $< -o $@
+
 $(BUILD_DIR)/%-canary.wasm: $(CANARY_DIR)/%-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/$*-canary.pre-opt.wasm \
 	$(YURT_CC) $< -o $@
 
-canaries: $(CANARIES)
+canaries: $(CANARIES) $(FORK_DEFAULT_CANARY)
 
 copy-fixtures: canaries
 	@for n in $(CANARY_NAMES); do cp $(BUILD_DIR)/$$n-canary.wasm $(FIXTURES)/$$n-canary.wasm; done
+	@cp $(FORK_DEFAULT_CANARY) $(FIXTURES)/fork-default-canary.wasm
 
 clean:
 	rm -rf $(BUILD_DIR)
 
-RUST_CANARY_NAMES := dup2 getgroups affinity signal
+RUST_CANARY_NAMES := dup2 getgroups affinity signal socket-rust
 RUST_CANARY_PRE_OPT := $(addprefix $(BUILD_DIR)/rust/,$(addsuffix -canary.pre-opt.wasm,$(RUST_CANARY_NAMES)))
 RUST_CANARY_WASM := $(addprefix $(BUILD_DIR)/rust/,$(addsuffix -canary.wasm,$(RUST_CANARY_NAMES)))
 RUST_STD_CANARY_NAMES := std-tempdir std-env-process std-paths std-fs std-file-lock std-thread std-process-status std-process-output std-process-env-cwd std-process-spawn-stdio std-process-child-stdout std-process-stdio-from std-net-connect std-net-stream std-net-peer-addr std-net-hostname std-net-shutdown std-net-try-clone std-net-socket-addr std-net-take-error std-net-nodelay std-net-peek std-net-nonblocking std-net-listener
@@ -114,10 +133,11 @@ rust-canaries: $(LIB) ensure-toolchain
 	YURT_CC_NO_WASM_OPT=1 \
 	CARGO_TARGET_DIR=$(REPO_ROOT)/target \
 	$(REPO_ROOT)/target/release/cargo-yurt yurt build --release \
-	  -p dup2-canary -p getgroups-canary -p affinity-canary -p signal-canary
+	  -p dup2-canary -p getgroups-canary -p affinity-canary -p signal-canary -p socket-rust-canary
 	@for n in $(RUST_CANARY_NAMES); do \
 	  cp $(REPO_ROOT)/target/wasm32-wasip1/release/$$n-canary.wasm $(BUILD_DIR)/rust/$$n-canary.wasm; \
 	done
+	@cp $(BUILD_DIR)/rust/socket-rust-canary.wasm $(FIXTURES)/socket-rust-canary.wasm
 
 rust-std-canaries: $(LIB) ensure-toolchain
 	@mkdir -p $(BUILD_DIR)/rust

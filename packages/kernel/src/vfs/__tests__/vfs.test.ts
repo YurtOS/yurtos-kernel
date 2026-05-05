@@ -299,15 +299,123 @@ describe('mode-bit enforcement', () => {
     expect(vfs.stat('/home/user/f.txt').permissions).toBe(0o444);
   });
 
-  it('chmod in 0o555 dir → EACCES', () => {
+  it('chmod owner-owned file succeeds even when parent dir is not writable', () => {
     const vfs = new VFS();
-    // /bin is 0o555, so chmod on any child is denied
+    vfs.mkdir('/tmp/owned-dir');
+    vfs.writeFile('/tmp/owned-dir/file.txt', new Uint8Array(1));
     vfs.withWriteAccess(() => {
-      vfs.writeFile('/bin/tool', new Uint8Array(1));
+      vfs.chmod('/tmp/owned-dir', 0o555);
     });
+    vfs.chmod('/tmp/owned-dir/file.txt', 0o444);
+    expect(vfs.stat('/tmp/owned-dir/file.txt').permissions).toBe(0o444);
+  });
+
+  it('chmod denies non-owners and masks file type bits from raw st_mode values', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.writeFile('/tmp/mode.txt', new Uint8Array(1));
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+
+    expect(() => other.chmod('/tmp/mode.txt', 0o777)).toThrow(/EACCES/);
+
+    owner.chmod('/tmp/mode.txt', 0o100644);
+    expect(owner.stat('/tmp/mode.txt').permissions).toBe(0o644);
+  });
+
+  it('chown is root-only and lchown mutates the symlink inode', () => {
+    const owner = new VFS({ uid: 1000, gid: 1000 });
+    owner.writeFile('/tmp/target.txt', new Uint8Array(1));
+    owner.symlink('/tmp/target.txt', '/tmp/link.txt');
+
+    expect(() => owner.chown('/tmp/target.txt', 2000, 2000)).toThrow(/EACCES/);
+
+    const root = owner.cowClone({ uid: 0, gid: 0 });
+    root.chown('/tmp/link.txt', 2000, 2000, false);
+    expect(root.lstat('/tmp/link.txt').uid).toBe(2000);
+    expect(root.stat('/tmp/target.txt').uid).toBe(1000);
+  });
+
+  it('uses group write bit when uid differs but gid matches', () => {
+    const owner = new VFS({ uid: 2000, gid: 1000 });
+    owner.writeFile('/tmp/group-writable.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/group-writable.txt', 0o660);
+
+    const groupPeer = owner.cowClone({ uid: 3000, gid: 1000 });
+    groupPeer.writeFile('/tmp/group-writable.txt', new Uint8Array([2]));
+    expect(groupPeer.readFile('/tmp/group-writable.txt')).toEqual(new Uint8Array([2]));
+  });
+
+  it('uses other write bit when neither uid nor gid matches', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.writeFile('/tmp/world-writable.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/world-writable.txt', 0o606);
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+    other.writeFile('/tmp/world-writable.txt', new Uint8Array([2]));
+    expect(other.readFile('/tmp/world-writable.txt')).toEqual(new Uint8Array([2]));
+  });
+
+  it('denies write when uid, gid, and other write bits do not grant access', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.writeFile('/tmp/private.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/private.txt', 0o640);
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
     expect(() => {
-      vfs.chmod('/bin/tool', 0o777);
+      other.writeFile('/tmp/private.txt', new Uint8Array([2]));
     }).toThrow(/EACCES/);
+  });
+
+  it('readFile uses owner, group, and other read bits', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.writeFile('/tmp/private.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/private.txt', 0o640);
+
+    const groupPeer = owner.cowClone({ uid: 3000, gid: 2000 });
+    expect(groupPeer.readFile('/tmp/private.txt')).toEqual(new Uint8Array([1]));
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+    expect(() => other.readFile('/tmp/private.txt')).toThrow(/EACCES/);
+
+    const root = owner.cowClone({ uid: 0, gid: 0 });
+    expect(root.readFile('/tmp/private.txt')).toEqual(new Uint8Array([1]));
+  });
+
+  it('directory search requires execute permission on every traversed directory', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.mkdir('/tmp/private-dir');
+    owner.writeFile('/tmp/private-dir/file.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/private-dir', 0o600);
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+    expect(() => other.stat('/tmp/private-dir/file.txt')).toThrow(/EACCES/);
+    expect(() => other.readFile('/tmp/private-dir/file.txt')).toThrow(/EACCES/);
+  });
+
+  it('directory listing requires read permission on the directory', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.mkdir('/tmp/listable');
+    owner.writeFile('/tmp/listable/file.txt', new Uint8Array([1]));
+    owner.chmod('/tmp/listable', 0o711);
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+    expect(() => other.readdir('/tmp/listable')).toThrow(/EACCES/);
+    expect(other.stat('/tmp/listable/file.txt').type).toBe('file');
+  });
+
+  it('creating entries in a directory requires write and execute permission', () => {
+    const owner = new VFS({ uid: 2000, gid: 2000 });
+    owner.mkdir('/tmp/dropbox');
+    owner.chmod('/tmp/dropbox', 0o622);
+
+    const other = owner.cowClone({ uid: 3000, gid: 3000 });
+    expect(() => {
+      other.writeFile('/tmp/dropbox/new.txt', new Uint8Array([1]));
+    }).toThrow(/EACCES/);
+
+    owner.chmod('/tmp/dropbox', 0o733);
+    const searchableOther = owner.cowClone({ uid: 3000, gid: 3000 });
+    searchableOther.writeFile('/tmp/dropbox/new.txt', new Uint8Array([1]));
+    expect(searchableOther.stat('/tmp/dropbox/new.txt').type).toBe('file');
   });
 
   it('mkdir in 0o555 dir → EACCES', () => {

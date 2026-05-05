@@ -6,7 +6,7 @@
  * (for fork simulation) and extensible with pipes (for shell pipelines).
  */
 
-import type { DirEntry, DirInode, Inode, StatResult } from './inode.js';
+import type { DirEntry, DirInode, FsCredential, Inode, StatResult } from './inode.js';
 import {
   VfsError,
   createDirInode,
@@ -20,12 +20,20 @@ import { DevProvider } from './dev-provider.js';
 import { ProcProvider } from './proc-provider.js';
 
 const MAX_SYMLINK_DEPTH = 40;
+const ROOT_UID = 0;
+const ROOT_GID = 0;
+const USER_UID = 1000;
+const USER_GID = 1000;
 
 export interface VfsOptions {
   /** Maximum total bytes stored in the VFS. Undefined = no limit. */
   fsLimitBytes?: number;
   /** Maximum number of files/directories. Undefined = no limit. */
   fileCount?: number;
+  /** Effective uid for normal VFS operations. Defaults to the sandbox user. */
+  uid?: number;
+  /** Effective gid for normal VFS operations. Defaults to the sandbox user group. */
+  gid?: number;
 }
 
 /**
@@ -63,6 +71,8 @@ export class VFS {
   private currentFileCount = 0;
   /** When true, bypass mode-bit permission checks (used during init and withWriteAccess). */
   private initializing = false;
+  private uid = USER_UID;
+  private gid = USER_GID;
   /** Mounted virtual providers keyed by mount path (e.g. '/dev', '/proc'). */
   private providers: Map<string, VirtualProvider> = new Map();
   /** Optional callback invoked after mutating VFS operations. */
@@ -77,7 +87,9 @@ export class VFS {
   private processListProvider: (() => ProcessInfo[]) | null = null;
 
   constructor(options?: VfsOptions) {
-    this.root = createDirInode(0o555);
+    this.uid = options?.uid ?? USER_UID;
+    this.gid = options?.gid ?? USER_GID;
+    this.root = createDirInode(0o555, ROOT_UID, ROOT_GID);
     this.fsLimitBytes = options?.fsLimitBytes;
     this.fileCountLimit = options?.fileCount;
     this.initializing = true;
@@ -100,6 +112,8 @@ export class VFS {
     totalBytes?: number;
     fileCountLimit?: number;
     currentFileCount?: number;
+    uid?: number;
+    gid?: number;
     providers?: Map<string, VirtualProvider>;
   }): VFS {
     const vfs = Object.create(VFS.prototype) as VFS;
@@ -111,6 +125,8 @@ export class VFS {
     vfs.fileCountLimit = options?.fileCountLimit;
     vfs.currentFileCount = options?.currentFileCount ?? 0;
     vfs.initializing = false;
+    vfs.uid = options?.uid ?? USER_UID;
+    vfs.gid = options?.gid ?? USER_GID;
     vfs.onChangeCallback = null;
     // Re-create built-in providers (fresh instances for independent state).
     // User-mounted providers are shared by reference (safe for read-only mounts).
@@ -136,23 +152,23 @@ export class VFS {
 
   /** Populate the default directory tree with explicit mode bits. */
   private initDefaultLayout(): void {
-    const dirs: Array<[string, number]> = [
-      ['/home', 0o755],
-      ['/home/user', 0o755],
-      ['/tmp', 0o777],
-      ['/bin', 0o555],
-      ['/usr', 0o555],
-      ['/usr/bin', 0o555],
-      ['/usr/lib', 0o555],
-      ['/usr/lib/python', 0o755],
-      ['/etc', 0o555],
-      ['/etc/yurt', 0o555],
-      ['/usr/share', 0o555],
-      ['/usr/share/pkg', 0o755],
-      ['/mnt', 0o555],
+    const dirs: Array<[string, number, number, number]> = [
+      ['/home', 0o755, ROOT_UID, ROOT_GID],
+      ['/home/user', 0o755, USER_UID, USER_GID],
+      ['/tmp', 0o777, ROOT_UID, ROOT_GID],
+      ['/bin', 0o555, ROOT_UID, ROOT_GID],
+      ['/usr', 0o555, ROOT_UID, ROOT_GID],
+      ['/usr/bin', 0o555, ROOT_UID, ROOT_GID],
+      ['/usr/lib', 0o555, ROOT_UID, ROOT_GID],
+      ['/usr/lib/python', 0o755, USER_UID, USER_GID],
+      ['/etc', 0o555, ROOT_UID, ROOT_GID],
+      ['/etc/yurt', 0o555, ROOT_UID, ROOT_GID],
+      ['/usr/share', 0o555, ROOT_UID, ROOT_GID],
+      ['/usr/share/pkg', 0o755, USER_UID, USER_GID],
+      ['/mnt', 0o555, ROOT_UID, ROOT_GID],
     ];
-    for (const [dir, mode] of dirs) {
-      this.mkdirInternal(dir, mode);
+    for (const [dir, mode, uid, gid] of dirs) {
+      this.mkdirInternal(dir, mode, uid, gid);
     }
   }
 
@@ -271,12 +287,63 @@ export class VFS {
     return undefined;
   }
 
-  /** Throw EACCES if the inode's owner write bit is not set. Bypassed during init/withWriteAccess. */
-  private assertWritePermission(inode: Inode): void {
-    if (this.initializing) return;
-    if (!(inode.metadata.permissions & 0o200)) {
+  private currentOwner(): { uid: number; gid: number } {
+    return { uid: this.uid, gid: this.gid };
+  }
+
+  private canAccess(inode: Inode, ownerBit: number, groupBit: number, otherBit: number): boolean {
+    if (this.initializing || this.uid === ROOT_UID) return true;
+    const mode = inode.metadata.permissions;
+    if (inode.metadata.uid === this.uid) return (mode & ownerBit) !== 0;
+    if (inode.metadata.gid === this.gid) return (mode & groupBit) !== 0;
+    return (mode & otherBit) !== 0;
+  }
+
+  private canRead(inode: Inode): boolean {
+    return this.canAccess(inode, 0o400, 0o040, 0o004);
+  }
+
+  private canWrite(inode: Inode): boolean {
+    return this.canAccess(inode, 0o200, 0o020, 0o002);
+  }
+
+  private canExecute(inode: Inode): boolean {
+    return this.canAccess(inode, 0o100, 0o010, 0o001);
+  }
+
+  private assertReadPermission(inode: Inode): void {
+    if (!this.canRead(inode)) {
       throw new VfsError('EACCES', 'permission denied');
     }
+  }
+
+  /** Throw EACCES if the effective user cannot write the inode. Bypassed during init/withWriteAccess. */
+  private assertWritePermission(inode: Inode): void {
+    if (!this.canWrite(inode)) {
+      throw new VfsError('EACCES', 'permission denied');
+    }
+  }
+
+  private assertSearchPermission(inode: Inode): void {
+    if (!this.canExecute(inode)) {
+      throw new VfsError('EACCES', 'permission denied');
+    }
+  }
+
+  private assertDirectoryMutationPermission(inode: Inode): void {
+    if (!this.canWrite(inode) || !this.canExecute(inode)) {
+      throw new VfsError('EACCES', 'permission denied');
+    }
+  }
+
+  private assertChmodPermission(inode: Inode): void {
+    if (this.initializing || this.uid === ROOT_UID || inode.metadata.uid === this.uid) return;
+    throw new VfsError('EACCES', 'permission denied');
+  }
+
+  private assertChownPermission(): void {
+    if (this.initializing || this.uid === ROOT_UID) return;
+    throw new VfsError('EACCES', 'permission denied');
   }
 
   /** Throw ENOSPC if the file-count limit has been reached. */
@@ -287,7 +354,7 @@ export class VFS {
   }
 
   /** Internal mkdir that silently skips existing directories. Used during init. */
-  private mkdirInternal(path: string, mode?: number): void {
+  private mkdirInternal(path: string, mode?: number, uid = this.uid, gid = this.gid): void {
     const segments = parsePath(path);
     let current: DirInode = this.root;
 
@@ -302,7 +369,7 @@ export class VFS {
       } else {
         // Apply specified mode only to the final segment
         const dirMode = (mode !== undefined && i === segments.length - 1) ? mode : undefined;
-        const newDir = createDirInode(dirMode);
+        const newDir = createDirInode(dirMode, uid, gid);
         current.children.set(segment, newDir);
         this.currentFileCount++;
         current = newDir;
@@ -337,6 +404,7 @@ export class VFS {
       if (current.type !== 'dir') {
         throw new VfsError('ENOTDIR', `not a directory: ${path}`);
       }
+      this.assertSearchPermission(current);
 
       const child = current.children.get(segments[i]);
       if (child === undefined) {
@@ -386,6 +454,7 @@ export class VFS {
       if (current.type !== 'dir') {
         throw new VfsError('ENOTDIR', `not a directory: ${path}`);
       }
+      this.assertSearchPermission(current);
       const child = current.children.get(segment);
       if (child === undefined) {
         throw new VfsError('ENOENT', `no such file or directory: ${path}`);
@@ -402,6 +471,7 @@ export class VFS {
     if (current.type !== 'dir') {
       throw new VfsError('ENOTDIR', `not a directory: ${path}`);
     }
+    this.assertSearchPermission(current);
 
     return { parent: current, name };
   }
@@ -415,6 +485,8 @@ export class VFS {
         type: ps.type,
         size: ps.size,
         permissions: ps.type === 'dir' ? 0o755 : 0o444,
+        uid: ROOT_UID,
+        gid: ROOT_GID,
         mtime: now,
         ctime: now,
         atime: now,
@@ -437,6 +509,8 @@ export class VFS {
       type: inode.type,
       size,
       permissions: metadata.permissions,
+      uid: metadata.uid,
+      gid: metadata.gid,
       mtime: metadata.mtime,
       ctime: metadata.ctime,
       atime: metadata.atime,
@@ -466,6 +540,8 @@ export class VFS {
       type: inode.type,
       size,
       permissions: metadata.permissions,
+      uid: metadata.uid,
+      gid: metadata.gid,
       mtime: metadata.mtime,
       ctime: metadata.ctime,
       atime: metadata.atime,
@@ -487,6 +563,7 @@ export class VFS {
       // Should not happen after resolve with followSymlinks, but guard anyway
       return this.readFile(inode.target);
     }
+    this.assertReadPermission(inode);
 
     inode.metadata.atime = new Date();
     return inode.content;
@@ -495,11 +572,32 @@ export class VFS {
   /** Run a callback with mode-bit permission checks disabled (root mode). */
   withWriteAccess(fn: () => void): void {
     const prev = this.initializing;
+    const prevUid = this.uid;
+    const prevGid = this.gid;
     this.initializing = true;
-    try { fn(); } finally { this.initializing = prev; }
+    this.uid = ROOT_UID;
+    this.gid = ROOT_GID;
+    try { fn(); } finally {
+      this.initializing = prev;
+      this.uid = prevUid;
+      this.gid = prevGid;
+    }
   }
 
-  writeFile(path: string, data: Uint8Array): void {
+  withCredential<T>(credential: FsCredential, fn: () => T): T {
+    const prevUid = this.uid;
+    const prevGid = this.gid;
+    this.uid = credential.uid;
+    this.gid = credential.gid;
+    try {
+      return fn();
+    } finally {
+      this.uid = prevUid;
+      this.gid = prevGid;
+    }
+  }
+
+  writeFile(path: string, data: Uint8Array, mode = 0o644): void {
     const match = this.matchProvider(path);
     if (match) {
       match.provider.writeFile(match.subpath, data);
@@ -517,7 +615,7 @@ export class VFS {
     if (existing !== undefined && existing.type === 'file') {
       this.assertWritePermission(existing);
     } else {
-      this.assertWritePermission(parent);
+      this.assertDirectoryMutationPermission(parent);
     }
 
     const oldSize = (existing !== undefined && existing.type === 'file') ? existing.content.byteLength : 0;
@@ -533,23 +631,25 @@ export class VFS {
       existing.metadata.mtime = new Date();
     } else {
       this.assertFileCountLimit();
-      parent.children.set(name, createFileInode(data));
+      const owner = this.currentOwner();
+      parent.children.set(name, createFileInode(data, normalizeMode(mode), owner.uid, owner.gid));
       this.currentFileCount++;
     }
     this.totalBytes += delta;
     this.notifyChange();
   }
 
-  mkdir(path: string): void {
+  mkdir(path: string, mode = 0o755): void {
     const { parent, name } = this.resolveParent(path);
-    this.assertWritePermission(parent);
 
     if (parent.children.has(name)) {
       throw new VfsError('EEXIST', `file exists: ${path}`);
     }
 
+    this.assertDirectoryMutationPermission(parent);
     this.assertFileCountLimit();
-    parent.children.set(name, createDirInode());
+    const owner = this.currentOwner();
+    parent.children.set(name, createDirInode(normalizeMode(mode), owner.uid, owner.gid));
     this.currentFileCount++;
     this.notifyChange();
   }
@@ -569,9 +669,10 @@ export class VFS {
         }
         current = existing;
       } else {
-        this.assertWritePermission(current);
+        this.assertDirectoryMutationPermission(current);
         this.assertFileCountLimit();
-        const newDir = createDirInode();
+        const owner = this.currentOwner();
+        const newDir = createDirInode(0o755, owner.uid, owner.gid);
         current.children.set(segment, newDir);
         this.currentFileCount++;
         current = newDir;
@@ -591,6 +692,7 @@ export class VFS {
     if (inode.type !== 'dir') {
       throw new VfsError('ENOTDIR', `not a directory: ${path}`);
     }
+    this.assertReadPermission(inode);
 
     inode.metadata.atime = new Date();
     const entries: DirEntry[] = [];
@@ -604,7 +706,7 @@ export class VFS {
 
   unlink(path: string): void {
     const { parent, name } = this.resolveParent(path);
-    this.assertWritePermission(parent);
+    this.assertDirectoryMutationPermission(parent);
     const child = parent.children.get(name);
 
     if (child === undefined) {
@@ -624,7 +726,7 @@ export class VFS {
 
   rmdir(path: string): void {
     const { parent, name } = this.resolveParent(path);
-    this.assertWritePermission(parent);
+    this.assertDirectoryMutationPermission(parent);
     const child = parent.children.get(name);
 
     if (child === undefined) {
@@ -644,7 +746,7 @@ export class VFS {
 
   rename(oldPath: string, newPath: string): void {
     const { parent: oldParent, name: oldName } = this.resolveParent(oldPath);
-    this.assertWritePermission(oldParent);
+    this.assertDirectoryMutationPermission(oldParent);
     const child = oldParent.children.get(oldName);
 
     if (child === undefined) {
@@ -652,7 +754,7 @@ export class VFS {
     }
 
     const { parent: newParent, name: newName } = this.resolveParent(newPath);
-    this.assertWritePermission(newParent);
+    this.assertDirectoryMutationPermission(newParent);
 
     oldParent.children.delete(oldName);
     newParent.children.set(newName, child);
@@ -674,7 +776,7 @@ export class VFS {
    */
   link(oldPath: string, newPath: string): void {
     const { parent: newParent, name: newName } = this.resolveParent(newPath);
-    this.assertWritePermission(newParent);
+    this.assertDirectoryMutationPermission(newParent);
     if (newParent.children.has(newName)) {
       throw new VfsError('EEXIST', `file exists: ${newPath}`);
     }
@@ -699,23 +801,32 @@ export class VFS {
 
   symlink(target: string, path: string): void {
     const { parent, name } = this.resolveParent(path);
-    this.assertWritePermission(parent);
+    this.assertDirectoryMutationPermission(parent);
 
     if (parent.children.has(name)) {
       throw new VfsError('EEXIST', `file exists: ${path}`);
     }
 
     this.assertFileCountLimit();
-    parent.children.set(name, createSymlinkInode(target));
+    const owner = this.currentOwner();
+    parent.children.set(name, createSymlinkInode(target, owner.uid, owner.gid));
     this.currentFileCount++;
     this.notifyChange();
   }
 
   chmod(path: string, mode: number): void {
-    const { parent } = this.resolveParent(path);
-    this.assertWritePermission(parent);
     const inode = this.resolve(path);
-    inode.metadata.permissions = mode;
+    this.assertChmodPermission(inode);
+    inode.metadata.permissions = normalizeMode(mode);
+    inode.metadata.ctime = new Date();
+    this.notifyChange();
+  }
+
+  chown(path: string, uid: number, gid: number, followSymlinks = true): void {
+    const inode = this.resolve(path, followSymlinks);
+    this.assertChownPermission();
+    inode.metadata.uid = uid;
+    inode.metadata.gid = gid;
     inode.metadata.ctime = new Date();
     this.notifyChange();
   }
@@ -790,13 +901,19 @@ export class VFS {
     walk(this.root);
   }
 
-  cowClone(): VFS {
+  cowClone(options?: { uid?: number; gid?: number }): VFS {
     return VFS.fromRoot(deepCloneRoot(this.root), {
       fsLimitBytes: this.fsLimitBytes,
       totalBytes: this.totalBytes,
       fileCountLimit: this.fileCountLimit,
       currentFileCount: this.currentFileCount,
+      uid: options?.uid ?? this.uid,
+      gid: options?.gid ?? this.gid,
       providers: this.providers,
     });
   }
+}
+
+function normalizeMode(mode: number): number {
+  return Math.trunc(mode) & 0o777;
 }

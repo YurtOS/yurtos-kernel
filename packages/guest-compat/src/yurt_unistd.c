@@ -10,9 +10,11 @@
 
 YURT_DECLARE_MARKER(dup2);
 YURT_DECLARE_MARKER(getgroups);
+YURT_DECLARE_MARKER(gethostname);
 
 YURT_DEFINE_MARKER(dup2, 0x64703200u)      /* "dp2\0" */
 YURT_DEFINE_MARKER(getgroups, 0x67677270u) /* "ggrp" */
+YURT_DEFINE_MARKER(gethostname, 0x67686e6du) /* "ghnm" */
 
 int dup2(int oldfd, int newfd) {
   YURT_MARKER_CALL(dup2);
@@ -54,6 +56,23 @@ int getgroups(int size, gid_t list[]) {
 
   list[0] = (gid_t) 1000;
   return 1;
+}
+
+int gethostname(char *name, size_t len) {
+  YURT_MARKER_CALL(gethostname);
+  static const char hostname[] = "yurt";
+
+  if (name == NULL) {
+    errno = EFAULT;
+    return -1;
+  }
+  if (len < sizeof(hostname)) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+
+  memcpy(name, hostname, sizeof(hostname));
+  return 0;
 }
 
 /* uname(2) — wasi-libc's default identifies the system as "wasi",

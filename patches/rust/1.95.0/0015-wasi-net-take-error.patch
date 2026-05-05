@@ -1,0 +1,27 @@
+--- a/library/std/src/sys/net/connection/wasip1.rs	2026-04-30 22:00:16
++++ b/library/std/src/sys/net/connection/wasip1.rs	2026-04-30 21:59:46
+@@ -70,0 +71,2 @@
++const YURT_SOL_SOCKET: i32 = 0;
++const YURT_SO_ERROR: i32 = 0x1007;
+@@ -107,0 +110 @@
++    fn getsockopt(fd: i32, level: i32, optname: i32, optval: *mut c_int, optlen: *mut YurtSockLen) -> i32;
+@@ -118,0 +122,16 @@
++fn tcp_take_error(fd: RawFd) -> io::Result<Option<io::Error>> {
++    let mut error: c_int = 0;
++    let mut len = mem::size_of::<c_int>() as YurtSockLen;
++    let rc = unsafe {
++        getsockopt(fd as i32, YURT_SOL_SOCKET, YURT_SO_ERROR, &mut error, &mut len)
++    };
++    if rc != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if error == 0 {
++        Ok(None)
++    } else {
++        Ok(Some(io::Error::from_raw_os_error(error)))
++    }
++}
++
+@@ -292 +311 @@
+-        unsupported()
++        tcp_take_error(self.socket().as_raw_fd())

@@ -11,7 +11,7 @@ int main(int argc, char **argv) {
   int status;
 
   if (argc == 2 && strcmp(argv[1], "status") == 0) {
-    cmd = "python3 -c \"import sys; sys.stdout.write('status-out'); sys.exit(7)\"";
+    cmd = "printf status-out; exit 7";
     expect_status = 7;
   } else if (argc != 1) {
     fprintf(stderr, "usage: popen-canary [status]\n");

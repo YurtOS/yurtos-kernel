@@ -1,0 +1,9 @@
+canary = "affinity-canary"
+summary = "Report scheduler priority from kernel process metadata."
+
+[[case]]
+name = "scheduler_policy_metadata"
+inputs = "sched_getscheduler(0), sched_getparam(0), SCHED_OTHER no-op updates, rejected FIFO update"
+expected.exit = 0
+expected.stdout = "scheduler:policy=other,param=0"
+expected.note = "default SCHED_OTHER priority is zero"

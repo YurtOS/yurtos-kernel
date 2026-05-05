@@ -44,4 +44,19 @@
 #define F_SETLKW 7
 #endif
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int yurt_fcntl(int fd, int cmd, ...);
+int fcntl(int fd, int cmd, ...);
+
+#ifndef YURT_FCNTL_NO_REMAP
+#define fcntl yurt_fcntl
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif

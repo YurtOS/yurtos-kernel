@@ -4,15 +4,18 @@
  * Used by WasiHost, ProcessManager, and worker-side process runners so they can
  * accept either the real VFS (main thread) or VfsProxy (Worker thread).
  */
-import type { DirEntry, StatResult } from './inode.js';
+import type { DirEntry, FsCredential, StatResult } from './inode.js';
+import type { OverlayState } from './overlay-vfs.js';
+import type { ProcessInfo } from './proc-provider.js';
+import type { MountEntry, VirtualProvider } from './provider.js';
 
 export interface VfsLike {
   readFile(path: string): Uint8Array;
-  writeFile(path: string, data: Uint8Array): void;
+  writeFile(path: string, data: Uint8Array, mode?: number): void;
   stat(path: string): StatResult;
   lstat(path: string): StatResult;
   readdir(path: string): DirEntry[];
-  mkdir(path: string): void;
+  mkdir(path: string, mode?: number): void;
   mkdirp(path: string): void;
   unlink(path: string): void;
   rmdir(path: string): void;
@@ -29,6 +32,8 @@ export interface VfsLike {
   link?(oldPath: string, newPath: string): void;
   readlink(path: string): string;
   chmod(path: string, mode: number): void;
+  chown(path: string, uid: number, gid: number, followSymlinks?: boolean): void;
+  withCredential?<T>(credential: FsCredential, fn: () => T): T;
   withWriteAccess(fn: () => void): void;
   /**
    * Optional: detect a streaming-capable provider entry (e.g.
@@ -42,4 +47,16 @@ export interface VfsLike {
     read?: (length: number) => Uint8Array;
     write?: (data: Uint8Array) => number;
   } | null;
+  setOnChange?(cb: (() => void) | null): void;
+  mount?(mountPath: string, provider: VirtualProvider): void;
+  getMountList?(): MountEntry[];
+  setProcessListProvider?(fn: (() => ProcessInfo[]) | null): void;
+  snapshot?(): string;
+  restore?(id: string): void;
+  cowClone?(): VfsLike;
+  getProviderPaths?(): string[];
+  clearFileContents?(): void;
+  exportOverlayState?(): OverlayState;
+  importOverlayState?(state: OverlayState): void;
+  exportUpperVfs?(): VfsLike;
 }

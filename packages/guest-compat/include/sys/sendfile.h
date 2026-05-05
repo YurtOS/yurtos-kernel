@@ -6,11 +6,8 @@
 #include <stddef.h>
 #include <sys/types.h>
 
-/* sendfile is not natively available in WASI; callers fall back to
- * read+write when it returns -1/ENOSYS. */
-static inline ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
-    (void)out_fd; (void)in_fd; (void)offset; (void)count;
-    return -1;
-}
+/* sendfile is not natively available in WASI. Yurt provides a compatibility
+ * symbol in libyurt_guest_compat.a, implemented over read/write/lseek. */
+ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
 
 #endif /* _SYS_SENDFILE_H */

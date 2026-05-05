@@ -21,6 +21,7 @@ export type FdTarget =
   | { type: 'pipe_read'; pipe: AsyncPipeReadEnd }
   | { type: 'pipe_write'; pipe: AsyncPipeWriteEnd }
   | { type: 'vfs_file'; fdTable: FdTable; fd: number; refs: number }
+  | { type: 'vfs_dir'; path: string }
   | {
       type: 'socket';
       socket: SocketHandle | null;
@@ -79,6 +80,10 @@ export function createTtySlaveTarget(state: TtyState): FdTarget & { type: 'tty_s
 
 export function createVfsFileTarget(fdTable: FdTable, fd: number): FdTarget & { type: 'vfs_file' } {
   return { type: 'vfs_file', fdTable, fd, refs: 1 };
+}
+
+export function createVfsDirTarget(path: string): FdTarget & { type: 'vfs_dir' } {
+  return { type: 'vfs_dir', path };
 }
 
 /** Host-side handle for I/O on one end of a TTY pair.

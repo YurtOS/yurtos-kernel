@@ -4,30 +4,34 @@
  * compiling its own replacement copies — which would otherwise
  * collide with our compat headers' inline versions.
  *
- * Sandbox semantics: yurt doesn't model file ownership or
- * process priorities, so the calls accept-and-no-op (or return
- * sensible defaults) rather than fail.  Programs that actually
- * care about ownership round-tripping are out of scope.
+ * Sandbox semantics: file ownership and process priority mutators route
+ * through the host/kernel authorization boundary. Priority changes only
+ * succeed when the selected engine backend can apply them.
  */
 
 #include "yurt_markers.h"
 #include "yurt_runtime.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <wasi/libc.h>
+#include <wasi/libc-nocwd.h>
 
 YURT_DECLARE_MARKER(chown);
 YURT_DECLARE_MARKER(lchown);
 YURT_DECLARE_MARKER(fchown);
 YURT_DECLARE_MARKER(fchdir);
 YURT_DECLARE_MARKER(chroot);
+YURT_DECLARE_MARKER(chmod);
 YURT_DECLARE_MARKER(getpriority);
 YURT_DECLARE_MARKER(setpriority);
 
@@ -36,6 +40,7 @@ YURT_DEFINE_MARKER(lchown,      0x6c63686fu) /* "lcho" */
 YURT_DEFINE_MARKER(fchown,      0x6663686fu) /* "fcho" */
 YURT_DEFINE_MARKER(fchdir,      0x66636864u) /* "fchd" */
 YURT_DEFINE_MARKER(chroot,      0x6368726fu) /* "chro" */
+YURT_DEFINE_MARKER(chmod,       0x63686d6fu) /* "chmo" */
 YURT_DEFINE_MARKER(getpriority, 0x67707269u) /* "gpri" */
 YURT_DEFINE_MARKER(setpriority, 0x73707269u) /* "spri" */
 /* getrusage is provided by libwasi-emulated-process-clocks; we used
@@ -43,28 +48,72 @@ YURT_DEFINE_MARKER(setpriority, 0x73707269u) /* "spri" */
  * error.  The wasi-emulated impl zero-fills the rusage struct,
  * which is what we want anyway. */
 
+static int yurt_apply_stat_permissions(int rc, struct stat *buf) {
+  if (rc != 0 || !buf) return rc;
+
+  /* WASI Preview 1 filestat has file type but no POSIX permission mode.
+   * The Yurt host writes VFS permission bits into filestat.dev; translate
+   * that side channel back into st_mode while preserving the file type.
+   */
+  buf->st_mode = (buf->st_mode & S_IFMT) | ((mode_t)buf->st_dev & 07777);
+  return rc;
+}
+
+int stat(const char *restrict path, struct stat *restrict buf) {
+  return yurt_apply_stat_permissions(__wasilibc_stat(path, buf, 0), buf);
+}
+
+int lstat(const char *restrict path, struct stat *restrict buf) {
+  return yurt_apply_stat_permissions(
+    __wasilibc_stat(path, buf, AT_SYMLINK_NOFOLLOW),
+    buf
+  );
+}
+
+int fstatat(int fd, const char *restrict path, struct stat *restrict buf, int flags) {
+  int rc = fd == AT_FDCWD
+    ? __wasilibc_stat(path, buf, flags)
+    : __wasilibc_nocwd_fstatat(fd, path, buf, flags);
+  return yurt_apply_stat_permissions(rc, buf);
+}
+
 int chown(const char *path, uid_t owner, gid_t group) {
   YURT_MARKER_CALL(chown);
-  (void)path; (void)owner; (void)group;
-  return 0;
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  int rc = yurt_host_chown((int)(intptr_t)path, (int)strlen(path), (int)owner, (int)group, 1);
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? ENOENT : (rc == -2) ? EPERM : EIO;
+  return -1;
 }
 
 int lchown(const char *path, uid_t owner, gid_t group) {
   YURT_MARKER_CALL(lchown);
-  (void)path; (void)owner; (void)group;
-  return 0;
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  int rc = yurt_host_chown((int)(intptr_t)path, (int)strlen(path), (int)owner, (int)group, 0);
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? ENOENT : (rc == -2) ? EPERM : EIO;
+  return -1;
 }
 
 int fchown(int fd, uid_t owner, gid_t group) {
   YURT_MARKER_CALL(fchown);
-  (void)fd; (void)owner; (void)group;
-  return 0;
+  int rc = yurt_host_fchown(fd, (int)owner, (int)group);
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? EBADF : (rc == -2) ? EPERM : EIO;
+  return -1;
 }
 
 int fchdir(int fd) {
   YURT_MARKER_CALL(fchdir);
-  (void)fd;
-  errno = ENOSYS;
+  int rc = yurt_host_fchdir(fd);
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? EBADF : (rc == -2) ? EACCES : (rc == -4) ? ENOTDIR : EIO;
   return -1;
 }
 
@@ -75,16 +124,76 @@ int chroot(const char *path) {
   return -1;
 }
 
+int chmod(const char *path, mode_t mode) {
+  YURT_MARKER_CALL(chmod);
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  int rc = yurt_host_chmod((int)(intptr_t)path, (int)strlen(path), (int)mode);
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? ENOENT : (rc == -2) ? EPERM : EIO;
+  return -1;
+}
+
+int chdir(const char *path) {
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  int rc = yurt_host_chdir((int)(intptr_t)path, (int)strlen(path));
+  if (rc == 0) return 0;
+  errno = (rc == -1) ? ENOENT : (rc == -2) ? EACCES : (rc == -4) ? ENOTDIR : EIO;
+  return -1;
+}
+
+char *getcwd(char *buf, size_t size) {
+  if (buf && size == 0) {
+    errno = EINVAL;
+    return NULL;
+  }
+  if (!buf) {
+    int required = yurt_host_getcwd(0, 0);
+    if (required <= 0) {
+      errno = EIO;
+      return NULL;
+    }
+    size_t alloc_size = size == 0 ? (size_t)required : size;
+    buf = (char *)malloc(alloc_size);
+    if (!buf) {
+      errno = ENOMEM;
+      return NULL;
+    }
+    int rc = yurt_host_getcwd((int)(intptr_t)buf, (int)alloc_size);
+    if (rc > 0 && (size_t)rc <= alloc_size) return buf;
+    free(buf);
+    errno = ERANGE;
+    return NULL;
+  }
+  int rc = yurt_host_getcwd((int)(intptr_t)buf, (int)size);
+  if (rc > 0 && (size_t)rc <= size) return buf;
+  errno = ERANGE;
+  return NULL;
+}
+
 int getpriority(int which, id_t who) {
   YURT_MARKER_CALL(getpriority);
-  (void)which; (void)who;
-  return 0;
+  int rc = yurt_host_getpriority(which, (int)who);
+  if (rc >= -20 && rc <= 19) return rc;
+  errno = (rc == -22) ? EINVAL : (rc == -1001) ? ESRCH : EIO;
+  return -1;
 }
 
 int setpriority(int which, id_t who, int prio) {
   YURT_MARKER_CALL(setpriority);
-  (void)which; (void)who; (void)prio;
-  return 0;
+  int rc = yurt_host_setpriority(which, (int)who, prio);
+  if (rc == 0) return 0;
+  errno = (rc == -38) ? ENOSYS
+    : (rc == -22) ? EINVAL
+    : (rc == -1) ? ESRCH
+    : (rc == -2) ? EPERM
+    : EIO;
+  return -1;
 }
 
 int nice(int inc) {
@@ -156,23 +265,59 @@ void qsort_r(void *base, size_t nmemb, size_t size,
   qsort_r_arg = NULL;
 }
 
-/* ── setresuid / setresgid — Linux extensions ──
- * Sandbox is single-user (uid=gid=1000); accept-and-ignore.  Required
- * for gnulib's lib/spawni.c which is dead code for us anyway, but
- * still needs to link. */
+/* ── uid/gid accessors and mutators ──
+ * Credentials live in the yurt process kernel.  Userland can request
+ * transitions, but the host import enforces POSIX-style authorization
+ * against the caller's effective uid/gid. */
 YURT_DECLARE_MARKER(setresuid);
 YURT_DECLARE_MARKER(setresgid);
 YURT_DEFINE_MARKER(setresuid, 0x73727569u) /* "srui" */
 YURT_DEFINE_MARKER(setresgid, 0x73726769u) /* "srgi" */
 
+uid_t getuid(void) {
+  return (uid_t)yurt_host_getuid();
+}
+
+uid_t geteuid(void) {
+  return (uid_t)yurt_host_geteuid();
+}
+
+gid_t getgid(void) {
+  return (gid_t)yurt_host_getgid();
+}
+
+gid_t getegid(void) {
+  return (gid_t)yurt_host_getegid();
+}
+
 int setresuid(uid_t r, uid_t e, uid_t s) {
   YURT_MARKER_CALL(setresuid);
-  (void)r; (void)e; (void)s;
-  return 0;
+  int rc = yurt_host_setresuid((int)r, (int)e, (int)s);
+  if (rc == 0) return 0;
+  errno = EPERM;
+  return -1;
 }
 
 int setresgid(gid_t r, gid_t e, gid_t s) {
   YURT_MARKER_CALL(setresgid);
-  (void)r; (void)e; (void)s;
-  return 0;
+  int rc = yurt_host_setresgid((int)r, (int)e, (int)s);
+  if (rc == 0) return 0;
+  errno = EPERM;
+  return -1;
+}
+
+int setuid(uid_t uid) {
+  return setresuid(uid, uid, uid);
+}
+
+int seteuid(uid_t uid) {
+  return setresuid((uid_t)-1, uid, (uid_t)-1);
+}
+
+int setgid(gid_t gid) {
+  return setresgid(gid, gid, gid);
+}
+
+int setegid(gid_t gid) {
+  return setresgid((gid_t)-1, gid, (gid_t)-1);
 }

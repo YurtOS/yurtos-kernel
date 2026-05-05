@@ -6,6 +6,8 @@
  */
 
 import { VFS } from './vfs/vfs.js';
+import { OverlayVFS } from './vfs/overlay-vfs.js';
+import { NodeDirectoryRootProvider } from './vfs/node-directory-root-provider.js';
 import { YURT_VERSION } from './version.js';
 import { ProcessManager } from './process/manager.js';
 /** Streaming callbacks for `Sandbox.run()`. Chunks are decoded UTF-8 strings. */
@@ -23,9 +25,10 @@ import type { RunResult } from './run-result.js';
 import type { PlatformAdapter } from './platform/adapter.js';
 import type { Process } from './process/handle.js';
 import type { ProcessMode } from './process/handle.js';
-import { INIT_PID, ProcessKernel, type SpawnRequest } from './process/kernel.js';
+import { INIT_PID, ProcessKernel, ROOT_UID, type ProcessCredentials, type SpawnRequest } from './process/kernel.js';
 import { loadProcess, type LoaderContext } from './process/loader.js';
 import type { DirEntry, StatResult } from './vfs/inode.js';
+import type { VfsLike } from './vfs/vfs-like.js';
 import { NetworkGateway } from './network/gateway.js';
 import type { NetworkPolicy } from './network/gateway.js';
 import { NetworkBridge, type NetworkBridgeLike } from './network/bridge.js';
@@ -51,6 +54,8 @@ import { createKernelImports } from './host-imports/kernel-imports.js';
 import { WasiHost } from './wasi/wasi-host.js';
 import { bufferToString, createBufferTarget, TtyHandle, type FdTarget } from './wasi/fd-target.js';
 import type { RunCommandHandler } from './run-command.js';
+import { normalizeNice, unsupportedRuntimeEngineBackend, type RuntimeEngineBackend } from './engine/backend.js';
+import { defaultWasmModuleCache, type WasmModuleCache } from './process/module-cache.js';
 
 /** Describes a set of host-provided files to mount into the VFS. */
 export interface MountConfig {
@@ -67,10 +72,14 @@ export interface SandboxOptions {
   wasmDir: string;
   /** Platform adapter. Auto-detected if not provided (Node vs browser). */
   adapter?: PlatformAdapter;
+  /** Optional wasm module cache. Defaults to the process-wide cache. */
+  moduleCache?: WasmModuleCache;
   /** Per-command wall-clock timeout in ms. Default 30000. */
   timeoutMs?: number;
   /** Max VFS size in bytes. Default 256MB. */
   fsLimitBytes?: number;
+  /** Host directory mounted as the read-only base root layer. Node only. */
+  baseRoot?: string;
   /** Path/URL to the default boot WASM. Defaults to `${wasmDir}/bash.wasm`. */
   bootWasmPath?: string;
   /** Deprecated alias for bootWasmPath. */
@@ -89,6 +98,8 @@ export interface SandboxOptions {
   socketBackend?: SocketBackend;
   /** Prepared policy surface for future bind/listen/accept support. */
   serverSockets?: SocketListenPolicy;
+  /** Engine-specific runtime capabilities. Selected once and reused by process imports. */
+  runtimeBackend?: RuntimeEngineBackend;
   /** Security policy and limits. */
   security?: SecurityOptions;
   /** Persistence configuration. Default mode is 'ephemeral' (no persistence). */
@@ -120,7 +131,7 @@ const DEFAULT_FS_LIMIT = 256 * 1024 * 1024; // 256 MB
 
 /** Internal config for the Sandbox constructor. Not part of the public API. */
 interface SandboxParts {
-  vfs: VFS;
+  vfs: VfsLike;
   kernel: ProcessKernel;
   processes: Map<number, Process>;
   bootProcess: Process;
@@ -129,10 +140,12 @@ interface SandboxParts {
   adapter: PlatformAdapter;
   wasmDir: string;
   bootWasmPath: string;
+  moduleCache: WasmModuleCache;
   mgr: ProcessManager;
   bridge?: NetworkBridgeLike;
   socketBackend?: SocketBackend;
   serverSockets?: SocketListenPolicy;
+  runtimeBackend: RuntimeEngineBackend;
   networkPolicy?: NetworkPolicy;
   security?: SecurityOptions;
   workerExecutor?: WorkerExecutor;
@@ -144,7 +157,7 @@ interface SandboxParts {
 }
 
 export class Sandbox {
-  private vfs: VFS;
+  private vfs: VfsLike;
   private kernel: ProcessKernel;
   private processes: Map<number, Process>;
   private bootProcess: Process;
@@ -157,11 +170,13 @@ export class Sandbox {
   private adapter: PlatformAdapter;
   private wasmDir: string;
   private bootWasmPath: string;
+  private moduleCache: WasmModuleCache;
   private mgr: ProcessManager;
   private envSnapshots: Map<string, Map<string, string>> = new Map();
   private bridge: NetworkBridgeLike | null = null;
   private socketBackend: SocketBackend | undefined;
   private serverSockets: SocketListenPolicy | undefined;
+  private runtimeBackend: RuntimeEngineBackend;
   private networkPolicy: NetworkPolicy | undefined;
   private security: SecurityOptions | undefined;
   readonly sessionId: string;
@@ -185,10 +200,12 @@ export class Sandbox {
     this.adapter = parts.adapter;
     this.wasmDir = parts.wasmDir;
     this.bootWasmPath = parts.bootWasmPath;
+    this.moduleCache = parts.moduleCache;
     this.mgr = parts.mgr;
     this.bridge = parts.bridge ?? null;
     this.socketBackend = parts.socketBackend;
     this.serverSockets = parts.serverSockets;
+    this.runtimeBackend = parts.runtimeBackend;
     this.networkPolicy = parts.networkPolicy;
     this.security = parts.security;
     this.sessionId = (typeof crypto !== 'undefined' && crypto.randomUUID)
@@ -218,17 +235,44 @@ export class Sandbox {
     const adapter = options.adapter ?? await Sandbox.detectAdapter();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const fsLimitBytes = options.fsLimitBytes ?? DEFAULT_FS_LIMIT;
+    const moduleCache = options.moduleCache ?? defaultWasmModuleCache;
 
-    const vfs = new VFS({
+    const upper = new VFS({
       fsLimitBytes,
       fileCount: options.security?.limits?.fileCount,
     });
+    const baseManifest = options.baseRoot
+      ? await Sandbox.readBaseRootManifest(options.baseRoot)
+      : undefined;
+    const vfs: VfsLike = options.baseRoot
+      ? new OverlayVFS({
+        base: new NodeDirectoryRootProvider(options.baseRoot, {
+          id: baseManifest?.id ?? `dir:${options.baseRoot}`,
+          metadata: Object.fromEntries((baseManifest?.files ?? []).map((f) => [
+            f.path,
+            { uid: f.uid, gid: f.gid, mode: f.mode },
+          ])),
+        }),
+        upper,
+      })
+      : upper;
     const { bridge } = options.networkBridge
       ? { bridge: options.networkBridge }
       : await Sandbox.createNetworkBridge(options.network);
-    const mgr = new ProcessManager(vfs, adapter, bridge, options.security?.toolAllowlist);
-    const tools = await Sandbox.registerTools(mgr, adapter, options.wasmDir, vfs);
-    await Sandbox.installCpythonStdlib(vfs, adapter, options.wasmDir, tools);
+    const mgr = new ProcessManager(
+      vfs,
+      adapter,
+      bridge,
+      options.security?.toolAllowlist,
+      moduleCache,
+    );
+    const tools = options.baseRoot
+      ? Sandbox.registerBaseRootTools(mgr, vfs)
+      : await Sandbox.registerTools(mgr, adapter, options.wasmDir, upper);
+    const runtimeBackend = options.runtimeBackend ?? unsupportedRuntimeEngineBackend;
+    if (!options.baseRoot) {
+      await Sandbox.installCpythonStdlib(upper, adapter, options.wasmDir, tools);
+    }
 
     // Register optional WASM tools from ToolRegistry before preloadModules()
     if (options.tools && options.tools.length > 0) {
@@ -264,6 +308,7 @@ export class Sandbox {
     if (options.mounts) {
       for (const mc of options.mounts) {
         const provider = new HostMount(mc.files, { writable: mc.writable });
+        if (!vfs.mount) throw new Error('Configured VFS does not support mounts');
         vfs.mount(mc.path, provider);
       }
     }
@@ -278,13 +323,16 @@ export class Sandbox {
       : baseBootWasmPath;
     const bootArgv = options.bootArgv ?? ['/bin/bash'];
 
-    await Sandbox.installBootProgram(vfs, adapter, bootArgv[0], bootWasmPath);
+    if (!options.baseRoot) {
+      await Sandbox.installBootProgram(upper, adapter, bootArgv[0], bootWasmPath);
+    }
 
     // Pre-load all tool modules so spawnSync can use them synchronously
     await mgr.preloadModules();
 
     const secLimits = options.security?.limits;
-    const kernel = new ProcessKernel();
+    const kernel = new ProcessKernel({ maxProcesses: secLimits?.processes });
+    vfs.setProcessListProvider?.(() => kernel.listProcesses());
     const processes = new Map<number, Process>();
     const env = new Map<string, string>();
     let sandboxRef: Sandbox | undefined;
@@ -298,6 +346,7 @@ export class Sandbox {
       bridge,
       socketBackend: options.socketBackend,
       serverSockets: options.serverSockets,
+      runtimeBackend,
       extensionRegistry,
       runCommandHandler: options.runCommandHandler,
       getSandbox: () => sandboxRef,
@@ -306,6 +355,7 @@ export class Sandbox {
       stdoutLimit: secLimits?.stdoutBytes,
       stderrLimit: secLimits?.stderrBytes,
       toolAllowlist: options.security?.toolAllowlist,
+      moduleCache,
     });
 
     const bootProcess = await loadProcess(loaderCtx, {
@@ -507,10 +557,11 @@ export class Sandbox {
 
     const sb = new Sandbox({
       vfs, kernel, processes, bootProcess, env, timeoutMs, adapter,
-      wasmDir: options.wasmDir, bootWasmPath,
+      wasmDir: options.wasmDir, bootWasmPath, moduleCache,
       mgr, bridge, networkPolicy: options.network,
       socketBackend: options.socketBackend,
       serverSockets: options.serverSockets,
+      runtimeBackend,
       security: options.security, workerExecutor,
       extensionRegistry, storage: options.storage,
       bootArgv, bootImports: options.bootImports,
@@ -577,6 +628,36 @@ export class Sandbox {
     return typeof bridgeWithSab?.getSab === 'function'
       ? bridgeWithSab.getSab()
       : undefined;
+  }
+
+  private static async readBaseRootManifest(baseRoot: string): Promise<{
+    id?: string;
+    files?: Array<{ path: string; type?: 'file' | 'dir' | 'symlink'; uid: number; gid: number; mode: number }>;
+    tools?: Array<{ name: string; path: string }>;
+  } | undefined> {
+    try {
+      const { readFile } = await import('node:fs/promises');
+      const raw = await readFile(`${baseRoot}/etc/yurt/base-image.json`, 'utf8');
+      return JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+  }
+
+  private static registerBaseRootTools(mgr: ProcessManager, vfs: VfsLike): Map<string, string> {
+    const tools = new Map<string, string>();
+    try {
+      const manifest = JSON.parse(new TextDecoder().decode(vfs.readFile('/etc/yurt/base-image.json'))) as {
+        tools?: Array<{ name: string; path: string }>;
+      };
+      for (const tool of manifest.tools ?? []) {
+        mgr.registerTool(tool.name, { kind: 'vfs', path: tool.path });
+        tools.set(tool.name, tool.path);
+      }
+    } catch {
+      // Base roots may choose to provide only the boot program.
+    }
+    return tools;
   }
 
   private static async registerTools(
@@ -689,7 +770,7 @@ export class Sandbox {
   }
 
   private static createBootImportFactory(
-    vfs: VFS,
+    vfs: VfsLike,
     mgr: ProcessManager,
     bootImports: ((api: KernelApi) => Record<string, WebAssembly.ImportValue>) | undefined,
   ): ((memory: WebAssembly.Memory) => Record<string, WebAssembly.ImportValue>) | undefined {
@@ -715,7 +796,7 @@ export class Sandbox {
   }
 
   private static createLoaderContext(opts: {
-    vfs: VFS;
+    vfs: VfsLike;
     adapter: PlatformAdapter;
     kernel: ProcessKernel;
     mgr: ProcessManager;
@@ -723,6 +804,7 @@ export class Sandbox {
     bridge?: NetworkBridgeLike;
     socketBackend?: SocketBackend;
     serverSockets?: SocketListenPolicy;
+    runtimeBackend: RuntimeEngineBackend;
     extensionRegistry: ExtensionRegistry;
     runCommandHandler?: RunCommandHandler;
     getSandbox: () => Sandbox | undefined;
@@ -731,6 +813,7 @@ export class Sandbox {
     stdoutLimit?: number;
     stderrLimit?: number;
     toolAllowlist?: string[];
+    moduleCache?: WasmModuleCache;
   }): LoaderContext {
     const {
       vfs,
@@ -741,6 +824,7 @@ export class Sandbox {
       bridge,
       socketBackend,
       serverSockets,
+      runtimeBackend,
       extensionRegistry,
       runCommandHandler,
       getSandbox,
@@ -749,6 +833,7 @@ export class Sandbox {
       stdoutLimit,
       stderrLimit,
       toolAllowlist,
+      moduleCache,
     } = opts;
     const allowedTools = toolAllowlist ? new Set(toolAllowlist) : null;
 
@@ -789,15 +874,17 @@ export class Sandbox {
           deadlineMs: getDeadlineMs?.(),
         });
       },
-      buildKernelImports: (pid, memory, _wasi, threadsBackend) => {
+      buildKernelImports: (pid, memory, wasiHost, threadsBackend) => {
         const kernelImports = createKernelImports({
           memory,
           callerPid: pid,
           kernel,
           vfs,
+          wasiHost,
           networkBridge: bridge,
           socketBackend,
           serverSockets,
+          runtimeBackend,
           extensionRegistry,
           mgr,
           nativeModules: mgr.nativeModules,
@@ -829,8 +916,23 @@ export class Sandbox {
           },
           spawnProcess: (req, fdTable) => {
             const childPid = kernel.allocPid(pid, req.prog);
-            kernel.registerPending(childPid, req.prog);
+            const childCwd = req.cwd || kernel.getCwd(pid);
+            kernel.setCwd(childPid, childCwd);
+            kernel.registerPending(childPid, req.prog, pid);
             kernel.adoptFdTable(childPid, fdTable);
+            const childNice = normalizeNice(req.nice ?? kernel.getPriority(pid));
+            if (childNice > 0) {
+              const priorityResult = runtimeBackend.scheduler?.setPriority({
+                callerPid: pid,
+                targetPid: childPid,
+                nice: childNice,
+              }) ?? { ok: false as const, error: 'unsupported' as const };
+              if (!priorityResult.ok) {
+                kernel.discardProcess(childPid);
+                return priorityResult.error === 'permission' ? -2 : -38;
+              }
+              kernel.setPriority(childPid, childNice);
+            }
             const commandName = req.prog.includes('/')
               ? req.prog.split('/').pop() ?? req.prog
               : req.prog;
@@ -842,16 +944,23 @@ export class Sandbox {
               kernel.releaseProcess(childPid, 126);
               return childPid;
             }
-            const argv = Sandbox.argvForSpawn(vfs, req);
+            let argv: string[];
+            try {
+              argv = Sandbox.argvForSpawn(vfs, req, kernel.getCredentials(pid));
+            } catch (e) {
+              kernel.discardProcess(childPid);
+              throw e;
+            }
             const childCtx = makeContextWithAllocator(() => childPid);
             const promise = loadProcess(childCtx, {
               argv,
               mode: 'cli',
               env: Object.fromEntries(req.env),
-              cwd: req.cwd || '/',
+              cwd: childCwd,
               memoryBytes,
               stdoutLimit,
               stderrLimit,
+              rollbackOnFailure: false,
             }).then(async (proc) => {
               processes.set(childPid, proc);
               await proc.terminate();
@@ -869,19 +978,58 @@ export class Sandbox {
         };
       },
       makeFdReadAndClear,
+      moduleCache,
     });
 
     return makeContextWithAllocator((argv) => kernel.allocPid(INIT_PID, argv[0]));
   }
 
-  private static argvForSpawn(vfs: VFS, req: SpawnRequest): string[] {
+  private static argvForSpawn(vfs: VfsLike, req: SpawnRequest, credentials: ProcessCredentials): string[] {
     const prog = req.prog.includes('/')
-      ? req.prog
+      ? Sandbox.resolveSpawnPath(req.prog, req.cwd || '/')
       : Sandbox.resolveExecutablePathForVfs(vfs, req.prog);
+    Sandbox.assertExecutableForSpawn(vfs, prog, credentials);
     return [prog, ...req.args];
   }
 
-  private static resolveExecutablePathForVfs(vfs: VFS, prog: string): string {
+  private static resolveSpawnPath(path: string, cwd: string): string {
+    return Sandbox.normalizeVfsPath(path.startsWith('/') ? path : `${cwd}/${path}`);
+  }
+
+  private static normalizeVfsPath(path: string): string {
+    const parts: string[] = [];
+    for (const part of path.split('/')) {
+      if (!part || part === '.') continue;
+      if (part === '..') {
+        parts.pop();
+      } else {
+        parts.push(part);
+      }
+    }
+    return `/${parts.join('/')}`;
+  }
+
+  private static assertExecutableForSpawn(vfs: VfsLike, path: string, credentials: ProcessCredentials): void {
+    let st: StatResult;
+    try {
+      st = vfs.stat(path);
+    } catch {
+      throw new Error(`ENOENT: no such file or directory: ${path}`);
+    }
+    if (st.type !== 'file' || !Sandbox.canExecute(st, credentials)) {
+      throw new Error(`EACCES: permission denied: ${path}`);
+    }
+  }
+
+  private static canExecute(st: StatResult, credentials: ProcessCredentials): boolean {
+    if (credentials.euid === ROOT_UID) return true;
+    const mode = st.permissions;
+    if (st.uid === credentials.euid) return (mode & 0o100) !== 0;
+    if (st.gid === credentials.egid) return (mode & 0o010) !== 0;
+    return (mode & 0o001) !== 0;
+  }
+
+  private static resolveExecutablePathForVfs(vfs: VfsLike, prog: string): string {
     for (const dir of ['/usr/extensions', '/usr/bin', '/bin']) {
       const path = `${dir}/${prog}`;
       try {
@@ -895,7 +1043,7 @@ export class Sandbox {
   }
 
   private static async createWorkerExecutor(
-    vfs: VFS,
+    vfs: VfsLike,
     wasmDir: string,
     shellExecWasmPath: string,
     tools: Map<string, string>,
@@ -906,6 +1054,7 @@ export class Sandbox {
     extensionRegistry?: ExtensionRegistry,
   ): Promise<WorkerExecutor | undefined> {
     if (!security?.hardKill || !adapter.supportsWorkerExecution) return undefined;
+    if (!(vfs instanceof VFS)) return undefined;
     const { WorkerExecutor: WE } = await import('./execution/worker-executor.js');
     const toolRegistry: [string, string][] = Array.from(tools);
     return new WE({
@@ -917,6 +1066,7 @@ export class Sandbox {
       stderrBytes: security.limits?.stderrBytes,
       toolAllowlist: security.toolAllowlist,
       memoryBytes: security.limits?.memoryBytes,
+      processes: security.limits?.processes,
       bridgeSab: Sandbox.getBridgeSab(bridge),
       networkPolicy: networkPolicy ? {
         allowedHosts: networkPolicy.allowedHosts,
@@ -1197,6 +1347,7 @@ export class Sandbox {
       bridge: this.bridge ?? undefined,
       socketBackend: this.socketBackend,
       serverSockets: this.serverSockets,
+      runtimeBackend: this.runtimeBackend,
       extensionRegistry: this.extensionRegistry ?? new ExtensionRegistry(),
       runCommandHandler: this.runCommandHandler,
       getSandbox: () => this,
@@ -1205,6 +1356,7 @@ export class Sandbox {
       stdoutLimit: this.security?.limits?.stdoutBytes,
       stderrLimit: this.security?.limits?.stderrBytes,
       toolAllowlist: this.security?.toolAllowlist,
+      moduleCache: this.moduleCache,
     });
     const proc = await loadProcess(loaderCtx, {
       argv,
@@ -1226,8 +1378,20 @@ export class Sandbox {
         this.security?.limits?.stdoutBytes,
         this.security?.limits?.stderrBytes,
       );
+      this.processes.set(proc.pid, proc);
+    } else {
+      const captured = {
+        1: proc.fdReadAndClear(1),
+        2: proc.fdReadAndClear(2),
+      };
+      proc.__setFdReadAndClear((fd) => {
+        const result = captured[fd];
+        captured[fd] = { data: '', truncated: false };
+        return result;
+      });
+      await proc.terminate();
+      await this.kernel.waitpid(proc.pid);
     }
-    this.processes.set(proc.pid, proc);
     return proc;
   }
 
@@ -1266,6 +1430,7 @@ export class Sandbox {
       typeof (filesOrProvider as VirtualProvider).readFile === 'function'
         ? (filesOrProvider as VirtualProvider)
         : new HostMount(filesOrProvider as Record<string, Uint8Array>);
+    if (!this.vfs.mount) throw new Error('Configured VFS does not support mounts');
     this.vfs.mount(path, provider);
   }
 
@@ -1301,6 +1466,7 @@ export class Sandbox {
 
   snapshot(): string {
     this.assertAlive();
+    if (!this.vfs.snapshot) throw new Error('Configured VFS does not support snapshot');
     const id = this.vfs.snapshot();
     this.envSnapshots.set(id, this.getEnvMap());
     return id;
@@ -1308,6 +1474,7 @@ export class Sandbox {
 
   restore(id: string): void {
     this.assertAlive();
+    if (!this.vfs.restore) throw new Error('Configured VFS does not support restore');
     this.vfs.restore(id);
     const envSnap = this.envSnapshots.get(id);
     if (envSnap) {
@@ -1318,7 +1485,7 @@ export class Sandbox {
   /** Export the entire sandbox state (VFS files + env vars) as a binary blob. */
   exportState(): Uint8Array {
     this.assertAlive();
-    return serializerExportState(this.vfs, this.getEnvMap(), this.vfs.getProviderPaths());
+    return serializerExportState(this.vfs, this.getEnvMap(), this.vfs.getProviderPaths?.());
   }
 
   /** Import a previously exported state blob, restoring files and env vars. */
@@ -1336,8 +1503,9 @@ export class Sandbox {
     if (this.destroyed) throw new Error('Sandbox has been destroyed');
     if (!this.storage) throw new Error('No storage callbacks configured');
     if (this.running) throw new Error('Cannot offload while a command is running');
+    if (!this.vfs.clearFileContents) throw new Error('Configured VFS does not support offload');
 
-    const blob = serializerExportState(this.vfs, this.getEnvMap(), this.vfs.getProviderPaths());
+    const blob = serializerExportState(this.vfs, this.getEnvMap(), this.vfs.getProviderPaths?.());
     await this.storage.save(this.sessionId, blob);
     this.vfs.clearFileContents();
     this.offloaded = true;
@@ -1386,15 +1554,24 @@ export class Sandbox {
 
   async fork(): Promise<Sandbox> {
     this.assertAlive();
+    if (!this.vfs.cowClone) throw new Error('Configured VFS does not support fork');
     const childVfs = this.vfs.cowClone();
     const { bridge } = await Sandbox.createNetworkBridge(this.networkPolicy);
-    const childMgr = new ProcessManager(childVfs, this.adapter, bridge, this.security?.toolAllowlist);
-    const tools = await Sandbox.registerTools(childMgr, this.adapter, this.wasmDir, childVfs);
+    const childMgr = new ProcessManager(
+      childVfs,
+      this.adapter,
+      bridge,
+      this.security?.toolAllowlist,
+      this.moduleCache,
+    );
+    const tools = childVfs instanceof OverlayVFS
+      ? Sandbox.registerBaseRootTools(childMgr, childVfs)
+      : await Sandbox.registerTools(childMgr, this.adapter, this.wasmDir, childVfs as VFS);
 
     // Pre-load all tool modules so spawnSync can use them synchronously
     await childMgr.preloadModules();
 
-    const childKernel = new ProcessKernel();
+    const childKernel = new ProcessKernel({ maxProcesses: this.security?.limits?.processes });
     const childProcesses = new Map<number, Process>();
     let childRef: Sandbox | undefined;
     const childCtx = Sandbox.createLoaderContext({
@@ -1406,6 +1583,7 @@ export class Sandbox {
       bridge,
       socketBackend: this.socketBackend,
       serverSockets: this.serverSockets,
+      runtimeBackend: this.runtimeBackend,
       extensionRegistry: this.extensionRegistry ?? new ExtensionRegistry(),
       runCommandHandler: this.runCommandHandler,
       getSandbox: () => childRef,
@@ -1414,6 +1592,7 @@ export class Sandbox {
       stdoutLimit: this.security?.limits?.stdoutBytes,
       stderrLimit: this.security?.limits?.stderrBytes,
       toolAllowlist: this.security?.toolAllowlist,
+      moduleCache: this.moduleCache,
     });
     const childEnv = this.getEnvMap();
     const childBootProcess = await loadProcess(childCtx, {
@@ -1451,12 +1630,14 @@ export class Sandbox {
       mgr: childMgr, bridge, networkPolicy: this.networkPolicy,
       socketBackend: this.socketBackend,
       serverSockets: this.serverSockets,
+      runtimeBackend: this.runtimeBackend,
       security: this.security, workerExecutor: childWorkerExecutor,
       extensionRegistry: this.extensionRegistry ?? undefined,
       storage: this.storage ?? undefined,
       bootArgv: this.bootArgv,
       bootImports: this.bootImports,
       runCommandHandler: this.runCommandHandler,
+      moduleCache: this.moduleCache,
     });
     childRef = child;
     return child;

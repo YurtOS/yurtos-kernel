@@ -22,7 +22,14 @@ import type { SocketBackend, SocketListenPolicy, SocketPortMapping } from '../ne
 import { createLoopbackSocketBackend, createNetworkBridgeSocketBackend } from '../network/socket-backend.js';
 import type { ExtensionRegistry } from '../extension/registry.js';
 import type { NativeModuleRegistry } from '../process/native-modules.js';
-import type { ProcessKernel, SpawnRequest } from '../process/kernel.js';
+import type { ProcessCredentials, ProcessKernel, SpawnRequest } from '../process/kernel.js';
+import {
+  normalizeNice,
+  normalizeSchedulerPolicy,
+  normalizeSchedulerPriority,
+  unsupportedRuntimeEngineBackend,
+  type RuntimeEngineBackend,
+} from '../engine/backend.js';
 import type { ProcessManager } from '../process/manager.js';
 import type { WasiHost } from '../wasi/wasi-host.js';
 import type { ThreadsBackend } from '../process/threads/backend.js';
@@ -40,6 +47,9 @@ export interface KernelImportsOptions {
 
   /** PID of the calling process (used for fd table lookups). */
   callerPid?: number;
+  /** Effective uid/gid of the calling guest process. Defaults to the sandbox user. */
+  callerUid?: number;
+  callerGid?: number;
 
   /** Process kernel for pipe/spawn/waitpid/close_fd. Optional until Task 8. */
   kernel?: ProcessKernel;
@@ -110,12 +120,24 @@ export interface KernelImportsOptions {
   /** Backend for guest pthread/std::thread host imports. */
   threadsBackend?: ThreadsBackend;
 
+  /** Engine-specific runtime capabilities selected once when the sandbox starts. */
+  runtimeBackend?: RuntimeEngineBackend;
+
   /** Process manager for tool registry (host_has_tool, host_register_tool). */
   mgr?: ProcessManager;
 }
 
 const ERR_NOT_FOUND = -1;
+const ERR_PERMISSION = -2;
 const ERR_IO = -3;
+const ERR_NOT_DIR = -4;
+const ERR_UNSUPPORTED = -38;
+const ERR_INVALID = -22;
+const ERR_PRIORITY_NOT_FOUND = -1001;
+const ROOT_UID = 0;
+const USER_UID = 1000;
+const USER_GID = 1000;
+const PRIO_PROCESS = 0;
 
 function globToRegExp(pattern: string): RegExp {
   let re = '';
@@ -199,9 +221,33 @@ function globMatch(vfs: VfsLike, pattern: string): string[] {
   return matches;
 }
 
+function normalizeImportPath(path: string): string {
+  const parts: string[] = [];
+  for (const part of path.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return '/' + parts.join('/');
+}
+
+function resolveCwdPath(cwd: string, path: string): string {
+  if (path.startsWith('/')) return normalizeImportPath(path);
+  if (path === '' || path === '.') return normalizeImportPath(cwd);
+  return normalizeImportPath(cwd === '/' ? `/${path}` : `${cwd}/${path}`);
+}
+
 export function createKernelImports(opts: KernelImportsOptions): Record<string, WebAssembly.ImportValue> {
   const { memory } = opts;
   const callerPid = opts.callerPid ?? 0;
+  const fallbackUid = opts.callerUid ?? USER_UID;
+  const fallbackGid = opts.callerGid ?? USER_GID;
+  const runtimeBackend = opts.runtimeBackend ?? unsupportedRuntimeEngineBackend;
+  const schedulerBackend = runtimeBackend.scheduler;
+  let fallbackUmask = 0o022;
   const bridgeSocketBackend = opts.networkBridge ? createNetworkBridgeSocketBackend(opts.networkBridge) : undefined;
   const socketBackend = opts.socketBackend ??
     (opts.serverSockets?.allowLoopback === true
@@ -209,6 +255,155 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       : bridgeSocketBackend);
   const socketLocalHost = opts.socketLocalHost ?? '10.0.2.15';
   const socketLocalPortForFd = (fd: number) => 49152 + (Math.max(0, fd - 3) % 16384);
+
+  function getCallerCredentials(): ProcessCredentials {
+    return opts.kernel?.getCredentials(callerPid) ?? {
+      uid: fallbackUid,
+      gid: fallbackGid,
+      euid: fallbackUid,
+      egid: fallbackGid,
+      suid: fallbackUid,
+      sgid: fallbackGid,
+    };
+  }
+
+  function withVfsCallerCredentials<T>(fn: () => T): T {
+    const credentials = getCallerCredentials();
+    const vfsWithCredential = opts.vfs as (VfsLike & {
+      withCredential?: <U>(credential: { uid: number; gid: number }, inner: () => U) => U;
+    }) | undefined;
+    return vfsWithCredential?.withCredential
+      ? vfsWithCredential.withCredential({ uid: credentials.euid, gid: credentials.egid }, fn)
+      : fn();
+  }
+
+  function limitToBigUint64(limit: number): bigint {
+    if (!Number.isFinite(limit)) return 0xffff_ffff_ffff_ffffn;
+    return BigInt(Math.max(0, Math.trunc(limit)));
+  }
+
+  function closeFdTarget(target: FdTarget): void {
+    if (target.type === 'pipe_write') target.pipe.close();
+    if (target.type === 'pipe_read') target.pipe.close();
+    if (target.type === 'vfs_file') {
+      target.refs--;
+      if (target.refs <= 0) target.fdTable.close(target.fd);
+    }
+    if (target.type === 'socket') {
+      target.refs--;
+      if (target.refs <= 0) {
+        if (target.listener != null && target.closeListener) {
+          target.closeListener(target.listener);
+          target.listener = null;
+        }
+        if (target.socket !== null) {
+          target.close(target.socket);
+          target.socket = null;
+        }
+      }
+    }
+    if (target.type === 'tty_master') {
+      target.state.masterClosed = true;
+      for (const waiter of target.state.toSlaveWaiters.splice(0)) waiter();
+    }
+  }
+
+  function retainFdTarget(target: FdTarget): void {
+    if (target.type === 'vfs_file' || target.type === 'socket') target.refs++;
+  }
+
+  const syntheticDns = new Map<string, string>();
+
+  function syntheticAddressForHost(hostname: string): string {
+    const existing = syntheticDns.get(hostname);
+    if (existing) return existing;
+    let hash = 0;
+    for (let i = 0; i < hostname.length; i++) {
+      hash = (hash * 33 + hostname.charCodeAt(i)) >>> 0;
+    }
+    const addr = `10.0.2.${2 + (hash % 253)}`;
+    syntheticDns.set(hostname, addr);
+    return addr;
+  }
+
+  function setFallbackUid(ruid: number, euid: number, suid: number): number {
+    const current = new Set([fallbackUid]);
+    for (const value of [ruid, euid, suid]) {
+      if (value !== -1 && !current.has(value)) return ERR_PERMISSION;
+    }
+    return 0;
+  }
+
+  function setFallbackGid(rgid: number, egid: number, sgid: number): number {
+    const current = new Set([fallbackGid]);
+    for (const value of [rgid, egid, sgid]) {
+      if (value !== -1 && !current.has(value)) return ERR_PERMISSION;
+    }
+    return 0;
+  }
+
+  function getCallerCwd(): string {
+    return opts.kernel?.getCwd(callerPid) ?? opts.wasiHost?.getCwd() ?? '/';
+  }
+
+  function setCallerCwd(cwd: string): void {
+    opts.kernel?.setCwd(callerPid, cwd);
+    opts.wasiHost?.setCwd(cwd);
+  }
+
+  function priorityTargetPid(which: number, who: number): number {
+    if (which !== PRIO_PROCESS) return ERR_INVALID;
+    if (who === 0) return callerPid;
+    if (!opts.kernel?.hasProcess(who)) return ERR_NOT_FOUND;
+    return who;
+  }
+
+  function authorizeSetPriority(targetPid: number, nice: number): number {
+    const caller = getCallerCredentials();
+    const currentNice = opts.kernel?.getPriority(targetPid) ?? 0;
+    if (targetPid !== callerPid && caller.euid !== ROOT_UID) {
+      const target = opts.kernel?.getCredentials(targetPid);
+      if (!target || target.uid !== caller.euid) return ERR_PERMISSION;
+    }
+    if (nice < currentNice && caller.euid !== ROOT_UID) return ERR_PERMISSION;
+    return 0;
+  }
+
+  function schedulerTargetPid(pidRaw: number): number {
+    const targetPid = Math.trunc(pidRaw) === 0 ? callerPid : Math.trunc(pidRaw);
+    if (targetPid < 0) return ERR_INVALID;
+    if (opts.kernel && !opts.kernel.hasProcess(targetPid)) return ERR_NOT_FOUND;
+    if (!opts.kernel && targetPid !== callerPid) return ERR_NOT_FOUND;
+    return targetPid;
+  }
+
+  function setSchedulerForTarget(targetPid: number, policyRaw: number, priorityRaw: number): number {
+    const policy = normalizeSchedulerPolicy(policyRaw);
+    const priority = normalizeSchedulerPriority(policy, priorityRaw);
+    if (policy < 0 || priority < 0) return ERR_INVALID;
+
+    const current = opts.kernel?.getScheduler(targetPid) ?? { policy: 0, priority: 0 };
+    const noOp = current.policy === policy && current.priority === priority;
+    if (!noOp) {
+      const caller = getCallerCredentials();
+      if (targetPid !== callerPid && caller.euid !== ROOT_UID) return ERR_PERMISSION;
+      if ((policy === 1 || policy === 2 || current.policy === 1 || current.policy === 2) && caller.euid !== ROOT_UID) {
+        return ERR_PERMISSION;
+      }
+      if (!schedulerBackend?.setScheduler) return ERR_UNSUPPORTED;
+      const result = schedulerBackend.setScheduler({ callerPid, targetPid, policy, priority });
+      if (!result.ok) {
+        if (result.error === 'unsupported') return ERR_UNSUPPORTED;
+        if (result.error === 'permission') return ERR_PERMISSION;
+        if (result.error === 'invalid') return ERR_INVALID;
+        if (result.error === 'not_found') return ERR_NOT_FOUND;
+        return ERR_IO;
+      }
+    }
+
+    opts.kernel?.setScheduler(targetPid, policy, priority);
+    return 0;
+  }
 
   function bytesToBase64(data: Uint8Array): string {
     let binary = '';
@@ -333,13 +528,27 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       }
 
       const req = JSON.parse(reqJson) as SpawnRequest;
+      const requestedNice = normalizeNice(req.nice ?? 0);
+      if (requestedNice > 0 && !schedulerBackend) return ERR_UNSUPPORTED;
+      if (req.nice !== undefined) req.nice = requestedNice;
       if (opts.spawnProcess && opts.kernel) {
+        if (!opts.kernel.canReserveProcessSlot()) return -1;
         const fdTable = opts.kernel.buildFdTableForSpawn(callerPid, req);
+        let previousStdin: FdTarget | undefined;
         // If stdin_data is provided, override fd 0 with a static target
         if (req.stdin_data) {
+          previousStdin = fdTable.get(0);
           fdTable.set(0, createStaticTarget(new TextEncoder().encode(req.stdin_data)));
         }
-        return opts.spawnProcess(req, fdTable, callerPid);
+        try {
+          const childPid = opts.spawnProcess(req, fdTable, callerPid);
+          if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
+          return childPid;
+        } catch {
+          opts.kernel.releaseFdTable(fdTable);
+          if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
+          return -1;
+        }
       }
       return -1;
     },
@@ -356,6 +565,160 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // sees getppid() == 0, mirroring Linux init).
     host_getppid(): number {
       return opts.kernel ? opts.kernel.getPpid(callerPid) : 0;
+    },
+
+    host_getuid(): number {
+      return getCallerCredentials().uid;
+    },
+
+    host_geteuid(): number {
+      return getCallerCredentials().euid;
+    },
+
+    host_getgid(): number {
+      return getCallerCredentials().gid;
+    },
+
+    host_getegid(): number {
+      return getCallerCredentials().egid;
+    },
+
+    host_setresuid(ruid: number, euid: number, suid: number): number {
+      if (!opts.kernel) return setFallbackUid(ruid, euid, suid);
+      return opts.kernel.setresuid(callerPid, ruid, euid, suid) ? 0 : ERR_PERMISSION;
+    },
+
+    host_setresgid(rgid: number, egid: number, sgid: number): number {
+      if (!opts.kernel) return setFallbackGid(rgid, egid, sgid);
+      return opts.kernel.setresgid(callerPid, rgid, egid, sgid) ? 0 : ERR_PERMISSION;
+    },
+
+    host_umask(mask: number): number {
+      if (opts.kernel) return opts.kernel.setUmask(callerPid, mask);
+      const prev = fallbackUmask;
+      fallbackUmask = Math.trunc(mask) & 0o777;
+      return prev;
+    },
+
+    host_getpriority(which: number, who: number): number {
+      const targetPid = priorityTargetPid(which, who);
+      if (targetPid === ERR_NOT_FOUND) return ERR_PRIORITY_NOT_FOUND;
+      if (targetPid < 0) return targetPid;
+      return opts.kernel?.getPriority(targetPid) ?? 0;
+    },
+
+    host_setpriority(which: number, who: number, niceRaw: number): number {
+      const targetPid = priorityTargetPid(which, who);
+      if (targetPid < 0) return targetPid;
+      const nice = normalizeNice(niceRaw);
+      const auth = authorizeSetPriority(targetPid, nice);
+      if (auth !== 0) return auth;
+      if (!schedulerBackend) return nice === (opts.kernel?.getPriority(targetPid) ?? 0) ? 0 : ERR_UNSUPPORTED;
+      const result = schedulerBackend.setPriority({ callerPid, targetPid, nice });
+      if (result.ok) {
+        opts.kernel?.setPriority(targetPid, nice);
+        return 0;
+      }
+      if (result.error === 'unsupported') return ERR_UNSUPPORTED;
+      if (result.error === 'permission') return ERR_PERMISSION;
+      if (result.error === 'invalid') return ERR_INVALID;
+      if (result.error === 'not_found') return ERR_NOT_FOUND;
+      return ERR_IO;
+    },
+
+    host_sched_getscheduler(pidRaw: number): number {
+      const targetPid = schedulerTargetPid(pidRaw);
+      if (targetPid < 0) return targetPid;
+      return opts.kernel?.getScheduler(targetPid).policy ?? 0;
+    },
+
+    host_sched_getparam(pidRaw: number): number {
+      const targetPid = schedulerTargetPid(pidRaw);
+      if (targetPid < 0) return targetPid;
+      return opts.kernel?.getScheduler(targetPid).priority ?? 0;
+    },
+
+    host_sched_setscheduler(pidRaw: number, policyRaw: number, priorityRaw: number): number {
+      const targetPid = schedulerTargetPid(pidRaw);
+      if (targetPid < 0) return targetPid;
+      return setSchedulerForTarget(targetPid, policyRaw, priorityRaw);
+    },
+
+    host_sched_setparam(pidRaw: number, priorityRaw: number): number {
+      const targetPid = schedulerTargetPid(pidRaw);
+      if (targetPid < 0) return targetPid;
+      const current = opts.kernel?.getScheduler(targetPid) ?? { policy: 0, priority: 0 };
+      return setSchedulerForTarget(targetPid, current.policy, priorityRaw);
+    },
+
+    host_getrlimit(resourceRaw: number, outPtr: number): number {
+      const limit = opts.kernel?.getResourceLimit(callerPid, Math.trunc(resourceRaw)) ?? defaultImportResourceLimit(Math.trunc(resourceRaw));
+      if (!limit) return ERR_INVALID;
+      const view = new DataView(memory.buffer);
+      view.setBigUint64(outPtr, limitToBigUint64(limit.soft), true);
+      view.setBigUint64(outPtr + 8, limitToBigUint64(limit.hard), true);
+      return 0;
+    },
+
+    host_setrlimit(resourceRaw: number, softRaw: number | bigint, hardRaw: number | bigint): number {
+      const resource = Math.trunc(resourceRaw);
+      if (!opts.kernel) return defaultImportResourceLimit(resource) ? 0 : ERR_INVALID;
+      const result = opts.kernel.setResourceLimit(callerPid, resource, softRaw, hardRaw);
+      if (result === 'ok') return 0;
+      if (result === 'permission') return ERR_PERMISSION;
+      return ERR_INVALID;
+    },
+
+    host_getcwd(outPtr: number, outCap: number): number {
+      const cwd = getCallerCwd();
+      const bytes = new TextEncoder().encode(cwd);
+      const required = bytes.byteLength + 1;
+      if (outCap < required) return required;
+      new Uint8Array(memory.buffer, outPtr, bytes.byteLength).set(bytes);
+      new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
+      return required;
+    },
+
+    host_chdir(pathPtr: number, pathLen: number): number {
+      if (!opts.vfs) return ERR_IO;
+      const rawPath = readString(memory, pathPtr, pathLen);
+      const path = resolveCwdPath(getCallerCwd(), rawPath);
+      try {
+        const stat = opts.vfs.stat(path);
+        if (stat.type !== 'dir') return ERR_NOT_DIR;
+        setCallerCwd(path);
+        return 0;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : '';
+        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        return ERR_IO;
+      }
+    },
+
+    host_fchdir(fd: number): number {
+      if (!opts.vfs) return ERR_IO;
+      let path = opts.wasiHost?.getDirectoryFdPath(fd) ?? null;
+      if (path === null && opts.kernel) {
+        const target = opts.kernel.getFdTarget(callerPid, fd);
+        if (target?.type === 'vfs_dir') {
+          path = target.path;
+        } else if (target?.type === 'vfs_file') {
+          path = target.fdTable.getPath(target.fd) ?? null;
+        }
+      }
+      if (path === null) return ERR_NOT_FOUND;
+      try {
+        const stat = opts.vfs.stat(path);
+        if (stat.type !== 'dir') return ERR_NOT_DIR;
+        setCallerCwd(path);
+        return 0;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : '';
+        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        return ERR_IO;
+      }
     },
 
     // host_kill(pid, sig) -> i32
@@ -508,13 +871,21 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
     // host_waitpid(pid, out_ptr, out_cap) -> i32
     // Async — must be wrapped with WebAssembly.Suspending for JSPI.
-    // Waits for the child process to exit and writes { exit_code } to the output buffer.
+    // Waits for a child process to exit and writes { pid, exit_code } to the output buffer.
     async host_waitpid(pid: number, outPtr: number, outCap: number): Promise<number> {
       if (!opts.kernel) {
         return writeJson(memory, outPtr, outCap, { exit_code: -1 });
       }
-      const exitCode = await opts.kernel.waitpid(pid);
-      return writeJson(memory, outPtr, outCap, { exit_code: exitCode });
+      if (pid <= 0) {
+        const result = await opts.kernel.waitAnyChild(callerPid);
+        if (!result) return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
+        return writeJson(memory, outPtr, outCap, {
+          pid: result.pid,
+          exit_code: result.exitCode,
+        });
+      }
+      const exitCode = await opts.kernel.waitpid(pid, callerPid);
+      return writeJson(memory, outPtr, outCap, { pid, exit_code: exitCode });
     },
 
     // host_close_fd(fd) -> i32
@@ -588,14 +959,24 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // host_dup2(src_fd, dst_fd) -> i32
     // Makes dst_fd point to the same target as src_fd.
     host_dup2(srcFd: number, dstFd: number): number {
-      let wasiResult = 0;
-      if (opts.wasiHost) {
-        wasiResult = opts.wasiHost.renumberFd(srcFd, dstFd) === 0 ? 0 : -1;
-      }
-      if (!opts.kernel) return wasiResult;
       try {
-        opts.kernel.dup2(callerPid, srcFd, dstFd);
-        return wasiResult === -1 ? -1 : 0;
+        if (opts.kernel) {
+          opts.kernel.dup2(callerPid, srcFd, dstFd);
+        }
+        if (opts.wasiHost) {
+          const ioFds = opts.wasiHost.getIoFds();
+          if (opts.kernel && ioFds === opts.kernel.getFdTable(callerPid)) return 0;
+          const target = ioFds.get(srcFd);
+          if (target) {
+            if (srcFd === dstFd) return 0;
+            const existing = ioFds.get(dstFd);
+            if (existing) closeFdTarget(existing);
+            retainFdTarget(target);
+            ioFds.set(dstFd, target);
+          }
+          else if (!opts.kernel) return -1;
+        }
+        return 0;
       } catch { return -1; }
     },
 
@@ -628,6 +1009,15 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       throw new Error('longjmp without matching setjmp (Asyncify-based sjlj is Phase 2)');
     },
 
+    // host_fork() -> i32
+    // The process loader replaces this with the Asyncify continuation
+    // implementation for binaries linked with YURT_CC_USE_SETJMP=1.
+    // Generic import creation cannot split a wasm continuation, so it
+    // reports ENOSYS instead of pretending fork succeeded.
+    host_fork(): number {
+      return -38;
+    },
+
     // host_yield() -> void
     // Async — yields to the JS microtask queue, allowing other WASM stacks to run.
     // This is the cooperative scheduling primitive: sleep(0).
@@ -635,11 +1025,28 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       await Promise.resolve();
     },
 
-    // host_waitpid_nohang(pid) -> i32
-    // Non-blocking: returns exit code if process exited, -1 if still running.
-    host_waitpid_nohang(pid: number): number {
+    // host_waitpid_nohang(pid, out_ptr?, out_cap?) -> i32
+    // Non-blocking JSON ABI: returns bytes for an exited child, -1 if still running,
+    // and -2 for ECHILD. The legacy one-argument form returns just the exit code.
+    host_waitpid_nohang(pid: number, outPtr?: number, outCap?: number): number {
       if (!opts.kernel) return -1;
-      return opts.kernel.waitpidNohang(pid);
+      if (typeof outPtr !== 'number' || typeof outCap !== 'number') {
+        return opts.kernel.waitpidNohang(pid, callerPid);
+      }
+
+      if (pid <= 0) {
+        const result = opts.kernel.waitAnyChildNohang(callerPid);
+        if (result.state === 'running') return -1;
+        if (result.state === 'none') return -2;
+        return writeJson(memory, outPtr, outCap, {
+          pid: result.pid,
+          exit_code: result.exitCode,
+        });
+      }
+
+      const exitCode = opts.kernel.waitpidNohang(pid, callerPid);
+      if (exitCode < 0) return exitCode;
+      return writeJson(memory, outPtr, outCap, { pid, exit_code: exitCode });
     },
 
     // host_wait_any(out_ptr, out_cap) -> i32 (async/JSPI)
@@ -657,9 +1064,14 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // { pid: 0 } if no child is ready yet. pid=-1 means no children exist.
     // Used by waitpid(-1, ..., WNOHANG).
     host_wait_any_nohang(outPtr: number, outCap: number): number {
-      if (!opts.kernel) return writeJson(memory, outPtr, outCap, { pid: 0, exit_code: -1 });
+      if (!opts.kernel) return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
       const result = opts.kernel.waitAnyNohang(callerPid);
-      if (!result) return writeJson(memory, outPtr, outCap, { pid: 0, exit_code: -1 });
+      if (result.state === 'running') {
+        return writeJson(memory, outPtr, outCap, { pid: 0, exit_code: -1 });
+      }
+      if (result.state === 'none') {
+        return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
+      }
       return writeJson(memory, outPtr, outCap, { pid: result.pid, exit_code: result.exitCode });
     },
 
@@ -771,8 +1183,17 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(socketLocalHost));
       }
       const addr = await resolveHostname(hostname);
+      if (!addr && socketBackend) {
+        return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(syntheticAddressForHost(hostname)));
+      }
       if (!addr) return -1;
       return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(addr));
+    },
+
+    // host_get_local_addr(out_ptr, out_cap) -> i32
+    // Writes the kernel-configured sandbox local IPv4 address to out_ptr.
+    host_get_local_addr(outPtr: number, outCap: number): number {
+      return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(socketLocalHost));
     },
 
     // ── Sockets (full mode only) ──
@@ -1338,11 +1759,54 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (!opts.vfs) return ERR_IO;
       const path = readString(memory, pathPtr, pathLen);
       try {
-        opts.vfs.chmod(path, mode);
+        const credentials = getCallerCredentials();
+        const authorized = withVfsCallerCredentials(() => {
+          const stat = opts.vfs!.stat(path);
+          if (credentials.euid !== ROOT_UID && stat.uid !== credentials.euid) {
+            return false;
+          }
+          opts.vfs!.chmod(path, mode);
+          return true;
+        });
+        if (!authorized) return ERR_PERMISSION;
         return 0;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : '';
         if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        return ERR_IO;
+      }
+    },
+
+    host_chown(pathPtr: number, pathLen: number, uid: number, gid: number, followSymlinks: number): number {
+      if (!opts.vfs) return ERR_IO;
+      const path = readString(memory, pathPtr, pathLen);
+      if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
+      try {
+        withVfsCallerCredentials(() => opts.vfs!.chown(path, uid, gid, followSymlinks !== 0));
+        return 0;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : '';
+        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        return ERR_IO;
+      }
+    },
+
+    host_fchown(fd: number, uid: number, gid: number): number {
+      if (!opts.vfs || !opts.kernel) return ERR_IO;
+      const target = opts.kernel.getFdTarget(callerPid, fd);
+      if (!target || target.type !== 'vfs_file') return ERR_NOT_FOUND;
+      const path = target.fdTable.getPath(target.fd);
+      if (!path) return ERR_NOT_FOUND;
+      if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
+      try {
+        withVfsCallerCredentials(() => opts.vfs!.chown(path, uid, gid));
+        return 0;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : '';
+        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
         return ERR_IO;
       }
     },
@@ -1445,4 +1909,24 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   }
 
   return imports;
+}
+
+function defaultImportResourceLimit(resource: number): { soft: number; hard: number } | null {
+  switch (resource) {
+    case 0:
+    case 1:
+      return { soft: Infinity, hard: Infinity };
+    case 2:
+    case 5:
+      return { soft: 64 * 1024 * 1024, hard: 64 * 1024 * 1024 };
+    case 3:
+      return { soft: 1024 * 1024, hard: 1024 * 1024 };
+    case 4:
+      return { soft: 0, hard: 0 };
+    case 6:
+    case 7:
+      return { soft: 1024, hard: 1024 };
+    default:
+      return null;
+  }
 }

@@ -268,3 +268,7 @@ unsigned alarm(unsigned seconds) {
   yurt_alarm_seconds = seconds;
   return previous;
 }
+
+int yurt_deliver_signal(int sig) {
+  return raise(sig);
+}

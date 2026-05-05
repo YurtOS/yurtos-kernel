@@ -9,7 +9,7 @@ int main(int argc, char **argv) {
   int rc;
 
   if (argc == 2 && strcmp(argv[1], "large") == 0) {
-    cmd = "python3 -c \"print('x' * 6000, end='')\"";
+    cmd = "i=0; while [ $i -lt 6000 ]; do printf x; i=$((i + 1)); done";
     success = "system-large-ok";
   } else if (argc != 1) {
     fprintf(stderr, "usage: system-canary [large]\n");

@@ -1,0 +1,169 @@
+--- a/library/std/src/sys/process/unsupported.rs
++++ b/library/std/src/sys/process/unsupported.rs
+@@ -1,13 +1,13 @@
+ use super::env::{CommandEnv, CommandEnvs};
+ pub use crate::ffi::OsString as EnvKey;
+-use crate::ffi::{c_char, CString, OsStr, OsString};
++use crate::ffi::{c_char, c_long, c_void, CString, OsStr, OsString};
+ use crate::os::wasi::prelude::*;
+ use crate::num::NonZero;
+ use crate::path::Path;
+ use crate::process::StdioPipes;
+ use crate::sys::fs::File;
+ use crate::sys::unsupported;
+-use crate::{fmt, io, ptr};
++use crate::{fmt, io, mem, ptr};
+
+ ////////////////////////////////////////////////////////////////////////////////
+ // Command
+@@ -99,23 +99,44 @@
+         _default: Stdio,
+         _needs_stdin: bool,
+     ) -> io::Result<(Process, StdioPipes)> {
+-        let program = cstring_from_os(&self.program)?;
+-        let args = cstring_vec(&self.args)?;
+-        let mut argv: Vec<*mut c_char> =
+-            args.iter().map(|arg| arg.as_ptr() as *mut c_char).collect();
+-        argv.push(ptr::null_mut());
+-
+-        let mut pid = 0;
+-        let rc = unsafe {
+-            posix_spawnp(&mut pid, program.as_ptr(), ptr::null(), ptr::null(), argv.as_ptr(), ptr::null())
+-        };
+-        if rc != 0 {
+-            return Err(io::Error::from_raw_os_error(rc));
+-        }
+-        Ok((Process { pid, status: None }, StdioPipes { stdin: None, stdout: None, stderr: None }))
++        spawn_command(self, ptr::null())
+     }
+ }
+
+-pub fn output(_cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
+-    unsupported()
++pub fn output(cmd: &mut Command) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
++    let stdout_pipe = create_pipe()?;
++    let stderr_pipe = create_pipe()?;
++    let mut actions = PosixSpawnFileActions::zeroed();
++    let actions_ptr = &mut actions as *mut PosixSpawnFileActions;
++
++    let spawn_result = unsafe {
++        cvt_spawn(posix_spawn_file_actions_init(actions_ptr))
++            .and_then(|_| cvt_spawn(posix_spawn_file_actions_adddup2(actions_ptr, stdout_pipe[1], 1)))
++            .and_then(|_| cvt_spawn(posix_spawn_file_actions_adddup2(actions_ptr, stderr_pipe[1], 2)))
++            .and_then(|_| spawn_command(cmd, actions_ptr))
++    };
++
++    unsafe {
++        posix_spawn_file_actions_destroy(actions_ptr);
++    }
++
++    close_ignoring_error(stdout_pipe[1]);
++    close_ignoring_error(stderr_pipe[1]);
++
++    let mut process = match spawn_result {
++        Ok((process, _pipes)) => process,
++        Err(err) => {
++            close_ignoring_error(stdout_pipe[0]);
++            close_ignoring_error(stderr_pipe[0]);
++            return Err(err);
++        }
++    };
++
++    let status = process.wait()?;
++    let stdout = read_all_fd(stdout_pipe[0]);
++    let stderr = read_all_fd(stderr_pipe[0]);
++    close_ignoring_error(stdout_pipe[0]);
++    close_ignoring_error(stderr_pipe[0]);
++
++    Ok((status, stdout?, stderr?))
+ }
+@@ -326,17 +347,88 @@
+
+ const WNOHANG: i32 = 1;
+
++#[repr(C)]
++struct PosixSpawnFileActions {
++    __priv: *mut c_void,
++    __pad: [c_long; 15],
++}
++
++impl PosixSpawnFileActions {
++    fn zeroed() -> Self {
++        unsafe { mem::zeroed() }
++    }
++}
++
+ unsafe extern "C" {
+     fn posix_spawnp(
+         pid: *mut i32,
+         file: *const c_char,
+-        file_actions: *const (),
++        file_actions: *const PosixSpawnFileActions,
+         attrp: *const (),
+         argv: *const *mut c_char,
+         envp: *const *mut c_char,
+     ) -> i32;
+     fn waitpid(pid: i32, wstatus: *mut i32, options: i32) -> i32;
++    fn pipe(fds: *mut i32) -> i32;
++    fn close(fd: i32) -> i32;
++    fn read(fd: i32, buf: *mut c_void, count: usize) -> isize;
++    fn posix_spawn_file_actions_init(actions: *mut PosixSpawnFileActions) -> i32;
++    fn posix_spawn_file_actions_destroy(actions: *mut PosixSpawnFileActions) -> i32;
++    fn posix_spawn_file_actions_adddup2(
++        actions: *mut PosixSpawnFileActions,
++        fd: i32,
++        newfd: i32,
++    ) -> i32;
+ }
++
++fn spawn_command(
++    cmd: &Command,
++    file_actions: *const PosixSpawnFileActions,
++) -> io::Result<(Process, StdioPipes)> {
++    let program = cstring_from_os(&cmd.program)?;
++    let args = cstring_vec(&cmd.args)?;
++    let mut argv: Vec<*mut c_char> =
++        args.iter().map(|arg| arg.as_ptr() as *mut c_char).collect();
++    argv.push(ptr::null_mut());
++
++    let mut pid = 0;
++    let rc = unsafe {
++        posix_spawnp(&mut pid, program.as_ptr(), file_actions, ptr::null(), argv.as_ptr(), ptr::null())
++    };
++    if rc != 0 {
++        return Err(io::Error::from_raw_os_error(rc));
++    }
++    Ok((Process { pid, status: None }, StdioPipes { stdin: None, stdout: None, stderr: None }))
++}
++
++fn create_pipe() -> io::Result<[i32; 2]> {
++    let mut fds = [0, 0];
++    let rc = unsafe { pipe(fds.as_mut_ptr()) };
++    if rc == 0 { Ok(fds) } else { Err(io::Error::last_os_error()) }
++}
++
++fn cvt_spawn(rc: i32) -> io::Result<()> {
++    if rc == 0 { Ok(()) } else { Err(io::Error::from_raw_os_error(rc)) }
++}
++
++fn close_ignoring_error(fd: i32) {
++    unsafe { close(fd); }
++}
++
++fn read_all_fd(fd: i32) -> io::Result<Vec<u8>> {
++    let mut out = Vec::new();
++    let mut buf = [0u8; 8192];
++    loop {
++        let n = unsafe { read(fd, buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
++        if n < 0 {
++            return Err(io::Error::last_os_error());
++        }
++        if n == 0 {
++            return Ok(out);
++        }
++        out.extend_from_slice(&buf[..n as usize]);
++    }
++}
+
+ fn cstring_from_os(value: &OsStr) -> io::Result<CString> {
+     CString::new(value.as_bytes())

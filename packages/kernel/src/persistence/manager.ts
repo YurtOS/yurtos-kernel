@@ -44,7 +44,10 @@ export class PersistenceManager {
   }
 
   /** Hook VFS onChange to schedule debounced saves. */
-  startAutosave(vfs: { setOnChange(cb: (() => void) | null): void }): void {
+  startAutosave(vfs: VfsLike): void {
+    if (!vfs.setOnChange) {
+      throw new Error('Configured VFS does not support autosave');
+    }
     vfs.setOnChange(() => this.scheduleSave());
   }
 

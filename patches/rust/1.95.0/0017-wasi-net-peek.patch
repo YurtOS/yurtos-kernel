@@ -1,0 +1,17 @@
+--- a/library/std/src/sys/net/connection/wasip1.rs	2026-04-30 22:37:01
++++ b/library/std/src/sys/net/connection/wasip1.rs	2026-04-30 22:37:44
+@@ -74,0 +75 @@
++const YURT_MSG_PEEK: i32 = 0x02;
+@@ -113,0 +115 @@
++    fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
+@@ -163,0 +166,5 @@
++fn tcp_peek(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
++    let rc = unsafe { recv(fd as i32, buf.as_mut_ptr(), buf.len(), YURT_MSG_PEEK) };
++    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(rc as usize) }
++}
++
+@@ -229,2 +236,2 @@
+-    pub fn peek(&self, _: &mut [u8]) -> io::Result<usize> {
+-        unsupported()
++    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
++        tcp_peek(self.socket().as_raw_fd(), buf)

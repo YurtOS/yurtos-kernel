@@ -1,0 +1,16 @@
+canary = "posix-runtime-canary"
+summary = "Exercise deterministic sendfile edge behavior without filesystem preopens."
+
+[[case]]
+name = "sendfile_zero_count"
+inputs = "sendfile(1, 0, NULL, 0)"
+expected.exit = 0
+expected.stdout = "sendfile_zero:0"
+
+[[case]]
+name = "sendfile_bad_fd"
+inputs = "sendfile(1, -1, NULL, 1)"
+expected.exit = 0
+expected.stdout = "sendfile_bad_fd:-1"
+expected.errno = 8
+expected.note = "EBADF is 8 on wasi-libc"

@@ -1,0 +1,94 @@
+--- a/library/std/src/sys/thread/unix.rs
++++ b/library/std/src/sys/thread/unix.rs
+@@ -155,9 +155,14 @@
+             target_os = "aix",
+             target_vendor = "apple",
+             target_os = "cygwin",
++            target_os = "wasi",
+         ) => {
+             #[allow(unused_assignments)]
+             #[allow(unused_mut)]
++            #[cfg(target_os = "wasi")]
++            const _SC_NPROCESSORS_ONLN: libc::c_int = 84;
++            #[cfg(not(target_os = "wasi"))]
++            const _SC_NPROCESSORS_ONLN: libc::c_int = libc::_SC_NPROCESSORS_ONLN;
+             let mut quota = usize::MAX;
+
+             #[cfg(any(target_os = "android", target_os = "linux"))]
+@@ -179,7 +184,7 @@
+                     }
+                 }
+             }
+-            match unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } {
++            match unsafe { libc::sysconf(_SC_NPROCESSORS_ONLN) } {
+                 -1 => Err(io::Error::last_os_error()),
+                 0 => Err(io::Error::UNKNOWN_THREAD_COUNT),
+                 cpus => {
+--- a/library/std/src/sys/thread_local/mod.rs
++++ b/library/std/src/sys/thread_local/mod.rs
+@@ -24,8 +24,7 @@
+ cfg_select! {
+     any(
+-        all(target_family = "wasm", not(target_feature = "atomics")),
+         target_os = "uefi",
+         target_os = "zkvm",
+         target_os = "trusty",
+         target_os = "vexos",
+     ) => {
+@@ -38,7 +37,7 @@
+         pub use no_threads::{EagerStorage, LazyStorage, thread_local_inner};
+         pub(crate) use no_threads::{LocalPointer, local_pointer};
+     }
+-    target_thread_local => {
++    all(target_thread_local, not(all(target_family = "wasm", not(target_feature = "atomics")))) => {
+         mod native;
+         pub use native::{EagerStorage, LazyStorage, thread_local_inner};
+         pub(crate) use native::{LocalPointer, local_pointer};
+@@ -151,13 +150,13 @@
+             ),
+             all(not(target_thread_local), target_vendor = "apple"),
+             target_os = "teeos",
+-            all(target_os = "wasi", target_env = "p1", target_feature = "atomics"),
++            all(target_os = "wasi", target_env = "p1"),
+         ) => {
+             mod racy;
+             mod unix;
+             #[cfg(test)]
+             mod tests;
+             pub(super) use racy::LazyKey;
+             pub(super) use unix::{Key, set};
+-            #[cfg(any(not(target_thread_local), test))]
++            #[cfg(any(not(target_thread_local), test, all(target_family = "wasm", not(target_feature = "atomics"))))]
+             pub(super) use unix::get;
+             use unix::{create, destroy};
+--- a/library/std/src/sys/thread_local/key/unix.rs
++++ b/library/std/src/sys/thread_local/key/unix.rs
+@@ -1,7 +1,7 @@
+ use crate::mem;
+
+ // For WASI add a few symbols not in upstream `libc` just yet.
+-#[cfg(all(target_os = "wasi", target_env = "p1", target_feature = "atomics"))]
++#[cfg(all(target_os = "wasi", target_env = "p1"))]
+ mod libc {
+     use crate::ffi;
+
+@@ -38,7 +38,7 @@
+ }
+
+ #[inline]
+-#[cfg(any(not(target_thread_local), test))]
++#[cfg(any(not(target_thread_local), test, all(target_family = "wasm", not(target_feature = "atomics"))))]
+ pub unsafe fn get(key: Key) -> *mut u8 {
+     unsafe { libc::pthread_getspecific(key) as *mut u8 }
+ }
+--- a/library/std/src/thread/current.rs
++++ b/library/std/src/thread/current.rs
+@@ -23,7 +23,7 @@
+     use super::*;
+
+     cfg_select! {
+-        target_thread_local => {
++        all(target_thread_local, not(all(target_family = "wasm", not(target_feature = "atomics")))) => {
+             use crate::cell::Cell;
+
+             #[thread_local]
