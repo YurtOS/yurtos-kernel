@@ -363,12 +363,14 @@ export class WorkerExecutor {
           break;
         }
         case 'chown': {
-          vfs.chown(
-            metadata.path as string,
-            metadata.uid as number,
-            metadata.gid as number,
-            metadata.followSymlinks as boolean | undefined,
-          );
+          vfs.withWriteAccess(() => {
+            vfs.chown(
+              metadata.path as string,
+              metadata.uid as number,
+              metadata.gid as number,
+              metadata.followSymlinks as boolean | undefined,
+            );
+          });
           encodeResponse(this.sab, { ok: true });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;

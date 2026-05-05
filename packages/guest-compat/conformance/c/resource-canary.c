@@ -62,9 +62,21 @@ static int case_invalid(void) {
   return 0;
 }
 
+static int case_setrlimit_raise_hard_denied(void) {
+  struct rlimit r = { 1024, 2048 };
+  errno = 0;
+  if (setrlimit(RLIMIT_NOFILE, &r) >= 0 || errno != EPERM) {
+    emit("setrlimit_raise_hard_should_eperm", 1, errno);
+    return 1;
+  }
+  emit("setrlimit_raise_hard_eperm", 0, 0);
+  return 0;
+}
+
 int main(void) {
   int rc = 0;
   rc |= case_nofile();
+  rc |= case_setrlimit_raise_hard_denied();
   rc |= case_setrlimit_enforced();
   rc |= case_invalid();
   return rc;

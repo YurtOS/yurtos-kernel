@@ -261,6 +261,18 @@ describe('Guest compatibility canaries', () => {
     expect(result.stdout.trim()).toBe('getgroups:1:1000');
   });
 
+  it('reports EPERM for unprivileged resource hard-limit raises', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('resource-canary');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('{"case":"setrlimit_raise_hard_eperm","exit":0,"v":0}');
+  });
+
   describe('posix-runtime-canary', () => {
     it('reports deterministic hostname and loopback interface lookups', async () => {
       sandbox = await Sandbox.create({
@@ -315,6 +327,20 @@ describe('Guest compatibility canaries', () => {
       expect(result.exitCode).toBe(0);
       expect(result.stdout.trim()).toBe(
         '{"case":"fcntl_pipe_status_flags","exit":0,"stdout":"fcntl_pipe_status_flags:ok"}',
+      );
+    });
+
+    it('does not let F_SETFL change access mode bits', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run('posix-runtime-canary --case fcntl_setfl_masks_access_mode');
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"fcntl_setfl_masks_access_mode","exit":0,"stdout":"fcntl_setfl_masks_access_mode:ok"}',
       );
     });
   });

@@ -42,7 +42,7 @@ int setrlimit(int resource, const struct rlimit *rlim) {
 
   int rc = yurt_host_setrlimit(resource, rlim->rlim_cur, rlim->rlim_max);
   if (rc < 0) {
-    errno = EINVAL;
+    errno = rc == -2 ? EPERM : EINVAL;
     return -1;
   }
   return 0;

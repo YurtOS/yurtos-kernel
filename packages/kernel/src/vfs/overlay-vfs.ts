@@ -234,7 +234,8 @@ export class OverlayVFS implements VfsLike {
     try {
       const st = this.options.upper.lstat(path);
       if (st.type === 'dir') throw new VfsError('EISDIR', `is a directory: ${path}`);
-      this.options.upper.unlink(path);
+      if (!this.privileged) this.assertCanMutateDirectoryEntry(path);
+      this.withUpperCredential(() => this.options.upper.unlink(path));
     } catch (e) {
       if (!isEnoent(e)) throw e;
       const st = this.options.base.lstat(path);
@@ -326,7 +327,24 @@ export class OverlayVFS implements VfsLike {
 
   link(oldPath: string, newPath: string): void {
     if (!this.options.upper.link) throw new VfsError('EACCES', 'hard link unsupported on overlay upper');
-    this.options.upper.link(oldPath, newPath);
+    oldPath = normalizeOverlayPath(oldPath);
+    newPath = normalizeOverlayPath(newPath);
+    this.assertNoWhiteoutedAncestor(oldPath);
+    const source = this.lookupMerged(oldPath);
+    if (!source) throw new VfsError('ENOENT', `no such file: ${oldPath}`);
+    if (source.type === 'dir') throw new VfsError('EACCES', `hard link not allowed for directory: ${oldPath}`);
+    const wasWhiteouted = this.whiteouts.has(newPath);
+    if (!this.privileged) this.assertCanMutateDirectoryEntry(newPath);
+    this.assertNoMergedEntry(newPath, wasWhiteouted);
+    try {
+      this.options.upper.lstat(oldPath);
+    } catch (e) {
+      if (!isEnoent(e)) throw e;
+      this.copyUpAny(oldPath, oldPath, source);
+    }
+    this.ensureUpperParentDirectory(newPath);
+    this.withUpperCredential(() => this.options.upper.link!(oldPath, newPath));
+    this.whiteouts.delete(newPath);
     this.notifyChange();
   }
 

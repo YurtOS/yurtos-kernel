@@ -627,6 +627,16 @@ Deno.test("host rlimit preserves 64-bit values and RLIM_INFINITY", () => {
   assertEquals(view.getBigUint64(72, true), infinity);
 });
 
+Deno.test("host_setrlimit reports EPERM when a user raises the hard limit", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const userPid = kernel.allocPid(1, "user");
+  const imports = createKernelImports({ memory, kernel, callerPid: userPid });
+
+  assertEquals((imports.host_setrlimit as (...args: unknown[]) => number)(7, 1024n, 2048n), -2);
+  assertEquals(kernel.getResourceLimit(userPid, 7), { soft: 1024, hard: 1024 });
+});
+
 Deno.test("host_dup2 closes overwritten WasiHost ioFds target", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const vfs = new VFS();

@@ -39,6 +39,8 @@ const MAGIC = new Uint8Array([0x57, 0x53, 0x4e, 0x44]); // "WSND"
 
 /** Current format version. */
 const FORMAT_VERSION = 2;
+const USER_UID = 1000;
+const USER_GID = 1000;
 
 /** Header size for v1: 4 bytes magic + 4 bytes version. */
 const HEADER_SIZE_V1 = 8;
@@ -250,8 +252,12 @@ export function importState(
     }
     for (const entry of safeFiles) {
       if (entry.type === 'symlink') continue;
-      if (entry.uid !== undefined && entry.gid !== undefined && targetVfs.chown) {
-        targetVfs.chown(entry.path, entry.uid, entry.gid);
+      if (targetVfs.chown) {
+        if (allowSystemPaths && entry.uid !== undefined && entry.gid !== undefined) {
+          targetVfs.chown(entry.path, entry.uid, entry.gid);
+        } else if (!allowSystemPaths) {
+          targetVfs.chown(entry.path, USER_UID, USER_GID);
+        }
       }
       if (entry.permissions !== undefined) {
         targetVfs.chmod(entry.path, entry.permissions);

@@ -118,6 +118,8 @@ export const WASI_WHENCE_END = 2;
 
 // Rights — we grant all rights (no capability enforcement inside the sandbox)
 export const WASI_RIGHTS_ALL = BigInt(0x1fffffff);
+export const WASI_RIGHTS_FD_READ = 1n << 1n;
+export const WASI_RIGHTS_FD_WRITE = 1n << 6n;
 
 // Event types (for poll_oneoff subscriptions and events)
 export const WASI_EVENTTYPE_CLOCK = 0;

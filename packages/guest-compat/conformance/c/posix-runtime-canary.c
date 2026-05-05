@@ -350,6 +350,50 @@ static int case_fcntl_pipe_status_flags(void) {
   return 0;
 }
 
+static int case_fcntl_setfl_masks_access_mode(void) {
+  const char *path = "/tmp/yurt-fcntl-mask.txt";
+  unlink(path);
+  int seed = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+  if (seed < 0) {
+    emit("fcntl_setfl_masks_access_mode", 1, "fcntl_setfl_masks_access_mode:create_failed", 1, errno);
+    return 1;
+  }
+  if (write(seed, "x", 1) != 1) {
+    int e = errno;
+    close(seed);
+    emit("fcntl_setfl_masks_access_mode", 1, "fcntl_setfl_masks_access_mode:write_failed", 1, e);
+    return 1;
+  }
+  close(seed);
+
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    emit("fcntl_setfl_masks_access_mode", 1, "fcntl_setfl_masks_access_mode:open_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (fcntl(fd, F_SETFL, O_RDWR | O_NONBLOCK) != 0) {
+    int e = errno;
+    close(fd);
+    emit("fcntl_setfl_masks_access_mode", 1, "fcntl_setfl_masks_access_mode:setfl_failed", 1, e);
+    return 1;
+  }
+
+  errno = 0;
+  int flags = fcntl(fd, F_GETFL);
+  close(fd);
+  if (flags < 0 || (flags & O_ACCMODE) != O_RDONLY || (flags & O_NONBLOCK) == 0) {
+    char out[96];
+    snprintf(out, sizeof(out), "fcntl_setfl_masks_access_mode:bad_flags:%d:%d:%d", flags, O_ACCMODE, O_RDONLY);
+    emit("fcntl_setfl_masks_access_mode", 1, out, flags < 0, errno);
+    return 1;
+  }
+
+  emit("fcntl_setfl_masks_access_mode", 0, "fcntl_setfl_masks_access_mode:ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "hostname") == 0) return case_hostname();
   if (strcmp(name, "hostname_too_small") == 0) return case_hostname_too_small();
@@ -365,6 +409,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "cwd_backend") == 0) return case_cwd_backend();
   if (strcmp(name, "priority_unsupported") == 0) return case_priority_unsupported();
   if (strcmp(name, "fcntl_pipe_status_flags") == 0) return case_fcntl_pipe_status_flags();
+  if (strcmp(name, "fcntl_setfl_masks_access_mode") == 0) return case_fcntl_setfl_masks_access_mode();
   fprintf(stderr, "posix-runtime-canary: unknown case %s\n", name);
   return 2;
 }
@@ -384,6 +429,7 @@ static int list_cases(void) {
   puts("cwd_backend");
   puts("priority_unsupported");
   puts("fcntl_pipe_status_flags");
+  puts("fcntl_setfl_masks_access_mode");
   return 0;
 }
 

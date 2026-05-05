@@ -663,7 +663,10 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     host_setrlimit(resourceRaw: number, softRaw: number | bigint, hardRaw: number | bigint): number {
       const resource = Math.trunc(resourceRaw);
       if (!opts.kernel) return defaultImportResourceLimit(resource) ? 0 : ERR_INVALID;
-      return opts.kernel.setResourceLimit(callerPid, resource, softRaw, hardRaw) ? 0 : ERR_INVALID;
+      const result = opts.kernel.setResourceLimit(callerPid, resource, softRaw, hardRaw);
+      if (result === 'ok') return 0;
+      if (result === 'permission') return ERR_PERMISSION;
+      return ERR_INVALID;
     },
 
     host_getcwd(outPtr: number, outCap: number): number {

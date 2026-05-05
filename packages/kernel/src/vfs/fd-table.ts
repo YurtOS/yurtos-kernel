@@ -277,6 +277,10 @@ export class FdTable {
     return this.entries.get(fd)?.path;
   }
 
+  getMode(fd: number): OpenMode | undefined {
+    return this.entries.get(fd)?.mode;
+  }
+
   /** Clone the fd table for fork, sharing POSIX open file descriptions. */
   clone(): FdTable {
     const cloned = new FdTable(this.vfs);

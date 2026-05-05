@@ -42,6 +42,8 @@ import {
   WASI_OFLAGS_TRUNC,
   WASI_PREOPENTYPE_DIR,
   WASI_RIGHTS_ALL,
+  WASI_RIGHTS_FD_READ,
+  WASI_RIGHTS_FD_WRITE,
   WASI_WHENCE_CUR,
   WASI_WHENCE_END,
   WASI_WHENCE_SET,
@@ -1143,9 +1145,18 @@ export class WasiHost {
     view.setUint16(bufPtr + 2, ioTarget?.type === 'socket' ? (ioTarget.fdFlags ?? 0) : 0, true); // fdflags
     // 4 bytes padding
     view.setUint32(bufPtr + 4, 0, true);
-    view.setBigUint64(bufPtr + 8, WASI_RIGHTS_ALL, true); // rights_base
+    view.setBigUint64(bufPtr + 8, this.fdRightsBase(fd), true); // rights_base
     view.setBigUint64(bufPtr + 16, WASI_RIGHTS_ALL, true); // rights_inheriting
     return WASI_ESUCCESS;
+  }
+
+  private fdRightsBase(fd: number): bigint {
+    const mode = this.fdTable.getMode(fd);
+    if (!mode) return WASI_RIGHTS_ALL;
+    let rights = WASI_RIGHTS_ALL & ~WASI_RIGHTS_FD_READ & ~WASI_RIGHTS_FD_WRITE;
+    if (mode === 'r' || mode === 'rw') rights |= WASI_RIGHTS_FD_READ;
+    if (mode === 'w' || mode === 'a' || mode === 'rw') rights |= WASI_RIGHTS_FD_WRITE;
+    return rights;
   }
 
   private fdFdstatSetFlags(fd: number, flags: number): number {

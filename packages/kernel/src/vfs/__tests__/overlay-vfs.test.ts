@@ -127,6 +127,44 @@ describe('OverlayVFS', () => {
     expect(dec.decode(vfs.readFile('/tmp/root-owned.txt'))).toBe('root');
   });
 
+  it('uses overlay credentials for upper-layer unlink authorization', () => {
+    const upper = new VFS();
+    upper.withWriteAccess(() => {
+      upper.mkdirp('/private');
+      upper.chown('/private', 1000, 1000);
+      upper.chmod('/private', 0o755);
+      upper.writeFile('/private/file.txt', enc.encode('data'));
+      upper.chown('/private/file.txt', 1000, 1000);
+    });
+    const vfs = new OverlayVFS({
+      base: new MemoryRoot(),
+      upper,
+      credential: { uid: 2000, gid: 2000 },
+    });
+
+    expect(() => vfs.unlink('/private/file.txt')).toThrow(/EACCES/);
+    expect(dec.decode(vfs.readFile('/private/file.txt'))).toBe('data');
+  });
+
+  it('uses overlay credentials for upper-layer hard link destination authorization', () => {
+    const upper = new VFS();
+    upper.withWriteAccess(() => {
+      upper.mkdirp('/private');
+      upper.chown('/private', 1000, 1000);
+      upper.chmod('/private', 0o755);
+      upper.writeFile('/tmp/source.txt', enc.encode('data'));
+      upper.chown('/tmp/source.txt', 1000, 1000);
+    });
+    const vfs = new OverlayVFS({
+      base: new MemoryRoot(),
+      upper,
+      credential: { uid: 2000, gid: 2000 },
+    });
+
+    expect(() => vfs.link('/tmp/source.txt', '/private/link.txt')).toThrow(/EACCES/);
+    expect(() => vfs.readFile('/private/link.txt')).toThrow(/ENOENT/);
+  });
+
   it('mkdir and symlink reject existing base entries unless whiteouted', () => {
     const base = new MemoryRoot();
     base.addDir('/opt/base', { uid: 1000, gid: 1000, permissions: 0o755 });

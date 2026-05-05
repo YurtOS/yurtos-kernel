@@ -299,6 +299,32 @@ describe('Persistence serializer', () => {
       expect(dst.stat('/tmp/partial-owner.txt').uid).toBe(1000);
       expect(dst.stat('/tmp/partial-owner.txt').gid).toBe(1000);
     });
+
+    it('does not import untrusted uid and gid ownership from safe user paths', () => {
+      const raw = {
+        version: 1,
+        files: [{
+          path: '/home/user/owned-by-blob.txt',
+          data: btoa('data'),
+          type: 'file',
+          permissions: 0o644,
+          uid: 0,
+          gid: 0,
+        }],
+      };
+
+      const body = enc(JSON.stringify(raw));
+      const blob = new Uint8Array(8 + body.byteLength);
+      blob.set(new Uint8Array([0x57, 0x53, 0x4e, 0x44]), 0);
+      new DataView(blob.buffer).setUint32(4, 1, true);
+      blob.set(body, 8);
+
+      const dst = new VFS();
+      importState(dst, blob);
+
+      expect(dst.stat('/home/user/owned-by-blob.txt').uid).toBe(1000);
+      expect(dst.stat('/home/user/owned-by-blob.txt').gid).toBe(1000);
+    });
   });
 });
 

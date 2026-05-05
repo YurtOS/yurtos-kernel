@@ -37,6 +37,8 @@ export interface ResourceLimit {
   hard: number;
 }
 
+export type SetResourceLimitResult = 'ok' | 'invalid' | 'permission';
+
 export interface ProcessCredentials {
   uid: number;
   gid: number;
@@ -266,18 +268,18 @@ export class ProcessKernel {
     return limit ? { ...limit } : null;
   }
 
-  setResourceLimit(pid: number, resource: number, softRaw: number | bigint, hardRaw: number | bigint): boolean {
+  setResourceLimit(pid: number, resource: number, softRaw: number | bigint, hardRaw: number | bigint): SetResourceLimitResult {
     const entry = this.processTable.get(pid);
-    if (!entry) return false;
+    if (!entry) return 'invalid';
     const current = entry.resourceLimits.get(resource);
-    if (!current) return false;
+    if (!current) return 'invalid';
     const soft = normalizeLimit(softRaw);
     const hard = normalizeLimit(hardRaw);
-    if (soft < 0 || hard < 0 || soft > hard) return false;
-    if (entry.credentials.euid !== ROOT_UID && hard > current.hard) return false;
-    if (entry.credentials.euid !== ROOT_UID && soft > current.hard) return false;
+    if (soft < 0 || hard < 0 || soft > hard) return 'invalid';
+    if (entry.credentials.euid !== ROOT_UID && hard > current.hard) return 'permission';
+    if (entry.credentials.euid !== ROOT_UID && soft > current.hard) return 'permission';
     entry.resourceLimits.set(resource, { soft, hard });
-    return true;
+    return 'ok';
   }
 
   setresuid(pid: number, ruid: number, euid: number, suid: number): boolean {

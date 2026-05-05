@@ -136,7 +136,9 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
         saved[saved_count++] = new_fd;
         new_fd = dup(fd);
       }
+      int saved_errno = errno;
       for (size_t i = 0; i < saved_count; ++i) close(saved[i]);
+      if (new_fd < 0) errno = saved_errno;
       return new_fd;
     }
 
@@ -163,6 +165,11 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
         return -1;
       }
       int flags = 0;
+      int can_read = (st.fs_rights_base & __WASI_RIGHTS_FD_READ) != 0;
+      int can_write = (st.fs_rights_base & __WASI_RIGHTS_FD_WRITE) != 0;
+      if (can_read && can_write) flags |= O_RDWR;
+      else if (can_write) flags |= O_WRONLY;
+      else if (can_read) flags |= O_RDONLY;
       if ((st.fs_flags & __WASI_FDFLAGS_APPEND) != 0) flags |= O_APPEND;
       if ((st.fs_flags & __WASI_FDFLAGS_NONBLOCK) != 0) flags |= O_NONBLOCK;
       flags |= yurt_fd_get_status_flags(fd);
@@ -187,7 +194,7 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
         errno = EINVAL;
         return -1;
       }
-      yurt_fd_set_status_flags(fd, flags);
+      yurt_fd_set_status_flags(fd, flags & (O_APPEND | O_NONBLOCK | O_DSYNC | O_SYNC | O_RSYNC));
       return 0;
     }
 
