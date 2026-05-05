@@ -171,7 +171,10 @@ export class NetworkBridge implements NetworkBridgeLike {
               return;
             }
           }
-          // Strip sensitive headers on cross-origin redirects
+          // Strip sensitive headers on cross-origin redirects.
+          // Case-insensitive: HTTP header names are case-insensitive, and a
+          // caller may legitimately pass 'AUTHORIZATION', 'set-cookie', etc.
+          // Kept in sync with NetworkGateway.fetch in gateway.ts.
           let reqHeaders = req.headers;
           if (redirectCount > 0) {
             try {
@@ -179,10 +182,12 @@ export class NetworkBridge implements NetworkBridgeLike {
               const curHost = new URL(currentUrl).hostname;
               if (origHost !== curHost) {
                 reqHeaders = Object.assign({}, req.headers);
-                delete reqHeaders['authorization'];
-                delete reqHeaders['Authorization'];
-                delete reqHeaders['cookie'];
-                delete reqHeaders['Cookie'];
+                for (const key of Object.keys(reqHeaders)) {
+                  const lower = key.toLowerCase();
+                  if (lower === 'authorization' || lower === 'cookie') {
+                    delete reqHeaders[key];
+                  }
+                }
               }
             } catch {}
           }

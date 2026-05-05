@@ -132,6 +132,13 @@ export class NetworkGateway {
       // Cross-origin redirect: drop credentials so a redirect target inside
       // the allow-list cannot harvest tokens meant for the original origin.
       // Mirrors the Worker bridge in network/bridge.ts.
+      //
+      // Comparison is per-hop against the *original* hostname, not against
+      // the previous hop. An A→B→A chain therefore re-attaches credentials
+      // on the third hop because hop 3's target equals the origin. This is
+      // intentional and matches the bridge worker: a redirect back to the
+      // initial host is server-internal, so the request lands at the
+      // origin that originally issued the credentials.
       if (redirectCount > 0 && originalHost !== null) {
         const currentHost = this.extractHost(currentUrl);
         if (currentHost !== null && currentHost !== originalHost) {

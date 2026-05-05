@@ -67,11 +67,12 @@ describe('Persistence serializer — OverlayVFS round-trip', () => {
     source.writeFile('/home/user/hi.txt', enc.encode('hello'));
 
     // includeBase: true elides the overlay metadata so the blob is just a
-    // flat tree dump that any VfsLike target can absorb.
+    // flat tree dump that any VfsLike target can absorb. /home/user is
+    // already under SAFE_IMPORT_PREFIXES, so no allowSystemPaths needed.
     const blob = exportState(source, undefined, { includeBase: true });
 
     const target = new VFS();
-    importState(target, blob, { allowSystemPaths: true });
+    importState(target, blob);
     expect(dec.decode(target.readFile('/home/user/hi.txt'))).toBe('hello');
   });
 });

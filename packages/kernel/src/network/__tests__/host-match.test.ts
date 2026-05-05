@@ -69,27 +69,45 @@ describe('matchesHostList — wildcard semantics', () => {
   });
 });
 
+// Shared fixtures used by both the canonical-impl assertions and the
+// HOST_MATCH_SOURCE parity test. Adding a row here automatically grows
+// the parity check, so the worker mirror cannot silently drift.
+const PARITY_CASES: Array<{ host: string; list: string[] }> = [
+  // Exact match
+  { host: 'example.com', list: ['example.com'] },
+  { host: 'evil.com', list: ['example.com'] },
+  { host: 'EXAMPLE.com', list: ['example.com'] },
+  { host: 'example.com', list: ['Example.COM'] },
+  { host: 'example.com', list: [] },
+  { host: 'a.example.com', list: ['other.com', '*.example.com'] },
+  // Wildcard
+  { host: 'a.example.com', list: ['*.example.com'] },
+  { host: 'a.b.c.example.com', list: ['*.example.com'] },
+  { host: 'example.com', list: ['*.example.com'] },
+  { host: 'notexample.com', list: ['*.example.com'] },
+  { host: 'evil-example.com', list: ['*.example.com'] },
+  // Bare *
+  { host: 'anything', list: ['*'] },
+  { host: '', list: ['*'] },
+  { host: 'localhost', list: ['*'] },
+  // Adversarial
+  { host: 'example.com:8080', list: ['example.com'] },
+  { host: 'foo*bar.com', list: ['foo*bar.com'] },
+  { host: 'fooXbar.com', list: ['foo*bar.com'] },
+];
+
 describe('HOST_MATCH_SOURCE — worker mirror stays in sync', () => {
-  it('produces a function with the same semantics for representative inputs', () => {
+  it('agrees with the canonical implementation on every fixture', () => {
     // Evaluate the worker source string in an isolated scope and exercise
     // it against the canonical implementation.
     const fn = new Function(
       `${HOST_MATCH_SOURCE}\n return matchesHostList;`,
     )() as (host: string, list: string[]) => boolean;
 
-    const cases: Array<{ host: string; list: string[] }> = [
-      { host: 'example.com', list: ['example.com'] },
-      { host: 'a.example.com', list: ['*.example.com'] },
-      { host: 'example.com', list: ['*.example.com'] },
-      { host: 'evil.com', list: ['*.example.com'] },
-      { host: 'anything', list: ['*'] },
-      { host: 'notexample.com', list: ['*.example.com'] },
-      { host: 'a.b.example.com', list: ['*.example.com'] },
-      { host: 'EXAMPLE.com', list: ['example.com'] },
-    ];
-
-    for (const c of cases) {
-      expect(fn(c.host, c.list)).toBe(matchesHostList(c.host, c.list));
+    for (const c of PARITY_CASES) {
+      const expected = matchesHostList(c.host, c.list);
+      const actual = fn(c.host, c.list);
+      expect(actual).toBe(expected);
     }
   });
 });
