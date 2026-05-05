@@ -842,9 +842,9 @@ export class WasiHost {
               }
               continue;
             }
-            if (((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0) return WASI_EAGAIN;
+            const nonblocking = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
             const result = target.recv(target.socket, iov.len, {
-              nonblocking: false,
+              nonblocking,
             });
             if (!result.ok) return result.error === 'EAGAIN' ? WASI_EAGAIN : WASI_EIO;
             const data = result.data_b64 !== undefined

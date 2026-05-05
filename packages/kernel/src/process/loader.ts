@@ -155,6 +155,7 @@ export async function loadProcess(
     "host_waitpid",
     "host_yield",
     "host_network_fetch",
+    "host_dns_resolve",
     "host_register_tool",
     "host_socket_accept",
     "host_extension_invoke",

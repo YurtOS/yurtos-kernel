@@ -1,0 +1,204 @@
+--- a/library/std/src/sys/process/unsupported.rs
++++ b/library/std/src/sys/process/unsupported.rs
+@@ -1,12 +1,13 @@
+ use super::env::{CommandEnv, CommandEnvs};
+ pub use crate::ffi::OsString as EnvKey;
+-use crate::ffi::{OsStr, OsString};
++use crate::ffi::{c_char, CString, OsStr, OsString};
++use crate::os::wasi::prelude::*;
+ use crate::num::NonZero;
+ use crate::path::Path;
+ use crate::process::StdioPipes;
+ use crate::sys::fs::File;
+ use crate::sys::unsupported;
+-use crate::{fmt, io};
++use crate::{fmt, io, ptr};
+
+ ////////////////////////////////////////////////////////////////////////////////
+ // Command
+@@ -98,7 +99,20 @@
+         _default: Stdio,
+         _needs_stdin: bool,
+     ) -> io::Result<(Process, StdioPipes)> {
+-        unsupported()
++        let program = cstring_from_os(&self.program)?;
++        let args = cstring_vec(&self.args)?;
++        let mut argv: Vec<*mut c_char> =
++            args.iter().map(|arg| arg.as_ptr() as *mut c_char).collect();
++        argv.push(ptr::null_mut());
++
++        let mut pid = 0;
++        let rc = unsafe {
++            posix_spawnp(&mut pid, program.as_ptr(), ptr::null(), ptr::null(), argv.as_ptr(), ptr::null())
++        };
++        if rc != 0 {
++            return Err(io::Error::from_raw_os_error(rc));
++        }
++        Ok((Process { pid, status: None }, StdioPipes { stdin: None, stdout: None, stderr: None }))
+     }
+ }
+
+@@ -196,57 +210,65 @@
+
+ #[derive(PartialEq, Eq, Clone, Copy, Debug, Default)]
+ #[non_exhaustive]
+-pub struct ExitStatus();
++pub struct ExitStatus(i32);
+
+ impl ExitStatus {
+     pub fn exit_ok(&self) -> Result<(), ExitStatusError> {
+-        Ok(())
++        match self.code() {
++            Some(0) => Ok(()),
++            Some(code) => Err(ExitStatusError(nonzero(code))),
++            None => Err(ExitStatusError(nonzero(1))),
++        }
+     }
+
+     pub fn code(&self) -> Option<i32> {
+-        Some(0)
++        if self.0 & 0x7f == 0 {
++            Some((self.0 & 0xff00) >> 8)
++        } else {
++            None
++        }
+     }
+ }
+
+ impl fmt::Display for ExitStatus {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        write!(f, "<dummy exit status>")
++        write!(f, "exit status: {}", self.code().unwrap_or(1))
+     }
+ }
+
+-pub struct ExitStatusError(!);
++pub struct ExitStatusError(NonZero<i32>);
+
+ impl Clone for ExitStatusError {
+     fn clone(&self) -> ExitStatusError {
+-        self.0
++        *self
+     }
+ }
+
+ impl Copy for ExitStatusError {}
+
+ impl PartialEq for ExitStatusError {
+-    fn eq(&self, _other: &ExitStatusError) -> bool {
+-        self.0
++    fn eq(&self, other: &ExitStatusError) -> bool {
++        self.0 == other.0
+     }
+ }
+
+ impl Eq for ExitStatusError {}
+
+ impl fmt::Debug for ExitStatusError {
+-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+-        self.0
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_tuple("ExitStatusError").field(&self.0).finish()
+     }
+ }
+
+ impl Into<ExitStatus> for ExitStatusError {
+     fn into(self) -> ExitStatus {
+-        self.0
++        ExitStatus(self.0.get() << 8)
+     }
+ }
+
+ impl ExitStatusError {
+     pub fn code(self) -> Option<NonZero<i32>> {
+-        self.0
++        Some(self.0)
+     }
+ }
+
+@@ -268,26 +290,80 @@
+     }
+ }
+
+-pub struct Process(!);
++pub struct Process {
++    pid: i32,
++    status: Option<ExitStatus>,
++}
+
+ impl Process {
+     pub fn id(&self) -> u32 {
+-        self.0
++        self.pid as u32
+     }
+
+     pub fn kill(&mut self) -> io::Result<()> {
+-        self.0
++        unsupported()
+     }
+
+     pub fn wait(&mut self) -> io::Result<ExitStatus> {
+-        self.0
++        if let Some(status) = self.status {
++            return Ok(status);
++        }
++        let status = wait_for_pid(self.pid, 0)?.expect("blocking waitpid returned no status");
++        self.status = Some(status);
++        Ok(status)
+     }
+
+     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+-        self.0
++        if let Some(status) = self.status {
++            return Ok(Some(status));
++        }
++        let status = wait_for_pid(self.pid, WNOHANG)?;
++        if let Some(status) = status {
++            self.status = Some(status);
++        }
++        Ok(status)
+     }
+ }
+
++const WNOHANG: i32 = 1;
++
++unsafe extern "C" {
++    fn posix_spawnp(
++        pid: *mut i32,
++        file: *const c_char,
++        file_actions: *const (),
++        attrp: *const (),
++        argv: *const *mut c_char,
++        envp: *const *mut c_char,
++    ) -> i32;
++    fn waitpid(pid: i32, wstatus: *mut i32, options: i32) -> i32;
++}
++
++fn cstring_from_os(value: &OsStr) -> io::Result<CString> {
++    CString::new(value.as_bytes())
++        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "nul byte in process argument"))
++}
++
++fn cstring_vec(values: &[OsString]) -> io::Result<Vec<CString>> {
++    values.iter().map(|value| cstring_from_os(value)).collect()
++}
++
++fn wait_for_pid(pid: i32, options: i32) -> io::Result<Option<ExitStatus>> {
++    let mut status = 0;
++    let rc = unsafe { waitpid(pid, &mut status, options) };
++    if rc < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if rc == 0 {
++        return Ok(None);
++    }
++    Ok(Some(ExitStatus(status)))
++}
++
++fn nonzero(value: i32) -> NonZero<i32> {
++    NonZero::new(value).unwrap_or_else(|| NonZero::new(1).unwrap())
++}
++
+ pub struct CommandArgs<'a> {
+     iter: crate::slice::Iter<'a, OsString>,
+ }

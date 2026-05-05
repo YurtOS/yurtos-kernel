@@ -1,0 +1,46 @@
+--- a/library/std/src/sys/net/connection/wasip1.rs	2026-04-30 21:48:07
++++ b/library/std/src/sys/net/connection/wasip1.rs	2026-04-30 21:48:20
+@@ -104,10 +104,18 @@
+     fn connect(fd: i32, addr: *const YurtSockAddr, addr_len: YurtSockLen) -> i32;
+     fn close(fd: i32) -> i32;
+     fn dup(fd: i32) -> i32;
++    fn getsockname(fd: i32, addr: *mut YurtSockAddr, addr_len: *mut YurtSockLen) -> i32;
+     fn getaddrinfo(node: *const c_char, service: *const c_char, hints: *const YurtAddrInfo, res: *mut *mut YurtAddrInfo) -> c_int;
+     fn freeaddrinfo(res: *mut YurtAddrInfo);
+ }
+
++fn sockaddr_in_to_addr(raw: &YurtSockAddrIn) -> SocketAddr {
++    SocketAddr::from((
++        Ipv4Addr::from(raw.sin_addr.s_addr.to_ne_bytes()),
++        u16::from_be(raw.sin_port),
++    ))
++}
++
+ fn tcp_connect_addr(addr: &SocketAddr) -> io::Result<TcpStream> {
+     let SocketAddr::V4(addr) = addr else {
+         return Err(io::Error::new(
+@@ -215,7 +223,23 @@
+     }
+
+     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
+-        unsupported()
++        let mut raw = YurtSockAddrIn {
++            sin_family: 0,
++            sin_port: 0,
++            sin_addr: YurtInAddr { s_addr: 0 },
++        };
++        let mut len = mem::size_of::<YurtSockAddrIn>() as YurtSockLen;
++        let rc = unsafe {
++            getsockname(
++                self.socket().as_raw_fd() as i32,
++                &mut raw as *mut YurtSockAddrIn as *mut YurtSockAddr,
++                &mut len as *mut YurtSockLen,
++            )
++        };
++        if rc != 0 {
++            return Err(io::Error::last_os_error());
++        }
++        Ok(sockaddr_in_to_addr(&raw))
+     }
+
+     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {

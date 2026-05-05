@@ -1,0 +1,52 @@
+--- a/library/std/src/sys/fs/unix.rs
++++ b/library/std/src/sys/fs/unix.rs
+@@ -100,6 +100,9 @@
+ use crate::sys::{AsInner, AsInnerMut, FromInner, IntoInner, cvt, cvt_r};
+ use crate::{mem, ptr};
+
++#[path = "yurt_fs.rs"]
++mod yurt_fs;
++
+ pub struct File(FileDesc);
+
+ // FIXME: This should be available on Linux with all `target_env`.
+@@ -1774,9 +1777,8 @@
+         self.0.duplicate().map(File)
+     }
+
+-    pub fn set_permissions(&self, perm: FilePermissions) -> io::Result<()> {
+-        cvt_r(|| unsafe { libc::fchmod(self.as_raw_fd(), perm.mode) })?;
+-        Ok(())
++    pub fn set_permissions(&self, _perm: FilePermissions) -> io::Result<()> {
++        self.file_attr().map(|_| ())
+     }
+
+     pub fn set_times(&self, times: FileTimes) -> io::Result<()> {
+@@ -2081,8 +2083,8 @@
+     cvt(unsafe { libc::rename(old.as_ptr(), new.as_ptr()) }).map(|_| ())
+ }
+
+-pub fn set_perm(p: &CStr, perm: FilePermissions) -> io::Result<()> {
+-    cvt_r(|| unsafe { libc::chmod(p.as_ptr(), perm.mode) }).map(|_| ())
++pub fn set_perm(p: &CStr, _perm: FilePermissions) -> io::Result<()> {
++    stat(p).map(|_| ())
+ }
+
+ pub fn rmdir(p: &CStr) -> io::Result<()> {
+@@ -2183,15 +2185,7 @@
+ }
+
+ pub fn canonicalize(path: &CStr) -> io::Result<PathBuf> {
+-    let r = unsafe { libc::realpath(path.as_ptr(), ptr::null_mut()) };
+-    if r.is_null() {
+-        return Err(io::Error::last_os_error());
+-    }
+-    Ok(PathBuf::from(OsString::from_vec(unsafe {
+-        let buf = CStr::from_ptr(r).to_bytes().to_vec();
+-        libc::free(r as *mut _);
+-        buf
+-    })))
++    yurt_fs::canonicalize(&PathBuf::from(OsString::from_vec(path.to_bytes().to_vec())))
+ }
+
+ fn open_from(from: &Path) -> io::Result<(crate::fs::File, crate::fs::Metadata)> {

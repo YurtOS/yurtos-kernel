@@ -312,6 +312,20 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     if (target.type === 'vfs_file' || target.type === 'socket') target.refs++;
   }
 
+  const syntheticDns = new Map<string, string>();
+
+  function syntheticAddressForHost(hostname: string): string {
+    const existing = syntheticDns.get(hostname);
+    if (existing) return existing;
+    let hash = 0;
+    for (let i = 0; i < hostname.length; i++) {
+      hash = (hash * 33 + hostname.charCodeAt(i)) >>> 0;
+    }
+    const addr = `10.0.2.${2 + (hash % 253)}`;
+    syntheticDns.set(hostname, addr);
+    return addr;
+  }
+
   function setFallbackUid(ruid: number, euid: number, suid: number): number {
     const current = new Set([fallbackUid]);
     for (const value of [ruid, euid, suid]) {
@@ -1166,6 +1180,9 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(socketLocalHost));
       }
       const addr = await resolveHostname(hostname);
+      if (!addr && socketBackend) {
+        return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(syntheticAddressForHost(hostname)));
+      }
       if (!addr) return -1;
       return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(addr));
     },

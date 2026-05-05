@@ -1,0 +1,27 @@
+--- a/library/std/src/sys/net/connection/wasip1.rs	2026-04-30 21:30:48
++++ b/library/std/src/sys/net/connection/wasip1.rs	2026-04-30 21:30:58
+@@ -103,6 +103,7 @@
+     fn socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
+     fn connect(fd: i32, addr: *const YurtSockAddr, addr_len: YurtSockLen) -> i32;
+     fn close(fd: i32) -> i32;
++    fn dup(fd: i32) -> i32;
+     fn getaddrinfo(node: *const c_char, service: *const c_char, hints: *const YurtAddrInfo, res: *mut *mut YurtAddrInfo) -> c_int;
+     fn freeaddrinfo(res: *mut YurtAddrInfo);
+ }
+@@ -228,7 +229,15 @@
+     }
+
+     pub fn duplicate(&self) -> io::Result<TcpStream> {
+-        unsupported()
++        let fd = unsafe { dup(self.socket().as_raw_fd() as i32) };
++        if fd < 0 {
++            return Err(io::Error::last_os_error());
++        }
++
++        Ok(TcpStream {
++            inner: unsafe { Socket::from_raw_fd(fd as RawFd) },
++            peer_addr: self.peer_addr,
++        })
+     }
+
+     pub fn set_linger(&self, _: Option<Duration>) -> io::Result<()> {

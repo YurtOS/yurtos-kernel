@@ -1,0 +1,113 @@
+--- a/library/std/src/sys/net/connection/wasip1.rs	2026-04-30 21:23:35
++++ b/library/std/src/sys/net/connection/wasip1.rs	2026-04-30 21:23:57
+@@ -1,10 +1,12 @@
+ #![forbid(unsafe_op_in_unsafe_fn)]
+
++use crate::ffi::{c_char, c_int, CString};
+ use crate::{fmt, mem};
+ use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
+ use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, ToSocketAddrs};
+ use crate::os::wasi::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+ use crate::sys::fd::FileDesc;
++use crate::vec;
+ use crate::sys::{AsInner, FromInner, IntoInner, err2io, unsupported};
+ use crate::time::Duration;
+
+@@ -85,10 +87,24 @@
+     sin_addr: YurtInAddr,
+ }
+
++#[repr(C)]
++struct YurtAddrInfo {
++    ai_flags: c_int,
++    ai_family: c_int,
++    ai_socktype: c_int,
++    ai_protocol: c_int,
++    ai_addrlen: YurtSockLen,
++    ai_addr: *mut YurtSockAddr,
++    ai_canonname: *mut c_char,
++    ai_next: *mut YurtAddrInfo,
++}
++
+ unsafe extern "C" {
+     fn socket(domain: i32, socket_type: i32, protocol: i32) -> i32;
+     fn connect(fd: i32, addr: *const YurtSockAddr, addr_len: YurtSockLen) -> i32;
+     fn close(fd: i32) -> i32;
++    fn getaddrinfo(node: *const c_char, service: *const c_char, hints: *const YurtAddrInfo, res: *mut *mut YurtAddrInfo) -> c_int;
++    fn freeaddrinfo(res: *mut YurtAddrInfo);
+ }
+
+ fn tcp_connect_addr(addr: &SocketAddr) -> io::Result<TcpStream> {
+@@ -552,15 +568,68 @@
+     }
+ }
+
+-pub struct LookupHost(!);
++pub struct LookupHost(vec::IntoIter<SocketAddr>);
+
+ impl Iterator for LookupHost {
+     type Item = SocketAddr;
+     fn next(&mut self) -> Option<SocketAddr> {
+-        self.0
++        self.0.next()
+     }
+ }
+
+-pub fn lookup_host(_host: &str, _port: u16) -> io::Result<LookupHost> {
+-    unsupported()
++pub fn lookup_host(host: &str, port: u16) -> io::Result<LookupHost> {
++    let node = CString::new(host).map_err(|_| {
++        io::Error::new(io::ErrorKind::InvalidInput, "host contains an interior NUL byte")
++    })?;
++    let service = CString::new(port.to_string()).map_err(|_| {
++        io::Error::new(io::ErrorKind::InvalidInput, "service contains an interior NUL byte")
++    })?;
++
++    let hints = YurtAddrInfo {
++        ai_flags: 0,
++        ai_family: YURT_AF_INET,
++        ai_socktype: YURT_SOCK_STREAM,
++        ai_protocol: 0,
++        ai_addrlen: 0,
++        ai_addr: crate::ptr::null_mut(),
++        ai_canonname: crate::ptr::null_mut(),
++        ai_next: crate::ptr::null_mut(),
++    };
++    let mut res: *mut YurtAddrInfo = crate::ptr::null_mut();
++
++    let rc = unsafe {
++        getaddrinfo(
++            node.as_ptr(),
++            service.as_ptr(),
++            &hints as *const YurtAddrInfo,
++            &mut res as *mut *mut YurtAddrInfo,
++        )
++    };
++    if rc != 0 {
++        return Err(io::Error::new(io::ErrorKind::Uncategorized, "host lookup failed"));
++    }
++
++    let mut addrs = vec::Vec::new();
++    let mut cur = res;
++    while !cur.is_null() {
++        let ai = unsafe { &*cur };
++        if ai.ai_family == YURT_AF_INET
++            && !ai.ai_addr.is_null()
++            && (ai.ai_addrlen as usize) >= mem::size_of::<YurtSockAddrIn>()
++        {
++            let raw = unsafe { &*(ai.ai_addr as *const YurtSockAddrIn) };
++            addrs.push(SocketAddr::from((
++                Ipv4Addr::from(raw.sin_addr.s_addr.to_ne_bytes()),
++                u16::from_be(raw.sin_port),
++            )));
++        }
++        cur = ai.ai_next;
++    }
++    unsafe { freeaddrinfo(res) };
++
++    if addrs.is_empty() {
++        return Err(io::Error::NO_ADDRESSES);
++    }
++
++    Ok(LookupHost(addrs.into_iter()))
+ }

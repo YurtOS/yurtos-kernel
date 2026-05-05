@@ -1,0 +1,91 @@
+--- a/library/std/src/sys/process/unsupported.rs
++++ b/library/std/src/sys/process/unsupported.rs
+@@ -379,6 +379,10 @@
+         actions: *mut PosixSpawnFileActions,
+         fd: i32,
+         newfd: i32,
++    ) -> i32;
++    fn posix_spawn_file_actions_addchdir_np(
++        actions: *mut PosixSpawnFileActions,
++        path: *const c_char,
+     ) -> i32;
+ }
+
+@@ -391,17 +395,76 @@
+     let mut argv: Vec<*mut c_char> =
+         args.iter().map(|arg| arg.as_ptr() as *mut c_char).collect();
+     argv.push(ptr::null_mut());
++
++    let env = CommandEnvp::capture(cmd)?;
++    let envp = env.as_ref().map_or(ptr::null(), |env| env.as_ptr());
++
++    let cwd = cmd.cwd.as_ref().map(|cwd| cstring_from_os(cwd)).transpose()?;
++    let mut owned_actions = PosixSpawnFileActions::zeroed();
++    let mut actions_ptr = file_actions as *mut PosixSpawnFileActions;
++    let mut owned_actions_initialized = false;
+
++    if cwd.is_some() && actions_ptr.is_null() {
++        cvt_spawn(unsafe { posix_spawn_file_actions_init(&mut owned_actions) })?;
++        actions_ptr = &mut owned_actions;
++        owned_actions_initialized = true;
++    }
++
++    if let Some(cwd) = &cwd {
++        if let Err(err) = cvt_spawn(unsafe {
++            posix_spawn_file_actions_addchdir_np(actions_ptr, cwd.as_ptr())
++        }) {
++            if owned_actions_initialized {
++                unsafe { posix_spawn_file_actions_destroy(&mut owned_actions); }
++            }
++            return Err(err);
++        }
++    }
++
+     let mut pid = 0;
+     let rc = unsafe {
+-        posix_spawnp(&mut pid, program.as_ptr(), file_actions, ptr::null(), argv.as_ptr(), ptr::null())
++        posix_spawnp(&mut pid, program.as_ptr(), actions_ptr, ptr::null(), argv.as_ptr(), envp)
+     };
++
++    if owned_actions_initialized {
++        unsafe { posix_spawn_file_actions_destroy(&mut owned_actions); }
++    }
++
+     if rc != 0 {
+         return Err(io::Error::from_raw_os_error(rc));
+     }
+     Ok((Process { pid, status: None }, StdioPipes { stdin: None, stdout: None, stderr: None }))
+ }
+
++struct CommandEnvp {
++    _entries: Vec<CString>,
++    ptrs: Vec<*mut c_char>,
++}
++
++impl CommandEnvp {
++    fn capture(cmd: &Command) -> io::Result<Option<Self>> {
++    let Some(captured) = cmd.env.capture_if_changed() else {
++        return Ok(None);
++    };
++
++    let mut entries = Vec::new();
++    for (mut key, value) in captured {
++        key.push("=");
++        key.push(&value);
++        entries.push(cstring_from_os(&key)?);
++    }
++
++    let mut envp: Vec<*mut c_char> =
++        entries.iter().map(|entry| entry.as_ptr() as *mut c_char).collect();
++    envp.push(ptr::null_mut());
++    Ok(Some(Self { _entries: entries, ptrs: envp }))
++    }
++
++    fn as_ptr(&self) -> *const *mut c_char {
++        self.ptrs.as_ptr()
++    }
++}
++
+ fn create_pipe() -> io::Result<[i32; 2]> {
+     let mut fds = [0, 0];
+     let rc = unsafe { pipe(fds.as_mut_ptr()) };
