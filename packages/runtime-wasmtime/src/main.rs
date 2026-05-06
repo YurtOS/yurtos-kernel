@@ -54,7 +54,8 @@ async fn main() -> anyhow::Result<()> {
         // Check if this is a callback response (id is a string starting with "cb_"
         // and no "method" key): route to cb_tx and skip normal dispatch.
         if let Ok(raw) = serde_json::from_str::<serde_json::Value>(&line) {
-            let is_cb = raw.get("id")
+            let is_cb = raw
+                .get("id")
                 .and_then(|v| v.as_str())
                 .map(|s| s.starts_with("cb_"))
                 .unwrap_or(false)

@@ -746,6 +746,24 @@ Deno.test("root process can change effective credentials for future authorizatio
   assertEquals(vfs.stat("/tmp/root-owned.txt").permissions, 0o644);
 });
 
+Deno.test("host_chmod resolves relative paths against caller cwd", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.mkdir("/tmp/work");
+  vfs.writeFile("/tmp/work/script.sh", new Uint8Array(0));
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  kernel.setCwd(pid, "/tmp/work");
+  const imports = createKernelImports({ memory, vfs, kernel, callerPid: pid });
+
+  const pathLen = writeString(memory, 0, "script.sh");
+  assertEquals(
+    (imports.host_chmod as (...args: number[]) => number)(0, pathLen, 0o755),
+    0,
+  );
+  assertEquals(vfs.stat("/tmp/work/script.sh").permissions, 0o755);
+});
+
 Deno.test("host_umask stores process-local mask inherited by children", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const kernel = new ProcessKernel();
@@ -1038,6 +1056,61 @@ Deno.test("host scheduler policy applies through an explicit scheduler backend",
   ]);
 });
 
+Deno.test("host scheduler affinity reports single CPU and validates target pid", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "worker");
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+  const view = new DataView(memory.buffer);
+
+  assertEquals(
+    (imports.host_sched_getaffinity as (...args: number[]) => number)(
+      0,
+      128,
+      8,
+    ),
+    0,
+  );
+  assertEquals(view.getBigUint64(128, true), 1n);
+
+  assertEquals(
+    (imports.host_sched_getaffinity as (...args: number[]) => number)(
+      999,
+      128,
+      8,
+    ),
+    -1,
+  );
+});
+
+Deno.test("host scheduler affinity accepts only CPU 0 in the single-CPU ABI", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "worker");
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+  const view = new DataView(memory.buffer);
+
+  view.setBigUint64(128, 1n, true);
+  assertEquals(
+    (imports.host_sched_setaffinity as (...args: number[]) => number)(
+      0,
+      128,
+      8,
+    ),
+    0,
+  );
+
+  view.setBigUint64(128, 2n, true);
+  assertEquals(
+    (imports.host_sched_setaffinity as (...args: number[]) => number)(
+      0,
+      128,
+      8,
+    ),
+    -22,
+  );
+});
+
 Deno.test("host rlimit stores process-local limits inherited by children", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const view = new DataView(memory.buffer);
@@ -1170,6 +1243,73 @@ Deno.test("host_dup2 does not duplicate refcounts twice when WasiHost uses the k
   assertEquals(oldTarget.refs, 0);
   assertEquals(fdTable.isOpen(oldFd), false);
   assertEquals(kernel.getFdTarget(pid, 2), srcTarget);
+});
+
+Deno.test("host_dup_min mirrors F_DUPFD into the active WasiHost file table", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS();
+  vfs.writeFile("/tmp/script.sh", new TextEncoder().encode("echo ok\n"));
+  const wasiHost = new WasiHost({
+    vfs,
+    args: [],
+    env: {},
+    preopens: {},
+  });
+  const fdTable = (wasiHost as unknown as { fdTable: FdTable }).fdTable;
+  const fd = fdTable.open("/tmp/script.sh", "r");
+  const imports = createKernelImports({ memory, wasiHost });
+
+  assertEquals((imports.host_dup_min as (...args: number[]) => number)(fd, 10), 10);
+  assertEquals(fdTable.isOpen(10), true);
+  fdTable.close(fd);
+  assertEquals(fdTable.isOpen(10), true);
+});
+
+Deno.test("host_dup_min keeps the kernel and WasiHost fd tables in sync", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS();
+  const fdTable = new FdTable(vfs);
+  const kernel = new ProcessKernel();
+  const pid = 1;
+  vfs.writeFile("/tmp/script.sh", new TextEncoder().encode("echo ok\n"));
+  const fd = fdTable.open("/tmp/script.sh", "r");
+  const srcTarget = createVfsFileTarget(fdTable, fd);
+  kernel.setFdTarget(pid, fd, srcTarget);
+  const wasiHost = new WasiHost({
+    vfs,
+    args: [],
+    env: {},
+    preopens: {},
+    ioFds: kernel.getFdTable(pid),
+    kernel,
+    pid,
+  });
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    wasiHost,
+  });
+
+  assertEquals((imports.host_dup_min as (...args: number[]) => number)(fd, 10), 10);
+  assertEquals(kernel.getFdTarget(pid, 10)?.type, "vfs_file");
+  assertEquals(fdTable.isOpen(10), true);
+  assertEquals(srcTarget.refs, 1);
+  assertEquals(kernel.closeFd(pid, fd), true);
+  assertEquals(fdTable.isOpen(10), true);
+});
+
+Deno.test("kernel /proc fd listing includes close-on-exec descriptors", () => {
+  const vfs = new VFS();
+  const fdTable = new FdTable(vfs);
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "ash");
+  vfs.writeFile("/tmp/script.sh", new TextEncoder().encode("echo ok\n"));
+  const fd = fdTable.open("/tmp/script.sh", "r");
+  kernel.setFdTarget(pid, fd, createVfsFileTarget(fdTable, fd));
+  kernel.setFdDescriptorFlags(pid, fd, 1);
+
+  assertEquals(kernel.listProcesses().find((proc) => proc.pid === pid)?.fds.includes(fd), true);
 });
 
 Deno.test("host_spawn rejects nonzero nice when the engine has no scheduler backend", () => {

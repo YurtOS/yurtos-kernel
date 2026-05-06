@@ -31,6 +31,7 @@ YURT_DEFINE_MARKER(dup3, 0x64757033u) /* "dup3" */
 YURT_DEFINE_MARKER(fcntl, 0x66636e74u) /* "fcnt" */
 
 static int yurt_fd_status_flags[65536];
+static int yurt_fd_descriptor_flags[65536];
 
 static int yurt_fd_get_status_flags(int fd) {
   if (fd < 0 || fd >= (int)(sizeof(yurt_fd_status_flags) / sizeof(yurt_fd_status_flags[0]))) {
@@ -44,6 +45,30 @@ static void yurt_fd_set_status_flags(int fd, int flags) {
     return;
   }
   yurt_fd_status_flags[fd] = flags;
+}
+
+static int yurt_fd_get_descriptor_flags(int fd) {
+  if (fd < 0 || fd >= (int)(sizeof(yurt_fd_descriptor_flags) / sizeof(yurt_fd_descriptor_flags[0]))) {
+    return 0;
+  }
+  return yurt_fd_descriptor_flags[fd];
+}
+
+static void yurt_fd_set_descriptor_flags(int fd, int flags) {
+  if (fd < 0 || fd >= (int)(sizeof(yurt_fd_descriptor_flags) / sizeof(yurt_fd_descriptor_flags[0]))) {
+    return;
+  }
+  yurt_fd_descriptor_flags[fd] = flags;
+}
+
+static int yurt_fd_apply_descriptor_flags(int fd, int flags) {
+  flags &= FD_CLOEXEC;
+  if (yurt_host_set_fd_descriptor_flags(fd, flags) != 0) {
+    errno = EBADF;
+    return -1;
+  }
+  yurt_fd_set_descriptor_flags(fd, flags);
+  return 0;
 }
 
 int dup(int oldfd) {
@@ -100,9 +125,12 @@ int dup3(int oldfd, int newfd, int flags) {
     errno = EINVAL;
     return -1;
   }
-  /* O_CLOEXEC is a no-op in yurt (no exec()), so we drop the flag
-   * and forward to dup2 — same renumber semantics. */
-  return dup2(oldfd, newfd);
+  int rc = dup2(oldfd, newfd);
+  if (rc < 0) return rc;
+  if ((flags & O_CLOEXEC) != 0 && yurt_fd_apply_descriptor_flags(newfd, FD_CLOEXEC) != 0) {
+    return -1;
+  }
+  return rc;
 }
 
 static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
@@ -120,25 +148,17 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
         return -1;
       }
 
-      int new_fd = dup(fd);
-      if (new_fd < 0) return -1;
-      if (new_fd >= min_fd) return new_fd;
-
-      int saved[64];
-      size_t saved_count = 0;
-      while (new_fd >= 0 && new_fd < min_fd) {
-        if (saved_count >= sizeof(saved) / sizeof(saved[0])) {
-          close(new_fd);
-          for (size_t i = 0; i < saved_count; ++i) close(saved[i]);
-          errno = EMFILE;
-          return -1;
-        }
-        saved[saved_count++] = new_fd;
-        new_fd = dup(fd);
+      int new_fd = yurt_host_dup_min(fd, min_fd);
+      if (new_fd < 0) {
+        errno = EBADF;
+        return -1;
       }
-      int saved_errno = errno;
-      for (size_t i = 0; i < saved_count; ++i) close(saved[i]);
-      if (new_fd < 0) errno = saved_errno;
+#ifdef F_DUPFD_CLOEXEC
+      if (cmd == F_DUPFD_CLOEXEC && yurt_fd_apply_descriptor_flags(new_fd, FD_CLOEXEC) != 0) {
+        close(new_fd);
+        return -1;
+      }
+#endif
       return new_fd;
     }
 
@@ -147,15 +167,19 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
         errno = EBADF;
         return -1;
       }
-      return 0;
+      return yurt_fd_get_descriptor_flags(fd);
 
-    case F_SETFD:
-      (void)va_arg(ap, int);
+    case F_SETFD: {
+      int flags = va_arg(ap, int);
       if (fd < 0) {
         errno = EBADF;
         return -1;
       }
+      if (yurt_fd_apply_descriptor_flags(fd, flags) != 0) {
+        return -1;
+      }
       return 0;
+    }
 
     case F_GETFL: {
       __wasi_fdstat_t st;

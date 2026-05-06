@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "yurt_markers.h"
+#include "yurt_runtime.h"
 
 YURT_DECLARE_MARKER(signal);
 YURT_DECLARE_MARKER(sigaction);
@@ -40,6 +41,8 @@ static unsigned long long yurt_signal_mask = 0;
 
 static int yurt_signal_validate(int sig);
 static int yurt_sigset_mask_bit(int sig, sigset_t *bit);
+static int yurt_signal_default_terminates(int sig);
+__attribute__((weak)) int yurt_forward_signal_to_exec_child(int sig);
 
 static int yurt_signal_bit(int sig, unsigned long long *bit) {
   if (yurt_signal_validate(sig) != 0) {
@@ -84,6 +87,35 @@ static int yurt_signal_validate(int sig) {
     return -1;
   }
   return 0;
+}
+
+static int yurt_signal_default_terminates(int sig) {
+  switch (sig) {
+    case SIGHUP:
+    case SIGINT:
+    case SIGQUIT:
+    case SIGILL:
+    case SIGTRAP:
+    case SIGABRT:
+    case SIGBUS:
+    case SIGFPE:
+    case SIGKILL:
+    case SIGUSR1:
+    case SIGSEGV:
+    case SIGUSR2:
+    case SIGPIPE:
+    case SIGALRM:
+    case SIGTERM:
+    case SIGXCPU:
+    case SIGXFSZ:
+    case SIGVTALRM:
+    case SIGIO:
+    case SIGPWR:
+    case SIGSYS:
+      return 1;
+    default:
+      return 0;
+  }
 }
 
 int sigemptyset(sigset_t *set) {
@@ -216,8 +248,16 @@ int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset
 }
 
 int sigsuspend(const sigset_t *mask) {
+  unsigned long long old_mask;
   YURT_MARKER_CALL(sigsuspend);
-  (void)mask;
+
+  yurt_signal_init();
+  old_mask = yurt_signal_mask;
+  if (mask) {
+    yurt_signal_mask = (unsigned long long)(*mask);
+  }
+  yurt_host_yield();
+  yurt_signal_mask = old_mask;
   errno = EINTR;
   return -1;
 }
@@ -245,6 +285,11 @@ int raise(int sig) {
     return 0;
   }
 
+  if (yurt_forward_signal_to_exec_child &&
+      yurt_forward_signal_to_exec_child(sig)) {
+    return 0;
+  }
+
   handler = yurt_signal_actions[sig].sa_handler;
 
   if (handler == SIG_IGN) {
@@ -255,7 +300,7 @@ int raise(int sig) {
     return 0;
   }
 
-  if (sig == SIGINT || sig == SIGTERM || sig == SIGALRM) {
+  if (yurt_signal_default_terminates(sig)) {
     _Exit(128 + sig);
   }
 

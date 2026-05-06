@@ -161,7 +161,10 @@ impl MemVfs {
             Inode::Dir { children, .. } => {
                 let mut entries: Vec<DirEntry> = children
                     .iter()
-                    .map(|(n, i)| DirEntry { name: n.clone(), is_dir: i.is_dir() })
+                    .map(|(n, i)| DirEntry {
+                        name: n.clone(),
+                        is_dir: i.is_dir(),
+                    })
                     .collect();
                 entries.sort_by(|a, b| a.name.cmp(&b.name));
                 Ok(entries)
@@ -213,7 +216,9 @@ impl MemVfs {
 
     pub fn glob_paths(&self, pattern: &str) -> Vec<String> {
         let mut out = Vec::new();
-        glob_walk(&self.root, "/", pattern, &mut out, |p| self.virtual_readdir(p));
+        glob_walk(&self.root, "/", pattern, &mut out, |p| {
+            self.virtual_readdir(p)
+        });
         out.sort();
         out
     }
@@ -239,7 +244,11 @@ impl MemVfs {
     pub fn cow_clone(&self) -> Self {
         Self {
             root: deep_clone(&self.root),
-            snapshots: self.snapshots.iter().map(|(k, v)| (k.clone(), deep_clone(v))).collect(),
+            snapshots: self
+                .snapshots
+                .iter()
+                .map(|(k, v)| (k.clone(), deep_clone(v)))
+                .collect(),
             next_snap_id: self.next_snap_id,
             total_bytes: self.total_bytes,
             fs_limit_bytes: self.fs_limit_bytes,
@@ -290,27 +299,38 @@ impl MemVfs {
 
     // ── Stats ────────────────────────────────────────────────────────────────
 
-    pub fn total_bytes(&self) -> usize { self.total_bytes }
-    pub fn fs_limit_bytes(&self) -> Option<usize> { self.fs_limit_bytes }
-    pub fn file_count(&self) -> usize { self.file_count }
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+    pub fn fs_limit_bytes(&self) -> Option<usize> {
+        self.fs_limit_bytes
+    }
+    pub fn file_count(&self) -> usize {
+        self.file_count
+    }
 
     // ── Virtual providers (/dev, /proc) ──────────────────────────────────────
 
     fn virtual_stat(&self, path: &str) -> Option<StatResult> {
         let now = now_ms();
         let stat = |is_dir: bool, size: usize| StatResult {
-            is_file: !is_dir, is_dir, is_symlink: false,
-            size, permissions: if is_dir { 0o555 } else { 0o444 },
-            mtime: now, ctime: now, atime: now,
+            is_file: !is_dir,
+            is_dir,
+            is_symlink: false,
+            size,
+            permissions: if is_dir { 0o555 } else { 0o444 },
+            mtime: now,
+            ctime: now,
+            atime: now,
         };
         match path {
             "/dev" | "/proc" => Some(stat(true, 0)),
-            p if p.starts_with("/dev/") => {
-                DEV_DEVICES.contains(&&p[5..]).then(|| stat(false, 0))
-            }
+            p if p.starts_with("/dev/") => DEV_DEVICES.contains(&&p[5..]).then(|| stat(false, 0)),
             p if p.starts_with("/proc/") => {
                 let name = &p[6..];
-                PROC_FILES.contains(&name).then(|| stat(false, self.proc_bytes(name).len()))
+                PROC_FILES
+                    .contains(&name)
+                    .then(|| stat(false, self.proc_bytes(name).len()))
             }
             _ => None,
         }
@@ -334,8 +354,24 @@ impl MemVfs {
 
     fn virtual_readdir(&self, path: &str) -> Option<Vec<DirEntry>> {
         match path {
-            "/dev" => Some(DEV_DEVICES.iter().map(|&n| DirEntry { name: n.to_owned(), is_dir: false }).collect()),
-            "/proc" => Some(PROC_FILES.iter().map(|&n| DirEntry { name: n.to_owned(), is_dir: false }).collect()),
+            "/dev" => Some(
+                DEV_DEVICES
+                    .iter()
+                    .map(|&n| DirEntry {
+                        name: n.to_owned(),
+                        is_dir: false,
+                    })
+                    .collect(),
+            ),
+            "/proc" => Some(
+                PROC_FILES
+                    .iter()
+                    .map(|&n| DirEntry {
+                        name: n.to_owned(),
+                        is_dir: false,
+                    })
+                    .collect(),
+            ),
             _ => None,
         }
     }
@@ -343,17 +379,22 @@ impl MemVfs {
     fn proc_bytes(&self, name: &str) -> Vec<u8> {
         let up = self.started_at.elapsed().as_secs_f64();
         match name {
-            "uptime"   => format!("{up:.2} {:.2}\n", up * 0.9).into_bytes(),
-            "version"  => b"Yurt 1.0.0 (WASI sandbox)\n".to_vec(),
-            "cpuinfo"  => b"processor\t: 0\nmodel name\t: Yurt virtual CPU\ncpu MHz\t\t: 1000.000\n".to_vec(),
-            "meminfo"  => b"MemTotal:       2097152 kB\nMemFree:        1048576 kB\n".to_vec(),
-            "diskstats" => format!(
+            "uptime" => format!("{up:.2} {:.2}\n", up * 0.9).into_bytes(),
+            "version" => b"Yurt 1.0.0 (WASI sandbox)\n".to_vec(),
+            "cpuinfo" => {
+                b"processor\t: 0\nmodel name\t: Yurt virtual CPU\ncpu MHz\t\t: 1000.000\n".to_vec()
+            }
+            "meminfo" => b"MemTotal:       2097152 kB\nMemFree:        1048576 kB\n".to_vec(),
+            "diskstats" => {
+                format!(
                 "{{\"totalBytes\":{},\"limitBytes\":{},\"fileCount\":{},\"fileCountLimit\":{}}}\n",
                 self.total_bytes,
                 self.fs_limit_bytes.map_or("null".to_owned(), |n| n.to_string()),
                 self.file_count,
                 self.file_count_limit.map_or("null".to_owned(), |n| n.to_string()),
-            ).into_bytes(),
+            )
+                .into_bytes()
+            }
             _ => vec![],
         }
     }
@@ -456,7 +497,9 @@ fn rename_node(root: &mut Inode, from: &str, to: &str) -> VfsResult<()> {
         split_path(from).ok_or_else(|| VfsError::NotFound(from.to_owned()))?;
     let node = {
         let parent = navigate_dir_mut(root, &from_parts)?;
-        parent.remove(from_name).ok_or_else(|| VfsError::NotFound(from.to_owned()))?
+        parent
+            .remove(from_name)
+            .ok_or_else(|| VfsError::NotFound(from.to_owned()))?
     };
     let (to_parts, to_name) =
         split_path(to).ok_or_else(|| VfsError::Invalid("cannot rename to root".to_owned()))?;
@@ -514,12 +557,7 @@ fn navigate_dir_mut<'a>(
 }
 
 /// Resolve a path to an inode, following symlinks when `follow` is true.
-fn resolve<'a>(
-    root: &'a Inode,
-    path: &str,
-    follow: bool,
-    depth: usize,
-) -> VfsResult<&'a Inode> {
+fn resolve<'a>(root: &'a Inode, path: &str, follow: bool, depth: usize) -> VfsResult<&'a Inode> {
     if depth > MAX_SYMLINK_DEPTH {
         return Err(VfsError::SymlinkLoop);
     }
@@ -559,14 +597,20 @@ fn glob_walk<F>(
     let children: Vec<(String, bool)> = if let Some(virt) = virtual_readdir(dir_path) {
         virt.into_iter().map(|e| (e.name, e.is_dir)).collect()
     } else if let Inode::Dir { children, .. } = node {
-        children.iter().map(|(n, i)| (n.clone(), i.is_dir())).collect()
+        children
+            .iter()
+            .map(|(n, i)| (n.clone(), i.is_dir()))
+            .collect()
     } else {
         return;
     };
 
     for (name, is_dir) in children {
-        let child_path =
-            if dir_path == "/" { format!("/{name}") } else { format!("{dir_path}/{name}") };
+        let child_path = if dir_path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{dir_path}/{name}")
+        };
         if glob::glob_match(pattern, &child_path) {
             out.push(child_path.clone());
         }
@@ -584,16 +628,21 @@ fn glob_walk<F>(
 
 pub fn deep_clone(node: &Inode) -> Inode {
     match node {
-        Inode::File { meta, content } => {
-            Inode::File { meta: meta.clone(), content: Arc::clone(content) }
-        }
+        Inode::File { meta, content } => Inode::File {
+            meta: meta.clone(),
+            content: Arc::clone(content),
+        },
         Inode::Dir { meta, children } => Inode::Dir {
             meta: meta.clone(),
-            children: children.iter().map(|(k, v)| (k.clone(), deep_clone(v))).collect(),
+            children: children
+                .iter()
+                .map(|(k, v)| (k.clone(), deep_clone(v)))
+                .collect(),
         },
-        Inode::Symlink { meta, target } => {
-            Inode::Symlink { meta: meta.clone(), target: target.clone() }
-        }
+        Inode::Symlink { meta, target } => Inode::Symlink {
+            meta: meta.clone(),
+            target: target.clone(),
+        },
     }
 }
 
@@ -617,12 +666,10 @@ fn count_subtree(node: &Inode) -> (usize, usize) {
     match node {
         Inode::File { content, .. } => (content.len(), 1),
         Inode::Symlink { .. } => (0, 1),
-        Inode::Dir { children, .. } => {
-            children.values().fold((0, 1), |(b, c), child| {
-                let (cb, cc) = count_subtree(child);
-                (b + cb, c + cc)
-            })
-        }
+        Inode::Dir { children, .. } => children.values().fold((0, 1), |(b, c), child| {
+            let (cb, cc) = count_subtree(child);
+            (b + cb, c + cc)
+        }),
     }
 }
 
@@ -649,7 +696,9 @@ fn pseudo_random(len: usize) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    fn vfs() -> MemVfs { MemVfs::new(None, None) }
+    fn vfs() -> MemVfs {
+        MemVfs::new(None, None)
+    }
 
     #[test]
     fn default_layout_exists() {

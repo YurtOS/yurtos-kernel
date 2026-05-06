@@ -30,9 +30,9 @@ typedef struct {
 typedef __yurt_jmp_buf_t jmp_buf[1];
 typedef __yurt_jmp_buf_t sigjmp_buf[1];
 
-extern int setjmp(jmp_buf env);
-extern int _setjmp(jmp_buf env);
-extern int sigsetjmp(sigjmp_buf env, int savesigs);
+extern int setjmp(jmp_buf env) __attribute__((returns_twice));
+extern int _setjmp(jmp_buf env) __attribute__((returns_twice));
+extern int sigsetjmp(sigjmp_buf env, int savesigs) __attribute__((returns_twice));
 
 extern void longjmp(jmp_buf env, int val) __attribute__((noreturn));
 extern void _longjmp(jmp_buf env, int val) __attribute__((noreturn));

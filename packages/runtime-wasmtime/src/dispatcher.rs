@@ -211,8 +211,7 @@ impl Dispatcher {
                                 let _ = sandbox.shell.vfs_mut().mkdirp(&parent_str);
                             }
                         }
-                        if let Err(e) =
-                            sandbox.shell.vfs_mut().write_file(&full_path, &data, false)
+                        if let Err(e) = sandbox.shell.vfs_mut().write_file(&full_path, &data, false)
                         {
                             return Response::err(
                                 id,
@@ -276,12 +275,20 @@ impl Dispatcher {
 
     // ── run + env ─────────────────────────────────────────────────────────────
 
-    async fn handle_run(&mut self, id: Option<RequestId>, params: &Value, sid: Option<&str>) -> Response {
+    async fn handle_run(
+        &mut self,
+        id: Option<RequestId>,
+        params: &Value,
+        sid: Option<&str>,
+    ) -> Response {
         let cmd = match require_str(&id, params, "command") {
             Ok(c) => c.to_owned(),
             Err(r) => return r,
         };
-        let stream = params.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+        let stream = params
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let sb = match self.manager.resolve(sid) {
             Ok(s) => s,
             Err(e) => return Response::err(id, codes::INVALID_PARAMS, e.to_string()),
@@ -305,7 +312,8 @@ impl Dispatcher {
                                     "stream": "stdout",
                                     "data": stdout,
                                 }
-                            })).unwrap_or_default();
+                            }))
+                            .unwrap_or_default();
                             let _ = self.stdout_tx.send(notif).await;
                         }
                         if !stderr.is_empty() {
@@ -317,15 +325,19 @@ impl Dispatcher {
                                     "stream": "stderr",
                                     "data": stderr,
                                 }
-                            })).unwrap_or_default();
+                            }))
+                            .unwrap_or_default();
                             let _ = self.stdout_tx.send(notif).await;
                         }
-                        return Response::ok(id, json!({
-                            "exitCode": result["exitCode"],
-                            "stdout": "",
-                            "stderr": "",
-                            "executionTimeMs": result["executionTimeMs"],
-                        }));
+                        return Response::ok(
+                            id,
+                            json!({
+                                "exitCode": result["exitCode"],
+                                "stdout": "",
+                                "stderr": "",
+                                "executionTimeMs": result["executionTimeMs"],
+                            }),
+                        );
                     }
                 }
                 Response::ok(id, result)
@@ -436,8 +448,9 @@ impl Dispatcher {
             Err(e) => return Response::err(id, codes::INVALID_PARAMS, e.to_string()),
         };
         // Ensure parent directory exists.
-        if let Some(parent) =
-            std::path::Path::new(&path).parent().and_then(|p| p.to_str())
+        if let Some(parent) = std::path::Path::new(&path)
+            .parent()
+            .and_then(|p| p.to_str())
         {
             if !parent.is_empty() && parent != "/" {
                 let _ = sb.shell.vfs_mut().mkdirp(parent);
@@ -468,10 +481,8 @@ impl Dispatcher {
                 let enriched: Vec<_> = entries
                     .iter()
                     .map(|e| {
-                        let full =
-                            format!("{}/{}", path.trim_end_matches('/'), e.name);
-                        let size =
-                            sb.shell.vfs().stat(&full).map(|s| s.size).unwrap_or(0);
+                        let full = format!("{}/{}", path.trim_end_matches('/'), e.name);
+                        let size = sb.shell.vfs().stat(&full).map(|s| s.size).unwrap_or(0);
                         let kind = if e.is_dir { "dir" } else { "file" };
                         json!({"name": e.name, "type": kind, "size": size})
                     })
@@ -680,11 +691,7 @@ impl Dispatcher {
         Response::ok(id, json!({"ok": true}))
     }
 
-    async fn handle_sandbox_create(
-        &mut self,
-        id: Option<RequestId>,
-        params: &Value,
-    ) -> Response {
+    async fn handle_sandbox_create(&mut self, id: Option<RequestId>, params: &Value) -> Response {
         if self.manager.named.len() >= 64 {
             return Response::err(id, codes::INVALID_PARAMS, "max sandboxes reached");
         }
@@ -702,10 +709,11 @@ impl Dispatcher {
             .unwrap_or(0);
         let timeout_ms = params.get("timeoutMs").and_then(|v| v.as_u64());
         let vfs = crate::vfs::MemVfs::new(None, None);
-        let shell = match crate::wasm::ShellInstance::new(&engine, &wasm_bytes, vfs, &[], nice).await {
-            Ok(s) => s,
-            Err(e) => return Response::err(id, codes::INTERNAL_ERROR, e.to_string()),
-        };
+        let shell =
+            match crate::wasm::ShellInstance::new(&engine, &wasm_bytes, vfs, &[], nice).await {
+                Ok(s) => s,
+                Err(e) => return Response::err(id, codes::INTERNAL_ERROR, e.to_string()),
+            };
         let sb = crate::sandbox::SandboxState {
             engine,
             wasm_bytes,
@@ -724,7 +732,10 @@ impl Dispatcher {
     }
 
     fn handle_sandbox_list(&self, id: Option<RequestId>) -> Response {
-        let entries: Vec<_> = self.manager.named.keys()
+        let entries: Vec<_> = self
+            .manager
+            .named
+            .keys()
             .map(|sid| json!({"sandboxId": sid}))
             .collect();
         Response::ok(id, json!(entries))
@@ -929,7 +940,10 @@ impl Dispatcher {
         let _ = sb.shell.vfs_mut().mkdirp(&path);
         for (rel, bytes) in &files_vec {
             let full = format!("{}/{}", path.trim_end_matches('/'), rel);
-            if let Some(parent) = std::path::Path::new(&full).parent().and_then(|p| p.to_str()) {
+            if let Some(parent) = std::path::Path::new(&full)
+                .parent()
+                .and_then(|p| p.to_str())
+            {
                 if !parent.is_empty() && parent != "/" {
                     let _ = sb.shell.vfs_mut().mkdirp(parent);
                 }

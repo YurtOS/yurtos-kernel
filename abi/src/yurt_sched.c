@@ -32,7 +32,6 @@ static int yurt_sched_validate_size(size_t cpusetsize) {
 
 int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask) {
   YURT_MARKER_CALL(sched_getaffinity);
-  (void)pid;
 
   if (!mask) {
     errno = EINVAL;
@@ -42,18 +41,16 @@ int sched_getaffinity(pid_t pid, size_t cpusetsize, cpu_set_t *mask) {
     return -1;
   }
 
-  memset(mask, 0, cpusetsize);
-  CPU_SET(0, mask);
+  int rc = yurt_host_sched_getaffinity((int)pid, mask, cpusetsize);
+  if (rc < 0) {
+    errno = (rc == -22) ? EINVAL : (rc == -1) ? ESRCH : ENOSYS;
+    return -1;
+  }
   return 0;
 }
 
 int sched_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *mask) {
   YURT_MARKER_CALL(sched_setaffinity);
-  const unsigned char *bytes;
-  size_t i;
-  unsigned long first_word;
-
-  (void)pid;
 
   if (!mask) {
     errno = EINVAL;
@@ -63,20 +60,11 @@ int sched_setaffinity(pid_t pid, size_t cpusetsize, const cpu_set_t *mask) {
     return -1;
   }
 
-  first_word = mask->__bits[0];
-  if (first_word != 1ul) {
-    errno = EINVAL;
+  int rc = yurt_host_sched_setaffinity((int)pid, mask, cpusetsize);
+  if (rc < 0) {
+    errno = (rc == -22) ? EINVAL : (rc == -1) ? ESRCH : ENOSYS;
     return -1;
   }
-
-  bytes = (const unsigned char *)mask;
-  for (i = sizeof(unsigned long); i < cpusetsize; ++i) {
-    if (bytes[i] != 0) {
-      errno = EINVAL;
-      return -1;
-    }
-  }
-
   return 0;
 }
 

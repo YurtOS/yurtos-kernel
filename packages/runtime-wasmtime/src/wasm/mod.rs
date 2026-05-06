@@ -12,6 +12,7 @@
 //! The `yurt` namespace provides filesystem operations backed by [`MemVfs`]
 //! and stubs for process/network operations (implemented in Phases 4–6).
 
+pub mod command;
 mod instance;
 pub mod kernel;
 pub mod network;
@@ -21,15 +22,16 @@ pub mod spawn;
 pub use instance::ShellInstance;
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use bytes::Bytes;
 use serde_json::json;
-use wasmtime::{Caller, Config, Engine, Linker};
-use wasmtime_wasi::{async_trait, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
-use wasmtime_wasi::{HostOutputStream, StreamError, StdoutStream, Subscribe};
+use wasmtime::{Caller, Config, Engine, Linker, Store};
 use wasmtime_wasi::preview1::WasiP1Ctx;
+use wasmtime_wasi::{async_trait, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{HostOutputStream, StdoutStream, StreamError, Subscribe};
 
 use kernel::{ChildState, ProcessKernel};
 use spawn::{SpawnContext, SpawnRequest};
@@ -50,7 +52,9 @@ pub struct DrainablePipe {
 
 impl DrainablePipe {
     pub fn new() -> Self {
-        Self { buf: Arc::new(Mutex::new(Vec::new())) }
+        Self {
+            buf: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     /// Return and clear all bytes written since the last `take()` call.
@@ -151,7 +155,9 @@ impl StoreData {
         let stderr_pipe = DrainablePipe::new();
 
         let mut builder = WasiCtxBuilder::new();
-        builder.stdin(wasmtime_wasi::pipe::MemoryInputPipe::new(Bytes::copy_from_slice(stdin)));
+        builder.stdin(wasmtime_wasi::pipe::MemoryInputPipe::new(
+            Bytes::copy_from_slice(stdin),
+        ));
         builder.stdout(stdout_pipe.clone());
         builder.stderr(stderr_pipe.clone());
         for (k, v) in env {
@@ -183,8 +189,9 @@ impl StoreData {
 pub struct WasmEngine {
     pub engine: Arc<Engine>,
     pub linker: Arc<Linker<StoreData>>,
-    /// Background epoch ticker task. Aborted when this WasmEngine is dropped.
-    ticker: tokio::task::JoinHandle<()>,
+    /// Background epoch ticker thread. Stopped when this WasmEngine is dropped.
+    ticker_stop: Arc<AtomicBool>,
+    ticker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WasmEngine {
@@ -199,21 +206,33 @@ impl WasmEngine {
         let engine = Engine::new(&config)?;
 
         // Ticker: increment epoch every 1ms so epoch-based yields and limits work.
+        //
+        // This is intentionally an OS thread, not a Tokio task. A CPU-bound
+        // Wasm poll can monopolize a current-thread executor until an epoch
+        // interrupt fires; the ticker must keep advancing independently.
         let ticker_engine = engine.clone();
-        let ticker = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(1));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                ticker_engine.increment_epoch();
-            }
-        });
+        let ticker_stop = Arc::new(AtomicBool::new(false));
+        let ticker_stop_thread = ticker_stop.clone();
+        let ticker = std::thread::Builder::new()
+            .name("yurt-wasmtime-epoch".to_owned())
+            .spawn(move || {
+                while !ticker_stop_thread.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    if ticker_stop_thread.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    ticker_engine.increment_epoch();
+                }
+            })
+            .context("starting Wasmtime epoch ticker")?;
 
         let mut linker: Linker<StoreData> = Linker::new(&engine);
 
         // Add all ~40 WASI preview1 functions (fd_read, fd_write, path_open, …)
-        wasmtime_wasi::preview1::add_to_linker_async(&mut linker, |data: &mut StoreData| &mut data.p1_ctx)
-            .context("adding WASI preview1 to linker")?;
+        wasmtime_wasi::preview1::add_to_linker_async(&mut linker, |data: &mut StoreData| {
+            &mut data.p1_ctx
+        })
+        .context("adding WASI preview1 to linker")?;
 
         // Add Yurt namespace host functions
         add_fs_imports(&mut linker)?;
@@ -225,14 +244,18 @@ impl WasmEngine {
         Ok(Self {
             engine: Arc::new(engine),
             linker: Arc::new(linker),
-            ticker,
+            ticker_stop,
+            ticker: Some(ticker),
         })
     }
 }
 
 impl Drop for WasmEngine {
     fn drop(&mut self) {
-        self.ticker.abort();
+        self.ticker_stop.store(true, Ordering::Relaxed);
+        if let Some(ticker) = self.ticker.take() {
+            let _ = ticker.join();
+        }
     }
 }
 
@@ -305,6 +328,17 @@ pub fn nice_to_quantum(nice: u8) -> u64 {
     (10 - n / 2).max(1)
 }
 
+pub(crate) fn configure_store_preemption(
+    store: &mut Store<StoreData>,
+    nice: u8,
+) -> anyhow::Result<()> {
+    store.set_fuel(u64::MAX / 2)?;
+    let quantum = nice_to_quantum(nice);
+    store.set_epoch_deadline(quantum);
+    store.epoch_deadline_async_yield_and_update(quantum);
+    Ok(())
+}
+
 // ── Filesystem host imports ───────────────────────────────────────────────────
 
 fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
@@ -312,7 +346,12 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     linker.func_wrap(
         "yurt",
         "host_stat",
-        |mut c: Caller<'_, StoreData>, path_ptr: u32, path_len: u32, out_ptr: u32, out_cap: u32| -> i32 {
+        |mut c: Caller<'_, StoreData>,
+         path_ptr: u32,
+         path_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 {
             let path = read_str(&mut c, path_ptr, path_len);
             match c.data().vfs.stat(&path) {
                 Ok(s) => {
@@ -350,7 +389,12 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     linker.func_wrap(
         "yurt",
         "host_read_file",
-        |mut c: Caller<'_, StoreData>, path_ptr: u32, path_len: u32, out_ptr: u32, out_cap: u32| -> i32 {
+        |mut c: Caller<'_, StoreData>,
+         path_ptr: u32,
+         path_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 {
             let path = read_str(&mut c, path_ptr, path_len);
             match c.data().vfs.read_file(&path) {
                 Ok(bytes) => {
@@ -387,7 +431,12 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     linker.func_wrap(
         "yurt",
         "host_readdir",
-        |mut c: Caller<'_, StoreData>, path_ptr: u32, path_len: u32, out_ptr: u32, out_cap: u32| -> i32 {
+        |mut c: Caller<'_, StoreData>,
+         path_ptr: u32,
+         path_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 {
             let path = read_str(&mut c, path_ptr, path_len);
             match c.data().vfs.readdir(&path) {
                 Ok(entries) => {
@@ -509,7 +558,12 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     linker.func_wrap(
         "yurt",
         "host_readlink",
-        |mut c: Caller<'_, StoreData>, path_ptr: u32, path_len: u32, out_ptr: u32, out_cap: u32| -> i32 {
+        |mut c: Caller<'_, StoreData>,
+         path_ptr: u32,
+         path_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 {
             let path = read_str(&mut c, path_ptr, path_len);
             match c.data().vfs.readlink(&path) {
                 Ok(target) => write_out(&mut c, out_ptr, out_cap, target.as_bytes()),
@@ -566,7 +620,11 @@ fn add_io_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         "yurt",
         "host_dup2",
         |mut c: Caller<'_, StoreData>, src: i32, dst: i32| -> i32 {
-            if c.data_mut().kernel.dup2(src, dst) { 0 } else { -1 }
+            if c.data_mut().kernel.dup2(src, dst) {
+                0
+            } else {
+                -1
+            }
         },
     )?;
 
@@ -587,9 +645,15 @@ fn add_io_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         "yurt",
         "host_write_fd",
         |mut c: Caller<'_, StoreData>, fd: i32, data_ptr: i32, data_len: i32| -> i32 {
-            if data_ptr < 0 || data_len < 0 { return -3; }
+            if data_ptr < 0 || data_len < 0 {
+                return -3;
+            }
             let data = read_mem(&mut c, data_ptr as u32, data_len as u32);
-            if c.data().kernel.write_fd(fd, &data) { data.len() as i32 } else { -1 }
+            if c.data().kernel.write_fd(fd, &data) {
+                data.len() as i32
+            } else {
+                -1
+            }
         },
     )?;
 
@@ -650,7 +714,10 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
             let stdin_data: Vec<u8> = if !req.stdin_data.is_empty() {
                 req.stdin_data.as_bytes().to_vec()
             } else if req.stdin_fd >= 3 {
-                c.data_mut().kernel.read_fd(req.stdin_fd).unwrap_or_default()
+                c.data_mut()
+                    .kernel
+                    .read_fd(req.stdin_fd)
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
@@ -675,8 +742,16 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
             let parent_nice = c.data().nice;
 
             // Spawn background task; get oneshot receiver.
-            let (_, rx) =
-                spawn::spawn_child(spawn_ctx, parent_vfs, parent_env, stdin_data, stdout_pipe, stderr_pipe, &req, parent_nice);
+            let (_, rx) = spawn::spawn_child(
+                spawn_ctx,
+                parent_vfs,
+                parent_env,
+                stdin_data,
+                stdout_pipe,
+                stderr_pipe,
+                &req,
+                parent_nice,
+            );
 
             // Register the child in the kernel's process table.
             c.data_mut().kernel.add_process(rx)
@@ -736,7 +811,12 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     linker.func_wrap(
         "yurt",
         "host_register_tool",
-        |mut c: Caller<'_, StoreData>, name_ptr: u32, name_len: u32, path_ptr: u32, path_len: u32| -> i32 {
+        |mut c: Caller<'_, StoreData>,
+         name_ptr: u32,
+         name_len: u32,
+         path_ptr: u32,
+         path_len: u32|
+         -> i32 {
             let name = read_str(&mut c, name_ptr, name_len);
             let _wasm_path = read_str(&mut c, path_ptr, path_len);
             c.data_mut().registered_tools.insert(name);
@@ -754,7 +834,8 @@ fn add_network_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     linker.func_wrap_async(
         "yurt",
         "host_network_fetch",
-        |mut caller: Caller<'_, StoreData>, (req_ptr, req_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
+        |mut caller: Caller<'_, StoreData>,
+         (req_ptr, req_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
             Box::new(async move {
                 let req_str = read_str(&mut caller, req_ptr, req_len);
                 let resp = network::fetch(&req_str).await;
@@ -801,10 +882,7 @@ fn add_misc_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                 return 1;
             }
             // Filesystem executables remain discoverable without kernel-only VFS flags.
-            let paths = [
-                format!("/bin/{name}"),
-                format!("/usr/bin/{name}"),
-            ];
+            let paths = [format!("/bin/{name}"), format!("/usr/bin/{name}")];
             for p in &paths {
                 if c.data().vfs.stat(p).is_ok() {
                     return 1;

@@ -65,7 +65,12 @@ pub mod codes {
 
 impl Response {
     pub fn ok(id: Option<RequestId>, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
     pub fn err(id: Option<RequestId>, code: i32, message: impl Into<String>) -> Self {
@@ -73,15 +78,27 @@ impl Response {
             jsonrpc: "2.0",
             id,
             result: None,
-            error: Some(RpcError { code, message: message.into(), data: None }),
+            error: Some(RpcError {
+                code,
+                message: message.into(),
+                data: None,
+            }),
         }
     }
 
     pub fn method_not_found(id: Option<RequestId>, method: &str) -> Self {
-        Self::err(id, codes::METHOD_NOT_FOUND, format!("method not found: {method}"))
+        Self::err(
+            id,
+            codes::METHOD_NOT_FOUND,
+            format!("method not found: {method}"),
+        )
     }
 
     pub fn not_implemented(id: Option<RequestId>, method: &str) -> Self {
-        Self::err(id, codes::INTERNAL_ERROR, format!("{method}: not yet implemented"))
+        Self::err(
+            id,
+            codes::INTERNAL_ERROR,
+            format!("{method}: not yet implemented"),
+        )
     }
 }

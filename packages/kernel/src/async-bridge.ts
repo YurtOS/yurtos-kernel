@@ -73,6 +73,7 @@ export interface AsyncBridge {
 export interface AsyncifyForkSnapshot {
   memoryBytes: Uint8Array;
   memoryPages: number;
+  stackPointer: number | null;
   dataAddr: number;
   dataSize: number;
   jmpBufStates: Array<[number, { savedHigh: number; savedData: Uint8Array }]>;
@@ -138,6 +139,7 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     getState: () => number;
     dataAddr: number;
     dataSize: number;
+    stackPointer: WebAssembly.Global | null;
   } | null = null;
 
   // The guest's linear memory — needed to read/write the asyncify
@@ -160,6 +162,8 @@ class AsyncifyAsyncBridge implements AsyncBridge {
   private pendingLongjmp: { envPtr: number; val: number } | null = null;
   private pendingFork = false;
   private pendingForkReturn: number | null = null;
+  private pendingForkMemoryBytes: Uint8Array | null = null;
+  private pendingForkStackPointer: number | null = null;
   private jmpBufStates: Map<number, { savedHigh: number; savedData: Uint8Array }> = new Map();
   private forkController: AsyncifyForkController | null = null;
 
@@ -181,6 +185,9 @@ class AsyncifyAsyncBridge implements AsyncBridge {
       getState:    exp.asyncify_get_state    as () => number,
       dataAddr,
       dataSize,
+      stackPointer: exp.__stack_pointer instanceof WebAssembly.Global
+        ? exp.__stack_pointer
+        : null,
     };
     this.memory = exp.memory as WebAssembly.Memory;
   }
@@ -265,6 +272,10 @@ class AsyncifyAsyncBridge implements AsyncBridge {
       return value;
     }
     this.pendingFork = true;
+    this.pendingForkMemoryBytes = this.memory
+      ? new Uint8Array(this.memory.buffer).slice()
+      : null;
+    this.pendingForkStackPointer = (exps.stackPointer?.value as number | undefined) ?? null;
     exps.startUnwind(exps.dataAddr);
     return 0; // ignored during unwind
   };
@@ -277,6 +288,9 @@ class AsyncifyAsyncBridge implements AsyncBridge {
       ]),
     );
     this.pendingForkReturn = forkReturn;
+    if (snapshot.stackPointer !== null && this.exports?.stackPointer) {
+      this.exports.stackPointer.value = snapshot.stackPointer;
+    }
   }
 
   startForkRewind(): void {
@@ -320,9 +334,18 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     if (!this.exports || !this.memory) {
       throw new Error('fork: bridge not initialized');
     }
+    const memoryBytes = this.pendingForkMemoryBytes?.slice() ??
+      new Uint8Array(this.memory.buffer).slice();
+    if (this.pendingForkMemoryBytes && this.exports.dataSize > 0) {
+      memoryBytes.set(
+        new Uint8Array(this.memory.buffer, this.exports.dataAddr, this.exports.dataSize),
+        this.exports.dataAddr,
+      );
+    }
     return {
-      memoryBytes: new Uint8Array(this.memory.buffer).slice(),
-      memoryPages: this.memory.buffer.byteLength / 65536,
+      memoryBytes,
+      memoryPages: memoryBytes.byteLength / 65536,
+      stackPointer: this.pendingForkStackPointer,
       dataAddr: this.exports.dataAddr,
       dataSize: this.exports.dataSize,
       jmpBufStates: Array.from(this.jmpBufStates.entries()).map(([ptr, state]) => [
@@ -397,6 +420,8 @@ class AsyncifyAsyncBridge implements AsyncBridge {
           const childPid = this.forkController
             ? this.forkController.forkFromContinuation(this.snapshotForkContinuation())
             : -38; // ENOSYS
+          this.pendingForkMemoryBytes = null;
+          this.pendingForkStackPointer = null;
           this.pendingForkReturn = childPid;
           exps.startRewind(exps.dataAddr);
           result = fn(...args);

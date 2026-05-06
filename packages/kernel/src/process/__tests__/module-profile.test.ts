@@ -112,7 +112,7 @@ Deno.test("setjmp imports require explicit asyncify feature metadata", () => {
   assertThrows(
     () => validateYurtModuleProfile(analyzeYurtModule(module)),
     Error,
-    "module imports yurt continuation host calls but lacks yurt.features setjmp marker",
+    "module imports yurt continuation host calls but lacks yurt.features continuations marker",
   );
 });
 
@@ -122,21 +122,21 @@ Deno.test("host_fork imports require asyncify feature metadata", () => {
   assertThrows(
     () => validateYurtModuleProfile(analyzeYurtModule(module)),
     Error,
-    "module imports yurt continuation host calls but lacks yurt.features setjmp marker",
+    "module imports yurt continuation host calls but lacks yurt.features continuations marker",
   );
 });
 
-Deno.test("asyncify feature metadata requires asyncify exports", () => {
-  const module = makeModule({ features: ["setjmp"] });
+Deno.test("continuation feature metadata requires asyncify exports", () => {
+  const module = makeModule({ features: ["continuations"] });
 
   assertThrows(
     () => validateYurtModuleProfile(analyzeYurtModule(module)),
     Error,
-    "module declares yurt.features setjmp/continuations but is not asyncify-instrumented",
+    "module declares yurt.features continuations but is not asyncify-instrumented",
   );
 });
 
-Deno.test("setjmp feature chooses asyncify bridge", () => {
+Deno.test("legacy setjmp feature still chooses asyncify bridge", () => {
   const module = makeModule({
     imports: ["host_setjmp", "host_longjmp"],
     features: ["setjmp"],

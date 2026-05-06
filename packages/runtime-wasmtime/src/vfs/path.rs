@@ -60,7 +60,10 @@ mod tests {
 
     #[test]
     fn normalizes_dots() {
-        assert_eq!(parse_path("/home/user/../tmp/./foo"), Some(vec!["home", "tmp", "foo"]));
+        assert_eq!(
+            parse_path("/home/user/../tmp/./foo"),
+            Some(vec!["home", "tmp", "foo"])
+        );
     }
 
     #[test]

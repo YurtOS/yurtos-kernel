@@ -32,6 +32,7 @@
 #include "yurt_markers.h"
 
 #include <errno.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -51,6 +52,16 @@ YURT_DEFINE_MARKER(execvp, 0x65786370u) /* "excp" */
 YURT_DEFINE_MARKER(execve, 0x65786365u) /* "exce" */
 
 extern char **environ;
+
+static pid_t yurt_exec_child_pid = -1;
+
+int yurt_forward_signal_to_exec_child(int sig) {
+  pid_t child = yurt_exec_child_pid;
+  if (child <= 0 || sig == SIGCHLD) {
+    return 0;
+  }
+  return kill(child, sig) == 0;
+}
 
 /* Spawn `prog` with `argv` and `envp`, wait for it, exit with its
  * status code.  On any failure before the exit, return -1 with errno
@@ -77,6 +88,12 @@ static int exec_via_spawn(const char *prog, char *const argv[], char *const envp
     errno = ENOENT;
     return -1;
   }
+  if (yurt_host_mark_exec_child(child) != 0) {
+    errno = ECHILD;
+    kill(child, SIGTERM);
+    return -1;
+  }
+  yurt_exec_child_pid = child;
   /* This process image is supposed to disappear after a successful exec.
    * Our spawn+wait emulation keeps it alive as a small waiter, so drop any
    * inherited non-stdio descriptors now.  The spawned replacement already has
@@ -86,12 +103,17 @@ static int exec_via_spawn(const char *prog, char *const argv[], char *const envp
     close(fd);
   }
   int status = 0;
-  if (waitpid(child, &status, 0) != child) {
+  while (waitpid(child, &status, 0) != child) {
+    if (errno == EINTR) {
+      continue;
+    }
     /* Child spawned but couldn't be reaped — surface as a generic
      * exec failure.  In practice this path is rare. */
+    yurt_exec_child_pid = -1;
     errno = ECHILD;
     return -1;
   }
+  yurt_exec_child_pid = -1;
   /* Mirror the child's exit status, just like a successful exec
    * would: the caller process disappears and only the child's exit
    * remains visible to the parent of the caller. */

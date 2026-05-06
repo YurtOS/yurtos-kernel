@@ -32,6 +32,7 @@ const PROC_TOP_FILES = new Set([
 
 /** Per-pid file names served under /proc/<pid>/. */
 const PROC_PID_FILES = new Set(['stat', 'status', 'cmdline', 'comm']);
+const PROC_PID_DIRS = new Set(['fd']);
 
 /** /proc/version banner.  Sourced from version.ts so a single bump
  *  flows through to both the host-visible /proc and the guest-side
@@ -54,6 +55,7 @@ export interface ProcessInfo {
   state: string;
   exit_code: number;
   command: string;
+  fds?: number[];
 }
 
 /** Parsed /proc subpath: either a top-level file, a pid root, or
@@ -63,6 +65,8 @@ type ProcPath =
   | { kind: 'top'; name: string }
   | { kind: 'pid_dir'; pid: number }
   | { kind: 'pid_file'; pid: number; name: string }
+  | { kind: 'pid_fd_dir'; pid: number }
+  | { kind: 'pid_fd'; pid: number; fd: number }
   | { kind: 'unknown'; subpath: string };
 
 function parseProcSubpath(subpath: string): ProcPath {
@@ -75,8 +79,14 @@ function parseProcSubpath(subpath: string): ProcPath {
   }
   const head = subpath.slice(0, slash);
   const tail = subpath.slice(slash + 1);
-  if (/^\d+$/.test(head) && PROC_PID_FILES.has(tail)) {
-    return { kind: 'pid_file', pid: parseInt(head, 10), name: tail };
+  if (/^\d+$/.test(head)) {
+    const pid = parseInt(head, 10);
+    if (PROC_PID_FILES.has(tail)) return { kind: 'pid_file', pid, name: tail };
+    if (PROC_PID_DIRS.has(tail)) return { kind: 'pid_fd_dir', pid };
+    if (tail.startsWith('fd/')) {
+      const fd = tail.slice('fd/'.length);
+      if (/^\d+$/.test(fd)) return { kind: 'pid_fd', pid, fd: parseInt(fd, 10) };
+    }
   }
   return { kind: 'unknown', subpath };
 }
@@ -121,6 +131,8 @@ export class ProcProvider implements VirtualProvider {
       case 'top': return true;
       case 'pid_dir': return this.findProcess(p.pid) !== undefined;
       case 'pid_file': return this.findProcess(p.pid) !== undefined;
+      case 'pid_fd_dir': return this.findProcess(p.pid) !== undefined;
+      case 'pid_fd': return this.findProcess(p.pid)?.fds?.includes(p.fd) ?? false;
       case 'unknown': return false;
     }
   }
@@ -142,13 +154,27 @@ export class ProcProvider implements VirtualProvider {
         if (!this.findProcess(p.pid)) {
           throw new VfsError('ENOENT', `no such file or directory: /proc/${subpath}`);
         }
-        return { type: 'dir', size: PROC_PID_FILES.size };
+        return { type: 'dir', size: PROC_PID_FILES.size + PROC_PID_DIRS.size };
+      case 'pid_fd_dir': {
+        const proc = this.findProcess(p.pid);
+        if (!proc) {
+          throw new VfsError('ENOENT', `no such file or directory: /proc/${subpath}`);
+        }
+        return { type: 'dir', size: proc.fds?.length ?? 0 };
+      }
       case 'pid_file': {
         if (!this.findProcess(p.pid)) {
           throw new VfsError('ENOENT', `no such file or directory: /proc/${subpath}`);
         }
         const content = this.generateContent(subpath);
         return { type: 'file', size: new TextEncoder().encode(content).byteLength };
+      }
+      case 'pid_fd': {
+        const proc = this.findProcess(p.pid);
+        if (!proc?.fds?.includes(p.fd)) {
+          throw new VfsError('ENOENT', `no such file or directory: /proc/${subpath}`);
+        }
+        return { type: 'file', size: 0 };
       }
       case 'unknown':
         throw new VfsError('ENOENT', `no such file or directory: /proc/${subpath}`);
@@ -170,7 +196,17 @@ export class ProcProvider implements VirtualProvider {
       if (!this.findProcess(p.pid)) {
         throw new VfsError('ENOENT', `no such file or directory: /proc/${subpath}`);
       }
-      return Array.from(PROC_PID_FILES).map(name => ({ name, type: 'file' as const }));
+      return [
+        ...Array.from(PROC_PID_FILES).map(name => ({ name, type: 'file' as const })),
+        ...Array.from(PROC_PID_DIRS).map(name => ({ name, type: 'dir' as const })),
+      ];
+    }
+    if (p.kind === 'pid_fd_dir') {
+      const proc = this.findProcess(p.pid);
+      if (!proc) {
+        throw new VfsError('ENOENT', `no such file or directory: /proc/${subpath}`);
+      }
+      return (proc.fds ?? []).sort((a, b) => a - b).map(fd => ({ name: String(fd), type: 'file' as const }));
     }
     throw new VfsError('ENOTDIR', `not a directory: /proc/${subpath}`);
   }
@@ -229,6 +265,7 @@ export class ProcProvider implements VirtualProvider {
             `PPid:\t${proc.ppid}\n` +
             `Uid:\t1000\t1000\t1000\t1000\n` +
             `Gid:\t1000\t1000\t1000\t1000\n` +
+            `SigIgn:\t0000000000000000\n` +
             `Threads:\t1\n`
           );
         }

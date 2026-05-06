@@ -22,7 +22,11 @@ fn match_impl(pat: &[u8], s: &[u8]) -> bool {
     // `**` — matches any sequence of characters including `/`
     if pat.starts_with(b"**") {
         // consume the `**` and an optional following `/`
-        let rest = if pat.get(2) == Some(&b'/') { &pat[3..] } else { &pat[2..] };
+        let rest = if pat.get(2) == Some(&b'/') {
+            &pat[3..]
+        } else {
+            &pat[2..]
+        };
         // try matching `rest` against every suffix of `s`
         for i in 0..=s.len() {
             if match_impl(rest, &s[i..]) {
@@ -121,7 +125,7 @@ mod tests {
     fn question_mark() {
         assert!(glob_match("foo?.rs", "foox.rs"));
         assert!(!glob_match("foo?.rs", "foo/x.rs")); // ? does not cross /
-        assert!(!glob_match("foo?.rs", "foo.rs"));   // requires exactly one char
+        assert!(!glob_match("foo?.rs", "foo.rs")); // requires exactly one char
     }
 
     #[test]

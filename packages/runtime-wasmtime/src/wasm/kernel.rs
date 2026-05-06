@@ -200,8 +200,16 @@ impl ProcessKernel {
         self.procs
             .iter()
             .map(|(&pid, state)| match state {
-                ChildState::Running(_) => ProcessInfo { pid, state: "running", exit_code: None },
-                ChildState::Done(code) => ProcessInfo { pid, state: "done", exit_code: Some(*code) },
+                ChildState::Running(_) => ProcessInfo {
+                    pid,
+                    state: "running",
+                    exit_code: None,
+                },
+                ChildState::Done(code) => ProcessInfo {
+                    pid,
+                    state: "done",
+                    exit_code: Some(*code),
+                },
             })
             .collect()
     }

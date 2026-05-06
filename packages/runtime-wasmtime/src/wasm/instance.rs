@@ -6,7 +6,7 @@ use std::sync::Arc;
 use wasmtime::{Memory, Module, Store, TypedFunc};
 
 use super::spawn::SpawnContext;
-use super::{StoreData, WasmEngine};
+use super::{configure_store_preemption, StoreData, WasmEngine};
 use crate::vfs::MemVfs;
 
 /// A live WASM instance for one sandbox.
@@ -34,19 +34,16 @@ impl ShellInstance {
         env: &[(String, String)],
         nice: u8,
     ) -> anyhow::Result<Self> {
-        let module = Arc::new(Module::new(&engine.engine, wasm_bytes).context("compiling WASM module")?);
+        let module =
+            Arc::new(Module::new(&engine.engine, wasm_bytes).context("compiling WASM module")?);
 
         let spawn_ctx = SpawnContext::new(engine, module.clone());
         let data = StoreData::new_with_ctx(vfs, &[], env, Some(spawn_ctx), nice)
             .context("creating store data")?;
         let mut store = Store::new(&engine.engine, data);
 
-        // Add fuel so the engine can interrupt runaway guests (Phase 6+ will tune this).
-        store.set_fuel(u64::MAX / 2)?;
-        // Yield to the tokio executor every `quantum` epochs (1ms each).
-        // Low nice = fewer yields (higher priority); high nice = more yields (lower priority).
-        let quantum = crate::wasm::nice_to_quantum(nice);
-        store.epoch_deadline_async_yield_and_update(quantum);
+        // Yield to the tokio executor every quantum so CPU-bound modules can be preempted.
+        configure_store_preemption(&mut store, nice)?;
 
         let instance = engine
             .linker
@@ -67,9 +64,10 @@ impl ShellInstance {
             .get_typed_func(&mut store, "__alloc")
             .context("WASM module missing '__alloc' export")?;
 
-        let dealloc: TypedFunc<(u32, u32), ()> = instance
-            .get_typed_func(&mut store, "__dealloc")
-            .context("WASM module missing '__dealloc' export")?;
+        let dealloc: TypedFunc<(u32, u32), ()> =
+            instance
+                .get_typed_func(&mut store, "__dealloc")
+                .context("WASM module missing '__dealloc' export")?;
 
         Ok(Self {
             store,
@@ -110,7 +108,10 @@ impl ShellInstance {
         // Call __run_command.
         let n = self
             .run_command
-            .call_async(&mut self.store, (cmd_ptr, cmd_bytes.len() as u32, out_ptr, out_cap))
+            .call_async(
+                &mut self.store,
+                (cmd_ptr, cmd_bytes.len() as u32, out_ptr, out_cap),
+            )
             .await
             .context("__run_command")?;
 

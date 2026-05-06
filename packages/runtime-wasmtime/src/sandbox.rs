@@ -113,10 +113,19 @@ impl SandboxState {
     /// Fork this sandbox: CoW VFS clone + fresh shell instance with same env.
     pub async fn fork(&self) -> Result<Self> {
         let forked_vfs = self.shell.vfs().cow_clone();
-        let env_vec: Vec<_> = self.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        let shell =
-            ShellInstance::new(&self.engine, &self.wasm_bytes, forked_vfs, &env_vec, self.nice)
-                .await?;
+        let env_vec: Vec<_> = self
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let shell = ShellInstance::new(
+            &self.engine,
+            &self.wasm_bytes,
+            forked_vfs,
+            &env_vec,
+            self.nice,
+        )
+        .await?;
         Ok(Self {
             engine: self.engine.clone(),
             wasm_bytes: self.wasm_bytes.clone(),
@@ -174,9 +183,10 @@ impl SandboxManager {
     /// Resolve a sandbox by id (None / "" → root).
     pub fn resolve(&mut self, sandbox_id: Option<&str>) -> Result<&mut SandboxState> {
         match sandbox_id {
-            None | Some("") => {
-                self.root.as_mut().ok_or_else(|| anyhow::anyhow!("no root sandbox"))
-            }
+            None | Some("") => self
+                .root
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("no root sandbox")),
             Some(id) => {
                 if let Some(sb) = self.named.get_mut(id) {
                     return Ok(sb);

@@ -129,10 +129,18 @@ pub fn spawn_child(
     let cmd_str = req.to_shell_cmd();
 
     tokio::spawn(async move {
-        let exit_code =
-            run_child(spawn_ctx, parent_vfs, stdin_data, child_env, cmd_str, stdout_pipe, stderr_pipe, child_nice)
-                .await
-                .unwrap_or(1);
+        let exit_code = run_child(
+            spawn_ctx,
+            parent_vfs,
+            stdin_data,
+            child_env,
+            cmd_str,
+            stdout_pipe,
+            stderr_pipe,
+            child_nice,
+        )
+        .await
+        .unwrap_or(1);
         let _ = tx.send(exit_code);
     });
 
@@ -162,9 +170,7 @@ async fn run_child(
     let child_stderr_pipe = data.stderr_pipe.clone();
 
     let mut store = Store::new(&ctx.engine, data);
-    store.set_fuel(u64::MAX / 2)?;
-    let quantum = crate::wasm::nice_to_quantum(nice);
-    store.epoch_deadline_async_yield_and_update(quantum);
+    super::configure_store_preemption(&mut store, nice)?;
 
     let instance = ctx
         .linker
@@ -177,7 +183,9 @@ async fn run_child(
     let dealloc: TypedFunc<(u32, u32), ()> = instance.get_typed_func(&mut store, "__dealloc")?;
     let run_cmd: TypedFunc<(u32, u32, u32, u32), i32> =
         instance.get_typed_func(&mut store, "__run_command")?;
-    let memory = instance.get_memory(&mut store, "memory").context("missing memory")?;
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .context("missing memory")?;
 
     // Allocate and write command string.
     let cmd_bytes = cmd.as_bytes();
@@ -187,7 +195,12 @@ async fn run_child(
     // Run with an initial 64 KB output buffer.
     let out_cap: u32 = 64 * 1024;
     let out_ptr = alloc.call_async(&mut store, out_cap).await?;
-    let n = run_cmd.call_async(&mut store, (cmd_ptr, cmd_bytes.len() as u32, out_ptr, out_cap)).await?;
+    let n = run_cmd
+        .call_async(
+            &mut store,
+            (cmd_ptr, cmd_bytes.len() as u32, out_ptr, out_cap),
+        )
+        .await?;
 
     // Handle "need bigger buffer" signal.
     let exit_code = if n > 0 && n as usize > out_cap as usize {
@@ -196,7 +209,10 @@ async fn run_child(
         let needed = n as u32;
         let big_ptr = alloc.call_async(&mut store, needed).await?;
         let n2 = run_cmd
-            .call_async(&mut store, (cmd_ptr, cmd_bytes.len() as u32, big_ptr, needed))
+            .call_async(
+                &mut store,
+                (cmd_ptr, cmd_bytes.len() as u32, big_ptr, needed),
+            )
             .await?;
         let mut result_buf = vec![0u8; n2.max(0) as usize];
         memory.read(&store, big_ptr as usize, &mut result_buf)?;
@@ -211,7 +227,9 @@ async fn run_child(
         1 // error
     };
 
-    dealloc.call_async(&mut store, (cmd_ptr, cmd_bytes.len() as u32)).await?;
+    dealloc
+        .call_async(&mut store, (cmd_ptr, cmd_bytes.len() as u32))
+        .await?;
 
     // Flush captured stdio into the parent's pipe buffers.
     let stdout_bytes = child_stdout_pipe.take();
@@ -237,5 +255,7 @@ fn parse_exit_code(json: &[u8]) -> i32 {
         #[serde(default)]
         exit_code: i32,
     }
-    serde_json::from_slice::<R>(json).map(|r| r.exit_code).unwrap_or(0)
+    serde_json::from_slice::<R>(json)
+        .map(|r| r.exit_code)
+        .unwrap_or(0)
 }

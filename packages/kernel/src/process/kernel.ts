@@ -1,5 +1,8 @@
 import type { FdTarget, TtyState } from "../wasi/fd-target.js";
-import { createTtySlaveTarget, createTtyState } from "../wasi/fd-target.js";
+import {
+  createTtySlaveTarget,
+  createTtyState,
+} from "../wasi/fd-target.js";
 import {
   normalizeNice,
   normalizeSchedulerPolicy,
@@ -21,6 +24,7 @@ export const USER_GID = 1000;
 export const RLIMIT_NOFILE = 7;
 export const RLIM_INFINITY_U64 = 0xffff_ffff_ffff_ffffn;
 export const DEFAULT_MAX_PROCESSES = 64;
+const SIGCHLD = 17;
 
 export class ProcessLimitError extends Error {
   readonly code = "EAGAIN";
@@ -54,6 +58,7 @@ export interface ProcessCredentials {
 
 export interface SpawnRequest {
   prog: string;
+  argv0?: string;
   args: string[];
   env: [string, string][];
   cwd: string;
@@ -63,6 +68,7 @@ export interface SpawnRequest {
   stdout_fd: number;
   stderr_fd: number;
   stdin_data?: string;
+  pass_fds?: number[];
 }
 
 export interface ProcessEntry {
@@ -96,7 +102,9 @@ export class ProcessKernel {
   private allocatedPids = new Set<number>();
   private parentPids = new Map<number, number>();
   private children = new Map<number, Set<number>>();
+  private execPidAliases = new Map<number, number>();
   private fdTables = new Map<number, Map<number, FdTarget>>();
+  private fdDescriptorFlags = new Map<number, Map<number, number>>();
   private nextFds = new Map<number, number>();
   private fileLocks = new Map<string, FileLockState>();
   private ttyTable = new Map<number, TtyState>();
@@ -202,6 +210,19 @@ export class ProcessKernel {
     fdTable.set(fd, target);
   }
 
+  setFdDescriptorFlags(pid: number, fd: number, flags: number): void {
+    let flagsTable = this.fdDescriptorFlags.get(pid);
+    if (!flagsTable) {
+      flagsTable = new Map();
+      this.fdDescriptorFlags.set(pid, flagsTable);
+    }
+    flagsTable.set(fd, flags);
+  }
+
+  getFdDescriptorFlags(pid: number, fd: number): number {
+    return this.fdDescriptorFlags.get(pid)?.get(fd) ?? 0;
+  }
+
   replaceFdTarget(pid: number, fd: number, target: FdTarget): void {
     const fdTable = this.getFdTable(pid);
     const existing = fdTable.get(fd);
@@ -218,6 +239,7 @@ export class ProcessKernel {
     let nextFd = this.nextFds.get(pid) ?? KERNEL_FD_BASE;
     while (fdTable.has(nextFd)) nextFd++;
     fdTable.set(nextFd, target);
+    this.fdDescriptorFlags.get(pid)?.delete(nextFd);
     this.nextFds.set(pid, nextFd + 1);
     return nextFd;
   }
@@ -389,41 +411,55 @@ export class ProcessKernel {
       throw new Error(`No fd table for caller pid ${callerPid}`);
     }
     const newFdTable = new Map<number, FdTarget>();
+    const cloneForChild = (target: FdTarget, childFd: number): FdTarget => {
+      if (target.type === "vfs_file") {
+        const detached = target.fdTable.duplicateSharedDetached(target.fd, childFd);
+        return { ...target, fdTable: detached.table, fd: detached.fd, refs: 1 };
+      }
+      this.retainTarget(target);
+      return target;
+    };
     const stdinTarget = callerFdTable.get(req.stdin_fd);
     if (stdinTarget) {
-      if (stdinTarget.type === "pipe_read") stdinTarget.pipe.addRef();
-      if (stdinTarget.type === "vfs_file") stdinTarget.refs++;
-      newFdTable.set(0, stdinTarget);
+      newFdTable.set(0, cloneForChild(stdinTarget, 0));
     }
     const stdoutTarget = callerFdTable.get(req.stdout_fd);
     if (stdoutTarget) {
-      if (stdoutTarget.type === "pipe_write") stdoutTarget.pipe.addRef();
-      if (stdoutTarget.type === "vfs_file") stdoutTarget.refs++;
-      newFdTable.set(1, stdoutTarget);
+      newFdTable.set(1, cloneForChild(stdoutTarget, 1));
     }
     const stderrTarget = callerFdTable.get(req.stderr_fd);
     if (stderrTarget) {
-      if (stderrTarget.type === "pipe_write") stderrTarget.pipe.addRef();
-      if (stderrTarget.type === "vfs_file") stderrTarget.refs++;
-      newFdTable.set(2, stderrTarget);
+      newFdTable.set(2, cloneForChild(stderrTarget, 2));
+    }
+    for (const fd of req.pass_fds ?? []) {
+      if (!Number.isInteger(fd) || fd < 3) continue;
+      if (this.getFdDescriptorFlags(callerPid, fd) & 1) continue;
+      const target = callerFdTable.get(fd);
+      if (target) newFdTable.set(fd, cloneForChild(target, fd));
     }
     return newFdTable;
   }
 
-  buildFdTableForFork(parentPid: number): Map<number, FdTarget> {
+  buildFdTableForFork(parentPid: number, childPid: number): Map<number, FdTarget> {
     const parentFdTable = this.fdTables.get(parentPid);
     if (!parentFdTable) {
       throw new Error(`No fd table for parent pid ${parentPid}`);
     }
+    const parentFlags = this.fdDescriptorFlags.get(parentPid);
+    const childFlags = new Map<number, number>();
     const childFdTable = new Map<number, FdTarget>();
     for (const [fd, target] of parentFdTable) {
       if (target.type === "pipe_read" || target.type === "pipe_write") {
         target.pipe.addRef();
-      } else if (target.type === "vfs_file" || target.type === "socket") {
+      } else if (target.type === "socket") {
         target.refs++;
       }
       childFdTable.set(fd, target);
+      const flags = parentFlags?.get(fd);
+      if (flags !== undefined) childFlags.set(fd, flags);
     }
+    this.fdDescriptorFlags.set(parentPid, parentFlags ?? new Map());
+    this.fdDescriptorFlags.set(childPid, childFlags);
     return childFdTable;
   }
 
@@ -471,6 +507,7 @@ export class ProcessKernel {
     const onExit = () => {
       entry.state = "exited";
       entry.exitCode = wasiHost?.getExitCode() ?? 0;
+      this.notifyParentOfChildExit(pid);
       this._reparentChildren(pid);
       // Close the child's fds (decrements pipe refcounts, signals EOF).
       this.cleanupFds(pid);
@@ -509,6 +546,7 @@ export class ProcessKernel {
       if (entry) {
         entry.state = "exited";
         entry.exitCode = wasiHost.getExitCode() ?? 0;
+        this.notifyParentOfChildExit(pid);
         this._reparentChildren(pid);
         this.cleanupFds(pid);
         for (const waiter of entry.waiters) waiter(entry.exitCode);
@@ -534,8 +572,27 @@ export class ProcessKernel {
     return this.parentPids.get(pid) ?? NO_PARENT_PID;
   }
 
+  getVisiblePid(pid: number): number {
+    return this.execPidAliases.get(pid) ?? pid;
+  }
+
+  getVisiblePpid(pid: number): number {
+    const visiblePid = this.getVisiblePid(pid);
+    return this.parentPids.get(visiblePid) ?? NO_PARENT_PID;
+  }
+
   isChildOf(pid: number, parentPid: number): boolean {
     return this.parentPids.get(pid) === parentPid;
+  }
+
+  markExecReplacement(wrapperPid: number, replacementPid: number): boolean {
+    if (!this.isChildOf(replacementPid, wrapperPid)) return false;
+    const wrapper = this.processTable.get(wrapperPid);
+    const replacement = this.processTable.get(replacementPid);
+    if (!wrapper || !replacement) return false;
+    if (wrapper.state === "exited" || replacement.state === "exited") return false;
+    this.execPidAliases.set(replacementPid, wrapperPid);
+    return true;
   }
 
   attachWasiHost(pid: number, wasiHost: WasiHost): void {
@@ -544,20 +601,32 @@ export class ProcessKernel {
   }
 
   killProcess(pid: number, sig: number): boolean {
-    const entry = this.processTable.get(pid);
+    const effectivePid = this.pidForSignalTarget(pid);
+    const entry = this.processTable.get(effectivePid);
     if (!entry || entry.state === "exited") return false;
     if (entry.wasiHost?.queueSignal(sig)) return true;
     entry.wasiHost?.cancelExecution();
     return true;
   }
 
+  private pidForSignalTarget(pid: number): number {
+    for (const [candidatePid, visiblePid] of this.execPidAliases) {
+      const entry = this.processTable.get(candidatePid);
+      if (visiblePid === pid && entry?.state === "running") return candidatePid;
+    }
+    return pid;
+  }
+
   releaseProcess(pid: number, exitCode: number): void {
+    this.execPidAliases.delete(pid);
+    this.notifyParentOfChildExit(pid);
     this._reparentChildren(pid);
     this.cleanupFds(pid);
     this.registerExited(pid, exitCode);
   }
 
   discardProcess(pid: number): void {
+    this.execPidAliases.delete(pid);
     this.cleanupFds(pid);
     this.reapProcess(pid);
   }
@@ -602,6 +671,12 @@ export class ProcessKernel {
     }
   }
 
+  private notifyParentOfChildExit(pid: number): void {
+    const ppid = this.parentPids.get(pid);
+    if (!ppid || ppid === NO_PARENT_PID) return;
+    this.processTable.get(ppid)?.wasiHost?.queueSignal(SIGCHLD);
+  }
+
   async waitpid(pid: number, parentPid?: number): Promise<number> {
     if (parentPid !== undefined && !this.isChildOf(pid, parentPid)) return -1;
     const entry = this.processTable.get(pid);
@@ -615,6 +690,41 @@ export class ProcessKernel {
       entry.waiters.push((exitCode) => {
         this.reapProcess(pid);
         resolve(exitCode);
+      });
+    });
+  }
+
+  async waitpidInterruptible(
+    pid: number,
+    parentPid: number | undefined,
+    interrupt: Promise<void>,
+  ): Promise<{ interrupted: true } | { interrupted: false; exitCode: number }> {
+    if (parentPid !== undefined && !this.isChildOf(pid, parentPid)) {
+      return { interrupted: false, exitCode: -1 };
+    }
+    const entry = this.processTable.get(pid);
+    if (!entry) return { interrupted: false, exitCode: -1 };
+    if (entry.state === "exited") {
+      const exitCode = entry.exitCode;
+      this.reapProcess(pid);
+      return { interrupted: false, exitCode };
+    }
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const waiter = (exitCode: number) => {
+        if (settled) return;
+        settled = true;
+        this.reapProcess(pid);
+        resolve({ interrupted: false, exitCode });
+      };
+      entry.waiters.push(waiter);
+      interrupt.then(() => {
+        if (settled) return;
+        settled = true;
+        const index = entry.waiters.indexOf(waiter);
+        if (index >= 0) entry.waiters.splice(index, 1);
+        resolve({ interrupted: true });
       });
     });
   }
@@ -635,6 +745,32 @@ export class ProcessKernel {
     return this.processTable.has(pid);
   }
 
+  private procFdsFor(pid: number): number[] {
+    const fdTable = this.fdTables.get(pid);
+    if (!fdTable) return [];
+
+    const visible = new Set<number>();
+    const pseudoDirs: number[] = [];
+    for (const [fd, target] of fdTable) {
+      if (fd === 3 && target.type === "vfs_dir" && target.path === "/") {
+        continue;
+      }
+      if (fd >= 100 && target.type === "vfs_dir") {
+        pseudoDirs.push(fd);
+        continue;
+      }
+      visible.add(fd);
+    }
+
+    for (const fd of pseudoDirs.sort((a, b) => a - b)) {
+      let displayFd = 3;
+      while (visible.has(displayFd)) displayFd++;
+      visible.add(displayFd);
+    }
+
+    return Array.from(visible).sort((a, b) => a - b);
+  }
+
   listProcesses(): {
     pid: number;
     ppid: number;
@@ -643,6 +779,7 @@ export class ProcessKernel {
     state: string;
     exit_code: number;
     command: string;
+    fds: number[];
   }[] {
     const result: {
       pid: number;
@@ -652,16 +789,25 @@ export class ProcessKernel {
       state: string;
       exit_code: number;
       command: string;
+      fds: number[];
     }[] = [];
+    const hiddenExecWrappers = new Set<number>();
+    for (const [replacementPid, visiblePid] of this.execPidAliases) {
+      const replacement = this.processTable.get(replacementPid);
+      if (replacement?.state === "running") hiddenExecWrappers.add(visiblePid);
+    }
     for (const [pid, entry] of this.processTable) {
+      const visiblePid = this.getVisiblePid(pid);
+      if (visiblePid === pid && hiddenExecWrappers.has(pid)) continue;
       result.push({
-        pid,
-        ppid: this.parentPids.get(pid) ?? 0,
+        pid: visiblePid,
+        ppid: this.parentPids.get(visiblePid) ?? 0,
         pgid: entry.pgid,
         sid: entry.sid,
         state: entry.state,
         exit_code: entry.exitCode,
         command: entry.command ?? "",
+        fds: this.procFdsFor(pid),
       });
     }
     return result;
@@ -672,16 +818,65 @@ export class ProcessKernel {
     if (!fdTable) throw new Error(`No fd table for pid ${pid}`);
     const srcTarget = fdTable.get(fd);
     if (!srcTarget) throw new Error(`dup: fd ${fd} not found`);
-    // Add ref for pipes
-    if (srcTarget.type === "pipe_write") srcTarget.pipe.addRef();
-    if (srcTarget.type === "pipe_read") srcTarget.pipe.addRef();
-    if (srcTarget.type === "vfs_file") srcTarget.refs++;
-    if (srcTarget.type === "socket") srcTarget.refs++;
-    // Allocate a new fd number
     let nextFd = this.nextFds.get(pid) ?? KERNEL_FD_BASE;
+    while (fdTable.has(nextFd)) nextFd++;
     const newFd = nextFd++;
     this.nextFds.set(pid, nextFd);
-    fdTable.set(newFd, srcTarget);
+    if (srcTarget.type === "vfs_file") {
+      srcTarget.fdTable.dupToShared(srcTarget.fd, newFd);
+      fdTable.set(newFd, { ...srcTarget, fd: newFd, refs: 1 });
+    } else {
+      this.retainTarget(srcTarget);
+      fdTable.set(newFd, srcTarget);
+    }
+    this.fdDescriptorFlags.get(pid)?.delete(newFd);
+    return newFd;
+  }
+
+  dupFromProcess(callerPid: number, sourcePid: number, fd: number): number {
+    const callerFdTable = this.fdTables.get(callerPid);
+    if (!callerFdTable) throw new Error(`No fd table for caller pid ${callerPid}`);
+    const sourceFdTable = this.fdTables.get(sourcePid);
+    if (!sourceFdTable) throw new Error(`No fd table for source pid ${sourcePid}`);
+    const srcTarget = sourceFdTable.get(fd);
+    if (!srcTarget) throw new Error(`dupFromProcess: fd ${fd} not found for pid ${sourcePid}`);
+
+    let nextFd = this.nextFds.get(callerPid) ?? KERNEL_FD_BASE;
+    while (callerFdTable.has(nextFd)) nextFd++;
+    const newFd = nextFd++;
+    this.nextFds.set(callerPid, nextFd);
+
+    if (srcTarget.type === "vfs_file") {
+      const vfsFd = srcTarget.fdTable.dupShared(srcTarget.fd);
+      callerFdTable.set(newFd, { ...srcTarget, fd: vfsFd, refs: 1 });
+    } else {
+      this.retainTarget(srcTarget);
+      callerFdTable.set(newFd, srcTarget);
+    }
+    this.fdDescriptorFlags.get(callerPid)?.delete(newFd);
+    return newFd;
+  }
+
+  dupMin(pid: number, fd: number, minFd: number): number {
+    if (minFd < 0) throw new Error(`dupMin: invalid min fd ${minFd}`);
+    const fdTable = this.fdTables.get(pid);
+    if (!fdTable) throw new Error(`No fd table for pid ${pid}`);
+    const srcTarget = fdTable.get(fd);
+    if (!srcTarget) throw new Error(`dupMin: src fd ${fd} not found`);
+
+    let newFd = minFd;
+    while (fdTable.has(newFd)) newFd++;
+
+    if (srcTarget.type === "vfs_file") {
+      srcTarget.fdTable.dupToShared(srcTarget.fd, newFd);
+      fdTable.set(newFd, { ...srcTarget, fd: newFd, refs: 1 });
+    } else {
+      this.retainTarget(srcTarget);
+      fdTable.set(newFd, srcTarget);
+    }
+    this.fdDescriptorFlags.get(pid)?.delete(newFd);
+    const nextFd = this.nextFds.get(pid) ?? KERNEL_FD_BASE;
+    if (newFd >= nextFd) this.nextFds.set(pid, newFd + 1);
     return newFd;
   }
 
@@ -696,12 +891,14 @@ export class ProcessKernel {
     if (existing) {
       this.closeTarget(existing);
     }
-    // Point dst to same target as src (add ref for pipes)
-    if (srcTarget.type === "pipe_write") srcTarget.pipe.addRef();
-    if (srcTarget.type === "pipe_read") srcTarget.pipe.addRef();
-    if (srcTarget.type === "vfs_file") srcTarget.refs++;
-    if (srcTarget.type === "socket") srcTarget.refs++;
-    fdTable.set(dstFd, srcTarget);
+    if (srcTarget.type === "vfs_file") {
+      srcTarget.fdTable.dupToShared(srcTarget.fd, dstFd);
+      fdTable.set(dstFd, { ...srcTarget, fd: dstFd, refs: 1 });
+    } else {
+      this.retainTarget(srcTarget);
+      fdTable.set(dstFd, srcTarget);
+    }
+    this.fdDescriptorFlags.get(pid)?.delete(dstFd);
   }
 
   closeFd(pid: number, fd: number): boolean {
@@ -715,6 +912,7 @@ export class ProcessKernel {
     this.unlockFile(pid, fd);
     this.closeTarget(target);
     fdTable.delete(fd);
+    this.fdDescriptorFlags.get(pid)?.delete(fd);
     return true;
   }
 
@@ -770,6 +968,8 @@ export class ProcessKernel {
         // Init auto-reaps already-exited orphans — no zombie accumulation.
         this.processTable.delete(childPid);
         this.fdTables.delete(childPid);
+        this.fdDescriptorFlags.delete(childPid);
+        this.execPidAliases.delete(childPid);
         this.nextFds.delete(childPid);
         this.parentPids.delete(childPid);
         this.children.delete(childPid);
@@ -781,6 +981,8 @@ export class ProcessKernel {
           child.waiters.push(() => {
             this.processTable.delete(childPid);
             this.fdTables.delete(childPid);
+            this.fdDescriptorFlags.delete(childPid);
+            this.execPidAliases.delete(childPid);
             this.nextFds.delete(childPid);
             this.parentPids.delete(childPid);
             this.children.delete(childPid);
@@ -821,8 +1023,7 @@ export class ProcessKernel {
     if (target.type === "pipe_write") target.pipe.close();
     if (target.type === "pipe_read") target.pipe.close();
     if (target.type === "vfs_file") {
-      target.refs--;
-      if (target.refs <= 0) {
+      if (target.fdTable.isOpen(target.fd)) {
         target.fdTable.close(target.fd);
       }
     }
@@ -841,6 +1042,13 @@ export class ProcessKernel {
     }
   }
 
+  private retainTarget(target: FdTarget): void {
+    if (target.type === "pipe_write") target.pipe.addRef();
+    if (target.type === "pipe_read") target.pipe.addRef();
+    if (target.type === "vfs_file") target.fdTable.retain(target.fd);
+    if (target.type === "socket") target.refs++;
+  }
+
   private reapProcess(pid: number): void {
     if (pid === INIT_PID) return;
     this.cleanupFds(pid);
@@ -850,7 +1058,9 @@ export class ProcessKernel {
     }
     this.processTable.delete(pid);
     this.allocatedPids.delete(pid);
+    this.execPidAliases.delete(pid);
     this.fdTables.delete(pid);
+    this.fdDescriptorFlags.delete(pid);
     this.nextFds.delete(pid);
     this.parentPids.delete(pid);
     this.children.delete(pid);
@@ -859,12 +1069,16 @@ export class ProcessKernel {
   initProcess(pid: number): void {
     if (!this.fdTables.has(pid)) {
       this.fdTables.set(pid, new Map());
+      this.fdDescriptorFlags.set(pid, new Map());
       this.nextFds.set(pid, KERNEL_FD_BASE);
     }
   }
 
   adoptFdTable(pid: number, fdTable: Map<number, FdTarget>): void {
     this.fdTables.set(pid, fdTable);
+    if (!this.fdDescriptorFlags.has(pid)) {
+      this.fdDescriptorFlags.set(pid, new Map());
+    }
     let nextFd = KERNEL_FD_BASE;
     for (const fd of fdTable.keys()) {
       if (fd >= nextFd) nextFd = fd + 1;
@@ -921,6 +1135,58 @@ export class ProcessKernel {
           settle({ pid, exitCode });
         });
       }
+    });
+  }
+
+  async waitAnyChildInterruptible(
+    parentPid: number,
+    interrupt: Promise<void>,
+  ): Promise<
+    | { interrupted: true }
+    | { interrupted: false; result: { pid: number; exitCode: number } | null }
+  > {
+    const exited = this.findExitedChild(parentPid);
+    if (exited) {
+      this.reapProcess(exited.pid);
+      return {
+        interrupted: false,
+        result: { pid: exited.pid, exitCode: exited.exitCode },
+      };
+    }
+
+    const running = this.findRunningChildren(parentPid);
+    if (running.length === 0) return { interrupted: false, result: null };
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const waiters: Array<{ entry: ProcessEntry; waiter: (exitCode: number) => void }> = [];
+      const settle = (
+        result:
+          | { interrupted: true }
+          | { interrupted: false; result: { pid: number; exitCode: number } | null },
+      ) => {
+        if (settled) return;
+        settled = true;
+        for (const { entry, waiter } of waiters) {
+          const index = entry.waiters.indexOf(waiter);
+          if (index >= 0) entry.waiters.splice(index, 1);
+        }
+        resolve(result);
+      };
+      for (const [pid, entry] of running) {
+        const waiter = (exitCode: number) => {
+          if (settled) return;
+          if (!this.processTable.has(pid)) {
+            settle({ interrupted: false, result: { pid, exitCode } });
+            return;
+          }
+          this.reapProcess(pid);
+          settle({ interrupted: false, result: { pid, exitCode } });
+        };
+        waiters.push({ entry, waiter });
+        entry.waiters.push(waiter);
+      }
+      interrupt.then(() => settle({ interrupted: true }));
     });
   }
 
@@ -1097,6 +1363,7 @@ export class ProcessKernel {
       }
     }
     this.fdTables.clear();
+    this.fdDescriptorFlags.clear();
     this.processTable.clear();
     this.allocatedPids.clear();
     this.parentPids.clear();

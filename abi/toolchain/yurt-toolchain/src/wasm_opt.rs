@@ -12,7 +12,7 @@ fn default_args() -> Vec<std::ffi::OsString> {
     ]
 }
 
-fn setjmp_args() -> Vec<std::ffi::OsString> {
+fn continuation_args() -> Vec<std::ffi::OsString> {
     let mut args = default_args();
     args.push("--asyncify".into());
     args
@@ -21,15 +21,15 @@ fn setjmp_args() -> Vec<std::ffi::OsString> {
 /// Run wasm-opt on `path` in place, according to `mode`.
 ///
 /// The default mode applies wasm feature flags and optimizations without
-/// Asyncify. Setjmp/longjmp is an explicit opt-in because it taints the
+/// Asyncify. Continuations are an explicit opt-in because they taint the
 /// process execution strategy: those modules run under the Asyncify adapter
 /// while normal modules remain free to use JSPI or another backend.
-pub fn maybe_run(path: &Path, mode: &WasmOptMode, use_setjmp: bool) -> Result<()> {
+pub fn maybe_run(path: &Path, mode: &WasmOptMode, use_continuation: bool) -> Result<()> {
     let args: Vec<std::ffi::OsString> = match mode {
         WasmOptMode::Disabled => return Ok(()),
         WasmOptMode::Default => {
-            if use_setjmp {
-                setjmp_args()
+            if use_continuation {
+                continuation_args()
             } else {
                 default_args()
             }
@@ -64,13 +64,13 @@ mod tests {
         assert!(args.contains(&"--enable-nontrapping-float-to-int".to_string()));
         assert!(
             !args.contains(&"--asyncify".to_string()),
-            "default yurt-cc output must not be asyncify/setjmp-tainted",
+            "default yurt-cc output must not be asyncify/continuation-tainted",
         );
     }
 
     #[test]
-    fn setjmp_wasm_opt_flags_enable_asyncify() {
-        let args = super::setjmp_args()
+    fn continuation_wasm_opt_flags_enable_asyncify() {
+        let args = super::continuation_args()
             .into_iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect::<Vec<_>>();

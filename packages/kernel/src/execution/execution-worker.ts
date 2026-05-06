@@ -224,9 +224,12 @@ class WorkerResidentRunner {
       return { data, truncated };
     };
 
-    const argvForSpawn = (req: SpawnRequest): string[] => {
-      const prog = req.prog.includes('/') ? req.prog : resolveExecutablePathForVfs(vfs, req.prog);
-      return [prog, ...req.args];
+    const argvForSpawn = (req: SpawnRequest, cwd: string): string[] => {
+      const prog = req.prog.includes('/')
+        ? resolveSpawnPath(req.prog, req.cwd || cwd)
+        : resolveExecutablePathForVfs(vfs, req.prog);
+      const interpreterArgv = resolveShebangInterpreter(vfs, prog);
+      return interpreterArgv ? [...interpreterArgv, prog, ...req.args] : [prog, ...req.args];
     };
 
     const makeContextWithAllocator = (
@@ -270,12 +273,13 @@ class WorkerResidentRunner {
             return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
           },
           spawnProcess: (req, fdTable) => {
-            const childPid = kernel.allocPid(pid, req.prog);
+            const commandLabel = req.argv0 ?? req.prog;
+            const childPid = kernel.allocPid(pid, commandLabel);
             const childCwd = req.cwd || kernel.getCwd(pid);
             kernel.setCwd(childPid, childCwd);
-            kernel.registerPending(childPid, req.prog, pid);
+            kernel.registerPending(childPid, commandLabel, pid);
             kernel.adoptFdTable(childPid, fdTable);
-            const argv = argvForSpawn(req);
+            const argv = argvForSpawn(req, childCwd);
             const childCtx = makeContextWithAllocator(() => childPid);
             loadProcess(childCtx, {
               argv,
@@ -307,6 +311,35 @@ class WorkerResidentRunner {
 
     return makeContextWithAllocator((argv) => kernel.allocPid(INIT_PID, argv[0]));
   }
+}
+
+function resolveSpawnPath(path: string, cwd: string): string {
+  return normalizeVfsPath(path.startsWith('/') ? path : `${cwd}/${path}`);
+}
+
+function normalizeVfsPath(path: string): string {
+  const parts: string[] = [];
+  for (const part of path.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  return `/${parts.join('/')}`;
+}
+
+function resolveShebangInterpreter(vfs: VfsProxy, path: string): string[] | null {
+  const data = vfs.readFile(path);
+  if (data.length < 2 || data[0] !== 0x23 || data[1] !== 0x21) return null;
+  const lineEnd = data.findIndex((byte) => byte === 0x0a || byte === 0x0d);
+  const lineBytes = data.slice(2, lineEnd >= 0 ? lineEnd : data.length);
+  const line = new TextDecoder().decode(lineBytes).trim();
+  if (!line) return null;
+  const parts = line.split(/\s+/);
+  const interpreter = parts[0];
+  const interpreterPath = interpreter.includes('/')
+    ? resolveSpawnPath(interpreter, '/')
+    : resolveExecutablePathForVfs(vfs, interpreter);
+  return [interpreterPath, ...parts.slice(1)];
 }
 
 function resolveExecutablePathForVfs(vfs: VfsProxy, prog: string): string {

@@ -1052,10 +1052,11 @@ export class Sandbox {
             };
           },
           spawnProcess: (req, fdTable) => {
-            const childPid = kernel.allocPid(pid, req.prog);
+            const commandLabel = req.argv0 ?? req.prog;
+            const childPid = kernel.allocPid(pid, commandLabel);
             const childCwd = req.cwd || kernel.getCwd(pid);
             kernel.setCwd(childPid, childCwd);
-            kernel.registerPending(childPid, req.prog, pid);
+            kernel.registerPending(childPid, commandLabel, pid);
             kernel.adoptFdTable(childPid, fdTable);
             const childNice = normalizeNice(
               req.nice ?? kernel.getPriority(pid),
@@ -1085,13 +1086,18 @@ export class Sandbox {
             }
             let argv: string[];
             try {
-              argv = Sandbox.argvForSpawn(vfs, req, kernel.getCredentials(pid));
+              argv = Sandbox.argvForSpawn(
+                vfs,
+                req,
+                kernel.getCredentials(pid),
+                childCwd,
+              );
             } catch (e) {
               kernel.discardProcess(childPid);
               throw e;
             }
             const childCtx = makeContextWithAllocator(() => childPid);
-            const promise = loadProcess(childCtx, {
+            loadProcess(childCtx, {
               argv,
               mode: "cli",
               env: Object.fromEntries(req.env),
@@ -1132,12 +1138,40 @@ export class Sandbox {
     vfs: VfsLike,
     req: SpawnRequest,
     credentials: ProcessCredentials,
+    cwd: string,
   ): string[] {
     const prog = req.prog.includes("/")
-      ? Sandbox.resolveSpawnPath(req.prog, req.cwd || "/")
+      ? Sandbox.resolveSpawnPath(req.prog, req.cwd || cwd)
       : Sandbox.resolveExecutablePathForVfs(vfs, req.prog);
     Sandbox.assertExecutableForSpawn(vfs, prog, credentials);
-    return [prog, ...req.args];
+    const interpreterArgv = Sandbox.resolveShebangInterpreter(
+      vfs,
+      prog,
+      credentials,
+    );
+    return interpreterArgv ? [...interpreterArgv, prog, ...req.args] : [prog, ...req.args];
+  }
+
+  private static resolveShebangInterpreter(
+    vfs: VfsLike,
+    path: string,
+    credentials: ProcessCredentials,
+  ): string[] | null {
+    const data = vfs.readFile(path);
+    if (data.length < 2 || data[0] !== 0x23 || data[1] !== 0x21) {
+      return null;
+    }
+    const lineEnd = data.findIndex((byte) => byte === 0x0a || byte === 0x0d);
+    const lineBytes = data.slice(2, lineEnd >= 0 ? lineEnd : data.length);
+    const line = new TextDecoder().decode(lineBytes).trim();
+    if (!line) return null;
+    const parts = line.split(/\s+/);
+    const interpreter = parts[0];
+    const interpreterPath = interpreter.includes("/")
+      ? Sandbox.resolveSpawnPath(interpreter, "/")
+      : Sandbox.resolveExecutablePathForVfs(vfs, interpreter);
+    Sandbox.assertExecutableForSpawn(vfs, interpreterPath, credentials);
+    return [interpreterPath, ...parts.slice(1)];
   }
 
   private static resolveSpawnPath(path: string, cwd: string): string {
@@ -1517,6 +1551,11 @@ export class Sandbox {
     this.vfs.mkdir(path);
   }
 
+  chmod(path: string, mode: number): void {
+    this.assertAlive();
+    this.vfs.chmod(path, mode);
+  }
+
   stat(path: string): StatResult {
     this.assertAlive();
     return this.vfs.stat(path);
@@ -1531,6 +1570,7 @@ export class Sandbox {
     mode?: ProcessMode;
     env?: Record<string, string>;
     cwd?: string;
+    stderrToStdout?: boolean;
     bootImports?: (api: KernelApi) => Record<string, WebAssembly.ImportValue>;
   } = {}): Promise<Process> {
     this.assertAlive();
@@ -1559,6 +1599,7 @@ export class Sandbox {
       mode: opts.mode ?? "cli",
       env: opts.env ?? Object.fromEntries(this.env),
       cwd: opts.cwd ?? "/",
+      stderrToStdout: opts.stderrToStdout,
       stdoutLimit: this.security?.limits?.stdoutBytes,
       stderrLimit: this.security?.limits?.stderrBytes,
       extraYurtImports: Sandbox.createBootImportFactory(

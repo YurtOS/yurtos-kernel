@@ -38,7 +38,11 @@ async fn echo_hello() {
     let exit_code = result["exit_code"].as_i64().unwrap_or(-1);
     assert_eq!(exit_code, 0, "exit_code should be 0, got: {result}");
     let stdout = inst.take_stdout();
-    assert_eq!(stdout.as_ref(), b"hello\n", "stdout should be 'hello\\n', got: {stdout:?}");
+    assert_eq!(
+        stdout.as_ref(),
+        b"hello\n",
+        "stdout should be 'hello\\n', got: {stdout:?}"
+    );
 }
 
 #[tokio::test]
@@ -76,7 +80,11 @@ async fn write_then_cat() {
     let exit_code = result["exit_code"].as_i64().unwrap_or(-1);
     assert_eq!(exit_code, 0, "exit_code should be 0, got: {result}");
     let stdout = inst.take_stdout();
-    assert_eq!(stdout.as_ref(), b"ok\n", "test -f should confirm file exists, got: {stdout:?}");
+    assert_eq!(
+        stdout.as_ref(),
+        b"ok\n",
+        "test -f should confirm file exists, got: {stdout:?}"
+    );
 }
 
 #[tokio::test]
@@ -85,7 +93,10 @@ async fn exit_code_propagated() {
     let mut inst = make_instance().await.expect("ShellInstance::new");
     let result = inst.run_command("false").await.expect("run_command");
     let exit_code = result["exit_code"].as_i64().unwrap_or(0);
-    assert_ne!(exit_code, 0, "exit_code should be non-zero for 'false', got: {result}");
+    assert_ne!(
+        exit_code, 0,
+        "exit_code should be non-zero for 'false', got: {result}"
+    );
 }
 
 #[tokio::test]
@@ -99,7 +110,10 @@ async fn stderr_captured() {
     let mut inst = make_instance().await.expect("ShellInstance::new");
     let result = inst.run_command("echo err >&2").await.expect("run_command");
     let exit_code = result["exit_code"].as_i64().unwrap_or(-1);
-    assert_eq!(exit_code, 0, "exit_code should be 0 for echo err >&2, got: {result}");
+    assert_eq!(
+        exit_code, 0,
+        "exit_code should be 0 for echo err >&2, got: {result}"
+    );
     // The redirected output lands in one of the two pipes; total bytes must be non-zero.
     let stdout = inst.take_stdout();
     let stderr = inst.take_stderr();

@@ -18,7 +18,12 @@ pub struct InodeMeta {
 impl InodeMeta {
     pub fn new(permissions: u32) -> Self {
         let now = now_ms();
-        Self { permissions, mtime: now, ctime: now, atime: now }
+        Self {
+            permissions,
+            mtime: now,
+            ctime: now,
+            atime: now,
+        }
     }
 }
 
@@ -47,7 +52,10 @@ pub enum Inode {
 
 impl Inode {
     pub fn new_file(permissions: u32, content: Vec<u8>) -> Self {
-        Self::File { meta: InodeMeta::new(permissions), content: Arc::new(content) }
+        Self::File {
+            meta: InodeMeta::new(permissions),
+            content: Arc::new(content),
+        }
     }
 
     pub fn new_dir(permissions: u32) -> Self {
@@ -58,7 +66,10 @@ impl Inode {
     }
 
     pub fn new_symlink(target: String) -> Self {
-        Self::Symlink { meta: InodeMeta::new(0o777), target }
+        Self::Symlink {
+            meta: InodeMeta::new(0o777),
+            target,
+        }
     }
 
     pub fn meta(&self) -> &InodeMeta {

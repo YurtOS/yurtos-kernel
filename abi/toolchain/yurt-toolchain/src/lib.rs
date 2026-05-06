@@ -111,4 +111,7 @@ pub const WRAPPED_WASI_LIBC_SYMBOLS: &[&str] = &[
     "send",
 ];
 
-pub const YURT_INTERNAL_EXPORTS: &[&str] = &["yurt_deliver_signal"];
+pub const YURT_INTERNAL_EXPORTS: &[&str] = &[
+    "__stack_pointer",
+    "yurt_deliver_signal",
+];

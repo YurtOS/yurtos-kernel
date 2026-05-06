@@ -3887,6 +3887,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "wasmtime-wasi",
+ "wat",
  "wiremock",
 ]
 

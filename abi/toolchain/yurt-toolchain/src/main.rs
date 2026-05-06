@@ -87,10 +87,10 @@ fn build_clang_invocation(
             argv.push("-Wl,--whole-archive".into());
             argv.push(archive.clone().into_os_string());
             argv.push("-Wl,--no-whole-archive".into());
-            if env.use_setjmp {
-                if let Some(setjmp_archive) = env.setjmp_archive.as_ref() {
+            if env.use_continuation {
+                if let Some(continuation_archive) = env.continuation_archive.as_ref() {
                     argv.push("-Wl,--whole-archive".into());
-                    argv.push(setjmp_archive.clone().into_os_string());
+                    argv.push(continuation_archive.clone().into_os_string());
                     argv.push("-Wl,--no-whole-archive".into());
                 }
             }
@@ -119,7 +119,8 @@ fn build_clang_invocation(
     if env.markers_enabled {
         argv.push("-DYURT_ABI_MARKERS=1".into());
     }
-    if env.use_setjmp {
+    if env.use_continuation {
+        argv.push("-DYURT_USE_CONTINUATION=1".into());
         argv.push("-DYURT_USE_SETJMP=1".into());
     }
     argv
@@ -173,9 +174,9 @@ fn main() -> Result<ExitCode> {
             preserve::copy_to_preserve(&out_wasm, env.preserve_pre_opt.as_deref())?;
         }
         if let Some(out_path) = preserve::output_path(&cli.args) {
-            wasm_opt::maybe_run(&out_path, &env.wasm_opt, env.use_setjmp)?;
-            if env.use_setjmp {
-                features::append_setjmp_features(&out_path)?;
+            wasm_opt::maybe_run(&out_path, &env.wasm_opt, env.use_continuation)?;
+            if env.use_continuation {
+                features::append_continuation_features(&out_path)?;
             }
         }
     }

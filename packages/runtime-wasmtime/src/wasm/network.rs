@@ -142,5 +142,8 @@ fn error_result(msg: &str) -> String {
         body_base64: None,
         error: Some(msg),
     })
-    .unwrap_or_else(|_| r#"{"ok":false,"status":0,"headers":{},"body":"","error":"serialization failed"}"#.to_owned())
+    .unwrap_or_else(|_| {
+        r#"{"ok":false,"status":0,"headers":{},"body":"","error":"serialization failed"}"#
+            .to_owned()
+    })
 }

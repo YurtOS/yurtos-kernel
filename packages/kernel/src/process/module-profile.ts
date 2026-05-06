@@ -40,7 +40,8 @@ export function analyzeYurtModule(
   const requiresAsyncify = importsFork || hasSetjmpFeature ||
     hasContinuationsFeature;
   const jspiAvailable = opts.jspiAvailable ??
-    typeof WebAssembly.Suspending === "function";
+    typeof (WebAssembly as unknown as { Suspending?: unknown }).Suspending ===
+      "function";
 
   return {
     importsSetjmp,
@@ -61,12 +62,12 @@ export function validateYurtModuleProfile(
     !hasAnyAsyncifyFeature(profile)
   ) {
     throw new Error(
-      "module imports yurt continuation host calls but lacks yurt.features setjmp marker; rebuild with yurt-cc YURT_CC_USE_SETJMP=1",
+      "module imports yurt continuation host calls but lacks yurt.features continuations marker; rebuild with yurt-cc YURT_CC_USE_CONTINUATION=1",
     );
   }
   if (profile.requiresAsyncify && !profile.hasAsyncify) {
     throw new Error(
-      "module declares yurt.features setjmp/continuations but is not asyncify-instrumented",
+      "module declares yurt.features continuations but is not asyncify-instrumented",
     );
   }
   return profile;

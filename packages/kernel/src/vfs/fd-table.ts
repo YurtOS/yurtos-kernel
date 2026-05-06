@@ -250,6 +250,12 @@ export class FdTable {
     return Array.from(this.entries.keys());
   }
 
+  /** Retain another process/kernel descriptor reference to an fd entry. */
+  retain(fd: number): void {
+    const entry = this.getEntry(fd);
+    entry.refs++;
+  }
+
   /** Move an fd entry from one number to another. Closes toFd if open. */
   renumber(fromFd: number, toFd: number): void {
     const entry = this.entries.get(fromFd);
@@ -272,6 +278,31 @@ export class FdTable {
     }
   }
 
+  /** Duplicate an fd to an exact number, sharing the same open file description. */
+  dupToShared(fromFd: number, toFd: number): void {
+    const entry = this.getEntry(fromFd);
+    if (fromFd === toFd) return;
+    if (this.entries.has(toFd)) {
+      this.close(toFd);
+    }
+    entry.refs++;
+    this.entries.set(toFd, entry);
+    if (toFd >= this.nextFd) {
+      this.nextFd = toFd + 1;
+    }
+  }
+
+  /** Duplicate an fd to the next available number, sharing the same open file description. */
+  dupShared(fd: number): number {
+    const entry = this.getEntry(fd);
+    let newFd = this.nextFd;
+    while (this.entries.has(newFd)) newFd++;
+    entry.refs++;
+    this.entries.set(newFd, entry);
+    this.nextFd = newFd + 1;
+    return newFd;
+  }
+
   /** Return the VFS path for an open fd, or undefined if not open. */
   getPath(fd: number): string | undefined {
     return this.entries.get(fd)?.path;
@@ -279,6 +310,27 @@ export class FdTable {
 
   getMode(fd: number): OpenMode | undefined {
     return this.entries.get(fd)?.mode;
+  }
+
+  /** Duplicate an fd into a detached table over the same VFS. */
+  duplicateDetached(fd: number): { table: FdTable; fd: number } {
+    const entry = this.getEntry(fd);
+    const table = new FdTable(this.vfs);
+    const childFd = table.open(entry.path, entry.mode);
+    table.seek(childFd, entry.offset, 'set');
+    return { table, fd: childFd };
+  }
+
+  /** Duplicate an fd into a detached table, sharing the same open file description. */
+  duplicateSharedDetached(fd: number, preferredFd = fd): { table: FdTable; fd: number } {
+    const entry = this.getEntry(fd);
+    const table = new FdTable(this.vfs);
+    let childFd = preferredFd;
+    while (table.entries.has(childFd)) childFd++;
+    entry.refs++;
+    table.entries.set(childFd, entry);
+    table.nextFd = childFd + 1;
+    return { table, fd: childFd };
   }
 
   /** Clone the fd table for fork, sharing POSIX open file descriptions. */

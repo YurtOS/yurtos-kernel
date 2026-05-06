@@ -1,14 +1,18 @@
 //! Integration tests for network::fetch (no WASM needed).
 
-use yurt_runtime_wasmtime::wasm::network;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+use yurt_runtime_wasmtime::wasm::network;
 
 #[tokio::test]
 async fn invalid_json_returns_error() {
     let result_str = network::fetch("not json").await;
-    let v: serde_json::Value = serde_json::from_str(&result_str).expect("result should be valid JSON");
-    assert_eq!(v["ok"], false, "ok should be false for invalid JSON request");
+    let v: serde_json::Value =
+        serde_json::from_str(&result_str).expect("result should be valid JSON");
+    assert_eq!(
+        v["ok"], false,
+        "ok should be false for invalid JSON request"
+    );
     let error = v["error"].as_str().unwrap_or("");
     assert!(
         error.to_lowercase().contains("invalid request"),
@@ -30,7 +34,8 @@ async fn get_request_ok() {
         "method": "GET"
     });
     let result_str = network::fetch(&req.to_string()).await;
-    let v: serde_json::Value = serde_json::from_str(&result_str).expect("result should be valid JSON");
+    let v: serde_json::Value =
+        serde_json::from_str(&result_str).expect("result should be valid JSON");
     assert_eq!(v["ok"], true, "ok should be true for 200 response");
     assert_eq!(v["status"], 200, "status should be 200");
     assert_eq!(v["body"], "world", "body should be 'world'");
@@ -51,7 +56,8 @@ async fn post_with_body() {
         "body": "payload"
     });
     let result_str = network::fetch(&req.to_string()).await;
-    let v: serde_json::Value = serde_json::from_str(&result_str).expect("result should be valid JSON");
+    let v: serde_json::Value =
+        serde_json::from_str(&result_str).expect("result should be valid JSON");
     assert_eq!(v["ok"], true, "ok should be true for 201 response");
     assert_eq!(v["status"], 201, "status should be 201");
 }
@@ -70,7 +76,8 @@ async fn error_status_sets_ok_false() {
         "method": "GET"
     });
     let result_str = network::fetch(&req.to_string()).await;
-    let v: serde_json::Value = serde_json::from_str(&result_str).expect("result should be valid JSON");
+    let v: serde_json::Value =
+        serde_json::from_str(&result_str).expect("result should be valid JSON");
     assert_eq!(v["ok"], false, "ok should be false for 404 response");
     assert_eq!(v["status"], 404, "status should be 404");
 }
@@ -89,7 +96,8 @@ async fn binary_response_uses_base64() {
         "method": "GET"
     });
     let result_str = network::fetch(&req.to_string()).await;
-    let v: serde_json::Value = serde_json::from_str(&result_str).expect("result should be valid JSON");
+    let v: serde_json::Value =
+        serde_json::from_str(&result_str).expect("result should be valid JSON");
     assert_eq!(v["ok"], true, "ok should be true for 200 response");
     assert_eq!(v["body"], "", "body should be empty for non-UTF8 response");
     assert!(

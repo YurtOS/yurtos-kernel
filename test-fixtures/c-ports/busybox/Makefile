@@ -11,7 +11,7 @@ SRC_DIR := src
 COMPAT_INCLUDE := $(abspath compat/include)
 ABI_INCLUDE := $(REPO_ROOT)/abi/include
 ABI_LIB := $(REPO_ROOT)/abi/build/libyurt_abi.a
-YURT_SETJMP_LIB := $(REPO_ROOT)/abi/build/libyurt_setjmp.a
+YURT_CONTINUATION_LIB := $(REPO_ROOT)/abi/build/libyurt_continuation.a
 
 YURT_CC := $(REPO_ROOT)/target/release/yurt-cc
 YURT_AR := $(REPO_ROOT)/target/release/yurt-ar
@@ -19,12 +19,12 @@ YURT_RANLIB := $(REPO_ROOT)/target/release/yurt-ranlib
 
 # `-mllvm -wasm-enable-sjlj` would lower setjmp/longjmp via the wasm
 # exception-handling proposal (calls __wasm_setjmp / __wasm_longjmp).
-# Yurt implements POSIX setjmp/longjmp on top of binaryen Asyncify
-# instead. BusyBox needs YURT_CC_USE_SETJMP so yurt-cc links the
-# setjmp archive, applies --asyncify, and marks the resulting WASM
-# for the runtime. So we want the *plain* setjmp/longjmp prototypes
-# here, not the wasm-EH-lowered ones.
-WASI_EMULATED_CFLAGS := -I$(COMPAT_INCLUDE) -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -DSOCK_RAW=3 -DSOCK_RDM=4 -DSOCK_SEQPACKET=5
+# Yurt implements POSIX setjmp/longjmp and fork on top of binaryen
+# Asyncify continuations instead. BusyBox needs YURT_CC_USE_CONTINUATION
+# so yurt-cc links the continuation archive, applies --asyncify, and marks
+# the resulting WASM for the runtime. So we want the *plain* setjmp/longjmp
+# prototypes here, not the wasm-EH-lowered ones.
+WASI_EMULATED_CFLAGS := -I$(COMPAT_INCLUDE) -D__linux__ -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -DSOCK_RAW=3 -DSOCK_RDM=4 -DSOCK_SEQPACKET=5
 WASI_EMULATED_LDFLAGS := -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -Wl,-u,__main_argc_argv
 
 .PHONY: all fetch configure copy-fixtures clean ensure-toolchain ensure-compat
@@ -39,7 +39,7 @@ ensure-toolchain:
 	cd $(REPO_ROOT) && cargo build --release -p yurt-toolchain
 
 ensure-compat:
-	$(MAKE) -C $(REPO_ROOT)/abi lib
+	$(MAKE) -C $(REPO_ROOT)/abi lib build/libyurt_continuation.a
 
 fetch:
 	mkdir -p $(BUILD_DIR) $(SRC_DIR)
@@ -95,8 +95,8 @@ configure: fetch busybox.config compat/include/paths.h ensure-toolchain
 $(BUILD_DIR)/busybox.wasm: configure ensure-compat
 	cd $(SRC_DIR) && \
 		YURT_CC_ARCHIVE="$(ABI_LIB)" \
-		YURT_CC_SETJMP_ARCHIVE="$(YURT_SETJMP_LIB)" \
-		YURT_CC_USE_SETJMP=1 \
+		YURT_CC_CONTINUATION_ARCHIVE="$(YURT_CONTINUATION_LIB)" \
+		YURT_CC_USE_CONTINUATION=1 \
 		YURT_CC_INCLUDE="$(ABI_INCLUDE)" \
 		$(MAKE) CC="$(YURT_CC)" AR="$(YURT_AR)" RANLIB="$(YURT_RANLIB)" \
 			EXTRA_CFLAGS="$(WASI_EMULATED_CFLAGS)" \
