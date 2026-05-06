@@ -164,6 +164,38 @@ fn dry_run_marks_setjmp_opt_in_builds() {
 }
 
 #[test]
+fn dry_run_marks_continuation_opt_in_builds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("share/wasi-sysroot")).unwrap();
+    let clang = root.join("bin/clang");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&clang, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&clang, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = Command::new(bin())
+        .env("WASI_SDK_PATH", root)
+        .env("YURT_CC_ARCHIVE", "/fake/libyurt.a")
+        .env("YURT_CC_CONTINUATION_ARCHIVE", "/fake/libyurt_continuation.a")
+        .env("YURT_CC_INCLUDE", "/fake/include")
+        .env("YURT_CC_SKIP_VERSION_CHECK", "1")
+        .env("YURT_CC_USE_CONTINUATION", "1")
+        .arg("--dry-run")
+        .arg("foo.c")
+        .arg("-o")
+        .arg("foo.wasm")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("-DYURT_USE_CONTINUATION=1"), "{stdout}");
+    assert!(stdout.contains("/fake/libyurt_continuation.a"), "{stdout}");
+}
+
+#[test]
 fn missing_version_sentinel_is_a_hard_error() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

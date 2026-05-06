@@ -234,6 +234,20 @@ describe('Kernel ABI canaries', () => {
       expect(r.exitCode).toBe(0);
       expect(r.stdout.trim()).toMatch(/^fork-ok child=\d+ parent=\d+$/);
     });
+
+    it('preserves pre-fork continuation frames in children', async () => {
+      sandbox = await Sandbox.create({ wasmDir: FIXTURES, adapter: new NodeAdapter() });
+      const cases = [
+        ['child-longjmp-prefork', 'fork-child-longjmp-ok'],
+        ['child-nested-longjmp-prefork', 'fork-child-nested-longjmp-ok'],
+        ['child-wait-longjmp-prefork', 'fork-child-wait-longjmp-ok'],
+      ];
+      for (const [caseName, expected] of cases) {
+        const r = await sandbox.run(`fork-canary --case ${caseName}`);
+        expect(r.exitCode).toBe(0);
+        expect(r.stdout.trim()).toBe(expected);
+      }
+    });
   });
 
   it('routes stderr through stdout after dup2(1, 2)', async () => {

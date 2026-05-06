@@ -1,8 +1,10 @@
 import { beforeEach, describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
-import { WasiHost } from "../wasi-host.js";
+import { WasiExitError, WasiHost } from "../wasi-host.js";
 import { VFS } from "../../vfs/vfs.js";
 import { ProcessKernel } from "../../process/kernel.js";
+import { createAsyncPipe } from "../../vfs/pipe.js";
+import type { FdTarget } from "../fd-target.js";
 import {
   WASI_EBADF,
   WASI_EMFILE,
@@ -147,6 +149,70 @@ describe("WasiHost", () => {
     });
   });
 
+  describe("fd_write to pipe", () => {
+    it("suspends and completes a pipe write larger than pipe capacity", async () => {
+      const [readEnd, writeEnd] = createAsyncPipe(8);
+      host = new WasiHost({
+        vfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+        ioFds: new Map([[4, { type: "pipe_write", pipe: writeEnd }]]),
+        canSuspendPipeReads: true,
+      });
+      host.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+      const payload = new TextEncoder().encode("abcdefghijklmnopqrst");
+      bytes.set(payload, 200);
+      view.setUint32(100, 200, true);
+      view.setUint32(104, payload.length, true);
+
+      const writePromise = wasi.fd_write(4, 100, 1, 300) as Promise<number>;
+      const received: number[] = [];
+      for (let i = 0; i < 3; i++) {
+        await new Promise(resolve => setTimeout(resolve, 0));
+        const chunk = new Uint8Array(8);
+        const n = await readEnd.read(chunk);
+        received.push(...chunk.subarray(0, n));
+      }
+
+      const errno = await writePromise;
+      expect(errno).toBe(WASI_ESUCCESS);
+      expect(view.getUint32(300, true)).toBe(payload.length);
+      expect(new TextDecoder().decode(new Uint8Array(received))).toBe("abcdefghijklmnopqrst");
+    });
+
+    it("delivers SIGPIPE when the read end is closed", async () => {
+      const [readEnd, writeEnd] = createAsyncPipe(8);
+      readEnd.close();
+      host = new WasiHost({
+        vfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+        ioFds: new Map([[4, { type: "pipe_write", pipe: writeEnd }]]),
+      });
+      host.setMemory(memory);
+      host.setSignalDeliverer((sig) => {
+        expect(sig).toBe(13);
+        throw new WasiExitError(128 + sig);
+      });
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+      bytes.set(new TextEncoder().encode("hello"), 200);
+      view.setUint32(100, 200, true);
+      view.setUint32(104, 5, true);
+
+      let error: unknown;
+      try {
+        await wasi.fd_write(4, 100, 1, 300);
+      } catch (err) {
+        error = err;
+      }
+      expect(error).toBeInstanceOf(WasiExitError);
+      expect((error as WasiExitError).code).toBe(141);
+    });
+  });
+
   describe("fd_write to file", () => {
     it("writes data to a VFS file via FdTable", () => {
       const { wasi, view, bytes } = getImportsAndView(host, memory);
@@ -267,6 +333,45 @@ describe("WasiHost", () => {
       const errno = wasi.fd_close(99);
       expect(errno).toBe(WASI_EBADF);
     });
+
+    it("keeps the hidden root preopen available when POSIX code closes fd 3", () => {
+      const { wasi, view } = getImportsAndView(host, memory);
+
+      expect(wasi.fd_close(3)).toBe(WASI_ESUCCESS);
+      expect(wasi.fd_prestat_get(3, 0)).toBe(WASI_ESUCCESS);
+      expect(view.getUint8(0)).toBe(WASI_PREOPENTYPE_DIR);
+    });
+
+    it("removes closed kernel-managed descriptors from the WASI fd mirror", () => {
+      const kernel = new ProcessKernel();
+      const pid = kernel.allocPid(1, "program");
+      const [readEnd, writeEnd] = createAsyncPipe(8);
+      const ioFds = new Map<number, FdTarget>();
+      const writeTarget: FdTarget = { type: "pipe_write", pipe: writeEnd };
+      kernel.setFdTarget(pid, 4, writeTarget);
+      ioFds.set(4, writeTarget);
+      host = new WasiHost({
+        vfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+        ioFds,
+        kernel,
+        pid,
+      });
+      host.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      expect(wasi.fd_close(4)).toBe(WASI_ESUCCESS);
+      expect(kernel.getFdTarget(pid, 4)).toBeNull();
+      expect(host.getIoFds().has(4)).toBe(false);
+
+      bytes.set(new TextEncoder().encode("x"), 200);
+      view.setUint32(100, 200, true);
+      view.setUint32(104, 1, true);
+      expect(wasi.fd_write(4, 100, 1, 300)).toBe(WASI_EBADF);
+      readEnd.close();
+    });
   });
 
   describe("clock_time_get", () => {
@@ -275,7 +380,7 @@ describe("WasiHost", () => {
       const errno = wasi.clock_time_get(0, BigInt(0), 100);
       expect(errno).toBe(WASI_ESUCCESS);
       const timestamp = view.getBigUint64(100, true);
-      expect(timestamp).toBeGreaterThan(BigInt(0));
+      expect(timestamp > BigInt(0)).toBe(true);
     });
 
     it("returns a nanosecond timestamp for monotonic clock", () => {
@@ -283,7 +388,7 @@ describe("WasiHost", () => {
       const errno = wasi.clock_time_get(1, BigInt(0), 100);
       expect(errno).toBe(WASI_ESUCCESS);
       const timestamp = view.getBigUint64(100, true);
-      expect(timestamp).toBeGreaterThan(BigInt(0));
+      expect(timestamp > BigInt(0)).toBe(true);
     });
   });
 
@@ -703,6 +808,29 @@ describe("WasiHost", () => {
       expect(errno).toBe(WASI_ESUCCESS);
       expect(view.getUint8(116)).toBe(WASI_FILETYPE_DIRECTORY);
     });
+
+    it("presents /dev/fd as the current process fd directory", () => {
+      const kernel = new ProcessKernel();
+      const pid = kernel.allocPid(1, "program");
+      vfs.setProcessListProvider(() => kernel.listProcesses());
+      host = new WasiHost({
+        vfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+        kernel,
+        pid,
+      });
+      host.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = "/dev/fd";
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+
+      const errno = wasi.path_filestat_get(3, 0, 500, pathStr.length, 100);
+      expect(errno).toBe(WASI_ESUCCESS);
+      expect(view.getUint8(116)).toBe(WASI_FILETYPE_DIRECTORY);
+    });
   });
 
   describe("fd_readdir", () => {
@@ -729,6 +857,43 @@ describe("WasiHost", () => {
       const dirFd = view.getUint32(400, true);
 
       // Read directory entries: fd_readdir(fd, buf, buf_len, cookie, bufused_ptr)
+      const errno = wasi.fd_readdir(dirFd, 1000, 4096, BigInt(0), 900);
+      expect(errno).toBe(WASI_ESUCCESS);
+      const bufused = view.getUint32(900, true);
+      expect(bufused).toBeGreaterThan(0);
+    });
+
+    it("lists current process fds through /dev/fd", () => {
+      const kernel = new ProcessKernel();
+      const pid = kernel.allocPid(1, "program");
+      vfs.setProcessListProvider(() => kernel.listProcesses());
+      host = new WasiHost({
+        vfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+        kernel,
+        pid,
+      });
+      host.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = "/dev/fd";
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+      const openErrno = wasi.path_open(
+        3,
+        0,
+        500,
+        pathStr.length,
+        2,
+        BigInt(0),
+        BigInt(0),
+        0,
+        400,
+      );
+      expect(openErrno).toBe(WASI_ESUCCESS);
+      const dirFd = view.getUint32(400, true);
+
       const errno = wasi.fd_readdir(dirFd, 1000, 4096, BigInt(0), 900);
       expect(errno).toBe(WASI_ESUCCESS);
       const bufused = view.getUint32(900, true);

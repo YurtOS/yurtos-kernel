@@ -65,6 +65,14 @@ describe('source-built fixture smoke tests', () => {
     const link = await sandbox.run('readlink /usr/bin/grep');
     expect(link.stdout.trim()).toBe('/usr/bin/busybox');
 
+    const binEchoLink = await sandbox.run('readlink /bin/echo');
+    expect(binEchoLink.exitCode).toBe(0);
+    expect(binEchoLink.stdout.trim()).toBe('/usr/bin/busybox');
+
+    const chmod = await sandbox.run("touch /tmp/executable.sh && chmod 755 /tmp/executable.sh && stat -c '%a' /tmp/executable.sh");
+    expect(chmod.exitCode).toBe(0);
+    expect(chmod.stdout.trim()).toBe('755');
+
     const grep = await sandbox.run('grep foo /tmp/data.txt');
     expect(grep.exitCode).toBe(0);
     expect(grep.stdout.trim()).toBe('foo');

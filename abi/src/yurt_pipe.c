@@ -9,8 +9,7 @@
  *
  * pipe2(fds, flags) is a Linux extension that bundles the create-
  * with-flags path.  We accept the call but ignore most flags:
- *   - O_CLOEXEC    no-op (yurt has no exec(); fds don't survive
- *                  a process boundary anyway)
+ *   - O_CLOEXEC    mark both descriptors close-on-exec in the kernel
  *   - O_NONBLOCK   we don't currently expose nonblocking pipes; the
  *                  flag is ignored, and the caller will see standard
  *                  blocking semantics.  Adding fcntl-driven O_NONBLOCK
@@ -22,6 +21,7 @@
 #include "yurt_markers.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -102,10 +102,16 @@ int pipe(int fds[2]) {
 
 int pipe2(int fds[2], int flags) {
   YURT_MARKER_CALL(pipe2);
-  /* See header comment for why most flags are ignored.  We don't
-   * fail on unknown flags either — POSIX/Linux only specify three,
-   * and rejecting unknown bits would gratuitously break callers
-   * that pass through Linux-specific extensions. */
-  (void)flags;
-  return pipe(fds);
+  if (pipe(fds) != 0) return -1;
+  if ((flags & O_CLOEXEC) != 0) {
+    if (yurt_host_set_fd_descriptor_flags(fds[0], FD_CLOEXEC) != 0 ||
+        yurt_host_set_fd_descriptor_flags(fds[1], FD_CLOEXEC) != 0) {
+      int saved = errno;
+      close(fds[0]);
+      close(fds[1]);
+      errno = saved ? saved : EBADF;
+      return -1;
+    }
+  }
+  return 0;
 }

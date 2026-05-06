@@ -25,7 +25,7 @@
 #include <stdint.h>
 
 __attribute__((import_module("yurt"), import_name("host_setjmp")))
-extern int yurt_host_setjmp(void *env);
+extern int yurt_host_setjmp(void *env) __attribute__((returns_twice));
 
 __attribute__((import_module("yurt"), import_name("host_longjmp")))
 extern void yurt_host_longjmp(void *env, int val);
@@ -69,14 +69,17 @@ int yurt_asyncify_buf_size(void) {
     return YURT_ASYNCIFY_BUF_SIZE;
 }
 
+int setjmp(jmp_buf env) __attribute__((returns_twice));
 int setjmp(jmp_buf env) {
     return yurt_host_setjmp((void *)env);
 }
 
+int _setjmp(jmp_buf env) __attribute__((returns_twice));
 int _setjmp(jmp_buf env) {
     return yurt_host_setjmp((void *)env);
 }
 
+int sigsetjmp(sigjmp_buf env, int savesigs) __attribute__((returns_twice));
 int sigsetjmp(sigjmp_buf env, int savesigs) {
     /* We don't track per-process signal masks separately, so
      * savesigs is a no-op; semantics are identical to setjmp. */

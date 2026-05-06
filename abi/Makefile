@@ -20,12 +20,14 @@ YURT_CC := $(REPO_ROOT)/target/release/yurt-cc
 YURT_AR := $(REPO_ROOT)/target/release/yurt-ar
 
 LIB := $(BUILD_DIR)/libyurt_abi.a
+CONTINUATION_LIB := $(BUILD_DIR)/libyurt_continuation.a
 SETJMP_LIB := $(BUILD_DIR)/libyurt_setjmp.a
 LIB_OBJS := \
   $(BUILD_DIR)/yurt_command.o \
   $(BUILD_DIR)/yurt_dup.o \
   $(BUILD_DIR)/yurt_exec.o \
   $(BUILD_DIR)/yurt_fetch.o \
+  $(BUILD_DIR)/yurt_fnmatch.o \
   $(BUILD_DIR)/yurt_fs.o \
   $(BUILD_DIR)/yurt_ioctl.o \
   $(BUILD_DIR)/yurt_mktemp.o \
@@ -44,7 +46,8 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_time.o \
   $(BUILD_DIR)/yurt_tty.o \
   $(BUILD_DIR)/yurt_unistd.o \
-  $(BUILD_DIR)/yurt_version.o
+  $(BUILD_DIR)/yurt_version.o \
+  $(BUILD_DIR)/yurt_write.o
 
 CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
@@ -72,31 +75,34 @@ $(BUILD_DIR)/%.o: src/%.c $(wildcard include/*.h) src/yurt_runtime.h src/yurt_ma
 
 lib: $(LIB)
 
-SETJMP_OBJS := \
+CONTINUATION_OBJS := \
   $(BUILD_DIR)/yurt_setjmp.o \
   $(BUILD_DIR)/yurt_fork.o
 
 $(LIB): $(LIB_OBJS) | $(BUILD_DIR) ensure-toolchain
 	$(YURT_AR) rcs $@ $(LIB_OBJS)
 
-$(SETJMP_LIB): $(SETJMP_OBJS) | $(BUILD_DIR) ensure-toolchain
-	$(YURT_AR) rcs $@ $(SETJMP_OBJS)
+$(CONTINUATION_LIB): $(CONTINUATION_OBJS) | $(BUILD_DIR) ensure-toolchain
+	$(YURT_AR) rcs $@ $(CONTINUATION_OBJS)
 
-$(BUILD_DIR)/setjmp-canary.wasm: $(CANARY_DIR)/setjmp-canary.c $(wildcard include/*.h) $(LIB) $(SETJMP_LIB) | $(BUILD_DIR) ensure-toolchain
+$(SETJMP_LIB): $(CONTINUATION_LIB) | $(BUILD_DIR)
+	cp $(CONTINUATION_LIB) $@
+
+$(BUILD_DIR)/setjmp-canary.wasm: $(CANARY_DIR)/setjmp-canary.c $(wildcard include/*.h) $(LIB) $(CONTINUATION_LIB) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
-	YURT_CC_SETJMP_ARCHIVE=$(abspath $(SETJMP_LIB)) \
-	YURT_CC_USE_SETJMP=1 \
+	YURT_CC_CONTINUATION_ARCHIVE=$(abspath $(CONTINUATION_LIB)) \
+	YURT_CC_USE_CONTINUATION=1 \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/setjmp-canary.pre-opt.wasm \
 	$(YURT_CC) $< -o $@
 
-$(BUILD_DIR)/fork-canary.wasm: $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) $(SETJMP_LIB) | $(BUILD_DIR) ensure-toolchain
+$(BUILD_DIR)/fork-canary.wasm: $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) $(CONTINUATION_LIB) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
-	YURT_CC_SETJMP_ARCHIVE=$(abspath $(SETJMP_LIB)) \
-	YURT_CC_USE_SETJMP=1 \
+	YURT_CC_CONTINUATION_ARCHIVE=$(abspath $(CONTINUATION_LIB)) \
+	YURT_CC_USE_CONTINUATION=1 \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/fork-canary.pre-opt.wasm \
-	$(YURT_CC) $< -o $@
+	$(YURT_CC) -DYURT_FORK_CANARY_CONTINUATION=1 $< -o $@
 
 $(FORK_DEFAULT_CANARY): $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \

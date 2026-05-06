@@ -15,6 +15,8 @@
 
 YURT_DECLARE_MARKER(fork);
 
+pid_t fork(void) __attribute__((returns_twice));
+
 pid_t fork(void) {
     YURT_MARKER_CALL(fork);
     int rc = yurt_host_fork();

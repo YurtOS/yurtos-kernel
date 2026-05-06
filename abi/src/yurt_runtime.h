@@ -10,6 +10,9 @@ int yurt_host_run_command(int req_ptr, int req_len, int out_ptr, int out_cap);
 __attribute__((import_module("yurt"), import_name("host_dup2")))
 int yurt_host_dup2(int src_fd, int dst_fd);
 
+__attribute__((import_module("yurt"), import_name("host_dup_min")))
+int yurt_host_dup_min(int src_fd, int min_fd);
+
 __attribute__((import_module("yurt"), import_name("host_yield")))
 void yurt_host_yield(void);
 
@@ -86,6 +89,12 @@ int yurt_host_sched_setscheduler(int pid, int policy, int priority);
 __attribute__((import_module("yurt"), import_name("host_sched_setparam")))
 int yurt_host_sched_setparam(int pid, int priority);
 
+__attribute__((import_module("yurt"), import_name("host_sched_getaffinity")))
+int yurt_host_sched_getaffinity(int pid, void *mask, size_t cpusetsize);
+
+__attribute__((import_module("yurt"), import_name("host_sched_setaffinity")))
+int yurt_host_sched_setaffinity(int pid, const void *mask, size_t cpusetsize);
+
 __attribute__((import_module("yurt"), import_name("host_getrlimit")))
 int yurt_host_getrlimit(int resource, void *out);
 
@@ -110,12 +119,18 @@ int yurt_host_pipe(int out_ptr, int out_cap);
 __attribute__((import_module("yurt"), import_name("host_dup")))
 int yurt_host_dup(int fd, int out_ptr, int out_cap);
 
+__attribute__((import_module("yurt"), import_name("host_set_fd_descriptor_flags")))
+int yurt_host_set_fd_descriptor_flags(int fd, int flags);
+
 /* host_spawn synchronously spawns a child WASM process from a JSON
  * SpawnRequest.  Returns the new child's PID, or -1 on failure.
  * Used by posix_spawn / posix_spawnp.  See SpawnRequest in
  * packages/kernel/src/process/kernel.ts for the JSON shape. */
 __attribute__((import_module("yurt"), import_name("host_spawn")))
 int yurt_host_spawn(int req_ptr, int req_len);
+
+__attribute__((import_module("yurt"), import_name("host_mark_exec_child")))
+int yurt_host_mark_exec_child(int child_pid);
 
 /* host_waitpid blocks until the named child exits and writes JSON
  * `{"exit_code":N}` to the output buffer.  Returns byte count or -1.
@@ -145,7 +160,7 @@ __attribute__((import_module("yurt"), import_name("host_wait_any_nohang")))
 int yurt_host_wait_any_nohang(int out_ptr, int out_cap);
 
 __attribute__((import_module("yurt"), import_name("host_fork")))
-int yurt_host_fork(void);
+int yurt_host_fork(void) __attribute__((returns_twice));
 
 __attribute__((import_module("yurt"), import_name("host_thread_spawn")))
 int yurt_host_thread_spawn(int fn_ptr, int arg);

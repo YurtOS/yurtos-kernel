@@ -133,6 +133,9 @@ static int waitpid_parse_pid(const char *json, size_t json_len, int fallback, in
 static int encode_wait_status(int kernel_exit) {
     if (kernel_exit < 0) return 0;
     if (kernel_exit == 124) return 9; /* SIGKILL-style cancel → WIFSIGNALED */
+    if (kernel_exit > 128 && kernel_exit < 128 + 32) {
+        return kernel_exit - 128;
+    }
     return (kernel_exit & 0xff) << 8;
 }
 
@@ -167,6 +170,10 @@ pid_t waitpid(pid_t pid, int *wstatus, int options) {
     } else {
         char buf[64];
         int n = yurt_host_waitpid((int)pid, (int)(intptr_t)buf, (int)sizeof(buf));
+        if (n == -EINTR) {
+            errno = EINTR;
+            return (pid_t)-1;
+        }
         if (n <= 0 || (size_t)n > sizeof(buf)) {
             errno = ECHILD;
             return (pid_t)-1;
@@ -326,13 +333,13 @@ YURT_DECLARE_MARKER(vfork);
 YURT_DEFINE_MARKER(fork,  0x666f726bu) /* "fork" */
 YURT_DEFINE_MARKER(vfork, 0x76666f72u) /* "vfor" */
 
-__attribute__((weak)) pid_t fork(void) {
+__attribute__((weak, returns_twice)) pid_t fork(void) {
     YURT_MARKER_CALL(fork);
     errno = ENOSYS;
     return (pid_t)-1;
 }
 
-__attribute__((weak)) pid_t vfork(void) {
+__attribute__((weak, returns_twice)) pid_t vfork(void) {
     YURT_MARKER_CALL(vfork);
     errno = ENOSYS;
     return (pid_t)-1;

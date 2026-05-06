@@ -52,12 +52,14 @@ export interface LoaderContext {
 
 export interface LoadProcessOptions {
   argv: string[];
+  wasiArgv?: string[];
   mode: ProcessMode;
   env?: Record<string, string>;
   cwd?: string;
   memoryBytes?: number;
   stdoutLimit?: number;
   stderrLimit?: number;
+  stderrToStdout?: boolean;
   extraYurtImports?: (
     memory: WebAssembly.Memory,
     wasiHost: WasiHost,
@@ -90,16 +92,17 @@ export async function loadProcess(
   const module = await (ctx.moduleCache ?? defaultWasmModuleCache)
     .getOrCompile(digest, bytes);
   const importsSetjmp = moduleImportsSetjmp(module);
-  const setjmpMarked = moduleHasYurtFeature(module, "setjmp");
-  if (importsSetjmp && !setjmpMarked) {
+  const continuationMarked = moduleHasContinuationFeature(module);
+  if (importsSetjmp && !continuationMarked) {
     throw new Error(
-      "module imports host_setjmp/host_longjmp but lacks yurt.features setjmp marker; rebuild with yurt-cc YURT_CC_USE_SETJMP=1",
+      "module imports host_setjmp/host_longjmp but lacks yurt.features continuations marker; rebuild with yurt-cc YURT_CC_USE_CONTINUATION=1",
     );
   }
-  if (setjmpMarked && !moduleHasAsyncify(module)) {
-    throw new Error("module declares yurt.features setjmp but is not asyncify-instrumented");
+  if (continuationMarked && !moduleHasAsyncify(module)) {
+    throw new Error("module declares yurt.features continuations but is not asyncify-instrumented");
   }
   const env = opts.env ?? {};
+  const wasiArgv = opts.wasiArgv ?? argv;
   const cwd = opts.cwd ?? "/";
   const rollbackOnFailure = opts.rollbackOnFailure ?? true;
   const pid = ctx.allocatePid(argv);
@@ -115,12 +118,15 @@ export async function loadProcess(
   if (!ctx.kernel.getFdTarget(pid, 1)) {
     ctx.kernel.setFdTarget(pid, 1, createBufferTarget(opts.stdoutLimit ?? Infinity));
   }
-  if (!ctx.kernel.getFdTarget(pid, 2)) {
+  if (opts.stderrToStdout) {
+    const stdoutTarget = ctx.kernel.getFdTarget(pid, 1);
+    if (stdoutTarget) ctx.kernel.setFdTarget(pid, 2, stdoutTarget);
+  } else if (!ctx.kernel.getFdTarget(pid, 2)) {
     ctx.kernel.setFdTarget(pid, 2, createBufferTarget(opts.stderrLimit ?? Infinity));
   }
 
   const proc = Process.__forLoader({ pid, mode });
-  const wasi = ctx.buildWasiHost(pid, argv, env, cwd);
+  const wasi = ctx.buildWasiHost(pid, wasiArgv, env, cwd);
   const wasiImports = wasi.getImports().wasi_snapshot_preview1;
 
   let memoryRef: WebAssembly.Memory | null = null;
@@ -153,6 +159,8 @@ export async function loadProcess(
   }
   wrapAsyncImports(yurtImports, [
     "host_waitpid",
+    "host_kill",
+    "host_killpg",
     "host_yield",
     "host_network_fetch",
     "host_dns_resolve",
@@ -237,12 +245,12 @@ export async function loadProcess(
     if (!ctx.kernel.canReserveProcessSlot()) return -11; // EAGAIN
 
     const childPid = ctx.kernel.allocPid(parentPid, path);
-    const childFdTable = ctx.kernel.buildFdTableForFork(parentPid);
+    const childFdTable = ctx.kernel.buildFdTableForFork(parentPid, childPid);
     ctx.kernel.adoptFdTable(childPid, childFdTable);
     const wasiSnapshot = parentWasi.snapshotForFork();
 
     const childPromise = (async () => {
-      const childWasi = ctx.buildWasiHost(childPid, argv, env, cwd);
+      const childWasi = ctx.buildWasiHost(childPid, wasiArgv, env, cwd);
       childWasi.restoreForkSnapshot(wasiSnapshot);
       childWasi.bindKernelFileTargets();
       childWasi.setCanSuspendPipeReads(true);
@@ -270,6 +278,8 @@ export async function loadProcess(
         .hostFork as unknown as WebAssembly.ImportValue;
       wrapAsyncImports(childYurtImports, [
         "host_waitpid",
+        "host_kill",
+        "host_killpg",
         "host_yield",
         "host_network_fetch",
         "host_register_tool",
@@ -417,7 +427,7 @@ function wrapAsyncImports(
 }
 
 function needsSetjmpBridge(module: WebAssembly.Module): boolean {
-  if (!moduleHasYurtFeature(module, "setjmp")) return false;
+  if (!moduleHasContinuationFeature(module)) return false;
   return moduleHasAsyncify(module);
 }
 
@@ -460,6 +470,11 @@ function moduleHasYurtFeature(module: WebAssembly.Module, feature: string): bool
     }
   }
   return false;
+}
+
+function moduleHasContinuationFeature(module: WebAssembly.Module): boolean {
+  return moduleHasYurtFeature(module, "continuations") ||
+    moduleHasYurtFeature(module, "setjmp");
 }
 
 function initAsyncifyBridge(

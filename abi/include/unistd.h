@@ -21,9 +21,8 @@ int getgroups(int size, gid_t list[]);
  * _GNU_SOURCE / _BSD_SOURCE / etc. */
 int pipe(int fd[2]);
 /* pipe2(2) is a Linux extension — wasi-libc doesn't even declare it.
- * Yurt accepts the call; flags are ignored (O_CLOEXEC is implicit
- * since yurt has no exec(); O_NONBLOCK isn't yet honored on
- * pipes).  Declared here so HAVE_PIPE2 detection in autoconf-built
+ * Yurt honors O_CLOEXEC and accepts the other common pipe flags for
+ * compatibility. Declared here so HAVE_PIPE2 detection in autoconf-built
  * ports finds the linker symbol. */
 int pipe2(int fd[2], int flags);
 
@@ -79,8 +78,8 @@ int chroot(const char *path);
  * for the fork+exec+wait pattern.  Real impls in yurt_exec.c.
  * The l-form variadic helpers below are still inline; they delegate
  * to execv / execvp. */
-pid_t fork(void);
-pid_t vfork(void);
+pid_t fork(void) __attribute__((returns_twice));
+pid_t vfork(void) __attribute__((returns_twice));
 int execv(const char *path, char *const argv[]);
 int execvp(const char *file, char *const argv[]);
 int execve(const char *path, char *const argv[], char *const envp[]);

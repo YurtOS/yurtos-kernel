@@ -5,10 +5,11 @@ use std::path::Path;
 const SECTION_ID_CUSTOM: u8 = 0;
 
 pub const YURT_FEATURES_SECTION: &str = "yurt.features";
-pub const SETJMP_FEATURES_JSON: &[u8] = br#"{"async":"asyncify","features":["setjmp"]}"#;
+pub const CONTINUATION_FEATURES_JSON: &[u8] =
+    br#"{"async":"asyncify","features":["continuations"]}"#;
 
-pub fn append_setjmp_features(path: &Path) -> Result<()> {
-    append_custom_section(path, YURT_FEATURES_SECTION, SETJMP_FEATURES_JSON)
+pub fn append_continuation_features(path: &Path) -> Result<()> {
+    append_custom_section(path, YURT_FEATURES_SECTION, CONTINUATION_FEATURES_JSON)
 }
 
 fn append_custom_section(path: &Path, name: &str, payload: &[u8]) -> Result<()> {
@@ -50,14 +51,14 @@ mod tests {
         let wasm = tmp.path().join("x.wasm");
         fs::write(&wasm, b"\0asm\x01\0\0\0").unwrap();
 
-        append_setjmp_features(&wasm).unwrap();
+        append_continuation_features(&wasm).unwrap();
         let bytes = fs::read(&wasm).unwrap();
         let mut found = false;
         for payload in wasmparser::Parser::new(0).parse_all(&bytes) {
             if let wasmparser::Payload::CustomSection(section) = payload.unwrap() {
                 if section.name() == YURT_FEATURES_SECTION {
                     found = true;
-                    assert_eq!(section.data(), SETJMP_FEATURES_JSON);
+                    assert_eq!(section.data(), CONTINUATION_FEATURES_JSON);
                 }
             }
         }

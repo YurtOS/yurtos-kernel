@@ -4,15 +4,13 @@
  * SpawnRequest with `prog`, `args`, `env`, `cwd`, `stdin_fd`,
  * `stdout_fd`, `stderr_fd`, and an optional `argv0` override.  The
  * file-action surface that POSIX exposes is richer (arbitrary
- * open/close/dup2 against arbitrary child fds), but the only file-
- * action effects that survive across our spawn boundary are the
- * three stdio fds — every other child fd is independent.  So we
- * walk the file_actions list, apply opens to *parent* fds
- * (returning real open fds for the duration of the spawn), simulate
- * the child fd map, and pick out the parent fds that end up at
- * child positions 0/1/2.  Anything the actions do to non-stdio child
- * fds is silently ignored — POSIX programs that need this should
- * use a real pipe()/dup2() pattern in the parent before spawning.
+ * open/close/dup2 against arbitrary child fds).  We walk the
+ * file_actions list, apply opens to *parent* fds (returning real
+ * open fds for the duration of the spawn), simulate the child fd
+ * map, and pick out the parent fds that end up at child positions
+ * 0/1/2.  The kernel also receives a conservative pass_fds list so
+ * non-CLOEXEC descriptors such as process-substitution fds can be
+ * inherited by the spawned process.
  */
 
 #include "spawn.h"
@@ -275,23 +273,23 @@ static int json_emit_int(char *buf, size_t cap, size_t *pos, long long v) {
 
 extern char **environ;
 
-/* Resolve the parent fd that should appear at child position
- * `child_fd` after applying file_actions in order.  Initially the
- * child inherits the same fd targets as the parent (so child_fd
- * starts pointing at parent_fd == child_fd).  Each action mutates
- * the simulated child mapping. */
-static int resolve_child_fd(const fa_state_t *s, int child_fd,
-                            int *opened_fds, int *opened_count, int max_opened) {
-  /* Start with default: child fd N comes from parent fd N. */
-  int parent_fd = child_fd;
+/* Resolve the parent fds that should appear at child stdio positions after
+ * applying file_actions in POSIX order.  A dup2 action observes earlier
+ * actions in the child fd table: `>file 2>&1` must route both fd 1 and fd 2
+ * to the opened file, not to the parent's original stdout. */
+static int resolve_stdio_fds(const fa_state_t *s, int stdio_fds[3],
+                             int *opened_fds, int *opened_count, int max_opened) {
+  stdio_fds[0] = 0;
+  stdio_fds[1] = 1;
+  stdio_fds[2] = 2;
 
-  if (!s) return parent_fd;
+  if (!s) return 0;
 
   for (int i = 0; i < s->count; i++) {
     const action_t *a = &s->items[i];
-    if (a->fd != child_fd) continue;
     switch (a->kind) {
       case ACTION_OPEN: {
+        if (a->fd < 0 || a->fd > 2) break;
         /* Open the file in the parent now; the spawn call will
          * dup it onto the child position.  Store the opened fd so
          * we can close it after the spawn returns. */
@@ -303,29 +301,31 @@ static int resolve_child_fd(const fa_state_t *s, int child_fd,
         if (*opened_count < max_opened) {
           opened_fds[(*opened_count)++] = new_fd;
         }
-        parent_fd = new_fd;
+        stdio_fds[a->fd] = new_fd;
         break;
       }
       case ACTION_CLOSE:
+        if (a->fd < 0 || a->fd > 2) break;
         /* Mark child fd as closed.  We model this as "no source",
          * but our SpawnRequest can't represent a closed stdio fd
          * — skip it and let the runtime use the default (parent's
          * matching fd).  Programs that *really* need a closed fd
          * 0/1/2 in the child are rare. */
-        parent_fd = -1;
+        stdio_fds[a->fd] = -1;
         break;
       case ACTION_DUP2:
-        /* Child fd N := parent's dup_src.  No actual dup happens
-         * on the parent side — the SpawnRequest will route the
-         * source directly. */
-        parent_fd = a->dup_src;
+        if (a->fd < 0 || a->fd > 2) break;
+        /* Child fd N := current child dup_src.  No actual dup happens
+         * on the parent side; SpawnRequest routes the resolved source. */
+        if (a->dup_src >= 0 && a->dup_src <= 2) stdio_fds[a->fd] = stdio_fds[a->dup_src];
+        else stdio_fds[a->fd] = a->dup_src;
         break;
       case ACTION_CHDIR:
         /* Chdir doesn't affect fd resolution. */
         break;
     }
   }
-  return parent_fd;
+  return 0;
 }
 
 /* Find the most recent ACTION_CHDIR in the file_actions list, or
@@ -337,6 +337,21 @@ static const char *resolve_chdir(const fa_state_t *s) {
     if (s->items[i].kind == ACTION_CHDIR) last = s->items[i].path;
   }
   return last;
+}
+
+static int child_fd_is_closed(const fa_state_t *s, int fd) {
+  if (!s) return 0;
+  int closed = 0;
+  for (int i = 0; i < s->count; i++) {
+    const action_t *a = &s->items[i];
+    if (a->fd != fd) continue;
+    if (a->kind == ACTION_CLOSE) {
+      closed = 1;
+    } else if (a->kind == ACTION_OPEN || a->kind == ACTION_DUP2) {
+      closed = 0;
+    }
+  }
+  return closed;
 }
 
 static int do_posix_spawn(pid_t *pid_out, const char *prog,
@@ -353,14 +368,16 @@ static int do_posix_spawn(pid_t *pid_out, const char *prog,
   int opened_fds[8];
   int opened_count = 0;
 
-  int stdin_fd  = resolve_child_fd(fa, 0, opened_fds, &opened_count, 8);
-  int stdout_fd = resolve_child_fd(fa, 1, opened_fds, &opened_count, 8);
-  int stderr_fd = resolve_child_fd(fa, 2, opened_fds, &opened_count, 8);
+  int stdio_fds[3];
+  if (resolve_stdio_fds(fa, stdio_fds, opened_fds, &opened_count, 8) != 0) goto fail_open;
+  int stdin_fd  = stdio_fds[0];
+  int stdout_fd = stdio_fds[1];
+  int stderr_fd = stdio_fds[2];
   if (stdin_fd < 0 && stdin_fd != -1) goto fail_open;
   if (stdout_fd < 0 && stdout_fd != -1) goto fail_open;
   if (stderr_fd < 0 && stderr_fd != -1) goto fail_open;
   /* Treat "closed" (stdin_fd == -1) as inheriting parent fd 0/1/2 —
-   * see resolve_child_fd above. */
+   * see resolve_stdio_fds above. */
   if (stdin_fd  == -1) stdin_fd  = 0;
   if (stdout_fd == -1) stdout_fd = 1;
   if (stderr_fd == -1) stderr_fd = 2;
@@ -377,6 +394,10 @@ static int do_posix_spawn(pid_t *pid_out, const char *prog,
   size_t cap = 65536;
   if (json_emit_lit(json, cap, &pos, "{\"prog\":") != 0) goto fail_json;
   if (json_emit_string(json, cap, &pos, prog) != 0) goto fail_json;
+  if (argv && argv[0]) {
+    if (json_emit_lit(json, cap, &pos, ",\"argv0\":") != 0) goto fail_json;
+    if (json_emit_string(json, cap, &pos, argv[0]) != 0) goto fail_json;
+  }
   if (json_emit_lit(json, cap, &pos, ",\"args\":[") != 0) goto fail_json;
   if (argv) {
     for (int i = 1; argv[i]; i++) {
@@ -416,6 +437,15 @@ static int do_posix_spawn(pid_t *pid_out, const char *prog,
   if (json_emit_int(json, cap, &pos, stdout_fd) != 0) goto fail_json;
   if (json_emit_lit(json, cap, &pos, ",\"stderr_fd\":") != 0) goto fail_json;
   if (json_emit_int(json, cap, &pos, stderr_fd) != 0) goto fail_json;
+  if (json_emit_lit(json, cap, &pos, ",\"pass_fds\":[") != 0) goto fail_json;
+  int pass_written = 0;
+  for (int fd = 3; fd < 256; fd++) {
+    if (child_fd_is_closed(fa, fd)) continue;
+    if (pass_written > 0 && json_emit_lit(json, cap, &pos, ",") != 0) goto fail_json;
+    if (json_emit_int(json, cap, &pos, fd) != 0) goto fail_json;
+    pass_written++;
+  }
+  if (json_emit_lit(json, cap, &pos, "]") != 0) goto fail_json;
   if (pos + 1 >= cap) goto fail_json;
   json[pos++] = '}';
 

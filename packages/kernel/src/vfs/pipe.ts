@@ -109,11 +109,13 @@ export function createPipe(): [PipeReadEnd, PipeWriteEnd] {
 // Async pipe with back-pressure, EOF, and EPIPE
 // ---------------------------------------------------------------------------
 
-const DEFAULT_PIPE_CAPACITY = 65536; // 64KB, matches Linux PIPE_BUF
+const DEFAULT_PIPE_CAPACITY = 1024 * 1024; // Linux pipe-max-size default
 
 export interface AsyncPipeReadEnd {
   /** Read up to buf.length bytes. Returns 0 on EOF. Suspends if empty. */
   read(buf: Uint8Array): Promise<number>;
+  /** Suspend until a non-blocking read would return data or EOF. */
+  waitReadable(): Promise<void>;
   /**
    * Synchronous read — for non-JSPI environments where WASM cannot await.
    * Reads available buffered data (up to buf.length bytes) and returns the
@@ -157,6 +159,7 @@ interface AsyncPipeBuffer {
   pendingReaderBuf: Uint8Array | null;
   pendingWriter: ((n: number) => void) | null;
   pendingWriterData: Uint8Array | null;
+  readWaiters: Array<() => void>;
 }
 
 /**
@@ -183,7 +186,12 @@ export function createAsyncPipe(
     pendingReaderBuf: null,
     pendingWriter: null,
     pendingWriterData: null,
+    readWaiters: [],
   };
+
+  function wakeReadWaiters(): void {
+    for (const resolve of shared.readWaiters.splice(0)) resolve();
+  }
 
   /** Drain buffered chunks into `buf`, returning bytes copied. */
   function drainChunks(buf: Uint8Array): number {
@@ -256,6 +264,13 @@ export function createAsyncPipe(
       });
     },
 
+    waitReadable(): Promise<void> {
+      if (shared.totalBytes > 0 || shared.writeClosed) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        shared.readWaiters.push(resolve);
+      });
+    },
+
     readSync(buf: Uint8Array): number {
       if (shared.totalBytes > 0) {
         const n = drainChunks(buf);
@@ -308,6 +323,7 @@ export function createAsyncPipe(
       if (toWrite > 0) {
         shared.chunks.push(data.slice(0, toWrite));
         shared.totalBytes += toWrite;
+        wakeReadWaiters();
       }
       // Wake a pending reader if one exists.
       if (shared.pendingReader && shared.pendingReaderBuf) {
@@ -368,6 +384,7 @@ export function createAsyncPipe(
     close() {
       if (--shared.writeRefs > 0) return;
       shared.writeClosed = true;
+      wakeReadWaiters();
       // Wake a pending reader with EOF.
       if (shared.pendingReader) {
         const resolve = shared.pendingReader;

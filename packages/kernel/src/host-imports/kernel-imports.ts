@@ -133,11 +133,16 @@ const ERR_IO = -3;
 const ERR_NOT_DIR = -4;
 const ERR_UNSUPPORTED = -38;
 const ERR_INVALID = -22;
+const ERR_INTERRUPTED = -27;
 const ERR_PRIORITY_NOT_FOUND = -1001;
 const ROOT_UID = 0;
 const USER_UID = 1000;
 const USER_GID = 1000;
 const PRIO_PROCESS = 0;
+
+function yieldToScheduler(): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
 
 function globToRegExp(pattern: string): RegExp {
   let re = '';
@@ -286,8 +291,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     if (target.type === 'pipe_write') target.pipe.close();
     if (target.type === 'pipe_read') target.pipe.close();
     if (target.type === 'vfs_file') {
-      target.refs--;
-      if (target.refs <= 0) target.fdTable.close(target.fd);
+      if (target.fdTable.isOpen(target.fd)) target.fdTable.close(target.fd);
     }
     if (target.type === 'socket') {
       target.refs--;
@@ -309,7 +313,17 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   }
 
   function retainFdTarget(target: FdTarget): void {
-    if (target.type === 'vfs_file' || target.type === 'socket') target.refs++;
+    if (target.type === 'pipe_write') target.pipe.addRef();
+    if (target.type === 'pipe_read') target.pipe.addRef();
+    if (target.type === 'vfs_file') target.fdTable.retain(target.fd);
+    if (target.type === 'socket') target.refs++;
+  }
+
+  function isActivePreopenFd(fd: number): boolean {
+    if (!opts.wasiHost?.isPreopenFd(fd)) return false;
+    if (!opts.kernel) return true;
+    const target = opts.kernel.getFdTarget(callerPid, fd);
+    return !target || target.type === 'vfs_dir';
   }
 
   const syntheticDns = new Map<string, string>();
@@ -402,6 +416,17 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     }
 
     opts.kernel?.setScheduler(targetPid, policy, priority);
+    return 0;
+  }
+
+  function validateSingleCpuAffinity(maskPtr: number, cpusetsizeRaw: number): number {
+    const cpusetsize = Math.trunc(cpusetsizeRaw);
+    if (cpusetsize < 4) return ERR_INVALID;
+    const bytes = new Uint8Array(memory.buffer, maskPtr, cpusetsize);
+    if (bytes[0] !== 1) return ERR_INVALID;
+    for (let i = 1; i < cpusetsize; i++) {
+      if (bytes[i] !== 0) return ERR_INVALID;
+    }
     return 0;
   }
 
@@ -556,7 +581,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // host_getpid() -> i32
     // Returns the pid of the calling process within the yurt kernel.
     host_getpid(): number {
-      return callerPid;
+      return opts.kernel?.getVisiblePid(callerPid) ?? callerPid;
     },
 
     // host_getppid() -> i32
@@ -564,7 +589,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // in-sandbox parent (the topmost process — typically the shell —
     // sees getppid() == 0, mirroring Linux init).
     host_getppid(): number {
-      return opts.kernel ? opts.kernel.getPpid(callerPid) : 0;
+      return opts.kernel ? opts.kernel.getVisiblePpid(callerPid) : 0;
+    },
+
+    // host_mark_exec_child(child_pid) -> i32
+    // Marks a freshly spawned child as the process image that replaces this
+    // caller for exec(3) emulation. The kernel verifies parentage before
+    // exposing the caller's PID through the replacement image.
+    host_mark_exec_child(childPid: number): number {
+      if (!opts.kernel) return -1;
+      return opts.kernel.markExecReplacement(callerPid, childPid) ? 0 : -1;
     },
 
     host_getuid(): number {
@@ -651,6 +685,23 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       return setSchedulerForTarget(targetPid, current.policy, priorityRaw);
     },
 
+    host_sched_getaffinity(pidRaw: number, maskPtr: number, cpusetsizeRaw: number): number {
+      const targetPid = schedulerTargetPid(pidRaw);
+      if (targetPid < 0) return targetPid;
+      const cpusetsize = Math.trunc(cpusetsizeRaw);
+      if (cpusetsize < 4) return ERR_INVALID;
+      const bytes = new Uint8Array(memory.buffer, maskPtr, cpusetsize);
+      bytes.fill(0);
+      bytes[0] = 1;
+      return 0;
+    },
+
+    host_sched_setaffinity(pidRaw: number, maskPtr: number, cpusetsizeRaw: number): number {
+      const targetPid = schedulerTargetPid(pidRaw);
+      if (targetPid < 0) return targetPid;
+      return validateSingleCpuAffinity(maskPtr, cpusetsizeRaw);
+    },
+
     host_getrlimit(resourceRaw: number, outPtr: number): number {
       const limit = opts.kernel?.getResourceLimit(callerPid, Math.trunc(resourceRaw)) ?? defaultImportResourceLimit(Math.trunc(resourceRaw));
       if (!limit) return ERR_INVALID;
@@ -727,7 +778,9 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // `kill -9` style termination from one in-sandbox process to another.
     // Returns 0 on success, -1 with errno=ESRCH (3) if no such process,
     // mirroring kill(2).
-    host_kill(pid: number, sig: number): number {
+    async host_kill(pid: number, sig: number): Promise<number> {
+      await yieldToScheduler();
+      opts.wasiHost?.drainPendingSignals();
       if (!opts.kernel) return -1;
       const exists = opts.kernel
         .listProcesses()
@@ -735,7 +788,11 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (!exists) return -1;
       // sig 0 is the existence probe — POSIX requires no signal sent.
       if (sig === 0) return 0;
-      return opts.kernel.killProcess(pid, sig) ? 0 : -1;
+      if (!opts.kernel.killProcess(pid, sig)) return -1;
+      if (pid === callerPid || pid === opts.kernel.getVisiblePid(callerPid)) {
+        opts.wasiHost?.drainPendingSignals();
+      }
+      return 0;
     },
 
     // host_getpgid(pid) -> i32
@@ -773,7 +830,9 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // host_killpg(pgid, sig) -> i32
     // Sends sig to all processes in process group pgid.
     // Returns 0 if at least one process was signalled, -1 if none found.
-    host_killpg(pgid: number, sig: number): number {
+    async host_killpg(pgid: number, sig: number): Promise<number> {
+      await yieldToScheduler();
+      opts.wasiHost?.drainPendingSignals();
       if (!opts.kernel) return -1;
       return opts.kernel.killpg(pgid, sig) > 0 ? 0 : -1;
     },
@@ -876,15 +935,31 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (!opts.kernel) {
         return writeJson(memory, outPtr, outCap, { exit_code: -1 });
       }
+      await yieldToScheduler();
+      opts.wasiHost?.drainPendingSignals();
+      const signalWait = opts.wasiHost?.waitForSignalDelivery();
+      const interrupt = signalWait?.promise ?? new Promise<void>(() => {});
       if (pid <= 0) {
-        const result = await opts.kernel.waitAnyChild(callerPid);
+        const waited = await opts.kernel.waitAnyChildInterruptible(callerPid, interrupt);
+        signalWait?.cancel();
+        if (waited.interrupted) {
+          opts.wasiHost?.drainPendingSignals();
+          return ERR_INTERRUPTED;
+        }
+        const result = waited.result;
         if (!result) return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
         return writeJson(memory, outPtr, outCap, {
           pid: result.pid,
           exit_code: result.exitCode,
         });
       }
-      const exitCode = await opts.kernel.waitpid(pid, callerPid);
+      const waited = await opts.kernel.waitpidInterruptible(pid, callerPid, interrupt);
+      signalWait?.cancel();
+      if (waited.interrupted) {
+        opts.wasiHost?.drainPendingSignals();
+        return ERR_INTERRUPTED;
+      }
+      const exitCode = waited.exitCode;
       return writeJson(memory, outPtr, outCap, { pid, exit_code: exitCode });
     },
 
@@ -950,34 +1025,82 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Duplicates a file descriptor, returning a new fd pointing to the same target.
     host_dup(fd: number, outPtr: number, outCap: number): number {
       if (!opts.kernel) return -1;
+      if (isActivePreopenFd(fd)) return -1;
       try {
         const newFd = opts.kernel.dup(callerPid, fd);
         return writeJson(memory, outPtr, outCap, { fd: newFd });
-      } catch { return -1; }
+      } catch {
+        return -1;
+      }
+    },
+
+    // host_dup_min(src_fd, min_fd) -> i32
+    // POSIX F_DUPFD/F_DUPFD_CLOEXEC: duplicate into the lowest free fd >= min_fd.
+    host_dup_min(srcFd: number, minFd: number): number {
+      if (isActivePreopenFd(srcFd)) return -1;
+      if (minFd < 0) return -1;
+      try {
+        const kernelTarget = opts.kernel?.getFdTarget(callerPid, srcFd);
+        if (opts.kernel && kernelTarget) {
+          const newFd = opts.kernel.dupMin(callerPid, srcFd, minFd);
+          if (opts.wasiHost && opts.wasiHost.getIoFds() !== opts.kernel.getFdTable(callerPid)) {
+            opts.wasiHost.duplicateFdTo(srcFd, newFd, false);
+          }
+          return newFd;
+        }
+        const newFd = opts.wasiHost?.duplicateFdMin(srcFd, minFd, false);
+        return newFd ?? -1;
+      } catch {
+        return -1;
+      }
     },
 
     // host_dup2(src_fd, dst_fd) -> i32
     // Makes dst_fd point to the same target as src_fd.
     host_dup2(srcFd: number, dstFd: number): number {
       try {
-        if (opts.kernel) {
+        if (isActivePreopenFd(srcFd)) return -1;
+        if (opts.kernel?.getFdTarget(callerPid, srcFd)) {
           opts.kernel.dup2(callerPid, srcFd, dstFd);
+          return 0;
         }
         if (opts.wasiHost) {
           const ioFds = opts.wasiHost.getIoFds();
-          if (opts.kernel && ioFds === opts.kernel.getFdTable(callerPid)) return 0;
+          const existingKernelTarget = opts.kernel?.getFdTarget(callerPid, dstFd) ?? null;
+          const mirrored = opts.wasiHost.duplicateFdTo(srcFd, dstFd, false);
+          if (mirrored) {
+            if (existingKernelTarget && existingKernelTarget !== mirrored) {
+              closeFdTarget(existingKernelTarget);
+            }
+            if (opts.kernel) opts.kernel.setFdTarget(callerPid, dstFd, mirrored);
+            return 0;
+          }
           const target = ioFds.get(srcFd);
           if (target) {
             if (srcFd === dstFd) return 0;
             const existing = ioFds.get(dstFd);
             if (existing) closeFdTarget(existing);
-            retainFdTarget(target);
-            ioFds.set(dstFd, target);
+            if (target.type === 'vfs_file') {
+              target.fdTable.dupToShared(target.fd, dstFd);
+              ioFds.set(dstFd, { ...target, fd: dstFd, refs: 1 });
+            } else {
+              retainFdTarget(target);
+              ioFds.set(dstFd, target);
+            }
           }
-          else if (!opts.kernel) return -1;
+          else return -1;
         }
         return 0;
       } catch { return -1; }
+    },
+
+    // host_set_fd_descriptor_flags(fd, flags) -> i32
+    // Stores POSIX descriptor flags such as FD_CLOEXEC in the kernel fd table.
+    host_set_fd_descriptor_flags(fd: number, flags: number): number {
+      if (!opts.kernel) return -1;
+      if (!opts.kernel.getFdTarget(callerPid, fd)) return -1;
+      opts.kernel.setFdDescriptorFlags(callerPid, fd, flags);
+      return 0;
     },
 
     // host_setjmp(env_ptr) -> i32
@@ -1011,7 +1134,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
     // host_fork() -> i32
     // The process loader replaces this with the Asyncify continuation
-    // implementation for binaries linked with YURT_CC_USE_SETJMP=1.
+    // implementation for binaries linked with YURT_CC_USE_CONTINUATION=1.
     // Generic import creation cannot split a wasm continuation, so it
     // reports ENOSYS instead of pretending fork succeeded.
     host_fork(): number {
@@ -1019,10 +1142,11 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     },
 
     // host_yield() -> void
-    // Async — yields to the JS microtask queue, allowing other WASM stacks to run.
+    // Async — yields to the JS event loop, allowing timers and other WASM stacks to run.
     // This is the cooperative scheduling primitive: sleep(0).
     async host_yield(): Promise<void> {
-      await Promise.resolve();
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      opts.wasiHost?.drainPendingSignals();
     },
 
     // host_waitpid_nohang(pid, out_ptr?, out_cap?) -> i32
@@ -1030,6 +1154,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // and -2 for ECHILD. The legacy one-argument form returns just the exit code.
     host_waitpid_nohang(pid: number, outPtr?: number, outCap?: number): number {
       if (!opts.kernel) return -1;
+      opts.wasiHost?.drainPendingSignals();
       if (typeof outPtr !== 'number' || typeof outCap !== 'number') {
         return opts.kernel.waitpidNohang(pid, callerPid);
       }
@@ -1055,6 +1180,8 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Used by waitpid(-1, ..., 0) — blocking wait-any.
     async host_wait_any(outPtr: number, outCap: number): Promise<number> {
       if (!opts.kernel) return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
+      await yieldToScheduler();
+      opts.wasiHost?.drainPendingSignals();
       const result = await opts.kernel.waitAny(callerPid);
       return writeJson(memory, outPtr, outCap, { pid: result.pid, exit_code: result.exitCode });
     },
@@ -1757,7 +1884,8 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
     host_chmod(pathPtr: number, pathLen: number, mode: number): number {
       if (!opts.vfs) return ERR_IO;
-      const path = readString(memory, pathPtr, pathLen);
+      const rawPath = readString(memory, pathPtr, pathLen);
+      const path = resolveCwdPath(getCallerCwd(), rawPath);
       try {
         const credentials = getCallerCredentials();
         const authorized = withVfsCallerCredentials(() => {
@@ -1780,7 +1908,8 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
     host_chown(pathPtr: number, pathLen: number, uid: number, gid: number, followSymlinks: number): number {
       if (!opts.vfs) return ERR_IO;
-      const path = readString(memory, pathPtr, pathLen);
+      const rawPath = readString(memory, pathPtr, pathLen);
+      const path = resolveCwdPath(getCallerCwd(), rawPath);
       if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
       try {
         withVfsCallerCredentials(() => opts.vfs!.chown(path, uid, gid, followSymlinks !== 0));

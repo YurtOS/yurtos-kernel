@@ -81,15 +81,13 @@ export class ProcessManager {
           // No pre-existing standalone stub.
         }
         this.vfs.symlink(`/usr/bin/${name}`, linkPath);
-        if (applet === 'sh' || applet === 'ash') {
-          const binLinkPath = `/bin/${applet}`;
-          try {
-            this.vfs.unlink(binLinkPath);
-          } catch {
-            // No pre-existing shell link.
-          }
-          this.vfs.symlink(`/usr/bin/${name}`, binLinkPath);
+        const binLinkPath = `/bin/${applet}`;
+        try {
+          this.vfs.unlink(binLinkPath);
+        } catch {
+          // No pre-existing /bin applet link.
         }
+        this.vfs.symlink(`/usr/bin/${name}`, binLinkPath);
       }
     });
   }

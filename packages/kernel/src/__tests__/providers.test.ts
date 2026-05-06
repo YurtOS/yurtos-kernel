@@ -219,6 +219,7 @@ describe('ProcProvider (/proc)', () => {
         state: string;
         exit_code: number;
         command: string;
+        fds?: number[];
       }[],
     ): VFS {
       const vfs = new VFS();
@@ -237,11 +238,20 @@ describe('ProcProvider (/proc)', () => {
       expect(names).toContain('uptime');
     });
 
-    it('/proc/<pid> is a directory containing stat / status / cmdline / comm', () => {
+    it('/proc/<pid> is a directory containing stat / status / cmdline / comm / fd', () => {
       const vfs = vfsWith([{ pid: 1, ppid: 0, state: 'running', exit_code: -1, command: 'shell' }]);
       expect(vfs.stat('/proc/1').type).toBe('dir');
       const entries = vfs.readdir('/proc/1').map(e => e.name).sort();
-      expect(entries).toEqual(['cmdline', 'comm', 'stat', 'status']);
+      expect(entries).toEqual(['cmdline', 'comm', 'fd', 'stat', 'status']);
+    });
+
+    it('/proc/<pid>/fd lists open file descriptors', () => {
+      const vfs = vfsWith([{ pid: 1, ppid: 0, state: 'running', exit_code: -1, command: 'shell', fds: [2, 0, 1, 10] }]);
+      expect(vfs.stat('/proc/1/fd').type).toBe('dir');
+      const entries = vfs.readdir('/proc/1/fd').map(e => e.name);
+      expect(entries).toEqual(['0', '1', '2', '10']);
+      expect(vfs.stat('/proc/1/fd/1').type).toBe('file');
+      expect(() => vfs.stat('/proc/1/fd/99')).toThrow(/ENOENT/);
     });
 
     it('/proc/<pid>/comm returns the basename of the program', () => {
