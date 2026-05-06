@@ -1,0 +1,47 @@
+[package]
+name = "yurt-runtime-wasmtime"
+version = "0.1.0"
+edition = "2021"
+description = "Wasmtime-based Yurt sandbox server (JSON-RPC 2.0 over stdio)"
+
+[[bin]]
+name = "yurt-runtime-wasmtime"
+path = "src/main.rs"
+
+[lib]
+name = "yurt_runtime_wasmtime"
+path = "src/lib.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# JSON / RPC
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging to stderr
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# WASM runtime
+wasmtime = { version = "28", features = ["async", "cranelift"] }
+wasmtime-wasi = { version = "28", features = ["preview1"] }
+
+# HTTP client (for host_network_fetch, Phase 5+)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+
+# Serialization
+bincode = "1"
+
+# Misc utilities
+base64 = "0.22"
+uuid = { version = "1", features = ["v4"] }
+bytes = "1"
+
+[dev-dependencies]
+wiremock = "0.6"
