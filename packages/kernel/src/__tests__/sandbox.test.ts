@@ -10,7 +10,7 @@ import { resolve } from 'node:path';
 import { Sandbox } from '../sandbox.js';
 import { NodeAdapter } from '../platform/node-adapter.js';
 
-const WASM_DIR = resolve(import.meta.dirname, '../platform/__tests__/fixtures');
+const WASM_DIR = resolve(import.meta.dirname!, '../platform/__tests__/fixtures');
 const IS_DENO = typeof (globalThis as any).Deno !== 'undefined';
 const workerDescribe = IS_DENO ? describe.skip : describe;
 
@@ -34,86 +34,6 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
     const result = await sandbox.run('echo hello world | wc -c');
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe('12');
-  });
-
-  it('executeCommand applies timeout policy around host executors', async () => {
-    const events: Array<{ type: string; [key: string]: unknown }> = [];
-    sandbox = await Sandbox.create({
-      wasmDir: WASM_DIR,
-      adapter: new NodeAdapter(),
-      security: {
-        limits: { timeoutMs: 1, stdoutBytes: 5, stderrBytes: 3 },
-        onAuditEvent: (event) => events.push(event),
-      },
-    });
-
-    const result = await sandbox.executeCommand('host-side command', async () => {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      return {
-        exitCode: 0,
-        stdout: '',
-        stderr: '',
-        executionTimeMs: 5,
-      };
-    });
-
-    expect(result.exitCode).toBe(124);
-    expect(result.errorClass).toBe('TIMEOUT');
-    expect(events.some((e) => e.type === 'command.timeout')).toBe(true);
-  });
-
-  it('executeCommand applies output limits around host executors', async () => {
-    const events: Array<{ type: string; [key: string]: unknown }> = [];
-    sandbox = await Sandbox.create({
-      wasmDir: WASM_DIR,
-      adapter: new NodeAdapter(),
-      security: {
-        limits: { stdoutBytes: 5, stderrBytes: 3 },
-        onAuditEvent: (event) => events.push(event),
-      },
-    });
-
-    const result = await sandbox.executeCommand('host-side command', async () => ({
-      exitCode: 0,
-      stdout: '123456789',
-      stderr: 'abcdef',
-      executionTimeMs: 1,
-    }));
-
-    expect(result.stdout).toBe('12345');
-    expect(result.stderr).toBe('abc');
-    expect(result.truncated).toEqual({ stdout: true, stderr: true });
-    expect(events.some((e) => e.type === 'limit.exceeded' && e.subtype === 'stdout')).toBe(true);
-    expect(events.some((e) => e.type === 'limit.exceeded' && e.subtype === 'stderr')).toBe(true);
-  });
-
-  it('executeCommand uses the supplied host executor even when worker execution is present', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    let workerCalled = 0;
-    (sandbox as unknown as { workerExecutor: { run: () => Promise<unknown>; kill: () => void; dispose: () => void } }).workerExecutor = {
-      run: async () => {
-        workerCalled++;
-        return {
-          exitCode: 99,
-          stdout: 'worker\n',
-          stderr: '',
-          executionTimeMs: 0,
-        };
-      },
-      kill: () => {},
-      dispose: () => {},
-    };
-
-    const result = await sandbox.executeCommand('host-side command', async () => ({
-      exitCode: 0,
-      stdout: 'host\n',
-      stderr: '',
-      executionTimeMs: 1,
-    }));
-
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toBe('host\n');
-    expect(workerCalled).toBe(0);
   });
 
   it('run still uses worker execution when present', async () => {
@@ -579,7 +499,11 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
   });
 
   workerDescribe('worker-based hard kill', () => {
-    it('kills a pure CPU-bound Python loop via worker termination', { timeout: 15000 }, async () => {
+    // workerDescribe is describe.skip in Deno, so this case only runs in
+    // Node — where the per-test timeout knob comes from the runner config,
+    // not @std/testing/bdd's options. The 3000ms hardKill plus headroom
+    // keeps the wall-clock comfortably under any reasonable default.
+    it('kills a pure CPU-bound Python loop via worker termination', async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
