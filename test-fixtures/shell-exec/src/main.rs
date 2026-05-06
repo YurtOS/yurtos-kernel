@@ -25,6 +25,29 @@ mod wasm_entry {
         STATE.get_or_init(|| Mutex::new(ShellState::new_default()))
     }
 
+    /// Replace the shell's environment with the JSON-encoded map at
+    /// `ptr`/`len`. Called by the host (`Sandbox.syncBootEnv`) so guest
+    /// commands inherit values pushed via `Sandbox.setEnv`.
+    ///
+    /// Returns 0 on success and a negative error code on failure (the
+    /// caller only distinguishes 0 vs. non-zero).
+    #[no_mangle]
+    pub extern "C" fn __set_env(ptr: *const u8, len: u32) -> i32 {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        let json_str = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        let map: std::collections::HashMap<String, String> =
+            match serde_json::from_str(json_str) {
+                Ok(m) => m,
+                Err(_) => return -2,
+            };
+        let mut state = get_state().lock().unwrap();
+        state.env = map;
+        0
+    }
+
     /// Execute a shell command and write the JSON result into the output buffer.
     ///
     /// # Parameters
