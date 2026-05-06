@@ -120,7 +120,14 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
 
   it('timeout returns exit code 124', async () => {
     sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter(), timeoutMs: 1 });
-    const result = await sandbox.run('yes hello | head -1000');
+    // A shell-builtin infinite loop runs entirely inside the resident
+    // shell-exec — no external fixture spawns to race with the 1ms
+    // deadline. The previous form `yes hello | head -1000` only hit
+    // the timeout on main because pipeline setup happened to take
+    // longer than 1ms when the spawned tools were missing fixtures
+    // (yes / head don't ship in __tests__/fixtures/); a slightly
+    // faster wasm build flipped it to exit 127.
+    const result = await sandbox.run('while true; do :; done');
     expect(result.exitCode).toBe(124);
     expect(result.errorClass).toBe('TIMEOUT');
   });
@@ -704,7 +711,11 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
           onAuditEvent: (event) => events.push(event),
         },
       });
-      await sandbox.run('yes hello | head -10000');
+      // See the comment on `timeout returns exit code 124` above —
+      // a shell-builtin infinite loop hits the 1ms deadline
+      // deterministically; the previous `yes | head` form was
+      // racy against pipeline-setup latency.
+      await sandbox.run('while true; do :; done');
 
       expect(events.find(e => e.type === 'command.timeout')).toBeDefined();
     });
@@ -740,16 +751,20 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
           onAuditEvent: (event) => events.push(event),
         },
       });
-      // Bounded producer (~700 bytes of output) overshoots the
-      // 20-byte cap and trips the limit.exceeded audit hook.
-      // Note: the original `yes hello | head -100` form deadlocks
-      // — even with the new fdWritePipe-via-writeAsync back-
-      // pressure, busybox stdio doesn't surface EPIPE as ferror
-      // through some interaction we haven't fully traced (yes
-      // keeps calling fd_write 3.7M times receiving WASI_EPIPE
-      // and never terminates).  The truncation event fires either
-      // way, but the bounded form keeps the test fast.
-      await sandbox.run('seq 1 200');
+      // Bounded producer (~520 bytes) overshoots the 20-byte cap
+      // and trips the limit.exceeded audit hook. Uses the shell
+      // builtin `echo` so this depends only on the resident
+      // shell-exec, not on a separately-built `seq` fixture
+      // (which doesn't ship in packages/kernel/src/platform/
+      // __tests__/fixtures/). The original `yes hello | head -100`
+      // form deadlocks: even with fdWritePipe-via-writeAsync
+      // back-pressure, busybox stdio doesn't surface EPIPE as
+      // ferror through some interaction we haven't fully traced —
+      // yes keeps calling fd_write 3.7M times receiving WASI_EPIPE
+      // and never terminates. The bounded echo form keeps the
+      // test fast and self-contained.
+      const longStr = 'abcdefghijklmnopqrstuvwxyz'.repeat(20);
+      await sandbox.run(`echo "${longStr}"`);
 
       expect(events.find(e => e.type === 'limit.exceeded' && e.subtype === 'stdout')).toBeDefined();
     });
