@@ -122,7 +122,12 @@ Required. Describes package identity and dependency constraints.
 Fields:
 
 - `schema_version`: Package metadata schema version. Initially `1`.
-- `name`: Lowercase package name, unique within a registry.
+- `name`: Lowercase ASCII package name, unique within a registry. Must match
+  the regex `^[a-z0-9][a-z0-9._-]*$` — that is, start with a digit or
+  lowercase letter, then any of `a-z`, `0-9`, `.`, `_`, `-`. Restricting
+  to ASCII keeps names unambiguous across registry implementations and
+  prevents Unicode-lookalike confusion attacks (e.g. Greek `σ` lowercases
+  to itself but is not the Latin `s`).
 - `version`: Upstream package version.
 - `build`: Yurt build identifier, used to distinguish rebuilds of the same
   upstream version.
@@ -175,6 +180,16 @@ Required. Records the installed file manifest for validation and uninstall.
 The tar entries remain authoritative for extraction. `info/files.json` exists so
 the installer can verify integrity, record ownership of installed paths, and
 uninstall packages without scanning historical archives.
+
+The `mode` field is always a **4-character zero-padded octal string**
+using digits `0`–`7` only — e.g. `"0755"`, `"0644"`, `"0000"`, or
+`"4755"` for a setuid binary. The first (leftmost, high-order) digit
+carries the special bits — `4` setuid, `2` setgid, `1` sticky, summed
+when more than one applies — and is `0` for ordinary permission modes.
+The remaining three digits are the user / group / other permission
+fields, just as `chmod` accepts them. Implementations must reject any
+other encoding (no `"755"`, no `"0o755"`, no decimal forms) so
+different tools produce the same bits for the same string.
 
 ### `info/yurt.json`
 
