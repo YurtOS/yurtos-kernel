@@ -421,7 +421,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
   function validateSingleCpuAffinity(maskPtr: number, cpusetsizeRaw: number): number {
     const cpusetsize = Math.trunc(cpusetsizeRaw);
-    if (cpusetsize < 8) return ERR_INVALID;
+    if (cpusetsize < 4) return ERR_INVALID;
     const bytes = new Uint8Array(memory.buffer, maskPtr, cpusetsize);
     if (bytes[0] !== 1) return ERR_INVALID;
     for (let i = 1; i < cpusetsize; i++) {
@@ -689,7 +689,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       const targetPid = schedulerTargetPid(pidRaw);
       if (targetPid < 0) return targetPid;
       const cpusetsize = Math.trunc(cpusetsizeRaw);
-      if (cpusetsize < 8) return ERR_INVALID;
+      if (cpusetsize < 4) return ERR_INVALID;
       const bytes = new Uint8Array(memory.buffer, maskPtr, cpusetsize);
       bytes.fill(0);
       bytes[0] = 1;

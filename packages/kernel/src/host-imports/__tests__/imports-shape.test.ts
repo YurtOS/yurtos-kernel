@@ -1067,17 +1067,26 @@ Deno.test("host scheduler affinity reports single CPU and validates target pid",
     (imports.host_sched_getaffinity as (...args: number[]) => number)(
       0,
       128,
-      8,
+      4,
     ),
     0,
   );
-  assertEquals(view.getBigUint64(128, true), 1n);
+  assertEquals(view.getUint32(128, true), 1);
+
+  assertEquals(
+    (imports.host_sched_getaffinity as (...args: number[]) => number)(
+      0,
+      128,
+      3,
+    ),
+    -22,
+  );
 
   assertEquals(
     (imports.host_sched_getaffinity as (...args: number[]) => number)(
       999,
       128,
-      8,
+      4,
     ),
     -1,
   );
@@ -1090,22 +1099,31 @@ Deno.test("host scheduler affinity accepts only CPU 0 in the single-CPU ABI", ()
   const imports = createKernelImports({ memory, kernel, callerPid: pid });
   const view = new DataView(memory.buffer);
 
-  view.setBigUint64(128, 1n, true);
+  view.setUint32(128, 1, true);
   assertEquals(
     (imports.host_sched_setaffinity as (...args: number[]) => number)(
       0,
       128,
-      8,
+      4,
     ),
     0,
   );
 
-  view.setBigUint64(128, 2n, true);
+  view.setUint32(128, 2, true);
   assertEquals(
     (imports.host_sched_setaffinity as (...args: number[]) => number)(
       0,
       128,
-      8,
+      4,
+    ),
+    -22,
+  );
+
+  assertEquals(
+    (imports.host_sched_setaffinity as (...args: number[]) => number)(
+      0,
+      128,
+      3,
     ),
     -22,
   );
