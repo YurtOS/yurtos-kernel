@@ -25,9 +25,17 @@ mod wasm_entry {
         STATE.get_or_init(|| Mutex::new(ShellState::new_default()))
     }
 
-    /// Replace the shell's environment with the JSON-encoded map at
-    /// `ptr`/`len`. Called by the host (`Sandbox.syncBootEnv`) so guest
+    /// Merge the JSON-encoded env map at `ptr`/`len` into the shell's
+    /// environment. Called by the host (`Sandbox.syncBootEnv`) so guest
     /// commands inherit values pushed via `Sandbox.setEnv`.
+    ///
+    /// Merge (not replace) keeps `ShellState::new_default()`'s seeded
+    /// values (HOME, PATH, etc.) intact when the host pushes a partial
+    /// env — which is the common case, since `Sandbox.env` starts
+    /// empty and only fills with the guest's defaults after the first
+    /// `__run_command` round trip. This matches the
+    /// `export FOO='bar'`-style prefix the worker executor uses,
+    /// where new vars add to bash's env without wiping it.
     ///
     /// Returns 0 on success and a negative error code on failure (the
     /// caller only distinguishes 0 vs. non-zero).
@@ -44,7 +52,7 @@ mod wasm_entry {
                 Err(_) => return -2,
             };
         let mut state = get_state().lock().unwrap();
-        state.env = map;
+        state.env.extend(map);
         0
     }
 
