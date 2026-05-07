@@ -12,6 +12,7 @@ fn check_bin() -> &'static str {
     env!("CARGO_BIN_EXE_yurt-check")
 }
 
+#[ignore = "slow: runs make + yurt-cc + yurt-check subprocesses"]
 #[test]
 fn signature_check_passes_on_canary_built_via_yurt_cc() {
     if std::env::var_os("WASI_SDK_PATH").is_none() {
@@ -62,6 +63,7 @@ fn signature_check_passes_on_canary_built_via_yurt_cc() {
     assert!(st.success(), "signature check failed on well-formed input");
 }
 
+#[ignore = "slow: runs yurt-cc subprocess to compile C fixture"]
 #[test]
 fn signature_check_fails_when_symbol_body_does_not_call_marker() {
     if std::env::var_os("WASI_SDK_PATH").is_none() {

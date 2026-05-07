@@ -30,6 +30,7 @@ fn build_rs_binary() -> PathBuf {
     bin
 }
 
+#[ignore = "slow: spawns rustc to compile build.rs, then runs the binary"]
 #[test]
 fn host_target_is_noop_regardless_of_env() {
     let bin = build_rs_binary();
@@ -61,6 +62,7 @@ fn host_target_is_noop_regardless_of_env() {
     );
 }
 
+#[ignore = "slow: spawns rustc to compile build.rs, then runs the binary"]
 #[test]
 fn wasip1_target_skips_when_yurt_link_injected_set() {
     let bin = build_rs_binary();
@@ -90,6 +92,7 @@ fn wasip1_target_skips_when_yurt_link_injected_set() {
     );
 }
 
+#[ignore = "slow: spawns rustc to compile build.rs, then runs the binary"]
 #[test]
 fn wasip1_target_emits_link_directives_when_archive_provided() {
     let bin = build_rs_binary();
@@ -129,6 +132,7 @@ fn wasip1_target_emits_link_directives_when_archive_provided() {
     );
 }
 
+#[ignore = "slow: spawns rustc to compile build.rs, then runs the binary"]
 #[test]
 fn wasip1_target_panics_when_neither_archive_env_set_and_not_injected() {
     let bin = build_rs_binary();
