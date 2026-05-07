@@ -1,0 +1,281 @@
+[constant.YURT_ABI_VERSION_MAJOR]
+type = "u32"
+value = 1
+doc = "Major version of the host/guest kernel ABI."
+
+[constant.YURT_ABI_VERSION_MINOR]
+type = "u32"
+value = 0
+doc = "Minor version of the host/guest kernel ABI."
+
+[constant.YURT_ABI_RECORD_VERSION]
+type = "u16"
+value = 1
+doc = "Native record format version."
+
+[constant.YURT_VERSION_STR]
+type = "str"
+value = "0.1.0"
+doc = "Yurt product version surfaced through uname and procfs."
+
+[constant.YURT_VERSION_MAJOR]
+type = "u32"
+value = 0
+doc = "Yurt product major version."
+
+[constant.YURT_VERSION_MINOR]
+type = "u32"
+value = 1
+doc = "Yurt product minor version."
+
+[constant.YURT_VERSION_PATCH]
+type = "u32"
+value = 0
+doc = "Yurt product patch version."
+
+[constant.YURT_WAIT_NOHANG]
+type = "u32"
+value = 1
+doc = "Return immediately from host_wait when no child has exited."
+
+[errno.EPERM]
+value = 1
+doc = "Operation not permitted."
+
+[errno.ENOENT]
+value = 2
+doc = "No such file or directory."
+
+[errno.ESRCH]
+value = 3
+doc = "No such process."
+
+[errno.EINTR]
+value = 4
+doc = "Interrupted system call."
+
+[errno.EIO]
+value = 5
+doc = "I/O error."
+
+[errno.ENOEXEC]
+value = 8
+doc = "Executable format error."
+
+[errno.EBADF]
+value = 9
+doc = "Bad file descriptor."
+
+[errno.ECHILD]
+value = 10
+doc = "No child processes."
+
+[errno.EAGAIN]
+value = 11
+doc = "Resource temporarily unavailable."
+
+[errno.EACCES]
+value = 13
+doc = "Permission denied."
+
+[errno.EEXIST]
+value = 17
+doc = "File exists."
+
+[errno.ENOTDIR]
+value = 20
+doc = "Not a directory."
+
+[errno.EINVAL]
+value = 22
+doc = "Invalid argument."
+
+[errno.EOVERFLOW]
+value = 75
+doc = "Value too large for defined data type."
+
+[errno.ECONNRESET]
+value = 104
+doc = "Connection reset by peer."
+
+[errno.ENOTCONN]
+value = 107
+doc = "Socket is not connected."
+
+[errno.ECONNREFUSED]
+value = 111
+doc = "Connection refused."
+
+[errno.EHOSTUNREACH]
+value = 113
+doc = "No route to host."
+
+[return.scalar_errno]
+doc = "Non-negative scalar success value, or negative POSIX errno on failure."
+
+[return.fixed_out]
+doc = "Writes a fixed-size output struct and returns bytes written. If out_cap is too small, returns the required size and does not write a partial struct."
+
+[return.record_out]
+doc = "Writes a variable-size native record and returns bytes written. If out_cap is too small, returns the required size and does not write a partial record."
+
+[return.stream_io]
+doc = "POSIX stream transfer. Returns bytes actually read or written, 0 for EOF on reads, or negative POSIX errno. Partial success is allowed."
+
+[struct.yurt_abi_record_header]
+doc = "Header at the front of every variable-size native request or response record."
+fields = [
+  { name = "size", type = "u32", doc = "Logical initialized record size in bytes." },
+  { name = "version", type = "u16", doc = "Record version." },
+  { name = "flags", type = "u16", doc = "Record-specific flags." },
+]
+
+[struct.yurt_wait_result_v1]
+doc = "Fixed output written by host_wait."
+fields = [
+  { name = "pid", type = "i32", doc = "Child pid that changed state." },
+  { name = "exit_code", type = "i32", doc = "Exit code when exited normally, otherwise 0." },
+  { name = "signal", type = "i32", doc = "Signal number when signaled, otherwise 0." },
+  { name = "flags", type = "i32", doc = "Wait result flags." },
+]
+
+[struct.yurt_pipe_result_v1]
+doc = "Fixed output written by host_pipe."
+fields = [
+  { name = "read_fd", type = "i32", doc = "Read end file descriptor." },
+  { name = "write_fd", type = "i32", doc = "Write end file descriptor." },
+]
+
+[struct.yurt_spawn_result_v1]
+doc = "Fixed output written by host_spawn."
+fields = [
+  { name = "pid", type = "i32", doc = "Spawned process id." },
+]
+
+[import.host_pipe]
+doc = "Create an anonymous pipe and write yurt_pipe_result_v1."
+return = "fixed_out"
+args = [
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_dup]
+doc = "Duplicate a file descriptor and write the new fd as a fixed i32 output."
+return = "fixed_out"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_spawn]
+doc = "Spawn a guest process from a native spawn request record and write yurt_spawn_result_v1."
+return = "fixed_out"
+args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_wait]
+doc = "Wait for a child process. pid -1 means any child; flags may include YURT_WAIT_NOHANG."
+return = "fixed_out"
+args = [
+  { name = "pid", type = "pid" },
+  { name = "flags", type = "u32" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_read_fd]
+doc = "Read up to out_cap bytes from fd into guest memory. Partial success is allowed."
+return = "stream_io"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_write_fd]
+doc = "Write up to data_len bytes from guest memory to fd. Partial success is allowed."
+return = "stream_io"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "data_ptr", type = "ptr" },
+  { name = "data_len", type = "usize" },
+]
+
+[import.host_socket_send]
+doc = "Send bytes on a socket. Partial success is allowed."
+return = "stream_io"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "data_ptr", type = "ptr" },
+  { name = "data_len", type = "usize" },
+  { name = "flags", type = "i32" },
+]
+
+[import.host_socket_recv]
+doc = "Receive bytes from a socket. Partial success is allowed."
+return = "stream_io"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+  { name = "flags", type = "i32" },
+]
+
+[import.host_dns_resolve]
+doc = "Resolve a UTF-8 host name and write a native address record."
+return = "record_out"
+args = [
+  { name = "host_ptr", type = "ptr" },
+  { name = "host_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_network_fetch]
+doc = "Execute a network fetch described by a native request record and write a native response record."
+return = "record_out"
+args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[function.yurt_system]
+doc = "Compatibility helper implemented over spawn, pipes, fd I/O, and wait. Not a host import."
+return = "int"
+args = [
+  { name = "cmd", type = "const char *" },
+]
+
+[function.yurt_popen]
+doc = "Compatibility helper implemented over spawn, pipes, fd I/O, and wait. Not a host import."
+return = "FILE *"
+args = [
+  { name = "cmd", type = "const char *" },
+  { name = "mode", type = "const char *" },
+]
+
+[function.yurt_pclose]
+doc = "Close a stream returned by yurt_popen and return command status."
+return = "int"
+args = [
+  { name = "stream", type = "FILE *" },
+]
+
+[function.yurt_fetch_text]
+doc = "Compatibility fetch helper implemented through host_network_fetch."
+return = "int"
+args = [
+  { name = "url", type = "const char *" },
+  { name = "method", type = "const char *" },
+  { name = "headers_json", type = "const char *" },
+  { name = "body", type = "const char *" },
+  { name = "out_body", type = "char **" },
+]

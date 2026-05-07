@@ -18,6 +18,7 @@ INCLUDE := $(abspath include)
 CANARY_DIR := conformance/c
 YURT_CC := $(REPO_ROOT)/target/release/yurt-cc
 YURT_AR := $(REPO_ROOT)/target/release/yurt-ar
+DENO ?= deno
 
 LIB := $(BUILD_DIR)/libyurt_abi.a
 CONTINUATION_LIB := $(BUILD_DIR)/libyurt_continuation.a
@@ -53,9 +54,12 @@ CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime s
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
 FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 
-.PHONY: all lib canaries copy-fixtures clean ensure-toolchain
+.PHONY: all lib canaries copy-fixtures clean ensure-toolchain check-native-abi-contract
 
 all: lib canaries
+
+check-native-abi-contract:
+	cd $(REPO_ROOT) && $(DENO) run --allow-read --allow-write scripts/generate-native-abi.ts --check
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
