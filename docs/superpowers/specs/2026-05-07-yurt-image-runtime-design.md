@@ -16,14 +16,17 @@ yurt image.yurtimg.zst [command...]
 
 An uncompressed `.yurtimg` is a tar filesystem image. The kernel loads its
 filesystem index into memory, uses the tar file as the read-only base VFS
-layer, and places runtime writes in the existing writable upper layer through
-`OverlayVFS`. A compressed `.yurtimg.zst` is the transport form; CLI and browser
-tooling expand it before booting.
+layer, and places runtime writes in a writable layer through `OverlayVFS`. The
+default writable layer is the existing in-memory `VFS`, but the upper layer is
+an explicit backend boundary: a caller can provide a local-directory,
+browser-storage, S3-backed, or other permission-aware implementation later. A
+compressed `.yurtimg.zst` is the transport form; CLI and browser tooling expand
+it before booting.
 
 The goal is not Docker compatibility. The kernel project owns the primitive
-image runtime: load image, run command, preserve upper state, and export a new
-image. Package repositories and friendlier Docker-like workflows can build on
-top of these primitives from `yurt-pkg`.
+image runtime: load image, run command, preserve or export upper state, merge
+overlay deltas, and export a new image. Package repositories and friendlier
+Docker-like workflows can build on top of these primitives from `yurt-pkg`.
 
 ## Existing Capabilities
 
@@ -69,6 +72,38 @@ and content is read lazily.
 Unsupported tar entry types fail image loading. v1 supports regular files,
 directories, symlinks, and hardlinks. Hardlinks must resolve to regular-file
 entries in the same image.
+
+Layer 1 is always a single image file. That keeps the kernel-facing artifact
+portable across Node, browser, and embedded runtimes. The image may be stored on
+disk, in memory, in OPFS, or in another byte provider, but semantically it is one
+indexed tar filesystem.
+
+## Layer Images
+
+Yurt also needs an overlay delta artifact for writable layer state:
+
+- **Layer image:** uncompressed tar-like overlay delta, extension `.yurtlayer`.
+- **Transport layer image:** compressed and signed layer image,
+  extension `.yurtlayer.zst`.
+
+A layer image records upper-layer additions, modifications, metadata changes,
+and deletions. Deletions are required because layer 2 can hide files and
+directories from layer 1; the format is not add-only.
+
+Layer images should use regular tar entries for created or modified filesystem
+objects and an explicit v1 whiteout representation for deletions. The exact
+encoding must be documented with the implementation, but it must satisfy these
+rules:
+
+- deleting a file hides that exact lower-layer path;
+- deleting a directory hides the lower directory and all children unless a
+  later layer recreates paths below it;
+- whiteout entries cannot target paths outside the image namespace;
+- applying layer images in order is deterministic.
+
+Yurt layer images are not OCI layers. They are kernel-owned overlay delta
+artifacts that can support Docker-like workflows later without importing Docker
+semantics into the kernel.
 
 ## TarImageRootProvider
 
@@ -138,6 +173,14 @@ The image is layer 1 and read-only. Runtime writes, deletes, chmod/chown
 changes, and package installs go to the upper layer. Existing overlay
 permissions and whiteouts remain authoritative.
 
+The upper layer must be pluggable. The v1 `yurt` CLI and image-building path can
+use the default in-memory `VFS`, because that is enough to run a command and then
+export either the upper layer or the merged filesystem. Other runtimes can supply
+a writable backend with the same semantics: local directory, browser OPFS,
+IndexedDB, S3, or a custom backend. Backend implementations are responsible for
+preserving the permission metadata and whiteout behavior exposed through the
+overlay interface.
+
 The existing `baseRoot` directory provider remains useful for tests and local
 development, but image loading is the normal kernel artifact path.
 
@@ -191,15 +234,32 @@ Suggested CLI cache:
 
 ## Suspend And Image Export
 
-The CLI runtime should support turning the resulting VFS state into a new
-image. This is the primitive that lets package tooling install at runtime and
-then collapse layer 2 into a new layer 1 image:
+The CLI runtime should support exporting either the upper layer or the merged
+filesystem at process exit. These are kernel-owned filesystem serialization
+primitives, not package policy.
+
+Upper-layer export preserves layer 2 as a reusable overlay delta:
+
+```bash
+yurt --export-upper session.yurtlayer base.yurtimg /bin/sh
+```
+
+Merged snapshot export collapses layer 1 plus layer 2 into a standalone runtime
+image:
 
 ```bash
 yurt --snapshot-out next.yurtimg base.yurtimg pkg install yurt-greet
 ```
 
-At process exit:
+At process exit, for `--export-upper`:
+
+1. The sandbox has a base image layer plus an upper writable layer.
+2. The kernel/tooling walks the upper layer state.
+3. It writes a `.yurtlayer` containing additions, modifications, metadata
+   changes, and whiteouts for deletions.
+4. The output layer can later be merged onto the same or compatible base image.
+
+At process exit, for `--snapshot-out`:
 
 1. The sandbox has base image layer plus upper VFS layer.
 2. The kernel/tooling walks the merged VFS view.
@@ -207,12 +267,32 @@ At process exit:
 4. The output image becomes a standalone runtime image; it does not require the
    previous base image or upper layer.
 
-This export path belongs in the kernel project because it is filesystem
-serialization, not package policy. `yurt-pkg` can later offer a nicer
-Docker-like wrapper around it, but the primitive is kernel-owned.
+The export paths belong in the kernel project because they serialize VFS state.
+`yurt-pkg` can later offer nicer package-aware image-building commands around
+them.
 
-The first export implementation may be full-image export. Incremental layer
-export is a non-goal for v1.
+## Layer Merge
+
+The kernel tooling should provide a primitive that merges one or more layer
+images onto a base image in order:
+
+```bash
+yurt image merge base.yurtimg layer1.yurtlayer layer2.yurtlayer -o out.yurtimg
+```
+
+Merge semantics:
+
+- start from the indexed layer 1 image;
+- apply each layer image in argument order;
+- regular entries create or replace paths;
+- metadata entries update the effective path metadata;
+- whiteouts hide lower-layer files or directories;
+- later layers may recreate paths hidden by earlier layers;
+- the result is a standalone `.yurtimg` tar with no dependency on the input
+  layers.
+
+This is enough to maintain Docker-like layer chains if a higher-level tool wants
+that, while keeping the kernel primitive small and filesystem-focused.
 
 ## Browser Runtime
 
@@ -231,6 +311,12 @@ The browser must not expand the image into thousands of files. It should use
 the same indexed tar provider model as the CLI. The implementation may start
 with an in-memory `Uint8Array`; OPFS-backed range reads can follow when image
 sizes require it.
+
+For browser image building, the default upper layer can be in memory for small
+sessions. Larger sessions can use OPFS or IndexedDB as the pluggable upper
+backend. Exporting upper layers and merged images should use the same kernel
+serialization logic as the CLI, writing bytes to the browser-selected storage
+target instead of to a host filesystem path.
 
 Browser tests should cover:
 
@@ -261,12 +347,17 @@ The signing workflow itself belongs to package/image publishing tooling, not
 the kernel runtime. The kernel CLI cache should store this manifest when
 available and should key runtime images by the uncompressed image hash.
 
+Layer image manifests should identify the base image hash they were produced
+against when that information is known. The low-level merge primitive may still
+accept layers explicitly, but signed publishing workflows should use the base
+hash to prevent accidentally applying a delta to the wrong image.
+
 ## Non-Goals
 
 - Dockerfile parsing.
 - OCI image/layer compatibility.
 - Registry push/pull.
-- Incremental layer export.
+- Content-addressed layer graph management.
 - Package dependency solving or repository policy.
 - Expanding images into host directory trees as the normal runtime path.
 
@@ -278,14 +369,24 @@ Kernel tests should include:
   hardlinks, metadata, duplicate-path rejection, and traversal rejection.
 - Overlay integration tests proving image base reads and upper writes work
   through `OverlayVFS`.
+- Upper-backend contract tests for writes, chmod/chown, whiteouts, permission
+  checks, and snapshots.
+- Layer-image export tests proving adds, modifications, metadata changes, and
+  deletions survive an `--export-upper` round trip.
+- Layer merge tests proving one or more `.yurtlayer` inputs apply in order,
+  including deleting layer 1 paths and recreating paths in later layers.
+- Snapshot export tests proving merged L1+L2 state becomes a standalone
+  `.yurtimg`.
 - CLI tests for:
   - `yurt image.yurtimg command`;
   - default `/bin/sh`;
   - missing shell error;
   - `.yurtimg.zst` cache expansion;
-  - `--snapshot-out`.
+  - `--export-upper`;
+  - `--snapshot-out`;
+  - `yurt image merge`.
 - Browser adapter tests for compressed image load, index build, command run,
-  and upper-layer writes.
+  upper-layer writes, and image/layer export.
 - Package-boundary tests proving the kernel treats `/var/lib/yurt-pkg` as
   ordinary files and does not need package-manager policy.
 
@@ -293,10 +394,14 @@ Kernel tests should include:
 
 1. Add tar image indexer and `TarImageRootProvider`.
 2. Wire `Sandbox.create({ image })` to `OverlayVFS`.
-3. Update `yurt` CLI to support `yurt <image> [command...]`.
-4. Add compressed image cache expansion for the CLI.
-5. Add full merged-VFS export to uncompressed `.yurtimg` tar and
+3. Define the upper-layer backend interface and keep the default `VFS`
+   implementation wired for CLI/image builds.
+4. Update `yurt` CLI to support `yurt <image> [command...]`.
+5. Add compressed image cache expansion for the CLI.
+6. Add upper-layer export to `.yurtlayer` with deletion/whiteout support.
+7. Add full merged-VFS export to uncompressed `.yurtimg` tar and
    `--snapshot-out`.
-6. Add browser image loading/decompression coverage.
-7. Add signed manifest/cache metadata plumbing once image publishing defines
+8. Add ordered layer merge into standalone `.yurtimg`.
+9. Add browser image loading/decompression/export coverage.
+10. Add signed manifest/cache metadata plumbing once image publishing defines
    the signing flow.
