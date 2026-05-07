@@ -20,14 +20,15 @@ Switching the wire format to FlatBuffers buys:
 
 ### In scope
 
-- Replace JSON with FlatBuffers for **every** host import that today calls `JSON.parse` or `writeJson`. Complete inventory in the Schema section. No JSON survivors.
-- Replace JSON with FlatBuffers on the resident PID-1 guest exports (`__run_command`, `__set_env`).
+- Replace the wire format with FlatBuffers for **every** host import that has a buffer pointer in its current signature, regardless of whether the existing encoding is JSON, raw bytes, raw strings, or marshalled C structs. Complete inventory in the Schema section. The goal is one mechanism across the whole non-trivial surface — no mix of "this call uses JSON, that one uses raw bytes, this third one marshals a `struct termios`."
+- Replace the wire format on the resident PID-1 guest exports (`__run_command`, `__set_env`).
+- **Reduce the syscall surface where folds are obvious.** The wait family (`host_waitpid`, `host_waitpid_nohang`, `host_wait_any`, `host_wait_any_nohang`) collapses into a single `host_wait` whose request carries the pid (or `ANY` sentinel) and a `nohang: bool`. Four functions become one. Other folds may surface during implementation; the spec records each one as it lands.
 - New schema file `abi/schema/yurt_abi.fbs`.
 - New Rust crate `abi/rust/yurt-abi-fb` providing `flatbuffers`-crate Rust bindings to internal Rust callers and an `extern "C"` builder/reader surface to C ABI shims.
 - TS bindings committed at `packages/kernel/src/host-imports/_generated/yurt_abi.ts`.
 - Rip-and-replace migration: no JSON code path retained, no version bump (the ABI is still being finalized; current consumers are internal).
 - Delete `host_native_invoke` outright. It's Python-bridge legacy; a purpose-built replacement will land with the CPython port.
-- **Normalize `host_spawn` onto the standard `(req_ptr, req_len, out_ptr, out_cap) -> i32` calling convention.** Eliminates the existing two-ABI split (the generic `(req_ptr, req_len) -> pid` form and the legacy 4-arg shell-test form). All spawn callers go through the 4-arg form, host writes a `SpawnResponse`. See "Calling convention" below for blast radius.
+- **Normalize every non-scalar host import onto the standard `(req_ptr, req_len, out_ptr, out_cap) -> i32` calling convention.** Several calls today have non-standard shapes — `host_spawn` has a two-ABI split (the generic `(req_ptr, req_len) -> pid` form and the legacy 4-arg shell-test form); `host_socket_close` is `(req_ptr, req_len) -> i32` with no out buffer; the path-based mutating calls (`host_chmod`, `host_chdir`, `host_mkdir`, `host_remove`, `host_rename`, `host_symlink`, `host_register_tool`, `host_write_fd`, `host_write_file`, `host_write_result`) take raw `(path_ptr, path_len, …)` args and return scalars without a response buffer. All of these gain a 4-arg form with an FB response. See "Calling convention" below for the blast-radius list.
 - Update `test-fixtures/shell-exec/src/main.rs` and regenerate `bash.wasm` / `bash-asyncify.wasm` to consume/produce FlatBuffer payloads on the PID-1 protocol.
 - CI drift check that the committed generated artifacts match the schema.
 
@@ -35,7 +36,8 @@ Switching the wire format to FlatBuffers buys:
 
 - Streaming responses for very large bodies. The existing `(req_ptr, req_len, out_ptr, out_cap) -> i32` calling convention with retry-on-too-small is preserved; chunked streaming is future work.
 - Backwards compatibility with JSON callers. There are none in the wild; rip-and-replace is the cheaper option.
-- Pure-scalar host imports (`host_getpid`, `host_dup2`, `host_chmod`, `host_setpriority`, etc. — anything whose signature is "scalars in, scalar out" with no buffer pointers). They never used JSON; they don't change.
+- Pure-scalar host imports — anything whose signature is "scalars in, scalar out" with **no** buffer pointers anywhere (`host_getpid`, `host_getppid`, `host_getuid` and the other cred getters, `host_dup2`, `host_dup_min`, `host_close_fd`, `host_file_lock`, `host_setresuid`/`gid`, `host_umask`, `host_setpgid`, `host_setsid`, `host_kill`, `host_killpg`, `host_isatty`, `host_setpriority`, `host_getpriority`, `host_setrlimit`, `host_socket_open`, `host_time`, `host_yield`, `host_fork`, `host_fchown`, `host_fchdir`, `host_mark_exec_child`, `host_set_fd_descriptor_flags`, `host_sched_getscheduler`/`setscheduler`/`getparam`/`setparam`, `host_tcsetpgrp`/`tcgetpgrp`/`tiocsctty`). Wrapping these in FB is pure overhead with no consistency win, and POSIX itself uses scalar returns for them.
+- `host_setjmp` / `host_longjmp` — the `jmp_buf` pointer is opaque save state with bit-for-bit C compatibility requirements. FB-wrapping does not apply.
 - Performance benchmarks. This change is a correctness/cleanliness/zero-copy cutover. If a regression appears in real workloads, it gets investigated as a separate workstream.
 - Fuzzing. FlatBuffers' verifier rejects malformed buffers at the read site. Adding a fuzz harness is a separate effort.
 
@@ -62,15 +64,13 @@ Switching the wire format to FlatBuffers buys:
 
 Every host import that carries a structured payload uses `(req_ptr, req_len, out_ptr, out_cap) -> i32`. Buffer-too-small still returns the required size for caller retry. Negative values are reserved for transport-level errors (see Error Handling).
 
-**Spawn normalization.** Today, `host_spawn` has two forms — the generic `(req_ptr, req_len) -> pid` (returns the new pid as the i32 directly) and a legacy 4-arg form for the shell test path. This split is folded into the 4-arg form. After the cutover:
+**ABI-shape changes.** Two host imports change their signatures (not just their wire format) as part of this cutover:
 
-- `host_spawn(req_ptr, req_len, out_ptr, out_cap) -> i32` is the only ABI.
-- Host writes a `SpawnResponse` containing either `SpawnOk { pid }` or `ErrorInfo`.
-- The C `posix_spawn` shim (`abi/src/yurt_spawn.c`) reads the response, returns the pid (or sets `errno` from `ErrorInfo.code` and returns `-1`).
-- The `syncSpawn` legacy callback type in `kernel-imports.ts` is replaced by a single spawn handler that writes a `SpawnResponse`.
-- All call sites that today pass `(req_ptr, req_len)` and consume the i32 as a pid get updated.
+- **`host_spawn`** today has two forms — the generic `(req_ptr, req_len) -> pid` (returns the new pid as the i32 directly) and a legacy 4-arg form for the shell test path. This split is folded into the 4-arg form. After the cutover, `host_spawn(req_ptr, req_len, out_ptr, out_cap) -> i32` is the only ABI; the host writes a `SpawnResponse` containing either `SpawnOk { pid }` or `ErrorInfo`. The C `posix_spawn` shim (`abi/src/yurt_spawn.c`) reads the response, returns the pid (or sets `errno` from `ErrorInfo.code` and returns `-1`). The `syncSpawn` legacy callback type in `kernel-imports.ts` is replaced by a single spawn handler that writes a `SpawnResponse`. All call sites that today consume the i32 return as a pid get updated.
 
-This is the largest blast-radius change in the cutover and is called out explicitly because it crosses the "wire-format-only" boundary into ABI shape.
+- **`host_socket_close`** today is `(req_ptr, req_len) -> i32` with no output buffer; the `i32` carries the close result directly. After the cutover, `host_socket_close(req_ptr, req_len, out_ptr, out_cap) -> i32` becomes the signature; the host writes a `SocketCloseResponse` containing either `SocketCloseOk` (empty) or `ErrorInfo` so close failures can be surfaced with a typed POSIX errno. C call sites in `abi/src/yurt_socket.c` are updated to pass an output buffer.
+
+These are the only "wire-format-only" boundary crossings — all other quartet additions preserve their existing 4-arg signatures.
 
 ### Per-table file identifiers (wrong-root guarantee)
 
@@ -125,57 +125,82 @@ table SocketRecvResponse   { result: SocketRecvResult; }
 
 ### Full inventory
 
-Every host import that today calls `JSON.parse` or `writeJson` gets a quartet. The inventory below is the complete set; the implementation plan will spell out each table's fields. Naming convention: `<Family><Verb>Request/Ok/Result/Response`.
+Every host import with a buffer pointer in its current signature gets a quartet, regardless of today's encoding. Pure-scalar imports (no buffer pointers anywhere) stay scalar. Naming convention: `<Family><Verb>Request/Ok/Result/Response`.
 
 **Process / exec.**
 
 | Host import | Quartet root | Notes |
 |---|---|---|
-| `host_pipe` | `Pipe` (response only) | No request payload; pure scalar inputs. |
-| `host_spawn` | `Spawn` | 4-arg ABI per "Calling convention" above. |
+| `host_pipe` | `Pipe` (response only) | No request payload. |
+| `host_spawn` | `Spawn` | ABI-shape change; see "Calling convention". |
 | `host_run_command` | `RunCommand` | stdout/stderr as `[ubyte]`. |
-| `host_waitpid` | `Wait` | Shared with the *_nohang and wait_any variants — same response shape. |
-| `host_waitpid_nohang` | `Wait` | Reuses `WaitResponse`. |
-| `host_wait_any` | `Wait` | Reuses `WaitResponse`. |
-| `host_wait_any_nohang` | `Wait` | Reuses `WaitResponse`. |
+| `host_wait` | `Wait` | **Fold of four:** `host_waitpid`, `host_waitpid_nohang`, `host_wait_any`, `host_wait_any_nohang`. Request carries `pid: int32` (or sentinel for "any") and `nohang: bool`. |
 | `host_list_processes` | `ListProcs` | `[ProcessInfo]` payload. |
-| `host_dup` | `Dup` | Currently returns `{ fd }` JSON; becomes a normal quartet. |
-| `host_read_fd` | `ReadFd` | Today: success returns raw bytes via `writeBytes`, error path returns JSON. After cutover: response is uniformly `ReadFdResponse { union { ReadFdOk: [ubyte], ErrorInfo } }`. Removes the success/error format mismatch. |
+| `host_dup` | `Dup` | |
+| `host_read_fd` | `ReadFd` | Currently mixed format (raw bytes on success, JSON on error). After cutover: uniform `ReadFdResponse`. |
+| `host_write_fd` | `WriteFd` | ABI-shape change: gains a response buffer. Today: `(fd, data_ptr, data_len) -> i32`. After: 4-arg with `WriteFdResponse`. |
+| `host_read_command` | `ReadCommand` | Currently raw bytes out. |
+| `host_write_result` | `WriteResult` | ABI-shape change: gains a response buffer. Today: `(result_ptr, result_len) -> void`. After: 4-arg with response. |
 
 **Network.**
 
 | Host import | Quartet root | Notes |
 |---|---|---|
 | `host_network_fetch` | `Fetch` | `body` is `[ubyte]` — no base64. |
-| `host_dns_resolve` | `DnsResolve` | Returns address list. |
-| `host_extension_invoke` | `ExtensionInvoke` | Generic extension dispatch. |
+| `host_dns_resolve` | `DnsResolve` | Currently raw bytes; FB-ified for uniformity. |
+| `host_extension_invoke` | `ExtensionInvoke` | |
 | `host_native_invoke` | — | **Deleted**, no replacement in this cutover. |
+| `host_get_local_addr` | `GetLocalAddr` | Currently raw bytes. |
 
 **Sockets.**
 
-| Host import | Quartet root |
-|---|---|
-| `host_socket_connect` | `SocketConnect` |
-| `host_socket_bind` | `SocketBind` |
-| `host_socket_listen` | `SocketListen` |
-| `host_socket_accept` | `SocketAccept` |
-| `host_socket_addr` | `SocketAddr` |
-| `host_socket_send` | `SocketSend` |
-| `host_socket_recv` | `SocketRecv` |
-| `host_socket_option` | `SocketOption` |
-| `host_socket_close` | `SocketClose` |
+| Host import | Quartet root | Notes |
+|---|---|---|
+| `host_socket_connect` | `SocketConnect` | |
+| `host_socket_bind` | `SocketBind` | |
+| `host_socket_listen` | `SocketListen` | |
+| `host_socket_accept` | `SocketAccept` | |
+| `host_socket_addr` | `SocketAddr` | |
+| `host_socket_send` | `SocketSend` | |
+| `host_socket_recv` | `SocketRecv` | |
+| `host_socket_option` | `SocketOption` | |
+| `host_socket_close` | `SocketClose` | ABI-shape change; see "Calling convention". |
 
-(`host_socket_open` stays scalar — its current signature has no buffer pointers.)
+(`host_socket_open` stays scalar — no buffer pointers.)
 
 **VFS / filesystem.**
 
-| Host import | Quartet root |
-|---|---|
-| `host_stat` | `Stat` |
-| `host_readdir` | `Readdir` |
-| `host_glob` | `Glob` |
+| Host import | Quartet root | Notes |
+|---|---|---|
+| `host_stat` | `Stat` | |
+| `host_readdir` | `Readdir` | |
+| `host_glob` | `Glob` | |
+| `host_read_file` | `ReadFile` | Currently raw bytes out. |
+| `host_write_file` | `WriteFile` | ABI-shape change: gains response buffer. |
+| `host_readlink` | `Readlink` | Currently raw string out. |
+| `host_getcwd` | `Getcwd` | Currently raw string out. |
+| `host_chdir` | `Chdir` | ABI-shape change: gains response buffer. |
+| `host_chmod` | `Chmod` | ABI-shape change: gains response buffer. |
+| `host_chown` | `Chown` | ABI-shape change: gains response buffer. |
+| `host_mkdir` | `Mkdir` | ABI-shape change: gains response buffer. |
+| `host_remove` | `Remove` | ABI-shape change: gains response buffer. |
+| `host_rename` | `Rename` | ABI-shape change: gains response buffer. |
+| `host_symlink` | `Symlink` | ABI-shape change: gains response buffer. |
+| `host_register_tool` | `RegisterTool` | ABI-shape change: gains response buffer. |
+| `host_has_tool` | `HasTool` | Currently `(name_ptr, name_len) -> i32` boolean. ABI-shape change. |
 
-(`host_read_file`, `host_write_file`, `host_readlink`, `host_getcwd`, `host_tcgetattr`, `host_winsize`, `host_getrlimit` etc. currently use raw bytes via `writeBytes` / `writeString`, not JSON. They are out of scope for this cutover and stay on the raw-bytes / scalar path. Future work may unify them but is not required for the JSON elimination goal.)
+(`host_setjmp` / `host_longjmp` stay raw — `jmp_buf` is opaque save state with bit-for-bit C ABI compatibility requirements.)
+
+**TTY / process resources.**
+
+| Host import | Quartet root | Notes |
+|---|---|---|
+| `host_tcgetattr` | `Tcgetattr` | Currently marshals raw `struct termios`. |
+| `host_tcsetattr` | `Tcsetattr` | ABI-shape change: gains response buffer. |
+| `host_winsize` | `Winsize` | Currently raw struct out. |
+| `host_getrlimit` | `Getrlimit` | Currently raw struct out. |
+| `host_sched_getaffinity` | `SchedGetaffinity` | Currently raw cpu_set out. |
+| `host_sched_setaffinity` | `SchedSetaffinity` | ABI-shape change: gains response buffer. |
 
 **Resident PID-1 protocol (guest exports).**
 
@@ -274,6 +299,24 @@ pub extern "C" fn yurt_fb_read_fetch_response(
     out_err: *mut YurtFbErr,
 ) -> i32; // 0 = ok, -1 = malformed buffer, -2 = wrong root identifier
 ```
+
+### C-side ergonomics — pattern macros
+
+The build/call/read/free dance is uniform across C shims. To keep each shim short, the C side provides a small set of pattern macros in a new header `abi/include/yurt_fb.h`, e.g.:
+
+```c
+// Path-string mutating syscall: builds a single-path request, calls the host
+// import, reads the response, sets errno from ErrorInfo.code on failure, and
+// returns 0 / -1 in POSIX shape.
+#define YURT_FB_PATH_OP(call, build_fn, read_fn, path)        \
+  /* expands to: build req → host_##call() → read resp →     \
+     map ErrorInfo.code to errno → free → return 0/-1 */
+
+// Two-path syscalls (rename, symlink), fd+arg syscalls (chown/fchown), etc.
+// have analogous macros following the same shape.
+```
+
+A C shim like `int chmod(const char *path, mode_t mode)` collapses to one or two lines using these macros. The macros live in the C ABI library, not generated. They are not part of the public C API — only the `yurt_*` shims use them.
 
 ### Buffer ownership
 
@@ -406,20 +449,36 @@ Normal "the call ran but failed" case. A well-formed response is written; its un
 - DNS failure on fetch → `ErrorInfo { code: -100, message: "getaddrinfo: example.invalid", source: "host_network_fetch" }`. Transport `i32` is `bytes_written`.
 - Program not found on spawn → `ErrorInfo { code: 2 /* ENOENT */, message: "no such file: /bin/foo", source: "host_spawn" }`.
 
-### Error code numbering
+### Error code numbering — POSIX errnos
 
-| Range | Meaning |
-|---|---|
-| `1..=255` | POSIX-aligned errnos. `2` = `ENOENT`, `13` = `EACCES`, etc. |
-| `-1..=-99` | Reserved (do not allocate). Gap that protects future Channel-1 expansion. |
-| `-100..=-199` | Network / fetch errors. `-100` = DNS, `-101` = TLS handshake, `-102` = redirect-limit, etc. |
-| `-200..=-299` | Process / spawn errors. `-200` = wasm validation, `-201` = entry-point missing. |
-| `-300..=-399` | VFS / filesystem-extension errors. |
-| `-400..=-499` | Socket errors. |
-| `-500..=-999` | Reserved. |
-| `-1000..` | Reserved for downstream userland use. Kernel never emits these. |
+`ErrorInfo.code` carries a **POSIX errno** in its standard positive range. No parallel custom range. The kernel implements POSIX where reasonable; reusing POSIX errnos avoids a parallel namespace and lets the C ABI shims map `ErrorInfo.code` straight into `errno` with no translation.
 
-Numbering lives in `abi/schema/yurt_abi.fbs` as commented constants alongside `ErrorInfo`. Mirrored into `abi/rust/yurt-abi-fb/src/error_codes.rs` and a TS sibling at `packages/kernel/src/host-imports/_generated/yurt_abi_error_codes.ts` as named constants. Mirrors are hand-maintained; the `abi-fb-drift` CI job greps the `.fbs` for `code:` constants and asserts each appears in both mirrors.
+The full POSIX-errno space (1..~256, depending on platform) is available. Where a yurt-specific cause maps onto a POSIX errno, use it:
+
+| Cause | POSIX errno | Numeric (Linux) |
+|---|---|---|
+| File / fd not found | `ENOENT` | 2 |
+| Bad fd | `EBADF` | 9 |
+| Permission denied | `EACCES` | 13 |
+| Path component is not a directory | `ENOTDIR` | 20 |
+| Already exists | `EEXIST` | 17 |
+| Invalid argument / malformed payload | `EINVAL` | 22 |
+| Buffer too small (caller side) | `EOVERFLOW` | 75 |
+| Bad UTF-8 in payload | `EILSEQ` | 84 |
+| DNS / host unreachable | `EHOSTUNREACH` | 113 |
+| TLS handshake / connection reset | `ECONNRESET` | 104 |
+| Connection refused | `ECONNREFUSED` | 111 |
+| Redirect limit exceeded | `ELOOP` | 40 |
+| WASM validation / entry-point missing | `ENOEXEC` | 8 |
+| Process not found | `ESRCH` | 3 |
+| No process: would block | `EAGAIN` | 11 |
+| Operation not permitted | `EPERM` | 1 |
+
+When POSIX has multiple plausible candidates and none fits cleanly, pick the closest and put the precise cause in `message`. Callers branch on `code` (POSIX errno), surface `message` to humans, and use `source` for debugging — same discipline as in the prior draft.
+
+**Yurt-specific extension range — not used in this cutover.** If a future kernel concept genuinely has no POSIX analogue, codes ≥ 256 are reserved for yurt-specific extensions (placing them safely above any current Linux errno). This range stays empty in this cutover; an explicit decision plus a spec amendment are required to allocate from it.
+
+Numbering — i.e., the curated mapping table — lives in `abi/schema/yurt_abi.fbs` as commented constants alongside `ErrorInfo`. Mirrored into `abi/rust/yurt-abi-fb/src/error_codes.rs` and a TS sibling at `packages/kernel/src/host-imports/_generated/yurt_abi_error_codes.ts` as named constants (the standard `E*` POSIX names). Mirrors are hand-maintained; the `abi-fb-drift` CI job greps the `.fbs` for the `code` annotation block and asserts each appears in both mirrors.
 
 ### Discipline rules
 
@@ -431,11 +490,12 @@ Numbering lives in `abi/schema/yurt_abi.fbs` as commented constants alongside `E
 
 ### What this replaces
 
-- The current JSON `{ ok: false, error: "..." }` shape → `Response.result == ErrorInfo`.
-- Today's implicit "host returned -1, just guess what went wrong" → explicit `-1` / `-2` reservations above.
-- The current `host_spawn` "negative pid means error, look at errno" → `SpawnResponse.result == ErrorInfo` with a typed code.
+- The current JSON `{ ok: false, error: "..." }` shape → `Response.result == ErrorInfo` with a POSIX errno.
+- Today's implicit "host returned -1, just guess what went wrong" → explicit `-1` / `-2` reservations above (transport-level only).
+- The current `host_spawn` "negative pid means error, look at errno" → `SpawnResponse.result == ErrorInfo` with a typed POSIX errno.
 - The current `host_read_fd` mixed format (raw bytes on success, JSON `{error}` on failure) → uniform `ReadFdResponse` quartet.
 - The current `yurt_pclose`-style "captured raw exit code" pattern is preserved (exit codes stay in `RunCommandOk.exit_code`); only error metadata moves.
+- The wait family's four separate ABIs → single `host_wait`.
 
 ## Testing Strategy
 
@@ -486,7 +546,7 @@ The full `deno test` over `packages/kernel` is the integration backstop. Pass cr
 
 - Concrete field layouts for every quartet in the inventory (the spec spells out the pattern; the implementation plan fills in field-by-field tables).
 - Concrete 4-byte file identifiers for every quartet (the spec assigns them at implementation time per the `*REQ` / `*RSP` namespacing rule).
-- Exact error code allocations beyond the placeholder examples (`-100`, `-200`, etc.) — assigned per-call as the implementation lands.
+- Per-call POSIX errno mapping for cases not in the curated table above — assigned per-call as the implementation lands. Default discipline: pick the closest standard POSIX errno; only allocate from the ≥256 yurt-extension range with an explicit spec amendment.
 - Pinned `flatc` version (e.g., `25.x.y`) — chosen against the latest stable at implementation time; recorded in the CI workflow file (single source of truth).
 - Optional: extracting a `make abi-fb-codegen-check` that runs `cargo check -p yurt-abi-fb` as part of the drift CI, to catch generated code that compiles in isolation but breaks downstream callers. Default: not included; add only if the layered test suite proves insufficient.
 
