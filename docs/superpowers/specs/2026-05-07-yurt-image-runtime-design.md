@@ -80,25 +80,37 @@ indexed tar filesystem.
 
 ## Layer Images
 
-Yurt also needs an overlay delta artifact for writable layer state:
+Yurt also needs a durable artifact for writable layer state:
 
-- **Layer image:** uncompressed tar-like overlay delta, extension `.yurtlayer`.
+- **Layer image:** serialized overlay upper state, extension `.yurtlayer`.
 - **Transport layer image:** compressed and signed layer image,
   extension `.yurtlayer.zst`.
 
-A layer image records upper-layer additions, modifications, metadata changes,
-and deletions. Deletions are required because layer 2 can hide files and
-directories from layer 1; the format is not add-only.
+A layer image is not a new filesystem model. It is the stable serialization of
+the data structures the kernel already uses for layer 2:
 
-Layer images should use regular tar entries for created or modified filesystem
-objects and an explicit v1 whiteout representation for deletions. The exact
-encoding must be documented with the implementation, but it must satisfy these
-rules:
+- `OverlayVFS.exportUpperVfs()` provides the mutable upper filesystem contents.
+- `OverlayVFS.exportOverlayState()` provides `{ baseId, whiteouts }`.
+- The default in-memory `VFS` upper layer stores directory, file, symlink,
+  metadata, and hardlink identity through its inode tree.
+
+The existing persistence serializer already exports the right conceptual shape:
+upper filesystem entries plus overlay metadata. `.yurtlayer` should be the
+kernel-owned, versioned form of that state, extended where needed so it is a
+complete layer artifact. In particular, if hardlinks are present in the upper
+VFS, the layer serializer must preserve hardlink identity instead of expanding
+each name into a separate regular file.
+
+A layer image records upper-layer additions, modifications, metadata changes,
+hardlinks, symlinks, and deletions. Deletions are required because layer 2 can
+hide files and directories from layer 1; the format is not add-only.
+
+The serialized state must satisfy these rules:
 
 - deleting a file hides that exact lower-layer path;
 - deleting a directory hides the lower directory and all children unless a
   later layer recreates paths below it;
-- whiteout entries cannot target paths outside the image namespace;
+- whiteout paths cannot target paths outside the image namespace;
 - applying layer images in order is deterministic.
 
 Yurt layer images are not OCI layers. They are kernel-owned overlay delta
