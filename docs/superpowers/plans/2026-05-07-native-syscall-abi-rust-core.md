@@ -4,7 +4,7 @@
 
 **Goal:** Replace JSON/FlatBuffers host-call payloads with a native syscall ABI and move pointer/buffer record handling into Rust.
 
-**Architecture:** Create `abi/rust/yurt-abi-core` as the single owner of native record layouts, errno constants, guest-memory helpers, and fixed-output encoders. Wire that core directly into the Rust Wasmtime runtime where Rust can read guest memory from `wasmtime::Caller`; keep the TypeScript/browser runtime as a correctness-compatible fallback that decodes the same native records in JS because browser runtimes cannot pass guest pointers to Rust without an extra bridge.
+**Architecture:** Create `abi/rust/yurt-abi-core` as the single owner of native record layouts, errno constants, guest-memory helpers, and fixed-output encoders. Wire that core directly into the Rust Wasmtime runtime where Rust can read guest memory from `wasmtime::Caller`; keep the Deno/browser TypeScript runtime as a correctness-compatible fallback that decodes the same native records in JS because browser-style runtimes cannot pass guest pointers to Rust without an extra bridge.
 
 **Tech Stack:** Rust 2024, Wasmtime, WASIp1, TypeScript/Deno tests, C ABI runtime, cargo-yurt/yurt-cc.
 
@@ -1352,4 +1352,4 @@ git commit -m "Add native ABI cleanup guard"
 
 - Spec coverage: covers native syscall ABI, JSON removal, FlatBuffers removal, Rust-owned buffer/pointer processing, wait fold, shell-as-normal-process constraint, C/Rust canaries, and cleanup grep checks.
 - Type consistency: `YurtWaitResultV1`, `YurtPipeResultV1`, `YurtSpawnResultV1`, `GuestMemory`, and native return conventions are defined before use.
-- Browser/runtime split: direct Rust pointer processing is the preferred path in `packages/runtime-wasmtime` because Wasmtime exposes memory to Rust. Browser JavaScript must remain supported, but it is allowed to pay the extra JS decode/encode cost; the plan intentionally avoids adding a native Rust bridge for browsers.
+- JS runtime split: direct Rust pointer processing is the preferred path in `packages/runtime-wasmtime` because Wasmtime exposes memory to Rust. Deno and browser JavaScript must remain supported, with Deno as the practical automated test target for the browser-style path. The JS fallback is allowed to pay the extra decode/encode cost; the plan intentionally avoids adding a native Rust bridge for JS runtimes.
