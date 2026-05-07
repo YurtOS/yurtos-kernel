@@ -4,7 +4,7 @@
 
 **Goal:** Replace JSON/FlatBuffers host-call payloads with a native syscall ABI and move pointer/buffer record handling into Rust.
 
-**Architecture:** Create `abi/rust/yurt-abi-core` as the single owner of native record layouts, errno constants, guest-memory helpers, and fixed-output encoders. Wire that core directly into the Rust Wasmtime runtime where Rust can read guest memory from `wasmtime::Caller`; keep the Deno/browser TypeScript runtime as a correctness-compatible fallback that decodes the same native records in JS because browser-style runtimes cannot pass guest pointers to Rust without an extra bridge.
+**Architecture:** Create `abi/contract/yurt_abi.toml` as the inspectable source of truth for the native syscall contract. Generate the C header, Rust constants/layout declarations, TypeScript fallback declarations, and Markdown ABI reference from that contract. Create `abi/rust/yurt-abi-core` as the hand-written owner of guest-memory helpers, record validation, and codecs that consume the generated Rust layout layer. Wire that core directly into the Rust Wasmtime runtime where Rust can read guest memory from `wasmtime::Caller`; keep the Deno/browser TypeScript runtime as a correctness-compatible fallback that decodes the same native records in JS because browser-style runtimes cannot pass guest pointers to Rust without an extra bridge. Enforce equivalence with shared byte fixtures that pass through Rust and TS parsers.
 
 **Tech Stack:** Rust 2024, Wasmtime, WASIp1, TypeScript/Deno tests, C ABI runtime, cargo-yurt/yurt-cc.
 
@@ -27,15 +27,23 @@ Do not copy FlatBuffers schema or generated bindings into the target design.
 
 ## File Structure
 
+- Create `abi/contract/yurt_abi.toml`: authoritative human-readable native ABI contract.
+- Create `scripts/generate-native-abi.ts`: generator for committed ABI views.
+- Create `abi/include/yurt_abi.h`: generated C constants, structs, and import declarations.
+- Create `abi/rust/yurt-abi-core/src/generated.rs`: generated Rust constants and layout declarations.
+- Create `packages/kernel/src/host-imports/native-generated.ts`: generated TypeScript constants, layout metadata, and import docs for the Deno/browser fallback.
+- Create `docs/abi/native-syscall-abi.md`: generated one-page ABI reference for review.
 - Create `abi/rust/yurt-abi-core/Cargo.toml`: Rust library for ABI records and memory helpers.
 - Create `abi/rust/yurt-abi-core/src/lib.rs`: module exports.
 - Create `abi/rust/yurt-abi-core/src/errno.rs`: POSIX errno constants used by Rust host code and tests.
 - Create `abi/rust/yurt-abi-core/src/memory.rs`: `GuestMemory` trait plus an in-memory test implementation.
-- Create `abi/rust/yurt-abi-core/src/layout.rs`: native ABI structs and constants.
+- Create `abi/rust/yurt-abi-core/src/layout.rs`: hand-written decoded request types and re-exports from `generated.rs`.
 - Create `abi/rust/yurt-abi-core/src/codec.rs`: decoders/encoders for compound records.
 - Create `abi/rust/yurt-abi-core/tests/codec.rs`: record and output encoding tests.
+- Create `abi/rust/yurt-abi-core/tests/fixtures/*.bin`: shared valid and malformed native-record byte fixtures.
+- Create `packages/kernel/src/host-imports/__tests__/native-record-fixtures.test.ts`: TS fallback parser tests over the same fixtures.
 - Modify `Cargo.toml`: add `abi/rust/yurt-abi-core`, remove `abi/rust/yurt-abi-fb` once no code depends on it.
-- Modify `abi/include/yurt_abi.h`: native structs/import declarations matching `layout.rs`.
+- Modify `abi/include/yurt_abi.h`: generated native structs/import declarations matching `yurt_abi.toml`.
 - Modify `abi/src/yurt_runtime.h`: remove JSON/FlatBuffers comments and old wait imports.
 - Modify `abi/src/yurt_pipe.c`, `abi/src/yurt_dup.c`, `abi/src/yurt_process.c`, `abi/src/yurt_spawn.c`, `abi/src/yurt_command.c`, `abi/src/yurt_fetch.c`, `abi/src/yurt_socket.c`, `abi/src/yurt_netdb.c`: call native imports and remove JSON/FB helpers.
 - Modify `packages/runtime-wasmtime/src/wasm/mod.rs`: replace local memory helpers with `yurt_abi_core` helpers and native outputs.
@@ -44,11 +52,85 @@ Do not copy FlatBuffers schema or generated bindings into the target design.
 - Delete `packages/kernel/src/host-imports/fb.ts`, `packages/kernel/src/host-imports/_generated/`, `abi/schema/yurt_abi.fbs`, and `abi/rust/yurt-abi-fb/` after conversion.
 - Add `packages/kernel/src/host-imports/__tests__/native-abi-shape.test.ts`: native signature/grep tests for the V8 harness.
 - Modify `packages/kernel/src/__tests__/abi.test.ts`: expect native ABI canaries only.
-- Modify `abi/Makefile`: remove FlatBuffers build/link steps and include the new Rust ABI core checks.
+- Modify `abi/Makefile`: remove FlatBuffers build/link steps and include the new Rust ABI core and generated-contract drift checks.
 
 ---
 
-### Task 1: Rust ABI Core Skeleton
+### Task 1: Generated Native ABI Contract
+
+**Files:**
+- Create: `abi/contract/yurt_abi.toml`
+- Create: `scripts/generate-native-abi.ts`
+- Create: `docs/abi/native-syscall-abi.md`
+- Create: `abi/include/yurt_abi.h`
+- Create: `packages/kernel/src/host-imports/native-generated.ts`
+- Modify: `abi/Makefile`
+
+- [ ] **Step 1: Create the contract file**
+
+Create `abi/contract/yurt_abi.toml` with:
+
+- POSIX errno constants used at the boundary.
+- Return conventions:
+  - `scalar_errno`: non-negative scalar result or negative POSIX errno.
+  - `fixed_out`: writes a fixed struct, returns bytes written, or required size if `out_cap` is too small.
+  - `record_out`: writes a variable record, returns bytes written, or required size if `out_cap` is too small.
+  - `stream_io`: POSIX partial transfer; returns bytes actually read/written, `0` for EOF on reads, negative errno on failure.
+- Structs:
+  - `yurt_abi_record_header { size: u32, version: u16, flags: u16 }`
+  - `yurt_wait_result_v1 { pid: i32, exit_code: i32, signal: i32, flags: i32 }`
+  - `yurt_pipe_result_v1 { read_fd: i32, write_fd: i32 }`
+  - `yurt_spawn_result_v1 { pid: i32 }`
+- Imports:
+  - process: `host_spawn`, `host_wait`, `host_dup`, `host_pipe`
+  - streams: `host_read_fd`, `host_write_fd`
+  - sockets: `host_socket_send`, `host_socket_recv`, `host_dns_resolve`
+  - network records: `host_network_fetch`
+
+Do not include `host_run_command`. Command execution is compatibility code over spawn, pipes, fd I/O, and wait.
+
+- [ ] **Step 2: Add the generator**
+
+Create `scripts/generate-native-abi.ts`. It reads `abi/contract/yurt_abi.toml` and writes:
+
+- `abi/include/yurt_abi.h`
+- `abi/rust/yurt-abi-core/src/generated.rs`
+- `packages/kernel/src/host-imports/native-generated.ts`
+- `docs/abi/native-syscall-abi.md`
+
+Generated files must include comments from the contract so the ABI can be inspected in one place through the Markdown reference and in language-native form at call sites.
+
+- [ ] **Step 3: Generate and commit the first ABI views**
+
+Run:
+
+```bash
+/Users/sunny/.deno/bin/deno run --allow-read --allow-write scripts/generate-native-abi.ts
+```
+
+Expected: generated C, Rust, TS, and Markdown files exist.
+
+- [ ] **Step 4: Add a drift check**
+
+Add an `abi/Makefile` target:
+
+```make
+check-native-abi-contract:
+	/Users/sunny/.deno/bin/deno run --allow-read --allow-write scripts/generate-native-abi.ts --check
+```
+
+The `--check` mode must fail if generation would change any committed output.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add abi/contract/yurt_abi.toml scripts/generate-native-abi.ts abi/include/yurt_abi.h abi/rust/yurt-abi-core/src/generated.rs packages/kernel/src/host-imports/native-generated.ts docs/abi/native-syscall-abi.md abi/Makefile
+git commit -m "Add generated native ABI contract"
+```
+
+---
+
+### Task 2: Rust ABI Core Skeleton
 
 **Files:**
 - Create: `abi/rust/yurt-abi-core/Cargo.toml`
@@ -78,6 +160,7 @@ Create `abi/rust/yurt-abi-core/src/lib.rs`:
 
 pub mod codec;
 pub mod errno;
+pub mod generated;
 pub mod layout;
 pub mod memory;
 ```
@@ -145,7 +228,7 @@ git commit -m "Add native ABI core crate"
 
 ---
 
-### Task 2: Guest Memory Trait And Tests
+### Task 3: Guest Memory Trait And Tests
 
 **Files:**
 - Create: `abi/rust/yurt-abi-core/src/memory.rs`
@@ -280,12 +363,14 @@ git commit -m "Add Rust guest memory helpers"
 
 ---
 
-### Task 3: Native Layouts And Codecs
+### Task 4: Native Layouts And Codecs
 
 **Files:**
-- Create: `abi/rust/yurt-abi-core/src/layout.rs`
+- Modify: `abi/rust/yurt-abi-core/src/layout.rs`
 - Create: `abi/rust/yurt-abi-core/src/codec.rs`
 - Create: `abi/rust/yurt-abi-core/tests/codec.rs`
+- Create: `abi/rust/yurt-abi-core/tests/fixtures/`
+- Create: `packages/kernel/src/host-imports/__tests__/native-record-fixtures.test.ts`
 
 - [ ] **Step 1: Add codec tests**
 
@@ -329,6 +414,20 @@ fn spawn_record_rejects_out_of_bounds_offset() {
     record[8..12].copy_from_slice(&9999_u32.to_le_bytes());
     assert!(codec::decode_spawn_request(&record).is_err());
 }
+
+#[test]
+fn spawn_record_rejects_unaligned_offset() {
+    let mut record = codec::test_spawn_record("/bin/echo", "echo", &[], &[], "/", &[]);
+    record[8..12].copy_from_slice(&61_u32.to_le_bytes());
+    assert!(codec::decode_spawn_request(&record).is_err());
+}
+
+#[test]
+fn spawn_record_rejects_unknown_version() {
+    let mut record = codec::test_spawn_record("/bin/echo", "echo", &[], &[], "/", &[]);
+    record[4..6].copy_from_slice(&999_u16.to_le_bytes());
+    assert!(codec::decode_spawn_request(&record).is_err());
+}
 ```
 
 - [ ] **Step 2: Run tests and verify failure**
@@ -343,41 +442,13 @@ Expected: compile failure because `layout` and `codec` contents are missing.
 
 - [ ] **Step 3: Add native layouts**
 
-Create `abi/rust/yurt-abi-core/src/layout.rs`:
+Modify `abi/rust/yurt-abi-core/src/layout.rs`:
 
 ```rust
-pub const YURT_ABI_RECORD_VERSION: u16 = 1;
-pub const YURT_WAIT_NOHANG: u32 = 1;
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct YurtAbiRecordHeader {
-    pub size: u32,
-    pub version: u16,
-    pub flags: u16,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct YurtWaitResultV1 {
-    pub pid: i32,
-    pub exit_code: i32,
-    pub signal: i32,
-    pub flags: i32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct YurtPipeResultV1 {
-    pub read_fd: i32,
-    pub write_fd: i32,
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct YurtSpawnResultV1 {
-    pub pid: i32,
-}
+pub use crate::generated::{
+    YURT_ABI_RECORD_VERSION, YURT_WAIT_NOHANG, YurtAbiRecordHeader, YurtPipeResultV1,
+    YurtSpawnResultV1, YurtWaitResultV1,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedSpawnRequest {
@@ -424,6 +495,9 @@ fn span_utf8(bytes: &[u8], off: u32, len: u32) -> Result<String, i32> {
         return Ok(String::new());
     }
     let start = off as usize;
+    if start % 4 != 0 {
+        return Err(errno::neg(errno::EINVAL));
+    }
     let end = start
         .checked_add(len as usize)
         .ok_or(errno::neg(errno::EOVERFLOW))?;
@@ -451,18 +525,19 @@ pub fn decode_spawn_request(bytes: &[u8]) -> Result<DecodedSpawnRequest, i32> {
         return Err(errno::neg(errno::EINVAL));
     }
     let size = u32_at(bytes, 0)? as usize;
-    if size != bytes.len() {
+    if size > bytes.len() || size < 60 {
         return Err(errno::neg(errno::EINVAL));
     }
+    let bytes = &bytes[..size];
     let version = u16_at(bytes, 4)?;
     let flags = u16_at(bytes, 6)?;
     if version != YURT_ABI_RECORD_VERSION {
         return Err(errno::neg(errno::EINVAL));
     }
 
-    let args_vec_off = u32_at(bytes, 24)? as usize;
-    let env_vec_off = u32_at(bytes, 28)? as usize;
-    let pass_fds_vec_off = u32_at(bytes, 52)? as usize;
+    let args_vec_off = aligned_record_offset(bytes, 24)?;
+    let env_vec_off = aligned_record_offset(bytes, 28)?;
+    let pass_fds_vec_off = aligned_record_offset(bytes, 52)?;
 
     Ok(DecodedSpawnRequest {
         version,
@@ -477,6 +552,17 @@ pub fn decode_spawn_request(bytes: &[u8]) -> Result<DecodedSpawnRequest, i32> {
         stderr_fd: i32_at(bytes, 48)?,
         pass_fds: read_i32_vec(bytes, pass_fds_vec_off)?,
     })
+}
+
+fn aligned_record_offset(bytes: &[u8], field_off: usize) -> Result<usize, i32> {
+    let off = u32_at(bytes, field_off)? as usize;
+    if off != 0 && off % 4 != 0 {
+        return Err(errno::neg(errno::EINVAL));
+    }
+    if off > bytes.len() {
+        return Err(errno::neg(errno::EINVAL));
+    }
+    Ok(off)
 }
 
 fn read_string_vec(bytes: &[u8], off: usize) -> Result<Vec<String>, i32> {
@@ -598,34 +684,52 @@ pub fn test_spawn_record(
 }
 ```
 
-- [ ] **Step 5: Run codec tests**
+Validation rules are part of the contract, not implementation discretion:
+
+- `header.size` is the logical initialized record size. It must be `<= req_len`, and all offsets/vectors must land within `header.size`.
+- Each known record version has a minimum header/body size. Smaller values are `-EINVAL`.
+- Every offset+length calculation uses checked arithmetic. Overflow is `-EOVERFLOW`.
+- Record offsets and vector starts are 4-byte aligned. Unaligned offsets are `-EINVAL`.
+- Vector `count * element_size` must fit in `usize` and inside `header.size`.
+- Strings must be UTF-8. Interior NUL is allowed because lengths are explicit.
+- Duplicate or overlapping immutable spans are allowed.
+- Unknown versions are rejected with `-EINVAL` until the contract explicitly documents a compatible extension.
+
+- [ ] **Step 5: Add shared byte fixtures**
+
+Write the valid spawn fixture and malformed variants (`size-too-large`, `size-too-small`, `unaligned-offset`, `offset-overflow`, `vector-overflow`, `invalid-utf8`, `unknown-version`) under `abi/rust/yurt-abi-core/tests/fixtures/`.
+
+Add `packages/kernel/src/host-imports/__tests__/native-record-fixtures.test.ts` that reads the same fixture files and asserts the TS fallback parser returns the same decoded value or same negative errno as Rust.
+
+- [ ] **Step 6: Run codec and fixture tests**
 
 Run:
 
 ```bash
 cargo test -p yurt-abi-core --test codec
+/Users/sunny/.deno/bin/deno test --no-check --allow-read packages/kernel/src/host-imports/__tests__/native-record-fixtures.test.ts
 ```
 
-Expected: 3 passed.
+Expected: Rust codec tests and TS fixture tests pass.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add abi/rust/yurt-abi-core/src/layout.rs abi/rust/yurt-abi-core/src/codec.rs abi/rust/yurt-abi-core/tests/codec.rs
+git add abi/rust/yurt-abi-core/src/layout.rs abi/rust/yurt-abi-core/src/codec.rs abi/rust/yurt-abi-core/tests/codec.rs abi/rust/yurt-abi-core/tests/fixtures packages/kernel/src/host-imports/__tests__/native-record-fixtures.test.ts
 git commit -m "Add native ABI record codecs"
 ```
 
 ---
 
-### Task 4: C Header And Runtime Declarations
+### Task 5: C Header And Runtime Declarations
 
 **Files:**
 - Modify: `abi/include/yurt_abi.h`
 - Modify: `abi/src/yurt_runtime.h`
 
-- [ ] **Step 1: Add C header layout declarations**
+- [ ] **Step 1: Verify generated C header layout declarations**
 
-Replace the ABI-struct section of `abi/include/yurt_abi.h` with:
+Verify the generated ABI-struct section of `abi/include/yurt_abi.h` contains:
 
 ```c
 #define YURT_ABI_RECORD_VERSION 1u
@@ -670,9 +774,6 @@ int yurt_host_spawn(int req_ptr, int req_len, int out_ptr, int out_cap);
 
 __attribute__((import_module("yurt"), import_name("host_wait")))
 int yurt_host_wait(int pid, int flags, int out_ptr, int out_cap);
-
-__attribute__((import_module("yurt"), import_name("host_run_command")))
-int yurt_host_run_command(int req_ptr, int req_len, int out_ptr, int out_cap);
 ```
 
 Remove declarations for:
@@ -682,6 +783,7 @@ yurt_host_waitpid
 yurt_host_waitpid_nohang
 yurt_host_wait_any
 yurt_host_wait_any_nohang
+yurt_host_run_command
 ```
 
 - [ ] **Step 3: Verify no old wait declarations remain**
@@ -689,7 +791,7 @@ yurt_host_wait_any_nohang
 Run:
 
 ```bash
-rg -n "host_waitpid|host_wait_any" abi/src abi/include
+rg -n "host_waitpid|host_wait_any|host_run_command" abi/src abi/include
 ```
 
 Expected: no output.
@@ -703,7 +805,7 @@ git commit -m "Declare native process ABI"
 
 ---
 
-### Task 5: Native Pipe, Dup, And Wait In TS Harness
+### Task 6: Native Pipe, Dup, And Wait In TS Harness
 
 **Files:**
 - Modify: `packages/kernel/src/host-imports/common.ts`
@@ -852,7 +954,7 @@ git commit -m "Use native ABI for pipe dup and wait"
 
 ---
 
-### Task 6: Convert C Pipe, Dup, And Wait Shims
+### Task 7: Convert C Pipe, Dup, And Wait Shims
 
 **Files:**
 - Modify: `abi/src/yurt_pipe.c`
@@ -952,7 +1054,7 @@ git commit -m "Convert process shims to native ABI"
 
 ---
 
-### Task 7: Wasmtime Rust Memory Adapter
+### Task 8: Wasmtime Rust Memory Adapter
 
 **Files:**
 - Create: `packages/runtime-wasmtime/src/wasm/abi_memory.rs`
@@ -1080,7 +1182,7 @@ git commit -m "Use Rust ABI core for Wasmtime guest memory"
 
 ---
 
-### Task 8: Native File And Socket Byte I/O
+### Task 9: Native File And Socket Byte I/O
 
 **Files:**
 - Modify: `packages/kernel/src/host-imports/kernel-imports.ts`
@@ -1101,7 +1203,14 @@ host_socket_recv(fd, outPtr, outCap, flags)
 host_dns_resolve(hostPtr, hostLen, outPtr, outCap)
 ```
 
-Use `readString`, `readBytes`, and `writeBytes` only. Return negative errno on error.
+Use `readString`, `readBytes`, and `writeBytes` only. Stream operations use POSIX partial transfer semantics:
+
+- `host_read_fd` and `host_socket_recv` write at most `out_cap` bytes and return the number of bytes read.
+- `host_write_fd` and `host_socket_send` write at most `data_len` bytes and return the number of bytes accepted.
+- Reads return `0` for EOF.
+- Nonblocking no-progress returns `-EAGAIN`.
+- These functions never return a positive required size and never require the host to buffer extra stream data for retry.
+- Structured outputs such as DNS results keep required-size retry semantics.
 
 - [ ] **Step 2: Update C socket shims**
 
@@ -1154,7 +1263,7 @@ git commit -m "Use native ABI for byte IO"
 
 ---
 
-### Task 9: Native Spawn And Command Records
+### Task 10: Native Spawn And Command Compatibility
 
 **Files:**
 - Modify: `abi/src/yurt_spawn.c`
@@ -1176,11 +1285,21 @@ if (rc < 0) { errno = -rc; return -1; }
 return 0;
 ```
 
-- [ ] **Step 2: Replace command JSON building**
+- [ ] **Step 2: Remove host command ABI and implement compatibility over normal processes**
 
-In `abi/src/yurt_command.c`, delete `yurt_json_call`, `build_command_request`, `parse_exit_code`, and `parse_json_string_field`. Build a native command request record and parse the native command response offsets returned by the host.
+In `abi/src/yurt_command.c`, delete `yurt_json_call`, `build_command_request`, `parse_exit_code`, `parse_json_string_field`, and any call to `yurt_host_run_command`.
 
-- [ ] **Step 3: Decode spawn and command records in Rust**
+Implement `yurt_system`, `yurt_popen`, and Python subprocess compatibility using the normal process ABI:
+
+- create pipes with `host_pipe` where stdin/stdout/stderr capture is needed;
+- spawn `/bin/sh`, `/bin/bash`, or the requested executable through `host_spawn`;
+- write stdin with `host_write_fd`;
+- read stdout/stderr with `host_read_fd` until EOF or buffer policy is satisfied;
+- wait with `host_wait`.
+
+`host_run_command` must not exist in `abi/src/yurt_runtime.h`, `packages/kernel/src/host-imports/kernel-imports.ts`, or the generated contract.
+
+- [ ] **Step 3: Decode spawn records in Rust**
 
 In `packages/runtime-wasmtime/src/wasm/spawn.rs`, replace:
 
@@ -1213,7 +1332,7 @@ let req = yurt_abi_core::codec::decode_spawn_request(&req_bytes)?;
 
 - [ ] **Step 4: Update TS harness to use Rust-compatible native record decoding**
 
-Until the V8 runtime is retired, implement the same native record decoding in `kernel-imports.ts` using small local functions named `decodeSpawnRecord` and `decodeCommandRecord`. These must mirror `yurt-abi-core` tests byte-for-byte. Delete all `JSON.parse(readString(...))` fallback branches.
+Until the V8 runtime is retired, implement the same native spawn/fetch record decoding in `kernel-imports.ts` using small local functions named `decodeSpawnRecord` and `decodeNetworkFetchRecord`, or generated helpers from `native-generated.ts` if the generator already provides them. These must mirror `yurt-abi-core` fixture tests byte-for-byte. Delete all `JSON.parse(readString(...))` fallback branches. Do not add a command-record decoder.
 
 - [ ] **Step 5: Run process canaries**
 
@@ -1230,12 +1349,12 @@ Expected: `system-canary`, `popen-canary`, Rust `std::process::*` canaries, and 
 
 ```bash
 git add abi/src/yurt_spawn.c abi/src/yurt_command.c packages/kernel/src/host-imports/kernel-imports.ts packages/runtime-wasmtime/src/wasm/spawn.rs packages/runtime-wasmtime/src/wasm/network.rs packages/kernel/src/platform/__tests__/fixtures
-git commit -m "Use native ABI for spawn and command execution"
+git commit -m "Use native ABI for spawn and command compatibility"
 ```
 
 ---
 
-### Task 10: Delete FlatBuffers And JSON ABI Artifacts
+### Task 11: Delete FlatBuffers And JSON ABI Artifacts
 
 **Files:**
 - Delete: `abi/schema/yurt_abi.fbs`
@@ -1270,7 +1389,7 @@ In `abi/Makefile`, remove references to `yurt-abi-fb`, `yurt_fb.h`, schema gener
 Run:
 
 ```bash
-rg -n "FlatBuffer|flatbuffers|yurt_abi\\.fbs|writeJson|JSON\\.parse\\(readString|host_waitpid|host_wait_any|yurt_fb" abi packages/kernel/src Cargo.toml
+rg -n "FlatBuffer|flatbuffers|yurt_abi\\.fbs|writeJson|JSON\\.parse\\(readString|host_waitpid|host_wait_any|host_run_command|RunCommand|run_command|yurt_json_call|yurt_fb" abi packages/kernel/src Cargo.toml
 ```
 
 Expected: no output except historical design docs under `docs/` if the command is widened to include docs.
@@ -1284,7 +1403,7 @@ git commit -m "Remove JSON and FlatBuffers ABI artifacts"
 
 ---
 
-### Task 11: Final Verification And CI Guard
+### Task 12: Final Verification And CI Guard
 
 **Files:**
 - Create: `scripts/check-native-abi-clean.sh`
@@ -1311,6 +1430,7 @@ check_absent() {
 check_absent 'writeJson' packages/kernel/src/host-imports
 check_absent 'JSON\.parse\(readString' packages/kernel/src/host-imports
 check_absent 'host_waitpid|host_wait_any|host_waitpid_nohang|host_wait_any_nohang' abi packages/kernel/src
+check_absent 'host_run_command|RunCommand|run_command|yurt_json_call' abi packages/kernel/src/host-imports
 check_absent 'FlatBuffer|flatbuffers|yurt_fb|yurt_abi\.fbs' abi packages/kernel/src/host-imports Cargo.toml
 
 exit "$bad"
@@ -1330,6 +1450,7 @@ Run:
 
 ```bash
 cargo test -p yurt-abi-core
+make -C abi check-native-abi-contract
 cargo check --target wasm32-wasip1 -p yurt-shell-exec
 make -C abi copy-fixtures rust-canaries rust-std-canaries
 /Users/sunny/.deno/bin/deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/abi.test.ts
@@ -1350,6 +1471,7 @@ git commit -m "Add native ABI cleanup guard"
 
 ## Self-Review
 
-- Spec coverage: covers native syscall ABI, JSON removal, FlatBuffers removal, Rust-owned buffer/pointer processing, wait fold, shell-as-normal-process constraint, C/Rust canaries, and cleanup grep checks.
+- Spec coverage: covers generated ABI contract, native syscall ABI, JSON removal, FlatBuffers removal, Rust-owned buffer/pointer processing, wait fold, shell-as-normal-process constraint, C/Rust canaries, and cleanup grep checks.
 - Type consistency: `YurtWaitResultV1`, `YurtPipeResultV1`, `YurtSpawnResultV1`, `GuestMemory`, and native return conventions are defined before use.
 - JS runtime split: direct Rust pointer processing is the preferred path in `packages/runtime-wasmtime` because Wasmtime exposes memory to Rust. Deno and browser JavaScript must remain supported, with Deno as the practical automated test target for the browser-style path. The JS fallback is allowed to pay the extra decode/encode cost; the plan intentionally avoids adding a native Rust bridge for JS runtimes.
+- Parser equivalence: Rust ABI core and TS fallback share generated layout metadata and byte fixtures. Malformed records must produce the same negative errno on both paths.

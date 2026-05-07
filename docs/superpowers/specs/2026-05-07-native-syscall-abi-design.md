@@ -21,7 +21,7 @@ The rational ABI is:
 - C-layout structs or small offset-table records in guest memory when a call needs compound data;
 - return values that follow POSIX-style errno conventions.
 
-The ABI should be easy to call from C, Rust, and TypeScript without generated bindings.
+The ABI should be easy to call from C, Rust, and TypeScript without runtime schema dependencies.
 
 ## Scope
 
@@ -52,7 +52,9 @@ Host imports use one of these conventions:
 - `>= 0`: success. The value is a byte count, fd, pid, boolean-as-0/1, or required output size depending on the call.
 - `< 0`: failure as negative POSIX errno, for example `-ENOENT`, `-EBADF`, `-EAGAIN`, `-EOVERFLOW`.
 
-If an output buffer is too small, the host returns the required size as a positive integer and does not partially commit the response unless the call explicitly documents partial writes.
+Structured outputs use retry sizing: if the output buffer is too small, the host returns the required size as a positive integer and does not partially commit the response.
+
+Stream I/O follows POSIX semantics instead. `host_read_fd`, `host_write_fd`, `host_socket_recv`, and `host_socket_send` may complete partially. They return the number of bytes actually read or written, `0` for EOF on reads, or negative errno for failure. Nonblocking calls return `-EAGAIN` when no progress can be made. These calls never use required-size retry semantics because doing so would force buffering/draining behavior and break nonblocking operation.
 
 ### Strings And Bytes
 
@@ -60,7 +62,18 @@ Strings are UTF-8 byte spans: `(ptr, len)`. They are not NUL-terminated at the A
 
 Byte buffers are raw spans: `(ptr, len)`. Binary data is never base64 encoded.
 
-Outputs use `(out_ptr, out_cap)` and return the number of bytes required or written.
+Structured outputs use `(out_ptr, out_cap)` and return the number of bytes required or written. Stream outputs use `(out_ptr, out_cap)` and return the number of bytes actually transferred.
+
+## ABI Contract Source
+
+The ABI contract is a generated and inspectable artifact set:
+
+- `abi/contract/yurt_abi.toml` is the authoritative human-readable contract. It lists every import, argument type, return convention, struct, record, constant, errno mapping, and doc comment.
+- `abi/include/yurt_abi.h`, `abi/rust/yurt-abi-core/src/generated.rs`, and `packages/kernel/src/host-imports/native-generated.ts` are generated from the contract and committed.
+- `docs/abi/native-syscall-abi.md` is generated from the same contract so reviewers can inspect the complete ABI in one place.
+- CI runs the generator and fails if generated artifacts drift.
+
+The contract generator is deliberately small and repo-local. It does not introduce a runtime schema dependency; it is only a build/review tool for keeping the C, Rust, TS fallback, and documentation views identical.
 
 ### Fixed Struct Outputs
 
@@ -86,6 +99,18 @@ typedef struct {
 ```
 
 Records use offsets relative to the start of the record, not guest absolute pointers, so a single `(ptr, len)` identifies the complete request. Offset `0` means absent where allowed.
+
+Validation is part of the ABI, not an implementation detail. Rust core and TS fallback must enforce the same rules:
+
+- `header.size` is the logical initialized record size, not allocation capacity.
+- `header.size <= req_len` and `header.size >= min_size_for(version)`.
+- All offsets and `offset + len` calculations are checked for integer overflow.
+- Every referenced span must land wholly within `header.size`.
+- All vector counts must fit within `header.size`; count multiplication is overflow-checked before indexing.
+- All multi-byte scalar fields and vector entries are 4-byte aligned. Unaligned offsets are invalid.
+- Strings are UTF-8 byte spans. Interior NUL bytes are allowed because ABI strings are not C strings; C shims that need C strings must copy and append their own terminator.
+- Duplicate references and overlapping spans are allowed for immutable input data.
+- Unknown record versions are invalid until explicitly added to the contract.
 
 Example pattern for spawn:
 
@@ -147,15 +172,9 @@ On success, host writes `yurt_spawn_result_v1 { int32_t pid; }` and returns its 
 
 ### Command Execution
 
-`host_run_command` should not be a JSON command object. Use a native record:
+`host_run_command` is **not** part of the native kernel ABI. Shell execution is represented by spawning a normal guest process such as `/bin/sh`, `/bin/bash`, or another registered executable with pipes for stdin/stdout/stderr.
 
-```c
-host_run_command(req_ptr, req_len, out_ptr, out_cap) -> i32
-```
-
-The request record carries `cmd`, optional `cwd`, optional stdin bytes, stdin fd, and env. The response record carries exit code and offset spans for stdout/stderr bytes. If `out_cap` is too small, return required size.
-
-Longer term, shell-like execution should prefer spawning `/bin/sh` or `/bin/bash` as a normal process rather than adding host-side shell semantics.
+The existing `yurt_system`, `yurt_popen`, Python subprocess shim, and PID-1 command helpers are compatibility layers. They must be implemented in terms of `host_spawn`, `host_pipe`, `host_write_fd`, `host_read_fd`, and `host_wait`, not by adding a command-execution syscall at the host boundary.
 
 ### File And Socket I/O
 
@@ -191,8 +210,8 @@ Memory views must be re-derived after any `await`, because `WebAssembly.Memory.g
 Add a Rust crate, `abi/rust/yurt-abi-core`, that owns the ABI record and memory rules:
 
 - `GuestMemory` trait for reading and writing guest linear memory without depending on V8, Deno, or Wasmtime.
-- `decode` modules for native records such as spawn and run-command.
-- `encode` modules for fixed outputs such as wait results, pipe results, process lists, socket addresses, stat metadata, and command results.
+- `decode` modules for native records such as spawn and process-list filters.
+- `encode` modules for fixed outputs such as wait results, pipe results, process lists, socket addresses, and stat metadata.
 - `errno` module with POSIX errno constants shared by Rust and generated C headers.
 - host-runtime helpers that can be used directly by `packages/runtime-wasmtime`.
 
@@ -202,7 +221,7 @@ The Wasmtime runtime is the preferred implementation path because Rust can recei
 
 ## C/Rust Guest Side
 
-The C ABI runtime owns a small header, `abi/include/yurt_abi.h`, generated or checked against the Rust ABI core, with:
+The C ABI runtime includes `abi/include/yurt_abi.h`, generated from `abi/contract/yurt_abi.toml`, with:
 
 - import declarations;
 - record structs;
@@ -213,31 +232,34 @@ Rust std patches call the same imports through `extern "C"` declarations or thro
 
 ## Migration
 
-1. Create `abi/rust/yurt-abi-core` by reusing the Rust ABI crate structure from the `rust-abi-pilot` worktree and the FFI boundary lessons from `rust-abi-high-impact`, but without FlatBuffers.
-2. Add `abi/include/yurt_abi.h` with native ABI structs, flags, and import declarations, sourced from or checked against the Rust ABI core.
-3. Convert TS host imports one family at a time to native signatures and delegate record/struct work to the Rust ABI core adapter.
-4. Convert C ABI shims and Rust std call sites to those signatures.
-5. Delete FlatBuffers helpers and generated bindings once no import uses them.
-6. Delete JSON helpers, `writeJson`, and all legacy JSON host branches.
-7. Rebuild C canaries, Rust canaries, Rust std canaries, and bash fixtures.
-8. Run ABI, host-import, fixture, and shell/process tests.
-9. Add grep-based CI checks that reject `writeJson`, ABI-boundary `JSON.parse`, FlatBuffers host imports, and old wait imports.
+1. Create `abi/contract/yurt_abi.toml` and a generator that emits C, Rust, TS fallback, and Markdown views of the contract.
+2. Create `abi/rust/yurt-abi-core` by reusing the Rust ABI crate structure from the `rust-abi-pilot` worktree and the FFI boundary lessons from `rust-abi-high-impact`, but without FlatBuffers.
+3. Generate `abi/include/yurt_abi.h` and Rust/TS constants and layouts from the contract.
+4. Convert TS host imports one family at a time to native signatures and use the generated TS fallback codec for Deno/browser tests.
+5. Convert C ABI shims and Rust std call sites to those signatures.
+6. Remove `host_run_command` from the kernel ABI and implement command compatibility through spawn/pipe/wait.
+7. Delete FlatBuffers helpers and generated bindings once no import uses them.
+8. Delete JSON helpers, `writeJson`, and all legacy JSON host branches.
+9. Rebuild C canaries, Rust canaries, Rust std canaries, and bash fixtures.
+10. Run ABI, host-import, fixture, and shell/process tests.
+11. Add grep-based CI checks that reject `writeJson`, ABI-boundary `JSON.parse`, FlatBuffers host imports, `host_run_command`, and old wait imports.
 
 ## Test Strategy
 
 - Unit tests for each host import family using direct memory buffers.
 - Rust ABI core unit tests for each record decoder and fixed-output writer using an in-memory `GuestMemory` implementation.
-- Cross-check tests that `abi/include/yurt_abi.h` constants and struct sizes match Rust ABI core constants.
+- Contract drift tests that regenerate `abi/include/yurt_abi.h`, Rust generated layouts, TS fallback layouts, and `docs/abi/native-syscall-abi.md` and compare them to the checked-in files.
+- Cross-parser fixtures: a shared corpus of valid and malformed native record bytes must produce identical decoded values or identical negative errno from Rust core and TS fallback.
 - ABI canaries for C and Rust std.
 - Memory-growth-across-await test for every async import that reads request bytes.
 - Grep canaries:
   - no `writeJson` under `packages/kernel/src/host-imports`;
   - no `JSON.parse(readString(...))` at host import boundaries;
   - no `host_waitpid`, `host_waitpid_nohang`, `host_wait_any`, or `host_wait_any_nohang`;
+  - no `host_run_command`;
   - no `abi/src/*json*` helper functions.
 
 ## Open Questions
 
-- Whether `host_run_command` survives long term or becomes a compatibility layer over spawning a shell process.
-- Exact record layouts for command execution and process listing.
+- Exact record layouts for process-list filters.
 - Whether all socket operations should be split into direct scalar signatures, or whether a few rare metadata operations deserve compact records.
