@@ -111,6 +111,44 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
     expect(result.stdout.trim()).toBe('/usr/extensions:/bin:/usr/bin');
   });
 
+  it('snapshot/restore drops env vars set after the snapshot from the guest', async () => {
+    // Regression test for the merge-only __set_env protocol: without
+    // an unset path, restore() shrunk Sandbox.env on the host but left
+    // the now-removed vars live in the guest, so subsequent runs saw
+    // stale values.
+    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+    sandbox.setEnv('KEEP', 'one');
+    const snap = sandbox.snapshot();
+    sandbox.setEnv('DROP', 'two');
+
+    const before = await sandbox.run('echo before:$KEEP:$DROP');
+    expect(before.stdout.trim()).toBe('before:one:two');
+
+    sandbox.restore(snap);
+    expect(sandbox.getEnv('DROP')).toBeUndefined();
+
+    const after = await sandbox.run('echo after:$KEEP:$DROP');
+    expect(after.stdout.trim()).toBe('after:one:');
+  });
+
+  it('exportState/importState drops env vars set after the snapshot from the guest', async () => {
+    // Same regression as above, walked through the exportState path
+    // rather than snapshot()/restore().
+    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+    sandbox.setEnv('KEEP', 'one');
+    const blob = sandbox.exportState();
+    sandbox.setEnv('DROP', 'two');
+
+    const before = await sandbox.run('echo before:$KEEP:$DROP');
+    expect(before.stdout.trim()).toBe('before:one:two');
+
+    sandbox.importState(blob);
+    expect(sandbox.getEnv('DROP')).toBeUndefined();
+
+    const after = await sandbox.run('echo after:$KEEP:$DROP');
+    expect(after.stdout.trim()).toBe('after:one:');
+  });
+
   it('destroy prevents further use', async () => {
     sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
     sandbox.destroy();

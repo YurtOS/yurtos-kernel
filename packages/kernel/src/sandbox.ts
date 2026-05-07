@@ -212,6 +212,14 @@ export class Sandbox {
   private runCommandHandler: RunCommandHandler | undefined;
   private activeDeadlineMs: number | undefined;
   private envNeedsSync = false;
+  /**
+   * What we last pushed across `__set_env` (and what the guest's full
+   * env was after the most recent `__run_command` round trip). Used by
+   * `syncBootEnv` to compute the unset diff: keys here that aren't in
+   * `this.env` need an `__unset_env` so the guest doesn't keep stale
+   * vars across `setEnvMap()` / `restore()` / `importState()`.
+   */
+  private lastSyncedEnv: Map<string, string> = new Map();
 
   private constructor(parts: SandboxParts) {
     this.vfs = parts.vfs;
@@ -1507,6 +1515,14 @@ export class Sandbox {
     const setEnv = proc.exports.__set_env as
       | ((ptr: number, len: number) => number)
       | undefined;
+    // __unset_env is optional: older boot wasms only export __set_env,
+    // and on those the diff-and-unset step is a no-op. The merge in
+    // __set_env still runs, so additive setEnv() calls work; only the
+    // setEnvMap()/restore()/importState() removal path silently
+    // degrades to "leaks the previously-synced keys".
+    const unsetEnv = proc.exports.__unset_env as
+      | ((ptr: number, len: number) => number)
+      | undefined;
     const alloc = proc.exports.__alloc as
       | ((size: number) => number)
       | undefined;
@@ -1515,7 +1531,37 @@ export class Sandbox {
       | undefined;
     if (!setEnv || !alloc || !dealloc) return;
 
-    const bytes = new TextEncoder().encode(
+    const encoder = new TextEncoder();
+
+    // Drop keys that were in the last sync but aren't in the current
+    // host map. Without this, a setEnvMap()/restore()/importState()
+    // that shrinks the env leaves the dropped vars live in the guest.
+    if (unsetEnv) {
+      const toUnset: string[] = [];
+      for (const key of this.lastSyncedEnv.keys()) {
+        if (!this.env.has(key)) toUnset.push(key);
+      }
+      if (toUnset.length > 0) {
+        const unsetBytes = encoder.encode(JSON.stringify(toUnset));
+        const unsetPtr = alloc(unsetBytes.length);
+        try {
+          new Uint8Array(proc.memory.buffer, unsetPtr, unsetBytes.length)
+            .set(unsetBytes);
+          const rc = await proc.callExport(
+            "__unset_env",
+            unsetPtr,
+            unsetBytes.length,
+          );
+          if (rc !== 0) {
+            throw new Error(`boot process rejected env unset: ${rc}`);
+          }
+        } finally {
+          dealloc(unsetPtr, unsetBytes.length);
+        }
+      }
+    }
+
+    const bytes = encoder.encode(
       JSON.stringify(Object.fromEntries(this.env)),
     );
     const ptr = alloc(bytes.length);
@@ -1526,6 +1572,7 @@ export class Sandbox {
         throw new Error(`boot process rejected environment sync: ${rc}`);
       }
       this.envNeedsSync = false;
+      this.lastSyncedEnv = new Map(this.env);
     } finally {
       dealloc(ptr, bytes.length);
     }
@@ -1715,6 +1762,10 @@ export class Sandbox {
   private replaceEnvMapFromGuest(env: Map<string, string>): void {
     this.env = new Map(env);
     this.envNeedsSync = false;
+    // The guest just reported its full env; that is the state on the
+    // other side of the protocol, so the unset-diff against it is
+    // accurate on the next sync.
+    this.lastSyncedEnv = new Map(env);
   }
 
   snapshot(): string {
