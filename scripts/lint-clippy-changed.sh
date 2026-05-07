@@ -8,7 +8,8 @@ set -euo pipefail
 mapfile -t CHANGED < <(git diff --cached --name-only --diff-filter=ACMRT -- '*.rs' || true)
 
 if [[ ${#CHANGED[@]} -eq 0 ]]; then
-  exec cargo clippy --workspace --all-targets -- -D warnings
+  # Default-members only — wasm-only canary crates need a different target.
+  exec cargo clippy --all-targets -- -D warnings
 fi
 
 # Map each changed file to the nearest Cargo.toml directory, dedupe.
@@ -25,7 +26,8 @@ for f in "${CHANGED[@]}"; do
 done
 
 if [[ ${#CRATE_DIRS[@]} -eq 0 ]]; then
-  exec cargo clippy --workspace --all-targets -- -D warnings
+  # Default-members only — wasm-only canary crates need a different target.
+  exec cargo clippy --all-targets -- -D warnings
 fi
 
 for dir in "${!CRATE_DIRS[@]}"; do

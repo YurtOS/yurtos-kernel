@@ -29,8 +29,9 @@ This installs the `pre-commit` framework (via `brew`, `pipx`, or
 
 Everything above, plus:
 
-- `cargo test --workspace --tests` (fast tier — Rust slow tests are
-  tagged `#[ignore]` and excluded by default).
+- `cargo test --tests` (fast tier — uses workspace `default-members`,
+  excludes wasm-only canary crates; Rust slow tests are tagged
+  `#[ignore]` and excluded by default).
 - `deno test … "packages/**/*_test.ts"` (fast tier — slow Deno tests
   use the suffix `_integration_test.ts` and are excluded).
 
@@ -52,11 +53,13 @@ var, `--no-verify`).
 
 ## CI
 
-- `.github/workflows/rust.yml` — `cargo fmt --check`, workspace
-  `cargo clippy -- -D warnings`, `cargo test --workspace --tests`.
+- `.github/workflows/rust.yml` — `cargo fmt --check`,
+  `cargo clippy --all-targets -- -D warnings`, `cargo test --tests`
+  (default-members only, excludes wasm-only canary crates).
 - `.github/workflows/deno.yml` — `deno fmt --check`, `deno lint`,
-  `deno check`, fast-tier `deno test`, plus a self-check job that
-  runs `pre-commit run --all-files`.
+  `deno check`, fast-tier `deno test`. (A `hooks-self-check` job is
+  staged for the format/lint cleanup follow-up PR — see the comment
+  in the workflow file.)
 - `.github/workflows/guest-compat.yml` — toolchain, ABI canaries,
   Rust-std canaries, BusyBox fixture, the Deno tests that depend
   on canary fixtures (the slow Deno tier in CI).

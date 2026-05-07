@@ -53,7 +53,8 @@ repos:
       # Pre-push only
       - id: cargo-test-fast
         name: cargo test (fast tier)
-        entry: cargo test --workspace --tests
+        # Uses workspace default-members (excludes wasm-only canary crates).
+        entry: cargo test --tests
         language: system
         types_or: [rust]
         pass_filenames: false
