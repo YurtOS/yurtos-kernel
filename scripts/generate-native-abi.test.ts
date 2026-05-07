@@ -22,7 +22,9 @@ Deno.test("native ABI generator check mode detects drift", async () => {
   const root = await Deno.makeTempDir();
   await Deno.mkdir(`${root}/abi/contract`, { recursive: true });
   await Deno.mkdir(`${root}/abi/include`, { recursive: true });
-  await Deno.mkdir(`${root}/abi/rust/yurt-abi-core/src`, { recursive: true });
+  await Deno.mkdir(`${root}/packages/runtime-wasmtime/src/wasm`, {
+    recursive: true,
+  });
   await Deno.mkdir(`${root}/packages/kernel/src/host-imports`, {
     recursive: true,
   });

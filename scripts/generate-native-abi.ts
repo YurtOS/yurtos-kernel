@@ -563,7 +563,10 @@ export async function writeGeneratedFiles(
 ): Promise<{ ok: boolean; changed: string[] }> {
   const files = [
     ["abi/include/yurt_abi.h", rendered.cHeader],
-    ["abi/rust/yurt-abi-core/src/generated.rs", rendered.rust],
+    [
+      "packages/runtime-wasmtime/src/wasm/native_abi_generated.rs",
+      rendered.rust,
+    ],
     [
       "packages/kernel/src/host-imports/native-generated.ts",
       rendered.typescript,
