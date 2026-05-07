@@ -3,6 +3,8 @@
 
 This document is generated from `abi/contract/yurt_abi.toml`.
 
+This is the proposed target ABI for the native syscall migration. It is not installed as the live guest/runtime header until the corresponding implementation task lands.
+
 ## Return Conventions
 
 - `scalar_errno`: Non-negative scalar success value, or negative POSIX errno on failure.

@@ -4,7 +4,7 @@
 
 **Goal:** Remove JSON and FlatBuffers from the syscall boundary without pushing ABI complexity into guest programs. Guests call normal Wasm host imports. Rust/Wasmtime and TS/Deno/browser hosts decode guest memory at the host boundary.
 
-**Architecture:** `abi/contract/yurt_abi.toml` is the inspectable ABI contract. It generates the C guest header, Rust host constants/layouts, TypeScript host metadata, and Markdown reference. There is no guest-side ABI codec crate. The C ABI runtime only contains thin libc/POSIX compatibility wrappers and small local request builders where a compound request is unavoidable. Rust Wasmtime import handlers read/write guest memory directly through `wasmtime::Caller`. The TypeScript host fallback uses the same import signatures and decodes the same guest memory bytes in TS. Shared byte fixtures enforce Rust/TS parser equivalence.
+**Architecture:** `abi/contract/yurt_abi.toml` is the inspectable ABI contract. It generates proposed C guest header, Rust host constants/layouts, TypeScript host metadata, and Markdown reference artifacts under `docs/abi/`. There is no guest-side ABI codec crate. The C ABI runtime only contains thin libc/POSIX compatibility wrappers and small local request builders where a compound request is unavoidable. Rust Wasmtime import handlers read/write guest memory directly through `wasmtime::Caller`. The TypeScript host fallback uses the same import signatures and decodes the same guest memory bytes in TS. Shared byte fixtures enforce Rust/TS parser equivalence.
 
 **Tech Stack:** Rust 2024, Wasmtime, WASIp1, TypeScript/Deno tests, C ABI runtime, cargo-yurt/yurt-cc.
 
@@ -14,10 +14,11 @@
 
 - Keep `abi/contract/yurt_abi.toml`: authoritative human-readable ABI contract.
 - Keep `scripts/generate-native-abi.ts`: generator for committed ABI views.
-- Keep generated `abi/include/yurt_abi.h`: guest-facing C declarations and small structs.
-- Keep generated `packages/runtime-wasmtime/src/wasm/native_abi_generated.rs`: Rust host constants/layout structs.
-- Keep generated `packages/kernel/src/host-imports/native-generated.ts`: TS host metadata.
+- Keep generated `docs/abi/generated/yurt_abi.h`: proposed guest-facing C declarations and small structs.
+- Keep generated `docs/abi/generated/native_abi_generated.rs`: proposed Rust host constants/layout structs.
+- Keep generated `docs/abi/generated/native-generated.ts`: proposed TS host metadata.
 - Keep generated `docs/abi/native-syscall-abi.md`: reviewable complete ABI reference.
+- Do not install generated views into live runtime/header paths before the corresponding implementation cutover.
 - Do not create `abi/rust/yurt-abi-core`.
 - Modify `abi/src/yurt_runtime.h`, `abi/src/yurt_pipe.c`, `abi/src/yurt_dup.c`, `abi/src/yurt_spawn.c`, `abi/src/yurt_command.c`, `abi/src/yurt_fetch.c`, `abi/src/yurt_socket.c`, and `abi/src/yurt_netdb.c`: call native imports and remove JSON/FB helpers.
 - Modify `packages/runtime-wasmtime/src/wasm/{mod,kernel,spawn,network}.rs`: decode pointer/span inputs in host import handlers.
@@ -36,15 +37,15 @@
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 
-- [ ] **Step 1: Generate Rust metadata into the host runtime**
+- [ ] **Step 1: Generate Rust metadata as a reference artifact**
 
 The generator writes Rust output to:
 
 ```text
-packages/runtime-wasmtime/src/wasm/native_abi_generated.rs
+docs/abi/generated/native_abi_generated.rs
 ```
 
-It must not write to `abi/rust/yurt-abi-core`.
+It must not write to `abi/rust/yurt-abi-core` or live host runtime paths until the corresponding import implementation is being installed.
 
 - [ ] **Step 2: Remove the core crate**
 
@@ -64,7 +65,7 @@ Expected: both pass.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add scripts/generate-native-abi.ts scripts/generate-native-abi.test.ts packages/runtime-wasmtime/src/wasm/native_abi_generated.rs Cargo.toml Cargo.lock abi/rust/yurt-abi-core
+git add scripts/generate-native-abi.ts scripts/generate-native-abi.test.ts docs/abi/generated docs/abi/native-syscall-abi.md Cargo.toml Cargo.lock abi/rust/yurt-abi-core
 git commit -m "Keep native ABI decoding at host boundary"
 ```
 

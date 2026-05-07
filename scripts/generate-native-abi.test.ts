@@ -21,13 +21,6 @@ Deno.test("native ABI generator renders contract views", async () => {
 Deno.test("native ABI generator check mode detects drift", async () => {
   const root = await Deno.makeTempDir();
   await Deno.mkdir(`${root}/abi/contract`, { recursive: true });
-  await Deno.mkdir(`${root}/abi/include`, { recursive: true });
-  await Deno.mkdir(`${root}/packages/runtime-wasmtime/src/wasm`, {
-    recursive: true,
-  });
-  await Deno.mkdir(`${root}/packages/kernel/src/host-imports`, {
-    recursive: true,
-  });
   await Deno.mkdir(`${root}/docs/abi`, { recursive: true });
   await Deno.writeTextFile(
     `${root}/abi/contract/yurt_abi.toml`,
@@ -64,8 +57,8 @@ args = [
   const second = await writeGeneratedFiles(root, rendered, { check: true });
   assertEquals(second, { ok: true, changed: [] });
 
-  await Deno.writeTextFile(`${root}/abi/include/yurt_abi.h`, "stale");
+  await Deno.writeTextFile(`${root}/docs/abi/generated/yurt_abi.h`, "stale");
   const third = await writeGeneratedFiles(root, rendered, { check: true });
   assertEquals(third.ok, false);
-  assertEquals(third.changed, ["abi/include/yurt_abi.h"]);
+  assertEquals(third.changed, ["docs/abi/generated/yurt_abi.h"]);
 });

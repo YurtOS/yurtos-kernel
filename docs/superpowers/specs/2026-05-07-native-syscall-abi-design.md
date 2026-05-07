@@ -69,11 +69,11 @@ Structured outputs use `(out_ptr, out_cap)` and return the number of bytes requi
 The ABI contract is a generated and inspectable artifact set:
 
 - `abi/contract/yurt_abi.toml` is the authoritative human-readable contract. It lists every import, argument type, return convention, struct, record, constant, errno mapping, and doc comment.
-- `abi/include/yurt_abi.h`, `packages/runtime-wasmtime/src/wasm/native_abi_generated.rs`, and `packages/kernel/src/host-imports/native-generated.ts` are generated from the contract and committed.
+- `docs/abi/generated/yurt_abi.h`, `docs/abi/generated/native_abi_generated.rs`, and `docs/abi/generated/native-generated.ts` are generated from the contract and committed as proposed target ABI reference artifacts.
 - `docs/abi/native-syscall-abi.md` is generated from the same contract so reviewers can inspect the complete ABI in one place.
 - CI runs the generator and fails if generated artifacts drift.
 
-The contract generator is deliberately small and repo-local. It does not introduce a runtime schema dependency; it is only a build/review tool for keeping the C guest header, Rust host metadata, TS host metadata, and documentation views identical.
+The contract generator is deliberately small and repo-local. It does not introduce a runtime schema dependency; it is only a build/review tool for keeping the proposed C guest header, Rust host metadata, TS host metadata, and documentation views identical. Until each import family is migrated, the generated views must stay out of live runtime/header paths such as `abi/include/yurt_abi.h`, `packages/runtime-wasmtime/src/wasm/`, and `packages/kernel/src/host-imports/`.
 
 ### Fixed Struct Outputs
 
@@ -212,27 +212,27 @@ Do not add a shared guest-facing ABI codec crate. The Wasmtime host is the optim
 - Host imports receive scalar arguments from Wasmtime.
 - Import handlers read/write guest linear memory through `wasmtime::Caller`.
 - Small Rust helper functions may live next to the import handlers for local parsing, bounds checks, and fixed-output writes.
-- Generated Rust metadata in `packages/runtime-wasmtime/src/wasm/native_abi_generated.rs` provides constants and C-layout structs for the host implementation.
+- Generated Rust metadata in `docs/abi/generated/native_abi_generated.rs` provides constants and C-layout structs for the proposed host implementation. Implementation tasks copy or install only the pieces whose import family has actually been cut over.
 
 The Wasmtime runtime is the preferred implementation path because Rust can receive the host-call scalars and read/write guest memory directly through `wasmtime::Caller`. Deno and browser JavaScript remain supported as the minimum JS-family fallback: they decode native records in TypeScript because browser-style runtimes cannot hand guest memory pointers to native Rust without adding a platform-specific bridge. That extra JS-side cost is acceptable and should not drive the server/Wasmtime ABI design. Deno is the primary automated test target for this fallback because it provides a browser-like WebAssembly environment with easier filesystem/process-driven tests.
 
 ## C/Rust Guest Side
 
-The C ABI runtime includes `abi/include/yurt_abi.h`, generated from `abi/contract/yurt_abi.toml`, with:
+The generated C ABI reference is `docs/abi/generated/yurt_abi.h`, produced from `abi/contract/yurt_abi.toml`, with:
 
 - import declarations;
 - record structs;
 - constants for flags and record versions;
 - small local builders for offset-table records where a compound request is unavoidable.
 
-Guest code should not depend on a general ABI codec library. It calls host imports. C shims only exist to present libc/POSIX-compatible functions on top of those imports.
+Guest code should not depend on a general ABI codec library. It calls host imports. C shims only exist to present libc/POSIX-compatible functions on top of those imports. The live `abi/include/yurt_abi.h` remains the shipped ABI header until the corresponding native cutover installs matching declarations and implementations.
 
 Rust std patches call the same imports through `extern "C"` declarations or through libc wrappers. No generated schema bindings are needed.
 
 ## Migration
 
 1. Create `abi/contract/yurt_abi.toml` and a generator that emits C guest, Rust host, TS host, and Markdown views of the contract.
-2. Generate `abi/include/yurt_abi.h`, `packages/runtime-wasmtime/src/wasm/native_abi_generated.rs`, and TS constants/layout metadata from the contract.
+2. Generate `docs/abi/generated/yurt_abi.h`, `docs/abi/generated/native_abi_generated.rs`, and `docs/abi/generated/native-generated.ts` from the contract as proposed reference artifacts.
 3. Convert TS host imports one family at a time to native signatures and decode pointer/span inputs in TS fallback code.
 4. Convert Rust/Wasmtime host imports one family at a time to native signatures and decode pointer/span inputs in import handlers.
 5. Convert C ABI shims and Rust std call sites to those signatures without adding a guest codec framework.
@@ -246,7 +246,7 @@ Rust std patches call the same imports through `extern "C"` declarations or thro
 ## Test Strategy
 
 - Unit tests for each host import family using direct memory buffers.
-- Contract drift tests that regenerate `abi/include/yurt_abi.h`, Rust generated layouts, TS fallback layouts, and `docs/abi/native-syscall-abi.md` and compare them to the checked-in files.
+- Contract drift tests that regenerate `docs/abi/generated/yurt_abi.h`, Rust generated layouts, TS fallback layouts, and `docs/abi/native-syscall-abi.md` and compare them to the checked-in files.
 - Cross-parser fixtures: a shared corpus of valid and malformed native record bytes must produce identical decoded values or identical negative errno from Rust/Wasmtime host parsers and TS fallback parsers.
 - ABI canaries for C and Rust std.
 - Memory-growth-across-await test for every async import that reads request bytes.
