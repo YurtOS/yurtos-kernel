@@ -12,30 +12,30 @@ if [[ ${#CHANGED[@]} -eq 0 ]]; then
   exec cargo clippy --all-targets -- -D warnings
 fi
 
-# Map each changed file to the nearest Cargo.toml directory, dedupe.
-declare -A CRATE_DIRS=()
+# Map each changed file to the nearest *package* Cargo.toml directory.
+# Virtual manifests (workspace-only Cargo.toml with no `name = ...`) are
+# skipped — keep walking up.
+declare -A CRATE_PKGS=()
 for f in "${CHANGED[@]}"; do
   dir="$(dirname "$f")"
   while [[ "$dir" != "." && "$dir" != "/" ]]; do
     if [[ -f "$dir/Cargo.toml" ]]; then
-      CRATE_DIRS["$dir"]=1
-      break
+      pkg="$(awk -F\" '/^name *=/ {print $2; exit}' "$dir/Cargo.toml")"
+      if [[ -n "$pkg" ]]; then
+        CRATE_PKGS["$pkg"]=1
+        break
+      fi
     fi
     dir="$(dirname "$dir")"
   done
 done
 
-if [[ ${#CRATE_DIRS[@]} -eq 0 ]]; then
+if [[ ${#CRATE_PKGS[@]} -eq 0 ]]; then
   # Default-members only — wasm-only canary crates need a different target.
   exec cargo clippy --all-targets -- -D warnings
 fi
 
-for dir in "${!CRATE_DIRS[@]}"; do
-  pkg="$(awk -F\" '/^name *=/ {print $2; exit}' "$dir/Cargo.toml")"
-  if [[ -z "$pkg" ]]; then
-    echo "lint-clippy-changed: could not parse package name in $dir/Cargo.toml" >&2
-    exit 2
-  fi
+for pkg in "${!CRATE_PKGS[@]}"; do
   echo "→ cargo clippy -p $pkg --all-targets -- -D warnings"
   cargo clippy -p "$pkg" --all-targets -- -D warnings
 done
