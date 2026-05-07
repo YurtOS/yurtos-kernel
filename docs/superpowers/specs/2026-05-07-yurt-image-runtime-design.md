@@ -49,8 +49,7 @@ This design adds image-backed roots without changing package-manager policy.
 Yurt has two image states:
 
 - **Runtime image:** uncompressed tar, extension `.yurtimg`.
-- **Transport image:** compressed and signed runtime image,
-  extension `.yurtimg.zst`.
+- **Transport image:** compressed runtime image, extension `.yurtimg.zst`.
 
 The kernel runtime consumes the uncompressed tar form. Tar is the v1 filesystem
 format because it already represents the data Yurt needs:
@@ -83,8 +82,7 @@ indexed tar filesystem.
 Yurt also needs a durable artifact for writable layer state:
 
 - **Layer image:** serialized overlay upper state, extension `.yurtlayer`.
-- **Transport layer image:** compressed and signed layer image,
-  extension `.yurtlayer.zst`.
+- **Transport layer image:** compressed layer image, extension `.yurtlayer.zst`.
 
 A layer image is not a new filesystem model. It is the stable serialization of
 the data structures the kernel already uses for layer 2:
@@ -112,6 +110,12 @@ The serialized state must satisfy these rules:
   later layer recreates paths below it;
 - whiteout paths cannot target paths outside the image namespace;
 - applying layer images in order is deterministic.
+
+Current `OverlayVFS` whiteouts are exact-path whiteouts. Directory deletion
+semantics therefore require new overlay behavior before image layers can rely on
+them: merged lookup must treat a whiteouted ancestor directory as hiding lower
+children, while still allowing later upper entries or later applied layers to
+recreate paths below that ancestor.
 
 Yurt layer images are not OCI layers. They are kernel-owned overlay delta
 artifacts that can support Docker-like workflows later without importing Docker
@@ -144,12 +148,19 @@ type TarImageEntry =
   | { type: "hardlink"; mode: number; uid: number; gid: number; mtime: number; target: string };
 ```
 
+`TarImageEntry` may keep hardlink entries internally so the image index can
+preserve tar identity and avoid duplicating file data. The public
+`RootProvider` contract remains unchanged in v1: `stat`, `lstat`, and
+`readdir` expose hardlinks as `type: "file"` because `RootProviderStat` and
+`DirEntry` currently support only `file | dir | symlink`.
+
 Provider behavior:
 
 - `readFile(path)` returns regular file bytes. For hardlinks, it reads the
   resolved target file bytes.
 - `stat(path)` follows symlinks according to existing `RootProvider` behavior.
-- `lstat(path)` returns the entry itself.
+- `lstat(path)` returns `type: "file"` for hardlink entries, with the hardlink
+  entry metadata and the resolved target size.
 - `readdir(path)` lists direct children from the index.
 - `readlink(path)` returns symlink targets.
 - Paths are absolute and normalized. `..` traversal is rejected while indexing.
@@ -185,13 +196,21 @@ The image is layer 1 and read-only. Runtime writes, deletes, chmod/chown
 changes, and package installs go to the upper layer. Existing overlay
 permissions and whiteouts remain authoritative.
 
-The upper layer must be pluggable. The v1 `yurt` CLI and image-building path can
-use the default in-memory `VFS`, because that is enough to run a command and then
-export either the upper layer or the merged filesystem. Other runtimes can supply
-a writable backend with the same semantics: local directory, browser OPFS,
-IndexedDB, S3, or a custom backend. Backend implementations are responsible for
-preserving the permission metadata and whiteout behavior exposed through the
-overlay interface.
+The upper layer must be pluggable, but "pluggable" means an explicit Yurt upper
+VFS contract, not an arbitrary object store. The v1 `yurt` CLI and image-building
+path can use the default in-memory `VFS`, because that is enough to run a
+command and then export either the upper layer or the merged filesystem.
+
+An upper backend must implement the mutating `VfsLike` operations used by
+`OverlayVFS`: read/write/stat/lstat/readdir, mkdir/mkdirp, unlink/rmdir, rename,
+symlink/readlink, chmod/chown, `withWriteAccess`, and permission behavior
+compatible with the in-memory `VFS`. Backends that participate in fork,
+suspend, or image-building flows must also provide the optional capabilities the
+overlay calls in those flows: `snapshot`/`restore`, `cowClone`, mount/provider
+metadata where relevant, and export/import support through
+`exportUpperVfs`/`exportOverlayState` at the overlay boundary. Local directory,
+browser OPFS/IndexedDB, S3, or other storage adapters can sit behind that
+contract, but they must preserve uid/gid/mode metadata and whiteout semantics.
 
 The existing `baseRoot` directory provider remains useful for tests and local
 development, but image loading is the normal kernel artifact path.
@@ -226,6 +245,14 @@ Command behavior:
 - The CLI should not use a host shell fallback.
 - The CLI should set the usual baseline environment:
   `HOME=/home/user`, `PWD=/home/user`, `USER=user`, `PATH=/bin:/usr/bin`.
+
+This requires an argv-native process entry point. The existing public
+`Sandbox.run(command: string)` API is shell-command oriented and must not be the
+only execution path for `yurt <image> [command...]`; joining CLI argv into a
+string would reintroduce host-side quoting ambiguity. The implementation should
+add a kernel process API that accepts executable path plus argv, then layer
+shell-command conveniences on top of it. Default `/bin/sh` may use argv
+`["/bin/sh"]`.
 
 Compressed image behavior:
 
@@ -383,6 +410,8 @@ Kernel tests should include:
   through `OverlayVFS`.
 - Upper-backend contract tests for writes, chmod/chown, whiteouts, permission
   checks, and snapshots.
+- Ancestor-whiteout tests proving a deleted lower-layer directory hides lower
+  descendants until the upper layer recreates them.
 - Layer-image export tests proving adds, modifications, metadata changes, and
   deletions survive an `--export-upper` round trip.
 - Layer merge tests proving one or more `.yurtlayer` inputs apply in order,
@@ -394,6 +423,7 @@ Kernel tests should include:
   - default `/bin/sh`;
   - missing shell error;
   - `.yurtimg.zst` cache expansion;
+  - argv-native command execution without shell joining;
   - `--export-upper`;
   - `--snapshot-out`;
   - `yurt image merge`.
@@ -408,12 +438,14 @@ Kernel tests should include:
 2. Wire `Sandbox.create({ image })` to `OverlayVFS`.
 3. Define the upper-layer backend interface and keep the default `VFS`
    implementation wired for CLI/image builds.
-4. Update `yurt` CLI to support `yurt <image> [command...]`.
-5. Add compressed image cache expansion for the CLI.
-6. Add upper-layer export to `.yurtlayer` with deletion/whiteout support.
-7. Add full merged-VFS export to uncompressed `.yurtimg` tar and
+4. Add ancestor-whiteout semantics to `OverlayVFS`.
+5. Add an argv-native process execution API.
+6. Update `yurt` CLI to support `yurt <image> [command...]`.
+7. Add compressed image cache expansion for the CLI.
+8. Add upper-layer export to `.yurtlayer` with deletion/whiteout support.
+9. Add full merged-VFS export to uncompressed `.yurtimg` tar and
    `--snapshot-out`.
-8. Add ordered layer merge into standalone `.yurtimg`.
-9. Add browser image loading/decompression/export coverage.
-10. Add signed manifest/cache metadata plumbing once image publishing defines
+10. Add ordered layer merge into standalone `.yurtimg`.
+11. Add browser image loading/decompression/export coverage.
+12. Add signed manifest/cache metadata plumbing once image publishing defines
    the signing flow.
