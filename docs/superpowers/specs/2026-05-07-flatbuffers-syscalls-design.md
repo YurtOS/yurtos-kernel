@@ -64,13 +64,32 @@ Switching the wire format to FlatBuffers buys:
 
 Every host import that carries a structured payload uses `(req_ptr, req_len, out_ptr, out_cap) -> i32`. Buffer-too-small still returns the required size for caller retry. Negative values are reserved for transport-level errors (see Error Handling).
 
-**ABI-shape changes.** Two host imports change their signatures (not just their wire format) as part of this cutover:
+**ABI-shape changes.** A meaningful subset of host imports change their *signatures* (not just their wire format) as part of this cutover. Every change folds into the standard `(req_ptr, req_len, out_ptr, out_cap) -> i32` shape.
 
-- **`host_spawn`** today has two forms — the generic `(req_ptr, req_len) -> pid` (returns the new pid as the i32 directly) and a legacy 4-arg form for the shell test path. This split is folded into the 4-arg form. After the cutover, `host_spawn(req_ptr, req_len, out_ptr, out_cap) -> i32` is the only ABI; the host writes a `SpawnResponse` containing either `SpawnOk { pid }` or `ErrorInfo`. The C `posix_spawn` shim (`abi/src/yurt_spawn.c`) reads the response, returns the pid (or sets `errno` from `ErrorInfo.code` and returns `-1`). The `syncSpawn` legacy callback type in `kernel-imports.ts` is replaced by a single spawn handler that writes a `SpawnResponse`. All call sites that today consume the i32 return as a pid get updated.
+| Host import | Today's signature | Reason for change |
+|---|---|---|
+| `host_spawn` | Two-ABI split: `(req_ptr, req_len) -> pid` (generic) and `(req_ptr, req_len, out_ptr, out_cap) -> i32` (legacy shell-test) | Fold both into the 4-arg form; `SpawnResponse` carries pid or `ErrorInfo`. |
+| `host_socket_close` | `(req_ptr, req_len) -> i32` | Gain a response buffer for typed POSIX-errno close errors. |
+| `host_write_fd` | `(fd, data_ptr, data_len) -> i32` | Wrap into a `WriteFd` quartet; gain a response buffer. |
+| `host_write_result` | `(result_ptr, result_len) -> void` | Gain a response buffer + return value. |
+| `host_write_file` | `(path_ptr, path_len, data_ptr, data_len, mode) -> i32` | Wrap into `WriteFile` quartet. |
+| `host_chdir` | `(path_ptr, path_len) -> i32` | Wrap into `Chdir` quartet. |
+| `host_chmod` | `(path_ptr, path_len, mode) -> i32` | Wrap into `Chmod` quartet. |
+| `host_chown` | `(path_ptr, path_len, uid, gid, follow_symlinks) -> i32` | Wrap into `Chown` quartet. |
+| `host_mkdir` | `(path_ptr, path_len) -> i32` | Wrap into `Mkdir` quartet. |
+| `host_remove` | `(path_ptr, path_len, recursive) -> i32` | Wrap into `Remove` quartet. |
+| `host_rename` | `(from_ptr, from_len, to_ptr, to_len) -> i32` | Wrap into `Rename` quartet. |
+| `host_symlink` | `(target_ptr, target_len, link_ptr, link_len) -> i32` | Wrap into `Symlink` quartet. |
+| `host_register_tool` | `(name_ptr, name_len, path_ptr, path_len) -> i32` | Wrap into `RegisterTool` quartet. |
+| `host_has_tool` | `(name_ptr, name_len) -> i32` (bool) | Wrap into `HasTool` quartet. |
+| `host_tcsetattr` | `(fd, actions, termios_ptr) -> i32` | Wrap into `Tcsetattr` quartet. |
+| `host_sched_setaffinity` | `(pid, mask_ptr, cpusetsize) -> i32` | Wrap into `SchedSetaffinity` quartet. |
 
-- **`host_socket_close`** today is `(req_ptr, req_len) -> i32` with no output buffer; the `i32` carries the close result directly. After the cutover, `host_socket_close(req_ptr, req_len, out_ptr, out_cap) -> i32` becomes the signature; the host writes a `SocketCloseResponse` containing either `SocketCloseOk` (empty) or `ErrorInfo` so close failures can be surfaced with a typed POSIX errno. C call sites in `abi/src/yurt_socket.c` are updated to pass an output buffer.
+For `host_spawn`, the C `posix_spawn` shim (`abi/src/yurt_spawn.c`) reads the response and returns the pid (or sets `errno` from `ErrorInfo.code` and returns `-1`); the `syncSpawn` legacy callback type in `kernel-imports.ts` collapses into a single spawn handler that writes a `SpawnResponse`. All other rows follow the same template (build req → call → read response → set errno + return -1 on `ErrorInfo`, or extract success), kept short via the C-side pattern macros.
 
-These are the only "wire-format-only" boundary crossings — all other quartet additions preserve their existing 4-arg signatures.
+All other quartet additions preserve their existing 4-arg signatures.
+
+**Imports explicitly out of scope (opaque pointers, not buffer-plus-length payloads).** `host_setjmp` / `host_longjmp` (jmp_buf save state) and the pthread / synchronization family — `host_thread_spawn` (`fn_ptr, arg`), `host_thread_join`, `host_thread_detach`, `host_thread_self`, `host_thread_yield`, `host_mutex_lock` / `mutex_unlock` / `mutex_trylock` (`mutex_ptr`), `host_cond_wait` / `cond_signal` / `cond_broadcast` (`cond_ptr`, `mutex_ptr`). These all carry **opaque kernel-managed state addresses**, not user data; FB-wrapping does not apply and would defeat their bit-compat-with-C semantics.
 
 ### Per-table file identifiers (wrong-root guarantee)
 
@@ -446,7 +465,7 @@ The wrong-root case is detected by the per-table file identifier check (see "Per
 
 Normal "the call ran but failed" case. A well-formed response is written; its union arm is `ErrorInfo`. Examples:
 
-- DNS failure on fetch → `ErrorInfo { code: -100, message: "getaddrinfo: example.invalid", source: "host_network_fetch" }`. Transport `i32` is `bytes_written`.
+- DNS failure on fetch → `ErrorInfo { code: 113 /* EHOSTUNREACH */, message: "getaddrinfo: example.invalid", source: "host_network_fetch" }`. Transport `i32` is `bytes_written`.
 - Program not found on spawn → `ErrorInfo { code: 2 /* ENOENT */, message: "no such file: /bin/foo", source: "host_spawn" }`.
 
 ### Error code numbering — POSIX errnos
@@ -556,12 +575,14 @@ Single PR delivers the entire cutover on a worktree:
 
 1. Add `abi/schema/yurt_abi.fbs` (full inventory).
 2. Add `abi/rust/yurt-abi-fb` crate (generated.rs, error_codes, identifiers, FFI surface, Cargo workspace entry).
-3. Switch `kernel-imports.ts`, `wasi-host.ts`, and friends to the FB code path; delete `writeJson` and `JSON.parse` paths.
-4. Switch `abi/src/yurt_*.c` shims to call `yurt_fb_build_*` / `yurt_fb_read_*`; delete hand-rolled JSON helpers.
-5. Normalize `host_spawn` onto the 4-arg ABI; update every spawn caller and the `syncSpawn` legacy-handler type.
-6. Delete `host_native_invoke` end-to-end.
-7. Update `test-fixtures/shell-exec/src/main.rs`; regenerate `bash.wasm` and `bash-asyncify.wasm`.
-8. Migrate and extend tests across all layers.
-9. Add the `abi-fb-drift` CI job.
+3. Add `abi/include/yurt_fb.h` with the C-side pattern macros.
+4. Switch `kernel-imports.ts`, `wasi-host.ts`, and friends to the FB code path; delete `writeJson` and `JSON.parse` paths.
+5. Switch `abi/src/yurt_*.c` shims to call `yurt_fb_build_*` / `yurt_fb_read_*` via the macros; delete hand-rolled JSON helpers.
+6. Apply the **ABI-shape changes** from the table in "Calling convention" — every import in that table moves to `(req_ptr, req_len, out_ptr, out_cap) -> i32`. Update every C call site, the corresponding `kernel-imports.ts` handler, and any direct callers in the kernel/test surface.
+7. Apply the **wait-family fold** — replace `host_waitpid`, `host_waitpid_nohang`, `host_wait_any`, `host_wait_any_nohang` with a single `host_wait` and migrate all callers (C shims under `abi/src/yurt_process.c`, TS handlers in `kernel-imports.ts`, any test surface).
+8. Delete `host_native_invoke` end-to-end.
+9. Update `test-fixtures/shell-exec/src/main.rs`; regenerate `bash.wasm` and `bash-asyncify.wasm`.
+10. Migrate and extend tests across all layers.
+11. Add the `abi-fb-drift` CI job.
 
 There is no JSON/FB coexistence period.
