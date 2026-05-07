@@ -4,7 +4,7 @@
 
 **Goal:** Replace JSON/FlatBuffers host-call payloads with a native syscall ABI and move pointer/buffer record handling into Rust.
 
-**Architecture:** Create `abi/rust/yurt-abi-core` as the single owner of native record layouts, errno constants, guest-memory helpers, and fixed-output encoders. Wire that core directly into the Rust Wasmtime runtime where Rust can read guest memory from `wasmtime::Caller`; keep the TypeScript runtime as a transitional compatibility harness while removing all JSON/FlatBuffers payloads from canaries and ABI shims.
+**Architecture:** Create `abi/rust/yurt-abi-core` as the single owner of native record layouts, errno constants, guest-memory helpers, and fixed-output encoders. Wire that core directly into the Rust Wasmtime runtime where Rust can read guest memory from `wasmtime::Caller`; keep the TypeScript/browser runtime as a correctness-compatible fallback that decodes the same native records in JS because browser runtimes cannot pass guest pointers to Rust without an extra bridge.
 
 **Tech Stack:** Rust 2024, Wasmtime, WASIp1, TypeScript/Deno tests, C ABI runtime, cargo-yurt/yurt-cc.
 
@@ -1352,4 +1352,4 @@ git commit -m "Add native ABI cleanup guard"
 
 - Spec coverage: covers native syscall ABI, JSON removal, FlatBuffers removal, Rust-owned buffer/pointer processing, wait fold, shell-as-normal-process constraint, C/Rust canaries, and cleanup grep checks.
 - Type consistency: `YurtWaitResultV1`, `YurtPipeResultV1`, `YurtSpawnResultV1`, `GuestMemory`, and native return conventions are defined before use.
-- Known risk: direct Rust pointer processing is practical in `packages/runtime-wasmtime` because Wasmtime exposes memory to Rust. The V8/Deno TS runtime cannot give Rust direct guest-memory access without a native addon or FFI bridge; this plan avoids adding that abstraction and treats TS as a transitional compatibility harness.
+- Browser/runtime split: direct Rust pointer processing is the preferred path in `packages/runtime-wasmtime` because Wasmtime exposes memory to Rust. Browser JavaScript must remain supported, but it is allowed to pay the extra JS decode/encode cost; the plan intentionally avoids adding a native Rust bridge for browsers.

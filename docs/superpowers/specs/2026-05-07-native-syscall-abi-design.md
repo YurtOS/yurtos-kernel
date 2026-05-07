@@ -198,6 +198,8 @@ Add a Rust crate, `abi/rust/yurt-abi-core`, that owns the ABI record and memory 
 
 The crate is a normal Rust library for tests and the Wasmtime runtime. It also exposes a narrow C ABI or generated header surface only where the C guest runtime needs builders for compound records. The old `yurt-abi-fb` crate is deleted once the native core is in place.
 
+The Wasmtime runtime is the preferred implementation path because Rust can receive the host-call scalars and read/write guest memory directly through `wasmtime::Caller`. Browser JavaScript remains supported, but it is a correctness-compatible fallback: it may decode native records in TypeScript because browser runtimes cannot hand guest memory pointers to native Rust without adding a platform-specific bridge. That extra browser-side cost is acceptable and should not drive the server/Wasmtime ABI design.
+
 ## C/Rust Guest Side
 
 The C ABI runtime owns a small header, `abi/include/yurt_abi.h`, generated or checked against the Rust ABI core, with:
