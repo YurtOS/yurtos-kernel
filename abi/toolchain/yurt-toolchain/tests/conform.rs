@@ -1,5 +1,6 @@
 use std::process::Command;
 
+#[ignore = "slow: launches full yurt-conf conformance runner"]
 #[test]
 fn yurt_conf_runs_end_to_end_when_wasi_sdk_is_available() {
     if std::env::var_os("WASI_SDK_PATH").is_none() {

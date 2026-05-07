@@ -1,0 +1,69 @@
+# yurtos-kernel pre-commit config
+# Local hooks orchestrated by https://pre-commit.com.
+# Install: scripts/install-hooks.sh
+default_install_hook_types: [pre-commit, pre-push]
+fail_fast: false
+
+repos:
+  # Generic hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+
+  # Local hooks (no upstream repo for these tools)
+  - repo: local
+    hooks:
+      - id: cargo-fmt-check
+        name: cargo fmt --check
+        entry: cargo fmt --all -- --check
+        language: system
+        types_or: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: cargo-clippy-changed
+        name: cargo clippy (changed crates)
+        entry: scripts/lint-clippy-changed.sh
+        language: system
+        types_or: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: deno-fmt-check
+        name: deno fmt --check
+        entry: deno fmt --check
+        language: system
+        types_or: [ts, tsx, javascript]
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: deno-lint
+        name: deno lint
+        entry: deno lint
+        language: system
+        types_or: [ts, tsx, javascript]
+        pass_filenames: false
+        stages: [pre-commit]
+
+      # Pre-push only
+      - id: cargo-test-fast
+        name: cargo test (fast tier)
+        # Uses workspace default-members (excludes wasm-only canary crates).
+        entry: cargo test --tests
+        language: system
+        types_or: [rust]
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: deno-test-fast
+        name: deno test (fast tier)
+        entry: bash -c 'deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run "packages/**/*_test.ts"'
+        language: system
+        types_or: [ts, tsx, javascript]
+        pass_filenames: false
+        stages: [pre-push]

@@ -19,3 +19,10 @@ if $_ok; then
   echo "[dev-init] OK — deno $(deno --version 2>/dev/null | head -1 | awk '{print $2}'), rustc $(rustc --version 2>/dev/null | awk '{print $2}')"
 fi
 unset _ok
+
+# --- Hook check ---
+if [[ -f .git/hooks/pre-commit ]] && grep -q "pre-commit.com" .git/hooks/pre-commit 2>/dev/null; then
+  : # hooks installed
+else
+  echo "[dev-init] hint: run scripts/install-hooks.sh to install local gates"
+fi

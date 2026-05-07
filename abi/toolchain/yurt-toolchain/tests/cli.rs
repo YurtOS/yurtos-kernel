@@ -230,6 +230,7 @@ fn missing_version_sentinel_is_a_hard_error() {
     );
 }
 
+#[ignore = "slow: invokes real clang via yurt-cc to compile a C file"]
 #[test]
 fn preserves_pre_opt_artifact_at_stable_path() {
     // Real clang+wasi-sdk build. Skip if WASI_SDK_PATH is not set in CI env.

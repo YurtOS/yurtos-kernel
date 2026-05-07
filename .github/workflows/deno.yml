@@ -1,0 +1,49 @@
+name: Deno
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  fmt-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno fmt --check
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno lint
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno check 'packages/**/*.ts'
+
+  test-fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run 'packages/**/*_test.ts'
+
+  # NOTE: a `hooks-self-check` job that runs `pre-commit run --all-files`
+  # belongs in this file but is intentionally omitted from the initial gates
+  # PR. It would fail on day one against the existing format/lint debt on
+  # main. The follow-up PR that clears that debt should land this job in the
+  # same change.
