@@ -25,6 +25,65 @@ mod wasm_entry {
         STATE.get_or_init(|| Mutex::new(ShellState::new_default()))
     }
 
+    /// Merge the JSON-encoded env map at `ptr`/`len` into the shell's
+    /// environment. Called by the host (`Sandbox.syncBootEnv`) so guest
+    /// commands inherit values pushed via `Sandbox.setEnv`.
+    ///
+    /// Pure additive merge: keys absent from the payload keep their
+    /// existing value (including `ShellState::new_default()`'s seeded
+    /// HOME/PATH/etc.). Removals come over the separate `__unset_env`
+    /// channel — the host computes the diff between what was last
+    /// synced and the current host map.
+    ///
+    /// Returns 0 on success and a negative error code on failure (the
+    /// caller only distinguishes 0 vs. non-zero).
+    #[no_mangle]
+    pub extern "C" fn __set_env(ptr: *const u8, len: u32) -> i32 {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        let json_str = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        let map: std::collections::HashMap<String, String> =
+            match serde_json::from_str(json_str) {
+                Ok(m) => m,
+                Err(_) => return -2,
+            };
+        let mut state = get_state().lock().unwrap();
+        state.env.extend(map);
+        0
+    }
+
+    /// Remove the named keys from the shell's environment. Payload is
+    /// a JSON array of strings.
+    ///
+    /// Pairs with `__set_env` to give the host strict-replacement
+    /// semantics whenever it wants them (e.g. `Sandbox.setEnvMap()`,
+    /// `restore()`, `importState()`): the host sends unsets for every
+    /// key that was last synced but is no longer in its map, then
+    /// sends sets for the new map. Without this export the guest can
+    /// only ever grow its env, which makes snapshot/restore leak
+    /// state across restorations.
+    ///
+    /// Returns 0 on success and a negative error code on failure.
+    #[no_mangle]
+    pub extern "C" fn __unset_env(ptr: *const u8, len: u32) -> i32 {
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        let json_str = match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return -1,
+        };
+        let keys: Vec<String> = match serde_json::from_str(json_str) {
+            Ok(k) => k,
+            Err(_) => return -2,
+        };
+        let mut state = get_state().lock().unwrap();
+        for k in keys {
+            state.env.remove(&k);
+        }
+        0
+    }
+
     /// Execute a shell command and write the JSON result into the output buffer.
     ///
     /// # Parameters

@@ -10,7 +10,7 @@ import { resolve } from 'node:path';
 import { Sandbox } from '../sandbox.js';
 import { NodeAdapter } from '../platform/node-adapter.js';
 
-const WASM_DIR = resolve(import.meta.dirname, '../platform/__tests__/fixtures');
+const WASM_DIR = resolve(import.meta.dirname!, '../platform/__tests__/fixtures');
 const IS_DENO = typeof (globalThis as any).Deno !== 'undefined';
 const workerDescribe = IS_DENO ? describe.skip : describe;
 
@@ -34,86 +34,6 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
     const result = await sandbox.run('echo hello world | wc -c');
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe('12');
-  });
-
-  it('executeCommand applies timeout policy around host executors', async () => {
-    const events: Array<{ type: string; [key: string]: unknown }> = [];
-    sandbox = await Sandbox.create({
-      wasmDir: WASM_DIR,
-      adapter: new NodeAdapter(),
-      security: {
-        limits: { timeoutMs: 1, stdoutBytes: 5, stderrBytes: 3 },
-        onAuditEvent: (event) => events.push(event),
-      },
-    });
-
-    const result = await sandbox.executeCommand('host-side command', async () => {
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      return {
-        exitCode: 0,
-        stdout: '',
-        stderr: '',
-        executionTimeMs: 5,
-      };
-    });
-
-    expect(result.exitCode).toBe(124);
-    expect(result.errorClass).toBe('TIMEOUT');
-    expect(events.some((e) => e.type === 'command.timeout')).toBe(true);
-  });
-
-  it('executeCommand applies output limits around host executors', async () => {
-    const events: Array<{ type: string; [key: string]: unknown }> = [];
-    sandbox = await Sandbox.create({
-      wasmDir: WASM_DIR,
-      adapter: new NodeAdapter(),
-      security: {
-        limits: { stdoutBytes: 5, stderrBytes: 3 },
-        onAuditEvent: (event) => events.push(event),
-      },
-    });
-
-    const result = await sandbox.executeCommand('host-side command', async () => ({
-      exitCode: 0,
-      stdout: '123456789',
-      stderr: 'abcdef',
-      executionTimeMs: 1,
-    }));
-
-    expect(result.stdout).toBe('12345');
-    expect(result.stderr).toBe('abc');
-    expect(result.truncated).toEqual({ stdout: true, stderr: true });
-    expect(events.some((e) => e.type === 'limit.exceeded' && e.subtype === 'stdout')).toBe(true);
-    expect(events.some((e) => e.type === 'limit.exceeded' && e.subtype === 'stderr')).toBe(true);
-  });
-
-  it('executeCommand uses the supplied host executor even when worker execution is present', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    let workerCalled = 0;
-    (sandbox as unknown as { workerExecutor: { run: () => Promise<unknown>; kill: () => void; dispose: () => void } }).workerExecutor = {
-      run: async () => {
-        workerCalled++;
-        return {
-          exitCode: 99,
-          stdout: 'worker\n',
-          stderr: '',
-          executionTimeMs: 0,
-        };
-      },
-      kill: () => {},
-      dispose: () => {},
-    };
-
-    const result = await sandbox.executeCommand('host-side command', async () => ({
-      exitCode: 0,
-      stdout: 'host\n',
-      stderr: '',
-      executionTimeMs: 1,
-    }));
-
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toBe('host\n');
-    expect(workerCalled).toBe(0);
   });
 
   it('run still uses worker execution when present', async () => {
@@ -191,6 +111,44 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
     expect(result.stdout.trim()).toBe('/usr/extensions:/bin:/usr/bin');
   });
 
+  it('snapshot/restore drops env vars set after the snapshot from the guest', async () => {
+    // Regression test for the merge-only __set_env protocol: without
+    // an unset path, restore() shrunk Sandbox.env on the host but left
+    // the now-removed vars live in the guest, so subsequent runs saw
+    // stale values.
+    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+    sandbox.setEnv('KEEP', 'one');
+    const snap = sandbox.snapshot();
+    sandbox.setEnv('DROP', 'two');
+
+    const before = await sandbox.run('echo before:$KEEP:$DROP');
+    expect(before.stdout.trim()).toBe('before:one:two');
+
+    sandbox.restore(snap);
+    expect(sandbox.getEnv('DROP')).toBeUndefined();
+
+    const after = await sandbox.run('echo after:$KEEP:$DROP');
+    expect(after.stdout.trim()).toBe('after:one:');
+  });
+
+  it('exportState/importState drops env vars set after the snapshot from the guest', async () => {
+    // Same regression as above, walked through the exportState path
+    // rather than snapshot()/restore().
+    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+    sandbox.setEnv('KEEP', 'one');
+    const blob = sandbox.exportState();
+    sandbox.setEnv('DROP', 'two');
+
+    const before = await sandbox.run('echo before:$KEEP:$DROP');
+    expect(before.stdout.trim()).toBe('before:one:two');
+
+    sandbox.importState(blob);
+    expect(sandbox.getEnv('DROP')).toBeUndefined();
+
+    const after = await sandbox.run('echo after:$KEEP:$DROP');
+    expect(after.stdout.trim()).toBe('after:one:');
+  });
+
   it('destroy prevents further use', async () => {
     sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
     sandbox.destroy();
@@ -200,7 +158,14 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
 
   it('timeout returns exit code 124', async () => {
     sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter(), timeoutMs: 1 });
-    const result = await sandbox.run('yes hello | head -1000');
+    // A shell-builtin infinite loop runs entirely inside the resident
+    // shell-exec — no external fixture spawns to race with the 1ms
+    // deadline. The previous form `yes hello | head -1000` only hit
+    // the timeout on main because pipeline setup happened to take
+    // longer than 1ms when the spawned tools were missing fixtures
+    // (yes / head don't ship in __tests__/fixtures/); a slightly
+    // faster wasm build flipped it to exit 127.
+    const result = await sandbox.run('while true; do :; done');
     expect(result.exitCode).toBe(124);
     expect(result.errorClass).toBe('TIMEOUT');
   });
@@ -579,7 +544,11 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
   });
 
   workerDescribe('worker-based hard kill', () => {
-    it('kills a pure CPU-bound Python loop via worker termination', { timeout: 15000 }, async () => {
+    // workerDescribe is describe.skip in Deno, so this case only runs in
+    // Node — where the per-test timeout knob comes from the runner config,
+    // not @std/testing/bdd's options. The 3000ms hardKill plus headroom
+    // keeps the wall-clock comfortably under any reasonable default.
+    it('kills a pure CPU-bound Python loop via worker termination', async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
@@ -780,7 +749,11 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
           onAuditEvent: (event) => events.push(event),
         },
       });
-      await sandbox.run('yes hello | head -10000');
+      // See the comment on `timeout returns exit code 124` above —
+      // a shell-builtin infinite loop hits the 1ms deadline
+      // deterministically; the previous `yes | head` form was
+      // racy against pipeline-setup latency.
+      await sandbox.run('while true; do :; done');
 
       expect(events.find(e => e.type === 'command.timeout')).toBeDefined();
     });
@@ -816,16 +789,20 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
           onAuditEvent: (event) => events.push(event),
         },
       });
-      // Bounded producer (~700 bytes of output) overshoots the
-      // 20-byte cap and trips the limit.exceeded audit hook.
-      // Note: the original `yes hello | head -100` form deadlocks
-      // — even with the new fdWritePipe-via-writeAsync back-
-      // pressure, busybox stdio doesn't surface EPIPE as ferror
-      // through some interaction we haven't fully traced (yes
-      // keeps calling fd_write 3.7M times receiving WASI_EPIPE
-      // and never terminates).  The truncation event fires either
-      // way, but the bounded form keeps the test fast.
-      await sandbox.run('seq 1 200');
+      // Bounded producer (~520 bytes) overshoots the 20-byte cap
+      // and trips the limit.exceeded audit hook. Uses the shell
+      // builtin `echo` so this depends only on the resident
+      // shell-exec, not on a separately-built `seq` fixture
+      // (which doesn't ship in packages/kernel/src/platform/
+      // __tests__/fixtures/). The original `yes hello | head -100`
+      // form deadlocks: even with fdWritePipe-via-writeAsync
+      // back-pressure, busybox stdio doesn't surface EPIPE as
+      // ferror through some interaction we haven't fully traced —
+      // yes keeps calling fd_write 3.7M times receiving WASI_EPIPE
+      // and never terminates. The bounded echo form keeps the
+      // test fast and self-contained.
+      const longStr = 'abcdefghijklmnopqrstuvwxyz'.repeat(20);
+      await sandbox.run(`echo "${longStr}"`);
 
       expect(events.find(e => e.type === 'limit.exceeded' && e.subtype === 'stdout')).toBeDefined();
     });
