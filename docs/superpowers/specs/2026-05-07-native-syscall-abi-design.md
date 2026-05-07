@@ -29,6 +29,7 @@ The ABI should be easy to call from C, Rust, and TypeScript without generated bi
 
 - Remove every JSON host-call payload and every `writeJson` / `JSON.parse` compatibility path at the kernel ABI boundary.
 - Remove the current FlatBuffers host-call payloads added during the cutover and replace them with native import signatures or native memory records.
+- Move the buffer/pointer processing logic into Rust. TypeScript may own high-level sandbox policy and existing V8 import registration for now, but native ABI record parsing, fixed-struct writing, errno mapping, and byte-span helpers live in a reusable Rust ABI core crate.
 - Keep pure scalar imports scalar.
 - Convert canaries and runtime shims to the new ABI. No legacy JSON canaries.
 - Keep shell/bash as a normal guest process. The only special fact is that TypeScript may start it from outside with a TTY; it does not get a separate ABI.
@@ -174,20 +175,32 @@ Socket metadata calls can stay scalar or fixed-struct where possible:
 
 ## TypeScript Host Side
 
-Host imports should read memory spans with small helpers:
+TypeScript host imports should become thin adapters:
 
-- `readBytes(memory, ptr, len).slice()` before any `await`;
-- `readUtf8(memory, ptr, len)`;
-- `writeBytes(memory, out_ptr, out_cap, bytes)`;
-- `writeStruct(memory, out_ptr, out_len, writer)`.
+- receive scalar import arguments from V8;
+- call the Rust ABI core for request decoding, fixed-struct writing, and output sizing;
+- perform host policy/state operations that still live in TypeScript, such as VFS, process kernel, network bridge, and socket backend calls;
+- call the Rust ABI core to encode structured responses when the syscall cannot be expressed as a direct scalar or byte-span return.
 
 Do not parse request JSON at the ABI boundary. Do not build response JSON at the ABI boundary.
 
 Memory views must be re-derived after any `await`, because `WebAssembly.Memory.grow()` can invalidate old views.
 
+## Rust ABI Core
+
+Add a Rust crate, `abi/rust/yurt-abi-core`, that owns the ABI record and memory rules:
+
+- `GuestMemory` trait for reading and writing guest linear memory without depending on V8, Deno, or Wasmtime.
+- `decode` modules for native records such as spawn and run-command.
+- `encode` modules for fixed outputs such as wait results, pipe results, process lists, socket addresses, stat metadata, and command results.
+- `errno` module with POSIX errno constants shared by Rust and generated C headers.
+- host-runtime helpers that can be used directly by `packages/runtime-wasmtime`.
+
+The crate is a normal Rust library for tests and the Wasmtime runtime. It also exposes a narrow C ABI or generated header surface only where the C guest runtime needs builders for compound records. The old `yurt-abi-fb` crate is deleted once the native core is in place.
+
 ## C/Rust Guest Side
 
-The C ABI runtime owns a small header, `abi/include/yurt_abi.h`, with:
+The C ABI runtime owns a small header, `abi/include/yurt_abi.h`, generated or checked against the Rust ABI core, with:
 
 - import declarations;
 - record structs;
@@ -198,18 +211,21 @@ Rust std patches call the same imports through `extern "C"` declarations or thro
 
 ## Migration
 
-1. Add `abi/include/yurt_abi.h` with native ABI structs, flags, and import declarations.
-2. Convert TS host imports one family at a time to native signatures.
-3. Convert C ABI shims and Rust std call sites to those signatures.
-4. Delete FlatBuffers helpers and generated bindings once no import uses them.
-5. Delete JSON helpers, `writeJson`, and all legacy JSON host branches.
-6. Rebuild C canaries, Rust canaries, Rust std canaries, and bash fixtures.
-7. Run ABI, host-import, fixture, and shell/process tests.
-8. Add grep-based CI checks that reject `writeJson`, ABI-boundary `JSON.parse`, and old wait imports.
+1. Create `abi/rust/yurt-abi-core` by reusing the Rust ABI crate structure from the `rust-abi-pilot` worktree and the FFI boundary lessons from `rust-abi-high-impact`, but without FlatBuffers.
+2. Add `abi/include/yurt_abi.h` with native ABI structs, flags, and import declarations, sourced from or checked against the Rust ABI core.
+3. Convert TS host imports one family at a time to native signatures and delegate record/struct work to the Rust ABI core adapter.
+4. Convert C ABI shims and Rust std call sites to those signatures.
+5. Delete FlatBuffers helpers and generated bindings once no import uses them.
+6. Delete JSON helpers, `writeJson`, and all legacy JSON host branches.
+7. Rebuild C canaries, Rust canaries, Rust std canaries, and bash fixtures.
+8. Run ABI, host-import, fixture, and shell/process tests.
+9. Add grep-based CI checks that reject `writeJson`, ABI-boundary `JSON.parse`, FlatBuffers host imports, and old wait imports.
 
 ## Test Strategy
 
 - Unit tests for each host import family using direct memory buffers.
+- Rust ABI core unit tests for each record decoder and fixed-output writer using an in-memory `GuestMemory` implementation.
+- Cross-check tests that `abi/include/yurt_abi.h` constants and struct sizes match Rust ABI core constants.
 - ABI canaries for C and Rust std.
 - Memory-growth-across-await test for every async import that reads request bytes.
 - Grep canaries:
