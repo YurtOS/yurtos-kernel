@@ -412,6 +412,91 @@ fn link_shaped_probe_can_disable_yurt_link_injection() {
 
 #[ignore = "slow: invokes real clang via yurt-cc to compile a C file"]
 #[test]
+fn standard_headers_expose_yurt_compat_declarations() {
+    if std::env::var_os("WASI_SDK_PATH").is_none() {
+        eprintln!("skipping - WASI_SDK_PATH not set");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("headers.c");
+    fs::write(
+        &src,
+        br#"
+#include <stdio.h>
+#include <time.h>
+int main(void) {
+    FILE *f = stdout;
+    clock_t c = 0;
+    tzset();
+    flockfile(f);
+    funlockfile(f);
+    return f == 0 || c != 0;
+}
+"#,
+    )
+    .unwrap();
+    let obj = tmp.path().join("headers.o");
+
+    let st = Command::new(bin())
+        .arg("-c")
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert!(obj.exists());
+}
+
+#[ignore = "slow: invokes real clang via yurt-cc to compile C fixtures"]
+#[test]
+fn zstd_like_shim_include_order_composes_with_yurt_headers() {
+    if std::env::var_os("WASI_SDK_PATH").is_none() {
+        eprintln!("skipping - WASI_SDK_PATH not set");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let shim = tmp.path().join("wasm-shim");
+    fs::create_dir_all(&shim).unwrap();
+    fs::write(
+        shim.join("time.h"),
+        b"#ifndef ZSTD_WASM_SHIM_TIME_H\n#define ZSTD_WASM_SHIM_TIME_H\n#include_next <time.h>\n#endif\n",
+    )
+    .unwrap();
+    let src = tmp.path().join("shim.c");
+    fs::write(
+        &src,
+        br#"
+#include <time.h>
+#include <stdio.h>
+int main(void) {
+    clock_t c = 0;
+    FILE *f = stdout;
+    tzset();
+    return f == 0 || c != 0;
+}
+"#,
+    )
+    .unwrap();
+    let obj = tmp.path().join("shim.o");
+
+    let st = Command::new(bin())
+        .env_remove("YURT_CC_INCLUDE")
+        .arg("-c")
+        .arg("-I")
+        .arg(&shim)
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .status()
+        .unwrap();
+    assert!(st.success());
+}
+
+#[ignore = "slow: invokes real clang via yurt-cc to compile a C file"]
+#[test]
 fn preserves_pre_opt_artifact_at_stable_path() {
     // Real clang+wasi-sdk build. Skip if WASI_SDK_PATH is not set in CI env.
     if std::env::var_os("WASI_SDK_PATH").is_none() {
