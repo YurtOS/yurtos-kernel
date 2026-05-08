@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use yurt_toolchain::{
@@ -36,6 +37,26 @@ fn is_final_yurt_link_invocation(env: &env::Env, user_args: &[String]) -> bool {
     !env.no_link_injection && !is_compile_or_probe_invocation(user_args)
 }
 
+fn default_yurt_include_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let bin_dir = exe.parent()?;
+    let installed = bin_dir.join("yurt-include");
+    if installed.join("stdio.h").is_file() {
+        return Some(installed.canonicalize().unwrap_or(installed));
+    }
+
+    repo_include_from_manifest_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn repo_include_from_manifest_dir(manifest_dir: &Path) -> Option<PathBuf> {
+    let include = manifest_dir.join("../..").join("include");
+    if include.join("stdio.h").is_file() {
+        Some(include.canonicalize().unwrap_or(include))
+    } else {
+        None
+    }
+}
+
 fn build_clang_invocation(
     sdk: &wasi_sdk::WasiSdk,
     env: &env::Env,
@@ -43,28 +64,20 @@ fn build_clang_invocation(
     final_yurt_link: bool,
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
+    for a in user_args {
+        argv.push(a.into());
+    }
+
     if let Some(inc) = env.include.as_ref() {
         argv.push("-I".into());
         argv.push(inc.clone().into_os_string());
     }
+    if let Some(default_include) = default_yurt_include_dir() {
+        argv.push("-I".into());
+        argv.push(default_include.into_os_string());
+    }
     argv.push(format!("--sysroot={}", sdk.sysroot().display()).into());
     argv.push("--target=wasm32-wasip1".into());
-    argv.push("-O2".into());
-    // Default to C23 (gnu23): gives us nullptr keyword and the
-    // unreachable()/byteswap/etc. additions to <stddef.h>, both of
-    // which gnulib code paths in coreutils require.  Backward-compat:
-    // C23 is a near-pure superset of C11 that mostly adds new
-    // keywords; the exception is `bool` becoming a real keyword.
-    // Pre-C23 code that used a `typedef ... bool` would break, but
-    // none of our current ports do so (BusyBox uses smallint, jq /
-    // file use int).  Ports that need an older standard can pass
-    // `-std=...` after; clang takes the last -std= flag.
-    argv.push("-std=gnu23".into());
-    argv.push("-Wall".into());
-    argv.push("-Wextra".into());
-    for a in user_args {
-        argv.push(a.into());
-    }
     // Link-arg framing must come after the user's objects so it is last in
     // the link line. The whole-archive pair must bracket only the compat
     // archive, and the whole thing must precede `-lc`. clang's default is

@@ -69,6 +69,8 @@ $(BUILD_DIR):
 # a `test -x` existence guard would silently use stale binaries.
 ensure-toolchain:
 	cd $(REPO_ROOT) && cargo build --release -p yurt-toolchain
+	rm -rf $(REPO_ROOT)/target/release/yurt-include
+	cp -R $(INCLUDE) $(REPO_ROOT)/target/release/yurt-include
 
 # Objects compile through `yurt-cc -c`. The compat archive is not yet built
 # when these rules fire and must not be injected; YURT_CC_ARCHIVE is
