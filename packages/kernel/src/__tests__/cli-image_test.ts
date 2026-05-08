@@ -4,6 +4,7 @@ import {
 } from "jsr:@std/assert@^1.0.19";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { zstdCompress } from "node:zlib";
 
 const WASM_DIR = resolve(
   decodeURIComponent(
@@ -78,10 +79,22 @@ function tar(entries: Uint8Array[]): Uint8Array {
   return out;
 }
 
+function zstd(data: Uint8Array): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    zstdCompress(data, (error, result) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(new Uint8Array(result));
+    });
+  });
+}
+
 Deno.test("yurt CLI runs an argv command from an image", async () => {
   const dir = await mkdtemp("/tmp/yurt-cli-image-");
   const imagePath = join(dir, "test.yurtimg");
-  await writeFile(imagePath, tar([
+  await writeFile(imagePath, await zstd(tar([
     tarEntry({ name: "bin/", type: "5" }),
     tarEntry({
       name: "bin/true",
@@ -105,10 +118,20 @@ Deno.test("yurt CLI runs an argv command from an image", async () => {
         ],
       })),
     }),
-  ]));
+  ])));
 
   const command = new Deno.Command(deno, {
-    args: ["run", "--allow-read", CLI, imagePath, "/bin/echo-args", "a b", "$HOME"],
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-env",
+      CLI,
+      imagePath,
+      "/bin/echo-args",
+      "a b",
+      "$HOME",
+    ],
     stdout: "piped",
     stderr: "piped",
   });
@@ -123,7 +146,7 @@ Deno.test("yurt CLI runs an argv command from an image", async () => {
 Deno.test("yurt CLI fails clearly when no command and /bin/sh is missing", async () => {
   const dir = await mkdtemp("/tmp/yurt-cli-image-");
   const imagePath = join(dir, "test.yurtimg");
-  await writeFile(imagePath, tar([
+  await writeFile(imagePath, await zstd(tar([
     tarEntry({ name: "bin/", type: "5" }),
     tarEntry({
       name: "bin/true",
@@ -139,10 +162,10 @@ Deno.test("yurt CLI fails clearly when no command and /bin/sh is missing", async
         tools: [{ name: "true", path: "/bin/true" }],
       })),
     }),
-  ]));
+  ])));
 
   const command = new Deno.Command(deno, {
-    args: ["run", "--allow-read", CLI, imagePath],
+    args: ["run", "--allow-read", "--allow-write", "--allow-env", CLI, imagePath],
     stdout: "piped",
     stderr: "piped",
   });

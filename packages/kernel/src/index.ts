@@ -7,6 +7,11 @@ export {
   buildTarImageIndex,
   TarImageRootProvider,
 } from "./vfs/tar-image-root-provider.js";
+export { loadYurtImage } from "./image-loader.js";
+export type {
+  LoadedYurtImage,
+  LoadYurtImageOptions,
+} from "./image-loader.js";
 export type { RootProvider, RootProviderStat } from "./vfs/root-provider.js";
 export type {
   TarImageEntry,

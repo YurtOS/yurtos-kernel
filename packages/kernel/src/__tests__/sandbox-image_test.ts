@@ -2,6 +2,7 @@ import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { zstdCompress } from "node:zlib";
 import { NodeAdapter } from "../platform/node-adapter.ts";
 import { Sandbox } from "../sandbox.ts";
 
@@ -77,9 +78,21 @@ function tar(entries: Uint8Array[]): Uint8Array {
   return out;
 }
 
+function zstd(data: Uint8Array): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    zstdCompress(data, (error, result) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve(new Uint8Array(result));
+    });
+  });
+}
+
 describe("Sandbox image root", { sanitizeResources: false, sanitizeOps: false }, () => {
-  it("boots from an uncompressed tar image and writes only to the upper layer", async () => {
-    const image = tar([
+  it("boots from a zstd .yurtimg and writes only to the upper layer", async () => {
+    const tarBytes = tar([
       tarEntry({ name: "bin/", type: "5", mode: 0o755 }),
       tarEntry({
         name: "bin/true",
@@ -108,7 +121,7 @@ describe("Sandbox image root", { sanitizeResources: false, sanitizeOps: false },
     const sandbox = await Sandbox.create({
       wasmDir: WASM_DIR,
       adapter: new NodeAdapter(),
-      image,
+      image: await zstd(tarBytes),
       bootArgv: ["/bin/true"],
     });
 
@@ -116,7 +129,7 @@ describe("Sandbox image root", { sanitizeResources: false, sanitizeOps: false },
       expect(dec.decode(sandbox.readFile("/etc/base-marker.txt"))).toBe("base");
       sandbox.writeFile("/etc/base-marker.txt", enc.encode("upper"));
       expect(dec.decode(sandbox.readFile("/etc/base-marker.txt"))).toBe("upper");
-      expect(dec.decode(image)).toContain("base");
+      expect(dec.decode(tarBytes)).toContain("base");
     } finally {
       sandbox.destroy();
     }
@@ -125,7 +138,7 @@ describe("Sandbox image root", { sanitizeResources: false, sanitizeOps: false },
   it("accepts an image file path", async () => {
     const dir = await mkdtemp("/tmp/yurt-image-");
     const imagePath = join(dir, "test.yurtimg");
-    await writeFile(imagePath, tar([
+    await writeFile(imagePath, await zstd(tar([
       tarEntry({ name: "bin/", type: "5" }),
       tarEntry({
         name: "bin/true",
@@ -141,7 +154,7 @@ describe("Sandbox image root", { sanitizeResources: false, sanitizeOps: false },
           tools: [{ name: "true", path: "/bin/true" }],
         })),
       }),
-    ]));
+    ])));
 
     const sandbox = await Sandbox.create({
       wasmDir: WASM_DIR,
@@ -157,7 +170,7 @@ describe("Sandbox image root", { sanitizeResources: false, sanitizeOps: false },
   });
 
   it("runs image commands with argv without shell joining", async () => {
-    const image = tar([
+    const image = await zstd(tar([
       tarEntry({ name: "bin/", type: "5" }),
       tarEntry({
         name: "bin/echo-args",
@@ -181,7 +194,7 @@ describe("Sandbox image root", { sanitizeResources: false, sanitizeOps: false },
           ],
         })),
       }),
-    ]);
+    ]));
     const sandbox = await Sandbox.create({
       wasmDir: WASM_DIR,
       adapter: new NodeAdapter(),

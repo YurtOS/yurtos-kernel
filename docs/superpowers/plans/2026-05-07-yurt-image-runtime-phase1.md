@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add the first runnable image-runtime slice: uncompressed `.yurtimg` tar images as read-only sandbox bases, ancestor directory whiteouts, argv-native execution, and `yurt <image> [command...]` CLI support.
+**Goal:** Add the first runnable image-runtime slice: zstd-compressed `.yurtimg` tar images as read-only sandbox bases, ancestor directory whiteouts, argv-native execution, and `yurt <image> [command...]` CLI support.
 
-**Architecture:** Add a focused tar index/root provider beside the existing VFS providers, then wire `Sandbox.create({ image })` through the same `OverlayVFS` path used by `baseRoot`. Tighten `OverlayVFS` whiteout lookup before layer export work depends on directory deletion semantics. Use the existing `Sandbox.spawn(argv)` process path for argv-native execution and expose a small result-oriented wrapper for CLI use.
+**Architecture:** Add a focused image loader plus tar index/root provider beside the existing VFS providers. The loader decompresses `.yurtimg` zstd payloads to tar bytes, optionally reuses a decompressed tar cache, then wires `Sandbox.create({ image })` through the same `OverlayVFS` path used by `baseRoot`. Tighten `OverlayVFS` whiteout lookup before layer export work depends on directory deletion semantics. Use the existing `Sandbox.spawn(argv)` process path for argv-native execution and expose a small result-oriented wrapper for CLI use.
 
 **Tech Stack:** TypeScript, Deno tests, Node-compatible filesystem APIs, existing `RootProvider`, `OverlayVFS`, `VFS`, `Sandbox`, and `ProcessManager`.
 
@@ -12,7 +12,7 @@
 
 ## Scope
 
-This plan intentionally implements only the uncompressed runtime path. It does not implement `.zst` cache expansion, `.yurtlayer` export, merged snapshot export, layer merge, signing manifests, OPFS-backed range reads, or browser storage. Those need separate plans after this vertical slice is passing.
+This plan intentionally implements only `.yurtimg` zstd load and CLI decompressed-tar cache support. It does not implement `.yurtlayer` export, merged snapshot export, layer merge, signing manifests, OPFS-backed range reads, or browser storage. Those need separate plans after this vertical slice is passing.
 
 ## File Structure
 
@@ -20,7 +20,8 @@ This plan intentionally implements only the uncompressed runtime path. It does n
 - Create `packages/kernel/src/vfs/__tests__/tar-image-root-provider_test.ts`: provider unit tests and tar fixture helpers.
 - Modify `packages/kernel/src/vfs/overlay-vfs.ts`: add ancestor-whiteout lookup semantics while preserving upper-layer recreation behavior.
 - Modify `packages/kernel/src/vfs/__tests__/overlay-vfs_test.ts`: regression tests for whiteouted lower directories and recreated upper children.
-- Modify `packages/kernel/src/sandbox.ts`: add `image?: string | Uint8Array`, build `TarImageRootProvider`, register image tools, and skip fixture installation for image-backed roots.
+- Create `packages/kernel/src/image-loader.ts`: decompress zstd `.yurtimg` payloads, optionally cache path images as tar, and build the tar index.
+- Modify `packages/kernel/src/sandbox.ts`: add `image?: string | Uint8Array`, load `.yurtimg` through `loadYurtImage`, build `TarImageRootProvider`, register image tools, and skip fixture installation for image-backed roots.
 - Create `packages/kernel/src/__tests__/sandbox-image_test.ts`: sandbox integration tests for image-backed reads/writes and command execution.
 - Modify `packages/kernel/src/cli.ts`: parse `yurt <image> [command...]`, use image-backed sandbox, default to `/bin/sh`, and run argv without shell joining.
 - Create `packages/kernel/src/__tests__/cli-image_test.ts`: CLI behavior tests using a small generated image.
@@ -548,7 +549,7 @@ const dec = new TextDecoder();
 // Include octal, stringField, tarEntry, and tar helpers from tar-image-root-provider_test.ts.
 
 describe("Sandbox image root", { sanitizeResources: false, sanitizeOps: false }, () => {
-  it("boots from an uncompressed tar image and writes only to the upper layer", async () => {
+  it("boots from a zstd .yurtimg and writes only to the upper layer", async () => {
     const image = tar([
       tarEntry({ name: "bin/", type: "5", mode: 0o755 }),
       tarEntry({ name: "bin/true", mode: 0o555, data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")) }),
@@ -616,14 +617,17 @@ Expected: FAIL because `SandboxOptions.image` is not defined.
 Modify `SandboxOptions` in `packages/kernel/src/sandbox.ts`:
 
 ```ts
-/** Uncompressed .yurtimg tar image used as the read-only base root. */
+/** Zstd-compressed .yurtimg tar image used as the read-only base root. */
 image?: string | Uint8Array;
+/** Directory for decompressed image tar cache entries. Node/Deno path loads only. */
+imageCacheDir?: string;
 ```
 
 Import the provider helpers:
 
 ```ts
-import { buildTarImageIndex, TarImageRootProvider } from "./vfs/tar-image-root-provider.ts";
+import { loadYurtImage } from "./image-loader.ts";
+import { TarImageRootProvider } from "./vfs/tar-image-root-provider.ts";
 ```
 
 In `Sandbox.create`, reject combined roots:
@@ -637,18 +641,17 @@ if (options.baseRoot && options.image) {
 Load image bytes and construct `vfs`:
 
 ```ts
-const imageBytes = typeof options.image === "string"
-  ? new Uint8Array(await (await import("node:fs/promises")).readFile(options.image))
-  : options.image;
-const imageIndex = imageBytes ? await buildTarImageIndex(imageBytes) : undefined;
+const image = options.image
+  ? await loadYurtImage(options.image, { cacheDir: options.imageCacheDir })
+  : undefined;
 const metadata = Object.fromEntries((baseManifest?.files ?? []).map((f) => [
   f.path,
   { uid: f.uid, gid: f.gid, mode: f.mode },
 ]));
 const baseProvider = options.baseRoot
   ? new NodeDirectoryRootProvider(options.baseRoot, { id: baseManifest?.id ?? `dir:${options.baseRoot}`, metadata })
-  : imageBytes && imageIndex
-    ? new TarImageRootProvider({ id: `sha256:${imageIndex.imageSha256}`, image: imageBytes, index: imageIndex })
+  : image
+    ? new TarImageRootProvider({ id: image.baseId, image: image.tarBytes, index: image.index })
     : undefined;
 const vfs: VfsLike = baseProvider ? new OverlayVFS({ base: baseProvider, upper }) : upper;
 const hasBaseRoot = !!baseProvider;
@@ -894,16 +897,12 @@ Modify `packages/kernel/src/cli.ts` so `main()` does:
 
 ```ts
 const [, , imageArg, ...commandArgv] = process.argv;
-if (imageArg && (imageArg.endsWith(".yurtimg") || imageArg.endsWith(".yurtimg.zst"))) {
-  if (imageArg.endsWith(".yurtimg.zst")) {
-    process.stderr.write(".yurtimg.zst is not supported by this build yet\n");
-    process.exitCode = 2;
-    return;
-  }
+if (imageArg && imageArg.endsWith(".yurtimg")) {
   const sandbox = await Sandbox.create({
     wasmDir: FIXTURES,
     adapter: new NodeAdapter(),
     image: imageArg,
+    imageCacheDir: process.env.YURT_IMAGE_CACHE_DIR ?? join(tmpdir(), "yurt-image-cache"),
     bootArgv: ["/bin/true"],
   });
   sandbox.setEnv("HOME", "/home/user");
@@ -1003,6 +1002,6 @@ If no cleanup was needed, do not create an empty commit.
 
 ## Self-Review
 
-- Spec coverage: This plan covers `TarImageRootProvider`, `Sandbox.create({ image })`, ancestor-whiteout semantics, argv-native command execution, and uncompressed `yurt <image> [command...]` CLI behavior. It intentionally defers compression, layer export, snapshot export, layer merge, browser storage, and signing.
+- Spec coverage: This plan covers `loadYurtImage`, `TarImageRootProvider`, `Sandbox.create({ image })`, ancestor-whiteout semantics, argv-native command execution, and zstd-compressed `yurt <image> [command...]` CLI behavior. It intentionally defers layer export, snapshot export, layer merge, browser storage, and signing.
 - Placeholder scan: No placeholder markers or unspecified test commands remain.
 - Type consistency: The provider exposes hardlinks as `file` through `RootProviderStat`, sandbox image input is `string | Uint8Array`, and CLI command execution uses `Sandbox.runArgv(argv)`.

@@ -11,17 +11,15 @@ tooling can run:
 
 ```bash
 yurt image.yurtimg [command...]
-yurt image.yurtimg.zst [command...]
 ```
 
-An uncompressed `.yurtimg` is a tar filesystem image. The kernel loads its
-filesystem index into memory, uses the tar file as the read-only base VFS
-layer, and places runtime writes in a writable layer through `OverlayVFS`. The
-default writable layer is the existing in-memory `VFS`, but the upper layer is
-an explicit backend boundary: a caller can provide a local-directory,
-browser-storage, S3-backed, or other permission-aware implementation later. A
-compressed `.yurtimg.zst` is the transport form; CLI and browser tooling expand
-it before booting.
+A `.yurtimg` is a zstd-compressed tar filesystem image. The loader decompresses
+the image into a cached tar when possible, the kernel loads the tar filesystem
+index into memory, and the tar becomes the read-only base VFS layer. Runtime
+writes go to a writable layer through `OverlayVFS`. The default writable layer
+is the existing in-memory `VFS`, but the upper layer is an explicit backend
+boundary: a caller can provide a local-directory, browser-storage, S3-backed,
+or other permission-aware implementation later.
 
 The goal is not Docker compatibility. The kernel project owns the primitive
 image runtime: load image, run command, preserve or export upper state, merge
@@ -46,13 +44,10 @@ This design adds image-backed roots without changing package-manager policy.
 
 ## Image Format
 
-Yurt has two image states:
-
-- **Runtime image:** uncompressed tar, extension `.yurtimg`.
-- **Transport image:** compressed runtime image, extension `.yurtimg.zst`.
-
-The kernel runtime consumes the uncompressed tar form. Tar is the v1 filesystem
-format because it already represents the data Yurt needs:
+The canonical published image is a zstd-compressed tar archive with extension
+`.yurtimg`. The decompressed tar is an internal cache/runtime artifact, not a
+separate user-facing extension. Tar is the v1 filesystem format because it
+already represents the data Yurt needs:
 
 - paths;
 - regular file bytes;
@@ -63,10 +58,11 @@ format because it already represents the data Yurt needs:
 - uid/gid;
 - mtime.
 
-The kernel does not expand `.yurtimg` into a directory tree. It scans tar
-headers, loads an in-memory path index, and serves file contents by offset from
-the image bytes/file. That is the normal filesystem shape: metadata is resident
-and content is read lazily.
+The kernel does not expand `.yurtimg` into a directory tree. The loader
+decompresses it to tar bytes or a cached tar file, scans tar headers, loads an
+in-memory path index, and serves file contents by offset from the decompressed
+tar bytes/file. That is the normal filesystem shape: metadata is resident and
+content is read lazily.
 
 Unsupported tar entry types fail image loading. v1 supports regular files,
 directories, symlinks, and hardlinks. Hardlinks must resolve to regular-file
@@ -127,7 +123,7 @@ Add `TarImageRootProvider`, implementing `RootProvider`:
 
 ```ts
 interface TarImageRootProviderOptions {
-  id: string;              // usually sha256:<uncompressed-image-sha256>
+  id: string;              // usually sha256:<decompressed-tar-sha256>
   image: Uint8Array | Blob | FileBackedImage;
   index?: TarImageIndex;
 }
@@ -168,9 +164,10 @@ Provider behavior:
 - Compatible duplicate directory entries may merge only when mode/uid/gid
   match. Any other duplicate path is invalid.
 
-For the TypeScript/browser path, v1 may require the uncompressed image bytes to
-be in memory. The provider API should keep the storage boundary explicit so a
-later OPFS/file-backed reader can avoid loading large images fully into memory.
+For the TypeScript/browser path, v1 may require the decompressed tar bytes to
+be in memory after zstd decompression. The provider API should keep the storage
+boundary explicit so a later OPFS/file-backed reader can avoid loading large
+images fully into memory.
 
 ## Sandbox Integration
 
@@ -256,9 +253,11 @@ shell-command conveniences on top of it. Default `/bin/sh` may use argv
 
 Compressed image behavior:
 
-- If `<image>` ends in `.yurtimg.zst`, expand it into a CLI cache before boot.
-- Cache by uncompressed content hash, not by input path.
-- Reuse an existing cached `.yurtimg` and index when the hash matches.
+- If `<image>` ends in `.yurtimg`, treat it as a zstd-compressed tar image.
+- Expand it into a CLI tar cache before boot when no matching cached tar
+  exists.
+- Reuse an existing cached tar and index when the compressed image hash
+  matches.
 - Signature verification can be added when signed image manifests land; v1 must
   keep the cache layout compatible with storing manifest/provenance beside the
   image.
@@ -266,7 +265,7 @@ Compressed image behavior:
 Suggested CLI cache:
 
 ```text
-~/.cache/yurt/images/sha256-<hash>/image.yurtimg
+~/.cache/yurt/images/sha256-<hash>/image.tar
 ~/.cache/yurt/images/sha256-<hash>/index.json
 ~/.cache/yurt/images/sha256-<hash>/manifest.json
 ```
@@ -302,7 +301,7 @@ At process exit, for `--snapshot-out`:
 
 1. The sandbox has base image layer plus upper VFS layer.
 2. The kernel/tooling walks the merged VFS view.
-3. It writes a new uncompressed `.yurtimg` tar.
+3. It writes a new zstd-compressed `.yurtimg` tar image.
 4. The output image becomes a standalone runtime image; it does not require the
    previous base image or upper layer.
 
@@ -339,8 +338,8 @@ Browser support is a first-class kernel-project deliverable.
 
 Browser flow:
 
-1. Fetch or receive `.yurtimg.zst`.
-2. Decompress to uncompressed tar bytes.
+1. Fetch or receive `.yurtimg`.
+2. Decompress the zstd payload to tar bytes.
 3. Scan tar headers and build/load the in-memory path index.
 4. Store image bytes plus index in IndexedDB/OPFS or keep them in memory for
    small images.
@@ -359,8 +358,8 @@ target instead of to a host filesystem path.
 
 Browser tests should cover:
 
-- loading an uncompressed image;
-- loading a compressed image through the browser decompression path;
+- loading a zstd `.yurtimg`;
+- loading a cached decompressed tar through the browser storage path;
 - reading files by index;
 - running a command from the image;
 - proving runtime writes land in upper VFS and do not mutate image bytes.
@@ -376,7 +375,7 @@ Expected signed transport shape:
 {
   "image_format": "yurtimg-tar-v1",
   "compressed_sha256": "...",
-  "uncompressed_sha256": "...",
+  "decompressed_tar_sha256": "...",
   "created_at": "...",
   "packages": []
 }
@@ -384,7 +383,7 @@ Expected signed transport shape:
 
 The signing workflow itself belongs to package/image publishing tooling, not
 the kernel runtime. The kernel CLI cache should store this manifest when
-available and should key runtime images by the uncompressed image hash.
+available and should record both compressed and decompressed image hashes.
 
 Layer image manifests should identify the base image hash they were produced
 against when that information is known. The low-level merge primitive may still
@@ -422,7 +421,7 @@ Kernel tests should include:
   - `yurt image.yurtimg command`;
   - default `/bin/sh`;
   - missing shell error;
-  - `.yurtimg.zst` cache expansion;
+  - `.yurtimg` zstd cache expansion;
   - argv-native command execution without shell joining;
   - `--export-upper`;
   - `--snapshot-out`;
@@ -441,9 +440,9 @@ Kernel tests should include:
 4. Add ancestor-whiteout semantics to `OverlayVFS`.
 5. Add an argv-native process execution API.
 6. Update `yurt` CLI to support `yurt <image> [command...]`.
-7. Add compressed image cache expansion for the CLI.
+7. Add `.yurtimg` zstd cache expansion for the CLI.
 8. Add upper-layer export to `.yurtlayer` with deletion/whiteout support.
-9. Add full merged-VFS export to uncompressed `.yurtimg` tar and
+9. Add full merged-VFS export to zstd-compressed `.yurtimg` tar and
    `--snapshot-out`.
 10. Add ordered layer merge into standalone `.yurtimg`.
 11. Add browser image loading/decompression/export coverage.

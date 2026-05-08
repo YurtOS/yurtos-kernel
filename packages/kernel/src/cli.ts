@@ -4,8 +4,9 @@
  */
 
 import { createInterface } from 'node:readline';
-import { resolve, dirname } from 'node:path';
+import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { tmpdir } from 'node:os';
 
 import { NodeAdapter } from './platform/node-adapter.js';
 import { Sandbox } from './sandbox.js';
@@ -17,17 +18,13 @@ const FIXTURES = resolve(__dirname, 'platform/__tests__/fixtures');
 async function main() {
   const adapter = new NodeAdapter();
   const [, , imageArg, ...commandArgv] = process.argv;
-  if (imageArg && (imageArg.endsWith('.yurtimg') || imageArg.endsWith('.yurtimg.zst'))) {
-    if (imageArg.endsWith('.yurtimg.zst')) {
-      process.stderr.write('.yurtimg.zst is not supported by this build yet\n');
-      process.exitCode = 2;
-      return;
-    }
-
+  if (imageArg && imageArg.endsWith('.yurtimg')) {
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter,
       image: imageArg,
+      imageCacheDir: process.env.YURT_IMAGE_CACHE_DIR ??
+        join(tmpdir(), 'yurt-image-cache'),
       bootArgv: ['/bin/true'],
     });
     sandbox.setEnv('HOME', '/home/user');

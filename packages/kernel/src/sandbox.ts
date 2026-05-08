@@ -9,9 +9,9 @@ import { VFS } from "./vfs/vfs.js";
 import { OverlayVFS } from "./vfs/overlay-vfs.js";
 import { NodeDirectoryRootProvider } from "./vfs/node-directory-root-provider.js";
 import {
-  buildTarImageIndex,
   TarImageRootProvider,
 } from "./vfs/tar-image-root-provider.js";
+import { loadYurtImage } from "./image-loader.js";
 import { YURT_VERSION } from "./version.js";
 import { ProcessManager } from "./process/manager.js";
 /** Streaming callbacks for `Sandbox.run()`. Chunks are decoded UTF-8 strings. */
@@ -115,8 +115,10 @@ export interface SandboxOptions {
   fsLimitBytes?: number;
   /** Host directory mounted as the read-only base root layer. Node only. */
   baseRoot?: string;
-  /** Uncompressed .yurtimg tar image used as the read-only base root. */
+  /** Zstd-compressed .yurtimg tar image used as the read-only base root. */
   image?: string | Uint8Array;
+  /** Directory for decompressed image tar cache entries. Node/Deno path loads only. */
+  imageCacheDir?: string;
   /** Path/URL to the default boot WASM. Defaults to `${wasmDir}/bash.wasm`. */
   bootWasmPath?: string;
   /** Deprecated alias for bootWasmPath. */
@@ -284,12 +286,9 @@ export class Sandbox {
     const baseManifest = options.baseRoot
       ? await Sandbox.readBaseRootManifest(options.baseRoot)
       : undefined;
-    const imageBytes = typeof options.image === "string"
-      ? new Uint8Array(
-        await (await import("node:fs/promises")).readFile(options.image),
-      )
-      : options.image;
-    const imageIndex = imageBytes ? await buildTarImageIndex(imageBytes) : undefined;
+    const image = options.image
+      ? await loadYurtImage(options.image, { cacheDir: options.imageCacheDir })
+      : undefined;
     const metadata = Object.fromEntries((baseManifest?.files ?? []).map((f) => [
       f.path,
       { uid: f.uid, gid: f.gid, mode: f.mode },
@@ -299,11 +298,11 @@ export class Sandbox {
         id: baseManifest?.id ?? `dir:${options.baseRoot}`,
         metadata,
       })
-      : imageBytes && imageIndex
+      : image
       ? new TarImageRootProvider({
-        id: `sha256:${imageIndex.imageSha256}`,
-        image: imageBytes,
-        index: imageIndex,
+        id: image.baseId,
+        image: image.tarBytes,
+        index: image.index,
       })
       : undefined;
     const vfs: VfsLike = baseProvider
