@@ -23,33 +23,33 @@ rustup target add wasm32-wasip1
 Run the interactive sandbox shell:
 
 ```bash
-deno run --allow-read --allow-write --allow-run --allow-env packages/kernel/src/cli.ts
+deno run --allow-read --allow-write --allow-run --allow-env packages/cli/src/cli.ts
 ```
 
 Run one shell command in the default fixture-backed sandbox:
 
 ```bash
-deno run --allow-read --allow-write --allow-run --allow-env packages/kernel/src/cli.ts -c 'echo hello'
+deno run --allow-read --allow-write --allow-run --allow-env packages/cli/src/cli.ts -c 'echo hello'
 ```
 
-Create a minimal `.yurtimg` from the checked-in WASM fixtures:
+Create a repeatable `.yurtimg` from a `Yurtfile`:
 
 ```bash
 deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts image build \
-  --empty \
-  -o /tmp/echo.yurtimg \
-  --copy packages/kernel/src/platform/__tests__/fixtures/true-cmd.wasm:/bin/true \
-  --chmod 555:/bin/true \
-  --copy packages/kernel/src/platform/__tests__/fixtures/echo-args.wasm:/bin/echo-args \
-  --chmod 555:/bin/echo-args
+  packages/cli/src/cli.ts image build \
+  -f Yurtfile \
+  -o /tmp/generated.yurtimg
 ```
+
+For one-off cases, `yurt image build` also accepts flags such as `--empty`,
+`--copy`, `--chmod`, `--rm`, and `--run`. See [docs/images.md](docs/images.md)
+for the full image guide.
 
 Run a command from that image:
 
 ```bash
 deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts /tmp/echo.yurtimg /bin/echo-args hello yurt
+  packages/cli/src/cli.ts /tmp/generated.yurtimg /bin/echo-args hello yurt
 ```
 
 The image runner uses the `.yurtimg` as a read-only base filesystem and writes
@@ -100,8 +100,8 @@ deno fmt --check \
   packages/kernel/src/__tests__/image-exporter_test.ts \
   packages/kernel/src/__tests__/image-builder_test.ts \
   packages/kernel/src/__tests__/sandbox-image_test.ts \
-  packages/kernel/src/__tests__/cli-image_test.ts \
-  packages/kernel/src/__tests__/cli-image-build_test.ts \
+  packages/cli/src/__tests__/cli-image_test.ts \
+  packages/cli/src/__tests__/cli-image-build_test.ts \
   packages/kernel/src/vfs/__tests__/tar-image-root-provider_test.ts
 
 deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run \
@@ -109,8 +109,8 @@ deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-
   packages/kernel/src/__tests__/image-exporter_test.ts \
   packages/kernel/src/__tests__/image-builder_test.ts \
   packages/kernel/src/__tests__/sandbox-image_test.ts \
-  packages/kernel/src/__tests__/cli-image_test.ts \
-  packages/kernel/src/__tests__/cli-image-build_test.ts \
+  packages/cli/src/__tests__/cli-image_test.ts \
+  packages/cli/src/__tests__/cli-image-build_test.ts \
   packages/kernel/src/vfs/__tests__/tar-image-root-provider_test.ts
 ```
 

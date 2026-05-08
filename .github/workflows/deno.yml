@@ -10,21 +10,25 @@ env:
     packages/kernel/src/image-loader.ts
     packages/kernel/src/image-exporter.ts
     packages/kernel/src/image-builder.ts
+    packages/cli/src/cli.ts
+    packages/cli/src/image-build-file.ts
     packages/kernel/src/vfs/tar-image-root-provider.ts
     packages/kernel/src/__tests__/image-loader_test.ts
     packages/kernel/src/__tests__/image-exporter_test.ts
     packages/kernel/src/__tests__/image-builder_test.ts
     packages/kernel/src/__tests__/sandbox-image_test.ts
-    packages/kernel/src/__tests__/cli-image_test.ts
-    packages/kernel/src/__tests__/cli-image-build_test.ts
+    packages/cli/src/__tests__/cli-image_test.ts
+    packages/cli/src/__tests__/cli-image-build_test.ts
+    packages/cli/src/__tests__/image-build-file_test.ts
     packages/kernel/src/vfs/__tests__/tar-image-root-provider_test.ts
   IMAGE_RUNTIME_TESTS: >-
     packages/kernel/src/__tests__/image-loader_test.ts
     packages/kernel/src/__tests__/image-exporter_test.ts
     packages/kernel/src/__tests__/image-builder_test.ts
     packages/kernel/src/__tests__/sandbox-image_test.ts
-    packages/kernel/src/__tests__/cli-image_test.ts
-    packages/kernel/src/__tests__/cli-image-build_test.ts
+    packages/cli/src/__tests__/cli-image_test.ts
+    packages/cli/src/__tests__/cli-image-build_test.ts
+    packages/cli/src/__tests__/image-build-file_test.ts
     packages/kernel/src/vfs/__tests__/tar-image-root-provider_test.ts
 
 jobs:

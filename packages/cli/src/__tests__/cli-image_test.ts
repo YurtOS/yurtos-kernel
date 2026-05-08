@@ -1,11 +1,12 @@
-import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.19";
+import { assertEquals, assertStringIncludes } from "@std/assert";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { zstdCompress } from "node:zlib";
 
 const WASM_DIR = resolve(
   decodeURIComponent(
-    new URL("../platform/__tests__/fixtures", import.meta.url).pathname,
+    new URL("../../../kernel/src/platform/__tests__/fixtures", import.meta.url)
+      .pathname,
   ),
 );
 const CLI = resolve(

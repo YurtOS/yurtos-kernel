@@ -4,7 +4,7 @@
 
 **Goal:** Add explicit `Yurtfile` support to `yurt image build`, including ordered file instructions, gated host-shell `HOSTRUN`, atomic build-file output writes, and docs/help coverage.
 
-**Architecture:** Add a focused `packages/kernel/src/image-build-file.ts` module for parsing and executing build-file instructions. Keep `cli.ts` as the argument router: flag mode stays as-is, build-file mode delegates to the new module, and only CLI-level options such as `-o` and `--allow-hostrun` are shared. Integration tests exercise the real CLI through Deno, while parser tests cover syntax and validation without launching commands.
+**Architecture:** Add a focused `packages/cli/src/image-build-file.ts` module for parsing and executing build-file instructions. Keep `cli.ts` as the argument router: flag mode stays as-is, build-file mode delegates to the new module, and only CLI-level options such as `-o` and `--allow-hostrun` are shared. Integration tests exercise the real CLI through Deno, while parser tests cover syntax and validation without launching commands.
 
 **Tech Stack:** TypeScript on Deno with Node compatibility imports, existing `YurtImageBuilder`, `node:child_process` for host shell execution, `node:fs/promises` for atomic output writes, and Deno test/assert helpers.
 
@@ -12,10 +12,10 @@
 
 ## File Structure
 
-- Create `packages/kernel/src/image-build-file.ts`: typed `Yurtfile` parser, tokenization, path resolution, `HOSTRUN` preflight, host shell execution, ordered builder execution, and atomic output writer.
-- Create `packages/kernel/src/__tests__/image-build-file_test.ts`: parser-focused tests for instruction shape, quoting, validation, relative path resolution, and conflict-free helper behavior.
-- Modify `packages/kernel/src/cli.ts`: add `-f/--file`, `--allow-hostrun`, `--help`; reject `-f` mixed with flag-mode build-source inputs and operation flags; delegate build-file execution to `image-build-file.ts`.
-- Modify `packages/kernel/src/__tests__/cli-image-build_test.ts`: add CLI integration tests for build-file happy path, hostrun gate, hostrun success/failure, atomic output preservation, relative base resolution, no implicit `Yurtfile`, and mixed argument rejection.
+- Create `packages/cli/src/image-build-file.ts`: typed `Yurtfile` parser, tokenization, path resolution, `HOSTRUN` preflight, host shell execution, ordered builder execution, and atomic output writer.
+- Create `packages/cli/src/__tests__/image-build-file_test.ts`: parser-focused tests for instruction shape, quoting, validation, relative path resolution, and conflict-free helper behavior.
+- Modify `packages/cli/src/cli.ts`: add `-f/--file`, `--allow-hostrun`, `--help`; reject `-f` mixed with flag-mode build-source inputs and operation flags; delegate build-file execution to `image-build-file.ts`.
+- Modify `packages/cli/src/__tests__/cli-image-build_test.ts`: add CLI integration tests for build-file happy path, hostrun gate, hostrun success/failure, atomic output preservation, relative base resolution, no implicit `Yurtfile`, and mixed argument rejection.
 - Modify `docs/images.md`: document `Yurtfile`, `HOSTRUN`, `--allow-hostrun`, and build-file failure behavior while preserving flag examples.
 - Modify `README.md`: keep the quick image-build example concise and point detailed image-build documentation to `docs/images.md`.
 
@@ -24,12 +24,12 @@
 ### Task 1: Add Yurtfile Parser
 
 **Files:**
-- Create: `packages/kernel/src/image-build-file.ts`
-- Create: `packages/kernel/src/__tests__/image-build-file_test.ts`
+- Create: `packages/cli/src/image-build-file.ts`
+- Create: `packages/cli/src/__tests__/image-build-file_test.ts`
 
 - [ ] **Step 1: Write failing parser tests**
 
-Create `packages/kernel/src/__tests__/image-build-file_test.ts` with:
+Create `packages/cli/src/__tests__/image-build-file_test.ts` with:
 
 ```ts
 import {
@@ -222,14 +222,14 @@ Deno.test("parseYurtfile rejects invalid instruction arguments", async () => {
 Run:
 
 ```bash
-/Users/sunny/.deno/bin/deno test --allow-read --allow-write packages/kernel/src/__tests__/image-build-file_test.ts
+/Users/sunny/.deno/bin/deno test --allow-read --allow-write packages/cli/src/__tests__/image-build-file_test.ts
 ```
 
-Expected: FAIL because `packages/kernel/src/image-build-file.ts` does not exist.
+Expected: FAIL because `packages/cli/src/image-build-file.ts` does not exist.
 
 - [ ] **Step 3: Implement parser types and `parseYurtfile`**
 
-Create `packages/kernel/src/image-build-file.ts` with this initial content:
+Create `packages/cli/src/image-build-file.ts` with this initial content:
 
 ```ts
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -379,7 +379,7 @@ export function parseYurtfileText(
 
 - [ ] **Step 4: Implement tokenizer and validation helpers**
 
-Append these helpers to `packages/kernel/src/image-build-file.ts`:
+Append these helpers to `packages/cli/src/image-build-file.ts`:
 
 ```ts
 function tokenizeYurtfileLine(
@@ -517,7 +517,7 @@ function yurtfileError(pathForDiagnostics: string, line: number, message: string
 Run:
 
 ```bash
-/Users/sunny/.deno/bin/deno test --allow-read --allow-write packages/kernel/src/__tests__/image-build-file_test.ts
+/Users/sunny/.deno/bin/deno test --allow-read --allow-write packages/cli/src/__tests__/image-build-file_test.ts
 ```
 
 Expected: PASS.
@@ -527,7 +527,7 @@ Expected: PASS.
 Run:
 
 ```bash
-git add packages/kernel/src/image-build-file.ts packages/kernel/src/__tests__/image-build-file_test.ts
+git add packages/cli/src/image-build-file.ts packages/cli/src/__tests__/image-build-file_test.ts
 git commit -m "feat: add yurtfile parser"
 ```
 
@@ -536,13 +536,13 @@ git commit -m "feat: add yurtfile parser"
 ### Task 2: Add Yurtfile Executor And Atomic Output
 
 **Files:**
-- Modify: `packages/kernel/src/image-build-file.ts`
-- Modify: `packages/kernel/src/__tests__/image-build-file_test.ts`
+- Modify: `packages/cli/src/image-build-file.ts`
+- Modify: `packages/cli/src/__tests__/image-build-file_test.ts`
 
 - [ ] **Step 1: Add focused executor tests**
 
 First extend the existing imports at the top of
-`packages/kernel/src/__tests__/image-build-file_test.ts` so they are:
+`packages/cli/src/__tests__/image-build-file_test.ts` so they are:
 
 ```ts
 import {
@@ -711,14 +711,14 @@ Deno.test("executeYurtfileBuild reports non-RUN instruction failures with source
 Run:
 
 ```bash
-/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/kernel/src/__tests__/image-build-file_test.ts
+/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/cli/src/__tests__/image-build-file_test.ts
 ```
 
 Expected: FAIL because `executeYurtfileBuild` is not implemented.
 
 - [ ] **Step 3: Add executor imports, options, and result types**
 
-Modify the top of `packages/kernel/src/image-build-file.ts` so the imports become:
+Modify the top of `packages/cli/src/image-build-file.ts` so the imports become:
 
 ```ts
 import { spawn } from "node:child_process";
@@ -921,7 +921,7 @@ async function writeOutputAtomically(outputPath: string, bytes: Uint8Array): Pro
 Run:
 
 ```bash
-/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/kernel/src/__tests__/image-build-file_test.ts
+/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/cli/src/__tests__/image-build-file_test.ts
 ```
 
 Expected: PASS.
@@ -931,7 +931,7 @@ Expected: PASS.
 Run:
 
 ```bash
-git add packages/kernel/src/image-build-file.ts packages/kernel/src/__tests__/image-build-file_test.ts
+git add packages/cli/src/image-build-file.ts packages/cli/src/__tests__/image-build-file_test.ts
 git commit -m "feat: execute yurtfile image builds"
 ```
 
@@ -940,12 +940,12 @@ git commit -m "feat: execute yurtfile image builds"
 ### Task 3: Wire Build-File Mode Into CLI
 
 **Files:**
-- Modify: `packages/kernel/src/cli.ts`
-- Modify: `packages/kernel/src/__tests__/cli-image-build_test.ts`
+- Modify: `packages/cli/src/cli.ts`
+- Modify: `packages/cli/src/__tests__/cli-image-build_test.ts`
 
 - [ ] **Step 1: Add failing CLI tests for build-file mode**
 
-Append these tests to `packages/kernel/src/__tests__/cli-image-build_test.ts`:
+Append these tests to `packages/cli/src/__tests__/cli-image-build_test.ts`:
 
 ```ts
 Deno.test("yurt image build uses explicit Yurtfile", async () => {
@@ -1093,14 +1093,14 @@ Deno.test("yurt image build rejects --allow-hostrun without a Yurtfile", async (
 Run:
 
 ```bash
-/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/kernel/src/__tests__/cli-image-build_test.ts
+/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/cli/src/__tests__/cli-image-build_test.ts
 ```
 
 Expected: FAIL because `cli.ts` does not parse `-f/--file`.
 
 - [ ] **Step 3: Import build-file executor and extend argument types**
 
-Modify imports in `packages/kernel/src/cli.ts`:
+Modify imports in `packages/cli/src/cli.ts`:
 
 ```ts
 import { writeFile } from 'node:fs/promises';
@@ -1196,7 +1196,7 @@ Change the final return to:
 
 - [ ] **Step 6: Add image build help output**
 
-Add this class and function near the parser helpers in `packages/kernel/src/cli.ts`:
+Add this class and function near the parser helpers in `packages/cli/src/cli.ts`:
 
 ```ts
 class ImageBuildHelp extends Error {}
@@ -1245,7 +1245,7 @@ Change the `runImageBuild` parse error handling to:
 Run:
 
 ```bash
-/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/kernel/src/__tests__/cli-image-build_test.ts
+/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/cli/src/__tests__/cli-image-build_test.ts
 ```
 
 Expected: PASS.
@@ -1255,7 +1255,7 @@ Expected: PASS.
 Run:
 
 ```bash
-git add packages/kernel/src/cli.ts packages/kernel/src/__tests__/cli-image-build_test.ts
+git add packages/cli/src/cli.ts packages/cli/src/__tests__/cli-image-build_test.ts
 git commit -m "feat: wire yurtfile image build cli"
 ```
 
@@ -1264,11 +1264,11 @@ git commit -m "feat: wire yurtfile image build cli"
 ### Task 4: Add CLI Integration Coverage For HOSTRUN, RUN Failure, Atomic Writes, And Relative Base
 
 **Files:**
-- Modify: `packages/kernel/src/__tests__/cli-image-build_test.ts`
+- Modify: `packages/cli/src/__tests__/cli-image-build_test.ts`
 
 - [ ] **Step 1: Add remaining integration tests**
 
-The existing `packages/kernel/src/__tests__/cli-image-build_test.ts` imports
+The existing `packages/cli/src/__tests__/cli-image-build_test.ts` imports
 already include `enc`, `VFS`, and `exportVfsToYurtImage`. If those imports have
 changed, ensure the file has:
 
@@ -1277,7 +1277,7 @@ import { exportVfsToYurtImage } from "../image-exporter.ts";
 import { VFS } from "../vfs/vfs.ts";
 ```
 
-Append these tests to `packages/kernel/src/__tests__/cli-image-build_test.ts`:
+Append these tests to `packages/cli/src/__tests__/cli-image-build_test.ts`:
 
 ```ts
 Deno.test("yurt image build gates HOSTRUN before execution", async () => {
@@ -1521,7 +1521,7 @@ Deno.test("yurt image build -h documents Yurtfile and HOSTRUN", async () => {
 Run:
 
 ```bash
-/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/kernel/src/__tests__/cli-image-build_test.ts
+/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/cli/src/__tests__/cli-image-build_test.ts
 ```
 
 Expected: PASS.
@@ -1531,7 +1531,7 @@ Expected: PASS.
 Run:
 
 ```bash
-git add packages/kernel/src/__tests__/cli-image-build_test.ts
+git add packages/cli/src/__tests__/cli-image-build_test.ts
 git commit -m "test: cover yurtfile image build cli behavior"
 ```
 
@@ -1564,7 +1564,7 @@ RUN /bin/echo-args build step
 
 ```bash
 deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts image build \
+  packages/cli/src/cli.ts image build \
   -f Yurtfile \
   -o /tmp/generated.yurtimg
 ```
@@ -1587,7 +1587,7 @@ CHMOD 555 /bin/python
 
 ```bash
 deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts image build \
+  packages/cli/src/cli.ts image build \
   -f Yurtfile \
   -o /tmp/python.yurtimg \
   --allow-hostrun
@@ -1619,7 +1619,7 @@ recipes. See [docs/images.md](docs/images.md) for the full image guide.
 
 ```bash
 deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts image build \
+  packages/cli/src/cli.ts image build \
   -f Yurtfile \
   -o /tmp/generated.yurtimg
 ```
@@ -1662,7 +1662,7 @@ git commit -m "docs: document yurtfile image builds"
 Run:
 
 ```bash
-/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/kernel/src/__tests__/image-build-file_test.ts packages/kernel/src/__tests__/cli-image-build_test.ts
+/Users/sunny/.deno/bin/deno test --allow-read --allow-write --allow-run --allow-env packages/cli/src/__tests__/image-build-file_test.ts packages/cli/src/__tests__/cli-image-build_test.ts
 ```
 
 Expected: PASS.
@@ -1703,7 +1703,7 @@ For a TypeScript source failure, edit the source or test named in the error,
 then stage the Yurtfile implementation files and commit:
 
 ```bash
-git add packages/kernel/src/image-build-file.ts packages/kernel/src/cli.ts packages/kernel/src/__tests__/image-build-file_test.ts packages/kernel/src/__tests__/cli-image-build_test.ts
+git add packages/cli/src/image-build-file.ts packages/cli/src/cli.ts packages/cli/src/__tests__/image-build-file_test.ts packages/cli/src/__tests__/cli-image-build_test.ts
 git commit -m "fix: address yurtfile verification failure"
 ```
 
