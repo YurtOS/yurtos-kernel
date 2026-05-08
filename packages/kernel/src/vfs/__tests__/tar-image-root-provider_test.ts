@@ -102,6 +102,12 @@ Deno.test("TarImageRootProvider serves files, directories, symlinks, hardlinks, 
       mode: 0o777,
       linkname: "/usr/bin/hello",
     }),
+    tarEntry({
+      name: "usr-link",
+      type: "2",
+      mode: 0o777,
+      linkname: "/usr",
+    }),
   ]);
   const index = await buildTarImageIndex(archive);
   const provider = new TarImageRootProvider({
@@ -118,10 +124,12 @@ Deno.test("TarImageRootProvider serves files, directories, symlinks, hardlinks, 
   assertEquals(provider.lstat("/usr/bin/hello-hard").size, 6);
   assertEquals(provider.readlink("/bin/hello"), "/usr/bin/hello");
   assertEquals(provider.stat("/bin/hello").type, "file");
+  assertEquals(provider.stat("/usr-link").type, "dir");
   assertEquals(provider.readdir("/usr/bin").map((entry) => entry.name).sort(), [
     "hello",
     "hello-hard",
   ]);
+  assertEquals(index.imageSha256.length, 64);
 });
 
 Deno.test("TarImageRootProvider rejects unsafe, duplicate, and unsupported entries", async () => {

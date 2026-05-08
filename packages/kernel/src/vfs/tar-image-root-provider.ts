@@ -1,4 +1,5 @@
 import { type DirEntry, VfsError } from "./inode.ts";
+import { sha256Hex } from "../process/module-cache.ts";
 import type { RootProvider, RootProviderStat } from "./root-provider.ts";
 
 const BLOCK_SIZE = 512;
@@ -71,9 +72,8 @@ export class TarImageRootProvider implements RootProvider {
   }
 
   stat(path: string): RootProviderStat {
-    const normalized = normalizeImagePath(path);
-    const entry = this.resolveSymlink(normalized);
-    return this.toStat(entry, normalized);
+    const resolved = this.resolveSymlinkWithPath(normalizeImagePath(path));
+    return this.toStat(resolved.entry, resolved.path);
   }
 
   lstat(path: string): RootProviderStat {
@@ -137,11 +137,18 @@ export class TarImageRootProvider implements RootProvider {
     path: string,
     seen = new Set<string>(),
   ): TarImageEntry {
+    return this.resolveSymlinkWithPath(path, seen).entry;
+  }
+
+  private resolveSymlinkWithPath(
+    path: string,
+    seen = new Set<string>(),
+  ): { path: string; entry: TarImageEntry } {
     const entry = this.lookup(path);
-    if (entry.type !== "symlink") return entry;
+    if (entry.type !== "symlink") return { path, entry };
     if (seen.has(path)) throw new VfsError("EACCES", `symlink loop: ${path}`);
     seen.add(path);
-    return this.resolveSymlink(resolveLinkTarget(path, entry.target), seen);
+    return this.resolveSymlinkWithPath(resolveLinkTarget(path, entry.target), seen);
   }
 
   private resolveHardlink(
@@ -162,7 +169,7 @@ export class TarImageRootProvider implements RootProvider {
       ? this.resolveHardlink(entry)
       : undefined;
     const size = entry.type === "dir"
-      ? this.readdir(path).length
+      ? this.childCount(path)
       : entry.type === "file"
       ? entry.size
       : entry.type === "hardlink"
@@ -184,12 +191,24 @@ export class TarImageRootProvider implements RootProvider {
       atime: date,
     };
   }
+
+  private childCount(path: string): number {
+    const prefix = path === "/" ? "/" : `${path}/`;
+    let count = 0;
+    for (const candidate of Object.keys(this.index.entries)) {
+      if (candidate === path || !candidate.startsWith(prefix)) continue;
+      const rest = candidate.slice(prefix.length);
+      if (rest && !rest.includes("/")) count++;
+    }
+    return count;
+  }
 }
 
 export async function buildTarImageIndex(
   image: Uint8Array,
 ): Promise<TarImageIndex> {
-  return buildTarImageIndexSync(image);
+  const index = buildTarImageIndexSync(image);
+  return { ...index, imageSha256: await sha256Hex(image) };
 }
 
 function buildTarImageIndexSync(image: Uint8Array): TarImageIndex {
@@ -215,7 +234,7 @@ function buildTarImageIndexSync(image: Uint8Array): TarImageIndex {
     addEntry(entries, path, toEntry(header, dataOffset, common));
   }
   validateHardlinks(entries);
-  return { imageSha256: "", entries };
+  return { imageSha256: "unhashed", entries };
 }
 
 function toEntry(
