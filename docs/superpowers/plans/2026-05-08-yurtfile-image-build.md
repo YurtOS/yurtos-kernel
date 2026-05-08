@@ -146,6 +146,36 @@ RUN /bin/echo-args "line\n" path\name`,
   });
 });
 
+Deno.test("parseYurtfile treats # as ordinary text outside full-line comments", async () => {
+  const dir = await mkdtemp("/tmp/yurtfile-hash-");
+  const file = join(dir, "Yurtfile");
+  await writeFile(
+    file,
+    [
+      "# full-line comments are ignored",
+      "FROM empty",
+      "RUN /bin/echo-args hi # comment text is argv",
+      "COPY #host /#image",
+    ].join("\n"),
+  );
+
+  const parsed = await parseYurtfile(file);
+
+  assertEquals(parsed.instructions, [
+    {
+      kind: "run",
+      line: 3,
+      argv: ["/bin/echo-args", "hi", "#", "comment", "text", "is", "argv"],
+    },
+    {
+      kind: "copy",
+      line: 4,
+      source: join(dir, "#host"),
+      destination: "/#image",
+    },
+  ]);
+});
+
 Deno.test("parseYurtfile rejects missing and duplicate FROM", async () => {
   const dir = await mkdtemp("/tmp/yurtfile-invalid-");
   const missing = join(dir, "missing.Yurtfile");
@@ -702,6 +732,7 @@ import {
 import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import type { PlatformAdapter } from "./platform/adapter.ts";
 import { YurtImageBuilder } from "./image-builder.ts";
+import { NodeAdapter } from "./platform/node-adapter.ts";
 ```
 
 Add these interfaces after `YurtfileInstruction`:
@@ -748,11 +779,12 @@ export async function executeYurtfileBuild(
 
   let builder: YurtImageBuilder | undefined;
   try {
+    const adapter = options.adapter ?? new NodeAdapter();
     builder = parsed.base.kind === "empty"
-      ? await YurtImageBuilder.empty({ wasmDir: options.wasmDir, adapter: options.adapter })
+      ? await YurtImageBuilder.empty({ wasmDir: options.wasmDir, adapter })
       : await YurtImageBuilder.create({
         wasmDir: options.wasmDir,
-        adapter: options.adapter,
+        adapter,
         baseImage: parsed.base.path,
         imageCacheDir: options.imageCacheDir,
       });
@@ -854,6 +886,7 @@ function runHostCommand(
     child.on("error", reject);
     child.on("close", (code, signal) => {
       if (signal) {
+        // Use 1 for signal termination; do not encode shell-style 128+signal.
         io.stderr(`${parsed.pathForDiagnostics}:${instruction.line}: HOSTRUN terminated by signal ${signal}: ${instruction.command}\n`);
         resolveResult({ exitCode: 1 });
         return;
@@ -1090,7 +1123,7 @@ interface ImageBuildArgs {
 
 - [ ] **Step 4: Delegate build-file mode in `runImageBuild`**
 
-In `runImageBuild`, after parsing succeeds and before creating `NodeAdapter`, add:
+In `runImageBuild`, after parsing succeeds and after creating `const adapter = new NodeAdapter();`, add:
 
 ```ts
   if (parsed.file) {
@@ -1099,6 +1132,7 @@ In `runImageBuild`, after parsing succeeds and before creating `NodeAdapter`, ad
       outputPath: parsed.outputPath,
       allowHostrun: parsed.allowHostrun,
       wasmDir: FIXTURES,
+      adapter,
       imageCacheDir: process.env.YURT_IMAGE_CACHE_DIR ??
         join(tmpdir(), 'yurt-image-cache'),
     });
@@ -1122,10 +1156,8 @@ function parseImageBuildArgs(args: string[]): ImageBuildArgs {
   const ops: ImageBuildOp[] = [];
 ```
 
-Inside the loop, replace the current first `if (arg === '--empty')` branch with
-this attached `if` / `else if` chain. The `--empty` branch must become
-`else if`; otherwise `--allow-hostrun` falls through to the unknown-option
-branch in the same iteration.
+Inside the loop, insert the help, file, and hostrun branches before the existing
+`--empty` branch in the same attached `if` / `else if` chain.
 
 ```ts
     if (arg === '-h' || arg === '--help') {
@@ -1235,6 +1267,15 @@ git commit -m "feat: wire yurtfile image build cli"
 - Modify: `packages/kernel/src/__tests__/cli-image-build_test.ts`
 
 - [ ] **Step 1: Add remaining integration tests**
+
+The existing `packages/kernel/src/__tests__/cli-image-build_test.ts` imports
+already include `enc`, `VFS`, and `exportVfsToYurtImage`. If those imports have
+changed, ensure the file has:
+
+```ts
+import { exportVfsToYurtImage } from "../image-exporter.ts";
+import { VFS } from "../vfs/vfs.ts";
+```
 
 Append these tests to `packages/kernel/src/__tests__/cli-image-build_test.ts`:
 
@@ -1530,6 +1571,8 @@ deno run --allow-read --allow-write --allow-run --allow-env \
 
 `Yurtfile` instructions run in order. `RUN` executes inside the image sandbox
 with `cwd=/`, `HOME=/`, `PATH=/bin:/usr/bin`, `PWD=/`, and `USER=root`.
+The CLI does not auto-discover `./Yurtfile`; build-file mode is used only when
+`-f` or `--file` is passed.
 
 `HOSTRUN` executes a raw command through the host shell, with the `Yurtfile`
 directory as its working directory and the CLI process environment inherited.
@@ -1686,10 +1729,10 @@ Expected: PASS. This is the Deno fast-tier test glob from the repo instructions.
 
 ## Self-Review
 
-- Spec coverage: The plan covers explicit `-f`, preserving flag mode, all initial instructions, host-shell `HOSTRUN`, `--allow-hostrun` preflight, no implicit `Yurtfile`, conflict rejection, relative host path/base resolution, parser quoting, inline comment behavior, atomic writes, source-location diagnostics, docs, CLI help, and focused tests.
+- Spec coverage: The plan covers explicit `-f`, preserving flag mode, all initial instructions, host-shell `HOSTRUN`, `--allow-hostrun` preflight, no implicit `Yurtfile`, conflict rejection, relative host path/base resolution, parser quoting, pinned `#` behavior for full-line comments versus ordinary argv/path text, atomic writes, source-location diagnostics, docs, CLI help, and focused tests.
 - Boundary check: Parser and executor live in `image-build-file.ts`; `cli.ts` only routes arguments and delegates build-file execution. No new `YurtImageBuilder` methods are introduced.
 - TDD check: Each implementation task starts with failing tests, then implementation, then focused verification.
 - Placeholder scan: The plan contains no open-ended implementation placeholders. Commands, expected results, file paths, and code snippets are concrete.
 - Type consistency: `ParsedYurtfile`, `YurtfileInstruction`, `ExecuteYurtfileBuildOptions`, and `ExecuteYurtfileBuildResult` are introduced once and reused consistently.
-- Review follow-up: `--allow-hostrun` is explicitly rejected without `-f`, parser branches are specified as one attached `if` / `else if` chain, unknown escapes are pinned, host signal termination gets a distinct diagnostic, relative-FROM tests avoid `/tmp` symlink assumptions, and both `--help` and `-h` are covered.
+- Review follow-up: `--allow-hostrun` is explicitly rejected without `-f`, parser branches are specified as one attached `if` / `else if` chain, executor and CLI build-file paths use an explicit `NodeAdapter`, unknown escapes and literal non-leading `#` behavior are pinned, host signal termination gets a distinct diagnostic with exit code `1`, relative-FROM tests avoid `/tmp` symlink assumptions, and both `--help` and `-h` are covered.
 - Deferred quality note: `writeOutputAtomically` intentionally preserves current CLI behavior for missing output directories: it reports a normal write failure instead of creating parent directories. `ParsedYurtfile.path` and `pathForDiagnostics` remain separate so a future CLI can preserve the user-supplied diagnostic path while using a normalized execution path; the first implementation sets them to the same value.
