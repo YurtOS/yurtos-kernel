@@ -8,6 +8,10 @@
 import { VFS } from "./vfs/vfs.js";
 import { OverlayVFS } from "./vfs/overlay-vfs.js";
 import { NodeDirectoryRootProvider } from "./vfs/node-directory-root-provider.js";
+import {
+  buildTarImageIndex,
+  TarImageRootProvider,
+} from "./vfs/tar-image-root-provider.js";
 import { YURT_VERSION } from "./version.js";
 import { ProcessManager } from "./process/manager.js";
 /** Streaming callbacks for `Sandbox.run()`. Chunks are decoded UTF-8 strings. */
@@ -111,6 +115,8 @@ export interface SandboxOptions {
   fsLimitBytes?: number;
   /** Host directory mounted as the read-only base root layer. Node only. */
   baseRoot?: string;
+  /** Uncompressed .yurtimg tar image used as the read-only base root. */
+  image?: string | Uint8Array;
   /** Path/URL to the default boot WASM. Defaults to `${wasmDir}/bash.wasm`. */
   bootWasmPath?: string;
   /** Deprecated alias for bootWasmPath. */
@@ -263,6 +269,9 @@ export class Sandbox {
   }
 
   static async create(options: SandboxOptions): Promise<Sandbox> {
+    if (options.baseRoot && options.image) {
+      throw new Error("Sandbox.create accepts either baseRoot or image, not both");
+    }
     const adapter = options.adapter ?? await Sandbox.detectAdapter();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const fsLimitBytes = options.fsLimitBytes ?? DEFAULT_FS_LIMIT;
@@ -275,18 +284,32 @@ export class Sandbox {
     const baseManifest = options.baseRoot
       ? await Sandbox.readBaseRootManifest(options.baseRoot)
       : undefined;
-    const vfs: VfsLike = options.baseRoot
-      ? new OverlayVFS({
-        base: new NodeDirectoryRootProvider(options.baseRoot, {
-          id: baseManifest?.id ?? `dir:${options.baseRoot}`,
-          metadata: Object.fromEntries((baseManifest?.files ?? []).map((f) => [
-            f.path,
-            { uid: f.uid, gid: f.gid, mode: f.mode },
-          ])),
-        }),
-        upper,
+    const imageBytes = typeof options.image === "string"
+      ? new Uint8Array(
+        await (await import("node:fs/promises")).readFile(options.image),
+      )
+      : options.image;
+    const imageIndex = imageBytes ? await buildTarImageIndex(imageBytes) : undefined;
+    const metadata = Object.fromEntries((baseManifest?.files ?? []).map((f) => [
+      f.path,
+      { uid: f.uid, gid: f.gid, mode: f.mode },
+    ]));
+    const baseProvider = options.baseRoot
+      ? new NodeDirectoryRootProvider(options.baseRoot, {
+        id: baseManifest?.id ?? `dir:${options.baseRoot}`,
+        metadata,
       })
+      : imageBytes && imageIndex
+      ? new TarImageRootProvider({
+        id: `sha256:${imageIndex.imageSha256}`,
+        image: imageBytes,
+        index: imageIndex,
+      })
+      : undefined;
+    const vfs: VfsLike = baseProvider
+      ? new OverlayVFS({ base: baseProvider, upper })
       : upper;
+    const hasBaseRoot = !!baseProvider;
     const { bridge } = options.networkBridge
       ? { bridge: options.networkBridge }
       : await Sandbox.createNetworkBridge(options.network);
@@ -297,12 +320,12 @@ export class Sandbox {
       options.security?.toolAllowlist,
       moduleCache,
     );
-    const tools = options.baseRoot
+    const tools = hasBaseRoot
       ? Sandbox.registerBaseRootTools(mgr, vfs)
       : await Sandbox.registerTools(mgr, adapter, options.wasmDir, upper);
     const runtimeBackend = options.runtimeBackend ??
       unsupportedRuntimeEngineBackend;
-    if (!options.baseRoot) {
+    if (!hasBaseRoot) {
       await Sandbox.installCpythonStdlib(
         upper,
         adapter,
@@ -367,7 +390,7 @@ export class Sandbox {
       : baseBootWasmPath;
     const bootArgv = options.bootArgv ?? ["/bin/bash"];
 
-    if (!options.baseRoot) {
+    if (!hasBaseRoot) {
       await Sandbox.installBootProgram(
         upper,
         adapter,
