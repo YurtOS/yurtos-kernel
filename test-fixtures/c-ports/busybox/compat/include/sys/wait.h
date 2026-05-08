@@ -35,10 +35,6 @@
 #define WIFSTOPPED(status) (((status) & 0xff) == 0x7f)
 #endif
 
-#ifndef WCOREDUMP
-#define WCOREDUMP(status) ((status) & 0x80)
-#endif
-
 #include <errno.h>
 
 /* No child processes in wasi: wait/waitpid return -1/ECHILD. Inline here so
