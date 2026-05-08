@@ -75,6 +75,11 @@ pub fn plan_invocation_with_sdk(
 
     plan.env
         .push(("YURT_LINK_INJECTED".to_string(), "1".to_string()));
+    // Cargo build scripts and cc-rs dependencies may run link-shaped compiler
+    // probes. Those probes must behave like wasi-sdk clang and must not inspect
+    // or inject the Yurt ABI archive.
+    plan.env
+        .push(("YURT_CC_NO_LINK_INJECTION".to_string(), "1".to_string()));
 
     // YURT_CC_NO_CLANG_LINKER skips the wasi-sdk clang linker injection so rust's
     // default rust-lld handles the link. Needed for ports whose dep tree

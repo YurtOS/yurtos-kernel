@@ -5,6 +5,7 @@
 use anyhow::{anyhow, Context as _, Result};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// One symbol's behavioral spec, loaded from `<symbol>.spec.toml`.
 #[derive(Debug, Clone)]
@@ -74,11 +75,6 @@ fn is_valid_case_name(name: &str) -> bool {
 }
 
 impl Spec {
-    /// Parse spec text without an associated file. `symbol` is set to "<inline>".
-    pub fn from_str(text: &str) -> Result<Self> {
-        Self::from_str_with_symbol(text, "<inline>", PathBuf::new())
-    }
-
     fn from_str_with_symbol(text: &str, symbol: &str, path: PathBuf) -> Result<Self> {
         let raw: RawSpec =
             toml::from_str(text).map_err(|e| anyhow!("parsing spec for {symbol}: {e}"))?;
@@ -143,5 +139,14 @@ impl Spec {
         }
         out.sort_by(|a, b| a.symbol.cmp(&b.symbol));
         Ok(out)
+    }
+}
+
+impl FromStr for Spec {
+    type Err = anyhow::Error;
+
+    /// Parse spec text without an associated file. `symbol` is set to "<inline>".
+    fn from_str(text: &str) -> Result<Self> {
+        Self::from_str_with_symbol(text, "<inline>", PathBuf::new())
     }
 }

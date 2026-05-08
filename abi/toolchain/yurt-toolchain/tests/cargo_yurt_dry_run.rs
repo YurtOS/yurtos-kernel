@@ -56,6 +56,19 @@ fn injected_env_includes_yurt_link_injected() {
 }
 
 #[test]
+fn cargo_yurt_disables_yurt_cc_link_injection_for_build_script_probes() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let plan = plan_invocation(Subcommand::Build, &[]).unwrap();
+    assert_eq!(
+        plan.env
+            .iter()
+            .find(|(k, _)| k == "YURT_CC_NO_LINK_INJECTION")
+            .map(|(_, v)| v.as_str()),
+        Some("1"),
+    );
+}
+
+#[test]
 fn dry_run_does_not_set_target_specific_env_when_archive_missing() {
     let _guard = ENV_LOCK.lock().unwrap();
     // Without YURT_CC_ARCHIVE pointing somewhere real, the linker/RUSTFLAGS env
@@ -234,8 +247,7 @@ fn repo_local_std_is_composed_when_manifest_opts_in() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     let nested = repo.join("nested/project");
-    let std_lib =
-        repo.join("abi/build/rust-std/1.93.0/lib/rustlib/wasm32-wasip1/lib");
+    let std_lib = repo.join("abi/build/rust-std/1.93.0/lib/rustlib/wasm32-wasip1/lib");
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::create_dir_all(&std_lib).unwrap();
     let manifest = nested.join("Cargo.toml");

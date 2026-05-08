@@ -37,10 +37,7 @@ fn signature_check_passes_on_canary_built_via_yurt_cc() {
     let cc = env!("CARGO_BIN_EXE_yurt-cc");
     let st = Command::new(cc)
         .env("YURT_CC_ARCHIVE", &archive)
-        .env(
-            "YURT_CC_INCLUDE",
-            root.join("abi/include"),
-        )
+        .env("YURT_CC_INCLUDE", root.join("abi/include"))
         .env("YURT_CC_PRESERVE_PRE_OPT", &preserved)
         .env("YURT_CC_NO_WASM_OPT", "1")
         .arg(root.join("abi/conformance/c/dup2-canary.c"))

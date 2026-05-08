@@ -20,6 +20,11 @@ YURT_CC := $(REPO_ROOT)/target/release/yurt-cc
 YURT_AR := $(REPO_ROOT)/target/release/yurt-ar
 DENO ?= deno
 
+# yurt-cc itself stays package-neutral. These flags preserve the curated ABI
+# build policy: gnulib-derived ports need C23 additions, and the ABI canaries
+# keep the historical warning/optimization profile here.
+YURT_CFLAGS := -O2 -std=gnu23 -Wall -Wextra
+
 LIB := $(BUILD_DIR)/libyurt_abi.a
 CONTINUATION_LIB := $(BUILD_DIR)/libyurt_continuation.a
 SETJMP_LIB := $(BUILD_DIR)/libyurt_setjmp.a
@@ -69,13 +74,15 @@ $(BUILD_DIR):
 # a `test -x` existence guard would silently use stale binaries.
 ensure-toolchain:
 	cd $(REPO_ROOT) && cargo build --release -p yurt-toolchain
+	rm -rf $(REPO_ROOT)/target/release/yurt-include
+	cp -R $(INCLUDE) $(REPO_ROOT)/target/release/yurt-include
 
 # Objects compile through `yurt-cc -c`. The compat archive is not yet built
 # when these rules fire and must not be injected; YURT_CC_ARCHIVE is
 # explicitly unset so yurt-cc skips link-arg framing. This is safe because
 # `-c` disables link anyway.
 $(BUILD_DIR)/%.o: src/%.c $(wildcard include/*.h) src/yurt_runtime.h src/yurt_markers.h | $(BUILD_DIR) ensure-toolchain
-	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) $(YURT_CC) -c $< -o $@
+	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) $(YURT_CC) $(YURT_CFLAGS) -c $< -o $@
 
 lib: $(LIB)
 
@@ -98,7 +105,7 @@ $(BUILD_DIR)/setjmp-canary.wasm: $(CANARY_DIR)/setjmp-canary.c $(wildcard includ
 	YURT_CC_USE_CONTINUATION=1 \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/setjmp-canary.pre-opt.wasm \
-	$(YURT_CC) $< -o $@
+	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
 
 $(BUILD_DIR)/fork-canary.wasm: $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) $(CONTINUATION_LIB) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
@@ -106,19 +113,19 @@ $(BUILD_DIR)/fork-canary.wasm: $(CANARY_DIR)/fork-canary.c $(wildcard include/*.
 	YURT_CC_USE_CONTINUATION=1 \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/fork-canary.pre-opt.wasm \
-	$(YURT_CC) -DYURT_FORK_CANARY_CONTINUATION=1 $< -o $@
+	$(YURT_CC) $(YURT_CFLAGS) -DYURT_FORK_CANARY_CONTINUATION=1 $< -o $@
 
 $(FORK_DEFAULT_CANARY): $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/fork-default-canary.pre-opt.wasm \
-	$(YURT_CC) $< -o $@
+	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
 
 $(BUILD_DIR)/%-canary.wasm: $(CANARY_DIR)/%-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/$*-canary.pre-opt.wasm \
-	$(YURT_CC) $< -o $@
+	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
 
 canaries: $(CANARIES) $(FORK_DEFAULT_CANARY)
 

@@ -5,6 +5,9 @@ fn main() {
     let stream = TcpStream::connect(addr).expect("connect stream");
     let pending = stream.take_error().expect("take socket error");
 
-    assert!(pending.is_none(), "newly connected stream has pending error");
+    assert!(
+        pending.is_none(),
+        "newly connected stream has pending error"
+    );
     println!("take_error=none");
 }

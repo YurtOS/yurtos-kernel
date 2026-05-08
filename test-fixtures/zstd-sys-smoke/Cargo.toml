@@ -1,0 +1,11 @@
+[package]
+name = "zstd-sys-smoke"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+zstd-sys = "=2.0.16"

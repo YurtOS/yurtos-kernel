@@ -296,7 +296,12 @@ fn case_sigprocmask_roundtrip() -> i32 {
         emit("sigprocmask_roundtrip", 1, None, None);
         return 1;
     }
-    emit("sigprocmask_roundtrip", 0, Some("sigprocmask:roundtrip"), None);
+    emit(
+        "sigprocmask_roundtrip",
+        0,
+        Some("sigprocmask:roundtrip"),
+        None,
+    );
     0
 }
 
@@ -326,7 +331,12 @@ fn case_sigsuspend_resumes_on_raise() -> i32 {
         emit("sigsuspend_resumes_on_raise", 1, None, None);
         return 1;
     }
-    emit("sigsuspend_resumes_on_raise", 0, Some("sigsuspend:handled"), None);
+    emit(
+        "sigsuspend_resumes_on_raise",
+        0,
+        Some("sigsuspend:handled"),
+        None,
+    );
     0
 }
 

@@ -11,7 +11,7 @@ name = "happy_path"
 expected.exit = 0
 expected.stdout = "dup2-ok"
 "#;
-    let spec: Spec = Spec::from_str(text).unwrap();
+    let spec: Spec = text.parse::<Spec>().unwrap();
     assert_eq!(spec.canary, "dup2-canary");
     assert_eq!(spec.cases.len(), 1);
     assert_eq!(spec.cases[0].name, "happy_path");
@@ -30,7 +30,7 @@ name = "invalid_fd"
 expected.exit = 1
 expected.errno = 8
 "#;
-    let spec: Spec = Spec::from_str(text).unwrap();
+    let spec: Spec = text.parse::<Spec>().unwrap();
     assert_eq!(spec.cases[0].expected.errno, Some(8));
 }
 
@@ -43,7 +43,7 @@ canary = "dup2-canary"
 name = "happy_path"
 expected.something_made_up = 42
 "#;
-    let err = Spec::from_str(text).unwrap_err().to_string();
+    let err = text.parse::<Spec>().unwrap_err().to_string();
     assert!(
         err.contains("unknown field") || err.contains("something_made_up"),
         "expected closed-schema error, got: {err}"
@@ -58,7 +58,7 @@ canary = "dup2-canary"
 [[case]]
 name = "empty"
 "#;
-    let err = Spec::from_str(text).unwrap_err().to_string();
+    let err = text.parse::<Spec>().unwrap_err().to_string();
     assert!(
         err.contains("at least one expected"),
         "expected at-least-one-expected error, got: {err}"
@@ -78,7 +78,7 @@ expected.exit = 0
 name = "happy_path"
 expected.exit = 1
 "#;
-    let err = Spec::from_str(text).unwrap_err().to_string();
+    let err = text.parse::<Spec>().unwrap_err().to_string();
     assert!(
         err.contains("duplicate"),
         "expected duplicate-name error, got: {err}"
@@ -94,7 +94,7 @@ canary = "dup2-canary"
 name = "Bad-Name!"
 expected.exit = 0
 "#;
-    let err = Spec::from_str(text).unwrap_err().to_string();
+    let err = text.parse::<Spec>().unwrap_err().to_string();
     assert!(
         err.contains("invalid case name") || err.contains("Bad-Name"),
         "expected invalid-name error, got: {err}"
@@ -112,7 +112,7 @@ inputs = "dup2(1, 2)"
 expected.exit = 0
 expected.note = "renumber"
 "#;
-    let spec = Spec::from_str(text).unwrap();
+    let spec = text.parse::<Spec>().unwrap();
     assert_eq!(spec.cases[0].inputs.as_deref(), Some("dup2(1, 2)"));
     assert_eq!(spec.cases[0].expected.note.as_deref(), Some("renumber"));
 }

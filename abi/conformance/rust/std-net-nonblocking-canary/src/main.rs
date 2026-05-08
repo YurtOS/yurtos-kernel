@@ -7,7 +7,9 @@ fn main() {
     stream.set_nonblocking(true).expect("enable nonblocking");
 
     let mut buf = [0_u8; 3];
-    let err = stream.read(&mut buf).expect_err("nonblocking read should not block");
+    let err = stream
+        .read(&mut buf)
+        .expect_err("nonblocking read should not block");
     assert_eq!(err.kind(), ErrorKind::WouldBlock);
 
     println!("nonblocking=ok");

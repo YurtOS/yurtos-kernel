@@ -44,11 +44,10 @@ mod wasm_entry {
             Ok(s) => s,
             Err(_) => return -1,
         };
-        let map: std::collections::HashMap<String, String> =
-            match serde_json::from_str(json_str) {
-                Ok(m) => m,
-                Err(_) => return -2,
-            };
+        let map: std::collections::HashMap<String, String> = match serde_json::from_str(json_str) {
+            Ok(m) => m,
+            Err(_) => return -2,
+        };
         let mut state = get_state().lock().unwrap();
         state.env.extend(map);
         0

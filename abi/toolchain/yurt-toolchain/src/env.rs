@@ -10,6 +10,7 @@ pub struct Env {
     pub continuation_archive: Option<PathBuf>,
     pub include: Option<PathBuf>,
     pub skip_version_check: bool,
+    pub no_link_injection: bool,
     pub preserve_pre_opt: Option<PathBuf>,
     pub wasm_opt: WasmOptMode,
     /// YURT_CC_USE_CONTINUATION=1 opts this linked module into the Asyncify
@@ -40,14 +41,14 @@ impl Env {
                 "YURT_CC_CONTINUATION_ARCHIVE",
                 "YURT_CC_SETJMP_ARCHIVE",
             ])
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| {
-                    let archive = var_os(["YURT_CC_ARCHIVE"])
-                        .filter(|v| !v.is_empty())
-                        .map(PathBuf::from)?;
-                    Some(archive.with_file_name("libyurt_continuation.a"))
-                }),
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                let archive = var_os(["YURT_CC_ARCHIVE"])
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)?;
+                Some(archive.with_file_name("libyurt_continuation.a"))
+            }),
             include: var_os(["YURT_CC_INCLUDE"])
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
@@ -57,6 +58,7 @@ impl Env {
                 "YURT_CC_SKIP_VERSION_CHECK",
                 "YURT_CC_SKIP_VERSION_CHECK",
             ]),
+            no_link_injection: has_var(["YURT_CC_NO_LINK_INJECTION"]),
             preserve_pre_opt: var_os(["YURT_CC_PRESERVE_PRE_OPT"]).map(PathBuf::from),
             wasm_opt: if has_var(["YURT_CC_NO_WASM_OPT"]) {
                 WasmOptMode::Disabled

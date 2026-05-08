@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use yurt_toolchain::{
@@ -21,44 +22,107 @@ struct Cli {
     args: Vec<String>,
 }
 
-fn is_link_invocation(user_args: &[String]) -> bool {
+fn is_compile_or_probe_invocation(user_args: &[String]) -> bool {
     // Relocatable (-r / --relocatable) and partial links must NOT receive the
     // --whole-archive compat injection: the archive symbols would end up in
     // intermediate .o files and cause duplicate-symbol errors when the final
     // link re-injects the archive. Only the final executable link step gets
     // the injection.
-    !user_args
-        .iter()
-        .any(|a| a == "-c" || a == "-E" || a == "-S" || a == "-r" || a == "--relocatable")
+    user_args.is_empty()
+        || is_query_only_invocation(user_args)
+        || user_args
+            .iter()
+            .any(|a| a == "-c" || a == "-E" || a == "-S" || a == "-r" || a == "--relocatable")
+}
+
+fn is_query_only_invocation(user_args: &[String]) -> bool {
+    user_args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "-v" | "-###"
+                | "--version"
+                | "-dumpmachine"
+                | "-dumpversion"
+                | "-print-search-dirs"
+                | "--print-search-dirs"
+                | "-print-resource-dir"
+                | "--print-resource-dir"
+                | "-print-target-triple"
+                | "-print-libgcc-file-name"
+        ) || a.starts_with("-print-file-name=")
+            || a.starts_with("-print-prog-name=")
+    }) && !has_compile_or_link_input(user_args)
+}
+
+fn has_compile_or_link_input(user_args: &[String]) -> bool {
+    let mut skip_next = false;
+    for arg in user_args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "-o" | "-I" | "-isystem" | "-iquote" | "-include" | "-L" | "-x"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if arg == "-" || !arg.starts_with('-') {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_final_yurt_link_invocation(env: &env::Env, user_args: &[String]) -> bool {
+    !env.no_link_injection && !is_compile_or_probe_invocation(user_args)
+}
+
+fn default_yurt_include_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let bin_dir = exe.parent()?;
+    let installed = bin_dir.join("yurt-include");
+    if installed.join("stdio.h").is_file() {
+        return Some(installed.canonicalize().unwrap_or(installed));
+    }
+
+    repo_include_from_manifest_dir(Path::new(env!("CARGO_MANIFEST_DIR")))
+}
+
+fn repo_include_from_manifest_dir(manifest_dir: &Path) -> Option<PathBuf> {
+    let include = manifest_dir.join("../..").join("include");
+    if include.join("stdio.h").is_file() {
+        Some(include.canonicalize().unwrap_or(include))
+    } else {
+        None
+    }
 }
 
 fn build_clang_invocation(
     sdk: &wasi_sdk::WasiSdk,
     env: &env::Env,
     user_args: &[String],
+    final_yurt_link: bool,
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
+    argv.push(format!("--sysroot={}", sdk.sysroot().display()).into());
+    argv.push("--target=wasm32-wasip1".into());
+    for a in user_args {
+        if let Some(filtered) = filter_unsupported_wasm_link_arg(a) {
+            argv.push(filtered.into());
+        }
+    }
+
     if let Some(inc) = env.include.as_ref() {
         argv.push("-I".into());
         argv.push(inc.clone().into_os_string());
     }
-    argv.push(format!("--sysroot={}", sdk.sysroot().display()).into());
-    argv.push("--target=wasm32-wasip1".into());
-    argv.push("-O2".into());
-    // Default to C23 (gnu23): gives us nullptr keyword and the
-    // unreachable()/byteswap/etc. additions to <stddef.h>, both of
-    // which gnulib code paths in coreutils require.  Backward-compat:
-    // C23 is a near-pure superset of C11 that mostly adds new
-    // keywords; the exception is `bool` becoming a real keyword.
-    // Pre-C23 code that used a `typedef ... bool` would break, but
-    // none of our current ports do so (BusyBox uses smallint, jq /
-    // file use int).  Ports that need an older standard can pass
-    // `-std=...` after; clang takes the last -std= flag.
-    argv.push("-std=gnu23".into());
-    argv.push("-Wall".into());
-    argv.push("-Wextra".into());
-    for a in user_args {
-        argv.push(a.into());
+    if env.include.is_none() {
+        if let Some(default_include) = default_yurt_include_dir() {
+            argv.push("-I".into());
+            argv.push(default_include.into_os_string());
+        }
     }
     // Link-arg framing must come after the user's objects so it is last in
     // the link line. The whole-archive pair must bracket only the compat
@@ -77,7 +141,7 @@ fn build_clang_invocation(
     //   §Verifying Precedence stages 2 and 3 can locate them by name in
     //   the export section of the pre-opt .wasm.
     if let Some(archive) = env.archive.as_ref() {
-        if is_link_invocation(user_args) {
+        if final_yurt_link {
             argv.push("--no-wasm-opt".into());
             argv.push("-Wl,--allow-multiple-definition".into());
             argv.push("-Wl,--export-table".into());
@@ -126,6 +190,33 @@ fn build_clang_invocation(
     argv
 }
 
+fn filter_unsupported_wasm_link_arg(arg: &str) -> Option<String> {
+    let Some(wl) = arg.strip_prefix("-Wl,") else {
+        return Some(arg.to_string());
+    };
+    let filtered: Vec<&str> = wl
+        .split(',')
+        .filter(|part| {
+            !matches!(
+                *part,
+                "--start-group"
+                    | "--end-group"
+                    | "--warn-common"
+                    | "--sort-common"
+                    | "--sort-section"
+                    | "alignment"
+            )
+        })
+        .collect();
+    if filtered.is_empty() {
+        None
+    } else if filtered.len() == wl.split(',').count() {
+        Some(arg.to_string())
+    } else {
+        Some(format!("-Wl,{}", filtered.join(",")))
+    }
+}
+
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let sdk = wasi_sdk::discover().context("locating wasi-sdk")?;
@@ -136,13 +227,17 @@ fn main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    if let Some(archive) = env.archive.as_ref() {
-        if !env.skip_version_check {
-            archive::check_version(&sdk.nm(), archive).context("version check")?;
+    let final_yurt_link = is_final_yurt_link_invocation(&env, &cli.args);
+
+    if final_yurt_link {
+        if let Some(archive) = env.archive.as_ref() {
+            if !env.skip_version_check {
+                archive::check_version(&sdk.nm(), archive).context("version check")?;
+            }
         }
     }
 
-    let argv = build_clang_invocation(&sdk, &env, &cli.args);
+    let argv = build_clang_invocation(&sdk, &env, &cli.args, final_yurt_link);
 
     if cli.dry_run {
         print!("{}", sdk.clang().display());
@@ -169,7 +264,7 @@ fn main() -> Result<ExitCode> {
     // any link output — BusyBox links to `busybox_unstripped` with no
     // extension, and that binary is still wasm by virtue of
     // --target=wasm32-wasip1 and still wants the --asyncify pass.
-    if is_link_invocation(&cli.args) {
+    if final_yurt_link {
         if let Some(out_wasm) = preserve::output_wasm(&cli.args) {
             preserve::copy_to_preserve(&out_wasm, env.preserve_pre_opt.as_deref())?;
         }

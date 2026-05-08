@@ -19,12 +19,7 @@ use walrus::{FunctionBuilder, FunctionId, Module};
 
 /// Table of stdlib fns we rewrite post-link. Mangled prefix (without the
 /// terminating hash segment) → yurt-wasi-shims export name.
-const SHIMS: &[(&str, &str)] = &[
-    (
-        "_ZN3std3env8temp_dir",
-        "__yurt_wasi_shim_env_temp_dir",
-    ),
-];
+const SHIMS: &[(&str, &str)] = &[("_ZN3std3env8temp_dir", "__yurt_wasi_shim_env_temp_dir")];
 
 #[derive(Parser, Debug)]
 #[command(

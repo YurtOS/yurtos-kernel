@@ -26,11 +26,7 @@ fn discover_built_std_requires_target_libdir() {
     std::fs::create_dir_all(&lib).unwrap();
 
     let found = discover_built_std(tmp.path(), "1.93.0").unwrap();
-    assert_eq!(
-        found,
-        tmp.path()
-            .join("abi/build/rust-std/1.93.0")
-    );
+    assert_eq!(found, tmp.path().join("abi/build/rust-std/1.93.0"));
 }
 
 #[test]

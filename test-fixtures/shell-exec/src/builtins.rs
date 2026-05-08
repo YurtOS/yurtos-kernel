@@ -2387,7 +2387,11 @@ fn builtin_unalias(state: &mut ShellState, args: &[String]) -> BuiltinResult {
 /// prints the current niceness (always 0 since priority is set at sandbox
 /// creation time by the host).  With a command, spawns it via the host ABI
 /// with the requested epoch quantum so the child runs at the right priority.
-fn builtin_nice(state: &mut ShellState, host: &dyn HostInterface, args: &[String]) -> BuiltinResult {
+fn builtin_nice(
+    state: &mut ShellState,
+    host: &dyn HostInterface,
+    args: &[String],
+) -> BuiltinResult {
     let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
     // Parse -n N / -nN / --adjustment=N
@@ -2419,10 +2423,24 @@ fn builtin_nice(state: &mut ShellState, host: &dyn HostInterface, args: &[String
 
     let prog = args[i];
     let spawn_args: Vec<&str> = args[i + 1..].to_vec();
-    let env_pairs: Vec<(&str, &str)> =
-        state.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let env_pairs: Vec<(&str, &str)> = state
+        .env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
-    match host.spawn(prog, None, &spawn_args, &env_pairs, &state.cwd, "", state.stdin_fd, state.stdout_fd, 2, nice) {
+    match host.spawn(
+        prog,
+        None,
+        &spawn_args,
+        &env_pairs,
+        &state.cwd,
+        "",
+        state.stdin_fd,
+        state.stdout_fd,
+        2,
+        nice,
+    ) {
         Ok(pid) => match host.waitpid(pid) {
             Ok(result) => BuiltinResult::Result(result.exit_code),
             Err(_) => BuiltinResult::Result(1),
