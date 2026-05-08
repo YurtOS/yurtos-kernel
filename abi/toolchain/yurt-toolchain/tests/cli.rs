@@ -5,6 +5,48 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_yurt-cc")
 }
 
+fn fake_sdk() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("share/wasi-sysroot/include")).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let clang = root.join("bin/clang");
+        fs::write(&clang, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&clang, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let nm = root.join("bin/llvm-nm");
+        fs::write(&nm, b"#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&nm, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    tmp
+}
+
+fn stdout_string(out: std::process::Output) -> String {
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn stdout_tokens(stdout: &str) -> Vec<&str> {
+    stdout.split_whitespace().collect()
+}
+
+fn expected_repo_yurt_include() -> String {
+    let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("include");
+    p.canonicalize().unwrap_or(p).display().to_string()
+}
+
 #[test]
 fn help_prints_usage() {
     let out = Command::new(bin())
@@ -33,6 +75,8 @@ fn version_prints_version() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
+    let first = stdout.lines().next().unwrap_or("");
+    assert!(first.starts_with("yurt-cc "), "version output: {stdout}");
     assert!(
         stdout.contains(env!("CARGO_PKG_VERSION")),
         "version output: {stdout}"
@@ -82,7 +126,58 @@ fn invoking_clang_respects_env_sdk() {
 }
 
 #[test]
-fn dry_run_injects_compat_archive_and_include_first() {
+fn dry_run_does_not_force_compile_policy_flags() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .arg("--dry-run")
+            .arg("-c")
+            .arg("foo.c")
+            .output()
+            .unwrap(),
+    );
+
+    assert!(stdout.contains("--target=wasm32-wasip1"), "{stdout}");
+    assert!(stdout.contains("--sysroot="), "{stdout}");
+    let tokens = stdout_tokens(&stdout);
+    assert!(!tokens.contains(&"-O2"), "{stdout}");
+    assert!(!tokens.contains(&"-std=gnu23"), "{stdout}");
+    assert!(!tokens.contains(&"-Wall"), "{stdout}");
+    assert!(!tokens.contains(&"-Wextra"), "{stdout}");
+}
+
+#[test]
+fn dry_run_discovers_default_yurt_include_after_user_includes() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .env_remove("YURT_CC_INCLUDE")
+            .arg("--dry-run")
+            .arg("-c")
+            .arg("-I")
+            .arg("package/include")
+            .arg("foo.c")
+            .output()
+            .unwrap(),
+    );
+
+    let user_idx = stdout.find("-I package/include").unwrap();
+    let expected_include = expected_repo_yurt_include();
+    let yurt_idx = stdout
+        .find("yurt-include")
+        .or_else(|| stdout.find(&expected_include))
+        .unwrap_or_else(|| panic!("missing default Yurt include {expected_include}: {stdout}"));
+    let sysroot_idx = stdout.find("--sysroot=").unwrap();
+    assert!(user_idx < yurt_idx, "{stdout}");
+    assert!(yurt_idx < sysroot_idx, "{stdout}");
+}
+
+#[test]
+fn dry_run_injects_archive_and_preserves_include_order() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     fs::create_dir_all(root.join("bin")).unwrap();
@@ -102,15 +197,27 @@ fn dry_run_injects_compat_archive_and_include_first() {
         .env("YURT_CC_SKIP_VERSION_CHECK", "1")
         .arg("--dry-run")
         .arg("foo.c")
+        .arg("-I")
+        .arg("package/include")
         .arg("-o")
         .arg("foo.wasm")
         .output()
         .unwrap();
     let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("-I package/include"), "{stdout}");
     assert!(stdout.contains("-I /fake/include"), "{stdout}");
+    let expected_include = expected_repo_yurt_include();
+    assert!(
+        stdout.contains("yurt-include") || stdout.contains(&expected_include),
+        "missing default Yurt include {expected_include}: {stdout}",
+    );
+    assert!(
+        stdout.find("-I package/include").unwrap() < stdout.find("-I /fake/include").unwrap(),
+        "user include must precede explicit Yurt include: {stdout}",
+    );
     assert!(
         stdout.find("-I /fake/include").unwrap() < stdout.find("--sysroot=").unwrap(),
-        "compat headers must precede the WASI sysroot headers: {stdout}",
+        "explicit Yurt include must precede the WASI sysroot headers: {stdout}",
     );
     assert!(stdout.contains("-Wl,--whole-archive"), "{stdout}");
     assert!(stdout.contains("/fake/libyurt_abi.a"), "{stdout}");
@@ -227,6 +334,88 @@ fn missing_version_sentinel_is_a_hard_error() {
     assert!(
         stderr.contains("yurt_abi_version"),
         "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn compile_only_skips_archive_validation_even_when_archive_is_invalid() {
+    let sdk = fake_sdk();
+
+    let out = Command::new(bin())
+        .env("WASI_SDK_PATH", sdk.path())
+        .env("YURT_CC_ARCHIVE", sdk.path().join("missing-libyurt_abi.a"))
+        .arg("-c")
+        .arg("foo.c")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(!stdout.contains("missing-libyurt_abi.a"), "{stdout}");
+    assert!(!stdout.contains("--whole-archive"), "{stdout}");
+}
+
+#[test]
+fn preprocess_only_skips_archive_validation_even_when_archive_is_invalid() {
+    let sdk = fake_sdk();
+
+    let out = Command::new(bin())
+        .env("WASI_SDK_PATH", sdk.path())
+        .env("YURT_CC_ARCHIVE", sdk.path().join("missing-libyurt_abi.a"))
+        .arg("-E")
+        .arg("foo.c")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(!stdout.contains("missing-libyurt_abi.a"), "{stdout}");
+    assert!(!stdout.contains("--whole-archive"), "{stdout}");
+}
+
+#[test]
+fn link_shaped_probe_can_disable_yurt_link_injection() {
+    let sdk = fake_sdk();
+
+    let without_opt_out = Command::new(bin())
+        .env("WASI_SDK_PATH", sdk.path())
+        .env("YURT_CC_ARCHIVE", sdk.path().join("missing-libyurt_abi.a"))
+        .arg("probe.c")
+        .arg("-o")
+        .arg("probe")
+        .output()
+        .unwrap();
+    assert!(
+        !without_opt_out.status.success(),
+        "expected invalid archive failure"
+    );
+    let stderr = String::from_utf8_lossy(&without_opt_out.stderr);
+    assert!(
+        stderr.contains("version check") || stderr.contains("missing-libyurt_abi"),
+        "{stderr}"
+    );
+
+    let with_opt_out = Command::new(bin())
+        .env("WASI_SDK_PATH", sdk.path())
+        .env("YURT_CC_ARCHIVE", sdk.path().join("missing-libyurt_abi.a"))
+        .env("YURT_CC_NO_LINK_INJECTION", "1")
+        .arg("probe.c")
+        .arg("-o")
+        .arg("probe")
+        .output()
+        .unwrap();
+    assert!(
+        with_opt_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&with_opt_out.stderr)
     );
 }
 
