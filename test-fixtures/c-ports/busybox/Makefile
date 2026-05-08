@@ -8,7 +8,6 @@ BUSYBOX_ARCHIVE := busybox-$(BUSYBOX_VERSION).tar.bz2
 BUSYBOX_URL := https://busybox.net/downloads/$(BUSYBOX_ARCHIVE)
 BUILD_DIR := build
 SRC_DIR := src
-COMPAT_INCLUDE := $(abspath compat/include)
 ABI_INCLUDE := $(REPO_ROOT)/abi/include
 ABI_LIB := $(REPO_ROOT)/abi/build/libyurt_abi.a
 YURT_CONTINUATION_LIB := $(REPO_ROOT)/abi/build/libyurt_continuation.a
@@ -24,7 +23,7 @@ YURT_RANLIB := $(REPO_ROOT)/target/release/yurt-ranlib
 # so yurt-cc links the continuation archive, applies --asyncify, and marks
 # the resulting WASM for the runtime. So we want the *plain* setjmp/longjmp
 # prototypes here, not the wasm-EH-lowered ones.
-WASI_EMULATED_CFLAGS := -I$(COMPAT_INCLUDE) -D__linux__ -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS -DSOCK_RAW=3 -DSOCK_RDM=4 -DSOCK_SEQPACKET=5
+WASI_EMULATED_CFLAGS := -D__linux__ -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_MMAN -D_WASI_EMULATED_PROCESS_CLOCKS
 WASI_EMULATED_LDFLAGS := -lwasi-emulated-signal -lwasi-emulated-mman -lwasi-emulated-process-clocks -Wl,-u,__main_argc_argv
 
 .PHONY: all fetch configure copy-fixtures clean ensure-toolchain ensure-compat
@@ -47,7 +46,7 @@ fetch:
 		curl -L $(BUSYBOX_URL) | tar -xj -C src --strip-components=1; \
 	fi
 
-configure: fetch busybox.config compat/include/paths.h ensure-toolchain
+configure: fetch busybox.config ensure-toolchain
 	cd $(SRC_DIR) && \
 		$(MAKE) CC="$(YURT_CC)" AR="$(YURT_AR)" RANLIB="$(YURT_RANLIB)" \
 			KCONFIG_ALLCONFIG="$(abspath busybox.config)" allnoconfig && \
