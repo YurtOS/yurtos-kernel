@@ -21,21 +21,26 @@ struct Cli {
     args: Vec<String>,
 }
 
-fn is_link_invocation(user_args: &[String]) -> bool {
+fn is_compile_or_probe_invocation(user_args: &[String]) -> bool {
     // Relocatable (-r / --relocatable) and partial links must NOT receive the
     // --whole-archive compat injection: the archive symbols would end up in
     // intermediate .o files and cause duplicate-symbol errors when the final
     // link re-injects the archive. Only the final executable link step gets
     // the injection.
-    !user_args
+    user_args
         .iter()
         .any(|a| a == "-c" || a == "-E" || a == "-S" || a == "-r" || a == "--relocatable")
+}
+
+fn is_final_yurt_link_invocation(env: &env::Env, user_args: &[String]) -> bool {
+    !env.no_link_injection && !is_compile_or_probe_invocation(user_args)
 }
 
 fn build_clang_invocation(
     sdk: &wasi_sdk::WasiSdk,
     env: &env::Env,
     user_args: &[String],
+    final_yurt_link: bool,
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
     if let Some(inc) = env.include.as_ref() {
@@ -77,7 +82,7 @@ fn build_clang_invocation(
     //   §Verifying Precedence stages 2 and 3 can locate them by name in
     //   the export section of the pre-opt .wasm.
     if let Some(archive) = env.archive.as_ref() {
-        if is_link_invocation(user_args) {
+        if final_yurt_link {
             argv.push("--no-wasm-opt".into());
             argv.push("-Wl,--allow-multiple-definition".into());
             argv.push("-Wl,--export-table".into());
@@ -136,13 +141,17 @@ fn main() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    if let Some(archive) = env.archive.as_ref() {
-        if !env.skip_version_check {
-            archive::check_version(&sdk.nm(), archive).context("version check")?;
+    let final_yurt_link = is_final_yurt_link_invocation(&env, &cli.args);
+
+    if final_yurt_link {
+        if let Some(archive) = env.archive.as_ref() {
+            if !env.skip_version_check {
+                archive::check_version(&sdk.nm(), archive).context("version check")?;
+            }
         }
     }
 
-    let argv = build_clang_invocation(&sdk, &env, &cli.args);
+    let argv = build_clang_invocation(&sdk, &env, &cli.args, final_yurt_link);
 
     if cli.dry_run {
         print!("{}", sdk.clang().display());
@@ -169,7 +178,7 @@ fn main() -> Result<ExitCode> {
     // any link output — BusyBox links to `busybox_unstripped` with no
     // extension, and that binary is still wasm by virtue of
     // --target=wasm32-wasip1 and still wants the --asyncify pass.
-    if is_link_invocation(&cli.args) {
+    if final_yurt_link {
         if let Some(out_wasm) = preserve::output_wasm(&cli.args) {
             preserve::copy_to_preserve(&out_wasm, env.preserve_pre_opt.as_deref())?;
         }

@@ -56,6 +56,19 @@ fn injected_env_includes_yurt_link_injected() {
 }
 
 #[test]
+fn cargo_yurt_disables_yurt_cc_link_injection_for_build_script_probes() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let plan = plan_invocation(Subcommand::Build, &[]).unwrap();
+    assert_eq!(
+        plan.env
+            .iter()
+            .find(|(k, _)| k == "YURT_CC_NO_LINK_INJECTION")
+            .map(|(_, v)| v.as_str()),
+        Some("1"),
+    );
+}
+
+#[test]
 fn dry_run_does_not_set_target_specific_env_when_archive_missing() {
     let _guard = ENV_LOCK.lock().unwrap();
     // Without YURT_CC_ARCHIVE pointing somewhere real, the linker/RUSTFLAGS env
