@@ -804,6 +804,12 @@ export class OverlayVFS implements VfsLike {
     path = normalizeOverlayPath(path);
     for (const ancestor of ancestorPaths(parentPath(path))) {
       if (this.whiteouts.has(ancestor)) {
+        try {
+          const st = this.options.upper.lstat(ancestor);
+          if (st.type === 'dir') continue;
+        } catch (e) {
+          if (!isEnoent(e)) throw e;
+        }
         throw new VfsError('ENOENT', `whiteout ancestor: ${ancestor}`);
       }
     }

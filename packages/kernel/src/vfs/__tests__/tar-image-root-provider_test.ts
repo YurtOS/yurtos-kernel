@@ -132,6 +132,24 @@ Deno.test("TarImageRootProvider serves files, directories, symlinks, hardlinks, 
   assertEquals(index.imageSha256.length, 64);
 });
 
+Deno.test("TarImageRootProvider follows symlinks in intermediate path components", () => {
+  const archive = tar([
+    tarEntry({ name: "usr/", type: "5", mode: 0o755 }),
+    tarEntry({ name: "usr/bin/", type: "5", mode: 0o755 }),
+    tarEntry({
+      name: "usr/bin/sh",
+      mode: 0o555,
+      data: text.encode("shell\n"),
+    }),
+    tarEntry({ name: "bin", type: "2", mode: 0o777, linkname: "/usr/bin" }),
+  ]);
+  const provider = new TarImageRootProvider({ id: "test", image: archive });
+
+  assertEquals(dec.decode(provider.readFile("/bin/sh")), "shell\n");
+  assertEquals(provider.stat("/bin/sh").type, "file");
+  assertEquals(provider.readdir("/bin").map((entry) => entry.name), ["sh"]);
+});
+
 Deno.test("TarImageRootProvider rejects unsafe, duplicate, and unsupported entries", async () => {
   await assertRejects(() =>
     buildTarImageIndex(

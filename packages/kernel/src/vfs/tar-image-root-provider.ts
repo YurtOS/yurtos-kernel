@@ -72,18 +72,19 @@ export class TarImageRootProvider implements RootProvider {
   }
 
   stat(path: string): RootProviderStat {
-    const resolved = this.resolveSymlinkWithPath(normalizeImagePath(path));
+    const resolved = this.resolvePath(path, { followLeaf: true });
     return this.toStat(resolved.entry, resolved.path);
   }
 
   lstat(path: string): RootProviderStat {
-    const normalized = normalizeImagePath(path);
-    return this.toStat(this.lookup(normalized), normalized);
+    const resolved = this.resolvePath(path, { followLeaf: false });
+    return this.toStat(resolved.entry, resolved.path);
   }
 
   readdir(path: string): DirEntry[] {
-    const normalized = normalizeImagePath(path);
-    const entry = this.lookup(normalized);
+    const resolved = this.resolvePath(path, { followLeaf: true });
+    const normalized = resolved.path;
+    const entry = resolved.entry;
     if (entry.type !== "dir") {
       throw new VfsError("ENOTDIR", `not a directory: ${path}`);
     }
@@ -108,7 +109,7 @@ export class TarImageRootProvider implements RootProvider {
   }
 
   readlink(path: string): string {
-    const entry = this.lookup(normalizeImagePath(path));
+    const entry = this.resolvePath(path, { followLeaf: false }).entry;
     if (entry.type !== "symlink") {
       throw new VfsError("ENOENT", `not a symlink: ${path}`);
     }
@@ -124,7 +125,7 @@ export class TarImageRootProvider implements RootProvider {
   private resolveFileEntry(
     path: string,
   ): Extract<TarImageEntry, { type: "file" }> {
-    const entry = this.resolveSymlink(normalizeImagePath(path));
+    const entry = this.resolvePath(path, { followLeaf: true }).entry;
     if (entry.type === "file") return entry;
     if (entry.type === "hardlink") return this.resolveHardlink(entry);
     if (entry.type === "dir") {
@@ -137,18 +138,42 @@ export class TarImageRootProvider implements RootProvider {
     path: string,
     seen = new Set<string>(),
   ): TarImageEntry {
-    return this.resolveSymlinkWithPath(path, seen).entry;
+    return this.resolvePath(path, { followLeaf: true }, seen).entry;
   }
 
-  private resolveSymlinkWithPath(
+  private resolvePath(
     path: string,
+    options: { followLeaf: boolean },
     seen = new Set<string>(),
   ): { path: string; entry: TarImageEntry } {
-    const entry = this.lookup(path);
-    if (entry.type !== "symlink") return { path, entry };
-    if (seen.has(path)) throw new VfsError("EACCES", `symlink loop: ${path}`);
-    seen.add(path);
-    return this.resolveSymlinkWithPath(resolveLinkTarget(path, entry.target), seen);
+    const normalized = normalizeImagePath(path);
+    if (normalized === "/") return { path: "/", entry: this.lookup("/") };
+
+    const parts = normalized.split("/").filter(Boolean);
+    let current = "";
+    for (let i = 0; i < parts.length; i++) {
+      current = `${current}/${parts[i]}`;
+      const entry = this.lookup(current);
+      const isLeaf = i === parts.length - 1;
+      if (entry.type !== "symlink" || (isLeaf && !options.followLeaf)) {
+        if (isLeaf) return { path: current, entry };
+        continue;
+      }
+
+      if (seen.has(current)) {
+        throw new VfsError("EACCES", `symlink loop: ${current}`);
+      }
+      seen.add(current);
+      const target = resolveLinkTarget(current, entry.target);
+      const remaining = parts.slice(i + 1).join("/");
+      return this.resolvePath(
+        remaining ? `${target}/${remaining}` : target,
+        options,
+        seen,
+      );
+    }
+
+    throw new VfsError("ENOENT", `no such path: ${normalized}`);
   }
 
   private resolveHardlink(
