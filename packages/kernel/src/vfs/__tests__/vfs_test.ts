@@ -12,6 +12,30 @@ describe('VFS', () => {
     expect(vfs.stat('/usr/bin')).toMatchObject({ type: 'dir' });
   });
 
+  it('empty disk layout starts with only virtual provider paths', () => {
+    const vfs = new VFS({ layout: 'empty' });
+
+    expect(vfs.readdir('/').map((entry) => entry.name).sort()).toEqual([
+      'dev',
+      'proc',
+    ]);
+    expect(vfs.getProviderPaths().sort()).toEqual(['/dev', '/proc']);
+    expect(vfs.stat('/dev').type).toBe('dir');
+    expect(vfs.stat('/proc').type).toBe('dir');
+  });
+
+  it('empty disk layout reserves virtual provider mount paths', () => {
+    const vfs = new VFS({ layout: 'empty' });
+
+    expect(() => vfs.mkdir('/dev')).toThrow(/EEXIST|EROFS|EACCES/);
+    expect(() => vfs.writeFile('/proc', new Uint8Array())).toThrow();
+    vfs.withWriteAccess(() => {
+      vfs.mkdir('/bin');
+      vfs.writeFile('/bin/tool', new Uint8Array([1]), 0o555);
+    });
+    expect(vfs.stat('/bin/tool').permissions).toBe(0o555);
+  });
+
   it('creates and reads files', () => {
     const vfs = new VFS();
     const data = new TextEncoder().encode('hello world');

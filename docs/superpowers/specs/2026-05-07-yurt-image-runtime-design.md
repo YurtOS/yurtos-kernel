@@ -11,17 +11,15 @@ tooling can run:
 
 ```bash
 yurt image.yurtimg [command...]
-yurt image.yurtimg.zst [command...]
 ```
 
-An uncompressed `.yurtimg` is a tar filesystem image. The kernel loads its
-filesystem index into memory, uses the tar file as the read-only base VFS
-layer, and places runtime writes in a writable layer through `OverlayVFS`. The
-default writable layer is the existing in-memory `VFS`, but the upper layer is
-an explicit backend boundary: a caller can provide a local-directory,
-browser-storage, S3-backed, or other permission-aware implementation later. A
-compressed `.yurtimg.zst` is the transport form; CLI and browser tooling expand
-it before booting.
+A `.yurtimg` is a zstd-compressed tar filesystem image. The loader decompresses
+the image into a cached tar when possible, the kernel loads the tar filesystem
+index into memory, and the tar becomes the read-only base VFS layer. Runtime
+writes go to a writable layer through `OverlayVFS`. The default writable layer
+is the existing in-memory `VFS`, but the upper layer is an explicit backend
+boundary: a caller can provide a local-directory, browser-storage, S3-backed,
+or other permission-aware implementation later.
 
 The goal is not Docker compatibility. The kernel project owns the primitive
 image runtime: load image, run command, preserve or export upper state, merge
@@ -46,14 +44,10 @@ This design adds image-backed roots without changing package-manager policy.
 
 ## Image Format
 
-Yurt has two image states:
-
-- **Runtime image:** uncompressed tar, extension `.yurtimg`.
-- **Transport image:** compressed and signed runtime image,
-  extension `.yurtimg.zst`.
-
-The kernel runtime consumes the uncompressed tar form. Tar is the v1 filesystem
-format because it already represents the data Yurt needs:
+The canonical published image is a zstd-compressed tar archive with extension
+`.yurtimg`. The decompressed tar is an internal cache/runtime artifact, not a
+separate user-facing extension. Tar is the v1 filesystem format because it
+already represents the data Yurt needs:
 
 - paths;
 - regular file bytes;
@@ -64,10 +58,11 @@ format because it already represents the data Yurt needs:
 - uid/gid;
 - mtime.
 
-The kernel does not expand `.yurtimg` into a directory tree. It scans tar
-headers, loads an in-memory path index, and serves file contents by offset from
-the image bytes/file. That is the normal filesystem shape: metadata is resident
-and content is read lazily.
+The kernel does not expand `.yurtimg` into a directory tree. The loader
+decompresses it to tar bytes or a cached tar file, scans tar headers, loads an
+in-memory path index, and serves file contents by offset from the decompressed
+tar bytes/file. That is the normal filesystem shape: metadata is resident and
+content is read lazily.
 
 Unsupported tar entry types fail image loading. v1 supports regular files,
 directories, symlinks, and hardlinks. Hardlinks must resolve to regular-file
@@ -83,8 +78,7 @@ indexed tar filesystem.
 Yurt also needs a durable artifact for writable layer state:
 
 - **Layer image:** serialized overlay upper state, extension `.yurtlayer`.
-- **Transport layer image:** compressed and signed layer image,
-  extension `.yurtlayer.zst`.
+- **Transport layer image:** compressed layer image, extension `.yurtlayer.zst`.
 
 A layer image is not a new filesystem model. It is the stable serialization of
 the data structures the kernel already uses for layer 2:
@@ -113,6 +107,12 @@ The serialized state must satisfy these rules:
 - whiteout paths cannot target paths outside the image namespace;
 - applying layer images in order is deterministic.
 
+Current `OverlayVFS` whiteouts are exact-path whiteouts. Directory deletion
+semantics therefore require new overlay behavior before image layers can rely on
+them: merged lookup must treat a whiteouted ancestor directory as hiding lower
+children, while still allowing later upper entries or later applied layers to
+recreate paths below that ancestor.
+
 Yurt layer images are not OCI layers. They are kernel-owned overlay delta
 artifacts that can support Docker-like workflows later without importing Docker
 semantics into the kernel.
@@ -123,7 +123,7 @@ Add `TarImageRootProvider`, implementing `RootProvider`:
 
 ```ts
 interface TarImageRootProviderOptions {
-  id: string;              // usually sha256:<uncompressed-image-sha256>
+  id: string;              // usually sha256:<decompressed-tar-sha256>
   image: Uint8Array | Blob | FileBackedImage;
   index?: TarImageIndex;
 }
@@ -144,12 +144,19 @@ type TarImageEntry =
   | { type: "hardlink"; mode: number; uid: number; gid: number; mtime: number; target: string };
 ```
 
+`TarImageEntry` may keep hardlink entries internally so the image index can
+preserve tar identity and avoid duplicating file data. The public
+`RootProvider` contract remains unchanged in v1: `stat`, `lstat`, and
+`readdir` expose hardlinks as `type: "file"` because `RootProviderStat` and
+`DirEntry` currently support only `file | dir | symlink`.
+
 Provider behavior:
 
 - `readFile(path)` returns regular file bytes. For hardlinks, it reads the
   resolved target file bytes.
 - `stat(path)` follows symlinks according to existing `RootProvider` behavior.
-- `lstat(path)` returns the entry itself.
+- `lstat(path)` returns `type: "file"` for hardlink entries, with the hardlink
+  entry metadata and the resolved target size.
 - `readdir(path)` lists direct children from the index.
 - `readlink(path)` returns symlink targets.
 - Paths are absolute and normalized. `..` traversal is rejected while indexing.
@@ -157,9 +164,10 @@ Provider behavior:
 - Compatible duplicate directory entries may merge only when mode/uid/gid
   match. Any other duplicate path is invalid.
 
-For the TypeScript/browser path, v1 may require the uncompressed image bytes to
-be in memory. The provider API should keep the storage boundary explicit so a
-later OPFS/file-backed reader can avoid loading large images fully into memory.
+For the TypeScript/browser path, v1 may require the decompressed tar bytes to
+be in memory after zstd decompression. The provider API should keep the storage
+boundary explicit so a later OPFS/file-backed reader can avoid loading large
+images fully into memory.
 
 ## Sandbox Integration
 
@@ -185,13 +193,21 @@ The image is layer 1 and read-only. Runtime writes, deletes, chmod/chown
 changes, and package installs go to the upper layer. Existing overlay
 permissions and whiteouts remain authoritative.
 
-The upper layer must be pluggable. The v1 `yurt` CLI and image-building path can
-use the default in-memory `VFS`, because that is enough to run a command and then
-export either the upper layer or the merged filesystem. Other runtimes can supply
-a writable backend with the same semantics: local directory, browser OPFS,
-IndexedDB, S3, or a custom backend. Backend implementations are responsible for
-preserving the permission metadata and whiteout behavior exposed through the
-overlay interface.
+The upper layer must be pluggable, but "pluggable" means an explicit Yurt upper
+VFS contract, not an arbitrary object store. The v1 `yurt` CLI and image-building
+path can use the default in-memory `VFS`, because that is enough to run a
+command and then export either the upper layer or the merged filesystem.
+
+An upper backend must implement the mutating `VfsLike` operations used by
+`OverlayVFS`: read/write/stat/lstat/readdir, mkdir/mkdirp, unlink/rmdir, rename,
+symlink/readlink, chmod/chown, `withWriteAccess`, and permission behavior
+compatible with the in-memory `VFS`. Backends that participate in fork,
+suspend, or image-building flows must also provide the optional capabilities the
+overlay calls in those flows: `snapshot`/`restore`, `cowClone`, mount/provider
+metadata where relevant, and export/import support through
+`exportUpperVfs`/`exportOverlayState` at the overlay boundary. Local directory,
+browser OPFS/IndexedDB, S3, or other storage adapters can sit behind that
+contract, but they must preserve uid/gid/mode metadata and whiteout semantics.
 
 The existing `baseRoot` directory provider remains useful for tests and local
 development, but image loading is the normal kernel artifact path.
@@ -227,11 +243,21 @@ Command behavior:
 - The CLI should set the usual baseline environment:
   `HOME=/home/user`, `PWD=/home/user`, `USER=user`, `PATH=/bin:/usr/bin`.
 
+This requires an argv-native process entry point. The existing public
+`Sandbox.run(command: string)` API is shell-command oriented and must not be the
+only execution path for `yurt <image> [command...]`; joining CLI argv into a
+string would reintroduce host-side quoting ambiguity. The implementation should
+add a kernel process API that accepts executable path plus argv, then layer
+shell-command conveniences on top of it. Default `/bin/sh` may use argv
+`["/bin/sh"]`.
+
 Compressed image behavior:
 
-- If `<image>` ends in `.yurtimg.zst`, expand it into a CLI cache before boot.
-- Cache by uncompressed content hash, not by input path.
-- Reuse an existing cached `.yurtimg` and index when the hash matches.
+- If `<image>` ends in `.yurtimg`, treat it as a zstd-compressed tar image.
+- Expand it into a CLI tar cache before boot when no matching cached tar
+  exists.
+- Reuse an existing cached tar and index when the compressed image hash
+  matches.
 - Signature verification can be added when signed image manifests land; v1 must
   keep the cache layout compatible with storing manifest/provenance beside the
   image.
@@ -239,7 +265,7 @@ Compressed image behavior:
 Suggested CLI cache:
 
 ```text
-~/.cache/yurt/images/sha256-<hash>/image.yurtimg
+~/.cache/yurt/images/sha256-<hash>/image.tar
 ~/.cache/yurt/images/sha256-<hash>/index.json
 ~/.cache/yurt/images/sha256-<hash>/manifest.json
 ```
@@ -275,7 +301,7 @@ At process exit, for `--snapshot-out`:
 
 1. The sandbox has base image layer plus upper VFS layer.
 2. The kernel/tooling walks the merged VFS view.
-3. It writes a new uncompressed `.yurtimg` tar.
+3. It writes a new zstd-compressed `.yurtimg` tar image.
 4. The output image becomes a standalone runtime image; it does not require the
    previous base image or upper layer.
 
@@ -312,8 +338,8 @@ Browser support is a first-class kernel-project deliverable.
 
 Browser flow:
 
-1. Fetch or receive `.yurtimg.zst`.
-2. Decompress to uncompressed tar bytes.
+1. Fetch or receive `.yurtimg`.
+2. Decompress the zstd payload to tar bytes.
 3. Scan tar headers and build/load the in-memory path index.
 4. Store image bytes plus index in IndexedDB/OPFS or keep them in memory for
    small images.
@@ -332,8 +358,8 @@ target instead of to a host filesystem path.
 
 Browser tests should cover:
 
-- loading an uncompressed image;
-- loading a compressed image through the browser decompression path;
+- loading a zstd `.yurtimg`;
+- loading a cached decompressed tar through the browser storage path;
 - reading files by index;
 - running a command from the image;
 - proving runtime writes land in upper VFS and do not mutate image bytes.
@@ -349,7 +375,7 @@ Expected signed transport shape:
 {
   "image_format": "yurtimg-tar-v1",
   "compressed_sha256": "...",
-  "uncompressed_sha256": "...",
+  "decompressed_tar_sha256": "...",
   "created_at": "...",
   "packages": []
 }
@@ -357,7 +383,7 @@ Expected signed transport shape:
 
 The signing workflow itself belongs to package/image publishing tooling, not
 the kernel runtime. The kernel CLI cache should store this manifest when
-available and should key runtime images by the uncompressed image hash.
+available and should record both compressed and decompressed image hashes.
 
 Layer image manifests should identify the base image hash they were produced
 against when that information is known. The low-level merge primitive may still
@@ -383,6 +409,8 @@ Kernel tests should include:
   through `OverlayVFS`.
 - Upper-backend contract tests for writes, chmod/chown, whiteouts, permission
   checks, and snapshots.
+- Ancestor-whiteout tests proving a deleted lower-layer directory hides lower
+  descendants until the upper layer recreates them.
 - Layer-image export tests proving adds, modifications, metadata changes, and
   deletions survive an `--export-upper` round trip.
 - Layer merge tests proving one or more `.yurtlayer` inputs apply in order,
@@ -393,7 +421,8 @@ Kernel tests should include:
   - `yurt image.yurtimg command`;
   - default `/bin/sh`;
   - missing shell error;
-  - `.yurtimg.zst` cache expansion;
+  - `.yurtimg` zstd cache expansion;
+  - argv-native command execution without shell joining;
   - `--export-upper`;
   - `--snapshot-out`;
   - `yurt image merge`.
@@ -408,12 +437,14 @@ Kernel tests should include:
 2. Wire `Sandbox.create({ image })` to `OverlayVFS`.
 3. Define the upper-layer backend interface and keep the default `VFS`
    implementation wired for CLI/image builds.
-4. Update `yurt` CLI to support `yurt <image> [command...]`.
-5. Add compressed image cache expansion for the CLI.
-6. Add upper-layer export to `.yurtlayer` with deletion/whiteout support.
-7. Add full merged-VFS export to uncompressed `.yurtimg` tar and
+4. Add ancestor-whiteout semantics to `OverlayVFS`.
+5. Add an argv-native process execution API.
+6. Update `yurt` CLI to support `yurt <image> [command...]`.
+7. Add `.yurtimg` zstd cache expansion for the CLI.
+8. Add upper-layer export to `.yurtlayer` with deletion/whiteout support.
+9. Add full merged-VFS export to zstd-compressed `.yurtimg` tar and
    `--snapshot-out`.
-8. Add ordered layer merge into standalone `.yurtimg`.
-9. Add browser image loading/decompression/export coverage.
-10. Add signed manifest/cache metadata plumbing once image publishing defines
+10. Add ordered layer merge into standalone `.yurtimg`.
+11. Add browser image loading/decompression/export coverage.
+12. Add signed manifest/cache metadata plumbing once image publishing defines
    the signing flow.

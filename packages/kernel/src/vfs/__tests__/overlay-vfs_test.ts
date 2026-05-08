@@ -342,6 +342,56 @@ describe('OverlayVFS', () => {
     expect(() => vfs.stat('/gone')).toThrow(/ENOENT/);
   });
 
+  it('imported directory whiteouts hide lower descendants', () => {
+    const base = new MemoryRoot('base:test');
+    base.addDir('/lower', { uid: 1000, gid: 1000, permissions: 0o755 });
+    base.addFile('/lower/file.txt', 'base', { uid: 1000, gid: 1000, permissions: 0o644 });
+    const vfs = new OverlayVFS({ base, upper: new VFS() });
+
+    vfs.importOverlayState({ baseId: 'base:test', whiteouts: ['/lower'] });
+
+    expect(() => vfs.stat('/lower')).toThrow(/ENOENT|whiteout/);
+    expect(() => vfs.readFile('/lower/file.txt')).toThrow(/ENOENT|whiteout/);
+  });
+
+  it('treats upper directories recreated below imported directory whiteouts as opaque', () => {
+    const base = new MemoryRoot('base:test');
+    base.dirs.set('/', { uid: 1000, gid: 1000, permissions: 0o755 });
+    base.addDir('/lower', { uid: 1000, gid: 1000, permissions: 0o777 });
+    base.addFile('/lower/file.txt', 'base', { uid: 1000, gid: 1000, permissions: 0o644 });
+    const vfs = new OverlayVFS({ base, upper: new VFS() });
+
+    vfs.importOverlayState({ baseId: 'base:test', whiteouts: ['/lower'] });
+    vfs.withWriteAccess(() => {
+      vfs.mkdirp('/lower');
+      vfs.writeFile('/lower/new.txt', enc.encode('upper'));
+    });
+
+    expect(dec.decode(vfs.readFile('/lower/new.txt'))).toBe('upper');
+    expect(() => vfs.readFile('/lower/file.txt')).toThrow(/ENOENT|whiteout/);
+    expect(vfs.readdir('/lower').map((entry) => entry.name)).toEqual(['new.txt']);
+  });
+
+  it('allows normal writes below directories recreated over imported whiteouts', () => {
+    const base = new MemoryRoot('base:test');
+    base.dirs.set('/', { uid: 1000, gid: 1000, permissions: 0o755 });
+    base.addDir('/lower', { uid: 1000, gid: 1000, permissions: 0o777 });
+    base.addFile('/lower/file.txt', 'base', { uid: 1000, gid: 1000, permissions: 0o644 });
+    const vfs = new OverlayVFS({ base, upper: new VFS() });
+
+    vfs.importOverlayState({ baseId: 'base:test', whiteouts: ['/lower'] });
+    vfs.withWriteAccess(() => {
+      vfs.mkdirp('/lower');
+      vfs.chown('/lower', 1000, 1000);
+      vfs.chmod('/lower', 0o755);
+    });
+    vfs.writeFile('/lower/new.txt', enc.encode('upper'));
+
+    expect(dec.decode(vfs.readFile('/lower/new.txt'))).toBe('upper');
+    expect(() => vfs.readFile('/lower/file.txt')).toThrow(/ENOENT|whiteout/);
+    expect(vfs.readdir('/lower').map((entry) => entry.name)).toEqual(['new.txt']);
+  });
+
   it('delete permission depends on the parent directory, not the file', () => {
     const base = new MemoryRoot();
     base.addDir('/writable', { uid: 1000, gid: 1000, permissions: 0o755 });

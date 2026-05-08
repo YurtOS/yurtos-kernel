@@ -8,6 +8,10 @@
 import { VFS } from "./vfs/vfs.js";
 import { OverlayVFS } from "./vfs/overlay-vfs.js";
 import { NodeDirectoryRootProvider } from "./vfs/node-directory-root-provider.js";
+import {
+  TarImageRootProvider,
+} from "./vfs/tar-image-root-provider.js";
+import { loadYurtImage } from "./image-loader.js";
 import { YURT_VERSION } from "./version.js";
 import { ProcessManager } from "./process/manager.js";
 /** Streaming callbacks for `Sandbox.run()`. Chunks are decoded UTF-8 strings. */
@@ -111,6 +115,10 @@ export interface SandboxOptions {
   fsLimitBytes?: number;
   /** Host directory mounted as the read-only base root layer. Node only. */
   baseRoot?: string;
+  /** Zstd-compressed .yurtimg tar image used as the read-only base root. */
+  image?: string | Uint8Array;
+  /** Directory for decompressed image tar cache entries. Node/Deno path loads only. */
+  imageCacheDir?: string;
   /** Path/URL to the default boot WASM. Defaults to `${wasmDir}/bash.wasm`. */
   bootWasmPath?: string;
   /** Deprecated alias for bootWasmPath. */
@@ -263,6 +271,9 @@ export class Sandbox {
   }
 
   static async create(options: SandboxOptions): Promise<Sandbox> {
+    if (options.baseRoot && options.image) {
+      throw new Error("Sandbox.create accepts either baseRoot or image, not both");
+    }
     const adapter = options.adapter ?? await Sandbox.detectAdapter();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     const fsLimitBytes = options.fsLimitBytes ?? DEFAULT_FS_LIMIT;
@@ -275,18 +286,29 @@ export class Sandbox {
     const baseManifest = options.baseRoot
       ? await Sandbox.readBaseRootManifest(options.baseRoot)
       : undefined;
-    const vfs: VfsLike = options.baseRoot
-      ? new OverlayVFS({
-        base: new NodeDirectoryRootProvider(options.baseRoot, {
-          id: baseManifest?.id ?? `dir:${options.baseRoot}`,
-          metadata: Object.fromEntries((baseManifest?.files ?? []).map((f) => [
-            f.path,
-            { uid: f.uid, gid: f.gid, mode: f.mode },
-          ])),
-        }),
-        upper,
+    const image = options.image
+      ? await loadYurtImage(options.image, { cacheDir: options.imageCacheDir })
+      : undefined;
+    const metadata = Object.fromEntries((baseManifest?.files ?? []).map((f) => [
+      f.path,
+      { uid: f.uid, gid: f.gid, mode: f.mode },
+    ]));
+    const baseProvider = options.baseRoot
+      ? new NodeDirectoryRootProvider(options.baseRoot, {
+        id: baseManifest?.id ?? `dir:${options.baseRoot}`,
+        metadata,
       })
+      : image
+      ? new TarImageRootProvider({
+        id: image.baseId,
+        image: image.tarBytes,
+        index: image.index,
+      })
+      : undefined;
+    const vfs: VfsLike = baseProvider
+      ? new OverlayVFS({ base: baseProvider, upper })
       : upper;
+    const hasBaseRoot = !!baseProvider;
     const { bridge } = options.networkBridge
       ? { bridge: options.networkBridge }
       : await Sandbox.createNetworkBridge(options.network);
@@ -297,12 +319,12 @@ export class Sandbox {
       options.security?.toolAllowlist,
       moduleCache,
     );
-    const tools = options.baseRoot
+    const tools = hasBaseRoot
       ? Sandbox.registerBaseRootTools(mgr, vfs)
       : await Sandbox.registerTools(mgr, adapter, options.wasmDir, upper);
     const runtimeBackend = options.runtimeBackend ??
       unsupportedRuntimeEngineBackend;
-    if (!options.baseRoot) {
+    if (!hasBaseRoot) {
       await Sandbox.installCpythonStdlib(
         upper,
         adapter,
@@ -367,7 +389,7 @@ export class Sandbox {
       : baseBootWasmPath;
     const bootArgv = options.bootArgv ?? ["/bin/bash"];
 
-    if (!options.baseRoot) {
+    if (!hasBaseRoot) {
       await Sandbox.installBootProgram(
         upper,
         adapter,
@@ -940,7 +962,7 @@ export class Sandbox {
     };
   }
 
-  private static createLoaderContext(opts: {
+  static createLoaderContext(opts: {
     vfs: VfsLike;
     adapter: PlatformAdapter;
     kernel: ProcessKernel;
@@ -1613,6 +1635,39 @@ export class Sandbox {
     return this.processes.get(pid);
   }
 
+  async runArgv(
+    argv: string[],
+    options: { env?: Record<string, string>; cwd?: string } = {},
+  ): Promise<RunResult> {
+    this.assertAlive();
+    if (argv.length === 0 || !argv[0]) {
+      return {
+        exitCode: 127,
+        stdout: "",
+        stderr: "empty argv\n",
+        executionTimeMs: 0,
+      };
+    }
+
+    const startTime = performance.now();
+    const proc = await this.spawn(argv, {
+      mode: "cli",
+      env: options.env ?? Object.fromEntries(this.env),
+      cwd: options.cwd ?? this.env.get("PWD") ?? "/",
+    });
+    const stdout = proc.fdReadAndClear(1);
+    const stderr = proc.fdReadAndClear(2);
+    return {
+      exitCode: proc.exitCode ?? 0,
+      stdout: stdout.data,
+      stderr: stderr.data,
+      executionTimeMs: performance.now() - startTime,
+      truncated: stdout.truncated || stderr.truncated
+        ? { stdout: stdout.truncated, stderr: stderr.truncated }
+        : undefined,
+    };
+  }
+
   async spawn(argv: string[], opts: {
     mode?: ProcessMode;
     env?: Record<string, string>;
@@ -2024,4 +2079,30 @@ export class Sandbox {
       throw new Error("Sandbox is offloaded — call rehydrate() first");
     }
   }
+}
+
+export function createProcessLoaderContextForVfs(opts: {
+  vfs: VfsLike;
+  adapter: PlatformAdapter;
+  kernel: ProcessKernel;
+  mgr: ProcessManager;
+  processes: Map<number, Process>;
+  runtimeBackend?: RuntimeEngineBackend;
+  moduleCache?: WasmModuleCache;
+  stdoutLimit?: number;
+  stderrLimit?: number;
+}): LoaderContext {
+  return Sandbox.createLoaderContext({
+    vfs: opts.vfs,
+    adapter: opts.adapter,
+    kernel: opts.kernel,
+    mgr: opts.mgr,
+    processes: opts.processes,
+    runtimeBackend: opts.runtimeBackend ?? unsupportedRuntimeEngineBackend,
+    extensionRegistry: new ExtensionRegistry(),
+    getSandbox: () => undefined,
+    moduleCache: opts.moduleCache,
+    stdoutLimit: opts.stdoutLimit,
+    stderrLimit: opts.stderrLimit,
+  });
 }
