@@ -17,6 +17,13 @@ export {
   exportVfsToYurtImage,
 } from "./image-exporter.js";
 export type { ExportTarOptions } from "./image-exporter.js";
+export { YurtImageBuilder } from "./image-builder.js";
+export type {
+  CopyInOptions,
+  RunImageCommandOptions,
+  RunImageCommandResult,
+  YurtImageBuilderOptions,
+} from "./image-builder.js";
 export type { RootProvider, RootProviderStat } from "./vfs/root-provider.js";
 export type {
   TarImageEntry,

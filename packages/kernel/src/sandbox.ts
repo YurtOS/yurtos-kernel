@@ -962,7 +962,7 @@ export class Sandbox {
     };
   }
 
-  private static createLoaderContext(opts: {
+  static createLoaderContext(opts: {
     vfs: VfsLike;
     adapter: PlatformAdapter;
     kernel: ProcessKernel;
@@ -2079,4 +2079,30 @@ export class Sandbox {
       throw new Error("Sandbox is offloaded — call rehydrate() first");
     }
   }
+}
+
+export function createProcessLoaderContextForVfs(opts: {
+  vfs: VfsLike;
+  adapter: PlatformAdapter;
+  kernel: ProcessKernel;
+  mgr: ProcessManager;
+  processes: Map<number, Process>;
+  runtimeBackend?: RuntimeEngineBackend;
+  moduleCache?: WasmModuleCache;
+  stdoutLimit?: number;
+  stderrLimit?: number;
+}): LoaderContext {
+  return Sandbox.createLoaderContext({
+    vfs: opts.vfs,
+    adapter: opts.adapter,
+    kernel: opts.kernel,
+    mgr: opts.mgr,
+    processes: opts.processes,
+    runtimeBackend: opts.runtimeBackend ?? unsupportedRuntimeEngineBackend,
+    extensionRegistry: new ExtensionRegistry(),
+    getSandbox: () => undefined,
+    moduleCache: opts.moduleCache,
+    stdoutLimit: opts.stdoutLimit,
+    stderrLimit: opts.stderrLimit,
+  });
 }
