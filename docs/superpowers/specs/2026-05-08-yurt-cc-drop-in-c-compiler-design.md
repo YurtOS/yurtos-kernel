@@ -76,9 +76,9 @@ There are three useful classes of failure:
 
 The wrapper should not force `-std=gnu23`, `-Wall`, `-Wextra`, or `-O2` for arbitrary package builds. Those flags change source compatibility and diagnostics. A package that enables `-Werror`, expects an older C mode, probes compiler flags through `cc-rs`, or depends on debug-friendly optimization behavior should see the package's requested clang behavior.
 
-Curated Yurt C ports that need stricter warnings, a newer C mode, or optimization should pass those flags in their Makefiles.
+Yurt-owned ABI and canary builds that need stricter warnings, a newer C mode, or optimization may pass those flags in their Makefiles. Third-party package builds should not gain Yurt compile policy flags as a compatibility requirement; their build systems should remain package-owned, with integration limited as much as possible to compiler, archiver, ranlib, sysroot, and runtime environment selection.
 
-The migration must inventory every curated port or ABI build that currently relies on wrapper-injected `-std=gnu23`, `-Wall`, `-Wextra`, or `-O2`. For each affected Makefile, move the required flags into that build and verify the result with the existing smoke target. For ABI and canary artifacts, compare exported symbols and run the existing conformance smoke checks after the migration; object byte-for-byte equivalence is not required, but missing exports, unexpected wrapped symbols, and obvious size regressions should be investigated.
+The migration must inventory every Yurt-owned ABI build that currently relies on wrapper-injected `-std=gnu23`, `-Wall`, `-Wextra`, or `-O2`. Move only those internal policy flags into the ABI build and verify the result with the existing smoke target. For ABI and canary artifacts, compare exported symbols and run the existing conformance smoke checks after the migration; object byte-for-byte equivalence is not required, but missing exports, unexpected wrapped symbols, and obvious size regressions should be investigated.
 
 ### 2. Provide The Compatibility Include Path By Default
 
@@ -244,12 +244,12 @@ Add small tests in `abi/toolchain/yurt-toolchain` for the bug class:
 
 ## Migration
 
-- Remove default wrapper-injected compile policy flags from `yurt-cc`: `-std=gnu23`, `-Wall`, `-Wextra`, and `-O2`. Move any required warning, optimization, or language-standard choices into curated port Makefiles.
-- Inventory curated C builds under `abi/` and `test-fixtures/c-ports/` for reliance on those flags, then run their existing smoke/conformance targets after migration.
+- Remove default wrapper-injected compile policy flags from `yurt-cc`: `-std=gnu23`, `-Wall`, `-Wextra`, and `-O2`. Move only Yurt-owned ABI/canary policy choices into Yurt-owned Makefiles.
+- Inventory third-party C builds under `test-fixtures/c-ports/` for accidental reliance on wrapper policy flags. Do not add Yurt policy flags to those Makefiles as the compatibility model; keep integration limited to environment/tool selection unless a package-specific runtime shim genuinely requires more.
 - Make `yurt-cc` discover and inject the default Yurt compatibility include directory without requiring `YURT_CC_INCLUDE`.
 - Audit Yurt standard-name headers for transparent extension behavior under arbitrary include ordering.
 - Move unsafe or non-transparent declarations into explicit `yurt/...` headers.
-- Keep existing curated C ports working by adding explicit Makefile flags or includes where those ports relied on wrapper side effects.
+- Keep existing third-party C fixtures working by making `yurt-cc` behave like the target compiler driver, not by patching their source or imposing Yurt warning/optimization/language-standard policy.
 - Update docs to state the supported package contract: replace `clang` with `yurt-cc`; do not patch source or bypass the wrapper unless a package requires unsupported runtime semantics.
 
 ## Open Questions

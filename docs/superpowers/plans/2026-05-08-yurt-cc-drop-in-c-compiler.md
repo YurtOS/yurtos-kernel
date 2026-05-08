@@ -31,7 +31,7 @@
 - Modify `abi/Makefile`
   - Move `-O2 -std=gnu23 -Wall -Wextra` into ABI compile/link invocations that relied on wrapper defaults.
 - Modify `test-fixtures/c-ports/busybox/Makefile`
-  - Add explicit compile policy flags if the Makefile currently relies on `yurt-cc` defaults.
+  - Keep BusyBox integration environment-only; do not add Yurt compile policy flags to this third-party package build.
 - Modify `abi/Makefile`
   - Copy `abi/include` into `target/release/yurt-include` during `ensure-toolchain`, so the release binary can discover headers relative to `current_exe()`.
 - Modify root `Cargo.toml`
@@ -594,11 +594,11 @@ git add abi/toolchain/yurt-toolchain/src/main.rs abi/toolchain/yurt-toolchain/te
 git commit -m "fix: make yurt-cc compile flags package-neutral"
 ```
 
-## Task 4: Move Curated Build Policy Flags Into Makefiles
+## Task 4: Move Yurt-Owned ABI Policy Flags Into Makefiles
 
 **Files:**
 - Modify: `abi/Makefile`
-- Modify: `test-fixtures/c-ports/busybox/Makefile`
+- Inspect: `test-fixtures/c-ports/busybox/Makefile`
 
 - [ ] **Step 1: Add ABI CFLAGS to `abi/Makefile`**
 
@@ -673,26 +673,14 @@ rg -n '\$\(YURT_CC\)' abi/Makefile
 
 Expected: direct C object/canary compile lines use `$(YURT_CC) $(YURT_CFLAGS)`. Remaining matches may include comments, variable definitions, or Rust `cargo-yurt` invocations.
 
-- [ ] **Step 4: Add explicit BusyBox flags**
+- [ ] **Step 4: Verify BusyBox remains environment-only**
 
-In `test-fixtures/c-ports/busybox/Makefile`, add this after the `YURT_RANLIB` definition:
+Do not add `YURT_CFLAGS` or forced `-O2`, `-Wall`, `-Wextra`, or `-std=gnu23` to `test-fixtures/c-ports/busybox/Makefile`. BusyBox is a third-party package fixture; it should validate the drop-in compiler contract by changing tool/environment selection rather than by accepting Yurt compile policy.
 
-```make
-# yurt-cc is package-neutral; BusyBox keeps its historical curated-build
-# warning/optimization/profile flags here.
-YURT_CFLAGS := -O2 -std=gnu23 -Wall -Wextra
-```
-
-Then change the BusyBox build invocation from:
+Confirm the BusyBox build invocation still passes only compatibility/runtime environment flags:
 
 ```make
 			EXTRA_CFLAGS="$(WASI_EMULATED_CFLAGS)" \
-```
-
-to:
-
-```make
-			EXTRA_CFLAGS="$(YURT_CFLAGS) $(WASI_EMULATED_CFLAGS)" \
 ```
 
 Also check for call sites that intentionally expected no Yurt include path. If one exists, add an explicit environment switch in Task 3 before proceeding; otherwise document in the commit body that the repo's generic builds use the default include path and curated builds that set `YURT_CC_INCLUDE=$(INCLUDE)` override that default.
@@ -712,11 +700,11 @@ Expected: PASS.
 - [ ] **Step 6: Commit curated build flag migration**
 
 ```bash
-git add abi/Makefile test-fixtures/c-ports/busybox/Makefile
+git add abi/Makefile
 git commit -m "chore: move yurt C policy flags into curated builds"
 ```
 
-If BusyBox needed no changes, omit it from `git add`.
+If the BusyBox Makefile had already been changed to add `YURT_CFLAGS`, revert that hunk before committing.
 
 ## Task 5: Add Header Composition Regression Coverage
 
