@@ -111,11 +111,11 @@ export class OverlayVFS implements VfsLike {
 
   readFile(path: string): Uint8Array {
     path = normalizeOverlayPath(path);
-    if (this.whiteouts.has(path)) throw new VfsError('ENOENT', `whiteout: ${path}`);
     try {
       return this.options.upper.readFile(path);
     } catch (e) {
       if (!isEnoent(e)) throw e;
+      this.assertNotHiddenByWhiteout(path);
       return this.options.base.readFile(path);
     }
   }
@@ -151,29 +151,38 @@ export class OverlayVFS implements VfsLike {
 
   stat(path: string): StatResult {
     path = normalizeOverlayPath(path);
-    if (this.whiteouts.has(path)) throw new VfsError('ENOENT', `whiteout: ${path}`);
     try {
       return this.options.upper.stat(path);
     } catch (e) {
       if (!isEnoent(e)) throw e;
+      this.assertNotHiddenByWhiteout(path);
       return rootStatToVfsStat(this.options.base.stat(path));
     }
   }
 
   lstat(path: string): StatResult {
     path = normalizeOverlayPath(path);
-    if (this.whiteouts.has(path)) throw new VfsError('ENOENT', `whiteout: ${path}`);
     try {
       return this.options.upper.lstat(path);
     } catch (e) {
       if (!isEnoent(e)) throw e;
+      this.assertNotHiddenByWhiteout(path);
       return rootStatToVfsStat(this.options.base.lstat(path));
     }
   }
 
   readdir(path: string): DirEntry[] {
     path = normalizeOverlayPath(path);
-    if (this.whiteouts.has(path)) throw new VfsError('ENOENT', `whiteout: ${path}`);
+    let upperEntries: DirEntry[] | null = null;
+    try {
+      upperEntries = this.options.upper.readdir(path);
+    } catch (e) {
+      if (!isEnoent(e)) throw e;
+    }
+    if (this.hasWhiteoutedSelfOrAncestor(path)) {
+      if (upperEntries) return upperEntries;
+      throw new VfsError('ENOENT', `whiteout: ${this.coveringWhiteout(path)}`);
+    }
     const entries = new Map<string, DirEntry>();
     let baseFound = false;
     try {
@@ -185,10 +194,9 @@ export class OverlayVFS implements VfsLike {
     for (const whiteout of this.whiteouts) {
       if (parentPath(whiteout) === path) entries.delete(basename(whiteout));
     }
-    try {
-      for (const entry of this.options.upper.readdir(path)) entries.set(entry.name, entry);
-    } catch (e) {
-      if (!isEnoent(e)) throw e;
+    if (upperEntries) {
+      for (const entry of upperEntries) entries.set(entry.name, entry);
+    } else {
       if (!baseFound) throw new VfsError('ENOENT', `no such directory: ${path}`);
     }
     return Array.from(entries.values());
@@ -201,7 +209,6 @@ export class OverlayVFS implements VfsLike {
     this.assertNoMergedEntry(path, wasWhiteouted);
     this.ensureUpperParentDirectory(path);
     this.options.upper.mkdir(path);
-    this.whiteouts.delete(path);
     this.notifyChange();
   }
 
@@ -220,7 +227,6 @@ export class OverlayVFS implements VfsLike {
       this.ensureUpperParentDirectory(dir);
       try {
         this.options.upper.mkdir(dir);
-        this.whiteouts.delete(dir);
         changed = true;
       } catch (e) {
         if (!isEexist(e)) throw e;
@@ -350,11 +356,11 @@ export class OverlayVFS implements VfsLike {
 
   readlink(path: string): string {
     path = normalizeOverlayPath(path);
-    if (this.whiteouts.has(path)) throw new VfsError('ENOENT', `whiteout: ${path}`);
     try {
       return this.options.upper.readlink(path);
     } catch (e) {
       if (!isEnoent(e)) throw e;
+      this.assertNotHiddenByWhiteout(path);
       return this.options.base.readlink(path);
     }
   }
@@ -725,12 +731,12 @@ export class OverlayVFS implements VfsLike {
 
   private lookupMerged(path: string): StatResult | null {
     path = normalizeOverlayPath(path);
-    if (this.whiteouts.has(path)) return null;
     try {
       return this.options.upper.lstat(path);
     } catch (e) {
       if (!isEnoent(e)) throw e;
     }
+    if (this.hasWhiteoutedSelfOrAncestor(path)) return null;
     try {
       return rootStatToVfsStat(this.options.base.lstat(path));
     } catch (e) {
@@ -747,6 +753,7 @@ export class OverlayVFS implements VfsLike {
     } catch (e) {
       if (!isEnoent(e)) throw e;
     }
+    if (this.hasWhiteoutedSelfOrAncestor(path)) return;
     if (!allowBaseWhiteout) {
       try {
         this.options.base.lstat(path);
@@ -761,7 +768,6 @@ export class OverlayVFS implements VfsLike {
     path = normalizeOverlayPath(path);
     const parent = parentPath(path);
     if (parent === '/') return;
-    this.assertNoWhiteoutedAncestor(path);
     try {
       const st = this.options.upper.stat(parent);
       if (st.type !== 'dir') throw new VfsError('ENOTDIR', `not a directory: ${parent}`);
@@ -779,6 +785,12 @@ export class OverlayVFS implements VfsLike {
         } catch (e) {
           if (!isEnoent(e)) throw e;
         }
+        if (this.hasWhiteoutedSelfOrAncestor(dir)) {
+          this.options.upper.mkdir(dir);
+          if (this.options.upper.chown) this.options.upper.chown(dir, this.credential.uid, this.credential.gid);
+          this.options.upper.chmod(dir, 0o755);
+          continue;
+        }
         const st = rootStatToVfsStat(this.options.base.stat(dir));
         if (st.type !== 'dir') throw new VfsError('ENOTDIR', `not a directory: ${dir}`);
         this.options.upper.mkdir(dir);
@@ -795,5 +807,23 @@ export class OverlayVFS implements VfsLike {
         throw new VfsError('ENOENT', `whiteout ancestor: ${ancestor}`);
       }
     }
+  }
+
+  private coveringWhiteout(path: string): string | null {
+    path = normalizeOverlayPath(path);
+    if (this.whiteouts.has(path)) return path;
+    for (const ancestor of ancestorPaths(parentPath(path)).reverse()) {
+      if (this.whiteouts.has(ancestor)) return ancestor;
+    }
+    return null;
+  }
+
+  private hasWhiteoutedSelfOrAncestor(path: string): boolean {
+    return this.coveringWhiteout(path) !== null;
+  }
+
+  private assertNotHiddenByWhiteout(path: string): void {
+    const whiteout = this.coveringWhiteout(path);
+    if (whiteout) throw new VfsError('ENOENT', `whiteout: ${whiteout}`);
   }
 }
