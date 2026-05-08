@@ -149,6 +149,36 @@ fn dry_run_does_not_force_compile_policy_flags() {
 }
 
 #[test]
+fn dry_run_strips_elf_linker_flags_that_wasm_ld_rejects() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .arg("--dry-run")
+            .arg("foo.o")
+            .arg("-Wl,--start-group")
+            .arg("-Wl,--warn-common,-Map,foo.map,--verbose")
+            .arg("-Wl,--sort-common")
+            .arg("-Wl,--sort-section,alignment")
+            .arg("-Wl,--end-group")
+            .arg("-o")
+            .arg("foo.wasm")
+            .output()
+            .unwrap(),
+    );
+
+    assert!(stdout.contains("foo.o"), "{stdout}");
+    assert!(stdout.contains("-o foo.wasm"), "{stdout}");
+    assert!(stdout.contains("-Wl,-Map,foo.map,--verbose"), "{stdout}");
+    assert!(!stdout.contains("--start-group"), "{stdout}");
+    assert!(!stdout.contains("--end-group"), "{stdout}");
+    assert!(!stdout.contains("--warn-common"), "{stdout}");
+    assert!(!stdout.contains("--sort-common"), "{stdout}");
+    assert!(!stdout.contains("--sort-section"), "{stdout}");
+}
+
+#[test]
 fn dry_run_discovers_default_yurt_include_after_user_includes() {
     let sdk = fake_sdk();
 

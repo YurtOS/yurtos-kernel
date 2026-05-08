@@ -109,7 +109,9 @@ fn build_clang_invocation(
     argv.push(format!("--sysroot={}", sdk.sysroot().display()).into());
     argv.push("--target=wasm32-wasip1".into());
     for a in user_args {
-        argv.push(a.into());
+        if let Some(filtered) = filter_unsupported_wasm_link_arg(a) {
+            argv.push(filtered.into());
+        }
     }
 
     if let Some(inc) = env.include.as_ref() {
@@ -186,6 +188,33 @@ fn build_clang_invocation(
         argv.push("-DYURT_USE_SETJMP=1".into());
     }
     argv
+}
+
+fn filter_unsupported_wasm_link_arg(arg: &str) -> Option<String> {
+    let Some(wl) = arg.strip_prefix("-Wl,") else {
+        return Some(arg.to_string());
+    };
+    let filtered: Vec<&str> = wl
+        .split(',')
+        .filter(|part| {
+            !matches!(
+                *part,
+                "--start-group"
+                    | "--end-group"
+                    | "--warn-common"
+                    | "--sort-common"
+                    | "--sort-section"
+                    | "alignment"
+            )
+        })
+        .collect();
+    if filtered.is_empty() {
+        None
+    } else if filtered.len() == wl.split(',').count() {
+        Some(arg.to_string())
+    } else {
+        Some(format!("-Wl,{}", filtered.join(",")))
+    }
 }
 
 fn main() -> Result<ExitCode> {

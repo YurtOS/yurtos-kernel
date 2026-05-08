@@ -82,14 +82,7 @@ configure: fetch busybox.config ensure-toolchain
 		mv .config.merged .config && \
 		rm -rf include/config include/autoconf.h && \
 		sleep 1 && \
-		$(MAKE) CC="$(YURT_CC)" AR="$(YURT_AR)" RANLIB="$(YURT_RANLIB)" silentoldconfig && \
-		sed -i.bak \
-			-e 's|^START_GROUP=.*|START_GROUP=""|' \
-			-e 's|^END_GROUP=.*|END_GROUP=""|' \
-			-e 's|-Wl,--warn-common||g' \
-			-e 's|-Wl,--sort-common||g' \
-			-e 's|-Wl,--sort-section,alignment||g' \
-			scripts/trylink
+		$(MAKE) CC="$(YURT_CC)" AR="$(YURT_AR)" RANLIB="$(YURT_RANLIB)" silentoldconfig
 
 $(BUILD_DIR)/busybox.wasm: configure ensure-compat
 	cd $(SRC_DIR) && \
