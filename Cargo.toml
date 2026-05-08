@@ -4,6 +4,7 @@ members = [
   "test-fixtures/yurt-process",
   "test-fixtures/shell",
   "test-fixtures/shell-exec",
+  "test-fixtures/zstd-sys-smoke",
   "abi/toolchain/yurt-toolchain",
   "abi/rust/yurt-abi-sys",
   "abi/rust/yurt-abi",

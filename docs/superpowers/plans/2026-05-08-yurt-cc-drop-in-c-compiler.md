@@ -846,7 +846,7 @@ git commit -m "test: cover yurt compatibility header composition"
 - Create: `test-fixtures/zstd-sys-smoke/Cargo.toml`
 - Create: `test-fixtures/zstd-sys-smoke/src/lib.rs`
 
-- [ ] **Step 1: Add the workspace member**
+- [x] **Step 1: Add the workspace member**
 
 In root `Cargo.toml`, add this member near the other `test-fixtures` entries:
 
@@ -856,7 +856,7 @@ In root `Cargo.toml`, add this member near the other `test-fixtures` entries:
 
 Do not add it to `default-members`; it is a targeted wasm dependency smoke fixture.
 
-- [ ] **Step 2: Create the fixture manifest**
+- [x] **Step 2: Create the fixture manifest**
 
 Create `test-fixtures/zstd-sys-smoke/Cargo.toml`:
 
@@ -871,12 +871,12 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-zstd-sys = "=2.0.16+zstd.1.5.7"
+zstd-sys = "=2.0.16"
 ```
 
-If `yurt-pkg`'s `Cargo.lock` shows a different failing `zstd-sys` version, replace this exact version with that lockfile version before committing. The fixture must stay deterministic rather than tracking the latest compatible `2.x` release.
+This resolves to the locked `zstd-sys` package version `2.0.16+zstd.1.5.7`; Cargo ignores build metadata in dependency requirements and warns if the requirement includes `+zstd.1.5.7`. If `yurt-pkg`'s `Cargo.lock` shows a different failing `zstd-sys` base version, replace this exact version with that lockfile version before committing. The fixture must stay deterministic rather than tracking the latest compatible `2.x` release.
 
-- [ ] **Step 3: Create the fixture source**
+- [x] **Step 3: Create the fixture source**
 
 Create `test-fixtures/zstd-sys-smoke/src/lib.rs`:
 
@@ -886,7 +886,7 @@ pub fn zstd_sys_smoke() -> i32 {
 }
 ```
 
-- [ ] **Step 4: Run metadata/check for the fixture**
+- [x] **Step 4: Run metadata/check for the fixture**
 
 Run:
 
@@ -896,7 +896,9 @@ cargo check -p zstd-sys-smoke --target wasm32-wasip1
 
 Expected: this may fail before the full wrapper fix if wasi-sdk or target dependencies are missing locally, but Cargo should recognize the package and update `Cargo.lock`. If it fails because the wasm target is unavailable, install/use the existing project target setup and rerun.
 
-- [ ] **Step 5: Commit the fixture**
+Result: `cargo check -p zstd-sys-smoke --target wasm32-wasip1` recognized the package and updated `Cargo.lock`; plain Cargo then failed in `zstd-sys` because cc-rs invoked host `clang` for `wasm32-wasip1`. The Task 7 `cargo-yurt` acceptance is the real drop-in compiler check.
+
+- [x] **Step 5: Commit the fixture**
 
 ```bash
 git add Cargo.toml Cargo.lock test-fixtures/zstd-sys-smoke
