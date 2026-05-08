@@ -11,7 +11,11 @@ fn main() {
         file.write_all(b"yurt").unwrap();
     }
 
-    let file = OpenOptions::new().read(true).write(true).open(path).unwrap();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
     let permissions = fs::metadata(path).unwrap().permissions();
     fs::set_permissions(path, permissions.clone()).unwrap();
     file.set_permissions(permissions).unwrap();

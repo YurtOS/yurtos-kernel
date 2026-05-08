@@ -6,5 +6,7 @@ fn main() {
     let local = stream.local_addr().expect("local addr");
 
     println!("local={local}");
-    assert!(matches!(local, SocketAddr::V4(v4) if *v4.ip() == Ipv4Addr::new(10, 0, 2, 15) && v4.port() >= 49152));
+    assert!(
+        matches!(local, SocketAddr::V4(v4) if *v4.ip() == Ipv4Addr::new(10, 0, 2, 15) && v4.port() >= 49152)
+    );
 }

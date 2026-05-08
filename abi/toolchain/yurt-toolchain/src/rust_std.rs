@@ -14,9 +14,7 @@ pub fn rustc_version_key(version_output: &str) -> Option<String> {
 }
 
 pub fn discover_built_std(repo_root: &Path, rust_key: &str) -> Option<PathBuf> {
-    let root = repo_root
-        .join("abi/build/rust-std")
-        .join(rust_key);
+    let root = repo_root.join("abi/build/rust-std").join(rust_key);
     let lib = root.join("lib/rustlib/wasm32-wasip1/lib");
     if lib.is_dir() {
         Some(root)

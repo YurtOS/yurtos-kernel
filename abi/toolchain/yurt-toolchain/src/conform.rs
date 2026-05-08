@@ -16,7 +16,12 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
         ("getgroups-canary", &["getgroups"]),
         (
             "posix-runtime-canary",
-            &["gethostname", "if_indextoname", "if_nametoindex", "sendfile"],
+            &[
+                "gethostname",
+                "if_indextoname",
+                "if_nametoindex",
+                "sendfile",
+            ],
         ),
         (
             "socket-canary",

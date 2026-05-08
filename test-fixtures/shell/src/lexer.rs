@@ -249,7 +249,9 @@ pub fn lex(input: &str) -> Vec<Token> {
                     // Just skip; no redirect token emitted
                 } else {
                     // >&1, >&2, etc — encode as StdoutOverwrite("&N")
-                    tokens.push(Token::Redirect(RedirectType::StdoutOverwrite(format!("&{fd}"))));
+                    tokens.push(Token::Redirect(RedirectType::StdoutOverwrite(format!(
+                        "&{fd}"
+                    ))));
                 }
             } else {
                 pos += 1;
@@ -1158,7 +1160,9 @@ fn parse_braced_var(content: &str) -> WordPart {
         }
     }
 
-    for op in &[":-", ":=", ":+", ":?", "##", "/#", "%%", "/%", "#", "%", "//", "/"] {
+    for op in &[
+        ":-", ":=", ":+", ":?", "##", "/#", "%%", "/%", "#", "%", "//", "/",
+    ] {
         if let Some(idx) = content.find(op) {
             return WordPart::ParamExpansion {
                 var: content[..idx].to_string(),

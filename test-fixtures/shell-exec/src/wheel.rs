@@ -92,8 +92,7 @@ mod tests {
         // dist-info (should be skipped)
         zip.start_file("tabulate-0.9.0.dist-info/METADATA", options)
             .unwrap();
-        zip.write_all(b"Name: tabulate\nVersion: 0.9.0\n")
-            .unwrap();
+        zip.write_all(b"Name: tabulate\nVersion: 0.9.0\n").unwrap();
 
         zip.start_file("tabulate-0.9.0.dist-info/RECORD", options)
             .unwrap();

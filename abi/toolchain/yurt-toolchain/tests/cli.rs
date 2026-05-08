@@ -373,6 +373,26 @@ fn preprocess_only_skips_archive_validation_even_when_archive_is_invalid() {
 }
 
 #[test]
+fn clang_query_invocations_skip_archive_validation_even_when_archive_is_invalid() {
+    let sdk = fake_sdk();
+
+    for arg in ["-print-search-dirs", "-v"] {
+        let out = Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .env("YURT_CC_ARCHIVE", sdk.path().join("missing-libyurt_abi.a"))
+            .arg(arg)
+            .output()
+            .unwrap();
+
+        assert!(
+            out.status.success(),
+            "{arg} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn link_shaped_probe_can_disable_yurt_link_injection() {
     let sdk = fake_sdk();
 

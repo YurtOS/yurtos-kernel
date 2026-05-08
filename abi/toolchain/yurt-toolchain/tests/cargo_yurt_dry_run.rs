@@ -247,8 +247,7 @@ fn repo_local_std_is_composed_when_manifest_opts_in() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");
     let nested = repo.join("nested/project");
-    let std_lib =
-        repo.join("abi/build/rust-std/1.93.0/lib/rustlib/wasm32-wasip1/lib");
+    let std_lib = repo.join("abi/build/rust-std/1.93.0/lib/rustlib/wasm32-wasip1/lib");
     std::fs::create_dir_all(&nested).unwrap();
     std::fs::create_dir_all(&std_lib).unwrap();
     let manifest = nested.join("Cargo.toml");

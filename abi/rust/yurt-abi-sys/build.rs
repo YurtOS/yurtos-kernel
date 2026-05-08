@@ -35,9 +35,7 @@ fn main() {
 
     if env::var("YURT_LINK_INJECTED").is_ok() {
         // Path 2: cargo-yurt already injected via RUSTFLAGS.
-        println!(
-            "cargo:warning=yurt-abi-sys: YURT_LINK_INJECTED set, skipping link directives"
-        );
+        println!("cargo:warning=yurt-abi-sys: YURT_LINK_INJECTED set, skipping link directives");
         return;
     }
 

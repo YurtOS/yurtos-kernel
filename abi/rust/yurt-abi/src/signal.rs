@@ -13,9 +13,13 @@ fn errno() -> c_int {
     // SAFETY: both accessors return a valid pointer to thread-local errno.
     unsafe {
         #[cfg(target_os = "linux")]
-        { *libc::__errno_location() }
+        {
+            *libc::__errno_location()
+        }
         #[cfg(not(target_os = "linux"))]
-        { *libc::__error() }
+        {
+            *libc::__error()
+        }
     }
 }
 

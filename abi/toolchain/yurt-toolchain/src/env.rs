@@ -41,14 +41,14 @@ impl Env {
                 "YURT_CC_CONTINUATION_ARCHIVE",
                 "YURT_CC_SETJMP_ARCHIVE",
             ])
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .or_else(|| {
-                    let archive = var_os(["YURT_CC_ARCHIVE"])
-                        .filter(|v| !v.is_empty())
-                        .map(PathBuf::from)?;
-                    Some(archive.with_file_name("libyurt_continuation.a"))
-                }),
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| {
+                let archive = var_os(["YURT_CC_ARCHIVE"])
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)?;
+                Some(archive.with_file_name("libyurt_continuation.a"))
+            }),
             include: var_os(["YURT_CC_INCLUDE"])
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),

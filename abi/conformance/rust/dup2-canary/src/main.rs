@@ -77,7 +77,10 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let exit = match argv.len() {
         1 => smoke_mode(),
-        2 if argv[1] == "--list-cases" => { list_cases(); 0 }
+        2 if argv[1] == "--list-cases" => {
+            list_cases();
+            0
+        }
         3 if argv[1] == "--case" => run_case(&argv[2]),
         _ => {
             eprintln!("usage: dup2-canary [--case <name> | --list-cases]");

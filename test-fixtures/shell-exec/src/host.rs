@@ -903,4 +903,3 @@ pub fn read_from_fd(fd: i32, buf: &mut [u8]) -> Result<usize, HostError> {
     }
     Ok(nread as usize)
 }
-

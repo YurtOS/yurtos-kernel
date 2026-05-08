@@ -9,7 +9,6 @@
 //! so the child runs at the requested epoch quantum.
 
 use std::io;
-use std::process::ExitStatus as StdExitStatus;
 
 // ── Host ABI ──────────────────────────────────────────────────────────────────
 
@@ -65,7 +64,11 @@ pub struct Command {
 impl Command {
     /// Create a new command for `program`.
     pub fn new(program: impl Into<String>) -> Self {
-        Command { program: program.into(), args: Vec::new(), nice: 0 }
+        Command {
+            program: program.into(),
+            args: Vec::new(),
+            nice: 0,
+        }
     }
 
     /// Append a single argument.
@@ -108,10 +111,7 @@ impl Command {
 
         let pid = unsafe { host_spawn_async(req_bytes.as_ptr(), req_bytes.len()) };
         if pid < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("host_spawn_async failed: {pid}"),
-            ));
+            return Err(io::Error::other(format!("host_spawn_async failed: {pid}")));
         }
 
         // Wait for child; read exit code from JSON response.
@@ -166,7 +166,9 @@ fn parse_exit_code(json: &[u8]) -> i32 {
     // Find `"exit_code":` then parse the integer that follows.
     if let Some(pos) = s.find("\"exit_code\":") {
         let rest = s[pos + 12..].trim_start();
-        let end = rest.find(|c: char| !c.is_ascii_digit() && c != '-').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '-')
+            .unwrap_or(rest.len());
         rest[..end].parse().unwrap_or(1)
     } else {
         1

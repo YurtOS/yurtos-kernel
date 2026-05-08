@@ -28,9 +28,51 @@ fn is_compile_or_probe_invocation(user_args: &[String]) -> bool {
     // intermediate .o files and cause duplicate-symbol errors when the final
     // link re-injects the archive. Only the final executable link step gets
     // the injection.
-    user_args
-        .iter()
-        .any(|a| a == "-c" || a == "-E" || a == "-S" || a == "-r" || a == "--relocatable")
+    user_args.is_empty()
+        || is_query_only_invocation(user_args)
+        || user_args
+            .iter()
+            .any(|a| a == "-c" || a == "-E" || a == "-S" || a == "-r" || a == "--relocatable")
+}
+
+fn is_query_only_invocation(user_args: &[String]) -> bool {
+    user_args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "-v" | "-###"
+                | "--version"
+                | "-dumpmachine"
+                | "-dumpversion"
+                | "-print-search-dirs"
+                | "--print-search-dirs"
+                | "-print-resource-dir"
+                | "--print-resource-dir"
+                | "-print-target-triple"
+                | "-print-libgcc-file-name"
+        ) || a.starts_with("-print-file-name=")
+            || a.starts_with("-print-prog-name=")
+    }) && !has_compile_or_link_input(user_args)
+}
+
+fn has_compile_or_link_input(user_args: &[String]) -> bool {
+    let mut skip_next = false;
+    for arg in user_args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "-o" | "-I" | "-isystem" | "-iquote" | "-include" | "-L" | "-x"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if arg == "-" || !arg.starts_with('-') {
+            return true;
+        }
+    }
+    false
 }
 
 fn is_final_yurt_link_invocation(env: &env::Env, user_args: &[String]) -> bool {

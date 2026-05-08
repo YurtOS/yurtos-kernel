@@ -1611,11 +1611,8 @@ pub fn exec_command(
             // child writes straight to fd 1 and the redirect silently
             // disappears — which is exactly how `… | tsort >actual`
             // ended up with an empty `actual` file in the BusyBox tests.
-            let mut last_stage_stdout_sink: Option<(
-                i32,
-                i32,
-                Vec<yurt_shell::ast::Redirect>,
-            )> = None;
+            let mut last_stage_stdout_sink: Option<(i32, i32, Vec<yurt_shell::ast::Redirect>)> =
+                None;
 
             for (i, cmd) in commands.iter().enumerate() {
                 // Set up fds for this pipeline stage:
@@ -2060,7 +2057,13 @@ pub fn exec_command(
                 let _ = host.close_fd(r);
                 let mut sink_stdout = String::from_utf8_lossy(&data).to_string();
                 let mut sink_stderr = String::new();
-                apply_output_redirects(state, host, &sink_redirects, &mut sink_stdout, &mut sink_stderr)?;
+                apply_output_redirects(
+                    state,
+                    host,
+                    &sink_redirects,
+                    &mut sink_stdout,
+                    &mut sink_stderr,
+                )?;
                 if !sink_stderr.is_empty() {
                     let _ = host.write_fd(2, sink_stderr.as_bytes());
                 }
@@ -2098,8 +2101,8 @@ pub fn exec_command(
         Command::List { left, op, right } => {
             // For && and ||, suppress errexit during evaluation (bash spec)
             let suppress_errexit = matches!(op, ListOp::And | ListOp::Or);
-            let had_errexit = suppress_errexit
-                && state.flags.contains(&crate::state::ShellFlag::Errexit);
+            let had_errexit =
+                suppress_errexit && state.flags.contains(&crate::state::ShellFlag::Errexit);
             if suppress_errexit && had_errexit {
                 state.flags.remove(&crate::state::ShellFlag::Errexit);
             }
@@ -2150,7 +2153,10 @@ pub fn exec_command(
                     // Exception: suppress if left side was &&/|| (bash spec).
                     let left_is_andor = matches!(
                         left.as_ref(),
-                        Command::List { op: ListOp::And | ListOp::Or, .. }
+                        Command::List {
+                            op: ListOp::And | ListOp::Or,
+                            ..
+                        }
                     );
                     if state.flags.contains(&crate::state::ShellFlag::Errexit)
                         && left_run.exit_code != 0
@@ -6729,8 +6735,3 @@ mod tests {
         assert_eq!(stdout, "world\n");
     }
 }
-
-
-
-
-

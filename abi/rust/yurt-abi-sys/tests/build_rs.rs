@@ -26,7 +26,7 @@ fn build_rs_binary() -> PathBuf {
         }
     }
     // Persist by leaking the tempdir — we want the binary to outlive `dir`.
-    let _ = dir.into_path();
+    let _ = dir.keep();
     bin
 }
 

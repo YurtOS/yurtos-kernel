@@ -799,7 +799,9 @@ fn expand_param(state: &mut ShellState, var: &str, op: &str, operand: &str) -> S
                     }
                 }
                 // String length of variable value: ${#VAR}
-                let v = state.env.get(operand)
+                let v = state
+                    .env
+                    .get(operand)
                     .or_else(|| state.env.get(operand))
                     .cloned()
                     .unwrap_or_default();
@@ -906,7 +908,11 @@ fn expand_param(state: &mut ShellState, var: &str, op: &str, operand: &str) -> S
                     if let Some(assoc) = state.assoc_arrays.get(&arr_name) {
                         let mut keys: Vec<&String> = assoc.keys().collect();
                         keys.sort();
-                        return keys.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(" ");
+                        return keys
+                            .iter()
+                            .map(|k| k.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ");
                     }
                     return String::new();
                 }

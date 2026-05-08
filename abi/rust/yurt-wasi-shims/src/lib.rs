@@ -20,7 +20,6 @@ use std::path::PathBuf;
 /// Rust's wasip1 stdlib hard-panics with "no filesystem on wasm" —
 /// `/tmp` is the POSIX convention and the directory that wasmtime
 /// runtimes typically preopen via `--dir=/tmp`.
-#[no_mangle]
 #[export_name = "__yurt_wasi_shim_env_temp_dir"]
 pub extern "Rust" fn env_temp_dir() -> PathBuf {
     PathBuf::from("/tmp")

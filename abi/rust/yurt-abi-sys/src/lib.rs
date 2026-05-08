@@ -11,4 +11,4 @@
 
 /// Compile-time version constant matching YURT_ABI_VERSION_MAJOR/MINOR
 /// in `abi/include/yurt_abi.h` (§Versioning).
-pub const VERSION: u32 = (1 << 16) | 0;
+pub const VERSION: u32 = 1 << 16;
