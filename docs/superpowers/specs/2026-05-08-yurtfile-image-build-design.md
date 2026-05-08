@@ -40,8 +40,13 @@ instructions it is given.
 
 ## File Model
 
-The default file name is `Yurtfile`. The CLI accepts an explicit file with
-`-f, --file <path>`.
+The conventional file name is `Yurtfile`. The first implementation only uses a
+build file when the caller passes `-f, --file <path>`.
+
+`yurt image build -o out.yurtimg` must keep the existing flag-mode behavior and
+fail because no `--empty` flag or base image was provided. It must not
+implicitly discover `./Yurtfile`, because that would change the current parser
+contract and could execute a recipe when the caller intended a flag-only build.
 
 The first non-comment instruction must be `FROM`:
 
@@ -114,6 +119,18 @@ path must be absolute.
 filesystem. It uses argv-native execution, not shell string execution. The
 command's writes are included in later instructions and in the exported image.
 
+Build-file `RUN` starts with explicit defaults matching the current
+`YurtImageBuilder` runtime:
+
+- `cwd`: `/`
+- `HOME`: `/`
+- `PATH`: `/bin:/usr/bin`
+- `PWD`: `/`
+- `USER`: `root`
+
+Future `WORKDIR` or `ENV` instructions may alter these defaults, but the first
+implementation does not include those instructions.
+
 ### HOSTRUN
 
 `HOSTRUN <argv...>` runs a command on the host. It exists for producing artifacts
@@ -156,13 +173,24 @@ If the file contains `HOSTRUN`, the caller must opt in:
 yurt image build -f Yurtfile -o out.yurtimg --allow-hostrun
 ```
 
-Without `--allow-hostrun`, parsing may succeed but execution fails before the
-first host command with an error naming the instruction and the required flag.
+Without `--allow-hostrun`, parsing may succeed but preflight fails before any
+instruction executes. The error must name the first `HOSTRUN` instruction and
+the required flag.
 
-The first implementation should reject mixing build-file instructions with
-operation flags such as `--copy`, `--chmod`, `--rm`, and `--run`. `-o/--output`
-and `--allow-hostrun` remain CLI-level options. This avoids ambiguous ordering
-between file instructions and CLI operations.
+The first implementation should reject mixing `-f/--file` with build-source
+inputs or operation flags:
+
+- `--empty`;
+- a positional base image;
+- `--copy`;
+- `--chmod`;
+- `--chown`;
+- `--rm`;
+- `--run`.
+
+`-o/--output` and `--allow-hostrun` remain CLI-level options. This avoids
+ambiguous ordering between `FROM` and CLI base inputs, and between file
+instructions and CLI operations.
 
 ## Parsing Rules
 
@@ -188,7 +216,8 @@ from top to bottom:
 
 1. Create `YurtImageBuilder.empty(...)` for `FROM empty`, or
    `YurtImageBuilder.create({ baseImage })` for a base image.
-2. For each instruction:
+2. Run preflight checks, including the `HOSTRUN` permission gate.
+3. For each instruction:
    - `COPY` calls `builder.copyIn`.
    - `CHMOD` calls `builder.chmod`.
    - `CHOWN` calls `builder.chown`.
@@ -196,12 +225,18 @@ from top to bottom:
    - `RUN` calls `builder.run`.
    - `HOSTRUN` uses `Deno.Command` or the Node equivalent available to the CLI
      runtime.
-3. Stop at the first failed instruction.
-4. Export the image only if all instructions succeed.
+4. Stop at the first failed instruction.
+5. Export the image only if all instructions succeed.
 
 This differs from the current `--run` flag behavior, which writes the image even
 when the command exits non-zero. For build files, a failed ordered step means the
 recipe failed and should not produce a new output image.
+
+Output writes must be atomic for build-file mode: write the exported image bytes
+to a temporary file in the output directory, then rename that file to the final
+output path only after every instruction succeeds and export completes. If
+parsing, preflight, an instruction, or export fails, an existing output image
+must remain untouched.
 
 ## Error Handling
 
@@ -242,6 +277,7 @@ Add focused Deno tests for:
 - running `HOSTRUN` with `--allow-hostrun`, then copying its generated artifact
   into the image;
 - stopping on a failing `RUN` without writing the output image;
+- preserving an existing output image when a build-file instruction fails;
 - rejecting mixed `-f` and operation flags.
 
 ## Documentation
