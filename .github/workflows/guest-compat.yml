@@ -56,6 +56,14 @@ jobs:
       - name: Build guest compat canaries
         run: make -C abi all copy-fixtures
 
+      - name: Build zstd-sys through cargo-yurt
+        env:
+          CC_wasm32_wasip1: ${{ github.workspace }}/target/release/yurt-cc
+          AR_wasm32_wasip1: ${{ github.workspace }}/target/release/yurt-ar
+          RANLIB_wasm32_wasip1: ${{ github.workspace }}/target/release/yurt-ranlib
+          YURT_CC_ARCHIVE: ${{ github.workspace }}/abi/build/libyurt_abi.a
+        run: env -u YURT_CC_INCLUDE target/release/cargo-yurt build --release -p zstd-sys-smoke
+
       - name: Build Rust std canaries
         run: |
           set -euxo pipefail
