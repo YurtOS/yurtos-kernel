@@ -252,3 +252,251 @@ Deno.test("yurt image build rejects --allow-hostrun without a Yurtfile", async (
     "--allow-hostrun requires -f/--file",
   );
 });
+
+Deno.test("yurt image build gates HOSTRUN before execution", async () => {
+  const dir = await mkdtemp("/tmp/yurt-cli-hostrun-gate-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  const marker = join(dir, "marker.txt");
+  await writeFile(file, `FROM empty\nHOSTRUN printf touched > ${marker}\n`);
+  await writeFile(out, "existing");
+
+  const result = await new Deno.Command(deno, {
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-run",
+      "--allow-env",
+      CLI,
+      "image",
+      "build",
+      "-f",
+      file,
+      "-o",
+      out,
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+
+  assertEquals(result.code, 2);
+  assertStringIncludes(
+    dec.decode(result.stderr),
+    "HOSTRUN requires --allow-hostrun",
+  );
+  assertEquals(await readFile(out, "utf8"), "existing");
+  try {
+    await readFile(marker);
+    throw new Error("expected HOSTRUN marker not to exist");
+  } catch (error) {
+    assertStringIncludes(String(error), "ENOENT");
+  }
+});
+
+Deno.test("yurt image build runs allowed HOSTRUN through shell", async () => {
+  const dir = await mkdtemp("/tmp/yurt-cli-hostrun-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await writeFile(
+    file,
+    [
+      "FROM empty",
+      "HOSTRUN printf shell-generated > generated.txt",
+      "COPY generated.txt /etc/generated.txt",
+    ].join("\n"),
+  );
+
+  const result = await new Deno.Command(deno, {
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-run",
+      "--allow-env",
+      CLI,
+      "image",
+      "build",
+      "-f",
+      file,
+      "-o",
+      out,
+      "--allow-hostrun",
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+
+  assertEquals(result.code, 0, dec.decode(result.stderr));
+  const root = await rootFromFile(out);
+  assertEquals(
+    dec.decode(root.readFile("/etc/generated.txt")),
+    "shell-generated",
+  );
+});
+
+Deno.test("yurt image build preserves existing output after failing HOSTRUN", async () => {
+  const dir = await mkdtemp("/tmp/yurt-cli-hostrun-fail-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await writeFile(file, "FROM empty\nHOSTRUN exit 7\n");
+  await writeFile(out, "existing");
+
+  const result = await new Deno.Command(deno, {
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-run",
+      "--allow-env",
+      CLI,
+      "image",
+      "build",
+      "-f",
+      file,
+      "-o",
+      out,
+      "--allow-hostrun",
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+
+  assertEquals(result.code, 7);
+  assertStringIncludes(
+    dec.decode(result.stderr),
+    "HOSTRUN exited with status 7",
+  );
+  assertEquals(await readFile(out, "utf8"), "existing");
+});
+
+Deno.test("yurt image build preserves existing output after failing RUN", async () => {
+  const dir = await mkdtemp("/tmp/yurt-cli-run-fail-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await writeFile(
+    file,
+    [
+      "FROM empty",
+      `COPY ${
+        resolve(
+          "packages/kernel/src/platform/__tests__/fixtures/false-cmd.wasm",
+        )
+      } /bin/false`,
+      "CHMOD 555 /bin/false",
+      "RUN /bin/false",
+    ].join("\n"),
+  );
+  await writeFile(out, "existing");
+
+  const result = await new Deno.Command(deno, {
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-run",
+      "--allow-env",
+      CLI,
+      "image",
+      "build",
+      "-f",
+      file,
+      "-o",
+      out,
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+
+  assertEquals(result.code, 1);
+  assertStringIncludes(dec.decode(result.stderr), "RUN exited with status 1");
+  assertEquals(await readFile(out, "utf8"), "existing");
+});
+
+Deno.test("yurt image build resolves relative FROM from Yurtfile directory", async () => {
+  const dir = await mkdtemp("/tmp/yurt-cli-relative-from-");
+  const subdir = join(dir, "build");
+  const otherCwd = join(dir, "other-cwd");
+  await Deno.mkdir(subdir);
+  await Deno.mkdir(otherCwd);
+  const base = join(dir, "base.yurtimg");
+  const file = join(subdir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  const vfs = new VFS({ layout: "empty" });
+  vfs.withWriteAccess(() => {
+    vfs.mkdir("/etc");
+    vfs.writeFile("/etc/base.txt", enc.encode("base"));
+  });
+  await writeFile(base, await exportVfsToYurtImage(vfs));
+  await writeFile(file, "FROM ../base.yurtimg\n");
+
+  const result = await new Deno.Command(deno, {
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-run",
+      "--allow-env",
+      CLI,
+      "image",
+      "build",
+      "-f",
+      file,
+      "-o",
+      out,
+    ],
+    cwd: otherCwd,
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+
+  assertEquals(result.code, 0, dec.decode(result.stderr));
+  const root = await rootFromFile(out);
+  assertEquals(dec.decode(root.readFile("/etc/base.txt")), "base");
+});
+
+Deno.test("yurt image build --help documents Yurtfile and HOSTRUN", async () => {
+  const result = await new Deno.Command(deno, {
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-run",
+      "--allow-env",
+      CLI,
+      "image",
+      "build",
+      "--help",
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+
+  assertEquals(result.code, 0);
+  const stdout = dec.decode(result.stdout);
+  assertStringIncludes(stdout, "yurt image build -f <Yurtfile>");
+  assertStringIncludes(stdout, "--allow-hostrun");
+});
+
+Deno.test("yurt image build -h documents Yurtfile and HOSTRUN", async () => {
+  const result = await new Deno.Command(deno, {
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-run",
+      "--allow-env",
+      CLI,
+      "image",
+      "build",
+      "-h",
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+
+  assertEquals(result.code, 0);
+  const stdout = dec.decode(result.stdout);
+  assertStringIncludes(stdout, "yurt image build -f <Yurtfile>");
+  assertStringIncludes(stdout, "--allow-hostrun");
+});
