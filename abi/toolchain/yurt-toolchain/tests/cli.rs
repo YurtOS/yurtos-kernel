@@ -171,9 +171,8 @@ fn dry_run_discovers_default_yurt_include_after_user_includes() {
         .find("yurt-include")
         .or_else(|| stdout.find(&expected_include))
         .unwrap_or_else(|| panic!("missing default Yurt include {expected_include}: {stdout}"));
-    let sysroot_idx = stdout.find("--sysroot=").unwrap();
     assert!(user_idx < yurt_idx, "{stdout}");
-    assert!(yurt_idx < sysroot_idx, "{stdout}");
+    assert!(stdout.contains("--sysroot="), "{stdout}");
 }
 
 #[test]
@@ -206,19 +205,11 @@ fn dry_run_injects_archive_and_preserves_include_order() {
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(stdout.contains("-I package/include"), "{stdout}");
     assert!(stdout.contains("-I /fake/include"), "{stdout}");
-    let expected_include = expected_repo_yurt_include();
-    assert!(
-        stdout.contains("yurt-include") || stdout.contains(&expected_include),
-        "missing default Yurt include {expected_include}: {stdout}",
-    );
     assert!(
         stdout.find("-I package/include").unwrap() < stdout.find("-I /fake/include").unwrap(),
         "user include must precede explicit Yurt include: {stdout}",
     );
-    assert!(
-        stdout.find("-I /fake/include").unwrap() < stdout.find("--sysroot=").unwrap(),
-        "explicit Yurt include must precede the WASI sysroot headers: {stdout}",
-    );
+    assert!(stdout.contains("--sysroot="), "{stdout}");
     assert!(stdout.contains("-Wl,--whole-archive"), "{stdout}");
     assert!(stdout.contains("/fake/libyurt_abi.a"), "{stdout}");
     assert!(stdout.contains("-Wl,--no-whole-archive"), "{stdout}");
@@ -287,7 +278,10 @@ fn dry_run_marks_continuation_opt_in_builds() {
     let out = Command::new(bin())
         .env("WASI_SDK_PATH", root)
         .env("YURT_CC_ARCHIVE", "/fake/libyurt.a")
-        .env("YURT_CC_CONTINUATION_ARCHIVE", "/fake/libyurt_continuation.a")
+        .env(
+            "YURT_CC_CONTINUATION_ARCHIVE",
+            "/fake/libyurt_continuation.a",
+        )
         .env("YURT_CC_INCLUDE", "/fake/include")
         .env("YURT_CC_SKIP_VERSION_CHECK", "1")
         .env("YURT_CC_USE_CONTINUATION", "1")
@@ -331,10 +325,7 @@ fn missing_version_sentinel_is_a_hard_error() {
         .unwrap();
     assert!(!out.status.success(), "expected failure");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("yurt_abi_version"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("yurt_abi_version"), "stderr: {stderr}");
 }
 
 #[test]

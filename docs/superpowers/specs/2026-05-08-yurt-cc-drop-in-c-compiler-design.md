@@ -94,7 +94,7 @@ The implementation must not simply prepend Yurt's include path before user argum
 
 This means a package shim such as `zstd-sys/wasm-shim/time.h` gets first chance when the package asks for it. If that shim uses `#include_next`, it should then reach Yurt's compatibility header, and Yurt's compatibility header should use `#include_next` to reach wasi-sdk. If a package shim does not include the next header, Yurt's standard-name header may be bypassed for that translation unit; that is acceptable only if the package shim is self-contained. Yurt must not depend on every translation unit observing its standard-name headers.
 
-`YURT_CC_INCLUDE` remains as an override or additive escape hatch for curated ports and local experiments, but it is not part of the generic package contract. A caller who only sets `CC=yurt-cc` or `CC_wasm32_wasip1=yurt-cc` should get the supported default behavior. Validation should explicitly clear `YURT_CC_INCLUDE` for generic-package tests so the result proves the default path, not ambient shell state.
+`YURT_CC_INCLUDE` remains an explicit override for curated ports and local experiments. When it is set, `yurt-cc` uses that include directory and does not also inject the discovered default include directory; duplicating equivalent Yurt standard-name headers breaks `#include_next` chains. `YURT_CC_INCLUDE` is not part of the generic package contract. A caller who only sets `CC=yurt-cc` or `CC_wasm32_wasip1=yurt-cc` should get the supported default behavior. Validation should explicitly clear `YURT_CC_INCLUDE` for generic-package tests so the result proves the default path, not ambient shell state.
 
 ### 3. Make Compatibility Headers Transparent
 

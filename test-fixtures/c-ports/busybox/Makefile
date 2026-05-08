@@ -17,6 +17,10 @@ YURT_CC := $(REPO_ROOT)/target/release/yurt-cc
 YURT_AR := $(REPO_ROOT)/target/release/yurt-ar
 YURT_RANLIB := $(REPO_ROOT)/target/release/yurt-ranlib
 
+# yurt-cc is package-neutral; BusyBox keeps its historical curated-build
+# warning/optimization/profile flags here.
+YURT_CFLAGS := -O2 -std=gnu23 -Wall -Wextra
+
 # `-mllvm -wasm-enable-sjlj` would lower setjmp/longjmp via the wasm
 # exception-handling proposal (calls __wasm_setjmp / __wasm_longjmp).
 # Yurt implements POSIX setjmp/longjmp and fork on top of binaryen
@@ -99,7 +103,7 @@ $(BUILD_DIR)/busybox.wasm: configure ensure-compat
 		YURT_CC_USE_CONTINUATION=1 \
 		YURT_CC_INCLUDE="$(ABI_INCLUDE)" \
 		$(MAKE) CC="$(YURT_CC)" AR="$(YURT_AR)" RANLIB="$(YURT_RANLIB)" \
-			EXTRA_CFLAGS="$(WASI_EMULATED_CFLAGS)" \
+			EXTRA_CFLAGS="$(YURT_CFLAGS) $(WASI_EMULATED_CFLAGS)" \
 			EXTRA_LDFLAGS="$(WASI_EMULATED_LDFLAGS)" \
 			SKIP_STRIP=y \
 			busybox

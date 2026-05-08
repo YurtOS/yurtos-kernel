@@ -64,6 +64,8 @@ fn build_clang_invocation(
     final_yurt_link: bool,
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
+    argv.push(format!("--sysroot={}", sdk.sysroot().display()).into());
+    argv.push("--target=wasm32-wasip1".into());
     for a in user_args {
         argv.push(a.into());
     }
@@ -72,12 +74,12 @@ fn build_clang_invocation(
         argv.push("-I".into());
         argv.push(inc.clone().into_os_string());
     }
-    if let Some(default_include) = default_yurt_include_dir() {
-        argv.push("-I".into());
-        argv.push(default_include.into_os_string());
+    if env.include.is_none() {
+        if let Some(default_include) = default_yurt_include_dir() {
+            argv.push("-I".into());
+            argv.push(default_include.into_os_string());
+        }
     }
-    argv.push(format!("--sysroot={}", sdk.sysroot().display()).into());
-    argv.push("--target=wasm32-wasip1".into());
     // Link-arg framing must come after the user's objects so it is last in
     // the link line. The whole-archive pair must bracket only the compat
     // archive, and the whole thing must precede `-lc`. clang's default is

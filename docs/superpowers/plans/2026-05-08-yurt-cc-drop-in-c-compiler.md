@@ -14,7 +14,7 @@
 
 - Modify `abi/toolchain/yurt-toolchain/src/env.rs`
   - Add `no_link_injection: bool` parsed from `YURT_CC_NO_LINK_INJECTION`.
-  - Keep `YURT_CC_INCLUDE` as an additive include path, not a replacement for the default Yurt include.
+  - Keep `YURT_CC_INCLUDE` as an explicit override for curated builds; generic builds use the discovered default include when it is unset.
 - Modify `abi/toolchain/yurt-toolchain/src/cargo_yurt.rs`
   - Export `YURT_CC_NO_LINK_INJECTION=1` into Cargo builds so `cc-rs`/build-script compiler probes do not inspect the Yurt ABI archive.
 - Modify `abi/toolchain/yurt-toolchain/src/main.rs`
@@ -543,7 +543,7 @@ Replace the beginning of `build_clang_invocation` with:
     argv.push("--target=wasm32-wasip1".into());
 ```
 
-This preserves package `-I` arguments before both `YURT_CC_INCLUDE` and the default Yurt include. `YURT_CC_INCLUDE` is additive: it does not suppress the default include. Keep `--target` and `--sysroot` near the front if needed for clang behavior, but still ensure package include arguments precede the Yurt include path. The CLI dry-run tests are the authority for this ordering.
+This preserves package `-I` arguments before the Yurt include path. `YURT_CC_INCLUDE` is an explicit override: when it is set, do not also inject the discovered default include, because duplicating equivalent Yurt standard-name headers breaks `#include_next` chains. Keep `--target` and `--sysroot` near the front so clang applies the wasi target/sysroot before compiling source inputs. The CLI dry-run tests are the authority for this ordering.
 
 - [ ] **Step 4: Copy headers next to release binaries in `abi/Makefile`**
 
@@ -695,7 +695,7 @@ to:
 			EXTRA_CFLAGS="$(YURT_CFLAGS) $(WASI_EMULATED_CFLAGS)" \
 ```
 
-Also check for call sites that intentionally expected no Yurt include path. If one exists, add an explicit environment switch in Task 3 before proceeding; otherwise document in the commit body that the repo's curated builds either set `YURT_CC_INCLUDE=$(INCLUDE)` explicitly or accept the new default include path.
+Also check for call sites that intentionally expected no Yurt include path. If one exists, add an explicit environment switch in Task 3 before proceeding; otherwise document in the commit body that the repo's generic builds use the default include path and curated builds that set `YURT_CC_INCLUDE=$(INCLUDE)` override that default.
 
 - [ ] **Step 5: Run formatting and build checks for toolchain and ABI**
 
