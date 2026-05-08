@@ -255,9 +255,10 @@ new TarImageRootProvider({
 })
 ```
 
-- [ ] **Step 5: Route CLI image boot through `.yurtimg` only**
+- [ ] **Step 5: Route CLI image boot through canonical `.yurtimg` only**
 
-In `packages/kernel/src/cli.ts`, remove `.yurtimg.zst` handling and make image execution branch:
+In `packages/kernel/src/cli.ts`, remove legacy split compressed-extension
+handling and make the image execution branch:
 
 ```ts
 const [, , imageArg, ...commandArgv] = process.argv;
@@ -300,7 +301,7 @@ export type {
 
 - [ ] **Step 8: Update runtime docs wording**
 
-Update `docs/superpowers/specs/2026-05-07-yurt-image-runtime-design.md` and `docs/superpowers/plans/2026-05-07-yurt-image-runtime-phase1.md` so they no longer describe `.yurtimg` as raw/uncompressed tar or expose `.yurtimg.zst` as a user-facing image extension. Use:
+Update `docs/superpowers/specs/2026-05-07-yurt-image-runtime-design.md` and `docs/superpowers/plans/2026-05-07-yurt-image-runtime-phase1.md` so they no longer describe `.yurtimg` as raw tar or expose the legacy split compressed suffix as a user-facing image extension. Use:
 
 - `.yurtimg` = zstd-compressed tar image;
 - decompressed tar = internal cache/runtime artifact;
@@ -1154,7 +1155,7 @@ Run:
 
 ```bash
 git diff --check
-rg -n "yurtimg\\.zst|uncompressed \\.yurtimg|ExportImageOptions|include\\?|exclude\\?|default stored directory" docs/superpowers/specs/2026-05-07-yurt-image-runtime-design.md docs/superpowers/specs/2026-05-08-yurt-image-build-design.md docs/superpowers/plans/2026-05-07-yurt-image-runtime-phase1.md docs/superpowers/plans/2026-05-08-yurt-image-build.md packages/kernel/src
+rg -n "yurtimg\\.[z]st|uncompressed \\.[y]urtimg|ExportImageOption[s]|include[?]|exclude[?]|default stored director[y]" docs/superpowers/specs/2026-05-07-yurt-image-runtime-design.md docs/superpowers/specs/2026-05-08-yurt-image-build-design.md docs/superpowers/plans/2026-05-07-yurt-image-runtime-phase1.md docs/superpowers/plans/2026-05-08-yurt-image-build.md packages/kernel/src
 ```
 
 Expected: `git diff --check` exits 0. The `rg` command exits 1 with no matches.
