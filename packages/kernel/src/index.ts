@@ -12,6 +12,11 @@ export type {
   LoadedYurtImage,
   LoadYurtImageOptions,
 } from "./image-loader.js";
+export {
+  exportVfsToTar,
+  exportVfsToYurtImage,
+} from "./image-exporter.js";
+export type { ExportTarOptions } from "./image-exporter.js";
 export type { RootProvider, RootProviderStat } from "./vfs/root-provider.js";
 export type {
   TarImageEntry,
