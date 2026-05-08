@@ -910,7 +910,7 @@ git commit -m "test: add zstd-sys yurt cc smoke fixture"
 **Files:**
 - No source edits expected.
 
-- [ ] **Step 1: Run Rust formatting**
+- [x] **Step 1: Run Rust formatting**
 
 ```bash
 cargo fmt --all -- --check
@@ -918,7 +918,9 @@ cargo fmt --all -- --check
 
 Expected: PASS.
 
-- [ ] **Step 2: Run yurt-toolchain tests**
+Result: FAIL on pre-existing formatting drift outside this work, including conformance canaries and shell fixtures. No broad formatting rewrite was made as part of this branch.
+
+- [x] **Step 2: Run yurt-toolchain tests**
 
 ```bash
 cargo test -p yurt-toolchain --tests
@@ -926,7 +928,9 @@ cargo test -p yurt-toolchain --tests
 
 Expected: PASS.
 
-- [ ] **Step 3: Run focused zstd smoke through cargo-yurt**
+Result: PASS.
+
+- [x] **Step 3: Run focused zstd smoke through cargo-yurt**
 
 First build the toolchain and ABI archive:
 
@@ -938,17 +942,20 @@ make -C abi lib
 Then run the smoke fixture:
 
 ```bash
+KERNEL_WORKTREE=$(pwd)
 env -u YURT_CC_INCLUDE \
-CC_wasm32_wasip1=target/release/yurt-cc \
-AR_wasm32_wasip1=target/release/yurt-ar \
-RANLIB_wasm32_wasip1=target/release/yurt-ranlib \
-YURT_CC_ARCHIVE=abi/build/libyurt_abi.a \
-target/release/cargo-yurt build --release -p zstd-sys-smoke
+CC_wasm32_wasip1="$KERNEL_WORKTREE/target/release/yurt-cc" \
+AR_wasm32_wasip1="$KERNEL_WORKTREE/target/release/yurt-ar" \
+RANLIB_wasm32_wasip1="$KERNEL_WORKTREE/target/release/yurt-ranlib" \
+YURT_CC_ARCHIVE="$KERNEL_WORKTREE/abi/build/libyurt_abi.a" \
+"$KERNEL_WORKTREE/target/release/cargo-yurt" build --release -p zstd-sys-smoke
 ```
 
 Expected: PASS; `zstd-sys` compiles through `yurt-cc`. `cargo-yurt` should export `YURT_CC_NO_LINK_INJECTION=1` into the Cargo build environment, so any `cc-rs` link-shaped probes do not inspect or inject the ABI archive.
 
-- [ ] **Step 4: Run ABI smoke**
+Result: PASS. A first attempt with relative `target/release/yurt-cc` failed because cc-rs resolves `CC_*` from the build-script working directory; the corrected command uses absolute paths.
+
+- [x] **Step 4: Run ABI smoke**
 
 ```bash
 make -C abi canaries
@@ -956,7 +963,9 @@ make -C abi canaries
 
 Expected: PASS.
 
-- [ ] **Step 5: Run clippy for touched Rust package**
+Result: PASS.
+
+- [x] **Step 5: Run clippy for touched Rust package**
 
 ```bash
 cargo clippy -p yurt-toolchain --all-targets -- -D warnings
@@ -964,7 +973,9 @@ cargo clippy -p yurt-toolchain --all-targets -- -D warnings
 
 Expected: PASS.
 
-- [ ] **Step 6: Run original yurt-pkg acceptance manually**
+Result: PASS after implementing `FromStr` for `Spec` to satisfy the package-level clippy gate.
+
+- [x] **Step 6: Run original yurt-pkg acceptance manually**
 
 This is a manual cross-repository acceptance check, not a required kernel CI gate. From the `yurt-pkg` checkout, run the original `pkg` build path with these compiler variables pointing back to this kernel worktree's release binaries:
 
@@ -979,7 +990,9 @@ YURT_CC_ARCHIVE=/Users/sunny/work/yurtos/yurtos-kernel/.worktrees/yurt-cc-drop-i
 
 Expected: the original `zstd-sys` failure is gone. If a later dependency fails for a distinct runtime/API gap, record that separately and do not expand this task unless the failure is another `yurt-cc` wrapper regression.
 
-- [ ] **Step 7: Commit any verification-only docs update if needed**
+Result: PARTIAL PASS. `zstd-sys v2.0.16+zstd.1.5.7` compiled through `cargo-yurt` with this branch's `yurt-cc`; the build then failed later in `fs2 v0.4.3` because that crate has no `sys` module for the selected target. That later dependency failure is distinct from the yurt-cc wrapper regression.
+
+- [x] **Step 7: Commit any verification-only docs update if needed**
 
 If verification reveals a required command correction in this plan or the spec, commit only that docs correction:
 
