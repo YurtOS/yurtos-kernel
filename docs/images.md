@@ -11,7 +11,7 @@ Use `yurt image build` through the Deno CLI entry point:
 
 ```bash
 deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts image build \
+  packages/cli/src/cli.ts image build \
   --empty \
   -o /tmp/echo.yurtimg \
   --copy packages/kernel/src/platform/__tests__/fixtures/true-cmd.wasm:/bin/true \
@@ -34,12 +34,63 @@ that fixture until the boot path becomes configurable.
 - `--chown <uid>:<gid>:/absolute/image/path`: set ownership metadata.
 - `--rm /absolute/image/path`: remove a path from the output image.
 - `--run <argv...>`: run a command during the build before export.
+- `-f, --file <path>`: read ordered image build instructions from a `Yurtfile`.
+- `--allow-hostrun`: allow `HOSTRUN` instructions in a `Yurtfile` to execute
+  host shell commands.
+
+### Build With A Yurtfile
+
+For repeatable image builds, put ordered instructions in a `Yurtfile` and pass
+it explicitly with `-f`:
+
+```yurtfile
+FROM empty
+COPY packages/kernel/src/platform/__tests__/fixtures/true-cmd.wasm /bin/true
+CHMOD 555 /bin/true
+COPY packages/kernel/src/platform/__tests__/fixtures/echo-args.wasm /bin/echo-args
+CHMOD 555 /bin/echo-args
+RUN /bin/echo-args build step
+```
+
+```bash
+deno run --allow-read --allow-write --allow-run --allow-env \
+  packages/cli/src/cli.ts image build \
+  -f Yurtfile \
+  -o /tmp/generated.yurtimg
+```
+
+`Yurtfile` instructions run in order. `RUN` executes inside the image sandbox
+with `cwd=/`, `HOME=/`, `PATH=/bin:/usr/bin`, `PWD=/`, and `USER=root`. The CLI
+does not auto-discover `./Yurtfile`; build-file mode is used only when `-f` or
+`--file` is passed.
+
+`HOSTRUN` executes a raw command through the host shell, with the `Yurtfile`
+directory as its working directory and the CLI process environment inherited.
+Because this runs arbitrary host code, it requires an explicit opt-in:
+
+```yurtfile
+FROM empty
+HOSTRUN make -C runtimes/python python.wasm
+COPY runtimes/python/python.wasm /bin/python
+CHMOD 555 /bin/python
+```
+
+```bash
+deno run --allow-read --allow-write --allow-run --allow-env \
+  packages/cli/src/cli.ts image build \
+  -f Yurtfile \
+  -o /tmp/python.yurtimg \
+  --allow-hostrun
+```
+
+Build-file mode writes the output image atomically. If parsing, `HOSTRUN`,
+`RUN`, or another instruction fails, an existing output image is left unchanged.
 
 Build from a base image and remove a path:
 
 ```bash
 deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts image build \
+  packages/cli/src/cli.ts image build \
   /tmp/base.yurtimg \
   -o /tmp/without-cache.yurtimg \
   --rm /var/cache/package.idx
@@ -49,7 +100,7 @@ Run a command during the build:
 
 ```bash
 deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts image build \
+  packages/cli/src/cli.ts image build \
   --empty \
   -o /tmp/generated.yurtimg \
   --copy packages/kernel/src/platform/__tests__/fixtures/true-cmd.wasm:/bin/true \
@@ -68,14 +119,14 @@ Pass the image as the first CLI argument, followed by the command argv:
 
 ```bash
 deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts /tmp/echo.yurtimg /bin/echo-args hello yurt
+  packages/cli/src/cli.ts /tmp/echo.yurtimg /bin/echo-args hello yurt
 ```
 
 If no command is provided, the CLI tries `/bin/sh`:
 
 ```bash
 deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts /tmp/dev.yurtimg
+  packages/cli/src/cli.ts /tmp/dev.yurtimg
 ```
 
 If the image does not contain `/bin/sh`, the CLI exits with:
@@ -103,7 +154,7 @@ tar. For path-based images, the CLI uses an image cache directory:
 
 ```bash
 YURT_IMAGE_CACHE_DIR=/tmp/yurt-cache deno run --allow-read --allow-write --allow-run --allow-env \
-  packages/kernel/src/cli.ts /tmp/echo.yurtimg /bin/echo-args cached
+  packages/cli/src/cli.ts /tmp/echo.yurtimg /bin/echo-args cached
 ```
 
 If `YURT_IMAGE_CACHE_DIR` is not set, the CLI uses a temporary directory under
