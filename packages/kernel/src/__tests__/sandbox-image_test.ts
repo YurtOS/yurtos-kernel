@@ -155,4 +155,45 @@ describe("Sandbox image root", { sanitizeResources: false, sanitizeOps: false },
       sandbox.destroy();
     }
   });
+
+  it("runs image commands with argv without shell joining", async () => {
+    const image = tar([
+      tarEntry({ name: "bin/", type: "5" }),
+      tarEntry({
+        name: "bin/echo-args",
+        mode: 0o555,
+        data: await Deno.readFile(join(WASM_DIR, "echo-args.wasm")),
+      }),
+      tarEntry({
+        name: "bin/true",
+        mode: 0o555,
+        data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
+      }),
+      tarEntry({ name: "etc/yurt/", type: "5" }),
+      tarEntry({
+        name: "etc/yurt/base-image.json",
+        data: enc.encode(JSON.stringify({
+          version: 1,
+          id: "argv-image",
+          tools: [
+            { name: "true", path: "/bin/true" },
+            { name: "echo-args", path: "/bin/echo-args" },
+          ],
+        })),
+      }),
+    ]);
+    const sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+      image,
+      bootArgv: ["/bin/true"],
+    });
+    try {
+      const result = await sandbox.runArgv(["/bin/echo-args", "a b", "$HOME"]);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe("a b\n$HOME\n");
+    } finally {
+      sandbox.destroy();
+    }
+  });
 });

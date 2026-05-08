@@ -1636,6 +1636,39 @@ export class Sandbox {
     return this.processes.get(pid);
   }
 
+  async runArgv(
+    argv: string[],
+    options: { env?: Record<string, string>; cwd?: string } = {},
+  ): Promise<RunResult> {
+    this.assertAlive();
+    if (argv.length === 0 || !argv[0]) {
+      return {
+        exitCode: 127,
+        stdout: "",
+        stderr: "empty argv\n",
+        executionTimeMs: 0,
+      };
+    }
+
+    const startTime = performance.now();
+    const proc = await this.spawn(argv, {
+      mode: "cli",
+      env: options.env ?? Object.fromEntries(this.env),
+      cwd: options.cwd ?? this.env.get("PWD") ?? "/",
+    });
+    const stdout = proc.fdReadAndClear(1);
+    const stderr = proc.fdReadAndClear(2);
+    return {
+      exitCode: proc.exitCode ?? 0,
+      stdout: stdout.data,
+      stderr: stderr.data,
+      executionTimeMs: performance.now() - startTime,
+      truncated: stdout.truncated || stderr.truncated
+        ? { stdout: stdout.truncated, stderr: stderr.truncated }
+        : undefined,
+    };
+  }
+
   async spawn(argv: string[], opts: {
     mode?: ProcessMode;
     env?: Record<string, string>;
