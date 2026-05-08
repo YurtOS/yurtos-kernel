@@ -128,6 +128,24 @@ Deno.test("parseYurtfile supports minimal quoting and escaping", async () => {
   });
 });
 
+Deno.test("parseYurtfile preserves unknown escape sequences literally", async () => {
+  const dir = await mkdtemp("/tmp/yurtfile-unknown-escape-");
+  const file = join(dir, "Yurtfile");
+  await writeFile(
+    file,
+    String.raw`FROM empty
+RUN /bin/echo-args "line\n" path\name`,
+  );
+
+  const parsed = await parseYurtfile(file);
+
+  assertEquals(parsed.instructions[0], {
+    kind: "run",
+    line: 2,
+    argv: ["/bin/echo-args", String.raw`line\n`, String.raw`path\name`],
+  });
+});
+
 Deno.test("parseYurtfile rejects missing and duplicate FROM", async () => {
   const dir = await mkdtemp("/tmp/yurtfile-invalid-");
   const missing = join(dir, "missing.Yurtfile");
@@ -834,7 +852,12 @@ function runHostCommand(
     child.stdout?.on("data", (chunk: Uint8Array) => io.stdout(new TextDecoder().decode(chunk)));
     child.stderr?.on("data", (chunk: Uint8Array) => io.stderr(new TextDecoder().decode(chunk)));
     child.on("error", reject);
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
+      if (signal) {
+        io.stderr(`${parsed.pathForDiagnostics}:${instruction.line}: HOSTRUN terminated by signal ${signal}: ${instruction.command}\n`);
+        resolveResult({ exitCode: 1 });
+        return;
+      }
       const exitCode = code ?? 1;
       if (exitCode !== 0) {
         io.stderr(`${parsed.pathForDiagnostics}:${instruction.line}: HOSTRUN exited with status ${exitCode}: ${instruction.command}\n`);
@@ -1003,6 +1026,33 @@ Deno.test("yurt image build rejects Yurtfile mixed with flag operations and base
     assertStringIncludes(dec.decode(result.stderr), "-f/--file cannot be combined");
   }
 });
+
+Deno.test("yurt image build rejects --allow-hostrun without a Yurtfile", async () => {
+  const dir = await mkdtemp("/tmp/yurt-cli-hostrun-flag-mode-");
+  const out = join(dir, "out.yurtimg");
+
+  const result = await new Deno.Command(deno, {
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-run",
+      "--allow-env",
+      CLI,
+      "image",
+      "build",
+      "--empty",
+      "-o",
+      out,
+      "--allow-hostrun",
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+
+  assertEquals(result.code, 2);
+  assertStringIncludes(dec.decode(result.stderr), "--allow-hostrun requires -f/--file");
+});
 ```
 
 - [ ] **Step 2: Run CLI tests and verify failure**
@@ -1072,7 +1122,10 @@ function parseImageBuildArgs(args: string[]): ImageBuildArgs {
   const ops: ImageBuildOp[] = [];
 ```
 
-Inside the loop, before `--empty`, add:
+Inside the loop, replace the current first `if (arg === '--empty')` branch with
+this attached `if` / `else if` chain. The `--empty` branch must become
+`else if`; otherwise `--allow-hostrun` falls through to the unknown-option
+branch in the same iteration.
 
 ```ts
     if (arg === '-h' || arg === '--help') {
@@ -1081,9 +1134,11 @@ Inside the loop, before `--empty`, add:
       file = requiredValue(args, ++i, arg);
     } else if (arg === '--allow-hostrun') {
       allowHostrun = true;
+    } else if (arg === '--empty') {
+      empty = true;
 ```
 
-Keep the existing `--empty`, `-o`, and operation branches after that.
+Keep the existing `-o` and operation branches after that as `else if` branches.
 
 Before final flag-mode validation, add:
 
@@ -1094,6 +1149,10 @@ Before final flag-mode validation, add:
     }
     if (!outputPath) throw new Error('missing -o/--output');
     return { empty: false, outputPath, ops, file, allowHostrun };
+  }
+
+  if (allowHostrun) {
+    throw new Error('--allow-hostrun requires -f/--file');
   }
 ```
 
@@ -1330,7 +1389,9 @@ Deno.test("yurt image build preserves existing output after failing RUN", async 
 Deno.test("yurt image build resolves relative FROM from Yurtfile directory", async () => {
   const dir = await mkdtemp("/tmp/yurt-cli-relative-from-");
   const subdir = join(dir, "build");
+  const otherCwd = join(dir, "other-cwd");
   await Deno.mkdir(subdir);
+  await Deno.mkdir(otherCwd);
   const base = join(dir, "base.yurtimg");
   const file = join(subdir, "Yurtfile");
   const out = join(dir, "out.yurtimg");
@@ -1357,7 +1418,7 @@ Deno.test("yurt image build resolves relative FROM from Yurtfile directory", asy
       "-o",
       out,
     ],
-    cwd: "/tmp",
+    cwd: otherCwd,
     stdout: "piped",
     stderr: "piped",
   }).output();
@@ -1379,6 +1440,29 @@ Deno.test("yurt image build --help documents Yurtfile and HOSTRUN", async () => 
       "image",
       "build",
       "--help",
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+
+  assertEquals(result.code, 0);
+  const stdout = dec.decode(result.stdout);
+  assertStringIncludes(stdout, "yurt image build -f <Yurtfile>");
+  assertStringIncludes(stdout, "--allow-hostrun");
+});
+
+Deno.test("yurt image build -h documents Yurtfile and HOSTRUN", async () => {
+  const result = await new Deno.Command(deno, {
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-run",
+      "--allow-env",
+      CLI,
+      "image",
+      "build",
+      "-h",
     ],
     stdout: "piped",
     stderr: "piped",
@@ -1607,3 +1691,5 @@ Expected: PASS. This is the Deno fast-tier test glob from the repo instructions.
 - TDD check: Each implementation task starts with failing tests, then implementation, then focused verification.
 - Placeholder scan: The plan contains no open-ended implementation placeholders. Commands, expected results, file paths, and code snippets are concrete.
 - Type consistency: `ParsedYurtfile`, `YurtfileInstruction`, `ExecuteYurtfileBuildOptions`, and `ExecuteYurtfileBuildResult` are introduced once and reused consistently.
+- Review follow-up: `--allow-hostrun` is explicitly rejected without `-f`, parser branches are specified as one attached `if` / `else if` chain, unknown escapes are pinned, host signal termination gets a distinct diagnostic, relative-FROM tests avoid `/tmp` symlink assumptions, and both `--help` and `-h` are covered.
+- Deferred quality note: `writeOutputAtomically` intentionally preserves current CLI behavior for missing output directories: it reports a normal write failure instead of creating parent directories. `ParsedYurtfile.path` and `pathForDiagnostics` remain separate so a future CLI can preserve the user-supplied diagnostic path while using a normalized execution path; the first implementation sets them to the same value.
