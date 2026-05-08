@@ -16,6 +16,46 @@ const FIXTURES = resolve(__dirname, 'platform/__tests__/fixtures');
 
 async function main() {
   const adapter = new NodeAdapter();
+  const [, , imageArg, ...commandArgv] = process.argv;
+  if (imageArg && (imageArg.endsWith('.yurtimg') || imageArg.endsWith('.yurtimg.zst'))) {
+    if (imageArg.endsWith('.yurtimg.zst')) {
+      process.stderr.write('.yurtimg.zst is not supported by this build yet\n');
+      process.exitCode = 2;
+      return;
+    }
+
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter,
+      image: imageArg,
+      bootArgv: ['/bin/true'],
+    });
+    sandbox.setEnv('HOME', '/home/user');
+    sandbox.setEnv('PWD', '/home/user');
+    sandbox.setEnv('USER', 'user');
+    sandbox.setEnv('PATH', '/bin:/usr/bin');
+
+    try {
+      const argv = commandArgv.length > 0 ? commandArgv : ['/bin/sh'];
+      if (commandArgv.length === 0) {
+        try {
+          sandbox.stat('/bin/sh');
+        } catch {
+          process.stderr.write('no command provided and /bin/sh is not present in image\n');
+          process.exitCode = 127;
+          return;
+        }
+      }
+      const result = await sandbox.runArgv(argv);
+      if (result.stdout) process.stdout.write(result.stdout);
+      if (result.stderr) process.stderr.write(result.stderr);
+      process.exitCode = result.exitCode;
+      return;
+    } finally {
+      sandbox.destroy();
+    }
+  }
+
   const sandbox = await Sandbox.create({
     wasmDir: FIXTURES,
     adapter,
