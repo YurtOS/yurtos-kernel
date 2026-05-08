@@ -46,7 +46,7 @@ build file when the caller passes `-f, --file <path>`.
 `yurt image build -o out.yurtimg` must keep the existing flag-mode behavior and
 fail because no `--empty` flag or base image was provided. It must not
 implicitly discover `./Yurtfile`, because that would change the current parser
-contract and could execute a recipe when the caller intended a flag-only build.
+contract when the caller intended a flag-only build.
 
 The first non-comment instruction must be `FROM`:
 
@@ -96,12 +96,17 @@ path is resolved relative to the `Yurtfile` directory unless absolute. The image
 path must be absolute.
 
 Directory copy is deferred. The first implementation should reject directories
-with a clear error rather than guessing recursive metadata behavior.
+with this error shape rather than guessing recursive metadata behavior:
+
+```text
+COPY does not support directories yet; copy individual files
+```
 
 ### CHMOD
 
-`CHMOD <octal-mode> <image-path>` applies file mode metadata. The image path must
-be absolute.
+`CHMOD <octal-mode> <image-path>` applies file mode metadata. The mode must be
+octal digits only, matching the existing `--chmod` parser. Symbolic modes such
+as `u+x` are not supported. The image path must be absolute.
 
 ### CHOWN
 
@@ -133,8 +138,8 @@ implementation does not include those instructions.
 
 ### HOSTRUN
 
-`HOSTRUN <argv...>` runs a command on the host. It exists for producing artifacts
-that later `COPY` instructions can place into the image:
+`HOSTRUN <shell-command>` runs a command through the host shell. It exists for
+producing artifacts that later `COPY` instructions can place into the image:
 
 ```yurtfile
 FROM empty
@@ -152,6 +157,11 @@ same builder API directly.
 
 Host commands run with the `Yurtfile` directory as their working directory by
 default. This keeps relative artifacts predictable across local and CI runs.
+Host commands inherit the CLI process environment, including `PATH`, `HOME`, and
+toolchain-specific variables. Shell resolution follows the host shell rules:
+`make` is found through the inherited `PATH`, while `./scripts/build.sh` resolves
+relative to the `Yurtfile` directory because that is the command working
+directory.
 
 ## CLI Surface
 
@@ -198,16 +208,24 @@ Use a small line-oriented parser:
 
 - trim leading and trailing whitespace;
 - ignore blank lines and lines whose first non-whitespace character is `#`;
-- split unquoted whitespace into tokens;
+- split unquoted whitespace into tokens for every instruction except `HOSTRUN`;
 - support single-quoted and double-quoted tokens for paths or args containing
   spaces;
-- support `\` escapes inside quoted strings and for whitespace in unquoted
-  tokens;
+- support only `\\`, `\"`, and `\'` escapes inside quoted strings, plus
+  backslash-escaped whitespace in unquoted tokens;
 - reject unterminated quotes, unknown instructions, wrong arity, missing `FROM`,
   duplicate `FROM`, and relative image paths.
 
 Inline comments are not part of the first pass. A `#` character inside a command
-argument is treated as ordinary text unless the whole line is a comment.
+argument is treated as ordinary text unless the whole line is a comment:
+
+```yurtfile
+RUN /bin/echo-args "# header"
+```
+
+For `HOSTRUN`, the parser treats everything after `HOSTRUN` and following
+whitespace as one raw shell command string. The host shell then applies its own
+quoting, escaping, and comment rules.
 
 ## Execution Model
 
@@ -223,8 +241,8 @@ from top to bottom:
    - `CHOWN` calls `builder.chown`.
    - `RM` calls `builder.remove`.
    - `RUN` calls `builder.run`.
-   - `HOSTRUN` uses `Deno.Command` or the Node equivalent available to the CLI
-     runtime.
+   - `HOSTRUN` runs the raw command text through the host shell using the
+     CLI's Node-compatible process execution layer.
 4. Stop at the first failed instruction.
 5. Export the image only if all instructions succeed.
 
@@ -240,7 +258,9 @@ must remain untouched.
 
 ## Error Handling
 
-Errors should include the source location:
+Errors should include the source location. The path in diagnostics is the path
+the user passed to `-f/--file`, preserving relative paths for editor-friendly
+`file:line` links:
 
 ```text
 Yurtfile:6: RUN exited with status 1: /bin/python -m pip install numpy
@@ -251,14 +271,16 @@ behavior. Instruction execution failures should return the failing command's
 exit code when available, otherwise `1`.
 
 Host command stdout and stderr should stream or be forwarded to the CLI stdout
-and stderr. Sandbox `RUN` output should keep the current image-builder behavior:
-write captured stdout and stderr to the corresponding CLI streams.
+and stderr. A failing `HOSTRUN` should stop the build and return the host
+command's exit code when available. Sandbox `RUN` output should keep the current
+image-builder behavior: write captured stdout and stderr to the corresponding
+CLI streams.
 
 ## Security And Permissions
 
 `HOSTRUN` executes arbitrary host code, so it must be gated by
-`--allow-hostrun`. This gate is separate from Deno's own `--allow-run`; both are
-required in practice when running through Deno.
+`--allow-hostrun`. This is a Yurt policy gate; the JavaScript runtime or host
+wrapper may also require its own permission for process execution.
 
 The CLI should not infer trust from file names or repository paths. A `Yurtfile`
 containing `HOSTRUN` requires the opt-in flag every time.
@@ -272,16 +294,20 @@ Add focused Deno tests for:
 - quoted and escaped arguments;
 - rejecting missing or duplicate `FROM`;
 - rejecting relative image paths;
+- resolving `FROM <relative-path>` against the `Yurtfile` directory, not the
+  process cwd;
 - building an image from a `Yurtfile` without `HOSTRUN`;
 - rejecting `HOSTRUN` without `--allow-hostrun`;
 - running `HOSTRUN` with `--allow-hostrun`, then copying its generated artifact
   into the image;
+- propagating a failing `HOSTRUN` exit code and leaving the output untouched;
 - stopping on a failing `RUN` without writing the output image;
 - preserving an existing output image when a build-file instruction fails;
-- rejecting mixed `-f` and operation flags.
+- rejecting `-f` mixed with `--empty`, a positional base image, or operation
+  flags.
 
 ## Documentation
 
-Update `docs/images.md` with a `Yurtfile` example and the security note for
-`HOSTRUN`. Keep the existing flag-based example because it remains useful for
-small one-off images and tests.
+Update `docs/images.md` and the CLI help output with a `Yurtfile` example and
+the security note for `HOSTRUN`. Keep the existing flag-based example because it
+remains useful for small one-off images and tests.
