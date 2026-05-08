@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { writeFile } from "node:fs/promises";
 
+import { executeYurtfileBuild } from "./image-build-file.js";
 import { YurtImageBuilder } from "../../kernel/src/image-builder.js";
 import { NodeAdapter } from "../../kernel/src/platform/node-adapter.js";
 import { Sandbox } from "../../kernel/src/sandbox.js";
@@ -32,6 +33,8 @@ interface ImageBuildArgs {
   outputPath: string;
   ops: ImageBuildOp[];
   runArgv?: string[];
+  file?: string;
+  allowHostrun: boolean;
 }
 
 async function main() {
@@ -172,6 +175,11 @@ async function runImageBuild(args: string[]): Promise<void> {
   try {
     parsed = parseImageBuildArgs(args);
   } catch (error) {
+    if (error instanceof ImageBuildHelp) {
+      process.stdout.write(imageBuildHelp());
+      process.exitCode = 0;
+      return;
+    }
     const message = error instanceof Error ? error.message : String(error);
     process.stderr.write(`${message}\n`);
     process.exitCode = 2;
@@ -179,6 +187,20 @@ async function runImageBuild(args: string[]): Promise<void> {
   }
 
   const adapter = new NodeAdapter();
+  if (parsed.file) {
+    const result = await executeYurtfileBuild({
+      file: parsed.file,
+      outputPath: parsed.outputPath,
+      allowHostrun: parsed.allowHostrun,
+      wasmDir: FIXTURES,
+      adapter,
+      imageCacheDir: process.env.YURT_IMAGE_CACHE_DIR ??
+        join(tmpdir(), "yurt-image-cache"),
+    });
+    process.exitCode = result.exitCode;
+    return;
+  }
+
   const builder = parsed.empty
     ? await YurtImageBuilder.empty({ wasmDir: FIXTURES, adapter })
     : await YurtImageBuilder.create({
@@ -222,11 +244,19 @@ function parseImageBuildArgs(args: string[]): ImageBuildArgs {
   let outputPath: string | undefined;
   let baseImage: string | undefined;
   let runArgv: string[] | undefined;
+  let file: string | undefined;
+  let allowHostrun = false;
   const ops: ImageBuildOp[] = [];
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === "--empty") {
+    if (arg === "-h" || arg === "--help") {
+      throw new ImageBuildHelp();
+    } else if (arg === "-f" || arg === "--file") {
+      file = requiredValue(args, ++i, arg);
+    } else if (arg === "--allow-hostrun") {
+      allowHostrun = true;
+    } else if (arg === "--empty") {
       empty = true;
     } else if (arg === "-o" || arg === "--output") {
       outputPath = requiredValue(args, ++i, arg);
@@ -278,6 +308,20 @@ function parseImageBuildArgs(args: string[]): ImageBuildArgs {
     }
   }
 
+  if (file) {
+    if (empty || baseImage || ops.length > 0 || runArgv) {
+      throw new Error(
+        "-f/--file cannot be combined with --empty, a base image, --copy, --chmod, --chown, --rm, or --run",
+      );
+    }
+    if (!outputPath) throw new Error("missing -o/--output");
+    return { empty: false, outputPath, ops, file, allowHostrun };
+  }
+
+  if (allowHostrun) {
+    throw new Error("--allow-hostrun requires -f/--file");
+  }
+
   if (!outputPath) throw new Error("missing -o/--output");
   if (empty && baseImage) {
     throw new Error("--empty cannot be combined with a base image");
@@ -286,7 +330,31 @@ function parseImageBuildArgs(args: string[]): ImageBuildArgs {
     throw new Error("missing base image; pass --empty for an empty disk");
   }
 
-  return { empty, baseImage, outputPath, ops, runArgv };
+  return { empty, baseImage, outputPath, ops, runArgv, allowHostrun };
+}
+
+class ImageBuildHelp extends Error {}
+
+function imageBuildHelp(): string {
+  return [
+    "usage:",
+    "  yurt image build --empty -o <out.yurtimg> [--copy host:/path ...] [--run argv...]",
+    "  yurt image build <base.yurtimg> -o <out.yurtimg> [--copy host:/path ...] [--run argv...]",
+    "  yurt image build -f <Yurtfile> -o <out.yurtimg> [--allow-hostrun]",
+    "",
+    "build-file mode:",
+    "  -f, --file <path>     read ordered image instructions from a Yurtfile",
+    "  --allow-hostrun       allow HOSTRUN instructions to execute host shell commands",
+    "",
+    "flag mode:",
+    "  --empty               start from an empty image",
+    "  --copy host:/path     copy a host file into the image",
+    "  --chmod mode:/path    set octal permissions",
+    "  --chown uid:gid:/path set ownership metadata",
+    "  --rm /path            remove a path from the image",
+    "  --run argv...         run an image command before export",
+    "",
+  ].join("\n");
 }
 
 function requiredValue(args: string[], index: number, option: string): string {
