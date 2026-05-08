@@ -62,7 +62,7 @@ function walk(vfs: VfsLike, skipPrefixes: Set<string>): string[] {
       .filter((entry: DirEntry) =>
         !isSkipped(joinPath(path, entry.name), skipPrefixes)
       )
-      .sort((a, b) => a.name.localeCompare(b.name));
+      .sort((a, b) => compareCodepoint(a.name, b.name));
     for (const entry of entries) visit(joinPath(path, entry.name));
   }
 
@@ -145,7 +145,10 @@ function splitTarPath(path: string, type: "0" | "2" | "5"): {
   for (let i = parts.length - 1; i > 0; i--) {
     const prefix = parts.slice(0, i).join("/");
     const name = parts.slice(i).join("/");
-    if (text.encode(prefix).byteLength <= 155 && text.encode(name).byteLength <= 100) {
+    if (
+      text.encode(prefix).byteLength <= 155 &&
+      text.encode(name).byteLength <= 100
+    ) {
       return { name, prefix };
     }
   }
@@ -185,6 +188,10 @@ function concat(chunks: Uint8Array[]): Uint8Array {
     offset += chunk.byteLength;
   }
   return out;
+}
+
+function compareCodepoint(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 async function zstdCompress(bytes: Uint8Array): Promise<Uint8Array> {

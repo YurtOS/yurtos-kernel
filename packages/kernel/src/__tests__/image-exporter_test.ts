@@ -1,7 +1,7 @@
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
 import { VFS } from "../vfs/vfs.ts";
-import { exportVfsToYurtImage } from "../image-exporter.ts";
+import { exportVfsToTar, exportVfsToYurtImage } from "../image-exporter.ts";
 import { loadYurtImage } from "../image-loader.ts";
 import { TarImageRootProvider } from "../vfs/tar-image-root-provider.ts";
 
@@ -67,4 +67,47 @@ describe("exportVfsToYurtImage", () => {
     expect(() => root.stat("/dev")).toThrow();
     expect(() => root.stat("/proc")).toThrow();
   });
+
+  it("orders tar entries by codepoint, independent of localeCompare", async () => {
+    const vfs = new VFS({ layout: "empty" });
+    vfs.withWriteAccess(() => {
+      vfs.writeFile("/b", enc.encode("b"));
+      vfs.writeFile("/a", enc.encode("a"));
+    });
+
+    const originalLocaleCompare = String.prototype.localeCompare;
+    try {
+      String.prototype.localeCompare = function (other: string): number {
+        const self = String(this);
+        return self < other ? 1 : self > other ? -1 : 0;
+      };
+
+      expect(tarNames(await exportVfsToTar(vfs))).toEqual(["a", "b"]);
+    } finally {
+      String.prototype.localeCompare = originalLocaleCompare;
+    }
+  });
 });
+
+function tarNames(tar: Uint8Array): string[] {
+  const names: string[] = [];
+  let offset = 0;
+  while (offset + 512 <= tar.byteLength) {
+    const block = tar.subarray(offset, offset + 512);
+    offset += 512;
+    if (block.every((byte) => byte === 0)) break;
+
+    const name = readString(block, 0, 100);
+    const prefix = readString(block, 345, 155);
+    names.push(prefix ? `${prefix}/${name}` : name);
+    const size = Number.parseInt(readString(block, 124, 12).trim() || "0", 8);
+    offset += Math.ceil(size / 512) * 512;
+  }
+  return names;
+}
+
+function readString(block: Uint8Array, start: number, length: number): string {
+  const field = block.subarray(start, start + length);
+  const end = field.indexOf(0);
+  return dec.decode(end >= 0 ? field.subarray(0, end) : field).trimEnd();
+}
