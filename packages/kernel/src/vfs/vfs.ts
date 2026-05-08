@@ -34,6 +34,8 @@ export interface VfsOptions {
   uid?: number;
   /** Effective gid for normal VFS operations. Defaults to the sandbox user group. */
   gid?: number;
+  /** Default creates convenience dirs; empty creates only stored root plus virtual providers. */
+  layout?: 'default' | 'empty';
 }
 
 /**
@@ -93,7 +95,9 @@ export class VFS {
     this.fsLimitBytes = options?.fsLimitBytes;
     this.fileCountLimit = options?.fileCount;
     this.initializing = true;
-    this.initDefaultLayout();
+    if ((options?.layout ?? 'default') === 'default') {
+      this.initDefaultLayout();
+    }
     this.initializing = false;
     this.registerProvider('/dev', new DevProvider());
     this.registerProvider(
@@ -285,6 +289,11 @@ export class VFS {
       }
     }
     return undefined;
+  }
+
+  private isProviderMountPath(path: string): boolean {
+    const normalized = '/' + parsePath(path).join('/');
+    return this.providers.has(normalized);
   }
 
   private currentOwner(): { uid: number; gid: number } {
@@ -598,6 +607,9 @@ export class VFS {
   }
 
   writeFile(path: string, data: Uint8Array, mode = 0o644): void {
+    if (this.isProviderMountPath(path)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${path}`);
+    }
     const match = this.matchProvider(path);
     if (match) {
       match.provider.writeFile(match.subpath, data);
@@ -640,6 +652,9 @@ export class VFS {
   }
 
   mkdir(path: string, mode = 0o755): void {
+    if (this.isProviderMountPath(path)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${path}`);
+    }
     const { parent, name } = this.resolveParent(path);
 
     if (parent.children.has(name)) {
@@ -655,6 +670,9 @@ export class VFS {
   }
 
   mkdirp(path: string): void {
+    if (this.isProviderMountPath(path)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${path}`);
+    }
     const segments = parsePath(path);
     let current: DirInode = this.root;
 
@@ -700,11 +718,22 @@ export class VFS {
     for (const [name, child] of inode.children) {
       entries.push({ name, type: child.type });
     }
+    if (parsePath(path).length === 0) {
+      for (const mountPath of this.providers.keys()) {
+        const [name, rest] = mountPath.slice(1).split('/');
+        if (name && rest === undefined && !inode.children.has(name)) {
+          entries.push({ name, type: 'dir' });
+        }
+      }
+    }
 
     return entries;
   }
 
   unlink(path: string): void {
+    if (this.isProviderMountPath(path)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${path}`);
+    }
     const { parent, name } = this.resolveParent(path);
     this.assertDirectoryMutationPermission(parent);
     const child = parent.children.get(name);
@@ -725,6 +754,9 @@ export class VFS {
   }
 
   rmdir(path: string): void {
+    if (this.isProviderMountPath(path)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${path}`);
+    }
     const { parent, name } = this.resolveParent(path);
     this.assertDirectoryMutationPermission(parent);
     const child = parent.children.get(name);
@@ -745,6 +777,12 @@ export class VFS {
   }
 
   rename(oldPath: string, newPath: string): void {
+    if (this.isProviderMountPath(oldPath)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${oldPath}`);
+    }
+    if (this.isProviderMountPath(newPath)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${newPath}`);
+    }
     const { parent: oldParent, name: oldName } = this.resolveParent(oldPath);
     this.assertDirectoryMutationPermission(oldParent);
     const child = oldParent.children.get(oldName);
@@ -775,6 +813,9 @@ export class VFS {
    * see the new path immediately.
    */
   link(oldPath: string, newPath: string): void {
+    if (this.isProviderMountPath(newPath)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${newPath}`);
+    }
     const { parent: newParent, name: newName } = this.resolveParent(newPath);
     this.assertDirectoryMutationPermission(newParent);
     if (newParent.children.has(newName)) {
@@ -800,6 +841,9 @@ export class VFS {
   }
 
   symlink(target: string, path: string): void {
+    if (this.isProviderMountPath(path)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${path}`);
+    }
     const { parent, name } = this.resolveParent(path);
     this.assertDirectoryMutationPermission(parent);
 

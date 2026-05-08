@@ -354,8 +354,10 @@ Deno.test("empty disk VFS reserves virtual provider mount paths", () => {
 
   expect(() => vfs.mkdir("/dev")).toThrow(/EEXIST|EROFS|EACCES/);
   expect(() => vfs.writeFile("/proc", new Uint8Array())).toThrow();
-  vfs.mkdir("/bin");
-  vfs.writeFile("/bin/tool", new Uint8Array([1]), 0o555);
+  vfs.withWriteAccess(() => {
+    vfs.mkdir("/bin");
+    vfs.writeFile("/bin/tool", new Uint8Array([1]), 0o555);
+  });
   expect(vfs.stat("/bin/tool").permissions).toBe(0o555);
 });
 ```
