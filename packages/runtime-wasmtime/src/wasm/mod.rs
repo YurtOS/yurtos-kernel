@@ -15,6 +15,7 @@
 pub mod command;
 mod instance;
 pub mod kernel;
+pub mod native_abi;
 pub mod network;
 pub mod spawn;
 
@@ -24,6 +25,7 @@ pub use instance::ShellInstance;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
@@ -34,6 +36,7 @@ use wasmtime_wasi::{async_trait, ResourceTable, WasiCtx, WasiCtxBuilder, WasiVie
 use wasmtime_wasi::{HostOutputStream, StdoutStream, StreamError, Subscribe};
 
 use kernel::{ChildState, ProcessKernel};
+use native_abi::decode_spawn_request;
 use spawn::{SpawnContext, SpawnRequest};
 
 use crate::vfs::{MemVfs, VfsError};
@@ -69,6 +72,12 @@ impl DrainablePipe {
     /// target for child-process stdout/stderr forwarding.
     pub fn as_pipe_buf(&self) -> kernel::PipeBuf {
         self.buf.clone()
+    }
+}
+
+impl Default for DrainablePipe {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -579,14 +588,16 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
 
 fn add_io_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     // host_pipe(out_ptr, out_cap) -> i32
-    // Creates a (read_fd, write_fd) pipe pair; writes JSON {"read_fd":N,"write_fd":M}.
+    // Creates a (read_fd, write_fd) pipe pair; writes yurt_pipe_result_v1.
     linker.func_wrap(
         "yurt",
         "host_pipe",
         |mut c: Caller<'_, StoreData>, out_ptr: u32, out_cap: u32| -> i32 {
             let (read_fd, write_fd) = c.data_mut().kernel.pipe();
-            let j = json!({"read_fd": read_fd, "write_fd": write_fd}).to_string();
-            write_out(&mut c, out_ptr, out_cap, j.as_bytes())
+            let mut out = [0u8; 8];
+            out[0..4].copy_from_slice(&read_fd.to_le_bytes());
+            out[4..8].copy_from_slice(&write_fd.to_le_bytes());
+            write_out(&mut c, out_ptr, out_cap, &out)
         },
     )?;
 
@@ -600,17 +611,14 @@ fn add_io_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         },
     )?;
 
-    // host_dup(fd, out_ptr, out_cap) -> i32  — writes JSON {"fd":N}
+    // host_dup(fd, out_ptr, out_cap) -> i32  — writes int32_t fd
     linker.func_wrap(
         "yurt",
         "host_dup",
         |mut c: Caller<'_, StoreData>, fd: i32, out_ptr: u32, out_cap: u32| -> i32 {
             match c.data_mut().kernel.dup(fd) {
-                Some(new_fd) => {
-                    let j = json!({"fd": new_fd}).to_string();
-                    write_out(&mut c, out_ptr, out_cap, j.as_bytes())
-                }
-                None => -1,
+                Some(new_fd) => write_out(&mut c, out_ptr, out_cap, &new_fd.to_le_bytes()),
+                None => -9,
             }
         },
     )?;
@@ -687,11 +695,83 @@ fn add_io_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
 
 fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     // host_spawn(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // Synchronous spawn (used in test/legacy mode); in production, shell uses host_spawn_async.
+    // Native spawn request; writes yurt_spawn_result_v1.
     linker.func_wrap(
         "yurt",
         "host_spawn",
-        |_: Caller<'_, StoreData>, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
+        |mut c: Caller<'_, StoreData>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 {
+            let req_bytes = read_mem(&mut c, req_ptr, req_len);
+            let native_req = match decode_spawn_request(&req_bytes) {
+                Ok(req) => req,
+                Err(e) => return e.errno(),
+            };
+            // This backend has no child fd-table clone path yet. Report that
+            // explicit non-stdio file-action mappings are unsupported instead
+            // of spawning a child with the wrong descriptors.
+            if !native_req.fd_map.is_empty() {
+                return -38;
+            }
+            let req = SpawnRequest {
+                prog: native_req.prog,
+                args: native_req.args,
+                env: native_req
+                    .env
+                    .into_iter()
+                    .map(|(key, value)| [key, value])
+                    .collect(),
+                cwd: native_req.cwd.unwrap_or_else(|| "/home/user".to_owned()),
+                stdin_fd: native_req.stdin_fd,
+                stdout_fd: native_req.stdout_fd,
+                stderr_fd: native_req.stderr_fd,
+                stdin_data: native_req.stdin_data.unwrap_or_default(),
+                nice: native_req.nice.clamp(0, 19) as u8,
+            };
+
+            let spawn_ctx = match c.data().spawn_ctx.clone() {
+                Some(ctx) => ctx,
+                None => return -38,
+            };
+            let stdin_data: Vec<u8> = if !req.stdin_data.is_empty() {
+                req.stdin_data.as_bytes().to_vec()
+            } else if req.stdin_fd >= 3 {
+                c.data_mut()
+                    .kernel
+                    .read_fd(req.stdin_fd)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let stdout_pipe = match req.stdout_fd {
+                1 => Some(c.data().stdout_pipe.as_pipe_buf()),
+                fd if fd >= 3 => c.data().kernel.pipe_buf(fd),
+                _ => None,
+            };
+            let stderr_pipe = match req.stderr_fd {
+                2 => Some(c.data().stderr_pipe.as_pipe_buf()),
+                fd if fd >= 3 => c.data().kernel.pipe_buf(fd),
+                _ => None,
+            };
+            let parent_vfs = c.data().vfs.cow_clone();
+            let parent_env = c.data().env.clone();
+            let parent_nice = c.data().nice;
+            let (_, rx) = spawn::spawn_child(
+                spawn_ctx,
+                parent_vfs,
+                parent_env,
+                stdin_data,
+                stdout_pipe,
+                stderr_pipe,
+                &req,
+                parent_nice,
+            );
+            let pid = c.data_mut().kernel.add_process(rx);
+            write_out(&mut c, out_ptr, out_cap, &pid.to_le_bytes())
+        },
     )?;
 
     // host_spawn_async(req_ptr, req_len) -> i32  — spawn a child, return PID immediately.
@@ -758,13 +838,43 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         },
     )?;
 
-    // host_waitpid(pid, out_ptr, out_cap) -> i32  — async: suspends until child exits.
+    // host_wait(pid, flags, out_ptr, out_cap) -> i32  — async: suspends until child exits.
     linker.func_wrap_async(
         "yurt",
-        "host_waitpid",
-        |mut caller: Caller<'_, StoreData>, (pid, out_ptr, out_cap): (i32, u32, u32)| {
+        "host_wait",
+        |mut caller: Caller<'_, StoreData>,
+         (pid, flags, out_ptr, out_cap): (i32, i32, u32, u32)| {
             Box::new(async move {
-                // Take the wait state out before awaiting (borrow-safety).
+                if pid <= 0 {
+                    loop {
+                        if let Some((waited_pid, exit_code)) =
+                            caller.data_mut().kernel.reap_any_exit()
+                        {
+                            let mut out = [0u8; 16];
+                            out[0..4].copy_from_slice(&waited_pid.to_le_bytes());
+                            out[4..8].copy_from_slice(&exit_code.to_le_bytes());
+                            return write_out(&mut caller, out_ptr, out_cap, &out);
+                        }
+                        if !caller.data().kernel.has_children() {
+                            return -10;
+                        }
+                        if flags & 1 != 0 {
+                            return -11;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+                if flags & 1 != 0 {
+                    return match caller.data_mut().kernel.poll_exit(pid) {
+                        Some(exit_code) => {
+                            let mut out = [0u8; 16];
+                            out[0..4].copy_from_slice(&pid.to_le_bytes());
+                            out[4..8].copy_from_slice(&exit_code.to_le_bytes());
+                            write_out(&mut caller, out_ptr, out_cap, &out)
+                        }
+                        None => -11,
+                    };
+                }
                 let state = caller.data_mut().kernel.take_state(pid);
                 let exit_code = match state {
                     Some(ChildState::Running(rx)) => {
@@ -773,20 +883,13 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                         code
                     }
                     Some(ChildState::Done(code)) => code,
-                    None => -1,
+                    None => return -10,
                 };
-                let j = json!({"exit_code": exit_code}).to_string();
-                write_out(&mut caller, out_ptr, out_cap, j.as_bytes())
+                let mut out = [0u8; 16];
+                out[0..4].copy_from_slice(&pid.to_le_bytes());
+                out[4..8].copy_from_slice(&exit_code.to_le_bytes());
+                write_out(&mut caller, out_ptr, out_cap, &out)
             })
-        },
-    )?;
-
-    // host_waitpid_nohang(pid) -> i32  — non-blocking: exit code or -1 if still running.
-    linker.func_wrap(
-        "yurt",
-        "host_waitpid_nohang",
-        |mut c: Caller<'_, StoreData>, pid: i32| -> i32 {
-            c.data_mut().kernel.poll_exit(pid).unwrap_or(-1)
         },
     )?;
 

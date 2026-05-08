@@ -25,10 +25,10 @@ export interface VirtualProvider {
   exists(subpath: string): boolean;
 
   /** Return type and size information for the given subpath. */
-  stat(subpath: string): { type: 'file' | 'dir'; size: number };
+  stat(subpath: string): { type: 'file' | 'dir' | 'char'; size: number };
 
   /** List entries in a directory at the given subpath. */
-  readdir(subpath: string): Array<{ name: string; type: 'file' | 'dir' }>;
+  readdir(subpath: string): Array<{ name: string; type: 'file' | 'dir' | 'char' }>;
 
   /**
    * Optional: stream-aware read.  When present, the VFS / FdTable

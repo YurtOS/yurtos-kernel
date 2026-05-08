@@ -33,6 +33,7 @@ int pipe2(int fd[2], int flags);
 int dup(int oldfd);
 int dup3(int oldfd, int newfd, int flags);
 int gethostname(char *name, size_t len);
+int isatty(int fd);
 
 /* wasi-libc gates many POSIX entries behind __wasilibc_unmodified_upstream
  * so they are absent on wasm32-wasip1.  The block below restores enough
@@ -61,6 +62,8 @@ int chown(const char *path, uid_t owner, gid_t group);
 int lchown(const char *path, uid_t owner, gid_t group);
 int fchown(int fd, uid_t owner, gid_t group);
 int fchdir(int fd);
+int chdir(const char *path);
+char *getcwd(char *buf, size_t size);
 int chroot(const char *path);
 
 /* fork / vfork — wasm has no fork(); both return -1/ENOSYS.  Real
@@ -73,7 +76,7 @@ int chroot(const char *path);
  *
  * exec family — replace the calling process image with a new program.
  * Yurt's emulation: spawn the new program (host_spawn), wait for
- * it (host_waitpid), exit with its status — the caller's wasm
+ * it (host_wait), exit with its status — the caller's wasm
  * instance never resumes, semantically equivalent to a real exec
  * for the fork+exec+wait pattern.  Real impls in yurt_exec.c.
  * The l-form variadic helpers below are still inline; they delegate
@@ -169,6 +172,11 @@ int setegid(gid_t gid);
 int setresuid(uid_t r, uid_t e, uid_t s);
 int setresgid(gid_t r, gid_t e, gid_t s);
 
+#ifndef L_cuserid
+#define L_cuserid 32
+#endif
+char *cuserid(char *s);
+
 /* ttyname_r: POSIX requires ENOTTY when fd isn't a terminal.  We
  * defer to isatty() (which wasi-libc implements via fdstat) and
  * synthesize a name when the fd IS a tty.  The sandbox doesn't have
@@ -181,6 +189,16 @@ static inline int ttyname_r(int fd, char *buf, size_t buflen) {
     if (buflen < sizeof(tty)) return ERANGE;
     for (size_t i = 0; i < sizeof(tty); i++) buf[i] = tty[i];
     return 0;
+}
+
+static inline char *ttyname(int fd) {
+    static char tty[sizeof("/dev/tty")];
+    int rc = ttyname_r(fd, tty, sizeof(tty));
+    if (rc != 0) {
+        errno = rc;
+        return NULL;
+    }
+    return tty;
 }
 
 /* Process groups / sessions are real symbols above; nothing to declare here. */

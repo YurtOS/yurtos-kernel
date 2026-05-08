@@ -22,6 +22,68 @@
 #define YURT_VERSION_MINOR  1u
 #define YURT_VERSION_PATCH  0u
 
+#define YURT_WAIT_NOHANG 1u
+#define YURT_ABI_RECORD_VERSION_1 1u
+
+typedef struct {
+  uint32_t size;
+  uint16_t version;
+  uint16_t flags;
+} yurt_abi_record_header;
+
+typedef struct {
+  uint32_t off;
+  uint32_t len;
+} yurt_abi_span_v1;
+
+typedef struct {
+  uint32_t key_off;
+  uint32_t key_len;
+  uint32_t value_off;
+  uint32_t value_len;
+} yurt_abi_env_pair_v1;
+
+typedef struct {
+  int32_t parent_fd;
+  int32_t child_fd;
+} yurt_spawn_fd_map_v1;
+
+typedef struct {
+  yurt_abi_record_header header;
+  yurt_abi_span_v1 prog;
+  yurt_abi_span_v1 argv0;
+  uint32_t args_off;
+  uint32_t args_count;
+  uint32_t env_off;
+  uint32_t env_count;
+  yurt_abi_span_v1 cwd;
+  int32_t stdin_fd;
+  int32_t stdout_fd;
+  int32_t stderr_fd;
+  uint32_t pass_fds_off;
+  uint32_t pass_fds_count;
+  yurt_abi_span_v1 stdin_data;
+  int32_t nice;
+  uint32_t fd_map_off;
+  uint32_t fd_map_count;
+} yurt_spawn_request_v1;
+
+typedef struct {
+  int32_t pid;
+  int32_t exit_code;
+  int32_t signal;
+  int32_t flags;
+} yurt_wait_result_v1;
+
+typedef struct {
+  int32_t read_fd;
+  int32_t write_fd;
+} yurt_pipe_result_v1;
+
+typedef struct {
+  int32_t pid;
+} yurt_spawn_result_v1;
+
 extern uint32_t yurt_abi_version;
 
 /*

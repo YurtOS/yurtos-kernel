@@ -8,7 +8,7 @@
  *   Process management (new):
  *   - host_pipe: create a pipe, returns read_fd and write_fd
  *   - host_spawn: spawn a child WASM process
- *   - host_waitpid: wait for a child process to exit (async, requires JSPI)
+ *   - host_wait: wait for a child process to exit (async, requires JSPI)
  *   - host_close_fd: close a file descriptor
  *
  *   Network / extensions:
@@ -94,8 +94,9 @@ export interface KernelImportsOptions {
 
   /**
    * Legacy synchronous spawn handler for the shell's 4-argument host_spawn ABI.
-   * The generic process ABI is host_spawn(req_ptr, req_len) -> pid. The shell
-   * test/legacy ABI is host_spawn(req_ptr, req_len, out_ptr, out_cap) -> bytes.
+   * The process ABI uses native records for host_spawn(req_ptr, req_len,
+   * out_ptr, out_cap). Older host_spawn_async callers still use the
+   * two-argument JSON SpawnRequest form.
    */
   syncSpawn?: (
     cmd: string,
@@ -135,10 +136,168 @@ const ERR_UNSUPPORTED = -38;
 const ERR_INVALID = -22;
 const ERR_INTERRUPTED = -27;
 const ERR_PRIORITY_NOT_FOUND = -1001;
+const ERR_AGAIN = -11;
+const ERR_CHILD = -10;
 const ROOT_UID = 0;
 const USER_UID = 1000;
 const USER_GID = 1000;
 const PRIO_PROCESS = 0;
+const YURT_WAIT_NOHANG = 1;
+
+function writeI32(memory: WebAssembly.Memory, ptr: number, cap: number, value: number): number {
+  const required = 4;
+  if (cap < required) return required;
+  const end = ptr + required;
+  if (ptr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+  new DataView(memory.buffer).setInt32(ptr, value, true);
+  return required;
+}
+
+function writePipeResult(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  readFd: number,
+  writeFd: number,
+): number {
+  const required = 8;
+  if (cap < required) return required;
+  const end = ptr + required;
+  if (ptr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+  const view = new DataView(memory.buffer);
+  view.setInt32(ptr, readFd, true);
+  view.setInt32(ptr + 4, writeFd, true);
+  return required;
+}
+
+function writeWaitResult(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  pid: number,
+  exitCode: number,
+  signal = 0,
+  flags = 0,
+): number {
+  const required = 16;
+  if (cap < required) return required;
+  const end = ptr + required;
+  if (ptr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+  const view = new DataView(memory.buffer);
+  view.setInt32(ptr, pid, true);
+  view.setInt32(ptr + 4, exitCode, true);
+  view.setInt32(ptr + 8, signal, true);
+  view.setInt32(ptr + 12, flags, true);
+  return required;
+}
+
+function writeSpawnResult(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  pid: number,
+): number {
+  return writeI32(memory, ptr, cap, pid);
+}
+
+const NATIVE_RECORD_VERSION_1 = 1;
+const SPAWN_REQUEST_V1_MIN_SIZE = 80;
+const SPAN_SIZE = 8;
+const ENV_PAIR_SIZE = 16;
+const FD_MAP_PAIR_SIZE = 8;
+const fatalUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
+
+function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
+  if (bytes.byteLength < SPAWN_REQUEST_V1_MIN_SIZE) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const logicalSize = view.getUint32(0, true);
+  const version = view.getUint16(4, true);
+  if (version !== NATIVE_RECORD_VERSION_1 || logicalSize < SPAWN_REQUEST_V1_MIN_SIZE) return null;
+  if (logicalSize > bytes.byteLength) throw new Error('native spawn request exceeds buffer');
+
+  const readU32 = (off: number) => {
+    if (off < 0 || off + 4 > logicalSize) throw new Error('native spawn scalar out of bounds');
+    return view.getUint32(off, true);
+  };
+  const readI32 = (off: number) => {
+    if (off < 0 || off + 4 > logicalSize) throw new Error('native spawn scalar out of bounds');
+    return view.getInt32(off, true);
+  };
+  const readSpan = (off: number): string | undefined => {
+    const spanOff = readU32(off);
+    const len = readU32(off + 4);
+    if (spanOff === 0 && len === 0) return undefined;
+    if (spanOff % 4 !== 0) throw new Error('native spawn unaligned span');
+    if (spanOff + len > logicalSize) throw new Error('native spawn span out of bounds');
+    return fatalUtf8Decoder.decode(bytes.subarray(spanOff, spanOff + len));
+  };
+  const readRequiredSpan = (off: number): string => {
+    const value = readSpan(off);
+    if (value === undefined) throw new Error('native spawn missing required string');
+    return value;
+  };
+  const readStringVec = (vecOff: number, count: number): string[] => {
+    if (count === 0) return [];
+    if (vecOff === 0 || vecOff % 4 !== 0 || vecOff + count * SPAN_SIZE > logicalSize) {
+      throw new Error('native spawn string vec out of bounds');
+    }
+    const out: string[] = [];
+    for (let i = 0; i < count; i++) out.push(readRequiredSpan(vecOff + i * SPAN_SIZE));
+    return out;
+  };
+  const readEnvVec = (vecOff: number, count: number): [string, string][] => {
+    if (count === 0) return [];
+    if (vecOff === 0 || vecOff % 4 !== 0 || vecOff + count * ENV_PAIR_SIZE > logicalSize) {
+      throw new Error('native spawn env vec out of bounds');
+    }
+    const out: [string, string][] = [];
+    for (let i = 0; i < count; i++) {
+      const off = vecOff + i * ENV_PAIR_SIZE;
+      out.push([readRequiredSpan(off), readRequiredSpan(off + SPAN_SIZE)]);
+    }
+    return out;
+  };
+  const readI32Vec = (vecOff: number, count: number): number[] => {
+    if (count === 0) return [];
+    if (vecOff === 0 || vecOff % 4 !== 0 || vecOff + count * 4 > logicalSize) {
+      throw new Error('native spawn i32 vec out of bounds');
+    }
+    const out: number[] = [];
+    for (let i = 0; i < count; i++) out.push(readI32(vecOff + i * 4));
+    return out;
+  };
+  const readFdMap = (vecOff: number, count: number): [number, number][] => {
+    if (count === 0) return [];
+    if (vecOff === 0 || vecOff % 4 !== 0 || vecOff + count * FD_MAP_PAIR_SIZE > logicalSize) {
+      throw new Error('native spawn fd map out of bounds');
+    }
+    const out: [number, number][] = [];
+    for (let i = 0; i < count; i++) {
+      const off = vecOff + i * FD_MAP_PAIR_SIZE;
+      out.push([readI32(off), readI32(off + 4)]);
+    }
+    return out;
+  };
+
+  const argv0 = readSpan(16);
+  const cwd = readSpan(40);
+  const stdinData = readSpan(68);
+  const fdMap = logicalSize >= 88 ? readFdMap(readU32(80), readU32(84)) : [];
+  return {
+    prog: readRequiredSpan(8),
+    ...(argv0 === undefined ? {} : { argv0 }),
+    args: readStringVec(readU32(24), readU32(28)),
+    env: readEnvVec(readU32(32), readU32(36)),
+    cwd: cwd ?? '',
+    stdin_fd: readI32(48),
+    stdout_fd: readI32(52),
+    stderr_fd: readI32(56),
+    pass_fds: readI32Vec(readU32(60), readU32(64)),
+    fd_map: fdMap,
+    ...(stdinData === undefined ? {} : { stdin_data: stdinData }),
+    nice: readI32(76),
+  };
+}
 
 function yieldToScheduler(): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -245,6 +404,82 @@ function resolveCwdPath(cwd: string, path: string): string {
   return normalizeImportPath(cwd === '/' ? `/${path}` : `${cwd}/${path}`);
 }
 
+function resolveLogicalCwdPath(cwd: string, path: string): string {
+  if (path.startsWith('/')) {
+    const physicalCwd = normalizeImportPath(cwd);
+    const physicalPath = normalizeImportPath(path);
+    if (cwd !== physicalCwd) {
+      if (physicalPath === physicalCwd) return cwd;
+      const prefix = physicalCwd === '/' ? '/' : `${physicalCwd}/`;
+      if (physicalPath.startsWith(prefix)) {
+        const suffix = physicalPath.slice(prefix.length);
+        return cwd === '/' ? `/${suffix}` : `${cwd}/${suffix}`;
+      }
+    }
+  }
+  const raw = path.startsWith('/') ? path : cwd === '/' ? `/${path}` : `${cwd}/${path}`;
+  const parts: string[] = [];
+  for (const part of raw.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return '/' + parts.join('/');
+}
+
+function dirnameOfPath(path: string): string {
+  const normalized = normalizeImportPath(path);
+  if (normalized === '/') return '/';
+  const slash = normalized.lastIndexOf('/');
+  return slash <= 0 ? '/' : normalized.slice(0, slash);
+}
+
+function splitResolutionPath(path: string): string[] {
+  if (!path.startsWith('/')) throw new Error(`ENOENT: not an absolute path: ${path}`);
+  return path.split('/').filter((part) => part !== '' && part !== '.');
+}
+
+function resolveRealpath(vfs: VfsLike, cwd: string, rawPath: string): string {
+  if (rawPath === '') throw new Error('ENOENT: empty path');
+  const startPath = rawPath.startsWith('/')
+    ? rawPath
+    : cwd === '/' ? `/${rawPath}` : `${cwd}/${rawPath}`;
+  let queue = splitResolutionPath(startPath);
+  const resolved: string[] = [];
+  let symlinkDepth = 0;
+
+  while (queue.length > 0) {
+    const part = queue.shift()!;
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      resolved.pop();
+      continue;
+    }
+
+    const candidate = '/' + [...resolved, part].join('/');
+    const stat = vfs.lstat(candidate);
+    if (stat.type !== 'symlink') {
+      resolved.push(part);
+      continue;
+    }
+    if (++symlinkDepth > 40) throw new Error('ELOOP: too many symlink levels');
+
+    const target = vfs.readlink(candidate);
+    const targetPath = target.startsWith('/')
+      ? target
+      : `${dirnameOfPath(candidate)}/${target}`;
+    queue = [...splitResolutionPath(targetPath), ...queue];
+    resolved.length = 0;
+  }
+
+  const real = '/' + resolved.join('/');
+  vfs.stat(real);
+  return real === '' ? '/' : real;
+}
+
 export function createKernelImports(opts: KernelImportsOptions): Record<string, WebAssembly.ImportValue> {
   const { memory } = opts;
   const callerPid = opts.callerPid ?? 0;
@@ -282,6 +517,19 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       : fn();
   }
 
+  function authorizeChown(path: string, uid: number, gid: number, followSymlinks = true): number {
+    const credentials = getCallerCredentials();
+    if (credentials.euid === ROOT_UID) return 0;
+    if (gid !== -1 && gid !== credentials.egid) return ERR_PERMISSION;
+    if (uid === -1) return 0;
+    try {
+      const stat = followSymlinks ? opts.vfs!.stat(path) : opts.vfs!.lstat(path);
+      return stat.uid === credentials.euid && uid === stat.uid ? 0 : ERR_PERMISSION;
+    } catch {
+      return ERR_PERMISSION;
+    }
+  }
+
   function limitToBigUint64(limit: number): bigint {
     if (!Number.isFinite(limit)) return 0xffff_ffff_ffff_ffffn;
     return BigInt(Math.max(0, Math.trunc(limit)));
@@ -292,6 +540,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     if (target.type === 'pipe_read') target.pipe.close();
     if (target.type === 'vfs_file') {
       if (target.fdTable.isOpen(target.fd)) target.fdTable.close(target.fd);
+      target.refs = Math.max(0, target.refs - 1);
     }
     if (target.type === 'socket') {
       target.refs--;
@@ -316,6 +565,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     if (target.type === 'pipe_write') target.pipe.addRef();
     if (target.type === 'pipe_read') target.pipe.addRef();
     if (target.type === 'vfs_file') target.fdTable.retain(target.fd);
+    if (target.type === 'vfs_file') target.refs++;
     if (target.type === 'socket') target.refs++;
   }
 
@@ -358,6 +608,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
   function getCallerCwd(): string {
     return opts.kernel?.getCwd(callerPid) ?? opts.wasiHost?.getCwd() ?? '/';
+  }
+
+  function getCallerPhysicalCwd(): string {
+    const cwd = getCallerCwd();
+    if (!opts.vfs) return normalizeImportPath(cwd);
+    try {
+      return withVfsCallerCredentials(() => resolveRealpath(opts.vfs!, cwd, '.'));
+    } catch {
+      return normalizeImportPath(cwd);
+    }
   }
 
   function setCallerCwd(cwd: string): void {
@@ -487,10 +747,10 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // ── Process management (new) ──
 
     // host_pipe(out_ptr, out_cap) -> i32
-    // Creates a pipe and writes { read_fd, write_fd } as JSON to the output buffer.
+    // Creates a pipe and writes yurt_pipe_result_v1 to the output buffer.
     host_pipe(outPtr: number, outCap: number): number {
       if (!opts.kernel) {
-        return writeJson(memory, outPtr, outCap, { error: 'kernel not available' });
+        return ERR_IO;
       }
       const { readFd, writeFd } = opts.kernel.createPipe(callerPid);
       if (opts.wasiHost) {
@@ -500,18 +760,59 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         if (readTarget) ioFds.set(readFd, readTarget);
         if (writeTarget) ioFds.set(writeFd, writeTarget);
       }
-      return writeJson(memory, outPtr, outCap, { read_fd: readFd, write_fd: writeFd });
+      return writePipeResult(memory, outPtr, outCap, readFd, writeFd);
     },
 
-    // host_spawn(req_ptr, req_len) -> i32 (pid or -1 on error)
-    // Spawns a child WASM process. The request is a JSON SpawnRequest.
+    // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32
+    // Native 4-argument form writes yurt_spawn_result_v1. The 2-argument
+    // JSON form remains for host_spawn_async compatibility.
     //
     // Compatibility: shell-exec also imports a legacy synchronous
     // host_spawn(req_ptr, req_len, out_ptr, out_cap) ABI for tests. Keep
     // that branch here for backwards compatibility.
     host_spawn(reqPtr: number, reqLen: number, outPtr?: number, outCap?: number): number {
-      const reqJson = readString(memory, reqPtr, reqLen);
+      const spawnFromRequest = (req: SpawnRequest): number => {
+        const requestedNice = normalizeNice(req.nice ?? 0);
+        if (requestedNice > 0 && !schedulerBackend) return ERR_UNSUPPORTED;
+        if (req.nice !== undefined) req.nice = requestedNice;
+        if (opts.spawnProcess && opts.kernel) {
+          if (!opts.kernel.canReserveProcessSlot()) return -1;
+          const fdTable = opts.kernel.buildFdTableForSpawn(callerPid, req);
+          let previousStdin: FdTarget | undefined;
+          if (req.stdin_data) {
+            previousStdin = fdTable.get(0);
+            fdTable.set(0, createStaticTarget(new TextEncoder().encode(req.stdin_data)));
+          }
+          try {
+            const childPid = opts.spawnProcess(req, fdTable, callerPid);
+            if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
+            return childPid;
+          } catch (e) {
+            opts.kernel.releaseFdTable(fdTable);
+            if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
+            const msg = e instanceof Error ? e.message : String(e);
+            if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+            if (msg.includes('ENOENT') || msg.includes('no such file or directory')) return ERR_NOT_FOUND;
+            if (msg.includes('ENOTDIR') || msg.includes('not a directory')) return ERR_NOT_DIR;
+            return -1;
+          }
+        }
+        return -1;
+      };
+
+      const reqBytes = readBytes(memory, reqPtr, reqLen);
       if (typeof outPtr === 'number' && typeof outCap === 'number') {
+        try {
+          const nativeReq = decodeNativeSpawnRequest(reqBytes);
+          if (nativeReq) {
+            const pid = spawnFromRequest(nativeReq);
+            return pid < 0 ? pid : writeSpawnResult(memory, outPtr, outCap, pid);
+          }
+        } catch {
+          return ERR_INVALID;
+        }
+
+        const reqJson = new TextDecoder().decode(reqBytes);
         let req: { program?: string; args?: string[]; env?: [string, string][]; cwd?: string; stdin?: string; stdin_fd?: number };
         try { req = JSON.parse(reqJson); } catch { req = {}; }
 
@@ -519,7 +820,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         const args = req.args?.map(String) ?? [];
         const env: Record<string, string> = {};
         if (req.env) for (const [k, v] of req.env) env[k] = v;
-        const cwd = req.cwd ?? '/';
+        const cwd = req.cwd ?? getCallerCwd();
         let stdinStr = req.stdin ?? '';
         if (!stdinStr && typeof req.stdin_fd === 'number' && opts.kernel) {
           const stdinTarget = opts.kernel.getFdTarget(callerPid, req.stdin_fd);
@@ -552,30 +853,9 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         });
       }
 
+      const reqJson = new TextDecoder().decode(reqBytes);
       const req = JSON.parse(reqJson) as SpawnRequest;
-      const requestedNice = normalizeNice(req.nice ?? 0);
-      if (requestedNice > 0 && !schedulerBackend) return ERR_UNSUPPORTED;
-      if (req.nice !== undefined) req.nice = requestedNice;
-      if (opts.spawnProcess && opts.kernel) {
-        if (!opts.kernel.canReserveProcessSlot()) return -1;
-        const fdTable = opts.kernel.buildFdTableForSpawn(callerPid, req);
-        let previousStdin: FdTarget | undefined;
-        // If stdin_data is provided, override fd 0 with a static target
-        if (req.stdin_data) {
-          previousStdin = fdTable.get(0);
-          fdTable.set(0, createStaticTarget(new TextEncoder().encode(req.stdin_data)));
-        }
-        try {
-          const childPid = opts.spawnProcess(req, fdTable, callerPid);
-          if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
-          return childPid;
-        } catch {
-          opts.kernel.releaseFdTable(fdTable);
-          if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
-          return -1;
-        }
-      }
-      return -1;
+      return spawnFromRequest(req);
     },
 
     // host_getpid() -> i32
@@ -721,13 +1001,34 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     },
 
     host_getcwd(outPtr: number, outCap: number): number {
-      const cwd = getCallerCwd();
+      const cwd = getCallerPhysicalCwd();
       const bytes = new TextEncoder().encode(cwd);
       const required = bytes.byteLength + 1;
       if (outCap < required) return required;
       new Uint8Array(memory.buffer, outPtr, bytes.byteLength).set(bytes);
       new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
       return required;
+    },
+
+    host_realpath(pathPtr: number, pathLen: number, outPtr: number, outCap: number): number {
+      if (!opts.vfs) return ERR_IO;
+      const rawPath = readString(memory, pathPtr, pathLen);
+      try {
+        const real = withVfsCallerCredentials(() => resolveRealpath(opts.vfs!, getCallerCwd(), rawPath));
+        const bytes = new TextEncoder().encode(real);
+        const required = bytes.byteLength + 1;
+        if (outCap < required) return required;
+        new Uint8Array(memory.buffer, outPtr, bytes.byteLength).set(bytes);
+        new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
+        return required;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : '';
+        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
+        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        if (msg.includes('ENOTDIR') || msg.includes('not a directory')) return ERR_NOT_DIR;
+        if (msg.includes('ELOOP')) return ERR_INVALID;
+        return ERR_IO;
+      }
     },
 
     host_chdir(pathPtr: number, pathLen: number): number {
@@ -737,7 +1038,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       try {
         const stat = opts.vfs.stat(path);
         if (stat.type !== 'dir') return ERR_NOT_DIR;
-        setCallerCwd(path);
+        setCallerCwd(resolveLogicalCwdPath(getCallerCwd(), rawPath));
         return 0;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : '';
@@ -778,8 +1079,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // `kill -9` style termination from one in-sandbox process to another.
     // Returns 0 on success, -1 with errno=ESRCH (3) if no such process,
     // mirroring kill(2).
-    async host_kill(pid: number, sig: number): Promise<number> {
-      await yieldToScheduler();
+    host_kill(pid: number, sig: number): number {
       opts.wasiHost?.drainPendingSignals();
       if (!opts.kernel) return -1;
       const exists = opts.kernel
@@ -830,10 +1130,14 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // host_killpg(pgid, sig) -> i32
     // Sends sig to all processes in process group pgid.
     // Returns 0 if at least one process was signalled, -1 if none found.
-    async host_killpg(pgid: number, sig: number): Promise<number> {
-      await yieldToScheduler();
+    host_killpg(pgid: number, sig: number): number {
       opts.wasiHost?.drainPendingSignals();
       if (!opts.kernel) return -1;
+      if (sig === 0) {
+        return opts.kernel
+          .listProcesses()
+          .some((p) => p.pgid === pgid && p.state !== 'exited') ? 0 : -1;
+      }
       return opts.kernel.killpg(pgid, sig) > 0 ? 0 : -1;
     },
 
@@ -928,39 +1232,61 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       return writeBytes(memory, outPtr, outCap, buf);
     },
 
-    // host_waitpid(pid, out_ptr, out_cap) -> i32
+    // host_wait(pid, flags, out_ptr, out_cap) -> i32
     // Async — must be wrapped with WebAssembly.Suspending for JSPI.
-    // Waits for a child process to exit and writes { pid, exit_code } to the output buffer.
-    async host_waitpid(pid: number, outPtr: number, outCap: number): Promise<number> {
-      if (!opts.kernel) {
-        return writeJson(memory, outPtr, outCap, { exit_code: -1 });
-      }
-      await yieldToScheduler();
+    // Waits for a child process to exit and writes yurt_wait_result_v1.
+    host_wait(pid: number, flags: number, outPtr: number, outCap: number): number | Promise<number> {
+      if (!opts.kernel) return ERR_CHILD;
+      const kernel = opts.kernel;
       opts.wasiHost?.drainPendingSignals();
-      const signalWait = opts.wasiHost?.waitForSignalDelivery();
-      const interrupt = signalWait?.promise ?? new Promise<void>(() => {});
-      if (pid <= 0) {
-        const waited = await opts.kernel.waitAnyChildInterruptible(callerPid, interrupt);
+      const nohang = (flags & YURT_WAIT_NOHANG) !== 0;
+
+      if (nohang) {
+        if (pid <= 0) {
+          const result = kernel.waitAnyChildNohang(callerPid);
+          if (result.state === 'running') return ERR_AGAIN;
+          if (result.state === 'none') return ERR_CHILD;
+          return writeWaitResult(memory, outPtr, outCap, result.pid, result.exitCode);
+        }
+        const exitCode = kernel.waitpidNohang(pid, callerPid);
+        if (exitCode === -1) return ERR_AGAIN;
+        if (exitCode < 0) return ERR_CHILD;
+        return writeWaitResult(memory, outPtr, outCap, pid, exitCode);
+      }
+
+      return (async () => {
+        await yieldToScheduler();
+        opts.wasiHost?.drainPendingSignals();
+        const signalWait = opts.wasiHost?.waitForSignalDelivery();
+        const interrupt = signalWait?.promise ?? new Promise<void>(() => {});
+        if (pid <= 0) {
+          const waited = await kernel.waitAnyChildInterruptible(callerPid, interrupt);
+          signalWait?.cancel();
+          if (waited.interrupted) {
+            opts.wasiHost?.drainPendingSignals();
+            const result = kernel.waitAnyChildNohang(callerPid);
+            if (result.state === 'exited') {
+              return writeWaitResult(memory, outPtr, outCap, result.pid, result.exitCode);
+            }
+            return ERR_INTERRUPTED;
+          }
+          const result = waited.result;
+          if (!result) return ERR_CHILD;
+          return writeWaitResult(memory, outPtr, outCap, result.pid, result.exitCode);
+        }
+        const waited = await kernel.waitpidInterruptible(pid, callerPid, interrupt);
         signalWait?.cancel();
         if (waited.interrupted) {
           opts.wasiHost?.drainPendingSignals();
+          const exitCode = kernel.waitpidNohang(pid, callerPid);
+          if (exitCode >= 0) {
+            return writeWaitResult(memory, outPtr, outCap, pid, exitCode);
+          }
           return ERR_INTERRUPTED;
         }
-        const result = waited.result;
-        if (!result) return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
-        return writeJson(memory, outPtr, outCap, {
-          pid: result.pid,
-          exit_code: result.exitCode,
-        });
-      }
-      const waited = await opts.kernel.waitpidInterruptible(pid, callerPid, interrupt);
-      signalWait?.cancel();
-      if (waited.interrupted) {
-        opts.wasiHost?.drainPendingSignals();
-        return ERR_INTERRUPTED;
-      }
-      const exitCode = waited.exitCode;
-      return writeJson(memory, outPtr, outCap, { pid, exit_code: exitCode });
+        if (waited.exitCode < 0) return ERR_CHILD;
+        return writeWaitResult(memory, outPtr, outCap, pid, waited.exitCode);
+      })();
     },
 
     // host_close_fd(fd) -> i32
@@ -1022,15 +1348,15 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     },
 
     // host_dup(fd, out_ptr, out_cap) -> i32
-    // Duplicates a file descriptor, returning a new fd pointing to the same target.
+    // Duplicates a file descriptor and writes the new fd as int32_t.
     host_dup(fd: number, outPtr: number, outCap: number): number {
-      if (!opts.kernel) return -1;
-      if (isActivePreopenFd(fd)) return -1;
+      if (!opts.kernel) return ERR_IO;
+      if (isActivePreopenFd(fd)) return -9;
       try {
         const newFd = opts.kernel.dup(callerPid, fd);
-        return writeJson(memory, outPtr, outCap, { fd: newFd });
+        return writeI32(memory, outPtr, outCap, newFd);
       } catch {
-        return -1;
+        return -9;
       }
     },
 
@@ -1043,9 +1369,6 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         const kernelTarget = opts.kernel?.getFdTarget(callerPid, srcFd);
         if (opts.kernel && kernelTarget) {
           const newFd = opts.kernel.dupMin(callerPid, srcFd, minFd);
-          if (opts.wasiHost && opts.wasiHost.getIoFds() !== opts.kernel.getFdTable(callerPid)) {
-            opts.wasiHost.duplicateFdTo(srcFd, newFd, false);
-          }
           return newFd;
         }
         const newFd = opts.wasiHost?.duplicateFdMin(srcFd, minFd, false);
@@ -1082,6 +1405,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
             if (existing) closeFdTarget(existing);
             if (target.type === 'vfs_file') {
               target.fdTable.dupToShared(target.fd, dstFd);
+              target.refs++;
               ioFds.set(dstFd, { ...target, fd: dstFd, refs: 1 });
             } else {
               retainFdTarget(target);
@@ -1147,59 +1471,6 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     async host_yield(): Promise<void> {
       await new Promise<void>((resolve) => setTimeout(resolve, 0));
       opts.wasiHost?.drainPendingSignals();
-    },
-
-    // host_waitpid_nohang(pid, out_ptr?, out_cap?) -> i32
-    // Non-blocking JSON ABI: returns bytes for an exited child, -1 if still running,
-    // and -2 for ECHILD. The legacy one-argument form returns just the exit code.
-    host_waitpid_nohang(pid: number, outPtr?: number, outCap?: number): number {
-      if (!opts.kernel) return -1;
-      opts.wasiHost?.drainPendingSignals();
-      if (typeof outPtr !== 'number' || typeof outCap !== 'number') {
-        return opts.kernel.waitpidNohang(pid, callerPid);
-      }
-
-      if (pid <= 0) {
-        const result = opts.kernel.waitAnyChildNohang(callerPid);
-        if (result.state === 'running') return -1;
-        if (result.state === 'none') return -2;
-        return writeJson(memory, outPtr, outCap, {
-          pid: result.pid,
-          exit_code: result.exitCode,
-        });
-      }
-
-      const exitCode = opts.kernel.waitpidNohang(pid, callerPid);
-      if (exitCode < 0) return exitCode;
-      return writeJson(memory, outPtr, outCap, { pid, exit_code: exitCode });
-    },
-
-    // host_wait_any(out_ptr, out_cap) -> i32 (async/JSPI)
-    // Waits for any child of the calling process to exit and reaps it.
-    // Writes { pid, exit_code } to output. pid=-1 means no children exist.
-    // Used by waitpid(-1, ..., 0) — blocking wait-any.
-    async host_wait_any(outPtr: number, outCap: number): Promise<number> {
-      if (!opts.kernel) return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
-      await yieldToScheduler();
-      opts.wasiHost?.drainPendingSignals();
-      const result = await opts.kernel.waitAny(callerPid);
-      return writeJson(memory, outPtr, outCap, { pid: result.pid, exit_code: result.exitCode });
-    },
-
-    // host_wait_any_nohang(out_ptr, out_cap) -> i32
-    // Non-blocking wait-any: writes { pid, exit_code } if a child exited, or
-    // { pid: 0 } if no child is ready yet. pid=-1 means no children exist.
-    // Used by waitpid(-1, ..., WNOHANG).
-    host_wait_any_nohang(outPtr: number, outCap: number): number {
-      if (!opts.kernel) return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
-      const result = opts.kernel.waitAnyNohang(callerPid);
-      if (result.state === 'running') {
-        return writeJson(memory, outPtr, outCap, { pid: 0, exit_code: -1 });
-      }
-      if (result.state === 'none') {
-        return writeJson(memory, outPtr, outCap, { pid: -1, exit_code: -1 });
-      }
-      return writeJson(memory, outPtr, outCap, { pid: result.pid, exit_code: result.exitCode });
     },
 
     // host_list_processes(out_ptr, out_cap) -> i32
@@ -1699,7 +1970,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
           const envObj: Record<string, string> = {};
           if (req.env) for (const [k, v] of req.env) envObj[k] = v;
-          const cwd = req.cwd ?? '/';
+          const cwd = req.cwd ?? getCallerCwd();
 
           const result = await opts.extensionRegistry.invoke(name, {
             args, stdin, env: envObj, cwd,
@@ -1910,9 +2181,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
       const path = resolveCwdPath(getCallerCwd(), rawPath);
-      if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
+      const targetUid = uid | 0;
+      const targetGid = gid | 0;
+      const authorized = authorizeChown(path, targetUid, targetGid, followSymlinks !== 0);
+      if (authorized !== 0) return authorized;
       try {
-        withVfsCallerCredentials(() => opts.vfs!.chown(path, uid, gid, followSymlinks !== 0));
+        withVfsCallerCredentials(() => opts.vfs!.chown(path, targetUid, targetGid, followSymlinks !== 0));
         return 0;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : '';
@@ -1924,13 +2198,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
     host_fchown(fd: number, uid: number, gid: number): number {
       if (!opts.vfs || !opts.kernel) return ERR_IO;
+      const targetUid = uid | 0;
+      const targetGid = gid | 0;
       const target = opts.kernel.getFdTarget(callerPid, fd);
       if (!target || target.type !== 'vfs_file') return ERR_NOT_FOUND;
       const path = target.fdTable.getPath(target.fd);
       if (!path) return ERR_NOT_FOUND;
-      if (getCallerCredentials().euid !== ROOT_UID) return ERR_PERMISSION;
+      const authorized = authorizeChown(path, targetUid, targetGid);
+      if (authorized !== 0) return authorized;
       try {
-        withVfsCallerCredentials(() => opts.vfs!.chown(path, uid, gid));
+        withVfsCallerCredentials(() => opts.vfs!.chown(path, targetUid, targetGid));
         return 0;
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : '';
@@ -1956,6 +2233,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       const to = readString(memory, toPtr, toLen);
       try {
         opts.vfs.rename(from, to);
+        opts.kernel?.remapCwdAfterRename(from, to);
         return 0;
       } catch {
         return ERR_IO;

@@ -111,6 +111,78 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
     expect(result.stdout.trim()).toBe('/usr/extensions:/bin:/usr/bin');
   });
 
+  it('openTty initializes login environment and cwd from passwd', async () => {
+    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+
+    sandbox.openTty();
+
+    const env = sandbox.getEnvMap();
+    expect(env.get('HOME')).toBe('/home/user/');
+    expect(env.get('SHELL')).toBe('/bin/sh');
+    expect(env.get('USER')).toBe('user');
+    expect(env.get('LOGNAME')).toBe('user');
+    expect(env.get('TERM')).toBe('xterm-256color');
+    expect(env.get('PWD')).toBe('/home/user');
+
+    const internals = sandbox as unknown as {
+      bootProcess: { pid: number };
+      kernel: { getCwd(pid: number): string };
+    };
+    expect(internals.kernel.getCwd(internals.bootProcess.pid)).toBe('/home/user');
+  });
+
+  it('startHostSession initializes environment and cwd without opening a tty', async () => {
+    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+
+    sandbox.startHostSession();
+
+    const env = sandbox.getEnvMap();
+    expect(env.get('HOME')).toBe('/home/user/');
+    expect(env.get('SHELL')).toBe('/bin/sh');
+    expect(env.get('USER')).toBe('user');
+    expect(env.get('LOGNAME')).toBe('user');
+    expect(env.get('TERM')).toBe('xterm-256color');
+    expect(env.get('PWD')).toBe('/home/user');
+
+    const result = await sandbox.run('pwd; echo "$HOME"; echo "$SHELL"; echo "$USER"; echo "$LOGNAME"; echo "$TERM"; echo "$PWD"');
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim().split('\n')).toEqual([
+      '/home/user',
+      '/home/user/',
+      '/bin/sh',
+      'user',
+      'user',
+      'xterm-256color',
+      '/home/user',
+    ]);
+  });
+
+  it('openTty preserves explicit host session environment and uses explicit PWD as cwd', async () => {
+    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+    sandbox.setEnv('HOME', '/tmp');
+    sandbox.setEnv('SHELL', '/bin/custom-sh');
+    sandbox.setEnv('USER', 'custom-user');
+    sandbox.setEnv('LOGNAME', 'custom-logname');
+    sandbox.setEnv('TERM', 'vt100');
+    sandbox.setEnv('PWD', '/tmp');
+
+    sandbox.openTty();
+
+    const env = sandbox.getEnvMap();
+    expect(env.get('HOME')).toBe('/tmp');
+    expect(env.get('SHELL')).toBe('/bin/custom-sh');
+    expect(env.get('USER')).toBe('custom-user');
+    expect(env.get('LOGNAME')).toBe('custom-logname');
+    expect(env.get('TERM')).toBe('vt100');
+    expect(env.get('PWD')).toBe('/tmp');
+
+    const internals = sandbox as unknown as {
+      bootProcess: { pid: number };
+      kernel: { getCwd(pid: number): string };
+    };
+    expect(internals.kernel.getCwd(internals.bootProcess.pid)).toBe('/tmp');
+  });
+
   it('snapshot/restore drops env vars set after the snapshot from the guest', async () => {
     // Regression test for the merge-only __set_env protocol: without
     // an unset path, restore() shrunk Sandbox.env on the host but left

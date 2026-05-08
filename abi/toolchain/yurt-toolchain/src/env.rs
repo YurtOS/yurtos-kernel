@@ -23,6 +23,17 @@ pub struct Env {
     /// Default off; structural verification via `yurt-check --mode=structural`
     /// (the default) doesn't require markers.
     pub markers_enabled: bool,
+    /// Optional compiler instrumentation for diagnostic builds.
+    /// `ubsan-trap` uses clang's trap-only UBSan path, which does not require
+    /// a sanitizer runtime in the WASI sysroot.
+    pub instrumentation: InstrumentationMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstrumentationMode {
+    None,
+    UbsanTrap,
+    Asan,
 }
 
 pub enum WasmOptMode {
@@ -77,6 +88,23 @@ impl Env {
             markers_enabled: var_os(["YURT_CC_MARKERS", "YURT_CC_MARKERS"])
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false),
+            instrumentation: InstrumentationMode::from_env_value(var_os(["YURT_CC_INSTRUMENT"])),
+        }
+    }
+}
+
+impl InstrumentationMode {
+    fn from_env_value(value: Option<OsString>) -> Self {
+        match value
+            .as_ref()
+            .map(|v| v.to_string_lossy().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("ubsan-trap" | "ubsan_trap" | "undefined-trap" | "undefined_trap") => {
+                Self::UbsanTrap
+            }
+            Some("asan" | "address") => Self::Asan,
+            _ => Self::None,
         }
     }
 }

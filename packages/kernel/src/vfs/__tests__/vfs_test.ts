@@ -129,6 +129,31 @@ describe('VFS symlinks', () => {
     expect(new TextDecoder().decode(vfs.readFile('/tmp/link3'))).toBe('ok');
   });
 
+  it('resolves relative symlink targets from the containing directory', () => {
+    const vfs = new VFS();
+    vfs.mkdir('/tmp/root');
+    vfs.mkdir('/tmp/root/real');
+    vfs.mkdir('/tmp/root/sub');
+    vfs.writeFile('/tmp/root/real/file.txt', new TextEncoder().encode('ok'));
+    vfs.symlink('../real', '/tmp/root/sub/fake');
+
+    const stat = vfs.stat('/tmp/root/sub/fake');
+    expect(stat.type).toBe('dir');
+    expect(new TextDecoder().decode(vfs.readFile('/tmp/root/sub/fake/file.txt')))
+      .toBe('ok');
+  });
+
+  it('applies parent traversal after resolving symlink path components', () => {
+    const vfs = new VFS();
+    vfs.mkdirp('/tmp/root/dir3/subdir');
+    vfs.mkdirp('/tmp/root/dir3/hello');
+    vfs.writeFile('/tmp/root/dir3/hello/world', new TextEncoder().encode('ok'));
+    vfs.symlink('dir3/subdir', '/tmp/root/link');
+
+    expect(new TextDecoder().decode(vfs.readFile('/tmp/root/link/../hello/world')))
+      .toBe('ok');
+  });
+
   it('throws on symlink chain exceeding max depth', () => {
     const vfs = new VFS();
     // Create 41 directories to hold symlinks, each pointing to the next
@@ -466,6 +491,13 @@ describe('mode-bit enforcement', () => {
       vfs.writeFile('/bin/tool', new Uint8Array(1));
     });
     expect(vfs.stat('/bin/tool').type).toBe('file');
+  });
+
+  it('preserves setuid, setgid, and sticky mode bits', () => {
+    const vfs = new VFS();
+    vfs.mkdir('/tmp/modish');
+    vfs.chmod('/tmp/modish', 0o7710);
+    expect(vfs.stat('/tmp/modish').permissions).toBe(0o7710);
   });
 
   it('creating top-level dirs → EACCES', () => {

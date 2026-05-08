@@ -4,7 +4,7 @@
 //! Provides the host-side state for:
 //! - `host_pipe` / `host_close_fd` / `host_dup` / `host_dup2`
 //! - `host_read_fd` / `host_write_fd`
-//! - `host_spawn_async` / `host_waitpid` / `host_waitpid_nohang`
+//! - `host_spawn_async` / `host_wait`
 //! - `host_list_processes`
 
 use std::collections::HashMap;
@@ -30,6 +30,36 @@ pub enum FdEntry {
     Pipe(PipeBuf),
     /// /dev/null — writes are discarded, reads return empty.
     Null,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reap_any_exit_reaps_any_completed_child() {
+        let mut kernel = ProcessKernel::default();
+        let (_running_tx, running_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let running_pid = kernel.add_process(running_rx);
+        let done_pid = kernel.add_process(done_rx);
+
+        done_tx.send(23).unwrap();
+
+        assert_eq!(kernel.reap_any_exit(), Some((done_pid, 23)));
+        assert_eq!(kernel.poll_exit(done_pid), None);
+        assert_eq!(kernel.poll_exit(running_pid), None);
+    }
+
+    #[test]
+    fn reap_any_exit_reports_none_when_children_are_still_running() {
+        let mut kernel = ProcessKernel::default();
+        let (_tx, rx) = oneshot::channel();
+        kernel.add_process(rx);
+
+        assert!(kernel.has_children());
+        assert_eq!(kernel.reap_any_exit(), None);
+    }
 }
 
 impl FdEntry {
@@ -193,6 +223,21 @@ impl ProcessKernel {
                 Err(_) => None,
             },
         }
+    }
+
+    pub fn has_children(&self) -> bool {
+        !self.procs.is_empty()
+    }
+
+    pub fn reap_any_exit(&mut self) -> Option<(i32, i32)> {
+        let pids = self.procs.keys().copied().collect::<Vec<_>>();
+        for pid in pids {
+            if let Some(code) = self.poll_exit(pid) {
+                self.procs.remove(&pid);
+                return Some((pid, code));
+            }
+        }
+        None
     }
 
     /// Snapshot all processes for `host_list_processes`.

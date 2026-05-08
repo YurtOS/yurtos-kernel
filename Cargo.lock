@@ -3978,6 +3978,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "yurt-process",
  "yurt-shell",
  "zip",
 ]

@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+#[cfg(target_arch = "wasm32")]
+use yurt_process::{build_spawn_request, SpawnRequest as YurtSpawnRequest};
 
 // ---------------------------------------------------------------------------
 // Types shared between trait and WASM host
@@ -20,6 +22,31 @@ pub struct FetchResult {
     #[serde(default)]
     pub body_base64: Option<String>,
     pub error: Option<String>,
+}
+
+#[cfg(target_arch = "wasm32")]
+const YURT_WAIT_NOHANG: i32 = 1;
+
+#[cfg(target_arch = "wasm32")]
+#[repr(C)]
+struct YurtPipeResult {
+    read_fd: i32,
+    write_fd: i32,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[repr(C)]
+struct YurtWaitResult {
+    pid: i32,
+    exit_code: i32,
+    signal: i32,
+    flags: i32,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[repr(C)]
+struct YurtSpawnResult {
+    pid: i32,
 }
 
 impl FetchResult {
@@ -227,7 +254,7 @@ pub trait HostInterface {
 #[link(wasm_import_module = "yurt")]
 extern "C" {
     /// Spawn a process on the host.
-    /// `req_ptr`/`req_len` — pointer and length of a JSON-encoded spawn request.
+    /// `req_ptr`/`req_len` — pointer and length of a native spawn request.
     /// `out_ptr`/`out_cap` — pointer and capacity of a caller-allocated output buffer.
     /// Returns the number of bytes written to `out_ptr`, or a negative error code.
     pub fn host_spawn(req_ptr: *const u8, req_len: u32, out_ptr: *mut u8, out_cap: u32) -> i32;
@@ -320,27 +347,21 @@ extern "C" {
 
     // ----- Process management syscalls (Task 5) -----
 
-    /// Create a pipe. Writes JSON `{"read_fd": N, "write_fd": M}` into the
-    /// output buffer. Returns bytes written, or negative error code.
+    /// Create a pipe. Writes yurt_pipe_result_v1 into the output buffer.
+    /// Returns bytes written, or negative error code.
     fn host_pipe(out_ptr: *mut u8, out_cap: u32) -> i32;
-
-    /// Spawn a child process asynchronously (does NOT wait for exit).
-    /// `req_ptr`/`req_len` — JSON-encoded spawn request with prog, args, env,
-    /// cwd, stdin_fd, stdout_fd, stderr_fd.
-    /// Returns the child PID (>= 0) or a negative error code.
-    fn host_spawn_async(req_ptr: *const u8, req_len: u32) -> i32;
 
     /// Wait for a child process to exit (BLOCKING — JSPI suspends the WASM
     /// stack while the host awaits the child).
-    /// Writes JSON `{"exit_code": N}` into the output buffer.
+    /// Writes yurt_wait_result_v1 into the output buffer.
     /// Returns bytes written, or negative error code.
-    fn host_waitpid(pid: i32, out_ptr: *mut u8, out_cap: u32) -> i32;
+    fn host_wait(pid: i32, flags: i32, out_ptr: *mut u8, out_cap: u32) -> i32;
 
     /// Close a host-side file descriptor. Returns 0 on success, negative on error.
     fn host_close_fd(fd: i32) -> i32;
 
     /// Duplicate fd: creates a new fd pointing to the same target.
-    /// Writes JSON `{"fd": N}` into the output buffer, or negative error code.
+    /// Writes one int32_t fd into the output buffer, or negative error code.
     fn host_dup(fd: i32, out_ptr: *mut u8, out_cap: u32) -> i32;
 
     /// Duplicate fd: makes dst_fd point to the same target as src_fd.
@@ -357,9 +378,6 @@ extern "C" {
     /// Yield to the JS microtask queue (cooperative scheduling: sleep(0)).
     /// JSPI-suspending — allows other WASM stacks to run.
     fn host_yield();
-
-    /// Non-blocking waitpid. Returns exit code if done, -1 if still running.
-    fn host_waitpid_nohang(pid: i32) -> i32;
 
     /// List all processes. Writes JSON array to output buffer.
     fn host_list_processes(out_ptr: *mut u8, out_cap: u32) -> i32;
@@ -459,31 +477,40 @@ impl HostInterface for WasmHost {
         stderr_fd: i32,
         nice: u8,
     ) -> Result<i32, HostError> {
-        let mut req = serde_json::json!({
-            "prog": program,
-            "args": args,
-            "env": env,
-            "cwd": cwd,
-            "stdin_fd": stdin_fd,
-            "stdout_fd": stdout_fd,
-            "stderr_fd": stderr_fd,
-            "nice": nice,
+        let req_bytes = build_spawn_request(&YurtSpawnRequest {
+            program,
+            argv0,
+            args,
+            env,
+            cwd: if cwd.is_empty() { None } else { Some(cwd) },
+            stdin_data: if stdin_data.is_empty() {
+                None
+            } else {
+                Some(stdin_data)
+            },
+            stdin_fd,
+            stdout_fd,
+            stderr_fd,
+            pass_fds: &[],
+            fd_map: &[],
+            nice: i32::from(nice),
         });
-        if let Some(v) = argv0 {
-            req["argv0"] = serde_json::Value::String(v.to_string());
-        }
-        if !stdin_data.is_empty() {
-            req["stdin_data"] = serde_json::Value::String(stdin_data.to_string());
-        }
-        let req_bytes = req.to_string();
-        let pid = unsafe { host_spawn_async(req_bytes.as_ptr(), req_bytes.len() as u32) };
-        if pid < 0 {
+        let mut result = YurtSpawnResult { pid: -1 };
+        let rc = unsafe {
+            host_spawn(
+                req_bytes.as_ptr(),
+                req_bytes.len() as u32,
+                (&mut result as *mut YurtSpawnResult).cast::<u8>(),
+                std::mem::size_of::<YurtSpawnResult>() as u32,
+            )
+        };
+        if rc != std::mem::size_of::<YurtSpawnResult>() as i32 || result.pid < 0 {
             return Err(HostError::IoError(format!(
                 "spawn({}): host error code {}",
-                program, pid
+                program, rc
             )));
         }
-        Ok(pid)
+        Ok(result.pid)
     }
 
     fn has_tool(&self, name: &str) -> bool {
@@ -684,24 +711,50 @@ impl HostInterface for WasmHost {
     // ----- Process management (Task 5) -----
 
     fn pipe(&self) -> Result<(i32, i32), HostError> {
-        let result_json = call_with_outbuf("pipe", |out_ptr, out_cap| unsafe {
-            host_pipe(out_ptr, out_cap)
-        })?;
-        let parsed: serde_json::Value = serde_json::from_str(&result_json)
-            .map_err(|e| HostError::IoError(format!("pipe: {e}")))?;
-        let read_fd = parsed["read_fd"].as_i64().unwrap_or(-1) as i32;
-        let write_fd = parsed["write_fd"].as_i64().unwrap_or(-1) as i32;
-        Ok((read_fd, write_fd))
+        let mut result = YurtPipeResult {
+            read_fd: -1,
+            write_fd: -1,
+        };
+        let rc = unsafe {
+            host_pipe(
+                (&mut result as *mut YurtPipeResult).cast::<u8>(),
+                std::mem::size_of::<YurtPipeResult>() as u32,
+            )
+        };
+        if rc != std::mem::size_of::<YurtPipeResult>() as i32
+            || result.read_fd < 0
+            || result.write_fd < 0
+        {
+            return Err(HostError::IoError(format!("pipe: host error code {rc}")));
+        }
+        Ok((result.read_fd, result.write_fd))
     }
 
     fn waitpid(&self, pid: i32) -> Result<SpawnResult, HostError> {
-        let result_json = call_with_outbuf("waitpid", |out_ptr, out_cap| unsafe {
-            host_waitpid(pid, out_ptr, out_cap)
-        })?;
-        let parsed: serde_json::Value = serde_json::from_str(&result_json)
-            .map_err(|e| HostError::IoError(format!("waitpid: {e}")))?;
+        let mut result = YurtWaitResult {
+            pid: -1,
+            exit_code: -1,
+            signal: 0,
+            flags: 0,
+        };
+        let rc = unsafe {
+            host_wait(
+                pid,
+                0,
+                (&mut result as *mut YurtWaitResult).cast::<u8>(),
+                std::mem::size_of::<YurtWaitResult>() as u32,
+            )
+        };
+        if rc != std::mem::size_of::<YurtWaitResult>() as i32
+            || result.pid < 0
+            || result.exit_code < 0
+        {
+            return Err(HostError::IoError(format!(
+                "waitpid({pid}): host error code {rc}"
+            )));
+        }
         Ok(SpawnResult {
-            exit_code: parsed["exit_code"].as_i64().unwrap_or(-1) as i32,
+            exit_code: result.exit_code,
         })
     }
 
@@ -717,12 +770,19 @@ impl HostInterface for WasmHost {
     }
 
     fn dup(&self, fd: i32) -> Result<i32, HostError> {
-        let result_json = call_with_outbuf("dup", |out_ptr, out_cap| unsafe {
-            host_dup(fd, out_ptr, out_cap)
-        })?;
-        let parsed: serde_json::Value = serde_json::from_str(&result_json)
-            .map_err(|e| HostError::IoError(format!("dup: {e}")))?;
-        let new_fd = parsed["fd"].as_i64().unwrap_or(-1) as i32;
+        let mut new_fd = -1i32;
+        let rc = unsafe {
+            host_dup(
+                fd,
+                (&mut new_fd as *mut i32).cast::<u8>(),
+                std::mem::size_of::<i32>() as u32,
+            )
+        };
+        if rc != std::mem::size_of::<i32>() as i32 {
+            return Err(HostError::IoError(format!(
+                "dup({fd}): host error code {rc}"
+            )));
+        }
         if new_fd < 0 {
             return Err(HostError::IoError(format!("dup({}): invalid fd", fd)));
         }
@@ -761,8 +821,30 @@ impl HostInterface for WasmHost {
     }
 
     fn waitpid_nohang(&self, pid: i32) -> Result<i32, HostError> {
-        let rc = unsafe { host_waitpid_nohang(pid) };
-        Ok(rc)
+        let mut result = YurtWaitResult {
+            pid: -1,
+            exit_code: -1,
+            signal: 0,
+            flags: 0,
+        };
+        let rc = unsafe {
+            host_wait(
+                pid,
+                YURT_WAIT_NOHANG,
+                (&mut result as *mut YurtWaitResult).cast::<u8>(),
+                std::mem::size_of::<YurtWaitResult>() as u32,
+            )
+        };
+        if rc == -11 {
+            return Ok(-1);
+        }
+        if rc == -10 {
+            return Ok(-2);
+        }
+        if rc != std::mem::size_of::<YurtWaitResult>() as i32 {
+            return Ok(-2);
+        }
+        Ok(result.exit_code)
     }
 
     fn list_processes(&self) -> Result<String, HostError> {

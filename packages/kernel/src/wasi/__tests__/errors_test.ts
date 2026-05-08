@@ -11,6 +11,7 @@ import {
   WASI_ENOSPC,
   WASI_ENOTDIR,
   WASI_ENOTEMPTY,
+  WASI_ENXIO,
   WASI_EROFS,
 } from "../types.js";
 
@@ -24,6 +25,7 @@ describe("vfsErrnoToWasi", () => {
     expect(vfsErrnoToWasi("EROFS")).toBe(WASI_EROFS);
     expect(vfsErrnoToWasi("EACCES")).toBe(WASI_EACCES);
     expect(vfsErrnoToWasi("ENOSPC")).toBe(WASI_ENOSPC);
+    expect(vfsErrnoToWasi("ENXIO")).toBe(WASI_ENXIO);
   });
 
   it("falls back to EIO for unrecognized errnos", () => {

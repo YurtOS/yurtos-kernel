@@ -11,6 +11,8 @@
  *                            unwinds the intermediate frames.
  *   - longjmp_negative     : longjmp(env, -7) returns -7 from
  *                            setjmp; the value is preserved as-is.
+ *   - longjmp_deep_stack   : setjmp captures a real, deep C stack
+ *                            before a longjmp rewinds to it.
  *
  * Output is JSONL — one line per case — for easy harness parsing. */
 
@@ -78,6 +80,35 @@ static int case_longjmp_negative(void) {
     return rc == -7 ? 0 : 1;
 }
 
+static jmp_buf deep_env;
+
+static void deep_jump(int value) {
+    longjmp(deep_env, value);
+}
+
+__attribute__((noinline))
+static int deep_setjmp_frame(int depth) {
+    volatile unsigned char padding[512];
+    padding[0] = (unsigned char)depth;
+    padding[sizeof(padding) - 1] = (unsigned char)(depth * 3);
+
+    if (depth > 0) {
+        return deep_setjmp_frame(depth - 1) + padding[0] - (unsigned char)depth;
+    }
+
+    int rc = setjmp(deep_env);
+    if (rc == 0) {
+        deep_jump(23);
+    }
+    return rc + padding[sizeof(padding) - 1];
+}
+
+static int case_longjmp_deep_stack(void) {
+    int rc = deep_setjmp_frame(40);
+    emit("longjmp_deep_stack", rc == 23 ? 0 : 1, rc);
+    return rc == 23 ? 0 : 1;
+}
+
 static int case_setjmp_returns_zero(void) {
     /* The minimal "does setjmp run at all" test — exercises the
      * Phase 1 stub independently of any longjmp work. */
@@ -93,6 +124,7 @@ static int run_case(const char *name) {
     if (strcmp(name, "longjmp_zero") == 0) return case_longjmp_zero();
     if (strcmp(name, "longjmp_through_calls") == 0) return case_longjmp_through_calls();
     if (strcmp(name, "longjmp_negative") == 0) return case_longjmp_negative();
+    if (strcmp(name, "longjmp_deep_stack") == 0) return case_longjmp_deep_stack();
     fprintf(stderr, "setjmp-canary: unknown case %s\n", name);
     return 2;
 }
@@ -103,6 +135,7 @@ static int list_cases(void) {
     puts("longjmp_zero");
     puts("longjmp_through_calls");
     puts("longjmp_negative");
+    puts("longjmp_deep_stack");
     return 0;
 }
 

@@ -9,3 +9,5 @@ dist/
 packages/kernel/src/platform/__tests__/fixtures/*-canary.wasm
 packages/kernel/src/platform/__tests__/fixtures/busybox.manifest.json
 packages/kernel/src/platform/__tests__/fixtures/busybox.wasm
+packages/kernel/src/platform/__tests__/fixtures/terminfo-canary.wasm
+packages/kernel/src/platform/__tests__/fixtures/zsh.wasm

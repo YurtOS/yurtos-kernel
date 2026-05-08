@@ -174,10 +174,14 @@
      }
  }
 
-@@ -384,8 +385,123 @@
+@@ -384,8 +385,131 @@
          actions: *mut PosixSpawnFileActions,
          path: *const c_char,
      ) -> i32;
++    fn posix_spawn_file_actions_addclose(
++        actions: *mut PosixSpawnFileActions,
++        fd: i32,
++    ) -> i32;
 +}
 +
 +fn spawn_command_with_stdio(
@@ -263,6 +267,8 @@
 +        Stdio::MakePipe => {
 +            let pipe = create_pipe()?;
 +            cvt_spawn(unsafe { posix_spawn_file_actions_adddup2(actions, pipe[0], 0) })?;
++            cvt_spawn(unsafe { posix_spawn_file_actions_addclose(actions, pipe[0]) })?;
++            cvt_spawn(unsafe { posix_spawn_file_actions_addclose(actions, pipe[1]) })?;
 +            *parent_pipe = Some(pipe[1]);
 +            close_after_spawn.push(pipe[0]);
 +            close_on_error.extend_from_slice(&pipe);
@@ -285,6 +291,8 @@
 +        Stdio::MakePipe => {
 +            let pipe = create_pipe()?;
 +            cvt_spawn(unsafe { posix_spawn_file_actions_adddup2(actions, pipe[1], child_fd) })?;
++            cvt_spawn(unsafe { posix_spawn_file_actions_addclose(actions, pipe[0]) })?;
++            cvt_spawn(unsafe { posix_spawn_file_actions_addclose(actions, pipe[1]) })?;
 +            *parent_pipe = Some(pipe[0]);
 +            close_after_spawn.push(pipe[1]);
 +            close_on_error.extend_from_slice(&pipe);

@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -222,6 +223,12 @@ static int case_identity_kernel(void) {
     return 1;
   }
 
+  char name[L_cuserid] = {0};
+  if (!cuserid(name) || strcmp(name, "user") != 0) {
+    emit("identity_kernel", 1, name[0] ? name : "identity_kernel:cuserid_failed", 1, errno);
+    return 1;
+  }
+
   emit("identity_kernel", 0, "identity_kernel:ok", 0, 0);
   return 0;
 }
@@ -284,6 +291,61 @@ static int case_cwd_backend(void) {
   }
 
   emit("cwd_backend", 0, "cwd_backend:ok", 0, 0);
+  return 0;
+}
+
+static int case_realpath_backend(void) {
+  const char *base = "/tmp/yurt-realpath-canary";
+  char resolved[128];
+  mkdir(base, 0755);
+  mkdir("/tmp/yurt-realpath-canary/real", 0755);
+  mkdir("/tmp/yurt-realpath-canary/sub", 0755);
+  symlink("../real", "/tmp/yurt-realpath-canary/sub/fake");
+
+  errno = 0;
+  if (!realpath("/tmp/yurt-realpath-canary/./sub/fake/.", resolved) ||
+      strcmp(resolved, "/tmp/yurt-realpath-canary/real") != 0) {
+    emit("realpath_backend", 1, resolved[0] ? resolved : "realpath_backend:canonical_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  char *allocated = realpath("/tmp/yurt-realpath-canary/sub/fake", NULL);
+  if (!allocated || strcmp(allocated, "/tmp/yurt-realpath-canary/real") != 0) {
+    int e = errno;
+    free(allocated);
+    emit("realpath_backend", 1, "realpath_backend:null_buffer_failed", 1, e);
+    return 1;
+  }
+  free(allocated);
+
+  errno = 0;
+  if (realpath("/tmp/yurt-realpath-canary/missing", resolved) != NULL || errno != ENOENT) {
+    emit("realpath_backend", 1, "realpath_backend:missing_not_enoent", 1, errno);
+    return 1;
+  }
+
+  emit("realpath_backend", 0, "realpath_backend:ok", 0, 0);
+  return 0;
+}
+
+static int case_ttyname_stdio(void) {
+  errno = 0;
+  char *name = ttyname(0);
+  if (name != NULL || errno != ENOTTY) {
+    emit("ttyname_stdio", 1, name ? name : "ttyname_stdio:ttyname_not_enotty", 1, errno);
+    return 1;
+  }
+
+  char buf[16];
+  errno = 0;
+  int rc = ttyname_r(1, buf, sizeof(buf));
+  if (rc != ENOTTY) {
+    emit("ttyname_stdio", 1, "ttyname_stdio:ttyname_r_not_enotty", 1, rc);
+    return 1;
+  }
+
+  emit("ttyname_stdio", 0, "ttyname_stdio:enotty", 0, 0);
   return 0;
 }
 
@@ -407,6 +469,8 @@ static int run_case(const char *name) {
   if (strcmp(name, "chown_denied") == 0) return case_chown_denied();
   if (strcmp(name, "identity_kernel") == 0) return case_identity_kernel();
   if (strcmp(name, "cwd_backend") == 0) return case_cwd_backend();
+  if (strcmp(name, "realpath_backend") == 0) return case_realpath_backend();
+  if (strcmp(name, "ttyname_stdio") == 0) return case_ttyname_stdio();
   if (strcmp(name, "priority_unsupported") == 0) return case_priority_unsupported();
   if (strcmp(name, "fcntl_pipe_status_flags") == 0) return case_fcntl_pipe_status_flags();
   if (strcmp(name, "fcntl_setfl_masks_access_mode") == 0) return case_fcntl_setfl_masks_access_mode();
@@ -427,6 +491,8 @@ static int list_cases(void) {
   puts("chown_denied");
   puts("identity_kernel");
   puts("cwd_backend");
+  puts("realpath_backend");
+  puts("ttyname_stdio");
   puts("priority_unsupported");
   puts("fcntl_pipe_status_flags");
   puts("fcntl_setfl_masks_access_mode");

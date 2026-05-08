@@ -38,12 +38,11 @@ extern void yurt_host_longjmp(void *env, int val);
  * `*(uint32_t*)dataAddr` to know where to write next, and
  * `*(uint32_t*)(dataAddr+4)` for the buffer end).
  *
- * 16 KiB is enough for the deepest C call stack we've measured in
- * the canaries and applets that use setjmp; binaries with deeper
- * stacks can grow this in a follow-up without changing the host
- * contract.  The buffer is exported by address so the runtime can
- * locate it without needing __alloc / malloc availability. */
-#define YURT_ASYNCIFY_BUF_SIZE 16384
+ * zsh's parameter-error path uses setjmp/longjmp through a materially
+ * deeper C stack than the small canaries, so keep this large enough for
+ * real shell unwinds.  The buffer is exported by address so the runtime
+ * can locate it without needing __alloc / malloc availability. */
+#define YURT_ASYNCIFY_BUF_SIZE 65536
 
 static char yurt_asyncify_buf[YURT_ASYNCIFY_BUF_SIZE]
     __attribute__((aligned(16)));

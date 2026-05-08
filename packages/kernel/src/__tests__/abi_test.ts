@@ -8,6 +8,7 @@ import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Sandbox } from '../sandbox.js';
 import { NodeAdapter } from '../platform/node-adapter.js';
+import { unsupportedRuntimeEngineBackend } from '../engine/backend.js';
 import type { NetworkBridgeLike, SyncFetchResult, SyncRequestResult } from '../network/bridge.ts';
 import type { SocketBackend, SocketHandle } from '../network/socket-backend.js';
 
@@ -148,6 +149,7 @@ describe('Kernel ABI canaries', () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
+      runtimeBackend: unsupportedRuntimeEngineBackend,
     });
 
     const result = await sandbox.run('posix-runtime-canary --case priority_unsupported');
@@ -166,6 +168,20 @@ describe('Kernel ABI canaries', () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe('{"case":"scheduler_policy_metadata","exit":0,"stdout":"scheduler:policy=other,param=0"}');
+  });
+
+  it('exposes ISO-10646 wchar conversion semantics to C ports', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('locale-canary unicode_quote_ascii');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('locale:iso10646=1');
+    expect(result.stdout).toContain('locale:c_wctomb=-1 errno=25');
+    expect(result.stdout).toContain('locale:strftime_invalid=0 first=120');
   });
 
   // ──────────────────────────────────────────────────────────────────────
@@ -218,6 +234,13 @@ describe('Kernel ABI canaries', () => {
       expect(r.exitCode).toBe(0);
       expect(r.stdout.trim()).toBe('{"case":"longjmp_negative","exit":0,"observed":-7}');
     });
+
+    it('captures enough continuation stack for deep setjmp users', async () => {
+      sandbox = await Sandbox.create({ wasmDir: FIXTURES, adapter: new NodeAdapter() });
+      const r = await sandbox.run('setjmp-canary --case longjmp_deep_stack');
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toBe('{"case":"longjmp_deep_stack","exit":0,"observed":23}');
+    });
   });
 
   describe('fork-canary', () => {
@@ -248,6 +271,13 @@ describe('Kernel ABI canaries', () => {
         expect(r.stdout.trim()).toBe(expected);
       }
     });
+
+    it('allows forked children to exec another process image', async () => {
+      sandbox = await Sandbox.create({ wasmDir: FIXTURES, adapter: new NodeAdapter() });
+      const r = await sandbox.run('fork-canary --case child-exec');
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout.trim()).toBe('fork-child-exec-ok');
+    });
   });
 
   it('routes stderr through stdout after dup2(1, 2)', async () => {
@@ -273,6 +303,18 @@ describe('Kernel ABI canaries', () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe('getgroups:1:1000');
+  });
+
+  it('runs spawn-canary including non-stdio file action open errors', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('spawn-canary');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain('{"case":"open_errno","exit":0}');
   });
 
   it('reports EPERM for unprivileged resource hard-limit raises', async () => {
@@ -382,6 +424,34 @@ describe('Kernel ABI canaries', () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe(
       '{"case":"host_kill_delivers_handler","exit":0,"stdout":"kill:handled"}',
+    );
+  });
+
+  it('round-trips SIGCHLD through the compact signal mask ABI', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('signal-canary --case sigprocmask_sigchld_roundtrip');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      '{"case":"sigprocmask_sigchld_roundtrip","exit":0,"stdout":"sigprocmask:sigchld"}',
+    );
+  });
+
+  it('keeps host-routed signals pending while the guest mask blocks them', async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run('signal-canary --case blocked_host_signal_delivers_after_unblock');
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      '{"case":"blocked_host_signal_delivers_after_unblock","exit":0,"stdout":"kill:blocked-then-handled"}',
     );
   });
 

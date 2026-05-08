@@ -38,33 +38,62 @@ static struct sigaction yurt_signal_actions[NSIG];
 static int yurt_signal_initialized = 0;
 static unsigned yurt_alarm_seconds = 0;
 static unsigned long long yurt_signal_mask = 0;
+static unsigned long long yurt_pending_signal_mask = 0;
+static int yurt_delivering_pending_signals = 0;
 
 static int yurt_signal_validate(int sig);
+static int yurt_signal_compact_slot(int sig);
 static int yurt_sigset_mask_bit(int sig, sigset_t *bit);
 static int yurt_signal_default_terminates(int sig);
+static void yurt_signal_deliver_pending(void);
+static int yurt_raise_now(int sig);
 __attribute__((weak)) int yurt_forward_signal_to_exec_child(int sig);
 
-static int yurt_signal_bit(int sig, unsigned long long *bit) {
+static int yurt_pending_signal_bit(int sig, unsigned long long *bit) {
   if (yurt_signal_validate(sig) != 0) {
     return -1;
   }
-  if (sig >= (int)(8 * sizeof(yurt_signal_mask))) {
+  if (sig >= (int)(8 * sizeof(*bit))) {
     errno = EINVAL;
     return -1;
   }
+
   *bit = 1ull << sig;
   return 0;
 }
 
+static int yurt_signal_compact_slot(int sig) {
+  switch (sig) {
+    case SIGHUP: return 0;
+    case SIGINT: return 1;
+    case SIGQUIT: return 2;
+    case SIGTERM: return 3;
+    case SIGCHLD: return 4;
+    case SIGWINCH: return 5;
+    case SIGPIPE: return 6;
+    case SIGUSR1:
+    case SIGUSR2:
+    case SIGALRM:
+      return 7;
+    default:
+      errno = EINVAL;
+      return -1;
+  }
+}
+
 static int yurt_sigset_mask_bit(int sig, sigset_t *bit) {
+  int slot;
+
   if (yurt_signal_validate(sig) != 0) {
     return -1;
   }
-  if (sig >= (int)(8 * sizeof(sigset_t))) {
-    errno = EINVAL;
+
+  slot = yurt_signal_compact_slot(sig);
+  if (slot < 0) {
     return -1;
   }
-  *bit = (sigset_t)(((unsigned long long)1u) << sig);
+
+  *bit = (sigset_t)(1u << slot);
   return 0;
 }
 
@@ -234,12 +263,15 @@ int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset
   switch (how) {
     case SIG_BLOCK:
       yurt_signal_mask |= (unsigned long long)(*set);
+      yurt_signal_deliver_pending();
       return 0;
     case SIG_UNBLOCK:
       yurt_signal_mask &= ~((unsigned long long)(*set));
+      yurt_signal_deliver_pending();
       return 0;
     case SIG_SETMASK:
       yurt_signal_mask = (unsigned long long)(*set);
+      yurt_signal_deliver_pending();
       return 0;
     default:
       errno = EINVAL;
@@ -256,8 +288,10 @@ int sigsuspend(const sigset_t *mask) {
   if (mask) {
     yurt_signal_mask = (unsigned long long)(*mask);
   }
+  yurt_signal_deliver_pending();
   yurt_host_yield();
   yurt_signal_mask = old_mask;
+  yurt_signal_deliver_pending();
   errno = EINTR;
   return -1;
 }
@@ -268,20 +302,23 @@ int pause(void) {
   return sigsuspend(&mask);
 }
 
-int raise(int sig) {
+static int yurt_raise_now(int sig) {
   YURT_MARKER_CALL(raise);
   sighandler_t handler;
-  unsigned long long bit;
+  unsigned long long pending_bit;
+  sigset_t mask_bit;
 
   if (yurt_signal_validate(sig) != 0) {
     return -1;
   }
 
   yurt_signal_init();
-  if (yurt_signal_bit(sig, &bit) != 0) {
+  if (yurt_pending_signal_bit(sig, &pending_bit) != 0) {
     return -1;
   }
-  if ((yurt_signal_mask & bit) != 0) {
+  if (yurt_sigset_mask_bit(sig, &mask_bit) == 0 &&
+      (yurt_signal_mask & (unsigned long long)mask_bit) != 0) {
+    yurt_pending_signal_mask |= pending_bit;
     return 0;
   }
 
@@ -305,6 +342,39 @@ int raise(int sig) {
   }
 
   return 0;
+}
+
+static void yurt_signal_deliver_pending(void) {
+  if (yurt_delivering_pending_signals) {
+    return;
+  }
+
+  yurt_delivering_pending_signals = 1;
+  for (;;) {
+    int delivered = 0;
+    for (int sig = 1; sig < NSIG; ++sig) {
+      unsigned long long pending_bit;
+      sigset_t mask_bit;
+      if (yurt_pending_signal_bit(sig, &pending_bit) != 0 ||
+          (yurt_pending_signal_mask & pending_bit) == 0) {
+        continue;
+      }
+      if (yurt_sigset_mask_bit(sig, &mask_bit) == 0 &&
+          (yurt_signal_mask & (unsigned long long)mask_bit) != 0) {
+        continue;
+      }
+      yurt_pending_signal_mask &= ~pending_bit;
+      yurt_raise_now(sig);
+      delivered = 1;
+      break;
+    }
+    if (!delivered) break;
+  }
+  yurt_delivering_pending_signals = 0;
+}
+
+int raise(int sig) {
+  return yurt_raise_now(sig);
 }
 
 unsigned alarm(unsigned seconds) {

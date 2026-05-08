@@ -1,11 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use yurt_toolchain::{
-    archive, env, features, preserve, wasi_sdk, wasm_opt, TIER1, WRAPPED_WASI_LIBC_SYMBOLS,
+    archive,
+    env::{self, InstrumentationMode},
+    features, preserve, wasi_sdk, wasm_opt, TIER1, WRAPPED_WASI_LIBC_SYMBOLS,
     YURT_INTERNAL_EXPORTS,
 };
 
@@ -99,6 +101,23 @@ fn repo_include_from_manifest_dir(manifest_dir: &Path) -> Option<PathBuf> {
     }
 }
 
+fn contains_define_or_undef(user_args: &[String], name: &str) -> bool {
+    let define = format!("-D{name}");
+    let define_eq = format!("-D{name}=");
+    let undef = format!("-U{name}");
+    user_args
+        .iter()
+        .any(|a| a == &define || a.starts_with(&define_eq) || a == &undef)
+}
+
+fn contains_exact_arg(user_args: &[String], arg: &str) -> bool {
+    user_args.iter().any(|a| a == arg)
+}
+
+fn is_user_library_arg(arg: &str) -> bool {
+    arg.starts_with("-l") || arg.ends_with(".a")
+}
+
 fn build_clang_invocation(
     sdk: &wasi_sdk::WasiSdk,
     env: &env::Env,
@@ -108,27 +127,81 @@ fn build_clang_invocation(
     let mut argv: Vec<OsString> = Vec::new();
     argv.push(format!("--sysroot={}", sdk.sysroot().display()).into());
     argv.push("--target=wasm32-wasip1".into());
-    for a in user_args {
-        if let Some(filtered) = filter_unsupported_wasm_link_arg(a) {
-            argv.push(filtered.into());
+    if final_yurt_link {
+        argv.push("-O2".into());
+        // Default to C23 (gnu23): gives us nullptr keyword and the
+        // unreachable()/byteswap/etc. additions to <stddef.h>, both of
+        // which gnulib code paths in coreutils require.  Backward-compat:
+        // C23 is a near-pure superset of C11 that mostly adds new
+        // keywords; the exception is `bool` becoming a real keyword.
+        // Pre-C23 code that used a `typedef ... bool` would break, but
+        // none of our current ports do so (BusyBox uses smallint, jq /
+        // file use int).  Ports that need an older standard can pass
+        // `-std=...` after; clang takes the last -std= flag.
+        argv.push("-std=gnu23".into());
+        argv.push("-Wall".into());
+        argv.push("-Wextra".into());
+    }
+    match env.instrumentation {
+        InstrumentationMode::None => {}
+        InstrumentationMode::UbsanTrap => {
+            argv.push("-fsanitize=undefined".into());
+            argv.push("-fsanitize-undefined-trap-on-error".into());
+        }
+        InstrumentationMode::Asan => {
+            argv.push("-fsanitize=address".into());
+        }
+    }
+    for name in [
+        "__linux__",
+        "__STDC_ISO_10646__=201706L",
+        "_WASI_EMULATED_SIGNAL",
+        "_WASI_EMULATED_MMAN",
+        "_WASI_EMULATED_PROCESS_CLOCKS",
+    ] {
+        let define_name = name.split_once('=').map_or(name, |(name, _)| name);
+        if !contains_define_or_undef(user_args, define_name) {
+            argv.push(format!("-D{name}").into());
         }
     }
 
+    let yurt_include = env
+        .include
+        .as_ref()
+        .cloned()
+        .or_else(default_yurt_include_dir);
+    if let Some(include) = yurt_include.as_ref() {
+        let preinclude = include.join("yurt_preinclude.h");
+        if preinclude.is_file() {
+            argv.push("-include".into());
+            argv.push(preinclude.into_os_string());
+        }
+    }
+
+    let mut deferred_user_libs: Vec<OsString> = Vec::new();
+    for a in user_args {
+        if let Some(filtered) = filter_unsupported_wasm_link_arg(a) {
+            if final_yurt_link && is_user_library_arg(&filtered) {
+                deferred_user_libs.push(filtered.into());
+            } else {
+                argv.push(filtered.into());
+            }
+        }
+    }
     if let Some(inc) = env.include.as_ref() {
         argv.push("-I".into());
         argv.push(inc.clone().into_os_string());
     }
     if env.include.is_none() {
-        if let Some(default_include) = default_yurt_include_dir() {
+        if let Some(default_include) = yurt_include {
             argv.push("-I".into());
             argv.push(default_include.into_os_string());
         }
     }
-    // Link-arg framing must come after the user's objects so it is last in
-    // the link line. The whole-archive pair must bracket only the compat
-    // archive, and the whole thing must precede `-lc`. clang's default is
-    // to insert `-lc` at the very end, so appending these three args is
-    // sufficient.
+    // Wrap directives must precede user libraries so an explicit `-lc` in
+    // a port's LIBS cannot resolve a symbol before lld sees `--wrap`. The
+    // whole-archive pair still follows user objects so those objects can
+    // pull ABI implementations from libyurt.
     //
     // When the archive is present:
     // - Pass --no-wasm-opt so that clang's automatic wasm-opt invocation
@@ -176,6 +249,19 @@ fn build_clang_invocation(
             }
         }
     }
+    argv.extend(deferred_user_libs);
+    if final_yurt_link {
+        for arg in [
+            "-lwasi-emulated-signal",
+            "-lwasi-emulated-mman",
+            "-lwasi-emulated-process-clocks",
+            "-Wl,-u,__main_argc_argv",
+        ] {
+            if !contains_exact_arg(user_args, arg) {
+                argv.push(arg.into());
+            }
+        }
+    }
     // -DYURT_ABI_MARKERS=1 expands the marker macros into
     // their real bodies in yurt_markers.h.  Without it, the macros
     // compile to nothing (no marker functions emitted, marker-call
@@ -217,10 +303,22 @@ fn filter_unsupported_wasm_link_arg(arg: &str) -> Option<String> {
     }
 }
 
+fn validate_instrumentation(env: &env::Env) -> Result<()> {
+    if env.instrumentation == InstrumentationMode::Asan {
+        bail!(
+            "YURT_CC_INSTRUMENT=asan is not supported by this wasi-sdk install: \
+             wasm ASan runtime libraries are not present. Use \
+             YURT_CC_INSTRUMENT=ubsan-trap for runtime-free trap instrumentation."
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     let sdk = wasi_sdk::discover().context("locating wasi-sdk")?;
     let env = env::Env::from_process();
+    validate_instrumentation(&env)?;
 
     if cli.print_sdk_path {
         println!("{}", sdk.root.display());
@@ -277,4 +375,60 @@ fn main() -> Result<ExitCode> {
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fake_sdk() -> wasi_sdk::WasiSdk {
+        wasi_sdk::WasiSdk {
+            root: PathBuf::from("/opt/fake-wasi-sdk"),
+        }
+    }
+
+    fn env_with_instrumentation(instrumentation: InstrumentationMode) -> env::Env {
+        env::Env {
+            archive: None,
+            continuation_archive: None,
+            include: None,
+            skip_version_check: false,
+            no_link_injection: false,
+            preserve_pre_opt: None,
+            wasm_opt: env::WasmOptMode::Default,
+            use_continuation: false,
+            markers_enabled: false,
+            instrumentation,
+        }
+    }
+
+    fn argv_strings(argv: Vec<OsString>) -> Vec<String> {
+        argv.into_iter()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn ubsan_trap_instrumentation_adds_runtime_free_clang_flags() {
+        let env = env_with_instrumentation(InstrumentationMode::UbsanTrap);
+        let argv = argv_strings(build_clang_invocation(
+            &fake_sdk(),
+            &env,
+            &["probe.c".into(), "-o".into(), "probe.wasm".into()],
+            true,
+        ));
+
+        assert!(argv.contains(&"-fsanitize=undefined".to_string()));
+        assert!(argv.contains(&"-fsanitize-undefined-trap-on-error".to_string()));
+    }
+
+    #[test]
+    fn asan_instrumentation_is_rejected_until_wasm_runtime_is_available() {
+        let env = env_with_instrumentation(InstrumentationMode::Asan);
+
+        let err = validate_instrumentation(&env).unwrap_err().to_string();
+
+        assert!(err.contains("YURT_CC_INSTRUMENT=asan is not supported"));
+    }
 }

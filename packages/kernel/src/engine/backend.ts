@@ -33,6 +33,18 @@ export interface RuntimeEngineBackend {
 
 export const unsupportedRuntimeEngineBackend: RuntimeEngineBackend = Object.freeze({});
 
+export const cooperativeRuntimeEngineBackend: RuntimeEngineBackend = Object.freeze({
+  scheduler: Object.freeze({
+    setPriority(_request: SchedulerPriorityRequest): SchedulerBackendResult {
+      return { ok: true };
+    },
+    setScheduler(request: SchedulerPolicyRequest): SchedulerBackendResult {
+      if (request.policy === 0 && request.priority === 0) return { ok: true };
+      return { ok: false, error: "unsupported" };
+    },
+  }),
+});
+
 export function normalizeNice(nice: number): number {
   if (!Number.isFinite(nice)) return 0;
   return Math.max(0, Math.min(19, Math.trunc(nice)));

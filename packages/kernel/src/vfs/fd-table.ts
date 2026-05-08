@@ -212,10 +212,10 @@ export class FdTable {
     const entry = this.getEntry(fd);
     entry.refs--;
     this.entries.delete(fd);
-    if (entry.refs > 0) return;
 
     if (entry.dirty) {
       this.vfs.writeFile(entry.path, entry.buffer);
+      entry.dirty = false;
     }
   }
 

@@ -29,6 +29,20 @@ describe("ProcessKernel", () => {
     expect(() => new ProcessKernel({ maxProcesses: 1.5 })).toThrow();
   });
 
+  it("remaps process cwd paths when a directory is renamed", () => {
+    const kernel = new ProcessKernel();
+    const parent = kernel.allocPid(1, "parent");
+    const child = kernel.allocPid(parent, "child");
+    kernel.setCwd(parent, "/tmp/tree/foo");
+    kernel.setCwd(child, "/tmp/tree/foo/nested");
+
+    kernel.remapCwdAfterRename("/tmp/tree/foo", "/tmp/tree/bar");
+
+    expect(kernel.getCwd(parent)).toBe("/tmp/tree/bar");
+    expect(kernel.getCwd(child)).toBe("/tmp/tree/bar/nested");
+    kernel.dispose();
+  });
+
   it("applies the process limit before PID allocation or fd-table creation", () => {
     const kernel = new ProcessKernel({ maxProcesses: 1 });
     const first = kernel.allocPid();
@@ -101,6 +115,28 @@ describe("ProcessKernel", () => {
     const target = kernel.getFdTarget(pid, readFd);
     expect(target).not.toBeNull();
     expect(target!.type).toBe("pipe_read");
+    kernel.dispose();
+  });
+
+  it("buildFdTableForSpawn applies explicit parent-to-child fd mappings", () => {
+    const kernel = new ProcessKernel();
+    const pid = kernel.allocPid();
+    const first = kernel.createPipe(pid);
+    const second = kernel.createPipe(pid);
+    const childTable = kernel.buildFdTableForSpawn(pid, {
+      prog: "/bin/cat",
+      args: [],
+      env: [],
+      cwd: "/",
+      stdin_fd: 0,
+      stdout_fd: 1,
+      stderr_fd: 2,
+      pass_fds: [second.readFd],
+      fd_map: [[first.readFd, second.readFd]],
+    });
+
+    expect(childTable.get(second.readFd)?.type).toBe("pipe_read");
+    expect(childTable.get(second.readFd)).toBe(kernel.getFdTarget(pid, first.readFd));
     kernel.dispose();
   });
 
@@ -311,6 +347,30 @@ describe("ProcessKernel", () => {
     expect(kernel.killProcess(pid, 10)).toBe(true);
     expect(queued).toEqual([10]);
     expect(cancelled).toBe(false);
+    kernel.dispose();
+  });
+
+  it("preserves signals sent before a WASI host attaches", () => {
+    const kernel = new ProcessKernel();
+    const pid = kernel.allocPid(1, "late-signal-target");
+
+    expect(kernel.killProcess(pid, 15)).toBe(true);
+
+    const queued: number[] = [];
+    kernel.attachWasiHost(
+      pid,
+      {
+        queueSignal(sig: number) {
+          queued.push(sig);
+          return true;
+        },
+        cancelExecution() {
+          throw new Error("should not cancel when signal delivery succeeds");
+        },
+      } as unknown as Parameters<ProcessKernel["attachWasiHost"]>[1],
+    );
+
+    expect(queued).toEqual([15]);
     kernel.dispose();
   });
 });

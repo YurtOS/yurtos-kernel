@@ -19,6 +19,7 @@
 
 #include "yurt_runtime.h"
 #include "yurt_markers.h"
+#include "yurt_abi.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -35,42 +36,6 @@ YURT_DECLARE_MARKER(pipe2);
 YURT_DEFINE_MARKER(pipe,  0x70697065u) /* "pipe" */
 YURT_DEFINE_MARKER(pipe2, 0x70697032u) /* "pip2" */
 
-/* Tiny inline parser: pull an unsigned-decimal field value from the
- * `{"read_fd":N,"write_fd":M}` JSON the host writes.  We don't pull
- * in the bigger yurt_command JSON helpers because pipe() is on
- * the hot path — startup of any pipeline-using program ends up here.
- *
- * Returns 0 on success and writes the parsed int into *out, or -1
- * if the field is missing or not a non-negative integer literal. */
-static int pipe_parse_int_field(const char *json, size_t json_len,
-                                const char *field, int *out) {
-  char needle[16];
-  int written = snprintf(needle, sizeof(needle), "\"%s\":", field);
-  if (written <= 0 || (size_t)written >= sizeof(needle)) {
-    return -1;
-  }
-  size_t needle_len = (size_t)written;
-  if (needle_len > json_len) {
-    return -1;
-  }
-  for (size_t i = 0; i + needle_len <= json_len; ++i) {
-    if (memcmp(json + i, needle, needle_len) != 0) continue;
-    const char *p = json + i + needle_len;
-    const char *end = json + json_len;
-    int val = 0;
-    int saw = 0;
-    while (p < end && *p >= '0' && *p <= '9') {
-      val = val * 10 + (*p - '0');
-      saw = 1;
-      ++p;
-    }
-    if (!saw) return -1;
-    *out = val;
-    return 0;
-  }
-  return -1;
-}
-
 int pipe(int fds[2]) {
   YURT_MARKER_CALL(pipe);
 
@@ -79,24 +44,19 @@ int pipe(int fds[2]) {
     return -1;
   }
 
-  /* 64 bytes is enough for `{"read_fd":<10>,"write_fd":<10>}` (32
-   * chars max).  Stack-allocated to keep pipe() malloc-free. */
-  char buf[64];
-  int n = yurt_host_pipe((int)(intptr_t)buf, (int)sizeof(buf));
-  if (n <= 0 || (size_t)n > sizeof(buf)) {
+  yurt_pipe_result_v1 result;
+  int n = yurt_host_pipe((int)(intptr_t)&result, (int)sizeof(result));
+  if (n < 0) {
+    errno = EIO;
+    return -1;
+  }
+  if (n != (int)sizeof(result)) {
     errno = EIO;
     return -1;
   }
 
-  int rfd = -1, wfd = -1;
-  if (pipe_parse_int_field(buf, (size_t)n, "read_fd", &rfd) != 0 ||
-      pipe_parse_int_field(buf, (size_t)n, "write_fd", &wfd) != 0) {
-    errno = EIO;
-    return -1;
-  }
-
-  fds[0] = rfd;
-  fds[1] = wfd;
+  fds[0] = result.read_fd;
+  fds[1] = result.write_fd;
   return 0;
 }
 

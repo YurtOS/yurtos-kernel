@@ -14,8 +14,10 @@
 #include "yurt_runtime.h"
 
 YURT_DECLARE_MARKER(fork);
+YURT_DECLARE_MARKER(vfork);
 
 pid_t fork(void) __attribute__((returns_twice));
+pid_t vfork(void) __attribute__((returns_twice));
 
 pid_t fork(void) {
     YURT_MARKER_CALL(fork);
@@ -25,4 +27,9 @@ pid_t fork(void) {
         return (pid_t)-1;
     }
     return (pid_t)rc;
+}
+
+pid_t vfork(void) {
+    YURT_MARKER_CALL(vfork);
+    return fork();
 }

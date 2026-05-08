@@ -202,12 +202,13 @@ export class ProcessManager {
       stdinData = drainReadEnd(opts.stdin);
     }
 
+    const cwd = opts.cwd ?? '/';
     const host = new WasiHost({
       vfs: this.vfs,
       args: [command, ...opts.args],
-      env: opts.env,
+      env: { ...opts.env, PWD: cwd },
       preopens: { '/': '/' },
-      cwd: opts.cwd ?? '/',
+      cwd,
       stdin: stdinData,
       stdoutLimit: opts.stdoutLimit,
       stderrLimit: opts.stderrLimit,
@@ -251,6 +252,8 @@ export class ProcessManager {
 
       imports.yurt = createKernelImports({
         memory: memoryProxy,
+        vfs: this.vfs,
+        wasiHost: host,
         networkBridge: this.networkBridge ?? undefined,
         extensionHandler: this.extensionHandler ?? undefined,
         nativeModules: this.nativeModules,

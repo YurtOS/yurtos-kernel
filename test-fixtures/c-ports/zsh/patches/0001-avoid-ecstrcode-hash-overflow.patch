@@ -1,0 +1,17 @@
+diff --git a/Src/parse.c b/Src/parse.c
+index 96b4e22..627063f 100644
+--- a/Src/parse.c
++++ b/Src/parse.c
+@@ -442,10 +442,10 @@ ecstrcode(char *s)
+     } else {
+ 	/* Long string. */
+ 	Eccstr p, *pp;
+-	long cmp;
++	int cmp;
+ 
+ 	for (pp = &ecstrs; (p = *pp); ) {
+-	    if (!(cmp = p->nfunc - ecnfunc) && !(cmp = (((long)p->hashval) - ((long)val))) && !(cmp = strcmp(p->str, s))) {
++	    if (!(cmp = p->nfunc - ecnfunc) && !(cmp = (int)(p->hashval - val)) && !(cmp = strcmp(p->str, s))) {
+ 		/* Re-use the existing string. */
+ 		return p->offs;
+             }

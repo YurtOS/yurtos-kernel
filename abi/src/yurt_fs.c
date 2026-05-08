@@ -14,6 +14,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,11 +26,15 @@
 #include <unistd.h>
 #include <wasi/libc.h>
 #include <wasi/libc-nocwd.h>
+#include <wasi/wasip1.h>
+
+#ifndef AT_EACCESS
+#define AT_EACCESS 0x200
+#endif
 
 YURT_DECLARE_MARKER(chown);
 YURT_DECLARE_MARKER(lchown);
 YURT_DECLARE_MARKER(fchown);
-YURT_DECLARE_MARKER(fchdir);
 YURT_DECLARE_MARKER(chroot);
 YURT_DECLARE_MARKER(chmod);
 YURT_DECLARE_MARKER(getpriority);
@@ -38,7 +43,6 @@ YURT_DECLARE_MARKER(setpriority);
 YURT_DEFINE_MARKER(chown,       0x63686f77u) /* "chow" */
 YURT_DEFINE_MARKER(lchown,      0x6c63686fu) /* "lcho" */
 YURT_DEFINE_MARKER(fchown,      0x6663686fu) /* "fcho" */
-YURT_DEFINE_MARKER(fchdir,      0x66636864u) /* "fchd" */
 YURT_DEFINE_MARKER(chroot,      0x6368726fu) /* "chro" */
 YURT_DEFINE_MARKER(chmod,       0x63686d6fu) /* "chmo" */
 YURT_DEFINE_MARKER(getpriority, 0x67707269u) /* "gpri" */
@@ -51,30 +55,203 @@ YURT_DEFINE_MARKER(setpriority, 0x73707269u) /* "spri" */
 static int yurt_apply_stat_permissions(int rc, struct stat *buf) {
   if (rc != 0 || !buf) return rc;
 
-  /* WASI Preview 1 filestat has file type but no POSIX permission mode.
-   * The Yurt host writes VFS permission bits into filestat.dev; translate
-   * that side channel back into st_mode while preserving the file type.
+  /* WASI Preview 1 filestat has file type/size/times but no POSIX
+   * permission or owner fields.  The Yurt host writes the VFS mode,
+   * uid, and gid into filestat.dev; translate that side channel back
+   * into struct stat while preserving the file type.
    */
-  buf->st_mode = (buf->st_mode & S_IFMT) | ((mode_t)buf->st_dev & 07777);
+  uint64_t meta = (uint64_t)buf->st_dev;
+  buf->st_mode = (buf->st_mode & S_IFMT) | ((mode_t)meta & 07777);
+  buf->st_uid = (uid_t)((meta >> 16) & 0xffffffu);
+  buf->st_gid = (gid_t)((meta >> 40) & 0xffffffu);
+  return rc;
+}
+
+static void yurt_fix_root_stat_inode(const char *path, struct stat *buf) {
+  if (!path || !buf || strcmp(path, "/") != 0) return;
+  buf->st_ino = (ino_t)12638123428881205758ull;
+}
+
+static mode_t yurt_wasi_filetype_mode(__wasi_filetype_t filetype) {
+  switch (filetype) {
+    case __WASI_FILETYPE_DIRECTORY:
+      return S_IFDIR;
+    case __WASI_FILETYPE_REGULAR_FILE:
+      return S_IFREG;
+    case __WASI_FILETYPE_SYMBOLIC_LINK:
+      return S_IFLNK;
+    case __WASI_FILETYPE_CHARACTER_DEVICE:
+      return S_IFCHR;
+    case __WASI_FILETYPE_BLOCK_DEVICE:
+      return S_IFBLK;
+    case __WASI_FILETYPE_SOCKET_DGRAM:
+    case __WASI_FILETYPE_SOCKET_STREAM:
+      return S_IFSOCK;
+    default:
+      return 0;
+  }
+}
+
+static void yurt_timespec_from_wasi(struct timespec *out, __wasi_timestamp_t ns) {
+  out->tv_sec = (time_t)(ns / 1000000000ull);
+  out->tv_nsec = (long)(ns % 1000000000ull);
+}
+
+static int yurt_stat_from_wasi_filestat(const __wasi_filestat_t *wst, struct stat *buf) {
+  if (!wst || !buf) {
+    errno = EFAULT;
+    return -1;
+  }
+  memset(buf, 0, sizeof(*buf));
+  uint64_t meta = (uint64_t)wst->dev;
+  buf->st_dev = (dev_t)wst->dev;
+  buf->st_ino = (ino_t)wst->ino;
+  buf->st_nlink = (nlink_t)wst->nlink;
+  buf->st_mode = yurt_wasi_filetype_mode(wst->filetype) | ((mode_t)meta & 07777);
+  buf->st_uid = (uid_t)((meta >> 16) & 0xffffffu);
+  buf->st_gid = (gid_t)((meta >> 40) & 0xffffffu);
+  buf->st_size = (off_t)wst->size;
+  buf->st_blksize = 4096;
+  buf->st_blocks = (blkcnt_t)((wst->size + 511) / 512);
+  yurt_timespec_from_wasi(&buf->st_atim, wst->atim);
+  yurt_timespec_from_wasi(&buf->st_mtim, wst->mtim);
+  yurt_timespec_from_wasi(&buf->st_ctim, wst->ctim);
+  return 0;
+}
+
+static int yurt_stat_impl(const char *restrict path, struct stat *restrict buf) {
+  int rc = yurt_apply_stat_permissions(__wasilibc_stat(path, buf, 0), buf);
+  if (rc == 0) yurt_fix_root_stat_inode(path, buf);
   return rc;
 }
 
 int stat(const char *restrict path, struct stat *restrict buf) {
-  return yurt_apply_stat_permissions(__wasilibc_stat(path, buf, 0), buf);
+  return yurt_stat_impl(path, buf);
 }
 
-int lstat(const char *restrict path, struct stat *restrict buf) {
-  return yurt_apply_stat_permissions(
+int __wrap_stat(const char *restrict path, struct stat *restrict buf) {
+  return yurt_stat_impl(path, buf);
+}
+
+static int yurt_lstat_impl(const char *restrict path, struct stat *restrict buf) {
+  int rc = yurt_apply_stat_permissions(
     __wasilibc_stat(path, buf, AT_SYMLINK_NOFOLLOW),
     buf
   );
+  if (rc == 0) yurt_fix_root_stat_inode(path, buf);
+  return rc;
 }
 
-int fstatat(int fd, const char *restrict path, struct stat *restrict buf, int flags) {
+int lstat(const char *restrict path, struct stat *restrict buf) {
+  return yurt_lstat_impl(path, buf);
+}
+
+int __wrap_lstat(const char *restrict path, struct stat *restrict buf) {
+  return yurt_lstat_impl(path, buf);
+}
+
+static int yurt_fstatat_impl(int fd, const char *restrict path, struct stat *restrict buf, int flags) {
   int rc = fd == AT_FDCWD
     ? __wasilibc_stat(path, buf, flags)
     : __wasilibc_nocwd_fstatat(fd, path, buf, flags);
-  return yurt_apply_stat_permissions(rc, buf);
+  rc = yurt_apply_stat_permissions(rc, buf);
+  if (rc == 0 && fd == AT_FDCWD) yurt_fix_root_stat_inode(path, buf);
+  return rc;
+}
+
+int fstatat(int fd, const char *restrict path, struct stat *restrict buf, int flags) {
+  return yurt_fstatat_impl(fd, path, buf, flags);
+}
+
+int __wrap_fstatat(int fd, const char *restrict path, struct stat *restrict buf, int flags) {
+  return yurt_fstatat_impl(fd, path, buf, flags);
+}
+
+static int yurt_fstat_impl(int fd, struct stat *buf) {
+  __wasi_filestat_t wst;
+  __wasi_errno_t err = __wasi_fd_filestat_get((__wasi_fd_t)fd, &wst);
+  if (err != 0) {
+    errno = EBADF;
+    return -1;
+  }
+  return yurt_stat_from_wasi_filestat(&wst, buf);
+}
+
+int fstat(int fd, struct stat *buf) {
+  return yurt_fstat_impl(fd, buf);
+}
+
+int __wrap_fstat(int fd, struct stat *buf) {
+  return yurt_fstat_impl(fd, buf);
+}
+
+static int yurt_stat_allows(const struct stat *st, int mode, uid_t uid, gid_t gid) {
+  if ((mode & F_OK) == 0 && mode == F_OK) return 1;
+  if ((mode & ~(R_OK | W_OK | X_OK)) != 0) {
+    errno = EINVAL;
+    return 0;
+  }
+
+  mode_t bits = st->st_mode;
+  if (uid == 0) {
+    if ((mode & X_OK) && !S_ISDIR(bits) && (bits & 0111) == 0) return 0;
+    return 1;
+  }
+
+  mode_t granted;
+  if (st->st_uid == uid) {
+    granted = (bits >> 6) & 07;
+  } else if (st->st_gid == gid) {
+    granted = (bits >> 3) & 07;
+  } else {
+    granted = bits & 07;
+  }
+
+  if ((mode & R_OK) && !(granted & 04)) return 0;
+  if ((mode & W_OK) && !(granted & 02)) return 0;
+  if ((mode & X_OK) && !(granted & 01)) return 0;
+  return 1;
+}
+
+static uid_t yurt_getuid_impl(void);
+static uid_t yurt_geteuid_impl(void);
+static gid_t yurt_getgid_impl(void);
+static gid_t yurt_getegid_impl(void);
+
+static int yurt_faccessat_impl(int fd, const char *path, int mode, int flags) {
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  struct stat st;
+  int stat_flags = (flags & AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW : 0;
+  if (yurt_fstatat_impl(fd, path, &st, stat_flags) != 0) return -1;
+
+  uid_t uid = (flags & AT_EACCESS) ? yurt_geteuid_impl() : yurt_getuid_impl();
+  gid_t gid = (flags & AT_EACCESS) ? yurt_getegid_impl() : yurt_getgid_impl();
+  if (yurt_stat_allows(&st, mode, uid, gid)) return 0;
+  errno = EACCES;
+  return -1;
+}
+
+int faccessat(int fd, const char *path, int mode, int flags) {
+  return yurt_faccessat_impl(fd, path, mode, flags);
+}
+
+int __wrap_faccessat(int fd, const char *path, int mode, int flags) {
+  return yurt_faccessat_impl(fd, path, mode, flags);
+}
+
+static int yurt_access_impl(const char *path, int mode) {
+  return yurt_faccessat_impl(AT_FDCWD, path, mode, 0);
+}
+
+int access(const char *path, int mode) {
+  return yurt_access_impl(path, mode);
+}
+
+int __wrap_access(const char *path, int mode) {
+  return yurt_access_impl(path, mode);
 }
 
 int chown(const char *path, uid_t owner, gid_t group) {
@@ -109,12 +286,24 @@ int fchown(int fd, uid_t owner, gid_t group) {
   return -1;
 }
 
-int fchdir(int fd) {
-  YURT_MARKER_CALL(fchdir);
-  int rc = yurt_host_fchdir(fd);
+int fchownat(int fd, const char *path, uid_t owner, gid_t group, int flags) {
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  if (fd != AT_FDCWD && path[0] != '/') {
+    errno = ENOSYS;
+    return -1;
+  }
+  int follow = (flags & AT_SYMLINK_NOFOLLOW) ? 0 : 1;
+  int rc = yurt_host_chown((int)(intptr_t)path, (int)strlen(path), (int)owner, (int)group, follow);
   if (rc == 0) return 0;
-  errno = (rc == -1) ? EBADF : (rc == -2) ? EACCES : (rc == -4) ? ENOTDIR : EIO;
+  errno = (rc == -1) ? ENOENT : (rc == -2) ? EPERM : EIO;
   return -1;
+}
+
+int __wrap_fchownat(int fd, const char *path, uid_t owner, gid_t group, int flags) {
+  return fchownat(fd, path, owner, group, flags);
 }
 
 int chroot(const char *path) {
@@ -134,46 +323,6 @@ int chmod(const char *path, mode_t mode) {
   if (rc == 0) return 0;
   errno = (rc == -1) ? ENOENT : (rc == -2) ? EPERM : EIO;
   return -1;
-}
-
-int chdir(const char *path) {
-  if (!path) {
-    errno = EFAULT;
-    return -1;
-  }
-  int rc = yurt_host_chdir((int)(intptr_t)path, (int)strlen(path));
-  if (rc == 0) return 0;
-  errno = (rc == -1) ? ENOENT : (rc == -2) ? EACCES : (rc == -4) ? ENOTDIR : EIO;
-  return -1;
-}
-
-char *getcwd(char *buf, size_t size) {
-  if (buf && size == 0) {
-    errno = EINVAL;
-    return NULL;
-  }
-  if (!buf) {
-    int required = yurt_host_getcwd(0, 0);
-    if (required <= 0) {
-      errno = EIO;
-      return NULL;
-    }
-    size_t alloc_size = size == 0 ? (size_t)required : size;
-    buf = (char *)malloc(alloc_size);
-    if (!buf) {
-      errno = ENOMEM;
-      return NULL;
-    }
-    int rc = yurt_host_getcwd((int)(intptr_t)buf, (int)alloc_size);
-    if (rc > 0 && (size_t)rc <= alloc_size) return buf;
-    free(buf);
-    errno = ERANGE;
-    return NULL;
-  }
-  int rc = yurt_host_getcwd((int)(intptr_t)buf, (int)size);
-  if (rc > 0 && (size_t)rc <= size) return buf;
-  errno = ERANGE;
-  return NULL;
 }
 
 int getpriority(int which, id_t who) {
@@ -274,23 +423,55 @@ YURT_DECLARE_MARKER(setresgid);
 YURT_DEFINE_MARKER(setresuid, 0x73727569u) /* "srui" */
 YURT_DEFINE_MARKER(setresgid, 0x73726769u) /* "srgi" */
 
-uid_t getuid(void) {
+static uid_t yurt_getuid_impl(void) {
   return (uid_t)yurt_host_getuid();
 }
 
-uid_t geteuid(void) {
+uid_t getuid(void) {
+  return yurt_getuid_impl();
+}
+
+uid_t __wrap_getuid(void) {
+  return yurt_getuid_impl();
+}
+
+static uid_t yurt_geteuid_impl(void) {
   return (uid_t)yurt_host_geteuid();
 }
 
-gid_t getgid(void) {
+uid_t geteuid(void) {
+  return yurt_geteuid_impl();
+}
+
+uid_t __wrap_geteuid(void) {
+  return yurt_geteuid_impl();
+}
+
+static gid_t yurt_getgid_impl(void) {
   return (gid_t)yurt_host_getgid();
 }
 
-gid_t getegid(void) {
+gid_t getgid(void) {
+  return yurt_getgid_impl();
+}
+
+gid_t __wrap_getgid(void) {
+  return yurt_getgid_impl();
+}
+
+static gid_t yurt_getegid_impl(void) {
   return (gid_t)yurt_host_getegid();
 }
 
-int setresuid(uid_t r, uid_t e, uid_t s) {
+gid_t getegid(void) {
+  return yurt_getegid_impl();
+}
+
+gid_t __wrap_getegid(void) {
+  return yurt_getegid_impl();
+}
+
+static int yurt_setresuid_impl(uid_t r, uid_t e, uid_t s) {
   YURT_MARKER_CALL(setresuid);
   int rc = yurt_host_setresuid((int)r, (int)e, (int)s);
   if (rc == 0) return 0;
@@ -298,7 +479,11 @@ int setresuid(uid_t r, uid_t e, uid_t s) {
   return -1;
 }
 
-int setresgid(gid_t r, gid_t e, gid_t s) {
+int setresuid(uid_t r, uid_t e, uid_t s) {
+  return yurt_setresuid_impl(r, e, s);
+}
+
+static int yurt_setresgid_impl(gid_t r, gid_t e, gid_t s) {
   YURT_MARKER_CALL(setresgid);
   int rc = yurt_host_setresgid((int)r, (int)e, (int)s);
   if (rc == 0) return 0;
@@ -306,18 +491,67 @@ int setresgid(gid_t r, gid_t e, gid_t s) {
   return -1;
 }
 
+int setresgid(gid_t r, gid_t e, gid_t s) {
+  return yurt_setresgid_impl(r, e, s);
+}
+
+static int yurt_setuid_impl(uid_t uid) {
+  return yurt_setresuid_impl(uid, uid, uid);
+}
+
 int setuid(uid_t uid) {
-  return setresuid(uid, uid, uid);
+  return yurt_setuid_impl(uid);
+}
+
+int __wrap_setuid(uid_t uid) {
+  return yurt_setuid_impl(uid);
+}
+
+static int yurt_seteuid_impl(uid_t uid) {
+  return yurt_setresuid_impl((uid_t)-1, uid, (uid_t)-1);
 }
 
 int seteuid(uid_t uid) {
-  return setresuid((uid_t)-1, uid, (uid_t)-1);
+  return yurt_seteuid_impl(uid);
+}
+
+int __wrap_seteuid(uid_t uid) {
+  return yurt_seteuid_impl(uid);
+}
+
+static int yurt_setgid_impl(gid_t gid) {
+  return yurt_setresgid_impl(gid, gid, gid);
 }
 
 int setgid(gid_t gid) {
-  return setresgid(gid, gid, gid);
+  return yurt_setgid_impl(gid);
+}
+
+int __wrap_setgid(gid_t gid) {
+  return yurt_setgid_impl(gid);
+}
+
+static int yurt_setegid_impl(gid_t gid) {
+  return yurt_setresgid_impl((gid_t)-1, gid, (gid_t)-1);
 }
 
 int setegid(gid_t gid) {
-  return setresgid((gid_t)-1, gid, (gid_t)-1);
+  return yurt_setegid_impl(gid);
+}
+
+int __wrap_setegid(gid_t gid) {
+  return yurt_setegid_impl(gid);
+}
+
+char *cuserid(char *s) {
+  static char user[L_cuserid];
+  char *out = s ? s : user;
+  const char *name = (geteuid() == 0) ? "root" : "user";
+  size_t n = strlen(name) + 1;
+  if (n > L_cuserid) {
+    errno = ERANGE;
+    return NULL;
+  }
+  memcpy(out, name, n);
+  return out;
 }

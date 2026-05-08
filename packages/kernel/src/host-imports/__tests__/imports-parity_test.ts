@@ -5,8 +5,7 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_pipe",
   "host_spawn",
   "host_mark_exec_child",
-  "host_waitpid",
-  "host_waitpid_nohang",
+  "host_wait",
   "host_close_fd",
   "host_getpid",
   "host_getppid",
@@ -18,6 +17,7 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_setresgid",
   "host_umask",
   "host_getcwd",
+  "host_realpath",
   "host_chdir",
   "host_fchdir",
   "host_getpriority",
@@ -86,9 +86,6 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_tcgetattr",
   "host_tcsetattr",
   "host_winsize",
-  // wait-any (waitpid(-1))
-  "host_wait_any",
-  "host_wait_any_nohang",
   // TTY controlling terminal
   "host_tiocsctty",
   // DNS

@@ -1,6 +1,6 @@
 /* exec-canary — verify execv/execvp/execve actually replace the
  * caller's exit status with the spawned program's.  Yurt
- * implements exec on top of host_spawn + host_waitpid + exit,
+ * implements exec on top of host_spawn + host_wait + exit,
  * so a successful exec should:
  *   1. spawn the new program (BusyBox `true` — exits 0)
  *   2. wait for it

@@ -28,6 +28,11 @@ import type { NetworkBridgeLike } from '../network/bridge.js';
 
 if (!parentPort) throw new Error('Must run as Worker thread');
 
+interface SpawnArgv {
+  loaderArgv: string[];
+  wasiArgv: string[];
+}
+
 interface InitMessage {
   type: 'init';
   sab: SharedArrayBuffer;
@@ -224,12 +229,26 @@ class WorkerResidentRunner {
       return { data, truncated };
     };
 
-    const argvForSpawn = (req: SpawnRequest, cwd: string): string[] => {
+    const argvForSpawn = (req: SpawnRequest, cwd: string): SpawnArgv => {
+      const env = Object.fromEntries(req.env);
       const prog = req.prog.includes('/')
         ? resolveSpawnPath(req.prog, req.cwd || cwd)
-        : resolveExecutablePathForVfs(vfs, req.prog);
+        : resolveExecutablePathForVfs(vfs, req.prog, req.cwd || cwd, env.PATH);
       const interpreterArgv = resolveShebangInterpreter(vfs, prog);
-      return interpreterArgv ? [...interpreterArgv, prog, ...req.args] : [prog, ...req.args];
+      if (interpreterArgv) {
+        const argv = [...interpreterArgv, prog, ...req.args];
+        return { loaderArgv: argv, wasiArgv: argv };
+      }
+      const argv0Override = req.argv0;
+      const overriddenShCommand = argv0Override !== undefined &&
+        (req.prog === 'sh' || req.prog.endsWith('/sh')) &&
+        req.args.length === 2 && req.args[0] === '-c';
+      return {
+        loaderArgv: [prog, ...req.args],
+        wasiArgv: overriddenShCommand
+          ? [req.prog, '-c', req.args[1], argv0Override]
+          : [argv0Override ?? prog, ...req.args],
+      };
     };
 
     const makeContextWithAllocator = (
@@ -274,15 +293,16 @@ class WorkerResidentRunner {
           },
           spawnProcess: (req, fdTable) => {
             const commandLabel = req.argv0 ?? req.prog;
-            const childPid = kernel.allocPid(pid, commandLabel);
+            const childPid = kernel.allocPid(pid);
             const childCwd = req.cwd || kernel.getCwd(pid);
-            kernel.setCwd(childPid, childCwd);
             kernel.registerPending(childPid, commandLabel, pid);
+            kernel.setCwd(childPid, childCwd);
             kernel.adoptFdTable(childPid, fdTable);
-            const argv = argvForSpawn(req, childCwd);
+            const spawnArgv = argvForSpawn(req, childCwd);
             const childCtx = makeContextWithAllocator(() => childPid);
             loadProcess(childCtx, {
-              argv,
+              argv: spawnArgv.loaderArgv,
+              wasiArgv: spawnArgv.wasiArgv,
               mode: 'cli',
               env: Object.fromEntries(req.env),
               cwd: childCwd,
@@ -342,9 +362,17 @@ function resolveShebangInterpreter(vfs: VfsProxy, path: string): string[] | null
   return [interpreterPath, ...parts.slice(1)];
 }
 
-function resolveExecutablePathForVfs(vfs: VfsProxy, prog: string): string {
-  for (const dir of ['/usr/extensions', '/usr/bin', '/bin']) {
-    const path = `${dir}/${prog}`;
+function resolveExecutablePathForVfs(
+  vfs: VfsProxy,
+  prog: string,
+  cwd = '/',
+  pathEnv = '/usr/extensions:/usr/bin:/bin',
+): string {
+  for (const dir of pathEnv.split(':')) {
+    const base = dir === '' ? cwd : dir.startsWith('/')
+      ? dir
+      : resolveSpawnPath(dir, cwd);
+    const path = `${base === '/' ? '' : base}/${prog}`;
     try {
       const st = vfs.stat(path);
       if (st.type === 'file' && (st.permissions & 0o111)) return path;

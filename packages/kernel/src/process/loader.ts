@@ -101,9 +101,9 @@ export async function loadProcess(
   if (continuationMarked && !moduleHasAsyncify(module)) {
     throw new Error("module declares yurt.features continuations but is not asyncify-instrumented");
   }
-  const env = opts.env ?? {};
   const wasiArgv = opts.wasiArgv ?? argv;
   const cwd = opts.cwd ?? "/";
+  const env = { ...(opts.env ?? {}), PWD: cwd };
   const rollbackOnFailure = opts.rollbackOnFailure ?? true;
   const pid = ctx.allocatePid(argv);
   const rollback = () => {
@@ -158,7 +158,7 @@ export async function loadProcess(
       .hostFork as unknown as WebAssembly.ImportValue;
   }
   wrapAsyncImports(yurtImports, [
-    "host_waitpid",
+    "host_wait",
     "host_kill",
     "host_killpg",
     "host_yield",
@@ -277,7 +277,7 @@ export async function loadProcess(
       childYurtImports.host_fork = childBridge
         .hostFork as unknown as WebAssembly.ImportValue;
       wrapAsyncImports(childYurtImports, [
-        "host_waitpid",
+        "host_wait",
         "host_kill",
         "host_killpg",
         "host_yield",

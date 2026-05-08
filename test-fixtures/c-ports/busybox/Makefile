@@ -91,8 +91,7 @@ $(BUILD_DIR)/busybox.wasm: configure ensure-compat
 		YURT_CC_USE_CONTINUATION=1 \
 		YURT_CC_INCLUDE="$(ABI_INCLUDE)" \
 		$(MAKE) CC="$(YURT_CC)" AR="$(YURT_AR)" RANLIB="$(YURT_RANLIB)" \
-			EXTRA_CFLAGS="$(WASI_EMULATED_CFLAGS)" \
-			EXTRA_LDFLAGS="$(WASI_EMULATED_LDFLAGS)" \
+			EXTRA_CFLAGS="$(YURT_CFLAGS)" \
 			SKIP_STRIP=y \
 			busybox
 	cp $(SRC_DIR)/busybox_unstripped $(BUILD_DIR)/busybox.wasm

@@ -30,12 +30,14 @@ CONTINUATION_LIB := $(BUILD_DIR)/libyurt_continuation.a
 SETJMP_LIB := $(BUILD_DIR)/libyurt_setjmp.a
 LIB_OBJS := \
   $(BUILD_DIR)/yurt_command.o \
+  $(BUILD_DIR)/yurt_cwd.o \
   $(BUILD_DIR)/yurt_dup.o \
   $(BUILD_DIR)/yurt_exec.o \
   $(BUILD_DIR)/yurt_fetch.o \
   $(BUILD_DIR)/yurt_fnmatch.o \
   $(BUILD_DIR)/yurt_fs.o \
   $(BUILD_DIR)/yurt_ioctl.o \
+  $(BUILD_DIR)/yurt_locale_rs.o \
   $(BUILD_DIR)/yurt_mktemp.o \
   $(BUILD_DIR)/yurt_netdb.o \
   $(BUILD_DIR)/yurt_netif.o \
@@ -55,7 +57,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_version.o \
   $(BUILD_DIR)/yurt_write.o
 
-CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
+CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
 FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 
@@ -84,6 +86,14 @@ ensure-toolchain:
 $(BUILD_DIR)/%.o: src/%.c $(wildcard include/*.h) src/yurt_runtime.h src/yurt_markers.h | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) $(YURT_CC) $(YURT_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/yurt_locale_rs.o: rust/yurt-libc/src/locale.rs | $(BUILD_DIR)
+	rustc --target wasm32-wasip1 \
+	  --crate-type=lib \
+	  --emit=obj=$@ \
+	  -C panic=abort \
+	  -C opt-level=2 \
+	  $<
+
 lib: $(LIB)
 
 CONTINUATION_OBJS := \
@@ -91,6 +101,7 @@ CONTINUATION_OBJS := \
   $(BUILD_DIR)/yurt_fork.o
 
 $(LIB): $(LIB_OBJS) | $(BUILD_DIR) ensure-toolchain
+	rm -f $@
 	$(YURT_AR) rcs $@ $(LIB_OBJS)
 
 $(CONTINUATION_LIB): $(CONTINUATION_OBJS) | $(BUILD_DIR) ensure-toolchain

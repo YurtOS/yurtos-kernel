@@ -11,6 +11,8 @@ import {
   WASI_ENOENT,
   WASI_ENOSYS,
   WASI_ESUCCESS,
+  WASI_FDFLAGS_APPEND,
+  WASI_FILETYPE_CHARACTER_DEVICE,
   WASI_FILETYPE_DIRECTORY,
   WASI_FILETYPE_REGULAR_FILE,
   WASI_PREOPENTYPE_DIR,
@@ -210,6 +212,56 @@ describe("WasiHost", () => {
       }
       expect(error).toBeInstanceOf(WasiExitError);
       expect((error as WasiExitError).code).toBe(141);
+    });
+  });
+
+  describe("poll_oneoff", () => {
+    it("propagates signal exits while waiting on a clock", async () => {
+      host.setSignalDeliverer((sig) => {
+        expect(sig).toBe(15);
+        throw new WasiExitError(128 + sig);
+      });
+      const { wasi, view } = getImportsAndView(host, memory);
+
+      view.setBigUint64(0, 7n, true); // userdata
+      view.setUint8(8, 0); // WASI_EVENTTYPE_CLOCK
+      view.setBigUint64(24, 60_000_000_000n, true); // 60s relative timeout
+      view.setUint16(40, 0, true);
+
+      const wait = wasi.poll_oneoff(0, 64, 1, 128) as Promise<number>;
+      host.queueSignal(15);
+
+      let error: unknown;
+      try {
+        await wait;
+      } catch (err) {
+        error = err;
+      }
+      expect(error).toBeInstanceOf(WasiExitError);
+      expect((error as WasiExitError).code).toBe(143);
+    });
+
+    it("does not restart relative clock deadlines after signal wakes", async () => {
+      host.setSignalDeliverer(() => {});
+      const { wasi, view } = getImportsAndView(host, memory);
+
+      view.setBigUint64(0, 9n, true); // userdata
+      view.setUint8(8, 0); // WASI_EVENTTYPE_CLOCK
+      view.setBigUint64(24, 50_000_000n, true); // 50ms relative timeout
+      view.setUint16(40, 0, true);
+
+      const started = Date.now();
+      const wait = wasi.poll_oneoff(0, 64, 1, 128) as Promise<number>;
+      const interval = setInterval(() => host.queueSignal(17), 5);
+      try {
+        const errno = await wait;
+        const elapsed = Date.now() - started;
+        expect(errno).toBe(WASI_ESUCCESS);
+        expect(elapsed).toBeGreaterThanOrEqual(40);
+        expect(elapsed).toBeLessThan(200);
+      } finally {
+        clearInterval(interval);
+      }
     });
   });
 
@@ -515,6 +567,26 @@ describe("WasiHost", () => {
       expect(fd).toBeGreaterThanOrEqual(4);
     });
 
+    it("does not create a missing file for append without CREAT", () => {
+      const { wasi, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = "tmp/append-missing.txt";
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+
+      const errno = wasi.path_open(
+        3,
+        0,
+        500,
+        pathStr.length,
+        0,
+        BigInt(0),
+        BigInt(0),
+        WASI_FDFLAGS_APPEND,
+        400,
+      );
+      expect(errno).toBe(WASI_ENOENT);
+    });
+
     it("applies the kernel process umask when creating files", () => {
       const kernel = new ProcessKernel();
       const pid = kernel.allocPid(1, "guest");
@@ -783,6 +855,7 @@ describe("WasiHost", () => {
   describe("path_filestat_get", () => {
     it("returns stat info for a file", () => {
       vfs.writeFile("/tmp/stat-me.txt", new TextEncoder().encode("12345"));
+      vfs.chown("/tmp/stat-me.txt", 1000, 1000);
       const { wasi, view, bytes } = getImportsAndView(host, memory);
 
       const pathStr = "tmp/stat-me.txt";
@@ -796,6 +869,10 @@ describe("WasiHost", () => {
       // size at offset 32 (dev:8 + ino:8 + filetype:1+padding:7 + nlink:8 + size:8)
       const size = view.getBigUint64(132, true);
       expect(size).toBe(BigInt(5));
+      const meta = view.getBigUint64(100, true);
+      expect(Number(meta & 0xffffn)).toBe(0o644);
+      expect(Number((meta >> 16n) & 0xffffffn)).toBe(1000);
+      expect(Number((meta >> 40n) & 0xffffffn)).toBe(1000);
     });
 
     it("returns stat info for a directory", () => {
@@ -807,6 +884,96 @@ describe("WasiHost", () => {
       const errno = wasi.path_filestat_get(3, 0, 500, pathStr.length, 100);
       expect(errno).toBe(WASI_ESUCCESS);
       expect(view.getUint8(116)).toBe(WASI_FILETYPE_DIRECTORY);
+    });
+
+    it("reports distinct inode metadata for cwd-relative and root paths", () => {
+      vfs.mkdir("/tmp/stat-cwd");
+      const cwdHost = new WasiHost({
+        vfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+        cwd: "/tmp/stat-cwd",
+      });
+      cwdHost.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(cwdHost, memory);
+
+      bytes.set(new TextEncoder().encode("tmp/stat-cwd"), 500);
+      bytes.set(new TextEncoder().encode("/"), 600);
+
+      const dotErrno = wasi.path_filestat_get(3, 0, 500, "tmp/stat-cwd".length, 100);
+      const rootErrno = wasi.path_filestat_get(3, 0, 600, 1, 200);
+
+      expect(dotErrno).toBe(WASI_ESUCCESS);
+      expect(rootErrno).toBe(WASI_ESUCCESS);
+      expect(view.getBigUint64(108, true)).not.toBe(
+        view.getBigUint64(208, true),
+      );
+    });
+
+    it("resolves root-preopen dot paths from process cwd", () => {
+      vfs.mkdir("/tmp/stat-dot-cwd");
+      const cwdHost = new WasiHost({
+        vfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+        cwd: "/tmp/stat-dot-cwd",
+      });
+      cwdHost.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(cwdHost, memory);
+
+      bytes.set(new TextEncoder().encode("."), 500);
+      bytes.set(new TextEncoder().encode("/tmp/stat-dot-cwd"), 600);
+
+      const dotErrno = wasi.path_filestat_get(3, 0, 500, 1, 100);
+      const cwdErrno = wasi.path_filestat_get(3, 0, 600, "/tmp/stat-dot-cwd".length, 200);
+
+      expect(dotErrno).toBe(WASI_ESUCCESS);
+      expect(cwdErrno).toBe(WASI_ESUCCESS);
+      expect(view.getBigUint64(108, true)).toBe(view.getBigUint64(208, true));
+    });
+
+    it("keeps root-preopen empty paths anchored at root", () => {
+      vfs.mkdir("/tmp/stat-empty-cwd");
+      const cwdHost = new WasiHost({
+        vfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+        cwd: "/tmp/stat-empty-cwd",
+      });
+      cwdHost.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(cwdHost, memory);
+
+      bytes.set(new TextEncoder().encode("/"), 500);
+
+      const emptyErrno = wasi.path_filestat_get(3, 0, 500, 0, 100);
+      const rootErrno = wasi.path_filestat_get(3, 0, 500, 1, 200);
+
+      expect(emptyErrno).toBe(WASI_ESUCCESS);
+      expect(rootErrno).toBe(WASI_ESUCCESS);
+      expect(view.getBigUint64(108, true)).toBe(view.getBigUint64(208, true));
+    });
+
+    it("reports matching inode metadata for followed symlinks and their target", () => {
+      vfs.mkdir("/tmp/stat-link");
+      vfs.mkdir("/tmp/stat-link/real");
+      vfs.mkdir("/tmp/stat-link/sub");
+      vfs.symlink("../real", "/tmp/stat-link/sub/fake");
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      const targetPath = "/tmp/stat-link/real";
+      const linkPath = "/tmp/stat-link/sub/fake";
+      bytes.set(new TextEncoder().encode(targetPath), 500);
+      bytes.set(new TextEncoder().encode(linkPath), 600);
+
+      const targetErrno = wasi.path_filestat_get(3, 1, 500, targetPath.length, 100);
+      const linkErrno = wasi.path_filestat_get(3, 1, 600, linkPath.length, 200);
+
+      expect(targetErrno).toBe(WASI_ESUCCESS);
+      expect(linkErrno).toBe(WASI_ESUCCESS);
+      expect(view.getBigUint64(208, true)).toBe(view.getBigUint64(108, true));
     });
 
     it("presents /dev/fd as the current process fd directory", () => {
@@ -830,6 +997,55 @@ describe("WasiHost", () => {
       const errno = wasi.path_filestat_get(3, 0, 500, pathStr.length, 100);
       expect(errno).toBe(WASI_ESUCCESS);
       expect(view.getUint8(116)).toBe(WASI_FILETYPE_DIRECTORY);
+    });
+
+    it("opens /proc/self/fd entries through the visible exec pid", () => {
+      const kernel = new ProcessKernel();
+      const wrapperPid = kernel.allocPid(1, "zsh");
+      const replacementPid = kernel.allocPid(wrapperPid, "cat");
+      expect(kernel.markExecReplacement(wrapperPid, replacementPid)).toBe(true);
+      vfs.writeFile("/tmp/proc-fd-source", new TextEncoder().encode("ok"));
+      kernel.openVfsFile(replacementPid, vfs, "/tmp/proc-fd-source", "r", 1084);
+      vfs.setProcessListProvider(() => kernel.listProcesses());
+      host = new WasiHost({
+        vfs,
+        args: ["cat"],
+        env: {},
+        preopens: { "/": "/" },
+        kernel,
+        pid: replacementPid,
+      });
+      host.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = "/proc/self/fd/1084";
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+      const openErrno = wasi.path_open(
+        3,
+        0,
+        500,
+        pathStr.length,
+        0,
+        BigInt(0),
+        BigInt(0),
+        0,
+        400,
+      );
+
+      expect(openErrno).toBe(WASI_ESUCCESS);
+      const duplicatedFd = view.getUint32(400, true);
+      expect(kernel.getFdTarget(replacementPid, duplicatedFd)).not.toBeNull();
+    });
+
+    it("presents /dev/tty as a character device", () => {
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = "/dev/tty";
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+
+      const errno = wasi.path_filestat_get(3, 0, 500, pathStr.length, 100);
+      expect(errno).toBe(WASI_ESUCCESS);
+      expect(view.getUint8(116)).toBe(WASI_FILETYPE_CHARACTER_DEVICE);
     });
   });
 
