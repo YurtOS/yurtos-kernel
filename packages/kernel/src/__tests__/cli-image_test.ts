@@ -1,7 +1,4 @@
-import {
-  assertEquals,
-  assertStringIncludes,
-} from "jsr:@std/assert@^1.0.19";
+import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.19";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { zstdCompress } from "node:zlib";
@@ -11,7 +8,9 @@ const WASM_DIR = resolve(
     new URL("../platform/__tests__/fixtures", import.meta.url).pathname,
   ),
 );
-const CLI = resolve(decodeURIComponent(new URL("../cli.ts", import.meta.url).pathname));
+const CLI = resolve(
+  decodeURIComponent(new URL("../cli.ts", import.meta.url).pathname),
+);
 const deno = Deno.execPath();
 const enc = new TextEncoder();
 
@@ -94,31 +93,34 @@ function zstd(data: Uint8Array): Promise<Uint8Array> {
 Deno.test("yurt CLI runs an argv command from an image", async () => {
   const dir = await mkdtemp("/tmp/yurt-cli-image-");
   const imagePath = join(dir, "test.yurtimg");
-  await writeFile(imagePath, await zstd(tar([
-    tarEntry({ name: "bin/", type: "5" }),
-    tarEntry({
-      name: "bin/true",
-      mode: 0o555,
-      data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
-    }),
-    tarEntry({
-      name: "bin/echo-args",
-      mode: 0o555,
-      data: await Deno.readFile(join(WASM_DIR, "echo-args.wasm")),
-    }),
-    tarEntry({ name: "etc/yurt/", type: "5" }),
-    tarEntry({
-      name: "etc/yurt/base-image.json",
-      data: enc.encode(JSON.stringify({
-        version: 1,
-        id: "cli-image",
-        tools: [
-          { name: "true", path: "/bin/true" },
-          { name: "echo-args", path: "/bin/echo-args" },
-        ],
-      })),
-    }),
-  ])));
+  await writeFile(
+    imagePath,
+    await zstd(tar([
+      tarEntry({ name: "bin/", type: "5" }),
+      tarEntry({
+        name: "bin/true",
+        mode: 0o555,
+        data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
+      }),
+      tarEntry({
+        name: "bin/echo-args",
+        mode: 0o555,
+        data: await Deno.readFile(join(WASM_DIR, "echo-args.wasm")),
+      }),
+      tarEntry({ name: "etc/yurt/", type: "5" }),
+      tarEntry({
+        name: "etc/yurt/base-image.json",
+        data: enc.encode(JSON.stringify({
+          version: 1,
+          id: "cli-image",
+          tools: [
+            { name: "true", path: "/bin/true" },
+            { name: "echo-args", path: "/bin/echo-args" },
+          ],
+        })),
+      }),
+    ])),
+  );
 
   const command = new Deno.Command(deno, {
     args: [
@@ -146,26 +148,36 @@ Deno.test("yurt CLI runs an argv command from an image", async () => {
 Deno.test("yurt CLI fails clearly when no command and /bin/sh is missing", async () => {
   const dir = await mkdtemp("/tmp/yurt-cli-image-");
   const imagePath = join(dir, "test.yurtimg");
-  await writeFile(imagePath, await zstd(tar([
-    tarEntry({ name: "bin/", type: "5" }),
-    tarEntry({
-      name: "bin/true",
-      mode: 0o555,
-      data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
-    }),
-    tarEntry({ name: "etc/yurt/", type: "5" }),
-    tarEntry({
-      name: "etc/yurt/base-image.json",
-      data: enc.encode(JSON.stringify({
-        version: 1,
-        id: "cli-image",
-        tools: [{ name: "true", path: "/bin/true" }],
-      })),
-    }),
-  ])));
+  await writeFile(
+    imagePath,
+    await zstd(tar([
+      tarEntry({ name: "bin/", type: "5" }),
+      tarEntry({
+        name: "bin/true",
+        mode: 0o555,
+        data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
+      }),
+      tarEntry({ name: "etc/yurt/", type: "5" }),
+      tarEntry({
+        name: "etc/yurt/base-image.json",
+        data: enc.encode(JSON.stringify({
+          version: 1,
+          id: "cli-image",
+          tools: [{ name: "true", path: "/bin/true" }],
+        })),
+      }),
+    ])),
+  );
 
   const command = new Deno.Command(deno, {
-    args: ["run", "--allow-read", "--allow-write", "--allow-env", CLI, imagePath],
+    args: [
+      "run",
+      "--allow-read",
+      "--allow-write",
+      "--allow-env",
+      CLI,
+      imagePath,
+    ],
     stdout: "piped",
     stderr: "piped",
   });
@@ -173,5 +185,8 @@ Deno.test("yurt CLI fails clearly when no command and /bin/sh is missing", async
   const stderr = new TextDecoder().decode(result.stderr);
 
   assertEquals(result.code, 127);
-  assertStringIncludes(stderr, "no command provided and /bin/sh is not present in image");
+  assertStringIncludes(
+    stderr,
+    "no command provided and /bin/sh is not present in image",
+  );
 });

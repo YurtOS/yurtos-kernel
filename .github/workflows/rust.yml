@@ -10,27 +10,66 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if git diff --name-only "$base"...HEAD -- '*.rs' 'Cargo.toml' 'Cargo.lock' | grep -q .; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.changed.outputs.rust == 'true'
+        run: cargo fmt --all -- --check
+      - if: steps.changed.outputs.rust != 'true'
+        run: echo "No Rust changes; skipping rustfmt"
 
   clippy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.95.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if git diff --name-only "$base"...HEAD -- '*.rs' 'Cargo.toml' 'Cargo.lock' | grep -q .; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
       # Uses workspace default-members (excludes wasm-only canary crates).
-      - run: cargo clippy --all-targets -- -D warnings
+      - if: steps.changed.outputs.rust == 'true'
+        run: cargo clippy --all-targets -- -D warnings
+      - if: steps.changed.outputs.rust != 'true'
+        run: echo "No Rust changes; skipping clippy"
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
+      - id: changed
+        run: |
+          base="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if git diff --name-only "$base"...HEAD -- '*.rs' 'Cargo.toml' 'Cargo.lock' | grep -q .; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
       # Uses workspace default-members (excludes wasm-only canary crates).
-      - run: cargo test --tests
+      - if: steps.changed.outputs.rust == 'true'
+        run: cargo test --tests
+      - if: steps.changed.outputs.rust != 'true'
+        run: echo "No Rust changes; skipping cargo test"

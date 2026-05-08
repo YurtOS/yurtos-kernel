@@ -4,11 +4,12 @@ import type { PlatformAdapter } from "./platform/adapter.js";
 import { Process } from "./process/handle.js";
 import { ProcessKernel } from "./process/kernel.js";
 import { loadProcess } from "./process/loader.js";
-import { defaultWasmModuleCache, type WasmModuleCache } from "./process/module-cache.js";
-import { ProcessManager } from "./process/manager.js";
 import {
-  createProcessLoaderContextForVfs,
-} from "./sandbox.js";
+  defaultWasmModuleCache,
+  type WasmModuleCache,
+} from "./process/module-cache.js";
+import { ProcessManager } from "./process/manager.js";
+import { createProcessLoaderContextForVfs } from "./sandbox.js";
 import { OverlayVFS } from "./vfs/overlay-vfs.js";
 import { TarImageRootProvider } from "./vfs/tar-image-root-provider.js";
 import { VFS } from "./vfs/vfs.js";
@@ -158,7 +159,9 @@ export class YurtImageBuilder {
 
   chown(path: string, uid: number, gid: number, followSymlinks = true): void {
     this.assertAlive();
-    this.vfs.withWriteAccess(() => this.vfs.chown(path, uid, gid, followSymlinks));
+    this.vfs.withWriteAccess(() =>
+      this.vfs.chown(path, uid, gid, followSymlinks)
+    );
   }
 
   unlink(path: string): void {

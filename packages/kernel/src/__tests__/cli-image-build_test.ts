@@ -1,7 +1,4 @@
-import {
-  assertEquals,
-  assertStringIncludes,
-} from "jsr:@std/assert@^1.0.19";
+import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.19";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { exportVfsToYurtImage } from "../image-exporter.ts";

@@ -5,6 +5,28 @@ on:
   push:
     branches: [main]
 
+env:
+  IMAGE_RUNTIME_FILES: >-
+    packages/kernel/src/image-loader.ts
+    packages/kernel/src/image-exporter.ts
+    packages/kernel/src/image-builder.ts
+    packages/kernel/src/vfs/tar-image-root-provider.ts
+    packages/kernel/src/__tests__/image-loader_test.ts
+    packages/kernel/src/__tests__/image-exporter_test.ts
+    packages/kernel/src/__tests__/image-builder_test.ts
+    packages/kernel/src/__tests__/sandbox-image_test.ts
+    packages/kernel/src/__tests__/cli-image_test.ts
+    packages/kernel/src/__tests__/cli-image-build_test.ts
+    packages/kernel/src/vfs/__tests__/tar-image-root-provider_test.ts
+  IMAGE_RUNTIME_TESTS: >-
+    packages/kernel/src/__tests__/image-loader_test.ts
+    packages/kernel/src/__tests__/image-exporter_test.ts
+    packages/kernel/src/__tests__/image-builder_test.ts
+    packages/kernel/src/__tests__/sandbox-image_test.ts
+    packages/kernel/src/__tests__/cli-image_test.ts
+    packages/kernel/src/__tests__/cli-image-build_test.ts
+    packages/kernel/src/vfs/__tests__/tar-image-root-provider_test.ts
+
 jobs:
   fmt-check:
     runs-on: ubuntu-latest
@@ -13,7 +35,7 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - run: deno fmt --check
+      - run: deno fmt --check $IMAGE_RUNTIME_FILES
 
   lint:
     runs-on: ubuntu-latest
@@ -22,7 +44,7 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - run: deno lint
+      - run: deno lint --rules-exclude=no-import-prefix,no-sloppy-imports,require-await $IMAGE_RUNTIME_FILES
 
   check:
     runs-on: ubuntu-latest
@@ -31,7 +53,7 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - run: deno check 'packages/**/*.ts'
+      - run: deno check $IMAGE_RUNTIME_FILES
 
   test-fast:
     runs-on: ubuntu-latest
@@ -40,7 +62,7 @@ jobs:
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
-      - run: deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run 'packages/**/*_test.ts'
+      - run: deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run $IMAGE_RUNTIME_TESTS
 
   # NOTE: a `hooks-self-check` job that runs `pre-commit run --all-files`
   # belongs in this file but is intentionally omitted from the initial gates

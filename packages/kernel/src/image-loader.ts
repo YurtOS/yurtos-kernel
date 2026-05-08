@@ -75,7 +75,9 @@ async function buildCachePath(
 
 async function readOptional(path: string): Promise<Uint8Array | undefined> {
   try {
-    return new Uint8Array(await (await import("node:fs/promises")).readFile(path));
+    return new Uint8Array(
+      await (await import("node:fs/promises")).readFile(path),
+    );
   } catch (error) {
     if (isNotFound(error)) return undefined;
     throw error;

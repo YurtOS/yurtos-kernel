@@ -90,123 +90,138 @@ function zstd(data: Uint8Array): Promise<Uint8Array> {
   });
 }
 
-describe("Sandbox image root", { sanitizeResources: false, sanitizeOps: false }, () => {
-  it("boots from a zstd .yurtimg and writes only to the upper layer", async () => {
-    const tarBytes = tar([
-      tarEntry({ name: "bin/", type: "5", mode: 0o755 }),
-      tarEntry({
-        name: "bin/true",
-        mode: 0o555,
-        data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
-      }),
-      tarEntry({ name: "etc/", type: "5", mode: 0o755 }),
-      tarEntry({
-        name: "etc/base-marker.txt",
-        mode: 0o666,
-        uid: 1000,
-        gid: 1000,
-        data: enc.encode("base"),
-      }),
-      tarEntry({ name: "etc/yurt/", type: "5", mode: 0o755 }),
-      tarEntry({
-        name: "etc/yurt/base-image.json",
-        mode: 0o444,
-        data: enc.encode(JSON.stringify({
-          version: 1,
-          id: "test-image",
-          tools: [{ name: "true", path: "/bin/true" }],
-        })),
-      }),
-    ]);
-    const sandbox = await Sandbox.create({
-      wasmDir: WASM_DIR,
-      adapter: new NodeAdapter(),
-      image: await zstd(tarBytes),
-      bootArgv: ["/bin/true"],
+describe(
+  "Sandbox image root",
+  { sanitizeResources: false, sanitizeOps: false },
+  () => {
+    it("boots from a zstd .yurtimg and writes only to the upper layer", async () => {
+      const tarBytes = tar([
+        tarEntry({ name: "bin/", type: "5", mode: 0o755 }),
+        tarEntry({
+          name: "bin/true",
+          mode: 0o555,
+          data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
+        }),
+        tarEntry({ name: "etc/", type: "5", mode: 0o755 }),
+        tarEntry({
+          name: "etc/base-marker.txt",
+          mode: 0o666,
+          uid: 1000,
+          gid: 1000,
+          data: enc.encode("base"),
+        }),
+        tarEntry({ name: "etc/yurt/", type: "5", mode: 0o755 }),
+        tarEntry({
+          name: "etc/yurt/base-image.json",
+          mode: 0o444,
+          data: enc.encode(JSON.stringify({
+            version: 1,
+            id: "test-image",
+            tools: [{ name: "true", path: "/bin/true" }],
+          })),
+        }),
+      ]);
+      const sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+        image: await zstd(tarBytes),
+        bootArgv: ["/bin/true"],
+      });
+
+      try {
+        expect(dec.decode(sandbox.readFile("/etc/base-marker.txt"))).toBe(
+          "base",
+        );
+        sandbox.writeFile("/etc/base-marker.txt", enc.encode("upper"));
+        expect(dec.decode(sandbox.readFile("/etc/base-marker.txt"))).toBe(
+          "upper",
+        );
+        expect(dec.decode(tarBytes)).toContain("base");
+      } finally {
+        sandbox.destroy();
+      }
     });
 
-    try {
-      expect(dec.decode(sandbox.readFile("/etc/base-marker.txt"))).toBe("base");
-      sandbox.writeFile("/etc/base-marker.txt", enc.encode("upper"));
-      expect(dec.decode(sandbox.readFile("/etc/base-marker.txt"))).toBe("upper");
-      expect(dec.decode(tarBytes)).toContain("base");
-    } finally {
-      sandbox.destroy();
-    }
-  });
+    it("accepts an image file path", async () => {
+      const dir = await mkdtemp("/tmp/yurt-image-");
+      const imagePath = join(dir, "test.yurtimg");
+      await writeFile(
+        imagePath,
+        await zstd(tar([
+          tarEntry({ name: "bin/", type: "5" }),
+          tarEntry({
+            name: "bin/true",
+            mode: 0o555,
+            data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
+          }),
+          tarEntry({ name: "etc/yurt/", type: "5" }),
+          tarEntry({
+            name: "etc/yurt/base-image.json",
+            data: enc.encode(JSON.stringify({
+              version: 1,
+              id: "path-image",
+              tools: [{ name: "true", path: "/bin/true" }],
+            })),
+          }),
+        ])),
+      );
 
-  it("accepts an image file path", async () => {
-    const dir = await mkdtemp("/tmp/yurt-image-");
-    const imagePath = join(dir, "test.yurtimg");
-    await writeFile(imagePath, await zstd(tar([
-      tarEntry({ name: "bin/", type: "5" }),
-      tarEntry({
-        name: "bin/true",
-        mode: 0o555,
-        data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
-      }),
-      tarEntry({ name: "etc/yurt/", type: "5" }),
-      tarEntry({
-        name: "etc/yurt/base-image.json",
-        data: enc.encode(JSON.stringify({
-          version: 1,
-          id: "path-image",
-          tools: [{ name: "true", path: "/bin/true" }],
-        })),
-      }),
-    ])));
-
-    const sandbox = await Sandbox.create({
-      wasmDir: WASM_DIR,
-      adapter: new NodeAdapter(),
-      image: imagePath,
-      bootArgv: ["/bin/true"],
+      const sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+        image: imagePath,
+        bootArgv: ["/bin/true"],
+      });
+      try {
+        expect(sandbox.stat("/bin/true").type).toBe("file");
+      } finally {
+        sandbox.destroy();
+      }
     });
-    try {
-      expect(sandbox.stat("/bin/true").type).toBe("file");
-    } finally {
-      sandbox.destroy();
-    }
-  });
 
-  it("runs image commands with argv without shell joining", async () => {
-    const image = await zstd(tar([
-      tarEntry({ name: "bin/", type: "5" }),
-      tarEntry({
-        name: "bin/echo-args",
-        mode: 0o555,
-        data: await Deno.readFile(join(WASM_DIR, "echo-args.wasm")),
-      }),
-      tarEntry({
-        name: "bin/true",
-        mode: 0o555,
-        data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
-      }),
-      tarEntry({ name: "etc/yurt/", type: "5" }),
-      tarEntry({
-        name: "etc/yurt/base-image.json",
-        data: enc.encode(JSON.stringify({
-          version: 1,
-          id: "argv-image",
-          tools: [
-            { name: "true", path: "/bin/true" },
-            { name: "echo-args", path: "/bin/echo-args" },
-          ],
-        })),
-      }),
-    ]));
-    const sandbox = await Sandbox.create({
-      wasmDir: WASM_DIR,
-      adapter: new NodeAdapter(),
-      image,
-      bootArgv: ["/bin/true"],
+    it("runs image commands with argv without shell joining", async () => {
+      const image = await zstd(tar([
+        tarEntry({ name: "bin/", type: "5" }),
+        tarEntry({
+          name: "bin/echo-args",
+          mode: 0o555,
+          data: await Deno.readFile(join(WASM_DIR, "echo-args.wasm")),
+        }),
+        tarEntry({
+          name: "bin/true",
+          mode: 0o555,
+          data: await Deno.readFile(join(WASM_DIR, "true-cmd.wasm")),
+        }),
+        tarEntry({ name: "etc/yurt/", type: "5" }),
+        tarEntry({
+          name: "etc/yurt/base-image.json",
+          data: enc.encode(JSON.stringify({
+            version: 1,
+            id: "argv-image",
+            tools: [
+              { name: "true", path: "/bin/true" },
+              { name: "echo-args", path: "/bin/echo-args" },
+            ],
+          })),
+        }),
+      ]));
+      const sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+        image,
+        bootArgv: ["/bin/true"],
+      });
+      try {
+        const result = await sandbox.runArgv([
+          "/bin/echo-args",
+          "a b",
+          "$HOME",
+        ]);
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout).toBe("a b\n$HOME\n");
+      } finally {
+        sandbox.destroy();
+      }
     });
-    try {
-      const result = await sandbox.runArgv(["/bin/echo-args", "a b", "$HOME"]);
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toBe("a b\n$HOME\n");
-    } finally {
-      sandbox.destroy();
-    }
-  });
-});
+  },
+);
