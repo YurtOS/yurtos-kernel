@@ -48,13 +48,13 @@ Deno.test("parseYurtfile parses ordered image instructions", async () => {
     file,
     [
       "# comment",
-      "FROM empty",
-      "COPY ./hello.txt /etc/hello.txt",
-      "CHMOD 640 /etc/hello.txt",
-      "CHOWN 10:20 /etc/hello.txt",
-      "RM /var/cache",
-      'RUN /bin/echo-args "# header"',
-      "HOSTRUN make -C runtimes/python python.wasm # host shell sees this",
+      "  FROM empty",
+      "\tCOPY ./hello.txt /etc/hello.txt",
+      "  CHMOD 640 /etc/hello.txt",
+      "\tCHOWN 10:20 /etc/hello.txt",
+      "  RM /var/cache",
+      '  RUN /bin/echo-args "# header"',
+      "\tHOSTRUN make -C runtimes/python python.wasm # host shell sees this",
       "",
     ].join("\n"),
   );
@@ -233,10 +233,11 @@ export function parseYurtfileText(
     const trimmed = rawLine.trim();
     if (trimmed === "" || trimmed.startsWith("#")) continue;
 
-    const firstSpace = rawLine.search(/\s/);
-    const rawInstruction = firstSpace === -1 ? rawLine : rawLine.slice(0, firstSpace);
+    const content = rawLine.trimStart();
+    const firstSpace = content.search(/\s/);
+    const rawInstruction = firstSpace === -1 ? content : content.slice(0, firstSpace);
     const instruction = rawInstruction.trim().toUpperCase();
-    const remainder = firstSpace === -1 ? "" : rawLine.slice(firstSpace).trimStart();
+    const remainder = firstSpace === -1 ? "" : content.slice(firstSpace).trimStart();
 
     if (instruction !== "FROM" && base === undefined) {
       throw yurtfileError(options.pathForDiagnostics, lineNumber, "first instruction must be FROM");
@@ -613,6 +614,48 @@ Deno.test("executeYurtfileBuild rejects directory COPY with specific message", a
   assertStringIncludes(stderr.join(""), "COPY does not support directories yet; copy individual files");
   await assertRejects(() => stat(out));
 });
+
+Deno.test("executeYurtfileBuild reports FROM load failures with source location", async () => {
+  const dir = await mkdtemp("/tmp/yurtfile-missing-from-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await writeFile(file, "FROM ./missing.yurtimg\n");
+
+  const stderr: string[] = [];
+  const result = await executeYurtfileBuild({
+    file,
+    outputPath: out,
+    allowHostrun: false,
+    wasmDir: join(resolve("."), "packages/kernel/src/platform/__tests__/fixtures"),
+    stdout: () => {},
+    stderr: (chunk) => stderr.push(chunk),
+  });
+
+  assertEquals(result.exitCode, 1);
+  assertStringIncludes(stderr.join(""), `${file}:1: FROM failed:`);
+  await assertRejects(() => stat(out));
+});
+
+Deno.test("executeYurtfileBuild reports non-RUN instruction failures with source location", async () => {
+  const dir = await mkdtemp("/tmp/yurtfile-missing-copy-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await writeFile(file, "FROM empty\nCOPY missing.txt /etc/missing.txt\n");
+
+  const stderr: string[] = [];
+  const result = await executeYurtfileBuild({
+    file,
+    outputPath: out,
+    allowHostrun: false,
+    wasmDir: join(resolve("."), "packages/kernel/src/platform/__tests__/fixtures"),
+    stdout: () => {},
+    stderr: (chunk) => stderr.push(chunk),
+  });
+
+  assertEquals(result.exitCode, 1);
+  assertStringIncludes(stderr.join(""), `${file}:2: COPY failed:`);
+  await assertRejects(() => stat(out));
+});
 ```
 
 - [ ] **Step 2: Run executor tests and verify failure**
@@ -685,16 +728,17 @@ export async function executeYurtfileBuild(
     return { exitCode: 2 };
   }
 
-  const builder = parsed.base.kind === "empty"
-    ? await YurtImageBuilder.empty({ wasmDir: options.wasmDir, adapter: options.adapter })
-    : await YurtImageBuilder.create({
-      wasmDir: options.wasmDir,
-      adapter: options.adapter,
-      baseImage: parsed.base.path,
-      imageCacheDir: options.imageCacheDir,
-    });
-
+  let builder: YurtImageBuilder | undefined;
   try {
+    builder = parsed.base.kind === "empty"
+      ? await YurtImageBuilder.empty({ wasmDir: options.wasmDir, adapter: options.adapter })
+      : await YurtImageBuilder.create({
+        wasmDir: options.wasmDir,
+        adapter: options.adapter,
+        baseImage: parsed.base.path,
+        imageCacheDir: options.imageCacheDir,
+      });
+
     for (const instruction of parsed.instructions) {
       const result = await executeInstruction(parsed, instruction, builder, { stdout, stderr });
       if (result.exitCode !== 0) return result;
@@ -703,10 +747,14 @@ export async function executeYurtfileBuild(
     await writeOutputAtomically(options.outputPath, await builder.exportImage());
     return { exitCode: 0 };
   } catch (error) {
-    stderr(`${error instanceof Error ? error.message : String(error)}\n`);
+    const line = builder === undefined ? parsed.base.line : undefined;
+    const prefix = builder === undefined && line !== undefined
+      ? `${parsed.pathForDiagnostics}:${line}: FROM failed: `
+      : "";
+    stderr(`${prefix}${error instanceof Error ? error.message : String(error)}\n`);
     return { exitCode: 1 };
   } finally {
-    builder.destroy();
+    builder?.destroy();
   }
 }
 ```
@@ -725,37 +773,46 @@ async function executeInstruction(
     stderr: (chunk: string) => void;
   },
 ): Promise<ExecuteYurtfileBuildResult> {
-  if (instruction.kind === "copy") {
-    const sourceStat = await stat(instruction.source);
-    if (sourceStat.isDirectory()) {
-      io.stderr(`${parsed.pathForDiagnostics}:${instruction.line}: COPY does not support directories yet; copy individual files\n`);
-      return { exitCode: 1 };
+  try {
+    if (instruction.kind === "copy") {
+      const sourceStat = await stat(instruction.source);
+      if (sourceStat.isDirectory()) {
+        io.stderr(`${parsed.pathForDiagnostics}:${instruction.line}: COPY does not support directories yet; copy individual files\n`);
+        return { exitCode: 1 };
+      }
+      await builder.copyIn(instruction.source, instruction.destination);
+      return { exitCode: 0 };
     }
-    await builder.copyIn(instruction.source, instruction.destination);
-    return { exitCode: 0 };
-  }
-  if (instruction.kind === "chmod") {
-    builder.chmod(instruction.path, instruction.mode);
-    return { exitCode: 0 };
-  }
-  if (instruction.kind === "chown") {
-    builder.chown(instruction.path, instruction.uid, instruction.gid);
-    return { exitCode: 0 };
-  }
-  if (instruction.kind === "rm") {
-    builder.remove(instruction.path);
-    return { exitCode: 0 };
-  }
-  if (instruction.kind === "run") {
-    const result = await builder.run(instruction.argv);
-    if (result.stdout) io.stdout(result.stdout);
-    if (result.stderr) io.stderr(result.stderr);
-    if (result.exitCode !== 0) {
-      io.stderr(`${parsed.pathForDiagnostics}:${instruction.line}: RUN exited with status ${result.exitCode}: ${instruction.argv.join(" ")}\n`);
+    if (instruction.kind === "chmod") {
+      builder.chmod(instruction.path, instruction.mode);
+      return { exitCode: 0 };
     }
-    return { exitCode: result.exitCode };
+    if (instruction.kind === "chown") {
+      builder.chown(instruction.path, instruction.uid, instruction.gid);
+      return { exitCode: 0 };
+    }
+    if (instruction.kind === "rm") {
+      builder.remove(instruction.path);
+      return { exitCode: 0 };
+    }
+    if (instruction.kind === "run") {
+      const result = await builder.run(instruction.argv);
+      if (result.stdout) io.stdout(result.stdout);
+      if (result.stderr) io.stderr(result.stderr);
+      if (result.exitCode !== 0) {
+        io.stderr(`${parsed.pathForDiagnostics}:${instruction.line}: RUN exited with status ${result.exitCode}: ${instruction.argv.join(" ")}\n`);
+      }
+      return { exitCode: result.exitCode };
+    }
+    return await runHostCommand(parsed, instruction, io);
+  } catch (error) {
+    io.stderr(`${parsed.pathForDiagnostics}:${instruction.line}: ${instructionName(instruction)} failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    return { exitCode: 1 };
   }
-  return await runHostCommand(parsed, instruction, io);
+}
+
+function instructionName(instruction: YurtfileInstruction): string {
+  return instruction.kind.toUpperCase();
 }
 
 function runHostCommand(
