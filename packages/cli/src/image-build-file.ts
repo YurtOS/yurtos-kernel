@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
 import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { YurtImageBuilder } from "../../kernel/src/image-builder.js";
-import type { PlatformAdapter } from "../../kernel/src/platform/adapter.js";
-import { NodeAdapter } from "../../kernel/src/platform/node-adapter.js";
+import process from "node:process";
+import { YurtImageBuilder } from "../../kernel/src/image-builder.ts";
+import type { PlatformAdapter } from "../../kernel/src/platform/adapter.ts";
+import { NodeAdapter } from "../../kernel/src/platform/node-adapter.ts";
 
 export interface ParsedYurtfile {
   path: string;

@@ -7,12 +7,13 @@ import { createInterface } from "node:readline";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
+import process from "node:process";
 import { writeFile } from "node:fs/promises";
 
-import { executeYurtfileBuild } from "./image-build-file.js";
-import { YurtImageBuilder } from "../../kernel/src/image-builder.js";
-import { NodeAdapter } from "../../kernel/src/platform/node-adapter.js";
-import { Sandbox } from "../../kernel/src/sandbox.js";
+import { executeYurtfileBuild } from "./image-build-file.ts";
+import { YurtImageBuilder } from "../../kernel/src/image-builder.ts";
+import { NodeAdapter } from "../../kernel/src/platform/node-adapter.ts";
+import { Sandbox } from "../../kernel/src/sandbox.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 

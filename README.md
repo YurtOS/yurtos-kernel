@@ -42,8 +42,8 @@ deno run --allow-read --allow-write --allow-run --allow-env \
 ```
 
 For one-off cases, `yurt image build` also accepts flags such as `--empty`,
-`--copy`, `--chmod`, `--rm`, and `--run`. See
-[docs/images.md](docs/images.md) for the full image guide.
+`--copy`, `--chmod`, `--rm`, and `--run`. See [docs/images.md](docs/images.md)
+for the full image guide.
 
 Run a command from that image:
 

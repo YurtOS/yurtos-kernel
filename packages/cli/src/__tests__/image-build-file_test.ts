@@ -1,8 +1,4 @@
-import {
-  assertEquals,
-  assertRejects,
-  assertStringIncludes,
-} from "jsr:@std/assert@^1.0.19";
+import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
 import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { executeYurtfileBuild, parseYurtfile } from "../image-build-file.ts";
