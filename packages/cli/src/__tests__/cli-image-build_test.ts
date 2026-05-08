@@ -1,10 +1,10 @@
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@^1.0.19";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { exportVfsToYurtImage } from "../image-exporter.ts";
-import { loadYurtImage } from "../image-loader.ts";
-import { TarImageRootProvider } from "../vfs/tar-image-root-provider.ts";
-import { VFS } from "../vfs/vfs.ts";
+import { exportVfsToYurtImage } from "../../../kernel/src/image-exporter.ts";
+import { loadYurtImage } from "../../../kernel/src/image-loader.ts";
+import { TarImageRootProvider } from "../../../kernel/src/vfs/tar-image-root-provider.ts";
+import { VFS } from "../../../kernel/src/vfs/vfs.ts";
 
 const CLI = resolve(
   decodeURIComponent(new URL("../cli.ts", import.meta.url).pathname),

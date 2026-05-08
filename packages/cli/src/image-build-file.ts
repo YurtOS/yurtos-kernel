@@ -1,5 +1,9 @@
-import { readFile } from "node:fs/promises";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { spawn } from "node:child_process";
+import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { YurtImageBuilder } from "../../kernel/src/image-builder.js";
+import type { PlatformAdapter } from "../../kernel/src/platform/adapter.js";
+import { NodeAdapter } from "../../kernel/src/platform/node-adapter.js";
 
 export interface ParsedYurtfile {
   path: string;
@@ -19,6 +23,84 @@ export type YurtfileInstruction =
   | { kind: "rm"; line: number; path: string }
   | { kind: "run"; line: number; argv: string[] }
   | { kind: "hostrun"; line: number; command: string };
+
+export interface ExecuteYurtfileBuildOptions {
+  file: string;
+  outputPath: string;
+  allowHostrun: boolean;
+  wasmDir: string;
+  adapter?: PlatformAdapter;
+  imageCacheDir?: string;
+  stdout?: (chunk: string) => void;
+  stderr?: (chunk: string) => void;
+}
+
+export interface ExecuteYurtfileBuildResult {
+  exitCode: number;
+}
+
+export async function executeYurtfileBuild(
+  options: ExecuteYurtfileBuildOptions,
+): Promise<ExecuteYurtfileBuildResult> {
+  const stdout = options.stdout ??
+    ((chunk: string) => process.stdout.write(chunk));
+  const stderr = options.stderr ??
+    ((chunk: string) => process.stderr.write(chunk));
+  let parsed: ParsedYurtfile;
+  try {
+    parsed = await parseYurtfile(options.file);
+    const hostrun = parsed.instructions.find((instruction) =>
+      instruction.kind === "hostrun"
+    );
+    if (hostrun && !options.allowHostrun) {
+      stderr(
+        `${parsed.pathForDiagnostics}:${hostrun.line}: HOSTRUN requires --allow-hostrun\n`,
+      );
+      return { exitCode: 2 };
+    }
+  } catch (error) {
+    stderr(`${error instanceof Error ? error.message : String(error)}\n`);
+    return { exitCode: 2 };
+  }
+
+  let builder: YurtImageBuilder | undefined;
+  try {
+    const adapter = options.adapter ?? new NodeAdapter();
+    builder = parsed.base.kind === "empty"
+      ? await YurtImageBuilder.empty({ wasmDir: options.wasmDir, adapter })
+      : await YurtImageBuilder.create({
+        wasmDir: options.wasmDir,
+        adapter,
+        baseImage: parsed.base.path,
+        imageCacheDir: options.imageCacheDir,
+      });
+
+    for (const instruction of parsed.instructions) {
+      const result = await executeInstruction(parsed, instruction, builder, {
+        stdout,
+        stderr,
+      });
+      if (result.exitCode !== 0) return result;
+    }
+
+    await writeOutputAtomically(
+      options.outputPath,
+      await builder.exportImage(),
+    );
+    return { exitCode: 0 };
+  } catch (error) {
+    const line = builder === undefined ? parsed.base.line : undefined;
+    const prefix = builder === undefined && line !== undefined
+      ? `${parsed.pathForDiagnostics}:${line}: FROM failed: `
+      : "";
+    stderr(
+      `${prefix}${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return { exitCode: 1 };
+  } finally {
+    builder?.destroy();
+  }
+}
 
 export async function parseYurtfile(path: string): Promise<ParsedYurtfile> {
   const text = await readFile(path, "utf8");
@@ -283,6 +365,130 @@ function tokenizeYurtfileLine(
   }
   if (tokenStarted) tokens.push(token);
   return tokens;
+}
+
+async function executeInstruction(
+  parsed: ParsedYurtfile,
+  instruction: YurtfileInstruction,
+  builder: YurtImageBuilder,
+  io: {
+    stdout: (chunk: string) => void;
+    stderr: (chunk: string) => void;
+  },
+): Promise<ExecuteYurtfileBuildResult> {
+  try {
+    if (instruction.kind === "copy") {
+      const sourceStat = await stat(instruction.source);
+      if (sourceStat.isDirectory()) {
+        io.stderr(
+          `${parsed.pathForDiagnostics}:${instruction.line}: COPY does not support directories yet; copy individual files\n`,
+        );
+        return { exitCode: 1 };
+      }
+      await builder.copyIn(instruction.source, instruction.destination);
+      return { exitCode: 0 };
+    }
+    if (instruction.kind === "chmod") {
+      builder.chmod(instruction.path, instruction.mode);
+      return { exitCode: 0 };
+    }
+    if (instruction.kind === "chown") {
+      builder.chown(instruction.path, instruction.uid, instruction.gid);
+      return { exitCode: 0 };
+    }
+    if (instruction.kind === "rm") {
+      builder.remove(instruction.path);
+      return { exitCode: 0 };
+    }
+    if (instruction.kind === "run") {
+      const result = await builder.run(instruction.argv);
+      if (result.stdout) io.stdout(result.stdout);
+      if (result.stderr) io.stderr(result.stderr);
+      if (result.exitCode !== 0) {
+        io.stderr(
+          `${parsed.pathForDiagnostics}:${instruction.line}: RUN exited with status ${result.exitCode}: ${
+            instruction.argv.join(" ")
+          }\n`,
+        );
+      }
+      return { exitCode: result.exitCode };
+    }
+    return await runHostCommand(parsed, instruction, io);
+  } catch (error) {
+    io.stderr(
+      `${parsed.pathForDiagnostics}:${instruction.line}: ${
+        instructionName(instruction)
+      } failed: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return { exitCode: 1 };
+  }
+}
+
+function instructionName(instruction: YurtfileInstruction): string {
+  return instruction.kind.toUpperCase();
+}
+
+function runHostCommand(
+  parsed: ParsedYurtfile,
+  instruction: Extract<YurtfileInstruction, { kind: "hostrun" }>,
+  io: {
+    stdout: (chunk: string) => void;
+    stderr: (chunk: string) => void;
+  },
+): Promise<ExecuteYurtfileBuildResult> {
+  return new Promise((resolveResult, reject) => {
+    const child = spawn(instruction.command, {
+      cwd: dirname(resolve(parsed.path)),
+      env: process.env,
+      shell: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    child.stdout?.on(
+      "data",
+      (chunk: Uint8Array) => io.stdout(new TextDecoder().decode(chunk)),
+    );
+    child.stderr?.on(
+      "data",
+      (chunk: Uint8Array) => io.stderr(new TextDecoder().decode(chunk)),
+    );
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      if (signal) {
+        // Use 1 for signal termination; do not encode shell-style 128+signal.
+        io.stderr(
+          `${parsed.pathForDiagnostics}:${instruction.line}: HOSTRUN terminated by signal ${signal}: ${instruction.command}\n`,
+        );
+        resolveResult({ exitCode: 1 });
+        return;
+      }
+      const exitCode = code ?? 1;
+      if (exitCode !== 0) {
+        io.stderr(
+          `${parsed.pathForDiagnostics}:${instruction.line}: HOSTRUN exited with status ${exitCode}: ${instruction.command}\n`,
+        );
+      }
+      resolveResult({ exitCode });
+    });
+  });
+}
+
+async function writeOutputAtomically(
+  outputPath: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  const dir = dirname(outputPath);
+  const tempPath = join(
+    dir,
+    `.${basename(outputPath)}.${process.pid}.${Date.now()}.tmp`,
+  );
+  try {
+    await writeFile(tempPath, bytes);
+    await rename(tempPath, outputPath);
+  } catch (error) {
+    await rm(tempPath, { force: true });
+    throw error;
+  }
 }
 
 function requireArity(

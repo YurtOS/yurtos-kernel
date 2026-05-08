@@ -3,25 +3,28 @@
  * yurt CLI — interactive shell running entirely in the WASM sandbox.
  */
 
-import { createInterface } from 'node:readline';
-import { resolve, dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'node:os';
-import { writeFile } from 'node:fs/promises';
+import { createInterface } from "node:readline";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { tmpdir } from "node:os";
+import { writeFile } from "node:fs/promises";
 
-import { NodeAdapter } from './platform/node-adapter.js';
-import { Sandbox } from './sandbox.js';
-import { YurtImageBuilder } from './image-builder.js';
+import { YurtImageBuilder } from "../../kernel/src/image-builder.js";
+import { NodeAdapter } from "../../kernel/src/platform/node-adapter.js";
+import { Sandbox } from "../../kernel/src/sandbox.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-const FIXTURES = resolve(__dirname, 'platform/__tests__/fixtures');
+const FIXTURES = resolve(
+  __dirname,
+  "../../kernel/src/platform/__tests__/fixtures",
+);
 
 type ImageBuildOp =
-  | { kind: 'copy'; hostPath: string; vfsPath: string }
-  | { kind: 'chmod'; path: string; mode: number }
-  | { kind: 'chown'; path: string; uid: number; gid: number }
-  | { kind: 'rm'; path: string };
+  | { kind: "copy"; hostPath: string; vfsPath: string }
+  | { kind: "chmod"; path: string; mode: number }
+  | { kind: "chown"; path: string; uid: number; gid: number }
+  | { kind: "rm"; path: string };
 
 interface ImageBuildArgs {
   empty: boolean;
@@ -32,34 +35,36 @@ interface ImageBuildArgs {
 }
 
 async function main() {
-  if (process.argv[2] === 'image' && process.argv[3] === 'build') {
+  if (process.argv[2] === "image" && process.argv[3] === "build") {
     await runImageBuild(process.argv.slice(4));
     return;
   }
 
   const adapter = new NodeAdapter();
   const [, , imageArg, ...commandArgv] = process.argv;
-  if (imageArg && imageArg.endsWith('.yurtimg')) {
+  if (imageArg && imageArg.endsWith(".yurtimg")) {
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter,
       image: imageArg,
       imageCacheDir: process.env.YURT_IMAGE_CACHE_DIR ??
-        join(tmpdir(), 'yurt-image-cache'),
-      bootArgv: ['/bin/true'],
+        join(tmpdir(), "yurt-image-cache"),
+      bootArgv: ["/bin/true"],
     });
-    sandbox.setEnv('HOME', '/home/user');
-    sandbox.setEnv('PWD', '/home/user');
-    sandbox.setEnv('USER', 'user');
-    sandbox.setEnv('PATH', '/bin:/usr/bin');
+    sandbox.setEnv("HOME", "/home/user");
+    sandbox.setEnv("PWD", "/home/user");
+    sandbox.setEnv("USER", "user");
+    sandbox.setEnv("PATH", "/bin:/usr/bin");
 
     try {
-      const argv = commandArgv.length > 0 ? commandArgv : ['/bin/sh'];
+      const argv = commandArgv.length > 0 ? commandArgv : ["/bin/sh"];
       if (commandArgv.length === 0) {
         try {
-          sandbox.stat('/bin/sh');
+          sandbox.stat("/bin/sh");
         } catch {
-          process.stderr.write('no command provided and /bin/sh is not present in image\n');
+          process.stderr.write(
+            "no command provided and /bin/sh is not present in image\n",
+          );
           process.exitCode = 127;
           return;
         }
@@ -78,13 +83,13 @@ async function main() {
     wasmDir: FIXTURES,
     adapter,
   });
-  sandbox.setEnv('HOME', '/home/user');
-  sandbox.setEnv('PWD', '/home/user');
-  sandbox.setEnv('USER', 'user');
-  sandbox.setEnv('PATH', '/bin:/usr/bin');
+  sandbox.setEnv("HOME", "/home/user");
+  sandbox.setEnv("PWD", "/home/user");
+  sandbox.setEnv("USER", "user");
+  sandbox.setEnv("PATH", "/bin:/usr/bin");
 
   // Handle -c flag: run single command and exit
-  const cIndex = process.argv.indexOf('-c');
+  const cIndex = process.argv.indexOf("-c");
   if (cIndex !== -1 && cIndex + 1 < process.argv.length) {
     const cmd = process.argv[cIndex + 1];
     const result = await sandbox.run(cmd);
@@ -98,7 +103,7 @@ async function main() {
   const rl = createInterface({
     input: process.stdin,
     output: process.stdout,
-    prompt: 'yurt$ ',
+    prompt: "yurt$ ",
   });
 
   const queue: string[] = [];
@@ -115,7 +120,7 @@ async function main() {
         rl.prompt();
         continue;
       }
-      if (cmd === 'exit' || cmd === 'quit') {
+      if (cmd === "exit" || cmd === "quit") {
         closing = true;
         break;
       }
@@ -138,22 +143,22 @@ async function main() {
     }
   }
 
-  console.log('yurt — WASM sandbox shell');
+  console.log("yurt — WASM sandbox shell");
   console.log('WASM tools + python3 available. Type "exit" to quit.\n');
   rl.prompt();
 
-  rl.on('line', (line: string) => {
+  rl.on("line", (line: string) => {
     queue.push(line);
     drain();
   });
 
-  rl.on('close', () => {
+  rl.on("close", () => {
     // Wait for any remaining commands to finish
     const waitAndExit = async () => {
       while (processing) {
-        await new Promise(r => setTimeout(r, 10));
+        await new Promise((r) => setTimeout(r, 10));
       }
-      console.log('\nbye');
+      console.log("\nbye");
       sandbox.destroy();
       process.exit(0);
     };
@@ -181,16 +186,16 @@ async function runImageBuild(args: string[]): Promise<void> {
       adapter,
       baseImage: parsed.baseImage,
       imageCacheDir: process.env.YURT_IMAGE_CACHE_DIR ??
-        join(tmpdir(), 'yurt-image-cache'),
+        join(tmpdir(), "yurt-image-cache"),
     });
 
   try {
     for (const op of parsed.ops) {
-      if (op.kind === 'copy') {
+      if (op.kind === "copy") {
         await builder.copyIn(op.hostPath, op.vfsPath);
-      } else if (op.kind === 'chmod') {
+      } else if (op.kind === "chmod") {
         builder.chmod(op.path, op.mode);
-      } else if (op.kind === 'chown') {
+      } else if (op.kind === "chown") {
         builder.chown(op.path, op.uid, op.gid);
       } else {
         builder.remove(op.path);
@@ -221,42 +226,50 @@ function parseImageBuildArgs(args: string[]): ImageBuildArgs {
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (arg === '--empty') {
+    if (arg === "--empty") {
       empty = true;
-    } else if (arg === '-o' || arg === '--output') {
+    } else if (arg === "-o" || arg === "--output") {
       outputPath = requiredValue(args, ++i, arg);
-    } else if (arg === '--copy') {
-      const { left, right } = splitPair(requiredValue(args, ++i, arg), ':', arg);
+    } else if (arg === "--copy") {
+      const { left, right } = splitPair(
+        requiredValue(args, ++i, arg),
+        ":",
+        arg,
+      );
       assertAbsolute(right, arg);
-      ops.push({ kind: 'copy', hostPath: left, vfsPath: right });
-    } else if (arg === '--chmod') {
-      const { left, right } = splitPair(requiredValue(args, ++i, arg), ':', arg);
+      ops.push({ kind: "copy", hostPath: left, vfsPath: right });
+    } else if (arg === "--chmod") {
+      const { left, right } = splitPair(
+        requiredValue(args, ++i, arg),
+        ":",
+        arg,
+      );
       assertAbsolute(right, arg);
-      ops.push({ kind: 'chmod', path: right, mode: parseMode(left) });
-    } else if (arg === '--chown') {
+      ops.push({ kind: "chmod", path: right, mode: parseMode(left) });
+    } else if (arg === "--chown") {
       const value = requiredValue(args, ++i, arg);
-      const first = value.indexOf(':');
-      const second = value.indexOf(':', first + 1);
+      const first = value.indexOf(":");
+      const second = value.indexOf(":", first + 1);
       if (first <= 0 || second <= first + 1 || second === value.length - 1) {
         throw new Error(`invalid ${arg}; expected uid:gid:/path`);
       }
       const path = value.slice(second + 1);
       assertAbsolute(path, arg);
       ops.push({
-        kind: 'chown',
-        uid: parseDecimal(value.slice(0, first), 'uid'),
-        gid: parseDecimal(value.slice(first + 1, second), 'gid'),
+        kind: "chown",
+        uid: parseDecimal(value.slice(0, first), "uid"),
+        gid: parseDecimal(value.slice(first + 1, second), "gid"),
         path,
       });
-    } else if (arg === '--rm') {
+    } else if (arg === "--rm") {
       const path = requiredValue(args, ++i, arg);
       assertAbsolute(path, arg);
-      ops.push({ kind: 'rm', path });
-    } else if (arg === '--run') {
+      ops.push({ kind: "rm", path });
+    } else if (arg === "--run") {
       runArgv = args.slice(i + 1);
-      if (runArgv.length === 0) throw new Error('--run requires argv');
+      if (runArgv.length === 0) throw new Error("--run requires argv");
       break;
-    } else if (arg.startsWith('-')) {
+    } else if (arg.startsWith("-")) {
       throw new Error(`unknown option: ${arg}`);
     } else if (baseImage === undefined) {
       baseImage = arg;
@@ -265,16 +278,20 @@ function parseImageBuildArgs(args: string[]): ImageBuildArgs {
     }
   }
 
-  if (!outputPath) throw new Error('missing -o/--output');
-  if (empty && baseImage) throw new Error('--empty cannot be combined with a base image');
-  if (!empty && !baseImage) throw new Error('missing base image; pass --empty for an empty disk');
+  if (!outputPath) throw new Error("missing -o/--output");
+  if (empty && baseImage) {
+    throw new Error("--empty cannot be combined with a base image");
+  }
+  if (!empty && !baseImage) {
+    throw new Error("missing base image; pass --empty for an empty disk");
+  }
 
   return { empty, baseImage, outputPath, ops, runArgv };
 }
 
 function requiredValue(args: string[], index: number, option: string): string {
   const value = args[index];
-  if (value === undefined || value.startsWith('--')) {
+  if (value === undefined || value.startsWith("--")) {
     throw new Error(`${option} requires a value`);
   }
   return value;
@@ -302,7 +319,7 @@ function parseDecimal(value: string, label: string): number {
 }
 
 function assertAbsolute(path: string, option: string): void {
-  if (!path.startsWith('/')) throw new Error(`${option} path must be absolute`);
+  if (!path.startsWith("/")) throw new Error(`${option} path must be absolute`);
 }
 
 main();

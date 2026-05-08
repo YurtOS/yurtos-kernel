@@ -5,7 +5,8 @@ import { zstdCompress } from "node:zlib";
 
 const WASM_DIR = resolve(
   decodeURIComponent(
-    new URL("../platform/__tests__/fixtures", import.meta.url).pathname,
+    new URL("../../../kernel/src/platform/__tests__/fixtures", import.meta.url)
+      .pathname,
   ),
 );
 const CLI = resolve(

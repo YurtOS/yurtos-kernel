@@ -3,9 +3,11 @@ import {
   assertRejects,
   assertStringIncludes,
 } from "jsr:@std/assert@^1.0.19";
-import { mkdtemp, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-import { parseYurtfile } from "../image-build-file.ts";
+import { mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { executeYurtfileBuild, parseYurtfile } from "../image-build-file.ts";
+import { loadYurtImage } from "../../../kernel/src/image-loader.ts";
+import { TarImageRootProvider } from "../../../kernel/src/vfs/tar-image-root-provider.ts";
 
 Deno.test("parseYurtfile parses ordered image instructions", async () => {
   const dir = await mkdtemp("/tmp/yurtfile-parse-");
@@ -180,4 +182,167 @@ Deno.test("parseYurtfile rejects invalid instruction arguments", async () => {
     const error = await assertRejects(() => parseYurtfile(file), Error);
     assertStringIncludes(error.message, message);
   }
+});
+
+const dec = new TextDecoder();
+
+async function rootFromImage(path: string): Promise<TarImageRootProvider> {
+  const loaded = await loadYurtImage(await readFile(path));
+  return new TarImageRootProvider({
+    id: loaded.baseId,
+    image: loaded.tarBytes,
+    index: loaded.index,
+  });
+}
+
+Deno.test("executeYurtfileBuild fails HOSTRUN preflight before touching output", async () => {
+  const dir = await mkdtemp("/tmp/yurtfile-hostrun-gate-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await writeFile(file, "FROM empty\nHOSTRUN echo blocked\n");
+  await writeFile(out, "existing");
+
+  const result = await executeYurtfileBuild({
+    file,
+    outputPath: out,
+    allowHostrun: false,
+    wasmDir: join(
+      resolve("."),
+      "packages/kernel/src/platform/__tests__/fixtures",
+    ),
+    stdout: () => {},
+    stderr: () => {},
+  });
+
+  assertEquals(result.exitCode, 2);
+  assertEquals(await readFile(out, "utf8"), "existing");
+});
+
+Deno.test("executeYurtfileBuild runs HOSTRUN through the host shell", async () => {
+  const dir = await mkdtemp("/tmp/yurtfile-hostrun-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await writeFile(
+    file,
+    [
+      "FROM empty",
+      "HOSTRUN printf generated > generated.txt",
+      "COPY generated.txt /etc/generated.txt",
+    ].join("\n"),
+  );
+
+  const result = await executeYurtfileBuild({
+    file,
+    outputPath: out,
+    allowHostrun: true,
+    wasmDir: join(
+      resolve("."),
+      "packages/kernel/src/platform/__tests__/fixtures",
+    ),
+    stdout: () => {},
+    stderr: () => {},
+  });
+
+  assertEquals(result.exitCode, 0);
+  const root = await rootFromImage(out);
+  assertEquals(dec.decode(root.readFile("/etc/generated.txt")), "generated");
+});
+
+Deno.test("executeYurtfileBuild propagates failing HOSTRUN and preserves existing output", async () => {
+  const dir = await mkdtemp("/tmp/yurtfile-hostrun-fail-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await writeFile(file, "FROM empty\nHOSTRUN exit 7\n");
+  await writeFile(out, "existing");
+
+  const result = await executeYurtfileBuild({
+    file,
+    outputPath: out,
+    allowHostrun: true,
+    wasmDir: join(
+      resolve("."),
+      "packages/kernel/src/platform/__tests__/fixtures",
+    ),
+    stdout: () => {},
+    stderr: () => {},
+  });
+
+  assertEquals(result.exitCode, 7);
+  assertEquals(await readFile(out, "utf8"), "existing");
+});
+
+Deno.test("executeYurtfileBuild rejects directory COPY with specific message", async () => {
+  const dir = await mkdtemp("/tmp/yurtfile-copy-dir-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await Deno.mkdir(join(dir, "srcdir"));
+  await writeFile(file, "FROM empty\nCOPY srcdir /srcdir\n");
+
+  const stderr: string[] = [];
+  const result = await executeYurtfileBuild({
+    file,
+    outputPath: out,
+    allowHostrun: false,
+    wasmDir: join(
+      resolve("."),
+      "packages/kernel/src/platform/__tests__/fixtures",
+    ),
+    stdout: () => {},
+    stderr: (chunk) => stderr.push(chunk),
+  });
+
+  assertEquals(result.exitCode, 1);
+  assertStringIncludes(
+    stderr.join(""),
+    "COPY does not support directories yet; copy individual files",
+  );
+  await assertRejects(() => stat(out));
+});
+
+Deno.test("executeYurtfileBuild reports FROM load failures with source location", async () => {
+  const dir = await mkdtemp("/tmp/yurtfile-missing-from-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await writeFile(file, "FROM ./missing.yurtimg\n");
+
+  const stderr: string[] = [];
+  const result = await executeYurtfileBuild({
+    file,
+    outputPath: out,
+    allowHostrun: false,
+    wasmDir: join(
+      resolve("."),
+      "packages/kernel/src/platform/__tests__/fixtures",
+    ),
+    stdout: () => {},
+    stderr: (chunk) => stderr.push(chunk),
+  });
+
+  assertEquals(result.exitCode, 1);
+  assertStringIncludes(stderr.join(""), `${file}:1: FROM failed:`);
+  await assertRejects(() => stat(out));
+});
+
+Deno.test("executeYurtfileBuild reports non-RUN instruction failures with source location", async () => {
+  const dir = await mkdtemp("/tmp/yurtfile-missing-copy-");
+  const file = join(dir, "Yurtfile");
+  const out = join(dir, "out.yurtimg");
+  await writeFile(file, "FROM empty\nCOPY missing.txt /etc/missing.txt\n");
+
+  const stderr: string[] = [];
+  const result = await executeYurtfileBuild({
+    file,
+    outputPath: out,
+    allowHostrun: false,
+    wasmDir: join(
+      resolve("."),
+      "packages/kernel/src/platform/__tests__/fixtures",
+    ),
+    stdout: () => {},
+    stderr: (chunk) => stderr.push(chunk),
+  });
+
+  assertEquals(result.exitCode, 1);
+  assertStringIncludes(stderr.join(""), `${file}:2: COPY failed:`);
+  await assertRejects(() => stat(out));
 });
