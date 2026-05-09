@@ -212,3 +212,13 @@ doc = "POSIX kill(pid, sig). Request bytes carry two little-endian u32s: target 
 id = 0x1_001C
 kind = "syscall"
 doc = "POSIX sigaction(sig, disposition). Request bytes carry two little-endian u32s: signal number (1..=63), disposition. Disposition encoding: 0 = SIG_DFL, 1 = SIG_IGN, anything else is treated as a user-provided wasm function index/pointer (kernel stores it; user-side libc maintains the actual mapping). Phase 2 stores per-pid only; delivery comes with AsyncBridge. Returns the previous disposition on success, -EINVAL for sig out of range."
+
+[method.sys_sched_yield]
+id = 0x1_001D
+kind = "syscall"
+doc = "POSIX sched_yield(). No request bytes. On JS hosts this is the natural AsyncBridge yield point; Phase 2 always returns 0. The kernel records a per-pid yield counter so tests can observe that the syscall reached the kernel. Real cooperative scheduling lands when the AsyncBridge integration does."
+
+[method.sys_nanosleep]
+id = 0x1_001E
+kind = "syscall"
+doc = "POSIX nanosleep(req). Request bytes are 8 bytes — duration in little-endian u64 nanoseconds. Phase 2 returns 0 immediately without actually blocking; real wall-clock sleep needs the AsyncBridge to suspend the process. The kernel still records the most recently requested duration per-pid so tests can observe the value reached the kernel. Returns 0 on success, -EINVAL for short request."

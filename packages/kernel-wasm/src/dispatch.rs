@@ -66,6 +66,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SETSID => setsid(caller_pid),
         METHOD_SYS_KILL => kill(request),
         METHOD_SYS_SIGACTION => sigaction(caller_pid, request),
+        METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
+        METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -612,6 +614,27 @@ fn sigaction(caller_pid: u32, request: &[u8]) -> i64 {
         *slot = disposition;
         prev as i64
     })
+}
+
+/// `sched_yield()`. Phase 2: increments a per-pid counter and returns
+/// 0 immediately. Real cooperative scheduling lands when the
+/// AsyncBridge integration does — the kernel-side return path will
+/// instead suspend the process to its host's runqueue.
+fn sched_yield(caller_pid: u32) -> i64 {
+    with_kernel(|k| k.process_mut(caller_pid).yield_count += 1);
+    0
+}
+
+/// `nanosleep(req: u64 ns)`. Phase 2: records the requested duration
+/// per-pid and returns 0 immediately. Real wall-clock blocking needs
+/// the AsyncBridge to suspend the process.
+fn nanosleep(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let ns = u64::from_le_bytes(request[..8].try_into().expect("8 bytes"));
+    with_kernel(|k| k.process_mut(caller_pid).last_nanosleep_ns = ns);
+    0
 }
 
 fn now_realtime(response: &mut [u8]) -> i64 {
@@ -1515,6 +1538,37 @@ mod tests {
         other.extend_from_slice(&9_u32.to_le_bytes()); // SIGKILL
         other.extend_from_slice(&0_u32.to_le_bytes());
         assert_eq!(dispatch(METHOD_SYS_SIGACTION, 1, &other, &mut []), 0);
+    }
+
+    #[test]
+    fn sched_yield_increments_per_pid_counter() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(dispatch(METHOD_SYS_SCHED_YIELD, 1, &[], &mut []), 0);
+        assert_eq!(dispatch(METHOD_SYS_SCHED_YIELD, 1, &[], &mut []), 0);
+        assert_eq!(dispatch(METHOD_SYS_SCHED_YIELD, 2, &[], &mut []), 0);
+        let (y1, y2) = crate::kernel::with_kernel(|k| {
+            (k.process_mut(1).yield_count, k.process_mut(2).yield_count)
+        });
+        assert_eq!(y1, 2);
+        assert_eq!(y2, 1);
+    }
+
+    #[test]
+    fn nanosleep_records_requested_duration() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let req = 5_000_000_000_u64.to_le_bytes(); // 5 seconds
+        assert_eq!(dispatch(METHOD_SYS_NANOSLEEP, 1, &req, &mut []), 0);
+        let recorded = crate::kernel::with_kernel(|k| k.process_mut(1).last_nanosleep_ns);
+        assert_eq!(recorded, 5_000_000_000);
+    }
+
+    #[test]
+    fn nanosleep_short_request_is_einval() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(METHOD_SYS_NANOSLEEP, 1, &[1, 2, 3], &mut []),
+            -(abi::EINVAL as i64)
+        );
     }
 
     #[test]

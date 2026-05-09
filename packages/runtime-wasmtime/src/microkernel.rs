@@ -73,6 +73,8 @@ mod sys_method_id {
     pub const SETSID: u32 = 0x1_001A;
     pub const KILL: u32 = 0x1_001B;
     pub const SIGACTION: u32 = 0x1_001C;
+    pub const SCHED_YIELD: u32 = 0x1_001D;
+    pub const NANOSLEEP: u32 = 0x1_001E;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -1187,6 +1189,21 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(sig as u32).to_le_bytes());
             req.extend_from_slice(&(disposition as u32).to_le_bytes());
             forward_request_bytes(&mut caller, sys_method_id::SIGACTION, &req) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_sched_yield",
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            forward_request_bytes(&mut caller, sys_method_id::SCHED_YIELD, &[]) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_nanosleep",
+        |mut caller: Caller<'_, UserState>, ns: i64| -> i32 {
+            let req = (ns as u64).to_le_bytes();
+            forward_request_bytes(&mut caller, sys_method_id::NANOSLEEP, &req) as i32
         },
     )?;
     Ok(())

@@ -166,6 +166,15 @@ pub struct Process {
     /// 0 = SIG_DFL, 1 = SIG_IGN, anything else is an opaque user-side
     /// handler value (typically a wasm function table index).
     pub signal_dispositions: [u32; 63],
+    /// Times the process has called `sys_sched_yield`. Phase 2
+    /// observability hook — real cooperative scheduling lands with
+    /// the AsyncBridge integration; tests use this to assert that
+    /// userland's yield call reached the kernel.
+    pub yield_count: u64,
+    /// Most recent argument the process passed to `sys_nanosleep`,
+    /// in nanoseconds. Same Phase 2 observability rationale as
+    /// `yield_count`.
+    pub last_nanosleep_ns: u64,
 }
 
 impl Default for Process {
@@ -184,6 +193,8 @@ impl Default for Process {
             sid: 0,
             pending_signals: 0,
             signal_dispositions: [0; 63],
+            yield_count: 0,
+            last_nanosleep_ns: 0,
         }
     }
 }

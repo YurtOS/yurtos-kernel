@@ -56,6 +56,8 @@ const METHOD_SYS_GETSID: u32 = 0x1_0019;
 const METHOD_SYS_SETSID: u32 = 0x1_001A;
 const METHOD_SYS_KILL: u32 = 0x1_001B;
 const METHOD_SYS_SIGACTION: u32 = 0x1_001C;
+const METHOD_SYS_SCHED_YIELD: u32 = 0x1_001D;
+const METHOD_SYS_NANOSLEEP: u32 = 0x1_001E;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -793,6 +795,16 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_SIGACTION,
             METHOD_SYS_SIGACTION as i64,
         ),
+        (
+            "sys_sched_yield",
+            METHOD_SYS_SCHED_YIELD,
+            METHOD_SYS_SCHED_YIELD as i64,
+        ),
+        (
+            "sys_nanosleep",
+            METHOD_SYS_NANOSLEEP,
+            METHOD_SYS_NANOSLEEP as i64,
+        ),
     ] {
         let entry = methods
             .get(name)
@@ -875,6 +887,22 @@ fn signal_storage_round_trips_through_trampoline() {
     req4.extend_from_slice(&64_u32.to_le_bytes());
     let rc = mk.syscall(METHOD_SYS_KILL, &req4, &mut []).unwrap();
     assert_eq!(rc, -22, "EINVAL for sig out of 1..=63");
+}
+
+#[test]
+fn sched_yield_and_nanosleep_round_trip_through_trampoline() {
+    // Phase 2 acknowledge-and-return stubs. We can't observe per-pid
+    // counters from outside the kernel.wasm sandbox, so this test
+    // just asserts the trampoline paths work end-to-end and return 0.
+    let mk = fresh_microkernel(0);
+    let rc = mk.syscall(METHOD_SYS_SCHED_YIELD, &[], &mut []).unwrap();
+    assert_eq!(rc, 0);
+    let req = 1_500_000_u64.to_le_bytes(); // 1.5ms
+    let rc = mk.syscall(METHOD_SYS_NANOSLEEP, &req, &mut []).unwrap();
+    assert_eq!(rc, 0);
+    // Short request → -EINVAL.
+    let rc = mk.syscall(METHOD_SYS_NANOSLEEP, &[1, 2, 3], &mut []).unwrap();
+    assert_eq!(rc, -22);
 }
 
 #[test]

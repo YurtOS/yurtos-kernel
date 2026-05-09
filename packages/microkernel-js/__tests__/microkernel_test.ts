@@ -278,6 +278,24 @@ Deno.test(
   },
 );
 
+Deno.test(
+  "sched_yield + nanosleep round-trip through the trampoline",
+  async () => {
+    const mk = await freshMicrokernel();
+    let { rc } = mk.syscall(METHOD.SYS_SCHED_YIELD, new Uint8Array(0), 0);
+    assertEquals(Number(rc), 0);
+
+    const ns = new Uint8Array(8);
+    new DataView(ns.buffer).setBigUint64(0, 1_500_000n, true);
+    ({ rc } = mk.syscall(METHOD.SYS_NANOSLEEP, ns, 0));
+    assertEquals(Number(rc), 0);
+
+    // Short request → -EINVAL (-22).
+    ({ rc } = mk.syscall(METHOD.SYS_NANOSLEEP, new Uint8Array([1, 2, 3]), 0));
+    assertEquals(Number(rc), -22);
+  },
+);
+
 Deno.test("microkernel direct syscalls use kernel pid 0", async () => {
   const mk = await freshMicrokernel();
   const { rc } = mk.syscall(METHOD.SYS_GETPID, new Uint8Array(0), 0);

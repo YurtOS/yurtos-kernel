@@ -173,6 +173,17 @@ export function buildSysImports(
       view.setUint32(4, disposition >>> 0, true);
       return forwardRequestBytes(METHOD.SYS_SIGACTION, req);
     },
+    sys_sched_yield: () =>
+      forwardRequestBytes(METHOD.SYS_SCHED_YIELD, new Uint8Array(0)),
+    sys_nanosleep: (ns) => {
+      // `ns` arrives as a JS bigint when the wasm import is declared
+      // with an i64 parameter type; coerce defensively for hosts that
+      // hand us a number-shaped 32-bit value instead.
+      const ns64 = typeof ns === "bigint" ? ns : BigInt(ns >>> 0);
+      const req = new Uint8Array(8);
+      new DataView(req.buffer).setBigUint64(0, ns64, true);
+      return forwardRequestBytes(METHOD.SYS_NANOSLEEP, req);
+    },
     sys_clock_gettime: (clockId, outPtr) => {
       const { rc, response } = forwardRequestWithResponse(
         METHOD.SYS_CLOCK_GETTIME,
