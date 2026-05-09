@@ -129,6 +129,36 @@ fn hello_wasm_prints_via_sys_write_through_kernel_wasm() {
 }
 
 #[test]
+fn echo_args_fixture_emits_argv_one_per_line() {
+    // Real fixture from test-fixtures/wasm/echo-args. Uses
+    // std::env::args(), which calls WASI args_get / args_sizes_get
+    // via our shim. Each arg goes through fd_write → sys_write →
+    // kh_log → captured here.
+    ensure_fixture_built("echo-args-wasm");
+    let wasm_bytes = std::fs::read(fixture_wasm_path("echo-args-wasm")).unwrap();
+    let (mk, sink) = fresh_microkernel_with_log();
+    // Note: argv[0] is the program name conventionally; the fixture
+    // skips it (`std::env::args().skip(1)`).
+    let argv: Vec<&[u8]> = vec![b"echo-args", b"alpha", b"beta", b"gamma"];
+    let mut user = mk.spawn_user_process_with_args(&wasm_bytes, &argv).unwrap();
+    let _ = user.run_start();
+
+    let messages = sink.messages.lock().unwrap();
+    let combined: String = messages.iter().map(|(_, m)| m.as_str()).collect();
+    for arg in &["alpha", "beta", "gamma"] {
+        assert!(
+            combined.contains(arg),
+            "expected '{arg}' in captured stdout, got: {combined:?}"
+        );
+    }
+    // argv[0] is the program name; the fixture skips it.
+    assert!(
+        !combined.contains("echo-args"),
+        "fixture skips argv[0]; captured stdout should not include the program name: {combined:?}"
+    );
+}
+
+#[test]
 fn true_cmd_fixture_runs_and_proc_exits_zero() {
     ensure_fixture_built("true-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("true-cmd-wasm")).unwrap();

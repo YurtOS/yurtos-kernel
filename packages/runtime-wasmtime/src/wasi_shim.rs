@@ -198,6 +198,72 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         },
     )?;
 
+    // ── args_get(argv: u32, argv_buf: u32) → write argv ────────────
+    // WASI layout:
+    //   argv:     argc * u32 pointers into argv_buf
+    //   argv_buf: NUL-terminated arg bytes packed back-to-back
+    linker.func_wrap(
+        WASI,
+        "args_get",
+        |mut caller: Caller<'_, UserState>, argv_ptr: u32, argv_buf_ptr: u32| -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return EINVAL,
+            };
+            let argv = caller.data().argv.clone();
+            let mut buf_offset: u32 = argv_buf_ptr;
+            for (i, arg) in argv.iter().enumerate() {
+                let ptr_addr = argv_ptr as usize + i * 4;
+                if memory
+                    .write(&mut caller, ptr_addr, &buf_offset.to_le_bytes())
+                    .is_err()
+                {
+                    return EINVAL;
+                }
+                if memory.write(&mut caller, buf_offset as usize, arg).is_err() {
+                    return EINVAL;
+                }
+                if memory
+                    .write(&mut caller, buf_offset as usize + arg.len(), &[0u8])
+                    .is_err()
+                {
+                    return EINVAL;
+                }
+                buf_offset = buf_offset.saturating_add(arg.len() as u32 + 1);
+            }
+            0
+        },
+    )?;
+    linker.func_wrap(
+        WASI,
+        "args_sizes_get",
+        |mut caller: Caller<'_, UserState>, count_ptr: u32, size_ptr: u32| -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return EINVAL,
+            };
+            let argv = &caller.data().argv;
+            let count = argv.len() as u32;
+            let size: u32 = argv
+                .iter()
+                .map(|a| a.len() as u32 + 1) // +1 for trailing NUL
+                .sum();
+            if memory
+                .write(&mut caller, count_ptr as usize, &count.to_le_bytes())
+                .is_err()
+            {
+                return EINVAL;
+            }
+            if memory
+                .write(&mut caller, size_ptr as usize, &size.to_le_bytes())
+                .is_err()
+            {
+                return EINVAL;
+            }
+            0
+        },
+    )?;
+
     // ── environ_get / environ_sizes_get → empty env ────────────────
     linker.func_wrap(
         WASI,
@@ -263,8 +329,6 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
     // can't do a wildcard, so we list the rest as ENOSYS stubs.
     // (Add to this list as fixtures need them.)
     for name in [
-        "args_get",
-        "args_sizes_get",
         "clock_res_get",
         "clock_time_get",
         "fd_advise",

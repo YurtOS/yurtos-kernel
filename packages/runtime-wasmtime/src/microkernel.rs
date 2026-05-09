@@ -292,6 +292,18 @@ impl Microkernel {
     /// process is assigned a fresh pid (starting at `1`); future
     /// spawns increment.
     pub fn spawn_user_process(&self, wasm: &[u8]) -> Result<UserProcess> {
+        self.spawn_user_process_with_args::<&[u8]>(wasm, &[])
+    }
+
+    /// Spawn a user process with the given argv (each arg is opaque
+    /// bytes — no UTF-8 guarantee, matching POSIX). The argv lands in
+    /// `UserState.argv`; the WASI shim's `args_get` /
+    /// `args_sizes_get` serves it to the user wasm.
+    pub fn spawn_user_process_with_args<S: AsRef<[u8]>>(
+        &self,
+        wasm: &[u8],
+        argv: &[S],
+    ) -> Result<UserProcess> {
         let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
         let mut linker: Linker<UserState> = Linker::new(&self.engine);
         register_sys_imports(&mut linker)?;
@@ -303,9 +315,11 @@ impl Microkernel {
         *next += 1;
         drop(next);
 
+        let argv: Vec<Vec<u8>> = argv.iter().map(|s| s.as_ref().to_vec()).collect();
         let user_state = UserState {
             kernel: self.kernel.clone(),
             pid,
+            argv,
         };
         let mut store = Store::new(&self.engine, user_state);
         let instance = linker
@@ -339,17 +353,25 @@ pub struct ProcessIo;
 
 /// State threaded through every host callback during a user-process
 /// call. Holds (a) a shared reference to kernel.wasm so `sys_*` and
-/// the WASI shim can forward into `kernel_dispatch`, and (b) the pid
-/// the kernel sees as the caller.
+/// the WASI shim can forward into `kernel_dispatch`, (b) the pid the
+/// kernel sees as the caller, and (c) the argv this process was
+/// spawned with (read by the WASI shim's `args_get` /
+/// `args_sizes_get`).
 ///
 /// User processes do *not* get a `WasiP1Ctx`. WASI preview1 imports
 /// are satisfied by [`crate::wasi_shim`], which routes them through
 /// the kernel's `sys_*` syscalls. fd_write therefore lands in
 /// `kernel.wasm` rather than wasmtime-wasi, and once cross-process
 /// pipes work, `cmd1 | cmd2` is the same pipe object on both sides.
+///
+/// Note on argv: keeping it in microkernel-side state for now is
+/// fine — the kernel's process tree is not tracking argv yet. Once
+/// `sys_spawn` lands and the kernel allocates pids itself, argv
+/// migrates into `Process` so it's preserved across exec.
 pub struct UserState {
     pub kernel: Arc<Mutex<KernelInstance>>,
     pub pid: u32,
+    pub argv: Vec<Vec<u8>>,
 }
 
 /// A spawned user-process instance.
