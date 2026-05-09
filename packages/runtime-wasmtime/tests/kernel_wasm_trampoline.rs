@@ -177,7 +177,7 @@ fn microkernel_serves_fresh_kh_value_each_dispatch() {
     mk.syscall(METHOD_NOW_REALTIME, &[], &mut response).unwrap();
     assert_eq!(u64::from_le_bytes(response), 100);
 
-    mk.host_state_mut().now_realtime_ns = 200;
+    mk.with_host_state_mut(|s| s.now_realtime_ns = 200);
     mk.syscall(METHOD_NOW_REALTIME, &[], &mut response).unwrap();
     assert_eq!(u64::from_le_bytes(response), 200);
 }

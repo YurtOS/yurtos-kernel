@@ -15,14 +15,14 @@
 //! `kernel_dispatch` is a supported backend — see
 //! `docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md`.
 
-use std::cell::{RefCell, RefMut};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime_wasi::pipe::MemoryOutputPipe;
 use wasmtime_wasi::preview1::WasiP1Ctx;
 use wasmtime_wasi::WasiCtxBuilder;
 
@@ -152,8 +152,11 @@ pub struct KernelStoreData {
 // ── Kernel instance: the loaded kernel.wasm + its wasmtime handles ─────────
 
 /// The loaded kernel.wasm plus the typed handles needed to drive it.
-/// Kept behind `Rc<RefCell<…>>` so that both the [`Microkernel`] and
-/// any spawned [`UserProcess`] can call into it.
+/// Kept behind `Arc<Mutex<…>>` so that both the [`Microkernel`] and
+/// any spawned [`UserProcess`] can call into it. (`Arc<Mutex<…>>`
+/// rather than `Rc<RefCell<…>>` so the type satisfies `Send`, which
+/// `wasmtime_wasi::preview1::add_to_linker_sync` requires for the
+/// per-process Linker data.)
 pub struct KernelInstance {
     store: Store<KernelStoreData>,
     memory: Memory,
@@ -211,7 +214,7 @@ impl KernelInstance {
 
 pub struct Microkernel {
     engine: Engine,
-    kernel: Rc<RefCell<KernelInstance>>,
+    kernel: Arc<Mutex<KernelInstance>>,
     next_pid: RefCell<u32>,
 }
 
@@ -260,7 +263,7 @@ impl Microkernel {
         };
         Ok(Self {
             engine,
-            kernel: Rc::new(RefCell::new(kernel)),
+            kernel: Arc::new(Mutex::new(kernel)),
             next_pid: RefCell::new(1),
         })
     }
@@ -270,33 +273,54 @@ impl Microkernel {
     /// operations that originate inside the microkernel itself.
     pub fn syscall(&self, method_id: u32, request: &[u8], response: &mut [u8]) -> Result<i64> {
         self.kernel
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .syscall(method_id, KERNEL_PID, request, response)
     }
 
-    /// Mutable view of the host state served to kernel.wasm. Returns a
-    /// `RefMut` that derefs to `&mut HostState`.
-    pub fn host_state_mut(&self) -> RefMut<'_, HostState> {
-        RefMut::map(self.kernel.borrow_mut(), |k| &mut k.store.data_mut().host)
+    /// Mutate the host state served to kernel.wasm via a closure.
+    /// (`std::sync::MutexGuard` doesn't have `map`, so we expose a
+    /// closure-based API rather than returning a guard. Tests that
+    /// want to mutate `now_realtime_ns` between dispatches use
+    /// `mk.with_host_state_mut(|s| s.now_realtime_ns = …)`.)
+    pub fn with_host_state_mut<R>(&self, f: impl FnOnce(&mut HostState) -> R) -> R {
+        let mut guard = self.kernel.lock().unwrap();
+        f(&mut guard.store.data_mut().host)
     }
 
     /// Compile and instantiate a user process whose `sys_*` imports
     /// are forwarded back into the kernel via the trampoline. The
-    /// process is assigned a fresh pid (starting at `1`); future spawns
-    /// increment.
+    /// process is assigned a fresh pid (starting at `1`); future
+    /// spawns increment.
     pub fn spawn_user_process(&self, wasm: &[u8]) -> Result<UserProcess> {
+        self.spawn_user_process_with_io(wasm, ProcessIo::default())
+    }
+
+    /// Spawn with custom stdin / stdout / stderr capture. Stdout and
+    /// stderr default to in-memory pipes you can read after the
+    /// process runs. Useful for fixture parity tests that assert on
+    /// captured output.
+    pub fn spawn_user_process_with_io(&self, wasm: &[u8], io: ProcessIo) -> Result<UserProcess> {
         let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
         let mut linker: Linker<UserState> = Linker::new(&self.engine);
         register_sys_imports(&mut linker)?;
+        wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |s: &mut UserState| &mut s.wasi)
+            .context("add WASI preview1 to user-process linker")?;
 
         let mut next = self.next_pid.borrow_mut();
         let pid = *next;
         *next += 1;
         drop(next);
 
+        let mut wasi_builder = WasiCtxBuilder::new();
+        wasi_builder.stdout(io.stdout.clone());
+        wasi_builder.stderr(io.stderr.clone());
+        let wasi = wasi_builder.build_p1();
+
         let user_state = UserState {
             kernel: self.kernel.clone(),
             pid,
+            wasi,
         };
         let mut store = Store::new(&self.engine, user_state);
         let instance = linker
@@ -306,19 +330,47 @@ impl Microkernel {
             store,
             instance,
             pid,
+            stdout: io.stdout,
+            stderr: io.stderr,
         })
+    }
+}
+
+/// I/O configuration for a spawned user process. By default both
+/// stdout and stderr are in-memory pipes the test can read after the
+/// process runs.
+pub struct ProcessIo {
+    pub stdout: MemoryOutputPipe,
+    pub stderr: MemoryOutputPipe,
+}
+
+impl Default for ProcessIo {
+    fn default() -> Self {
+        Self {
+            stdout: MemoryOutputPipe::new(64 * 1024),
+            stderr: MemoryOutputPipe::new(64 * 1024),
+        }
     }
 }
 
 // ── User process ─────────────────────────────────────────────────────────────
 
-/// State threaded through every host callback that runs during a
-/// user-process call. Holds a shared reference to the kernel so
-/// `sys_*` imports can forward into `kernel_dispatch`, plus the pid
-/// the kernel sees as the caller for this process.
+/// State threaded through every host callback during a user-process
+/// call. Carries (a) a shared reference to kernel.wasm so `sys_*`
+/// imports forward into `kernel_dispatch`, (b) the pid the kernel
+/// sees as the caller, and (c) a per-process WASI ctx so existing
+/// WASI-built fixtures run.
+///
+/// Note on WASI: this is the *transitional* WASI integration —
+/// fixtures that call `fd_write` / `proc_exit` go through wasmtime-
+/// wasi directly, bypassing our `sys_*` layer. The end state is a
+/// thin wasi-shim that translates WASI → `sys_*` so fd_write to a
+/// pipe set up by `sys_pipe` works seamlessly. Until that lands,
+/// WASI sits *next to* `sys_*`, not on top of it.
 pub struct UserState {
-    kernel: Rc<RefCell<KernelInstance>>,
+    kernel: Arc<Mutex<KernelInstance>>,
     pid: u32,
+    pub wasi: WasiP1Ctx,
 }
 
 /// A spawned user-process instance.
@@ -326,6 +378,8 @@ pub struct UserProcess {
     store: Store<UserState>,
     instance: wasmtime::Instance,
     pid: u32,
+    stdout: MemoryOutputPipe,
+    stderr: MemoryOutputPipe,
 }
 
 impl UserProcess {
@@ -348,6 +402,27 @@ impl UserProcess {
             .with_context(|| format!("user-process missing '{name}() -> i32' export"))?;
         f.call(&mut self.store, ())
             .with_context(|| format!("user-process {name}()"))
+    }
+
+    /// Run the standard WASI entry point (`_start`). Returns Ok(()) on
+    /// normal exit; a `proc_exit` from the guest surfaces as an error
+    /// carrying the exit code in the wasmtime trap.
+    pub fn run_start(&mut self) -> Result<()> {
+        let f = self
+            .instance
+            .get_typed_func::<(), ()>(&mut self.store, "_start")
+            .context("user-process missing '_start' (not a WASI command)")?;
+        f.call(&mut self.store, ()).context("user-process _start()")
+    }
+
+    /// Captured stdout written by the user process via WASI fd_write.
+    pub fn captured_stdout(&self) -> Vec<u8> {
+        self.stdout.contents().to_vec()
+    }
+
+    /// Captured stderr written by the user process via WASI fd_write.
+    pub fn captured_stderr(&self) -> Vec<u8> {
+        self.stderr.contents().to_vec()
     }
 
     /// Read `len` bytes from this user-process's exported `memory` at
@@ -459,7 +534,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     fn forward_scalar(caller: &Caller<'_, UserState>, method_id: u32) -> i32 {
         let pid = caller.data().pid;
         let kernel = caller.data().kernel.clone();
-        let mut k = kernel.borrow_mut();
+        let mut k = kernel.lock().unwrap();
         let dispatch = k.dispatch.clone();
         match dispatch.call(&mut k.store, (method_id, pid, 0, 0, 0, 0)) {
             Ok(rc) => rc as i32,
@@ -483,7 +558,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     ) -> i64 {
         let pid = caller.data().pid;
         let kernel = caller.data().kernel.clone();
-        let mut k = kernel.borrow_mut();
+        let mut k = kernel.lock().unwrap();
         let scratch_ptr = k.scratch_ptr;
         let memory = k.memory;
         let dispatch = k.dispatch.clone();
@@ -550,7 +625,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     ) -> i64 {
         let pid = caller.data().pid;
         let kernel = caller.data().kernel.clone();
-        let mut k = kernel.borrow_mut();
+        let mut k = kernel.lock().unwrap();
         let scratch_ptr = k.scratch_ptr;
         let scratch_len = k.scratch_len;
         let kernel_memory = k.memory;
@@ -613,7 +688,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     ) -> i32 {
         let pid = caller.data().pid;
         let kernel = caller.data().kernel.clone();
-        let mut k = kernel.borrow_mut();
+        let mut k = kernel.lock().unwrap();
         let scratch_ptr = k.scratch_ptr;
         let kernel_memory = k.memory;
         let dispatch = k.dispatch.clone();
