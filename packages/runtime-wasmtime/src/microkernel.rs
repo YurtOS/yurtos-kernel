@@ -58,6 +58,9 @@ mod sys_method_id {
     pub const GETCWD: u32 = 0x1_000B;
     pub const GETRLIMIT: u32 = 0x1_000C;
     pub const SETRLIMIT: u32 = 0x1_000D;
+    pub const CLOSE: u32 = 0x1_000E;
+    pub const DUP: u32 = 0x1_000F;
+    pub const DUP2: u32 = 0x1_0011;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -751,6 +754,30 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(soft as u64).to_le_bytes());
             req.extend_from_slice(&(hard as u64).to_le_bytes());
             forward_request_bytes(&mut caller, sys_method_id::SETRLIMIT, &req) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_close",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            forward_u32_arg(&mut caller, sys_method_id::CLOSE, fd as u32)
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_dup",
+        |mut caller: Caller<'_, UserState>, oldfd: i32| -> i32 {
+            forward_u32_arg(&mut caller, sys_method_id::DUP, oldfd as u32)
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_dup2",
+        |mut caller: Caller<'_, UserState>, oldfd: i32, newfd: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(oldfd as u32).to_le_bytes());
+            req.extend_from_slice(&(newfd as u32).to_le_bytes());
+            forward_request_bytes(&mut caller, sys_method_id::DUP2, &req) as i32
         },
     )?;
     Ok(())

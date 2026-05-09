@@ -47,6 +47,9 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_GETCWD => getcwd(caller_pid, response),
         METHOD_SYS_GETRLIMIT => getrlimit(caller_pid, request, response),
         METHOD_SYS_SETRLIMIT => setrlimit(caller_pid, request),
+        METHOD_SYS_CLOSE => close_fd(caller_pid, request),
+        METHOD_SYS_DUP => dup_fd(caller_pid, request),
+        METHOD_SYS_DUP2 => dup2_fd(caller_pid, request),
         METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
         _ => -(abi::ENOSYS as i64),
     }
@@ -137,6 +140,41 @@ fn getrlimit(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             None => -(abi::EINVAL as i64),
         }
     })
+}
+
+/// `close(fd: u32) -> 0 / -EBADF`.
+fn close_fd(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| match k.process_mut(caller_pid).fd_table.close(fd) {
+        Some(_) => 0,
+        None => -(abi::EBADF as i64),
+    })
+}
+
+/// `dup(oldfd: u32) -> newfd / -EBADF`.
+fn dup_fd(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([oldfd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| match k.process_mut(caller_pid).fd_table.dup(oldfd) {
+        Some(newfd) => newfd as i64,
+        None => -(abi::EBADF as i64),
+    })
+}
+
+/// `dup2(oldfd: u32, newfd: u32) -> newfd / -EBADF`.
+fn dup2_fd(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([oldfd, newfd]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(
+        |k| match k.process_mut(caller_pid).fd_table.dup2(oldfd, newfd) {
+            Some(fd) => fd as i64,
+            None => -(abi::EBADF as i64),
+        },
+    )
 }
 
 /// `setrlimit(resource: u32, soft: u64, hard: u64) -> 0 / -EINVAL / -EPERM`.
@@ -450,6 +488,149 @@ mod tests {
         let mut out = [0u8; 16];
         assert_eq!(dispatch(METHOD_SYS_GETRLIMIT, 2, &req_get, &mut out), 16);
         assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 1024);
+    }
+
+    #[test]
+    fn fd_table_starts_with_stdin_stdout_stderr() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // close(0), close(1), close(2) all succeed; close(3) does not.
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &0_u32.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &1_u32.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &2_u32.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
+            -(abi::EBADF as i64)
+        );
+    }
+
+    #[test]
+    fn close_unknown_fd_is_ebadf() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &99_u32.to_le_bytes(), &mut []),
+            -(abi::EBADF as i64)
+        );
+    }
+
+    #[test]
+    fn dup_returns_lowest_unused_fd() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Default has 0/1/2; dup(1) should return 3.
+        assert_eq!(
+            dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+            3
+        );
+        // Both 1 and 3 still close cleanly.
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &1_u32.to_le_bytes(), &mut []),
+            0
+        );
+    }
+
+    #[test]
+    fn dup_fills_holes_in_the_table() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Close 0; next dup should put the duplicate at 0.
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &0_u32.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+            0
+        );
+    }
+
+    #[test]
+    fn dup_of_unopened_fd_is_ebadf() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(METHOD_SYS_DUP, 1, &42_u32.to_le_bytes(), &mut []),
+            -(abi::EBADF as i64)
+        );
+    }
+
+    #[test]
+    fn dup2_overwrites_target_silently() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // dup2(1, 2): fd 2 was stderr; now it's the same as fd 1.
+        let mut req = Vec::new();
+        req.extend_from_slice(&1_u32.to_le_bytes());
+        req.extend_from_slice(&2_u32.to_le_bytes());
+        assert_eq!(dispatch(METHOD_SYS_DUP2, 1, &req, &mut []), 2);
+        // Closing 2 succeeds (it was open after the dup2).
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &2_u32.to_le_bytes(), &mut []),
+            0
+        );
+    }
+
+    #[test]
+    fn dup2_to_arbitrary_high_fd_works() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&1_u32.to_le_bytes());
+        req.extend_from_slice(&100_u32.to_le_bytes());
+        assert_eq!(dispatch(METHOD_SYS_DUP2, 1, &req, &mut []), 100);
+        // dup() now skips both 0/1/2 and 100; should return 3.
+        assert_eq!(
+            dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+            3
+        );
+    }
+
+    #[test]
+    fn dup2_same_fd_is_noop_when_open() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&1_u32.to_le_bytes());
+        req.extend_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(dispatch(METHOD_SYS_DUP2, 1, &req, &mut []), 1);
+    }
+
+    #[test]
+    fn dup2_oldfd_unopened_is_ebadf() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&42_u32.to_le_bytes());
+        req.extend_from_slice(&5_u32.to_le_bytes());
+        assert_eq!(
+            dispatch(METHOD_SYS_DUP2, 1, &req, &mut []),
+            -(abi::EBADF as i64)
+        );
+    }
+
+    #[test]
+    fn fd_table_is_per_pid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Close fd 0 in pid 1.
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &0_u32.to_le_bytes(), &mut []),
+            0
+        );
+        // Pid 2 still has fd 0.
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 2, &0_u32.to_le_bytes(), &mut []),
+            0
+        );
+        // Closing again in pid 2 fails.
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 2, &0_u32.to_le_bytes(), &mut []),
+            -(abi::EBADF as i64)
+        );
     }
 
     #[test]

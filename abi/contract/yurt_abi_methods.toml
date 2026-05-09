@@ -118,6 +118,21 @@ id = 0x1_000D
 kind = "syscall"
 doc = "Set a POSIX resource limit. Request bytes carry u32 resource id + le u64 soft + le u64 hard (20 bytes). Returns 0 on success, -EINVAL for unsupported resources, -EPERM if the new limit exceeds the existing hard limit (POSIX rule)."
 
+[method.sys_close]
+id = 0x1_000E
+kind = "syscall"
+doc = "Close an open file descriptor. Request bytes carry the u32 fd. Returns 0 on success, -EBADF if the fd is not open."
+
+[method.sys_dup]
+id = 0x1_000F
+kind = "syscall"
+doc = "Duplicate an fd to the lowest unused number. Request bytes carry the u32 oldfd. Returns the new fd (non-negative) on success, -EBADF if oldfd is not open."
+
+[method.sys_dup2]
+id = 0x1_0011
+kind = "syscall"
+doc = "Duplicate oldfd to exactly newfd, silently closing newfd first if it was open. Request bytes carry two u32s: oldfd, newfd. Returns newfd on success, -EBADF if oldfd is not open."
+
 [method.sys_extension_invoke]
 id = 0x1_0010
 kind = "syscall"

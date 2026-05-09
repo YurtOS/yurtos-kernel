@@ -42,6 +42,9 @@ const METHOD_SYS_CHDIR: u32 = 0x1_000A;
 const METHOD_SYS_GETCWD: u32 = 0x1_000B;
 const METHOD_SYS_GETRLIMIT: u32 = 0x1_000C;
 const METHOD_SYS_SETRLIMIT: u32 = 0x1_000D;
+const METHOD_SYS_CLOSE: u32 = 0x1_000E;
+const METHOD_SYS_DUP: u32 = 0x1_000F;
+const METHOD_SYS_DUP2: u32 = 0x1_0011;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -517,6 +520,65 @@ fn user_process_getrlimit_then_setrlimit_round_trip() {
 }
 
 #[test]
+fn user_process_fd_table_dup_close_lifecycle() {
+    // Validates the complete fd-table mechanic through a single user
+    // process: default fds 0/1/2 are open, dup() returns the next
+    // free slot, dup2() can install at an arbitrary fd, and close()
+    // frees the slot for re-allocation. Closing an already-closed fd
+    // surfaces -EBADF (= -9).
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_dup"   (func $dup   (param i32) (result i32)))
+          (import "env" "sys_dup2"  (func $dup2  (param i32 i32) (result i32)))
+          (import "env" "sys_close" (func $close (param i32) (result i32)))
+          (func (export "dup_stdout") (result i32) (call $dup (i32.const 1)))
+          (func (export "dup_unopened") (result i32) (call $dup (i32.const 99)))
+          (func (export "dup2_into_50") (result i32)
+            (call $dup2 (i32.const 1) (i32.const 50)))
+          (func (export "close_50") (result i32) (call $close (i32.const 50)))
+          (func (export "close_50_again") (result i32) (call $close (i32.const 50)))
+          (func (export "close_3") (result i32) (call $close (i32.const 3))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    // Default {0,1,2} → first dup returns 3.
+    assert_eq!(user.call_export_i32("dup_stdout").unwrap(), 3);
+    // Dup'ing a closed fd → -EBADF.
+    assert_eq!(user.call_export_i32("dup_unopened").unwrap(), -9);
+    // Dup2 to an arbitrary high fd.
+    assert_eq!(user.call_export_i32("dup2_into_50").unwrap(), 50);
+    // Close the high fd; second close fails -EBADF.
+    assert_eq!(user.call_export_i32("close_50").unwrap(), 0);
+    assert_eq!(user.call_export_i32("close_50_again").unwrap(), -9);
+    // The fd 3 from dup_stdout is still open from earlier.
+    assert_eq!(user.call_export_i32("close_3").unwrap(), 0);
+}
+
+#[test]
+fn user_process_fd_table_is_per_process() {
+    // Closing fd 0 in one process must not affect another process's
+    // fd table.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_close" (func $close (param i32) (result i32)))
+          (func (export "close0") (result i32) (call $close (i32.const 0)))
+          (func (export "close0_again") (result i32) (call $close (i32.const 0))))
+    "#;
+    let wasm = wat::parse_str(user_wat).unwrap();
+    let mut a = mk.spawn_user_process(&wasm).unwrap();
+    let mut b = mk.spawn_user_process(&wasm).unwrap();
+
+    assert_eq!(a.call_export_i32("close0").unwrap(), 0);
+    assert_eq!(a.call_export_i32("close0_again").unwrap(), -9);
+    // Process B still has fd 0 open.
+    assert_eq!(b.call_export_i32("close0").unwrap(), 0);
+}
+
+#[test]
 fn user_process_setresgid_changes_subsequent_getgid() {
     let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
@@ -606,6 +668,9 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_SETRLIMIT,
             METHOD_SYS_SETRLIMIT as i64,
         ),
+        ("sys_close", METHOD_SYS_CLOSE, METHOD_SYS_CLOSE as i64),
+        ("sys_dup", METHOD_SYS_DUP, METHOD_SYS_DUP as i64),
+        ("sys_dup2", METHOD_SYS_DUP2, METHOD_SYS_DUP2 as i64),
         (
             "sys_extension_invoke",
             METHOD_SYS_EXTENSION_INVOKE,

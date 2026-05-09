@@ -34,6 +34,89 @@ pub type ResourceLimit = (u64, u64);
 /// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
 pub const RLIMIT_SLOTS: usize = 8;
 
+// ── File descriptor table ──────────────────────────────────────────────────
+
+/// What an open fd refers to. Cloneable so `dup` / `dup2` can share
+/// the same underlying object across multiple fds.
+///
+/// The pipe / file / socket variants are stubbed out for now; real
+/// shared state for pipes will live in [`Kernel`] (a registry keyed
+/// by id, referenced by id from `FdEntry`) rather than inside the
+/// fd entry itself, so we don't have to thread `Rc<Mutex<…>>` through
+/// `Process`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FdEntry {
+    Stdin,
+    Stdout,
+    Stderr,
+    // Future: Pipe { id: u64, end: PipeEnd }
+    // Future: File { id: u64 }
+    // Future: Socket { id: u64 }
+}
+
+/// Per-pid file-descriptor table. Sparse — closed fds are absent.
+#[derive(Clone, Debug)]
+pub struct FdTable {
+    entries: BTreeMap<u32, FdEntry>,
+}
+
+impl FdTable {
+    /// Default table for a freshly-spawned process: stdin/stdout/stderr
+    /// pre-opened on fds 0/1/2. Real "inheritance from parent" plus
+    /// O_CLOEXEC handling lands when sys_spawn does.
+    fn new() -> Self {
+        let mut entries = BTreeMap::new();
+        entries.insert(0, FdEntry::Stdin);
+        entries.insert(1, FdEntry::Stdout);
+        entries.insert(2, FdEntry::Stderr);
+        Self { entries }
+    }
+
+    pub fn entry(&self, fd: u32) -> Option<&FdEntry> {
+        self.entries.get(&fd)
+    }
+
+    /// POSIX `close`: removes the entry; -EBADF if absent.
+    pub fn close(&mut self, fd: u32) -> Option<FdEntry> {
+        self.entries.remove(&fd)
+    }
+
+    /// POSIX `dup`: duplicate `oldfd` to the lowest unused fd number.
+    /// Returns the new fd.
+    pub fn dup(&mut self, oldfd: u32) -> Option<u32> {
+        let entry = self.entries.get(&oldfd).cloned()?;
+        let newfd = self.next_free();
+        self.entries.insert(newfd, entry);
+        Some(newfd)
+    }
+
+    /// POSIX `dup2`: duplicate `oldfd` to exactly `newfd`. If `newfd`
+    /// is already open, it is silently closed first. If `oldfd ==
+    /// newfd` and `oldfd` is open, returns `newfd` without action;
+    /// returns `None` (EBADF) if `oldfd` is not open.
+    pub fn dup2(&mut self, oldfd: u32, newfd: u32) -> Option<u32> {
+        let entry = self.entries.get(&oldfd).cloned()?;
+        if oldfd != newfd {
+            self.entries.insert(newfd, entry);
+        }
+        Some(newfd)
+    }
+
+    fn next_free(&self) -> u32 {
+        let mut n = 0;
+        while self.entries.contains_key(&n) {
+            n += 1;
+        }
+        n
+    }
+}
+
+impl Default for FdTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Default resource limits, indexed by resource id. Mirrors
 /// `defaultImportResourceLimit` in the TS kernel.
 pub const DEFAULT_RLIMITS: [Option<ResourceLimit>; RLIMIT_SLOTS] = [
@@ -57,6 +140,8 @@ pub struct Process {
     /// POSIX resource limits per `getrlimit` / `setrlimit`. `None`
     /// for unsupported resource ids; `Some((soft, hard))` otherwise.
     pub rlimits: [Option<ResourceLimit>; RLIMIT_SLOTS],
+    /// Open file descriptors. Default = stdin/stdout/stderr on 0/1/2.
+    pub fd_table: FdTable,
 }
 
 impl Default for Process {
@@ -66,6 +151,7 @@ impl Default for Process {
             credentials: Credentials::DEFAULT,
             cwd: b"/".to_vec(),
             rlimits: DEFAULT_RLIMITS,
+            fd_table: FdTable::default(),
         }
     }
 }
