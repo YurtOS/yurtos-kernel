@@ -575,9 +575,10 @@ describe("socket fd host imports", () => {
     backend = {
       connect: () => ({ ok: true, socket: 303 }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: (socket, maxBytes) => {
-        requests.push({ op: "recv", socket, maxBytes });
-        return { ok: true, data_b64: btoa("abc") };
+      recv: (socket, maxBytes, opts) => {
+        requests.push({ op: "recv", socket, maxBytes, opts });
+        // Real loopback backend signals EAGAIN when no bytes are buffered.
+        return { ok: false, error: "EAGAIN" };
       },
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
@@ -631,7 +632,13 @@ describe("socket fd host imports", () => {
     new DataView(memory.buffer).setUint32(132, 3, true);
 
     expect(wasiImports.fd_read(fd, 128, 1, 192)).toBe(WASI_EAGAIN);
-    expect(requests).toEqual([]);
+    // Backend was polled (with the nonblocking flag) and signaled EAGAIN.
+    expect(requests).toEqual([{
+      op: "recv",
+      socket: 303,
+      maxBytes: 3,
+      opts: { nonblocking: true },
+    }]);
   });
 
   it("returns EAGAIN for nonblocking host_socket_recv without buffered data", () => {
@@ -642,9 +649,9 @@ describe("socket fd host imports", () => {
     backend = {
       connect: () => ({ ok: true, socket: 404 }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: (socket, maxBytes) => {
-        requests.push({ op: "recv", socket, maxBytes });
-        return { ok: true, data_b64: btoa("abc") };
+      recv: (socket, maxBytes, opts) => {
+        requests.push({ op: "recv", socket, maxBytes, opts });
+        return { ok: false, error: "EAGAIN" };
       },
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
@@ -704,7 +711,12 @@ describe("socket fd host imports", () => {
       ok: false,
       error: "EAGAIN",
     });
-    expect(requests).toEqual([]);
+    expect(requests).toEqual([{
+      op: "recv",
+      socket: 404,
+      maxBytes: 3,
+      opts: { nonblocking: true },
+    }]);
   });
 
   it("preserves nonblocking host_socket_recv peeked bytes", () => {

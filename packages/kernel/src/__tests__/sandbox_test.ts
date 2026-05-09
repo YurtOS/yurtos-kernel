@@ -294,6 +294,25 @@ describe("Sandbox", { sanitizeResources: false, sanitizeOps: false }, () => {
     sandbox.destroy(); // double destroy is safe
   });
 
+  it(
+    "wires sandbox.net to the same loopback backend processes use",
+    async () => {
+      // P1 from PR #17 review: Sandbox.create must build the loopback
+      // backend once and pass it to every process import (and to itself
+      // for sandbox.net). Without sharing, a process listen() registers
+      // a port nobody else can see.
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+        serverSockets: { allowLoopback: true },
+      });
+      expect(sandbox.net).not.toBeNull();
+      // No listeners yet — but the accessor must work, proving the
+      // registry was constructed and is reachable from the host side.
+      expect(sandbox.net?.listListeners()).toEqual([]);
+    },
+  );
+
   it("timeout returns exit code 124", async () => {
     sandbox = await Sandbox.create({
       wasmDir: WASM_DIR,

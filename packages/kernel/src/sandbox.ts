@@ -40,9 +40,11 @@ import type { VfsLike } from "./vfs/vfs-like.js";
 import { NetworkGateway } from "./network/gateway.js";
 import type { NetworkPolicy } from "./network/gateway.js";
 import { NetworkBridge, type NetworkBridgeLike } from "./network/bridge.js";
-import type {
-  SocketBackend,
-  SocketListenPolicy,
+import {
+  createLoopbackSocketBackend,
+  createNetworkBridgeSocketBackend,
+  type SocketBackend,
+  type SocketListenPolicy,
 } from "./network/socket-backend.js";
 import type { ListenerRegistry } from "./network/listener-registry.js";
 import { SandboxNet } from "./network/sandbox-net.js";
@@ -347,6 +349,19 @@ export class Sandbox {
     const { bridge } = options.networkBridge
       ? { bridge: options.networkBridge }
       : await Sandbox.createNetworkBridge(options.network);
+
+    // Construct the socket backend exactly once per sandbox so that every
+    // process import shares the same ListenerRegistry. Without this, a
+    // listen() in one process would register the port in a backend nobody
+    // else can see — clients (and Sandbox.net) would fail to connect.
+    const socketBackend: SocketBackend | undefined = options.socketBackend ??
+      (options.serverSockets?.allowLoopback === true
+        ? createLoopbackSocketBackend(
+          bridge ? createNetworkBridgeSocketBackend(bridge) : undefined,
+        )
+        : bridge
+        ? createNetworkBridgeSocketBackend(bridge)
+        : undefined);
     const mgr = new ProcessManager(
       vfs,
       adapter,
@@ -450,7 +465,7 @@ export class Sandbox {
       mgr,
       processes,
       bridge,
-      socketBackend: options.socketBackend,
+      socketBackend,
       serverSockets: options.serverSockets,
       runtimeBackend,
       extensionRegistry,
@@ -691,7 +706,7 @@ export class Sandbox {
       mgr,
       bridge,
       networkPolicy: options.network,
-      socketBackend: options.socketBackend,
+      socketBackend,
       serverSockets: options.serverSockets,
       runtimeBackend,
       security: options.security,

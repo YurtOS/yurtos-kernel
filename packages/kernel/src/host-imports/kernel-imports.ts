@@ -542,6 +542,11 @@ export function createKernelImports(
   const runtimeBackend = opts.runtimeBackend ?? unsupportedRuntimeEngineBackend;
   const schedulerBackend = runtimeBackend.scheduler;
   let fallbackUmask = 0o022;
+  // Sandbox.create owns the socket-backend decision so all processes share
+  // the same ListenerRegistry. Fall back to constructing one here only when
+  // no Sandbox is in the loop (standalone createKernelImports callers, like
+  // a few unit tests) — those callers also won't share state across imports
+  // by construction.
   const bridgeSocketBackend = opts.networkBridge
     ? createNetworkBridgeSocketBackend(opts.networkBridge)
     : undefined;
@@ -2291,13 +2296,13 @@ export function createKernelImports(
           return writeJson(memory, outPtr, outCap, probe);
         }
         if (nonblocking) {
-          // Without buffered data, nonblocking recv returns EAGAIN without
-          // consulting the backend — incoming bytes only land in peekBuffer
-          // through prior peek/recvAsync deliveries.
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "EAGAIN",
+          // Poll the backend with the nonblocking flag. The backend either
+          // returns queued bytes, signals EAGAIN, or reports EOF/error;
+          // surface whatever it says directly.
+          const probe = socketBackend.recv(target.socket, maxBytes, {
+            nonblocking: true,
           });
+          return writeJson(memory, outPtr, outCap, probe);
         }
         return target.recvAsync(target.socket, maxBytes).then((result) =>
           writeJson(memory, outPtr, outCap, result)
