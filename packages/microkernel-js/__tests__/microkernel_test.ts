@@ -406,6 +406,18 @@ Deno.test("echo-args fixture emits argv one per line", async () => {
   assertEquals(stdout, "alpha\nbeta\ngamma\n");
 });
 
+Deno.test(
+  "cat-ramfs fixture reads /etc/motd via WASI path_open + sys_open",
+  async () => {
+    const wasm = await fixtureWasm("cat-ramfs-wasm", "cat-ramfs-wasm");
+    const mk = await freshMicrokernel();
+    mk.registerRamfsFile(s("/etc/motd"), s("hello ramfs\n"));
+    const user = mk.spawnUserProcessWithArgs(wasm, [s("cat-ramfs")]);
+    captureProcExit(user);
+    assertEquals(user.capturedStdout(), s("hello ramfs\n"));
+  },
+);
+
 Deno.test("cat-stdin fixture echoes stdin to stdout", async () => {
   const wasm = await fixtureWasm("cat-stdin-wasm", "cat-stdin-wasm");
   const mk = await freshMicrokernel();

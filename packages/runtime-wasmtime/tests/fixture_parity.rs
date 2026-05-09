@@ -157,6 +157,31 @@ fn true_cmd_fixture_runs_and_proc_exits_zero() {
 }
 
 #[test]
+fn cat_ramfs_fixture_reads_through_wasi_path_open() {
+    // First fixture that exercises std::fs::File::open against the
+    // in-memory ramfs. Drives the full WASI shim path:
+    //
+    //   user wasm  fs::read("/etc/motd")
+    //     → wasi-libc fd_prestat_get walk → fd 3 = "/" preopen
+    //     → wasi-libc path_open(dirfd=3, "etc/motd", …)
+    //       → microkernel path_open shim → sys_open("/etc/motd")
+    //         → kernel.wasm sys_open → FdEntry::File at fd 3
+    //     → fd_read(fd=3, …) → sys_read → file bytes
+    ensure_fixture_built("cat-ramfs-wasm");
+    let wasm_bytes = std::fs::read(fixture_wasm_path("cat-ramfs-wasm")).unwrap();
+    let mk = fresh_microkernel();
+    mk.register_ramfs_file(b"/etc/motd", b"hello ramfs\n").unwrap();
+    let argv: Vec<&[u8]> = vec![b"cat-ramfs"];
+    let mut user = mk.spawn_user_process_with_args(&wasm_bytes, &argv).unwrap();
+    let _ = user.run_start(); // proc_exit traps; that's fine
+    let stdout = user.captured_stdout().unwrap();
+    assert_eq!(
+        stdout, b"hello ramfs\n",
+        "cat-ramfs printed registered file via std::fs::read"
+    );
+}
+
+#[test]
 fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     ensure_fixture_built("false-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("false-cmd-wasm")).unwrap();

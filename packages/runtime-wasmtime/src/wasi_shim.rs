@@ -30,11 +30,32 @@ use crate::microkernel::UserState;
 
 const WASI: &str = "wasi_snapshot_preview1";
 
-// POSIX errno values used by the shim.
-const EBADF: i32 = 9;
-const EINVAL: i32 = 22;
-const ESPIPE: i32 = 29;
-const ENOSYS: i32 = 38;
+// WASI preview1 errno values (NOT the POSIX values — wasi-libc
+// uses the spec enum below, so e.g. EBADF=8 here vs 9 in POSIX).
+// These shim returns are what wasi-libc reads literally.
+const EBADF: i32 = 8;
+const EINVAL: i32 = 28;
+const ESPIPE: i32 = 70;
+const ENOSYS: i32 = 52;
+
+/// Map kernel-side POSIX errno → WASI preview1 errno. The kernel
+/// uses POSIX values (matching abi/contract/yurt_abi.toml); the WASI
+/// preview1 spec assigns its own integer enum that differs from
+/// POSIX. Anything we can't map gets bucketed to EINVAL.
+fn posix_to_wasi(posix: i32) -> i32 {
+    match posix {
+        0 => 0,
+        1 => 63,   // EPERM
+        2 => 44,   // ENOENT
+        9 => 8,    // EBADF
+        11 => 6,   // EAGAIN
+        22 => 28,  // EINVAL
+        29 => 70,  // ESPIPE
+        32 => 64,  // EPIPE
+        38 => 52,  // ENOSYS
+        _ => 28,   // fallback EINVAL
+    }
+}
 
 /// WASI errno mapping. Negative kernel returns become positive WASI
 /// errno; 0 stays 0.
@@ -42,7 +63,7 @@ fn errno_from_kernel(rc: i64) -> i32 {
     if rc >= 0 {
         0
     } else {
-        (-rc) as i32
+        posix_to_wasi((-rc) as i32)
     }
 }
 
@@ -310,15 +331,26 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 Some(m) => m,
                 None => return EINVAL,
             };
-            if !(0..=2).contains(&fd) {
-                return EBADF;
-            }
             let mut buf = [0u8; 24];
-            buf[0] = 2; // CHARACTER_DEVICE
-                        // fs_rights_base: allow fd_read | fd_write (bits 1 + 6).
-            let rights: u64 = (1 << 1) | (1 << 6);
-            buf[8..16].copy_from_slice(&rights.to_le_bytes());
-            buf[16..24].copy_from_slice(&rights.to_le_bytes());
+            match fd {
+                0..=2 => {
+                    buf[0] = 2; // CHARACTER_DEVICE
+                    let rights: u64 = (1 << 1) | (1 << 6);
+                    buf[8..16].copy_from_slice(&rights.to_le_bytes());
+                    buf[16..24].copy_from_slice(&rights.to_le_bytes());
+                }
+                f if f == PREOPEN_ROOT_FD => {
+                    // The synthetic root preopen. wasi-libc expects
+                    // DIRECTORY (3) with rights that include path_open.
+                    buf[0] = 3; // DIRECTORY
+                    // path_open + path_filestat_get + path_create_directory…
+                    // Granting all path_* + fd_readdir is enough for std::fs.
+                    let rights: u64 = u64::MAX;
+                    buf[8..16].copy_from_slice(&rights.to_le_bytes());
+                    buf[16..24].copy_from_slice(&rights.to_le_bytes());
+                }
+                _ => return EBADF,
+            }
             let _ = memory.write(&mut caller, statbuf_ptr as usize, &buf);
             0
         },
@@ -360,10 +392,135 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         },
     )?;
 
+    // ── Preopen surface: fd 3 = "/" ─────────────────────────────────
+    // wasi-libc walks preopens (`fd_prestat_get(3..)`) at startup,
+    // matches by prefix, then calls `path_open` against that fd with
+    // the *relative* path. We expose exactly one preopen — root —
+    // because Phase 2 has a flat ramfs with absolute-path keys; that
+    // lets `std::fs::File::open("/etc/motd")` route through.
+    linker.func_wrap(
+        WASI,
+        "fd_prestat_get",
+        |mut caller: Caller<'_, UserState>, fd: i32, prestat_ptr: u32| -> i32 {
+            if fd != PREOPEN_ROOT_FD {
+                return EBADF;
+            }
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return EINVAL,
+            };
+            // Layout: tag (u8) + 3 pad + dir_name_len (u32). tag 0 = dir.
+            let mut buf = [0u8; 8];
+            buf[0] = 0; // PREOPENTYPE_DIR
+            buf[4..8].copy_from_slice(&(PREOPEN_ROOT_NAME.len() as u32).to_le_bytes());
+            if memory.write(&mut caller, prestat_ptr as usize, &buf).is_err() {
+                return EINVAL;
+            }
+            0
+        },
+    )?;
+    linker.func_wrap(
+        WASI,
+        "fd_prestat_dir_name",
+        |mut caller: Caller<'_, UserState>, fd: i32, path_ptr: u32, path_len: u32| -> i32 {
+            if fd != PREOPEN_ROOT_FD {
+                return EBADF;
+            }
+            if (path_len as usize) < PREOPEN_ROOT_NAME.len() {
+                return EINVAL;
+            }
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return EINVAL,
+            };
+            if memory
+                .write(&mut caller, path_ptr as usize, PREOPEN_ROOT_NAME.as_bytes())
+                .is_err()
+            {
+                return EINVAL;
+            }
+            0
+        },
+    )?;
+    linker.func_wrap(
+        WASI,
+        "path_open",
+        |mut caller: Caller<'_, UserState>,
+         dirfd: i32,
+         _dirflags: i32,
+         path_ptr: u32,
+         path_len: u32,
+         _oflags: i32,
+         _fs_rights_base: i64,
+         _fs_rights_inheriting: i64,
+         _fdflags: i32,
+         ret_fd_ptr: u32|
+         -> i32 {
+            if dirfd != PREOPEN_ROOT_FD {
+                return EBADF;
+            }
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return EINVAL,
+            };
+            // Read the relative path bytes out of user memory.
+            let mut rel = vec![0u8; path_len as usize];
+            if path_len > 0 && memory.read(&caller, path_ptr as usize, &mut rel).is_err() {
+                return EINVAL;
+            }
+            // Prepend "/" so the path matches the ramfs key. wasi-libc
+            // strips the preopen prefix; we restore it.
+            let mut full = Vec::with_capacity(rel.len() + 1);
+            full.push(b'/');
+            full.extend_from_slice(&rel);
+            let rc = crate::microkernel::trampoline_request_with_response(
+                &mut caller,
+                METHOD_OPEN,
+                &full,
+                &mut [],
+            );
+            if rc < 0 {
+                return errno_from_kernel(rc);
+            }
+            let new_fd = (rc as u32).to_le_bytes();
+            if memory
+                .write(&mut caller, ret_fd_ptr as usize, &new_fd)
+                .is_err()
+            {
+                return EINVAL;
+            }
+            0
+        },
+    )?;
+
+    // ── fd_filestat_get → ENOSYS (typed stub) ───────────────────────
+    // std::fs::read calls fd_filestat_get to learn the file size for
+    // a precise allocation; if it errors, std falls back to chunked
+    // reads. Phase 2 ramfs returns ENOSYS to use the fallback path.
+    linker.func_wrap(
+        WASI,
+        "fd_filestat_get",
+        |_caller: Caller<'_, UserState>, _fd: i32, _filestat_ptr: u32| -> i32 { ENOSYS },
+    )?;
+
+    // ── path_filestat_get → ENOSYS (typed stub) ─────────────────────
+    linker.func_wrap(
+        WASI,
+        "path_filestat_get",
+        |_caller: Caller<'_, UserState>,
+         _dirfd: i32,
+         _flags: i32,
+         _path_ptr: u32,
+         _path_len: u32,
+         _filestat_ptr: u32|
+         -> i32 { ENOSYS },
+    )?;
+
     // ── Catch-all: any other preview1 call returns ENOSYS ──────────
     // Wasmtime requires every imported function to be defined. We
-    // can't do a wildcard, so we list the rest as ENOSYS stubs.
-    // (Add to this list as fixtures need them.)
+    // can't do a wildcard, so we list the rest as no-arg ENOSYS stubs.
+    // Calls with real signatures get typed stubs above; add here only
+    // calls that no fixture needs yet.
     for name in [
         "clock_res_get",
         "fd_advise",
@@ -371,22 +528,17 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         "fd_datasync",
         "fd_fdstat_set_flags",
         "fd_fdstat_set_rights",
-        "fd_filestat_get",
         "fd_filestat_set_size",
         "fd_filestat_set_times",
         "fd_pread",
-        "fd_prestat_get",
-        "fd_prestat_dir_name",
         "fd_pwrite",
         "fd_readdir",
         "fd_renumber",
         "fd_sync",
         "fd_tell",
         "path_create_directory",
-        "path_filestat_get",
         "path_filestat_set_times",
         "path_link",
-        "path_open",
         "path_readlink",
         "path_remove_directory",
         "path_rename",
@@ -414,3 +566,10 @@ const METHOD_WRITE: u32 = 0x1_0014;
 const METHOD_READ: u32 = 0x1_0013;
 const METHOD_CLOSE: u32 = 0x1_000E;
 const METHOD_CLOCK_GETTIME: u32 = 0x1_0016;
+const METHOD_OPEN: u32 = 0x1_001F;
+
+/// Synthetic preopen fd we expose to wasi-libc so its preopen walk
+/// terminates with one match: "/". Matches the lowest fd that's
+/// neither stdio nor pre-allocated by the kernel-side fd_table.
+const PREOPEN_ROOT_FD: i32 = 3;
+const PREOPEN_ROOT_NAME: &str = "/";

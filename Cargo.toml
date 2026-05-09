@@ -17,6 +17,7 @@ members = [
   "test-fixtures/wasm/wc-bytes",
   "test-fixtures/wasm/true-cmd",
   "test-fixtures/wasm/false-cmd",
+  "test-fixtures/wasm/cat-ramfs",
   "abi/conformance/rust/dup2-canary",
   "abi/conformance/rust/getgroups-canary",
   "abi/conformance/rust/affinity-canary",

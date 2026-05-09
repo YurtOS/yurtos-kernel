@@ -324,6 +324,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cat-ramfs-wasm"
+version = "0.1.0"
+
+[[package]]
 name = "cat-stdin-wasm"
 version = "0.1.0"
 
