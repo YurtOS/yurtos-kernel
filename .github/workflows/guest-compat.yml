@@ -56,6 +56,12 @@ jobs:
       - name: Build guest compat canaries
         run: make -C abi all copy-fixtures
 
+      - name: Build Yurt Rust std
+        run: |
+          set -euxo pipefail
+          RUST_VERSION="$(rustc --version | awk '{print $2}')"
+          scripts/build-rust-std.sh --rust "$RUST_VERSION"
+
       - name: Build zstd-sys through cargo-yurt
         env:
           CC_wasm32_wasip1: ${{ github.workspace }}/target/release/yurt-cc
@@ -65,11 +71,7 @@ jobs:
         run: env -u YURT_CC_INCLUDE target/release/cargo-yurt build --release -p zstd-sys-smoke
 
       - name: Build Rust std canaries
-        run: |
-          set -euxo pipefail
-          RUST_VERSION="$(rustc --version | awk '{print $2}')"
-          scripts/build-rust-std.sh --rust "$RUST_VERSION"
-          make -C abi rust-canaries rust-std-canaries
+        run: make -C abi rust-canaries rust-std-canaries
 
       - name: Build BusyBox fixture
         run: make -C test-fixtures/c-ports/busybox copy-fixtures
