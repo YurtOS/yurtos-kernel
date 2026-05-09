@@ -5,8 +5,8 @@
  * code under test runs in any JS engine; Deno is the convenient
  * test driver because it has a stock test runner and WebAssembly
  * ready out of the box. The same code runs unchanged in browsers —
- * the difference is the loading path (fetch vs Deno.readFile), which
- * belongs in the future `packages/microkernel-browser/`.
+ * the only delta there is the loading path (fetch vs Deno.readFile),
+ * which lives in the application layer above the microkernel.
  *
  * Loads the same `yurt-kernel-wasm` artifact the Rust tests build and
  * exercises the trampoline through the JS microkernel. Mirrors the

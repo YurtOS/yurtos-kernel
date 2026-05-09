@@ -1,7 +1,7 @@
 //! Yurt kernel, sandboxed.
 //!
 //! Compiled to `wasm32-wasip1` and instantiated by any microkernel host
-//! (`microkernel-wasmtime`, `microkernel-browser`, `microkernel-deno`,
+//! (`microkernel-wasmtime`, `microkernel-js`, `microkernel-deno`,
 //! bare `wasmtime run`, …). The host forwards each user `host_*` syscall
 //! into [`kernel_dispatch`] after copying the request bytes into kernel
 //! linear memory; the kernel writes the response back into the same

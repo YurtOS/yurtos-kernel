@@ -26,7 +26,8 @@ the same `kh_*` imports and call `kernel_dispatch` is a supported
 backend — wasmtime, Wasmer, the browser engine via JSPI/asyncify,
 Wasmi for embedded, and future runtimes drop in without touching
 kernel.wasm or process. Each microkernel package
-(`microkernel-wasmtime`, `microkernel-browser`, `microkernel-deno`, …)
+(`microkernel-wasmtime` for native, `microkernel-js` for any JS engine
+plus `microkernel-deno` for Deno-only extensions, future runtimes, …)
 is a thin adapter that satisfies one well-defined interface.
 
 ## Why
@@ -47,8 +48,10 @@ is a thin adapter that satisfies one well-defined interface.
 ┌──────────────────────────────────────────────────────────────┐
 │ Host Microkernel (per-platform)                              │
 │  - wasmtime native     packages/microkernel-wasmtime         │
-│  - browser (JSPI)      packages/microkernel-browser          │
-│  - deno (debug)        packages/microkernel-deno             │
+│  - any JS engine       packages/microkernel-js               │
+│       (Deno, browsers, Node, Bun all share this)             │
+│  - Deno-only adds      packages/microkernel-deno             │
+│       (real fs / sockets / subprocess on top of -js)         │
 │  - bare CLI            wasmtime run kernel.wasm              │
 └────────┬──────────────────────────────────┬──────────────────┘
          │ user→kernel trampoline           │ kernel→host (kh_*)
@@ -154,7 +157,7 @@ surface, grouped:
   block. There is no polling loop on any path. PR15 also adds a
   host-page `sandbox.net` facade and a `ListenerRegistry` for routing
   in-tab fetch/WS into the sandbox; those live above the kernel↔host
-  ABI and are the microkernel-browser adapter's concern, not
+  ABI and are the microkernel-js adapter's concern, not
   kernel.wasm's.
 - **Wasm engine ops:** `kh_spawn_process` (creates a new process
   instance from a module already loaded into the host's module cache,

@@ -73,10 +73,12 @@ jobs:
     # (packages/microkernel-js/) runs the same kernel.wasm artifact
     # the wasmtime backend uses, validating that the contract
     # (`kernel_dispatch` + `kh_*` imports) is genuinely runtime-
-    # agnostic. The Deno-specific extensions live in
-    # packages/microkernel-deno/ (currently a re-export); browser-
-    # specific extensions land later in packages/microkernel-browser/.
-    # See docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md.
+    # agnostic. The Deno-only extensions (real fs / sockets /
+    # subprocess) live in packages/microkernel-deno/ (currently a
+    # re-export of -js, will fill in as we port the relevant
+    # syscalls). Browsers consume packages/microkernel-js/ directly —
+    # there is no separate microkernel-browser. See
+    # docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

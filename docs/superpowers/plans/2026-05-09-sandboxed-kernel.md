@@ -35,7 +35,7 @@ preemption).
 ┌──────────────────────────────────────────────────────────────┐
 │ Host Microkernel (per-platform; small)                       │
 │  - wasmtime native:  packages/microkernel-wasmtime           │
-│  - browser/JSPI:     packages/microkernel-browser            │
+│  - browser/JSPI:     packages/microkernel-js            │
 │  - deno (debug):     packages/microkernel-deno               │
 │  - bare CLI:         `wasmtime run yurt-kernel.wasm`         │
 │                                                              │
@@ -145,7 +145,7 @@ exit/stdout/stderr.
   and `kh_destroy_instance`.
 
 ### Phase 6 — Browser / Deno / bare-CLI microkernels
-- `packages/microkernel-browser` — small TS+wasm using JSPI to suspend
+- `packages/microkernel-js` — small TS+wasm using JSPI to suspend
   process at the trampoline; asyncify fallback for engines without JSPI.
   Replaces `packages/kernel/src/browser-adapter.ts`.
 - `packages/microkernel-deno` — Deno-based microkernel (debug-friendly,
@@ -168,7 +168,7 @@ exit/stdout/stderr.
 **To create:**
 - `packages/kernel-wasm/Cargo.toml`, `src/lib.rs`, per-subsystem modules
 - `packages/microkernel-wasmtime/` (rename from `packages/runtime-wasmtime`)
-- `packages/microkernel-browser/`
+- `packages/microkernel-js/`
 - `packages/microkernel-deno/`
 - `abi/contract/kernel_host_abi.toml`
 - `docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md`
@@ -198,7 +198,7 @@ runs `guest-compat.yml` twice with each kernel selection.
 End-to-end smoke per microkernel host:
 - `cargo test -p microkernel-wasmtime` — native path
 - `deno test packages/microkernel-deno/**/*_test.ts` — Deno path
-- A Playwright run of microkernel-browser loading `kernel.wasm` and
+- A Playwright run of microkernel-js loading `kernel.wasm` and
   executing the BusyBox shell fixture in JSPI mode and again in asyncify
   mode.
 - `wasmtime run target/wasm32-wasip1/release/yurt-kernel.wasm -- <args>`

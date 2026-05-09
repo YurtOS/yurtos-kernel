@@ -1,26 +1,29 @@
 /**
  * Sandboxed-kernel microkernel — portable JS / WebAssembly core.
  *
- * Runs in any JS engine with WebAssembly: Deno, browsers (with JSPI
- * or asyncify when blocking syscalls land), Node, Bun. No host-
- * specific APIs (no `Deno.*`, no Web Worker, no `fs`); only `crypto`
- * and `WebAssembly`, which are universal.
+ * Runs unchanged in every JS engine: Deno, browsers (with JSPI or
+ * asyncify when blocking syscalls land), Node, Bun. Browsers and
+ * Deno share enough — WebAssembly, fetch, crypto, IndexedDB,
+ * WebSocket — that there's no separate `microkernel-browser`. They
+ * use *this* package directly.
+ *
+ * No host-specific APIs (no `Deno.*`, no `fs`, no `Worker`); only
+ * `crypto` and `WebAssembly`, which are universal.
  *
  * Loads `yurt-kernel-wasm` (compiled to `wasm32-wasip1`), satisfies
  * the documented `kh_*` import surface, and runs the same kernel.wasm
  * artifact the wasmtime backend uses.
  *
- * Engine-specific extensions (real TCP sockets, real filesystem,
- * subprocess invocation, Service-Worker fetch routing, OPFS / IndexedDB
- * persistence) live in sibling packages that *consume* this one:
- *
- *   - `packages/microkernel-deno/` — Deno-only (Deno.connect / readFile /
- *     Command).
- *   - `packages/microkernel-browser/` — browser-only (eventual; Service
- *     Worker, OPFS, fetch interception).
- *
- * Splitting that way keeps `microkernel-js` dependency-free of any
- * host API and lets the same code run unchanged across all JS engines.
+ * Where engines actually differ:
+ *   - **Real TCP sockets, real filesystem, real subprocess.** Only
+ *     Deno (and Node) have these natively. They live in
+ *     `packages/microkernel-deno/` as a thin extension consumed on
+ *     top of this core.
+ *   - **Service-Worker fetch routing, OPFS, IndexedDB persistence,**
+ *     **postMessage to a host page.** Those are browser-page concerns
+ *     above the microkernel — they live in the application layer
+ *     (e.g. PR15's `sandbox.net` / `ListenerRegistry`), not as a
+ *     parallel microkernel package.
  *
  * User-process syscall plumbing lives in two sibling files inside
  * this package:

@@ -6,10 +6,12 @@
 //! spawns user processes into separate stores whose `sys_*` imports
 //! are wired back through the kernel.
 //!
-//! Eventually extracted into:
-//! - `packages/microkernel-wasmtime` (this code)
-//! - `packages/microkernel-browser` (JSPI/asyncify)
-//! - `packages/microkernel-deno` (debug)
+//! Sibling backends sharing this contract:
+//! - `packages/microkernel-wasmtime` (this code; native perf path).
+//! - `packages/microkernel-js` (portable JS+wasm; runs in Deno,
+//!   browsers, Node, Bun unchanged).
+//! - `packages/microkernel-deno` (Deno-only extensions: real fs,
+//!   real sockets, subprocess).
 //!
 //! Any wasm runtime that hosts the same `kh_*` imports and calls
 //! `kernel_dispatch` is a supported backend — see
