@@ -202,3 +202,13 @@ doc = "POSIX getsid(pid). Request bytes carry the u32 target pid (0 = self). Ret
 id = 0x1_001A
 kind = "syscall"
 doc = "POSIX setsid(): make the calling process a new session leader. No request bytes. Sets sid = pgid = caller_pid. Returns the new sid on success, -EPERM if the caller is already a process-group leader (POSIX: a session leader cannot already lead a group)."
+
+[method.sys_kill]
+id = 0x1_001B
+kind = "syscall"
+doc = "POSIX kill(pid, sig). Request bytes carry two little-endian u32s: target pid, signal number (1..=63). Phase 2 records the signal in the target's pending mask but does not deliver — actual delivery requires async unwind (asyncify or JSPI) which lands when the AsyncBridge integration does. Returns 0 on success, -ESRCH for unknown pids, -EINVAL for sig out of range. sig==0 is the POSIX 'is the pid alive?' probe; we always return 0 today (no process tree)."
+
+[method.sys_sigaction]
+id = 0x1_001C
+kind = "syscall"
+doc = "POSIX sigaction(sig, disposition). Request bytes carry two little-endian u32s: signal number (1..=63), disposition. Disposition encoding: 0 = SIG_DFL, 1 = SIG_IGN, anything else is treated as a user-provided wasm function index/pointer (kernel stores it; user-side libc maintains the actual mapping). Phase 2 stores per-pid only; delivery comes with AsyncBridge. Returns the previous disposition on success, -EINVAL for sig out of range."

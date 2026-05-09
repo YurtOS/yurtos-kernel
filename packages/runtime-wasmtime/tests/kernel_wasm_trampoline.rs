@@ -54,6 +54,8 @@ const METHOD_SYS_GETPGID: u32 = 0x1_0017;
 const METHOD_SYS_SETPGID: u32 = 0x1_0018;
 const METHOD_SYS_GETSID: u32 = 0x1_0019;
 const METHOD_SYS_SETSID: u32 = 0x1_001A;
+const METHOD_SYS_KILL: u32 = 0x1_001B;
+const METHOD_SYS_SIGACTION: u32 = 0x1_001C;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -785,6 +787,12 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_setpgid", METHOD_SYS_SETPGID, METHOD_SYS_SETPGID as i64),
         ("sys_getsid", METHOD_SYS_GETSID, METHOD_SYS_GETSID as i64),
         ("sys_setsid", METHOD_SYS_SETSID, METHOD_SYS_SETSID as i64),
+        ("sys_kill", METHOD_SYS_KILL, METHOD_SYS_KILL as i64),
+        (
+            "sys_sigaction",
+            METHOD_SYS_SIGACTION,
+            METHOD_SYS_SIGACTION as i64,
+        ),
     ] {
         let entry = methods
             .get(name)
@@ -831,6 +839,42 @@ fn process_group_and_session_round_trip_through_trampoline() {
         .syscall(METHOD_SYS_GETSID, &42_u32.to_le_bytes(), &mut [])
         .unwrap();
     assert_eq!(rc, 42, "getsid lazy-primes independently of pgid");
+}
+
+#[test]
+fn signal_storage_round_trips_through_trampoline() {
+    // Phase 2 stubs: sys_kill records pending bits, sys_sigaction
+    // returns the previous disposition. Actual delivery requires
+    // asyncify/JSPI unwind and lands with the AsyncBridge integration.
+    let mk = fresh_microkernel(0);
+
+    // sigaction(SIGTERM=15, SIG_IGN=1) → previous SIG_DFL=0.
+    let mut req = Vec::new();
+    req.extend_from_slice(&15_u32.to_le_bytes());
+    req.extend_from_slice(&1_u32.to_le_bytes());
+    let rc = mk.syscall(METHOD_SYS_SIGACTION, &req, &mut []).unwrap();
+    assert_eq!(rc, 0, "previous disposition was SIG_DFL");
+
+    // Replace with a user handler value; previous should be SIG_IGN=1.
+    let mut req2 = Vec::new();
+    req2.extend_from_slice(&15_u32.to_le_bytes());
+    req2.extend_from_slice(&0xDEAD_u32.to_le_bytes());
+    let rc = mk.syscall(METHOD_SYS_SIGACTION, &req2, &mut []).unwrap();
+    assert_eq!(rc, 1, "previous disposition was SIG_IGN");
+
+    // kill(target=7, sig=0) is the alive-probe; succeeds with no tree.
+    let mut req3 = Vec::new();
+    req3.extend_from_slice(&7_u32.to_le_bytes());
+    req3.extend_from_slice(&0_u32.to_le_bytes());
+    let rc = mk.syscall(METHOD_SYS_KILL, &req3, &mut []).unwrap();
+    assert_eq!(rc, 0, "sig 0 is the existence probe; always 0 today");
+
+    // kill out-of-range → -EINVAL.
+    let mut req4 = Vec::new();
+    req4.extend_from_slice(&7_u32.to_le_bytes());
+    req4.extend_from_slice(&64_u32.to_le_bytes());
+    let rc = mk.syscall(METHOD_SYS_KILL, &req4, &mut []).unwrap();
+    assert_eq!(rc, -22, "EINVAL for sig out of 1..=63");
 }
 
 #[test]

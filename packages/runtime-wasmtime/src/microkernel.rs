@@ -71,6 +71,8 @@ mod sys_method_id {
     pub const SETPGID: u32 = 0x1_0018;
     pub const GETSID: u32 = 0x1_0019;
     pub const SETSID: u32 = 0x1_001A;
+    pub const KILL: u32 = 0x1_001B;
+    pub const SIGACTION: u32 = 0x1_001C;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -1165,6 +1167,26 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "sys_setsid",
         |mut caller: Caller<'_, UserState>| -> i32 {
             forward_request_bytes(&mut caller, sys_method_id::SETSID, &[]) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_kill",
+        |mut caller: Caller<'_, UserState>, pid: i32, sig: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(pid as u32).to_le_bytes());
+            req.extend_from_slice(&(sig as u32).to_le_bytes());
+            forward_request_bytes(&mut caller, sys_method_id::KILL, &req) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_sigaction",
+        |mut caller: Caller<'_, UserState>, sig: i32, disposition: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(sig as u32).to_le_bytes());
+            req.extend_from_slice(&(disposition as u32).to_le_bytes());
+            forward_request_bytes(&mut caller, sys_method_id::SIGACTION, &req) as i32
         },
     )?;
     Ok(())

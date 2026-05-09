@@ -241,6 +241,43 @@ Deno.test(
   },
 );
 
+Deno.test(
+  "signal stubs (kill + sigaction) round-trip through the trampoline",
+  async () => {
+    const mk = await freshMicrokernel();
+
+    // sigaction(SIGTERM=15, SIG_IGN=1) → previous SIG_DFL=0.
+    const sa1 = new Uint8Array(8);
+    const sa1View = new DataView(sa1.buffer);
+    sa1View.setUint32(0, 15, true);
+    sa1View.setUint32(4, 1, true);
+    let { rc } = mk.syscall(METHOD.SYS_SIGACTION, sa1, 0);
+    assertEquals(Number(rc), 0);
+
+    // Replace with user handler 0xDEAD; previous should be 1 (SIG_IGN).
+    const sa2 = new Uint8Array(8);
+    const sa2View = new DataView(sa2.buffer);
+    sa2View.setUint32(0, 15, true);
+    sa2View.setUint32(4, 0xDEAD, true);
+    ({ rc } = mk.syscall(METHOD.SYS_SIGACTION, sa2, 0));
+    assertEquals(Number(rc), 1);
+
+    // kill(target=7, sig=0) succeeds (alive probe).
+    const k1 = new Uint8Array(8);
+    new DataView(k1.buffer).setUint32(0, 7, true);
+    ({ rc } = mk.syscall(METHOD.SYS_KILL, k1, 0));
+    assertEquals(Number(rc), 0);
+
+    // kill out-of-range → -EINVAL (-22).
+    const k2 = new Uint8Array(8);
+    const k2View = new DataView(k2.buffer);
+    k2View.setUint32(0, 7, true);
+    k2View.setUint32(4, 64, true);
+    ({ rc } = mk.syscall(METHOD.SYS_KILL, k2, 0));
+    assertEquals(Number(rc), -22);
+  },
+);
+
 Deno.test("microkernel direct syscalls use kernel pid 0", async () => {
   const mk = await freshMicrokernel();
   const { rc } = mk.syscall(METHOD.SYS_GETPID, new Uint8Array(0), 0);

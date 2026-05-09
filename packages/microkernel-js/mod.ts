@@ -84,6 +84,8 @@ export const METHOD = {
   SYS_SETPGID: 0x1_0018,
   SYS_GETSID: 0x1_0019,
   SYS_SETSID: 0x1_001A,
+  SYS_KILL: 0x1_001B,
+  SYS_SIGACTION: 0x1_001C,
 } as const;
 
 export const KERNEL_PID = 0;

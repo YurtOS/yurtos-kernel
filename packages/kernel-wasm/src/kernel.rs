@@ -157,6 +157,15 @@ pub struct Process {
     pub pgid: Pid,
     /// POSIX session id. Same default-to-pid convention as `pgid`.
     pub sid: Pid,
+    /// Pending signals as a bitmask: bit (sig-1) is set when sig is
+    /// queued for delivery. Phase 2 records but does not deliver —
+    /// delivery requires asyncify/JSPI unwind which lands later. Sig
+    /// numbers 1..=63 use bits 0..=62.
+    pub pending_signals: u64,
+    /// Per-signal disposition. Index `sig - 1` for sig in 1..=63.
+    /// 0 = SIG_DFL, 1 = SIG_IGN, anything else is an opaque user-side
+    /// handler value (typically a wasm function table index).
+    pub signal_dispositions: [u32; 63],
 }
 
 impl Default for Process {
@@ -173,6 +182,8 @@ impl Default for Process {
             stderr_buffer: Vec::new(),
             pgid: 0,
             sid: 0,
+            pending_signals: 0,
+            signal_dispositions: [0; 63],
         }
     }
 }

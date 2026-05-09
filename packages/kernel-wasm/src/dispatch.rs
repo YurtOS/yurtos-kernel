@@ -64,6 +64,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SETPGID => setpgid(caller_pid, request),
         METHOD_SYS_GETSID => getsid(caller_pid, request),
         METHOD_SYS_SETSID => setsid(caller_pid),
+        METHOD_SYS_KILL => kill(request),
+        METHOD_SYS_SIGACTION => sigaction(caller_pid, request),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -569,6 +571,46 @@ fn setsid(caller_pid: u32) -> i64 {
         p.sid = caller_pid;
         p.pgid = caller_pid;
         caller_pid as i64
+    })
+}
+
+/// `kill(target_pid, sig)`. Records sig in target's pending mask.
+/// Phase 2: storage only — actual delivery requires asyncify/JSPI
+/// unwind from the AsyncBridge integration. sig==0 is the POSIX
+/// "is the pid alive?" probe; with no process tree we always say yes.
+fn kill(request: &[u8]) -> i64 {
+    let Some([target, sig]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if sig == 0 {
+        return 0;
+    }
+    if !(1..=63).contains(&sig) {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        k.process_mut(target).pending_signals |= 1u64 << (sig - 1);
+    });
+    0
+}
+
+/// `sigaction(sig, disposition) -> previous_disposition`. Disposition
+/// encoding is opaque to the kernel: 0/1 are SIG_DFL/SIG_IGN by
+/// convention, anything else is a user-side handler value (typically
+/// a wasm function table index). The kernel stores per-pid; user-side
+/// libc wraps invocation when delivery lands.
+fn sigaction(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([sig, disposition]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if !(1..=63).contains(&sig) {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let slot = &mut k.process_mut(caller_pid).signal_dispositions[(sig - 1) as usize];
+        let prev = *slot;
+        *slot = disposition;
+        prev as i64
     })
 }
 
@@ -1401,6 +1443,78 @@ mod tests {
             dispatch(METHOD_SYS_GETSID, 11, &0_u32.to_le_bytes(), &mut []),
             11
         );
+    }
+
+    #[test]
+    fn kill_sig_zero_is_alive_probe_and_succeeds() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&5_u32.to_le_bytes()); // target
+        req.extend_from_slice(&0_u32.to_le_bytes()); // sig 0 = probe
+        assert_eq!(dispatch(METHOD_SYS_KILL, 1, &req, &mut []), 0);
+    }
+
+    #[test]
+    fn kill_records_signal_in_pending_mask() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&5_u32.to_le_bytes()); // target pid
+        req.extend_from_slice(&15_u32.to_le_bytes()); // SIGTERM
+        assert_eq!(dispatch(METHOD_SYS_KILL, 1, &req, &mut []), 0);
+        // Bit 14 (sig 15 - 1) should now be set on pid 5.
+        let pending = crate::kernel::with_kernel(|k| k.process_mut(5).pending_signals);
+        assert_eq!(pending, 1u64 << 14);
+    }
+
+    #[test]
+    fn kill_out_of_range_sig_is_einval() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&5_u32.to_le_bytes());
+        req.extend_from_slice(&64_u32.to_le_bytes()); // 1..=63 only
+        assert_eq!(
+            dispatch(METHOD_SYS_KILL, 1, &req, &mut []),
+            -(abi::EINVAL as i64)
+        );
+    }
+
+    #[test]
+    fn sigaction_returns_previous_disposition_and_persists_new() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&15_u32.to_le_bytes()); // SIGTERM
+        req.extend_from_slice(&0xCAFEBABE_u32.to_le_bytes()); // user handler
+        assert_eq!(dispatch(METHOD_SYS_SIGACTION, 1, &req, &mut []), 0); // prev was SIG_DFL
+
+        // Replace with SIG_IGN; should report 0xCAFEBABE as previous.
+        let mut req2 = Vec::new();
+        req2.extend_from_slice(&15_u32.to_le_bytes());
+        req2.extend_from_slice(&1_u32.to_le_bytes()); // SIG_IGN
+        assert_eq!(
+            dispatch(METHOD_SYS_SIGACTION, 1, &req2, &mut []),
+            0xCAFEBABE_i64
+        );
+    }
+
+    #[test]
+    fn sigaction_is_per_pid_per_sig() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&15_u32.to_le_bytes());
+        req.extend_from_slice(&7_u32.to_le_bytes());
+        dispatch(METHOD_SYS_SIGACTION, 1, &req, &mut []);
+
+        // pid 2, same sig: still SIG_DFL.
+        let mut probe = Vec::new();
+        probe.extend_from_slice(&15_u32.to_le_bytes());
+        probe.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(dispatch(METHOD_SYS_SIGACTION, 2, &probe, &mut []), 0);
+
+        // pid 1, different sig: still SIG_DFL.
+        let mut other = Vec::new();
+        other.extend_from_slice(&9_u32.to_le_bytes()); // SIGKILL
+        other.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(dispatch(METHOD_SYS_SIGACTION, 1, &other, &mut []), 0);
     }
 
     #[test]
