@@ -230,6 +230,30 @@ parity on every supported host.
    pre-mount images into kernel.wasm memory at boot? Default: through
    `kh_real_*`; revisit if startup cost is unacceptable.
 
+## Extensions Live in the Microkernel, Not the Kernel
+
+The TS kernel exposes `host_extension_invoke` as the user-facing escape
+hatch for "syscalls implemented via a plugin" — database access, custom
+host callbacks, Python-backed handlers, etc. Extensions are *the*
+mechanism for adding new syscall-shaped functionality without changing
+the ABI.
+
+In the sandboxed-kernel split this means: **kernel.wasm does not host
+extensions.** It forwards `host_extension_invoke` straight through to
+the microkernel via a `kh_extension_invoke` import (TBD; will be added
+to `kernel_host_abi.toml` when we port the syscall). Each microkernel
+embedder owns its own extension registry — wasmtime hosts register
+native Rust handlers, the browser microkernel registers JS/TS handlers
+via JSPI, and so on. The kernel only carries bytes between the calling
+process and the host-side handler.
+
+Consequence: adding a new domain capability ("access a database",
+"call a custom RPC", "invoke a TS callback") is an extension
+registration on the microkernel side, never a kernel.wasm change. New
+user-facing syscalls inside `yurt_abi.toml` remain rare — they're
+reserved for genuinely kernel-resident concerns (process tree, fd
+table, signals, VFS).
+
 ## Non-Goals
 
 - Replacing user processes' ABI surface. They keep importing `host_*`.

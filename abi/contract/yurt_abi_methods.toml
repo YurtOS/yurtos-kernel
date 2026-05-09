@@ -1,0 +1,60 @@
+# Method-id assignments for the user→kernel trampoline.
+#
+# This file is the *authoritative* mapping between the user-facing
+# syscall names declared in `yurt_abi.toml` (and the kernel-internal
+# methods exposed by `kernel.wasm`) and the stable u32 method IDs the
+# microkernel passes to `kernel_dispatch`.
+#
+# Rules:
+#   - IDs are stable. Never reuse, never renumber. New entries append.
+#   - 0 is reserved for negotiation / health.
+#   - 1..=0xFFFF is the kernel-internal range (echo, now_realtime, …).
+#     These methods are not part of `yurt_abi.toml`; they exist only so
+#     the microkernel can validate trampoline plumbing without a real
+#     syscall.
+#   - 0x1_0000+ is the yurt_abi.toml syscall range. One entry per
+#     `[import.<name>]` in `yurt_abi.toml` — this file lags slightly as
+#     syscalls move from the TS kernel into kernel.wasm.
+#
+# Consumed by `packages/kernel-wasm/build.rs` to emit Rust constants
+# (`METHOD_<UPPERCASE_NAME>: u32`).
+
+[constant.YURT_KERNEL_DISPATCH_NEGOTIATION]
+type = "u32"
+value = 0
+doc = "Reserved method id for protocol negotiation / health checks."
+
+# Kernel-internal methods (1..=0xFFFF range).
+[method.kernel_echo]
+id = 1
+kind = "internal"
+doc = "Round-trip request bytes into the response buffer; validates memory-mediated trampoline."
+
+[method.kernel_now_realtime]
+id = 2
+kind = "internal"
+doc = "Round-trip a kh_now_realtime call into the response buffer; validates kernel→host direction."
+
+# yurt_abi.toml syscall methods (0x1_0000+ range).
+# Each entry corresponds to a `[import.host_*]` declaration in yurt_abi.toml.
+# Methods land here as they get ported from the TS kernel into kernel.wasm.
+
+[method.host_getuid]
+id = 0x1_0001
+kind = "syscall"
+doc = "Real user id of the calling process."
+
+[method.host_geteuid]
+id = 0x1_0002
+kind = "syscall"
+doc = "Effective user id of the calling process."
+
+[method.host_getgid]
+id = 0x1_0003
+kind = "syscall"
+doc = "Real group id of the calling process."
+
+[method.host_getegid]
+id = 0x1_0004
+kind = "syscall"
+doc = "Effective group id of the calling process."

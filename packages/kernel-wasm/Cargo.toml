@@ -10,5 +10,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 
+[build-dependencies]
+toml = "0.8"
+
 [features]
 default = []

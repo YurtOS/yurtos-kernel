@@ -131,6 +131,54 @@ fn microkernel_serves_fresh_kh_value_each_dispatch() {
 }
 
 #[test]
+fn microkernel_method_ids_match_yurt_abi_methods_toml() {
+    // Contract test: every method ID this test file hardcodes must
+    // match the authoritative pinning in
+    // `abi/contract/yurt_abi_methods.toml`. Catches drift in either
+    // direction — if the TOML changes an ID, this test fails; if a new
+    // syscall ID gets added in code without an entry, this test stays
+    // silent (so methods.toml is the source of truth).
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap();
+    let raw =
+        std::fs::read_to_string(workspace_root.join("abi/contract/yurt_abi_methods.toml")).unwrap();
+    let parsed: toml::Value = raw.parse().unwrap();
+    let methods = parsed.get("method").and_then(|v| v.as_table()).unwrap();
+
+    for (name, method, expected_id) in [
+        ("kernel_echo", METHOD_ECHO, METHOD_ECHO as i64),
+        (
+            "kernel_now_realtime",
+            METHOD_NOW_REALTIME,
+            METHOD_NOW_REALTIME as i64,
+        ),
+        ("host_getuid", METHOD_HOST_GETUID, METHOD_HOST_GETUID as i64),
+        (
+            "host_geteuid",
+            METHOD_HOST_GETEUID,
+            METHOD_HOST_GETEUID as i64,
+        ),
+        ("host_getgid", METHOD_HOST_GETGID, METHOD_HOST_GETGID as i64),
+        (
+            "host_getegid",
+            METHOD_HOST_GETEGID,
+            METHOD_HOST_GETEGID as i64,
+        ),
+    ] {
+        let entry = methods
+            .get(name)
+            .unwrap_or_else(|| panic!("method.{name} missing from yurt_abi_methods.toml"));
+        let id = entry.get("id").and_then(|v| v.as_integer()).unwrap();
+        assert_eq!(
+            id, expected_id,
+            "method.{name}: TOML says id={id}, code says id={method:#x}"
+        );
+    }
+}
+
+#[test]
 fn credentials_syscalls_round_trip_through_trampoline() {
     // First user-facing syscall family. Pure scalar return; no memory
     // copies. With no process kernel yet, all four resolve to the TS

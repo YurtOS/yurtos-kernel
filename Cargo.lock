@@ -3938,6 +3938,9 @@ dependencies = [
 [[package]]
 name = "yurt-kernel-wasm"
 version = "0.0.0"
+dependencies = [
+ "toml",
+]
 
 [[package]]
 name = "yurt-process"
@@ -3956,6 +3959,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "uuid",

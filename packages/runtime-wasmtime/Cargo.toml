@@ -44,5 +44,6 @@ uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 
 [dev-dependencies]
+toml = "0.8"
 wat = "1"
 wiremock = "0.6"
