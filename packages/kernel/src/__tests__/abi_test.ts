@@ -4,7 +4,7 @@
  */
 import { describe, it, afterEach } from '@std/testing/bdd';
 import { expect } from '@std/expect';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Sandbox } from '../sandbox.js';
 import { NodeAdapter } from '../platform/node-adapter.js';
@@ -1125,5 +1125,93 @@ describe('Kernel ABI canaries', () => {
     const busyboxResult = await sandbox.run('busybox seq 3');
     expect(busyboxResult.exitCode).toBe(0);
     expect(busyboxResult.stdout).toBe('1\n2\n3\n');
+  });
+
+  // dlopen-canary documents the Phase 1 shared-library contract.
+  // Spec: docs/superpowers/specs/2026-05-09-shared-libraries-design.md
+  // Plan: docs/superpowers/plans/2026-05-09-shared-libraries-phase1.md
+  //
+  // The fixture wasm files do not exist yet — they require slice 1B
+  // (`yurt-cc -shared` + libyurt_dlcanary.wasm side module), 1C (the
+  // dlfcn.h header + guest stubs), and 1D/1E (Wasmtime + Deno/Node
+  // host loaders). Each subsequent slice flips this `describe.ignore`
+  // closer to active by enabling the relevant cases.
+  describe.ignore('dlopen-canary (Phase 1 shared libraries — pending 1B/1C/1D/1E)', () => {
+    it('happy_path: load /lib/libyurt_dlcanary.wasm and call yurt_dlcanary_double(21) → 42', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run('dlopen-canary --case happy_path');
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toContain('"stdout":"dlcanary-ok"');
+    });
+
+    it('lazy_now_equiv: RTLD_LAZY and RTLD_NOW return identical handles', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run('dlopen-canary --case lazy_now_equiv');
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toContain('"stdout":"lazy-now-ok"');
+    });
+
+    it('double_open_refcount: two opens, one close, dlsym still works', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run('dlopen-canary --case double_open_refcount');
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toContain('"stdout":"refcount-ok"');
+    });
+
+    it('missing_path: dlopen returns NULL, dlerror is non-empty', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run('dlopen-canary --case missing_path');
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toContain('"stdout":"missing-path-ok"');
+    });
+
+    it('missing_symbol: dlsym returns NULL, dlerror is non-empty', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run('dlopen-canary --case missing_symbol');
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toContain('"stdout":"missing-symbol-ok"');
+    });
+
+    it('bad_format: opening a non-side-module wasm is rejected', async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      sandbox.writeFile(
+        '/tmp/not-a-side-module.wasm',
+        readFileSync(resolve(FIXTURES, 'dup2-canary.wasm')),
+      );
+
+      const result = await sandbox.run('dlopen-canary --case bad_format');
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toContain('"stdout":"bad-format-ok"');
+    });
   });
 });
