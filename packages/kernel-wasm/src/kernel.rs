@@ -27,6 +27,26 @@ pub type Pid = u32;
 
 pub const DEFAULT_UMASK: u16 = 0o022;
 
+/// `(soft, hard)` resource limits. `u64::MAX` means RLIM_INFINITY.
+pub type ResourceLimit = (u64, u64);
+
+/// Number of POSIX rlimit slots tracked. Matches the TS kernel's
+/// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
+pub const RLIMIT_SLOTS: usize = 8;
+
+/// Default resource limits, indexed by resource id. Mirrors
+/// `defaultImportResourceLimit` in the TS kernel.
+pub const DEFAULT_RLIMITS: [Option<ResourceLimit>; RLIMIT_SLOTS] = [
+    Some((u64::MAX, u64::MAX)),                 // 0 RLIMIT_CPU
+    Some((u64::MAX, u64::MAX)),                 // 1 RLIMIT_FSIZE
+    Some((64 * 1024 * 1024, 64 * 1024 * 1024)), // 2 RLIMIT_DATA
+    Some((1024 * 1024, 1024 * 1024)),           // 3 RLIMIT_STACK
+    Some((0, 0)),                               // 4 RLIMIT_CORE
+    Some((64 * 1024 * 1024, 64 * 1024 * 1024)), // 5 RLIMIT_RSS
+    Some((1024, 1024)),                         // 6 RLIMIT_NPROC
+    Some((1024, 1024)),                         // 7 RLIMIT_NOFILE
+];
+
 #[derive(Clone, Debug)]
 pub struct Process {
     pub umask: u16,
@@ -34,6 +54,9 @@ pub struct Process {
     /// Working directory as raw bytes (cwd has no UTF-8 guarantee in
     /// POSIX). Default `/`.
     pub cwd: Vec<u8>,
+    /// POSIX resource limits per `getrlimit` / `setrlimit`. `None`
+    /// for unsupported resource ids; `Some((soft, hard))` otherwise.
+    pub rlimits: [Option<ResourceLimit>; RLIMIT_SLOTS],
 }
 
 impl Default for Process {
@@ -42,6 +65,7 @@ impl Default for Process {
             umask: DEFAULT_UMASK,
             credentials: Credentials::DEFAULT,
             cwd: b"/".to_vec(),
+            rlimits: DEFAULT_RLIMITS,
         }
     }
 }

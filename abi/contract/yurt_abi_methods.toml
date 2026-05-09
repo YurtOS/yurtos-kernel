@@ -108,6 +108,16 @@ id = 0x1_000B
 kind = "syscall"
 doc = "Write the calling process's working directory (NUL-terminated) into the response buffer. Returns required size (path length + 1) on success — caller checks against out_cap to detect a too-small buffer (matches the TS host_getcwd convention)."
 
+[method.sys_getrlimit]
+id = 0x1_000C
+kind = "syscall"
+doc = "Read a POSIX resource limit. Request bytes carry the u32 resource id; response is 16 bytes — soft (le u64) followed by hard (le u64). u64::MAX = RLIM_INFINITY. Returns 16 on success, -EINVAL for unsupported resource ids."
+
+[method.sys_setrlimit]
+id = 0x1_000D
+kind = "syscall"
+doc = "Set a POSIX resource limit. Request bytes carry u32 resource id + le u64 soft + le u64 hard (20 bytes). Returns 0 on success, -EINVAL for unsupported resources, -EPERM if the new limit exceeds the existing hard limit (POSIX rule)."
+
 [method.sys_extension_invoke]
 id = 0x1_0010
 kind = "syscall"

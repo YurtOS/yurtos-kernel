@@ -40,6 +40,8 @@ const METHOD_SYS_SETRESUID: u32 = 0x1_0008;
 const METHOD_SYS_SETRESGID: u32 = 0x1_0009;
 const METHOD_SYS_CHDIR: u32 = 0x1_000A;
 const METHOD_SYS_GETCWD: u32 = 0x1_000B;
+const METHOD_SYS_GETRLIMIT: u32 = 0x1_000C;
+const METHOD_SYS_SETRLIMIT: u32 = 0x1_000D;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -470,6 +472,51 @@ fn user_process_chdir_then_getcwd_round_trip() {
 }
 
 #[test]
+fn user_process_getrlimit_then_setrlimit_round_trip() {
+    // Validates a per-pid table-state syscall that takes a u32 arg and
+    // writes a 16-byte struct back into user memory, plus a 3-arg
+    // setrlimit (u32 + 2*u64) round-trip.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_getrlimit"
+            (func $getrlimit (param i32 i32) (result i32)))
+          (import "env" "sys_setrlimit"
+            (func $setrlimit (param i32 i64 i64) (result i32)))
+          (memory (export "memory") 1)
+          ;; rlimit struct lands at offset 64 (16 bytes).
+          (func (export "get_stack") (result i32)
+            (call $getrlimit (i32.const 3) (i32.const 64)))
+          ;; Lower RLIMIT_NOFILE (=7) to 256 / 512.
+          (func (export "set_nofile_lo") (result i32)
+            (call $setrlimit
+              (i32.const 7) (i64.const 256) (i64.const 512)))
+          (func (export "get_nofile") (result i32)
+            (call $getrlimit (i32.const 7) (i32.const 64)))
+          (func (export "load_u64_lo") (result i64) (i64.load (i32.const 64)))
+          (func (export "load_u64_hi") (result i64) (i64.load (i32.const 72))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    // Default RLIMIT_STACK = 1 MB.
+    assert_eq!(user.call_export_i32("get_stack").unwrap(), 0);
+    let mem = user.read_memory(64, 16).unwrap();
+    let soft = u64::from_le_bytes(mem[0..8].try_into().unwrap());
+    let hard = u64::from_le_bytes(mem[8..16].try_into().unwrap());
+    assert_eq!(soft, 1024 * 1024);
+    assert_eq!(hard, 1024 * 1024);
+
+    // Lower RLIMIT_NOFILE; read it back.
+    assert_eq!(user.call_export_i32("set_nofile_lo").unwrap(), 0);
+    assert_eq!(user.call_export_i32("get_nofile").unwrap(), 0);
+    let mem = user.read_memory(64, 16).unwrap();
+    assert_eq!(u64::from_le_bytes(mem[0..8].try_into().unwrap()), 256);
+    assert_eq!(u64::from_le_bytes(mem[8..16].try_into().unwrap()), 512);
+}
+
+#[test]
 fn user_process_setresgid_changes_subsequent_getgid() {
     let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
@@ -549,6 +596,16 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ),
         ("sys_chdir", METHOD_SYS_CHDIR, METHOD_SYS_CHDIR as i64),
         ("sys_getcwd", METHOD_SYS_GETCWD, METHOD_SYS_GETCWD as i64),
+        (
+            "sys_getrlimit",
+            METHOD_SYS_GETRLIMIT,
+            METHOD_SYS_GETRLIMIT as i64,
+        ),
+        (
+            "sys_setrlimit",
+            METHOD_SYS_SETRLIMIT,
+            METHOD_SYS_SETRLIMIT as i64,
+        ),
         (
             "sys_extension_invoke",
             METHOD_SYS_EXTENSION_INVOKE,

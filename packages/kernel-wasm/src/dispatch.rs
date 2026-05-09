@@ -45,6 +45,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SETRESGID => setresgid(caller_pid, request),
         METHOD_SYS_CHDIR => chdir(caller_pid, request),
         METHOD_SYS_GETCWD => getcwd(caller_pid, response),
+        METHOD_SYS_GETRLIMIT => getrlimit(caller_pid, request, response),
+        METHOD_SYS_SETRLIMIT => setrlimit(caller_pid, request),
         METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
         _ => -(abi::ENOSYS as i64),
     }
@@ -111,6 +113,63 @@ fn chdir(caller_pid: u32, request: &[u8]) -> i64 {
         k.process_mut(caller_pid).cwd = request.to_vec();
     });
     0
+}
+
+/// `getrlimit(resource: u32) -> (soft, hard) as 16 bytes LE`.
+fn getrlimit(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([resource]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if (resource as usize) >= crate::kernel::RLIMIT_SLOTS {
+        return -(abi::EINVAL as i64);
+    }
+    if response.len() < 16 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let limit = k.process_mut(caller_pid).rlimits[resource as usize];
+        match limit {
+            Some((soft, hard)) => {
+                response[0..8].copy_from_slice(&soft.to_le_bytes());
+                response[8..16].copy_from_slice(&hard.to_le_bytes());
+                16
+            }
+            None => -(abi::EINVAL as i64),
+        }
+    })
+}
+
+/// `setrlimit(resource: u32, soft: u64, hard: u64) -> 0 / -EINVAL / -EPERM`.
+/// POSIX rule: a process may not raise its hard limit, only lower it;
+/// soft must not exceed hard.
+fn setrlimit(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 4 + 8 + 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let resource = u32::from_le_bytes([request[0], request[1], request[2], request[3]]);
+    let soft = u64::from_le_bytes(request[4..12].try_into().expect("8 bytes"));
+    let hard = u64::from_le_bytes(request[12..20].try_into().expect("8 bytes"));
+    if (resource as usize) >= crate::kernel::RLIMIT_SLOTS {
+        return -(abi::EINVAL as i64);
+    }
+    if soft > hard {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let slot = &mut k.process_mut(caller_pid).rlimits[resource as usize];
+        let Some((_, prev_hard)) = *slot else {
+            return -(abi::EINVAL as i64);
+        };
+        // POSIX: only privileged processes may raise the hard limit.
+        // Phase 2 has no capability check; enforce the simple rule
+        // that hard cannot increase. setresuid-as-root + raise comes
+        // when security policy lands.
+        if hard > prev_hard {
+            return -(abi::EPERM as i64);
+        }
+        *slot = Some((soft, hard));
+        0
+    })
 }
 
 fn getcwd(caller_pid: u32, response: &mut [u8]) -> i64 {
@@ -298,6 +357,99 @@ mod tests {
             dispatch(METHOD_SYS_UMASK, 1, &[1, 2], &mut []),
             -(abi::EINVAL as i64)
         );
+    }
+
+    #[test]
+    fn getrlimit_default_stack_is_one_megabyte() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let req = 3_u32.to_le_bytes(); // RLIMIT_STACK
+        let mut out = [0u8; 16];
+        let n = dispatch(METHOD_SYS_GETRLIMIT, 1, &req, &mut out);
+        assert_eq!(n, 16);
+        let soft = u64::from_le_bytes(out[0..8].try_into().unwrap());
+        let hard = u64::from_le_bytes(out[8..16].try_into().unwrap());
+        assert_eq!(soft, 1024 * 1024);
+        assert_eq!(hard, 1024 * 1024);
+    }
+
+    #[test]
+    fn getrlimit_default_cpu_is_infinity() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let req = 0_u32.to_le_bytes(); // RLIMIT_CPU
+        let mut out = [0u8; 16];
+        assert_eq!(dispatch(METHOD_SYS_GETRLIMIT, 1, &req, &mut out), 16);
+        let soft = u64::from_le_bytes(out[0..8].try_into().unwrap());
+        assert_eq!(soft, u64::MAX, "RLIM_INFINITY");
+    }
+
+    #[test]
+    fn getrlimit_unknown_resource_is_einval() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let req = 99_u32.to_le_bytes();
+        let mut out = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_GETRLIMIT, 1, &req, &mut out),
+            -(abi::EINVAL as i64)
+        );
+    }
+
+    #[test]
+    fn setrlimit_lowers_then_get_reflects() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Lower RLIMIT_NOFILE (id=7) from 1024/1024 to 256/512.
+        let mut req = Vec::new();
+        req.extend_from_slice(&7_u32.to_le_bytes());
+        req.extend_from_slice(&256_u64.to_le_bytes());
+        req.extend_from_slice(&512_u64.to_le_bytes());
+        assert_eq!(dispatch(METHOD_SYS_SETRLIMIT, 1, &req, &mut []), 0);
+
+        let req_get = 7_u32.to_le_bytes();
+        let mut out = [0u8; 16];
+        assert_eq!(dispatch(METHOD_SYS_GETRLIMIT, 1, &req_get, &mut out), 16);
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 256);
+        assert_eq!(u64::from_le_bytes(out[8..16].try_into().unwrap()), 512);
+    }
+
+    #[test]
+    fn setrlimit_raising_hard_is_eperm() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&7_u32.to_le_bytes());
+        req.extend_from_slice(&1024_u64.to_le_bytes());
+        req.extend_from_slice(&(u64::MAX).to_le_bytes());
+        assert_eq!(
+            dispatch(METHOD_SYS_SETRLIMIT, 1, &req, &mut []),
+            -(abi::EPERM as i64)
+        );
+    }
+
+    #[test]
+    fn setrlimit_soft_above_hard_is_einval() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&7_u32.to_le_bytes());
+        req.extend_from_slice(&2048_u64.to_le_bytes()); // soft
+        req.extend_from_slice(&512_u64.to_le_bytes()); // hard
+        assert_eq!(
+            dispatch(METHOD_SYS_SETRLIMIT, 1, &req, &mut []),
+            -(abi::EINVAL as i64)
+        );
+    }
+
+    #[test]
+    fn rlimits_are_per_pid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&7_u32.to_le_bytes());
+        req.extend_from_slice(&100_u64.to_le_bytes());
+        req.extend_from_slice(&200_u64.to_le_bytes());
+        assert_eq!(dispatch(METHOD_SYS_SETRLIMIT, 1, &req, &mut []), 0);
+
+        // Pid 2 still sees default (1024/1024).
+        let req_get = 7_u32.to_le_bytes();
+        let mut out = [0u8; 16];
+        assert_eq!(dispatch(METHOD_SYS_GETRLIMIT, 2, &req_get, &mut out), 16);
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 1024);
     }
 
     #[test]

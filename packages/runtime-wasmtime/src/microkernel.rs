@@ -56,6 +56,8 @@ mod sys_method_id {
     pub const SETRESGID: u32 = 0x1_0009;
     pub const CHDIR: u32 = 0x1_000A;
     pub const GETCWD: u32 = 0x1_000B;
+    pub const GETRLIMIT: u32 = 0x1_000C;
+    pub const SETRLIMIT: u32 = 0x1_000D;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -527,6 +529,72 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         forward_request_bytes(caller, method_id, &buf) as i32
     }
 
+    /// Forward a syscall whose request is `req_bytes` (already
+    /// encoded by the caller) and whose response goes into a user-
+    /// memory buffer `(user_out_ptr, user_out_cap)`. The kernel writes
+    /// into kernel scratch, then we copy from there into user memory.
+    /// Returns the syscall scalar verbatim — callers that want POSIX
+    /// "0 on success" can collapse a positive `rc` themselves.
+    fn forward_request_with_user_response(
+        caller: &mut Caller<'_, UserState>,
+        method_id: u32,
+        req_bytes: &[u8],
+        user_out_ptr: u32,
+        user_out_cap: u32,
+    ) -> i64 {
+        let pid = caller.data().pid;
+        let kernel = caller.data().kernel.clone();
+        let mut k = kernel.borrow_mut();
+        let scratch_ptr = k.scratch_ptr;
+        let scratch_len = k.scratch_len;
+        let kernel_memory = k.memory;
+        let dispatch = k.dispatch.clone();
+        let in_ptr = scratch_ptr;
+        let in_len = req_bytes.len() as u32;
+        let out_ptr = scratch_ptr + in_len;
+        let out_cap = user_out_cap.min(scratch_len.saturating_sub(in_len));
+
+        if !req_bytes.is_empty()
+            && kernel_memory
+                .write(&mut k.store, in_ptr as usize, req_bytes)
+                .is_err()
+        {
+            return -EFAULT;
+        }
+        let rc = match dispatch.call(
+            &mut k.store,
+            (method_id, pid, in_ptr, in_len, out_ptr, out_cap),
+        ) {
+            Ok(rc) => rc,
+            Err(_) => return -EFAULT,
+        };
+        if rc <= 0 {
+            return rc;
+        }
+        let to_copy = (rc as u32).min(out_cap) as usize;
+        if to_copy > 0 {
+            let mut tmp = vec![0u8; to_copy];
+            if kernel_memory
+                .read(&k.store, out_ptr as usize, &mut tmp)
+                .is_err()
+            {
+                return -EFAULT;
+            }
+            drop(k);
+            let user_memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            if user_memory
+                .write(&mut *caller, user_out_ptr as usize, &tmp)
+                .is_err()
+            {
+                return -EFAULT;
+            }
+        }
+        rc
+    }
+
     /// Forward a syscall that fills a response buffer in *user-process*
     /// memory at `(user_out_ptr, user_out_cap)`. The kernel writes the
     /// response into kernel scratch, which we then copy out into user
@@ -651,6 +719,38 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "sys_getcwd",
         |mut caller: Caller<'_, UserState>, out_ptr: u32, out_cap: u32| -> i32 {
             forward_response_to_user(&mut caller, sys_method_id::GETCWD, out_ptr, out_cap)
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_getrlimit",
+        |mut caller: Caller<'_, UserState>, resource: i32, out_ptr: u32| -> i32 {
+            let req = (resource as u32).to_le_bytes();
+            let rc = forward_request_with_user_response(
+                &mut caller,
+                sys_method_id::GETRLIMIT,
+                &req,
+                out_ptr,
+                16,
+            );
+            // Kernel returns bytes-written (16) on success; POSIX
+            // contract is 0 on success / negative on error.
+            if rc == 16 {
+                0
+            } else {
+                rc as i32
+            }
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_setrlimit",
+        |mut caller: Caller<'_, UserState>, resource: i32, soft: i64, hard: i64| -> i32 {
+            let mut req = Vec::with_capacity(20);
+            req.extend_from_slice(&(resource as u32).to_le_bytes());
+            req.extend_from_slice(&(soft as u64).to_le_bytes());
+            req.extend_from_slice(&(hard as u64).to_le_bytes());
+            forward_request_bytes(&mut caller, sys_method_id::SETRLIMIT, &req) as i32
         },
     )?;
     Ok(())
