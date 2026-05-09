@@ -36,20 +36,27 @@ pub const RLIMIT_SLOTS: usize = 8;
 
 // ── File descriptor table ──────────────────────────────────────────────────
 
+/// One end of a pipe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipeEnd {
+    Read,
+    Write,
+}
+
 /// What an open fd refers to. Cloneable so `dup` / `dup2` can share
 /// the same underlying object across multiple fds.
 ///
-/// The pipe / file / socket variants are stubbed out for now; real
-/// shared state for pipes will live in [`Kernel`] (a registry keyed
-/// by id, referenced by id from `FdEntry`) rather than inside the
-/// fd entry itself, so we don't have to thread `Rc<Mutex<…>>` through
-/// `Process`.
+/// Pipe entries refer to a [`PipeBuf`] in [`Kernel::pipes`] by id —
+/// we don't embed `Rc<RefCell<…>>` inside the entry, since `Process`
+/// lives behind a `Mutex<Kernel>` and shared mutable state stays
+/// inside the kernel. Future variants (file, socket) will follow the
+/// same id-into-registry pattern.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FdEntry {
     Stdin,
     Stdout,
     Stderr,
-    // Future: Pipe { id: u64, end: PipeEnd }
+    Pipe { id: u64, end: PipeEnd },
     // Future: File { id: u64 }
     // Future: Socket { id: u64 }
 }
@@ -72,42 +79,31 @@ impl FdTable {
         Self { entries }
     }
 
+    /// Read-only view of an entry. None if `fd` is closed.
     pub fn entry(&self, fd: u32) -> Option<&FdEntry> {
         self.entries.get(&fd)
     }
 
-    /// POSIX `close`: removes the entry; -EBADF if absent.
-    pub fn close(&mut self, fd: u32) -> Option<FdEntry> {
-        self.entries.remove(&fd)
-    }
-
-    /// POSIX `dup`: duplicate `oldfd` to the lowest unused fd number.
-    /// Returns the new fd.
-    pub fn dup(&mut self, oldfd: u32) -> Option<u32> {
-        let entry = self.entries.get(&oldfd).cloned()?;
-        let newfd = self.next_free();
-        self.entries.insert(newfd, entry);
-        Some(newfd)
-    }
-
-    /// POSIX `dup2`: duplicate `oldfd` to exactly `newfd`. If `newfd`
-    /// is already open, it is silently closed first. If `oldfd ==
-    /// newfd` and `oldfd` is open, returns `newfd` without action;
-    /// returns `None` (EBADF) if `oldfd` is not open.
-    pub fn dup2(&mut self, oldfd: u32, newfd: u32) -> Option<u32> {
-        let entry = self.entries.get(&oldfd).cloned()?;
-        if oldfd != newfd {
-            self.entries.insert(newfd, entry);
-        }
-        Some(newfd)
-    }
-
-    fn next_free(&self) -> u32 {
+    /// Lowest unused fd number. Used by `dup` and `pipe` to allocate.
+    pub fn lowest_free_fd(&self) -> u32 {
         let mut n = 0;
         while self.entries.contains_key(&n) {
             n += 1;
         }
         n
+    }
+
+    /// Install `entry` at `fd`, returning the previous occupant (which
+    /// the caller is responsible for cleaning up — pipe refcount,
+    /// future file refcount, etc.).
+    pub fn install(&mut self, fd: u32, entry: FdEntry) -> Option<FdEntry> {
+        self.entries.insert(fd, entry)
+    }
+
+    /// Remove the entry at `fd`. Caller is responsible for any
+    /// refcount cleanup on the returned entry.
+    pub fn remove(&mut self, fd: u32) -> Option<FdEntry> {
+        self.entries.remove(&fd)
     }
 }
 
@@ -156,14 +152,90 @@ impl Default for Process {
     }
 }
 
+// ── Pipe registry ─────────────────────────────────────────────────────────
+
+/// Anonymous-pipe buffer plus refcounts for each end. Lives in
+/// [`Kernel::pipes`]; FdEntry::Pipe references it by id.
+#[derive(Debug)]
+pub struct PipeBuf {
+    /// Bytes queued for the read side. Writers append; the reader drains.
+    pub bytes: std::collections::VecDeque<u8>,
+    /// Number of fds currently referring to the read end. When this
+    /// drops to zero with `bytes` empty and `write_ends > 0`, writes
+    /// see `EPIPE`.
+    pub read_ends: u32,
+    /// Number of fds currently referring to the write end. When this
+    /// drops to zero, reads on a drained buffer see EOF (return 0)
+    /// instead of `EAGAIN`.
+    pub write_ends: u32,
+}
+
+impl PipeBuf {
+    fn new() -> Self {
+        Self {
+            bytes: std::collections::VecDeque::new(),
+            read_ends: 1,
+            write_ends: 1,
+        }
+    }
+
+    pub fn inc_ref(&mut self, end: PipeEnd) {
+        match end {
+            PipeEnd::Read => self.read_ends += 1,
+            PipeEnd::Write => self.write_ends += 1,
+        }
+    }
+
+    /// Decrement the refcount on `end`. Returns true if the buffer
+    /// has no remaining references at all (caller should drop it
+    /// from the registry).
+    pub fn dec_ref(&mut self, end: PipeEnd) -> bool {
+        match end {
+            PipeEnd::Read => self.read_ends = self.read_ends.saturating_sub(1),
+            PipeEnd::Write => self.write_ends = self.write_ends.saturating_sub(1),
+        }
+        self.read_ends == 0 && self.write_ends == 0
+    }
+}
+
 pub struct Kernel {
     processes: BTreeMap<Pid, Process>,
+    pipes: BTreeMap<u64, PipeBuf>,
+    next_pipe_id: u64,
 }
 
 impl Kernel {
     fn new() -> Self {
         Self {
             processes: BTreeMap::new(),
+            pipes: BTreeMap::new(),
+            next_pipe_id: 1,
+        }
+    }
+
+    /// Allocate a fresh pipe buffer with one reader-end and one
+    /// writer-end already counted. Returns the pipe id.
+    pub fn create_pipe(&mut self) -> u64 {
+        let id = self.next_pipe_id;
+        self.next_pipe_id += 1;
+        self.pipes.insert(id, PipeBuf::new());
+        id
+    }
+
+    pub fn pipe_buf_mut(&mut self, id: u64) -> Option<&mut PipeBuf> {
+        self.pipes.get_mut(&id)
+    }
+
+    /// Decrement the refcount on one end of pipe `id` and free the
+    /// buffer if both ends are now closed.
+    pub fn pipe_dec_ref(&mut self, id: u64, end: PipeEnd) {
+        let drop = self
+            .pipes
+            .get_mut(&id)
+            .map(|b| b.dec_ref(end))
+            .unwrap_or(false);
+        if drop {
+            self.pipes.remove(&id);
         }
     }
 

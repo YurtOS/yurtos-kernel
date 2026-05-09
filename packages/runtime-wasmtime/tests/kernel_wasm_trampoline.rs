@@ -45,6 +45,9 @@ const METHOD_SYS_SETRLIMIT: u32 = 0x1_000D;
 const METHOD_SYS_CLOSE: u32 = 0x1_000E;
 const METHOD_SYS_DUP: u32 = 0x1_000F;
 const METHOD_SYS_DUP2: u32 = 0x1_0011;
+const METHOD_SYS_PIPE: u32 = 0x1_0012;
+const METHOD_SYS_READ: u32 = 0x1_0013;
+const METHOD_SYS_WRITE: u32 = 0x1_0014;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -520,6 +523,93 @@ fn user_process_getrlimit_then_setrlimit_round_trip() {
 }
 
 #[test]
+fn user_process_pipe_round_trip_within_one_process() {
+    // The full single-process pipe lifecycle through the trampoline:
+    // pipe() returns two fds, write() to the writer end, read() from
+    // the reader end, close both, second read returns -EBADF.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_pipe"  (func $pipe  (param i32) (result i32)))
+          (import "env" "sys_read"  (func $read  (param i32 i32 i32) (result i32)))
+          (import "env" "sys_write" (func $write (param i32 i32 i32) (result i32)))
+          (import "env" "sys_close" (func $close (param i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 64) "hello pipe")
+          ;; pipe() writes (read_fd, write_fd) to offset 16 (8 bytes).
+          (func (export "do_pipe") (result i32) (call $pipe (i32.const 16)))
+          (func (export "read_fd")  (result i32) (i32.load (i32.const 16)))
+          (func (export "write_fd") (result i32) (i32.load (i32.const 20)))
+          ;; write 10 bytes from offset 64 to write_fd loaded from mem[20].
+          (func (export "do_write") (result i32)
+            (call $write (i32.load (i32.const 20)) (i32.const 64) (i32.const 10)))
+          ;; read up to 16 bytes from read_fd into offset 128.
+          (func (export "do_read") (result i32)
+            (call $read (i32.load (i32.const 16)) (i32.const 128) (i32.const 16)))
+          (func (export "close_writer") (result i32)
+            (call $close (i32.load (i32.const 20))))
+          (func (export "close_reader") (result i32)
+            (call $close (i32.load (i32.const 16)))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    assert_eq!(user.call_export_i32("do_pipe").unwrap(), 0);
+    assert_eq!(user.call_export_i32("read_fd").unwrap(), 3);
+    assert_eq!(user.call_export_i32("write_fd").unwrap(), 4);
+
+    assert_eq!(user.call_export_i32("do_write").unwrap(), 10);
+    assert_eq!(user.call_export_i32("do_read").unwrap(), 10);
+    let got = user.read_memory(128, 10).unwrap();
+    assert_eq!(&got, b"hello pipe");
+
+    // After draining, with writer still open, another read returns
+    // -EAGAIN (Phase 2 nonblocking semantics — kh_yield comes later).
+    assert_eq!(user.call_export_i32("do_read").unwrap(), -11);
+
+    // Close writer; subsequent read sees EOF (0).
+    assert_eq!(user.call_export_i32("close_writer").unwrap(), 0);
+    assert_eq!(user.call_export_i32("do_read").unwrap(), 0);
+
+    // Closing the reader frees the buffer.
+    assert_eq!(user.call_export_i32("close_reader").unwrap(), 0);
+}
+
+#[test]
+fn user_process_pipe_dup_keeps_writer_alive() {
+    // dup() on a pipe end must increment the kernel-side refcount;
+    // closing the original fd should not collapse the buffer.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_pipe"  (func $pipe  (param i32) (result i32)))
+          (import "env" "sys_dup"   (func $dup   (param i32) (result i32)))
+          (import "env" "sys_read"  (func $read  (param i32 i32 i32) (result i32)))
+          (import "env" "sys_close" (func $close (param i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "setup") (result i32)
+            (call $pipe (i32.const 16)))
+          (func (export "dup_writer") (result i32)
+            (call $dup (i32.load (i32.const 20))))
+          (func (export "close_orig_writer") (result i32)
+            (call $close (i32.load (i32.const 20))))
+          (func (export "read_one") (result i32)
+            (call $read (i32.load (i32.const 16)) (i32.const 128) (i32.const 16))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.call_export_i32("setup").unwrap(), 0);
+    let dup_fd = user.call_export_i32("dup_writer").unwrap();
+    assert!(dup_fd > 0, "dup returned a positive fd");
+    // Close original writer; reader still has one writer attached.
+    assert_eq!(user.call_export_i32("close_orig_writer").unwrap(), 0);
+    // Read should be -EAGAIN (writers attached, no data) — not EOF.
+    assert_eq!(user.call_export_i32("read_one").unwrap(), -11);
+}
+
+#[test]
 fn user_process_fd_table_dup_close_lifecycle() {
     // Validates the complete fd-table mechanic through a single user
     // process: default fds 0/1/2 are open, dup() returns the next
@@ -671,6 +761,9 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_close", METHOD_SYS_CLOSE, METHOD_SYS_CLOSE as i64),
         ("sys_dup", METHOD_SYS_DUP, METHOD_SYS_DUP as i64),
         ("sys_dup2", METHOD_SYS_DUP2, METHOD_SYS_DUP2 as i64),
+        ("sys_pipe", METHOD_SYS_PIPE, METHOD_SYS_PIPE as i64),
+        ("sys_read", METHOD_SYS_READ, METHOD_SYS_READ as i64),
+        ("sys_write", METHOD_SYS_WRITE, METHOD_SYS_WRITE as i64),
         (
             "sys_extension_invoke",
             METHOD_SYS_EXTENSION_INVOKE,

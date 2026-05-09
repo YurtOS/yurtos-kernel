@@ -133,6 +133,21 @@ id = 0x1_0011
 kind = "syscall"
 doc = "Duplicate oldfd to exactly newfd, silently closing newfd first if it was open. Request bytes carry two u32s: oldfd, newfd. Returns newfd on success, -EBADF if oldfd is not open."
 
+[method.sys_pipe]
+id = 0x1_0012
+kind = "syscall"
+doc = "Create an anonymous pipe. No request. Response is 8 bytes: read_fd (u32 LE) followed by write_fd (u32 LE). Both fds reference the same kernel-side PipeBuf. Returns 8 on success."
+
+[method.sys_read]
+id = 0x1_0013
+kind = "syscall"
+doc = "Read up to response capacity bytes from fd. Request bytes carry the u32 fd. Returns bytes-read on success, 0 for EOF (writers all closed), -EAGAIN if no data and writers still attached, -EBADF for bad fd, -EINVAL for non-readable fd type."
+
+[method.sys_write]
+id = 0x1_0014
+kind = "syscall"
+doc = "Write payload bytes to fd. Request bytes are: u32 fd LE + payload. Returns bytes-written on success, -EPIPE if all readers have closed (pipes), -EBADF for bad fd, -EINVAL for non-writable fd type. Stdout/stderr writes are routed through kh_log."
+
 [method.sys_extension_invoke]
 id = 0x1_0010
 kind = "syscall"

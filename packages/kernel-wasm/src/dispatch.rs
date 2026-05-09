@@ -50,6 +50,9 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_CLOSE => close_fd(caller_pid, request),
         METHOD_SYS_DUP => dup_fd(caller_pid, request),
         METHOD_SYS_DUP2 => dup2_fd(caller_pid, request),
+        METHOD_SYS_PIPE => pipe(caller_pid, response),
+        METHOD_SYS_READ => read_fd(caller_pid, request, response),
+        METHOD_SYS_WRITE => write_fd(caller_pid, request),
         METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
         _ => -(abi::ENOSYS as i64),
     }
@@ -142,25 +145,45 @@ fn getrlimit(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     })
 }
 
-/// `close(fd: u32) -> 0 / -EBADF`.
+/// `close(fd: u32) -> 0 / -EBADF`. Decrements pipe refcounts when
+/// the closed entry is a pipe end.
 fn close_fd(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([fd]) = read_u32_args::<1>(request) else {
         return -(abi::EINVAL as i64);
     };
-    with_kernel(|k| match k.process_mut(caller_pid).fd_table.close(fd) {
-        Some(_) => 0,
-        None => -(abi::EBADF as i64),
+    with_kernel(|k| {
+        let removed = k.process_mut(caller_pid).fd_table.remove(fd);
+        match removed {
+            None => -(abi::EBADF as i64),
+            Some(crate::kernel::FdEntry::Pipe { id, end }) => {
+                k.pipe_dec_ref(id, end);
+                0
+            }
+            Some(_) => 0,
+        }
     })
 }
 
-/// `dup(oldfd: u32) -> newfd / -EBADF`.
+/// `dup(oldfd: u32) -> newfd / -EBADF`. Increments pipe refcount when
+/// the entry is a pipe end.
 fn dup_fd(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([oldfd]) = read_u32_args::<1>(request) else {
         return -(abi::EINVAL as i64);
     };
-    with_kernel(|k| match k.process_mut(caller_pid).fd_table.dup(oldfd) {
-        Some(newfd) => newfd as i64,
-        None => -(abi::EBADF as i64),
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(oldfd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        if let crate::kernel::FdEntry::Pipe { id, end } = &entry {
+            if let Some(buf) = k.pipe_buf_mut(*id) {
+                buf.inc_ref(*end);
+            }
+        }
+        let p = k.process_mut(caller_pid);
+        let newfd = p.fd_table.lowest_free_fd();
+        p.fd_table.install(newfd, entry);
+        newfd as i64
     })
 }
 
@@ -169,12 +192,148 @@ fn dup2_fd(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([oldfd, newfd]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
-    with_kernel(
-        |k| match k.process_mut(caller_pid).fd_table.dup2(oldfd, newfd) {
-            Some(fd) => fd as i64,
-            None => -(abi::EBADF as i64),
-        },
-    )
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(oldfd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        // POSIX: dup2 of an fd onto itself is a no-op when oldfd is
+        // valid. Skip the refcount dance.
+        if oldfd == newfd {
+            return newfd as i64;
+        }
+        // If newfd was already a pipe end, decrement it before
+        // overwriting (POSIX says newfd is silently closed first).
+        let prev = k.process_mut(caller_pid).fd_table.entry(newfd).cloned();
+        if let Some(crate::kernel::FdEntry::Pipe { id, end }) = prev {
+            k.pipe_dec_ref(id, end);
+        }
+        // Increment the pipe refcount for the new alias.
+        if let crate::kernel::FdEntry::Pipe { id, end } = &entry {
+            if let Some(buf) = k.pipe_buf_mut(*id) {
+                buf.inc_ref(*end);
+            }
+        }
+        k.process_mut(caller_pid).fd_table.install(newfd, entry);
+        newfd as i64
+    })
+}
+
+/// `pipe() -> writes 8 bytes into response (read_fd, write_fd as u32 LE), returns 8 or -ENFILE`.
+fn pipe(caller_pid: u32, response: &mut [u8]) -> i64 {
+    if response.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let id = k.create_pipe();
+        let p = k.process_mut(caller_pid);
+        let read_fd = p.fd_table.lowest_free_fd();
+        p.fd_table.install(
+            read_fd,
+            crate::kernel::FdEntry::Pipe {
+                id,
+                end: crate::kernel::PipeEnd::Read,
+            },
+        );
+        let write_fd = p.fd_table.lowest_free_fd();
+        p.fd_table.install(
+            write_fd,
+            crate::kernel::FdEntry::Pipe {
+                id,
+                end: crate::kernel::PipeEnd::Write,
+            },
+        );
+        response[0..4].copy_from_slice(&read_fd.to_le_bytes());
+        response[4..8].copy_from_slice(&write_fd.to_le_bytes());
+        8
+    })
+}
+
+/// `read(fd: u32) -> bytes_read into response, or -EBADF / 0 EOF / -EAGAIN`.
+fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match entry {
+            crate::kernel::FdEntry::Stdin => 0, // Phase 2: no host stdin source.
+            crate::kernel::FdEntry::Stdout | crate::kernel::FdEntry::Stderr => {
+                -(abi::EINVAL as i64) // not readable
+            }
+            crate::kernel::FdEntry::Pipe { id, end: _ } => {
+                let buf = match k.pipe_buf_mut(id) {
+                    Some(b) => b,
+                    None => return -(abi::EBADF as i64),
+                };
+                if buf.bytes.is_empty() {
+                    if buf.write_ends == 0 {
+                        return 0; // EOF: writer hung up, drain done.
+                    }
+                    // No data, writers still attached. Phase 2 has no
+                    // kh_yield wiring; surface POSIX nonblocking semantics.
+                    return -(abi::EAGAIN as i64);
+                }
+                let take = buf.bytes.len().min(response.len());
+                for (i, b) in buf.bytes.drain(..take).enumerate() {
+                    response[i] = b;
+                }
+                take as i64
+            }
+        }
+    })
+}
+
+/// `write(fd: u32, bytes…) -> bytes_written, or -EBADF / -EPIPE / -EINVAL`.
+/// Request bytes are: u32 fd LE + payload bytes.
+fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes([request[0], request[1], request[2], request[3]]);
+    let payload = &request[4..];
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match entry {
+            crate::kernel::FdEntry::Stdin => -(abi::EINVAL as i64),
+            crate::kernel::FdEntry::Stdout => {
+                if let Ok(s) = std::str::from_utf8(payload) {
+                    kh::log(kh::LogSeverity::Info, s);
+                }
+                payload.len() as i64
+            }
+            crate::kernel::FdEntry::Stderr => {
+                if let Ok(s) = std::str::from_utf8(payload) {
+                    kh::log(kh::LogSeverity::Error, s);
+                }
+                payload.len() as i64
+            }
+            crate::kernel::FdEntry::Pipe {
+                id,
+                end: crate::kernel::PipeEnd::Write,
+            } => {
+                let buf = match k.pipe_buf_mut(id) {
+                    Some(b) => b,
+                    None => return -(abi::EBADF as i64),
+                };
+                if buf.read_ends == 0 {
+                    return -(abi::EPIPE as i64);
+                }
+                buf.bytes.extend(payload);
+                payload.len() as i64
+            }
+            crate::kernel::FdEntry::Pipe {
+                end: crate::kernel::PipeEnd::Read,
+                ..
+            } => -(abi::EBADF as i64), // can't write to read end
+        }
+    })
 }
 
 /// `setrlimit(resource: u32, soft: u64, hard: u64) -> 0 / -EINVAL / -EPERM`.
@@ -630,6 +789,174 @@ mod tests {
         assert_eq!(
             dispatch(METHOD_SYS_CLOSE, 2, &0_u32.to_le_bytes(), &mut []),
             -(abi::EBADF as i64)
+        );
+    }
+
+    #[test]
+    fn pipe_allocates_two_consecutive_fds_and_round_trips_bytes() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // pipe() with default fd table {0,1,2} → read on 3, write on 4.
+        let mut fds = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds), 8);
+        let read_fd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let write_fd = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+        assert_eq!(read_fd, 3);
+        assert_eq!(write_fd, 4);
+
+        // Write "hello" to write_fd.
+        let mut wreq = Vec::new();
+        wreq.extend_from_slice(&write_fd.to_le_bytes());
+        wreq.extend_from_slice(b"hello");
+        assert_eq!(dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []), 5);
+
+        // Read it back from read_fd.
+        let mut buf = [0u8; 16];
+        let n = dispatch(METHOD_SYS_READ, 1, &read_fd.to_le_bytes(), &mut buf);
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..5], b"hello");
+    }
+
+    #[test]
+    fn pipe_read_with_no_data_and_writers_attached_is_eagain() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut fds = [0u8; 8];
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds);
+        let read_fd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let mut buf = [0u8; 16];
+        // Empty buffer, writer still open → -EAGAIN.
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &read_fd.to_le_bytes(), &mut buf),
+            -(abi::EAGAIN as i64)
+        );
+    }
+
+    #[test]
+    fn pipe_read_after_writer_closed_and_drained_is_eof() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut fds = [0u8; 8];
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds);
+        let read_fd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let write_fd = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+
+        // Close the writer (no data was written).
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &write_fd.to_le_bytes(), &mut []),
+            0
+        );
+        let mut buf = [0u8; 16];
+        // Drained + no writers → 0 (EOF), not EAGAIN.
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &read_fd.to_le_bytes(), &mut buf),
+            0
+        );
+    }
+
+    #[test]
+    fn pipe_write_after_all_readers_closed_is_epipe() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut fds = [0u8; 8];
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds);
+        let read_fd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let write_fd = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &read_fd.to_le_bytes(), &mut []),
+            0
+        );
+        let mut wreq = Vec::new();
+        wreq.extend_from_slice(&write_fd.to_le_bytes());
+        wreq.extend_from_slice(b"x");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []),
+            -(abi::EPIPE as i64)
+        );
+    }
+
+    #[test]
+    fn pipe_dup_increments_refcount_so_close_does_not_drop_buffer() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut fds = [0u8; 8];
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds);
+        let read_fd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let write_fd = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+
+        // Dup the writer so we have two write-end fds.
+        let dup_writer = dispatch(METHOD_SYS_DUP, 1, &write_fd.to_le_bytes(), &mut []);
+        assert!(dup_writer > 0);
+        let dup_writer = dup_writer as u32;
+
+        // Close the original writer; the second one keeps the pipe open.
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &write_fd.to_le_bytes(), &mut []),
+            0
+        );
+
+        // Reader should still see EAGAIN (writers attached), not EOF.
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &read_fd.to_le_bytes(), &mut buf),
+            -(abi::EAGAIN as i64)
+        );
+
+        // Closing the dup_writer drops the last write-end → reader EOF.
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &dup_writer.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &read_fd.to_le_bytes(), &mut buf),
+            0
+        );
+    }
+
+    #[test]
+    fn pipe_partial_read_returns_min_of_buffer_and_response() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut fds = [0u8; 8];
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds);
+        let read_fd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let write_fd = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+
+        let mut wreq = Vec::new();
+        wreq.extend_from_slice(&write_fd.to_le_bytes());
+        wreq.extend_from_slice(b"abcdefghij");
+        dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []);
+
+        // Small response buffer → reads partial.
+        let mut small = [0u8; 4];
+        let n = dispatch(METHOD_SYS_READ, 1, &read_fd.to_le_bytes(), &mut small);
+        assert_eq!(n, 4);
+        assert_eq!(&small, b"abcd");
+
+        // Subsequent read drains the rest.
+        let mut rest = [0u8; 16];
+        let n = dispatch(METHOD_SYS_READ, 1, &read_fd.to_le_bytes(), &mut rest);
+        assert_eq!(n, 6);
+        assert_eq!(&rest[..6], b"efghij");
+    }
+
+    #[test]
+    fn write_to_stdout_routes_to_log_sink() {
+        // sys_write to fd 1 (Stdout) feeds kh_log; the native test
+        // path's kh stub is a no-op, so we just verify it doesn't
+        // error and reports the byte count.
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut wreq = Vec::new();
+        wreq.extend_from_slice(&1_u32.to_le_bytes());
+        wreq.extend_from_slice(b"hello stdout");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []),
+            "hello stdout".len() as i64
+        );
+    }
+
+    #[test]
+    fn read_from_stdin_returns_eof_in_phase_2() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &0_u32.to_le_bytes(), &mut buf),
+            0
         );
     }
 

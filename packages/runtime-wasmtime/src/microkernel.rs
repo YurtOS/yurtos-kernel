@@ -61,6 +61,9 @@ mod sys_method_id {
     pub const CLOSE: u32 = 0x1_000E;
     pub const DUP: u32 = 0x1_000F;
     pub const DUP2: u32 = 0x1_0011;
+    pub const PIPE: u32 = 0x1_0012;
+    pub const READ: u32 = 0x1_0013;
+    pub const WRITE: u32 = 0x1_0014;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -778,6 +781,66 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(oldfd as u32).to_le_bytes());
             req.extend_from_slice(&(newfd as u32).to_le_bytes());
             forward_request_bytes(&mut caller, sys_method_id::DUP2, &req) as i32
+        },
+    )?;
+    // POSIX `pipe(int fd[2])`: caller provides a 2-int buffer, kernel
+    // fills (read_fd, write_fd). Returns 0 on success / negated errno.
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_pipe",
+        |mut caller: Caller<'_, UserState>, out_ptr: u32| -> i32 {
+            let rc = forward_request_with_user_response(
+                &mut caller,
+                sys_method_id::PIPE,
+                &[],
+                out_ptr,
+                8,
+            );
+            if rc == 8 {
+                0
+            } else {
+                rc as i32
+            }
+        },
+    )?;
+    // POSIX `read(fd, buf, count)`: write up to count bytes from fd
+    // into user buffer at out_ptr. Returns bytes read or negated errno.
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_read",
+        |mut caller: Caller<'_, UserState>, fd: i32, out_ptr: u32, count: u32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            forward_request_with_user_response(
+                &mut caller,
+                sys_method_id::READ,
+                &req,
+                out_ptr,
+                count,
+            ) as i32
+        },
+    )?;
+    // POSIX `write(fd, buf, count)`: read count bytes from user_buf,
+    // write them to fd. Returns bytes written or negated errno.
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_write",
+        |mut caller: Caller<'_, UserState>, fd: i32, buf_ptr: u32, count: u32| -> i32 {
+            // Stage `(u32 fd LE | payload bytes)` in kernel scratch.
+            let user_memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -(EFAULT as i32),
+            };
+            let mut payload = vec![0u8; count as usize];
+            if user_memory
+                .read(&caller, buf_ptr as usize, &mut payload)
+                .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+            let mut req = Vec::with_capacity(4 + payload.len());
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&payload);
+            forward_request_bytes(&mut caller, sys_method_id::WRITE, &req) as i32
         },
     )?;
     Ok(())

@@ -5,5 +5,7 @@
 
 pub const EPERM: i32 = 1;
 pub const EBADF: i32 = 9;
+pub const EAGAIN: i32 = 11;
 pub const EINVAL: i32 = 22;
 pub const ENOSYS: i32 = 38;
+pub const EPIPE: i32 = 32;
