@@ -9,9 +9,40 @@
  * the contract (`kernel_dispatch` + `kh_*` imports) is genuinely
  * runtime-agnostic.
  *
- * Deno is the testing surrogate for the eventual browser microkernel:
- * the import shapes and the user-process linking flow are identical;
- * a browser microkernel adds JSPI / asyncify suspension on top.
+ * Deno is the testing surrogate for the browser microkernel: the
+ * import shapes and user-process linking flow are identical. A
+ * browser version reuses this code modulo `Deno.readFile` → `fetch`
+ * and `Deno.Command` removal.
+ *
+ * Async / suspension (future work — *do not reinvent*):
+ *
+ *   The TS kernel ships `AsyncBridge` at
+ *   `packages/kernel/src/async-bridge.ts`, with `jspi`, `asyncify`,
+ *   and `threads` modes already implemented and in production for the
+ *   user-process loaders, setjmp/longjmp, and the process manager.
+ *   The sandboxed-kernel reuses it verbatim:
+ *
+ *     - kh_* imports that go async become `bridge.wrapImport(asyncFn)`.
+ *     - kernel_dispatch is wrapped via `bridge.wrapExport(...)` so
+ *       callers await the result.
+ *     - kernel.wasm gets an `-asyncify` variant matching
+ *       `bridge.binarySuffix` for Safari / Bun.
+ *
+ *   Two architectural absolutes for JS hosts (irrelevant on native
+ *   wasmtime, where Tokio + epoch interruption cover everything):
+ *
+ *     - Cooperative multitasking *requires* JSPI or asyncify. WASM on
+ *       JS engines has no preemption; suspending one process to run
+ *       another is impossible without one of those mechanisms.
+ *     - setjmp / longjmp *requires* asyncify, regardless of whether
+ *       JSPI is otherwise active — the unwind/rewind machinery is
+ *       the long-jump. (See `needsSetjmpBridge` in
+ *       `process/manager.ts`.)
+ *
+ *   The current sync path here is correct because no `kh_*` is async
+ *   yet and there's only one user process at a time. When the first
+ *   blocking syscall (kh_yield, sys_recv, sys_wait) or the second
+ *   concurrent process lands, this file plugs into AsyncBridge.
  *
  * See `docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md`.
  */

@@ -174,20 +174,67 @@ caller-provided fixed-size out buffers.
 
 ## Suspension Model
 
+The sandboxed-kernel reuses the existing `AsyncBridge` infrastructure
+in `packages/kernel/src/async-bridge.ts` rather than reinventing it.
+That module already implements all three modes the migration needs —
+`jspi`, `asyncify` (with snapshot/fork), and `threads` — and is
+currently driving the TS kernel's user-process loaders, setjmp/longjmp,
+and process manager. The Rust kernel.wasm + microkernel split slots
+into the same bridge:
+
 - **Native wasmtime:** Both the process and the kernel wasm run in
   Tokio-driven async stores with `epoch_interruption` enabled. Syscalls
   from process execute inline; the kernel's `kh_yield` is a real
-  `tokio::task::yield_now`.
-- **Browser, JSPI:** The host trampoline is a JSPI-suspendable function.
-  Each layer that needs to wait (user→kernel, kernel→host) suspends its
-  caller and resumes when the result is available.
-- **Browser, asyncify fallback:** The kernel.wasm is post-processed with
-  Binaryen's asyncify pass. User wasm is asyncified by the existing
-  toolchain. Cost is ~30% size and per-call overhead; documented as a
-  Safari-only fallback.
-- **Deno:** Same shape as browser-with-JSPI. Deno gates JSPI behind
-  `--v8-flags=--experimental-wasm-jspi`; document the flag in the
-  microkernel-deno README.
+  `tokio::task::yield_now`. No JS-side bridge required.
+- **Browser / Deno, JSPI:** the microkernel-side `kh_*` host functions
+  that perform async work are wrapped with `bridge.wrapImport(asyncFn)`,
+  which returns a `WebAssembly.Suspending`. The `kernel_dispatch`
+  export is wrapped with `bridge.wrapExport(...)`, which returns
+  `WebAssembly.promising(...)` so callers `await` the result. JSPI is
+  unflagged in Deno 1.40+ and Chrome 137+.
+- **Browser, asyncify fallback:** the kernel.wasm artifact is built
+  with `wasm-opt --asyncify --pass-arg=asyncify-imports@<list>`
+  emitting a `-asyncify` suffixed binary. The bridge's
+  `AsyncifyAsyncBridge` drives the unwind/rewind loop on the JS side,
+  including the snapshot/fork support already used for setjmp/longjmp.
+  Safari and Bun ride this fallback.
+- **Threads (future):** wasi-threads + `SharedArrayBuffer` +
+  `Atomics.wait`. True parallelism with no JSPI/asyncify needed; the
+  bridge already has the protocol stubbed.
+
+When the first blocking `kh_*` call lands (likely `kh_yield` for
+pipe/wait), the microkernel-deno integrates `AsyncBridge`. The
+existing implementation stays — the migration's job is to consume it,
+not replace it.
+
+### Two architectural absolutes for JS-hosted backends
+
+Both of these are **non-negotiable** on browser / Deno; native
+wasmtime is unaffected because epoch interruption + Tokio cover them.
+
+1. **Cooperative multitasking requires JSPI or asyncify.** WebAssembly
+   on JS engines has no preemption: a process that doesn't make a host
+   call cannot be interrupted. The kernel's scheduler — for any
+   scenario beyond a single user process running to completion —
+   needs to suspend a running process and resume another. The only
+   primitives JS provides for that are `WebAssembly.Suspending` /
+   `promising` (JSPI) and Binaryen's asyncify unwind/rewind. There is
+   no third option. Engines that lack JSPI (Safari, Bun) must run
+   asyncify-built artifacts.
+
+2. **setjmp/longjmp requires asyncify.** Even on engines with JSPI,
+   POSIX `setjmp`/`longjmp` semantics on wasm are implemented via the
+   asyncify pass — the unwind/rewind machinery *is* the long-jump.
+   JSPI doesn't replace this. The TS kernel today gates a setjmp
+   bridge per-module via `needsSetjmpBridge(module)` in
+   `process/manager.ts`; the sandboxed-kernel inherits the same
+   discipline. Modules that need setjmp/longjmp are built with
+   asyncify regardless of which suspension mode is otherwise active.
+
+Consequence for the build pipeline: kernel.wasm and any user-process
+binary that uses setjmp/longjmp must have an `-asyncify` variant
+available. The microkernel selects the right artifact at instantiation
+time (matches the existing `binarySuffix` logic on `AsyncBridge`).
 
 ## Memory & Concurrency
 
