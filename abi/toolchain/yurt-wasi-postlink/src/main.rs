@@ -1,20 +1,31 @@
 //! Post-link .wasm rewriter. See Cargo.toml for the design; this file
 //! is the glue.
 //!
-//! Each `Shim` entry pairs:
-//!   - A stable legacy-mangling PREFIX for the target stdlib function
-//!     (the final 17h<hash>E suffix is build-dependent; we match anything
-//!     after the prefix).
-//!   - The stable `#[export_name = ...]` identifier of the yurt-wasi-shims
-//!     replacement that the consumer crate must have linked in.
+//! Two operating modes:
 //!
-//! On each shim: look up both functions in the module, assert their wasm
-//! type signatures are equal, rewrite the target's body to call the
-//! replacement and return, leaving all other functions untouched.
+//! 1. **Default (shim rewrite).** Each `Shim` entry pairs a stable
+//!    legacy-mangling PREFIX for a panicky Rust stdlib function (the
+//!    final 17h<hash>E suffix is build-dependent; we match anything
+//!    after the prefix) with the stable `#[export_name = ...]` identifier
+//!    of the yurt-wasi-shims replacement that the consumer crate must
+//!    have linked in. We look up both functions in the module, assert
+//!    their wasm type signatures are equal, rewrite the target's body
+//!    to call the replacement and return, leaving all other functions
+//!    untouched.
+//!
+//! 2. **`--side-module`.** Validate the wasm-ld-emitted `dylink.0`
+//!    custom section (per the WebAssembly tool-conventions
+//!    DynamicLinking spec) and emit a `<output>.yurtmeta.json` sidecar
+//!    listing the side module's SONAME, exported symbols, declared
+//!    dependencies, and dylink memory/table requirements. Used by the
+//!    Phase 1 shared-library loader (see
+//!    docs/superpowers/specs/2026-05-09-shared-libraries-design.md).
+
+pub mod side_module;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use walrus::{FunctionBuilder, FunctionId, Module};
 
 /// Table of stdlib fns we rewrite post-link. Mangled prefix (without the
@@ -24,11 +35,11 @@ const SHIMS: &[(&str, &str)] = &[("_ZN3std3env8temp_dir", "__yurt_wasi_shim_env_
 #[derive(Parser, Debug)]
 #[command(
     name = "yurt-wasi-postlink",
-    about = "Rewrite wasip1 stdlib-panic functions in a .wasm to call yurt-wasi-shims replacements."
+    about = "Post-link .wasm rewriter (stdlib-shim rewrite + Phase 1 side-module validation)."
 )]
 struct Args {
-    /// Input .wasm file (must still contain its `name` custom section;
-    /// build with `strip = false`).
+    /// Input .wasm file (in shim-rewrite mode, must still contain its
+    /// `name` custom section; build with `strip = false`).
     #[arg(short, long)]
     input: PathBuf,
 
@@ -36,15 +47,113 @@ struct Args {
     #[arg(short, long)]
     output: PathBuf,
 
+    /// Treat the input as a side module: validate the `dylink.0` custom
+    /// section, emit a `<output>.yurtmeta.json` sidecar, and skip the
+    /// stdlib-shim rewrite.
+    #[arg(long)]
+    side_module: bool,
+
+    /// SONAME to record in the side-module manifest. Defaults to the
+    /// input file's basename with any leading `lib` and trailing `.wasm`
+    /// stripped (so `libfoo.wasm` → `foo`). Only meaningful with
+    /// `--side-module`.
+    #[arg(long, requires = "side_module")]
+    soname: Option<String>,
+
+    /// Output path for the side-module manifest. Defaults to
+    /// `<output>.yurtmeta.json`. Only meaningful with `--side-module`.
+    #[arg(long, requires = "side_module")]
+    meta_out: Option<PathBuf>,
+
     /// Exit successfully if no target symbols are found (useful for
     /// blanket application across crates that don't all use panicky fns).
+    /// Only meaningful in the default (shim-rewrite) mode.
     #[arg(long)]
     allow_missing: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.side_module {
+        run_side_module(&args)
+    } else {
+        run_shim_rewrite(&args)
+    }
+}
 
+fn run_side_module(args: &Args) -> Result<()> {
+    let mut module = Module::from_file(&args.input)
+        .with_context(|| format!("loading {}", args.input.display()))?;
+
+    let dylink = module
+        .customs
+        .iter()
+        .find_map(|(_id, sec)| {
+            if sec.name() == "dylink.0" {
+                let raw = sec
+                    .as_any()
+                    .downcast_ref::<walrus::RawCustomSection>()?;
+                Some(raw.data.clone())
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "{} is missing the `dylink.0` custom section. \
+                 yurt-cc -shared was supposed to emit one. \
+                 Either the link did not pass --experimental-pic or the input is not a side module.",
+                args.input.display()
+            )
+        })?;
+
+    let info = side_module::parse_dylink_0(&dylink)
+        .with_context(|| format!("parsing dylink.0 in {}", args.input.display()))?;
+
+    let exports = side_module::collect_dynamic_exports(&module);
+
+    let soname = args
+        .soname
+        .clone()
+        .unwrap_or_else(|| side_module::soname_from_path(&args.input));
+
+    let meta = side_module::Manifest {
+        soname,
+        exports,
+        deps: info.needed,
+        mem_size: info.mem_size,
+        mem_align: info.mem_align,
+        table_size: info.table_size,
+        table_align: info.table_align,
+    };
+
+    let meta_path = args
+        .meta_out
+        .clone()
+        .unwrap_or_else(|| default_meta_path(&args.output));
+
+    side_module::write_manifest(&meta, &meta_path)
+        .with_context(|| format!("writing {}", meta_path.display()))?;
+
+    module
+        .emit_wasm_file(&args.output)
+        .with_context(|| format!("writing {}", args.output.display()))?;
+
+    eprintln!(
+        "yurt-wasi-postlink --side-module: wrote {} (+ {})",
+        args.output.display(),
+        meta_path.display()
+    );
+    Ok(())
+}
+
+fn default_meta_path(output: &Path) -> PathBuf {
+    let mut s = output.as_os_str().to_owned();
+    s.push(".yurtmeta.json");
+    PathBuf::from(s)
+}
+
+fn run_shim_rewrite(args: &Args) -> Result<()> {
     let mut module = Module::from_file(&args.input)
         .with_context(|| format!("loading {}", args.input.display()))?;
 
