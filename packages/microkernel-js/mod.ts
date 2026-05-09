@@ -90,6 +90,8 @@ export const METHOD = {
   SYS_SCHED_YIELD: 0x1_001D,
   SYS_NANOSLEEP: 0x1_001E,
   SYS_OPEN: 0x1_001F,
+  SYS_LSEEK: 0x1_0020,
+  SYS_FSTAT: 0x1_0021,
 } as const;
 
 export const KERNEL_PID = 0;

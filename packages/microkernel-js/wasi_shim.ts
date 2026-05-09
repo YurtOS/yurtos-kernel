@@ -152,8 +152,28 @@ export function buildWasiShim(
     return errnoFromKernel(rc);
   };
 
-  // ── fd_seek: ESPIPE; fd_fdstat_get: minimal CHARACTER_DEVICE ──
-  const fd_seek = (): number => ESPIPE;
+  // ── fd_seek: route to sys_lseek ────────────────────────────────
+  const fd_seek = (
+    fd: number,
+    offset: bigint | number,
+    whence: number,
+    newOffsetPtr: number,
+  ): number => {
+    const off64 = typeof offset === "bigint" ? offset : BigInt(offset);
+    const req = new Uint8Array(16);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, fd >>> 0, true);
+    view.setBigInt64(4, off64, true);
+    view.setUint32(12, whence >>> 0, true);
+    const { rc, response } = kernel.syscall(METHOD.SYS_LSEEK, pid, req, 8);
+    const n = Number(rc);
+    if (n < 0) {
+      const err = errnoFromKernel(n);
+      return err === EBADF ? ESPIPE : err;
+    }
+    new Uint8Array(um(), newOffsetPtr, 8).set(response.subarray(0, 8));
+    return 0;
+  };
   const fd_fdstat_get = (fd: number, statbuf: number): number => {
     const buf = new Uint8Array(um(), statbuf, 24);
     buf.fill(0);
@@ -251,7 +271,22 @@ export function buildWasiShim(
   // get invoked by wasi-libc but aren't yet implemented. std::fs::read
   // calls fd_filestat_get to size the buffer; ENOSYS is fine since std
   // falls back to chunked reads.
-  const fd_filestat_get = (_fd: number, _filestatPtr: number): number => ENOSYS;
+  const fd_filestat_get = (fd: number, filestatPtr: number): number => {
+    const req = new Uint8Array(4);
+    new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+    const { rc, response } = kernel.syscall(METHOD.SYS_FSTAT, pid, req, 16);
+    const n = Number(rc);
+    if (n !== 16) return errnoFromKernel(n);
+    const size = new DataView(response.buffer, response.byteOffset).getBigUint64(0, true);
+    const filetype = new DataView(response.buffer, response.byteOffset).getUint32(8, true);
+    const buf = new Uint8Array(64);
+    const view = new DataView(buf.buffer);
+    buf[16] = filetype & 0xff;
+    view.setBigUint64(24, 1n, true); // nlink = 1
+    view.setBigUint64(32, size, true);
+    new Uint8Array(um(), filestatPtr, 64).set(buf);
+    return 0;
+  };
   const path_filestat_get = (
     _dirfd: number,
     _flags: number,

@@ -59,6 +59,8 @@ const METHOD_SYS_SIGACTION: u32 = 0x1_001C;
 const METHOD_SYS_SCHED_YIELD: u32 = 0x1_001D;
 const METHOD_SYS_NANOSLEEP: u32 = 0x1_001E;
 const METHOD_SYS_OPEN: u32 = 0x1_001F;
+const METHOD_SYS_LSEEK: u32 = 0x1_0020;
+const METHOD_SYS_FSTAT: u32 = 0x1_0021;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -807,6 +809,8 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_NANOSLEEP as i64,
         ),
         ("sys_open", METHOD_SYS_OPEN, METHOD_SYS_OPEN as i64),
+        ("sys_lseek", METHOD_SYS_LSEEK, METHOD_SYS_LSEEK as i64),
+        ("sys_fstat", METHOD_SYS_FSTAT, METHOD_SYS_FSTAT as i64),
     ] {
         let entry = methods
             .get(name)

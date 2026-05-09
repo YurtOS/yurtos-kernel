@@ -57,11 +57,11 @@ pub enum FdEntry {
     Stdout,
     Stderr,
     Pipe { id: u64, end: PipeEnd },
-    /// Read-only handle into the in-memory ramfs. `id` references a
-    /// `RamfsFile` in `Kernel::files`; `offset` is the byte cursor.
-    /// Phase 2 keeps the offset per-fd; the OFD registry that lets
-    /// dup'd fds share one cursor lands later.
-    File { id: u64, offset: u64 },
+    /// Read-only handle into the in-memory ramfs. `ofd_id` references
+    /// an [`OpenFileDescription`] in `Kernel::ofds`; the OFD owns the
+    /// byte cursor and (once we add it) flags. Multiple fds — created
+    /// via dup/dup2 — share the same OFD, matching POSIX semantics.
+    File { ofd_id: u64 },
     // Future: Socket { id: u64 }
 }
 
@@ -263,6 +263,18 @@ pub struct RamfsFile {
     pub content: Vec<u8>,
 }
 
+/// One open-file-description: the POSIX object that holds a cursor
+/// (and, eventually, open flags) for a particular `open()` call.
+/// Multiple fds — created via dup/dup2 — point at the same OFD and
+/// therefore share its cursor. `refs` is the count of live fds
+/// referencing this OFD; when it hits zero the OFD is freed.
+#[derive(Debug)]
+pub struct OpenFileDescription {
+    pub file_id: u64,
+    pub offset: u64,
+    pub refs: u32,
+}
+
 pub struct Kernel {
     processes: BTreeMap<Pid, Process>,
     pipes: BTreeMap<u64, PipeBuf>,
@@ -270,6 +282,8 @@ pub struct Kernel {
     files: BTreeMap<u64, RamfsFile>,
     path_to_file: BTreeMap<Vec<u8>, u64>,
     next_file_id: u64,
+    ofds: BTreeMap<u64, OpenFileDescription>,
+    next_ofd_id: u64,
 }
 
 impl Kernel {
@@ -281,6 +295,52 @@ impl Kernel {
             files: BTreeMap::new(),
             path_to_file: BTreeMap::new(),
             next_file_id: 1,
+            ofds: BTreeMap::new(),
+            next_ofd_id: 1,
+        }
+    }
+
+    /// Allocate a fresh OFD for `file_id`, with refcount 1 and offset
+    /// 0. Returns the OFD id.
+    pub fn create_ofd(&mut self, file_id: u64) -> u64 {
+        let id = self.next_ofd_id;
+        self.next_ofd_id += 1;
+        self.ofds.insert(
+            id,
+            OpenFileDescription {
+                file_id,
+                offset: 0,
+                refs: 1,
+            },
+        );
+        id
+    }
+
+    pub fn ofd_mut(&mut self, id: u64) -> Option<&mut OpenFileDescription> {
+        self.ofds.get_mut(&id)
+    }
+
+    pub fn ofd(&self, id: u64) -> Option<&OpenFileDescription> {
+        self.ofds.get(&id)
+    }
+
+    /// Increment the refcount on an OFD (dup / dup2).
+    pub fn ofd_inc_ref(&mut self, id: u64) {
+        if let Some(ofd) = self.ofds.get_mut(&id) {
+            ofd.refs += 1;
+        }
+    }
+
+    /// Decrement the refcount. Frees the OFD when it hits 0.
+    pub fn ofd_dec_ref(&mut self, id: u64) {
+        let drop = if let Some(ofd) = self.ofds.get_mut(&id) {
+            ofd.refs = ofd.refs.saturating_sub(1);
+            ofd.refs == 0
+        } else {
+            false
+        };
+        if drop {
+            self.ofds.remove(&id);
         }
     }
 
@@ -362,6 +422,8 @@ pub fn reset_for_tests() {
     k.files.clear();
     k.path_to_file.clear();
     k.next_file_id = 1;
+    k.ofds.clear();
+    k.next_ofd_id = 1;
 }
 
 /// Native unit tests share the same `static KERNEL` and run in

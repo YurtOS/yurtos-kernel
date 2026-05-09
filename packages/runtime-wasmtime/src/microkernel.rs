@@ -76,6 +76,8 @@ mod sys_method_id {
     pub const SCHED_YIELD: u32 = 0x1_001D;
     pub const NANOSLEEP: u32 = 0x1_001E;
     pub const OPEN: u32 = 0x1_001F;
+    pub const LSEEK: u32 = 0x1_0020;
+    pub const FSTAT: u32 = 0x1_0021;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -1230,6 +1232,44 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "sys_open",
         |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32| -> i32 {
             forward_user_ptr_len(&mut caller, sys_method_id::OPEN, path_ptr, path_len)
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_lseek",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         offset: i64,
+         whence: i32,
+         out_ptr: u32|
+         -> i32 {
+            let mut req = Vec::with_capacity(16);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&offset.to_le_bytes());
+            req.extend_from_slice(&(whence as u32).to_le_bytes());
+            let rc = forward_request_with_user_response(
+                &mut caller,
+                sys_method_id::LSEEK,
+                &req,
+                out_ptr,
+                8,
+            );
+            if rc == 8 { 0 } else { rc as i32 }
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_fstat",
+        |mut caller: Caller<'_, UserState>, fd: i32, out_ptr: u32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            let rc = forward_request_with_user_response(
+                &mut caller,
+                sys_method_id::FSTAT,
+                &req,
+                out_ptr,
+                16,
+            );
+            if rc == 16 { 0 } else { rc as i32 }
         },
     )?;
     Ok(())

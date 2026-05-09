@@ -305,16 +305,50 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         },
     )?;
 
-    // ── fd_seek → ESPIPE (we don't seek streams) ───────────────────
+    // ── fd_seek → sys_lseek ────────────────────────────────────────
+    // WASI whence: 0=SET, 1=CUR, 2=END (matches POSIX). The kernel's
+    // sys_lseek refuses non-file fds with -EBADF; for stdio/pipe we
+    // map that to ESPIPE which is the WASI errno user code expects.
     linker.func_wrap(
         WASI,
         "fd_seek",
-        |_caller: Caller<'_, UserState>,
-         _fd: i32,
-         _offset: i64,
-         _whence: i32,
-         _new_offset_ptr: u32|
-         -> i32 { ESPIPE },
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         offset: i64,
+         whence: i32,
+         new_offset_ptr: u32|
+         -> i32 {
+            let mut req = Vec::with_capacity(16);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&offset.to_le_bytes());
+            req.extend_from_slice(&(whence as u32).to_le_bytes());
+            let mut resp = [0u8; 8];
+            let rc = crate::microkernel::trampoline_request_with_response(
+                &mut caller,
+                METHOD_LSEEK,
+                &req,
+                &mut resp,
+            );
+            if rc < 0 {
+                // EBADF on a stream → ESPIPE for WASI compliance.
+                let err = errno_from_kernel(rc);
+                return if err == EBADF { ESPIPE } else { err };
+            }
+            // Spec: write the new offset as u64 LE into *new_offset_ptr.
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return EINVAL,
+            };
+            // sys_lseek returns i64; widen to u64 for WASI.
+            let new_off = i64::from_le_bytes(resp);
+            if memory
+                .write(&mut caller, new_offset_ptr as usize, &(new_off as u64).to_le_bytes())
+                .is_err()
+            {
+                return EINVAL;
+            }
+            0
+        },
     )?;
 
     // ── fd_fdstat_get → minimal stat for stream fds (0/1/2) ───────
@@ -493,14 +527,43 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         },
     )?;
 
-    // ── fd_filestat_get → ENOSYS (typed stub) ───────────────────────
-    // std::fs::read calls fd_filestat_get to learn the file size for
-    // a precise allocation; if it errors, std falls back to chunked
-    // reads. Phase 2 ramfs returns ENOSYS to use the fallback path.
+    // ── fd_filestat_get → sys_fstat (precise size) ──────────────────
+    // WASI filestat layout (64 bytes): dev(u64) ino(u64) filetype(u8)
+    // pad(7) nlink(u64) size(u64) atim(u64) mtim(u64) ctim(u64). We
+    // fill size + filetype from sys_fstat; everything else stays 0.
     linker.func_wrap(
         WASI,
         "fd_filestat_get",
-        |_caller: Caller<'_, UserState>, _fd: i32, _filestat_ptr: u32| -> i32 { ENOSYS },
+        |mut caller: Caller<'_, UserState>, fd: i32, filestat_ptr: u32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            let mut resp = [0u8; 16];
+            let rc = crate::microkernel::trampoline_request_with_response(
+                &mut caller,
+                METHOD_FSTAT,
+                &req,
+                &mut resp,
+            );
+            if rc != 16 {
+                return errno_from_kernel(rc);
+            }
+            let size = u64::from_le_bytes(resp[0..8].try_into().unwrap());
+            let filetype = u32::from_le_bytes(resp[8..12].try_into().unwrap()) as u8;
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return EINVAL,
+            };
+            let mut buf = [0u8; 64];
+            // dev / ino zeros are fine.
+            buf[16] = filetype;
+            // nlink at offset 24: we report 1.
+            buf[24..32].copy_from_slice(&1u64.to_le_bytes());
+            buf[32..40].copy_from_slice(&size.to_le_bytes());
+            // atim/mtim/ctim left zero.
+            if memory.write(&mut caller, filestat_ptr as usize, &buf).is_err() {
+                return EINVAL;
+            }
+            0
+        },
     )?;
 
     // ── path_filestat_get → ENOSYS (typed stub) ─────────────────────
@@ -567,6 +630,8 @@ const METHOD_READ: u32 = 0x1_0013;
 const METHOD_CLOSE: u32 = 0x1_000E;
 const METHOD_CLOCK_GETTIME: u32 = 0x1_0016;
 const METHOD_OPEN: u32 = 0x1_001F;
+const METHOD_LSEEK: u32 = 0x1_0020;
+const METHOD_FSTAT: u32 = 0x1_0021;
 
 /// Synthetic preopen fd we expose to wasi-libc so its preopen walk
 /// terminates with one match: "/". Matches the lowest fd that's

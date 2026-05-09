@@ -181,6 +181,32 @@ export function buildSysImports(
       );
       return forwardRequestBytes(METHOD.SYS_OPEN, buf);
     },
+    sys_lseek: (fd, offset, whence, outPtr) => {
+      const off64 = typeof offset === "bigint" ? offset : BigInt(offset);
+      const req = new Uint8Array(16);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setBigInt64(4, off64, true);
+      view.setUint32(12, whence >>> 0, true);
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_LSEEK,
+        req,
+        8,
+      );
+      if (rc !== 8) return rc;
+      new Uint8Array(um(), outPtr, 8).set(response.subarray(0, 8));
+      return 0;
+    },
+    sys_fstat: (fd, outPtr) => {
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_FSTAT,
+        u32(fd),
+        16,
+      );
+      if (rc !== 16) return rc;
+      new Uint8Array(um(), outPtr, 16).set(response.subarray(0, 16));
+      return 0;
+    },
     sys_nanosleep: (ns) => {
       // `ns` arrives as a JS bigint when the wasm import is declared
       // with an i64 parameter type; coerce defensively for hosts that

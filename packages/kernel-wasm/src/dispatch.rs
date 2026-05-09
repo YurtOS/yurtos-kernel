@@ -70,6 +70,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
         METHOD_SYS_OPEN => sys_open(caller_pid, request),
+        METHOD_SYS_LSEEK => lseek(caller_pid, request, response),
+        METHOD_SYS_FSTAT => fstat(caller_pid, request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -224,6 +226,10 @@ fn close_fd(caller_pid: u32, request: &[u8]) -> i64 {
                 k.pipe_dec_ref(id, end);
                 0
             }
+            Some(crate::kernel::FdEntry::File { ofd_id }) => {
+                k.ofd_dec_ref(ofd_id);
+                0
+            }
             Some(_) => 0,
         }
     })
@@ -240,10 +246,14 @@ fn dup_fd(caller_pid: u32, request: &[u8]) -> i64 {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
-        if let crate::kernel::FdEntry::Pipe { id, end } = &entry {
-            if let Some(buf) = k.pipe_buf_mut(*id) {
-                buf.inc_ref(*end);
+        match &entry {
+            crate::kernel::FdEntry::Pipe { id, end } => {
+                if let Some(buf) = k.pipe_buf_mut(*id) {
+                    buf.inc_ref(*end);
+                }
             }
+            crate::kernel::FdEntry::File { ofd_id } => k.ofd_inc_ref(*ofd_id),
+            _ => {}
         }
         let p = k.process_mut(caller_pid);
         let newfd = p.fd_table.lowest_free_fd();
@@ -267,17 +277,23 @@ fn dup2_fd(caller_pid: u32, request: &[u8]) -> i64 {
         if oldfd == newfd {
             return newfd as i64;
         }
-        // If newfd was already a pipe end, decrement it before
-        // overwriting (POSIX says newfd is silently closed first).
+        // POSIX: newfd is silently closed first. Decrement its
+        // refcount based on what kind of entry was sitting at newfd.
         let prev = k.process_mut(caller_pid).fd_table.entry(newfd).cloned();
-        if let Some(crate::kernel::FdEntry::Pipe { id, end }) = prev {
-            k.pipe_dec_ref(id, end);
+        match prev {
+            Some(crate::kernel::FdEntry::Pipe { id, end }) => k.pipe_dec_ref(id, end),
+            Some(crate::kernel::FdEntry::File { ofd_id }) => k.ofd_dec_ref(ofd_id),
+            _ => {}
         }
-        // Increment the pipe refcount for the new alias.
-        if let crate::kernel::FdEntry::Pipe { id, end } = &entry {
-            if let Some(buf) = k.pipe_buf_mut(*id) {
-                buf.inc_ref(*end);
+        // Increment the refcount for the new alias.
+        match &entry {
+            crate::kernel::FdEntry::Pipe { id, end } => {
+                if let Some(buf) = k.pipe_buf_mut(*id) {
+                    buf.inc_ref(*end);
+                }
             }
+            crate::kernel::FdEntry::File { ofd_id } => k.ofd_inc_ref(*ofd_id),
+            _ => {}
         }
         k.process_mut(caller_pid).fd_table.install(newfd, entry);
         newfd as i64
@@ -361,8 +377,12 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                 }
                 take as i64
             }
-            crate::kernel::FdEntry::File { id, offset } => {
-                let take = match k.ramfs_file(id) {
+            crate::kernel::FdEntry::File { ofd_id } => {
+                let (file_id, offset) = match k.ofd(ofd_id) {
+                    Some(o) => (o.file_id, o.offset),
+                    None => return -(abi::EBADF as i64),
+                };
+                let take = match k.ramfs_file(file_id) {
                     Some(file) => {
                         let start = (offset as usize).min(file.content.len());
                         let avail = file.content.len() - start;
@@ -375,11 +395,9 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                     }
                     None => return -(abi::EBADF as i64),
                 };
-                // Advance the per-fd offset.
-                if let Some(crate::kernel::FdEntry::File { offset, .. }) =
-                    k.process_mut(caller_pid).fd_table.entry_mut(fd)
-                {
-                    *offset += take as u64;
+                // Advance the OFD offset; dup'd fds see the same cursor.
+                if let Some(ofd) = k.ofd_mut(ofd_id) {
+                    ofd.offset += take as u64;
                 }
                 take as i64
             }
@@ -690,15 +708,91 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
-        let id = match k.lookup_file_id(request) {
+        let file_id = match k.lookup_file_id(request) {
             Some(id) => id,
             None => return -(abi::ENOENT as i64),
         };
+        let ofd_id = k.create_ofd(file_id);
         let p = k.process_mut(caller_pid);
         let fd = p.fd_table.lowest_free_fd();
         p.fd_table
-            .install(fd, crate::kernel::FdEntry::File { id, offset: 0 });
+            .install(fd, crate::kernel::FdEntry::File { ofd_id });
         fd as i64
+    })
+}
+
+/// `lseek(fd, offset, whence)`. POSIX semantics: SET=0, CUR=1, END=2.
+/// Negative resulting offsets are -EINVAL. Response: 8 bytes — new
+/// offset as i64 LE.
+fn lseek(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 4 + 8 + 4 || response.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().unwrap());
+    let offset = i64::from_le_bytes(request[4..12].try_into().unwrap());
+    let whence = u32::from_le_bytes(request[12..16].try_into().unwrap());
+    with_kernel(|k| {
+        let ofd_id = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(crate::kernel::FdEntry::File { ofd_id }) => *ofd_id,
+            _ => return -(abi::EBADF as i64),
+        };
+        let (file_id, current) = match k.ofd(ofd_id) {
+            Some(o) => (o.file_id, o.offset),
+            None => return -(abi::EBADF as i64),
+        };
+        let size = k.ramfs_file(file_id).map(|f| f.content.len() as u64).unwrap_or(0);
+        let base: i64 = match whence {
+            0 => 0,
+            1 => current as i64,
+            2 => size as i64,
+            _ => return -(abi::EINVAL as i64),
+        };
+        let new_off = base.saturating_add(offset);
+        if new_off < 0 {
+            return -(abi::EINVAL as i64);
+        }
+        if let Some(o) = k.ofd_mut(ofd_id) {
+            o.offset = new_off as u64;
+        }
+        response[..8].copy_from_slice(&new_off.to_le_bytes());
+        8
+    })
+}
+
+/// `fstat(fd)`. Response: 16 bytes — u64 size + u32 filetype +
+/// u32 mode. Filetype values match WASI preview1: 2=CHARACTER_DEVICE,
+/// 3=DIRECTORY, 4=REGULAR_FILE, 6=SOCKET_STREAM. Mode is 0 for now
+/// (POSIX permission bits land with the OFD-flags work).
+fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if response.len() < 16 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        let (size, filetype): (u64, u32) = match entry {
+            crate::kernel::FdEntry::Stdin
+            | crate::kernel::FdEntry::Stdout
+            | crate::kernel::FdEntry::Stderr => (0, 2),
+            crate::kernel::FdEntry::Pipe { .. } => (0, 6),
+            crate::kernel::FdEntry::File { ofd_id } => {
+                let file_id = match k.ofd(ofd_id) {
+                    Some(o) => o.file_id,
+                    None => return -(abi::EBADF as i64),
+                };
+                let sz = k.ramfs_file(file_id).map(|f| f.content.len() as u64).unwrap_or(0);
+                (sz, 4)
+            }
+        };
+        response[0..8].copy_from_slice(&size.to_le_bytes());
+        response[8..12].copy_from_slice(&filetype.to_le_bytes());
+        response[12..16].copy_from_slice(&0u32.to_le_bytes());
+        16
     })
 }
 
@@ -1726,6 +1820,147 @@ mod tests {
         let n = dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut rest);
         assert_eq!(n, 6);
         assert_eq!(&rest[..6], b"456789");
+    }
+
+    #[test]
+    fn dup_of_file_fd_shares_ofd_cursor() {
+        // POSIX: dup'd fds share the open-file-description cursor.
+        // Read 4 bytes via fd, then read 4 more via duped fd — the
+        // duped fd should pick up at offset 4, not start over at 0.
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&6_u32.to_le_bytes());
+        reg.extend_from_slice(b"/abcde");
+        reg.extend_from_slice(b"0123456789");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/abcde", &mut []) as u32;
+
+        let mut buf = [0u8; 4];
+        assert_eq!(dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut buf), 4);
+        assert_eq!(&buf, b"0123");
+
+        let dupfd = dispatch(METHOD_SYS_DUP, 1, &fd.to_le_bytes(), &mut []) as u32;
+        let mut buf2 = [0u8; 4];
+        let n = dispatch(METHOD_SYS_READ, 1, &dupfd.to_le_bytes(), &mut buf2);
+        assert_eq!(n, 4, "duped fd shares offset, sees bytes 4..8");
+        assert_eq!(&buf2, b"4567");
+    }
+
+    #[test]
+    fn close_one_file_fd_keeps_ofd_alive_via_dup() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&5_u32.to_le_bytes());
+        reg.extend_from_slice(b"/keep");
+        reg.extend_from_slice(b"abc");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/keep", &mut []) as u32;
+        let dup = dispatch(METHOD_SYS_DUP, 1, &fd.to_le_bytes(), &mut []) as u32;
+
+        // Close the original — the duped fd should still read fine.
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &fd.to_le_bytes(), &mut []),
+            0
+        );
+        let mut buf = [0u8; 8];
+        let n = dispatch(METHOD_SYS_READ, 1, &dup.to_le_bytes(), &mut buf);
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..3], b"abc");
+    }
+
+    #[test]
+    fn lseek_set_then_read_picks_up_at_new_offset() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&5_u32.to_le_bytes());
+        reg.extend_from_slice(b"/seek");
+        reg.extend_from_slice(b"0123456789");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/seek", &mut []) as u32;
+
+        // Seek to offset 4 (whence=SET).
+        let mut req = Vec::new();
+        req.extend_from_slice(&fd.to_le_bytes());
+        req.extend_from_slice(&4_i64.to_le_bytes());
+        req.extend_from_slice(&0_u32.to_le_bytes());
+        let mut out = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_LSEEK, 1, &req, &mut out), 8);
+        assert_eq!(i64::from_le_bytes(out), 4);
+
+        // Read should now start at "4".
+        let mut buf = [0u8; 4];
+        assert_eq!(dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut buf), 4);
+        assert_eq!(&buf, b"4567");
+    }
+
+    #[test]
+    fn lseek_end_then_cur_compose() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&4_u32.to_le_bytes());
+        reg.extend_from_slice(b"/end");
+        reg.extend_from_slice(b"abcdefgh"); // 8 bytes
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/end", &mut []) as u32;
+
+        // Seek to END - 2.
+        let mut req = Vec::new();
+        req.extend_from_slice(&fd.to_le_bytes());
+        req.extend_from_slice(&(-2_i64).to_le_bytes());
+        req.extend_from_slice(&2_u32.to_le_bytes());
+        let mut out = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_LSEEK, 1, &req, &mut out), 8);
+        assert_eq!(i64::from_le_bytes(out), 6);
+
+        // Now CUR + 1.
+        let mut req = Vec::new();
+        req.extend_from_slice(&fd.to_le_bytes());
+        req.extend_from_slice(&1_i64.to_le_bytes());
+        req.extend_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(dispatch(METHOD_SYS_LSEEK, 1, &req, &mut out), 8);
+        assert_eq!(i64::from_le_bytes(out), 7);
+    }
+
+    #[test]
+    fn lseek_negative_resulting_offset_is_einval() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        reg.extend_from_slice(b"/ng");
+        reg.extend_from_slice(b"hi");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/ng", &mut []) as u32;
+
+        let mut req = Vec::new();
+        req.extend_from_slice(&fd.to_le_bytes());
+        req.extend_from_slice(&(-5_i64).to_le_bytes());
+        req.extend_from_slice(&0_u32.to_le_bytes()); // SET
+        let mut out = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_LSEEK, 1, &req, &mut out),
+            -(abi::EINVAL as i64),
+        );
+    }
+
+    #[test]
+    fn fstat_reports_size_and_filetype() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&4_u32.to_le_bytes());
+        reg.extend_from_slice(b"/sta");
+        reg.extend_from_slice(b"hello"); // 5 bytes
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/sta", &mut []) as u32;
+
+        let mut out = [0u8; 16];
+        assert_eq!(dispatch(METHOD_SYS_FSTAT, 1, &fd.to_le_bytes(), &mut out), 16);
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 5);
+        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 4); // REGULAR_FILE
+
+        // fstat on stdin (fd 0) reports filetype=2 CHARACTER_DEVICE.
+        let mut out2 = [0u8; 16];
+        assert_eq!(dispatch(METHOD_SYS_FSTAT, 1, &0_u32.to_le_bytes(), &mut out2), 16);
+        assert_eq!(u32::from_le_bytes(out2[8..12].try_into().unwrap()), 2);
     }
 
     #[test]
