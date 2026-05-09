@@ -278,6 +278,27 @@ args = [
   { name = "result", type = "i64" },
 ]
 
+# ── Extension dispatch ───────────────────────────────────────────────────────
+#
+# The kernel forwards `host_extension_invoke` bytes verbatim to the
+# microkernel-side extension registry. Wire format is opaque to
+# kernel.wasm — currently JSON, but the kernel only shuttles bytes
+# between the calling process's request and the response buffer. This
+# is the architectural escape hatch for "syscalls implemented via a
+# plugin": database access, custom RPC, language-runtime hooks. Adding
+# a new extension is a microkernel-side registration, never a
+# kernel.wasm change.
+
+[import.kh_extension_invoke]
+doc = "Forward an extension request to the host registry. (req_ptr, req_len) is opaque guest-supplied bytes; the host writes the response bytes into (out_ptr, out_cap) and returns the number of bytes written, or negated errno (-ENOENT if no handler is registered for the requested name)."
+return = "fixed_out"
+args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
 # ── Diagnostics & cooperative yield ──────────────────────────────────────────
 
 [import.kh_log]

@@ -7,12 +7,12 @@
 //! `docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md`.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use wasmtime::{Engine, Module};
 
 use yurt_runtime_wasmtime::microkernel::{
-    build_kernel_wasm, default_kernel_wasm_path, HostState, Microkernel,
+    build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, Microkernel,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -33,12 +33,14 @@ const METHOD_HOST_GETUID: u32 = 0x1_0001;
 const METHOD_HOST_GETEUID: u32 = 0x1_0002;
 const METHOD_HOST_GETGID: u32 = 0x1_0003;
 const METHOD_HOST_GETEGID: u32 = 0x1_0004;
+const METHOD_HOST_EXTENSION_INVOKE: u32 = 0x1_0010;
 
 fn fresh_microkernel(now_ns: u64) -> Microkernel {
     Microkernel::load(
         ensure_kernel_wasm_built(),
         HostState {
             now_realtime_ns: now_ns,
+            ..Default::default()
         },
     )
     .unwrap()
@@ -85,7 +87,10 @@ fn kernel_wasm_imports_only_documented_kh_namespace() {
     imports.sort();
     assert_eq!(
         imports,
-        vec![("kh".to_owned(), "kh_now_realtime".to_owned())]
+        vec![
+            ("kh".to_owned(), "kh_extension_invoke".to_owned()),
+            ("kh".to_owned(), "kh_now_realtime".to_owned()),
+        ]
     );
 }
 
@@ -130,6 +135,77 @@ fn microkernel_serves_fresh_kh_value_each_dispatch() {
     assert_eq!(u64::from_le_bytes(response), 200);
 }
 
+/// Test extension that records every request it sees and returns a
+/// fixed response. Lets the test assert the kernel forwarded the
+/// caller's bytes verbatim and wrote back what the host returned.
+struct EchoExtension {
+    last_request: Mutex<Vec<u8>>,
+    response: Vec<u8>,
+}
+
+impl ExtensionRegistry for EchoExtension {
+    fn invoke(&self, request: &[u8], response: &mut [u8]) -> i64 {
+        *self.last_request.lock().unwrap() = request.to_vec();
+        let n = self.response.len().min(response.len());
+        response[..n].copy_from_slice(&self.response[..n]);
+        n as i64
+    }
+}
+
+#[test]
+fn host_extension_invoke_forwards_bytes_through_microkernel() {
+    // Architectural test for the extension escape hatch:
+    //   user → kernel.wasm (METHOD_HOST_EXTENSION_INVOKE) → kh_extension_invoke
+    //                                                     → microkernel registry
+    //                                                     → response back
+    // The kernel is a byte courier; wire format (currently JSON) is
+    // entirely the registry's concern.
+    build_kernel_wasm().unwrap();
+    let registry = Arc::new(EchoExtension {
+        last_request: Mutex::new(Vec::new()),
+        response: br#"{"exit_code":0,"stdout":"hello from extension\n","stderr":""}"#.to_vec(),
+    });
+    let mut mk = Microkernel::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            extensions: registry.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let request = br#"{"name":"my_ext","args":["a","b"],"stdin":"","cwd":"/"}"#;
+    let mut response = vec![0u8; 256];
+    let written = mk
+        .syscall(METHOD_HOST_EXTENSION_INVOKE, request, &mut response)
+        .unwrap();
+    assert!(written > 0, "extension wrote response: {written}");
+
+    assert_eq!(
+        registry.last_request.lock().unwrap().as_slice(),
+        request as &[u8],
+        "kernel forwarded request bytes verbatim"
+    );
+    let written_usize = written as usize;
+    assert_eq!(
+        &response[..written_usize],
+        registry.response.as_slice(),
+        "microkernel wrote registry response back into kernel memory"
+    );
+}
+
+#[test]
+fn host_extension_invoke_returns_negated_enoent_when_no_registry() {
+    // Default registry is empty; -ENOENT propagates back through the
+    // trampoline as a negative scalar.
+    let mut mk = fresh_microkernel(0);
+    let mut response = [0u8; 64];
+    let rc = mk
+        .syscall(METHOD_HOST_EXTENSION_INVOKE, b"{}", &mut response)
+        .unwrap();
+    assert_eq!(rc, -2, "expected -ENOENT, got {rc}");
+}
+
 #[test]
 fn microkernel_method_ids_match_yurt_abi_methods_toml() {
     // Contract test: every method ID this test file hardcodes must
@@ -165,6 +241,11 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             "host_getegid",
             METHOD_HOST_GETEGID,
             METHOD_HOST_GETEGID as i64,
+        ),
+        (
+            "host_extension_invoke",
+            METHOD_HOST_EXTENSION_INVOKE,
+            METHOD_HOST_EXTENSION_INVOKE as i64,
         ),
     ] {
         let entry = methods

@@ -26,6 +26,7 @@ pub fn dispatch(method_id: u32, request: &[u8], response: &mut [u8]) -> i64 {
         METHOD_HOST_GETEUID => Credentials::DEFAULT.euid as i64,
         METHOD_HOST_GETGID => Credentials::DEFAULT.gid as i64,
         METHOD_HOST_GETEGID => Credentials::DEFAULT.egid as i64,
+        METHOD_HOST_EXTENSION_INVOKE => kh::extension_invoke(request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }

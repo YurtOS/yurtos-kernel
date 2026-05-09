@@ -15,6 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
@@ -22,14 +23,46 @@ use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 /// Fully-qualified path of the `kh_*` import namespace.
 const KH_NAMESPACE: &str = "kh";
 
+/// POSIX errno values referenced by the trampoline. Mirrors
+/// `abi/contract/yurt_abi.toml`.
+const EFAULT: i64 = 14;
+const ENOENT: i64 = 2;
+
+/// Microkernel-side handler for `host_extension_invoke`. Receives the
+/// opaque request bytes the calling process supplied; writes the
+/// response bytes into `response`. Returns bytes written or negated
+/// POSIX errno (e.g. `-ENOENT` if no handler matches).
+pub trait ExtensionRegistry: Send + Sync {
+    fn invoke(&self, request: &[u8], response: &mut [u8]) -> i64;
+}
+
+/// Empty registry — all extension calls return `-ENOENT`. Useful as a
+/// safe default for embedders that don't expose extensions.
+pub struct EmptyExtensionRegistry;
+
+impl ExtensionRegistry for EmptyExtensionRegistry {
+    fn invoke(&self, _request: &[u8], _response: &mut [u8]) -> i64 {
+        -ENOENT
+    }
+}
+
 /// State threaded through every wasmtime host callback.
 ///
 /// `now_realtime_ns` is a deterministic clock value used by the test
 /// microkernel and any embedder that wants to inject time. Real
 /// production microkernels read the host clock instead.
-#[derive(Default)]
 pub struct HostState {
     pub now_realtime_ns: u64,
+    pub extensions: Arc<dyn ExtensionRegistry>,
+}
+
+impl Default for HostState {
+    fn default() -> Self {
+        Self {
+            now_realtime_ns: 0,
+            extensions: Arc::new(EmptyExtensionRegistry),
+        }
+    }
 }
 
 /// A loaded kernel.wasm instance plus the typed handles the microkernel
@@ -135,15 +168,57 @@ fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
             let now = caller.data().now_realtime_ns;
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
-                None => return -14, // -EFAULT
+                None => return -(EFAULT as i32),
             };
             if memory
                 .write(&mut caller, out_ptr as usize, &now.to_le_bytes())
                 .is_err()
             {
-                return -14;
+                return -(EFAULT as i32);
             }
             0
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_extension_invoke",
+        |mut caller: Caller<'_, HostState>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            // Copy the request out of kernel memory so the host
+            // handler doesn't borrow from the same Caller we need to
+            // re-borrow for the response write.
+            let mut request = vec![0u8; req_len as usize];
+            if memory
+                .read(&caller, req_ptr as usize, &mut request)
+                .is_err()
+            {
+                return -EFAULT;
+            }
+            let mut response = vec![0u8; out_cap as usize];
+            let registry = caller.data().extensions.clone();
+            let written = registry.invoke(&request, &mut response);
+            if written < 0 {
+                return written;
+            }
+            let written_usize = written as usize;
+            if written_usize > response.len() {
+                return -EFAULT;
+            }
+            if memory
+                .write(&mut caller, out_ptr as usize, &response[..written_usize])
+                .is_err()
+            {
+                return -EFAULT;
+            }
+            written
         },
     )?;
     Ok(())

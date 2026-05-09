@@ -58,3 +58,8 @@ doc = "Real group id of the calling process."
 id = 0x1_0004
 kind = "syscall"
 doc = "Effective group id of the calling process."
+
+[method.host_extension_invoke]
+id = 0x1_0010
+kind = "syscall"
+doc = "Forward an opaque request to the microkernel-side extension registry. The kernel acts as a byte courier; wire format is the registry's concern."

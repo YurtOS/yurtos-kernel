@@ -10,6 +10,12 @@
 #[link(wasm_import_module = "kh")]
 extern "C" {
     fn kh_now_realtime(out_ptr: *mut u64) -> i32;
+    fn kh_extension_invoke(
+        req_ptr: *const u8,
+        req_len: usize,
+        out_ptr: *mut u8,
+        out_cap: usize,
+    ) -> i64;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -20,6 +26,18 @@ unsafe fn kh_now_realtime(out_ptr: *mut u64) -> i32 {
     0
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_extension_invoke(
+    _req_ptr: *const u8,
+    _req_len: usize,
+    _out_ptr: *mut u8,
+    _out_cap: usize,
+) -> i64 {
+    // Native unit tests don't exercise this path; the wasm trampoline
+    // tests cover it end-to-end through a real microkernel.
+    -38 // -ENOSYS
+}
+
 /// Wall-clock time in nanoseconds since the Unix epoch.
 pub fn now_realtime_ns() -> Result<u64, i32> {
     let mut out: u64 = 0;
@@ -28,5 +46,19 @@ pub fn now_realtime_ns() -> Result<u64, i32> {
         Ok(out)
     } else {
         Err(rc)
+    }
+}
+
+/// Forward an opaque extension-invoke request to the microkernel
+/// registry; the host writes the response bytes into `response`.
+/// Returns bytes written (non-negative) or negated POSIX errno.
+pub fn extension_invoke(request: &[u8], response: &mut [u8]) -> i64 {
+    unsafe {
+        kh_extension_invoke(
+            request.as_ptr(),
+            request.len(),
+            response.as_mut_ptr(),
+            response.len(),
+        )
     }
 }
