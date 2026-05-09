@@ -52,6 +52,10 @@ mod sys_method_id {
     pub const GETPID: u32 = 0x1_0005;
     pub const GETPPID: u32 = 0x1_0006;
     pub const UMASK: u32 = 0x1_0007;
+    pub const SETRESUID: u32 = 0x1_0008;
+    pub const SETRESGID: u32 = 0x1_0009;
+    pub const CHDIR: u32 = 0x1_000A;
+    pub const GETCWD: u32 = 0x1_000B;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -337,6 +341,21 @@ impl UserProcess {
         f.call(&mut self.store, ())
             .with_context(|| format!("user-process {name}()"))
     }
+
+    /// Read `len` bytes from this user-process's exported `memory` at
+    /// `addr`. Useful for tests that want to inspect what a syscall
+    /// wrote back.
+    pub fn read_memory(&mut self, addr: u32, len: u32) -> Result<Vec<u8>> {
+        let memory = self
+            .instance
+            .get_memory(&mut self.store, "memory")
+            .ok_or_else(|| anyhow!("user-process missing 'memory' export"))?;
+        let mut buf = vec![0u8; len as usize];
+        memory
+            .read(&self.store, addr as usize, &mut buf)
+            .context("read user-process memory")?;
+        Ok(buf)
+    }
 }
 
 // ── Linker registration ──────────────────────────────────────────────────────
@@ -443,23 +462,122 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     /// Forward a syscall whose only argument is a single `u32`. The
     /// argument is staged as 4 little-endian bytes in kernel scratch.
     fn forward_u32_arg(caller: &mut Caller<'_, UserState>, method_id: u32, arg: u32) -> i32 {
+        forward_request_bytes(caller, method_id, &arg.to_le_bytes()) as i32
+    }
+
+    /// Forward a syscall whose request is `request_bytes`; no response
+    /// buffer. Returns the syscall scalar (i64 to preserve sign /
+    /// negative-errno semantics; callers that want i32 can cast).
+    fn forward_request_bytes(
+        caller: &mut Caller<'_, UserState>,
+        method_id: u32,
+        request_bytes: &[u8],
+    ) -> i64 {
         let pid = caller.data().pid;
         let kernel = caller.data().kernel.clone();
         let mut k = kernel.borrow_mut();
         let scratch_ptr = k.scratch_ptr;
         let memory = k.memory;
         let dispatch = k.dispatch.clone();
-        let bytes = arg.to_le_bytes();
-        if memory
-            .write(&mut k.store, scratch_ptr as usize, &bytes)
+        if !request_bytes.is_empty()
+            && memory
+                .write(&mut k.store, scratch_ptr as usize, request_bytes)
+                .is_err()
+        {
+            return -EFAULT;
+        }
+        match dispatch.call(
+            &mut k.store,
+            (
+                method_id,
+                pid,
+                scratch_ptr,
+                request_bytes.len() as u32,
+                0,
+                0,
+            ),
+        ) {
+            Ok(rc) => rc,
+            Err(_) => -EFAULT,
+        }
+    }
+
+    /// Forward a syscall that reads bytes from the *user-process* wasm
+    /// at `(user_ptr, user_len)`, copies them into kernel scratch, and
+    /// invokes `kernel_dispatch`. Used by syscalls like `sys_chdir`
+    /// where the user-process supplies a pointer + length to its own
+    /// memory.
+    fn forward_user_ptr_len(
+        caller: &mut Caller<'_, UserState>,
+        method_id: u32,
+        user_ptr: u32,
+        user_len: u32,
+    ) -> i32 {
+        let user_memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            Some(m) => m,
+            None => return -(EFAULT as i32),
+        };
+        let mut buf = vec![0u8; user_len as usize];
+        if user_memory
+            .read(&caller, user_ptr as usize, &mut buf)
             .is_err()
         {
             return -(EFAULT as i32);
         }
-        match dispatch.call(&mut k.store, (method_id, pid, scratch_ptr, 4, 0, 0)) {
-            Ok(rc) => rc as i32,
-            Err(_) => -(EFAULT as i32),
+        forward_request_bytes(caller, method_id, &buf) as i32
+    }
+
+    /// Forward a syscall that fills a response buffer in *user-process*
+    /// memory at `(user_out_ptr, user_out_cap)`. The kernel writes the
+    /// response into kernel scratch, which we then copy out into user
+    /// memory.
+    fn forward_response_to_user(
+        caller: &mut Caller<'_, UserState>,
+        method_id: u32,
+        user_out_ptr: u32,
+        user_out_cap: u32,
+    ) -> i32 {
+        let pid = caller.data().pid;
+        let kernel = caller.data().kernel.clone();
+        let mut k = kernel.borrow_mut();
+        let scratch_ptr = k.scratch_ptr;
+        let kernel_memory = k.memory;
+        let dispatch = k.dispatch.clone();
+        let cap = user_out_cap.min(k.scratch_len);
+        let rc = match dispatch.call(&mut k.store, (method_id, pid, 0, 0, scratch_ptr, cap)) {
+            Ok(rc) => rc,
+            Err(_) => return -(EFAULT as i32),
+        };
+        // The kernel-side convention for "buffer too small" varies per
+        // syscall (e.g. getcwd returns required size as a positive
+        // value). We copy out at most cap bytes regardless so the user
+        // sees what fit.
+        if rc <= 0 {
+            return rc as i32;
         }
+        let to_copy = (rc as u32).min(cap) as usize;
+        if to_copy > 0 {
+            let mut tmp = vec![0u8; to_copy];
+            if kernel_memory
+                .read(&k.store, scratch_ptr as usize, &mut tmp)
+                .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+            // Drop the kernel borrow before touching user memory.
+            drop(k);
+            let user_memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -(EFAULT as i32),
+            };
+            if user_memory
+                .write(&mut *caller, user_out_ptr as usize, &tmp)
+                .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+        }
+        rc as i32
     }
 
     linker.func_wrap(
@@ -497,6 +615,42 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "sys_umask",
         |mut caller: Caller<'_, UserState>, mask: i32| -> i32 {
             forward_u32_arg(&mut caller, sys_method_id::UMASK, mask as u32)
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_setresuid",
+        |mut caller: Caller<'_, UserState>, ruid: i32, euid: i32, suid: i32| -> i32 {
+            let mut req = Vec::with_capacity(12);
+            req.extend_from_slice(&(ruid as u32).to_le_bytes());
+            req.extend_from_slice(&(euid as u32).to_le_bytes());
+            req.extend_from_slice(&(suid as u32).to_le_bytes());
+            forward_request_bytes(&mut caller, sys_method_id::SETRESUID, &req) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_setresgid",
+        |mut caller: Caller<'_, UserState>, rgid: i32, egid: i32, sgid: i32| -> i32 {
+            let mut req = Vec::with_capacity(12);
+            req.extend_from_slice(&(rgid as u32).to_le_bytes());
+            req.extend_from_slice(&(egid as u32).to_le_bytes());
+            req.extend_from_slice(&(sgid as u32).to_le_bytes());
+            forward_request_bytes(&mut caller, sys_method_id::SETRESGID, &req) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_chdir",
+        |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32| -> i32 {
+            forward_user_ptr_len(&mut caller, sys_method_id::CHDIR, path_ptr, path_len)
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_getcwd",
+        |mut caller: Caller<'_, UserState>, out_ptr: u32, out_cap: u32| -> i32 {
+            forward_response_to_user(&mut caller, sys_method_id::GETCWD, out_ptr, out_cap)
         },
     )?;
     Ok(())

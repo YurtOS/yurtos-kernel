@@ -88,6 +88,26 @@ id = 0x1_0007
 kind = "syscall"
 doc = "Set the file-mode-creation mask for the calling process; returns the previous value. Request bytes carry the new mask as a little-endian u32 (only the low 9 bits are meaningful)."
 
+[method.sys_setresuid]
+id = 0x1_0008
+kind = "syscall"
+doc = "Set the calling process's real, effective, and saved uid. Request bytes carry three little-endian u32s: ruid, euid, suid. Phase 2 has no permission checks; security policy comes later. Returns 0 or negated POSIX errno."
+
+[method.sys_setresgid]
+id = 0x1_0009
+kind = "syscall"
+doc = "Set the calling process's real, effective, and saved gid. Request bytes carry three little-endian u32s: rgid, egid, sgid. Returns 0 or negated POSIX errno."
+
+[method.sys_chdir]
+id = 0x1_000A
+kind = "syscall"
+doc = "Change the calling process's working directory. Request bytes carry the path. Phase 2 has no VFS validation — the path is stored verbatim. Returns 0 or negated POSIX errno."
+
+[method.sys_getcwd]
+id = 0x1_000B
+kind = "syscall"
+doc = "Write the calling process's working directory (NUL-terminated) into the response buffer. Returns required size (path length + 1) on success — caller checks against out_cap to detect a too-small buffer (matches the TS host_getcwd convention)."
+
 [method.sys_extension_invoke]
 id = 0x1_0010
 kind = "syscall"

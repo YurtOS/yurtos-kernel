@@ -27,10 +27,13 @@ pub type Pid = u32;
 
 pub const DEFAULT_UMASK: u16 = 0o022;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Process {
     pub umask: u16,
     pub credentials: Credentials,
+    /// Working directory as raw bytes (cwd has no UTF-8 guarantee in
+    /// POSIX). Default `/`.
+    pub cwd: Vec<u8>,
 }
 
 impl Default for Process {
@@ -38,6 +41,7 @@ impl Default for Process {
         Self {
             umask: DEFAULT_UMASK,
             credentials: Credentials::DEFAULT,
+            cwd: b"/".to_vec(),
         }
     }
 }
@@ -59,10 +63,10 @@ impl Kernel {
         self.processes.entry(pid).or_default()
     }
 
-    /// Get the process record for `pid`, returning a default copy if
-    /// no entry exists yet (without inserting).
-    pub fn process(&self, pid: Pid) -> Process {
-        self.processes.get(&pid).copied().unwrap_or_default()
+    /// Get an immutable reference to the process record for `pid`.
+    /// Lazily inserts a default `Process` if no entry exists yet.
+    pub fn process(&mut self, pid: Pid) -> &Process {
+        self.processes.entry(pid).or_default()
     }
 }
 
@@ -105,16 +109,18 @@ mod tests {
     #[test]
     fn lazy_insert_yields_defaults() {
         let _g = TestGuard::acquire();
-        let p = with_kernel(|k| *k.process_mut(42));
-        assert_eq!(p.umask, DEFAULT_UMASK);
+        let umask = with_kernel(|k| k.process_mut(42).umask);
+        let cwd = with_kernel(|k| k.process_mut(42).cwd.clone());
+        assert_eq!(umask, DEFAULT_UMASK);
+        assert_eq!(cwd, b"/");
     }
 
     #[test]
     fn writes_persist_across_calls() {
         let _g = TestGuard::acquire();
         with_kernel(|k| k.process_mut(1).umask = 0o077);
-        let again = with_kernel(|k| *k.process_mut(1));
-        assert_eq!(again.umask, 0o077);
+        let again = with_kernel(|k| k.process_mut(1).umask);
+        assert_eq!(again, 0o077);
     }
 
     #[test]

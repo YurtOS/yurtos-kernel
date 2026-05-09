@@ -36,6 +36,10 @@ const METHOD_SYS_GETEGID: u32 = 0x1_0004;
 const METHOD_SYS_GETPID: u32 = 0x1_0005;
 const METHOD_SYS_GETPPID: u32 = 0x1_0006;
 const METHOD_SYS_UMASK: u32 = 0x1_0007;
+const METHOD_SYS_SETRESUID: u32 = 0x1_0008;
+const METHOD_SYS_SETRESGID: u32 = 0x1_0009;
+const METHOD_SYS_CHDIR: u32 = 0x1_000A;
+const METHOD_SYS_GETCWD: u32 = 0x1_000B;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -402,6 +406,90 @@ fn user_process_umask_persists_across_calls_for_same_pid() {
 }
 
 #[test]
+fn user_process_setresuid_changes_subsequent_getuid() {
+    // Multi-arg syscall (3 u32s) marshalled into kernel scratch as
+    // 12 bytes. Validates the multi-arg encoding plus per-pid
+    // credential mutation visible across syscalls.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_setresuid" (func $setresuid (param i32 i32 i32) (result i32)))
+          (import "env" "sys_getuid" (func $getuid (result i32)))
+          (func (export "set") (result i32)
+            (call $setresuid (i32.const 4242) (i32.const 4242) (i32.const 4242)))
+          (func (export "get") (result i32)
+            (call $getuid)))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.call_export_i32("get").unwrap(), 1000, "default uid");
+    assert_eq!(user.call_export_i32("set").unwrap(), 0);
+    assert_eq!(user.call_export_i32("get").unwrap(), 4242, "uid was set");
+}
+
+#[test]
+fn user_process_chdir_then_getcwd_round_trip() {
+    // Variable-size request (path bytes from user memory) + variable-
+    // size response (cwd bytes back into user memory). Exercises
+    // forward_user_ptr_len and forward_response_to_user.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    // The WAT module hard-codes a path string at offset 16 in its
+    // memory and a getcwd output buffer at offset 64. `chdir` reads
+    // path bytes, `getcwd` writes the cwd to the buffer; the test
+    // exports `read_byte(i32) -> i32` so we can inspect the buffer.
+    let user_wat = r#"
+        (module
+          (import "env" "sys_chdir" (func $chdir (param i32 i32) (result i32)))
+          (import "env" "sys_getcwd" (func $getcwd (param i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 16) "/srv/yurt")
+          (func (export "set") (result i32)
+            (call $chdir (i32.const 16) (i32.const 9)))
+          (func (export "get") (result i32)
+            (call $getcwd (i32.const 64) (i32.const 64)))
+          (func (export "byte") (param $i i32) (result i32)
+            (i32.load8_u (local.get $i))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    // Initial cwd = "/" → required size 2 (1 byte path + 1 NUL).
+    let initial = user.call_export_i32("get").unwrap();
+    assert_eq!(initial, 2);
+
+    // chdir then getcwd.
+    assert_eq!(user.call_export_i32("set").unwrap(), 0);
+    let n = user.call_export_i32("get").unwrap();
+    assert_eq!(n, 10, "/srv/yurt + NUL");
+
+    // Read back bytes from the user-process buffer at offset 64.
+    let got = user.read_memory(64, 10).unwrap();
+    assert_eq!(&got, b"/srv/yurt\0");
+}
+
+#[test]
+fn user_process_setresgid_changes_subsequent_getgid() {
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_setresgid" (func $setresgid (param i32 i32 i32) (result i32)))
+          (import "env" "sys_getgid" (func $getgid (result i32)))
+          (func (export "set") (result i32)
+            (call $setresgid (i32.const 99) (i32.const 99) (i32.const 99)))
+          (func (export "get") (result i32)
+            (call $getgid)))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.call_export_i32("get").unwrap(), 1000);
+    assert_eq!(user.call_export_i32("set").unwrap(), 0);
+    assert_eq!(user.call_export_i32("get").unwrap(), 99);
+}
+
+#[test]
 fn user_process_can_call_kernel_multiple_times() {
     // The Rc<RefCell<KernelInstance>> sharing pattern must support
     // repeated borrow_mut acquisitions without deadlock or panic.
@@ -449,6 +537,18 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_getpid", METHOD_SYS_GETPID, METHOD_SYS_GETPID as i64),
         ("sys_getppid", METHOD_SYS_GETPPID, METHOD_SYS_GETPPID as i64),
         ("sys_umask", METHOD_SYS_UMASK, METHOD_SYS_UMASK as i64),
+        (
+            "sys_setresuid",
+            METHOD_SYS_SETRESUID,
+            METHOD_SYS_SETRESUID as i64,
+        ),
+        (
+            "sys_setresgid",
+            METHOD_SYS_SETRESGID,
+            METHOD_SYS_SETRESGID as i64,
+        ),
+        ("sys_chdir", METHOD_SYS_CHDIR, METHOD_SYS_CHDIR as i64),
+        ("sys_getcwd", METHOD_SYS_GETCWD, METHOD_SYS_GETCWD as i64),
         (
             "sys_extension_invoke",
             METHOD_SYS_EXTENSION_INVOKE,
