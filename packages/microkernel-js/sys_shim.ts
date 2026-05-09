@@ -175,6 +175,12 @@ export function buildSysImports(
     },
     sys_sched_yield: () =>
       forwardRequestBytes(METHOD.SYS_SCHED_YIELD, new Uint8Array(0)),
+    sys_open: (pathPtr, pathLen) => {
+      const buf = new Uint8Array(
+        new Uint8Array(um(), pathPtr, pathLen).slice().buffer,
+      );
+      return forwardRequestBytes(METHOD.SYS_OPEN, buf);
+    },
     sys_nanosleep: (ns) => {
       // `ns` arrives as a JS bigint when the wasm import is declared
       // with an i64 parameter type; coerce defensively for hosts that

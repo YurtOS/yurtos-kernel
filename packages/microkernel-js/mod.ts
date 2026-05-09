@@ -58,6 +58,7 @@ export const METHOD = {
   KERNEL_CLOSE_STDIN: 5,
   KERNEL_DRAIN_STDOUT: 6,
   KERNEL_DRAIN_STDERR: 7,
+  KERNEL_REGISTER_FILE: 8,
   SYS_GETUID: 0x1_0001,
   SYS_GETEUID: 0x1_0002,
   SYS_GETGID: 0x1_0003,
@@ -88,6 +89,7 @@ export const METHOD = {
   SYS_SIGACTION: 0x1_001C,
   SYS_SCHED_YIELD: 0x1_001D,
   SYS_NANOSLEEP: 0x1_001E,
+  SYS_OPEN: 0x1_001F,
 } as const;
 
 export const KERNEL_PID = 0;
@@ -387,6 +389,22 @@ export class Microkernel {
 
   hostStateMut(): HostState {
     return this.hostState;
+  }
+
+  /**
+   * Install a file blob into kernel.wasm's in-memory ramfs at `path`,
+   * replacing any existing content. Phase 2 ramfs is read-only from
+   * userland; this is the only way bytes get in today.
+   */
+  registerRamfsFile(path: Uint8Array, content: Uint8Array): void {
+    const req = new Uint8Array(4 + path.byteLength + content.byteLength);
+    new DataView(req.buffer).setUint32(0, path.byteLength >>> 0, true);
+    req.set(path, 4);
+    req.set(content, 4 + path.byteLength);
+    const { rc } = this.syscall(METHOD.KERNEL_REGISTER_FILE, req, 0);
+    if (Number(rc) !== 0) {
+      throw new Error(`kernel_register_file failed: rc=${rc}`);
+    }
   }
 
   spawnUserProcess(userWasmBytes: Uint8Array): UserProcess {

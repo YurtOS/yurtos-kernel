@@ -75,6 +75,7 @@ mod sys_method_id {
     pub const SIGACTION: u32 = 0x1_001C;
     pub const SCHED_YIELD: u32 = 0x1_001D;
     pub const NANOSLEEP: u32 = 0x1_001E;
+    pub const OPEN: u32 = 0x1_001F;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -88,6 +89,7 @@ const METHOD_KERNEL_PROVIDE_STDIN: u32 = 4;
 const METHOD_KERNEL_CLOSE_STDIN: u32 = 5;
 const METHOD_KERNEL_DRAIN_STDOUT: u32 = 6;
 const METHOD_KERNEL_DRAIN_STDERR: u32 = 7;
+const METHOD_KERNEL_REGISTER_FILE: u32 = 8;
 
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
@@ -294,6 +296,23 @@ impl Microkernel {
             .lock()
             .unwrap()
             .syscall(method_id, KERNEL_PID, request, response)
+    }
+
+    /// Install a file blob into kernel.wasm's in-memory ramfs at
+    /// `path`, replacing any existing content. Phase 2 ramfs is
+    /// read-only from userland; this is the only way bytes get in
+    /// today. Real `open(O_CREAT | O_WRONLY)` from user processes
+    /// arrives with the OFD registry.
+    pub fn register_ramfs_file(&self, path: &[u8], content: &[u8]) -> Result<()> {
+        let mut req = Vec::with_capacity(4 + path.len() + content.len());
+        req.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        req.extend_from_slice(path);
+        req.extend_from_slice(content);
+        let rc = self.syscall(METHOD_KERNEL_REGISTER_FILE, &req, &mut [])?;
+        if rc != 0 {
+            anyhow::bail!("kernel_register_file failed: rc={rc}");
+        }
+        Ok(())
     }
 
     /// Mutate the host state served to kernel.wasm via a closure.
@@ -1204,6 +1223,13 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         |mut caller: Caller<'_, UserState>, ns: i64| -> i32 {
             let req = (ns as u64).to_le_bytes();
             forward_request_bytes(&mut caller, sys_method_id::NANOSLEEP, &req) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_open",
+        |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32| -> i32 {
+            forward_user_ptr_len(&mut caller, sys_method_id::OPEN, path_ptr, path_len)
         },
     )?;
     Ok(())

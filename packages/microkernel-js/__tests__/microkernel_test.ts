@@ -296,6 +296,31 @@ Deno.test(
   },
 );
 
+Deno.test(
+  "ramfs register_file + sys_open + sys_read round-trip content",
+  async () => {
+    const mk = await freshMicrokernel();
+    const enc = new TextEncoder();
+    mk.registerRamfsFile(enc.encode("/etc/motd"), enc.encode("hello ramfs\n"));
+
+    // Open via direct kernel syscall (KERNEL_PID is the caller).
+    const path = enc.encode("/etc/motd");
+    const open = mk.syscall(METHOD.SYS_OPEN, path, 0);
+    const fd = Number(open.rc);
+    if (fd < 0) throw new Error(`expected open success, got ${fd}`);
+
+    const fdReq = new Uint8Array(4);
+    new DataView(fdReq.buffer).setUint32(0, fd >>> 0, true);
+    const { rc, response } = mk.syscall(METHOD.SYS_READ, fdReq, 64);
+    const n = Number(rc);
+    assertEquals(new TextDecoder().decode(response.subarray(0, n)), "hello ramfs\n");
+
+    // Unknown path → -ENOENT (-2).
+    const missing = mk.syscall(METHOD.SYS_OPEN, enc.encode("/no/such"), 0);
+    assertEquals(Number(missing.rc), -2);
+  },
+);
+
 Deno.test("microkernel direct syscalls use kernel pid 0", async () => {
   const mk = await freshMicrokernel();
   const { rc } = mk.syscall(METHOD.SYS_GETPID, new Uint8Array(0), 0);

@@ -4,6 +4,7 @@
 //! generator produces a Rust crate we can depend on directly.
 
 pub const EPERM: i32 = 1;
+pub const ENOENT: i32 = 2;
 pub const EBADF: i32 = 9;
 pub const EAGAIN: i32 = 11;
 pub const EINVAL: i32 = 22;

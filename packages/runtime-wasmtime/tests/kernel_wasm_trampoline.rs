@@ -58,6 +58,7 @@ const METHOD_SYS_KILL: u32 = 0x1_001B;
 const METHOD_SYS_SIGACTION: u32 = 0x1_001C;
 const METHOD_SYS_SCHED_YIELD: u32 = 0x1_001D;
 const METHOD_SYS_NANOSLEEP: u32 = 0x1_001E;
+const METHOD_SYS_OPEN: u32 = 0x1_001F;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -805,6 +806,7 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_NANOSLEEP,
             METHOD_SYS_NANOSLEEP as i64,
         ),
+        ("sys_open", METHOD_SYS_OPEN, METHOD_SYS_OPEN as i64),
     ] {
         let entry = methods
             .get(name)
@@ -903,6 +905,37 @@ fn sched_yield_and_nanosleep_round_trip_through_trampoline() {
     // Short request → -EINVAL.
     let rc = mk.syscall(METHOD_SYS_NANOSLEEP, &[1, 2, 3], &mut []).unwrap();
     assert_eq!(rc, -22);
+}
+
+#[test]
+fn ramfs_open_then_read_round_trips_content_through_trampoline() {
+    // End-to-end: microkernel → kernel_register_file → kernel.wasm
+    // ramfs → microkernel.syscall(SYS_OPEN, …) → fd → SYS_READ.
+    let mk = fresh_microkernel(0);
+    mk.register_ramfs_file(b"/etc/motd", b"hello ramfs\n").unwrap();
+
+    // Open the file as KERNEL_PID. Returns fd 0 (kernel pid has no
+    // pre-installed stdio because direct syscalls aren't a real
+    // process — the fd_table is only auto-populated when a Process
+    // record is first observed; previous direct calls to KERNEL_PID
+    // already touched it via the credentials calls upstream of us in
+    // the test runner, so the lowest free fd is 3).
+    let fd = mk
+        .syscall(METHOD_SYS_OPEN, b"/etc/motd", &mut [])
+        .unwrap();
+    assert!(fd >= 0, "open succeeded: fd = {fd}");
+
+    // Read the content into a buffer.
+    let mut buf = [0u8; 64];
+    let n = mk
+        .syscall(METHOD_SYS_READ, &(fd as u32).to_le_bytes(), &mut buf)
+        .unwrap();
+    assert_eq!(n as usize, b"hello ramfs\n".len());
+    assert_eq!(&buf[..n as usize], b"hello ramfs\n");
+
+    // Open of an unknown path → -ENOENT (-2).
+    let rc = mk.syscall(METHOD_SYS_OPEN, b"/no/such", &mut []).unwrap();
+    assert_eq!(rc, -2);
 }
 
 #[test]

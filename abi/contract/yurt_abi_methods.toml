@@ -60,6 +60,11 @@ id = 7
 kind = "internal"
 doc = "Microkernel-only: drain the target process's stderr buffer into the response. Request bytes are u32 target_pid. Returns bytes read."
 
+[method.kernel_register_file]
+id = 8
+kind = "internal"
+doc = "Microkernel-only: install a file blob into the in-memory ramfs at the given path. Request bytes are u32 path_len (LE) + path_bytes + content_bytes. The path namespace is flat (no directory creation). Returns 0 on success, -EINVAL for malformed input. Phase 2 ramfs is read-only from userland; writes / unlink / mkdir land later."
+
 # Syscall methods (0x1_0000+ range).
 #
 # These are the real user-process-facing syscalls — `sys_*` names match
@@ -222,3 +227,8 @@ doc = "POSIX sched_yield(). No request bytes. On JS hosts this is the natural As
 id = 0x1_001E
 kind = "syscall"
 doc = "POSIX nanosleep(req). Request bytes are 8 bytes — duration in little-endian u64 nanoseconds. Phase 2 returns 0 immediately without actually blocking; real wall-clock sleep needs the AsyncBridge to suspend the process. The kernel still records the most recently requested duration per-pid so tests can observe the value reached the kernel. Returns 0 on success, -EINVAL for short request."
+
+[method.sys_open]
+id = 0x1_001F
+kind = "syscall"
+doc = "Open a file in the in-memory ramfs. Request bytes are the path bytes (no NUL terminator). Phase 2 is read-only — the path must have been pre-installed via kernel_register_file. Returns the new fd (>=0) on success, -ENOENT if no file at that path. fd's offset starts at 0; sys_read advances it. Note: per-fd offset (not per-open-file-description) until the OFD registry lands — `dup` produces an independent cursor."

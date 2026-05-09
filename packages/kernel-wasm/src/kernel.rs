@@ -57,7 +57,11 @@ pub enum FdEntry {
     Stdout,
     Stderr,
     Pipe { id: u64, end: PipeEnd },
-    // Future: File { id: u64 }
+    /// Read-only handle into the in-memory ramfs. `id` references a
+    /// `RamfsFile` in `Kernel::files`; `offset` is the byte cursor.
+    /// Phase 2 keeps the offset per-fd; the OFD registry that lets
+    /// dup'd fds share one cursor lands later.
+    File { id: u64, offset: u64 },
     // Future: Socket { id: u64 }
 }
 
@@ -82,6 +86,12 @@ impl FdTable {
     /// Read-only view of an entry. None if `fd` is closed.
     pub fn entry(&self, fd: u32) -> Option<&FdEntry> {
         self.entries.get(&fd)
+    }
+
+    /// Mutable view — used for in-place edits (e.g. advancing a
+    /// `FdEntry::File` cursor after a successful read).
+    pub fn entry_mut(&mut self, fd: u32) -> Option<&mut FdEntry> {
+        self.entries.get_mut(&fd)
     }
 
     /// Lowest unused fd number. Used by `dup` and `pipe` to allocate.
@@ -245,10 +255,21 @@ impl PipeBuf {
     }
 }
 
+/// One file in the in-memory ramfs. Read-only from userland for now;
+/// the microkernel installs entries via `kernel_register_file` at
+/// process-setup time.
+#[derive(Debug)]
+pub struct RamfsFile {
+    pub content: Vec<u8>,
+}
+
 pub struct Kernel {
     processes: BTreeMap<Pid, Process>,
     pipes: BTreeMap<u64, PipeBuf>,
     next_pipe_id: u64,
+    files: BTreeMap<u64, RamfsFile>,
+    path_to_file: BTreeMap<Vec<u8>, u64>,
+    next_file_id: u64,
 }
 
 impl Kernel {
@@ -257,7 +278,35 @@ impl Kernel {
             processes: BTreeMap::new(),
             pipes: BTreeMap::new(),
             next_pipe_id: 1,
+            files: BTreeMap::new(),
+            path_to_file: BTreeMap::new(),
+            next_file_id: 1,
         }
+    }
+
+    /// Install a file blob at `path`, replacing any existing content
+    /// at that path. Returns the file id. Caller controls visibility:
+    /// future open() calls against the path see this content.
+    pub fn install_file(&mut self, path: Vec<u8>, content: Vec<u8>) -> u64 {
+        if let Some(existing_id) = self.path_to_file.get(&path).copied() {
+            if let Some(file) = self.files.get_mut(&existing_id) {
+                file.content = content;
+                return existing_id;
+            }
+        }
+        let id = self.next_file_id;
+        self.next_file_id += 1;
+        self.files.insert(id, RamfsFile { content });
+        self.path_to_file.insert(path, id);
+        id
+    }
+
+    pub fn lookup_file_id(&self, path: &[u8]) -> Option<u64> {
+        self.path_to_file.get(path).copied()
+    }
+
+    pub fn ramfs_file(&self, id: u64) -> Option<&RamfsFile> {
+        self.files.get(&id)
     }
 
     /// Allocate a fresh pipe buffer with one reader-end and one
@@ -310,6 +359,9 @@ pub fn with_kernel<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
 pub fn reset_for_tests() {
     let mut k = KERNEL.lock().unwrap();
     k.processes.clear();
+    k.files.clear();
+    k.path_to_file.clear();
+    k.next_file_id = 1;
 }
 
 /// Native unit tests share the same `static KERNEL` and run in

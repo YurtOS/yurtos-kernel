@@ -35,6 +35,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_CLOSE_STDIN => close_stdin(request),
         METHOD_KERNEL_DRAIN_STDOUT => drain_stream(request, response, /*stdout=*/ true),
         METHOD_KERNEL_DRAIN_STDERR => drain_stream(request, response, /*stdout=*/ false),
+        METHOD_KERNEL_REGISTER_FILE => register_file(request),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
@@ -68,6 +69,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SIGACTION => sigaction(caller_pid, request),
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
+        METHOD_SYS_OPEN => sys_open(caller_pid, request),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -359,6 +361,28 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                 }
                 take as i64
             }
+            crate::kernel::FdEntry::File { id, offset } => {
+                let take = match k.ramfs_file(id) {
+                    Some(file) => {
+                        let start = (offset as usize).min(file.content.len());
+                        let avail = file.content.len() - start;
+                        let take = avail.min(response.len());
+                        if take > 0 {
+                            response[..take]
+                                .copy_from_slice(&file.content[start..start + take]);
+                        }
+                        take
+                    }
+                    None => return -(abi::EBADF as i64),
+                };
+                // Advance the per-fd offset.
+                if let Some(crate::kernel::FdEntry::File { offset, .. }) =
+                    k.process_mut(caller_pid).fd_table.entry_mut(fd)
+                {
+                    *offset += take as u64;
+                }
+                take as i64
+            }
         }
     })
 }
@@ -408,6 +432,9 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
                 end: crate::kernel::PipeEnd::Read,
                 ..
             } => -(abi::EBADF as i64), // can't write to read end
+            // Phase 2 ramfs is read-only; writes through a File fd are
+            // refused. Real write support arrives with the OFD registry.
+            crate::kernel::FdEntry::File { .. } => -(abi::EBADF as i64),
         }
     })
 }
@@ -635,6 +662,44 @@ fn nanosleep(caller_pid: u32, request: &[u8]) -> i64 {
     let ns = u64::from_le_bytes(request[..8].try_into().expect("8 bytes"));
     with_kernel(|k| k.process_mut(caller_pid).last_nanosleep_ns = ns);
     0
+}
+
+/// `kernel_register_file(path_len: u32, path_bytes, content_bytes)`.
+/// Microkernel-only; installs (or replaces) a file at `path`. Returns
+/// 0 on success, -EINVAL if the request is malformed.
+fn register_file(request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let path_len =
+        u32::from_le_bytes([request[0], request[1], request[2], request[3]]) as usize;
+    if request.len() < 4 + path_len {
+        return -(abi::EINVAL as i64);
+    }
+    let path = request[4..4 + path_len].to_vec();
+    let content = request[4 + path_len..].to_vec();
+    with_kernel(|k| {
+        k.install_file(path, content);
+    });
+    0
+}
+
+/// `sys_open(path) -> fd`. Read-only against the in-memory ramfs.
+fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let id = match k.lookup_file_id(request) {
+            Some(id) => id,
+            None => return -(abi::ENOENT as i64),
+        };
+        let p = k.process_mut(caller_pid);
+        let fd = p.fd_table.lowest_free_fd();
+        p.fd_table
+            .install(fd, crate::kernel::FdEntry::File { id, offset: 0 });
+        fd as i64
+    })
 }
 
 fn now_realtime(response: &mut [u8]) -> i64 {
@@ -1569,6 +1634,98 @@ mod tests {
             dispatch(METHOD_SYS_NANOSLEEP, 1, &[1, 2, 3], &mut []),
             -(abi::EINVAL as i64)
         );
+    }
+
+    #[test]
+    fn register_file_then_open_then_read_round_trips_content() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Install /etc/hello with content "hi from ramfs".
+        let mut req = Vec::new();
+        let path: &[u8] = b"/etc/hello";
+        req.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        req.extend_from_slice(path);
+        req.extend_from_slice(b"hi from ramfs");
+        assert_eq!(dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &req, &mut []), 0);
+
+        // Open it; expect the lowest free fd (3, since 0/1/2 are stdio).
+        let fd = dispatch(METHOD_SYS_OPEN, 1, path, &mut []);
+        assert_eq!(fd, 3);
+
+        // Read all bytes.
+        let mut buf = [0u8; 64];
+        let n = dispatch(
+            METHOD_SYS_READ,
+            1,
+            &(fd as u32).to_le_bytes(),
+            &mut buf,
+        );
+        assert_eq!(n as usize, b"hi from ramfs".len());
+        assert_eq!(&buf[..n as usize], b"hi from ramfs");
+
+        // Subsequent read at EOF returns 0.
+        let n = dispatch(
+            METHOD_SYS_READ,
+            1,
+            &(fd as u32).to_le_bytes(),
+            &mut buf,
+        );
+        assert_eq!(n, 0);
+
+        // close the file fd.
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &(fd as u32).to_le_bytes(), &mut []),
+            0
+        );
+    }
+
+    #[test]
+    fn open_nonexistent_path_is_enoent() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(METHOD_SYS_OPEN, 1, b"/no/such", &mut []),
+            -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
+    fn write_to_ramfs_file_fd_is_ebadf() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&5_u32.to_le_bytes());
+        reg.extend_from_slice(b"/zero");
+        reg.extend_from_slice(b"abc");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/zero", &mut []);
+        assert!(fd >= 0);
+        let mut wreq = Vec::new();
+        wreq.extend_from_slice(&(fd as u32).to_le_bytes());
+        wreq.extend_from_slice(b"NOPE");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []),
+            -(abi::EBADF as i64),
+            "ramfs is read-only in Phase 2"
+        );
+    }
+
+    #[test]
+    fn ramfs_partial_read_advances_offset() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&7_u32.to_le_bytes());
+        reg.extend_from_slice(b"/abcdef");
+        reg.extend_from_slice(b"0123456789");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/abcdef", &mut []) as u32;
+
+        let mut small = [0u8; 4];
+        let n = dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut small);
+        assert_eq!(n, 4);
+        assert_eq!(&small, b"0123");
+
+        let mut rest = [0u8; 16];
+        let n = dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut rest);
+        assert_eq!(n, 6);
+        assert_eq!(&rest[..6], b"456789");
     }
 
     #[test]
