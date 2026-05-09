@@ -68,14 +68,15 @@ jobs:
           deno-version: v2.x
       - run: deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run $IMAGE_RUNTIME_TESTS
 
-  microkernel-deno:
-    # Sandboxed-kernel: the JS-hosted microkernel runs the same
-    # kernel.wasm artifact the wasmtime backend uses, validating that
-    # the contract (`kernel_dispatch` + `kh_*` imports) is genuinely
-    # runtime-agnostic. Needs Rust + wasm32-wasip1 to build the
-    # kernel.wasm artifact, plus wabt for the inline-WAT tests that
-    # spawn user processes. See
-    # docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md.
+  microkernel-js:
+    # Sandboxed-kernel: the portable JS+wasm microkernel
+    # (packages/microkernel-js/) runs the same kernel.wasm artifact
+    # the wasmtime backend uses, validating that the contract
+    # (`kernel_dispatch` + `kh_*` imports) is genuinely runtime-
+    # agnostic. The Deno-specific extensions live in
+    # packages/microkernel-deno/ (currently a re-export); browser-
+    # specific extensions land later in packages/microkernel-browser/.
+    # See docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -91,13 +92,13 @@ jobs:
       - name: Build kernel.wasm
         run: cargo build --release -p yurt-kernel-wasm --target wasm32-wasip1
       - name: Format check
-        run: deno fmt --check packages/microkernel-deno/
+        run: deno fmt --check packages/microkernel-js/ packages/microkernel-deno/
       - name: Lint
-        run: deno lint packages/microkernel-deno/
+        run: deno lint packages/microkernel-js/ packages/microkernel-deno/
       - name: Test
         run: |
           deno test --no-check --allow-read --allow-env --allow-run \
-            packages/microkernel-deno/__tests__/
+            packages/microkernel-js/__tests__/
 
   # NOTE: a `hooks-self-check` job that runs `pre-commit run --all-files`
   # belongs in this file but is intentionally omitted from the initial gates
