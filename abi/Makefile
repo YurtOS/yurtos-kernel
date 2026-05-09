@@ -5,10 +5,13 @@
 # libyurt_abi.a per §Override And Link Precedence).
 #
 # Targets:
-#   make lib          — build libyurt_abi.a
-#   make canaries     — build every conformance/c/*-canary.wasm
-#   make all          — lib + canaries
-#   make copy-fixtures — copy canary .wasm into the kernel fixtures dir
+#   make lib                  — build libyurt_abi.a
+#   make canaries             — build every conformance/c/*-canary.wasm
+#   make side-module-canaries — build Phase 1 shared-library side modules
+#                               (NOT in `all` until slice 1C/1D land — see
+#                               docs/superpowers/plans/2026-05-09-shared-libraries-phase1.md)
+#   make all                  — lib + canaries
+#   make copy-fixtures        — copy canary .wasm into the kernel fixtures dir
 #   make clean
 
 REPO_ROOT := $(shell cd .. && pwd)
@@ -61,7 +64,19 @@ CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime l
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
 FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 
-.PHONY: all lib canaries copy-fixtures clean ensure-toolchain check-native-abi-contract
+# Phase 1 shared-library side-module fixtures
+# (docs/superpowers/specs/2026-05-09-shared-libraries-design.md). These are
+# NOT linked against libyurt_abi.a; they are built with `yurt-cc -shared`,
+# validated by `yurt-wasi-postlink --side-module`, and consumed by the
+# Phase 1 dlopen loader (which itself lands in slices 1C–1E). Until that
+# loader is wired up, building side modules is opt-in: the
+# `side-module-canaries` target is intentionally NOT a prerequisite of
+# `all`. Run it manually (or in CI when the consumer arrives) via
+# `make -C abi side-module-canaries`.
+SIDE_MODULE_CANARIES := $(BUILD_DIR)/libyurt_dlcanary.wasm
+YURT_WASI_POSTLINK := $(REPO_ROOT)/target/release/yurt-wasi-postlink
+
+.PHONY: all lib canaries copy-fixtures clean ensure-toolchain check-native-abi-contract side-module-canaries
 
 all: lib canaries
 
@@ -75,7 +90,7 @@ $(BUILD_DIR):
 # rebuild. `cargo build` is a near-no-op when everything is up to date;
 # a `test -x` existence guard would silently use stale binaries.
 ensure-toolchain:
-	cd $(REPO_ROOT) && cargo build --release -p yurt-toolchain
+	cd $(REPO_ROOT) && cargo build --release -p yurt-toolchain -p yurt-wasi-postlink
 	rm -rf $(REPO_ROOT)/target/release/yurt-include
 	cp -R $(INCLUDE) $(REPO_ROOT)/target/release/yurt-include
 
@@ -139,6 +154,31 @@ $(BUILD_DIR)/%-canary.wasm: $(CANARY_DIR)/%-canary.c $(wildcard include/*.h) $(L
 	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
 
 canaries: $(CANARIES) $(FORK_DEFAULT_CANARY)
+
+# ── Side-module fixtures (Phase 1 shared libraries) ──────────────────
+# Each side module follows the same two-step build:
+#   1. yurt-cc -fPIC -c     compile with position-independent code
+#   2. yurt-cc -shared      link via wasm-ld --shared --experimental-pic
+#                           (skips libyurt_abi.a injection per slice 1B.1)
+# Then `yurt-wasi-postlink --side-module` validates the dylink.0 custom
+# section emitted by wasm-ld and writes a sidecar manifest the Phase 1
+# loader will consume.
+#
+# Side modules do NOT depend on $(LIB); they have no static ABI archive
+# to link against by definition. They DO depend on the headers in
+# include/ (currently only <stdint.h>-style standard headers, but the
+# rule wildcard keeps incremental rebuilds correct if a header is added).
+$(BUILD_DIR)/libyurt_dlcanary.o: $(CANARY_DIR)/libyurt_dlcanary.c $(wildcard include/*.h) | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) \
+	$(YURT_CC) $(YURT_CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
+
+$(BUILD_DIR)/libyurt_dlcanary.wasm: $(BUILD_DIR)/libyurt_dlcanary.o | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_NO_WASM_OPT=1 \
+	$(YURT_CC) -shared $< -o $@
+	$(YURT_WASI_POSTLINK) --side-module --input $@ --output $@
+
+side-module-canaries: $(SIDE_MODULE_CANARIES)
 
 copy-fixtures: canaries
 	@for n in $(CANARY_NAMES); do cp $(BUILD_DIR)/$$n-canary.wasm $(FIXTURES)/$$n-canary.wasm; done
