@@ -31,6 +31,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
             kh::log(kh::LogSeverity::Info, "kernel.wasm hello via kh_log");
             0
         }
+        METHOD_KERNEL_PROVIDE_STDIN => provide_stdin(request),
+        METHOD_KERNEL_CLOSE_STDIN => close_stdin(request),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
@@ -143,6 +145,32 @@ fn getrlimit(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             None => -(abi::EINVAL as i64),
         }
     })
+}
+
+/// `kernel_provide_stdin(target_pid, payload)`. Microkernel-only;
+/// appends bytes to the target process's stdin buffer.
+fn provide_stdin(request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let pid = u32::from_le_bytes([request[0], request[1], request[2], request[3]]);
+    let payload = &request[4..];
+    with_kernel(|k| {
+        k.process_mut(pid).stdin_buffer.extend(payload);
+    });
+    payload.len() as i64
+}
+
+/// `kernel_close_stdin(target_pid)`. Microkernel-only; marks the
+/// target process's stdin as EOF.
+fn close_stdin(request: &[u8]) -> i64 {
+    let Some([pid]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        k.process_mut(pid).stdin_eof = true;
+    });
+    0
 }
 
 /// `close(fd: u32) -> 0 / -EBADF`. Decrements pipe refcounts when
@@ -260,7 +288,20 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             None => return -(abi::EBADF as i64),
         };
         match entry {
-            crate::kernel::FdEntry::Stdin => 0, // Phase 2: no host stdin source.
+            crate::kernel::FdEntry::Stdin => {
+                let p = k.process_mut(caller_pid);
+                if p.stdin_buffer.is_empty() {
+                    if p.stdin_eof {
+                        return 0; // EOF
+                    }
+                    return -(abi::EAGAIN as i64);
+                }
+                let take = p.stdin_buffer.len().min(response.len());
+                for (i, b) in p.stdin_buffer.drain(..take).enumerate() {
+                    response[i] = b;
+                }
+                take as i64
+            }
             crate::kernel::FdEntry::Stdout | crate::kernel::FdEntry::Stderr => {
                 -(abi::EINVAL as i64) // not readable
             }
@@ -951,13 +992,84 @@ mod tests {
     }
 
     #[test]
-    fn read_from_stdin_returns_eof_in_phase_2() {
+    fn read_from_empty_stdin_without_eof_is_eagain() {
         let _g = crate::kernel::TestGuard::acquire();
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &0_u32.to_le_bytes(), &mut buf),
+            -(abi::EAGAIN as i64)
+        );
+    }
+
+    #[test]
+    fn read_from_empty_stdin_with_eof_is_zero() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let close_req = 1_u32.to_le_bytes();
+        assert_eq!(
+            dispatch(METHOD_KERNEL_CLOSE_STDIN, 0, &close_req, &mut []),
+            0
+        );
         let mut buf = [0u8; 8];
         assert_eq!(
             dispatch(METHOD_SYS_READ, 1, &0_u32.to_le_bytes(), &mut buf),
             0
         );
+    }
+
+    #[test]
+    fn provided_stdin_drains_then_reaches_eof() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&1_u32.to_le_bytes());
+        req.extend_from_slice(b"abcdefg");
+        assert_eq!(dispatch(METHOD_KERNEL_PROVIDE_STDIN, 0, &req, &mut []), 7);
+
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &0_u32.to_le_bytes(), &mut buf),
+            4
+        );
+        assert_eq!(&buf, b"abcd");
+
+        let mut buf2 = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &0_u32.to_le_bytes(), &mut buf2),
+            3
+        );
+        assert_eq!(&buf2[..3], b"efg");
+
+        // Drained, no EOF yet → -EAGAIN.
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &0_u32.to_le_bytes(), &mut buf2),
+            -(abi::EAGAIN as i64)
+        );
+
+        // After EOF mark → 0.
+        let close_req = 1_u32.to_le_bytes();
+        dispatch(METHOD_KERNEL_CLOSE_STDIN, 0, &close_req, &mut []);
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &0_u32.to_le_bytes(), &mut buf2),
+            0
+        );
+    }
+
+    #[test]
+    fn stdin_is_per_pid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut r1 = Vec::new();
+        r1.extend_from_slice(&1_u32.to_le_bytes());
+        r1.extend_from_slice(b"alpha");
+        dispatch(METHOD_KERNEL_PROVIDE_STDIN, 0, &r1, &mut []);
+        let mut r2 = Vec::new();
+        r2.extend_from_slice(&2_u32.to_le_bytes());
+        r2.extend_from_slice(b"beta");
+        dispatch(METHOD_KERNEL_PROVIDE_STDIN, 0, &r2, &mut []);
+
+        let mut buf = [0u8; 16];
+        let n = dispatch(METHOD_SYS_READ, 1, &0_u32.to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"alpha");
+        let n = dispatch(METHOD_SYS_READ, 2, &0_u32.to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"beta");
     }
 
     #[test]

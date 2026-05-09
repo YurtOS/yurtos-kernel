@@ -40,6 +40,16 @@ id = 3
 kind = "internal"
 doc = "Emit a fixed log line via kh_log at INFO severity; validates the host log sink wiring."
 
+[method.kernel_provide_stdin]
+id = 4
+kind = "internal"
+doc = "Microkernel-only: append bytes to the target process's stdin buffer. Request bytes are u32 target_pid + payload. Used at spawn time to seed standard input for fixtures and shells."
+
+[method.kernel_close_stdin]
+id = 5
+kind = "internal"
+doc = "Microkernel-only: mark the target process's stdin as EOF. Subsequent sys_read on Stdin returns 0 once the buffer drains. Request bytes are u32 target_pid."
+
 # Syscall methods (0x1_0000+ range).
 #
 # These are the real user-process-facing syscalls — `sys_*` names match

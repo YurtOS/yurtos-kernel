@@ -138,6 +138,13 @@ pub struct Process {
     pub rlimits: [Option<ResourceLimit>; RLIMIT_SLOTS],
     /// Open file descriptors. Default = stdin/stdout/stderr on 0/1/2.
     pub fd_table: FdTable,
+    /// Bytes the host has supplied as standard input. Drains as
+    /// `sys_read` on `FdEntry::Stdin` consumes them. When empty and
+    /// `stdin_eof` is set, reads return 0 (EOF); otherwise -EAGAIN.
+    pub stdin_buffer: std::collections::VecDeque<u8>,
+    /// Set by the microkernel via `METHOD_KERNEL_STDIN_EOF` once it
+    /// has no more bytes to feed.
+    pub stdin_eof: bool,
 }
 
 impl Default for Process {
@@ -148,6 +155,8 @@ impl Default for Process {
             cwd: b"/".to_vec(),
             rlimits: DEFAULT_RLIMITS,
             fd_table: FdTable::default(),
+            stdin_buffer: std::collections::VecDeque::new(),
+            stdin_eof: false,
         }
     }
 }

@@ -159,6 +159,54 @@ fn echo_args_fixture_emits_argv_one_per_line() {
 }
 
 #[test]
+fn cat_stdin_fixture_echoes_stdin_to_stdout() {
+    // Real fixture from test-fixtures/wasm/cat-stdin: reads stdin
+    // until EOF, writes the same bytes to stdout. Exercises both
+    // sys_read on Stdin (kernel-side stdin buffer drain) and
+    // sys_write on Stdout in a single binary.
+    ensure_fixture_built("cat-stdin-wasm");
+    let wasm_bytes = std::fs::read(fixture_wasm_path("cat-stdin-wasm")).unwrap();
+    let (mk, sink) = fresh_microkernel_with_log();
+    let argv: Vec<&[u8]> = vec![b"cat-stdin"];
+    let mut user = mk
+        .spawn_user_process_with_args_and_stdin(
+            &wasm_bytes,
+            &argv,
+            b"sandboxed kernel input\n",
+            true, // EOF — no further bytes
+        )
+        .unwrap();
+    let _ = user.run_start();
+
+    let messages = sink.messages.lock().unwrap();
+    let combined: String = messages.iter().map(|(_, m)| m.as_str()).collect();
+    assert!(
+        combined.contains("sandboxed kernel input"),
+        "expected stdin echoed to captured stdout, got: {combined:?}"
+    );
+}
+
+#[test]
+fn wc_bytes_fixture_counts_stdin_bytes() {
+    ensure_fixture_built("wc-bytes-wasm");
+    let wasm_bytes = std::fs::read(fixture_wasm_path("wc-bytes-wasm")).unwrap();
+    let (mk, sink) = fresh_microkernel_with_log();
+    let argv: Vec<&[u8]> = vec![b"wc-bytes"];
+    let stdin = b"0123456789"; // 10 bytes
+    let mut user = mk
+        .spawn_user_process_with_args_and_stdin(&wasm_bytes, &argv, stdin, true)
+        .unwrap();
+    let _ = user.run_start();
+
+    let messages = sink.messages.lock().unwrap();
+    let combined: String = messages.iter().map(|(_, m)| m.as_str()).collect();
+    assert!(
+        combined.contains("10"),
+        "expected '10' in captured stdout, got: {combined:?}"
+    );
+}
+
+#[test]
 fn true_cmd_fixture_runs_and_proc_exits_zero() {
     ensure_fixture_built("true-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("true-cmd-wasm")).unwrap();

@@ -70,6 +70,11 @@ mod sys_method_id {
 /// internal bookkeeping. Real user processes start at `1`.
 pub const KERNEL_PID: u32 = 0;
 
+/// Kernel-internal method ids the microkernel calls during process
+/// setup (mirrors `abi/contract/yurt_abi_methods.toml`).
+const METHOD_KERNEL_PROVIDE_STDIN: u32 = 4;
+const METHOD_KERNEL_CLOSE_STDIN: u32 = 5;
+
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
 /// Microkernel-side handler for `sys_extension_invoke`. Receives the
@@ -295,6 +300,42 @@ impl Microkernel {
         self.spawn_user_process_with_args::<&[u8]>(wasm, &[])
     }
 
+    /// Spawn with both argv and stdin bytes. Stdin is fed to the
+    /// process's stdin buffer in the kernel via the
+    /// `kernel_provide_stdin` / `kernel_close_stdin` internal
+    /// methods. `eof` controls whether the buffer is sealed
+    /// immediately (no further bytes coming) — set to false if you
+    /// intend to feed more bytes later via [`UserProcess::feed_stdin`].
+    pub fn spawn_user_process_with_args_and_stdin<S: AsRef<[u8]>>(
+        &self,
+        wasm: &[u8],
+        argv: &[S],
+        stdin: &[u8],
+        eof: bool,
+    ) -> Result<UserProcess> {
+        let user = self.spawn_user_process_with_args(wasm, argv)?;
+        if !stdin.is_empty() {
+            let mut req = Vec::with_capacity(4 + stdin.len());
+            req.extend_from_slice(&user.pid.to_le_bytes());
+            req.extend_from_slice(stdin);
+            self.kernel.lock().unwrap().syscall(
+                METHOD_KERNEL_PROVIDE_STDIN,
+                KERNEL_PID,
+                &req,
+                &mut [],
+            )?;
+        }
+        if eof {
+            self.kernel.lock().unwrap().syscall(
+                METHOD_KERNEL_CLOSE_STDIN,
+                KERNEL_PID,
+                &user.pid.to_le_bytes(),
+                &mut [],
+            )?;
+        }
+        Ok(user)
+    }
+
     /// Spawn a user process with the given argv (each arg is opaque
     /// bytes — no UTF-8 guarantee, matching POSIX). The argv lands in
     /// `UserState.argv`; the WASI shim's `args_get` /
@@ -412,6 +453,32 @@ impl UserProcess {
             .get_typed_func::<(), ()>(&mut self.store, "_start")
             .context("user-process missing '_start' (not a WASI command)")?;
         f.call(&mut self.store, ()).context("user-process _start()")
+    }
+
+    /// Append `bytes` to this process's stdin buffer (kernel side).
+    /// Useful for incremental input feeding from a test driver.
+    pub fn feed_stdin(&mut self, bytes: &[u8]) -> Result<()> {
+        let mut req = Vec::with_capacity(4 + bytes.len());
+        req.extend_from_slice(&self.pid.to_le_bytes());
+        req.extend_from_slice(bytes);
+        let kernel = self.store.data().kernel.clone();
+        kernel
+            .lock()
+            .unwrap()
+            .syscall(METHOD_KERNEL_PROVIDE_STDIN, KERNEL_PID, &req, &mut [])?;
+        Ok(())
+    }
+
+    /// Mark this process's stdin as EOF.
+    pub fn close_stdin(&mut self) -> Result<()> {
+        let kernel = self.store.data().kernel.clone();
+        kernel.lock().unwrap().syscall(
+            METHOD_KERNEL_CLOSE_STDIN,
+            KERNEL_PID,
+            &self.pid.to_le_bytes(),
+            &mut [],
+        )?;
+        Ok(())
     }
 
     /// Read `len` bytes from this user-process's exported `memory` at
