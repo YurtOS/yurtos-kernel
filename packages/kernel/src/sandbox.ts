@@ -46,7 +46,6 @@ import {
   type SocketBackend,
   type SocketListenPolicy,
 } from "./network/socket-backend.js";
-import type { ListenerRegistry } from "./network/listener-registry.js";
 import { SandboxNet } from "./network/sandbox-net.js";
 import {
   buildSiteCustomizeSource,
@@ -287,9 +286,7 @@ export class Sandbox {
    */
   get net(): SandboxNet | null {
     if (this._net) return this._net;
-    const registry =
-      (this.socketBackend as { registry?: ListenerRegistry } | undefined)
-        ?.registry;
+    const registry = this.socketBackend?.registry;
     if (!registry) return null;
     this._net = new SandboxNet(registry);
     return this._net;

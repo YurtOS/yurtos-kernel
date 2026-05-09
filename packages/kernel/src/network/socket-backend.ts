@@ -103,6 +103,12 @@ export interface SocketBackend {
   ): Promise<SocketBackendResult>;
   closeListener?(listener: SocketListenerHandle): SocketBackendResult;
   close(socket: SocketHandle): SocketBackendResult;
+  /**
+   * Loopback backends expose their underlying ListenerRegistry so the host
+   * can build a SandboxNet over the same routing tables the kernel sees.
+   * Bridge / mock backends that don't have a registry leave this undefined.
+   */
+  registry?: ListenerRegistry;
 }
 
 function parseAccept(
@@ -192,9 +198,13 @@ export function createLoopbackSocketBackend(
   delegate?: SocketBackend,
   registry: ListenerRegistry = new ListenerRegistry(),
 ): SocketBackend & { registry: ListenerRegistry } {
+  // Registry handles are positive ints; we expose them as negative ints
+  // through this backend so they can't collide with bridge-allocated
+  // positive handles. Negation is self-inverse, so the same flip works
+  // in both directions; the two aliases stay for caller-side intent.
   const isLocal = (h: number) => h < 0;
   const pub = (h: number) => -h;
-  const reg = (h: number) => -h;
+  const reg = pub;
 
   function bytesToBase64(data: Uint8Array): string {
     if (data.byteLength === 0) return "";
@@ -467,13 +477,31 @@ export function createNetworkBridgeSocketBackend(
       }
     },
 
-    recvAsync(socket, maxBytes) {
-      return Promise.resolve(socketResult(bridge.requestSync({
-        op: "recv",
-        socket_id: socket,
-        max_bytes: maxBytes,
-        nonblocking: false,
-      })));
+    /**
+     * Poll the bridge with `nonblocking: true` and back off until bytes
+     * arrive, the socket closes, or any non-EAGAIN error is reported.
+     * A blocking `requestSync` would park the worker and deadlock any
+     * concurrent op on the same SAB queue (see acceptAsync above for the
+     * same constraint). Issue #18 tracks the original blocking version.
+     */
+    async recvAsync(socket, maxBytes) {
+      let delayMs = 5;
+      // deno-lint-ignore no-constant-condition
+      while (true) {
+        const r = socketResult(bridge.requestSync({
+          op: "recv",
+          socket_id: socket,
+          max_bytes: maxBytes,
+          nonblocking: true,
+        }));
+        if (r.ok) {
+          // EOF (`ok` with no bytes) and any byte payload exit the poll.
+          return r;
+        }
+        if (r.error !== "EAGAIN") return r;
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (delayMs < 100) delayMs = Math.min(100, delayMs * 2);
+      }
     },
 
     closeListener(listener) {

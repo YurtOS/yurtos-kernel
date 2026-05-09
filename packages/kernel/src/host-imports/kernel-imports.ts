@@ -1989,7 +1989,7 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
-        const host = req.host === "localhost" ? "localhost" : req.host;
+        const host = req.host;
         if (
           host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
         ) {
