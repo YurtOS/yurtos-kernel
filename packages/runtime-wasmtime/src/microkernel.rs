@@ -74,6 +74,8 @@ pub const KERNEL_PID: u32 = 0;
 /// setup (mirrors `abi/contract/yurt_abi_methods.toml`).
 const METHOD_KERNEL_PROVIDE_STDIN: u32 = 4;
 const METHOD_KERNEL_CLOSE_STDIN: u32 = 5;
+const METHOD_KERNEL_DRAIN_STDOUT: u32 = 6;
+const METHOD_KERNEL_DRAIN_STDERR: u32 = 7;
 
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
@@ -162,11 +164,11 @@ pub struct KernelStoreData {
 /// `wasmtime_wasi::preview1::add_to_linker_sync` requires for the
 /// per-process Linker data.)
 pub struct KernelInstance {
-    store: Store<KernelStoreData>,
-    memory: Memory,
-    scratch_ptr: u32,
-    scratch_len: u32,
-    dispatch: TypedFunc<(u32, u32, u32, u32, u32, u32), i64>,
+    pub(crate) store: Store<KernelStoreData>,
+    pub(crate) memory: Memory,
+    pub(crate) scratch_ptr: u32,
+    pub(crate) scratch_len: u32,
+    pub(crate) dispatch: TypedFunc<(u32, u32, u32, u32, u32, u32), i64>,
 }
 
 impl KernelInstance {
@@ -453,6 +455,48 @@ impl UserProcess {
             .get_typed_func::<(), ()>(&mut self.store, "_start")
             .context("user-process missing '_start' (not a WASI command)")?;
         f.call(&mut self.store, ()).context("user-process _start()")
+    }
+
+    /// Drain bytes the process has written to its stdout buffer
+    /// (kernel side). Returns the bytes; the buffer is emptied.
+    pub fn captured_stdout(&mut self) -> Result<Vec<u8>> {
+        self.drain_stream(METHOD_KERNEL_DRAIN_STDOUT)
+    }
+
+    /// Drain bytes the process has written to its stderr buffer.
+    pub fn captured_stderr(&mut self) -> Result<Vec<u8>> {
+        self.drain_stream(METHOD_KERNEL_DRAIN_STDERR)
+    }
+
+    fn drain_stream(&mut self, method_id: u32) -> Result<Vec<u8>> {
+        // Chunk size is bounded by `scratch_len - 4` (request carries
+        // the 4-byte pid; response shares the same scratch buffer).
+        // Loop until the kernel reports an empty drain.
+        let mut out = Vec::new();
+        let kernel = self.store.data().kernel.clone();
+        let chunk_cap = {
+            let k = kernel.lock().unwrap();
+            (k.scratch_len.saturating_sub(4)) as usize
+        };
+        loop {
+            let mut chunk = vec![0u8; chunk_cap];
+            let n = kernel.lock().unwrap().syscall(
+                method_id,
+                KERNEL_PID,
+                &self.pid.to_le_bytes(),
+                &mut chunk,
+            )?;
+            if n <= 0 {
+                break;
+            }
+            chunk.truncate(n as usize);
+            let was_full = chunk.len() == chunk_cap;
+            out.extend_from_slice(&chunk);
+            if !was_full {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Append `bytes` to this process's stdin buffer (kernel side).

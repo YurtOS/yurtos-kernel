@@ -145,6 +145,11 @@ pub struct Process {
     /// Set by the microkernel via `METHOD_KERNEL_STDIN_EOF` once it
     /// has no more bytes to feed.
     pub stdin_eof: bool,
+    /// Bytes this process has written to stdout (FdEntry::Stdout).
+    /// The microkernel drains this via `METHOD_KERNEL_DRAIN_STDOUT`.
+    pub stdout_buffer: Vec<u8>,
+    /// Bytes this process has written to stderr (FdEntry::Stderr).
+    pub stderr_buffer: Vec<u8>,
 }
 
 impl Default for Process {
@@ -157,6 +162,8 @@ impl Default for Process {
             fd_table: FdTable::default(),
             stdin_buffer: std::collections::VecDeque::new(),
             stdin_eof: false,
+            stdout_buffer: Vec::new(),
+            stderr_buffer: Vec::new(),
         }
     }
 }

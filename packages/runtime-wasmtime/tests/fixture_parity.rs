@@ -1,25 +1,27 @@
 //! Real-fixture parity tests.
 //!
 //! Builds existing wasm fixtures from `test-fixtures/wasm/` and runs
-//! them through the sandboxed-kernel microkernel. Validates that an
-//! unmodified pre-existing binary boots through the new architecture
-//! AND that its `fd_write` calls actually flow through `kernel.wasm`
-//! (via the WASI shim → `sys_write` → `kh_log` path) rather than
-//! short-circuiting through wasmtime-wasi.
+//! them through the sandboxed-kernel microkernel. Captures each
+//! process's stdout/stderr from the kernel's per-pid buffer (drained
+//! via `METHOD_KERNEL_DRAIN_STDOUT` after the run completes), so
+//! tests assert on bytes the *kernel* observed, not on a host-side
+//! shortcut.
 //!
-//! Capture mechanism today: stdout/stderr writes from a user process
-//! land in the kernel's `sys_write` handler, which routes
-//! Stdout/Stderr writes through `kh_log` to the configured `LogSink`.
-//! These tests install a `RecordingLogSink` on the microkernel and
-//! assert on its messages. When per-process stream sinks land, this
-//! becomes a `UserProcess::captured_stdout()` accessor.
+//! End-to-end byte path validated by every test below:
+//!
+//!   user wasm fd_write(1, ...)
+//!     → microkernel WASI shim
+//!         → trampoline_request(METHOD_SYS_WRITE, [fd|payload])
+//!             → kernel.wasm sys_write on FdEntry::Stdout
+//!                 → Process.stdout_buffer (per-pid)
+//!                 ← UserProcess::captured_stdout() drain
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use yurt_runtime_wasmtime::microkernel::{
-    build_kernel_wasm, default_kernel_wasm_path, HostState, LogSink, Microkernel,
+    build_kernel_wasm, default_kernel_wasm_path, HostState, Microkernel,
 };
 
 fn workspace_root() -> &'static Path {
@@ -70,150 +72,82 @@ fn ensure_kernel_wasm() -> &'static PathBuf {
     })
 }
 
-/// Captures messages emitted via kh_log. Tests assert on the captured
-/// stream after running a fixture.
-#[derive(Default)]
-struct RecordingLogSink {
-    messages: Mutex<Vec<(u32, String)>>,
-}
-
-impl LogSink for RecordingLogSink {
-    fn emit(&self, severity: u32, message: &str) {
-        self.messages
-            .lock()
-            .unwrap()
-            .push((severity, message.to_owned()));
-    }
-}
-
-fn fresh_microkernel_with_log() -> (Microkernel, Arc<RecordingLogSink>) {
-    let sink = Arc::new(RecordingLogSink::default());
-    let mk = Microkernel::load(
-        ensure_kernel_wasm(),
-        HostState {
-            log_sink: sink.clone(),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    (mk, sink)
+fn fresh_microkernel() -> Microkernel {
+    Microkernel::load(ensure_kernel_wasm(), HostState::default()).unwrap()
 }
 
 #[test]
 fn hello_wasm_prints_via_sys_write_through_kernel_wasm() {
-    // Real fixture from test-fixtures/wasm/hello: a stock `cargo run`
-    // Rust binary calling `println!("hello from wasm")`. Boots via
-    // `_start`. Its fd_write goes through:
-    //
-    //   user wasm fd_write(1, iovs, ...)
-    //     → microkernel WASI shim
-    //         → sys_write trampoline into kernel.wasm
-    //             → kernel sys_write on Stdout → kh_log
-    //               → LogSink (captured here)
-    //
-    // This is the integration test we couldn't write before the WASI
-    // shim landed.
     ensure_fixture_built("hello-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("hello-wasm")).unwrap();
-
-    let (mk, sink) = fresh_microkernel_with_log();
+    let mk = fresh_microkernel();
     let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
     let _ = user.run_start(); // proc_exit traps; that's fine
 
-    let messages = sink.messages.lock().unwrap();
-    let combined: String = messages.iter().map(|(_, m)| m.as_str()).collect();
-    assert!(
-        combined.contains("hello from wasm"),
-        "expected 'hello from wasm' in captured kh_log stream, got: {combined:?}"
+    let stdout = String::from_utf8_lossy(&user.captured_stdout().unwrap()).to_string();
+    assert_eq!(
+        stdout, "hello from wasm\n",
+        "hello-wasm wrote exactly its expected stdout via the kernel"
     );
 }
 
 #[test]
 fn echo_args_fixture_emits_argv_one_per_line() {
-    // Real fixture from test-fixtures/wasm/echo-args. Uses
-    // std::env::args(), which calls WASI args_get / args_sizes_get
-    // via our shim. Each arg goes through fd_write → sys_write →
-    // kh_log → captured here.
     ensure_fixture_built("echo-args-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("echo-args-wasm")).unwrap();
-    let (mk, sink) = fresh_microkernel_with_log();
-    // Note: argv[0] is the program name conventionally; the fixture
-    // skips it (`std::env::args().skip(1)`).
+    let mk = fresh_microkernel();
     let argv: Vec<&[u8]> = vec![b"echo-args", b"alpha", b"beta", b"gamma"];
     let mut user = mk.spawn_user_process_with_args(&wasm_bytes, &argv).unwrap();
     let _ = user.run_start();
 
-    let messages = sink.messages.lock().unwrap();
-    let combined: String = messages.iter().map(|(_, m)| m.as_str()).collect();
-    for arg in &["alpha", "beta", "gamma"] {
-        assert!(
-            combined.contains(arg),
-            "expected '{arg}' in captured stdout, got: {combined:?}"
-        );
-    }
-    // argv[0] is the program name; the fixture skips it.
-    assert!(
-        !combined.contains("echo-args"),
-        "fixture skips argv[0]; captured stdout should not include the program name: {combined:?}"
+    let stdout = String::from_utf8_lossy(&user.captured_stdout().unwrap()).to_string();
+    assert_eq!(
+        stdout, "alpha\nbeta\ngamma\n",
+        "echo-args wrote argv[1..] one per line"
     );
 }
 
 #[test]
 fn cat_stdin_fixture_echoes_stdin_to_stdout() {
-    // Real fixture from test-fixtures/wasm/cat-stdin: reads stdin
-    // until EOF, writes the same bytes to stdout. Exercises both
-    // sys_read on Stdin (kernel-side stdin buffer drain) and
-    // sys_write on Stdout in a single binary.
     ensure_fixture_built("cat-stdin-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("cat-stdin-wasm")).unwrap();
-    let (mk, sink) = fresh_microkernel_with_log();
+    let mk = fresh_microkernel();
     let argv: Vec<&[u8]> = vec![b"cat-stdin"];
     let mut user = mk
         .spawn_user_process_with_args_and_stdin(
             &wasm_bytes,
             &argv,
             b"sandboxed kernel input\n",
-            true, // EOF — no further bytes
+            true,
         )
         .unwrap();
     let _ = user.run_start();
 
-    let messages = sink.messages.lock().unwrap();
-    let combined: String = messages.iter().map(|(_, m)| m.as_str()).collect();
-    assert!(
-        combined.contains("sandboxed kernel input"),
-        "expected stdin echoed to captured stdout, got: {combined:?}"
-    );
+    let stdout = user.captured_stdout().unwrap();
+    assert_eq!(stdout, b"sandboxed kernel input\n");
 }
 
 #[test]
 fn wc_bytes_fixture_counts_stdin_bytes() {
     ensure_fixture_built("wc-bytes-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("wc-bytes-wasm")).unwrap();
-    let (mk, sink) = fresh_microkernel_with_log();
+    let mk = fresh_microkernel();
     let argv: Vec<&[u8]> = vec![b"wc-bytes"];
-    let stdin = b"0123456789"; // 10 bytes
     let mut user = mk
-        .spawn_user_process_with_args_and_stdin(&wasm_bytes, &argv, stdin, true)
+        .spawn_user_process_with_args_and_stdin(&wasm_bytes, &argv, b"0123456789", true)
         .unwrap();
     let _ = user.run_start();
 
-    let messages = sink.messages.lock().unwrap();
-    let combined: String = messages.iter().map(|(_, m)| m.as_str()).collect();
-    assert!(
-        combined.contains("10"),
-        "expected '10' in captured stdout, got: {combined:?}"
-    );
+    let stdout = String::from_utf8_lossy(&user.captured_stdout().unwrap()).to_string();
+    assert_eq!(stdout, "10\n");
 }
 
 #[test]
 fn true_cmd_fixture_runs_and_proc_exits_zero() {
     ensure_fixture_built("true-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("true-cmd-wasm")).unwrap();
-    let (mk, _sink) = fresh_microkernel_with_log();
+    let mk = fresh_microkernel();
     let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
-    // proc_exit traps via our shim; we just confirm the run reached
-    // proc_exit (i.e. the trap message mentions proc_exit).
     let err = user.run_start().unwrap_err();
     let msg = format!("{err:#}");
     assert!(
@@ -226,7 +160,7 @@ fn true_cmd_fixture_runs_and_proc_exits_zero() {
 fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     ensure_fixture_built("false-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("false-cmd-wasm")).unwrap();
-    let (mk, _sink) = fresh_microkernel_with_log();
+    let mk = fresh_microkernel();
     let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
     let err = user.run_start().unwrap_err();
     let msg = format!("{err:#}");
@@ -234,11 +168,8 @@ fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
         msg.contains("proc_exit"),
         "expected proc_exit trap, got: {msg}"
     );
-    // false-cmd should report a non-zero exit code in the trap message.
     assert!(
-        msg.contains("proc_exit(1)")
-            || msg.contains("proc_exit(101)")
-            || !msg.contains("proc_exit(0)"),
-        "expected non-zero exit code in proc_exit trap, got: {msg}"
+        !msg.contains("proc_exit(0)"),
+        "false-cmd should report a non-zero exit code; got: {msg}"
     );
 }

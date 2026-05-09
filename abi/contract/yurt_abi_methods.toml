@@ -50,6 +50,16 @@ id = 5
 kind = "internal"
 doc = "Microkernel-only: mark the target process's stdin as EOF. Subsequent sys_read on Stdin returns 0 once the buffer drains. Request bytes are u32 target_pid."
 
+[method.kernel_drain_stdout]
+id = 6
+kind = "internal"
+doc = "Microkernel-only: drain the target process's stdout buffer into the response. Request bytes are u32 target_pid. Returns bytes read (which empties the buffer)."
+
+[method.kernel_drain_stderr]
+id = 7
+kind = "internal"
+doc = "Microkernel-only: drain the target process's stderr buffer into the response. Request bytes are u32 target_pid. Returns bytes read."
+
 # Syscall methods (0x1_0000+ range).
 #
 # These are the real user-process-facing syscalls — `sys_*` names match

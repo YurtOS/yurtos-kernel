@@ -33,6 +33,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         }
         METHOD_KERNEL_PROVIDE_STDIN => provide_stdin(request),
         METHOD_KERNEL_CLOSE_STDIN => close_stdin(request),
+        METHOD_KERNEL_DRAIN_STDOUT => drain_stream(request, response, /*stdout=*/ true),
+        METHOD_KERNEL_DRAIN_STDERR => drain_stream(request, response, /*stdout=*/ false),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
@@ -159,6 +161,29 @@ fn provide_stdin(request: &[u8]) -> i64 {
         k.process_mut(pid).stdin_buffer.extend(payload);
     });
     payload.len() as i64
+}
+
+/// `kernel_drain_stdout|stderr(target_pid)`. Microkernel-only;
+/// drains the target process's stdout (or stderr) buffer into the
+/// response. Returns bytes read.
+fn drain_stream(request: &[u8], response: &mut [u8], stdout: bool) -> i64 {
+    let Some([pid]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let p = k.process_mut(pid);
+        let buf = if stdout {
+            &mut p.stdout_buffer
+        } else {
+            &mut p.stderr_buffer
+        };
+        let take = buf.len().min(response.len());
+        if take > 0 {
+            response[..take].copy_from_slice(&buf[..take]);
+            buf.drain(..take);
+        }
+        take as i64
+    })
 }
 
 /// `kernel_close_stdin(target_pid)`. Microkernel-only; marks the
@@ -344,15 +369,15 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
         match entry {
             crate::kernel::FdEntry::Stdin => -(abi::EINVAL as i64),
             crate::kernel::FdEntry::Stdout => {
-                if let Ok(s) = std::str::from_utf8(payload) {
-                    kh::log(kh::LogSeverity::Info, s);
-                }
+                k.process_mut(caller_pid)
+                    .stdout_buffer
+                    .extend_from_slice(payload);
                 payload.len() as i64
             }
             crate::kernel::FdEntry::Stderr => {
-                if let Ok(s) = std::str::from_utf8(payload) {
-                    kh::log(kh::LogSeverity::Error, s);
-                }
+                k.process_mut(caller_pid)
+                    .stderr_buffer
+                    .extend_from_slice(payload);
                 payload.len() as i64
             }
             crate::kernel::FdEntry::Pipe {
@@ -977,10 +1002,9 @@ mod tests {
     }
 
     #[test]
-    fn write_to_stdout_routes_to_log_sink() {
-        // sys_write to fd 1 (Stdout) feeds kh_log; the native test
-        // path's kh stub is a no-op, so we just verify it doesn't
-        // error and reports the byte count.
+    fn write_to_stdout_buffers_in_per_pid_state() {
+        // sys_write to fd 1 (Stdout) appends to Process.stdout_buffer;
+        // METHOD_KERNEL_DRAIN_STDOUT reads it back.
         let _g = crate::kernel::TestGuard::acquire();
         let mut wreq = Vec::new();
         wreq.extend_from_slice(&1_u32.to_le_bytes());
@@ -989,6 +1013,67 @@ mod tests {
             dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []),
             "hello stdout".len() as i64
         );
+        // Drain the buffer via METHOD_KERNEL_DRAIN_STDOUT and verify.
+        let mut buf = [0u8; 64];
+        let drain_req = 1_u32.to_le_bytes();
+        let n = dispatch(METHOD_KERNEL_DRAIN_STDOUT, 0, &drain_req, &mut buf);
+        assert_eq!(n, "hello stdout".len() as i64);
+        assert_eq!(&buf[..n as usize], b"hello stdout");
+        // Subsequent drain returns 0.
+        assert_eq!(
+            dispatch(METHOD_KERNEL_DRAIN_STDOUT, 0, &drain_req, &mut buf),
+            0
+        );
+    }
+
+    #[test]
+    fn write_to_stderr_uses_separate_per_pid_buffer() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut w = Vec::new();
+        w.extend_from_slice(&2_u32.to_le_bytes());
+        w.extend_from_slice(b"err msg");
+        dispatch(METHOD_SYS_WRITE, 1, &w, &mut []);
+
+        // Stderr drains separately; stdout is empty.
+        let drain_req = 1_u32.to_le_bytes();
+        let mut buf = [0u8; 64];
+        assert_eq!(
+            dispatch(METHOD_KERNEL_DRAIN_STDOUT, 0, &drain_req, &mut buf),
+            0
+        );
+        let n = dispatch(METHOD_KERNEL_DRAIN_STDERR, 0, &drain_req, &mut buf);
+        assert_eq!(n, "err msg".len() as i64);
+        assert_eq!(&buf[..n as usize], b"err msg");
+    }
+
+    #[test]
+    fn stdout_buffers_are_per_pid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Pid 1 writes "alpha"; pid 2 writes "beta".
+        let mut w1 = Vec::new();
+        w1.extend_from_slice(&1_u32.to_le_bytes());
+        w1.extend_from_slice(b"alpha");
+        dispatch(METHOD_SYS_WRITE, 1, &w1, &mut []);
+        let mut w2 = Vec::new();
+        w2.extend_from_slice(&1_u32.to_le_bytes());
+        w2.extend_from_slice(b"beta");
+        dispatch(METHOD_SYS_WRITE, 2, &w2, &mut []);
+
+        let mut buf = [0u8; 64];
+        let n = dispatch(
+            METHOD_KERNEL_DRAIN_STDOUT,
+            0,
+            &1_u32.to_le_bytes(),
+            &mut buf,
+        );
+        assert_eq!(&buf[..n as usize], b"alpha");
+        let n = dispatch(
+            METHOD_KERNEL_DRAIN_STDOUT,
+            0,
+            &2_u32.to_le_bytes(),
+            &mut buf,
+        );
+        assert_eq!(&buf[..n as usize], b"beta");
     }
 
     #[test]
