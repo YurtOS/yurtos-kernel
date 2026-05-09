@@ -57,6 +57,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
+        METHOD_SYS_ISATTY => isatty(caller_pid, request),
+        METHOD_SYS_CLOCK_GETTIME => clock_gettime(request, response),
         METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
         _ => -(abi::ENOSYS as i64),
     }
@@ -462,6 +464,41 @@ fn umask(caller_pid: u32, request: &[u8]) -> i64 {
         p.umask = new_mask;
         prev as i64
     })
+}
+
+fn isatty(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(fd) {
+        None => -(abi::EBADF as i64),
+        Some(crate::kernel::FdEntry::Stdin)
+        | Some(crate::kernel::FdEntry::Stdout)
+        | Some(crate::kernel::FdEntry::Stderr) => 1,
+        Some(_) => 0,
+    })
+}
+
+/// `clock_gettime(clock_id) -> 8 bytes le u64 ns`. clock_id 0 =
+/// REALTIME (kh_now_realtime), 1 = MONOTONIC (kh_now_monotonic when
+/// it lands; today aliased to REALTIME).
+fn clock_gettime(request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([clock_id]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if response.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    match clock_id {
+        0 | 1 => match kh::now_realtime_ns() {
+            Ok(ns) => {
+                response[..8].copy_from_slice(&ns.to_le_bytes());
+                8
+            }
+            Err(rc) => rc as i64,
+        },
+        _ => -(abi::EINVAL as i64),
+    }
 }
 
 fn now_realtime(response: &mut [u8]) -> i64 {
@@ -1155,6 +1192,60 @@ mod tests {
         assert_eq!(&buf[..n as usize], b"alpha");
         let n = dispatch(METHOD_SYS_READ, 2, &0_u32.to_le_bytes(), &mut buf);
         assert_eq!(&buf[..n as usize], b"beta");
+    }
+
+    #[test]
+    fn isatty_reports_one_for_stdio_and_zero_for_pipe_ends() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Default fd table has 0/1/2 → all three report 1.
+        for fd in 0..=2u32 {
+            assert_eq!(
+                dispatch(METHOD_SYS_ISATTY, 1, &fd.to_le_bytes(), &mut []),
+                1,
+                "fd {fd} should be a tty"
+            );
+        }
+        // Allocate a pipe; both ends report 0.
+        let mut fds = [0u8; 8];
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds);
+        let read_fd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let write_fd = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+        assert_eq!(
+            dispatch(METHOD_SYS_ISATTY, 1, &read_fd.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_ISATTY, 1, &write_fd.to_le_bytes(), &mut []),
+            0
+        );
+    }
+
+    #[test]
+    fn isatty_on_closed_fd_is_ebadf() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(METHOD_SYS_ISATTY, 1, &99_u32.to_le_bytes(), &mut []),
+            -(abi::EBADF as i64)
+        );
+    }
+
+    #[test]
+    fn clock_gettime_realtime_returns_kh_now_value() {
+        // Native test stub for kh_now_realtime returns
+        // 1_700_000_000_000_000_000 ns; check it round-trips.
+        let mut buf = [0u8; 8];
+        let n = dispatch(METHOD_SYS_CLOCK_GETTIME, 1, &0_u32.to_le_bytes(), &mut buf);
+        assert_eq!(n, 8);
+        assert_eq!(u64::from_le_bytes(buf), 1_700_000_000_000_000_000_u64);
+    }
+
+    #[test]
+    fn clock_gettime_unknown_clock_is_einval() {
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOCK_GETTIME, 1, &99_u32.to_le_bytes(), &mut buf),
+            -(abi::EINVAL as i64)
+        );
     }
 
     #[test]

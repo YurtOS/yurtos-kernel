@@ -143,6 +143,31 @@ export function buildWasiShim(
     throw new Error(`user process called proc_exit(${rval})`);
   };
 
+  // ── clock_time_get: route to sys_clock_gettime ────────────────
+  const clock_time_get = (
+    clockId: number,
+    _precision: bigint,
+    timePtr: number,
+  ): number => {
+    const mapped = clockId === 0 ? 0 : clockId === 1 || clockId === 2 ||
+        clockId === 3
+      ? 1
+      : -1;
+    if (mapped < 0) return 22; // EINVAL
+    const req = new Uint8Array(4);
+    new DataView(req.buffer).setUint32(0, mapped, true);
+    const { rc, response } = kernel.syscall(
+      METHOD.SYS_CLOCK_GETTIME,
+      pid,
+      req,
+      8,
+    );
+    const n = Number(rc);
+    if (n !== 8) return errnoFromKernel(n);
+    new Uint8Array(um(), timePtr, 8).set(response.subarray(0, 8));
+    return 0;
+  };
+
   const implemented = {
     fd_write,
     fd_read,
@@ -150,6 +175,7 @@ export function buildWasiShim(
     fd_seek,
     fd_fdstat_get,
     proc_exit,
+    clock_time_get,
     args_get,
     args_sizes_get,
     environ_get,
@@ -164,7 +190,6 @@ export function buildWasiShim(
   for (
     const name of [
       "clock_res_get",
-      "clock_time_get",
       "fd_advise",
       "fd_allocate",
       "fd_datasync",

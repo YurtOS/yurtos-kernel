@@ -78,6 +78,8 @@ export const METHOD = {
   SYS_PIPE: 0x1_0012,
   SYS_READ: 0x1_0013,
   SYS_WRITE: 0x1_0014,
+  SYS_ISATTY: 0x1_0015,
+  SYS_CLOCK_GETTIME: 0x1_0016,
 } as const;
 
 export const KERNEL_PID = 0;

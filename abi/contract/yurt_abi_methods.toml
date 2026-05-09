@@ -168,6 +168,16 @@ id = 0x1_0014
 kind = "syscall"
 doc = "Write payload bytes to fd. Request bytes are: u32 fd LE + payload. Returns bytes-written on success, -EPIPE if all readers have closed (pipes), -EBADF for bad fd, -EINVAL for non-writable fd type. Stdout/stderr writes are routed through kh_log."
 
+[method.sys_isatty]
+id = 0x1_0015
+kind = "syscall"
+doc = "POSIX isatty(fd). Request bytes carry the u32 fd. Returns 1 if the fd refers to a terminal (Stdin/Stdout/Stderr today), 0 if it does not, -EBADF if the fd isn't open."
+
+[method.sys_clock_gettime]
+id = 0x1_0016
+kind = "syscall"
+doc = "POSIX clock_gettime. Request bytes carry the u32 clock_id (0 = REALTIME, 1 = MONOTONIC; others -EINVAL). Response is 8 bytes — u64 nanoseconds little-endian. Returns 8 on success, negated POSIX errno on error."
+
 [method.sys_extension_invoke]
 id = 0x1_0010
 kind = "syscall"

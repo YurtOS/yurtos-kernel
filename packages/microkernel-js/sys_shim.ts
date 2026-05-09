@@ -147,5 +147,19 @@ export function buildSysImports(
       req.set(payload, 4);
       return forwardRequestBytes(METHOD.SYS_WRITE, req);
     },
+
+    sys_isatty: (fd) => forwardRequestBytes(METHOD.SYS_ISATTY, u32(fd)),
+    sys_clock_gettime: (clockId, outPtr) => {
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_CLOCK_GETTIME,
+        u32(clockId),
+        8,
+      );
+      if (rc === 8) {
+        new Uint8Array(um(), outPtr, 8).set(response.subarray(0, 8));
+        return 0;
+      }
+      return rc;
+    },
   };
 }

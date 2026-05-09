@@ -65,6 +65,8 @@ mod sys_method_id {
     pub const PIPE: u32 = 0x1_0012;
     pub const READ: u32 = 0x1_0013;
     pub const WRITE: u32 = 0x1_0014;
+    pub const ISATTY: u32 = 0x1_0015;
+    pub const CLOCK_GETTIME: u32 = 0x1_0016;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -1102,6 +1104,32 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(fd as u32).to_le_bytes());
             req.extend_from_slice(&payload);
             forward_request_bytes(&mut caller, sys_method_id::WRITE, &req) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_isatty",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            forward_u32_arg(&mut caller, sys_method_id::ISATTY, fd as u32)
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_clock_gettime",
+        |mut caller: Caller<'_, UserState>, clock_id: i32, out_ptr: u32| -> i32 {
+            let req = (clock_id as u32).to_le_bytes();
+            let rc = forward_request_with_user_response(
+                &mut caller,
+                sys_method_id::CLOCK_GETTIME,
+                &req,
+                out_ptr,
+                8,
+            );
+            if rc == 8 {
+                0
+            } else {
+                rc as i32
+            }
         },
     )?;
     Ok(())

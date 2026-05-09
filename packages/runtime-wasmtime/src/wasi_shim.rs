@@ -324,13 +324,48 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         },
     )?;
 
+    // ── clock_time_get: route to sys_clock_gettime ────────────────
+    linker.func_wrap(
+        WASI,
+        "clock_time_get",
+        |mut caller: Caller<'_, UserState>, clock_id: i32, _precision: i64, time_ptr: u32| -> i32 {
+            // WASI clock ids: 0 = REALTIME, 1 = MONOTONIC, 2 =
+            // PROCESS_CPUTIME, 3 = THREAD_CPUTIME. Our kernel handles
+            // 0 and 1; map 2/3 → 1 (MONOTONIC) until process-cpu
+            // accounting lands.
+            let mapped = match clock_id {
+                0 => 0u32,
+                1 | 2 | 3 => 1u32,
+                _ => return EINVAL,
+            };
+            let req = mapped.to_le_bytes();
+            let mut resp = [0u8; 8];
+            let rc = crate::microkernel::trampoline_request_with_response(
+                &mut caller,
+                METHOD_CLOCK_GETTIME,
+                &req,
+                &mut resp,
+            );
+            if rc != 8 {
+                return errno_from_kernel(rc);
+            }
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return EINVAL,
+            };
+            if memory.write(&mut caller, time_ptr as usize, &resp).is_err() {
+                return EINVAL;
+            }
+            0
+        },
+    )?;
+
     // ── Catch-all: any other preview1 call returns ENOSYS ──────────
     // Wasmtime requires every imported function to be defined. We
     // can't do a wildcard, so we list the rest as ENOSYS stubs.
     // (Add to this list as fixtures need them.)
     for name in [
         "clock_res_get",
-        "clock_time_get",
         "fd_advise",
         "fd_allocate",
         "fd_datasync",
@@ -378,3 +413,4 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
 const METHOD_WRITE: u32 = 0x1_0014;
 const METHOD_READ: u32 = 0x1_0013;
 const METHOD_CLOSE: u32 = 0x1_000E;
+const METHOD_CLOCK_GETTIME: u32 = 0x1_0016;

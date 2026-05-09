@@ -48,6 +48,8 @@ const METHOD_SYS_DUP2: u32 = 0x1_0011;
 const METHOD_SYS_PIPE: u32 = 0x1_0012;
 const METHOD_SYS_READ: u32 = 0x1_0013;
 const METHOD_SYS_WRITE: u32 = 0x1_0014;
+const METHOD_SYS_ISATTY: u32 = 0x1_0015;
+const METHOD_SYS_CLOCK_GETTIME: u32 = 0x1_0016;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -764,6 +766,12 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_pipe", METHOD_SYS_PIPE, METHOD_SYS_PIPE as i64),
         ("sys_read", METHOD_SYS_READ, METHOD_SYS_READ as i64),
         ("sys_write", METHOD_SYS_WRITE, METHOD_SYS_WRITE as i64),
+        ("sys_isatty", METHOD_SYS_ISATTY, METHOD_SYS_ISATTY as i64),
+        (
+            "sys_clock_gettime",
+            METHOD_SYS_CLOCK_GETTIME,
+            METHOD_SYS_CLOCK_GETTIME as i64,
+        ),
         (
             "sys_extension_invoke",
             METHOD_SYS_EXTENSION_INVOKE,
