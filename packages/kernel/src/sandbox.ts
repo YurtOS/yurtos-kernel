@@ -46,6 +46,8 @@ import type {
   SocketBackend,
   SocketListenPolicy,
 } from "./network/socket-backend.js";
+import type { ListenerRegistry } from "./network/listener-registry.js";
+import { SandboxNet } from "./network/sandbox-net.js";
 import {
   buildSiteCustomizeSource,
   getRequestsShimSource,
@@ -218,6 +220,7 @@ export class Sandbox {
   private envSnapshots: Map<string, Map<string, string>> = new Map();
   private bridge: NetworkBridgeLike | null = null;
   private socketBackend: SocketBackend | undefined;
+  private _net: SandboxNet | null = null;
   private serverSockets: SocketListenPolicy | undefined;
   private runtimeBackend: RuntimeEngineBackend;
   private networkPolicy: NetworkPolicy | undefined;
@@ -272,6 +275,23 @@ export class Sandbox {
     this.bootImports = parts.bootImports;
     this.runCommandHandler = parts.runCommandHandler;
     this.envNeedsSync = parts.env.size > 0;
+  }
+
+  /**
+   * Host-page-facing network API. Returns a SandboxNet wrapper over the
+   * socket backend's listener registry, or null if the configured
+   * backend doesn't expose one (e.g. the legacy network-bridge worker
+   * path that talks to real OS sockets via SAB). The browser harness
+   * uses this to enumerate sandbox-bound listeners and open duplex
+   * streams from page code into a sandbox-listening server.
+   */
+  get net(): SandboxNet | null {
+    if (this._net) return this._net;
+    const registry = (this.socketBackend as { registry?: ListenerRegistry } | undefined)
+      ?.registry;
+    if (!registry) return null;
+    this._net = new SandboxNet(registry);
+    return this._net;
   }
 
   private audit(type: string, data?: Record<string, unknown>): void {

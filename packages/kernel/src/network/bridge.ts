@@ -319,7 +319,34 @@ export class NetworkBridge implements NetworkBridgeLike {
           writeOk({ ok: true, ...item });
           return;
         }
-        writeOk({ ok: false, would_block: true, error: 'accept would block' });
+        if (req.nonblocking) {
+          writeOk({ ok: false, would_block: true, error: 'accept would block' });
+          return;
+        }
+        // Block until a connection arrives. The pre-existing connection
+        // handler already pushes incoming sockets into the pending queue
+        // and wakes the first waiter; we queue here and reply when poked.
+        return new Promise((resolve) => {
+          let settled = false;
+          const wake = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            const item = listener.pending.shift();
+            if (item) writeOk({ ok: true, ...item });
+            else writeErr('accept: listener closed');
+            resolve();
+          };
+          const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            const i = listener.connectWaiters.indexOf(wake);
+            if (i >= 0) listener.connectWaiters.splice(i, 1);
+            writeErr('accept: timed out');
+            resolve();
+          }, 30000);
+          listener.connectWaiters.push(wake);
+        });
       }
 
       function handleCloseListener(req) {
@@ -441,7 +468,7 @@ export class NetworkBridge implements NetworkBridgeLike {
               case 'fetch': await handleFetch(req); break;
               case 'connect': await handleConnect(req); break;
               case 'listen': await handleListen(req); break;
-              case 'accept': handleAccept(req); break;
+              case 'accept': await handleAccept(req); break;
               case 'send': await handleSend(req); break;
               case 'recv': await handleRecv(req); break;
               case 'set_no_delay': handleSetNoDelay(req); break;
