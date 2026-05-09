@@ -378,16 +378,30 @@ export function createNetworkBridgeSocketBackend(
       return parseAccept(bridge.requestSync({
         op: "accept",
         listener_id: listener,
-        nonblocking: true,
       }));
     },
 
-    acceptAsync(listener) {
-      return Promise.resolve(parseAccept(bridge.requestSync({
-        op: "accept",
-        listener_id: listener,
-        nonblocking: false,
-      })));
+    /**
+     * The bridge worker serializes requests over the SAB; a long-running
+     * accept on the worker side would deadlock against the connect that
+     * feeds it. Poll instead, yielding the kernel-side event loop
+     * between attempts so other host work can run. This is the
+     * transport's only supported async pattern; the host-import handler
+     * still sees a single `await acceptAsync`.
+     */
+    async acceptAsync(listener) {
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        const r = parseAccept(bridge.requestSync({
+          op: "accept",
+          listener_id: listener,
+        }));
+        if (!(r.ok === false && "wouldBlock" in r && r.wouldBlock === true)) {
+          return r;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      return { ok: false, error: "accept: timed out" };
     },
 
     recvAsync(socket, maxBytes) {

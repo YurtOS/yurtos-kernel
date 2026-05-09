@@ -279,6 +279,8 @@ export class NetworkBridge implements NetworkBridgeLike {
             local_port: req.port,
           };
           pending.push(item);
+          // Unblock a routed-loopback connecting client whose
+          // handleConnect is awaiting acceptedReady on this listener.
           const waiter = connectWaiters.shift();
           if (waiter) waiter();
         });
@@ -319,34 +321,10 @@ export class NetworkBridge implements NetworkBridgeLike {
           writeOk({ ok: true, ...item });
           return;
         }
-        if (req.nonblocking) {
-          writeOk({ ok: false, would_block: true, error: 'accept would block' });
-          return;
-        }
-        // Block until a connection arrives. The pre-existing connection
-        // handler already pushes incoming sockets into the pending queue
-        // and wakes the first waiter; we queue here and reply when poked.
-        return new Promise((resolve) => {
-          let settled = false;
-          const wake = () => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            const item = listener.pending.shift();
-            if (item) writeOk({ ok: true, ...item });
-            else writeErr('accept: listener closed');
-            resolve();
-          };
-          const timer = setTimeout(() => {
-            if (settled) return;
-            settled = true;
-            const i = listener.connectWaiters.indexOf(wake);
-            if (i >= 0) listener.connectWaiters.splice(i, 1);
-            writeErr('accept: timed out');
-            resolve();
-          }, 30000);
-          listener.connectWaiters.push(wake);
-        });
+        // Bridge requests are serialized over the SAB, so a long-running
+        // accept here would block any connect that's about to feed it.
+        // Always reply immediately; the kernel-side adapter polls.
+        writeOk({ ok: false, would_block: true, error: 'accept would block' });
       }
 
       function handleCloseListener(req) {
@@ -468,7 +446,7 @@ export class NetworkBridge implements NetworkBridgeLike {
               case 'fetch': await handleFetch(req); break;
               case 'connect': await handleConnect(req); break;
               case 'listen': await handleListen(req); break;
-              case 'accept': await handleAccept(req); break;
+              case 'accept': handleAccept(req); break;
               case 'send': await handleSend(req); break;
               case 'recv': await handleRecv(req); break;
               case 'set_no_delay': handleSetNoDelay(req); break;

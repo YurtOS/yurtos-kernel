@@ -2276,18 +2276,19 @@ export function createKernelImports(
     },
 
     // host_socket_recv(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // Receives data from an open socket. Async — backends that implement
-    // recvAsync (loopback registry, browser registry) suspend the host
-    // import via JSPI/Asyncify until at least one byte (or EOF) is
-    // available, so a guest's blocking read(2) doesn't busy-poll.
+    // Receives data from an open socket. Returns synchronously for
+    // peek-with-buffer and nonblocking reads; returns a Promise for
+    // blocking reads, so backends with recvAsync (loopback, browser
+    // registry) suspend the host import via JSPI/Asyncify until at
+    // least one byte (or EOF) arrives.
     // Request JSON: { fd, max_bytes }
     // Response JSON: { ok, data_b64 } or { ok: false, error }
-    async host_socket_recv(
+    host_socket_recv(
       reqPtr: number,
       reqLen: number,
       outPtr: number,
       outCap: number,
-    ): Promise<number> {
+    ): number | Promise<number> {
       if (!socketBackend) {
         return writeJson(memory, outPtr, outCap, {
           ok: false,
@@ -2327,18 +2328,19 @@ export function createKernelImports(
           });
           return writeJson(memory, outPtr, outCap, nbResult);
         }
-        const result = await target.recvAsync(target.socket, maxBytes);
-        if (peek && result.ok) {
-          const data = base64ToBytes(result.data_b64 ?? "");
-          target.peekBuffer = target.peekBuffer
-            ? concatBytes(target.peekBuffer, data)
-            : data;
-          return writeJson(memory, outPtr, outCap, {
-            ok: true,
-            data_b64: bytesToBase64(data),
-          });
-        }
-        return writeJson(memory, outPtr, outCap, result);
+        return target.recvAsync(target.socket, maxBytes).then((result) => {
+          if (peek && result.ok) {
+            const data = base64ToBytes(result.data_b64 ?? "");
+            target.peekBuffer = target.peekBuffer
+              ? concatBytes(target.peekBuffer, data)
+              : data;
+            return writeJson(memory, outPtr, outCap, {
+              ok: true,
+              data_b64: bytesToBase64(data),
+            });
+          }
+          return writeJson(memory, outPtr, outCap, result);
+        });
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return writeJson(memory, outPtr, outCap, { ok: false, error: msg });

@@ -260,6 +260,12 @@ export class ListenerRegistry {
     this.listeners.delete(handle);
     const err = new Error("accept: listener closed");
     for (const w of listener.acceptWaiters.splice(0)) w.reject(err);
+    // Drain unclaimed accepts: close their server-side sockets so the
+    // connected clients see EOF on the next recvAsync instead of
+    // hanging forever waiting for a peer that will never read.
+    for (const accepted of listener.pending.splice(0)) {
+      this.closeSocket(accepted.socket);
+    }
     this.emit("unlisten", info);
   }
 
@@ -323,7 +329,14 @@ export class ListenerRegistry {
     if (!local) return;
     local.closed = true;
     this.sockets.delete(handle);
-    // Wake any peer waiters with EOF.
+    // Wake our own waiters: a recvAsync in flight on a socket the
+    // caller just closed must resolve, not leak. Report as error since
+    // EOF would imply the peer closed.
+    for (const w of local.rxWaiters.splice(0)) {
+      w.resolve({ ok: false, error: "recv: socket closed" });
+    }
+    // Wake peer waiters with EOF — from the peer's perspective, we
+    // are the closed end.
     const peer = this.sockets.get(local.peerHandle);
     if (peer) {
       for (const w of peer.rxWaiters.splice(0)) {

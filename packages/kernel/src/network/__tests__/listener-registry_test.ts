@@ -161,6 +161,31 @@ describe("ListenerRegistry socket I/O", () => {
     expect(dec.decode(r2.bytes)).toBe(" world");
   });
 
+  it("closeSocket wakes the closer's own pending recvAsync", async () => {
+    const reg = new ListenerRegistry();
+    const lr = reg.listen({ host: "127.0.0.1", port: 7110, backlog: 16 });
+    const c = reg.connect({ host: "127.0.0.1", port: 7110 });
+    if (!c.ok) throw new Error("connect failed");
+    await reg.accept(lr.handle);
+    const recvPromise = reg.recvAsync(c.socket, 1024);
+    reg.closeSocket(c.socket);
+    const got = await recvPromise;
+    expect(got.ok).toBe(false);
+  });
+
+  it("closeListener delivers EOF to clients with unclaimed accepts", async () => {
+    const reg = new ListenerRegistry();
+    const lr = reg.listen({ host: "127.0.0.1", port: 7111, backlog: 16 });
+    const c = reg.connect({ host: "127.0.0.1", port: 7111 });
+    if (!c.ok) throw new Error("connect failed");
+    // Note: NO accept call. The connection sits in listener.pending.
+    const recvPromise = reg.recvAsync(c.socket, 1024);
+    reg.closeListener(lr.handle);
+    const got = await recvPromise;
+    if (!got.ok) throw new Error("expected EOF, got error: " + got.error);
+    expect(got.bytes.length).toBe(0);
+  });
+
   it("send to closed peer fails", async () => {
     const reg = new ListenerRegistry();
     const lr = reg.listen({ host: "127.0.0.1", port: 7104, backlog: 16 });
