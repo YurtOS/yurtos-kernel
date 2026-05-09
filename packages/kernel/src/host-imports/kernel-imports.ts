@@ -2269,7 +2269,12 @@ export function createKernelImports(
         // peekBuffer is empty.
         if (peek) {
           // Peek probes the backend without suspending and stashes any data
-          // into peekBuffer for the following non-peek recv.
+          // into peekBuffer for the following non-peek recv. The probe is
+          // always nonblocking — even on a blocking fd a peek that finds
+          // nothing returns EAGAIN here rather than waiting for bytes.
+          // That diverges from a real `MSG_PEEK` on a blocking socket
+          // (which would block) but matches how peek is used in the libc
+          // shim today as a select()-style readiness check.
           const probe = socketBackend.recv(target.socket, maxBytes, {
             nonblocking: true,
           });

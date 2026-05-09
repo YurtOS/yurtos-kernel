@@ -411,7 +411,10 @@ export class ListenerRegistry {
   }
 
   private allocEphemeralPort(): number {
-    for (let i = 0; i < EPHEMERAL_PORT_END - EPHEMERAL_PORT_START; i++) {
+    // Inclusive range, so probe count is END - START + 1 (without this the
+    // last port is never tried).
+    const probeCount = EPHEMERAL_PORT_END - EPHEMERAL_PORT_START + 1;
+    for (let i = 0; i < probeCount; i++) {
       const port = this.nextEphemeralPort++;
       if (this.nextEphemeralPort > EPHEMERAL_PORT_END) {
         this.nextEphemeralPort = EPHEMERAL_PORT_START;
