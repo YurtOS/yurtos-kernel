@@ -265,6 +265,39 @@ fn microkernel_serves_kh_call_during_kernel_dispatch() {
 }
 
 #[test]
+fn credentials_syscalls_round_trip_through_trampoline() {
+    // First user-facing syscall family. Each method returns the
+    // process credential as a scalar via the dispatch return value —
+    // no memory copies needed. With no process tree yet, all four
+    // resolve to the TS kernel's USER_UID/USER_GID fallback (1000).
+    build_kernel_wasm();
+    let wasm = std::fs::read(kernel_wasm_path()).expect("kernel.wasm exists after build");
+    let engine = Engine::default();
+    let module = Module::new(&engine, &wasm).unwrap();
+    let linker = microkernel_linker(&engine, 0);
+    let mut store = Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let dispatch = instance
+        .get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_dispatch")
+        .unwrap();
+
+    const METHOD_HOST_GETUID: u32 = 0x1_0001;
+    const METHOD_HOST_GETEUID: u32 = 0x1_0002;
+    const METHOD_HOST_GETGID: u32 = 0x1_0003;
+    const METHOD_HOST_GETEGID: u32 = 0x1_0004;
+
+    for (name, method) in [
+        ("getuid", METHOD_HOST_GETUID),
+        ("geteuid", METHOD_HOST_GETEUID),
+        ("getgid", METHOD_HOST_GETGID),
+        ("getegid", METHOD_HOST_GETEGID),
+    ] {
+        let rc = dispatch.call(&mut store, (method, 0, 0, 0, 0)).unwrap();
+        assert_eq!(rc, 1000, "{name} returns default 1000");
+    }
+}
+
+#[test]
 fn microkernel_kh_call_count_matches_dispatch_count() {
     // Each METHOD_NOW_REALTIME dispatch must trigger exactly one
     // kh_now_realtime call. Counting at the host side confirms the

@@ -16,6 +16,7 @@
 mod abi;
 mod dispatch;
 mod kh;
+mod state;
 
 pub use dispatch::dispatch;
 
