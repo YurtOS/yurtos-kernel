@@ -29,20 +29,32 @@
  *       `bridge.binarySuffix` for Safari / Bun.
  *
  *   Two architectural absolutes for JS hosts (irrelevant on native
- *   wasmtime, where Tokio + epoch interruption cover everything):
+ *   wasmtime, where epoch interruption preempts at any guest
+ *   instruction):
  *
- *     - Cooperative multitasking *requires* JSPI or asyncify. WASM on
- *       JS engines has no preemption; suspending one process to run
- *       another is impossible without one of those mechanisms.
+ *     - Cooperative multitasking *requires* JSPI or asyncify, and
+ *       *every* `sys_*` call is a suspension point — not just ones
+ *       that route async work to the host. Syscall boundaries are
+ *       the only places a process running on a JS engine can be
+ *       suspended; the scheduler chooses there whether to resume
+ *       immediately or yield to another runnable process. Trivial
+ *       syscalls like `sys_getuid` are wrapped via
+ *       `bridge.wrapImport(asyncFn)` for the same reason — without
+ *       it, a tight loop of `sys_getuid` calls would starve other
+ *       processes indefinitely.
  *     - setjmp / longjmp *requires* asyncify, regardless of whether
  *       JSPI is otherwise active — the unwind/rewind machinery is
  *       the long-jump. (See `needsSetjmpBridge` in
  *       `process/manager.ts`.)
  *
- *   The current sync path here is correct because no `kh_*` is async
- *   yet and there's only one user process at a time. When the first
- *   blocking syscall (kh_yield, sys_recv, sys_wait) or the second
- *   concurrent process lands, this file plugs into AsyncBridge.
+ *   The sync path in this file today is a single-process simplification:
+ *   only one user process exists, no scheduling decisions are needed.
+ *   As soon as the kernel grows a scheduler and a second concurrent
+ *   process — or the first blocking syscall (kh_yield, sys_recv,
+ *   sys_wait) lands — every sys_* import here is wrapped through
+ *   `AsyncBridge`, and `kernel_dispatch` is wrapped with
+ *   `bridge.wrapExport()` so the await boundary becomes the
+ *   user-process call to `sys_*`.
  *
  * See `docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md`.
  */

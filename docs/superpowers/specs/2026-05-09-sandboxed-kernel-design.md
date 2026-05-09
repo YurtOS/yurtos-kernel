@@ -212,15 +212,33 @@ not replace it.
 Both of these are **non-negotiable** on browser / Deno; native
 wasmtime is unaffected because epoch interruption + Tokio cover them.
 
-1. **Cooperative multitasking requires JSPI or asyncify.** WebAssembly
-   on JS engines has no preemption: a process that doesn't make a host
-   call cannot be interrupted. The kernel's scheduler — for any
-   scenario beyond a single user process running to completion —
-   needs to suspend a running process and resume another. The only
-   primitives JS provides for that are `WebAssembly.Suspending` /
-   `promising` (JSPI) and Binaryen's asyncify unwind/rewind. There is
-   no third option. Engines that lack JSPI (Safari, Bun) must run
-   asyncify-built artifacts.
+1. **Cooperative multitasking requires JSPI or asyncify, and the
+   suspension point is *every* `sys_*` call — not just the ones that
+   route async work to the host.** WebAssembly on JS engines has no
+   preemption: a process that doesn't make a host call cannot be
+   interrupted. The only points in a process's execution where the
+   scheduler can possibly intervene are the syscall boundaries. So
+   every `sys_*` import on JS hosts goes through
+   `bridge.wrapImport(asyncFn)` — even trivial scalar syscalls like
+   `sys_getuid` that have nothing async to do. The scheduler decides
+   *at each syscall* whether to resume the caller immediately (no
+   contention) or yield to another runnable process; the engine
+   makes that choice possible by suspending the user-process wasm
+   stack at the import boundary. Without that wrapping, a tight loop
+   between two `sys_getuid` calls in one process would starve every
+   other process indefinitely.
+
+   The only primitives JS provides for the suspension are
+   `WebAssembly.Suspending` / `promising` (JSPI) and Binaryen's
+   asyncify unwind/rewind. There is no third option. Engines that
+   lack JSPI (Safari, Bun) must run asyncify-built artifacts.
+
+   On the native wasmtime backend the equivalent is wasmtime's epoch
+   interruption — every N quanta of guest execution, any process can
+   be preempted regardless of whether it called a syscall. The Rust
+   microkernel does *not* need to wrap every `sys_*` for scheduling;
+   epochs handle it. This is the one architectural difference between
+   the JS-hosted and native backends.
 
 2. **setjmp/longjmp requires asyncify.** Even on engines with JSPI,
    POSIX `setjmp`/`longjmp` semantics on wasm are implemented via the
