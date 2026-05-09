@@ -83,6 +83,7 @@ import {
 } from "./wasi/fd-target.js";
 import type { RunCommandHandler } from "./run-command.js";
 import {
+  cooperativeRuntimeEngineBackend,
   normalizeNice,
   type RuntimeEngineBackend,
   unsupportedRuntimeEngineBackend,
@@ -91,6 +92,11 @@ import {
   defaultWasmModuleCache,
   type WasmModuleCache,
 } from "./process/module-cache.js";
+
+interface SpawnArgv {
+  loaderArgv: string[];
+  wasiArgv: string[];
+}
 
 /** Describes a set of host-provided files to mount into the VFS. */
 export interface MountConfig {
@@ -183,6 +189,14 @@ interface SandboxParts {
   bootArgv: string[];
   bootImports?: (api: KernelApi) => Record<string, WebAssembly.ImportValue>;
   runCommandHandler?: RunCommandHandler;
+}
+
+interface PasswdEntry {
+  username: string;
+  uid: number;
+  gid: number;
+  home: string;
+  shell: string;
 }
 
 export class Sandbox {
@@ -323,7 +337,7 @@ export class Sandbox {
       ? Sandbox.registerBaseRootTools(mgr, vfs)
       : await Sandbox.registerTools(mgr, adapter, options.wasmDir, upper);
     const runtimeBackend = options.runtimeBackend ??
-      unsupportedRuntimeEngineBackend;
+      cooperativeRuntimeEngineBackend;
     if (!hasBaseRoot) {
       await Sandbox.installCpythonStdlib(
         upper,
@@ -571,7 +585,7 @@ export class Sandbox {
           enc.encode(
             [
               "root:x:0:0:root:/root:/bin/sh",
-              "user:x:1000:1000:user:/home/user:/bin/sh",
+              "user:x:1000:1000:user:/home/user/:/bin/sh",
             ].join("\n") + "\n",
           ),
         );
@@ -1083,10 +1097,10 @@ export class Sandbox {
           },
           spawnProcess: (req, fdTable) => {
             const commandLabel = req.argv0 ?? req.prog;
-            const childPid = kernel.allocPid(pid, commandLabel);
+            const childPid = kernel.allocPid(pid);
             const childCwd = req.cwd || kernel.getCwd(pid);
-            kernel.setCwd(childPid, childCwd);
             kernel.registerPending(childPid, commandLabel, pid);
+            kernel.setCwd(childPid, childCwd);
             kernel.adoptFdTable(childPid, fdTable);
             const childNice = normalizeNice(
               req.nice ?? kernel.getPriority(pid),
@@ -1114,9 +1128,9 @@ export class Sandbox {
               kernel.releaseProcess(childPid, 126);
               return childPid;
             }
-            let argv: string[];
+            let spawnArgv: SpawnArgv;
             try {
-              argv = Sandbox.argvForSpawn(
+              spawnArgv = Sandbox.argvForSpawn(
                 vfs,
                 req,
                 kernel.getCredentials(pid),
@@ -1128,7 +1142,8 @@ export class Sandbox {
             }
             const childCtx = makeContextWithAllocator(() => childPid);
             loadProcess(childCtx, {
-              argv,
+              argv: spawnArgv.loaderArgv,
+              wasiArgv: spawnArgv.wasiArgv,
               mode: "cli",
               env: Object.fromEntries(req.env),
               cwd: childCwd,
@@ -1169,17 +1184,36 @@ export class Sandbox {
     req: SpawnRequest,
     credentials: ProcessCredentials,
     cwd: string,
-  ): string[] {
+  ): SpawnArgv {
+    const env = Object.fromEntries(req.env);
     const prog = req.prog.includes("/")
       ? Sandbox.resolveSpawnPath(req.prog, req.cwd || cwd)
-      : Sandbox.resolveExecutablePathForVfs(vfs, req.prog);
+      : Sandbox.resolveExecutablePathForVfs(
+        vfs,
+        req.prog,
+        req.cwd || cwd,
+        env.PATH,
+      );
     Sandbox.assertExecutableForSpawn(vfs, prog, credentials);
     const interpreterArgv = Sandbox.resolveShebangInterpreter(
       vfs,
       prog,
       credentials,
     );
-    return interpreterArgv ? [...interpreterArgv, prog, ...req.args] : [prog, ...req.args];
+    if (interpreterArgv) {
+      const argv = [...interpreterArgv, prog, ...req.args];
+      return { loaderArgv: argv, wasiArgv: argv };
+    }
+    const argv0Override = req.argv0;
+    const overriddenShCommand = argv0Override !== undefined &&
+      (req.prog === "sh" || req.prog.endsWith("/sh")) &&
+      req.args.length === 2 && req.args[0] === "-c";
+    return {
+      loaderArgv: [prog, ...req.args],
+      wasiArgv: overriddenShCommand
+        ? [req.prog, "-c", req.args[1], argv0Override]
+        : [argv0Override ?? prog, ...req.args],
+    };
   }
 
   private static resolveShebangInterpreter(
@@ -1253,9 +1287,14 @@ export class Sandbox {
   private static resolveExecutablePathForVfs(
     vfs: VfsLike,
     prog: string,
+    cwd = "/",
+    pathEnv = "/usr/extensions:/usr/bin:/bin",
   ): string {
-    for (const dir of ["/usr/extensions", "/usr/bin", "/bin"]) {
-      const path = `${dir}/${prog}`;
+    for (const dir of pathEnv.split(":")) {
+      const base = dir === "" ? cwd : dir.startsWith("/")
+        ? dir
+        : Sandbox.resolveSpawnPath(dir, cwd);
+      const path = `${base === "/" ? "" : base}/${prog}`;
       try {
         const st = vfs.stat(path);
         if (st.type === "file" && (st.permissions & 0o111)) return path;
@@ -1600,6 +1639,83 @@ export class Sandbox {
     }
   }
 
+  private readPasswdEntryForUid(uid: number): PasswdEntry | null {
+    let text: string;
+    try {
+      text = new TextDecoder().decode(this.vfs.readFile("/etc/passwd"));
+    } catch {
+      return null;
+    }
+
+    for (const rawLine of text.split("\n")) {
+      const line = rawLine.trim();
+      if (line.length === 0 || line.startsWith("#")) continue;
+      const fields = line.split(":");
+      if (fields.length < 7) continue;
+
+      const entryUid = Number(fields[2]);
+      const entryGid = Number(fields[3]);
+      if (
+        entryUid !== uid ||
+        !Number.isInteger(entryUid) ||
+        !Number.isInteger(entryGid)
+      ) {
+        continue;
+      }
+
+      return {
+        username: fields[0],
+        uid: entryUid,
+        gid: entryGid,
+        home: fields[5] || "/",
+        shell: fields[6] || "/bin/sh",
+      };
+    }
+
+    return null;
+  }
+
+  private setEnvDefault(name: string, value: string): void {
+    if (this.env.has(name)) return;
+    this.env.set(name, value);
+    this.envNeedsSync = true;
+  }
+
+  private trySetProcessCwd(pid: number, path: string): boolean {
+    try {
+      if (this.vfs.stat(path).type !== "dir") return false;
+    } catch {
+      return false;
+    }
+    this.kernel.setCwd(pid, path);
+    return true;
+  }
+
+  private applyHostSessionDefaults(pid: number): void {
+    const credentials = this.kernel.getCredentials(pid);
+    const passwdEntry = this.readPasswdEntryForUid(credentials.euid) ??
+      this.readPasswdEntryForUid(credentials.uid);
+    if (!passwdEntry) return;
+
+    this.setEnvDefault("HOME", passwdEntry.home);
+    this.setEnvDefault("SHELL", passwdEntry.shell);
+    this.setEnvDefault("USER", passwdEntry.username);
+    this.setEnvDefault("LOGNAME", passwdEntry.username);
+    this.setEnvDefault("TERM", "xterm-256color");
+
+    const explicitPwd = this.env.get("PWD");
+    if (explicitPwd && this.trySetProcessCwd(pid, explicitPwd)) return;
+
+    if (this.trySetProcessCwd(pid, passwdEntry.home)) {
+      this.setEnvDefault("PWD", this.kernel.getCwd(pid));
+    }
+  }
+
+  startHostSession(): void {
+    this.assertAlive();
+    this.applyHostSessionDefaults(this.bootProcess.pid);
+  }
+
   readFile(path: string): Uint8Array {
     this.assertAlive();
     return this.vfs.readFile(path);
@@ -1747,6 +1863,7 @@ export class Sandbox {
   openTty(rows = 24, cols = 80): TtyHandle {
     this.assertAlive();
     const pid = this.bootProcess.pid;
+    this.applyHostSessionDefaults(pid);
     if (this.kernel.getsid(pid) !== pid && this.kernel.setsid(pid) !== pid) {
       throw new Error(`failed to create session for pid ${pid}`);
     }

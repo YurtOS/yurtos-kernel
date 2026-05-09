@@ -11,9 +11,8 @@
  * Widening here would corrupt the stack of any caller compiled against
  * the canonical wasi-libc typedef (every Rust program hits that path via
  * libc-crate's `pub type sigset_t = c_uchar`, and their `zeroed::<sigset_t>`
- * allocates only one byte).  Keeping the 1-byte encoding limits
- * sigaddset/sigdelset to signals 0..7; conformance cases only use
- * signals within that range for that reason. */
+ * allocates only one byte).  The runtime maps common POSIX signals onto
+ * this compact byte; the representation is intentionally opaque. */
 typedef unsigned char sigset_t;
 #define __DEFINED_sigset_t
 #endif

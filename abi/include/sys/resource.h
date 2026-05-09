@@ -40,6 +40,8 @@ struct rlimit {
 #define RLIMIT_MSGQUEUE 12
 #define RLIMIT_NICE    13
 #define RLIMIT_RTPRIO  14
+#define RLIM_NLIMITS   15
+#define RLIMIT_NLIMITS RLIM_NLIMITS
 #define RLIM_INFINITY ((rlim_t)-1)
 
 struct rusage {

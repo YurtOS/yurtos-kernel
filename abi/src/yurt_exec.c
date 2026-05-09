@@ -2,7 +2,7 @@
  *
  * wasm has no native process-replacement primitive; the WASI
  * `process-replace` proposal isn't standardized.  Yurt's process
- * kernel does have host_spawn (used by posix_spawn) and host_waitpid,
+ * kernel does have host_spawn (used by posix_spawn) and host_wait,
  * which together can emulate exec semantics:
  *
  *   1. spawn the new program with the caller's current stdin/stdout/
@@ -71,21 +71,11 @@ static int exec_via_spawn(const char *prog, char *const argv[], char *const envp
     errno = EFAULT;
     return -1;
   }
-  if (strchr(prog, '/') != NULL) {
-    struct stat st;
-    if (stat(prog, &st) != 0) {
-      return -1;
-    }
-    if (S_ISDIR(st.st_mode) || (st.st_mode & 0111) == 0) {
-      errno = EACCES;
-      return -1;
-    }
-  }
   pid_t child = -1;
   int rc = posix_spawnp(&child, prog, /*file_actions=*/NULL, /*attrp=*/NULL,
                         argv, envp ? envp : environ);
   if (rc != 0 || child < 0) {
-    errno = ENOENT;
+    errno = rc != 0 ? rc : ENOENT;
     return -1;
   }
   if (yurt_host_mark_exec_child(child) != 0) {

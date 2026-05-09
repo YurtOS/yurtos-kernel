@@ -1,6 +1,6 @@
 /** Inode types and metadata for the in-memory VFS. */
 
-export type InodeType = 'file' | 'dir' | 'symlink';
+export type InodeType = 'file' | 'dir' | 'symlink' | 'char';
 
 export interface InodeMetadata {
   permissions: number;
@@ -31,7 +31,16 @@ export interface SymlinkInode {
 
 export type Inode = FileInode | DirInode | SymlinkInode;
 
-export type Errno = 'ENOENT' | 'EEXIST' | 'ENOTDIR' | 'EISDIR' | 'ENOTEMPTY' | 'ENOSPC' | 'EROFS' | 'EACCES';
+export type Errno =
+  | 'ENOENT'
+  | 'EEXIST'
+  | 'ENOTDIR'
+  | 'EISDIR'
+  | 'ENOTEMPTY'
+  | 'ENOSPC'
+  | 'EROFS'
+  | 'EACCES'
+  | 'ENXIO';
 
 export class VfsError extends Error {
   errno: Errno;

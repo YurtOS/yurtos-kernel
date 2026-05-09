@@ -8,10 +8,10 @@ use std::sync::atomic::{AtomicI32, Ordering};
 // Constants from yurt's signal.h (same numeric values as WASI/Linux)
 const SIGINT: i32 = 2;
 const SIGTERM: i32 = 15;
+const SIGCHLD: i32 = 17;
 const SIGUSR2: i32 = 12;
-// sigaddset / sigismember are bounded by sigset_t's 8-bit width (see
-// include/signal.h), so sigset-manipulation cases pick a second signal
-// within that range. SIGQUIT (3) is distinct from SIGINT (2) and fits.
+// sigset_t is a one-byte opaque set in yurt's ABI; the runtime maps the
+// practical POSIX signal set into that compact representation.
 const SIGQUIT: i32 = 3;
 const SIG_SETMASK: i32 = 2;
 // SIG_ERR = (sighandler_t)(intptr_t)-1 = usize::MAX on wasm32 (wrapping cast)
@@ -305,6 +305,42 @@ fn case_sigprocmask_roundtrip() -> i32 {
     0
 }
 
+fn case_sigprocmask_sigchld_roundtrip() -> i32 {
+    let mut set: SigsetT = 0;
+    let mut oldset: SigsetT = 0;
+    if unsafe { sigemptyset(&mut set) } != 0 {
+        let errno = unsafe { *__errno_location() };
+        emit("sigprocmask_sigchld_roundtrip", 1, None, Some(errno));
+        return 1;
+    }
+    if unsafe { sigaddset(&mut set, SIGCHLD) } != 0 {
+        let errno = unsafe { *__errno_location() };
+        emit("sigprocmask_sigchld_roundtrip", 1, None, Some(errno));
+        return 1;
+    }
+    if unsafe { sigprocmask(SIG_SETMASK, &set, std::ptr::null_mut()) } != 0 {
+        let errno = unsafe { *__errno_location() };
+        emit("sigprocmask_sigchld_roundtrip", 1, None, Some(errno));
+        return 1;
+    }
+    if unsafe { sigprocmask(SIG_SETMASK, std::ptr::null(), &mut oldset) } != 0 {
+        let errno = unsafe { *__errno_location() };
+        emit("sigprocmask_sigchld_roundtrip", 1, None, Some(errno));
+        return 1;
+    }
+    if unsafe { sigismember(&oldset, SIGCHLD) } != 1 {
+        emit("sigprocmask_sigchld_roundtrip", 1, None, None);
+        return 1;
+    }
+    emit(
+        "sigprocmask_sigchld_roundtrip",
+        0,
+        Some("sigprocmask:sigchld"),
+        None,
+    );
+    0
+}
+
 fn case_sigsuspend_resumes_on_raise() -> i32 {
     // NOTE: Does NOT call sigsuspend — raises before suspending would deadlock in
     // yurt's signal layer. Matches C canary behavior exactly (raise + handler check).
@@ -352,6 +388,7 @@ fn run_case(name: &str) -> i32 {
         "sigdelset_removes" => case_sigdelset_removes(),
         "sigismember_reports" => case_sigismember_reports(),
         "sigprocmask_roundtrip" => case_sigprocmask_roundtrip(),
+        "sigprocmask_sigchld_roundtrip" => case_sigprocmask_sigchld_roundtrip(),
         "sigsuspend_resumes_on_raise" => case_sigsuspend_resumes_on_raise(),
         _ => {
             eprintln!("signal-canary: unknown case {name}");
@@ -371,6 +408,7 @@ fn list_cases() {
     println!("sigdelset_removes");
     println!("sigismember_reports");
     println!("sigprocmask_roundtrip");
+    println!("sigprocmask_sigchld_roundtrip");
     println!("sigsuspend_resumes_on_raise");
 }
 

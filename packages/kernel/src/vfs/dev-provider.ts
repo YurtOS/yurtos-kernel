@@ -26,7 +26,7 @@ import type { VirtualProvider } from './provider.js';
 /** Compatibility chunk size for the readFile fallback. */
 const LEGACY_READ_SIZE = 4096;
 
-const DEVICES = new Set(['null', 'zero', 'random', 'urandom', 'full']);
+const DEVICES = new Set(['null', 'zero', 'random', 'urandom', 'full', 'tty']);
 
 export class DevProvider implements VirtualProvider {
   readonly fsType = 'devtmpfs';
@@ -38,6 +38,8 @@ export class DevProvider implements VirtualProvider {
       case 'zero':
       case 'full':
         return new Uint8Array(LEGACY_READ_SIZE);
+      case 'tty':
+        return new Uint8Array(0);
       case 'random':
       case 'urandom': {
         const buf = new Uint8Array(LEGACY_READ_SIZE);
@@ -113,6 +115,8 @@ export class DevProvider implements VirtualProvider {
       case 'random':
       case 'urandom':
         throw new VfsError('EROFS', `read-only device: /dev/${subpath}`);
+      case 'tty':
+        throw new VfsError('ENXIO', `no controlling terminal: /dev/${subpath}`);
       default:
         throw new VfsError('ENOENT', `no such file or directory: /dev/${subpath}`);
     }
@@ -123,21 +127,21 @@ export class DevProvider implements VirtualProvider {
     return DEVICES.has(subpath);
   }
 
-  stat(subpath: string): { type: 'file' | 'dir'; size: number } {
+  stat(subpath: string): { type: 'file' | 'dir' | 'char'; size: number } {
     if (subpath === '') {
       return { type: 'dir', size: DEVICES.size };
     }
     if (DEVICES.has(subpath)) {
       // Linux reports 0 for character devices in stat.st_size.
-      return { type: 'file', size: 0 };
+      return { type: 'char', size: 0 };
     }
     throw new VfsError('ENOENT', `no such file or directory: /dev/${subpath}`);
   }
 
-  readdir(subpath: string): Array<{ name: string; type: 'file' | 'dir' }> {
+  readdir(subpath: string): Array<{ name: string; type: 'file' | 'dir' | 'char' }> {
     if (subpath !== '') {
       throw new VfsError('ENOTDIR', `not a directory: /dev/${subpath}`);
     }
-    return Array.from(DEVICES).map(name => ({ name, type: 'file' as const }));
+    return Array.from(DEVICES).map(name => ({ name, type: 'char' as const }));
   }
 }

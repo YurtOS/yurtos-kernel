@@ -15,6 +15,11 @@ void flockfile(FILE *f);
 void funlockfile(FILE *f);
 int  ftrylockfile(FILE *f);
 
+#ifndef L_cuserid
+#define L_cuserid 32
+#endif
+char *cuserid(char *s);
+
 /* popen(3) / pclose(3) — POSIX, not in wasi-libc.
  *
  * Provided by libyurt_abi (yurt_process.c → wraps

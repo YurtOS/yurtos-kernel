@@ -63,6 +63,17 @@ function parsePath(path: string): string[] {
   return segments;
 }
 
+function parseResolutionPath(path: string): string[] {
+  if (!path.startsWith('/')) {
+    throw new VfsError('ENOENT', `not an absolute path: ${path}`);
+  }
+  return path.split('/').filter((part) => part !== '' && part !== '.');
+}
+
+function pathFromSegments(segments: string[]): string {
+  return segments.length === 0 ? '/' : `/${segments.join('/')}`;
+}
+
 export class VFS {
   private root: DirInode;
   private snapshots: Map<string, DirInode> = new Map();
@@ -350,8 +361,17 @@ export class VFS {
     throw new VfsError('EACCES', 'permission denied');
   }
 
-  private assertChownPermission(): void {
+  private assertChownPermission(inode: Inode, uid: number, gid: number): void {
     if (this.initializing || this.uid === ROOT_UID) return;
+    const requestedUid = uid === -1 ? inode.metadata.uid : uid;
+    const requestedGid = gid === -1 ? inode.metadata.gid : gid;
+    if (
+      inode.metadata.uid === this.uid &&
+      requestedUid === inode.metadata.uid &&
+      (requestedGid === inode.metadata.gid || requestedGid === this.gid)
+    ) {
+      return;
+    }
     throw new VfsError('EACCES', 'permission denied');
   }
 
@@ -392,22 +412,24 @@ export class VFS {
    * or the resolved inode when `resolveLeaf` is true.
    */
   private resolve(path: string, followSymlinks = true, depth = 0): Inode {
-    const segments = parsePath(path);
-
-    if (segments.length === 0) {
+    let queue = parseResolutionPath(path);
+    if (queue.length === 0) {
       return this.root;
     }
 
     let current: Inode = this.root;
+    const resolvedSegments: string[] = [];
 
-    for (let i = 0; i < segments.length; i++) {
-      // Follow symlinks for intermediate path components (and leaf if requested)
-      if (current.type === 'symlink') {
-        if (depth >= MAX_SYMLINK_DEPTH) {
-          throw new VfsError('ENOENT', `too many symlinks: ${path}`);
+    while (queue.length > 0) {
+      const segment = queue.shift()!;
+      if (segment === '..') {
+        if (resolvedSegments.length > 0) {
+          resolvedSegments.pop();
+          current = this.resolve(pathFromSegments(resolvedSegments), true, depth);
+        } else {
+          current = this.root;
         }
-        depth++;
-        current = this.resolve(current.target, true, depth);
+        continue;
       }
 
       if (current.type !== 'dir') {
@@ -415,21 +437,27 @@ export class VFS {
       }
       this.assertSearchPermission(current);
 
-      const child = current.children.get(segments[i]);
+      const child = current.children.get(segment);
       if (child === undefined) {
         throw new VfsError('ENOENT', `no such file or directory: ${path}`);
       }
 
-      current = child;
-    }
-
-    // Optionally follow symlink at the leaf
-    if (followSymlinks && current.type === 'symlink') {
-      if (depth >= MAX_SYMLINK_DEPTH) {
-        throw new VfsError('ENOENT', `too many symlinks: ${path}`);
+      if (child.type === 'symlink' && (queue.length > 0 || followSymlinks)) {
+        if (depth >= MAX_SYMLINK_DEPTH) {
+          throw new VfsError('ENOENT', `too many symlinks: ${path}`);
+        }
+        const targetQueue = child.target.startsWith('/')
+          ? parseResolutionPath(child.target)
+          : [...resolvedSegments, ...child.target.split('/').filter((part) => part !== '' && part !== '.')];
+        queue = [...targetQueue, ...queue];
+        resolvedSegments.length = 0;
+        current = this.root;
+        depth++;
+        continue;
       }
-      depth++;
-      current = this.resolve(current.target, true, depth);
+
+      current = child;
+      resolvedSegments.push(segment);
     }
 
     return current;
@@ -447,36 +475,7 @@ export class VFS {
     }
 
     const name = segments[segments.length - 1];
-    const parentSegments = segments.slice(0, -1);
-
-    let current: Inode = this.root;
-    let depth = 0;
-
-    for (const segment of parentSegments) {
-      if (current.type === 'symlink') {
-        if (depth >= MAX_SYMLINK_DEPTH) {
-          throw new VfsError('ENOENT', `too many symlinks: ${path}`);
-        }
-        current = this.resolve(current.target, true, depth + 1);
-        depth++;
-      }
-      if (current.type !== 'dir') {
-        throw new VfsError('ENOTDIR', `not a directory: ${path}`);
-      }
-      this.assertSearchPermission(current);
-      const child = current.children.get(segment);
-      if (child === undefined) {
-        throw new VfsError('ENOENT', `no such file or directory: ${path}`);
-      }
-      current = child;
-    }
-
-    if (current.type === 'symlink') {
-      if (depth >= MAX_SYMLINK_DEPTH) {
-        throw new VfsError('ENOENT', `too many symlinks: ${path}`);
-      }
-      current = this.resolve(current.target, true, depth + 1);
-    }
+    const current = this.resolve(pathFromSegments(segments.slice(0, -1)));
     if (current.type !== 'dir') {
       throw new VfsError('ENOTDIR', `not a directory: ${path}`);
     }
@@ -868,9 +867,9 @@ export class VFS {
 
   chown(path: string, uid: number, gid: number, followSymlinks = true): void {
     const inode = this.resolve(path, followSymlinks);
-    this.assertChownPermission();
-    inode.metadata.uid = uid;
-    inode.metadata.gid = gid;
+    this.assertChownPermission(inode, uid, gid);
+    if (uid !== -1) inode.metadata.uid = uid;
+    if (gid !== -1) inode.metadata.gid = gid;
     inode.metadata.ctime = new Date();
     this.notifyChange();
   }
@@ -959,5 +958,5 @@ export class VFS {
 }
 
 function normalizeMode(mode: number): number {
-  return Math.trunc(mode) & 0o777;
+  return Math.trunc(mode) & 0o7777;
 }

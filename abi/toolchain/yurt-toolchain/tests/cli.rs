@@ -106,6 +106,7 @@ fn invoking_clang_respects_env_sdk() {
         .arg("foo.c")
         .arg("-o")
         .arg("foo.wasm")
+        .arg("-lc")
         .output()
         .unwrap();
     assert!(
@@ -198,8 +199,8 @@ fn dry_run_discovers_default_yurt_include_after_user_includes() {
     let user_idx = stdout.find("-I package/include").unwrap();
     let expected_include = expected_repo_yurt_include();
     let yurt_idx = stdout
-        .find("yurt-include")
-        .or_else(|| stdout.find(&expected_include))
+        .find("-I yurt-include")
+        .or_else(|| stdout.find(&format!("-I {expected_include}")))
         .unwrap_or_else(|| panic!("missing default Yurt include {expected_include}: {stdout}"));
     assert!(user_idx < yurt_idx, "{stdout}");
     assert!(stdout.contains("--sysroot="), "{stdout}");
@@ -230,6 +231,7 @@ fn dry_run_injects_archive_and_preserves_include_order() {
         .arg("package/include")
         .arg("-o")
         .arg("foo.wasm")
+        .arg("-lc")
         .output()
         .unwrap();
     let stdout = String::from_utf8(out.stdout).unwrap();
@@ -256,6 +258,132 @@ fn dry_run_injects_archive_and_preserves_include_order() {
     assert!(
         whole_idx < no_whole_idx,
         "whole_archive must precede no_whole_archive"
+    );
+    let wrap_idx = stdout.find("-Wl,--wrap=getcwd").unwrap();
+    let user_libc_idx = stdout
+        .find(" -lc ")
+        .unwrap_or_else(|| stdout.find(" -lc").unwrap());
+    assert!(
+        wrap_idx < user_libc_idx,
+        "wrap directives must precede user libraries so explicit -lc cannot resolve wrapped symbols first: {stdout}",
+    );
+}
+
+#[test]
+fn dry_run_injects_yurt_portability_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("share/wasi-sysroot")).unwrap();
+    let clang = root.join("bin/clang");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&clang, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&clang, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = Command::new(bin())
+        .env("WASI_SDK_PATH", root)
+        .arg("--dry-run")
+        .arg("foo.c")
+        .arg("-o")
+        .arg("foo.wasm")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("-D__linux__"), "{stdout}");
+    assert!(stdout.contains("-D_WASI_EMULATED_SIGNAL"), "{stdout}");
+    assert!(stdout.contains("-D_WASI_EMULATED_MMAN"), "{stdout}");
+    assert!(
+        stdout.contains("-D_WASI_EMULATED_PROCESS_CLOCKS"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("-lwasi-emulated-signal"), "{stdout}");
+    assert!(stdout.contains("-lwasi-emulated-mman"), "{stdout}");
+    assert!(
+        stdout.contains("-lwasi-emulated-process-clocks"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("-Wl,-u,__main_argc_argv"), "{stdout}");
+}
+
+#[test]
+fn dry_run_does_not_duplicate_yurt_portability_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("share/wasi-sysroot")).unwrap();
+    let clang = root.join("bin/clang");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&clang, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&clang, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let out = Command::new(bin())
+        .env("WASI_SDK_PATH", root)
+        .arg("--dry-run")
+        .arg("-D__linux__")
+        .arg("-D_WASI_EMULATED_SIGNAL")
+        .arg("-D_WASI_EMULATED_MMAN")
+        .arg("-D_WASI_EMULATED_PROCESS_CLOCKS")
+        .arg("foo.c")
+        .arg("-lwasi-emulated-signal")
+        .arg("-lwasi-emulated-mman")
+        .arg("-lwasi-emulated-process-clocks")
+        .arg("-Wl,-u,__main_argc_argv")
+        .arg("-o")
+        .arg("foo.wasm")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout.matches("-D__linux__").count(), 1, "{stdout}");
+    assert_eq!(
+        stdout.matches("-D_WASI_EMULATED_SIGNAL").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("-D_WASI_EMULATED_MMAN").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("-D_WASI_EMULATED_PROCESS_CLOCKS").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("-lwasi-emulated-signal").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("-lwasi-emulated-mman").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("-lwasi-emulated-process-clocks").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("-Wl,-u,__main_argc_argv").count(),
+        1,
+        "{stdout}"
     );
 }
 

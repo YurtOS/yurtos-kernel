@@ -85,9 +85,8 @@ static int case_sigemptyset_clears(void) {
   return 0;
 }
 
-/* sigset_t is `unsigned char` (see include/signal.h), so sigaddset /
- * sigismember only handle signals 0..7.  Cases pick a "present" signal
- * (SIGINT=2) and a "not present" signal (SIGQUIT=3) within that range. */
+/* sigset_t is `unsigned char` (see include/signal.h). Yurt maps the
+ * practical POSIX signal set into that compact opaque byte. */
 static int case_sigfillset_fills(void) {
   sigset_t s;
   if (sigfillset(&s) != 0) { emit("sigfillset_fills", 1, NULL, 1, errno); return 1; }
@@ -139,6 +138,17 @@ static int case_sigprocmask_roundtrip(void) {
   return 0;
 }
 
+static int case_sigprocmask_sigchld_roundtrip(void) {
+  sigset_t set, oldset;
+  if (sigemptyset(&set) != 0) { emit("sigprocmask_sigchld_roundtrip", 1, NULL, 1, errno); return 1; }
+  if (sigaddset(&set, SIGCHLD) != 0) { emit("sigprocmask_sigchld_roundtrip", 1, NULL, 1, errno); return 1; }
+  if (sigprocmask(SIG_SETMASK, &set, NULL) != 0) { emit("sigprocmask_sigchld_roundtrip", 1, NULL, 1, errno); return 1; }
+  if (sigprocmask(SIG_SETMASK, NULL, &oldset) != 0) { emit("sigprocmask_sigchld_roundtrip", 1, NULL, 1, errno); return 1; }
+  if (sigismember(&oldset, SIGCHLD) != 1) { emit("sigprocmask_sigchld_roundtrip", 1, NULL, 0, 0); return 1; }
+  emit("sigprocmask_sigchld_roundtrip", 0, "sigprocmask:sigchld", 0, 0);
+  return 0;
+}
+
 static int case_sigsuspend_resumes_on_raise(void) {
   /* sigsuspend with empty mask + raise == handler runs synchronously, suspend returns -1/EINTR. */
   struct sigaction sa;
@@ -171,6 +181,25 @@ static int case_host_kill_delivers_handler(void) {
   return 0;
 }
 
+static int case_blocked_host_signal_delivers_after_unblock(void) {
+  struct sigaction sa;
+  sigset_t set;
+  signal_canary_seen = 0;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = signal_canary_handler;
+  if (sigaction(SIGUSR1, &sa, NULL) != 0) { emit("blocked_host_signal_delivers_after_unblock", 1, NULL, 1, errno); return 1; }
+  if (sigemptyset(&set) != 0) { emit("blocked_host_signal_delivers_after_unblock", 1, NULL, 1, errno); return 1; }
+  if (sigaddset(&set, SIGUSR1) != 0) { emit("blocked_host_signal_delivers_after_unblock", 1, NULL, 1, errno); return 1; }
+  if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) { emit("blocked_host_signal_delivers_after_unblock", 1, NULL, 1, errno); return 1; }
+  if (kill(getpid(), SIGUSR1) != 0) { emit("blocked_host_signal_delivers_after_unblock", 1, NULL, 1, errno); return 1; }
+  (void)write(1, "", 0);
+  if (signal_canary_seen != 0) { emit("blocked_host_signal_delivers_after_unblock", 1, NULL, 0, 0); return 1; }
+  if (sigprocmask(SIG_UNBLOCK, &set, NULL) != 0) { emit("blocked_host_signal_delivers_after_unblock", 1, NULL, 1, errno); return 1; }
+  if (signal_canary_seen != SIGUSR1) { emit("blocked_host_signal_delivers_after_unblock", 1, NULL, 0, 0); return 1; }
+  emit("blocked_host_signal_delivers_after_unblock", 0, "kill:blocked-then-handled", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "signal_install") == 0) return case_signal_install();
   if (strcmp(name, "sigaction_raise") == 0) return case_sigaction_raise();
@@ -182,8 +211,10 @@ static int run_case(const char *name) {
   if (strcmp(name, "sigdelset_removes") == 0) return case_sigdelset_removes();
   if (strcmp(name, "sigismember_reports") == 0) return case_sigismember_reports();
   if (strcmp(name, "sigprocmask_roundtrip") == 0) return case_sigprocmask_roundtrip();
+  if (strcmp(name, "sigprocmask_sigchld_roundtrip") == 0) return case_sigprocmask_sigchld_roundtrip();
   if (strcmp(name, "sigsuspend_resumes_on_raise") == 0) return case_sigsuspend_resumes_on_raise();
   if (strcmp(name, "host_kill_delivers_handler") == 0) return case_host_kill_delivers_handler();
+  if (strcmp(name, "blocked_host_signal_delivers_after_unblock") == 0) return case_blocked_host_signal_delivers_after_unblock();
   fprintf(stderr, "signal-canary: unknown case %s\n", name);
   return 2;
 }
@@ -199,8 +230,10 @@ static int list_cases(void) {
   puts("sigdelset_removes");
   puts("sigismember_reports");
   puts("sigprocmask_roundtrip");
+  puts("sigprocmask_sigchld_roundtrip");
   puts("sigsuspend_resumes_on_raise");
   puts("host_kill_delivers_handler");
+  puts("blocked_host_signal_delivers_after_unblock");
   return 0;
 }
 

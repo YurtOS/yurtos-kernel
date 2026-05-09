@@ -76,7 +76,9 @@ export interface AsyncifyForkSnapshot {
   stackPointer: number | null;
   dataAddr: number;
   dataSize: number;
-  jmpBufStates: Array<[number, { savedHigh: number; savedData: Uint8Array }]>;
+  jmpBufStates: Array<
+    [number, { savedHigh: number; savedData: Uint8Array; stackPointer: number | null }]
+  >;
 }
 
 export interface AsyncifyForkController {
@@ -164,8 +166,22 @@ class AsyncifyAsyncBridge implements AsyncBridge {
   private pendingForkReturn: number | null = null;
   private pendingForkMemoryBytes: Uint8Array | null = null;
   private pendingForkStackPointer: number | null = null;
-  private jmpBufStates: Map<number, { savedHigh: number; savedData: Uint8Array }> = new Map();
+  private jmpBufStates: Map<
+    number,
+    { savedHigh: number; savedData: Uint8Array; stackPointer: number | null }
+  > = new Map();
   private forkController: AsyncifyForkController | null = null;
+
+  private resetBufferHeader(): void {
+    if (!this.exports || !this.memory || this.exports.dataSize < 8) return;
+    const view = new DataView(this.memory.buffer);
+    view.setUint32(this.exports.dataAddr, this.exports.dataAddr + 8, true);
+    view.setUint32(
+      this.exports.dataAddr + 4,
+      this.exports.dataAddr + this.exports.dataSize,
+      true,
+    );
+  }
 
   /**
    * Call once after instantiation.
@@ -221,6 +237,7 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     const exps = this.exports;
     if (exps.getState() === 2 /* REWINDING */) {
       exps.stopRewind();
+      this.resetBufferHeader();
       if (this.pendingLongjmp) {
         const val = this.pendingLongjmp.val;
         this.pendingLongjmp = null;
@@ -234,6 +251,7 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     // sees the unwind, captures the buffer into jmpBufStates, and
     // rewinds back here.
     this.pendingSetjmp = envPtr;
+    this.resetBufferHeader();
     exps.startUnwind(exps.dataAddr);
     return 0;  // ignored during unwind
   };
@@ -259,6 +277,7 @@ class AsyncifyAsyncBridge implements AsyncBridge {
       throw new Error(`longjmp: unknown jmp_buf @0x${envPtr.toString(16)}`);
     }
     this.pendingLongjmp = { envPtr, val };
+    this.resetBufferHeader();
     this.exports.startUnwind(this.exports.dataAddr);
   };
 
@@ -267,6 +286,7 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     const exps = this.exports;
     if (exps.getState() === 2 /* REWINDING */) {
       exps.stopRewind();
+      this.resetBufferHeader();
       const value = this.pendingForkReturn ?? -11; // EAGAIN if the controller failed.
       this.pendingForkReturn = null;
       return value;
@@ -276,6 +296,7 @@ class AsyncifyAsyncBridge implements AsyncBridge {
       ? new Uint8Array(this.memory.buffer).slice()
       : null;
     this.pendingForkStackPointer = (exps.stackPointer?.value as number | undefined) ?? null;
+    this.resetBufferHeader();
     exps.startUnwind(exps.dataAddr);
     return 0; // ignored during unwind
   };
@@ -284,7 +305,11 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     this.jmpBufStates = new Map(
       snapshot.jmpBufStates.map(([ptr, state]) => [
         ptr,
-        { savedHigh: state.savedHigh, savedData: state.savedData.slice() },
+        {
+          savedHigh: state.savedHigh,
+          savedData: state.savedData.slice(),
+          stackPointer: state.stackPointer,
+        },
       ]),
     );
     this.pendingForkReturn = forkReturn;
@@ -314,7 +339,9 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     const bufStart = this.exports.dataAddr + 8;
     const dataLen = high - bufStart;
     const savedData = new Uint8Array(this.memory.buffer, bufStart, dataLen).slice();
-    this.jmpBufStates.set(envPtr, { savedHigh: high, savedData });
+    const stackPointer =
+      (this.exports.stackPointer?.value as number | undefined) ?? null;
+    this.jmpBufStates.set(envPtr, { savedHigh: high, savedData, stackPointer });
   }
 
   /** Write jmpBufStates[envPtr]'s saved bytes back into the asyncify
@@ -328,6 +355,9 @@ class AsyncifyAsyncBridge implements AsyncBridge {
     new Uint8Array(this.memory.buffer, this.exports.dataAddr + 8, state.savedData.length)
       .set(state.savedData);
     view.setUint32(this.exports.dataAddr, state.savedHigh, true);
+    if (state.stackPointer !== null && this.exports.stackPointer) {
+      this.exports.stackPointer.value = state.stackPointer;
+    }
   }
 
   private snapshotForkContinuation(): AsyncifyForkSnapshot {
@@ -350,7 +380,11 @@ class AsyncifyAsyncBridge implements AsyncBridge {
       dataSize: this.exports.dataSize,
       jmpBufStates: Array.from(this.jmpBufStates.entries()).map(([ptr, state]) => [
         ptr,
-        { savedHigh: state.savedHigh, savedData: state.savedData.slice() },
+        {
+          savedHigh: state.savedHigh,
+          savedData: state.savedData.slice(),
+          stackPointer: state.stackPointer,
+        },
       ]),
     };
   }
@@ -373,6 +407,7 @@ class AsyncifyAsyncBridge implements AsyncBridge {
       // Rewinding: WASM is replaying the call — return the stored result.
       if (exps.getState() === 2) {
         exps.stopRewind();
+        this.resetBufferHeader();
         return this.pendingResult;
       }
       // Normal execution: call the actual host function.
@@ -380,6 +415,7 @@ class AsyncifyAsyncBridge implements AsyncBridge {
       if (ret instanceof Promise) {
         // Async: save the promise and start unwinding the WASM stack.
         this.pendingPromise = ret.then(r => { this.pendingResult = r; });
+        this.resetBufferHeader();
         exps.startUnwind(exps.dataAddr);
         return 0; // ignored during unwind
       }

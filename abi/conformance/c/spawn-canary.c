@@ -6,6 +6,7 @@
  * symbols is the objective.
  */
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
@@ -55,9 +56,31 @@ static int case_attrs(void) {
   return 0;
 }
 
+static int case_open_errno(void) {
+  posix_spawn_file_actions_t fa;
+  pid_t pid = -1;
+  char *argv[] = { "missing-open", NULL };
+  if (posix_spawn_file_actions_init(&fa) != 0) { emit("open_errno_init_fail", 1); return 1; }
+  if (posix_spawn_file_actions_addopen(&fa, 7, "/tmp/does-not-exist-for-spawn", O_RDONLY, 0) != 0) {
+    emit("open_errno_addopen_fail", 1);
+    return 1;
+  }
+  errno = 0;
+  int rc = posix_spawn(&pid, "missing-open", &fa, NULL, argv, NULL);
+  int saved_errno = errno;
+  if (posix_spawn_file_actions_destroy(&fa) != 0) { emit("open_errno_destroy_fail", 1); return 1; }
+  if (rc != ENOENT || saved_errno != ENOENT) {
+    emit("open_errno_fail", 1);
+    return 1;
+  }
+  emit("open_errno", 0);
+  return 0;
+}
+
 int main(void) {
   int rc = 0;
   rc |= case_file_actions();
   rc |= case_attrs();
+  rc |= case_open_errno();
   return rc;
 }

@@ -3,7 +3,7 @@
  * Spawns a child via posix_spawnp("true"), then blocks in waitpid()
  * until the child exits.  This exercises the full async path:
  *   posix_spawn  → host_spawn (sync)
- *   waitpid      → host_waitpid (async, JSPI-wrapped or asyncify)
+ *   waitpid      → host_wait (async, JSPI-wrapped or asyncify)
  *
  * The kernel's host scheduler (wasi-2-preempt > JSPI > asyncify)
  * is what makes the C caller see waitpid as a normal blocking call —
@@ -39,7 +39,7 @@ int main(void) {
     }
     emit("spawn", 0, (int)child);
 
-    /* Block via waitpid → host_waitpid.  The async host import is
+    /* Block via waitpid → host_wait.  The async host import is
      * wrapped at instantiation time; from C this just blocks. */
     int status = 0;
     pid_t reaped = waitpid(child, &status, 0);

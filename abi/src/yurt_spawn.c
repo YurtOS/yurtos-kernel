@@ -1,19 +1,21 @@
 /* posix_spawn(3) family — built on top of host_spawn.
  *
- * The yurt kernel's host_spawn primitive accepts a JSON
- * SpawnRequest with `prog`, `args`, `env`, `cwd`, `stdin_fd`,
+ * The yurt kernel's host_spawn primitive accepts a native
+ * yurt_spawn_request_v1 with `prog`, `args`, `env`, `cwd`, `stdin_fd`,
  * `stdout_fd`, `stderr_fd`, and an optional `argv0` override.  The
  * file-action surface that POSIX exposes is richer (arbitrary
  * open/close/dup2 against arbitrary child fds).  We walk the
  * file_actions list, apply opens to *parent* fds (returning real
  * open fds for the duration of the spawn), simulate the child fd
- * map, and pick out the parent fds that end up at child positions
- * 0/1/2.  The kernel also receives a conservative pass_fds list so
- * non-CLOEXEC descriptors such as process-substitution fds can be
- * inherited by the spawned process.
+ * map, pick out the parent fds that end up at child positions 0/1/2,
+ * and send explicit parent-fd-to-child-fd mappings for non-stdio file
+ * actions.  The kernel also receives a conservative pass_fds list so
+ * non-CLOEXEC descriptors such as process-substitution fds can be inherited
+ * by the spawned process.
  */
 
 #include "spawn.h"
+#include "yurt_abi.h"
 #include "yurt_runtime.h"
 #include "yurt_markers.h"
 
@@ -24,6 +26,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -70,6 +73,8 @@ typedef struct {
   int schedpolicy;
   struct sched_param schedparam;
 } attr_state_t;
+
+static int child_fd_is_closed(const fa_state_t *s, int fd);
 
 /* ─── File-actions ─── */
 
@@ -220,52 +225,181 @@ int posix_spawnattr_setschedparam(posix_spawnattr_t *__restrict attr,
   return 0;
 }
 
-/* ─── JSON building ─── */
+/* ─── Native spawn-request building ─── */
 
-/* Append a JSON-quoted string into buf at *pos.  Returns 0 on success
- * or -1 if buf would overflow.  Escapes: backslash, dquote, control
- * chars (\b \f \n \r \t and \uXXXX for the rest). */
-static int json_emit_string(char *buf, size_t cap, size_t *pos, const char *s) {
-  size_t p = *pos;
-  if (p + 1 >= cap) return -1;
-  buf[p++] = '"';
-  for (const unsigned char *u = (const unsigned char *)s; *u; u++) {
-    if (p + 6 >= cap) return -1;
-    unsigned char c = *u;
-    if (c == '"' || c == '\\') {
-      buf[p++] = '\\';
-      buf[p++] = (char)c;
-    } else if (c == '\b') { buf[p++] = '\\'; buf[p++] = 'b'; }
-    else if (c == '\f') { buf[p++] = '\\'; buf[p++] = 'f'; }
-    else if (c == '\n') { buf[p++] = '\\'; buf[p++] = 'n'; }
-    else if (c == '\r') { buf[p++] = '\\'; buf[p++] = 'r'; }
-    else if (c == '\t') { buf[p++] = '\\'; buf[p++] = 't'; }
-    else if (c < 0x20) {
-      int n = snprintf(buf + p, cap - p, "\\u%04x", c);
-      if (n < 0 || (size_t)n >= cap - p) return -1;
-      p += (size_t)n;
-    } else {
-      buf[p++] = (char)c;
+typedef struct {
+  unsigned char *bytes;
+  size_t len;
+  size_t cap;
+} spawn_record_builder_t;
+
+typedef struct {
+  int child_fd;
+  int parent_fd;
+  int open;
+} child_fd_mapping_t;
+
+static int spawn_record_align4(spawn_record_builder_t *b) {
+  while ((b->len % 4) != 0) {
+    if (b->len >= b->cap) return -1;
+    b->bytes[b->len++] = 0;
+  }
+  return 0;
+}
+
+static int spawn_record_append(spawn_record_builder_t *b, const void *data, size_t len,
+                               uint32_t *off_out) {
+  if (spawn_record_align4(b) != 0) return -1;
+  if (b->len > UINT32_MAX || len > UINT32_MAX || b->len + len > b->cap) return -1;
+  *off_out = (uint32_t)b->len;
+  memcpy(b->bytes + b->len, data, len);
+  b->len += len;
+  return 0;
+}
+
+static int spawn_record_span(spawn_record_builder_t *b, yurt_abi_span_v1 *span,
+                             const char *value) {
+  uint32_t off;
+  size_t len;
+  if (!value || value[0] == '\0') {
+    span->off = 0;
+    span->len = 0;
+    return 0;
+  }
+  len = strlen(value);
+  if (spawn_record_append(b, value, len, &off) != 0) return -1;
+  span->off = off;
+  span->len = (uint32_t)len;
+  return 0;
+}
+
+static int spawn_record_span_allow_empty(spawn_record_builder_t *b, yurt_abi_span_v1 *span,
+                                         const char *value) {
+  uint32_t off;
+  size_t len = value ? strlen(value) : 0;
+  if (spawn_record_append(b, value ? value : "", len, &off) != 0) return -1;
+  span->off = off;
+  span->len = (uint32_t)len;
+  return 0;
+}
+
+static int spawn_record_args(spawn_record_builder_t *b, yurt_spawn_request_v1 *req,
+                             char *const argv[]) {
+  int count = 0;
+  uint32_t off;
+  yurt_abi_span_v1 *spans;
+  if (argv) {
+    while (argv[count + 1]) count++;
+  }
+  if (count == 0) return 0;
+  if (spawn_record_align4(b) != 0) return -1;
+  if (b->len + sizeof(yurt_abi_span_v1) * (size_t)count > b->cap) return -1;
+  off = (uint32_t)b->len;
+  b->len += sizeof(yurt_abi_span_v1) * (size_t)count;
+  spans = (yurt_abi_span_v1 *)(void *)(b->bytes + off);
+  memset(spans, 0, sizeof(yurt_abi_span_v1) * (size_t)count);
+  req->args_off = off;
+  req->args_count = (uint32_t)count;
+  for (int i = 0; i < count; i++) {
+    if (spawn_record_span_allow_empty(b, &spans[i], argv[i + 1]) != 0) return -1;
+  }
+  return 0;
+}
+
+static int spawn_record_env(spawn_record_builder_t *b, yurt_spawn_request_v1 *req,
+                            char *const env[]) {
+  int count = 0;
+  uint32_t off;
+  yurt_abi_env_pair_v1 *pairs;
+  if (env) {
+    for (int i = 0; env[i]; i++) {
+      if (strchr(env[i], '=')) count++;
     }
   }
-  if (p + 1 >= cap) return -1;
-  buf[p++] = '"';
-  *pos = p;
+  if (count == 0) return 0;
+  if (spawn_record_align4(b) != 0) return -1;
+  if (b->len + sizeof(yurt_abi_env_pair_v1) * (size_t)count > b->cap) return -1;
+  off = (uint32_t)b->len;
+  b->len += sizeof(yurt_abi_env_pair_v1) * (size_t)count;
+  pairs = (yurt_abi_env_pair_v1 *)(void *)(b->bytes + off);
+  memset(pairs, 0, sizeof(yurt_abi_env_pair_v1) * (size_t)count);
+  req->env_off = off;
+  req->env_count = (uint32_t)count;
+  count = 0;
+  for (int i = 0; env[i]; i++) {
+    const char *eq = strchr(env[i], '=');
+    if (!eq) continue;
+    size_t key_len = (size_t)(eq - env[i]);
+    uint32_t key_off;
+    yurt_abi_span_v1 value_span;
+    if (spawn_record_append(b, env[i], key_len, &key_off) != 0) return -1;
+    pairs[count].key_off = key_off;
+    pairs[count].key_len = (uint32_t)key_len;
+    if (spawn_record_span_allow_empty(b, &value_span, eq + 1) != 0) return -1;
+    pairs[count].value_off = value_span.off;
+    pairs[count].value_len = value_span.len;
+    count++;
+  }
   return 0;
 }
 
-static int json_emit_lit(char *buf, size_t cap, size_t *pos, const char *lit) {
-  size_t n = strlen(lit);
-  if (*pos + n + 1 >= cap) return -1;
-  memcpy(buf + *pos, lit, n);
-  *pos += n;
+static int child_fd_is_explicitly_mapped(const child_fd_mapping_t *maps, int count, int fd) {
+  for (int i = 0; i < count; i++) {
+    if (maps[i].child_fd == fd) return maps[i].open;
+  }
   return 0;
 }
 
-static int json_emit_int(char *buf, size_t cap, size_t *pos, long long v) {
-  int n = snprintf(buf + *pos, cap - *pos, "%lld", v);
-  if (n < 0 || (size_t)n >= cap - *pos) return -1;
-  *pos += (size_t)n;
+static int spawn_record_pass_fds(spawn_record_builder_t *b, yurt_spawn_request_v1 *req,
+                                 const fa_state_t *fa,
+                                 const child_fd_mapping_t *maps, int map_count) {
+  uint32_t off;
+  uint32_t count = 0;
+  int32_t *fds;
+  for (int fd = 3; fd < 2048; fd++) {
+    if (!child_fd_is_closed(fa, fd) &&
+        !child_fd_is_explicitly_mapped(maps, map_count, fd)) {
+      count++;
+    }
+  }
+  if (count == 0) return 0;
+  if (spawn_record_align4(b) != 0) return -1;
+  if (b->len + sizeof(int32_t) * (size_t)count > b->cap) return -1;
+  off = (uint32_t)b->len;
+  b->len += sizeof(int32_t) * (size_t)count;
+  fds = (int32_t *)(void *)(b->bytes + off);
+  count = 0;
+  for (int fd = 3; fd < 2048; fd++) {
+    if (!child_fd_is_closed(fa, fd) && !child_fd_is_explicitly_mapped(maps, map_count, fd)) {
+      fds[count++] = fd;
+    }
+  }
+  req->pass_fds_off = off;
+  req->pass_fds_count = count;
+  return 0;
+}
+
+static int spawn_record_fd_map(spawn_record_builder_t *b, yurt_spawn_request_v1 *req,
+                               const child_fd_mapping_t *maps, int map_count) {
+  uint32_t count = 0;
+  for (int i = 0; i < map_count; i++) {
+    if (maps[i].open && maps[i].child_fd >= 3) count++;
+  }
+  if (count == 0) return 0;
+  if (spawn_record_align4(b) != 0) return -1;
+  if (b->len + sizeof(yurt_spawn_fd_map_v1) * (size_t)count > b->cap) return -1;
+  uint32_t off = (uint32_t)b->len;
+  b->len += sizeof(yurt_spawn_fd_map_v1) * (size_t)count;
+  yurt_spawn_fd_map_v1 *pairs = (yurt_spawn_fd_map_v1 *)(void *)(b->bytes + off);
+  count = 0;
+  for (int i = 0; i < map_count; i++) {
+    if (!maps[i].open || maps[i].child_fd < 3) continue;
+    pairs[count].parent_fd = maps[i].parent_fd;
+    pairs[count].child_fd = maps[i].child_fd;
+    count++;
+  }
+  req->fd_map_off = off;
+  req->fd_map_count = count;
   return 0;
 }
 
@@ -273,15 +407,60 @@ static int json_emit_int(char *buf, size_t cap, size_t *pos, long long v) {
 
 extern char **environ;
 
-/* Resolve the parent fds that should appear at child stdio positions after
- * applying file_actions in POSIX order.  A dup2 action observes earlier
- * actions in the child fd table: `>file 2>&1` must route both fd 1 and fd 2
- * to the opened file, not to the parent's original stdout. */
-static int resolve_stdio_fds(const fa_state_t *s, int stdio_fds[3],
+/* Resolve the parent fds that should appear in the child after applying
+ * file_actions in POSIX order.  A dup2 action observes earlier actions in the
+ * child fd table: `>file 2>&1` must route both fd 1 and fd 2 to the opened
+ * file, not to the parent's original stdout. */
+static int set_child_mapping(child_fd_mapping_t *maps, int *map_count, int max_maps,
+                             int child_fd, int parent_fd, int open) {
+  if (child_fd < 0) {
+    errno = EBADF;
+    return -1;
+  }
+  for (int i = 0; i < *map_count; i++) {
+    if (maps[i].child_fd == child_fd) {
+      maps[i].parent_fd = parent_fd;
+      maps[i].open = open;
+      return 0;
+    }
+  }
+  if (*map_count >= max_maps) {
+    errno = ENOMEM;
+    return -1;
+  }
+  maps[*map_count].child_fd = child_fd;
+  maps[*map_count].parent_fd = parent_fd;
+  maps[*map_count].open = open;
+  (*map_count)++;
+  return 0;
+}
+
+static int resolve_child_parent_fd(const child_fd_mapping_t *maps, int map_count,
+                                   int child_fd, int *parent_fd) {
+  if (child_fd < 0) {
+    errno = EBADF;
+    return -1;
+  }
+  for (int i = 0; i < map_count; i++) {
+    if (maps[i].child_fd != child_fd) continue;
+    if (!maps[i].open) {
+      errno = EBADF;
+      return -1;
+    }
+    *parent_fd = maps[i].parent_fd;
+    return 0;
+  }
+  *parent_fd = child_fd;
+  return 0;
+}
+
+static int resolve_spawn_fds(const fa_state_t *s, int stdio_fds[3],
+                             child_fd_mapping_t *maps, int *map_count, int max_maps,
                              int *opened_fds, int *opened_count, int max_opened) {
   stdio_fds[0] = 0;
   stdio_fds[1] = 1;
   stdio_fds[2] = 2;
+  *map_count = 0;
 
   if (!s) return 0;
 
@@ -289,7 +468,6 @@ static int resolve_stdio_fds(const fa_state_t *s, int stdio_fds[3],
     const action_t *a = &s->items[i];
     switch (a->kind) {
       case ACTION_OPEN: {
-        if (a->fd < 0 || a->fd > 2) break;
         /* Open the file in the parent now; the spawn call will
          * dup it onto the child position.  Store the opened fd so
          * we can close it after the spawn returns. */
@@ -298,28 +476,34 @@ static int resolve_stdio_fds(const fa_state_t *s, int stdio_fds[3],
           /* Bubble open failure up by returning -1. */
           return -1;
         }
-        if (*opened_count < max_opened) {
-          opened_fds[(*opened_count)++] = new_fd;
+        if (*opened_count >= max_opened) {
+          close(new_fd);
+          errno = ENOMEM;
+          return -1;
         }
-        stdio_fds[a->fd] = new_fd;
+        opened_fds[(*opened_count)++] = new_fd;
+        if (set_child_mapping(maps, map_count, max_maps, a->fd, new_fd, 1) != 0) return -1;
+        if (a->fd >= 0 && a->fd <= 2) stdio_fds[a->fd] = new_fd;
         break;
       }
       case ACTION_CLOSE:
-        if (a->fd < 0 || a->fd > 2) break;
+        if (set_child_mapping(maps, map_count, max_maps, a->fd, -1, 0) != 0) return -1;
         /* Mark child fd as closed.  We model this as "no source",
          * but our SpawnRequest can't represent a closed stdio fd
          * — skip it and let the runtime use the default (parent's
          * matching fd).  Programs that *really* need a closed fd
          * 0/1/2 in the child are rare. */
-        stdio_fds[a->fd] = -1;
+        if (a->fd >= 0 && a->fd <= 2) stdio_fds[a->fd] = -1;
         break;
-      case ACTION_DUP2:
-        if (a->fd < 0 || a->fd > 2) break;
+      case ACTION_DUP2: {
         /* Child fd N := current child dup_src.  No actual dup happens
          * on the parent side; SpawnRequest routes the resolved source. */
-        if (a->dup_src >= 0 && a->dup_src <= 2) stdio_fds[a->fd] = stdio_fds[a->dup_src];
-        else stdio_fds[a->fd] = a->dup_src;
+        int parent_fd = -1;
+        if (resolve_child_parent_fd(maps, *map_count, a->dup_src, &parent_fd) != 0) return -1;
+        if (set_child_mapping(maps, map_count, max_maps, a->fd, parent_fd, 1) != 0) return -1;
+        if (a->fd >= 0 && a->fd <= 2) stdio_fds[a->fd] = parent_fd;
         break;
+      }
       case ACTION_CHDIR:
         /* Chdir doesn't affect fd resolution. */
         break;
@@ -365,11 +549,21 @@ static int do_posix_spawn(pid_t *pid_out, const char *prog,
 
   /* Track parent fds we opened on the child's behalf so we can close
    * them after host_spawn returns. */
-  int opened_fds[8];
+  int action_cap = fa && fa->count > 0 ? fa->count : 1;
+  int *opened_fds = (int *)calloc((size_t)action_cap, sizeof(int));
+  child_fd_mapping_t *fd_maps = (child_fd_mapping_t *)calloc((size_t)action_cap, sizeof(*fd_maps));
+  if (!opened_fds || !fd_maps) {
+    free(opened_fds);
+    free(fd_maps);
+    errno = ENOMEM;
+    return ENOMEM;
+  }
   int opened_count = 0;
+  int fd_map_count = 0;
 
   int stdio_fds[3];
-  if (resolve_stdio_fds(fa, stdio_fds, opened_fds, &opened_count, 8) != 0) goto fail_open;
+  if (resolve_spawn_fds(fa, stdio_fds, fd_maps, &fd_map_count, action_cap,
+                        opened_fds, &opened_count, action_cap) != 0) goto fail_open;
   int stdin_fd  = stdio_fds[0];
   int stdout_fd = stdio_fds[1];
   int stderr_fd = stdio_fds[2];
@@ -383,94 +577,69 @@ static int do_posix_spawn(pid_t *pid_out, const char *prog,
   if (stderr_fd == -1) stderr_fd = 2;
 
   const char *cwd = resolve_chdir(fa);
-  /* Build the SpawnRequest JSON.  64 KB upper bound — anything past
-   * that is a degenerate argv/env. */
-  char *json = (char *)malloc(65536);
-  if (!json) {
+  unsigned char *record = (unsigned char *)calloc(1, 65536);
+  if (!record) {
     errno = ENOMEM;
     goto fail_open;
   }
-  size_t pos = 0;
-  size_t cap = 65536;
-  if (json_emit_lit(json, cap, &pos, "{\"prog\":") != 0) goto fail_json;
-  if (json_emit_string(json, cap, &pos, prog) != 0) goto fail_json;
-  if (argv && argv[0]) {
-    if (json_emit_lit(json, cap, &pos, ",\"argv0\":") != 0) goto fail_json;
-    if (json_emit_string(json, cap, &pos, argv[0]) != 0) goto fail_json;
-  }
-  if (json_emit_lit(json, cap, &pos, ",\"args\":[") != 0) goto fail_json;
-  if (argv) {
-    for (int i = 1; argv[i]; i++) {
-      if (i > 1 && json_emit_lit(json, cap, &pos, ",") != 0) goto fail_json;
-      if (json_emit_string(json, cap, &pos, argv[i]) != 0) goto fail_json;
-    }
-  }
-  if (json_emit_lit(json, cap, &pos, "],\"env\":[") != 0) goto fail_json;
-  char *const *env = envp ? envp : environ;
-  if (env) {
-    int written = 0;
-    for (int i = 0; env[i]; i++) {
-      const char *eq = strchr(env[i], '=');
-      if (!eq) continue;
-      if (written > 0 && json_emit_lit(json, cap, &pos, ",") != 0) goto fail_json;
-      if (json_emit_lit(json, cap, &pos, "[") != 0) goto fail_json;
-      char key[256];
-      size_t key_len = (size_t)(eq - env[i]);
-      if (key_len >= sizeof(key)) continue;
-      memcpy(key, env[i], key_len);
-      key[key_len] = '\0';
-      if (json_emit_string(json, cap, &pos, key) != 0) goto fail_json;
-      if (json_emit_lit(json, cap, &pos, ",") != 0) goto fail_json;
-      if (json_emit_string(json, cap, &pos, eq + 1) != 0) goto fail_json;
-      if (json_emit_lit(json, cap, &pos, "]") != 0) goto fail_json;
-      written++;
-    }
-  }
-  if (json_emit_lit(json, cap, &pos, "]") != 0) goto fail_json;
-  if (cwd) {
-    if (json_emit_lit(json, cap, &pos, ",\"cwd\":") != 0) goto fail_json;
-    if (json_emit_string(json, cap, &pos, cwd) != 0) goto fail_json;
-  }
-  if (json_emit_lit(json, cap, &pos, ",\"stdin_fd\":") != 0) goto fail_json;
-  if (json_emit_int(json, cap, &pos, stdin_fd) != 0) goto fail_json;
-  if (json_emit_lit(json, cap, &pos, ",\"stdout_fd\":") != 0) goto fail_json;
-  if (json_emit_int(json, cap, &pos, stdout_fd) != 0) goto fail_json;
-  if (json_emit_lit(json, cap, &pos, ",\"stderr_fd\":") != 0) goto fail_json;
-  if (json_emit_int(json, cap, &pos, stderr_fd) != 0) goto fail_json;
-  if (json_emit_lit(json, cap, &pos, ",\"pass_fds\":[") != 0) goto fail_json;
-  int pass_written = 0;
-  for (int fd = 3; fd < 256; fd++) {
-    if (child_fd_is_closed(fa, fd)) continue;
-    if (pass_written > 0 && json_emit_lit(json, cap, &pos, ",") != 0) goto fail_json;
-    if (json_emit_int(json, cap, &pos, fd) != 0) goto fail_json;
-    pass_written++;
-  }
-  if (json_emit_lit(json, cap, &pos, "]") != 0) goto fail_json;
-  if (pos + 1 >= cap) goto fail_json;
-  json[pos++] = '}';
+  spawn_record_builder_t builder = {
+    .bytes = record,
+    .len = sizeof(yurt_spawn_request_v1),
+    .cap = 65536,
+  };
+  yurt_spawn_request_v1 *req = (yurt_spawn_request_v1 *)(void *)record;
+  req->header.version = YURT_ABI_RECORD_VERSION_1;
+  req->stdin_fd = stdin_fd;
+  req->stdout_fd = stdout_fd;
+  req->stderr_fd = stderr_fd;
 
-  int new_pid = yurt_host_spawn((int)(intptr_t)json, (int)pos);
-  free(json);
+  if (spawn_record_span(&builder, &req->prog, prog) != 0) goto fail_record;
+  if (argv && argv[0] && spawn_record_span_allow_empty(&builder, &req->argv0, argv[0]) != 0) goto fail_record;
+  if (spawn_record_args(&builder, req, argv) != 0) goto fail_record;
+  char *const *env = envp ? envp : environ;
+  if (spawn_record_env(&builder, req, env) != 0) goto fail_record;
+  if (cwd && spawn_record_span(&builder, &req->cwd, cwd) != 0) goto fail_record;
+  if (spawn_record_pass_fds(&builder, req, fa, fd_maps, fd_map_count) != 0) goto fail_record;
+  if (spawn_record_fd_map(&builder, req, fd_maps, fd_map_count) != 0) goto fail_record;
+  req->header.size = (uint32_t)builder.len;
+
+  yurt_spawn_result_v1 spawn_result = { .pid = -1 };
+  int written = yurt_host_spawn((int)(intptr_t)record, (int)builder.len,
+                                (int)(intptr_t)&spawn_result, (int)sizeof(spawn_result));
+  free(record);
 
   /* Whether the spawn succeeded or not, drop the fds we opened
    * on the child's behalf — the kernel duplicated them into the
    * child's table during host_spawn. */
   for (int i = 0; i < opened_count; i++) close(opened_fds[i]);
+  free(opened_fds);
+  free(fd_maps);
 
-  if (new_pid < 0) {
-    errno = EAGAIN;
-    return EAGAIN;
+  if (written != (int)sizeof(spawn_result) || spawn_result.pid < 0) {
+    int err = EAGAIN;
+    int code = written < 0 ? written : spawn_result.pid;
+    if (code == -1) err = ENOENT;
+    else if (code == -2) err = EACCES;
+    else if (code == -22) err = EINVAL;
+    else if (code == -38) err = ENOSYS;
+    errno = err;
+    return err;
   }
 
-  if (pid_out) *pid_out = (pid_t)new_pid;
+  if (pid_out) *pid_out = (pid_t)spawn_result.pid;
   return 0;
 
-fail_json:
-  free(json);
+fail_record:
+  free(record);
 fail_open:
-  for (int i = 0; i < opened_count; i++) close(opened_fds[i]);
-  errno = ENOMEM;
-  return ENOMEM;
+  {
+    int saved_errno = errno ? errno : ENOMEM;
+    for (int i = 0; i < opened_count; i++) close(opened_fds[i]);
+    free(opened_fds);
+    free(fd_maps);
+    errno = saved_errno;
+    return saved_errno;
+  }
 }
 
 int posix_spawn(pid_t *__restrict pid, const char *__restrict path,

@@ -9,6 +9,7 @@
 #endif
 
 static int fork_memory_probe = 17;
+extern char **environ;
 #if YURT_FORK_CANARY_CONTINUATION
 static jmp_buf fork_jump;
 static jmp_buf fork_nested_top;
@@ -171,10 +172,131 @@ static int expect_child_wait_then_longjmp_to_prefork_handler(void) {
     puts("fork-child-wait-longjmp-ok");
     return 0;
 }
+
+static int expect_child_exec_after_fork(void) {
+    pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "fork failed errno=%d\n", errno);
+        return 1;
+    }
+    if (pid == 0) {
+        char *child_argv[] = { "true", NULL };
+        execve("/usr/bin/true", child_argv, environ);
+        fprintf(stderr, "child execve failed errno=%d\n", errno);
+        _exit(111);
+    }
+
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, 0);
+    if (waited != pid) {
+        fprintf(stderr, "waitpid returned %ld for child %ld errno=%d\n", (long)waited, (long)pid, errno);
+        return 2;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "child exec status mismatch: raw=%d\n", status);
+        return 3;
+    }
+
+    puts("fork-child-exec-ok");
+    return 0;
+}
+
+static pid_t wrapped_fork(void) {
+    return fork();
+}
+
+static int expect_wrapped_fork_parent_continues(void) {
+    pid_t pid = wrapped_fork();
+    if (pid < 0) {
+        fprintf(stderr, "wrapped fork failed errno=%d\n", errno);
+        return 1;
+    }
+    if (pid == 0) {
+        puts("wrapped-child");
+        _exit(0);
+    }
+
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, 0);
+    if (waited != pid) {
+        fprintf(stderr, "waitpid returned %ld for child %ld errno=%d\n", (long)waited, (long)pid, errno);
+        return 2;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "wrapped child status mismatch: raw=%d\n", status);
+        return 3;
+    }
+
+    puts("wrapped-parent");
+    return 0;
+}
+
+static int expect_pipe_synced_fork_parent_continues(void) {
+    int fds[2];
+    if (pipe(fds) != 0) {
+        fprintf(stderr, "pipe failed errno=%d\n", errno);
+        return 1;
+    }
+
+    pid_t pid = wrapped_fork();
+    if (pid < 0) {
+        fprintf(stderr, "wrapped fork failed errno=%d\n", errno);
+        return 2;
+    }
+    if (pid == 0) {
+        close(fds[0]);
+        const char msg[] = "ready";
+        if (write(fds[1], msg, sizeof(msg)) != (ssize_t)sizeof(msg)) _exit(4);
+        close(fds[1]);
+        puts("pipe-child");
+        _exit(0);
+    }
+
+    close(fds[1]);
+    char buf[sizeof("ready")];
+    ssize_t n = read(fds[0], buf, sizeof(buf));
+    close(fds[0]);
+    if (n != (ssize_t)sizeof(buf) || memcmp(buf, "ready", sizeof(buf)) != 0) {
+        fprintf(stderr, "parent read sync failed n=%ld errno=%d\n", (long)n, errno);
+        return 3;
+    }
+
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, 0);
+    if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "pipe child status mismatch waited=%ld raw=%d errno=%d\n", (long)waited, status, errno);
+        return 4;
+    }
+
+    puts("pipe-parent");
+    return 0;
+}
+
+static int expect_wait_any_after_fork(void) {
+    pid_t pid = wrapped_fork();
+    if (pid < 0) {
+        fprintf(stderr, "wrapped fork failed errno=%d\n", errno);
+        return 1;
+    }
+    if (pid == 0) {
+        puts("wait-any-child");
+        _exit(0);
+    }
+
+    int status = 0;
+    pid_t waited = waitpid(-1, &status, 0);
+    if (waited != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "wait-any mismatch waited=%ld child=%ld raw=%d errno=%d\n", (long)waited, (long)pid, status, errno);
+        return 2;
+    }
+
+    puts("wait-any-parent");
+    return 0;
+}
 #endif
 
 static int usage(const char *argv0) {
-    fprintf(stderr, "usage: %s [--case default-enosys|continuation-split|child-longjmp-prefork|child-nested-longjmp-prefork|child-wait-longjmp-prefork]\n", argv0);
+    fprintf(stderr, "usage: %s [--case default-enosys|continuation-split|child-longjmp-prefork|child-nested-longjmp-prefork|child-wait-longjmp-prefork|child-exec|wrapped-fork|pipe-synced-fork|wait-any]\n", argv0);
     return 2;
 }
 
@@ -192,6 +314,10 @@ int main(int argc, char **argv) {
     if (strcmp(name, "child-longjmp-prefork") == 0) return expect_child_longjmp_to_prefork_handler();
     if (strcmp(name, "child-nested-longjmp-prefork") == 0) return expect_child_nested_longjmp_to_prefork_handler();
     if (strcmp(name, "child-wait-longjmp-prefork") == 0) return expect_child_wait_then_longjmp_to_prefork_handler();
+    if (strcmp(name, "child-exec") == 0) return expect_child_exec_after_fork();
+    if (strcmp(name, "wrapped-fork") == 0) return expect_wrapped_fork_parent_continues();
+    if (strcmp(name, "pipe-synced-fork") == 0) return expect_pipe_synced_fork_parent_continues();
+    if (strcmp(name, "wait-any") == 0) return expect_wait_any_after_fork();
 #endif
     return usage(argv[0]);
 }

@@ -5,6 +5,14 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#ifndef RLIM_NLIMITS
+#error "sys/resource.h must expose RLIM_NLIMITS for zsh/Linux compatibility"
+#endif
+
+#if RLIM_NLIMITS <= RLIMIT_RTPRIO
+#error "RLIM_NLIMITS must be larger than the highest resource id"
+#endif
+
 static void emit(const char *case_name, int exit_code, unsigned long v) {
   printf("{\"case\":\"%s\",\"exit\":%d,\"v\":%lu}\n", case_name, exit_code, v);
 }

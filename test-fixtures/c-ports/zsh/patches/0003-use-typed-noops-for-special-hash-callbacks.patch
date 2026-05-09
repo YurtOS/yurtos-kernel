@@ -1,0 +1,51 @@
+--- a/Src/params.c
++++ b/Src/params.c
+@@ -1062,6 +1062,27 @@ shempty(void)
+ {
+ }
+ 
++static void
++shemptytable(UNUSED(HashTable ht))
++{
++}
++
++static void
++shemptyadd(UNUSED(HashTable ht), UNUSED(char *name), UNUSED(void *nodeptr))
++{
++}
++
++static HashNode
++shemptyremove(UNUSED(HashTable ht), UNUSED(const char *name))
++{
++    return NULL;
++}
++
++static void
++shemptyfree(UNUSED(HashNode hn))
++{
++}
++
+ /*
+  * Create a simple special hash parameter.
+  *
+@@ -1104,15 +1124,15 @@ createspecialhash(char *name, GetNodeFunc get, ScanTabFunc scan, int flags)
+     pm->u.hash = ht = newhashtable(0, name, NULL);
+ 
+     ht->hash        = hasher;
+-    ht->emptytable  = (TableFunc) shempty;
++    ht->emptytable  = shemptytable;
+     ht->filltable   = NULL;
+-    ht->addnode     = (AddNodeFunc) shempty;
++    ht->addnode     = shemptyadd;
+     ht->getnode     = ht->getnode2 = get;
+-    ht->removenode  = (RemoveNodeFunc) shempty;
++    ht->removenode  = shemptyremove;
+     ht->disablenode = NULL;
+     ht->enablenode  = NULL;
+-    ht->freenode    = (FreeNodeFunc) shempty;
++    ht->freenode    = shemptyfree;
+     ht->printnode   = printparamnode;
+     ht->scantab     = scan;
+ 
+     return pm;
+ }

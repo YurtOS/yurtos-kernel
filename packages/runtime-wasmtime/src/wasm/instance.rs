@@ -47,7 +47,7 @@ impl ShellInstance {
 
         let instance = engine
             .linker
-            .instantiate_async(&mut store, &*module)
+            .instantiate_async(&mut store, &module)
             .await
             .context("instantiating WASM module")?;
 

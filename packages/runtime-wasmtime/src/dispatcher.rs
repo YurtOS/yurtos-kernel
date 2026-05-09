@@ -57,6 +57,7 @@ fn vfs_err(id: Option<RequestId>, e: VfsError) -> Response {
     Response::err(id, 1, e.to_string())
 }
 
+#[allow(clippy::result_large_err)]
 fn require_str<'a>(
     id: &Option<RequestId>,
     params: &'a Value,
@@ -352,11 +353,11 @@ impl Dispatcher {
         params: &Value,
         sid: Option<&str>,
     ) -> Response {
-        let name = match require_str(&id, &params, "name") {
+        let name = match require_str(&id, params, "name") {
             Ok(n) => n.to_owned(),
             Err(r) => return r,
         };
-        let value = match require_str(&id, &params, "value") {
+        let value = match require_str(&id, params, "value") {
             Ok(v) => v.to_owned(),
             Err(r) => return r,
         };

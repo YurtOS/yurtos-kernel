@@ -26,14 +26,30 @@ YURT_DEFINE_MARKER(getpid,  0x67706964u) /* gpid */
 YURT_DEFINE_MARKER(getppid, 0x67707064u) /* gppd */
 YURT_DEFINE_MARKER(kill,    0x6b696c6cu) /* kill */
 
-pid_t getpid(void) {
+static pid_t yurt_getpid_impl(void) {
     YURT_MARKER_CALL(getpid);
     return (pid_t)yurt_host_getpid();
 }
 
-pid_t getppid(void) {
+pid_t getpid(void) {
+    return yurt_getpid_impl();
+}
+
+pid_t __wrap_getpid(void) {
+    return yurt_getpid_impl();
+}
+
+static pid_t yurt_getppid_impl(void) {
     YURT_MARKER_CALL(getppid);
     return (pid_t)yurt_host_getppid();
+}
+
+pid_t getppid(void) {
+    return yurt_getppid_impl();
+}
+
+pid_t __wrap_getppid(void) {
+    return yurt_getppid_impl();
 }
 
 int kill(pid_t pid, int sig) {
@@ -66,20 +82,16 @@ int pclose(FILE *stream) {
 }
 
 /* wait(2) / waitpid(2) — POSIX wait surface routed through the
- * yurt kernel's host_waitpid.  host_waitpid is async on the
+ * yurt kernel's host_wait.  host_wait is async on the
  * kernel side; the host wraps it with JSPI Suspending (or
  * the asyncify bridge as fallback), so from the C caller's
  * perspective it's a normal blocking call regardless of the
  * underlying scheduler — wasi-2-preempt, JSPI, or asyncify.
  *
- * The host_waitpid response is JSON `{"exit_code":N}`; we do an
- * inline parse to avoid pulling in the yurt_command JSON helpers
- * for what should be a hot path on tools that posix_spawn children.
- *
- * waitpid(pid > 0): blocks via host_waitpid until that specific
- *   child exits.  Honors WNOHANG by switching to host_waitpid_nohang.
+ * waitpid(pid > 0): blocks via host_wait until that specific
+ *   child exits.  Honors WNOHANG with YURT_WAIT_NOHANG.
  * waitpid(-1) / wait(): waits for any child owned by the calling
- *   sandbox process.  The host returns JSON `{"pid":N,"exit_code":M}`
+ *   sandbox process.  The host returns yurt_wait_result_v1
  *   so wait-any can return the actual reaped child PID. */
 
 #include <stddef.h>
@@ -88,112 +100,45 @@ int pclose(FILE *stream) {
 #include <sys/resource.h>
 #include <sys/wait.h>
 
+#include "yurt_abi.h"
+
 YURT_DECLARE_MARKER(wait);
 YURT_DECLARE_MARKER(waitpid);
 YURT_DEFINE_MARKER(wait,    0x77616974u) /* "wait" */
 YURT_DEFINE_MARKER(waitpid, 0x77706964u) /* "wpid" */
 
-/* Pull a numeric value for `key` out of a JSON object. */
-static int json_parse_int(const char *json, size_t json_len, const char *key, size_t klen, int *out) {
-    for (size_t i = 0; i + klen <= json_len; ++i) {
-        if (memcmp(json + i, key, klen) != 0) continue;
-        const char *p = json + i + klen;
-        const char *end = json + json_len;
-        int sign = 1;
-        if (p < end && *p == '-') { sign = -1; ++p; }
-        int val = 0, saw = 0;
-        while (p < end && *p >= '0' && *p <= '9') { val = val * 10 + (*p - '0'); saw = 1; ++p; }
-        if (!saw) return -1;
-        *out = sign * val;
-        return 0;
-    }
-    return -1;
-}
-
-/* Pull `"exit_code":N` out of the JSON response. */
-static int waitpid_parse_exit(const char *json, size_t json_len, int *out) {
-    static const char needle[] = "\"exit_code\":";
-    return json_parse_int(json, json_len, needle, sizeof(needle) - 1, out);
-}
-
-static int waitpid_parse_pid(const char *json, size_t json_len, int fallback, int *out) {
-    static const char needle[] = "\"pid\":";
-    if (json_parse_int(json, json_len, needle, sizeof(needle) - 1, out) == 0) return 0;
-    *out = fallback;
-    return 0;
-}
-
 /* Pack a kernel exit code into the POSIX wait status encoding so
  * WIFEXITED / WEXITSTATUS / WTERMSIG round-trip cleanly:
  *   - low byte = signal (0 if exited normally)
  *   - bits 8-15 = exit code
- * Negative codes from the kernel (host_waitpid returns -1 if the
- * process couldn't be waited on) are reported as ECHILD by the
+ * Negative codes from the kernel are reported as errno by the
  * caller; we don't try to encode them in the status. */
 static int encode_wait_status(int kernel_exit) {
     if (kernel_exit < 0) return 0;
     if (kernel_exit == 124) return 9; /* SIGKILL-style cancel → WIFSIGNALED */
-    if (kernel_exit > 128 && kernel_exit < 128 + 32) {
-        return kernel_exit - 128;
-    }
     return (kernel_exit & 0xff) << 8;
 }
 
 pid_t waitpid(pid_t pid, int *wstatus, int options) {
     YURT_MARKER_CALL(waitpid);
 
-    int exit_code;
-    int waited_pid = (int)pid;
-    if (options & WNOHANG) {
-        char buf[64];
-        int n = yurt_host_waitpid_nohang((int)pid, (int)(intptr_t)buf, (int)sizeof(buf));
-        if (n == -1) {
-            /* No child has exited yet: WNOHANG returns 0 with status untouched. */
-            return 0;
-        }
-        if (n <= 0 || (size_t)n > sizeof(buf)) {
-            errno = ECHILD;
-            return (pid_t)-1;
-        }
-        if (waitpid_parse_exit(buf, (size_t)n, &exit_code) != 0) {
-            errno = ECHILD;
-            return (pid_t)-1;
-        }
-        if (exit_code < 0) {
-            errno = ECHILD;
-            return (pid_t)-1;
-        }
-        if (waitpid_parse_pid(buf, (size_t)n, (int)pid, &waited_pid) != 0 || waited_pid < 0) {
-            errno = ECHILD;
-            return (pid_t)-1;
-        }
-    } else {
-        char buf[64];
-        int n = yurt_host_waitpid((int)pid, (int)(intptr_t)buf, (int)sizeof(buf));
-        if (n == -EINTR) {
-            errno = EINTR;
-            return (pid_t)-1;
-        }
-        if (n <= 0 || (size_t)n > sizeof(buf)) {
-            errno = ECHILD;
-            return (pid_t)-1;
-        }
-        if (waitpid_parse_exit(buf, (size_t)n, &exit_code) != 0) {
-            errno = ECHILD;
-            return (pid_t)-1;
-        }
-        if (exit_code < 0) {
-            errno = ECHILD;
-            return (pid_t)-1;
-        }
-        if (waitpid_parse_pid(buf, (size_t)n, (int)pid, &waited_pid) != 0 || waited_pid < 0) {
-            errno = ECHILD;
-            return (pid_t)-1;
-        }
+    int flags = (options & WNOHANG) ? (int)YURT_WAIT_NOHANG : 0;
+    yurt_wait_result_v1 result;
+    int n = yurt_host_wait((int)pid, flags, (int)(intptr_t)&result, (int)sizeof(result));
+    if (n == -EAGAIN) {
+        return 0;
+    }
+    if (n == -EINTR) {
+        errno = EINTR;
+        return (pid_t)-1;
+    }
+    if (n < 0 || n != (int)sizeof(result) || result.pid < 0 || result.exit_code < 0) {
+        errno = ECHILD;
+        return (pid_t)-1;
     }
 
-    if (wstatus) *wstatus = encode_wait_status(exit_code);
-    return (pid_t)waited_pid;
+    if (wstatus) *wstatus = encode_wait_status(result.exit_code);
+    return (pid_t)result.pid;
 }
 
 pid_t wait(int *wstatus) {

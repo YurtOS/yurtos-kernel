@@ -79,34 +79,17 @@ int dup(int oldfd) {
     return -1;
   }
 
-  /* host_dup writes `{"fd":<n>}` JSON to our buffer; pull the int
-   * out by hand to keep this hot path malloc-free. */
-  char buf[32];
-  int n = yurt_host_dup(oldfd, (int)(intptr_t)buf, (int)sizeof(buf));
-  if (n <= 0 || (size_t)n > sizeof(buf)) {
+  int32_t new_fd = -1;
+  int n = yurt_host_dup(oldfd, (int)(intptr_t)&new_fd, (int)sizeof(new_fd));
+  if (n < 0) {
     errno = EBADF;
     return -1;
   }
-
-  /* Find `"fd":` followed by a non-negative integer. */
-  static const char needle[] = "\"fd\":";
-  size_t needle_len = sizeof(needle) - 1;
-  for (size_t i = 0; i + needle_len <= (size_t)n; ++i) {
-    if (memcmp(buf + i, needle, needle_len) != 0) continue;
-    const char *p = buf + i + needle_len;
-    const char *end = buf + n;
-    int val = 0;
-    int saw = 0;
-    while (p < end && *p >= '0' && *p <= '9') {
-      val = val * 10 + (*p - '0');
-      saw = 1;
-      ++p;
-    }
-    if (saw) return val;
-    break;
+  if (n != (int)sizeof(new_fd) || new_fd < 0) {
+    errno = EBADF;
+    return -1;
   }
-  errno = EBADF;
-  return -1;
+  return (int)new_fd;
 }
 
 int dup3(int oldfd, int newfd, int flags) {

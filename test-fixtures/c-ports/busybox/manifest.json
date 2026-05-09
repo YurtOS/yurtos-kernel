@@ -7,7 +7,7 @@
       "cksum", "cmp", "comm", "cp", "cpio", "cut",
       "cryptpw", "dc", "dd", "df", "diff", "dirname",
       "du", "echo", "env", "expand", "expr",
-      "factor", "false", "find", "fold", "grep",
+      "egrep", "factor", "false", "fgrep", "find", "fold", "grep",
       "groups", "gzip", "head", "hexdump", "hostid",
       "hostname", "id", "link", "ln", "logname",
       "ls", "md5sum", "mkdir", "mktemp", "mv",

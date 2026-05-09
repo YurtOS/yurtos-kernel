@@ -95,6 +95,7 @@ fn shell_quote(s: &str) -> String {
 /// Spawn a child WASM instance in a background task.
 ///
 /// Returns the PID assigned to this child.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_child(
     spawn_ctx: Arc<SpawnContext>,
     parent_vfs: MemVfs,
@@ -152,6 +153,7 @@ pub fn spawn_child(
 /// Create and run a child WASM instance to completion.
 ///
 /// Returns the exit code.
+#[allow(clippy::too_many_arguments)]
 async fn run_child(
     ctx: Arc<SpawnContext>,
     vfs: MemVfs,

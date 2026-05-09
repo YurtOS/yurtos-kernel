@@ -73,11 +73,27 @@ jobs:
       - name: Build Rust std canaries
         run: make -C abi rust-canaries rust-std-canaries
 
+      - name: Build shell runner fixture
+        run: |
+          set -euxo pipefail
+          cargo build --release --target wasm32-wasip1 -p yurt-shell-exec
+          cp target/wasm32-wasip1/release/yurt-shell-exec.wasm \
+            packages/kernel/src/platform/__tests__/fixtures/bash.wasm
+
       - name: Build BusyBox fixture
         run: make -C test-fixtures/c-ports/busybox copy-fixtures
 
+      - name: Build ncurses fixture
+        run: make -C test-fixtures/c-ports/ncurses copy-fixtures
+
+      - name: Build zsh fixture
+        run: make -C test-fixtures/c-ports/zsh copy-fixtures
+
       - name: Run fixture smoke tests
         run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/fixture-build-smoke_test.ts packages/kernel/src/process/__tests__/module-cache_test.ts
+
+      - name: Run upstream zsh tests
+        run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/zsh-upstream_slow.ts
 
       - name: Run guest compatibility tests
         run: deno test --no-check --allow-read --allow-env --allow-run packages/kernel/src/__tests__/abi_test.ts

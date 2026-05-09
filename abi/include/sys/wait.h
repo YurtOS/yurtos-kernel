@@ -3,19 +3,15 @@
 
 /* POSIX <sys/wait.h> — wasi-libc doesn't ship one because WASI has
  * no traditional wait/waitpid model.  Yurt's process kernel does
- * track child PIDs (host_waitpid is async; host_waitpid_nohang is
- * sync), but exposing them under the standard libc names requires
- * a compat shim that we haven't wired yet (it would need a sync
- * polling loop or JSPI suspending from a sync libc call site).
+ * track child PIDs through host_wait, and libyurt_abi routes the
+ * standard libc names through that kernel import.
  *
  * For the purposes of building POSIX C code that compiles regardless
  * of whether wait/waitpid actually work, we expose:
  *   - the W* macros for parsing exit status integers (pure
  *     bitfield operations, no syscalls)
  *   - WNOHANG / WUNTRACED / WCONTINUED option flags
- *   - wait/waitpid prototypes that return -1/ECHILD at runtime —
- *     posix_spawn'd children are reaped via host_waitpid_nohang
- *     elsewhere, not through this header
+ *   - wait/waitpid prototypes implemented in libyurt_abi
  *
  * Programs that do not actually call wait()/waitpid() at runtime
  * (the common case after `--disable-*` flags strip decompressor
@@ -31,7 +27,7 @@ extern "C" {
 
 /* Exit-status parsing macros — pure bit-field math.  Same encoding
  * Linux uses: low byte = signal (0 if exited), bits 8-15 = exit code.
- * The yurt kernel reports exit codes directly via host_waitpid;
+ * The yurt kernel reports exit codes directly via host_wait;
  * tools that need the W* macros (mostly to compose status ints) get
  * the right behaviour for synthetic statuses too. */
 #define WNOHANG    1
@@ -50,10 +46,7 @@ extern "C" {
 #define WIFCONTINUED(s) ((s) == 0xffff)
 #define WCOREDUMP(s)    ((s) & 0x80)
 
-/* wait(2) / waitpid(2) — declared but not currently routed through
- * the yurt kernel (posix_spawn returns the child PID, and tools
- * that need to wait can poll via implementation-defined paths).
- * Both return -1 with errno = ECHILD at runtime via libyurt_abi. */
+/* wait(2) / waitpid(2) — real impls in yurt_process.c wrap host_wait. */
 pid_t wait(int *wstatus);
 pid_t waitpid(pid_t pid, int *wstatus, int options);
 

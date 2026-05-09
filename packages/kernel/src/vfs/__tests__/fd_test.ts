@@ -56,6 +56,22 @@ describe('FdTable', () => {
     expect(new TextDecoder().decode(buf)).toBe('hello');
   });
 
+  it('flushes shared file descriptions when any descriptor closes', () => {
+    const vfs = new VFS();
+    const parent = new FdTable(vfs);
+    const fd = parent.open('/home/user/out.txt', 'w');
+    parent.dupToShared(fd, 1);
+
+    const child = parent.duplicateSharedDetached(1, 1);
+    child.table.write(child.fd, new TextEncoder().encode('child output\n'));
+    child.table.close(child.fd);
+
+    expect(new TextDecoder().decode(vfs.readFile('/home/user/out.txt'))).toBe(
+      'child output\n',
+    );
+    expect(parent.isOpen(1)).toBe(true);
+  });
+
   it('clones fd table for fork', () => {
     const vfs = new VFS();
     vfs.writeFile('/home/user/test.txt', new TextEncoder().encode('hello'));

@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <yurt_abi.h>
+
 __attribute__((import_module("yurt"), import_name("host_run_command")))
 int yurt_host_run_command(int req_ptr, int req_len, int out_ptr, int out_cap);
 
@@ -65,6 +67,9 @@ int yurt_host_umask(int mask);
 __attribute__((import_module("yurt"), import_name("host_getcwd")))
 int yurt_host_getcwd(int out_ptr, int out_cap);
 
+__attribute__((import_module("yurt"), import_name("host_realpath")))
+int yurt_host_realpath(int path_ptr, int path_len, int out_ptr, int out_cap);
+
 __attribute__((import_module("yurt"), import_name("host_chdir")))
 int yurt_host_chdir(int path_ptr, int path_len);
 
@@ -106,58 +111,28 @@ int yurt_host_setrlimit(int resource, uint64_t soft, uint64_t hard);
 __attribute__((import_module("yurt"), import_name("host_kill")))
 int yurt_host_kill(int pid, int sig);
 
-/* host_pipe creates a pipe and writes JSON `{"read_fd":N,"write_fd":M}`
- * to the output buffer.  Returns the byte count written, or the
- * required size if out_cap was too small.  The 64-byte buffer in
- * pipe()/pipe2() is sized for that JSON shape. */
+/* host_pipe writes yurt_pipe_result_v1 to the output buffer. */
 __attribute__((import_module("yurt"), import_name("host_pipe")))
 int yurt_host_pipe(int out_ptr, int out_cap);
 
-/* host_dup duplicates a fd in the caller's table and writes JSON
- * `{"fd":<new_fd>}` to the output buffer.  Returns byte count or -1.
- * dup(2) needs this so we can hand back a fresh kernel-managed fd. */
+/* host_dup writes one int32_t fd to the output buffer. */
 __attribute__((import_module("yurt"), import_name("host_dup")))
 int yurt_host_dup(int fd, int out_ptr, int out_cap);
 
 __attribute__((import_module("yurt"), import_name("host_set_fd_descriptor_flags")))
 int yurt_host_set_fd_descriptor_flags(int fd, int flags);
 
-/* host_spawn synchronously spawns a child WASM process from a JSON
- * SpawnRequest.  Returns the new child's PID, or -1 on failure.
- * Used by posix_spawn / posix_spawnp.  See SpawnRequest in
- * packages/kernel/src/process/kernel.ts for the JSON shape. */
+/* host_spawn synchronously spawns a child WASM process from a native
+ * yurt_spawn_request_v1 record and writes yurt_spawn_result_v1. */
 __attribute__((import_module("yurt"), import_name("host_spawn")))
-int yurt_host_spawn(int req_ptr, int req_len);
+int yurt_host_spawn(int req_ptr, int req_len, int out_ptr, int out_cap);
 
 __attribute__((import_module("yurt"), import_name("host_mark_exec_child")))
 int yurt_host_mark_exec_child(int child_pid);
 
-/* host_waitpid blocks until the named child exits and writes JSON
- * `{"exit_code":N}` to the output buffer.  Returns byte count or -1.
- * The kernel wraps this with WebAssembly.Suspending (JSPI) or
- * the asyncify bridge automatically — backend choice is host-wide
- * (wasi2-preempt > JSPI > asyncify), so the C caller just sees a
- * normal blocking call.  Used by waitpid(pid > 0). */
-__attribute__((import_module("yurt"), import_name("host_waitpid")))
-int yurt_host_waitpid(int pid, int out_ptr, int out_cap);
-
-/* host_waitpid_nohang is the synchronous non-blocking variant.
- * It writes {"pid":N,"exit_code":M} and returns the byte count when
- * a child was reaped, -1 when no child has exited, and -2 for ECHILD. */
-__attribute__((import_module("yurt"), import_name("host_waitpid_nohang")))
-int yurt_host_waitpid_nohang(int pid, int out_ptr, int out_cap);
-
-/* host_wait_any writes { pid, exit_code } JSON into the output buffer and
- * suspends (JSPI) until a child exits.  Returns bytes written or -1.
- * Used by waitpid(-1, ..., 0) — blocking wait-any. */
-__attribute__((import_module("yurt"), import_name("host_wait_any")))
-int yurt_host_wait_any(int out_ptr, int out_cap);
-
-/* host_wait_any_nohang writes { pid, exit_code } if a child has already
- * exited, or { pid: 0 } if no child is ready.  Returns bytes written or -1.
- * Used by waitpid(-1, ..., WNOHANG). */
-__attribute__((import_module("yurt"), import_name("host_wait_any_nohang")))
-int yurt_host_wait_any_nohang(int out_ptr, int out_cap);
+/* host_wait writes yurt_wait_result_v1 to the output buffer. */
+__attribute__((import_module("yurt"), import_name("host_wait")))
+int yurt_host_wait(int pid, int flags, int out_ptr, int out_cap);
 
 __attribute__((import_module("yurt"), import_name("host_fork")))
 int yurt_host_fork(void) __attribute__((returns_twice));

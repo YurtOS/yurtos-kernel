@@ -52,6 +52,7 @@ import {
   WASI_FILETYPE_SYMBOLIC_LINK,
   WASI_OFLAGS_CREAT,
   WASI_OFLAGS_DIRECTORY,
+  WASI_OFLAGS_EXCL,
   WASI_OFLAGS_TRUNC,
   WASI_PREOPENTYPE_DIR,
   WASI_RIGHTS_ALL,
@@ -64,6 +65,103 @@ import {
 } from "./types.js";
 
 const SIGPIPE = 13;
+const YURT_STAT_MODE_BITS = 16n;
+const YURT_STAT_UID_BITS = 24n;
+const YURT_STAT_MODE_MASK = (1n << YURT_STAT_MODE_BITS) - 1n;
+const YURT_STAT_ID_MASK = (1n << YURT_STAT_UID_BITS) - 1n;
+
+function closeFdTarget(target: FdTarget): void {
+  if (target.type === "pipe_write") target.pipe.close();
+  if (target.type === "pipe_read") target.pipe.close();
+  if (target.type === "vfs_file") {
+    if (target.fdTable.isOpen(target.fd)) target.fdTable.close(target.fd);
+    target.refs = Math.max(0, target.refs - 1);
+  }
+  if (target.type === "socket") {
+    target.refs--;
+    if (target.refs <= 0) {
+      if (target.listener != null && target.closeListener) {
+        target.closeListener(target.listener);
+        target.listener = null;
+      }
+      if (target.socket !== null) {
+        target.close(target.socket);
+        target.socket = null;
+      }
+    }
+  }
+  if (target.type === "tty_master") {
+    target.state.masterClosed = true;
+    for (const waiter of target.state.toSlaveWaiters.splice(0)) waiter();
+  }
+}
+
+function retainFdTarget(target: FdTarget): void {
+  if (target.type === "pipe_write") target.pipe.addRef();
+  if (target.type === "pipe_read") target.pipe.addRef();
+  if (target.type === "vfs_file") {
+    target.fdTable.retain(target.fd);
+    target.refs++;
+  }
+  if (target.type === "socket") target.refs++;
+}
+
+function stablePathInode(path: string): bigint {
+  let hash = BigInt("0xcbf29ce484222325");
+  const prime = BigInt("0x100000001b3");
+  const mask = BigInt("0xffffffffffffffff");
+  for (let i = 0; i < path.length; i++) {
+    hash ^= BigInt(path.charCodeAt(i));
+    hash = (hash * prime) & mask;
+  }
+  return hash === BigInt(0) ? BigInt(1) : hash;
+}
+
+function yurtStatDevice(stat: { permissions: number; uid: number; gid: number }): bigint {
+  const mode = BigInt(stat.permissions & 0xffff);
+  const uid = BigInt(stat.uid >>> 0) & YURT_STAT_ID_MASK;
+  const gid = BigInt(stat.gid >>> 0) & YURT_STAT_ID_MASK;
+  return mode | (uid << YURT_STAT_MODE_BITS) | (gid << (YURT_STAT_MODE_BITS + YURT_STAT_UID_BITS));
+}
+
+function dirnameOfVfsPath(path: string): string {
+  const normalized = normalizeVfsPath(path);
+  if (normalized === "/") return "/";
+  const slash = normalized.lastIndexOf("/");
+  return slash <= 0 ? "/" : normalized.slice(0, slash);
+}
+
+function splitVfsPath(path: string): string[] {
+  const normalized = normalizeVfsPath(path);
+  return normalized === "/" ? [] : normalized.slice(1).split("/");
+}
+
+function canonicalStatPath(vfs: VfsLike, absPath: string): string {
+  let queue = splitVfsPath(absPath);
+  const resolved: string[] = [];
+  let symlinkDepth = 0;
+
+  while (queue.length > 0) {
+    const part = queue.shift()!;
+    const candidate = "/" + [...resolved, part].join("/");
+    const stat = vfs.lstat(candidate);
+    if (stat.type !== "symlink") {
+      resolved.push(part);
+      continue;
+    }
+    if (++symlinkDepth > 40) throw new Error("ELOOP: too many symlink levels");
+    const target = vfs.readlink(candidate);
+    const targetPath = target.startsWith("/")
+      ? target
+      : `${dirnameOfVfsPath(candidate)}/${target}`;
+    queue = [...splitVfsPath(targetPath), ...queue];
+    resolved.length = 0;
+  }
+
+  const canonical = "/" + resolved.join("/");
+  vfs.stat(canonical);
+  return canonical === "" ? "/" : canonical;
+}
 
 export class WasiExitError extends Error {
   code: number;
@@ -157,6 +255,8 @@ function inodeTypeToWasiFiletype(type: InodeType): number {
       return WASI_FILETYPE_DIRECTORY;
     case "symlink":
       return WASI_FILETYPE_SYMBOLIC_LINK;
+    case "char":
+      return WASI_FILETYPE_CHARACTER_DEVICE;
     default:
       return 0;
   }
@@ -310,14 +410,29 @@ export class WasiHost {
 
   duplicateFdTo(srcFd: number, dstFd: number, includeIo = true): FdTarget | null {
     if (srcFd === dstFd) {
+      const kernelTarget = this.kernelFdTarget(srcFd);
+      if (kernelTarget) return kernelTarget;
       if (this.fdTable.isOpen(srcFd)) return createVfsFileTarget(this.fdTable, srcFd);
       const dirPath = this.dirFds.get(srcFd);
       if (dirPath !== undefined) return createVfsDirTarget(dirPath);
       return includeIo ? this.ioFds.get(srcFd) ?? null : null;
     }
 
+    if (this.kernel && this.pid !== undefined && this.kernel.getFdTarget(this.pid, srcFd)) {
+      try {
+        this.kernel.dup2(this.pid, srcFd, dstFd);
+        if (this.dirFds.has(srcFd)) this.dirFds.set(dstFd, this.dirFds.get(srcFd)!);
+        else this.dirFds.delete(dstFd);
+        return this.kernel.getFdTarget(this.pid, dstFd);
+      } catch {
+        return null;
+      }
+    }
+
     if (this.fdTable.isOpen(srcFd)) {
       if (!this.isPreopenFd(dstFd)) this.dirFds.delete(dstFd);
+      const oldIoTarget = this.ioFds.get(dstFd);
+      if (oldIoTarget) closeFdTarget(oldIoTarget);
       this.ioFds.delete(dstFd);
       this.fdTable.dupToShared(srcFd, dstFd);
       return createVfsFileTarget(this.fdTable, dstFd);
@@ -325,6 +440,9 @@ export class WasiHost {
 
     const dirPath = this.dirFds.get(srcFd);
     if (dirPath !== undefined) {
+      const oldIoTarget = this.ioFds.get(dstFd);
+      if (oldIoTarget) closeFdTarget(oldIoTarget);
+      this.ioFds.delete(dstFd);
       if (this.fdTable.isOpen(dstFd)) {
         try {
           this.fdTable.close(dstFd);
@@ -342,6 +460,9 @@ export class WasiHost {
           this.fdTable.close(dstFd);
         } catch { /* ignore */ }
       }
+      const oldIoTarget = this.ioFds.get(dstFd);
+      if (oldIoTarget && oldIoTarget !== ioTarget) closeFdTarget(oldIoTarget);
+      retainFdTarget(ioTarget);
       this.ioFds.set(dstFd, ioTarget);
       return ioTarget;
     }
@@ -351,6 +472,16 @@ export class WasiHost {
 
   duplicateFdMin(srcFd: number, minFd: number, includeIo = true): number | null {
     if (minFd < 0) return null;
+    if (this.kernel && this.pid !== undefined && this.kernel.getFdTarget(this.pid, srcFd)) {
+      try {
+        const newFd = this.kernel.dupMin(this.pid, srcFd, minFd);
+        const dirPath = this.dirFds.get(srcFd);
+        if (dirPath !== undefined) this.dirFds.set(newFd, dirPath);
+        return newFd;
+      } catch {
+        return null;
+      }
+    }
     const hasSource = this.fdTable.isOpen(srcFd) ||
       this.dirFds.has(srcFd) ||
       (includeIo && this.ioFds.has(srcFd));
@@ -423,6 +554,15 @@ export class WasiHost {
     return this.kernelFdTarget(fd) ?? this.ioFds.get(fd);
   }
 
+  private hasKernelFd(fd: number): boolean {
+    return this.kernelFdTarget(fd) !== null;
+  }
+
+  private hasOpenFd(fd: number): boolean {
+    return this.hasKernelFd(fd) || this.ioFds.has(fd) ||
+      this.dirFds.has(fd) || this.fdTable.isOpen(fd);
+  }
+
   snapshotForFork(): WasiHostForkSnapshot {
     return {
       fdTable: this.fdTable.clone(),
@@ -445,15 +585,9 @@ export class WasiHost {
 
   bindKernelFileTargets(): void {
     if (!this.kernel || this.pid === undefined) return;
-    for (const fd of this.fdTable.openFds()) {
-      if (this.dirFds.has(fd)) continue;
-      if (!this.kernel.getFdTarget(this.pid, fd)) continue;
-      this.kernel.setFdTarget(
-        this.pid,
-        fd,
-        createVfsFileTarget(this.fdTable, fd),
-      );
-    }
+    // Regular file descriptors are owned by ProcessKernel. Fork builds the
+    // child's kernel fd table directly; rebinding from this WASI-side cache
+    // would replace the inherited open file descriptions with stale mirrors.
   }
 
   setCanSuspendPipeReads(enabled: boolean): void {
@@ -692,7 +826,10 @@ export class WasiHost {
     if (cwd === "/" || relativePath.startsWith("/")) {
       return this.resolveProcSelf(joinVfsPath("/", relativePath));
     }
-    if (relativePath === "" || relativePath === ".") {
+    if (relativePath === "") {
+      return this.resolveProcSelf("/");
+    }
+    if (relativePath === ".") {
       return this.resolveProcSelf(cwd);
     }
 
@@ -726,7 +863,9 @@ export class WasiHost {
     }
     const match = path.match(/^\/proc\/(\d+)\/fd\/(\d+)$/);
     if (!match) return null;
-    return { pid: Number(match[1]), fd: Number(match[2]) };
+    const visiblePid = Number(match[1]);
+    const pid = this.kernel?.resolveVisiblePid(visiblePid) ?? visiblePid;
+    return { pid, fd: Number(match[2]) };
   }
 
   private pathExists(path: string): boolean {
@@ -869,7 +1008,9 @@ export class WasiHost {
           }
           case "vfs_file": {
             try {
-              totalWritten += target.fdTable.write(target.fd, data);
+              totalWritten += this.kernel && this.pid !== undefined
+                ? this.kernel.writeVfsFile(this.pid, fd, data)
+                : target.fdTable.write(target.fd, data);
             } catch (err) {
               return fdErrorToWasi(err);
             }
@@ -1035,7 +1176,9 @@ export class WasiHost {
             const buf = new Uint8Array(iov.len);
             let n: number;
             try {
-              n = target.fdTable.read(target.fd, buf);
+              n = this.kernel && this.pid !== undefined
+                ? this.kernel.readVfsFile(this.pid, fd, buf)
+                : target.fdTable.read(target.fd, buf);
             } catch (err) {
               return fdErrorToWasi(err);
             }
@@ -1293,10 +1436,15 @@ export class WasiHost {
   ): number {
     try {
       const target = this.fdTarget(fd);
-      const fdTable = target?.type === "vfs_file" ? target.fdTable : this.fdTable;
-      const vfsFd = target?.type === "vfs_file" ? target.fd : fd;
       const vfsWhence = wasiWhenceToVfs(whence);
-      const newOffset = fdTable.seek(vfsFd, Number(offset), vfsWhence);
+      const newOffset = target?.type === "vfs_file" &&
+          this.kernel && this.pid !== undefined
+        ? this.kernel.seekVfsFile(this.pid, fd, Number(offset), vfsWhence)
+        : (target?.type === "vfs_file" ? target.fdTable : this.fdTable).seek(
+          target?.type === "vfs_file" ? target.fd : fd,
+          Number(offset),
+          vfsWhence,
+        );
       const view = this.getView();
       view.setBigUint64(newOffsetPtr, BigInt(newOffset), true);
       return WASI_ESUCCESS;
@@ -1308,9 +1456,12 @@ export class WasiHost {
   private fdTell(fd: number, offsetPtr: number): number {
     try {
       const target = this.fdTarget(fd);
-      const fdTable = target?.type === "vfs_file" ? target.fdTable : this.fdTable;
-      const vfsFd = target?.type === "vfs_file" ? target.fd : fd;
-      const offset = fdTable.tell(vfsFd);
+      const offset = target?.type === "vfs_file" &&
+          this.kernel && this.pid !== undefined
+        ? this.kernel.tellVfsFile(this.pid, fd)
+        : (target?.type === "vfs_file" ? target.fdTable : this.fdTable).tell(
+          target?.type === "vfs_file" ? target.fd : fd,
+        );
       const view = this.getView();
       view.setBigUint64(offsetPtr, BigInt(offset), true);
       return WASI_ESUCCESS;
@@ -1361,10 +1512,14 @@ export class WasiHost {
     let filetype: number;
 
     // I/O target fds (stdio or custom) are character devices, except sockets.
-    const ioTarget = this.ioFds.get(fd);
-    if (ioTarget) {
-      filetype = ioTarget.type === "socket"
+    const target = this.fdTarget(fd);
+    if (target) {
+      filetype = target.type === "socket"
         ? WASI_FILETYPE_SOCKET_STREAM
+        : target.type === "vfs_dir"
+        ? WASI_FILETYPE_DIRECTORY
+        : target.type === "vfs_file"
+        ? WASI_FILETYPE_REGULAR_FILE
         : WASI_FILETYPE_CHARACTER_DEVICE;
     } else if (this.dirFds.has(fd)) {
       filetype = WASI_FILETYPE_DIRECTORY;
@@ -1378,7 +1533,7 @@ export class WasiHost {
     view.setUint8(bufPtr + 1, 0); // padding
     view.setUint16(
       bufPtr + 2,
-      ioTarget?.type === "socket" ? (ioTarget.fdFlags ?? 0) : 0,
+      target?.type === "socket" ? (target.fdFlags ?? 0) : 0,
       true,
     ); // fdflags
     // 4 bytes padding
@@ -1389,7 +1544,9 @@ export class WasiHost {
   }
 
   private fdRightsBase(fd: number): bigint {
-    const mode = this.fdTable.getMode(fd);
+    const mode = this.kernel && this.pid !== undefined
+      ? this.kernel.vfsFileMode(this.pid, fd) ?? this.fdTable.getMode(fd)
+      : this.fdTable.getMode(fd);
     if (!mode) return WASI_RIGHTS_ALL;
     let rights = WASI_RIGHTS_ALL & ~WASI_RIGHTS_FD_READ & ~WASI_RIGHTS_FD_WRITE;
     if (mode === "r" || mode === "rw") rights |= WASI_RIGHTS_FD_READ;
@@ -1420,13 +1577,17 @@ export class WasiHost {
       return this.writeFilestat(bufPtr, dirPath);
     }
 
-    // For I/O target fds (stdio or custom), return a minimal character device stat
-    if (this.ioFds.has(fd)) {
+    const target = this.fdTarget(fd);
+    // For non-file I/O target fds (stdio, pipes, sockets, ttys), return a
+    // minimal character device stat. Regular files are handled by path below.
+    if (target && target.type !== "vfs_file" && target.type !== "vfs_dir") {
       return this.writeCharDeviceStat(bufPtr);
     }
 
     // For regular file fds opened via path_open
-    const filePath = this.fdTable.getPath(fd);
+    const filePath = this.kernel && this.pid !== undefined
+      ? this.kernel.vfsFilePath(this.pid, fd) ?? this.fdTable.getPath(fd)
+      : this.fdTable.getPath(fd);
     if (filePath !== undefined) {
       return this.writeFilestat(bufPtr, filePath);
     }
@@ -1538,6 +1699,7 @@ export class WasiHost {
 
       const wantCreate = (oflags & WASI_OFLAGS_CREAT) !== 0;
       const wantTrunc = (oflags & WASI_OFLAGS_TRUNC) !== 0;
+      const wantExcl = (oflags & WASI_OFLAGS_EXCL) !== 0;
       const wantDir = (oflags & WASI_OFLAGS_DIRECTORY) !== 0;
       const wantAppend = (fdflags & WASI_FDFLAGS_APPEND) !== 0;
 
@@ -1568,6 +1730,7 @@ export class WasiHost {
         }
       }
 
+      return this.withVfsCredentials(() => {
       // If opening a directory, just register it and return
       if (wantDir) {
         // Verify the path is actually a directory
@@ -1584,11 +1747,14 @@ export class WasiHost {
       // Determine open mode
       let mode: OpenMode;
       if (wantAppend) {
+        if (!wantCreate && !this.pathExists(absPath)) return WASI_ENOENT;
         mode = "a";
       } else if (wantCreate && wantTrunc) {
+        if (wantExcl && this.pathExists(absPath)) return WASI_EEXIST;
         mode = "w";
       } else if (wantCreate) {
         // Create if not exists, but don't truncate
+        if (wantExcl && this.pathExists(absPath)) return WASI_EEXIST;
         mode = "rw";
         // Ensure parent dirs exist and file is created if missing
         try {
@@ -1636,22 +1802,21 @@ export class WasiHost {
       if (this.openFdCount() >= this.nofileSoftLimit()) {
         return WASI_EMFILE;
       }
-      let fd = this.fdTable.open(absPath, mode);
+      let fd: number;
       const stdioSlot = this.firstAvailableStdioFd();
-      if (stdioSlot !== null) {
-        this.fdTable.renumber(fd, stdioSlot);
-        fd = stdioSlot;
-      }
       if (this.kernel && this.pid !== undefined) {
-        this.kernel.setFdTarget(
-          this.pid,
-          fd,
-          createVfsFileTarget(this.fdTable, fd),
-        );
+        fd = this.kernel.openVfsFile(this.pid, this.vfs, absPath, mode, stdioSlot ?? undefined);
+      } else {
+        fd = this.fdTable.open(absPath, mode);
+        if (stdioSlot !== null) {
+          this.fdTable.renumber(fd, stdioSlot);
+          fd = stdioSlot;
+        }
       }
       const view = this.getView();
       view.setUint32(fdPtr, fd, true);
       return WASI_ESUCCESS;
+      });
     } catch (err) {
       if (err instanceof VfsError) {
         return vfsErrnoToWasi(err.errno);
@@ -1662,7 +1827,7 @@ export class WasiHost {
 
   private firstAvailableStdioFd(): number | null {
     for (let fd = 0; fd <= 2; fd++) {
-      if (!this.ioFds.has(fd) && !this.dirFds.has(fd) && !this.fdTable.isOpen(fd)) {
+      if (!this.hasOpenFd(fd)) {
         return fd;
       }
     }
@@ -1682,7 +1847,7 @@ export class WasiHost {
       const absPath = this.resolvePath(dirFd, relativePath);
       // flags bit 0 = SYMLINK_FOLLOW; when not set, use lstat
       const followSymlinks = (flags & 1) !== 0;
-      return this.writeFilestat(bufPtr, absPath, followSymlinks);
+      return this.withVfsCredentials(() => this.writeFilestat(bufPtr, absPath, followSymlinks));
     } catch (err) {
       if (err instanceof VfsError) {
         return vfsErrnoToWasi(err.errno);
@@ -1701,7 +1866,7 @@ export class WasiHost {
       const relativePath = this.readString(pathPtr, pathLen);
       const absPath = this.resolvePath(dirFd, relativePath);
       if (absPath === "/") return WASI_EEXIST;
-      this.vfs.mkdir(absPath, this.creationMode(0o777));
+      this.withVfsCredentials(() => this.vfs.mkdir(absPath, this.creationMode(0o777)));
       return WASI_ESUCCESS;
     } catch (err) {
       if (err instanceof VfsError) {
@@ -1718,11 +1883,20 @@ export class WasiHost {
     return Math.trunc(baseMode) & ~mask & 0o777;
   }
 
+  private withVfsCredentials<T>(fn: () => T): T {
+    if (!this.kernel || this.pid === undefined || !this.vfs.withCredential) return fn();
+    const credentials = this.kernel.getCredentials(this.pid);
+    return this.vfs.withCredential({ uid: credentials.euid, gid: credentials.egid }, fn);
+  }
+
   private openFdCount(): number {
     const fds = new Set<number>();
     for (const fd of this.ioFds.keys()) fds.add(fd);
     for (const fd of this.dirFds.keys()) fds.add(fd);
     for (const fd of this.fdTable.openFds()) fds.add(fd);
+    if (this.kernel && this.pid !== undefined) {
+      for (const fd of this.kernel.getFdTable(this.pid).keys()) fds.add(fd);
+    }
     return fds.size;
   }
 
@@ -1739,7 +1913,7 @@ export class WasiHost {
     try {
       const relativePath = this.readString(pathPtr, pathLen);
       const absPath = this.resolvePath(dirFd, relativePath);
-      this.vfs.rmdir(absPath);
+      this.withVfsCredentials(() => this.vfs.rmdir(absPath));
       return WASI_ESUCCESS;
     } catch (err) {
       if (err instanceof VfsError) {
@@ -1758,7 +1932,7 @@ export class WasiHost {
     try {
       const relativePath = this.readString(pathPtr, pathLen);
       const absPath = this.resolvePath(dirFd, relativePath);
-      this.vfs.unlink(absPath);
+      this.withVfsCredentials(() => this.vfs.unlink(absPath));
       return WASI_ESUCCESS;
     } catch (err) {
       if (err instanceof VfsError) {
@@ -1782,7 +1956,8 @@ export class WasiHost {
       const newRelative = this.readString(newPathPtr, newPathLen);
       const oldAbs = this.resolvePath(oldDirFd, oldRelative);
       const newAbs = this.resolvePath(newDirFd, newRelative);
-      this.vfs.rename(oldAbs, newAbs);
+      this.withVfsCredentials(() => this.vfs.rename(oldAbs, newAbs));
+      this.kernel?.remapCwdAfterRename(oldAbs, newAbs);
       return WASI_ESUCCESS;
     } catch (err) {
       if (err instanceof VfsError) {
@@ -1804,7 +1979,7 @@ export class WasiHost {
       const target = this.readString(oldPathPtr, oldPathLen);
       const newRelative = this.readString(newPathPtr, newPathLen);
       const newAbs = this.resolvePath(dirFd, newRelative);
-      this.vfs.symlink(target, newAbs);
+      this.withVfsCredentials(() => this.vfs.symlink(target, newAbs));
       return WASI_ESUCCESS;
     } catch (err) {
       if (err instanceof VfsError) {
@@ -1908,7 +2083,9 @@ export class WasiHost {
     try {
       for (const iov of iovecs) {
         const buf = new Uint8Array(iov.len);
-        const n = fdTable.pread(vfsFd, buf, pos);
+        const n = this.kernel && this.pid !== undefined && target?.type === "vfs_file"
+          ? this.kernel.preadVfsFile(this.pid, fd, buf, pos)
+          : fdTable.pread(vfsFd, buf, pos);
         if (n > 0) {
           this.getBytes().set(buf.subarray(0, n), iov.buf);
           totalRead += n;
@@ -1931,7 +2108,10 @@ export class WasiHost {
     offset: bigint,
     nwrittenPtr: number,
   ): number {
-    if (this.ioFds.has(fd) || this.dirFds.has(fd)) return WASI_EBADF;
+    const target = this.fdTarget(fd);
+    if (this.dirFds.has(fd) || (target && target.type !== "vfs_file")) {
+      return WASI_EBADF;
+    }
     const view = this.getView();
     const iovecs = readIovecs(view, iovsPtr, iovsLen);
     let totalWritten = 0;
@@ -1939,7 +2119,9 @@ export class WasiHost {
     try {
       for (const iov of iovecs) {
         const data = this.getBytes().slice(iov.buf, iov.buf + iov.len);
-        const n = this.fdTable.pwrite(fd, data, pos);
+        const n = this.kernel && this.pid !== undefined && target?.type === "vfs_file"
+          ? this.kernel.pwriteVfsFile(this.pid, fd, data, pos)
+          : this.fdTable.pwrite(fd, data, pos);
         totalWritten += n;
         pos += n;
       }
@@ -1952,9 +2134,16 @@ export class WasiHost {
 
   /** fd_filestat_set_size — ftruncate. */
   private fdFilestatSetSize(fd: number, size: bigint): number {
-    if (this.ioFds.has(fd) || this.dirFds.has(fd)) return WASI_EBADF;
+    const target = this.fdTarget(fd);
+    if (this.dirFds.has(fd) || (target && target.type !== "vfs_file")) {
+      return WASI_EBADF;
+    }
     try {
-      this.fdTable.truncate(fd, Number(size));
+      if (this.kernel && this.pid !== undefined && target?.type === "vfs_file") {
+        this.kernel.truncateVfsFile(this.pid, fd, Number(size));
+      } else {
+        this.fdTable.truncate(fd, Number(size));
+      }
       return WASI_ESUCCESS;
     } catch (err) {
       return fdErrorToWasi(err);
@@ -1965,7 +2154,9 @@ export class WasiHost {
     this.checkDeadline();
     try {
       if (this.dirFds.has(fd)) return WASI_ESUCCESS;
-      return this.fdTable.isOpen(fd) ? WASI_ESUCCESS : WASI_EBADF;
+      return this.hasKernelFd(fd) || this.fdTable.isOpen(fd)
+        ? WASI_ESUCCESS
+        : WASI_EBADF;
     } catch (err) {
       return fdErrorToWasi(err);
     }
@@ -2070,10 +2261,30 @@ export class WasiHost {
 
   private fdRenumber(fromFd: number, toFd: number): number {
     if (fromFd === toFd) {
-      return (this.ioFds.has(fromFd) || this.dirFds.has(fromFd) ||
-          this.fdTable.isOpen(fromFd))
+      return this.hasOpenFd(fromFd)
         ? WASI_ESUCCESS
         : WASI_EBADF;
+    }
+
+    if (this.kernel && this.pid !== undefined) {
+      const kernelTarget = this.kernel.getFdTarget(this.pid, fromFd);
+      if (kernelTarget) {
+        try {
+          this.kernel.dup2(this.pid, fromFd, toFd);
+          this.kernel.closeFd(this.pid, fromFd);
+          const dirPath = this.dirFds.get(fromFd);
+          if (dirPath !== undefined) {
+            this.dirFds.delete(fromFd);
+            this.dirFds.set(toFd, dirPath);
+          } else {
+            this.dirFds.delete(toFd);
+          }
+          this.ioFds.delete(fromFd);
+          return WASI_ESUCCESS;
+        } catch (err) {
+          return fdErrorToWasi(err);
+        }
+      }
     }
 
     if (this.fdTable.isOpen(fromFd)) {
@@ -2185,7 +2396,7 @@ export class WasiHost {
 
     let earliestClockDeadlineMs = Infinity;
     let hasClockSub = false;
-    const clockSubs: Array<{ userdata: bigint; deadlineMs: number }> = [];
+    const clockSubs: Array<{ userdata: bigint; deadlineMs: number; base: number }> = [];
     const readinessWaits: Array<Promise<void>> = [];
 
     // Parse all subscriptions (48 bytes each)
@@ -2208,7 +2419,7 @@ export class WasiHost {
           deadlineMs = Date.now() + Number(timeout / BigInt(1_000_000));
         }
 
-        clockSubs.push({ userdata, deadlineMs });
+        clockSubs.push({ userdata, deadlineMs, base });
         if (deadlineMs < earliestClockDeadlineMs) {
           earliestClockDeadlineMs = deadlineMs;
         }
@@ -2313,56 +2524,109 @@ export class WasiHost {
           this.deadlineMs - now,
         ),
       );
+      const pollWithPreservedClockDeadlines = () => {
+        const patched = clockSubs.map((sub) => {
+          const timeoutOffset = sub.base + 24;
+          const flagsOffset = sub.base + 40;
+          const timeout = view.getBigUint64(timeoutOffset, true);
+          const flags = view.getUint16(flagsOffset, true);
+          view.setBigUint64(
+            timeoutOffset,
+            BigInt(Math.max(0, Math.trunc(sub.deadlineMs))) * 1_000_000n,
+            true,
+          );
+          view.setUint16(
+            flagsOffset,
+            flags | WASI_SUBCLOCKFLAGS_SUBSCRIPTION_CLOCK_ABSTIME,
+            true,
+          );
+          return { timeoutOffset, flagsOffset, timeout, flags };
+        });
+        try {
+          return this.pollOneoff(inPtr, outPtr, nsubscriptions, neventsPtr);
+        } finally {
+          for (const patch of patched) {
+            view.setBigUint64(patch.timeoutOffset, patch.timeout, true);
+            view.setUint16(patch.flagsOffset, patch.flags, true);
+          }
+        }
+      };
 
-      return new Promise<number>((resolve) => {
+      return new Promise<number>((resolve, reject) => {
         let done = false;
         const signalWait = this.waitForSignalDelivery();
         const finish = (value: number | Promise<number>) => {
           if (done) return;
           done = true;
           signalWait.cancel();
-          resolve(value);
+          Promise.resolve(value).then(resolve, reject);
+        };
+        const fail = (error: unknown) => {
+          if (done) return;
+          done = true;
+          signalWait.cancel();
+          reject(error);
         };
         const timeoutId = setTimeout(() => {
-          this.checkDeadline();
-          const afterWait = Date.now();
-          for (const sub of clockSubs) {
-            if (sub.deadlineMs <= afterWait) {
+          try {
+            this.checkDeadline();
+            const afterWait = Date.now();
+            for (const sub of clockSubs) {
+              if (sub.deadlineMs <= afterWait) {
+                events.push({
+                  userdata: sub.userdata,
+                  error: WASI_ESUCCESS,
+                  type: WASI_EVENTTYPE_CLOCK,
+                  nbytes: BigInt(0),
+                  flags: 0,
+                });
+              }
+            }
+            if (events.length === 0) {
               events.push({
-                userdata: sub.userdata,
+                userdata: clockSubs[0].userdata,
                 error: WASI_ESUCCESS,
                 type: WASI_EVENTTYPE_CLOCK,
                 nbytes: BigInt(0),
                 flags: 0,
               });
             }
+            finish(this.writePollEvents(outPtr, neventsPtr, events));
+          } catch (error) {
+            fail(error);
           }
-          if (events.length === 0) {
-            events.push({
-              userdata: clockSubs[0].userdata,
-              error: WASI_ESUCCESS,
-              type: WASI_EVENTTYPE_CLOCK,
-              nbytes: BigInt(0),
-              flags: 0,
-            });
-          }
-          finish(this.writePollEvents(outPtr, neventsPtr, events));
         }, waitMs);
-        Promise.race([...readinessWaits, signalWait.promise]).then(() => {
+        const readiness = readinessWaits.length > 0
+          ? Promise.race(readinessWaits)
+          : new Promise<void>(() => {});
+        Promise.race([readiness, signalWait.promise]).then(() => {
           if (!done) {
             clearTimeout(timeoutId);
-            finish(this.pollOneoff(inPtr, outPtr, nsubscriptions, neventsPtr));
+            try {
+              finish(pollWithPreservedClockDeadlines());
+            } catch (error) {
+              fail(error);
+            }
           }
-        });
+        }, fail);
       });
     }
 
     if (readinessWaits.length > 0) {
-      return new Promise<number>((resolve) => {
+      return new Promise<number>((resolve, reject) => {
         const signalWait = this.waitForSignalDelivery();
         Promise.race([...readinessWaits, signalWait.promise]).then(() => {
           signalWait.cancel();
-          resolve(this.pollOneoff(inPtr, outPtr, nsubscriptions, neventsPtr));
+          try {
+            Promise.resolve(
+              this.pollOneoff(inPtr, outPtr, nsubscriptions, neventsPtr),
+            ).then(resolve, reject);
+          } catch (error) {
+            reject(error);
+          }
+        }, (error) => {
+          signalWait.cancel();
+          reject(error);
         });
       });
     }
@@ -2468,8 +2732,9 @@ export class WasiHost {
       //   u64 mtim         (offset 48)
       //   u64 ctim         (offset 56)
 
-      view.setBigUint64(bufPtr, BigInt(stat.permissions), true); // dev (stores Unix permissions)
-      view.setBigUint64(bufPtr + 8, BigInt(0), true); // ino
+      const inodePath = followSymlinks ? canonicalStatPath(this.vfs, absPath) : normalizeVfsPath(absPath);
+      view.setBigUint64(bufPtr, yurtStatDevice(stat), true); // dev (Yurt stat metadata side channel)
+      view.setBigUint64(bufPtr + 8, stablePathInode(inodePath), true); // ino
       view.setUint8(bufPtr + 16, inodeTypeToWasiFiletype(stat.type)); // filetype
       // padding bytes 17-23
       for (let i = 17; i < 24; i++) {
