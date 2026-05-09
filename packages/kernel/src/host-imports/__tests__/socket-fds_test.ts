@@ -667,7 +667,7 @@ describe("socket fd host imports", () => {
         localPort: 18081,
       }),
       closeListener: () => ({ ok: true }),
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+      acceptAsync: (listener) => Promise.resolve(backend.accept!(listener)),
       recvAsync: (socket, maxBytes) =>
         Promise.resolve(backend.recv(socket, maxBytes)),
     };

@@ -169,6 +169,15 @@ export class ListenerRegistry {
         error: `connection refused: ${req.host}:${req.port}`,
       };
     }
+    if (
+      listener.acceptWaiters.length === 0 &&
+      listener.pending.length >= listener.backlog
+    ) {
+      return {
+        ok: false,
+        error: `connection refused: listener backlog full`,
+      };
+    }
 
     const clientHandle = this.nextSocketHandle++;
     const serverHandle = this.nextSocketHandle++;

@@ -74,6 +74,24 @@ describe("ListenerRegistry", () => {
     expect(a1.socket).not.toBe(a2.socket);
   });
 
+  it("rejects connects once the pending accept queue reaches backlog", async () => {
+    const reg = new ListenerRegistry();
+    const lr = reg.listen({ host: "127.0.0.1", port: 6004, backlog: 1 });
+
+    const c1 = reg.connect({ host: "127.0.0.1", port: 6004 });
+    expect(c1.ok).toBe(true);
+
+    const c2 = reg.connect({ host: "127.0.0.1", port: 6004 });
+    expect(c2.ok).toBe(false);
+    if (!c2.ok) expect(c2.error).toMatch(/backlog/i);
+
+    const accepted = await reg.accept(lr.handle);
+    expect(accepted.localPort).toBe(6004);
+
+    const c3 = reg.connect({ host: "127.0.0.1", port: 6004 });
+    expect(c3.ok).toBe(true);
+  });
+
   it("closeListener rejects pending accepts", async () => {
     const reg = new ListenerRegistry();
     const lr = reg.listen({ host: "127.0.0.1", port: 6003, backlog: 16 });
