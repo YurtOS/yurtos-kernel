@@ -93,10 +93,12 @@ function buildNativeSpawnRequest(req: {
   };
   const appendEnv = (values: [string, string][]) => {
     if (values.length === 0) return 0;
-    const valueSpans = values.map(([key, value]) => [
-      internString(key),
-      internString(value),
-    ] as const);
+    const valueSpans = values.map(([key, value]) =>
+      [
+        internString(key),
+        internString(value),
+      ] as const
+    );
     align();
     const off = size;
     const bytes = new Uint8Array(values.length * 16);
@@ -265,7 +267,12 @@ Deno.test("kernel host_spawn accepts native spawn request records", () => {
   });
 
   assertEquals(
-    (imports.host_spawn as (...args: number[]) => number)(0, request.byteLength, 4096, 4),
+    (imports.host_spawn as (...args: number[]) => number)(
+      0,
+      request.byteLength,
+      4096,
+      4,
+    ),
     4,
   );
   assertEquals(new DataView(memory.buffer).getInt32(4096, true), 42);
@@ -452,15 +459,30 @@ Deno.test("kernel host_wait nohang distinguishes running from ECHILD", () => {
   });
 
   assertEquals(
-    (parentImports.host_wait as (...args: number[]) => number)(childPid, 1, 4096, 1024),
+    (parentImports.host_wait as (...args: number[]) => number)(
+      childPid,
+      1,
+      4096,
+      1024,
+    ),
     -11,
   );
   assertEquals(
-    (siblingImports.host_wait as (...args: number[]) => number)(childPid, 1, 4096, 1024),
+    (siblingImports.host_wait as (...args: number[]) => number)(
+      childPid,
+      1,
+      4096,
+      1024,
+    ),
     -10,
   );
   assertEquals(
-    (parentImports.host_wait as (...args: number[]) => number)(999, 1, 4096, 1024),
+    (parentImports.host_wait as (...args: number[]) => number)(
+      999,
+      1,
+      4096,
+      1024,
+    ),
     -10,
   );
   kernel.dispose();
@@ -609,11 +631,15 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
 
 Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for socket-backed guests", async () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
-  const socketBackend: SocketBackend = {
+  let socketBackend: SocketBackend;
+  socketBackend = {
     connect: () => ({ ok: false, error: "unused" }),
     send: () => ({ ok: false, error: "unused" }),
     recv: () => ({ ok: false, error: "unused" }),
     close: () => ({ ok: true }),
+    acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+    recvAsync: (socket, maxBytes) =>
+      Promise.resolve(socketBackend.recv(socket, maxBytes)),
   };
   const imports = createKernelImports({ memory, socketBackend });
   const hostLen = writeString(memory, 0, "nonexistent-yurt.invalid");
@@ -1126,7 +1152,9 @@ Deno.test("host_getcwd returns the physical cwd for symlinked process cwd", () =
     "/tmp/cwd-real".length + 1,
   );
   assertEquals(
-    new TextDecoder().decode(new Uint8Array(memory.buffer, 0, "/tmp/cwd-real".length)),
+    new TextDecoder().decode(
+      new Uint8Array(memory.buffer, 0, "/tmp/cwd-real".length),
+    ),
     "/tmp/cwd-real",
   );
 });
@@ -1146,15 +1174,27 @@ Deno.test("host_realpath canonicalizes dot segments and symlinks", () => {
   const pathLen = writeString(memory, 0, "./sub/fake/.");
   const expected = "/tmp/work/real";
   assertEquals(
-    (imports.host_realpath as (...args: number[]) => number)(0, pathLen, 128, 8),
+    (imports.host_realpath as (...args: number[]) => number)(
+      0,
+      pathLen,
+      128,
+      8,
+    ),
     expected.length + 1,
   );
   assertEquals(
-    (imports.host_realpath as (...args: number[]) => number)(0, pathLen, 128, 64),
+    (imports.host_realpath as (...args: number[]) => number)(
+      0,
+      pathLen,
+      128,
+      64,
+    ),
     expected.length + 1,
   );
   assertEquals(
-    new TextDecoder().decode(new Uint8Array(memory.buffer, 128, expected.length)),
+    new TextDecoder().decode(
+      new Uint8Array(memory.buffer, 128, expected.length),
+    ),
     expected,
   );
   assertEquals(new Uint8Array(memory.buffer)[128 + expected.length], 0);
@@ -1175,11 +1215,18 @@ Deno.test("host_realpath applies parent traversal after symlink path components"
   const pathLen = writeString(memory, 0, "link/../hello/world");
   const expected = "/tmp/work/dir3/hello/world";
   assertEquals(
-    (imports.host_realpath as (...args: number[]) => number)(0, pathLen, 128, 64),
+    (imports.host_realpath as (...args: number[]) => number)(
+      0,
+      pathLen,
+      128,
+      64,
+    ),
     expected.length + 1,
   );
   assertEquals(
-    new TextDecoder().decode(new Uint8Array(memory.buffer, 128, expected.length)),
+    new TextDecoder().decode(
+      new Uint8Array(memory.buffer, 128, expected.length),
+    ),
     expected,
   );
 });
@@ -1636,7 +1683,10 @@ Deno.test("host_dup_min mirrors F_DUPFD into the active WasiHost file table", ()
   const fd = fdTable.open("/tmp/script.sh", "r");
   const imports = createKernelImports({ memory, wasiHost });
 
-  assertEquals((imports.host_dup_min as (...args: number[]) => number)(fd, 10), 10);
+  assertEquals(
+    (imports.host_dup_min as (...args: number[]) => number)(fd, 10),
+    10,
+  );
   assertEquals(fdTable.isOpen(10), true);
   fdTable.close(fd);
   assertEquals(fdTable.isOpen(10), true);
@@ -1668,7 +1718,10 @@ Deno.test("host_dup_min keeps the kernel and WasiHost fd tables in sync", () => 
     wasiHost,
   });
 
-  assertEquals((imports.host_dup_min as (...args: number[]) => number)(fd, 10), 10);
+  assertEquals(
+    (imports.host_dup_min as (...args: number[]) => number)(fd, 10),
+    10,
+  );
   assertEquals(kernel.getFdTarget(pid, 10)?.type, "vfs_file");
   assertEquals(fdTable.isOpen(10), true);
   assertEquals(srcTarget.refs, 1);
@@ -1686,7 +1739,10 @@ Deno.test("kernel /proc fd listing includes close-on-exec descriptors", () => {
   kernel.setFdTarget(pid, fd, createVfsFileTarget(fdTable, fd));
   kernel.setFdDescriptorFlags(pid, fd, 1);
 
-  assertEquals(kernel.listProcesses().find((proc) => proc.pid === pid)?.fds.includes(fd), true);
+  assertEquals(
+    kernel.listProcesses().find((proc) => proc.pid === pid)?.fds.includes(fd),
+    true,
+  );
 });
 
 Deno.test("host_spawn rejects nonzero nice when the engine has no scheduler backend", () => {

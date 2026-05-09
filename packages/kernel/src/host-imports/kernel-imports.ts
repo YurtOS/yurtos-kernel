@@ -17,30 +17,52 @@
  *   - host_run_command: run a shell command and collect output (async/JSPI, Python subprocess)
  */
 
-import type { FetchRedirectMode, NetworkBridgeLike } from '../network/bridge.js';
-import type { SocketBackend, SocketListenPolicy, SocketPortMapping } from '../network/socket-backend.js';
-import { createLoopbackSocketBackend, createNetworkBridgeSocketBackend } from '../network/socket-backend.js';
-import type { ExtensionRegistry } from '../extension/registry.js';
-import type { NativeModuleRegistry } from '../process/native-modules.js';
-import type { ProcessCredentials, ProcessKernel, SpawnRequest } from '../process/kernel.js';
+import type {
+  FetchRedirectMode,
+  NetworkBridgeLike,
+} from "../network/bridge.js";
+import type {
+  SocketBackend,
+  SocketListenPolicy,
+  SocketPortMapping,
+} from "../network/socket-backend.js";
+import {
+  acceptSocketAsync,
+  createLoopbackSocketBackend,
+  createNetworkBridgeSocketBackend,
+  recvSocketAsync,
+} from "../network/socket-backend.js";
+import type { ExtensionRegistry } from "../extension/registry.js";
+import type { NativeModuleRegistry } from "../process/native-modules.js";
+import type {
+  ProcessCredentials,
+  ProcessKernel,
+  SpawnRequest,
+} from "../process/kernel.js";
 import {
   normalizeNice,
   normalizeSchedulerPolicy,
   normalizeSchedulerPriority,
-  unsupportedRuntimeEngineBackend,
   type RuntimeEngineBackend,
-} from '../engine/backend.js';
-import type { ProcessManager } from '../process/manager.js';
-import type { WasiHost } from '../wasi/wasi-host.js';
-import type { ThreadsBackend } from '../process/threads/backend.js';
-import type { VfsLike } from '../vfs/vfs-like.js';
-import type { FdTarget } from '../wasi/fd-target.js';
-import { createStaticTarget } from '../wasi/fd-target.js';
-import { WASI_FDFLAGS_NONBLOCK } from '../wasi/types.ts';
-import { readString, readBytes, writeJson, writeString, writeBytes } from './common.js';
-import { resolveHostname } from '../platform/dns.js';
-import type { RunCommandHandler, RunRequest } from '../run-command.js';
-import type { Sandbox } from '../sandbox.js';
+  unsupportedRuntimeEngineBackend,
+} from "../engine/backend.js";
+import type { ProcessManager } from "../process/manager.js";
+import type { WasiHost } from "../wasi/wasi-host.js";
+import type { ThreadsBackend } from "../process/threads/backend.js";
+import type { VfsLike } from "../vfs/vfs-like.js";
+import type { FdTarget } from "../wasi/fd-target.js";
+import { createStaticTarget } from "../wasi/fd-target.js";
+import { WASI_FDFLAGS_NONBLOCK } from "../wasi/types.ts";
+import {
+  readBytes,
+  readString,
+  writeBytes,
+  writeJson,
+  writeString,
+} from "./common.js";
+import { resolveHostname } from "../platform/dns.js";
+import type { RunCommandHandler, RunRequest } from "../run-command.js";
+import type { Sandbox } from "../sandbox.js";
 
 export interface KernelImportsOptions {
   memory: WebAssembly.Memory;
@@ -84,7 +106,10 @@ export interface KernelImportsOptions {
   extensionHandler?: (cmd: Record<string, unknown>) => Record<string, unknown>;
 
   /** Run a shell command and collect output. Used by Python _yurt.spawn(). */
-  runCommand?: (cmd: string, stdin: string) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
+  runCommand?: (
+    cmd: string,
+    stdin: string,
+  ) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
 
   /** Host-registered handler for guest-issued host_run_command. */
   runCommandHandler?: RunCommandHandler;
@@ -110,7 +135,11 @@ export interface KernelImportsOptions {
    *  `parentPid` is the PID of the in-sandbox process making the spawn
    *  call — set on the child as ppid so getppid() inside the child
    *  resolves to its real spawning parent. */
-  spawnProcess?: (req: SpawnRequest, fdTable: Map<number, FdTarget>, parentPid: number) => number;
+  spawnProcess?: (
+    req: SpawnRequest,
+    fdTable: Map<number, FdTarget>,
+    parentPid: number,
+  ) => number;
 
   /** Registry of dynamically loaded native Python module WASMs. */
   nativeModules?: NativeModuleRegistry;
@@ -144,7 +173,12 @@ const USER_GID = 1000;
 const PRIO_PROCESS = 0;
 const YURT_WAIT_NOHANG = 1;
 
-function writeI32(memory: WebAssembly.Memory, ptr: number, cap: number, value: number): number {
+function writeI32(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  value: number,
+): number {
   const required = 4;
   if (cap < required) return required;
   const end = ptr + required;
@@ -205,50 +239,71 @@ const SPAWN_REQUEST_V1_MIN_SIZE = 80;
 const SPAN_SIZE = 8;
 const ENV_PAIR_SIZE = 16;
 const FD_MAP_PAIR_SIZE = 8;
-const fatalUtf8Decoder = new TextDecoder('utf-8', { fatal: true });
+const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
   if (bytes.byteLength < SPAWN_REQUEST_V1_MIN_SIZE) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const logicalSize = view.getUint32(0, true);
   const version = view.getUint16(4, true);
-  if (version !== NATIVE_RECORD_VERSION_1 || logicalSize < SPAWN_REQUEST_V1_MIN_SIZE) return null;
-  if (logicalSize > bytes.byteLength) throw new Error('native spawn request exceeds buffer');
+  if (
+    version !== NATIVE_RECORD_VERSION_1 ||
+    logicalSize < SPAWN_REQUEST_V1_MIN_SIZE
+  ) return null;
+  if (logicalSize > bytes.byteLength) {
+    throw new Error("native spawn request exceeds buffer");
+  }
 
   const readU32 = (off: number) => {
-    if (off < 0 || off + 4 > logicalSize) throw new Error('native spawn scalar out of bounds');
+    if (off < 0 || off + 4 > logicalSize) {
+      throw new Error("native spawn scalar out of bounds");
+    }
     return view.getUint32(off, true);
   };
   const readI32 = (off: number) => {
-    if (off < 0 || off + 4 > logicalSize) throw new Error('native spawn scalar out of bounds');
+    if (off < 0 || off + 4 > logicalSize) {
+      throw new Error("native spawn scalar out of bounds");
+    }
     return view.getInt32(off, true);
   };
   const readSpan = (off: number): string | undefined => {
     const spanOff = readU32(off);
     const len = readU32(off + 4);
     if (spanOff === 0 && len === 0) return undefined;
-    if (spanOff % 4 !== 0) throw new Error('native spawn unaligned span');
-    if (spanOff + len > logicalSize) throw new Error('native spawn span out of bounds');
+    if (spanOff % 4 !== 0) throw new Error("native spawn unaligned span");
+    if (spanOff + len > logicalSize) {
+      throw new Error("native spawn span out of bounds");
+    }
     return fatalUtf8Decoder.decode(bytes.subarray(spanOff, spanOff + len));
   };
   const readRequiredSpan = (off: number): string => {
     const value = readSpan(off);
-    if (value === undefined) throw new Error('native spawn missing required string');
+    if (value === undefined) {
+      throw new Error("native spawn missing required string");
+    }
     return value;
   };
   const readStringVec = (vecOff: number, count: number): string[] => {
     if (count === 0) return [];
-    if (vecOff === 0 || vecOff % 4 !== 0 || vecOff + count * SPAN_SIZE > logicalSize) {
-      throw new Error('native spawn string vec out of bounds');
+    if (
+      vecOff === 0 || vecOff % 4 !== 0 ||
+      vecOff + count * SPAN_SIZE > logicalSize
+    ) {
+      throw new Error("native spawn string vec out of bounds");
     }
     const out: string[] = [];
-    for (let i = 0; i < count; i++) out.push(readRequiredSpan(vecOff + i * SPAN_SIZE));
+    for (let i = 0; i < count; i++) {
+      out.push(readRequiredSpan(vecOff + i * SPAN_SIZE));
+    }
     return out;
   };
   const readEnvVec = (vecOff: number, count: number): [string, string][] => {
     if (count === 0) return [];
-    if (vecOff === 0 || vecOff % 4 !== 0 || vecOff + count * ENV_PAIR_SIZE > logicalSize) {
-      throw new Error('native spawn env vec out of bounds');
+    if (
+      vecOff === 0 || vecOff % 4 !== 0 ||
+      vecOff + count * ENV_PAIR_SIZE > logicalSize
+    ) {
+      throw new Error("native spawn env vec out of bounds");
     }
     const out: [string, string][] = [];
     for (let i = 0; i < count; i++) {
@@ -260,7 +315,7 @@ function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
   const readI32Vec = (vecOff: number, count: number): number[] => {
     if (count === 0) return [];
     if (vecOff === 0 || vecOff % 4 !== 0 || vecOff + count * 4 > logicalSize) {
-      throw new Error('native spawn i32 vec out of bounds');
+      throw new Error("native spawn i32 vec out of bounds");
     }
     const out: number[] = [];
     for (let i = 0; i < count; i++) out.push(readI32(vecOff + i * 4));
@@ -268,8 +323,11 @@ function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
   };
   const readFdMap = (vecOff: number, count: number): [number, number][] => {
     if (count === 0) return [];
-    if (vecOff === 0 || vecOff % 4 !== 0 || vecOff + count * FD_MAP_PAIR_SIZE > logicalSize) {
-      throw new Error('native spawn fd map out of bounds');
+    if (
+      vecOff === 0 || vecOff % 4 !== 0 ||
+      vecOff + count * FD_MAP_PAIR_SIZE > logicalSize
+    ) {
+      throw new Error("native spawn fd map out of bounds");
     }
     const out: [number, number][] = [];
     for (let i = 0; i < count; i++) {
@@ -288,7 +346,7 @@ function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
     ...(argv0 === undefined ? {} : { argv0 }),
     args: readStringVec(readU32(24), readU32(28)),
     env: readEnvVec(readU32(32), readU32(36)),
-    cwd: cwd ?? '',
+    cwd: cwd ?? "",
     stdin_fd: readI32(48),
     stdout_fd: readI32(52),
     stderr_fd: readI32(56),
@@ -304,71 +362,71 @@ function yieldToScheduler(): Promise<void> {
 }
 
 function globToRegExp(pattern: string): RegExp {
-  let re = '';
+  let re = "";
   let i = 0;
   while (i < pattern.length) {
     const ch = pattern[i];
-    if (ch === '*') {
-      if (pattern[i + 1] === '*') {
-        re += '.*';
+    if (ch === "*") {
+      if (pattern[i + 1] === "*") {
+        re += ".*";
         i += 2;
-        if (pattern[i] === '/') i++;
+        if (pattern[i] === "/") i++;
       } else {
-        re += '[^/]*';
+        re += "[^/]*";
         i++;
       }
-    } else if (ch === '?') {
-      re += '[^/]';
+    } else if (ch === "?") {
+      re += "[^/]";
       i++;
-    } else if (ch === '[') {
+    } else if (ch === "[") {
       let j = i + 1;
-      if (j < pattern.length && (pattern[j] === '!' || pattern[j] === '^')) j++;
-      if (j < pattern.length && pattern[j] === ']') j++;
-      while (j < pattern.length && pattern[j] !== ']') j++;
+      if (j < pattern.length && (pattern[j] === "!" || pattern[j] === "^")) j++;
+      if (j < pattern.length && pattern[j] === "]") j++;
+      while (j < pattern.length && pattern[j] !== "]") j++;
       if (j >= pattern.length) {
-        re += '\\[';
+        re += "\\[";
         i++;
       } else {
         let cls = pattern.slice(i + 1, j);
-        if (cls.startsWith('!')) cls = '^' + cls.slice(1);
-        re += '[' + cls + ']';
+        if (cls.startsWith("!")) cls = "^" + cls.slice(1);
+        re += "[" + cls + "]";
         i = j + 1;
       }
-    } else if ('.+^${}()|\\'.includes(ch)) {
-      re += '\\' + ch;
+    } else if (".+^${}()|\\".includes(ch)) {
+      re += "\\" + ch;
       i++;
     } else {
       re += ch;
       i++;
     }
   }
-  return new RegExp('^' + re + '$');
+  return new RegExp("^" + re + "$");
 }
 
 function globBaseDir(pattern: string): string {
-  const parts = pattern.split('/');
+  const parts = pattern.split("/");
   const base: string[] = [];
   for (const part of parts) {
     if (/[*?[\]]/.test(part)) break;
     base.push(part);
   }
-  const dir = base.join('/');
-  if (dir === '') return pattern.startsWith('/') ? '/' : '.';
+  const dir = base.join("/");
+  if (dir === "") return pattern.startsWith("/") ? "/" : ".";
   return dir;
 }
 
 function walkVfs(vfs: VfsLike, dir: string): string[] {
   const results: string[] = [];
-  let entries: ReturnType<VfsLike['readdir']>;
+  let entries: ReturnType<VfsLike["readdir"]>;
   try {
     entries = vfs.readdir(dir);
   } catch {
     return results;
   }
   for (const entry of entries) {
-    const fullPath = dir === '/' ? '/' + entry.name : dir + '/' + entry.name;
+    const fullPath = dir === "/" ? "/" + entry.name : dir + "/" + entry.name;
     results.push(fullPath);
-    if (entry.type === 'dir') {
+    if (entry.type === "dir") {
       results.push(...walkVfs(vfs, fullPath));
     }
   }
@@ -376,111 +434,121 @@ function walkVfs(vfs: VfsLike, dir: string): string[] {
 }
 
 function globMatch(vfs: VfsLike, pattern: string): string[] {
-  const absPattern = pattern.startsWith('/') ? pattern : '/' + pattern;
+  const absPattern = pattern.startsWith("/") ? pattern : "/" + pattern;
   const baseDir = globBaseDir(absPattern);
   const regex = globToRegExp(absPattern);
   const allPaths = walkVfs(vfs, baseDir);
-  const matches = allPaths.filter(p => regex.test(p));
+  const matches = allPaths.filter((p) => regex.test(p));
   matches.sort();
   return matches;
 }
 
 function normalizeImportPath(path: string): string {
   const parts: string[] = [];
-  for (const part of path.split('/')) {
-    if (part === '' || part === '.') continue;
-    if (part === '..') {
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
       parts.pop();
       continue;
     }
     parts.push(part);
   }
-  return '/' + parts.join('/');
+  return "/" + parts.join("/");
 }
 
 function resolveCwdPath(cwd: string, path: string): string {
-  if (path.startsWith('/')) return normalizeImportPath(path);
-  if (path === '' || path === '.') return normalizeImportPath(cwd);
-  return normalizeImportPath(cwd === '/' ? `/${path}` : `${cwd}/${path}`);
+  if (path.startsWith("/")) return normalizeImportPath(path);
+  if (path === "" || path === ".") return normalizeImportPath(cwd);
+  return normalizeImportPath(cwd === "/" ? `/${path}` : `${cwd}/${path}`);
 }
 
 function resolveLogicalCwdPath(cwd: string, path: string): string {
-  if (path.startsWith('/')) {
+  if (path.startsWith("/")) {
     const physicalCwd = normalizeImportPath(cwd);
     const physicalPath = normalizeImportPath(path);
     if (cwd !== physicalCwd) {
       if (physicalPath === physicalCwd) return cwd;
-      const prefix = physicalCwd === '/' ? '/' : `${physicalCwd}/`;
+      const prefix = physicalCwd === "/" ? "/" : `${physicalCwd}/`;
       if (physicalPath.startsWith(prefix)) {
         const suffix = physicalPath.slice(prefix.length);
-        return cwd === '/' ? `/${suffix}` : `${cwd}/${suffix}`;
+        return cwd === "/" ? `/${suffix}` : `${cwd}/${suffix}`;
       }
     }
   }
-  const raw = path.startsWith('/') ? path : cwd === '/' ? `/${path}` : `${cwd}/${path}`;
+  const raw = path.startsWith("/")
+    ? path
+    : cwd === "/"
+    ? `/${path}`
+    : `${cwd}/${path}`;
   const parts: string[] = [];
-  for (const part of raw.split('/')) {
-    if (part === '' || part === '.') continue;
-    if (part === '..') {
+  for (const part of raw.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
       parts.pop();
       continue;
     }
     parts.push(part);
   }
-  return '/' + parts.join('/');
+  return "/" + parts.join("/");
 }
 
 function dirnameOfPath(path: string): string {
   const normalized = normalizeImportPath(path);
-  if (normalized === '/') return '/';
-  const slash = normalized.lastIndexOf('/');
-  return slash <= 0 ? '/' : normalized.slice(0, slash);
+  if (normalized === "/") return "/";
+  const slash = normalized.lastIndexOf("/");
+  return slash <= 0 ? "/" : normalized.slice(0, slash);
 }
 
 function splitResolutionPath(path: string): string[] {
-  if (!path.startsWith('/')) throw new Error(`ENOENT: not an absolute path: ${path}`);
-  return path.split('/').filter((part) => part !== '' && part !== '.');
+  if (!path.startsWith("/")) {
+    throw new Error(`ENOENT: not an absolute path: ${path}`);
+  }
+  return path.split("/").filter((part) => part !== "" && part !== ".");
 }
 
 function resolveRealpath(vfs: VfsLike, cwd: string, rawPath: string): string {
-  if (rawPath === '') throw new Error('ENOENT: empty path');
-  const startPath = rawPath.startsWith('/')
+  if (rawPath === "") throw new Error("ENOENT: empty path");
+  const startPath = rawPath.startsWith("/")
     ? rawPath
-    : cwd === '/' ? `/${rawPath}` : `${cwd}/${rawPath}`;
+    : cwd === "/"
+    ? `/${rawPath}`
+    : `${cwd}/${rawPath}`;
   let queue = splitResolutionPath(startPath);
   const resolved: string[] = [];
   let symlinkDepth = 0;
 
   while (queue.length > 0) {
     const part = queue.shift()!;
-    if (part === '' || part === '.') continue;
-    if (part === '..') {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
       resolved.pop();
       continue;
     }
 
-    const candidate = '/' + [...resolved, part].join('/');
+    const candidate = "/" + [...resolved, part].join("/");
     const stat = vfs.lstat(candidate);
-    if (stat.type !== 'symlink') {
+    if (stat.type !== "symlink") {
       resolved.push(part);
       continue;
     }
-    if (++symlinkDepth > 40) throw new Error('ELOOP: too many symlink levels');
+    if (++symlinkDepth > 40) throw new Error("ELOOP: too many symlink levels");
 
     const target = vfs.readlink(candidate);
-    const targetPath = target.startsWith('/')
+    const targetPath = target.startsWith("/")
       ? target
       : `${dirnameOfPath(candidate)}/${target}`;
     queue = [...splitResolutionPath(targetPath), ...queue];
     resolved.length = 0;
   }
 
-  const real = '/' + resolved.join('/');
+  const real = "/" + resolved.join("/");
   vfs.stat(real);
-  return real === '' ? '/' : real;
+  return real === "" ? "/" : real;
 }
 
-export function createKernelImports(opts: KernelImportsOptions): Record<string, WebAssembly.ImportValue> {
+export function createKernelImports(
+  opts: KernelImportsOptions,
+): Record<string, WebAssembly.ImportValue> {
   const { memory } = opts;
   const callerPid = opts.callerPid ?? 0;
   const fallbackUid = opts.callerUid ?? USER_UID;
@@ -488,13 +556,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   const runtimeBackend = opts.runtimeBackend ?? unsupportedRuntimeEngineBackend;
   const schedulerBackend = runtimeBackend.scheduler;
   let fallbackUmask = 0o022;
-  const bridgeSocketBackend = opts.networkBridge ? createNetworkBridgeSocketBackend(opts.networkBridge) : undefined;
+  const bridgeSocketBackend = opts.networkBridge
+    ? createNetworkBridgeSocketBackend(opts.networkBridge)
+    : undefined;
   const socketBackend = opts.socketBackend ??
     (opts.serverSockets?.allowLoopback === true
       ? createLoopbackSocketBackend(bridgeSocketBackend)
       : bridgeSocketBackend);
-  const socketLocalHost = opts.socketLocalHost ?? '10.0.2.15';
-  const socketLocalPortForFd = (fd: number) => 49152 + (Math.max(0, fd - 3) % 16384);
+  const socketLocalHost = opts.socketLocalHost ?? "10.0.2.15";
+  const socketLocalPortForFd = (fd: number) =>
+    49152 + (Math.max(0, fd - 3) % 16384);
 
   function getCallerCredentials(): ProcessCredentials {
     return opts.kernel?.getCredentials(callerPid) ?? {
@@ -509,22 +580,39 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
   function withVfsCallerCredentials<T>(fn: () => T): T {
     const credentials = getCallerCredentials();
-    const vfsWithCredential = opts.vfs as (VfsLike & {
-      withCredential?: <U>(credential: { uid: number; gid: number }, inner: () => U) => U;
-    }) | undefined;
+    const vfsWithCredential = opts.vfs as
+      | (VfsLike & {
+        withCredential?: <U>(
+          credential: { uid: number; gid: number },
+          inner: () => U,
+        ) => U;
+      })
+      | undefined;
     return vfsWithCredential?.withCredential
-      ? vfsWithCredential.withCredential({ uid: credentials.euid, gid: credentials.egid }, fn)
+      ? vfsWithCredential.withCredential({
+        uid: credentials.euid,
+        gid: credentials.egid,
+      }, fn)
       : fn();
   }
 
-  function authorizeChown(path: string, uid: number, gid: number, followSymlinks = true): number {
+  function authorizeChown(
+    path: string,
+    uid: number,
+    gid: number,
+    followSymlinks = true,
+  ): number {
     const credentials = getCallerCredentials();
     if (credentials.euid === ROOT_UID) return 0;
     if (gid !== -1 && gid !== credentials.egid) return ERR_PERMISSION;
     if (uid === -1) return 0;
     try {
-      const stat = followSymlinks ? opts.vfs!.stat(path) : opts.vfs!.lstat(path);
-      return stat.uid === credentials.euid && uid === stat.uid ? 0 : ERR_PERMISSION;
+      const stat = followSymlinks
+        ? opts.vfs!.stat(path)
+        : opts.vfs!.lstat(path);
+      return stat.uid === credentials.euid && uid === stat.uid
+        ? 0
+        : ERR_PERMISSION;
     } catch {
       return ERR_PERMISSION;
     }
@@ -536,13 +624,13 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   }
 
   function closeFdTarget(target: FdTarget): void {
-    if (target.type === 'pipe_write') target.pipe.close();
-    if (target.type === 'pipe_read') target.pipe.close();
-    if (target.type === 'vfs_file') {
+    if (target.type === "pipe_write") target.pipe.close();
+    if (target.type === "pipe_read") target.pipe.close();
+    if (target.type === "vfs_file") {
       if (target.fdTable.isOpen(target.fd)) target.fdTable.close(target.fd);
       target.refs = Math.max(0, target.refs - 1);
     }
-    if (target.type === 'socket') {
+    if (target.type === "socket") {
       target.refs--;
       if (target.refs <= 0) {
         if (target.listener != null && target.closeListener) {
@@ -555,25 +643,25 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         }
       }
     }
-    if (target.type === 'tty_master') {
+    if (target.type === "tty_master") {
       target.state.masterClosed = true;
       for (const waiter of target.state.toSlaveWaiters.splice(0)) waiter();
     }
   }
 
   function retainFdTarget(target: FdTarget): void {
-    if (target.type === 'pipe_write') target.pipe.addRef();
-    if (target.type === 'pipe_read') target.pipe.addRef();
-    if (target.type === 'vfs_file') target.fdTable.retain(target.fd);
-    if (target.type === 'vfs_file') target.refs++;
-    if (target.type === 'socket') target.refs++;
+    if (target.type === "pipe_write") target.pipe.addRef();
+    if (target.type === "pipe_read") target.pipe.addRef();
+    if (target.type === "vfs_file") target.fdTable.retain(target.fd);
+    if (target.type === "vfs_file") target.refs++;
+    if (target.type === "socket") target.refs++;
   }
 
   function isActivePreopenFd(fd: number): boolean {
     if (!opts.wasiHost?.isPreopenFd(fd)) return false;
     if (!opts.kernel) return true;
     const target = opts.kernel.getFdTarget(callerPid, fd);
-    return !target || target.type === 'vfs_dir';
+    return !target || target.type === "vfs_dir";
   }
 
   const syntheticDns = new Map<string, string>();
@@ -607,14 +695,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   }
 
   function getCallerCwd(): string {
-    return opts.kernel?.getCwd(callerPid) ?? opts.wasiHost?.getCwd() ?? '/';
+    return opts.kernel?.getCwd(callerPid) ?? opts.wasiHost?.getCwd() ?? "/";
   }
 
   function getCallerPhysicalCwd(): string {
     const cwd = getCallerCwd();
     if (!opts.vfs) return normalizeImportPath(cwd);
     try {
-      return withVfsCallerCredentials(() => resolveRealpath(opts.vfs!, cwd, '.'));
+      return withVfsCallerCredentials(() =>
+        resolveRealpath(opts.vfs!, cwd, ".")
+      );
     } catch {
       return normalizeImportPath(cwd);
     }
@@ -651,26 +741,41 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     return targetPid;
   }
 
-  function setSchedulerForTarget(targetPid: number, policyRaw: number, priorityRaw: number): number {
+  function setSchedulerForTarget(
+    targetPid: number,
+    policyRaw: number,
+    priorityRaw: number,
+  ): number {
     const policy = normalizeSchedulerPolicy(policyRaw);
     const priority = normalizeSchedulerPriority(policy, priorityRaw);
     if (policy < 0 || priority < 0) return ERR_INVALID;
 
-    const current = opts.kernel?.getScheduler(targetPid) ?? { policy: 0, priority: 0 };
+    const current = opts.kernel?.getScheduler(targetPid) ??
+      { policy: 0, priority: 0 };
     const noOp = current.policy === policy && current.priority === priority;
     if (!noOp) {
       const caller = getCallerCredentials();
-      if (targetPid !== callerPid && caller.euid !== ROOT_UID) return ERR_PERMISSION;
-      if ((policy === 1 || policy === 2 || current.policy === 1 || current.policy === 2) && caller.euid !== ROOT_UID) {
+      if (targetPid !== callerPid && caller.euid !== ROOT_UID) {
+        return ERR_PERMISSION;
+      }
+      if (
+        (policy === 1 || policy === 2 || current.policy === 1 ||
+          current.policy === 2) && caller.euid !== ROOT_UID
+      ) {
         return ERR_PERMISSION;
       }
       if (!schedulerBackend?.setScheduler) return ERR_UNSUPPORTED;
-      const result = schedulerBackend.setScheduler({ callerPid, targetPid, policy, priority });
+      const result = schedulerBackend.setScheduler({
+        callerPid,
+        targetPid,
+        policy,
+        priority,
+      });
       if (!result.ok) {
-        if (result.error === 'unsupported') return ERR_UNSUPPORTED;
-        if (result.error === 'permission') return ERR_PERMISSION;
-        if (result.error === 'invalid') return ERR_INVALID;
-        if (result.error === 'not_found') return ERR_NOT_FOUND;
+        if (result.error === "unsupported") return ERR_UNSUPPORTED;
+        if (result.error === "permission") return ERR_PERMISSION;
+        if (result.error === "invalid") return ERR_INVALID;
+        if (result.error === "not_found") return ERR_NOT_FOUND;
         return ERR_IO;
       }
     }
@@ -679,7 +784,10 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     return 0;
   }
 
-  function validateSingleCpuAffinity(maskPtr: number, cpusetsizeRaw: number): number {
+  function validateSingleCpuAffinity(
+    maskPtr: number,
+    cpusetsizeRaw: number,
+  ): number {
     const cpusetsize = Math.trunc(cpusetsizeRaw);
     if (cpusetsize < 4) return ERR_INVALID;
     const bytes = new Uint8Array(memory.buffer, maskPtr, cpusetsize);
@@ -691,7 +799,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   }
 
   function bytesToBase64(data: Uint8Array): string {
-    let binary = '';
+    let binary = "";
     for (let i = 0; i < data.byteLength; i++) {
       binary += String.fromCharCode(data[i]);
     }
@@ -716,29 +824,45 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
   function authorizeListen(
     policy: SocketListenPolicy | undefined,
-    host: '127.0.0.1' | 'localhost' | '0.0.0.0',
+    host: "127.0.0.1" | "localhost" | "0.0.0.0",
     port: number,
     backlog: number,
   ): { ok: true; mapping?: SocketPortMapping } | { ok: false; error: string } {
     if (!policy) {
-      return { ok: false, error: `listen on ${host}:${port} is not allowed by sandbox policy` };
+      return {
+        ok: false,
+        error: `listen on ${host}:${port} is not allowed by sandbox policy`,
+      };
     }
-    if (host === '127.0.0.1' || host === 'localhost') {
+    if (host === "127.0.0.1" || host === "localhost") {
       if (policy.allowLoopback === true) return { ok: true };
-      return { ok: false, error: `listen on ${host}:${port} is not allowed by sandbox policy` };
+      return {
+        ok: false,
+        error: `listen on ${host}:${port} is not allowed by sandbox policy`,
+      };
     }
     const mapping = policy.portMappings?.find((m) =>
-      m.sandboxHost === '0.0.0.0' && m.sandboxPort === port
+      m.sandboxHost === "0.0.0.0" && m.sandboxPort === port
     );
     if (!mapping) {
-      return { ok: false, error: `listen on 0.0.0.0:${port} requires an explicit port mapping` };
+      return {
+        ok: false,
+        error: `listen on 0.0.0.0:${port} requires an explicit port mapping`,
+      };
     }
     const allowed = policy.onListen?.({ host, port, backlog, mapping });
     if (allowed === false) {
-      return { ok: false, error: `listen on 0.0.0.0:${port} was denied by sandbox policy` };
+      return {
+        ok: false,
+        error: `listen on 0.0.0.0:${port} was denied by sandbox policy`,
+      };
     }
-    if (allowed && typeof (allowed as Promise<boolean>).then === 'function') {
-      return { ok: false, error: 'async listen authorization is not supported by synchronous socket imports' };
+    if (allowed && typeof (allowed as Promise<boolean>).then === "function") {
+      return {
+        ok: false,
+        error:
+          "async listen authorization is not supported by synchronous socket imports",
+      };
     }
     return { ok: true, mapping };
   }
@@ -770,7 +894,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Compatibility: shell-exec also imports a legacy synchronous
     // host_spawn(req_ptr, req_len, out_ptr, out_cap) ABI for tests. Keep
     // that branch here for backwards compatibility.
-    host_spawn(reqPtr: number, reqLen: number, outPtr?: number, outCap?: number): number {
+    host_spawn(
+      reqPtr: number,
+      reqLen: number,
+      outPtr?: number,
+      outCap?: number,
+    ): number {
       const spawnFromRequest = (req: SpawnRequest): number => {
         const requestedNice = normalizeNice(req.nice ?? 0);
         if (requestedNice > 0 && !schedulerBackend) return ERR_UNSUPPORTED;
@@ -781,19 +910,33 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
           let previousStdin: FdTarget | undefined;
           if (req.stdin_data) {
             previousStdin = fdTable.get(0);
-            fdTable.set(0, createStaticTarget(new TextEncoder().encode(req.stdin_data)));
+            fdTable.set(
+              0,
+              createStaticTarget(new TextEncoder().encode(req.stdin_data)),
+            );
           }
           try {
             const childPid = opts.spawnProcess(req, fdTable, callerPid);
-            if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
+            if (previousStdin) {
+              opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
+            }
             return childPid;
           } catch (e) {
             opts.kernel.releaseFdTable(fdTable);
-            if (previousStdin) opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
+            if (previousStdin) {
+              opts.kernel.releaseFdTable(new Map([[0, previousStdin]]));
+            }
             const msg = e instanceof Error ? e.message : String(e);
-            if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
-            if (msg.includes('ENOENT') || msg.includes('no such file or directory')) return ERR_NOT_FOUND;
-            if (msg.includes('ENOTDIR') || msg.includes('not a directory')) return ERR_NOT_DIR;
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            if (
+              msg.includes("ENOENT") ||
+              msg.includes("no such file or directory")
+            ) return ERR_NOT_FOUND;
+            if (msg.includes("ENOTDIR") || msg.includes("not a directory")) {
+              return ERR_NOT_DIR;
+            }
             return -1;
           }
         }
@@ -801,32 +944,47 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       };
 
       const reqBytes = readBytes(memory, reqPtr, reqLen);
-      if (typeof outPtr === 'number' && typeof outCap === 'number') {
+      if (typeof outPtr === "number" && typeof outCap === "number") {
         try {
           const nativeReq = decodeNativeSpawnRequest(reqBytes);
           if (nativeReq) {
             const pid = spawnFromRequest(nativeReq);
-            return pid < 0 ? pid : writeSpawnResult(memory, outPtr, outCap, pid);
+            return pid < 0
+              ? pid
+              : writeSpawnResult(memory, outPtr, outCap, pid);
           }
         } catch {
           return ERR_INVALID;
         }
 
         const reqJson = new TextDecoder().decode(reqBytes);
-        let req: { program?: string; args?: string[]; env?: [string, string][]; cwd?: string; stdin?: string; stdin_fd?: number };
-        try { req = JSON.parse(reqJson); } catch { req = {}; }
+        let req: {
+          program?: string;
+          args?: string[];
+          env?: [string, string][];
+          cwd?: string;
+          stdin?: string;
+          stdin_fd?: number;
+        };
+        try {
+          req = JSON.parse(reqJson);
+        } catch {
+          req = {};
+        }
 
-        const cmd = req.program ?? '';
+        const cmd = req.program ?? "";
         const args = req.args?.map(String) ?? [];
         const env: Record<string, string> = {};
-        if (req.env) for (const [k, v] of req.env) env[k] = v;
+        if (req.env) { for (const [k, v] of req.env) env[k] = v; }
         const cwd = req.cwd ?? getCallerCwd();
-        let stdinStr = req.stdin ?? '';
-        if (!stdinStr && typeof req.stdin_fd === 'number' && opts.kernel) {
+        let stdinStr = req.stdin ?? "";
+        if (!stdinStr && typeof req.stdin_fd === "number" && opts.kernel) {
           const stdinTarget = opts.kernel.getFdTarget(callerPid, req.stdin_fd);
-          if (stdinTarget?.type === 'static') {
-            stdinStr = new TextDecoder().decode(stdinTarget.data.slice(stdinTarget.offset));
-          } else if (stdinTarget?.type === 'pipe_read') {
+          if (stdinTarget?.type === "static") {
+            stdinStr = new TextDecoder().decode(
+              stdinTarget.data.slice(stdinTarget.offset),
+            );
+          } else if (stdinTarget?.type === "pipe_read") {
             stdinStr = new TextDecoder().decode(stdinTarget.pipe.drainSync());
           }
         }
@@ -840,7 +998,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
             const msg = e instanceof Error ? e.message : String(e);
             return writeJson(memory, outPtr, outCap, {
               exit_code: 127,
-              stdout: '',
+              stdout: "",
               stderr: `${cmd}: ${msg}\n`,
             });
           }
@@ -848,7 +1006,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
         return writeJson(memory, outPtr, outCap, {
           exit_code: 127,
-          stdout: '',
+          stdout: "",
           stderr: `${cmd}: sync spawn not available\n`,
         });
       }
@@ -899,12 +1057,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
     host_setresuid(ruid: number, euid: number, suid: number): number {
       if (!opts.kernel) return setFallbackUid(ruid, euid, suid);
-      return opts.kernel.setresuid(callerPid, ruid, euid, suid) ? 0 : ERR_PERMISSION;
+      return opts.kernel.setresuid(callerPid, ruid, euid, suid)
+        ? 0
+        : ERR_PERMISSION;
     },
 
     host_setresgid(rgid: number, egid: number, sgid: number): number {
       if (!opts.kernel) return setFallbackGid(rgid, egid, sgid);
-      return opts.kernel.setresgid(callerPid, rgid, egid, sgid) ? 0 : ERR_PERMISSION;
+      return opts.kernel.setresgid(callerPid, rgid, egid, sgid)
+        ? 0
+        : ERR_PERMISSION;
     },
 
     host_umask(mask: number): number {
@@ -927,16 +1089,24 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       const nice = normalizeNice(niceRaw);
       const auth = authorizeSetPriority(targetPid, nice);
       if (auth !== 0) return auth;
-      if (!schedulerBackend) return nice === (opts.kernel?.getPriority(targetPid) ?? 0) ? 0 : ERR_UNSUPPORTED;
-      const result = schedulerBackend.setPriority({ callerPid, targetPid, nice });
+      if (!schedulerBackend) {
+        return nice === (opts.kernel?.getPriority(targetPid) ?? 0)
+          ? 0
+          : ERR_UNSUPPORTED;
+      }
+      const result = schedulerBackend.setPriority({
+        callerPid,
+        targetPid,
+        nice,
+      });
       if (result.ok) {
         opts.kernel?.setPriority(targetPid, nice);
         return 0;
       }
-      if (result.error === 'unsupported') return ERR_UNSUPPORTED;
-      if (result.error === 'permission') return ERR_PERMISSION;
-      if (result.error === 'invalid') return ERR_INVALID;
-      if (result.error === 'not_found') return ERR_NOT_FOUND;
+      if (result.error === "unsupported") return ERR_UNSUPPORTED;
+      if (result.error === "permission") return ERR_PERMISSION;
+      if (result.error === "invalid") return ERR_INVALID;
+      if (result.error === "not_found") return ERR_NOT_FOUND;
       return ERR_IO;
     },
 
@@ -952,7 +1122,11 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       return opts.kernel?.getScheduler(targetPid).priority ?? 0;
     },
 
-    host_sched_setscheduler(pidRaw: number, policyRaw: number, priorityRaw: number): number {
+    host_sched_setscheduler(
+      pidRaw: number,
+      policyRaw: number,
+      priorityRaw: number,
+    ): number {
       const targetPid = schedulerTargetPid(pidRaw);
       if (targetPid < 0) return targetPid;
       return setSchedulerForTarget(targetPid, policyRaw, priorityRaw);
@@ -961,11 +1135,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     host_sched_setparam(pidRaw: number, priorityRaw: number): number {
       const targetPid = schedulerTargetPid(pidRaw);
       if (targetPid < 0) return targetPid;
-      const current = opts.kernel?.getScheduler(targetPid) ?? { policy: 0, priority: 0 };
+      const current = opts.kernel?.getScheduler(targetPid) ??
+        { policy: 0, priority: 0 };
       return setSchedulerForTarget(targetPid, current.policy, priorityRaw);
     },
 
-    host_sched_getaffinity(pidRaw: number, maskPtr: number, cpusetsizeRaw: number): number {
+    host_sched_getaffinity(
+      pidRaw: number,
+      maskPtr: number,
+      cpusetsizeRaw: number,
+    ): number {
       const targetPid = schedulerTargetPid(pidRaw);
       if (targetPid < 0) return targetPid;
       const cpusetsize = Math.trunc(cpusetsizeRaw);
@@ -976,14 +1155,20 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       return 0;
     },
 
-    host_sched_setaffinity(pidRaw: number, maskPtr: number, cpusetsizeRaw: number): number {
+    host_sched_setaffinity(
+      pidRaw: number,
+      maskPtr: number,
+      cpusetsizeRaw: number,
+    ): number {
       const targetPid = schedulerTargetPid(pidRaw);
       if (targetPid < 0) return targetPid;
       return validateSingleCpuAffinity(maskPtr, cpusetsizeRaw);
     },
 
     host_getrlimit(resourceRaw: number, outPtr: number): number {
-      const limit = opts.kernel?.getResourceLimit(callerPid, Math.trunc(resourceRaw)) ?? defaultImportResourceLimit(Math.trunc(resourceRaw));
+      const limit =
+        opts.kernel?.getResourceLimit(callerPid, Math.trunc(resourceRaw)) ??
+          defaultImportResourceLimit(Math.trunc(resourceRaw));
       if (!limit) return ERR_INVALID;
       const view = new DataView(memory.buffer);
       view.setBigUint64(outPtr, limitToBigUint64(limit.soft), true);
@@ -991,12 +1176,23 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       return 0;
     },
 
-    host_setrlimit(resourceRaw: number, softRaw: number | bigint, hardRaw: number | bigint): number {
+    host_setrlimit(
+      resourceRaw: number,
+      softRaw: number | bigint,
+      hardRaw: number | bigint,
+    ): number {
       const resource = Math.trunc(resourceRaw);
-      if (!opts.kernel) return defaultImportResourceLimit(resource) ? 0 : ERR_INVALID;
-      const result = opts.kernel.setResourceLimit(callerPid, resource, softRaw, hardRaw);
-      if (result === 'ok') return 0;
-      if (result === 'permission') return ERR_PERMISSION;
+      if (!opts.kernel) {
+        return defaultImportResourceLimit(resource) ? 0 : ERR_INVALID;
+      }
+      const result = opts.kernel.setResourceLimit(
+        callerPid,
+        resource,
+        softRaw,
+        hardRaw,
+      );
+      if (result === "ok") return 0;
+      if (result === "permission") return ERR_PERMISSION;
       return ERR_INVALID;
     },
 
@@ -1010,11 +1206,18 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       return required;
     },
 
-    host_realpath(pathPtr: number, pathLen: number, outPtr: number, outCap: number): number {
+    host_realpath(
+      pathPtr: number,
+      pathLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
       try {
-        const real = withVfsCallerCredentials(() => resolveRealpath(opts.vfs!, getCallerCwd(), rawPath));
+        const real = withVfsCallerCredentials(() =>
+          resolveRealpath(opts.vfs!, getCallerCwd(), rawPath)
+        );
         const bytes = new TextEncoder().encode(real);
         const required = bytes.byteLength + 1;
         if (outCap < required) return required;
@@ -1022,11 +1225,17 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
         return required;
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : '';
-        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
-        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
-        if (msg.includes('ENOTDIR') || msg.includes('not a directory')) return ERR_NOT_DIR;
-        if (msg.includes('ELOOP')) return ERR_INVALID;
+        const msg = e instanceof Error ? e.message : "";
+        if (msg.includes("ENOENT") || msg.includes("no such file")) {
+          return ERR_NOT_FOUND;
+        }
+        if (msg.includes("EACCES") || msg.includes("permission denied")) {
+          return ERR_PERMISSION;
+        }
+        if (msg.includes("ENOTDIR") || msg.includes("not a directory")) {
+          return ERR_NOT_DIR;
+        }
+        if (msg.includes("ELOOP")) return ERR_INVALID;
         return ERR_IO;
       }
     },
@@ -1037,13 +1246,17 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       const path = resolveCwdPath(getCallerCwd(), rawPath);
       try {
         const stat = opts.vfs.stat(path);
-        if (stat.type !== 'dir') return ERR_NOT_DIR;
+        if (stat.type !== "dir") return ERR_NOT_DIR;
         setCallerCwd(resolveLogicalCwdPath(getCallerCwd(), rawPath));
         return 0;
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : '';
-        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
-        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        const msg = e instanceof Error ? e.message : "";
+        if (msg.includes("ENOENT") || msg.includes("no such file")) {
+          return ERR_NOT_FOUND;
+        }
+        if (msg.includes("EACCES") || msg.includes("permission denied")) {
+          return ERR_PERMISSION;
+        }
         return ERR_IO;
       }
     },
@@ -1053,22 +1266,26 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       let path = opts.wasiHost?.getDirectoryFdPath(fd) ?? null;
       if (path === null && opts.kernel) {
         const target = opts.kernel.getFdTarget(callerPid, fd);
-        if (target?.type === 'vfs_dir') {
+        if (target?.type === "vfs_dir") {
           path = target.path;
-        } else if (target?.type === 'vfs_file') {
+        } else if (target?.type === "vfs_file") {
           path = target.fdTable.getPath(target.fd) ?? null;
         }
       }
       if (path === null) return ERR_NOT_FOUND;
       try {
         const stat = opts.vfs.stat(path);
-        if (stat.type !== 'dir') return ERR_NOT_DIR;
+        if (stat.type !== "dir") return ERR_NOT_DIR;
         setCallerCwd(path);
         return 0;
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : '';
-        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
-        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        const msg = e instanceof Error ? e.message : "";
+        if (msg.includes("ENOENT") || msg.includes("no such file")) {
+          return ERR_NOT_FOUND;
+        }
+        if (msg.includes("EACCES") || msg.includes("permission denied")) {
+          return ERR_PERMISSION;
+        }
         return ERR_IO;
       }
     },
@@ -1084,7 +1301,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (!opts.kernel) return -1;
       const exists = opts.kernel
         .listProcesses()
-        .some(p => p.pid === pid && p.state !== 'exited');
+        .some((p) => p.pid === pid && p.state !== "exited");
       if (!exists) return -1;
       // sig 0 is the existence probe — POSIX requires no signal sent.
       if (sig === 0) return 0;
@@ -1135,8 +1352,10 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (!opts.kernel) return -1;
       if (sig === 0) {
         return opts.kernel
-          .listProcesses()
-          .some((p) => p.pgid === pgid && p.state !== 'exited') ? 0 : -1;
+            .listProcesses()
+            .some((p) => p.pgid === pgid && p.state !== "exited")
+          ? 0
+          : -1;
       }
       return opts.kernel.killpg(pgid, sig) > 0 ? 0 : -1;
     },
@@ -1145,17 +1364,23 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Returns 0 if fd refers to a TTY (tty_slave or tty_master), -1 (ENOTTY) otherwise.
     host_isatty(fd: number): number {
       const ioTarget = opts.wasiHost?.getIoFds().get(fd);
-      if (ioTarget?.type === 'tty_slave' || ioTarget?.type === 'tty_master') return 0;
+      if (ioTarget?.type === "tty_slave" || ioTarget?.type === "tty_master") {
+        return 0;
+      }
       const kernelTarget = opts.kernel?.getFdTarget(callerPid, fd);
-      if (kernelTarget?.type === 'tty_slave' || kernelTarget?.type === 'tty_master') return 0;
+      if (
+        kernelTarget?.type === "tty_slave" ||
+        kernelTarget?.type === "tty_master"
+      ) return 0;
       return -1;
     },
 
     // host_tcgetpgrp(fd) -> i32
     // Returns the foreground process group of the terminal on fd, or -1.
     host_tcgetpgrp(fd: number): number {
-      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
-      if (target?.type === 'tty_slave' || target?.type === 'tty_master') {
+      const target = opts.wasiHost?.getIoFds().get(fd) ??
+        opts.kernel?.getFdTarget(callerPid, fd);
+      if (target?.type === "tty_slave" || target?.type === "tty_master") {
         return target.state.fgPgid;
       }
       return -1;
@@ -1166,8 +1391,9 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Returns 0 on success, -1 if fd is not a terminal.
     host_tcsetpgrp(fd: number, pgid: number): number {
       if (!opts.kernel) return -1;
-      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
-      if (target?.type === 'tty_slave' || target?.type === 'tty_master') {
+      const target = opts.wasiHost?.getIoFds().get(fd) ??
+        opts.kernel?.getFdTarget(callerPid, fd);
+      if (target?.type === "tty_slave" || target?.type === "tty_master") {
         return opts.kernel.tcsetpgrp(target.ttyId, pgid, callerPid) ? 0 : -1;
       }
       return -1;
@@ -1178,8 +1404,11 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Returns 0 on success, -1 if fd is not a TTY.
     host_tiocsctty(fd: number): number {
       if (!opts.kernel) return -1;
-      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel.getFdTarget(callerPid, fd);
-      if (!target || (target.type !== 'tty_slave' && target.type !== 'tty_master')) return -1;
+      const target = opts.wasiHost?.getIoFds().get(fd) ??
+        opts.kernel.getFdTarget(callerPid, fd);
+      if (
+        !target || (target.type !== "tty_slave" && target.type !== "tty_master")
+      ) return -1;
       return opts.kernel.setControllingTty(callerPid, target.ttyId);
     },
 
@@ -1187,8 +1416,11 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Writes a minimal sane termios struct to the output buffer.
     // Returns bytes written, or -1 if fd is not a terminal.
     host_tcgetattr(fd: number, outPtr: number, outCap: number): number {
-      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || (target.type !== 'tty_slave' && target.type !== 'tty_master')) return -1;
+      const target = opts.wasiHost?.getIoFds().get(fd) ??
+        opts.kernel?.getFdTarget(callerPid, fd);
+      if (
+        !target || (target.type !== "tty_slave" && target.type !== "tty_master")
+      ) return -1;
       // musl wasm32 termios layout (60 bytes):
       //   [0]  c_iflag (4) — ICRNL|IXON
       //   [4]  c_oflag (4) — OPOST|ONLCR
@@ -1199,14 +1431,22 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       //   [40] c_ispeed (4), [44] c_ospeed (4)
       const buf = new Uint8Array(60);
       const view = new DataView(buf.buffer);
-      view.setUint32(0, 0x0600, true);  // c_iflag: ICRNL(0x400)|IXON(0x200)
-      view.setUint32(4, 0x0005, true);  // c_oflag: OPOST(0x01)|ONLCR(0x04)
-      view.setUint32(8, 0x08BF, true);  // c_cflag: CS8|CREAD|CLOCAL|B38400
+      view.setUint32(0, 0x0600, true); // c_iflag: ICRNL(0x400)|IXON(0x200)
+      view.setUint32(4, 0x0005, true); // c_oflag: OPOST(0x01)|ONLCR(0x04)
+      view.setUint32(8, 0x08BF, true); // c_cflag: CS8|CREAD|CLOCAL|B38400
       view.setUint32(12, 0x8A3B, true); // c_lflag: ISIG|ICANON|ECHO|ECHOE|ECHOK|IEXTEN
-      buf[17] = 3;   buf[18] = 28;  buf[19] = 127; buf[20] = 21;  // VINTR VQUIT VERASE VKILL
-      buf[21] = 4;   buf[22] = 0;   buf[23] = 1;                  // VEOF VTIME VMIN
-      buf[25] = 17;  buf[26] = 19;  buf[27] = 26;                  // VSTART VSTOP VSUSP
-      view.setUint32(40, 15, true); view.setUint32(44, 15, true);  // B38400
+      buf[17] = 3;
+      buf[18] = 28;
+      buf[19] = 127;
+      buf[20] = 21; // VINTR VQUIT VERASE VKILL
+      buf[21] = 4;
+      buf[22] = 0;
+      buf[23] = 1; // VEOF VTIME VMIN
+      buf[25] = 17;
+      buf[26] = 19;
+      buf[27] = 26; // VSTART VSTOP VSUSP
+      view.setUint32(40, 15, true);
+      view.setUint32(44, 15, true); // B38400
       return writeBytes(memory, outPtr, outCap, buf);
     },
 
@@ -1214,8 +1454,11 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Accepts terminal attribute changes silently (we don't implement a line discipline).
     // Returns 0 on success, -1 if fd is not a terminal.
     host_tcsetattr(fd: number, _actions: number, _termiosPtr: number): number {
-      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || (target.type !== 'tty_slave' && target.type !== 'tty_master')) return -1;
+      const target = opts.wasiHost?.getIoFds().get(fd) ??
+        opts.kernel?.getFdTarget(callerPid, fd);
+      if (
+        !target || (target.type !== "tty_slave" && target.type !== "tty_master")
+      ) return -1;
       return 0;
     },
 
@@ -1223,8 +1466,11 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Writes a struct winsize { rows, cols, xpixel, ypixel } to the output buffer.
     // Returns bytes written, or -1 if fd is not a terminal.
     host_winsize(fd: number, outPtr: number, outCap: number): number {
-      const target = opts.wasiHost?.getIoFds().get(fd) ?? opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || (target.type !== 'tty_slave' && target.type !== 'tty_master')) return -1;
+      const target = opts.wasiHost?.getIoFds().get(fd) ??
+        opts.kernel?.getFdTarget(callerPid, fd);
+      if (
+        !target || (target.type !== "tty_slave" && target.type !== "tty_master")
+      ) return -1;
       const buf = new Uint8Array(8);
       const view = new DataView(buf.buffer);
       view.setUint16(0, target.state.rows, true);
@@ -1235,7 +1481,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // host_wait(pid, flags, out_ptr, out_cap) -> i32
     // Async — must be wrapped with WebAssembly.Suspending for JSPI.
     // Waits for a child process to exit and writes yurt_wait_result_v1.
-    host_wait(pid: number, flags: number, outPtr: number, outCap: number): number | Promise<number> {
+    host_wait(
+      pid: number,
+      flags: number,
+      outPtr: number,
+      outCap: number,
+    ): number | Promise<number> {
       if (!opts.kernel) return ERR_CHILD;
       const kernel = opts.kernel;
       opts.wasiHost?.drainPendingSignals();
@@ -1244,9 +1495,15 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       if (nohang) {
         if (pid <= 0) {
           const result = kernel.waitAnyChildNohang(callerPid);
-          if (result.state === 'running') return ERR_AGAIN;
-          if (result.state === 'none') return ERR_CHILD;
-          return writeWaitResult(memory, outPtr, outCap, result.pid, result.exitCode);
+          if (result.state === "running") return ERR_AGAIN;
+          if (result.state === "none") return ERR_CHILD;
+          return writeWaitResult(
+            memory,
+            outPtr,
+            outCap,
+            result.pid,
+            result.exitCode,
+          );
         }
         const exitCode = kernel.waitpidNohang(pid, callerPid);
         if (exitCode === -1) return ERR_AGAIN;
@@ -1260,21 +1517,40 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         const signalWait = opts.wasiHost?.waitForSignalDelivery();
         const interrupt = signalWait?.promise ?? new Promise<void>(() => {});
         if (pid <= 0) {
-          const waited = await kernel.waitAnyChildInterruptible(callerPid, interrupt);
+          const waited = await kernel.waitAnyChildInterruptible(
+            callerPid,
+            interrupt,
+          );
           signalWait?.cancel();
           if (waited.interrupted) {
             opts.wasiHost?.drainPendingSignals();
             const result = kernel.waitAnyChildNohang(callerPid);
-            if (result.state === 'exited') {
-              return writeWaitResult(memory, outPtr, outCap, result.pid, result.exitCode);
+            if (result.state === "exited") {
+              return writeWaitResult(
+                memory,
+                outPtr,
+                outCap,
+                result.pid,
+                result.exitCode,
+              );
             }
             return ERR_INTERRUPTED;
           }
           const result = waited.result;
           if (!result) return ERR_CHILD;
-          return writeWaitResult(memory, outPtr, outCap, result.pid, result.exitCode);
+          return writeWaitResult(
+            memory,
+            outPtr,
+            outCap,
+            result.pid,
+            result.exitCode,
+          );
         }
-        const waited = await kernel.waitpidInterruptible(pid, callerPid, interrupt);
+        const waited = await kernel.waitpidInterruptible(
+          pid,
+          callerPid,
+          interrupt,
+        );
         signalWait?.cancel();
         if (waited.interrupted) {
           opts.wasiHost?.drainPendingSignals();
@@ -1319,11 +1595,15 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Reads all available data from a pipe fd and writes it to the output buffer.
     host_read_fd(fd: number, outPtr: number, outCap: number): number {
       if (!opts.kernel) {
-        return writeJson(memory, outPtr, outCap, { error: 'kernel not available' });
+        return writeJson(memory, outPtr, outCap, {
+          error: "kernel not available",
+        });
       }
       const target = opts.kernel.getFdTarget(callerPid, fd);
-      if (!target || target.type !== 'pipe_read') {
-        return writeJson(memory, outPtr, outCap, { error: `not a readable fd: ${fd}` });
+      if (!target || target.type !== "pipe_read") {
+        return writeJson(memory, outPtr, outCap, {
+          error: `not a readable fd: ${fd}`,
+        });
       }
       const data = target.pipe.drainSync();
       const str = new TextDecoder().decode(data);
@@ -1339,7 +1619,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     host_write_fd(fd: number, dataPtr: number, dataLen: number): number {
       if (!opts.kernel) return -1;
       const target = opts.kernel.getFdTarget(callerPid, fd);
-      if (!target || target.type !== 'pipe_write') {
+      if (!target || target.type !== "pipe_write") {
         return -1;
       }
       const data = new Uint8Array(memory.buffer, dataPtr, dataLen);
@@ -1389,13 +1669,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         }
         if (opts.wasiHost) {
           const ioFds = opts.wasiHost.getIoFds();
-          const existingKernelTarget = opts.kernel?.getFdTarget(callerPid, dstFd) ?? null;
+          const existingKernelTarget =
+            opts.kernel?.getFdTarget(callerPid, dstFd) ?? null;
           const mirrored = opts.wasiHost.duplicateFdTo(srcFd, dstFd, false);
           if (mirrored) {
             if (existingKernelTarget && existingKernelTarget !== mirrored) {
               closeFdTarget(existingKernelTarget);
             }
-            if (opts.kernel) opts.kernel.setFdTarget(callerPid, dstFd, mirrored);
+            if (opts.kernel) {
+              opts.kernel.setFdTarget(callerPid, dstFd, mirrored);
+            }
             return 0;
           }
           const target = ioFds.get(srcFd);
@@ -1403,7 +1686,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
             if (srcFd === dstFd) return 0;
             const existing = ioFds.get(dstFd);
             if (existing) closeFdTarget(existing);
-            if (target.type === 'vfs_file') {
+            if (target.type === "vfs_file") {
               target.fdTable.dupToShared(target.fd, dstFd);
               target.refs++;
               ioFds.set(dstFd, { ...target, fd: dstFd, refs: 1 });
@@ -1411,11 +1694,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
               retainFdTarget(target);
               ioFds.set(dstFd, target);
             }
-          }
-          else return -1;
+          } else return -1;
         }
         return 0;
-      } catch { return -1; }
+      } catch {
+        return -1;
+      }
     },
 
     // host_set_fd_descriptor_flags(fd, flags) -> i32
@@ -1451,9 +1735,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // real Asyncify-driven unwind+rewind back to the matching
     // host_setjmp call site.
     host_longjmp(envPtr: number, val: number): void {
-      void envPtr; void val;
+      void envPtr;
+      void val;
       if (opts.wasiHost) opts.wasiHost.cancelExecution();
-      throw new Error('longjmp without matching setjmp (Asyncify-based sjlj is Phase 2)');
+      throw new Error(
+        "longjmp without matching setjmp (Asyncify-based sjlj is Phase 2)",
+      );
     },
 
     // host_fork() -> i32
@@ -1486,14 +1773,26 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // host_network_fetch(req_ptr, req_len, out_ptr, out_cap) -> i32
     // HTTP fetch via NetworkBridge. Async (JSPI) to support both SAB-based
     // bridges (Node/Deno) and direct fetch() in the browser.
-    async host_network_fetch(reqPtr: number, reqLen: number, outPtr: number, outCap: number): Promise<number> {
+    async host_network_fetch(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): Promise<number> {
       const reqJson = readString(memory, reqPtr, reqLen);
 
       const fetchError = (error: string) =>
-        writeJson(memory, outPtr, outCap, { ok: false, status: 0, headers: {}, body: '', body_base64: null, error });
+        writeJson(memory, outPtr, outCap, {
+          ok: false,
+          status: 0,
+          headers: {},
+          body: "",
+          body_base64: null,
+          error,
+        });
 
       if (!opts.networkBridge) {
-        return fetchError('networking not configured');
+        return fetchError("networking not configured");
       }
 
       try {
@@ -1505,14 +1804,22 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
           redirect?: FetchRedirectMode;
         };
         const url = req.url as string;
-        const method = (req.method as string) ?? 'GET';
+        const method = (req.method as string) ?? "GET";
         const headers = (req.headers as Record<string, string>) ?? {};
         const body = req.body as string | undefined;
-        const redirect: FetchRedirectMode = req.redirect === 'manual' ? 'manual' : 'follow';
+        const redirect: FetchRedirectMode = req.redirect === "manual"
+          ? "manual"
+          : "follow";
 
         // Use async fetch if available (browser), otherwise fall back to sync (SAB bridge)
         const result = opts.networkBridge.fetchAsync
-          ? await opts.networkBridge.fetchAsync(url, method, headers, body, redirect)
+          ? await opts.networkBridge.fetchAsync(
+            url,
+            method,
+            headers,
+            body,
+            redirect,
+          )
           : opts.networkBridge.fetchSync(url, method, headers, body, redirect);
         return writeJson(memory, outPtr, outCap, {
           ok: !result.error && result.status >= 200 && result.status < 400,
@@ -1537,13 +1844,19 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // with the CPython port. New userlands should not depend on Python-specific
     // module invocation from the kernel.
     host_native_invoke(
-      modulePtr: number, moduleLen: number,
-      methodPtr: number, methodLen: number,
-      argsPtr: number, argsLen: number,
-      outPtr: number, outCap: number,
+      modulePtr: number,
+      moduleLen: number,
+      methodPtr: number,
+      methodLen: number,
+      argsPtr: number,
+      argsLen: number,
+      outPtr: number,
+      outCap: number,
     ): number {
       if (!opts.nativeModules) {
-        return writeJson(memory, outPtr, outCap, { error: 'native modules not available' });
+        return writeJson(memory, outPtr, outCap, {
+          error: "native modules not available",
+        });
       }
       const moduleName = readString(memory, modulePtr, moduleLen);
       const method = readString(memory, methodPtr, methodLen);
@@ -1569,20 +1882,40 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Resolves a hostname to a dotted-decimal IPv4 address string.
     // Returns bytes written into out_ptr, or -1 if the name cannot be resolved.
     // Async (JSPI): used by yurt_netdb_addr_for_host in the guest.
-    async host_dns_resolve(hostPtr: number, hostLen: number, outPtr: number, outCap: number): Promise<number> {
+    async host_dns_resolve(
+      hostPtr: number,
+      hostLen: number,
+      outPtr: number,
+      outCap: number,
+    ): Promise<number> {
       const hostname = readString(memory, hostPtr, hostLen);
       if (!hostname) return -1;
       // Loopback — always resolved locally regardless of platform.
-      if (hostname === 'localhost' || hostname === '127.0.0.1') {
-        return writeBytes(memory, outPtr, outCap, new TextEncoder().encode('127.0.0.1'));
+      if (hostname === "localhost" || hostname === "127.0.0.1") {
+        return writeBytes(
+          memory,
+          outPtr,
+          outCap,
+          new TextEncoder().encode("127.0.0.1"),
+        );
       }
       // Sandbox's own address — matches the configured local IP without a syscall.
       if (hostname === socketLocalHost) {
-        return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(socketLocalHost));
+        return writeBytes(
+          memory,
+          outPtr,
+          outCap,
+          new TextEncoder().encode(socketLocalHost),
+        );
       }
       const addr = await resolveHostname(hostname);
       if (!addr && socketBackend) {
-        return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(syntheticAddressForHost(hostname)));
+        return writeBytes(
+          memory,
+          outPtr,
+          outCap,
+          new TextEncoder().encode(syntheticAddressForHost(hostname)),
+        );
       }
       if (!addr) return -1;
       return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(addr));
@@ -1591,22 +1924,44 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // host_get_local_addr(out_ptr, out_cap) -> i32
     // Writes the kernel-configured sandbox local IPv4 address to out_ptr.
     host_get_local_addr(outPtr: number, outCap: number): number {
-      return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(socketLocalHost));
+      return writeBytes(
+        memory,
+        outPtr,
+        outCap,
+        new TextEncoder().encode(socketLocalHost),
+      );
     },
 
     // ── Sockets (full mode only) ──
 
     // host_socket_open(domain, type, protocol) -> fd
     // Allocates a kernel-owned socket fd. connect() fills in the backend handle later.
-    host_socket_open(_domain: number, _type: number, _protocol: number): number {
+    host_socket_open(
+      _domain: number,
+      _type: number,
+      _protocol: number,
+    ): number {
       if (!opts.kernel) return -1;
       return opts.kernel.allocFd(callerPid, {
-        type: 'socket',
+        type: "socket",
         socket: null,
         refs: 1,
-        send: (socket, dataB64) => socketBackend?.send(socket, dataB64) ?? { ok: false, error: 'networking not configured' },
-        recv: (socket, maxBytes, recvOpts) => socketBackend?.recv(socket, maxBytes, recvOpts) ?? { ok: false, error: 'networking not configured' },
-        setNoDelay: (socket, enabled) => socketBackend?.setNoDelay?.(socket, enabled) ?? { ok: false, error: 'TCP_NODELAY not supported by socket backend' },
+        send: (socket, dataB64) =>
+          socketBackend?.send(socket, dataB64) ??
+            { ok: false, error: "networking not configured" },
+        recv: (socket, maxBytes, recvOpts) =>
+          socketBackend?.recv(socket, maxBytes, recvOpts) ??
+            { ok: false, error: "networking not configured" },
+        recvAsync: (socket, maxBytes) =>
+          socketBackend
+            ? recvSocketAsync(socketBackend, socket, maxBytes)
+            : Promise.resolve({
+              ok: false,
+              error: "networking not configured",
+            }),
+        setNoDelay: (socket, enabled) =>
+          socketBackend?.setNoDelay?.(socket, enabled) ??
+            { ok: false, error: "TCP_NODELAY not supported by socket backend" },
         close: (socket) => {
           socketBackend?.close(socket);
         },
@@ -1617,31 +1972,52 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Opens a TCP or TLS socket to the given host:port.
     // Request JSON: { fd, host, port, tls }
     // Response JSON: { ok: true } or { ok: false, error }
-    host_socket_connect(reqPtr: number, reqLen: number, outPtr: number, outCap: number): number {
+    host_socket_connect(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       if (!socketBackend) {
-        return writeJson(memory, outPtr, outCap, { ok: false, error: 'networking not configured' });
+        return writeJson(memory, outPtr, outCap, {
+          ok: false,
+          error: "networking not configured",
+        });
       }
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== 'number') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'missing socket fd' });
+        if (typeof req.fd !== "number") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "missing socket fd",
+          });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== 'socket') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a socket fd: ${req.fd}` });
+        if (!target || target.type !== "socket") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `not a socket fd: ${req.fd}`,
+          });
         }
         const result = socketBackend.connect({
-          host: req.host, port: req.port, tls: req.tls ?? false,
+          host: req.host,
+          port: req.port,
+          tls: req.tls ?? false,
         });
         if (result.ok) {
           if (target.noDelay) {
-            const optionResult = target.setNoDelay?.(result.socket, true)
-              ?? { ok: false, error: 'TCP_NODELAY not supported by socket backend' };
-            if (!optionResult.ok) return writeJson(memory, outPtr, outCap, optionResult);
+            const optionResult = target.setNoDelay?.(result.socket, true) ??
+              {
+                ok: false,
+                error: "TCP_NODELAY not supported by socket backend",
+              };
+            if (!optionResult.ok) {
+              return writeJson(memory, outPtr, outCap, optionResult);
+            }
           }
           target.socket = result.socket;
-          target.peerHost = typeof req.host === 'string' ? req.host : '0.0.0.0';
-          target.peerPort = typeof req.port === 'number' ? req.port : 0;
+          target.peerHost = typeof req.host === "string" ? req.host : "0.0.0.0";
+          target.peerPort = typeof req.port === "number" ? req.port : 0;
           target.localHost = socketLocalHost;
           target.localPort = socketLocalPortForFd(req.fd);
           return writeJson(memory, outPtr, outCap, { ok: true });
@@ -1655,26 +2031,45 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
     // host_socket_bind(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Records the sandbox-visible local address requested for a socket fd.
-    host_socket_bind(reqPtr: number, reqLen: number, outPtr: number, outCap: number): number {
+    host_socket_bind(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== 'number') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'missing socket fd' });
+        if (typeof req.fd !== "number") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "missing socket fd",
+          });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== 'socket') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a socket fd: ${req.fd}` });
+        if (!target || target.type !== "socket") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `not a socket fd: ${req.fd}`,
+          });
         }
-        const host = req.host === 'localhost' ? 'localhost' : req.host;
-        if (host !== '127.0.0.1' && host !== 'localhost' && host !== '0.0.0.0') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `unsupported bind host: ${String(req.host)}` });
+        const host = req.host === "localhost" ? "localhost" : req.host;
+        if (
+          host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
+        ) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `unsupported bind host: ${String(req.host)}`,
+          });
         }
-        if (typeof req.port !== 'number' || req.port < 0 || req.port > 65535) {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `invalid bind port: ${String(req.port)}` });
+        if (typeof req.port !== "number" || req.port < 0 || req.port > 65535) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `invalid bind port: ${String(req.port)}`,
+          });
         }
         target.boundHost = host;
         target.boundPort = req.port;
-        target.localHost = host === '0.0.0.0' ? socketLocalHost : host;
+        target.localHost = host === "0.0.0.0" ? socketLocalHost : host;
         target.localPort = req.port;
         return writeJson(memory, outPtr, outCap, { ok: true });
       } catch (e: unknown) {
@@ -1685,32 +2080,55 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
     // host_socket_listen(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Creates a backend listener for a socket fd after sandbox policy authorizes it.
-    host_socket_listen(reqPtr: number, reqLen: number, outPtr: number, outCap: number): number {
+    host_socket_listen(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== 'number') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'missing socket fd' });
+        if (typeof req.fd !== "number") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "missing socket fd",
+          });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== 'socket') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a socket fd: ${req.fd}` });
+        if (!target || target.type !== "socket") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `not a socket fd: ${req.fd}`,
+          });
         }
-        const host = target.boundHost ?? '127.0.0.1';
+        const host = target.boundHost ?? "127.0.0.1";
         const port = target.boundPort ?? 0;
-        const backlog = typeof req.backlog === 'number' && req.backlog > 0 ? req.backlog : 128;
+        const backlog = typeof req.backlog === "number" && req.backlog > 0
+          ? req.backlog
+          : 128;
         const auth = authorizeListen(opts.serverSockets, host, port, backlog);
         if (!auth.ok) return writeJson(memory, outPtr, outCap, auth);
         if (!socketBackend?.listen) {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'server sockets are not supported by this backend' });
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "server sockets are not supported by this backend",
+          });
         }
-        const result = socketBackend.listen({ host, port, backlog, mapping: auth.mapping });
+        const result = socketBackend.listen({
+          host,
+          port,
+          backlog,
+          mapping: auth.mapping,
+        });
         if (!result.ok) return writeJson(memory, outPtr, outCap, result);
         target.listener = result.listener;
         target.boundHost = host;
         target.boundPort = port;
         target.localHost = result.host;
         target.localPort = result.port;
-        target.closeListener = (listener) => { socketBackend.closeListener?.(listener); };
+        target.closeListener = (listener) => {
+          socketBackend.closeListener?.(listener);
+        };
         return writeJson(memory, outPtr, outCap, { ok: true });
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -1720,32 +2138,47 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
 
     // host_socket_accept(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Polls one accepted connection from a listening socket fd.
-    async host_socket_accept(reqPtr: number, reqLen: number, outPtr: number, outCap: number): Promise<number> {
+    async host_socket_accept(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): Promise<number> {
       if (!socketBackend?.accept) {
-        return writeJson(memory, outPtr, outCap, { ok: false, error: 'server sockets are not supported by this backend' });
+        return writeJson(memory, outPtr, outCap, {
+          ok: false,
+          error: "server sockets are not supported by this backend",
+        });
       }
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== 'number') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'missing socket fd' });
+        if (typeof req.fd !== "number") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "missing socket fd",
+          });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== 'socket' || target.listener == null) {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a listening socket fd: ${req.fd}` });
+        if (!target || target.type !== "socket" || target.listener == null) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `not a listening socket fd: ${req.fd}`,
+          });
         }
-        let accepted = socketBackend.accept(target.listener);
-        let attempts = 0;
-        while (!accepted.ok && 'wouldBlock' in accepted && accepted.wouldBlock === true) {
-          if (++attempts > 100000) return writeJson(memory, outPtr, outCap, accepted);
-          await new Promise((resolve) => setTimeout(resolve, 0));
-          accepted = socketBackend.accept(target.listener);
-        }
+        // Prefer backend suspension; legacy backends fall back to accept().
+        const accepted = await acceptSocketAsync(
+          socketBackend,
+          target.listener,
+        );
         if (!accepted.ok) return writeJson(memory, outPtr, outCap, accepted);
         if (!opts.kernel) {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'kernel not configured' });
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "kernel not configured",
+          });
         }
         const acceptedFd = opts.kernel.allocFd(callerPid, {
-          type: 'socket',
+          type: "socket",
           socket: accepted.socket,
           refs: 1,
           peerHost: accepted.peerHost,
@@ -1754,8 +2187,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
           localPort: accepted.localPort,
           send: socketBackend.send.bind(socketBackend),
           recv: socketBackend.recv.bind(socketBackend),
+          recvAsync: (socket, maxBytes) =>
+            recvSocketAsync(socketBackend, socket, maxBytes),
           setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-          close: (socket) => { socketBackend.close(socket); },
+          close: (socket) => {
+            socketBackend.close(socket);
+          },
         });
         return writeJson(memory, outPtr, outCap, {
           ok: true,
@@ -1775,19 +2212,30 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Reports sandbox-visible socket address metadata.
     // Request JSON: { fd }
     // Response JSON: { ok, peer_host, peer_port, local_host, local_port } or { ok: false, error }
-    host_socket_addr(reqPtr: number, reqLen: number, outPtr: number, outCap: number): number {
+    host_socket_addr(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== 'number') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'missing socket fd' });
+        if (typeof req.fd !== "number") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "missing socket fd",
+          });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== 'socket' || target.socket === null) {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a connected socket fd: ${req.fd}` });
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `not a connected socket fd: ${req.fd}`,
+          });
         }
         return writeJson(memory, outPtr, outCap, {
           ok: true,
-          peer_host: target.peerHost ?? '0.0.0.0',
+          peer_host: target.peerHost ?? "0.0.0.0",
           peer_port: target.peerPort ?? 0,
           local_host: target.localHost ?? socketLocalHost,
           local_port: target.localPort ?? socketLocalPortForFd(req.fd),
@@ -1802,18 +2250,32 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Sends data on an open socket.
     // Request JSON: { fd, data_b64 }
     // Response JSON: { ok, bytes_sent } or { ok: false, error }
-    host_socket_send(reqPtr: number, reqLen: number, outPtr: number, outCap: number): number {
+    host_socket_send(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       if (!socketBackend) {
-        return writeJson(memory, outPtr, outCap, { ok: false, error: 'networking not configured' });
+        return writeJson(memory, outPtr, outCap, {
+          ok: false,
+          error: "networking not configured",
+        });
       }
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== 'number') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'missing socket fd' });
+        if (typeof req.fd !== "number") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "missing socket fd",
+          });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== 'socket' || target.socket === null) {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a connected socket fd: ${req.fd}` });
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `not a connected socket fd: ${req.fd}`,
+          });
         }
         const result = socketBackend.send(target.socket, req.data_b64);
         return writeJson(memory, outPtr, outCap, result);
@@ -1824,21 +2286,39 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     },
 
     // host_socket_recv(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // Receives data from an open socket.
+    // Receives data from an open socket. Returns synchronously for
+    // peek-with-buffer and nonblocking reads; returns a Promise for
+    // blocking reads, so backends with recvAsync (loopback, browser
+    // registry) suspend the host import via JSPI/Asyncify until at
+    // least one byte (or EOF) arrives.
     // Request JSON: { fd, max_bytes }
     // Response JSON: { ok, data_b64 } or { ok: false, error }
-    host_socket_recv(reqPtr: number, reqLen: number, outPtr: number, outCap: number): number {
+    host_socket_recv(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number | Promise<number> {
       if (!socketBackend) {
-        return writeJson(memory, outPtr, outCap, { ok: false, error: 'networking not configured' });
+        return writeJson(memory, outPtr, outCap, {
+          ok: false,
+          error: "networking not configured",
+        });
       }
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== 'number') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'missing socket fd' });
+        if (typeof req.fd !== "number") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "missing socket fd",
+          });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== 'socket' || target.socket === null) {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a connected socket fd: ${req.fd}` });
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `not a connected socket fd: ${req.fd}`,
+          });
         }
         const maxBytes = req.max_bytes ?? 65536;
         const peek = req.peek === true;
@@ -1847,20 +2327,40 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
           if (!peek) {
             target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
           }
-          return writeJson(memory, outPtr, outCap, { ok: true, data_b64: bytesToBase64(chunk) });
+          return writeJson(memory, outPtr, outCap, {
+            ok: true,
+            data_b64: bytesToBase64(chunk),
+          });
         }
         if (((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0) {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'EAGAIN' });
+          const nbResult = socketBackend.recv(target.socket, maxBytes, {
+            nonblocking: true,
+          });
+          if (peek && nbResult.ok) {
+            const data = base64ToBytes(nbResult.data_b64 ?? "");
+            target.peekBuffer = target.peekBuffer
+              ? concatBytes(target.peekBuffer, data)
+              : data;
+            return writeJson(memory, outPtr, outCap, {
+              ok: true,
+              data_b64: bytesToBase64(data),
+            });
+          }
+          return writeJson(memory, outPtr, outCap, nbResult);
         }
-        const result = socketBackend.recv(target.socket, maxBytes, {
-          nonblocking: false,
+        return target.recvAsync(target.socket, maxBytes).then((result) => {
+          if (peek && result.ok) {
+            const data = base64ToBytes(result.data_b64 ?? "");
+            target.peekBuffer = target.peekBuffer
+              ? concatBytes(target.peekBuffer, data)
+              : data;
+            return writeJson(memory, outPtr, outCap, {
+              ok: true,
+              data_b64: bytesToBase64(data),
+            });
+          }
+          return writeJson(memory, outPtr, outCap, result);
         });
-        if (peek && result.ok) {
-          const data = base64ToBytes(result.data_b64 ?? '');
-          target.peekBuffer = target.peekBuffer ? concatBytes(target.peekBuffer, data) : data;
-          return writeJson(memory, outPtr, outCap, { ok: true, data_b64: bytesToBase64(data) });
-        }
-        return writeJson(memory, outPtr, outCap, result);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
@@ -1871,28 +2371,48 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // Applies or reports socket option state owned by the kernel.
     // Request JSON: { fd, option, value? }
     // Response JSON: { ok: true, value? } or { ok: false, error }
-    host_socket_option(reqPtr: number, reqLen: number, outPtr: number, outCap: number): number {
+    host_socket_option(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== 'number') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'missing socket fd' });
+        if (typeof req.fd !== "number") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "missing socket fd",
+          });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== 'socket') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a socket fd: ${req.fd}` });
+        if (!target || target.type !== "socket") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `not a socket fd: ${req.fd}`,
+          });
         }
-        if (req.option !== 'no_delay') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `unsupported socket option: ${req.option}` });
+        if (req.option !== "no_delay") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `unsupported socket option: ${req.option}`,
+          });
         }
-        if (!('value' in req)) {
-          return writeJson(memory, outPtr, outCap, { ok: true, value: target.noDelay ? 1 : 0 });
+        if (!("value" in req)) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: true,
+            value: target.noDelay ? 1 : 0,
+          });
         }
-        if (typeof req.value !== 'boolean') {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: 'socket option value must be boolean' });
+        if (typeof req.value !== "boolean") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "socket option value must be boolean",
+          });
         }
         if (target.socket !== null) {
-          const result = target.setNoDelay?.(target.socket, req.value)
-            ?? { ok: false, error: 'TCP_NODELAY not supported by socket backend' };
+          const result = target.setNoDelay?.(target.socket, req.value) ??
+            { ok: false, error: "TCP_NODELAY not supported by socket backend" };
           if (!result.ok) return writeJson(memory, outPtr, outCap, result);
         }
         target.noDelay = req.value;
@@ -1910,9 +2430,9 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     host_socket_close(reqPtr: number, reqLen: number): number {
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== 'number') return -1;
+        if (typeof req.fd !== "number") return -1;
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== 'socket') return -1;
+        if (!target || target.type !== "socket") return -1;
         if (target.socket !== null) {
           if (!socketBackend) return -1;
           const socket = target.socket;
@@ -1920,7 +2440,9 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
           socketBackend.close(socket);
         }
         return opts.kernel?.closeFd(callerPid, req.fd) ? 0 : -1;
-      } catch { return -1; }
+      } catch {
+        return -1;
+      }
     },
 
     // ── Extensions (Python only — shell routes through host_spawn) ──
@@ -1932,8 +2454,10 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     // register extensions through SandboxOptions/ExtensionRegistry and keep
     // userland-specific protocols outside the kernel.
     async host_extension_invoke(
-      reqPtr: number, reqLen: number,
-      outPtr: number, outCap: number,
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
     ): Promise<number> {
       const reqJson = readString(memory, reqPtr, reqLen);
 
@@ -1950,7 +2474,7 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
             cwd?: string;
           };
 
-          const name = (req.name ?? req.extension ?? '') as string;
+          const name = (req.name ?? req.extension ?? "") as string;
 
           // Python kwargs arrive as `args: {args: [...], stdin: "...", ...}`.
           // Detect and unpack that shape; otherwise treat args as a string array.
@@ -1958,33 +2482,38 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
           let stdin: string;
           if (Array.isArray(req.args)) {
             args = req.args as string[];
-            stdin = req.stdin ?? '';
-          } else if (req.args && typeof req.args === 'object') {
+            stdin = req.stdin ?? "";
+          } else if (req.args && typeof req.args === "object") {
             const kw = req.args as Record<string, unknown>;
             args = Array.isArray(kw.args) ? (kw.args as string[]) : [];
-            stdin = typeof kw.stdin === 'string' ? kw.stdin : (req.stdin ?? '');
+            stdin = typeof kw.stdin === "string" ? kw.stdin : (req.stdin ?? "");
           } else {
             args = [];
-            stdin = req.stdin ?? '';
+            stdin = req.stdin ?? "";
           }
 
           const envObj: Record<string, string> = {};
-          if (req.env) for (const [k, v] of req.env) envObj[k] = v;
+          if (req.env) { for (const [k, v] of req.env) envObj[k] = v; }
           const cwd = req.cwd ?? getCallerCwd();
 
           const result = await opts.extensionRegistry.invoke(name, {
-            args, stdin, env: envObj, cwd,
+            args,
+            stdin,
+            env: envObj,
+            cwd,
           });
 
           return writeJson(memory, outPtr, outCap, {
             exit_code: result.exitCode,
-            stdout: result.stdout ?? '',
-            stderr: result.stderr ?? '',
+            stdout: result.stdout ?? "",
+            stderr: result.stderr ?? "",
           });
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
           return writeJson(memory, outPtr, outCap, {
-            exit_code: 1, stdout: '', stderr: `${msg}\n`,
+            exit_code: 1,
+            stdout: "",
+            stderr: `${msg}\n`,
           });
         }
       }
@@ -1998,42 +2527,59 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
           return writeJson(memory, outPtr, outCap, {
-            exit_code: 1, stdout: '', stderr: `${msg}\n`,
+            exit_code: 1,
+            stdout: "",
+            stderr: `${msg}\n`,
           });
         }
       }
 
       return writeJson(memory, outPtr, outCap, {
-        exit_code: 1, stdout: '', stderr: 'extensions not available\n',
+        exit_code: 1,
+        stdout: "",
+        stderr: "extensions not available\n",
       });
     },
 
     // host_run_command(req_ptr, req_len, out_ptr, out_cap) -> i32 (async/JSPI)
     // Runs a shell command and captures output. Used by Python _yurt.spawn().
     async host_run_command(
-      reqPtr: number, reqLen: number,
-      outPtr: number, outCap: number,
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
     ): Promise<number> {
       if (opts.runCommandHandler && opts.sandbox) {
         try {
-          const req = JSON.parse(readString(memory, reqPtr, reqLen)) as RunRequest;
-          const result = await opts.runCommandHandler(req, { sandbox: opts.sandbox });
+          const req = JSON.parse(
+            readString(memory, reqPtr, reqLen),
+          ) as RunRequest;
+          const result = await opts.runCommandHandler(req, {
+            sandbox: opts.sandbox,
+          });
           return writeJson(memory, outPtr, outCap, result);
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
           return writeJson(memory, outPtr, outCap, {
-            exit_code: 1, stdout: '', stderr: `${msg}\n`,
+            exit_code: 1,
+            stdout: "",
+            stderr: `${msg}\n`,
           });
         }
       }
       if (!opts.runCommand) {
         return writeJson(memory, outPtr, outCap, {
-          exit_code: 1, stdout: '', stderr: 'subprocess not available\n',
+          exit_code: 1,
+          stdout: "",
+          stderr: "subprocess not available\n",
         });
       }
       try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen)) as { cmd: string; stdin?: string };
-        const result = await opts.runCommand(req.cmd, req.stdin ?? '');
+        const req = JSON.parse(readString(memory, reqPtr, reqLen)) as {
+          cmd: string;
+          stdin?: string;
+        };
+        const result = await opts.runCommand(req.cmd, req.stdin ?? "");
         return writeJson(memory, outPtr, outCap, {
           exit_code: result.exitCode,
           stdout: result.stdout,
@@ -2042,7 +2588,9 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return writeJson(memory, outPtr, outCap, {
-          exit_code: 1, stdout: '', stderr: `${msg}\n`,
+          exit_code: 1,
+          stdout: "",
+          stderr: `${msg}\n`,
         });
       }
     },
@@ -2058,16 +2606,21 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       return Date.now() / 1000;
     },
 
-    host_stat(pathPtr: number, pathLen: number, outPtr: number, outCap: number): number {
+    host_stat(
+      pathPtr: number,
+      pathLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
       try {
         const s = opts.vfs.stat(path);
         return writeJson(memory, outPtr, outCap, {
           exists: true,
-          is_file: s.type === 'file',
-          is_dir: s.type === 'dir',
-          is_symlink: s.type === 'symlink',
+          is_file: s.type === "file",
+          is_dir: s.type === "dir",
+          is_symlink: s.type === "symlink",
           size: s.size,
           mode: s.permissions,
           mtime_ms: s.mtime ? s.mtime.getTime() : 0,
@@ -2077,7 +2630,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       }
     },
 
-    host_read_file(pathPtr: number, pathLen: number, outPtr: number, outCap: number): number {
+    host_read_file(
+      pathPtr: number,
+      pathLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
       try {
@@ -2088,7 +2646,13 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       }
     },
 
-    host_write_file(pathPtr: number, pathLen: number, dataPtr: number, dataLen: number, mode: number): number {
+    host_write_file(
+      pathPtr: number,
+      pathLen: number,
+      dataPtr: number,
+      dataLen: number,
+      mode: number,
+    ): number {
       if (!opts.vfs) return ERR_IO;
       const path = readString(memory, pathPtr, pathLen);
       const data = readBytes(memory, dataPtr, dataLen);
@@ -2112,11 +2676,16 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       }
     },
 
-    host_readdir(pathPtr: number, pathLen: number, outPtr: number, outCap: number): number {
+    host_readdir(
+      pathPtr: number,
+      pathLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
       try {
-        const entries = opts.vfs.readdir(path).map(e => e.name);
+        const entries = opts.vfs.readdir(path).map((e) => e.name);
         return writeJson(memory, outPtr, outCap, entries);
       } catch {
         return ERR_NOT_FOUND;
@@ -2170,28 +2739,49 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
         if (!authorized) return ERR_PERMISSION;
         return 0;
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : '';
-        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
-        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        const msg = e instanceof Error ? e.message : "";
+        if (msg.includes("ENOENT") || msg.includes("no such file")) {
+          return ERR_NOT_FOUND;
+        }
+        if (msg.includes("EACCES") || msg.includes("permission denied")) {
+          return ERR_PERMISSION;
+        }
         return ERR_IO;
       }
     },
 
-    host_chown(pathPtr: number, pathLen: number, uid: number, gid: number, followSymlinks: number): number {
+    host_chown(
+      pathPtr: number,
+      pathLen: number,
+      uid: number,
+      gid: number,
+      followSymlinks: number,
+    ): number {
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
       const path = resolveCwdPath(getCallerCwd(), rawPath);
       const targetUid = uid | 0;
       const targetGid = gid | 0;
-      const authorized = authorizeChown(path, targetUid, targetGid, followSymlinks !== 0);
+      const authorized = authorizeChown(
+        path,
+        targetUid,
+        targetGid,
+        followSymlinks !== 0,
+      );
       if (authorized !== 0) return authorized;
       try {
-        withVfsCallerCredentials(() => opts.vfs!.chown(path, targetUid, targetGid, followSymlinks !== 0));
+        withVfsCallerCredentials(() =>
+          opts.vfs!.chown(path, targetUid, targetGid, followSymlinks !== 0)
+        );
         return 0;
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : '';
-        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
-        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        const msg = e instanceof Error ? e.message : "";
+        if (msg.includes("ENOENT") || msg.includes("no such file")) {
+          return ERR_NOT_FOUND;
+        }
+        if (msg.includes("EACCES") || msg.includes("permission denied")) {
+          return ERR_PERMISSION;
+        }
         return ERR_IO;
       }
     },
@@ -2201,23 +2791,34 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       const targetUid = uid | 0;
       const targetGid = gid | 0;
       const target = opts.kernel.getFdTarget(callerPid, fd);
-      if (!target || target.type !== 'vfs_file') return ERR_NOT_FOUND;
+      if (!target || target.type !== "vfs_file") return ERR_NOT_FOUND;
       const path = target.fdTable.getPath(target.fd);
       if (!path) return ERR_NOT_FOUND;
       const authorized = authorizeChown(path, targetUid, targetGid);
       if (authorized !== 0) return authorized;
       try {
-        withVfsCallerCredentials(() => opts.vfs!.chown(path, targetUid, targetGid));
+        withVfsCallerCredentials(() =>
+          opts.vfs!.chown(path, targetUid, targetGid)
+        );
         return 0;
       } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : '';
-        if (msg.includes('ENOENT') || msg.includes('no such file')) return ERR_NOT_FOUND;
-        if (msg.includes('EACCES') || msg.includes('permission denied')) return ERR_PERMISSION;
+        const msg = e instanceof Error ? e.message : "";
+        if (msg.includes("ENOENT") || msg.includes("no such file")) {
+          return ERR_NOT_FOUND;
+        }
+        if (msg.includes("EACCES") || msg.includes("permission denied")) {
+          return ERR_PERMISSION;
+        }
         return ERR_IO;
       }
     },
 
-    host_glob(patternPtr: number, patternLen: number, outPtr: number, outCap: number): number {
+    host_glob(
+      patternPtr: number,
+      patternLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       if (!opts.vfs) return writeJson(memory, outPtr, outCap, []);
       const pattern = readString(memory, patternPtr, patternLen);
       try {
@@ -2227,7 +2828,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       }
     },
 
-    host_rename(fromPtr: number, fromLen: number, toPtr: number, toLen: number): number {
+    host_rename(
+      fromPtr: number,
+      fromLen: number,
+      toPtr: number,
+      toLen: number,
+    ): number {
       if (!opts.vfs) return ERR_IO;
       const from = readString(memory, fromPtr, fromLen);
       const to = readString(memory, toPtr, toLen);
@@ -2240,7 +2846,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       }
     },
 
-    host_symlink(targetPtr: number, targetLen: number, linkPtr: number, linkLen: number): number {
+    host_symlink(
+      targetPtr: number,
+      targetLen: number,
+      linkPtr: number,
+      linkLen: number,
+    ): number {
       if (!opts.vfs) return ERR_IO;
       const target = readString(memory, targetPtr, targetLen);
       const link = readString(memory, linkPtr, linkLen);
@@ -2252,7 +2863,12 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       }
     },
 
-    host_readlink(pathPtr: number, pathLen: number, outPtr: number, outCap: number): number {
+    host_readlink(
+      pathPtr: number,
+      pathLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
       try {
@@ -2262,13 +2878,18 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       }
     },
 
-    async host_register_tool(namePtr: number, nameLen: number, pathPtr: number, pathLen: number): Promise<number> {
+    async host_register_tool(
+      namePtr: number,
+      nameLen: number,
+      pathPtr: number,
+      pathLen: number,
+    ): Promise<number> {
       if (!opts.mgr || !opts.vfs) return ERR_IO;
       const name = readString(memory, namePtr, nameLen);
       const path = readString(memory, pathPtr, pathLen);
       try {
-        if (name.startsWith('__native__')) {
-          const moduleName = name.slice('__native__'.length);
+        if (name.startsWith("__native__")) {
+          const moduleName = name.slice("__native__".length);
           const wasmBytes = opts.vfs.readFile(path);
           await opts.mgr.registerNativeModule(moduleName, wasmBytes);
           return 0;
@@ -2281,14 +2902,15 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
     },
 
     host_read_command(outPtr: number, outCap: number): number {
-      void outPtr; void outCap;
+      void outPtr;
+      void outCap;
       return 0;
     },
 
     host_write_result(resultPtr: number, resultLen: number): void {
-      void resultPtr; void resultLen;
+      void resultPtr;
+      void resultLen;
     },
-
   };
 
   if (opts.threadsBackend) {
@@ -2299,8 +2921,10 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
       tb.join(tid)) as unknown as WebAssembly.ImportValue;
     imports.host_thread_detach = (async (tid: number) =>
       tb.detach(tid)) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_self = (() => tb.self()) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_yield = (async () => tb.yield_()) as unknown as WebAssembly.ImportValue;
+    imports.host_thread_self = (() =>
+      tb.self()) as unknown as WebAssembly.ImportValue;
+    imports.host_thread_yield = (async () =>
+      tb.yield_()) as unknown as WebAssembly.ImportValue;
     imports.host_mutex_lock = (async (mutexPtr: number) =>
       tb.mutexLock(mutexPtr)) as unknown as WebAssembly.ImportValue;
     imports.host_mutex_unlock = ((mutexPtr: number) =>
@@ -2318,7 +2942,9 @@ export function createKernelImports(opts: KernelImportsOptions): Record<string, 
   return imports;
 }
 
-function defaultImportResourceLimit(resource: number): { soft: number; hard: number } | null {
+function defaultImportResourceLimit(
+  resource: number,
+): { soft: number; hard: number } | null {
   switch (resource) {
     case 0:
     case 1:
