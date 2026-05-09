@@ -150,6 +150,13 @@ pub struct Process {
     pub stdout_buffer: Vec<u8>,
     /// Bytes this process has written to stderr (FdEntry::Stderr).
     pub stderr_buffer: Vec<u8>,
+    /// POSIX process group id. New processes inherit pgid==pid until
+    /// `setpgid` moves them; we approximate that here by initializing
+    /// to the pid on first observation (caller responsibility — the
+    /// dispatch handler primes it on first `getpgid`).
+    pub pgid: Pid,
+    /// POSIX session id. Same default-to-pid convention as `pgid`.
+    pub sid: Pid,
 }
 
 impl Default for Process {
@@ -164,6 +171,8 @@ impl Default for Process {
             stdin_eof: false,
             stdout_buffer: Vec::new(),
             stderr_buffer: Vec::new(),
+            pgid: 0,
+            sid: 0,
         }
     }
 }

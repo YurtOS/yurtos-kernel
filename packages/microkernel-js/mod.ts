@@ -80,6 +80,10 @@ export const METHOD = {
   SYS_WRITE: 0x1_0014,
   SYS_ISATTY: 0x1_0015,
   SYS_CLOCK_GETTIME: 0x1_0016,
+  SYS_GETPGID: 0x1_0017,
+  SYS_SETPGID: 0x1_0018,
+  SYS_GETSID: 0x1_0019,
+  SYS_SETSID: 0x1_001A,
 } as const;
 
 export const KERNEL_PID = 0;

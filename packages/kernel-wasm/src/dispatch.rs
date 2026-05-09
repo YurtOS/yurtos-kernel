@@ -60,6 +60,10 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_ISATTY => isatty(caller_pid, request),
         METHOD_SYS_CLOCK_GETTIME => clock_gettime(request, response),
         METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
+        METHOD_SYS_GETPGID => getpgid(caller_pid, request),
+        METHOD_SYS_SETPGID => setpgid(caller_pid, request),
+        METHOD_SYS_GETSID => getsid(caller_pid, request),
+        METHOD_SYS_SETSID => setsid(caller_pid),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -499,6 +503,73 @@ fn clock_gettime(request: &[u8], response: &mut [u8]) -> i64 {
         },
         _ => -(abi::EINVAL as i64),
     }
+}
+
+/// Return the target's pgid. POSIX: a pgid of 0 in *the request* means
+/// "the calling process". Per-pid pgid defaults to the pid itself on
+/// first observation — a freshly-spawned process is its own group leader
+/// until `setpgid` moves it.
+fn getpgid(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([target_arg]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = if target_arg == 0 { caller_pid } else { target_arg };
+    with_kernel(|k| {
+        let p = k.process_mut(target);
+        if p.pgid == 0 {
+            p.pgid = target;
+        }
+        p.pgid as i64
+    })
+}
+
+/// `setpgid(pid, pgid)`. pid==0 → caller; pgid==0 → target's pid (i.e.
+/// make the target a new group leader). Phase 2 has no permission /
+/// session-membership checks.
+fn setpgid(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([target_arg, pgid_arg]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = if target_arg == 0 { caller_pid } else { target_arg };
+    let new_pgid = if pgid_arg == 0 { target } else { pgid_arg };
+    with_kernel(|k| {
+        k.process_mut(target).pgid = new_pgid;
+    });
+    0
+}
+
+fn getsid(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([target_arg]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = if target_arg == 0 { caller_pid } else { target_arg };
+    with_kernel(|k| {
+        let p = k.process_mut(target);
+        if p.sid == 0 {
+            p.sid = target;
+        }
+        p.sid as i64
+    })
+}
+
+/// POSIX `setsid()`: the caller becomes a new session leader and a new
+/// process-group leader. Real POSIX returns EPERM if the caller is
+/// already a process-group leader (you must fork first). Phase 2 has
+/// no spawn yet, so we soften that to "EPERM if the caller has already
+/// successfully called setsid before" — first call from a fresh pid
+/// succeeds, repeat calls fail. Tracked via `sid != 0`: a fresh process
+/// has sid == 0 until either getsid (which lazily primes it) or setsid
+/// runs.
+fn setsid(caller_pid: u32) -> i64 {
+    with_kernel(|k| {
+        let p = k.process_mut(caller_pid);
+        if p.sid == caller_pid {
+            return -(abi::EPERM as i64);
+        }
+        p.sid = caller_pid;
+        p.pgid = caller_pid;
+        caller_pid as i64
+    })
 }
 
 fn now_realtime(response: &mut [u8]) -> i64 {
@@ -1245,6 +1316,90 @@ mod tests {
         assert_eq!(
             dispatch(METHOD_SYS_CLOCK_GETTIME, 1, &99_u32.to_le_bytes(), &mut buf),
             -(abi::EINVAL as i64)
+        );
+    }
+
+    #[test]
+    fn getpgid_self_defaults_to_caller_pid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // pid 7 with target 0 → "self"; default pgid lazily primes to pid.
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPGID, 7, &0_u32.to_le_bytes(), &mut []),
+            7
+        );
+    }
+
+    #[test]
+    fn setpgid_then_getpgid_round_trips() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&0_u32.to_le_bytes()); // target = self
+        req.extend_from_slice(&5_u32.to_le_bytes()); // new pgid
+        assert_eq!(dispatch(METHOD_SYS_SETPGID, 1, &req, &mut []), 0);
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPGID, 1, &0_u32.to_le_bytes(), &mut []),
+            5
+        );
+    }
+
+    #[test]
+    fn setpgid_pgid_zero_makes_target_a_group_leader() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&3_u32.to_le_bytes());
+        req.extend_from_slice(&0_u32.to_le_bytes()); // pgid 0 → target's pid
+        assert_eq!(dispatch(METHOD_SYS_SETPGID, 1, &req, &mut []), 0);
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPGID, 1, &3_u32.to_le_bytes(), &mut []),
+            3
+        );
+    }
+
+    #[test]
+    fn pgid_is_per_pid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // pid 1 default sees pgid 1; setting pid 2's pgid doesn't move pid 1.
+        let mut req = Vec::new();
+        req.extend_from_slice(&2_u32.to_le_bytes());
+        req.extend_from_slice(&99_u32.to_le_bytes());
+        dispatch(METHOD_SYS_SETPGID, 1, &req, &mut []);
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPGID, 1, &0_u32.to_le_bytes(), &mut []),
+            1
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPGID, 1, &2_u32.to_le_bytes(), &mut []),
+            99
+        );
+    }
+
+    #[test]
+    fn setsid_first_call_creates_session_then_repeats_eperm() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // First setsid from a fresh pid succeeds and returns the pid.
+        assert_eq!(dispatch(METHOD_SYS_SETSID, 9, &[], &mut []), 9);
+        // sid and pgid are now both 9.
+        assert_eq!(
+            dispatch(METHOD_SYS_GETSID, 9, &0_u32.to_le_bytes(), &mut []),
+            9
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPGID, 9, &0_u32.to_le_bytes(), &mut []),
+            9
+        );
+        // Second call → EPERM (already a session leader).
+        assert_eq!(
+            dispatch(METHOD_SYS_SETSID, 9, &[], &mut []),
+            -(abi::EPERM as i64)
+        );
+    }
+
+    #[test]
+    fn getsid_self_lazily_primes_to_caller_pid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(METHOD_SYS_GETSID, 11, &0_u32.to_le_bytes(), &mut []),
+            11
         );
     }
 

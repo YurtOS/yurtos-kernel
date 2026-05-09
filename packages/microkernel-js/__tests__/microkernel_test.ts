@@ -207,6 +207,40 @@ Deno.test("sys_extension_invoke forwards bytes through the registry", async () =
   );
 });
 
+Deno.test(
+  "process group + session syscalls round-trip through the trampoline",
+  async () => {
+    // Mirror of fixture_parity / kernel_wasm_trampoline equivalents on
+    // the wasmtime side. Each direct .syscall() call passes KERNEL_PID
+    // (0) as the caller, so we use an explicit non-zero target pid.
+    const mk = await freshMicrokernel();
+
+    const targetPid = 42;
+    const target = new Uint8Array(4);
+    new DataView(target.buffer).setUint32(0, targetPid, true);
+
+    // getpgid(42) lazily primes pgid to the target pid.
+    let { rc } = mk.syscall(METHOD.SYS_GETPGID, target, 0);
+    assertEquals(Number(rc), targetPid);
+
+    // setpgid(42, 99).
+    const setReq = new Uint8Array(8);
+    const setView = new DataView(setReq.buffer);
+    setView.setUint32(0, targetPid, true);
+    setView.setUint32(4, 99, true);
+    ({ rc } = mk.syscall(METHOD.SYS_SETPGID, setReq, 0));
+    assertEquals(Number(rc), 0);
+
+    // getpgid now reflects 99.
+    ({ rc } = mk.syscall(METHOD.SYS_GETPGID, target, 0));
+    assertEquals(Number(rc), 99);
+
+    // getsid(42) lazily primes sid independently.
+    ({ rc } = mk.syscall(METHOD.SYS_GETSID, target, 0));
+    assertEquals(Number(rc), targetPid);
+  },
+);
+
 Deno.test("microkernel direct syscalls use kernel pid 0", async () => {
   const mk = await freshMicrokernel();
   const { rc } = mk.syscall(METHOD.SYS_GETPID, new Uint8Array(0), 0);

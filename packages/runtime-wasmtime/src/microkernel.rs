@@ -67,6 +67,10 @@ mod sys_method_id {
     pub const WRITE: u32 = 0x1_0014;
     pub const ISATTY: u32 = 0x1_0015;
     pub const CLOCK_GETTIME: u32 = 0x1_0016;
+    pub const GETPGID: u32 = 0x1_0017;
+    pub const SETPGID: u32 = 0x1_0018;
+    pub const GETSID: u32 = 0x1_0019;
+    pub const SETSID: u32 = 0x1_001A;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -1130,6 +1134,37 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             } else {
                 rc as i32
             }
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_getpgid",
+        |mut caller: Caller<'_, UserState>, pid: i32| -> i32 {
+            forward_u32_arg(&mut caller, sys_method_id::GETPGID, pid as u32)
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_setpgid",
+        |mut caller: Caller<'_, UserState>, pid: i32, pgid: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(pid as u32).to_le_bytes());
+            req.extend_from_slice(&(pgid as u32).to_le_bytes());
+            forward_request_bytes(&mut caller, sys_method_id::SETPGID, &req) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_getsid",
+        |mut caller: Caller<'_, UserState>, pid: i32| -> i32 {
+            forward_u32_arg(&mut caller, sys_method_id::GETSID, pid as u32)
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_setsid",
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            forward_request_bytes(&mut caller, sys_method_id::SETSID, &[]) as i32
         },
     )?;
     Ok(())

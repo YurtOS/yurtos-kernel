@@ -149,6 +149,16 @@ export function buildSysImports(
     },
 
     sys_isatty: (fd) => forwardRequestBytes(METHOD.SYS_ISATTY, u32(fd)),
+    sys_getpgid: (pid) => forwardRequestBytes(METHOD.SYS_GETPGID, u32(pid)),
+    sys_setpgid: (pid, pgid) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, pid >>> 0, true);
+      view.setUint32(4, pgid >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_SETPGID, req);
+    },
+    sys_getsid: (pid) => forwardRequestBytes(METHOD.SYS_GETSID, u32(pid)),
+    sys_setsid: () => forwardRequestBytes(METHOD.SYS_SETSID, new Uint8Array(0)),
     sys_clock_gettime: (clockId, outPtr) => {
       const { rc, response } = forwardRequestWithResponse(
         METHOD.SYS_CLOCK_GETTIME,

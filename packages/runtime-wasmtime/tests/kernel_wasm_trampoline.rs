@@ -50,6 +50,10 @@ const METHOD_SYS_READ: u32 = 0x1_0013;
 const METHOD_SYS_WRITE: u32 = 0x1_0014;
 const METHOD_SYS_ISATTY: u32 = 0x1_0015;
 const METHOD_SYS_CLOCK_GETTIME: u32 = 0x1_0016;
+const METHOD_SYS_GETPGID: u32 = 0x1_0017;
+const METHOD_SYS_SETPGID: u32 = 0x1_0018;
+const METHOD_SYS_GETSID: u32 = 0x1_0019;
+const METHOD_SYS_SETSID: u32 = 0x1_001A;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -777,6 +781,10 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_EXTENSION_INVOKE,
             METHOD_SYS_EXTENSION_INVOKE as i64,
         ),
+        ("sys_getpgid", METHOD_SYS_GETPGID, METHOD_SYS_GETPGID as i64),
+        ("sys_setpgid", METHOD_SYS_SETPGID, METHOD_SYS_SETPGID as i64),
+        ("sys_getsid", METHOD_SYS_GETSID, METHOD_SYS_GETSID as i64),
+        ("sys_setsid", METHOD_SYS_SETSID, METHOD_SYS_SETSID as i64),
     ] {
         let entry = methods
             .get(name)
@@ -787,6 +795,42 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             "method.{name}: TOML says id={id}, code says id={method:#x}"
         );
     }
+}
+
+#[test]
+fn process_group_and_session_round_trip_through_trampoline() {
+    // Exercises the pgid/sid family end-to-end:
+    //   (1) getpgid(target=42) lazily primes pgid to the target pid,
+    //   (2) setpgid(target=42, pgid=99) reassigns,
+    //   (3) getsid(target=42) lazily primes sid to the target pid.
+    // KERNEL_PID is the caller for direct .syscall() calls, so we use
+    // an explicit non-zero target pid throughout.
+    let mk = fresh_microkernel(0);
+
+    // Default getpgid(42) → 42.
+    let rc = mk
+        .syscall(METHOD_SYS_GETPGID, &42_u32.to_le_bytes(), &mut [])
+        .unwrap();
+    assert_eq!(rc, 42, "lazy getpgid primes to target pid");
+
+    // setpgid(42, 99).
+    let mut req = Vec::new();
+    req.extend_from_slice(&42_u32.to_le_bytes());
+    req.extend_from_slice(&99_u32.to_le_bytes());
+    let rc = mk.syscall(METHOD_SYS_SETPGID, &req, &mut []).unwrap();
+    assert_eq!(rc, 0, "setpgid succeeds");
+
+    // getpgid now reflects 99.
+    let rc = mk
+        .syscall(METHOD_SYS_GETPGID, &42_u32.to_le_bytes(), &mut [])
+        .unwrap();
+    assert_eq!(rc, 99, "setpgid took effect across the trampoline");
+
+    // getsid(42) lazily primes to 42 (separate from pgid).
+    let rc = mk
+        .syscall(METHOD_SYS_GETSID, &42_u32.to_le_bytes(), &mut [])
+        .unwrap();
+    assert_eq!(rc, 42, "getsid lazy-primes independently of pgid");
 }
 
 #[test]

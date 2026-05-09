@@ -182,3 +182,23 @@ doc = "POSIX clock_gettime. Request bytes carry the u32 clock_id (0 = REALTIME, 
 id = 0x1_0010
 kind = "syscall"
 doc = "Forward an opaque request to the microkernel-side extension registry. The kernel acts as a byte courier; wire format is the registry's concern."
+
+[method.sys_getpgid]
+id = 0x1_0017
+kind = "syscall"
+doc = "POSIX getpgid(pid). Request bytes carry the u32 target pid (0 = self). Returns the target's process-group id (>=0) or -ESRCH for unknown pids. Process groups default to the pid itself until setpgid moves them."
+
+[method.sys_setpgid]
+id = 0x1_0018
+kind = "syscall"
+doc = "POSIX setpgid(pid, pgid). Request bytes carry two little-endian u32s: target pid (0 = self), new pgid (0 = use target pid). Phase 2 has no permission checks; security policy comes later. Returns 0 on success or -ESRCH for unknown target."
+
+[method.sys_getsid]
+id = 0x1_0019
+kind = "syscall"
+doc = "POSIX getsid(pid). Request bytes carry the u32 target pid (0 = self). Returns the target's session id (>=0) or -ESRCH for unknown pids. Sessions default to the pid itself until setsid creates a new one."
+
+[method.sys_setsid]
+id = 0x1_001A
+kind = "syscall"
+doc = "POSIX setsid(): make the calling process a new session leader. No request bytes. Sets sid = pgid = caller_pid. Returns the new sid on success, -EPERM if the caller is already a process-group leader (POSIX: a session leader cannot already lead a group)."
