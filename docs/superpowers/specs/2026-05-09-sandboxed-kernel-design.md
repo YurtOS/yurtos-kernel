@@ -65,6 +65,24 @@ module instantiated by the microkernel that imports `host_*` from
 `yurt_abi.toml`. The repo is mid-rename from the older "guest"
 terminology.)
 
+### Naming note: the user→kernel ABI is a syscall, not a host call
+
+Internally we name the user-facing operations `sys_*` (in
+`yurt_abi_methods.toml` and `kernel_dispatch` constants) because, in
+the sandboxed-kernel model, these calls land *inside kernel.wasm* —
+they are syscalls in the architectural sense. The microkernel sits
+between the calling process and the kernel, but it does not service
+the call.
+
+The legacy wasm import symbols in `yurt_abi.toml` are still spelled
+`host_*` for transitional binary compatibility with already-built
+userland (BusyBox, zsh, …); the microkernel maps each legacy `host_*`
+import to its `sys_*` method id when forwarding the trampoline call.
+**This compatibility is transitional only.** When the sandboxed-kernel
+migration completes, the wasm symbols are renamed to `sys_*`,
+userland is recompiled against the new names, the microkernel mapping
+goes away, and no `host_*` naming survives anywhere in the tree.
+
 Two ABI surfaces:
 
 - **User→Kernel** — `abi/contract/yurt_abi.toml`. Unchanged. The microkernel

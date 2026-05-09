@@ -28,7 +28,7 @@ const KH_NAMESPACE: &str = "kh";
 const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
 
-/// Microkernel-side handler for `host_extension_invoke`. Receives the
+/// Microkernel-side handler for `sys_extension_invoke`. Receives the
 /// opaque request bytes the calling process supplied; writes the
 /// response bytes into `response`. Returns bytes written or negated
 /// POSIX errno (e.g. `-ENOENT` if no handler matches).
@@ -46,6 +46,36 @@ impl ExtensionRegistry for EmptyExtensionRegistry {
     }
 }
 
+/// Microkernel-side sink for `kh_log` messages from kernel.wasm.
+/// Severity values mirror `LogSeverity` in the kernel: 0 = debug,
+/// 1 = info, 2 = warn, 3 = error.
+pub trait LogSink: Send + Sync {
+    fn emit(&self, severity: u32, message: &str);
+}
+
+/// Default log sink — drops everything. Embedders that want output
+/// supply their own (`StderrLogSink` works for native CLI hosts).
+pub struct DiscardLogSink;
+
+impl LogSink for DiscardLogSink {
+    fn emit(&self, _severity: u32, _message: &str) {}
+}
+
+/// Stderr log sink. Suitable for the wasmtime-native microkernel.
+pub struct StderrLogSink;
+
+impl LogSink for StderrLogSink {
+    fn emit(&self, severity: u32, message: &str) {
+        let label = match severity {
+            0 => "debug",
+            1 => "info",
+            2 => "warn",
+            _ => "error",
+        };
+        eprintln!("[kernel.wasm {label}] {message}");
+    }
+}
+
 /// State threaded through every wasmtime host callback.
 ///
 /// `now_realtime_ns` is a deterministic clock value used by the test
@@ -54,6 +84,7 @@ impl ExtensionRegistry for EmptyExtensionRegistry {
 pub struct HostState {
     pub now_realtime_ns: u64,
     pub extensions: Arc<dyn ExtensionRegistry>,
+    pub log_sink: Arc<dyn LogSink>,
 }
 
 impl Default for HostState {
@@ -61,6 +92,7 @@ impl Default for HostState {
         Self {
             now_realtime_ns: 0,
             extensions: Arc::new(EmptyExtensionRegistry),
+            log_sink: Arc::new(DiscardLogSink),
         }
     }
 }
@@ -175,6 +207,26 @@ fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 .is_err()
             {
                 return -(EFAULT as i32);
+            }
+            0
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_log",
+        |mut caller: Caller<'_, HostState>, severity: u32, msg_ptr: u32, msg_len: u32| -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -(EFAULT as i32),
+            };
+            let mut buf = vec![0u8; msg_len as usize];
+            if memory.read(&caller, msg_ptr as usize, &mut buf).is_err() {
+                return -(EFAULT as i32);
+            }
+            let sink = caller.data().log_sink.clone();
+            // Drop non-UTF8 silently — logging must never fail loudly.
+            if let Ok(s) = std::str::from_utf8(&buf) {
+                sink.emit(severity, s);
             }
             0
         },

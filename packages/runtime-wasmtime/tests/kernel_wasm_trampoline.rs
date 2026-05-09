@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use wasmtime::{Engine, Module};
 
 use yurt_runtime_wasmtime::microkernel::{
-    build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, Microkernel,
+    build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, LogSink, Microkernel,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -29,11 +29,12 @@ fn ensure_kernel_wasm_built() -> &'static PathBuf {
 const ENOSYS: i64 = 38;
 const METHOD_ECHO: u32 = 1;
 const METHOD_NOW_REALTIME: u32 = 2;
-const METHOD_HOST_GETUID: u32 = 0x1_0001;
-const METHOD_HOST_GETEUID: u32 = 0x1_0002;
-const METHOD_HOST_GETGID: u32 = 0x1_0003;
-const METHOD_HOST_GETEGID: u32 = 0x1_0004;
-const METHOD_HOST_EXTENSION_INVOKE: u32 = 0x1_0010;
+const METHOD_SYS_GETUID: u32 = 0x1_0001;
+const METHOD_SYS_GETEUID: u32 = 0x1_0002;
+const METHOD_SYS_GETGID: u32 = 0x1_0003;
+const METHOD_SYS_GETEGID: u32 = 0x1_0004;
+const METHOD_KERNEL_LOG_TEST: u32 = 3;
+const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
 fn fresh_microkernel(now_ns: u64) -> Microkernel {
     Microkernel::load(
@@ -89,6 +90,7 @@ fn kernel_wasm_imports_only_documented_kh_namespace() {
         imports,
         vec![
             ("kh".to_owned(), "kh_extension_invoke".to_owned()),
+            ("kh".to_owned(), "kh_log".to_owned()),
             ("kh".to_owned(), "kh_now_realtime".to_owned()),
         ]
     );
@@ -135,6 +137,48 @@ fn microkernel_serves_fresh_kh_value_each_dispatch() {
     assert_eq!(u64::from_le_bytes(response), 200);
 }
 
+/// Recording log sink — captures every message the kernel emits.
+struct RecordingLogSink {
+    messages: Mutex<Vec<(u32, String)>>,
+}
+
+impl LogSink for RecordingLogSink {
+    fn emit(&self, severity: u32, message: &str) {
+        self.messages
+            .lock()
+            .unwrap()
+            .push((severity, message.to_owned()));
+    }
+}
+
+#[test]
+fn kernel_log_test_emits_message_through_kh_log() {
+    // Validates kh_log end-to-end: kernel.wasm calls kh_log via the
+    // kernel-internal METHOD_KERNEL_LOG_TEST method; the microkernel
+    // routes the bytes to the configured LogSink. Future kernel-side
+    // diagnostics ride on this exact wire.
+    let sink = Arc::new(RecordingLogSink {
+        messages: Mutex::new(Vec::new()),
+    });
+    let mut mk = Microkernel::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            log_sink: sink.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let rc = mk.syscall(METHOD_KERNEL_LOG_TEST, &[], &mut []).unwrap();
+    assert_eq!(rc, 0);
+
+    let messages = sink.messages.lock().unwrap();
+    assert_eq!(messages.len(), 1);
+    let (severity, msg) = &messages[0];
+    assert_eq!(*severity, 1, "INFO severity"); // kh::LogSeverity::Info as u32
+    assert_eq!(msg, "kernel.wasm hello via kh_log");
+}
+
 /// Test extension that records every request it sees and returns a
 /// fixed response. Lets the test assert the kernel forwarded the
 /// caller's bytes verbatim and wrote back what the host returned.
@@ -153,9 +197,9 @@ impl ExtensionRegistry for EchoExtension {
 }
 
 #[test]
-fn host_extension_invoke_forwards_bytes_through_microkernel() {
+fn sys_extension_invoke_forwards_bytes_through_microkernel() {
     // Architectural test for the extension escape hatch:
-    //   user → kernel.wasm (METHOD_HOST_EXTENSION_INVOKE) → kh_extension_invoke
+    //   user → kernel.wasm (METHOD_SYS_EXTENSION_INVOKE) → kh_extension_invoke
     //                                                     → microkernel registry
     //                                                     → response back
     // The kernel is a byte courier; wire format (currently JSON) is
@@ -177,7 +221,7 @@ fn host_extension_invoke_forwards_bytes_through_microkernel() {
     let request = br#"{"name":"my_ext","args":["a","b"],"stdin":"","cwd":"/"}"#;
     let mut response = vec![0u8; 256];
     let written = mk
-        .syscall(METHOD_HOST_EXTENSION_INVOKE, request, &mut response)
+        .syscall(METHOD_SYS_EXTENSION_INVOKE, request, &mut response)
         .unwrap();
     assert!(written > 0, "extension wrote response: {written}");
 
@@ -195,13 +239,13 @@ fn host_extension_invoke_forwards_bytes_through_microkernel() {
 }
 
 #[test]
-fn host_extension_invoke_returns_negated_enoent_when_no_registry() {
+fn sys_extension_invoke_returns_negated_enoent_when_no_registry() {
     // Default registry is empty; -ENOENT propagates back through the
     // trampoline as a negative scalar.
     let mut mk = fresh_microkernel(0);
     let mut response = [0u8; 64];
     let rc = mk
-        .syscall(METHOD_HOST_EXTENSION_INVOKE, b"{}", &mut response)
+        .syscall(METHOD_SYS_EXTENSION_INVOKE, b"{}", &mut response)
         .unwrap();
     assert_eq!(rc, -2, "expected -ENOENT, got {rc}");
 }
@@ -230,22 +274,14 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             METHOD_NOW_REALTIME,
             METHOD_NOW_REALTIME as i64,
         ),
-        ("host_getuid", METHOD_HOST_GETUID, METHOD_HOST_GETUID as i64),
+        ("sys_getuid", METHOD_SYS_GETUID, METHOD_SYS_GETUID as i64),
+        ("sys_geteuid", METHOD_SYS_GETEUID, METHOD_SYS_GETEUID as i64),
+        ("sys_getgid", METHOD_SYS_GETGID, METHOD_SYS_GETGID as i64),
+        ("sys_getegid", METHOD_SYS_GETEGID, METHOD_SYS_GETEGID as i64),
         (
-            "host_geteuid",
-            METHOD_HOST_GETEUID,
-            METHOD_HOST_GETEUID as i64,
-        ),
-        ("host_getgid", METHOD_HOST_GETGID, METHOD_HOST_GETGID as i64),
-        (
-            "host_getegid",
-            METHOD_HOST_GETEGID,
-            METHOD_HOST_GETEGID as i64,
-        ),
-        (
-            "host_extension_invoke",
-            METHOD_HOST_EXTENSION_INVOKE,
-            METHOD_HOST_EXTENSION_INVOKE as i64,
+            "sys_extension_invoke",
+            METHOD_SYS_EXTENSION_INVOKE,
+            METHOD_SYS_EXTENSION_INVOKE as i64,
         ),
     ] {
         let entry = methods
@@ -266,10 +302,10 @@ fn credentials_syscalls_round_trip_through_trampoline() {
     // kernel's USER_UID/USER_GID = 1000 fallback.
     let mut mk = fresh_microkernel(0);
     for (name, method) in [
-        ("getuid", METHOD_HOST_GETUID),
-        ("geteuid", METHOD_HOST_GETEUID),
-        ("getgid", METHOD_HOST_GETGID),
-        ("getegid", METHOD_HOST_GETEGID),
+        ("getuid", METHOD_SYS_GETUID),
+        ("geteuid", METHOD_SYS_GETEUID),
+        ("getgid", METHOD_SYS_GETGID),
+        ("getegid", METHOD_SYS_GETEGID),
     ] {
         let rc = mk.syscall(method, &[], &mut []).unwrap();
         assert_eq!(rc, 1000, "{name} returns default 1000");

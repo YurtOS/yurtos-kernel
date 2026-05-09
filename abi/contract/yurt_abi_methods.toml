@@ -35,31 +35,45 @@ id = 2
 kind = "internal"
 doc = "Round-trip a kh_now_realtime call into the response buffer; validates kernel→host direction."
 
-# yurt_abi.toml syscall methods (0x1_0000+ range).
-# Each entry corresponds to a `[import.host_*]` declaration in yurt_abi.toml.
-# Methods land here as they get ported from the TS kernel into kernel.wasm.
+[method.kernel_log_test]
+id = 3
+kind = "internal"
+doc = "Emit a fixed log line via kh_log at INFO severity; validates the host log sink wiring."
 
-[method.host_getuid]
+# Syscall methods (0x1_0000+ range).
+#
+# These are the real user-process-facing syscalls — `sys_*` names match
+# the architectural reality (the call lands inside kernel.wasm). The
+# legacy wasm import symbols in `yurt_abi.toml` are still `host_*` for
+# binary compatibility with already-built userland (BusyBox, zsh, …);
+# the microkernel maps each legacy `host_*` import to its `sys_*`
+# method id when forwarding the trampoline call. A future sweep will
+# rename the wasm symbols and recompile userland.
+#
+# Methods land here as they get ported from the TS kernel into
+# kernel.wasm.
+
+[method.sys_getuid]
 id = 0x1_0001
 kind = "syscall"
 doc = "Real user id of the calling process."
 
-[method.host_geteuid]
+[method.sys_geteuid]
 id = 0x1_0002
 kind = "syscall"
 doc = "Effective user id of the calling process."
 
-[method.host_getgid]
+[method.sys_getgid]
 id = 0x1_0003
 kind = "syscall"
 doc = "Real group id of the calling process."
 
-[method.host_getegid]
+[method.sys_getegid]
 id = 0x1_0004
 kind = "syscall"
 doc = "Effective group id of the calling process."
 
-[method.host_extension_invoke]
+[method.sys_extension_invoke]
 id = 0x1_0010
 kind = "syscall"
 doc = "Forward an opaque request to the microkernel-side extension registry. The kernel acts as a byte courier; wire format is the registry's concern."

@@ -22,11 +22,15 @@ pub fn dispatch(method_id: u32, request: &[u8], response: &mut [u8]) -> i64 {
     match method_id {
         METHOD_KERNEL_ECHO => echo(request, response),
         METHOD_KERNEL_NOW_REALTIME => now_realtime(response),
-        METHOD_HOST_GETUID => Credentials::DEFAULT.uid as i64,
-        METHOD_HOST_GETEUID => Credentials::DEFAULT.euid as i64,
-        METHOD_HOST_GETGID => Credentials::DEFAULT.gid as i64,
-        METHOD_HOST_GETEGID => Credentials::DEFAULT.egid as i64,
-        METHOD_HOST_EXTENSION_INVOKE => kh::extension_invoke(request, response),
+        METHOD_KERNEL_LOG_TEST => {
+            kh::log(kh::LogSeverity::Info, "kernel.wasm hello via kh_log");
+            0
+        }
+        METHOD_SYS_GETUID => Credentials::DEFAULT.uid as i64,
+        METHOD_SYS_GETEUID => Credentials::DEFAULT.euid as i64,
+        METHOD_SYS_GETGID => Credentials::DEFAULT.gid as i64,
+        METHOD_SYS_GETEGID => Credentials::DEFAULT.egid as i64,
+        METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -69,10 +73,10 @@ mod tests {
 
     #[test]
     fn credentials_syscalls_return_default_uid_gid() {
-        assert_eq!(dispatch(METHOD_HOST_GETUID, &[], &mut []), 1000);
-        assert_eq!(dispatch(METHOD_HOST_GETEUID, &[], &mut []), 1000);
-        assert_eq!(dispatch(METHOD_HOST_GETGID, &[], &mut []), 1000);
-        assert_eq!(dispatch(METHOD_HOST_GETEGID, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETUID, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETEUID, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETGID, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETEGID, &[], &mut []), 1000);
     }
 
     #[test]
@@ -81,10 +85,10 @@ mod tests {
         for required in [
             "kernel_echo",
             "kernel_now_realtime",
-            "host_getuid",
-            "host_geteuid",
-            "host_getgid",
-            "host_getegid",
+            "sys_getuid",
+            "sys_geteuid",
+            "sys_getgid",
+            "sys_getegid",
         ] {
             assert!(
                 names.contains(&required),
