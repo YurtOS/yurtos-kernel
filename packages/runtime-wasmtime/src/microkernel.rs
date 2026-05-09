@@ -22,7 +22,6 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
-use wasmtime_wasi::pipe::MemoryOutputPipe;
 use wasmtime_wasi::preview1::WasiP1Ctx;
 use wasmtime_wasi::WasiCtxBuilder;
 
@@ -293,34 +292,20 @@ impl Microkernel {
     /// process is assigned a fresh pid (starting at `1`); future
     /// spawns increment.
     pub fn spawn_user_process(&self, wasm: &[u8]) -> Result<UserProcess> {
-        self.spawn_user_process_with_io(wasm, ProcessIo::default())
-    }
-
-    /// Spawn with custom stdin / stdout / stderr capture. Stdout and
-    /// stderr default to in-memory pipes you can read after the
-    /// process runs. Useful for fixture parity tests that assert on
-    /// captured output.
-    pub fn spawn_user_process_with_io(&self, wasm: &[u8], io: ProcessIo) -> Result<UserProcess> {
         let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
         let mut linker: Linker<UserState> = Linker::new(&self.engine);
         register_sys_imports(&mut linker)?;
-        wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |s: &mut UserState| &mut s.wasi)
-            .context("add WASI preview1 to user-process linker")?;
+        crate::wasi_shim::add_to_linker(&mut linker)
+            .context("install WASI preview1 shim on user-process linker")?;
 
         let mut next = self.next_pid.borrow_mut();
         let pid = *next;
         *next += 1;
         drop(next);
 
-        let mut wasi_builder = WasiCtxBuilder::new();
-        wasi_builder.stdout(io.stdout.clone());
-        wasi_builder.stderr(io.stderr.clone());
-        let wasi = wasi_builder.build_p1();
-
         let user_state = UserState {
             kernel: self.kernel.clone(),
             pid,
-            wasi,
         };
         let mut store = Store::new(&self.engine, user_state);
         let instance = linker
@@ -330,47 +315,41 @@ impl Microkernel {
             store,
             instance,
             pid,
-            stdout: io.stdout,
-            stderr: io.stderr,
         })
     }
-}
 
-/// I/O configuration for a spawned user process. By default both
-/// stdout and stderr are in-memory pipes the test can read after the
-/// process runs.
-pub struct ProcessIo {
-    pub stdout: MemoryOutputPipe,
-    pub stderr: MemoryOutputPipe,
-}
-
-impl Default for ProcessIo {
-    fn default() -> Self {
-        Self {
-            stdout: MemoryOutputPipe::new(64 * 1024),
-            stderr: MemoryOutputPipe::new(64 * 1024),
-        }
+    /// Reserved alias for [`spawn_user_process`]. The WASI preview1
+    /// shim routes user `fd_write` through `sys_write` and out via
+    /// `kh_log` to the configured `LogSink`, so per-process I/O
+    /// capture is best done through the `LogSink` for now. A future
+    /// revision plumbs per-process stream sinks here.
+    pub fn spawn_user_process_with_io(&self, wasm: &[u8], _io: ProcessIo) -> Result<UserProcess> {
+        self.spawn_user_process(wasm)
     }
 }
+
+/// Placeholder I/O config — kept for backwards compatibility with the
+/// initial fixture parity tests. Capture currently happens via
+/// `HostState.log_sink`; this struct will gain per-process sinks
+/// when the kernel-side stream registry lands.
+#[derive(Default)]
+pub struct ProcessIo;
 
 // ── User process ─────────────────────────────────────────────────────────────
 
 /// State threaded through every host callback during a user-process
-/// call. Carries (a) a shared reference to kernel.wasm so `sys_*`
-/// imports forward into `kernel_dispatch`, (b) the pid the kernel
-/// sees as the caller, and (c) a per-process WASI ctx so existing
-/// WASI-built fixtures run.
+/// call. Holds (a) a shared reference to kernel.wasm so `sys_*` and
+/// the WASI shim can forward into `kernel_dispatch`, and (b) the pid
+/// the kernel sees as the caller.
 ///
-/// Note on WASI: this is the *transitional* WASI integration —
-/// fixtures that call `fd_write` / `proc_exit` go through wasmtime-
-/// wasi directly, bypassing our `sys_*` layer. The end state is a
-/// thin wasi-shim that translates WASI → `sys_*` so fd_write to a
-/// pipe set up by `sys_pipe` works seamlessly. Until that lands,
-/// WASI sits *next to* `sys_*`, not on top of it.
+/// User processes do *not* get a `WasiP1Ctx`. WASI preview1 imports
+/// are satisfied by [`crate::wasi_shim`], which routes them through
+/// the kernel's `sys_*` syscalls. fd_write therefore lands in
+/// `kernel.wasm` rather than wasmtime-wasi, and once cross-process
+/// pipes work, `cmd1 | cmd2` is the same pipe object on both sides.
 pub struct UserState {
-    kernel: Arc<Mutex<KernelInstance>>,
-    pid: u32,
-    pub wasi: WasiP1Ctx,
+    pub kernel: Arc<Mutex<KernelInstance>>,
+    pub pid: u32,
 }
 
 /// A spawned user-process instance.
@@ -378,8 +357,6 @@ pub struct UserProcess {
     store: Store<UserState>,
     instance: wasmtime::Instance,
     pid: u32,
-    stdout: MemoryOutputPipe,
-    stderr: MemoryOutputPipe,
 }
 
 impl UserProcess {
@@ -405,24 +382,14 @@ impl UserProcess {
     }
 
     /// Run the standard WASI entry point (`_start`). Returns Ok(()) on
-    /// normal exit; a `proc_exit` from the guest surfaces as an error
-    /// carrying the exit code in the wasmtime trap.
+    /// normal exit; a `proc_exit` from the user surfaces as an error
+    /// (our shim traps via `anyhow!` from the `proc_exit` import).
     pub fn run_start(&mut self) -> Result<()> {
         let f = self
             .instance
             .get_typed_func::<(), ()>(&mut self.store, "_start")
             .context("user-process missing '_start' (not a WASI command)")?;
         f.call(&mut self.store, ()).context("user-process _start()")
-    }
-
-    /// Captured stdout written by the user process via WASI fd_write.
-    pub fn captured_stdout(&self) -> Vec<u8> {
-        self.stdout.contents().to_vec()
-    }
-
-    /// Captured stderr written by the user process via WASI fd_write.
-    pub fn captured_stderr(&self) -> Vec<u8> {
-        self.stderr.contents().to_vec()
     }
 
     /// Read `len` bytes from this user-process's exported `memory` at
@@ -439,6 +406,90 @@ impl UserProcess {
             .context("read user-process memory")?;
         Ok(buf)
     }
+}
+
+// ── Module-level trampoline helpers (used by both register_sys_imports
+//    and wasi_shim::add_to_linker) ──────────────────────────────────────────
+
+/// Forward a syscall whose request is `req_bytes` and which returns
+/// only a scalar (no response buffer to fill).
+///
+/// Used by:
+/// - `register_sys_imports` for the `sys_*` shims
+/// - `wasi_shim::add_to_linker` for `fd_write` / `fd_close`
+pub fn trampoline_request(
+    caller: &mut Caller<'_, UserState>,
+    method_id: u32,
+    req_bytes: &[u8],
+) -> i64 {
+    let pid = caller.data().pid;
+    let kernel = caller.data().kernel.clone();
+    let mut k = kernel.lock().unwrap();
+    let scratch_ptr = k.scratch_ptr;
+    let memory = k.memory;
+    let dispatch = k.dispatch.clone();
+    if !req_bytes.is_empty()
+        && memory
+            .write(&mut k.store, scratch_ptr as usize, req_bytes)
+            .is_err()
+    {
+        return -EFAULT;
+    }
+    match dispatch.call(
+        &mut k.store,
+        (method_id, pid, scratch_ptr, req_bytes.len() as u32, 0, 0),
+    ) {
+        Ok(rc) => rc,
+        Err(_) => -EFAULT,
+    }
+}
+
+/// Forward a syscall and copy the kernel's response into `response`.
+/// Returns the syscall scalar (e.g. bytes written by the kernel).
+pub fn trampoline_request_with_response(
+    caller: &mut Caller<'_, UserState>,
+    method_id: u32,
+    req_bytes: &[u8],
+    response: &mut [u8],
+) -> i64 {
+    let pid = caller.data().pid;
+    let kernel = caller.data().kernel.clone();
+    let mut k = kernel.lock().unwrap();
+    let scratch_ptr = k.scratch_ptr;
+    let scratch_len = k.scratch_len;
+    let kernel_memory = k.memory;
+    let dispatch = k.dispatch.clone();
+    let in_ptr = scratch_ptr;
+    let in_len = req_bytes.len() as u32;
+    let out_ptr = scratch_ptr + in_len;
+    let out_cap = (response.len() as u32).min(scratch_len.saturating_sub(in_len));
+
+    if !req_bytes.is_empty()
+        && kernel_memory
+            .write(&mut k.store, in_ptr as usize, req_bytes)
+            .is_err()
+    {
+        return -EFAULT;
+    }
+    let rc = match dispatch.call(
+        &mut k.store,
+        (method_id, pid, in_ptr, in_len, out_ptr, out_cap),
+    ) {
+        Ok(rc) => rc,
+        Err(_) => return -EFAULT,
+    };
+    if rc <= 0 {
+        return rc;
+    }
+    let to_copy = (rc as u32).min(out_cap) as usize;
+    if to_copy > 0
+        && kernel_memory
+            .read(&k.store, out_ptr as usize, &mut response[..to_copy])
+            .is_err()
+    {
+        return -EFAULT;
+    }
+    rc
 }
 
 // ── Linker registration ──────────────────────────────────────────────────────

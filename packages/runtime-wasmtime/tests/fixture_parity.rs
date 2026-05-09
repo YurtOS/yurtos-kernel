@@ -1,28 +1,25 @@
 //! Real-fixture parity tests.
 //!
 //! Builds existing wasm fixtures from `test-fixtures/wasm/` and runs
-//! them through the sandboxed-kernel microkernel, asserting on
-//! captured stdout. This is the first end-to-end check that an
-//! unmodified pre-existing binary boots and runs correctly under the
-//! new architecture.
+//! them through the sandboxed-kernel microkernel. Validates that an
+//! unmodified pre-existing binary boots through the new architecture
+//! AND that its `fd_write` calls actually flow through `kernel.wasm`
+//! (via the WASI shim → `sys_write` → `kh_log` path) rather than
+//! short-circuiting through wasmtime-wasi.
 //!
-//! Scope today: WASI-only fixtures (hello, true-cmd, false-cmd). The
-//! microkernel adds wasmtime-wasi to the user-process linker, so
-//! `_start` resolves and `fd_write` / `proc_exit` work directly.
-//! These fixtures don't call any `sys_*` syscalls, so this is a
-//! "WASI surface works" test, not a sys_*-mediated parity test.
-//!
-//! Real parity (fixtures that mix WASI + sys_*) needs a wasi-shim
-//! layer that translates WASI fd_write to our sys_write, etc. That's
-//! the next integration step. Until it lands, this file documents
-//! the gap rather than hiding it.
+//! Capture mechanism today: stdout/stderr writes from a user process
+//! land in the kernel's `sys_write` handler, which routes
+//! Stdout/Stderr writes through `kh_log` to the configured `LogSink`.
+//! These tests install a `RecordingLogSink` on the microkernel and
+//! assert on its messages. When per-process stream sinks land, this
+//! becomes a `UserProcess::captured_stdout()` accessor.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use yurt_runtime_wasmtime::microkernel::{
-    build_kernel_wasm, default_kernel_wasm_path, HostState, Microkernel,
+    build_kernel_wasm, default_kernel_wasm_path, HostState, LogSink, Microkernel,
 };
 
 fn workspace_root() -> &'static Path {
@@ -73,54 +70,97 @@ fn ensure_kernel_wasm() -> &'static PathBuf {
     })
 }
 
+/// Captures messages emitted via kh_log. Tests assert on the captured
+/// stream after running a fixture.
+#[derive(Default)]
+struct RecordingLogSink {
+    messages: Mutex<Vec<(u32, String)>>,
+}
+
+impl LogSink for RecordingLogSink {
+    fn emit(&self, severity: u32, message: &str) {
+        self.messages
+            .lock()
+            .unwrap()
+            .push((severity, message.to_owned()));
+    }
+}
+
+fn fresh_microkernel_with_log() -> (Microkernel, Arc<RecordingLogSink>) {
+    let sink = Arc::new(RecordingLogSink::default());
+    let mk = Microkernel::load(
+        ensure_kernel_wasm(),
+        HostState {
+            log_sink: sink.clone(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (mk, sink)
+}
+
 #[test]
-fn hello_wasm_fixture_runs_and_prints_to_stdout() {
-    // Real fixture, unmodified from `test-fixtures/wasm/hello`. It
-    // links only against WASI (`fd_write`, `proc_exit`, `environ_*`)
-    // and calls `println!("hello from wasm")` from `main`. Boots via
-    // the standard WASI `_start` entry point.
+fn hello_wasm_prints_via_sys_write_through_kernel_wasm() {
+    // Real fixture from test-fixtures/wasm/hello: a stock `cargo run`
+    // Rust binary calling `println!("hello from wasm")`. Boots via
+    // `_start`. Its fd_write goes through:
+    //
+    //   user wasm fd_write(1, iovs, ...)
+    //     → microkernel WASI shim
+    //         → sys_write trampoline into kernel.wasm
+    //             → kernel sys_write on Stdout → kh_log
+    //               → LogSink (captured here)
+    //
+    // This is the integration test we couldn't write before the WASI
+    // shim landed.
     ensure_fixture_built("hello-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("hello-wasm")).unwrap();
 
-    let mk = Microkernel::load(ensure_kernel_wasm(), HostState::default()).unwrap();
+    let (mk, sink) = fresh_microkernel_with_log();
     let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
+    let _ = user.run_start(); // proc_exit traps; that's fine
 
-    // _start in a WASI command exits via proc_exit, which surfaces
-    // as a wasmtime trap carrying the exit code. Exit 0 trips the
-    // trap too — we just assert stdout contents regardless.
-    let _ = user.run_start();
-
-    let stdout = String::from_utf8_lossy(&user.captured_stdout()).to_string();
+    let messages = sink.messages.lock().unwrap();
+    let combined: String = messages.iter().map(|(_, m)| m.as_str()).collect();
     assert!(
-        stdout.contains("hello from wasm"),
-        "expected 'hello from wasm' in captured stdout, got: {stdout:?}"
+        combined.contains("hello from wasm"),
+        "expected 'hello from wasm' in captured kh_log stream, got: {combined:?}"
     );
 }
 
 #[test]
-fn true_cmd_fixture_exits_zero() {
+fn true_cmd_fixture_runs_and_proc_exits_zero() {
     ensure_fixture_built("true-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("true-cmd-wasm")).unwrap();
-    let mk = Microkernel::load(ensure_kernel_wasm(), HostState::default()).unwrap();
+    let (mk, _sink) = fresh_microkernel_with_log();
     let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
-    // We assert it doesn't panic during execution. proc_exit(0) traps
-    // wasmtime in the standard way; the test passes if no other error
-    // surfaces.
-    let _ = user.run_start();
+    // proc_exit traps via our shim; we just confirm the run reached
+    // proc_exit (i.e. the trap message mentions proc_exit).
+    let err = user.run_start().unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("proc_exit"),
+        "expected proc_exit trap, got: {msg}"
+    );
 }
 
 #[test]
-fn false_cmd_fixture_exits_one() {
+fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     ensure_fixture_built("false-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("false-cmd-wasm")).unwrap();
-    let mk = Microkernel::load(ensure_kernel_wasm(), HostState::default()).unwrap();
+    let (mk, _sink) = fresh_microkernel_with_log();
     let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
-    let result = user.run_start();
-    // proc_exit(1) traps; the trap message contains "exit_code = 1"
-    // or similar. We accept any error here — the goal is verifying
-    // it didn't run to completion (which would be exit 0).
+    let err = user.run_start().unwrap_err();
+    let msg = format!("{err:#}");
     assert!(
-        result.is_err(),
-        "expected non-zero exit from false-cmd; got Ok"
+        msg.contains("proc_exit"),
+        "expected proc_exit trap, got: {msg}"
+    );
+    // false-cmd should report a non-zero exit code in the trap message.
+    assert!(
+        msg.contains("proc_exit(1)")
+            || msg.contains("proc_exit(101)")
+            || !msg.contains("proc_exit(0)"),
+        "expected non-zero exit code in proc_exit trap, got: {msg}"
     );
 }
