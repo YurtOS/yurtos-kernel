@@ -2336,6 +2336,16 @@ export function createKernelImports(
           const nbResult = socketBackend.recv(target.socket, maxBytes, {
             nonblocking: true,
           });
+          if (peek && nbResult.ok) {
+            const data = base64ToBytes(nbResult.data_b64 ?? "");
+            target.peekBuffer = target.peekBuffer
+              ? concatBytes(target.peekBuffer, data)
+              : data;
+            return writeJson(memory, outPtr, outCap, {
+              ok: true,
+              data_b64: bytesToBase64(data),
+            });
+          }
           return writeJson(memory, outPtr, outCap, nbResult);
         }
         return target.recvAsync(target.socket, maxBytes).then((result) => {

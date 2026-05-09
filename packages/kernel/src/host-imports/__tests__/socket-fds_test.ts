@@ -643,6 +643,98 @@ describe("socket fd host imports", () => {
     expect(requests).toEqual([]);
   });
 
+  it("preserves nonblocking host_socket_recv peeked bytes", () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    const kernel = new ProcessKernel();
+    const requests: Record<string, unknown>[] = [];
+    let backend: SocketBackend;
+    backend = {
+      connect: () => ({ ok: true, socket: 505 }),
+      send: () => ({ ok: true, bytes_sent: 0 }),
+      recv: (socket, maxBytes) => {
+        requests.push({ op: "recv", socket, maxBytes });
+        return { ok: true, data_b64: btoa("abc") };
+      },
+      close: () => ({ ok: true }),
+      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+      recvAsync: (socket, maxBytes) =>
+        Promise.resolve(backend.recv(socket, maxBytes)),
+    };
+    const imports = createKernelImports({
+      memory,
+      kernel,
+      socketBackend: backend,
+    });
+
+    const fd = (imports.host_socket_open as (...args: number[]) => number)(
+      2,
+      1,
+      0,
+    );
+    const connectReqLen = writeString(
+      memory,
+      16,
+      JSON.stringify({
+        fd,
+        host: "example.test",
+        port: 443,
+        tls: false,
+      }),
+    );
+    (imports.host_socket_connect as (...args: number[]) => number)(
+      16,
+      connectReqLen,
+      256,
+      4096,
+    );
+    const target = kernel.getFdTarget(0, fd);
+    expect(target?.type).toBe("socket");
+    if (!target || target.type !== "socket") {
+      throw new Error("expected socket fd target");
+    }
+    target.fdFlags = WASI_FDFLAGS_NONBLOCK;
+
+    const peekReqLen = writeString(
+      memory,
+      16,
+      JSON.stringify({
+        fd,
+        max_bytes: 3,
+        peek: true,
+      }),
+    );
+    const peekLen = (imports.host_socket_recv as (...args: number[]) => number)(
+      16,
+      peekReqLen,
+      512,
+      4096,
+    );
+    expect(readJson(memory, 512, peekLen)).toEqual({
+      ok: true,
+      data_b64: btoa("abc"),
+    });
+
+    const recvReqLen = writeString(
+      memory,
+      16,
+      JSON.stringify({
+        fd,
+        max_bytes: 3,
+      }),
+    );
+    const recvLen = (imports.host_socket_recv as (...args: number[]) => number)(
+      16,
+      recvReqLen,
+      512,
+      4096,
+    );
+    expect(readJson(memory, 512, recvLen)).toEqual({
+      ok: true,
+      data_b64: btoa("abc"),
+    });
+    expect(requests).toEqual([{ op: "recv", socket: 505, maxBytes: 3 }]);
+  });
+
   it("accepts a listener connection and allocates a connected socket fd", async () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
