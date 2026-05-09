@@ -75,18 +75,17 @@ export interface SocketBackend {
   /** Polls for one accepted socket. Must not block the bridge request loop. */
   accept?(listener: SocketListenerHandle): SocketAcceptBackendResult;
   /**
-   * Suspend until a connection is available. The single accept path
-   * for the kernel host import — drives JSPI/Asyncify suspension so
-   * the guest's blocking accept(2) doesn't busy-poll.
+   * Optional blocking accept path. Backends that omit this fall back to
+   * accept(), preserving older connect-only/mock implementations.
    */
-  acceptAsync(
+  acceptAsync?(
     listener: SocketListenerHandle,
   ): Promise<SocketAcceptBackendResult>;
   /**
-   * Suspend until at least one byte (or EOF) is available. The single
-   * blocking-recv path for the kernel host import.
+   * Optional blocking recv path. Backends that omit this fall back to
+   * recv(..., { nonblocking: false }).
    */
-  recvAsync(
+  recvAsync?(
     socket: SocketHandle,
     maxBytes: number,
   ): Promise<SocketBackendResult>;
@@ -145,6 +144,26 @@ function socketResult(
       ? result.error
       : "socket operation failed",
   };
+}
+
+export function recvSocketAsync(
+  backend: SocketBackend,
+  socket: SocketHandle,
+  maxBytes: number,
+): Promise<SocketBackendResult> {
+  return backend.recvAsync?.(socket, maxBytes) ??
+    Promise.resolve(backend.recv(socket, maxBytes, { nonblocking: false }));
+}
+
+export function acceptSocketAsync(
+  backend: SocketBackend,
+  listener: SocketListenerHandle,
+): Promise<SocketAcceptBackendResult> {
+  if (backend.acceptAsync) return backend.acceptAsync(listener);
+  return Promise.resolve(
+    backend.accept?.(listener) ??
+      { ok: false, error: "accept: invalid listener" },
+  );
 }
 
 /**
@@ -231,7 +250,7 @@ export function createLoopbackSocketBackend(
           : { ok: false, error: r.error };
       }
       if (!delegate) return { ok: false, error: "recv: invalid socket" };
-      return delegate.recvAsync(socket, maxBytes);
+      return recvSocketAsync(delegate, socket, maxBytes);
     },
 
     setNoDelay(socket, enabled) {
@@ -280,8 +299,8 @@ export function createLoopbackSocketBackend(
           };
         }
       }
-      return delegate?.acceptAsync(listener) ??
-        { ok: false, error: "accept: invalid listener" };
+      if (!delegate) return { ok: false, error: "accept: invalid listener" };
+      return acceptSocketAsync(delegate, listener);
     },
 
     closeListener(listener) {

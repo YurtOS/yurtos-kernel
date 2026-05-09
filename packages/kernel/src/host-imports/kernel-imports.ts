@@ -27,8 +27,10 @@ import type {
   SocketPortMapping,
 } from "../network/socket-backend.js";
 import {
+  acceptSocketAsync,
   createLoopbackSocketBackend,
   createNetworkBridgeSocketBackend,
+  recvSocketAsync,
 } from "../network/socket-backend.js";
 import type { ExtensionRegistry } from "../extension/registry.js";
 import type { NativeModuleRegistry } from "../process/native-modules.js";
@@ -1951,8 +1953,12 @@ export function createKernelImports(
           socketBackend?.recv(socket, maxBytes, recvOpts) ??
             { ok: false, error: "networking not configured" },
         recvAsync: (socket, maxBytes) =>
-          socketBackend?.recvAsync(socket, maxBytes) ??
-            Promise.resolve({ ok: false, error: "networking not configured" }),
+          socketBackend
+            ? recvSocketAsync(socketBackend, socket, maxBytes)
+            : Promise.resolve({
+              ok: false,
+              error: "networking not configured",
+            }),
         setNoDelay: (socket, enabled) =>
           socketBackend?.setNoDelay?.(socket, enabled) ??
             { ok: false, error: "TCP_NODELAY not supported by socket backend" },
@@ -2159,8 +2165,11 @@ export function createKernelImports(
             error: `not a listening socket fd: ${req.fd}`,
           });
         }
-        // Suspend the host import via JSPI/Asyncify until a peer connects.
-        const accepted = await socketBackend.acceptAsync(target.listener);
+        // Prefer backend suspension; legacy backends fall back to accept().
+        const accepted = await acceptSocketAsync(
+          socketBackend,
+          target.listener,
+        );
         if (!accepted.ok) return writeJson(memory, outPtr, outCap, accepted);
         if (!opts.kernel) {
           return writeJson(memory, outPtr, outCap, {
@@ -2178,7 +2187,8 @@ export function createKernelImports(
           localPort: accepted.localPort,
           send: socketBackend.send.bind(socketBackend),
           recv: socketBackend.recv.bind(socketBackend),
-          recvAsync: socketBackend.recvAsync?.bind(socketBackend),
+          recvAsync: (socket, maxBytes) =>
+            recvSocketAsync(socketBackend, socket, maxBytes),
           setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
           close: (socket) => {
             socketBackend.close(socket);
