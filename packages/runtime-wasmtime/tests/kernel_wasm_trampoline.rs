@@ -49,7 +49,7 @@ fn fresh_microkernel(now_ns: u64) -> Microkernel {
 
 #[test]
 fn unknown_method_returns_negated_enosys() {
-    let mut mk = fresh_microkernel(0);
+    let mk = fresh_microkernel(0);
     let rc = mk.syscall(0xDEAD_BEEF, &[], &mut []).unwrap();
     assert_eq!(rc, -ENOSYS);
 }
@@ -101,7 +101,7 @@ fn microkernel_round_trips_request_and_response_through_kernel_memory() {
     // Memory-mediated trampoline: ECHO copies request → response in
     // kernel memory; the microkernel reads it back. Architectural
     // primitive every variable-size syscall builds on.
-    let mut mk = fresh_microkernel(0);
+    let mk = fresh_microkernel(0);
     let request = b"trampoline-validates-the-architecture";
     let mut response = vec![0xAA_u8; request.len()];
     let rc = mk.syscall(METHOD_ECHO, request, &mut response).unwrap();
@@ -115,7 +115,7 @@ fn microkernel_serves_kh_call_during_kernel_dispatch() {
     // microkernel via kh_now_realtime; the host serves the value out
     // of HostState; the kernel writes it into the response.
     let now_ns: u64 = 1_715_000_000_000_000_000;
-    let mut mk = fresh_microkernel(now_ns);
+    let mk = fresh_microkernel(now_ns);
     let mut response = [0u8; 8];
     let rc = mk.syscall(METHOD_NOW_REALTIME, &[], &mut response).unwrap();
     assert_eq!(rc, 8);
@@ -126,7 +126,7 @@ fn microkernel_serves_kh_call_during_kernel_dispatch() {
 fn microkernel_serves_fresh_kh_value_each_dispatch() {
     // The kernel must not cache the kh result. Mutating HostState
     // between dispatches changes the response.
-    let mut mk = fresh_microkernel(100);
+    let mk = fresh_microkernel(100);
     let mut response = [0u8; 8];
 
     mk.syscall(METHOD_NOW_REALTIME, &[], &mut response).unwrap();
@@ -160,7 +160,7 @@ fn kernel_log_test_emits_message_through_kh_log() {
     let sink = Arc::new(RecordingLogSink {
         messages: Mutex::new(Vec::new()),
     });
-    let mut mk = Microkernel::load(
+    let mk = Microkernel::load(
         ensure_kernel_wasm_built(),
         HostState {
             log_sink: sink.clone(),
@@ -209,7 +209,7 @@ fn sys_extension_invoke_forwards_bytes_through_microkernel() {
         last_request: Mutex::new(Vec::new()),
         response: br#"{"exit_code":0,"stdout":"hello from extension\n","stderr":""}"#.to_vec(),
     });
-    let mut mk = Microkernel::load(
+    let mk = Microkernel::load(
         ensure_kernel_wasm_built(),
         HostState {
             extensions: registry.clone(),
@@ -242,12 +242,56 @@ fn sys_extension_invoke_forwards_bytes_through_microkernel() {
 fn sys_extension_invoke_returns_negated_enoent_when_no_registry() {
     // Default registry is empty; -ENOENT propagates back through the
     // trampoline as a negative scalar.
-    let mut mk = fresh_microkernel(0);
+    let mk = fresh_microkernel(0);
     let mut response = [0u8; 64];
     let rc = mk
         .syscall(METHOD_SYS_EXTENSION_INVOKE, b"{}", &mut response)
         .unwrap();
     assert_eq!(rc, -2, "expected -ENOENT, got {rc}");
+}
+
+#[test]
+fn user_process_calls_kernel_through_full_trampoline() {
+    // The whole architecture, end to end, in one test:
+    //
+    //   user.wasm calls host_getuid (legacy import name)
+    //     → microkernel forwards to kernel.wasm via kernel_dispatch
+    //         → kernel handles METHOD_SYS_GETUID, returns 1000
+    //     ← microkernel writes scalar back into user.wasm
+    //   user.wasm receives 1000 and returns it from `run`
+    //
+    // No previous test actually instantiated a user-process wasm.
+    // This is the missing architectural piece.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+
+    let user_wat = r#"
+        (module
+          (import "env" "host_getuid" (func $host_getuid (result i32)))
+          (func (export "run") (result i32)
+            (call $host_getuid)))
+    "#;
+    let user_wasm = wat::parse_str(user_wat).unwrap();
+    let mut user = mk.spawn_user_process(&user_wasm).unwrap();
+
+    let rc = user.call_run().unwrap();
+    assert_eq!(rc, 1000, "user-process saw uid 1000 from kernel.wasm");
+}
+
+#[test]
+fn user_process_can_call_kernel_multiple_times() {
+    // The Rc<RefCell<KernelInstance>> sharing pattern must support
+    // repeated borrow_mut acquisitions without deadlock or panic.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "host_getuid" (func $host_getuid (result i32)))
+          (import "env" "host_getgid" (func $host_getgid (result i32)))
+          (func (export "run") (result i32)
+            (i32.add (call $host_getuid) (call $host_getgid))))
+    "#;
+    let user_wasm = wat::parse_str(user_wat).unwrap();
+    let mut user = mk.spawn_user_process(&user_wasm).unwrap();
+    assert_eq!(user.call_run().unwrap(), 2000, "uid + gid = 1000 + 1000");
 }
 
 #[test]
@@ -300,7 +344,7 @@ fn credentials_syscalls_round_trip_through_trampoline() {
     // First user-facing syscall family. Pure scalar return; no memory
     // copies. With no process kernel yet, all four resolve to the TS
     // kernel's USER_UID/USER_GID = 1000 fallback.
-    let mut mk = fresh_microkernel(0);
+    let mk = fresh_microkernel(0);
     for (name, method) in [
         ("getuid", METHOD_SYS_GETUID),
         ("geteuid", METHOD_SYS_GETEUID),

@@ -1,11 +1,13 @@
 //! Sandboxed-kernel microkernel skeleton.
 //!
 //! Loads `yurt-kernel-wasm` (compiled to `wasm32-wasip1`) into a
-//! wasmtime engine, satisfies the documented `kh_*` import surface, and
-//! forwards user-syscall requests into `kernel_dispatch`. This is the
-//! rails-only version that future packages will sit on top of:
+//! wasmtime engine, satisfies the documented `kh_*` import surface,
+//! and forwards user-syscall requests into `kernel_dispatch`. Also
+//! spawns user processes into separate stores whose `host_*` imports
+//! are wired back through the kernel.
 //!
-//! - `packages/microkernel-wasmtime` (this code, eventually extracted)
+//! Eventually extracted into:
+//! - `packages/microkernel-wasmtime` (this code)
 //! - `packages/microkernel-browser` (JSPI/asyncify)
 //! - `packages/microkernel-deno` (debug)
 //!
@@ -13,8 +15,10 @@
 //! `kernel_dispatch` is a supported backend — see
 //! `docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md`.
 
+use std::cell::{RefCell, RefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -23,10 +27,29 @@ use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
 /// Fully-qualified path of the `kh_*` import namespace.
 const KH_NAMESPACE: &str = "kh";
 
+/// Module name user processes import their syscalls from. Default for
+/// C / Rust `extern "C"` declarations without an explicit
+/// `#[link(wasm_import_module = …)]`.
+const SYS_NAMESPACE: &str = "env";
+
 /// POSIX errno values referenced by the trampoline. Mirrors
 /// `abi/contract/yurt_abi.toml`.
 const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
+
+/// Method ids that the user-process linker forwards. Generated
+/// constants live inside `yurt-kernel-wasm`'s build artifact, not in
+/// the host crate, so we mirror the ones we forward here. Drift is
+/// caught by the `microkernel_method_ids_match_yurt_abi_methods_toml`
+/// trampoline test.
+mod sys_method_id {
+    pub const GETUID: u32 = 0x1_0001;
+    pub const GETEUID: u32 = 0x1_0002;
+    pub const GETGID: u32 = 0x1_0003;
+    pub const GETEGID: u32 = 0x1_0004;
+}
+
+// ── Host-side traits embedders implement ─────────────────────────────────────
 
 /// Microkernel-side handler for `sys_extension_invoke`. Receives the
 /// opaque request bytes the calling process supplied; writes the
@@ -53,15 +76,12 @@ pub trait LogSink: Send + Sync {
     fn emit(&self, severity: u32, message: &str);
 }
 
-/// Default log sink — drops everything. Embedders that want output
-/// supply their own (`StderrLogSink` works for native CLI hosts).
 pub struct DiscardLogSink;
 
 impl LogSink for DiscardLogSink {
     fn emit(&self, _severity: u32, _message: &str) {}
 }
 
-/// Stderr log sink. Suitable for the wasmtime-native microkernel.
 pub struct StderrLogSink;
 
 impl LogSink for StderrLogSink {
@@ -76,11 +96,8 @@ impl LogSink for StderrLogSink {
     }
 }
 
-/// State threaded through every wasmtime host callback.
-///
-/// `now_realtime_ns` is a deterministic clock value used by the test
-/// microkernel and any embedder that wants to inject time. Real
-/// production microkernels read the host clock instead.
+/// State threaded through every wasmtime host callback that runs
+/// during kernel.wasm execution.
 pub struct HostState {
     pub now_realtime_ns: u64,
     pub extensions: Arc<dyn ExtensionRegistry>,
@@ -97,9 +114,12 @@ impl Default for HostState {
     }
 }
 
-/// A loaded kernel.wasm instance plus the typed handles the microkernel
-/// uses to drive it.
-pub struct Microkernel {
+// ── Kernel instance: the loaded kernel.wasm + its wasmtime handles ─────────
+
+/// The loaded kernel.wasm plus the typed handles needed to drive it.
+/// Kept behind `Rc<RefCell<…>>` so that both the [`Microkernel`] and
+/// any spawned [`UserProcess`] can call into it.
+pub struct KernelInstance {
     store: Store<HostState>,
     memory: Memory,
     scratch_ptr: u32,
@@ -107,51 +127,9 @@ pub struct Microkernel {
     dispatch: TypedFunc<(u32, u32, u32, u32, u32), i64>,
 }
 
-impl Microkernel {
-    /// Load `kernel.wasm` from `path` into a fresh wasmtime engine and
-    /// instantiate it with the documented `kh_*` import surface.
-    pub fn load(path: &Path, host_state: HostState) -> Result<Self> {
-        let wasm = std::fs::read(path)
-            .with_context(|| format!("read kernel.wasm at {}", path.display()))?;
-        let engine = Engine::default();
-        let module = Module::new(&engine, &wasm).context("compile kernel.wasm")?;
-
-        let mut linker: Linker<HostState> = Linker::new(&engine);
-        register_kh_imports(&mut linker)?;
-
-        let mut store = Store::new(&engine, host_state);
-        let instance = linker
-            .instantiate(&mut store, &module)
-            .context("instantiate kernel.wasm")?;
-
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| anyhow!("kernel.wasm missing 'memory' export"))?;
-        let scratch_ptr = instance
-            .get_typed_func::<(), u32>(&mut store, "kernel_scratch_ptr")?
-            .call(&mut store, ())?;
-        let scratch_len = instance
-            .get_typed_func::<(), u32>(&mut store, "kernel_scratch_len")?
-            .call(&mut store, ())?;
-        let dispatch = instance
-            .get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_dispatch")?;
-
-        Ok(Self {
-            store,
-            memory,
-            scratch_ptr,
-            scratch_len,
-            dispatch,
-        })
-    }
-
-    /// Invoke a kernel syscall via the trampoline.
-    ///
-    /// `request` is staged into kernel-side scratch memory and passed
-    /// to `kernel_dispatch`; the kernel writes its response into a
-    /// disjoint slice of the same scratch region, which the
-    /// microkernel reads back into `response`. Returns the syscall
-    /// scalar (`>= 0` success / `< 0` negated POSIX errno).
+impl KernelInstance {
+    /// Run a syscall. Stages `request` in the kernel scratch buffer,
+    /// invokes `kernel_dispatch`, copies the response back out.
     pub fn syscall(&mut self, method_id: u32, request: &[u8], response: &mut [u8]) -> Result<i64> {
         if request.len() + response.len() > self.scratch_len as usize {
             return Err(anyhow!(
@@ -184,13 +162,120 @@ impl Microkernel {
         }
         Ok(rc)
     }
+}
 
-    /// Mutable host state for tests / embedders that need to mutate
-    /// values served back to the kernel between syscalls.
-    pub fn host_state_mut(&mut self) -> &mut HostState {
-        self.store.data_mut()
+// ── Microkernel: orchestrates the kernel and user processes ───────────────
+
+pub struct Microkernel {
+    engine: Engine,
+    kernel: Rc<RefCell<KernelInstance>>,
+}
+
+impl Microkernel {
+    /// Load `kernel.wasm` from `path` into a fresh wasmtime engine and
+    /// instantiate it with the documented `kh_*` import surface.
+    pub fn load(path: &Path, host_state: HostState) -> Result<Self> {
+        let wasm = std::fs::read(path)
+            .with_context(|| format!("read kernel.wasm at {}", path.display()))?;
+        let engine = Engine::default();
+        let module = Module::new(&engine, &wasm).context("compile kernel.wasm")?;
+
+        let mut linker: Linker<HostState> = Linker::new(&engine);
+        register_kh_imports(&mut linker)?;
+
+        let mut store = Store::new(&engine, host_state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .context("instantiate kernel.wasm")?;
+
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| anyhow!("kernel.wasm missing 'memory' export"))?;
+        let scratch_ptr = instance
+            .get_typed_func::<(), u32>(&mut store, "kernel_scratch_ptr")?
+            .call(&mut store, ())?;
+        let scratch_len = instance
+            .get_typed_func::<(), u32>(&mut store, "kernel_scratch_len")?
+            .call(&mut store, ())?;
+        let dispatch = instance
+            .get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_dispatch")?;
+
+        let kernel = KernelInstance {
+            store,
+            memory,
+            scratch_ptr,
+            scratch_len,
+            dispatch,
+        };
+        Ok(Self {
+            engine,
+            kernel: Rc::new(RefCell::new(kernel)),
+        })
+    }
+
+    /// Invoke a kernel syscall directly (no user process). Useful for
+    /// tests and for operations that originate inside the microkernel
+    /// itself.
+    pub fn syscall(&self, method_id: u32, request: &[u8], response: &mut [u8]) -> Result<i64> {
+        self.kernel
+            .borrow_mut()
+            .syscall(method_id, request, response)
+    }
+
+    /// Mutable view of the host state served to kernel.wasm. Returns a
+    /// `RefMut` that derefs to `&mut HostState`.
+    pub fn host_state_mut(&self) -> RefMut<'_, HostState> {
+        RefMut::map(self.kernel.borrow_mut(), |k| k.store.data_mut())
+    }
+
+    /// Compile and instantiate a user process whose `host_*` imports
+    /// are forwarded back into the kernel via the trampoline.
+    pub fn spawn_user_process(&self, wasm: &[u8]) -> Result<UserProcess> {
+        let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
+        let mut linker: Linker<UserState> = Linker::new(&self.engine);
+        register_sys_imports(&mut linker)?;
+
+        let user_state = UserState {
+            kernel: self.kernel.clone(),
+        };
+        let mut store = Store::new(&self.engine, user_state);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .context("instantiate user-process wasm")?;
+        Ok(UserProcess { store, instance })
     }
 }
+
+// ── User process ─────────────────────────────────────────────────────────────
+
+/// State threaded through every host callback that runs during a
+/// user-process call. Holds a shared reference to the kernel so
+/// `host_*` imports can forward into `kernel_dispatch`.
+pub struct UserState {
+    kernel: Rc<RefCell<KernelInstance>>,
+}
+
+/// A spawned user-process instance.
+pub struct UserProcess {
+    store: Store<UserState>,
+    instance: wasmtime::Instance,
+}
+
+impl UserProcess {
+    /// Invoke an exported `() -> i32` function. The convention for
+    /// trampoline tests is a `run() -> i32` export that returns the
+    /// scalar result of a single syscall; richer entry points come
+    /// later.
+    pub fn call_run(&mut self) -> Result<i32> {
+        let f = self
+            .instance
+            .get_typed_func::<(), i32>(&mut self.store, "run")
+            .context("user-process missing 'run() -> i32' export")?;
+        f.call(&mut self.store, ()).context("user-process run()")
+    }
+}
+
+// ── Linker registration ──────────────────────────────────────────────────────
 
 fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
@@ -224,7 +309,6 @@ fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return -(EFAULT as i32);
             }
             let sink = caller.data().log_sink.clone();
-            // Drop non-UTF8 silently — logging must never fail loudly.
             if let Ok(s) = std::str::from_utf8(&buf) {
                 sink.emit(severity, s);
             }
@@ -244,9 +328,6 @@ fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 Some(m) => m,
                 None => return -EFAULT,
             };
-            // Copy the request out of kernel memory so the host
-            // handler doesn't borrow from the same Caller we need to
-            // re-borrow for the response write.
             let mut request = vec![0u8; req_len as usize];
             if memory
                 .read(&caller, req_ptr as usize, &mut request)
@@ -276,9 +357,47 @@ fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
     Ok(())
 }
 
-/// Workspace-relative location of the built `yurt-kernel-wasm`
-/// artifact. The microkernel doesn't build it — embedders that want a
-/// build-on-demand should call [`build_kernel_wasm`] first.
+/// Wires the `host_*` import surface user processes link against. Each
+/// import forwards into `kernel_dispatch` with the appropriate method
+/// id from `yurt_abi_methods.toml`. The legacy `host_*` namespace
+/// remains during the transition; userland is recompiled against
+/// `sys_*` symbols when the migration completes.
+fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
+    fn forward_scalar(caller: &Caller<'_, UserState>, method_id: u32) -> i32 {
+        let kernel = caller.data().kernel.clone();
+        let mut k = kernel.borrow_mut();
+        let dispatch = k.dispatch.clone();
+        match dispatch.call(&mut k.store, (method_id, 0, 0, 0, 0)) {
+            Ok(rc) => rc as i32,
+            Err(_) => -(EFAULT as i32),
+        }
+    }
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "host_getuid",
+        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETUID) },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "host_geteuid",
+        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETEUID) },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "host_getgid",
+        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETGID) },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "host_getegid",
+        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETEGID) },
+    )?;
+    Ok(())
+}
+
+// ── Build / path helpers ─────────────────────────────────────────────────────
+
 pub fn default_kernel_wasm_path() -> PathBuf {
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -291,8 +410,6 @@ pub fn default_kernel_wasm_path() -> PathBuf {
     target_dir.join("wasm32-wasip1/release/yurt_kernel_wasm.wasm")
 }
 
-/// Build `yurt-kernel-wasm` for `wasm32-wasip1` so [`default_kernel_wasm_path`]
-/// resolves to a fresh artifact. Used by the integration tests.
 pub fn build_kernel_wasm() -> Result<()> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
