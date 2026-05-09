@@ -35,6 +35,7 @@ const METHOD_SYS_GETGID: u32 = 0x1_0003;
 const METHOD_SYS_GETEGID: u32 = 0x1_0004;
 const METHOD_SYS_GETPID: u32 = 0x1_0005;
 const METHOD_SYS_GETPPID: u32 = 0x1_0006;
+const METHOD_SYS_UMASK: u32 = 0x1_0007;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -77,25 +78,55 @@ fn kernel_wasm_export_surface_is_locked() {
 }
 
 #[test]
-fn kernel_wasm_imports_only_documented_kh_namespace() {
-    // Phase guard: when a new `kh_*` import lands without being added
-    // to the microkernel Linker (or vice versa), this test catches it.
+fn kernel_wasm_imports_match_documented_namespaces() {
+    // Phase guard. kernel.wasm imports come from two namespaces:
+    //   * `kh.*`     — the documented kernel→host ABI we own.
+    //   * `wasi_snapshot_preview1.*` — pulled in transitively by std on
+    //     wasm32-wasip1 for panic / abort infrastructure (fd_write,
+    //     proc_exit, environ_*). The kernel doesn't *use* WASI for
+    //     real I/O — that goes through kh_log / kh_real_* — but std
+    //     needs these symbols to resolve, so the microkernel's kernel
+    //     linker satisfies them via wasmtime-wasi.
+    //
+    // When a new `kh_*` import lands without being added to the
+    // microkernel Linker (or vice versa), this test catches it.
     let wasm = std::fs::read(ensure_kernel_wasm_built()).unwrap();
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
-    let mut imports: Vec<(String, String)> = module
-        .imports()
-        .map(|i| (i.module().to_owned(), i.name().to_owned()))
-        .collect();
-    imports.sort();
+    let mut kh_imports: Vec<&str> = Vec::new();
+    let mut wasi_imports: Vec<&str> = Vec::new();
+    for import in module.imports() {
+        match import.module() {
+            "kh" => kh_imports.push(import.name()),
+            "wasi_snapshot_preview1" => wasi_imports.push(import.name()),
+            other => panic!("unexpected import namespace: {other}.{}", import.name()),
+        }
+    }
+    kh_imports.sort();
+    wasi_imports.sort();
     assert_eq!(
-        imports,
-        vec![
-            ("kh".to_owned(), "kh_extension_invoke".to_owned()),
-            ("kh".to_owned(), "kh_log".to_owned()),
-            ("kh".to_owned(), "kh_now_realtime".to_owned()),
-        ]
+        kh_imports,
+        vec!["kh_extension_invoke", "kh_log", "kh_now_realtime"],
+        "documented kh_* surface"
     );
+    // We don't pin the exact wasi import set (std internals can vary
+    // between toolchains) — just assert that what's there is a subset
+    // of the panic-related calls and contains nothing else.
+    let wasi_allowed: &[&str] = &[
+        "environ_get",
+        "environ_sizes_get",
+        "fd_write",
+        "fd_close",
+        "fd_seek",
+        "fd_fdstat_get",
+        "proc_exit",
+    ];
+    for w in &wasi_imports {
+        assert!(
+            wasi_allowed.contains(w),
+            "unexpected WASI import: {w} (allowed: {wasi_allowed:?})"
+        );
+    }
 }
 
 #[test]
@@ -347,6 +378,30 @@ fn getppid_returns_kernel_pid_for_first_user_process() {
 }
 
 #[test]
+fn user_process_umask_persists_across_calls_for_same_pid() {
+    // Per-pid kernel state validation. The user process calls sys_umask
+    // twice — first sets a new mask and reads back the default, second
+    // call reads back what the first set. State lives in
+    // kernel.wasm's static Mutex<Kernel>, keyed by caller_pid.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    // 0o077 = 63, 0o007 = 7 (WAT i32.const doesn't accept octal).
+    let user_wat = r#"
+        (module
+          (import "env" "sys_umask" (func $umask (param i32) (result i32)))
+          (func (export "first") (result i32)
+            (call $umask (i32.const 63)))
+          (func (export "second") (result i32)
+            (call $umask (i32.const 7))))
+    "#;
+    let wasm = wat::parse_str(user_wat).unwrap();
+    let mut user = mk.spawn_user_process(&wasm).unwrap();
+    let first = user.call_export_i32("first").unwrap();
+    assert_eq!(first, 0o022, "default umask 022");
+    let second = user.call_export_i32("second").unwrap();
+    assert_eq!(second, 0o077, "previous mask from first call persisted");
+}
+
+#[test]
 fn user_process_can_call_kernel_multiple_times() {
     // The Rc<RefCell<KernelInstance>> sharing pattern must support
     // repeated borrow_mut acquisitions without deadlock or panic.
@@ -393,6 +448,7 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_getegid", METHOD_SYS_GETEGID, METHOD_SYS_GETEGID as i64),
         ("sys_getpid", METHOD_SYS_GETPID, METHOD_SYS_GETPID as i64),
         ("sys_getppid", METHOD_SYS_GETPPID, METHOD_SYS_GETPPID as i64),
+        ("sys_umask", METHOD_SYS_UMASK, METHOD_SYS_UMASK as i64),
         (
             "sys_extension_invoke",
             METHOD_SYS_EXTENSION_INVOKE,

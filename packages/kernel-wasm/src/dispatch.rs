@@ -13,8 +13,8 @@
 //!   0x1_0000+  — `host_*` syscalls from `yurt_abi.toml`
 
 use crate::abi;
+use crate::kernel::with_kernel;
 use crate::kh;
-use crate::state::Credentials;
 
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
 
@@ -31,15 +31,16 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
             kh::log(kh::LogSeverity::Info, "kernel.wasm hello via kh_log");
             0
         }
-        METHOD_SYS_GETUID => Credentials::DEFAULT.uid as i64,
-        METHOD_SYS_GETEUID => Credentials::DEFAULT.euid as i64,
-        METHOD_SYS_GETGID => Credentials::DEFAULT.gid as i64,
-        METHOD_SYS_GETEGID => Credentials::DEFAULT.egid as i64,
+        METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
+        METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
+        METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
+        METHOD_SYS_GETEGID => with_kernel(|k| k.process(caller_pid).credentials.egid as i64),
         METHOD_SYS_GETPID => caller_pid as i64,
         // No process tree yet: every process's parent is the kernel
         // itself. Once the spawn syscall lands and the kernel tracks a
         // real Process map, this reads ppid from that map.
         METHOD_SYS_GETPPID => KERNEL_PID as i64,
+        METHOD_SYS_UMASK => umask(caller_pid, request),
         METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
         _ => -(abi::ENOSYS as i64),
     }
@@ -49,6 +50,20 @@ fn echo(request: &[u8], response: &mut [u8]) -> i64 {
     let n = request.len().min(response.len());
     response[..n].copy_from_slice(&request[..n]);
     n as i64
+}
+
+fn umask(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let new_mask = u32::from_le_bytes([request[0], request[1], request[2], request[3]]) as u16;
+    let new_mask = new_mask & 0o777;
+    with_kernel(|k| {
+        let p = k.process_mut(caller_pid);
+        let prev = p.umask;
+        p.umask = new_mask;
+        prev as i64
+    })
 }
 
 fn now_realtime(response: &mut [u8]) -> i64 {
@@ -103,6 +118,27 @@ mod tests {
         // direct child of the kernel.
         assert_eq!(dispatch(METHOD_SYS_GETPPID, 1, &[], &mut []), 0);
         assert_eq!(dispatch(METHOD_SYS_GETPPID, 99, &[], &mut []), 0);
+    }
+
+    #[test]
+    fn umask_round_trips_through_per_pid_state() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // First call: returns the default 022, sets new mask 077.
+        let req = 0o077_u32.to_le_bytes();
+        assert_eq!(dispatch(METHOD_SYS_UMASK, 1, &req, &mut []), 0o022);
+        // Second call from the same pid: previous = 077.
+        let req2 = 0o007_u32.to_le_bytes();
+        assert_eq!(dispatch(METHOD_SYS_UMASK, 1, &req2, &mut []), 0o077);
+        // A different pid sees its own default.
+        assert_eq!(dispatch(METHOD_SYS_UMASK, 2, &req, &mut []), 0o022);
+    }
+
+    #[test]
+    fn umask_rejects_short_request() {
+        assert_eq!(
+            dispatch(METHOD_SYS_UMASK, 1, &[1, 2], &mut []),
+            -(abi::EINVAL as i64)
+        );
     }
 
     #[test]

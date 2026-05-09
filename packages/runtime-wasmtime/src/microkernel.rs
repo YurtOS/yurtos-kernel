@@ -23,6 +23,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime_wasi::preview1::WasiP1Ctx;
+use wasmtime_wasi::WasiCtxBuilder;
 
 /// Fully-qualified path of the `kh_*` import namespace.
 const KH_NAMESPACE: &str = "kh";
@@ -49,6 +51,7 @@ mod sys_method_id {
     pub const GETEGID: u32 = 0x1_0004;
     pub const GETPID: u32 = 0x1_0005;
     pub const GETPPID: u32 = 0x1_0006;
+    pub const UMASK: u32 = 0x1_0007;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -121,13 +124,26 @@ impl Default for HostState {
     }
 }
 
+/// What lives in the kernel-wasm wasmtime Store. Bundles the
+/// embedder-supplied [`HostState`] with a `WasiP1Ctx` so that
+/// `std`-on-wasi panic infrastructure (`fd_write`, `proc_exit`,
+/// `environ_*`) can resolve. The kernel doesn't *use* WASI for I/O —
+/// real I/O goes through `kh_*` — but std pulls a few WASI imports
+/// for panic/abort. We satisfy them with a stub-friendly WasiCtx
+/// (no preopened dirs, no inherited stdio); kh_log handles real
+/// diagnostic output.
+pub struct KernelStoreData {
+    pub host: HostState,
+    pub wasi: WasiP1Ctx,
+}
+
 // ── Kernel instance: the loaded kernel.wasm + its wasmtime handles ─────────
 
 /// The loaded kernel.wasm plus the typed handles needed to drive it.
 /// Kept behind `Rc<RefCell<…>>` so that both the [`Microkernel`] and
 /// any spawned [`UserProcess`] can call into it.
 pub struct KernelInstance {
-    store: Store<HostState>,
+    store: Store<KernelStoreData>,
     memory: Memory,
     scratch_ptr: u32,
     scratch_len: u32,
@@ -196,10 +212,17 @@ impl Microkernel {
         let engine = Engine::default();
         let module = Module::new(&engine, &wasm).context("compile kernel.wasm")?;
 
-        let mut linker: Linker<HostState> = Linker::new(&engine);
+        let mut linker: Linker<KernelStoreData> = Linker::new(&engine);
+        wasmtime_wasi::preview1::add_to_linker_sync(&mut linker, |d| &mut d.wasi)
+            .context("add WASI preview1 to kernel linker (panic/abort support)")?;
         register_kh_imports(&mut linker)?;
 
-        let mut store = Store::new(&engine, host_state);
+        let wasi = WasiCtxBuilder::new().build_p1();
+        let store_data = KernelStoreData {
+            host: host_state,
+            wasi,
+        };
+        let mut store = Store::new(&engine, store_data);
         let instance = linker
             .instantiate(&mut store, &module)
             .context("instantiate kernel.wasm")?;
@@ -242,7 +265,7 @@ impl Microkernel {
     /// Mutable view of the host state served to kernel.wasm. Returns a
     /// `RefMut` that derefs to `&mut HostState`.
     pub fn host_state_mut(&self) -> RefMut<'_, HostState> {
-        RefMut::map(self.kernel.borrow_mut(), |k| k.store.data_mut())
+        RefMut::map(self.kernel.borrow_mut(), |k| &mut k.store.data_mut().host)
     }
 
     /// Compile and instantiate a user process whose `sys_*` imports
@@ -299,27 +322,31 @@ impl UserProcess {
         self.pid
     }
 
-    /// Invoke an exported `() -> i32` function. The convention for
-    /// trampoline tests is a `run() -> i32` export that returns the
-    /// scalar result of a single syscall; richer entry points come
-    /// later.
+    /// Invoke the exported `run() -> i32` function. Convention for
+    /// the trampoline tests; richer entry points come later.
     pub fn call_run(&mut self) -> Result<i32> {
+        self.call_export_i32("run")
+    }
+
+    /// Invoke any exported `() -> i32` function by name.
+    pub fn call_export_i32(&mut self, name: &str) -> Result<i32> {
         let f = self
             .instance
-            .get_typed_func::<(), i32>(&mut self.store, "run")
-            .context("user-process missing 'run() -> i32' export")?;
-        f.call(&mut self.store, ()).context("user-process run()")
+            .get_typed_func::<(), i32>(&mut self.store, name)
+            .with_context(|| format!("user-process missing '{name}() -> i32' export"))?;
+        f.call(&mut self.store, ())
+            .with_context(|| format!("user-process {name}()"))
     }
 }
 
 // ── Linker registration ──────────────────────────────────────────────────────
 
-fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
+fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_now_realtime",
-        |mut caller: Caller<'_, HostState>, out_ptr: u32| -> i32 {
-            let now = caller.data().now_realtime_ns;
+        |mut caller: Caller<'_, KernelStoreData>, out_ptr: u32| -> i32 {
+            let now = caller.data().host.now_realtime_ns;
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -(EFAULT as i32),
@@ -336,7 +363,11 @@ fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_log",
-        |mut caller: Caller<'_, HostState>, severity: u32, msg_ptr: u32, msg_len: u32| -> i32 {
+        |mut caller: Caller<'_, KernelStoreData>,
+         severity: u32,
+         msg_ptr: u32,
+         msg_len: u32|
+         -> i32 {
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -(EFAULT as i32),
@@ -345,7 +376,7 @@ fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
             if memory.read(&caller, msg_ptr as usize, &mut buf).is_err() {
                 return -(EFAULT as i32);
             }
-            let sink = caller.data().log_sink.clone();
+            let sink = caller.data().host.log_sink.clone();
             if let Ok(s) = std::str::from_utf8(&buf) {
                 sink.emit(severity, s);
             }
@@ -355,7 +386,7 @@ fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_extension_invoke",
-        |mut caller: Caller<'_, HostState>,
+        |mut caller: Caller<'_, KernelStoreData>,
          req_ptr: u32,
          req_len: u32,
          out_ptr: u32,
@@ -373,7 +404,7 @@ fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
                 return -EFAULT;
             }
             let mut response = vec![0u8; out_cap as usize];
-            let registry = caller.data().extensions.clone();
+            let registry = caller.data().host.extensions.clone();
             let written = registry.invoke(&request, &mut response);
             if written < 0 {
                 return written;
@@ -409,6 +440,28 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         }
     }
 
+    /// Forward a syscall whose only argument is a single `u32`. The
+    /// argument is staged as 4 little-endian bytes in kernel scratch.
+    fn forward_u32_arg(caller: &mut Caller<'_, UserState>, method_id: u32, arg: u32) -> i32 {
+        let pid = caller.data().pid;
+        let kernel = caller.data().kernel.clone();
+        let mut k = kernel.borrow_mut();
+        let scratch_ptr = k.scratch_ptr;
+        let memory = k.memory;
+        let dispatch = k.dispatch.clone();
+        let bytes = arg.to_le_bytes();
+        if memory
+            .write(&mut k.store, scratch_ptr as usize, &bytes)
+            .is_err()
+        {
+            return -(EFAULT as i32);
+        }
+        match dispatch.call(&mut k.store, (method_id, pid, scratch_ptr, 4, 0, 0)) {
+            Ok(rc) => rc as i32,
+            Err(_) => -(EFAULT as i32),
+        }
+    }
+
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_getuid",
@@ -438,6 +491,13 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         SYS_NAMESPACE,
         "sys_getppid",
         |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETPPID) },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_umask",
+        |mut caller: Caller<'_, UserState>, mask: i32| -> i32 {
+            forward_u32_arg(&mut caller, sys_method_id::UMASK, mask as u32)
+        },
     )?;
     Ok(())
 }

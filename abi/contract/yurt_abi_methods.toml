@@ -83,6 +83,11 @@ id = 0x1_0006
 kind = "syscall"
 doc = "Parent pid of the calling process. Returns 0 (kernel pid) until the spawn syscall lands and the kernel tracks parent/child relationships."
 
+[method.sys_umask]
+id = 0x1_0007
+kind = "syscall"
+doc = "Set the file-mode-creation mask for the calling process; returns the previous value. Request bytes carry the new mask as a little-endian u32 (only the low 9 bits are meaningful)."
+
 [method.sys_extension_invoke]
 id = 0x1_0010
 kind = "syscall"
