@@ -34,6 +34,10 @@ name = "cargo-yurt"
 path = "src/bin/cargo-yurt.rs"
 
 [[bin]]
+name = "yurt-rustc-wrapper"
+path = "src/bin/yurt-rustc-wrapper.rs"
+
+[[bin]]
 name = "maturin-yurt"
 path = "src/bin/maturin-yurt.rs"
 

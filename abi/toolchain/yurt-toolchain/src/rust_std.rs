@@ -72,14 +72,9 @@ pub fn package_metadata_opt_in(manifest_path: &Path) -> Result<bool> {
         .is_some())
 }
 
-pub fn resolve_std_for_invocation(forwarded: &[String]) -> Result<Option<PathBuf>> {
+pub fn resolve_std_for_invocation(_forwarded: &[String]) -> Result<PathBuf> {
     if let Some(explicit) = std::env::var_os("YURT_RUST_STD").filter(|v| !v.is_empty()) {
-        return Ok(Some(PathBuf::from(explicit)));
-    }
-
-    let manifest = manifest_path_from_args(forwarded);
-    if !package_metadata_opt_in(&manifest)? {
-        return Ok(None);
+        return Ok(PathBuf::from(explicit));
     }
 
     let rust_version_output = if let Some(v) = std::env::var_os("YURT_RUSTC_VERSION") {
@@ -99,12 +94,12 @@ pub fn resolve_std_for_invocation(forwarded: &[String]) -> Result<Option<PathBuf
 
     if let Some(root) = std::env::var_os("YURT_ROOT").filter(|v| !v.is_empty()) {
         if let Some(found) = discover_built_std(&PathBuf::from(root), &rust_key) {
-            return Ok(Some(found));
+            return Ok(found);
         }
     }
 
     if let Some(found) = discover_repo_std_from_cwd(&rust_key) {
-        return Ok(Some(found));
+        return Ok(found);
     }
 
     let home = std::env::var_os("YURT_HOME")
@@ -113,17 +108,13 @@ pub fn resolve_std_for_invocation(forwarded: &[String]) -> Result<Option<PathBuf
         .or_else(default_yurt_home);
     if let Some(home) = home {
         if let Some(found) = discover_installed_std(&home, &rust_key) {
-            return Ok(Some(found));
+            return Ok(found);
         }
     }
 
-    if std::env::var_os("YURT_STRICT_TOOLCHAIN").is_some() {
-        return Err(anyhow!(
-            "missing Yurt Rust std for {rust_key}; set YURT_RUST_STD or install under YURT_HOME"
-        ));
-    }
-
-    Ok(None)
+    Err(anyhow!(
+        "missing Yurt Rust std for {rust_key}; set YURT_RUST_STD, build it under YURT_ROOT, or install it under YURT_HOME"
+    ))
 }
 
 fn default_yurt_home() -> Option<PathBuf> {

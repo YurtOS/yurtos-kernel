@@ -123,8 +123,19 @@ edition = "2021"
 EOF
 
 cat > "$BUILD_CRATE/src/main.rs" <<'EOF'
+use std::fs::File;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{symlink, MetadataExt};
+use std::os::unix::io::AsRawFd;
+
 fn main() {
     println!("{}", std::env::temp_dir().display());
+    let _ = std::ffi::OsStr::new("probe").as_bytes();
+    let file = File::open(".").unwrap();
+    let _ = file.as_raw_fd();
+    let metadata = file.metadata().unwrap();
+    let _ = metadata.dev();
+    let _symlink = symlink::<&str, &str>;
 }
 EOF
 
@@ -138,6 +149,7 @@ chmod +x "$RUSTC_WRAPPER"
 CARGO_TARGET_DIR="$OUT_DIR/target" \
 RUSTC="$RUSTC_WRAPPER" \
 RUSTC_BOOTSTRAP=1 \
+CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS="--cfg yurt" \
 cargo "+$RUST_VERSION" build \
   -Z build-std=core,alloc,std,panic_abort,proc_macro,test \
   --target wasm32-wasip1 \

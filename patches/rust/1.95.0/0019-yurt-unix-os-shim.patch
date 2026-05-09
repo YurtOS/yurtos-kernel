@@ -1,0 +1,283 @@
+diff --git a/library/std/src/os/mod.rs b/library/std/src/os/mod.rs
+--- a/library/std/src/os/mod.rs
++++ b/library/std/src/os/mod.rs
+@@ -81,5 +81,5 @@ pub mod darwin;
+     )
+ )))]
+-#[cfg(all(not(target_os = "hermit"), any(unix, doc)))]
++#[cfg(all(not(target_os = "hermit"), any(unix, yurt, doc)))]
+ pub mod unix;
+ 
+diff --git a/library/std/src/os/unix/mod.rs b/library/std/src/os/unix/mod.rs
+--- a/library/std/src/os/unix/mod.rs
++++ b/library/std/src/os/unix/mod.rs
+@@ -90,8 +90,36 @@ mod platform {
++#[cfg(yurt)]
++#[path = "../wasi/ffi.rs"]
++pub mod ffi;
++#[cfg(not(yurt))]
+ pub mod ffi;
++#[cfg(yurt)]
++#[path = "yurt_fs.rs"]
++pub mod fs;
++#[cfg(not(yurt))]
+ pub mod fs;
++#[cfg(yurt)]
++#[path = "../wasi/io/mod.rs"]
++pub mod io;
++#[cfg(not(yurt))]
+ pub mod io;
++#[cfg(not(yurt))]
+ pub mod net;
++#[cfg(not(yurt))]
+ pub mod process;
++#[cfg(yurt)]
++#[stable(feature = "rust1", since = "1.0.0")]
++pub mod raw {
++    #[stable(feature = "rust1", since = "1.0.0")]
++    pub use crate::os::raw::*;
++    #[stable(feature = "pthread_t", since = "1.8.0")]
++    pub type pthread_t = *mut crate::ffi::c_void;
++    #[stable(feature = "raw_ext", since = "1.1.0")]
++    pub use crate::sys::os::libc::{blkcnt_t, blksize_t, dev_t, ino_t, mode_t, nlink_t, off_t};
++    #[stable(feature = "pthread_t", since = "1.8.0")]
++    pub use crate::sys::os::libc::time_t;
++}
++#[cfg(not(yurt))]
+ pub mod raw;
++#[cfg(not(yurt))]
+ pub mod thread;
+ 
+@@ -107,20 +135,28 @@ pub mod prelude {
+     #[stable(feature = "rust1", since = "1.0.0")]
+     pub use super::fs::DirEntryExt;
+     #[doc(no_inline)]
++    #[cfg(not(yurt))]
+     #[stable(feature = "file_offset", since = "1.15.0")]
+     pub use super::fs::FileExt;
+     #[doc(no_inline)]
+     #[stable(feature = "rust1", since = "1.0.0")]
++    #[cfg(not(yurt))]
+     pub use super::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
++    #[cfg(yurt)]
++    #[stable(feature = "rust1", since = "1.0.0")]
++    pub use super::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
+     #[doc(no_inline)]
+     #[stable(feature = "rust1", since = "1.0.0")]
+     pub use super::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+     #[doc(no_inline)]
++    #[cfg(not(yurt))]
+     #[unstable(feature = "unix_send_signal", issue = "141975")]
+     pub use super::process::ChildExt;
+     #[doc(no_inline)]
++    #[cfg(not(yurt))]
+     #[stable(feature = "rust1", since = "1.0.0")]
+     pub use super::process::{CommandExt, ExitStatusExt};
+     #[doc(no_inline)]
++    #[cfg(not(yurt))]
+     #[stable(feature = "rust1", since = "1.0.0")]
+     pub use super::thread::JoinHandleExt;
+ }
+
+diff --git a/library/std/src/os/unix/yurt_fs.rs b/library/std/src/os/unix/yurt_fs.rs
+new file mode 100644
+--- /dev/null
++++ b/library/std/src/os/unix/yurt_fs.rs
+@@ -0,0 +1,197 @@
++//! Yurt Unix-compatibility extensions to primitives in the [`std::fs`] module.
++//!
++//! [`std::fs`]: crate::fs
++
++#![stable(feature = "rust1", since = "1.0.0")]
++
++use crate::fs::{self, OpenOptions};
++use crate::io;
++use crate::path::Path;
++use crate::sys;
++use crate::sys::{AsInner, AsInnerMut};
++
++/// Creates a new symbolic link on the filesystem.
++#[stable(feature = "rust1", since = "1.0.0")]
++pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
++    crate::sys::fs::symlink(original.as_ref(), link.as_ref())
++}
++
++/// Yurt Unix-compatible extensions to [`OpenOptions`].
++#[stable(feature = "rust1", since = "1.0.0")]
++pub trait OpenOptionsExt {
++    /// Pass custom flags to the `flags` argument of `open`.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn custom_flags(&mut self, flags: i32) -> &mut Self;
++}
++
++#[stable(feature = "rust1", since = "1.0.0")]
++impl OpenOptionsExt for OpenOptions {
++    fn custom_flags(&mut self, flags: i32) -> &mut OpenOptions {
++        self.as_inner_mut().custom_flags(flags);
++        self
++    }
++}
++
++/// Yurt Unix-compatible extensions to [`fs::Metadata`].
++#[stable(feature = "rust1", since = "1.0.0")]
++pub trait MetadataExt {
++    /// Returns the device ID for this metadata.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn dev(&self) -> u64;
++    /// Returns the inode number for this metadata.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn ino(&self) -> u64;
++    /// Returns the link count for this metadata.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn nlink(&self) -> u64;
++    /// Returns the number of allocated 512-byte blocks for this metadata.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn blocks(&self) -> u64;
++    /// Returns the mode for this metadata.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn mode(&self) -> u32;
++    /// Returns the user ID for this metadata.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn uid(&self) -> u32;
++    /// Returns the group ID for this metadata.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn gid(&self) -> u32;
++    /// Returns the device ID for special file metadata.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn rdev(&self) -> u64;
++    /// Returns the file size for this metadata.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn size(&self) -> u64;
++    /// Returns the last access time in seconds.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn atime(&self) -> i64;
++    /// Returns the last access time in nanoseconds.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn atime_nsec(&self) -> i64;
++    /// Returns the last modification time in seconds.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn mtime(&self) -> i64;
++    /// Returns the last modification time in nanoseconds.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn mtime_nsec(&self) -> i64;
++    /// Returns the last status change time in seconds.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn ctime(&self) -> i64;
++    /// Returns the last status change time in nanoseconds.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn ctime_nsec(&self) -> i64;
++}
++
++#[stable(feature = "rust1", since = "1.0.0")]
++impl MetadataExt for fs::Metadata {
++    fn dev(&self) -> u64 {
++        self.as_inner().as_inner().st_dev
++    }
++
++    fn ino(&self) -> u64 {
++        self.as_inner().as_inner().st_ino
++    }
++
++    fn nlink(&self) -> u64 {
++        self.as_inner().as_inner().st_nlink
++    }
++
++    fn blocks(&self) -> u64 {
++        self.as_inner().as_inner().st_blocks as u64
++    }
++
++    fn mode(&self) -> u32 {
++        self.as_inner().as_inner().st_mode
++    }
++
++    fn uid(&self) -> u32 {
++        self.as_inner().as_inner().st_uid
++    }
++
++    fn gid(&self) -> u32 {
++        self.as_inner().as_inner().st_gid
++    }
++
++    fn rdev(&self) -> u64 {
++        self.as_inner().as_inner().st_rdev
++    }
++
++    fn size(&self) -> u64 {
++        self.as_inner().as_inner().st_size as u64
++    }
++
++    fn atime(&self) -> i64 {
++        self.as_inner().as_inner().st_atim.tv_sec
++    }
++
++    fn atime_nsec(&self) -> i64 {
++        self.as_inner().as_inner().st_atim.tv_nsec.into()
++    }
++
++    fn mtime(&self) -> i64 {
++        self.as_inner().as_inner().st_mtim.tv_sec
++    }
++
++    fn mtime_nsec(&self) -> i64 {
++        self.as_inner().as_inner().st_mtim.tv_nsec.into()
++    }
++
++    fn ctime(&self) -> i64 {
++        self.as_inner().as_inner().st_ctim.tv_sec
++    }
++
++    fn ctime_nsec(&self) -> i64 {
++        self.as_inner().as_inner().st_ctim.tv_nsec.into()
++    }
++}
++
++/// Yurt Unix-compatible extensions for [`fs::FileType`].
++#[stable(feature = "rust1", since = "1.0.0")]
++pub trait FileTypeExt {
++    /// Returns `true` if this file type is a block device.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn is_block_device(&self) -> bool;
++    /// Returns `true` if this file type is a character device.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn is_char_device(&self) -> bool;
++    /// Returns `true` if this file type is any type of socket.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn is_socket(&self) -> bool;
++    /// Returns `true` if this file type is a FIFO.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn is_fifo(&self) -> bool;
++}
++
++#[stable(feature = "rust1", since = "1.0.0")]
++impl FileTypeExt for fs::FileType {
++    fn is_block_device(&self) -> bool {
++        self.as_inner().is(sys::os::libc::S_IFBLK)
++    }
++
++    fn is_char_device(&self) -> bool {
++        self.as_inner().is(sys::os::libc::S_IFCHR)
++    }
++
++    fn is_socket(&self) -> bool {
++        self.as_inner().is(sys::os::libc::S_IFSOCK)
++    }
++
++    fn is_fifo(&self) -> bool {
++        self.as_inner().is(sys::os::libc::S_IFIFO)
++    }
++}
++
++/// Yurt Unix-compatible extension methods for [`fs::DirEntry`].
++#[stable(feature = "rust1", since = "1.0.0")]
++pub trait DirEntryExt {
++    /// Returns the inode number for this directory entry.
++    #[stable(feature = "rust1", since = "1.0.0")]
++    fn ino(&self) -> u64;
++}
++
++#[stable(feature = "rust1", since = "1.0.0")]
++impl DirEntryExt for fs::DirEntry {
++    fn ino(&self) -> u64 {
++        self.as_inner().ino()
++    }
++}

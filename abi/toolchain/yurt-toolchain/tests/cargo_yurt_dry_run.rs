@@ -6,10 +6,21 @@ use yurt_toolchain::cargo_yurt::{
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+fn with_yurt_std<T>(f: impl FnOnce() -> T) -> T {
+    let prev = std::env::var_os("YURT_RUST_STD");
+    std::env::set_var("YURT_RUST_STD", "/tmp/yurt-rust-std");
+    let result = f();
+    match prev {
+        Some(v) => std::env::set_var("YURT_RUST_STD", v),
+        None => std::env::remove_var("YURT_RUST_STD"),
+    }
+    result
+}
+
 #[test]
 fn build_subcommand_uses_wasm32_wasip1_target() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let plan = plan_invocation(Subcommand::Build, &["--release".into()]).unwrap();
+    let plan = with_yurt_std(|| plan_invocation(Subcommand::Build, &["--release".into()])).unwrap();
     assert!(plan.cargo_args.iter().any(|a| a == "build"));
     assert!(plan
         .cargo_args
@@ -21,7 +32,7 @@ fn build_subcommand_uses_wasm32_wasip1_target() {
 #[test]
 fn test_subcommand_uses_wasm32_wasip1_target() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let plan = plan_invocation(Subcommand::Test, &[]).unwrap();
+    let plan = with_yurt_std(|| plan_invocation(Subcommand::Test, &[])).unwrap();
     assert!(plan.cargo_args.iter().any(|a| a == "test"));
     assert!(plan
         .cargo_args
@@ -32,7 +43,8 @@ fn test_subcommand_uses_wasm32_wasip1_target() {
 #[test]
 fn run_subcommand_uses_wasm32_wasip1_target() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let plan = plan_invocation(Subcommand::Run, &["--bin".into(), "foo".into()]).unwrap();
+    let plan = with_yurt_std(|| plan_invocation(Subcommand::Run, &["--bin".into(), "foo".into()]))
+        .unwrap();
     assert!(plan.cargo_args.iter().any(|a| a == "run"));
     assert!(plan
         .cargo_args
@@ -45,7 +57,7 @@ fn run_subcommand_uses_wasm32_wasip1_target() {
 #[test]
 fn injected_env_includes_yurt_link_injected() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let plan = plan_invocation(Subcommand::Build, &[]).unwrap();
+    let plan = with_yurt_std(|| plan_invocation(Subcommand::Build, &[])).unwrap();
     assert_eq!(
         plan.env
             .iter()
@@ -58,7 +70,7 @@ fn injected_env_includes_yurt_link_injected() {
 #[test]
 fn cargo_yurt_disables_yurt_cc_link_injection_for_build_script_probes() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let plan = plan_invocation(Subcommand::Build, &[]).unwrap();
+    let plan = with_yurt_std(|| plan_invocation(Subcommand::Build, &[])).unwrap();
     assert_eq!(
         plan.env
             .iter()
@@ -69,30 +81,105 @@ fn cargo_yurt_disables_yurt_cc_link_injection_for_build_script_probes() {
 }
 
 #[test]
-fn dry_run_does_not_set_target_specific_env_when_archive_missing() {
+fn cargo_yurt_installs_rustc_wrapper() {
     let _guard = ENV_LOCK.lock().unwrap();
-    // Without YURT_CC_ARCHIVE pointing somewhere real, the linker/RUSTFLAGS env
-    // vars are not set — letting the user diagnose "where's my archive?"
-    // before they run a build.
-    let plan = plan_invocation(Subcommand::Build, &[]).unwrap();
-    let has_rustflags = plan
+    let prev = std::env::var_os("RUSTC_WRAPPER");
+    std::env::remove_var("RUSTC_WRAPPER");
+    let plan = with_yurt_std(|| plan_invocation(Subcommand::Build, &[])).unwrap();
+    match prev {
+        Some(v) => std::env::set_var("RUSTC_WRAPPER", v),
+        None => std::env::remove_var("RUSTC_WRAPPER"),
+    }
+
+    let wrapper = plan
         .env
         .iter()
-        .any(|(k, _)| k == "CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS");
+        .find(|(k, _)| k == "RUSTC_WRAPPER")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
     assert!(
-        !has_rustflags,
-        "RUSTFLAGS should not be injected when archive is unset"
+        wrapper.ends_with("yurt-rustc-wrapper"),
+        "wrapper: {wrapper}"
+    );
+}
+
+#[test]
+fn cargo_yurt_patches_yurt_compat_crates_when_available() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let plan = with_yurt_std(|| plan_invocation(Subcommand::Build, &[])).unwrap();
+    let configs: Vec<&str> = plan
+        .cargo_args
+        .windows(2)
+        .filter(|pair| pair[0] == "--config")
+        .map(|pair| pair[1].as_str())
+        .collect();
+    assert!(
+        configs
+            .iter()
+            .any(|config| config.contains("patch.crates-io.fs2.path")),
+        "cargo args: {:?}",
+        plan.cargo_args
+    );
+    assert!(
+        configs
+            .iter()
+            .any(|config| config.contains("patch.crates-io.libc.path")),
+        "cargo args: {:?}",
+        plan.cargo_args
+    );
+}
+
+#[test]
+fn cargo_yurt_chains_existing_rustc_wrapper() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let prev = std::env::var_os("RUSTC_WRAPPER");
+    std::env::set_var("RUSTC_WRAPPER", "/tools/sccache");
+    let plan = with_yurt_std(|| plan_invocation(Subcommand::Build, &[])).unwrap();
+    match prev {
+        Some(v) => std::env::set_var("RUSTC_WRAPPER", v),
+        None => std::env::remove_var("RUSTC_WRAPPER"),
+    }
+
+    let inner = plan
+        .env
+        .iter()
+        .find(|(k, _)| k == "YURT_RUSTC_WRAPPER_INNER")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(inner, Some("/tools/sccache"));
+}
+
+#[test]
+fn dry_run_sets_yurt_std_flags_without_archive_link_flags() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let plan = with_yurt_std(|| plan_invocation(Subcommand::Build, &[])).unwrap();
+    let rustflags = plan
+        .env
+        .iter()
+        .find(|(k, _)| k == "CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS")
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    assert!(
+        rustflags.contains("--sysroot=/tmp/yurt-rust-std"),
+        "flags: {rustflags}"
+    );
+    assert!(rustflags.contains("--cfg yurt"), "flags: {rustflags}");
+    assert!(rustflags.contains("--cfg unix"), "flags: {rustflags}");
+    assert!(
+        !rustflags.contains("--whole-archive"),
+        "archive link flags should not be injected when archive is unset: {rustflags}"
     );
 }
 
 #[test]
 fn linker_injected_when_clang_supplied() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let plan = plan_invocation_with_sdk(
-        Subcommand::Build,
-        &[],
-        Some(&PathBuf::from("/wasi-sdk/bin/clang")),
-    )
+    let plan = with_yurt_std(|| {
+        plan_invocation_with_sdk(
+            Subcommand::Build,
+            &[],
+            Some(&PathBuf::from("/wasi-sdk/bin/clang")),
+        )
+    })
     .unwrap();
     let linker = plan
         .env
@@ -105,7 +192,7 @@ fn linker_injected_when_clang_supplied() {
 #[test]
 fn linker_omitted_when_clang_missing() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let plan = plan_invocation_with_sdk(Subcommand::Build, &[], None).unwrap();
+    let plan = with_yurt_std(|| plan_invocation_with_sdk(Subcommand::Build, &[], None)).unwrap();
     let linker = plan
         .env
         .iter()
@@ -129,11 +216,13 @@ fn clang_linker_omitted_when_yurt_cc_no_clang_linker_set() {
     // Save and restore to avoid cross-test contamination.
     let prev = std::env::var_os("YURT_CC_NO_CLANG_LINKER");
     std::env::set_var("YURT_CC_NO_CLANG_LINKER", "1");
-    let plan = plan_invocation_with_sdk(
-        Subcommand::Build,
-        &[],
-        Some(&PathBuf::from("/wasi-sdk/bin/clang")),
-    )
+    let plan = with_yurt_std(|| {
+        plan_invocation_with_sdk(
+            Subcommand::Build,
+            &[],
+            Some(&PathBuf::from("/wasi-sdk/bin/clang")),
+        )
+    })
     .unwrap();
     match prev {
         Some(v) => std::env::set_var("YURT_CC_NO_CLANG_LINKER", v),
@@ -172,6 +261,8 @@ fn built_std_env_is_composed_into_target_rustflags() {
         flags.contains("--sysroot=/tmp/yurt-rust-std"),
         "flags: {flags}"
     );
+    assert!(flags.contains("--cfg yurt"), "flags: {flags}");
+    assert!(flags.contains("--cfg unix"), "flags: {flags}");
 }
 
 #[test]

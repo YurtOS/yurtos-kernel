@@ -7,6 +7,7 @@ pub mod maturin_yurt;
 pub mod precheck;
 pub mod preserve;
 pub mod rust_std;
+pub mod rustc_wrapper;
 pub mod spec;
 pub mod trace;
 pub mod wasi_sdk;

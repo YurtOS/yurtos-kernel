@@ -1,7 +1,7 @@
 diff --git a/library/std/src/sys/pal/wasi/os.rs b/library/std/src/sys/pal/wasi/os.rs
 --- a/library/std/src/sys/pal/wasi/os.rs
 +++ b/library/std/src/sys/pal/wasi/os.rs
-@@ -7,6 +7,8 @@ use crate::sys::helpers::run_path_with_cstr;
+@@ -7,6 +7,9 @@ use crate::sys::helpers::run_path_with_cstr;
  use crate::sys::unsupported;
  use crate::{fmt, io};
 
@@ -9,6 +9,7 @@ diff --git a/library/std/src/sys/pal/wasi/os.rs b/library/std/src/sys/pal/wasi/o
 +mod yurt;
  // Add a few symbols not in upstream `libc` just yet.
  pub mod libc {
++    #[stable(feature = "rust1", since = "1.0.0")]
      pub use libc::*;
 @@ -53,57 +55,57 @@ pub fn chdir(p: &path::Path) -> io::Result<()> {
      }

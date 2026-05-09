@@ -4,7 +4,7 @@
 //! handshake with the optional `-sys` crate, version checking, pre-opt wasm
 //! preservation, and post-link `wasm-opt`.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -67,6 +67,13 @@ pub fn plan_invocation_with_sdk(
     let verb = sub
         .cargo_verb()
         .ok_or_else(|| anyhow!("subcommand {sub:?} does not correspond to a cargo verb"))?;
+    for (name, path) in discover_yurt_crate_ports()? {
+        plan.cargo_args.push("--config".to_string());
+        plan.cargo_args.push(format!(
+            "patch.crates-io.{name}.path=\"{}\"",
+            path.display()
+        ));
+    }
     plan.cargo_args.push(verb.to_string());
     plan.cargo_args.push("--target=wasm32-wasip1".to_string());
     for arg in forwarded {
@@ -80,6 +87,16 @@ pub fn plan_invocation_with_sdk(
     // or inject the Yurt ABI archive.
     plan.env
         .push(("YURT_CC_NO_LINK_INJECTION".to_string(), "1".to_string()));
+    if let Some(existing) = std::env::var_os("RUSTC_WRAPPER").filter(|v| !v.is_empty()) {
+        plan.env.push((
+            "YURT_RUSTC_WRAPPER_INNER".to_string(),
+            PathBuf::from(existing).display().to_string(),
+        ));
+    }
+    plan.env.push((
+        "RUSTC_WRAPPER".to_string(),
+        rustc_wrapper_path()?.display().to_string(),
+    ));
 
     // YURT_CC_NO_CLANG_LINKER skips the wasi-sdk clang linker injection so rust's
     // default rust-lld handles the link. Needed for ports whose dep tree
@@ -99,12 +116,14 @@ pub fn plan_invocation_with_sdk(
     }
 
     let mut rustflags = std::env::var("CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS").unwrap_or_default();
-    if let Some(std_root) = crate::rust_std::resolve_std_for_invocation(forwarded)? {
-        if !rustflags.is_empty() {
-            rustflags.push(' ');
-        }
-        rustflags.push_str(&format!("--sysroot={}", std_root.display()));
+    let std_root = crate::rust_std::resolve_std_for_invocation(forwarded)?;
+    if !rustflags.is_empty() {
+        rustflags.push(' ');
     }
+    rustflags.push_str(&format!(
+        "--sysroot={} -Aexplicit-builtin-cfgs-in-flags --cfg yurt --cfg unix",
+        std_root.display()
+    ));
 
     if let Some(archive) = &env.archive {
         // §Override And Link Precedence: --whole-archive bracket the compat
@@ -161,6 +180,104 @@ pub fn plan_invocation_with_sdk(
     }
 
     Ok(plan)
+}
+
+pub fn rustc_wrapper_path() -> Result<PathBuf> {
+    let mut path = std::env::current_exe().context("locating current executable")?;
+    path.set_file_name("yurt-rustc-wrapper");
+    Ok(path)
+}
+
+pub fn discover_yurt_crate_ports() -> Result<Vec<(String, PathBuf)>> {
+    let Some(root) = discover_yurt_crate_ports_root()? else {
+        return Ok(Vec::new());
+    };
+
+    let mut ports = Vec::new();
+    for entry in std::fs::read_dir(&root)
+        .with_context(|| format!("reading Yurt crate ports from {}", root.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("reading Yurt crate port entry in {}", root.display()))?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let manifest = path.join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let package_name = cargo_manifest_package_name(&manifest)?;
+        ports.push((package_name, path));
+    }
+
+    ports.sort_by(|(left_name, left_path), (right_name, right_path)| {
+        left_name
+            .cmp(right_name)
+            .then_with(|| left_path.cmp(right_path))
+    });
+    Ok(ports)
+}
+
+fn discover_yurt_crate_ports_root() -> Result<Option<PathBuf>> {
+    if let Some(explicit) = std::env::var_os("YURT_RUST_CRATE_PORTS").filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(explicit);
+        if path.is_dir() {
+            return Ok(Some(path));
+        }
+        return Err(anyhow!(
+            "YURT_RUST_CRATE_PORTS does not name a directory: {}",
+            path.display()
+        ));
+    }
+
+    let relative_path = "abi/rust/crate-ports";
+    if let Some(root) = std::env::var_os("YURT_ROOT").filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(root).join(relative_path);
+        if path.is_dir() {
+            return Ok(Some(path));
+        }
+    }
+
+    let exe = std::env::current_exe().context("locating current executable")?;
+    for ancestor in exe.ancestors() {
+        let path = ancestor.join(relative_path);
+        if path.is_dir() {
+            return Ok(Some(path));
+        }
+    }
+
+    let mut dir = std::env::current_dir().context("locating current directory")?;
+    loop {
+        let path = dir.join(relative_path);
+        if path.is_dir() {
+            return Ok(Some(path));
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+
+    Ok(None)
+}
+
+fn cargo_manifest_package_name(manifest: &Path) -> Result<String> {
+    let contents = std::fs::read_to_string(manifest)
+        .with_context(|| format!("reading Yurt crate port manifest {}", manifest.display()))?;
+    let manifest_value = contents
+        .parse::<toml::Value>()
+        .with_context(|| format!("parsing Yurt crate port manifest {}", manifest.display()))?;
+    manifest_value
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(|name| name.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow!(
+                "Yurt crate port manifest lacks package.name: {}",
+                manifest.display()
+            )
+        })
 }
 
 /// Locate every top-level .wasm artifact under `target/wasm32-wasip1/<profile>/`.
