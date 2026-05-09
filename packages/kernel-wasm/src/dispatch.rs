@@ -378,28 +378,17 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                 take as i64
             }
             crate::kernel::FdEntry::File { ofd_id } => {
-                let (file_id, offset) = match k.ofd(ofd_id) {
+                let (inode, offset) = match k.ofd(ofd_id) {
                     Some(o) => (o.file_id, o.offset),
                     None => return -(abi::EBADF as i64),
                 };
-                let take = match k.ramfs_file(file_id) {
-                    Some(file) => {
-                        let start = (offset as usize).min(file.content.len());
-                        let avail = file.content.len() - start;
-                        let take = avail.min(response.len());
-                        if take > 0 {
-                            response[..take]
-                                .copy_from_slice(&file.content[start..start + take]);
-                        }
-                        take
+                let n = k.vfs.read(inode, offset, response);
+                if n > 0 {
+                    if let Some(ofd) = k.ofd_mut(ofd_id) {
+                        ofd.offset += n as u64;
                     }
-                    None => return -(abi::EBADF as i64),
-                };
-                // Advance the OFD offset; dup'd fds see the same cursor.
-                if let Some(ofd) = k.ofd_mut(ofd_id) {
-                    ofd.offset += take as u64;
                 }
-                take as i64
+                n
             }
         }
     })
@@ -451,30 +440,20 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
                 ..
             } => -(abi::EBADF as i64), // can't write to read end
             crate::kernel::FdEntry::File { ofd_id } => {
-                let (file_id, offset, writable) = match k.ofd(ofd_id) {
+                let (inode, offset, writable) = match k.ofd(ofd_id) {
                     Some(o) => (o.file_id, o.offset, o.writable),
                     None => return -(abi::EBADF as i64),
                 };
                 if !writable {
                     return -(abi::EBADF as i64);
                 }
-                // Write into the file at offset, growing if needed.
-                let written = match k.ramfs_file_mut(file_id) {
-                    Some(f) => {
-                        let start = offset as usize;
-                        let end = start + payload.len();
-                        if end > f.content.len() {
-                            f.content.resize(end, 0);
-                        }
-                        f.content[start..end].copy_from_slice(payload);
-                        payload.len()
+                let n = k.vfs.write(inode, offset, payload);
+                if n > 0 {
+                    if let Some(o) = k.ofd_mut(ofd_id) {
+                        o.offset += n as u64;
                     }
-                    None => return -(abi::EBADF as i64),
-                };
-                if let Some(o) = k.ofd_mut(ofd_id) {
-                    o.offset += written as u64;
                 }
-                written as i64
+                n
             }
         }
     })
@@ -720,7 +699,15 @@ fn register_file(request: &[u8]) -> i64 {
     let path = request[4..4 + path_len].to_vec();
     let content = request[4 + path_len..].to_vec();
     with_kernel(|k| {
-        k.install_file(path, content);
+        // Microkernel-only path; only the root mount accepts these.
+        // The path comes through as absolute; root ramfs uses it as-is.
+        k.vfs.create(&path).map(|inode| {
+            // Replace empty content with what was supplied. Lookup
+            // already returns the inode if it exists; otherwise create
+            // installs an empty file. Either way, write the content.
+            let _ = k.vfs.write(inode, 0, &content);
+            inode
+        });
     });
     0
 }
@@ -741,20 +728,23 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
     let create = flags & 0b010 != 0;
     let trunc = flags & 0b100 != 0;
     with_kernel(|k| {
-        let file_id = match k.lookup_file_id(path) {
+        let inode = match k.vfs.lookup(path) {
             Some(id) => id,
             None => {
                 if create {
-                    k.install_file(path.to_vec(), Vec::new())
+                    match k.vfs.create(path) {
+                        Some(id) => id,
+                        None => return -(abi::EPERM as i64),
+                    }
                 } else {
                     return -(abi::ENOENT as i64);
                 }
             }
         };
         if trunc {
-            k.ramfs_truncate(file_id);
+            k.vfs.truncate(inode);
         }
-        let ofd_id = k.create_ofd(file_id, writable);
+        let ofd_id = k.create_ofd(inode, writable);
         let p = k.process_mut(caller_pid);
         let fd = p.fd_table.lowest_free_fd();
         p.fd_table
@@ -778,11 +768,11 @@ fn lseek(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             Some(crate::kernel::FdEntry::File { ofd_id }) => *ofd_id,
             _ => return -(abi::EBADF as i64),
         };
-        let (file_id, current) = match k.ofd(ofd_id) {
+        let (inode, current) = match k.ofd(ofd_id) {
             Some(o) => (o.file_id, o.offset),
             None => return -(abi::EBADF as i64),
         };
-        let size = k.ramfs_file(file_id).map(|f| f.content.len() as u64).unwrap_or(0);
+        let size = k.vfs.size(inode).unwrap_or(0);
         let base: i64 = match whence {
             0 => 0,
             1 => current as i64,
@@ -823,11 +813,11 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             | crate::kernel::FdEntry::Stderr => (0, 2),
             crate::kernel::FdEntry::Pipe { .. } => (0, 6),
             crate::kernel::FdEntry::File { ofd_id } => {
-                let file_id = match k.ofd(ofd_id) {
+                let inode = match k.ofd(ofd_id) {
                     Some(o) => o.file_id,
                     None => return -(abi::EBADF as i64),
                 };
-                let sz = k.ramfs_file(file_id).map(|f| f.content.len() as u64).unwrap_or(0);
+                let sz = k.vfs.size(inode).unwrap_or(0);
                 (sz, 4)
             }
         };

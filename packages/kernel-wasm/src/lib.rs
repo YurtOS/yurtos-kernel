@@ -18,6 +18,7 @@ mod dispatch;
 mod kernel;
 mod kh;
 mod state;
+mod vfs;
 
 pub use dispatch::dispatch;
 

@@ -255,14 +255,6 @@ impl PipeBuf {
     }
 }
 
-/// One file in the in-memory ramfs. Read-only from userland for now;
-/// the microkernel installs entries via `kernel_register_file` at
-/// process-setup time.
-#[derive(Debug)]
-pub struct RamfsFile {
-    pub content: Vec<u8>,
-}
-
 /// One open-file-description: the POSIX object that holds a cursor
 /// (and, eventually, open flags) for a particular `open()` call.
 /// Multiple fds — created via dup/dup2 — point at the same OFD and
@@ -282,9 +274,9 @@ pub struct Kernel {
     processes: BTreeMap<Pid, Process>,
     pipes: BTreeMap<u64, PipeBuf>,
     next_pipe_id: u64,
-    files: BTreeMap<u64, RamfsFile>,
-    path_to_file: BTreeMap<Vec<u8>, u64>,
-    next_file_id: u64,
+    /// Filesystem layer. All file syscalls go through this. Backends
+    /// (ramfs, host-fs, S3, image layers) are registered as mounts.
+    pub vfs: crate::vfs::MountTable,
     ofds: BTreeMap<u64, OpenFileDescription>,
     next_ofd_id: u64,
 }
@@ -295,41 +287,27 @@ impl Kernel {
             processes: BTreeMap::new(),
             pipes: BTreeMap::new(),
             next_pipe_id: 1,
-            files: BTreeMap::new(),
-            path_to_file: BTreeMap::new(),
-            next_file_id: 1,
+            vfs: crate::vfs::MountTable::new(Box::new(crate::vfs::RamfsBackend::new())),
             ofds: BTreeMap::new(),
             next_ofd_id: 1,
         }
     }
 
-    /// Allocate a fresh OFD for `file_id`, with refcount 1, offset 0,
+    /// Allocate a fresh OFD for `inode`, with refcount 1, offset 0,
     /// and the requested `writable` flag. Returns the OFD id.
-    pub fn create_ofd(&mut self, file_id: u64, writable: bool) -> u64 {
+    pub fn create_ofd(&mut self, inode: u64, writable: bool) -> u64 {
         let id = self.next_ofd_id;
         self.next_ofd_id += 1;
         self.ofds.insert(
             id,
             OpenFileDescription {
-                file_id,
+                file_id: inode,
                 offset: 0,
                 refs: 1,
                 writable,
             },
         );
         id
-    }
-
-    /// Mutable view of a ramfs file's content (used by sys_write).
-    pub fn ramfs_file_mut(&mut self, id: u64) -> Option<&mut RamfsFile> {
-        self.files.get_mut(&id)
-    }
-
-    /// Truncate a ramfs file to length 0 (used by sys_open with O_TRUNC).
-    pub fn ramfs_truncate(&mut self, id: u64) {
-        if let Some(f) = self.files.get_mut(&id) {
-            f.content.clear();
-        }
     }
 
     pub fn ofd_mut(&mut self, id: u64) -> Option<&mut OpenFileDescription> {
@@ -358,31 +336,6 @@ impl Kernel {
         if drop {
             self.ofds.remove(&id);
         }
-    }
-
-    /// Install a file blob at `path`, replacing any existing content
-    /// at that path. Returns the file id. Caller controls visibility:
-    /// future open() calls against the path see this content.
-    pub fn install_file(&mut self, path: Vec<u8>, content: Vec<u8>) -> u64 {
-        if let Some(existing_id) = self.path_to_file.get(&path).copied() {
-            if let Some(file) = self.files.get_mut(&existing_id) {
-                file.content = content;
-                return existing_id;
-            }
-        }
-        let id = self.next_file_id;
-        self.next_file_id += 1;
-        self.files.insert(id, RamfsFile { content });
-        self.path_to_file.insert(path, id);
-        id
-    }
-
-    pub fn lookup_file_id(&self, path: &[u8]) -> Option<u64> {
-        self.path_to_file.get(path).copied()
-    }
-
-    pub fn ramfs_file(&self, id: u64) -> Option<&RamfsFile> {
-        self.files.get(&id)
     }
 
     /// Allocate a fresh pipe buffer with one reader-end and one
@@ -435,9 +388,7 @@ pub fn with_kernel<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
 pub fn reset_for_tests() {
     let mut k = KERNEL.lock().unwrap();
     k.processes.clear();
-    k.files.clear();
-    k.path_to_file.clear();
-    k.next_file_id = 1;
+    k.vfs.clear();
     k.ofds.clear();
     k.next_ofd_id = 1;
 }
