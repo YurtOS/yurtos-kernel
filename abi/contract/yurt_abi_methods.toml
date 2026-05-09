@@ -73,6 +73,16 @@ id = 0x1_0004
 kind = "syscall"
 doc = "Effective group id of the calling process."
 
+[method.sys_getpid]
+id = 0x1_0005
+kind = "syscall"
+doc = "Pid of the calling process. Threaded through kernel_dispatch via caller_pid."
+
+[method.sys_getppid]
+id = 0x1_0006
+kind = "syscall"
+doc = "Parent pid of the calling process. Returns 0 (kernel pid) until the spawn syscall lands and the kernel tracks parent/child relationships."
+
 [method.sys_extension_invoke]
 id = 0x1_0010
 kind = "syscall"

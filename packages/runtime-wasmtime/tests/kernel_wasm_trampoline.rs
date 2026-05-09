@@ -33,6 +33,8 @@ const METHOD_SYS_GETUID: u32 = 0x1_0001;
 const METHOD_SYS_GETEUID: u32 = 0x1_0002;
 const METHOD_SYS_GETGID: u32 = 0x1_0003;
 const METHOD_SYS_GETEGID: u32 = 0x1_0004;
+const METHOD_SYS_GETPID: u32 = 0x1_0005;
+const METHOD_SYS_GETPPID: u32 = 0x1_0006;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -254,7 +256,7 @@ fn sys_extension_invoke_returns_negated_enoent_when_no_registry() {
 fn user_process_calls_kernel_through_full_trampoline() {
     // The whole architecture, end to end, in one test:
     //
-    //   user.wasm calls host_getuid (legacy import name)
+    //   user.wasm calls sys_getuid
     //     → microkernel forwards to kernel.wasm via kernel_dispatch
     //         → kernel handles METHOD_SYS_GETUID, returns 1000
     //     ← microkernel writes scalar back into user.wasm
@@ -266,9 +268,9 @@ fn user_process_calls_kernel_through_full_trampoline() {
 
     let user_wat = r#"
         (module
-          (import "env" "host_getuid" (func $host_getuid (result i32)))
+          (import "env" "sys_getuid" (func $sys_getuid (result i32)))
           (func (export "run") (result i32)
-            (call $host_getuid)))
+            (call $sys_getuid)))
     "#;
     let user_wasm = wat::parse_str(user_wat).unwrap();
     let mut user = mk.spawn_user_process(&user_wasm).unwrap();
@@ -278,16 +280,83 @@ fn user_process_calls_kernel_through_full_trampoline() {
 }
 
 #[test]
+fn microkernel_direct_syscall_uses_kernel_pid_zero() {
+    // Microkernel-owned syscalls (no user process in flight) see the
+    // kernel as their caller — pid 0. sys_getpid via dispatch
+    // therefore returns 0.
+    let mk = fresh_microkernel(0);
+    let rc = mk.syscall(METHOD_SYS_GETPID, &[], &mut []).unwrap();
+    assert_eq!(rc, 0, "microkernel direct call sees KERNEL_PID");
+}
+
+#[test]
+fn user_process_sees_its_assigned_pid() {
+    // First spawned process is pid 1; getpid returns it through the
+    // full trampoline. Validates caller_pid plumbing end-to-end.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_getpid" (func $getpid (result i32)))
+          (func (export "run") (result i32)
+            (call $getpid)))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.pid(), 1);
+    assert_eq!(user.call_run().unwrap(), 1);
+}
+
+#[test]
+fn each_spawned_process_gets_a_unique_pid() {
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_getpid" (func $getpid (result i32)))
+          (func (export "run") (result i32)
+            (call $getpid)))
+    "#;
+    let wasm = wat::parse_str(user_wat).unwrap();
+    let mut a = mk.spawn_user_process(&wasm).unwrap();
+    let mut b = mk.spawn_user_process(&wasm).unwrap();
+    let mut c = mk.spawn_user_process(&wasm).unwrap();
+
+    assert_eq!(a.pid(), 1);
+    assert_eq!(b.pid(), 2);
+    assert_eq!(c.pid(), 3);
+    assert_eq!(a.call_run().unwrap(), 1);
+    assert_eq!(b.call_run().unwrap(), 2);
+    assert_eq!(c.call_run().unwrap(), 3);
+}
+
+#[test]
+fn getppid_returns_kernel_pid_for_first_user_process() {
+    // No process tree yet — until host_spawn lands, every process is
+    // a direct child of the kernel.
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_getppid" (func $getppid (result i32)))
+          (func (export "run") (result i32)
+            (call $getppid)))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.call_run().unwrap(), 0);
+}
+
+#[test]
 fn user_process_can_call_kernel_multiple_times() {
     // The Rc<RefCell<KernelInstance>> sharing pattern must support
     // repeated borrow_mut acquisitions without deadlock or panic.
     let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
-          (import "env" "host_getuid" (func $host_getuid (result i32)))
-          (import "env" "host_getgid" (func $host_getgid (result i32)))
+          (import "env" "sys_getuid" (func $sys_getuid (result i32)))
+          (import "env" "sys_getgid" (func $sys_getgid (result i32)))
           (func (export "run") (result i32)
-            (i32.add (call $host_getuid) (call $host_getgid))))
+            (i32.add (call $sys_getuid) (call $sys_getgid))))
     "#;
     let user_wasm = wat::parse_str(user_wat).unwrap();
     let mut user = mk.spawn_user_process(&user_wasm).unwrap();
@@ -322,6 +391,8 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_geteuid", METHOD_SYS_GETEUID, METHOD_SYS_GETEUID as i64),
         ("sys_getgid", METHOD_SYS_GETGID, METHOD_SYS_GETGID as i64),
         ("sys_getegid", METHOD_SYS_GETEGID, METHOD_SYS_GETEGID as i64),
+        ("sys_getpid", METHOD_SYS_GETPID, METHOD_SYS_GETPID as i64),
+        ("sys_getppid", METHOD_SYS_GETPPID, METHOD_SYS_GETPPID as i64),
         (
             "sys_extension_invoke",
             METHOD_SYS_EXTENSION_INVOKE,

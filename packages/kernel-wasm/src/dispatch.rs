@@ -18,7 +18,12 @@ use crate::state::Credentials;
 
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
 
-pub fn dispatch(method_id: u32, request: &[u8], response: &mut [u8]) -> i64 {
+/// Reserved pid for direct calls from outside any user process — i.e.
+/// the microkernel itself driving the kernel for tests, bootstrapping,
+/// or its own bookkeeping. Real user processes start at pid 1.
+pub const KERNEL_PID: u32 = 0;
+
+pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     match method_id {
         METHOD_KERNEL_ECHO => echo(request, response),
         METHOD_KERNEL_NOW_REALTIME => now_realtime(response),
@@ -30,6 +35,11 @@ pub fn dispatch(method_id: u32, request: &[u8], response: &mut [u8]) -> i64 {
         METHOD_SYS_GETEUID => Credentials::DEFAULT.euid as i64,
         METHOD_SYS_GETGID => Credentials::DEFAULT.gid as i64,
         METHOD_SYS_GETEGID => Credentials::DEFAULT.egid as i64,
+        METHOD_SYS_GETPID => caller_pid as i64,
+        // No process tree yet: every process's parent is the kernel
+        // itself. Once the spawn syscall lands and the kernel tracks a
+        // real Process map, this reads ppid from that map.
+        METHOD_SYS_GETPPID => KERNEL_PID as i64,
         METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
         _ => -(abi::ENOSYS as i64),
     }
@@ -61,22 +71,38 @@ mod tests {
     #[test]
     fn echo_copies_min_of_request_and_response_lengths() {
         let mut out = [0u8; 4];
-        assert_eq!(dispatch(METHOD_KERNEL_ECHO, b"hello", &mut out), 4);
+        assert_eq!(dispatch(METHOD_KERNEL_ECHO, 0, b"hello", &mut out), 4);
         assert_eq!(&out, b"hell");
     }
 
     #[test]
     fn echo_handles_empty_request() {
         let mut out = [0u8; 8];
-        assert_eq!(dispatch(METHOD_KERNEL_ECHO, &[], &mut out), 0);
+        assert_eq!(dispatch(METHOD_KERNEL_ECHO, 0, &[], &mut out), 0);
     }
 
     #[test]
     fn credentials_syscalls_return_default_uid_gid() {
-        assert_eq!(dispatch(METHOD_SYS_GETUID, &[], &mut []), 1000);
-        assert_eq!(dispatch(METHOD_SYS_GETEUID, &[], &mut []), 1000);
-        assert_eq!(dispatch(METHOD_SYS_GETGID, &[], &mut []), 1000);
-        assert_eq!(dispatch(METHOD_SYS_GETEGID, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETUID, 1, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETEUID, 1, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETGID, 1, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETEGID, 1, &[], &mut []), 1000);
+    }
+
+    #[test]
+    fn getpid_returns_caller_pid() {
+        assert_eq!(dispatch(METHOD_SYS_GETPID, 1, &[], &mut []), 1);
+        assert_eq!(dispatch(METHOD_SYS_GETPID, 42, &[], &mut []), 42);
+        assert_eq!(dispatch(METHOD_SYS_GETPID, 0, &[], &mut []), 0);
+    }
+
+    #[test]
+    fn getppid_returns_kernel_pid_until_process_tree_exists() {
+        // Phase note: until host_spawn lands and the kernel tracks
+        // parent/child relationships, every process is treated as a
+        // direct child of the kernel.
+        assert_eq!(dispatch(METHOD_SYS_GETPPID, 1, &[], &mut []), 0);
+        assert_eq!(dispatch(METHOD_SYS_GETPPID, 99, &[], &mut []), 0);
     }
 
     #[test]
@@ -89,6 +115,8 @@ mod tests {
             "sys_geteuid",
             "sys_getgid",
             "sys_getegid",
+            "sys_getpid",
+            "sys_getppid",
         ] {
             assert!(
                 names.contains(&required),

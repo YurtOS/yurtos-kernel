@@ -3,7 +3,7 @@
 //! Loads `yurt-kernel-wasm` (compiled to `wasm32-wasip1`) into a
 //! wasmtime engine, satisfies the documented `kh_*` import surface,
 //! and forwards user-syscall requests into `kernel_dispatch`. Also
-//! spawns user processes into separate stores whose `host_*` imports
+//! spawns user processes into separate stores whose `sys_*` imports
 //! are wired back through the kernel.
 //!
 //! Eventually extracted into:
@@ -47,7 +47,14 @@ mod sys_method_id {
     pub const GETEUID: u32 = 0x1_0002;
     pub const GETGID: u32 = 0x1_0003;
     pub const GETEGID: u32 = 0x1_0004;
+    pub const GETPID: u32 = 0x1_0005;
+    pub const GETPPID: u32 = 0x1_0006;
 }
+
+/// Reserved pid for direct calls from outside any user process — the
+/// microkernel itself driving the kernel for tests, bootstrapping, or
+/// internal bookkeeping. Real user processes start at `1`.
+pub const KERNEL_PID: u32 = 0;
 
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
@@ -124,13 +131,21 @@ pub struct KernelInstance {
     memory: Memory,
     scratch_ptr: u32,
     scratch_len: u32,
-    dispatch: TypedFunc<(u32, u32, u32, u32, u32), i64>,
+    dispatch: TypedFunc<(u32, u32, u32, u32, u32, u32), i64>,
 }
 
 impl KernelInstance {
     /// Run a syscall. Stages `request` in the kernel scratch buffer,
     /// invokes `kernel_dispatch`, copies the response back out.
-    pub fn syscall(&mut self, method_id: u32, request: &[u8], response: &mut [u8]) -> Result<i64> {
+    /// `caller_pid` identifies the originating user process (or
+    /// [`KERNEL_PID`] for direct microkernel-internal calls).
+    pub fn syscall(
+        &mut self,
+        method_id: u32,
+        caller_pid: u32,
+        request: &[u8],
+        response: &mut [u8],
+    ) -> Result<i64> {
         if request.len() + response.len() > self.scratch_len as usize {
             return Err(anyhow!(
                 "request+response ({} bytes) exceeds scratch capacity ({} bytes)",
@@ -152,7 +167,7 @@ impl KernelInstance {
             .dispatch
             .call(
                 &mut self.store,
-                (method_id, in_ptr, in_len, out_ptr, out_cap),
+                (method_id, caller_pid, in_ptr, in_len, out_ptr, out_cap),
             )
             .context("kernel_dispatch")?;
         if !response.is_empty() {
@@ -169,6 +184,7 @@ impl KernelInstance {
 pub struct Microkernel {
     engine: Engine,
     kernel: Rc<RefCell<KernelInstance>>,
+    next_pid: RefCell<u32>,
 }
 
 impl Microkernel {
@@ -198,7 +214,7 @@ impl Microkernel {
             .get_typed_func::<(), u32>(&mut store, "kernel_scratch_len")?
             .call(&mut store, ())?;
         let dispatch = instance
-            .get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_dispatch")?;
+            .get_typed_func::<(u32, u32, u32, u32, u32, u32), i64>(&mut store, "kernel_dispatch")?;
 
         let kernel = KernelInstance {
             store,
@@ -210,16 +226,17 @@ impl Microkernel {
         Ok(Self {
             engine,
             kernel: Rc::new(RefCell::new(kernel)),
+            next_pid: RefCell::new(1),
         })
     }
 
-    /// Invoke a kernel syscall directly (no user process). Useful for
-    /// tests and for operations that originate inside the microkernel
-    /// itself.
+    /// Invoke a kernel syscall directly (no user process). The kernel
+    /// sees `KERNEL_PID` (0) as the caller. Useful for tests and for
+    /// operations that originate inside the microkernel itself.
     pub fn syscall(&self, method_id: u32, request: &[u8], response: &mut [u8]) -> Result<i64> {
         self.kernel
             .borrow_mut()
-            .syscall(method_id, request, response)
+            .syscall(method_id, KERNEL_PID, request, response)
     }
 
     /// Mutable view of the host state served to kernel.wasm. Returns a
@@ -228,21 +245,33 @@ impl Microkernel {
         RefMut::map(self.kernel.borrow_mut(), |k| k.store.data_mut())
     }
 
-    /// Compile and instantiate a user process whose `host_*` imports
-    /// are forwarded back into the kernel via the trampoline.
+    /// Compile and instantiate a user process whose `sys_*` imports
+    /// are forwarded back into the kernel via the trampoline. The
+    /// process is assigned a fresh pid (starting at `1`); future spawns
+    /// increment.
     pub fn spawn_user_process(&self, wasm: &[u8]) -> Result<UserProcess> {
         let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
         let mut linker: Linker<UserState> = Linker::new(&self.engine);
         register_sys_imports(&mut linker)?;
 
+        let mut next = self.next_pid.borrow_mut();
+        let pid = *next;
+        *next += 1;
+        drop(next);
+
         let user_state = UserState {
             kernel: self.kernel.clone(),
+            pid,
         };
         let mut store = Store::new(&self.engine, user_state);
         let instance = linker
             .instantiate(&mut store, &module)
             .context("instantiate user-process wasm")?;
-        Ok(UserProcess { store, instance })
+        Ok(UserProcess {
+            store,
+            instance,
+            pid,
+        })
     }
 }
 
@@ -250,18 +279,26 @@ impl Microkernel {
 
 /// State threaded through every host callback that runs during a
 /// user-process call. Holds a shared reference to the kernel so
-/// `host_*` imports can forward into `kernel_dispatch`.
+/// `sys_*` imports can forward into `kernel_dispatch`, plus the pid
+/// the kernel sees as the caller for this process.
 pub struct UserState {
     kernel: Rc<RefCell<KernelInstance>>,
+    pid: u32,
 }
 
 /// A spawned user-process instance.
 pub struct UserProcess {
     store: Store<UserState>,
     instance: wasmtime::Instance,
+    pid: u32,
 }
 
 impl UserProcess {
+    /// Pid the kernel sees as this process's caller_pid.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// Invoke an exported `() -> i32` function. The convention for
     /// trampoline tests is a `run() -> i32` export that returns the
     /// scalar result of a single syscall; richer entry points come
@@ -357,17 +394,16 @@ fn register_kh_imports(linker: &mut Linker<HostState>) -> Result<()> {
     Ok(())
 }
 
-/// Wires the `host_*` import surface user processes link against. Each
+/// Wires the `sys_*` import surface user processes link against. Each
 /// import forwards into `kernel_dispatch` with the appropriate method
-/// id from `yurt_abi_methods.toml`. The legacy `host_*` namespace
-/// remains during the transition; userland is recompiled against
-/// `sys_*` symbols when the migration completes.
+/// id from `yurt_abi_methods.toml`. The wasm import names match the architectural reality: these are syscalls.
 fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     fn forward_scalar(caller: &Caller<'_, UserState>, method_id: u32) -> i32 {
+        let pid = caller.data().pid;
         let kernel = caller.data().kernel.clone();
         let mut k = kernel.borrow_mut();
         let dispatch = k.dispatch.clone();
-        match dispatch.call(&mut k.store, (method_id, 0, 0, 0, 0)) {
+        match dispatch.call(&mut k.store, (method_id, pid, 0, 0, 0, 0)) {
             Ok(rc) => rc as i32,
             Err(_) => -(EFAULT as i32),
         }
@@ -375,23 +411,33 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
 
     linker.func_wrap(
         SYS_NAMESPACE,
-        "host_getuid",
+        "sys_getuid",
         |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETUID) },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
-        "host_geteuid",
+        "sys_geteuid",
         |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETEUID) },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
-        "host_getgid",
+        "sys_getgid",
         |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETGID) },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
-        "host_getegid",
+        "sys_getegid",
         |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETEGID) },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_getpid",
+        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETPID) },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_getppid",
+        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETPPID) },
     )?;
     Ok(())
 }

@@ -48,11 +48,14 @@ pub extern "C" fn kernel_scratch_len() -> u32 {
 
 /// Host-callable entry point. Stable C ABI.
 ///
-/// `method_id` is the stable u32 assigned to each `[import.<name>]` entry
-/// in `abi/contract/yurt_abi.toml`. `(in_ptr, in_len)` points at the
-/// request bytes the microkernel copied out of process; the kernel
-/// writes the response (a fixed-size record per `yurt_abi.toml`) into
-/// `(out_ptr, out_cap)`. Return value is the syscall scalar.
+/// `method_id` is the stable u32 assigned in
+/// `abi/contract/yurt_abi_methods.toml`. `caller_pid` identifies the
+/// originating user process — `0` is reserved for the microkernel
+/// itself (direct calls from outside any user process); user processes
+/// start at `1`. `(in_ptr, in_len)` points at the request bytes the
+/// microkernel copied out of the caller; the kernel writes the
+/// response into `(out_ptr, out_cap)`. Return value is the syscall
+/// scalar (`>= 0` success / `< 0` negated POSIX errno).
 ///
 /// # Safety
 ///
@@ -61,6 +64,7 @@ pub extern "C" fn kernel_scratch_len() -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn kernel_dispatch(
     method_id: u32,
+    caller_pid: u32,
     in_ptr: *const u8,
     in_len: usize,
     out_ptr: *mut u8,
@@ -76,7 +80,7 @@ pub unsafe extern "C" fn kernel_dispatch(
     } else {
         core::slice::from_raw_parts_mut(out_ptr, out_cap)
     };
-    dispatch::dispatch(method_id, request, response)
+    dispatch::dispatch(method_id, caller_pid, request, response)
 }
 
 #[cfg(test)]
@@ -89,6 +93,7 @@ mod tests {
         let rc = unsafe {
             kernel_dispatch(
                 0xDEAD_BEEF,
+                0,
                 core::ptr::null(),
                 0,
                 out.as_mut_ptr(),
@@ -100,8 +105,16 @@ mod tests {
 
     #[test]
     fn null_buffers_are_treated_as_empty() {
-        let rc =
-            unsafe { kernel_dispatch(0xDEAD_BEEF, core::ptr::null(), 0, core::ptr::null_mut(), 0) };
+        let rc = unsafe {
+            kernel_dispatch(
+                0xDEAD_BEEF,
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
         assert_eq!(rc, -(abi::ENOSYS as i64));
     }
 }
