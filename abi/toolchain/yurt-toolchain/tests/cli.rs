@@ -704,6 +704,151 @@ fn preserves_pre_opt_artifact_at_stable_path() {
     assert!(out_wasm.exists(), "linked wasm missing");
 }
 
+// ── Slice 1B (shared libraries Phase 1, toolchain) ────────────────────
+//
+// These tests pin the contract for `yurt-cc -shared` side-module builds.
+// Spec: docs/superpowers/specs/2026-05-09-shared-libraries-design.md.
+//
+// A side module is NOT a final Yurt link in the static-archive sense:
+// it must not bundle libyurt_abi.a, must not force-export Tier 1
+// symbols, must not pull in the WASI emulation libs or `__main_argc_argv`
+// reference, but it IS a final link as far as the wasm-ld invocation goes.
+// The dry-run output makes the wasm-ld flags inspectable without needing
+// a real wasi-sdk install.
+
+#[test]
+fn shared_link_passes_shared_and_experimental_pic_flags() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .arg("--dry-run")
+            .arg("-shared")
+            .arg("foo.o")
+            .arg("-o")
+            .arg("libfoo.wasm")
+            .output()
+            .unwrap(),
+    );
+
+    let tokens = stdout_tokens(&stdout);
+    assert!(tokens.contains(&"-shared"), "{stdout}");
+    assert!(
+        stdout.contains("-Wl,--experimental-pic"),
+        "wasm-ld needs --experimental-pic for side modules: {stdout}",
+    );
+}
+
+#[test]
+fn shared_link_does_not_inject_libyurt_abi_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("share/wasi-sysroot")).unwrap();
+    let clang = root.join("bin/clang");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&clang, b"#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&clang, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", root)
+            .env("YURT_CC_ARCHIVE", "/fake/libyurt_abi.a")
+            .env("YURT_CC_INCLUDE", "/fake/include")
+            .env("YURT_CC_SKIP_VERSION_CHECK", "1")
+            .arg("--dry-run")
+            .arg("-shared")
+            .arg("foo.o")
+            .arg("-o")
+            .arg("libfoo.wasm")
+            .output()
+            .unwrap(),
+    );
+
+    assert!(
+        !stdout.contains("--whole-archive"),
+        "side module must not include libyurt_abi.a via --whole-archive: {stdout}",
+    );
+    assert!(
+        !stdout.contains("/fake/libyurt_abi.a"),
+        "side module must not bundle the static ABI archive: {stdout}",
+    );
+    assert!(
+        !stdout.contains("-Wl,--export=dup2"),
+        "Tier 1 forced exports belong to the main module, not side modules: {stdout}",
+    );
+    assert!(
+        !stdout.contains("-Wl,--wrap=getcwd"),
+        "WASI libc symbol wrapping is for main modules only: {stdout}",
+    );
+    assert!(
+        !stdout.contains("-lwasi-emulated-signal"),
+        "WASI emulated libs are linked into main modules, not side modules: {stdout}",
+    );
+    assert!(
+        !stdout.contains("-Wl,-u,__main_argc_argv"),
+        "side modules have no `main`, must not force the entrypoint reference: {stdout}",
+    );
+}
+
+#[test]
+fn shared_link_does_not_force_compile_policy_flags() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .arg("--dry-run")
+            .arg("-shared")
+            .arg("foo.o")
+            .arg("-o")
+            .arg("libfoo.wasm")
+            .output()
+            .unwrap(),
+    );
+
+    // -shared is a link step; the compile-policy defaults (-O2, -std=gnu23,
+    // -Wall, -Wextra) belong to compilation of the main module's source
+    // files. They are noise here.
+    let tokens = stdout_tokens(&stdout);
+    assert!(!tokens.contains(&"-O2"), "{stdout}");
+    assert!(!tokens.contains(&"-std=gnu23"), "{stdout}");
+    assert!(!tokens.contains(&"-Wall"), "{stdout}");
+    assert!(!tokens.contains(&"-Wextra"), "{stdout}");
+}
+
+#[test]
+fn fpic_compile_passes_through_to_clang() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .arg("--dry-run")
+            .arg("-c")
+            .arg("-fPIC")
+            .arg("foo.c")
+            .arg("-o")
+            .arg("foo.o")
+            .output()
+            .unwrap(),
+    );
+
+    let tokens = stdout_tokens(&stdout);
+    assert!(
+        tokens.contains(&"-fPIC"),
+        "-fPIC must reach clang: {stdout}"
+    );
+    assert!(tokens.contains(&"-c"), "{stdout}");
+    // Compile-only invocations skip the archive/Tier 1 framing regardless
+    // of -fPIC; we just confirm -fPIC does not flip that off.
+    assert!(!stdout.contains("--whole-archive"), "{stdout}");
+}
+
 #[test]
 fn yurt_ar_exists_and_forwards_help() {
     let ar = env!("CARGO_BIN_EXE_yurt-ar");

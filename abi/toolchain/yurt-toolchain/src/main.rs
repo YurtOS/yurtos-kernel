@@ -78,7 +78,22 @@ fn has_compile_or_link_input(user_args: &[String]) -> bool {
 }
 
 fn is_final_yurt_link_invocation(env: &env::Env, user_args: &[String]) -> bool {
-    !env.no_link_injection && !is_compile_or_probe_invocation(user_args)
+    !env.no_link_injection
+        && !is_compile_or_probe_invocation(user_args)
+        && !is_shared_link_invocation(user_args)
+}
+
+/// `yurt-cc -shared` produces a WASM side module per the Phase 1 shared-library
+/// contract (§docs/superpowers/specs/2026-05-09-shared-libraries-design.md).
+/// A side module is a final wasm-ld invocation but it must not bundle the
+/// `libyurt_abi.a` static archive, force-export Tier 1 symbols, wrap WASI
+/// libc, or pull in the WASI emulation libs / `__main_argc_argv` reference —
+/// those are properties of the main module that loads the side module at
+/// run time. The shared-link path keeps clang's normal `-shared` handling and
+/// adds `-Wl,--experimental-pic` so wasm-ld emits a position-independent
+/// `dylink.0`-bearing wasm.
+fn is_shared_link_invocation(user_args: &[String]) -> bool {
+    user_args.iter().any(|a| a == "-shared")
 }
 
 fn default_yurt_include_dir() -> Option<PathBuf> {
@@ -261,6 +276,13 @@ fn build_clang_invocation(
                 argv.push(arg.into());
             }
         }
+    }
+    if is_shared_link_invocation(user_args)
+        && !contains_exact_arg(user_args, "-Wl,--experimental-pic")
+    {
+        // wasm-ld requires --experimental-pic to honor `-shared` and emit
+        // the dylink.0 custom section that the Phase 1 loader reads.
+        argv.push("-Wl,--experimental-pic".into());
     }
     // -DYURT_ABI_MARKERS=1 expands the marker macros into
     // their real bodies in yurt_markers.h.  Without it, the macros
