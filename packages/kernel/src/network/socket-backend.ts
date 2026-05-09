@@ -63,7 +63,19 @@ export type SocketAcceptBackendResult =
 export interface SocketBackend {
   connect(
     req: { host: string; port: number; tls: boolean },
-  ): { ok: true; socket: SocketHandle } | { ok: false; error: string };
+  ):
+    | {
+      ok: true;
+      socket: SocketHandle;
+      /** Peer/local addresses observed by the backend. Optional so
+       *  long-lived test backends without registry-style bookkeeping
+       *  remain valid; loopback and bridge backends always populate them. */
+      peerHost?: string;
+      peerPort?: number;
+      localHost?: string;
+      localPort?: number;
+    }
+    | { ok: false; error: string };
   send(socket: SocketHandle, dataB64: string): SocketBackendResult;
   recv(
     socket: SocketHandle,
@@ -215,7 +227,16 @@ export function createLoopbackSocketBackend(
 
     connect(req) {
       const r = registry.connect({ host: req.host, port: req.port });
-      if (r.ok) return { ok: true, socket: pub(r.socket) };
+      if (r.ok) {
+        return {
+          ok: true,
+          socket: pub(r.socket),
+          peerHost: r.peerHost,
+          peerPort: r.peerPort,
+          localHost: r.localHost,
+          localPort: r.localPort,
+        };
+      }
       return delegate?.connect(req) ?? { ok: false, error: r.error };
     },
 
@@ -341,7 +362,22 @@ export function createNetworkBridgeSocketBackend(
             : "socket connect failed",
         };
       }
-      return { ok: true, socket: result.socket_id };
+      return {
+        ok: true,
+        socket: result.socket_id,
+        ...(typeof result.peer_host === "string"
+          ? { peerHost: result.peer_host }
+          : {}),
+        ...(typeof result.peer_port === "number"
+          ? { peerPort: result.peer_port }
+          : {}),
+        ...(typeof result.local_host === "string"
+          ? { localHost: result.local_host }
+          : {}),
+        ...(typeof result.local_port === "number"
+          ? { localPort: result.local_port }
+          : {}),
+      };
     },
 
     send(socket, dataB64) {
@@ -407,10 +443,18 @@ export function createNetworkBridgeSocketBackend(
      * between attempts so other host work can run. This is the
      * transport's only supported async pattern; the host-import handler
      * still sees a single `await acceptAsync`.
+     *
+     * No artificial deadline: real `accept(2)` blocks until a connection
+     * arrives or the listener closes. Process-level timeouts/cancellations
+     * are enforced by the kernel's deadline machinery, not here. The
+     * polling cadence backs off from 5ms to 100ms so an idle listener
+     * doesn't hammer the SAB. Loop terminates when the bridge returns
+     * any non-`wouldBlock` result — success, listener-closed, or error.
      */
     async acceptAsync(listener) {
-      const deadline = Date.now() + 30_000;
-      while (Date.now() < deadline) {
+      let delayMs = 5;
+      // deno-lint-ignore no-constant-condition
+      while (true) {
         const r = parseAccept(bridge.requestSync({
           op: "accept",
           listener_id: listener,
@@ -418,9 +462,9 @@ export function createNetworkBridgeSocketBackend(
         if (!(r.ok === false && "wouldBlock" in r && r.wouldBlock === true)) {
           return r;
         }
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (delayMs < 100) delayMs = Math.min(100, delayMs * 2);
       }
-      return { ok: false, error: "accept: timed out" };
     },
 
     recvAsync(socket, maxBytes) {

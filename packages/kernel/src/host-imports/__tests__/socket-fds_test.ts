@@ -104,7 +104,7 @@ describe("socket fd host imports", () => {
     expect(kernel.getFdTarget(0, fd)).toBeNull();
   });
 
-  it("routes WASI fd_read and fd_write for connected socket fds through the backend", () => {
+  it("routes WASI fd_read and fd_write for connected socket fds through the backend", async () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const requests: Record<string, unknown>[] = [];
@@ -186,7 +186,7 @@ describe("socket fd host imports", () => {
 
     view.setUint32(40, 600, true);
     view.setUint32(44, 8, true);
-    expect(wasi.fd_read(fd, 40, 1, 68)).toBe(WASI_ESUCCESS);
+    expect(await wasi.fd_read(fd, 40, 1, 68)).toBe(WASI_ESUCCESS);
     expect(view.getUint32(68, true)).toBe(4);
     expect(new TextDecoder().decode(bytes.subarray(600, 604))).toBe("pong");
     expect(requests.at(-1)).toEqual({
@@ -254,6 +254,70 @@ describe("socket fd host imports", () => {
     });
     expect(typeof addr.local_port).toBe("number");
     expect(addr.local_port as number).toBeGreaterThanOrEqual(49152);
+  });
+
+  it("uses backend-reported addresses for connected socket fds", () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    const kernel = new ProcessKernel();
+    let backend: SocketBackend;
+    backend = {
+      connect: () => ({
+        ok: true,
+        socket: 77,
+        peerHost: "10.0.2.15",
+        peerPort: 8080,
+        localHost: "127.0.0.1",
+        localPort: 50321,
+      }),
+      send: () => ({ ok: true, bytes_sent: 0 }),
+      recv: () => ({ ok: true, data_b64: "" }),
+      close: () => ({ ok: true }),
+      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+      recvAsync: (socket, maxBytes) =>
+        Promise.resolve(backend.recv(socket, maxBytes)),
+    };
+    const imports = createKernelImports({
+      memory,
+      kernel,
+      socketBackend: backend,
+    });
+
+    const fd = (imports.host_socket_open as (...args: number[]) => number)(
+      2,
+      1,
+      0,
+    );
+    const connectReqLen = writeString(
+      memory,
+      16,
+      JSON.stringify({
+        fd,
+        host: "example.test",
+        port: 443,
+        tls: false,
+      }),
+    );
+    (imports.host_socket_connect as (...args: number[]) => number)(
+      16,
+      connectReqLen,
+      256,
+      4096,
+    );
+
+    const addrReqLen = writeString(memory, 16, JSON.stringify({ fd }));
+    const addrLen = (imports.host_socket_addr as (...args: number[]) => number)(
+      16,
+      addrReqLen,
+      512,
+      4096,
+    );
+    expect(readJson(memory, 512, addrLen)).toEqual({
+      ok: true,
+      peer_host: "10.0.2.15",
+      peer_port: 8080,
+      local_host: "127.0.0.1",
+      local_port: 50321,
+    });
   });
 
   it("applies and reports TCP_NODELAY through connected socket fds", () => {

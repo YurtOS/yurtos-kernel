@@ -1239,27 +1239,12 @@ export class WasiHost {
             const nonblocking =
               ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
             if (nonblocking) {
-              const result = target.recv(target.socket, iov.len, {
-                nonblocking: true,
-              });
-              if (!result.ok) {
-                return result.error === "EAGAIN" ? WASI_EAGAIN : WASI_EIO;
-              }
-              const data = result.data_b64 !== undefined
-                ? base64ToBytes(result.data_b64)
-                : this.encoder.encode(result.data ?? "");
-              const toRead = Math.min(iov.len, data.byteLength);
-              if (toRead > 0) {
-                const bytes = this.getBytes();
-                bytes.set(data.subarray(0, toRead), iov.buf);
-                totalRead += toRead;
-              }
-              if (toRead < iov.len) {
-                const viewAfter = this.getView();
-                viewAfter.setUint32(nreadPtr, totalRead, true);
-                return WASI_ESUCCESS;
-              }
-              continue;
+              // peekBuffer was already empty (we'd have returned above
+              // otherwise); nonblocking reads return EAGAIN without
+              // consulting the backend — incoming bytes only land in
+              // peekBuffer through prior host_socket_recv peek probes or
+              // recvAsync deliveries.
+              return WASI_EAGAIN;
             }
             // Blocking socket read — suspend the WASM stack via JSPI/Asyncify
             // until at least one byte (or EOF) is available.

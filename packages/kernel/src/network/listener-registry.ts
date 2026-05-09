@@ -118,8 +118,23 @@ export class ListenerRegistry {
 
   listen(req: ListenRequest): ListenerInfo {
     const port = req.port === 0 ? this.allocEphemeralPort() : req.port;
-    const key = `${normalizeHost(req.host)}:${port}`;
+    const newHost = normalizeHost(req.host);
+    const key = `${newHost}:${port}`;
+    const wildcardKey = `0.0.0.0:${port}`;
     if (this.routes.has(key)) {
+      throw new Error(`address ${req.host}:${port} already in use`);
+    }
+    // A wildcard bind covers every interface, so it must be exclusive on
+    // its port: a new wildcard collides with any existing specific bind,
+    // and a new specific bind collides with an existing wildcard.
+    if (newHost === "0.0.0.0") {
+      const portSuffix = `:${port}`;
+      for (const existing of this.routes.keys()) {
+        if (existing.endsWith(portSuffix)) {
+          throw new Error(`address ${req.host}:${port} already in use`);
+        }
+      }
+    } else if (this.routes.has(wildcardKey)) {
       throw new Error(`address ${req.host}:${port} already in use`);
     }
     const handle = this.nextListenerHandle++;

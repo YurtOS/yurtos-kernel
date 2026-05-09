@@ -8,9 +8,7 @@
 import { VFS } from "./vfs/vfs.js";
 import { OverlayVFS } from "./vfs/overlay-vfs.js";
 import { NodeDirectoryRootProvider } from "./vfs/node-directory-root-provider.js";
-import {
-  TarImageRootProvider,
-} from "./vfs/tar-image-root-provider.js";
+import { TarImageRootProvider } from "./vfs/tar-image-root-provider.js";
 import { loadYurtImage } from "./image-loader.js";
 import { YURT_VERSION } from "./version.js";
 import { ProcessManager } from "./process/manager.js";
@@ -287,8 +285,9 @@ export class Sandbox {
    */
   get net(): SandboxNet | null {
     if (this._net) return this._net;
-    const registry = (this.socketBackend as { registry?: ListenerRegistry } | undefined)
-      ?.registry;
+    const registry =
+      (this.socketBackend as { registry?: ListenerRegistry } | undefined)
+        ?.registry;
     if (!registry) return null;
     this._net = new SandboxNet(registry);
     return this._net;
@@ -306,7 +305,9 @@ export class Sandbox {
 
   static async create(options: SandboxOptions): Promise<Sandbox> {
     if (options.baseRoot && options.image) {
-      throw new Error("Sandbox.create accepts either baseRoot or image, not both");
+      throw new Error(
+        "Sandbox.create accepts either baseRoot or image, not both",
+      );
     }
     const adapter = options.adapter ?? await Sandbox.detectAdapter();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -1311,7 +1312,9 @@ export class Sandbox {
     pathEnv = "/usr/extensions:/usr/bin:/bin",
   ): string {
     for (const dir of pathEnv.split(":")) {
-      const base = dir === "" ? cwd : dir.startsWith("/")
+      const base = dir === ""
+        ? cwd
+        : dir.startsWith("/")
         ? dir
         : Sandbox.resolveSpawnPath(dir, cwd);
       const path = `${base === "/" ? "" : base}/${prog}`;
@@ -1764,6 +1767,29 @@ export class Sandbox {
   stat(path: string): StatResult {
     this.assertAlive();
     return this.vfs.stat(path);
+  }
+
+  /**
+   * Snapshot of VFS storage usage and configured limits. Useful for tests and
+   * for hosts that surface disk-space telemetry to the user. Returns
+   * `undefined` for VFS implementations that don't track byte/file counts.
+   */
+  getStorageStats(): {
+    totalBytes: number;
+    limitBytes: number | undefined;
+    fileCount: number;
+    fileCountLimit: number | undefined;
+  } | undefined {
+    this.assertAlive();
+    const fn = (this.vfs as { getStorageStats?: () => unknown })
+      .getStorageStats;
+    if (typeof fn !== "function") return undefined;
+    return fn.call(this.vfs) as {
+      totalBytes: number;
+      limitBytes: number | undefined;
+      fileCount: number;
+      fileCountLimit: number | undefined;
+    };
   }
 
   process(pid: number): Process | undefined {
