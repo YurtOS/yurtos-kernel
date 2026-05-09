@@ -248,19 +248,28 @@ export function buildWasiShim(
     _dirflags: number,
     pathPtr: number,
     pathLen: number,
-    _oflags: number,
-    _fsRightsBase: bigint,
+    oflags: number,
+    fsRightsBase: bigint,
     _fsRightsInheriting: bigint,
     _fdflags: number,
     retFdPtr: number,
   ): number => {
     if (dirfd !== PREOPEN_ROOT_FD) return EBADF;
     const rel = new Uint8Array(um(), pathPtr, pathLen).slice();
-    // wasi-libc strips the preopen prefix; restore the leading '/'.
-    const full = new Uint8Array(rel.length + 1);
-    full[0] = 0x2f; // '/'
-    full.set(rel, 1);
-    const { rc } = kernel.syscall(METHOD.SYS_OPEN, pid, full, 0);
+    // Map WASI oflags + rights → kernel sys_open flags.
+    // WASI oflags: CREAT=1, DIRECTORY=2, EXCL=4, TRUNC=8.
+    // WASI rights: FD_WRITE = bit 6.
+    const wantWrite = (fsRightsBase & (1n << 6n)) !== 0n;
+    let kFlags = 0;
+    if (wantWrite) kFlags |= 0b001;
+    if (oflags & 0b0001) kFlags |= 0b010; // CREAT
+    if (oflags & 0b1000) kFlags |= 0b100; // TRUNC
+    // Build "u32 flags + '/' + relpath".
+    const req = new Uint8Array(4 + 1 + rel.length);
+    new DataView(req.buffer).setUint32(0, kFlags >>> 0, true);
+    req[4] = 0x2f; // '/'
+    req.set(rel, 5);
+    const { rc } = kernel.syscall(METHOD.SYS_OPEN, pid, req, 0);
     const n = Number(rc);
     if (n < 0) return errnoFromKernel(n);
     new DataView(um()).setUint32(retFdPtr, n >>> 0, true);

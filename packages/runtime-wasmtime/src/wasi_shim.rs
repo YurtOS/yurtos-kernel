@@ -484,8 +484,8 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
          _dirflags: i32,
          path_ptr: u32,
          path_len: u32,
-         _oflags: i32,
-         _fs_rights_base: i64,
+         oflags: i32,
+         fs_rights_base: i64,
          _fs_rights_inheriting: i64,
          _fdflags: i32,
          ret_fd_ptr: u32|
@@ -497,20 +497,34 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 Some(m) => m,
                 None => return EINVAL,
             };
-            // Read the relative path bytes out of user memory.
             let mut rel = vec![0u8; path_len as usize];
             if path_len > 0 && memory.read(&caller, path_ptr as usize, &mut rel).is_err() {
                 return EINVAL;
             }
-            // Prepend "/" so the path matches the ramfs key. wasi-libc
-            // strips the preopen prefix; we restore it.
-            let mut full = Vec::with_capacity(rel.len() + 1);
-            full.push(b'/');
-            full.extend_from_slice(&rel);
+            // Map WASI oflags + rights → kernel sys_open flags.
+            // WASI oflags: CREAT=1, DIRECTORY=2, EXCL=4, TRUNC=8.
+            // WASI rights: FD_WRITE = bit 6.
+            let want_write = (fs_rights_base as u64) & (1 << 6) != 0;
+            let mut k_flags: u32 = 0;
+            if want_write {
+                k_flags |= 0b001;
+            }
+            if oflags & 0b0001 != 0 {
+                k_flags |= 0b010; // CREAT
+            }
+            if oflags & 0b1000 != 0 {
+                k_flags |= 0b100; // TRUNC
+            }
+            // Build "u32 flags + '/' + relpath" — wasi-libc strips
+            // the preopen prefix, we restore it.
+            let mut req = Vec::with_capacity(4 + 1 + rel.len());
+            req.extend_from_slice(&k_flags.to_le_bytes());
+            req.push(b'/');
+            req.extend_from_slice(&rel);
             let rc = crate::microkernel::trampoline_request_with_response(
                 &mut caller,
                 METHOD_OPEN,
-                &full,
+                &req,
                 &mut [],
             );
             if rc < 0 {

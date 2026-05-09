@@ -304,8 +304,14 @@ Deno.test(
     mk.registerRamfsFile(enc.encode("/etc/motd"), enc.encode("hello ramfs\n"));
 
     // Open via direct kernel syscall (KERNEL_PID is the caller).
-    const path = enc.encode("/etc/motd");
-    const open = mk.syscall(METHOD.SYS_OPEN, path, 0);
+    // sys_open wire format: u32 flags + path bytes. flags=0 = read-only.
+    const buildOpen = (flags: number, path: Uint8Array) => {
+      const req = new Uint8Array(4 + path.byteLength);
+      new DataView(req.buffer).setUint32(0, flags >>> 0, true);
+      req.set(path, 4);
+      return req;
+    };
+    const open = mk.syscall(METHOD.SYS_OPEN, buildOpen(0, enc.encode("/etc/motd")), 0);
     const fd = Number(open.rc);
     if (fd < 0) throw new Error(`expected open success, got ${fd}`);
 
@@ -316,7 +322,7 @@ Deno.test(
     assertEquals(new TextDecoder().decode(response.subarray(0, n)), "hello ramfs\n");
 
     // Unknown path → -ENOENT (-2).
-    const missing = mk.syscall(METHOD.SYS_OPEN, enc.encode("/no/such"), 0);
+    const missing = mk.syscall(METHOD.SYS_OPEN, buildOpen(0, enc.encode("/no/such")), 0);
     assertEquals(Number(missing.rc), -2);
   },
 );

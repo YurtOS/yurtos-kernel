@@ -450,9 +450,32 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
                 end: crate::kernel::PipeEnd::Read,
                 ..
             } => -(abi::EBADF as i64), // can't write to read end
-            // Phase 2 ramfs is read-only; writes through a File fd are
-            // refused. Real write support arrives with the OFD registry.
-            crate::kernel::FdEntry::File { .. } => -(abi::EBADF as i64),
+            crate::kernel::FdEntry::File { ofd_id } => {
+                let (file_id, offset, writable) = match k.ofd(ofd_id) {
+                    Some(o) => (o.file_id, o.offset, o.writable),
+                    None => return -(abi::EBADF as i64),
+                };
+                if !writable {
+                    return -(abi::EBADF as i64);
+                }
+                // Write into the file at offset, growing if needed.
+                let written = match k.ramfs_file_mut(file_id) {
+                    Some(f) => {
+                        let start = offset as usize;
+                        let end = start + payload.len();
+                        if end > f.content.len() {
+                            f.content.resize(end, 0);
+                        }
+                        f.content[start..end].copy_from_slice(payload);
+                        payload.len()
+                    }
+                    None => return -(abi::EBADF as i64),
+                };
+                if let Some(o) = k.ofd_mut(ofd_id) {
+                    o.offset += written as u64;
+                }
+                written as i64
+            }
         }
     })
 }
@@ -702,17 +725,36 @@ fn register_file(request: &[u8]) -> i64 {
     0
 }
 
-/// `sys_open(path) -> fd`. Read-only against the in-memory ramfs.
+/// `sys_open(flags, path) -> fd`. Request: u32 flags LE + path bytes.
+/// Flags bits: 0=writable, 1=create-if-missing (O_CREAT),
+/// 2=truncate-if-exists (O_TRUNC).
 fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
-    if request.is_empty() {
+    if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
+    let flags = u32::from_le_bytes(request[0..4].try_into().unwrap());
+    let path = &request[4..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let writable = flags & 0b001 != 0;
+    let create = flags & 0b010 != 0;
+    let trunc = flags & 0b100 != 0;
     with_kernel(|k| {
-        let file_id = match k.lookup_file_id(request) {
+        let file_id = match k.lookup_file_id(path) {
             Some(id) => id,
-            None => return -(abi::ENOENT as i64),
+            None => {
+                if create {
+                    k.install_file(path.to_vec(), Vec::new())
+                } else {
+                    return -(abi::ENOENT as i64);
+                }
+            }
         };
-        let ofd_id = k.create_ofd(file_id);
+        if trunc {
+            k.ramfs_truncate(file_id);
+        }
+        let ofd_id = k.create_ofd(file_id, writable);
         let p = k.process_mut(caller_pid);
         let fd = p.fd_table.lowest_free_fd();
         p.fd_table
@@ -812,6 +854,17 @@ fn now_realtime(response: &mut [u8]) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Helper: pack a sys_open request (u32 flags + path bytes).
+    /// flags=0 means read-only (the previous default).
+    fn open_req(flags: u32, path: &[u8]) -> Vec<u8> {
+        let mut req = flags.to_le_bytes().to_vec();
+        req.extend_from_slice(path);
+        req
+    }
+    const O_WRITE: u32 = 0b001;
+    const O_CREAT: u32 = 0b010;
+    const O_TRUNC: u32 = 0b100;
 
     #[test]
     fn echo_copies_min_of_request_and_response_lengths() {
@@ -1742,7 +1795,7 @@ mod tests {
         assert_eq!(dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &req, &mut []), 0);
 
         // Open it; expect the lowest free fd (3, since 0/1/2 are stdio).
-        let fd = dispatch(METHOD_SYS_OPEN, 1, path, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, path), &mut []);
         assert_eq!(fd, 3);
 
         // Read all bytes.
@@ -1776,7 +1829,7 @@ mod tests {
     fn open_nonexistent_path_is_enoent() {
         let _g = crate::kernel::TestGuard::acquire();
         assert_eq!(
-            dispatch(METHOD_SYS_OPEN, 1, b"/no/such", &mut []),
+            dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/no/such"), &mut []),
             -(abi::ENOENT as i64)
         );
     }
@@ -1789,7 +1842,7 @@ mod tests {
         reg.extend_from_slice(b"/zero");
         reg.extend_from_slice(b"abc");
         dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
-        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/zero", &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/zero"), &mut []);
         assert!(fd >= 0);
         let mut wreq = Vec::new();
         wreq.extend_from_slice(&(fd as u32).to_le_bytes());
@@ -1809,7 +1862,7 @@ mod tests {
         reg.extend_from_slice(b"/abcdef");
         reg.extend_from_slice(b"0123456789");
         dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
-        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/abcdef", &mut []) as u32;
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/abcdef"), &mut []) as u32;
 
         let mut small = [0u8; 4];
         let n = dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut small);
@@ -1833,7 +1886,7 @@ mod tests {
         reg.extend_from_slice(b"/abcde");
         reg.extend_from_slice(b"0123456789");
         dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
-        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/abcde", &mut []) as u32;
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/abcde"), &mut []) as u32;
 
         let mut buf = [0u8; 4];
         assert_eq!(dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut buf), 4);
@@ -1854,7 +1907,7 @@ mod tests {
         reg.extend_from_slice(b"/keep");
         reg.extend_from_slice(b"abc");
         dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
-        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/keep", &mut []) as u32;
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/keep"), &mut []) as u32;
         let dup = dispatch(METHOD_SYS_DUP, 1, &fd.to_le_bytes(), &mut []) as u32;
 
         // Close the original — the duped fd should still read fine.
@@ -1876,7 +1929,7 @@ mod tests {
         reg.extend_from_slice(b"/seek");
         reg.extend_from_slice(b"0123456789");
         dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
-        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/seek", &mut []) as u32;
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/seek"), &mut []) as u32;
 
         // Seek to offset 4 (whence=SET).
         let mut req = Vec::new();
@@ -1901,7 +1954,7 @@ mod tests {
         reg.extend_from_slice(b"/end");
         reg.extend_from_slice(b"abcdefgh"); // 8 bytes
         dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
-        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/end", &mut []) as u32;
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/end"), &mut []) as u32;
 
         // Seek to END - 2.
         let mut req = Vec::new();
@@ -1929,7 +1982,7 @@ mod tests {
         reg.extend_from_slice(b"/ng");
         reg.extend_from_slice(b"hi");
         dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
-        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/ng", &mut []) as u32;
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/ng"), &mut []) as u32;
 
         let mut req = Vec::new();
         req.extend_from_slice(&fd.to_le_bytes());
@@ -1950,7 +2003,7 @@ mod tests {
         reg.extend_from_slice(b"/sta");
         reg.extend_from_slice(b"hello"); // 5 bytes
         dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
-        let fd = dispatch(METHOD_SYS_OPEN, 1, b"/sta", &mut []) as u32;
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/sta"), &mut []) as u32;
 
         let mut out = [0u8; 16];
         assert_eq!(dispatch(METHOD_SYS_FSTAT, 1, &fd.to_le_bytes(), &mut out), 16);
@@ -1961,6 +2014,97 @@ mod tests {
         let mut out2 = [0u8; 16];
         assert_eq!(dispatch(METHOD_SYS_FSTAT, 1, &0_u32.to_le_bytes(), &mut out2), 16);
         assert_eq!(u32::from_le_bytes(out2[8..12].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn open_with_create_installs_empty_file() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // No prior register. Path doesn't exist; CREAT should make it.
+        let fd = dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, b"/new"),
+            &mut [],
+        );
+        assert!(fd >= 0, "CREAT created /new, fd = {fd}");
+        // Write some bytes.
+        let mut wreq = Vec::new();
+        wreq.extend_from_slice(&(fd as u32).to_le_bytes());
+        wreq.extend_from_slice(b"hello world");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []),
+            "hello world".len() as i64
+        );
+        // Reopen read-only and read it back.
+        let rfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/new"), &mut []);
+        let mut buf = [0u8; 32];
+        let n = dispatch(METHOD_SYS_READ, 1, &(rfd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"hello world");
+    }
+
+    #[test]
+    fn write_to_readonly_open_is_ebadf() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        reg.extend_from_slice(b"/ro");
+        reg.extend_from_slice(b"abc");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/ro"), &mut []);
+        let mut wreq = Vec::new();
+        wreq.extend_from_slice(&(fd as u32).to_le_bytes());
+        wreq.extend_from_slice(b"NO");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []),
+            -(abi::EBADF as i64)
+        );
+    }
+
+    #[test]
+    fn open_with_trunc_clears_existing_content() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        reg.extend_from_slice(b"/tr");
+        reg.extend_from_slice(b"existing-data");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        // Open with WRITE | TRUNC → file becomes empty.
+        let fd = dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_TRUNC, b"/tr"),
+            &mut [],
+        ) as u32;
+        // fstat now reports size 0.
+        let mut out = [0u8; 16];
+        dispatch(METHOD_SYS_FSTAT, 1, &fd.to_le_bytes(), &mut out);
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn write_grows_file_and_advances_ofd_offset() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let fd = dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, b"/grow"),
+            &mut [],
+        ) as u32;
+        // Write twice.
+        for chunk in [b"abc".as_slice(), b"def"] {
+            let mut w = Vec::new();
+            w.extend_from_slice(&fd.to_le_bytes());
+            w.extend_from_slice(chunk);
+            assert_eq!(
+                dispatch(METHOD_SYS_WRITE, 1, &w, &mut []),
+                chunk.len() as i64
+            );
+        }
+        // Open read-only and verify "abcdef".
+        let rfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/grow"), &mut []);
+        let mut buf = [0u8; 16];
+        let n = dispatch(METHOD_SYS_READ, 1, &(rfd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"abcdef");
     }
 
     #[test]

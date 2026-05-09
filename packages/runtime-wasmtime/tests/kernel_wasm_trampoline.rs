@@ -924,9 +924,10 @@ fn ramfs_open_then_read_round_trips_content_through_trampoline() {
     // record is first observed; previous direct calls to KERNEL_PID
     // already touched it via the credentials calls upstream of us in
     // the test runner, so the lowest free fd is 3).
-    let fd = mk
-        .syscall(METHOD_SYS_OPEN, b"/etc/motd", &mut [])
-        .unwrap();
+    // sys_open wire format: u32 flags + path bytes. flags=0 = read-only.
+    let mut open_req = 0_u32.to_le_bytes().to_vec();
+    open_req.extend_from_slice(b"/etc/motd");
+    let fd = mk.syscall(METHOD_SYS_OPEN, &open_req, &mut []).unwrap();
     assert!(fd >= 0, "open succeeded: fd = {fd}");
 
     // Read the content into a buffer.
@@ -938,7 +939,9 @@ fn ramfs_open_then_read_round_trips_content_through_trampoline() {
     assert_eq!(&buf[..n as usize], b"hello ramfs\n");
 
     // Open of an unknown path → -ENOENT (-2).
-    let rc = mk.syscall(METHOD_SYS_OPEN, b"/no/such", &mut []).unwrap();
+    let mut miss_req = 0_u32.to_le_bytes().to_vec();
+    miss_req.extend_from_slice(b"/no/such");
+    let rc = mk.syscall(METHOD_SYS_OPEN, &miss_req, &mut []).unwrap();
     assert_eq!(rc, -2);
 }
 

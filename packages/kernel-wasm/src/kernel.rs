@@ -273,6 +273,9 @@ pub struct OpenFileDescription {
     pub file_id: u64,
     pub offset: u64,
     pub refs: u32,
+    /// Whether this OFD permits writes (O_WRONLY / O_RDWR set at
+    /// open time). Read-only OFDs reject sys_write with -EBADF.
+    pub writable: bool,
 }
 
 pub struct Kernel {
@@ -300,9 +303,9 @@ impl Kernel {
         }
     }
 
-    /// Allocate a fresh OFD for `file_id`, with refcount 1 and offset
-    /// 0. Returns the OFD id.
-    pub fn create_ofd(&mut self, file_id: u64) -> u64 {
+    /// Allocate a fresh OFD for `file_id`, with refcount 1, offset 0,
+    /// and the requested `writable` flag. Returns the OFD id.
+    pub fn create_ofd(&mut self, file_id: u64, writable: bool) -> u64 {
         let id = self.next_ofd_id;
         self.next_ofd_id += 1;
         self.ofds.insert(
@@ -311,9 +314,22 @@ impl Kernel {
                 file_id,
                 offset: 0,
                 refs: 1,
+                writable,
             },
         );
         id
+    }
+
+    /// Mutable view of a ramfs file's content (used by sys_write).
+    pub fn ramfs_file_mut(&mut self, id: u64) -> Option<&mut RamfsFile> {
+        self.files.get_mut(&id)
+    }
+
+    /// Truncate a ramfs file to length 0 (used by sys_open with O_TRUNC).
+    pub fn ramfs_truncate(&mut self, id: u64) {
+        if let Some(f) = self.files.get_mut(&id) {
+            f.content.clear();
+        }
     }
 
     pub fn ofd_mut(&mut self, id: u64) -> Option<&mut OpenFileDescription> {

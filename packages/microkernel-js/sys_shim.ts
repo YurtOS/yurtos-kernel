@@ -175,11 +175,12 @@ export function buildSysImports(
     },
     sys_sched_yield: () =>
       forwardRequestBytes(METHOD.SYS_SCHED_YIELD, new Uint8Array(0)),
-    sys_open: (pathPtr, pathLen) => {
-      const buf = new Uint8Array(
-        new Uint8Array(um(), pathPtr, pathLen).slice().buffer,
-      );
-      return forwardRequestBytes(METHOD.SYS_OPEN, buf);
+    sys_open: (flags, pathPtr, pathLen) => {
+      const path = new Uint8Array(um(), pathPtr, pathLen).slice();
+      const req = new Uint8Array(4 + path.byteLength);
+      new DataView(req.buffer).setUint32(0, flags >>> 0, true);
+      req.set(path, 4);
+      return forwardRequestBytes(METHOD.SYS_OPEN, req);
     },
     sys_lseek: (fd, offset, whence, outPtr) => {
       const off64 = typeof offset === "bigint" ? offset : BigInt(offset);

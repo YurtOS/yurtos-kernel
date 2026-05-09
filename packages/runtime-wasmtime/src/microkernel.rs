@@ -1230,8 +1230,25 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_open",
-        |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32| -> i32 {
-            forward_user_ptr_len(&mut caller, sys_method_id::OPEN, path_ptr, path_len)
+        |mut caller: Caller<'_, UserState>,
+         flags: i32,
+         path_ptr: u32,
+         path_len: u32|
+         -> i32 {
+            // Read the path bytes out of user memory and prepend
+            // u32 flags LE as the wire format expects.
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut path = vec![0u8; path_len as usize];
+            if path_len > 0 && memory.read(&caller, path_ptr as usize, &mut path).is_err() {
+                return -22;
+            }
+            let mut req = Vec::with_capacity(4 + path.len());
+            req.extend_from_slice(&(flags as u32).to_le_bytes());
+            req.extend_from_slice(&path);
+            forward_request_bytes(&mut caller, sys_method_id::OPEN, &req) as i32
         },
     )?;
     linker.func_wrap(

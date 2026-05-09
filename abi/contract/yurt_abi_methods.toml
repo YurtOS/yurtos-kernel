@@ -231,7 +231,7 @@ doc = "POSIX nanosleep(req). Request bytes are 8 bytes — duration in little-en
 [method.sys_open]
 id = 0x1_001F
 kind = "syscall"
-doc = "Open a file in the in-memory ramfs. Request bytes are the path bytes (no NUL terminator). Read-only — the path must have been pre-installed via kernel_register_file. Returns the new fd (>=0) on success, -ENOENT if no file at that path. The fd points to a fresh open-file-description with offset 0; dup'd fds share that OFD's cursor (POSIX-correct)."
+doc = "Open a file in the in-memory ramfs. Request bytes are u32 flags LE + path bytes (no NUL terminator). Flags bitfield: bit 0 = writable (O_WRONLY/O_RDWR), bit 1 = create-if-missing (O_CREAT), bit 2 = truncate-if-exists (O_TRUNC). Read-only opens (flags=0) require a pre-installed path; CREAT installs an empty file. Returns the new fd (>=0) on success, -ENOENT if no file and no CREAT. The fd points to a fresh open-file-description; dup'd fds share its cursor (POSIX-correct)."
 
 [method.sys_lseek]
 id = 0x1_0020
