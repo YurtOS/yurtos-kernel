@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "packages/runtime-wasmtime",
+  "packages/kernel-wasm",
   "test-fixtures/yurt-process",
   "test-fixtures/shell",
   "test-fixtures/shell-exec",
