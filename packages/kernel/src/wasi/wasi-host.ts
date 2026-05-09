@@ -1239,6 +1239,10 @@ export class WasiHost {
             const nonblocking =
               ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
             if (nonblocking) {
+              // peekBuffer was empty (drained above). Poll the backend
+              // with the nonblocking flag — if data is queued, deliver
+              // it; if the backend signals EAGAIN, surface it; on EOF
+              // (ok with no bytes) return success with totalRead=0.
               const result = target.recv(target.socket, iov.len, {
                 nonblocking: true,
               });

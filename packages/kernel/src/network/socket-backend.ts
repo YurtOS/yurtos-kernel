@@ -63,7 +63,19 @@ export type SocketAcceptBackendResult =
 export interface SocketBackend {
   connect(
     req: { host: string; port: number; tls: boolean },
-  ): { ok: true; socket: SocketHandle } | { ok: false; error: string };
+  ):
+    | {
+      ok: true;
+      socket: SocketHandle;
+      /** Peer/local addresses observed by the backend. Optional so
+       *  long-lived test backends without registry-style bookkeeping
+       *  remain valid; loopback and bridge backends always populate them. */
+      peerHost?: string;
+      peerPort?: number;
+      localHost?: string;
+      localPort?: number;
+    }
+    | { ok: false; error: string };
   send(socket: SocketHandle, dataB64: string): SocketBackendResult;
   recv(
     socket: SocketHandle,
@@ -91,6 +103,12 @@ export interface SocketBackend {
   ): Promise<SocketBackendResult>;
   closeListener?(listener: SocketListenerHandle): SocketBackendResult;
   close(socket: SocketHandle): SocketBackendResult;
+  /**
+   * Loopback backends expose their underlying ListenerRegistry so the host
+   * can build a SandboxNet over the same routing tables the kernel sees.
+   * Bridge / mock backends that don't have a registry leave this undefined.
+   */
+  registry?: ListenerRegistry;
 }
 
 function parseAccept(
@@ -180,9 +198,13 @@ export function createLoopbackSocketBackend(
   delegate?: SocketBackend,
   registry: ListenerRegistry = new ListenerRegistry(),
 ): SocketBackend & { registry: ListenerRegistry } {
+  // Registry handles are positive ints; we expose them as negative ints
+  // through this backend so they can't collide with bridge-allocated
+  // positive handles. Negation is self-inverse, so the same flip works
+  // in both directions; the two aliases stay for caller-side intent.
   const isLocal = (h: number) => h < 0;
   const pub = (h: number) => -h;
-  const reg = (h: number) => -h;
+  const reg = pub;
 
   function bytesToBase64(data: Uint8Array): string {
     if (data.byteLength === 0) return "";
@@ -215,7 +237,16 @@ export function createLoopbackSocketBackend(
 
     connect(req) {
       const r = registry.connect({ host: req.host, port: req.port });
-      if (r.ok) return { ok: true, socket: pub(r.socket) };
+      if (r.ok) {
+        return {
+          ok: true,
+          socket: pub(r.socket),
+          peerHost: r.peerHost,
+          peerPort: r.peerPort,
+          localHost: r.localHost,
+          localPort: r.localPort,
+        };
+      }
       return delegate?.connect(req) ?? { ok: false, error: r.error };
     },
 
@@ -341,7 +372,22 @@ export function createNetworkBridgeSocketBackend(
             : "socket connect failed",
         };
       }
-      return { ok: true, socket: result.socket_id };
+      return {
+        ok: true,
+        socket: result.socket_id,
+        ...(typeof result.peer_host === "string"
+          ? { peerHost: result.peer_host }
+          : {}),
+        ...(typeof result.peer_port === "number"
+          ? { peerPort: result.peer_port }
+          : {}),
+        ...(typeof result.local_host === "string"
+          ? { localHost: result.local_host }
+          : {}),
+        ...(typeof result.local_port === "number"
+          ? { localPort: result.local_port }
+          : {}),
+      };
     },
 
     send(socket, dataB64) {
@@ -407,10 +453,18 @@ export function createNetworkBridgeSocketBackend(
      * between attempts so other host work can run. This is the
      * transport's only supported async pattern; the host-import handler
      * still sees a single `await acceptAsync`.
+     *
+     * No artificial deadline: real `accept(2)` blocks until a connection
+     * arrives or the listener closes. Process-level timeouts/cancellations
+     * are enforced by the kernel's deadline machinery, not here. The
+     * polling cadence backs off from 5ms to 100ms so an idle listener
+     * doesn't hammer the SAB. Loop terminates when the bridge returns
+     * any non-`wouldBlock` result — success, listener-closed, or error.
      */
     async acceptAsync(listener) {
-      const deadline = Date.now() + 30_000;
-      while (Date.now() < deadline) {
+      let delayMs = 5;
+      // deno-lint-ignore no-constant-condition
+      while (true) {
         const r = parseAccept(bridge.requestSync({
           op: "accept",
           listener_id: listener,
@@ -418,18 +472,36 @@ export function createNetworkBridgeSocketBackend(
         if (!(r.ok === false && "wouldBlock" in r && r.wouldBlock === true)) {
           return r;
         }
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (delayMs < 100) delayMs = Math.min(100, delayMs * 2);
       }
-      return { ok: false, error: "accept: timed out" };
     },
 
-    recvAsync(socket, maxBytes) {
-      return Promise.resolve(socketResult(bridge.requestSync({
-        op: "recv",
-        socket_id: socket,
-        max_bytes: maxBytes,
-        nonblocking: false,
-      })));
+    /**
+     * Poll the bridge with `nonblocking: true` and back off until bytes
+     * arrive, the socket closes, or any non-EAGAIN error is reported.
+     * A blocking `requestSync` would park the worker and deadlock any
+     * concurrent op on the same SAB queue (see acceptAsync above for the
+     * same constraint). Issue #18 tracks the original blocking version.
+     */
+    async recvAsync(socket, maxBytes) {
+      let delayMs = 5;
+      // deno-lint-ignore no-constant-condition
+      while (true) {
+        const r = socketResult(bridge.requestSync({
+          op: "recv",
+          socket_id: socket,
+          max_bytes: maxBytes,
+          nonblocking: true,
+        }));
+        if (r.ok) {
+          // EOF (`ok` with no bytes) and any byte payload exit the poll.
+          return r;
+        }
+        if (r.error !== "EAGAIN") return r;
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (delayMs < 100) delayMs = Math.min(100, delayMs * 2);
+      }
     },
 
     closeListener(listener) {

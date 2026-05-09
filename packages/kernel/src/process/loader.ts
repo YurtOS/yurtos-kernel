@@ -285,7 +285,7 @@ export async function loadProcess(
         "host_network_fetch",
         "host_register_tool",
         "host_socket_accept",
-    "host_socket_recv",
+        "host_socket_recv",
         "host_extension_invoke",
         "host_run_command",
         "host_thread_spawn",

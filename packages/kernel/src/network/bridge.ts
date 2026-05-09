@@ -363,7 +363,15 @@ export class NetworkBridge implements NetworkBridgeLike {
             return;
           }
           if (req.nonblocking) {
-            writeErr('EAGAIN');
+            // After peer FIN with no buffered bytes, readableEnded
+            // becomes true once the 'end' event has fired. Return EOF
+            // (ok with empty bytes) so polling callers don't spin
+            // forever after the peer closes.
+            if (sock.readableEnded || sock.destroyed) {
+              writeOk({ ok: true, data_b64: '' });
+            } else {
+              writeErr('EAGAIN');
+            }
             resolve();
             return;
           }

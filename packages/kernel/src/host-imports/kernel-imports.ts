@@ -117,20 +117,6 @@ export interface KernelImportsOptions {
   /** Sandbox instance supplied to RunCommandContext when invoking runCommandHandler. */
   sandbox?: Sandbox;
 
-  /**
-   * Legacy synchronous spawn handler for the shell's 4-argument host_spawn ABI.
-   * The process ABI uses native records for host_spawn(req_ptr, req_len,
-   * out_ptr, out_cap). Older host_spawn_async callers still use the
-   * two-argument JSON SpawnRequest form.
-   */
-  syncSpawn?: (
-    cmd: string,
-    args: string[],
-    env: Record<string, string>,
-    stdin: Uint8Array,
-    cwd: string,
-  ) => { exit_code: number; stdout: string; stderr: string };
-
   /** Called by host_spawn to actually create and start a WASM process.
    *  `parentPid` is the PID of the in-sandbox process making the spawn
    *  call — set on the child as ppid so getppid() inside the child
@@ -556,6 +542,11 @@ export function createKernelImports(
   const runtimeBackend = opts.runtimeBackend ?? unsupportedRuntimeEngineBackend;
   const schedulerBackend = runtimeBackend.scheduler;
   let fallbackUmask = 0o022;
+  // Sandbox.create owns the socket-backend decision so all processes share
+  // the same ListenerRegistry. Fall back to constructing one here only when
+  // no Sandbox is in the loop (standalone createKernelImports callers, like
+  // a few unit tests) — those callers also won't share state across imports
+  // by construction.
   const bridgeSocketBackend = opts.networkBridge
     ? createNetworkBridgeSocketBackend(opts.networkBridge)
     : undefined;
@@ -888,12 +879,10 @@ export function createKernelImports(
     },
 
     // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32
-    // Native 4-argument form writes yurt_spawn_result_v1. The 2-argument
-    // JSON form remains for host_spawn_async compatibility.
-    //
-    // Compatibility: shell-exec also imports a legacy synchronous
-    // host_spawn(req_ptr, req_len, out_ptr, out_cap) ABI for tests. Keep
-    // that branch here for backwards compatibility.
+    // Native-only: the request bytes must decode as a yurt_spawn_request_v1
+    // record. The 4-argument form writes yurt_spawn_result_v1; the 2-argument
+    // form (host_spawn_async) returns the pid directly. There is no JSON
+    // fallback — a decode failure is a hard error.
     host_spawn(
       reqPtr: number,
       reqLen: number,
@@ -944,76 +933,19 @@ export function createKernelImports(
       };
 
       const reqBytes = readBytes(memory, reqPtr, reqLen);
-      if (typeof outPtr === "number" && typeof outCap === "number") {
-        try {
-          const nativeReq = decodeNativeSpawnRequest(reqBytes);
-          if (nativeReq) {
-            const pid = spawnFromRequest(nativeReq);
-            return pid < 0
-              ? pid
-              : writeSpawnResult(memory, outPtr, outCap, pid);
-          }
-        } catch {
-          return ERR_INVALID;
-        }
-
-        const reqJson = new TextDecoder().decode(reqBytes);
-        let req: {
-          program?: string;
-          args?: string[];
-          env?: [string, string][];
-          cwd?: string;
-          stdin?: string;
-          stdin_fd?: number;
-        };
-        try {
-          req = JSON.parse(reqJson);
-        } catch {
-          req = {};
-        }
-
-        const cmd = req.program ?? "";
-        const args = req.args?.map(String) ?? [];
-        const env: Record<string, string> = {};
-        if (req.env) { for (const [k, v] of req.env) env[k] = v; }
-        const cwd = req.cwd ?? getCallerCwd();
-        let stdinStr = req.stdin ?? "";
-        if (!stdinStr && typeof req.stdin_fd === "number" && opts.kernel) {
-          const stdinTarget = opts.kernel.getFdTarget(callerPid, req.stdin_fd);
-          if (stdinTarget?.type === "static") {
-            stdinStr = new TextDecoder().decode(
-              stdinTarget.data.slice(stdinTarget.offset),
-            );
-          } else if (stdinTarget?.type === "pipe_read") {
-            stdinStr = new TextDecoder().decode(stdinTarget.pipe.drainSync());
-          }
-        }
-        const stdin = new TextEncoder().encode(stdinStr);
-
-        if (opts.syncSpawn) {
-          try {
-            const result = opts.syncSpawn(cmd, args, env, stdin, cwd);
-            return writeJson(memory, outPtr, outCap, result);
-          } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            return writeJson(memory, outPtr, outCap, {
-              exit_code: 127,
-              stdout: "",
-              stderr: `${cmd}: ${msg}\n`,
-            });
-          }
-        }
-
-        return writeJson(memory, outPtr, outCap, {
-          exit_code: 127,
-          stdout: "",
-          stderr: `${cmd}: sync spawn not available\n`,
-        });
+      let req: SpawnRequest;
+      try {
+        const decoded = decodeNativeSpawnRequest(reqBytes);
+        if (!decoded) return ERR_INVALID;
+        req = decoded;
+      } catch {
+        return ERR_INVALID;
       }
-
-      const reqJson = new TextDecoder().decode(reqBytes);
-      const req = JSON.parse(reqJson) as SpawnRequest;
-      return spawnFromRequest(req);
+      const pid = spawnFromRequest(req);
+      if (typeof outPtr === "number" && typeof outCap === "number") {
+        return pid < 0 ? pid : writeSpawnResult(memory, outPtr, outCap, pid);
+      }
+      return pid;
     },
 
     // host_getpid() -> i32
@@ -2016,10 +1948,15 @@ export function createKernelImports(
             }
           }
           target.socket = result.socket;
-          target.peerHost = typeof req.host === "string" ? req.host : "0.0.0.0";
-          target.peerPort = typeof req.port === "number" ? req.port : 0;
-          target.localHost = socketLocalHost;
-          target.localPort = socketLocalPortForFd(req.fd);
+          // Prefer backend-reported addresses so getsockname/getpeername stay
+          // consistent with what the peer's accept()ed socket sees. Fall back
+          // to synthetic values for legacy backends that omit them.
+          target.peerHost = result.peerHost ??
+            (typeof req.host === "string" ? req.host : "0.0.0.0");
+          target.peerPort = result.peerPort ??
+            (typeof req.port === "number" ? req.port : 0);
+          target.localHost = result.localHost ?? socketLocalHost;
+          target.localPort = result.localPort ?? socketLocalPortForFd(req.fd);
           return writeJson(memory, outPtr, outCap, { ok: true });
         }
         return writeJson(memory, outPtr, outCap, result);
@@ -2052,7 +1989,7 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
-        const host = req.host === "localhost" ? "localhost" : req.host;
+        const host = req.host;
         if (
           host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
         ) {
@@ -2322,6 +2259,8 @@ export function createKernelImports(
         }
         const maxBytes = req.max_bytes ?? 65536;
         const peek = req.peek === true;
+        const nonblocking =
+          ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
         if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
           const chunk = target.peekBuffer.slice(0, maxBytes);
           if (!peek) {
@@ -2332,12 +2271,20 @@ export function createKernelImports(
             data_b64: bytesToBase64(chunk),
           });
         }
-        if (((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0) {
-          const nbResult = socketBackend.recv(target.socket, maxBytes, {
+        // peekBuffer is empty.
+        if (peek) {
+          // Peek probes the backend without suspending and stashes any data
+          // into peekBuffer for the following non-peek recv. The probe is
+          // always nonblocking — even on a blocking fd a peek that finds
+          // nothing returns EAGAIN here rather than waiting for bytes.
+          // That diverges from a real `MSG_PEEK` on a blocking socket
+          // (which would block) but matches how peek is used in the libc
+          // shim today as a select()-style readiness check.
+          const probe = socketBackend.recv(target.socket, maxBytes, {
             nonblocking: true,
           });
-          if (peek && nbResult.ok) {
-            const data = base64ToBytes(nbResult.data_b64 ?? "");
+          if (probe.ok) {
+            const data = base64ToBytes(probe.data_b64 ?? "");
             target.peekBuffer = target.peekBuffer
               ? concatBytes(target.peekBuffer, data)
               : data;
@@ -2346,21 +2293,20 @@ export function createKernelImports(
               data_b64: bytesToBase64(data),
             });
           }
-          return writeJson(memory, outPtr, outCap, nbResult);
+          return writeJson(memory, outPtr, outCap, probe);
         }
-        return target.recvAsync(target.socket, maxBytes).then((result) => {
-          if (peek && result.ok) {
-            const data = base64ToBytes(result.data_b64 ?? "");
-            target.peekBuffer = target.peekBuffer
-              ? concatBytes(target.peekBuffer, data)
-              : data;
-            return writeJson(memory, outPtr, outCap, {
-              ok: true,
-              data_b64: bytesToBase64(data),
-            });
-          }
-          return writeJson(memory, outPtr, outCap, result);
-        });
+        if (nonblocking) {
+          // Poll the backend with the nonblocking flag. The backend either
+          // returns queued bytes, signals EAGAIN, or reports EOF/error;
+          // surface whatever it says directly.
+          const probe = socketBackend.recv(target.socket, maxBytes, {
+            nonblocking: true,
+          });
+          return writeJson(memory, outPtr, outCap, probe);
+        }
+        return target.recvAsync(target.socket, maxBytes).then((result) =>
+          writeJson(memory, outPtr, outCap, result)
+        );
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return writeJson(memory, outPtr, outCap, { ok: false, error: msg });

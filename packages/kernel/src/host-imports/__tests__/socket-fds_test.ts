@@ -104,7 +104,7 @@ describe("socket fd host imports", () => {
     expect(kernel.getFdTarget(0, fd)).toBeNull();
   });
 
-  it("routes WASI fd_read and fd_write for connected socket fds through the backend", () => {
+  it("routes WASI fd_read and fd_write for connected socket fds through the backend", async () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const requests: Record<string, unknown>[] = [];
@@ -186,7 +186,7 @@ describe("socket fd host imports", () => {
 
     view.setUint32(40, 600, true);
     view.setUint32(44, 8, true);
-    expect(wasi.fd_read(fd, 40, 1, 68)).toBe(WASI_ESUCCESS);
+    expect(await wasi.fd_read(fd, 40, 1, 68)).toBe(WASI_ESUCCESS);
     expect(view.getUint32(68, true)).toBe(4);
     expect(new TextDecoder().decode(bytes.subarray(600, 604))).toBe("pong");
     expect(requests.at(-1)).toEqual({
@@ -254,6 +254,70 @@ describe("socket fd host imports", () => {
     });
     expect(typeof addr.local_port).toBe("number");
     expect(addr.local_port as number).toBeGreaterThanOrEqual(49152);
+  });
+
+  it("uses backend-reported addresses for connected socket fds", () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    const kernel = new ProcessKernel();
+    let backend: SocketBackend;
+    backend = {
+      connect: () => ({
+        ok: true,
+        socket: 77,
+        peerHost: "10.0.2.15",
+        peerPort: 8080,
+        localHost: "127.0.0.1",
+        localPort: 50321,
+      }),
+      send: () => ({ ok: true, bytes_sent: 0 }),
+      recv: () => ({ ok: true, data_b64: "" }),
+      close: () => ({ ok: true }),
+      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+      recvAsync: (socket, maxBytes) =>
+        Promise.resolve(backend.recv(socket, maxBytes)),
+    };
+    const imports = createKernelImports({
+      memory,
+      kernel,
+      socketBackend: backend,
+    });
+
+    const fd = (imports.host_socket_open as (...args: number[]) => number)(
+      2,
+      1,
+      0,
+    );
+    const connectReqLen = writeString(
+      memory,
+      16,
+      JSON.stringify({
+        fd,
+        host: "example.test",
+        port: 443,
+        tls: false,
+      }),
+    );
+    (imports.host_socket_connect as (...args: number[]) => number)(
+      16,
+      connectReqLen,
+      256,
+      4096,
+    );
+
+    const addrReqLen = writeString(memory, 16, JSON.stringify({ fd }));
+    const addrLen = (imports.host_socket_addr as (...args: number[]) => number)(
+      16,
+      addrReqLen,
+      512,
+      4096,
+    );
+    expect(readJson(memory, 512, addrLen)).toEqual({
+      ok: true,
+      peer_host: "10.0.2.15",
+      peer_port: 8080,
+      local_host: "127.0.0.1",
+      local_port: 50321,
+    });
   });
 
   it("applies and reports TCP_NODELAY through connected socket fds", () => {
@@ -511,9 +575,10 @@ describe("socket fd host imports", () => {
     backend = {
       connect: () => ({ ok: true, socket: 303 }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: (socket, maxBytes) => {
-        requests.push({ op: "recv", socket, maxBytes });
-        return { ok: true, data_b64: btoa("abc") };
+      recv: (socket, maxBytes, opts) => {
+        requests.push({ op: "recv", socket, maxBytes, opts });
+        // Real loopback backend signals EAGAIN when no bytes are buffered.
+        return { ok: false, error: "EAGAIN" };
       },
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
@@ -567,7 +632,13 @@ describe("socket fd host imports", () => {
     new DataView(memory.buffer).setUint32(132, 3, true);
 
     expect(wasiImports.fd_read(fd, 128, 1, 192)).toBe(WASI_EAGAIN);
-    expect(requests).toEqual([]);
+    // Backend was polled (with the nonblocking flag) and signaled EAGAIN.
+    expect(requests).toEqual([{
+      op: "recv",
+      socket: 303,
+      maxBytes: 3,
+      opts: { nonblocking: true },
+    }]);
   });
 
   it("returns EAGAIN for nonblocking host_socket_recv without buffered data", () => {
@@ -578,9 +649,9 @@ describe("socket fd host imports", () => {
     backend = {
       connect: () => ({ ok: true, socket: 404 }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: (socket, maxBytes) => {
-        requests.push({ op: "recv", socket, maxBytes });
-        return { ok: true, data_b64: btoa("abc") };
+      recv: (socket, maxBytes, opts) => {
+        requests.push({ op: "recv", socket, maxBytes, opts });
+        return { ok: false, error: "EAGAIN" };
       },
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
@@ -640,7 +711,12 @@ describe("socket fd host imports", () => {
       ok: false,
       error: "EAGAIN",
     });
-    expect(requests).toEqual([]);
+    expect(requests).toEqual([{
+      op: "recv",
+      socket: 404,
+      maxBytes: 3,
+      opts: { nonblocking: true },
+    }]);
   });
 
   it("preserves nonblocking host_socket_recv peeked bytes", () => {

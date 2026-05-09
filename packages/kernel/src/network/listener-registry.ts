@@ -83,6 +83,9 @@ interface PairedSocket {
   peerPort: number;
   localHost: string;
   localPort: number;
+  /** Set on the client side of openPair — the localPort was drawn from
+   *  clientPorts and must be released back to the allocator on close. */
+  ownsClientPort?: boolean;
 }
 
 interface ListenerState {
@@ -110,6 +113,13 @@ export class ListenerRegistry {
   /** Routing key is `${normalizedHost}:${port}` and `0.0.0.0:${port}`. */
   private routes = new Map<string, ListenerHandle>();
   private sockets = new Map<SocketHandle, PairedSocket>();
+  /** Ports currently held by listeners or in-flight client sockets. Used
+   *  by allocEphemeralPort so two concurrent connect()s don't collide on
+   *  a client localPort, and so the wildcard collision check is O(1). */
+  private busyPorts = new Set<number>();
+  /** Ports held by client-side ephemeral allocations only. Released when
+   *  the client socket is closed. */
+  private clientPorts = new Set<number>();
   private nextListenerHandle = 1;
   private nextSocketHandle = 1;
   private nextEphemeralPort = EPHEMERAL_PORT_START;
@@ -118,8 +128,22 @@ export class ListenerRegistry {
 
   listen(req: ListenRequest): ListenerInfo {
     const port = req.port === 0 ? this.allocEphemeralPort() : req.port;
-    const key = `${normalizeHost(req.host)}:${port}`;
+    const newHost = normalizeHost(req.host);
+    const key = `${newHost}:${port}`;
+    const wildcardKey = `0.0.0.0:${port}`;
     if (this.routes.has(key)) {
+      throw new Error(`address ${req.host}:${port} already in use`);
+    }
+    // A wildcard bind covers every interface, so it must be exclusive on
+    // its port: a new wildcard collides with any existing specific bind,
+    // and a new specific bind collides with an existing wildcard.
+    // busyPorts tracks listener-bound ports for an O(1) lookup on either
+    // wildcard or specific binds.
+    if (newHost === "0.0.0.0") {
+      if (this.busyPorts.has(port)) {
+        throw new Error(`address ${req.host}:${port} already in use`);
+      }
+    } else if (this.routes.has(wildcardKey)) {
       throw new Error(`address ${req.host}:${port} already in use`);
     }
     const handle = this.nextListenerHandle++;
@@ -134,6 +158,7 @@ export class ListenerRegistry {
     };
     this.listeners.set(handle, state);
     this.routes.set(key, handle);
+    this.busyPorts.add(port);
     // localhost ↔ 127.0.0.1 alias
     if (req.host === "localhost") this.routes.set(`127.0.0.1:${port}`, handle);
     if (req.host === "127.0.0.1") this.routes.set(`localhost:${port}`, handle);
@@ -181,7 +206,7 @@ export class ListenerRegistry {
 
     const clientHandle = this.nextSocketHandle++;
     const serverHandle = this.nextSocketHandle++;
-    const clientPort = this.allocEphemeralPort();
+    const clientPort = this.allocClientPort();
     const serverLocalHost = listener.host === "0.0.0.0"
       ? "10.0.2.15"
       : "127.0.0.1";
@@ -196,6 +221,7 @@ export class ListenerRegistry {
       peerPort: listener.port,
       localHost: "127.0.0.1",
       localPort: clientPort,
+      ownsClientPort: true,
     };
     const serverSock: PairedSocket = {
       handle: serverHandle,
@@ -267,6 +293,17 @@ export class ListenerRegistry {
       if (value === handle) this.routes.delete(key);
     }
     this.listeners.delete(handle);
+    // Release the listener's port unless another listener still holds it
+    // (currently impossible since we reject collisions in listen(), but
+    // keep this defensive in case alias bookkeeping changes).
+    let stillBound = false;
+    for (const other of this.listeners.values()) {
+      if (other.port === listener.port) {
+        stillBound = true;
+        break;
+      }
+    }
+    if (!stillBound) this.busyPorts.delete(listener.port);
     const err = new Error("accept: listener closed");
     for (const w of listener.acceptWaiters.splice(0)) w.reject(err);
     // Drain unclaimed accepts: close their server-side sockets so the
@@ -338,6 +375,7 @@ export class ListenerRegistry {
     if (!local) return;
     local.closed = true;
     this.sockets.delete(handle);
+    if (local.ownsClientPort) this.releaseClientPort(local.localPort);
     // Wake our own waiters: a recvAsync in flight on a socket the
     // caller just closed must resolve, not leak. Report as error since
     // EOF would imply the peer closed.
@@ -396,16 +434,31 @@ export class ListenerRegistry {
   }
 
   private allocEphemeralPort(): number {
-    for (let i = 0; i < EPHEMERAL_PORT_END - EPHEMERAL_PORT_START; i++) {
+    // Inclusive range, so probe count is END - START + 1 (without this the
+    // last port is never tried).
+    const probeCount = EPHEMERAL_PORT_END - EPHEMERAL_PORT_START + 1;
+    for (let i = 0; i < probeCount; i++) {
       const port = this.nextEphemeralPort++;
       if (this.nextEphemeralPort > EPHEMERAL_PORT_END) {
         this.nextEphemeralPort = EPHEMERAL_PORT_START;
       }
-      const inUse = this.routes.has(`127.0.0.1:${port}`) ||
-        this.routes.has(`0.0.0.0:${port}`);
-      if (!inUse) return port;
+      // Listener-bound and in-flight client ephemeral ports both block
+      // reuse so two concurrent connect()s don't share a localPort and
+      // listen(0) can't recycle into a port a client already holds.
+      if (this.busyPorts.has(port) || this.clientPorts.has(port)) continue;
+      return port;
     }
     throw new Error("no ephemeral ports available");
+  }
+
+  private allocClientPort(): number {
+    const port = this.allocEphemeralPort();
+    this.clientPorts.add(port);
+    return port;
+  }
+
+  private releaseClientPort(port: number): void {
+    this.clientPorts.delete(port);
   }
 }
 

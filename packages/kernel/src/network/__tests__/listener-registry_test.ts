@@ -29,6 +29,22 @@ describe("ListenerRegistry", () => {
       .toThrow(/in use/i);
   });
 
+  it("wildcard bind blocks subsequent specific bind on the same port", () => {
+    const reg = new ListenerRegistry();
+    reg.listen({ host: "0.0.0.0", port: 9100, backlog: 16 });
+    expect(() => reg.listen({ host: "127.0.0.1", port: 9100, backlog: 16 }))
+      .toThrow(/in use/i);
+    expect(() => reg.listen({ host: "localhost", port: 9100, backlog: 16 }))
+      .toThrow(/in use/i);
+  });
+
+  it("specific bind blocks subsequent wildcard bind on the same port", () => {
+    const reg = new ListenerRegistry();
+    reg.listen({ host: "127.0.0.1", port: 9101, backlog: 16 });
+    expect(() => reg.listen({ host: "0.0.0.0", port: 9101, backlog: 16 }))
+      .toThrow(/in use/i);
+  });
+
   it("localhost and 127.0.0.1 alias to the same listener", async () => {
     const reg = new ListenerRegistry();
     const lr = reg.listen({ host: "localhost", port: 7000, backlog: 16 });

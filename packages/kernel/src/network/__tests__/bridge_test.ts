@@ -297,6 +297,36 @@ describe(
       backend.closeListener!(listen.listener);
     });
 
+    it("acceptAsync polling exits when the listener is closed mid-poll", async () => {
+      // Issue 2 from the second review: the polling loop has no other
+      // termination path beyond the bridge response. Closing the listener
+      // while a poll is parked must surface a non-wouldBlock result so
+      // the loop returns instead of leaking.
+      const gateway = new NetworkGateway({
+        allowedHosts: ["127.0.0.1", "localhost"],
+      });
+      bridge = new NetworkBridge(gateway);
+      await bridge.start();
+
+      const backend = createNetworkBridgeSocketBackend(bridge);
+      const listen = backend.listen!({
+        host: "127.0.0.1",
+        port: 18093,
+        backlog: 8,
+      });
+      expect(listen.ok).toBe(true);
+      if (!listen.ok) throw new Error(listen.error);
+
+      const acceptPromise = backend.acceptAsync!(listen.listener);
+      // Yield to let the first poll run and observe wouldBlock.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      backend.closeListener!(listen.listener);
+      const r = await acceptPromise;
+      expect(r.ok).toBe(false);
+    });
+
+
     it("binds mapped 0.0.0.0 sandbox listeners to configured host port", async () => {
       const gateway = new NetworkGateway({
         allowedHosts: ["127.0.0.1", "localhost"],
