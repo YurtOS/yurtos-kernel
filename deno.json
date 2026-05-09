@@ -3,6 +3,7 @@
   "nodeModulesDir": "auto",
   "imports": {
     "@yurt/kernel": "./packages/kernel/src/index.ts",
+    "@yurt/microkernel-deno": "./packages/microkernel-deno/mod.ts",
     "@std/testing": "jsr:@std/testing@^1",
     "@std/expect": "jsr:@std/expect@^1",
     "@std/assert": "jsr:@std/assert@^1",
