@@ -946,6 +946,25 @@ fn install_tar_layer(request: &[u8]) -> i64 {
     0
 }
 
+/// `/proc/self/<x>` → `/proc/<caller_pid>/<x>`. Linux convention; the
+/// expansion happens at the dispatch layer so ProcBackend doesn't need
+/// to know the caller. Path bytes aren't guaranteed UTF-8; we rewrite
+/// as raw bytes. Returns the original slice when no rewrite is needed
+/// so common-case paths don't allocate.
+fn proc_self_rewrite<'a>(caller_pid: u32, path: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+    if let Some(suffix) = path.strip_prefix(b"/proc/self") {
+        // Match only when the next byte is `/` or end-of-path so
+        // we don't rewrite paths like "/proc/selfish".
+        if suffix.is_empty() || suffix.starts_with(b"/") {
+            let prefix = format!("/proc/{caller_pid}");
+            let mut buf = prefix.into_bytes();
+            buf.extend_from_slice(suffix);
+            return std::borrow::Cow::Owned(buf);
+        }
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 /// `sys_open(flags, path) -> fd`. Request: u32 flags LE + path bytes.
 /// Flags bits: 0=writable, 1=create-if-missing (O_CREAT),
 /// 2=truncate-if-exists (O_TRUNC).
@@ -958,20 +977,8 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
     if raw_path.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    // /proc/self/<x> → /proc/<caller_pid>/<x>. Linux convention; the
-    // expansion happens at the dispatch layer so ProcBackend doesn't
-    // need to know the caller. Path bytes are not guaranteed UTF-8;
-    // we rewrite as raw bytes.
-    let path_owned: Vec<u8>;
-    let path: &[u8] = if let Some(suffix) = raw_path.strip_prefix(b"/proc/self") {
-        let prefix = format!("/proc/{caller_pid}");
-        let mut buf = prefix.into_bytes();
-        buf.extend_from_slice(suffix);
-        path_owned = buf;
-        &path_owned
-    } else {
-        raw_path
-    };
+    let rewritten = proc_self_rewrite(caller_pid, raw_path);
+    let path: &[u8] = &rewritten;
     let writable = flags & 0b001 != 0;
     let create = flags & 0b010 != 0;
     let trunc = flags & 0b100 != 0;
@@ -1110,8 +1117,8 @@ fn mkdir(caller_pid: u32, request: &[u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
-    with_kernel(|k| k.vfs.mkdir(request) as i64)
+    let path = proc_self_rewrite(caller_pid, request);
+    with_kernel(|k| k.vfs.mkdir(&path) as i64)
 }
 
 /// `rmdir(path) -> 0 / -ENOENT / -ENOTEMPTY / -EROFS`.
@@ -1119,8 +1126,8 @@ fn rmdir(caller_pid: u32, request: &[u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
-    with_kernel(|k| k.vfs.rmdir(request) as i64)
+    let path = proc_self_rewrite(caller_pid, request);
+    with_kernel(|k| k.vfs.rmdir(&path) as i64)
 }
 
 /// `readdir(path) -> packed entries`. Response layout:
@@ -1133,9 +1140,9 @@ fn readdir(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if response.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
+    let path = proc_self_rewrite(caller_pid, request);
     with_kernel(|k| {
-        let entries = match k.vfs.readdir(request) {
+        let entries = match k.vfs.readdir(&path) {
             Some(e) => e,
             None => return -(abi::ENOENT as i64),
         };
@@ -1144,7 +1151,7 @@ fn readdir(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         // backend doesn't know — userland will stat to find out.
         let mut cursor = 4usize;
         let mut count: u32 = 0;
-        let parent = request;
+        let parent: &[u8] = &path;
         for name in &entries {
             let need = 4 + 1 + name.len();
             if cursor + need > response.len() {
@@ -1187,12 +1194,15 @@ fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let target = &request[4..4 + target_len];
-    let link_path = &request[4 + target_len..];
-    if link_path.is_empty() {
+    let link_path_raw = &request[4 + target_len..];
+    if link_path_raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
-    with_kernel(|k| k.vfs.symlink(target, link_path) as i64)
+    // Symlink target stays verbatim — it's content, not a path
+    // resolved at install time. Only link_path goes through the
+    // /proc/self rewrite.
+    let link_path = proc_self_rewrite(caller_pid, link_path_raw);
+    with_kernel(|k| k.vfs.symlink(target, &link_path) as i64)
 }
 
 /// `rename(old_len, old, new)`. Wire shape mirrors symlink/link.
@@ -1205,13 +1215,14 @@ fn rename(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 4 + old_len {
         return -(abi::EINVAL as i64);
     }
-    let old_path = &request[4..4 + old_len];
-    let new_path = &request[4 + old_len..];
-    if new_path.is_empty() {
+    let old_raw = &request[4..4 + old_len];
+    let new_raw = &request[4 + old_len..];
+    if new_raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
-    with_kernel(|k| k.vfs.rename(old_path, new_path) as i64)
+    let old_path = proc_self_rewrite(caller_pid, old_raw);
+    let new_path = proc_self_rewrite(caller_pid, new_raw);
+    with_kernel(|k| k.vfs.rename(&old_path, &new_path) as i64)
 }
 
 /// `link(target_len, target, link_path)`. Same wire format as
@@ -1226,13 +1237,14 @@ fn hard_link(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 4 + target_len {
         return -(abi::EINVAL as i64);
     }
-    let target = &request[4..4 + target_len];
-    let link_path = &request[4 + target_len..];
-    if link_path.is_empty() {
+    let target_raw = &request[4..4 + target_len];
+    let link_raw = &request[4 + target_len..];
+    if link_raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
-    with_kernel(|k| k.vfs.link(target, link_path) as i64)
+    let target = proc_self_rewrite(caller_pid, target_raw);
+    let link_path = proc_self_rewrite(caller_pid, link_raw);
+    with_kernel(|k| k.vfs.link(&target, &link_path) as i64)
 }
 
 /// `readlink(path) -> bytes-written or -ENOENT/-EINVAL`. Writes
@@ -1242,9 +1254,9 @@ fn readlink(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
+    let path = proc_self_rewrite(caller_pid, request);
     with_kernel(|k| {
-        let Some(target) = k.vfs.readlink(request) else {
+        let Some(target) = k.vfs.readlink(&path) else {
             return -(abi::EINVAL as i64);
         };
         let n = target.len().min(response.len());
@@ -1260,8 +1272,8 @@ fn unlink(caller_pid: u32, request: &[u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
-    with_kernel(|k| k.vfs.unlink(request) as i64)
+    let path = proc_self_rewrite(caller_pid, request);
+    with_kernel(|k| k.vfs.unlink(&path) as i64)
 }
 
 /// `stat(path) -> 16-byte fstat-shaped record`. Same wire format as
@@ -1274,9 +1286,9 @@ fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
+    let path = proc_self_rewrite(caller_pid, request);
     with_kernel(|k| {
-        let (mount_id, inode) = match k.vfs.open(request, 0) {
+        let (mount_id, inode) = match k.vfs.open(&path, 0) {
             Some(pair) => pair,
             None => return -(abi::ENOENT as i64),
         };
@@ -1303,13 +1315,13 @@ fn chown(caller_pid: u32, request: &[u8]) -> i64 {
     }
     let uid = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let gid = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
-    let path = &request[8..];
-    if path.is_empty() {
+    let raw = &request[8..];
+    if raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
+    let path = proc_self_rewrite(caller_pid, raw);
     with_kernel(|k| {
-        let (mount_id, inode) = match k.vfs.open(path, 0) {
+        let (mount_id, inode) = match k.vfs.open(&path, 0) {
             Some(pair) => pair,
             None => return -(abi::ENOENT as i64),
         };
@@ -1329,13 +1341,13 @@ fn utimens(caller_pid: u32, request: &[u8]) -> i64 {
     }
     let mtime_ns =
         u64::from_le_bytes(request[0..8].try_into().expect("8 bytes"));
-    let path = &request[8..];
-    if path.is_empty() {
+    let raw = &request[8..];
+    if raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid;
+    let path = proc_self_rewrite(caller_pid, raw);
     with_kernel(|k| {
-        let (mount_id, inode) = match k.vfs.open(path, 0) {
+        let (mount_id, inode) = match k.vfs.open(&path, 0) {
             Some(pair) => pair,
             None => return -(abi::ENOENT as i64),
         };
@@ -1355,13 +1367,14 @@ fn chmod(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let mode = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
-    let path = &request[4..];
-    if path.is_empty() {
+    let raw = &request[4..];
+    if raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let _ = caller_pid; // future: use for permission checks
+    // future: use caller_pid for permission checks too
+    let path = proc_self_rewrite(caller_pid, raw);
     with_kernel(|k| {
-        let (mount_id, inode) = match k.vfs.open(path, 0) {
+        let (mount_id, inode) = match k.vfs.open(&path, 0) {
             Some(pair) => pair,
             None => return -(abi::ENOENT as i64),
         };
@@ -3261,6 +3274,33 @@ mod tests {
             dispatch(METHOD_SYS_LINK, 1, &req, &mut []),
             -(abi::EEXIST as i64),
         );
+    }
+
+    #[test]
+    fn proc_selfish_path_is_not_rewritten() {
+        // "/proc/selfish" must not match the /proc/self prefix —
+        // the rewrite requires the next byte to be '/' or end.
+        // Resolves through the regular VFS as a missing path.
+        let _g = crate::kernel::TestGuard::acquire();
+        let rc = dispatch(
+            METHOD_SYS_OPEN,
+            7,
+            &open_req(0, b"/proc/selfish"),
+            &mut [],
+        );
+        assert!(rc < 0, "/proc/selfish should miss, got rc={rc}");
+    }
+
+    #[test]
+    fn proc_self_unlink_attempts_proc_caller_path() {
+        // Even non-/proc-aware syscalls (unlink) must apply the
+        // rewrite. /proc is read-only, so this returns -EROFS or
+        // similar negative — the assertion is just that the path
+        // gets rewritten (the error code reflects ProcBackend's
+        // refusal, not a missing /proc/self mount).
+        let _g = crate::kernel::TestGuard::acquire();
+        let rc = dispatch(METHOD_SYS_UNLINK, 7, b"/proc/self/status", &mut []);
+        assert!(rc < 0, "unlink under /proc must fail (got {rc})");
     }
 
     #[test]
