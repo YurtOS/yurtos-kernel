@@ -262,7 +262,13 @@ impl PipeBuf {
 /// referencing this OFD; when it hits zero the OFD is freed.
 #[derive(Debug)]
 pub struct OpenFileDescription {
-    pub file_id: u64,
+    /// Which mount in `Kernel.vfs` owns this OFD's inode. Lets the
+    /// kernel route reads/writes to the right backend without doing
+    /// path resolution on every syscall.
+    pub mount_id: crate::vfs::MountId,
+    /// Backend-allocated inode id (only meaningful relative to
+    /// `mount_id`).
+    pub inode: u64,
     pub offset: u64,
     pub refs: u32,
     /// Whether this OFD permits writes (O_WRONLY / O_RDWR set at
@@ -293,15 +299,22 @@ impl Kernel {
         }
     }
 
-    /// Allocate a fresh OFD for `inode`, with refcount 1, offset 0,
-    /// and the requested `writable` flag. Returns the OFD id.
-    pub fn create_ofd(&mut self, inode: u64, writable: bool) -> u64 {
+    /// Allocate a fresh OFD pointing at `(mount_id, inode)`, with
+    /// refcount 1, offset 0, and the requested `writable` flag.
+    /// Returns the OFD id.
+    pub fn create_ofd(
+        &mut self,
+        mount_id: crate::vfs::MountId,
+        inode: u64,
+        writable: bool,
+    ) -> u64 {
         let id = self.next_ofd_id;
         self.next_ofd_id += 1;
         self.ofds.insert(
             id,
             OpenFileDescription {
-                file_id: inode,
+                mount_id,
+                inode,
                 offset: 0,
                 refs: 1,
                 writable,

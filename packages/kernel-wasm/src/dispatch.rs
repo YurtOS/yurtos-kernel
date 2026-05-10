@@ -378,11 +378,11 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                 take as i64
             }
             crate::kernel::FdEntry::File { ofd_id } => {
-                let (inode, offset) = match k.ofd(ofd_id) {
-                    Some(o) => (o.file_id, o.offset),
+                let (mount_id, inode, offset) = match k.ofd(ofd_id) {
+                    Some(o) => (o.mount_id, o.inode, o.offset),
                     None => return -(abi::EBADF as i64),
                 };
-                let n = k.vfs.read(inode, offset, response);
+                let n = k.vfs.read(mount_id, inode, offset, response);
                 if n > 0 {
                     if let Some(ofd) = k.ofd_mut(ofd_id) {
                         ofd.offset += n as u64;
@@ -440,14 +440,14 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
                 ..
             } => -(abi::EBADF as i64), // can't write to read end
             crate::kernel::FdEntry::File { ofd_id } => {
-                let (inode, offset, writable) = match k.ofd(ofd_id) {
-                    Some(o) => (o.file_id, o.offset, o.writable),
+                let (mount_id, inode, offset, writable) = match k.ofd(ofd_id) {
+                    Some(o) => (o.mount_id, o.inode, o.offset, o.writable),
                     None => return -(abi::EBADF as i64),
                 };
                 if !writable {
                     return -(abi::EBADF as i64);
                 }
-                let n = k.vfs.write(inode, offset, payload);
+                let n = k.vfs.write(mount_id, inode, offset, payload);
                 if n > 0 {
                     if let Some(o) = k.ofd_mut(ofd_id) {
                         o.offset += n as u64;
@@ -699,15 +699,13 @@ fn register_file(request: &[u8]) -> i64 {
     let path = request[4..4 + path_len].to_vec();
     let content = request[4 + path_len..].to_vec();
     with_kernel(|k| {
-        // Microkernel-only path; only the root mount accepts these.
-        // The path comes through as absolute; root ramfs uses it as-is.
-        k.vfs.create(&path).map(|inode| {
-            // Replace empty content with what was supplied. Lookup
-            // already returns the inode if it exists; otherwise create
-            // installs an empty file. Either way, write the content.
-            let _ = k.vfs.write(inode, 0, &content);
-            inode
-        });
+        // Microkernel-only: install or replace the file at `path`.
+        // create() returns Some((mount_id, inode)) on the root mount;
+        // ramfs's create overwrites existing entries with empty
+        // content, so a subsequent write puts the staged bytes in.
+        if let Some((mount_id, inode)) = k.vfs.create(&path) {
+            let _ = k.vfs.write(mount_id, inode, 0, &content);
+        }
     });
     0
 }
@@ -728,12 +726,12 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
     let create = flags & 0b010 != 0;
     let trunc = flags & 0b100 != 0;
     with_kernel(|k| {
-        let inode = match k.vfs.lookup(path) {
-            Some(id) => id,
+        let (mount_id, inode) = match k.vfs.lookup(path) {
+            Some(pair) => pair,
             None => {
                 if create {
                     match k.vfs.create(path) {
-                        Some(id) => id,
+                        Some(pair) => pair,
                         None => return -(abi::EPERM as i64),
                     }
                 } else {
@@ -742,9 +740,9 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             }
         };
         if trunc {
-            k.vfs.truncate(inode);
+            k.vfs.truncate(mount_id, inode);
         }
-        let ofd_id = k.create_ofd(inode, writable);
+        let ofd_id = k.create_ofd(mount_id, inode, writable);
         let p = k.process_mut(caller_pid);
         let fd = p.fd_table.lowest_free_fd();
         p.fd_table
@@ -768,11 +766,11 @@ fn lseek(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             Some(crate::kernel::FdEntry::File { ofd_id }) => *ofd_id,
             _ => return -(abi::EBADF as i64),
         };
-        let (inode, current) = match k.ofd(ofd_id) {
-            Some(o) => (o.file_id, o.offset),
+        let (mount_id, inode, current) = match k.ofd(ofd_id) {
+            Some(o) => (o.mount_id, o.inode, o.offset),
             None => return -(abi::EBADF as i64),
         };
-        let size = k.vfs.size(inode).unwrap_or(0);
+        let size = k.vfs.size(mount_id, inode).unwrap_or(0);
         let base: i64 = match whence {
             0 => 0,
             1 => current as i64,
@@ -813,11 +811,11 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             | crate::kernel::FdEntry::Stderr => (0, 2),
             crate::kernel::FdEntry::Pipe { .. } => (0, 6),
             crate::kernel::FdEntry::File { ofd_id } => {
-                let inode = match k.ofd(ofd_id) {
-                    Some(o) => o.file_id,
+                let (mount_id, inode) = match k.ofd(ofd_id) {
+                    Some(o) => (o.mount_id, o.inode),
                     None => return -(abi::EBADF as i64),
                 };
-                let sz = k.vfs.size(inode).unwrap_or(0);
+                let sz = k.vfs.size(mount_id, inode).unwrap_or(0);
                 (sz, 4)
             }
         };
