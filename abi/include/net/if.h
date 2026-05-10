@@ -10,6 +10,10 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define IFNAMSIZ  16
 #define IF_NAMESIZE 16
 
@@ -79,5 +83,9 @@ struct ifreq {
  * and yurt-check can verify precedence. */
 unsigned int if_nametoindex(const char *ifname);
 char *if_indextoname(unsigned int ifindex, char *ifname);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _NET_IF_H */

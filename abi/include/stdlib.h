@@ -28,6 +28,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* getentropy(3) is provided by wasi-libc and routes through WASI
  * random_get, which the yurt host services with crypto.getRandomValues
  * (see packages/kernel/src/wasi/wasi-host.ts:randomGet).  This is
@@ -56,6 +60,10 @@ static inline int ptsname_r(int fd, char *buf, size_t buflen) {
     (void)fd; (void)buf; (void)buflen;
     errno = ENOSYS; return -1;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* !__wasilibc_unmodified_upstream */
 

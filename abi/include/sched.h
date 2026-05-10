@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #define CPU_SETSIZE (8 * sizeof(unsigned long))
 
 typedef struct {
@@ -43,5 +47,9 @@ int sched_getscheduler(pid_t pid);
 int sched_setscheduler(pid_t pid, int policy, const struct sched_param *param);
 int sched_getparam(pid_t pid, struct sched_param *param);
 int sched_setparam(pid_t pid, const struct sched_param *param);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

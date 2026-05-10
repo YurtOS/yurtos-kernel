@@ -279,6 +279,8 @@ export class NetworkBridge implements NetworkBridgeLike {
             local_port: req.port,
           };
           pending.push(item);
+          // Unblock a routed-loopback connecting client whose
+          // handleConnect is awaiting acceptedReady on this listener.
           const waiter = connectWaiters.shift();
           if (waiter) waiter();
         });
@@ -319,6 +321,9 @@ export class NetworkBridge implements NetworkBridgeLike {
           writeOk({ ok: true, ...item });
           return;
         }
+        // Bridge requests are serialized over the SAB, so a long-running
+        // accept here would block any connect that's about to feed it.
+        // Always reply immediately; the kernel-side adapter polls.
         writeOk({ ok: false, would_block: true, error: 'accept would block' });
       }
 
@@ -358,7 +363,15 @@ export class NetworkBridge implements NetworkBridgeLike {
             return;
           }
           if (req.nonblocking) {
-            writeErr('EAGAIN');
+            // After peer FIN with no buffered bytes, readableEnded
+            // becomes true once the 'end' event has fired. Return EOF
+            // (ok with empty bytes) so polling callers don't spin
+            // forever after the peer closes.
+            if (sock.readableEnded || sock.destroyed) {
+              writeOk({ ok: true, data_b64: '' });
+            } else {
+              writeErr('EAGAIN');
+            }
             resolve();
             return;
           }

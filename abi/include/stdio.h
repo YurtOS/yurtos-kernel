@@ -4,6 +4,10 @@
 /* Pull in the real wasi-sdk stdio.h. */
 #include_next <stdio.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* flockfile / funlockfile / ftrylockfile — POSIX thread-safe stdio
  * locking.  wasi-libc gates these behind `_REENTRANT` (single-thread
  * sandbox builds don't define it), but autoconf-generated code
@@ -33,5 +37,9 @@ char *cuserid(char *s);
  * BusyBox-specific about this; it's a plain POSIX surface gap. */
 FILE *popen(const char *command, const char *mode);
 int pclose(FILE *stream);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* YURT_COMPAT_STDIO_H */

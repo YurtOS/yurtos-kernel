@@ -8,9 +8,7 @@
 import { VFS } from "./vfs/vfs.js";
 import { OverlayVFS } from "./vfs/overlay-vfs.js";
 import { NodeDirectoryRootProvider } from "./vfs/node-directory-root-provider.js";
-import {
-  TarImageRootProvider,
-} from "./vfs/tar-image-root-provider.js";
+import { TarImageRootProvider } from "./vfs/tar-image-root-provider.js";
 import { loadYurtImage } from "./image-loader.js";
 import { YURT_VERSION } from "./version.js";
 import { ProcessManager } from "./process/manager.js";
@@ -42,10 +40,13 @@ import type { VfsLike } from "./vfs/vfs-like.js";
 import { NetworkGateway } from "./network/gateway.js";
 import type { NetworkPolicy } from "./network/gateway.js";
 import { NetworkBridge, type NetworkBridgeLike } from "./network/bridge.js";
-import type {
-  SocketBackend,
-  SocketListenPolicy,
+import {
+  createLoopbackSocketBackend,
+  createNetworkBridgeSocketBackend,
+  type SocketBackend,
+  type SocketListenPolicy,
 } from "./network/socket-backend.js";
+import { SandboxNet } from "./network/sandbox-net.js";
 import {
   buildSiteCustomizeSource,
   getRequestsShimSource,
@@ -218,6 +219,7 @@ export class Sandbox {
   private envSnapshots: Map<string, Map<string, string>> = new Map();
   private bridge: NetworkBridgeLike | null = null;
   private socketBackend: SocketBackend | undefined;
+  private _net: SandboxNet | null = null;
   private serverSockets: SocketListenPolicy | undefined;
   private runtimeBackend: RuntimeEngineBackend;
   private networkPolicy: NetworkPolicy | undefined;
@@ -274,6 +276,22 @@ export class Sandbox {
     this.envNeedsSync = parts.env.size > 0;
   }
 
+  /**
+   * Host-page-facing network API. Returns a SandboxNet wrapper over the
+   * socket backend's listener registry, or null if the configured
+   * backend doesn't expose one (e.g. the legacy network-bridge worker
+   * path that talks to real OS sockets via SAB). The browser harness
+   * uses this to enumerate sandbox-bound listeners and open duplex
+   * streams from page code into a sandbox-listening server.
+   */
+  get net(): SandboxNet | null {
+    if (this._net) return this._net;
+    const registry = this.socketBackend?.registry;
+    if (!registry) return null;
+    this._net = new SandboxNet(registry);
+    return this._net;
+  }
+
   private audit(type: string, data?: Record<string, unknown>): void {
     if (!this.auditHandler) return;
     this.auditHandler({
@@ -286,7 +304,9 @@ export class Sandbox {
 
   static async create(options: SandboxOptions): Promise<Sandbox> {
     if (options.baseRoot && options.image) {
-      throw new Error("Sandbox.create accepts either baseRoot or image, not both");
+      throw new Error(
+        "Sandbox.create accepts either baseRoot or image, not both",
+      );
     }
     const adapter = options.adapter ?? await Sandbox.detectAdapter();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -326,6 +346,19 @@ export class Sandbox {
     const { bridge } = options.networkBridge
       ? { bridge: options.networkBridge }
       : await Sandbox.createNetworkBridge(options.network);
+
+    // Construct the socket backend exactly once per sandbox so that every
+    // process import shares the same ListenerRegistry. Without this, a
+    // listen() in one process would register the port in a backend nobody
+    // else can see — clients (and Sandbox.net) would fail to connect.
+    const socketBackend: SocketBackend | undefined = options.socketBackend ??
+      (options.serverSockets?.allowLoopback === true
+        ? createLoopbackSocketBackend(
+          bridge ? createNetworkBridgeSocketBackend(bridge) : undefined,
+        )
+        : bridge
+        ? createNetworkBridgeSocketBackend(bridge)
+        : undefined);
     const mgr = new ProcessManager(
       vfs,
       adapter,
@@ -429,7 +462,7 @@ export class Sandbox {
       mgr,
       processes,
       bridge,
-      socketBackend: options.socketBackend,
+      socketBackend,
       serverSockets: options.serverSockets,
       runtimeBackend,
       extensionRegistry,
@@ -670,7 +703,7 @@ export class Sandbox {
       mgr,
       bridge,
       networkPolicy: options.network,
-      socketBackend: options.socketBackend,
+      socketBackend,
       serverSockets: options.serverSockets,
       runtimeBackend,
       security: options.security,
@@ -1291,7 +1324,9 @@ export class Sandbox {
     pathEnv = "/usr/extensions:/usr/bin:/bin",
   ): string {
     for (const dir of pathEnv.split(":")) {
-      const base = dir === "" ? cwd : dir.startsWith("/")
+      const base = dir === ""
+        ? cwd
+        : dir.startsWith("/")
         ? dir
         : Sandbox.resolveSpawnPath(dir, cwd);
       const path = `${base === "/" ? "" : base}/${prog}`;
@@ -1744,6 +1779,29 @@ export class Sandbox {
   stat(path: string): StatResult {
     this.assertAlive();
     return this.vfs.stat(path);
+  }
+
+  /**
+   * Snapshot of VFS storage usage and configured limits. Useful for tests and
+   * for hosts that surface disk-space telemetry to the user. Returns
+   * `undefined` for VFS implementations that don't track byte/file counts.
+   */
+  getStorageStats(): {
+    totalBytes: number;
+    limitBytes: number | undefined;
+    fileCount: number;
+    fileCountLimit: number | undefined;
+  } | undefined {
+    this.assertAlive();
+    const fn = (this.vfs as { getStorageStats?: () => unknown })
+      .getStorageStats;
+    if (typeof fn !== "function") return undefined;
+    return fn.call(this.vfs) as {
+      totalBytes: number;
+      limitBytes: number | undefined;
+      fileCount: number;
+      fileCountLimit: number | undefined;
+    };
   }
 
   process(pid: number): Process | undefined {

@@ -149,6 +149,17 @@ static int case_sigprocmask_sigchld_roundtrip(void) {
   return 0;
 }
 
+static int case_pthread_sigmask_roundtrip(void) {
+  sigset_t set, oldset;
+  if (sigemptyset(&set) != 0) { emit("pthread_sigmask_roundtrip", 1, NULL, 1, errno); return 1; }
+  if (sigaddset(&set, SIGQUIT) != 0) { emit("pthread_sigmask_roundtrip", 1, NULL, 1, errno); return 1; }
+  if (pthread_sigmask(SIG_SETMASK, &set, NULL) != 0) { emit("pthread_sigmask_roundtrip", 1, NULL, 1, errno); return 1; }
+  if (pthread_sigmask(SIG_SETMASK, NULL, &oldset) != 0) { emit("pthread_sigmask_roundtrip", 1, NULL, 1, errno); return 1; }
+  if (sigismember(&oldset, SIGQUIT) != 1) { emit("pthread_sigmask_roundtrip", 1, NULL, 0, 0); return 1; }
+  emit("pthread_sigmask_roundtrip", 0, "pthread_sigmask:roundtrip", 0, 0);
+  return 0;
+}
+
 static int case_sigsuspend_resumes_on_raise(void) {
   /* sigsuspend with empty mask + raise == handler runs synchronously, suspend returns -1/EINTR. */
   struct sigaction sa;
@@ -212,6 +223,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "sigismember_reports") == 0) return case_sigismember_reports();
   if (strcmp(name, "sigprocmask_roundtrip") == 0) return case_sigprocmask_roundtrip();
   if (strcmp(name, "sigprocmask_sigchld_roundtrip") == 0) return case_sigprocmask_sigchld_roundtrip();
+  if (strcmp(name, "pthread_sigmask_roundtrip") == 0) return case_pthread_sigmask_roundtrip();
   if (strcmp(name, "sigsuspend_resumes_on_raise") == 0) return case_sigsuspend_resumes_on_raise();
   if (strcmp(name, "host_kill_delivers_handler") == 0) return case_host_kill_delivers_handler();
   if (strcmp(name, "blocked_host_signal_delivers_after_unblock") == 0) return case_blocked_host_signal_delivers_after_unblock();
@@ -231,6 +243,7 @@ static int list_cases(void) {
   puts("sigismember_reports");
   puts("sigprocmask_roundtrip");
   puts("sigprocmask_sigchld_roundtrip");
+  puts("pthread_sigmask_roundtrip");
   puts("sigsuspend_resumes_on_raise");
   puts("host_kill_delivers_handler");
   puts("blocked_host_signal_delivers_after_unblock");

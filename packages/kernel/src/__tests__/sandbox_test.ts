@@ -4,48 +4,68 @@
  * Exercises the full public API: create, run, file operations, env,
  * destroy, timeout, and VFS size limits.
  */
-import { describe, it, afterEach } from '@std/testing/bdd';
-import { expect } from '@std/expect';
-import { resolve } from 'node:path';
-import { Sandbox } from '../sandbox.js';
-import { NodeAdapter } from '../platform/node-adapter.js';
+import { afterEach, describe, it } from "@std/testing/bdd";
+import { expect } from "@std/expect";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { Sandbox } from "../sandbox.js";
+import { NodeAdapter } from "../platform/node-adapter.js";
 
-const WASM_DIR = resolve(import.meta.dirname!, '../platform/__tests__/fixtures');
-const IS_DENO = typeof (globalThis as any).Deno !== 'undefined';
+const WASM_DIR = resolve(
+  import.meta.dirname!,
+  "../platform/__tests__/fixtures",
+);
+const IS_DENO = typeof (globalThis as any).Deno !== "undefined";
 const workerDescribe = IS_DENO ? describe.skip : describe;
+const CPYTHON_WASM = resolve(WASM_DIR, "cpython3.wasm");
+const cpythonDescribe = existsSync(CPYTHON_WASM) ? describe : describe.skip;
 
-
-describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
+describe("Sandbox", { sanitizeResources: false, sanitizeOps: false }, () => {
   let sandbox: Sandbox;
 
   afterEach(() => {
     sandbox?.destroy();
   });
 
-  it('create and run a simple command', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    const result = await sandbox.run('echo hello');
+  it("create and run a simple command", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    const result = await sandbox.run("echo hello");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe('hello');
+    expect(result.stdout.trim()).toBe("hello");
   });
 
-  it('run a pipeline', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    const result = await sandbox.run('echo hello world | wc -c');
+  it("run a pipeline", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    const result = await sandbox.run("echo hello world | wc -c");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe('12');
+    expect(result.stdout.trim()).toBe("12");
   });
 
-  it('run still uses worker execution when present', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+  it("run still uses worker execution when present", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
     let workerCalled = 0;
-    (sandbox as unknown as { workerExecutor: { run: () => Promise<unknown>; kill: () => void; dispose: () => void } }).workerExecutor = {
+    (sandbox as unknown as {
+      workerExecutor: {
+        run: () => Promise<unknown>;
+        kill: () => void;
+        dispose: () => void;
+      };
+    }).workerExecutor = {
       run: async () => {
         workerCalled++;
         return {
           exitCode: 0,
-          stdout: 'worker\n',
-          stderr: '',
+          stdout: "worker\n",
+          stderr: "",
           executionTimeMs: 1,
         };
       },
@@ -53,183 +73,252 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
       dispose: () => {},
     };
 
-    const result = await sandbox.run('echo host');
+    const result = await sandbox.run("echo host");
 
-    expect(result.stdout).toBe('worker\n');
+    expect(result.stdout).toBe("worker\n");
     expect(workerCalled).toBe(1);
   });
 
-  it('writeFile and readFile', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    const data = new TextEncoder().encode('test content');
-    sandbox.writeFile('/tmp/test.txt', data);
-    const read = sandbox.readFile('/tmp/test.txt');
-    expect(new TextDecoder().decode(read)).toBe('test content');
+  it("writeFile and readFile", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    const data = new TextEncoder().encode("test content");
+    sandbox.writeFile("/tmp/test.txt", data);
+    const read = sandbox.readFile("/tmp/test.txt");
+    expect(new TextDecoder().decode(read)).toBe("test content");
   });
 
-  it('writeFile then cat via run', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    sandbox.writeFile('/tmp/data.txt', new TextEncoder().encode('hello from host'));
-    const result = await sandbox.run('cat /tmp/data.txt');
-    expect(result.stdout).toBe('hello from host');
+  it("writeFile then cat via run", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    sandbox.writeFile(
+      "/tmp/data.txt",
+      new TextEncoder().encode("hello from host"),
+    );
+    const result = await sandbox.run("cat /tmp/data.txt");
+    expect(result.stdout).toBe("hello from host");
   });
 
-  it('mkdir and readDir', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    sandbox.mkdir('/tmp/mydir');
-    const entries = sandbox.readDir('/tmp');
-    expect(entries.some(e => e.name === 'mydir')).toBe(true);
+  it("mkdir and readDir", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    sandbox.mkdir("/tmp/mydir");
+    const entries = sandbox.readDir("/tmp");
+    expect(entries.some((e) => e.name === "mydir")).toBe(true);
   });
 
-  it('stat returns file info', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    sandbox.writeFile('/tmp/s.txt', new TextEncoder().encode('abc'));
-    const s = sandbox.stat('/tmp/s.txt');
+  it("stat returns file info", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    sandbox.writeFile("/tmp/s.txt", new TextEncoder().encode("abc"));
+    const s = sandbox.stat("/tmp/s.txt");
     expect(s.size).toBe(3);
-    expect(s.type).toBe('file');
+    expect(s.type).toBe("file");
   });
 
-  it('rm removes a file', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    sandbox.writeFile('/tmp/del.txt', new TextEncoder().encode('x'));
-    sandbox.rm('/tmp/del.txt');
-    expect(() => sandbox.stat('/tmp/del.txt')).toThrow();
+  it("rm removes a file", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    sandbox.writeFile("/tmp/del.txt", new TextEncoder().encode("x"));
+    sandbox.rm("/tmp/del.txt");
+    expect(() => sandbox.stat("/tmp/del.txt")).toThrow();
   });
 
-  it('setEnv and getEnv', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    sandbox.setEnv('MY_VAR', 'hello');
-    expect(sandbox.getEnv('MY_VAR')).toBe('hello');
-    const result = await sandbox.run('printenv MY_VAR');
-    expect(result.stdout.trim()).toBe('hello');
+  it("setEnv and getEnv", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    sandbox.setEnv("MY_VAR", "hello");
+    expect(sandbox.getEnv("MY_VAR")).toBe("hello");
+    const result = await sandbox.run("printenv MY_VAR");
+    expect(result.stdout.trim()).toBe("hello");
   });
 
-  it('passes argv to external commands', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    const result = await sandbox.run('printenv PATH');
+  it("passes argv to external commands", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    const result = await sandbox.run("printenv PATH");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe('/usr/extensions:/bin:/usr/bin');
+    expect(result.stdout.trim()).toBe("/usr/extensions:/bin:/usr/bin");
   });
 
-  it('openTty initializes login environment and cwd from passwd', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+  it("openTty initializes login environment and cwd from passwd", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
 
     sandbox.openTty();
 
     const env = sandbox.getEnvMap();
-    expect(env.get('HOME')).toBe('/home/user/');
-    expect(env.get('SHELL')).toBe('/bin/sh');
-    expect(env.get('USER')).toBe('user');
-    expect(env.get('LOGNAME')).toBe('user');
-    expect(env.get('TERM')).toBe('xterm-256color');
-    expect(env.get('PWD')).toBe('/home/user');
+    expect(env.get("HOME")).toBe("/home/user/");
+    expect(env.get("SHELL")).toBe("/bin/sh");
+    expect(env.get("USER")).toBe("user");
+    expect(env.get("LOGNAME")).toBe("user");
+    expect(env.get("TERM")).toBe("xterm-256color");
+    expect(env.get("PWD")).toBe("/home/user");
 
     const internals = sandbox as unknown as {
       bootProcess: { pid: number };
       kernel: { getCwd(pid: number): string };
     };
-    expect(internals.kernel.getCwd(internals.bootProcess.pid)).toBe('/home/user');
+    expect(internals.kernel.getCwd(internals.bootProcess.pid)).toBe(
+      "/home/user",
+    );
   });
 
-  it('startHostSession initializes environment and cwd without opening a tty', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+  it("startHostSession initializes environment and cwd without opening a tty", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
 
     sandbox.startHostSession();
 
     const env = sandbox.getEnvMap();
-    expect(env.get('HOME')).toBe('/home/user/');
-    expect(env.get('SHELL')).toBe('/bin/sh');
-    expect(env.get('USER')).toBe('user');
-    expect(env.get('LOGNAME')).toBe('user');
-    expect(env.get('TERM')).toBe('xterm-256color');
-    expect(env.get('PWD')).toBe('/home/user');
+    expect(env.get("HOME")).toBe("/home/user/");
+    expect(env.get("SHELL")).toBe("/bin/sh");
+    expect(env.get("USER")).toBe("user");
+    expect(env.get("LOGNAME")).toBe("user");
+    expect(env.get("TERM")).toBe("xterm-256color");
+    expect(env.get("PWD")).toBe("/home/user");
 
-    const result = await sandbox.run('pwd; echo "$HOME"; echo "$SHELL"; echo "$USER"; echo "$LOGNAME"; echo "$TERM"; echo "$PWD"');
+    const result = await sandbox.run(
+      'pwd; echo "$HOME"; echo "$SHELL"; echo "$USER"; echo "$LOGNAME"; echo "$TERM"; echo "$PWD"',
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim().split('\n')).toEqual([
-      '/home/user',
-      '/home/user/',
-      '/bin/sh',
-      'user',
-      'user',
-      'xterm-256color',
-      '/home/user',
+    expect(result.stdout.trim().split("\n")).toEqual([
+      "/home/user",
+      "/home/user/",
+      "/bin/sh",
+      "user",
+      "user",
+      "xterm-256color",
+      "/home/user",
     ]);
   });
 
-  it('openTty preserves explicit host session environment and uses explicit PWD as cwd', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    sandbox.setEnv('HOME', '/tmp');
-    sandbox.setEnv('SHELL', '/bin/custom-sh');
-    sandbox.setEnv('USER', 'custom-user');
-    sandbox.setEnv('LOGNAME', 'custom-logname');
-    sandbox.setEnv('TERM', 'vt100');
-    sandbox.setEnv('PWD', '/tmp');
+  it("openTty preserves explicit host session environment and uses explicit PWD as cwd", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    sandbox.setEnv("HOME", "/tmp");
+    sandbox.setEnv("SHELL", "/bin/custom-sh");
+    sandbox.setEnv("USER", "custom-user");
+    sandbox.setEnv("LOGNAME", "custom-logname");
+    sandbox.setEnv("TERM", "vt100");
+    sandbox.setEnv("PWD", "/tmp");
 
     sandbox.openTty();
 
     const env = sandbox.getEnvMap();
-    expect(env.get('HOME')).toBe('/tmp');
-    expect(env.get('SHELL')).toBe('/bin/custom-sh');
-    expect(env.get('USER')).toBe('custom-user');
-    expect(env.get('LOGNAME')).toBe('custom-logname');
-    expect(env.get('TERM')).toBe('vt100');
-    expect(env.get('PWD')).toBe('/tmp');
+    expect(env.get("HOME")).toBe("/tmp");
+    expect(env.get("SHELL")).toBe("/bin/custom-sh");
+    expect(env.get("USER")).toBe("custom-user");
+    expect(env.get("LOGNAME")).toBe("custom-logname");
+    expect(env.get("TERM")).toBe("vt100");
+    expect(env.get("PWD")).toBe("/tmp");
 
     const internals = sandbox as unknown as {
       bootProcess: { pid: number };
       kernel: { getCwd(pid: number): string };
     };
-    expect(internals.kernel.getCwd(internals.bootProcess.pid)).toBe('/tmp');
+    expect(internals.kernel.getCwd(internals.bootProcess.pid)).toBe("/tmp");
   });
 
-  it('snapshot/restore drops env vars set after the snapshot from the guest', async () => {
+  it("snapshot/restore drops env vars set after the snapshot from the guest", async () => {
     // Regression test for the merge-only __set_env protocol: without
     // an unset path, restore() shrunk Sandbox.env on the host but left
     // the now-removed vars live in the guest, so subsequent runs saw
     // stale values.
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    sandbox.setEnv('KEEP', 'one');
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    sandbox.setEnv("KEEP", "one");
     const snap = sandbox.snapshot();
-    sandbox.setEnv('DROP', 'two');
+    sandbox.setEnv("DROP", "two");
 
-    const before = await sandbox.run('echo before:$KEEP:$DROP');
-    expect(before.stdout.trim()).toBe('before:one:two');
+    const before = await sandbox.run("echo before:$KEEP:$DROP");
+    expect(before.stdout.trim()).toBe("before:one:two");
 
     sandbox.restore(snap);
-    expect(sandbox.getEnv('DROP')).toBeUndefined();
+    expect(sandbox.getEnv("DROP")).toBeUndefined();
 
-    const after = await sandbox.run('echo after:$KEEP:$DROP');
-    expect(after.stdout.trim()).toBe('after:one:');
+    const after = await sandbox.run("echo after:$KEEP:$DROP");
+    expect(after.stdout.trim()).toBe("after:one:");
   });
 
-  it('exportState/importState drops env vars set after the snapshot from the guest', async () => {
+  it("exportState/importState drops env vars set after the snapshot from the guest", async () => {
     // Same regression as above, walked through the exportState path
     // rather than snapshot()/restore().
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    sandbox.setEnv('KEEP', 'one');
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    sandbox.setEnv("KEEP", "one");
     const blob = sandbox.exportState();
-    sandbox.setEnv('DROP', 'two');
+    sandbox.setEnv("DROP", "two");
 
-    const before = await sandbox.run('echo before:$KEEP:$DROP');
-    expect(before.stdout.trim()).toBe('before:one:two');
+    const before = await sandbox.run("echo before:$KEEP:$DROP");
+    expect(before.stdout.trim()).toBe("before:one:two");
 
     sandbox.importState(blob);
-    expect(sandbox.getEnv('DROP')).toBeUndefined();
+    expect(sandbox.getEnv("DROP")).toBeUndefined();
 
-    const after = await sandbox.run('echo after:$KEEP:$DROP');
-    expect(after.stdout.trim()).toBe('after:one:');
+    const after = await sandbox.run("echo after:$KEEP:$DROP");
+    expect(after.stdout.trim()).toBe("after:one:");
   });
 
-  it('destroy prevents further use', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+  it("destroy prevents further use", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
     sandbox.destroy();
-    expect(() => sandbox.readFile('/tmp/x')).toThrow(/destroyed/);
+    expect(() => sandbox.readFile("/tmp/x")).toThrow(/destroyed/);
     sandbox.destroy(); // double destroy is safe
   });
 
-  it('timeout returns exit code 124', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter(), timeoutMs: 1 });
+  it(
+    "wires sandbox.net to the same loopback backend processes use",
+    async () => {
+      // P1 from PR #17 review: Sandbox.create must build the loopback
+      // backend once and pass it to every process import (and to itself
+      // for sandbox.net). Without sharing, a process listen() registers
+      // a port nobody else can see.
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+        serverSockets: { allowLoopback: true },
+      });
+      expect(sandbox.net).not.toBeNull();
+      // No listeners yet — but the accessor must work, proving the
+      // registry was constructed and is reachable from the host side.
+      expect(sandbox.net?.listListeners()).toEqual([]);
+    },
+  );
+
+  it("timeout returns exit code 124", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+      timeoutMs: 1,
+    });
     // A shell-builtin infinite loop runs entirely inside the resident
     // shell-exec — no external fixture spawns to race with the 1ms
     // deadline. The previous form `yes hello | head -1000` only hit
@@ -237,202 +326,280 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
     // longer than 1ms when the spawned tools were missing fixtures
     // (yes / head don't ship in __tests__/fixtures/); a slightly
     // faster wasm build flipped it to exit 127.
-    const result = await sandbox.run('while true; do :; done');
+    const result = await sandbox.run("while true; do :; done");
     expect(result.exitCode).toBe(124);
-    expect(result.errorClass).toBe('TIMEOUT');
+    expect(result.errorClass).toBe("TIMEOUT");
   });
 
-  it('VFS size limit enforces ENOSPC', async () => {
-    // Init installs real WASM executables into /bin and /usr/bin; current
-    // fixture bytes are ~188.1MB. This limit leaves enough room for the
-    // first 40KB write, but not for the second 200KB write.
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter(), fsLimitBytes: 188_150_000 });
-    sandbox.writeFile('/tmp/a.txt', new Uint8Array(40_000));
+  it("VFS size limit enforces ENOSPC", async () => {
+    // Measure how many bytes the kernel installs during init (bash.wasm,
+    // busybox.wasm, etc.) so the test stays robust as fixture sizes shift,
+    // then size fsLimitBytes to permit the first write but trip the second.
+    const probe = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    const baseline = probe.getStorageStats()?.totalBytes ?? 0;
+    probe.destroy();
+    expect(baseline).toBeGreaterThan(0);
+
+    const headroom = 100_000;
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+      fsLimitBytes: baseline + headroom,
+    });
+    sandbox.writeFile("/tmp/a.txt", new Uint8Array(40_000));
     expect(() => {
-      sandbox.writeFile('/tmp/b.txt', new Uint8Array(10_000_000));
+      sandbox.writeFile("/tmp/b.txt", new Uint8Array(headroom));
     }).toThrow(/ENOSPC/);
   });
 
-  it('discovers tools via scanTools', async () => {
-    sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-    const result = await sandbox.run('uname');
-    expect(result.stdout.trim()).toBe('yurt');
+  it("discovers tools via scanTools", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+    });
+    const result = await sandbox.run("uname");
+    expect(result.stdout.trim()).toBe("yurt");
   });
 
-  describe('aliases', () => {
-    it('alias expansion works', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+  describe("aliases", () => {
+    it("alias expansion works", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
       await sandbox.run('alias greet="echo hello"');
-      const r = await sandbox.run('greet world');
-      expect(r.stdout).toBe('hello world\n');
+      const r = await sandbox.run("greet world");
+      expect(r.stdout).toBe("hello world\n");
     });
 
-    it('alias list and unalias', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+    it("alias list and unalias", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
       await sandbox.run('alias foo="echo bar"');
-      const r1 = await sandbox.run('alias');
+      const r1 = await sandbox.run("alias");
       expect(r1.stdout).toContain("alias foo='echo bar'");
-      await sandbox.run('unalias foo');
-      const r2 = await sandbox.run('alias');
-      expect(r2.stdout).not.toContain('foo');
+      await sandbox.run("unalias foo");
+      const r2 = await sandbox.run("alias");
+      expect(r2.stdout).not.toContain("foo");
     });
   });
 
-  describe('arrays', () => {
-    it('indexed array operations', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      const r = await sandbox.run('arr=(one two three); echo ${arr[1]}');
-      expect(r.stdout).toBe('two\n');
+  describe("arrays", () => {
+    it("indexed array operations", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      const r = await sandbox.run("arr=(one two three); echo ${arr[1]}");
+      expect(r.stdout).toBe("two\n");
     });
 
-    it('array all elements', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      const r = await sandbox.run('arr=(a b c); echo ${arr[@]}');
-      expect(r.stdout).toBe('a b c\n');
+    it("array all elements", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      const r = await sandbox.run("arr=(a b c); echo ${arr[@]}");
+      expect(r.stdout).toBe("a b c\n");
     });
 
-    it('array length', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      const r = await sandbox.run('arr=(a b c d); echo ${#arr[@]}');
-      expect(r.stdout).toBe('4\n');
+    it("array length", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      const r = await sandbox.run("arr=(a b c d); echo ${#arr[@]}");
+      expect(r.stdout).toBe("4\n");
     });
 
-    it('array append', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      const r = await sandbox.run('arr=(a b); arr+=(c d); echo ${arr[@]}');
-      expect(r.stdout).toBe('a b c d\n');
+    it("array append", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      const r = await sandbox.run("arr=(a b); arr+=(c d); echo ${arr[@]}");
+      expect(r.stdout).toBe("a b c d\n");
     });
 
-    it('associative array', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      const r = await sandbox.run('declare -A m; m[name]=alice; m[age]=30; echo ${m[name]} is ${m[age]}');
-      expect(r.stdout).toBe('alice is 30\n');
+    it("associative array", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      const r = await sandbox.run(
+        "declare -A m; m[name]=alice; m[age]=30; echo ${m[name]} is ${m[age]}",
+      );
+      expect(r.stdout).toBe("alice is 30\n");
     });
   });
 
-  describe('process substitution', () => {
-    it('input process substitution <(cmd)', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      const r = await sandbox.run('cat <(echo hello)');
-      expect(r.stdout).toBe('hello\n');
+  describe("process substitution", () => {
+    it("input process substitution <(cmd)", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      const r = await sandbox.run("cat <(echo hello)");
+      expect(r.stdout).toBe("hello\n");
     });
 
-    it('diff with two process substitutions', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      const r = await sandbox.run('diff <(printf "a\\nb\\n") <(printf "a\\nb\\n")');
+    it("diff with two process substitutions", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      const r = await sandbox.run(
+        'diff <(printf "a\\nb\\n") <(printf "a\\nb\\n")',
+      );
       expect(r.exitCode).toBe(0);
     });
   });
 
-  describe('snapshot and restore', () => {
-    it('snapshot captures VFS + env state', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      sandbox.writeFile('/tmp/data.txt', new TextEncoder().encode('v1'));
-      sandbox.setEnv('MY_VAR', 'original');
+  describe("snapshot and restore", () => {
+    it("snapshot captures VFS + env state", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      sandbox.writeFile("/tmp/data.txt", new TextEncoder().encode("v1"));
+      sandbox.setEnv("MY_VAR", "original");
       const snapId = sandbox.snapshot();
 
-      sandbox.writeFile('/tmp/data.txt', new TextEncoder().encode('v2'));
-      sandbox.setEnv('MY_VAR', 'changed');
-      sandbox.writeFile('/tmp/new.txt', new TextEncoder().encode('new'));
+      sandbox.writeFile("/tmp/data.txt", new TextEncoder().encode("v2"));
+      sandbox.setEnv("MY_VAR", "changed");
+      sandbox.writeFile("/tmp/new.txt", new TextEncoder().encode("new"));
 
       sandbox.restore(snapId);
-      expect(new TextDecoder().decode(sandbox.readFile('/tmp/data.txt'))).toBe('v1');
-      expect(sandbox.getEnv('MY_VAR')).toBe('original');
-      expect(() => sandbox.stat('/tmp/new.txt')).toThrow();
+      expect(new TextDecoder().decode(sandbox.readFile("/tmp/data.txt"))).toBe(
+        "v1",
+      );
+      expect(sandbox.getEnv("MY_VAR")).toBe("original");
+      expect(() => sandbox.stat("/tmp/new.txt")).toThrow();
     });
 
-    it('snapshots are reusable', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      sandbox.writeFile('/tmp/f.txt', new TextEncoder().encode('snap'));
+    it("snapshots are reusable", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      sandbox.writeFile("/tmp/f.txt", new TextEncoder().encode("snap"));
       const snapId = sandbox.snapshot();
 
-      sandbox.writeFile('/tmp/f.txt', new TextEncoder().encode('changed1'));
+      sandbox.writeFile("/tmp/f.txt", new TextEncoder().encode("changed1"));
       sandbox.restore(snapId);
-      expect(new TextDecoder().decode(sandbox.readFile('/tmp/f.txt'))).toBe('snap');
+      expect(new TextDecoder().decode(sandbox.readFile("/tmp/f.txt"))).toBe(
+        "snap",
+      );
 
-      sandbox.writeFile('/tmp/f.txt', new TextEncoder().encode('changed2'));
+      sandbox.writeFile("/tmp/f.txt", new TextEncoder().encode("changed2"));
       sandbox.restore(snapId);
-      expect(new TextDecoder().decode(sandbox.readFile('/tmp/f.txt'))).toBe('snap');
+      expect(new TextDecoder().decode(sandbox.readFile("/tmp/f.txt"))).toBe(
+        "snap",
+      );
     });
 
-    it('restore throws for invalid snapshot ID', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      expect(() => sandbox.restore('nonexistent')).toThrow();
+    it("restore throws for invalid snapshot ID", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      expect(() => sandbox.restore("nonexistent")).toThrow();
     });
   });
 
-  describe('fork', () => {
-    it('creates an independent sandbox with COW VFS', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
-      sandbox.writeFile('/tmp/shared.txt', new TextEncoder().encode('original'));
-      sandbox.setEnv('FORKED', 'yes');
+  describe("fork", () => {
+    it("creates an independent sandbox with COW VFS", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
+      sandbox.writeFile(
+        "/tmp/shared.txt",
+        new TextEncoder().encode("original"),
+      );
+      sandbox.setEnv("FORKED", "yes");
 
       const child = await sandbox.fork();
       try {
-        expect(new TextDecoder().decode(child.readFile('/tmp/shared.txt'))).toBe('original');
-        expect(child.getEnv('FORKED')).toBe('yes');
+        expect(new TextDecoder().decode(child.readFile("/tmp/shared.txt")))
+          .toBe("original");
+        expect(child.getEnv("FORKED")).toBe("yes");
 
-        child.writeFile('/tmp/shared.txt', new TextEncoder().encode('child'));
-        expect(new TextDecoder().decode(sandbox.readFile('/tmp/shared.txt'))).toBe('original');
-        expect(new TextDecoder().decode(child.readFile('/tmp/shared.txt'))).toBe('child');
+        child.writeFile("/tmp/shared.txt", new TextEncoder().encode("child"));
+        expect(new TextDecoder().decode(sandbox.readFile("/tmp/shared.txt")))
+          .toBe("original");
+        expect(new TextDecoder().decode(child.readFile("/tmp/shared.txt")))
+          .toBe("child");
 
-        child.writeFile('/tmp/child-only.txt', new TextEncoder().encode('x'));
-        expect(() => sandbox.stat('/tmp/child-only.txt')).toThrow();
+        child.writeFile("/tmp/child-only.txt", new TextEncoder().encode("x"));
+        expect(() => sandbox.stat("/tmp/child-only.txt")).toThrow();
       } finally {
         child.destroy();
       }
     });
 
-    it('forked sandbox can run commands independently', async () => {
-      sandbox = await Sandbox.create({ wasmDir: WASM_DIR, adapter: new NodeAdapter() });
+    it("forked sandbox can run commands independently", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: WASM_DIR,
+        adapter: new NodeAdapter(),
+      });
       const child = await sandbox.fork();
       try {
-        const result = await child.run('echo hello from fork');
+        const result = await child.run("echo hello from fork");
         expect(result.exitCode).toBe(0);
-        expect(result.stdout.trim()).toBe('hello from fork');
+        expect(result.stdout.trim()).toBe("hello from fork");
       } finally {
         child.destroy();
       }
     });
   });
 
-  describe('resource limits', () => {
-    it('rejects command exceeding commandBytes limit', async () => {
+  describe("resource limits", () => {
+    it("rejects command exceeding commandBytes limit", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { commandBytes: 10 } },
       });
-      const result = await sandbox.run('echo this is a long command that exceeds the limit');
+      const result = await sandbox.run(
+        "echo this is a long command that exceeds the limit",
+      );
       expect(result.exitCode).toBe(1);
-      expect(result.errorClass).toBe('LIMIT_EXCEEDED');
-      expect(result.stderr).toContain('command too large');
+      expect(result.errorClass).toBe("LIMIT_EXCEEDED");
+      expect(result.stderr).toContain("command too large");
     });
 
-    it('truncates stdout exceeding stdoutBytes limit', async () => {
+    it("truncates stdout exceeding stdoutBytes limit", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { stdoutBytes: 20 } },
       });
       // Use WASM command (not builtin) so WASI-level truncation applies
-      const result = await sandbox.run('yes hello | head -100');
+      const result = await sandbox.run("yes hello | head -100");
       expect(result.truncated?.stdout).toBe(true);
       expect(result.stdout.length).toBeLessThanOrEqual(70); // 20 + truncation marker
     });
 
-    it('truncates stderr exceeding stderrBytes limit', async () => {
+    it("truncates stderr exceeding stderrBytes limit", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { stderrBytes: 20 } },
       });
       // cat on nonexistent file generates stderr via WASM
-      const result = await sandbox.run('cat /nonexistent/file1; cat /nonexistent/file2; cat /nonexistent/file3');
+      const result = await sandbox.run(
+        "cat /nonexistent/file1; cat /nonexistent/file2; cat /nonexistent/file3",
+      );
       expect(result.truncated?.stderr).toBe(true);
     });
 
-    it('passes fileCount limit to VFS', async () => {
+    it("passes fileCount limit to VFS", async () => {
       // The limit must be high enough to survive VFS init + populateBin()
       // which creates ~9 dirs + ~230 tool stubs in /bin and /usr/bin.
       sandbox = await Sandbox.create({
@@ -440,14 +607,14 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
         adapter: new NodeAdapter(),
         security: { limits: { fileCount: 500 } },
       });
-      sandbox.writeFile('/tmp/a.txt', new Uint8Array(1));
+      sandbox.writeFile("/tmp/a.txt", new Uint8Array(1));
       // Fill remaining slots to trigger the limit
       let hitLimit = false;
       for (let i = 0; i < 500; i++) {
         try {
           sandbox.writeFile(`/tmp/fill-${i}.txt`, new Uint8Array(1));
         } catch (e: unknown) {
-          if (e instanceof Error && e.message.includes('ENOSPC')) {
+          if (e instanceof Error && e.message.includes("ENOSPC")) {
             hitLimit = true;
             break;
           }
@@ -457,103 +624,103 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
       expect(hitLimit).toBe(true);
     });
 
-    it('sets errorClass TIMEOUT on timeout', async () => {
+    it("sets errorClass TIMEOUT on timeout", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         timeoutMs: 1,
       });
-      const result = await sandbox.run('yes hello | head -1000');
+      const result = await sandbox.run("yes hello | head -1000");
       expect(result.exitCode).toBe(124);
-      expect(result.errorClass).toBe('TIMEOUT');
+      expect(result.errorClass).toBe("TIMEOUT");
     });
 
-    it('no truncation when output is within limits', async () => {
+    it("no truncation when output is within limits", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { stdoutBytes: 1_000_000 } },
       });
-      const result = await sandbox.run('echo hello');
+      const result = await sandbox.run("echo hello");
       expect(result.truncated).toBeUndefined();
     });
   });
 
-  describe('socket shim bootstrap', () => {
-    it('writes socket.py to VFS when network is configured', async () => {
+  describe("socket shim bootstrap", () => {
+    it("writes socket.py to VFS when network is configured", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
-        network: { allowedHosts: ['example.com'] },
+        network: { allowedHosts: ["example.com"] },
       });
-      const data = sandbox.readFile('/usr/lib/python/socket.py');
+      const data = sandbox.readFile("/usr/lib/python/socket.py");
       const content = new TextDecoder().decode(data);
-      expect(content).toContain('import _yurt');
-      expect(content).toContain('class socket:');
+      expect(content).toContain("import _yurt");
+      expect(content).toContain("class socket:");
 
-      const siteData = sandbox.readFile('/usr/lib/python/sitecustomize.py');
+      const siteData = sandbox.readFile("/usr/lib/python/sitecustomize.py");
       const siteContent = new TextDecoder().decode(siteData);
-      expect(siteContent).toContain('sys.modules[name]');
+      expect(siteContent).toContain("sys.modules[name]");
     });
 
-    it('sets PYTHONPATH when network is configured', async () => {
+    it("sets PYTHONPATH when network is configured", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
-        network: { allowedHosts: ['example.com'] },
+        network: { allowedHosts: ["example.com"] },
       });
-      expect(sandbox.getEnv('PYTHONPATH')).toBe('/usr/lib/python');
+      expect(sandbox.getEnv("PYTHONPATH")).toBe("/usr/lib/python");
     });
 
-    it('does not write socket.py when network is not configured', async () => {
+    it("does not write socket.py when network is not configured", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
       });
-      expect(() => sandbox.readFile('/usr/lib/python/socket.py')).toThrow();
+      expect(() => sandbox.readFile("/usr/lib/python/socket.py")).toThrow();
     });
 
-    it('forked sandbox inherits socket.py', async () => {
+    it("forked sandbox inherits socket.py", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
-        network: { allowedHosts: ['example.com'] },
+        network: { allowedHosts: ["example.com"] },
       });
       const child = await sandbox.fork();
       try {
-        const data = child.readFile('/usr/lib/python/socket.py');
-        expect(new TextDecoder().decode(data)).toContain('import _yurt');
+        const data = child.readFile("/usr/lib/python/socket.py");
+        expect(new TextDecoder().decode(data)).toContain("import _yurt");
       } finally {
         child.destroy();
       }
     });
   });
 
-  describe('output limits', () => {
-    it('truncates stdout at configured limit', async () => {
+  describe("output limits", () => {
+    it("truncates stdout at configured limit", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { stdoutBytes: 20 } },
       });
-      const result = await sandbox.run('yes hello | head -100');
+      const result = await sandbox.run("yes hello | head -100");
       expect(result.stdout.length).toBeLessThanOrEqual(70); // 20 + truncation marker
       expect(result.truncated?.stdout).toBe(true);
     });
 
-    it('does not truncate when under limit', async () => {
+    it("does not truncate when under limit", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { stdoutBytes: 10000 } },
       });
-      const result = await sandbox.run('echo hello');
+      const result = await sandbox.run("echo hello");
       expect(result.truncated?.stdout).toBeFalsy();
     });
   });
 
-  describe('file count limit', () => {
-    it('rejects file creation when limit reached', async () => {
+  describe("file count limit", () => {
+    it("rejects file creation when limit reached", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
@@ -565,7 +732,7 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
       let threw = false;
       for (let i = 0; i < 400; i++) {
         try {
-          sandbox.writeFile(`/tmp/f${i}.txt`, new TextEncoder().encode('x'));
+          sandbox.writeFile(`/tmp/f${i}.txt`, new TextEncoder().encode("x"));
         } catch {
           threw = true;
           break;
@@ -575,32 +742,32 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
     });
   });
 
-  describe('command size limit', () => {
-    it('rejects command exceeding commandBytes limit', async () => {
+  describe("command size limit", () => {
+    it("rejects command exceeding commandBytes limit", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { commandBytes: 50 } },
       });
-      const result = await sandbox.run('echo ' + 'x'.repeat(100));
-      expect(result.errorClass).toBe('LIMIT_EXCEEDED');
+      const result = await sandbox.run("echo " + "x".repeat(100));
+      expect(result.errorClass).toBe("LIMIT_EXCEEDED");
       expect(result.exitCode).not.toBe(0);
     });
 
-    it('allows command under the limit', async () => {
+    it("allows command under the limit", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { commandBytes: 1000 } },
       });
-      const result = await sandbox.run('echo hello');
+      const result = await sandbox.run("echo hello");
       expect(result.exitCode).toBe(0);
       expect(result.errorClass).toBeUndefined();
     });
   });
 
-  describe('broadened syscall deadline checks', () => {
-    it('kills WASM that calls clock_time_get in a loop', async () => {
+  cpythonDescribe("broadened syscall deadline checks", () => {
+    it("kills WASM that calls clock_time_get in a loop", async () => {
       // Python's time.time() calls clock_time_get — a tight loop calling it will now hit the deadline
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
@@ -608,19 +775,21 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
         security: { limits: { timeoutMs: 300 } },
       });
       const start = performance.now();
-      const result = await sandbox.run('python3 -c "import time\nwhile True:\n time.time()"');
+      const result = await sandbox.run(
+        'python3 -c "import time\nwhile True:\n time.time()"',
+      );
       const elapsed = performance.now() - start;
-      expect(result.errorClass).toBe('TIMEOUT');
+      expect(result.errorClass).toBe("TIMEOUT");
       expect(elapsed).toBeLessThan(3000);
     });
   });
 
-  workerDescribe('worker-based hard kill', () => {
+  workerDescribe("worker-based hard kill", () => {
     // workerDescribe is describe.skip in Deno, so this case only runs in
     // Node — where the per-test timeout knob comes from the runner config,
     // not @std/testing/bdd's options. The 3000ms hardKill plus headroom
     // keeps the wall-clock comfortably under any reasonable default.
-    it('kills a pure CPU-bound Python loop via worker termination', async () => {
+    it("kills a pure CPU-bound Python loop via worker termination", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
@@ -629,13 +798,13 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
       const start = performance.now();
       const result = await sandbox.run('python3 -c "while True: pass"');
       const elapsed = performance.now() - start;
-      expect(result.errorClass).toBe('TIMEOUT');
+      expect(result.errorClass).toBe("TIMEOUT");
       expect(elapsed).toBeLessThan(10000);
     });
   });
 
-  describe('hard cancellation', () => {
-    it('timeout kills long-running WASM via deadline in fdWrite', async () => {
+  describe("hard cancellation", () => {
+    it("timeout kills long-running WASM via deadline in fdWrite", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
@@ -643,75 +812,75 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
       });
       const start = performance.now();
       // seq 1 billion generates huge output; deadline in fdWrite kills it
-      const result = await sandbox.run('seq 1 999999999');
+      const result = await sandbox.run("seq 1 999999999");
       const elapsed = performance.now() - start;
-      expect(result.errorClass).toBe('TIMEOUT');
+      expect(result.errorClass).toBe("TIMEOUT");
       expect(result.exitCode).toBe(124);
       // Should complete near the timeout, not run for 30s
       expect(elapsed).toBeLessThan(3000);
     });
 
-    it('timeout kills chained commands via deadline in execCommand', async () => {
+    it("timeout kills chained commands via deadline in execCommand", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { timeoutMs: 50 } },
       });
       // Two sequential heavy WASM commands — second gets killed by deadline
-      const result = await sandbox.run('seq 1 999999999 && seq 1 999999999');
-      expect(result.errorClass).toBe('TIMEOUT');
+      const result = await sandbox.run("seq 1 999999999 && seq 1 999999999");
+      expect(result.errorClass).toBe("TIMEOUT");
       expect(result.exitCode).toBe(124);
     });
   });
 
-  describe('tool allowlist', () => {
-    it('blocks tools not in allowlist', async () => {
+  describe("tool allowlist", () => {
+    it("blocks tools not in allowlist", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
-        security: { toolAllowlist: ['echo', 'cat'] },
+        security: { toolAllowlist: ["echo", "cat"] },
       });
-      const result = await sandbox.run('grep hello /tmp/f.txt');
+      const result = await sandbox.run("grep hello /tmp/f.txt");
       expect(result.exitCode).not.toBe(0);
-      expect(result.stderr).toContain('not allowed');
+      expect(result.stderr).toContain("not allowed");
     });
 
-    it('allows tools in allowlist', async () => {
+    it("allows tools in allowlist", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
-        security: { toolAllowlist: ['echo', 'cat'] },
+        security: { toolAllowlist: ["echo", "cat"] },
       });
       // echo is a builtin, always available
-      const result = await sandbox.run('echo hello');
-      expect(result.stdout.trim()).toBe('hello');
+      const result = await sandbox.run("echo hello");
+      expect(result.stdout.trim()).toBe("hello");
     });
 
-    it('no allowlist means all tools allowed', async () => {
+    it("no allowlist means all tools allowed", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
       });
-      const result = await sandbox.run('uname');
+      const result = await sandbox.run("uname");
       expect(result.exitCode).toBe(0);
     });
   });
 
-  describe('memoryBytes limit', () => {
-    it('rejects WASM that exceeds memoryBytes limit', async () => {
+  describe("memoryBytes limit", () => {
+    it("rejects WASM that exceeds memoryBytes limit", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { memoryBytes: 1024 } }, // 1KB — too small for any WASM
       });
-      const result = await sandbox.run('cat /tmp/nonexistent');
+      const result = await sandbox.run("cat /tmp/nonexistent");
       expect(result.exitCode).not.toBe(0);
-      expect(result.stderr).toContain('memory limit');
+      expect(result.stderr).toContain("memory limit");
     });
   });
 
-  describe('SecurityOptions', () => {
-    it('accepts security options on create', async () => {
+  describe("SecurityOptions", () => {
+    it("accepts security options on create", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
@@ -719,81 +888,81 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
           limits: { stdoutBytes: 1024, stderrBytes: 1024 },
         },
       });
-      const result = await sandbox.run('echo hello');
+      const result = await sandbox.run("echo hello");
       expect(result.exitCode).toBe(0);
     });
 
-    it('RunResult includes errorClass on timeout', async () => {
+    it("RunResult includes errorClass on timeout", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { limits: { timeoutMs: 1 } },
       });
       // yes | head produces enough work to exceed 1ms timeout
-      const result = await sandbox.run('yes hello | head -10000');
-      expect(result.errorClass).toBe('TIMEOUT');
+      const result = await sandbox.run("yes hello | head -10000");
+      expect(result.errorClass).toBe("TIMEOUT");
     });
   });
 
-  workerDescribe('hard kill via Worker', () => {
-    it('timeout terminates execution via worker.terminate()', async () => {
+  workerDescribe("hard kill via Worker", () => {
+    it("timeout terminates execution via worker.terminate()", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { hardKill: true, limits: { timeoutMs: 200 } },
       });
       const start = performance.now();
-      const result = await sandbox.run('seq 1 999999999');
+      const result = await sandbox.run("seq 1 999999999");
       const elapsed = performance.now() - start;
-      expect(result.errorClass).toBe('TIMEOUT');
+      expect(result.errorClass).toBe("TIMEOUT");
       expect(result.exitCode).toBe(124);
       expect(elapsed).toBeLessThan(5000);
     });
 
-    it('cancel() immediately kills Worker execution', async () => {
+    it("cancel() immediately kills Worker execution", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { hardKill: true },
         timeoutMs: 30000,
       });
-      const promise = sandbox.run('seq 1 999999999');
-      await new Promise(r => setTimeout(r, 100));
+      const promise = sandbox.run("seq 1 999999999");
+      await new Promise((r) => setTimeout(r, 100));
       sandbox.cancel();
       const result = await promise;
-      expect(result.errorClass).toBe('CANCELLED');
+      expect(result.errorClass).toBe("CANCELLED");
       expect(result.exitCode).toBe(125);
     });
 
-    it('next run after timeout works correctly', async () => {
+    it("next run after timeout works correctly", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { hardKill: true, limits: { timeoutMs: 100 } },
       });
-      const r1 = await sandbox.run('seq 1 999999999');
-      expect(r1.errorClass).toBe('TIMEOUT');
-      const r2 = await sandbox.run('echo recovered');
+      const r1 = await sandbox.run("seq 1 999999999");
+      expect(r1.errorClass).toBe("TIMEOUT");
+      const r2 = await sandbox.run("echo recovered");
       expect(r2.exitCode).toBe(0);
-      expect(r2.stdout.trim()).toBe('recovered');
+      expect(r2.stdout.trim()).toBe("recovered");
     });
 
-    it('VFS is consistent after timeout kill', async () => {
+    it("VFS is consistent after timeout kill", async () => {
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: { hardKill: true, limits: { timeoutMs: 100 } },
       });
-      sandbox.writeFile('/tmp/pre.txt', new TextEncoder().encode('before'));
-      const r1 = await sandbox.run('seq 1 999999999');
-      expect(r1.errorClass).toBe('TIMEOUT');
-      const content = sandbox.readFile('/tmp/pre.txt');
-      expect(new TextDecoder().decode(content)).toBe('before');
+      sandbox.writeFile("/tmp/pre.txt", new TextEncoder().encode("before"));
+      const r1 = await sandbox.run("seq 1 999999999");
+      expect(r1.errorClass).toBe("TIMEOUT");
+      const content = sandbox.readFile("/tmp/pre.txt");
+      expect(new TextDecoder().decode(content)).toBe("before");
     });
   });
 
-  describe('audit logging', () => {
-    it('emits events for command lifecycle', async () => {
+  describe("audit logging", () => {
+    it("emits events for command lifecycle", async () => {
       const events: any[] = [];
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
@@ -802,16 +971,16 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
           onAuditEvent: (event) => events.push(event),
         },
       });
-      await sandbox.run('echo hello');
+      await sandbox.run("echo hello");
       sandbox.destroy();
 
-      expect(events.find(e => e.type === 'sandbox.create')).toBeDefined();
-      expect(events.find(e => e.type === 'command.start')).toBeDefined();
-      expect(events.find(e => e.type === 'command.complete')).toBeDefined();
-      expect(events.find(e => e.type === 'sandbox.destroy')).toBeDefined();
+      expect(events.find((e) => e.type === "sandbox.create")).toBeDefined();
+      expect(events.find((e) => e.type === "command.start")).toBeDefined();
+      expect(events.find((e) => e.type === "command.complete")).toBeDefined();
+      expect(events.find((e) => e.type === "sandbox.destroy")).toBeDefined();
     });
 
-    it('emits timeout event', async () => {
+    it("emits timeout event", async () => {
       const events: any[] = [];
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
@@ -825,12 +994,12 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
       // a shell-builtin infinite loop hits the 1ms deadline
       // deterministically; the previous `yes | head` form was
       // racy against pipeline-setup latency.
-      await sandbox.run('while true; do :; done');
+      await sandbox.run("while true; do :; done");
 
-      expect(events.find(e => e.type === 'command.timeout')).toBeDefined();
+      expect(events.find((e) => e.type === "command.timeout")).toBeDefined();
     });
 
-    it('audit events have sessionId and timestamp', async () => {
+    it("audit events have sessionId and timestamp", async () => {
       const events: any[] = [];
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
@@ -839,19 +1008,19 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
           onAuditEvent: (event) => events.push(event),
         },
       });
-      await sandbox.run('echo hello');
+      await sandbox.run("echo hello");
 
       for (const e of events) {
         expect(e.sessionId).toBeDefined();
-        expect(typeof e.sessionId).toBe('string');
+        expect(typeof e.sessionId).toBe("string");
         expect(e.timestamp).toBeGreaterThan(0);
       }
       // All events share the same sessionId
-      const ids = new Set(events.map(e => e.sessionId));
+      const ids = new Set(events.map((e) => e.sessionId));
       expect(ids.size).toBe(1);
     });
 
-    it('emits limit.exceeded event on output truncation', async () => {
+    it("emits limit.exceeded event on output truncation", async () => {
       const events: any[] = [];
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
@@ -873,25 +1042,29 @@ describe('Sandbox', { sanitizeResources: false, sanitizeOps: false }, () => {
       // yes keeps calling fd_write 3.7M times receiving WASI_EPIPE
       // and never terminates. The bounded echo form keeps the
       // test fast and self-contained.
-      const longStr = 'abcdefghijklmnopqrstuvwxyz'.repeat(20);
+      const longStr = "abcdefghijklmnopqrstuvwxyz".repeat(20);
       await sandbox.run(`echo "${longStr}"`);
 
-      expect(events.find(e => e.type === 'limit.exceeded' && e.subtype === 'stdout')).toBeDefined();
+      expect(
+        events.find((e) =>
+          e.type === "limit.exceeded" && e.subtype === "stdout"
+        ),
+      ).toBeDefined();
     });
 
-    it('emits capability.denied on blocked tool', async () => {
+    it("emits capability.denied on blocked tool", async () => {
       const events: any[] = [];
       sandbox = await Sandbox.create({
         wasmDir: WASM_DIR,
         adapter: new NodeAdapter(),
         security: {
-          toolAllowlist: ['echo'],
+          toolAllowlist: ["echo"],
           onAuditEvent: (event) => events.push(event),
         },
       });
-      await sandbox.run('grep hello /tmp/f.txt');
+      await sandbox.run("grep hello /tmp/f.txt");
 
-      expect(events.find(e => e.type === 'capability.denied')).toBeDefined();
+      expect(events.find((e) => e.type === "capability.denied")).toBeDefined();
     });
   });
 });

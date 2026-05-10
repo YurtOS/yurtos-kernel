@@ -56,6 +56,10 @@ export type FdTarget =
       maxBytes: number,
       opts?: { nonblocking?: boolean },
     ) => SocketBackendResult;
+    recvAsync: (
+      socket: SocketHandle,
+      maxBytes: number,
+    ) => Promise<SocketBackendResult>;
     setNoDelay?: (
       socket: SocketHandle,
       enabled: boolean,

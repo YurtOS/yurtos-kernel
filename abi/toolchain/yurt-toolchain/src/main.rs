@@ -133,6 +133,96 @@ fn is_user_library_arg(arg: &str) -> bool {
     arg.starts_with("-l") || arg.ends_with(".a")
 }
 
+/// Detect whether the invocation is compiling C++ source so we can
+/// substitute a C++ standard for the default `-std=gnu23` (which clang
+/// rejects in C++ mode). Heuristic: explicit `-x c++` / `-x cpp-output`
+/// from the caller, or a `.cpp`/`.cc`/`.cxx`/`.C` source file in the
+/// argument list. Skips operands to options like `-o`, `-include`, etc.
+/// so `yurt-cc foo.c -o foo.cpp` isn't misclassified as C++.
+fn is_cxx_invocation(user_args: &[String]) -> bool {
+    let mut want_lang = false;
+    let mut skip_next = false;
+    for a in user_args {
+        if want_lang {
+            if a == "c++" || a == "cpp-output" || a == "c++-cpp-output" {
+                return true;
+            }
+            want_lang = false;
+            continue;
+        }
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if a == "-x" {
+            want_lang = true;
+            continue;
+        }
+        // Mirror has_compile_or_link_input: these options take a separate
+        // operand which is NOT a source input — skip it so e.g.
+        // `-o foo.cpp` doesn't trip the extension check below.
+        if matches!(
+            a.as_str(),
+            "-o" | "-I" | "-isystem" | "-iquote" | "-include" | "-L" | "-MT" | "-MF" | "-MQ"
+        ) {
+            skip_next = true;
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix("-x") {
+            if rest == "c++" || rest == "cpp-output" || rest == "c++-cpp-output" {
+                return true;
+            }
+            continue;
+        }
+        // Anything else starting with `-` is a flag, not a source file.
+        if a.starts_with('-') {
+            continue;
+        }
+        let lower = a.to_ascii_lowercase();
+        if lower.ends_with(".cpp")
+            || lower.ends_with(".cc")
+            || lower.ends_with(".cxx")
+            || lower.ends_with(".c++")
+            || a.ends_with(".C")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod cxx_detection_tests {
+    use super::is_cxx_invocation;
+
+    fn args(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cpp_source_is_cxx() {
+        assert!(is_cxx_invocation(&args(&["-c", "foo.cpp"])));
+    }
+
+    #[test]
+    fn explicit_x_cxx_is_cxx() {
+        assert!(is_cxx_invocation(&args(&["-x", "c++", "-c", "foo.c"])));
+        assert!(is_cxx_invocation(&args(&["-xc++", "-c", "foo.c"])));
+    }
+
+    #[test]
+    fn c_source_with_cpp_output_path_is_not_cxx() {
+        assert!(!is_cxx_invocation(&args(&["foo.c", "-o", "foo.cpp"])));
+        assert!(!is_cxx_invocation(&args(&["-o", "out.C", "foo.c"])));
+        assert!(!is_cxx_invocation(&args(&["-include", "stub.cc", "foo.c"])));
+    }
+
+    #[test]
+    fn flag_with_cpp_substring_is_not_cxx() {
+        assert!(!is_cxx_invocation(&args(&["-DFOO=bar.cpp", "foo.c"])));
+    }
+}
+
 fn build_clang_invocation(
     sdk: &wasi_sdk::WasiSdk,
     env: &env::Env,
@@ -144,16 +234,22 @@ fn build_clang_invocation(
     argv.push("--target=wasm32-wasip1".into());
     if final_yurt_link {
         argv.push("-O2".into());
-        // Default to C23 (gnu23): gives us nullptr keyword and the
-        // unreachable()/byteswap/etc. additions to <stddef.h>, both of
-        // which gnulib code paths in coreutils require.  Backward-compat:
-        // C23 is a near-pure superset of C11 that mostly adds new
-        // keywords; the exception is `bool` becoming a real keyword.
-        // Pre-C23 code that used a `typedef ... bool` would break, but
-        // none of our current ports do so (BusyBox uses smallint, jq /
-        // file use int).  Ports that need an older standard can pass
-        // `-std=...` after; clang takes the last -std= flag.
-        argv.push("-std=gnu23".into());
+        // Default standard depends on language mode. C23 (gnu23) gives us
+        // nullptr / unreachable() / <stddef.h> additions that gnulib code
+        // paths in coreutils require. C23 is a near-pure superset of C11
+        // (the one exception is `bool` becoming a real keyword; none of
+        // our current ports rely on `typedef ... bool`).
+        //
+        // For C++ source, gnu23 is invalid ("not allowed with 'C++'") so
+        // emit gnu++17 instead — current C++ baseline that all our
+        // expected C++ ports (libzmq, etc.) target. Ports needing a
+        // different standard can pass `-std=...` after; clang takes the
+        // last `-std=` flag.
+        if is_cxx_invocation(user_args) {
+            argv.push("-std=gnu++17".into());
+        } else {
+            argv.push("-std=gnu23".into());
+        }
         argv.push("-Wall".into());
         argv.push("-Wextra".into());
     }

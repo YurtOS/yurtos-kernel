@@ -1,0 +1,14 @@
+{
+  "soname": "yurt_dlcanary",
+  "exports": [
+    "_initialize",
+    "yurt_dlcanary_double"
+  ],
+  "deps": [
+    "libc.so"
+  ],
+  "mem_size": 4,
+  "mem_align": 2,
+  "table_size": 0,
+  "table_align": 0
+}

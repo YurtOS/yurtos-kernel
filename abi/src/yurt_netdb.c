@@ -66,7 +66,7 @@ YURT_DEFINE_MARKER(gethostbyaddr, 0x67686261u) /* "ghba" */
 #define NI_NAMEREQD 0x0004
 #endif
 
-static int yurt_parse_service(const char *service, int socktype, uint16_t *port_out) {
+static int yurt_parse_service(const char *service, int socktype, int flags, uint16_t *port_out) {
     if (!service || !*service) {
         *port_out = 0;
         return 0;
@@ -80,6 +80,7 @@ static int yurt_parse_service(const char *service, int socktype, uint16_t *port_
         return 0;
     }
 
+    if (flags & AI_NUMERICSERV) return EAI_SERVICE;
     if (socktype != 0 && socktype != SOCK_STREAM) return EAI_SERVICE;
     if (strcmp(service, "http") == 0) {
         *port_out = 80;
@@ -282,7 +283,7 @@ int getaddrinfo(const char *node, const char *service,
     int protocol = hints ? hints->ai_protocol : 0;
     int flags = hints ? hints->ai_flags : 0;
 
-    if (flags & ~(AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST)) {
+    if (flags & ~(AI_PASSIVE | AI_CANONNAME | AI_NUMERICHOST | AI_NUMERICSERV)) {
         return EAI_BADFLAGS;
     }
     if (family != AF_UNSPEC && family != AF_INET) {
@@ -298,7 +299,7 @@ int getaddrinfo(const char *node, const char *service,
     if (socktype == SOCK_STREAM && protocol == IPPROTO_UDP) return EAI_SERVICE;
 
     uint16_t port = 0;
-    int rc = yurt_parse_service(service, socktype, &port);
+    int rc = yurt_parse_service(service, socktype, flags, &port);
     if (rc != 0) return rc;
 
     uint32_t addr = 0;

@@ -16,6 +16,7 @@ YURT_DECLARE_MARKER(sigaddset);
 YURT_DECLARE_MARKER(sigdelset);
 YURT_DECLARE_MARKER(sigismember);
 YURT_DECLARE_MARKER(sigprocmask);
+YURT_DECLARE_MARKER(pthread_sigmask);
 YURT_DECLARE_MARKER(sigsuspend);
 
 YURT_DEFINE_MARKER(signal,       0x73676e6cu) /* sgnl */
@@ -28,6 +29,7 @@ YURT_DEFINE_MARKER(sigaddset,    0x73616464u) /* sadd */
 YURT_DEFINE_MARKER(sigdelset,    0x7364656cu) /* sdel */
 YURT_DEFINE_MARKER(sigismember,  0x7369736du) /* sism */
 YURT_DEFINE_MARKER(sigprocmask,  0x7370726du) /* sprm */
+YURT_DEFINE_MARKER(pthread_sigmask, 0x70736d6bu) /* psmk */
 YURT_DEFINE_MARKER(sigsuspend,   0x73737370u) /* sssp */
 
 #ifndef NSIG
@@ -277,6 +279,11 @@ int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset
       errno = EINVAL;
       return -1;
   }
+}
+
+int pthread_sigmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset) {
+  YURT_MARKER_CALL(pthread_sigmask);
+  return sigprocmask(how, set, oldset);
 }
 
 int sigsuspend(const sigset_t *mask) {

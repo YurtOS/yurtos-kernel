@@ -69,7 +69,7 @@ impl ShellState {
         env.insert("HOME".into(), "/home/user".into());
         env.insert("PWD".into(), "/home/user".into());
         env.insert("USER".into(), "user".into());
-        env.insert("PATH".into(), "/bin:/usr/bin".into());
+        env.insert("PATH".into(), "/usr/extensions:/bin:/usr/bin".into());
         env.insert("PYTHONPATH".into(), "/usr/lib/python".into());
         env.insert("SHELL".into(), "/bin/sh".into());
 

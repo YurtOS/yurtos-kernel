@@ -6,14 +6,11 @@ import { OverlayVFS } from "../../vfs/overlay-vfs.ts";
 import { MemoryRoot } from "../../vfs/__tests__/helpers.ts";
 import { ProcessKernel } from "../../process/kernel.ts";
 import { FdTable } from "../../vfs/fd-table.ts";
-import {
-  createStaticTarget,
-  createVfsFileTarget,
-  type FdTarget,
-} from "../../wasi/fd-target.ts";
+import { createVfsFileTarget, type FdTarget } from "../../wasi/fd-target.ts";
 import { WasiHost } from "../../wasi/wasi-host.ts";
 import type { RuntimeEngineBackend } from "../../engine/backend.ts";
 import type { SocketBackend } from "../../network/socket-backend.ts";
+import { buildNativeSpawnRequest } from "./spawn-request-fixture.ts";
 
 const encoder = new TextEncoder();
 
@@ -21,10 +18,6 @@ function writeString(memory: WebAssembly.Memory, ptr: number, value: string) {
   const bytes = encoder.encode(value);
   new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
   return bytes.length;
-}
-
-function readJson(memory: WebAssembly.Memory, ptr: number, len: number) {
-  return JSON.parse(readString(memory, ptr, len)) as Record<string, unknown>;
 }
 
 function readWaitResult(memory: WebAssembly.Memory, ptr: number) {
@@ -36,191 +29,6 @@ function readWaitResult(memory: WebAssembly.Memory, ptr: number) {
     flags: view.getInt32(ptr + 12, true),
   };
 }
-
-function buildNativeSpawnRequest(req: {
-  prog: string;
-  argv0?: string;
-  args?: string[];
-  env?: [string, string][];
-  cwd?: string;
-  stdin_fd?: number;
-  stdout_fd?: number;
-  stderr_fd?: number;
-  pass_fds?: number[];
-  fd_map?: [number, number][];
-  stdin_data?: string;
-  nice?: number;
-}): Uint8Array {
-  const spans = new Map<string, { off: number; len: number }>();
-  const parts: Uint8Array[] = [new Uint8Array(88)];
-  let size = 88;
-  const align = () => {
-    const padding = (4 - (size % 4)) % 4;
-    if (padding > 0) {
-      parts.push(new Uint8Array(padding));
-      size += padding;
-    }
-  };
-  const append = (bytes: Uint8Array) => {
-    align();
-    const off = size;
-    parts.push(bytes);
-    size += bytes.byteLength;
-    return { off, len: bytes.byteLength };
-  };
-  const internString = (value: string | undefined) => {
-    if (value === undefined) return { off: 0, len: 0 };
-    const existing = spans.get(value);
-    if (existing) return existing;
-    const span = append(encoder.encode(value));
-    spans.set(value, span);
-    return span;
-  };
-  const appendSpans = (values: string[]) => {
-    if (values.length === 0) return 0;
-    const valueSpans = values.map((value) => internString(value));
-    align();
-    const off = size;
-    const bytes = new Uint8Array(values.length * 8);
-    const view = new DataView(bytes.buffer);
-    valueSpans.forEach((span, index) => {
-      view.setUint32(index * 8, span.off, true);
-      view.setUint32(index * 8 + 4, span.len, true);
-    });
-    parts.push(bytes);
-    size += bytes.byteLength;
-    return off;
-  };
-  const appendEnv = (values: [string, string][]) => {
-    if (values.length === 0) return 0;
-    const valueSpans = values.map(([key, value]) => [
-      internString(key),
-      internString(value),
-    ] as const);
-    align();
-    const off = size;
-    const bytes = new Uint8Array(values.length * 16);
-    const view = new DataView(bytes.buffer);
-    valueSpans.forEach(([keySpan, valueSpan], index) => {
-      const base = index * 16;
-      view.setUint32(base, keySpan.off, true);
-      view.setUint32(base + 4, keySpan.len, true);
-      view.setUint32(base + 8, valueSpan.off, true);
-      view.setUint32(base + 12, valueSpan.len, true);
-    });
-    parts.push(bytes);
-    size += bytes.byteLength;
-    return off;
-  };
-  const appendI32s = (values: number[]) => {
-    if (values.length === 0) return 0;
-    align();
-    const off = size;
-    const bytes = new Uint8Array(values.length * 4);
-    const view = new DataView(bytes.buffer);
-    values.forEach((value, index) => view.setInt32(index * 4, value, true));
-    parts.push(bytes);
-    size += bytes.byteLength;
-    return off;
-  };
-  const appendFdMap = (values: [number, number][]) => {
-    if (values.length === 0) return 0;
-    align();
-    const off = size;
-    const bytes = new Uint8Array(values.length * 8);
-    const view = new DataView(bytes.buffer);
-    values.forEach(([parentFd, childFd], index) => {
-      const base = index * 8;
-      view.setInt32(base, parentFd, true);
-      view.setInt32(base + 4, childFd, true);
-    });
-    parts.push(bytes);
-    size += bytes.byteLength;
-    return off;
-  };
-
-  const prog = internString(req.prog);
-  const argv0 = internString(req.argv0);
-  const args = req.args ?? [];
-  const env = req.env ?? [];
-  const passFds = req.pass_fds ?? [];
-  const fdMap = req.fd_map ?? [];
-  const argsOff = appendSpans(args);
-  const envOff = appendEnv(env);
-  const cwd = internString(req.cwd ?? "");
-  const passFdsOff = appendI32s(passFds);
-  const fdMapOff = appendFdMap(fdMap);
-  const stdinData = internString(req.stdin_data);
-  align();
-
-  const out = new Uint8Array(size);
-  let offset = 0;
-  for (const part of parts) {
-    out.set(part, offset);
-    offset += part.byteLength;
-  }
-  const view = new DataView(out.buffer);
-  view.setUint32(0, size, true);
-  view.setUint16(4, 1, true);
-  view.setUint32(8, prog.off, true);
-  view.setUint32(12, prog.len, true);
-  view.setUint32(16, argv0.off, true);
-  view.setUint32(20, argv0.len, true);
-  view.setUint32(24, argsOff, true);
-  view.setUint32(28, args.length, true);
-  view.setUint32(32, envOff, true);
-  view.setUint32(36, env.length, true);
-  view.setUint32(40, cwd.off, true);
-  view.setUint32(44, cwd.len, true);
-  view.setInt32(48, req.stdin_fd ?? 0, true);
-  view.setInt32(52, req.stdout_fd ?? 1, true);
-  view.setInt32(56, req.stderr_fd ?? 2, true);
-  view.setUint32(60, passFdsOff, true);
-  view.setUint32(64, passFds.length, true);
-  view.setUint32(68, stdinData.off, true);
-  view.setUint32(72, stdinData.len, true);
-  view.setInt32(76, req.nice ?? 0, true);
-  view.setUint32(80, fdMapOff, true);
-  view.setUint32(84, fdMap.length, true);
-  return out;
-}
-
-Deno.test("kernel host_spawn preserves shell's legacy synchronous result ABI", () => {
-  const memory = new WebAssembly.Memory({ initial: 1 });
-  const request = JSON.stringify({
-    program: "echo",
-    args: ["hello"],
-    env: [["A", "B"]],
-    cwd: "/tmp",
-    stdin: "input",
-  });
-  const reqLen = writeString(memory, 0, request);
-
-  const imports = createKernelImports({
-    memory,
-    syncSpawn: (cmd, args, env, stdin, cwd) => {
-      assertEquals(cmd, "echo");
-      assertEquals(args, ["hello"]);
-      assertEquals(env, { A: "B" });
-      assertEquals(new TextDecoder().decode(stdin), "input");
-      assertEquals(cwd, "/tmp");
-      return { exit_code: 0, stdout: "hello\n", stderr: "" };
-    },
-  });
-
-  const written = (imports.host_spawn as (...args: number[]) => number)(
-    0,
-    reqLen,
-    4096,
-    1024,
-  );
-
-  assertEquals(readJson(memory, 4096, written), {
-    exit_code: 0,
-    stdout: "hello\n",
-    stderr: "",
-  });
-});
 
 Deno.test("kernel host_spawn accepts native spawn request records", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
@@ -265,7 +73,12 @@ Deno.test("kernel host_spawn accepts native spawn request records", () => {
   });
 
   assertEquals(
-    (imports.host_spawn as (...args: number[]) => number)(0, request.byteLength, 4096, 4),
+    (imports.host_spawn as (...args: number[]) => number)(
+      0,
+      request.byteLength,
+      4096,
+      4,
+    ),
     4,
   );
   assertEquals(new DataView(memory.buffer).getInt32(4096, true), 42);
@@ -276,16 +89,15 @@ Deno.test("kernel host_spawn reserves a process slot before fd cloning", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const kernel = new ProcessKernel({ maxProcesses: 1 });
   const parentPid = kernel.allocPid();
-  const request = JSON.stringify({
+  const request = buildNativeSpawnRequest({
     prog: "/bin/cat",
-    args: [],
-    env: [],
     cwd: "/",
     stdin_fd: 0,
     stdout_fd: 1,
     stderr_fd: 2,
   });
-  const reqLen = writeString(memory, 0, request);
+  new Uint8Array(memory.buffer, 0, request.byteLength).set(request);
+  const reqLen = request.byteLength;
   let spawned = false;
 
   const imports = createKernelImports({
@@ -317,16 +129,15 @@ Deno.test("kernel host_spawn releases cloned fd refs when spawnProcess fails", (
   const fd = fdTable.open("/tmp/in.txt", "r");
   const target = createVfsFileTarget(fdTable, fd);
   kernel.setFdTarget(parentPid, 0, target);
-  const request = JSON.stringify({
+  const request = buildNativeSpawnRequest({
     prog: "/bin/cat",
-    args: [],
-    env: [],
     cwd: "/",
     stdin_fd: 0,
     stdout_fd: 1,
     stderr_fd: 2,
   });
-  const reqLen = writeString(memory, 0, request);
+  new Uint8Array(memory.buffer, 0, request.byteLength).set(request);
+  const reqLen = request.byteLength;
 
   const imports = createKernelImports({
     memory,
@@ -355,17 +166,16 @@ Deno.test("kernel host_spawn preserves cloned stdin refs when stdin_data spawn f
   const fd = fdTable.open("/tmp/in.txt", "r");
   const target = createVfsFileTarget(fdTable, fd);
   kernel.setFdTarget(parentPid, 0, target);
-  const request = JSON.stringify({
+  const request = buildNativeSpawnRequest({
     prog: "/bin/cat",
-    args: [],
-    env: [],
     cwd: "/",
     stdin_fd: 0,
     stdout_fd: 1,
     stderr_fd: 2,
     stdin_data: "override",
   });
-  const reqLen = writeString(memory, 0, request);
+  new Uint8Array(memory.buffer, 0, request.byteLength).set(request);
+  const reqLen = request.byteLength;
 
   const imports = createKernelImports({
     memory,
@@ -452,15 +262,30 @@ Deno.test("kernel host_wait nohang distinguishes running from ECHILD", () => {
   });
 
   assertEquals(
-    (parentImports.host_wait as (...args: number[]) => number)(childPid, 1, 4096, 1024),
+    (parentImports.host_wait as (...args: number[]) => number)(
+      childPid,
+      1,
+      4096,
+      1024,
+    ),
     -11,
   );
   assertEquals(
-    (siblingImports.host_wait as (...args: number[]) => number)(childPid, 1, 4096, 1024),
+    (siblingImports.host_wait as (...args: number[]) => number)(
+      childPid,
+      1,
+      4096,
+      1024,
+    ),
     -10,
   );
   assertEquals(
-    (parentImports.host_wait as (...args: number[]) => number)(999, 1, 4096, 1024),
+    (parentImports.host_wait as (...args: number[]) => number)(
+      999,
+      1,
+      4096,
+      1024,
+    ),
     -10,
   );
   kernel.dispose();
@@ -609,11 +434,15 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
 
 Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for socket-backed guests", async () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
-  const socketBackend: SocketBackend = {
+  let socketBackend: SocketBackend;
+  socketBackend = {
     connect: () => ({ ok: false, error: "unused" }),
     send: () => ({ ok: false, error: "unused" }),
     recv: () => ({ ok: false, error: "unused" }),
     close: () => ({ ok: true }),
+    acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+    recvAsync: (socket, maxBytes) =>
+      Promise.resolve(socketBackend.recv(socket, maxBytes)),
   };
   const imports = createKernelImports({ memory, socketBackend });
   const hostLen = writeString(memory, 0, "nonexistent-yurt.invalid");
@@ -1126,7 +955,9 @@ Deno.test("host_getcwd returns the physical cwd for symlinked process cwd", () =
     "/tmp/cwd-real".length + 1,
   );
   assertEquals(
-    new TextDecoder().decode(new Uint8Array(memory.buffer, 0, "/tmp/cwd-real".length)),
+    new TextDecoder().decode(
+      new Uint8Array(memory.buffer, 0, "/tmp/cwd-real".length),
+    ),
     "/tmp/cwd-real",
   );
 });
@@ -1146,15 +977,27 @@ Deno.test("host_realpath canonicalizes dot segments and symlinks", () => {
   const pathLen = writeString(memory, 0, "./sub/fake/.");
   const expected = "/tmp/work/real";
   assertEquals(
-    (imports.host_realpath as (...args: number[]) => number)(0, pathLen, 128, 8),
+    (imports.host_realpath as (...args: number[]) => number)(
+      0,
+      pathLen,
+      128,
+      8,
+    ),
     expected.length + 1,
   );
   assertEquals(
-    (imports.host_realpath as (...args: number[]) => number)(0, pathLen, 128, 64),
+    (imports.host_realpath as (...args: number[]) => number)(
+      0,
+      pathLen,
+      128,
+      64,
+    ),
     expected.length + 1,
   );
   assertEquals(
-    new TextDecoder().decode(new Uint8Array(memory.buffer, 128, expected.length)),
+    new TextDecoder().decode(
+      new Uint8Array(memory.buffer, 128, expected.length),
+    ),
     expected,
   );
   assertEquals(new Uint8Array(memory.buffer)[128 + expected.length], 0);
@@ -1175,11 +1018,18 @@ Deno.test("host_realpath applies parent traversal after symlink path components"
   const pathLen = writeString(memory, 0, "link/../hello/world");
   const expected = "/tmp/work/dir3/hello/world";
   assertEquals(
-    (imports.host_realpath as (...args: number[]) => number)(0, pathLen, 128, 64),
+    (imports.host_realpath as (...args: number[]) => number)(
+      0,
+      pathLen,
+      128,
+      64,
+    ),
     expected.length + 1,
   );
   assertEquals(
-    new TextDecoder().decode(new Uint8Array(memory.buffer, 128, expected.length)),
+    new TextDecoder().decode(
+      new Uint8Array(memory.buffer, 128, expected.length),
+    ),
     expected,
   );
 });
@@ -1636,7 +1486,10 @@ Deno.test("host_dup_min mirrors F_DUPFD into the active WasiHost file table", ()
   const fd = fdTable.open("/tmp/script.sh", "r");
   const imports = createKernelImports({ memory, wasiHost });
 
-  assertEquals((imports.host_dup_min as (...args: number[]) => number)(fd, 10), 10);
+  assertEquals(
+    (imports.host_dup_min as (...args: number[]) => number)(fd, 10),
+    10,
+  );
   assertEquals(fdTable.isOpen(10), true);
   fdTable.close(fd);
   assertEquals(fdTable.isOpen(10), true);
@@ -1668,7 +1521,10 @@ Deno.test("host_dup_min keeps the kernel and WasiHost fd tables in sync", () => 
     wasiHost,
   });
 
-  assertEquals((imports.host_dup_min as (...args: number[]) => number)(fd, 10), 10);
+  assertEquals(
+    (imports.host_dup_min as (...args: number[]) => number)(fd, 10),
+    10,
+  );
   assertEquals(kernel.getFdTarget(pid, 10)?.type, "vfs_file");
   assertEquals(fdTable.isOpen(10), true);
   assertEquals(srcTarget.refs, 1);
@@ -1686,22 +1542,25 @@ Deno.test("kernel /proc fd listing includes close-on-exec descriptors", () => {
   kernel.setFdTarget(pid, fd, createVfsFileTarget(fdTable, fd));
   kernel.setFdDescriptorFlags(pid, fd, 1);
 
-  assertEquals(kernel.listProcesses().find((proc) => proc.pid === pid)?.fds.includes(fd), true);
+  assertEquals(
+    kernel.listProcesses().find((proc) => proc.pid === pid)?.fds.includes(fd),
+    true,
+  );
 });
 
 Deno.test("host_spawn rejects nonzero nice when the engine has no scheduler backend", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
-  const request = JSON.stringify({
+  const request = buildNativeSpawnRequest({
     prog: "echo",
     args: ["hello"],
-    env: [],
     cwd: "/",
     stdin_fd: 0,
     stdout_fd: 1,
     stderr_fd: 2,
     nice: 5,
   });
-  const reqLen = writeString(memory, 0, request);
+  new Uint8Array(memory.buffer, 0, request.byteLength).set(request);
+  const reqLen = request.byteLength;
   const kernel = new ProcessKernel();
   const parentPid = kernel.allocPid(1, "parent");
   const imports = createKernelImports({

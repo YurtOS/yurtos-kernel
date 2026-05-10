@@ -32,6 +32,20 @@ int main(void) {
   freeaddrinfo(res);
   res = NULL;
 
+  hints.ai_flags = AI_NUMERICSERV;
+  if (getaddrinfo("127.0.0.1", "443", &hints, &res) != 0 || !res) {
+    emit("getaddrinfo_numericserv", 1);
+    return 1;
+  }
+  freeaddrinfo(res);
+  res = NULL;
+  if (getaddrinfo("127.0.0.1", "https", &hints, &res) != EAI_SERVICE) {
+    emit("getaddrinfo_numericserv_rejects_name", 1);
+    freeaddrinfo(res);
+    return 1;
+  }
+  hints.ai_flags = 0;
+
   if (getaddrinfo("localhost", "80", &hints, &res) != 0 || !res) {
     emit("getaddrinfo_hostname", 1);
     return 1;
@@ -217,6 +231,32 @@ int main(void) {
   }
 
   freeaddrinfo(res);
+
+  /* socketpair smoke. yurt emulates AF_UNIX/SOCK_STREAM via TCP
+   * loopback. Verify we get a valid pair back, that argument
+   * validation rejects unsupported types/families, and that release
+   * via shutdown(SHUT_RDWR) doesn't fault. */
+  int sv[2] = { -1, -1 };
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0 || sv[0] < 0 || sv[1] < 0) {
+    emit("socketpair_basic", 1);
+    return 1;
+  }
+  shutdown(sv[0], SHUT_RDWR);
+  shutdown(sv[1], SHUT_RDWR);
+
+  /* Reject SOCK_DGRAM (current emulation is TCP-only). */
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != -1 || errno != EPROTOTYPE) {
+    emit("socketpair_rejects_dgram", 1);
+    return 1;
+  }
+
+  /* Reject NULL output array. */
+  errno = 0;
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, NULL) != -1 || errno != EFAULT) {
+    emit("socketpair_rejects_null_sv", 1);
+    return 1;
+  }
+
   emit("socket_surface", 0);
   return 0;
 }

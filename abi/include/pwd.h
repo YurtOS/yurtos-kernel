@@ -19,6 +19,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct passwd {
     char *pw_name;
     char *pw_passwd;
@@ -128,5 +132,9 @@ static inline int getpwnam_r(const char *name, struct passwd *pwd,
     *result = (rc == 0) ? pwd : NULL;
     return rc;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* YURT_COMPAT_PWD_H */
