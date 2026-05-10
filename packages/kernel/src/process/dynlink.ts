@@ -359,11 +359,18 @@ export function sonameFromPath(p: string): string {
  * accessor is invoked lazily because the main module instance
  * does not exist until after `WebAssembly.instantiate(main, imports)`
  * resolves — which happens AFTER `createKernelImports` returns.
+ *
+ * `instance` is exposed so the loader can resolve side-module
+ * `env.*` imports the main module already satisfies (e.g. wasi-libc
+ * internals like `__wasi_init_tp` that wasm-ld --shared marks as
+ * external from `libc.so` even when the main module statically
+ * provides them).
  */
 export interface MainModuleAccess {
   memory: WebAssembly.Memory;
   table: WebAssembly.Table;
   alloc: (size: number) => number;
+  instance: WebAssembly.Instance;
 }
 
 export function mainAccessFromInstance(
@@ -383,6 +390,7 @@ export function mainAccessFromInstance(
     memory,
     table,
     alloc: alloc as (size: number) => number,
+    instance,
   };
 }
 
@@ -439,14 +447,18 @@ export function loadSideModule(
     throw new Error("main module not ready");
   }
 
-  // Recursively load declared dependencies first. Cycle detection by
-  // canonical path: a dep that resolves to the same canonical path we
-  // are currently loading would already appear in the handle table
-  // after `acquireExisting` above, so no extra book-keeping is needed
-  // for simple cycles. Pathological multi-step cycles fall out as the
-  // same canonical path on the way back through.
+  // Recursively load declared dependencies that exist on the search
+  // path. wasm-ld --shared emits NEEDED entries for system libraries
+  // (libc.so, libm.so, ...) even when the main module statically
+  // provides them; those are resolved at instantiation time from
+  // main.instance.exports below. Treating "not found on search path"
+  // as "satisfied by main" lets Phase 1 work without bundling system
+  // libraries as separate side modules. Real link errors still surface
+  // when env.* import resolution fails.
   for (const dep of info.needed) {
-    loadSideModule(dep, table, opts);
+    if (resolveSearchPath(dep, opts.vfs, opts.searchPath) !== undefined) {
+      loadSideModule(dep, table, opts);
+    }
   }
 
   // Reserve a region of main memory for the side module's data
@@ -464,27 +476,58 @@ export function loadSideModule(
     ? main.table.length
     : main.table.grow(info.tableSize);
 
+  const module = new WebAssembly.Module(got.bytes as BufferSource);
+
+  // Build the env import object dynamically. Start with the four
+  // standard PIC bindings, then resolve any other env.* imports the
+  // side module declares from (in order) RTLD_GLOBAL handles, the
+  // main module's exports. wasm-ld emits __wasi_init_tp and friends
+  // as `env.*` imports nominally backed by libc.so; the main module
+  // already exports them.
+  const env: Record<string, WebAssembly.ImportValue> = {
+    memory: main.memory,
+    __indirect_function_table: main.table,
+    __memory_base: new WebAssembly.Global(
+      { value: "i32", mutable: false },
+      memoryBase,
+    ),
+    __table_base: new WebAssembly.Global(
+      { value: "i32", mutable: false },
+      tableBase,
+    ),
+  };
+  // Share the main module's stack pointer when it's exported. A fresh
+  // global initialized to 0 traps on the first stack push; the main
+  // module's stack pointer is the right value for a side module that
+  // runs synchronously inside a host import call.
+  const mainStackPointer = main.instance.exports.__stack_pointer;
+  if (mainStackPointer instanceof WebAssembly.Global) {
+    env.__stack_pointer = mainStackPointer;
+  } else {
+    env.__stack_pointer = new WebAssembly.Global(
+      { value: "i32", mutable: true },
+      0,
+    );
+  }
+  for (const imp of WebAssembly.Module.imports(module)) {
+    if (imp.module !== "env") continue;
+    if (env[imp.name] !== undefined) continue;
+    const fromGlobal = table.resolveGlobal(imp.name);
+    if (fromGlobal) {
+      const v = fromGlobal.instance.exports[imp.name];
+      if (v !== undefined) {
+        env[imp.name] = v as WebAssembly.ImportValue;
+        continue;
+      }
+    }
+    const v = main.instance.exports[imp.name];
+    if (v !== undefined) env[imp.name] = v as WebAssembly.ImportValue;
+  }
   const sideImports: WebAssembly.Imports = {
-    env: {
-      memory: main.memory,
-      __indirect_function_table: main.table,
-      __memory_base: new WebAssembly.Global(
-        { value: "i32", mutable: false },
-        memoryBase,
-      ),
-      __table_base: new WebAssembly.Global(
-        { value: "i32", mutable: false },
-        tableBase,
-      ),
-      __stack_pointer: new WebAssembly.Global(
-        { value: "i32", mutable: true },
-        0,
-      ),
-    },
+    env,
     yurt: opts.yurtImports,
   };
 
-  const module = new WebAssembly.Module(got.bytes as BufferSource);
   const instance = new WebAssembly.Instance(module, sideImports);
 
   const applyRelocs = instance.exports.__wasm_apply_data_relocs;
@@ -496,7 +539,7 @@ export function loadSideModule(
     (ctors as () => void)();
   }
 
-  const funcTableIndex = scanFunctionTableIndices(
+  const funcTableIndex = ensureFunctionExportsInTable(
     instance,
     main.table,
     tableBase,
@@ -517,17 +560,25 @@ export function loadSideModule(
 
 /**
  * Build a name → table-index map for every function export of the
- * side module. Scans the reservation in `__indirect_function_table`
- * once and matches table entries against export references.
+ * side module. wasm-ld --shared --experimental-pic only places
+ * address-taken functions in the indirect function table; non-AT
+ * exports (the common case for dlsym targets) are not in the table
+ * at all, which would make `dlsym` always return -1.
+ *
+ * Strategy: scan the reservation once for pre-populated entries
+ * (using JS reference equality against `instance.exports[name]`,
+ * which V8/SpiderMonkey/JSC each cache stably for the same wasm
+ * function); for any function export not already in the table,
+ * grow the table by one and place the export there. The resulting
+ * slot index is what `dlsym` returns to the guest.
  */
-function scanFunctionTableIndices(
+function ensureFunctionExportsInTable(
   instance: WebAssembly.Instance,
   table: WebAssembly.Table,
   tableBase: number,
   tableSize: number,
 ): Map<string, number> {
   const out = new Map<string, number>();
-  if (tableSize === 0) return out;
   const refToIndex = new Map<unknown, number>();
   for (let i = 0; i < tableSize; i++) {
     const ref = table.get(tableBase + i);
@@ -537,8 +588,17 @@ function scanFunctionTableIndices(
   }
   for (const [name, exp] of Object.entries(instance.exports)) {
     if (typeof exp !== "function") continue;
-    const idx = refToIndex.get(exp);
-    if (idx !== undefined) out.set(name, idx);
+    let idx = refToIndex.get(exp);
+    if (idx === undefined) {
+      // table.grow returns the previous length, which is the new slot's
+      // index. Cast through unknown because the WebAssembly.Table type
+      // declares set as accepting Function; the runtime accepts wasm
+      // function exports.
+      idx = table.grow(1);
+      table.set(idx, exp as unknown as Function);
+      refToIndex.set(exp, idx);
+    }
+    out.set(name, idx);
   }
   return out;
 }

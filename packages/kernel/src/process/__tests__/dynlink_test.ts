@@ -1,14 +1,20 @@
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import {
   DEFAULT_SEARCH_PATH,
   DylinkParseError,
   findDylink0Section,
   HandleTable,
   type LoadedSideModule,
+  loadSideModule,
+  lookupSymbol,
+  type MainModuleAccess,
   parseDylink0,
   resolveSearchPath,
   RTLD_GLOBAL,
+  RTLD_NOW,
   sonameFromPath,
 } from "../dynlink.ts";
 
@@ -274,4 +280,138 @@ describe("resolveSearchPath", () => {
       "/usr/lib",
     ]);
   });
+});
+
+// End-to-end loader test using the real `libyurt_dlcanary.wasm` fixture
+// produced by `make -C abi all copy-fixtures`. Validates the three
+// behaviors that broke the Phase 1 happy path before being fixed:
+//   - env.* imports the side module declares (e.g. __wasi_init_tp,
+//     normally backed by libc.so) are satisfied from the main module's
+//     exports rather than failing instantiation.
+//   - Function exports get a slot in __indirect_function_table even
+//     when wasm-ld --shared did not place them there (the common case
+//     for non-address-taken exports).
+//   - dlopen of an unresolvable NEEDED dep (like libc.so on a system
+//     where it's statically linked into the main module) does not throw.
+const FIXTURE_PATH = resolvePath(
+  import.meta.dirname!,
+  "../../platform/__tests__/fixtures/libyurt_dlcanary.wasm",
+);
+const HAS_FIXTURE = existsSync(FIXTURE_PATH);
+const fixtureIt = HAS_FIXTURE ? it : it.skip;
+
+describe("loadSideModule (real wasm-ld --shared fixture)", () => {
+  fixtureIt(
+    "loads libyurt_dlcanary.wasm and dlsym resolves yurt_dlcanary_double",
+    () => {
+      const sideBytes = readFileSync(FIXTURE_PATH);
+
+      // Build a minimal main-module surrogate that exports the wasi-libc
+      // internals the side module imports as `env.*`. In the real loader
+      // these come from the main module's instance.exports.
+      const mainMemory = new WebAssembly.Memory({ initial: 2 });
+      const mainTable = new WebAssembly.Table({
+        element: "anyfunc",
+        initial: 0,
+      });
+      const mainStackPointer = new WebAssembly.Global(
+        { value: "i32", mutable: true },
+        65536,
+      );
+      const fakeMainExports: Record<string, WebAssembly.ExportValue> = {
+        memory: mainMemory,
+        __indirect_function_table: mainTable,
+        __wasi_init_tp: (() => {}) as unknown as Function,
+        __stack_pointer: mainStackPointer,
+        __alloc: ((_n: number) => 0) as unknown as Function,
+      };
+      const main: MainModuleAccess = {
+        memory: mainMemory,
+        table: mainTable,
+        alloc: (_n: number) => 0,
+        instance: {
+          exports: fakeMainExports,
+        } as unknown as WebAssembly.Instance,
+      };
+
+      const handles = new HandleTable();
+      const handle = loadSideModule(
+        "/lib/libyurt_dlcanary.wasm",
+        handles,
+        {
+          flags: RTLD_NOW,
+          vfs: {
+            readFile(p) {
+              if (p === "/lib/libyurt_dlcanary.wasm") {
+                return { bytes: sideBytes, canonicalPath: p };
+              }
+              return undefined;
+            },
+          },
+          yurtImports: {},
+          mainAccess: () => main,
+        },
+      );
+      expect(handle).toBeGreaterThan(0);
+
+      const loaded = handles.get(handle);
+      expect(loaded).toBeDefined();
+
+      const idx = lookupSymbol(loaded!, "yurt_dlcanary_double");
+      expect(idx).toBeGreaterThanOrEqual(0);
+
+      const fn = mainTable.get(idx) as ((x: number) => number) | null;
+      expect(typeof fn).toBe("function");
+      expect(fn!(21)).toBe(42);
+    },
+  );
+
+  fixtureIt(
+    "double-dlopen returns same handle and refcount keeps it alive",
+    () => {
+      const sideBytes = readFileSync(FIXTURE_PATH);
+      const mainMemory = new WebAssembly.Memory({ initial: 2 });
+      const mainTable = new WebAssembly.Table({
+        element: "anyfunc",
+        initial: 0,
+      });
+      const main: MainModuleAccess = {
+        memory: mainMemory,
+        table: mainTable,
+        alloc: (_n: number) => 0,
+        instance: {
+          exports: {
+            memory: mainMemory,
+            __indirect_function_table: mainTable,
+            __wasi_init_tp: (() => {}) as unknown as Function,
+            __stack_pointer: new WebAssembly.Global(
+              { value: "i32", mutable: true },
+              65536,
+            ),
+          },
+        } as unknown as WebAssembly.Instance,
+      };
+      const handles = new HandleTable();
+      const opts = {
+        flags: RTLD_NOW,
+        vfs: {
+          readFile(p: string) {
+            return p === "/lib/libyurt_dlcanary.wasm"
+              ? { bytes: sideBytes, canonicalPath: p }
+              : undefined;
+          },
+        },
+        yurtImports: {},
+        mainAccess: () => main,
+      };
+      const h1 = loadSideModule("/lib/libyurt_dlcanary.wasm", handles, opts);
+      const h2 = loadSideModule("/lib/libyurt_dlcanary.wasm", handles, opts);
+      expect(h2).toBe(h1);
+      expect(handles.release(h1)).toBe(0);
+      // Still alive (refcount went 2 → 1).
+      expect(handles.get(h1)).toBeDefined();
+      expect(handles.release(h1)).toBe(0);
+      expect(handles.get(h1)).toBeUndefined();
+    },
+  );
 });
