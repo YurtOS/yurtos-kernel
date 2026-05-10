@@ -9,6 +9,9 @@ description = "Yurt kernel compiled to wasm32-wasip1; runs inside any microkerne
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# Tar parsing for image-layer mounts. Pure Rust; works on
+# wasm32-wasip1 without features.
+tar = { version = "0.4", default-features = false }
 
 [build-dependencies]
 toml = "0.8"

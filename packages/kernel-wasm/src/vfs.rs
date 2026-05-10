@@ -759,3 +759,132 @@ impl HostFsHandle {
         }
     }
 }
+
+// ── Tar image-layer backend ───────────────────────────────────────
+//
+// Read-only mount served from an in-memory tar archive. The
+// microkernel pushes the tar bytes once via
+// `kernel_install_tar_layer`; we walk them at install time and
+// build a path → (offset, len) index. Reads slice into the
+// archive bytes — O(1) per read, zero copy beyond the response
+// buffer fill.
+//
+// Phase 5 surface: uncompressed tar only. Zstd-wrapped tar
+// (image-layer.tar.zst, the format the existing TS image-loader
+// produces) lands as a follow-up: just `zstd::decode_all` the
+// bytes before passing to TarLayerBackend::new.
+
+pub struct TarLayerBackend {
+    /// The full tar archive kept in memory. Reads slice into this.
+    archive: Vec<u8>,
+    /// path (relative to mount, with leading `/`) → (offset, len)
+    /// pointing at the file's data range inside `archive`.
+    files: BTreeMap<Vec<u8>, (u64, u64)>,
+    /// path → stable inode id. Index is monotonic so opens of the
+    /// same path return the same inode across the backend's life.
+    inodes: BTreeMap<Vec<u8>, u64>,
+    next_id: u64,
+}
+
+impl TarLayerBackend {
+    /// Build the index by walking the tar entries. Bad archives
+    /// produce an empty backend — callers see -ENOENT for every
+    /// path. (Phase 5: no error surface; if the embedder cares,
+    /// it can pre-validate.)
+    pub fn new(archive: Vec<u8>) -> Self {
+        let mut files: BTreeMap<Vec<u8>, (u64, u64)> = BTreeMap::new();
+        let mut inodes: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut next_id: u64 = 1;
+        // tar::Archive walks the headers; raw_file_position gives
+        // us the byte offset of each entry's data within the
+        // archive bytes — exactly what we need to slice on read.
+        let mut ar = tar::Archive::new(&archive[..]);
+        if let Ok(entries) = ar.entries() {
+            for entry in entries.flatten() {
+                let header = entry.header();
+                if header.entry_type() != tar::EntryType::Regular {
+                    continue;
+                }
+                let Ok(path) = entry.path() else { continue };
+                let path_str = path.to_string_lossy().into_owned();
+                // Normalize to leading `/`. Tar stores paths
+                // typically as "etc/motd" — we want "/etc/motd"
+                // so the lookup matches what the user wrote.
+                let mut p = if path_str.starts_with('/') {
+                    path_str.into_bytes()
+                } else {
+                    let mut v = Vec::with_capacity(1 + path_str.len());
+                    v.push(b'/');
+                    v.extend_from_slice(path_str.as_bytes());
+                    v
+                };
+                // Strip trailing slash if any (directory entries
+                // shouldn't reach here because of the type check
+                // above, but be defensive).
+                if p.ends_with(b"/") {
+                    p.pop();
+                }
+                let offset = entry.raw_file_position();
+                let len = header.size().unwrap_or(0);
+                if !files.contains_key(&p) {
+                    inodes.insert(p.clone(), next_id);
+                    next_id += 1;
+                }
+                files.insert(p, (offset, len));
+            }
+        }
+        Self {
+            archive,
+            files,
+            inodes,
+            next_id,
+        }
+    }
+}
+
+impl VfsBackend for TarLayerBackend {
+    fn lookup(&mut self, path: &[u8]) -> Option<u64> {
+        self.inodes.get(path).copied()
+    }
+
+    fn create(&mut self, _path: &[u8]) -> Option<u64> {
+        // Image layers are immutable; refuse.
+        None
+    }
+
+    fn truncate(&mut self, _inode: u64) {}
+
+    fn read(&self, inode: u64, offset: u64, buf: &mut [u8]) -> i64 {
+        // Find the path for this inode (small N — linear scan is
+        // fine for image layers up to a few thousand files; if it
+        // matters we'll add an inode → range index).
+        let entry = self
+            .inodes
+            .iter()
+            .find(|(_p, &id)| id == inode)
+            .and_then(|(p, _)| self.files.get(p));
+        let Some(&(file_off, file_len)) = entry else {
+            return -(crate::abi::EBADF as i64);
+        };
+        let start = (offset).min(file_len) as usize;
+        let avail = (file_len as usize) - start;
+        let n = avail.min(buf.len());
+        if n > 0 {
+            let abs_start = file_off as usize + start;
+            buf[..n].copy_from_slice(&self.archive[abs_start..abs_start + n]);
+        }
+        n as i64
+    }
+
+    fn write(&mut self, _inode: u64, _offset: u64, _payload: &[u8]) -> i64 {
+        -(crate::abi::EBADF as i64) // read-only image layer
+    }
+
+    fn size(&self, inode: u64) -> Option<u64> {
+        self.inodes
+            .iter()
+            .find(|(_p, &id)| id == inode)
+            .and_then(|(p, _)| self.files.get(p))
+            .map(|&(_off, len)| len)
+    }
+}

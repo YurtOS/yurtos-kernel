@@ -70,6 +70,11 @@ id = 9
 kind = "internal"
 doc = "Microkernel-only: store the calling process's argv on its Process record so /proc/<pid>/cmdline and /proc/<pid>/comm can serve it. Request bytes: u32 target_pid LE + sequence of (u32 arg_len LE + arg_bytes) entries. Returns 0 on success, -EINVAL for malformed input. Microkernel invokes this after spawn so the kernel sees the same argv the user-process WASI args_get serves."
 
+[method.kernel_install_tar_layer]
+id = 10
+kind = "internal"
+doc = "Microkernel-only: mount a TarLayerBackend at the given prefix. Request bytes: u32 prefix_len LE + prefix_bytes + tar_archive_bytes. The kernel walks the tar at install time and indexes regular-file entries; subsequent sys_open under the prefix serves slices of the archive. Read-only — image layers refuse create/write. Returns 0 on success, -EINVAL for malformed input."
+
 # Syscall methods (0x1_0000+ range).
 #
 # These are the real user-process-facing syscalls — `sys_*` names match

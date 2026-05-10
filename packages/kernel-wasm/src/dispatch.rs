@@ -37,6 +37,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_DRAIN_STDERR => drain_stream(request, response, /*stdout=*/ false),
         METHOD_KERNEL_REGISTER_FILE => register_file(request),
         METHOD_KERNEL_SET_ARGV => set_argv(request),
+        METHOD_KERNEL_INSTALL_TAR_LAYER => install_tar_layer(request),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
@@ -735,6 +736,30 @@ fn set_argv(request: &[u8]) -> i64 {
     }
     with_kernel(|k| {
         k.process_mut(pid).argv = argv;
+    });
+    0
+}
+
+/// `kernel_install_tar_layer(prefix_len, prefix_bytes, tar_bytes)`.
+/// Microkernel-only; mounts a [`TarLayerBackend`] at `prefix`. The
+/// archive is indexed at install time so subsequent reads slice into
+/// the in-memory bytes. Read-only mount.
+fn install_tar_layer(request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let prefix_len =
+        u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    if request.len() < 4 + prefix_len {
+        return -(abi::EINVAL as i64);
+    }
+    let prefix = request[4..4 + prefix_len].to_vec();
+    let archive = request[4 + prefix_len..].to_vec();
+    with_kernel(|k| {
+        k.vfs.add_mount(
+            prefix,
+            Box::new(crate::vfs::TarLayerBackend::new(archive)),
+        );
     });
     0
 }
@@ -2361,6 +2386,125 @@ mod tests {
         let n = dispatch(METHOD_SYS_READ, 6, &(fd as u32).to_le_bytes(), &mut buf);
         let text = std::str::from_utf8(&buf[..n as usize]).unwrap();
         assert!(text.contains("Name:\tls\n"), "expected Name:\\tls in: {text}");
+    }
+
+    /// Build a tiny in-memory tar with the given (path, content)
+    /// pairs. Used by the tar-layer tests.
+    #[cfg(test)]
+    fn build_tar_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            for (path, content) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append_data(&mut header, path, *content).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn tar_layer_serves_files_after_install() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let tar_bytes = build_tar_archive(&[
+            ("etc/motd", b"hello from tar layer\n"),
+            ("usr/share/doc/readme.txt", b"docs"),
+        ]);
+        // Pack request: u32 prefix_len + prefix + tar bytes.
+        let prefix: &[u8] = b"/img";
+        let mut req = (prefix.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(prefix);
+        req.extend_from_slice(&tar_bytes);
+        assert_eq!(
+            dispatch(METHOD_KERNEL_INSTALL_TAR_LAYER, 0, &req, &mut []),
+            0
+        );
+
+        // Open + read /img/etc/motd.
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/img/etc/motd"), &mut []);
+        assert!(fd >= 0, "open succeeded: {fd}");
+        let mut buf = [0u8; 64];
+        let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"hello from tar layer\n");
+
+        // fstat reports the real size from the tar header.
+        let mut stat = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_FSTAT, 1, &(fd as u32).to_le_bytes(), &mut stat),
+            16
+        );
+        assert_eq!(
+            u64::from_le_bytes(stat[0..8].try_into().unwrap()),
+            b"hello from tar layer\n".len() as u64
+        );
+    }
+
+    #[test]
+    fn tar_layer_refuses_create_and_write() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let tar_bytes = build_tar_archive(&[("readme", b"x")]);
+        let prefix: &[u8] = b"/img2";
+        let mut req = (prefix.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(prefix);
+        req.extend_from_slice(&tar_bytes);
+        dispatch(METHOD_KERNEL_INSTALL_TAR_LAYER, 0, &req, &mut []);
+
+        // CREAT against a tar mount → -EPERM (backend.create returns None).
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_OPEN,
+                1,
+                &open_req(O_WRITE | O_CREAT, b"/img2/new.txt"),
+                &mut []
+            ),
+            -(abi::EPERM as i64)
+        );
+
+        // Write through a writable-OFD → -EBADF (backend.write rejects).
+        // We can't easily get a writable OFD on a tar file (open with
+        // WRITE bit returns the existing inode but not in CREAT path —
+        // and the Phase 5 sys_open pre-CREAT semantics for read-only
+        // backends mean WRITE succeeds at the kernel side but write()
+        // hits the backend's refusal). Probe by opening read-only and
+        // verifying writes are blocked at the OFD level too.
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/img2/readme"), &mut []);
+        let mut wreq = (fd as u32).to_le_bytes().to_vec();
+        wreq.extend_from_slice(b"NOPE");
+        // Read-only OFD blocks writes at -EBADF (existing dispatch
+        // semantics) — no need to reach the backend.
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []),
+            -(abi::EBADF as i64)
+        );
+    }
+
+    #[test]
+    fn tar_layer_partial_read_advances_offset() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let payload: &[u8] = b"0123456789";
+        let tar_bytes = build_tar_archive(&[("counts", payload)]);
+        let prefix: &[u8] = b"/img3";
+        let mut req = (prefix.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(prefix);
+        req.extend_from_slice(&tar_bytes);
+        dispatch(METHOD_KERNEL_INSTALL_TAR_LAYER, 0, &req, &mut []);
+
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/img3/counts"), &mut [])
+            as u32;
+        let mut small = [0u8; 4];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut small),
+            4
+        );
+        assert_eq!(&small, b"0123");
+        let mut rest = [0u8; 16];
+        let n = dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut rest);
+        assert_eq!(n, 6);
+        assert_eq!(&rest[..6], b"456789");
     }
 
     #[test]
