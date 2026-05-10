@@ -85,6 +85,18 @@ mod sys_method_id {
     pub const OPEN: u32 = 0x1_001F;
     pub const LSEEK: u32 = 0x1_0020;
     pub const FSTAT: u32 = 0x1_0021;
+    pub const FETCH: u32 = 0x1_0030;
+    pub const SOCKET_CONNECT: u32 = 0x1_0031;
+    pub const SOCKET_SEND: u32 = 0x1_0032;
+    pub const SOCKET_RECV: u32 = 0x1_0033;
+    pub const SOCKET_CLOSE: u32 = 0x1_0034;
+    pub const IDB_GET: u32 = 0x1_0035;
+    pub const IDB_PUT: u32 = 0x1_0036;
+    pub const IDB_DELETE: u32 = 0x1_0037;
+    pub const IDB_LIST: u32 = 0x1_0038;
+    pub const SOCKET_LISTEN: u32 = 0x1_0039;
+    pub const SOCKET_ACCEPT: u32 = 0x1_003A;
+    pub const SOCKET_ADDR: u32 = 0x1_003B;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -3053,6 +3065,285 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             if rc == 16 { 0 } else { rc as i32 }
         },
     )?;
+
+    // ── Networking + KV imports for user processes ──────────────────
+    //
+    // These wrap the sys_fetch / sys_socket_* / sys_idb_* methods so
+    // libc-shaped userland (BusyBox, Python, zsh) reaches them under
+    // the same `env` namespace as every other sys_* call. Each one
+    // copies request bytes out of user memory, dispatches via the
+    // shared trampoline helpers, and copies any response bytes back.
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_fetch",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut req = vec![0u8; req_len as usize];
+            if req_len > 0 && memory.read(&caller, req_ptr as usize, &mut req).is_err() {
+                return -22;
+            }
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::FETCH,
+                &req,
+                out_ptr,
+                out_cap,
+            )
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_connect",
+        |mut caller: Caller<'_, UserState>,
+         family: i32,
+         sock_type: i32,
+         flags: i32,
+         addr_ptr: u32,
+         addr_len: u32|
+         -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut addr = vec![0u8; addr_len as usize];
+            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
+                return -22;
+            }
+            // Wire format: u8 family + u8 sock_type + u16 _pad + u32 flags + addr.
+            let mut req: Vec<u8> = vec![family as u8, sock_type as u8, 0, 0];
+            req.extend_from_slice(&(flags as u32).to_le_bytes());
+            req.extend_from_slice(&addr);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_CONNECT,
+                &req,
+            ) as i32
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_send",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         data_ptr: u32,
+         data_len: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut data = vec![0u8; data_len as usize];
+            if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut data).is_err() {
+                return -22;
+            }
+            let mut req = (fd as u32).to_le_bytes().to_vec();
+            req.extend_from_slice(&data);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_SEND,
+                &req,
+            )
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_recv",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         out_ptr: u32,
+         out_cap: u32,
+         flags: i32|
+         -> i64 {
+            let mut req = (fd as u32).to_le_bytes().to_vec();
+            req.extend_from_slice(&(flags as u32).to_le_bytes());
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_RECV,
+                &req,
+                out_ptr,
+                out_cap,
+            )
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_close",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_CLOSE,
+                &req,
+            ) as i32
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_listen",
+        |mut caller: Caller<'_, UserState>,
+         backlog: i32,
+         addr_ptr: u32,
+         addr_len: u32|
+         -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut addr = vec![0u8; addr_len as usize];
+            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
+                return -22;
+            }
+            let mut req = (backlog as u32).to_le_bytes().to_vec();
+            req.extend_from_slice(&addr);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_LISTEN,
+                &req,
+            ) as i32
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_accept",
+        |mut caller: Caller<'_, UserState>, fd: i32, flags: i32| -> i32 {
+            let mut req = (fd as u32).to_le_bytes().to_vec();
+            req.extend_from_slice(&(flags as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_ACCEPT,
+                &req,
+            ) as i32
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_addr",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let req = (fd as u32).to_le_bytes();
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_ADDR,
+                &req,
+                out_ptr,
+                out_cap,
+            )
+        },
+    )?;
+
+    // sys_idb_* — request bytes are already the native wire format
+    // (u8 store_len + store + key/prefix or key+value). Userland
+    // packs the request; we just shuttle bytes.
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_idb_get",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut req = vec![0u8; req_len as usize];
+            if req_len > 0 && memory.read(&caller, req_ptr as usize, &mut req).is_err() {
+                return -22;
+            }
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::IDB_GET,
+                &req,
+                out_ptr,
+                out_cap,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_idb_put",
+        |mut caller: Caller<'_, UserState>, req_ptr: u32, req_len: u32| -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut req = vec![0u8; req_len as usize];
+            if req_len > 0 && memory.read(&caller, req_ptr as usize, &mut req).is_err() {
+                return -22;
+            }
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::IDB_PUT,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_idb_delete",
+        |mut caller: Caller<'_, UserState>, req_ptr: u32, req_len: u32| -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut req = vec![0u8; req_len as usize];
+            if req_len > 0 && memory.read(&caller, req_ptr as usize, &mut req).is_err() {
+                return -22;
+            }
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::IDB_DELETE,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_idb_list",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut req = vec![0u8; req_len as usize];
+            if req_len > 0 && memory.read(&caller, req_ptr as usize, &mut req).is_err() {
+                return -22;
+            }
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::IDB_LIST,
+                &req,
+                out_ptr,
+                out_cap,
+            )
+        },
+    )?;
+
     Ok(())
 }
 

@@ -490,10 +490,38 @@ args = [
   { name = "out_cap", type = "usize" },
 ]
 
-[import.host_list_processes]
-doc = "Write a native process-list response record."
+[import.host_idb_get]
+doc = "Read a durable KV entry. Request is u8 store_len + store + key bytes. Writes value bytes into (out_ptr, out_cap)."
 return = "record_out"
 args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_idb_put]
+doc = "Write a durable KV entry. Request is u8 store_len + store + u32 key_len LE + key + value."
+return = "stream_io"
+args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
+]
+
+[import.host_idb_delete]
+doc = "Remove a durable KV entry. Request is u8 store_len + store + key bytes."
+return = "stream_io"
+args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
+]
+
+[import.host_idb_list]
+doc = "List keys in a store. Request is u8 store_len + store + prefix bytes (empty = all). Writes count + (len, bytes)*."
+return = "record_out"
+args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
   { name = "out_ptr", type = "ptr" },
   { name = "out_cap", type = "usize" },
 ]
