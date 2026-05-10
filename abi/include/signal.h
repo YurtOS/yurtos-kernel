@@ -8,7 +8,9 @@
 #ifdef __cplusplus
 extern "C" {
 /* C++ doesn't have `restrict`; map it to clang's __restrict__ for the
- * declarations below.  Symmetric `#undef` near the closing brace. */
+ * declarations below, preserving any caller-provided portability macro. */
+#pragma push_macro("restrict")
+#undef restrict
 #define restrict __restrict__
 #endif
 
@@ -124,22 +126,13 @@ int sigismember(const sigset_t *set, int sig);
 sighandler_t signal(int sig, sighandler_t handler);
 int sigaction(int sig, const struct sigaction *restrict act, struct sigaction *restrict oldact);
 int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset);
+int pthread_sigmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset);
 int sigsuspend(const sigset_t *mask);
 int raise(int sig);
 unsigned alarm(unsigned seconds);
 
-/* wasi-libc gates pthread_sigmask behind __wasilibc_unmodified_upstream.
- * yurt's signal model is process-wide (no per-thread masks), so we
- * delegate to sigprocmask — POSIX permits the two to be equivalent in
- * single-threaded contexts, which is yurt's case. Header-inline so any
- * C/C++ TU including <signal.h> can resolve the symbol. */
-static inline int pthread_sigmask(int how, const sigset_t *restrict set,
-                                  sigset_t *restrict oldset) {
-    return sigprocmask(how, set, oldset);
-}
-
 #ifdef __cplusplus
-#undef restrict
+#pragma pop_macro("restrict")
 }
 #endif
 

@@ -31,6 +31,7 @@ pairs=(
   "sigdelset yurt_signal.o"
   "sigismember yurt_signal.o"
   "sigprocmask yurt_signal.o"
+  "pthread_sigmask yurt_signal.o"
   "sigsuspend yurt_signal.o"
 )
 

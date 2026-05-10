@@ -103,6 +103,7 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
                 "sigdelset",
                 "sigismember",
                 "sigprocmask",
+                "pthread_sigmask",
                 "sigsuspend",
             ],
         ),
