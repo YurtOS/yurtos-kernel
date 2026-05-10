@@ -90,6 +90,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_MKDIR => mkdir(caller_pid, request),
         METHOD_SYS_RMDIR => rmdir(caller_pid, request),
         METHOD_SYS_READDIR => readdir(caller_pid, request, response),
+        METHOD_SYS_LINK => hard_link(caller_pid, request),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -1177,6 +1178,27 @@ fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
     }
     let _ = caller_pid;
     with_kernel(|k| k.vfs.symlink(target, link_path) as i64)
+}
+
+/// `link(target_len, target, link_path)`. Same wire format as
+/// `symlink` so both can share request decoding shape. Routes to
+/// `MountTable::link`, which enforces same-mount and refcount.
+fn hard_link(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let target_len =
+        u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    if request.len() < 4 + target_len {
+        return -(abi::EINVAL as i64);
+    }
+    let target = &request[4..4 + target_len];
+    let link_path = &request[4 + target_len..];
+    if link_path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| k.vfs.link(target, link_path) as i64)
 }
 
 /// `readlink(path) -> bytes-written or -ENOENT/-EINVAL`. Writes
@@ -3141,6 +3163,83 @@ mod tests {
         assert_eq!(
             dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/un"), &mut []),
             -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
+    fn link_creates_second_path_to_same_inode_and_survives_first_unlink() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Register a regular file with content "first".
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&5_u32.to_le_bytes());
+        reg.extend_from_slice(b"/orig");
+        reg.extend_from_slice(b"first");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        // sys_link(target="/orig", link="/dup")
+        let target: &[u8] = b"/orig";
+        let link_path: &[u8] = b"/dup";
+        let mut req = (target.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(target);
+        req.extend_from_slice(link_path);
+        assert_eq!(dispatch(METHOD_SYS_LINK, 1, &req, &mut []), 0);
+
+        // Unlinking /orig must NOT erase the file — /dup still points
+        // at the same inode.
+        assert_eq!(dispatch(METHOD_SYS_UNLINK, 1, b"/orig", &mut []), 0);
+        let dup_fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/dup"), &mut []);
+        assert!(dup_fd >= 0, "/dup must still open after unlinking /orig");
+        let mut buf = [0u8; 16];
+        let read_req = (dup_fd as u32).to_le_bytes().to_vec();
+        let n = dispatch(METHOD_SYS_READ, 1, &read_req, &mut buf);
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..5], b"first");
+
+        // Unlinking the last path drops the inode; subsequent open
+        // returns ENOENT.
+        assert_eq!(dispatch(METHOD_SYS_UNLINK, 1, b"/dup", &mut []), 0);
+        assert_eq!(
+            dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/dup"), &mut []),
+            -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
+    fn link_to_existing_link_path_is_eexist() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&2_u32.to_le_bytes());
+        reg.extend_from_slice(b"/a");
+        reg.extend_from_slice(b"x");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let mut reg2 = Vec::new();
+        reg2.extend_from_slice(&2_u32.to_le_bytes());
+        reg2.extend_from_slice(b"/b");
+        reg2.extend_from_slice(b"y");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg2, &mut []);
+
+        let target: &[u8] = b"/a";
+        let link_path: &[u8] = b"/b";
+        let mut req = (target.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(target);
+        req.extend_from_slice(link_path);
+        assert_eq!(
+            dispatch(METHOD_SYS_LINK, 1, &req, &mut []),
+            -(abi::EEXIST as i64),
+        );
+    }
+
+    #[test]
+    fn link_with_missing_target_is_enoent() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let target: &[u8] = b"/no-such-target";
+        let link_path: &[u8] = b"/wherever";
+        let mut req = (target.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(target);
+        req.extend_from_slice(link_path);
+        assert_eq!(
+            dispatch(METHOD_SYS_LINK, 1, &req, &mut []),
+            -(abi::ENOENT as i64),
         );
     }
 

@@ -582,6 +582,67 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         },
     )?;
 
+    // ── path_link(old_dirfd, _old_flags, old_path, old_len,
+    //              new_dirfd, new_path, new_len) ─────────────────────
+    // Both dirfds must be the synthetic preopen root (fd 3); we have
+    // no other directory fds yet. Maps to sys_link with our path
+    // wire format: u32 target_len LE + target_bytes + linkpath_bytes.
+    linker.func_wrap(
+        WASI,
+        "path_link",
+        |mut caller: Caller<'_, UserState>,
+         old_dirfd: i32,
+         _old_flags: i32,
+         old_path_ptr: u32,
+         old_path_len: u32,
+         new_dirfd: i32,
+         new_path_ptr: u32,
+         new_path_len: u32|
+         -> i32 {
+            if old_dirfd != PREOPEN_ROOT_FD || new_dirfd != PREOPEN_ROOT_FD {
+                return EBADF;
+            }
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return EINVAL,
+            };
+            let mut old_rel = vec![0u8; old_path_len as usize];
+            if old_path_len > 0
+                && memory
+                    .read(&caller, old_path_ptr as usize, &mut old_rel)
+                    .is_err()
+            {
+                return EINVAL;
+            }
+            let mut new_rel = vec![0u8; new_path_len as usize];
+            if new_path_len > 0
+                && memory
+                    .read(&caller, new_path_ptr as usize, &mut new_rel)
+                    .is_err()
+            {
+                return EINVAL;
+            }
+            // Restore preopen prefix on both paths.
+            let mut target = Vec::with_capacity(1 + old_rel.len());
+            target.push(b'/');
+            target.extend_from_slice(&old_rel);
+            let mut link_path = Vec::with_capacity(1 + new_rel.len());
+            link_path.push(b'/');
+            link_path.extend_from_slice(&new_rel);
+
+            let mut req = Vec::with_capacity(4 + target.len() + link_path.len());
+            req.extend_from_slice(&(target.len() as u32).to_le_bytes());
+            req.extend_from_slice(&target);
+            req.extend_from_slice(&link_path);
+            let rc = crate::microkernel::trampoline_request(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                METHOD_SYS_LINK,
+                &req,
+            );
+            errno_from_kernel(rc)
+        },
+    )?;
+
     linker.func_wrap(
         WASI,
         "path_open",
@@ -734,7 +795,6 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         "fd_tell",
         "path_create_directory",
         "path_filestat_set_times",
-        "path_link",
         "path_readlink",
         "path_remove_directory",
         "path_rename",
@@ -766,6 +826,7 @@ const METHOD_OPEN: u32 = 0x1_001F;
 const METHOD_LSEEK: u32 = 0x1_0020;
 const METHOD_FSTAT: u32 = 0x1_0021;
 const METHOD_SYS_READDIR: u32 = 0x1_002B;
+const METHOD_SYS_LINK: u32 = 0x1_002D;
 
 /// Synthetic preopen fd we expose to wasi-libc so its preopen walk
 /// terminates with one match: "/". Matches the lowest fd that's

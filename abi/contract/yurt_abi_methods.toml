@@ -327,3 +327,8 @@ doc = "POSIX rmdir(path). Request bytes: path. Removes an empty directory. Retur
 id = 0x1_002B
 kind = "syscall"
 doc = "POSIX-shaped getdents. Request bytes: path. Response: count_le (u32) + (name_len_le u32, name_bytes)*. Caller checks the count, parses entries. Truncated when out_cap exceeded; the returned count reflects only what fit. Returns bytes-written on success, -ENOENT for unknown directory, -ENOTDIR if the path is a regular file."
+
+[method.sys_link]
+id = 0x1_002D
+kind = "syscall"
+doc = "POSIX link(target, linkpath). Request bytes: u32 target_len LE + target_bytes + linkpath_bytes. Creates a hard link `linkpath` pointing at the same inode as `target`. Returns 0 on success, -ENOENT if target is missing, -EEXIST if linkpath exists, -EXDEV when the two paths fall on different mounts (cross-mount hard links are not supported), -EPERM when the backend is read-only, or other negated POSIX errno from the backend."

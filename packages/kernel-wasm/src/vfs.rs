@@ -161,6 +161,16 @@ pub trait VfsBackend: Send {
     fn readdir(&self, _path: &[u8]) -> Option<Vec<Vec<u8>>> {
         None
     }
+
+    /// Create a hard link at `link_path` pointing at the same inode
+    /// as `target`. Both paths are absolute on the backend (already
+    /// stripped of any mount prefix by the dispatch layer). Returns
+    /// 0 / -ENOENT (target missing) / -EEXIST (link_path occupied) /
+    /// -EROFS (backend immutable). Default: -EPERM (backend has no
+    /// concept of multiple paths sharing an inode).
+    fn link(&mut self, _target: &[u8], _link_path: &[u8]) -> i32 {
+        -1 // -EPERM
+    }
 }
 
 /// One row in the mount table.
@@ -329,6 +339,24 @@ impl MountTable {
         self.mounts[id as usize].backend.readdir(&rel)
     }
 
+    /// Hard-link `link_path` to the same inode as `target`. Both
+    /// must resolve to the same mount — POSIX disallows cross-
+    /// device hard links, and our mount-id-tagged inodes don't
+    /// translate across backends. Returns -EXDEV when they don't
+    /// match.
+    pub fn link(&mut self, target: &[u8], link_path: &[u8]) -> i32 {
+        let Some((tid, t_rel)) = self.resolve(target) else {
+            return -(crate::abi::ENOENT as i64) as i32;
+        };
+        let Some((lid, l_rel)) = self.resolve(link_path) else {
+            return -(crate::abi::ENOENT as i64) as i32;
+        };
+        if tid != lid {
+            return -(crate::abi::EXDEV as i64) as i32;
+        }
+        self.mounts[tid as usize].backend.link(&t_rel, &l_rel)
+    }
+
     /// Push a fresh snapshot of the kernel's process table to every
     /// mounted backend. Called from dispatch before /proc-touching
     /// syscalls so procfs serves up-to-date contents.
@@ -379,6 +407,12 @@ pub struct RamfsBackend {
     /// the implicit "this path is a dir" marker; future MetadataOverlay
     /// stores dir-level uid/gid/mode independently.
     dirs: BTreeSet<Vec<u8>>,
+    /// inode → number of paths referring to it. Bumped by install
+    /// (creating a new path) and by `link`; decremented by `unlink`.
+    /// When the count hits zero the inode buffer in `inodes` is
+    /// dropped — that's the moment a hardlinked file actually
+    /// disappears, *not* the first unlink.
+    refcount: BTreeMap<u64, u32>,
     next_id: u64,
 }
 
@@ -389,6 +423,7 @@ impl RamfsBackend {
             paths: BTreeMap::new(),
             symlinks: BTreeMap::new(),
             dirs: BTreeSet::new(),
+            refcount: BTreeMap::new(),
             next_id: 1,
         }
     }
@@ -429,6 +464,7 @@ impl RamfsBackend {
         let id = self.next_id;
         self.next_id += 1;
         self.inodes.insert(id, content);
+        self.refcount.insert(id, 1);
         self.paths.insert(path, id);
         id
     }
@@ -577,14 +613,43 @@ impl VfsBackend for RamfsBackend {
     }
 
     fn unlink(&mut self, path: &[u8]) -> i32 {
-        // Symlinks unlink the same way as regular files.
+        // Symlinks unlink the same way as regular files (and have
+        // no refcount — each symlink is its own entity).
         if self.symlinks.remove(path).is_some() {
             return 0;
         }
         let Some(id) = self.paths.remove(path) else {
             return -2; // -ENOENT
         };
-        self.inodes.remove(&id);
+        // Decrement refcount; only drop the inode buffer when the
+        // last path goes away. This is what makes hard links work.
+        let remaining = self
+            .refcount
+            .get_mut(&id)
+            .map(|c| {
+                *c = c.saturating_sub(1);
+                *c
+            })
+            .unwrap_or(0);
+        if remaining == 0 {
+            self.inodes.remove(&id);
+            self.refcount.remove(&id);
+        }
+        0
+    }
+
+    fn link(&mut self, target: &[u8], link_path: &[u8]) -> i32 {
+        let Some(&id) = self.paths.get(target) else {
+            return -(crate::abi::ENOENT as i64) as i32;
+        };
+        if self.paths.contains_key(link_path)
+            || self.symlinks.contains_key(link_path)
+            || self.dirs.contains(link_path)
+        {
+            return -(crate::abi::EEXIST as i64) as i32;
+        }
+        self.paths.insert(link_path.to_vec(), id);
+        *self.refcount.entry(id).or_insert(0) += 1;
         0
     }
 
