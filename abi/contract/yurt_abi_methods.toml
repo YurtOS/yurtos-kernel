@@ -338,6 +338,11 @@ id = 0x1_002E
 kind = "syscall"
 doc = "POSIX rename(oldpath, newpath). Request bytes: u32 old_len LE + old_bytes + new_bytes. Atomically moves the entry at `oldpath` to `newpath` within the same mount; if `newpath` exists it is replaced (regular files only — directory replacement is -EEXIST). Returns 0 on success, -ENOENT if old is missing, -EXDEV across mounts, -EISDIR/-ENOTDIR on type mismatch, -EROFS on a read-only backend, or other negated POSIX errno."
 
+[method.sys_fetch]
+id = 0x1_0030
+kind = "syscall"
+doc = "Outbound HTTP fetch. Request bytes: a JSON document {url, method, headers, body} (UTF-8). Response bytes: a JSON document {ok, status, headers, body, body_base64?, error?} written into the response buffer up to its capacity. Returns bytes-written (>= 0) on success, or -EACCES when the embedder's PolicyEnforcer denies the request, -ENOSYS when the host has no network backend, -E2BIG when the response doesn't fit. The kernel forwards the request bytes verbatim to kh_fetch — wire-format changes happen in `network::fetch` on the host side."
+
 [method.sys_spawn]
 id = 0x1_002F
 kind = "syscall"

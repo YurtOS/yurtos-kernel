@@ -122,6 +122,16 @@ args = [
   { name = "out_cap", type = "usize" },
 ]
 
+[import.kh_fetch_blocking]
+doc = "Synchronous-from-the-kernel HTTP fetch. Request bytes use the same JSON encoding as host_network_fetch. Writes the JSON-encoded fetch result into (out_ptr, out_cap). Returns bytes-written on success, -EACCES when the embedder's PolicyEnforcer denies the request, -E2BIG when the response doesn't fit the output buffer. Implementations on JS hosts use JSPI/asyncify to suspend the kernel; native hosts may run the future on a shared blocking runtime."
+return = "fixed_out"
+args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
 # Socket surface mirrors host_socket_* in yurt_abi.toml plus the
 # event-driven blocking semantics established by PR15
 # (`feat: kernel primitives for in-browser sandbox-listening servers`).

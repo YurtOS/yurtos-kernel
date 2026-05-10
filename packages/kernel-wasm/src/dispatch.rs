@@ -94,6 +94,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_LINK => hard_link(caller_pid, request),
         METHOD_SYS_RENAME => rename(caller_pid, request),
         METHOD_SYS_SPAWN => sys_spawn(caller_pid, request),
+        METHOD_SYS_FETCH => sys_fetch(request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -1205,6 +1206,20 @@ fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
     // /proc/self rewrite.
     let link_path = proc_self_rewrite(caller_pid, link_path_raw);
     with_kernel(|k| k.vfs.symlink(target, &link_path) as i64)
+}
+
+/// `sys_fetch(json_request_bytes) -> json_response_bytes`. Forwards
+/// the request bytes verbatim to `kh_fetch_blocking` and writes the
+/// response bytes back. Wire format is whatever `network::fetch`
+/// accepts on the host.
+fn sys_fetch(request: &[u8], response: &mut [u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    if response.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    kh::fetch_blocking(request, response)
 }
 
 /// `sys_spawn(path_len, path, (arg_len, arg)*)`. Reads the wasm

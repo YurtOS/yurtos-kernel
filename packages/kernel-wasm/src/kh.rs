@@ -27,6 +27,12 @@ extern "C" {
         out_ptr: *mut u8,
         out_cap: usize,
     ) -> i64;
+    fn kh_fetch_blocking(
+        req_ptr: *const u8,
+        req_len: usize,
+        out_ptr: *mut u8,
+        out_cap: usize,
+    ) -> i64;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -83,6 +89,16 @@ unsafe fn kh_real_close(_fd: i32) -> i32 {
 unsafe fn kh_real_stat(
     _path_ptr: *const u8,
     _path_len: usize,
+    _out_ptr: *mut u8,
+    _out_cap: usize,
+) -> i64 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_fetch_blocking(
+    _req_ptr: *const u8,
+    _req_len: usize,
     _out_ptr: *mut u8,
     _out_cap: usize,
 ) -> i64 {
@@ -160,6 +176,23 @@ pub fn real_write(fd: i32, bytes: &[u8]) -> i64 {
 /// callers ignore.
 pub fn real_close(fd: i32) -> i32 {
     unsafe { kh_real_close(fd) }
+}
+
+/// Forward an HTTP fetch request to the host. The request bytes
+/// are a JSON document (see `host::network::fetch` for the
+/// schema); the response bytes (also JSON) get written into
+/// `response`. Returns bytes-written on success or a negated
+/// POSIX errno (-EACCES from the policy gate, -E2BIG when the
+/// response is larger than `response.len()`).
+pub fn fetch_blocking(request: &[u8], response: &mut [u8]) -> i64 {
+    unsafe {
+        kh_fetch_blocking(
+            request.as_ptr(),
+            request.len(),
+            response.as_mut_ptr(),
+            response.len(),
+        )
+    }
 }
 
 /// Stat a host path. Returns the file size on success (in bytes),

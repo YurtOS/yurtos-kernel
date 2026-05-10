@@ -203,6 +203,13 @@ pub trait PolicyEnforcer: Send + Sync {
     fn may_get_realtime(&self) -> PolicyDecision {
         PolicyDecision::Allow
     }
+
+    /// Gate outbound HTTP fetches. `request` is the JSON document
+    /// the kernel forwarded — embedders inspect the URL, method,
+    /// or headers and Allow/Deny. Default: Allow.
+    fn may_fetch(&self, _request: &[u8]) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
 }
 
 /// Default policy: every hook returns Allow. Equivalent to having
@@ -234,6 +241,9 @@ impl PolicyEnforcer for DenyAllPolicy {
         PolicyDecision::Deny
     }
     fn may_get_realtime(&self) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_fetch(&self, _request: &[u8]) -> PolicyDecision {
         PolicyDecision::Deny
     }
 }
@@ -1354,6 +1364,70 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             32 // bytes written
         },
     )?;
+
+    // ── kh_fetch_blocking ──────────────────────────────────────────
+    // Sync wrapper around `network::fetch`. Reads request bytes
+    // from kernel memory, drives the async fetch on a shared
+    // tokio runtime, writes the response bytes back. Policy gate
+    // fires on the request bytes; deny → -EACCES.
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_fetch_blocking",
+        |mut caller: Caller<'_, KernelStoreData>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            let mut request = vec![0u8; req_len as usize];
+            if req_len > 0
+                && memory
+                    .read(&caller, req_ptr as usize, &mut request)
+                    .is_err()
+            {
+                return -EFAULT;
+            }
+            if caller.data().host.policy.may_fetch(&request) == PolicyDecision::Deny {
+                return -EACCES;
+            }
+            let req_str = match std::str::from_utf8(&request) {
+                Ok(s) => s.to_owned(),
+                Err(_) => return -EINVAL,
+            };
+            // Run the async fetch on a fresh OS thread so the
+            // implementation is the same whether the caller is
+            // inside a tokio runtime (`#[tokio::test]`, embedder
+            // server context) or not. block_on inside an existing
+            // runtime is illegal; spawning a thread sidesteps it.
+            let response = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("kh_fetch_blocking: build current-thread tokio runtime");
+                rt.block_on(crate::wasm::network::fetch(&req_str))
+            })
+            .join()
+            .unwrap_or_else(|_| {
+                r#"{"ok":false,"error":"fetch worker panicked"}"#.to_owned()
+            });
+            let bytes = response.as_bytes();
+            if (bytes.len() as u32) > out_cap {
+                return -(7 as i64); // -E2BIG
+            }
+            if memory
+                .write(&mut caller, out_ptr as usize, bytes)
+                .is_err()
+            {
+                return -EFAULT;
+            }
+            bytes.len() as i64
+        },
+    )?;
+
     Ok(())
 }
 

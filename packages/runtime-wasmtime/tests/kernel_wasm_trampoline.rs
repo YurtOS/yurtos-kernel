@@ -75,6 +75,7 @@ const METHOD_SYS_WAIT: u32 = 0x1_002C;
 const METHOD_SYS_LINK: u32 = 0x1_002D;
 const METHOD_SYS_RENAME: u32 = 0x1_002E;
 const METHOD_SYS_SPAWN: u32 = 0x1_002F;
+const METHOD_SYS_FETCH: u32 = 0x1_0030;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -147,6 +148,7 @@ fn kernel_wasm_imports_match_documented_namespaces() {
         kh_imports,
         vec![
             "kh_extension_invoke",
+            "kh_fetch_blocking",
             "kh_log",
             "kh_now_realtime",
             // kh_real_* land via the HostFsBackend mount at /host;
@@ -845,6 +847,57 @@ fn run_pending_spawns_runs_real_wasm_child_and_parent_reaps() {
     assert_eq!(status, 1, "false-cmd exits with 1, got {status}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn sys_fetch_round_trips_through_kh_fetch_blocking() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/hello"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"world"))
+        .mount(&server)
+        .await;
+
+    // The kh handler builds its own current-thread runtime via
+    // OnceLock and `block_on`s the future; calling that from inside
+    // a multi-thread tokio context is fine because we're not inside
+    // the runtime itself when the kernel syscall fires.
+    let mk = fresh_microkernel(0);
+    let req = serde_json::json!({
+        "url": format!("{}/hello", server.uri()),
+        "method": "GET",
+    });
+    let req_bytes = req.to_string().into_bytes();
+    let mut resp = vec![0u8; 8 * 1024];
+    let n = mk
+        .syscall(METHOD_SYS_FETCH, &req_bytes, &mut resp)
+        .unwrap();
+    assert!(n > 0, "sys_fetch returned {n}");
+    let body = std::str::from_utf8(&resp[..n as usize]).unwrap();
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["status"], 200);
+    assert_eq!(v["body"], "world");
+}
+
+#[test]
+fn sys_fetch_denied_by_policy_returns_eacces() {
+    use yurt_runtime_wasmtime::microkernel::DenyAllPolicy;
+    build_kernel_wasm().unwrap();
+    let mk = Microkernel::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            policy: Arc::new(DenyAllPolicy),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let req = br#"{"url":"http://example.invalid","method":"GET"}"#;
+    let mut resp = [0u8; 64];
+    let rc = mk.syscall(METHOD_SYS_FETCH, req, &mut resp).unwrap();
+    assert_eq!(rc, -13, "deny policy should return -EACCES, got {rc}");
+}
+
 #[test]
 fn sys_extension_invoke_returns_negated_enoent_when_no_registry() {
     // Default registry is empty; -ENOENT propagates back through the
@@ -1374,6 +1427,7 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_link", METHOD_SYS_LINK, METHOD_SYS_LINK as i64),
         ("sys_rename", METHOD_SYS_RENAME, METHOD_SYS_RENAME as i64),
         ("sys_spawn", METHOD_SYS_SPAWN, METHOD_SYS_SPAWN as i64),
+        ("sys_fetch", METHOD_SYS_FETCH, METHOD_SYS_FETCH as i64),
     ] {
         let entry = methods
             .get(name)
