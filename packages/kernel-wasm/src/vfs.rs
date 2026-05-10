@@ -28,7 +28,7 @@
 //!   namespaces; mkdir/readdir/unlink land later.
 //! - Permissions / owner / mode bits not modeled.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Per-inode metadata kernels need to track *separately* from the
 /// underlying storage. Files written through HostFs land on disk
@@ -118,6 +118,15 @@ pub trait VfsBackend: Send {
     /// (uid=0, gid=0, mode=0o100644 for regular files, mtime=0).
     fn default_metadata(&self, _inode: u64) -> Option<Metadata> {
         None
+    }
+
+    /// Remove `path` from the backend. Returns:
+    ///   0  — success
+    ///  -2  — path not found (`-ENOENT`)
+    /// -30  — backend is read-only (`-EROFS`)
+    /// Default impl is `-EROFS`; mutable backends override.
+    fn unlink(&mut self, _path: &[u8]) -> i32 {
+        -30 // -EROFS
     }
 }
 
@@ -240,6 +249,15 @@ impl MountTable {
         self.mounts
             .get(mount_id as usize)
             .and_then(|m| m.backend.default_metadata(inode))
+    }
+
+    /// Remove `path`. Routes to the owning backend's `unlink`. Returns
+    /// 0 on success, negated POSIX errno otherwise.
+    pub fn unlink(&mut self, path: &[u8]) -> i32 {
+        let Some((id, rel)) = self.resolve(path) else {
+            return -2; // -ENOENT
+        };
+        self.mounts[id as usize].backend.unlink(&rel)
     }
 
     /// Push a fresh snapshot of the kernel's process table to every
@@ -452,6 +470,14 @@ impl VfsBackend for RamfsBackend {
     fn default_metadata(&self, _inode: u64) -> Option<Metadata> {
         Some(Self::ramfs_default_metadata())
     }
+
+    fn unlink(&mut self, path: &[u8]) -> i32 {
+        let Some(id) = self.paths.remove(path) else {
+            return -2; // -ENOENT
+        };
+        self.inodes.remove(&id);
+        0
+    }
 }
 
 #[cfg(test)]
@@ -570,6 +596,51 @@ mod tests {
         // First three bytes are now "!!!", the rest is leftover
         // from lower (we wrote AT offset 0 without truncating).
         assert!(buf[..n as usize].starts_with(b"!!!"));
+    }
+
+    #[test]
+    fn overlay_unlink_whiteouts_lower_only_path() {
+        // /etc/motd lives only in lower; unlink masks it via
+        // whiteout. Subsequent open returns None.
+        let mut lower = RamfsBackend::new();
+        lower.install(b"/etc/motd".to_vec(), b"image text".to_vec());
+        let upper = RamfsBackend::new();
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+
+        // Pre-unlink: open succeeds.
+        assert!(overlay.open(b"/etc/motd", 0).is_some());
+        assert_eq!(overlay.unlink(b"/etc/motd"), 0);
+        // Post-unlink: lookup misses despite lower still having it.
+        assert!(overlay.open(b"/etc/motd", 0).is_none());
+
+        // Re-create with the create-bit lifts the whiteout.
+        let new_inode = overlay.open(b"/etc/motd", 0b011).unwrap();
+        overlay.write(new_inode, 0, b"new");
+        let r = overlay.open(b"/etc/motd", 0).unwrap();
+        let mut buf = [0u8; 16];
+        let n = overlay.read(r, 0, &mut buf);
+        assert_eq!(&buf[..n as usize], b"new");
+    }
+
+    #[test]
+    fn overlay_unlink_upper_only_path_does_not_whiteout_lower() {
+        // If upper has a path that lower doesn't, unlinking just
+        // removes from upper — no whiteout needed.
+        let lower = RamfsBackend::new();
+        let mut upper = RamfsBackend::new();
+        upper.install(b"/upper-only".to_vec(), b"data".to_vec());
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+        assert!(overlay.open(b"/upper-only", 0).is_some());
+        assert_eq!(overlay.unlink(b"/upper-only"), 0);
+        assert!(overlay.open(b"/upper-only", 0).is_none());
+    }
+
+    #[test]
+    fn overlay_unlink_unknown_path_is_enoent() {
+        let lower = RamfsBackend::new();
+        let upper = RamfsBackend::new();
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+        assert_eq!(overlay.unlink(b"/missing"), -2);
     }
 
     #[test]
@@ -1077,6 +1148,11 @@ pub struct OverlayBackend {
     layered: BTreeMap<u64, (Layer, u64)>,
     /// Path → external inode cache. Populated lazily on open.
     paths: BTreeMap<Vec<u8>, u64>,
+    /// Paths that have been unlinked at the overlay level. Future
+    /// lookups for these paths return None even if the lower layer
+    /// still has them. Cleared if the path is recreated via open
+    /// with the create-bit. Mirrors UnionFS / OverlayFS whiteouts.
+    whiteouts: BTreeSet<Vec<u8>>,
     next_id: u64,
 }
 
@@ -1087,6 +1163,7 @@ impl OverlayBackend {
             upper,
             layered: BTreeMap::new(),
             paths: BTreeMap::new(),
+            whiteouts: BTreeSet::new(),
             next_id: 1,
         }
     }
@@ -1129,6 +1206,17 @@ impl VfsBackend for OverlayBackend {
     fn open(&mut self, path: &[u8], flags: u32) -> Option<u64> {
         let writable = flags & 0b001 != 0;
         let create = flags & 0b010 != 0;
+        // Whiteout takes priority over the cache + lower fallback.
+        // Re-creating with the create-bit clears the whiteout so the
+        // path becomes visible again (with a fresh upper file).
+        if self.whiteouts.contains(path) {
+            if !create {
+                return None;
+            }
+            self.whiteouts.remove(path);
+            // Drop any cached lower-tagged id from before the unlink.
+            self.paths.remove(path);
+        }
         // Cache hit: re-use the existing external id only when the
         // cached layer is compatible with this open's intent. A
         // Lower-tagged cached id can serve any read; a writable open
@@ -1215,5 +1303,34 @@ impl VfsBackend for OverlayBackend {
             (Layer::Upper, inner) => self.upper.size(*inner),
             (Layer::Lower, inner) => self.lower.size(*inner),
         }
+    }
+
+    fn unlink(&mut self, path: &[u8]) -> i32 {
+        // Always invalidate the cache regardless — even if the path
+        // exists only in lower (we'll just whiteout).
+        let cached = self.paths.remove(path);
+        let _ = cached; // existing OFDs keep working through `layered`.
+
+        // Try unlinking from upper first.
+        let upper_rc = self.upper.unlink(path);
+        // Try lower as well — but it's read-only, so its unlink
+        // returns -EROFS. We don't propagate that as an error: the
+        // canonical UnionFS behavior for a lower-only file is
+        // whiteout, not refuse.
+        let lower_has = {
+            let probe = self.lower.open(path, 0);
+            probe.is_some()
+        };
+
+        if upper_rc == 0 || lower_has {
+            // Whether we removed from upper, or the lower had it
+            // (or both), we whiteout the path so future lookups
+            // skip both layers. The path can be re-created via open
+            // with the create-bit, which lifts the whiteout.
+            self.whiteouts.insert(path.to_vec());
+            return 0;
+        }
+        // Neither layer had it.
+        -2 // -ENOENT
     }
 }

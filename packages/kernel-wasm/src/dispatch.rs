@@ -79,6 +79,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_CHMOD => chmod(caller_pid, request),
         METHOD_SYS_CHOWN => chown(caller_pid, request),
         METHOD_SYS_UTIMENS => utimens(caller_pid, request),
+        METHOD_SYS_UNLINK => unlink(caller_pid, request),
+        METHOD_SYS_STAT => stat_path(caller_pid, request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -987,6 +989,47 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         response[0..8].copy_from_slice(&size.to_le_bytes());
         response[8..12].copy_from_slice(&filetype.to_le_bytes());
         response[12..16].copy_from_slice(&mode.to_le_bytes());
+        16
+    })
+}
+
+/// `unlink(path) -> 0 / -ENOENT / -EROFS`. Path-based delete; the
+/// active backend's `unlink` does the work, including overlay
+/// whiteouts.
+fn unlink(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| k.vfs.unlink(request) as i64)
+}
+
+/// `stat(path) -> 16-byte fstat-shaped record`. Same wire format as
+/// sys_fstat: u64 size + u32 filetype + u32 mode. Doesn't require an
+/// open fd. Returns 16 on success, -ENOENT for unresolvable path.
+fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    if response.len() < 16 {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| {
+        let (mount_id, inode) = match k.vfs.open(request, 0) {
+            Some(pair) => pair,
+            None => return -(abi::ENOENT as i64),
+        };
+        let size = k.vfs.size(mount_id, inode).unwrap_or(0);
+        let meta = k.resolve_metadata(mount_id, inode);
+        // Filetype always REGULAR_FILE for path-resolved entries
+        // (no directory or device-like backends route through here
+        // today; Dev's /null/zero return REGULAR_FILE which is
+        // close enough for Phase 6).
+        let filetype: u32 = 4;
+        response[0..8].copy_from_slice(&size.to_le_bytes());
+        response[8..12].copy_from_slice(&filetype.to_le_bytes());
+        response[12..16].copy_from_slice(&meta.mode.to_le_bytes());
         16
     })
 }
@@ -2876,6 +2919,61 @@ mod tests {
         assert_eq!(meta.uid, 2000);
         assert_eq!(meta.gid, 3000);
         assert_eq!(meta.mtime_ns, 1_500_000_000_000_000_000);
+    }
+
+    #[test]
+    fn unlink_removes_ramfs_path() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        reg.extend_from_slice(b"/un");
+        reg.extend_from_slice(b"x");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        // Sanity: path opens before unlink.
+        assert!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/un"), &mut []) >= 0);
+
+        assert_eq!(dispatch(METHOD_SYS_UNLINK, 1, b"/un", &mut []), 0);
+        // After unlink, open returns -ENOENT.
+        assert_eq!(
+            dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/un"), &mut []),
+            -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
+    fn unlink_unknown_path_is_enoent() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(METHOD_SYS_UNLINK, 1, b"/none", &mut []),
+            -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
+    fn stat_path_returns_size_and_mode_without_an_fd() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&5_u32.to_le_bytes());
+        reg.extend_from_slice(b"/info");
+        reg.extend_from_slice(b"hello"); // 5 bytes
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let mut out = [0u8; 16];
+        assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/info", &mut out), 16);
+        assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 5);
+        let mode = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        // Ramfs default — regular file, 0o644.
+        assert_eq!(mode, 0o100_644);
+    }
+
+    #[test]
+    fn stat_unknown_path_is_enoent() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut out = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_STAT, 1, b"/missing", &mut out),
+            -(abi::ENOENT as i64)
+        );
     }
 
     #[test]

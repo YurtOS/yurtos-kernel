@@ -64,6 +64,8 @@ const METHOD_SYS_FSTAT: u32 = 0x1_0021;
 const METHOD_SYS_CHMOD: u32 = 0x1_0022;
 const METHOD_SYS_CHOWN: u32 = 0x1_0023;
 const METHOD_SYS_UTIMENS: u32 = 0x1_0024;
+const METHOD_SYS_UNLINK: u32 = 0x1_0025;
+const METHOD_SYS_STAT: u32 = 0x1_0026;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -1251,6 +1253,8 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_chmod", METHOD_SYS_CHMOD, METHOD_SYS_CHMOD as i64),
         ("sys_chown", METHOD_SYS_CHOWN, METHOD_SYS_CHOWN as i64),
         ("sys_utimens", METHOD_SYS_UTIMENS, METHOD_SYS_UTIMENS as i64),
+        ("sys_unlink", METHOD_SYS_UNLINK, METHOD_SYS_UNLINK as i64),
+        ("sys_stat", METHOD_SYS_STAT, METHOD_SYS_STAT as i64),
     ] {
         let entry = methods
             .get(name)

@@ -277,3 +277,13 @@ doc = "POSIX chown(path, uid, gid). Request bytes: u32 uid LE + u32 gid LE + pat
 id = 0x1_0024
 kind = "syscall"
 doc = "POSIX utimens-style mtime update. Request bytes: u64 mtime_ns LE + path bytes. Writes mtime to the MetadataOverlay. atime is not tracked separately yet — Phase 6 only surfaces mtime through fstat. Returns 0 on success, -ENOENT for unresolvable path."
+
+[method.sys_unlink]
+id = 0x1_0025
+kind = "syscall"
+doc = "POSIX unlink(path). Request bytes: path. Removes the path's user-visible binding: ramfs / overlay-upper drop the entry; overlay marks the path as a whiteout so any underlying lower-layer file is hidden too. HostFs unlink hits kh_real_unlink (not yet wired — returns -EROFS). Tar/Dev/Proc are read-only; unlink returns -EROFS. Returns 0 on success, -ENOENT if the path doesn't resolve, -EROFS if the backend refuses."
+
+[method.sys_stat]
+id = 0x1_0026
+kind = "syscall"
+doc = "POSIX stat(path). Path-based version of sys_fstat. Request bytes: path. Response: same 16-byte layout as sys_fstat (u64 size + u32 filetype + u32 mode). Returns 16 on success, -ENOENT if the path doesn't resolve."
