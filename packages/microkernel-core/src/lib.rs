@@ -59,22 +59,34 @@ pub enum EngineError {
     Other(String),
 }
 
+/// Outcome of a [`HostCallCtx::dispatch_kernel`] call. `rc` is the
+/// syscall scalar (negative POSIX errno on error, otherwise the
+/// engine-neutral semantic value); `response` carries up to
+/// `response_cap` bytes from kernel scratch when `rc > 0`.
+#[derive(Debug)]
+pub struct KernelDispatchOutcome {
+    pub rc: i64,
+    pub response: Vec<u8>,
+}
+
 /// What every host-side import callback gets, regardless of engine.
 /// The kernel-host code (sys_* trampoline, WASI shim) reads/writes
-/// user-process memory and reaches the per-process state through this
-/// trait — never through `wasmtime::Caller` directly.
+/// user-process memory, reaches the per-process state, and invokes
+/// `kernel_dispatch` through this trait — never through
+/// `wasmtime::Caller` directly. That's the surface a different engine
+/// (WasmEdge, wasmer) plugs into.
 ///
 /// User-state type `S` is supplied by kernel-host code (today
-/// [`UserState`] in microkernel-wasmtime: `pid`, `argv`, the
-/// `Arc<Mutex<KernelInstance>>`).
+/// [`UserState`] in microkernel-wasmtime: `pid`, `argv`, the kernel
+/// handle).
 pub trait HostCallCtx<S> {
     /// Read `buf.len()` bytes from the user process's linear memory
     /// starting at `addr`. Returns [`EngineError::MemoryRead`] on OOB.
-    fn read_memory(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), EngineError>;
+    fn read_user_memory(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), EngineError>;
 
     /// Write `bytes` into the user process's linear memory at `addr`.
     /// Returns [`EngineError::MemoryWrite`] on OOB.
-    fn write_memory(&mut self, addr: u32, bytes: &[u8]) -> Result<(), EngineError>;
+    fn write_user_memory(&mut self, addr: u32, bytes: &[u8]) -> Result<(), EngineError>;
 
     /// Borrow the embedder's per-process state (pid, argv, kernel
     /// handle).
@@ -82,6 +94,20 @@ pub trait HostCallCtx<S> {
 
     /// Mutably borrow the embedder's per-process state.
     fn user_state_mut(&mut self) -> &mut S;
+
+    /// Stage `req_bytes` in kernel scratch and invoke
+    /// `kernel_dispatch(method_id, caller_pid, in_ptr, in_len,
+    /// out_ptr, out_cap)`. Returns the syscall scalar and (when
+    /// positive) up to `response_cap` bytes from kernel scratch.
+    /// The trait impl owns all the wasm-engine-specific glue —
+    /// callers see only bytes in / bytes out.
+    fn dispatch_kernel(
+        &mut self,
+        method_id: u32,
+        caller_pid: u32,
+        req_bytes: &[u8],
+        response_cap: u32,
+    ) -> KernelDispatchOutcome;
 }
 
 /// Top-level engine handle. Compiles modules; the rest of the

@@ -40,6 +40,10 @@ const SYS_NAMESPACE: &str = "env";
 const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
 
+/// Public re-export so the engine adapter (`engine::WasmtimeCtx`)
+/// can return the same EFAULT value our trampoline uses internally.
+pub(crate) const EFAULT_PUB: i64 = EFAULT;
+
 /// Method ids that the user-process linker forwards. Generated
 /// constants live inside `yurt-kernel-wasm`'s build artifact, not in
 /// the host crate, so we mirror the ones we forward here. Drift is
@@ -595,79 +599,31 @@ impl UserProcess {
 /// Used by:
 /// - `register_sys_imports` for the `sys_*` shims
 /// - `wasi_shim::add_to_linker` for `fd_write` / `fd_close`
-pub fn trampoline_request(
-    caller: &mut Caller<'_, UserState>,
+pub fn trampoline_request<C: yurt_microkernel_core::HostCallCtx<UserState>>(
+    ctx: &mut C,
     method_id: u32,
     req_bytes: &[u8],
 ) -> i64 {
-    let pid = caller.data().pid;
-    let kernel = caller.data().kernel.clone();
-    let mut k = kernel.lock().unwrap();
-    let scratch_ptr = k.scratch_ptr;
-    let memory = k.memory;
-    let dispatch = k.dispatch.clone();
-    if !req_bytes.is_empty()
-        && memory
-            .write(&mut k.store, scratch_ptr as usize, req_bytes)
-            .is_err()
-    {
-        return -EFAULT;
-    }
-    match dispatch.call(
-        &mut k.store,
-        (method_id, pid, scratch_ptr, req_bytes.len() as u32, 0, 0),
-    ) {
-        Ok(rc) => rc,
-        Err(_) => -EFAULT,
-    }
+    let pid = ctx.user_state().pid;
+    ctx.dispatch_kernel(method_id, pid, req_bytes, 0).rc
 }
 
 /// Forward a syscall and copy the kernel's response into `response`.
 /// Returns the syscall scalar (e.g. bytes written by the kernel).
-pub fn trampoline_request_with_response(
-    caller: &mut Caller<'_, UserState>,
+pub fn trampoline_request_with_response<C: yurt_microkernel_core::HostCallCtx<UserState>>(
+    ctx: &mut C,
     method_id: u32,
     req_bytes: &[u8],
     response: &mut [u8],
 ) -> i64 {
-    let pid = caller.data().pid;
-    let kernel = caller.data().kernel.clone();
-    let mut k = kernel.lock().unwrap();
-    let scratch_ptr = k.scratch_ptr;
-    let scratch_len = k.scratch_len;
-    let kernel_memory = k.memory;
-    let dispatch = k.dispatch.clone();
-    let in_ptr = scratch_ptr;
-    let in_len = req_bytes.len() as u32;
-    let out_ptr = scratch_ptr + in_len;
-    let out_cap = (response.len() as u32).min(scratch_len.saturating_sub(in_len));
-
-    if !req_bytes.is_empty()
-        && kernel_memory
-            .write(&mut k.store, in_ptr as usize, req_bytes)
-            .is_err()
-    {
-        return -EFAULT;
+    let pid = ctx.user_state().pid;
+    let outcome = ctx.dispatch_kernel(method_id, pid, req_bytes, response.len() as u32);
+    if outcome.rc <= 0 {
+        return outcome.rc;
     }
-    let rc = match dispatch.call(
-        &mut k.store,
-        (method_id, pid, in_ptr, in_len, out_ptr, out_cap),
-    ) {
-        Ok(rc) => rc,
-        Err(_) => return -EFAULT,
-    };
-    if rc <= 0 {
-        return rc;
-    }
-    let to_copy = (rc as u32).min(out_cap) as usize;
-    if to_copy > 0
-        && kernel_memory
-            .read(&k.store, out_ptr as usize, &mut response[..to_copy])
-            .is_err()
-    {
-        return -EFAULT;
-    }
-    rc
+    let to_copy = outcome.response.len().min(response.len());
+    response[..to_copy].copy_from_slice(&outcome.response[..to_copy]);
+    outcome.rc
 }
 
 // ── Linker registration ──────────────────────────────────────────────────────
@@ -760,58 +716,33 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
 /// import forwards into `kernel_dispatch` with the appropriate method
 /// id from `yurt_abi_methods.toml`. The wasm import names match the architectural reality: these are syscalls.
 fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
-    fn forward_scalar(caller: &Caller<'_, UserState>, method_id: u32) -> i32 {
-        let pid = caller.data().pid;
-        let kernel = caller.data().kernel.clone();
-        let mut k = kernel.lock().unwrap();
-        let dispatch = k.dispatch.clone();
-        match dispatch.call(&mut k.store, (method_id, pid, 0, 0, 0, 0)) {
-            Ok(rc) => rc as i32,
-            Err(_) => -(EFAULT as i32),
-        }
+    use yurt_microkernel_core::HostCallCtx;
+
+    fn forward_scalar<C: HostCallCtx<UserState>>(ctx: &mut C, method_id: u32) -> i32 {
+        let pid = ctx.user_state().pid;
+        ctx.dispatch_kernel(method_id, pid, &[], 0).rc as i32
     }
 
     /// Forward a syscall whose only argument is a single `u32`. The
     /// argument is staged as 4 little-endian bytes in kernel scratch.
-    fn forward_u32_arg(caller: &mut Caller<'_, UserState>, method_id: u32, arg: u32) -> i32 {
-        forward_request_bytes(caller, method_id, &arg.to_le_bytes()) as i32
+    fn forward_u32_arg<C: HostCallCtx<UserState>>(
+        ctx: &mut C,
+        method_id: u32,
+        arg: u32,
+    ) -> i32 {
+        forward_request_bytes(ctx, method_id, &arg.to_le_bytes()) as i32
     }
 
     /// Forward a syscall whose request is `request_bytes`; no response
     /// buffer. Returns the syscall scalar (i64 to preserve sign /
     /// negative-errno semantics; callers that want i32 can cast).
-    fn forward_request_bytes(
-        caller: &mut Caller<'_, UserState>,
+    fn forward_request_bytes<C: HostCallCtx<UserState>>(
+        ctx: &mut C,
         method_id: u32,
         request_bytes: &[u8],
     ) -> i64 {
-        let pid = caller.data().pid;
-        let kernel = caller.data().kernel.clone();
-        let mut k = kernel.lock().unwrap();
-        let scratch_ptr = k.scratch_ptr;
-        let memory = k.memory;
-        let dispatch = k.dispatch.clone();
-        if !request_bytes.is_empty()
-            && memory
-                .write(&mut k.store, scratch_ptr as usize, request_bytes)
-                .is_err()
-        {
-            return -EFAULT;
-        }
-        match dispatch.call(
-            &mut k.store,
-            (
-                method_id,
-                pid,
-                scratch_ptr,
-                request_bytes.len() as u32,
-                0,
-                0,
-            ),
-        ) {
-            Ok(rc) => rc,
-            Err(_) => -EFAULT,
-        }
+        let pid = ctx.user_state().pid;
+        ctx.dispatch_kernel(method_id, pid, request_bytes, 0).rc
     }
 
     /// Forward a syscall that reads bytes from the *user-process* wasm
@@ -819,24 +750,17 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     /// invokes `kernel_dispatch`. Used by syscalls like `sys_chdir`
     /// where the user-process supplies a pointer + length to its own
     /// memory.
-    fn forward_user_ptr_len(
-        caller: &mut Caller<'_, UserState>,
+    fn forward_user_ptr_len<C: HostCallCtx<UserState>>(
+        ctx: &mut C,
         method_id: u32,
         user_ptr: u32,
         user_len: u32,
     ) -> i32 {
-        let user_memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-            Some(m) => m,
-            None => return -(EFAULT as i32),
-        };
         let mut buf = vec![0u8; user_len as usize];
-        if user_memory
-            .read(&caller, user_ptr as usize, &mut buf)
-            .is_err()
-        {
+        if user_len > 0 && ctx.read_user_memory(user_ptr, &mut buf).is_err() {
             return -(EFAULT as i32);
         }
-        forward_request_bytes(caller, method_id, &buf) as i32
+        forward_request_bytes(ctx, method_id, &buf) as i32
     }
 
     /// Forward a syscall whose request is `req_bytes` (already
@@ -845,154 +769,122 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     /// into kernel scratch, then we copy from there into user memory.
     /// Returns the syscall scalar verbatim — callers that want POSIX
     /// "0 on success" can collapse a positive `rc` themselves.
-    fn forward_request_with_user_response(
-        caller: &mut Caller<'_, UserState>,
+    fn forward_request_with_user_response<C: HostCallCtx<UserState>>(
+        ctx: &mut C,
         method_id: u32,
         req_bytes: &[u8],
         user_out_ptr: u32,
         user_out_cap: u32,
     ) -> i64 {
-        let pid = caller.data().pid;
-        let kernel = caller.data().kernel.clone();
-        let mut k = kernel.lock().unwrap();
-        let scratch_ptr = k.scratch_ptr;
-        let scratch_len = k.scratch_len;
-        let kernel_memory = k.memory;
-        let dispatch = k.dispatch.clone();
-        let in_ptr = scratch_ptr;
-        let in_len = req_bytes.len() as u32;
-        let out_ptr = scratch_ptr + in_len;
-        let out_cap = user_out_cap.min(scratch_len.saturating_sub(in_len));
-
-        if !req_bytes.is_empty()
-            && kernel_memory
-                .write(&mut k.store, in_ptr as usize, req_bytes)
+        let pid = ctx.user_state().pid;
+        let outcome = ctx.dispatch_kernel(method_id, pid, req_bytes, user_out_cap);
+        if outcome.rc <= 0 {
+            return outcome.rc;
+        }
+        if !outcome.response.is_empty()
+            && ctx
+                .write_user_memory(user_out_ptr, &outcome.response)
                 .is_err()
         {
             return -EFAULT;
         }
-        let rc = match dispatch.call(
-            &mut k.store,
-            (method_id, pid, in_ptr, in_len, out_ptr, out_cap),
-        ) {
-            Ok(rc) => rc,
-            Err(_) => return -EFAULT,
-        };
-        if rc <= 0 {
-            return rc;
-        }
-        let to_copy = (rc as u32).min(out_cap) as usize;
-        if to_copy > 0 {
-            let mut tmp = vec![0u8; to_copy];
-            if kernel_memory
-                .read(&k.store, out_ptr as usize, &mut tmp)
-                .is_err()
-            {
-                return -EFAULT;
-            }
-            drop(k);
-            let user_memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT,
-            };
-            if user_memory
-                .write(&mut *caller, user_out_ptr as usize, &tmp)
-                .is_err()
-            {
-                return -EFAULT;
-            }
-        }
-        rc
+        outcome.rc
     }
 
     /// Forward a syscall that fills a response buffer in *user-process*
     /// memory at `(user_out_ptr, user_out_cap)`. The kernel writes the
     /// response into kernel scratch, which we then copy out into user
     /// memory.
-    fn forward_response_to_user(
-        caller: &mut Caller<'_, UserState>,
+    fn forward_response_to_user<C: HostCallCtx<UserState>>(
+        ctx: &mut C,
         method_id: u32,
         user_out_ptr: u32,
         user_out_cap: u32,
     ) -> i32 {
-        let pid = caller.data().pid;
-        let kernel = caller.data().kernel.clone();
-        let mut k = kernel.lock().unwrap();
-        let scratch_ptr = k.scratch_ptr;
-        let kernel_memory = k.memory;
-        let dispatch = k.dispatch.clone();
-        let cap = user_out_cap.min(k.scratch_len);
-        let rc = match dispatch.call(&mut k.store, (method_id, pid, 0, 0, scratch_ptr, cap)) {
-            Ok(rc) => rc,
-            Err(_) => return -(EFAULT as i32),
-        };
+        let pid = ctx.user_state().pid;
+        let outcome = ctx.dispatch_kernel(method_id, pid, &[], user_out_cap);
         // The kernel-side convention for "buffer too small" varies per
         // syscall (e.g. getcwd returns required size as a positive
         // value). We copy out at most cap bytes regardless so the user
         // sees what fit.
-        if rc <= 0 {
-            return rc as i32;
+        if outcome.rc <= 0 {
+            return outcome.rc as i32;
         }
-        let to_copy = (rc as u32).min(cap) as usize;
-        if to_copy > 0 {
-            let mut tmp = vec![0u8; to_copy];
-            if kernel_memory
-                .read(&k.store, scratch_ptr as usize, &mut tmp)
+        if !outcome.response.is_empty()
+            && ctx
+                .write_user_memory(user_out_ptr, &outcome.response)
                 .is_err()
-            {
-                return -(EFAULT as i32);
-            }
-            // Drop the kernel borrow before touching user memory.
-            drop(k);
-            let user_memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -(EFAULT as i32),
-            };
-            if user_memory
-                .write(&mut *caller, user_out_ptr as usize, &tmp)
-                .is_err()
-            {
-                return -(EFAULT as i32);
-            }
+        {
+            return -(EFAULT as i32);
         }
-        rc as i32
+        outcome.rc as i32
     }
 
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_getuid",
-        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETUID) },
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            forward_scalar(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::GETUID,
+            )
+        },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_geteuid",
-        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETEUID) },
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            forward_scalar(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::GETEUID,
+            )
+        },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_getgid",
-        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETGID) },
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            forward_scalar(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::GETGID,
+            )
+        },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_getegid",
-        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETEGID) },
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            forward_scalar(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::GETEGID,
+            )
+        },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_getpid",
-        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETPID) },
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            forward_scalar(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::GETPID,
+            )
+        },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_getppid",
-        |caller: Caller<'_, UserState>| -> i32 { forward_scalar(&caller, sys_method_id::GETPPID) },
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            forward_scalar(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::GETPPID,
+            )
+        },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_umask",
         |mut caller: Caller<'_, UserState>, mask: i32| -> i32 {
-            forward_u32_arg(&mut caller, sys_method_id::UMASK, mask as u32)
+            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::UMASK, mask as u32)
         },
     )?;
     linker.func_wrap(
@@ -1003,7 +895,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(ruid as u32).to_le_bytes());
             req.extend_from_slice(&(euid as u32).to_le_bytes());
             req.extend_from_slice(&(suid as u32).to_le_bytes());
-            forward_request_bytes(&mut caller, sys_method_id::SETRESUID, &req) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SETRESUID, &req) as i32
         },
     )?;
     linker.func_wrap(
@@ -1014,21 +906,21 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(rgid as u32).to_le_bytes());
             req.extend_from_slice(&(egid as u32).to_le_bytes());
             req.extend_from_slice(&(sgid as u32).to_le_bytes());
-            forward_request_bytes(&mut caller, sys_method_id::SETRESGID, &req) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SETRESGID, &req) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_chdir",
         |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32| -> i32 {
-            forward_user_ptr_len(&mut caller, sys_method_id::CHDIR, path_ptr, path_len)
+            forward_user_ptr_len(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::CHDIR, path_ptr, path_len)
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_getcwd",
         |mut caller: Caller<'_, UserState>, out_ptr: u32, out_cap: u32| -> i32 {
-            forward_response_to_user(&mut caller, sys_method_id::GETCWD, out_ptr, out_cap)
+            forward_response_to_user(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::GETCWD, out_ptr, out_cap)
         },
     )?;
     linker.func_wrap(
@@ -1037,7 +929,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         |mut caller: Caller<'_, UserState>, resource: i32, out_ptr: u32| -> i32 {
             let req = (resource as u32).to_le_bytes();
             let rc = forward_request_with_user_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::GETRLIMIT,
                 &req,
                 out_ptr,
@@ -1060,21 +952,21 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(resource as u32).to_le_bytes());
             req.extend_from_slice(&(soft as u64).to_le_bytes());
             req.extend_from_slice(&(hard as u64).to_le_bytes());
-            forward_request_bytes(&mut caller, sys_method_id::SETRLIMIT, &req) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SETRLIMIT, &req) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_close",
         |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
-            forward_u32_arg(&mut caller, sys_method_id::CLOSE, fd as u32)
+            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::CLOSE, fd as u32)
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_dup",
         |mut caller: Caller<'_, UserState>, oldfd: i32| -> i32 {
-            forward_u32_arg(&mut caller, sys_method_id::DUP, oldfd as u32)
+            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::DUP, oldfd as u32)
         },
     )?;
     linker.func_wrap(
@@ -1084,7 +976,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(8);
             req.extend_from_slice(&(oldfd as u32).to_le_bytes());
             req.extend_from_slice(&(newfd as u32).to_le_bytes());
-            forward_request_bytes(&mut caller, sys_method_id::DUP2, &req) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::DUP2, &req) as i32
         },
     )?;
     // POSIX `pipe(int fd[2])`: caller provides a 2-int buffer, kernel
@@ -1094,7 +986,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "sys_pipe",
         |mut caller: Caller<'_, UserState>, out_ptr: u32| -> i32 {
             let rc = forward_request_with_user_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::PIPE,
                 &[],
                 out_ptr,
@@ -1115,7 +1007,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         |mut caller: Caller<'_, UserState>, fd: i32, out_ptr: u32, count: u32| -> i32 {
             let req = (fd as u32).to_le_bytes();
             forward_request_with_user_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::READ,
                 &req,
                 out_ptr,
@@ -1144,14 +1036,14 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(4 + payload.len());
             req.extend_from_slice(&(fd as u32).to_le_bytes());
             req.extend_from_slice(&payload);
-            forward_request_bytes(&mut caller, sys_method_id::WRITE, &req) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::WRITE, &req) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_isatty",
         |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
-            forward_u32_arg(&mut caller, sys_method_id::ISATTY, fd as u32)
+            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::ISATTY, fd as u32)
         },
     )?;
     linker.func_wrap(
@@ -1160,7 +1052,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         |mut caller: Caller<'_, UserState>, clock_id: i32, out_ptr: u32| -> i32 {
             let req = (clock_id as u32).to_le_bytes();
             let rc = forward_request_with_user_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::CLOCK_GETTIME,
                 &req,
                 out_ptr,
@@ -1177,7 +1069,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         SYS_NAMESPACE,
         "sys_getpgid",
         |mut caller: Caller<'_, UserState>, pid: i32| -> i32 {
-            forward_u32_arg(&mut caller, sys_method_id::GETPGID, pid as u32)
+            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::GETPGID, pid as u32)
         },
     )?;
     linker.func_wrap(
@@ -1187,21 +1079,21 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(8);
             req.extend_from_slice(&(pid as u32).to_le_bytes());
             req.extend_from_slice(&(pgid as u32).to_le_bytes());
-            forward_request_bytes(&mut caller, sys_method_id::SETPGID, &req) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SETPGID, &req) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_getsid",
         |mut caller: Caller<'_, UserState>, pid: i32| -> i32 {
-            forward_u32_arg(&mut caller, sys_method_id::GETSID, pid as u32)
+            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::GETSID, pid as u32)
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_setsid",
         |mut caller: Caller<'_, UserState>| -> i32 {
-            forward_request_bytes(&mut caller, sys_method_id::SETSID, &[]) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SETSID, &[]) as i32
         },
     )?;
     linker.func_wrap(
@@ -1211,7 +1103,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(8);
             req.extend_from_slice(&(pid as u32).to_le_bytes());
             req.extend_from_slice(&(sig as u32).to_le_bytes());
-            forward_request_bytes(&mut caller, sys_method_id::KILL, &req) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::KILL, &req) as i32
         },
     )?;
     linker.func_wrap(
@@ -1221,14 +1113,14 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(8);
             req.extend_from_slice(&(sig as u32).to_le_bytes());
             req.extend_from_slice(&(disposition as u32).to_le_bytes());
-            forward_request_bytes(&mut caller, sys_method_id::SIGACTION, &req) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SIGACTION, &req) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_sched_yield",
         |mut caller: Caller<'_, UserState>| -> i32 {
-            forward_request_bytes(&mut caller, sys_method_id::SCHED_YIELD, &[]) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SCHED_YIELD, &[]) as i32
         },
     )?;
     linker.func_wrap(
@@ -1236,7 +1128,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "sys_nanosleep",
         |mut caller: Caller<'_, UserState>, ns: i64| -> i32 {
             let req = (ns as u64).to_le_bytes();
-            forward_request_bytes(&mut caller, sys_method_id::NANOSLEEP, &req) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::NANOSLEEP, &req) as i32
         },
     )?;
     linker.func_wrap(
@@ -1260,7 +1152,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(4 + path.len());
             req.extend_from_slice(&(flags as u32).to_le_bytes());
             req.extend_from_slice(&path);
-            forward_request_bytes(&mut caller, sys_method_id::OPEN, &req) as i32
+            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::OPEN, &req) as i32
         },
     )?;
     linker.func_wrap(
@@ -1277,7 +1169,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&offset.to_le_bytes());
             req.extend_from_slice(&(whence as u32).to_le_bytes());
             let rc = forward_request_with_user_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::LSEEK,
                 &req,
                 out_ptr,
@@ -1292,7 +1184,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         |mut caller: Caller<'_, UserState>, fd: i32, out_ptr: u32| -> i32 {
             let req = (fd as u32).to_le_bytes();
             let rc = forward_request_with_user_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::FSTAT,
                 &req,
                 out_ptr,

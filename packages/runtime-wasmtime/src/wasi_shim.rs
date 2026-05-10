@@ -109,7 +109,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(4 + payload.len());
             req.extend_from_slice(&(fd as u32).to_le_bytes());
             req.extend_from_slice(&payload);
-            let rc = crate::microkernel::trampoline_request(&mut caller, METHOD_WRITE, &req);
+            let rc = crate::microkernel::trampoline_request(&mut crate::engine::WasmtimeCtx::new(&mut caller), METHOD_WRITE, &req);
             if rc < 0 {
                 return errno_from_kernel(rc);
             }
@@ -162,7 +162,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             let req = (fd as u32).to_le_bytes();
             let mut buf = vec![0u8; total_cap as usize];
             let rc = crate::microkernel::trampoline_request_with_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_READ,
                 &req,
                 &mut buf,
@@ -205,7 +205,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         "fd_close",
         |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
             let req = (fd as u32).to_le_bytes();
-            let rc = crate::microkernel::trampoline_request(&mut caller, METHOD_CLOSE, &req);
+            let rc = crate::microkernel::trampoline_request(&mut crate::engine::WasmtimeCtx::new(&mut caller), METHOD_CLOSE, &req);
             errno_from_kernel(rc)
         },
     )?;
@@ -324,7 +324,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(whence as u32).to_le_bytes());
             let mut resp = [0u8; 8];
             let rc = crate::microkernel::trampoline_request_with_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_LSEEK,
                 &req,
                 &mut resp,
@@ -407,7 +407,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             let req = mapped.to_le_bytes();
             let mut resp = [0u8; 8];
             let rc = crate::microkernel::trampoline_request_with_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_CLOCK_GETTIME,
                 &req,
                 &mut resp,
@@ -522,7 +522,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             req.push(b'/');
             req.extend_from_slice(&rel);
             let rc = crate::microkernel::trampoline_request_with_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_OPEN,
                 &req,
                 &mut [],
@@ -552,7 +552,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             let req = (fd as u32).to_le_bytes();
             let mut resp = [0u8; 16];
             let rc = crate::microkernel::trampoline_request_with_response(
-                &mut caller,
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_FSTAT,
                 &req,
                 &mut resp,
