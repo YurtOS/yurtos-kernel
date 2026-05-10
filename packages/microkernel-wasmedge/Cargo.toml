@@ -1,0 +1,13 @@
+[package]
+name = "yurt-microkernel-wasmedge"
+version = "0.1.0"
+edition = "2021"
+description = "WasmEdge-backed microkernel — STUB. Validates the WasmEngine trait shape; real impl pulls wasmedge-sdk."
+
+[lib]
+name = "yurt_microkernel_wasmedge"
+path = "src/lib.rs"
+
+[dependencies]
+yurt-microkernel-core = { path = "../microkernel-core" }
+thiserror = "2"

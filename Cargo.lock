@@ -3958,6 +3958,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "yurt-microkernel-wasmedge"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "yurt-microkernel-core",
+]
+
+[[package]]
+name = "yurt-microkernel-wasmer"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "yurt-microkernel-core",
+]
+
+[[package]]
 name = "yurt-process"
 version = "0.1.0"
 

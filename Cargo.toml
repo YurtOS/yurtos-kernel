@@ -2,6 +2,8 @@
 members = [
   "packages/runtime-wasmtime",
   "packages/microkernel-core",
+  "packages/microkernel-wasmedge",
+  "packages/microkernel-wasmer",
   "packages/kernel-wasm",
   "test-fixtures/yurt-process",
   "test-fixtures/shell",
