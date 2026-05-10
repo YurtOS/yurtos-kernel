@@ -210,6 +210,13 @@ pub trait PolicyEnforcer: Send + Sync {
     fn may_fetch(&self, _request: &[u8]) -> PolicyDecision {
         PolicyDecision::Allow
     }
+
+    /// Gate durable KV access. `store` is the store name, `write`
+    /// distinguishes mutating ops (put/delete) from read-only
+    /// (get/list). Embedders enforce per-store namespacing.
+    fn may_idb(&self, _store: &[u8], _write: bool) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
 }
 
 /// Default policy: every hook returns Allow. Equivalent to having
@@ -244,6 +251,9 @@ impl PolicyEnforcer for DenyAllPolicy {
         PolicyDecision::Deny
     }
     fn may_fetch(&self, _request: &[u8]) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_idb(&self, _store: &[u8], _write: bool) -> PolicyDecision {
         PolicyDecision::Deny
     }
 }
@@ -305,6 +315,11 @@ pub struct HostState {
     /// - Browser microkernels plug in a WebSocket-backed impl
     ///   here (browsers can't open raw TCP).
     pub tcp: Option<Arc<dyn TcpSocketImpl>>,
+    /// Durable key-value backend for the `kh_idb_*` imports.
+    /// `None` denies every access. Browser microkernels back
+    /// this with IndexedDB; native deployments use a disk-backed
+    /// store or [`InMemoryKv`] for tests.
+    pub kv: Option<Arc<dyn KvBackend>>,
 }
 
 impl Default for HostState {
@@ -316,7 +331,79 @@ impl Default for HostState {
             policy: Arc::new(AllowAllPolicy),
             host_fs: None,
             tcp: None,
+            kv: None,
         }
+    }
+}
+
+/// Pluggable durable key-value store. Browser microkernels back
+/// this with IndexedDB (one IDB store per `store` name); native
+/// deployments use an on-disk store or [`InMemoryKv`].
+pub trait KvBackend: Send + Sync {
+    fn get(&self, store: &[u8], key: &[u8]) -> Result<Vec<u8>, i32>;
+    fn put(&self, store: &[u8], key: &[u8], value: &[u8]) -> i32;
+    fn delete(&self, store: &[u8], key: &[u8]) -> i32;
+    fn list(&self, store: &[u8], prefix: &[u8]) -> Vec<Vec<u8>>;
+}
+
+/// In-process [`KvBackend`] implementation. Map of
+/// (store, key) → bytes. Useful for tests and as the placeholder
+/// browser microkernels point at while IndexedDB wiring is in
+/// flight.
+pub struct InMemoryKv {
+    inner: std::sync::Mutex<
+        std::collections::BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
+    >,
+}
+
+impl InMemoryKv {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+}
+
+impl Default for InMemoryKv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl KvBackend for InMemoryKv {
+    fn get(&self, store: &[u8], key: &[u8]) -> Result<Vec<u8>, i32> {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&(store.to_vec(), key.to_vec()))
+            .cloned()
+            .ok_or(-(2 as i32)) // -ENOENT
+    }
+
+    fn put(&self, store: &[u8], key: &[u8], value: &[u8]) -> i32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .insert((store.to_vec(), key.to_vec()), value.to_vec());
+        0
+    }
+
+    fn delete(&self, store: &[u8], key: &[u8]) -> i32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .remove(&(store.to_vec(), key.to_vec()));
+        0
+    }
+
+    fn list(&self, store: &[u8], prefix: &[u8]) -> Vec<Vec<u8>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((s, k), _)| s == store && k.starts_with(prefix))
+            .map(|((_, k), _)| k.clone())
+            .collect()
     }
 }
 
@@ -2044,6 +2131,185 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 None => return 0,
             };
             tcp.close(handle)
+        },
+    )?;
+
+    // ── kh_idb_* (durable KV) ───────────────────────────────────────
+    //
+    // get/put/delete/list against HostState.kv. Each call is gated
+    // by may_idb(store, write). Browsers point kv at IndexedDB;
+    // native deployments at disk or InMemoryKv.
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_idb_get",
+        |mut caller: Caller<'_, KernelStoreData>,
+         store_ptr: u32,
+         store_len: u32,
+         key_ptr: u32,
+         key_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            let mut store = vec![0u8; store_len as usize];
+            if store_len > 0 && memory.read(&caller, store_ptr as usize, &mut store).is_err() {
+                return -EFAULT;
+            }
+            let mut key = vec![0u8; key_len as usize];
+            if key_len > 0 && memory.read(&caller, key_ptr as usize, &mut key).is_err() {
+                return -EFAULT;
+            }
+            if caller.data().host.policy.may_idb(&store, false) == PolicyDecision::Deny {
+                return -EACCES;
+            }
+            let kv = match caller.data().host.kv.clone() {
+                Some(k) => k,
+                None => return -EACCES,
+            };
+            let value = match kv.get(&store, &key) {
+                Ok(v) => v,
+                Err(rc) => return rc as i64,
+            };
+            if (value.len() as u32) > out_cap {
+                return -(7 as i64); // -E2BIG
+            }
+            if memory
+                .write(&mut caller, out_ptr as usize, &value)
+                .is_err()
+            {
+                return -EFAULT;
+            }
+            value.len() as i64
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_idb_put",
+        |mut caller: Caller<'_, KernelStoreData>,
+         store_ptr: u32,
+         store_len: u32,
+         key_ptr: u32,
+         key_len: u32,
+         value_ptr: u32,
+         value_len: u32|
+         -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT as i32,
+            };
+            let mut store = vec![0u8; store_len as usize];
+            if store_len > 0 && memory.read(&caller, store_ptr as usize, &mut store).is_err() {
+                return -EFAULT as i32;
+            }
+            let mut key = vec![0u8; key_len as usize];
+            if key_len > 0 && memory.read(&caller, key_ptr as usize, &mut key).is_err() {
+                return -EFAULT as i32;
+            }
+            let mut value = vec![0u8; value_len as usize];
+            if value_len > 0
+                && memory
+                    .read(&caller, value_ptr as usize, &mut value)
+                    .is_err()
+            {
+                return -EFAULT as i32;
+            }
+            if caller.data().host.policy.may_idb(&store, true) == PolicyDecision::Deny {
+                return -EACCES as i32;
+            }
+            let kv = match caller.data().host.kv.clone() {
+                Some(k) => k,
+                None => return -EACCES as i32,
+            };
+            kv.put(&store, &key, &value)
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_idb_delete",
+        |mut caller: Caller<'_, KernelStoreData>,
+         store_ptr: u32,
+         store_len: u32,
+         key_ptr: u32,
+         key_len: u32|
+         -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT as i32,
+            };
+            let mut store = vec![0u8; store_len as usize];
+            if store_len > 0 && memory.read(&caller, store_ptr as usize, &mut store).is_err() {
+                return -EFAULT as i32;
+            }
+            let mut key = vec![0u8; key_len as usize];
+            if key_len > 0 && memory.read(&caller, key_ptr as usize, &mut key).is_err() {
+                return -EFAULT as i32;
+            }
+            if caller.data().host.policy.may_idb(&store, true) == PolicyDecision::Deny {
+                return -EACCES as i32;
+            }
+            let kv = match caller.data().host.kv.clone() {
+                Some(k) => k,
+                None => return -EACCES as i32,
+            };
+            kv.delete(&store, &key)
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_idb_list",
+        |mut caller: Caller<'_, KernelStoreData>,
+         store_ptr: u32,
+         store_len: u32,
+         prefix_ptr: u32,
+         prefix_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            let mut store = vec![0u8; store_len as usize];
+            if store_len > 0 && memory.read(&caller, store_ptr as usize, &mut store).is_err() {
+                return -EFAULT;
+            }
+            let mut prefix = vec![0u8; prefix_len as usize];
+            if prefix_len > 0
+                && memory
+                    .read(&caller, prefix_ptr as usize, &mut prefix)
+                    .is_err()
+            {
+                return -EFAULT;
+            }
+            if caller.data().host.policy.may_idb(&store, false) == PolicyDecision::Deny {
+                return -EACCES;
+            }
+            let kv = match caller.data().host.kv.clone() {
+                Some(k) => k,
+                None => return -EACCES,
+            };
+            let keys = kv.list(&store, &prefix);
+            // Pack count + (len, bytes)*. Stop early when out of room.
+            let mut buf: Vec<u8> = Vec::with_capacity(out_cap as usize);
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            let mut count: u32 = 0;
+            for k in &keys {
+                let need = 4 + k.len();
+                if buf.len() + need > out_cap as usize {
+                    break;
+                }
+                buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                buf.extend_from_slice(k);
+                count += 1;
+            }
+            buf[0..4].copy_from_slice(&count.to_le_bytes());
+            if memory.write(&mut caller, out_ptr as usize, &buf).is_err() {
+                return -EFAULT;
+            }
+            buf.len() as i64
         },
     )?;
 

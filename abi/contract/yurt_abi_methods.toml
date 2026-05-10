@@ -358,6 +358,26 @@ id = 0x1_0034
 kind = "syscall"
 doc = "Close a socket fd previously returned from sys_socket_connect. Request bytes: u32 fd LE. Returns 0 or -EBADF."
 
+[method.sys_idb_get]
+id = 0x1_0035
+kind = "syscall"
+doc = "Read a durable KV entry. Request bytes: u8 store_len + store_name + key bytes (UTF-8). Response: the value bytes (any length). Returns bytes-written on success, -ENOENT if the key isn't present, -EACCES if the embedder denies the access."
+
+[method.sys_idb_put]
+id = 0x1_0036
+kind = "syscall"
+doc = "Write a durable KV entry. Request bytes: u8 store_len + store_name + u32 key_len LE + key_bytes + value_bytes. Returns 0 on success, -EACCES on policy denial, -EIO on backend failure."
+
+[method.sys_idb_delete]
+id = 0x1_0037
+kind = "syscall"
+doc = "Remove a durable KV entry. Request bytes: u8 store_len + store_name + key_bytes. Returns 0 (whether or not the key existed) or -EACCES."
+
+[method.sys_idb_list]
+id = 0x1_0038
+kind = "syscall"
+doc = "List keys in a store with an optional prefix. Request bytes: u8 store_len + store_name + prefix_bytes (empty = all keys). Response: u32 count_le + (u32 key_len_le + key_bytes)*. Returns bytes-written on success, -EACCES on policy denial. Truncated when out_cap exceeded; returned count reflects only what fit."
+
 [method.sys_fetch]
 id = 0x1_0030
 kind = "syscall"

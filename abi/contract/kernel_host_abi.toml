@@ -239,6 +239,60 @@ args = [
   { name = "handle", type = "i32" },
 ]
 
+# ── Durable KV (IndexedDB-shaped) ────────────────────────────────────
+#
+# Browser microkernels back this with IndexedDB; native ones use a
+# disk-backed key-value store or an in-memory map. The kernel
+# never sees where the bytes live — only the four primitive ops.
+# Stores are arbitrary opaque names (the embedder may forbid
+# certain prefixes via policy).
+
+[import.kh_idb_get]
+doc = "Read a value. Writes (out_ptr, out_cap) and returns bytes-written, or -ENOENT, -EACCES, -E2BIG."
+return = "fixed_out"
+args = [
+  { name = "store_ptr", type = "ptr" },
+  { name = "store_len", type = "usize" },
+  { name = "key_ptr", type = "ptr" },
+  { name = "key_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.kh_idb_put]
+doc = "Write a value. Returns 0 or negated errno."
+return = "scalar"
+args = [
+  { name = "store_ptr", type = "ptr" },
+  { name = "store_len", type = "usize" },
+  { name = "key_ptr", type = "ptr" },
+  { name = "key_len", type = "usize" },
+  { name = "value_ptr", type = "ptr" },
+  { name = "value_len", type = "usize" },
+]
+
+[import.kh_idb_delete]
+doc = "Remove a value. Returns 0 (idempotent) or negated errno."
+return = "scalar"
+args = [
+  { name = "store_ptr", type = "ptr" },
+  { name = "store_len", type = "usize" },
+  { name = "key_ptr", type = "ptr" },
+  { name = "key_len", type = "usize" },
+]
+
+[import.kh_idb_list]
+doc = "List keys with an optional prefix. Writes count + (len, bytes)* into (out_ptr, out_cap). Returns bytes-written or negated errno."
+return = "fixed_out"
+args = [
+  { name = "store_ptr", type = "ptr" },
+  { name = "store_len", type = "usize" },
+  { name = "prefix_ptr", type = "ptr" },
+  { name = "prefix_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
 # ── Wasm engine ops ──────────────────────────────────────────────────────────
 
 [import.kh_spawn_process]

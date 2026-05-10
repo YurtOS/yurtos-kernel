@@ -13,7 +13,7 @@ use wasmtime::{Engine, Module};
 
 use yurt_runtime_wasmtime::microkernel::{
     build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, InMemoryHostFs,
-    LogSink, Microkernel, NativeHostFs, NativeTcpSocket,
+    InMemoryKv, LogSink, Microkernel, NativeHostFs, NativeTcpSocket,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -81,6 +81,10 @@ const METHOD_SYS_SOCKET_CONNECT: u32 = 0x1_0031;
 const METHOD_SYS_SOCKET_SEND: u32 = 0x1_0032;
 const METHOD_SYS_SOCKET_RECV: u32 = 0x1_0033;
 const METHOD_SYS_SOCKET_CLOSE: u32 = 0x1_0034;
+const METHOD_SYS_IDB_GET: u32 = 0x1_0035;
+const METHOD_SYS_IDB_PUT: u32 = 0x1_0036;
+const METHOD_SYS_IDB_DELETE: u32 = 0x1_0037;
+const METHOD_SYS_IDB_LIST: u32 = 0x1_0038;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -154,6 +158,10 @@ fn kernel_wasm_imports_match_documented_namespaces() {
         vec![
             "kh_extension_invoke",
             "kh_fetch_blocking",
+            "kh_idb_delete",
+            "kh_idb_get",
+            "kh_idb_list",
+            "kh_idb_put",
             "kh_log",
             "kh_now_realtime",
             // kh_real_* land via the HostFsBackend mount at /host;
@@ -1025,6 +1033,93 @@ fn run_pending_spawns_runs_real_wasm_child_and_parent_reaps() {
 }
 
 #[test]
+fn sys_idb_put_get_delete_list_round_trips() {
+    // Full kv loop through the trampoline. InMemoryKv satisfies
+    // KvBackend without disk I/O — same shape browser
+    // microkernels will use against IndexedDB.
+    build_kernel_wasm().unwrap();
+    let mut host = HostState::default();
+    host.kv = Some(Arc::new(InMemoryKv::new()));
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+
+    let store: &[u8] = b"sessions";
+    // put: u8 store_len + store + u32 key_len LE + key + value
+    let put_req = |store: &[u8], key: &[u8], value: &[u8]| -> Vec<u8> {
+        let mut r = vec![store.len() as u8];
+        r.extend_from_slice(store);
+        r.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        r.extend_from_slice(key);
+        r.extend_from_slice(value);
+        r
+    };
+    let store_key = |store: &[u8], key: &[u8]| -> Vec<u8> {
+        let mut r = vec![store.len() as u8];
+        r.extend_from_slice(store);
+        r.extend_from_slice(key);
+        r
+    };
+
+    // put a couple entries.
+    assert_eq!(
+        mk.syscall(METHOD_SYS_IDB_PUT, &put_req(store, b"alice", b"AAA"), &mut [])
+            .unwrap(),
+        0,
+    );
+    assert_eq!(
+        mk.syscall(METHOD_SYS_IDB_PUT, &put_req(store, b"bob", b"BBB"), &mut [])
+            .unwrap(),
+        0,
+    );
+
+    // get one back.
+    let mut buf = vec![0u8; 32];
+    let n = mk
+        .syscall(METHOD_SYS_IDB_GET, &store_key(store, b"alice"), &mut buf)
+        .unwrap();
+    assert_eq!(n, 3);
+    assert_eq!(&buf[..n as usize], b"AAA");
+
+    // list keys with prefix.
+    let mut buf = vec![0u8; 256];
+    let n = mk
+        .syscall(METHOD_SYS_IDB_LIST, &store_key(store, b""), &mut buf)
+        .unwrap();
+    assert!(n >= 4);
+    let count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+    assert_eq!(count, 2);
+
+    // delete + miss.
+    assert_eq!(
+        mk.syscall(METHOD_SYS_IDB_DELETE, &store_key(store, b"alice"), &mut [])
+            .unwrap(),
+        0,
+    );
+    let rc = mk
+        .syscall(METHOD_SYS_IDB_GET, &store_key(store, b"alice"), &mut buf)
+        .unwrap();
+    assert_eq!(rc, -2, "deleted key should miss with -ENOENT, got {rc}");
+}
+
+#[test]
+fn sys_idb_denied_by_policy_returns_eacces() {
+    use yurt_runtime_wasmtime::microkernel::DenyAllPolicy;
+    build_kernel_wasm().unwrap();
+    let mk = Microkernel::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            policy: Arc::new(DenyAllPolicy),
+            kv: Some(Arc::new(InMemoryKv::new())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut req = vec![1u8, b's'];
+    req.extend_from_slice(b"k");
+    let rc = mk.syscall(METHOD_SYS_IDB_GET, &req, &mut [0u8; 8]).unwrap();
+    assert_eq!(rc, -13, "deny → -EACCES, got {rc}");
+}
+
+#[test]
 fn sys_socket_connect_send_recv_through_local_echo_server() {
     // Spin up a one-shot TCP echo server on 127.0.0.1, dial it
     // through sys_socket_connect, send a payload, recv it back,
@@ -1704,6 +1799,18 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             "sys_socket_close",
             METHOD_SYS_SOCKET_CLOSE,
             METHOD_SYS_SOCKET_CLOSE as i64,
+        ),
+        ("sys_idb_get", METHOD_SYS_IDB_GET, METHOD_SYS_IDB_GET as i64),
+        ("sys_idb_put", METHOD_SYS_IDB_PUT, METHOD_SYS_IDB_PUT as i64),
+        (
+            "sys_idb_delete",
+            METHOD_SYS_IDB_DELETE,
+            METHOD_SYS_IDB_DELETE as i64,
+        ),
+        (
+            "sys_idb_list",
+            METHOD_SYS_IDB_LIST,
+            METHOD_SYS_IDB_LIST as i64,
         ),
     ] {
         let entry = methods

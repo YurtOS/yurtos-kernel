@@ -51,6 +51,36 @@ extern "C" {
     fn kh_socket_send(handle: i32, data_ptr: *const u8, data_len: usize) -> i64;
     fn kh_socket_recv(handle: i32, out_ptr: *mut u8, len: usize, flags: u32) -> i64;
     fn kh_socket_close(handle: i32) -> i32;
+    fn kh_idb_get(
+        store_ptr: *const u8,
+        store_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+        out_ptr: *mut u8,
+        out_cap: usize,
+    ) -> i64;
+    fn kh_idb_put(
+        store_ptr: *const u8,
+        store_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+        value_ptr: *const u8,
+        value_len: usize,
+    ) -> i32;
+    fn kh_idb_delete(
+        store_ptr: *const u8,
+        store_len: usize,
+        key_ptr: *const u8,
+        key_len: usize,
+    ) -> i32;
+    fn kh_idb_list(
+        store_ptr: *const u8,
+        store_len: usize,
+        prefix_ptr: *const u8,
+        prefix_len: usize,
+        out_ptr: *mut u8,
+        out_cap: usize,
+    ) -> i64;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -175,6 +205,52 @@ unsafe fn kh_socket_recv(
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_socket_close(_handle: i32) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_idb_get(
+    _store_ptr: *const u8,
+    _store_len: usize,
+    _key_ptr: *const u8,
+    _key_len: usize,
+    _out_ptr: *mut u8,
+    _out_cap: usize,
+) -> i64 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_idb_put(
+    _store_ptr: *const u8,
+    _store_len: usize,
+    _key_ptr: *const u8,
+    _key_len: usize,
+    _value_ptr: *const u8,
+    _value_len: usize,
+) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_idb_delete(
+    _store_ptr: *const u8,
+    _store_len: usize,
+    _key_ptr: *const u8,
+    _key_len: usize,
+) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_idb_list(
+    _store_ptr: *const u8,
+    _store_len: usize,
+    _prefix_ptr: *const u8,
+    _prefix_len: usize,
+    _out_ptr: *mut u8,
+    _out_cap: usize,
+) -> i64 {
     -38
 }
 
@@ -305,6 +381,49 @@ pub fn socket_recv(handle: i32, buf: &mut [u8], flags: u32) -> i64 {
 
 pub fn socket_close(handle: i32) -> i32 {
     unsafe { kh_socket_close(handle) }
+}
+
+pub fn idb_get(store: &[u8], key: &[u8], out: &mut [u8]) -> i64 {
+    unsafe {
+        kh_idb_get(
+            store.as_ptr(),
+            store.len(),
+            key.as_ptr(),
+            key.len(),
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    }
+}
+
+pub fn idb_put(store: &[u8], key: &[u8], value: &[u8]) -> i32 {
+    unsafe {
+        kh_idb_put(
+            store.as_ptr(),
+            store.len(),
+            key.as_ptr(),
+            key.len(),
+            value.as_ptr(),
+            value.len(),
+        )
+    }
+}
+
+pub fn idb_delete(store: &[u8], key: &[u8]) -> i32 {
+    unsafe { kh_idb_delete(store.as_ptr(), store.len(), key.as_ptr(), key.len()) }
+}
+
+pub fn idb_list(store: &[u8], prefix: &[u8], out: &mut [u8]) -> i64 {
+    unsafe {
+        kh_idb_list(
+            store.as_ptr(),
+            store.len(),
+            prefix.as_ptr(),
+            prefix.len(),
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    }
 }
 
 /// Forward an HTTP fetch request to the host. The request bytes

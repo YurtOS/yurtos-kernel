@@ -99,6 +99,10 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SOCKET_SEND => sys_socket_send(request),
         METHOD_SYS_SOCKET_RECV => sys_socket_recv(request, response),
         METHOD_SYS_SOCKET_CLOSE => sys_socket_close(request),
+        METHOD_SYS_IDB_GET => sys_idb_get(request, response),
+        METHOD_SYS_IDB_PUT => sys_idb_put(request),
+        METHOD_SYS_IDB_DELETE => sys_idb_delete(request),
+        METHOD_SYS_IDB_LIST => sys_idb_list(request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -1210,6 +1214,82 @@ fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
     // /proc/self rewrite.
     let link_path = proc_self_rewrite(caller_pid, link_path_raw);
     with_kernel(|k| k.vfs.symlink(target, &link_path) as i64)
+}
+
+/// `sys_idb_get(store, key) -> bytes`. Request: u8 store_len +
+/// store_name + key_bytes. Forwards to kh_idb_get.
+fn sys_idb_get(request: &[u8], response: &mut [u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let store_len = request[0] as usize;
+    if 1 + store_len > request.len() {
+        return -(abi::EINVAL as i64);
+    }
+    let store = &request[1..1 + store_len];
+    let key = &request[1 + store_len..];
+    if key.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    if response.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    kh::idb_get(store, key, response)
+}
+
+fn sys_idb_put(request: &[u8]) -> i64 {
+    if request.len() < 5 {
+        return -(abi::EINVAL as i64);
+    }
+    let store_len = request[0] as usize;
+    if 1 + store_len + 4 > request.len() {
+        return -(abi::EINVAL as i64);
+    }
+    let store = &request[1..1 + store_len];
+    let key_len = u32::from_le_bytes(
+        request[1 + store_len..1 + store_len + 4]
+            .try_into()
+            .expect("4 bytes"),
+    ) as usize;
+    let body_start = 1 + store_len + 4;
+    if body_start + key_len > request.len() {
+        return -(abi::EINVAL as i64);
+    }
+    let key = &request[body_start..body_start + key_len];
+    let value = &request[body_start + key_len..];
+    kh::idb_put(store, key, value) as i64
+}
+
+fn sys_idb_delete(request: &[u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let store_len = request[0] as usize;
+    if 1 + store_len > request.len() {
+        return -(abi::EINVAL as i64);
+    }
+    let store = &request[1..1 + store_len];
+    let key = &request[1 + store_len..];
+    if key.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    kh::idb_delete(store, key) as i64
+}
+
+fn sys_idb_list(request: &[u8], response: &mut [u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let store_len = request[0] as usize;
+    if 1 + store_len > request.len() {
+        return -(abi::EINVAL as i64);
+    }
+    let store = &request[1..1 + store_len];
+    let prefix = &request[1 + store_len..];
+    if response.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    kh::idb_list(store, prefix, response)
 }
 
 /// `sys_socket_connect(addr_bytes) -> handle`. Request layout
