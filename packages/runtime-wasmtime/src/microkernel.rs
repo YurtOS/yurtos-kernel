@@ -104,6 +104,7 @@ const METHOD_KERNEL_INSTALL_HOST_FS_MOUNT: u32 = 11;
 const METHOD_KERNEL_INSTALL_YURTFS: u32 = 12;
 const METHOD_KERNEL_REGISTER_CHILD: u32 = 13;
 const METHOD_KERNEL_RECORD_EXIT: u32 = 14;
+const METHOD_KERNEL_DRAIN_SPAWN: u32 = 15;
 
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
@@ -444,6 +445,23 @@ impl Microkernel {
             .syscall(method_id, KERNEL_PID, request, response)
     }
 
+    /// Invoke a kernel syscall as a specific caller pid. Used by
+    /// tests that need to exercise per-process state (sys_wait
+    /// reaping a child of pid 1, /proc/self resolution, etc.)
+    /// without spinning up a real user process.
+    pub fn syscall_as(
+        &self,
+        caller_pid: u32,
+        method_id: u32,
+        request: &[u8],
+        response: &mut [u8],
+    ) -> Result<i64> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .syscall(method_id, caller_pid, request, response)
+    }
+
     /// Install a file blob into kernel.wasm's in-memory ramfs at
     /// `path`, replacing any existing content. Phase 2 ramfs is
     /// read-only from userland; this is the only way bytes get in
@@ -513,6 +531,54 @@ impl Microkernel {
             anyhow::bail!("kernel_record_exit failed: rc={rc}");
         }
         Ok(())
+    }
+
+    /// Drain the next sys_spawn-staged child from the kernel, if
+    /// any. Returns Ok(Some(record)) when a spawn is waiting,
+    /// Ok(None) when the queue is empty. The embedder typically
+    /// calls this in a loop after each parent syscall and
+    /// instantiates each child via `spawn_child` + run-to-
+    /// completion + `record_exit`.
+    pub fn drain_pending_spawn(&self) -> Result<Option<PendingSpawn>> {
+        // Sized to leave room in the kernel scratch buffer (1 MiB
+        // total). Real wasm fixtures need to fit; we'll switch to
+        // a chunked transfer if/when individual children grow
+        // beyond this.
+        let mut buf = vec![0u8; 768 * 1024];
+        let rc = self.syscall(METHOD_KERNEL_DRAIN_SPAWN, &[], &mut buf)?;
+        if rc == -2 {
+            return Ok(None); // -ENOENT: queue empty
+        }
+        if rc < 0 {
+            anyhow::bail!("kernel_drain_spawn failed: rc={rc}");
+        }
+        let used = rc as usize;
+        if used < 8 {
+            anyhow::bail!("kernel_drain_spawn returned malformed record (len={used})");
+        }
+        let child_pid = u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes"));
+        let wasm_len = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")) as usize;
+        if 8 + wasm_len + 4 > used {
+            anyhow::bail!("kernel_drain_spawn record truncated at wasm body");
+        }
+        let wasm = buf[8..8 + wasm_len].to_vec();
+        let mut cur = 8 + wasm_len;
+        let argc = u32::from_le_bytes(buf[cur..cur + 4].try_into().expect("4 bytes")) as usize;
+        cur += 4;
+        let mut argv = Vec::with_capacity(argc);
+        for _ in 0..argc {
+            if cur + 4 > used {
+                anyhow::bail!("kernel_drain_spawn argv header truncated");
+            }
+            let alen = u32::from_le_bytes(buf[cur..cur + 4].try_into().expect("4 bytes")) as usize;
+            cur += 4;
+            if cur + alen > used {
+                anyhow::bail!("kernel_drain_spawn argv body truncated");
+            }
+            argv.push(buf[cur..cur + alen].to_vec());
+            cur += alen;
+        }
+        Ok(Some(PendingSpawn { child_pid, wasm, argv }))
     }
 
     /// Mount a YURTFS L1+L2 overlay at `prefix`. The image bytes
@@ -660,6 +726,14 @@ impl Microkernel {
 /// when the kernel-side stream registry lands.
 #[derive(Default)]
 pub struct ProcessIo;
+
+/// One sys_spawn-staged child waiting for the host to instantiate
+/// and run it. Returned from [`Microkernel::drain_pending_spawn`].
+pub struct PendingSpawn {
+    pub child_pid: u32,
+    pub wasm: Vec<u8>,
+    pub argv: Vec<Vec<u8>>,
+}
 
 // ── User process ─────────────────────────────────────────────────────────────
 

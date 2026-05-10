@@ -74,6 +74,7 @@ const METHOD_SYS_READDIR: u32 = 0x1_002B;
 const METHOD_SYS_WAIT: u32 = 0x1_002C;
 const METHOD_SYS_LINK: u32 = 0x1_002D;
 const METHOD_SYS_RENAME: u32 = 0x1_002E;
+const METHOD_SYS_SPAWN: u32 = 0x1_002F;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -744,6 +745,62 @@ fn deny_all_policy_blocks_realtime_clock() {
 }
 
 #[test]
+fn sys_spawn_stages_child_and_drain_pending_returns_it() {
+    // End-to-end: register a "wasm" file in ramfs, parent (pid 1)
+    // calls sys_spawn, host drains the staged record, then records
+    // exit and the parent's sys_wait reaps. Doesn't actually
+    // instantiate the wasm — that's the next slice; this validates
+    // the full kernel-stage / host-drain / record-exit / wait loop.
+    let mk = fresh_microkernel(0);
+    let body = b"\0asm\x01\x00\x00\x00fake".to_vec();
+    let path: &[u8] = b"/bin/echo";
+    mk.register_ramfs_file(path, &body).unwrap();
+
+    // Build sys_spawn request: u32 path_len + path + (u32 alen + arg)*
+    let mut sreq = (path.len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(path);
+    for arg in [b"echo".as_slice(), b"hi".as_slice()] {
+        sreq.extend_from_slice(&(arg.len() as u32).to_le_bytes());
+        sreq.extend_from_slice(arg);
+    }
+    let child_pid = mk
+        .syscall_as(1, METHOD_SYS_SPAWN, &sreq, &mut [])
+        .unwrap();
+    assert!(child_pid >= 1000, "kernel-allocated pid expected, got {child_pid}");
+
+    // Host drains the staged spawn.
+    let pending = mk.drain_pending_spawn().unwrap().expect("staged spawn");
+    assert_eq!(pending.child_pid as i64, child_pid);
+    assert_eq!(pending.wasm, body);
+    assert_eq!(pending.argv, vec![b"echo".to_vec(), b"hi".to_vec()]);
+
+    // Queue is now empty.
+    assert!(mk.drain_pending_spawn().unwrap().is_none());
+
+    // Pretend the host ran the child and it exited with 7.
+    mk.record_exit(pending.child_pid, 7).unwrap();
+
+    // Need the parent (pid 1) to exist for sys_wait. Spawn it via
+    // the regular path so the kernel has its Process record.
+    // (sys_spawn already created the parent's children entry.)
+    // Parent's sys_wait reaps the child.
+    let mut wreq = 0_u32.to_le_bytes().to_vec(); // wait for any
+    wreq.extend_from_slice(&0_u32.to_le_bytes()); // no flags
+    let mut wresp = [0u8; 8];
+    // Use kernel-internal caller_pid path: syscall() defaults to
+    // KERNEL_PID; sys_wait resolves children on caller_pid. Need
+    // a per-pid syscall API; the trampoline-test scaffold has
+    // direct syscall() with implicit caller_pid 0. The parent we
+    // want to reap from is pid 1 — use pid_syscall if available.
+    let n = mk
+        .syscall_as(1, METHOD_SYS_WAIT, &wreq, &mut wresp)
+        .unwrap();
+    assert_eq!(n, 8, "sys_wait failed: rc={n}");
+    assert_eq!(u32::from_le_bytes(wresp[0..4].try_into().unwrap()), pending.child_pid);
+    assert_eq!(i32::from_le_bytes(wresp[4..8].try_into().unwrap()), 7);
+}
+
+#[test]
 fn sys_extension_invoke_returns_negated_enoent_when_no_registry() {
     // Default registry is empty; -ENOENT propagates back through the
     // trampoline as a negative scalar.
@@ -1271,6 +1328,7 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_wait", METHOD_SYS_WAIT, METHOD_SYS_WAIT as i64),
         ("sys_link", METHOD_SYS_LINK, METHOD_SYS_LINK as i64),
         ("sys_rename", METHOD_SYS_RENAME, METHOD_SYS_RENAME as i64),
+        ("sys_spawn", METHOD_SYS_SPAWN, METHOD_SYS_SPAWN as i64),
     ] {
         let entry = methods
             .get(name)

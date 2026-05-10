@@ -18,7 +18,7 @@
 // which violates the architectural invariant that the kernel only
 // imports `kh_*`. BTreeMap is deterministic and trivially fast at the
 // process counts we actually run.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
 
 use crate::state::Credentials;
@@ -316,6 +316,27 @@ pub struct Kernel {
     /// later. Lets sandbox-uid metadata coexist with host-uid
     /// storage on HostFs / YURTFS L2.
     metadata_overrides: BTreeMap<(crate::vfs::MountId, u64), crate::vfs::Metadata>,
+    /// FIFO of children that sys_spawn has accepted but the host
+    /// hasn't yet instantiated. Microkernel drains via the
+    /// `kernel_drain_spawn` internal method between syscalls and
+    /// runs each child synchronously, then calls
+    /// `kernel_record_exit`. Necessary because re-entering kernel
+    /// dispatch from inside another dispatch call would deadlock
+    /// the kernel-state lock.
+    pending_spawns: VecDeque<PendingSpawn>,
+    /// Pid counter for sys_spawn-allocated children. Starts at 1000
+    /// to leave the low range for host-allocated user processes;
+    /// the host's pid allocator must stay below 1000 for now (a
+    /// proper unified allocator is a follow-up).
+    next_spawn_pid: Pid,
+}
+
+/// One staged sys_spawn waiting for the host to instantiate it.
+/// Bytes + argv are owned by the kernel until drained.
+pub struct PendingSpawn {
+    pub child_pid: Pid,
+    pub wasm: Vec<u8>,
+    pub argv: Vec<Vec<u8>>,
 }
 
 impl Kernel {
@@ -339,7 +360,35 @@ impl Kernel {
             ofds: BTreeMap::new(),
             next_ofd_id: 1,
             metadata_overrides: BTreeMap::new(),
+            pending_spawns: VecDeque::new(),
+            next_spawn_pid: 1000,
         }
+    }
+
+    /// Allocate the next pid for a sys_spawn child and bump the
+    /// counter. Pids stay above 1000 to leave room for host-
+    /// allocated user processes.
+    pub fn alloc_spawn_pid(&mut self) -> Pid {
+        let pid = self.next_spawn_pid;
+        self.next_spawn_pid = self.next_spawn_pid.saturating_add(1);
+        pid
+    }
+
+    /// Push a freshly-staged spawn onto the queue.
+    pub fn enqueue_spawn(&mut self, spawn: PendingSpawn) {
+        self.pending_spawns.push_back(spawn);
+    }
+
+    /// Pop the next pending spawn for the host to run. Returns None
+    /// when the queue is empty.
+    pub fn drain_spawn(&mut self) -> Option<PendingSpawn> {
+        self.pending_spawns.pop_front()
+    }
+
+    /// Restore a drained spawn to the head of the queue (used when
+    /// the response buffer was too small to serialize it).
+    pub fn pending_spawns_push_front(&mut self, spawn: PendingSpawn) {
+        self.pending_spawns.push_front(spawn);
     }
 
     /// Compose the kernel's view of an inode's metadata:

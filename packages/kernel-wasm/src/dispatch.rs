@@ -43,6 +43,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_INSTALL_YURTFS => install_yurtfs(request),
         METHOD_KERNEL_REGISTER_CHILD => register_child(request),
         METHOD_KERNEL_RECORD_EXIT => record_exit(request),
+        METHOD_KERNEL_DRAIN_SPAWN => drain_spawn(response),
         METHOD_SYS_WAIT => sys_wait(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
@@ -92,6 +93,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_READDIR => readdir(caller_pid, request, response),
         METHOD_SYS_LINK => hard_link(caller_pid, request),
         METHOD_SYS_RENAME => rename(caller_pid, request),
+        METHOD_SYS_SPAWN => sys_spawn(caller_pid, request),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -1203,6 +1205,101 @@ fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
     // /proc/self rewrite.
     let link_path = proc_self_rewrite(caller_pid, link_path_raw);
     with_kernel(|k| k.vfs.symlink(target, &link_path) as i64)
+}
+
+/// `sys_spawn(path_len, path, (arg_len, arg)*)`. Reads the wasm
+/// image from the VFS, allocates a child pid (kernel range starts
+/// at 1000), records the parent/child relationship, and stages a
+/// PendingSpawn for the host to run. Returns the child pid.
+fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let path_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    if request.len() < 4 + path_len {
+        return -(abi::EINVAL as i64);
+    }
+    let raw_path = &request[4..4 + path_len];
+    if raw_path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let path = proc_self_rewrite(caller_pid, raw_path);
+    // Decode argv list from the trailing bytes.
+    let mut argv: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = 4 + path_len;
+    while cursor + 4 <= request.len() {
+        let alen = u32::from_le_bytes(request[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
+        cursor += 4;
+        if cursor + alen > request.len() {
+            return -(abi::EINVAL as i64);
+        }
+        argv.push(request[cursor..cursor + alen].to_vec());
+        cursor += alen;
+    }
+
+    with_kernel(|k| {
+        // Read the image bytes from VFS.
+        let Some((mount_id, inode)) = k.vfs.open(&path, 0) else {
+            return -(abi::ENOENT as i64);
+        };
+        let size = k.vfs.size(mount_id, inode).unwrap_or(0) as usize;
+        let mut wasm = vec![0u8; size];
+        let n = k.vfs.read(mount_id, inode, 0, &mut wasm);
+        if n < 0 {
+            return n;
+        }
+        wasm.truncate(n as usize);
+
+        let child_pid = k.alloc_spawn_pid();
+        // Wire the parent/child relationship so sys_wait can reap.
+        k.process_mut(child_pid).ppid = caller_pid;
+        let parent = k.process_mut(caller_pid);
+        if !parent.children.contains(&child_pid) {
+            parent.children.push(child_pid);
+        }
+        k.enqueue_spawn(crate::kernel::PendingSpawn {
+            child_pid,
+            wasm,
+            argv,
+        });
+        child_pid as i64
+    })
+}
+
+/// Internal: pop the next PendingSpawn and serialize it for the
+/// host. Wire format: u32 child_pid + u32 wasm_len + wasm_bytes +
+/// u32 argc + (u32 arg_len + arg_bytes)*. Returns -ENOENT when
+/// the queue is empty.
+fn drain_spawn(response: &mut [u8]) -> i64 {
+    with_kernel(|k| {
+        let Some(spawn) = k.drain_spawn() else {
+            return -(abi::ENOENT as i64);
+        };
+        let need = 4 + 4 + spawn.wasm.len()
+            + 4
+            + spawn.argv.iter().map(|a| 4 + a.len()).sum::<usize>();
+        if response.len() < need {
+            // Re-enqueue at front so the next call picks it up.
+            k.pending_spawns_push_front(spawn);
+            return -(abi::EINVAL as i64);
+        }
+        let mut cur = 0usize;
+        response[cur..cur + 4].copy_from_slice(&spawn.child_pid.to_le_bytes());
+        cur += 4;
+        response[cur..cur + 4].copy_from_slice(&(spawn.wasm.len() as u32).to_le_bytes());
+        cur += 4;
+        response[cur..cur + spawn.wasm.len()].copy_from_slice(&spawn.wasm);
+        cur += spawn.wasm.len();
+        response[cur..cur + 4].copy_from_slice(&(spawn.argv.len() as u32).to_le_bytes());
+        cur += 4;
+        for a in &spawn.argv {
+            response[cur..cur + 4].copy_from_slice(&(a.len() as u32).to_le_bytes());
+            cur += 4;
+            response[cur..cur + a.len()].copy_from_slice(a);
+            cur += a.len();
+        }
+        cur as i64
+    })
 }
 
 /// `rename(old_len, old, new)`. Wire shape mirrors symlink/link.
@@ -3301,6 +3398,90 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
         let rc = dispatch(METHOD_SYS_UNLINK, 7, b"/proc/self/status", &mut []);
         assert!(rc < 0, "unlink under /proc must fail (got {rc})");
+    }
+
+    #[test]
+    fn sys_spawn_reads_vfs_then_drains_and_reaps() {
+        // End-to-end (kernel-side only — host instantiation is a
+        // separate slice). Steps:
+        //   1. Register a "wasm" file at /bin/echo with synthetic
+        //      bytes so we can verify drain returns them verbatim.
+        //   2. sys_spawn("/bin/echo", ["echo","hi"]) returns a fresh
+        //      child pid >= 1000.
+        //   3. drain_spawn returns the staged record.
+        //   4. record_exit(child, 7) makes parent's sys_wait reap.
+        let _g = crate::kernel::TestGuard::acquire();
+        let body: &[u8] = b"\0asm\x01\x00\x00\x00fake-wasm-bytes";
+        let path: &[u8] = b"/bin/echo";
+        let mut reg = (path.len() as u32).to_le_bytes().to_vec();
+        reg.extend_from_slice(path);
+        reg.extend_from_slice(body);
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        // sys_spawn request: u32 path_len + path + (u32 alen + arg)*
+        let mut sreq = (path.len() as u32).to_le_bytes().to_vec();
+        sreq.extend_from_slice(path);
+        for arg in [b"echo".as_slice(), b"hi".as_slice()] {
+            sreq.extend_from_slice(&(arg.len() as u32).to_le_bytes());
+            sreq.extend_from_slice(arg);
+        }
+        let parent_pid: u32 = 1;
+        let child_pid = dispatch(METHOD_SYS_SPAWN, parent_pid, &sreq, &mut []);
+        assert!(
+            child_pid >= 1000,
+            "spawn pid must come from kernel range >= 1000: got {child_pid}",
+        );
+        let child_pid_u32 = child_pid as u32;
+
+        // Drain the queued spawn.
+        let mut buf = vec![0u8; 1024];
+        let n = dispatch(METHOD_KERNEL_DRAIN_SPAWN, 0, &[], &mut buf);
+        assert!(n > 0, "drain_spawn returned {n}");
+        let used = n as usize;
+        assert_eq!(
+            u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            child_pid_u32,
+        );
+        let wasm_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        assert_eq!(wasm_len, body.len());
+        assert_eq!(&buf[8..8 + wasm_len], body);
+        let argc_off = 8 + wasm_len;
+        let argc = u32::from_le_bytes(buf[argc_off..argc_off + 4].try_into().unwrap());
+        assert_eq!(argc, 2);
+        assert!(argc_off + 4 <= used);
+
+        // After draining, queue is empty.
+        let n2 = dispatch(METHOD_KERNEL_DRAIN_SPAWN, 0, &[], &mut buf);
+        assert_eq!(n2, -(abi::ENOENT as i64));
+
+        // Host pretends it ran the child and exited with code 7.
+        let mut rex = child_pid_u32.to_le_bytes().to_vec();
+        rex.extend_from_slice(&7_i32.to_le_bytes());
+        assert_eq!(dispatch(METHOD_KERNEL_RECORD_EXIT, 0, &rex, &mut []), 0);
+
+        // Parent's sys_wait reaps the spawned child.
+        let mut wreq = 0_u32.to_le_bytes().to_vec(); // wait for any
+        wreq.extend_from_slice(&0_u32.to_le_bytes()); // no flags
+        let mut wresp = [0u8; 8];
+        let wn = dispatch(METHOD_SYS_WAIT, parent_pid, &wreq, &mut wresp);
+        assert_eq!(wn, 8);
+        assert_eq!(
+            u32::from_le_bytes(wresp[0..4].try_into().unwrap()),
+            child_pid_u32,
+        );
+        assert_eq!(i32::from_le_bytes(wresp[4..8].try_into().unwrap()), 7);
+    }
+
+    #[test]
+    fn sys_spawn_missing_path_is_enoent() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let path: &[u8] = b"/no-such-binary";
+        let mut sreq = (path.len() as u32).to_le_bytes().to_vec();
+        sreq.extend_from_slice(path);
+        assert_eq!(
+            dispatch(METHOD_SYS_SPAWN, 1, &sreq, &mut []),
+            -(abi::ENOENT as i64),
+        );
     }
 
     #[test]

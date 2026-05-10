@@ -337,3 +337,13 @@ doc = "POSIX link(target, linkpath). Request bytes: u32 target_len LE + target_b
 id = 0x1_002E
 kind = "syscall"
 doc = "POSIX rename(oldpath, newpath). Request bytes: u32 old_len LE + old_bytes + new_bytes. Atomically moves the entry at `oldpath` to `newpath` within the same mount; if `newpath` exists it is replaced (regular files only — directory replacement is -EEXIST). Returns 0 on success, -ENOENT if old is missing, -EXDEV across mounts, -EISDIR/-ENOTDIR on type mismatch, -EROFS on a read-only backend, or other negated POSIX errno."
+
+[method.sys_spawn]
+id = 0x1_002F
+kind = "syscall"
+doc = "POSIX-shaped spawn(path, argv) — the userland-facing fork+exec. Request bytes: u32 path_len LE + path_bytes + (u32 arg_len + arg_bytes)*. Reads the wasm image at `path` from the VFS, allocates a fresh child pid (kernel range starts at 1000 to avoid collision with the host's user-process pid allocator), records the parent/child relationship, and enqueues a PendingSpawn for the host to instantiate. The microkernel must call drain_pending_spawn between parent syscalls to actually run staged children — without that drain the child never runs. Returns the child pid on success, -ENOENT if path is missing, -ENOMEM if the file can't be read, or -EINVAL on a malformed request."
+
+[method.kernel_drain_spawn]
+id = 15
+kind = "internal"
+doc = "Microkernel-only: pop the next PendingSpawn enqueued by sys_spawn and serialize it for the host. Response: u32 child_pid + u32 wasm_len + wasm_bytes + u32 argc + (u32 arg_len + arg_bytes)*. Returns bytes-written on success, -ENOENT when the queue is empty. The host instantiates the child wasm with the returned pid, runs it to completion, and calls kernel_record_exit to make the parent's sys_wait reap it."

@@ -29,7 +29,7 @@ pub use dispatch::dispatch;
 /// in the hot path. Capacity is intentionally generous; individual
 /// syscalls cap their own usage. See the trampoline protocol in
 /// `docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md`.
-const SCRATCH_LEN: usize = 4096;
+const SCRATCH_LEN: usize = 1024 * 1024;
 static mut SCRATCH: [u8; SCRATCH_LEN] = [0; SCRATCH_LEN];
 
 /// Offset of [`SCRATCH`] within this kernel instance's linear memory.
