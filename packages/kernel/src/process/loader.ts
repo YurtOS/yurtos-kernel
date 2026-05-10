@@ -8,7 +8,11 @@ import type { PlatformAdapter } from "../platform/adapter.js";
 import type { VfsLike } from "../vfs/vfs-like.js";
 import type { ProcessKernel } from "./kernel.js";
 import { WasiHost } from "../wasi/wasi-host.js";
-import { createBufferTarget, createNullTarget, createStaticTarget } from "../wasi/fd-target.js";
+import {
+  createBufferTarget,
+  createNullTarget,
+  createStaticTarget,
+} from "../wasi/fd-target.js";
 import {
   AsyncifyAsyncBridge,
   type AsyncifyForkSnapshot,
@@ -16,9 +20,16 @@ import {
 import { CooperativeSerialBackend } from "./threads/cooperative-serial.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
 import type { ThreadsBackend } from "./threads/backend.js";
-import { defaultWasmModuleCache, sha256Hex, type WasmModuleCache } from "./module-cache.js";
+import {
+  defaultWasmModuleCache,
+  sha256Hex,
+  type WasmModuleCache,
+} from "./module-cache.js";
 
-function bindSignalDeliverer(wasi: WasiHost, instance: WebAssembly.Instance): void {
+function bindSignalDeliverer(
+  wasi: WasiHost,
+  instance: WebAssembly.Instance,
+): void {
   const deliverSignal = instance.exports.yurt_deliver_signal;
   if (typeof deliverSignal !== "function") return;
   wasi.setSignalDeliverer((sig) => {
@@ -43,6 +54,7 @@ export interface LoaderContext {
     memory: WebAssembly.Memory,
     wasiHost: WasiHost,
     threadsBackend: ThreadsBackend,
+    mainInstance: () => WebAssembly.Instance | null,
   ): Record<string, WebAssembly.ImportValue>;
   makeFdReadAndClear(
     pid: number,
@@ -99,7 +111,9 @@ export async function loadProcess(
     );
   }
   if (continuationMarked && !moduleHasAsyncify(module)) {
-    throw new Error("module declares yurt.features continuations but is not asyncify-instrumented");
+    throw new Error(
+      "module declares yurt.features continuations but is not asyncify-instrumented",
+    );
   }
   const wasiArgv = opts.wasiArgv ?? argv;
   const cwd = opts.cwd ?? "/";
@@ -116,13 +130,21 @@ export async function loadProcess(
     ctx.kernel.setFdTarget(pid, 0, createNullTarget());
   }
   if (!ctx.kernel.getFdTarget(pid, 1)) {
-    ctx.kernel.setFdTarget(pid, 1, createBufferTarget(opts.stdoutLimit ?? Infinity));
+    ctx.kernel.setFdTarget(
+      pid,
+      1,
+      createBufferTarget(opts.stdoutLimit ?? Infinity),
+    );
   }
   if (opts.stderrToStdout) {
     const stdoutTarget = ctx.kernel.getFdTarget(pid, 1);
     if (stdoutTarget) ctx.kernel.setFdTarget(pid, 2, stdoutTarget);
   } else if (!ctx.kernel.getFdTarget(pid, 2)) {
-    ctx.kernel.setFdTarget(pid, 2, createBufferTarget(opts.stderrLimit ?? Infinity));
+    ctx.kernel.setFdTarget(
+      pid,
+      2,
+      createBufferTarget(opts.stderrLimit ?? Infinity),
+    );
   }
 
   const proc = Process.__forLoader({ pid, mode });
@@ -145,8 +167,15 @@ export async function loadProcess(
     : null;
   const threadsBackend = new CooperativeSerialBackend();
 
+  let mainInstanceRef: WebAssembly.Instance | null = null;
   const yurtImports: Record<string, WebAssembly.ImportValue> = {
-    ...ctx.buildKernelImports(pid, memoryProxy, wasi, threadsBackend),
+    ...ctx.buildKernelImports(
+      pid,
+      memoryProxy,
+      wasi,
+      threadsBackend,
+      () => mainInstanceRef,
+    ),
     ...(opts.extraYurtImports?.(memoryProxy, wasi) ?? {}),
   };
   if (asyncifyBridge) {
@@ -192,21 +221,27 @@ export async function loadProcess(
     rollback();
     throw e;
   }
+  // Wire the main-instance ref captured by the dlopen loader closure.
+  mainInstanceRef = instance;
   const table = instance.exports.__indirect_function_table;
   if (table instanceof WebAssembly.Table) {
-    const promising =
-      typeof WebAssembly.promising === "function"
-        ? ((fn: unknown) => WebAssembly.promising(fn as Function))
-        : ((fn: unknown) => fn);
+    const promising = typeof WebAssembly.promising === "function"
+      ? ((fn: unknown) => WebAssembly.promising(fn as Function))
+      : ((fn: unknown) => fn);
     threadsBackend.setIndirectCallTable(
       makeIndirectCallTable(table, promising),
     );
   }
 
   memoryRef = instance.exports.memory as WebAssembly.Memory;
-  if (opts.memoryBytes !== undefined && memoryRef.buffer.byteLength > opts.memoryBytes) {
+  if (
+    opts.memoryBytes !== undefined &&
+    memoryRef.buffer.byteLength > opts.memoryBytes
+  ) {
     rollback();
-    throw new Error(`memory limit exceeded: ${memoryRef.buffer.byteLength} > ${opts.memoryBytes}`);
+    throw new Error(
+      `memory limit exceeded: ${memoryRef.buffer.byteLength} > ${opts.memoryBytes}`,
+    );
   }
   proc.__setMemory(memoryRef);
   proc.__setFdReadAndClear(ctx.makeFdReadAndClear(pid));
@@ -214,7 +249,9 @@ export async function loadProcess(
     ctx.kernel.setFdTarget(
       pid,
       0,
-      data && data.byteLength > 0 ? createStaticTarget(data) : createNullTarget(),
+      data && data.byteLength > 0
+        ? createStaticTarget(data)
+        : createNullTarget(),
     );
   });
 
@@ -263,12 +300,21 @@ export async function loadProcess(
         get(_target, prop) {
           if (!childMemoryRef) throw new Error("child memory not initialized");
           const val =
-            (childMemoryRef as unknown as Record<string | symbol, unknown>)[prop];
+            (childMemoryRef as unknown as Record<string | symbol, unknown>)[
+              prop
+            ];
           return typeof val === "function" ? val.bind(childMemoryRef) : val;
         },
       });
+      let childInstanceRef: WebAssembly.Instance | null = null;
       const childYurtImports: Record<string, WebAssembly.ImportValue> = {
-        ...ctx.buildKernelImports(childPid, childMemoryProxy, childWasi, childThreadsBackend),
+        ...ctx.buildKernelImports(
+          childPid,
+          childMemoryProxy,
+          childWasi,
+          childThreadsBackend,
+          () => childInstanceRef,
+        ),
         ...(opts.extraYurtImports?.(childMemoryProxy, childWasi) ?? {}),
       };
       childYurtImports.host_setjmp = childBridge
@@ -307,16 +353,25 @@ export async function loadProcess(
         wasi_snapshot_preview1: childWasiImports,
         yurt: childYurtImports,
       });
+      // Wire the child's main-instance ref captured by the dlopen loader
+      // closure for this child process.
+      childInstanceRef = childInstance;
       bindSignalDeliverer(childWasi, childInstance);
       ctx.kernel.attachWasiHost(childPid, childWasi);
       childMemoryRef = childInstance.exports.memory as WebAssembly.Memory;
-      while (childMemoryRef.buffer.byteLength < snapshot.memoryBytes.byteLength) {
+      while (
+        childMemoryRef.buffer.byteLength < snapshot.memoryBytes.byteLength
+      ) {
         childMemoryRef.grow(1);
       }
       new Uint8Array(childMemoryRef.buffer, 0, snapshot.memoryBytes.byteLength)
         .set(snapshot.memoryBytes);
 
-      childBridge.initFromInstance(childInstance, snapshot.dataAddr, snapshot.dataSize);
+      childBridge.initFromInstance(
+        childInstance,
+        snapshot.dataAddr,
+        snapshot.dataSize,
+      );
       childBridge.restoreForkSnapshot(snapshot, 0);
       childBridge.setForkController({
         forkFromContinuation: (childSnapshot) =>
@@ -325,16 +380,17 @@ export async function loadProcess(
 
       const table = childInstance.exports.__indirect_function_table;
       if (table instanceof WebAssembly.Table) {
-        const promising =
-          typeof WebAssembly.promising === "function"
-            ? ((fn: unknown) => WebAssembly.promising(fn as Function))
-            : ((fn: unknown) => fn);
+        const promising = typeof WebAssembly.promising === "function"
+          ? ((fn: unknown) => WebAssembly.promising(fn as Function))
+          : ((fn: unknown) => fn);
         childThreadsBackend.setIndirectCallTable(
           makeIndirectCallTable(table, promising),
         );
       }
 
-      const childRawStart = childInstance.exports._start as (() => number) | undefined;
+      const childRawStart = childInstance.exports._start as
+        | (() => number)
+        | undefined;
       const childStartFn = childRawStart
         ? childBridge.wrapExport(childRawStart)
         : undefined;
@@ -457,13 +513,20 @@ function moduleImportsSetjmp(module: WebAssembly.Module): boolean {
   );
 }
 
-function moduleHasYurtFeature(module: WebAssembly.Module, feature: string): boolean {
-  for (const section of WebAssembly.Module.customSections(module, "yurt.features")) {
+function moduleHasYurtFeature(
+  module: WebAssembly.Module,
+  feature: string,
+): boolean {
+  for (
+    const section of WebAssembly.Module.customSections(module, "yurt.features")
+  ) {
     try {
       const decoded = JSON.parse(new TextDecoder().decode(section)) as {
         features?: unknown;
       };
-      if (Array.isArray(decoded.features) && decoded.features.includes(feature)) {
+      if (
+        Array.isArray(decoded.features) && decoded.features.includes(feature)
+      ) {
         return true;
       }
     } catch {
@@ -492,8 +555,12 @@ function initAsyncifyBridge(
     typeof exports.asyncify_get_state === "function";
   if (!hasAsyncifyState) return false;
 
-  const addrExport = exports.yurt_asyncify_buf_addr as (() => number) | undefined;
-  const sizeExport = exports.yurt_asyncify_buf_size as (() => number) | undefined;
+  const addrExport = exports.yurt_asyncify_buf_addr as
+    | (() => number)
+    | undefined;
+  const sizeExport = exports.yurt_asyncify_buf_size as
+    | (() => number)
+    | undefined;
   const alloc = exports.__alloc as ((size: number) => number) | undefined;
 
   let dataAddr: number;
@@ -505,7 +572,9 @@ function initAsyncifyBridge(
     asyncifyBufSize = 65536;
     dataAddr = alloc(asyncifyBufSize);
   } else {
-    throw new Error("asyncify requires yurt_asyncify_buf_addr/size or __alloc exports");
+    throw new Error(
+      "asyncify requires yurt_asyncify_buf_addr/size or __alloc exports",
+    );
   }
 
   const memory = exports.memory as WebAssembly.Memory;

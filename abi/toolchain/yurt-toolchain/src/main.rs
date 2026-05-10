@@ -78,7 +78,22 @@ fn has_compile_or_link_input(user_args: &[String]) -> bool {
 }
 
 fn is_final_yurt_link_invocation(env: &env::Env, user_args: &[String]) -> bool {
-    !env.no_link_injection && !is_compile_or_probe_invocation(user_args)
+    !env.no_link_injection
+        && !is_compile_or_probe_invocation(user_args)
+        && !is_shared_link_invocation(user_args)
+}
+
+/// `yurt-cc -shared` produces a WASM side module per the Phase 1 shared-library
+/// contract (§docs/superpowers/specs/2026-05-09-shared-libraries-design.md).
+/// A side module is a final wasm-ld invocation but it must not bundle the
+/// `libyurt_abi.a` static archive, force-export Tier 1 symbols, wrap WASI
+/// libc, or pull in the WASI emulation libs / `__main_argc_argv` reference —
+/// those are properties of the main module that loads the side module at
+/// run time. The shared-link path keeps clang's normal `-shared` handling and
+/// adds `-Wl,--experimental-pic` so wasm-ld emits a position-independent
+/// `dylink.0`-bearing wasm.
+fn is_shared_link_invocation(user_args: &[String]) -> bool {
+    user_args.iter().any(|a| a == "-shared")
 }
 
 fn default_yurt_include_dir() -> Option<PathBuf> {
@@ -358,6 +373,13 @@ fn build_clang_invocation(
             }
         }
     }
+    if is_shared_link_invocation(user_args)
+        && !contains_exact_arg(user_args, "-Wl,--experimental-pic")
+    {
+        // wasm-ld requires --experimental-pic to honor `-shared` and emit
+        // the dylink.0 custom section that the Phase 1 loader reads.
+        argv.push("-Wl,--experimental-pic".into());
+    }
     // -DYURT_ABI_MARKERS=1 expands the marker macros into
     // their real bodies in yurt_markers.h.  Without it, the macros
     // compile to nothing (no marker functions emitted, marker-call
@@ -470,7 +492,68 @@ fn main() -> Result<ExitCode> {
         }
     }
 
+    // Side-module postlink: `yurt-cc -shared` produces a wasm with a
+    // `dylink.0` custom section. Run yurt-wasi-postlink --side-module
+    // automatically to validate the section and emit the
+    // `<output>.yurtmeta.json` sidecar the Phase 1 loader consumes.
+    // Skipped when the user opts out via YURT_CC_NO_SIDE_MODULE_POSTLINK
+    // (e.g., a build system that runs postlink as a separate make rule
+    // and does not want the redundant invocation).
+    if is_shared_link_invocation(&cli.args)
+        && std::env::var_os("YURT_CC_NO_SIDE_MODULE_POSTLINK").is_none()
+    {
+        if let Some(out_path) = preserve::output_path(&cli.args) {
+            run_side_module_postlink(&out_path).with_context(|| {
+                format!("yurt-wasi-postlink --side-module on {}", out_path.display())
+            })?;
+        }
+    }
+
     Ok(ExitCode::SUCCESS)
+}
+
+/// Locate the `yurt-wasi-postlink` binary alongside `yurt-cc`.
+/// The two ship as workspace siblings; once installed they live in the
+/// same `bin/` directory. Falls back to `target/release/` when invoked
+/// from the build tree.
+fn locate_yurt_wasi_postlink() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("locating yurt-cc binary")?;
+    let bin_dir = exe
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("yurt-cc has no parent directory"))?;
+    let candidate = bin_dir.join(if cfg!(windows) {
+        "yurt-wasi-postlink.exe"
+    } else {
+        "yurt-wasi-postlink"
+    });
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    bail!(
+        "could not locate yurt-wasi-postlink next to yurt-cc at {} \
+         (set YURT_CC_NO_SIDE_MODULE_POSTLINK=1 to skip auto-postlink)",
+        candidate.display()
+    );
+}
+
+fn run_side_module_postlink(wasm: &Path) -> Result<()> {
+    let postlink = locate_yurt_wasi_postlink()?;
+    let status = Command::new(&postlink)
+        .arg("--side-module")
+        .arg("--input")
+        .arg(wasm)
+        .arg("--output")
+        .arg(wasm)
+        .status()
+        .with_context(|| format!("spawning {}", postlink.display()))?;
+    if !status.success() {
+        bail!(
+            "{} --side-module exited with {}",
+            postlink.display(),
+            status.code().unwrap_or(-1)
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

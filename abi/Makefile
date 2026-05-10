@@ -5,10 +5,13 @@
 # libyurt_abi.a per §Override And Link Precedence).
 #
 # Targets:
-#   make lib          — build libyurt_abi.a
-#   make canaries     — build every conformance/c/*-canary.wasm
-#   make all          — lib + canaries
-#   make copy-fixtures — copy canary .wasm into the kernel fixtures dir
+#   make lib                  — build libyurt_abi.a
+#   make canaries             — build every conformance/c/*-canary.wasm
+#   make side-module-canaries — build Phase 1 shared-library side modules
+#                               (NOT in `all` until slice 1C/1D land — see
+#                               docs/superpowers/plans/2026-05-09-shared-libraries-phase1.md)
+#   make all                  — lib + canaries
+#   make copy-fixtures        — copy canary .wasm into the kernel fixtures dir
 #   make clean
 
 REPO_ROOT := $(shell cd .. && pwd)
@@ -31,6 +34,7 @@ SETJMP_LIB := $(BUILD_DIR)/libyurt_setjmp.a
 LIB_OBJS := \
   $(BUILD_DIR)/yurt_command.o \
   $(BUILD_DIR)/yurt_cwd.o \
+  $(BUILD_DIR)/yurt_dlfcn.o \
   $(BUILD_DIR)/yurt_dup.o \
   $(BUILD_DIR)/yurt_exec.o \
   $(BUILD_DIR)/yurt_fetch.o \
@@ -57,13 +61,25 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_version.o \
   $(BUILD_DIR)/yurt_write.o
 
-CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
+CANARY_NAMES := stdio sleep system popen affinity dup2 dlopen getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
 FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 
-.PHONY: all lib canaries copy-fixtures clean ensure-toolchain check-native-abi-contract
+# Phase 1 shared-library side-module fixtures
+# (docs/superpowers/specs/2026-05-09-shared-libraries-design.md). These are
+# NOT linked against libyurt_abi.a; they are built with `yurt-cc -shared`,
+# validated by `yurt-wasi-postlink --side-module`, and consumed by the
+# Phase 1 dlopen loader (which itself lands in slices 1C–1E). Until that
+# loader is wired up, building side modules is opt-in: the
+# `side-module-canaries` target is intentionally NOT a prerequisite of
+# `all`. Run it manually (or in CI when the consumer arrives) via
+# `make -C abi side-module-canaries`.
+SIDE_MODULE_CANARIES := $(BUILD_DIR)/libyurt_dlcanary.wasm
+YURT_WASI_POSTLINK := $(REPO_ROOT)/target/release/yurt-wasi-postlink
 
-all: lib canaries
+.PHONY: all lib canaries copy-fixtures clean ensure-toolchain check-native-abi-contract side-module-canaries
+
+all: lib canaries side-module-canaries
 
 check-native-abi-contract:
 	cd $(REPO_ROOT) && $(DENO) run --allow-read --allow-write scripts/generate-native-abi.ts --check
@@ -75,7 +91,7 @@ $(BUILD_DIR):
 # rebuild. `cargo build` is a near-no-op when everything is up to date;
 # a `test -x` existence guard would silently use stale binaries.
 ensure-toolchain:
-	cd $(REPO_ROOT) && cargo build --release -p yurt-toolchain
+	cd $(REPO_ROOT) && cargo build --release -p yurt-toolchain -p yurt-wasi-postlink
 	rm -rf $(REPO_ROOT)/target/release/yurt-include
 	cp -R $(INCLUDE) $(REPO_ROOT)/target/release/yurt-include
 
@@ -140,9 +156,38 @@ $(BUILD_DIR)/%-canary.wasm: $(CANARY_DIR)/%-canary.c $(wildcard include/*.h) $(L
 
 canaries: $(CANARIES) $(FORK_DEFAULT_CANARY)
 
-copy-fixtures: canaries
+# ── Side-module fixtures (Phase 1 shared libraries) ──────────────────
+# Each side module follows the same two-step build:
+#   1. yurt-cc -fPIC -c     compile with position-independent code
+#   2. yurt-cc -shared      link via wasm-ld --shared --experimental-pic
+#                           (skips libyurt_abi.a injection per slice 1B.1)
+# Then `yurt-wasi-postlink --side-module` validates the dylink.0 custom
+# section emitted by wasm-ld and writes a sidecar manifest the Phase 1
+# loader will consume.
+#
+# Side modules do NOT depend on $(LIB); they have no static ABI archive
+# to link against by definition. They DO depend on the headers in
+# include/ (currently only <stdint.h>-style standard headers, but the
+# rule wildcard keeps incremental rebuilds correct if a header is added).
+$(BUILD_DIR)/libyurt_dlcanary.o: $(CANARY_DIR)/libyurt_dlcanary.c $(wildcard include/*.h) | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) \
+	$(YURT_CC) $(YURT_CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
+
+$(BUILD_DIR)/libyurt_dlcanary.wasm: $(BUILD_DIR)/libyurt_dlcanary.o | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_NO_WASM_OPT=1 \
+	$(YURT_CC) -shared $< -o $@
+	# yurt-cc -shared automatically runs `yurt-wasi-postlink --side-module`
+	# at the end of the link, validating dylink.0 and emitting
+	# $@.yurtmeta.json. No separate postlink invocation needed.
+
+side-module-canaries: $(SIDE_MODULE_CANARIES)
+
+copy-fixtures: canaries side-module-canaries
 	@for n in $(CANARY_NAMES); do cp $(BUILD_DIR)/$$n-canary.wasm $(FIXTURES)/$$n-canary.wasm; done
 	@cp $(FORK_DEFAULT_CANARY) $(FIXTURES)/fork-default-canary.wasm
+	@cp $(BUILD_DIR)/libyurt_dlcanary.wasm $(FIXTURES)/libyurt_dlcanary.wasm
+	@cp $(BUILD_DIR)/libyurt_dlcanary.wasm.yurtmeta.json $(FIXTURES)/libyurt_dlcanary.wasm.yurtmeta.json
 
 clean:
 	rm -rf $(BUILD_DIR)

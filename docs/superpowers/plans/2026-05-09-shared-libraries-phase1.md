@@ -1,0 +1,265 @@
+# Shared Libraries — Phase 1 Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use
+> `superpowers:subagent-driven-development` (recommended) or
+> `superpowers:executing-plans` to implement this plan task-by-task. Steps use
+> checkbox (`- [ ]`) syntax for tracking.
+
+**Spec:**
+[2026-05-09 Shared Libraries Design](../specs/2026-05-09-shared-libraries-design.md)
+
+**Goal:** Land the guest-visible shared-library contract and a correct
+(unoptimized) base implementation that works identically on Wasmtime, Deno/Node,
+and browsers. Performance optimizations are out of scope and covered by a
+follow-up spec.
+
+**Non-goals for Phase 1:**
+
+- Module deduplication, AOT cache, pooling allocator, CoW initial memory,
+  sandbox snapshots — Wasmtime-only optimizations, follow-up spec.
+- Component Model dynamic composition.
+- TLS in side modules.
+
+---
+
+## Slice ordering
+
+Each slice ships independently and gates the next. Sub-slices may parallelize
+where their **Depends on** column allows.
+
+| #  | Slice                                  | Output                                                                                                                                                                                      | Depends on |
+| -- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| 1A | Spec + plan + failing canary skeleton  | This doc; the design spec; canary `.c` and `.spec.toml` committed; Deno tests `it.skip` with TODO; Rust test `#[ignore]`                                                                    | —          |
+| 1B | Toolchain                              | `yurt-cc -fPIC`, `yurt-cc -shared`; `yurt-wasi-postlink` `dylink.0` validator + `yurtmeta.json` emitter                                                                                     | 1A         |
+| 1C | Headers + guest stubs                  | `abi/include/dlfcn.h`; `abi/src/dlfcn.c` calling `yurt_dl*` host imports; main module exports `__alloc`/`__dealloc` available to loader                                                     | 1A         |
+| 1D | Generic loader (Deno + Node + browser) | `packages/kernel/src/process/dynlink.ts`: handle table, dylink.0 parser, instantiation algorithm; host imports in `host-imports/kernel-imports.ts`; canaries pass on Deno/Node and browsers | 1B + 1C    |
+| 1E | Wasmtime backend                       | `packages/runtime-wasmtime/src/wasm/dynlink.rs` mirroring the same contract via Wasmtime APIs; host imports in `mod.rs:977`; canary passes on Wasmtime                                      | 1D         |
+| 1F | Dogfood                                | `libyurt_sched.wasm` side module; affinity-canary rebuilt against the dynamic version; passes existing `sched_*` specs on all backends                                                      | 1D + 1E    |
+
+The contract is observably frozen at the end of 1A. Slices 1B–1F implement the
+contract; if any of them surfaces a contract problem we land an amendment to the
+spec before the slice ships.
+
+---
+
+## Slice 1A — Spec + plan + failing canary skeleton (this commit)
+
+**Files in this slice:**
+
+- Create: `docs/superpowers/specs/2026-05-09-shared-libraries-design.md`
+- Create: `docs/superpowers/plans/2026-05-09-shared-libraries-phase1.md` (this
+  document)
+- Create: `abi/conformance/c/dlopen-canary.c`
+- Modify: `packages/kernel/src/__tests__/abi_test.ts`
+  - Add a `describe.skip('dlopen-canary', ...)` block that documents the cases
+    the canary should cover, with a
+    `TODO: requires
+    yurt-cc -shared (1B) + Wasmtime/Deno loaders (1D, 1E)`
+    comment.
+
+**Tasks:**
+
+- [ ] **Step 1: Land the spec doc.** Already produced; review against the user
+      feedback: "stabilize the ABI; make sure the contract is right and the base
+      implementation works; optimize later, with Wasmtime in mind." Confirm the
+      spec separates contract (Phase 1) from optimization (deferred).
+
+- [ ] **Step 2: Land this plan doc.** Confirms slice ordering and pins the
+      dependency graph.
+
+- [ ] **Step 3: Add `abi/conformance/c/dlopen-canary.c`** following the existing
+      canary template (`abi/conformance/c/dup2-canary.c`). The C source
+      documents the six cases (`happy_path`, `lazy_now_equiv`,
+      `double_open_refcount`, `missing_path`, `missing_symbol`, `bad_format`)
+      and references `<dlfcn.h>` (which itself lands in 1C). The canary is not
+      added to `CANARY_NAMES` in `abi/Makefile` until 1B.
+
+- [ ] **Step 4: Defer `abi/conformance/dlopen.spec.toml` to slice 1B.**
+      `yurt-conf` (the local opt-in conformance runner) hard-fails when a
+      `.spec.toml` exists without a corresponding built canary wasm. The spec
+      doc and the C source already document the cases; the TOML ships in 1B
+      alongside the build wiring.
+
+- [ ] **Step 5: Add a skipped Deno test** under
+      `packages/kernel/src/__tests__/abi_test.ts` that documents the expected
+      end state. Use `describe.ignore` with a comment pointing at this plan and
+      the spec.
+
+- [ ] **Step 6: pre-commit + pre-push.** No code is built in 1A so the gates are
+      paperwork-only: `deno fmt --check`, `deno lint`,
+      `cargo fmt --all -- --check`, hygiene hooks. `cargo test --tests` and the
+      deno test glob must remain green. New canary `.c` is not yet built, so it
+      does not affect `make -C abi all` or `yurt-conf` (no spec.toml → no
+      failure path triggered).
+
+**Definition of done for 1A:** This commit lands on
+`claude/add-shared-libraries-zzuRn`. CI is green. Reviewer can answer "is the
+contract right?" purely from the spec doc + canary cases.
+
+---
+
+## Slice 1B — Toolchain (next commit)
+
+**Files in this slice:**
+
+- Modify: `abi/toolchain/yurt-toolchain/src/main.rs` — add `-fPIC` and `-shared`
+  modes; route `-shared` invocations through
+  `wasm-ld --shared --experimental-pic` plus the new postlink pass.
+- Modify: `abi/toolchain/yurt-wasi-postlink/` — add the `dylink.0` validator
+  pass and `yurtmeta.json` sidecar emitter.
+- Modify: `abi/Makefile` — new rule for side-module canaries; add
+  `dlopen-canary` to `CANARY_NAMES` once the side module `libyurt_dlcanary.wasm`
+  builds; add `libyurt_dlcanary.wasm` recipe.
+- Add: `abi/conformance/c/libyurt_dlcanary.c` (companion side module for
+  `dlopen-canary`; exports `yurt_dlcanary_double`).
+- Add: `abi/conformance/dlopen.spec.toml` — case definitions for the conformance
+  runner. Lands here (not in 1A) so that `yurt-conf` does not hard-fail before
+  the canary wasm is built.
+
+**Definition of done:** `make -C abi canaries` produces
+`build/libyurt_dlcanary.wasm` with a valid `dylink.0` section and a sidecar
+manifest. `yurt-wasi-postlink` rejects malformed `dylink.0` sections in unit
+tests.
+
+---
+
+## Slice 1C — Headers + guest stubs
+
+**Files:**
+
+- Add: `abi/include/dlfcn.h` (per spec § dlfcn API Surface).
+- Add: `abi/src/yurt_dlfcn.c` — guest-side stubs that call
+  `yurt_dlopen`/`yurt_dlsym`/`yurt_dlclose`/`yurt_dlerror`.
+- Modify: `abi/Makefile` — add `yurt_dlfcn.o` to `LIB_OBJS`; the static archive
+  grows by ~1 KB. Existing static-link path unaffected.
+
+**Definition of done:** `make -C abi lib` produces a `libyurt_abi.a` that
+contains `dlopen`/`dlsym`/`dlclose`/`dlerror`. The stubs return `NULL`/`-1` at
+run time when the host has no loader (1D/1E land that). `dup2-canary` and
+friends rebuild without regression.
+
+---
+
+## Slice 1D — Generic loader (Deno + Node + browser)
+
+The loader is runtime-agnostic. It uses only standard
+`WebAssembly.{Module,Instance,Table}` and the host VFS, so the same code runs
+under Deno, Node, and any browser. Wasmtime gets its own backend in 1E that
+observes the same contract.
+
+**Files:**
+
+- Add: `packages/kernel/src/process/dynlink.ts` — handle table, dylink.0 parser,
+  instantiation algorithm (per spec § Loader Algorithm). Mirrors the parser
+  semantics of `abi/toolchain/yurt-wasi-postlink/src/side_module.rs` so the two
+  stay byte-compatible.
+- Modify: `packages/kernel/src/host-imports/kernel-imports.ts` — register
+  `yurt_dlopen`/`yurt_dlsym`/`yurt_dlclose`/`yurt_dlerror` host imports backed
+  by the loader; thread a `mainInstance: () =>
+  WebAssembly.Instance | null`
+  accessor through `KernelImportsOptions` so the loader can call the main
+  module's `__alloc` and grow its `__indirect_function_table`.
+- Modify: `packages/kernel/src/process/loader.ts` and
+  `packages/kernel/src/process/manager.ts` — wire the `mainInstance` ref via the
+  same closure pattern used for `memory`.
+- Add: `packages/kernel/src/process/__tests__/dynlink_test.ts` — parser,
+  handle-table, search-path, and SONAME unit tests.
+
+**Definition of done:** parser/handle-table/search-path tests pass. Existing
+fast-tier tests stay green. The full instantiation happy path is exercised
+end-to-end in slice 1F (dogfood) where a real side module wasm exists; for slice
+1D we rely on the unit-test coverage of the parts that don't need a real wasm
+fixture.
+
+---
+
+## Slice 1E — Wasmtime backend
+
+**Files:**
+
+- Add: `packages/runtime-wasmtime/src/wasm/dynlink.rs` mirroring 1D's algorithm
+  using `wasmtime::Linker::instantiate`, `wasmtime::Module`,
+  `wasmtime::Table::grow`, and `wasmtime::TypedFunc`. Handle table on
+  `StoreData`.
+- Modify: `packages/runtime-wasmtime/src/wasm/mod.rs` — register the same four
+  host imports next to `add_misc_imports` at line 977.
+- Add: `packages/runtime-wasmtime/tests/dlopen.rs` — Rust integration test
+  driving the canary against the Wasmtime backend.
+
+**Definition of done:** `dlopen-canary` passes on Wasmtime with identical
+observable behavior to the generic loader from 1D. Existing canaries still pass.
+`cargo clippy --all-targets -- -D warnings` clean.
+
+---
+
+## Slice 1F — Dogfood
+
+**Files:**
+
+- Add: `abi/src/yurt_sched_pic.c` — same content as the relevant parts of
+  `abi/src/yurt_sched.c` but compiled with `-fPIC` and linked with `-shared`.
+- Modify: `abi/Makefile` — new recipe building `build/libyurt_sched.wasm`.
+  Static `libyurt_abi.a` keeps a strong reference to the same symbols.
+- Add: `abi/conformance/c/affinity-canary-dyn.c` — a variant of
+  `affinity-canary.c` that loads `libyurt_sched.wasm` via `dlopen` and calls
+  into it.
+- Spec: existing `abi/conformance/sched_*.spec.toml` files cover the expected
+  behavior; the dynamic canary asserts the same outputs.
+
+**Definition of done:** `affinity-canary-dyn` passes on all three backends with
+identical observable output to `affinity-canary`. The contract is proven
+end-to-end on a real ABI piece.
+
+---
+
+## Known follow-ons (Phase 1 scope, not in slices 1A–1F)
+
+These are gaps surfaced by the post-slice-1D audit. They belong to the
+Phase 1 contract — the spec already covers them — but their implementation
+is deferred to follow-on slices so we do not compound an already-large PR.
+
+- **Rust side-module path through `cargo-yurt`.** Today `cargo-yurt`
+  always whole-archives `libyurt_abi.a` and force-exports Tier 1.
+  Neither belongs on a Rust crate built as a side module
+  (`crate-type = ["cdylib"]` + `-Wl,--shared --experimental-pic`).
+  Adding a `cargo-yurt --side-module` mode that mirrors `yurt-cc -shared`
+  (skip archive injection, skip Tier 1 exports, run
+  `yurt-wasi-postlink --side-module` after the build) is the natural
+  generalisation. Until it lands, Rust crates that should ship as side
+  modules cannot do so via the standard toolchain — port them through
+  C / `cc-rs` or hand-tune `RUSTFLAGS`.
+- **Auto-loading of main-module `NEEDED` deps before `_start`.** The
+  classical ld.so behavior: when a guest binary itself has a
+  `dylink.0` section listing `NEEDED` libraries, the kernel should
+  walk that list and `dlopen` each entry before invoking `_start`.
+  Phase 1 supports explicit `dlopen` calls; `NEEDED` auto-load is a
+  small loader hook in `packages/kernel/src/process/loader.ts`.
+- **RPATH from the main module's `dylink.0` runtime-path subsection +
+  `LD_LIBRARY_PATH` from sandbox env.** The Phase 1 spec defines both;
+  the current loader resolves only absolute paths and the default
+  `/usr/local/lib`, `/lib`, `/usr/lib` set.
+- **Symlink / `realpath` canonicalisation for SONAME → versioned-file
+  resolution.** Today the loader uses the requested path as the
+  canonical key; opening `libfoo.wasm` and `libfoo.wasm.3.45` (linked
+  via VFS symlinks per the spec) yields two distinct handles instead
+  of the same handle bumping its refcount.
+
+---
+
+## Cross-cutting verification
+
+After each slice the following gates must be green:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --tests`
+- `deno fmt --check`
+- `deno lint`
+- `deno check 'packages/**/*.ts'`
+- `deno test` (fast tier)
+- `make -C abi all` and `copy-fixtures` from 1B onward
+- `guest-compat.yml` (the slow tier) from 1D onward, locally if available,
+  otherwise on PR
+
+"CI green = done" per [`AGENTS.md:11`](../../../AGENTS.md). The bar is
+unchanged.

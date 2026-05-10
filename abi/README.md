@@ -28,8 +28,12 @@ Not included yet:
 
 - full POSIX compatibility
 - full fork/vfork process cloning
-- shared libraries
 - a general network interface/device model
+
+Phase 1 shared-library support (dlopen/dylink.0 for C guests via
+`yurt-cc -shared`) is in flight — see
+[`docs/superpowers/specs/2026-05-09-shared-libraries-design.md`](../docs/superpowers/specs/2026-05-09-shared-libraries-design.md)
+and the `make -C abi side-module-canaries` target.
 
 ## Build canaries
 

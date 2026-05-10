@@ -32,6 +32,12 @@ import {
   createNetworkBridgeSocketBackend,
   recvSocketAsync,
 } from "../network/socket-backend.js";
+import {
+  HandleTable as DynlinkHandleTable,
+  loadSideModule,
+  lookupSymbol,
+  mainAccessFromInstance,
+} from "../process/dynlink.js";
 import type { ExtensionRegistry } from "../extension/registry.js";
 import type { NativeModuleRegistry } from "../process/native-modules.js";
 import type {
@@ -141,6 +147,19 @@ export interface KernelImportsOptions {
 
   /** Process manager for tool registry (host_has_tool, host_register_tool). */
   mgr?: ProcessManager;
+
+  /**
+   * Lazy accessor for the main module's instance. Used by the Phase 1
+   * shared-library loader to call `__alloc`, grow the
+   * `__indirect_function_table`, and reuse `memory` when instantiating
+   * a side module. The accessor is invoked AFTER the main module
+   * finishes instantiating (which is necessarily after
+   * `createKernelImports` has returned), so callers wire it via a
+   * captured ref-cell or proxy. Returns `null` if dlopen is invoked
+   * before the main module is ready (the loader treats that as an
+   * error). See packages/kernel/src/process/dynlink.ts.
+   */
+  mainInstance?: () => WebAssembly.Instance | null;
 }
 
 const ERR_NOT_FOUND = -1;
@@ -856,6 +875,42 @@ export function createKernelImports(
       };
     }
     return { ok: true, mapping };
+  }
+
+  // ── Phase 1 dlopen state (per-sandbox) ──
+  // Spec: docs/superpowers/specs/2026-05-09-shared-libraries-design.md.
+  // The handle table owns loaded side-module instances; lastDlError
+  // is drained by yurt_dlerror per POSIX dlerror semantics. The string
+  // helpers reused here (readString) are imported from common.ts.
+  const dlHandleTable = new DynlinkHandleTable();
+  let lastDlError = "";
+
+  // The yurt-namespace imports are forwarded to side modules so they
+  // can call the same host imports the main module uses. The closure
+  // below captures the `imports` record after it is fully built —
+  // dlopen runs from inside a host import call, so by then the record
+  // exists and is populated.
+  function getYurtImportSnapshot(): WebAssembly.ModuleImports {
+    return imports as WebAssembly.ModuleImports;
+  }
+
+  function makeDlVfsLookup(vfs: VfsLike) {
+    return {
+      readFile(
+        path: string,
+      ): { bytes: Uint8Array; canonicalPath: string } | undefined {
+        try {
+          const bytes = vfs.readFile(path);
+          // Phase 1 base: canonical path is the requested absolute
+          // path. Symlink resolution / realpath promotion is a
+          // follow-on; the dlopen-canary uses absolute paths so the
+          // canary case set is fully covered without it.
+          return { bytes, canonicalPath: path };
+        } catch {
+          return undefined;
+        }
+      },
+    };
   }
 
   const imports: Record<string, WebAssembly.ImportValue> = {
@@ -2856,6 +2911,78 @@ export function createKernelImports(
     host_write_result(resultPtr: number, resultLen: number): void {
       void resultPtr;
       void resultLen;
+    },
+
+    // ── Phase 1 shared-library loader ──
+    // Spec: docs/superpowers/specs/2026-05-09-shared-libraries-design.md.
+    // The four yurt_dl* imports back the dlfcn surface in
+    // abi/include/dlfcn.h via the guest stubs in abi/src/yurt_dlfcn.c.
+    // Errors set lastDlError; dlerror() drains it.
+
+    yurt_dlopen(pathPtr: number, pathLen: number, flags: number): number {
+      const path = readString(memory, pathPtr, pathLen);
+      const vfs = opts.vfs;
+      if (!vfs) {
+        lastDlError = "dlopen: no vfs available";
+        return 0;
+      }
+      try {
+        const handle = loadSideModule(path, dlHandleTable, {
+          flags,
+          vfs: makeDlVfsLookup(vfs),
+          yurtImports: getYurtImportSnapshot(),
+          mainAccess: () => {
+            const inst = opts.mainInstance?.() ?? null;
+            return inst === null ? undefined : mainAccessFromInstance(inst);
+          },
+        });
+        lastDlError = "";
+        return handle;
+      } catch (e) {
+        lastDlError = e instanceof Error ? e.message : String(e);
+        return 0;
+      }
+    },
+
+    yurt_dlsym(handle: number, namePtr: number, nameLen: number): number {
+      const loaded = dlHandleTable.get(handle);
+      if (!loaded) {
+        lastDlError = `dlsym: invalid handle ${handle}`;
+        return -1;
+      }
+      const name = readString(memory, namePtr, nameLen);
+      const result = lookupSymbol(loaded, name);
+      if (result < 0) {
+        lastDlError = `undefined symbol: ${name}`;
+        return -1;
+      }
+      lastDlError = "";
+      return result;
+    },
+
+    yurt_dlclose(handle: number): number {
+      const result = dlHandleTable.release(handle);
+      if (result < 0) {
+        lastDlError = `dlclose: invalid handle ${handle}`;
+        return -1;
+      }
+      lastDlError = "";
+      return 0;
+    },
+
+    yurt_dlerror(outPtr: number, outCap: number): number {
+      if (lastDlError === "") return 0;
+      const buf = new TextEncoder().encode(lastDlError);
+      const view = new Uint8Array(
+        memory.buffer,
+        outPtr,
+        Math.min(buf.length, outCap),
+      );
+      view.set(buf.subarray(0, view.length));
+      const written = buf.length;
+      // POSIX dlerror semantics: drain on read.
+      lastDlError = "";
+      return written;
     },
   };
 
