@@ -36,6 +36,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_DRAIN_STDOUT => drain_stream(request, response, /*stdout=*/ true),
         METHOD_KERNEL_DRAIN_STDERR => drain_stream(request, response, /*stdout=*/ false),
         METHOD_KERNEL_REGISTER_FILE => register_file(request),
+        METHOD_KERNEL_SET_ARGV => set_argv(request),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
@@ -706,6 +707,34 @@ fn register_file(request: &[u8]) -> i64 {
         if let Some((mount_id, inode)) = k.vfs.create(&path) {
             let _ = k.vfs.write(mount_id, inode, 0, &content);
         }
+    });
+    0
+}
+
+/// `kernel_set_argv(target_pid, [(arg_len, arg_bytes)…])`. Microkernel-
+/// only; populates Process.argv so /proc/<pid>/cmdline + comm have
+/// content to serve.
+fn set_argv(request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let pid = u32::from_le_bytes(request[0..4].try_into().unwrap());
+    let mut cursor = 4usize;
+    let mut argv: Vec<Vec<u8>> = Vec::new();
+    while cursor < request.len() {
+        if request.len() - cursor < 4 {
+            return -(abi::EINVAL as i64);
+        }
+        let len = u32::from_le_bytes(request[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        if request.len() - cursor < len {
+            return -(abi::EINVAL as i64);
+        }
+        argv.push(request[cursor..cursor + len].to_vec());
+        cursor += len;
+    }
+    with_kernel(|k| {
+        k.process_mut(pid).argv = argv;
     });
     0
 }
@@ -2265,6 +2294,73 @@ mod tests {
             dispatch(METHOD_SYS_WRITE, 3, &w, &mut []),
             -(abi::EBADF as i64)
         );
+    }
+
+    /// Helper for set_argv: pack pid + (u32 len + bytes)* like the
+    /// kernel_set_argv wire format expects.
+    fn set_argv_req(pid: u32, args: &[&[u8]]) -> Vec<u8> {
+        let mut req = pid.to_le_bytes().to_vec();
+        for a in args {
+            req.extend_from_slice(&(a.len() as u32).to_le_bytes());
+            req.extend_from_slice(a);
+        }
+        req
+    }
+
+    #[test]
+    fn proc_cmdline_serves_null_separated_argv() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Touch pid 4 to register it, then push argv.
+        assert_eq!(dispatch(METHOD_SYS_GETUID, 4, &[], &mut []), 1000);
+        let req = set_argv_req(4, &[b"/usr/bin/zsh", b"-l", b"-c", b"echo hi"]);
+        assert_eq!(dispatch(METHOD_KERNEL_SET_ARGV, 0, &req, &mut []), 0);
+
+        let fd = dispatch(METHOD_SYS_OPEN, 4, &open_req(0, b"/proc/4/cmdline"), &mut []);
+        let mut buf = [0u8; 64];
+        let n = dispatch(METHOD_SYS_READ, 4, &(fd as u32).to_le_bytes(), &mut buf);
+        let bytes = &buf[..n as usize];
+        // Linux convention: NUL-separated, no trailing NL.
+        let expected: &[u8] = b"/usr/bin/zsh\0-l\0-c\0echo hi\0";
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn proc_comm_is_basename_of_argv0() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(dispatch(METHOD_SYS_GETUID, 8, &[], &mut []), 1000);
+        let req = set_argv_req(8, &[b"/bin/cat"]);
+        dispatch(METHOD_KERNEL_SET_ARGV, 0, &req, &mut []);
+
+        let fd = dispatch(METHOD_SYS_OPEN, 8, &open_req(0, b"/proc/8/comm"), &mut []);
+        let mut buf = [0u8; 32];
+        let n = dispatch(METHOD_SYS_READ, 8, &(fd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"cat\n");
+    }
+
+    #[test]
+    fn proc_cwd_serves_chdir_path() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Set cwd via sys_chdir, then read /proc/<N>/cwd.
+        assert_eq!(dispatch(METHOD_SYS_CHDIR, 11, b"/var/tmp", &mut []), 0);
+
+        let fd = dispatch(METHOD_SYS_OPEN, 11, &open_req(0, b"/proc/11/cwd"), &mut []);
+        let mut buf = [0u8; 64];
+        let n = dispatch(METHOD_SYS_READ, 11, &(fd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"/var/tmp");
+    }
+
+    #[test]
+    fn proc_status_includes_name_when_argv_present() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(dispatch(METHOD_SYS_GETUID, 6, &[], &mut []), 1000);
+        let req = set_argv_req(6, &[b"/usr/bin/ls"]);
+        dispatch(METHOD_KERNEL_SET_ARGV, 0, &req, &mut []);
+
+        let fd = dispatch(METHOD_SYS_OPEN, 6, &open_req(0, b"/proc/6/status"), &mut []);
+        let mut buf = [0u8; 256];
+        let n = dispatch(METHOD_SYS_READ, 6, &(fd as u32).to_le_bytes(), &mut buf);
+        let text = std::str::from_utf8(&buf[..n as usize]).unwrap();
+        assert!(text.contains("Name:\tls\n"), "expected Name:\\tls in: {text}");
     }
 
     #[test]

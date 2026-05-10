@@ -424,6 +424,25 @@ Deno.test(
   },
 );
 
+Deno.test(
+  "proc-cmdline fixture reads /proc/self/cmdline through the WASI shim",
+  async () => {
+    const wasm = await fixtureWasm("proc-cmdline-wasm", "proc-cmdline-wasm");
+    const mk = await freshMicrokernel();
+    const argv = [
+      s("/usr/bin/proc-cmdline"),
+      s("--flag"),
+      s("value"),
+    ];
+    const user = mk.spawnUserProcessWithArgs(wasm, argv);
+    captureProcExit(user);
+    assertEquals(
+      user.capturedStdout(),
+      s("/usr/bin/proc-cmdline\0--flag\0value\0"),
+    );
+  },
+);
+
 Deno.test("cat-stdin fixture echoes stdin to stdout", async () => {
   const wasm = await fixtureWasm("cat-stdin-wasm", "cat-stdin-wasm");
   const mk = await freshMicrokernel();

@@ -92,6 +92,7 @@ const METHOD_KERNEL_CLOSE_STDIN: u32 = 5;
 const METHOD_KERNEL_DRAIN_STDOUT: u32 = 6;
 const METHOD_KERNEL_DRAIN_STDERR: u32 = 7;
 const METHOD_KERNEL_REGISTER_FILE: u32 = 8;
+const METHOD_KERNEL_SET_ARGV: u32 = 9;
 
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
@@ -392,6 +393,17 @@ impl Microkernel {
         drop(next);
 
         let argv: Vec<Vec<u8>> = argv.iter().map(|s| s.as_ref().to_vec()).collect();
+
+        // Push argv to the kernel so /proc/<pid>/cmdline + comm have
+        // content to serve. Format: u32 pid + (u32 len + bytes)*.
+        let mut req = Vec::with_capacity(4 + argv.iter().map(|a| 4 + a.len()).sum::<usize>());
+        req.extend_from_slice(&pid.to_le_bytes());
+        for a in &argv {
+            req.extend_from_slice(&(a.len() as u32).to_le_bytes());
+            req.extend_from_slice(a);
+        }
+        self.syscall(METHOD_KERNEL_SET_ARGV, &req, &mut [])?;
+
         let user_state = UserState {
             kernel: self.kernel.clone(),
             pid,

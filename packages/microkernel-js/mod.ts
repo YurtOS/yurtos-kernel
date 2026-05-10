@@ -59,6 +59,7 @@ export const METHOD = {
   KERNEL_DRAIN_STDOUT: 6,
   KERNEL_DRAIN_STDERR: 7,
   KERNEL_REGISTER_FILE: 8,
+  KERNEL_SET_ARGV: 9,
   SYS_GETUID: 0x1_0001,
   SYS_GETEUID: 0x1_0002,
   SYS_GETGID: 0x1_0003,
@@ -419,6 +420,22 @@ export class Microkernel {
   ): UserProcess {
     const pid = this.nextPid++;
     const userMemoryRef: { memory?: WebAssembly.Memory } = {};
+
+    // Push argv to the kernel so /proc/<pid>/cmdline + comm have
+    // content to serve. Format: u32 pid + (u32 arg_len + arg_bytes)*.
+    let argvSize = 4;
+    for (const a of argv) argvSize += 4 + a.byteLength;
+    const argvReq = new Uint8Array(argvSize);
+    const argvView = new DataView(argvReq.buffer);
+    argvView.setUint32(0, pid >>> 0, true);
+    let cursor = 4;
+    for (const a of argv) {
+      argvView.setUint32(cursor, a.byteLength >>> 0, true);
+      cursor += 4;
+      argvReq.set(a, cursor);
+      cursor += a.byteLength;
+    }
+    this.kernel.syscall(METHOD.KERNEL_SET_ARGV, KERNEL_PID, argvReq, 0);
 
     const sysImports = buildSysImports(pid, this.kernel, userMemoryRef);
     // sys_setrlimit takes (i32, i64, i64); BigInt at the wasm boundary

@@ -185,6 +185,11 @@ pub struct Process {
     /// in nanoseconds. Same Phase 2 observability rationale as
     /// `yield_count`.
     pub last_nanosleep_ns: u64,
+    /// argv as raw bytes per arg. Set at spawn time via
+    /// `kernel_set_argv`; surfaces through /proc/<pid>/cmdline and
+    /// /proc/<pid>/comm. Empty if the microkernel never registered
+    /// it (e.g. tests that hit the kernel directly).
+    pub argv: Vec<Vec<u8>>,
 }
 
 impl Default for Process {
@@ -205,6 +210,7 @@ impl Default for Process {
             signal_dispositions: [0; 63],
             yield_count: 0,
             last_nanosleep_ns: 0,
+            argv: Vec::new(),
         }
     }
 }
@@ -361,6 +367,8 @@ impl Kernel {
                 egid: p.credentials.egid,
                 pgid: if p.pgid == 0 { *pid } else { p.pgid },
                 sid: if p.sid == 0 { *pid } else { p.sid },
+                argv: p.argv.clone(),
+                cwd: p.cwd.clone(),
             })
             .collect();
         self.vfs.refresh_processes(&snaps);

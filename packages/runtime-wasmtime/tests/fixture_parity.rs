@@ -182,6 +182,25 @@ fn cat_ramfs_fixture_reads_through_wasi_path_open() {
 }
 
 #[test]
+fn proc_cmdline_fixture_round_trips_argv() {
+    // End-to-end: spawn a real wasm with argv → microkernel pushes
+    // argv to kernel via kernel_set_argv → /proc/self/cmdline serves
+    // it back NUL-separated → process prints it through fd_write.
+    ensure_fixture_built("proc-cmdline-wasm");
+    let wasm_bytes = std::fs::read(fixture_wasm_path("proc-cmdline-wasm")).unwrap();
+    let mk = fresh_microkernel();
+    let argv: Vec<&[u8]> = vec![b"/usr/bin/proc-cmdline", b"--flag", b"value"];
+    let mut user = mk.spawn_user_process_with_args(&wasm_bytes, &argv).unwrap();
+    let _ = user.run_start();
+
+    let stdout = user.captured_stdout().unwrap();
+    assert_eq!(
+        stdout, b"/usr/bin/proc-cmdline\0--flag\0value\0",
+        "/proc/self/cmdline should serve NUL-separated argv"
+    );
+}
+
+#[test]
 fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     ensure_fixture_built("false-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("false-cmd-wasm")).unwrap();

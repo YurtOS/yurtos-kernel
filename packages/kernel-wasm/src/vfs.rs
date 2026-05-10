@@ -43,6 +43,12 @@ pub struct ProcessSnapshot {
     pub egid: u32,
     pub pgid: u32,
     pub sid: u32,
+    /// argv as raw bytes per arg. Empty if the microkernel never
+    /// pushed an argv for this pid via `kernel_set_argv`.
+    pub argv: Vec<Vec<u8>>,
+    /// Working directory raw bytes (no UTF-8 guarantee). Defaults to
+    /// `/`.
+    pub cwd: Vec<u8>,
 }
 
 /// What every concrete filesystem backend implements. The kernel
@@ -470,6 +476,11 @@ impl ProcBackend {
     /// Format the per-pid status content. Linux-shaped subset.
     fn format_status(p: &ProcessSnapshot) -> Vec<u8> {
         let mut s = String::new();
+        // /proc/<pid>/comm equivalent for status (Name:) is the
+        // basename of argv[0], like Linux.
+        if let Some(name) = comm_from_argv(&p.argv) {
+            s.push_str(&format!("Name:\t{}\n", name));
+        }
         s.push_str(&format!("Pid:\t{}\n", p.pid));
         s.push_str(&format!("PPid:\t{}\n", p.ppid));
         // Real / effective / saved (we don't track saved yet — repeat euid)
@@ -479,6 +490,45 @@ impl ProcBackend {
         s.push_str(&format!("Sid:\t{}\n", p.sid));
         s.into_bytes()
     }
+
+    /// Format /proc/<pid>/cmdline: argv concatenated with NUL
+    /// separators, no trailing newline. Linux convention.
+    fn format_cmdline(p: &ProcessSnapshot) -> Vec<u8> {
+        let mut out = Vec::new();
+        for arg in &p.argv {
+            out.extend_from_slice(arg);
+            out.push(0);
+        }
+        out
+    }
+
+    /// Format /proc/<pid>/comm: basename of argv[0] + trailing newline.
+    fn format_comm(p: &ProcessSnapshot) -> Vec<u8> {
+        let mut out = comm_from_argv(&p.argv)
+            .map(|s| s.into_bytes())
+            .unwrap_or_default();
+        out.push(b'\n');
+        out
+    }
+
+    /// Format /proc/<pid>/cwd as a regular file containing the cwd
+    /// path bytes. Real Linux exposes /proc/<pid>/cwd as a symlink;
+    /// we don't have symlinks yet so we surface the path as content.
+    fn format_cwd(p: &ProcessSnapshot) -> Vec<u8> {
+        p.cwd.clone()
+    }
+}
+
+/// First-component basename of argv[0] as a UTF-8-lossy String, or
+/// None if argv is empty. Used for Name:/comm output.
+fn comm_from_argv(argv: &[Vec<u8>]) -> Option<String> {
+    let first = argv.first()?;
+    let last_slash = first.iter().rposition(|&b| b == b'/');
+    let basename: &[u8] = match last_slash {
+        Some(i) => &first[i + 1..],
+        None => first,
+    };
+    Some(String::from_utf8_lossy(basename).into_owned())
 }
 
 impl Default for ProcBackend {
@@ -532,17 +582,27 @@ impl VfsBackend for ProcBackend {
         // intact so any open fd survives a refresh.
         let mut new_entries: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
         for snap in snapshots {
-            let path = format!("/{}/status", snap.pid).into_bytes();
-            let id = match self.inodes.get(&path) {
-                Some(&id) => id,
-                None => {
-                    let id = self.next_id;
-                    self.next_id += 1;
-                    self.inodes.insert(path.clone(), id);
-                    id
-                }
-            };
-            new_entries.insert(path, (id, Self::format_status(snap)));
+            // Per-pid files we synthesize. Each is a (suffix, content)
+            // pair; we mint stable inode ids per absolute path.
+            let files: [(&str, Vec<u8>); 4] = [
+                ("status", Self::format_status(snap)),
+                ("cmdline", Self::format_cmdline(snap)),
+                ("comm", Self::format_comm(snap)),
+                ("cwd", Self::format_cwd(snap)),
+            ];
+            for (name, content) in files {
+                let path = format!("/{}/{}", snap.pid, name).into_bytes();
+                let id = match self.inodes.get(&path) {
+                    Some(&id) => id,
+                    None => {
+                        let id = self.next_id;
+                        self.next_id += 1;
+                        self.inodes.insert(path.clone(), id);
+                        id
+                    }
+                };
+                new_entries.insert(path, (id, content));
+            }
         }
         self.entries = new_entries;
     }
