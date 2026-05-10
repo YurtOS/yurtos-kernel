@@ -77,6 +77,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_LSEEK => lseek(caller_pid, request, response),
         METHOD_SYS_FSTAT => fstat(caller_pid, request, response),
         METHOD_SYS_CHMOD => chmod(caller_pid, request),
+        METHOD_SYS_CHOWN => chown(caller_pid, request),
+        METHOD_SYS_UTIMENS => utimens(caller_pid, request),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -986,6 +988,58 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         response[8..12].copy_from_slice(&filetype.to_le_bytes());
         response[12..16].copy_from_slice(&mode.to_le_bytes());
         16
+    })
+}
+
+/// `chown(uid, gid, path) -> 0 or -ENOENT`. Request: u32 uid + u32
+/// gid + path bytes. Sandbox-view only — underlying host storage's
+/// owner is unchanged.
+fn chown(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let uid = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let gid = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let path = &request[8..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| {
+        let (mount_id, inode) = match k.vfs.open(path, 0) {
+            Some(pair) => pair,
+            None => return -(abi::ENOENT as i64),
+        };
+        let mut meta = k.resolve_metadata(mount_id, inode);
+        meta.uid = uid;
+        meta.gid = gid;
+        k.set_metadata_override(mount_id, inode, meta);
+        0
+    })
+}
+
+/// `utimens(mtime_ns, path) -> 0 or -ENOENT`. Phase 6 surfaces
+/// mtime only; atime tracking lands later.
+fn utimens(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let mtime_ns =
+        u64::from_le_bytes(request[0..8].try_into().expect("8 bytes"));
+    let path = &request[8..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| {
+        let (mount_id, inode) = match k.vfs.open(path, 0) {
+            Some(pair) => pair,
+            None => return -(abi::ENOENT as i64),
+        };
+        let mut meta = k.resolve_metadata(mount_id, inode);
+        meta.mtime_ns = mtime_ns;
+        k.set_metadata_override(mount_id, inode, meta);
+        0
     })
 }
 
@@ -2731,6 +2785,97 @@ mod tests {
             dispatch(METHOD_SYS_CHMOD, 1, &creq, &mut []),
             -(abi::ENOENT as i64)
         );
+    }
+
+    #[test]
+    fn chown_writes_uid_gid_to_overlay() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        reg.extend_from_slice(b"/co");
+        reg.extend_from_slice(b"x");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let mut req = Vec::new();
+        req.extend_from_slice(&1234_u32.to_le_bytes()); // uid
+        req.extend_from_slice(&5678_u32.to_le_bytes()); // gid
+        req.extend_from_slice(b"/co");
+        assert_eq!(dispatch(METHOD_SYS_CHOWN, 1, &req, &mut []), 0);
+
+        // Verify via the kernel-side resolve_metadata helper.
+        let meta = crate::kernel::with_kernel(|k| {
+            let pair = k.vfs.open(b"/co", 0).unwrap();
+            k.resolve_metadata(pair.0, pair.1)
+        });
+        assert_eq!(meta.uid, 1234);
+        assert_eq!(meta.gid, 5678);
+    }
+
+    #[test]
+    fn utimens_writes_mtime_to_overlay() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        reg.extend_from_slice(b"/ut");
+        reg.extend_from_slice(b"x");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let mut req = Vec::new();
+        let want_ns: u64 = 1_700_000_000_000_000_000;
+        req.extend_from_slice(&want_ns.to_le_bytes());
+        req.extend_from_slice(b"/ut");
+        assert_eq!(dispatch(METHOD_SYS_UTIMENS, 1, &req, &mut []), 0);
+
+        let meta = crate::kernel::with_kernel(|k| {
+            let pair = k.vfs.open(b"/ut", 0).unwrap();
+            k.resolve_metadata(pair.0, pair.1)
+        });
+        assert_eq!(meta.mtime_ns, want_ns);
+    }
+
+    #[test]
+    fn tar_layer_default_metadata_comes_from_header() {
+        // Build a tar with a custom mode + uid + gid in the header.
+        let _g = crate::kernel::TestGuard::acquire();
+        let archive = {
+            let mut buf: Vec<u8> = Vec::new();
+            {
+                let mut builder = tar::Builder::new(&mut buf);
+                let content: &[u8] = b"sh-script";
+                let mut header = tar::Header::new_gnu();
+                header.set_size(content.len() as u64);
+                header.set_mode(0o755);
+                header.set_uid(2000);
+                header.set_gid(3000);
+                header.set_mtime(1_500_000_000);
+                header.set_cksum();
+                builder.append_data(&mut header, "bin/sh", content).unwrap();
+                builder.finish().unwrap();
+            }
+            buf
+        };
+        let prefix: &[u8] = b"/tmeta";
+        let mut req = (prefix.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(prefix);
+        req.extend_from_slice(&archive);
+        dispatch(METHOD_KERNEL_INSTALL_TAR_LAYER, 0, &req, &mut []);
+
+        // fstat /tmeta/bin/sh — mode/uid/gid come from tar header.
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/tmeta/bin/sh"), &mut []);
+        let mut out = [0u8; 16];
+        dispatch(METHOD_SYS_FSTAT, 1, &(fd as u32).to_le_bytes(), &mut out);
+        let mode = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        assert_eq!(mode, 0o100_755, "tar mode bits surface via fstat");
+
+        // Direct resolve_metadata check for uid/gid (not in fstat
+        // wire format yet).
+        let meta = crate::kernel::with_kernel(|k| {
+            let pair = k.vfs.open(b"/tmeta/bin/sh", 0).unwrap();
+            k.resolve_metadata(pair.0, pair.1)
+        });
+        assert_eq!(meta.uid, 2000);
+        assert_eq!(meta.gid, 3000);
+        assert_eq!(meta.mtime_ns, 1_500_000_000_000_000_000);
     }
 
     #[test]

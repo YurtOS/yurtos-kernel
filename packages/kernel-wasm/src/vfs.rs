@@ -918,6 +918,11 @@ pub struct TarLayerBackend {
     /// path → stable inode id. Index is monotonic so opens of the
     /// same path return the same inode across the backend's life.
     inodes: BTreeMap<Vec<u8>, u64>,
+    /// inode → metadata as the tar header reported it. Surface
+    /// these via `default_metadata` so fstat without a chmod
+    /// override still reflects the image-builder's intent
+    /// (e.g. `/bin/python` arrives 0o755).
+    metadata: BTreeMap<u64, Metadata>,
     next_id: u64,
 }
 
@@ -929,10 +934,8 @@ impl TarLayerBackend {
     pub fn new(archive: Vec<u8>) -> Self {
         let mut files: BTreeMap<Vec<u8>, (u64, u64)> = BTreeMap::new();
         let mut inodes: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut metadata: BTreeMap<u64, Metadata> = BTreeMap::new();
         let mut next_id: u64 = 1;
-        // tar::Archive walks the headers; raw_file_position gives
-        // us the byte offset of each entry's data within the
-        // archive bytes — exactly what we need to slice on read.
         let mut ar = tar::Archive::new(&archive[..]);
         if let Ok(entries) = ar.entries() {
             for entry in entries.flatten() {
@@ -942,9 +945,6 @@ impl TarLayerBackend {
                 }
                 let Ok(path) = entry.path() else { continue };
                 let path_str = path.to_string_lossy().into_owned();
-                // Normalize to leading `/`. Tar stores paths
-                // typically as "etc/motd" — we want "/etc/motd"
-                // so the lookup matches what the user wrote.
                 let mut p = if path_str.starts_with('/') {
                     path_str.into_bytes()
                 } else {
@@ -953,25 +953,46 @@ impl TarLayerBackend {
                     v.extend_from_slice(path_str.as_bytes());
                     v
                 };
-                // Strip trailing slash if any (directory entries
-                // shouldn't reach here because of the type check
-                // above, but be defensive).
                 if p.ends_with(b"/") {
                     p.pop();
                 }
                 let offset = entry.raw_file_position();
                 let len = header.size().unwrap_or(0);
-                if !files.contains_key(&p) {
-                    inodes.insert(p.clone(), next_id);
+                let inode_id = if let Some(&existing) = inodes.get(&p) {
+                    existing
+                } else {
+                    let id = next_id;
                     next_id += 1;
-                }
+                    inodes.insert(p.clone(), id);
+                    id
+                };
                 files.insert(p, (offset, len));
+                // Capture the header's view of metadata. Tar carries
+                // POSIX-shaped uid/gid/mode + mtime; we store it raw
+                // and let `default_metadata` surface it. mode bits
+                // come back as the file-perm portion only; we OR in
+                // 0o100000 to mark it as a regular file (the tar
+                // entry-type filter above already restricts to that).
+                let uid = header.uid().unwrap_or(0) as u32;
+                let gid = header.gid().unwrap_or(0) as u32;
+                let mode_bits = header.mode().unwrap_or(0o644) & 0o7777;
+                let mtime = header.mtime().unwrap_or(0).saturating_mul(1_000_000_000);
+                metadata.insert(
+                    inode_id,
+                    Metadata {
+                        uid,
+                        gid,
+                        mode: 0o100_000 | mode_bits,
+                        mtime_ns: mtime,
+                    },
+                );
             }
         }
         Self {
             archive,
             files,
             inodes,
+            metadata,
             next_id,
         }
     }
@@ -1022,6 +1043,10 @@ impl VfsBackend for TarLayerBackend {
             .find(|(_p, &id)| id == inode)
             .and_then(|(p, _)| self.files.get(p))
             .map(|&(_off, len)| len)
+    }
+
+    fn default_metadata(&self, inode: u64) -> Option<Metadata> {
+        self.metadata.get(&inode).copied()
     }
 }
 

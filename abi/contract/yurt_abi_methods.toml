@@ -267,3 +267,13 @@ doc = "POSIX fstat (subset). Request bytes: u32 fd LE. Response: 16 bytes — u6
 id = 0x1_0022
 kind = "syscall"
 doc = "POSIX chmod(path, mode). Request bytes: u32 mode LE + path bytes. Writes to the kernel's MetadataOverlay so subsequent fstat reflects the new mode regardless of underlying storage (matters for HostFs / YURTFS L2 where on-disk metadata is the host user's). Phase 6: no permission checks — userland can chmod any path it can open. Returns 0 on success, -ENOENT if the path doesn't resolve."
+
+[method.sys_chown]
+id = 0x1_0023
+kind = "syscall"
+doc = "POSIX chown(path, uid, gid). Request bytes: u32 uid LE + u32 gid LE + path bytes. Writes uid/gid to the MetadataOverlay; underlying storage's owner is unchanged (host fs file stays owned by the microkernel's host user — this is sandbox-view ownership only). Phase 6: no permission checks. Returns 0 on success, -ENOENT for unresolvable path."
+
+[method.sys_utimens]
+id = 0x1_0024
+kind = "syscall"
+doc = "POSIX utimens-style mtime update. Request bytes: u64 mtime_ns LE + path bytes. Writes mtime to the MetadataOverlay. atime is not tracked separately yet — Phase 6 only surfaces mtime through fstat. Returns 0 on success, -ENOENT for unresolvable path."
