@@ -1589,3 +1589,335 @@ export class Microkernel {
 export function s(value: string): Uint8Array {
   return new TextEncoder().encode(value);
 }
+
+// ── Universal browser-friendly impls ──────────────────────────────────
+//
+// These work in any host that ships the matching standard JS APIs:
+// browsers always; Deno where the API exists (fetch + WebSocket).
+// Browser-only APIs (IndexedDB, OPFS) feature-detect at construction
+// time and throw a clear error in environments where they're absent.
+
+/**
+ * Universal `HostState.fetch` impl that wraps `globalThis.fetch`
+ * with the JSON request/response encoding `network::fetch` speaks.
+ * Works in browsers, Deno, Bun, Node 18+. When installed with
+ * JSPI available, kh_fetch_blocking suspends the calling wasm.
+ */
+export async function globalFetch(
+  request: Uint8Array,
+): Promise<Uint8Array> {
+  const reqStr = new TextDecoder().decode(request);
+  let req: {
+    url: string;
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  };
+  try {
+    req = JSON.parse(reqStr);
+  } catch (e) {
+    return new TextEncoder().encode(JSON.stringify({
+      ok: false,
+      status: 0,
+      headers: {},
+      body: "",
+      error: `invalid request JSON: ${e}`,
+    }));
+  }
+  try {
+    const resp = await fetch(req.url, {
+      method: req.method ?? "GET",
+      headers: req.headers,
+      body: req.body,
+    });
+    const headers: Record<string, string> = {};
+    for (const [k, v] of resp.headers.entries()) headers[k] = v;
+    const bodyBytes = new Uint8Array(await resp.arrayBuffer());
+    const body = new TextDecoder("utf-8", { fatal: false }).decode(bodyBytes);
+    return new TextEncoder().encode(JSON.stringify({
+      ok: resp.ok,
+      status: resp.status,
+      headers,
+      body,
+      error: null,
+    }));
+  } catch (e) {
+    return new TextEncoder().encode(JSON.stringify({
+      ok: false,
+      status: 0,
+      headers: {},
+      body: "",
+      error: `${e}`,
+    }));
+  }
+}
+
+/**
+ * `TcpSocketImpl` that uses `WebSocket` as the transport. Suitable
+ * for browsers (where raw TCP isn't available) and any host that
+ * ships the WebSocket constructor. Connect maps the requested
+ * `host:port` to a `ws://host:port/` URL by default; embedders
+ * that need a different URL scheme override `urlForAddr`.
+ *
+ * Outbound only. Inbound (listen / accept) requires a page-side
+ * relay callback per the project_listen_port_mapping memory note.
+ */
+export class WebSocketTcp implements TcpSocketImpl {
+  private nextHandle = 1;
+  private sockets = new Map<number, WebSocket>();
+  // Buffered inbound bytes per handle; recvAsync drains them.
+  private inbox = new Map<number, Uint8Array[]>();
+  // Pending recv resolvers when inbox is empty and the caller is awaiting.
+  private waiters = new Map<number, (n: number) => void>();
+  // Tells recv whether the socket is closed (for EOF semantics).
+  private closed = new Set<number>();
+
+  constructor(
+    /** Override to map `host:port` to a ws:// or wss:// URL. */
+    private urlForAddr: (host: string, port: number) => string =
+      (h, p) => `ws://${h}:${p}/`,
+  ) {}
+
+  // Sync stubs.
+  connect(): number { return -38; }
+  send(): number { return -38; }
+  recv(): number { return -38; }
+  listen(): number { return -38; }
+  accept(): number { return -38; }
+  localAddr(): { host: string; port: number } | null { return null; }
+
+  close(handle: number): number {
+    const ws = this.sockets.get(handle);
+    if (ws) {
+      try { ws.close(); } catch { /* */ }
+      this.sockets.delete(handle);
+    }
+    this.inbox.delete(handle);
+    this.waiters.delete(handle);
+    this.closed.add(handle);
+    return 0;
+  }
+
+  connectAsync(host: string, port: number, _flags: number): Promise<number> {
+    return new Promise<number>((resolve) => {
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(this.urlForAddr(host, port));
+        ws.binaryType = "arraybuffer";
+      } catch (_e) {
+        resolve(-(111)); // -ECONNREFUSED
+        return;
+      }
+      const handle = this.nextHandle++;
+      ws.onmessage = (ev) => {
+        const data = ev.data instanceof ArrayBuffer
+          ? new Uint8Array(ev.data)
+          : new TextEncoder().encode(String(ev.data));
+        const queue = this.inbox.get(handle) ?? [];
+        queue.push(data);
+        this.inbox.set(handle, queue);
+        const w = this.waiters.get(handle);
+        if (w) {
+          this.waiters.delete(handle);
+          w(0); // signal; recvAsync drains the queue itself
+        }
+      };
+      ws.onclose = () => {
+        this.closed.add(handle);
+        const w = this.waiters.get(handle);
+        if (w) {
+          this.waiters.delete(handle);
+          w(0);
+        }
+      };
+      ws.onerror = () => { /* surface via close */ };
+      ws.onopen = () => {
+        this.sockets.set(handle, ws);
+        resolve(handle);
+      };
+    });
+  }
+
+  send_internal(handle: number, data: Uint8Array): number {
+    const ws = this.sockets.get(handle);
+    if (!ws) return -9; // -EBADF
+    try {
+      ws.send(data);
+      return data.byteLength;
+    } catch (_e) {
+      return -32; // -EPIPE
+    }
+  }
+
+  // recv blocks (asynchronously) until bytes arrive or peer closes.
+  async recvAsync(
+    handle: number,
+    buf: Uint8Array,
+    _flags: number,
+  ): Promise<number> {
+    const drain = (): number => {
+      const queue = this.inbox.get(handle);
+      if (!queue || queue.length === 0) return -1;
+      const next = queue.shift()!;
+      const n = Math.min(next.byteLength, buf.byteLength);
+      buf.set(next.subarray(0, n));
+      if (next.byteLength > n) {
+        // Push back the remainder.
+        queue.unshift(next.subarray(n));
+      }
+      this.inbox.set(handle, queue);
+      return n;
+    };
+    let drained = drain();
+    if (drained >= 0) return drained;
+    if (this.closed.has(handle) && !this.sockets.has(handle)) return 0; // EOF
+    await new Promise<void>((resolve) => {
+      this.waiters.set(handle, () => resolve());
+    });
+    drained = drain();
+    if (drained >= 0) return drained;
+    return 0; // EOF
+  }
+}
+
+/**
+ * `KvBackend` that proxies to browser-native `globalThis.indexedDB`.
+ * Browser-only — throws at construction in Deno (no `indexedDB`)
+ * and other hosts that don't ship the API. Storage layout: one
+ * IDB *database* per `IndexedDbKv` instance; one IDB *object store*
+ * per `store` argument; entries are `(key bytes -> value bytes)`.
+ *
+ * All ops are async (matches IndexedDB). Without JSPI the matching
+ * kh_idb_* imports stay -EACCES — same constraint as kh_fetch_blocking.
+ */
+export class IndexedDbKv implements KvBackend {
+  private db: IDBDatabase | null = null;
+  private opening: Promise<IDBDatabase>;
+  private knownStores = new Set<string>();
+
+  constructor(private dbName: string = "yurt-kv") {
+    // deno-lint-ignore no-explicit-any
+    const idb = (globalThis as any).indexedDB as IDBFactory | undefined;
+    if (!idb) {
+      throw new Error(
+        "IndexedDbKv: globalThis.indexedDB is not available — use this impl from browser code only",
+      );
+    }
+    this.opening = new Promise((resolve, reject) => {
+      const req = idb.open(this.dbName, 1);
+      req.onupgradeneeded = () => {
+        // Stores added lazily via ensureStore; nothing to do here.
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    this.opening.then((db) => {
+      this.db = db;
+    });
+  }
+
+  private storeName(s: Uint8Array): string {
+    return new TextDecoder().decode(s) || "_default";
+  }
+
+  private async ensureStore(name: string): Promise<IDBDatabase> {
+    const db = this.db ?? (await this.opening);
+    if (db.objectStoreNames.contains(name)) {
+      this.knownStores.add(name);
+      return db;
+    }
+    if (this.knownStores.has(name)) return db;
+    // Trigger an upgrade to add the new store.
+    db.close();
+    this.db = null;
+    // deno-lint-ignore no-explicit-any
+    const idb = (globalThis as any).indexedDB as IDBFactory;
+    const newDb = await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = idb.open(this.dbName, db.version + 1);
+      req.onupgradeneeded = () => {
+        const upgraded = req.result;
+        if (!upgraded.objectStoreNames.contains(name)) {
+          upgraded.createObjectStore(name);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    this.knownStores.add(name);
+    this.db = newDb;
+    this.opening = Promise.resolve(newDb);
+    return newDb;
+  }
+
+  // Sync stubs.
+  get(): Uint8Array | number { return -38; }
+  put(): number { return -38; }
+  delete(): number { return -38; }
+  list(): Uint8Array[] { return []; }
+
+  async getAsync(
+    store: Uint8Array,
+    key: Uint8Array,
+  ): Promise<Uint8Array | number> {
+    const name = this.storeName(store);
+    const db = await this.ensureStore(name);
+    return await new Promise((resolve) => {
+      const tx = db.transaction(name, "readonly");
+      const req = tx.objectStore(name).get(key);
+      req.onsuccess = () => {
+        const v = req.result as Uint8Array | undefined;
+        resolve(v ?? -2); // -ENOENT
+      };
+      req.onerror = () => resolve(-5); // -EIO
+    });
+  }
+
+  async putAsync(
+    store: Uint8Array,
+    key: Uint8Array,
+    value: Uint8Array,
+  ): Promise<number> {
+    const name = this.storeName(store);
+    const db = await this.ensureStore(name);
+    return await new Promise((resolve) => {
+      const tx = db.transaction(name, "readwrite");
+      const req = tx.objectStore(name).put(value, key);
+      req.onsuccess = () => resolve(0);
+      req.onerror = () => resolve(-5);
+    });
+  }
+
+  async deleteAsync(store: Uint8Array, key: Uint8Array): Promise<number> {
+    const name = this.storeName(store);
+    const db = await this.ensureStore(name);
+    return await new Promise((resolve) => {
+      const tx = db.transaction(name, "readwrite");
+      const req = tx.objectStore(name).delete(key);
+      req.onsuccess = () => resolve(0);
+      req.onerror = () => resolve(-5);
+    });
+  }
+
+  async listAsync(
+    store: Uint8Array,
+    prefix: Uint8Array,
+  ): Promise<Uint8Array[]> {
+    const name = this.storeName(store);
+    const db = await this.ensureStore(name);
+    return await new Promise((resolve) => {
+      const tx = db.transaction(name, "readonly");
+      const req = tx.objectStore(name).getAllKeys();
+      req.onsuccess = () => {
+        const keys = (req.result as Uint8Array[]).filter((k) => {
+          if (k.byteLength < prefix.byteLength) return false;
+          for (let i = 0; i < prefix.byteLength; i++) {
+            if (k[i] !== prefix[i]) return false;
+          }
+          return true;
+        });
+        resolve(keys);
+      };
+      req.onerror = () => resolve([]);
+    });
+  }
+}
