@@ -165,6 +165,83 @@ class DiscardLogSink implements LogSink {
 }
 
 /**
+ * Capabilities an {@link AsyncBridge} impl exposes. **Non-uniform
+ * across hosts** — see project memory `project_async_bridge` for
+ * the matrix. Always check `capabilities()` before calling
+ * `suspendUntil`; bridges without suspension throw NOT_SUSPENDABLE.
+ *
+ * - `jspi`: host supports `WebAssembly.Suspending` /
+ *   `WebAssembly.promising`. Available on V8 / SpiderMonkey;
+ *   **NOT on Safari (JavaScriptCore) today** — re-check
+ *   `webassembly.org/features` before relying on it.
+ * - `asyncify`: kernel.wasm + user wasm were built with binaryen
+ *   `--asyncify`. Universal fallback when JSPI is unavailable.
+ * - `threads`: host supports wasi-threads.
+ */
+export interface AsyncCapabilities {
+  jspi: boolean;
+  asyncify: boolean;
+  threads: boolean;
+}
+
+/**
+ * Host-supplied bridge to the JS event loop. Lets blocking
+ * syscalls — sys_nanosleep, sys_read on an empty pipe, sys_wait
+ * once spawn lands — suspend the calling wasm until the host work
+ * completes. Capability-dependent: when nothing suspends
+ * (Safari without asyncify-built wasm), `suspendUntil` throws
+ * `"NOT_SUSPENDABLE"` and callers fall back to non-blocking
+ * semantics (EAGAIN / immediate-return).
+ *
+ * Mirrors the Rust-side `AsyncBridge` trait.
+ */
+export interface AsyncBridge {
+  capabilities(): AsyncCapabilities;
+  /**
+   * Suspend the calling wasm until `task` resolves; return its
+   * payload. Throws `"NOT_SUSPENDABLE"` (literal string) if neither
+   * JSPI nor asyncify is available.
+   */
+  suspendUntil(task: () => Promise<Uint8Array>): Uint8Array;
+}
+
+/**
+ * Default no-suspension bridge. Used by hosts that have neither
+ * JSPI nor asyncify-built wasm. Blocking syscalls fall back to
+ * non-blocking semantics through this.
+ */
+export const noopAsyncBridge: AsyncBridge = {
+  capabilities() {
+    return { jspi: false, asyncify: false, threads: false };
+  },
+  suspendUntil() {
+    throw new Error("NOT_SUSPENDABLE");
+  },
+};
+
+/**
+ * Probe the current host for AsyncBridge capabilities. Returns a
+ * fresh capability descriptor; the actual bridge that uses these
+ * is plugged in by the embedder. JSPI detection is conservative —
+ * presence of the `WebAssembly.Suspending` constructor.
+ *
+ * Asyncify detection requires inspecting the loaded user wasm
+ * (the binaryen pass adds `asyncify_*` exports); detection is
+ * deferred to the engine impl that knows which module to inspect.
+ */
+export function detectAsyncCapabilities(): AsyncCapabilities {
+  // deno-lint-ignore no-explicit-any
+  const W = (globalThis as any).WebAssembly;
+  const hasJspi = typeof W?.Suspending === "function" &&
+    typeof W?.promising === "function";
+  return {
+    jspi: hasJspi,
+    asyncify: false, // engine fills this in after instantiation
+    threads: false, // wasi-threads detection is engine-level
+  };
+}
+
+/**
  * Default policy: every hook returns "allow". Equivalent to having
  * no policy enforcer at all.
  */

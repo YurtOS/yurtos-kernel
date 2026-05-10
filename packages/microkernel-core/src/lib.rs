@@ -55,6 +55,8 @@ pub enum EngineError {
     MemoryWrite { addr: u32, len: u32 },
     #[error("trap: {0}")]
     Trap(String),
+    #[error("engine cannot suspend: no JSPI and no asyncify available")]
+    NotSuspendable,
     #[error("engine error: {0}")]
     Other(String),
 }
@@ -76,6 +78,79 @@ pub struct KernelDispatchOutcome {
 /// line.
 pub trait HasCallerPid {
     fn caller_pid(&self) -> u32;
+}
+
+/// Capabilities a [`AsyncBridge`] impl exposes. **Non-uniform across
+/// engines and hosts** — see project memory `project_async_bridge`
+/// for the matrix. Always check capabilities before calling
+/// [`AsyncBridge::suspend_until`]; engines without suspension
+/// support return [`EngineError::NotSuspendable`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AsyncCapabilities {
+    /// Host supports WebAssembly.Suspending / wasm-side promises
+    /// (V8 / SpiderMonkey / Wasmer). NOT available on Safari, plain
+    /// wasmtime, or WasmEdge today.
+    pub jspi: bool,
+    /// kernel.wasm + user wasm were built with the binaryen
+    /// `--asyncify` pass, so the engine can drive coroutine-style
+    /// unwind/rewind. Universal fallback when JSPI is unavailable;
+    /// costs ~30% code size + per-call instrumentation.
+    pub asyncify: bool,
+    /// Host supports wasi-threads (engine spawns wasm threads).
+    /// Orthogonal to suspension; relevant for kernel reentrance.
+    pub threads: bool,
+}
+
+/// Engine-supplied bridge to the host's async machinery. Lets
+/// blocking syscalls (`sys_nanosleep`, `sys_read` on a drained pipe,
+/// `sys_wait` once spawn lands, signal-aware syscalls in general)
+/// suspend the calling wasm until the host completes the work.
+///
+/// **Capability-dependent.** Some engines have neither JSPI nor
+/// asyncify (wasmtime today); their bridges return
+/// [`EngineError::NotSuspendable`]. Calling code is expected to
+/// check [`AsyncBridge::capabilities`] first and fall back to
+/// non-blocking semantics (EAGAIN / immediate-return) when
+/// suspension is unavailable.
+pub trait AsyncBridge: Send + Sync {
+    fn capabilities(&self) -> AsyncCapabilities;
+
+    /// Suspend the calling wasm until `task` resolves, then return
+    /// its bytes payload. Engines that can't suspend return
+    /// [`EngineError::NotSuspendable`] without invoking `task`.
+    ///
+    /// Phase 5 surface uses opaque byte payloads so the trait stays
+    /// dyn-compatible; engines impl the actual JSPI / asyncify dance
+    /// behind the scenes. When typed payloads are needed (return a
+    /// typed timer-elapsed result), helpers above wrap (de)serialize
+    /// — no need for generics here.
+    ///
+    /// `task` is invoked synchronously by the engine impl; impls
+    /// that need async dispatch (Tokio, the JS event loop) wrap the
+    /// closure into their runtime.
+    fn suspend_until(
+        &self,
+        task: Box<dyn FnOnce() -> Result<Vec<u8>, EngineError> + Send>,
+    ) -> Result<Vec<u8>, EngineError>;
+}
+
+/// Default no-suspension bridge. Wasmtime uses this today (no JSPI,
+/// no asyncify). Blocking syscalls that route through it must fall
+/// back to non-blocking semantics — sys_nanosleep returns 0
+/// immediately, sys_read returns EAGAIN.
+pub struct NoopAsyncBridge;
+
+impl AsyncBridge for NoopAsyncBridge {
+    fn capabilities(&self) -> AsyncCapabilities {
+        AsyncCapabilities::default()
+    }
+
+    fn suspend_until(
+        &self,
+        _task: Box<dyn FnOnce() -> Result<Vec<u8>, EngineError> + Send>,
+    ) -> Result<Vec<u8>, EngineError> {
+        Err(EngineError::NotSuspendable)
+    }
 }
 
 /// What every host-side import callback gets, regardless of engine.
