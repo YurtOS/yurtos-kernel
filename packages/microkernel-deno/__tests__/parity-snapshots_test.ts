@@ -94,6 +94,18 @@ const FIXTURES: FixtureSpec[] = [
     argv: ["/usr/bin/proc-cmdline", "--flag", "value"],
     snapshot: "proc-cmdline.stdout",
   },
+  {
+    name: "true-cmd",
+    wasm: "true-cmd-wasm",
+    argv: ["true"],
+    snapshot: "true-cmd.stdout",
+  },
+  {
+    name: "false-cmd",
+    wasm: "false-cmd-wasm",
+    argv: ["false"],
+    snapshot: "false-cmd.stdout",
+  },
 ];
 
 async function loadSnapshot(name: string): Promise<Uint8Array> {
