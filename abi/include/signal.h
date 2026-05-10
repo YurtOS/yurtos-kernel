@@ -128,6 +128,16 @@ int sigsuspend(const sigset_t *mask);
 int raise(int sig);
 unsigned alarm(unsigned seconds);
 
+/* wasi-libc gates pthread_sigmask behind __wasilibc_unmodified_upstream.
+ * yurt's signal model is process-wide (no per-thread masks), so we
+ * delegate to sigprocmask — POSIX permits the two to be equivalent in
+ * single-threaded contexts, which is yurt's case. Header-inline so any
+ * C/C++ TU including <signal.h> can resolve the symbol. */
+static inline int pthread_sigmask(int how, const sigset_t *restrict set,
+                                  sigset_t *restrict oldset) {
+    return sigprocmask(how, set, oldset);
+}
+
 #ifdef __cplusplus
 #undef restrict
 }
