@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stddef.h>
@@ -804,6 +805,23 @@ static void yurt_socketpair_release(int fd) {
   shutdown(fd, 2);
 }
 
+/* Honor the SOCK_NONBLOCK / SOCK_CLOEXEC bits Linux lets callers fold
+ * into socket() / socketpair() type. wasi-libc's socket() ignores
+ * those bits, so we route them through fcntl() after the fact. */
+static int yurt_socketpair_apply_type_flags(int fd, int type) {
+  if ((type & SOCK_NONBLOCK) != 0) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return -1;
+    if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) return -1;
+  }
+  if ((type & SOCK_CLOEXEC) != 0) {
+    int fd_fl = fcntl(fd, F_GETFD, 0);
+    if (fd_fl < 0) return -1;
+    if (fcntl(fd, F_SETFD, fd_fl | FD_CLOEXEC) < 0) return -1;
+  }
+  return 0;
+}
+
 int socketpair(int domain, int type, int protocol, int sv[2]) {
   YURT_MARKER_CALL(socketpair);
 
@@ -853,6 +871,16 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
   /* Listener has done its job — release it; the pair is the
    * acceptor (read end) and the connector (write end). */
   yurt_socketpair_release(listener);
+
+  /* Propagate SOCK_NONBLOCK / SOCK_CLOEXEC bits onto both ends.
+   * Linux socketpair() applies these atomically; we apply
+   * post-creation, which is the best wasi-libc allows today. */
+  if (yurt_socketpair_apply_type_flags(acceptor, type) < 0 ||
+      yurt_socketpair_apply_type_flags(connector, type) < 0) {
+    int saved = errno;
+    yurt_socketpair_release(acceptor); yurt_socketpair_release(connector);
+    errno = saved; return -1;
+  }
 
   sv[0] = acceptor;
   sv[1] = connector;
