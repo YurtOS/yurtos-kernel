@@ -118,6 +118,44 @@ fn is_user_library_arg(arg: &str) -> bool {
     arg.starts_with("-l") || arg.ends_with(".a")
 }
 
+/// Detect whether the invocation is compiling C++ source so we can
+/// substitute a C++ standard for the default `-std=gnu23` (which clang
+/// rejects in C++ mode). Heuristic: explicit `-x c++` / `-x cpp-output`
+/// from the caller, or a `.cpp`/`.cc`/`.cxx`/`.C` source file in the
+/// argument list. Misses `-x` after a `=` sign (rare); good enough for
+/// typical autoconf-generated invocations.
+fn is_cxx_invocation(user_args: &[String]) -> bool {
+    let mut want_lang = false;
+    for a in user_args {
+        if want_lang {
+            if a == "c++" || a == "cpp-output" || a == "c++-cpp-output" {
+                return true;
+            }
+            want_lang = false;
+            continue;
+        }
+        if a == "-x" {
+            want_lang = true;
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix("-x") {
+            if rest == "c++" || rest == "cpp-output" || rest == "c++-cpp-output" {
+                return true;
+            }
+        }
+        let lower = a.to_ascii_lowercase();
+        if lower.ends_with(".cpp")
+            || lower.ends_with(".cc")
+            || lower.ends_with(".cxx")
+            || lower.ends_with(".c++")
+            || a.ends_with(".C")
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn build_clang_invocation(
     sdk: &wasi_sdk::WasiSdk,
     env: &env::Env,
@@ -129,16 +167,22 @@ fn build_clang_invocation(
     argv.push("--target=wasm32-wasip1".into());
     if final_yurt_link {
         argv.push("-O2".into());
-        // Default to C23 (gnu23): gives us nullptr keyword and the
-        // unreachable()/byteswap/etc. additions to <stddef.h>, both of
-        // which gnulib code paths in coreutils require.  Backward-compat:
-        // C23 is a near-pure superset of C11 that mostly adds new
-        // keywords; the exception is `bool` becoming a real keyword.
-        // Pre-C23 code that used a `typedef ... bool` would break, but
-        // none of our current ports do so (BusyBox uses smallint, jq /
-        // file use int).  Ports that need an older standard can pass
-        // `-std=...` after; clang takes the last -std= flag.
-        argv.push("-std=gnu23".into());
+        // Default standard depends on language mode. C23 (gnu23) gives us
+        // nullptr / unreachable() / <stddef.h> additions that gnulib code
+        // paths in coreutils require. C23 is a near-pure superset of C11
+        // (the one exception is `bool` becoming a real keyword; none of
+        // our current ports rely on `typedef ... bool`).
+        //
+        // For C++ source, gnu23 is invalid ("not allowed with 'C++'") so
+        // emit gnu++17 instead — current C++ baseline that all our
+        // expected C++ ports (libzmq, etc.) target. Ports needing a
+        // different standard can pass `-std=...` after; clang takes the
+        // last `-std=` flag.
+        if is_cxx_invocation(user_args) {
+            argv.push("-std=gnu++17".into());
+        } else {
+            argv.push("-std=gnu23".into());
+        }
         argv.push("-Wall".into());
         argv.push("-Wextra".into());
     }

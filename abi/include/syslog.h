@@ -6,6 +6,10 @@
 
 #include <stdarg.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Facility codes */
 #define LOG_KERN     (0<<3)
 #define LOG_USER     (1<<3)
@@ -59,5 +63,9 @@ static inline void vsyslog(int priority, const char *format, va_list ap) {
     (void)priority; (void)format; (void)ap;
 }
 static inline int setlogmask(int mask) { (void)mask; return 0xff; }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* _SYSLOG_H */

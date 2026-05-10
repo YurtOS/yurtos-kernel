@@ -16,6 +16,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct mntent {
     char *mnt_fsname;   /* device or server */
     char *mnt_dir;      /* mount point */
@@ -122,5 +126,9 @@ static inline char *hasmntopt(const struct mntent *mnt, const char *opt) {
     }
     return NULL;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* YURT_COMPAT_MNTENT_H */

@@ -10,6 +10,10 @@
 #include <string.h>
 #include <sys/types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct group {
     char *gr_name;
     char *gr_passwd;
@@ -86,5 +90,9 @@ static inline int setgroups(int size, const gid_t *list) {
     errno = EPERM;
     return -1;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* YURT_COMPAT_GRP_H */

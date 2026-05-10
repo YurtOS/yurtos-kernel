@@ -5,6 +5,13 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#ifdef __cplusplus
+extern "C" {
+/* C++ doesn't have `restrict`; map it to clang's __restrict__ for the
+ * declarations below.  Symmetric `#undef` near the closing brace. */
+#define restrict __restrict__
+#endif
+
 #if !defined(__wasilibc___typedef_sigset_t_h) && !defined(__DEFINED_sigset_t)
 /* Matches wasi-libc's current placeholder typedef (share/wasi-sysroot/
  * include/__typedef_sigset_t.h: `typedef unsigned char sigset_t;`).
@@ -120,5 +127,10 @@ int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset
 int sigsuspend(const sigset_t *mask);
 int raise(int sig);
 unsigned alarm(unsigned seconds);
+
+#ifdef __cplusplus
+#undef restrict
+}
+#endif
 
 #endif

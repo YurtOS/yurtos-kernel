@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* Kernel ABI version — the major/minor of the host/guest
  * protocol (host imports, signal numbers, etc.).  Separate from the
  * yurt product version below: a host running kernel ABI 2.x
@@ -106,5 +110,9 @@ int yurt_fetch_text(
   const char *body,
   char **out_body
 );
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
