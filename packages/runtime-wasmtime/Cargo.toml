@@ -46,6 +46,9 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 
+# Embedded KV used by RedbKv (durable backing for kh_idb_*)
+redb = "2"
+
 [dev-dependencies]
 tar = { version = "0.4", default-features = false }
 toml = "0.8"

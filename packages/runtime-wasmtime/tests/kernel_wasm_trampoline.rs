@@ -13,7 +13,7 @@ use wasmtime::{Engine, Module};
 
 use yurt_runtime_wasmtime::microkernel::{
     build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, InMemoryHostFs,
-    InMemoryKv, LogSink, Microkernel, NativeHostFs, NativeTcpSocket,
+    InMemoryKv, LogSink, Microkernel, NativeHostFs, NativeTcpSocket, RedbKv,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -1036,6 +1036,60 @@ fn run_pending_spawns_runs_real_wasm_child_and_parent_reaps() {
     assert_eq!(u32::from_le_bytes(wresp[0..4].try_into().unwrap()), child_pid);
     let status = i32::from_le_bytes(wresp[4..8].try_into().unwrap());
     assert_eq!(status, 1, "false-cmd exits with 1, got {status}");
+}
+
+#[test]
+fn redb_kv_persists_across_microkernel_restarts() {
+    // RedbKv is one concrete impl behind the pluggable KvBackend
+    // trait. Embedders may swap in sled / rocksdb / SQLite / S3
+    // by writing their own KvBackend impl — this test just
+    // exercises the in-tree redb-backed one.
+    //
+    // Phase 1: write entries through one Microkernel instance.
+    // Phase 2: drop it, build a fresh Microkernel pointing at the
+    // same redb file, and confirm the entries are still readable.
+    use std::fs;
+    let dir = std::env::temp_dir().join(format!("yurt-redb-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("kv.redb");
+    build_kernel_wasm().unwrap();
+
+    {
+        let kv = Arc::new(RedbKv::open(db_path.clone()).unwrap());
+        let mut host = HostState::default();
+        host.kv = Some(kv);
+        let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+
+        let mut put_req = vec![5_u8];
+        put_req.extend_from_slice(b"users");
+        put_req.extend_from_slice(&3_u32.to_le_bytes());
+        put_req.extend_from_slice(b"abc");
+        put_req.extend_from_slice(b"alice");
+        assert_eq!(
+            mk.syscall(METHOD_SYS_IDB_PUT, &put_req, &mut []).unwrap(),
+            0,
+        );
+    }
+
+    {
+        let kv = Arc::new(RedbKv::open(db_path.clone()).unwrap());
+        let mut host = HostState::default();
+        host.kv = Some(kv);
+        let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+
+        let mut get_req = vec![5_u8];
+        get_req.extend_from_slice(b"users");
+        get_req.extend_from_slice(b"abc");
+        let mut buf = vec![0u8; 32];
+        let n = mk
+            .syscall(METHOD_SYS_IDB_GET, &get_req, &mut buf)
+            .unwrap();
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n as usize], b"alice");
+    }
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

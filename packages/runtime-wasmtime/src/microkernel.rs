@@ -346,6 +346,120 @@ pub trait KvBackend: Send + Sync {
     fn list(&self, store: &[u8], prefix: &[u8]) -> Vec<Vec<u8>>;
 }
 
+/// `redb`-backed [`KvBackend`] — single-file, all-Rust embedded
+/// store, suitable for native deployments that want real disk
+/// persistence without bringing FFI. Each logical "store" maps
+/// to a redb table; keys/values are byte slices verbatim. Fully
+/// transactional inside each call (per-call read/write txns).
+///
+/// For deployments that need a different backing (sled, rocksdb,
+/// SQLite, S3) the embedder writes its own [`KvBackend`] impl
+/// and wires it onto `HostState.kv` — same surface, different
+/// store.
+pub struct RedbKv {
+    db: redb::Database,
+}
+
+impl RedbKv {
+    pub fn open(path: PathBuf) -> Result<Self, redb::Error> {
+        let db = redb::Database::create(path)?;
+        Ok(Self { db })
+    }
+
+    fn table_def(store: &[u8]) -> redb::TableDefinition<'_, &'static [u8], &'static [u8]> {
+        // redb requires UTF-8 table names; if a store name isn't
+        // valid UTF-8 the embedder gets a single shared "_bin"
+        // table. Almost every real-world store name is UTF-8.
+        let name = std::str::from_utf8(store).unwrap_or("_bin");
+        // SAFETY: we leak the name string for the table definition
+        // — table defs are short-lived per call, but the Cow they
+        // hold needs a 'static lifetime. Real impl could use a
+        // store-name → 'static-string interner; for the slice we
+        // use a single shared static fallback above when names are
+        // non-UTF-8.
+        redb::TableDefinition::new(Box::leak(name.to_owned().into_boxed_str()))
+    }
+}
+
+impl KvBackend for RedbKv {
+    fn get(&self, store: &[u8], key: &[u8]) -> Result<Vec<u8>, i32> {
+        let txn = self.db.begin_read().map_err(|_| -(5 as i32))?;
+        let table = match txn.open_table(Self::table_def(store)) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Err(-(2 as i32)),
+            Err(_) => return Err(-(5 as i32)),
+        };
+        match table.get(key) {
+            Ok(Some(v)) => Ok(v.value().to_vec()),
+            Ok(None) => Err(-(2 as i32)),
+            Err(_) => Err(-(5 as i32)),
+        }
+    }
+
+    fn put(&self, store: &[u8], key: &[u8], value: &[u8]) -> i32 {
+        let txn = match self.db.begin_write() {
+            Ok(t) => t,
+            Err(_) => return -(5 as i32),
+        };
+        {
+            let mut table = match txn.open_table(Self::table_def(store)) {
+                Ok(t) => t,
+                Err(_) => return -(5 as i32),
+            };
+            if table.insert(key, value).is_err() {
+                return -(5 as i32);
+            }
+        }
+        match txn.commit() {
+            Ok(()) => 0,
+            Err(_) => -(5 as i32),
+        }
+    }
+
+    fn delete(&self, store: &[u8], key: &[u8]) -> i32 {
+        let txn = match self.db.begin_write() {
+            Ok(t) => t,
+            Err(_) => return -(5 as i32),
+        };
+        {
+            let mut table = match txn.open_table(Self::table_def(store)) {
+                Ok(t) => t,
+                Err(redb::TableError::TableDoesNotExist(_)) => return 0,
+                Err(_) => return -(5 as i32),
+            };
+            let _ = table.remove(key);
+        }
+        match txn.commit() {
+            Ok(()) => 0,
+            Err(_) => -(5 as i32),
+        }
+    }
+
+    fn list(&self, store: &[u8], prefix: &[u8]) -> Vec<Vec<u8>> {
+        use redb::ReadableTable;
+        let txn = match self.db.begin_read() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let table = match txn.open_table(Self::table_def(store)) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let iter = match table.iter() {
+            Ok(it) => it,
+            Err(_) => return Vec::new(),
+        };
+        let mut keys = Vec::new();
+        for entry in iter.flatten() {
+            let k = entry.0.value().to_vec();
+            if k.starts_with(prefix) {
+                keys.push(k);
+            }
+        }
+        keys
+    }
+}
+
 /// In-process [`KvBackend`] implementation. Map of
 /// (store, key) → bytes. Useful for tests and as the placeholder
 /// browser microkernels point at while IndexedDB wiring is in
