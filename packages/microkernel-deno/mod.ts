@@ -41,7 +41,11 @@ export {
   UserProcess,
 } from "../microkernel-js/mod.ts";
 
-import type { HostFsImpl, HostFsStat } from "../microkernel-js/mod.ts";
+import type {
+  HostFsImpl,
+  HostFsStat,
+  TcpSocketImpl,
+} from "../microkernel-js/mod.ts";
 
 const ENOENT = 2;
 const EBADF = 9;
@@ -227,4 +231,159 @@ function mapErrno(e: unknown): number {
   if (e instanceof Deno.errors.PermissionDenied) return -EACCES;
   if (e instanceof Deno.errors.AlreadyExists) return -EEXIST;
   return -EIO;
+}
+
+/**
+ * Deno-backed implementation of `HostState.fetch`. Wraps
+ * `globalThis.fetch` with the JSON-shaped request/response
+ * encoding `network::fetch` already speaks (see
+ * packages/runtime-wasmtime/src/wasm/network.rs). When installed
+ * with JSPI available, `kh_fetch_blocking` actually performs
+ * real HTTP and the wasm caller suspends until the response
+ * arrives.
+ */
+export async function denoFetch(
+  request: Uint8Array,
+): Promise<Uint8Array> {
+  const reqStr = new TextDecoder().decode(request);
+  let req: {
+    url: string;
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+  };
+  try {
+    req = JSON.parse(reqStr);
+  } catch (e) {
+    return new TextEncoder().encode(JSON.stringify({
+      ok: false,
+      status: 0,
+      headers: {},
+      body: "",
+      error: `invalid request JSON: ${e}`,
+    }));
+  }
+  try {
+    const resp = await fetch(req.url, {
+      method: req.method ?? "GET",
+      headers: req.headers,
+      body: req.body,
+    });
+    const headers: Record<string, string> = {};
+    for (const [k, v] of resp.headers.entries()) headers[k] = v;
+    const bodyBytes = new Uint8Array(await resp.arrayBuffer());
+    const body = new TextDecoder("utf-8", { fatal: false }).decode(bodyBytes);
+    return new TextEncoder().encode(JSON.stringify({
+      ok: resp.ok,
+      status: resp.status,
+      headers,
+      body,
+      error: null,
+    }));
+  } catch (e) {
+    return new TextEncoder().encode(JSON.stringify({
+      ok: false,
+      status: 0,
+      headers: {},
+      body: "",
+      error: `${e}`,
+    }));
+  }
+}
+
+/**
+ * Deno-backed [`TcpSocketImpl`]. Implements only the *Async
+ * variants — Deno's TCP primitives are inherently async, so the
+ * sync stubs return -ENOSYS. When the host has JSPI (Deno does)
+ * the matching kh_socket_* imports are wrapped with
+ * `WebAssembly.Suspending` and userland's syscall actually
+ * suspends until the I/O completes.
+ *
+ * Holds two handle tables internally — one for connected
+ * `Deno.TcpConn`s, one for `Deno.TcpListener`s — so the trait
+ * surface (`close`) can route a handle to whichever side it is.
+ */
+export class DenoTcpSocket implements TcpSocketImpl {
+  private nextHandle = 1;
+  private conns = new Map<number, Deno.TcpConn>();
+  private listeners = new Map<number, Deno.TcpListener>();
+
+  // Sync stubs — JSPI takes the *Async path.
+  connect(): number { return -38; }
+  send(): number { return -38; }
+  recv(): number { return -38; }
+  listen(): number { return -38; }
+  accept(): number { return -38; }
+  localAddr(handle: number): { host: string; port: number } | null {
+    const l = this.listeners.get(handle);
+    if (l && l.addr.transport === "tcp") {
+      return { host: l.addr.hostname, port: l.addr.port };
+    }
+    const c = this.conns.get(handle);
+    if (c && c.localAddr.transport === "tcp") {
+      return { host: c.localAddr.hostname, port: c.localAddr.port };
+    }
+    return null;
+  }
+
+  close(handle: number): number {
+    const c = this.conns.get(handle);
+    if (c) { try { c.close(); } catch { /* */ } this.conns.delete(handle); return 0; }
+    const l = this.listeners.get(handle);
+    if (l) { try { l.close(); } catch { /* */ } this.listeners.delete(handle); return 0; }
+    return 0;
+  }
+
+  async connectAsync(host: string, port: number, _flags: number): Promise<number> {
+    try {
+      const conn = await Deno.connect({ hostname: host, port, transport: "tcp" });
+      const h = this.nextHandle++;
+      this.conns.set(h, conn);
+      return h;
+    } catch (e) {
+      return mapErrno(e);
+    }
+  }
+
+  async recvAsync(handle: number, buf: Uint8Array, _flags: number): Promise<number> {
+    const conn = this.conns.get(handle);
+    if (!conn) return -EBADF;
+    try {
+      const n = await conn.read(buf);
+      return n ?? 0;
+    } catch (e) {
+      return mapErrno(e);
+    }
+  }
+
+  async acceptAsync(handle: number, _flags: number): Promise<number> {
+    const l = this.listeners.get(handle);
+    if (!l) return -EBADF;
+    try {
+      const conn = await l.accept();
+      const h = this.nextHandle++;
+      this.conns.set(h, conn);
+      return h;
+    } catch (e) {
+      return mapErrno(e);
+    }
+  }
+
+  /**
+   * Convenience: the sync `listen` is -ENOSYS but Deno's
+   * Deno.listen IS sync (the listener returns a Promise on
+   * `accept`). Embedders that want listen-via-async create a
+   * listener directly through this method and pass the handle
+   * to userland.
+   */
+  bindListener(host: string, port: number): number {
+    try {
+      const listener = Deno.listen({ hostname: host, port, transport: "tcp" });
+      const h = this.nextHandle++;
+      this.listeners.set(h, listener);
+      return h;
+    } catch (e) {
+      return mapErrno(e);
+    }
+  }
 }
