@@ -83,6 +83,9 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_STAT => stat_path(caller_pid, request, response),
         METHOD_SYS_SYMLINK => symlink(caller_pid, request),
         METHOD_SYS_READLINK => readlink(caller_pid, request, response),
+        METHOD_SYS_MKDIR => mkdir(caller_pid, request),
+        METHOD_SYS_RMDIR => rmdir(caller_pid, request),
+        METHOD_SYS_READDIR => readdir(caller_pid, request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -1009,6 +1012,61 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         response[8..12].copy_from_slice(&filetype.to_le_bytes());
         response[12..16].copy_from_slice(&mode.to_le_bytes());
         16
+    })
+}
+
+/// `mkdir(path) -> 0 / -EEXIST / -EROFS`.
+fn mkdir(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| k.vfs.mkdir(request) as i64)
+}
+
+/// `rmdir(path) -> 0 / -ENOENT / -ENOTEMPTY / -EROFS`.
+fn rmdir(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| k.vfs.rmdir(request) as i64)
+}
+
+/// `readdir(path) -> packed entries`. Response layout:
+/// u32 count_le + (u32 name_len_le + name_bytes)*. Truncated when
+/// out_cap exceeded; the count reflects only what fit.
+fn readdir(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    if response.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| {
+        let entries = match k.vfs.readdir(request) {
+            Some(e) => e,
+            None => return -(abi::ENOENT as i64),
+        };
+        // Pack as count + (len, bytes)*. Stop early if a record
+        // wouldn't fit; the surfaced count is what fit.
+        let mut cursor = 4usize;
+        let mut count: u32 = 0;
+        for name in &entries {
+            let need = 4 + name.len();
+            if cursor + need > response.len() {
+                break;
+            }
+            response[cursor..cursor + 4]
+                .copy_from_slice(&(name.len() as u32).to_le_bytes());
+            cursor += 4;
+            response[cursor..cursor + name.len()].copy_from_slice(name);
+            cursor += name.len();
+            count += 1;
+        }
+        response[0..4].copy_from_slice(&count.to_le_bytes());
+        cursor as i64
     })
 }
 
@@ -3111,6 +3169,83 @@ mod tests {
             dispatch(METHOD_SYS_READLINK, 1, b"/rg", &mut buf),
             -(abi::EINVAL as i64)
         );
+    }
+
+    #[test]
+    fn mkdir_creates_directory_and_readdir_lists_children() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // mkdir /etc
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/etc", &mut []), 0);
+        // Register two files under /etc and verify readdir lists them.
+        for name in ["motd", "hostname"] {
+            let path = format!("/etc/{}", name);
+            let mut reg = (path.len() as u32).to_le_bytes().to_vec();
+            reg.extend_from_slice(path.as_bytes());
+            reg.extend_from_slice(b"x");
+            dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        }
+        let mut buf = [0u8; 256];
+        let n = dispatch(METHOD_SYS_READDIR, 1, b"/etc", &mut buf) as usize;
+        assert!(n >= 4);
+        let count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        assert_eq!(count, 2);
+        // Parse names: u32 len + bytes, repeated.
+        let mut cursor = 4usize;
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..count {
+            let len = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            names.push(buf[cursor..cursor + len].to_vec());
+            cursor += len;
+        }
+        assert!(names.iter().any(|n| n == b"motd"));
+        assert!(names.iter().any(|n| n == b"hostname"));
+    }
+
+    #[test]
+    fn mkdir_existing_path_is_eexist() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), -17);
+    }
+
+    #[test]
+    fn rmdir_empty_directory_succeeds() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/empty", &mut []), 0);
+        assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/empty", &mut []), 0);
+        // After rmdir, readdir should miss.
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_READDIR, 1, b"/empty", &mut buf),
+            -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
+    fn rmdir_nonempty_is_enotempty() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/full", &mut []), 0);
+        let mut reg = 9_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(b"/full/foo");
+        reg.extend_from_slice(b"x");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/full", &mut []), -39); // -ENOTEMPTY
+    }
+
+    #[test]
+    fn readdir_root_lists_top_level_entries() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Stash a top-level file.
+        let mut reg = 5_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(b"/root");
+        reg.extend_from_slice(b"x");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let mut buf = [0u8; 64];
+        let n = dispatch(METHOD_SYS_READDIR, 1, b"/", &mut buf) as usize;
+        assert!(n >= 4);
+        let count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        assert!(count >= 1, "root contains at least /root");
     }
 
     #[test]

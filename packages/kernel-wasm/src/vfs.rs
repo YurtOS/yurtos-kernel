@@ -142,6 +142,25 @@ pub trait VfsBackend: Send {
     fn readlink(&self, _path: &[u8]) -> Option<Vec<u8>> {
         None
     }
+
+    /// Create a directory at `path`. Returns 0 / -EEXIST / -EROFS.
+    fn mkdir(&mut self, _path: &[u8]) -> i32 {
+        -30 // -EROFS
+    }
+
+    /// Remove an empty directory. Returns 0 / -ENOENT / -ENOTEMPTY /
+    /// -EROFS.
+    fn rmdir(&mut self, _path: &[u8]) -> i32 {
+        -30 // -EROFS
+    }
+
+    /// List immediate children of `path`. Returns the entry names
+    /// (no leading directory portion). None means "no such
+    /// directory" / "not a directory" / "backend doesn't track
+    /// dirs". Empty Vec means "empty directory".
+    fn readdir(&self, _path: &[u8]) -> Option<Vec<Vec<u8>>> {
+        None
+    }
 }
 
 /// One row in the mount table.
@@ -291,6 +310,25 @@ impl MountTable {
         self.mounts[id as usize].backend.readlink(&rel)
     }
 
+    pub fn mkdir(&mut self, path: &[u8]) -> i32 {
+        let Some((id, rel)) = self.resolve(path) else {
+            return -2; // -ENOENT
+        };
+        self.mounts[id as usize].backend.mkdir(&rel)
+    }
+
+    pub fn rmdir(&mut self, path: &[u8]) -> i32 {
+        let Some((id, rel)) = self.resolve(path) else {
+            return -2;
+        };
+        self.mounts[id as usize].backend.rmdir(&rel)
+    }
+
+    pub fn readdir(&self, path: &[u8]) -> Option<Vec<Vec<u8>>> {
+        let (id, rel) = self.resolve(path)?;
+        self.mounts[id as usize].backend.readdir(&rel)
+    }
+
     /// Push a fresh snapshot of the kernel's process table to every
     /// mounted backend. Called from dispatch before /proc-touching
     /// syscalls so procfs serves up-to-date contents.
@@ -335,6 +373,12 @@ pub struct RamfsBackend {
     /// from regular files so lookup paths can fall through to
     /// readlink without colliding with regular-file inode numbers.
     symlinks: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// Explicit directory paths. mkdir adds; rmdir removes (only
+    /// if empty). readdir filters self.paths/symlinks by parent.
+    /// Phase 8: directories carry no metadata of their own beyond
+    /// the implicit "this path is a dir" marker; future MetadataOverlay
+    /// stores dir-level uid/gid/mode independently.
+    dirs: BTreeSet<Vec<u8>>,
     next_id: u64,
 }
 
@@ -344,7 +388,32 @@ impl RamfsBackend {
             inodes: BTreeMap::new(),
             paths: BTreeMap::new(),
             symlinks: BTreeMap::new(),
+            dirs: BTreeSet::new(),
             next_id: 1,
+        }
+    }
+
+    /// Parent path of `p` — the directory `readdir` would list to
+    /// see this entry. Used for the readdir "is this entry under
+    /// `path`?" check. `/foo` → `/`; `/foo/bar` → `/foo`.
+    fn parent_of(p: &[u8]) -> Vec<u8> {
+        if let Some(idx) = p.iter().rposition(|&b| b == b'/') {
+            if idx == 0 {
+                b"/".to_vec()
+            } else {
+                p[..idx].to_vec()
+            }
+        } else {
+            b"/".to_vec()
+        }
+    }
+
+    /// Last path component (basename) of `p`.
+    fn basename(p: &[u8]) -> Vec<u8> {
+        if let Some(idx) = p.iter().rposition(|&b| b == b'/') {
+            p[idx + 1..].to_vec()
+        } else {
+            p.to_vec()
         }
     }
 
@@ -529,6 +598,61 @@ impl VfsBackend for RamfsBackend {
 
     fn readlink(&self, path: &[u8]) -> Option<Vec<u8>> {
         self.symlinks.get(path).cloned()
+    }
+
+    fn mkdir(&mut self, path: &[u8]) -> i32 {
+        if self.paths.contains_key(path)
+            || self.symlinks.contains_key(path)
+            || self.dirs.contains(path)
+        {
+            return -17; // -EEXIST
+        }
+        self.dirs.insert(path.to_vec());
+        0
+    }
+
+    fn rmdir(&mut self, path: &[u8]) -> i32 {
+        if !self.dirs.contains(path) {
+            return -2; // -ENOENT (or ENOTDIR if it's a regular file)
+        }
+        // Empty check: walk children. A child is any tracked path
+        // whose parent is `path`.
+        for p in self.paths.keys().chain(self.symlinks.keys()).chain(self.dirs.iter()) {
+            if p == path {
+                continue;
+            }
+            if Self::parent_of(p) == path {
+                return -39; // -ENOTEMPTY
+            }
+        }
+        self.dirs.remove(path);
+        0
+    }
+
+    fn readdir(&self, path: &[u8]) -> Option<Vec<Vec<u8>>> {
+        // Treat root "/" as always-extant; otherwise require a
+        // mkdir record. (Root is implicit; mkdir on "/" would
+        // -EEXIST anyway.)
+        let exists = path == b"/" || self.dirs.contains(path);
+        if !exists {
+            // If the path resolves to a regular file we should
+            // surface -ENOTDIR via the dispatch layer; "None" here
+            // means "no such directory" → caller maps to -ENOENT.
+            return None;
+        }
+        let mut entries: Vec<Vec<u8>> = Vec::new();
+        for p in self.paths.keys().chain(self.symlinks.keys()).chain(self.dirs.iter()) {
+            if p == path {
+                continue;
+            }
+            if Self::parent_of(p) == path {
+                entries.push(Self::basename(p));
+            }
+        }
+        entries.sort();
+        entries.dedup(); // dirs/symlinks/files at the same path can't really collide,
+                         // but defensive.
+        Some(entries)
     }
 }
 

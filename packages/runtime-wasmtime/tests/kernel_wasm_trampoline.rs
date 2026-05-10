@@ -68,6 +68,9 @@ const METHOD_SYS_UNLINK: u32 = 0x1_0025;
 const METHOD_SYS_STAT: u32 = 0x1_0026;
 const METHOD_SYS_SYMLINK: u32 = 0x1_0027;
 const METHOD_SYS_READLINK: u32 = 0x1_0028;
+const METHOD_SYS_MKDIR: u32 = 0x1_0029;
+const METHOD_SYS_RMDIR: u32 = 0x1_002A;
+const METHOD_SYS_READDIR: u32 = 0x1_002B;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -1259,6 +1262,9 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_stat", METHOD_SYS_STAT, METHOD_SYS_STAT as i64),
         ("sys_symlink", METHOD_SYS_SYMLINK, METHOD_SYS_SYMLINK as i64),
         ("sys_readlink", METHOD_SYS_READLINK, METHOD_SYS_READLINK as i64),
+        ("sys_mkdir", METHOD_SYS_MKDIR, METHOD_SYS_MKDIR as i64),
+        ("sys_rmdir", METHOD_SYS_RMDIR, METHOD_SYS_RMDIR as i64),
+        ("sys_readdir", METHOD_SYS_READDIR, METHOD_SYS_READDIR as i64),
     ] {
         let entry = methods
             .get(name)

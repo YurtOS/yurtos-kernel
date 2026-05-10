@@ -297,3 +297,18 @@ doc = "POSIX symlink(target, link_path). Request bytes: u32 target_len LE + targ
 id = 0x1_0028
 kind = "syscall"
 doc = "POSIX readlink(path). Request bytes: path. Response: target bytes. Returns bytes-written on success, -ENOENT if no symlink at that path, -EINVAL if the path is a regular file."
+
+[method.sys_mkdir]
+id = 0x1_0029
+kind = "syscall"
+doc = "POSIX mkdir(path). Request bytes: path. Creates a directory record. Returns 0 / -EEXIST if path already exists / -EROFS if the backend is read-only."
+
+[method.sys_rmdir]
+id = 0x1_002A
+kind = "syscall"
+doc = "POSIX rmdir(path). Request bytes: path. Removes an empty directory. Returns 0 / -ENOENT / -ENOTEMPTY / -EROFS."
+
+[method.sys_readdir]
+id = 0x1_002B
+kind = "syscall"
+doc = "POSIX-shaped getdents. Request bytes: path. Response: count_le (u32) + (name_len_le u32, name_bytes)*. Caller checks the count, parses entries. Truncated when out_cap exceeded; the returned count reflects only what fit. Returns bytes-written on success, -ENOENT for unknown directory, -ENOTDIR if the path is a regular file."
