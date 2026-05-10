@@ -217,15 +217,19 @@ standard POSIX names declared above.
 
 ### Host imports
 
-| Import | Signature (i32 unless noted) | Behavior |
+| Import | Signature (all i32) | Behavior |
 |---|---|---|
-| `yurt_dlopen` | `(path_ptr, path_len, flags) -> handle (i64)` | Resolve path, locate or compile side module, instantiate, return opaque handle. `0` on error. |
-| `yurt_dlsym` | `(handle: i64, name_ptr, name_len) -> i32` | Look up `name` in the handle's exports; for functions, return their index in `__indirect_function_table`. `-1` on error. |
-| `yurt_dlclose` | `(handle: i64) -> i32` | Decrement refcount. `0` on success, `-1` on error. |
+| `yurt_dlopen` | `(path_ptr, path_len, flags) -> handle` | Resolve path, locate or compile side module, instantiate, return opaque handle. `0` on error. |
+| `yurt_dlsym` | `(handle, name_ptr, name_len) -> i32` | Look up `name` in the handle's exports; for functions, return their index in `__indirect_function_table`. `-1` on error. |
+| `yurt_dlclose` | `(handle) -> i32` | Decrement refcount. `0` on success, `-1` on error. |
 | `yurt_dlerror` | `(out_ptr, out_cap) -> i32` | Copy the last error string into the guest buffer; return bytes written (or required, if `> out_cap`). `0` if no error. |
 
-The handle is a host-side `u64` keyed into a per-sandbox handle table.
-It is deliberately opaque to the guest.
+The handle is an opaque host-allocated `i32` keyed into a per-sandbox
+handle table. wasm32's `void *` is 32 bits, so the i32 fits a guest
+`void *` directly without a guest-side trampoline. If/when a wasm64
+guest target lands, the contract widens to i64 in lockstep with the
+guest pointer width — that is a deliberate Phase 1 simplification, not
+a permanent restriction. `0` is reserved for "error / no handle".
 
 ### Instantiation algorithm
 

@@ -34,6 +34,7 @@ SETJMP_LIB := $(BUILD_DIR)/libyurt_setjmp.a
 LIB_OBJS := \
   $(BUILD_DIR)/yurt_command.o \
   $(BUILD_DIR)/yurt_cwd.o \
+  $(BUILD_DIR)/yurt_dlfcn.o \
   $(BUILD_DIR)/yurt_dup.o \
   $(BUILD_DIR)/yurt_exec.o \
   $(BUILD_DIR)/yurt_fetch.o \
