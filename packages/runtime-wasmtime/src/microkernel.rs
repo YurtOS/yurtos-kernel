@@ -102,6 +102,8 @@ const METHOD_KERNEL_REGISTER_FILE: u32 = 8;
 const METHOD_KERNEL_SET_ARGV: u32 = 9;
 const METHOD_KERNEL_INSTALL_HOST_FS_MOUNT: u32 = 11;
 const METHOD_KERNEL_INSTALL_YURTFS: u32 = 12;
+const METHOD_KERNEL_REGISTER_CHILD: u32 = 13;
+const METHOD_KERNEL_RECORD_EXIT: u32 = 14;
 
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
@@ -472,6 +474,43 @@ impl Microkernel {
         let rc = self.syscall(METHOD_KERNEL_INSTALL_HOST_FS_MOUNT, prefix, &mut [])?;
         if rc != 0 {
             anyhow::bail!("kernel_install_host_fs_mount failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    /// Spawn a child user-process linked to `parent_pid`. Same as
+    /// `spawn_user_process_with_args` but registers the parent/child
+    /// relationship in the kernel; the parent's `sys_wait` finds
+    /// the child once it exits. Use `record_exit` after the child
+    /// runs to completion to make wait return the status.
+    pub fn spawn_child<S: AsRef<[u8]>>(
+        &self,
+        parent_pid: u32,
+        wasm: &[u8],
+        argv: &[S],
+    ) -> Result<UserProcess> {
+        let user = self.spawn_user_process_with_args(wasm, argv)?;
+        let mut req = Vec::with_capacity(8);
+        req.extend_from_slice(&parent_pid.to_le_bytes());
+        req.extend_from_slice(&user.pid.to_le_bytes());
+        let rc = self.syscall(METHOD_KERNEL_REGISTER_CHILD, &req, &mut [])?;
+        if rc != 0 {
+            anyhow::bail!("kernel_register_child failed: rc={rc}");
+        }
+        Ok(user)
+    }
+
+    /// Record a process's exit status with the kernel so its
+    /// parent's `sys_wait` can reap it. Embedders typically call
+    /// this after a `UserProcess::run_start` returns (extracting
+    /// the exit code from the proc_exit trap).
+    pub fn record_exit(&self, pid: u32, exit_status: i32) -> Result<()> {
+        let mut req = Vec::with_capacity(8);
+        req.extend_from_slice(&pid.to_le_bytes());
+        req.extend_from_slice(&exit_status.to_le_bytes());
+        let rc = self.syscall(METHOD_KERNEL_RECORD_EXIT, &req, &mut [])?;
+        if rc != 0 {
+            anyhow::bail!("kernel_record_exit failed: rc={rc}");
         }
         Ok(())
     }

@@ -21,6 +21,7 @@ include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
 /// Reserved pid for direct calls from outside any user process — i.e.
 /// the microkernel itself driving the kernel for tests, bootstrapping,
 /// or its own bookkeeping. Real user processes start at pid 1.
+#[allow(dead_code)]
 pub const KERNEL_PID: u32 = 0;
 
 pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
@@ -40,15 +41,18 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_INSTALL_TAR_LAYER => install_tar_layer(request),
         METHOD_KERNEL_INSTALL_HOST_FS_MOUNT => install_host_fs_mount(request),
         METHOD_KERNEL_INSTALL_YURTFS => install_yurtfs(request),
+        METHOD_KERNEL_REGISTER_CHILD => register_child(request),
+        METHOD_KERNEL_RECORD_EXIT => record_exit(request),
+        METHOD_SYS_WAIT => sys_wait(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
         METHOD_SYS_GETEGID => with_kernel(|k| k.process(caller_pid).credentials.egid as i64),
         METHOD_SYS_GETPID => caller_pid as i64,
-        // No process tree yet: every process's parent is the kernel
-        // itself. Once the spawn syscall lands and the kernel tracks a
-        // real Process map, this reads ppid from that map.
-        METHOD_SYS_GETPPID => KERNEL_PID as i64,
+        // ppid comes from the Process record now that
+        // kernel_register_child wires parent/child links. Returns 0
+        // (KERNEL_PID) for the root user-process.
+        METHOD_SYS_GETPPID => with_kernel(|k| k.process(caller_pid).ppid as i64),
         METHOD_SYS_UMASK => umask(caller_pid, request),
         METHOD_SYS_SETRESUID => setresuid(caller_pid, request),
         METHOD_SYS_SETRESGID => setresgid(caller_pid, request),
@@ -754,6 +758,90 @@ fn set_argv(request: &[u8]) -> i64 {
         k.process_mut(pid).argv = argv;
     });
     0
+}
+
+/// `kernel_register_child(parent_pid, child_pid)`. Microkernel-
+/// only; sets the child's ppid and adds it to parent's children
+/// list. Called after the host has spawned a child user-process.
+fn register_child(request: &[u8]) -> i64 {
+    let Some([parent, child]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        k.process_mut(child).ppid = parent;
+        let pp = k.process_mut(parent);
+        if !pp.children.contains(&child) {
+            pp.children.push(child);
+        }
+    });
+    0
+}
+
+/// `kernel_record_exit(pid, exit_status)`. Microkernel-only; marks
+/// `pid` as zombie with the given exit status. The next sys_wait
+/// from its parent will reap it.
+fn record_exit(request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let pid = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let status = i32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    with_kernel(|k| {
+        k.process_mut(pid).exit_status = Some(status);
+    });
+    0
+}
+
+/// `wait(child_pid, flags) -> (pid, status)`. child_pid==0 means
+/// "any child". Returns 8 bytes (u32 pid + i32 status) on a
+/// successful reap, -EAGAIN if WNOHANG (flags bit 0) and no child
+/// has exited, -ECHILD if the caller has no waitable children.
+fn sys_wait(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([want_pid, flags]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if response.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let nohang = flags & 1 != 0;
+    with_kernel(|k| {
+        let parent = k.process_mut(caller_pid);
+        // Snapshot children we care about.
+        let candidates: Vec<u32> = if want_pid == 0 {
+            parent.children.clone()
+        } else if parent.children.contains(&want_pid) {
+            vec![want_pid]
+        } else {
+            return -(abi::ECHILD as i64);
+        };
+        if candidates.is_empty() {
+            return -(abi::ECHILD as i64);
+        }
+        // Find the first candidate that's exited.
+        let exited = candidates.iter().find_map(|&c| {
+            let cp = k.process_mut(c);
+            cp.exit_status.map(|s| (c, s))
+        });
+        let Some((pid, status)) = exited else {
+            return if nohang {
+                -(abi::EAGAIN as i64)
+            } else {
+                // No AsyncBridge yet → treat blocking wait the same
+                // as WNOHANG. Real blocking lands when the bridge
+                // wires kh_yield.
+                -(abi::EAGAIN as i64)
+            };
+        };
+        // Reap: drop from parent's children list. Leave the
+        // Process record itself (it may still hold metadata
+        // /proc consumers care about).
+        k.process_mut(caller_pid)
+            .children
+            .retain(|&c| c != pid);
+        response[0..4].copy_from_slice(&pid.to_le_bytes());
+        response[4..8].copy_from_slice(&status.to_le_bytes());
+        8
+    })
 }
 
 /// `kernel_install_host_fs_mount(prefix)`. Microkernel-only; mounts
@@ -3246,6 +3334,110 @@ mod tests {
         assert!(n >= 4);
         let count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         assert!(count >= 1, "root contains at least /root");
+    }
+
+    #[test]
+    fn register_child_then_getppid_returns_parent() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = 1_u32.to_le_bytes().to_vec();
+        req.extend_from_slice(&7_u32.to_le_bytes());
+        assert_eq!(dispatch(METHOD_KERNEL_REGISTER_CHILD, 0, &req, &mut []), 0);
+
+        // Child (pid 7) sees its ppid (1) via getppid.
+        assert_eq!(dispatch(METHOD_SYS_GETPPID, 7, &[], &mut []), 1);
+    }
+
+    #[test]
+    fn sys_wait_returns_exited_child() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Register child 5 under parent 1, then record its exit.
+        let mut reg = 1_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(&5_u32.to_le_bytes());
+        dispatch(METHOD_KERNEL_REGISTER_CHILD, 0, &reg, &mut []);
+
+        let mut exit = 5_u32.to_le_bytes().to_vec();
+        exit.extend_from_slice(&42_i32.to_le_bytes());
+        dispatch(METHOD_KERNEL_RECORD_EXIT, 0, &exit, &mut []);
+
+        // Parent's sys_wait reaps the child. Request: child_pid=0 (any) + flags=0.
+        let mut wreq = 0_u32.to_le_bytes().to_vec();
+        wreq.extend_from_slice(&0_u32.to_le_bytes());
+        let mut wresp = [0u8; 8];
+        let n = dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp);
+        assert_eq!(n, 8);
+        assert_eq!(u32::from_le_bytes(wresp[0..4].try_into().unwrap()), 5);
+        assert_eq!(i32::from_le_bytes(wresp[4..8].try_into().unwrap()), 42);
+
+        // After reaping, no more children → next wait is -ECHILD.
+        let mut wresp2 = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp2),
+            -(abi::ECHILD as i64)
+        );
+    }
+
+    #[test]
+    fn sys_wait_with_no_children_is_echild() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // pid 1 has no children — wait returns -ECHILD.
+        let mut wreq = 0_u32.to_le_bytes().to_vec();
+        wreq.extend_from_slice(&0_u32.to_le_bytes());
+        let mut wresp = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp),
+            -(abi::ECHILD as i64)
+        );
+    }
+
+    #[test]
+    fn sys_wait_running_child_is_eagain_with_wnohang() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Register child but don't record exit — wait returns -EAGAIN
+        // (and continues to with WNOHANG; blocking semantics will
+        // wait via AsyncBridge once it lands).
+        let mut reg = 1_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        dispatch(METHOD_KERNEL_REGISTER_CHILD, 0, &reg, &mut []);
+
+        let mut wreq = 0_u32.to_le_bytes().to_vec();
+        wreq.extend_from_slice(&1_u32.to_le_bytes()); // WNOHANG
+        let mut wresp = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp),
+            -(abi::EAGAIN as i64)
+        );
+    }
+
+    #[test]
+    fn sys_wait_for_specific_pid_returns_just_that_one() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Two children; only one has exited.
+        for c in [10u32, 11u32] {
+            let mut reg = 1_u32.to_le_bytes().to_vec();
+            reg.extend_from_slice(&c.to_le_bytes());
+            dispatch(METHOD_KERNEL_REGISTER_CHILD, 0, &reg, &mut []);
+        }
+        let mut exit = 11_u32.to_le_bytes().to_vec();
+        exit.extend_from_slice(&7_i32.to_le_bytes());
+        dispatch(METHOD_KERNEL_RECORD_EXIT, 0, &exit, &mut []);
+
+        // Wait specifically on pid 10 — running, not 11 (exited).
+        // Should return -EAGAIN (would block) since 10 hasn't exited.
+        let mut wreq = 10_u32.to_le_bytes().to_vec();
+        wreq.extend_from_slice(&1_u32.to_le_bytes()); // WNOHANG
+        let mut wresp = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp),
+            -(abi::EAGAIN as i64)
+        );
+
+        // Now wait on pid 11 — that one exited.
+        let mut wreq = 11_u32.to_le_bytes().to_vec();
+        wreq.extend_from_slice(&0_u32.to_le_bytes());
+        let n = dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp);
+        assert_eq!(n, 8);
+        assert_eq!(u32::from_le_bytes(wresp[0..4].try_into().unwrap()), 11);
+        assert_eq!(i32::from_le_bytes(wresp[4..8].try_into().unwrap()), 7);
     }
 
     #[test]

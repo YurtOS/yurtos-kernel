@@ -190,6 +190,21 @@ pub struct Process {
     /// /proc/<pid>/comm. Empty if the microkernel never registered
     /// it (e.g. tests that hit the kernel directly).
     pub argv: Vec<Vec<u8>>,
+    /// Parent pid. 0 means "no parent / kernel is parent" (the
+    /// initial user process and any orphaned children point here).
+    /// Set by the microkernel via `kernel_register_child` after a
+    /// successful spawn.
+    pub ppid: Pid,
+    /// Direct children's pids. Updated alongside ppid on
+    /// register_child; entries are removed when sys_wait reaps a
+    /// child (zombie → fully gone).
+    pub children: Vec<Pid>,
+    /// POSIX exit status when the process has terminated; None
+    /// while running. Bits 0..=7 carry the exit code, bits 8..=15
+    /// carry the signal number when killed (matches Linux
+    /// waitstatus encoding). The microkernel sets this via
+    /// `kernel_record_exit`; sys_wait reads it.
+    pub exit_status: Option<i32>,
 }
 
 impl Default for Process {
@@ -211,6 +226,9 @@ impl Default for Process {
             yield_count: 0,
             last_nanosleep_ns: 0,
             argv: Vec::new(),
+            ppid: 0,
+            children: Vec::new(),
+            exit_status: None,
         }
     }
 }

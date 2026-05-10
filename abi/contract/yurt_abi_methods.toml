@@ -85,6 +85,21 @@ id = 12
 kind = "internal"
 doc = "Microkernel-only: mount a full YURTFS L1+L2 overlay at the given prefix in one call. Request bytes are u32 prefix_len LE + prefix_bytes + tar_archive_bytes. The kernel walks the tar (lower / image), creates a fresh ramfs (upper / overlay), composes them via OverlayBackend, and mounts the result. Reads fall through to lower; writes go to upper; first write of a lower-only file copies up. Phase 6 surface — uncompressed tar, no whiteouts, no metadata copy-up, ramfs-backed upper. Returns 0 on success, -EINVAL for malformed input."
 
+[method.kernel_register_child]
+id = 13
+kind = "internal"
+doc = "Microkernel-only: record a parent/child relationship after the host has spawned a child user-process. Request bytes: u32 parent_pid LE + u32 child_pid LE. The kernel sets child's ppid and adds child to parent's child list so sys_wait can find it. Returns 0 on success."
+
+[method.kernel_record_exit]
+id = 14
+kind = "internal"
+doc = "Microkernel-only: mark a process as exited. Request bytes: u32 pid LE + i32 exit_status LE (POSIX exit codes; the high byte carries the signal number when the process was killed). The kernel transitions the process to zombie state; the next sys_wait from its parent reaps it. Returns 0 on success."
+
+[method.sys_wait]
+id = 0x1_002C
+kind = "syscall"
+doc = "POSIX waitpid-style wait. Request bytes: u32 child_pid LE (0 = wait for any child) + u32 flags LE (bit 0 = WNOHANG). Response: 8 bytes — u32 exited_pid LE + i32 exit_status LE. Returns 8 on success, -ECHILD if no children to wait on, -EAGAIN if WNOHANG and no child has exited yet."
+
 # Syscall methods (0x1_0000+ range).
 #
 # These are the real user-process-facing syscalls — `sys_*` names match
