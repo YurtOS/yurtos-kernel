@@ -103,6 +103,9 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_IDB_PUT => sys_idb_put(request),
         METHOD_SYS_IDB_DELETE => sys_idb_delete(request),
         METHOD_SYS_IDB_LIST => sys_idb_list(request, response),
+        METHOD_SYS_SOCKET_LISTEN => sys_socket_listen(request),
+        METHOD_SYS_SOCKET_ACCEPT => sys_socket_accept(request),
+        METHOD_SYS_SOCKET_ADDR => sys_socket_addr(request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -1290,6 +1293,42 @@ fn sys_idb_list(request: &[u8], response: &mut [u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     kh::idb_list(store, prefix, response)
+}
+
+/// `sys_socket_listen(backlog, addr) -> handle`. Combines
+/// open+bind+listen so userland gets a usable listener in one
+/// hop. Request: u32 backlog LE + addr ('host:port', port=0
+/// = host-chosen).
+fn sys_socket_listen(request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let backlog = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let addr = &request[4..];
+    if addr.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    kh::socket_listen_at(addr, backlog) as i64
+}
+
+fn sys_socket_accept(request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    kh::socket_accept(handle, flags) as i64
+}
+
+fn sys_socket_addr(request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    if response.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    kh::socket_local_addr(handle, response)
 }
 
 /// `sys_socket_connect(addr_bytes) -> handle`. Request layout

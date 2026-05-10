@@ -85,6 +85,9 @@ const METHOD_SYS_IDB_GET: u32 = 0x1_0035;
 const METHOD_SYS_IDB_PUT: u32 = 0x1_0036;
 const METHOD_SYS_IDB_DELETE: u32 = 0x1_0037;
 const METHOD_SYS_IDB_LIST: u32 = 0x1_0038;
+const METHOD_SYS_SOCKET_LISTEN: u32 = 0x1_0039;
+const METHOD_SYS_SOCKET_ACCEPT: u32 = 0x1_003A;
+const METHOD_SYS_SOCKET_ADDR: u32 = 0x1_003B;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -178,8 +181,11 @@ fn kernel_wasm_imports_match_documented_namespaces() {
             "kh_real_symlink",
             "kh_real_unlink",
             "kh_real_write",
+            "kh_socket_accept_blocking",
             "kh_socket_close",
             "kh_socket_connect",
+            "kh_socket_listen_at",
+            "kh_socket_local_addr",
             "kh_socket_recv",
             "kh_socket_send",
         ],
@@ -1120,6 +1126,92 @@ fn sys_idb_denied_by_policy_returns_eacces() {
 }
 
 #[test]
+fn sys_socket_listen_accept_round_trips_through_kernel() {
+    // Userland inside the sandbox listens on 127.0.0.1:0 (host-
+    // chosen port), retrieves the actual port via sys_socket_addr,
+    // and accepts an incoming connection. A test thread plays the
+    // remote dialer and writes a payload; the listener accepts,
+    // recv's the bytes, validates them.
+    use std::io::Write;
+    use std::net::TcpStream;
+
+    build_kernel_wasm().unwrap();
+    let mut host = HostState::default();
+    host.tcp = Some(Arc::new(NativeTcpSocket::new()));
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+
+    // sys_socket_listen request: u32 backlog + addr.
+    let mut req = 16_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"127.0.0.1:0");
+    let listener = mk.syscall(METHOD_SYS_SOCKET_LISTEN, &req, &mut []).unwrap();
+    assert!(listener >= 0, "listen failed: {listener}");
+    let listener_handle = listener as i32;
+
+    // Discover the actually-bound port.
+    let mut addr_buf = [0u8; 64];
+    let n = mk
+        .syscall(METHOD_SYS_SOCKET_ADDR, &listener_handle.to_le_bytes(), &mut addr_buf)
+        .unwrap();
+    assert!(n > 2, "addr response: {n}");
+    let port = u16::from_le_bytes(addr_buf[0..2].try_into().unwrap());
+    assert!(port > 0, "kernel-chosen port must be non-zero");
+
+    // Dial from a separate thread so accept() can complete.
+    let dialer = std::thread::spawn(move || {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"incoming").unwrap();
+    });
+
+    // Accept (blocks until the dialer connects).
+    let mut acc_req = listener_handle.to_le_bytes().to_vec();
+    acc_req.extend_from_slice(&0_u32.to_le_bytes()); // flags=0 (blocking)
+    let conn = mk.syscall(METHOD_SYS_SOCKET_ACCEPT, &acc_req, &mut []).unwrap();
+    assert!(conn >= 0, "accept failed: {conn}");
+    let conn_handle = conn as i32;
+
+    // recv on the connection.
+    let mut recv_req = conn_handle.to_le_bytes().to_vec();
+    recv_req.extend_from_slice(&0_u32.to_le_bytes());
+    let mut buf = vec![0u8; 64];
+    let n = mk
+        .syscall(METHOD_SYS_SOCKET_RECV, &recv_req, &mut buf)
+        .unwrap();
+    assert!(n > 0, "recv failed: {n}");
+    assert_eq!(&buf[..n as usize], b"incoming");
+
+    let _ = dialer.join();
+    assert_eq!(
+        mk.syscall(METHOD_SYS_SOCKET_CLOSE, &conn_handle.to_le_bytes(), &mut [])
+            .unwrap(),
+        0,
+    );
+    assert_eq!(
+        mk.syscall(METHOD_SYS_SOCKET_CLOSE, &listener_handle.to_le_bytes(), &mut [])
+            .unwrap(),
+        0,
+    );
+}
+
+#[test]
+fn sys_socket_listen_denied_by_policy_returns_eacces() {
+    use yurt_runtime_wasmtime::microkernel::DenyAllPolicy;
+    build_kernel_wasm().unwrap();
+    let mk = Microkernel::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            policy: Arc::new(DenyAllPolicy),
+            tcp: Some(Arc::new(NativeTcpSocket::new())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut req = 16_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"127.0.0.1:0");
+    let rc = mk.syscall(METHOD_SYS_SOCKET_LISTEN, &req, &mut []).unwrap();
+    assert_eq!(rc, -13, "deny → -EACCES, got {rc}");
+}
+
+#[test]
 fn sys_socket_connect_send_recv_through_local_echo_server() {
     // Spin up a one-shot TCP echo server on 127.0.0.1, dial it
     // through sys_socket_connect, send a payload, recv it back,
@@ -1811,6 +1903,21 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             "sys_idb_list",
             METHOD_SYS_IDB_LIST,
             METHOD_SYS_IDB_LIST as i64,
+        ),
+        (
+            "sys_socket_listen",
+            METHOD_SYS_SOCKET_LISTEN,
+            METHOD_SYS_SOCKET_LISTEN as i64,
+        ),
+        (
+            "sys_socket_accept",
+            METHOD_SYS_SOCKET_ACCEPT,
+            METHOD_SYS_SOCKET_ACCEPT as i64,
+        ),
+        (
+            "sys_socket_addr",
+            METHOD_SYS_SOCKET_ADDR,
+            METHOD_SYS_SOCKET_ADDR as i64,
         ),
     ] {
         let entry = methods

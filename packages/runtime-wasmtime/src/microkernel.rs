@@ -424,8 +424,29 @@ pub trait TcpSocketImpl: Send + Sync {
     /// Receive into `buf`. Returns bytes-read (0 = peer closed)
     /// or negated errno (-EAGAIN with KH_SOCK_NONBLOCK).
     fn recv(&self, handle: i32, buf: &mut [u8], flags: u32) -> i64;
-    /// Close the handle.
+    /// Close the handle (listener or connection).
     fn close(&self, handle: i32) -> i32;
+    /// Bind to `host:port` (port=0 lets the host pick) and start
+    /// accepting. Returns a listener handle or negated errno.
+    /// Default: -ENOSYS — embedders that want listen wire it up
+    /// in their TcpSocketImpl. (Browser microkernels typically
+    /// implement this via Service Worker / WebSocket relay; see
+    /// the project_listen_port_mapping memory note.)
+    fn listen(&self, _host: &str, _port: u16, _backlog: u32) -> i32 {
+        -38 // -ENOSYS
+    }
+    /// Block until an incoming connection arrives on `handle`.
+    /// Returns a connection handle (usable with send/recv/close)
+    /// or negated errno. -EAGAIN with KH_SOCK_NONBLOCK.
+    fn accept(&self, _handle: i32, _flags: u32) -> i32 {
+        -38
+    }
+    /// Return the locally-bound (host, port) of `handle`. Used
+    /// after listen with port=0 to discover the kernel-chosen
+    /// port.
+    fn local_addr(&self, _handle: i32) -> Option<(String, u16)> {
+        None
+    }
 }
 
 /// std::net::TcpStream-backed [`TcpSocketImpl`]. Blocking I/O;
@@ -440,6 +461,7 @@ pub struct NativeTcpSocket {
 #[derive(Default)]
 struct NativeTcpState {
     sockets: std::collections::BTreeMap<i32, std::net::TcpStream>,
+    listeners: std::collections::BTreeMap<i32, std::net::TcpListener>,
     next_handle: i32,
 }
 
@@ -516,8 +538,77 @@ impl TcpSocketImpl for NativeTcpSocket {
     }
 
     fn close(&self, handle: i32) -> i32 {
-        self.inner.lock().unwrap().sockets.remove(&handle);
+        let mut s = self.inner.lock().unwrap();
+        // A handle may be either a connected stream or a listener;
+        // close releases whichever side it is.
+        s.sockets.remove(&handle);
+        s.listeners.remove(&handle);
         0
+    }
+
+    fn listen(&self, host: &str, port: u16, _backlog: u32) -> i32 {
+        let bind_addr = if host == "0.0.0.0" || host == "" {
+            format!("0.0.0.0:{port}")
+        } else if host == "localhost" {
+            format!("127.0.0.1:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
+        let listener = match std::net::TcpListener::bind(&bind_addr) {
+            Ok(l) => l,
+            Err(e) => return tcp_io_errno(e),
+        };
+        let mut s = self.inner.lock().unwrap();
+        let handle = s.next_handle;
+        s.next_handle = s.next_handle.saturating_add(1);
+        s.listeners.insert(handle, listener);
+        handle
+    }
+
+    fn accept(&self, handle: i32, _flags: u32) -> i32 {
+        // Take ownership of the listener temporarily so the lock
+        // is released across the (potentially-blocking) accept.
+        // We don't dup the listener — pulling it out then putting
+        // it back is single-threaded and good enough for this
+        // slice. (A future slice with multiple concurrent accepts
+        // can use Arc<TcpListener>.)
+        let listener = {
+            let mut s = self.inner.lock().unwrap();
+            match s.listeners.remove(&handle) {
+                Some(l) => l,
+                None => return -(9 as i32), // -EBADF
+            }
+        };
+        let result = listener.accept();
+        // Restore the listener so subsequent accepts work.
+        {
+            let mut s = self.inner.lock().unwrap();
+            s.listeners.insert(handle, listener);
+        }
+        match result {
+            Ok((stream, _peer)) => {
+                let mut s = self.inner.lock().unwrap();
+                let conn = s.next_handle;
+                s.next_handle = s.next_handle.saturating_add(1);
+                s.sockets.insert(conn, stream);
+                conn
+            }
+            Err(e) => tcp_io_errno(e),
+        }
+    }
+
+    fn local_addr(&self, handle: i32) -> Option<(String, u16)> {
+        let s = self.inner.lock().unwrap();
+        if let Some(l) = s.listeners.get(&handle) {
+            return l.local_addr().ok().map(|a| (a.ip().to_string(), a.port()));
+        }
+        if let Some(stream) = s.sockets.get(&handle) {
+            return stream
+                .local_addr()
+                .ok()
+                .map(|a| (a.ip().to_string(), a.port()));
+        }
+        None
     }
 }
 
@@ -2131,6 +2222,89 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 None => return 0,
             };
             tcp.close(handle)
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_socket_listen_at",
+        |mut caller: Caller<'_, KernelStoreData>,
+         addr_ptr: u32,
+         addr_len: u32,
+         backlog: u32|
+         -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT as i32,
+            };
+            let mut addr = vec![0u8; addr_len as usize];
+            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
+                return -EFAULT as i32;
+            }
+            let addr_str = match std::str::from_utf8(&addr) {
+                Ok(s) => s,
+                Err(_) => return -EINVAL as i32,
+            };
+            let (host, port_str) = match addr_str.rsplit_once(':') {
+                Some(p) => p,
+                None => return -EINVAL as i32,
+            };
+            let port: u16 = match port_str.parse() {
+                Ok(p) => p,
+                Err(_) => return -EINVAL as i32,
+            };
+            if caller.data().host.policy.may_listen(port) == PolicyDecision::Deny {
+                return -EACCES as i32;
+            }
+            let tcp = match caller.data().host.tcp.clone() {
+                Some(t) => t,
+                None => return -EACCES as i32,
+            };
+            tcp.listen(host, port, backlog)
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_socket_accept_blocking",
+        |mut caller: Caller<'_, KernelStoreData>, handle: i32, flags: u32| -> i32 {
+            let tcp = match caller.data().host.tcp.clone() {
+                Some(t) => t,
+                None => return -(9 as i32), // -EBADF
+            };
+            tcp.accept(handle, flags)
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_socket_local_addr",
+        |mut caller: Caller<'_, KernelStoreData>,
+         handle: i32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            let tcp = match caller.data().host.tcp.clone() {
+                Some(t) => t,
+                None => return -(9 as i64),
+            };
+            let (host, port) = match tcp.local_addr(handle) {
+                Some(p) => p,
+                None => return -(9 as i64),
+            };
+            let host_bytes = host.as_bytes();
+            let need = 2 + host_bytes.len();
+            if (need as u32) > out_cap {
+                return -(7 as i64); // -E2BIG
+            }
+            let mut buf = Vec::with_capacity(need);
+            buf.extend_from_slice(&port.to_le_bytes());
+            buf.extend_from_slice(host_bytes);
+            if memory.write(&mut caller, out_ptr as usize, &buf).is_err() {
+                return -EFAULT;
+            }
+            need as i64
         },
     )?;
 

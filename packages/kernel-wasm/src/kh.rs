@@ -51,6 +51,9 @@ extern "C" {
     fn kh_socket_send(handle: i32, data_ptr: *const u8, data_len: usize) -> i64;
     fn kh_socket_recv(handle: i32, out_ptr: *mut u8, len: usize, flags: u32) -> i64;
     fn kh_socket_close(handle: i32) -> i32;
+    fn kh_socket_listen_at(addr_ptr: *const u8, addr_len: usize, backlog: u32) -> i32;
+    fn kh_socket_accept_blocking(handle: i32, flags: u32) -> i32;
+    fn kh_socket_local_addr(handle: i32, out_ptr: *mut u8, out_cap: usize) -> i64;
     fn kh_idb_get(
         store_ptr: *const u8,
         store_len: usize,
@@ -205,6 +208,21 @@ unsafe fn kh_socket_recv(
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_socket_close(_handle: i32) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_socket_listen_at(_addr_ptr: *const u8, _addr_len: usize, _backlog: u32) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_socket_accept_blocking(_handle: i32, _flags: u32) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_socket_local_addr(_handle: i32, _out_ptr: *mut u8, _out_cap: usize) -> i64 {
     -38
 }
 
@@ -381,6 +399,18 @@ pub fn socket_recv(handle: i32, buf: &mut [u8], flags: u32) -> i64 {
 
 pub fn socket_close(handle: i32) -> i32 {
     unsafe { kh_socket_close(handle) }
+}
+
+pub fn socket_listen_at(addr: &[u8], backlog: u32) -> i32 {
+    unsafe { kh_socket_listen_at(addr.as_ptr(), addr.len(), backlog) }
+}
+
+pub fn socket_accept(handle: i32, flags: u32) -> i32 {
+    unsafe { kh_socket_accept_blocking(handle, flags) }
+}
+
+pub fn socket_local_addr(handle: i32, out: &mut [u8]) -> i64 {
+    unsafe { kh_socket_local_addr(handle, out.as_mut_ptr(), out.len()) }
 }
 
 pub fn idb_get(store: &[u8], key: &[u8], out: &mut [u8]) -> i64 {

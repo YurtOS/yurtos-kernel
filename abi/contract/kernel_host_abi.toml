@@ -247,6 +247,32 @@ args = [
 # Stores are arbitrary opaque names (the embedder may forbid
 # certain prefixes via policy).
 
+[import.kh_socket_listen_at]
+doc = "Open + bind + listen in one shot. addr is UTF-8 'host:port'; port=0 lets the host pick. Returns a listener handle or negated errno. Use kh_socket_addr to fetch the actually-bound port."
+return = "scalar"
+args = [
+  { name = "addr_ptr", type = "ptr" },
+  { name = "addr_len", type = "usize" },
+  { name = "backlog", type = "u32" },
+]
+
+[import.kh_socket_accept_blocking]
+doc = "Block until a connection arrives on `handle`. Returns the connection's socket handle (usable with kh_socket_send/recv/close), -EAGAIN with KH_SOCK_NONBLOCK, or other errno."
+return = "scalar"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "flags", type = "u32" },
+]
+
+[import.kh_socket_local_addr]
+doc = "Write the bound address as u16 port LE + UTF-8 host bytes into (out_ptr, out_cap). Returns bytes-written or -EBADF."
+return = "fixed_out"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
 [import.kh_idb_get]
 doc = "Read a value. Writes (out_ptr, out_cap) and returns bytes-written, or -ENOENT, -EACCES, -E2BIG."
 return = "fixed_out"
