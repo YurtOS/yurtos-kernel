@@ -287,3 +287,13 @@ doc = "POSIX unlink(path). Request bytes: path. Removes the path's user-visible 
 id = 0x1_0026
 kind = "syscall"
 doc = "POSIX stat(path). Path-based version of sys_fstat. Request bytes: path. Response: same 16-byte layout as sys_fstat (u64 size + u32 filetype + u32 mode). Returns 16 on success, -ENOENT if the path doesn't resolve."
+
+[method.sys_symlink]
+id = 0x1_0027
+kind = "syscall"
+doc = "POSIX symlink(target, link_path). Request bytes: u32 target_len LE + target_bytes + link_path_bytes. Creates a symlink at link_path pointing at target (target may be absolute or relative — the kernel stores the bytes verbatim and resolves at open time). Backends that support symlinks (Ramfs and Overlay-upper) install the link; read-only backends (Tar / Proc / Dev / HostFs without write) return -EROFS. Returns 0 / -EROFS / -EEXIST / -EINVAL."
+
+[method.sys_readlink]
+id = 0x1_0028
+kind = "syscall"
+doc = "POSIX readlink(path). Request bytes: path. Response: target bytes. Returns bytes-written on success, -ENOENT if no symlink at that path, -EINVAL if the path is a regular file."

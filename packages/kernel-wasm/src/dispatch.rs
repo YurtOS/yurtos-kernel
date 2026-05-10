@@ -81,6 +81,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_UTIMENS => utimens(caller_pid, request),
         METHOD_SYS_UNLINK => unlink(caller_pid, request),
         METHOD_SYS_STAT => stat_path(caller_pid, request, response),
+        METHOD_SYS_SYMLINK => symlink(caller_pid, request),
+        METHOD_SYS_READLINK => readlink(caller_pid, request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -884,6 +886,23 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
         // Refresh procfs snapshots so /proc/<N>/status reflects the
         // current process table at open time.
         k.publish_proc_snapshots();
+        // Symlink resolution: walk the path through readlink up to
+        // 40 hops (POSIX SYMLOOP_MAX). Each hop replaces the path
+        // verbatim — Phase 7 only handles final-component
+        // symlinks; intermediate-dir resolution comes with mkdir.
+        let mut resolved: Vec<u8> = path.to_vec();
+        let mut hops = 0u32;
+        loop {
+            let Some(target) = k.vfs.readlink(&resolved) else {
+                break;
+            };
+            hops += 1;
+            if hops > 40 {
+                return -(abi::EINVAL as i64); // -ELOOP shape
+            }
+            resolved = target;
+        }
+        let path: &[u8] = &resolved;
         // open() handles both lookup and create-if-missing in one
         // call. The flags bits propagate to the backend so it knows
         // the caller's intent (writable opens vs read-only).
@@ -990,6 +1009,45 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         response[8..12].copy_from_slice(&filetype.to_le_bytes());
         response[12..16].copy_from_slice(&mode.to_le_bytes());
         16
+    })
+}
+
+/// `symlink(target_len, target, link_path)`. Request: u32 target_len
+/// LE + target_bytes + link_path_bytes. Returns 0 on success or
+/// negated POSIX errno from the backend.
+fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let target_len =
+        u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    if request.len() < 4 + target_len {
+        return -(abi::EINVAL as i64);
+    }
+    let target = &request[4..4 + target_len];
+    let link_path = &request[4 + target_len..];
+    if link_path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| k.vfs.symlink(target, link_path) as i64)
+}
+
+/// `readlink(path) -> bytes-written or -ENOENT/-EINVAL`. Writes
+/// the symlink target into the response. Path that doesn't resolve
+/// to a symlink returns -EINVAL (POSIX) or -ENOENT (no such path).
+fn readlink(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| {
+        let Some(target) = k.vfs.readlink(request) else {
+            return -(abi::EINVAL as i64);
+        };
+        let n = target.len().min(response.len());
+        response[..n].copy_from_slice(&target[..n]);
+        n as i64
     })
 }
 
@@ -2973,6 +3031,85 @@ mod tests {
         assert_eq!(
             dispatch(METHOD_SYS_STAT, 1, b"/missing", &mut out),
             -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
+    fn symlink_creates_link_and_readlink_returns_target() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Register a target file so we can verify the open follows.
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&5_u32.to_le_bytes());
+        reg.extend_from_slice(b"/real");
+        reg.extend_from_slice(b"contents");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        // sys_symlink(target="/real", link="/alias")
+        let target: &[u8] = b"/real";
+        let link_path: &[u8] = b"/alias";
+        let mut req = (target.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(target);
+        req.extend_from_slice(link_path);
+        assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &req, &mut []), 0);
+
+        // readlink returns the target verbatim.
+        let mut buf = [0u8; 16];
+        let n = dispatch(METHOD_SYS_READLINK, 1, b"/alias", &mut buf);
+        assert_eq!(&buf[..n as usize], b"/real");
+    }
+
+    #[test]
+    fn open_follows_symlink_to_target() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&5_u32.to_le_bytes());
+        reg.extend_from_slice(b"/real");
+        reg.extend_from_slice(b"contents");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        // Create alias → real.
+        let mut sreq = 5_u32.to_le_bytes().to_vec();
+        sreq.extend_from_slice(b"/real");
+        sreq.extend_from_slice(b"/alias");
+        dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []);
+
+        // sys_open /alias should follow the symlink and read /real.
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/alias"), &mut []);
+        let mut buf = [0u8; 32];
+        let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"contents");
+    }
+
+    #[test]
+    fn open_eloops_on_circular_symlinks() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // a -> b -> a — open should bail with -EINVAL after the
+        // hop limit (SYMLOOP_MAX 40).
+        let mut sreq = 2_u32.to_le_bytes().to_vec();
+        sreq.extend_from_slice(b"/b");
+        sreq.extend_from_slice(b"/a");
+        dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []);
+        let mut sreq = 2_u32.to_le_bytes().to_vec();
+        sreq.extend_from_slice(b"/a");
+        sreq.extend_from_slice(b"/b");
+        dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []);
+
+        let rc = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/a"), &mut []);
+        assert!(rc < 0, "circular symlink should error: rc = {rc}");
+    }
+
+    #[test]
+    fn readlink_on_regular_file_is_einval() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        reg.extend_from_slice(b"/rg");
+        reg.extend_from_slice(b"hi");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_READLINK, 1, b"/rg", &mut buf),
+            -(abi::EINVAL as i64)
         );
     }
 

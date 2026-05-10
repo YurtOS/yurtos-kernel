@@ -128,6 +128,20 @@ pub trait VfsBackend: Send {
     fn unlink(&mut self, _path: &[u8]) -> i32 {
         -30 // -EROFS
     }
+
+    /// Install a symlink at `link_path` pointing at `target`.
+    /// Returns 0 on success, -EROFS if the backend is read-only,
+    /// -EEXIST if a path is already there. Default: -EROFS.
+    fn symlink(&mut self, _target: &[u8], _link_path: &[u8]) -> i32 {
+        -30 // -EROFS
+    }
+
+    /// If `path` is a symlink, return its target bytes verbatim
+    /// (resolution is the kernel's job, not the backend's).
+    /// Returns None for non-symlinks or unknown paths.
+    fn readlink(&self, _path: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// One row in the mount table.
@@ -260,6 +274,23 @@ impl MountTable {
         self.mounts[id as usize].backend.unlink(&rel)
     }
 
+    /// Create a symlink at `link_path` pointing at `target`. Routes to
+    /// the backend that owns `link_path`. Returns 0 on success or
+    /// negated POSIX errno.
+    pub fn symlink(&mut self, target: &[u8], link_path: &[u8]) -> i32 {
+        let Some((id, rel)) = self.resolve(link_path) else {
+            return -2; // -ENOENT
+        };
+        self.mounts[id as usize].backend.symlink(target, &rel)
+    }
+
+    /// Read the symlink at `path`. Returns target bytes if `path`
+    /// resolves to a symlink, None otherwise.
+    pub fn readlink(&self, path: &[u8]) -> Option<Vec<u8>> {
+        let (id, rel) = self.resolve(path)?;
+        self.mounts[id as usize].backend.readlink(&rel)
+    }
+
     /// Push a fresh snapshot of the kernel's process table to every
     /// mounted backend. Called from dispatch before /proc-touching
     /// syscalls so procfs serves up-to-date contents.
@@ -300,6 +331,10 @@ impl MountTable {
 pub struct RamfsBackend {
     inodes: BTreeMap<u64, Vec<u8>>, // inode → content
     paths: BTreeMap<Vec<u8>, u64>,  // path → inode
+    /// path → symlink target bytes. Symlinks are tracked separately
+    /// from regular files so lookup paths can fall through to
+    /// readlink without colliding with regular-file inode numbers.
+    symlinks: BTreeMap<Vec<u8>, Vec<u8>>,
     next_id: u64,
 }
 
@@ -308,6 +343,7 @@ impl RamfsBackend {
         Self {
             inodes: BTreeMap::new(),
             paths: BTreeMap::new(),
+            symlinks: BTreeMap::new(),
             next_id: 1,
         }
     }
@@ -472,11 +508,27 @@ impl VfsBackend for RamfsBackend {
     }
 
     fn unlink(&mut self, path: &[u8]) -> i32 {
+        // Symlinks unlink the same way as regular files.
+        if self.symlinks.remove(path).is_some() {
+            return 0;
+        }
         let Some(id) = self.paths.remove(path) else {
             return -2; // -ENOENT
         };
         self.inodes.remove(&id);
         0
+    }
+
+    fn symlink(&mut self, target: &[u8], link_path: &[u8]) -> i32 {
+        if self.paths.contains_key(link_path) || self.symlinks.contains_key(link_path) {
+            return -17; // -EEXIST
+        }
+        self.symlinks.insert(link_path.to_vec(), target.to_vec());
+        0
+    }
+
+    fn readlink(&self, path: &[u8]) -> Option<Vec<u8>> {
+        self.symlinks.get(path).cloned()
     }
 }
 
