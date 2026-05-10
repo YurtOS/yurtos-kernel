@@ -165,22 +165,31 @@ class DiscardLogSink implements LogSink {
 }
 
 /**
- * Capabilities an {@link AsyncBridge} impl exposes. **Non-uniform
- * across hosts** — see project memory `project_async_bridge` for
- * the matrix. Always check `capabilities()` before calling
- * `suspendUntil`; bridges without suspension throw NOT_SUSPENDABLE.
+ * Capabilities an {@link AsyncBridge} impl exposes. **Two flags are
+ * per-host (jspi, threads) and one is per-loaded-wasm (asyncify)**.
+ * See project memory `project_async_bridge` for the matrix.
  *
  * - `jspi`: host supports `WebAssembly.Suspending` /
- *   `WebAssembly.promising`. Available on V8 / SpiderMonkey;
- *   **NOT on Safari (JavaScriptCore) today** — re-check
+ *   `WebAssembly.promising`. V8 / SpiderMonkey: yes; **Safari
+ *   (JavaScriptCore) not yet** — re-check
  *   `webassembly.org/features` before relying on it.
  * - `asyncify`: kernel.wasm + user wasm were built with binaryen
- *   `--asyncify`. Universal fallback when JSPI is unavailable.
- * - `threads`: host supports wasi-threads.
+ *   `--asyncify`. Engine-agnostic — works on every wasm engine
+ *   because the instrumentation is wasm-level. Universal fallback
+ *   when JSPI / stack switching aren't available.
+ * - `stackSwitching`: engine supports the WebAssembly Stack
+ *   Switching proposal (`cont.new`, `suspend`, `resume`).
+ *   First-class wasm suspend/resume — supersedes asyncify and
+ *   JSPI. Wasmer ships it; Chrome has experimental support.
+ *   When available, prefer over asyncify.
+ * - `threads`: host supports wasi-threads / wasm-threads. Widely
+ *   supported across modern engines and JS hosts (Safari ≥ 14.1
+ *   included).
  */
 export interface AsyncCapabilities {
   jspi: boolean;
   asyncify: boolean;
+  stackSwitching: boolean;
   threads: boolean;
 }
 
@@ -212,7 +221,7 @@ export interface AsyncBridge {
  */
 export const noopAsyncBridge: AsyncBridge = {
   capabilities() {
-    return { jspi: false, asyncify: false, threads: false };
+    return { jspi: false, asyncify: false, stackSwitching: false, threads: false };
   },
   suspendUntil() {
     throw new Error("NOT_SUSPENDABLE");
@@ -234,9 +243,15 @@ export function detectAsyncCapabilities(): AsyncCapabilities {
   const W = (globalThis as any).WebAssembly;
   const hasJspi = typeof W?.Suspending === "function" &&
     typeof W?.promising === "function";
+  // Stack Switching detection is similarly conservative — the
+  // proposal exposes a `WebAssembly.Suspending` (used by JSPI) plus
+  // `WebAssembly.Tag` etc.; for now mark unknown so engines fill
+  // in after a feature probe of their choosing.
   return {
     jspi: hasJspi,
-    asyncify: false, // engine fills this in after instantiation
+    asyncify: false, // engine fills this in after instantiation by checking
+    //                  for `asyncify_*` exports in the loaded module
+    stackSwitching: false, // engine fills this in via runtime probe
     threads: false, // wasi-threads detection is engine-level
   };
 }

@@ -80,24 +80,40 @@ pub trait HasCallerPid {
     fn caller_pid(&self) -> u32;
 }
 
-/// Capabilities a [`AsyncBridge`] impl exposes. **Non-uniform across
-/// engines and hosts** — see project memory `project_async_bridge`
-/// for the matrix. Always check capabilities before calling
-/// [`AsyncBridge::suspend_until`]; engines without suspension
-/// support return [`EngineError::NotSuspendable`].
+/// Capabilities a [`AsyncBridge`] impl exposes. **Two of these are
+/// "per-host" (JSPI, native async) and one is "per-loaded-wasm"
+/// (asyncify)** — see project memory `project_async_bridge` for the
+/// matrix. Always check capabilities before calling
+/// [`AsyncBridge::suspend_until`]; bridges with no suspension
+/// mechanism return [`EngineError::NotSuspendable`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AsyncCapabilities {
-    /// Host supports WebAssembly.Suspending / wasm-side promises
-    /// (V8 / SpiderMonkey / Wasmer). NOT available on Safari, plain
-    /// wasmtime, or WasmEdge today.
+    /// **JS hosts only.** Host supports `WebAssembly.Suspending` /
+    /// `WebAssembly.promising` so wasm imports can return Promises
+    /// that suspend the calling wasm. V8 / SpiderMonkey: yes;
+    /// JavaScriptCore (Safari): not yet. Native engines (wasmtime,
+    /// wasmedge, wasmer) use their own async mechanisms instead;
+    /// JSPI is `false` for them by definition.
     pub jspi: bool,
     /// kernel.wasm + user wasm were built with the binaryen
-    /// `--asyncify` pass, so the engine can drive coroutine-style
-    /// unwind/rewind. Universal fallback when JSPI is unavailable;
-    /// costs ~30% code size + per-call instrumentation.
+    /// `--asyncify` pass — the wasm exports
+    /// `asyncify_{start,stop}_{unwind,rewind}` and the host drives
+    /// suspension by calling them across import-call boundaries.
+    /// **Engine-agnostic**: works on wasmtime, wasmedge, wasmer,
+    /// every JS engine. Universal fallback when JSPI / stack
+    /// switching / native async aren't available.
     pub asyncify: bool,
-    /// Host supports wasi-threads (engine spawns wasm threads).
-    /// Orthogonal to suspension; relevant for kernel reentrance.
+    /// Engine supports the WebAssembly Stack Switching proposal
+    /// (`cont.new`, `suspend`, `resume`). First-class wasm
+    /// suspend/resume primitives — supersedes asyncify and JSPI.
+    /// Wasmer ships it today; Chrome has experimental support; the
+    /// rest of the matrix lags. When universal, AsyncBridge impls
+    /// prefer this over asyncify.
+    pub stack_switching: bool,
+    /// Host supports wasi-threads / wasm-threads. Widely supported
+    /// across modern engines (wasmtime, wasmedge, wasmer, V8,
+    /// SpiderMonkey, JavaScriptCore ≥ 14.1). Orthogonal to
+    /// suspension; relevant for kernel reentrance.
     pub threads: bool,
 }
 
