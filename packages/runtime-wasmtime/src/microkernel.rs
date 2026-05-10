@@ -670,18 +670,29 @@ impl Microkernel {
         wasm: &[u8],
         argv: &[S],
     ) -> Result<UserProcess> {
+        let mut next = self.next_pid.borrow_mut();
+        let pid = *next;
+        *next += 1;
+        drop(next);
+        let argv: Vec<Vec<u8>> = argv.iter().map(|s| s.as_ref().to_vec()).collect();
+        self.instantiate_with_pid(pid, wasm, argv)
+    }
+
+    /// Build a UserProcess with an explicit pid (used by
+    /// `run_pending_spawns` so the host's instance pid matches the
+    /// kernel-side pid that sys_spawn allocated). Same setup as
+    /// `spawn_user_process_with_args` modulo the pid source.
+    fn instantiate_with_pid(
+        &self,
+        pid: u32,
+        wasm: &[u8],
+        argv: Vec<Vec<u8>>,
+    ) -> Result<UserProcess> {
         let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
         let mut linker: Linker<UserState> = Linker::new(&self.engine);
         register_sys_imports(&mut linker)?;
         crate::wasi_shim::add_to_linker(&mut linker)
             .context("install WASI preview1 shim on user-process linker")?;
-
-        let mut next = self.next_pid.borrow_mut();
-        let pid = *next;
-        *next += 1;
-        drop(next);
-
-        let argv: Vec<Vec<u8>> = argv.iter().map(|s| s.as_ref().to_vec()).collect();
 
         // Push argv to the kernel so /proc/<pid>/cmdline + comm have
         // content to serve. Format: u32 pid + (u32 len + bytes)*.
@@ -698,6 +709,7 @@ impl Microkernel {
             pid,
             argv,
             dir_fds: std::collections::BTreeMap::new(),
+            last_exit: None,
         };
         let mut store = Store::new(&self.engine, user_state);
         let instance = linker
@@ -708,6 +720,29 @@ impl Microkernel {
             instance,
             pid,
         })
+    }
+
+    /// Drain every staged sys_spawn child, instantiate it with the
+    /// kernel-allocated pid, run it to completion, and call
+    /// `record_exit` so the parent's `sys_wait` can reap it.
+    /// Returns the number of children actually run. Embedders
+    /// typically call this in a loop after each parent syscall (or
+    /// in a fixed-cadence drain) — without it, sys_spawn-staged
+    /// children never run.
+    pub fn run_pending_spawns(&self) -> Result<usize> {
+        let mut count = 0usize;
+        while let Some(spawn) = self.drain_pending_spawn()? {
+            let mut child = self.instantiate_with_pid(spawn.child_pid, &spawn.wasm, spawn.argv)?;
+            // run_start traps when the child calls proc_exit; the
+            // shim stashes the exit code in UserState first. A
+            // clean return (non-WASI exit) leaves last_exit None,
+            // which we report as 0.
+            let _ = child.run_start();
+            let exit = child.last_exit().unwrap_or(0);
+            self.record_exit(spawn.child_pid, exit)?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Reserved alias for [`spawn_user_process`]. The WASI preview1
@@ -765,6 +800,12 @@ pub struct UserState {
     /// the kernel) keeps the kernel's OFD surface unchanged — the
     /// shim is the one that needs the path-key, not the kernel.
     pub dir_fds: std::collections::BTreeMap<i32, Vec<u8>>,
+    /// Last `proc_exit` code the process passed before the WASI
+    /// shim trapped. The trap message is the only signal that
+    /// reaches the embedder otherwise; this side-channel gives a
+    /// typed exit code to `run_pending_spawns` so it can call
+    /// `record_exit` without parsing the trap string.
+    pub last_exit: Option<i32>,
 }
 
 impl yurt_microkernel_core::HasCallerPid for UserState {
@@ -800,6 +841,14 @@ impl UserProcess {
             .with_context(|| format!("user-process missing '{name}() -> i32' export"))?;
         f.call(&mut self.store, ())
             .with_context(|| format!("user-process {name}()"))
+    }
+
+    /// Exit code the process passed to `proc_exit`, if it called
+    /// proc_exit (which the WASI shim turns into a trap). Returns
+    /// None for processes that returned normally from `_start` or
+    /// haven't run yet.
+    pub fn last_exit(&self) -> Option<i32> {
+        self.store.data().last_exit
     }
 
     /// Run the standard WASI entry point (`_start`). Returns Ok(()) on

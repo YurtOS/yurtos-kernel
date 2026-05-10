@@ -215,7 +215,12 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
     linker.func_wrap(
         WASI,
         "proc_exit",
-        |_caller: Caller<'_, UserState>, rval: i32| -> Result<()> {
+        |mut caller: Caller<'_, UserState>, rval: i32| -> Result<()> {
+            // Side-channel the exit code to the embedder before
+            // trapping; run_pending_spawns reads it via
+            // UserProcess::last_exit() and feeds record_exit so
+            // the parent's sys_wait sees the right status.
+            caller.data_mut().last_exit = Some(rval);
             Err(anyhow!("user process called proc_exit({rval})"))
         },
     )?;

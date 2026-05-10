@@ -801,6 +801,51 @@ fn sys_spawn_stages_child_and_drain_pending_returns_it() {
 }
 
 #[test]
+fn run_pending_spawns_runs_real_wasm_child_and_parent_reaps() {
+    // Full loop: register a real wasm fixture (false-cmd, exits 1)
+    // in ramfs, parent calls sys_spawn, run_pending_spawns
+    // instantiates + runs + record_exits, parent's sys_wait reaps
+    // the actual exit code from the child's proc_exit.
+    let mk = fresh_microkernel(0);
+    let target_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .unwrap()
+        .join("target/wasm32-wasip1/release");
+    let body = std::fs::read(target_dir.join("false-cmd-wasm.wasm"))
+        .expect("false-cmd-wasm.wasm must be built");
+    let path: &[u8] = b"/bin/false";
+    mk.register_ramfs_file(path, &body).unwrap();
+
+    let mut sreq = (path.len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(path);
+    let arg = b"false".as_slice();
+    sreq.extend_from_slice(&(arg.len() as u32).to_le_bytes());
+    sreq.extend_from_slice(arg);
+
+    let parent_pid: u32 = 1;
+    let child_pid = mk
+        .syscall_as(parent_pid, METHOD_SYS_SPAWN, &sreq, &mut [])
+        .unwrap() as u32;
+    assert!(child_pid >= 1000, "kernel pid range, got {child_pid}");
+
+    let ran = mk.run_pending_spawns().unwrap();
+    assert_eq!(ran, 1);
+
+    // Parent's sys_wait must reap the child with the real exit code.
+    let mut wreq = 0_u32.to_le_bytes().to_vec();
+    wreq.extend_from_slice(&0_u32.to_le_bytes());
+    let mut wresp = [0u8; 8];
+    let n = mk
+        .syscall_as(parent_pid, METHOD_SYS_WAIT, &wreq, &mut wresp)
+        .unwrap();
+    assert_eq!(n, 8);
+    assert_eq!(u32::from_le_bytes(wresp[0..4].try_into().unwrap()), child_pid);
+    let status = i32::from_le_bytes(wresp[4..8].try_into().unwrap());
+    assert_eq!(status, 1, "false-cmd exits with 1, got {status}");
+}
+
+#[test]
 fn sys_extension_invoke_returns_negated_enoent_when_no_registry() {
     // Default registry is empty; -ENOENT propagates back through the
     // trampoline as a negative scalar.
