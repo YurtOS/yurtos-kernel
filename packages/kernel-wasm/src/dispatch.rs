@@ -38,6 +38,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_REGISTER_FILE => register_file(request),
         METHOD_KERNEL_SET_ARGV => set_argv(request),
         METHOD_KERNEL_INSTALL_TAR_LAYER => install_tar_layer(request),
+        METHOD_KERNEL_INSTALL_HOST_FS_MOUNT => install_host_fs_mount(request),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
@@ -740,6 +741,22 @@ fn set_argv(request: &[u8]) -> i64 {
     }
     with_kernel(|k| {
         k.process_mut(pid).argv = argv;
+    });
+    0
+}
+
+/// `kernel_install_host_fs_mount(prefix)`. Microkernel-only; mounts
+/// a fresh [`HostFsBackend`] at `prefix`. Embedders pick where the
+/// host fs lives. Returns 0 on success, -EINVAL for empty prefix.
+fn install_host_fs_mount(request: &[u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        k.vfs.add_mount(
+            request.to_vec(),
+            Box::new(crate::vfs::HostFsBackend::new()),
+        );
     });
     0
 }

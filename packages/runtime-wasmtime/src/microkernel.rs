@@ -100,6 +100,7 @@ const METHOD_KERNEL_DRAIN_STDOUT: u32 = 6;
 const METHOD_KERNEL_DRAIN_STDERR: u32 = 7;
 const METHOD_KERNEL_REGISTER_FILE: u32 = 8;
 const METHOD_KERNEL_SET_ARGV: u32 = 9;
+const METHOD_KERNEL_INSTALL_HOST_FS_MOUNT: u32 = 11;
 
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
@@ -453,6 +454,23 @@ impl Microkernel {
         let rc = self.syscall(METHOD_KERNEL_REGISTER_FILE, &req, &mut [])?;
         if rc != 0 {
             anyhow::bail!("kernel_register_file failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    /// Mount a [`HostFsBackend`] at `prefix`. Embedders pick the
+    /// prefix — `/host`, `/users/user`, `/`, anywhere their workload
+    /// expects the host fs to live. Pair with
+    /// `HostState.host_fs_root` (the disk root) and a
+    /// `PolicyEnforcer.may_open_path` impl to control which paths
+    /// are accessible.
+    pub fn mount_host_fs(&self, prefix: &[u8]) -> Result<()> {
+        if prefix.is_empty() {
+            anyhow::bail!("mount_host_fs: prefix must not be empty");
+        }
+        let rc = self.syscall(METHOD_KERNEL_INSTALL_HOST_FS_MOUNT, prefix, &mut [])?;
+        if rc != 0 {
+            anyhow::bail!("kernel_install_host_fs_mount failed: rc={rc}");
         }
         Ok(())
     }

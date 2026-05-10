@@ -394,6 +394,8 @@ fn host_fs_backend_reads_real_file_via_kh_real_open() {
     host.host_fs_root = Some(dir.clone());
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
+    mk.mount_host_fs(b"/host").unwrap();
+
     // Open /host/greeting.txt — HostFsBackend strips /host and
     // asks the host for /greeting.txt under the configured root.
     let mut req = 0_u32.to_le_bytes().to_vec();
@@ -437,6 +439,8 @@ fn host_fs_fstat_reports_real_file_size() {
     host.host_fs_root = Some(dir.clone());
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
+    mk.mount_host_fs(b"/host").unwrap();
+
     let mut req = 0_u32.to_le_bytes().to_vec();
     req.extend_from_slice(b"/host/ten.txt");
     let fd = mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap();
@@ -474,6 +478,8 @@ fn host_fs_writes_create_a_real_file() {
     host.host_fs_root = Some(dir.clone());
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
+    mk.mount_host_fs(b"/host").unwrap();
+
     // sys_open with flags: writable (1) + create-if-missing (2) = 3.
     let mut req = 3_u32.to_le_bytes().to_vec();
     req.extend_from_slice(b"/host/note.txt");
@@ -492,6 +498,55 @@ fn host_fs_writes_create_a_real_file() {
     // Verify the host disk content.
     let on_disk = fs::read(dir.join("note.txt")).unwrap();
     assert_eq!(on_disk, b"hello from sandbox\n");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn host_fs_mount_prefix_is_arbitrary() {
+    // Embedders pick the mount prefix. Mount the same root at
+    // /users/user instead of /host and verify both that /users/user
+    // works AND that /host (the previous default) does not exist
+    // anymore unless explicitly mounted.
+    use std::fs;
+    use std::io::Write;
+    build_kernel_wasm().unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "yurt-host-fs-prefix-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    {
+        let mut f = fs::File::create(dir.join("hello.txt")).unwrap();
+        f.write_all(b"alt prefix").unwrap();
+    }
+
+    let mut host = HostState::default();
+    host.host_fs_root = Some(dir.clone());
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    mk.mount_host_fs(b"/users/user").unwrap();
+
+    // /host is no longer auto-mounted — open returns -ENOENT.
+    let mut req = 0_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"/host/hello.txt");
+    assert_eq!(
+        mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap(),
+        -2,
+        "/host without explicit mount → ENOENT"
+    );
+
+    // /users/user/hello.txt opens fine and reads the host bytes.
+    let mut req = 0_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"/users/user/hello.txt");
+    let fd = mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap();
+    assert!(fd >= 0);
+    let mut buf = [0u8; 32];
+    let n = mk
+        .syscall(METHOD_SYS_READ, &(fd as u32).to_le_bytes(), &mut buf)
+        .unwrap();
+    assert_eq!(&buf[..n as usize], b"alt prefix");
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -545,6 +600,8 @@ fn host_fs_policy_can_deny_specific_paths() {
     host.host_fs_root = Some(dir.clone());
     host.policy = Arc::new(Allowlist);
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+
+    mk.mount_host_fs(b"/host").unwrap();
 
     // Allowed.
     let mut ok = 0_u32.to_le_bytes().to_vec();

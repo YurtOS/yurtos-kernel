@@ -234,10 +234,8 @@ impl MountTable {
             prefix: b"/proc".to_vec(),
             backend: Box::new(ProcBackend::new()),
         });
-        self.mounts.push(Mount {
-            prefix: b"/host".to_vec(),
-            backend: Box::new(HostFsBackend::new()),
-        });
+        // No /host auto-mount — embedders configure HostFs via
+        // `kernel_install_host_fs_mount` at whatever prefix fits.
     }
 }
 
