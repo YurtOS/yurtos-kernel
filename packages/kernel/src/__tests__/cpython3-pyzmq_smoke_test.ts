@@ -5,10 +5,14 @@
  * (with PYZMQ_PREFIX live) can:
  *
  *   1. Boot through the yurt sandbox process path.
- *   2. Resolve the `_zmq` builtin baked into the interpreter.
- *   3. Import the `zmq` package from /usr/local/lib/python3.14/
+ *   2. Import the `zmq` package from /usr/local/lib/python3.14/
  *      site-packages/zmq/ — staged into the sandbox VFS via the
- *      sandbox's cpython3-lib-manifest mechanism.
+ *      sandbox's cpython3-lib-manifest mechanism. This transitively
+ *      exercises the baked-in `_zmq` builtin (Cython's init function
+ *      runs as part of `from . import _zmq`); we don't `import _zmq`
+ *      directly because the Cython module's init expects the parent
+ *      `zmq` package context, so a top-level `import _zmq` always
+ *      raises — that's a Cython convention, not a yurt bug.
  *
  * Skipped when fixtures/cpython3.wasm is not present (the file is
  * gitignored; populate by running scripts/stage-cpython-fixtures.sh
