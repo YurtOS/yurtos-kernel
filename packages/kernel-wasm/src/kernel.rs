@@ -289,11 +289,17 @@ pub struct Kernel {
 
 impl Kernel {
     fn new() -> Self {
+        let mut vfs =
+            crate::vfs::MountTable::new(Box::new(crate::vfs::RamfsBackend::new()));
+        // Linux-style virtual mounts. /dev gives us a non-ramfs backend
+        // that exercises the trait surface; /proc lands later when we
+        // need per-pid introspection.
+        vfs.add_mount(b"/dev".to_vec(), Box::new(crate::vfs::DevBackend::new()));
         Self {
             processes: BTreeMap::new(),
             pipes: BTreeMap::new(),
             next_pipe_id: 1,
-            vfs: crate::vfs::MountTable::new(Box::new(crate::vfs::RamfsBackend::new())),
+            vfs,
             ofds: BTreeMap::new(),
             next_ofd_id: 1,
         }

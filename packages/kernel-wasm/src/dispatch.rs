@@ -2096,6 +2096,74 @@ mod tests {
     }
 
     #[test]
+    fn dev_null_open_read_write() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // /dev is auto-mounted; /dev/null is read+writable.
+        let fd = dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE, b"/dev/null"),
+            &mut [],
+        );
+        assert!(fd >= 0, "open /dev/null: fd = {fd}");
+        // Read returns 0 (EOF immediately).
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf),
+            0
+        );
+        // Writes succeed and report payload.len() bytes consumed.
+        let mut w = Vec::new();
+        w.extend_from_slice(&(fd as u32).to_le_bytes());
+        w.extend_from_slice(b"discard me");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &w, &mut []),
+            "discard me".len() as i64
+        );
+    }
+
+    #[test]
+    fn dev_zero_yields_zero_bytes() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/dev/zero"), &mut []);
+        let mut buf = [0xffu8; 8];
+        let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(n, 8);
+        assert_eq!(&buf, &[0u8; 8]);
+    }
+
+    #[test]
+    fn dev_namespace_refuses_create() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // /dev is a fixed namespace; CREAT inside it returns -EPERM.
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_OPEN,
+                1,
+                &open_req(O_WRITE | O_CREAT, b"/dev/whatever"),
+                &mut [],
+            ),
+            -(abi::EPERM as i64)
+        );
+    }
+
+    #[test]
+    fn root_mount_owns_paths_that_only_share_a_prefix_with_dev() {
+        // Regression: longest-prefix-match must respect component
+        // boundaries — `/devil` belongs to root, not /dev.
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&6_u32.to_le_bytes());
+        reg.extend_from_slice(b"/devil");
+        reg.extend_from_slice(b"horns");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/devil"), &mut []);
+        let mut buf = [0u8; 16];
+        let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"horns");
+    }
+
+    #[test]
     fn known_methods_table_includes_credentials_family() {
         let names: Vec<&str> = KNOWN_METHODS.iter().map(|(n, _)| *n).collect();
         for required in [

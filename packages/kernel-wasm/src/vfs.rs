@@ -103,12 +103,26 @@ impl MountTable {
 
     /// Find the mount that owns `path`. Returns `(mount_id, relpath)`.
     /// The root mount's relative path is the absolute path verbatim;
-    /// non-root mounts get the suffix after their prefix.
+    /// non-root mounts get the suffix after their prefix. A non-root
+    /// prefix `/dev` only matches when the next character is `/` or
+    /// end-of-path — `/devil` belongs to the root mount.
     fn resolve(&self, path: &[u8]) -> Option<(MountId, Vec<u8>)> {
         let mut best: Option<usize> = None;
         let mut best_len = 0usize;
         for (i, m) in self.mounts.iter().enumerate() {
-            if path.starts_with(&m.prefix) && m.prefix.len() >= best_len {
+            if !path.starts_with(&m.prefix) {
+                continue;
+            }
+            if m.prefix != b"/" {
+                // Component boundary check: next byte must be '/' or
+                // end-of-path. Skips false-prefix matches like
+                // "/devil" against a "/dev" mount.
+                let after = &path[m.prefix.len()..];
+                if !(after.is_empty() || after.starts_with(b"/")) {
+                    continue;
+                }
+            }
+            if m.prefix.len() >= best_len {
                 best = Some(i);
                 best_len = m.prefix.len();
             }
@@ -170,11 +184,18 @@ impl MountTable {
 
     #[cfg(test)]
     pub fn clear(&mut self) {
-        // Drop all non-root mounts and reset the root to a fresh ramfs.
-        self.mounts.truncate(1);
-        if let Some(m) = self.mounts.first_mut() {
-            m.backend = Box::new(RamfsBackend::new());
-        }
+        // Reset the table to its boot-time shape: fresh ramfs at /,
+        // fresh DevBackend at /dev. Drops any extra mounts that tests
+        // may have added.
+        self.mounts.clear();
+        self.mounts.push(Mount {
+            prefix: b"/".to_vec(),
+            backend: Box::new(RamfsBackend::new()),
+        });
+        self.mounts.push(Mount {
+            prefix: b"/dev".to_vec(),
+            backend: Box::new(DevBackend::new()),
+        });
     }
 }
 
@@ -217,6 +238,78 @@ impl RamfsBackend {
 impl Default for RamfsBackend {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── /dev backend ───────────────────────────────────────────────────
+//
+// Mounted at "/dev". Linux-style virtual filesystem: well-known paths
+// resolve to fixed inode ids; reads/writes execute the device's
+// behavior rather than touching any storage. Phase 3 ships /dev/null
+// and /dev/zero — enough to validate the trait against a non-ramfs
+// backend without pulling in `kh_random` (which urandom would need).
+//
+// Inode ids are stable so callers can hold a fd across opens; nothing
+// here references the kernel's process table.
+
+const DEV_NULL_INODE: u64 = 1;
+const DEV_ZERO_INODE: u64 = 2;
+
+pub struct DevBackend;
+
+impl DevBackend {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for DevBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VfsBackend for DevBackend {
+    fn lookup(&self, path: &[u8]) -> Option<u64> {
+        match path {
+            b"/null" => Some(DEV_NULL_INODE),
+            b"/zero" => Some(DEV_ZERO_INODE),
+            _ => None,
+        }
+    }
+
+    fn create(&mut self, _path: &[u8]) -> Option<u64> {
+        // /dev is a fixed namespace; refuse new entries.
+        None
+    }
+
+    fn truncate(&mut self, _inode: u64) {
+        // No-op: device files have no content to truncate.
+    }
+
+    fn read(&self, inode: u64, _offset: u64, buf: &mut [u8]) -> i64 {
+        match inode {
+            DEV_NULL_INODE => 0, // immediate EOF
+            DEV_ZERO_INODE => {
+                buf.fill(0);
+                buf.len() as i64
+            }
+            _ => -(crate::abi::EBADF as i64),
+        }
+    }
+
+    fn write(&mut self, inode: u64, _offset: u64, payload: &[u8]) -> i64 {
+        match inode {
+            DEV_NULL_INODE | DEV_ZERO_INODE => payload.len() as i64, // /dev/null swallows; /dev/zero same
+            _ => -(crate::abi::EBADF as i64),
+        }
+    }
+
+    fn size(&self, inode: u64) -> Option<u64> {
+        match inode {
+            DEV_NULL_INODE | DEV_ZERO_INODE => Some(0),
+            _ => None,
+        }
     }
 }
 
