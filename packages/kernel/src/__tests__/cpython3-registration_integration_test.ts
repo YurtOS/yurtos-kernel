@@ -13,10 +13,13 @@ const WASM_DIR = resolve(
 const CPYTHON_WASM = resolve(WASM_DIR, "cpython3.wasm");
 
 const maybeDescribe = existsSync(CPYTHON_WASM) ? describe : describe.skip;
-const CPYTHON_ENV = "PYTHONHOME=/usr/local PYTHONPATH=";
 
+// yurt's shell currently rejects the `VAR=val cmd` env-prefix form
+// with EINVAL when spawning, so cpython3 is always invoked bare.
+// The interpreter finds its stdlib via the default --prefix=/usr/local
+// baked in at configure time — no PYTHONHOME/PYTHONPATH needed.
 function cpythonCommand(args: string): string {
-  return `${CPYTHON_ENV} cpython3 ${args}`;
+  return `cpython3 ${args}`;
 }
 
 maybeDescribe("CPython bring-up registration", () => {

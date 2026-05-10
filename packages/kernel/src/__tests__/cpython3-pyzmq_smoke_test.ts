@@ -14,9 +14,12 @@
  *      `zmq` package context, so a top-level `import _zmq` always
  *      raises — that's a Cython convention, not a yurt bug.
  *
- * Skipped when fixtures/cpython3.wasm is not present (the file is
- * gitignored; populate by running scripts/stage-cpython-fixtures.sh
- * after building the cpython + pyzmq ports).
+ * Skipped unless BOTH the cpython3.wasm and the pyzmq site-packages
+ * sidecar are staged (gitignored; populate by running
+ * scripts/stage-cpython-fixtures.sh after building the cpython + pyzmq
+ * ports). Gating on cpython3.wasm alone would unskip on dev boxes that
+ * have the existing CPython smoke fixture but no pyzmq tree, producing
+ * a false `import zmq` failure.
  *
  * Note: invocations are bare (`cpython3 --version`, not
  * `PYTHONHOME=... cpython3 ...`). yurt's shell currently rejects
@@ -36,8 +39,16 @@ const WASM_DIR = resolve(
   "../platform/__tests__/fixtures",
 );
 const CPYTHON_WASM = resolve(WASM_DIR, "cpython3.wasm");
+// pyzmq sidecar gate: cpython3.wasm alone is not enough — the
+// `import zmq` case needs the pyzmq site-packages tree staged by
+// scripts/stage-cpython-fixtures.sh.
+const PYZMQ_INIT = resolve(
+  WASM_DIR,
+  "cpython3-lib/site-packages/zmq/__init__.py",
+);
+const HAS_FIXTURES = existsSync(CPYTHON_WASM) && existsSync(PYZMQ_INIT);
 
-const maybeDescribe = existsSync(CPYTHON_WASM) ? describe : describe.skip;
+const maybeDescribe = HAS_FIXTURES ? describe : describe.skip;
 
 maybeDescribe("cpython3 + pyzmq runtime smoke", () => {
   it("boots cpython3 and reports its version", async () => {
@@ -48,7 +59,8 @@ maybeDescribe("cpython3 + pyzmq runtime smoke", () => {
     try {
       const result = await sandbox.run("cpython3 --version");
       expect(result.exitCode).toBe(0);
-      expect(result.stdout.trim()).toBe("Python 3.14.4");
+      // Match `Python 3.x.y` so cpython point-bumps don't break the smoke.
+      expect(result.stdout.trim()).toMatch(/^Python 3\.\d+\.\d+$/);
     } finally {
       sandbox.destroy();
     }
