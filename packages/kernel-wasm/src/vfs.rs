@@ -820,6 +820,69 @@ mod tests {
     }
 
     #[test]
+    fn tar_layer_readdir_lists_immediate_children() {
+        // Build a small tar in-memory with /bin/sh, /bin/ls,
+        // /etc/hosts, and verify readdir of "/" lists ["bin","etc"]
+        // and readdir of "/bin" lists ["ls","sh"].
+        let mut ar_bytes: Vec<u8> = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut ar_bytes);
+            for (path, body) in [
+                ("bin/sh", &b"#!sh"[..]),
+                ("bin/ls", &b"#!ls"[..]),
+                ("etc/hosts", &b"127.0.0.1 localhost\n"[..]),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let tar = TarLayerBackend::new(ar_bytes);
+        let root = tar.readdir(b"/").expect("/ exists");
+        assert_eq!(
+            root,
+            vec![b"bin".to_vec(), b"etc".to_vec()],
+            "tar root readdir must surface dir prefixes"
+        );
+        let bin = tar.readdir(b"/bin").expect("/bin exists");
+        assert_eq!(bin, vec![b"ls".to_vec(), b"sh".to_vec()]);
+        assert!(tar.readdir(b"/missing").is_none());
+    }
+
+    #[test]
+    fn overlay_readdir_unions_layers_and_hides_whiteouts() {
+        // Lower has /a, /b. Upper has /c. Overlay should list a,b,c.
+        // After unlink(/a), whiteout drops "a" from the listing.
+        let mut lower = RamfsBackend::new();
+        lower.install(b"/a".to_vec(), b"A".to_vec());
+        lower.install(b"/b".to_vec(), b"B".to_vec());
+        let mut upper = RamfsBackend::new();
+        upper.install(b"/c".to_vec(), b"C".to_vec());
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+
+        let mut entries = overlay.readdir(b"/").expect("root");
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "overlay readdir must union both layers"
+        );
+
+        let rc = overlay.unlink(b"/a");
+        assert_eq!(rc, 0);
+        let entries = overlay.readdir(b"/").expect("root");
+        assert_eq!(
+            entries,
+            vec![b"b".to_vec(), b"c".to_vec()],
+            "whiteout must hide /a from readdir"
+        );
+    }
+
+    #[test]
     fn overlay_read_only_lower_file_keeps_lower_inode() {
         let mut lower = RamfsBackend::new();
         lower.install(b"/ro".to_vec(), b"data".to_vec());
@@ -1295,6 +1358,46 @@ impl VfsBackend for TarLayerBackend {
     fn default_metadata(&self, inode: u64) -> Option<Metadata> {
         self.metadata.get(&inode).copied()
     }
+
+    fn readdir(&self, path: &[u8]) -> Option<Vec<Vec<u8>>> {
+        // Tar archives carry regular files only (we filtered out
+        // dir/symlink entries during indexing). Directories are
+        // implicit — every prefix of a file path is a directory.
+        // To list `path`, walk every indexed file and emit the
+        // immediate child basename (whether the child is a file in
+        // the archive or just a directory containing deeper files).
+        let prefix: Vec<u8> = if path == b"/" {
+            b"/".to_vec()
+        } else {
+            let mut p = path.to_vec();
+            p.push(b'/');
+            p
+        };
+        let mut entries: Vec<Vec<u8>> = Vec::new();
+        let mut found_dir = path == b"/";
+        for file_path in self.files.keys() {
+            if !file_path.starts_with(&prefix) {
+                continue;
+            }
+            found_dir = true;
+            let rest = &file_path[prefix.len()..];
+            if rest.is_empty() {
+                continue;
+            }
+            // Immediate child = bytes up to the next '/'.
+            let child = match rest.iter().position(|&b| b == b'/') {
+                Some(idx) => rest[..idx].to_vec(),
+                None => rest.to_vec(),
+            };
+            entries.push(child);
+        }
+        if !found_dir {
+            return None;
+        }
+        entries.sort();
+        entries.dedup();
+        Some(entries)
+    }
 }
 
 // ── Overlay backend (YURTFS L1 + L2 union) ────────────────────────
@@ -1508,5 +1611,39 @@ impl VfsBackend for OverlayBackend {
         }
         // Neither layer had it.
         -2 // -ENOENT
+    }
+
+    fn readdir(&self, path: &[u8]) -> Option<Vec<Vec<u8>>> {
+        // Union of upper and lower entries. Either layer being a
+        // directory makes the path a directory; missing in both →
+        // None (caller turns into -ENOENT). For every entry we
+        // also check whether the absolute child path is whited
+        // out — if so, we drop it.
+        let upper = self.upper.readdir(path);
+        let lower = self.lower.readdir(path);
+        if upper.is_none() && lower.is_none() {
+            return None;
+        }
+        let prefix: Vec<u8> = if path == b"/" {
+            b"/".to_vec()
+        } else {
+            let mut p = path.to_vec();
+            p.push(b'/');
+            p
+        };
+        let mut entries: Vec<Vec<u8>> = Vec::new();
+        for src in upper.into_iter().chain(lower.into_iter()) {
+            for name in src {
+                let mut full = prefix.clone();
+                full.extend_from_slice(&name);
+                if self.whiteouts.contains(&full) {
+                    continue;
+                }
+                entries.push(name);
+            }
+        }
+        entries.sort();
+        entries.dedup();
+        Some(entries)
     }
 }
