@@ -437,6 +437,100 @@ mod tests {
         assert_eq!(ROOT_MOUNT, 0);
         let _ = mt; // keep MountTable construction tested.
     }
+
+    #[test]
+    fn overlay_reads_fall_through_to_lower() {
+        // Lower has /etc/motd; upper is empty.
+        let mut lower = RamfsBackend::new();
+        lower.install(b"/etc/motd".to_vec(), b"from lower".to_vec());
+        let upper = RamfsBackend::new();
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+
+        let inode = overlay.open(b"/etc/motd", 0).unwrap();
+        let mut buf = [0u8; 32];
+        let n = overlay.read(inode, 0, &mut buf);
+        assert_eq!(&buf[..n as usize], b"from lower");
+    }
+
+    #[test]
+    fn overlay_upper_shadows_lower() {
+        // Both layers have /file but upper wins.
+        let mut lower = RamfsBackend::new();
+        lower.install(b"/file".to_vec(), b"old".to_vec());
+        let mut upper = RamfsBackend::new();
+        upper.install(b"/file".to_vec(), b"new".to_vec());
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+
+        let inode = overlay.open(b"/file", 0).unwrap();
+        let mut buf = [0u8; 16];
+        let n = overlay.read(inode, 0, &mut buf);
+        assert_eq!(&buf[..n as usize], b"new");
+    }
+
+    #[test]
+    fn overlay_create_lands_in_upper() {
+        // Path doesn't exist anywhere; create in upper.
+        let lower = RamfsBackend::new();
+        let upper = RamfsBackend::new();
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+
+        let inode = overlay.open(b"/new", 0b011 /* WRITE | CREAT */).unwrap();
+        assert_eq!(overlay.write(inode, 0, b"hello"), 5);
+        // Re-open read-only sees the upper content.
+        let r = overlay.open(b"/new", 0).unwrap();
+        let mut buf = [0u8; 16];
+        let n = overlay.read(r, 0, &mut buf);
+        assert_eq!(&buf[..n as usize], b"hello");
+    }
+
+    #[test]
+    fn overlay_writable_open_of_lower_file_copies_up() {
+        // /bin/python in lower; open it WRITE → copy-up.
+        let mut lower = RamfsBackend::new();
+        lower.install(
+            b"/bin/python".to_vec(),
+            b"#!/usr/bin/env python\nprint('lower')\n".to_vec(),
+        );
+        let upper = RamfsBackend::new();
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+
+        // Writable open triggers copy-up. The fd we get back points
+        // at the upper inode (now containing lower's bytes).
+        let inode = overlay.open(b"/bin/python", 0b001 /* WRITE */).unwrap();
+
+        // Verify we see lower's content via the upper inode.
+        let mut buf = [0u8; 64];
+        let n = overlay.read(inode, 0, &mut buf);
+        assert!(
+            &buf[..n as usize] == b"#!/usr/bin/env python\nprint('lower')\n",
+            "expected copy-up to preserve lower content; got {:?}",
+            &buf[..n as usize]
+        );
+
+        // Overwrite. Subsequent reads see the new bytes — lower is
+        // shadowed permanently for this overlay.
+        overlay.write(inode, 0, b"!!!");
+        let mut buf = [0u8; 64];
+        let n = overlay.read(inode, 0, &mut buf);
+        // First three bytes are now "!!!", the rest is leftover
+        // from lower (we wrote AT offset 0 without truncating).
+        assert!(buf[..n as usize].starts_with(b"!!!"));
+    }
+
+    #[test]
+    fn overlay_read_only_lower_file_keeps_lower_inode() {
+        let mut lower = RamfsBackend::new();
+        lower.install(b"/ro".to_vec(), b"data".to_vec());
+        let upper = RamfsBackend::new();
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+
+        // Read-only open returns a lower-tagged external id; writes
+        // through it are -EBADF (the trait-level barrier — lower is
+        // read-only via OverlayBackend's routing).
+        let inode = overlay.open(b"/ro", 0).unwrap();
+        let rc = overlay.write(inode, 0, b"NOPE");
+        assert!(rc < 0, "write through lower-tagged fd should fail");
+    }
 }
 
 // ── /proc backend ──────────────────────────────────────────────────
@@ -873,5 +967,162 @@ impl VfsBackend for TarLayerBackend {
             .find(|(_p, &id)| id == inode)
             .and_then(|(p, _)| self.files.get(p))
             .map(|&(_off, len)| len)
+    }
+}
+
+// ── Overlay backend (YURTFS L1 + L2 union) ────────────────────────
+//
+// One logical filesystem composed of two VfsBackends: a read-only
+// `lower` (the image — typically TarLayerBackend) and a writable
+// `upper` (the overlay — RamfsBackend, future disk-backed indexfs,
+// etc.). Reads check upper first, fall through to lower. Writes go
+// to upper; first write of a lower-only file triggers copy-up.
+//
+// Inode-id namespace: this backend allocates *external* ids and
+// keeps a side-table that maps each external id to (layer,
+// internal_id). The kernel sees only external ids; reads/writes
+// dispatch to the right layer.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layer {
+    Upper,
+    Lower,
+}
+
+pub struct OverlayBackend {
+    lower: Box<dyn VfsBackend>,
+    upper: Box<dyn VfsBackend>,
+    /// External inode → (layer, internal inode). Stable across the
+    /// backend's lifetime so OFDs survive copy-up.
+    layered: BTreeMap<u64, (Layer, u64)>,
+    /// Path → external inode cache. Populated lazily on open.
+    paths: BTreeMap<Vec<u8>, u64>,
+    next_id: u64,
+}
+
+impl OverlayBackend {
+    pub fn new(lower: Box<dyn VfsBackend>, upper: Box<dyn VfsBackend>) -> Self {
+        Self {
+            lower,
+            upper,
+            layered: BTreeMap::new(),
+            paths: BTreeMap::new(),
+            next_id: 1,
+        }
+    }
+
+    fn alloc_id(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        id
+    }
+
+    /// Copy-up: read the full content of `path` from lower, install
+    /// it in upper, return the new upper inode. Used on first write
+    /// to a lower-only file. Phase 6 surface — relies on
+    /// `lower.size()` being accurate (Tar/Ramfs/HostFs all are).
+    fn copy_up(&mut self, path: &[u8]) -> Option<u64> {
+        let lower_inode = self.lower.open(path, 0)?;
+        let len = self.lower.size(lower_inode).unwrap_or(0) as usize;
+        let mut content = vec![0u8; len];
+        if len > 0 {
+            let n = self.lower.read(lower_inode, 0, &mut content);
+            if n < 0 {
+                return None;
+            }
+            content.truncate(n as usize);
+        }
+        // Open in upper with create+write so a new file is made.
+        let upper_inode = self.upper.open(path, 0b011)?;
+        // Truncate in case upper had some leftover state, then
+        // write the lower bytes at offset 0.
+        self.upper.truncate(upper_inode);
+        let written = self.upper.write(upper_inode, 0, &content);
+        if written < 0 {
+            return None;
+        }
+        Some(upper_inode)
+    }
+}
+
+impl VfsBackend for OverlayBackend {
+    fn open(&mut self, path: &[u8], flags: u32) -> Option<u64> {
+        // Cache hit: re-use existing external id.
+        if let Some(&id) = self.paths.get(path) {
+            return Some(id);
+        }
+        let writable = flags & 0b001 != 0;
+        let create = flags & 0b010 != 0;
+
+        // Step 1: check upper. If found there, that wins regardless
+        // of intent — upper shadows lower.
+        if let Some(upper_inode) = self.upper.open(path, flags) {
+            let id = self.alloc_id();
+            self.layered.insert(id, (Layer::Upper, upper_inode));
+            self.paths.insert(path.to_vec(), id);
+            return Some(id);
+        }
+        // Step 2: check lower. Read-only opens stay in lower;
+        // writable opens trigger copy-up so the write lands in upper.
+        if let Some(lower_inode) = self.lower.open(path, 0) {
+            if writable {
+                // Copy-up: lower content → upper, return upper inode.
+                let upper_inode = self.copy_up(path)?;
+                let id = self.alloc_id();
+                self.layered.insert(id, (Layer::Upper, upper_inode));
+                self.paths.insert(path.to_vec(), id);
+                return Some(id);
+            }
+            let id = self.alloc_id();
+            self.layered.insert(id, (Layer::Lower, lower_inode));
+            self.paths.insert(path.to_vec(), id);
+            return Some(id);
+        }
+        // Step 3: doesn't exist in either layer. If create-bit set,
+        // create in upper; else miss.
+        if create {
+            let upper_inode = self.upper.open(path, flags)?;
+            let id = self.alloc_id();
+            self.layered.insert(id, (Layer::Upper, upper_inode));
+            self.paths.insert(path.to_vec(), id);
+            return Some(id);
+        }
+        None
+    }
+
+    fn truncate(&mut self, inode: u64) {
+        match self.layered.get(&inode) {
+            Some(&(Layer::Upper, inner)) => self.upper.truncate(inner),
+            // Truncating a lower-only file is meaningless — lower is
+            // read-only. Silently ignore (matches POSIX truncate-on-
+            // O_TRUNC of a file with no write permission: error,
+            // but we don't have an errno return on truncate yet).
+            _ => {}
+        }
+    }
+
+    fn read(&self, inode: u64, offset: u64, buf: &mut [u8]) -> i64 {
+        match self.layered.get(&inode) {
+            Some(&(Layer::Upper, inner)) => self.upper.read(inner, offset, buf),
+            Some(&(Layer::Lower, inner)) => self.lower.read(inner, offset, buf),
+            None => -(crate::abi::EBADF as i64),
+        }
+    }
+
+    fn write(&mut self, inode: u64, offset: u64, payload: &[u8]) -> i64 {
+        match self.layered.get(&inode) {
+            Some(&(Layer::Upper, inner)) => self.upper.write(inner, offset, payload),
+            // Writes through a lower-layer fd shouldn't happen —
+            // open() routes writable opens to upper via copy-up. If
+            // we get here it's a bug or a read-only fd; refuse.
+            _ => -(crate::abi::EBADF as i64),
+        }
+    }
+
+    fn size(&self, inode: u64) -> Option<u64> {
+        match self.layered.get(&inode)? {
+            (Layer::Upper, inner) => self.upper.size(*inner),
+            (Layer::Lower, inner) => self.lower.size(*inner),
+        }
     }
 }
