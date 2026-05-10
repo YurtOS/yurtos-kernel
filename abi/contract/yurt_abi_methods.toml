@@ -80,6 +80,11 @@ id = 11
 kind = "internal"
 doc = "Microkernel-only: mount a HostFsBackend at the given prefix. Request bytes are the prefix path (no length header — the entire request is the prefix). Embedders pick where the host fs lives ('/host', '/users/user', '/', whatever); the auto-mount at /host has been removed because the right prefix is workload-specific. Real-disk reads/writes still gate through PolicyEnforcer + HostState.host_fs_root. Returns 0 on success, -EINVAL for empty prefix."
 
+[method.kernel_install_yurtfs]
+id = 12
+kind = "internal"
+doc = "Microkernel-only: mount a full YURTFS L1+L2 overlay at the given prefix in one call. Request bytes are u32 prefix_len LE + prefix_bytes + tar_archive_bytes. The kernel walks the tar (lower / image), creates a fresh ramfs (upper / overlay), composes them via OverlayBackend, and mounts the result. Reads fall through to lower; writes go to upper; first write of a lower-only file copies up. Phase 6 surface — uncompressed tar, no whiteouts, no metadata copy-up, ramfs-backed upper. Returns 0 on success, -EINVAL for malformed input."
+
 # Syscall methods (0x1_0000+ range).
 #
 # These are the real user-process-facing syscalls — `sys_*` names match

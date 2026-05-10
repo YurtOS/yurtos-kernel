@@ -1047,12 +1047,23 @@ impl OverlayBackend {
 
 impl VfsBackend for OverlayBackend {
     fn open(&mut self, path: &[u8], flags: u32) -> Option<u64> {
-        // Cache hit: re-use existing external id.
-        if let Some(&id) = self.paths.get(path) {
-            return Some(id);
-        }
         let writable = flags & 0b001 != 0;
         let create = flags & 0b010 != 0;
+        // Cache hit: re-use the existing external id only when the
+        // cached layer is compatible with this open's intent. A
+        // Lower-tagged cached id can serve any read; a writable open
+        // needs Upper, so we drop the cache entry and re-resolve
+        // through copy-up. Keep the layered entry — in-flight fds
+        // referring to the old (Lower) external id stay valid; this
+        // open returns a fresh Upper-tagged id.
+        if let Some(&id) = self.paths.get(path) {
+            let cached_layer = self.layered.get(&id).map(|(l, _)| *l);
+            let cache_ok = !writable || matches!(cached_layer, Some(Layer::Upper));
+            if cache_ok {
+                return Some(id);
+            }
+            self.paths.remove(path);
+        }
 
         // Step 1: check upper. If found there, that wins regardless
         // of intent — upper shadows lower.

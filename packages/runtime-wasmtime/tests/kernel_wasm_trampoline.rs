@@ -552,6 +552,91 @@ fn host_fs_mount_prefix_is_arbitrary() {
 }
 
 #[test]
+fn yurtfs_mount_overlays_image_with_writable_upper() {
+    // The user's canonical example: /bin/python is in the image
+    // (lower); a process with permissions overwrites it (upper).
+    // Verifies the full L1+L2 + copy-up flow through the
+    // microkernel's `mount_yurtfs` API.
+    use std::process::Command;
+    build_kernel_wasm().unwrap();
+
+    // Build a tiny tar archive in-memory with /bin/python.
+    let tar_bytes = {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut buf);
+            let content: &[u8] =
+                b"#!/usr/bin/env python\nprint('image python')\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "bin/python", content)
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        buf
+    };
+
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    mk.mount_yurtfs(b"/img", &tar_bytes).unwrap();
+
+    // Read /img/bin/python — content comes from the lower (tar).
+    let mut req = 0_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"/img/bin/python");
+    let fd = mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap();
+    assert!(fd >= 0);
+    let mut buf = [0u8; 128];
+    let n = mk
+        .syscall(METHOD_SYS_READ, &(fd as u32).to_le_bytes(), &mut buf)
+        .unwrap();
+    assert!(
+        std::str::from_utf8(&buf[..n as usize])
+            .unwrap()
+            .contains("image python"),
+        "lower content visible: {:?}",
+        &buf[..n as usize]
+    );
+
+    // Writable open of the same path triggers copy-up.
+    let mut wreq = 1_u32.to_le_bytes().to_vec(); // WRITE
+    wreq.extend_from_slice(b"/img/bin/python");
+    let wfd = mk.syscall(METHOD_SYS_OPEN, &wreq, &mut []).unwrap();
+    assert!(wfd >= 0);
+
+    // Truncate first so we don't leave lower bytes after our write.
+    let mut sreq = (wfd as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(&0_i64.to_le_bytes());
+    sreq.extend_from_slice(&0_u32.to_le_bytes()); // SEEK_SET
+    let mut soff = [0u8; 8];
+    let _ = mk.syscall(METHOD_SYS_LSEEK, &sreq, &mut soff);
+
+    // Write replacement content.
+    let mut wbytes = (wfd as u32).to_le_bytes().to_vec();
+    wbytes.extend_from_slice(b"#!/usr/bin/env python\nprint('overlay python')\n");
+    let written = mk.syscall(METHOD_SYS_WRITE, &wbytes, &mut []).unwrap();
+    assert!(written > 0);
+
+    // Suppress the unused-variable warning from the tar import path.
+    let _ = Command::new("true");
+
+    // Re-open read-only — copy-up means we now see overlay content.
+    let mut req2 = 0_u32.to_le_bytes().to_vec();
+    req2.extend_from_slice(b"/img/bin/python");
+    let fd2 = mk.syscall(METHOD_SYS_OPEN, &req2, &mut []).unwrap();
+    let mut buf2 = [0u8; 128];
+    let n2 = mk
+        .syscall(METHOD_SYS_READ, &(fd2 as u32).to_le_bytes(), &mut buf2)
+        .unwrap();
+    let text2 = std::str::from_utf8(&buf2[..n2 as usize]).unwrap();
+    assert!(
+        text2.contains("overlay python"),
+        "after copy-up + write, reads see upper: {text2:?}"
+    );
+}
+
+#[test]
 fn host_fs_returns_enoent_without_a_root_configured() {
     // Default HostState has host_fs_root = None → kh_real_open
     // returns -EACCES → HostFsBackend.lookup returns None → sys_open

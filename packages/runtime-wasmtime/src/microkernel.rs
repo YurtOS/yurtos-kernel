@@ -101,6 +101,7 @@ const METHOD_KERNEL_DRAIN_STDERR: u32 = 7;
 const METHOD_KERNEL_REGISTER_FILE: u32 = 8;
 const METHOD_KERNEL_SET_ARGV: u32 = 9;
 const METHOD_KERNEL_INSTALL_HOST_FS_MOUNT: u32 = 11;
+const METHOD_KERNEL_INSTALL_YURTFS: u32 = 12;
 
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
@@ -471,6 +472,32 @@ impl Microkernel {
         let rc = self.syscall(METHOD_KERNEL_INSTALL_HOST_FS_MOUNT, prefix, &mut [])?;
         if rc != 0 {
             anyhow::bail!("kernel_install_host_fs_mount failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    /// Mount a YURTFS L1+L2 overlay at `prefix`. The image bytes
+    /// (uncompressed tar) become the read-only lower layer; a fresh
+    /// in-memory ramfs is the writable upper layer. Reads fall
+    /// through to the image; writes go to the overlay; first write
+    /// of a lower-only file copy-ups so the image content is
+    /// preserved at the upper inode.
+    ///
+    /// Phase 6 surface — uncompressed tar only, ramfs upper, no
+    /// whiteouts, no metadata copy-up. Future slices: zstd-wrapped
+    /// images, disk-backed indexfs upper for persistence,
+    /// MetadataOverlay sidecar.
+    pub fn mount_yurtfs(&self, prefix: &[u8], image_tar: &[u8]) -> Result<()> {
+        if prefix.is_empty() {
+            anyhow::bail!("mount_yurtfs: prefix must not be empty");
+        }
+        let mut req = Vec::with_capacity(4 + prefix.len() + image_tar.len());
+        req.extend_from_slice(&(prefix.len() as u32).to_le_bytes());
+        req.extend_from_slice(prefix);
+        req.extend_from_slice(image_tar);
+        let rc = self.syscall(METHOD_KERNEL_INSTALL_YURTFS, &req, &mut [])?;
+        if rc != 0 {
+            anyhow::bail!("kernel_install_yurtfs failed: rc={rc}");
         }
         Ok(())
     }

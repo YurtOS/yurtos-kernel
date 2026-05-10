@@ -39,6 +39,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_SET_ARGV => set_argv(request),
         METHOD_KERNEL_INSTALL_TAR_LAYER => install_tar_layer(request),
         METHOD_KERNEL_INSTALL_HOST_FS_MOUNT => install_host_fs_mount(request),
+        METHOD_KERNEL_INSTALL_YURTFS => install_yurtfs(request),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
@@ -756,6 +757,33 @@ fn install_host_fs_mount(request: &[u8]) -> i64 {
         k.vfs.add_mount(
             request.to_vec(),
             Box::new(crate::vfs::HostFsBackend::new()),
+        );
+    });
+    0
+}
+
+/// `kernel_install_yurtfs(prefix_len, prefix, tar_bytes)`.
+/// Microkernel-only; mounts an [`OverlayBackend`] composing a
+/// [`TarLayerBackend`] (lower / image) and a fresh
+/// [`RamfsBackend`] (upper / overlay) at `prefix`. One call wires
+/// the L1+L2 union the user reads about as YURTFS.
+fn install_yurtfs(request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let prefix_len =
+        u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    if request.len() < 4 + prefix_len {
+        return -(abi::EINVAL as i64);
+    }
+    let prefix = request[4..4 + prefix_len].to_vec();
+    let archive = request[4 + prefix_len..].to_vec();
+    with_kernel(|k| {
+        let lower = Box::new(crate::vfs::TarLayerBackend::new(archive));
+        let upper = Box::new(crate::vfs::RamfsBackend::new());
+        k.vfs.add_mount(
+            prefix,
+            Box::new(crate::vfs::OverlayBackend::new(lower, upper)),
         );
     });
     0
