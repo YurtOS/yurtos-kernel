@@ -12,6 +12,10 @@
 #include_next <unistd.h>
 #pragma clang diagnostic pop
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 int dup2(int oldfd, int newfd);
 int getgroups(int size, gid_t list[]);
 
@@ -245,5 +249,9 @@ int pause(void);
 int nice(int inc);
 
 #endif /* !__wasilibc_unmodified_upstream */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* YURT_COMPAT_UNISTD_H */

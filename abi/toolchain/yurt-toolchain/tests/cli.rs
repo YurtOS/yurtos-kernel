@@ -314,6 +314,68 @@ fn dry_run_injects_yurt_portability_defaults() {
 }
 
 #[test]
+fn dry_run_defaults_final_c_links_to_gnu23() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .arg("--dry-run")
+            .arg("foo.c")
+            .arg("-o")
+            .arg("foo.wasm")
+            .output()
+            .unwrap(),
+    );
+
+    let tokens = stdout_tokens(&stdout);
+    assert!(tokens.contains(&"-std=gnu23"), "{stdout}");
+    assert!(!tokens.contains(&"-std=gnu++17"), "{stdout}");
+}
+
+#[test]
+fn dry_run_defaults_final_cpp_links_to_gnupp17_by_extension() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .arg("--dry-run")
+            .arg("foo.cpp")
+            .arg("-o")
+            .arg("foo.wasm")
+            .output()
+            .unwrap(),
+    );
+
+    let tokens = stdout_tokens(&stdout);
+    assert!(tokens.contains(&"-std=gnu++17"), "{stdout}");
+    assert!(!tokens.contains(&"-std=gnu23"), "{stdout}");
+}
+
+#[test]
+fn dry_run_defaults_final_cpp_links_to_gnupp17_by_x_lang() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .arg("--dry-run")
+            .arg("-x")
+            .arg("c++")
+            .arg("foo.c")
+            .arg("-o")
+            .arg("foo.wasm")
+            .output()
+            .unwrap(),
+    );
+
+    let tokens = stdout_tokens(&stdout);
+    assert!(tokens.contains(&"-std=gnu++17"), "{stdout}");
+    assert!(!tokens.contains(&"-std=gnu23"), "{stdout}");
+}
+
+#[test]
 fn dry_run_does_not_duplicate_yurt_portability_defaults() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();

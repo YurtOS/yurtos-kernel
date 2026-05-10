@@ -8,6 +8,10 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct hostent {
 	char *h_name;
 	char **h_aliases;
@@ -125,5 +129,9 @@ int getnameinfo(const struct sockaddr *addr, socklen_t addrlen,
 	char *host, socklen_t hostlen,
 	char *serv, socklen_t servlen, int flags);
 char *hstrerror(int err);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -22,6 +22,10 @@
 
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct {
     /* Opaque host-managed state.  Aligned to 8 for pointer storage. */
     char _state[64] __attribute__((aligned(8)));
@@ -37,5 +41,9 @@ extern int sigsetjmp(sigjmp_buf env, int savesigs) __attribute__((returns_twice)
 extern void longjmp(jmp_buf env, int val) __attribute__((noreturn));
 extern void _longjmp(jmp_buf env, int val) __attribute__((noreturn));
 extern void siglongjmp(sigjmp_buf env, int val) __attribute__((noreturn));
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* YURT_COMPAT_SETJMP_H */
