@@ -6,6 +6,10 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* SO_* constants that wasi-sdk defines in upstream mode but may not expose
  * via the WASI-mode path. */
 #ifndef SO_BROADCAST
@@ -128,5 +132,9 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
 int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen);
 int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen);
 int shutdown(int sockfd, int how);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
