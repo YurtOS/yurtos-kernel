@@ -107,14 +107,52 @@ export interface LogSink {
   emit(severity: number, message: string): void;
 }
 
+/**
+ * Policy decisions returned from {@link PolicyEnforcer} hooks.
+ * Synchronous so embedders can plug in any blocking prompt
+ * (browser dialog, CLI, "ask the human") behind a single method.
+ */
+export type PolicyDecision = "allow" | "deny";
+
+/**
+ * Embedder-supplied gate that sits at every `kh_*` crossing where
+ * kernel.wasm is about to reach the outside world. Mirrors the
+ * Rust-side `PolicyEnforcer` trait exactly so the same harness can
+ * gate either microkernel backend.
+ *
+ * Defaults to Allow on every hook so embedders that don't care
+ * about policy don't have to implement it. Embedders that do care
+ * override the relevant methods.
+ *
+ * Hooks fire *before* the embedder's I/O code (extension registry,
+ * log sink, eventual fs/socket bridges); a Deny short-circuits with
+ * `-EACCES`.
+ */
+export interface PolicyEnforcer {
+  /** Gate kh_extension_invoke. Default Allow. */
+  mayInvokeExtension?(request: Uint8Array): PolicyDecision;
+  /** Gate kh_real_fs_* (not wired yet). */
+  mayOpenPath?(path: Uint8Array, write: boolean): PolicyDecision;
+  /** Gate kh_socket_connect (not wired yet). */
+  mayConnect?(host: string, port: number): PolicyDecision;
+  /** Gate kh_socket_listen (not wired yet). */
+  mayListen?(port: number): PolicyDecision;
+  /** Gate kh_log emissions per message. */
+  mayLog?(severity: number, message: string): PolicyDecision;
+  /** Gate kh_now_realtime. */
+  mayGetRealtime?(): PolicyDecision;
+}
+
 export interface HostState {
   nowRealtimeNs: bigint;
   extensions: ExtensionRegistry;
   logSink: LogSink;
+  policy: PolicyEnforcer;
 }
 
 const ENOENT = 2;
 const EFAULT = 14;
+const EACCES = 13;
 
 class EmptyExtensionRegistry implements ExtensionRegistry {
   invoke(): number {
@@ -126,11 +164,31 @@ class DiscardLogSink implements LogSink {
   emit(): void {}
 }
 
+/**
+ * Default policy: every hook returns "allow". Equivalent to having
+ * no policy enforcer at all.
+ */
+export const allowAllPolicy: PolicyEnforcer = {};
+
+/**
+ * Strict policy: every hook returns "deny". Tests and embedders
+ * that want zero outside-world access use this.
+ */
+export const denyAllPolicy: PolicyEnforcer = {
+  mayInvokeExtension: () => "deny",
+  mayOpenPath: () => "deny",
+  mayConnect: () => "deny",
+  mayListen: () => "deny",
+  mayLog: () => "deny",
+  mayGetRealtime: () => "deny",
+};
+
 export function defaultHostState(): HostState {
   return {
     nowRealtimeNs: 0n,
     extensions: new EmptyExtensionRegistry(),
     logSink: new DiscardLogSink(),
+    policy: allowAllPolicy,
   };
 }
 
@@ -286,6 +344,12 @@ export class Microkernel {
 
     const khImports = {
       kh_now_realtime: (outPtr: number): number => {
+        // Policy gate fires before any state read.
+        if (
+          hostBox.state.policy.mayGetRealtime?.() === "deny"
+        ) {
+          return -EACCES;
+        }
         new DataView(memoryRef.memory!.buffer).setBigUint64(
           outPtr,
           hostBox.state.nowRealtimeNs,
@@ -295,7 +359,14 @@ export class Microkernel {
       },
       kh_log: (severity: number, msgPtr: number, msgLen: number): number => {
         const bytes = new Uint8Array(memoryRef.memory!.buffer, msgPtr, msgLen);
-        hostBox.state.logSink.emit(severity, new TextDecoder().decode(bytes));
+        const message = new TextDecoder().decode(bytes);
+        // Policy may suppress per message; default Allow.
+        if (
+          hostBox.state.policy.mayLog?.(severity, message) === "deny"
+        ) {
+          return 0;
+        }
+        hostBox.state.logSink.emit(severity, message);
         return 0;
       },
       kh_extension_invoke: (
@@ -308,6 +379,13 @@ export class Microkernel {
           new Uint8Array(memoryRef.memory!.buffer, reqPtr, reqLen).slice()
             .buffer,
         );
+        // Policy gate at the kh_* boundary — denied calls don't
+        // reach the registry.
+        if (
+          hostBox.state.policy.mayInvokeExtension?.(request) === "deny"
+        ) {
+          return BigInt(-EACCES);
+        }
         const result = hostBox.state.extensions.invoke(request, outCap);
         if (typeof result === "number") return BigInt(result);
         if (result.byteLength > outCap) return BigInt(-EFAULT);

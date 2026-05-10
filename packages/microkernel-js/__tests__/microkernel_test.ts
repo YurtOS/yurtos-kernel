@@ -18,6 +18,7 @@
 import { assertEquals } from "@std/assert";
 import {
   defaultHostState,
+  denyAllPolicy,
   type ExtensionRegistry,
   type LogSink,
   METHOD,
@@ -324,6 +325,61 @@ Deno.test(
     // Unknown path → -ENOENT (-2).
     const missing = mk.syscall(METHOD.SYS_OPEN, buildOpen(0, enc.encode("/no/such")), 0);
     assertEquals(Number(missing.rc), -2);
+  },
+);
+
+Deno.test(
+  "PolicyEnforcer denies extension at the kh_* boundary",
+  async () => {
+    // Policy mirrors the Rust BlockEvil test: deny anything
+    // containing "evil" before the extension registry sees it.
+    const recorded: Uint8Array[] = [];
+    const registry: ExtensionRegistry = {
+      invoke(req, _cap) {
+        recorded.push(req);
+        return new TextEncoder().encode("ok");
+      },
+    };
+    const mk = await Microkernel.load(await kernelWasm(), {
+      ...defaultHostState(),
+      extensions: registry,
+      policy: {
+        mayInvokeExtension(request) {
+          const text = new TextDecoder().decode(request);
+          return text.includes("evil") ? "deny" : "allow";
+        },
+      },
+    });
+
+    // Allowed call goes through.
+    const benign = new TextEncoder().encode("benign request");
+    const ok = mk.syscall(METHOD.SYS_EXTENSION_INVOKE, benign, 64);
+    if (Number(ok.rc) <= 0) throw new Error(`expected positive rc, got ${ok.rc}`);
+    assertEquals(recorded.length, 1);
+
+    // Denied call returns -EACCES (-13) and never reaches registry.
+    const evil = new TextEncoder().encode("do something evil");
+    const denied = mk.syscall(METHOD.SYS_EXTENSION_INVOKE, evil, 64);
+    assertEquals(Number(denied.rc), -13);
+    assertEquals(recorded.length, 1, "registry must not see denied call");
+  },
+);
+
+Deno.test(
+  "denyAllPolicy blocks kh_now_realtime → sys_clock_gettime",
+  async () => {
+    const mk = await Microkernel.load(await kernelWasm(), {
+      ...defaultHostState(),
+      policy: denyAllPolicy,
+    });
+    const { rc } = mk.syscall(
+      METHOD.SYS_CLOCK_GETTIME,
+      new Uint8Array(4), // clock_id = 0 (REALTIME), little-endian zero
+      8,
+    );
+    if (Number(rc) >= 0) {
+      throw new Error(`expected denial, got rc=${rc}`);
+    }
   },
 );
 
