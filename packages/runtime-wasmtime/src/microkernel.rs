@@ -578,6 +578,12 @@ pub struct UserState {
     pub argv: Vec<Vec<u8>>,
 }
 
+impl yurt_microkernel_core::HasCallerPid for UserState {
+    fn caller_pid(&self) -> u32 {
+        self.pid
+    }
+}
+
 /// A spawned user-process instance.
 pub struct UserProcess {
     store: Store<UserState>,
@@ -711,32 +717,10 @@ impl UserProcess {
 /// Used by:
 /// - `register_sys_imports` for the `sys_*` shims
 /// - `wasi_shim::add_to_linker` for `fd_write` / `fd_close`
-pub fn trampoline_request<C: yurt_microkernel_core::HostCallCtx<UserState>>(
-    ctx: &mut C,
-    method_id: u32,
-    req_bytes: &[u8],
-) -> i64 {
-    let pid = ctx.user_state().pid;
-    ctx.dispatch_kernel(method_id, pid, req_bytes, 0).rc
-}
-
-/// Forward a syscall and copy the kernel's response into `response`.
-/// Returns the syscall scalar (e.g. bytes written by the kernel).
-pub fn trampoline_request_with_response<C: yurt_microkernel_core::HostCallCtx<UserState>>(
-    ctx: &mut C,
-    method_id: u32,
-    req_bytes: &[u8],
-    response: &mut [u8],
-) -> i64 {
-    let pid = ctx.user_state().pid;
-    let outcome = ctx.dispatch_kernel(method_id, pid, req_bytes, response.len() as u32);
-    if outcome.rc <= 0 {
-        return outcome.rc;
-    }
-    let to_copy = outcome.response.len().min(response.len());
-    response[..to_copy].copy_from_slice(&outcome.response[..to_copy]);
-    outcome.rc
-}
+// Trampoline helpers (`forward_*`, `trampoline_request*`) live in
+// `yurt_microkernel_core` now — they're engine-agnostic. We re-export
+// the two `pub` ones the WASI shim uses for backwards compatibility.
+pub use yurt_microkernel_core::{trampoline_request, trampoline_request_with_response};
 
 // ── Linker registration ──────────────────────────────────────────────────────
 
@@ -850,109 +834,14 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
 /// import forwards into `kernel_dispatch` with the appropriate method
 /// id from `yurt_abi_methods.toml`. The wasm import names match the architectural reality: these are syscalls.
 fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
-    use yurt_microkernel_core::HostCallCtx;
-
-    fn forward_scalar<C: HostCallCtx<UserState>>(ctx: &mut C, method_id: u32) -> i32 {
-        let pid = ctx.user_state().pid;
-        ctx.dispatch_kernel(method_id, pid, &[], 0).rc as i32
-    }
-
-    /// Forward a syscall whose only argument is a single `u32`. The
-    /// argument is staged as 4 little-endian bytes in kernel scratch.
-    fn forward_u32_arg<C: HostCallCtx<UserState>>(
-        ctx: &mut C,
-        method_id: u32,
-        arg: u32,
-    ) -> i32 {
-        forward_request_bytes(ctx, method_id, &arg.to_le_bytes()) as i32
-    }
-
-    /// Forward a syscall whose request is `request_bytes`; no response
-    /// buffer. Returns the syscall scalar (i64 to preserve sign /
-    /// negative-errno semantics; callers that want i32 can cast).
-    fn forward_request_bytes<C: HostCallCtx<UserState>>(
-        ctx: &mut C,
-        method_id: u32,
-        request_bytes: &[u8],
-    ) -> i64 {
-        let pid = ctx.user_state().pid;
-        ctx.dispatch_kernel(method_id, pid, request_bytes, 0).rc
-    }
-
-    /// Forward a syscall that reads bytes from the *user-process* wasm
-    /// at `(user_ptr, user_len)`, copies them into kernel scratch, and
-    /// invokes `kernel_dispatch`. Used by syscalls like `sys_chdir`
-    /// where the user-process supplies a pointer + length to its own
-    /// memory.
-    fn forward_user_ptr_len<C: HostCallCtx<UserState>>(
-        ctx: &mut C,
-        method_id: u32,
-        user_ptr: u32,
-        user_len: u32,
-    ) -> i32 {
-        let mut buf = vec![0u8; user_len as usize];
-        if user_len > 0 && ctx.read_user_memory(user_ptr, &mut buf).is_err() {
-            return -(EFAULT as i32);
-        }
-        forward_request_bytes(ctx, method_id, &buf) as i32
-    }
-
-    /// Forward a syscall whose request is `req_bytes` (already
-    /// encoded by the caller) and whose response goes into a user-
-    /// memory buffer `(user_out_ptr, user_out_cap)`. The kernel writes
-    /// into kernel scratch, then we copy from there into user memory.
-    /// Returns the syscall scalar verbatim — callers that want POSIX
-    /// "0 on success" can collapse a positive `rc` themselves.
-    fn forward_request_with_user_response<C: HostCallCtx<UserState>>(
-        ctx: &mut C,
-        method_id: u32,
-        req_bytes: &[u8],
-        user_out_ptr: u32,
-        user_out_cap: u32,
-    ) -> i64 {
-        let pid = ctx.user_state().pid;
-        let outcome = ctx.dispatch_kernel(method_id, pid, req_bytes, user_out_cap);
-        if outcome.rc <= 0 {
-            return outcome.rc;
-        }
-        if !outcome.response.is_empty()
-            && ctx
-                .write_user_memory(user_out_ptr, &outcome.response)
-                .is_err()
-        {
-            return -EFAULT;
-        }
-        outcome.rc
-    }
-
-    /// Forward a syscall that fills a response buffer in *user-process*
-    /// memory at `(user_out_ptr, user_out_cap)`. The kernel writes the
-    /// response into kernel scratch, which we then copy out into user
-    /// memory.
-    fn forward_response_to_user<C: HostCallCtx<UserState>>(
-        ctx: &mut C,
-        method_id: u32,
-        user_out_ptr: u32,
-        user_out_cap: u32,
-    ) -> i32 {
-        let pid = ctx.user_state().pid;
-        let outcome = ctx.dispatch_kernel(method_id, pid, &[], user_out_cap);
-        // The kernel-side convention for "buffer too small" varies per
-        // syscall (e.g. getcwd returns required size as a positive
-        // value). We copy out at most cap bytes regardless so the user
-        // sees what fit.
-        if outcome.rc <= 0 {
-            return outcome.rc as i32;
-        }
-        if !outcome.response.is_empty()
-            && ctx
-                .write_user_memory(user_out_ptr, &outcome.response)
-                .is_err()
-        {
-            return -(EFAULT as i32);
-        }
-        outcome.rc as i32
-    }
+    // Trampoline helpers are now in `microkernel-core` — they're
+    // engine-agnostic and shared by every native engine impl. The
+    // `register_sys_imports` body just wires the typed wasmtime
+    // closures to those helpers.
+    use yurt_microkernel_core::{
+        forward_request_bytes, forward_request_with_user_response, forward_response_to_user,
+        forward_scalar, forward_u32_arg, forward_user_ptr_len,
+    };
 
     linker.func_wrap(
         SYS_NAMESPACE,
