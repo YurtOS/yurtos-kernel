@@ -39,6 +39,7 @@ const SYS_NAMESPACE: &str = "env";
 /// `abi/contract/yurt_abi.toml`.
 const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
+const EACCES: i64 = 13;
 
 /// Public re-export so the engine adapter (`engine::WasmtimeCtx`)
 /// can return the same EFAULT value our trampoline uses internally.
@@ -125,6 +126,111 @@ pub trait LogSink: Send + Sync {
     fn emit(&self, severity: u32, message: &str);
 }
 
+/// Policy decisions. Synchronous so the host can plug in any
+/// blocking prompt (CLI, GUI, "ask the human") behind a single
+/// trait method. Embedders that want fully non-interactive
+/// behavior pre-commit to Allow / Deny in their impl.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyDecision {
+    Allow,
+    Deny,
+}
+
+/// Embedder-supplied gate that sits at every `kh_*` crossing where
+/// kernel.wasm is about to reach the outside world. The microkernel
+/// consults the policy before invoking real I/O; a Deny decision
+/// turns into a kernel-side `-EACCES`.
+///
+/// Granularity is per-action, with the action's salient parameters
+/// (path bytes, target host+port, signal number, …) so policies can
+/// be precise — the canonical "ask me before connecting to evil.com"
+/// reads `may_connect("www.evil.com", 443)` and prompts the human.
+///
+/// Defaults to Allow on every hook so embedders that don't care
+/// about policy don't have to implement it. Embedders that do care
+/// override the relevant methods.
+///
+/// All hooks are synchronous. Interactive impls block the calling
+/// kernel-host thread; long blocks should be avoided for hooks that
+/// fire on hot paths (today only `may_invoke_extension` does, and
+/// even that is a host-only call from the kernel — never user code).
+pub trait PolicyEnforcer: Send + Sync {
+    /// Gate `kh_extension_invoke` — the kernel forwards an opaque
+    /// extension-registry request to the host. Embedders that
+    /// trust everything inside their own extensions can leave this
+    /// as the default Allow.
+    fn may_invoke_extension(&self, _request: &[u8]) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
+    /// Gate file-system access from kernel.wasm to the real host fs
+    /// (via the eventual `kh_real_fs_*` ABI; not wired yet). `write`
+    /// distinguishes read-only opens from writable opens.
+    fn may_open_path(&self, _path: &[u8], _write: bool) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
+    /// Gate outbound network connections (eventual `kh_socket_connect`).
+    /// `host` is the resolved hostname / IP literal the connection is
+    /// targeting; `port` is the TCP/UDP port. The embedder can match
+    /// domain suffixes, port ranges, or ask the user.
+    fn may_connect(&self, _host: &str, _port: u16) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
+    /// Gate inbound listeners (eventual `kh_socket_listen`).
+    fn may_listen(&self, _port: u16) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
+    /// Gate `kh_log` emissions. Most embedders Allow these; some
+    /// (e.g. embedded contexts that have no log sink) may Deny to
+    /// drop noise without paying for the message format.
+    fn may_log(&self, _severity: u32, _message: &str) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
+    /// Gate `kh_now_realtime`. Privacy-sensitive embedders may
+    /// quantize or refuse access to wall-clock; the kernel sees
+    /// Deny as `-EACCES`.
+    fn may_get_realtime(&self) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+}
+
+/// Default policy: every hook returns Allow. Equivalent to having
+/// no policy enforcer at all; useful as the safe default for
+/// embedders that don't need gating.
+pub struct AllowAllPolicy;
+
+impl PolicyEnforcer for AllowAllPolicy {}
+
+/// Strict policy: every hook returns Deny. Tests and "no I/O at all"
+/// embedders use this. Combined with extension hooks, it produces a
+/// kernel that can only read its own ramfs and talk to itself.
+pub struct DenyAllPolicy;
+
+impl PolicyEnforcer for DenyAllPolicy {
+    fn may_invoke_extension(&self, _request: &[u8]) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_open_path(&self, _path: &[u8], _write: bool) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_connect(&self, _host: &str, _port: u16) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_listen(&self, _port: u16) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_log(&self, _severity: u32, _message: &str) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_get_realtime(&self) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+}
+
 pub struct DiscardLogSink;
 
 impl LogSink for DiscardLogSink {
@@ -151,6 +257,11 @@ pub struct HostState {
     pub now_realtime_ns: u64,
     pub extensions: Arc<dyn ExtensionRegistry>,
     pub log_sink: Arc<dyn LogSink>,
+    /// Policy gate consulted at every `kh_*` boundary that touches
+    /// the outside world. Defaults to AllowAllPolicy; embedders
+    /// override via `Microkernel::with_host_state_mut` or by
+    /// constructing a custom HostState.
+    pub policy: Arc<dyn PolicyEnforcer>,
 }
 
 impl Default for HostState {
@@ -159,6 +270,7 @@ impl Default for HostState {
             now_realtime_ns: 0,
             extensions: Arc::new(EmptyExtensionRegistry),
             log_sink: Arc::new(DiscardLogSink),
+            policy: Arc::new(AllowAllPolicy),
         }
     }
 }
@@ -633,6 +745,11 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
         KH_NAMESPACE,
         "kh_now_realtime",
         |mut caller: Caller<'_, KernelStoreData>, out_ptr: u32| -> i32 {
+            // Policy gate: privacy-sensitive embedders may refuse
+            // wall-clock access. Default policy is Allow.
+            if caller.data().host.policy.may_get_realtime() == PolicyDecision::Deny {
+                return -(EACCES as i32);
+            }
             let now = caller.data().host.now_realtime_ns;
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
@@ -664,8 +781,13 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 return -(EFAULT as i32);
             }
             let sink = caller.data().host.log_sink.clone();
+            let policy = caller.data().host.policy.clone();
             if let Ok(s) = std::str::from_utf8(&buf) {
-                sink.emit(severity, s);
+                // Policy gate fires per message so embedders can
+                // suppress noisy severities or specific content.
+                if policy.may_log(severity, s) == PolicyDecision::Allow {
+                    sink.emit(severity, s);
+                }
             }
             0
         },
@@ -689,6 +811,18 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 .is_err()
             {
                 return -EFAULT;
+            }
+            // Policy gate: embedders that don't trust extension
+            // requests inspect the bytes here. Returning Deny short-
+            // circuits the registry call with -EACCES.
+            if caller
+                .data()
+                .host
+                .policy
+                .may_invoke_extension(&request)
+                == PolicyDecision::Deny
+            {
+                return -EACCES;
             }
             let mut response = vec![0u8; out_cap as usize];
             let registry = caller.data().host.extensions.clone();

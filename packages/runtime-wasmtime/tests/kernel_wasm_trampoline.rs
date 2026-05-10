@@ -297,6 +297,90 @@ fn sys_extension_invoke_forwards_bytes_through_microkernel() {
 }
 
 #[test]
+fn policy_can_deny_extension_invoke_at_kh_boundary() {
+    use yurt_runtime_wasmtime::microkernel::{PolicyDecision, PolicyEnforcer};
+    // Embedder rejects any extension request whose body contains
+    // the literal "evil". The "ask the human" use-case slots in
+    // here; this test stubs that with a string match for
+    // determinism.
+    struct BlockEvil;
+    impl PolicyEnforcer for BlockEvil {
+        fn may_invoke_extension(&self, request: &[u8]) -> PolicyDecision {
+            if request.windows(4).any(|w| w == b"evil") {
+                PolicyDecision::Deny
+            } else {
+                PolicyDecision::Allow
+            }
+        }
+    }
+
+    build_kernel_wasm().unwrap();
+    // Echo registry that would happily handle anything — but the
+    // policy sits in front and short-circuits.
+    let registry = Arc::new(EchoExtension {
+        last_request: Mutex::new(Vec::new()),
+        response: b"{}".to_vec(),
+    });
+    let mk = Microkernel::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            extensions: registry.clone(),
+            policy: Arc::new(BlockEvil),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    // Allowed call goes through.
+    let mut response = vec![0u8; 64];
+    let rc = mk
+        .syscall(METHOD_SYS_EXTENSION_INVOKE, b"benign request", &mut response)
+        .unwrap();
+    assert!(rc > 0, "benign request: rc = {rc}");
+
+    // Denied call returns -EACCES (-13). Critically, the registry
+    // is *not* invoked — the gate is at the kh_* boundary, before
+    // the embedder sees the bytes.
+    let registry_calls_before = registry.last_request.lock().unwrap().len();
+    let rc = mk
+        .syscall(METHOD_SYS_EXTENSION_INVOKE, b"do something evil", &mut response)
+        .unwrap();
+    assert_eq!(rc, -13, "expected -EACCES, got {rc}");
+    let registry_calls_after = registry.last_request.lock().unwrap().len();
+    // The previous "benign request" updated the recorded request;
+    // the denied call must NOT have updated it.
+    assert_eq!(
+        registry_calls_before, registry_calls_after,
+        "denied request must not reach the registry"
+    );
+}
+
+#[test]
+fn deny_all_policy_blocks_realtime_clock() {
+    use yurt_runtime_wasmtime::microkernel::DenyAllPolicy;
+    // When a policy denies kh_now_realtime, kernel.wasm sees
+    // -EACCES from kh_now_realtime, which sys_clock_gettime
+    // forwards back to the caller. (Constant for ergonomic
+    // matching: -13 = -EACCES.)
+    build_kernel_wasm().unwrap();
+    let mk = Microkernel::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            policy: Arc::new(DenyAllPolicy),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    // sys_clock_gettime(REALTIME=0) goes through kh_now_realtime,
+    // which the deny-all policy refuses.
+    let mut buf = [0u8; 8];
+    let rc = mk
+        .syscall(METHOD_SYS_CLOCK_GETTIME, &0_u32.to_le_bytes(), &mut buf)
+        .unwrap();
+    assert!(rc < 0, "deny-all policy should block clock_gettime: got {rc}");
+}
+
+#[test]
 fn sys_extension_invoke_returns_negated_enoent_when_no_registry() {
     // Default registry is empty; -ENOENT propagates back through the
     // trampoline as a negative scalar.
