@@ -13,7 +13,7 @@ use wasmtime::{Engine, Module};
 
 use yurt_runtime_wasmtime::microkernel::{
     build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, InMemoryHostFs,
-    LogSink, Microkernel, NativeHostFs,
+    LogSink, Microkernel, NativeHostFs, NativeTcpSocket,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -77,6 +77,10 @@ const METHOD_SYS_LINK: u32 = 0x1_002D;
 const METHOD_SYS_RENAME: u32 = 0x1_002E;
 const METHOD_SYS_SPAWN: u32 = 0x1_002F;
 const METHOD_SYS_FETCH: u32 = 0x1_0030;
+const METHOD_SYS_SOCKET_CONNECT: u32 = 0x1_0031;
+const METHOD_SYS_SOCKET_SEND: u32 = 0x1_0032;
+const METHOD_SYS_SOCKET_RECV: u32 = 0x1_0033;
+const METHOD_SYS_SOCKET_CLOSE: u32 = 0x1_0034;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -166,6 +170,10 @@ fn kernel_wasm_imports_match_documented_namespaces() {
             "kh_real_symlink",
             "kh_real_unlink",
             "kh_real_write",
+            "kh_socket_close",
+            "kh_socket_connect",
+            "kh_socket_recv",
+            "kh_socket_send",
         ],
         "documented kh_* surface"
     );
@@ -1016,6 +1024,86 @@ fn run_pending_spawns_runs_real_wasm_child_and_parent_reaps() {
     assert_eq!(status, 1, "false-cmd exits with 1, got {status}");
 }
 
+#[test]
+fn sys_socket_connect_send_recv_through_local_echo_server() {
+    // Spin up a one-shot TCP echo server on 127.0.0.1, dial it
+    // through sys_socket_connect, send a payload, recv it back,
+    // verify byte-for-byte. The server thread shuts down as soon
+    // as the connection closes — keeps the test self-contained.
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 64];
+            if let Ok(n) = stream.read(&mut buf) {
+                let _ = stream.write_all(&buf[..n]);
+            }
+        }
+    });
+
+    build_kernel_wasm().unwrap();
+    let mut host = HostState::default();
+    host.tcp = Some(Arc::new(NativeTcpSocket::new()));
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+
+    // sys_socket_connect request: u8 family + u8 sock_type + u16
+    // pad + u32 flags + addr ("host:port" UTF-8).
+    let addr = format!("127.0.0.1:{port}");
+    let mut req: Vec<u8> = vec![2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 0, 0];
+    req.extend_from_slice(&0_u32.to_le_bytes()); // flags
+    req.extend_from_slice(addr.as_bytes());
+    let handle = mk
+        .syscall(METHOD_SYS_SOCKET_CONNECT, &req, &mut [])
+        .unwrap();
+    assert!(handle >= 0, "connect failed: {handle}");
+
+    // Send a payload.
+    let payload = b"hello tcp";
+    let mut send_req = (handle as i32).to_le_bytes().to_vec();
+    send_req.extend_from_slice(payload);
+    let n = mk.syscall(METHOD_SYS_SOCKET_SEND, &send_req, &mut []).unwrap();
+    assert_eq!(n as usize, payload.len());
+
+    // Receive it back.
+    let mut recv_req = (handle as i32).to_le_bytes().to_vec();
+    recv_req.extend_from_slice(&0_u32.to_le_bytes()); // flags=0 (blocking)
+    let mut buf = vec![0u8; 64];
+    let n = mk.syscall(METHOD_SYS_SOCKET_RECV, &recv_req, &mut buf).unwrap();
+    assert!(n > 0, "recv failed: {n}");
+    assert_eq!(&buf[..n as usize], payload);
+
+    // Close.
+    let close_req = (handle as i32).to_le_bytes();
+    assert_eq!(
+        mk.syscall(METHOD_SYS_SOCKET_CLOSE, &close_req, &mut [])
+            .unwrap(),
+        0,
+    );
+    let _ = server.join();
+}
+
+#[test]
+fn sys_socket_connect_denied_by_policy_returns_eacces() {
+    use yurt_runtime_wasmtime::microkernel::DenyAllPolicy;
+    build_kernel_wasm().unwrap();
+    let mk = Microkernel::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            policy: Arc::new(DenyAllPolicy),
+            tcp: Some(Arc::new(NativeTcpSocket::new())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut req: Vec<u8> = vec![2, 1, 0, 0];
+    req.extend_from_slice(&0_u32.to_le_bytes());
+    req.extend_from_slice(b"127.0.0.1:1");
+    let rc = mk.syscall(METHOD_SYS_SOCKET_CONNECT, &req, &mut []).unwrap();
+    assert_eq!(rc, -13, "deny → -EACCES, got {rc}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sys_fetch_round_trips_through_kh_fetch_blocking() {
     use wiremock::matchers::{method, path};
@@ -1597,6 +1685,26 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_rename", METHOD_SYS_RENAME, METHOD_SYS_RENAME as i64),
         ("sys_spawn", METHOD_SYS_SPAWN, METHOD_SYS_SPAWN as i64),
         ("sys_fetch", METHOD_SYS_FETCH, METHOD_SYS_FETCH as i64),
+        (
+            "sys_socket_connect",
+            METHOD_SYS_SOCKET_CONNECT,
+            METHOD_SYS_SOCKET_CONNECT as i64,
+        ),
+        (
+            "sys_socket_send",
+            METHOD_SYS_SOCKET_SEND,
+            METHOD_SYS_SOCKET_SEND as i64,
+        ),
+        (
+            "sys_socket_recv",
+            METHOD_SYS_SOCKET_RECV,
+            METHOD_SYS_SOCKET_RECV as i64,
+        ),
+        (
+            "sys_socket_close",
+            METHOD_SYS_SOCKET_CLOSE,
+            METHOD_SYS_SOCKET_CLOSE as i64,
+        ),
     ] {
         let entry = methods
             .get(name)

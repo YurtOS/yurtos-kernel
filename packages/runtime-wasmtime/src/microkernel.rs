@@ -294,6 +294,17 @@ pub struct HostState {
     ///   OPFS yet.
     /// - Embedder-provided impls for S3, OPFS, IndexedDB, etc.
     pub host_fs: Option<Arc<dyn HostFsImpl>>,
+    /// Outbound TCP backend the `kh_socket_*` imports route to.
+    /// Pluggable like [`host_fs`]; the trait is the contract.
+    /// `None` means no socket access — every connect returns
+    /// -EACCES.
+    ///
+    /// In-tree implementations:
+    /// - [`NativeTcpSocket::new`] — std::net::TcpStream, blocking,
+    ///   subject to the embedder's `may_connect` policy gate.
+    /// - Browser microkernels plug in a WebSocket-backed impl
+    ///   here (browsers can't open raw TCP).
+    pub tcp: Option<Arc<dyn TcpSocketImpl>>,
 }
 
 impl Default for HostState {
@@ -304,7 +315,137 @@ impl Default for HostState {
             log_sink: Arc::new(DiscardLogSink),
             policy: Arc::new(AllowAllPolicy),
             host_fs: None,
+            tcp: None,
         }
+    }
+}
+
+/// Pluggable outbound TCP backend. The embedder picks an
+/// implementation; kernel.wasm's `kh_socket_*` imports route here.
+/// Browser microkernels plug in a WebSocket-backed impl since
+/// browsers can't open raw TCP; native deployments use
+/// [`NativeTcpSocket`]. Containment is the embedder's job — the
+/// `may_connect` policy gate fires before this trait sees any
+/// request.
+pub trait TcpSocketImpl: Send + Sync {
+    /// Connect to `host:port` and return a non-negative socket
+    /// handle, or a negated POSIX errno.
+    fn connect(&self, host: &str, port: u16, flags: u32) -> i32;
+    /// Send up to `data.len()` bytes. Returns bytes sent or
+    /// negated errno.
+    fn send(&self, handle: i32, data: &[u8]) -> i64;
+    /// Receive into `buf`. Returns bytes-read (0 = peer closed)
+    /// or negated errno (-EAGAIN with KH_SOCK_NONBLOCK).
+    fn recv(&self, handle: i32, buf: &mut [u8], flags: u32) -> i64;
+    /// Close the handle.
+    fn close(&self, handle: i32) -> i32;
+}
+
+/// std::net::TcpStream-backed [`TcpSocketImpl`]. Blocking I/O;
+/// each `connect` issues a fresh DNS resolve + TCP handshake with
+/// a configurable timeout. Suitable for native CLI / server
+/// embedders. Browser microkernels need their own impl.
+pub struct NativeTcpSocket {
+    connect_timeout: std::time::Duration,
+    inner: std::sync::Mutex<NativeTcpState>,
+}
+
+#[derive(Default)]
+struct NativeTcpState {
+    sockets: std::collections::BTreeMap<i32, std::net::TcpStream>,
+    next_handle: i32,
+}
+
+impl NativeTcpSocket {
+    pub fn new() -> Self {
+        Self::with_connect_timeout(std::time::Duration::from_secs(30))
+    }
+
+    pub fn with_connect_timeout(connect_timeout: std::time::Duration) -> Self {
+        Self {
+            connect_timeout,
+            inner: std::sync::Mutex::new(NativeTcpState {
+                next_handle: 1,
+                ..Default::default()
+            }),
+        }
+    }
+}
+
+impl Default for NativeTcpSocket {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TcpSocketImpl for NativeTcpSocket {
+    fn connect(&self, host: &str, port: u16, _flags: u32) -> i32 {
+        use std::net::ToSocketAddrs;
+        // Resolve every address the host name maps to and try
+        // them in turn — first-success wins. POSIX-shaped: the
+        // kernel never sees the IP, just the resulting handle.
+        let addrs: Vec<std::net::SocketAddr> = match (host, port).to_socket_addrs() {
+            Ok(it) => it.collect(),
+            Err(_) => return -(2 as i32), // -ENOENT (DNS miss)
+        };
+        let mut last_err: i32 = -(111 as i32); // -ECONNREFUSED default
+        for addr in addrs {
+            match std::net::TcpStream::connect_timeout(&addr, self.connect_timeout) {
+                Ok(stream) => {
+                    let mut s = self.inner.lock().unwrap();
+                    let handle = s.next_handle;
+                    s.next_handle = s.next_handle.saturating_add(1);
+                    s.sockets.insert(handle, stream);
+                    return handle;
+                }
+                Err(e) => last_err = tcp_io_errno(e),
+            }
+        }
+        last_err
+    }
+
+    fn send(&self, handle: i32, data: &[u8]) -> i64 {
+        use std::io::Write;
+        let mut s = self.inner.lock().unwrap();
+        let Some(stream) = s.sockets.get_mut(&handle) else {
+            return -(9 as i64); // -EBADF
+        };
+        match stream.write(data) {
+            Ok(n) => n as i64,
+            Err(e) => tcp_io_errno(e) as i64,
+        }
+    }
+
+    fn recv(&self, handle: i32, buf: &mut [u8], _flags: u32) -> i64 {
+        use std::io::Read;
+        let mut s = self.inner.lock().unwrap();
+        let Some(stream) = s.sockets.get_mut(&handle) else {
+            return -(9 as i64);
+        };
+        match stream.read(buf) {
+            Ok(n) => n as i64,
+            Err(e) => tcp_io_errno(e) as i64,
+        }
+    }
+
+    fn close(&self, handle: i32) -> i32 {
+        self.inner.lock().unwrap().sockets.remove(&handle);
+        0
+    }
+}
+
+fn tcp_io_errno(e: std::io::Error) -> i32 {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        ConnectionRefused => -(111 as i32),
+        ConnectionReset => -(104 as i32),
+        ConnectionAborted => -(103 as i32),
+        TimedOut => -(110 as i32),
+        BrokenPipe => -(32 as i32), // -EPIPE
+        WouldBlock => -(11 as i32), // -EAGAIN
+        NotFound => -(2 as i32),
+        PermissionDenied => -(13 as i32),
+        _ => -(5 as i32), // -EIO
     }
 }
 
@@ -1797,6 +1938,112 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 None => return -(EACCES as i32),
             };
             fs.rename(&old_path, &new_path)
+        },
+    )?;
+
+    // ── kh_socket_* (outbound TCP) ─────────────────────────────────
+    //
+    // connect: parse "host:port", consult may_connect, delegate to
+    // HostState.tcp. send/recv/close pass the host handle through.
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_socket_connect",
+        |mut caller: Caller<'_, KernelStoreData>,
+         addr_ptr: u32,
+         addr_len: u32,
+         flags: u32|
+         -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT as i32,
+            };
+            let mut addr = vec![0u8; addr_len as usize];
+            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
+                return -EFAULT as i32;
+            }
+            let addr_str = match std::str::from_utf8(&addr) {
+                Ok(s) => s,
+                Err(_) => return -EINVAL as i32,
+            };
+            let (host, port_str) = match addr_str.rsplit_once(':') {
+                Some(p) => p,
+                None => return -EINVAL as i32,
+            };
+            let port: u16 = match port_str.parse() {
+                Ok(p) => p,
+                Err(_) => return -EINVAL as i32,
+            };
+            if caller.data().host.policy.may_connect(host, port) == PolicyDecision::Deny {
+                return -EACCES as i32;
+            }
+            let tcp = match caller.data().host.tcp.clone() {
+                Some(t) => t,
+                None => return -EACCES as i32,
+            };
+            tcp.connect(host, port, flags)
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_socket_send",
+        |mut caller: Caller<'_, KernelStoreData>,
+         handle: i32,
+         data_ptr: u32,
+         data_len: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            let mut buf = vec![0u8; data_len as usize];
+            if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut buf).is_err() {
+                return -EFAULT;
+            }
+            let tcp = match caller.data().host.tcp.clone() {
+                Some(t) => t,
+                None => return -(EBADF as i64),
+            };
+            tcp.send(handle, &buf)
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_socket_recv",
+        |mut caller: Caller<'_, KernelStoreData>,
+         handle: i32,
+         out_ptr: u32,
+         len: u32,
+         flags: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            let tcp = match caller.data().host.tcp.clone() {
+                Some(t) => t,
+                None => return -(EBADF as i64),
+            };
+            let mut buf = vec![0u8; len as usize];
+            let n = tcp.recv(handle, &mut buf, flags);
+            if n > 0
+                && memory
+                    .write(&mut caller, out_ptr as usize, &buf[..n as usize])
+                    .is_err()
+            {
+                return -EFAULT;
+            }
+            n
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_socket_close",
+        |mut caller: Caller<'_, KernelStoreData>, handle: i32| -> i32 {
+            let tcp = match caller.data().host.tcp.clone() {
+                Some(t) => t,
+                None => return 0,
+            };
+            tcp.close(handle)
         },
     )?;
 

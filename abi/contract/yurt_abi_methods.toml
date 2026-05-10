@@ -338,6 +338,26 @@ id = 0x1_002E
 kind = "syscall"
 doc = "POSIX rename(oldpath, newpath). Request bytes: u32 old_len LE + old_bytes + new_bytes. Atomically moves the entry at `oldpath` to `newpath` within the same mount; if `newpath` exists it is replaced (regular files only — directory replacement is -EEXIST). Returns 0 on success, -ENOENT if old is missing, -EXDEV across mounts, -EISDIR/-ENOTDIR on type mismatch, -EROFS on a read-only backend, or other negated POSIX errno."
 
+[method.sys_socket_connect]
+id = 0x1_0031
+kind = "syscall"
+doc = "Open a TCP socket and connect to `host:port`. Request bytes: u8 family + u8 sock_type + u16 _pad + u32 flags + addr bytes (UTF-8 'host:port', e.g. 'example.com:443'). Returns a non-negative socket fd or a negated errno (-EACCES policy denial, -ECONNREFUSED, -EHOSTUNREACH). The fd participates in the same kernel fd table as files; sys_close releases it."
+
+[method.sys_socket_send]
+id = 0x1_0032
+kind = "syscall"
+doc = "Send bytes on a socket fd. Request bytes: u32 fd LE + payload bytes. Returns bytes-sent or -EBADF / -EPIPE / -EAGAIN. Blocking unless the socket was opened with KH_SOCK_NONBLOCK."
+
+[method.sys_socket_recv]
+id = 0x1_0033
+kind = "syscall"
+doc = "Receive bytes on a socket fd into the response buffer. Request bytes: u32 fd LE + u32 flags LE. Returns bytes-read into the response (0 = peer closed / EOF) or -EBADF / -EAGAIN."
+
+[method.sys_socket_close]
+id = 0x1_0034
+kind = "syscall"
+doc = "Close a socket fd previously returned from sys_socket_connect. Request bytes: u32 fd LE. Returns 0 or -EBADF."
+
 [method.sys_fetch]
 id = 0x1_0030
 kind = "syscall"

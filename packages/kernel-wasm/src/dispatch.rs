@@ -95,6 +95,10 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_RENAME => rename(caller_pid, request),
         METHOD_SYS_SPAWN => sys_spawn(caller_pid, request),
         METHOD_SYS_FETCH => sys_fetch(request, response),
+        METHOD_SYS_SOCKET_CONNECT => sys_socket_connect(request),
+        METHOD_SYS_SOCKET_SEND => sys_socket_send(request),
+        METHOD_SYS_SOCKET_RECV => sys_socket_recv(request, response),
+        METHOD_SYS_SOCKET_CLOSE => sys_socket_close(request),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -1206,6 +1210,56 @@ fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
     // /proc/self rewrite.
     let link_path = proc_self_rewrite(caller_pid, link_path_raw);
     with_kernel(|k| k.vfs.symlink(target, &link_path) as i64)
+}
+
+/// `sys_socket_connect(addr_bytes) -> handle`. Request layout
+/// matches the toml: u8 family + u8 sock_type + u16 _pad + u32
+/// flags + addr bytes (UTF-8 "host:port"). Returns the host
+/// handle directly — userland passes it to subsequent
+/// sys_socket_send/recv/close.
+fn sys_socket_connect(request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    // u8 family + u8 sock_type + u16 pad — currently unused; kept
+    // in the wire format so future AF_INET6 / SOCK_DGRAM fits.
+    let _family = request[0];
+    let _sock_type = request[1];
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let addr = &request[8..];
+    if addr.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    kh::socket_connect(addr, flags) as i64
+}
+
+fn sys_socket_send(request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let data = &request[4..];
+    kh::socket_send(handle, data)
+}
+
+fn sys_socket_recv(request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    if response.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    kh::socket_recv(handle, response, flags)
+}
+
+fn sys_socket_close(request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    kh::socket_close(handle) as i64
 }
 
 /// `sys_fetch(json_request_bytes) -> json_response_bytes`. Forwards

@@ -47,6 +47,10 @@ extern "C" {
         new_ptr: *const u8,
         new_len: usize,
     ) -> i32;
+    fn kh_socket_connect(addr_ptr: *const u8, addr_len: usize, flags: u32) -> i32;
+    fn kh_socket_send(handle: i32, data_ptr: *const u8, data_len: usize) -> i64;
+    fn kh_socket_recv(handle: i32, out_ptr: *mut u8, len: usize, flags: u32) -> i64;
+    fn kh_socket_close(handle: i32) -> i32;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -146,6 +150,31 @@ unsafe fn kh_real_rename(
     _new_ptr: *const u8,
     _new_len: usize,
 ) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_socket_connect(_addr_ptr: *const u8, _addr_len: usize, _flags: u32) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_socket_send(_handle: i32, _data_ptr: *const u8, _data_len: usize) -> i64 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_socket_recv(
+    _handle: i32,
+    _out_ptr: *mut u8,
+    _len: usize,
+    _flags: u32,
+) -> i64 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_socket_close(_handle: i32) -> i32 {
     -38
 }
 
@@ -258,6 +287,24 @@ pub fn real_rename(old_path: &[u8], new_path: &[u8]) -> i32 {
             new_path.len(),
         )
     }
+}
+
+/// Open a TCP socket and connect to `addr` (a UTF-8 "host:port"
+/// string). Returns a non-negative socket handle or negated errno.
+pub fn socket_connect(addr: &[u8], flags: u32) -> i32 {
+    unsafe { kh_socket_connect(addr.as_ptr(), addr.len(), flags) }
+}
+
+pub fn socket_send(handle: i32, data: &[u8]) -> i64 {
+    unsafe { kh_socket_send(handle, data.as_ptr(), data.len()) }
+}
+
+pub fn socket_recv(handle: i32, buf: &mut [u8], flags: u32) -> i64 {
+    unsafe { kh_socket_recv(handle, buf.as_mut_ptr(), buf.len(), flags) }
+}
+
+pub fn socket_close(handle: i32) -> i32 {
+    unsafe { kh_socket_close(handle) }
 }
 
 /// Forward an HTTP fetch request to the host. The request bytes
