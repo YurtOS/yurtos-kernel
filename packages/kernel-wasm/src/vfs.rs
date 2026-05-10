@@ -1041,6 +1041,49 @@ mod tests {
     }
 
     #[test]
+    fn overlay_link_copies_lower_target_up_then_links_in_upper() {
+        // Lower has /orig with bytes; upper is empty. After link
+        // /dup → /orig, both paths read the same content; unlinking
+        // one preserves the other (refcount semantics through upper).
+        let mut lower = RamfsBackend::new();
+        lower.install(b"/orig".to_vec(), b"link-me".to_vec());
+        let upper = RamfsBackend::new();
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+
+        let rc = overlay.link(b"/orig", b"/dup");
+        assert_eq!(rc, 0, "link rc = {rc}");
+
+        // /dup reads the same content.
+        let i = overlay.open(b"/dup", 0).unwrap();
+        let mut buf = [0u8; 16];
+        let n = overlay.read(i, 0, &mut buf);
+        assert_eq!(&buf[..n as usize], b"link-me");
+
+        // After unlinking /orig, /dup still resolves and reads.
+        let rc = overlay.unlink(b"/orig");
+        assert_eq!(rc, 0);
+        let i = overlay
+            .open(b"/dup", 0)
+            .expect("/dup must outlive /orig (hard link)");
+        let mut buf = [0u8; 16];
+        let n = overlay.read(i, 0, &mut buf);
+        assert_eq!(&buf[..n as usize], b"link-me");
+    }
+
+    #[test]
+    fn overlay_link_to_existing_path_is_eexist() {
+        let mut lower = RamfsBackend::new();
+        lower.install(b"/a".to_vec(), b"a".to_vec());
+        lower.install(b"/b".to_vec(), b"b".to_vec());
+        let upper = RamfsBackend::new();
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+        assert_eq!(
+            overlay.link(b"/a", b"/b"),
+            -(crate::abi::EEXIST as i64) as i32,
+        );
+    }
+
+    #[test]
     fn overlay_rename_lower_only_file_to_new_path() {
         // Source lives only in lower. After rename, new_path reads
         // the original bytes; old_path is whited out (gone).
@@ -1889,6 +1932,49 @@ impl VfsBackend for OverlayBackend {
             return upper;
         }
         self.lower.entry_type(path)
+    }
+
+    fn link(&mut self, target: &[u8], link_path: &[u8]) -> i32 {
+        // Target must exist somewhere; the destination must not.
+        if self.whiteouts.contains(target) {
+            return -(crate::abi::ENOENT as i64) as i32;
+        }
+        if self.entry_type(target) == 0 {
+            return -(crate::abi::ENOENT as i64) as i32;
+        }
+        if self.entry_type(link_path) != 0 {
+            return -(crate::abi::EEXIST as i64) as i32;
+        }
+        // Hard links share an inode, which only makes sense within
+        // a single backend. Copy the target up to upper if it's
+        // currently lower-only so both paths land in the same
+        // upper backend; then delegate to upper.link. (The lower
+        // version remains addressable through any pre-existing
+        // OFD, but new opens of `target` go through the upper
+        // copy-up like any other write.)
+        let in_upper = matches!(
+            self.upper.entry_type(target),
+            3 | 4 | 7,
+        );
+        if !in_upper {
+            // Copy-up only handles regular files today; symlinks
+            // would need readlink+symlink in upper. Fall back to
+            // -EPERM for non-files until that's plumbed.
+            if self.lower.entry_type(target) != 4 {
+                return -(crate::abi::EPERM as i64) as i32;
+            }
+            if self.copy_up(target).is_none() {
+                return -(crate::abi::EIO as i64) as i32;
+            }
+            // Drop any cached lower-tagged id so future opens see
+            // the new upper copy.
+            self.paths.remove(target);
+        }
+        let rc = self.upper.link(target, link_path);
+        if rc == 0 {
+            self.whiteouts.remove(link_path);
+        }
+        rc
     }
 
     fn rename(&mut self, old_path: &[u8], new_path: &[u8]) -> i32 {
