@@ -195,6 +195,18 @@ export interface KvBackend {
   put(store: Uint8Array, key: Uint8Array, value: Uint8Array): number;
   delete(store: Uint8Array, key: Uint8Array): number;
   list(store: Uint8Array, prefix: Uint8Array): Uint8Array[];
+  /**
+   * Optional async variants. When present AND the host supports
+   * JSPI, the matching kh_idb_* import is wrapped with
+   * `WebAssembly.Suspending` so userland's syscall actually
+   * suspends until the IndexedDB transaction (or other async
+   * backing store) resolves. Without JSPI these are ignored and
+   * the sync variants run.
+   */
+  getAsync?(store: Uint8Array, key: Uint8Array): Promise<Uint8Array | number>;
+  putAsync?(store: Uint8Array, key: Uint8Array, value: Uint8Array): Promise<number>;
+  deleteAsync?(store: Uint8Array, key: Uint8Array): Promise<number>;
+  listAsync?(store: Uint8Array, prefix: Uint8Array): Promise<Uint8Array[]>;
 }
 
 /**
@@ -1206,11 +1218,16 @@ export class Microkernel {
     const hasJspi = typeof W?.Suspending === "function" &&
       typeof W?.promising === "function";
     const tcpAsync = hostState.tcp;
+    const kvAsync = hostState.kv;
     const wantsAsync = hasJspi && (
       hostState.fetch != null ||
       tcpAsync?.connectAsync != null ||
       tcpAsync?.recvAsync != null ||
-      tcpAsync?.acceptAsync != null
+      tcpAsync?.acceptAsync != null ||
+      kvAsync?.getAsync != null ||
+      kvAsync?.putAsync != null ||
+      kvAsync?.deleteAsync != null ||
+      kvAsync?.listAsync != null
     );
     if (wantsAsync && hostState.fetch != null) {
       const fetchImpl = hostState.fetch;
@@ -1291,6 +1308,114 @@ export class Microkernel {
       khImports.kh_socket_accept_blocking = new W.Suspending(
         async (handle: number, flags: number): Promise<number> => {
           return await acceptAsync(handle, flags);
+        },
+      );
+    }
+    if (wantsAsync && kvAsync?.getAsync != null) {
+      const getAsync = kvAsync.getAsync.bind(kvAsync);
+      khImports.kh_idb_get = new W.Suspending(
+        async (
+          storePtr: number,
+          storeLen: number,
+          keyPtr: number,
+          keyLen: number,
+          outPtr: number,
+          outCap: number,
+        ): Promise<bigint> => {
+          const memBuf = () => memoryRef.memory!.buffer;
+          const store = new Uint8Array(memBuf(), storePtr, storeLen).slice();
+          const key = new Uint8Array(memBuf(), keyPtr, keyLen).slice();
+          if (
+            hostBox.state.policy.mayIdb?.(store, false) === "deny"
+          ) return BigInt(-EACCES);
+          const value = await getAsync(store, key);
+          if (typeof value === "number") return BigInt(value);
+          if (value.byteLength > outCap) return BigInt(-E2BIG);
+          new Uint8Array(memBuf(), outPtr, value.byteLength).set(value);
+          return BigInt(value.byteLength);
+        },
+      );
+    }
+    if (wantsAsync && kvAsync?.putAsync != null) {
+      const putAsync = kvAsync.putAsync.bind(kvAsync);
+      khImports.kh_idb_put = new W.Suspending(
+        async (
+          storePtr: number,
+          storeLen: number,
+          keyPtr: number,
+          keyLen: number,
+          valuePtr: number,
+          valueLen: number,
+        ): Promise<number> => {
+          const memBuf = () => memoryRef.memory!.buffer;
+          const store = new Uint8Array(memBuf(), storePtr, storeLen).slice();
+          const key = new Uint8Array(memBuf(), keyPtr, keyLen).slice();
+          const value = new Uint8Array(memBuf(), valuePtr, valueLen).slice();
+          if (
+            hostBox.state.policy.mayIdb?.(store, true) === "deny"
+          ) return -EACCES;
+          return await putAsync(store, key, value);
+        },
+      );
+    }
+    if (wantsAsync && kvAsync?.deleteAsync != null) {
+      const deleteAsync = kvAsync.deleteAsync.bind(kvAsync);
+      khImports.kh_idb_delete = new W.Suspending(
+        async (
+          storePtr: number,
+          storeLen: number,
+          keyPtr: number,
+          keyLen: number,
+        ): Promise<number> => {
+          const memBuf = () => memoryRef.memory!.buffer;
+          const store = new Uint8Array(memBuf(), storePtr, storeLen).slice();
+          const key = new Uint8Array(memBuf(), keyPtr, keyLen).slice();
+          if (
+            hostBox.state.policy.mayIdb?.(store, true) === "deny"
+          ) return -EACCES;
+          return await deleteAsync(store, key);
+        },
+      );
+    }
+    if (wantsAsync && kvAsync?.listAsync != null) {
+      const listAsync = kvAsync.listAsync.bind(kvAsync);
+      khImports.kh_idb_list = new W.Suspending(
+        async (
+          storePtr: number,
+          storeLen: number,
+          prefixPtr: number,
+          prefixLen: number,
+          outPtr: number,
+          outCap: number,
+        ): Promise<bigint> => {
+          const memBuf = () => memoryRef.memory!.buffer;
+          const store = new Uint8Array(memBuf(), storePtr, storeLen).slice();
+          const prefix = new Uint8Array(memBuf(), prefixPtr, prefixLen).slice();
+          if (
+            hostBox.state.policy.mayIdb?.(store, false) === "deny"
+          ) return BigInt(-EACCES);
+          const keys = await listAsync(store, prefix);
+          let total = 4;
+          let count = 0;
+          for (const k of keys) {
+            const need = 4 + k.byteLength;
+            if (total + need > outCap) break;
+            total += need;
+            count++;
+          }
+          const buf = new Uint8Array(total);
+          const view = new DataView(buf.buffer);
+          view.setUint32(0, count >>> 0, true);
+          let cur = 4;
+          for (let i = 0; i < count; i++) {
+            const k = keys[i];
+            view.setUint32(cur, k.byteLength >>> 0, true);
+            cur += 4;
+            buf.set(k, cur);
+            cur += k.byteLength;
+          }
+          new Uint8Array(memBuf(), outPtr, total).set(buf);
+          return BigInt(total);
         },
       );
     }
