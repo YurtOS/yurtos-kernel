@@ -175,6 +175,24 @@ export interface HostFsImpl {
   mkdir(path: Uint8Array, mode: number): number;
   symlink(target: Uint8Array, linkPath: Uint8Array): number;
   rename(oldPath: Uint8Array, newPath: Uint8Array): number;
+  /**
+   * Optional async variants for hosts where the underlying FS
+   * primitive is Promise-shaped (OPFS, S3, Cloudflare R2, etc.).
+   * When present AND JSPI is available, the matching kh_real_*
+   * import is wrapped with `WebAssembly.Suspending` so userland's
+   * sys_open / sys_read / etc. actually suspend until the I/O
+   * completes. Without JSPI these are ignored and the sync
+   * variants run.
+   */
+  openAsync?(path: Uint8Array, flags: number): Promise<number>;
+  readAsync?(fd: number, buf: Uint8Array): Promise<number>;
+  writeAsync?(fd: number, data: Uint8Array): Promise<number>;
+  closeAsync?(fd: number): Promise<number>;
+  statAsync?(path: Uint8Array): Promise<HostFsStat | number>;
+  unlinkAsync?(path: Uint8Array): Promise<number>;
+  mkdirAsync?(path: Uint8Array, mode: number): Promise<number>;
+  symlinkAsync?(target: Uint8Array, linkPath: Uint8Array): Promise<number>;
+  renameAsync?(oldPath: Uint8Array, newPath: Uint8Array): Promise<number>;
 }
 
 export interface HostFsStat {
@@ -1219,6 +1237,7 @@ export class Microkernel {
       typeof W?.promising === "function";
     const tcpAsync = hostState.tcp;
     const kvAsync = hostState.kv;
+    const fsAsync = hostState.hostFs;
     const wantsAsync = hasJspi && (
       hostState.fetch != null ||
       tcpAsync?.connectAsync != null ||
@@ -1227,7 +1246,15 @@ export class Microkernel {
       kvAsync?.getAsync != null ||
       kvAsync?.putAsync != null ||
       kvAsync?.deleteAsync != null ||
-      kvAsync?.listAsync != null
+      kvAsync?.listAsync != null ||
+      fsAsync?.openAsync != null ||
+      fsAsync?.readAsync != null ||
+      fsAsync?.writeAsync != null ||
+      fsAsync?.statAsync != null ||
+      fsAsync?.unlinkAsync != null ||
+      fsAsync?.mkdirAsync != null ||
+      fsAsync?.symlinkAsync != null ||
+      fsAsync?.renameAsync != null
     );
     if (wantsAsync && hostState.fetch != null) {
       const fetchImpl = hostState.fetch;
@@ -1308,6 +1335,127 @@ export class Microkernel {
       khImports.kh_socket_accept_blocking = new W.Suspending(
         async (handle: number, flags: number): Promise<number> => {
           return await acceptAsync(handle, flags);
+        },
+      );
+    }
+    // Async kh_real_* — same Suspending pattern as kh_socket_* /
+    // kh_idb_*. OPFS, S3, R2, async-fs embedders plug their
+    // *Async impls in here.
+    if (wantsAsync && fsAsync?.openAsync != null) {
+      const openAsync = fsAsync.openAsync.bind(fsAsync);
+      khImports.kh_real_open = new W.Suspending(
+        async (
+          pathPtr: number,
+          pathLen: number,
+          flags: number,
+          _mode: number,
+        ): Promise<number> => {
+          const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+          return await openAsync(path, flags);
+        },
+      );
+    }
+    if (wantsAsync && fsAsync?.readAsync != null) {
+      const readAsync = fsAsync.readAsync.bind(fsAsync);
+      khImports.kh_real_read = new W.Suspending(
+        async (fd: number, outPtr: number, len: number): Promise<bigint> => {
+          const buf = new Uint8Array(len);
+          const n = await readAsync(fd, buf);
+          if (n > 0) {
+            new Uint8Array(memoryRef.memory!.buffer, outPtr, n).set(
+              buf.subarray(0, n),
+            );
+          }
+          return BigInt(n);
+        },
+      );
+    }
+    if (wantsAsync && fsAsync?.writeAsync != null) {
+      const writeAsync = fsAsync.writeAsync.bind(fsAsync);
+      khImports.kh_real_write = new W.Suspending(
+        async (fd: number, dataPtr: number, dataLen: number): Promise<bigint> => {
+          const data = new Uint8Array(memoryRef.memory!.buffer, dataPtr, dataLen).slice();
+          return BigInt(await writeAsync(fd, data));
+        },
+      );
+    }
+    if (wantsAsync && fsAsync?.closeAsync != null) {
+      const closeAsync = fsAsync.closeAsync.bind(fsAsync);
+      khImports.kh_real_close = new W.Suspending(
+        async (fd: number): Promise<number> => await closeAsync(fd),
+      );
+    }
+    if (wantsAsync && fsAsync?.statAsync != null) {
+      const statAsync = fsAsync.statAsync.bind(fsAsync);
+      khImports.kh_real_stat = new W.Suspending(
+        async (
+          pathPtr: number,
+          pathLen: number,
+          outPtr: number,
+          outCap: number,
+        ): Promise<bigint> => {
+          if (outCap < 32) return BigInt(-22);
+          const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+          const stat = await statAsync(path);
+          if (typeof stat === "number") return BigInt(stat);
+          const buf = new Uint8Array(32);
+          const view = new DataView(buf.buffer);
+          view.setUint16(0, 1, true);
+          view.setUint32(4, stat.mode >>> 0, true);
+          view.setBigUint64(8, stat.size, true);
+          view.setBigUint64(16, stat.mtimeNs, true);
+          buf[24] = stat.isDir ? 1 : 0;
+          buf[25] = stat.isSymlink ? 1 : 0;
+          new Uint8Array(memoryRef.memory!.buffer, outPtr, 32).set(buf);
+          return BigInt(32);
+        },
+      );
+    }
+    if (wantsAsync && fsAsync?.unlinkAsync != null) {
+      const unlinkAsync = fsAsync.unlinkAsync.bind(fsAsync);
+      khImports.kh_real_unlink = new W.Suspending(
+        async (pathPtr: number, pathLen: number): Promise<number> => {
+          const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+          return await unlinkAsync(path);
+        },
+      );
+    }
+    if (wantsAsync && fsAsync?.mkdirAsync != null) {
+      const mkdirAsync = fsAsync.mkdirAsync.bind(fsAsync);
+      khImports.kh_real_mkdir = new W.Suspending(
+        async (pathPtr: number, pathLen: number, mode: number): Promise<number> => {
+          const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+          return await mkdirAsync(path, mode);
+        },
+      );
+    }
+    if (wantsAsync && fsAsync?.symlinkAsync != null) {
+      const symlinkAsync = fsAsync.symlinkAsync.bind(fsAsync);
+      khImports.kh_real_symlink = new W.Suspending(
+        async (
+          targetPtr: number,
+          targetLen: number,
+          linkPtr: number,
+          linkLen: number,
+        ): Promise<number> => {
+          const target = new Uint8Array(memoryRef.memory!.buffer, targetPtr, targetLen).slice();
+          const link = new Uint8Array(memoryRef.memory!.buffer, linkPtr, linkLen).slice();
+          return await symlinkAsync(target, link);
+        },
+      );
+    }
+    if (wantsAsync && fsAsync?.renameAsync != null) {
+      const renameAsync = fsAsync.renameAsync.bind(fsAsync);
+      khImports.kh_real_rename = new W.Suspending(
+        async (
+          oldPtr: number,
+          oldLen: number,
+          newPtr: number,
+          newLen: number,
+        ): Promise<number> => {
+          const oldP = new Uint8Array(memoryRef.memory!.buffer, oldPtr, oldLen).slice();
+          const newP = new Uint8Array(memoryRef.memory!.buffer, newPtr, newLen).slice();
+          return await renameAsync(oldP, newP);
         },
       );
     }
