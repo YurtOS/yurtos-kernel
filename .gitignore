@@ -11,3 +11,8 @@ packages/kernel/src/platform/__tests__/fixtures/busybox.manifest.json
 packages/kernel/src/platform/__tests__/fixtures/busybox.wasm
 packages/kernel/src/platform/__tests__/fixtures/terminfo-canary.wasm
 packages/kernel/src/platform/__tests__/fixtures/zsh.wasm
+# cpython3 + pyzmq runtime smoke fixtures — large, populated by
+# scripts/stage-cpython-fixtures.sh from the yurt-ports build outputs.
+packages/kernel/src/platform/__tests__/fixtures/cpython3.wasm
+packages/kernel/src/platform/__tests__/fixtures/cpython3-lib/
+packages/kernel/src/platform/__tests__/fixtures/cpython3-lib-manifest.json
