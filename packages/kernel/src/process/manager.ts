@@ -6,20 +6,24 @@
  * with its own file descriptor table, args, and environment.
  */
 
-import type { PlatformAdapter } from '../platform/adapter.js';
-import type { VfsLike } from '../vfs/vfs-like.js';
-import { WasiHost } from '../wasi/wasi-host.js';
-import type { NetworkBridgeLike } from '../network/bridge.js';
-import { createKernelImports } from '../host-imports/kernel-imports.js';
-import { AsyncifyAsyncBridge } from '../async-bridge.js';
+import type { PlatformAdapter } from "../platform/adapter.js";
+import type { VfsLike } from "../vfs/vfs-like.js";
+import { WasiHost } from "../wasi/wasi-host.js";
+import type { NetworkBridgeLike } from "../network/bridge.js";
+import { createKernelImports } from "../host-imports/kernel-imports.js";
+import { AsyncifyAsyncBridge } from "../async-bridge.js";
 
-import type { SpawnOptions, SpawnResult } from './process.js';
-import { NativeModuleRegistry } from './native-modules.js';
-import { defaultWasmModuleCache, sha256Hex, type WasmModuleCache } from './module-cache.js';
+import type { SpawnOptions, SpawnResult } from "./process.js";
+import { NativeModuleRegistry } from "./native-modules.js";
+import {
+  defaultWasmModuleCache,
+  sha256Hex,
+  type WasmModuleCache,
+} from "./module-cache.js";
 
 export type ToolSource =
-  | { kind: 'host'; path: string }
-  | { kind: 'vfs'; path: string };
+  | { kind: "host"; path: string }
+  | { kind: "vfs"; path: string };
 
 export class ProcessManager {
   private vfs: VfsLike;
@@ -30,7 +34,9 @@ export class ProcessManager {
   private networkBridge: NetworkBridgeLike | null;
   private currentHost: WasiHost | null = null;
   private toolAllowlist: Set<string> | null = null;
-  private extensionHandler: ((cmd: Record<string, unknown>) => Record<string, unknown>) | null = null;
+  private extensionHandler:
+    | ((cmd: Record<string, unknown>) => Record<string, unknown>)
+    | null = null;
 
   /** Registry for dynamically loaded native Python module WASMs. */
   readonly nativeModules: NativeModuleRegistry;
@@ -52,12 +58,18 @@ export class ProcessManager {
 
   /** Register a tool name to a .wasm file path. */
   /** Register a native Python module WASM (loaded for _yurt.native_call bridge). */
-  async registerNativeModule(name: string, wasmBytes: Uint8Array): Promise<void> {
+  async registerNativeModule(
+    name: string,
+    wasmBytes: Uint8Array,
+  ): Promise<void> {
     await this.nativeModules.loadModule(name, wasmBytes);
   }
 
   registerTool(name: string, source: string | ToolSource): void {
-    this.registry.set(name, typeof source === 'string' ? { kind: 'host', path: source } : source);
+    this.registry.set(
+      name,
+      typeof source === "string" ? { kind: "host", path: source } : source,
+    );
   }
 
   /**
@@ -67,9 +79,13 @@ export class ProcessManager {
    * `/usr/bin/<name>`, while the registry override keeps bare command dispatch
    * on the multicall wasm even if a standalone applet wasm was scanned earlier.
    */
-  registerMulticallTool(name: string, wasmPath: string, applets: string[]): void {
+  registerMulticallTool(
+    name: string,
+    wasmPath: string,
+    applets: string[],
+  ): void {
     this.registerTool(name, wasmPath);
-    const source: ToolSource = { kind: 'host', path: wasmPath };
+    const source: ToolSource = { kind: "host", path: wasmPath };
 
     this.vfs.withWriteAccess(() => {
       for (const applet of applets) {
@@ -94,7 +110,7 @@ export class ProcessManager {
 
   /** Register and preload a tool from VFS. */
   async registerAndLoadTool(name: string, wasmPath: string): Promise<void> {
-    const source: ToolSource = { kind: 'vfs', path: wasmPath };
+    const source: ToolSource = { kind: "vfs", path: wasmPath };
     this.registerTool(name, source);
     // Load WASM bytes from VFS and compile directly (not from host filesystem)
     const wasmBytes = this.vfs.readFile(wasmPath);
@@ -113,7 +129,9 @@ export class ProcessManager {
   }
 
   /** Set the extension handler for Python package → host extension bridge. */
-  setExtensionHandler(handler: (cmd: Record<string, unknown>) => Record<string, unknown>): void {
+  setExtensionHandler(
+    handler: (cmd: Record<string, unknown>) => Record<string, unknown>,
+  ): void {
     this.extensionHandler = handler;
   }
 
@@ -137,15 +155,15 @@ export class ProcessManager {
     const direct = this.registry.get(name);
     if (direct !== undefined) return direct;
 
-    const candidatePaths = name.includes('/')
+    const candidatePaths = name.includes("/")
       ? [name]
-      : ['/usr/extensions', '/usr/bin', '/bin'].map(dir => `${dir}/${name}`);
+      : ["/usr/extensions", "/usr/bin", "/bin"].map((dir) => `${dir}/${name}`);
 
     for (const filePath of candidatePaths) {
       try {
         const st = this.vfs.stat(filePath);
-        if (st.type === 'file' && (st.permissions & 0o111)) {
-          return { kind: 'vfs', path: filePath };
+        if (st.type === "file" && (st.permissions & 0o111)) {
+          return { kind: "vfs", path: filePath };
         }
       } catch {
         // Try the next PATH entry.
@@ -188,7 +206,7 @@ export class ProcessManager {
     if (this.toolAllowlist && !this.toolAllowlist.has(command)) {
       return {
         exitCode: 126,
-        stdout: '',
+        stdout: "",
         stderr: `${command}: tool not allowed by security policy\n`,
         executionTimeMs: 0,
       };
@@ -202,12 +220,12 @@ export class ProcessManager {
       stdinData = drainReadEnd(opts.stdin);
     }
 
-    const cwd = opts.cwd ?? '/';
+    const cwd = opts.cwd ?? "/";
     const host = new WasiHost({
       vfs: this.vfs,
       args: [command, ...opts.args],
       env: { ...opts.env, PWD: cwd },
-      preopens: { '/': '/' },
+      preopens: { "/": "/" },
       cwd,
       stdin: stdinData,
       stdoutLimit: opts.stdoutLimit,
@@ -216,12 +234,14 @@ export class ProcessManager {
     });
 
     // If memoryBytes is set, inject a bounded memory into the import object
-    const imports = host.getImports() as WebAssembly.Imports & Record<string, WebAssembly.ModuleImports>;
+    const imports = host.getImports() as
+      & WebAssembly.Imports
+      & Record<string, WebAssembly.ModuleImports>;
     if (opts.memoryBytes !== undefined) {
       const maxPages = Math.ceil(opts.memoryBytes / 65536);
       const moduleImports = WebAssembly.Module.imports(module);
       for (const imp of moduleImports) {
-        if (imp.kind === 'memory') {
+        if (imp.kind === "memory") {
           const mem = new WebAssembly.Memory({ initial: 1, maximum: maxPages });
           if (!imports[imp.module]) imports[imp.module] = {};
           imports[imp.module][imp.name] = mem;
@@ -233,20 +253,34 @@ export class ProcessManager {
     // imports using a memory proxy (memory comes from instance exports, which
     // aren't available until after instantiation).
     const moduleImportDescs = WebAssembly.Module.imports(module);
-    const needsYurt = moduleImportDescs.some(imp => imp.module === 'yurt');
+    const needsYurt = moduleImportDescs.some((imp) => imp.module === "yurt");
 
     let setMemoryRef: ((mem: WebAssembly.Memory) => void) | null = null;
-    const setjmpBridge = needsSetjmpBridge(module) ? new AsyncifyAsyncBridge() : null;
+    const setjmpBridge = needsSetjmpBridge(module)
+      ? new AsyncifyAsyncBridge()
+      : null;
+
+    let setMainInstanceRef: ((inst: WebAssembly.Instance) => void) | null =
+      null;
+    let mainInstanceRef: WebAssembly.Instance | null = null;
 
     if (needsYurt) {
       let memRef: WebAssembly.Memory | null = null;
-      setMemoryRef = (mem: WebAssembly.Memory) => { memRef = mem; };
+      setMemoryRef = (mem: WebAssembly.Memory) => {
+        memRef = mem;
+      };
+      setMainInstanceRef = (inst: WebAssembly.Instance) => {
+        mainInstanceRef = inst;
+      };
 
       const memoryProxy = new Proxy({} as WebAssembly.Memory, {
         get(_target, prop) {
-          if (!memRef) throw new Error('memory not initialized');
-          const val = (memRef as unknown as Record<string | symbol, unknown>)[prop];
-          return typeof val === 'function' ? (val as Function).bind(memRef) : val;
+          if (!memRef) throw new Error("memory not initialized");
+          const val =
+            (memRef as unknown as Record<string | symbol, unknown>)[prop];
+          return typeof val === "function"
+            ? (val as Function).bind(memRef)
+            : val;
         },
       });
 
@@ -257,10 +291,13 @@ export class ProcessManager {
         networkBridge: this.networkBridge ?? undefined,
         extensionHandler: this.extensionHandler ?? undefined,
         nativeModules: this.nativeModules,
+        mainInstance: () => mainInstanceRef,
       });
       if (setjmpBridge) {
-        imports.yurt.host_setjmp = setjmpBridge.hostSetjmp as unknown as WebAssembly.ImportValue;
-        imports.yurt.host_longjmp = setjmpBridge.hostLongjmp as unknown as WebAssembly.ImportValue;
+        imports.yurt.host_setjmp = setjmpBridge
+          .hostSetjmp as unknown as WebAssembly.ImportValue;
+        imports.yurt.host_longjmp = setjmpBridge
+          .hostLongjmp as unknown as WebAssembly.ImportValue;
       }
     }
 
@@ -269,6 +306,10 @@ export class ProcessManager {
     // Wire up the real memory reference for the yurt import proxy
     if (setMemoryRef) {
       setMemoryRef(instance.exports.memory as WebAssembly.Memory);
+    }
+    // Wire the main-instance ref for the Phase 1 dlopen loader.
+    if (setMainInstanceRef) {
+      setMainInstanceRef(instance);
     }
     const startFn = setjmpBridge && initAsyncifyBridge(setjmpBridge, instance)
       ? setjmpBridge.wrapExportSync(instance.exports._start as () => number)
@@ -282,23 +323,27 @@ export class ProcessManager {
         // If we injected a bounded memory via imports, that's fine. But if
         // the module defines memory internally, it bypasses our limit.
         const moduleImports = WebAssembly.Module.imports(module);
-        const hasMemoryImport = moduleImports.some(imp => imp.kind === 'memory');
+        const hasMemoryImport = moduleImports.some((imp) =>
+          imp.kind === "memory"
+        );
         if (!hasMemoryImport) {
           // Module defined its own memory — check if it has a maximum.
           // We can't inspect the max directly, but we can reject if the
           // module exported memory without importing our bounded one.
           return {
             exitCode: 1,
-            stdout: '',
-            stderr: `module defines its own memory, bypassing sandbox memory limit\n`,
+            stdout: "",
+            stderr:
+              `module defines its own memory, bypassing sandbox memory limit\n`,
             executionTimeMs: 0,
           };
         }
         if (mem.buffer.byteLength > opts.memoryBytes) {
           return {
             exitCode: 1,
-            stdout: '',
-            stderr: `memory limit exceeded: ${mem.buffer.byteLength} > ${opts.memoryBytes}\n`,
+            stdout: "",
+            stderr:
+              `memory limit exceeded: ${mem.buffer.byteLength} > ${opts.memoryBytes}\n`,
             executionTimeMs: 0,
           };
         }
@@ -319,7 +364,9 @@ export class ProcessManager {
       stdout: host.getStdout(),
       stderr: host.getStderr(),
       executionTimeMs,
-      truncated: (stdoutTruncated || stderrTruncated) ? { stdout: stdoutTruncated, stderr: stderrTruncated } : undefined,
+      truncated: (stdoutTruncated || stderrTruncated)
+        ? { stdout: stdoutTruncated, stderr: stderrTruncated }
+        : undefined,
     };
   }
 
@@ -335,7 +382,7 @@ export class ProcessManager {
       return cached;
     }
 
-    const bytes = source.kind === 'vfs'
+    const bytes = source.kind === "vfs"
       ? this.vfs.readFile(source.path)
       : await this.adapter.readBytes(source.path);
     const module = await this.compileBytes(bytes);
@@ -344,7 +391,7 @@ export class ProcessManager {
   }
 
   private cacheKey(source: ToolSource): string {
-    return source.kind === 'host' ? source.path : `vfs:${source.path}`;
+    return source.kind === "host" ? source.path : `vfs:${source.path}`;
   }
 
   private async compileBytes(bytes: Uint8Array): Promise<WebAssembly.Module> {
@@ -361,7 +408,9 @@ export class ProcessManager {
     for (const source of this.registry.values()) {
       sources.set(this.cacheKey(source), source);
     }
-    await Promise.all(Array.from(sources.values()).map(source => this.loadModule(source)));
+    await Promise.all(
+      Array.from(sources.values()).map((source) => this.loadModule(source)),
+    );
   }
 
   /**
@@ -375,12 +424,17 @@ export class ProcessManager {
     env: Record<string, string>,
     stdin: Uint8Array,
     cwd: string,
-    opts?: { deadlineMs?: number; stdoutLimit?: number; stderrLimit?: number; memoryBytes?: number },
+    opts?: {
+      deadlineMs?: number;
+      stdoutLimit?: number;
+      stderrLimit?: number;
+      memoryBytes?: number;
+    },
   ): { exit_code: number; stdout: string; stderr: string } {
     if (this.toolAllowlist && !this.toolAllowlist.has(command)) {
       return {
         exit_code: 126,
-        stdout: '',
+        stdout: "",
         stderr: `${command}: tool not allowed by security policy\n`,
       };
     }
@@ -389,19 +443,23 @@ export class ProcessManager {
     try {
       source = this.resolveToolSource(command);
     } catch {
-      return { exit_code: 127, stdout: '', stderr: `${command}: not found\n` };
+      return { exit_code: 127, stdout: "", stderr: `${command}: not found\n` };
     }
 
     const module = this.moduleCache.get(this.cacheKey(source));
     if (!module) {
-      return { exit_code: 127, stdout: '', stderr: `${command}: module not loaded\n` };
+      return {
+        exit_code: 127,
+        stdout: "",
+        stderr: `${command}: module not loaded\n`,
+      };
     }
 
     const host = new WasiHost({
       vfs: this.vfs,
       args: [command, ...args],
       env,
-      preopens: { '/': '/' },
+      preopens: { "/": "/" },
       cwd,
       stdin,
       stdoutLimit: opts?.stdoutLimit,
@@ -409,14 +467,16 @@ export class ProcessManager {
       deadlineMs: opts?.deadlineMs,
     });
 
-    const imports = host.getImports() as WebAssembly.Imports & Record<string, WebAssembly.ModuleImports>;
+    const imports = host.getImports() as
+      & WebAssembly.Imports
+      & Record<string, WebAssembly.ModuleImports>;
 
     // If memoryBytes is set, inject a bounded memory into the import object
     if (opts?.memoryBytes !== undefined) {
       const maxPages = Math.ceil(opts.memoryBytes / 65536);
       const moduleImportDescs2 = WebAssembly.Module.imports(module);
       for (const imp of moduleImportDescs2) {
-        if (imp.kind === 'memory') {
+        if (imp.kind === "memory") {
           const mem = new WebAssembly.Memory({ initial: 1, maximum: maxPages });
           if (!imports[imp.module]) imports[imp.module] = {};
           imports[imp.module][imp.name] = mem;
@@ -427,20 +487,33 @@ export class ProcessManager {
     // If the module imports from the `yurt` namespace, inject Python host
     // imports using a memory proxy.
     const moduleImportDescs = WebAssembly.Module.imports(module);
-    const needsYurt = moduleImportDescs.some(imp => imp.module === 'yurt');
+    const needsYurt = moduleImportDescs.some((imp) => imp.module === "yurt");
 
     let setMemoryRef: ((mem: WebAssembly.Memory) => void) | null = null;
-    const setjmpBridge = needsSetjmpBridge(module) ? new AsyncifyAsyncBridge() : null;
+    let setMainInstanceRef: ((inst: WebAssembly.Instance) => void) | null =
+      null;
+    let mainInstanceRef: WebAssembly.Instance | null = null;
+    const setjmpBridge = needsSetjmpBridge(module)
+      ? new AsyncifyAsyncBridge()
+      : null;
 
     if (needsYurt) {
       let memRef: WebAssembly.Memory | null = null;
-      setMemoryRef = (mem: WebAssembly.Memory) => { memRef = mem; };
+      setMemoryRef = (mem: WebAssembly.Memory) => {
+        memRef = mem;
+      };
+      setMainInstanceRef = (inst: WebAssembly.Instance) => {
+        mainInstanceRef = inst;
+      };
 
       const memoryProxy = new Proxy({} as WebAssembly.Memory, {
         get(_target, prop) {
-          if (!memRef) throw new Error('memory not initialized');
-          const val = (memRef as unknown as Record<string | symbol, unknown>)[prop];
-          return typeof val === 'function' ? (val as Function).bind(memRef) : val;
+          if (!memRef) throw new Error("memory not initialized");
+          const val =
+            (memRef as unknown as Record<string | symbol, unknown>)[prop];
+          return typeof val === "function"
+            ? (val as Function).bind(memRef)
+            : val;
         },
       });
 
@@ -449,10 +522,13 @@ export class ProcessManager {
         networkBridge: this.networkBridge ?? undefined,
         extensionHandler: this.extensionHandler ?? undefined,
         nativeModules: this.nativeModules,
+        mainInstance: () => mainInstanceRef,
       });
       if (setjmpBridge) {
-        imports.yurt.host_setjmp = setjmpBridge.hostSetjmp as unknown as WebAssembly.ImportValue;
-        imports.yurt.host_longjmp = setjmpBridge.hostLongjmp as unknown as WebAssembly.ImportValue;
+        imports.yurt.host_setjmp = setjmpBridge
+          .hostSetjmp as unknown as WebAssembly.ImportValue;
+        imports.yurt.host_longjmp = setjmpBridge
+          .hostLongjmp as unknown as WebAssembly.ImportValue;
       }
     }
 
@@ -461,13 +537,20 @@ export class ProcessManager {
     try {
       instance = new WebAssembly.Instance(module, imports);
     } catch (e: unknown) {
-      if (opts?.memoryBytes !== undefined && e instanceof Error && /memory/i.test(e.message)) {
-        return { exit_code: 1, stdout: '', stderr: `memory limit exceeded\n` };
+      if (
+        opts?.memoryBytes !== undefined && e instanceof Error &&
+        /memory/i.test(e.message)
+      ) {
+        return { exit_code: 1, stdout: "", stderr: `memory limit exceeded\n` };
       }
       // Catch >8MB sync instantiation errors (V8 main-thread limitation) and
       // other instantiation failures — return an error result instead of crashing.
       if (e instanceof Error) {
-        return { exit_code: 1, stdout: '', stderr: `${command}: ${e.message}\n` };
+        return {
+          exit_code: 1,
+          stdout: "",
+          stderr: `${command}: ${e.message}\n`,
+        };
       }
       throw e;
     }
@@ -477,18 +560,31 @@ export class ProcessManager {
       const mem = instance.exports.memory as WebAssembly.Memory | undefined;
       if (mem) {
         const moduleImports3 = WebAssembly.Module.imports(module);
-        const hasMemoryImport = moduleImports3.some(imp => imp.kind === 'memory');
+        const hasMemoryImport = moduleImports3.some((imp) =>
+          imp.kind === "memory"
+        );
         if (!hasMemoryImport) {
-          return { exit_code: 1, stdout: '', stderr: `memory limit exceeded\n` };
+          return {
+            exit_code: 1,
+            stdout: "",
+            stderr: `memory limit exceeded\n`,
+          };
         }
         if (mem.buffer.byteLength > opts.memoryBytes) {
-          return { exit_code: 1, stdout: '', stderr: `memory limit exceeded\n` };
+          return {
+            exit_code: 1,
+            stdout: "",
+            stderr: `memory limit exceeded\n`,
+          };
         }
       }
     }
 
     if (setMemoryRef) {
       setMemoryRef(instance.exports.memory as WebAssembly.Memory);
+    }
+    if (setMainInstanceRef) {
+      setMainInstanceRef(instance);
     }
     const startFn = setjmpBridge && initAsyncifyBridge(setjmpBridge, instance)
       ? setjmpBridge.wrapExportSync(instance.exports._start as () => number)
@@ -505,9 +601,11 @@ export class ProcessManager {
       exit_code: exitCode,
       stdout: host.getStdout(),
       stderr: host.getStderr(),
-      ...(stdoutTruncated || stderrTruncated ? {
-        truncated: { stdout: stdoutTruncated, stderr: stderrTruncated },
-      } : {}),
+      ...(stdoutTruncated || stderrTruncated
+        ? {
+          truncated: { stdout: stdoutTruncated, stderr: stderrTruncated },
+        }
+        : {}),
     };
   }
 }
@@ -516,17 +614,19 @@ function needsSetjmpBridge(module: WebAssembly.Module): boolean {
   const imports = WebAssembly.Module.imports(module);
   const exports = WebAssembly.Module.exports(module);
   const importsSetjmp = imports.some((imp) =>
-    imp.module === 'yurt' &&
-    (imp.name === 'host_setjmp' || imp.name === 'host_longjmp')
+    imp.module === "yurt" &&
+    (imp.name === "host_setjmp" || imp.name === "host_longjmp")
   );
   if (!importsSetjmp) return false;
   return [
-    'asyncify_start_unwind',
-    'asyncify_stop_unwind',
-    'asyncify_start_rewind',
-    'asyncify_stop_rewind',
-    'asyncify_get_state',
-  ].every((name) => exports.some((exp) => exp.kind === 'function' && exp.name === name));
+    "asyncify_start_unwind",
+    "asyncify_stop_unwind",
+    "asyncify_start_rewind",
+    "asyncify_stop_rewind",
+    "asyncify_get_state",
+  ].every((name) =>
+    exports.some((exp) => exp.kind === "function" && exp.name === name)
+  );
 }
 
 function initAsyncifyBridge(
@@ -535,28 +635,34 @@ function initAsyncifyBridge(
 ): boolean {
   const exports = instance.exports;
   const hasAsyncifyState =
-    typeof exports.asyncify_start_unwind === 'function' &&
-    typeof exports.asyncify_stop_unwind === 'function' &&
-    typeof exports.asyncify_start_rewind === 'function' &&
-    typeof exports.asyncify_stop_rewind === 'function' &&
-    typeof exports.asyncify_get_state === 'function';
+    typeof exports.asyncify_start_unwind === "function" &&
+    typeof exports.asyncify_stop_unwind === "function" &&
+    typeof exports.asyncify_start_rewind === "function" &&
+    typeof exports.asyncify_stop_rewind === "function" &&
+    typeof exports.asyncify_get_state === "function";
   if (!hasAsyncifyState) return false;
 
   const memory = exports.memory as WebAssembly.Memory;
-  const addrExport = exports.yurt_asyncify_buf_addr as (() => number) | undefined;
-  const sizeExport = exports.yurt_asyncify_buf_size as (() => number) | undefined;
+  const addrExport = exports.yurt_asyncify_buf_addr as
+    | (() => number)
+    | undefined;
+  const sizeExport = exports.yurt_asyncify_buf_size as
+    | (() => number)
+    | undefined;
   const alloc = exports.__alloc as ((size: number) => number) | undefined;
 
   let dataAddr: number;
   let dataSize: number;
-  if (typeof addrExport === 'function' && typeof sizeExport === 'function') {
+  if (typeof addrExport === "function" && typeof sizeExport === "function") {
     dataAddr = addrExport();
     dataSize = sizeExport();
-  } else if (typeof alloc === 'function') {
+  } else if (typeof alloc === "function") {
     dataSize = 65536;
     dataAddr = alloc(dataSize);
   } else {
-    throw new Error('asyncify requires yurt_asyncify_buf_addr/size or __alloc exports');
+    throw new Error(
+      "asyncify requires yurt_asyncify_buf_addr/size or __alloc exports",
+    );
   }
 
   if (dataSize < 16) {
