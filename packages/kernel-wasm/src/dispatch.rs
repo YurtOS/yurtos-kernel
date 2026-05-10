@@ -702,10 +702,14 @@ fn register_file(request: &[u8]) -> i64 {
     let content = request[4 + path_len..].to_vec();
     with_kernel(|k| {
         // Microkernel-only: install or replace the file at `path`.
-        // create() returns Some((mount_id, inode)) on the root mount;
-        // ramfs's create overwrites existing entries with empty
-        // content, so a subsequent write puts the staged bytes in.
-        if let Some((mount_id, inode)) = k.vfs.create(&path) {
+        // open() with the create+write bits returns the inode on
+        // the root mount; ramfs's open creates a fresh empty file
+        // when the path is missing, then a subsequent write puts
+        // the staged bytes in.
+        if let Some((mount_id, inode)) = k.vfs.open(&path, 0b011) {
+            // Truncate any pre-existing content first so the
+            // resulting file matches the staged content exactly.
+            k.vfs.truncate(mount_id, inode);
             let _ = k.vfs.write(mount_id, inode, 0, &content);
         }
     });
@@ -797,14 +801,20 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
         // Refresh procfs snapshots so /proc/<N>/status reflects the
         // current process table at open time.
         k.publish_proc_snapshots();
-        let (mount_id, inode) = match k.vfs.lookup(path) {
+        // open() handles both lookup and create-if-missing in one
+        // call. The flags bits propagate to the backend so it knows
+        // the caller's intent (writable opens vs read-only).
+        let (mount_id, inode) = match k.vfs.open(path, flags) {
             Some(pair) => pair,
             None => {
+                // Distinguish "create wasn't allowed" from "no such
+                // file": read-only backends (Tar, Proc, Dev) refuse
+                // the create bit and return None regardless. Phase 5
+                // surfaces both as ENOENT (no create) / EPERM (with
+                // create) — embedders that want richer signals plumb
+                // them later.
                 if create {
-                    match k.vfs.create(path) {
-                        Some(pair) => pair,
-                        None => return -(abi::EPERM as i64),
-                    }
+                    return -(abi::EPERM as i64);
                 } else {
                     return -(abi::ENOENT as i64);
                 }

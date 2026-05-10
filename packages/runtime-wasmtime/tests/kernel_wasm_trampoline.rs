@@ -144,6 +144,7 @@ fn kernel_wasm_imports_match_documented_namespaces() {
             "kh_real_open",
             "kh_real_read",
             "kh_real_stat",
+            "kh_real_write",
         ],
         "documented kh_* surface"
     );
@@ -450,6 +451,47 @@ fn host_fs_fstat_reports_real_file_size() {
     assert_eq!(size, payload.len() as u64);
     let filetype = u32::from_le_bytes(stat[8..12].try_into().unwrap());
     assert_eq!(filetype, 4, "regular file"); // 4 = REGULAR_FILE in WASI
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn host_fs_writes_create_a_real_file() {
+    // Open with O_WRITE | O_CREAT under a fresh tempdir; sys_write
+    // bytes; close; verify the host now has the file with the
+    // expected content.
+    use std::fs;
+    build_kernel_wasm().unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "yurt-host-fs-write-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let mut host = HostState::default();
+    host.host_fs_root = Some(dir.clone());
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+
+    // sys_open with flags: writable (1) + create-if-missing (2) = 3.
+    let mut req = 3_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"/host/note.txt");
+    let fd = mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap();
+    assert!(fd >= 0, "open succeeded: fd = {fd}");
+
+    // sys_write payload.
+    let mut wreq = (fd as u32).to_le_bytes().to_vec();
+    wreq.extend_from_slice(b"hello from sandbox\n");
+    let n = mk.syscall(METHOD_SYS_WRITE, &wreq, &mut []).unwrap();
+    assert_eq!(n as usize, "hello from sandbox\n".len());
+
+    // sys_close so the file is flushed (Drop on the host File closes).
+    let _ = mk.syscall(0x1_000E /* sys_close */, &(fd as u32).to_le_bytes(), &mut []);
+
+    // Verify the host disk content.
+    let on_disk = fs::read(dir.join("note.txt")).unwrap();
+    assert_eq!(on_disk, b"hello from sandbox\n");
 
     let _ = fs::remove_dir_all(&dir);
 }

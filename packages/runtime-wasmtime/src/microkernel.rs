@@ -866,7 +866,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
         |mut caller: Caller<'_, KernelStoreData>,
          path_ptr: u32,
          path_len: u32,
-         _flags: u32,
+         flags: u32,
          _mode: u32|
          -> i32 {
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
@@ -877,21 +877,20 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             if path_len > 0 && memory.read(&caller, path_ptr as usize, &mut path).is_err() {
                 return -(EFAULT as i32);
             }
-            // Phase 5: read-only opens only. Embedder can deny by
-            // leaving host_fs_root None or via policy.
             let root = match caller.data().host.host_fs_root.clone() {
                 Some(r) => r,
                 None => return -(EACCES as i32),
             };
-            // Treat the kernel-supplied path as relative; strip a
-            // leading slash if present so `root.join` keeps us under
-            // the root. Future writable opens add the write bit to
-            // policy.may_open_path's `write` arg.
+            // Flags bit 0 = writable; bit 1 = create-if-missing;
+            // bit 2 = truncate. They mirror sys_open exactly.
+            let writable = flags & 0b001 != 0;
+            let create = flags & 0b010 != 0;
+            let trunc = flags & 0b100 != 0;
             if caller
                 .data()
                 .host
                 .policy
-                .may_open_path(&path, false)
+                .may_open_path(&path, writable)
                 == PolicyDecision::Deny
             {
                 return -(EACCES as i32);
@@ -902,21 +901,49 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Err(_) => return -(EINVAL as i32),
             };
             let candidate = root.join(rel_str);
-            // Escape protection: canonicalize and verify the result
-            // is under root. `canonicalize` requires the file exist —
-            // if it doesn't, that's also -ENOENT.
-            let resolved = match candidate.canonicalize() {
-                Ok(p) => p,
-                Err(_) => return -(ENOENT as i32),
-            };
+            // Escape protection. For writable opens that target a
+            // brand-new file, canonicalize on the *parent* directory
+            // (the file itself doesn't exist yet) — same containment
+            // guarantee.
             let root_canon = match root.canonicalize() {
                 Ok(p) => p,
                 Err(_) => return -(EACCES as i32),
             };
+            let resolved = match candidate.canonicalize() {
+                Ok(p) => p,
+                Err(_) if writable && create => {
+                    // For new-file creates, validate the parent is
+                    // under root, then build the full target path.
+                    let parent = match candidate.parent() {
+                        Some(p) => p,
+                        None => return -(EINVAL as i32),
+                    };
+                    let parent_canon = match parent.canonicalize() {
+                        Ok(p) => p,
+                        Err(_) => return -(ENOENT as i32),
+                    };
+                    if !parent_canon.starts_with(&root_canon) {
+                        return -(EACCES as i32);
+                    }
+                    parent_canon.join(candidate.file_name().unwrap_or_default())
+                }
+                Err(_) => return -(ENOENT as i32),
+            };
             if !resolved.starts_with(&root_canon) {
                 return -(EACCES as i32);
             }
-            let file = match std::fs::File::open(&resolved) {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true);
+            if writable {
+                opts.write(true);
+            }
+            if create {
+                opts.create(true);
+            }
+            if trunc && writable {
+                opts.truncate(true);
+            }
+            let file = match opts.open(&resolved) {
                 Ok(f) => f,
                 Err(e) => {
                     return match e.kind() {
@@ -968,6 +995,41 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 return -EFAULT;
             }
             n as i64
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_real_write",
+        |mut caller: Caller<'_, KernelStoreData>,
+         fd: i32,
+         data_ptr: u32,
+         data_len: u32|
+         -> i64 {
+            use std::io::Write;
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            let mut buf = vec![0u8; data_len as usize];
+            if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut buf).is_err() {
+                return -EFAULT;
+            }
+            // The fd was opened with the writable bit (or we wouldn't
+            // have a writable OFD on the kernel side); std::fs::File
+            // returns an error if the file's mode doesn't permit
+            // writes. We surface that as -EBADF.
+            let file = match caller.data_mut().host.host_fs_handles.get_mut(&fd) {
+                Some(f) => f,
+                None => return -(EBADF as i64),
+            };
+            match file.write(&buf) {
+                Ok(n) => n as i64,
+                Err(e) => match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => -(EACCES as i64),
+                    std::io::ErrorKind::WriteZero => 0,
+                    _ => -EFAULT,
+                },
+            }
         },
     )?;
     linker.func_wrap(

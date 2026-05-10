@@ -19,6 +19,7 @@ extern "C" {
     fn kh_log(severity: u32, msg_ptr: *const u8, msg_len: usize) -> i32;
     fn kh_real_open(path_ptr: *const u8, path_len: usize, flags: u32, mode: u32) -> i32;
     fn kh_real_read(fd: i32, out_ptr: *mut u8, len: usize) -> i64;
+    fn kh_real_write(fd: i32, data_ptr: *const u8, data_len: usize) -> i64;
     fn kh_real_close(fd: i32) -> i32;
     fn kh_real_stat(
         path_ptr: *const u8,
@@ -65,6 +66,11 @@ unsafe fn kh_real_open(
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_real_read(_fd: i32, _out_ptr: *mut u8, _len: usize) -> i64 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_real_write(_fd: i32, _data_ptr: *const u8, _data_len: usize) -> i64 {
     -38
 }
 
@@ -142,6 +148,12 @@ pub fn real_open(path: &[u8], flags: u32, mode: u32) -> i32 {
 /// (0 = EOF) or negated errno.
 pub fn real_read(fd: i32, buf: &mut [u8]) -> i64 {
     unsafe { kh_real_read(fd, buf.as_mut_ptr(), buf.len()) }
+}
+
+/// Write `bytes` to a host-fd. Returns bytes written or negated
+/// errno (-EBADF for unwritable fds, -EACCES if policy denies, etc.).
+pub fn real_write(fd: i32, bytes: &[u8]) -> i64 {
+    unsafe { kh_real_write(fd, bytes.as_ptr(), bytes.len()) }
 }
 
 /// Close a host-fd. Best-effort; failures are surfaced but most

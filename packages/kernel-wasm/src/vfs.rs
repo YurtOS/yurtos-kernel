@@ -55,18 +55,18 @@ pub struct ProcessSnapshot {
 /// dispatch layer only ever calls these methods — it never inspects
 /// backend internals.
 pub trait VfsBackend: Send {
-    /// Resolve a path *relative to this mount* to an inode id, or
-    /// `None` if the path doesn't exist. Takes `&mut self` because
-    /// some backends (HostFsBackend) need to open + cache the
-    /// underlying handle on first lookup; pure-storage backends
-    /// (ramfs) only mutate when they have to.
-    fn lookup(&mut self, path: &[u8]) -> Option<u64>;
-
-    /// Create a fresh empty file at `path`, returning its inode id.
-    /// Used by `sys_open` when O_CREAT is set and the path is missing.
-    /// Returning `None` means the backend refuses creation (e.g. a
-    /// read-only image-layer mount).
-    fn create(&mut self, path: &[u8]) -> Option<u64>;
+    /// Open (or create) `path`, returning the inode id. `flags`
+    /// carries the same bits as `sys_open`:
+    ///
+    ///   bit 0: writable (O_WRONLY/O_RDWR)
+    ///   bit 1: create-if-missing (O_CREAT)
+    ///   bit 2: truncate (O_TRUNC) — applied after open by dispatch
+    ///
+    /// Returns `None` for "no such file" or "the backend refuses".
+    /// Read-only backends (TarLayerBackend, ProcBackend, DevBackend)
+    /// return None for the create bit; HostFsBackend forwards flags
+    /// to `kh_real_open` so the write bit reaches the host.
+    fn open(&mut self, path: &[u8], flags: u32) -> Option<u64>;
 
     /// Truncate the file's content to length zero.
     fn truncate(&mut self, inode: u64);
@@ -168,19 +168,11 @@ impl MountTable {
         Some((i as MountId, rel))
     }
 
-    pub fn lookup(&mut self, path: &[u8]) -> Option<(MountId, u64)> {
+    pub fn open(&mut self, path: &[u8], flags: u32) -> Option<(MountId, u64)> {
         let (id, rel) = self.resolve(path)?;
         self.mounts[id as usize]
             .backend
-            .lookup(&rel)
-            .map(|inode| (id, inode))
-    }
-
-    pub fn create(&mut self, path: &[u8]) -> Option<(MountId, u64)> {
-        let (id, rel) = self.resolve(path)?;
-        self.mounts[id as usize]
-            .backend
-            .create(&rel)
+            .open(&rel, flags)
             .map(|inode| (id, inode))
     }
 
@@ -320,17 +312,14 @@ impl Default for DevBackend {
 }
 
 impl VfsBackend for DevBackend {
-    fn lookup(&mut self, path: &[u8]) -> Option<u64> {
+    fn open(&mut self, path: &[u8], _flags: u32) -> Option<u64> {
+        // /dev is a fixed namespace — flags are ignored. Unknown
+        // paths return None; the create bit doesn't add new entries.
         match path {
             b"/null" => Some(DEV_NULL_INODE),
             b"/zero" => Some(DEV_ZERO_INODE),
             _ => None,
         }
-    }
-
-    fn create(&mut self, _path: &[u8]) -> Option<u64> {
-        // /dev is a fixed namespace; refuse new entries.
-        None
     }
 
     fn truncate(&mut self, _inode: u64) {
@@ -364,12 +353,15 @@ impl VfsBackend for DevBackend {
 }
 
 impl VfsBackend for RamfsBackend {
-    fn lookup(&mut self, path: &[u8]) -> Option<u64> {
-        self.paths.get(path).copied()
-    }
-
-    fn create(&mut self, path: &[u8]) -> Option<u64> {
-        Some(self.install(path.to_vec(), Vec::new()))
+    fn open(&mut self, path: &[u8], flags: u32) -> Option<u64> {
+        if let Some(&id) = self.paths.get(path) {
+            return Some(id);
+        }
+        // Create-if-missing on the create bit.
+        if flags & 0b010 != 0 {
+            return Some(self.install(path.to_vec(), Vec::new()));
+        }
+        None
     }
 
     fn truncate(&mut self, inode: u64) {
@@ -422,8 +414,9 @@ mod tests {
         // /etc/hello → root mount; /data/foo → sub-mount.
         // The root sees the full path (incl. leading /); the sub-mount
         // sees the suffix after its prefix ("/foo").
-        mt.create(b"/etc/hello").unwrap();
-        let (sub_mount, sub_inode) = mt.create(b"/data/foo").unwrap();
+        // Open with create-bit (0b010) so missing paths are made.
+        mt.open(b"/etc/hello", 0b010).unwrap();
+        let (sub_mount, sub_inode) = mt.open(b"/data/foo", 0b010).unwrap();
         assert_eq!(sub_mount, sub_id);
 
         // Each backend sees an independent inode-id space.
@@ -436,7 +429,8 @@ mod tests {
     #[test]
     fn lookup_returns_none_for_unknown_path() {
         let mut mt = MountTable::new(Box::new(RamfsBackend::new()));
-        assert!(mt.lookup(b"/missing").is_none());
+        // Open without create-bit on a missing path → None.
+        assert!(mt.open(b"/missing", 0).is_none());
     }
 
     #[test]
@@ -546,13 +540,10 @@ impl Default for ProcBackend {
 }
 
 impl VfsBackend for ProcBackend {
-    fn lookup(&mut self, path: &[u8]) -> Option<u64> {
+    fn open(&mut self, path: &[u8], _flags: u32) -> Option<u64> {
+        // /proc is read-only synthetic — flags ignored, create-bit
+        // doesn't apply. Existing paths return their current inode.
         self.entries.get(path).map(|(id, _)| *id)
-    }
-
-    fn create(&mut self, _path: &[u8]) -> Option<u64> {
-        // /proc is a synthetic namespace; userland can't add files.
-        None
     }
 
     fn truncate(&mut self, _inode: u64) {}
@@ -669,25 +660,26 @@ impl Default for HostFsBackend {
 }
 
 impl VfsBackend for HostFsBackend {
-    fn lookup(&mut self, path: &[u8]) -> Option<u64> {
-        // Cached: re-use the existing host-fd / inode mapping.
+    fn open(&mut self, path: &[u8], flags: u32) -> Option<u64> {
+        // Cached: re-use the existing host-fd / inode mapping. The
+        // cached fd was opened with whatever flags the *first*
+        // caller used; subsequent opens with different flags share
+        // it. POSIX-correct behavior would dup() with new flags;
+        // Phase 5 keeps it simple — embedders that need separate
+        // RW vs RO views close + reopen in between.
         if let Some(&inode) = self.paths.get(path) {
             return Some(inode);
         }
         // Cold path: ask the host. The microkernel applies the
-        // policy gate (`PolicyEnforcer::may_open_path`) before
-        // touching the real disk — a Deny returns -EACCES which
-        // we map to None (lookup miss → ENOENT in the syscall).
-        // Real ENOENTs from the host filesystem also surface as
-        // None here.
-        let host_fd = crate::kh::real_open(path, 0, 0);
+        // policy gate (`PolicyEnforcer::may_open_path`) and root
+        // canonicalization before touching the real disk — a Deny
+        // returns -EACCES which we map to None (lookup miss →
+        // ENOENT in the syscall).
+        let host_fd = crate::kh::real_open(path, flags, 0);
         if host_fd < 0 {
             return None;
         }
         let inode = host_fd as u64;
-        // Stat the file to cache its size. Failures here don't fail
-        // the open — host_fd is already valid. We just leave size
-        // unknown so size() returns 0 (matching pre-stat behavior).
         let size = crate::kh::real_stat_size(path).ok();
         self.paths.insert(path.to_vec(), inode);
         self.fds.insert(
@@ -699,15 +691,6 @@ impl VfsBackend for HostFsBackend {
             },
         );
         Some(inode)
-    }
-
-    fn create(&mut self, path: &[u8]) -> Option<u64> {
-        // Host-fs "create" today is the same as lookup — there's
-        // no kh_real_open(O_CREAT) wired yet, so attempting to
-        // create a path that doesn't exist on the host fails. When
-        // kh_real_create lands this becomes a separate path with
-        // O_CREAT|O_TRUNC|O_WRONLY semantics.
-        self.lookup(path)
     }
 
     fn truncate(&mut self, _inode: u64) {
@@ -725,9 +708,14 @@ impl VfsBackend for HostFsBackend {
         crate::kh::real_read(inode as i32, buf)
     }
 
-    fn write(&mut self, _inode: u64, _offset: u64, _payload: &[u8]) -> i64 {
-        // Read-only Phase 5 surface — kh_real_write isn't wired yet.
-        -(crate::abi::EBADF as i64)
+    fn write(&mut self, inode: u64, _offset: u64, payload: &[u8]) -> i64 {
+        // Phase 5: writes go straight to the host fd. Offset is
+        // ignored — the host writes at its current cursor. Real
+        // pwrite-style positioning lands when kh_real_pwrite does.
+        if !self.fds.contains_key(&inode) {
+            return -(crate::abi::EBADF as i64);
+        }
+        crate::kh::real_write(inode as i32, payload)
     }
 
     fn size(&self, inode: u64) -> Option<u64> {
@@ -843,13 +831,14 @@ impl TarLayerBackend {
 }
 
 impl VfsBackend for TarLayerBackend {
-    fn lookup(&mut self, path: &[u8]) -> Option<u64> {
+    fn open(&mut self, path: &[u8], flags: u32) -> Option<u64> {
+        // Image layers are immutable; refuse the create bit and
+        // any writable open. Read-only lookups return existing
+        // inodes; missing paths return None.
+        if flags & 0b011 != 0 {
+            return None;
+        }
         self.inodes.get(path).copied()
-    }
-
-    fn create(&mut self, _path: &[u8]) -> Option<u64> {
-        // Image layers are immutable; refuse.
-        None
     }
 
     fn truncate(&mut self, _inode: u64) {}
