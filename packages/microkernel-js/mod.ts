@@ -223,6 +223,29 @@ export interface HostState {
   kv?: KvBackend;
   /** When set, every `kh_socket_*` import delegates here. */
   tcp?: TcpSocketImpl;
+  /**
+   * Bridge that lets kh_* handlers suspend the calling wasm until
+   * a JS Promise resolves. Default is `noopAsyncBridge` (every
+   * blocking attempt throws "NOT_SUSPENDABLE"); embedders that
+   * want real async I/O install one of:
+   *
+   * - **JSPI** (V8 / SpiderMonkey, Chrome 137+, recent Firefox,
+   *   Deno via V8): wrap kh imports with `WebAssembly.Suspending`
+   *   and the kernel_dispatch export with `WebAssembly.promising`.
+   *   Every syscall becomes async at the JS boundary.
+   * - **Asyncify**: kernel.wasm + user wasm built with binaryen
+   *   `--asyncify`. Engine-agnostic; works on Safari and old
+   *   browsers but adds ~30% binary-size overhead.
+   * - **Stack Switching**: when wasmer / Chrome ship the proposal
+   *   stably, supersedes both.
+   *
+   * Async-capable kh_* handlers (kh_fetch_blocking,
+   * kh_socket_recv, kh_socket_accept_blocking) check
+   * `asyncBridge.capabilities()` and either route through
+   * `suspendUntil` or return -ENOSYS when no path is available.
+   * See project memory `project_async_bridge` for the matrix.
+   */
+  asyncBridge?: AsyncBridge;
 }
 
 const ENOENT = 2;
@@ -553,6 +576,7 @@ export function defaultHostState(): HostState {
     extensions: new EmptyExtensionRegistry(),
     logSink: new DiscardLogSink(),
     policy: allowAllPolicy,
+    asyncBridge: noopAsyncBridge,
   };
 }
 
