@@ -33,6 +33,20 @@ extern "C" {
         out_ptr: *mut u8,
         out_cap: usize,
     ) -> i64;
+    fn kh_real_unlink(path_ptr: *const u8, path_len: usize) -> i32;
+    fn kh_real_mkdir(path_ptr: *const u8, path_len: usize, mode: u32) -> i32;
+    fn kh_real_symlink(
+        target_ptr: *const u8,
+        target_len: usize,
+        link_ptr: *const u8,
+        link_len: usize,
+    ) -> i32;
+    fn kh_real_rename(
+        old_ptr: *const u8,
+        old_len: usize,
+        new_ptr: *const u8,
+        new_len: usize,
+    ) -> i32;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -102,6 +116,36 @@ unsafe fn kh_fetch_blocking(
     _out_ptr: *mut u8,
     _out_cap: usize,
 ) -> i64 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_real_unlink(_path_ptr: *const u8, _path_len: usize) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_real_mkdir(_path_ptr: *const u8, _path_len: usize, _mode: u32) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_real_symlink(
+    _target_ptr: *const u8,
+    _target_len: usize,
+    _link_ptr: *const u8,
+    _link_len: usize,
+) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_real_rename(
+    _old_ptr: *const u8,
+    _old_len: usize,
+    _new_ptr: *const u8,
+    _new_len: usize,
+) -> i32 {
     -38
 }
 
@@ -176,6 +220,44 @@ pub fn real_write(fd: i32, bytes: &[u8]) -> i64 {
 /// callers ignore.
 pub fn real_close(fd: i32) -> i32 {
     unsafe { kh_real_close(fd) }
+}
+
+/// Unlink a host-fs path. Same policy gate as `kh_real_open`.
+pub fn real_unlink(path: &[u8]) -> i32 {
+    unsafe { kh_real_unlink(path.as_ptr(), path.len()) }
+}
+
+/// Create a host-fs directory at `path`. `mode` is the POSIX
+/// permission bits.
+pub fn real_mkdir(path: &[u8], mode: u32) -> i32 {
+    unsafe { kh_real_mkdir(path.as_ptr(), path.len(), mode) }
+}
+
+/// Create a host-fs symlink at `link_path` pointing at `target`
+/// (target stays verbatim).
+pub fn real_symlink(target: &[u8], link_path: &[u8]) -> i32 {
+    unsafe {
+        kh_real_symlink(
+            target.as_ptr(),
+            target.len(),
+            link_path.as_ptr(),
+            link_path.len(),
+        )
+    }
+}
+
+/// Rename a host-fs path. POSIX semantics — atomic on most
+/// filesystems within a mount; cross-mount renames return -EXDEV
+/// from the host.
+pub fn real_rename(old_path: &[u8], new_path: &[u8]) -> i32 {
+    unsafe {
+        kh_real_rename(
+            old_path.as_ptr(),
+            old_path.len(),
+            new_path.as_ptr(),
+            new_path.len(),
+        )
+    }
 }
 
 /// Forward an HTTP fetch request to the host. The request bytes

@@ -1437,6 +1437,33 @@ impl VfsBackend for HostFsBackend {
         // couldn't stat for whatever reason.
         self.fds.get(&inode).and_then(|h| h.size).or(Some(0))
     }
+
+    fn unlink(&mut self, path: &[u8]) -> i32 {
+        // Drop our cached fd if any so the next open re-issues. We
+        // don't actively kh_real_close here — that happens in Drop.
+        self.paths.remove(path);
+        crate::kh::real_unlink(path)
+    }
+
+    fn mkdir(&mut self, path: &[u8]) -> i32 {
+        crate::kh::real_mkdir(path, 0o755)
+    }
+
+    fn symlink(&mut self, target: &[u8], link_path: &[u8]) -> i32 {
+        crate::kh::real_symlink(target, link_path)
+    }
+
+    fn rename(&mut self, old_path: &[u8], new_path: &[u8]) -> i32 {
+        // Invalidate any cached host-fd for the source path; the
+        // target inode is now reachable under new_path. Real fds
+        // stay open — the host's rename(2) preserves them.
+        if let Some(inode) = self.paths.remove(old_path) {
+            self.paths.insert(new_path.to_vec(), inode);
+        } else {
+            self.paths.remove(new_path);
+        }
+        crate::kh::real_rename(old_path, new_path)
+    }
 }
 
 impl Drop for HostFsBackend {

@@ -972,6 +972,79 @@ pub use yurt_microkernel_core::{trampoline_request, trampoline_request_with_resp
 
 // ── Linker registration ──────────────────────────────────────────────────────
 
+/// Resolve a kernel-supplied host-fs path to an absolute filesystem
+/// path under the embedder's host_fs_root. Applies the same policy
+/// gate as kh_real_open with write=true and the same root-
+/// containment guarantee. When `allow_missing` is true (mkdir,
+/// symlink, rename target) the leaf is allowed to not exist —
+/// containment is then enforced on the parent.
+fn resolve_host_write_path(
+    caller: &mut Caller<'_, KernelStoreData>,
+    path_ptr: u32,
+    path_len: u32,
+    allow_missing: bool,
+) -> std::result::Result<std::path::PathBuf, i32> {
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or(-EFAULT as i32)?;
+    let mut path = vec![0u8; path_len as usize];
+    if path_len > 0
+        && memory
+            .read(&*caller, path_ptr as usize, &mut path)
+            .is_err()
+    {
+        return Err(-EFAULT as i32);
+    }
+    let root = caller
+        .data()
+        .host
+        .host_fs_root
+        .clone()
+        .ok_or(-EACCES as i32)?;
+    if caller
+        .data()
+        .host
+        .policy
+        .may_open_path(&path, true)
+        == PolicyDecision::Deny
+    {
+        return Err(-EACCES as i32);
+    }
+    let rel: &[u8] = if path.starts_with(b"/") { &path[1..] } else { &path };
+    let rel_str = std::str::from_utf8(rel).map_err(|_| -EINVAL as i32)?;
+    let candidate = root.join(rel_str);
+    let root_canon = root.canonicalize().map_err(|_| -EACCES as i32)?;
+    let resolved = match candidate.canonicalize() {
+        Ok(p) => p,
+        Err(_) if allow_missing => {
+            // Leaf doesn't exist; canonicalize parent and rebuild.
+            let parent = candidate.parent().ok_or(-EINVAL as i32)?;
+            let parent_canon = parent.canonicalize().map_err(|_| -ENOENT as i32)?;
+            if !parent_canon.starts_with(&root_canon) {
+                return Err(-EACCES as i32);
+            }
+            return Ok(parent_canon.join(candidate.file_name().unwrap_or_default()));
+        }
+        Err(_) => return Err(-ENOENT as i32),
+    };
+    if !resolved.starts_with(&root_canon) {
+        return Err(-EACCES as i32);
+    }
+    Ok(resolved)
+}
+
+fn host_io_errno(e: std::io::Error) -> i32 {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        NotFound => -ENOENT as i32,
+        PermissionDenied => -EACCES as i32,
+        AlreadyExists => -(17 as i32), // -EEXIST
+        DirectoryNotEmpty => -(39 as i32), // -ENOTEMPTY
+        _ => -EFAULT as i32,
+    }
+}
+
 fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
@@ -1362,6 +1435,122 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 return -EFAULT;
             }
             32 // bytes written
+        },
+    )?;
+
+    // ── kh_real_unlink / mkdir / symlink / rename ──────────────────
+    //
+    // Mutating counterparts to kh_real_open/stat. Each does the
+    // same root containment check and asks the policy via
+    // may_open_path(write=true) before touching the host fs.
+    // Errno mapping is the same as kh_real_open.
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_real_unlink",
+        |mut caller: Caller<'_, KernelStoreData>,
+         path_ptr: u32,
+         path_len: u32|
+         -> i32 {
+            match resolve_host_write_path(&mut caller, path_ptr, path_len, false) {
+                Err(rc) => rc,
+                Ok(p) => match std::fs::remove_file(&p) {
+                    Ok(()) => 0,
+                    Err(e) => host_io_errno(e),
+                },
+            }
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_real_mkdir",
+        |mut caller: Caller<'_, KernelStoreData>,
+         path_ptr: u32,
+         path_len: u32,
+         _mode: u32|
+         -> i32 {
+            // We canonicalize the *parent* (mkdir creates the leaf)
+            // — `allow_missing` lets resolve_host_write_path do the
+            // parent-canonicalization fallback.
+            match resolve_host_write_path(&mut caller, path_ptr, path_len, true) {
+                Err(rc) => rc,
+                Ok(p) => match std::fs::create_dir(&p) {
+                    Ok(()) => 0,
+                    Err(e) => host_io_errno(e),
+                },
+            }
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_real_symlink",
+        |mut caller: Caller<'_, KernelStoreData>,
+         target_ptr: u32,
+         target_len: u32,
+         link_ptr: u32,
+         link_len: u32|
+         -> i32 {
+            // Read target verbatim — it's the symlink contents, not
+            // a path resolved against the root. Only the link path
+            // goes through the policy + containment check.
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT as i32,
+            };
+            let mut target = vec![0u8; target_len as usize];
+            if target_len > 0
+                && memory
+                    .read(&caller, target_ptr as usize, &mut target)
+                    .is_err()
+            {
+                return -EFAULT as i32;
+            }
+            let link_resolved = match resolve_host_write_path(
+                &mut caller,
+                link_ptr,
+                link_len,
+                true, // allow missing — we're creating it
+            ) {
+                Err(rc) => return rc,
+                Ok(p) => p,
+            };
+            let target_str = match std::str::from_utf8(&target) {
+                Ok(s) => s,
+                Err(_) => return -EINVAL as i32,
+            };
+            #[cfg(unix)]
+            let res = std::os::unix::fs::symlink(target_str, &link_resolved);
+            #[cfg(not(unix))]
+            let res: std::io::Result<()> =
+                Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "symlink"));
+            match res {
+                Ok(()) => 0,
+                Err(e) => host_io_errno(e),
+            }
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_real_rename",
+        |mut caller: Caller<'_, KernelStoreData>,
+         old_ptr: u32,
+         old_len: u32,
+         new_ptr: u32,
+         new_len: u32|
+         -> i32 {
+            let old_resolved =
+                match resolve_host_write_path(&mut caller, old_ptr, old_len, false) {
+                    Err(rc) => return rc,
+                    Ok(p) => p,
+                };
+            let new_resolved =
+                match resolve_host_write_path(&mut caller, new_ptr, new_len, true) {
+                    Err(rc) => return rc,
+                    Ok(p) => p,
+                };
+            match std::fs::rename(&old_resolved, &new_resolved) {
+                Ok(()) => 0,
+                Err(e) => host_io_errno(e),
+            }
         },
     )?;
 

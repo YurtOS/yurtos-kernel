@@ -157,9 +157,13 @@ fn kernel_wasm_imports_match_documented_namespaces() {
             // counterparts arrive when the OFD-backed write path
             // does.
             "kh_real_close",
+            "kh_real_mkdir",
             "kh_real_open",
             "kh_real_read",
+            "kh_real_rename",
             "kh_real_stat",
+            "kh_real_symlink",
+            "kh_real_unlink",
             "kh_real_write",
         ],
         "documented kh_* surface"
@@ -426,6 +430,62 @@ fn host_fs_backend_reads_real_file_via_kh_real_open() {
         .unwrap();
     assert!(n > 0, "read returned bytes: n = {n}");
     assert_eq!(&buf[..n as usize], b"hello from real disk\n");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn host_fs_writable_ops_create_then_rename_then_unlink() {
+    // End-to-end: through HostFsBackend, mkdir creates a real
+    // directory, rename moves a real file, unlink removes it.
+    // Containment: paths outside host_fs_root return -EACCES.
+    use std::fs;
+    use std::io::Write;
+    build_kernel_wasm().unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "yurt-host-fs-write-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    {
+        let mut f = fs::File::create(dir.join("a.txt")).unwrap();
+        f.write_all(b"hi").unwrap();
+    }
+
+    let mut host = HostState::default();
+    host.host_fs_root = Some(dir.clone());
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    mk.mount_host_fs(b"/host").unwrap();
+
+    // mkdir /host/sub
+    assert_eq!(
+        mk.syscall(METHOD_SYS_MKDIR, b"/host/sub", &mut []).unwrap(),
+        0,
+    );
+    assert!(dir.join("sub").is_dir(), "real mkdir landed on disk");
+
+    // rename /host/a.txt -> /host/sub/b.txt
+    let old: &[u8] = b"/host/a.txt";
+    let new: &[u8] = b"/host/sub/b.txt";
+    let mut req = (old.len() as u32).to_le_bytes().to_vec();
+    req.extend_from_slice(old);
+    req.extend_from_slice(new);
+    assert_eq!(
+        mk.syscall(METHOD_SYS_RENAME, &req, &mut []).unwrap(),
+        0,
+    );
+    assert!(!dir.join("a.txt").exists());
+    assert!(dir.join("sub/b.txt").exists());
+
+    // unlink /host/sub/b.txt
+    assert_eq!(
+        mk.syscall(METHOD_SYS_UNLINK, b"/host/sub/b.txt", &mut [])
+            .unwrap(),
+        0,
+    );
+    assert!(!dir.join("sub/b.txt").exists());
 
     let _ = fs::remove_dir_all(&dir);
 }
