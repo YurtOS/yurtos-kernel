@@ -234,62 +234,13 @@ function mapErrno(e: unknown): number {
 }
 
 /**
- * Deno-backed implementation of `HostState.fetch`. Wraps
- * `globalThis.fetch` with the JSON-shaped request/response
- * encoding `network::fetch` already speaks (see
- * packages/runtime-wasmtime/src/wasm/network.rs). When installed
- * with JSPI available, `kh_fetch_blocking` actually performs
- * real HTTP and the wasm caller suspends until the response
- * arrives.
+ * Deno-backed implementation of `HostState.fetch`. The Deno
+ * impl is identical to the universal `globalFetch` in
+ * microkernel-js (both wrap `globalThis.fetch`), so this is
+ * just a re-export under the Deno-named alias for embedder
+ * ergonomics. Embedders writing portable JS can use either name.
  */
-export async function denoFetch(
-  request: Uint8Array,
-): Promise<Uint8Array> {
-  const reqStr = new TextDecoder().decode(request);
-  let req: {
-    url: string;
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-  };
-  try {
-    req = JSON.parse(reqStr);
-  } catch (e) {
-    return new TextEncoder().encode(JSON.stringify({
-      ok: false,
-      status: 0,
-      headers: {},
-      body: "",
-      error: `invalid request JSON: ${e}`,
-    }));
-  }
-  try {
-    const resp = await fetch(req.url, {
-      method: req.method ?? "GET",
-      headers: req.headers,
-      body: req.body,
-    });
-    const headers: Record<string, string> = {};
-    for (const [k, v] of resp.headers.entries()) headers[k] = v;
-    const bodyBytes = new Uint8Array(await resp.arrayBuffer());
-    const body = new TextDecoder("utf-8", { fatal: false }).decode(bodyBytes);
-    return new TextEncoder().encode(JSON.stringify({
-      ok: resp.ok,
-      status: resp.status,
-      headers,
-      body,
-      error: null,
-    }));
-  } catch (e) {
-    return new TextEncoder().encode(JSON.stringify({
-      ok: false,
-      status: 0,
-      headers: {},
-      body: "",
-      error: `${e}`,
-    }));
-  }
-}
+export { globalFetch as denoFetch } from "../microkernel-js/mod.ts";
 
 /**
  * Deno-backed [`TcpSocketImpl`]. Implements only the *Async

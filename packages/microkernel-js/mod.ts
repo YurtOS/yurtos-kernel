@@ -1781,6 +1781,55 @@ export class WebSocketTcp implements TcpSocketImpl {
 }
 
 /**
+ * Browser-native [`HostFsImpl`] backed by OPFS (the Origin
+ * Private File System, exposed through
+ * `navigator.storage.getDirectory()`). Browser-only — throws
+ * at construction in Deno and other hosts where the API is
+ * absent.
+ *
+ * OPFS is inherently async, so HostFsImpl's sync methods stub
+ * to -ENOSYS. **TODO**: extending HostFsImpl with optional
+ * async variants (mirroring KvBackend / TcpSocketImpl) lets
+ * kh_real_* suspend through JSPI the same way kh_idb_* /
+ * kh_fetch_blocking already do; this OpfsHostFs scaffold is
+ * the join point. Until that lands, the kh_real_* surface on
+ * browsers stays stubbed, and this class is the
+ * documentation+placeholder the future async-fs slice plugs
+ * its impl into.
+ *
+ * Containment is automatic: OPFS is rooted at the page's
+ * origin storage bucket; there's no concept of `..` escape.
+ */
+export class OpfsHostFs implements HostFsImpl {
+  private rootHandle: Promise<FileSystemDirectoryHandle>;
+
+  constructor() {
+    // deno-lint-ignore no-explicit-any
+    const nav = (globalThis as any).navigator;
+    if (!nav?.storage?.getDirectory) {
+      throw new Error(
+        "OpfsHostFs: navigator.storage.getDirectory() is not available — browser-only impl",
+      );
+    }
+    this.rootHandle = nav.storage.getDirectory();
+  }
+
+  // Sync stubs — kh_real_* on browsers needs the async-fs
+  // variants of HostFsImpl that are coming in a follow-up
+  // slice. The class is shipped now so embedders can
+  // import-and-detect.
+  open(): number { return -38; }
+  read(): number { return -38; }
+  write(): number { return -38; }
+  close(): number { return 0; }
+  stat(): HostFsStat | number { return -38; }
+  unlink(): number { return -38; }
+  mkdir(): number { return -38; }
+  symlink(): number { return -38; }
+  rename(): number { return -38; }
+}
+
+/**
  * `KvBackend` that proxies to browser-native `globalThis.indexedDB`.
  * Browser-only — throws at construction in Deno (no `indexedDB`)
  * and other hosts that don't ship the API. Storage layout: one

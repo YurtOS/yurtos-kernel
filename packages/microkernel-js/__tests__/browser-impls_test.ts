@@ -72,4 +72,11 @@ describe("browser-friendly impls", () => {
       /globalThis\.indexedDB is not available/,
     );
   });
+
+  it("OpfsHostFs refuses to construct without navigator.storage.getDirectory", async () => {
+    const { OpfsHostFs } = await import("../mod.ts");
+    expect(() => new OpfsHostFs()).toThrow(
+      /navigator\.storage\.getDirectory/,
+    );
+  });
 });
