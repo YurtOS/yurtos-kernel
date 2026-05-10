@@ -1932,24 +1932,23 @@ export class WebSocketTcp implements TcpSocketImpl {
  * Browser-native [`HostFsImpl`] backed by OPFS (the Origin
  * Private File System, exposed through
  * `navigator.storage.getDirectory()`). Browser-only — throws
- * at construction in Deno and other hosts where the API is
- * absent.
- *
- * OPFS is inherently async, so HostFsImpl's sync methods stub
- * to -ENOSYS. **TODO**: extending HostFsImpl with optional
- * async variants (mirroring KvBackend / TcpSocketImpl) lets
- * kh_real_* suspend through JSPI the same way kh_idb_* /
- * kh_fetch_blocking already do; this OpfsHostFs scaffold is
- * the join point. Until that lands, the kh_real_* surface on
- * browsers stays stubbed, and this class is the
- * documentation+placeholder the future async-fs slice plugs
- * its impl into.
+ * at construction on hosts without the API (Deno, Node).
  *
  * Containment is automatic: OPFS is rooted at the page's
  * origin storage bucket; there's no concept of `..` escape.
+ *
+ * Sync HostFsImpl methods stub to -ENOSYS; the actual work
+ * lives in the *Async variants and runs through the JSPI
+ * Suspending pipeline. Symlinks aren't supported by OPFS —
+ * symlinkAsync returns -ENOSYS.
  */
 export class OpfsHostFs implements HostFsImpl {
   private rootHandle: Promise<FileSystemDirectoryHandle>;
+  private fds = new Map<
+    number,
+    { fileHandle: FileSystemFileHandle; cursor: number; writable: boolean }
+  >();
+  private nextFd = 1;
 
   constructor() {
     // deno-lint-ignore no-explicit-any
@@ -1962,10 +1961,7 @@ export class OpfsHostFs implements HostFsImpl {
     this.rootHandle = nav.storage.getDirectory();
   }
 
-  // Sync stubs — kh_real_* on browsers needs the async-fs
-  // variants of HostFsImpl that are coming in a follow-up
-  // slice. The class is shipped now so embedders can
-  // import-and-detect.
+  // Sync stubs — JSPI takes the *Async path.
   open(): number { return -38; }
   read(): number { return -38; }
   write(): number { return -38; }
@@ -1975,6 +1971,182 @@ export class OpfsHostFs implements HostFsImpl {
   mkdir(): number { return -38; }
   symlink(): number { return -38; }
   rename(): number { return -38; }
+
+  /**
+   * Resolve `path` (kernel-supplied, leading slash optional)
+   * to (parent dir handle, leaf name). Walks the directory
+   * tree creating intermediate dirs only when `createInter`
+   * is set.
+   */
+  private async resolveParent(
+    path: Uint8Array,
+    createInter: boolean,
+  ): Promise<
+    { parent: FileSystemDirectoryHandle; leaf: string } | number
+  > {
+    const str = new TextDecoder().decode(path);
+    const rel = str.startsWith("/") ? str.slice(1) : str;
+    if (rel === "") return -22; // -EINVAL on root
+    const parts = rel.split("/").filter((p) => p !== "");
+    let dir = await this.rootHandle;
+    for (let i = 0; i < parts.length - 1; i++) {
+      try {
+        dir = await dir.getDirectoryHandle(parts[i], { create: createInter });
+      } catch {
+        return -2; // -ENOENT
+      }
+    }
+    return { parent: dir, leaf: parts[parts.length - 1] };
+  }
+
+  async openAsync(path: Uint8Array, flags: number): Promise<number> {
+    const writable = (flags & 0b001) !== 0;
+    const create = (flags & 0b010) !== 0;
+    const trunc = (flags & 0b100) !== 0;
+    const resolved = await this.resolveParent(path, writable && create);
+    if (typeof resolved === "number") return resolved;
+    let fileHandle: FileSystemFileHandle;
+    try {
+      fileHandle = await resolved.parent.getFileHandle(resolved.leaf, {
+        create: writable && create,
+      });
+    } catch {
+      return -2; // -ENOENT
+    }
+    if (trunc && writable) {
+      try {
+        const w = await fileHandle.createWritable();
+        await w.truncate(0);
+        await w.close();
+      } catch {
+        return -5; // -EIO
+      }
+    }
+    const fd = this.nextFd++;
+    this.fds.set(fd, { fileHandle, cursor: 0, writable });
+    return fd;
+  }
+
+  async readAsync(fd: number, buf: Uint8Array): Promise<number> {
+    const e = this.fds.get(fd);
+    if (!e) return -9; // -EBADF
+    let file: File;
+    try {
+      file = await e.fileHandle.getFile();
+    } catch {
+      return -5;
+    }
+    const slice = file.slice(e.cursor, e.cursor + buf.byteLength);
+    const bytes = new Uint8Array(await slice.arrayBuffer());
+    buf.set(bytes);
+    e.cursor += bytes.byteLength;
+    return bytes.byteLength;
+  }
+
+  async writeAsync(fd: number, data: Uint8Array): Promise<number> {
+    const e = this.fds.get(fd);
+    if (!e) return -9;
+    if (!e.writable) return -9;
+    try {
+      const w = await e.fileHandle.createWritable({ keepExistingData: true });
+      await w.write({ type: "write", position: e.cursor, data });
+      await w.close();
+      e.cursor += data.byteLength;
+      return data.byteLength;
+    } catch {
+      return -5;
+    }
+  }
+
+  async closeAsync(fd: number): Promise<number> {
+    this.fds.delete(fd);
+    return 0;
+  }
+
+  async statAsync(path: Uint8Array): Promise<HostFsStat | number> {
+    const resolved = await this.resolveParent(path, false);
+    if (typeof resolved === "number") return resolved;
+    // Try as a file first; fall back to directory.
+    try {
+      const handle = await resolved.parent.getFileHandle(resolved.leaf);
+      const file = await handle.getFile();
+      return {
+        size: BigInt(file.size),
+        mode: 0o100_644,
+        mtimeNs: BigInt(file.lastModified) * 1_000_000n,
+        isDir: false,
+        isSymlink: false,
+      };
+    } catch {
+      try {
+        await resolved.parent.getDirectoryHandle(resolved.leaf);
+        return {
+          size: 0n,
+          mode: 0o040_755,
+          mtimeNs: 0n,
+          isDir: true,
+          isSymlink: false,
+        };
+      } catch {
+        return -2;
+      }
+    }
+  }
+
+  async unlinkAsync(path: Uint8Array): Promise<number> {
+    const resolved = await this.resolveParent(path, false);
+    if (typeof resolved === "number") return resolved;
+    try {
+      await resolved.parent.removeEntry(resolved.leaf);
+      return 0;
+    } catch {
+      return -2;
+    }
+  }
+
+  async mkdirAsync(path: Uint8Array, _mode: number): Promise<number> {
+    const resolved = await this.resolveParent(path, true);
+    if (typeof resolved === "number") return resolved;
+    // Detect already-exists by getting it without create first.
+    try {
+      await resolved.parent.getDirectoryHandle(resolved.leaf);
+      return -17; // -EEXIST
+    } catch { /* didn't exist — proceed */ }
+    try {
+      await resolved.parent.getDirectoryHandle(resolved.leaf, { create: true });
+      return 0;
+    } catch {
+      return -5;
+    }
+  }
+
+  async symlinkAsync(_target: Uint8Array, _linkPath: Uint8Array): Promise<number> {
+    return -38; // OPFS doesn't support symlinks
+  }
+
+  async renameAsync(oldPath: Uint8Array, newPath: Uint8Array): Promise<number> {
+    // Fallback: copy + delete. The newer FileSystemFileHandle.move
+    // API isn't universally available, so this works everywhere
+    // OPFS does. Loses inode identity (POSIX rename callers
+    // don't observe inode numbers).
+    const oldR = await this.resolveParent(oldPath, false);
+    if (typeof oldR === "number") return oldR;
+    const newR = await this.resolveParent(newPath, true);
+    if (typeof newR === "number") return newR;
+    try {
+      const src = await oldR.parent.getFileHandle(oldR.leaf);
+      const file = await src.getFile();
+      const data = new Uint8Array(await file.arrayBuffer());
+      const dst = await newR.parent.getFileHandle(newR.leaf, { create: true });
+      const w = await dst.createWritable();
+      await w.write(data);
+      await w.close();
+      await oldR.parent.removeEntry(oldR.leaf);
+      return 0;
+    } catch {
+      return -5;
+    }
+  }
 }
 
 /**
