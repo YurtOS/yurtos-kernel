@@ -579,6 +579,120 @@ export const noopAsyncBridge: AsyncBridge = {
 };
 
 /**
+ * Asyncify state values as exposed by the binaryen --asyncify
+ * pass. The wasm module exports `asyncify_get_state()` returning
+ * one of these.
+ */
+const ASYNCIFY_NORMAL = 0;
+const ASYNCIFY_UNWINDING = 1;
+const ASYNCIFY_REWINDING = 2;
+
+/**
+ * Asyncify-instrumented dispatch wrapper. Drives the
+ * unwind/rewind dance that lets a wasm module built with
+ * `wasm-opt --asyncify` suspend mid-execution on hosts WITHOUT
+ * JSPI (Safari's JavaScriptCore today, older browsers, Node
+ * builds without --jspi).
+ *
+ * The asyncify protocol:
+ *
+ * 1. JS calls `dispatch(...)`. State == NORMAL.
+ * 2. wasm calls one of the listed `asyncImports` (e.g.
+ *    `kh_fetch_blocking`).
+ * 3. The wrapped import schedules the real async work, then
+ *    triggers `asyncify_start_unwind(buf)`. The wasm stack
+ *    unwinds back to JS; `dispatch` returns. State == UNWINDING.
+ * 4. JS awaits the queued Promise.
+ * 5. JS calls `asyncify_stop_unwind`, then
+ *    `asyncify_start_rewind(buf)`. State == REWINDING.
+ * 6. JS calls `dispatch(...)` AGAIN with the same args. Wasm
+ *    replays its stack back to where the import suspended.
+ * 7. The wrapped import returns the resolved value. wasm calls
+ *    `asyncify_stop_rewind`. State == NORMAL. Execution
+ *    continues normally; `dispatch` returns the real result.
+ *
+ * Real (browser-tested) usage requires building kernel.wasm
+ * with `wasm-opt --asyncify --pass-arg=asyncify-imports@kh_fetch_blocking,kh_socket_recv,…`.
+ * Without that build flag the asyncify_* exports are absent and
+ * this path stays dormant.
+ */
+function maybeWrapWithAsyncify(
+  instance: WebAssembly.Instance,
+  rawDispatch: (
+    methodId: number,
+    callerPid: number,
+    inPtr: number,
+    inLen: number,
+    outPtr: number,
+    outCap: number,
+  ) => bigint,
+  pendingResults: Map<string, unknown>,
+): {
+  asyncDispatch: ((
+    methodId: number,
+    callerPid: number,
+    inPtr: number,
+    inLen: number,
+    outPtr: number,
+    outCap: number,
+  ) => Promise<bigint>) | null;
+  enabled: boolean;
+} {
+  const exports = instance.exports as Record<string, unknown>;
+  const getState = exports.asyncify_get_state as (() => number) | undefined;
+  const startUnwind = exports.asyncify_start_unwind as
+    | ((addr: number) => void)
+    | undefined;
+  const stopUnwind = exports.asyncify_stop_unwind as (() => void) | undefined;
+  const startRewind = exports.asyncify_start_rewind as
+    | ((addr: number) => void)
+    | undefined;
+  const stopRewind = exports.asyncify_stop_rewind as (() => void) | undefined;
+  if (
+    !getState ||
+    !startUnwind ||
+    !stopUnwind ||
+    !startRewind ||
+    !stopRewind
+  ) {
+    return { asyncDispatch: null, enabled: false };
+  }
+  // Reserve a 4 KiB slot for the asyncify stack-save buffer at
+  // a fixed address. The actual buffer comes from kernel.wasm's
+  // own scratch — for the dormant path we just remember we'd
+  // need one. When the build flag flips, kernel.wasm exports
+  // a dedicated `asyncify_buffer_ptr` that returns its address.
+  const asyncifyBufferPtr =
+    (exports.asyncify_buffer_ptr as (() => number) | undefined)?.() ?? 0;
+  const asyncDispatch = async (
+    methodId: number,
+    callerPid: number,
+    inPtr: number,
+    inLen: number,
+    outPtr: number,
+    outCap: number,
+  ): Promise<bigint> => {
+    let result = rawDispatch(methodId, callerPid, inPtr, inLen, outPtr, outCap);
+    while (getState() === ASYNCIFY_UNWINDING) {
+      stopUnwind();
+      // Take the most-recently-queued pending Promise. The
+      // wrapped import populated `pendingResults` with a
+      // promise keyed by the import name.
+      const promise = pendingResults.get("__pending__") as
+        | Promise<unknown>
+        | undefined;
+      pendingResults.delete("__pending__");
+      const resolved = promise ? await promise : undefined;
+      pendingResults.set("__resolved__", resolved);
+      startRewind(asyncifyBufferPtr);
+      result = rawDispatch(methodId, callerPid, inPtr, inLen, outPtr, outCap);
+    }
+    return result;
+  };
+  return { asyncDispatch, enabled: true };
+}
+
+/**
  * Probe the current host for AsyncBridge capabilities. Returns a
  * fresh capability descriptor; the actual bridge that uses these
  * is plugged in by the embedder. JSPI detection is conservative —
@@ -1588,16 +1702,33 @@ export class Microkernel {
 
     // promising-wrap returns a function that returns Promise<i64>;
     // the underlying call may suspend via any Suspending import.
-    const dispatchAsync = wantsAsync
-      ? (W.promising(dispatch) as (
+    let dispatchAsync: ((
+      methodId: number,
+      callerPid: number,
+      inPtr: number,
+      inLen: number,
+      outPtr: number,
+      outCap: number,
+    ) => Promise<bigint>) | null = null;
+    if (wantsAsync) {
+      dispatchAsync = W.promising(dispatch) as (
         methodId: number,
         callerPid: number,
         inPtr: number,
         inLen: number,
         outPtr: number,
         outCap: number,
-      ) => Promise<bigint>)
-      : null;
+      ) => Promise<bigint>;
+    } else {
+      // JSPI not available — try asyncify-instrumented dispatch as
+      // the universal fallback. Only kicks in when kernel.wasm was
+      // built with `wasm-opt --asyncify`; otherwise dormant.
+      const pendingResults = new Map<string, unknown>();
+      const asyncify = maybeWrapWithAsyncify(instance, dispatch, pendingResults);
+      if (asyncify.enabled) {
+        dispatchAsync = asyncify.asyncDispatch;
+      }
+    }
 
     const kernel = new KernelInstance(
       memory,
