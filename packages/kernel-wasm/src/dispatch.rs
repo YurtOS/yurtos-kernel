@@ -1138,18 +1138,32 @@ fn readdir(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             Some(e) => e,
             None => return -(abi::ENOENT as i64),
         };
-        // Pack as count + (len, bytes)*. Stop early if a record
-        // wouldn't fit; the surfaced count is what fit.
+        // Pack as count + (u32 name_len, u8 type, name_bytes)*.
+        // Type byte is a WASI filetype (0/3/4/7); 0 means the
+        // backend doesn't know — userland will stat to find out.
         let mut cursor = 4usize;
         let mut count: u32 = 0;
+        let parent = request;
         for name in &entries {
-            let need = 4 + name.len();
+            let need = 4 + 1 + name.len();
             if cursor + need > response.len() {
                 break;
             }
+            // Build child absolute path = parent + "/" + name (with
+            // root special-cased so we don't end up with "//foo").
+            let mut child = Vec::with_capacity(parent.len() + 1 + name.len());
+            child.extend_from_slice(parent);
+            if parent != b"/" {
+                child.push(b'/');
+            }
+            child.extend_from_slice(name);
+            let ty = k.vfs.entry_type(&child);
+
             response[cursor..cursor + 4]
                 .copy_from_slice(&(name.len() as u32).to_le_bytes());
             cursor += 4;
+            response[cursor] = ty;
+            cursor += 1;
             response[cursor..cursor + name.len()].copy_from_slice(name);
             cursor += name.len();
             count += 1;
@@ -3376,17 +3390,20 @@ mod tests {
         assert!(n >= 4);
         let count = u32::from_le_bytes(buf[0..4].try_into().unwrap());
         assert_eq!(count, 2);
-        // Parse names: u32 len + bytes, repeated.
+        // Parse names: (u32 len, u8 type, bytes), repeated. Files
+        // registered via register_file are regular files (type 4).
         let mut cursor = 4usize;
-        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut entries: Vec<(Vec<u8>, u8)> = Vec::new();
         for _ in 0..count {
             let len = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
-            names.push(buf[cursor..cursor + len].to_vec());
+            let ty = buf[cursor];
+            cursor += 1;
+            entries.push((buf[cursor..cursor + len].to_vec(), ty));
             cursor += len;
         }
-        assert!(names.iter().any(|n| n == b"motd"));
-        assert!(names.iter().any(|n| n == b"hostname"));
+        assert!(entries.iter().any(|(n, t)| n == b"motd" && *t == 4));
+        assert!(entries.iter().any(|(n, t)| n == b"hostname" && *t == 4));
     }
 
     #[test]
@@ -3418,6 +3435,44 @@ mod tests {
         reg.extend_from_slice(b"x");
         dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
         assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/full", &mut []), -39); // -ENOTEMPTY
+    }
+
+    #[test]
+    fn readdir_distinguishes_files_dirs_and_symlinks_via_type_byte() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // /etc/file (regular), /etc/sub (dir), /etc/link (symlink).
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/etc", &mut []), 0);
+        let mut reg = 9_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(b"/etc/file");
+        reg.extend_from_slice(b"x");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/etc/sub", &mut []), 0);
+        let target: &[u8] = b"/etc/file";
+        let link: &[u8] = b"/etc/link";
+        let mut sreq = (target.len() as u32).to_le_bytes().to_vec();
+        sreq.extend_from_slice(target);
+        sreq.extend_from_slice(link);
+        assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+        let mut buf = [0u8; 256];
+        let n = dispatch(METHOD_SYS_READDIR, 1, b"/etc", &mut buf) as usize;
+        assert!(n >= 4);
+        let count = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+        assert_eq!(count, 3);
+        let mut cursor = 4usize;
+        let mut by_name: std::collections::BTreeMap<Vec<u8>, u8> =
+            std::collections::BTreeMap::new();
+        for _ in 0..count {
+            let len = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let ty = buf[cursor];
+            cursor += 1;
+            by_name.insert(buf[cursor..cursor + len].to_vec(), ty);
+            cursor += len;
+        }
+        assert_eq!(by_name.get(&b"file".to_vec()), Some(&4));
+        assert_eq!(by_name.get(&b"sub".to_vec()), Some(&3));
+        assert_eq!(by_name.get(&b"link".to_vec()), Some(&7));
     }
 
     #[test]

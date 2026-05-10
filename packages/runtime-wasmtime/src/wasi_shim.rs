@@ -529,11 +529,13 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 None => return 28, // EINVAL
             };
             for idx in 0..count {
-                if cur + 4 > used {
+                if cur + 5 > used {
                     break;
                 }
                 let nlen = u32::from_le_bytes(resp[cur..cur + 4].try_into().unwrap()) as usize;
                 cur += 4;
+                let ty = resp[cur];
+                cur += 1;
                 if cur + nlen > used {
                     break;
                 }
@@ -547,16 +549,15 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 if written + need > buf_len as usize {
                     break;
                 }
-                // Build a 24-byte header. d_type 4 = REGULAR_FILE; we
-                // don't yet distinguish directories here (kernel
-                // surface returns just names). Good enough for libc
-                // readdir(); a richer surface comes when sys_readdir
-                // returns types alongside names.
+                // 24-byte WASI dirent header. d_type comes straight
+                // from the kernel's per-entry type byte (0/3/4/7);
+                // libc readdir() honors it and skips the per-entry
+                // stat fast-path miss when it's nonzero.
                 let mut hdr = [0u8; 24];
                 hdr[0..8].copy_from_slice(&((idx as u64) + 1).to_le_bytes());
                 // d_ino zero is fine for now.
                 hdr[16..20].copy_from_slice(&(nlen as u32).to_le_bytes());
-                hdr[20] = 4; // REGULAR_FILE
+                hdr[20] = ty;
                 if memory
                     .write(&mut caller, buf as usize + written, &hdr)
                     .is_err()

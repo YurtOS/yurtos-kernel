@@ -162,6 +162,17 @@ pub trait VfsBackend: Send {
         None
     }
 
+    /// Classify an entry by absolute (mount-relative) path. Returns
+    /// a WASI filetype byte: 0=UNKNOWN, 3=DIRECTORY, 4=REGULAR_FILE,
+    /// 7=SYMBOLIC_LINK. The dispatch layer pairs each name returned
+    /// from `readdir` with this byte so userland (libc readdir) sees
+    /// the right `d_type` and avoids an extra stat per entry.
+    /// Default: UNKNOWN — backends that don't implement it force
+    /// userland to stat for the truth, which is correct, just slow.
+    fn entry_type(&self, _path: &[u8]) -> u8 {
+        0
+    }
+
     /// Create a hard link at `link_path` pointing at the same inode
     /// as `target`. Both paths are absolute on the backend (already
     /// stripped of any mount prefix by the dispatch layer). Returns
@@ -337,6 +348,13 @@ impl MountTable {
     pub fn readdir(&self, path: &[u8]) -> Option<Vec<Vec<u8>>> {
         let (id, rel) = self.resolve(path)?;
         self.mounts[id as usize].backend.readdir(&rel)
+    }
+
+    pub fn entry_type(&self, path: &[u8]) -> u8 {
+        let Some((id, rel)) = self.resolve(path) else {
+            return 0;
+        };
+        self.mounts[id as usize].backend.entry_type(&rel)
     }
 
     /// Hard-link `link_path` to the same inode as `target`. Both
@@ -651,6 +669,18 @@ impl VfsBackend for RamfsBackend {
         self.paths.insert(link_path.to_vec(), id);
         *self.refcount.entry(id).or_insert(0) += 1;
         0
+    }
+
+    fn entry_type(&self, path: &[u8]) -> u8 {
+        if path == b"/" || self.dirs.contains(path) {
+            3 // DIRECTORY
+        } else if self.symlinks.contains_key(path) {
+            7 // SYMBOLIC_LINK
+        } else if self.paths.contains_key(path) {
+            4 // REGULAR_FILE
+        } else {
+            0
+        }
     }
 
     fn symlink(&mut self, target: &[u8], link_path: &[u8]) -> i32 {
@@ -1463,6 +1493,26 @@ impl VfsBackend for TarLayerBackend {
         entries.dedup();
         Some(entries)
     }
+
+    fn entry_type(&self, path: &[u8]) -> u8 {
+        if self.files.contains_key(path) {
+            return 4; // REGULAR_FILE
+        }
+        // Directory if any indexed file is under `path/`. Root is
+        // always a directory regardless of whether the archive
+        // happens to be empty.
+        if path == b"/" {
+            return 3;
+        }
+        let mut probe = path.to_vec();
+        probe.push(b'/');
+        for k in self.files.keys() {
+            if k.starts_with(&probe) {
+                return 3; // DIRECTORY
+            }
+        }
+        0
+    }
 }
 
 // ── Overlay backend (YURTFS L1 + L2 union) ────────────────────────
@@ -1710,5 +1760,16 @@ impl VfsBackend for OverlayBackend {
         entries.sort();
         entries.dedup();
         Some(entries)
+    }
+
+    fn entry_type(&self, path: &[u8]) -> u8 {
+        if self.whiteouts.contains(path) {
+            return 0;
+        }
+        let upper = self.upper.entry_type(path);
+        if upper != 0 {
+            return upper;
+        }
+        self.lower.entry_type(path)
     }
 }

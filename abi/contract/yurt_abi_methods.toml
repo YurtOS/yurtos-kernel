@@ -326,7 +326,7 @@ doc = "POSIX rmdir(path). Request bytes: path. Removes an empty directory. Retur
 [method.sys_readdir]
 id = 0x1_002B
 kind = "syscall"
-doc = "POSIX-shaped getdents. Request bytes: path. Response: count_le (u32) + (name_len_le u32, name_bytes)*. Caller checks the count, parses entries. Truncated when out_cap exceeded; the returned count reflects only what fit. Returns bytes-written on success, -ENOENT for unknown directory, -ENOTDIR if the path is a regular file."
+doc = "POSIX-shaped getdents. Request bytes: path. Response: count_le (u32) + (name_len_le u32, type u8, name_bytes)*. Type byte is a WASI filetype (0=UNKNOWN, 3=DIRECTORY, 4=REGULAR_FILE, 7=SYMBOLIC_LINK); userland fills d_type from it and avoids per-entry stat. Truncated when out_cap exceeded; the returned count reflects only what fit. Returns bytes-written on success, -ENOENT for unknown directory, -ENOTDIR if the path is a regular file."
 
 [method.sys_link]
 id = 0x1_002D
