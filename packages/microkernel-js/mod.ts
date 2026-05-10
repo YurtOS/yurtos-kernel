@@ -210,6 +210,18 @@ export interface TcpSocketImpl {
   listen(host: string, port: number, backlog: number): number;
   accept(handle: number, flags: number): number;
   localAddr(handle: number): { host: string; port: number } | null;
+  /**
+   * Optional async variants for hosts where the underlying
+   * primitive (Deno.connect, fetch + WebSocket, ...) returns a
+   * Promise. When present AND the host supports JSPI, the
+   * matching kh_socket_* import is wrapped with
+   * `WebAssembly.Suspending` and userland's syscall actually
+   * suspends until the I/O completes. Without JSPI these are
+   * ignored and the sync variants run.
+   */
+  connectAsync?(host: string, port: number, flags: number): Promise<number>;
+  recvAsync?(handle: number, buf: Uint8Array, flags: number): Promise<number>;
+  acceptAsync?(handle: number, flags: number): Promise<number>;
 }
 
 export interface HostState {
@@ -1193,9 +1205,15 @@ export class Microkernel {
     const W = (globalThis as any).WebAssembly;
     const hasJspi = typeof W?.Suspending === "function" &&
       typeof W?.promising === "function";
-    const wantsAsync = hasJspi && hostState.fetch != null;
-    if (wantsAsync) {
-      const fetchImpl = hostState.fetch!;
+    const tcpAsync = hostState.tcp;
+    const wantsAsync = hasJspi && (
+      hostState.fetch != null ||
+      tcpAsync?.connectAsync != null ||
+      tcpAsync?.recvAsync != null ||
+      tcpAsync?.acceptAsync != null
+    );
+    if (wantsAsync && hostState.fetch != null) {
+      const fetchImpl = hostState.fetch;
       // The Suspending wrapper takes an async function; the wasm
       // sees a normal sync import that may suspend the calling
       // stack until the promise resolves.
@@ -1222,6 +1240,57 @@ export class Microkernel {
             response,
           );
           return BigInt(response.byteLength);
+        },
+      );
+    }
+    if (wantsAsync && tcpAsync?.connectAsync != null) {
+      const connectAsync = tcpAsync.connectAsync.bind(tcpAsync);
+      khImports.kh_socket_connect = new W.Suspending(
+        async (
+          addrPtr: number,
+          addrLen: number,
+          flags: number,
+        ): Promise<number> => {
+          const addr = new TextDecoder().decode(
+            new Uint8Array(memoryRef.memory!.buffer, addrPtr, addrLen),
+          );
+          const colon = addr.lastIndexOf(":");
+          if (colon < 0) return -22;
+          const host = addr.slice(0, colon);
+          const port = parseInt(addr.slice(colon + 1), 10);
+          if (!Number.isFinite(port)) return -22;
+          if (
+            hostBox.state.policy.mayConnect?.(host, port) === "deny"
+          ) return -EACCES;
+          return await connectAsync(host, port, flags);
+        },
+      );
+    }
+    if (wantsAsync && tcpAsync?.recvAsync != null) {
+      const recvAsync = tcpAsync.recvAsync.bind(tcpAsync);
+      khImports.kh_socket_recv = new W.Suspending(
+        async (
+          handle: number,
+          outPtr: number,
+          len: number,
+          flags: number,
+        ): Promise<bigint> => {
+          const buf = new Uint8Array(len);
+          const n = await recvAsync(handle, buf, flags);
+          if (n > 0) {
+            new Uint8Array(memoryRef.memory!.buffer, outPtr, n).set(
+              buf.subarray(0, n),
+            );
+          }
+          return BigInt(n);
+        },
+      );
+    }
+    if (wantsAsync && tcpAsync?.acceptAsync != null) {
+      const acceptAsync = tcpAsync.acceptAsync.bind(tcpAsync);
+      khImports.kh_socket_accept_blocking = new W.Suspending(
+        async (handle: number, flags: number): Promise<number> => {
+          return await acceptAsync(handle, flags);
         },
       );
     }
