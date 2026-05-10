@@ -40,6 +40,8 @@ const SYS_NAMESPACE: &str = "env";
 const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
 const EACCES: i64 = 13;
+const EBADF: i64 = 9;
+const EINVAL: i64 = 22;
 
 /// Public re-export so the engine adapter (`engine::WasmtimeCtx`)
 /// can return the same EFAULT value our trampoline uses internally.
@@ -262,6 +264,24 @@ pub struct HostState {
     /// override via `Microkernel::with_host_state_mut` or by
     /// constructing a custom HostState.
     pub policy: Arc<dyn PolicyEnforcer>,
+    /// Filesystem root for `kh_real_*`. When `None`, every host-fs
+    /// open returns -EACCES (the safe default). When set,
+    /// `kh_real_open` joins this path with the user-supplied
+    /// relative path; canonicalized result must stay under the
+    /// root (escape protection — `..` traversal that climbs above
+    /// the root is rejected). Embedders that want full host fs
+    /// access leave `host_fs_root = Some(PathBuf::from("/"))` and
+    /// rely on `PolicyEnforcer::may_open_path` for filtering.
+    pub host_fs_root: Option<PathBuf>,
+    /// Open host-side file descriptors keyed by the kh-fd handed
+    /// out from `kh_real_open`. The `i32` keys are also the
+    /// `inode` values surfaced through HostFsBackend. Mutated by
+    /// every `kh_real_open` / `kh_real_close`.
+    pub host_fs_handles: std::collections::BTreeMap<i32, std::fs::File>,
+    /// Counter for the next `kh_real_open` allocation. Starts at 1
+    /// so positive returns are non-zero (matches POSIX-fd
+    /// convention; negative is reserved for errors).
+    pub next_host_fd: i32,
 }
 
 impl Default for HostState {
@@ -271,6 +291,9 @@ impl Default for HostState {
             extensions: Arc::new(EmptyExtensionRegistry),
             log_sink: Arc::new(DiscardLogSink),
             policy: Arc::new(AllowAllPolicy),
+            host_fs_root: None,
+            host_fs_handles: std::collections::BTreeMap::new(),
+            next_host_fd: 1,
         }
     }
 }
@@ -825,6 +848,137 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 return -EFAULT;
             }
             written
+        },
+    )?;
+    // ── Real-disk host FS imports ──────────────────────────────────
+    //
+    // kh_real_open / kh_real_read / kh_real_close back the
+    // HostFsBackend in kernel.wasm. Each open is double-gated:
+    //   1. HostState.host_fs_root must be Some (no root → EACCES).
+    //   2. PolicyEnforcer.may_open_path must Allow.
+    // The relative path the kernel sends is joined against the root
+    // and canonicalized; results that escape the root via `..`
+    // traversal are rejected. fd handles are u31 (positive i32)
+    // tracked in HostState.host_fs_handles; close removes the entry.
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_real_open",
+        |mut caller: Caller<'_, KernelStoreData>,
+         path_ptr: u32,
+         path_len: u32,
+         _flags: u32,
+         _mode: u32|
+         -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -(EFAULT as i32),
+            };
+            let mut path = vec![0u8; path_len as usize];
+            if path_len > 0 && memory.read(&caller, path_ptr as usize, &mut path).is_err() {
+                return -(EFAULT as i32);
+            }
+            // Phase 5: read-only opens only. Embedder can deny by
+            // leaving host_fs_root None or via policy.
+            let root = match caller.data().host.host_fs_root.clone() {
+                Some(r) => r,
+                None => return -(EACCES as i32),
+            };
+            // Treat the kernel-supplied path as relative; strip a
+            // leading slash if present so `root.join` keeps us under
+            // the root. Future writable opens add the write bit to
+            // policy.may_open_path's `write` arg.
+            if caller
+                .data()
+                .host
+                .policy
+                .may_open_path(&path, false)
+                == PolicyDecision::Deny
+            {
+                return -(EACCES as i32);
+            }
+            let rel: &[u8] = if path.starts_with(b"/") { &path[1..] } else { &path };
+            let rel_str = match std::str::from_utf8(rel) {
+                Ok(s) => s,
+                Err(_) => return -(EINVAL as i32),
+            };
+            let candidate = root.join(rel_str);
+            // Escape protection: canonicalize and verify the result
+            // is under root. `canonicalize` requires the file exist —
+            // if it doesn't, that's also -ENOENT.
+            let resolved = match candidate.canonicalize() {
+                Ok(p) => p,
+                Err(_) => return -(ENOENT as i32),
+            };
+            let root_canon = match root.canonicalize() {
+                Ok(p) => p,
+                Err(_) => return -(EACCES as i32),
+            };
+            if !resolved.starts_with(&root_canon) {
+                return -(EACCES as i32);
+            }
+            let file = match std::fs::File::open(&resolved) {
+                Ok(f) => f,
+                Err(e) => {
+                    return match e.kind() {
+                        std::io::ErrorKind::NotFound => -(ENOENT as i32),
+                        std::io::ErrorKind::PermissionDenied => -(EACCES as i32),
+                        _ => -(EFAULT as i32),
+                    };
+                }
+            };
+            let host = caller.data_mut();
+            let fd = host.host.next_host_fd;
+            host.host.next_host_fd = host.host.next_host_fd.saturating_add(1);
+            host.host.host_fs_handles.insert(fd, file);
+            fd
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_real_read",
+        |mut caller: Caller<'_, KernelStoreData>,
+         fd: i32,
+         out_ptr: u32,
+         len: u32|
+         -> i64 {
+            use std::io::Read;
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            let mut buf = vec![0u8; len as usize];
+            // Read the file. Hold a mutable borrow on host state
+            // for the duration so the same fd isn't read twice
+            // concurrently from the (single-threaded) kernel side.
+            let n = {
+                let file = match caller.data_mut().host.host_fs_handles.get_mut(&fd) {
+                    Some(f) => f,
+                    None => return -(EBADF as i64),
+                };
+                match file.read(&mut buf) {
+                    Ok(n) => n,
+                    Err(_) => return -EFAULT,
+                }
+            };
+            if n > 0
+                && memory
+                    .write(&mut caller, out_ptr as usize, &buf[..n])
+                    .is_err()
+            {
+                return -EFAULT;
+            }
+            n as i64
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_real_close",
+        |mut caller: Caller<'_, KernelStoreData>, fd: i32| -> i32 {
+            // Remove the entry; Drop closes the file. Returning the
+            // count keeps caller-visible behavior the same whether or
+            // not the fd existed (best-effort close, like POSIX).
+            caller.data_mut().host.host_fs_handles.remove(&fd);
+            0
         },
     )?;
     Ok(())

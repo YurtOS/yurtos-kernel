@@ -301,6 +301,13 @@ impl Kernel {
         // VfsBackend trait; dispatch never special-cases their paths.
         vfs.add_mount(b"/dev".to_vec(), Box::new(crate::vfs::DevBackend::new()));
         vfs.add_mount(b"/proc".to_vec(), Box::new(crate::vfs::ProcBackend::new()));
+        // Real-disk mount. The backend's lookup hits kh_real_open;
+        // the microkernel gates each open through PolicyEnforcer +
+        // an embedder-supplied filesystem root. With no root
+        // configured the host returns -EACCES → lookup misses →
+        // sys_open sees -ENOENT, so non-host-fs embedders see no
+        // behavior change beyond /host paths returning -ENOENT.
+        vfs.add_mount(b"/host".to_vec(), Box::new(crate::vfs::HostFsBackend::new()));
         Self {
             processes: BTreeMap::new(),
             pipes: BTreeMap::new(),

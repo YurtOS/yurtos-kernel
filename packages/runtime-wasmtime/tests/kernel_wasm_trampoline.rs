@@ -131,7 +131,19 @@ fn kernel_wasm_imports_match_documented_namespaces() {
     wasi_imports.sort();
     assert_eq!(
         kh_imports,
-        vec!["kh_extension_invoke", "kh_log", "kh_now_realtime"],
+        vec![
+            "kh_extension_invoke",
+            "kh_log",
+            "kh_now_realtime",
+            // kh_real_* land via the HostFsBackend mount at /host;
+            // kernel.wasm imports them so the backend can open/
+            // read/close real-disk files. Phase 5 surface — write
+            // counterparts arrive when the OFD-backed write path
+            // does.
+            "kh_real_close",
+            "kh_real_open",
+            "kh_real_read",
+        ],
         "documented kh_* surface"
     );
     // We don't pin the exact wasi import set (std internals can vary
@@ -353,6 +365,116 @@ fn policy_can_deny_extension_invoke_at_kh_boundary() {
         registry_calls_before, registry_calls_after,
         "denied request must not reach the registry"
     );
+}
+
+#[test]
+fn host_fs_backend_reads_real_file_via_kh_real_open() {
+    // End-to-end: write a tempdir + file on disk; configure
+    // HostState.host_fs_root; sys_open /host/<rel> goes through
+    // HostFsBackend → kh_real_open → kh_real_read → returns bytes.
+    use std::fs;
+    use std::io::Write;
+    build_kernel_wasm().unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "yurt-host-fs-test-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let file_path = dir.join("greeting.txt");
+    {
+        let mut f = fs::File::create(&file_path).unwrap();
+        f.write_all(b"hello from real disk\n").unwrap();
+    }
+
+    let mut host = HostState::default();
+    host.host_fs_root = Some(dir.clone());
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+
+    // Open /host/greeting.txt — HostFsBackend strips /host and
+    // asks the host for /greeting.txt under the configured root.
+    let mut req = 0_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"/host/greeting.txt");
+    let fd = mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap();
+    assert!(fd >= 0, "open succeeded: fd = {fd}");
+
+    // Read its content back.
+    let mut buf = vec![0u8; 64];
+    let n = mk
+        .syscall(METHOD_SYS_READ, &(fd as u32).to_le_bytes(), &mut buf)
+        .unwrap();
+    assert!(n > 0, "read returned bytes: n = {n}");
+    assert_eq!(&buf[..n as usize], b"hello from real disk\n");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn host_fs_returns_enoent_without_a_root_configured() {
+    // Default HostState has host_fs_root = None → kh_real_open
+    // returns -EACCES → HostFsBackend.lookup returns None → sys_open
+    // sees -ENOENT.
+    let mk = fresh_microkernel(0);
+    let mut req = 0_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"/host/anywhere");
+    let rc = mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap();
+    assert_eq!(rc, -2, "no host_fs_root → -ENOENT, got {rc}");
+}
+
+#[test]
+fn host_fs_policy_can_deny_specific_paths() {
+    use yurt_runtime_wasmtime::microkernel::{PolicyDecision, PolicyEnforcer};
+    // Policy that says yes to "greeting.txt" and no to "secret.txt".
+    struct Allowlist;
+    impl PolicyEnforcer for Allowlist {
+        fn may_open_path(&self, path: &[u8], _write: bool) -> PolicyDecision {
+            if path == b"/greeting.txt" {
+                PolicyDecision::Allow
+            } else {
+                PolicyDecision::Deny
+            }
+        }
+    }
+    use std::fs;
+    use std::io::Write;
+    build_kernel_wasm().unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "yurt-host-fs-policy-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    {
+        let mut f = fs::File::create(dir.join("greeting.txt")).unwrap();
+        f.write_all(b"ok").unwrap();
+    }
+    {
+        let mut f = fs::File::create(dir.join("secret.txt")).unwrap();
+        f.write_all(b"nope").unwrap();
+    }
+
+    let mut host = HostState::default();
+    host.host_fs_root = Some(dir.clone());
+    host.policy = Arc::new(Allowlist);
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+
+    // Allowed.
+    let mut ok = 0_u32.to_le_bytes().to_vec();
+    ok.extend_from_slice(b"/host/greeting.txt");
+    let fd = mk.syscall(METHOD_SYS_OPEN, &ok, &mut []).unwrap();
+    assert!(fd >= 0);
+
+    // Denied → policy returns -EACCES at kh_real_open → backend
+    // returns None → sys_open emits -ENOENT (the kernel doesn't
+    // see the policy verdict, only the lookup miss).
+    let mut deny = 0_u32.to_le_bytes().to_vec();
+    deny.extend_from_slice(b"/host/secret.txt");
+    let rc = mk.syscall(METHOD_SYS_OPEN, &deny, &mut []).unwrap();
+    assert_eq!(rc, -2, "policy-denied path → -ENOENT, got {rc}");
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

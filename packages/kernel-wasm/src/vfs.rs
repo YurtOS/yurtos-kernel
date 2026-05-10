@@ -56,8 +56,11 @@ pub struct ProcessSnapshot {
 /// backend internals.
 pub trait VfsBackend: Send {
     /// Resolve a path *relative to this mount* to an inode id, or
-    /// `None` if the path doesn't exist.
-    fn lookup(&self, path: &[u8]) -> Option<u64>;
+    /// `None` if the path doesn't exist. Takes `&mut self` because
+    /// some backends (HostFsBackend) need to open + cache the
+    /// underlying handle on first lookup; pure-storage backends
+    /// (ramfs) only mutate when they have to.
+    fn lookup(&mut self, path: &[u8]) -> Option<u64>;
 
     /// Create a fresh empty file at `path`, returning its inode id.
     /// Used by `sys_open` when O_CREAT is set and the path is missing.
@@ -223,8 +226,9 @@ impl MountTable {
     #[cfg(test)]
     pub fn clear(&mut self) {
         // Reset the table to its boot-time shape: fresh ramfs at /,
-        // fresh DevBackend at /dev, fresh ProcBackend at /proc.
-        // Drops any extra mounts that tests may have added.
+        // fresh DevBackend at /dev, fresh ProcBackend at /proc,
+        // fresh HostFsBackend at /host. Drops any extra mounts that
+        // tests may have added.
         self.mounts.clear();
         self.mounts.push(Mount {
             prefix: b"/".to_vec(),
@@ -237,6 +241,10 @@ impl MountTable {
         self.mounts.push(Mount {
             prefix: b"/proc".to_vec(),
             backend: Box::new(ProcBackend::new()),
+        });
+        self.mounts.push(Mount {
+            prefix: b"/host".to_vec(),
+            backend: Box::new(HostFsBackend::new()),
         });
     }
 }
@@ -312,7 +320,7 @@ impl Default for DevBackend {
 }
 
 impl VfsBackend for DevBackend {
-    fn lookup(&self, path: &[u8]) -> Option<u64> {
+    fn lookup(&mut self, path: &[u8]) -> Option<u64> {
         match path {
             b"/null" => Some(DEV_NULL_INODE),
             b"/zero" => Some(DEV_ZERO_INODE),
@@ -356,7 +364,7 @@ impl VfsBackend for DevBackend {
 }
 
 impl VfsBackend for RamfsBackend {
-    fn lookup(&self, path: &[u8]) -> Option<u64> {
+    fn lookup(&mut self, path: &[u8]) -> Option<u64> {
         self.paths.get(path).copied()
     }
 
@@ -538,7 +546,7 @@ impl Default for ProcBackend {
 }
 
 impl VfsBackend for ProcBackend {
-    fn lookup(&self, path: &[u8]) -> Option<u64> {
+    fn lookup(&mut self, path: &[u8]) -> Option<u64> {
         self.entries.get(path).map(|(id, _)| *id)
     }
 
@@ -605,5 +613,140 @@ impl VfsBackend for ProcBackend {
             }
         }
         self.entries = new_entries;
+    }
+}
+
+// ── Host-FS backend ───────────────────────────────────────────────
+//
+// Mounts a real-disk subtree at a given prefix (e.g. /host/data).
+// Path lookups translate to `kh_real_open` calls; reads to
+// `kh_real_read`; close to `kh_real_close`. The host (microkernel)
+// gates every open through `PolicyEnforcer::may_open_path` and
+// translates the relative path against an embedder-supplied root —
+// the kernel never sees absolute host paths.
+//
+// Inode ids are the host fd handles. Each lookup → host-fd pair is
+// tracked here so subsequent reads + close can find them. Reads
+// pull bytes via kh_real_read until EOF (no offset support yet —
+// host-fs OFDs always read sequentially through this backend).
+
+pub struct HostFsBackend {
+    /// inode id (== host fd, as i32 widened to u64) → cached size
+    /// after first stat-via-read; None until known.
+    fds: BTreeMap<u64, HostFsHandle>,
+    /// Path → inode id (host fd). Stable for the lifetime of the
+    /// open; lookups for the same path return the same fd until
+    /// close.
+    paths: BTreeMap<Vec<u8>, u64>,
+}
+
+#[derive(Debug)]
+struct HostFsHandle {
+    /// Cumulative bytes consumed from the host file. Tracks EOF
+    /// detection — read returning 0 marks the file fully drained
+    /// and unblocks size queries.
+    drained: u64,
+    eof_seen: bool,
+}
+
+impl HostFsBackend {
+    pub fn new() -> Self {
+        Self {
+            fds: BTreeMap::new(),
+            paths: BTreeMap::new(),
+        }
+    }
+}
+
+impl Default for HostFsBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VfsBackend for HostFsBackend {
+    fn lookup(&mut self, path: &[u8]) -> Option<u64> {
+        // Cached: re-use the existing host-fd / inode mapping.
+        if let Some(&inode) = self.paths.get(path) {
+            return Some(inode);
+        }
+        // Cold path: ask the host. The microkernel applies the
+        // policy gate (`PolicyEnforcer::may_open_path`) before
+        // touching the real disk — a Deny returns -EACCES which
+        // we map to None (lookup miss → ENOENT in the syscall).
+        // Real ENOENTs from the host filesystem also surface as
+        // None here.
+        let host_fd = crate::kh::real_open(path, 0, 0);
+        if host_fd < 0 {
+            return None;
+        }
+        let inode = host_fd as u64;
+        self.paths.insert(path.to_vec(), inode);
+        self.fds.insert(
+            inode,
+            HostFsHandle {
+                drained: 0,
+                eof_seen: false,
+            },
+        );
+        Some(inode)
+    }
+
+    fn create(&mut self, path: &[u8]) -> Option<u64> {
+        // Host-fs "create" today is the same as lookup — there's
+        // no kh_real_open(O_CREAT) wired yet, so attempting to
+        // create a path that doesn't exist on the host fails. When
+        // kh_real_create lands this becomes a separate path with
+        // O_CREAT|O_TRUNC|O_WRONLY semantics.
+        self.lookup(path)
+    }
+
+    fn truncate(&mut self, _inode: u64) {
+        // Read-only mount; truncate is a no-op.
+    }
+
+    fn read(&self, inode: u64, _offset: u64, buf: &mut [u8]) -> i64 {
+        // Note: offset is ignored — host-fs reads sequentially.
+        // The OFD's offset still advances on the kernel side, but
+        // it doesn't drive position here. sys_lseek on a host-fs
+        // file is therefore a no-op until kh_real_seek lands.
+        if !self.fds.contains_key(&inode) {
+            return -(crate::abi::EBADF as i64);
+        }
+        crate::kh::real_read(inode as i32, buf)
+    }
+
+    fn write(&mut self, _inode: u64, _offset: u64, _payload: &[u8]) -> i64 {
+        // Read-only Phase 5 surface — kh_real_write isn't wired yet.
+        -(crate::abi::EBADF as i64)
+    }
+
+    fn size(&self, _inode: u64) -> Option<u64> {
+        // Phase 5: host-fs doesn't expose stat through this trait
+        // yet. fstat on a host-fs fd reports size 0. Real stat
+        // wires through kh_real_stat in a follow-up slice.
+        Some(0)
+    }
+}
+
+impl Drop for HostFsBackend {
+    fn drop(&mut self) {
+        // Best-effort close every open host-fd when the backend
+        // goes away. Errors are dropped — the host is the only
+        // party that can reasonably react.
+        for (&inode, _) in &self.fds {
+            let _ = crate::kh::real_close(inode as i32);
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl HostFsHandle {
+    fn note_progress(&mut self, n: i64) {
+        if n == 0 {
+            self.eof_seen = true;
+        } else if n > 0 {
+            self.drained = self.drained.saturating_add(n as u64);
+        }
     }
 }

@@ -17,6 +17,9 @@ extern "C" {
         out_cap: usize,
     ) -> i64;
     fn kh_log(severity: u32, msg_ptr: *const u8, msg_len: usize) -> i32;
+    fn kh_real_open(path_ptr: *const u8, path_len: usize, flags: u32, mode: u32) -> i32;
+    fn kh_real_read(fd: i32, out_ptr: *mut u8, len: usize) -> i64;
+    fn kh_real_close(fd: i32) -> i32;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -42,6 +45,26 @@ unsafe fn kh_extension_invoke(
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_log(_severity: u32, _msg_ptr: *const u8, _msg_len: usize) -> i32 {
     0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_real_open(
+    _path_ptr: *const u8,
+    _path_len: usize,
+    _flags: u32,
+    _mode: u32,
+) -> i32 {
+    -38 // -ENOSYS
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_real_read(_fd: i32, _out_ptr: *mut u8, _len: usize) -> i64 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_real_close(_fd: i32) -> i32 {
+    -38
 }
 
 /// Wall-clock time in nanoseconds since the Unix epoch.
@@ -89,4 +112,24 @@ pub fn log(severity: LogSeverity, msg: &str) {
     unsafe {
         let _ = kh_log(severity as u32, bytes.as_ptr(), bytes.len());
     }
+}
+
+/// Open a host-fs path via the microkernel. Returns a non-negative
+/// host-fd handle or a negated POSIX errno (e.g. -EACCES from the
+/// policy gate, -ENOENT from the host filesystem). flags / mode use
+/// POSIX values; bit 0 = writable, identical to sys_open.
+pub fn real_open(path: &[u8], flags: u32, mode: u32) -> i32 {
+    unsafe { kh_real_open(path.as_ptr(), path.len(), flags, mode) }
+}
+
+/// Read up to `buf.len()` bytes from a host-fd. Returns bytes read
+/// (0 = EOF) or negated errno.
+pub fn real_read(fd: i32, buf: &mut [u8]) -> i64 {
+    unsafe { kh_real_read(fd, buf.as_mut_ptr(), buf.len()) }
+}
+
+/// Close a host-fd. Best-effort; failures are surfaced but most
+/// callers ignore.
+pub fn real_close(fd: i32) -> i32 {
+    unsafe { kh_real_close(fd) }
 }

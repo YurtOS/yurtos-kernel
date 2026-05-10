@@ -461,6 +461,19 @@ export class Microkernel {
         hostBox.state.logSink.emit(severity, message);
         return 0;
       },
+      // Real-disk imports. Phase 5 in microkernel-js: stubs that
+      // return -EACCES until the host-fs bridge is wired (Deno
+      // can serve these via Deno.openSync; browsers via OPFS).
+      // Same shape as the Rust microkernel-wasmtime impl.
+      kh_real_open: (
+        _pathPtr: number,
+        _pathLen: number,
+        _flags: number,
+        _mode: number,
+      ): number => -EACCES,
+      kh_real_read: (_fd: number, _outPtr: number, _len: number): bigint =>
+        BigInt(-EACCES),
+      kh_real_close: (_fd: number): number => 0,
       kh_extension_invoke: (
         reqPtr: number,
         reqLen: number,
