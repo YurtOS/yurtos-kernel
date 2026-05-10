@@ -30,6 +30,21 @@
 
 use std::collections::BTreeMap;
 
+/// Lightweight, copy-friendly snapshot of one process's metadata.
+/// Backends that want to surface live process state (`/proc`)
+/// receive these via [`VfsBackend::refresh_processes`].
+#[derive(Clone, Debug)]
+pub struct ProcessSnapshot {
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub pgid: u32,
+    pub sid: u32,
+}
+
 /// What every concrete filesystem backend implements. The kernel
 /// dispatch layer only ever calls these methods — it never inspects
 /// backend internals.
@@ -59,6 +74,14 @@ pub trait VfsBackend: Send {
     /// Current size of the file in bytes, or `None` if the inode
     /// is unknown.
     fn size(&self, inode: u64) -> Option<u64>;
+
+    /// Optional hook: receive a fresh snapshot of the kernel's
+    /// process table. Backends that surface live process state
+    /// (procfs) refresh internal caches; default no-op for everyone
+    /// else. Called from the dispatch layer before /proc-touching
+    /// syscalls (we just call it on every sys_open today — the cost
+    /// is one no-op closure for non-proc backends).
+    fn refresh_processes(&mut self, _snapshots: &[ProcessSnapshot]) {}
 }
 
 /// One row in the mount table.
@@ -182,11 +205,20 @@ impl MountTable {
         self.mounts.get(mount_id as usize).and_then(|m| m.backend.size(inode))
     }
 
+    /// Push a fresh snapshot of the kernel's process table to every
+    /// mounted backend. Called from dispatch before /proc-touching
+    /// syscalls so procfs serves up-to-date contents.
+    pub fn refresh_processes(&mut self, snapshots: &[ProcessSnapshot]) {
+        for m in &mut self.mounts {
+            m.backend.refresh_processes(snapshots);
+        }
+    }
+
     #[cfg(test)]
     pub fn clear(&mut self) {
         // Reset the table to its boot-time shape: fresh ramfs at /,
-        // fresh DevBackend at /dev. Drops any extra mounts that tests
-        // may have added.
+        // fresh DevBackend at /dev, fresh ProcBackend at /proc.
+        // Drops any extra mounts that tests may have added.
         self.mounts.clear();
         self.mounts.push(Mount {
             prefix: b"/".to_vec(),
@@ -195,6 +227,10 @@ impl MountTable {
         self.mounts.push(Mount {
             prefix: b"/dev".to_vec(),
             backend: Box::new(DevBackend::new()),
+        });
+        self.mounts.push(Mount {
+            prefix: b"/proc".to_vec(),
+            backend: Box::new(ProcBackend::new()),
         });
     }
 }
@@ -394,5 +430,120 @@ mod tests {
         let mt = MountTable::new(Box::new(RamfsBackend::new()));
         assert_eq!(ROOT_MOUNT, 0);
         let _ = mt; // keep MountTable construction tested.
+    }
+}
+
+// ── /proc backend ──────────────────────────────────────────────────
+//
+// Mounted at "/proc". Linux-style: per-pid synthetic files generated
+// from a snapshot of the kernel's process table. Phase 4 surface:
+//
+//   /proc/<pid>/status — Linux-style multi-line key:value text
+//
+// (`/proc/self/...` resolution happens at the dispatch layer, not
+// here — `caller_pid` lives there and the substitution is trivial.)
+//
+// Snapshots are pushed from dispatch via `refresh_processes` before
+// each /proc-touching syscall. Inode ids are stable for a given path
+// across refreshes so an open fd keeps reading the path you opened —
+// even though the *content* is regenerated when you call sys_read.
+
+pub struct ProcBackend {
+    /// path → (inode_id, current_content). Both fields refresh on
+    /// `refresh_processes`. Inode id stays stable across refreshes
+    /// for the same path so existing OFDs don't dangle.
+    entries: BTreeMap<Vec<u8>, (u64, Vec<u8>)>,
+    /// Path → stable inode id (preserved across refreshes).
+    inodes: BTreeMap<Vec<u8>, u64>,
+    next_id: u64,
+}
+
+impl ProcBackend {
+    pub fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            inodes: BTreeMap::new(),
+            next_id: 1,
+        }
+    }
+
+    /// Format the per-pid status content. Linux-shaped subset.
+    fn format_status(p: &ProcessSnapshot) -> Vec<u8> {
+        let mut s = String::new();
+        s.push_str(&format!("Pid:\t{}\n", p.pid));
+        s.push_str(&format!("PPid:\t{}\n", p.ppid));
+        // Real / effective / saved (we don't track saved yet — repeat euid)
+        s.push_str(&format!("Uid:\t{}\t{}\t{}\t{}\n", p.uid, p.euid, p.euid, p.euid));
+        s.push_str(&format!("Gid:\t{}\t{}\t{}\t{}\n", p.gid, p.egid, p.egid, p.egid));
+        s.push_str(&format!("Pgid:\t{}\n", p.pgid));
+        s.push_str(&format!("Sid:\t{}\n", p.sid));
+        s.into_bytes()
+    }
+}
+
+impl Default for ProcBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VfsBackend for ProcBackend {
+    fn lookup(&self, path: &[u8]) -> Option<u64> {
+        self.entries.get(path).map(|(id, _)| *id)
+    }
+
+    fn create(&mut self, _path: &[u8]) -> Option<u64> {
+        // /proc is a synthetic namespace; userland can't add files.
+        None
+    }
+
+    fn truncate(&mut self, _inode: u64) {}
+
+    fn read(&self, inode: u64, offset: u64, buf: &mut [u8]) -> i64 {
+        // Linear scan — Phase 4 has at most a handful of entries.
+        for (_path, (id, content)) in &self.entries {
+            if *id == inode {
+                let start = (offset as usize).min(content.len());
+                let n = (content.len() - start).min(buf.len());
+                if n > 0 {
+                    buf[..n].copy_from_slice(&content[start..start + n]);
+                }
+                return n as i64;
+            }
+        }
+        -(crate::abi::EBADF as i64)
+    }
+
+    fn write(&mut self, _inode: u64, _offset: u64, _payload: &[u8]) -> i64 {
+        // /proc files are read-only at this layer.
+        -(crate::abi::EBADF as i64)
+    }
+
+    fn size(&self, inode: u64) -> Option<u64> {
+        self.entries
+            .iter()
+            .find(|(_p, (id, _c))| *id == inode)
+            .map(|(_p, (_id, c))| c.len() as u64)
+    }
+
+    fn refresh_processes(&mut self, snapshots: &[ProcessSnapshot]) {
+        // Drop entries for pids no longer in the snapshot, regenerate
+        // content for those still present, leave the inode-id mapping
+        // intact so any open fd survives a refresh.
+        let mut new_entries: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        for snap in snapshots {
+            let path = format!("/{}/status", snap.pid).into_bytes();
+            let id = match self.inodes.get(&path) {
+                Some(&id) => id,
+                None => {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    self.inodes.insert(path.clone(), id);
+                    id
+                }
+            };
+            new_entries.insert(path, (id, Self::format_status(snap)));
+        }
+        self.entries = new_entries;
     }
 }

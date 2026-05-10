@@ -291,10 +291,10 @@ impl Kernel {
     fn new() -> Self {
         let mut vfs =
             crate::vfs::MountTable::new(Box::new(crate::vfs::RamfsBackend::new()));
-        // Linux-style virtual mounts. /dev gives us a non-ramfs backend
-        // that exercises the trait surface; /proc lands later when we
-        // need per-pid introspection.
+        // Linux-style virtual mounts. Both backends slot in via the
+        // VfsBackend trait; dispatch never special-cases their paths.
         vfs.add_mount(b"/dev".to_vec(), Box::new(crate::vfs::DevBackend::new()));
+        vfs.add_mount(b"/proc".to_vec(), Box::new(crate::vfs::ProcBackend::new()));
         Self {
             processes: BTreeMap::new(),
             pipes: BTreeMap::new(),
@@ -342,6 +342,28 @@ impl Kernel {
         if let Some(ofd) = self.ofds.get_mut(&id) {
             ofd.refs += 1;
         }
+    }
+
+    /// Build a snapshot of the live process table and push it to
+    /// every mounted backend. Backends that don't care (everyone
+    /// except procfs today) get a default no-op. Called from
+    /// dispatch before /proc-touching syscalls.
+    pub fn publish_proc_snapshots(&mut self) {
+        let snaps: Vec<crate::vfs::ProcessSnapshot> = self
+            .processes
+            .iter()
+            .map(|(pid, p)| crate::vfs::ProcessSnapshot {
+                pid: *pid,
+                ppid: 0, // no process tree yet — every process is a child of the kernel
+                uid: p.credentials.uid,
+                euid: p.credentials.euid,
+                gid: p.credentials.gid,
+                egid: p.credentials.egid,
+                pgid: if p.pgid == 0 { *pid } else { p.pgid },
+                sid: if p.sid == 0 { *pid } else { p.sid },
+            })
+            .collect();
+        self.vfs.refresh_processes(&snaps);
     }
 
     /// Decrement the refcount. Frees the OFD when it hits 0.

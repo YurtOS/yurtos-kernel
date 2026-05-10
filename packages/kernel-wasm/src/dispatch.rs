@@ -718,14 +718,31 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let flags = u32::from_le_bytes(request[0..4].try_into().unwrap());
-    let path = &request[4..];
-    if path.is_empty() {
+    let raw_path = &request[4..];
+    if raw_path.is_empty() {
         return -(abi::EINVAL as i64);
     }
+    // /proc/self/<x> → /proc/<caller_pid>/<x>. Linux convention; the
+    // expansion happens at the dispatch layer so ProcBackend doesn't
+    // need to know the caller. Path bytes are not guaranteed UTF-8;
+    // we rewrite as raw bytes.
+    let path_owned: Vec<u8>;
+    let path: &[u8] = if let Some(suffix) = raw_path.strip_prefix(b"/proc/self") {
+        let prefix = format!("/proc/{caller_pid}");
+        let mut buf = prefix.into_bytes();
+        buf.extend_from_slice(suffix);
+        path_owned = buf;
+        &path_owned
+    } else {
+        raw_path
+    };
     let writable = flags & 0b001 != 0;
     let create = flags & 0b010 != 0;
     let trunc = flags & 0b100 != 0;
     with_kernel(|k| {
+        // Refresh procfs snapshots so /proc/<N>/status reflects the
+        // current process table at open time.
+        k.publish_proc_snapshots();
         let (mount_id, inode) = match k.vfs.lookup(path) {
             Some(pair) => pair,
             None => {
@@ -2161,6 +2178,93 @@ mod tests {
         let mut buf = [0u8; 16];
         let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
         assert_eq!(&buf[..n as usize], b"horns");
+    }
+
+    #[test]
+    fn proc_self_status_routes_through_caller_pid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // First touch a syscall that lazy-inserts pid 7 into the
+        // kernel's process map. getpid is a pure caller_pid pass-
+        // through so it doesn't qualify; getuid does (it reads from
+        // process_mut, which lazy-creates).
+        assert_eq!(dispatch(METHOD_SYS_GETUID, 7, &[], &mut []), 1000);
+
+        // Open /proc/self/status as pid 7 → resolves to /proc/7/status.
+        let fd = dispatch(
+            METHOD_SYS_OPEN,
+            7,
+            &open_req(0, b"/proc/self/status"),
+            &mut [],
+        );
+        assert!(fd >= 0, "open /proc/self/status: fd = {fd}");
+
+        // Read content and verify the expected lines.
+        let mut buf = [0u8; 256];
+        let n = dispatch(METHOD_SYS_READ, 7, &(fd as u32).to_le_bytes(), &mut buf);
+        assert!(n > 0);
+        let text = std::str::from_utf8(&buf[..n as usize]).unwrap();
+        assert!(text.contains("Pid:\t7\n"), "expected Pid:\\t7 in: {text}");
+        assert!(text.contains("Uid:\t1000"), "expected default uid in: {text}");
+    }
+
+    #[test]
+    fn proc_status_reflects_setresuid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // Touch pid 5 to register it, then change its uid.
+        assert_eq!(dispatch(METHOD_SYS_GETUID, 5, &[], &mut []), 1000);
+        let mut req = Vec::new();
+        req.extend_from_slice(&500_u32.to_le_bytes());
+        req.extend_from_slice(&501_u32.to_le_bytes());
+        req.extend_from_slice(&502_u32.to_le_bytes());
+        dispatch(METHOD_SYS_SETRESUID, 5, &req, &mut []);
+
+        // Re-open /proc/5/status — open-time refresh picks up new uid.
+        let fd = dispatch(
+            METHOD_SYS_OPEN,
+            5,
+            &open_req(0, b"/proc/5/status"),
+            &mut [],
+        );
+        let mut buf = [0u8; 256];
+        let n = dispatch(METHOD_SYS_READ, 5, &(fd as u32).to_le_bytes(), &mut buf);
+        let text = std::str::from_utf8(&buf[..n as usize]).unwrap();
+        assert!(text.contains("Uid:\t500\t501"), "uid update missing: {text}");
+    }
+
+    #[test]
+    fn proc_unknown_pid_returns_enoent() {
+        let _g = crate::kernel::TestGuard::acquire();
+        // No syscalls have populated pid 999, so no /proc/999/status.
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_OPEN,
+                1,
+                &open_req(0, b"/proc/999/status"),
+                &mut [],
+            ),
+            -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
+    fn proc_writes_are_ebadf() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(dispatch(METHOD_SYS_GETUID, 3, &[], &mut []), 1000);
+        // Open with WRITE bit set; the OFD is "writable" but the
+        // backend refuses writes.
+        let fd = dispatch(
+            METHOD_SYS_OPEN,
+            3,
+            &open_req(O_WRITE, b"/proc/3/status"),
+            &mut [],
+        );
+        let mut w = Vec::new();
+        w.extend_from_slice(&(fd as u32).to_le_bytes());
+        w.extend_from_slice(b"clobber");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 3, &w, &mut []),
+            -(abi::EBADF as i64)
+        );
     }
 
     #[test]
