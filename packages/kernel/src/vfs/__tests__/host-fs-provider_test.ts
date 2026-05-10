@@ -1,6 +1,6 @@
 import { describe, it, beforeAll, afterAll } from '@std/testing/bdd';
 import { expect } from '@std/expect';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { HostFsProvider } from '../host-fs-provider.js';
@@ -192,5 +192,71 @@ describe('HostFsProvider', () => {
   it('blocks traversal via writeFile()', () => {
     const provider = new HostFsProvider(testDir, { writable: true });
     expect(() => provider.writeFile('../../../tmp/evil.txt', enc('x'))).toThrow('ENOENT');
+  });
+
+  // --- Symlink escape prevention ---
+  //
+  // The bug previously: when a path didn't exist (typical for
+  // writeFile creating a new file), resolveHost fell back to the
+  // pre-symlink-resolved string. If a parent of that path was a
+  // symlink pointing outside the mount, writeFile happily wrote
+  // through it. These cases pin the fix.
+
+  it('blocks writeFile through a parent symlink pointing outside the mount', () => {
+    const mount = join(testDir, 'sym-escape-mount');
+    const outside = join(testDir, 'sym-escape-outside');
+    mkdirSync(mount, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    // Inside the mount, plant a symlink whose target is outside.
+    symlinkSync(outside, join(mount, 'escape'));
+
+    const provider = new HostFsProvider(mount, { writable: true });
+    expect(() => provider.writeFile('escape/pwned.txt', enc('escaped'))).toThrow('ENOENT');
+    // The outside directory must be untouched.
+    expect(existsSync(join(outside, 'pwned.txt'))).toBe(false);
+  });
+
+  it('blocks writeFile through a deeply nested ancestor symlink', () => {
+    const mount = join(testDir, 'sym-deep-mount');
+    const outside = join(testDir, 'sym-deep-outside');
+    mkdirSync(mount, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    mkdirSync(join(mount, 'a'), { recursive: true });
+    symlinkSync(outside, join(mount, 'a', 'esc'));
+
+    const provider = new HostFsProvider(mount, { writable: true });
+    expect(() =>
+      provider.writeFile('a/esc/deeper/file.txt', enc('x')),
+    ).toThrow('ENOENT');
+    expect(existsSync(join(outside, 'deeper'))).toBe(false);
+  });
+
+  it('blocks readFile through an escaping ancestor symlink', () => {
+    const mount = join(testDir, 'sym-read-mount');
+    const outside = join(testDir, 'sym-read-outside');
+    mkdirSync(mount, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(join(outside, 'secret.txt'), 'leaked');
+    symlinkSync(outside, join(mount, 'leak'));
+
+    const provider = new HostFsProvider(mount);
+    expect(() => provider.readFile('leak/secret.txt')).toThrow('ENOENT');
+  });
+
+  it('allows writeFile through an internal symlink that stays inside the mount', () => {
+    // Symlinks within the mount are fine — that's existing behaviour
+    // for readFile and we preserve it for writeFile too. Pin it so a
+    // future tightening doesn't regress the legitimate case.
+    const mount = join(testDir, 'sym-internal-mount');
+    mkdirSync(mount, { recursive: true });
+    mkdirSync(join(mount, 'real'), { recursive: true });
+    symlinkSync('real', join(mount, 'alias'));
+
+    const provider = new HostFsProvider(mount, { writable: true });
+    provider.writeFile('alias/inside.txt', enc('ok'));
+
+    // Visible via the symlinked name and the real path.
+    expect(dec(provider.readFile('alias/inside.txt'))).toBe('ok');
+    expect(dec(new Uint8Array(readFileSync(join(mount, 'real', 'inside.txt'))))).toBe('ok');
   });
 });

@@ -9,7 +9,7 @@
  */
 
 import { readFileSync, writeFileSync, statSync, readdirSync, mkdirSync, realpathSync } from 'node:fs';
-import { resolve, normalize, dirname } from 'node:path';
+import { resolve, normalize, dirname, join } from 'node:path';
 import { VfsError } from './inode.js';
 import type { VirtualProvider } from './provider.js';
 
@@ -98,6 +98,13 @@ export class HostFsProvider implements VirtualProvider {
   /**
    * Resolve a VFS subpath to an absolute host path, preventing path traversal.
    * Throws if the resolved path escapes hostRoot.
+   *
+   * For paths that don't exist yet (e.g. writeFile creating a new file),
+   * we walk up to find the nearest existing ancestor, realpath() *that*,
+   * and verify the resolved ancestor is under realRoot. The unresolved
+   * residual is then re-attached, giving us a path that writes will
+   * land under the real mount even if an intermediate ancestor is a
+   * symlink to outside the mount — those get rejected.
    */
   private resolveHost(subpath: string): string {
     // For root access (empty subpath), return hostRoot itself
@@ -105,22 +112,39 @@ export class HostFsProvider implements VirtualProvider {
       return this.hostRoot;
     }
     const full = normalize(resolve(this.hostRoot, subpath));
-    // Ensure the resolved path is still under hostRoot (pre-symlink check)
+    // Pre-symlink containment check (textual; catches `..` escapes).
     if (!full.startsWith(this.hostRoot + '/') && full !== this.hostRoot) {
       throw new VfsError('ENOENT', `path traversal blocked: ${subpath}`);
     }
-    // Resolve symlinks and re-check containment to prevent symlink escapes
-    try {
-      const real = realpathSync(full);
-      const realRoot = realpathSync(this.hostRoot);
-      if (!real.startsWith(realRoot + '/') && real !== realRoot) {
-        throw new VfsError('ENOENT', `symlink traversal blocked: ${subpath}`);
+    const realRoot = realpathSync(this.hostRoot);
+
+    // Walk up until realpathSync succeeds. For an existing leaf this
+    // resolves on the first try; for non-existent paths it keeps
+    // peeling components until it finds an ancestor that *does*
+    // exist, so any symlink along the way is followed by realpath
+    // and exposed to the containment check below.
+    let probe = full;
+    const residual: string[] = [];
+    while (true) {
+      try {
+        const realProbe = realpathSync(probe);
+        if (!realProbe.startsWith(realRoot + '/') && realProbe !== realRoot) {
+          throw new VfsError('ENOENT', `symlink traversal blocked: ${subpath}`);
+        }
+        return residual.length === 0 ? realProbe : join(realProbe, ...residual);
+      } catch (err) {
+        if (err instanceof VfsError) throw err;
+        const parent = dirname(probe);
+        if (parent === probe) {
+          // Walked all the way to the filesystem root without
+          // finding any existing ancestor. hostRoot is created at
+          // construction time so this should never happen, but bail
+          // rather than fall through to an uncontained path.
+          throw new VfsError('ENOENT', `path traversal blocked: ${subpath}`);
+        }
+        residual.unshift(probe.slice(parent.length + 1));
+        probe = parent;
       }
-      return real;
-    } catch (err) {
-      if (err instanceof VfsError) throw err;
-      // Path doesn't exist yet (e.g. writeFile to new path) — use normalized path
-      return full;
     }
   }
 }

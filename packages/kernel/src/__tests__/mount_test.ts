@@ -8,7 +8,11 @@ import { Sandbox } from '../sandbox.js';
 import { NodeAdapter } from '../platform/node-adapter.js';
 import { HostMount } from '../vfs/host-mount.js';
 
-const WASM_DIR = resolve(import.meta.dirname, '../platform/__tests__/fixtures');
+// `import.meta.dirname` is typed `string | undefined` under deno's
+// current `@types/node`. The non-null assertion is what every other
+// kernel test uses; assertion is safe because the constant is only
+// read after this module loads from disk.
+const WASM_DIR = resolve(import.meta.dirname!, '../platform/__tests__/fixtures');
 
 const enc = (s: string) => new TextEncoder().encode(s);
 
