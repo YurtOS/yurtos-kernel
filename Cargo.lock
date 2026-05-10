@@ -3951,6 +3951,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "yurt-microkernel-core"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "yurt-process"
 version = "0.1.0"
 
@@ -3975,6 +3982,7 @@ dependencies = [
  "wasmtime-wasi",
  "wat",
  "wiremock",
+ "yurt-microkernel-core",
 ]
 
 [[package]]

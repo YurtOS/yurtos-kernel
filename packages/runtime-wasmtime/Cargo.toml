@@ -13,6 +13,9 @@ name = "yurt_runtime_wasmtime"
 path = "src/lib.rs"
 
 [dependencies]
+# Engine-agnostic kernel-host scaffolding (WasmEngine trait, etc.)
+yurt-microkernel-core = { path = "../microkernel-core" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
