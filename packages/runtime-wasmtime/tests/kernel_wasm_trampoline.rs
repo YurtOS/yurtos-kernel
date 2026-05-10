@@ -143,6 +143,7 @@ fn kernel_wasm_imports_match_documented_namespaces() {
             "kh_real_close",
             "kh_real_open",
             "kh_real_read",
+            "kh_real_stat",
         ],
         "documented kh_* surface"
     );
@@ -406,6 +407,49 @@ fn host_fs_backend_reads_real_file_via_kh_real_open() {
         .unwrap();
     assert!(n > 0, "read returned bytes: n = {n}");
     assert_eq!(&buf[..n as usize], b"hello from real disk\n");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn host_fs_fstat_reports_real_file_size() {
+    // sys_fstat on a host-fs fd should return the actual size that
+    // kh_real_stat reported at open time, not 0. This drives
+    // std::fs::read's precise-allocation path.
+    use std::fs;
+    use std::io::Write;
+    build_kernel_wasm().unwrap();
+
+    let dir = std::env::temp_dir().join(format!(
+        "yurt-host-fs-stat-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let payload: &[u8] = b"abcdefghij"; // 10 bytes
+    {
+        let mut f = fs::File::create(dir.join("ten.txt")).unwrap();
+        f.write_all(payload).unwrap();
+    }
+
+    let mut host = HostState::default();
+    host.host_fs_root = Some(dir.clone());
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+
+    let mut req = 0_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"/host/ten.txt");
+    let fd = mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap();
+    assert!(fd >= 0);
+
+    let mut stat = [0u8; 16];
+    let n = mk
+        .syscall(METHOD_SYS_FSTAT, &(fd as u32).to_le_bytes(), &mut stat)
+        .unwrap();
+    assert_eq!(n, 16);
+    let size = u64::from_le_bytes(stat[0..8].try_into().unwrap());
+    assert_eq!(size, payload.len() as u64);
+    let filetype = u32::from_le_bytes(stat[8..12].try_into().unwrap());
+    assert_eq!(filetype, 4, "regular file"); // 4 = REGULAR_FILE in WASI
 
     let _ = fs::remove_dir_all(&dir);
 }

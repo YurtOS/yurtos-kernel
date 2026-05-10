@@ -643,10 +643,14 @@ pub struct HostFsBackend {
 #[derive(Debug)]
 struct HostFsHandle {
     /// Cumulative bytes consumed from the host file. Tracks EOF
-    /// detection — read returning 0 marks the file fully drained
-    /// and unblocks size queries.
+    /// detection — read returning 0 marks the file fully drained.
     drained: u64,
     eof_seen: bool,
+    /// Cached file size from kh_real_stat at open time. `None` if
+    /// the host couldn't stat (most likely permission denied even
+    /// though open succeeded — rare). `fstat` returns 0 in that
+    /// case, matching the previous behavior.
+    size: Option<u64>,
 }
 
 impl HostFsBackend {
@@ -681,12 +685,17 @@ impl VfsBackend for HostFsBackend {
             return None;
         }
         let inode = host_fd as u64;
+        // Stat the file to cache its size. Failures here don't fail
+        // the open — host_fd is already valid. We just leave size
+        // unknown so size() returns 0 (matching pre-stat behavior).
+        let size = crate::kh::real_stat_size(path).ok();
         self.paths.insert(path.to_vec(), inode);
         self.fds.insert(
             inode,
             HostFsHandle {
                 drained: 0,
                 eof_seen: false,
+                size,
             },
         );
         Some(inode)
@@ -721,11 +730,11 @@ impl VfsBackend for HostFsBackend {
         -(crate::abi::EBADF as i64)
     }
 
-    fn size(&self, _inode: u64) -> Option<u64> {
-        // Phase 5: host-fs doesn't expose stat through this trait
-        // yet. fstat on a host-fs fd reports size 0. Real stat
-        // wires through kh_real_stat in a follow-up slice.
-        Some(0)
+    fn size(&self, inode: u64) -> Option<u64> {
+        // Cached at open time via kh_real_stat. None falls back to
+        // 0 in the dispatch layer; that's correct for files we
+        // couldn't stat for whatever reason.
+        self.fds.get(&inode).and_then(|h| h.size).or(Some(0))
     }
 }
 

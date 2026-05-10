@@ -981,6 +981,102 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             0
         },
     )?;
+    // ── kh_real_stat: kh_stat_v1 record into kernel scratch ────────
+    //
+    // Same path-resolution and policy gates as kh_real_open. Writes
+    // the kh_stat_v1 (32-byte) record per
+    // abi/contract/kernel_host_abi.toml: u16 version, u16 _pad, u32
+    // mode, u64 size, u64 mtime_ns, u8 is_dir, u8 is_symlink,
+    // u8[6] _reserved.
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_real_stat",
+        |mut caller: Caller<'_, KernelStoreData>,
+         path_ptr: u32,
+         path_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            if (out_cap as usize) < 32 {
+                return -EINVAL;
+            }
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            let mut path = vec![0u8; path_len as usize];
+            if path_len > 0 && memory.read(&caller, path_ptr as usize, &mut path).is_err() {
+                return -EFAULT;
+            }
+            let root = match caller.data().host.host_fs_root.clone() {
+                Some(r) => r,
+                None => return -EACCES,
+            };
+            // Stat is read-only access; mirror the open path's
+            // policy gate with write=false.
+            if caller
+                .data()
+                .host
+                .policy
+                .may_open_path(&path, false)
+                == PolicyDecision::Deny
+            {
+                return -EACCES;
+            }
+            let rel: &[u8] = if path.starts_with(b"/") { &path[1..] } else { &path };
+            let rel_str = match std::str::from_utf8(rel) {
+                Ok(s) => s,
+                Err(_) => return -EINVAL,
+            };
+            let candidate = root.join(rel_str);
+            let resolved = match candidate.canonicalize() {
+                Ok(p) => p,
+                Err(_) => return -ENOENT,
+            };
+            let root_canon = match root.canonicalize() {
+                Ok(p) => p,
+                Err(_) => return -EACCES,
+            };
+            if !resolved.starts_with(&root_canon) {
+                return -EACCES;
+            }
+            let meta = match std::fs::metadata(&resolved) {
+                Ok(m) => m,
+                Err(e) => {
+                    return match e.kind() {
+                        std::io::ErrorKind::NotFound => -ENOENT,
+                        std::io::ErrorKind::PermissionDenied => -EACCES,
+                        _ => -EFAULT,
+                    };
+                }
+            };
+            let mut buf = [0u8; 32];
+            // version=1
+            buf[0..2].copy_from_slice(&1_u16.to_le_bytes());
+            // mode (POSIX-style file mode bits; std::fs's permissions
+            // don't expose the full mode portably, so we reconstruct
+            // a minimal one). Phase 5: 0o100644 for regular files,
+            // 0o040755 for dirs.
+            let mode: u32 = if meta.is_dir() { 0o040_755 } else { 0o100_644 };
+            buf[4..8].copy_from_slice(&mode.to_le_bytes());
+            buf[8..16].copy_from_slice(&meta.len().to_le_bytes());
+            // mtime_ns: best-effort; falls back to 0 on platforms
+            // without modified() support.
+            let mtime_ns = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            buf[16..24].copy_from_slice(&mtime_ns.to_le_bytes());
+            buf[24] = if meta.is_dir() { 1 } else { 0 };
+            buf[25] = 0; // is_symlink — std::fs::metadata follows symlinks
+            if memory.write(&mut caller, out_ptr as usize, &buf).is_err() {
+                return -EFAULT;
+            }
+            32 // bytes written
+        },
+    )?;
     Ok(())
 }
 

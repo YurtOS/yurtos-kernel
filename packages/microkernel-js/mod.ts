@@ -474,6 +474,12 @@ export class Microkernel {
       kh_real_read: (_fd: number, _outPtr: number, _len: number): bigint =>
         BigInt(-EACCES),
       kh_real_close: (_fd: number): number => 0,
+      kh_real_stat: (
+        _pathPtr: number,
+        _pathLen: number,
+        _outPtr: number,
+        _outCap: number,
+      ): bigint => BigInt(-EACCES),
       kh_extension_invoke: (
         reqPtr: number,
         reqLen: number,
