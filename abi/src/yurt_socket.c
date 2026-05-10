@@ -786,12 +786,24 @@ int shutdown(int sockfd, int how) {
  * pair. AF_UNIX is folded onto AF_INET because yurt has no Unix
  * domain sockets — callers (libzmq's signaler in particular) treat
  * the pair as opaque, so the underlying transport is a transparent
- * implementation detail.
+ * implementation detail. SOCK_DGRAM is rejected (EPROTOTYPE) — only
+ * SOCK_STREAM (with optional SOCK_CLOEXEC/SOCK_NONBLOCK bits) maps
+ * onto our TCP-loopback emulation. Add a UDP-loopback path here
+ * when a guest needs datagram pairs.
  *
- * Cleanup paths use shutdown()+close() not raw host_socket_close so
- * the runtime accounting stays consistent. The function is
- * deliberately verbose about errno on partial failure — every early
- * exit closes any sockets it already created. */
+ * Cleanup uses yurt_socketpair_release() — yurt's `shutdown()`
+ * already routes through host_socket_close internally (see the
+ * shutdown impl above), but a sibling helper here keeps each call
+ * site unambiguous about the intent ("release this fd") and lets
+ * us swap to a real close() if/when the host fd table accepts
+ * wasi-libc's close path. Every early-exit frees any sockets the
+ * function has already allocated. */
+static void yurt_socketpair_release(int fd) {
+  if (fd < 0) return;
+  /* SHUT_RDWR (= 2) — on yurt this triggers host_socket_close. */
+  shutdown(fd, 2);
+}
+
 int socketpair(int domain, int type, int protocol, int sv[2]) {
   YURT_MARKER_CALL(socketpair);
 
@@ -811,35 +823,36 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
   sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
   if (bind(listener, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
-    int saved = errno; shutdown(listener, 0); errno = saved; return -1;
+    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
   }
   if (listen(listener, 1) < 0) {
-    int saved = errno; shutdown(listener, 0); errno = saved; return -1;
+    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
   }
   /* Read back the assigned ephemeral port so connect() can target it. */
   socklen_t sa_len = sizeof(sa);
   if (getsockname(listener, (struct sockaddr *)&sa, &sa_len) < 0) {
-    int saved = errno; shutdown(listener, 0); errno = saved; return -1;
+    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
   }
 
   int connector = socket(AF_INET, SOCK_STREAM, 0);
   if (connector < 0) {
-    int saved = errno; shutdown(listener, 0); errno = saved; return -1;
+    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
   }
   if (connect(connector, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
     int saved = errno;
-    shutdown(connector, 0); shutdown(listener, 0);
+    yurt_socketpair_release(connector); yurt_socketpair_release(listener);
     errno = saved; return -1;
   }
 
   int acceptor = accept(listener, NULL, NULL);
   if (acceptor < 0) {
     int saved = errno;
-    shutdown(connector, 0); shutdown(listener, 0);
+    yurt_socketpair_release(connector); yurt_socketpair_release(listener);
     errno = saved; return -1;
   }
-  /* Listener has done its job. */
-  shutdown(listener, 0);
+  /* Listener has done its job — release it; the pair is the
+   * acceptor (read end) and the connector (write end). */
+  yurt_socketpair_release(listener);
 
   sv[0] = acceptor;
   sv[1] = connector;

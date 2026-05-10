@@ -33,6 +33,7 @@ pairs=(
   "sigprocmask yurt_signal.o"
   "pthread_sigmask yurt_signal.o"
   "sigsuspend yurt_signal.o"
+  "socketpair yurt_socket.o"
 )
 
 fail=0
