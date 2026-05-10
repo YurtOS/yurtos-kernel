@@ -229,5 +229,111 @@ export function buildSysImports(
       }
       return rc;
     },
+    // ── Networking + KV imports ──────────────────────────────────
+    // Mirror the wasmtime side's register_sys_imports surface so
+    // user processes call the same env-namespaced symbols on
+    // either microkernel.
+    sys_fetch: (reqPtr, reqLen, outPtr, outCap) => {
+      const req = new Uint8Array(um(), reqPtr, reqLen).slice();
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_FETCH,
+        req,
+        outCap,
+      );
+      if (rc > 0) {
+        new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+      }
+      return rc;
+    },
+    sys_socket_connect: (family, sockType, flags, addrPtr, addrLen) => {
+      const addr = new Uint8Array(um(), addrPtr, addrLen).slice();
+      const req = new Uint8Array(8 + addr.byteLength);
+      const view = new DataView(req.buffer);
+      req[0] = family & 0xff;
+      req[1] = sockType & 0xff;
+      view.setUint32(4, flags >>> 0, true);
+      req.set(addr, 8);
+      return forwardRequestBytes(METHOD.SYS_SOCKET_CONNECT, req);
+    },
+    sys_socket_send: (fd, dataPtr, dataLen) => {
+      const data = new Uint8Array(um(), dataPtr, dataLen).slice();
+      const req = new Uint8Array(4 + data.byteLength);
+      new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+      req.set(data, 4);
+      return forwardRequestBytes(METHOD.SYS_SOCKET_SEND, req);
+    },
+    sys_socket_recv: (fd, outPtr, outCap, flags) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, flags >>> 0, true);
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_SOCKET_RECV,
+        req,
+        outCap,
+      );
+      if (rc > 0) {
+        new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+      }
+      return rc;
+    },
+    sys_socket_close: (fd) => forwardRequestBytes(METHOD.SYS_SOCKET_CLOSE, u32(fd)),
+    sys_socket_listen: (backlog, addrPtr, addrLen) => {
+      const addr = new Uint8Array(um(), addrPtr, addrLen).slice();
+      const req = new Uint8Array(4 + addr.byteLength);
+      new DataView(req.buffer).setUint32(0, backlog >>> 0, true);
+      req.set(addr, 4);
+      return forwardRequestBytes(METHOD.SYS_SOCKET_LISTEN, req);
+    },
+    sys_socket_accept: (fd, flags) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, flags >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_SOCKET_ACCEPT, req);
+    },
+    sys_socket_addr: (fd, outPtr, outCap) => {
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_SOCKET_ADDR,
+        u32(fd),
+        outCap,
+      );
+      if (rc > 0) {
+        new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+      }
+      return rc;
+    },
+    sys_idb_get: (reqPtr, reqLen, outPtr, outCap) => {
+      const req = new Uint8Array(um(), reqPtr, reqLen).slice();
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_IDB_GET,
+        req,
+        outCap,
+      );
+      if (rc > 0) {
+        new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+      }
+      return rc;
+    },
+    sys_idb_put: (reqPtr, reqLen) => {
+      const req = new Uint8Array(um(), reqPtr, reqLen).slice();
+      return forwardRequestBytes(METHOD.SYS_IDB_PUT, req);
+    },
+    sys_idb_delete: (reqPtr, reqLen) => {
+      const req = new Uint8Array(um(), reqPtr, reqLen).slice();
+      return forwardRequestBytes(METHOD.SYS_IDB_DELETE, req);
+    },
+    sys_idb_list: (reqPtr, reqLen, outPtr, outCap) => {
+      const req = new Uint8Array(um(), reqPtr, reqLen).slice();
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_IDB_LIST,
+        req,
+        outCap,
+      );
+      if (rc > 0) {
+        new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+      }
+      return rc;
+    },
   };
 }
