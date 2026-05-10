@@ -435,6 +435,66 @@ fn host_fs_backend_reads_real_file_via_kh_real_open() {
 }
 
 #[test]
+fn host_fs_traversal_outside_root_is_eacces() {
+    // Embedder gives the sandbox a single directory as host_fs_root.
+    // Userland tries to escape with `..` segments — every kh_real_*
+    // call that reaches the canonicalize-and-contain check must
+    // refuse with -EACCES, not silently resolve to a sibling.
+    use std::fs;
+    use std::io::Write;
+    build_kernel_wasm().unwrap();
+
+    // Build /tmp/yurt-escape-<pid>/inner as the sandbox root, with
+    // a sibling /tmp/yurt-escape-<pid>/outside that the sandbox
+    // must not be able to read or mutate.
+    let parent = std::env::temp_dir().join(format!(
+        "yurt-escape-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&parent);
+    fs::create_dir_all(parent.join("inner")).unwrap();
+    fs::create_dir_all(parent.join("outside")).unwrap();
+    {
+        let mut f = fs::File::create(parent.join("outside/secret.txt")).unwrap();
+        f.write_all(b"don't leak me").unwrap();
+    }
+
+    let mut host = HostState::default();
+    host.host_fs_root = Some(parent.join("inner"));
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    mk.mount_host_fs(b"/host").unwrap();
+
+    // Read attempt: /host/../outside/secret.txt — should miss.
+    let mut req = 0_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"/host/../outside/secret.txt");
+    let rc = mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap();
+    assert!(rc < 0, "open of escape path must fail, got {rc}");
+
+    // Write attempts: mkdir/unlink/rename outside the root must
+    // also refuse with a negative errno (the exact code depends
+    // on whether the path canonicalizes through the parent or
+    // misses; -EACCES or -ENOENT both indicate the request was
+    // refused before touching the host fs).
+    let escape: &[u8] = b"/host/../outside/newdir";
+    let rc = mk.syscall(METHOD_SYS_MKDIR, escape, &mut []).unwrap();
+    assert!(rc < 0, "mkdir escape: {rc}");
+    assert!(
+        !parent.join("outside/newdir").exists(),
+        "host fs must not have been mutated"
+    );
+    let rc = mk
+        .syscall(METHOD_SYS_UNLINK, b"/host/../outside/secret.txt", &mut [])
+        .unwrap();
+    assert!(rc < 0, "unlink escape: {rc}");
+    assert!(
+        parent.join("outside/secret.txt").exists(),
+        "real file must still be present after refused unlink"
+    );
+
+    let _ = fs::remove_dir_all(&parent);
+}
+
+#[test]
 fn host_fs_writable_ops_create_then_rename_then_unlink() {
     // End-to-end: through HostFsBackend, mkdir creates a real
     // directory, rename moves a real file, unlink removes it.
