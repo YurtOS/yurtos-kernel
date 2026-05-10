@@ -1041,6 +1041,61 @@ mod tests {
     }
 
     #[test]
+    fn overlay_rename_lower_only_file_to_new_path() {
+        // Source lives only in lower. After rename, new_path reads
+        // the original bytes; old_path is whited out (gone).
+        let mut lower = RamfsBackend::new();
+        lower.install(b"/orig".to_vec(), b"hello-overlay".to_vec());
+        let upper = RamfsBackend::new();
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+
+        let rc = overlay.rename(b"/orig", b"/moved");
+        assert_eq!(rc, 0);
+
+        // /moved exists with original content.
+        let inode = overlay.open(b"/moved", 0).expect("/moved must exist");
+        let mut buf = [0u8; 32];
+        let n = overlay.read(inode, 0, &mut buf);
+        assert!(n >= 0);
+        assert_eq!(&buf[..n as usize], b"hello-overlay");
+
+        // /orig is gone (whited out).
+        assert!(overlay.open(b"/orig", 0).is_none());
+    }
+
+    #[test]
+    fn overlay_rename_upper_file_replaces_lower_destination() {
+        // Lower has /a (lower-side data) and /b (lower-side data).
+        // Upper has /a (upper-shadow) — rename(/a, /b) must end up
+        // with /b carrying the upper-shadow bytes and /a gone.
+        let mut lower = RamfsBackend::new();
+        lower.install(b"/a".to_vec(), b"lower-A".to_vec());
+        lower.install(b"/b".to_vec(), b"lower-B".to_vec());
+        let mut upper = RamfsBackend::new();
+        upper.install(b"/a".to_vec(), b"UPPER-A".to_vec());
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+
+        assert_eq!(overlay.rename(b"/a", b"/b"), 0);
+
+        let inode = overlay.open(b"/b", 0).expect("/b must exist");
+        let mut buf = [0u8; 32];
+        let n = overlay.read(inode, 0, &mut buf);
+        assert_eq!(&buf[..n as usize], b"UPPER-A");
+        assert!(overlay.open(b"/a", 0).is_none(), "/a must be gone");
+    }
+
+    #[test]
+    fn overlay_rename_missing_source_is_enoent() {
+        let lower = RamfsBackend::new();
+        let upper = RamfsBackend::new();
+        let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
+        assert_eq!(
+            overlay.rename(b"/nope", b"/yep"),
+            -(crate::abi::ENOENT as i64) as i32,
+        );
+    }
+
+    #[test]
     fn overlay_read_only_lower_file_keeps_lower_inode() {
         let mut lower = RamfsBackend::new();
         lower.install(b"/ro".to_vec(), b"data".to_vec());
@@ -1834,5 +1889,89 @@ impl VfsBackend for OverlayBackend {
             return upper;
         }
         self.lower.entry_type(path)
+    }
+
+    fn rename(&mut self, old_path: &[u8], new_path: &[u8]) -> i32 {
+        // Source must exist (in either layer, ignoring whiteout).
+        if self.whiteouts.contains(old_path) {
+            return -(crate::abi::ENOENT as i64) as i32;
+        }
+        let src_kind = self.entry_type(old_path);
+        if src_kind == 0 {
+            return -(crate::abi::ENOENT as i64) as i32;
+        }
+        if old_path == new_path {
+            return 0;
+        }
+        // Destination: directories aren't supported as a target
+        // here; surface -EEXIST to mirror RamfsBackend's stance.
+        if self.entry_type(new_path) == 3 {
+            return -(crate::abi::EEXIST as i64) as i32;
+        }
+        // Rename strategy: open source for read, install bytes at
+        // the new path in upper (which handles whiteouts if the
+        // dest existed in lower), then unlink source (which
+        // whiteouts in lower or removes upper). Inode identity is
+        // not preserved — POSIX rename callers don't observe inode
+        // numbers, and lower→upper transitions already break
+        // identity via copy-up.
+        match src_kind {
+            // Regular file: read source, write to new (create-bit),
+            // unlink source. Symlinks go through readlink+symlink.
+            4 => {
+                let src_inode = match self.open(old_path, 0) {
+                    Some(i) => i,
+                    None => return -(crate::abi::ENOENT as i64) as i32,
+                };
+                let len = self.size(src_inode).unwrap_or(0) as usize;
+                let mut content = vec![0u8; len];
+                if len > 0 {
+                    let n = self.read(src_inode, 0, &mut content);
+                    if n < 0 {
+                        return n as i32;
+                    }
+                    content.truncate(n as usize);
+                }
+                // If destination exists in upper, unlink it first
+                // so the create-write doesn't refuse via EEXIST in
+                // ramfs; if it exists only in lower, our unlink
+                // will produce a whiteout that we then clear by
+                // creating in upper with the create-bit.
+                if self.entry_type(new_path) != 0 {
+                    self.unlink(new_path);
+                }
+                let dst_inode = match self.open(new_path, 0b011) {
+                    Some(i) => i,
+                    None => return -(crate::abi::EIO as i64) as i32,
+                };
+                self.truncate(dst_inode);
+                let w = self.write(dst_inode, 0, &content);
+                if w < 0 {
+                    return w as i32;
+                }
+                self.unlink(old_path);
+                0
+            }
+            7 => {
+                let target = match self.readlink(old_path) {
+                    Some(t) => t,
+                    None => return -(crate::abi::ENOENT as i64) as i32,
+                };
+                if self.entry_type(new_path) != 0 {
+                    self.unlink(new_path);
+                }
+                let rc = self.symlink(&target, new_path);
+                if rc != 0 {
+                    return rc;
+                }
+                self.unlink(old_path);
+                0
+            }
+            // Directory rename across the union is non-trivial
+            // (requires walking children for whiteout/copy-up).
+            // Refuse for now; userland sees -EXDEV and falls back
+            // to recursive copy.
+            _ => -(crate::abi::EXDEV as i64) as i32,
+        }
     }
 }
