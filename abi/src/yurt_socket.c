@@ -37,6 +37,7 @@
 #define YURT_TCP_NODELAY 1
 
 YURT_DECLARE_MARKER(socket);
+YURT_DECLARE_MARKER(socketpair);
 YURT_DECLARE_MARKER(connect);
 YURT_DECLARE_MARKER(getpeername);
 YURT_DECLARE_MARKER(getsockname);
@@ -47,7 +48,8 @@ YURT_DECLARE_MARKER(send);
 YURT_DECLARE_MARKER(recv);
 YURT_DECLARE_MARKER(shutdown);
 
-YURT_DEFINE_MARKER(socket,   0x736f636bu) /* "sock" */
+YURT_DEFINE_MARKER(socket,     0x736f636bu) /* "sock" */
+YURT_DEFINE_MARKER(socketpair, 0x73706169u) /* "spai" */
 YURT_DEFINE_MARKER(connect,  0x636f6e6eu) /* "conn" */
 YURT_DEFINE_MARKER(getpeername, 0x70656572u) /* "peer" */
 YURT_DEFINE_MARKER(getsockname, 0x736e616du) /* "snam" */
@@ -775,5 +777,71 @@ int shutdown(int sockfd, int how) {
     errno = EIO;
     return -1;
   }
+  return 0;
+}
+
+/* socketpair — wasi-libc lacks it (gated behind
+ * __wasilibc_unmodified_upstream). Emulate via TCP loopback: bind a
+ * listener on 127.0.0.1:0, accept-side and connect-side become the
+ * pair. AF_UNIX is folded onto AF_INET because yurt has no Unix
+ * domain sockets — callers (libzmq's signaler in particular) treat
+ * the pair as opaque, so the underlying transport is a transparent
+ * implementation detail.
+ *
+ * Cleanup paths use shutdown()+close() not raw host_socket_close so
+ * the runtime accounting stays consistent. The function is
+ * deliberately verbose about errno on partial failure — every early
+ * exit closes any sockets it already created. */
+int socketpair(int domain, int type, int protocol, int sv[2]) {
+  YURT_MARKER_CALL(socketpair);
+
+  if (!sv) { errno = EFAULT; return -1; }
+  /* Accept the AF_UNIX form libzmq calls with; remap to AF_INET. */
+  if (domain != AF_UNIX && domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+  if ((type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK) != SOCK_STREAM) { errno = EPROTOTYPE; return -1; }
+  (void)protocol;
+
+  int listener = socket(AF_INET, SOCK_STREAM, 0);
+  if (listener < 0) return -1;
+
+  struct sockaddr_in sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  sa.sin_port = 0; /* ephemeral */
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  if (bind(listener, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
+    int saved = errno; shutdown(listener, 0); errno = saved; return -1;
+  }
+  if (listen(listener, 1) < 0) {
+    int saved = errno; shutdown(listener, 0); errno = saved; return -1;
+  }
+  /* Read back the assigned ephemeral port so connect() can target it. */
+  socklen_t sa_len = sizeof(sa);
+  if (getsockname(listener, (struct sockaddr *)&sa, &sa_len) < 0) {
+    int saved = errno; shutdown(listener, 0); errno = saved; return -1;
+  }
+
+  int connector = socket(AF_INET, SOCK_STREAM, 0);
+  if (connector < 0) {
+    int saved = errno; shutdown(listener, 0); errno = saved; return -1;
+  }
+  if (connect(connector, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
+    int saved = errno;
+    shutdown(connector, 0); shutdown(listener, 0);
+    errno = saved; return -1;
+  }
+
+  int acceptor = accept(listener, NULL, NULL);
+  if (acceptor < 0) {
+    int saved = errno;
+    shutdown(connector, 0); shutdown(listener, 0);
+    errno = saved; return -1;
+  }
+  /* Listener has done its job. */
+  shutdown(listener, 0);
+
+  sv[0] = acceptor;
+  sv[1] = connector;
   return 0;
 }
