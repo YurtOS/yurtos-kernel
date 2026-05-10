@@ -631,6 +631,7 @@ impl Microkernel {
             kernel: self.kernel.clone(),
             pid,
             argv,
+            dir_fds: std::collections::BTreeMap::new(),
         };
         let mut store = Store::new(&self.engine, user_state);
         let instance = linker
@@ -683,6 +684,13 @@ pub struct UserState {
     pub kernel: Arc<Mutex<KernelInstance>>,
     pub pid: u32,
     pub argv: Vec<Vec<u8>>,
+    /// fd → absolute path, populated on every successful `path_open`
+    /// and cleared on `fd_close`. Used by the WASI `fd_readdir` shim
+    /// to translate a directory fd back into a path it can pass to
+    /// `sys_readdir` on the kernel side. Storing the path here (not
+    /// the kernel) keeps the kernel's OFD surface unchanged — the
+    /// shim is the one that needs the path-key, not the kernel.
+    pub dir_fds: std::collections::BTreeMap<i32, Vec<u8>>,
 }
 
 impl yurt_microkernel_core::HasCallerPid for UserState {

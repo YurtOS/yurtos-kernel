@@ -204,6 +204,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         WASI,
         "fd_close",
         |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            caller.data_mut().dir_fds.remove(&fd);
             let req = (fd as u32).to_le_bytes();
             let rc = crate::microkernel::trampoline_request(&mut crate::engine::WasmtimeCtx::new(&mut caller), METHOD_CLOSE, &req);
             errno_from_kernel(rc)
@@ -476,6 +477,111 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             0
         },
     )?;
+    // ── fd_readdir(fd, buf, buf_len, cookie, bufused_ptr) ────────────
+    // WASI dirent layout (24 bytes header + name): d_next(u64) at 0,
+    // d_ino(u64) at 8, d_namlen(u32) at 16, d_type(u8) at 20, pad to
+    // 24, then `d_namlen` name bytes. `cookie` is the index of the
+    // *next* entry to return; we serialize entries from cookie..,
+    // writing as many full records (header + name) as fit. Truncated
+    // tail is silently dropped so the caller will iterate again with
+    // an updated cookie. Bufused = bytes actually written.
+    linker.func_wrap(
+        WASI,
+        "fd_readdir",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         buf: u32,
+         buf_len: u32,
+         cookie: i64,
+         bufused_ptr: u32|
+         -> i32 {
+            let path = match caller.data().dir_fds.get(&fd).cloned() {
+                Some(p) => p,
+                None => return 8, // EBADF (WASI errno)
+            };
+            // Ask the kernel for the listing. Allocate a generously
+            // sized response — entries are bounded by mount size in
+            // practice; 64 KiB covers any sane directory and saves a
+            // round-trip-with-resize. If a real fixture overflows,
+            // bump this; the kernel surface returns the actual byte
+            // count it filled.
+            let mut resp = vec![0u8; 64 * 1024];
+            let rc = crate::microkernel::trampoline_request_with_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                METHOD_SYS_READDIR,
+                &path,
+                &mut resp,
+            );
+            if rc < 0 {
+                return errno_from_kernel(rc);
+            }
+            let used = rc as usize;
+            if used < 4 {
+                return 28; // EINVAL
+            }
+            let count = u32::from_le_bytes(resp[0..4].try_into().unwrap()) as usize;
+            // Walk records to find offsets we need (skip the first
+            // `cookie` entries, write the rest as WASI dirents).
+            let mut cur = 4usize;
+            let mut written = 0usize;
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return 28, // EINVAL
+            };
+            for idx in 0..count {
+                if cur + 4 > used {
+                    break;
+                }
+                let nlen = u32::from_le_bytes(resp[cur..cur + 4].try_into().unwrap()) as usize;
+                cur += 4;
+                if cur + nlen > used {
+                    break;
+                }
+                if (idx as i64) < cookie {
+                    cur += nlen;
+                    continue;
+                }
+                let name = &resp[cur..cur + nlen];
+                cur += nlen;
+                let need = 24 + nlen;
+                if written + need > buf_len as usize {
+                    break;
+                }
+                // Build a 24-byte header. d_type 4 = REGULAR_FILE; we
+                // don't yet distinguish directories here (kernel
+                // surface returns just names). Good enough for libc
+                // readdir(); a richer surface comes when sys_readdir
+                // returns types alongside names.
+                let mut hdr = [0u8; 24];
+                hdr[0..8].copy_from_slice(&((idx as u64) + 1).to_le_bytes());
+                // d_ino zero is fine for now.
+                hdr[16..20].copy_from_slice(&(nlen as u32).to_le_bytes());
+                hdr[20] = 4; // REGULAR_FILE
+                if memory
+                    .write(&mut caller, buf as usize + written, &hdr)
+                    .is_err()
+                {
+                    return 28;
+                }
+                if memory
+                    .write(&mut caller, buf as usize + written + 24, name)
+                    .is_err()
+                {
+                    return 28;
+                }
+                written += need;
+            }
+            let written_u32 = (written as u32).to_le_bytes();
+            if memory
+                .write(&mut caller, bufused_ptr as usize, &written_u32)
+                .is_err()
+            {
+                return 28;
+            }
+            0
+        },
+    )?;
+
     linker.func_wrap(
         WASI,
         "path_open",
@@ -530,7 +636,21 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if rc < 0 {
                 return errno_from_kernel(rc);
             }
-            let new_fd = (rc as u32).to_le_bytes();
+            let new_fd_u32 = rc as u32;
+            // Record the absolute path for this fd so a later
+            // fd_readdir on this fd can ask sys_readdir by path.
+            // Build the absolute path the same way the request did
+            // (preopen prefix `/` + the relative path bytes).
+            let mut abs = Vec::with_capacity(1 + rel.len());
+            abs.push(b'/');
+            abs.extend_from_slice(&rel);
+            // Strip any trailing slash for parity with how kernel
+            // paths look (sys_readdir compares to canonical paths).
+            if abs.len() > 1 && abs.last() == Some(&b'/') {
+                abs.pop();
+            }
+            caller.data_mut().dir_fds.insert(new_fd_u32 as i32, abs);
+            let new_fd = new_fd_u32.to_le_bytes();
             if memory
                 .write(&mut caller, ret_fd_ptr as usize, &new_fd)
                 .is_err()
@@ -609,7 +729,6 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         "fd_filestat_set_times",
         "fd_pread",
         "fd_pwrite",
-        "fd_readdir",
         "fd_renumber",
         "fd_sync",
         "fd_tell",
@@ -646,6 +765,7 @@ const METHOD_CLOCK_GETTIME: u32 = 0x1_0016;
 const METHOD_OPEN: u32 = 0x1_001F;
 const METHOD_LSEEK: u32 = 0x1_0020;
 const METHOD_FSTAT: u32 = 0x1_0021;
+const METHOD_SYS_READDIR: u32 = 0x1_002B;
 
 /// Synthetic preopen fd we expose to wasi-libc so its preopen walk
 /// terminates with one match: "/". Matches the lowest fd that's
