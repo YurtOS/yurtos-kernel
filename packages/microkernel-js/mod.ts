@@ -153,6 +153,63 @@ export interface PolicyEnforcer {
   mayLog?(severity: number, message: string): PolicyDecision;
   /** Gate kh_now_realtime. */
   mayGetRealtime?(): PolicyDecision;
+  /** Gate kh_fetch_blocking. `request` is the JSON document. */
+  mayFetch?(request: Uint8Array): PolicyDecision;
+  /** Gate kh_idb_*. `write` distinguishes mutating ops. */
+  mayIdb?(store: Uint8Array, write: boolean): PolicyDecision;
+}
+
+/**
+ * Pluggable host filesystem. Mirrors the Rust `HostFsImpl` trait
+ * — every kh_real_* import goes through this interface when
+ * `HostState.hostFs` is set. Browser microkernels back this with
+ * OPFS, Deno embedders with Deno.openSync, etc.
+ */
+export interface HostFsImpl {
+  open(path: Uint8Array, flags: number): number;
+  read(fd: number, buf: Uint8Array): number;
+  write(fd: number, data: Uint8Array): number;
+  close(fd: number): number;
+  stat(path: Uint8Array): HostFsStat | number; // number = -errno
+  unlink(path: Uint8Array): number;
+  mkdir(path: Uint8Array, mode: number): number;
+  symlink(target: Uint8Array, linkPath: Uint8Array): number;
+  rename(oldPath: Uint8Array, newPath: Uint8Array): number;
+}
+
+export interface HostFsStat {
+  size: bigint;
+  mode: number;
+  mtimeNs: bigint;
+  isDir: boolean;
+  isSymlink: boolean;
+}
+
+/**
+ * Pluggable durable KV. Mirrors the Rust `KvBackend` trait. Browser
+ * microkernels back this with IndexedDB; native deployments with
+ * redb / sled / rocksdb / SQLite.
+ */
+export interface KvBackend {
+  get(store: Uint8Array, key: Uint8Array): Uint8Array | number; // number = -errno
+  put(store: Uint8Array, key: Uint8Array, value: Uint8Array): number;
+  delete(store: Uint8Array, key: Uint8Array): number;
+  list(store: Uint8Array, prefix: Uint8Array): Uint8Array[];
+}
+
+/**
+ * Pluggable outbound TCP backend. Mirrors the Rust `TcpSocketImpl`
+ * trait. Browser microkernels relay through WebSocket / Service
+ * Worker; Deno wraps Deno.connect / Deno.listen.
+ */
+export interface TcpSocketImpl {
+  connect(host: string, port: number, flags: number): number;
+  send(handle: number, data: Uint8Array): number;
+  recv(handle: number, buf: Uint8Array, flags: number): number;
+  close(handle: number): number;
+  listen(host: string, port: number, backlog: number): number;
+  accept(handle: number, flags: number): number;
+  localAddr(handle: number): { host: string; port: number } | null;
 }
 
 export interface HostState {
@@ -160,11 +217,20 @@ export interface HostState {
   extensions: ExtensionRegistry;
   logSink: LogSink;
   policy: PolicyEnforcer;
+  /** When set, every `kh_real_*` import delegates here. */
+  hostFs?: HostFsImpl;
+  /** When set, every `kh_idb_*` import delegates here. */
+  kv?: KvBackend;
+  /** When set, every `kh_socket_*` import delegates here. */
+  tcp?: TcpSocketImpl;
 }
 
 const ENOENT = 2;
 const EFAULT = 14;
 const EACCES = 13;
+const EBADF = 9;
+const EEXIST = 17;
+const E2BIG = 7;
 
 class EmptyExtensionRegistry implements ExtensionRegistry {
   invoke(): number {
@@ -174,6 +240,198 @@ class EmptyExtensionRegistry implements ExtensionRegistry {
 
 class DiscardLogSink implements LogSink {
   emit(): void {}
+}
+
+/**
+ * Map-backed [`HostFsImpl`]. Useful for tests and for browser
+ * microkernels that haven't wired up OPFS yet.
+ */
+export class InMemoryHostFs implements HostFsImpl {
+  private files = new Map<string, Uint8Array>();
+  private dirs = new Set<string>();
+  private symlinks = new Map<string, Uint8Array>();
+  private fds = new Map<number, { path: string; cursor: number }>();
+  private nextFd = 1;
+
+  installFile(path: Uint8Array, content: Uint8Array): void {
+    this.files.set(this.bkey(path), content);
+  }
+
+  private bkey(b: Uint8Array): string {
+    // Use a binary-faithful key; raw byte-string indexing.
+    return Array.from(b).map((x) => x.toString(36)).join(",");
+  }
+
+  open(path: Uint8Array, flags: number): number {
+    const key = this.bkey(path);
+    const writable = (flags & 0b001) !== 0;
+    const create = (flags & 0b010) !== 0;
+    const trunc = (flags & 0b100) !== 0;
+    if (!this.files.has(key)) {
+      if (!create) return -ENOENT;
+      if (!writable) return -EACCES;
+      this.files.set(key, new Uint8Array(0));
+    } else if (trunc && writable) {
+      this.files.set(key, new Uint8Array(0));
+    }
+    const fd = this.nextFd++;
+    this.fds.set(fd, { path: key, cursor: 0 });
+    return fd;
+  }
+
+  read(fd: number, buf: Uint8Array): number {
+    const entry = this.fds.get(fd);
+    if (!entry) return -EBADF;
+    const content = this.files.get(entry.path);
+    if (!content) return -EBADF;
+    const start = Math.min(entry.cursor, content.byteLength);
+    const n = Math.min(buf.byteLength, content.byteLength - start);
+    if (n > 0) buf.set(content.subarray(start, start + n));
+    entry.cursor += n;
+    return n;
+  }
+
+  write(fd: number, data: Uint8Array): number {
+    const entry = this.fds.get(fd);
+    if (!entry) return -EBADF;
+    const content = this.files.get(entry.path);
+    if (!content) return -EBADF;
+    const start = entry.cursor;
+    const end = start + data.byteLength;
+    if (end > content.byteLength) {
+      const grown = new Uint8Array(end);
+      grown.set(content);
+      this.files.set(entry.path, grown);
+    }
+    this.files.get(entry.path)!.set(data, start);
+    entry.cursor += data.byteLength;
+    return data.byteLength;
+  }
+
+  close(fd: number): number {
+    this.fds.delete(fd);
+    return 0;
+  }
+
+  stat(path: Uint8Array): HostFsStat | number {
+    const key = this.bkey(path);
+    const f = this.files.get(key);
+    if (f) {
+      return {
+        size: BigInt(f.byteLength),
+        mode: 0o100_644,
+        mtimeNs: 0n,
+        isDir: false,
+        isSymlink: false,
+      };
+    }
+    if (this.dirs.has(key)) {
+      return {
+        size: 0n,
+        mode: 0o040_755,
+        mtimeNs: 0n,
+        isDir: true,
+        isSymlink: false,
+      };
+    }
+    if (this.symlinks.has(key)) {
+      return {
+        size: 0n,
+        mode: 0o120_777,
+        mtimeNs: 0n,
+        isDir: false,
+        isSymlink: true,
+      };
+    }
+    return -ENOENT;
+  }
+
+  unlink(path: Uint8Array): number {
+    const key = this.bkey(path);
+    if (this.symlinks.delete(key)) return 0;
+    if (this.files.delete(key)) return 0;
+    return -ENOENT;
+  }
+
+  mkdir(path: Uint8Array, _mode: number): number {
+    const key = this.bkey(path);
+    if (this.dirs.has(key) || this.files.has(key)) return -EEXIST;
+    this.dirs.add(key);
+    return 0;
+  }
+
+  symlink(target: Uint8Array, linkPath: Uint8Array): number {
+    const key = this.bkey(linkPath);
+    if (
+      this.files.has(key) ||
+      this.symlinks.has(key) ||
+      this.dirs.has(key)
+    ) return -EEXIST;
+    this.symlinks.set(key, target);
+    return 0;
+  }
+
+  rename(oldPath: Uint8Array, newPath: Uint8Array): number {
+    const ok = this.bkey(oldPath);
+    const nk = this.bkey(newPath);
+    if (this.files.has(ok)) {
+      this.files.set(nk, this.files.get(ok)!);
+      this.files.delete(ok);
+      return 0;
+    }
+    if (this.symlinks.has(ok)) {
+      this.symlinks.set(nk, this.symlinks.get(ok)!);
+      this.symlinks.delete(ok);
+      return 0;
+    }
+    if (this.dirs.has(ok)) {
+      this.dirs.delete(ok);
+      this.dirs.add(nk);
+      return 0;
+    }
+    return -ENOENT;
+  }
+}
+
+/** Map-backed [`KvBackend`]. */
+export class InMemoryKv implements KvBackend {
+  private store = new Map<string, Uint8Array>();
+  private composite(s: Uint8Array, k: Uint8Array): string {
+    return s.byteLength + ":" + Array.from(s).join(",") + "|" +
+      Array.from(k).join(",");
+  }
+  get(store: Uint8Array, key: Uint8Array): Uint8Array | number {
+    const v = this.store.get(this.composite(store, key));
+    return v ?? -ENOENT;
+  }
+  put(store: Uint8Array, key: Uint8Array, value: Uint8Array): number {
+    this.store.set(this.composite(store, key), value);
+    return 0;
+  }
+  delete(store: Uint8Array, key: Uint8Array): number {
+    this.store.delete(this.composite(store, key));
+    return 0;
+  }
+  list(store: Uint8Array, prefix: Uint8Array): Uint8Array[] {
+    const sPart = store.byteLength + ":" + Array.from(store).join(",") + "|";
+    const out: Uint8Array[] = [];
+    for (const [k] of this.store) {
+      if (!k.startsWith(sPart)) continue;
+      const keyStr = k.slice(sPart.length);
+      const keyBytes = keyStr === ""
+        ? new Uint8Array(0)
+        : new Uint8Array(keyStr.split(",").map((n) => Number(n)));
+      let starts = true;
+      for (let i = 0; i < prefix.byteLength; i++) {
+        if (keyBytes[i] !== prefix[i]) {
+          starts = false;
+          break;
+        }
+      }
+      if (starts) out.push(keyBytes);
+    }
+    return out;
+  }
 }
 
 /**
@@ -281,6 +539,8 @@ export const allowAllPolicy: PolicyEnforcer = {};
 export const denyAllPolicy: PolicyEnforcer = {
   mayInvokeExtension: () => "deny",
   mayOpenPath: () => "deny",
+  mayFetch: () => "deny",
+  mayIdb: () => "deny",
   mayConnect: () => "deny",
   mayListen: () => "deny",
   mayLog: () => "deny",
@@ -477,124 +737,304 @@ export class Microkernel {
       // return -EACCES until the host-fs bridge is wired (Deno
       // can serve these via Deno.openSync; browsers via OPFS).
       // Same shape as the Rust microkernel-wasmtime impl.
+      // Pluggable kh_real_*. When HostState.hostFs is set, delegate
+      // through the trait-equivalent interface; otherwise -EACCES.
+      // Default kept restrictive so embedders that forget to wire
+      // hostFs don't accidentally expose host disk access.
       kh_real_open: (
-        _pathPtr: number,
-        _pathLen: number,
-        _flags: number,
+        pathPtr: number,
+        pathLen: number,
+        flags: number,
         _mode: number,
-      ): number => -EACCES,
-      kh_real_read: (_fd: number, _outPtr: number, _len: number): bigint =>
-        BigInt(-EACCES),
-      kh_real_write: (
-        _fd: number,
-        _dataPtr: number,
-        _dataLen: number,
-      ): bigint => BigInt(-EACCES),
-      kh_real_close: (_fd: number): number => 0,
+      ): number => {
+        const fs = hostBox.state.hostFs;
+        if (!fs) return -EACCES;
+        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+        return fs.open(path, flags);
+      },
+      kh_real_read: (fd: number, outPtr: number, len: number): bigint => {
+        const fs = hostBox.state.hostFs;
+        if (!fs) return BigInt(-EBADF);
+        const buf = new Uint8Array(len);
+        const n = fs.read(fd, buf);
+        if (n > 0) {
+          new Uint8Array(memoryRef.memory!.buffer, outPtr, n).set(buf.subarray(0, n));
+        }
+        return BigInt(n);
+      },
+      kh_real_write: (fd: number, dataPtr: number, dataLen: number): bigint => {
+        const fs = hostBox.state.hostFs;
+        if (!fs) return BigInt(-EBADF);
+        const data = new Uint8Array(memoryRef.memory!.buffer, dataPtr, dataLen).slice();
+        return BigInt(fs.write(fd, data));
+      },
+      kh_real_close: (fd: number): number => {
+        const fs = hostBox.state.hostFs;
+        if (!fs) return 0;
+        return fs.close(fd);
+      },
       kh_real_stat: (
-        _pathPtr: number,
-        _pathLen: number,
-        _outPtr: number,
-        _outCap: number,
-      ): bigint => BigInt(-EACCES),
-      // Mutating host-fs ops. Stubs until the JS microkernel grows
-      // a HostFsImpl-shaped pluggable slot (mirrors the Rust
-      // microkernel's host_fs trait). Browser microkernels back
-      // these with OPFS; Deno with Deno.* APIs.
-      kh_real_unlink: (_pathPtr: number, _pathLen: number): number => -EACCES,
+        pathPtr: number,
+        pathLen: number,
+        outPtr: number,
+        outCap: number,
+      ): bigint => {
+        const fs = hostBox.state.hostFs;
+        if (!fs) return BigInt(-EACCES);
+        if (outCap < 32) return BigInt(-22);
+        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+        const stat = fs.stat(path);
+        if (typeof stat === "number") return BigInt(stat);
+        // kh_stat_v1: u16 ver + u16 pad + u32 mode + u64 size + u64 mtime + u8 isDir + u8 isSym + u8[6] reserved.
+        const buf = new Uint8Array(32);
+        const view = new DataView(buf.buffer);
+        view.setUint16(0, 1, true);
+        view.setUint32(4, stat.mode >>> 0, true);
+        view.setBigUint64(8, stat.size, true);
+        view.setBigUint64(16, stat.mtimeNs, true);
+        buf[24] = stat.isDir ? 1 : 0;
+        buf[25] = stat.isSymlink ? 1 : 0;
+        new Uint8Array(memoryRef.memory!.buffer, outPtr, 32).set(buf);
+        return BigInt(32);
+      },
+      kh_real_unlink: (pathPtr: number, pathLen: number): number => {
+        const fs = hostBox.state.hostFs;
+        if (!fs) return -EACCES;
+        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+        return fs.unlink(path);
+      },
       kh_real_mkdir: (
-        _pathPtr: number,
-        _pathLen: number,
-        _mode: number,
-      ): number => -EACCES,
+        pathPtr: number,
+        pathLen: number,
+        mode: number,
+      ): number => {
+        const fs = hostBox.state.hostFs;
+        if (!fs) return -EACCES;
+        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+        return fs.mkdir(path, mode);
+      },
       kh_real_symlink: (
-        _targetPtr: number,
-        _targetLen: number,
-        _linkPtr: number,
-        _linkLen: number,
-      ): number => -EACCES,
+        targetPtr: number,
+        targetLen: number,
+        linkPtr: number,
+        linkLen: number,
+      ): number => {
+        const fs = hostBox.state.hostFs;
+        if (!fs) return -EACCES;
+        const target = new Uint8Array(memoryRef.memory!.buffer, targetPtr, targetLen).slice();
+        const link = new Uint8Array(memoryRef.memory!.buffer, linkPtr, linkLen).slice();
+        return fs.symlink(target, link);
+      },
       kh_real_rename: (
-        _oldPtr: number,
-        _oldLen: number,
-        _newPtr: number,
-        _newLen: number,
-      ): number => -EACCES,
-      // Outbound HTTP — browser microkernels back this with the
-      // browser's fetch(); Deno with native fetch. Stub for now.
+        oldPtr: number,
+        oldLen: number,
+        newPtr: number,
+        newLen: number,
+      ): number => {
+        const fs = hostBox.state.hostFs;
+        if (!fs) return -EACCES;
+        const oldP = new Uint8Array(memoryRef.memory!.buffer, oldPtr, oldLen).slice();
+        const newP = new Uint8Array(memoryRef.memory!.buffer, newPtr, newLen).slice();
+        return fs.rename(oldP, newP);
+      },
+      // Outbound HTTP — kh_fetch_blocking is intrinsically async on
+      // the JS side (fetch() returns a Promise). Until the
+      // AsyncBridge integration lands, the JS microkernel stubs
+      // this with -ENOSYS so callers fall back to an alternative
+      // path. Browser/Deno embedders that want it functional
+      // arrange JSPI / asyncify suspension and call fetch() there.
       kh_fetch_blocking: (
         _reqPtr: number,
         _reqLen: number,
         _outPtr: number,
         _outCap: number,
-      ): bigint => BigInt(-EACCES),
-      // TCP socket surface. Browser microkernels can't open raw
-      // TCP — they map kh_socket_* to WebSocket transport with a
-      // matching wire shape; Deno wires Deno.connect / Deno.listen.
+      ): bigint => BigInt(-38), // -ENOSYS
+      // Pluggable TCP socket surface. When HostState.tcp is set,
+      // delegate; otherwise -EACCES. Browser microkernels install
+      // a WebSocket-relay impl; Deno wires Deno.connect/listen.
       kh_socket_connect: (
-        _addrPtr: number,
-        _addrLen: number,
-        _flags: number,
-      ): number => -EACCES,
+        addrPtr: number,
+        addrLen: number,
+        flags: number,
+      ): number => {
+        const tcp = hostBox.state.tcp;
+        if (!tcp) return -EACCES;
+        const addr = new TextDecoder().decode(
+          new Uint8Array(memoryRef.memory!.buffer, addrPtr, addrLen),
+        );
+        const colon = addr.lastIndexOf(":");
+        if (colon < 0) return -22;
+        const host = addr.slice(0, colon);
+        const port = parseInt(addr.slice(colon + 1), 10);
+        if (!Number.isFinite(port)) return -22;
+        if (hostBox.state.policy.mayConnect?.(host, port) === "deny") return -EACCES;
+        return tcp.connect(host, port, flags);
+      },
       kh_socket_send: (
-        _handle: number,
-        _dataPtr: number,
-        _dataLen: number,
-      ): bigint => BigInt(-EACCES),
+        handle: number,
+        dataPtr: number,
+        dataLen: number,
+      ): bigint => {
+        const tcp = hostBox.state.tcp;
+        if (!tcp) return BigInt(-EBADF);
+        const data = new Uint8Array(memoryRef.memory!.buffer, dataPtr, dataLen).slice();
+        return BigInt(tcp.send(handle, data));
+      },
       kh_socket_recv: (
-        _handle: number,
-        _outPtr: number,
-        _len: number,
-        _flags: number,
-      ): bigint => BigInt(-EACCES),
-      kh_socket_close: (_handle: number): number => 0,
+        handle: number,
+        outPtr: number,
+        len: number,
+        flags: number,
+      ): bigint => {
+        const tcp = hostBox.state.tcp;
+        if (!tcp) return BigInt(-EBADF);
+        const buf = new Uint8Array(len);
+        const n = tcp.recv(handle, buf, flags);
+        if (n > 0) {
+          new Uint8Array(memoryRef.memory!.buffer, outPtr, n).set(buf.subarray(0, n));
+        }
+        return BigInt(n);
+      },
+      kh_socket_close: (handle: number): number => {
+        const tcp = hostBox.state.tcp;
+        if (!tcp) return 0;
+        return tcp.close(handle);
+      },
       kh_socket_listen_at: (
-        _addrPtr: number,
-        _addrLen: number,
-        _backlog: number,
-      ): number => -EACCES,
+        addrPtr: number,
+        addrLen: number,
+        backlog: number,
+      ): number => {
+        const tcp = hostBox.state.tcp;
+        if (!tcp) return -EACCES;
+        const addr = new TextDecoder().decode(
+          new Uint8Array(memoryRef.memory!.buffer, addrPtr, addrLen),
+        );
+        const colon = addr.lastIndexOf(":");
+        if (colon < 0) return -22;
+        const host = addr.slice(0, colon);
+        const port = parseInt(addr.slice(colon + 1), 10);
+        if (!Number.isFinite(port)) return -22;
+        if (hostBox.state.policy.mayListen?.(port) === "deny") return -EACCES;
+        return tcp.listen(host, port, backlog);
+      },
       kh_socket_accept_blocking: (
-        _handle: number,
-        _flags: number,
-      ): number => -EACCES,
+        handle: number,
+        flags: number,
+      ): number => {
+        const tcp = hostBox.state.tcp;
+        if (!tcp) return -EBADF;
+        return tcp.accept(handle, flags);
+      },
       kh_socket_local_addr: (
-        _handle: number,
-        _outPtr: number,
-        _outCap: number,
-      ): bigint => BigInt(-EACCES),
+        handle: number,
+        outPtr: number,
+        outCap: number,
+      ): bigint => {
+        const tcp = hostBox.state.tcp;
+        if (!tcp) return BigInt(-EBADF);
+        const addr = tcp.localAddr(handle);
+        if (!addr) return BigInt(-EBADF);
+        const hostBytes = new TextEncoder().encode(addr.host);
+        const need = 2 + hostBytes.byteLength;
+        if (need > outCap) return BigInt(-E2BIG);
+        const buf = new Uint8Array(need);
+        new DataView(buf.buffer).setUint16(0, addr.port, true);
+        buf.set(hostBytes, 2);
+        new Uint8Array(memoryRef.memory!.buffer, outPtr, need).set(buf);
+        return BigInt(need);
+      },
       // Durable KV (IndexedDB-shaped). Browser microkernels back
       // this with IndexedDB; Deno with redb-shaped storage; stub
       // returns -EACCES so kernel.wasm callers see the policy
       // shape consistently.
       kh_idb_get: (
-        _storePtr: number,
-        _storeLen: number,
-        _keyPtr: number,
-        _keyLen: number,
-        _outPtr: number,
-        _outCap: number,
-      ): bigint => BigInt(-EACCES),
+        storePtr: number,
+        storeLen: number,
+        keyPtr: number,
+        keyLen: number,
+        outPtr: number,
+        outCap: number,
+      ): bigint => {
+        const kv = hostBox.state.kv;
+        if (!kv) return BigInt(-EACCES);
+        const store = new Uint8Array(memoryRef.memory!.buffer, storePtr, storeLen).slice();
+        const key = new Uint8Array(memoryRef.memory!.buffer, keyPtr, keyLen).slice();
+        if (
+          hostBox.state.policy.mayIdb?.(store, false) === "deny"
+        ) return BigInt(-EACCES);
+        const v = kv.get(store, key);
+        if (typeof v === "number") return BigInt(v);
+        if (v.byteLength > outCap) return BigInt(-E2BIG);
+        new Uint8Array(memoryRef.memory!.buffer, outPtr, v.byteLength).set(v);
+        return BigInt(v.byteLength);
+      },
       kh_idb_put: (
-        _storePtr: number,
-        _storeLen: number,
-        _keyPtr: number,
-        _keyLen: number,
-        _valuePtr: number,
-        _valueLen: number,
-      ): number => -EACCES,
+        storePtr: number,
+        storeLen: number,
+        keyPtr: number,
+        keyLen: number,
+        valuePtr: number,
+        valueLen: number,
+      ): number => {
+        const kv = hostBox.state.kv;
+        if (!kv) return -EACCES;
+        const store = new Uint8Array(memoryRef.memory!.buffer, storePtr, storeLen).slice();
+        const key = new Uint8Array(memoryRef.memory!.buffer, keyPtr, keyLen).slice();
+        const value = new Uint8Array(memoryRef.memory!.buffer, valuePtr, valueLen).slice();
+        if (hostBox.state.policy.mayIdb?.(store, true) === "deny") return -EACCES;
+        return kv.put(store, key, value);
+      },
       kh_idb_delete: (
-        _storePtr: number,
-        _storeLen: number,
-        _keyPtr: number,
-        _keyLen: number,
-      ): number => -EACCES,
+        storePtr: number,
+        storeLen: number,
+        keyPtr: number,
+        keyLen: number,
+      ): number => {
+        const kv = hostBox.state.kv;
+        if (!kv) return -EACCES;
+        const store = new Uint8Array(memoryRef.memory!.buffer, storePtr, storeLen).slice();
+        const key = new Uint8Array(memoryRef.memory!.buffer, keyPtr, keyLen).slice();
+        if (hostBox.state.policy.mayIdb?.(store, true) === "deny") return -EACCES;
+        return kv.delete(store, key);
+      },
       kh_idb_list: (
-        _storePtr: number,
-        _storeLen: number,
-        _prefixPtr: number,
-        _prefixLen: number,
-        _outPtr: number,
-        _outCap: number,
-      ): bigint => BigInt(-EACCES),
+        storePtr: number,
+        storeLen: number,
+        prefixPtr: number,
+        prefixLen: number,
+        outPtr: number,
+        outCap: number,
+      ): bigint => {
+        const kv = hostBox.state.kv;
+        if (!kv) return BigInt(-EACCES);
+        const store = new Uint8Array(memoryRef.memory!.buffer, storePtr, storeLen).slice();
+        const prefix = new Uint8Array(memoryRef.memory!.buffer, prefixPtr, prefixLen).slice();
+        if (hostBox.state.policy.mayIdb?.(store, false) === "deny") return BigInt(-EACCES);
+        const keys = kv.list(store, prefix);
+        // Pack count + (len, bytes)*.
+        let total = 4;
+        let count = 0;
+        for (const k of keys) {
+          const need = 4 + k.byteLength;
+          if (total + need > outCap) break;
+          total += need;
+          count++;
+        }
+        const buf = new Uint8Array(total);
+        const view = new DataView(buf.buffer);
+        view.setUint32(0, count >>> 0, true);
+        let cur = 4;
+        for (let i = 0; i < count; i++) {
+          const k = keys[i];
+          view.setUint32(cur, k.byteLength >>> 0, true);
+          cur += 4;
+          buf.set(k, cur);
+          cur += k.byteLength;
+        }
+        new Uint8Array(memoryRef.memory!.buffer, outPtr, total).set(buf);
+        return BigInt(total);
+      },
       kh_extension_invoke: (
         reqPtr: number,
         reqLen: number,
