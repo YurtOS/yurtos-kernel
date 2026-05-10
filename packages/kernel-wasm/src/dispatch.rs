@@ -91,6 +91,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_RMDIR => rmdir(caller_pid, request),
         METHOD_SYS_READDIR => readdir(caller_pid, request, response),
         METHOD_SYS_LINK => hard_link(caller_pid, request),
+        METHOD_SYS_RENAME => rename(caller_pid, request),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -1192,6 +1193,25 @@ fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
     }
     let _ = caller_pid;
     with_kernel(|k| k.vfs.symlink(target, link_path) as i64)
+}
+
+/// `rename(old_len, old, new)`. Wire shape mirrors symlink/link.
+/// Routes to `MountTable::rename`, which enforces same-mount.
+fn rename(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let old_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    if request.len() < 4 + old_len {
+        return -(abi::EINVAL as i64);
+    }
+    let old_path = &request[4..4 + old_len];
+    let new_path = &request[4 + old_len..];
+    if new_path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid;
+    with_kernel(|k| k.vfs.rename(old_path, new_path) as i64)
 }
 
 /// `link(target_len, target, link_path)`. Same wire format as
@@ -3240,6 +3260,74 @@ mod tests {
         assert_eq!(
             dispatch(METHOD_SYS_LINK, 1, &req, &mut []),
             -(abi::EEXIST as i64),
+        );
+    }
+
+    #[test]
+    fn rename_moves_regular_file_to_new_path() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = 5_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(b"/old0");
+        reg.extend_from_slice(b"data!");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let old: &[u8] = b"/old0";
+        let new: &[u8] = b"/new0";
+        let mut req = (old.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(old);
+        req.extend_from_slice(new);
+        assert_eq!(dispatch(METHOD_SYS_RENAME, 1, &req, &mut []), 0);
+
+        // /old0 is gone.
+        assert_eq!(
+            dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/old0"), &mut []),
+            -(abi::ENOENT as i64),
+        );
+        // /new0 has the original content.
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/new0"), &mut []);
+        assert!(fd >= 0);
+        let mut buf = [0u8; 8];
+        let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"data!");
+    }
+
+    #[test]
+    fn rename_replaces_existing_destination_file() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut a = 3_u32.to_le_bytes().to_vec();
+        a.extend_from_slice(b"/aa");
+        a.extend_from_slice(b"AAA");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &a, &mut []);
+        let mut b = 3_u32.to_le_bytes().to_vec();
+        b.extend_from_slice(b"/bb");
+        b.extend_from_slice(b"BBB");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &b, &mut []);
+
+        let old: &[u8] = b"/aa";
+        let new: &[u8] = b"/bb";
+        let mut req = (old.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(old);
+        req.extend_from_slice(new);
+        assert_eq!(dispatch(METHOD_SYS_RENAME, 1, &req, &mut []), 0);
+
+        // /bb now reads "AAA".
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/bb"), &mut []);
+        let mut buf = [0u8; 8];
+        let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"AAA");
+    }
+
+    #[test]
+    fn rename_missing_source_is_enoent() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let old: &[u8] = b"/no";
+        let new: &[u8] = b"/yes";
+        let mut req = (old.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(old);
+        req.extend_from_slice(new);
+        assert_eq!(
+            dispatch(METHOD_SYS_RENAME, 1, &req, &mut []),
+            -(abi::ENOENT as i64),
         );
     }
 

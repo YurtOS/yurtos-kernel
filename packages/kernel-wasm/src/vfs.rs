@@ -182,6 +182,13 @@ pub trait VfsBackend: Send {
     fn link(&mut self, _target: &[u8], _link_path: &[u8]) -> i32 {
         -1 // -EPERM
     }
+
+    /// Atomically rename `old_path` to `new_path`. Same backend; the
+    /// MountTable enforces same-mount before delegating. Default:
+    /// -EROFS — backends that don't support mutation say so.
+    fn rename(&mut self, _old_path: &[u8], _new_path: &[u8]) -> i32 {
+        -30 // -EROFS
+    }
 }
 
 /// One row in the mount table.
@@ -373,6 +380,19 @@ impl MountTable {
             return -(crate::abi::EXDEV as i64) as i32;
         }
         self.mounts[tid as usize].backend.link(&t_rel, &l_rel)
+    }
+
+    pub fn rename(&mut self, old_path: &[u8], new_path: &[u8]) -> i32 {
+        let Some((oid, o_rel)) = self.resolve(old_path) else {
+            return -(crate::abi::ENOENT as i64) as i32;
+        };
+        let Some((nid, n_rel)) = self.resolve(new_path) else {
+            return -(crate::abi::ENOENT as i64) as i32;
+        };
+        if oid != nid {
+            return -(crate::abi::EXDEV as i64) as i32;
+        }
+        self.mounts[oid as usize].backend.rename(&o_rel, &n_rel)
     }
 
     /// Push a fresh snapshot of the kernel's process table to every
@@ -681,6 +701,49 @@ impl VfsBackend for RamfsBackend {
         } else {
             0
         }
+    }
+
+    fn rename(&mut self, old_path: &[u8], new_path: &[u8]) -> i32 {
+        if old_path == new_path {
+            return 0;
+        }
+        // Source must exist (regular file, symlink, or directory).
+        let src_kind = if self.paths.contains_key(old_path) {
+            1u8
+        } else if self.symlinks.contains_key(old_path) {
+            2
+        } else if self.dirs.contains(old_path) {
+            3
+        } else {
+            return -(crate::abi::ENOENT as i64) as i32;
+        };
+        // Destination handling: refuse if it's a directory (POSIX
+        // requires the destination be empty, and we don't yet
+        // walk children to check). Replace a regular file by
+        // unlinking it first; replace a symlink the same way.
+        if self.dirs.contains(new_path) {
+            return -(crate::abi::EEXIST as i64) as i32;
+        }
+        if self.paths.contains_key(new_path) {
+            self.unlink(new_path);
+        } else if self.symlinks.contains_key(new_path) {
+            self.symlinks.remove(new_path);
+        }
+        match src_kind {
+            1 => {
+                let id = self.paths.remove(old_path).expect("checked above");
+                self.paths.insert(new_path.to_vec(), id);
+            }
+            2 => {
+                let target = self.symlinks.remove(old_path).expect("checked above");
+                self.symlinks.insert(new_path.to_vec(), target);
+            }
+            _ => {
+                self.dirs.remove(old_path);
+                self.dirs.insert(new_path.to_vec());
+            }
+        }
+        0
     }
 
     fn symlink(&mut self, target: &[u8], link_path: &[u8]) -> i32 {
