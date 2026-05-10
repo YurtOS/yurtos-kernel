@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use wasmtime::{Engine, Module};
 
 use yurt_runtime_wasmtime::microkernel::{
-    build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, LogSink, Microkernel,
+    build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, InMemoryHostFs,
+    LogSink, Microkernel, NativeHostFs,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -411,7 +412,7 @@ fn host_fs_backend_reads_real_file_via_kh_real_open() {
     }
 
     let mut host = HostState::default();
-    host.host_fs_root = Some(dir.clone());
+    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
@@ -432,6 +433,54 @@ fn host_fs_backend_reads_real_file_via_kh_real_open() {
     assert_eq!(&buf[..n as usize], b"hello from real disk\n");
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn host_fs_in_memory_impl_round_trips_without_real_disk() {
+    // Same kernel.wasm, different host_fs impl. The InMemoryHostFs
+    // is the shape browser microkernels use while OPFS isn't yet
+    // wired (it satisfies HostFsImpl without touching real disk):
+    // sandbox tests can exercise the full kh_real_* surface here
+    // and the browser microkernel can later swap in OPFS without
+    // changing kernel.wasm.
+    build_kernel_wasm().unwrap();
+    let memfs = Arc::new(InMemoryHostFs::new());
+    memfs.install_file(b"/seed.txt", b"hello memfs".to_vec());
+
+    let mut host = HostState::default();
+    host.host_fs = Some(memfs.clone());
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    mk.mount_host_fs(b"/host").unwrap();
+
+    // Read the pre-installed file via the user-facing sys_open +
+    // sys_read path.
+    let mut req = 0_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(b"/host/seed.txt");
+    let fd = mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap();
+    assert!(fd >= 0, "open: {fd}");
+    let mut buf = vec![0u8; 32];
+    let n = mk
+        .syscall(METHOD_SYS_READ, &(fd as u32).to_le_bytes(), &mut buf)
+        .unwrap();
+    assert_eq!(&buf[..n as usize], b"hello memfs");
+
+    // Mutating ops also work — mkdir, rename, unlink — against the
+    // same in-memory store, with no disk I/O at all.
+    assert_eq!(
+        mk.syscall(METHOD_SYS_MKDIR, b"/host/sub", &mut []).unwrap(),
+        0,
+    );
+    let old: &[u8] = b"/host/seed.txt";
+    let new: &[u8] = b"/host/moved.txt";
+    let mut req = (old.len() as u32).to_le_bytes().to_vec();
+    req.extend_from_slice(old);
+    req.extend_from_slice(new);
+    assert_eq!(mk.syscall(METHOD_SYS_RENAME, &req, &mut []).unwrap(), 0);
+    assert_eq!(
+        mk.syscall(METHOD_SYS_UNLINK, b"/host/moved.txt", &mut [])
+            .unwrap(),
+        0,
+    );
 }
 
 #[test]
@@ -460,7 +509,7 @@ fn host_fs_traversal_outside_root_is_eacces() {
     }
 
     let mut host = HostState::default();
-    host.host_fs_root = Some(parent.join("inner"));
+    host.host_fs = Some(Arc::new(NativeHostFs::new(parent.join("inner"))));
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/host").unwrap();
 
@@ -515,7 +564,7 @@ fn host_fs_writable_ops_create_then_rename_then_unlink() {
     }
 
     let mut host = HostState::default();
-    host.host_fs_root = Some(dir.clone());
+    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/host").unwrap();
 
@@ -572,7 +621,7 @@ fn host_fs_fstat_reports_real_file_size() {
     }
 
     let mut host = HostState::default();
-    host.host_fs_root = Some(dir.clone());
+    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
@@ -611,7 +660,7 @@ fn host_fs_writes_create_a_real_file() {
     fs::create_dir_all(&dir).unwrap();
 
     let mut host = HostState::default();
-    host.host_fs_root = Some(dir.clone());
+    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
@@ -660,7 +709,7 @@ fn host_fs_mount_prefix_is_arbitrary() {
     }
 
     let mut host = HostState::default();
-    host.host_fs_root = Some(dir.clone());
+    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/users/user").unwrap();
 
@@ -818,7 +867,7 @@ fn host_fs_policy_can_deny_specific_paths() {
     }
 
     let mut host = HostState::default();
-    host.host_fs_root = Some(dir.clone());
+    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
     host.policy = Arc::new(Allowlist);
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 

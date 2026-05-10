@@ -279,24 +279,21 @@ pub struct HostState {
     /// override via `Microkernel::with_host_state_mut` or by
     /// constructing a custom HostState.
     pub policy: Arc<dyn PolicyEnforcer>,
-    /// Filesystem root for `kh_real_*`. When `None`, every host-fs
-    /// open returns -EACCES (the safe default). When set,
-    /// `kh_real_open` joins this path with the user-supplied
-    /// relative path; canonicalized result must stay under the
-    /// root (escape protection — `..` traversal that climbs above
-    /// the root is rejected). Embedders that want full host fs
-    /// access leave `host_fs_root = Some(PathBuf::from("/"))` and
-    /// rely on `PolicyEnforcer::may_open_path` for filtering.
-    pub host_fs_root: Option<PathBuf>,
-    /// Open host-side file descriptors keyed by the kh-fd handed
-    /// out from `kh_real_open`. The `i32` keys are also the
-    /// `inode` values surfaced through HostFsBackend. Mutated by
-    /// every `kh_real_open` / `kh_real_close`.
-    pub host_fs_handles: std::collections::BTreeMap<i32, std::fs::File>,
-    /// Counter for the next `kh_real_open` allocation. Starts at 1
-    /// so positive returns are non-zero (matches POSIX-fd
-    /// convention; negative is reserved for errors).
-    pub next_host_fd: i32,
+    /// The host filesystem the `kh_real_*` imports route to. *All*
+    /// host-fs access — local disk, S3, OPFS, in-memory — goes
+    /// through this trait; the embedder picks an implementation.
+    /// `None` means "no host fs at all" and every `kh_real_*` call
+    /// returns -EACCES (the safe default for sandboxes that don't
+    /// need it).
+    ///
+    /// Common choices:
+    /// - [`NativeHostFs::new(root)`] — local disk under `root`
+    ///   with canonicalize-and-contain protection.
+    /// - [`InMemoryHostFs::new()`] — in-process map, useful for
+    ///   tests and for browser microkernels that haven't wired up
+    ///   OPFS yet.
+    /// - Embedder-provided impls for S3, OPFS, IndexedDB, etc.
+    pub host_fs: Option<Arc<dyn HostFsImpl>>,
 }
 
 impl Default for HostState {
@@ -306,10 +303,432 @@ impl Default for HostState {
             extensions: Arc::new(EmptyExtensionRegistry),
             log_sink: Arc::new(DiscardLogSink),
             policy: Arc::new(AllowAllPolicy),
-            host_fs_root: None,
-            host_fs_handles: std::collections::BTreeMap::new(),
-            next_host_fd: 1,
+            host_fs: None,
         }
+    }
+}
+
+/// Pluggable host-fs backend. *Every* host-fs access goes through
+/// this trait — local disk, OPFS, S3, in-memory, all the same
+/// surface. The microkernel calls these methods from inside each
+/// `kh_real_*` import after the policy gate has Allowed the call;
+/// implementations are responsible for their own rooting/
+/// containment (e.g. [`NativeHostFs`] canonicalizes against its
+/// configured root and rejects escapes; [`InMemoryHostFs`] keys
+/// directly off the path bytes; an S3 impl would map paths to
+/// object keys under a configured bucket prefix).
+pub trait HostFsImpl: Send + Sync {
+    fn open(&self, path: &[u8], flags: u32) -> i32;
+    fn read(&self, fd: i32, buf: &mut [u8]) -> i64;
+    fn write(&self, fd: i32, data: &[u8]) -> i64;
+    fn close(&self, fd: i32) -> i32;
+    fn stat(&self, path: &[u8]) -> Result<HostFsStat, i32>;
+    fn unlink(&self, path: &[u8]) -> i32;
+    fn mkdir(&self, path: &[u8], mode: u32) -> i32;
+    fn symlink(&self, target: &[u8], link_path: &[u8]) -> i32;
+    fn rename(&self, old_path: &[u8], new_path: &[u8]) -> i32;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HostFsStat {
+    pub size: u64,
+    pub mode: u32,
+    pub mtime_ns: u64,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+}
+
+/// Real-disk implementation of [`HostFsImpl`]. Wraps `std::fs`
+/// with a configured root directory and canonicalize-and-contain
+/// path resolution: every absolute path the kernel sends (e.g.
+/// `/etc/hosts`) is joined against the root, canonicalized, and
+/// rejected if the result climbs above the root via `..`. Open
+/// fds are stored in an internal map keyed by the i32 handle the
+/// kernel sees.
+pub struct NativeHostFs {
+    root: PathBuf,
+    inner: std::sync::Mutex<NativeFsState>,
+}
+
+#[derive(Default)]
+struct NativeFsState {
+    fds: std::collections::BTreeMap<i32, std::fs::File>,
+    next_fd: i32,
+}
+
+impl NativeHostFs {
+    pub fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            inner: std::sync::Mutex::new(NativeFsState {
+                next_fd: 1,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Canonicalize `path` (kernel-supplied absolute) against the
+    /// root. Returns the resolved absolute path on success or a
+    /// negated POSIX errno (-EACCES on escape, -ENOENT when the
+    /// leaf is missing and `allow_missing` is false). The leaf-
+    /// missing case is allowed for create/mkdir/symlink/rename
+    /// destinations and falls back to canonicalizing the parent.
+    fn resolve(&self, path: &[u8], allow_missing: bool) -> std::result::Result<PathBuf, i32> {
+        let rel: &[u8] = if path.starts_with(b"/") { &path[1..] } else { path };
+        let rel_str = std::str::from_utf8(rel).map_err(|_| -EINVAL as i32)?;
+        let candidate = self.root.join(rel_str);
+        let root_canon = self.root.canonicalize().map_err(|_| -EACCES as i32)?;
+        match candidate.canonicalize() {
+            Ok(p) if p.starts_with(&root_canon) => Ok(p),
+            Ok(_) => Err(-EACCES as i32),
+            Err(_) if allow_missing => {
+                let parent = candidate.parent().ok_or(-EINVAL as i32)?;
+                let parent_canon = parent.canonicalize().map_err(|_| -ENOENT as i32)?;
+                if !parent_canon.starts_with(&root_canon) {
+                    return Err(-EACCES as i32);
+                }
+                Ok(parent_canon.join(candidate.file_name().unwrap_or_default()))
+            }
+            Err(_) => Err(-ENOENT as i32),
+        }
+    }
+
+    fn map_io(e: std::io::Error) -> i32 {
+        host_io_errno(e)
+    }
+}
+
+impl HostFsImpl for NativeHostFs {
+    fn open(&self, path: &[u8], flags: u32) -> i32 {
+        let writable = flags & 0b001 != 0;
+        let create = flags & 0b010 != 0;
+        let trunc = flags & 0b100 != 0;
+        let resolved = match self.resolve(path, writable && create) {
+            Ok(p) => p,
+            Err(rc) => return rc,
+        };
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        if writable {
+            opts.write(true);
+        }
+        if create {
+            opts.create(true);
+        }
+        if trunc && writable {
+            opts.truncate(true);
+        }
+        let file = match opts.open(&resolved) {
+            Ok(f) => f,
+            Err(e) => return Self::map_io(e),
+        };
+        let mut s = self.inner.lock().unwrap();
+        let fd = s.next_fd;
+        s.next_fd = s.next_fd.saturating_add(1);
+        s.fds.insert(fd, file);
+        fd
+    }
+
+    fn read(&self, fd: i32, buf: &mut [u8]) -> i64 {
+        use std::io::Read;
+        let mut s = self.inner.lock().unwrap();
+        let Some(file) = s.fds.get_mut(&fd) else {
+            return -(9 as i64);
+        };
+        match file.read(buf) {
+            Ok(n) => n as i64,
+            Err(e) => Self::map_io(e) as i64,
+        }
+    }
+
+    fn write(&self, fd: i32, data: &[u8]) -> i64 {
+        use std::io::Write;
+        let mut s = self.inner.lock().unwrap();
+        let Some(file) = s.fds.get_mut(&fd) else {
+            return -(9 as i64);
+        };
+        match file.write(data) {
+            Ok(n) => n as i64,
+            Err(e) => Self::map_io(e) as i64,
+        }
+    }
+
+    fn close(&self, fd: i32) -> i32 {
+        self.inner.lock().unwrap().fds.remove(&fd);
+        0
+    }
+
+    fn stat(&self, path: &[u8]) -> Result<HostFsStat, i32> {
+        let resolved = self.resolve(path, false)?;
+        let meta = std::fs::metadata(&resolved).map_err(Self::map_io)?;
+        let mode: u32 = if meta.is_dir() { 0o040_755 } else { 0o100_644 };
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        Ok(HostFsStat {
+            size: meta.len(),
+            mode,
+            mtime_ns,
+            is_dir: meta.is_dir(),
+            is_symlink: false,
+        })
+    }
+
+    fn unlink(&self, path: &[u8]) -> i32 {
+        let resolved = match self.resolve(path, false) {
+            Ok(p) => p,
+            Err(rc) => return rc,
+        };
+        match std::fs::remove_file(&resolved) {
+            Ok(()) => 0,
+            Err(e) => Self::map_io(e),
+        }
+    }
+
+    fn mkdir(&self, path: &[u8], _mode: u32) -> i32 {
+        let resolved = match self.resolve(path, true) {
+            Ok(p) => p,
+            Err(rc) => return rc,
+        };
+        match std::fs::create_dir(&resolved) {
+            Ok(()) => 0,
+            Err(e) => Self::map_io(e),
+        }
+    }
+
+    fn symlink(&self, target: &[u8], link_path: &[u8]) -> i32 {
+        let link_resolved = match self.resolve(link_path, true) {
+            Ok(p) => p,
+            Err(rc) => return rc,
+        };
+        let target_str = match std::str::from_utf8(target) {
+            Ok(s) => s,
+            Err(_) => return -EINVAL as i32,
+        };
+        #[cfg(unix)]
+        let res = std::os::unix::fs::symlink(target_str, &link_resolved);
+        #[cfg(not(unix))]
+        let res: std::io::Result<()> =
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "symlink"));
+        match res {
+            Ok(()) => 0,
+            Err(e) => Self::map_io(e),
+        }
+    }
+
+    fn rename(&self, old_path: &[u8], new_path: &[u8]) -> i32 {
+        let old_resolved = match self.resolve(old_path, false) {
+            Ok(p) => p,
+            Err(rc) => return rc,
+        };
+        let new_resolved = match self.resolve(new_path, true) {
+            Ok(p) => p,
+            Err(rc) => return rc,
+        };
+        match std::fs::rename(&old_resolved, &new_resolved) {
+            Ok(()) => 0,
+            Err(e) => Self::map_io(e),
+        }
+    }
+}
+
+/// Minimal in-memory implementation of [`HostFsImpl`]. Files are
+/// `Vec<u8>` blobs keyed by absolute path; symlinks are a
+/// separate map of target bytes; directories track only
+/// existence. Reads use a per-fd cursor. No size cap, no
+/// pagination, no concurrent-handle edge cases — this is here so
+/// browser microkernels (and tests that don't want a temp dir)
+/// have a working backend to point at while OPFS is being wired
+/// up.
+pub struct InMemoryHostFs {
+    inner: std::sync::Mutex<InMemoryFsState>,
+}
+
+#[derive(Default)]
+struct InMemoryFsState {
+    files: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    dirs: std::collections::BTreeSet<Vec<u8>>,
+    symlinks: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    /// fd → (path, cursor). The path is the canonical key into
+    /// `files`; cursor is a byte offset advanced by read/write.
+    fds: std::collections::BTreeMap<i32, (Vec<u8>, u64)>,
+    next_fd: i32,
+}
+
+impl InMemoryHostFs {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(InMemoryFsState {
+                next_fd: 1,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Pre-populate a regular file. Useful for tests: install
+    /// fixtures before the microkernel touches them.
+    pub fn install_file(&self, path: &[u8], content: Vec<u8>) {
+        let mut s = self.inner.lock().unwrap();
+        s.files.insert(path.to_vec(), content);
+    }
+}
+
+impl Default for InMemoryHostFs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HostFsImpl for InMemoryHostFs {
+    fn open(&self, path: &[u8], flags: u32) -> i32 {
+        let writable = flags & 0b001 != 0;
+        let create = flags & 0b010 != 0;
+        let trunc = flags & 0b100 != 0;
+        let mut s = self.inner.lock().unwrap();
+        if !s.files.contains_key(path) {
+            if !create {
+                return -(2 as i32); // -ENOENT
+            }
+            if !writable {
+                return -(13 as i32); // -EACCES (create requires write)
+            }
+            s.files.insert(path.to_vec(), Vec::new());
+        } else if trunc && writable {
+            s.files.get_mut(path).unwrap().clear();
+        }
+        let fd = s.next_fd;
+        s.next_fd = s.next_fd.saturating_add(1);
+        s.fds.insert(fd, (path.to_vec(), 0));
+        fd
+    }
+
+    fn read(&self, fd: i32, buf: &mut [u8]) -> i64 {
+        let mut s = self.inner.lock().unwrap();
+        let Some((path, cursor)) = s.fds.get(&fd).cloned() else {
+            return -(9 as i64); // -EBADF
+        };
+        let Some(content) = s.files.get(&path) else {
+            return -(9 as i64);
+        };
+        let start = (cursor as usize).min(content.len());
+        let avail = content.len() - start;
+        let n = avail.min(buf.len());
+        if n > 0 {
+            buf[..n].copy_from_slice(&content[start..start + n]);
+        }
+        if let Some(entry) = s.fds.get_mut(&fd) {
+            entry.1 = entry.1.saturating_add(n as u64);
+        }
+        n as i64
+    }
+
+    fn write(&self, fd: i32, data: &[u8]) -> i64 {
+        let mut s = self.inner.lock().unwrap();
+        let Some((path, cursor)) = s.fds.get(&fd).cloned() else {
+            return -(9 as i64);
+        };
+        let Some(content) = s.files.get_mut(&path) else {
+            return -(9 as i64);
+        };
+        let start = cursor as usize;
+        let end = start + data.len();
+        if end > content.len() {
+            content.resize(end, 0);
+        }
+        content[start..end].copy_from_slice(data);
+        if let Some(entry) = s.fds.get_mut(&fd) {
+            entry.1 = entry.1.saturating_add(data.len() as u64);
+        }
+        data.len() as i64
+    }
+
+    fn close(&self, fd: i32) -> i32 {
+        self.inner.lock().unwrap().fds.remove(&fd);
+        0
+    }
+
+    fn stat(&self, path: &[u8]) -> Result<HostFsStat, i32> {
+        let s = self.inner.lock().unwrap();
+        if let Some(content) = s.files.get(path) {
+            return Ok(HostFsStat {
+                size: content.len() as u64,
+                mode: 0o100_644,
+                mtime_ns: 0,
+                is_dir: false,
+                is_symlink: false,
+            });
+        }
+        if s.dirs.contains(path) {
+            return Ok(HostFsStat {
+                size: 0,
+                mode: 0o040_755,
+                mtime_ns: 0,
+                is_dir: true,
+                is_symlink: false,
+            });
+        }
+        if s.symlinks.contains_key(path) {
+            return Ok(HostFsStat {
+                size: 0,
+                mode: 0o120_777,
+                mtime_ns: 0,
+                is_dir: false,
+                is_symlink: true,
+            });
+        }
+        Err(-(2 as i32))
+    }
+
+    fn unlink(&self, path: &[u8]) -> i32 {
+        let mut s = self.inner.lock().unwrap();
+        if s.symlinks.remove(path).is_some() {
+            return 0;
+        }
+        if s.files.remove(path).is_some() {
+            return 0;
+        }
+        -(2 as i32)
+    }
+
+    fn mkdir(&self, path: &[u8], _mode: u32) -> i32 {
+        let mut s = self.inner.lock().unwrap();
+        if s.dirs.contains(path) || s.files.contains_key(path) {
+            return -(17 as i32); // -EEXIST
+        }
+        s.dirs.insert(path.to_vec());
+        0
+    }
+
+    fn symlink(&self, target: &[u8], link_path: &[u8]) -> i32 {
+        let mut s = self.inner.lock().unwrap();
+        if s.files.contains_key(link_path)
+            || s.symlinks.contains_key(link_path)
+            || s.dirs.contains(link_path)
+        {
+            return -(17 as i32);
+        }
+        s.symlinks.insert(link_path.to_vec(), target.to_vec());
+        0
+    }
+
+    fn rename(&self, old_path: &[u8], new_path: &[u8]) -> i32 {
+        let mut s = self.inner.lock().unwrap();
+        if let Some(content) = s.files.remove(old_path) {
+            s.files.insert(new_path.to_vec(), content);
+            return 0;
+        }
+        if let Some(target) = s.symlinks.remove(old_path) {
+            s.symlinks.insert(new_path.to_vec(), target);
+            return 0;
+        }
+        if s.dirs.remove(old_path) {
+            s.dirs.insert(new_path.to_vec());
+            return 0;
+        }
+        -(2 as i32)
     }
 }
 
@@ -972,18 +1391,14 @@ pub use yurt_microkernel_core::{trampoline_request, trampoline_request_with_resp
 
 // ── Linker registration ──────────────────────────────────────────────────────
 
-/// Resolve a kernel-supplied host-fs path to an absolute filesystem
-/// path under the embedder's host_fs_root. Applies the same policy
-/// gate as kh_real_open with write=true and the same root-
-/// containment guarantee. When `allow_missing` is true (mkdir,
-/// symlink, rename target) the leaf is allowed to not exist —
-/// containment is then enforced on the parent.
-fn resolve_host_write_path(
+/// Read a kernel-supplied path slice out of kernel.wasm memory.
+/// Returns the bytes verbatim — no rooting, no canonicalization;
+/// each [`HostFsImpl`] decides how to interpret them.
+fn read_path(
     caller: &mut Caller<'_, KernelStoreData>,
     path_ptr: u32,
     path_len: u32,
-    allow_missing: bool,
-) -> std::result::Result<std::path::PathBuf, i32> {
+) -> std::result::Result<Vec<u8>, i32> {
     let memory = caller
         .get_export("memory")
         .and_then(|e| e.into_memory())
@@ -996,42 +1411,7 @@ fn resolve_host_write_path(
     {
         return Err(-EFAULT as i32);
     }
-    let root = caller
-        .data()
-        .host
-        .host_fs_root
-        .clone()
-        .ok_or(-EACCES as i32)?;
-    if caller
-        .data()
-        .host
-        .policy
-        .may_open_path(&path, true)
-        == PolicyDecision::Deny
-    {
-        return Err(-EACCES as i32);
-    }
-    let rel: &[u8] = if path.starts_with(b"/") { &path[1..] } else { &path };
-    let rel_str = std::str::from_utf8(rel).map_err(|_| -EINVAL as i32)?;
-    let candidate = root.join(rel_str);
-    let root_canon = root.canonicalize().map_err(|_| -EACCES as i32)?;
-    let resolved = match candidate.canonicalize() {
-        Ok(p) => p,
-        Err(_) if allow_missing => {
-            // Leaf doesn't exist; canonicalize parent and rebuild.
-            let parent = candidate.parent().ok_or(-EINVAL as i32)?;
-            let parent_canon = parent.canonicalize().map_err(|_| -ENOENT as i32)?;
-            if !parent_canon.starts_with(&root_canon) {
-                return Err(-EACCES as i32);
-            }
-            return Ok(parent_canon.join(candidate.file_name().unwrap_or_default()));
-        }
-        Err(_) => return Err(-ENOENT as i32),
-    };
-    if !resolved.starts_with(&root_canon) {
-        return Err(-EACCES as i32);
-    }
-    Ok(resolved)
+    Ok(path)
 }
 
 fn host_io_errno(e: std::io::Error) -> i32 {
@@ -1157,7 +1537,9 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     // The relative path the kernel sends is joined against the root
     // and canonicalized; results that escape the root via `..`
     // traversal are rejected. fd handles are u31 (positive i32)
-    // tracked in HostState.host_fs_handles; close removes the entry.
+    // tracked by the host_fs HostFsImpl; the trait's close removes
+    // the entry. All routing — local disk, OPFS, S3, in-memory —
+    // goes through HostState.host_fs.
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_real_open",
@@ -1167,23 +1549,11 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          flags: u32,
          _mode: u32|
          -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -(EFAULT as i32),
+            let path = match read_path(&mut caller, path_ptr, path_len) {
+                Ok(p) => p,
+                Err(rc) => return rc,
             };
-            let mut path = vec![0u8; path_len as usize];
-            if path_len > 0 && memory.read(&caller, path_ptr as usize, &mut path).is_err() {
-                return -(EFAULT as i32);
-            }
-            let root = match caller.data().host.host_fs_root.clone() {
-                Some(r) => r,
-                None => return -(EACCES as i32),
-            };
-            // Flags bit 0 = writable; bit 1 = create-if-missing;
-            // bit 2 = truncate. They mirror sys_open exactly.
             let writable = flags & 0b001 != 0;
-            let create = flags & 0b010 != 0;
-            let trunc = flags & 0b100 != 0;
             if caller
                 .data()
                 .host
@@ -1193,69 +1563,11 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             {
                 return -(EACCES as i32);
             }
-            let rel: &[u8] = if path.starts_with(b"/") { &path[1..] } else { &path };
-            let rel_str = match std::str::from_utf8(rel) {
-                Ok(s) => s,
-                Err(_) => return -(EINVAL as i32),
+            let fs = match caller.data().host.host_fs.clone() {
+                Some(f) => f,
+                None => return -(EACCES as i32),
             };
-            let candidate = root.join(rel_str);
-            // Escape protection. For writable opens that target a
-            // brand-new file, canonicalize on the *parent* directory
-            // (the file itself doesn't exist yet) — same containment
-            // guarantee.
-            let root_canon = match root.canonicalize() {
-                Ok(p) => p,
-                Err(_) => return -(EACCES as i32),
-            };
-            let resolved = match candidate.canonicalize() {
-                Ok(p) => p,
-                Err(_) if writable && create => {
-                    // For new-file creates, validate the parent is
-                    // under root, then build the full target path.
-                    let parent = match candidate.parent() {
-                        Some(p) => p,
-                        None => return -(EINVAL as i32),
-                    };
-                    let parent_canon = match parent.canonicalize() {
-                        Ok(p) => p,
-                        Err(_) => return -(ENOENT as i32),
-                    };
-                    if !parent_canon.starts_with(&root_canon) {
-                        return -(EACCES as i32);
-                    }
-                    parent_canon.join(candidate.file_name().unwrap_or_default())
-                }
-                Err(_) => return -(ENOENT as i32),
-            };
-            if !resolved.starts_with(&root_canon) {
-                return -(EACCES as i32);
-            }
-            let mut opts = std::fs::OpenOptions::new();
-            opts.read(true);
-            if writable {
-                opts.write(true);
-            }
-            if create {
-                opts.create(true);
-            }
-            if trunc && writable {
-                opts.truncate(true);
-            }
-            let file = match opts.open(&resolved) {
-                Ok(f) => f,
-                Err(e) => {
-                    return match e.kind() {
-                        std::io::ErrorKind::NotFound => -(ENOENT as i32),
-                        std::io::ErrorKind::PermissionDenied => -(EACCES as i32),
-                        _ => -(EFAULT as i32),
-                    };
-                }
-            };
-            let host = caller.data_mut();
-            let fd = host.host.next_host_fd;
-            host.host.next_host_fd = host.host.next_host_fd.saturating_add(1);
-            host.host.host_fs_handles.insert(fd, file);
-            fd
+            fs.open(&path, flags)
         },
     )?;
     linker.func_wrap(
@@ -1266,33 +1578,24 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          out_ptr: u32,
          len: u32|
          -> i64 {
-            use std::io::Read;
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -EFAULT,
             };
-            let mut buf = vec![0u8; len as usize];
-            // Read the file. Hold a mutable borrow on host state
-            // for the duration so the same fd isn't read twice
-            // concurrently from the (single-threaded) kernel side.
-            let n = {
-                let file = match caller.data_mut().host.host_fs_handles.get_mut(&fd) {
-                    Some(f) => f,
-                    None => return -(EBADF as i64),
-                };
-                match file.read(&mut buf) {
-                    Ok(n) => n,
-                    Err(_) => return -EFAULT,
-                }
+            let fs = match caller.data().host.host_fs.clone() {
+                Some(f) => f,
+                None => return -(EBADF as i64),
             };
+            let mut buf = vec![0u8; len as usize];
+            let n = fs.read(fd, &mut buf);
             if n > 0
                 && memory
-                    .write(&mut caller, out_ptr as usize, &buf[..n])
+                    .write(&mut caller, out_ptr as usize, &buf[..n as usize])
                     .is_err()
             {
                 return -EFAULT;
             }
-            n as i64
+            n
         },
     )?;
     linker.func_wrap(
@@ -1303,7 +1606,6 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          data_ptr: u32,
          data_len: u32|
          -> i64 {
-            use std::io::Write;
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -EFAULT,
@@ -1312,42 +1614,24 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut buf).is_err() {
                 return -EFAULT;
             }
-            // The fd was opened with the writable bit (or we wouldn't
-            // have a writable OFD on the kernel side); std::fs::File
-            // returns an error if the file's mode doesn't permit
-            // writes. We surface that as -EBADF.
-            let file = match caller.data_mut().host.host_fs_handles.get_mut(&fd) {
+            let fs = match caller.data().host.host_fs.clone() {
                 Some(f) => f,
                 None => return -(EBADF as i64),
             };
-            match file.write(&buf) {
-                Ok(n) => n as i64,
-                Err(e) => match e.kind() {
-                    std::io::ErrorKind::PermissionDenied => -(EACCES as i64),
-                    std::io::ErrorKind::WriteZero => 0,
-                    _ => -EFAULT,
-                },
-            }
+            fs.write(fd, &buf)
         },
     )?;
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_real_close",
         |mut caller: Caller<'_, KernelStoreData>, fd: i32| -> i32 {
-            // Remove the entry; Drop closes the file. Returning the
-            // count keeps caller-visible behavior the same whether or
-            // not the fd existed (best-effort close, like POSIX).
-            caller.data_mut().host.host_fs_handles.remove(&fd);
-            0
+            let fs = match caller.data().host.host_fs.clone() {
+                Some(f) => f,
+                None => return 0,
+            };
+            fs.close(fd)
         },
     )?;
-    // ── kh_real_stat: kh_stat_v1 record into kernel scratch ────────
-    //
-    // Same path-resolution and policy gates as kh_real_open. Writes
-    // the kh_stat_v1 (32-byte) record per
-    // abi/contract/kernel_host_abi.toml: u16 version, u16 _pad, u32
-    // mode, u64 size, u64 mtime_ns, u8 is_dir, u8 is_symlink,
-    // u8[6] _reserved.
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_real_stat",
@@ -1364,16 +1648,10 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Some(m) => m,
                 None => return -EFAULT,
             };
-            let mut path = vec![0u8; path_len as usize];
-            if path_len > 0 && memory.read(&caller, path_ptr as usize, &mut path).is_err() {
-                return -EFAULT;
-            }
-            let root = match caller.data().host.host_fs_root.clone() {
-                Some(r) => r,
-                None => return -EACCES,
+            let path = match read_path(&mut caller, path_ptr, path_len) {
+                Ok(p) => p,
+                Err(rc) => return rc as i64,
             };
-            // Stat is read-only access; mirror the open path's
-            // policy gate with write=false.
             if caller
                 .data()
                 .host
@@ -1383,81 +1661,46 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             {
                 return -EACCES;
             }
-            let rel: &[u8] = if path.starts_with(b"/") { &path[1..] } else { &path };
-            let rel_str = match std::str::from_utf8(rel) {
+            let fs = match caller.data().host.host_fs.clone() {
+                Some(f) => f,
+                None => return -EACCES,
+            };
+            let stat = match fs.stat(&path) {
                 Ok(s) => s,
-                Err(_) => return -EINVAL,
+                Err(rc) => return rc as i64,
             };
-            let candidate = root.join(rel_str);
-            let resolved = match candidate.canonicalize() {
-                Ok(p) => p,
-                Err(_) => return -ENOENT,
-            };
-            let root_canon = match root.canonicalize() {
-                Ok(p) => p,
-                Err(_) => return -EACCES,
-            };
-            if !resolved.starts_with(&root_canon) {
-                return -EACCES;
-            }
-            let meta = match std::fs::metadata(&resolved) {
-                Ok(m) => m,
-                Err(e) => {
-                    return match e.kind() {
-                        std::io::ErrorKind::NotFound => -ENOENT,
-                        std::io::ErrorKind::PermissionDenied => -EACCES,
-                        _ => -EFAULT,
-                    };
-                }
-            };
+            // kh_stat_v1: u16 version + u16 _pad + u32 mode +
+            // u64 size + u64 mtime_ns + u8 is_dir + u8 is_symlink +
+            // u8[6] _reserved = 32 bytes total.
             let mut buf = [0u8; 32];
-            // version=1
             buf[0..2].copy_from_slice(&1_u16.to_le_bytes());
-            // mode (POSIX-style file mode bits; std::fs's permissions
-            // don't expose the full mode portably, so we reconstruct
-            // a minimal one). Phase 5: 0o100644 for regular files,
-            // 0o040755 for dirs.
-            let mode: u32 = if meta.is_dir() { 0o040_755 } else { 0o100_644 };
-            buf[4..8].copy_from_slice(&mode.to_le_bytes());
-            buf[8..16].copy_from_slice(&meta.len().to_le_bytes());
-            // mtime_ns: best-effort; falls back to 0 on platforms
-            // without modified() support.
-            let mtime_ns = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0);
-            buf[16..24].copy_from_slice(&mtime_ns.to_le_bytes());
-            buf[24] = if meta.is_dir() { 1 } else { 0 };
-            buf[25] = 0; // is_symlink — std::fs::metadata follows symlinks
+            buf[4..8].copy_from_slice(&stat.mode.to_le_bytes());
+            buf[8..16].copy_from_slice(&stat.size.to_le_bytes());
+            buf[16..24].copy_from_slice(&stat.mtime_ns.to_le_bytes());
+            buf[24] = if stat.is_dir { 1 } else { 0 };
+            buf[25] = if stat.is_symlink { 1 } else { 0 };
             if memory.write(&mut caller, out_ptr as usize, &buf).is_err() {
                 return -EFAULT;
             }
-            32 // bytes written
+            32
         },
     )?;
-
-    // ── kh_real_unlink / mkdir / symlink / rename ──────────────────
-    //
-    // Mutating counterparts to kh_real_open/stat. Each does the
-    // same root containment check and asks the policy via
-    // may_open_path(write=true) before touching the host fs.
-    // Errno mapping is the same as kh_real_open.
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_real_unlink",
-        |mut caller: Caller<'_, KernelStoreData>,
-         path_ptr: u32,
-         path_len: u32|
-         -> i32 {
-            match resolve_host_write_path(&mut caller, path_ptr, path_len, false) {
-                Err(rc) => rc,
-                Ok(p) => match std::fs::remove_file(&p) {
-                    Ok(()) => 0,
-                    Err(e) => host_io_errno(e),
-                },
+        |mut caller: Caller<'_, KernelStoreData>, path_ptr: u32, path_len: u32| -> i32 {
+            let path = match read_path(&mut caller, path_ptr, path_len) {
+                Ok(p) => p,
+                Err(rc) => return rc,
+            };
+            if caller.data().host.policy.may_open_path(&path, true) == PolicyDecision::Deny {
+                return -(EACCES as i32);
             }
+            let fs = match caller.data().host.host_fs.clone() {
+                Some(f) => f,
+                None => return -(EACCES as i32),
+            };
+            fs.unlink(&path)
         },
     )?;
     linker.func_wrap(
@@ -1466,18 +1709,20 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
         |mut caller: Caller<'_, KernelStoreData>,
          path_ptr: u32,
          path_len: u32,
-         _mode: u32|
+         mode: u32|
          -> i32 {
-            // We canonicalize the *parent* (mkdir creates the leaf)
-            // — `allow_missing` lets resolve_host_write_path do the
-            // parent-canonicalization fallback.
-            match resolve_host_write_path(&mut caller, path_ptr, path_len, true) {
-                Err(rc) => rc,
-                Ok(p) => match std::fs::create_dir(&p) {
-                    Ok(()) => 0,
-                    Err(e) => host_io_errno(e),
-                },
+            let path = match read_path(&mut caller, path_ptr, path_len) {
+                Ok(p) => p,
+                Err(rc) => return rc,
+            };
+            if caller.data().host.policy.may_open_path(&path, true) == PolicyDecision::Deny {
+                return -(EACCES as i32);
             }
+            let fs = match caller.data().host.host_fs.clone() {
+                Some(f) => f,
+                None => return -(EACCES as i32),
+            };
+            fs.mkdir(&path, mode)
         },
     )?;
     linker.func_wrap(
@@ -1489,9 +1734,9 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          link_ptr: u32,
          link_len: u32|
          -> i32 {
-            // Read target verbatim — it's the symlink contents, not
-            // a path resolved against the root. Only the link path
-            // goes through the policy + containment check.
+            // Read both byte ranges from kernel memory; target is
+            // verbatim symlink content, link is a path subject to
+            // the policy gate.
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -EFAULT as i32,
@@ -1504,28 +1749,24 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             {
                 return -EFAULT as i32;
             }
-            let link_resolved = match resolve_host_write_path(
-                &mut caller,
-                link_ptr,
-                link_len,
-                true, // allow missing — we're creating it
-            ) {
-                Err(rc) => return rc,
+            let link_path = match read_path(&mut caller, link_ptr, link_len) {
                 Ok(p) => p,
+                Err(rc) => return rc,
             };
-            let target_str = match std::str::from_utf8(&target) {
-                Ok(s) => s,
-                Err(_) => return -EINVAL as i32,
-            };
-            #[cfg(unix)]
-            let res = std::os::unix::fs::symlink(target_str, &link_resolved);
-            #[cfg(not(unix))]
-            let res: std::io::Result<()> =
-                Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "symlink"));
-            match res {
-                Ok(()) => 0,
-                Err(e) => host_io_errno(e),
+            if caller
+                .data()
+                .host
+                .policy
+                .may_open_path(&link_path, true)
+                == PolicyDecision::Deny
+            {
+                return -(EACCES as i32);
             }
+            let fs = match caller.data().host.host_fs.clone() {
+                Some(f) => f,
+                None => return -(EACCES as i32),
+            };
+            fs.symlink(&target, &link_path)
         },
     )?;
     linker.func_wrap(
@@ -1537,20 +1778,25 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          new_ptr: u32,
          new_len: u32|
          -> i32 {
-            let old_resolved =
-                match resolve_host_write_path(&mut caller, old_ptr, old_len, false) {
-                    Err(rc) => return rc,
-                    Ok(p) => p,
-                };
-            let new_resolved =
-                match resolve_host_write_path(&mut caller, new_ptr, new_len, true) {
-                    Err(rc) => return rc,
-                    Ok(p) => p,
-                };
-            match std::fs::rename(&old_resolved, &new_resolved) {
-                Ok(()) => 0,
-                Err(e) => host_io_errno(e),
+            let old_path = match read_path(&mut caller, old_ptr, old_len) {
+                Ok(p) => p,
+                Err(rc) => return rc,
+            };
+            let new_path = match read_path(&mut caller, new_ptr, new_len) {
+                Ok(p) => p,
+                Err(rc) => return rc,
+            };
+            let policy = caller.data().host.policy.clone();
+            if policy.may_open_path(&old_path, true) == PolicyDecision::Deny
+                || policy.may_open_path(&new_path, true) == PolicyDecision::Deny
+            {
+                return -(EACCES as i32);
             }
+            let fs = match caller.data().host.host_fs.clone() {
+                Some(f) => f,
+                None => return -(EACCES as i32),
+            };
+            fs.rename(&old_path, &new_path)
         },
     )?;
 
