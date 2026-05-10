@@ -224,6 +224,20 @@ export interface HostState {
   /** When set, every `kh_socket_*` import delegates here. */
   tcp?: TcpSocketImpl;
   /**
+   * Async outbound fetch. When set AND the host supports JSPI,
+   * `kh_fetch_blocking` is wrapped with `WebAssembly.Suspending`
+   * and the user's `sys_fetch` actually awaits the response —
+   * the calling wasm suspends at the trampoline boundary. Without
+   * JSPI (Safari today, Node/Deno without --jspi), the slot is
+   * ignored and `kh_fetch_blocking` returns -ENOSYS.
+   *
+   * The function takes the JSON request bytes, returns the JSON
+   * response bytes (same shape as the existing `host_network_fetch`
+   * encoding). Browser microkernels wrap `globalThis.fetch`; Deno
+   * embedders wrap `globalThis.fetch` too (it's in the platform).
+   */
+  fetch?: (request: Uint8Array) => Promise<Uint8Array>;
+  /**
    * Bridge that lets kh_* handlers suspend the calling wasm until
    * a JS Promise resolves. Default is `noopAsyncBridge` (every
    * blocking attempt throws "NOT_SUSPENDABLE"); embedders that
@@ -254,6 +268,7 @@ const EACCES = 13;
 const EBADF = 9;
 const EEXIST = 17;
 const E2BIG = 7;
+const EIO = 5;
 
 class EmptyExtensionRegistry implements ExtensionRegistry {
   invoke(): number {
@@ -599,14 +614,24 @@ export class KernelInstance {
       outPtr: number,
       outCap: number,
     ) => bigint,
+    /**
+     * Promising-wrapped variant of `dispatch`. Present only when
+     * the host supports JSPI and at least one kh_* import is
+     * Suspending-wrapped. Returns `Promise<bigint>` instead of
+     * `bigint`; routes through the same scratch buffer. Used by
+     * `syscallAsync`.
+     */
+    readonly dispatchAsync: ((
+      methodId: number,
+      callerPid: number,
+      inPtr: number,
+      inLen: number,
+      outPtr: number,
+      outCap: number,
+    ) => Promise<bigint>) | null = null,
   ) {}
 
-  syscall(
-    methodId: number,
-    callerPid: number,
-    request: Uint8Array,
-    responseCap: number,
-  ): { rc: bigint; response: Uint8Array } {
+  private stage(request: Uint8Array, responseCap: number): { inPtr: number; inLen: number; outPtr: number } {
     if (request.byteLength + responseCap > this.scratchLen) {
       throw new Error(
         `request+response (${
@@ -620,7 +645,46 @@ export class KernelInstance {
     if (inLen > 0) {
       new Uint8Array(this.memory.buffer, inPtr, inLen).set(request);
     }
-    const rc = this.dispatch(
+    return { inPtr, inLen, outPtr };
+  }
+
+  private collectResponse(outPtr: number, responseCap: number): Uint8Array {
+    if (responseCap === 0) return new Uint8Array(0);
+    return new Uint8Array(
+      new Uint8Array(this.memory.buffer, outPtr, responseCap).slice().buffer,
+    );
+  }
+
+  syscall(
+    methodId: number,
+    callerPid: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): { rc: bigint; response: Uint8Array } {
+    const { inPtr, inLen, outPtr } = this.stage(request, responseCap);
+    const rc = this.dispatch(methodId, callerPid, inPtr, inLen, outPtr, responseCap);
+    return { rc, response: this.collectResponse(outPtr, responseCap) };
+  }
+
+  /**
+   * Async syscall — routes through the promising-wrapped dispatch
+   * so kh_* handlers wrapped with `WebAssembly.Suspending` can
+   * await JS Promises (real fetch, real socket I/O). Throws if
+   * the host has no JSPI support (no `dispatchAsync` slot).
+   */
+  async syscallAsync(
+    methodId: number,
+    callerPid: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): Promise<{ rc: bigint; response: Uint8Array }> {
+    if (!this.dispatchAsync) {
+      throw new Error(
+        "syscallAsync called on a kernel without JSPI — install an asyncBridge / fetch impl that requires it, or fall back to syscall()",
+      );
+    }
+    const { inPtr, inLen, outPtr } = this.stage(request, responseCap);
+    const rc = await this.dispatchAsync(
       methodId,
       callerPid,
       inPtr,
@@ -628,13 +692,7 @@ export class KernelInstance {
       outPtr,
       responseCap,
     );
-    let response = new Uint8Array(0);
-    if (responseCap > 0) {
-      response = new Uint8Array(
-        new Uint8Array(this.memory.buffer, outPtr, responseCap).slice().buffer,
-      );
-    }
-    return { rc, response };
+    return { rc, response: this.collectResponse(outPtr, responseCap) };
   }
 }
 
@@ -861,12 +919,11 @@ export class Microkernel {
         const newP = new Uint8Array(memoryRef.memory!.buffer, newPtr, newLen).slice();
         return fs.rename(oldP, newP);
       },
-      // Outbound HTTP — kh_fetch_blocking is intrinsically async on
-      // the JS side (fetch() returns a Promise). Until the
-      // AsyncBridge integration lands, the JS microkernel stubs
-      // this with -ENOSYS so callers fall back to an alternative
-      // path. Browser/Deno embedders that want it functional
-      // arrange JSPI / asyncify suspension and call fetch() there.
+      // Outbound HTTP. When the host supports JSPI AND
+      // hostState.fetch is set, this slot becomes a Suspending
+      // wrapper a few lines below; the placeholder here is
+      // installed unconditionally so the Linker has a binding,
+      // and the wrap-with-Suspending step below replaces it.
       kh_fetch_blocking: (
         _reqPtr: number,
         _reqLen: number,
@@ -1125,6 +1182,50 @@ export class Microkernel {
     const module = await WebAssembly.compile(
       kernelWasmBytes as unknown as BufferSource,
     );
+
+    // JSPI integration: when the host supports JSPI AND the
+    // embedder supplied an async backend (fetch, etc.), wrap
+    // the relevant kh_* imports with WebAssembly.Suspending so
+    // they can await Promises inside the wasm call. The
+    // matching kernel_dispatch export gets WebAssembly.promising'd
+    // so callers see a Promise<i64> at the JS boundary.
+    // deno-lint-ignore no-explicit-any
+    const W = (globalThis as any).WebAssembly;
+    const hasJspi = typeof W?.Suspending === "function" &&
+      typeof W?.promising === "function";
+    const wantsAsync = hasJspi && hostState.fetch != null;
+    if (wantsAsync) {
+      const fetchImpl = hostState.fetch!;
+      // The Suspending wrapper takes an async function; the wasm
+      // sees a normal sync import that may suspend the calling
+      // stack until the promise resolves.
+      khImports.kh_fetch_blocking = new W.Suspending(
+        async (
+          reqPtr: number,
+          reqLen: number,
+          outPtr: number,
+          outCap: number,
+        ): Promise<bigint> => {
+          const memBuf = () => memoryRef.memory!.buffer;
+          const request = new Uint8Array(memBuf(), reqPtr, reqLen).slice();
+          if (
+            hostBox.state.policy.mayFetch?.(request) === "deny"
+          ) return BigInt(-EACCES);
+          let response: Uint8Array;
+          try {
+            response = await fetchImpl(request);
+          } catch (_e) {
+            return BigInt(-EIO);
+          }
+          if (response.byteLength > outCap) return BigInt(-E2BIG);
+          new Uint8Array(memBuf(), outPtr, response.byteLength).set(
+            response,
+          );
+          return BigInt(response.byteLength);
+        },
+      );
+    }
+
     const instance = await WebAssembly.instantiate(module, {
       kh: khImports,
       wasi_snapshot_preview1: wasiKernelStubs,
@@ -1143,7 +1244,26 @@ export class Microkernel {
       outCap: number,
     ) => bigint;
 
-    const kernel = new KernelInstance(memory, scratchPtr, scratchLen, dispatch);
+    // promising-wrap returns a function that returns Promise<i64>;
+    // the underlying call may suspend via any Suspending import.
+    const dispatchAsync = wantsAsync
+      ? (W.promising(dispatch) as (
+        methodId: number,
+        callerPid: number,
+        inPtr: number,
+        inLen: number,
+        outPtr: number,
+        outCap: number,
+      ) => Promise<bigint>)
+      : null;
+
+    const kernel = new KernelInstance(
+      memory,
+      scratchPtr,
+      scratchLen,
+      dispatch,
+      dispatchAsync,
+    );
     hostBox.state = hostState;
     const mk = new Microkernel(kernel, hostState);
     (mk as unknown as { hostBox: typeof hostBox }).hostBox = hostBox;
@@ -1156,6 +1276,20 @@ export class Microkernel {
     responseCap: number,
   ): { rc: bigint; response: Uint8Array } {
     return this.kernel.syscall(methodId, KERNEL_PID, request, responseCap);
+  }
+
+  /**
+   * Async syscall — required for any method whose kh_* handlers
+   * may suspend the wasm stack (fetch, blocking sockets, future
+   * persistent KV with async backing). Throws if the host
+   * doesn't support JSPI.
+   */
+  syscallAsync(
+    methodId: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): Promise<{ rc: bigint; response: Uint8Array }> {
+    return this.kernel.syscallAsync(methodId, KERNEL_PID, request, responseCap);
   }
 
   hostStateMut(): HostState {
