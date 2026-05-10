@@ -32,6 +32,20 @@ int main(void) {
   freeaddrinfo(res);
   res = NULL;
 
+  hints.ai_flags = AI_NUMERICSERV;
+  if (getaddrinfo("127.0.0.1", "443", &hints, &res) != 0 || !res) {
+    emit("getaddrinfo_numericserv", 1);
+    return 1;
+  }
+  freeaddrinfo(res);
+  res = NULL;
+  if (getaddrinfo("127.0.0.1", "https", &hints, &res) != EAI_SERVICE) {
+    emit("getaddrinfo_numericserv_rejects_name", 1);
+    freeaddrinfo(res);
+    return 1;
+  }
+  hints.ai_flags = 0;
+
   if (getaddrinfo("localhost", "80", &hints, &res) != 0 || !res) {
     emit("getaddrinfo_hostname", 1);
     return 1;

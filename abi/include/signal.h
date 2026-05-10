@@ -8,7 +8,9 @@
 #ifdef __cplusplus
 extern "C" {
 /* C++ doesn't have `restrict`; map it to clang's __restrict__ for the
- * declarations below.  Symmetric `#undef` near the closing brace. */
+ * declarations below, preserving any caller-provided portability macro. */
+#pragma push_macro("restrict")
+#undef restrict
 #define restrict __restrict__
 #endif
 
@@ -124,12 +126,13 @@ int sigismember(const sigset_t *set, int sig);
 sighandler_t signal(int sig, sighandler_t handler);
 int sigaction(int sig, const struct sigaction *restrict act, struct sigaction *restrict oldact);
 int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset);
+int pthread_sigmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset);
 int sigsuspend(const sigset_t *mask);
 int raise(int sig);
 unsigned alarm(unsigned seconds);
 
 #ifdef __cplusplus
-#undef restrict
+#pragma pop_macro("restrict")
 }
 #endif
 

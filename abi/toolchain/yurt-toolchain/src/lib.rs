@@ -84,6 +84,7 @@ pub const TIER1: &[&str] = &[
     "sigdelset",
     "sigismember",
     "sigprocmask",
+    "pthread_sigmask",
     "sigsuspend",
     "tzset",
     "wait",

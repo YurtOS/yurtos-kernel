@@ -57,6 +57,10 @@ struct addrinfo {
 #define AI_NUMERICHOST 0x0004
 #endif
 
+#ifndef AI_NUMERICSERV
+#define AI_NUMERICSERV 0x0400
+#endif
+
 #ifndef NI_NUMERICHOST
 #define NI_NUMERICHOST 0x0001
 #endif

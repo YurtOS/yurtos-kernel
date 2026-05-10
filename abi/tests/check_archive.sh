@@ -29,7 +29,7 @@ done
 tier1=(dup2 getgroups sched_getaffinity sched_setaffinity sched_getcpu \
        signal sigaction raise alarm \
        sigemptyset sigfillset sigaddset sigdelset sigismember \
-       sigprocmask sigsuspend)
+       sigprocmask pthread_sigmask sigsuspend)
 nm_out="$("$NM" --defined-only "$ARCHIVE")"
 
 fail=0
