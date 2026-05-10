@@ -177,7 +177,9 @@ $(BUILD_DIR)/libyurt_dlcanary.wasm: $(BUILD_DIR)/libyurt_dlcanary.o | $(BUILD_DI
 	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_NO_WASM_OPT=1 \
 	$(YURT_CC) -shared $< -o $@
-	$(YURT_WASI_POSTLINK) --side-module --input $@ --output $@
+	# yurt-cc -shared automatically runs `yurt-wasi-postlink --side-module`
+	# at the end of the link, validating dylink.0 and emitting
+	# $@.yurtmeta.json. No separate postlink invocation needed.
 
 side-module-canaries: $(SIDE_MODULE_CANARIES)
 

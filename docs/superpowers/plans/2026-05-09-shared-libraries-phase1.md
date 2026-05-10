@@ -212,6 +212,40 @@ end-to-end on a real ABI piece.
 
 ---
 
+## Known follow-ons (Phase 1 scope, not in slices 1A–1F)
+
+These are gaps surfaced by the post-slice-1D audit. They belong to the
+Phase 1 contract — the spec already covers them — but their implementation
+is deferred to follow-on slices so we do not compound an already-large PR.
+
+- **Rust side-module path through `cargo-yurt`.** Today `cargo-yurt`
+  always whole-archives `libyurt_abi.a` and force-exports Tier 1.
+  Neither belongs on a Rust crate built as a side module
+  (`crate-type = ["cdylib"]` + `-Wl,--shared --experimental-pic`).
+  Adding a `cargo-yurt --side-module` mode that mirrors `yurt-cc -shared`
+  (skip archive injection, skip Tier 1 exports, run
+  `yurt-wasi-postlink --side-module` after the build) is the natural
+  generalisation. Until it lands, Rust crates that should ship as side
+  modules cannot do so via the standard toolchain — port them through
+  C / `cc-rs` or hand-tune `RUSTFLAGS`.
+- **Auto-loading of main-module `NEEDED` deps before `_start`.** The
+  classical ld.so behavior: when a guest binary itself has a
+  `dylink.0` section listing `NEEDED` libraries, the kernel should
+  walk that list and `dlopen` each entry before invoking `_start`.
+  Phase 1 supports explicit `dlopen` calls; `NEEDED` auto-load is a
+  small loader hook in `packages/kernel/src/process/loader.ts`.
+- **RPATH from the main module's `dylink.0` runtime-path subsection +
+  `LD_LIBRARY_PATH` from sandbox env.** The Phase 1 spec defines both;
+  the current loader resolves only absolute paths and the default
+  `/usr/local/lib`, `/lib`, `/usr/lib` set.
+- **Symlink / `realpath` canonicalisation for SONAME → versioned-file
+  resolution.** Today the loader uses the requested path as the
+  canonical key; opening `libfoo.wasm` and `libfoo.wasm.3.45` (linked
+  via VFS symlinks per the spec) yields two distinct handles instead
+  of the same handle bumping its refcount.
+
+---
+
 ## Cross-cutting verification
 
 After each slice the following gates must be green:
