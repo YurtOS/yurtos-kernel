@@ -261,4 +261,9 @@ doc = "POSIX lseek. Request bytes: u32 fd LE + i64 offset LE + u32 whence (0=SET
 [method.sys_fstat]
 id = 0x1_0021
 kind = "syscall"
-doc = "POSIX fstat (subset). Request bytes: u32 fd LE. Response: 16 bytes — u64 size LE + u32 filetype + u32 mode. filetype matches WASI preview1 (2=CHARACTER_DEVICE, 3=DIRECTORY, 4=REGULAR_FILE). Returns 16 on success, -EBADF for closed fd."
+doc = "POSIX fstat (subset). Request bytes: u32 fd LE. Response: 16 bytes — u64 size LE + u32 filetype + u32 mode. filetype matches WASI preview1 (2=CHARACTER_DEVICE, 3=DIRECTORY, 4=REGULAR_FILE). Mode comes from the kernel's MetadataOverlay (override → backend default → 0o644 fallback). Returns 16 on success, -EBADF for closed fd."
+
+[method.sys_chmod]
+id = 0x1_0022
+kind = "syscall"
+doc = "POSIX chmod(path, mode). Request bytes: u32 mode LE + path bytes. Writes to the kernel's MetadataOverlay so subsequent fstat reflects the new mode regardless of underlying storage (matters for HostFs / YURTFS L2 where on-disk metadata is the host user's). Phase 6: no permission checks — userland can chmod any path it can open. Returns 0 on success, -ENOENT if the path doesn't resolve."

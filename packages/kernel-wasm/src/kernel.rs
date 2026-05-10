@@ -291,6 +291,13 @@ pub struct Kernel {
     pub vfs: crate::vfs::MountTable,
     ofds: BTreeMap<u64, OpenFileDescription>,
     next_ofd_id: u64,
+    /// MetadataOverlay — `(mount_id, inode) → Metadata`.
+    /// chmod/chown/utimens write here; fstat reads composed
+    /// override → backend default → kernel fallback. Survives the
+    /// lifetime of the kernel; persistence (sidecar journal) lands
+    /// later. Lets sandbox-uid metadata coexist with host-uid
+    /// storage on HostFs / YURTFS L2.
+    metadata_overrides: BTreeMap<(crate::vfs::MountId, u64), crate::vfs::Metadata>,
 }
 
 impl Kernel {
@@ -313,7 +320,44 @@ impl Kernel {
             vfs,
             ofds: BTreeMap::new(),
             next_ofd_id: 1,
+            metadata_overrides: BTreeMap::new(),
         }
+    }
+
+    /// Compose the kernel's view of an inode's metadata:
+    /// override → backend default → fallback.
+    pub fn resolve_metadata(
+        &self,
+        mount_id: crate::vfs::MountId,
+        inode: u64,
+    ) -> crate::vfs::Metadata {
+        if let Some(over) = self.metadata_overrides.get(&(mount_id, inode)) {
+            return *over;
+        }
+        if let Some(def) = self.vfs.default_metadata(mount_id, inode) {
+            return def;
+        }
+        // Fallback for backends with no opinion (Dev/Proc don't
+        // track per-file metadata; their inodes have no mode bits
+        // beyond filetype).
+        crate::vfs::Metadata {
+            uid: 0,
+            gid: 0,
+            mode: 0o100_644,
+            mtime_ns: 0,
+        }
+    }
+
+    /// Set the override metadata for an inode. Used by chmod /
+    /// chown / utimens; the new value supplants any backend
+    /// default until cleared.
+    pub fn set_metadata_override(
+        &mut self,
+        mount_id: crate::vfs::MountId,
+        inode: u64,
+        meta: crate::vfs::Metadata,
+    ) {
+        self.metadata_overrides.insert((mount_id, inode), meta);
     }
 
     /// Allocate a fresh OFD pointing at `(mount_id, inode)`, with
@@ -445,6 +489,7 @@ pub fn reset_for_tests() {
     k.vfs.clear();
     k.ofds.clear();
     k.next_ofd_id = 1;
+    k.metadata_overrides.clear();
 }
 
 /// Native unit tests share the same `static KERNEL` and run in

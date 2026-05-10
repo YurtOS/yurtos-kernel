@@ -76,6 +76,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_OPEN => sys_open(caller_pid, request),
         METHOD_SYS_LSEEK => lseek(caller_pid, request, response),
         METHOD_SYS_FSTAT => fstat(caller_pid, request, response),
+        METHOD_SYS_CHMOD => chmod(caller_pid, request),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -964,24 +965,55 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
-        let (size, filetype): (u64, u32) = match entry {
+        // (size, filetype, mode) — size/filetype come from the
+        // backend, mode from the kernel's MetadataOverlay.
+        let (size, filetype, mode): (u64, u32, u32) = match entry {
             crate::kernel::FdEntry::Stdin
             | crate::kernel::FdEntry::Stdout
-            | crate::kernel::FdEntry::Stderr => (0, 2),
-            crate::kernel::FdEntry::Pipe { .. } => (0, 6),
+            | crate::kernel::FdEntry::Stderr => (0, 2, 0o020_666),
+            crate::kernel::FdEntry::Pipe { .. } => (0, 6, 0o010_600),
             crate::kernel::FdEntry::File { ofd_id } => {
                 let (mount_id, inode) = match k.ofd(ofd_id) {
                     Some(o) => (o.mount_id, o.inode),
                     None => return -(abi::EBADF as i64),
                 };
                 let sz = k.vfs.size(mount_id, inode).unwrap_or(0);
-                (sz, 4)
+                let meta = k.resolve_metadata(mount_id, inode);
+                (sz, 4, meta.mode)
             }
         };
         response[0..8].copy_from_slice(&size.to_le_bytes());
         response[8..12].copy_from_slice(&filetype.to_le_bytes());
-        response[12..16].copy_from_slice(&0u32.to_le_bytes());
+        response[12..16].copy_from_slice(&mode.to_le_bytes());
         16
+    })
+}
+
+/// `chmod(mode, path) -> 0 or -ENOENT`. Request: u32 mode LE +
+/// path bytes. Writes to the kernel's MetadataOverlay; subsequent
+/// fstat sees the new mode. Phase 6 has no permission checks —
+/// any process that can resolve the path can chmod it.
+fn chmod(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let mode = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let path = &request[4..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let _ = caller_pid; // future: use for permission checks
+    with_kernel(|k| {
+        let (mount_id, inode) = match k.vfs.open(path, 0) {
+            Some(pair) => pair,
+            None => return -(abi::ENOENT as i64),
+        };
+        let mut meta = k.resolve_metadata(mount_id, inode);
+        // Only update permission bits — high nibble (file type)
+        // is fixed by the backend, not the user.
+        meta.mode = (meta.mode & 0o170_000) | (mode & 0o007_777);
+        k.set_metadata_override(mount_id, inode, meta);
+        0
     })
 }
 
@@ -2647,6 +2679,58 @@ mod tests {
         let mut buf = [0u8; 8];
         let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
         assert_eq!(&buf[..n as usize], b"v1");
+    }
+
+    #[test]
+    fn fstat_returns_default_mode_from_backend() {
+        // Ramfs default is 0o100644 (regular file, rw-r--r--).
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        reg.extend_from_slice(b"/m1");
+        reg.extend_from_slice(b"hi");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/m1"), &mut []);
+        let mut out = [0u8; 16];
+        assert_eq!(dispatch(METHOD_SYS_FSTAT, 1, &(fd as u32).to_le_bytes(), &mut out), 16);
+        let mode = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        assert_eq!(mode, 0o100_644, "default mode from backend");
+    }
+
+    #[test]
+    fn chmod_writes_to_metadata_overlay_and_fstat_reflects_it() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        reg.extend_from_slice(b"/m2");
+        reg.extend_from_slice(b"hi");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        // chmod 0o600 on /m2.
+        let mut creq = 0o600_u32.to_le_bytes().to_vec();
+        creq.extend_from_slice(b"/m2");
+        assert_eq!(dispatch(METHOD_SYS_CHMOD, 1, &creq, &mut []), 0);
+
+        // fstat sees the new perms; file type bits unchanged.
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/m2"), &mut []);
+        let mut out = [0u8; 16];
+        dispatch(METHOD_SYS_FSTAT, 1, &(fd as u32).to_le_bytes(), &mut out);
+        let mode = u32::from_le_bytes(out[12..16].try_into().unwrap());
+        assert_eq!(
+            mode, 0o100_600,
+            "chmod kept file-type bits, replaced perms"
+        );
+    }
+
+    #[test]
+    fn chmod_unknown_path_is_enoent() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut creq = 0o755_u32.to_le_bytes().to_vec();
+        creq.extend_from_slice(b"/missing");
+        assert_eq!(
+            dispatch(METHOD_SYS_CHMOD, 1, &creq, &mut []),
+            -(abi::ENOENT as i64)
+        );
     }
 
     #[test]

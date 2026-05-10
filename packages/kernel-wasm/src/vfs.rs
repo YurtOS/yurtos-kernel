@@ -30,6 +30,24 @@
 
 use std::collections::BTreeMap;
 
+/// Per-inode metadata kernels need to track *separately* from the
+/// underlying storage. Files written through HostFs land on disk
+/// with the host user's uid/gid; files inside a tar layer carry
+/// the image-builder's metadata. Neither matches our sandbox's
+/// view (uid=1000 by default, mode=0o644 etc.). The kernel keeps a
+/// `(mount_id, inode) → Metadata` override map; sys_fstat consults
+/// it; sys_chmod / sys_chown / sys_utimens (the last two TBD)
+/// write to it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Metadata {
+    pub uid: u32,
+    pub gid: u32,
+    /// POSIX mode bits — file type in the high nibble, perms in
+    /// the low. e.g. 0o100644 for a regular file, rw-r--r--.
+    pub mode: u32,
+    pub mtime_ns: u64,
+}
+
 /// Lightweight, copy-friendly snapshot of one process's metadata.
 /// Backends that want to surface live process state (`/proc`)
 /// receive these via [`VfsBackend::refresh_processes`].
@@ -91,6 +109,16 @@ pub trait VfsBackend: Send {
     /// syscalls (we just call it on every sys_open today — the cost
     /// is one no-op closure for non-proc backends).
     fn refresh_processes(&mut self, _snapshots: &[ProcessSnapshot]) {}
+
+    /// Optional hook: backends that have native metadata (tar
+    /// headers carry uid/gid/mode/mtime; host fs has them all)
+    /// surface their best guess via this. The kernel composes
+    /// override → default → fallback; default `None` means "no
+    /// opinion" and the kernel uses its standard fallback
+    /// (uid=0, gid=0, mode=0o100644 for regular files, mtime=0).
+    fn default_metadata(&self, _inode: u64) -> Option<Metadata> {
+        None
+    }
 }
 
 /// One row in the mount table.
@@ -204,6 +232,14 @@ impl MountTable {
 
     pub fn size(&self, mount_id: MountId, inode: u64) -> Option<u64> {
         self.mounts.get(mount_id as usize).and_then(|m| m.backend.size(inode))
+    }
+
+    /// Surface a backend's best-guess default metadata for an
+    /// inode. The kernel composes this with its override map.
+    pub fn default_metadata(&self, mount_id: MountId, inode: u64) -> Option<Metadata> {
+        self.mounts
+            .get(mount_id as usize)
+            .and_then(|m| m.backend.default_metadata(inode))
     }
 
     /// Push a fresh snapshot of the kernel's process table to every
@@ -350,6 +386,21 @@ impl VfsBackend for DevBackend {
     }
 }
 
+impl RamfsBackend {
+    /// Default metadata for files in the ramfs — regular files,
+    /// 0o644 perms. Inode argument is ignored; ramfs doesn't track
+    /// per-file metadata yet (would require a parallel map; the
+    /// kernel's MetadataOverlay covers all our chmod/chown needs).
+    fn ramfs_default_metadata() -> Metadata {
+        Metadata {
+            uid: 0,
+            gid: 0,
+            mode: 0o100_644,
+            mtime_ns: 0,
+        }
+    }
+}
+
 impl VfsBackend for RamfsBackend {
     fn open(&mut self, path: &[u8], flags: u32) -> Option<u64> {
         if let Some(&id) = self.paths.get(path) {
@@ -396,6 +447,10 @@ impl VfsBackend for RamfsBackend {
 
     fn size(&self, inode: u64) -> Option<u64> {
         self.inodes.get(&inode).map(|c| c.len() as u64)
+    }
+
+    fn default_metadata(&self, _inode: u64) -> Option<Metadata> {
+        Some(Self::ramfs_default_metadata())
     }
 }
 
