@@ -61,7 +61,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_version.o \
   $(BUILD_DIR)/yurt_write.o
 
-CANARY_NAMES := stdio sleep system popen affinity dup2 getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
+CANARY_NAMES := stdio sleep system popen affinity dup2 dlopen getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
 FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 
@@ -79,7 +79,7 @@ YURT_WASI_POSTLINK := $(REPO_ROOT)/target/release/yurt-wasi-postlink
 
 .PHONY: all lib canaries copy-fixtures clean ensure-toolchain check-native-abi-contract side-module-canaries
 
-all: lib canaries
+all: lib canaries side-module-canaries
 
 check-native-abi-contract:
 	cd $(REPO_ROOT) && $(DENO) run --allow-read --allow-write scripts/generate-native-abi.ts --check
@@ -181,9 +181,11 @@ $(BUILD_DIR)/libyurt_dlcanary.wasm: $(BUILD_DIR)/libyurt_dlcanary.o | $(BUILD_DI
 
 side-module-canaries: $(SIDE_MODULE_CANARIES)
 
-copy-fixtures: canaries
+copy-fixtures: canaries side-module-canaries
 	@for n in $(CANARY_NAMES); do cp $(BUILD_DIR)/$$n-canary.wasm $(FIXTURES)/$$n-canary.wasm; done
 	@cp $(FORK_DEFAULT_CANARY) $(FIXTURES)/fork-default-canary.wasm
+	@cp $(BUILD_DIR)/libyurt_dlcanary.wasm $(FIXTURES)/libyurt_dlcanary.wasm
+	@cp $(BUILD_DIR)/libyurt_dlcanary.wasm.yurtmeta.json $(FIXTURES)/libyurt_dlcanary.wasm.yurtmeta.json
 
 clean:
 	rm -rf $(BUILD_DIR)

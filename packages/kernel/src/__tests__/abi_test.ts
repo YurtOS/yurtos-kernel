@@ -14,6 +14,13 @@ import type { SocketBackend, SocketHandle } from '../network/socket-backend.js';
 
 const FIXTURES = resolve(import.meta.dirname!, '../platform/__tests__/fixtures');
 const HAS_BUSYBOX_FIXTURE = existsSync(resolve(FIXTURES, 'busybox.wasm'));
+// Phase 1 shared-library smoke test: gated on the side-module fixture
+// being present. The fixture is built by `make -C abi side-module-canaries`
+// (requires WASI SDK), so locally the test runs only if the dev has
+// the fixture; in CI guest-compat.yml runs `make -C abi all copy-fixtures`
+// which produces it.
+const HAS_DLCANARY_FIXTURE = existsSync(resolve(FIXTURES, 'libyurt_dlcanary.wasm')) &&
+  existsSync(resolve(FIXTURES, 'dlopen-canary.wasm'));
 
 class StaticFetchBridge implements NetworkBridgeLike {
   requests: Array<{
@@ -1131,23 +1138,45 @@ describe('Kernel ABI canaries', () => {
   // Spec: docs/superpowers/specs/2026-05-09-shared-libraries-design.md
   // Plan: docs/superpowers/plans/2026-05-09-shared-libraries-phase1.md
   //
-  // The fixture wasm files do not exist yet — they require slice 1B
-  // (`yurt-cc -shared` + libyurt_dlcanary.wasm side module), 1C (the
-  // dlfcn.h header + guest stubs), and 1D/1E (Wasmtime + Deno/Node
-  // host loaders). Each subsequent slice flips this `describe.ignore`
-  // closer to active by enabling the relevant cases.
-  describe.ignore('dlopen-canary (Phase 1 shared libraries — pending 1B/1C/1D/1E)', () => {
-    it('happy_path: load /lib/libyurt_dlcanary.wasm and call yurt_dlcanary_double(21) → 42', async () => {
-      sandbox = await Sandbox.create({
-        wasmDir: FIXTURES,
-        adapter: new NodeAdapter(),
-      });
+  // happy_path is the first end-to-end gate for Phase 1: a real
+  // dynamically-linked guest binary builds, loads, and calls a
+  // function exported by a separately-compiled side module via
+  // dlopen / dlsym. It runs only when the fixtures exist (built by
+  // `make -C abi all copy-fixtures` in CI / locally with WASI SDK).
+  // The remaining cases stay in `describe.ignore` until Phase 1 1F
+  // dogfood validates the broader contract.
+  const dlcanaryIt = HAS_DLCANARY_FIXTURE ? it : it.skip;
+  describe('dlopen-canary (Phase 1 shared libraries — happy path)', () => {
+    dlcanaryIt(
+      'happy_path: load /lib/libyurt_dlcanary.wasm and call yurt_dlcanary_double(21) → 42',
+      async () => {
+        sandbox = await Sandbox.create({
+          wasmDir: FIXTURES,
+          adapter: new NodeAdapter(),
+        });
 
-      const result = await sandbox.run('dlopen-canary --case happy_path');
+        // The Phase 1 search path resolves /lib/<name> against the
+        // sandbox VFS. Pre-populate it with the side module fixture
+        // built by abi/Makefile's side-module-canaries target.
+        try {
+          sandbox.mkdir('/lib');
+        } catch {
+          // /lib may already exist in the sandbox image; ignore.
+        }
+        sandbox.writeFile(
+          '/lib/libyurt_dlcanary.wasm',
+          readFileSync(resolve(FIXTURES, 'libyurt_dlcanary.wasm')),
+        );
 
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout.trim()).toContain('"stdout":"dlcanary-ok"');
-    });
+        const result = await sandbox.run('dlopen-canary --case happy_path');
+
+        expect(result.exitCode).toBe(0);
+        expect(result.stdout.trim()).toContain('"stdout":"dlcanary-ok"');
+      },
+    );
+  });
+
+  describe.ignore('dlopen-canary (Phase 1 shared libraries — pending 1F)', () => {
 
     it('lazy_now_equiv: RTLD_LAZY and RTLD_NOW return identical handles', async () => {
       sandbox = await Sandbox.create({
