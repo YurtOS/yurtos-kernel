@@ -82,8 +82,19 @@ fn main() -> Result<()> {
 }
 
 fn run_side_module(args: &Args) -> Result<()> {
-    let mut module = Module::from_file(&args.input)
-        .with_context(|| format!("loading {}", args.input.display()))?;
+    // Read the input bytes once and keep them around. We use walrus
+    // only to *read* exports for the manifest — we DO NOT round-trip
+    // the wasm through `emit_wasm_file`. Walrus places custom sections
+    // after the standard sections during emission, but the WebAssembly
+    // DynamicLinking spec requires `dylink.0` to appear BEFORE any
+    // non-custom section. A walrus re-emit would silently demote a
+    // valid wasm-ld --shared output into something the runtime loader
+    // would refuse as "not a side module". Bytes-in / bytes-out keeps
+    // the section ordering wasm-ld emitted.
+    let bytes =
+        std::fs::read(&args.input).with_context(|| format!("reading {}", args.input.display()))?;
+    let module =
+        Module::from_buffer(&bytes).with_context(|| format!("parsing {}", args.input.display()))?;
 
     let dylink = module
         .customs
@@ -135,9 +146,14 @@ fn run_side_module(args: &Args) -> Result<()> {
     side_module::write_manifest(&meta, &meta_path)
         .with_context(|| format!("writing {}", meta_path.display()))?;
 
-    module
-        .emit_wasm_file(&args.output)
-        .with_context(|| format!("writing {}", args.output.display()))?;
+    // Copy the input bytes verbatim to the output. When --output
+    // equals --input (the in-place mode used by yurt-cc auto-postlink)
+    // skip the write entirely — there is nothing to do, the bytes are
+    // already on disk under the right name.
+    if args.input != args.output {
+        std::fs::write(&args.output, &bytes)
+            .with_context(|| format!("writing {}", args.output.display()))?;
+    }
 
     eprintln!(
         "yurt-wasi-postlink --side-module: wrote {} (+ {})",

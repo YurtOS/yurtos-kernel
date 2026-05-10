@@ -231,3 +231,71 @@ fn side_module_rejects_malformed_dylink_0() {
         "stderr should describe the malformed section: {stderr}"
     );
 }
+
+/// The WebAssembly DynamicLinking spec requires `dylink.0` to appear
+/// BEFORE any non-custom section in the wasm. wasm-ld --shared
+/// places it first; if the postlink validator round-trips the wasm
+/// through walrus' `emit_wasm_file`, custom sections get re-ordered
+/// after the standard sections and the side module silently becomes
+/// non-spec-compliant. The contract is "bytes in / bytes out": the
+/// output wasm is a verbatim copy of the input.
+#[test]
+fn side_module_output_is_byte_equal_to_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let input = tmp.path().join("libyurt_dlcanary.wasm");
+    let output = tmp.path().join("libyurt_dlcanary.out.wasm");
+
+    let mut dylink = make_mem_info(64, 0, 4, 0);
+    dylink.extend(make_needed(&["libfoo.wasm"]));
+    build_side_module(&input, dylink, &["yurt_dlcanary_double"]);
+
+    let input_bytes = fs::read(&input).unwrap();
+
+    let status = Command::new(bin())
+        .arg("--side-module")
+        .arg("--input")
+        .arg(&input)
+        .arg("--output")
+        .arg(&output)
+        .status()
+        .unwrap();
+    assert!(status.success(), "yurt-wasi-postlink --side-module failed");
+
+    let output_bytes = fs::read(&output).unwrap();
+    assert_eq!(
+        output_bytes, input_bytes,
+        "postlink --side-module must not modify the wasm bytes \
+         (would re-order dylink.0 after standard sections)",
+    );
+}
+
+/// In-place mode (input == output) is what `yurt-cc -shared`
+/// auto-postlink uses. The validator must not corrupt the file —
+/// either by writing junk over it, or by re-emitting through walrus.
+#[test]
+fn side_module_in_place_preserves_wasm_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("libfoo.wasm");
+
+    let mut dylink = make_mem_info(0, 0, 0, 0);
+    dylink.extend(make_needed(&[]));
+    build_side_module(&path, dylink, &["foo"]);
+
+    let original = fs::read(&path).unwrap();
+
+    let status = Command::new(bin())
+        .arg("--side-module")
+        .arg("--input")
+        .arg(&path)
+        .arg("--output")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let after = fs::read(&path).unwrap();
+    assert_eq!(
+        after, original,
+        "in-place --side-module must be a no-op on the wasm"
+    );
+}
