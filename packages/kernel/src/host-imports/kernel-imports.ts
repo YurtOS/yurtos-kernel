@@ -887,19 +887,10 @@ export function createKernelImports(
   // ── Phase 1 dlopen state (per-sandbox) ──
   // Spec: docs/superpowers/specs/2026-05-09-shared-libraries-design.md.
   // The handle table owns loaded side-module instances; lastDlError
-  // is drained by yurt_dlerror per POSIX dlerror semantics.
+  // is drained by yurt_dlerror per POSIX dlerror semantics. The string
+  // helpers reused here (readString) are imported from common.ts.
   const dlHandleTable = new DynlinkHandleTable();
   let lastDlError = "";
-
-  function readString(
-    mem: WebAssembly.Memory,
-    ptr: number,
-    len: number,
-  ): string {
-    if (len === 0) return "";
-    const bytes = new Uint8Array(mem.buffer, ptr, len);
-    return new TextDecoder().decode(bytes);
-  }
 
   // The yurt-namespace imports are forwarded to side modules so they
   // can call the same host imports the main module uses. The closure

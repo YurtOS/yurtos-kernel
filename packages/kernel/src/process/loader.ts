@@ -351,6 +351,9 @@ export async function loadProcess(
         wasi_snapshot_preview1: childWasiImports,
         yurt: childYurtImports,
       });
+      // Wire the child's main-instance ref captured by the dlopen loader
+      // closure for this child process.
+      childInstanceRef = childInstance;
       bindSignalDeliverer(childWasi, childInstance);
       ctx.kernel.attachWasiHost(childPid, childWasi);
       childMemoryRef = childInstance.exports.memory as WebAssembly.Memory;
