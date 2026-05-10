@@ -485,6 +485,104 @@ export class Microkernel {
         _outPtr: number,
         _outCap: number,
       ): bigint => BigInt(-EACCES),
+      // Mutating host-fs ops. Stubs until the JS microkernel grows
+      // a HostFsImpl-shaped pluggable slot (mirrors the Rust
+      // microkernel's host_fs trait). Browser microkernels back
+      // these with OPFS; Deno with Deno.* APIs.
+      kh_real_unlink: (_pathPtr: number, _pathLen: number): number => -EACCES,
+      kh_real_mkdir: (
+        _pathPtr: number,
+        _pathLen: number,
+        _mode: number,
+      ): number => -EACCES,
+      kh_real_symlink: (
+        _targetPtr: number,
+        _targetLen: number,
+        _linkPtr: number,
+        _linkLen: number,
+      ): number => -EACCES,
+      kh_real_rename: (
+        _oldPtr: number,
+        _oldLen: number,
+        _newPtr: number,
+        _newLen: number,
+      ): number => -EACCES,
+      // Outbound HTTP — browser microkernels back this with the
+      // browser's fetch(); Deno with native fetch. Stub for now.
+      kh_fetch_blocking: (
+        _reqPtr: number,
+        _reqLen: number,
+        _outPtr: number,
+        _outCap: number,
+      ): bigint => BigInt(-EACCES),
+      // TCP socket surface. Browser microkernels can't open raw
+      // TCP — they map kh_socket_* to WebSocket transport with a
+      // matching wire shape; Deno wires Deno.connect / Deno.listen.
+      kh_socket_connect: (
+        _addrPtr: number,
+        _addrLen: number,
+        _flags: number,
+      ): number => -EACCES,
+      kh_socket_send: (
+        _handle: number,
+        _dataPtr: number,
+        _dataLen: number,
+      ): bigint => BigInt(-EACCES),
+      kh_socket_recv: (
+        _handle: number,
+        _outPtr: number,
+        _len: number,
+        _flags: number,
+      ): bigint => BigInt(-EACCES),
+      kh_socket_close: (_handle: number): number => 0,
+      kh_socket_listen_at: (
+        _addrPtr: number,
+        _addrLen: number,
+        _backlog: number,
+      ): number => -EACCES,
+      kh_socket_accept_blocking: (
+        _handle: number,
+        _flags: number,
+      ): number => -EACCES,
+      kh_socket_local_addr: (
+        _handle: number,
+        _outPtr: number,
+        _outCap: number,
+      ): bigint => BigInt(-EACCES),
+      // Durable KV (IndexedDB-shaped). Browser microkernels back
+      // this with IndexedDB; Deno with redb-shaped storage; stub
+      // returns -EACCES so kernel.wasm callers see the policy
+      // shape consistently.
+      kh_idb_get: (
+        _storePtr: number,
+        _storeLen: number,
+        _keyPtr: number,
+        _keyLen: number,
+        _outPtr: number,
+        _outCap: number,
+      ): bigint => BigInt(-EACCES),
+      kh_idb_put: (
+        _storePtr: number,
+        _storeLen: number,
+        _keyPtr: number,
+        _keyLen: number,
+        _valuePtr: number,
+        _valueLen: number,
+      ): number => -EACCES,
+      kh_idb_delete: (
+        _storePtr: number,
+        _storeLen: number,
+        _keyPtr: number,
+        _keyLen: number,
+      ): number => -EACCES,
+      kh_idb_list: (
+        _storePtr: number,
+        _storeLen: number,
+        _prefixPtr: number,
+        _prefixLen: number,
+        _outPtr: number,
+        _outCap: number,
+      ): bigint => BigInt(-EACCES),
       kh_extension_invoke: (
         reqPtr: number,
         reqLen: number,
