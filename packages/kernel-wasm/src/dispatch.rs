@@ -767,6 +767,11 @@ fn install_host_fs_mount(request: &[u8]) -> i64 {
 /// [`TarLayerBackend`] (lower / image) and a fresh
 /// [`RamfsBackend`] (upper / overlay) at `prefix`. One call wires
 /// the L1+L2 union the user reads about as YURTFS.
+///
+/// Auto-detects zstd: if the archive begins with the zstd magic
+/// (`0x28 0xB5 0x2F 0xFD`), decompresses it before walking. That
+/// keeps `mount_yurtfs` compatible with the existing `.tar.zst`
+/// image format the TS image-loader produces.
 fn install_yurtfs(request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
@@ -778,6 +783,10 @@ fn install_yurtfs(request: &[u8]) -> i64 {
     }
     let prefix = request[4..4 + prefix_len].to_vec();
     let archive = request[4 + prefix_len..].to_vec();
+    let archive = match maybe_decompress_zstd(archive) {
+        Some(bytes) => bytes,
+        None => return -(abi::EINVAL as i64),
+    };
     with_kernel(|k| {
         let lower = Box::new(crate::vfs::TarLayerBackend::new(archive));
         let upper = Box::new(crate::vfs::RamfsBackend::new());
@@ -787,6 +796,26 @@ fn install_yurtfs(request: &[u8]) -> i64 {
         );
     });
     0
+}
+
+/// If `bytes` begins with the zstd magic, decompress to plain tar.
+/// Returns `Some(plain)` for either uncompressed or successfully
+/// decompressed input; `None` only if zstd decoding fails.
+fn maybe_decompress_zstd(bytes: Vec<u8>) -> Option<Vec<u8>> {
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+    if bytes.len() < 4 || bytes[0..4] != ZSTD_MAGIC {
+        return Some(bytes);
+    }
+    let mut decoder = match ruzstd::StreamingDecoder::new(&bytes[..]) {
+        Ok(d) => d,
+        Err(_) => return None,
+    };
+    let mut out = Vec::new();
+    use std::io::Read;
+    if decoder.read_to_end(&mut out).is_err() {
+        return None;
+    }
+    Some(out)
 }
 
 /// `kernel_install_tar_layer(prefix_len, prefix_bytes, tar_bytes)`.
@@ -804,6 +833,10 @@ fn install_tar_layer(request: &[u8]) -> i64 {
     }
     let prefix = request[4..4 + prefix_len].to_vec();
     let archive = request[4 + prefix_len..].to_vec();
+    let archive = match maybe_decompress_zstd(archive) {
+        Some(bytes) => bytes,
+        None => return -(abi::EINVAL as i64),
+    };
     with_kernel(|k| {
         k.vfs.add_mount(
             prefix,
@@ -2560,6 +2593,60 @@ mod tests {
         let n = dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut rest);
         assert_eq!(n, 6);
         assert_eq!(&rest[..6], b"456789");
+    }
+
+    #[test]
+    fn install_yurtfs_auto_decompresses_zstd_wrapped_tar() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let tar = build_tar_archive(&[("etc/release", b"compressed")]);
+        // Wrap in zstd. The dev-dep `zstd` crate pulls a C lib; fine
+        // for tests, not for the wasm crate (which uses the pure-Rust
+        // ruzstd decoder).
+        let zstd_wrapped = zstd::stream::encode_all(&tar[..], 0).unwrap();
+        // Sanity: the wrapper begins with the zstd magic.
+        assert_eq!(&zstd_wrapped[0..4], &[0x28, 0xB5, 0x2F, 0xFD]);
+
+        let prefix: &[u8] = b"/zimg";
+        let mut req = (prefix.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(prefix);
+        req.extend_from_slice(&zstd_wrapped);
+        assert_eq!(
+            dispatch(METHOD_KERNEL_INSTALL_YURTFS, 0, &req, &mut []),
+            0,
+            "zstd-wrapped install_yurtfs succeeds"
+        );
+
+        // Open + read /zimg/etc/release verifies the auto-decompress
+        // happened and the tar walked correctly afterward.
+        let fd = dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(0, b"/zimg/etc/release"),
+            &mut [],
+        );
+        assert!(fd >= 0, "open under zstd-wrapped image: {fd}");
+        let mut buf = [0u8; 32];
+        let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"compressed");
+    }
+
+    #[test]
+    fn install_tar_layer_auto_decompresses_zstd() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let tar = build_tar_archive(&[("info", b"v1")]);
+        let zstd_wrapped = zstd::stream::encode_all(&tar[..], 0).unwrap();
+        let prefix: &[u8] = b"/zlayer";
+        let mut req = (prefix.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(prefix);
+        req.extend_from_slice(&zstd_wrapped);
+        assert_eq!(
+            dispatch(METHOD_KERNEL_INSTALL_TAR_LAYER, 0, &req, &mut []),
+            0
+        );
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/zlayer/info"), &mut []);
+        let mut buf = [0u8; 8];
+        let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
+        assert_eq!(&buf[..n as usize], b"v1");
     }
 
     #[test]
