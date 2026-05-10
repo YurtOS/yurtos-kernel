@@ -6,6 +6,10 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* SO_* constants that wasi-sdk defines in upstream mode but may not expose
  * via the WASI-mode path. */
 #ifndef SO_BROADCAST
@@ -113,6 +117,11 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags);
 ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
 
 int socket(int domain, int type, int protocol);
+/* socketpair: emulated via TCP loopback (yurt has no AF_UNIX). The
+ * resulting pair behaves like an opaque connected pair for libzmq's
+ * signaler and similar use cases; consumers should not assume
+ * Unix-domain semantics (no SCM_RIGHTS fd passing, etc.). */
+int socketpair(int domain, int type, int protocol, int sv[2]);
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
@@ -128,5 +137,9 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
 int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen);
 int getsockopt(int sockfd, int level, int optname, void *optval, socklen_t *optlen);
 int shutdown(int sockfd, int how);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

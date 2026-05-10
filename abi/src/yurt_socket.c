@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stddef.h>
@@ -37,6 +38,7 @@
 #define YURT_TCP_NODELAY 1
 
 YURT_DECLARE_MARKER(socket);
+YURT_DECLARE_MARKER(socketpair);
 YURT_DECLARE_MARKER(connect);
 YURT_DECLARE_MARKER(getpeername);
 YURT_DECLARE_MARKER(getsockname);
@@ -47,7 +49,8 @@ YURT_DECLARE_MARKER(send);
 YURT_DECLARE_MARKER(recv);
 YURT_DECLARE_MARKER(shutdown);
 
-YURT_DEFINE_MARKER(socket,   0x736f636bu) /* "sock" */
+YURT_DEFINE_MARKER(socket,     0x736f636bu) /* "sock" */
+YURT_DEFINE_MARKER(socketpair, 0x73706169u) /* "spai" */
 YURT_DEFINE_MARKER(connect,  0x636f6e6eu) /* "conn" */
 YURT_DEFINE_MARKER(getpeername, 0x70656572u) /* "peer" */
 YURT_DEFINE_MARKER(getsockname, 0x736e616du) /* "snam" */
@@ -775,5 +778,111 @@ int shutdown(int sockfd, int how) {
     errno = EIO;
     return -1;
   }
+  return 0;
+}
+
+/* socketpair — wasi-libc lacks it (gated behind
+ * __wasilibc_unmodified_upstream). Emulate via TCP loopback: bind a
+ * listener on 127.0.0.1:0, accept-side and connect-side become the
+ * pair. AF_UNIX is folded onto AF_INET because yurt has no Unix
+ * domain sockets — callers (libzmq's signaler in particular) treat
+ * the pair as opaque, so the underlying transport is a transparent
+ * implementation detail. SOCK_DGRAM is rejected (EPROTOTYPE) — only
+ * SOCK_STREAM (with optional SOCK_CLOEXEC/SOCK_NONBLOCK bits) maps
+ * onto our TCP-loopback emulation. Add a UDP-loopback path here
+ * when a guest needs datagram pairs.
+ *
+ * Cleanup uses yurt_socketpair_release() — yurt's `shutdown()`
+ * already routes through host_socket_close internally (see the
+ * shutdown impl above), but a sibling helper here keeps each call
+ * site unambiguous about the intent ("release this fd") and lets
+ * us swap to a real close() if/when the host fd table accepts
+ * wasi-libc's close path. Every early-exit frees any sockets the
+ * function has already allocated. */
+static void yurt_socketpair_release(int fd) {
+  if (fd < 0) return;
+  /* SHUT_RDWR (= 2) — on yurt this triggers host_socket_close. */
+  shutdown(fd, 2);
+}
+
+/* Honor the SOCK_NONBLOCK / SOCK_CLOEXEC bits Linux lets callers fold
+ * into socket() / socketpair() type. wasi-libc's socket() ignores
+ * those bits, so we route them through fcntl() after the fact. */
+static int yurt_socketpair_apply_type_flags(int fd, int type) {
+  if ((type & SOCK_NONBLOCK) != 0) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return -1;
+    if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) return -1;
+  }
+  if ((type & SOCK_CLOEXEC) != 0) {
+    int fd_fl = fcntl(fd, F_GETFD, 0);
+    if (fd_fl < 0) return -1;
+    if (fcntl(fd, F_SETFD, fd_fl | FD_CLOEXEC) < 0) return -1;
+  }
+  return 0;
+}
+
+int socketpair(int domain, int type, int protocol, int sv[2]) {
+  YURT_MARKER_CALL(socketpair);
+
+  if (!sv) { errno = EFAULT; return -1; }
+  /* Accept the AF_UNIX form libzmq calls with; remap to AF_INET. */
+  if (domain != AF_UNIX && domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+  if ((type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK) != SOCK_STREAM) { errno = EPROTOTYPE; return -1; }
+  (void)protocol;
+
+  int listener = socket(AF_INET, SOCK_STREAM, 0);
+  if (listener < 0) return -1;
+
+  struct sockaddr_in sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  sa.sin_port = 0; /* ephemeral */
+  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+  if (bind(listener, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
+    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
+  }
+  if (listen(listener, 1) < 0) {
+    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
+  }
+  /* Read back the assigned ephemeral port so connect() can target it. */
+  socklen_t sa_len = sizeof(sa);
+  if (getsockname(listener, (struct sockaddr *)&sa, &sa_len) < 0) {
+    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
+  }
+
+  int connector = socket(AF_INET, SOCK_STREAM, 0);
+  if (connector < 0) {
+    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
+  }
+  if (connect(connector, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
+    int saved = errno;
+    yurt_socketpair_release(connector); yurt_socketpair_release(listener);
+    errno = saved; return -1;
+  }
+
+  int acceptor = accept(listener, NULL, NULL);
+  if (acceptor < 0) {
+    int saved = errno;
+    yurt_socketpair_release(connector); yurt_socketpair_release(listener);
+    errno = saved; return -1;
+  }
+  /* Listener has done its job — release it; the pair is the
+   * acceptor (read end) and the connector (write end). */
+  yurt_socketpair_release(listener);
+
+  /* Propagate SOCK_NONBLOCK / SOCK_CLOEXEC bits onto both ends.
+   * Linux socketpair() applies these atomically; we apply
+   * post-creation, which is the best wasi-libc allows today. */
+  if (yurt_socketpair_apply_type_flags(acceptor, type) < 0 ||
+      yurt_socketpair_apply_type_flags(connector, type) < 0) {
+    int saved = errno;
+    yurt_socketpair_release(acceptor); yurt_socketpair_release(connector);
+    errno = saved; return -1;
+  }
+
+  sv[0] = acceptor;
+  sv[1] = connector;
   return 0;
 }

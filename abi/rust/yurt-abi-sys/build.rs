@@ -115,6 +115,7 @@ const TIER1: &[&str] = &[
     "pipe2",
     "if_indextoname",
     "if_nametoindex",
+    "socketpair",
     "sendfile",
     "posix_spawn",
     "posix_spawnp",
