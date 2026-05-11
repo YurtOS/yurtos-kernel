@@ -145,4 +145,21 @@ pub const WRAPPED_WASI_LIBC_SYMBOLS: &[&str] = &[
     "__ctype_get_mb_cur_max",
 ];
 
-pub const YURT_INTERNAL_EXPORTS: &[&str] = &["__stack_pointer", "yurt_deliver_signal"];
+pub const YURT_INTERNAL_EXPORTS: &[&str] = &[
+    "__stack_pointer",
+    "yurt_deliver_signal",
+    // Phase 1 shared-library contract — see
+    // docs/superpowers/specs/2026-05-09-shared-libraries-design.md §86.
+    // `__alloc` / `__dealloc` are defined in libyurt_abi
+    // (abi/src/yurt_dl_main.c) and the loader requires them on every
+    // PIE main module that may host dlopen. `__wasi_init_tp` lives in
+    // wasi-libc; the side modules wasm-ld --shared produces declare it
+    // as an `env.*` import nominally backed by libc.so, and the loader
+    // resolves it from main.instance.exports. Without the export
+    // wasm-ld would let the symbol stay internal and side-module
+    // instantiation fails with "function import requires a callable"
+    // on `env.__wasi_init_tp`.
+    "__alloc",
+    "__dealloc",
+    "__wasi_init_tp",
+];

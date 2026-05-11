@@ -329,6 +329,17 @@ fn build_clang_invocation(
             argv.push("--no-wasm-opt".into());
             argv.push("-Wl,--allow-multiple-definition".into());
             argv.push("-Wl,--export-table".into());
+            // Phase 1 shared-library contract: dlopen's loader calls
+            // `__indirect_function_table.grow()` to reserve slots for
+            // side-module function imports (see
+            // packages/kernel/src/process/dynlink.ts line ~477 and the
+            // spec at docs/superpowers/specs/2026-05-09-shared-
+            // libraries-design.md §86). wasm-ld defaults to a non-
+            // growable table; `--growable-table` emits the table with
+            // no maximum so the host-side grow() succeeds. Cost is
+            // zero on guests that never dlopen — the bigger limits
+            // encoding is a handful of bytes.
+            argv.push("-Wl,--growable-table".into());
             for sym in WRAPPED_WASI_LIBC_SYMBOLS {
                 argv.push(format!("-Wl,--wrap={sym}").into());
             }

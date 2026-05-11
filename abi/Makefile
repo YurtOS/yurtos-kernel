@@ -34,6 +34,7 @@ SETJMP_LIB := $(BUILD_DIR)/libyurt_setjmp.a
 LIB_OBJS := \
   $(BUILD_DIR)/yurt_command.o \
   $(BUILD_DIR)/yurt_cwd.o \
+  $(BUILD_DIR)/yurt_dl_main.o \
   $(BUILD_DIR)/yurt_dlfcn.o \
   $(BUILD_DIR)/yurt_dup.o \
   $(BUILD_DIR)/yurt_exec.o \
@@ -153,23 +154,6 @@ $(BUILD_DIR)/%-canary.wasm: $(CANARY_DIR)/%-canary.c $(wildcard include/*.h) $(L
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/$*-canary.pre-opt.wasm \
 	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
-
-# Override for dlopen-canary: also force-export __alloc / __dealloc.
-# The Phase 1 loader (packages/kernel/src/process/dynlink.ts) requires
-# main modules to export an allocator pair so side modules can reserve
-# data-section memory. yurt-cc's YURT_INTERNAL_EXPORTS list doesn't
-# include these yet (only __stack_pointer + yurt_deliver_signal). The
-# canary defines `__alloc` / `__dealloc` as thin malloc/free wrappers
-# (see abi/conformance/c/dlopen-canary.c) and we add the export flags
-# here so they end up in the wasm export section.
-$(BUILD_DIR)/dlopen-canary.wasm: $(CANARY_DIR)/dlopen-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
-	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
-	YURT_CC_INCLUDE=$(INCLUDE) \
-	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/dlopen-canary.pre-opt.wasm \
-	$(YURT_CC) $(YURT_CFLAGS) \
-	    -Wl,--export=__alloc -Wl,--export=__dealloc \
-	    -Wl,--export=__wasi_init_tp \
-	    $< -o $@
 
 canaries: $(CANARIES) $(FORK_DEFAULT_CANARY)
 
