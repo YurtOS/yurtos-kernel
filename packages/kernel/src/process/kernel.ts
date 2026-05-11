@@ -119,6 +119,7 @@ export class ProcessKernel {
   private nextFds = new Map<number, number>();
   private fileLocks = new Map<string, FileLockState>();
   private ttyTable = new Map<number, TtyState>();
+  private namedTtyTable = new Map<string, number>();
   private nextTtyId = 1;
   readonly maxProcesses: number;
 
@@ -1546,6 +1547,21 @@ export class ProcessKernel {
     return this.ttyTable.get(ttyId) ?? null;
   }
 
+  createNamedTty(name: string): TtyState {
+    const { state } = this.createTty();
+    this.namedTtyTable.set(name, state.ttyId);
+    return state;
+  }
+
+  getNamedTtyState(name: string): TtyState | null {
+    const ttyId = this.namedTtyTable.get(name);
+    return ttyId !== undefined ? (this.ttyTable.get(ttyId) ?? null) : null;
+  }
+
+  listNamedTtys(): string[] {
+    return Array.from(this.namedTtyTable.keys());
+  }
+
   /** Create a TTY pair and wire fds 0/1/2 of pid to the slave side. */
   openTtyForProcess(pid: number): TtyState {
     const { state } = this.createTty();
@@ -1677,6 +1693,7 @@ export class ProcessKernel {
     this.parentPids.clear();
     this.fileLocks.clear();
     this.ttyTable.clear();
+    this.namedTtyTable.clear();
   }
 }
 

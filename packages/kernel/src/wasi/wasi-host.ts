@@ -36,6 +36,7 @@ import {
   WASI_EMFILE,
   WASI_ENOENT,
   WASI_ENOSYS,
+  WASI_ENXIO,
   WASI_ENOTSOCK,
   WASI_ENOTSUP,
   WASI_EPIPE,
@@ -1810,6 +1811,21 @@ export class WasiHost {
         if (!state) return WASI_ENOENT;
         if (this.openFdCount() >= this.nofileSoftLimit()) return WASI_EMFILE;
 
+        const fd = this.allocateIoFd(createTtySlaveTarget(state));
+        const view = this.getView();
+        view.setUint32(fdPtr, fd, true);
+        return WASI_ESUCCESS;
+      }
+
+      // /dev/ttyN — named TTY devices (tty0, tty1, tty2, console)
+      const namedTtyMatch = absPath.match(/^\/dev\/(tty\d+|console)$/);
+      if (namedTtyMatch) {
+        if (wantDir || wantCreate || wantTrunc) return WASI_EINVAL;
+        if (!this.kernel || this.pid === undefined) return WASI_ENOENT;
+        const devName = namedTtyMatch[1];
+        const state = this.kernel.getNamedTtyState(devName);
+        if (!state) return WASI_ENXIO;
+        if (this.openFdCount() >= this.nofileSoftLimit()) return WASI_EMFILE;
         const fd = this.allocateIoFd(createTtySlaveTarget(state));
         const view = this.getView();
         view.setUint32(fdPtr, fd, true);

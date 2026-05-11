@@ -408,7 +408,7 @@ export class Sandbox {
     // else can see — clients (and Sandbox.net) would fail to connect.
     const socketBackend: SocketBackend | undefined = options.socketBackend ??
       (options.serverSockets?.allowLoopback === true ||
-        options.serverSockets?.allowUnixDomain === true
+          options.serverSockets?.allowUnixDomain === true
         ? createLoopbackSocketBackend(
           bridge ? createNetworkBridgeSocketBackend(bridge) : undefined,
         )
@@ -507,6 +507,11 @@ export class Sandbox {
     const secLimits = options.security?.limits;
     const kernel = new ProcessKernel({ maxProcesses: secLimits?.processes });
     vfs.setProcessListProvider?.(() => kernel.listProcesses());
+    // Pre-create standard named TTY devices so /dev/ttyN opens work.
+    kernel.createNamedTty("console");
+    kernel.createNamedTty("tty0");
+    kernel.createNamedTty("tty1");
+    kernel.createNamedTty("tty2");
     const processes = new Map<number, Process>();
     const env = new Map<string, string>();
     let sandboxRef: Sandbox | undefined;
@@ -673,8 +678,11 @@ export class Sandbox {
           "/etc/passwd",
           enc.encode(
             [
-              "root:x:0:0:root:/root:/bin/sh",
-              "user:x:1000:1000:user:/home/user/:/bin/sh",
+              // Empty password field (not 'x') → busybox login accepts
+              // blank password without consulting /etc/shadow, which we
+              // don't ship.  root stays locked so login guards the tty.
+              "root:!:0:0:root:/root:/bin/sh",
+              "user::1000:1000:user:/home/user:/bin/sh",
             ].join("\n") + "\n",
           ),
         );
@@ -687,6 +695,27 @@ export class Sandbox {
             ].join("\n") + "\n",
           ),
         );
+        // busybox init reads /etc/inittab to learn which programs to run on
+        // each TTY.  tty1 runs getty which prompts for login; the user entry in
+        // /etc/passwd has an empty password field so no password is required.
+        vfs.writeFile(
+          "/etc/inittab",
+          enc.encode(
+            [
+              "# /etc/inittab — busybox init",
+              "::sysinit:/bin/sh -c 'true'",
+              "tty1::respawn:/sbin/getty 38400 tty1",
+              "::restart:/sbin/init",
+              "::ctrlaltdel:/bin/sh -c 'true'",
+            ].join("\n") + "\n",
+          ),
+        );
+        // /sbin/init is the canonical init location; also link /init for
+        // kernels that look there.  Both point to the same busybox binary.
+        try {
+          vfs.mkdirp("/sbin");
+        } catch { /* exists */ }
+
         for (
           const f of [
             "/etc/os-release",
@@ -694,6 +723,7 @@ export class Sandbox {
             "/etc/hosts",
             "/etc/passwd",
             "/etc/group",
+            "/etc/inittab",
           ]
         ) {
           vfs.chmod(f, 0o444);
@@ -1580,7 +1610,55 @@ export class Sandbox {
     command: string,
     options?: { stdinData?: Uint8Array },
   ): Promise<RunResult> {
-    return await this.callBootCommand(this.bootProcess, command, options);
+    // If the boot process exports the bash-specific __run_command ABI, use
+    // the legacy callBootCommand path.  Otherwise (e.g. when booting init)
+    // fall through to the POSIX spawn path: read /etc/passwd, pick the
+    // user's shell, and spawn [shell, "-c", command].
+    const hasRunCommand =
+      typeof this.bootProcess.exports.__run_command === "function";
+    if (hasRunCommand) {
+      return await this.callBootCommand(this.bootProcess, command, options);
+    }
+    return await this.runPosixCommand(command, options);
+  }
+
+  private async runPosixCommand(
+    command: string,
+    options?: { stdinData?: Uint8Array },
+  ): Promise<RunResult> {
+    const uid = 1000;
+    const passwdEntry = this.readPasswdEntryForUid(uid);
+    const shell = passwdEntry?.shell || "/bin/sh";
+    const home = passwdEntry?.home || "/home/user";
+    const username = passwdEntry?.username || "user";
+    const env: Record<string, string> = {
+      ...Object.fromEntries(this.env),
+      HOME: home,
+      USER: username,
+      LOGNAME: username,
+      SHELL: shell,
+      PWD: this.env.get("PWD") ?? home,
+    };
+    const startTime = performance.now();
+    const proc = await this.spawn([shell, "-c", command], {
+      mode: "cli",
+      env,
+      cwd: env.PWD,
+    });
+    if (options?.stdinData) {
+      proc.setStdin(options.stdinData);
+    }
+    const stdout = proc.fdReadAndClear(1);
+    const stderr = proc.fdReadAndClear(2);
+    return {
+      exitCode: proc.exitCode ?? 0,
+      stdout: stdout.data,
+      stderr: stderr.data,
+      executionTimeMs: performance.now() - startTime,
+      ...(stdout.truncated || stderr.truncated
+        ? { truncated: { stdout: stdout.truncated, stderr: stderr.truncated } }
+        : {}),
+    };
   }
 
   private async callBootCommand(
