@@ -16,9 +16,12 @@ surface is `Sandbox.create({ kernelImpl: "wasm" })` plus `wasmHostImports` /
 still the intended CLI/CI spelling.
 
 Recent parity work filled the Deno wasm-kernel wrapper table for durable KV /
-IndexedDB-shaped `host_idb_*` imports. The socket rows still need a dedicated
-adapter pass: legacy TS host imports use JSON requests tied to TS kernel socket
-fds, while Rust `SYS_SOCKET_*` currently uses direct host socket handles.
+IndexedDB-shaped `host_idb_*` imports. The socket wrappers now follow the direct
+`yurt_abi.toml` socket signatures (`fd`, pointer/length, flags) for the Rust
+`SYS_SOCKET_*` rows; older TS-kernel-only helper imports such as
+`host_socket_open`, `host_socket_bind`, and `host_socket_option` remain outside
+the wasm-kernel table until userland stops depending on them or Rust grows
+matching kernel-owned fd/socket option semantics.
 
 The next milestone is parity, not feature count. The Rust kernel already has
 many syscall families; the work now is to make those routes selectable from the
@@ -71,10 +74,12 @@ instances, scheduling, JSPI/asyncify suspension, and native epoch preemption.
   invoke, and the socket connect/listen/accept/addr/send/recv/close surface.
   Durable KV (`host_idb_get`, `host_idb_put`, `host_idb_delete`,
   `host_idb_list`) is now covered by `wasm-kernel-imports_test.ts`.
-- Treat socket parity as a separate adapter task, not just a table-presence
-  task. The wrapper must either translate the legacy JSON/socket-fd contract or
-  the userland ABI must be rebuilt to call the Rust handle-oriented socket
-  syscalls directly.
+- Treat socket parity as a separate runtime task, not just a table-presence
+  task. The Deno wrapper table now emits the direct transitional ABI shape for
+  connect/listen/accept/addr/send/recv/close; remaining work is end-to-end
+  userland coverage and deciding whether `host_socket_open` / `host_socket_bind`
+  / `host_socket_option` are deleted from the C shim path or reintroduced as
+  real Rust-kernel fd/socket-option operations.
 
 ### Phase C — Parity Harness
 

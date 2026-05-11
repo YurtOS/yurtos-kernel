@@ -339,61 +339,75 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["ptr_len", "out_cap"],
     returnsBytes: true,
   },
-  // host_socket_connect(reqPtr, reqLen, outPtr, outCap) → handle / -errno.
-  // SYS_SOCKET_CONNECT accepts the native socket request bytes and
-  // returns the host socket handle directly.
+  // host_socket_connect(addrPtr, addrLen, flags) → handle / -errno.
+  // SYS_SOCKET_CONNECT currently keeps an 8-byte header for future
+  // family/type expansion: u8 family + u8 sock_type + u16 pad +
+  // u32 flags, followed by UTF-8 "host:port" bytes.
   {
     name: "host_socket_connect",
     method: METHOD.SYS_SOCKET_CONNECT,
-    args: ["ptr_len", "out_cap"],
+    args: [],
+    custom: (mk, memBuf) =>
+    async (
+      addrPtr: number,
+      addrLen: number,
+      flags: number,
+    ): Promise<number> => {
+      const addr = new Uint8Array(memBuf(), addrPtr, addrLen).slice();
+      const req = new Uint8Array(8 + addr.length);
+      new DataView(req.buffer).setUint32(4, flags >>> 0, true);
+      req.set(addr, 8);
+      const out = await mk.syscallAsync(METHOD.SYS_SOCKET_CONNECT, req, 0);
+      return Number(out.rc);
+    },
   },
-  // host_socket_listen(reqPtr, reqLen, outPtr, outCap) → handle / -errno.
-  // SYS_SOCKET_LISTEN accepts u32 backlog + "host:port" bytes.
+  // host_socket_listen(backlog, addrPtr, addrLen) → handle / -errno.
+  // SYS_SOCKET_LISTEN accepts u32 backlog + UTF-8 "host:port" bytes.
   {
     name: "host_socket_listen",
     method: METHOD.SYS_SOCKET_LISTEN,
-    args: ["ptr_len", "out_cap"],
+    args: ["scalar", "ptr_len"],
   },
-  // host_socket_accept(reqPtr, reqLen, outPtr, outCap) → handle / -errno.
+  // host_socket_accept(fd, flags) → handle / -errno.
   // SYS_SOCKET_ACCEPT accepts u32 handle + u32 flags.
   {
     name: "host_socket_accept",
     method: METHOD.SYS_SOCKET_ACCEPT,
-    args: ["ptr_len", "out_cap"],
+    args: ["scalar", "scalar"],
   },
-  // host_socket_addr(reqPtr, reqLen, outPtr, outCap) → bytes.
+  // host_socket_addr(fd, outPtr, outCap) → bytes.
   // SYS_SOCKET_ADDR accepts u32 handle and writes the packed address record.
   {
     name: "host_socket_addr",
     method: METHOD.SYS_SOCKET_ADDR,
-    args: ["ptr_len", "out_cap"],
+    args: ["scalar", "out_cap"],
     returnsBytes: true,
   },
-  // host_socket_send(reqPtr, reqLen, outPtr, outCap) → bytes.
-  // SYS_SOCKET_SEND accepts (u32 handle + payload bytes) and
-  // returns the number of bytes accepted; nothing written back.
-  // The TS-side signature still passes outPtr/outCap (for a
-  // future status struct), but the kernel ignores them today.
+  // host_socket_send(fd, dataPtr, dataLen, flags) → bytes.
+  // SYS_SOCKET_SEND accepts u32 handle + u32 flags + payload
+  // bytes. The kernel currently ignores flags after decoding.
   {
     name: "host_socket_send",
     method: METHOD.SYS_SOCKET_SEND,
-    args: ["ptr_len", "out_cap"],
+    args: ["scalar", "scalar", "ptr_len"],
+    argOrder: [0, 3, 1, 2],
   },
-  // host_socket_recv(reqPtr, reqLen, outPtr, outCap) → bytes.
-  // SYS_SOCKET_RECV: u32 handle in request, returns recv bytes
-  // in the response buffer.
+  // host_socket_recv(fd, outPtr, outCap, flags) → bytes.
+  // SYS_SOCKET_RECV accepts u32 handle + u32 flags and returns
+  // recv bytes in the response buffer.
   {
     name: "host_socket_recv",
     method: METHOD.SYS_SOCKET_RECV,
-    args: ["ptr_len", "out_cap"],
+    args: ["scalar", "scalar", "out_cap"],
+    argOrder: [0, 3, 1, 2],
     returnsBytes: true,
   },
-  // host_socket_close(reqPtr, reqLen) → 0 / -errno.
+  // host_socket_close(fd) → 0 / -errno.
   // SYS_SOCKET_CLOSE: u32 handle in request, no response.
   {
     name: "host_socket_close",
     method: METHOD.SYS_SOCKET_CLOSE,
-    args: ["ptr_len"],
+    args: ["scalar"],
   },
 
   // ── Durable KV / IndexedDB-shaped persistence ─────────────

@@ -1351,11 +1351,12 @@ fn sys_socket_connect(request: &[u8]) -> i64 {
 }
 
 fn sys_socket_send(request: &[u8]) -> i64 {
-    if request.len() < 4 {
+    if request.len() < 8 {
         return -(abi::EINVAL as i64);
     }
     let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
-    let data = &request[4..];
+    let _flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let data = &request[8..];
     kh::socket_send(handle, data)
 }
 
@@ -2965,6 +2966,21 @@ mod tests {
         let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
         assert_eq!(n, 8);
         assert_eq!(&buf, &[0u8; 8]);
+    }
+
+    #[test]
+    fn socket_send_requires_flags_slot_before_payload() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_SEND, 1, &7_u32.to_le_bytes(), &mut []),
+            -(abi::EINVAL as i64)
+        );
+
+        let mut req = Vec::new();
+        req.extend_from_slice(&7_u32.to_le_bytes());
+        req.extend_from_slice(&0_u32.to_le_bytes());
+        req.extend_from_slice(b"payload");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_SEND, 1, &req, &mut []), -38);
     }
 
     #[test]

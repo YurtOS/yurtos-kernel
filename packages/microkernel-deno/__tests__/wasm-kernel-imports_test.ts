@@ -41,6 +41,30 @@ async function freshMk(): Promise<Microkernel> {
   );
 }
 
+interface CapturedCall {
+  method: number;
+  request: Uint8Array;
+  responseCap: number;
+}
+
+function capturingMk(rc = 0, response = new Uint8Array()): {
+  mk: Microkernel;
+  calls: CapturedCall[];
+} {
+  const calls: CapturedCall[] = [];
+  const mk = {
+    syscallAsync(
+      method: number,
+      request: Uint8Array,
+      responseCap: number,
+    ): Promise<{ rc: bigint; response: Uint8Array }> {
+      calls.push({ method, request: request.slice(), responseCap });
+      return Promise.resolve({ rc: BigInt(rc), response });
+    },
+  } as unknown as Microkernel;
+  return { mk, calls };
+}
+
 function kvKey(store: Uint8Array, key: Uint8Array): string {
   return `${new TextDecoder().decode(store)}\0${new TextDecoder().decode(key)}`;
 }
@@ -299,6 +323,108 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     // -ENOENT from the empty extension registry — proves the
     // bytes round-tripped through the trampoline.
     expect(rc).toEqual(-2);
+  });
+
+  it("socket wrappers use the direct yurt_abi socket signatures", async () => {
+    const buf = new ArrayBuffer(128);
+    const u = new Uint8Array(buf);
+    const { mk, calls } = capturingMk(0, new Uint8Array([9, 8, 7, 6]));
+    const imports = buildWasmKernelImports(mk, () => buf);
+
+    u.set(new TextEncoder().encode("127.0.0.1:8080"), 0);
+    await imports.host_socket_connect(0, 14, 0x40);
+    expect(calls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_CONNECT,
+      responseCap: 0,
+    });
+    expect(Array.from(calls.at(-1)!.request.slice(0, 8))).toEqual([
+      0,
+      0,
+      0,
+      0,
+      0x40,
+      0,
+      0,
+      0,
+    ]);
+    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(8)))
+      .toEqual("127.0.0.1:8080");
+
+    u.set(new TextEncoder().encode("payload"), 32);
+    await imports.host_socket_send(7, 32, 7, 0x02);
+    expect(calls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_SEND,
+      responseCap: 0,
+    });
+    expect(Array.from(calls.at(-1)!.request.slice(0, 8))).toEqual([
+      7,
+      0,
+      0,
+      0,
+      0x02,
+      0,
+      0,
+      0,
+    ]);
+    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(8)))
+      .toEqual("payload");
+
+    const received = await imports.host_socket_recv(7, 64, 4, 0x04);
+    expect(received).toEqual(0);
+    expect(calls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_RECV,
+      responseCap: 4,
+    });
+    expect(Array.from(calls.at(-1)!.request)).toEqual([
+      7,
+      0,
+      0,
+      0,
+      0x04,
+      0,
+      0,
+      0,
+    ]);
+
+    await imports.host_socket_listen(128, 0, 14);
+    expect(calls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_LISTEN,
+      responseCap: 0,
+    });
+    expect(new DataView(calls.at(-1)!.request.buffer).getUint32(0, true))
+      .toEqual(128);
+    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(4)))
+      .toEqual("127.0.0.1:8080");
+
+    await imports.host_socket_accept(9, 0x08);
+    expect(calls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_ACCEPT,
+      responseCap: 0,
+    });
+    expect(Array.from(calls.at(-1)!.request)).toEqual([
+      9,
+      0,
+      0,
+      0,
+      0x08,
+      0,
+      0,
+      0,
+    ]);
+
+    await imports.host_socket_addr(9, 80, 16);
+    expect(calls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_ADDR,
+      responseCap: 16,
+    });
+    expect(Array.from(calls.at(-1)!.request)).toEqual([9, 0, 0, 0]);
+
+    await imports.host_socket_close(9);
+    expect(calls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_CLOSE,
+      responseCap: 0,
+    });
+    expect(Array.from(calls.at(-1)!.request)).toEqual([9, 0, 0, 0]);
   });
 
   it("durable KV wrappers round-trip put/get/list/delete", async () => {
