@@ -38,6 +38,10 @@ export interface SocketListenPolicy {
    * stores the hook but still rejects listen because server sockets are deferred.
    */
   onListen?: (request: SocketListenRequest) => boolean | Promise<boolean>;
+  /** Allow AF_UNIX pathname and abstract domain sockets. */
+  allowUnixDomain?: boolean;
+  /** If set, only allow bind() on paths matching one of these patterns. */
+  unixPathAllowlist?: RegExp[];
 }
 
 export type SocketBackendResult =

@@ -43,6 +43,21 @@ export interface AcceptedConnection {
   localPort: number;
 }
 
+export interface UnixListenRequest {
+  path: string;
+  backlog: number;
+}
+
+export interface UnixAcceptedConnection {
+  socket: SocketHandle;
+  peerPath?: string;
+  localPath: string;
+}
+
+export type UnixConnectResult =
+  | { ok: true; socket: SocketHandle; localPath: string; peerPath: string }
+  | { ok: false; error: string };
+
 export type ConnectResult =
   | {
     ok: true;
@@ -86,6 +101,9 @@ interface PairedSocket {
   /** Set on the client side of openPair — the localPort was drawn from
    *  clientPorts and must be released back to the allocator on close. */
   ownsClientPort?: boolean;
+  /** AF_UNIX path fields — only set for unix-domain connected sockets. */
+  localPath?: string;
+  peerPath?: string;
 }
 
 interface ListenerState {
@@ -99,6 +117,14 @@ interface ListenerState {
     reject: (e: Error) => void;
   }>;
   closed: boolean;
+  /** AF_UNIX-specific fields — only set when isUnixListener is true. */
+  isUnixListener?: boolean;
+  localPath?: string;
+  pendingUnix?: UnixAcceptedConnection[];
+  unixAcceptWaiters?: Array<{
+    resolve: (a: UnixAcceptedConnection) => void;
+    reject: (e: Error) => void;
+  }>;
 }
 
 const EPHEMERAL_PORT_START = 49152;
@@ -312,8 +338,199 @@ export class ListenerRegistry {
     for (const accepted of listener.pending.splice(0)) {
       this.closeSocket(accepted.socket);
     }
+    // Also drain unix-specific queues.
+    if (listener.unixAcceptWaiters) {
+      for (const w of listener.unixAcceptWaiters.splice(0)) w.reject(err);
+    }
+    if (listener.pendingUnix) {
+      for (const accepted of listener.pendingUnix.splice(0)) {
+        this.closeSocket(accepted.socket);
+      }
+    }
     this.emit("unlisten", info);
   }
+
+  // ── AF_UNIX path-namespace methods ────────────────────────────────────────
+
+  /**
+   * Bind a unix pathname socket. Creates a listener keyed by `AF_UNIX:<path>`.
+   * Throws EADDRINUSE if path is already bound.
+   */
+  listenOnPath(path: string, backlog: number): ListenerHandle {
+    const routeKey = `AF_UNIX:${path}`;
+    if (this.routes.has(routeKey)) {
+      throw new Error(`address ${path} already in use`);
+    }
+    const handle = this.nextListenerHandle++;
+    const state: ListenerState = {
+      handle,
+      // AF_UNIX listeners still need host/port fields to satisfy the type;
+      // use sentinel values that are clearly not AF_INET.
+      host: "127.0.0.1" as ListenHost,
+      port: 0,
+      backlog,
+      pending: [],
+      acceptWaiters: [],
+      closed: false,
+      isUnixListener: true,
+      localPath: path,
+      pendingUnix: [],
+      unixAcceptWaiters: [],
+    };
+    this.listeners.set(handle, state);
+    this.routes.set(routeKey, handle);
+    return handle;
+  }
+
+  /**
+   * Connect to a unix pathname listener. Creates a paired socket and either
+   * hands it to a parked acceptUnix waiter or pushes it to pendingUnix.
+   */
+  connectToPath(path: string): UnixConnectResult {
+    const routeKey = `AF_UNIX:${path}`;
+    const listenerHandle = this.routes.get(routeKey);
+    const listener = listenerHandle !== undefined
+      ? this.listeners.get(listenerHandle)
+      : undefined;
+    if (!listener || listener.closed) {
+      return { ok: false, error: `connection refused: ${path}` };
+    }
+    const pendingUnix = listener.pendingUnix!;
+    const unixAcceptWaiters = listener.unixAcceptWaiters!;
+    if (
+      unixAcceptWaiters.length === 0 &&
+      pendingUnix.length >= listener.backlog
+    ) {
+      return { ok: false, error: "connection refused: listener backlog full" };
+    }
+
+    const clientHandle = this.nextSocketHandle++;
+    const serverHandle = this.nextSocketHandle++;
+
+    const clientSock: PairedSocket = {
+      handle: clientHandle,
+      peerHandle: serverHandle,
+      rx: [],
+      rxWaiters: [],
+      closed: false,
+      peerHost: "",
+      peerPort: 0,
+      localHost: "",
+      localPort: 0,
+      localPath: path,
+      peerPath: path,
+    };
+    const serverSock: PairedSocket = {
+      handle: serverHandle,
+      peerHandle: clientHandle,
+      rx: [],
+      rxWaiters: [],
+      closed: false,
+      peerHost: "",
+      peerPort: 0,
+      localHost: "",
+      localPort: 0,
+      localPath: path,
+      peerPath: path,
+    };
+    this.sockets.set(clientHandle, clientSock);
+    this.sockets.set(serverHandle, serverSock);
+
+    const accepted: UnixAcceptedConnection = {
+      socket: serverHandle,
+      localPath: path,
+      peerPath: path,
+    };
+
+    const waiter = unixAcceptWaiters.shift();
+    if (waiter) waiter.resolve(accepted);
+    else pendingUnix.push(accepted);
+
+    return { ok: true, socket: clientHandle, localPath: path, peerPath: path };
+  }
+
+  /** Async accept for AF_UNIX listeners. */
+  acceptUnix(handle: ListenerHandle): Promise<UnixAcceptedConnection> {
+    const listener = this.listeners.get(handle);
+    if (!listener || listener.closed) {
+      return Promise.reject(new Error("accept: listener closed"));
+    }
+    if (!listener.isUnixListener) {
+      return Promise.reject(
+        new Error("acceptUnix: not a unix listener"),
+      );
+    }
+    const ready = listener.pendingUnix!.shift();
+    if (ready) return Promise.resolve(ready);
+    return new Promise<UnixAcceptedConnection>((resolve, reject) => {
+      listener.unixAcceptWaiters!.push({ resolve, reject });
+    });
+  }
+
+  /** Synchronous poll variant for AF_UNIX accept. */
+  acceptNowUnix(handle: ListenerHandle): UnixAcceptedConnection | null {
+    const listener = this.listeners.get(handle);
+    if (!listener || listener.closed || !listener.isUnixListener) return null;
+    return listener.pendingUnix!.shift() ?? null;
+  }
+
+  /** Close a unix pathname listener by path, removing the route key. */
+  closePathListener(path: string): void {
+    const routeKey = `AF_UNIX:${path}`;
+    const listenerHandle = this.routes.get(routeKey);
+    if (listenerHandle === undefined) return;
+    // closeListener already removes all route keys for this handle and
+    // drains waiters, but it doesn't know the AF_UNIX key — delete it
+    // first so callers see it gone immediately, then delegate cleanup.
+    this.routes.delete(routeKey);
+    this.closeListener(listenerHandle);
+  }
+
+  /**
+   * Create a socketpair() — two connected AF_UNIX sockets, no listener.
+   * Returns raw registry handles (positive ints). Callers in kernel-imports
+   * negate them for the loopback backend convention.
+   */
+  openUnixPair(_type: "STREAM" = "STREAM"): { a: SocketHandle; b: SocketHandle } {
+    const aHandle = this.nextSocketHandle++;
+    const bHandle = this.nextSocketHandle++;
+    const aSock: PairedSocket = {
+      handle: aHandle,
+      peerHandle: bHandle,
+      rx: [],
+      rxWaiters: [],
+      closed: false,
+      peerHost: "",
+      peerPort: 0,
+      localHost: "",
+      localPort: 0,
+    };
+    const bSock: PairedSocket = {
+      handle: bHandle,
+      peerHandle: aHandle,
+      rx: [],
+      rxWaiters: [],
+      closed: false,
+      peerHost: "",
+      peerPort: 0,
+      localHost: "",
+      localPort: 0,
+    };
+    this.sockets.set(aHandle, aSock);
+    this.sockets.set(bHandle, bSock);
+    return { a: aHandle, b: bHandle };
+  }
+
+  /** Query unix path address info for a socket handle. */
+  socketUnixAddrInfo(
+    handle: SocketHandle,
+  ): { localPath?: string; peerPath?: string } | null {
+    const s = this.sockets.get(handle);
+    if (!s) return null;
+    return { localPath: s.localPath, peerPath: s.peerPath };
+  }
+
+  // ── existing methods continue ──────────────────────────────────────────────
 
   send(handle: SocketHandle, bytes: Uint8Array): SendResult {
     const local = this.sockets.get(handle);
