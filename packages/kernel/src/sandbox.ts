@@ -1102,6 +1102,31 @@ export class Sandbox {
           // with "main module not ready" — see PR #23 + the abi_test
           // dlopen-canary happy_path case.
           mainInstance,
+          runCommand: async (cmd, stdin) => {
+            const sandbox = getSandbox();
+            if (!sandbox) {
+              return { exitCode: 1, stdout: "", stderr: "sandbox not ready\n" };
+            }
+            if (runCommandHandler) {
+              const result = await runCommandHandler(
+                { cmd, stdin },
+                { sandbox },
+              );
+              return {
+                exitCode: result.exit_code,
+                stdout: result.stdout,
+                stderr: result.stderr,
+              };
+            }
+            const result = await sandbox.runBootCommandInFreshProcess(cmd, {
+              stdinData: stdin ? new TextEncoder().encode(stdin) : undefined,
+            });
+            return {
+              exitCode: result.exitCode,
+              stdout: result.stdout,
+              stderr: result.stderr,
+            };
+          },
           spawnProcess: (req, fdTable) => {
             const commandLabel = req.argv0 ?? req.prog;
             const childPid = kernel.allocPid(pid);

@@ -23,7 +23,28 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* The Phase 1 dlopen loader requires the main module to export
+ * `__alloc` / `__dealloc` so it can reserve memory for side modules'
+ * data sections (see packages/kernel/src/process/dynlink.ts ::
+ * mainAccessFromInstance and the spec at
+ * docs/superpowers/specs/2026-05-09-shared-libraries-design.md §86).
+ * Standard yurt-cc binaries don't force-export these yet (only the
+ * Tier-1 ABI symbols + YURT_INTERNAL_EXPORTS, which omits __alloc),
+ * so the canary defines them locally as thin malloc/free wrappers
+ * and the Makefile force-exports them. When yurt-cc grows a generic
+ * mechanism for main-module allocator exports, these stubs can go
+ * away and the Makefile flags fold into yurt-cc itself. */
+__attribute__((visibility("default"))) void *__alloc(size_t n) {
+  return malloc(n);
+}
+
+__attribute__((visibility("default"))) void __dealloc(void *p, size_t n) {
+  (void)n;
+  free(p);
+}
 
 /* Print one JSONL trace line. Same convention as dup2-canary.c so the
  * harness can parse output with the existing helpers. */
