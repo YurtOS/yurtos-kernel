@@ -32,10 +32,18 @@ class FakeAsyncKv implements KvBackend {
   private store = new Map<string, Uint8Array>();
 
   // Sync stubs.
-  get(): Uint8Array | number { return -38; }
-  put(): number { return -38; }
-  delete(): number { return -38; }
-  list(): Uint8Array[] { return []; }
+  get(): Uint8Array | number {
+    return -38;
+  }
+  put(): number {
+    return -38;
+  }
+  delete(): number {
+    return -38;
+  }
+  list(): Uint8Array[] {
+    return [];
+  }
 
   async getAsync(s: Uint8Array, k: Uint8Array): Promise<Uint8Array | number> {
     await new Promise<void>((r) => queueMicrotask(r));
@@ -69,10 +77,16 @@ describe("JSPI / kh_idb_*", () => {
     const store = new TextEncoder().encode("sessions");
     const key = new TextEncoder().encode("alice");
     const value = new TextEncoder().encode("AAA");
-    const putReq = new Uint8Array(1 + store.byteLength + 4 + key.byteLength + value.byteLength);
+    const putReq = new Uint8Array(
+      1 + store.byteLength + 4 + key.byteLength + value.byteLength,
+    );
     putReq[0] = store.byteLength;
     putReq.set(store, 1);
-    new DataView(putReq.buffer).setUint32(1 + store.byteLength, key.byteLength, true);
+    new DataView(putReq.buffer).setUint32(
+      1 + store.byteLength,
+      key.byteLength,
+      true,
+    );
     putReq.set(key, 1 + store.byteLength + 4);
     putReq.set(value, 1 + store.byteLength + 4 + key.byteLength);
     const putOut = await mk.syscallAsync(METHOD.SYS_IDB_PUT, putReq, 0);

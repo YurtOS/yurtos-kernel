@@ -24,16 +24,26 @@ const ENOSYS = 52;
  */
 const posixToWasi = (posix: number): number => {
   switch (posix) {
-    case 0: return 0;
-    case 1: return 63; // EPERM
-    case 2: return 44; // ENOENT
-    case 9: return 8; // EBADF
-    case 11: return 6; // EAGAIN
-    case 22: return 28; // EINVAL
-    case 29: return 70; // ESPIPE
-    case 32: return 64; // EPIPE
-    case 38: return 52; // ENOSYS
-    default: return 28; // EINVAL fallback
+    case 0:
+      return 0;
+    case 1:
+      return 63; // EPERM
+    case 2:
+      return 44; // ENOENT
+    case 9:
+      return 8; // EBADF
+    case 11:
+      return 6; // EAGAIN
+    case 22:
+      return 28; // EINVAL
+    case 29:
+      return 70; // ESPIPE
+    case 32:
+      return 64; // EPIPE
+    case 38:
+      return 52; // ENOSYS
+    default:
+      return 28; // EINVAL fallback
   }
 };
 
@@ -42,8 +52,7 @@ const posixToWasi = (posix: number): number => {
 const PREOPEN_ROOT_FD = 3;
 const PREOPEN_ROOT_NAME = "/";
 
-const errnoFromKernel = (rc: number): number =>
-  rc >= 0 ? 0 : posixToWasi(-rc);
+const errnoFromKernel = (rc: number): number => rc >= 0 ? 0 : posixToWasi(-rc);
 
 export function buildWasiShim(
   pid: number,
@@ -286,8 +295,10 @@ export function buildWasiShim(
     const { rc, response } = kernel.syscall(METHOD.SYS_FSTAT, pid, req, 16);
     const n = Number(rc);
     if (n !== 16) return errnoFromKernel(n);
-    const size = new DataView(response.buffer, response.byteOffset).getBigUint64(0, true);
-    const filetype = new DataView(response.buffer, response.byteOffset).getUint32(8, true);
+    const size = new DataView(response.buffer, response.byteOffset)
+      .getBigUint64(0, true);
+    const filetype = new DataView(response.buffer, response.byteOffset)
+      .getUint32(8, true);
     const buf = new Uint8Array(64);
     const view = new DataView(buf.buffer);
     buf[16] = filetype & 0xff;

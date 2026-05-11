@@ -165,9 +165,7 @@ export class DenoHostFs implements HostFsImpl {
       return {
         size: BigInt(meta.size),
         mode,
-        mtimeNs: meta.mtime
-          ? BigInt(meta.mtime.getTime()) * 1_000_000n
-          : 0n,
+        mtimeNs: meta.mtime ? BigInt(meta.mtime.getTime()) * 1_000_000n : 0n,
         isDir: meta.isDirectory,
         isSymlink: meta.isSymlink,
       };
@@ -260,11 +258,21 @@ export class DenoTcpSocket implements TcpSocketImpl {
   private listeners = new Map<number, Deno.TcpListener>();
 
   // Sync stubs — JSPI takes the *Async path.
-  connect(): number { return -38; }
-  send(): number { return -38; }
-  recv(): number { return -38; }
-  listen(): number { return -38; }
-  accept(): number { return -38; }
+  connect(): number {
+    return -38;
+  }
+  send(): number {
+    return -38;
+  }
+  recv(): number {
+    return -38;
+  }
+  listen(): number {
+    return -38;
+  }
+  accept(): number {
+    return -38;
+  }
   localAddr(handle: number): { host: string; port: number } | null {
     const l = this.listeners.get(handle);
     if (l && l.addr.transport === "tcp") {
@@ -279,15 +287,35 @@ export class DenoTcpSocket implements TcpSocketImpl {
 
   close(handle: number): number {
     const c = this.conns.get(handle);
-    if (c) { try { c.close(); } catch { /* */ } this.conns.delete(handle); return 0; }
+    if (c) {
+      try {
+        c.close();
+      } catch { /* */ }
+      this.conns.delete(handle);
+      return 0;
+    }
     const l = this.listeners.get(handle);
-    if (l) { try { l.close(); } catch { /* */ } this.listeners.delete(handle); return 0; }
+    if (l) {
+      try {
+        l.close();
+      } catch { /* */ }
+      this.listeners.delete(handle);
+      return 0;
+    }
     return 0;
   }
 
-  async connectAsync(host: string, port: number, _flags: number): Promise<number> {
+  async connectAsync(
+    host: string,
+    port: number,
+    _flags: number,
+  ): Promise<number> {
     try {
-      const conn = await Deno.connect({ hostname: host, port, transport: "tcp" });
+      const conn = await Deno.connect({
+        hostname: host,
+        port,
+        transport: "tcp",
+      });
       const h = this.nextHandle++;
       this.conns.set(h, conn);
       return h;
@@ -296,7 +324,11 @@ export class DenoTcpSocket implements TcpSocketImpl {
     }
   }
 
-  async recvAsync(handle: number, buf: Uint8Array, _flags: number): Promise<number> {
+  async recvAsync(
+    handle: number,
+    buf: Uint8Array,
+    _flags: number,
+  ): Promise<number> {
     const conn = this.conns.get(handle);
     if (!conn) return -EBADF;
     try {

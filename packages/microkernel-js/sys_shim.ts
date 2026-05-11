@@ -277,7 +277,8 @@ export function buildSysImports(
       }
       return rc;
     },
-    sys_socket_close: (fd) => forwardRequestBytes(METHOD.SYS_SOCKET_CLOSE, u32(fd)),
+    sys_socket_close: (fd) =>
+      forwardRequestBytes(METHOD.SYS_SOCKET_CLOSE, u32(fd)),
     sys_socket_listen: (backlog, addrPtr, addrLen) => {
       const addr = new Uint8Array(um(), addrPtr, addrLen).slice();
       const req = new Uint8Array(4 + addr.byteLength);

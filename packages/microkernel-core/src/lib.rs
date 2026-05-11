@@ -265,10 +265,7 @@ const EFAULT: i64 = 14;
 
 /// Forward a scalar-only syscall (no request bytes, no response
 /// capacity). Returns the i32 cast of the kernel's i64 result.
-pub fn forward_scalar<S: HasCallerPid, C: HostCallCtx<S>>(
-    ctx: &mut C,
-    method_id: u32,
-) -> i32 {
+pub fn forward_scalar<S: HasCallerPid, C: HostCallCtx<S>>(ctx: &mut C, method_id: u32) -> i32 {
     let pid = ctx.user_state().caller_pid();
     ctx.dispatch_kernel(method_id, pid, &[], 0).rc as i32
 }

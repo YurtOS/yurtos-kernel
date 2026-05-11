@@ -68,7 +68,11 @@ describe("DenoHostFs", () => {
       expect(Deno.statSync(`${root}/sub/b.txt`).isFile).toEqual(true);
       expect(fs.unlink(enc("/sub/b.txt"))).toEqual(0);
       let exists = true;
-      try { Deno.statSync(`${root}/sub/b.txt`); } catch { exists = false; }
+      try {
+        Deno.statSync(`${root}/sub/b.txt`);
+      } catch {
+        exists = false;
+      }
       expect(exists).toEqual(false);
     } finally {
       Deno.removeSync(root, { recursive: true });

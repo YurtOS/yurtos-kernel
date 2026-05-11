@@ -9,8 +9,8 @@ import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
 import {
   defaultHostState,
-  DenoTcpSocket,
   denoFetch,
+  DenoTcpSocket,
   METHOD,
   Microkernel,
 } from "../mod.ts";
@@ -144,7 +144,9 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
       // Close client-side handle so Deno's leak checker is happy.
       tcp.close(handle);
     } finally {
-      try { listener.close(); } catch { /* */ }
+      try {
+        listener.close();
+      } catch { /* */ }
       await serverDone;
     }
   });

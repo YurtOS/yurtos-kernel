@@ -312,7 +312,11 @@ Deno.test(
       req.set(path, 4);
       return req;
     };
-    const open = mk.syscall(METHOD.SYS_OPEN, buildOpen(0, enc.encode("/etc/motd")), 0);
+    const open = mk.syscall(
+      METHOD.SYS_OPEN,
+      buildOpen(0, enc.encode("/etc/motd")),
+      0,
+    );
     const fd = Number(open.rc);
     if (fd < 0) throw new Error(`expected open success, got ${fd}`);
 
@@ -320,10 +324,17 @@ Deno.test(
     new DataView(fdReq.buffer).setUint32(0, fd >>> 0, true);
     const { rc, response } = mk.syscall(METHOD.SYS_READ, fdReq, 64);
     const n = Number(rc);
-    assertEquals(new TextDecoder().decode(response.subarray(0, n)), "hello ramfs\n");
+    assertEquals(
+      new TextDecoder().decode(response.subarray(0, n)),
+      "hello ramfs\n",
+    );
 
     // Unknown path → -ENOENT (-2).
-    const missing = mk.syscall(METHOD.SYS_OPEN, buildOpen(0, enc.encode("/no/such")), 0);
+    const missing = mk.syscall(
+      METHOD.SYS_OPEN,
+      buildOpen(0, enc.encode("/no/such")),
+      0,
+    );
     assertEquals(Number(missing.rc), -2);
   },
 );
@@ -354,7 +365,9 @@ Deno.test(
     // Allowed call goes through.
     const benign = new TextEncoder().encode("benign request");
     const ok = mk.syscall(METHOD.SYS_EXTENSION_INVOKE, benign, 64);
-    if (Number(ok.rc) <= 0) throw new Error(`expected positive rc, got ${ok.rc}`);
+    if (Number(ok.rc) <= 0) {
+      throw new Error(`expected positive rc, got ${ok.rc}`);
+    }
     assertEquals(recorded.length, 1);
 
     // Denied call returns -EACCES (-13) and never reaches registry.

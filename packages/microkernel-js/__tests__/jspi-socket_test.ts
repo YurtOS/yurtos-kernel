@@ -35,25 +35,45 @@ class FakeAsyncTcp implements TcpSocketImpl {
   }
 
   // Sync stubs — Suspending uses *Async only.
-  connect(): number { return -38; }
-  send(): number { return -38; }
-  recv(): number { return -38; }
+  connect(): number {
+    return -38;
+  }
+  send(): number {
+    return -38;
+  }
+  recv(): number {
+    return -38;
+  }
   close(handle: number): number {
     this.connected.delete(handle);
     return 0;
   }
-  listen(): number { return -38; }
-  accept(): number { return -38; }
-  localAddr(): { host: string; port: number } | null { return null; }
+  listen(): number {
+    return -38;
+  }
+  accept(): number {
+    return -38;
+  }
+  localAddr(): { host: string; port: number } | null {
+    return null;
+  }
 
-  async connectAsync(_host: string, _port: number, _flags: number): Promise<number> {
+  async connectAsync(
+    _host: string,
+    _port: number,
+    _flags: number,
+  ): Promise<number> {
     await new Promise<void>((r) => queueMicrotask(r));
     const h = this.nextHandle++;
     this.connected.add(h);
     return h;
   }
 
-  async recvAsync(handle: number, buf: Uint8Array, _flags: number): Promise<number> {
+  async recvAsync(
+    handle: number,
+    buf: Uint8Array,
+    _flags: number,
+  ): Promise<number> {
     await new Promise<void>((r) => queueMicrotask(r));
     const queue = this.recvQueue.get(handle);
     if (!queue || queue.length === 0) return 0;

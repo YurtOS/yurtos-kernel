@@ -39,15 +39,33 @@ class FakeAsyncFs implements HostFsImpl {
     this.files.set(this.bkey(path), content);
   }
   // Sync stubs.
-  open(): number { return -38; }
-  read(): number { return -38; }
-  write(): number { return -38; }
-  close(): number { return 0; }
-  stat(): HostFsStat | number { return -38; }
-  unlink(): number { return -38; }
-  mkdir(): number { return -38; }
-  symlink(): number { return -38; }
-  rename(): number { return -38; }
+  open(): number {
+    return -38;
+  }
+  read(): number {
+    return -38;
+  }
+  write(): number {
+    return -38;
+  }
+  close(): number {
+    return 0;
+  }
+  stat(): HostFsStat | number {
+    return -38;
+  }
+  unlink(): number {
+    return -38;
+  }
+  mkdir(): number {
+    return -38;
+  }
+  symlink(): number {
+    return -38;
+  }
+  rename(): number {
+    return -38;
+  }
 
   async openAsync(path: Uint8Array, _flags: number): Promise<number> {
     await new Promise<void>((r) => queueMicrotask(r));

@@ -89,7 +89,11 @@ describe("installYurtPackageTar", () => {
     const data = enc.encode("hello");
     const archive = tar([
       {
-        hdr: header({ path: "bin/hello.txt", type: "0", size: data.byteLength }),
+        hdr: header({
+          path: "bin/hello.txt",
+          type: "0",
+          size: data.byteLength,
+        }),
         data,
       },
     ]);
@@ -105,7 +109,11 @@ describe("installYurtPackageTar", () => {
     const data = enc.encode("x");
     const archive = tar([
       {
-        hdr: header({ path: "a/b/c/file.txt", type: "0", size: data.byteLength }),
+        hdr: header({
+          path: "a/b/c/file.txt",
+          type: "0",
+          size: data.byteLength,
+        }),
         data,
       },
     ]);
@@ -179,11 +187,19 @@ describe("installYurtPackageTar", () => {
     const data = enc.encode("real");
     const archive = tar([
       {
-        hdr: header({ path: "info/index.json", type: "0", size: meta.byteLength }),
+        hdr: header({
+          path: "info/index.json",
+          type: "0",
+          size: meta.byteLength,
+        }),
         data: meta,
       },
       {
-        hdr: header({ path: "info/files.json", type: "0", size: meta.byteLength }),
+        hdr: header({
+          path: "info/files.json",
+          type: "0",
+          size: meta.byteLength,
+        }),
         data: meta,
       },
       {
@@ -205,7 +221,12 @@ describe("installYurtPackageTar", () => {
     const data = enc.encode("exe");
     const archive = tar([
       {
-        hdr: header({ path: "bin/tool", type: "0", size: data.byteLength, mode: 0o755 }),
+        hdr: header({
+          path: "bin/tool",
+          type: "0",
+          size: data.byteLength,
+          mode: 0o755,
+        }),
         data,
       },
     ]);
@@ -234,7 +255,11 @@ describe("installYurtPackageTar", () => {
     const data = enc.encode("x");
     const archive = tar([
       {
-        hdr: header({ path: "../../etc/passwd", type: "0", size: data.byteLength }),
+        hdr: header({
+          path: "../../etc/passwd",
+          type: "0",
+          size: data.byteLength,
+        }),
         data,
       },
     ]);

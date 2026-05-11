@@ -32,18 +32,19 @@ const HAS_JSPI = typeof W?.Suspending === "function" &&
 describe("browser-friendly impls", () => {
   it("globalFetch wraps globalThis.fetch — same shape as denoFetch", async () => {
     if (!HAS_JSPI) return;
-    const ac = new AbortController();
-    const server = Deno.serve(
-      { port: 0, signal: ac.signal, onListen: () => {} },
-      () => new Response("hello globalFetch", { status: 200 }),
-    );
-    const port = (server.addr as Deno.NetAddr).port;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (input) => {
+      expect(String(input)).toEqual("https://example.invalid/");
+      return Promise.resolve(
+        new Response("hello globalFetch", { status: 200 }),
+      );
+    };
     try {
       const host = defaultHostState();
       host.fetch = globalFetch;
       const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
       const reqJson = JSON.stringify({
-        url: `http://127.0.0.1:${port}/`,
+        url: "https://example.invalid/",
         method: "GET",
       });
       const out = await mk.syscallAsync(
@@ -58,8 +59,7 @@ describe("browser-friendly impls", () => {
       );
       expect(resp.body).toEqual("hello globalFetch");
     } finally {
-      ac.abort();
-      await server.finished;
+      globalThis.fetch = originalFetch;
     }
   });
 
