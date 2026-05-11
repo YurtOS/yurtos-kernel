@@ -15,6 +15,7 @@ import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
 import {
   defaultHostState,
+  type KvBackend,
   METHOD,
   Microkernel,
 } from "../../microkernel-js/mod.ts";
@@ -40,6 +41,43 @@ async function freshMk(): Promise<Microkernel> {
   );
 }
 
+function kvKey(store: Uint8Array, key: Uint8Array): string {
+  return `${new TextDecoder().decode(store)}\0${new TextDecoder().decode(key)}`;
+}
+
+class FakeKv implements KvBackend {
+  private values = new Map<string, Uint8Array>();
+
+  get(store: Uint8Array, key: Uint8Array): Uint8Array | number {
+    return this.values.get(kvKey(store, key)) ?? -2;
+  }
+
+  put(store: Uint8Array, key: Uint8Array, value: Uint8Array): number {
+    this.values.set(kvKey(store, key), value);
+    return 0;
+  }
+
+  delete(store: Uint8Array, key: Uint8Array): number {
+    this.values.delete(kvKey(store, key));
+    return 0;
+  }
+
+  list(store: Uint8Array, prefix: Uint8Array): Uint8Array[] {
+    const storeName = new TextDecoder().decode(store);
+    const prefixText = new TextDecoder().decode(prefix);
+    const keys: Uint8Array[] = [];
+    for (const fullKey of this.values.keys()) {
+      const [stored, key] = fullKey.split("\0");
+      if (stored === storeName && key.startsWith(prefixText)) {
+        keys.push(new TextEncoder().encode(key));
+      }
+    }
+    return keys.sort((a, b) =>
+      new TextDecoder().decode(a).localeCompare(new TextDecoder().decode(b))
+    );
+  }
+}
+
 describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
   it("covers the legacy socket host import names that have Rust syscalls", () => {
     const names = new Set(HOST_BINDINGS.map((b) => b.name));
@@ -52,6 +90,20 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
         "host_socket_send",
         "host_socket_recv",
         "host_socket_close",
+      ]
+    ) {
+      expect(names.has(name)).toEqual(true);
+    }
+  });
+
+  it("covers the legacy durable KV host import names that have Rust syscalls", () => {
+    const names = new Set(HOST_BINDINGS.map((b) => b.name));
+    for (
+      const name of [
+        "host_idb_get",
+        "host_idb_put",
+        "host_idb_delete",
+        "host_idb_list",
       ]
     ) {
       expect(names.has(name)).toEqual(true);
@@ -247,6 +299,62 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     // -ENOENT from the empty extension registry — proves the
     // bytes round-tripped through the trampoline.
     expect(rc).toEqual(-2);
+  });
+
+  it("durable KV wrappers round-trip put/get/list/delete", async () => {
+    if (!HAS_JSPI) return;
+    const host = defaultHostState();
+    host.kv = new FakeKv();
+    const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+    const buf = new ArrayBuffer(256);
+    const u = new Uint8Array(buf);
+    const imports = buildWasmKernelImports(mk, () => buf);
+
+    const store = new TextEncoder().encode("sessions");
+    const key = new TextEncoder().encode("alice");
+    const value = new TextEncoder().encode("AAA");
+    const putReq = new Uint8Array(
+      1 + store.byteLength + 4 + key.byteLength + value.byteLength,
+    );
+    putReq[0] = store.byteLength;
+    putReq.set(store, 1);
+    new DataView(putReq.buffer).setUint32(
+      1 + store.byteLength,
+      key.byteLength,
+      true,
+    );
+    putReq.set(key, 1 + store.byteLength + 4);
+    putReq.set(value, 1 + store.byteLength + 4 + key.byteLength);
+    u.set(putReq, 0);
+
+    expect(await imports.host_idb_put(0, putReq.byteLength)).toEqual(0);
+
+    const getReq = new Uint8Array(1 + store.byteLength + key.byteLength);
+    getReq[0] = store.byteLength;
+    getReq.set(store, 1);
+    getReq.set(key, 1 + store.byteLength);
+    u.set(getReq, 64);
+
+    const gotLen = await imports.host_idb_get(64, getReq.byteLength, 128, 64);
+    expect(gotLen).toEqual(3);
+    expect(new TextDecoder().decode(new Uint8Array(buf, 128, gotLen)))
+      .toEqual("AAA");
+
+    const listLen = await imports.host_idb_list(
+      64,
+      store.byteLength + 1,
+      128,
+      64,
+    );
+    const listView = new DataView(buf, 128, listLen);
+    expect(listView.getUint32(0, true)).toEqual(1);
+    const keyLen = listView.getUint32(4, true);
+    expect(new TextDecoder().decode(new Uint8Array(buf, 136, keyLen)))
+      .toEqual("alice");
+
+    expect(await imports.host_idb_delete(64, getReq.byteLength)).toEqual(0);
+    expect(await imports.host_idb_get(64, getReq.byteLength, 128, 64))
+      .toEqual(-2);
   });
 });
 

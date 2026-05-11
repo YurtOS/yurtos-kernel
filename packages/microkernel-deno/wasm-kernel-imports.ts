@@ -396,6 +396,34 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["ptr_len"],
   },
 
+  // ── Durable KV / IndexedDB-shaped persistence ─────────────
+  // host_idb_get(reqPtr, reqLen, outPtr, outCap) → bytes.
+  {
+    name: "host_idb_get",
+    method: METHOD.SYS_IDB_GET,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
+  // host_idb_put(reqPtr, reqLen) → 0 / -errno.
+  {
+    name: "host_idb_put",
+    method: METHOD.SYS_IDB_PUT,
+    args: ["ptr_len"],
+  },
+  // host_idb_delete(reqPtr, reqLen) → 0 / -errno.
+  {
+    name: "host_idb_delete",
+    method: METHOD.SYS_IDB_DELETE,
+    args: ["ptr_len"],
+  },
+  // host_idb_list(reqPtr, reqLen, outPtr, outCap) → bytes.
+  {
+    name: "host_idb_list",
+    method: METHOD.SYS_IDB_LIST,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
+
   // ── Custom builders (wire-format adapters) ────────────────
   // host_time() → seconds-as-float. TS impl returns
   // `Date.now() / 1000`. We route through SYS_CLOCK_GETTIME
