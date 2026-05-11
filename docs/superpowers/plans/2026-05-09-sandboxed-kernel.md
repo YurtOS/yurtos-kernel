@@ -15,6 +15,12 @@ surface is `Sandbox.create({ kernelImpl: "wasm" })` plus `wasmHostImports` /
 `wasmOverrideNames`, with the older `YURT_KERNEL=ts|wasm` environment switch
 still the intended CLI/CI spelling.
 
+Recent parity work added standard-image regression coverage for the legacy
+BusyBox waitpid ABI and filled the Deno wasm-kernel wrapper table for durable KV
+/ IndexedDB-shaped `host_idb_*` imports. The socket rows still need a dedicated
+adapter pass: legacy TS host imports use JSON requests tied to TS kernel socket
+fds, while Rust `SYS_SOCKET_*` currently uses direct host socket handles.
+
 The next milestone is parity, not feature count. The Rust kernel already has
 many syscall families; the work now is to make those routes selectable from the
 existing sandbox, run the same fixtures through TS and wasm kernels, and close
@@ -64,6 +70,12 @@ instances, scheduling, JSPI/asyncify suspension, and native epoch preemption.
 - Cover every wrapper-table addition with a Deno test. At minimum, keep the
   table covering identity, cwd, fd/pipe, wait, VFS path ops, fetch, extension
   invoke, and the socket connect/listen/accept/addr/send/recv/close surface.
+  Durable KV (`host_idb_get`, `host_idb_put`, `host_idb_delete`,
+  `host_idb_list`) is now covered by `wasm-kernel-imports_test.ts`.
+- Treat socket parity as a separate adapter task, not just a table-presence
+  task. The wrapper must either translate the legacy JSON/socket-fd contract or
+  the userland ABI must be rebuilt to call the Rust handle-oriented socket
+  syscalls directly.
 
 ### Phase C — Parity Harness
 
