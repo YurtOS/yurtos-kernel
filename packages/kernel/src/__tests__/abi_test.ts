@@ -663,6 +663,8 @@ describe("Kernel ABI canaries", () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
+      network: { allowedHosts: ["127.0.0.1", "localhost"] },
+      serverSockets: { allowLoopback: true },
     });
 
     const result = await sandbox.run("pthread-main-exit-canary");
