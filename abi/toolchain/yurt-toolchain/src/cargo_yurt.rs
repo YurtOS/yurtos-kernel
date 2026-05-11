@@ -158,6 +158,9 @@ pub fn plan_invocation_with_sdk(
             "-C link-arg={linker_flag_prefix}--allow-multiple-definition "
         ));
         rustflags.push_str(&format!("-C link-arg={linker_flag_prefix}--export-table "));
+        rustflags.push_str(&format!(
+            "-C link-arg={linker_flag_prefix}--growable-table "
+        ));
         for sym in crate::WRAPPED_WASI_LIBC_SYMBOLS {
             rustflags.push_str(&format!("-C link-arg={linker_flag_prefix}--wrap={sym} "));
         }

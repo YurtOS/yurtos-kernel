@@ -218,13 +218,15 @@ class WorkerResidentRunner {
         return { loaderArgv: argv, wasiArgv: argv };
       }
       const argv0Override = req.argv0;
+      const isShCommand = req.prog === 'sh' || req.prog.endsWith('/sh');
       const overriddenShCommand = argv0Override !== undefined &&
-        (req.prog === 'sh' || req.prog.endsWith('/sh')) &&
+        isShCommand &&
         req.args.length === 2 && req.args[0] === '-c';
+      const shellArgv0 = isShCommand ? req.prog.split('/').at(-1)! : prog;
       return {
         loaderArgv: [prog, ...req.args],
         wasiArgv: overriddenShCommand
-          ? [req.prog, '-c', req.args[1], argv0Override]
+          ? [shellArgv0, '-c', req.args[1], argv0Override]
           : [argv0Override ?? prog, ...req.args],
       };
     };
@@ -251,7 +253,7 @@ class WorkerResidentRunner {
           kernel,
           pid,
         }),
-      buildKernelImports: (pid, memory, wasiHost, threadsBackend) =>
+      buildKernelImports: (pid, memory, wasiHost, threadsBackend, mainInstance) =>
         createKernelImports({
           memory,
           callerPid: pid,
@@ -262,6 +264,7 @@ class WorkerResidentRunner {
           extensionHandler: this.extensionHandler,
           nativeModules: mgr.nativeModules,
           threadsBackend,
+          mainInstance,
           spawnProcess: (req, fdTable) => {
             const commandLabel = req.argv0 ?? req.prog;
             const childPid = kernel.allocPid(pid);

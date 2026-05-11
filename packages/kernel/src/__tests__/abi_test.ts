@@ -21,6 +21,7 @@ const FIXTURES = resolve(
   "../platform/__tests__/fixtures",
 );
 const HAS_BUSYBOX_FIXTURE = existsSync(resolve(FIXTURES, "busybox.wasm"));
+const shellIt = HAS_BUSYBOX_FIXTURE ? it : it.skip;
 // Phase 1 shared-library smoke test: gated on the side-module fixture
 // being present. The fixture is built by `make -C abi side-module-canaries`
 // (requires WASI SDK), so locally the test runs only if the dev has
@@ -34,13 +35,27 @@ function installTestShell(sandbox: Sandbox): void {
   const vfs = (sandbox as unknown as {
     vfs: {
       withWriteAccess(fn: () => void): void;
+      mkdirp(path: string): void;
       writeFile(path: string, data: Uint8Array): void;
+      symlink(target: string, path: string): void;
+      unlink(path: string): void;
       chmod(path: string, mode: number): void;
     };
   }).vfs;
   vfs.withWriteAccess(() => {
-    vfs.writeFile("/bin/sh", Deno.readFileSync(resolve(FIXTURES, "bash.wasm")));
-    vfs.chmod("/bin/sh", 0o555);
+    vfs.mkdirp("/usr/bin");
+    vfs.mkdirp("/bin");
+    vfs.writeFile(
+      "/usr/bin/busybox",
+      Deno.readFileSync(resolve(FIXTURES, "busybox.wasm")),
+    );
+    vfs.chmod("/usr/bin/busybox", 0o555);
+    try {
+      vfs.unlink("/bin/sh");
+    } catch {
+      // The fixture manifest may not have installed this link yet.
+    }
+    vfs.symlink("/usr/bin/busybox", "/bin/sh");
   });
 }
 
@@ -119,7 +134,7 @@ describe("Kernel ABI canaries", () => {
     expect(elapsedMs).toBeGreaterThanOrEqual(lowerBoundMs);
   });
 
-  it("runs system-canary through POSIX system()", async () => {
+  shellIt("runs system-canary through POSIX system()", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -132,7 +147,7 @@ describe("Kernel ABI canaries", () => {
     expect(result.stdout.trim()).toContain("system-ok");
   });
 
-  it("runs popen-canary and captures command output", async () => {
+  shellIt("runs popen-canary and captures command output", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -145,20 +160,23 @@ describe("Kernel ABI canaries", () => {
     expect(result.stdout.trim()).toBe("popen:hello-from-shell");
   });
 
-  it("streams large system() command output through the process path", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
-    installTestShell(sandbox);
+  shellIt(
+    "streams large system() command output through the process path",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+      installTestShell(sandbox);
 
-    const result = await sandbox.run("system-canary large");
+      const result = await sandbox.run("system-canary large");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("system-large-ok");
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("system-large-ok");
+    },
+  );
 
-  it("returns the command exit status from pclose", async () => {
+  shellIt("returns the command exit status from pclose", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1485,7 +1503,6 @@ describe("Kernel ABI canaries", () => {
             },
           ],
         });
-
         const result = await sandbox.run("dlopen-canary --case happy_path");
 
         if (result.exitCode !== 0) {
