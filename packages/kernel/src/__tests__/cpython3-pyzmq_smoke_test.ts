@@ -39,6 +39,7 @@ import { expect } from "@std/expect";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { Sandbox } from "../sandbox.js";
+import type { RunResult } from "../run-result.js";
 import { NodeAdapter } from "../platform/node-adapter.js";
 
 const WASM_DIR = resolve(
@@ -56,6 +57,22 @@ const PYZMQ_INIT = resolve(
 const HAS_FIXTURES = existsSync(CPYTHON_WASM) && existsSync(PYZMQ_INIT);
 
 const maybeDescribe = HAS_FIXTURES ? describe : describe.skip;
+
+/**
+ * Run a Python program in the sandbox by piping it to `cpython3 -` over
+ * stdin. Prefer this over `cpython3 -c "..."` for any program containing
+ * `"`, `$`, `\`, or backticks: the latter nests inside the shell's
+ * double-quoted argument and breaks silently on those characters.
+ */
+async function runPython(
+  sandbox: Sandbox,
+  lines: string[],
+): Promise<RunResult> {
+  const program = lines.join("\n") + "\n";
+  return sandbox.run("cpython3 -", {
+    stdinData: new TextEncoder().encode(program),
+  });
+}
 
 maybeDescribe("cpython3 + pyzmq runtime smoke", () => {
   it("boots cpython3 and reports its version", async () => {
@@ -82,14 +99,13 @@ maybeDescribe("cpython3 + pyzmq runtime smoke", () => {
       // The repeated 'hello' makes DEFLATE actually compress; a
       // single short string can come out *bigger* due to format
       // overhead, which would mask a working zlib.
-      const code = [
+      const result = await runPython(sandbox, [
         "import zlib",
         "data = b'hello hello hello hello hello hello'",
         "comp = zlib.compress(data)",
         "assert zlib.decompress(comp) == data",
         "print(zlib.ZLIB_VERSION)",
-      ].join("; ");
-      const result = await sandbox.run(`cpython3 -c "${code}"`);
+      ]);
       if (result.exitCode !== 0) {
         console.log("--- zlib: exit", result.exitCode);
         console.log("--- zlib stderr:", result.stderr);
@@ -118,13 +134,12 @@ maybeDescribe("cpython3 + pyzmq runtime smoke", () => {
       adapter: new NodeAdapter(),
     });
     try {
-      const code = [
+      const result = await runPython(sandbox, [
         "import binascii",
         "h = binascii.hexlify(b'yurt')",
         "assert binascii.unhexlify(h) == b'yurt'",
         "print(h.decode())",
-      ].join("; ");
-      const result = await sandbox.run(`cpython3 -c "${code}"`);
+      ]);
       if (result.exitCode !== 0) {
         console.log("--- binascii: exit", result.exitCode);
         console.log("--- binascii stderr:", result.stderr);
@@ -158,9 +173,10 @@ maybeDescribe("cpython3 + pyzmq runtime smoke", () => {
       // No `-S` here — the zlib port (yurt-ports/ports/zlib) lets
       // site.py boot cleanly, so site-packages is on sys.path
       // without manual insertion.
-      const result = await sandbox.run(
-        `cpython3 -c "import zmq; print(zmq.zmq_version())"`,
-      );
+      const result = await runPython(sandbox, [
+        "import zmq",
+        "print(zmq.zmq_version())",
+      ]);
       if (result.exitCode !== 0) {
         console.log("--- zmq import: exit", result.exitCode);
         console.log("--- zmq stderr:", result.stderr);
