@@ -50,7 +50,23 @@ export type ArgSpec =
    * the record size is statically known (rlimit = 16,
    * clock_time = 8).
    */
-  | { kind: "fixed_out"; cap: number };
+  | { kind: "fixed_out"; cap: number }
+  /**
+   * Consumes (ptr, cap). After the call: if rc >= 0 and cap >= 4,
+   * the rc is written as i32 LE into user memory at ptr and the
+   * wrapper returns 4 (bytes written). If rc < 0 or cap < 4, the
+   * wrapper returns rc directly. Used by host_dup-style imports
+   * where the kernel returns the new fd as rc but the TS-side
+   * caller expects it written into an out pointer.
+   */
+  | "rc_to_out"
+  /**
+   * Consumes one scalar slot from the incoming args and emits
+   * nothing on the wire. Used when the TS-side host_* declares an
+   * extra scalar that the kernel doesn't need (e.g. host_remove's
+   * `recursive` flag — SYS_UNLINK is non-recursive by design).
+   */
+  | "ignore_scalar";
 
 export interface HostBinding {
   /** The legacy TS-kernel-shaped name, e.g. "host_pipe". */
@@ -266,6 +282,64 @@ export const HOST_BINDINGS: HostBinding[] = [
   // (rc), but wasm-side discards rc here.
   { name: "host_yield", method: METHOD.SYS_SCHED_YIELD, args: [] },
 
+  // ── fd duplicate (rc_to_out shape) ────────────────────────
+  // host_dup(fd, outPtr, outCap) — kernel SYS_DUP returns the
+  // new fd as rc; the rc_to_out spec writes it into outPtr as
+  // i32 LE and returns bytes-written (4).
+  {
+    name: "host_dup",
+    method: METHOD.SYS_DUP,
+    args: ["scalar", "rc_to_out"],
+  },
+
+  // ── Path-with-ignored-flag ─────────────────────────────────
+  // host_remove(pathPtr, pathLen, recursive). SYS_UNLINK is
+  // non-recursive; recursive scalar is consumed and dropped.
+  // Bash callers that want recursive removal walk readdir
+  // themselves — same as TS behavior on the platform.
+  {
+    name: "host_remove",
+    method: METHOD.SYS_UNLINK,
+    args: ["ptr_len", "ignore_scalar"],
+  },
+
+  // ── Networking ────────────────────────────────────────────
+  // host_network_fetch(reqPtr, reqLen, outPtr, outCap) → bytes.
+  // Same wire shape as host_native_invoke; SYS_FETCH consumes
+  // the JSON request and writes the JSON response.
+  {
+    name: "host_network_fetch",
+    method: METHOD.SYS_FETCH,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
+  // host_socket_send(reqPtr, reqLen, outPtr, outCap) → bytes.
+  // SYS_SOCKET_SEND accepts (u32 handle + payload bytes) and
+  // returns the number of bytes accepted; nothing written back.
+  // The TS-side signature still passes outPtr/outCap (for a
+  // future status struct), but the kernel ignores them today.
+  {
+    name: "host_socket_send",
+    method: METHOD.SYS_SOCKET_SEND,
+    args: ["ptr_len", "out_cap"],
+  },
+  // host_socket_recv(reqPtr, reqLen, outPtr, outCap) → bytes.
+  // SYS_SOCKET_RECV: u32 handle in request, returns recv bytes
+  // in the response buffer.
+  {
+    name: "host_socket_recv",
+    method: METHOD.SYS_SOCKET_RECV,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
+  // host_socket_close(reqPtr, reqLen) → 0 / -errno.
+  // SYS_SOCKET_CLOSE: u32 handle in request, no response.
+  {
+    name: "host_socket_close",
+    method: METHOD.SYS_SOCKET_CLOSE,
+    args: ["ptr_len"],
+  },
+
   // ── Signals ───────────────────────────────────────────────
   // sigaction(sig, actPtr, actLen) — TS host_sigaction shape.
   // Not in our common test path; left to a future expansion.
@@ -313,6 +387,8 @@ function makeWrapper(
     const reqParts: Uint8Array[] = [];
     let outPtr = 0;
     let outCap = 0;
+    let rcToOutPtr: number | null = null;
+    let rcToOutCap = 0;
     let ai = 0;
     for (const spec of b.args) {
       if (spec === "scalar") {
@@ -344,6 +420,11 @@ function makeWrapper(
       } else if (typeof spec === "object" && spec.kind === "fixed_out") {
         outPtr = ordered[ai++] >>> 0;
         outCap = spec.cap;
+      } else if (spec === "rc_to_out") {
+        rcToOutPtr = ordered[ai++] >>> 0;
+        rcToOutCap = ordered[ai++] >>> 0;
+      } else if (spec === "ignore_scalar") {
+        ai++;
       } else {
         throw new Error(`unknown arg spec ${JSON.stringify(spec)}`);
       }
@@ -361,6 +442,14 @@ function makeWrapper(
     const rc = Number(out.rc);
     if (b.returnsBytes && rc > 0 && outCap > 0) {
       new Uint8Array(memBuf(), outPtr, rc).set(out.response.subarray(0, rc));
+    }
+    if (rcToOutPtr !== null) {
+      if (rc >= 0 && rcToOutCap >= 4) {
+        const view = new DataView(memBuf(), rcToOutPtr, 4);
+        view.setInt32(0, rc, true);
+        return 4;
+      }
+      return rc;
     }
     return rc;
   };

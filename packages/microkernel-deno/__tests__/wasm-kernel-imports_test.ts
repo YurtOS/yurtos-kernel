@@ -146,6 +146,36 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(got).toEqual("/dst");
   });
 
+  it("rc_to_out: host_dup writes new fd into out memory", async () => {
+    if (!HAS_JSPI) return;
+    const mk = await freshMk();
+    const buf = new ArrayBuffer(16);
+    const imports = buildWasmKernelImports(mk, () => buf);
+    // pipe() to get two real fds we can dup.
+    const n = await imports.host_pipe(0, 8);
+    expect(n).toEqual(8);
+    const readFd = new DataView(buf).getUint32(0, true);
+    // host_dup(fd, outPtr=8, outCap=4). Writes the new fd as
+    // i32 LE at offset 8 and returns 4 (bytes-written).
+    const r = await imports.host_dup(readFd, 8, 4);
+    expect(r).toEqual(4);
+    const newFd = new DataView(buf).getInt32(8, true);
+    expect(newFd).toBeGreaterThan(readFd);
+  });
+
+  it("ignore_scalar: host_remove discards `recursive` flag", async () => {
+    if (!HAS_JSPI) return;
+    const mk = await freshMk();
+    const buf = new ArrayBuffer(64);
+    new Uint8Array(buf).set(new TextEncoder().encode("/tmpfile"));
+    const imports = buildWasmKernelImports(mk, () => buf);
+    // Unlink on a non-existent file returns -ENOENT; the test is
+    // that the call decodes the wire (path bytes only) and that
+    // the recursive scalar didn't poison the wire.
+    const rc = await imports.host_remove(0, 8, 1);
+    expect(rc).toEqual(-2); // -ENOENT, not -EINVAL
+  });
+
   it("host_native_invoke forwards bytes via sys_extension_invoke", async () => {
     if (!HAS_JSPI) return;
     const mk = await freshMk();
