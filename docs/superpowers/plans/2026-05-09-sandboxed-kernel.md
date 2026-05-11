@@ -15,9 +15,8 @@ surface is `Sandbox.create({ kernelImpl: "wasm" })` plus `wasmHostImports` /
 `wasmOverrideNames`, with the older `YURT_KERNEL=ts|wasm` environment switch
 still the intended CLI/CI spelling.
 
-Recent parity work added standard-image regression coverage for the legacy
-BusyBox waitpid ABI and filled the Deno wasm-kernel wrapper table for durable KV
-/ IndexedDB-shaped `host_idb_*` imports. The socket rows still need a dedicated
+Recent parity work filled the Deno wasm-kernel wrapper table for durable KV /
+IndexedDB-shaped `host_idb_*` imports. The socket rows still need a dedicated
 adapter pass: legacy TS host imports use JSON requests tied to TS kernel socket
 fds, while Rust `SYS_SOCKET_*` currently uses direct host socket handles.
 
