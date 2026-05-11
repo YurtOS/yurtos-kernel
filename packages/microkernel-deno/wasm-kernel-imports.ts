@@ -423,56 +423,6 @@ export const HOST_BINDINGS: HostBinding[] = [
       },
   },
 
-  // ── TS-only sugar stubs ──────────────────────────────────
-  // These TS-side host_* have no Rust SYS_* counterpart (they're
-  // sugar layered above the kernel surface). The wasm overlay
-  // installs neutral stubs so bash gets sensible default replies
-  // instead of -ENOSYS. Embedders that need the real TS behavior
-  // can omit these from `wasmOverrideNames`, leaving them TS.
-
-  // host_has_tool(name_ptr, name_len) → 0 (not registered) /
-  // -ENOENT. The neutral answer "no" lets bash fall through to a
-  // PATH lookup via host_spawn.
-  {
-    name: "host_has_tool",
-    method: 0,
-    args: [],
-    custom: () => async (): Promise<number> => -2, // -ENOENT
-  },
-  // host_register_tool(name_ptr, name_len, path_ptr, path_len) → 0.
-  // The wasm-mode kernel doesn't maintain a tool registry — the
-  // host-side ProcessManager does, on the TS side. Acknowledge
-  // (0) so bash's startup checks don't error.
-  {
-    name: "host_register_tool",
-    method: 0,
-    args: [],
-    custom: () => async (): Promise<number> => 0,
-  },
-  // host_glob(pat_ptr, pat_len, out_ptr, out_cap) → -ENOSYS.
-  // Bash falls back to its built-in glob expansion when the host
-  // doesn't provide one.
-  {
-    name: "host_glob",
-    method: 0,
-    args: [],
-    custom: () => async (): Promise<number> => -38, // -ENOSYS
-  },
-  // host_list_processes(out_ptr, out_cap) → 4 (count=0). The
-  // wire format is u32 count + entries; writing just a zero count
-  // is a valid "no entries" response.
-  {
-    name: "host_list_processes",
-    method: 0,
-    args: [],
-    custom: (_mk, memBuf) =>
-      async (outPtr: number, outCap: number): Promise<number> => {
-        if (outCap < 4) return -22; // -EINVAL
-        new DataView(memBuf(), outPtr, 4).setUint32(0, 0, true);
-        return 4;
-      },
-  },
-
   // host_write_file(pathPtr, pathLen, dataPtr, dataLen, mode) → bytes.
   // Compound: SYS_OPEN(O_WRITE|O_CREAT [|O_TRUNC]) → optional
   // SYS_LSEEK(SEEK_END) for mode=1 (append) → SYS_WRITE →
