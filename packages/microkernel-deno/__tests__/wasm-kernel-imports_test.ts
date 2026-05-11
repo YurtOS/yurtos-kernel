@@ -93,6 +93,34 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     const got = new TextDecoder().decode(raw.subarray(0, end));
     expect(got).toEqual("/");
   });
+
+  it("out_cap arg: host_pipe writes 8 bytes (read_fd + write_fd)", async () => {
+    if (!HAS_JSPI) return;
+    const mk = await freshMk();
+    const buf = new ArrayBuffer(16);
+    const imports = buildWasmKernelImports(mk, () => buf);
+    const n = await imports.host_pipe(0, 8);
+    expect(n).toEqual(8);
+    const view = new DataView(buf);
+    const readFd = view.getUint32(0, true);
+    const writeFd = view.getUint32(4, true);
+    expect(readFd).toBeGreaterThan(0);
+    expect(writeFd).toBeGreaterThan(readFd);
+  });
+
+  it("host_native_invoke forwards bytes via sys_extension_invoke", async () => {
+    if (!HAS_JSPI) return;
+    const mk = await freshMk();
+    const buf = new ArrayBuffer(64);
+    // Stage a request — anything; the empty registry rejects.
+    new Uint8Array(buf).set(new TextEncoder().encode("{}"));
+    const imports = buildWasmKernelImports(mk, () => buf);
+    // host_native_invoke(reqPtr=0, reqLen=2, outPtr=8, outCap=56)
+    const rc = await imports.host_native_invoke(0, 2, 8, 56);
+    // -ENOENT from the empty extension registry — proves the
+    // bytes round-tripped through the trampoline.
+    expect(rc).toEqual(-2);
+  });
 });
 
 // Re-import METHOD so the unused-import lint stays quiet for

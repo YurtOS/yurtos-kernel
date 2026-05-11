@@ -31,7 +31,19 @@
 
 import { METHOD, type Microkernel } from "../microkernel-js/mod.ts";
 
-export type ArgSpec = "scalar" | "scalar64" | "ptr_len" | "out_cap";
+export type ArgSpec =
+  | "scalar"
+  | "scalar64"
+  | "ptr_len"
+  | "out_cap"
+  /**
+   * (ptr) consumed from the call; the response is always
+   * exactly `cap` bytes written into user memory at that ptr.
+   * Used by C-ABI-shaped imports that don't pass a cap because
+   * the record size is statically known (rlimit = 16,
+   * clock_time = 8).
+   */
+  | { kind: "fixed_out"; cap: number };
 
 export interface HostBinding {
   /** The legacy TS-kernel-shaped name, e.g. "host_pipe". */
@@ -104,6 +116,80 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["scalar", "ptr_len"],
     returnsBytes: true,
   },
+
+  // ── fd ops ────────────────────────────────────────────────
+  // host_pipe(outPtr, outCap) → writes 8 bytes (u32 read_fd + u32 write_fd)
+  {
+    name: "host_pipe",
+    method: METHOD.SYS_PIPE,
+    args: ["out_cap"],
+    returnsBytes: true,
+  },
+  // host_dup(fd, outPtr, outCap) — TS shape writes the new fd
+  // into outPtr; our sys_dup returns the new fd as rc. The
+  // mapping needs an arg-spec variant that writes the rc back
+  // into user memory ("rc_to_out"). Left out of the table
+  // until that variant lands.
+
+  // ── Resource limits ───────────────────────────────────────
+  // host_getrlimit(resource, outPtr) — rlimit record is 16 bytes
+  // (u64 soft + u64 hard) on the Rust side.
+  {
+    name: "host_getrlimit",
+    method: METHOD.SYS_GETRLIMIT,
+    args: ["scalar", { kind: "fixed_out", cap: 16 }],
+    returnsBytes: true,
+  },
+  // host_clock_gettime(clockId, outPtr) — writes u64 ns (8 bytes).
+  {
+    name: "host_clock_gettime",
+    method: METHOD.SYS_CLOCK_GETTIME,
+    args: ["scalar", { kind: "fixed_out", cap: 8 }],
+    returnsBytes: true,
+  },
+  // host_setrlimit(resource, soft, hard) → 3 scalars
+  // soft and hard are typically u64. Use scalar64 to be safe.
+  {
+    name: "host_setrlimit",
+    method: METHOD.SYS_SETRLIMIT,
+    args: ["scalar", "scalar64", "scalar64"],
+  },
+
+  // ── File ops via path ─────────────────────────────────────
+  // host_realpath(pathPtr, pathLen, outPtr, outCap) → bytes
+  // No exact sys_* equivalent yet — kernel's path resolution stays
+  // string-shaped within open(). Leave out until the kernel side
+  // grows a dedicated method.
+
+  // ── Wait / process tree ───────────────────────────────────
+  // host_wait(pid, flags, outPtr, outCap) — sys_wait expects (pid, flags)
+  // as u32s and writes (u32 exited_pid + i32 status) = 8 bytes.
+  // Existing host_wait declares scalars + outPtr + outCap.
+  {
+    name: "host_wait",
+    method: METHOD.SYS_WAIT,
+    args: ["scalar", "scalar", "out_cap"],
+    returnsBytes: true,
+  },
+
+  // ── Extensions / native invoke ────────────────────────────
+  // host_native_invoke(reqPtr, reqLen, outPtr, outCap) — same wire
+  // shape as kh_extension_invoke (just forwards bytes).
+  {
+    name: "host_native_invoke",
+    method: METHOD.SYS_EXTENSION_INVOKE,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
+
+  // ── Signals ───────────────────────────────────────────────
+  // sigaction(sig, actPtr, actLen) — TS host_sigaction shape.
+  // Not in our common test path; left to a future expansion.
+
+  // ── Clock ─────────────────────────────────────────────────
+  // host_clock_gettime(clockId, outPtr) → 8 bytes (u64 ns)
+  // Existing TS signature is (clockId, outPtr) without a cap. Same
+  // fixed_out issue as host_getrlimit; defer.
 ];
 
 /**
@@ -161,8 +247,11 @@ function makeWrapper(
       } else if (spec === "out_cap") {
         outPtr = args[ai++] >>> 0;
         outCap = args[ai++] >>> 0;
+      } else if (typeof spec === "object" && spec.kind === "fixed_out") {
+        outPtr = args[ai++] >>> 0;
+        outCap = spec.cap;
       } else {
-        throw new Error(`unknown arg spec ${spec}`);
+        throw new Error(`unknown arg spec ${JSON.stringify(spec)}`);
       }
     }
     // Concatenate request parts.
