@@ -1352,24 +1352,14 @@ export class Microkernel {
     const tcpAsync = hostState.tcp;
     const kvAsync = hostState.kv;
     const fsAsync = hostState.hostFs;
-    const wantsAsync = hasJspi && (
-      hostState.fetch != null ||
-      tcpAsync?.connectAsync != null ||
-      tcpAsync?.recvAsync != null ||
-      tcpAsync?.acceptAsync != null ||
-      kvAsync?.getAsync != null ||
-      kvAsync?.putAsync != null ||
-      kvAsync?.deleteAsync != null ||
-      kvAsync?.listAsync != null ||
-      fsAsync?.openAsync != null ||
-      fsAsync?.readAsync != null ||
-      fsAsync?.writeAsync != null ||
-      fsAsync?.statAsync != null ||
-      fsAsync?.unlinkAsync != null ||
-      fsAsync?.mkdirAsync != null ||
-      fsAsync?.symlinkAsync != null ||
-      fsAsync?.renameAsync != null
-    );
+    // When JSPI is available, always emit the promising-wrapped
+    // dispatch so callers (Phase 7.2 macro wrappers, embedders
+    // mixing sync + async paths) can use syscallAsync uniformly.
+    // The Suspending wrappers for the kh_* imports below still
+    // only fire when the matching async backend is provided —
+    // that's the gating that matters for "will any specific kh
+    // call actually suspend."
+    const wantsAsync = hasJspi;
     if (wantsAsync && hostState.fetch != null) {
       const fetchImpl = hostState.fetch;
       // The Suspending wrapper takes an async function; the wasm
