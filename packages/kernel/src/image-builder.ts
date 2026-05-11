@@ -9,7 +9,10 @@ import {
   type WasmModuleCache,
 } from "./process/module-cache.js";
 import { ProcessManager } from "./process/manager.js";
-import { createProcessLoaderContextForVfs } from "./sandbox.js";
+import {
+  createProcessLoaderContextForVfs,
+  rootProcessCredentials,
+} from "./sandbox.js";
 import { OverlayVFS } from "./vfs/overlay-vfs.js";
 import { TarImageRootProvider } from "./vfs/tar-image-root-provider.js";
 import { VFS } from "./vfs/vfs.js";
@@ -39,6 +42,7 @@ export interface CopyInOptions {
 export interface RunImageCommandOptions {
   env?: Record<string, string>;
   cwd?: string;
+  user?: "root" | "user";
   stderrToStdout?: boolean;
   stdoutLimit?: number;
   stderrLimit?: number;
@@ -197,6 +201,9 @@ export class YurtImageBuilder {
       moduleCache: this.moduleCache,
       stdoutLimit: options.stdoutLimit,
       stderrLimit: options.stderrLimit,
+      processCredentials: options.user === "root"
+        ? rootProcessCredentials()
+        : undefined,
     });
     const proc = await loadProcess(loaderCtx, {
       argv,

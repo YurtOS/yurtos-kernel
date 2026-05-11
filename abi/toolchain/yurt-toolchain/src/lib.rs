@@ -117,6 +117,7 @@ pub const WRAPPED_WASI_LIBC_SYMBOLS: &[&str] = &[
     "accept",
     "access",
     "chdir",
+    "chmod",
     "fchdir",
     "fchownat",
     "faccessat",

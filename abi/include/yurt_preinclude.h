@@ -3,6 +3,7 @@
 
 #if !defined(__ASSEMBLER__)
 #include <sys/mman.h>
+#include <wasm32-wasip1/time.h>
 
 #ifdef __cplusplus
 extern "C" {

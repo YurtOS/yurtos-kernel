@@ -367,6 +367,11 @@ export class ProcessKernel {
     return this.processTable.get(pid)?.credentials ?? userCredentials();
   }
 
+  setCredentials(pid: number, credentials: ProcessCredentials): void {
+    const entry = this.processTable.get(pid);
+    if (entry) entry.credentials = { ...credentials };
+  }
+
   getCwd(pid: number): string {
     return this.processTable.get(pid)?.cwd ?? "/";
   }

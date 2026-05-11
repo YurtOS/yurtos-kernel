@@ -31,6 +31,7 @@ import {
   INIT_PID,
   type ProcessCredentials,
   ProcessKernel,
+  ROOT_GID,
   ROOT_UID,
   type SpawnRequest,
 } from "./process/kernel.js";
@@ -1017,6 +1018,7 @@ export class Sandbox {
     stderrLimit?: number;
     toolAllowlist?: string[];
     moduleCache?: WasmModuleCache;
+    processCredentials?: ProcessCredentials;
   }): LoaderContext {
     const {
       vfs,
@@ -1035,6 +1037,7 @@ export class Sandbox {
       stderrLimit,
       toolAllowlist,
       moduleCache,
+      processCredentials,
     } = opts;
     const allowedTools = toolAllowlist ? new Set(toolAllowlist) : null;
 
@@ -1181,9 +1184,11 @@ export class Sandbox {
       moduleCache,
     });
 
-    return makeContextWithAllocator((argv) =>
-      kernel.allocPid(INIT_PID, argv[0])
-    );
+    return makeContextWithAllocator((argv) => {
+      const pid = kernel.allocPid(INIT_PID, argv[0]);
+      if (processCredentials) kernel.setCredentials(pid, processCredentials);
+      return pid;
+    });
   }
 
   private static argvForSpawn(
@@ -2221,6 +2226,7 @@ export function createProcessLoaderContextForVfs(opts: {
   moduleCache?: WasmModuleCache;
   stdoutLimit?: number;
   stderrLimit?: number;
+  processCredentials?: ProcessCredentials;
 }): LoaderContext {
   return Sandbox.createLoaderContext({
     vfs: opts.vfs,
@@ -2233,5 +2239,17 @@ export function createProcessLoaderContextForVfs(opts: {
     moduleCache: opts.moduleCache,
     stdoutLimit: opts.stdoutLimit,
     stderrLimit: opts.stderrLimit,
+    processCredentials: opts.processCredentials,
   });
+}
+
+export function rootProcessCredentials(): ProcessCredentials {
+  return {
+    uid: ROOT_UID,
+    gid: ROOT_GID,
+    euid: ROOT_UID,
+    egid: ROOT_GID,
+    suid: ROOT_UID,
+    sgid: ROOT_GID,
+  };
 }

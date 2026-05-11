@@ -1063,9 +1063,11 @@ export class WasiHost {
           }
           case "vfs_file": {
             try {
-              totalWritten += this.kernel && this.pid !== undefined
-                ? this.kernel.writeVfsFile(this.pid, fd, data)
-                : target.fdTable.write(target.fd, data);
+              totalWritten += this.withVfsCredentials(() =>
+                this.kernel && this.pid !== undefined
+                  ? this.kernel.writeVfsFile(this.pid, fd, data)
+                  : target.fdTable.write(target.fd, data)
+              );
             } catch (err) {
               return fdErrorToWasi(err);
             }
@@ -1108,7 +1110,9 @@ export class WasiHost {
       } else {
         // No I/O target — fall through to VFS file write
         try {
-          totalWritten += this.fdTable.write(fd, data);
+          totalWritten += this.withVfsCredentials(() =>
+            this.fdTable.write(fd, data)
+          );
         } catch (err) {
           return fdErrorToWasi(err);
         }
@@ -1502,10 +1506,12 @@ export class WasiHost {
       if (target) {
         if (target.type === "vfs_dir") this.dirFds.delete(fd);
         try {
-          if (target.type === "vfs_dir" && this.fdTable.isOpen(fd)) {
-            this.fdTable.close(fd);
-          }
-          const closed = this.kernel.closeFd(this.pid, fd);
+          const closed = this.withVfsCredentials(() => {
+            if (target.type === "vfs_dir" && this.fdTable.isOpen(fd)) {
+              this.fdTable.close(fd);
+            }
+            return this.kernel!.closeFd(this.pid!, fd);
+          });
           if (closed) this.ioFds.delete(fd);
           return closed ? WASI_ESUCCESS : WASI_EBADF;
         } catch (err) {
@@ -1520,7 +1526,7 @@ export class WasiHost {
     }
 
     try {
-      this.fdTable.close(fd);
+      this.withVfsCredentials(() => this.fdTable.close(fd));
       this.dirFds.delete(fd);
       return WASI_ESUCCESS;
     } catch (err) {
@@ -2249,10 +2255,11 @@ export class WasiHost {
     try {
       for (const iov of iovecs) {
         const data = this.getBytes().slice(iov.buf, iov.buf + iov.len);
-        const n =
+        const n = this.withVfsCredentials(() =>
           this.kernel && this.pid !== undefined && target?.type === "vfs_file"
             ? this.kernel.pwriteVfsFile(this.pid, fd, data, pos)
-            : this.fdTable.pwrite(fd, data, pos);
+            : this.fdTable.pwrite(fd, data, pos)
+        );
         totalWritten += n;
         pos += n;
       }
@@ -2273,9 +2280,11 @@ export class WasiHost {
       if (
         this.kernel && this.pid !== undefined && target?.type === "vfs_file"
       ) {
-        this.kernel.truncateVfsFile(this.pid, fd, Number(size));
+        this.withVfsCredentials(() =>
+          this.kernel!.truncateVfsFile(this.pid!, fd, Number(size))
+        );
       } else {
-        this.fdTable.truncate(fd, Number(size));
+        this.withVfsCredentials(() => this.fdTable.truncate(fd, Number(size)));
       }
       return WASI_ESUCCESS;
     } catch (err) {

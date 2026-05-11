@@ -215,6 +215,28 @@ function writeWaitResult(
   return required;
 }
 
+function legacyWaitStatus(exitCode: number): number {
+  if (exitCode < 0) return 0;
+  if (exitCode === 124) return 9;
+  return (exitCode & 0xff) << 8;
+}
+
+function writeLegacyWaitStatus(
+  memory: WebAssembly.Memory,
+  statusPtr: number,
+  exitCode: number,
+): number {
+  if (statusPtr === 0) return 0;
+  const end = statusPtr + 4;
+  if (statusPtr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+  new DataView(memory.buffer).setInt32(
+    statusPtr,
+    legacyWaitStatus(exitCode),
+    true,
+  );
+  return 0;
+}
+
 function writeSpawnResult(
   memory: WebAssembly.Memory,
   ptr: number,
@@ -1559,6 +1581,76 @@ export function createKernelImports(
           waited.exitCode,
           waited.signal,
         );
+      })();
+    },
+
+    host_waitpid_nohang(
+      pid: number,
+      statusPtr: number,
+      _options: number,
+    ): number {
+      if (!opts.kernel) return ERR_CHILD;
+      opts.wasiHost?.drainPendingSignals();
+      if (pid <= 0) {
+        const result = opts.kernel.waitAnyChildNohang(callerPid);
+        if (result.state === "running") return 0;
+        if (result.state === "none") return ERR_CHILD;
+        const writeErr = writeLegacyWaitStatus(
+          memory,
+          statusPtr,
+          result.exitCode,
+        );
+        return writeErr < 0 ? writeErr : result.pid;
+      }
+      const exitCode = opts.kernel.waitpidNohang(pid, callerPid);
+      if (exitCode === -1) return 0;
+      if (exitCode < 0) return ERR_CHILD;
+      const writeErr = writeLegacyWaitStatus(memory, statusPtr, exitCode);
+      return writeErr < 0 ? writeErr : pid;
+    },
+
+    host_waitpid(
+      pid: number,
+      statusPtr: number,
+      _options: number,
+    ): Promise<number> | number {
+      if (!opts.kernel) return ERR_CHILD;
+      const kernel = opts.kernel;
+      return (async () => {
+        await yieldToScheduler();
+        opts.wasiHost?.drainPendingSignals();
+        const signalWait = opts.wasiHost?.waitForSignalDelivery();
+        const interrupt = signalWait?.promise ?? new Promise<void>(() => {});
+        if (pid <= 0) {
+          const waited = await kernel.waitAnyChildInterruptible(
+            callerPid,
+            interrupt,
+          );
+          signalWait?.cancel();
+          if (waited.interrupted) return ERR_INTERRUPTED;
+          const result = waited.result;
+          if (!result) return ERR_CHILD;
+          const writeErr = writeLegacyWaitStatus(
+            memory,
+            statusPtr,
+            result.exitCode,
+          );
+          return writeErr < 0 ? writeErr : result.pid;
+        }
+        const waited = await kernel.waitpidInterruptible(
+          pid,
+          callerPid,
+          interrupt,
+        );
+        signalWait?.cancel();
+        if (waited.interrupted) return ERR_INTERRUPTED;
+        if (waited.exitCode < 0) return ERR_CHILD;
+        const writeErr = writeLegacyWaitStatus(
+          memory,
+          statusPtr,
+          waited.exitCode,
+        );
+        return writeErr < 0 ? writeErr : pid;
       })();
     },
 

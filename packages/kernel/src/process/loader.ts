@@ -193,6 +193,7 @@ export async function loadProcess(
     yurtImports,
     [
       "host_wait",
+      "host_waitpid",
       "host_kill",
       "host_killpg",
       "host_yield",
@@ -202,6 +203,7 @@ export async function loadProcess(
       "host_socket_accept",
       "host_socket_recv",
       "host_extension_invoke",
+      "host_run_command",
       "host_thread_spawn",
       "host_thread_join",
       "host_thread_detach",
@@ -344,6 +346,7 @@ export async function loadProcess(
         childYurtImports,
         [
           "host_wait",
+          "host_waitpid",
           "host_kill",
           "host_killpg",
           "host_yield",
@@ -352,6 +355,7 @@ export async function loadProcess(
           "host_socket_accept",
           "host_socket_recv",
           "host_extension_invoke",
+          "host_run_command",
           "host_thread_spawn",
           "host_thread_join",
           "host_thread_detach",

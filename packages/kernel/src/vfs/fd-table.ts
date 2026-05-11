@@ -101,7 +101,7 @@ export class FdTable {
     const offset = mode === "a" ? buffer.byteLength : 0;
 
     const fd = this.nextFd++;
-    this.entries.set(fd, {
+    const entry: FdEntry = {
       path,
       mode,
       buffer,
@@ -109,7 +109,9 @@ export class FdTable {
       dirty: mode === "w" || mode === "a",
       refs: 1,
       credential: this.credential,
-    });
+    };
+    this.entries.set(fd, entry);
+    this.flushEntry(entry);
 
     return fd;
   }
@@ -158,6 +160,7 @@ export class FdTable {
     entry.buffer.set(data, entry.offset);
     entry.offset += data.byteLength;
     entry.dirty = true;
+    this.flushEntry(entry);
     return data.byteLength;
   }
 
@@ -185,6 +188,7 @@ export class FdTable {
     }
     entry.buffer.set(data, offset);
     entry.dirty = true;
+    this.flushEntry(entry);
     return data.byteLength;
   }
 
@@ -199,6 +203,7 @@ export class FdTable {
     entry.buffer = newBuf;
     if (entry.offset > size) entry.offset = size;
     entry.dirty = true;
+    this.flushEntry(entry);
   }
 
   /** Seek to a position in the file. Returns the new offset. */
@@ -229,11 +234,7 @@ export class FdTable {
     this.entries.delete(fd);
 
     if (entry.dirty) {
-      this.withEntryCredential(
-        entry,
-        () => this.vfs.writeFile(entry.path, entry.buffer),
-      );
-      entry.dirty = false;
+      this.flushEntry(entry);
     }
   }
 
@@ -380,5 +381,14 @@ export class FdTable {
   private withEntryCredential<T>(entry: FdEntry, fn: () => T): T {
     if (!entry.credential || !this.vfs.withCredential) return fn();
     return this.vfs.withCredential(entry.credential, fn);
+  }
+
+  private flushEntry(entry: FdEntry): void {
+    if (!entry.dirty) return;
+    this.withEntryCredential(
+      entry,
+      () => this.vfs.writeFile(entry.path, entry.buffer),
+    );
+    entry.dirty = false;
   }
 }
