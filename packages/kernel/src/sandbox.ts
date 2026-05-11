@@ -1640,11 +1640,23 @@ export class Sandbox {
       PWD: this.env.get("PWD") ?? home,
     };
     const startTime = performance.now();
-    const proc = await this.spawn([shell, "-c", command], {
-      mode: "cli",
-      env,
-      cwd: env.PWD,
-    });
+    let proc: import("./process/handle.js").Process;
+    try {
+      proc = await this.spawn([shell, "-c", command], {
+        mode: "cli",
+        env,
+        cwd: env.PWD,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const isNoEnt = msg.includes("ENOENT") || msg.includes("no such file");
+      return {
+        exitCode: 127,
+        stdout: "",
+        stderr: isNoEnt ? `${shell}: not found\n` : `spawn error: ${msg}\n`,
+        executionTimeMs: performance.now() - startTime,
+      };
+    }
     if (options?.stdinData) {
       proc.setStdin(options.stdinData);
     }
@@ -2068,6 +2080,23 @@ export class Sandbox {
     state.rows = rows;
     state.cols = cols;
     return new TtyHandle(state);
+  }
+
+  /**
+   * Return the master-side TtyHandle for a named TTY device (e.g. "tty1").
+   *
+   * Named TTYs are pre-created at Sandbox.create() time (console, tty0–tty2).
+   * The guest side (getty, login, shell) opens /dev/ttyN as a slave fd via the
+   * normal path_open path.  The host uses this handle to feed keystrokes to the
+   * guest and read output back — the same interface as openTty() but without
+   * wiring the boot-process fds.
+   *
+   * Returns null if the name is not registered (e.g. "tty9").
+   */
+  getNamedTtyHandle(name: string): TtyHandle | null {
+    this.assertAlive();
+    const state = this.kernel.getNamedTtyState(name);
+    return state ? new TtyHandle(state) : null;
   }
 
   rm(path: string): void {
