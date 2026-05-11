@@ -16,3 +16,7 @@ packages/kernel/src/platform/__tests__/fixtures/zsh.wasm
 packages/kernel/src/platform/__tests__/fixtures/cpython3.wasm
 packages/kernel/src/platform/__tests__/fixtures/cpython3-lib/
 packages/kernel/src/platform/__tests__/fixtures/cpython3-lib-manifest.json
+# yurt-jupyter ipykernel smoke fixtures — large, populated by
+# scripts/stage-jupyter-fixtures.sh from the sibling yurt-jupyter
+# repo's dist/extracted/. ~200 MB raw / ~40 MB compressed yurtpkg.
+packages/kernel/src/platform/__tests__/fixtures/yurt-jupyter/
