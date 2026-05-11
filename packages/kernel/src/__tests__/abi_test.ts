@@ -560,9 +560,17 @@ describe("Kernel ABI canaries", () => {
   });
 
   it("exposes the POSIX socket compatibility header surface", async () => {
+    // socket-canary now exercises socketpair(), which emulates AF_UNIX
+    // SOCK_STREAM via a TCP-loopback listen/accept dance (yurtos-kernel
+    // PR #22's yurt_socket.c::socketpair). Allow loopback listeners so
+    // that path can complete. The canary still verifies that listen()
+    // on 0.0.0.0 is denied (EOPNOTSUPP) before the socketpair section
+    // runs — that case fires because 0.0.0.0 is not loopback.
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
+      network: { allowedHosts: ["127.0.0.1", "localhost"] },
+      serverSockets: { allowLoopback: true },
     });
 
     const result = await sandbox.run("socket-canary");
