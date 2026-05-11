@@ -1491,3 +1491,44 @@ describe("Kernel ABI canaries", () => {
     },
   );
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// AF_UNIX (unix-canary)
+//
+// Spec: docs/superpowers/specs/2026-05-11-af-unix-design.md
+// Plan: docs/superpowers/plans/2026-05-11-af-unix.md
+//
+// Slice 1 pins the contract: this describe.skip block lists every
+// case the canary defines and the slice that will unskip it. The
+// canary itself emits {"exit":99,"stdout":"pending-impl"} for each
+// case until its slice lands, so the C source compiles cleanly
+// against today's libyurt (which rejects AF_UNIX with EAFNOSUPPORT)
+// and CI stays green.
+//
+// Each `it.skip` carries a one-line TODO citing the slice that flips
+// it to `it`.
+// ─────────────────────────────────────────────────────────────────────
+describe.ignore("AF_UNIX (unix-canary)", () => {
+  // TODO(af-unix slice 2): unskip — pair_basic exercises socketpair(AF_UNIX, SOCK_STREAM).
+  it.skip("pair_basic: socketpair(AF_UNIX, SOCK_STREAM) returns two connected fds", () => {});
+  // TODO(af-unix slice 2): unskip — bind/listen/accept on a pathname.
+  it.skip("bind_listen_accept: bind, listen, and accept on /tmp/foo.sock", () => {});
+  // TODO(af-unix slice 2): unskip — bound path appears as S_IFSOCK in the VFS.
+  it.skip("stat_socket_inode: bind creates an S_IFSOCK inode visible to stat()", () => {});
+  // TODO(af-unix slice 2): unskip — unlink removes the socket inode.
+  it.skip("unlink_removes: unlink of the bound path makes subsequent connect() fail", () => {});
+  // TODO(af-unix slice 2): unskip — connect to an unbound path returns ECONNREFUSED.
+  it.skip("connect_refused: connect to a path with no listener returns ECONNREFUSED", () => {});
+  // TODO(af-unix slice 3): unskip — abstract namespace bind/connect.
+  it.skip("abstract_bind_connect: bind/connect with a \\0-prefixed name", () => {});
+  // TODO(af-unix slice 3): unskip — abstract names are invisible to stat().
+  it.skip("abstract_invisible_to_stat: abstract names do not appear in the VFS", () => {});
+  // TODO(af-unix slice 4): unskip — datagram socketpair preserves message boundaries.
+  it.skip("dgram_pair_message_framing: socketpair SOCK_DGRAM preserves message boundaries", () => {});
+  // TODO(af-unix slice 4): unskip — sendto by path.
+  it.skip("dgram_path_sendto: sendto delivers a datagram to a bound path", () => {});
+  // TODO(af-unix slice 5): unskip — fd passing via sendmsg/SCM_RIGHTS.
+  it.skip("scm_rights_pipe_handoff: sendmsg with SCM_RIGHTS passes a pipe read end", () => {});
+  // TODO(af-unix slice 6): unskip — SO_PEERCRED reads peer pid/uid/gid.
+  it.skip("peercred_after_accept: getsockopt(SO_PEERCRED) returns the peer's ucred", () => {});
+});
