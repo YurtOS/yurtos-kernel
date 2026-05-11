@@ -483,7 +483,12 @@ export class OverlayVFS implements VfsLike {
     this.notifyChange();
   }
 
-  setTimes(path: string, atime?: Date, mtime?: Date, followSymlinks = true): void {
+  setTimes(
+    path: string,
+    atime?: Date,
+    mtime?: Date,
+    followSymlinks = true,
+  ): void {
     path = normalizeOverlayPath(path);
     if (!this.privileged) this.assertCanWritePath(path);
     try {
@@ -495,7 +500,7 @@ export class OverlayVFS implements VfsLike {
     }
     const setUpperTimes = () => {
       if (!this.options.upper.setTimes) {
-        throw new VfsError('EROFS', `timestamps are read-only: ${path}`);
+        throw new VfsError("EROFS", `timestamps are read-only: ${path}`);
       }
       this.options.upper.setTimes(path, atime, mtime, followSymlinks);
     };

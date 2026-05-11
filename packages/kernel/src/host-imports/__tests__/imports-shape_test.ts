@@ -8,6 +8,7 @@ import { ProcessKernel } from "../../process/kernel.ts";
 import { FdTable } from "../../vfs/fd-table.ts";
 import { createVfsFileTarget, type FdTarget } from "../../wasi/fd-target.ts";
 import { WasiExitError, WasiHost } from "../../wasi/wasi-host.ts";
+import { createAsyncPipe } from "../../vfs/pipe.ts";
 import type { RuntimeEngineBackend } from "../../engine/backend.ts";
 import type { SocketBackend } from "../../network/socket-backend.ts";
 import { buildNativeSpawnRequest } from "./spawn-request-fixture.ts";
@@ -28,6 +29,27 @@ function readWaitResult(memory: WebAssembly.Memory, ptr: number) {
     signal: view.getInt32(ptr + 8, true),
     flags: view.getInt32(ptr + 12, true),
   };
+}
+
+const POLLIN = 0x0001;
+const POLLOUT = 0x0002;
+const POLLHUP = 0x2000;
+const POLLNVAL = 0x4000;
+
+function writePollFd(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  fd: number,
+  events: number,
+) {
+  const view = new DataView(memory.buffer);
+  view.setInt32(ptr, fd, true);
+  view.setInt16(ptr + 4, events, true);
+  view.setInt16(ptr + 6, 0, true);
+}
+
+function readPollRevents(memory: WebAssembly.Memory, ptr: number): number {
+  return new DataView(memory.buffer).getInt16(ptr + 6, true);
 }
 
 Deno.test("kernel host_spawn accepts native spawn request records", () => {
@@ -1633,4 +1655,71 @@ Deno.test("host_thread_exit maps main-thread pthread_exit to process exit", () =
     assertEquals(err instanceof WasiExitError, true);
     assertEquals((err as WasiExitError).code, 0);
   }
+});
+
+Deno.test("host_poll reports regular file readiness and invalid fds", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS();
+  const fdTable = new FdTable(vfs);
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  vfs.writeFile("/tmp/data.txt", encoder.encode("data"));
+  const fd = fdTable.open("/tmp/data.txt", "r");
+  kernel.setFdTarget(pid, fd, createVfsFileTarget(fdTable, fd));
+  writePollFd(memory, 64, fd, POLLIN | POLLOUT);
+  writePollFd(memory, 72, 999, POLLIN);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  const ready = (imports.host_poll as (...args: number[]) => number)(
+    64,
+    2,
+    0,
+  );
+
+  assertEquals(ready, 2);
+  assertEquals(readPollRevents(memory, 64), POLLIN | POLLOUT);
+  assertEquals(readPollRevents(memory, 72), POLLNVAL);
+  kernel.dispose();
+});
+
+Deno.test("host_poll reports pipe readiness, capacity, and hangup", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  const [readEnd, writeEnd] = createAsyncPipe(4);
+  kernel.setFdTarget(pid, 3, { type: "pipe_read", pipe: readEnd });
+  kernel.setFdTarget(pid, 4, { type: "pipe_write", pipe: writeEnd });
+  writePollFd(memory, 128, 3, POLLIN);
+  writePollFd(memory, 136, 4, POLLOUT);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(128, 2, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 128), 0);
+  assertEquals(readPollRevents(memory, 136), POLLOUT);
+
+  assertEquals(writeEnd.write(encoder.encode("abcd")), 4);
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(128, 2, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 128), POLLIN);
+  assertEquals(readPollRevents(memory, 136), 0);
+
+  writeEnd.close();
+  writePollFd(memory, 136, -1, POLLOUT);
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(128, 2, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 128), POLLIN);
+  readEnd.drainSync();
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(128, 2, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 128), POLLHUP);
+  kernel.dispose();
 });

@@ -1,0 +1,37 @@
+#include <errno.h>
+#include <limits.h>
+#include <poll.h>
+#include <stdint.h>
+
+#include "yurt_markers.h"
+#include "yurt_runtime.h"
+
+YURT_DECLARE_MARKER(poll);
+YURT_DEFINE_MARKER(poll, 0x706f6c6cu) /* "poll" */
+
+static int yurt_poll_impl(struct pollfd *fds, nfds_t nfds, int timeout) {
+  YURT_MARKER_CALL(poll);
+  if (nfds > (nfds_t)INT_MAX) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (nfds > 0 && fds == NULL) {
+    errno = EFAULT;
+    return -1;
+  }
+
+  int rc = yurt_host_poll((int)(intptr_t)fds, (int)nfds, timeout);
+  if (rc < 0) {
+    errno = -rc;
+    return -1;
+  }
+  return rc;
+}
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+  return yurt_poll_impl(fds, nfds, timeout);
+}
+
+int __wrap_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+  return yurt_poll_impl(fds, nfds, timeout);
+}

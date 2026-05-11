@@ -9,6 +9,8 @@ interface SpawnSlot {
   reaped: boolean;
   detached: boolean;
   finished: boolean;
+  started: boolean;
+  start: () => void;
   stackPointer: number | null;
 }
 
@@ -42,6 +44,8 @@ export class CooperativeSerialBackend implements ThreadsBackend {
   private tids = new AsyncLocalStorage<number>();
   private mutexes = new Map<number, MutexState>();
   private condvars = new Map<number, CondvarState>();
+  private detachedWaiters = new Set<() => void>();
+  private detachedCancelled = false;
   private memory: WebAssembly.Memory | null = null;
   private stackPointer: WebAssembly.Global | null = null;
   private activeTid = 0;
@@ -91,11 +95,19 @@ export class CooperativeSerialBackend implements ThreadsBackend {
       reaped: false,
       detached: false,
       finished: false,
+      started: false,
+      start: () => {},
       stackPointer: this.slots[tid]?.stackPointer ??
         this.allocateThreadStackTop(),
     };
     this.slots[tid] = slot;
-    slot.result = Promise.resolve()
+    slot.result = new Promise<void>((resolve) => {
+      slot.start = () => {
+        if (slot.started) return;
+        slot.started = true;
+        resolve();
+      };
+    })
       .then(() =>
         this.tids.run(tid, async () => {
           this.restoreLinearStack(tid);
@@ -111,6 +123,9 @@ export class CooperativeSerialBackend implements ThreadsBackend {
       .finally(() => {
         slot.finished = true;
       });
+    setTimeout(() => {
+      if (!slot.detached) slot.start();
+    }, 0);
     return tid;
   }
 
@@ -118,6 +133,7 @@ export class CooperativeSerialBackend implements ThreadsBackend {
     const slot = this.slots[tid];
     if (!slot || slot.reaped || slot.detached) return -1;
     slot.reaped = true;
+    slot.start();
     return await slot.result;
   }
 
@@ -129,6 +145,29 @@ export class CooperativeSerialBackend implements ThreadsBackend {
     return 0;
   }
 
+  isDetached(tid: number): boolean {
+    return this.slots[tid]?.detached === true;
+  }
+
+  detachedThreadsCancelled(): boolean {
+    return this.detachedCancelled;
+  }
+
+  parkDetachedThread(): Promise<number> {
+    if (this.detachedCancelled) return Promise.resolve(0);
+    return new Promise<number>((resolve) => {
+      const waiter = () => resolve(0);
+      this.detachedWaiters.add(waiter);
+    });
+  }
+
+  cancelDetachedThreads(): void {
+    this.detachedCancelled = true;
+    const waiters = [...this.detachedWaiters];
+    this.detachedWaiters.clear();
+    for (const waiter of waiters) waiter();
+  }
+
   exit(retval: number): never {
     throw new ThreadExit(retval);
   }
@@ -138,7 +177,10 @@ export class CooperativeSerialBackend implements ThreadsBackend {
   }
 
   async yield_(): Promise<number> {
-    await Promise.resolve();
+    for (const slot of this.slots) {
+      if (slot.detached && !slot.finished) slot.start();
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     return 0;
   }
 
@@ -234,6 +276,8 @@ export class CooperativeSerialBackend implements ThreadsBackend {
       reaped: true,
       detached: false,
       finished: true,
+      started: true,
+      start: () => {},
       stackPointer: this.stackPointer?.value as number | undefined ?? null,
     });
   }
@@ -259,6 +303,8 @@ export class CooperativeSerialBackend implements ThreadsBackend {
   }
 
   private liveSpawnedThreads(): number {
-    return this.slots.filter((slot, tid) => tid !== 0 && !slot.finished).length;
+    return this.slots.filter((slot, tid) =>
+      tid !== 0 && !slot.finished && !slot.detached
+    ).length;
   }
 }

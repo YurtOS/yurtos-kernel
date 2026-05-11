@@ -553,6 +553,38 @@ describe("Kernel ABI canaries", () => {
         '{"case":"utimes_mtime","exit":0,"stdout":"utimes_mtime:ok"}',
       );
     });
+
+    it("reports poll readiness for regular and invalid descriptors", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run(
+        "posix-runtime-canary --case poll_regular_fd",
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"poll_regular_fd","exit":0,"stdout":"poll_regular_fd:ok"}',
+      );
+    });
+
+    it("reports select readiness for regular and invalid descriptors", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run(
+        "posix-runtime-canary --case select_regular_fd",
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"select_regular_fd","exit":0,"stdout":"select_regular_fd:ok"}',
+      );
+    });
   });
 
   it("exposes the narrow signal compatibility header surface", async () => {

@@ -162,6 +162,12 @@ const USER_UID = 1000;
 const USER_GID = 1000;
 const PRIO_PROCESS = 0;
 const YURT_WAIT_NOHANG = 1;
+const POLLIN = 0x0001;
+const POLLOUT = 0x0002;
+const POLLERR = 0x1000;
+const POLLHUP = 0x2000;
+const POLLNVAL = 0x4000;
+const POLLFD_SIZE = 8;
 
 function writeI32(
   memory: WebAssembly.Memory,
@@ -371,6 +377,52 @@ function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
 
 function yieldToScheduler(): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+function pollReventsForTarget(target: FdTarget, events: number): number {
+  let revents = 0;
+  const wantsRead = (events & POLLIN) !== 0;
+  const wantsWrite = (events & POLLOUT) !== 0;
+
+  switch (target.type) {
+    case "pipe_read":
+      if (wantsRead && target.pipe.hasBufferedData) revents |= POLLIN;
+      if (target.pipe.writeClosed && !target.pipe.hasBufferedData) {
+        revents |= POLLHUP;
+      }
+      break;
+    case "pipe_write":
+      if (target.pipe.closed) revents |= POLLERR;
+      else if (wantsWrite && target.pipe.hasCapacity) revents |= POLLOUT;
+      break;
+    case "tty_slave":
+      if (wantsRead && target.state.toSlave.length > 0) revents |= POLLIN;
+      if (target.state.masterClosed) revents |= POLLHUP;
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+    case "tty_master":
+      if (wantsRead && target.state.toMaster.length > 0) revents |= POLLIN;
+      if (wantsWrite && !target.state.masterClosed) revents |= POLLOUT;
+      if (target.state.masterClosed) revents |= POLLHUP;
+      break;
+    case "buffer":
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+    case "static":
+      if (wantsRead && target.offset < target.data.byteLength) {
+        revents |= POLLIN;
+      }
+      break;
+    case "null":
+    case "socket":
+    case "vfs_file":
+    case "vfs_dir":
+      if (wantsRead) revents |= POLLIN;
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+  }
+
+  return revents;
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -938,6 +990,63 @@ export function createKernelImports(
         if (writeTarget) ioFds.set(writeFd, writeTarget);
       }
       return writePipeResult(memory, outPtr, outCap, readFd, writeFd);
+    },
+
+    // host_poll(fds_ptr, nfds, timeout_ms) -> i32 | Promise<i32>
+    // Updates pollfd.revents in-place and returns the number of ready fds.
+    host_poll(
+      fdsPtr: number,
+      nfds: number,
+      timeoutMs: number,
+    ): number | Promise<number> {
+      if (!opts.kernel) return ERR_IO;
+      if (nfds < 0 || !Number.isInteger(nfds)) return ERR_INVALID;
+
+      const evaluate = (): number => {
+        const end = fdsPtr + nfds * POLLFD_SIZE;
+        if (fdsPtr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+        const view = new DataView(memory.buffer);
+        let ready = 0;
+        for (let i = 0; i < nfds; i++) {
+          const base = fdsPtr + i * POLLFD_SIZE;
+          const fd = view.getInt32(base, true);
+          const events = view.getInt16(base + 4, true);
+          let revents = 0;
+          if (fd >= 0) {
+            const target = opts.kernel!.getFdTarget(callerPid, fd);
+            revents = target ? pollReventsForTarget(target, events) : POLLNVAL;
+          }
+          view.setInt16(base + 6, revents, true);
+          if (revents !== 0) ready++;
+        }
+        return ready;
+      };
+
+      const immediate = evaluate();
+      if (immediate !== 0 || timeoutMs === 0) return immediate;
+
+      const tid = opts.threadsBackend?.self() ?? 0;
+      if (
+        tid !== 0 && timeoutMs < 0 && opts.threadsBackend?.isDetached?.(tid)
+      ) {
+        if (opts.threadsBackend.detachedThreadsCancelled?.()) {
+          opts.threadsBackend.exit(0);
+        }
+        return opts.threadsBackend.parkDetachedThread?.() ??
+          new Promise<number>(() => {});
+      }
+
+      return new Promise<number>((resolve) => {
+        const started = Date.now();
+        const interval = setInterval(() => {
+          const ready = evaluate();
+          const expired = timeoutMs >= 0 && Date.now() - started >= timeoutMs;
+          if (ready !== 0 || expired) {
+            clearInterval(interval);
+            resolve(ready > 0 ? ready : 0);
+          }
+        }, 10);
+      });
     },
 
     // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32

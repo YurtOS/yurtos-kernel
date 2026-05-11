@@ -6,6 +6,9 @@ import { createPipe } from "../pipe.js";
 import { OverlayVFS } from "../overlay-vfs.ts";
 import { MemoryRoot } from "./helpers.ts";
 
+const text = new TextEncoder();
+const decode = (data: Uint8Array): string => new TextDecoder().decode(data);
+
 describe("FdTable", () => {
   it("opens a file and returns an fd", () => {
     const vfs = new VFS();
@@ -35,6 +38,60 @@ describe("FdTable", () => {
     expect(new TextDecoder().decode(vfs.readFile("/home/user/out.txt"))).toBe(
       "written",
     );
+  });
+
+  it("restores buffered write state when immediate flush fails", () => {
+    const vfs = new VFS({ fsLimitBytes: 3 });
+    const fdt = new FdTable(vfs);
+    const fd = fdt.open("/home/user/out.txt", "w");
+    fdt.write(fd, text.encode("abc"));
+
+    expect(() => fdt.write(fd, text.encode("d"))).toThrow(/ENOSPC/);
+
+    expect(fdt.tell(fd)).toBe(3);
+    fdt.seek(fd, 0, "set");
+    const buf = new Uint8Array(4);
+    const n = fdt.read(fd, buf);
+    expect(n).toBe(3);
+    expect(decode(buf.subarray(0, n))).toBe("abc");
+    fdt.close(fd);
+    expect(decode(vfs.readFile("/home/user/out.txt"))).toBe("abc");
+  });
+
+  it("restores buffered pwrite state when immediate flush fails", () => {
+    const vfs = new VFS({ fsLimitBytes: 3 });
+    vfs.writeFile("/home/user/out.txt", text.encode("abc"));
+    const fdt = new FdTable(vfs);
+    const fd = fdt.open("/home/user/out.txt", "rw");
+
+    expect(() => fdt.pwrite(fd, text.encode("d"), 3)).toThrow(/ENOSPC/);
+
+    const buf = new Uint8Array(4);
+    const n = fdt.pread(fd, buf, 0);
+    expect(n).toBe(3);
+    expect(decode(buf.subarray(0, n))).toBe("abc");
+    fdt.close(fd);
+    expect(decode(vfs.readFile("/home/user/out.txt"))).toBe("abc");
+  });
+
+  it("restores buffered truncate state when immediate flush fails", () => {
+    const vfs = new VFS();
+    vfs.writeFile("/home/user/out.txt", text.encode("abc"));
+    const fdt = new FdTable(vfs);
+    const fd = fdt.open("/home/user/out.txt", "rw");
+    fdt.seek(fd, 3, "set");
+    vfs.chmod("/home/user/out.txt", 0o444);
+
+    expect(() => fdt.truncate(fd, 1)).toThrow(/EACCES/);
+
+    expect(fdt.tell(fd)).toBe(3);
+    const buf = new Uint8Array(3);
+    const n = fdt.pread(fd, buf, 0);
+    expect(n).toBe(3);
+    expect(decode(buf)).toBe("abc");
+    vfs.chmod("/home/user/out.txt", 0o644);
+    fdt.close(fd);
+    expect(decode(vfs.readFile("/home/user/out.txt"))).toBe("abc");
   });
 
   it("makes writes visible to stat before close", () => {
@@ -208,35 +265,43 @@ describe("FdTable", () => {
     );
   });
 
-  it('flushes writes on close for files created through privileged overlay setup', () => {
+  it("flushes writes on close for files created through privileged overlay setup", () => {
     const base = new MemoryRoot();
-    base.addDir('/tmp', { uid: 0, gid: 0, permissions: 0o777 });
+    base.addDir("/tmp", { uid: 0, gid: 0, permissions: 0o777 });
     const vfs = new OverlayVFS({ base, upper: new VFS() });
 
-    vfs.writeFile('/tmp/out.txt', new Uint8Array(0));
+    vfs.writeFile("/tmp/out.txt", new Uint8Array(0));
     const fdt = new FdTable(vfs);
-    const fd = fdt.open('/tmp/out.txt', 'w');
-    fdt.write(fd, new TextEncoder().encode('buffered close flush'));
+    const fd = fdt.open("/tmp/out.txt", "w");
+    fdt.write(fd, new TextEncoder().encode("buffered close flush"));
     fdt.close(fd);
 
-    expect(new TextDecoder().decode(vfs.readFile('/tmp/out.txt'))).toBe(
-      'buffered close flush',
+    expect(new TextDecoder().decode(vfs.readFile("/tmp/out.txt"))).toBe(
+      "buffered close flush",
     );
   });
 
-  it('flushes dirty writes with the descriptor credentials, not privileged VFS access', () => {
+  it("flushes writes with the descriptor credentials, not privileged VFS access", () => {
     const vfs = new VFS();
     vfs.withWriteAccess(() => {
-      vfs.writeFile('/root-owned.txt', new TextEncoder().encode('original'), 0o444);
-      vfs.chown('/root-owned.txt', 0, 0);
+      vfs.writeFile(
+        "/root-owned.txt",
+        new TextEncoder().encode("original"),
+        0o444,
+      );
+      vfs.chown("/root-owned.txt", 0, 0);
     });
 
     const fdt = new FdTable(vfs, { uid: 1000, gid: 1000 });
-    const fd = fdt.open('/root-owned.txt', 'w');
-    fdt.write(fd, new TextEncoder().encode('bypass'));
+    const fd = fdt.open("/root-owned.txt", "w");
 
-    expect(() => fdt.close(fd)).toThrow('permission denied');
-    expect(new TextDecoder().decode(vfs.readFile('/root-owned.txt'))).toBe('original');
+    expect(() => fdt.write(fd, new TextEncoder().encode("bypass"))).toThrow(
+      "permission denied",
+    );
+    expect(new TextDecoder().decode(vfs.readFile("/root-owned.txt"))).toBe(
+      "original",
+    );
+    expect(() => fdt.close(fd)).toThrow("permission denied");
   });
 });
 
