@@ -877,6 +877,29 @@ export function createKernelImports(
     return { ok: true, mapping };
   }
 
+  function authorizeUnixListen(
+    policy: SocketListenPolicy | undefined,
+    path: string,
+  ): { ok: true } | { ok: false; error: string } {
+    if (!policy?.allowUnixDomain) {
+      return {
+        ok: false,
+        error: `AF_UNIX listen on ${path} is not allowed by sandbox policy`,
+      };
+    }
+    const allowlist = policy.unixPathAllowlist;
+    if (allowlist && allowlist.length > 0) {
+      const allowed = allowlist.some((re) => re.test(path));
+      if (!allowed) {
+        return {
+          ok: false,
+          error: `AF_UNIX path ${path} is not in the sandbox allowlist`,
+        };
+      }
+    }
+    return { ok: true };
+  }
+
   // ── Phase 1 dlopen state (per-sandbox) ──
   // Spec: docs/superpowers/specs/2026-05-09-shared-libraries-design.md.
   // The handle table owns loaded side-module instances; lastDlError
@@ -1986,6 +2009,26 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
+        // AF_UNIX connect: req.path is present
+        if (typeof req.path === "string") {
+          const registry = socketBackend?.registry;
+          if (!registry) {
+            return writeJson(memory, outPtr, outCap, {
+              ok: false,
+              error: "AF_UNIX sockets require a loopback socket backend",
+            });
+          }
+          const unixResult = registry.connectToPath(req.path);
+          if (!unixResult.ok) {
+            return writeJson(memory, outPtr, outCap, { ok: false, error: unixResult.error });
+          }
+          target.socket = -unixResult.socket; // negate for loopback convention
+          target.family = "AF_UNIX";
+          target.peerPath = req.path;
+          return writeJson(memory, outPtr, outCap, { ok: true });
+        }
+
+        // AF_INET connect
         const result = socketBackend.connect({
           host: req.host,
           port: req.port,
@@ -2023,6 +2066,7 @@ export function createKernelImports(
 
     // host_socket_bind(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Records the sandbox-visible local address requested for a socket fd.
+    // AF_UNIX: req = { fd, path }; AF_INET: req = { fd, host, port }
     host_socket_bind(
       reqPtr: number,
       reqLen: number,
@@ -2044,6 +2088,21 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
+
+        // AF_UNIX bind: req.path is present
+        if (typeof req.path === "string") {
+          target.family = "AF_UNIX";
+          target.boundPath = req.path;
+          try {
+            opts.vfs?.createSocket?.(req.path);
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+          }
+          return writeJson(memory, outPtr, outCap, { ok: true });
+        }
+
+        // AF_INET bind
         const host = req.host;
         if (
           host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
@@ -2059,6 +2118,7 @@ export function createKernelImports(
             error: `invalid bind port: ${String(req.port)}`,
           });
         }
+        target.family = "AF_INET";
         target.boundHost = host;
         target.boundPort = req.port;
         target.localHost = host === "0.0.0.0" ? socketLocalHost : host;
@@ -2093,11 +2153,41 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
-        const host = target.boundHost ?? "127.0.0.1";
-        const port = target.boundPort ?? 0;
         const backlog = typeof req.backlog === "number" && req.backlog > 0
           ? req.backlog
           : 128;
+
+        // AF_UNIX listen
+        if (target.family === "AF_UNIX" || typeof target.boundPath === "string") {
+          const path = target.boundPath!;
+          const auth = authorizeUnixListen(opts.serverSockets, path);
+          if (!auth.ok) return writeJson(memory, outPtr, outCap, auth);
+          const registry = socketBackend?.registry;
+          if (!registry) {
+            return writeJson(memory, outPtr, outCap, {
+              ok: false,
+              error: "AF_UNIX sockets require a loopback socket backend",
+            });
+          }
+          try {
+            const rawHandle = registry.listenOnPath(path, backlog);
+            // Negate to follow the loopback backend's negative-handle convention.
+            target.listener = -rawHandle;
+            const boundPath = path;
+            target.closeListener = (_listener) => {
+              registry.closePathListener(boundPath);
+              try { opts.vfs?.unlink(boundPath); } catch { /* already gone */ }
+            };
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+          }
+          return writeJson(memory, outPtr, outCap, { ok: true });
+        }
+
+        // AF_INET listen
+        const host = target.boundHost ?? "127.0.0.1";
+        const port = target.boundPort ?? 0;
         const auth = authorizeListen(opts.serverSockets, host, port, backlog);
         if (!auth.ok) return writeJson(memory, outPtr, outCap, auth);
         if (!socketBackend?.listen) {
@@ -2136,7 +2226,7 @@ export function createKernelImports(
       outPtr: number,
       outCap: number,
     ): Promise<number> {
-      if (!socketBackend?.accept) {
+      if (!socketBackend?.accept && !socketBackend?.registry) {
         return writeJson(memory, outPtr, outCap, {
           ok: false,
           error: "server sockets are not supported by this backend",
@@ -2157,18 +2247,45 @@ export function createKernelImports(
             error: `not a listening socket fd: ${req.fd}`,
           });
         }
-        // Prefer backend suspension; legacy backends fall back to accept().
-        const accepted = await acceptSocketAsync(
-          socketBackend,
-          target.listener,
-        );
-        if (!accepted.ok) return writeJson(memory, outPtr, outCap, accepted);
         if (!opts.kernel) {
           return writeJson(memory, outPtr, outCap, {
             ok: false,
             error: "kernel not configured",
           });
         }
+
+        // AF_UNIX accept: use registry.acceptUnix directly.
+        if (target.family === "AF_UNIX" && socketBackend?.registry) {
+          const rawHandle = -(target.listener); // un-negate to get registry handle
+          const unixAccepted = await socketBackend.registry.acceptUnix(rawHandle);
+          const acceptedFd = opts.kernel.allocFd(callerPid, {
+            type: "socket",
+            socket: -(unixAccepted.socket), // negate for loopback convention
+            family: "AF_UNIX",
+            boundPath: unixAccepted.localPath,
+            peerPath: unixAccepted.peerPath,
+            refs: 1,
+            send: socketBackend.send.bind(socketBackend),
+            recv: socketBackend.recv.bind(socketBackend),
+            recvAsync: (socket, maxBytes) =>
+              recvSocketAsync(socketBackend, socket, maxBytes),
+            setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+            close: (socket) => { socketBackend.close(socket); },
+          });
+          return writeJson(memory, outPtr, outCap, {
+            ok: true,
+            fd: acceptedFd,
+            peer_path: unixAccepted.peerPath ?? "",
+            local_path: unixAccepted.localPath ?? "",
+          });
+        }
+
+        // AF_INET accept: prefer backend suspension; legacy backends fall back to accept().
+        const accepted = await acceptSocketAsync(
+          socketBackend,
+          target.listener,
+        );
+        if (!accepted.ok) return writeJson(memory, outPtr, outCap, accepted);
         const acceptedFd = opts.kernel.allocFd(callerPid, {
           type: "socket",
           socket: accepted.socket,
@@ -2241,6 +2358,15 @@ export function createKernelImports(
             error: `socket not bound or connected: ${req.fd}`,
           });
         }
+        // AF_UNIX: return path-based address info
+        if (target.family === "AF_UNIX") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: true,
+            local_path: target.boundPath ?? "",
+            peer_path: target.peerPath ?? "",
+          });
+        }
+
         return writeJson(memory, outPtr, outCap, {
           ok: true,
           peer_host: target.peerHost ?? "0.0.0.0",
@@ -2434,6 +2560,56 @@ export function createKernelImports(
         }
         target.noDelay = req.value;
         return writeJson(memory, outPtr, outCap, { ok: true });
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+      }
+    },
+
+    // host_socket_socketpair(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // Creates a connected pair of AF_UNIX sockets.
+    // Request JSON: { family, type }   (family=1=AF_UNIX, type=1=SOCK_STREAM)
+    // Response JSON: { ok: true, fds: [int, int] } or { ok: false, error }
+    host_socket_socketpair(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
+      try {
+        if (!opts.kernel) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "kernel not configured",
+          });
+        }
+        const registry = socketBackend?.registry;
+        if (!registry) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "AF_UNIX sockets require a loopback socket backend",
+          });
+        }
+        JSON.parse(readString(memory, reqPtr, reqLen)); // validate JSON (family/type unused — STREAM only for now)
+        const { a, b } = registry.openUnixPair();
+        const makeTarget = (rawHandle: number): FdTarget => ({
+          type: "socket",
+          socket: -rawHandle, // negate for loopback convention
+          family: "AF_UNIX",
+          refs: 1,
+          send: socketBackend!.send.bind(socketBackend),
+          recv: socketBackend!.recv.bind(socketBackend),
+          recvAsync: (socket, maxBytes) =>
+            recvSocketAsync(socketBackend!, socket, maxBytes),
+          setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
+          close: (socket) => { socketBackend!.close(socket); },
+        });
+        const fdA = opts.kernel.allocFd(callerPid, makeTarget(a));
+        const fdB = opts.kernel.allocFd(callerPid, makeTarget(b));
+        return writeJson(memory, outPtr, outCap, {
+          ok: true,
+          fds: [fdA, fdB],
+        });
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
