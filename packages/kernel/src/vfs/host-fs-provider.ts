@@ -8,7 +8,7 @@
  * Path traversal is prevented: all resolved paths must stay under hostRoot.
  */
 
-import { readFileSync, writeFileSync, statSync, readdirSync, mkdirSync, realpathSync } from 'node:fs';
+import { readFileSync, writeFileSync, statSync, readdirSync, mkdirSync, realpathSync, lstatSync } from 'node:fs';
 import { resolve, normalize, dirname, join } from 'node:path';
 import { VfsError } from './inode.js';
 import type { VirtualProvider } from './provider.js';
@@ -134,6 +134,19 @@ export class HostFsProvider implements VirtualProvider {
         return residual.length === 0 ? realProbe : join(realProbe, ...residual);
       } catch (err) {
         if (err instanceof VfsError) throw err;
+        // realpathSync also throws ENOENT for *dangling* symlinks (the
+        // link exists but its target doesn't). Without this check, the
+        // catch arm would pop the dangling-symlink leaf into `residual`,
+        // pass containment on its in-mount parent, and return a path
+        // that subsequent writeFileSync would follow out of the mount.
+        try {
+          if (lstatSync(probe).isSymbolicLink()) {
+            throw new VfsError('ENOENT', `symlink traversal blocked: ${subpath}`);
+          }
+        } catch (lerr) {
+          if (lerr instanceof VfsError) throw lerr;
+          // probe truly doesn't exist — fall through to pop and continue.
+        }
         const parent = dirname(probe);
         if (parent === probe) {
           // Walked all the way to the filesystem root without

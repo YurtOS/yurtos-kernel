@@ -259,4 +259,23 @@ describe('HostFsProvider', () => {
     expect(dec(provider.readFile('alias/inside.txt'))).toBe('ok');
     expect(dec(new Uint8Array(readFileSync(join(mount, 'real', 'inside.txt'))))).toBe('ok');
   });
+
+  it('blocks writeFile through a dangling symlink leaf pointing outside', () => {
+    // realpathSync throws ENOENT for both "path doesn't exist" and
+    // "path is a symlink whose target doesn't exist". Without an
+    // explicit lstat check, the resolver would treat the dangling
+    // symlink leaf like a non-existent file, return an in-mount path,
+    // and the subsequent writeFileSync would follow the link out of
+    // the mount.
+    const mount = join(testDir, 'sym-dangling-mount');
+    const outside = join(testDir, 'sym-dangling-outside');
+    mkdirSync(mount, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    const leakedTarget = join(outside, 'leaked.txt');
+    symlinkSync(leakedTarget, join(mount, 'danglink'));
+
+    const provider = new HostFsProvider(mount, { writable: true });
+    expect(() => provider.writeFile('danglink', enc('pwned'))).toThrow('ENOENT');
+    expect(existsSync(leakedTarget)).toBe(false);
+  });
 });
