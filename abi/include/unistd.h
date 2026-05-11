@@ -2,15 +2,23 @@
 #define YURT_COMPAT_UNISTD_H
 
 /* Pull in the real wasi-sdk unistd.h.  wasi-libc marks getpid() as
- * deprecated to nudge users toward -D_WASI_EMULATED_GETPID, but yurt
- * provides a real getpid() via libyurt_abi (yurt_process.c
- * → yurt_host_getpid → kernel.allocPid), so the deprecation warning
- * is misleading.  Suppress it across everything that includes this
- * header so guest TUs aren't drowned in noise. */
+ * deprecated unless _WASI_EMULATED_GETPID is defined. Yurt provides a real
+ * getpid() via libyurt_abi (yurt_process.c -> yurt_host_getpid ->
+ * kernel.allocPid), so importing the deprecated declaration is misleading.
+ * A later redeclaration cannot remove Clang's deprecated attribute, so force
+ * wasi-libc's non-deprecated declaration while this overlay includes it. */
+#ifndef _WASI_EMULATED_GETPID
+#define YURT_DEFINED_WASI_EMULATED_GETPID 1
+#define _WASI_EMULATED_GETPID 1
+#endif
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 #include_next <unistd.h>
 #pragma clang diagnostic pop
+#ifdef YURT_DEFINED_WASI_EMULATED_GETPID
+#undef _WASI_EMULATED_GETPID
+#undef YURT_DEFINED_WASI_EMULATED_GETPID
+#endif
 
 #ifdef __cplusplus
 extern "C" {

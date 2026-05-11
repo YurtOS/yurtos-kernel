@@ -49,6 +49,7 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
                 "getpgrp",
                 "getsid",
                 "lchown",
+                "posix_madvise",
                 "setpgid",
                 "setpgrp",
                 "setpriority",
