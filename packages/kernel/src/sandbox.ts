@@ -1948,6 +1948,11 @@ export class Sandbox {
     };
   }
 
+  lstat(path: string): StatResult {
+    this.assertAlive();
+    return this.vfs.lstat(path);
+  }
+
   process(pid: number): Process | undefined {
     this.assertAlive();
     return this.processes.get(pid);

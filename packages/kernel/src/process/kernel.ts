@@ -826,8 +826,8 @@ export class ProcessKernel {
     this.execPidAliases.delete(pid);
     this._reparentChildren(pid);
     this.cleanupFds(pid);
-    this.registerExited(pid, exitCode, undefined, signal);
     this.notifyParentOfChildExit(pid);
+    this.registerExited(pid, exitCode, undefined, signal);
   }
 
   discardProcess(pid: number): void {

@@ -391,7 +391,11 @@ fn policy_can_deny_extension_invoke_at_kh_boundary() {
     // Allowed call goes through.
     let mut response = vec![0u8; 64];
     let rc = mk
-        .syscall(METHOD_SYS_EXTENSION_INVOKE, b"benign request", &mut response)
+        .syscall(
+            METHOD_SYS_EXTENSION_INVOKE,
+            b"benign request",
+            &mut response,
+        )
         .unwrap();
     assert!(rc > 0, "benign request: rc = {rc}");
 
@@ -400,7 +404,11 @@ fn policy_can_deny_extension_invoke_at_kh_boundary() {
     // the embedder sees the bytes.
     let registry_calls_before = registry.last_request.lock().unwrap().len();
     let rc = mk
-        .syscall(METHOD_SYS_EXTENSION_INVOKE, b"do something evil", &mut response)
+        .syscall(
+            METHOD_SYS_EXTENSION_INVOKE,
+            b"do something evil",
+            &mut response,
+        )
         .unwrap();
     assert_eq!(rc, -13, "expected -EACCES, got {rc}");
     let registry_calls_after = registry.last_request.lock().unwrap().len();
@@ -421,10 +429,7 @@ fn host_fs_backend_reads_real_file_via_kh_real_open() {
     use std::io::Write;
     build_kernel_wasm().unwrap();
 
-    let dir = std::env::temp_dir().join(format!(
-        "yurt-host-fs-test-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("yurt-host-fs-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let file_path = dir.join("greeting.txt");
@@ -433,8 +438,10 @@ fn host_fs_backend_reads_real_file_via_kh_real_open() {
         f.write_all(b"hello from real disk\n").unwrap();
     }
 
-    let mut host = HostState::default();
-    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
+    let host = HostState {
+        host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
@@ -469,8 +476,10 @@ fn host_fs_in_memory_impl_round_trips_without_real_disk() {
     let memfs = Arc::new(InMemoryHostFs::new());
     memfs.install_file(b"/seed.txt", b"hello memfs".to_vec());
 
-    let mut host = HostState::default();
-    host.host_fs = Some(memfs.clone());
+    let host = HostState {
+        host_fs: Some(memfs.clone()),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/host").unwrap();
 
@@ -518,10 +527,7 @@ fn host_fs_traversal_outside_root_is_eacces() {
     // Build /tmp/yurt-escape-<pid>/inner as the sandbox root, with
     // a sibling /tmp/yurt-escape-<pid>/outside that the sandbox
     // must not be able to read or mutate.
-    let parent = std::env::temp_dir().join(format!(
-        "yurt-escape-{}",
-        std::process::id()
-    ));
+    let parent = std::env::temp_dir().join(format!("yurt-escape-{}", std::process::id()));
     let _ = fs::remove_dir_all(&parent);
     fs::create_dir_all(parent.join("inner")).unwrap();
     fs::create_dir_all(parent.join("outside")).unwrap();
@@ -530,8 +536,10 @@ fn host_fs_traversal_outside_root_is_eacces() {
         f.write_all(b"don't leak me").unwrap();
     }
 
-    let mut host = HostState::default();
-    host.host_fs = Some(Arc::new(NativeHostFs::new(parent.join("inner"))));
+    let host = HostState {
+        host_fs: Some(Arc::new(NativeHostFs::new(parent.join("inner")))),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/host").unwrap();
 
@@ -574,10 +582,7 @@ fn host_fs_writable_ops_create_then_rename_then_unlink() {
     use std::io::Write;
     build_kernel_wasm().unwrap();
 
-    let dir = std::env::temp_dir().join(format!(
-        "yurt-host-fs-write-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("yurt-host-fs-mutate-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     {
@@ -585,8 +590,10 @@ fn host_fs_writable_ops_create_then_rename_then_unlink() {
         f.write_all(b"hi").unwrap();
     }
 
-    let mut host = HostState::default();
-    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
+    let host = HostState {
+        host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/host").unwrap();
 
@@ -603,10 +610,7 @@ fn host_fs_writable_ops_create_then_rename_then_unlink() {
     let mut req = (old.len() as u32).to_le_bytes().to_vec();
     req.extend_from_slice(old);
     req.extend_from_slice(new);
-    assert_eq!(
-        mk.syscall(METHOD_SYS_RENAME, &req, &mut []).unwrap(),
-        0,
-    );
+    assert_eq!(mk.syscall(METHOD_SYS_RENAME, &req, &mut []).unwrap(), 0,);
     assert!(!dir.join("a.txt").exists());
     assert!(dir.join("sub/b.txt").exists());
 
@@ -630,10 +634,7 @@ fn host_fs_fstat_reports_real_file_size() {
     use std::io::Write;
     build_kernel_wasm().unwrap();
 
-    let dir = std::env::temp_dir().join(format!(
-        "yurt-host-fs-stat-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("yurt-host-fs-stat-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     let payload: &[u8] = b"abcdefghij"; // 10 bytes
@@ -642,8 +643,10 @@ fn host_fs_fstat_reports_real_file_size() {
         f.write_all(payload).unwrap();
     }
 
-    let mut host = HostState::default();
-    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
+    let host = HostState {
+        host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
@@ -674,15 +677,14 @@ fn host_fs_writes_create_a_real_file() {
     use std::fs;
     build_kernel_wasm().unwrap();
 
-    let dir = std::env::temp_dir().join(format!(
-        "yurt-host-fs-write-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("yurt-host-fs-write-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
 
-    let mut host = HostState::default();
-    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
+    let host = HostState {
+        host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
@@ -700,7 +702,11 @@ fn host_fs_writes_create_a_real_file() {
     assert_eq!(n as usize, "hello from sandbox\n".len());
 
     // sys_close so the file is flushed (Drop on the host File closes).
-    let _ = mk.syscall(0x1_000E /* sys_close */, &(fd as u32).to_le_bytes(), &mut []);
+    let _ = mk.syscall(
+        0x1_000E, /* sys_close */
+        &(fd as u32).to_le_bytes(),
+        &mut [],
+    );
 
     // Verify the host disk content.
     let on_disk = fs::read(dir.join("note.txt")).unwrap();
@@ -719,10 +725,7 @@ fn host_fs_mount_prefix_is_arbitrary() {
     use std::io::Write;
     build_kernel_wasm().unwrap();
 
-    let dir = std::env::temp_dir().join(format!(
-        "yurt-host-fs-prefix-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("yurt-host-fs-prefix-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     {
@@ -730,8 +733,10 @@ fn host_fs_mount_prefix_is_arbitrary() {
         f.write_all(b"alt prefix").unwrap();
     }
 
-    let mut host = HostState::default();
-    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
+    let host = HostState {
+        host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/users/user").unwrap();
 
@@ -772,8 +777,7 @@ fn yurtfs_mount_overlays_image_with_writable_upper() {
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut builder = tar::Builder::new(&mut buf);
-            let content: &[u8] =
-                b"#!/usr/bin/env python\nprint('image python')\n";
+            let content: &[u8] = b"#!/usr/bin/env python\nprint('image python')\n";
             let mut header = tar::Header::new_gnu();
             header.set_size(content.len() as u64);
             header.set_mode(0o755);
@@ -873,10 +877,7 @@ fn host_fs_policy_can_deny_specific_paths() {
     use std::io::Write;
     build_kernel_wasm().unwrap();
 
-    let dir = std::env::temp_dir().join(format!(
-        "yurt-host-fs-policy-{}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("yurt-host-fs-policy-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).unwrap();
     {
@@ -888,9 +889,11 @@ fn host_fs_policy_can_deny_specific_paths() {
         f.write_all(b"nope").unwrap();
     }
 
-    let mut host = HostState::default();
-    host.host_fs = Some(Arc::new(NativeHostFs::new(dir.clone())));
-    host.policy = Arc::new(Allowlist);
+    let host = HostState {
+        host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
+        policy: Arc::new(Allowlist),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
@@ -934,7 +937,10 @@ fn deny_all_policy_blocks_realtime_clock() {
     let rc = mk
         .syscall(METHOD_SYS_CLOCK_GETTIME, &0_u32.to_le_bytes(), &mut buf)
         .unwrap();
-    assert!(rc < 0, "deny-all policy should block clock_gettime: got {rc}");
+    assert!(
+        rc < 0,
+        "deny-all policy should block clock_gettime: got {rc}"
+    );
 }
 
 #[test]
@@ -956,10 +962,11 @@ fn sys_spawn_stages_child_and_drain_pending_returns_it() {
         sreq.extend_from_slice(&(arg.len() as u32).to_le_bytes());
         sreq.extend_from_slice(arg);
     }
-    let child_pid = mk
-        .syscall_as(1, METHOD_SYS_SPAWN, &sreq, &mut [])
-        .unwrap();
-    assert!(child_pid >= 1000, "kernel-allocated pid expected, got {child_pid}");
+    let child_pid = mk.syscall_as(1, METHOD_SYS_SPAWN, &sreq, &mut []).unwrap();
+    assert!(
+        child_pid >= 1000,
+        "kernel-allocated pid expected, got {child_pid}"
+    );
 
     // Host drains the staged spawn.
     let pending = mk.drain_pending_spawn().unwrap().expect("staged spawn");
@@ -989,7 +996,10 @@ fn sys_spawn_stages_child_and_drain_pending_returns_it() {
         .syscall_as(1, METHOD_SYS_WAIT, &wreq, &mut wresp)
         .unwrap();
     assert_eq!(n, 8, "sys_wait failed: rc={n}");
-    assert_eq!(u32::from_le_bytes(wresp[0..4].try_into().unwrap()), pending.child_pid);
+    assert_eq!(
+        u32::from_le_bytes(wresp[0..4].try_into().unwrap()),
+        pending.child_pid
+    );
     assert_eq!(i32::from_le_bytes(wresp[4..8].try_into().unwrap()), 7);
 }
 
@@ -1033,7 +1043,10 @@ fn run_pending_spawns_runs_real_wasm_child_and_parent_reaps() {
         .syscall_as(parent_pid, METHOD_SYS_WAIT, &wreq, &mut wresp)
         .unwrap();
     assert_eq!(n, 8);
-    assert_eq!(u32::from_le_bytes(wresp[0..4].try_into().unwrap()), child_pid);
+    assert_eq!(
+        u32::from_le_bytes(wresp[0..4].try_into().unwrap()),
+        child_pid
+    );
     let status = i32::from_le_bytes(wresp[4..8].try_into().unwrap());
     assert_eq!(status, 1, "false-cmd exits with 1, got {status}");
 }
@@ -1057,8 +1070,10 @@ fn redb_kv_persists_across_microkernel_restarts() {
 
     {
         let kv = Arc::new(RedbKv::open(db_path.clone()).unwrap());
-        let mut host = HostState::default();
-        host.kv = Some(kv);
+        let host = HostState {
+            kv: Some(kv),
+            ..Default::default()
+        };
         let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
         let mut put_req = vec![5_u8];
@@ -1074,17 +1089,17 @@ fn redb_kv_persists_across_microkernel_restarts() {
 
     {
         let kv = Arc::new(RedbKv::open(db_path.clone()).unwrap());
-        let mut host = HostState::default();
-        host.kv = Some(kv);
+        let host = HostState {
+            kv: Some(kv),
+            ..Default::default()
+        };
         let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
         let mut get_req = vec![5_u8];
         get_req.extend_from_slice(b"users");
         get_req.extend_from_slice(b"abc");
         let mut buf = vec![0u8; 32];
-        let n = mk
-            .syscall(METHOD_SYS_IDB_GET, &get_req, &mut buf)
-            .unwrap();
+        let n = mk.syscall(METHOD_SYS_IDB_GET, &get_req, &mut buf).unwrap();
         assert_eq!(n, 5);
         assert_eq!(&buf[..n as usize], b"alice");
     }
@@ -1098,8 +1113,10 @@ fn sys_idb_put_get_delete_list_round_trips() {
     // KvBackend without disk I/O — same shape browser
     // microkernels will use against IndexedDB.
     build_kernel_wasm().unwrap();
-    let mut host = HostState::default();
-    host.kv = Some(Arc::new(InMemoryKv::new()));
+    let host = HostState {
+        kv: Some(Arc::new(InMemoryKv::new())),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
     let store: &[u8] = b"sessions";
@@ -1121,8 +1138,12 @@ fn sys_idb_put_get_delete_list_round_trips() {
 
     // put a couple entries.
     assert_eq!(
-        mk.syscall(METHOD_SYS_IDB_PUT, &put_req(store, b"alice", b"AAA"), &mut [])
-            .unwrap(),
+        mk.syscall(
+            METHOD_SYS_IDB_PUT,
+            &put_req(store, b"alice", b"AAA"),
+            &mut []
+        )
+        .unwrap(),
         0,
     );
     assert_eq!(
@@ -1190,8 +1211,10 @@ fn sys_socket_listen_accept_round_trips_through_kernel() {
     use std::net::TcpStream;
 
     build_kernel_wasm().unwrap();
-    let mut host = HostState::default();
-    host.tcp = Some(Arc::new(NativeTcpSocket::new()));
+    let host = HostState {
+        tcp: Some(Arc::new(NativeTcpSocket::new())),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
     // sys_socket_listen request: u32 backlog + addr.
@@ -1204,7 +1227,11 @@ fn sys_socket_listen_accept_round_trips_through_kernel() {
     // Discover the actually-bound port.
     let mut addr_buf = [0u8; 64];
     let n = mk
-        .syscall(METHOD_SYS_SOCKET_ADDR, &listener_handle.to_le_bytes(), &mut addr_buf)
+        .syscall(
+            METHOD_SYS_SOCKET_ADDR,
+            &listener_handle.to_le_bytes(),
+            &mut addr_buf,
+        )
         .unwrap();
     assert!(n > 2, "addr response: {n}");
     let port = u16::from_le_bytes(addr_buf[0..2].try_into().unwrap());
@@ -1219,7 +1246,9 @@ fn sys_socket_listen_accept_round_trips_through_kernel() {
     // Accept (blocks until the dialer connects).
     let mut acc_req = listener_handle.to_le_bytes().to_vec();
     acc_req.extend_from_slice(&0_u32.to_le_bytes()); // flags=0 (blocking)
-    let conn = mk.syscall(METHOD_SYS_SOCKET_ACCEPT, &acc_req, &mut []).unwrap();
+    let conn = mk
+        .syscall(METHOD_SYS_SOCKET_ACCEPT, &acc_req, &mut [])
+        .unwrap();
     assert!(conn >= 0, "accept failed: {conn}");
     let conn_handle = conn as i32;
 
@@ -1240,8 +1269,12 @@ fn sys_socket_listen_accept_round_trips_through_kernel() {
         0,
     );
     assert_eq!(
-        mk.syscall(METHOD_SYS_SOCKET_CLOSE, &listener_handle.to_le_bytes(), &mut [])
-            .unwrap(),
+        mk.syscall(
+            METHOD_SYS_SOCKET_CLOSE,
+            &listener_handle.to_le_bytes(),
+            &mut []
+        )
+        .unwrap(),
         0,
     );
 }
@@ -1285,8 +1318,10 @@ fn sys_socket_connect_send_recv_through_local_echo_server() {
     });
 
     build_kernel_wasm().unwrap();
-    let mut host = HostState::default();
-    host.tcp = Some(Arc::new(NativeTcpSocket::new()));
+    let host = HostState {
+        tcp: Some(Arc::new(NativeTcpSocket::new())),
+        ..Default::default()
+    };
     let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
 
     // sys_socket_connect request: u8 family + u8 sock_type + u16
@@ -1304,14 +1339,18 @@ fn sys_socket_connect_send_recv_through_local_echo_server() {
     let payload = b"hello tcp";
     let mut send_req = (handle as i32).to_le_bytes().to_vec();
     send_req.extend_from_slice(payload);
-    let n = mk.syscall(METHOD_SYS_SOCKET_SEND, &send_req, &mut []).unwrap();
+    let n = mk
+        .syscall(METHOD_SYS_SOCKET_SEND, &send_req, &mut [])
+        .unwrap();
     assert_eq!(n as usize, payload.len());
 
     // Receive it back.
     let mut recv_req = (handle as i32).to_le_bytes().to_vec();
     recv_req.extend_from_slice(&0_u32.to_le_bytes()); // flags=0 (blocking)
     let mut buf = vec![0u8; 64];
-    let n = mk.syscall(METHOD_SYS_SOCKET_RECV, &recv_req, &mut buf).unwrap();
+    let n = mk
+        .syscall(METHOD_SYS_SOCKET_RECV, &recv_req, &mut buf)
+        .unwrap();
     assert!(n > 0, "recv failed: {n}");
     assert_eq!(&buf[..n as usize], payload);
 
@@ -1341,7 +1380,9 @@ fn sys_socket_connect_denied_by_policy_returns_eacces() {
     let mut req: Vec<u8> = vec![2, 1, 0, 0];
     req.extend_from_slice(&0_u32.to_le_bytes());
     req.extend_from_slice(b"127.0.0.1:1");
-    let rc = mk.syscall(METHOD_SYS_SOCKET_CONNECT, &req, &mut []).unwrap();
+    let rc = mk
+        .syscall(METHOD_SYS_SOCKET_CONNECT, &req, &mut [])
+        .unwrap();
     assert_eq!(rc, -13, "deny → -EACCES, got {rc}");
 }
 
@@ -1367,9 +1408,7 @@ async fn sys_fetch_round_trips_through_kh_fetch_blocking() {
     });
     let req_bytes = req.to_string().into_bytes();
     let mut resp = vec![0u8; 8 * 1024];
-    let n = mk
-        .syscall(METHOD_SYS_FETCH, &req_bytes, &mut resp)
-        .unwrap();
+    let n = mk.syscall(METHOD_SYS_FETCH, &req_bytes, &mut resp).unwrap();
     assert!(n > 0, "sys_fetch returned {n}");
     let body = std::str::from_utf8(&resp[..n as usize]).unwrap();
     let v: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -1917,7 +1956,11 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
         ("sys_unlink", METHOD_SYS_UNLINK, METHOD_SYS_UNLINK as i64),
         ("sys_stat", METHOD_SYS_STAT, METHOD_SYS_STAT as i64),
         ("sys_symlink", METHOD_SYS_SYMLINK, METHOD_SYS_SYMLINK as i64),
-        ("sys_readlink", METHOD_SYS_READLINK, METHOD_SYS_READLINK as i64),
+        (
+            "sys_readlink",
+            METHOD_SYS_READLINK,
+            METHOD_SYS_READLINK as i64,
+        ),
         ("sys_mkdir", METHOD_SYS_MKDIR, METHOD_SYS_MKDIR as i64),
         ("sys_rmdir", METHOD_SYS_RMDIR, METHOD_SYS_RMDIR as i64),
         ("sys_readdir", METHOD_SYS_READDIR, METHOD_SYS_READDIR as i64),
@@ -2069,7 +2112,9 @@ fn sched_yield_and_nanosleep_round_trip_through_trampoline() {
     let rc = mk.syscall(METHOD_SYS_NANOSLEEP, &req, &mut []).unwrap();
     assert_eq!(rc, 0);
     // Short request → -EINVAL.
-    let rc = mk.syscall(METHOD_SYS_NANOSLEEP, &[1, 2, 3], &mut []).unwrap();
+    let rc = mk
+        .syscall(METHOD_SYS_NANOSLEEP, &[1, 2, 3], &mut [])
+        .unwrap();
     assert_eq!(rc, -22);
 }
 
@@ -2078,7 +2123,8 @@ fn ramfs_open_then_read_round_trips_content_through_trampoline() {
     // End-to-end: microkernel → kernel_register_file → kernel.wasm
     // ramfs → microkernel.syscall(SYS_OPEN, …) → fd → SYS_READ.
     let mk = fresh_microkernel(0);
-    mk.register_ramfs_file(b"/etc/motd", b"hello ramfs\n").unwrap();
+    mk.register_ramfs_file(b"/etc/motd", b"hello ramfs\n")
+        .unwrap();
 
     // Open the file as KERNEL_PID. Returns fd 0 (kernel pid has no
     // pre-installed stdio because direct syscalls aren't a real

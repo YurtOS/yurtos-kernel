@@ -13,8 +13,15 @@
 
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
-import { defaultHostState, METHOD, Microkernel } from "../../microkernel-js/mod.ts";
-import { buildWasmKernelImports } from "../wasm-kernel-imports.ts";
+import {
+  defaultHostState,
+  METHOD,
+  Microkernel,
+} from "../../microkernel-js/mod.ts";
+import {
+  buildWasmKernelImports,
+  HOST_BINDINGS,
+} from "../wasm-kernel-imports.ts";
 
 const KERNEL_WASM = new URL(
   "../../../target/wasm32-wasip1/release/yurt_kernel_wasm.wasm",
@@ -34,6 +41,23 @@ async function freshMk(): Promise<Microkernel> {
 }
 
 describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
+  it("covers the legacy socket host import names that have Rust syscalls", () => {
+    const names = new Set(HOST_BINDINGS.map((b) => b.name));
+    for (
+      const name of [
+        "host_socket_connect",
+        "host_socket_listen",
+        "host_socket_accept",
+        "host_socket_addr",
+        "host_socket_send",
+        "host_socket_recv",
+        "host_socket_close",
+      ]
+    ) {
+      expect(names.has(name)).toEqual(true);
+    }
+  });
+
   it("scalar-zero-arg: host_getuid → sys_getuid via factory", async () => {
     if (!HAS_JSPI) return;
     const mk = await freshMk();

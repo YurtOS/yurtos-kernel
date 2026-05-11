@@ -170,7 +170,8 @@ fn cat_ramfs_fixture_reads_through_wasi_path_open() {
     ensure_fixture_built("cat-ramfs-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("cat-ramfs-wasm")).unwrap();
     let mk = fresh_microkernel();
-    mk.register_ramfs_file(b"/etc/motd", b"hello ramfs\n").unwrap();
+    mk.register_ramfs_file(b"/etc/motd", b"hello ramfs\n")
+        .unwrap();
     let argv: Vec<&[u8]> = vec![b"cat-ramfs"];
     let mut user = mk.spawn_user_process_with_args(&wasm_bytes, &argv).unwrap();
     let _ = user.run_start(); // proc_exit traps; that's fine

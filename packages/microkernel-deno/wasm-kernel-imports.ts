@@ -132,11 +132,23 @@ export const HOST_BINDINGS: HostBinding[] = [
 
   // Single-scalar args returning a scalar.
   { name: "host_umask", method: METHOD.SYS_UMASK, args: ["scalar"] },
-  { name: "host_setresuid", method: METHOD.SYS_SETRESUID, args: ["scalar", "scalar", "scalar"] },
-  { name: "host_setresgid", method: METHOD.SYS_SETRESGID, args: ["scalar", "scalar", "scalar"] },
+  {
+    name: "host_setresuid",
+    method: METHOD.SYS_SETRESUID,
+    args: ["scalar", "scalar", "scalar"],
+  },
+  {
+    name: "host_setresgid",
+    method: METHOD.SYS_SETRESGID,
+    args: ["scalar", "scalar", "scalar"],
+  },
   { name: "host_kill", method: METHOD.SYS_KILL, args: ["scalar", "scalar"] },
   { name: "host_getpgid", method: METHOD.SYS_GETPGID, args: ["scalar"] },
-  { name: "host_setpgid", method: METHOD.SYS_SETPGID, args: ["scalar", "scalar"] },
+  {
+    name: "host_setpgid",
+    method: METHOD.SYS_SETPGID,
+    args: ["scalar", "scalar"],
+  },
   { name: "host_getsid", method: METHOD.SYS_GETSID, args: ["scalar"] },
   { name: "host_setsid", method: METHOD.SYS_SETSID, args: [] },
   { name: "host_isatty", method: METHOD.SYS_ISATTY, args: ["scalar"] },
@@ -180,12 +192,6 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["out_cap"],
     returnsBytes: true,
   },
-  // host_dup(fd, outPtr, outCap) — TS shape writes the new fd
-  // into outPtr; our sys_dup returns the new fd as rc. The
-  // mapping needs an arg-spec variant that writes the rc back
-  // into user memory ("rc_to_out"). Left out of the table
-  // until that variant lands.
-
   // ── Resource limits ───────────────────────────────────────
   // host_getrlimit(resource, outPtr) — rlimit record is 16 bytes
   // (u64 soft + u64 hard) on the Rust side.
@@ -333,6 +339,36 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["ptr_len", "out_cap"],
     returnsBytes: true,
   },
+  // host_socket_connect(reqPtr, reqLen, outPtr, outCap) → handle / -errno.
+  // SYS_SOCKET_CONNECT accepts the native socket request bytes and
+  // returns the host socket handle directly.
+  {
+    name: "host_socket_connect",
+    method: METHOD.SYS_SOCKET_CONNECT,
+    args: ["ptr_len", "out_cap"],
+  },
+  // host_socket_listen(reqPtr, reqLen, outPtr, outCap) → handle / -errno.
+  // SYS_SOCKET_LISTEN accepts u32 backlog + "host:port" bytes.
+  {
+    name: "host_socket_listen",
+    method: METHOD.SYS_SOCKET_LISTEN,
+    args: ["ptr_len", "out_cap"],
+  },
+  // host_socket_accept(reqPtr, reqLen, outPtr, outCap) → handle / -errno.
+  // SYS_SOCKET_ACCEPT accepts u32 handle + u32 flags.
+  {
+    name: "host_socket_accept",
+    method: METHOD.SYS_SOCKET_ACCEPT,
+    args: ["ptr_len", "out_cap"],
+  },
+  // host_socket_addr(reqPtr, reqLen, outPtr, outCap) → bytes.
+  // SYS_SOCKET_ADDR accepts u32 handle and writes the packed address record.
+  {
+    name: "host_socket_addr",
+    method: METHOD.SYS_SOCKET_ADDR,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
   // host_socket_send(reqPtr, reqLen, outPtr, outCap) → bytes.
   // SYS_SOCKET_SEND accepts (u32 handle + payload bytes) and
   // returns the number of bytes accepted; nothing written back.
@@ -391,36 +427,36 @@ export const HOST_BINDINGS: HostBinding[] = [
     method: METHOD.SYS_OPEN, // first hop; documentation only
     args: [],
     custom: (mk, memBuf) =>
-      async (
-        pathPtr: number,
-        pathLen: number,
-        outPtr: number,
-        outCap: number,
-      ): Promise<number> => {
-        const path = new Uint8Array(memBuf(), pathPtr, pathLen).slice();
-        const openReq = new Uint8Array(4 + path.length);
-        // flags=0 → read-only.
-        openReq.set(path, 4);
-        const openOut = await mk.syscallAsync(METHOD.SYS_OPEN, openReq, 0);
-        const fd = Number(openOut.rc);
-        if (fd < 0) return fd;
-        try {
-          const readReq = new Uint8Array(4);
-          new DataView(readReq.buffer).setUint32(0, fd, true);
-          const readOut = await mk.syscallAsync(METHOD.SYS_READ, readReq, outCap);
-          const n = Number(readOut.rc);
-          if (n > 0) {
-            new Uint8Array(memBuf(), outPtr, n).set(
-              readOut.response.subarray(0, n),
-            );
-          }
-          return n;
-        } finally {
-          const closeReq = new Uint8Array(4);
-          new DataView(closeReq.buffer).setUint32(0, fd, true);
-          await mk.syscallAsync(METHOD.SYS_CLOSE, closeReq, 0);
+    async (
+      pathPtr: number,
+      pathLen: number,
+      outPtr: number,
+      outCap: number,
+    ): Promise<number> => {
+      const path = new Uint8Array(memBuf(), pathPtr, pathLen).slice();
+      const openReq = new Uint8Array(4 + path.length);
+      // flags=0 → read-only.
+      openReq.set(path, 4);
+      const openOut = await mk.syscallAsync(METHOD.SYS_OPEN, openReq, 0);
+      const fd = Number(openOut.rc);
+      if (fd < 0) return fd;
+      try {
+        const readReq = new Uint8Array(4);
+        new DataView(readReq.buffer).setUint32(0, fd, true);
+        const readOut = await mk.syscallAsync(METHOD.SYS_READ, readReq, outCap);
+        const n = Number(readOut.rc);
+        if (n > 0) {
+          new Uint8Array(memBuf(), outPtr, n).set(
+            readOut.response.subarray(0, n),
+          );
         }
-      },
+        return n;
+      } finally {
+        const closeReq = new Uint8Array(4);
+        new DataView(closeReq.buffer).setUint32(0, fd, true);
+        await mk.syscallAsync(METHOD.SYS_CLOSE, closeReq, 0);
+      }
+    },
   },
 
   // host_write_file(pathPtr, pathLen, dataPtr, dataLen, mode) → bytes.
@@ -432,55 +468,54 @@ export const HOST_BINDINGS: HostBinding[] = [
     method: METHOD.SYS_OPEN,
     args: [],
     custom: (mk, memBuf) =>
-      async (
-        pathPtr: number,
-        pathLen: number,
-        dataPtr: number,
-        dataLen: number,
-        mode: number,
-      ): Promise<number> => {
-        const path = new Uint8Array(memBuf(), pathPtr, pathLen).slice();
-        // mode 0 = overwrite (truncate); mode 1 = append.
-        const flags = mode === 1 ? 0b011 : 0b111; // W|C [|T]
-        const openReq = new Uint8Array(4 + path.length);
-        new DataView(openReq.buffer).setUint32(0, flags, true);
-        openReq.set(path, 4);
-        const openOut = await mk.syscallAsync(METHOD.SYS_OPEN, openReq, 0);
-        const fd = Number(openOut.rc);
-        if (fd < 0) return fd;
-        try {
-          if (mode === 1) {
-            // Seek to end. Request: u32 fd + i64 offset (0) + u32
-            // whence (SEEK_END=2). Response: 8-byte new offset.
-            const lseekReq = new Uint8Array(16);
-            const lv = new DataView(lseekReq.buffer);
-            lv.setUint32(0, fd, true);
-            lv.setBigInt64(4, 0n, true);
-            lv.setUint32(12, 2, true);
-            await mk.syscallAsync(METHOD.SYS_LSEEK, lseekReq, 8);
-          }
-          const data = new Uint8Array(memBuf(), dataPtr, dataLen).slice();
-          const writeReq = new Uint8Array(4 + data.length);
-          new DataView(writeReq.buffer).setUint32(0, fd, true);
-          writeReq.set(data, 4);
-          const writeOut = await mk.syscallAsync(METHOD.SYS_WRITE, writeReq, 0);
-          return Number(writeOut.rc);
-        } finally {
-          const closeReq = new Uint8Array(4);
-          new DataView(closeReq.buffer).setUint32(0, fd, true);
-          await mk.syscallAsync(METHOD.SYS_CLOSE, closeReq, 0);
+    async (
+      pathPtr: number,
+      pathLen: number,
+      dataPtr: number,
+      dataLen: number,
+      mode: number,
+    ): Promise<number> => {
+      const path = new Uint8Array(memBuf(), pathPtr, pathLen).slice();
+      // mode 0 = overwrite (truncate); mode 1 = append.
+      const flags = mode === 1 ? 0b011 : 0b111; // W|C [|T]
+      const openReq = new Uint8Array(4 + path.length);
+      new DataView(openReq.buffer).setUint32(0, flags, true);
+      openReq.set(path, 4);
+      const openOut = await mk.syscallAsync(METHOD.SYS_OPEN, openReq, 0);
+      const fd = Number(openOut.rc);
+      if (fd < 0) return fd;
+      try {
+        if (mode === 1) {
+          // Seek to end. Request: u32 fd + i64 offset (0) + u32
+          // whence (SEEK_END=2). Response: 8-byte new offset.
+          const lseekReq = new Uint8Array(16);
+          const lv = new DataView(lseekReq.buffer);
+          lv.setUint32(0, fd, true);
+          lv.setBigInt64(4, 0n, true);
+          lv.setUint32(12, 2, true);
+          await mk.syscallAsync(METHOD.SYS_LSEEK, lseekReq, 8);
         }
-      },
+        const data = new Uint8Array(memBuf(), dataPtr, dataLen).slice();
+        const writeReq = new Uint8Array(4 + data.length);
+        new DataView(writeReq.buffer).setUint32(0, fd, true);
+        writeReq.set(data, 4);
+        const writeOut = await mk.syscallAsync(METHOD.SYS_WRITE, writeReq, 0);
+        return Number(writeOut.rc);
+      } finally {
+        const closeReq = new Uint8Array(4);
+        new DataView(closeReq.buffer).setUint32(0, fd, true);
+        await mk.syscallAsync(METHOD.SYS_CLOSE, closeReq, 0);
+      }
+    },
   },
-
   // ── Signals ───────────────────────────────────────────────
   // sigaction(sig, actPtr, actLen) — TS host_sigaction shape.
   // Not in our common test path; left to a future expansion.
 
   // ── Clock ─────────────────────────────────────────────────
   // host_clock_gettime(clockId, outPtr) → 8 bytes (u64 ns)
-  // Existing TS signature is (clockId, outPtr) without a cap. Same
-  // fixed_out issue as host_getrlimit; defer.
+  // Existing TS signature is (clockId, outPtr) without a cap;
+  // the fixed_out arg spec supplies the 8-byte response capacity.
 ];
 
 /**
@@ -500,7 +535,9 @@ export function buildWasmKernelImports(
 ): Record<string, (...args: number[]) => Promise<number>> {
   const imports: Record<string, (...args: number[]) => Promise<number>> = {};
   for (const b of HOST_BINDINGS) {
-    imports[b.name] = b.custom ? b.custom(mk, memBuf) : makeWrapper(b, mk, memBuf);
+    imports[b.name] = b.custom
+      ? b.custom(mk, memBuf)
+      : makeWrapper(b, mk, memBuf);
   }
   return imports;
 }
@@ -514,9 +551,7 @@ function makeWrapper(
     // Apply optional argument permutation. The reordered view is
     // what the spec walker consumes; the original `args` is the
     // shape bash (or any TS-host-shaped caller) passes.
-    const ordered = b.argOrder
-      ? b.argOrder.map((i) => args[i])
-      : args;
+    const ordered = b.argOrder ? b.argOrder.map((i) => args[i]) : args;
     const reqParts: Uint8Array[] = [];
     let outPtr = 0;
     let outCap = 0;

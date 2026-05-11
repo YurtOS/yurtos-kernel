@@ -36,9 +36,9 @@ import {
   WASI_EMFILE,
   WASI_ENOENT,
   WASI_ENOSYS,
-  WASI_ENXIO,
   WASI_ENOTSOCK,
   WASI_ENOTSUP,
+  WASI_ENXIO,
   WASI_EPIPE,
   WASI_ESUCCESS,
   WASI_EVENTRWFLAGS_FD_READWRITE_HANGUP,
@@ -452,7 +452,11 @@ export class WasiHost {
       if (oldIoTarget) closeFdTarget(oldIoTarget);
       this.ioFds.delete(dstFd);
       this.fdTable.dupToShared(srcFd, dstFd);
-      return createVfsFileTarget(this.fdTable, dstFd);
+      const vfsTarget = createVfsFileTarget(this.fdTable, dstFd);
+      if (this.kernel && this.pid !== undefined) {
+        this.kernel.setFdTarget(this.pid, dstFd, vfsTarget);
+      }
+      return vfsTarget;
     }
 
     const dirPath = this.dirFds.get(srcFd);

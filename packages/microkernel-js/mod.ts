@@ -48,6 +48,67 @@
 import { buildSysImports } from "./sys_shim.ts";
 import { buildWasiShim } from "./wasi_shim.ts";
 
+interface FileSystemWritableFileStream {
+  truncate(size: number): Promise<void>;
+  write(
+    chunk: Uint8Array | { type: "write"; position: number; data: Uint8Array },
+  ): Promise<void>;
+  close(): Promise<void>;
+}
+
+interface FileSystemFileHandle {
+  getFile(): Promise<File>;
+  createWritable(
+    options?: { keepExistingData?: boolean },
+  ): Promise<FileSystemWritableFileStream>;
+}
+
+interface FileSystemDirectoryHandle {
+  getDirectoryHandle(
+    name: string,
+    options?: { create?: boolean },
+  ): Promise<FileSystemDirectoryHandle>;
+  getFileHandle(
+    name: string,
+    options?: { create?: boolean },
+  ): Promise<FileSystemFileHandle>;
+  removeEntry(name: string): Promise<void>;
+}
+
+interface IDBRequest<T> {
+  result: T;
+  error: unknown;
+  onsuccess: (() => void) | null;
+  onerror: (() => void) | null;
+}
+
+interface IDBOpenDBRequest extends IDBRequest<IDBDatabase> {
+  onupgradeneeded: (() => void) | null;
+}
+
+interface IDBObjectStore {
+  get(key: Uint8Array): IDBRequest<Uint8Array | undefined>;
+  put(value: Uint8Array, key: Uint8Array): IDBRequest<unknown>;
+  delete(key: Uint8Array): IDBRequest<unknown>;
+  getAllKeys(): IDBRequest<Uint8Array[]>;
+}
+
+interface IDBTransaction {
+  objectStore(name: string): IDBObjectStore;
+}
+
+interface IDBDatabase {
+  objectStoreNames: { contains(name: string): boolean };
+  version: number;
+  close(): void;
+  createObjectStore(name: string): void;
+  transaction(name: string, mode: "readonly" | "readwrite"): IDBTransaction;
+}
+
+interface IDBFactory {
+  open(name: string, version?: number): IDBOpenDBRequest;
+}
+
 // ── Method IDs (must match abi/contract/yurt_abi_methods.toml) ────────────
 
 export const METHOD = {
@@ -236,7 +297,11 @@ export interface KvBackend {
    * the sync variants run.
    */
   getAsync?(store: Uint8Array, key: Uint8Array): Promise<Uint8Array | number>;
-  putAsync?(store: Uint8Array, key: Uint8Array, value: Uint8Array): Promise<number>;
+  putAsync?(
+    store: Uint8Array,
+    key: Uint8Array,
+    value: Uint8Array,
+  ): Promise<number>;
   deleteAsync?(store: Uint8Array, key: Uint8Array): Promise<number>;
   listAsync?(store: Uint8Array, prefix: Uint8Array): Promise<Uint8Array[]>;
 }
@@ -585,21 +650,20 @@ export interface AsyncBridge {
  */
 export const noopAsyncBridge: AsyncBridge = {
   capabilities() {
-    return { jspi: false, asyncify: false, stackSwitching: false, threads: false };
+    return {
+      jspi: false,
+      asyncify: false,
+      stackSwitching: false,
+      threads: false,
+    };
   },
   suspendUntil() {
     throw new Error("NOT_SUSPENDABLE");
   },
 };
 
-/**
- * Asyncify state values as exposed by the binaryen --asyncify
- * pass. The wasm module exports `asyncify_get_state()` returning
- * one of these.
- */
-const ASYNCIFY_NORMAL = 0;
+// Asyncify state value exposed by the binaryen --asyncify pass.
 const ASYNCIFY_UNWINDING = 1;
-const ASYNCIFY_REWINDING = 2;
 
 /**
  * Asyncify-instrumented dispatch wrapper. Drives the
@@ -642,14 +706,16 @@ function maybeWrapWithAsyncify(
   ) => bigint,
   pendingResults: Map<string, unknown>,
 ): {
-  asyncDispatch: ((
-    methodId: number,
-    callerPid: number,
-    inPtr: number,
-    inLen: number,
-    outPtr: number,
-    outCap: number,
-  ) => Promise<bigint>) | null;
+  asyncDispatch:
+    | ((
+      methodId: number,
+      callerPid: number,
+      inPtr: number,
+      inLen: number,
+      outPtr: number,
+      outCap: number,
+    ) => Promise<bigint>)
+    | null;
   enabled: boolean;
 } {
   const exports = instance.exports as Record<string, unknown>;
@@ -791,17 +857,22 @@ export class KernelInstance {
      * `bigint`; routes through the same scratch buffer. Used by
      * `syscallAsync`.
      */
-    readonly dispatchAsync: ((
-      methodId: number,
-      callerPid: number,
-      inPtr: number,
-      inLen: number,
-      outPtr: number,
-      outCap: number,
-    ) => Promise<bigint>) | null = null,
+    readonly dispatchAsync:
+      | ((
+        methodId: number,
+        callerPid: number,
+        inPtr: number,
+        inLen: number,
+        outPtr: number,
+        outCap: number,
+      ) => Promise<bigint>)
+      | null = null,
   ) {}
 
-  private stage(request: Uint8Array, responseCap: number): { inPtr: number; inLen: number; outPtr: number } {
+  private stage(
+    request: Uint8Array,
+    responseCap: number,
+  ): { inPtr: number; inLen: number; outPtr: number } {
     if (request.byteLength + responseCap > this.scratchLen) {
       throw new Error(
         `request+response (${
@@ -832,7 +903,14 @@ export class KernelInstance {
     responseCap: number,
   ): { rc: bigint; response: Uint8Array } {
     const { inPtr, inLen, outPtr } = this.stage(request, responseCap);
-    const rc = this.dispatch(methodId, callerPid, inPtr, inLen, outPtr, responseCap);
+    const rc = this.dispatch(
+      methodId,
+      callerPid,
+      inPtr,
+      inLen,
+      outPtr,
+      responseCap,
+    );
     return { rc, response: this.collectResponse(outPtr, responseCap) };
   }
 
@@ -1001,7 +1079,8 @@ export class Microkernel {
       ): number => {
         const fs = hostBox.state.hostFs;
         if (!fs) return -EACCES;
-        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen)
+          .slice();
         return fs.open(path, flags);
       },
       kh_real_read: (fd: number, outPtr: number, len: number): bigint => {
@@ -1010,14 +1089,17 @@ export class Microkernel {
         const buf = new Uint8Array(len);
         const n = fs.read(fd, buf);
         if (n > 0) {
-          new Uint8Array(memoryRef.memory!.buffer, outPtr, n).set(buf.subarray(0, n));
+          new Uint8Array(memoryRef.memory!.buffer, outPtr, n).set(
+            buf.subarray(0, n),
+          );
         }
         return BigInt(n);
       },
       kh_real_write: (fd: number, dataPtr: number, dataLen: number): bigint => {
         const fs = hostBox.state.hostFs;
         if (!fs) return BigInt(-EBADF);
-        const data = new Uint8Array(memoryRef.memory!.buffer, dataPtr, dataLen).slice();
+        const data = new Uint8Array(memoryRef.memory!.buffer, dataPtr, dataLen)
+          .slice();
         return BigInt(fs.write(fd, data));
       },
       kh_real_close: (fd: number): number => {
@@ -1034,7 +1116,8 @@ export class Microkernel {
         const fs = hostBox.state.hostFs;
         if (!fs) return BigInt(-EACCES);
         if (outCap < 32) return BigInt(-22);
-        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen)
+          .slice();
         const stat = fs.stat(path);
         if (typeof stat === "number") return BigInt(stat);
         // kh_stat_v1: u16 ver + u16 pad + u32 mode + u64 size + u64 mtime + u8 isDir + u8 isSym + u8[6] reserved.
@@ -1052,7 +1135,8 @@ export class Microkernel {
       kh_real_unlink: (pathPtr: number, pathLen: number): number => {
         const fs = hostBox.state.hostFs;
         if (!fs) return -EACCES;
-        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen)
+          .slice();
         return fs.unlink(path);
       },
       kh_real_mkdir: (
@@ -1062,7 +1146,8 @@ export class Microkernel {
       ): number => {
         const fs = hostBox.state.hostFs;
         if (!fs) return -EACCES;
-        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+        const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen)
+          .slice();
         return fs.mkdir(path, mode);
       },
       kh_real_symlink: (
@@ -1073,8 +1158,13 @@ export class Microkernel {
       ): number => {
         const fs = hostBox.state.hostFs;
         if (!fs) return -EACCES;
-        const target = new Uint8Array(memoryRef.memory!.buffer, targetPtr, targetLen).slice();
-        const link = new Uint8Array(memoryRef.memory!.buffer, linkPtr, linkLen).slice();
+        const target = new Uint8Array(
+          memoryRef.memory!.buffer,
+          targetPtr,
+          targetLen,
+        ).slice();
+        const link = new Uint8Array(memoryRef.memory!.buffer, linkPtr, linkLen)
+          .slice();
         return fs.symlink(target, link);
       },
       kh_real_rename: (
@@ -1085,8 +1175,10 @@ export class Microkernel {
       ): number => {
         const fs = hostBox.state.hostFs;
         if (!fs) return -EACCES;
-        const oldP = new Uint8Array(memoryRef.memory!.buffer, oldPtr, oldLen).slice();
-        const newP = new Uint8Array(memoryRef.memory!.buffer, newPtr, newLen).slice();
+        const oldP = new Uint8Array(memoryRef.memory!.buffer, oldPtr, oldLen)
+          .slice();
+        const newP = new Uint8Array(memoryRef.memory!.buffer, newPtr, newLen)
+          .slice();
         return fs.rename(oldP, newP);
       },
       // Outbound HTTP. When the host supports JSPI AND
@@ -1118,7 +1210,9 @@ export class Microkernel {
         const host = addr.slice(0, colon);
         const port = parseInt(addr.slice(colon + 1), 10);
         if (!Number.isFinite(port)) return -22;
-        if (hostBox.state.policy.mayConnect?.(host, port) === "deny") return -EACCES;
+        if (hostBox.state.policy.mayConnect?.(host, port) === "deny") {
+          return -EACCES;
+        }
         return tcp.connect(host, port, flags);
       },
       kh_socket_send: (
@@ -1128,7 +1222,8 @@ export class Microkernel {
       ): bigint => {
         const tcp = hostBox.state.tcp;
         if (!tcp) return BigInt(-EBADF);
-        const data = new Uint8Array(memoryRef.memory!.buffer, dataPtr, dataLen).slice();
+        const data = new Uint8Array(memoryRef.memory!.buffer, dataPtr, dataLen)
+          .slice();
         return BigInt(tcp.send(handle, data));
       },
       kh_socket_recv: (
@@ -1142,7 +1237,9 @@ export class Microkernel {
         const buf = new Uint8Array(len);
         const n = tcp.recv(handle, buf, flags);
         if (n > 0) {
-          new Uint8Array(memoryRef.memory!.buffer, outPtr, n).set(buf.subarray(0, n));
+          new Uint8Array(memoryRef.memory!.buffer, outPtr, n).set(
+            buf.subarray(0, n),
+          );
         }
         return BigInt(n);
       },
@@ -1209,8 +1306,13 @@ export class Microkernel {
       ): bigint => {
         const kv = hostBox.state.kv;
         if (!kv) return BigInt(-EACCES);
-        const store = new Uint8Array(memoryRef.memory!.buffer, storePtr, storeLen).slice();
-        const key = new Uint8Array(memoryRef.memory!.buffer, keyPtr, keyLen).slice();
+        const store = new Uint8Array(
+          memoryRef.memory!.buffer,
+          storePtr,
+          storeLen,
+        ).slice();
+        const key = new Uint8Array(memoryRef.memory!.buffer, keyPtr, keyLen)
+          .slice();
         if (
           hostBox.state.policy.mayIdb?.(store, false) === "deny"
         ) return BigInt(-EACCES);
@@ -1230,10 +1332,21 @@ export class Microkernel {
       ): number => {
         const kv = hostBox.state.kv;
         if (!kv) return -EACCES;
-        const store = new Uint8Array(memoryRef.memory!.buffer, storePtr, storeLen).slice();
-        const key = new Uint8Array(memoryRef.memory!.buffer, keyPtr, keyLen).slice();
-        const value = new Uint8Array(memoryRef.memory!.buffer, valuePtr, valueLen).slice();
-        if (hostBox.state.policy.mayIdb?.(store, true) === "deny") return -EACCES;
+        const store = new Uint8Array(
+          memoryRef.memory!.buffer,
+          storePtr,
+          storeLen,
+        ).slice();
+        const key = new Uint8Array(memoryRef.memory!.buffer, keyPtr, keyLen)
+          .slice();
+        const value = new Uint8Array(
+          memoryRef.memory!.buffer,
+          valuePtr,
+          valueLen,
+        ).slice();
+        if (hostBox.state.policy.mayIdb?.(store, true) === "deny") {
+          return -EACCES;
+        }
         return kv.put(store, key, value);
       },
       kh_idb_delete: (
@@ -1244,9 +1357,16 @@ export class Microkernel {
       ): number => {
         const kv = hostBox.state.kv;
         if (!kv) return -EACCES;
-        const store = new Uint8Array(memoryRef.memory!.buffer, storePtr, storeLen).slice();
-        const key = new Uint8Array(memoryRef.memory!.buffer, keyPtr, keyLen).slice();
-        if (hostBox.state.policy.mayIdb?.(store, true) === "deny") return -EACCES;
+        const store = new Uint8Array(
+          memoryRef.memory!.buffer,
+          storePtr,
+          storeLen,
+        ).slice();
+        const key = new Uint8Array(memoryRef.memory!.buffer, keyPtr, keyLen)
+          .slice();
+        if (hostBox.state.policy.mayIdb?.(store, true) === "deny") {
+          return -EACCES;
+        }
         return kv.delete(store, key);
       },
       kh_idb_list: (
@@ -1259,9 +1379,19 @@ export class Microkernel {
       ): bigint => {
         const kv = hostBox.state.kv;
         if (!kv) return BigInt(-EACCES);
-        const store = new Uint8Array(memoryRef.memory!.buffer, storePtr, storeLen).slice();
-        const prefix = new Uint8Array(memoryRef.memory!.buffer, prefixPtr, prefixLen).slice();
-        if (hostBox.state.policy.mayIdb?.(store, false) === "deny") return BigInt(-EACCES);
+        const store = new Uint8Array(
+          memoryRef.memory!.buffer,
+          storePtr,
+          storeLen,
+        ).slice();
+        const prefix = new Uint8Array(
+          memoryRef.memory!.buffer,
+          prefixPtr,
+          prefixLen,
+        ).slice();
+        if (hostBox.state.policy.mayIdb?.(store, false) === "deny") {
+          return BigInt(-EACCES);
+        }
         const keys = kv.list(store, prefix);
         // Pack count + (len, bytes)*.
         let total = 4;
@@ -1468,7 +1598,11 @@ export class Microkernel {
           flags: number,
           _mode: number,
         ): Promise<number> => {
-          const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+          const path = new Uint8Array(
+            memoryRef.memory!.buffer,
+            pathPtr,
+            pathLen,
+          ).slice();
           return await openAsync(path, flags);
         },
       );
@@ -1491,8 +1625,16 @@ export class Microkernel {
     if (wantsAsync && fsAsync?.writeAsync != null) {
       const writeAsync = fsAsync.writeAsync.bind(fsAsync);
       khImports.kh_real_write = new W.Suspending(
-        async (fd: number, dataPtr: number, dataLen: number): Promise<bigint> => {
-          const data = new Uint8Array(memoryRef.memory!.buffer, dataPtr, dataLen).slice();
+        async (
+          fd: number,
+          dataPtr: number,
+          dataLen: number,
+        ): Promise<bigint> => {
+          const data = new Uint8Array(
+            memoryRef.memory!.buffer,
+            dataPtr,
+            dataLen,
+          ).slice();
           return BigInt(await writeAsync(fd, data));
         },
       );
@@ -1513,7 +1655,11 @@ export class Microkernel {
           outCap: number,
         ): Promise<bigint> => {
           if (outCap < 32) return BigInt(-22);
-          const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+          const path = new Uint8Array(
+            memoryRef.memory!.buffer,
+            pathPtr,
+            pathLen,
+          ).slice();
           const stat = await statAsync(path);
           if (typeof stat === "number") return BigInt(stat);
           const buf = new Uint8Array(32);
@@ -1533,7 +1679,11 @@ export class Microkernel {
       const unlinkAsync = fsAsync.unlinkAsync.bind(fsAsync);
       khImports.kh_real_unlink = new W.Suspending(
         async (pathPtr: number, pathLen: number): Promise<number> => {
-          const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+          const path = new Uint8Array(
+            memoryRef.memory!.buffer,
+            pathPtr,
+            pathLen,
+          ).slice();
           return await unlinkAsync(path);
         },
       );
@@ -1541,8 +1691,16 @@ export class Microkernel {
     if (wantsAsync && fsAsync?.mkdirAsync != null) {
       const mkdirAsync = fsAsync.mkdirAsync.bind(fsAsync);
       khImports.kh_real_mkdir = new W.Suspending(
-        async (pathPtr: number, pathLen: number, mode: number): Promise<number> => {
-          const path = new Uint8Array(memoryRef.memory!.buffer, pathPtr, pathLen).slice();
+        async (
+          pathPtr: number,
+          pathLen: number,
+          mode: number,
+        ): Promise<number> => {
+          const path = new Uint8Array(
+            memoryRef.memory!.buffer,
+            pathPtr,
+            pathLen,
+          ).slice();
           return await mkdirAsync(path, mode);
         },
       );
@@ -1556,8 +1714,16 @@ export class Microkernel {
           linkPtr: number,
           linkLen: number,
         ): Promise<number> => {
-          const target = new Uint8Array(memoryRef.memory!.buffer, targetPtr, targetLen).slice();
-          const link = new Uint8Array(memoryRef.memory!.buffer, linkPtr, linkLen).slice();
+          const target = new Uint8Array(
+            memoryRef.memory!.buffer,
+            targetPtr,
+            targetLen,
+          ).slice();
+          const link = new Uint8Array(
+            memoryRef.memory!.buffer,
+            linkPtr,
+            linkLen,
+          ).slice();
           return await symlinkAsync(target, link);
         },
       );
@@ -1571,8 +1737,10 @@ export class Microkernel {
           newPtr: number,
           newLen: number,
         ): Promise<number> => {
-          const oldP = new Uint8Array(memoryRef.memory!.buffer, oldPtr, oldLen).slice();
-          const newP = new Uint8Array(memoryRef.memory!.buffer, newPtr, newLen).slice();
+          const oldP = new Uint8Array(memoryRef.memory!.buffer, oldPtr, oldLen)
+            .slice();
+          const newP = new Uint8Array(memoryRef.memory!.buffer, newPtr, newLen)
+            .slice();
           return await renameAsync(oldP, newP);
         },
       );
@@ -1706,14 +1874,16 @@ export class Microkernel {
 
     // promising-wrap returns a function that returns Promise<i64>;
     // the underlying call may suspend via any Suspending import.
-    let dispatchAsync: ((
-      methodId: number,
-      callerPid: number,
-      inPtr: number,
-      inLen: number,
-      outPtr: number,
-      outCap: number,
-    ) => Promise<bigint>) | null = null;
+    let dispatchAsync:
+      | ((
+        methodId: number,
+        callerPid: number,
+        inPtr: number,
+        inLen: number,
+        outPtr: number,
+        outCap: number,
+      ) => Promise<bigint>)
+      | null = null;
     if (wantsAsync) {
       dispatchAsync = W.promising(dispatch) as (
         methodId: number,
@@ -1728,7 +1898,11 @@ export class Microkernel {
       // the universal fallback. Only kicks in when kernel.wasm was
       // built with `wasm-opt --asyncify`; otherwise dormant.
       const pendingResults = new Map<string, unknown>();
-      const asyncify = maybeWrapWithAsyncify(instance, dispatch, pendingResults);
+      const asyncify = maybeWrapWithAsyncify(
+        instance,
+        dispatch,
+        pendingResults,
+      );
       if (asyncify.enabled) {
         dispatchAsync = asyncify.asyncDispatch;
       }
@@ -1957,22 +2131,36 @@ export class WebSocketTcp implements TcpSocketImpl {
 
   constructor(
     /** Override to map `host:port` to a ws:// or wss:// URL. */
-    private urlForAddr: (host: string, port: number) => string =
-      (h, p) => `ws://${h}:${p}/`,
+    private urlForAddr: (host: string, port: number) => string = (h, p) =>
+      `ws://${h}:${p}/`,
   ) {}
 
   // Sync stubs.
-  connect(): number { return -38; }
-  send(): number { return -38; }
-  recv(): number { return -38; }
-  listen(): number { return -38; }
-  accept(): number { return -38; }
-  localAddr(): { host: string; port: number } | null { return null; }
+  connect(): number {
+    return -38;
+  }
+  send(): number {
+    return -38;
+  }
+  recv(): number {
+    return -38;
+  }
+  listen(): number {
+    return -38;
+  }
+  accept(): number {
+    return -38;
+  }
+  localAddr(): { host: string; port: number } | null {
+    return null;
+  }
 
   close(handle: number): number {
     const ws = this.sockets.get(handle);
     if (ws) {
-      try { ws.close(); } catch { /* */ }
+      try {
+        ws.close();
+      } catch { /* */ }
       this.sockets.delete(handle);
     }
     this.inbox.delete(handle);
@@ -2013,7 +2201,7 @@ export class WebSocketTcp implements TcpSocketImpl {
           w(0);
         }
       };
-      ws.onerror = () => { /* surface via close */ };
+      ws.onerror = () => {/* surface via close */};
       ws.onopen = () => {
         this.sockets.set(handle, ws);
         resolve(handle);
@@ -2097,15 +2285,33 @@ export class OpfsHostFs implements HostFsImpl {
   }
 
   // Sync stubs — JSPI takes the *Async path.
-  open(): number { return -38; }
-  read(): number { return -38; }
-  write(): number { return -38; }
-  close(): number { return 0; }
-  stat(): HostFsStat | number { return -38; }
-  unlink(): number { return -38; }
-  mkdir(): number { return -38; }
-  symlink(): number { return -38; }
-  rename(): number { return -38; }
+  open(): number {
+    return -38;
+  }
+  read(): number {
+    return -38;
+  }
+  write(): number {
+    return -38;
+  }
+  close(): number {
+    return 0;
+  }
+  stat(): HostFsStat | number {
+    return -38;
+  }
+  unlink(): number {
+    return -38;
+  }
+  mkdir(): number {
+    return -38;
+  }
+  symlink(): number {
+    return -38;
+  }
+  rename(): number {
+    return -38;
+  }
 
   /**
    * Resolve `path` (kernel-supplied, leading slash optional)
@@ -2193,9 +2399,9 @@ export class OpfsHostFs implements HostFsImpl {
     }
   }
 
-  async closeAsync(fd: number): Promise<number> {
+  closeAsync(fd: number): Promise<number> {
     this.fds.delete(fd);
-    return 0;
+    return Promise.resolve(0);
   }
 
   async statAsync(path: Uint8Array): Promise<HostFsStat | number> {
@@ -2255,8 +2461,11 @@ export class OpfsHostFs implements HostFsImpl {
     }
   }
 
-  async symlinkAsync(_target: Uint8Array, _linkPath: Uint8Array): Promise<number> {
-    return -38; // OPFS doesn't support symlinks
+  symlinkAsync(
+    _target: Uint8Array,
+    _linkPath: Uint8Array,
+  ): Promise<number> {
+    return Promise.resolve(-38); // OPFS doesn't support symlinks
   }
 
   async renameAsync(oldPath: Uint8Array, newPath: Uint8Array): Promise<number> {
@@ -2354,10 +2563,18 @@ export class IndexedDbKv implements KvBackend {
   }
 
   // Sync stubs.
-  get(): Uint8Array | number { return -38; }
-  put(): number { return -38; }
-  delete(): number { return -38; }
-  list(): Uint8Array[] { return []; }
+  get(): Uint8Array | number {
+    return -38;
+  }
+  put(): number {
+    return -38;
+  }
+  delete(): number {
+    return -38;
+  }
+  list(): Uint8Array[] {
+    return [];
+  }
 
   async getAsync(
     store: Uint8Array,

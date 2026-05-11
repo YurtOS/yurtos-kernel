@@ -373,7 +373,7 @@ pub struct RedbKv {
 }
 
 impl RedbKv {
-    pub fn open(path: PathBuf) -> Result<Self, redb::Error> {
+    pub fn open(path: PathBuf) -> Result<Self, Box<redb::DatabaseError>> {
         let db = redb::Database::create(path)?;
         Ok(Self { db })
     }
@@ -395,55 +395,55 @@ impl RedbKv {
 
 impl KvBackend for RedbKv {
     fn get(&self, store: &[u8], key: &[u8]) -> Result<Vec<u8>, i32> {
-        let txn = self.db.begin_read().map_err(|_| -(5 as i32))?;
+        let txn = self.db.begin_read().map_err(|_| -5_i32)?;
         let table = match txn.open_table(Self::table_def(store)) {
             Ok(t) => t,
-            Err(redb::TableError::TableDoesNotExist(_)) => return Err(-(2 as i32)),
-            Err(_) => return Err(-(5 as i32)),
+            Err(redb::TableError::TableDoesNotExist(_)) => return Err(-2_i32),
+            Err(_) => return Err(-5_i32),
         };
         match table.get(key) {
             Ok(Some(v)) => Ok(v.value().to_vec()),
-            Ok(None) => Err(-(2 as i32)),
-            Err(_) => Err(-(5 as i32)),
+            Ok(None) => Err(-2_i32),
+            Err(_) => Err(-5_i32),
         }
     }
 
     fn put(&self, store: &[u8], key: &[u8], value: &[u8]) -> i32 {
         let txn = match self.db.begin_write() {
             Ok(t) => t,
-            Err(_) => return -(5 as i32),
+            Err(_) => return -5_i32,
         };
         {
             let mut table = match txn.open_table(Self::table_def(store)) {
                 Ok(t) => t,
-                Err(_) => return -(5 as i32),
+                Err(_) => return -5_i32,
             };
             if table.insert(key, value).is_err() {
-                return -(5 as i32);
+                return -5_i32;
             }
         }
         match txn.commit() {
             Ok(()) => 0,
-            Err(_) => -(5 as i32),
+            Err(_) => -5_i32,
         }
     }
 
     fn delete(&self, store: &[u8], key: &[u8]) -> i32 {
         let txn = match self.db.begin_write() {
             Ok(t) => t,
-            Err(_) => return -(5 as i32),
+            Err(_) => return -5_i32,
         };
         {
             let mut table = match txn.open_table(Self::table_def(store)) {
                 Ok(t) => t,
                 Err(redb::TableError::TableDoesNotExist(_)) => return 0,
-                Err(_) => return -(5 as i32),
+                Err(_) => return -5_i32,
             };
             let _ = table.remove(key);
         }
         match txn.commit() {
             Ok(()) => 0,
-            Err(_) => -(5 as i32),
+            Err(_) => -5_i32,
         }
     }
 
@@ -477,10 +477,10 @@ impl KvBackend for RedbKv {
 /// browser microkernels point at while IndexedDB wiring is in
 /// flight.
 pub struct InMemoryKv {
-    inner: std::sync::Mutex<
-        std::collections::BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>>,
-    >,
+    inner: std::sync::Mutex<KvMap>,
 }
+
+type KvMap = std::collections::BTreeMap<(Vec<u8>, Vec<u8>), Vec<u8>>;
 
 impl InMemoryKv {
     pub fn new() -> Self {
@@ -503,7 +503,7 @@ impl KvBackend for InMemoryKv {
             .unwrap()
             .get(&(store.to_vec(), key.to_vec()))
             .cloned()
-            .ok_or(-(2 as i32)) // -ENOENT
+            .ok_or(-2_i32) // -ENOENT
     }
 
     fn put(&self, store: &[u8], key: &[u8], value: &[u8]) -> i32 {
@@ -621,9 +621,9 @@ impl TcpSocketImpl for NativeTcpSocket {
         // kernel never sees the IP, just the resulting handle.
         let addrs: Vec<std::net::SocketAddr> = match (host, port).to_socket_addrs() {
             Ok(it) => it.collect(),
-            Err(_) => return -(2 as i32), // -ENOENT (DNS miss)
+            Err(_) => return -2_i32, // -ENOENT (DNS miss)
         };
-        let mut last_err: i32 = -(111 as i32); // -ECONNREFUSED default
+        let mut last_err: i32 = -111_i32; // -ECONNREFUSED default
         for addr in addrs {
             match std::net::TcpStream::connect_timeout(&addr, self.connect_timeout) {
                 Ok(stream) => {
@@ -643,7 +643,7 @@ impl TcpSocketImpl for NativeTcpSocket {
         use std::io::Write;
         let mut s = self.inner.lock().unwrap();
         let Some(stream) = s.sockets.get_mut(&handle) else {
-            return -(9 as i64); // -EBADF
+            return -9_i64; // -EBADF
         };
         match stream.write(data) {
             Ok(n) => n as i64,
@@ -655,7 +655,7 @@ impl TcpSocketImpl for NativeTcpSocket {
         use std::io::Read;
         let mut s = self.inner.lock().unwrap();
         let Some(stream) = s.sockets.get_mut(&handle) else {
-            return -(9 as i64);
+            return -9_i64;
         };
         match stream.read(buf) {
             Ok(n) => n as i64,
@@ -673,7 +673,7 @@ impl TcpSocketImpl for NativeTcpSocket {
     }
 
     fn listen(&self, host: &str, port: u16, _backlog: u32) -> i32 {
-        let bind_addr = if host == "0.0.0.0" || host == "" {
+        let bind_addr = if host == "0.0.0.0" || host.is_empty() {
             format!("0.0.0.0:{port}")
         } else if host == "localhost" {
             format!("127.0.0.1:{port}")
@@ -702,7 +702,7 @@ impl TcpSocketImpl for NativeTcpSocket {
             let mut s = self.inner.lock().unwrap();
             match s.listeners.remove(&handle) {
                 Some(l) => l,
-                None => return -(9 as i32), // -EBADF
+                None => return -9_i32, // -EBADF
             }
         };
         let result = listener.accept();
@@ -741,15 +741,15 @@ impl TcpSocketImpl for NativeTcpSocket {
 fn tcp_io_errno(e: std::io::Error) -> i32 {
     use std::io::ErrorKind::*;
     match e.kind() {
-        ConnectionRefused => -(111 as i32),
-        ConnectionReset => -(104 as i32),
-        ConnectionAborted => -(103 as i32),
-        TimedOut => -(110 as i32),
-        BrokenPipe => -(32 as i32), // -EPIPE
-        WouldBlock => -(11 as i32), // -EAGAIN
-        NotFound => -(2 as i32),
-        PermissionDenied => -(13 as i32),
-        _ => -(5 as i32), // -EIO
+        ConnectionRefused => -111_i32,
+        ConnectionReset => -104_i32,
+        ConnectionAborted => -103_i32,
+        TimedOut => -110_i32,
+        BrokenPipe => -32_i32, // -EPIPE
+        WouldBlock => -11_i32, // -EAGAIN
+        NotFound => -2_i32,
+        PermissionDenied => -13_i32,
+        _ => -5_i32, // -EIO
     }
 }
 
@@ -819,7 +819,11 @@ impl NativeHostFs {
     /// missing case is allowed for create/mkdir/symlink/rename
     /// destinations and falls back to canonicalizing the parent.
     fn resolve(&self, path: &[u8], allow_missing: bool) -> std::result::Result<PathBuf, i32> {
-        let rel: &[u8] = if path.starts_with(b"/") { &path[1..] } else { path };
+        let rel: &[u8] = if path.starts_with(b"/") {
+            &path[1..]
+        } else {
+            path
+        };
         let rel_str = std::str::from_utf8(rel).map_err(|_| -EINVAL as i32)?;
         let candidate = self.root.join(rel_str);
         let root_canon = self.root.canonicalize().map_err(|_| -EACCES as i32)?;
@@ -878,7 +882,7 @@ impl HostFsImpl for NativeHostFs {
         use std::io::Read;
         let mut s = self.inner.lock().unwrap();
         let Some(file) = s.fds.get_mut(&fd) else {
-            return -(9 as i64);
+            return -9_i64;
         };
         match file.read(buf) {
             Ok(n) => n as i64,
@@ -890,7 +894,7 @@ impl HostFsImpl for NativeHostFs {
         use std::io::Write;
         let mut s = self.inner.lock().unwrap();
         let Some(file) = s.fds.get_mut(&fd) else {
-            return -(9 as i64);
+            return -9_i64;
         };
         match file.write(data) {
             Ok(n) => n as i64,
@@ -956,8 +960,10 @@ impl HostFsImpl for NativeHostFs {
         #[cfg(unix)]
         let res = std::os::unix::fs::symlink(target_str, &link_resolved);
         #[cfg(not(unix))]
-        let res: std::io::Result<()> =
-            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "symlink"));
+        let res: std::io::Result<()> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "symlink",
+        ));
         match res {
             Ok(()) => 0,
             Err(e) => Self::map_io(e),
@@ -1035,10 +1041,10 @@ impl HostFsImpl for InMemoryHostFs {
         let mut s = self.inner.lock().unwrap();
         if !s.files.contains_key(path) {
             if !create {
-                return -(2 as i32); // -ENOENT
+                return -2_i32; // -ENOENT
             }
             if !writable {
-                return -(13 as i32); // -EACCES (create requires write)
+                return -13_i32; // -EACCES (create requires write)
             }
             s.files.insert(path.to_vec(), Vec::new());
         } else if trunc && writable {
@@ -1053,10 +1059,10 @@ impl HostFsImpl for InMemoryHostFs {
     fn read(&self, fd: i32, buf: &mut [u8]) -> i64 {
         let mut s = self.inner.lock().unwrap();
         let Some((path, cursor)) = s.fds.get(&fd).cloned() else {
-            return -(9 as i64); // -EBADF
+            return -9_i64; // -EBADF
         };
         let Some(content) = s.files.get(&path) else {
-            return -(9 as i64);
+            return -9_i64;
         };
         let start = (cursor as usize).min(content.len());
         let avail = content.len() - start;
@@ -1073,10 +1079,10 @@ impl HostFsImpl for InMemoryHostFs {
     fn write(&self, fd: i32, data: &[u8]) -> i64 {
         let mut s = self.inner.lock().unwrap();
         let Some((path, cursor)) = s.fds.get(&fd).cloned() else {
-            return -(9 as i64);
+            return -9_i64;
         };
         let Some(content) = s.files.get_mut(&path) else {
-            return -(9 as i64);
+            return -9_i64;
         };
         let start = cursor as usize;
         let end = start + data.len();
@@ -1124,7 +1130,7 @@ impl HostFsImpl for InMemoryHostFs {
                 is_symlink: true,
             });
         }
-        Err(-(2 as i32))
+        Err(-2_i32)
     }
 
     fn unlink(&self, path: &[u8]) -> i32 {
@@ -1135,13 +1141,13 @@ impl HostFsImpl for InMemoryHostFs {
         if s.files.remove(path).is_some() {
             return 0;
         }
-        -(2 as i32)
+        -2_i32
     }
 
     fn mkdir(&self, path: &[u8], _mode: u32) -> i32 {
         let mut s = self.inner.lock().unwrap();
         if s.dirs.contains(path) || s.files.contains_key(path) {
-            return -(17 as i32); // -EEXIST
+            return -17_i32; // -EEXIST
         }
         s.dirs.insert(path.to_vec());
         0
@@ -1153,7 +1159,7 @@ impl HostFsImpl for InMemoryHostFs {
             || s.symlinks.contains_key(link_path)
             || s.dirs.contains(link_path)
         {
-            return -(17 as i32);
+            return -17_i32;
         }
         s.symlinks.insert(link_path.to_vec(), target.to_vec());
         0
@@ -1173,7 +1179,7 @@ impl HostFsImpl for InMemoryHostFs {
             s.dirs.insert(new_path.to_vec());
             return 0;
         }
-        -(2 as i32)
+        -2_i32
     }
 }
 
@@ -1452,7 +1458,11 @@ impl Microkernel {
             argv.push(buf[cur..cur + alen].to_vec());
             cur += alen;
         }
-        Ok(Some(PendingSpawn { child_pid, wasm, argv }))
+        Ok(Some(PendingSpawn {
+            child_pid,
+            wasm,
+            argv,
+        }))
     }
 
     /// Mount a YURTFS L1+L2 overlay at `prefix`. The image bytes
@@ -1849,11 +1859,7 @@ fn read_path(
         .and_then(|e| e.into_memory())
         .ok_or(-EFAULT as i32)?;
     let mut path = vec![0u8; path_len as usize];
-    if path_len > 0
-        && memory
-            .read(&*caller, path_ptr as usize, &mut path)
-            .is_err()
-    {
+    if path_len > 0 && memory.read(&*caller, path_ptr as usize, &mut path).is_err() {
         return Err(-EFAULT as i32);
     }
     Ok(path)
@@ -1864,8 +1870,8 @@ fn host_io_errno(e: std::io::Error) -> i32 {
     match e.kind() {
         NotFound => -ENOENT as i32,
         PermissionDenied => -EACCES as i32,
-        AlreadyExists => -(17 as i32), // -EEXIST
-        DirectoryNotEmpty => -(39 as i32), // -ENOTEMPTY
+        AlreadyExists => -17_i32,     // -EEXIST
+        DirectoryNotEmpty => -39_i32, // -ENOTEMPTY
         _ => -EFAULT as i32,
     }
 }
@@ -1945,13 +1951,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             // Policy gate: embedders that don't trust extension
             // requests inspect the bytes here. Returning Deny short-
             // circuits the registry call with -EACCES.
-            if caller
-                .data()
-                .host
-                .policy
-                .may_invoke_extension(&request)
-                == PolicyDecision::Deny
-            {
+            if caller.data().host.policy.may_invoke_extension(&request) == PolicyDecision::Deny {
                 return -EACCES;
             }
             let mut response = vec![0u8; out_cap as usize];
@@ -1999,13 +1999,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Err(rc) => return rc,
             };
             let writable = flags & 0b001 != 0;
-            if caller
-                .data()
-                .host
-                .policy
-                .may_open_path(&path, writable)
-                == PolicyDecision::Deny
-            {
+            if caller.data().host.policy.may_open_path(&path, writable) == PolicyDecision::Deny {
                 return -(EACCES as i32);
             }
             let fs = match caller.data().host.host_fs.clone() {
@@ -2018,18 +2012,14 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_real_read",
-        |mut caller: Caller<'_, KernelStoreData>,
-         fd: i32,
-         out_ptr: u32,
-         len: u32|
-         -> i64 {
+        |mut caller: Caller<'_, KernelStoreData>, fd: i32, out_ptr: u32, len: u32| -> i64 {
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -EFAULT,
             };
             let fs = match caller.data().host.host_fs.clone() {
                 Some(f) => f,
-                None => return -(EBADF as i64),
+                None => return -EBADF,
             };
             let mut buf = vec![0u8; len as usize];
             let n = fs.read(fd, &mut buf);
@@ -2046,11 +2036,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_real_write",
-        |mut caller: Caller<'_, KernelStoreData>,
-         fd: i32,
-         data_ptr: u32,
-         data_len: u32|
-         -> i64 {
+        |mut caller: Caller<'_, KernelStoreData>, fd: i32, data_ptr: u32, data_len: u32| -> i64 {
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -EFAULT,
@@ -2061,7 +2047,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             }
             let fs = match caller.data().host.host_fs.clone() {
                 Some(f) => f,
-                None => return -(EBADF as i64),
+                None => return -EBADF,
             };
             fs.write(fd, &buf)
         },
@@ -2069,7 +2055,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_real_close",
-        |mut caller: Caller<'_, KernelStoreData>, fd: i32| -> i32 {
+        |caller: Caller<'_, KernelStoreData>, fd: i32| -> i32 {
             let fs = match caller.data().host.host_fs.clone() {
                 Some(f) => f,
                 None => return 0,
@@ -2097,13 +2083,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Ok(p) => p,
                 Err(rc) => return rc as i64,
             };
-            if caller
-                .data()
-                .host
-                .policy
-                .may_open_path(&path, false)
-                == PolicyDecision::Deny
-            {
+            if caller.data().host.policy.may_open_path(&path, false) == PolicyDecision::Deny {
                 return -EACCES;
             }
             let fs = match caller.data().host.host_fs.clone() {
@@ -2151,11 +2131,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_real_mkdir",
-        |mut caller: Caller<'_, KernelStoreData>,
-         path_ptr: u32,
-         path_len: u32,
-         mode: u32|
-         -> i32 {
+        |mut caller: Caller<'_, KernelStoreData>, path_ptr: u32, path_len: u32, mode: u32| -> i32 {
             let path = match read_path(&mut caller, path_ptr, path_len) {
                 Ok(p) => p,
                 Err(rc) => return rc,
@@ -2198,13 +2174,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Ok(p) => p,
                 Err(rc) => return rc,
             };
-            if caller
-                .data()
-                .host
-                .policy
-                .may_open_path(&link_path, true)
-                == PolicyDecision::Deny
-            {
+            if caller.data().host.policy.may_open_path(&link_path, true) == PolicyDecision::Deny {
                 return -(EACCES as i32);
             }
             let fs = match caller.data().host.host_fs.clone() {
@@ -2305,7 +2275,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             }
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
-                None => return -(EBADF as i64),
+                None => return -EBADF,
             };
             tcp.send(handle, &buf)
         },
@@ -2325,7 +2295,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             };
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
-                None => return -(EBADF as i64),
+                None => return -EBADF,
             };
             let mut buf = vec![0u8; len as usize];
             let n = tcp.recv(handle, &mut buf, flags);
@@ -2342,7 +2312,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_socket_close",
-        |mut caller: Caller<'_, KernelStoreData>, handle: i32| -> i32 {
+        |caller: Caller<'_, KernelStoreData>, handle: i32| -> i32 {
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
                 None => return 0,
@@ -2391,10 +2361,10 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_socket_accept_blocking",
-        |mut caller: Caller<'_, KernelStoreData>, handle: i32, flags: u32| -> i32 {
+        |caller: Caller<'_, KernelStoreData>, handle: i32, flags: u32| -> i32 {
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
-                None => return -(9 as i32), // -EBADF
+                None => return -9_i32, // -EBADF
             };
             tcp.accept(handle, flags)
         },
@@ -2402,27 +2372,23 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_socket_local_addr",
-        |mut caller: Caller<'_, KernelStoreData>,
-         handle: i32,
-         out_ptr: u32,
-         out_cap: u32|
-         -> i64 {
+        |mut caller: Caller<'_, KernelStoreData>, handle: i32, out_ptr: u32, out_cap: u32| -> i64 {
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -EFAULT,
             };
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
-                None => return -(9 as i64),
+                None => return -9_i64,
             };
             let (host, port) = match tcp.local_addr(handle) {
                 Some(p) => p,
-                None => return -(9 as i64),
+                None => return -9_i64,
             };
             let host_bytes = host.as_bytes();
             let need = 2 + host_bytes.len();
             if (need as u32) > out_cap {
-                return -(7 as i64); // -E2BIG
+                return -7_i64; // -E2BIG
             }
             let mut buf = Vec::with_capacity(need);
             buf.extend_from_slice(&port.to_le_bytes());
@@ -2455,7 +2421,11 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 None => return -EFAULT,
             };
             let mut store = vec![0u8; store_len as usize];
-            if store_len > 0 && memory.read(&caller, store_ptr as usize, &mut store).is_err() {
+            if store_len > 0
+                && memory
+                    .read(&caller, store_ptr as usize, &mut store)
+                    .is_err()
+            {
                 return -EFAULT;
             }
             let mut key = vec![0u8; key_len as usize];
@@ -2474,12 +2444,9 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Err(rc) => return rc as i64,
             };
             if (value.len() as u32) > out_cap {
-                return -(7 as i64); // -E2BIG
+                return -7_i64; // -E2BIG
             }
-            if memory
-                .write(&mut caller, out_ptr as usize, &value)
-                .is_err()
-            {
+            if memory.write(&mut caller, out_ptr as usize, &value).is_err() {
                 return -EFAULT;
             }
             value.len() as i64
@@ -2501,7 +2468,11 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 None => return -EFAULT as i32,
             };
             let mut store = vec![0u8; store_len as usize];
-            if store_len > 0 && memory.read(&caller, store_ptr as usize, &mut store).is_err() {
+            if store_len > 0
+                && memory
+                    .read(&caller, store_ptr as usize, &mut store)
+                    .is_err()
+            {
                 return -EFAULT as i32;
             }
             let mut key = vec![0u8; key_len as usize];
@@ -2540,7 +2511,11 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 None => return -EFAULT as i32,
             };
             let mut store = vec![0u8; store_len as usize];
-            if store_len > 0 && memory.read(&caller, store_ptr as usize, &mut store).is_err() {
+            if store_len > 0
+                && memory
+                    .read(&caller, store_ptr as usize, &mut store)
+                    .is_err()
+            {
                 return -EFAULT as i32;
             }
             let mut key = vec![0u8; key_len as usize];
@@ -2573,7 +2548,11 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 None => return -EFAULT,
             };
             let mut store = vec![0u8; store_len as usize];
-            if store_len > 0 && memory.read(&caller, store_ptr as usize, &mut store).is_err() {
+            if store_len > 0
+                && memory
+                    .read(&caller, store_ptr as usize, &mut store)
+                    .is_err()
+            {
                 return -EFAULT;
             }
             let mut prefix = vec![0u8; prefix_len as usize];
@@ -2659,17 +2638,12 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 rt.block_on(crate::wasm::network::fetch(&req_str))
             })
             .join()
-            .unwrap_or_else(|_| {
-                r#"{"ok":false,"error":"fetch worker panicked"}"#.to_owned()
-            });
+            .unwrap_or_else(|_| r#"{"ok":false,"error":"fetch worker panicked"}"#.to_owned());
             let bytes = response.as_bytes();
             if (bytes.len() as u32) > out_cap {
-                return -(7 as i64); // -E2BIG
+                return -7_i64; // -E2BIG
             }
-            if memory
-                .write(&mut caller, out_ptr as usize, bytes)
-                .is_err()
-            {
+            if memory.write(&mut caller, out_ptr as usize, bytes).is_err() {
                 return -EFAULT;
             }
             bytes.len() as i64
@@ -2756,7 +2730,11 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         SYS_NAMESPACE,
         "sys_umask",
         |mut caller: Caller<'_, UserState>, mask: i32| -> i32 {
-            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::UMASK, mask as u32)
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::UMASK,
+                mask as u32,
+            )
         },
     )?;
     linker.func_wrap(
@@ -2767,7 +2745,11 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(ruid as u32).to_le_bytes());
             req.extend_from_slice(&(euid as u32).to_le_bytes());
             req.extend_from_slice(&(suid as u32).to_le_bytes());
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SETRESUID, &req) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SETRESUID,
+                &req,
+            ) as i32
         },
     )?;
     linker.func_wrap(
@@ -2778,21 +2760,35 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(rgid as u32).to_le_bytes());
             req.extend_from_slice(&(egid as u32).to_le_bytes());
             req.extend_from_slice(&(sgid as u32).to_le_bytes());
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SETRESGID, &req) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SETRESGID,
+                &req,
+            ) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_chdir",
         |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32| -> i32 {
-            forward_user_ptr_len(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::CHDIR, path_ptr, path_len)
+            forward_user_ptr_len(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::CHDIR,
+                path_ptr,
+                path_len,
+            )
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_getcwd",
         |mut caller: Caller<'_, UserState>, out_ptr: u32, out_cap: u32| -> i32 {
-            forward_response_to_user(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::GETCWD, out_ptr, out_cap)
+            forward_response_to_user(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::GETCWD,
+                out_ptr,
+                out_cap,
+            )
         },
     )?;
     linker.func_wrap(
@@ -2824,21 +2820,33 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(resource as u32).to_le_bytes());
             req.extend_from_slice(&(soft as u64).to_le_bytes());
             req.extend_from_slice(&(hard as u64).to_le_bytes());
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SETRLIMIT, &req) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SETRLIMIT,
+                &req,
+            ) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_close",
         |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
-            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::CLOSE, fd as u32)
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::CLOSE,
+                fd as u32,
+            )
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_dup",
         |mut caller: Caller<'_, UserState>, oldfd: i32| -> i32 {
-            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::DUP, oldfd as u32)
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::DUP,
+                oldfd as u32,
+            )
         },
     )?;
     linker.func_wrap(
@@ -2848,7 +2856,11 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(8);
             req.extend_from_slice(&(oldfd as u32).to_le_bytes());
             req.extend_from_slice(&(newfd as u32).to_le_bytes());
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::DUP2, &req) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::DUP2,
+                &req,
+            ) as i32
         },
     )?;
     // POSIX `pipe(int fd[2])`: caller provides a 2-int buffer, kernel
@@ -2908,14 +2920,22 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(4 + payload.len());
             req.extend_from_slice(&(fd as u32).to_le_bytes());
             req.extend_from_slice(&payload);
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::WRITE, &req) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::WRITE,
+                &req,
+            ) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_isatty",
         |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
-            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::ISATTY, fd as u32)
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::ISATTY,
+                fd as u32,
+            )
         },
     )?;
     linker.func_wrap(
@@ -2941,7 +2961,11 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         SYS_NAMESPACE,
         "sys_getpgid",
         |mut caller: Caller<'_, UserState>, pid: i32| -> i32 {
-            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::GETPGID, pid as u32)
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::GETPGID,
+                pid as u32,
+            )
         },
     )?;
     linker.func_wrap(
@@ -2951,21 +2975,33 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(8);
             req.extend_from_slice(&(pid as u32).to_le_bytes());
             req.extend_from_slice(&(pgid as u32).to_le_bytes());
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SETPGID, &req) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SETPGID,
+                &req,
+            ) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_getsid",
         |mut caller: Caller<'_, UserState>, pid: i32| -> i32 {
-            forward_u32_arg(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::GETSID, pid as u32)
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::GETSID,
+                pid as u32,
+            )
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_setsid",
         |mut caller: Caller<'_, UserState>| -> i32 {
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SETSID, &[]) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SETSID,
+                &[],
+            ) as i32
         },
     )?;
     linker.func_wrap(
@@ -2975,7 +3011,11 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(8);
             req.extend_from_slice(&(pid as u32).to_le_bytes());
             req.extend_from_slice(&(sig as u32).to_le_bytes());
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::KILL, &req) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::KILL,
+                &req,
+            ) as i32
         },
     )?;
     linker.func_wrap(
@@ -2985,14 +3025,22 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(8);
             req.extend_from_slice(&(sig as u32).to_le_bytes());
             req.extend_from_slice(&(disposition as u32).to_le_bytes());
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SIGACTION, &req) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SIGACTION,
+                &req,
+            ) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_sched_yield",
         |mut caller: Caller<'_, UserState>| -> i32 {
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::SCHED_YIELD, &[]) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SCHED_YIELD,
+                &[],
+            ) as i32
         },
     )?;
     linker.func_wrap(
@@ -3000,17 +3048,17 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "sys_nanosleep",
         |mut caller: Caller<'_, UserState>, ns: i64| -> i32 {
             let req = (ns as u64).to_le_bytes();
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::NANOSLEEP, &req) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::NANOSLEEP,
+                &req,
+            ) as i32
         },
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_open",
-        |mut caller: Caller<'_, UserState>,
-         flags: i32,
-         path_ptr: u32,
-         path_len: u32|
-         -> i32 {
+        |mut caller: Caller<'_, UserState>, flags: i32, path_ptr: u32, path_len: u32| -> i32 {
             // Read the path bytes out of user memory and prepend
             // u32 flags LE as the wire format expects.
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
@@ -3024,7 +3072,11 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(4 + path.len());
             req.extend_from_slice(&(flags as u32).to_le_bytes());
             req.extend_from_slice(&path);
-            forward_request_bytes(&mut crate::engine::WasmtimeCtx::new(&mut caller), sys_method_id::OPEN, &req) as i32
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::OPEN,
+                &req,
+            ) as i32
         },
     )?;
     linker.func_wrap(
@@ -3047,7 +3099,11 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 out_ptr,
                 8,
             );
-            if rc == 8 { 0 } else { rc as i32 }
+            if rc == 8 {
+                0
+            } else {
+                rc as i32
+            }
         },
     )?;
     linker.func_wrap(
@@ -3062,7 +3118,11 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 out_ptr,
                 16,
             );
-            if rc == 16 { 0 } else { rc as i32 }
+            if rc == 16 {
+                0
+            } else {
+                rc as i32
+            }
         },
     )?;
 
@@ -3134,11 +3194,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_socket_send",
-        |mut caller: Caller<'_, UserState>,
-         fd: i32,
-         data_ptr: u32,
-         data_len: u32|
-         -> i64 {
+        |mut caller: Caller<'_, UserState>, fd: i32, data_ptr: u32, data_len: u32| -> i64 {
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -22,
@@ -3194,11 +3250,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_socket_listen",
-        |mut caller: Caller<'_, UserState>,
-         backlog: i32,
-         addr_ptr: u32,
-         addr_len: u32|
-         -> i32 {
+        |mut caller: Caller<'_, UserState>, backlog: i32, addr_ptr: u32, addr_len: u32| -> i32 {
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -22,
@@ -3234,11 +3286,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_socket_addr",
-        |mut caller: Caller<'_, UserState>,
-         fd: i32,
-         out_ptr: u32,
-         out_cap: u32|
-         -> i64 {
+        |mut caller: Caller<'_, UserState>, fd: i32, out_ptr: u32, out_cap: u32| -> i64 {
             let req = (fd as u32).to_le_bytes();
             forward_request_with_user_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),

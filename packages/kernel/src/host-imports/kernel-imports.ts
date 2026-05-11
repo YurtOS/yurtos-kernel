@@ -1137,6 +1137,10 @@ export function createKernelImports(
 
     // host_pipe(out_ptr, out_cap) -> i32
     // Creates a pipe and writes yurt_pipe_result_v1 to the output buffer.
+    // Supports two output formats depending on capacity:
+    //   - cap >= 8: binary struct {read_fd: i32, write_fd: i32} (new ABI, returns 8)
+    //   - cap >= 16 AND old-ABI probe: ASCII "READ_FD\nWRITE_FD\n" (legacy busybox, returns byte count)
+    // Legacy busybox passes cap=64 and expects ASCII decimal text.
     host_pipe(outPtr: number, outCap: number): number {
       if (!opts.kernel) {
         return ERR_IO;
@@ -1148,6 +1152,18 @@ export function createKernelImports(
         const writeTarget = opts.kernel.getFdTarget(callerPid, writeFd);
         if (readTarget) ioFds.set(readFd, readTarget);
         if (writeTarget) ioFds.set(writeFd, writeTarget);
+      }
+      // Legacy binaries (busybox in standard image) pass outCap=64 and expect
+      // JSON {"read_fd":N,"write_fd":M}. Detect via cap > 8.
+      if (outCap > 8) {
+        const json = `{"read_fd":${readFd},"write_fd":${writeFd}}`;
+        const bytes = new TextEncoder().encode(json);
+        if (outCap < bytes.length) return ERR_IO;
+        if (outPtr < 0 || outPtr + bytes.length > memory.buffer.byteLength) {
+          return ERR_IO;
+        }
+        new Uint8Array(memory.buffer, outPtr, bytes.length).set(bytes);
+        return bytes.length;
       }
       return writePipeResult(memory, outPtr, outCap, readFd, writeFd);
     },
@@ -1423,8 +1439,14 @@ export function createKernelImports(
       let req: SpawnRequest;
       try {
         const decoded = decodeNativeSpawnRequest(reqBytes);
-        if (!decoded) return ERR_INVALID;
-        req = decoded;
+        if (!decoded) {
+          // Fallback: legacy busybox sends JSON spawn requests.
+          const json = new TextDecoder().decode(reqBytes);
+          const parsed = JSON.parse(json) as SpawnRequest;
+          req = parsed;
+        } else {
+          req = decoded;
+        }
       } catch {
         return ERR_INVALID;
       }
@@ -2009,6 +2031,104 @@ export function createKernelImports(
       })();
     },
 
+    // host_waitpid_nohang(pid, wstatus_ptr, wstatus_len) -> i32
+    // Non-blocking waitpid: returns waited pid, 0 if no child exited yet, or -errno.
+    // Writes POSIX wstatus (exitCode << 8) to wstatus_ptr if non-zero and child exited.
+    host_waitpid_nohang(
+      pid: number,
+      wstatusPtr: number,
+      wstatusLen: number,
+    ): number {
+      if (!opts.kernel) return ERR_CHILD;
+      opts.wasiHost?.drainPendingSignals();
+      const kernel = opts.kernel;
+      if (pid <= 0) {
+        const result = kernel.waitAnyChildNohang(callerPid);
+        if (result.state === "running") return 0;
+        if (result.state === "none") return ERR_CHILD;
+        if (wstatusPtr !== 0 && wstatusLen >= 4) {
+          new DataView(memory.buffer).setInt32(
+            wstatusPtr,
+            result.exitCode << 8,
+            true,
+          );
+        }
+        return result.pid!;
+      }
+      const exitCode = kernel.waitpidNohang(pid, callerPid);
+      if (exitCode === -1) return 0;
+      if (exitCode < 0) return ERR_CHILD;
+      if (wstatusPtr !== 0 && wstatusLen >= 4) {
+        new DataView(memory.buffer).setInt32(wstatusPtr, exitCode << 8, true);
+      }
+      return pid;
+    },
+
+    // host_waitpid(pid, wstatus_ptr, wstatus_len) -> i32 | Promise<i32>
+    // Blocking waitpid: suspends until child exits. Returns waited pid or -errno.
+    // Writes POSIX wstatus (exitCode << 8) to wstatus_ptr if non-zero.
+    host_waitpid(
+      pid: number,
+      wstatusPtr: number,
+      wstatusLen: number,
+    ): number | Promise<number> {
+      if (!opts.kernel) return ERR_CHILD;
+      const kernel = opts.kernel;
+
+      return (async () => {
+        await yieldToScheduler();
+        const signalWait = opts.wasiHost?.waitForSignalDelivery();
+        const interrupt = signalWait?.promise ?? new Promise<void>(() => {});
+
+        const writeStatus = (waitedPid: number, code: number): number => {
+          if (wstatusPtr !== 0 && wstatusLen >= 4) {
+            new DataView(memory.buffer).setInt32(wstatusPtr, code << 8, true);
+          }
+          return waitedPid;
+        };
+
+        if (pid <= 0) {
+          // Do NOT call drainPendingSignals() here: the asyncify buffer holds a
+          // saved WASM stack.  If the SIGCHLD handler calls host_waitpid (async),
+          // wrapImport would overwrite the buffer and corrupt the outer waitpid
+          // resume point.  The interrupt promise (from waitForSignalDelivery) is
+          // sufficient — it fires when any signal is queued.
+          const waitedPromise = kernel.waitAnyChildInterruptible(
+            callerPid,
+            interrupt,
+          );
+          const waited = await waitedPromise;
+          signalWait?.cancel();
+          if (waited.interrupted) {
+            const result = kernel.waitAnyChildNohang(callerPid);
+            if (result.state === "exited") {
+              return writeStatus(result.pid!, result.exitCode);
+            }
+            return ERR_INTERRUPTED;
+          }
+          const result = waited.result;
+          if (!result) return ERR_CHILD;
+          return writeStatus(result.pid, result.exitCode);
+        }
+
+        // Same safety rule: no drainPendingSignals() while asyncify buffer is live.
+        const waitedPromise = kernel.waitpidInterruptible(
+          pid,
+          callerPid,
+          interrupt,
+        );
+        const waited = await waitedPromise;
+        signalWait?.cancel();
+        if (waited.interrupted) {
+          const exitCode = kernel.waitpidNohang(pid, callerPid);
+          if (exitCode >= 0) return writeStatus(pid, exitCode);
+          return ERR_INTERRUPTED;
+        }
+        if (waited.exitCode < 0) return ERR_CHILD;
+        return writeStatus(pid, waited.exitCode);
+      })();
+    },
+
     // host_close_fd(fd) -> i32
     // Closes a file descriptor in the caller's fd table.
     host_close_fd(fd: number): number {
@@ -2150,7 +2270,6 @@ export function createKernelImports(
     // Stores POSIX descriptor flags such as FD_CLOEXEC in the kernel fd table.
     host_set_fd_descriptor_flags(fd: number, flags: number): number {
       if (!opts.kernel) return -1;
-      if (!opts.kernel.getFdTarget(callerPid, fd)) return -1;
       opts.kernel.setFdDescriptorFlags(callerPid, fd, flags);
       return 0;
     },

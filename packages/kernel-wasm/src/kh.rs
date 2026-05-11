@@ -21,12 +21,7 @@ extern "C" {
     fn kh_real_read(fd: i32, out_ptr: *mut u8, len: usize) -> i64;
     fn kh_real_write(fd: i32, data_ptr: *const u8, data_len: usize) -> i64;
     fn kh_real_close(fd: i32) -> i32;
-    fn kh_real_stat(
-        path_ptr: *const u8,
-        path_len: usize,
-        out_ptr: *mut u8,
-        out_cap: usize,
-    ) -> i64;
+    fn kh_real_stat(path_ptr: *const u8, path_len: usize, out_ptr: *mut u8, out_cap: usize) -> i64;
     fn kh_fetch_blocking(
         req_ptr: *const u8,
         req_len: usize,
@@ -112,12 +107,7 @@ unsafe fn kh_log(_severity: u32, _msg_ptr: *const u8, _msg_len: usize) -> i32 {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn kh_real_open(
-    _path_ptr: *const u8,
-    _path_len: usize,
-    _flags: u32,
-    _mode: u32,
-) -> i32 {
+unsafe fn kh_real_open(_path_ptr: *const u8, _path_len: usize, _flags: u32, _mode: u32) -> i32 {
     -38 // -ENOSYS
 }
 
@@ -197,12 +187,7 @@ unsafe fn kh_socket_send(_handle: i32, _data_ptr: *const u8, _data_len: usize) -
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn kh_socket_recv(
-    _handle: i32,
-    _out_ptr: *mut u8,
-    _len: usize,
-    _flags: u32,
-) -> i64 {
+unsafe fn kh_socket_recv(_handle: i32, _out_ptr: *mut u8, _len: usize, _flags: u32) -> i64 {
     -38
 }
 
@@ -483,9 +468,7 @@ pub fn real_stat_size(path: &[u8]) -> Result<u64, i32> {
     //   u8 is_dir, u8 is_symlink, u8[6] _reserved
     // Total = 32 bytes; size is at offset 8.
     let mut buf = [0u8; 32];
-    let rc = unsafe {
-        kh_real_stat(path.as_ptr(), path.len(), buf.as_mut_ptr(), buf.len())
-    };
+    let rc = unsafe { kh_real_stat(path.as_ptr(), path.len(), buf.as_mut_ptr(), buf.len()) };
     if rc < 0 {
         return Err(rc as i32);
     }

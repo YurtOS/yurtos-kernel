@@ -598,7 +598,11 @@ fn getpgid(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([target_arg]) = read_u32_args::<1>(request) else {
         return -(abi::EINVAL as i64);
     };
-    let target = if target_arg == 0 { caller_pid } else { target_arg };
+    let target = if target_arg == 0 {
+        caller_pid
+    } else {
+        target_arg
+    };
     with_kernel(|k| {
         let p = k.process_mut(target);
         if p.pgid == 0 {
@@ -615,7 +619,11 @@ fn setpgid(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([target_arg, pgid_arg]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
-    let target = if target_arg == 0 { caller_pid } else { target_arg };
+    let target = if target_arg == 0 {
+        caller_pid
+    } else {
+        target_arg
+    };
     let new_pgid = if pgid_arg == 0 { target } else { pgid_arg };
     with_kernel(|k| {
         k.process_mut(target).pgid = new_pgid;
@@ -627,7 +635,11 @@ fn getsid(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([target_arg]) = read_u32_args::<1>(request) else {
         return -(abi::EINVAL as i64);
     };
-    let target = if target_arg == 0 { caller_pid } else { target_arg };
+    let target = if target_arg == 0 {
+        caller_pid
+    } else {
+        target_arg
+    };
     with_kernel(|k| {
         let p = k.process_mut(target);
         if p.sid == 0 {
@@ -725,8 +737,7 @@ fn register_file(request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    let path_len =
-        u32::from_le_bytes([request[0], request[1], request[2], request[3]]) as usize;
+    let path_len = u32::from_le_bytes([request[0], request[1], request[2], request[3]]) as usize;
     if request.len() < 4 + path_len {
         return -(abi::EINVAL as i64);
     }
@@ -851,9 +862,7 @@ fn sys_wait(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         // Reap: drop from parent's children list. Leave the
         // Process record itself (it may still hold metadata
         // /proc consumers care about).
-        k.process_mut(caller_pid)
-            .children
-            .retain(|&c| c != pid);
+        k.process_mut(caller_pid).children.retain(|&c| c != pid);
         response[0..4].copy_from_slice(&pid.to_le_bytes());
         response[4..8].copy_from_slice(&status.to_le_bytes());
         8
@@ -868,10 +877,8 @@ fn install_host_fs_mount(request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
-        k.vfs.add_mount(
-            request.to_vec(),
-            Box::new(crate::vfs::HostFsBackend::new()),
-        );
+        k.vfs
+            .add_mount(request.to_vec(), Box::new(crate::vfs::HostFsBackend::new()));
     });
     0
 }
@@ -890,8 +897,7 @@ fn install_yurtfs(request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    let prefix_len =
-        u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    let prefix_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
     if request.len() < 4 + prefix_len {
         return -(abi::EINVAL as i64);
     }
@@ -940,8 +946,7 @@ fn install_tar_layer(request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    let prefix_len =
-        u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    let prefix_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
     if request.len() < 4 + prefix_len {
         return -(abi::EINVAL as i64);
     }
@@ -952,10 +957,8 @@ fn install_tar_layer(request: &[u8]) -> i64 {
         None => return -(abi::EINVAL as i64),
     };
     with_kernel(|k| {
-        k.vfs.add_mount(
-            prefix,
-            Box::new(crate::vfs::TarLayerBackend::new(archive)),
-        );
+        k.vfs
+            .add_mount(prefix, Box::new(crate::vfs::TarLayerBackend::new(archive)));
     });
     0
 }
@@ -1006,10 +1009,7 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
         // symlinks; intermediate-dir resolution comes with mkdir.
         let mut resolved: Vec<u8> = path.to_vec();
         let mut hops = 0u32;
-        loop {
-            let Some(target) = k.vfs.readlink(&resolved) else {
-                break;
-            };
+        while let Some(target) = k.vfs.readlink(&resolved) {
             hops += 1;
             if hops > 40 {
                 return -(abi::EINVAL as i64); // -ELOOP shape
@@ -1181,8 +1181,7 @@ fn readdir(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             child.extend_from_slice(name);
             let ty = k.vfs.entry_type(&child);
 
-            response[cursor..cursor + 4]
-                .copy_from_slice(&(name.len() as u32).to_le_bytes());
+            response[cursor..cursor + 4].copy_from_slice(&(name.len() as u32).to_le_bytes());
             cursor += 4;
             response[cursor] = ty;
             cursor += 1;
@@ -1202,8 +1201,7 @@ fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    let target_len =
-        u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    let target_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
     if request.len() < 4 + target_len {
         return -(abi::EINVAL as i64);
     }
@@ -1416,7 +1414,8 @@ fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
     let mut argv: Vec<Vec<u8>> = Vec::new();
     let mut cursor = 4 + path_len;
     while cursor + 4 <= request.len() {
-        let alen = u32::from_le_bytes(request[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
+        let alen =
+            u32::from_le_bytes(request[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
         cursor += 4;
         if cursor + alen > request.len() {
             return -(abi::EINVAL as i64);
@@ -1463,9 +1462,8 @@ fn drain_spawn(response: &mut [u8]) -> i64 {
         let Some(spawn) = k.drain_spawn() else {
             return -(abi::ENOENT as i64);
         };
-        let need = 4 + 4 + spawn.wasm.len()
-            + 4
-            + spawn.argv.iter().map(|a| 4 + a.len()).sum::<usize>();
+        let need =
+            4 + 4 + spawn.wasm.len() + 4 + spawn.argv.iter().map(|a| 4 + a.len()).sum::<usize>();
         if response.len() < need {
             // Re-enqueue at front so the next call picks it up.
             k.pending_spawns_push_front(spawn);
@@ -1517,8 +1515,7 @@ fn hard_link(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    let target_len =
-        u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    let target_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
     if request.len() < 4 + target_len {
         return -(abi::EINVAL as i64);
     }
@@ -1624,8 +1621,7 @@ fn utimens(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 8 {
         return -(abi::EINVAL as i64);
     }
-    let mtime_ns =
-        u64::from_le_bytes(request[0..8].try_into().expect("8 bytes"));
+    let mtime_ns = u64::from_le_bytes(request[0..8].try_into().expect("8 bytes"));
     let raw = &request[8..];
     if raw.is_empty() {
         return -(abi::EINVAL as i64);
@@ -2634,22 +2630,12 @@ mod tests {
 
         // Read all bytes.
         let mut buf = [0u8; 64];
-        let n = dispatch(
-            METHOD_SYS_READ,
-            1,
-            &(fd as u32).to_le_bytes(),
-            &mut buf,
-        );
+        let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
         assert_eq!(n as usize, b"hi from ramfs".len());
         assert_eq!(&buf[..n as usize], b"hi from ramfs");
 
         // Subsequent read at EOF returns 0.
-        let n = dispatch(
-            METHOD_SYS_READ,
-            1,
-            &(fd as u32).to_le_bytes(),
-            &mut buf,
-        );
+        let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
         assert_eq!(n, 0);
 
         // close the file fd.
@@ -2745,10 +2731,7 @@ mod tests {
         let dup = dispatch(METHOD_SYS_DUP, 1, &fd.to_le_bytes(), &mut []) as u32;
 
         // Close the original — the duped fd should still read fine.
-        assert_eq!(
-            dispatch(METHOD_SYS_CLOSE, 1, &fd.to_le_bytes(), &mut []),
-            0
-        );
+        assert_eq!(dispatch(METHOD_SYS_CLOSE, 1, &fd.to_le_bytes(), &mut []), 0);
         let mut buf = [0u8; 8];
         let n = dispatch(METHOD_SYS_READ, 1, &dup.to_le_bytes(), &mut buf);
         assert_eq!(n, 3);
@@ -2840,13 +2823,19 @@ mod tests {
         let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/sta"), &mut []) as u32;
 
         let mut out = [0u8; 16];
-        assert_eq!(dispatch(METHOD_SYS_FSTAT, 1, &fd.to_le_bytes(), &mut out), 16);
+        assert_eq!(
+            dispatch(METHOD_SYS_FSTAT, 1, &fd.to_le_bytes(), &mut out),
+            16
+        );
         assert_eq!(u64::from_le_bytes(out[0..8].try_into().unwrap()), 5);
         assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 4); // REGULAR_FILE
 
         // fstat on stdin (fd 0) reports filetype=2 CHARACTER_DEVICE.
         let mut out2 = [0u8; 16];
-        assert_eq!(dispatch(METHOD_SYS_FSTAT, 1, &0_u32.to_le_bytes(), &mut out2), 16);
+        assert_eq!(
+            dispatch(METHOD_SYS_FSTAT, 1, &0_u32.to_le_bytes(), &mut out2),
+            16
+        );
         assert_eq!(u32::from_le_bytes(out2[8..12].try_into().unwrap()), 2);
     }
 
@@ -3033,7 +3022,10 @@ mod tests {
         assert!(n > 0);
         let text = std::str::from_utf8(&buf[..n as usize]).unwrap();
         assert!(text.contains("Pid:\t7\n"), "expected Pid:\\t7 in: {text}");
-        assert!(text.contains("Uid:\t1000"), "expected default uid in: {text}");
+        assert!(
+            text.contains("Uid:\t1000"),
+            "expected default uid in: {text}"
+        );
     }
 
     #[test]
@@ -3048,16 +3040,14 @@ mod tests {
         dispatch(METHOD_SYS_SETRESUID, 5, &req, &mut []);
 
         // Re-open /proc/5/status — open-time refresh picks up new uid.
-        let fd = dispatch(
-            METHOD_SYS_OPEN,
-            5,
-            &open_req(0, b"/proc/5/status"),
-            &mut [],
-        );
+        let fd = dispatch(METHOD_SYS_OPEN, 5, &open_req(0, b"/proc/5/status"), &mut []);
         let mut buf = [0u8; 256];
         let n = dispatch(METHOD_SYS_READ, 5, &(fd as u32).to_le_bytes(), &mut buf);
         let text = std::str::from_utf8(&buf[..n as usize]).unwrap();
-        assert!(text.contains("Uid:\t500\t501"), "uid update missing: {text}");
+        assert!(
+            text.contains("Uid:\t500\t501"),
+            "uid update missing: {text}"
+        );
     }
 
     #[test]
@@ -3115,7 +3105,12 @@ mod tests {
         let req = set_argv_req(4, &[b"/usr/bin/zsh", b"-l", b"-c", b"echo hi"]);
         assert_eq!(dispatch(METHOD_KERNEL_SET_ARGV, 0, &req, &mut []), 0);
 
-        let fd = dispatch(METHOD_SYS_OPEN, 4, &open_req(0, b"/proc/4/cmdline"), &mut []);
+        let fd = dispatch(
+            METHOD_SYS_OPEN,
+            4,
+            &open_req(0, b"/proc/4/cmdline"),
+            &mut [],
+        );
         let mut buf = [0u8; 64];
         let n = dispatch(METHOD_SYS_READ, 4, &(fd as u32).to_le_bytes(), &mut buf);
         let bytes = &buf[..n as usize];
@@ -3160,7 +3155,10 @@ mod tests {
         let mut buf = [0u8; 256];
         let n = dispatch(METHOD_SYS_READ, 6, &(fd as u32).to_le_bytes(), &mut buf);
         let text = std::str::from_utf8(&buf[..n as usize]).unwrap();
-        assert!(text.contains("Name:\tls\n"), "expected Name:\\tls in: {text}");
+        assert!(
+            text.contains("Name:\tls\n"),
+            "expected Name:\\tls in: {text}"
+        );
     }
 
     /// Build a tiny in-memory tar with the given (path, content)
@@ -3268,8 +3266,7 @@ mod tests {
         req.extend_from_slice(&tar_bytes);
         dispatch(METHOD_KERNEL_INSTALL_TAR_LAYER, 0, &req, &mut []);
 
-        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/img3/counts"), &mut [])
-            as u32;
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/img3/counts"), &mut []) as u32;
         let mut small = [0u8; 4];
         assert_eq!(
             dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut small),
@@ -3347,7 +3344,10 @@ mod tests {
         dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
         let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/m1"), &mut []);
         let mut out = [0u8; 16];
-        assert_eq!(dispatch(METHOD_SYS_FSTAT, 1, &(fd as u32).to_le_bytes(), &mut out), 16);
+        assert_eq!(
+            dispatch(METHOD_SYS_FSTAT, 1, &(fd as u32).to_le_bytes(), &mut out),
+            16
+        );
         let mode = u32::from_le_bytes(out[12..16].try_into().unwrap());
         assert_eq!(mode, 0o100_644, "default mode from backend");
     }
@@ -3371,10 +3371,7 @@ mod tests {
         let mut out = [0u8; 16];
         dispatch(METHOD_SYS_FSTAT, 1, &(fd as u32).to_le_bytes(), &mut out);
         let mode = u32::from_le_bytes(out[12..16].try_into().unwrap());
-        assert_eq!(
-            mode, 0o100_600,
-            "chmod kept file-type bits, replaced perms"
-        );
+        assert_eq!(mode, 0o100_600, "chmod kept file-type bits, replaced perms");
     }
 
     #[test]
@@ -3567,12 +3564,7 @@ mod tests {
         // the rewrite requires the next byte to be '/' or end.
         // Resolves through the regular VFS as a missing path.
         let _g = crate::kernel::TestGuard::acquire();
-        let rc = dispatch(
-            METHOD_SYS_OPEN,
-            7,
-            &open_req(0, b"/proc/selfish"),
-            &mut [],
-        );
+        let rc = dispatch(METHOD_SYS_OPEN, 7, &open_req(0, b"/proc/selfish"), &mut []);
         assert!(rc < 0, "/proc/selfish should miss, got rc={rc}");
     }
 
@@ -3967,9 +3959,9 @@ mod tests {
             by_name.insert(buf[cursor..cursor + len].to_vec(), ty);
             cursor += len;
         }
-        assert_eq!(by_name.get(&b"file".to_vec()), Some(&4));
-        assert_eq!(by_name.get(&b"sub".to_vec()), Some(&3));
-        assert_eq!(by_name.get(&b"link".to_vec()), Some(&7));
+        assert_eq!(by_name.get(b"file".as_slice()), Some(&4));
+        assert_eq!(by_name.get(b"sub".as_slice()), Some(&3));
+        assert_eq!(by_name.get(b"link".as_slice()), Some(&7));
     }
 
     #[test]

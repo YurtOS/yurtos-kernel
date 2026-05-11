@@ -217,12 +217,13 @@ pub struct MountTable {
 
 impl MountTable {
     pub fn new(root: Box<dyn VfsBackend>) -> Self {
-        Self {
-            mounts: vec![Mount {
-                prefix: b"/".to_vec(),
-                backend: root,
-            }],
-        }
+        let root_mount = ROOT_MOUNT as usize;
+        let mounts = vec![Mount {
+            prefix: b"/".to_vec(),
+            backend: root,
+        }];
+        debug_assert_eq!(root_mount, 0);
+        Self { mounts }
     }
 
     /// Add a mount at `prefix`. Returns its [`MountId`].
@@ -287,13 +288,7 @@ impl MountTable {
         }
     }
 
-    pub fn write(
-        &mut self,
-        mount_id: MountId,
-        inode: u64,
-        offset: u64,
-        payload: &[u8],
-    ) -> i64 {
+    pub fn write(&mut self, mount_id: MountId, inode: u64, offset: u64, payload: &[u8]) -> i64 {
         match self.mounts.get_mut(mount_id as usize) {
             Some(m) => m.backend.write(inode, offset, payload),
             None => -(crate::abi::EBADF as i64),
@@ -301,7 +296,9 @@ impl MountTable {
     }
 
     pub fn size(&self, mount_id: MountId, inode: u64) -> Option<u64> {
-        self.mounts.get(mount_id as usize).and_then(|m| m.backend.size(inode))
+        self.mounts
+            .get(mount_id as usize)
+            .and_then(|m| m.backend.size(inode))
     }
 
     /// Surface a backend's best-guess default metadata for an
@@ -775,7 +772,12 @@ impl VfsBackend for RamfsBackend {
         }
         // Empty check: walk children. A child is any tracked path
         // whose parent is `path`.
-        for p in self.paths.keys().chain(self.symlinks.keys()).chain(self.dirs.iter()) {
+        for p in self
+            .paths
+            .keys()
+            .chain(self.symlinks.keys())
+            .chain(self.dirs.iter())
+        {
             if p == path {
                 continue;
             }
@@ -799,7 +801,12 @@ impl VfsBackend for RamfsBackend {
             return None;
         }
         let mut entries: Vec<Vec<u8>> = Vec::new();
-        for p in self.paths.keys().chain(self.symlinks.keys()).chain(self.dirs.iter()) {
+        for p in self
+            .paths
+            .keys()
+            .chain(self.symlinks.keys())
+            .chain(self.dirs.iter())
+        {
             if p == path {
                 continue;
             }
@@ -1199,8 +1206,14 @@ impl ProcBackend {
         s.push_str(&format!("Pid:\t{}\n", p.pid));
         s.push_str(&format!("PPid:\t{}\n", p.ppid));
         // Real / effective / saved (we don't track saved yet — repeat euid)
-        s.push_str(&format!("Uid:\t{}\t{}\t{}\t{}\n", p.uid, p.euid, p.euid, p.euid));
-        s.push_str(&format!("Gid:\t{}\t{}\t{}\t{}\n", p.gid, p.egid, p.egid, p.egid));
+        s.push_str(&format!(
+            "Uid:\t{}\t{}\t{}\t{}\n",
+            p.uid, p.euid, p.euid, p.euid
+        ));
+        s.push_str(&format!(
+            "Gid:\t{}\t{}\t{}\t{}\n",
+            p.gid, p.egid, p.egid, p.egid
+        ));
         s.push_str(&format!("Pgid:\t{}\n", p.pgid));
         s.push_str(&format!("Sid:\t{}\n", p.sid));
         s.into_bytes()
@@ -1263,7 +1276,7 @@ impl VfsBackend for ProcBackend {
 
     fn read(&self, inode: u64, offset: u64, buf: &mut [u8]) -> i64 {
         // Linear scan — Phase 4 has at most a handful of entries.
-        for (_path, (id, content)) in &self.entries {
+        for (id, content) in self.entries.values() {
             if *id == inode {
                 let start = (offset as usize).min(content.len());
                 let n = (content.len() - start).min(buf.len());
@@ -1471,7 +1484,7 @@ impl Drop for HostFsBackend {
         // Best-effort close every open host-fd when the backend
         // goes away. Errors are dropped — the host is the only
         // party that can reasonably react.
-        for (&inode, _) in &self.fds {
+        for &inode in self.fds.keys() {
             let _ = crate::kh::real_close(inode as i32);
         }
     }
@@ -1516,7 +1529,6 @@ pub struct TarLayerBackend {
     /// override still reflects the image-builder's intent
     /// (e.g. `/bin/python` arrives 0o755).
     metadata: BTreeMap<u64, Metadata>,
-    next_id: u64,
 }
 
 impl TarLayerBackend {
@@ -1586,7 +1598,6 @@ impl TarLayerBackend {
             files,
             inodes,
             metadata,
-            next_id,
         }
     }
 }
@@ -1852,13 +1863,12 @@ impl VfsBackend for OverlayBackend {
     }
 
     fn truncate(&mut self, inode: u64) {
-        match self.layered.get(&inode) {
-            Some(&(Layer::Upper, inner)) => self.upper.truncate(inner),
+        if let Some(&(Layer::Upper, inner)) = self.layered.get(&inode) {
+            self.upper.truncate(inner);
             // Truncating a lower-only file is meaningless — lower is
             // read-only. Silently ignore (matches POSIX truncate-on-
             // O_TRUNC of a file with no write permission: error,
             // but we don't have an errno return on truncate yet).
-            _ => {}
         }
     }
 
@@ -1935,7 +1945,7 @@ impl VfsBackend for OverlayBackend {
             p
         };
         let mut entries: Vec<Vec<u8>> = Vec::new();
-        for src in upper.into_iter().chain(lower.into_iter()) {
+        for src in upper.into_iter().chain(lower) {
             for name in src {
                 let mut full = prefix.clone();
                 full.extend_from_slice(&name);
@@ -1979,10 +1989,7 @@ impl VfsBackend for OverlayBackend {
         // version remains addressable through any pre-existing
         // OFD, but new opens of `target` go through the upper
         // copy-up like any other write.)
-        let in_upper = matches!(
-            self.upper.entry_type(target),
-            3 | 4 | 7,
-        );
+        let in_upper = matches!(self.upper.entry_type(target), 3 | 4 | 7,);
         if !in_upper {
             // Copy-up only handles regular files today; symlinks
             // would need readlink+symlink in upper. Fall back to

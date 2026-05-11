@@ -15,9 +15,8 @@
 //!   - `environ_get`     → empty environment (writes nothing)
 //!   - `environ_sizes_get` → (0 vars, 0 bytes)
 //!   - `fd_seek`         → -ESPIPE (we don't seek pipes/streams)
-//!   - `fd_fdstat_get`   → minimal stat advertising character-stream
-//!                         semantics on fds 0/1/2 so std doesn't try
-//!                         to seek them
+//!   - `fd_fdstat_get`   → minimal stat advertising character-stream semantics
+//!     on fds 0/1/2 so std doesn't try to seek them
 //!
 //! Anything else returns `-ENOSYS`. Real fixtures that need a richer
 //! WASI surface (path_open, fd_pread, etc.) will fail with a clear
@@ -45,15 +44,15 @@ const ENOSYS: i32 = 52;
 fn posix_to_wasi(posix: i32) -> i32 {
     match posix {
         0 => 0,
-        1 => 63,   // EPERM
-        2 => 44,   // ENOENT
-        9 => 8,    // EBADF
-        11 => 6,   // EAGAIN
-        22 => 28,  // EINVAL
-        29 => 70,  // ESPIPE
-        32 => 64,  // EPIPE
-        38 => 52,  // ENOSYS
-        _ => 28,   // fallback EINVAL
+        1 => 63,  // EPERM
+        2 => 44,  // ENOENT
+        9 => 8,   // EBADF
+        11 => 6,  // EAGAIN
+        22 => 28, // EINVAL
+        29 => 70, // ESPIPE
+        32 => 64, // EPIPE
+        38 => 52, // ENOSYS
+        _ => 28,  // fallback EINVAL
     }
 }
 
@@ -109,7 +108,11 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(4 + payload.len());
             req.extend_from_slice(&(fd as u32).to_le_bytes());
             req.extend_from_slice(&payload);
-            let rc = crate::microkernel::trampoline_request(&mut crate::engine::WasmtimeCtx::new(&mut caller), METHOD_WRITE, &req);
+            let rc = crate::microkernel::trampoline_request(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                METHOD_WRITE,
+                &req,
+            );
             if rc < 0 {
                 return errno_from_kernel(rc);
             }
@@ -206,7 +209,11 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
             caller.data_mut().dir_fds.remove(&fd);
             let req = (fd as u32).to_le_bytes();
-            let rc = crate::microkernel::trampoline_request(&mut crate::engine::WasmtimeCtx::new(&mut caller), METHOD_CLOSE, &req);
+            let rc = crate::microkernel::trampoline_request(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                METHOD_CLOSE,
+                &req,
+            );
             errno_from_kernel(rc)
         },
     )?;
@@ -348,7 +355,11 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             // sys_lseek returns i64; widen to u64 for WASI.
             let new_off = i64::from_le_bytes(resp);
             if memory
-                .write(&mut caller, new_offset_ptr as usize, &(new_off as u64).to_le_bytes())
+                .write(
+                    &mut caller,
+                    new_offset_ptr as usize,
+                    &(new_off as u64).to_le_bytes(),
+                )
                 .is_err()
             {
                 return EINVAL;
@@ -383,8 +394,8 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                     // The synthetic root preopen. wasi-libc expects
                     // DIRECTORY (3) with rights that include path_open.
                     buf[0] = 3; // DIRECTORY
-                    // path_open + path_filestat_get + path_create_directory…
-                    // Granting all path_* + fd_readdir is enough for std::fs.
+                                // path_open + path_filestat_get + path_create_directory…
+                                // Granting all path_* + fd_readdir is enough for std::fs.
                     let rights: u64 = u64::MAX;
                     buf[8..16].copy_from_slice(&rights.to_le_bytes());
                     buf[16..24].copy_from_slice(&rights.to_le_bytes());
@@ -407,7 +418,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             // accounting lands.
             let mapped = match clock_id {
                 0 => 0u32,
-                1 | 2 | 3 => 1u32,
+                1..=3 => 1u32,
                 _ => return EINVAL,
             };
             let req = mapped.to_le_bytes();
@@ -453,7 +464,10 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             let mut buf = [0u8; 8];
             buf[0] = 0; // PREOPENTYPE_DIR
             buf[4..8].copy_from_slice(&(PREOPEN_ROOT_NAME.len() as u32).to_le_bytes());
-            if memory.write(&mut caller, prestat_ptr as usize, &buf).is_err() {
+            if memory
+                .write(&mut caller, prestat_ptr as usize, &buf)
+                .is_err()
+            {
                 return EINVAL;
             }
             0
@@ -818,7 +832,10 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             buf[24..32].copy_from_slice(&1u64.to_le_bytes());
             buf[32..40].copy_from_slice(&size.to_le_bytes());
             // atim/mtim/ctim left zero.
-            if memory.write(&mut caller, filestat_ptr as usize, &buf).is_err() {
+            if memory
+                .write(&mut caller, filestat_ptr as usize, &buf)
+                .is_err()
+            {
                 return EINVAL;
             }
             0

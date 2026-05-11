@@ -56,12 +56,17 @@ pub enum FdEntry {
     Stdin,
     Stdout,
     Stderr,
-    Pipe { id: u64, end: PipeEnd },
+    Pipe {
+        id: u64,
+        end: PipeEnd,
+    },
     /// Read-only handle into the in-memory ramfs. `ofd_id` references
     /// an [`OpenFileDescription`] in `Kernel::ofds`; the OFD owns the
     /// byte cursor and (once we add it) flags. Multiple fds — created
     /// via dup/dup2 — share the same OFD, matching POSIX semantics.
-    File { ofd_id: u64 },
+    File {
+        ofd_id: u64,
+    },
     // Future: Socket { id: u64 }
 }
 
@@ -86,12 +91,6 @@ impl FdTable {
     /// Read-only view of an entry. None if `fd` is closed.
     pub fn entry(&self, fd: u32) -> Option<&FdEntry> {
         self.entries.get(&fd)
-    }
-
-    /// Mutable view — used for in-place edits (e.g. advancing a
-    /// `FdEntry::File` cursor after a successful read).
-    pub fn entry_mut(&mut self, fd: u32) -> Option<&mut FdEntry> {
-        self.entries.get_mut(&fd)
     }
 
     /// Lowest unused fd number. Used by `dup` and `pipe` to allocate.
@@ -341,8 +340,7 @@ pub struct PendingSpawn {
 
 impl Kernel {
     fn new() -> Self {
-        let mut vfs =
-            crate::vfs::MountTable::new(Box::new(crate::vfs::RamfsBackend::new()));
+        let mut vfs = crate::vfs::MountTable::new(Box::new(crate::vfs::RamfsBackend::new()));
         // Linux-style virtual mounts. Both backends slot in via the
         // VfsBackend trait; dispatch never special-cases their paths.
         vfs.add_mount(b"/dev".to_vec(), Box::new(crate::vfs::DevBackend::new()));
@@ -430,12 +428,7 @@ impl Kernel {
     /// Allocate a fresh OFD pointing at `(mount_id, inode)`, with
     /// refcount 1, offset 0, and the requested `writable` flag.
     /// Returns the OFD id.
-    pub fn create_ofd(
-        &mut self,
-        mount_id: crate::vfs::MountId,
-        inode: u64,
-        writable: bool,
-    ) -> u64 {
+    pub fn create_ofd(&mut self, mount_id: crate::vfs::MountId, inode: u64, writable: bool) -> u64 {
         let id = self.next_ofd_id;
         self.next_ofd_id += 1;
         self.ofds.insert(

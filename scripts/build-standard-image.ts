@@ -66,6 +66,8 @@ async function fetchOrCache(
   return bytes;
 }
 
+const enc = new TextEncoder();
+
 async function main() {
   console.log("Building standard.yurtimg from pre-built yurtpkg packages...\n");
 
@@ -80,6 +82,53 @@ async function main() {
     await installYurtPackage(bytes, vfs);
     console.log(`  OK`);
   }
+
+  // Add /sbin symlinks for init/getty/login.  The busybox binary includes
+  // these applets (CONFIG_INIT/GETTY/LOGIN=y); the package only ships the
+  // flat /bin/ tree so we wire up the sbin entries here.
+  console.log("\nWiring /sbin symlinks...");
+  vfs.withWriteAccess(() => {
+    vfs.mkdirp("/sbin");
+    for (const name of ["init", "getty", "halt", "reboot", "poweroff"]) {
+      try {
+        vfs.symlink("/bin/busybox", `/sbin/${name}`);
+      } catch {
+        // already present — fine
+      }
+    }
+    // login lives in /bin alongside the other user-facing tools
+    try {
+      vfs.symlink("busybox", "/bin/login");
+    } catch { /* exists */ }
+  });
+  console.log("  OK");
+
+  // Minimal /etc scaffold for a working POSIX boot.
+  // Full /etc/passwd and /etc/inittab are provisioned by Sandbox.create();
+  // we write the empty directories here so the VFS stat succeeds even when
+  // the sandbox layer hasn't been applied yet.
+  vfs.withWriteAccess(() => {
+    try {
+      vfs.mkdirp("/etc");
+    } catch { /* exists */ }
+    try {
+      vfs.mkdirp("/home/user");
+    } catch { /* exists */ }
+    try {
+      vfs.mkdirp("/root");
+    } catch { /* exists */ }
+    try {
+      vfs.mkdirp("/var/run");
+    } catch { /* exists */ }
+    try {
+      vfs.mkdirp("/tmp");
+    } catch { /* exists */ }
+    // /etc/shells — tells login which shells are acceptable
+    vfs.writeFile(
+      "/etc/shells",
+      enc.encode("/bin/sh\n/bin/ash\n/bin/busybox\n"),
+    );
+  });
 
   console.log("\nExporting standard.yurtimg...");
   const img = await exportVfsToYurtImage(vfs);
