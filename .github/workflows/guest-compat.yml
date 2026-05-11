@@ -91,6 +91,15 @@ jobs:
       - name: Build BusyBox fixture
         run: make -C test-fixtures/c-ports/busybox copy-fixtures
 
+      - name: Cache yurt-packages downloads
+        uses: actions/cache@v4
+        with:
+          path: test-fixtures/.pkg-cache
+          key: yurt-packages-busybox-1.37.0-pkg-0.1.0
+
+      - name: Build standard image from pre-built packages
+        run: deno run -A scripts/build-standard-image.ts
+
       - name: Build ncurses fixture
         run: make -C test-fixtures/c-ports/ncurses copy-fixtures
 
