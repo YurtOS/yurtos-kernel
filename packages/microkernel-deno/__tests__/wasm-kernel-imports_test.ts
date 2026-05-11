@@ -191,6 +191,26 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(t).toEqual(1.5);
   });
 
+  it("compound custom: host_write_file then host_read_file round-trips bytes", async () => {
+    if (!HAS_JSPI) return;
+    const mk = await freshMk();
+    const buf = new ArrayBuffer(128);
+    const u = new Uint8Array(buf);
+    // Stage "/data" at offset 0, "hello" at offset 16.
+    u.set(new TextEncoder().encode("/data"), 0);
+    u.set(new TextEncoder().encode("hello"), 16);
+    const imports = buildWasmKernelImports(mk, () => buf);
+    // host_write_file(pathPtr=0, pathLen=5, dataPtr=16, dataLen=5, mode=0)
+    const written = await imports.host_write_file(0, 5, 16, 5, 0);
+    expect(written).toEqual(5);
+    // host_read_file(pathPtr=0, pathLen=5, outPtr=32, outCap=32)
+    u.subarray(32, 64).fill(0);
+    const n = await imports.host_read_file(0, 5, 32, 32);
+    expect(n).toEqual(5);
+    const got = new TextDecoder().decode(new Uint8Array(buf, 32, n));
+    expect(got).toEqual("hello");
+  });
+
   it("host_native_invoke forwards bytes via sys_extension_invoke", async () => {
     if (!HAS_JSPI) return;
     const mk = await freshMk();

@@ -383,6 +383,146 @@ export const HOST_BINDINGS: HostBinding[] = [
     },
   },
 
+  // host_read_file(pathPtr, pathLen, outPtr, outCap) → bytes.
+  // Compound: SYS_OPEN(flags=0, path) → fd → SYS_READ(fd) →
+  // SYS_CLOSE(fd). Close happens even if read fails.
+  {
+    name: "host_read_file",
+    method: METHOD.SYS_OPEN, // first hop; documentation only
+    args: [],
+    custom: (mk, memBuf) =>
+      async (
+        pathPtr: number,
+        pathLen: number,
+        outPtr: number,
+        outCap: number,
+      ): Promise<number> => {
+        const path = new Uint8Array(memBuf(), pathPtr, pathLen).slice();
+        const openReq = new Uint8Array(4 + path.length);
+        // flags=0 → read-only.
+        openReq.set(path, 4);
+        const openOut = await mk.syscallAsync(METHOD.SYS_OPEN, openReq, 0);
+        const fd = Number(openOut.rc);
+        if (fd < 0) return fd;
+        try {
+          const readReq = new Uint8Array(4);
+          new DataView(readReq.buffer).setUint32(0, fd, true);
+          const readOut = await mk.syscallAsync(METHOD.SYS_READ, readReq, outCap);
+          const n = Number(readOut.rc);
+          if (n > 0) {
+            new Uint8Array(memBuf(), outPtr, n).set(
+              readOut.response.subarray(0, n),
+            );
+          }
+          return n;
+        } finally {
+          const closeReq = new Uint8Array(4);
+          new DataView(closeReq.buffer).setUint32(0, fd, true);
+          await mk.syscallAsync(METHOD.SYS_CLOSE, closeReq, 0);
+        }
+      },
+  },
+
+  // ── TS-only sugar stubs ──────────────────────────────────
+  // These TS-side host_* have no Rust SYS_* counterpart (they're
+  // sugar layered above the kernel surface). The wasm overlay
+  // installs neutral stubs so bash gets sensible default replies
+  // instead of -ENOSYS. Embedders that need the real TS behavior
+  // can omit these from `wasmOverrideNames`, leaving them TS.
+
+  // host_has_tool(name_ptr, name_len) → 0 (not registered) /
+  // -ENOENT. The neutral answer "no" lets bash fall through to a
+  // PATH lookup via host_spawn.
+  {
+    name: "host_has_tool",
+    method: 0,
+    args: [],
+    custom: () => async (): Promise<number> => -2, // -ENOENT
+  },
+  // host_register_tool(name_ptr, name_len, path_ptr, path_len) → 0.
+  // The wasm-mode kernel doesn't maintain a tool registry — the
+  // host-side ProcessManager does, on the TS side. Acknowledge
+  // (0) so bash's startup checks don't error.
+  {
+    name: "host_register_tool",
+    method: 0,
+    args: [],
+    custom: () => async (): Promise<number> => 0,
+  },
+  // host_glob(pat_ptr, pat_len, out_ptr, out_cap) → -ENOSYS.
+  // Bash falls back to its built-in glob expansion when the host
+  // doesn't provide one.
+  {
+    name: "host_glob",
+    method: 0,
+    args: [],
+    custom: () => async (): Promise<number> => -38, // -ENOSYS
+  },
+  // host_list_processes(out_ptr, out_cap) → 4 (count=0). The
+  // wire format is u32 count + entries; writing just a zero count
+  // is a valid "no entries" response.
+  {
+    name: "host_list_processes",
+    method: 0,
+    args: [],
+    custom: (_mk, memBuf) =>
+      async (outPtr: number, outCap: number): Promise<number> => {
+        if (outCap < 4) return -22; // -EINVAL
+        new DataView(memBuf(), outPtr, 4).setUint32(0, 0, true);
+        return 4;
+      },
+  },
+
+  // host_write_file(pathPtr, pathLen, dataPtr, dataLen, mode) → bytes.
+  // Compound: SYS_OPEN(O_WRITE|O_CREAT [|O_TRUNC]) → optional
+  // SYS_LSEEK(SEEK_END) for mode=1 (append) → SYS_WRITE →
+  // SYS_CLOSE.
+  {
+    name: "host_write_file",
+    method: METHOD.SYS_OPEN,
+    args: [],
+    custom: (mk, memBuf) =>
+      async (
+        pathPtr: number,
+        pathLen: number,
+        dataPtr: number,
+        dataLen: number,
+        mode: number,
+      ): Promise<number> => {
+        const path = new Uint8Array(memBuf(), pathPtr, pathLen).slice();
+        // mode 0 = overwrite (truncate); mode 1 = append.
+        const flags = mode === 1 ? 0b011 : 0b111; // W|C [|T]
+        const openReq = new Uint8Array(4 + path.length);
+        new DataView(openReq.buffer).setUint32(0, flags, true);
+        openReq.set(path, 4);
+        const openOut = await mk.syscallAsync(METHOD.SYS_OPEN, openReq, 0);
+        const fd = Number(openOut.rc);
+        if (fd < 0) return fd;
+        try {
+          if (mode === 1) {
+            // Seek to end. Request: u32 fd + i64 offset (0) + u32
+            // whence (SEEK_END=2). Response: 8-byte new offset.
+            const lseekReq = new Uint8Array(16);
+            const lv = new DataView(lseekReq.buffer);
+            lv.setUint32(0, fd, true);
+            lv.setBigInt64(4, 0n, true);
+            lv.setUint32(12, 2, true);
+            await mk.syscallAsync(METHOD.SYS_LSEEK, lseekReq, 8);
+          }
+          const data = new Uint8Array(memBuf(), dataPtr, dataLen).slice();
+          const writeReq = new Uint8Array(4 + data.length);
+          new DataView(writeReq.buffer).setUint32(0, fd, true);
+          writeReq.set(data, 4);
+          const writeOut = await mk.syscallAsync(METHOD.SYS_WRITE, writeReq, 0);
+          return Number(writeOut.rc);
+        } finally {
+          const closeReq = new Uint8Array(4);
+          new DataView(closeReq.buffer).setUint32(0, fd, true);
+          await mk.syscallAsync(METHOD.SYS_CLOSE, closeReq, 0);
+        }
+      },
+  },
+
   // ── Signals ───────────────────────────────────────────────
   // sigaction(sig, actPtr, actLen) — TS host_sigaction shape.
   // Not in our common test path; left to a future expansion.
