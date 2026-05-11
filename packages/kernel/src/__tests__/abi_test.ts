@@ -60,7 +60,110 @@ class StaticFetchBridge implements NetworkBridgeLike {
   }
 }
 
-describe("Kernel ABI canaries", () => {
+// ─────────────────────────────────────────────────────────────────────
+// AF_UNIX (unix-canary)
+//
+// Spec: docs/superpowers/specs/2026-05-11-af-unix-design.md
+// Plan: docs/superpowers/plans/2026-05-11-af-unix.md
+//
+// Slice 1 pins the contract: this describe.skip block lists every
+// case the canary defines and the slice that will unskip it. The
+// canary itself emits {"exit":99,"stdout":"pending-impl"} for each
+// case until its slice lands, so the C source compiles cleanly
+// against today's libyurt (which rejects AF_UNIX with EAFNOSUPPORT)
+// and CI stays green.
+//
+// Each `it.skip` carries a one-line TODO citing the slice that flips
+// it to `it`.
+// ─────────────────────────────────────────────────────────────────────
+describe("AF_UNIX (unix-canary)", () => {
+  it("pair_basic: socketpair(AF_UNIX, SOCK_STREAM) returns two connected fds", async () => {
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case pair_basic");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"pair_basic","exit":0,"stdout":"pair=ok"}');
+  });
+
+  it("bind_listen_accept: bind, listen, and accept on /tmp/foo.sock", async () => {
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case bind_listen_accept");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"bind_listen_accept","exit":0,"stdout":"bla=ok"}');
+  });
+
+  it("stat_socket_inode: bind creates an S_IFSOCK inode visible to stat()", async () => {
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case stat_socket_inode");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"stat_socket_inode","exit":0,"stdout":"ifsock=ok"}');
+  });
+
+  it("unlink_removes: unlink of the bound path makes subsequent connect() fail", async () => {
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case unlink_removes");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"unlink_removes","exit":0,"stdout":"unlink=ok"}');
+  });
+
+  it("connect_refused: connect to a path with no listener returns ECONNREFUSED", async () => {
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case connect_refused");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"connect_refused","exit":0,"stdout":"refused=ok"}');
+  });
+
+  it("abstract_bind_connect: bind/connect with a \\0-prefixed name", async () => {
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//], unixAbstractAllowlist: [/.*/] },
+    });
+    const result = await sandbox.run("unix-canary --case abstract_bind_connect");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"abstract_bind_connect","exit":0,"stdout":"abstract=ok"}');
+  });
+
+  it("abstract_invisible_to_stat: abstract names do not appear in the VFS", async () => {
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//], unixAbstractAllowlist: [/.*/] },
+    });
+    const result = await sandbox.run("unix-canary --case abstract_invisible_to_stat");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"abstract_invisible_to_stat","exit":0,"stdout":"invisible=ok"}');
+  });
+  // TODO(af-unix slice 4): unskip — datagram socketpair preserves message boundaries.
+  it.skip("dgram_pair_message_framing: socketpair SOCK_DGRAM preserves message boundaries", () => {});
+  // TODO(af-unix slice 4): unskip — sendto by path.
+  it.skip("dgram_path_sendto: sendto delivers a datagram to a bound path", () => {});
+  // TODO(af-unix slice 5): unskip — fd passing via sendmsg/SCM_RIGHTS.
+  it.skip("scm_rights_pipe_handoff: sendmsg with SCM_RIGHTS passes a pipe read end", () => {});
+  // TODO(af-unix slice 6): unskip — SO_PEERCRED reads peer pid/uid/gid.
+  it.skip("peercred_after_accept: getsockopt(SO_PEERCRED) returns the peer's ucred", () => {});
+});
+
+describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }, () => {
   let sandbox: Sandbox | null = null;
 
   afterEach(() => {
@@ -1497,107 +1600,4 @@ describe("Kernel ABI canaries", () => {
       });
     },
   );
-});
-
-// ─────────────────────────────────────────────────────────────────────
-// AF_UNIX (unix-canary)
-//
-// Spec: docs/superpowers/specs/2026-05-11-af-unix-design.md
-// Plan: docs/superpowers/plans/2026-05-11-af-unix.md
-//
-// Slice 1 pins the contract: this describe.skip block lists every
-// case the canary defines and the slice that will unskip it. The
-// canary itself emits {"exit":99,"stdout":"pending-impl"} for each
-// case until its slice lands, so the C source compiles cleanly
-// against today's libyurt (which rejects AF_UNIX with EAFNOSUPPORT)
-// and CI stays green.
-//
-// Each `it.skip` carries a one-line TODO citing the slice that flips
-// it to `it`.
-// ─────────────────────────────────────────────────────────────────────
-describe("AF_UNIX (unix-canary)", () => {
-  it("pair_basic: socketpair(AF_UNIX, SOCK_STREAM) returns two connected fds", async () => {
-    const sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
-    });
-    const result = await sandbox.run("unix-canary --case pair_basic");
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"pair_basic","exit":0,"stdout":"pair=ok"}');
-  });
-
-  it("bind_listen_accept: bind, listen, and accept on /tmp/foo.sock", async () => {
-    const sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
-    });
-    const result = await sandbox.run("unix-canary --case bind_listen_accept");
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"bind_listen_accept","exit":0,"stdout":"bla=ok"}');
-  });
-
-  it("stat_socket_inode: bind creates an S_IFSOCK inode visible to stat()", async () => {
-    const sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
-    });
-    const result = await sandbox.run("unix-canary --case stat_socket_inode");
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"stat_socket_inode","exit":0,"stdout":"ifsock=ok"}');
-  });
-
-  it("unlink_removes: unlink of the bound path makes subsequent connect() fail", async () => {
-    const sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
-    });
-    const result = await sandbox.run("unix-canary --case unlink_removes");
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"unlink_removes","exit":0,"stdout":"unlink=ok"}');
-  });
-
-  it("connect_refused: connect to a path with no listener returns ECONNREFUSED", async () => {
-    const sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
-    });
-    const result = await sandbox.run("unix-canary --case connect_refused");
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"connect_refused","exit":0,"stdout":"refused=ok"}');
-  });
-
-  it("abstract_bind_connect: bind/connect with a \\0-prefixed name", async () => {
-    const sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//], unixAbstractAllowlist: [/.*/] },
-    });
-    const result = await sandbox.run("unix-canary --case abstract_bind_connect");
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"abstract_bind_connect","exit":0,"stdout":"abstract=ok"}');
-  });
-
-  it("abstract_invisible_to_stat: abstract names do not appear in the VFS", async () => {
-    const sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//], unixAbstractAllowlist: [/.*/] },
-    });
-    const result = await sandbox.run("unix-canary --case abstract_invisible_to_stat");
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"abstract_invisible_to_stat","exit":0,"stdout":"invisible=ok"}');
-  });
-  // TODO(af-unix slice 4): unskip — datagram socketpair preserves message boundaries.
-  it.skip("dgram_pair_message_framing: socketpair SOCK_DGRAM preserves message boundaries", () => {});
-  // TODO(af-unix slice 4): unskip — sendto by path.
-  it.skip("dgram_path_sendto: sendto delivers a datagram to a bound path", () => {});
-  // TODO(af-unix slice 5): unskip — fd passing via sendmsg/SCM_RIGHTS.
-  it.skip("scm_rights_pipe_handoff: sendmsg with SCM_RIGHTS passes a pipe read end", () => {});
-  // TODO(af-unix slice 6): unskip — SO_PEERCRED reads peer pid/uid/gid.
-  it.skip("peercred_after_accept: getsockopt(SO_PEERCRED) returns the peer's ucred", () => {});
 });
