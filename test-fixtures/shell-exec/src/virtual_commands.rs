@@ -31,7 +31,14 @@ pub fn try_virtual_command(
     let do_dup2 = state.stdout_fd != 1;
     let saved_fd1 = if do_dup2 { host.dup(1).ok() } else { None };
     if do_dup2 {
-        let _ = host.dup2(state.stdout_fd, 1);
+        if let Err(err) = host.dup2(state.stdout_fd, 1) {
+            if let Some(fd) = saved_fd1 {
+                let _ = host.dup2(fd, 1);
+                let _ = host.close_fd(fd);
+            }
+            shell_eprint!("{}: failed to redirect stdout: {err}\n", cmd);
+            return Some(RunResult::exit(1));
+        }
     }
 
     let result = match cmd {
@@ -42,7 +49,11 @@ pub fn try_virtual_command(
     };
 
     if let Some(fd) = saved_fd1 {
-        let _ = host.dup2(fd, 1);
+        if let Err(err) = host.dup2(fd, 1) {
+            let _ = host.close_fd(fd);
+            shell_eprint!("{}: failed to restore stdout: {err}\n", cmd);
+            return Some(RunResult::exit(1));
+        }
         let _ = host.close_fd(fd);
     }
 
@@ -353,4 +364,41 @@ fn cmd_wget(state: &mut ShellState, host: &dyn HostInterface, args: &[String]) -
     }
 
     RunResult::empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::try_virtual_command;
+    use crate::host::FetchResult;
+    use crate::state::ShellState;
+    use crate::test_support::mock::MockHost;
+    use std::collections::HashMap;
+
+    #[test]
+    fn virtual_command_reports_stdout_dup2_setup_failure() {
+        let mut state = ShellState::new_default();
+        state.stdout_fd = -1;
+        let host = MockHost::new().with_fetch_result(
+            "https://example.com",
+            FetchResult {
+                ok: true,
+                status: 200,
+                headers: HashMap::new(),
+                body: "body".to_string(),
+                body_base64: None,
+                error: None,
+            },
+        );
+
+        let result = try_virtual_command(
+            &mut state,
+            &host,
+            "curl",
+            &["https://example.com".to_string()],
+            "",
+        )
+        .expect("curl should be handled as a virtual command");
+
+        assert_eq!(result.exit_code, 1);
+    }
 }

@@ -143,6 +143,9 @@ int yurt_host_thread_join(int tid);
 __attribute__((import_module("yurt"), import_name("host_thread_detach")))
 int yurt_host_thread_detach(int tid);
 
+__attribute__((import_module("yurt"), import_name("host_thread_exit")))
+void yurt_host_thread_exit(int retval) __attribute__((noreturn));
+
 __attribute__((import_module("yurt"), import_name("host_thread_self")))
 int yurt_host_thread_self(void);
 

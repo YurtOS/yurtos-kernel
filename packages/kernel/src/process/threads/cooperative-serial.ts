@@ -1,8 +1,8 @@
-import type { ThreadsBackend } from './backend.js';
-import type { IndirectCallTable } from './indirect-call-table.js';
-import { NULL_INDIRECT_CALL_TABLE } from './indirect-call-table.js';
-import { AsyncLocalStorage } from 'node:async_hooks';
-import { WASI_EBUSY } from '../../wasi/types.js';
+import type { ThreadsBackend } from "./backend.js";
+import type { IndirectCallTable } from "./indirect-call-table.js";
+import { NULL_INDIRECT_CALL_TABLE } from "./indirect-call-table.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { WASI_EBUSY } from "../../wasi/types.js";
 
 interface SpawnSlot {
   result: Promise<number>;
@@ -26,8 +26,12 @@ interface Waiter {
   wake: () => void;
 }
 
+class ThreadExit {
+  constructor(readonly retval: number) {}
+}
+
 export class CooperativeSerialBackend implements ThreadsBackend {
-  readonly kind = 'cooperative-serial' as const;
+  readonly kind = "cooperative-serial" as const;
 
   // FIXME: This backend is only a compatibility bridge for one spawned thread at a
   // time. Real Rayon/std::thread parallelism requires a shared-memory + atomics
@@ -42,6 +46,7 @@ export class CooperativeSerialBackend implements ThreadsBackend {
   private stackPointer: WebAssembly.Global | null = null;
   private activeTid = 0;
   private readonly stackPagesPerThread = 16;
+  private readonly maxSpawnSlots = 8;
 
   setIndirectCallTable(table: IndirectCallTable): void {
     this.indirectTable = table;
@@ -73,15 +78,23 @@ export class CooperativeSerialBackend implements ThreadsBackend {
   async spawn(fnPtr: number, arg: number): Promise<number> {
     this.ensureMainSlot();
     if (this.liveSpawnedThreads() >= this.maxLiveSpawnedThreads) return -1;
-    const tid = this.slots.length;
+    const canAllocateSlot = this.slots.length <= this.maxSpawnSlots;
+    const reusableTid = canAllocateSlot
+      ? -1
+      : this.slots.findIndex((slot, tid) =>
+        tid !== 0 && slot.finished && slot.reaped
+      );
+    if (!canAllocateSlot && reusableTid === -1) return -1;
+    const tid = reusableTid === -1 ? this.slots.length : reusableTid;
     const slot: SpawnSlot = {
       result: Promise.resolve(-1),
       reaped: false,
       detached: false,
       finished: false,
-      stackPointer: this.allocateThreadStackTop(),
+      stackPointer: this.slots[tid]?.stackPointer ??
+        this.allocateThreadStackTop(),
     };
-    this.slots.push(slot);
+    this.slots[tid] = slot;
     slot.result = Promise.resolve()
       .then(() =>
         this.tids.run(tid, async () => {
@@ -94,7 +107,7 @@ export class CooperativeSerialBackend implements ThreadsBackend {
           }
         })
       )
-      .catch(() => -1)
+      .catch((err) => err instanceof ThreadExit ? err.retval : -1)
       .finally(() => {
         slot.finished = true;
       });
@@ -116,6 +129,10 @@ export class CooperativeSerialBackend implements ThreadsBackend {
     return 0;
   }
 
+  exit(retval: number): never {
+    throw new ThreadExit(retval);
+  }
+
   self(): number {
     return this.tids.getStore() ?? 0;
   }
@@ -134,10 +151,12 @@ export class CooperativeSerialBackend implements ThreadsBackend {
         return 0;
       }
       if (state.owner === tid) return -1;
-      await new Promise<void>((resolve) => state.waiters.push({
-        tid,
-        wake: resolve,
-      }));
+      await new Promise<void>((resolve) =>
+        state.waiters.push({
+          tid,
+          wake: resolve,
+        })
+      );
     }
   }
 
@@ -159,10 +178,12 @@ export class CooperativeSerialBackend implements ThreadsBackend {
   async condWait(condPtr: number, mutexPtr: number): Promise<number> {
     const state = this.condvarState(condPtr);
     const tid = this.self();
-    const wait = new Promise<void>((resolve) => state.waiters.push({
-      tid,
-      wake: resolve,
-    }));
+    const wait = new Promise<void>((resolve) =>
+      state.waiters.push({
+        tid,
+        wake: resolve,
+      })
+    );
     const unlock = this.mutexUnlock(mutexPtr);
     if (unlock !== 0) return unlock;
     await wait;

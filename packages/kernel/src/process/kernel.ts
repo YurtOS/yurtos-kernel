@@ -279,7 +279,11 @@ export class ProcessKernel {
     const fd = preferredFd !== undefined && !processFds.has(preferredFd)
       ? preferredFd
       : this.nextLowestFd(pid, 0);
-    const openFile = new FdTable(vfs);
+    const credentials = this.getCredentials(pid);
+    const openFile = new FdTable(vfs, {
+      uid: credentials.euid,
+      gid: credentials.egid,
+    });
     let vfsFd = openFile.open(path, mode);
     if (vfsFd !== fd) {
       openFile.renumber(vfsFd, fd);

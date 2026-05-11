@@ -69,3 +69,38 @@ Deno.test("cooperative serial backend gives spawned threads a separate linear st
   assertEquals(await join, 0);
   assertEquals(stackPointer.value, 65536);
 });
+
+Deno.test("cooperative serial backend maps thread exit to join retval", async () => {
+  const backend = new CooperativeSerialBackend();
+  backend.setIndirectCallTable({
+    call() {
+      return Promise.resolve().then(() => backend.exit(42));
+    },
+  });
+
+  const tid = await backend.spawn(1, 0);
+  assertEquals(tid, 1);
+  assertEquals(await backend.join(tid), 42);
+});
+
+Deno.test("cooperative serial backend keeps spawned thread stack growth bounded", async () => {
+  const backend = new CooperativeSerialBackend();
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const stackPointer = new WebAssembly.Global(
+    { value: "i32", mutable: true },
+    65536,
+  );
+  backend.bindLinearStack(memory, stackPointer);
+  backend.setIndirectCallTable({
+    call(_fnPtr, arg) {
+      return Promise.resolve(arg);
+    },
+  });
+
+  for (let i = 0; i < 10; i++) {
+    const tid = await backend.spawn(1, i + 11);
+    assertEquals(await backend.join(tid), i + 11);
+  }
+
+  assertEquals(memory.buffer.byteLength / 65536, 2 + 8 * 16);
+});

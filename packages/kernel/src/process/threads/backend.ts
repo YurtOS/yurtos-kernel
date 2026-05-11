@@ -6,6 +6,7 @@ export interface ThreadsBackend {
   spawn(fnPtr: number, arg: number): Promise<number>;
   join(tid: number): Promise<number>;
   detach(tid: number): Promise<number>;
+  exit(retval: number): never;
   self(): number;
   yield_(): Promise<number>;
   mutexLock(mutexPtr: number): Promise<number>;

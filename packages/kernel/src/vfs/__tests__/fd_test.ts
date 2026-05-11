@@ -184,6 +184,21 @@ describe('FdTable', () => {
       'buffered close flush',
     );
   });
+
+  it('flushes dirty writes with the descriptor credentials, not privileged VFS access', () => {
+    const vfs = new VFS();
+    vfs.withWriteAccess(() => {
+      vfs.writeFile('/root-owned.txt', new TextEncoder().encode('original'), 0o444);
+      vfs.chown('/root-owned.txt', 0, 0);
+    });
+
+    const fdt = new FdTable(vfs, { uid: 1000, gid: 1000 });
+    const fd = fdt.open('/root-owned.txt', 'w');
+    fdt.write(fd, new TextEncoder().encode('bypass'));
+
+    expect(() => fdt.close(fd)).toThrow('permission denied');
+    expect(new TextDecoder().decode(vfs.readFile('/root-owned.txt'))).toBe('original');
+  });
 });
 
 describe('Pipe', () => {

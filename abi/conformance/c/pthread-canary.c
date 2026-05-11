@@ -1,6 +1,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <poll.h>
+#include <sched.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -21,6 +22,16 @@ static void *exit_poll_blocker(void *arg) {
   }
   return NULL;
 }
+
+static void *return_arg_worker(void *arg) {
+  return arg;
+}
+
+static void *pthread_exit_worker(void *arg) {
+  pthread_exit(arg);
+  return (void *)1;
+}
+
 static void *worker(void *arg) {
   int id = (int)(long)arg;
   long initial_tls_value = (long)pthread_getspecific(tls_key);
@@ -132,16 +143,61 @@ int main(void) {
     fprintf(stderr, "pthread-canary: counter race: got %d, expected %d\n", shared_counter, EXPECTED);
     return 5;
   }
+
+  pthread_t exit_value_tid;
+  void *exit_value = NULL;
+  int exit_value_rc = pthread_create(&exit_value_tid, NULL, pthread_exit_worker, (void *)42);
+  if (exit_value_rc != 0) {
+    fprintf(stderr, "pthread-canary: pthread_exit pthread_create returned %d\n", exit_value_rc);
+    return 1;
+  }
+  exit_value_rc = pthread_join(exit_value_tid, &exit_value);
+  if (exit_value_rc != 0 || exit_value != (void *)42) {
+    fprintf(stderr, "pthread-canary: pthread_exit join returned rc=%d value=%p\n", exit_value_rc, exit_value);
+    return 1;
+  }
+
+  for (long i = 0; i < 4; i++) {
+    pthread_t cycle_tid;
+    void *cycle_value = NULL;
+    int cycle_rc = pthread_create(&cycle_tid, NULL, return_arg_worker, (void *)(i + 10));
+    if (cycle_rc != 0) {
+      fprintf(stderr, "pthread-canary: lifecycle pthread_create #%ld returned %d\n", i, cycle_rc);
+      return 1;
+    }
+    cycle_rc = pthread_join(cycle_tid, &cycle_value);
+    if (cycle_rc != 0 || cycle_value != (void *)(i + 10)) {
+      fprintf(stderr, "pthread-canary: lifecycle join #%ld rc=%d value=%p\n", i, cycle_rc, cycle_value);
+      return 1;
+    }
+  }
+
   if (pipe(exit_poll_pipe) != 0) {
     fprintf(stderr, "pthread-canary: exit poll pipe failed\n");
     return 1;
   }
   pthread_attr_t exit_attr;
+  int detach_state = PTHREAD_CREATE_JOINABLE;
   if (pthread_attr_init(&exit_attr) != 0 ||
-      pthread_attr_setdetachstate(&exit_attr, PTHREAD_CREATE_DETACHED) != 0) {
+      pthread_attr_setdetachstate(&exit_attr, PTHREAD_CREATE_DETACHED) != 0 ||
+      pthread_attr_getdetachstate(&exit_attr, &detach_state) != 0 ||
+      detach_state != PTHREAD_CREATE_DETACHED) {
     fprintf(stderr, "pthread-canary: exit attr setup failed\n");
     return 1;
   }
+  pthread_t detached_return_tid;
+  int detached_return_rc = pthread_create(&detached_return_tid, &exit_attr, return_arg_worker, (void *)7);
+  if (detached_return_rc != 0) {
+    fprintf(stderr, "pthread-canary: detached-return pthread_create returned %d\n", detached_return_rc);
+    return 1;
+  }
+  void *detached_return_value = NULL;
+  detached_return_rc = pthread_join(detached_return_tid, &detached_return_value);
+  if (detached_return_rc != ESRCH) {
+    fprintf(stderr, "pthread-canary: detached pthread_join returned %d, expected ESRCH=%d\n", detached_return_rc, ESRCH);
+    return 1;
+  }
+  sched_yield();
   pthread_t exit_tid;
   int exit_rc = pthread_create(&exit_tid, &exit_attr, exit_poll_blocker, NULL);
   pthread_attr_destroy(&exit_attr);

@@ -49,6 +49,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_pipe.o \
   $(BUILD_DIR)/yurt_process.o \
   $(BUILD_DIR)/yurt_pthread.o \
+  $(BUILD_DIR)/yurt_pthread_rs.o \
   $(BUILD_DIR)/yurt_resource.o \
   $(BUILD_DIR)/yurt_sched.o \
   $(BUILD_DIR)/yurt_sendfile.o \
@@ -107,6 +108,14 @@ $(BUILD_DIR)/%.o: src/%.c $(wildcard include/*.h) src/yurt_runtime.h src/yurt_ma
 	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) $(YURT_CC) $(YURT_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/yurt_locale_rs.o: rust/yurt-libc/src/locale.rs | $(BUILD_DIR)
+	rustc --target wasm32-wasip1 \
+	  --crate-type=lib \
+	  --emit=obj=$@ \
+	  -C panic=abort \
+	  -C opt-level=2 \
+	  $<
+
+$(BUILD_DIR)/yurt_pthread_rs.o: rust/yurt-libc/src/pthread.rs | $(BUILD_DIR)
 	rustc --target wasm32-wasip1 \
 	  --crate-type=lib \
 	  --emit=obj=$@ \
