@@ -73,6 +73,13 @@ export interface LoaderContext {
     pid: number,
   ): (fd: 1 | 2) => { data: string; truncated: boolean };
   moduleCache?: WasmModuleCache;
+  /**
+   * Extra import names whose values are Promise-returning and must
+   * be wrapped with WebAssembly.Suspending (or AsyncifyBridge).
+   * Populated by Sandbox when kernelImpl="wasm" overlays host_*
+   * imports with Microkernel-backed wrappers.
+   */
+  extraAsyncImports?: string[];
 }
 
 export interface LoadProcessOptions {
@@ -233,6 +240,7 @@ export async function loadProcess(
       "host_thread_yield",
       "host_mutex_lock",
       "host_cond_wait",
+      ...(ctx.extraAsyncImports ?? []),
     ],
     asyncifyBridge,
     threadsBackend,
@@ -411,6 +419,7 @@ export async function loadProcess(
           "host_thread_yield",
           "host_mutex_lock",
           "host_cond_wait",
+          ...(ctx.extraAsyncImports ?? []),
         ],
         childBridge,
         childThreadsBackend,

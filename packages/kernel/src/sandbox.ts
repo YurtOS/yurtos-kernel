@@ -128,9 +128,26 @@ export interface SandboxOptions {
    * kernel.wasm bytes used when `kernelImpl: "wasm"`. Embedders
    * typically `await Deno.readFile(...)` the artifact built by
    * `cargo build -p yurt-kernel-wasm --target wasm32-wasip1
-   * --release`.
+   * --release`. Optional metadata only — the actual wiring is
+   * supplied via `wasmHostImports`.
    */
   wasmKernelBytes?: Uint8Array;
+  /**
+   * Factory invoked per-guest-instance to overlay
+   * Microkernel-backed wrappers for the host_* imports listed in
+   * `wasmOverrideNames`. Each wrapper returns Promise<number>;
+   * the loader wraps them with WebAssembly.Suspending (JSPI) or
+   * AsyncifyAsyncBridge (asyncify fallback) before instantiation.
+   *
+   * Required when `kernelImpl: "wasm"`. Typically constructed via
+   * microkernel-deno's `buildWasmKernelImports` against a
+   * Microkernel loaded from `wasmKernelBytes`.
+   */
+  wasmHostImports?: (
+    memory: WebAssembly.Memory,
+  ) => Record<string, (...args: number[]) => Promise<number>>;
+  /** Names of host_* imports covered by `wasmHostImports`. */
+  wasmOverrideNames?: string[];
   /** Directory (Node) or URL base (browser) containing .wasm files. */
   wasmDir: string;
   /** Platform adapter. Auto-detected if not provided (Node vs browser). */
@@ -208,6 +225,11 @@ interface SandboxParts {
   storage?: StorageCallbacks;
   bootArgv: string[];
   bootImports?: (api: KernelApi) => Record<string, WebAssembly.ImportValue>;
+  runCommandHandler?: RunCommandHandler;
+  wasmHostImports?: (
+    memory: WebAssembly.Memory,
+  ) => Record<string, (...args: number[]) => Promise<number>>;
+  wasmOverrideNames?: string[];
 }
 
 interface PasswdEntry {
@@ -251,6 +273,13 @@ export class Sandbox {
   private bootImports:
     | ((api: KernelApi) => Record<string, WebAssembly.ImportValue>)
     | undefined;
+  private runCommandHandler: RunCommandHandler | undefined;
+  private wasmHostImports:
+    | ((
+      memory: WebAssembly.Memory,
+    ) => Record<string, (...args: number[]) => Promise<number>>)
+    | undefined;
+  private wasmOverrideNames: string[] | undefined;
   private activeDeadlineMs: number | undefined;
   private envNeedsSync = false;
   /**
@@ -289,6 +318,9 @@ export class Sandbox {
     this.storage = parts.storage ?? null;
     this.bootArgv = parts.bootArgv;
     this.bootImports = parts.bootImports;
+    this.runCommandHandler = parts.runCommandHandler;
+    this.wasmHostImports = parts.wasmHostImports;
+    this.wasmOverrideNames = parts.wasmOverrideNames;
     this.envNeedsSync = parts.env.size > 0;
   }
 
@@ -324,22 +356,12 @@ export class Sandbox {
         "Sandbox.create accepts either baseRoot or image, not both",
       );
     }
-    if (options.kernelImpl === "wasm" && !options.wasmKernelBytes) {
+    if (options.kernelImpl === "wasm" && !options.wasmHostImports) {
       throw new Error(
-        "Sandbox.create({kernelImpl:'wasm'}) requires wasmKernelBytes (the kernel.wasm artifact). Build it with `cargo build -p yurt-kernel-wasm --target wasm32-wasip1 --release`.",
+        "Sandbox.create({kernelImpl:'wasm'}) requires wasmHostImports. " +
+          "Construct via microkernel-deno's buildWasmKernelImports against " +
+          "a Microkernel loaded from wasmKernelBytes.",
       );
-    }
-    // Phase 7.2c integration is in flight — the wasm-mode path
-    // loads a Microkernel from wasmKernelBytes and overlays
-    // host_* imports through microkernel-deno's
-    // buildWasmKernelImports. Until that lands end-to-end the
-    // option is accepted (so embedders can pin to the contract)
-    // but routes to the TS kernel for now. See
-    // project_phase7_parity_gate memory for the remaining work.
-    if (options.kernelImpl === "wasm") {
-      // No-op for now; see memory note. The Sandbox does NOT
-      // throw — the kernelImpl option is the stable surface
-      // even before the integration finishes.
     }
     const adapter = options.adapter ?? await Sandbox.detectAdapter();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -506,6 +528,8 @@ export class Sandbox {
       stderrLimit: secLimits?.stderrBytes,
       toolAllowlist: options.security?.toolAllowlist,
       moduleCache,
+      wasmHostImports: options.wasmHostImports,
+      wasmOverrideNames: options.wasmOverrideNames,
     });
 
     const bootProcess = await loadProcess(loaderCtx, {
@@ -744,6 +768,9 @@ export class Sandbox {
       storage: options.storage,
       bootArgv,
       bootImports: options.bootImports,
+      runCommandHandler: options.runCommandHandler,
+      wasmHostImports: options.wasmHostImports,
+      wasmOverrideNames: options.wasmOverrideNames,
     });
     sandboxRef = sb;
 
@@ -1058,6 +1085,16 @@ export class Sandbox {
     toolAllowlist?: string[];
     moduleCache?: WasmModuleCache;
     processCredentials?: ProcessCredentials;
+    /**
+     * When kernelImpl="wasm", a factory that returns the
+     * Microkernel-backed host_* overlay for a given guest memory.
+     * Wrappers are Promise-returning; the loader wraps them with
+     * Suspending/asyncify alongside the existing async list.
+     */
+    wasmHostImports?: (
+      memory: WebAssembly.Memory,
+    ) => Record<string, (...args: number[]) => Promise<number>>;
+    wasmOverrideNames?: string[];
   }): LoaderContext {
     const {
       vfs,
@@ -1077,6 +1114,8 @@ export class Sandbox {
       toolAllowlist,
       moduleCache,
       processCredentials,
+      wasmHostImports,
+      wasmOverrideNames,
     } = opts;
     const allowedTools = toolAllowlist ? new Set(toolAllowlist) : null;
 
@@ -1214,13 +1253,24 @@ export class Sandbox {
             return childPid;
           },
         });
-        return {
+        const base: Record<string, WebAssembly.ImportValue> = {
           ...kernelImports,
           host_spawn_async: kernelImports.host_spawn,
         };
+        if (wasmHostImports) {
+          // Overlay Microkernel-backed wrappers. Each wrapper is
+          // Promise<number>; the loader's wrap list wraps them
+          // with Suspending/asyncify before instantiation.
+          const overlay = wasmHostImports(memory);
+          for (const [name, fn] of Object.entries(overlay)) {
+            base[name] = fn as unknown as WebAssembly.ImportValue;
+          }
+        }
+        return base;
       },
       makeFdReadAndClear,
       moduleCache,
+      extraAsyncImports: wasmOverrideNames,
     });
 
     return makeContextWithAllocator((argv) => {
@@ -1871,6 +1921,8 @@ export class Sandbox {
       stderrLimit: this.security?.limits?.stderrBytes,
       toolAllowlist: this.security?.toolAllowlist,
       moduleCache: this.moduleCache,
+      wasmHostImports: this.wasmHostImports,
+      wasmOverrideNames: this.wasmOverrideNames,
     });
     const proc = await loadProcess(loaderCtx, {
       argv,
@@ -2158,6 +2210,8 @@ export class Sandbox {
       stderrLimit: this.security?.limits?.stderrBytes,
       toolAllowlist: this.security?.toolAllowlist,
       moduleCache: this.moduleCache,
+      wasmHostImports: this.wasmHostImports,
+      wasmOverrideNames: this.wasmOverrideNames,
     });
     const childEnv = this.getEnvMap();
     const childBootProcess = await loadProcess(childCtx, {
