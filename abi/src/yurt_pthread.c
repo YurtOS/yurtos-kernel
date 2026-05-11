@@ -1,7 +1,6 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "yurt_markers.h"
@@ -34,40 +33,6 @@ YURT_DEFINE_MARKER(pthread_key_create,   0x70726b63u)
 YURT_DEFINE_MARKER(pthread_setspecific,  0x70737073u)
 YURT_DEFINE_MARKER(pthread_getspecific,  0x70677073u)
 YURT_DEFINE_MARKER(pthread_once,         0x706f6e63u)
-
-int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
-                   void *(*start_routine)(void *), void *arg) {
-  YURT_MARKER_CALL(pthread_create);
-  (void)attr;
-  if (!thread || !start_routine) return EINVAL;
-  int tid = yurt_host_thread_spawn((int)(intptr_t)start_routine, (int)(intptr_t)arg);
-  if (tid < 0) return EAGAIN;
-  *thread = (pthread_t)tid;
-  return 0;
-}
-
-int pthread_join(pthread_t thread, void **retval) {
-  YURT_MARKER_CALL(pthread_join);
-  int rv = yurt_host_thread_join((int)thread);
-  if (rv == -1) return ESRCH;
-  if (retval) *retval = (void *)(intptr_t)rv;
-  return 0;
-}
-
-int pthread_detach(pthread_t thread) {
-  YURT_MARKER_CALL(pthread_detach);
-  return yurt_host_thread_detach((int)thread) < 0 ? ESRCH : 0;
-}
-
-void pthread_exit(void *retval) {
-  YURT_MARKER_CALL(pthread_exit);
-  exit(retval ? 1 : 0);
-}
-
-pthread_t pthread_self(void) {
-  YURT_MARKER_CALL(pthread_self);
-  return (pthread_t)yurt_host_thread_self();
-}
 
 int pthread_equal(pthread_t a, pthread_t b) {
   return a == b;
@@ -203,59 +168,6 @@ int pthread_once(pthread_once_t *once_control, void (*init_routine)(void)) {
     *done = 1;
   }
   return 0;
-}
-
-int pthread_attr_init(pthread_attr_t *attr) {
-  if (!attr) return EINVAL;
-  memset(attr, 0, sizeof(*attr));
-  return 0;
-}
-
-int pthread_attr_destroy(pthread_attr_t *attr) {
-  return attr ? 0 : EINVAL;
-}
-
-int pthread_attr_getdetachstate(const pthread_attr_t *attr, int *detachstate) {
-  if (!attr || !detachstate) return EINVAL;
-  *detachstate = PTHREAD_CREATE_JOINABLE;
-  return 0;
-}
-
-int pthread_attr_setdetachstate(pthread_attr_t *attr, int detachstate) {
-  if (!attr) return EINVAL;
-  return detachstate == PTHREAD_CREATE_JOINABLE || detachstate == PTHREAD_CREATE_DETACHED
-    ? 0
-    : EINVAL;
-}
-
-int pthread_attr_getstacksize(const pthread_attr_t *attr, size_t *stacksize) {
-  if (!attr || !stacksize) return EINVAL;
-  *stacksize = 1024 * 1024;
-  return 0;
-}
-
-int pthread_attr_setstacksize(pthread_attr_t *attr, size_t stacksize) {
-  (void)stacksize;
-  return attr ? 0 : EINVAL;
-}
-
-int pthread_attr_getstack(const pthread_attr_t *attr, void **stackaddr, size_t *stacksize) {
-  if (!attr || !stackaddr || !stacksize) return EINVAL;
-  *stackaddr = NULL;
-  *stacksize = 1024 * 1024;
-  return 0;
-}
-
-int pthread_attr_getguardsize(const pthread_attr_t *attr, size_t *guardsize) {
-  if (!attr || !guardsize) return EINVAL;
-  *guardsize = 0;
-  return 0;
-}
-
-int pthread_getattr_np(pthread_t thread, pthread_attr_t *attr) {
-  if (!attr) return EINVAL;
-  if (!pthread_equal(thread, pthread_self())) return ESRCH;
-  return pthread_attr_init(attr);
 }
 
 int pthread_mutexattr_init(pthread_mutexattr_t *attr) {

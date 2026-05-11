@@ -27,7 +27,6 @@ DENO ?= deno
 # build policy: gnulib-derived ports need C23 additions, and the ABI canaries
 # keep the historical warning/optimization profile here.
 YURT_CFLAGS := -O2 -std=gnu23 -Wall -Wextra
-
 LIB := $(BUILD_DIR)/libyurt_abi.a
 CONTINUATION_LIB := $(BUILD_DIR)/libyurt_continuation.a
 SETJMP_LIB := $(BUILD_DIR)/libyurt_setjmp.a
@@ -50,6 +49,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_pipe.o \
   $(BUILD_DIR)/yurt_process.o \
   $(BUILD_DIR)/yurt_pthread.o \
+  $(BUILD_DIR)/yurt_pthread_rs.o \
   $(BUILD_DIR)/yurt_resource.o \
   $(BUILD_DIR)/yurt_sched.o \
   $(BUILD_DIR)/yurt_sendfile.o \
@@ -63,7 +63,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_version.o \
   $(BUILD_DIR)/yurt_write.o
 
-CANARY_NAMES := stdio sleep system popen affinity dup2 dlopen getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread
+CANARY_NAMES := stdio sleep system popen affinity dup2 dlopen getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread pthread-main-exit
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
 FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 
@@ -108,6 +108,14 @@ $(BUILD_DIR)/%.o: src/%.c $(wildcard include/*.h) src/yurt_runtime.h src/yurt_ma
 	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) $(YURT_CC) $(YURT_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/yurt_locale_rs.o: rust/yurt-libc/src/locale.rs | $(BUILD_DIR)
+	rustc --target wasm32-wasip1 \
+	  --crate-type=lib \
+	  --emit=obj=$@ \
+	  -C panic=abort \
+	  -C opt-level=2 \
+	  $<
+
+$(BUILD_DIR)/yurt_pthread_rs.o: rust/yurt-libc/src/pthread.rs | $(BUILD_DIR)
 	rustc --target wasm32-wasip1 \
 	  --crate-type=lib \
 	  --emit=obj=$@ \

@@ -247,28 +247,6 @@ args = [
   { name = "out_cap", type = "usize" },
 ]
 
-[function.yurt_system]
-doc = "Compatibility helper implemented over spawn, pipes, fd I/O, and wait. Not a host import."
-return = "int"
-args = [
-  { name = "cmd", type = "const char *" },
-]
-
-[function.yurt_popen]
-doc = "Compatibility helper implemented over spawn, pipes, fd I/O, and wait. Not a host import."
-return = "FILE *"
-args = [
-  { name = "cmd", type = "const char *" },
-  { name = "mode", type = "const char *" },
-]
-
-[function.yurt_pclose]
-doc = "Close a stream returned by yurt_popen and return command status."
-return = "int"
-args = [
-  { name = "stream", type = "FILE *" },
-]
-
 [function.yurt_fetch_text]
 doc = "Compatibility fetch helper implemented through host_network_fetch."
 return = "int"

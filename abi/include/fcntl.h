@@ -16,7 +16,12 @@
 
 #define F_DUPFD 0
 
+#pragma push_macro("__wasi__")
+#ifndef __wasi__
+#define __wasi__ 1
+#endif
 #include_next <fcntl.h>
+#pragma pop_macro("__wasi__")
 
 /* POSIX record-locking — wasi-sdk's WASI-mode path (__header_fcntl.h)
  * does not define these constants.  Provide the standard Linux values. */

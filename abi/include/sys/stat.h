@@ -8,7 +8,12 @@
  * <sys/stat.h> for the bulk of the surface, then declare umask
  * unconditionally so guest C code that reads/writes the mask compiles. */
 
+#pragma push_macro("__wasi__")
+#ifndef __wasi__
+#define __wasi__ 1
+#endif
 #include_next <sys/stat.h>
+#pragma pop_macro("__wasi__")
 
 #ifndef __wasilibc_unmodified_upstream
 #include <sys/types.h>

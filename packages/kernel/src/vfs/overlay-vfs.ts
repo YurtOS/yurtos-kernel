@@ -142,9 +142,13 @@ export class OverlayVFS implements VfsLike {
       this.copyUpMetadataOnly(path);
     }
     this.ensureUpperParentDirectory(path);
-    this.options.upper.withWriteAccess(() => {
-      this.options.upper.writeFile(path, data);
-    });
+    if (this.privileged) {
+      this.options.upper.withWriteAccess(() => {
+        this.options.upper.writeFile(path, data);
+      });
+    } else {
+      this.withUpperCredential(() => this.options.upper.writeFile(path, data));
+    }
     this.whiteouts.delete(path);
     this.notifyChange();
   }
@@ -391,6 +395,30 @@ export class OverlayVFS implements VfsLike {
       if (!isEnoent(e)) throw e;
       this.copyUpMetadataOnly(path);
       this.withUpperCredential(() => this.options.upper.chown!(path, uid, gid, followSymlinks));
+    }
+    this.notifyChange();
+  }
+
+  setTimes(path: string, atime?: Date, mtime?: Date, followSymlinks = true): void {
+    path = normalizeOverlayPath(path);
+    if (!this.privileged) this.assertCanWritePath(path);
+    try {
+      this.options.upper.lstat(path);
+    } catch (e) {
+      if (!isEnoent(e)) throw e;
+      this.assertNotHiddenByWhiteout(path);
+      this.copyUpMetadataOnly(path);
+    }
+    const setUpperTimes = () => {
+      if (!this.options.upper.setTimes) {
+        throw new VfsError('EROFS', `timestamps are read-only: ${path}`);
+      }
+      this.options.upper.setTimes(path, atime, mtime, followSymlinks);
+    };
+    if (this.privileged) {
+      this.options.upper.withWriteAccess(setUpperTimes);
+    } else {
+      this.withUpperCredential(setUpperTimes);
     }
     this.notifyChange();
   }

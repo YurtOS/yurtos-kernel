@@ -19,7 +19,12 @@ struct in6_addr {
 #define s6_addr32 __u6_addr.__u6_addr32
 #endif
 
+#pragma push_macro("__wasi__")
+#ifndef __wasi__
+#define __wasi__ 1
+#endif
 #include_next <netinet/in.h>
+#pragma pop_macro("__wasi__")
 
 #ifndef SOL_IP
 #define SOL_IP 0

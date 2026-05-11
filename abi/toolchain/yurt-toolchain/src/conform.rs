@@ -114,6 +114,7 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
             "system-canary",
             &["mkdtemp", "mkostemp", "mkstemp", "mktemp"],
         ),
+        ("stdio-canary", &["tmpfile"]),
         (
             "pthread-canary",
             &[

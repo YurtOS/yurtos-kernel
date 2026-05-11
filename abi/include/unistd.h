@@ -13,7 +13,14 @@
 #endif
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#define getpid __yurt_hidden_wasilibc_getpid
+#pragma push_macro("__wasi__")
+#ifndef __wasi__
+#define __wasi__ 1
+#endif
 #include_next <unistd.h>
+#pragma pop_macro("__wasi__")
+#undef getpid
 #pragma clang diagnostic pop
 #ifdef YURT_DEFINED_WASI_EMULATED_GETPID
 #undef _WASI_EMULATED_GETPID
