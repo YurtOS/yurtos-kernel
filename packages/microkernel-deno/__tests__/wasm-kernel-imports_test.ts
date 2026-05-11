@@ -108,6 +108,44 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(writeFd).toBeGreaterThan(readFd);
   });
 
+  it("argOrder: host_chmod permutes (path,len,mode) → (mode,path)", async () => {
+    if (!HAS_JSPI) return;
+    const mk = await freshMk();
+    const buf = new ArrayBuffer(64);
+    // Use the root path so chmod can find an extant inode. The
+    // point of this test is the *wire format* — that mode arrives
+    // ahead of the path on the request bytes. Returning -EINVAL
+    // would mean wire mismatch; any other rc (0 or path-specific
+    // errno) means the kernel decoded our bytes.
+    new Uint8Array(buf).set(new TextEncoder().encode("/"));
+    const imports = buildWasmKernelImports(mk, () => buf);
+    const rc = await imports.host_chmod(0, 1, 0o755);
+    // -EINVAL would mean our wire format was wrong. Any other
+    // rc means chmod parsed (mode=0o755, path="/") successfully.
+    expect(rc).not.toEqual(-22);
+  });
+
+  it("prefixed_ptr_len: host_symlink emits u32 len + target + linkpath", async () => {
+    if (!HAS_JSPI) return;
+    const mk = await freshMk();
+    const buf = new ArrayBuffer(64);
+    // Stage "/dst" at 0 (target = /dst), "/lnk" at 16 (linkpath).
+    const u = new Uint8Array(buf);
+    u.set(new TextEncoder().encode("/dst"), 0);
+    u.set(new TextEncoder().encode("/lnk"), 16);
+    const imports = buildWasmKernelImports(mk, () => buf);
+    // host_symlink(targetPtr=0, targetLen=4, linkPtr=16, linkLen=4)
+    const rc = await imports.host_symlink(0, 4, 16, 4);
+    expect(rc).toEqual(0);
+    // Confirm: readlink resolves the link back to the target.
+    new Uint8Array(buf, 32, 32).fill(0);
+    u.set(new TextEncoder().encode("/lnk"), 0);
+    const n = await imports.host_readlink(0, 4, 32, 32);
+    expect(n).toEqual(4);
+    const got = new TextDecoder().decode(new Uint8Array(buf, 32, n));
+    expect(got).toEqual("/dst");
+  });
+
   it("host_native_invoke forwards bytes via sys_extension_invoke", async () => {
     if (!HAS_JSPI) return;
     const mk = await freshMk();

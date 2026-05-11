@@ -35,6 +35,13 @@ export type ArgSpec =
   | "scalar"
   | "scalar64"
   | "ptr_len"
+  /**
+   * Like ptr_len but prefixes the consumed bytes with a u32 LE
+   * length on the wire. Used by multi-path syscalls (rename,
+   * symlink, link) whose kernel-side decoder needs an embedded
+   * length to split the parts.
+   */
+  | "prefixed_ptr_len"
   | "out_cap"
   /**
    * (ptr) consumed from the call; the response is always
@@ -52,6 +59,18 @@ export interface HostBinding {
   method: number;
   /** Positional arg shape. */
   args: ArgSpec[];
+  /**
+   * Permutation applied to the wrapper's incoming `args` before
+   * walking the `args` spec. Each entry is the index of the
+   * incoming arg to consume at that wire position. Used when the
+   * TS-side host_* declares args in a different order than the
+   * kernel's request layout (e.g. host_chmod takes
+   * (pathPtr,pathLen,mode) but SYS_CHMOD packs mode first).
+   *
+   * Length must match the number of incoming arg slots — i.e. the
+   * sum of slots consumed by each ArgSpec.
+   */
+  argOrder?: number[];
   /**
    * Does the binding return bytes-written from the syscall
    * response? Most "out_cap"-shape calls do. When false, the
@@ -182,6 +201,71 @@ export const HOST_BINDINGS: HostBinding[] = [
     returnsBytes: true,
   },
 
+  // ── fd duplication ────────────────────────────────────────
+  // host_dup2(srcFd, dstFd) → newfd or -EBADF.
+  { name: "host_dup2", method: METHOD.SYS_DUP2, args: ["scalar", "scalar"] },
+
+  // ── Path-based fs ops (single path) ────────────────────────
+  // host_mkdir(pathPtr, pathLen) → 0 / -errno.
+  { name: "host_mkdir", method: METHOD.SYS_MKDIR, args: ["ptr_len"] },
+  // host_rmdir doesn't have a TS-side counterpart of identical
+  // shape — bash uses host_remove for both. Leave SYS_RMDIR
+  // unbound until a caller materializes.
+  // host_stat(pathPtr, pathLen, outPtr, outCap) → bytes-written
+  // (kernel writes a 16-byte fstat record).
+  {
+    name: "host_stat",
+    method: METHOD.SYS_STAT,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
+  // host_readlink(pathPtr, pathLen, outPtr, outCap) → bytes-written.
+  {
+    name: "host_readlink",
+    method: METHOD.SYS_READLINK,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
+  // host_readdir(pathPtr, pathLen, outPtr, outCap) → bytes-written.
+  {
+    name: "host_readdir",
+    method: METHOD.SYS_READDIR,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
+
+  // ── Chmod / chown / utimens ───────────────────────────────
+  // host_chmod(pathPtr, pathLen, mode) → 0 / -errno. Kernel wire
+  // expects (u32 mode, path); permute the incoming args.
+  {
+    name: "host_chmod",
+    method: METHOD.SYS_CHMOD,
+    args: ["scalar", "ptr_len"],
+    argOrder: [2, 0, 1],
+  },
+
+  // ── Multi-path ops (rename, symlink, link) ────────────────
+  // host_rename(fromPtr, fromLen, toPtr, toLen) → 0 / -errno.
+  // Kernel wire: u32 old_len + old + new.
+  {
+    name: "host_rename",
+    method: METHOD.SYS_RENAME,
+    args: ["prefixed_ptr_len", "ptr_len"],
+  },
+  // host_symlink(targetPtr, targetLen, linkPtr, linkLen) → 0/-errno.
+  // Kernel wire: u32 target_len + target + linkpath.
+  {
+    name: "host_symlink",
+    method: METHOD.SYS_SYMLINK,
+    args: ["prefixed_ptr_len", "ptr_len"],
+  },
+
+  // ── Misc ──────────────────────────────────────────────────
+  // host_yield() — async fairness hint. Maps to SYS_SCHED_YIELD;
+  // TS host_yield returns void, our wrapper returns Promise<number>
+  // (rc), but wasm-side discards rc here.
+  { name: "host_yield", method: METHOD.SYS_SCHED_YIELD, args: [] },
+
   // ── Signals ───────────────────────────────────────────────
   // sigaction(sig, actPtr, actLen) — TS host_sigaction shape.
   // Not in our common test path; left to a future expansion.
@@ -220,35 +304,45 @@ function makeWrapper(
   memBuf: () => ArrayBuffer,
 ): (...args: number[]) => Promise<number> {
   return async (...args: number[]): Promise<number> => {
-    // Build the request bytes by walking the arg spec. Track
-    // where (if anywhere) the response should be written.
+    // Apply optional argument permutation. The reordered view is
+    // what the spec walker consumes; the original `args` is the
+    // shape bash (or any TS-host-shaped caller) passes.
+    const ordered = b.argOrder
+      ? b.argOrder.map((i) => args[i])
+      : args;
     const reqParts: Uint8Array[] = [];
     let outPtr = 0;
     let outCap = 0;
     let ai = 0;
     for (const spec of b.args) {
       if (spec === "scalar") {
-        const v = args[ai++] >>> 0;
+        const v = ordered[ai++] >>> 0;
         const bytes = new Uint8Array(4);
         new DataView(bytes.buffer).setUint32(0, v, true);
         reqParts.push(bytes);
       } else if (spec === "scalar64") {
-        // u64 can arrive as bigint or number; normalize.
-        const raw = args[ai++];
+        const raw = ordered[ai++];
         const v = typeof raw === "bigint" ? raw : BigInt(raw >>> 0);
         const bytes = new Uint8Array(8);
         new DataView(bytes.buffer).setBigUint64(0, v as bigint, true);
         reqParts.push(bytes);
       } else if (spec === "ptr_len") {
-        const ptr = args[ai++] >>> 0;
-        const len = args[ai++] >>> 0;
+        const ptr = ordered[ai++] >>> 0;
+        const len = ordered[ai++] >>> 0;
         const slice = new Uint8Array(memBuf(), ptr, len).slice();
         reqParts.push(slice);
+      } else if (spec === "prefixed_ptr_len") {
+        const ptr = ordered[ai++] >>> 0;
+        const len = ordered[ai++] >>> 0;
+        const lenBytes = new Uint8Array(4);
+        new DataView(lenBytes.buffer).setUint32(0, len, true);
+        reqParts.push(lenBytes);
+        reqParts.push(new Uint8Array(memBuf(), ptr, len).slice());
       } else if (spec === "out_cap") {
-        outPtr = args[ai++] >>> 0;
-        outCap = args[ai++] >>> 0;
+        outPtr = ordered[ai++] >>> 0;
+        outCap = ordered[ai++] >>> 0;
       } else if (typeof spec === "object" && spec.kind === "fixed_out") {
-        outPtr = args[ai++] >>> 0;
+        outPtr = ordered[ai++] >>> 0;
         outCap = spec.cap;
       } else {
         throw new Error(`unknown arg spec ${JSON.stringify(spec)}`);
