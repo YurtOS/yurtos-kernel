@@ -352,7 +352,8 @@ export class Sandbox {
     // listen() in one process would register the port in a backend nobody
     // else can see — clients (and Sandbox.net) would fail to connect.
     const socketBackend: SocketBackend | undefined = options.socketBackend ??
-      (options.serverSockets?.allowLoopback === true
+      (options.serverSockets?.allowLoopback === true ||
+        options.serverSockets?.allowUnixDomain === true
         ? createLoopbackSocketBackend(
           bridge ? createNetworkBridgeSocketBackend(bridge) : undefined,
         )
@@ -1086,6 +1087,7 @@ export class Sandbox {
           kernel,
           pid,
           deadlineMs: getDeadlineMs?.(),
+          socketRegistry: socketBackend?.registry,
         });
       },
       buildKernelImports: (pid, memory, wasiHost, threadsBackend) => {
