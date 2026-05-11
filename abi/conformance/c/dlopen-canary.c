@@ -23,7 +23,21 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* The Phase 1 dlopen loader requires the main module to export `__alloc`
+ * so it can reserve memory for side-module data segments. Re-export
+ * malloc under that name. */
+__attribute__((used, visibility("default"), export_name("__alloc")))
+void *yurt_dlopen_canary_alloc(size_t n) { return malloc(n); }
+
+/* wasm-ld emits env.__wasi_init_tp as an import from any side module
+ * built with wasi-libc's shared-library mode. The dlopen loader
+ * resolves side-module env.* imports against the main module's
+ * exports, so re-export a no-op stub here. */
+__attribute__((used, visibility("default"), export_name("__wasi_init_tp")))
+void yurt_dlopen_canary_wasi_init_tp(void) {}
 
 /* Print one JSONL trace line. Same convention as dup2-canary.c so the
  * harness can parse output with the existing helpers. */

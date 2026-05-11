@@ -474,6 +474,119 @@ export class ListenerRegistry {
     return listener.pendingUnix!.shift() ?? null;
   }
 
+  // ── AF_UNIX abstract namespace methods ────────────────────────────────────
+
+  /**
+   * Bind an abstract socket. Key: `AF_UNIX_ABSTRACT:<name>`.
+   * Abstract sockets are filesystem-invisible: no VFS inode is ever created.
+   */
+  listenOnAbstract(name: string, backlog: number): ListenerHandle {
+    const routeKey = `AF_UNIX_ABSTRACT:${name}`;
+    if (this.routes.has(routeKey)) {
+      throw new Error(`abstract address @${name} already in use`);
+    }
+    const handle = this.nextListenerHandle++;
+    const state: ListenerState = {
+      handle,
+      host: "127.0.0.1" as ListenHost,
+      port: 0,
+      backlog,
+      pending: [],
+      acceptWaiters: [],
+      closed: false,
+      isUnixListener: true,
+      localPath: `\0${name}`, // leading NUL marks abstract
+      pendingUnix: [],
+      unixAcceptWaiters: [],
+    };
+    this.listeners.set(handle, state);
+    this.routes.set(routeKey, handle);
+    return handle;
+  }
+
+  /**
+   * Connect to an abstract socket listener. Creates a paired socket and
+   * either hands it to a parked unixAcceptWaiters entry or queues it.
+   */
+  connectToAbstract(name: string): UnixConnectResult {
+    const routeKey = `AF_UNIX_ABSTRACT:${name}`;
+    const listenerHandle = this.routes.get(routeKey);
+    const listener = listenerHandle !== undefined
+      ? this.listeners.get(listenerHandle)
+      : undefined;
+    if (!listener || listener.closed) {
+      return { ok: false, error: `connection refused: @${name}` };
+    }
+    const pendingUnix = listener.pendingUnix!;
+    const unixAcceptWaiters = listener.unixAcceptWaiters!;
+    if (
+      unixAcceptWaiters.length === 0 &&
+      pendingUnix.length >= listener.backlog
+    ) {
+      return { ok: false, error: "connection refused: listener backlog full" };
+    }
+
+    const clientHandle = this.nextSocketHandle++;
+    const serverHandle = this.nextSocketHandle++;
+    const abstractPath = `\0${name}`; // leading NUL for C-side reconstruction
+
+    const clientSock: PairedSocket = {
+      handle: clientHandle,
+      peerHandle: serverHandle,
+      rx: [],
+      rxWaiters: [],
+      closed: false,
+      peerHost: "",
+      peerPort: 0,
+      localHost: "",
+      localPort: 0,
+      localPath: abstractPath,
+      peerPath: abstractPath,
+    };
+    const serverSock: PairedSocket = {
+      handle: serverHandle,
+      peerHandle: clientHandle,
+      rx: [],
+      rxWaiters: [],
+      closed: false,
+      peerHost: "",
+      peerPort: 0,
+      localHost: "",
+      localPort: 0,
+      localPath: abstractPath,
+      peerPath: abstractPath,
+    };
+    this.sockets.set(clientHandle, clientSock);
+    this.sockets.set(serverHandle, serverSock);
+
+    const accepted: UnixAcceptedConnection = {
+      socket: serverHandle,
+      localPath: abstractPath,
+      peerPath: abstractPath,
+    };
+
+    const waiter = unixAcceptWaiters.shift();
+    if (waiter) waiter.resolve(accepted);
+    else pendingUnix.push(accepted);
+
+    return {
+      ok: true,
+      socket: clientHandle,
+      localPath: abstractPath,
+      peerPath: abstractPath,
+    };
+  }
+
+  /** Close an abstract socket listener by name. */
+  closeAbstractListener(name: string): void {
+    const routeKey = `AF_UNIX_ABSTRACT:${name}`;
+    const listenerHandle = this.routes.get(routeKey);
+    if (listenerHandle === undefined) return;
+    // Remove the abstract-namespace route key before delegating cleanup.
+    this.routes.delete(routeKey);
+    this.closeListener(listenerHandle);
+  }
+
   /** Close a unix pathname listener by path, removing the route key. */
   closePathListener(path: string): void {
     const routeKey = `AF_UNIX:${path}`;

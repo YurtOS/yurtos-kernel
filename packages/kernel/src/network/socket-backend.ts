@@ -42,6 +42,8 @@ export interface SocketListenPolicy {
   allowUnixDomain?: boolean;
   /** If set, only allow bind() on paths matching one of these patterns. */
   unixPathAllowlist?: RegExp[];
+  /** If set, only allow abstract-namespace bind() on names matching one of these patterns. */
+  unixAbstractAllowlist?: RegExp[];
 }
 
 export type SocketBackendResult =

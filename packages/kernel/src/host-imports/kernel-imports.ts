@@ -900,6 +900,29 @@ export function createKernelImports(
     return { ok: true };
   }
 
+  function authorizeUnixAbstract(
+    policy: SocketListenPolicy | undefined,
+    name: string,
+  ): { ok: true } | { ok: false; error: string } {
+    if (!policy?.allowUnixDomain) {
+      return {
+        ok: false,
+        error: `AF_UNIX abstract listen on @${name} is not allowed by sandbox policy`,
+      };
+    }
+    const allowlist = policy.unixAbstractAllowlist;
+    if (allowlist && allowlist.length > 0) {
+      const allowed = allowlist.some((re) => re.test(name));
+      if (!allowed) {
+        return {
+          ok: false,
+          error: `AF_UNIX abstract name @${name} is not in the sandbox allowlist`,
+        };
+      }
+    }
+    return { ok: true };
+  }
+
   // ── Phase 1 dlopen state (per-sandbox) ──
   // Spec: docs/superpowers/specs/2026-05-09-shared-libraries-design.md.
   // The handle table owns loaded side-module instances; lastDlError
@@ -2009,7 +2032,26 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
-        // AF_UNIX connect: req.path is present
+        // AF_UNIX abstract connect: req.abstract is present
+        if (typeof req.abstract === "string") {
+          const registry = socketBackend?.registry;
+          if (!registry) {
+            return writeJson(memory, outPtr, outCap, {
+              ok: false,
+              error: "AF_UNIX sockets require a loopback socket backend",
+            });
+          }
+          const unixResult = registry.connectToAbstract(req.abstract);
+          if (!unixResult.ok) {
+            return writeJson(memory, outPtr, outCap, { ok: false, error: unixResult.error });
+          }
+          target.socket = -unixResult.socket; // negate for loopback convention
+          target.family = "AF_UNIX";
+          target.peerPath = `\0${req.abstract}`;
+          return writeJson(memory, outPtr, outCap, { ok: true });
+        }
+
+        // AF_UNIX pathname connect: req.path is present
         if (typeof req.path === "string") {
           const registry = socketBackend?.registry;
           if (!registry) {
@@ -2089,7 +2131,14 @@ export function createKernelImports(
           });
         }
 
-        // AF_UNIX bind: req.path is present
+        // AF_UNIX abstract bind: req.abstract is present (no VFS inode)
+        if (typeof req.abstract === "string") {
+          target.family = "AF_UNIX";
+          target.boundPath = `\0${req.abstract}`; // leading NUL marks abstract internally
+          return writeJson(memory, outPtr, outCap, { ok: true });
+        }
+
+        // AF_UNIX pathname bind: req.path is present
         if (typeof req.path === "string") {
           target.family = "AF_UNIX";
           target.boundPath = req.path;
@@ -2157,11 +2206,9 @@ export function createKernelImports(
           ? req.backlog
           : 128;
 
-        // AF_UNIX listen
+        // AF_UNIX listen (pathname or abstract)
         if (target.family === "AF_UNIX" || typeof target.boundPath === "string") {
           const path = target.boundPath!;
-          const auth = authorizeUnixListen(opts.serverSockets, path);
-          if (!auth.ok) return writeJson(memory, outPtr, outCap, auth);
           const registry = socketBackend?.registry;
           if (!registry) {
             return writeJson(memory, outPtr, outCap, {
@@ -2169,6 +2216,26 @@ export function createKernelImports(
               error: "AF_UNIX sockets require a loopback socket backend",
             });
           }
+          // Abstract socket: boundPath starts with NUL
+          if (path.startsWith("\0")) {
+            const abstractName = path.slice(1);
+            const auth = authorizeUnixAbstract(opts.serverSockets, abstractName);
+            if (!auth.ok) return writeJson(memory, outPtr, outCap, auth);
+            try {
+              const rawHandle = registry.listenOnAbstract(abstractName, backlog);
+              target.listener = -rawHandle;
+              target.closeListener = (_listener) => {
+                registry.closeAbstractListener(abstractName);
+              };
+            } catch (e: unknown) {
+              const msg = e instanceof Error ? e.message : String(e);
+              return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+            }
+            return writeJson(memory, outPtr, outCap, { ok: true });
+          }
+          // Pathname socket
+          const auth = authorizeUnixListen(opts.serverSockets, path);
+          if (!auth.ok) return writeJson(memory, outPtr, outCap, auth);
           try {
             const rawHandle = registry.listenOnPath(path, backlog);
             // Negate to follow the loopback backend's negative-handle convention.
@@ -2351,7 +2418,7 @@ export function createKernelImports(
         // a listener with this call, so listening sockets must work.
         if (
           target.socket === null && target.listener == null &&
-          target.boundPort === undefined
+          target.boundPort === undefined && target.boundPath === undefined
         ) {
           return writeJson(memory, outPtr, outCap, {
             ok: false,
@@ -2360,11 +2427,23 @@ export function createKernelImports(
         }
         // AF_UNIX: return path-based address info
         if (target.family === "AF_UNIX") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: true,
-            local_path: target.boundPath ?? "",
-            peer_path: target.peerPath ?? "",
-          });
+          const localPath = target.boundPath ?? "";
+          const peerPath = target.peerPath ?? "";
+          // Abstract sockets use a separate field to avoid NUL-in-JSON issues:
+          // local_abstract / peer_abstract carry the name WITHOUT leading NUL.
+          // Pathname sockets use local_path / peer_path as before.
+          const resp: Record<string, unknown> = { ok: true };
+          if (localPath.startsWith("\0")) {
+            resp.local_abstract = localPath.slice(1);
+          } else {
+            resp.local_path = localPath;
+          }
+          if (peerPath.startsWith("\0")) {
+            resp.peer_abstract = peerPath.slice(1);
+          } else {
+            resp.peer_path = peerPath;
+          }
+          return writeJson(memory, outPtr, outCap, resp);
         }
 
         return writeJson(memory, outPtr, outCap, {

@@ -237,7 +237,11 @@ int main(void) {
    * validation rejects unsupported types/families, and that release
    * via shutdown(SHUT_RDWR) doesn't fault. */
   int sv[2] = { -1, -1 };
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0 || sv[0] < 0 || sv[1] < 0) {
+  errno = 0;
+  int sp_rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+  int sp_errno = errno;
+  if (sp_rc != 0 || sv[0] < 0 || sv[1] < 0) {
+    fprintf(stderr, "DBG socketpair rc=%d errno=%d sv=[%d,%d]\n", sp_rc, sp_errno, sv[0], sv[1]);
     emit("socketpair_basic", 1);
     return 1;
   }

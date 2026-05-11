@@ -574,6 +574,7 @@ describe("Kernel ABI canaries", () => {
 
     const result = await sandbox.run("socket-canary");
 
+    console.error("DBG sock stdout:", JSON.stringify(result.stdout), "stderr:", JSON.stringify(result.stderr), "exit:", result.exitCode);
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe('{"case":"socket_surface","exit":0}');
   });
@@ -1397,18 +1398,24 @@ describe("Kernel ABI canaries", () => {
         // The Phase 1 search path resolves /lib/<name> against the
         // sandbox VFS. Pre-populate it with the side module fixture
         // built by abi/Makefile's side-module-canaries target.
-        try {
-          sandbox.mkdir("/lib");
-        } catch {
-          // /lib may already exist in the sandbox image; ignore.
-        }
-        sandbox.writeFile(
-          "/lib/libyurt_dlcanary.wasm",
-          readFileSync(resolve(FIXTURES, "libyurt_dlcanary.wasm")),
-        );
+        const vfs = (sandbox as unknown as {
+          vfs: {
+            withWriteAccess(fn: () => void): void;
+            mkdirp(path: string): void;
+            writeFile(path: string, data: Uint8Array): void;
+          };
+        }).vfs;
+        vfs.withWriteAccess(() => {
+          vfs.mkdirp("/lib");
+          vfs.writeFile(
+            "/lib/libyurt_dlcanary.wasm",
+            readFileSync(resolve(FIXTURES, "libyurt_dlcanary.wasm")),
+          );
+        });
 
         const result = await sandbox.run("dlopen-canary --case happy_path");
 
+        console.error("DBG dlopen:", JSON.stringify(result.stdout), "stderr:", JSON.stringify(result.stderr), "exit:", result.exitCode);
         expect(result.exitCode).toBe(0);
         expect(result.stdout.trim()).toContain('"stdout":"dlcanary-ok"');
       },
@@ -1564,10 +1571,27 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.stdout.trim()).toContain('{"case":"connect_refused","exit":0,"stdout":"refused=ok"}');
   });
 
-  // TODO(af-unix slice 3): unskip — abstract namespace bind/connect.
-  it.skip("abstract_bind_connect: bind/connect with a \\0-prefixed name", () => {});
-  // TODO(af-unix slice 3): unskip — abstract names are invisible to stat().
-  it.skip("abstract_invisible_to_stat: abstract names do not appear in the VFS", () => {});
+  it("abstract_bind_connect: bind/connect with a \\0-prefixed name", async () => {
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//], unixAbstractAllowlist: [/.*/] },
+    });
+    const result = await sandbox.run("unix-canary --case abstract_bind_connect");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"abstract_bind_connect","exit":0,"stdout":"abstract=ok"}');
+  });
+
+  it("abstract_invisible_to_stat: abstract names do not appear in the VFS", async () => {
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//], unixAbstractAllowlist: [/.*/] },
+    });
+    const result = await sandbox.run("unix-canary --case abstract_invisible_to_stat");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"abstract_invisible_to_stat","exit":0,"stdout":"invisible=ok"}');
+  });
   // TODO(af-unix slice 4): unskip — datagram socketpair preserves message boundaries.
   it.skip("dgram_pair_message_framing: socketpair SOCK_DGRAM preserves message boundaries", () => {});
   // TODO(af-unix slice 4): unskip — sendto by path.

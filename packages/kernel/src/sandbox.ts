@@ -1090,7 +1090,7 @@ export class Sandbox {
           socketRegistry: socketBackend?.registry,
         });
       },
-      buildKernelImports: (pid, memory, wasiHost, threadsBackend) => {
+      buildKernelImports: (pid, memory, wasiHost, threadsBackend, mainInstance) => {
         const kernelImports = createKernelImports({
           memory,
           callerPid: pid,
@@ -1105,6 +1105,7 @@ export class Sandbox {
           mgr,
           nativeModules: mgr.nativeModules,
           threadsBackend,
+          mainInstance,
           runCommand: async (cmd, stdin) => {
             const sandbox = getSandbox();
             if (!sandbox) {

@@ -247,8 +247,95 @@ static int case_connect_refused(void) {
   emit("connect_refused", 1, "connect-succeeded", 0, 0);
   return 1;
 }
-static int case_abstract_bind_connect(void)      { return pending("abstract_bind_connect"); }
-static int case_abstract_invisible_to_stat(void) { return pending("abstract_invisible_to_stat"); }
+static int case_abstract_bind_connect(void) {
+  const char *abstract_name = "yurt-test";
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  /* abstract address: sun_path[0] = '\0', name follows */
+  strncpy(addr.sun_path + 1, abstract_name, sizeof(addr.sun_path) - 2);
+  socklen_t addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + strlen(abstract_name));
+
+  int server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (server_fd < 0) { emit("abstract_bind_connect", 1, NULL, 1, errno); return 1; }
+  if (bind(server_fd, (struct sockaddr *)&addr, addrlen) != 0) {
+    emit("abstract_bind_connect", 1, NULL, 1, errno);
+    close(server_fd);
+    return 1;
+  }
+  if (listen(server_fd, 1) != 0) {
+    emit("abstract_bind_connect", 1, NULL, 1, errno);
+    close(server_fd);
+    return 1;
+  }
+
+  int client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (client_fd < 0) {
+    emit("abstract_bind_connect", 1, NULL, 1, errno);
+    close(server_fd);
+    return 1;
+  }
+  if (connect(client_fd, (struct sockaddr *)&addr, addrlen) != 0) {
+    emit("abstract_bind_connect", 1, NULL, 1, errno);
+    close(client_fd);
+    close(server_fd);
+    return 1;
+  }
+
+  int accepted_fd = accept(server_fd, NULL, NULL);
+  if (accepted_fd < 0) {
+    emit("abstract_bind_connect", 1, NULL, 1, errno);
+    close(client_fd);
+    close(server_fd);
+    return 1;
+  }
+
+  send(accepted_fd, "hello", 5, 0);
+  char buf[16];
+  ssize_t n = recv(client_fd, buf, 16, 0);
+  close(accepted_fd);
+  close(client_fd);
+  close(server_fd);
+
+  if (n == 5 && memcmp(buf, "hello", 5) == 0) {
+    emit("abstract_bind_connect", 0, "abstract=ok", 0, 0);
+    return 0;
+  }
+  emit("abstract_bind_connect", 1, "mismatch", 0, 0);
+  return 1;
+}
+
+static int case_abstract_invisible_to_stat(void) {
+  const char *abstract_name = "yurt-stat-test";
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path + 1, abstract_name, sizeof(addr.sun_path) - 2);
+  socklen_t addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + strlen(abstract_name));
+
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) { emit("abstract_invisible_to_stat", 1, NULL, 1, errno); return 1; }
+  if (bind(fd, (struct sockaddr *)&addr, addrlen) != 0) {
+    emit("abstract_invisible_to_stat", 1, NULL, 1, errno);
+    close(fd);
+    return 1;
+  }
+
+  /* The abstract name must NOT appear in the VFS — stat should fail */
+  char vfs_path[128];
+  snprintf(vfs_path, sizeof(vfs_path), "/%s", abstract_name);
+  struct stat st;
+  int rc = stat(vfs_path, &st);
+  close(fd);
+
+  if (rc != 0) {
+    /* stat failed as expected — abstract socket is invisible */
+    emit("abstract_invisible_to_stat", 0, "invisible=ok", 0, 0);
+    return 0;
+  }
+  emit("abstract_invisible_to_stat", 1, "stat-succeeded", 0, 0);
+  return 1;
+}
 static int case_dgram_pair_message_framing(void) { return pending("dgram_pair_message_framing"); }
 static int case_dgram_path_sendto(void)          { return pending("dgram_path_sendto"); }
 static int case_scm_rights_pipe_handoff(void)    { return pending("scm_rights_pipe_handoff"); }

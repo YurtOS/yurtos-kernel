@@ -302,13 +302,23 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return -1;
   }
 
-  /* AF_UNIX: send { fd, path } request */
+  /* AF_UNIX: send { fd, path } or { fd, abstract } request */
   if (addr->sa_family == AF_UNIX) {
     const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
-    size_t pathlen = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
-    n = snprintf(req, sizeof(req),
-      "{\"fd\":%d,\"path\":\"%.*s\"}",
-      sockfd, (int)pathlen, un->sun_path);
+    if (un->sun_path[0] == '\0') {
+      /* abstract address: name is sun_path[1..addrlen-offsetof(sun_path)-1] */
+      size_t namelen = (size_t)addrlen > offsetof(struct sockaddr_un, sun_path) + 1
+        ? (size_t)addrlen - offsetof(struct sockaddr_un, sun_path) - 1
+        : 0;
+      n = snprintf(req, sizeof(req),
+        "{\"fd\":%d,\"abstract\":\"%.*s\"}",
+        sockfd, (int)namelen, un->sun_path + 1);
+    } else {
+      size_t pathlen = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
+      n = snprintf(req, sizeof(req),
+        "{\"fd\":%d,\"path\":\"%.*s\"}",
+        sockfd, (int)pathlen, un->sun_path);
+    }
     if (n < 0 || (size_t)n >= sizeof(req)) { errno = EOVERFLOW; return -1; }
     n = yurt_host_socket_connect((int)(intptr_t)req, n,
                                   (int)(intptr_t)resp, (int)sizeof(resp));
@@ -370,7 +380,15 @@ static int yurt_fill_sockaddr_un(
   if (!addr || !addrlen) { errno = EINVAL; return -1; }
   memset(&un, 0, sizeof(un));
   un.sun_family = AF_UNIX;
-  strncpy(un.sun_path, path, sizeof(un.sun_path) - 1);
+  if (path[0] == '\0') {
+    /* abstract address: copy name (after leading NUL) into sun_path[1..] */
+    size_t namelen = strlen(path + 1);
+    un.sun_path[0] = '\0';
+    strncpy(un.sun_path + 1, path + 1, sizeof(un.sun_path) - 2);
+    (void)namelen;
+  } else {
+    strncpy(un.sun_path, path, sizeof(un.sun_path) - 1);
+  }
   size_t copy = (*addrlen < sizeof(un)) ? (size_t)*addrlen : sizeof(un);
   memcpy(addr, &un, copy);
   *addrlen = (socklen_t)sizeof(un);
@@ -455,18 +473,33 @@ static int yurt_sockname_impl(
     return -1;
   }
 
-  /* Check for AF_UNIX path fields (local_path / peer_path). */
-  /* host_field for getsockname is "local_host" → path field is "local_path";
-   * for getpeername it is "peer_host" → path field is "peer_path". */
+  /* Check for AF_UNIX path fields (local_path / peer_path) or abstract fields
+   * (local_abstract / peer_abstract). host_field for getsockname is "local_host"
+   * → path field is "local_path", abstract field is "local_abstract";
+   * for getpeername it is "peer_host" → "peer_path" / "peer_abstract". */
   {
     /* Derive the path field name: replace trailing "_host" with "_path". */
     char path_field[64];
+    char abstract_field[64];
     size_t hf_len = strlen(host_field);
-    /* host_field ends in "_host"; replace with "_path". */
+    /* host_field ends in "_host"; replace with "_path" and "_abstract". */
     if (hf_len > 5 && memcmp(host_field + hf_len - 5, "_host", 5) == 0) {
       snprintf(path_field, sizeof(path_field), "%.*s_path", (int)(hf_len - 5), host_field);
+      snprintf(abstract_field, sizeof(abstract_field), "%.*s_abstract", (int)(hf_len - 5), host_field);
     } else {
       path_field[0] = '\0';
+      abstract_field[0] = '\0';
+    }
+    if (abstract_field[0] != '\0') {
+      char abstract_name[107]; /* 108 - 1 for NUL prefix */
+      if (parse_json_string_field(resp, (size_t)n, abstract_field, abstract_name, sizeof(abstract_name)) == 0) {
+        /* Reconstruct path with leading NUL: "\0name" */
+        char unix_path[109];
+        unix_path[0] = '\0';
+        strncpy(unix_path + 1, abstract_name, sizeof(unix_path) - 2);
+        unix_path[sizeof(unix_path) - 1] = '\0';
+        return yurt_fill_sockaddr_un(addr, addrlen, unix_path);
+      }
     }
     if (path_field[0] != '\0') {
       char unix_path[108];
@@ -505,13 +538,23 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
   if (!addr || addrlen < 2) { errno = EINVAL; return -1; }
 
-  /* AF_UNIX: send { fd, path } request */
+  /* AF_UNIX: send { fd, path } or { fd, abstract } request */
   if (addr->sa_family == AF_UNIX) {
     const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
-    size_t pathlen = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
-    n = snprintf(req, sizeof(req),
-      "{\"fd\":%d,\"path\":\"%.*s\"}",
-      sockfd, (int)pathlen, un->sun_path);
+    if (un->sun_path[0] == '\0') {
+      /* abstract address: name is sun_path[1..addrlen-offsetof(sun_path)-1] */
+      size_t namelen = (size_t)addrlen > offsetof(struct sockaddr_un, sun_path) + 1
+        ? (size_t)addrlen - offsetof(struct sockaddr_un, sun_path) - 1
+        : 0;
+      n = snprintf(req, sizeof(req),
+        "{\"fd\":%d,\"abstract\":\"%.*s\"}",
+        sockfd, (int)namelen, un->sun_path + 1);
+    } else {
+      size_t pathlen = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
+      n = snprintf(req, sizeof(req),
+        "{\"fd\":%d,\"path\":\"%.*s\"}",
+        sockfd, (int)pathlen, un->sun_path);
+    }
     if (n < 0 || (size_t)n >= sizeof(req)) { errno = EOVERFLOW; return -1; }
     n = yurt_host_socket_bind((int)(intptr_t)req, n,
                                (int)(intptr_t)resp, (int)sizeof(resp));
