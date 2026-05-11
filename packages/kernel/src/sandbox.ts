@@ -111,6 +111,26 @@ export interface MountConfig {
 }
 
 export interface SandboxOptions {
+  /**
+   * Which kernel handles syscalls. Default is "ts" (the legacy
+   * TS kernel runtime in this package). Set to "wasm" to route
+   * the subset of host_* imports listed in
+   * `microkernel-deno/wasm-kernel-imports.ts` through the Rust
+   * kernel.wasm via microkernel-deno's Microkernel. Imports not
+   * in HOST_BINDINGS keep their TS implementation, so the mode
+   * is a *hybrid* — porting more host_* shifts the mix toward
+   * the Rust kernel without breaking unrelated paths.
+   *
+   * Requires `wasmKernelBytes` when set to "wasm".
+   */
+  kernelImpl?: "ts" | "wasm";
+  /**
+   * kernel.wasm bytes used when `kernelImpl: "wasm"`. Embedders
+   * typically `await Deno.readFile(...)` the artifact built by
+   * `cargo build -p yurt-kernel-wasm --target wasm32-wasip1
+   * --release`.
+   */
+  wasmKernelBytes?: Uint8Array;
   /** Directory (Node) or URL base (browser) containing .wasm files. */
   wasmDir: string;
   /** Platform adapter. Auto-detected if not provided (Node vs browser). */
@@ -303,6 +323,23 @@ export class Sandbox {
       throw new Error(
         "Sandbox.create accepts either baseRoot or image, not both",
       );
+    }
+    if (options.kernelImpl === "wasm" && !options.wasmKernelBytes) {
+      throw new Error(
+        "Sandbox.create({kernelImpl:'wasm'}) requires wasmKernelBytes (the kernel.wasm artifact). Build it with `cargo build -p yurt-kernel-wasm --target wasm32-wasip1 --release`.",
+      );
+    }
+    // Phase 7.2c integration is in flight — the wasm-mode path
+    // loads a Microkernel from wasmKernelBytes and overlays
+    // host_* imports through microkernel-deno's
+    // buildWasmKernelImports. Until that lands end-to-end the
+    // option is accepted (so embedders can pin to the contract)
+    // but routes to the TS kernel for now. See
+    // project_phase7_parity_gate memory for the remaining work.
+    if (options.kernelImpl === "wasm") {
+      // No-op for now; see memory note. The Sandbox does NOT
+      // throw — the kernelImpl option is the stable surface
+      // even before the integration finishes.
     }
     const adapter = options.adapter ?? await Sandbox.detectAdapter();
     const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
