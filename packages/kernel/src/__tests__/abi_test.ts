@@ -659,6 +659,18 @@ describe("Kernel ABI canaries", () => {
     expect(result.stdout.trim()).toBe("pthread:ok");
   });
 
+  it("treats pthread_exit from main as a clean process exit", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run("pthread-main-exit-canary");
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("");
+  });
+
   it("exposes the POSIX socket compatibility header surface", async () => {
     // socket-canary now exercises socketpair(), which emulates AF_UNIX
     // SOCK_STREAM via a TCP-loopback listen/accept dance (yurtos-kernel

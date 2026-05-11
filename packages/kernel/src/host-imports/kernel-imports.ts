@@ -52,7 +52,7 @@ import {
   unsupportedRuntimeEngineBackend,
 } from "../engine/backend.js";
 import type { ProcessManager } from "../process/manager.js";
-import type { WasiHost } from "../wasi/wasi-host.js";
+import { WasiExitError, type WasiHost } from "../wasi/wasi-host.js";
 import type { ThreadsBackend } from "../process/threads/backend.js";
 import type { VfsLike } from "../vfs/vfs-like.js";
 import type { FdTarget } from "../wasi/fd-target.js";
@@ -2968,8 +2968,12 @@ export function createKernelImports(
       tb.join(tid)) as unknown as WebAssembly.ImportValue;
     imports.host_thread_detach = (async (tid: number) =>
       tb.detach(tid)) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_exit = ((retval: number) =>
-      tb.exit(retval)) as unknown as WebAssembly.ImportValue;
+    imports.host_thread_exit = ((retval: number) => {
+      if (tb.self() === 0) {
+        throw new WasiExitError(0);
+      }
+      return tb.exit(retval);
+    }) as unknown as WebAssembly.ImportValue;
     imports.host_thread_self = (() =>
       tb.self()) as unknown as WebAssembly.ImportValue;
     imports.host_thread_yield = (async () =>
