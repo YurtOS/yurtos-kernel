@@ -2219,10 +2219,29 @@ export function createKernelImports(
           });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket" || target.socket === null) {
+        if (!target || target.type !== "socket") {
           return writeJson(memory, outPtr, outCap, {
             ok: false,
-            error: `not a connected socket fd: ${req.fd}`,
+            error: `not a socket fd: ${req.fd}`,
+          });
+        }
+        // POSIX getsockname()/getpeername() are defined for any socket
+        // that has been bound, connected, or is listening. Accept all
+        // three states: connected (target.socket !== null), listening
+        // (target.listener != null), and bound-but-not-yet-listening
+        // (target.boundPort !== undefined). The socketpair() emulation
+        // in abi/src/yurt_socket.c reads back the ephemeral port from
+        // a fresh listener via getsockname(), so listening sockets
+        // must work — pre-this-fix it rejected with "not a connected
+        // socket fd" and the socket-canary's socketpair section
+        // failed.
+        if (
+          target.socket === null && target.listener == null &&
+          target.boundPort === undefined
+        ) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `socket not bound or connected: ${req.fd}`,
           });
         }
         return writeJson(memory, outPtr, outCap, {

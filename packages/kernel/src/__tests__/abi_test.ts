@@ -560,9 +560,17 @@ describe("Kernel ABI canaries", () => {
   });
 
   it("exposes the POSIX socket compatibility header surface", async () => {
+    // socket-canary now exercises socketpair(), which emulates AF_UNIX
+    // SOCK_STREAM via a TCP-loopback listen/accept dance (yurtos-kernel
+    // PR #22's yurt_socket.c::socketpair). Allow loopback listeners so
+    // that path can complete. The canary still verifies that listen()
+    // on 0.0.0.0 is denied (EOPNOTSUPP) before the socketpair section
+    // runs — that case fires because 0.0.0.0 is not loopback.
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
+      network: { allowedHosts: ["127.0.0.1", "localhost"] },
+      serverSockets: { allowLoopback: true },
     });
 
     const result = await sandbox.run("socket-canary");
@@ -1374,26 +1382,34 @@ describe("Kernel ABI canaries", () => {
     dlcanaryIt(
       "happy_path: load /lib/libyurt_dlcanary.wasm and call yurt_dlcanary_double(21) → 42",
       async () => {
+        // The Phase 1 search path resolves /lib/<name> against the
+        // sandbox VFS. Use a HostMount at create time so the side
+        // module is in place before the test runs anything — the
+        // earlier sandbox.mkdir("/lib") + sandbox.writeFile() path
+        // failed at mkdir (the sandbox's effective uid lacks
+        // permission to mkdir at root) and then at writeFile (parent
+        // /lib still missing).
         sandbox = await Sandbox.create({
           wasmDir: FIXTURES,
           adapter: new NodeAdapter(),
+          mounts: [
+            {
+              path: "/lib",
+              files: {
+                "libyurt_dlcanary.wasm": readFileSync(
+                  resolve(FIXTURES, "libyurt_dlcanary.wasm"),
+                ),
+              },
+            },
+          ],
         });
-
-        // The Phase 1 search path resolves /lib/<name> against the
-        // sandbox VFS. Pre-populate it with the side module fixture
-        // built by abi/Makefile's side-module-canaries target.
-        try {
-          sandbox.mkdir("/lib");
-        } catch {
-          // /lib may already exist in the sandbox image; ignore.
-        }
-        sandbox.writeFile(
-          "/lib/libyurt_dlcanary.wasm",
-          readFileSync(resolve(FIXTURES, "libyurt_dlcanary.wasm")),
-        );
 
         const result = await sandbox.run("dlopen-canary --case happy_path");
 
+        if (result.exitCode !== 0) {
+          console.log("--- dlopen-canary stdout ---\n" + result.stdout);
+          console.log("--- dlopen-canary stderr ---\n" + result.stderr);
+        }
         expect(result.exitCode).toBe(0);
         expect(result.stdout.trim()).toContain('"stdout":"dlcanary-ok"');
       },

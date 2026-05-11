@@ -1088,7 +1088,7 @@ export class Sandbox {
           deadlineMs: getDeadlineMs?.(),
         });
       },
-      buildKernelImports: (pid, memory, wasiHost, threadsBackend) => {
+      buildKernelImports: (pid, memory, wasiHost, threadsBackend, mainInstance) => {
         const kernelImports = createKernelImports({
           memory,
           callerPid: pid,
@@ -1103,6 +1103,12 @@ export class Sandbox {
           mgr,
           nativeModules: mgr.nativeModules,
           threadsBackend,
+          // Phase 1 shared-library loader reads this to call back into
+          // the main module's __alloc / __indirect_function_table.
+          // sandbox.ts used to drop this arg silently, leaving dlopen
+          // with "main module not ready" — see PR #23 + the abi_test
+          // dlopen-canary happy_path case.
+          mainInstance,
           runCommand: async (cmd, stdin) => {
             const sandbox = getSandbox();
             if (!sandbox) {
