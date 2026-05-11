@@ -218,6 +218,39 @@ function writeWaitResult(
   return required;
 }
 
+function writeLegacyWaitpidStatus(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  pid: number,
+  exitCode: number,
+): number {
+  // Legacy BusyBox imports host_waitpid with a 64-byte status buffer and
+  // expects a JSON payload plus byte-count return, mirroring host_pipe.
+  const payload = textEncoder.encode(`{"exit_code":${exitCode},"pid":${pid}}`);
+  if (cap < payload.length) return payload.length;
+  const end = ptr + payload.length;
+  if (ptr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+  new Uint8Array(memory.buffer, ptr, payload.length).set(payload);
+  return payload.length;
+}
+
+function writeWaitpidStatus(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  pid: number,
+  exitCode: number,
+): number {
+  if (ptr !== 0 && cap > 4) {
+    return writeLegacyWaitpidStatus(memory, ptr, cap, pid, exitCode);
+  }
+  if (ptr !== 0 && cap >= 4) {
+    new DataView(memory.buffer).setInt32(ptr, exitCode << 8, true);
+  }
+  return pid;
+}
+
 function writeSpawnResult(
   memory: WebAssembly.Memory,
   ptr: number,
@@ -237,6 +270,7 @@ const SPAN_SIZE = 8;
 const ENV_PAIR_SIZE = 16;
 const FD_MAP_PAIR_SIZE = 8;
 const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+const textEncoder = new TextEncoder();
 
 function writeStatRecord(
   memory: WebAssembly.Memory,
@@ -2046,22 +2080,18 @@ export function createKernelImports(
         const result = kernel.waitAnyChildNohang(callerPid);
         if (result.state === "running") return 0;
         if (result.state === "none") return ERR_CHILD;
-        if (wstatusPtr !== 0 && wstatusLen >= 4) {
-          new DataView(memory.buffer).setInt32(
-            wstatusPtr,
-            result.exitCode << 8,
-            true,
-          );
-        }
-        return result.pid!;
+        return writeWaitpidStatus(
+          memory,
+          wstatusPtr,
+          wstatusLen,
+          result.pid!,
+          result.exitCode,
+        );
       }
       const exitCode = kernel.waitpidNohang(pid, callerPid);
       if (exitCode === -1) return 0;
       if (exitCode < 0) return ERR_CHILD;
-      if (wstatusPtr !== 0 && wstatusLen >= 4) {
-        new DataView(memory.buffer).setInt32(wstatusPtr, exitCode << 8, true);
-      }
-      return pid;
+      return writeWaitpidStatus(memory, wstatusPtr, wstatusLen, pid, exitCode);
     },
 
     // host_waitpid(pid, wstatus_ptr, wstatus_len) -> i32 | Promise<i32>
@@ -2081,10 +2111,13 @@ export function createKernelImports(
         const interrupt = signalWait?.promise ?? new Promise<void>(() => {});
 
         const writeStatus = (waitedPid: number, code: number): number => {
-          if (wstatusPtr !== 0 && wstatusLen >= 4) {
-            new DataView(memory.buffer).setInt32(wstatusPtr, code << 8, true);
-          }
-          return waitedPid;
+          return writeWaitpidStatus(
+            memory,
+            wstatusPtr,
+            wstatusLen,
+            waitedPid,
+            code,
+          );
         };
 
         if (pid <= 0) {

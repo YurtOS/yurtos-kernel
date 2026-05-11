@@ -451,6 +451,62 @@ Deno.test("kernel host_wait only reaps children of the caller", async () => {
   kernel.dispose();
 });
 
+Deno.test("kernel host_waitpid preserves legacy JSON wait status buffers", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const parentPid = kernel.allocPid();
+  const childPid = kernel.allocPid(parentPid, "child");
+  kernel.releaseProcess(childPid, 7);
+
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: parentPid,
+  });
+  const written = await (imports.host_waitpid as (
+    ...args: number[]
+  ) => Promise<number>)(
+    -1,
+    4096,
+    64,
+  );
+
+  assertEquals(
+    readString(memory, 4096, written),
+    `{"exit_code":7,"pid":${childPid}}`,
+  );
+  assertEquals(kernel.hasProcess(childPid), false);
+  kernel.dispose();
+});
+
+Deno.test("kernel host_waitpid_nohang preserves legacy JSON wait status buffers", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const parentPid = kernel.allocPid();
+  const childPid = kernel.allocPid(parentPid, "child");
+  kernel.releaseProcess(childPid, 3);
+
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: parentPid,
+  });
+  const written = (imports.host_waitpid_nohang as (
+    ...args: number[]
+  ) => number)(
+    childPid,
+    4096,
+    64,
+  );
+
+  assertEquals(
+    readString(memory, 4096, written),
+    `{"exit_code":3,"pid":${childPid}}`,
+  );
+  assertEquals(kernel.hasProcess(childPid), false);
+  kernel.dispose();
+});
+
 Deno.test("kernel host_wait nohang distinguishes running from ECHILD", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const kernel = new ProcessKernel();
