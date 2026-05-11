@@ -30,6 +30,20 @@ const HAS_DLCANARY_FIXTURE =
   existsSync(resolve(FIXTURES, "libyurt_dlcanary.wasm")) &&
   existsSync(resolve(FIXTURES, "dlopen-canary.wasm"));
 
+function installTestShell(sandbox: Sandbox): void {
+  const vfs = (sandbox as unknown as {
+    vfs: {
+      withWriteAccess(fn: () => void): void;
+      writeFile(path: string, data: Uint8Array): void;
+      chmod(path: string, mode: number): void;
+    };
+  }).vfs;
+  vfs.withWriteAccess(() => {
+    vfs.writeFile("/bin/sh", Deno.readFileSync(resolve(FIXTURES, "bash.wasm")));
+    vfs.chmod("/bin/sh", 0o555);
+  });
+}
+
 class StaticFetchBridge implements NetworkBridgeLike {
   requests: Array<{
     url: string;
@@ -105,11 +119,12 @@ describe("Kernel ABI canaries", () => {
     expect(elapsedMs).toBeGreaterThanOrEqual(lowerBoundMs);
   });
 
-  it("runs system-canary through the host command shim", async () => {
+  it("runs system-canary through POSIX system()", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
     });
+    installTestShell(sandbox);
 
     const result = await sandbox.run("system-canary");
 
@@ -122,6 +137,7 @@ describe("Kernel ABI canaries", () => {
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
     });
+    installTestShell(sandbox);
 
     const result = await sandbox.run("popen-canary");
 
@@ -129,23 +145,25 @@ describe("Kernel ABI canaries", () => {
     expect(result.stdout.trim()).toBe("popen:hello-from-shell");
   });
 
-  it("retries host_run_command when the response exceeds the initial buffer", async () => {
+  it("streams large system() command output through the process path", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
     });
+    installTestShell(sandbox);
 
     const result = await sandbox.run("system-canary large");
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("system-large-ok");
+    expect(result.stdout).toContain("system-large-ok");
   });
 
-  it("returns the command exit status from yurt_pclose", async () => {
+  it("returns the command exit status from pclose", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
     });
+    installTestShell(sandbox);
 
     const result = await sandbox.run("popen-canary status");
 
@@ -485,6 +503,38 @@ describe("Kernel ABI canaries", () => {
         '{"case":"fcntl_setfl_masks_access_mode","exit":0,"stdout":"fcntl_setfl_masks_access_mode:ok"}',
       );
     });
+
+    it("returns POSIX dot entries from readdir", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run(
+        "posix-runtime-canary --case readdir_dot_entries",
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"readdir_dot_entries","exit":0,"stdout":"readdir_dot_entries:ok"}',
+      );
+    });
+
+    it("applies utimes mtime updates through WASI filestat setters", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run(
+        "posix-runtime-canary --case utimes_mtime",
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"utimes_mtime","exit":0,"stdout":"utimes_mtime:ok"}',
+      );
+    });
   });
 
   it("exposes the narrow signal compatibility header surface", async () => {
@@ -544,6 +594,38 @@ describe("Kernel ABI canaries", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe(
       '{"case":"blocked_host_signal_delivers_after_unblock","exit":0,"stdout":"kill:blocked-then-handled"}',
+    );
+  });
+
+  it("reports terminating signals through waitpid status", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run(
+      "signal-canary --case waitpid_reports_terminating_signal",
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      '{"case":"waitpid_reports_terminating_signal","exit":0,"stdout":"waitpid:signal"}',
+    );
+  });
+
+  it("preserves normal child exit codes above 128 through waitpid status", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run(
+      "signal-canary --case waitpid_preserves_high_exit_code",
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      '{"case":"waitpid_preserves_high_exit_code","exit":0,"stdout":"waitpid:exit143"}',
     );
   });
 

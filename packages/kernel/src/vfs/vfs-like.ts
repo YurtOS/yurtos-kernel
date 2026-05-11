@@ -33,6 +33,7 @@ export interface VfsLike {
   readlink(path: string): string;
   chmod(path: string, mode: number): void;
   chown(path: string, uid: number, gid: number, followSymlinks?: boolean): void;
+  setTimes?(path: string, atime?: Date, mtime?: Date, followSymlinks?: boolean): void;
   withCredential?<T>(credential: FsCredential, fn: () => T): T;
   withWriteAccess(fn: () => void): void;
   /**

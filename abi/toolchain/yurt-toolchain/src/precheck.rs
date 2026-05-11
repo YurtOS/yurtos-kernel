@@ -2,6 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use std::path::Path;
 use std::process::Command;
 
+use crate::WRAPPED_WASI_LIBC_SYMBOLS;
+
 /// Stage 1: `llvm-nm` on the archive — every named Tier 1 symbol and its
 /// marker must be defined in the same object. `llvm-nm -A` prefixes each
 /// line with `archive.a(obj):` so we can correlate the object that owns
@@ -93,7 +95,11 @@ pub fn check_wasm_structural(pre_opt: &Path, symbols: &[&str]) -> Result<()> {
         }
     }
     for sym in symbols {
-        if !exported_funcs.contains(*sym) {
+        let wrapped_impl = format!("__wrap_{sym}");
+        let has_export = exported_funcs.contains(*sym)
+            || (WRAPPED_WASI_LIBC_SYMBOLS.contains(sym)
+                && exported_funcs.contains(wrapped_impl.as_str()));
+        if !has_export {
             return Err(anyhow!(
                 "structural check failed: pre-opt wasm missing export {sym} \
                  (Tier 1 symbol must be defined inside, not extern)"
@@ -182,9 +188,20 @@ fn verify_call_edges(
         }
     }
     for sym in symbols {
-        let sym_idx = *exports.get(*sym).ok_or_else(|| {
-            anyhow!("§Verifying Precedence step 2 failed: export for {sym} missing in pre-opt wasm")
-        })?;
+        let wrapped_impl = format!("__wrap_{sym}");
+        let sym_idx = *exports
+            .get(*sym)
+            .or_else(|| {
+                WRAPPED_WASI_LIBC_SYMBOLS
+                    .contains(sym)
+                    .then(|| exports.get(wrapped_impl.as_str()))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "§Verifying Precedence step 2 failed: export for {sym} missing in pre-opt wasm"
+                )
+            })?;
         let marker_idx = *exports
             .get(&format!("__yurt_abi_marker_{sym}"))
             .expect("marker export presence already checked");

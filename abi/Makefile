@@ -27,7 +27,6 @@ DENO ?= deno
 # build policy: gnulib-derived ports need C23 additions, and the ABI canaries
 # keep the historical warning/optimization profile here.
 YURT_CFLAGS := -O2 -std=gnu23 -Wall -Wextra
-
 LIB := $(BUILD_DIR)/libyurt_abi.a
 CONTINUATION_LIB := $(BUILD_DIR)/libyurt_continuation.a
 SETJMP_LIB := $(BUILD_DIR)/libyurt_setjmp.a

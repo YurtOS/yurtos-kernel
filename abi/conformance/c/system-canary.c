@@ -1,7 +1,7 @@
-#include "yurt_abi.h"
-
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
 
 int main(int argc, char **argv) {
   const char *cmd = "echo system-ok";
@@ -16,8 +16,8 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  rc = yurt_system(cmd);
-  if (rc != 0) {
+  rc = system(cmd);
+  if (rc == -1 || !WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
     return rc;
   }
 

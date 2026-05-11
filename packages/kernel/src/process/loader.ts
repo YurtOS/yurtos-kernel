@@ -42,7 +42,7 @@ export interface LoaderContext {
   adapter: PlatformAdapter;
   kernel: ProcessKernel;
   allocatePid(argv: string[]): number;
-  releasePid(pid: number, exitCode: number): void;
+  releasePid(pid: number, exitCode: number, signal?: number): void;
   buildWasiHost(
     pid: number,
     argv: string[],
@@ -197,7 +197,6 @@ export async function loadProcess(
     "host_socket_accept",
     "host_socket_recv",
     "host_extension_invoke",
-    "host_run_command",
     "host_thread_spawn",
     "host_thread_join",
     "host_thread_detach",
@@ -333,7 +332,6 @@ export async function loadProcess(
         "host_socket_accept",
         "host_socket_recv",
         "host_extension_invoke",
-        "host_run_command",
         "host_thread_spawn",
         "host_thread_join",
         "host_thread_detach",
@@ -396,7 +394,7 @@ export async function loadProcess(
         : undefined;
       childBridge.startForkRewind();
       const exitCode = await childWasi.startAsync(childInstance, childStartFn);
-      ctx.releasePid(childPid, exitCode);
+      ctx.releasePid(childPid, exitCode, childWasi.getExitSignal());
     })().catch(() => {
       ctx.releasePid(childPid, 127);
     });
@@ -457,7 +455,7 @@ export async function loadProcess(
   proc.__setExports({ exports: wrappedExports });
 
   proc.__setTerminate(async () => {
-    ctx.releasePid(pid, proc.exitCode ?? 0);
+    ctx.releasePid(pid, proc.exitCode ?? 0, wasi.getExitSignal());
   });
 
   return proc;

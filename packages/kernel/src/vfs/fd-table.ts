@@ -214,7 +214,12 @@ export class FdTable {
     this.entries.delete(fd);
 
     if (entry.dirty) {
-      this.vfs.writeFile(entry.path, entry.buffer);
+      const writableVfs = this.vfs as VfsLike & { withWriteAccess?: (fn: () => void) => void };
+      if (writableVfs.withWriteAccess) {
+        writableVfs.withWriteAccess(() => writableVfs.writeFile(entry.path, entry.buffer));
+      } else {
+        this.vfs.writeFile(entry.path, entry.buffer);
+      }
       entry.dirty = false;
     }
   }

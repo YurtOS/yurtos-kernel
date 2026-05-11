@@ -1,7 +1,6 @@
 /**
  * Python source for /usr/lib/python/subprocess.py — subprocess shim for the
- * WASI sandbox. Routes execution through _yurt.spawn() which calls back
- * into the TypeScript host via host_run_command.
+ * WASI sandbox. Routes execution through _yurt.spawn().
  *
  * Also patches os.popen at module level so code using os.popen works without
  * an explicit `import subprocess`.

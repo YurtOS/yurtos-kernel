@@ -1,4 +1,4 @@
-//! Virtual commands — curl, wget.
+//! Virtual commands — cat, curl, wget.
 //!
 //! Command logic runs entirely in the sandbox (Rust). Only I/O crosses to the
 //! host via `HostInterface::fetch` / `register_tool`.
@@ -12,7 +12,7 @@ use crate::{shell_eprint, shell_print};
 // Public API
 // ---------------------------------------------------------------------------
 
-pub const VIRTUAL_COMMANDS: &[&str] = &["curl", "wget"];
+pub const VIRTUAL_COMMANDS: &[&str] = &["cat", "curl", "wget"];
 
 pub fn is_virtual_command(name: &str) -> bool {
     VIRTUAL_COMMANDS.contains(&name)
@@ -35,6 +35,7 @@ pub fn try_virtual_command(
     }
 
     let result = match cmd {
+        "cat" => Some(cmd_cat(state, host, args, stdin)),
         "curl" => Some(cmd_curl(state, host, args, stdin)),
         "wget" => Some(cmd_wget(state, host, args)),
         _ => None,
@@ -46,6 +47,34 @@ pub fn try_virtual_command(
     }
 
     result
+}
+
+fn cmd_cat(
+    state: &ShellState,
+    host: &dyn HostInterface,
+    args: &[String],
+    stdin: &str,
+) -> RunResult {
+    if args.is_empty() {
+        shell_print!("{}", stdin);
+        return RunResult::empty();
+    }
+
+    for arg in args {
+        if arg == "-" {
+            shell_print!("{}", stdin);
+            continue;
+        }
+        let resolved = state.resolve_path(arg);
+        match host.read_file_str(&resolved) {
+            Ok(contents) => shell_print!("{}", contents),
+            Err(err) => {
+                shell_eprint!("cat: {arg}: {err}\n");
+                return RunResult::exit(1);
+            }
+        }
+    }
+    RunResult::empty()
 }
 
 // ---------------------------------------------------------------------------

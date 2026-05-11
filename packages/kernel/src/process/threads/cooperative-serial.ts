@@ -68,7 +68,8 @@ export class CooperativeSerialBackend implements ThreadsBackend {
       finished: false,
     };
     this.slots.push(slot);
-    slot.result = this.tids.run(tid, () => this.indirectTable.call(fnPtr, arg))
+    slot.result = Promise.resolve()
+      .then(() => this.tids.run(tid, () => this.indirectTable.call(fnPtr, arg)))
       .catch(() => -1)
       .finally(() => {
         slot.finished = true;

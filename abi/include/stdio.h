@@ -2,7 +2,18 @@
 #define YURT_COMPAT_STDIO_H
 
 /* Pull in the real wasi-sdk stdio.h. */
+#define tmpfile __yurt_hidden_wasilibc_tmpfile
+#pragma push_macro("__wasi__")
+#ifndef __wasi__
+#define __wasi__ 1
+#endif
 #include_next <stdio.h>
+#pragma pop_macro("__wasi__")
+#undef tmpfile
+#ifdef tmpfile64
+#undef tmpfile64
+#define tmpfile64 tmpfile
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,19 +35,13 @@ int  ftrylockfile(FILE *f);
 #endif
 char *cuserid(char *s);
 
-/* popen(3) / pclose(3) — POSIX, not in wasi-libc.
- *
- * Provided by libyurt_abi (yurt_process.c → wraps
- * yurt_popen / yurt_pclose, which route through host_run_command
- * to actually run the shell command).  The yurt runtime owns the
- * subprocess, so popen returns a FILE* you can read or write end-to-end
- * and pclose collects the exit status — no fork/exec involved.
- *
- * Declared here so any guest C program that includes <stdio.h> and links
- * libyurt_abi sees the prototypes — there's nothing
- * BusyBox-specific about this; it's a plain POSIX surface gap. */
+/* popen(3) / pclose(3) — POSIX, not in wasi-libc.  libyurt_abi provides
+ * read-mode popen via pipe(), posix_spawn("/bin/sh", "-c", command), and
+ * waitpid(). */
 FILE *popen(const char *command, const char *mode);
 int pclose(FILE *stream);
+
+FILE *tmpfile(void);
 
 #ifdef __cplusplus
 }

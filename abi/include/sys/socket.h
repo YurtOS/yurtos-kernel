@@ -1,7 +1,12 @@
 #ifndef YURT_COMPAT_SYS_SOCKET_H
 #define YURT_COMPAT_SYS_SOCKET_H
 
+#pragma push_macro("__wasi__")
+#ifndef __wasi__
+#define __wasi__ 1
+#endif
 #include_next <sys/socket.h>
+#pragma pop_macro("__wasi__")
 
 #include <stddef.h>
 #include <sys/types.h>

@@ -121,6 +121,12 @@ export const WASI_RIGHTS_ALL = BigInt(0x1fffffff);
 export const WASI_RIGHTS_FD_READ = 1n << 1n;
 export const WASI_RIGHTS_FD_WRITE = 1n << 6n;
 
+// Filestat timestamp flags
+export const WASI_FSTFLAGS_ATIM = 1;
+export const WASI_FSTFLAGS_ATIM_NOW = 2;
+export const WASI_FSTFLAGS_MTIM = 4;
+export const WASI_FSTFLAGS_MTIM_NOW = 8;
+
 // Event types (for poll_oneoff subscriptions and events)
 export const WASI_EVENTTYPE_CLOCK = 0;
 export const WASI_EVENTTYPE_FD_READ = 1;

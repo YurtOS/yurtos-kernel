@@ -120,28 +120,6 @@ class WorkerResidentRunner {
     return await this.callBootCommand(this.bootProcess, command);
   }
 
-  private async runInFreshBootProcess(command: string, stdin?: Uint8Array): Promise<RunResult> {
-    if (!this.bootProcess) {
-      return { exitCode: 1, stdout: '', stderr: 'Worker not initialized\n', executionTimeMs: 0 };
-    }
-    const child = await loadProcess(this.createLoaderContext(), {
-      argv: ['/bin/bash'],
-      mode: 'resident',
-      env: Object.fromEntries(this.env),
-      cwd: '/',
-      stdoutLimit: this.stdoutLimit,
-      stderrLimit: this.stderrLimit,
-    });
-    this.processes.set(child.pid, child);
-    this.applyOutputLimits(child.pid);
-    try {
-      return await this.callBootCommand(child, command, stdin);
-    } finally {
-      await child.terminate();
-      this.processes.delete(child.pid);
-    }
-  }
-
   private async callBootCommand(
     proc: Process,
     command: string,
@@ -284,13 +262,6 @@ class WorkerResidentRunner {
           extensionHandler: this.extensionHandler,
           nativeModules: mgr.nativeModules,
           threadsBackend,
-          runCommand: async (cmd, stdin) => {
-            const result = await this.runInFreshBootProcess(
-              cmd,
-              stdin ? new TextEncoder().encode(stdin) : undefined,
-            );
-            return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
-          },
           spawnProcess: (req, fdTable) => {
             const commandLabel = req.argv0 ?? req.prog;
             const childPid = kernel.allocPid(pid);

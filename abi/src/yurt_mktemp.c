@@ -1,4 +1,4 @@
-/* mktemp / mkstemp / mkostemp / mkdtemp — real symbols.
+/* mktemp / mkstemp / mkostemp / mkdtemp / tmpfile — real symbols.
  *
  * wasi-libc has these gated behind __wasilibc_unmodified_upstream
  * (i.e. absent from wasm32-wasip1).  Previously we provided header-
@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -28,10 +29,12 @@ YURT_DECLARE_MARKER(mktemp);
 YURT_DECLARE_MARKER(mkstemp);
 YURT_DECLARE_MARKER(mkostemp);
 YURT_DECLARE_MARKER(mkdtemp);
+YURT_DECLARE_MARKER(tmpfile);
 YURT_DEFINE_MARKER(mktemp,   0x6d6b7470u) /* "mktp" */
 YURT_DEFINE_MARKER(mkstemp,  0x6d6b7374u) /* "mkst" */
 YURT_DEFINE_MARKER(mkostemp, 0x6d6b6f73u) /* "mkos" */
 YURT_DEFINE_MARKER(mkdtemp,  0x6d6b6474u) /* "mkdt" */
+YURT_DEFINE_MARKER(tmpfile,  0x746d7066u) /* "tmpf" */
 
 extern int getentropy(void *buffer, size_t length);
 
@@ -111,4 +114,29 @@ char *mkdtemp(char *tmpl) {
   }
   errno = EEXIST;
   return NULL;
+}
+
+FILE *tmpfile(void) {
+  YURT_MARKER_CALL(tmpfile);
+  /* Yurt's guest ramfs provides /tmp. If that changes, this should follow
+   * P_tmpdir or TMPDIR before falling back to the POSIX default. */
+  char tmpl[] = "/tmp/yurt-tmpfile-XXXXXX";
+  int fd = mkstemp(tmpl);
+  if (fd < 0) {
+    return NULL;
+  }
+  if (unlink(tmpl) != 0) {
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return NULL;
+  }
+  FILE *f = fdopen(fd, "w+b");
+  if (!f) {
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return NULL;
+  }
+  return f;
 }

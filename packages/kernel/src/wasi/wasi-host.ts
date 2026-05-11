@@ -50,6 +50,10 @@ import {
   WASI_FILETYPE_REGULAR_FILE,
   WASI_FILETYPE_SOCKET_STREAM,
   WASI_FILETYPE_SYMBOLIC_LINK,
+  WASI_FSTFLAGS_ATIM,
+  WASI_FSTFLAGS_ATIM_NOW,
+  WASI_FSTFLAGS_MTIM,
+  WASI_FSTFLAGS_MTIM_NOW,
   WASI_OFLAGS_CREAT,
   WASI_OFLAGS_DIRECTORY,
   WASI_OFLAGS_EXCL,
@@ -125,6 +129,10 @@ function yurtStatDevice(
   const gid = BigInt(stat.gid >>> 0) & YURT_STAT_ID_MASK;
   return mode | (uid << YURT_STAT_MODE_BITS) |
     (gid << (YURT_STAT_MODE_BITS + YURT_STAT_UID_BITS));
+}
+
+function wasiTimestampToDate(timestamp: bigint): Date {
+  return new Date(Number(timestamp / BigInt(1_000_000)));
 }
 
 function dirnameOfVfsPath(path: string): string {
@@ -329,6 +337,7 @@ export class WasiHost {
   private ioFds: Map<number, FdTarget>;
 
   private cancelled = false;
+  private cancelSignal: number | null = null;
   private deadlineMs: number = Infinity;
   private kernel?: ProcessKernel;
   private pid?: number;
@@ -647,7 +656,16 @@ export class WasiHost {
     try {
       while (this.pendingSignals.length > 0) {
         const sig = this.pendingSignals.shift();
-        if (sig !== undefined) this.signalDeliverer(sig);
+        if (sig !== undefined) {
+          try {
+            this.signalDeliverer(sig);
+          } catch (e) {
+            if (e instanceof WasiExitError && e.code === 128 + sig) {
+              this.cancelSignal = sig;
+            }
+            throw e;
+          }
+        }
       }
     } finally {
       this.drainingSignals = false;
@@ -655,20 +673,27 @@ export class WasiHost {
   }
 
   /** Signal cancellation — next syscall check will throw WasiExitError. */
-  cancelExecution(): void {
+  cancelExecution(signal?: number): void {
     this.cancelled = true;
+    this.cancelSignal = signal ?? null;
   }
 
   /** Throw WasiExitError(124) if cancelled or past deadline. */
   private checkDeadline(): void {
     this.drainPendingSignals();
     if (this.cancelled || Date.now() > this.deadlineMs) {
-      throw new WasiExitError(124);
+      throw new WasiExitError(
+        this.cancelSignal !== null ? 128 + this.cancelSignal : 124,
+      );
     }
   }
 
   getExitCode(): number | null {
     return this.exitCode;
+  }
+
+  getExitSignal(): number {
+    return this.cancelSignal ?? 0;
   }
 
   /**
@@ -690,6 +715,7 @@ export class WasiHost {
       return 0;
     } catch (e: unknown) {
       if (e instanceof WasiExitError) {
+        this.exitCode = e.code;
         return e.code;
       }
       // WASM trap (RuntimeError: unreachable) from a Rust panic.
@@ -723,6 +749,7 @@ export class WasiHost {
       return 0;
     } catch (e: unknown) {
       if (e instanceof WasiExitError) {
+        this.exitCode = e.code;
         return e.code;
       }
       // WASM trap (RuntimeError: unreachable) from a Rust panic.
@@ -1680,7 +1707,11 @@ export class WasiHost {
     }
 
     try {
-      const entries = this.vfs.readdir(dirPath);
+      const entries = [
+        { name: ".", type: "dir" as const },
+        { name: "..", type: "dir" as const },
+        ...this.vfs.readdir(dirPath),
+      ];
       const view = this.getView();
       const bytes = this.getBytes();
 
@@ -2250,13 +2281,20 @@ export class WasiHost {
     }
   }
 
-  private fdFilestatSetTimes(fd: number): number {
+  private fdFilestatSetTimes(
+    fd: number,
+    atim: bigint,
+    mtim: bigint,
+    fstFlags: number,
+  ): number {
     this.checkDeadline();
     try {
       if (this.dirFds.has(fd)) return WASI_ESUCCESS;
-      return this.hasKernelFd(fd) || this.fdTable.isOpen(fd)
-        ? WASI_ESUCCESS
-        : WASI_EBADF;
+      const filePath = this.kernel && this.pid !== undefined
+        ? this.kernel.vfsFilePath(this.pid, fd) ?? this.fdTable.getPath(fd)
+        : this.fdTable.getPath(fd);
+      if (filePath === undefined) return WASI_EBADF;
+      return this.setVfsTimes(filePath, atim, mtim, fstFlags);
     } catch (err) {
       return fdErrorToWasi(err);
     }
@@ -2264,22 +2302,60 @@ export class WasiHost {
 
   private pathFilestatSetTimes(
     dirFd: number,
-    _flags: number,
+    flags: number,
     pathPtr: number,
     pathLen: number,
+    atim: bigint,
+    mtim: bigint,
+    fstFlags: number,
   ): number {
     this.checkDeadline();
     try {
       const relativePath = this.readString(pathPtr, pathLen);
       const absPath = this.resolvePath(dirFd, relativePath);
-      this.vfs.stat(absPath);
-      return WASI_ESUCCESS;
+      const followSymlinks = (flags & 1) !== 0;
+      return this.setVfsTimes(absPath, atim, mtim, fstFlags, followSymlinks);
     } catch (err) {
       if (err instanceof VfsError) {
         return vfsErrnoToWasi(err.errno);
       }
       return fdErrorToWasi(err);
     }
+  }
+
+  private setVfsTimes(
+    absPath: string,
+    atim: bigint,
+    mtim: bigint,
+    fstFlags: number,
+    followSymlinks = true,
+  ): number {
+    const invalidAtim = (fstFlags & WASI_FSTFLAGS_ATIM) !== 0 &&
+      (fstFlags & WASI_FSTFLAGS_ATIM_NOW) !== 0;
+    const invalidMtim = (fstFlags & WASI_FSTFLAGS_MTIM) !== 0 &&
+      (fstFlags & WASI_FSTFLAGS_MTIM_NOW) !== 0;
+    if (invalidAtim || invalidMtim) return WASI_EINVAL;
+
+    const now = new Date();
+    const atime = (fstFlags & WASI_FSTFLAGS_ATIM_NOW) !== 0
+      ? now
+      : (fstFlags & WASI_FSTFLAGS_ATIM) !== 0
+      ? wasiTimestampToDate(atim)
+      : undefined;
+    const mtime = (fstFlags & WASI_FSTFLAGS_MTIM_NOW) !== 0
+      ? now
+      : (fstFlags & WASI_FSTFLAGS_MTIM) !== 0
+      ? wasiTimestampToDate(mtim)
+      : undefined;
+    if (!atime && !mtime) {
+      this.vfs.stat(absPath);
+      return WASI_ESUCCESS;
+    }
+    if (!this.vfs.setTimes) return WASI_ENOSYS;
+    this.withVfsCredentials(() => {
+      this.vfs.setTimes!(absPath, atime, mtime, followSymlinks);
+    });
+    return WASI_ESUCCESS;
   }
 
   private clockResGet(clockId: number, resPtr: number): number {

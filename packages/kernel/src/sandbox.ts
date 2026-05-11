@@ -82,7 +82,6 @@ import {
   type FdTarget,
   TtyHandle,
 } from "./wasi/fd-target.js";
-import type { RunCommandHandler } from "./run-command.js";
 import {
   cooperativeRuntimeEngineBackend,
   normalizeNice,
@@ -134,8 +133,6 @@ export interface SandboxOptions {
   bootArgv?: string[];
   /** Userland-specific imports merged into PID 1's yurt import namespace. */
   bootImports?: (api: KernelApi) => Record<string, WebAssembly.ImportValue>;
-  /** Host callback for guest subprocess shims such as Python _yurt.spawn(). */
-  runCommandHandler?: RunCommandHandler;
   /** Network policy for guest programs. If omitted, network access is disabled. */
   network?: NetworkPolicy;
   /** Optional network bridge override. Primarily used by tests and alternate embeddings. */
@@ -189,7 +186,6 @@ interface SandboxParts {
   storage?: StorageCallbacks;
   bootArgv: string[];
   bootImports?: (api: KernelApi) => Record<string, WebAssembly.ImportValue>;
-  runCommandHandler?: RunCommandHandler;
 }
 
 interface PasswdEntry {
@@ -233,7 +229,6 @@ export class Sandbox {
   private bootImports:
     | ((api: KernelApi) => Record<string, WebAssembly.ImportValue>)
     | undefined;
-  private runCommandHandler: RunCommandHandler | undefined;
   private activeDeadlineMs: number | undefined;
   private envNeedsSync = false;
   /**
@@ -272,7 +267,6 @@ export class Sandbox {
     this.storage = parts.storage ?? null;
     this.bootArgv = parts.bootArgv;
     this.bootImports = parts.bootImports;
-    this.runCommandHandler = parts.runCommandHandler;
     this.envNeedsSync = parts.env.size > 0;
   }
 
@@ -466,8 +460,6 @@ export class Sandbox {
       serverSockets: options.serverSockets,
       runtimeBackend,
       extensionRegistry,
-      runCommandHandler: options.runCommandHandler,
-      getSandbox: () => sandboxRef,
       getDeadlineMs: () => sandboxRef?.activeDeadlineMs,
       memoryBytes: secLimits?.memoryBytes,
       stdoutLimit: secLimits?.stdoutBytes,
@@ -712,7 +704,6 @@ export class Sandbox {
       storage: options.storage,
       bootArgv,
       bootImports: options.bootImports,
-      runCommandHandler: options.runCommandHandler,
     });
     sandboxRef = sb;
 
@@ -1020,8 +1011,6 @@ export class Sandbox {
     serverSockets?: SocketListenPolicy;
     runtimeBackend: RuntimeEngineBackend;
     extensionRegistry: ExtensionRegistry;
-    runCommandHandler?: RunCommandHandler;
-    getSandbox: () => Sandbox | undefined;
     getDeadlineMs?: () => number | undefined;
     memoryBytes?: number;
     stdoutLimit?: number;
@@ -1040,8 +1029,6 @@ export class Sandbox {
       serverSockets,
       runtimeBackend,
       extensionRegistry,
-      runCommandHandler,
-      getSandbox,
       getDeadlineMs,
       memoryBytes,
       stdoutLimit,
@@ -1071,8 +1058,8 @@ export class Sandbox {
       adapter,
       kernel,
       allocatePid,
-      releasePid: (pid, exitCode) => {
-        kernel.releaseProcess(pid, exitCode);
+      releasePid: (pid, exitCode, signal) => {
+        kernel.releaseProcess(pid, exitCode, signal);
         processes.delete(pid);
       },
       buildWasiHost: (pid, argv, env, cwd) => {
@@ -1519,22 +1506,6 @@ export class Sandbox {
     return await this.callBootCommand(this.bootProcess, command, options);
   }
 
-  private async runBootCommandInFreshProcess(
-    command: string,
-    options?: { stdinData?: Uint8Array },
-  ): Promise<RunResult> {
-    const child = await this.spawn(this.bootArgv, {
-      mode: "resident",
-      env: Object.fromEntries(this.env),
-      bootImports: this.bootImports,
-    });
-    try {
-      return await this.callBootCommand(child, command, options);
-    } finally {
-      await child.terminate();
-    }
-  }
-
   private async callBootCommand(
     proc: Process,
     command: string,
@@ -1867,8 +1838,6 @@ export class Sandbox {
       serverSockets: this.serverSockets,
       runtimeBackend: this.runtimeBackend,
       extensionRegistry: this.extensionRegistry ?? new ExtensionRegistry(),
-      runCommandHandler: this.runCommandHandler,
-      getSandbox: () => this,
       getDeadlineMs: () => this.activeDeadlineMs,
       memoryBytes: this.security?.limits?.memoryBytes,
       stdoutLimit: this.security?.limits?.stdoutBytes,
@@ -2156,8 +2125,6 @@ export class Sandbox {
       serverSockets: this.serverSockets,
       runtimeBackend: this.runtimeBackend,
       extensionRegistry: this.extensionRegistry ?? new ExtensionRegistry(),
-      runCommandHandler: this.runCommandHandler,
-      getSandbox: () => childRef,
       getDeadlineMs: () => childRef?.activeDeadlineMs,
       memoryBytes: this.security?.limits?.memoryBytes,
       stdoutLimit: this.security?.limits?.stdoutBytes,
@@ -2221,7 +2188,6 @@ export class Sandbox {
       storage: this.storage ?? undefined,
       bootArgv: this.bootArgv,
       bootImports: this.bootImports,
-      runCommandHandler: this.runCommandHandler,
       moduleCache: this.moduleCache,
     });
     childRef = child;
@@ -2281,7 +2247,6 @@ export function createProcessLoaderContextForVfs(opts: {
     processes: opts.processes,
     runtimeBackend: opts.runtimeBackend ?? unsupportedRuntimeEngineBackend,
     extensionRegistry: new ExtensionRegistry(),
-    getSandbox: () => undefined,
     moduleCache: opts.moduleCache,
     stdoutLimit: opts.stdoutLimit,
     stderrLimit: opts.stderrLimit,

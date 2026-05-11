@@ -1,28 +1,33 @@
 import { assertEquals } from "jsr:@std/assert@^1.0.19";
 import { CooperativeSerialBackend } from "../threads/cooperative-serial.ts";
 
-Deno.test("cooperative serial backend rejects a second live spawned thread", async () => {
+Deno.test("cooperative serial backend returns from spawn while spawned routines run", async () => {
   const backend = new CooperativeSerialBackend();
-  let releaseFirst!: () => void;
-  const firstThreadStarted = new Promise<void>((resolve) => {
+  let releaseThread!: () => void;
+  const threadStarted = new Promise<void>((resolve) => {
     backend.setIndirectCallTable({
       async call(_fnPtr, arg) {
-        if (arg === 1) {
-          resolve();
-          await new Promise<void>((release) => {
-            releaseFirst = release;
-          });
-        }
+        resolve();
+        await new Promise<void>((release) => {
+          releaseThread = release;
+        });
         return arg;
       },
     });
   });
 
-  const first = await backend.spawn(1, 1);
-  await firstThreadStarted;
+  let spawnReturned = false;
+  const spawnResult = backend.spawn(1, 7).then((tid) => {
+    spawnReturned = true;
+    return tid;
+  });
+  await Promise.resolve();
 
-  assertEquals(await backend.spawn(1, 2), -1);
+  assertEquals(spawnReturned, true);
+  assertEquals(await spawnResult, 1);
 
-  releaseFirst();
-  assertEquals(await backend.join(first), 1);
+  await threadStarted;
+  const joinResult = backend.join(1);
+  releaseThread();
+  assertEquals(await joinResult, 7);
 });

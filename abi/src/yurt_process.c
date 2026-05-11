@@ -62,25 +62,6 @@ int kill(pid_t pid, int sig) {
     return 0;
 }
 
-/* popen / pclose libc names — wasi-libc doesn't ship them; yurt
- * provides yurt_popen / yurt_pclose against host_run_command.
- * Expose the standard POSIX names by aliasing to those impls so any
- * guest C program that links libyurt_abi gets the real
- * popen/pclose, regardless of how it spells its build (BusyBox, awk
- * variants, hand-rolled C, Rust crates pulling in libc, etc.). */
-#include <stdio.h>
-
-extern FILE *yurt_popen(const char *cmd, const char *mode);
-extern int yurt_pclose(FILE *stream);
-
-FILE *popen(const char *cmd, const char *mode) {
-    return yurt_popen(cmd, mode);
-}
-
-int pclose(FILE *stream) {
-    return yurt_pclose(stream);
-}
-
 /* wait(2) / waitpid(2) — POSIX wait surface routed through the
  * yurt kernel's host_wait.  host_wait is async on the
  * kernel side; the host wraps it with JSPI Suspending (or
@@ -107,15 +88,15 @@ YURT_DECLARE_MARKER(waitpid);
 YURT_DEFINE_MARKER(wait,    0x77616974u) /* "wait" */
 YURT_DEFINE_MARKER(waitpid, 0x77706964u) /* "wpid" */
 
-/* Pack a kernel exit code into the POSIX wait status encoding so
+/* Pack a kernel exit code and signal into the POSIX wait status encoding so
  * WIFEXITED / WEXITSTATUS / WTERMSIG round-trip cleanly:
  *   - low byte = signal (0 if exited normally)
  *   - bits 8-15 = exit code
  * Negative codes from the kernel are reported as errno by the
  * caller; we don't try to encode them in the status. */
-static int encode_wait_status(int kernel_exit) {
+static int encode_wait_status(int kernel_exit, int signal) {
     if (kernel_exit < 0) return 0;
-    if (kernel_exit == 124) return 9; /* SIGKILL-style cancel → WIFSIGNALED */
+    if (signal > 0) return signal & 0x7f;
     return (kernel_exit & 0xff) << 8;
 }
 
@@ -137,7 +118,7 @@ pid_t waitpid(pid_t pid, int *wstatus, int options) {
         return (pid_t)-1;
     }
 
-    if (wstatus) *wstatus = encode_wait_status(result.exit_code);
+    if (wstatus) *wstatus = encode_wait_status(result.exit_code, result.signal);
     return (pid_t)result.pid;
 }
 

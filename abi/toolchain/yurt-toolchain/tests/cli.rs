@@ -314,6 +314,46 @@ fn dry_run_injects_yurt_portability_defaults() {
 }
 
 #[test]
+fn dry_run_advertises_yurt_personality_by_default() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .arg("--dry-run")
+            .arg("foo.c")
+            .arg("-o")
+            .arg("foo.wasm")
+            .output()
+            .unwrap(),
+    );
+
+    let tokens = stdout_tokens(&stdout);
+    assert!(tokens.contains(&"-D__yurt__"), "{stdout}");
+    assert!(!tokens.contains(&"-U__wasi__"), "{stdout}");
+}
+
+#[test]
+fn dry_run_preserves_explicit_user_yurt_personality() {
+    let sdk = fake_sdk();
+
+    let stdout = stdout_string(
+        Command::new(bin())
+            .env("WASI_SDK_PATH", sdk.path())
+            .arg("--dry-run")
+            .arg("-U__yurt__")
+            .arg("foo.c")
+            .arg("-o")
+            .arg("foo.wasm")
+            .output()
+            .unwrap(),
+    );
+
+    assert!(stdout.contains("-U__yurt__"), "{stdout}");
+    assert!(!stdout.contains("-D__yurt__"), "{stdout}");
+}
+
+#[test]
 fn dry_run_defaults_final_c_links_to_gnu23() {
     let sdk = fake_sdk();
 
@@ -677,6 +717,88 @@ int main(void) {
     )
     .unwrap();
     let obj = tmp.path().join("headers.o");
+
+    let st = Command::new(bin())
+        .arg("-c")
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert!(obj.exists());
+}
+
+#[ignore = "slow: invokes real clang via yurt-cc to compile a C++ file"]
+#[test]
+fn signal_header_preserves_caller_restrict_macro_in_cxx() {
+    if std::env::var_os("WASI_SDK_PATH").is_none() {
+        eprintln!("skipping - WASI_SDK_PATH not set");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("signal_restrict.cc");
+    fs::write(
+        &src,
+        br#"
+#define restrict __restrict__
+#include <signal.h>
+#ifndef restrict
+#error "signal.h must preserve caller-defined restrict"
+#endif
+extern "C" int after_signal_header(const int *restrict value);
+extern "C" int after_signal_header(const int *restrict value) {
+    return value ? *value : 0;
+}
+"#,
+    )
+    .unwrap();
+    let obj = tmp.path().join("signal_restrict.o");
+
+    let st = Command::new(bin())
+        .arg("-c")
+        .arg(&src)
+        .arg("-o")
+        .arg(&obj)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert!(obj.exists());
+}
+
+#[ignore = "slow: invokes real clang via yurt-cc to compile a C file"]
+#[test]
+fn target_headers_expose_yurt_pthread_declarations() {
+    if std::env::var_os("WASI_SDK_PATH").is_none() {
+        eprintln!("skipping - WASI_SDK_PATH not set");
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("pthread_guard.c");
+    fs::write(
+        &src,
+        br#"
+#ifndef __yurt__
+#error "__yurt__ must identify Yurt target builds"
+#endif
+
+#include <pthread.h>
+
+int main(void) {
+    pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+    pthread_t self = pthread_self();
+    return pthread_mutex_lock(&mutex) ||
+           pthread_mutex_unlock(&mutex) ||
+           pthread_cond_signal(&cond) ||
+           !pthread_equal(self, pthread_self());
+}
+"#,
+    )
+    .unwrap();
+    let obj = tmp.path().join("pthread_guard.o");
 
     let st = Command::new(bin())
         .arg("-c")
