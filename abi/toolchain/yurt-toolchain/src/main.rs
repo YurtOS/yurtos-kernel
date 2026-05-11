@@ -265,6 +265,7 @@ fn build_clang_invocation(
     }
     for name in [
         "__linux__",
+        "__yurt__",
         "__STDC_ISO_10646__=201706L",
         "_WASI_EMULATED_SIGNAL",
         "_WASI_EMULATED_MMAN",

@@ -9,6 +9,7 @@ interface SpawnSlot {
   reaped: boolean;
   detached: boolean;
   finished: boolean;
+  stackPointer: number | null;
 }
 
 interface MutexState {
@@ -37,28 +38,40 @@ export class CooperativeSerialBackend implements ThreadsBackend {
   private tids = new AsyncLocalStorage<number>();
   private mutexes = new Map<number, MutexState>();
   private condvars = new Map<number, CondvarState>();
+  private memory: WebAssembly.Memory | null = null;
+  private stackPointer: WebAssembly.Global | null = null;
+  private activeTid = 0;
+  private readonly stackPagesPerThread = 16;
 
   setIndirectCallTable(table: IndirectCallTable): void {
     this.indirectTable = table;
-    if (this.slots.length === 0) {
-      this.slots.push({
-        result: Promise.resolve(0),
-        reaped: true,
-        detached: false,
-        finished: true,
-      });
-    }
+    this.ensureMainSlot();
+  }
+
+  bindLinearStack(
+    memory: WebAssembly.Memory,
+    stackPointer: WebAssembly.Global,
+  ): void {
+    this.memory = memory;
+    this.stackPointer = stackPointer;
+    this.ensureMainSlot();
+    this.slots[0].stackPointer = stackPointer.value as number;
+  }
+
+  suspendCurrentLinearStack(): number {
+    const tid = this.self();
+    this.saveStackPointer(tid);
+    return tid;
+  }
+
+  restoreLinearStack(tid: number): void {
+    this.saveStackPointer(this.activeTid);
+    this.restoreStackPointer(tid);
+    this.activeTid = tid;
   }
 
   async spawn(fnPtr: number, arg: number): Promise<number> {
-    if (this.slots.length === 0) {
-      this.slots.push({
-        result: Promise.resolve(0),
-        reaped: true,
-        detached: false,
-        finished: true,
-      });
-    }
+    this.ensureMainSlot();
     if (this.liveSpawnedThreads() >= this.maxLiveSpawnedThreads) return -1;
     const tid = this.slots.length;
     const slot: SpawnSlot = {
@@ -66,10 +79,21 @@ export class CooperativeSerialBackend implements ThreadsBackend {
       reaped: false,
       detached: false,
       finished: false,
+      stackPointer: this.allocateThreadStackTop(),
     };
     this.slots.push(slot);
     slot.result = Promise.resolve()
-      .then(() => this.tids.run(tid, () => this.indirectTable.call(fnPtr, arg)))
+      .then(() =>
+        this.tids.run(tid, async () => {
+          this.restoreLinearStack(tid);
+          try {
+            return await this.indirectTable.call(fnPtr, arg);
+          } finally {
+            this.saveStackPointer(tid);
+            this.restoreLinearStack(0);
+          }
+        })
+      )
       .catch(() => -1)
       .finally(() => {
         slot.finished = true;
@@ -180,6 +204,37 @@ export class CooperativeSerialBackend implements ThreadsBackend {
   private wake(waiter: Waiter | undefined): void {
     if (!waiter) return;
     this.tids.run(waiter.tid, waiter.wake);
+  }
+
+  private ensureMainSlot(): void {
+    if (this.slots.length !== 0) return;
+    this.slots.push({
+      result: Promise.resolve(0),
+      reaped: true,
+      detached: false,
+      finished: true,
+      stackPointer: this.stackPointer?.value as number | undefined ?? null,
+    });
+  }
+
+  private allocateThreadStackTop(): number | null {
+    if (!this.memory) return null;
+    const oldPages = this.memory.grow(this.stackPagesPerThread);
+    return (oldPages + this.stackPagesPerThread) * 65536;
+  }
+
+  private saveStackPointer(tid: number): void {
+    if (!this.stackPointer) return;
+    const slot = this.slots[tid];
+    if (!slot) return;
+    slot.stackPointer = this.stackPointer.value as number;
+  }
+
+  private restoreStackPointer(tid: number): void {
+    if (!this.stackPointer) return;
+    const slot = this.slots[tid];
+    if (!slot || slot.stackPointer === null) return;
+    this.stackPointer.value = slot.stackPointer;
   }
 
   private liveSpawnedThreads(): number {

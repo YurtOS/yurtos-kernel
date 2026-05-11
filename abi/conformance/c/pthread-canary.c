@@ -1,6 +1,8 @@
 #include <pthread.h>
 #include <errno.h>
+#include <poll.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #define NUM_THREADS 1
 #define ITERS_PER_THREAD 10000
@@ -9,7 +11,16 @@
 static int shared_counter = 0;
 static pthread_mutex_t shared_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t tls_key;
+static int exit_poll_pipe[2] = { -1, -1 };
 
+static void *exit_poll_blocker(void *arg) {
+  (void)arg;
+  struct pollfd pfd = { .fd = exit_poll_pipe[0], .events = POLLIN, .revents = 0 };
+  for (;;) {
+    poll(&pfd, 1, -1);
+  }
+  return NULL;
+}
 static void *worker(void *arg) {
   int id = (int)(long)arg;
   long initial_tls_value = (long)pthread_getspecific(tls_key);
@@ -120,6 +131,23 @@ int main(void) {
   if (shared_counter != EXPECTED) {
     fprintf(stderr, "pthread-canary: counter race: got %d, expected %d\n", shared_counter, EXPECTED);
     return 5;
+  }
+  if (pipe(exit_poll_pipe) != 0) {
+    fprintf(stderr, "pthread-canary: exit poll pipe failed\n");
+    return 1;
+  }
+  pthread_attr_t exit_attr;
+  if (pthread_attr_init(&exit_attr) != 0 ||
+      pthread_attr_setdetachstate(&exit_attr, PTHREAD_CREATE_DETACHED) != 0) {
+    fprintf(stderr, "pthread-canary: exit attr setup failed\n");
+    return 1;
+  }
+  pthread_t exit_tid;
+  int exit_rc = pthread_create(&exit_tid, &exit_attr, exit_poll_blocker, NULL);
+  pthread_attr_destroy(&exit_attr);
+  if (exit_rc != 0) {
+    fprintf(stderr, "pthread-canary: exit pthread_create returned %d\n", exit_rc);
+    return 1;
   }
   printf("pthread:ok\n");
   return 0;

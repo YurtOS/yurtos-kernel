@@ -31,3 +31,41 @@ Deno.test("cooperative serial backend returns from spawn while spawned routines 
   releaseThread();
   assertEquals(await joinResult, 7);
 });
+
+Deno.test("cooperative serial backend gives spawned threads a separate linear stack", async () => {
+  const backend = new CooperativeSerialBackend();
+  const memory = new WebAssembly.Memory({ initial: 2 });
+  const stackPointer = new WebAssembly.Global(
+    { value: "i32", mutable: true },
+    65536,
+  );
+  backend.bindLinearStack(memory, stackPointer);
+
+  let workerStackPointer = 0;
+  let releaseThread!: () => void;
+  const threadEntered = new Promise<void>((resolve) => {
+    backend.setIndirectCallTable({
+      async call() {
+        workerStackPointer = stackPointer.value as number;
+        resolve();
+        await new Promise<void>((release) => {
+          releaseThread = release;
+        });
+        return 0;
+      },
+    });
+  });
+
+  const spawnResult = backend.spawn(1, 0);
+  assertEquals(stackPointer.value, 65536);
+  const tid = await spawnResult;
+  assertEquals(tid, 1);
+
+  await threadEntered;
+  assertEquals(workerStackPointer > 65536, true);
+
+  const join = backend.join(tid);
+  releaseThread();
+  assertEquals(await join, 0);
+  assertEquals(stackPointer.value, 65536);
+});

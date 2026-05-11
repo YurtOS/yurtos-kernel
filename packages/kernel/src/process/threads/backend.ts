@@ -15,3 +15,12 @@ export interface ThreadsBackend {
   condSignal(condPtr: number): number;
   condBroadcast(condPtr: number): number;
 }
+
+export interface LinearStackSwitchingThreadsBackend extends ThreadsBackend {
+  bindLinearStack(
+    memory: WebAssembly.Memory,
+    stackPointer: WebAssembly.Global,
+  ): void;
+  suspendCurrentLinearStack(): number;
+  restoreLinearStack(tid: number): void;
+}

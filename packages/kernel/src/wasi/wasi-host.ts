@@ -675,7 +675,9 @@ export class WasiHost {
   /** Signal cancellation — next syscall check will throw WasiExitError. */
   cancelExecution(signal?: number): void {
     this.cancelled = true;
-    this.cancelSignal = signal ?? null;
+    if (signal !== undefined) this.cancelSignal = signal;
+    const waiters = this.signalWaiters.splice(0);
+    for (const wake of waiters) wake();
   }
 
   /** Throw WasiExitError(124) if cancelled or past deadline. */
