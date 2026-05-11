@@ -2,6 +2,8 @@
 #define YURT_COMPAT_PREINCLUDE_H
 
 #if !defined(__ASSEMBLER__)
+#include <sys/mman.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
