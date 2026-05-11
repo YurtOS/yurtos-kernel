@@ -37,7 +37,7 @@
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, relative, resolve } from "node:path";
+import { relative, resolve } from "node:path";
 import { Sandbox } from "../sandbox.js";
 import { NodeAdapter } from "../platform/node-adapter.js";
 
@@ -54,7 +54,9 @@ const HAS_FIXTURES = existsSync(
 
 const maybeDescribe = HAS_FIXTURES ? describe : describe.skip;
 
-interface MountFiles { [vfsPath: string]: Uint8Array }
+interface MountFiles {
+  [vfsPath: string]: Uint8Array;
+}
 
 /** Walk a host directory and build the `files` map a HostMount
  * consumes. The Jupyter tree is ~200 MB / ~12k files; readFileSync
