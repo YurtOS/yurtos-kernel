@@ -176,6 +176,21 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(rc).toEqual(-2); // -ENOENT, not -EINVAL
   });
 
+  it("custom builder: host_time returns seconds-as-float from SYS_CLOCK_GETTIME", async () => {
+    if (!HAS_JSPI) return;
+    // Build a Microkernel with a pinned now-time so the test is
+    // deterministic. defaultHostState() supplies 0 by default;
+    // we want a non-zero ns value to confirm the conversion.
+    const bytes = await Deno.readFile(KERNEL_WASM);
+    const mk = await Microkernel.load(bytes, {
+      ...defaultHostState(),
+      nowRealtimeNs: 1_500_000_000n, // 1.5 seconds
+    });
+    const imports = buildWasmKernelImports(mk, () => new ArrayBuffer(0));
+    const t = await imports.host_time();
+    expect(t).toEqual(1.5);
+  });
+
   it("host_native_invoke forwards bytes via sys_extension_invoke", async () => {
     if (!HAS_JSPI) return;
     const mk = await freshMk();

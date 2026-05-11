@@ -68,6 +68,19 @@ export type ArgSpec =
    */
   | "ignore_scalar";
 
+/**
+ * Custom builder escape hatch. Used for host_* whose
+ * wire-format requirements don't fit the ArgSpec vocabulary
+ * (e.g. host_time needs to read 8 bytes from a clock_gettime
+ * response and convert ns→seconds-as-float). When supplied,
+ * the factory ignores `method`/`args` for this binding and
+ * uses the builder's returned function directly.
+ */
+export type CustomBuilder = (
+  mk: Microkernel,
+  memBuf: () => ArrayBuffer,
+) => (...args: number[]) => Promise<number>;
+
 export interface HostBinding {
   /** The legacy TS-kernel-shaped name, e.g. "host_pipe". */
   name: string;
@@ -75,6 +88,13 @@ export interface HostBinding {
   method: number;
   /** Positional arg shape. */
   args: ArgSpec[];
+  /**
+   * When set, overrides the macro factory entirely — the
+   * builder's returned function becomes the binding. `method`
+   * and `args` are still required (for documentation) but
+   * unused at call time.
+   */
+  custom?: CustomBuilder;
   /**
    * Permutation applied to the wrapper's incoming `args` before
    * walking the `args` spec. Each entry is the index of the
@@ -340,6 +360,29 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["ptr_len"],
   },
 
+  // ── Custom builders (wire-format adapters) ────────────────
+  // host_time() → seconds-as-float. TS impl returns
+  // `Date.now() / 1000`. We route through SYS_CLOCK_GETTIME
+  // with CLOCK_REALTIME (=0) and divide the u64 ns response
+  // by 1e9 to match. Demonstrates the `custom` escape hatch
+  // for bindings whose shape doesn't fit ArgSpec.
+  {
+    name: "host_time",
+    method: METHOD.SYS_CLOCK_GETTIME,
+    args: [],
+    custom: (mk) => async (): Promise<number> => {
+      const req = new Uint8Array(4); // CLOCK_REALTIME = 0
+      const out = await mk.syscallAsync(METHOD.SYS_CLOCK_GETTIME, req, 8);
+      if (Number(out.rc) !== 8) return 0;
+      const ns = new DataView(
+        out.response.buffer,
+        out.response.byteOffset,
+        8,
+      ).getBigUint64(0, true);
+      return Number(ns) / 1e9;
+    },
+  },
+
   // ── Signals ───────────────────────────────────────────────
   // sigaction(sig, actPtr, actLen) — TS host_sigaction shape.
   // Not in our common test path; left to a future expansion.
@@ -367,7 +410,7 @@ export function buildWasmKernelImports(
 ): Record<string, (...args: number[]) => Promise<number>> {
   const imports: Record<string, (...args: number[]) => Promise<number>> = {};
   for (const b of HOST_BINDINGS) {
-    imports[b.name] = makeWrapper(b, mk, memBuf);
+    imports[b.name] = b.custom ? b.custom(mk, memBuf) : makeWrapper(b, mk, memBuf);
   }
   return imports;
 }
