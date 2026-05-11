@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <wasi/wasip1.h>
 
 #ifndef SO_ERROR
@@ -265,6 +266,17 @@ static ssize_t base64_decode(const char *src, unsigned char *dst, size_t cap) {
 int socket(int domain, int type, int protocol) {
   YURT_MARKER_CALL(socket);
 
+  if (domain == AF_UNIX) {
+    /* AF_UNIX: only SOCK_STREAM in this slice. */
+    if ((type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK) != SOCK_STREAM) {
+      errno = EPROTOTYPE;
+      return -1;
+    }
+    /* Allocate via the host socket open call. */
+    int fd = yurt_host_socket_open(AF_UNIX, type, 0);
+    if (fd < 0) { errno = EMFILE; return -1; }
+    return fd;
+  }
   if (domain != AF_INET || (type & SOCK_STREAM) != SOCK_STREAM) {
     errno = EAFNOSUPPORT;
     return -1;
@@ -285,7 +297,26 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   char resp[YURT_SOCKET_RESP_CAP];
   int n;
 
-  if (!addr || addrlen < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) {
+  if (!addr || addrlen < 2) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  /* AF_UNIX: send { fd, path } request */
+  if (addr->sa_family == AF_UNIX) {
+    const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
+    size_t pathlen = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
+    n = snprintf(req, sizeof(req),
+      "{\"fd\":%d,\"path\":\"%.*s\"}",
+      sockfd, (int)pathlen, un->sun_path);
+    if (n < 0 || (size_t)n >= sizeof(req)) { errno = EOVERFLOW; return -1; }
+    n = yurt_host_socket_connect((int)(intptr_t)req, n,
+                                  (int)(intptr_t)resp, (int)sizeof(resp));
+    if (n <= 0 || !parse_json_ok(resp, (size_t)n)) { errno = ECONNREFUSED; return -1; }
+    return 0;
+  }
+
+  if (addrlen < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) {
     errno = EAFNOSUPPORT;
     return -1;
   }
@@ -327,6 +358,22 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     errno = ECONNREFUSED;
     return -1;
   }
+  return 0;
+}
+
+static int yurt_fill_sockaddr_un(
+  struct sockaddr *addr,
+  socklen_t *addrlen,
+  const char *path
+) {
+  struct sockaddr_un un;
+  if (!addr || !addrlen) { errno = EINVAL; return -1; }
+  memset(&un, 0, sizeof(un));
+  un.sun_family = AF_UNIX;
+  strncpy(un.sun_path, path, sizeof(un.sun_path) - 1);
+  size_t copy = (*addrlen < sizeof(un)) ? (size_t)*addrlen : sizeof(un);
+  memcpy(addr, &un, copy);
+  *addrlen = (socklen_t)sizeof(un);
   return 0;
 }
 
@@ -407,6 +454,28 @@ static int yurt_sockname_impl(
     errno = ENOTCONN;
     return -1;
   }
+
+  /* Check for AF_UNIX path fields (local_path / peer_path). */
+  /* host_field for getsockname is "local_host" → path field is "local_path";
+   * for getpeername it is "peer_host" → path field is "peer_path". */
+  {
+    /* Derive the path field name: replace trailing "_host" with "_path". */
+    char path_field[64];
+    size_t hf_len = strlen(host_field);
+    /* host_field ends in "_host"; replace with "_path". */
+    if (hf_len > 5 && memcmp(host_field + hf_len - 5, "_host", 5) == 0) {
+      snprintf(path_field, sizeof(path_field), "%.*s_path", (int)(hf_len - 5), host_field);
+    } else {
+      path_field[0] = '\0';
+    }
+    if (path_field[0] != '\0') {
+      char unix_path[108];
+      if (parse_json_string_field(resp, (size_t)n, path_field, unix_path, sizeof(unix_path)) == 0) {
+        return yurt_fill_sockaddr_un(addr, addrlen, unix_path);
+      }
+    }
+  }
+
   if (parse_json_string_field(resp, (size_t)n, host_field, host, sizeof(host)) != 0 ||
       parse_json_int(resp, (size_t)n, port_field, &port) != 0) {
     return -1;
@@ -434,6 +503,23 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   int req_len;
   int n;
 
+  if (!addr || addrlen < 2) { errno = EINVAL; return -1; }
+
+  /* AF_UNIX: send { fd, path } request */
+  if (addr->sa_family == AF_UNIX) {
+    const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
+    size_t pathlen = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
+    n = snprintf(req, sizeof(req),
+      "{\"fd\":%d,\"path\":\"%.*s\"}",
+      sockfd, (int)pathlen, un->sun_path);
+    if (n < 0 || (size_t)n >= sizeof(req)) { errno = EOVERFLOW; return -1; }
+    n = yurt_host_socket_bind((int)(intptr_t)req, n,
+                               (int)(intptr_t)resp, (int)sizeof(resp));
+    if (n <= 0 || !parse_json_ok(resp, (size_t)n)) { errno = EADDRINUSE; return -1; }
+    return 0;
+  }
+
+  /* AF_INET path (existing) */
   if (yurt_sockaddr_to_host_port(addr, addrlen, host, sizeof(host), &port) != 0) {
     return -1;
   }
@@ -781,24 +867,10 @@ int shutdown(int sockfd, int how) {
   return 0;
 }
 
-/* socketpair — wasi-libc lacks it (gated behind
- * __wasilibc_unmodified_upstream). Emulate via TCP loopback: bind a
- * listener on 127.0.0.1:0, accept-side and connect-side become the
- * pair. AF_UNIX is folded onto AF_INET because yurt has no Unix
- * domain sockets — callers (libzmq's signaler in particular) treat
- * the pair as opaque, so the underlying transport is a transparent
- * implementation detail. SOCK_DGRAM is rejected (EPROTOTYPE) — only
- * SOCK_STREAM (with optional SOCK_CLOEXEC/SOCK_NONBLOCK bits) maps
- * onto our TCP-loopback emulation. Add a UDP-loopback path here
- * when a guest needs datagram pairs.
- *
- * Cleanup uses yurt_socketpair_release() — yurt's `shutdown()`
- * already routes through host_socket_close internally (see the
- * shutdown impl above), but a sibling helper here keeps each call
- * site unambiguous about the intent ("release this fd") and lets
- * us swap to a real close() if/when the host fd table accepts
- * wasi-libc's close path. Every early-exit frees any sockets the
- * function has already allocated. */
+/* socketpair — backed by the in-kernel UnixSocketRegistry via
+ * host_socket_socketpair.  Returns a connected AF_UNIX SOCK_STREAM
+ * pair.  Cleanup uses yurt_socketpair_release() so every early-exit
+ * path frees any sockets already allocated. */
 static void yurt_socketpair_release(int fd) {
   if (fd < 0) return;
   /* SHUT_RDWR (= 2) — on yurt this triggers host_socket_close. */
@@ -824,65 +896,41 @@ static int yurt_socketpair_apply_type_flags(int fd, int type) {
 
 int socketpair(int domain, int type, int protocol, int sv[2]) {
   YURT_MARKER_CALL(socketpair);
+  char req[64];
+  char resp[YURT_SOCKET_RESP_CAP];
+  int n;
 
   if (!sv) { errno = EFAULT; return -1; }
-  /* Accept the AF_UNIX form libzmq calls with; remap to AF_INET. */
   if (domain != AF_UNIX && domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
   if ((type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK) != SOCK_STREAM) { errno = EPROTOTYPE; return -1; }
   (void)protocol;
 
-  int listener = socket(AF_INET, SOCK_STREAM, 0);
-  if (listener < 0) return -1;
+  /* Ask the kernel to create a paired AF_UNIX socketpair. */
+  n = snprintf(req, sizeof(req), "{\"family\":1,\"type\":1}");
+  n = yurt_host_socket_socketpair((int)(intptr_t)req, n,
+                                   (int)(intptr_t)resp, (int)sizeof(resp));
+  if (n <= 0) { errno = ENOTSUP; return -1; }
 
-  struct sockaddr_in sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sin_family = AF_INET;
-  sa.sin_port = 0; /* ephemeral */
-  sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  /* Parse { ok: true, fds: [fd0, fd1] } */
+  int fd0 = -1, fd1 = -1;
+  const char *p = strstr(resp, "\"fds\":[");
+  if (!p) { errno = ENOTSUP; return -1; }
+  p += 7; /* skip "fds":[ */
+  fd0 = (int)strtol(p, NULL, 10);
+  p = strchr(p, ',');
+  if (!p) { errno = ENOTSUP; return -1; }
+  fd1 = (int)strtol(p + 1, NULL, 10);
+  if (fd0 < 0 || fd1 < 0) { errno = ENOTSUP; return -1; }
 
-  if (bind(listener, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
-    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
-  }
-  if (listen(listener, 1) < 0) {
-    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
-  }
-  /* Read back the assigned ephemeral port so connect() can target it. */
-  socklen_t sa_len = sizeof(sa);
-  if (getsockname(listener, (struct sockaddr *)&sa, &sa_len) < 0) {
-    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
-  }
-
-  int connector = socket(AF_INET, SOCK_STREAM, 0);
-  if (connector < 0) {
-    int saved = errno; yurt_socketpair_release(listener); errno = saved; return -1;
-  }
-  if (connect(connector, (const struct sockaddr *)&sa, sizeof(sa)) < 0) {
+  /* Apply SOCK_NONBLOCK / SOCK_CLOEXEC bits. */
+  if (yurt_socketpair_apply_type_flags(fd0, type) < 0 ||
+      yurt_socketpair_apply_type_flags(fd1, type) < 0) {
     int saved = errno;
-    yurt_socketpair_release(connector); yurt_socketpair_release(listener);
+    yurt_socketpair_release(fd0); yurt_socketpair_release(fd1);
     errno = saved; return -1;
   }
 
-  int acceptor = accept(listener, NULL, NULL);
-  if (acceptor < 0) {
-    int saved = errno;
-    yurt_socketpair_release(connector); yurt_socketpair_release(listener);
-    errno = saved; return -1;
-  }
-  /* Listener has done its job — release it; the pair is the
-   * acceptor (read end) and the connector (write end). */
-  yurt_socketpair_release(listener);
-
-  /* Propagate SOCK_NONBLOCK / SOCK_CLOEXEC bits onto both ends.
-   * Linux socketpair() applies these atomically; we apply
-   * post-creation, which is the best wasi-libc allows today. */
-  if (yurt_socketpair_apply_type_flags(acceptor, type) < 0 ||
-      yurt_socketpair_apply_type_flags(connector, type) < 0) {
-    int saved = errno;
-    yurt_socketpair_release(acceptor); yurt_socketpair_release(connector);
-    errno = saved; return -1;
-  }
-
-  sv[0] = acceptor;
-  sv[1] = connector;
+  sv[0] = fd0;
+  sv[1] = fd1;
   return 0;
 }
