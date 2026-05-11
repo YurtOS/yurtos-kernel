@@ -10,10 +10,11 @@
  * allocated by open().
  */
 
-import type { VfsLike } from './vfs-like.js';
+import type { VfsLike } from "./vfs-like.js";
+import type { FsCredential } from "./inode.js";
 
-export type OpenMode = 'r' | 'w' | 'a' | 'rw';
-export type SeekWhence = 'set' | 'cur' | 'end';
+export type OpenMode = "r" | "w" | "a" | "rw";
+export type SeekWhence = "set" | "cur" | "end";
 
 interface FdEntry {
   path: string;
@@ -22,6 +23,7 @@ interface FdEntry {
   offset: number;
   dirty: boolean;
   refs: number;
+  credential?: FsCredential;
   /**
    * Per-syscall stream callbacks for endless / device-style files
    * (/dev/urandom, /dev/zero, /dev/null, /dev/full).  When present,
@@ -48,9 +50,12 @@ export class FdTable {
   private entries: Map<number, FdEntry> = new Map();
   private nextFd: number = FIRST_FD;
 
-  constructor(vfs: VfsLike) {
+  constructor(vfs: VfsLike, credential?: FsCredential) {
     this.vfs = vfs;
+    this.credential = credential;
   }
+
+  private credential?: FsCredential;
 
   /** Open a file and return its fd number. */
   open(path: string, mode: OpenMode): number {
@@ -69,6 +74,7 @@ export class FdTable {
         offset: 0,
         dirty: false,
         refs: 1,
+        credential: this.credential,
         streamRead: stream.read,
         streamWrite: stream.write,
       });
@@ -77,9 +83,9 @@ export class FdTable {
 
     let buffer: Uint8Array;
 
-    if (mode === 'r' || mode === 'rw') {
+    if (mode === "r" || mode === "rw") {
       buffer = new Uint8Array(this.vfs.readFile(path));
-    } else if (mode === 'a') {
+    } else if (mode === "a") {
       // Append: load existing content so writes go after it
       try {
         const existing = this.vfs.readFile(path);
@@ -92,7 +98,7 @@ export class FdTable {
       buffer = new Uint8Array(0);
     }
 
-    const offset = mode === 'a' ? buffer.byteLength : 0;
+    const offset = mode === "a" ? buffer.byteLength : 0;
 
     const fd = this.nextFd++;
     this.entries.set(fd, {
@@ -100,8 +106,9 @@ export class FdTable {
       mode,
       buffer,
       offset,
-      dirty: mode === 'w' || mode === 'a',
+      dirty: mode === "w" || mode === "a",
       refs: 1,
+      credential: this.credential,
     });
 
     return fd;
@@ -137,7 +144,10 @@ export class FdTable {
       // /dev/full) which libc translates into errno=ENOSPC.
       return entry.streamWrite(data);
     }
-    const newLength = Math.max(entry.buffer.byteLength, entry.offset + data.byteLength);
+    const newLength = Math.max(
+      entry.buffer.byteLength,
+      entry.offset + data.byteLength,
+    );
 
     if (newLength > entry.buffer.byteLength) {
       const grown = new Uint8Array(newLength);
@@ -164,7 +174,10 @@ export class FdTable {
   /** Write data to an open fd at a given offset without changing the fd's offset. */
   pwrite(fd: number, data: Uint8Array, offset: number): number {
     const entry = this.getEntry(fd);
-    const newLength = Math.max(entry.buffer.byteLength, offset + data.byteLength);
+    const newLength = Math.max(
+      entry.buffer.byteLength,
+      offset + data.byteLength,
+    );
     if (newLength > entry.buffer.byteLength) {
       const grown = new Uint8Array(newLength);
       grown.set(entry.buffer);
@@ -180,7 +193,9 @@ export class FdTable {
     const entry = this.getEntry(fd);
     if (size === entry.buffer.byteLength) return;
     const newBuf = new Uint8Array(size);
-    newBuf.set(entry.buffer.subarray(0, Math.min(size, entry.buffer.byteLength)));
+    newBuf.set(
+      entry.buffer.subarray(0, Math.min(size, entry.buffer.byteLength)),
+    );
     entry.buffer = newBuf;
     if (entry.offset > size) entry.offset = size;
     entry.dirty = true;
@@ -190,9 +205,9 @@ export class FdTable {
   seek(fd: number, offset: number, whence: SeekWhence): number {
     const entry = this.getEntry(fd);
 
-    if (whence === 'set') {
+    if (whence === "set") {
       entry.offset = offset;
-    } else if (whence === 'cur') {
+    } else if (whence === "cur") {
       entry.offset += offset;
     } else {
       entry.offset = entry.buffer.byteLength + offset;
@@ -214,7 +229,10 @@ export class FdTable {
     this.entries.delete(fd);
 
     if (entry.dirty) {
-      this.vfs.writeFile(entry.path, entry.buffer);
+      this.withEntryCredential(
+        entry,
+        () => this.vfs.writeFile(entry.path, entry.buffer),
+      );
       entry.dirty = false;
     }
   }
@@ -231,6 +249,7 @@ export class FdTable {
       offset: 0,
       dirty: entry.dirty,
       refs: 1,
+      credential: entry.credential,
     });
 
     return newFd;
@@ -315,16 +334,19 @@ export class FdTable {
   /** Duplicate an fd into a detached table over the same VFS. */
   duplicateDetached(fd: number): { table: FdTable; fd: number } {
     const entry = this.getEntry(fd);
-    const table = new FdTable(this.vfs);
+    const table = new FdTable(this.vfs, entry.credential);
     const childFd = table.open(entry.path, entry.mode);
-    table.seek(childFd, entry.offset, 'set');
+    table.seek(childFd, entry.offset, "set");
     return { table, fd: childFd };
   }
 
   /** Duplicate an fd into a detached table, sharing the same open file description. */
-  duplicateSharedDetached(fd: number, preferredFd = fd): { table: FdTable; fd: number } {
+  duplicateSharedDetached(
+    fd: number,
+    preferredFd = fd,
+  ): { table: FdTable; fd: number } {
     const entry = this.getEntry(fd);
-    const table = new FdTable(this.vfs);
+    const table = new FdTable(this.vfs, entry.credential);
     let childFd = preferredFd;
     while (table.entries.has(childFd)) childFd++;
     entry.refs++;
@@ -335,7 +357,7 @@ export class FdTable {
 
   /** Clone the fd table for fork, sharing POSIX open file descriptions. */
   clone(): FdTable {
-    const cloned = new FdTable(this.vfs);
+    const cloned = new FdTable(this.vfs, this.credential);
     cloned.nextFd = this.nextFd;
 
     for (const [fd, entry] of this.entries) {
@@ -353,5 +375,10 @@ export class FdTable {
       throw new Error(`EBADF: bad file descriptor ${fd}`);
     }
     return entry;
+  }
+
+  private withEntryCredential<T>(entry: FdEntry, fn: () => T): T {
+    if (!entry.credential || !this.vfs.withCredential) return fn();
+    return this.vfs.withCredential(entry.credential, fn);
   }
 }

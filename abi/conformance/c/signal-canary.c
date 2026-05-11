@@ -1,7 +1,10 @@
 #include <errno.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef SA_ONSTACK
@@ -211,6 +214,56 @@ static int case_blocked_host_signal_delivers_after_unblock(void) {
   return 0;
 }
 
+static int case_waitpid_reports_terminating_signal(void) {
+  pid_t pid;
+  char *argv[] = { "sleep-canary", "1000", NULL };
+  int rc = posix_spawnp(&pid, "sleep-canary", NULL, NULL, argv, NULL);
+  if (rc != 0) {
+    emit("waitpid_reports_terminating_signal", 1, "spawn_failed", 1, rc);
+    return 1;
+  }
+  if (kill(pid, SIGTERM) != 0) {
+    emit("waitpid_reports_terminating_signal", 1, "kill_failed", 1, errno);
+    return 1;
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid) {
+    emit("waitpid_reports_terminating_signal", 1, "waitpid_failed", 1, errno);
+    return 1;
+  }
+  if (!WIFSIGNALED(status) || WTERMSIG(status) != SIGTERM) {
+    char out[96];
+    snprintf(out, sizeof(out), "bad_status:%d", status);
+    emit("waitpid_reports_terminating_signal", 1, out, 0, 0);
+    return 1;
+  }
+  emit("waitpid_reports_terminating_signal", 0, "waitpid:signal", 0, 0);
+  return 0;
+}
+
+static int case_waitpid_preserves_high_exit_code(void) {
+  pid_t pid;
+  char *argv[] = { "signal-canary", "--exit-code", "143", NULL };
+  int rc = posix_spawnp(&pid, "signal-canary", NULL, NULL, argv, NULL);
+  if (rc != 0) {
+    emit("waitpid_preserves_high_exit_code", 1, "spawn_failed", 1, rc);
+    return 1;
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid) {
+    emit("waitpid_preserves_high_exit_code", 1, "waitpid_failed", 1, errno);
+    return 1;
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 143) {
+    char out[96];
+    snprintf(out, sizeof(out), "bad_status:%d", status);
+    emit("waitpid_preserves_high_exit_code", 1, out, 0, 0);
+    return 1;
+  }
+  emit("waitpid_preserves_high_exit_code", 0, "waitpid:exit143", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "signal_install") == 0) return case_signal_install();
   if (strcmp(name, "sigaction_raise") == 0) return case_sigaction_raise();
@@ -227,6 +280,8 @@ static int run_case(const char *name) {
   if (strcmp(name, "sigsuspend_resumes_on_raise") == 0) return case_sigsuspend_resumes_on_raise();
   if (strcmp(name, "host_kill_delivers_handler") == 0) return case_host_kill_delivers_handler();
   if (strcmp(name, "blocked_host_signal_delivers_after_unblock") == 0) return case_blocked_host_signal_delivers_after_unblock();
+  if (strcmp(name, "waitpid_reports_terminating_signal") == 0) return case_waitpid_reports_terminating_signal();
+  if (strcmp(name, "waitpid_preserves_high_exit_code") == 0) return case_waitpid_preserves_high_exit_code();
   fprintf(stderr, "signal-canary: unknown case %s\n", name);
   return 2;
 }
@@ -247,6 +302,8 @@ static int list_cases(void) {
   puts("sigsuspend_resumes_on_raise");
   puts("host_kill_delivers_handler");
   puts("blocked_host_signal_delivers_after_unblock");
+  puts("waitpid_reports_terminating_signal");
+  puts("waitpid_preserves_high_exit_code");
   return 0;
 }
 
@@ -265,6 +322,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && strcmp(argv[1], "--list-cases") == 0) return list_cases();
   if (argc == 3 && strcmp(argv[1], "--case") == 0) return run_case(argv[2]);
+  if (argc == 3 && strcmp(argv[1], "--exit-code") == 0) return atoi(argv[2]);
   fprintf(stderr, "usage: signal-canary [--case <name> | --list-cases]\n");
   return 2;
 }

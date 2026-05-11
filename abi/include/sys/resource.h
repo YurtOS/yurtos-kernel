@@ -19,6 +19,10 @@
 
 #include <stdint.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef uint64_t rlim_t;
 struct rlimit {
     rlim_t rlim_cur;
@@ -70,5 +74,8 @@ int getrusage(int who, struct rusage *r);
 int getrlimit(int resource, struct rlimit *rlim);
 int setrlimit(int resource, const struct rlimit *rlim);
 
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* YURT_COMPAT_SYS_RESOURCE_H */

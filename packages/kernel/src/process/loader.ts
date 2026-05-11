@@ -19,7 +19,10 @@ import {
 } from "../async-bridge.js";
 import { CooperativeSerialBackend } from "./threads/cooperative-serial.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
-import type { ThreadsBackend } from "./threads/backend.js";
+import type {
+  LinearStackSwitchingThreadsBackend,
+  ThreadsBackend,
+} from "./threads/backend.js";
 import {
   defaultWasmModuleCache,
   sha256Hex,
@@ -42,7 +45,7 @@ export interface LoaderContext {
   adapter: PlatformAdapter;
   kernel: ProcessKernel;
   allocatePid(argv: string[]): number;
-  releasePid(pid: number, exitCode: number): void;
+  releasePid(pid: number, exitCode: number, signal?: number): void;
   buildWasiHost(
     pid: number,
     argv: string[],
@@ -186,29 +189,34 @@ export async function loadProcess(
     yurtImports.host_fork = asyncifyBridge
       .hostFork as unknown as WebAssembly.ImportValue;
   }
-  wrapAsyncImports(yurtImports, [
-    "host_wait",
-    "host_kill",
-    "host_killpg",
-    "host_yield",
-    "host_network_fetch",
-    "host_dns_resolve",
-    "host_register_tool",
-    "host_socket_accept",
-    "host_socket_recv",
-    "host_extension_invoke",
-    "host_run_command",
-    "host_thread_spawn",
-    "host_thread_join",
-    "host_thread_detach",
-    "host_thread_yield",
-    "host_mutex_lock",
-    "host_cond_wait",
-  ], asyncifyBridge);
+  wrapAsyncImports(
+    yurtImports,
+    [
+      "host_wait",
+      "host_kill",
+      "host_killpg",
+      "host_yield",
+      "host_network_fetch",
+      "host_dns_resolve",
+      "host_register_tool",
+      "host_socket_accept",
+      "host_socket_recv",
+      "host_extension_invoke",
+      "host_thread_spawn",
+      "host_thread_join",
+      "host_thread_detach",
+      "host_thread_yield",
+      "host_mutex_lock",
+      "host_cond_wait",
+    ],
+    asyncifyBridge,
+    threadsBackend,
+  );
   wrapAsyncImports(
     wasiImports as Record<string, WebAssembly.ImportValue>,
     ["fd_read", "fd_write", "poll_oneoff"],
     asyncifyBridge,
+    threadsBackend,
   );
 
   let instance: WebAssembly.Instance;
@@ -234,6 +242,15 @@ export async function loadProcess(
   }
 
   memoryRef = instance.exports.memory as WebAssembly.Memory;
+  if (
+    instance.exports.__stack_pointer instanceof WebAssembly.Global &&
+    "bindLinearStack" in threadsBackend
+  ) {
+    (threadsBackend as LinearStackSwitchingThreadsBackend).bindLinearStack(
+      memoryRef,
+      instance.exports.__stack_pointer,
+    );
+  }
   if (
     opts.memoryBytes !== undefined &&
     memoryRef.buffer.byteLength > opts.memoryBytes
@@ -323,30 +340,35 @@ export async function loadProcess(
         .hostLongjmp as unknown as WebAssembly.ImportValue;
       childYurtImports.host_fork = childBridge
         .hostFork as unknown as WebAssembly.ImportValue;
-      wrapAsyncImports(childYurtImports, [
-        "host_wait",
-        "host_kill",
-        "host_killpg",
-        "host_yield",
-        "host_network_fetch",
-        "host_register_tool",
-        "host_socket_accept",
-        "host_socket_recv",
-        "host_extension_invoke",
-        "host_run_command",
-        "host_thread_spawn",
-        "host_thread_join",
-        "host_thread_detach",
-        "host_thread_yield",
-        "host_mutex_lock",
-        "host_cond_wait",
-      ], childBridge);
+      wrapAsyncImports(
+        childYurtImports,
+        [
+          "host_wait",
+          "host_kill",
+          "host_killpg",
+          "host_yield",
+          "host_network_fetch",
+          "host_register_tool",
+          "host_socket_accept",
+          "host_socket_recv",
+          "host_extension_invoke",
+          "host_thread_spawn",
+          "host_thread_join",
+          "host_thread_detach",
+          "host_thread_yield",
+          "host_mutex_lock",
+          "host_cond_wait",
+        ],
+        childBridge,
+        childThreadsBackend,
+      );
 
       const childWasiImports = childWasi.getImports().wasi_snapshot_preview1;
       wrapAsyncImports(
         childWasiImports as Record<string, WebAssembly.ImportValue>,
         ["fd_read", "fd_write", "poll_oneoff"],
         childBridge,
+        childThreadsBackend,
       );
 
       const childInstance = await ctx.adapter.instantiate(module, {
@@ -359,6 +381,16 @@ export async function loadProcess(
       bindSignalDeliverer(childWasi, childInstance);
       ctx.kernel.attachWasiHost(childPid, childWasi);
       childMemoryRef = childInstance.exports.memory as WebAssembly.Memory;
+      if (
+        childInstance.exports.__stack_pointer instanceof WebAssembly.Global &&
+        "bindLinearStack" in childThreadsBackend
+      ) {
+        (childThreadsBackend as LinearStackSwitchingThreadsBackend)
+          .bindLinearStack(
+            childMemoryRef,
+            childInstance.exports.__stack_pointer,
+          );
+      }
       while (
         childMemoryRef.buffer.byteLength < snapshot.memoryBytes.byteLength
       ) {
@@ -396,7 +428,7 @@ export async function loadProcess(
         : undefined;
       childBridge.startForkRewind();
       const exitCode = await childWasi.startAsync(childInstance, childStartFn);
-      ctx.releasePid(childPid, exitCode);
+      ctx.releasePid(childPid, exitCode, childWasi.getExitSignal());
     })().catch(() => {
       ctx.releasePid(childPid, 127);
     });
@@ -457,7 +489,8 @@ export async function loadProcess(
   proc.__setExports({ exports: wrappedExports });
 
   proc.__setTerminate(async () => {
-    ctx.releasePid(pid, proc.exitCode ?? 0);
+    wasi.cancelExecution();
+    ctx.releasePid(pid, proc.exitCode ?? 0, wasi.getExitSignal());
   });
 
   return proc;
@@ -467,18 +500,36 @@ function wrapAsyncImports(
   imports: Record<string, WebAssembly.ImportValue>,
   names: string[],
   asyncifyBridge: AsyncifyAsyncBridge | null,
+  threadsBackend?: ThreadsBackend,
 ): void {
+  const stackSwitcher =
+    threadsBackend && "suspendCurrentLinearStack" in threadsBackend &&
+      "restoreLinearStack" in threadsBackend
+      ? threadsBackend as LinearStackSwitchingThreadsBackend
+      : null;
   for (const name of names) {
     const value = imports[name];
     if (typeof value !== "function") continue;
+    const withStackSwitching = (...args: number[]): unknown => {
+      const result = (value as (...args: number[]) => unknown)(...args);
+      if (!stackSwitcher || !(result instanceof Promise)) return result;
+      const tid = stackSwitcher.suspendCurrentLinearStack();
+      return result.then((resolved) => {
+        stackSwitcher.restoreLinearStack(tid);
+        return resolved;
+      }, (error) => {
+        stackSwitcher.restoreLinearStack(tid);
+        throw error;
+      });
+    };
 
     if (asyncifyBridge) {
       imports[name] = asyncifyBridge.wrapImport(
-        value as (...args: number[]) => Promise<number> | number,
+        withStackSwitching as (...args: number[]) => Promise<number> | number,
       ) as WebAssembly.ImportValue;
     } else if (typeof WebAssembly.Suspending === "function") {
       imports[name] = new WebAssembly.Suspending(
-        value as (...args: number[]) => unknown,
+        withStackSwitching as (...args: number[]) => unknown,
       ) as unknown as WebAssembly.ImportValue;
     }
   }

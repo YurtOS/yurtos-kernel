@@ -5,7 +5,12 @@
 #ifndef YURT_COMPAT_SYS_TIME_H
 #define YURT_COMPAT_SYS_TIME_H
 
+#pragma push_macro("__wasi__")
+#ifndef __wasi__
+#define __wasi__ 1
+#endif
 #include_next <sys/time.h>
+#pragma pop_macro("__wasi__")
 
 #include <errno.h>
 

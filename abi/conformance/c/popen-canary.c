@@ -1,7 +1,6 @@
-#include "yurt_abi.h"
-
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
 
 int main(int argc, char **argv) {
   char buf[128];
@@ -18,29 +17,29 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  fp = yurt_popen(cmd, "r");
+  fp = popen(cmd, "r");
   if (!fp) {
-    perror("yurt_popen");
+    perror("popen");
     return 1;
   }
 
   if (!fgets(buf, sizeof(buf), fp)) {
-    yurt_pclose(fp);
+    pclose(fp);
     return 1;
   }
 
-  status = yurt_pclose(fp);
+  status = pclose(fp);
   if (status < 0) {
-    perror("yurt_pclose");
+    perror("pclose");
     return 1;
   }
 
   if (expect_status != 0) {
-    if (status != expect_status) {
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != expect_status) {
       fprintf(stderr, "unexpected status: %d\n", status);
       return 1;
     }
-    printf("pclose:%d\n", status);
+    printf("pclose:%d\n", WEXITSTATUS(status));
     return 0;
   }
 

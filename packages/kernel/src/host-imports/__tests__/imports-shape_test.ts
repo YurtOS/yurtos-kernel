@@ -7,7 +7,7 @@ import { MemoryRoot } from "../../vfs/__tests__/helpers.ts";
 import { ProcessKernel } from "../../process/kernel.ts";
 import { FdTable } from "../../vfs/fd-table.ts";
 import { createVfsFileTarget, type FdTarget } from "../../wasi/fd-target.ts";
-import { WasiHost } from "../../wasi/wasi-host.ts";
+import { WasiExitError, WasiHost } from "../../wasi/wasi-host.ts";
 import type { RuntimeEngineBackend } from "../../engine/backend.ts";
 import type { SocketBackend } from "../../network/socket-backend.ts";
 import { buildNativeSpawnRequest } from "./spawn-request-fixture.ts";
@@ -1578,4 +1578,59 @@ Deno.test("host_spawn rejects nonzero nice when the engine has no scheduler back
     (imports.host_spawn as (...args: number[]) => number)(0, reqLen),
     -38,
   );
+});
+
+Deno.test("host_thread_exit maps main-thread pthread_exit to process exit", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const imports = createKernelImports({
+    memory,
+    threadsBackend: {
+      kind: "cooperative-serial",
+      setIndirectCallTable() {},
+      async spawn() {
+        return -1;
+      },
+      async join() {
+        return -1;
+      },
+      async detach() {
+        return -1;
+      },
+      exit(): never {
+        throw new Error("spawned-thread exit path should not run");
+      },
+      self() {
+        return 0;
+      },
+      async yield_() {
+        return 0;
+      },
+      async mutexLock() {
+        return 0;
+      },
+      mutexUnlock() {
+        return 0;
+      },
+      mutexTryLock() {
+        return 0;
+      },
+      async condWait() {
+        return 0;
+      },
+      condSignal() {
+        return 0;
+      },
+      condBroadcast() {
+        return 0;
+      },
+    },
+  });
+
+  try {
+    (imports.host_thread_exit as (retval: number) => never)(123);
+    throw new Error("host_thread_exit returned");
+  } catch (err) {
+    assertEquals(err instanceof WasiExitError, true);
+    assertEquals((err as WasiExitError).code, 0);
+  }
 });

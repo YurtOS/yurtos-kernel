@@ -16,6 +16,7 @@ YURT_DECLARE_MARKER(setrlimit);
 YURT_DEFINE_MARKER(getrlimit, 0x67726c6du) /* "grlm" */
 YURT_DEFINE_MARKER(setrlimit, 0x73726c6du) /* "srlm" */
 
+__attribute__((visibility("default")))
 int getrlimit(int resource, struct rlimit *rlim) {
   YURT_MARKER_CALL(getrlimit);
 
@@ -32,6 +33,7 @@ int getrlimit(int resource, struct rlimit *rlim) {
   return 0;
 }
 
+__attribute__((visibility("default")))
 int setrlimit(int resource, const struct rlimit *rlim) {
   YURT_MARKER_CALL(setrlimit);
 

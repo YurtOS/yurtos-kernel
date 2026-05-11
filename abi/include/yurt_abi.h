@@ -2,7 +2,10 @@
 #define YURT_ABI_H
 
 #include <stdint.h>
-#include <stdio.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,19 +92,6 @@ typedef struct {
 } yurt_spawn_result_v1;
 
 extern uint32_t yurt_abi_version;
-
-/*
- * Narrow Phase A command-execution shim for yurt guests, part of the
- * yurt kernel ABI runtime (see
- * docs/superpowers/specs/2026-04-19-ABI-runtime-design.md).
- *
- * This is a yurt extension layer on top of wasi-libc, not a POSIX process
- * API. Only read-mode popen is supported, and yurt_pclose() returns the
- * captured raw exit code from the completed command.
- */
-int yurt_system(const char *cmd);
-FILE *yurt_popen(const char *cmd, const char *mode);
-int yurt_pclose(FILE *stream);
 
 int yurt_fetch_text(
   const char *url,

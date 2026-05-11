@@ -8,7 +8,12 @@
  * "C" locale defaults.  Exposing these symbols lets POSIX-portable
  * upstream code (file/libmagic, GNU coreutils, etc.) link without
  * having to ifdef out timezone handling. */
+#pragma push_macro("__wasi__")
+#ifndef __wasi__
+#define __wasi__ 1
+#endif
 #include_next <time.h>
+#pragma pop_macro("__wasi__")
 
 #ifndef __wasilibc_unmodified_upstream
 

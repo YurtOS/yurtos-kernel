@@ -21,6 +21,7 @@ const FIXTURES = resolve(
   "../platform/__tests__/fixtures",
 );
 const HAS_BUSYBOX_FIXTURE = existsSync(resolve(FIXTURES, "busybox.wasm"));
+const shellIt = HAS_BUSYBOX_FIXTURE ? it : it.skip;
 // Phase 1 shared-library smoke test: gated on the side-module fixture
 // being present. The fixture is built by `make -C abi side-module-canaries`
 // (requires WASI SDK), so locally the test runs only if the dev has
@@ -29,6 +30,34 @@ const HAS_BUSYBOX_FIXTURE = existsSync(resolve(FIXTURES, "busybox.wasm"));
 const HAS_DLCANARY_FIXTURE =
   existsSync(resolve(FIXTURES, "libyurt_dlcanary.wasm")) &&
   existsSync(resolve(FIXTURES, "dlopen-canary.wasm"));
+
+function installTestShell(sandbox: Sandbox): void {
+  const vfs = (sandbox as unknown as {
+    vfs: {
+      withWriteAccess(fn: () => void): void;
+      mkdirp(path: string): void;
+      writeFile(path: string, data: Uint8Array): void;
+      symlink(target: string, path: string): void;
+      unlink(path: string): void;
+      chmod(path: string, mode: number): void;
+    };
+  }).vfs;
+  vfs.withWriteAccess(() => {
+    vfs.mkdirp("/usr/bin");
+    vfs.mkdirp("/bin");
+    vfs.writeFile(
+      "/usr/bin/busybox",
+      Deno.readFileSync(resolve(FIXTURES, "busybox.wasm")),
+    );
+    vfs.chmod("/usr/bin/busybox", 0o555);
+    try {
+      vfs.unlink("/bin/sh");
+    } catch {
+      // The fixture manifest may not have installed this link yet.
+    }
+    vfs.symlink("/usr/bin/busybox", "/bin/sh");
+  });
+}
 
 class StaticFetchBridge implements NetworkBridgeLike {
   requests: Array<{
@@ -105,11 +134,12 @@ describe("Kernel ABI canaries", () => {
     expect(elapsedMs).toBeGreaterThanOrEqual(lowerBoundMs);
   });
 
-  it("runs system-canary through the host command shim", async () => {
+  shellIt("runs system-canary through POSIX system()", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
     });
+    installTestShell(sandbox);
 
     const result = await sandbox.run("system-canary");
 
@@ -117,11 +147,12 @@ describe("Kernel ABI canaries", () => {
     expect(result.stdout.trim()).toContain("system-ok");
   });
 
-  it("runs popen-canary and captures command output", async () => {
+  shellIt("runs popen-canary and captures command output", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
     });
+    installTestShell(sandbox);
 
     const result = await sandbox.run("popen-canary");
 
@@ -129,23 +160,28 @@ describe("Kernel ABI canaries", () => {
     expect(result.stdout.trim()).toBe("popen:hello-from-shell");
   });
 
-  it("retries host_run_command when the response exceeds the initial buffer", async () => {
+  shellIt(
+    "streams large system() command output through the process path",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+      installTestShell(sandbox);
+
+      const result = await sandbox.run("system-canary large");
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("system-large-ok");
+    },
+  );
+
+  shellIt("returns the command exit status from pclose", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
     });
-
-    const result = await sandbox.run("system-canary large");
-
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("system-large-ok");
-  });
-
-  it("returns the command exit status from yurt_pclose", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+    installTestShell(sandbox);
 
     const result = await sandbox.run("popen-canary status");
 
@@ -485,6 +521,38 @@ describe("Kernel ABI canaries", () => {
         '{"case":"fcntl_setfl_masks_access_mode","exit":0,"stdout":"fcntl_setfl_masks_access_mode:ok"}',
       );
     });
+
+    it("returns POSIX dot entries from readdir", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run(
+        "posix-runtime-canary --case readdir_dot_entries",
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"readdir_dot_entries","exit":0,"stdout":"readdir_dot_entries:ok"}',
+      );
+    });
+
+    it("applies utimes mtime updates through WASI filestat setters", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run(
+        "posix-runtime-canary --case utimes_mtime",
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"utimes_mtime","exit":0,"stdout":"utimes_mtime:ok"}',
+      );
+    });
   });
 
   it("exposes the narrow signal compatibility header surface", async () => {
@@ -547,6 +615,38 @@ describe("Kernel ABI canaries", () => {
     );
   });
 
+  it("reports terminating signals through waitpid status", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run(
+      "signal-canary --case waitpid_reports_terminating_signal",
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      '{"case":"waitpid_reports_terminating_signal","exit":0,"stdout":"waitpid:signal"}',
+    );
+  });
+
+  it("preserves normal child exit codes above 128 through waitpid status", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run(
+      "signal-canary --case waitpid_preserves_high_exit_code",
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      '{"case":"waitpid_preserves_high_exit_code","exit":0,"stdout":"waitpid:exit143"}',
+    );
+  });
+
   it("runs the pthread-canary single-thread compatibility test", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
@@ -557,6 +657,18 @@ describe("Kernel ABI canaries", () => {
 
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe("pthread:ok");
+  });
+
+  it("treats pthread_exit from main as a clean process exit", async () => {
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run("pthread-main-exit-canary");
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("");
   });
 
   it("exposes the POSIX socket compatibility header surface", async () => {
@@ -1403,7 +1515,6 @@ describe("Kernel ABI canaries", () => {
             },
           ],
         });
-
         const result = await sandbox.run("dlopen-canary --case happy_path");
 
         if (result.exitCode !== 0) {
