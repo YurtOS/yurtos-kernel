@@ -890,4 +890,95 @@ describe("socket fd host imports", () => {
       localPort: 18081,
     });
   });
+
+  it("reports listener local address but rejects peer address", () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    const kernel = new ProcessKernel();
+    let backend: SocketBackend;
+    backend = {
+      connect: () => ({ ok: false, error: "not used" }),
+      send: () => ({ ok: true, bytes_sent: 0 }),
+      recv: () => ({ ok: true, data_b64: "" }),
+      close: () => ({ ok: true }),
+      listen: () => ({
+        ok: true,
+        listener: 55,
+        host: "127.0.0.1",
+        port: 51234,
+      }),
+      accept: () => ({ ok: false, error: "not used" }),
+      closeListener: () => ({ ok: true }),
+      acceptAsync: (listener) => Promise.resolve(backend.accept!(listener)),
+      recvAsync: (socket, maxBytes) =>
+        Promise.resolve(backend.recv(socket, maxBytes)),
+    };
+    const imports = createKernelImports({
+      memory,
+      kernel,
+      socketBackend: backend,
+      serverSockets: { allowLoopback: true },
+    });
+
+    const fd = (imports.host_socket_open as (...args: number[]) => number)(
+      2,
+      1,
+      0,
+    );
+    const bindLen = writeString(
+      memory,
+      16,
+      JSON.stringify({ fd, host: "127.0.0.1", port: 0 }),
+    );
+    (imports.host_socket_bind as (...args: number[]) => number)(
+      16,
+      bindLen,
+      256,
+      4096,
+    );
+    const listenLen = writeString(
+      memory,
+      16,
+      JSON.stringify({ fd, backlog: 1 }),
+    );
+    (imports.host_socket_listen as (...args: number[]) => number)(
+      16,
+      listenLen,
+      256,
+      4096,
+    );
+
+    const localReqLen = writeString(
+      memory,
+      16,
+      JSON.stringify({ fd, kind: "local" }),
+    );
+    const localLen =
+      (imports.host_socket_addr as (...args: number[]) => number)(
+        16,
+        localReqLen,
+        512,
+        4096,
+      );
+    expect(readJson(memory, 512, localLen)).toMatchObject({
+      ok: true,
+      local_host: "127.0.0.1",
+      local_port: 51234,
+    });
+
+    const peerReqLen = writeString(
+      memory,
+      16,
+      JSON.stringify({ fd, kind: "peer" }),
+    );
+    const peerLen = (imports.host_socket_addr as (...args: number[]) => number)(
+      16,
+      peerReqLen,
+      512,
+      4096,
+    );
+    expect(readJson(memory, 512, peerLen)).toMatchObject({
+      ok: false,
+      error: `socket not connected: ${fd}`,
+    });
+  });
 });

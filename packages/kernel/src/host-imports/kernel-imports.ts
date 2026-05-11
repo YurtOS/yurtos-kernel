@@ -2202,7 +2202,7 @@ export function createKernelImports(
 
     // host_socket_addr(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Reports sandbox-visible socket address metadata.
-    // Request JSON: { fd }
+    // Request JSON: { fd, kind?: "local" | "peer" }
     // Response JSON: { ok, peer_host, peer_port, local_host, local_port } or { ok: false, error }
     host_socket_addr(
       reqPtr: number,
@@ -2225,19 +2225,18 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
-        // POSIX getsockname()/getpeername() are defined for any socket
-        // that has been bound, connected, or is listening. Accept all
-        // three states: connected (target.socket !== null), listening
-        // (target.listener != null), and bound-but-not-yet-listening
-        // (target.boundPort !== undefined). The socketpair() emulation
-        // in abi/src/yurt_socket.c reads back the ephemeral port from
-        // a fresh listener via getsockname(), so listening sockets
-        // must work — pre-this-fix it rejected with "not a connected
-        // socket fd" and the socket-canary's socketpair section
-        // failed.
+        const kind = req.kind === "peer" ? "peer" : "local";
+        if (kind === "peer" && target.socket === null) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `socket not connected: ${req.fd}`,
+          });
+        }
+        // getsockname() is defined for connected, listening, and bound sockets.
+        // socketpair() reads back the ephemeral listener port via getsockname().
         if (
-          target.socket === null && target.listener == null &&
-          target.boundPort === undefined
+          kind === "local" && target.socket === null &&
+          target.listener == null && target.boundPort === undefined
         ) {
           return writeJson(memory, outPtr, outCap, {
             ok: false,
