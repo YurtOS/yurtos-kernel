@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -81,11 +82,27 @@ static int case_setrlimit_raise_hard_denied(void) {
   return 0;
 }
 
+static int case_posix_madvise(void) {
+  char page[4096];
+  if (posix_madvise(page, sizeof(page), POSIX_MADV_NORMAL) != 0) {
+    emit("posix_madvise_normal_fail", 1, errno);
+    return 1;
+  }
+  int rc = posix_madvise(page, sizeof(page), 999);
+  if (rc != EINVAL) {
+    emit("posix_madvise_invalid_should_einval", 1, (unsigned long)rc);
+    return 1;
+  }
+  emit("posix_madvise", 0, 0);
+  return 0;
+}
+
 int main(void) {
   int rc = 0;
   rc |= case_nofile();
   rc |= case_setrlimit_raise_hard_denied();
   rc |= case_setrlimit_enforced();
   rc |= case_invalid();
+  rc |= case_posix_madvise();
   return rc;
 }

@@ -71,6 +71,7 @@ pub const TIER1: &[&str] = &[
     "posix_spawnp",
     "posix_spawn_file_actions_init",
     "posix_spawnattr_init",
+    "posix_madvise",
     "setrlimit",
     "sched_getaffinity",
     "sched_setaffinity",

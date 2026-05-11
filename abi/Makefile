@@ -43,6 +43,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_fs.o \
   $(BUILD_DIR)/yurt_ioctl.o \
   $(BUILD_DIR)/yurt_locale_rs.o \
+  $(BUILD_DIR)/yurt_mman.o \
   $(BUILD_DIR)/yurt_mktemp.o \
   $(BUILD_DIR)/yurt_netdb.o \
   $(BUILD_DIR)/yurt_netif.o \
@@ -78,12 +79,15 @@ FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 SIDE_MODULE_CANARIES := $(BUILD_DIR)/libyurt_dlcanary.wasm
 YURT_WASI_POSTLINK := $(REPO_ROOT)/target/release/yurt-wasi-postlink
 
-.PHONY: all lib canaries copy-fixtures clean ensure-toolchain check-native-abi-contract side-module-canaries
+.PHONY: all lib canaries copy-fixtures clean ensure-toolchain check-native-abi-contract check-headers side-module-canaries
 
 all: lib canaries side-module-canaries
 
 check-native-abi-contract:
 	cd $(REPO_ROOT) && $(DENO) run --allow-read --allow-write scripts/generate-native-abi.ts --check
+
+check-headers: ensure-toolchain
+	$(abspath tests/check_headers.sh)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
