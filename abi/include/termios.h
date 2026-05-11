@@ -20,6 +20,7 @@
 #define _TERMIOS_H
 
 #include <stdint.h>
+#include <sys/types.h>
 
 typedef uint32_t tcflag_t;
 typedef uint8_t  cc_t;
@@ -87,6 +88,7 @@ struct termios {
 
 /* c_cflag bits */
 #define CBAUD   0x0000000fu
+#define CBAUDEX 0x00001000u
 #define B0      0u
 #define B50     1u
 #define B75     2u
@@ -114,6 +116,7 @@ struct termios {
 #define PARODD  0x00000200u
 #define HUPCL   0x00000400u
 #define CLOCAL  0x00000800u
+#define CRTSCTS 0x80000000u
 
 /* c_lflag bits */
 #define ISIG    0x00000001u
@@ -161,6 +164,7 @@ struct winsize {
 #define TIOCCONS   0x541D
 #define TIOCLINUX  0x541C
 #define TIOCSCTTY  0x540E
+#define TIOCNOTTY  0x5422
 
 #ifdef __cplusplus
 extern "C" {
@@ -172,6 +176,7 @@ int      tcflush(int fd, int queue_selector);
 int      tcdrain(int fd);
 int      tcflow(int fd, int action);
 int      tcsendbreak(int fd, int duration);
+pid_t    tcgetsid(int fd);
 
 speed_t  cfgetospeed(const struct termios *termios_p);
 speed_t  cfgetispeed(const struct termios *termios_p);
