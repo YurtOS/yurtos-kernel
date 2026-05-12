@@ -60,6 +60,8 @@ import { createStaticTarget } from "../wasi/fd-target.js";
 import { WASI_FDFLAGS_NONBLOCK } from "../wasi/types.ts";
 import {
   readBytes,
+  readRecordHeader,
+  readSpan,
   readString,
   writeBytes,
   writeJson,
@@ -1826,45 +1828,168 @@ export function createKernelImports(
     // ── Network ──
 
     // host_network_fetch(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // HTTP fetch via NetworkBridge. Async (JSPI) to support both SAB-based
-    // bridges (Node/Deno) and direct fetch() in the browser.
+    // HTTP fetch via native yurt_fetch_request_v1/yurt_fetch_response_v1 records.
+    // Async (JSPI) to support both SAB-based bridges (Node/Deno) and direct
+    // fetch() in the browser.
     async host_network_fetch(
       reqPtr: number,
       reqLen: number,
       outPtr: number,
       outCap: number,
     ): Promise<number> {
-      const reqJson = readString(memory, reqPtr, reqLen);
+      const readFetchString = (
+        base: number,
+        size: number,
+        off: number,
+        len: number,
+      ): string | null => {
+        const bytes = readSpan(memory, base, size, off, len);
+        return bytes === null ? null : new TextDecoder().decode(bytes);
+      };
+      const readHeaderPairs = (
+        base: number,
+        size: number,
+        off: number,
+        count: number,
+      ): Record<string, string> | null => {
+        const pairBytes = readSpan(memory, base, size, off, count * 16);
+        if (pairBytes === null) return null;
+        const view = new DataView(pairBytes.buffer, pairBytes.byteOffset);
+        const headers: Record<string, string> = {};
+        for (let i = 0; i < count; i++) {
+          const at = i * 16;
+          const key = readFetchString(
+            base,
+            size,
+            view.getUint32(at, true),
+            view.getUint32(at + 4, true),
+          );
+          const value = readFetchString(
+            base,
+            size,
+            view.getUint32(at + 8, true),
+            view.getUint32(at + 12, true),
+          );
+          if (key === null || value === null) return null;
+          headers[key] = value;
+        }
+        return headers;
+      };
+      const writeFetchResponse = (
+        status: number,
+        headers: Record<string, string>,
+        body: Uint8Array,
+        error: string | null,
+      ): number => {
+        const encoder = new TextEncoder();
+        const entries = Object.entries(headers);
+        const headerSize = 36;
+        const pairSize = 16;
+        const pairsOffset = headerSize;
+        let cursor = pairsOffset + entries.length * pairSize;
+        const strings: Uint8Array[] = [];
+        const pairs: Array<[number, number, number, number]> = [];
+        for (const [key, value] of entries) {
+          const keyBytes = encoder.encode(key);
+          const valueBytes = encoder.encode(value);
+          const keyOffset = cursor;
+          cursor += keyBytes.byteLength;
+          const valueOffset = cursor;
+          cursor += valueBytes.byteLength;
+          strings.push(keyBytes, valueBytes);
+          pairs.push([
+            keyOffset,
+            keyBytes.byteLength,
+            valueOffset,
+            valueBytes.byteLength,
+          ]);
+        }
+        const bodyOffset = cursor;
+        cursor += body.byteLength;
+        const errorBytes = error ? encoder.encode(error) : new Uint8Array();
+        const errorOffset = cursor;
+        cursor += errorBytes.byteLength;
+        const size = cursor;
+        if (outCap < size) return size;
+
+        const out = new Uint8Array(memory.buffer, outPtr, size);
+        out.fill(0);
+        const view = new DataView(memory.buffer, outPtr, size);
+        view.setUint32(0, size, true);
+        view.setUint16(4, 1, true);
+        view.setUint16(6, 0, true);
+        view.setUint32(8, status >>> 0, true);
+        view.setUint32(12, pairsOffset, true);
+        view.setUint32(16, entries.length, true);
+        view.setUint32(20, bodyOffset, true);
+        view.setUint32(24, body.byteLength, true);
+        view.setUint32(28, errorOffset, true);
+        view.setUint32(32, errorBytes.byteLength, true);
+        for (let i = 0; i < pairs.length; i++) {
+          const at = pairsOffset + i * pairSize;
+          const [keyOffset, keyLength, valueOffset, valueLength] = pairs[i];
+          view.setUint32(at, keyOffset, true);
+          view.setUint32(at + 4, keyLength, true);
+          view.setUint32(at + 8, valueOffset, true);
+          view.setUint32(at + 12, valueLength, true);
+        }
+        cursor = pairsOffset + entries.length * pairSize;
+        for (const bytes of strings) {
+          out.set(bytes, cursor);
+          cursor += bytes.byteLength;
+        }
+        out.set(body, bodyOffset);
+        out.set(errorBytes, errorOffset);
+        return size;
+      };
 
       const fetchError = (error: string) =>
-        writeJson(memory, outPtr, outCap, {
-          ok: false,
-          status: 0,
-          headers: {},
-          body: "",
-          body_base64: null,
-          error,
-        });
+        writeFetchResponse(0, {}, new Uint8Array(), error);
 
       if (!opts.networkBridge) {
         return fetchError("networking not configured");
       }
 
       try {
-        const req = JSON.parse(reqJson) as {
-          url?: string;
-          method?: string;
-          headers?: Record<string, string>;
-          body?: string;
-          redirect?: FetchRedirectMode;
-        };
-        const url = req.url as string;
-        const method = (req.method as string) ?? "GET";
-        const headers = (req.headers as Record<string, string>) ?? {};
-        const body = req.body as string | undefined;
-        const redirect: FetchRedirectMode = req.redirect === "manual"
+        const header = readRecordHeader(memory, reqPtr, reqLen);
+        if (!header || header.version !== 1 || header.size < 44) {
+          return fetchError("invalid fetch request record");
+        }
+        const view = new DataView(memory.buffer, reqPtr, header.size);
+        const url = readFetchString(
+          reqPtr,
+          header.size,
+          view.getUint32(8, true),
+          view.getUint32(12, true),
+        );
+        const method = readFetchString(
+          reqPtr,
+          header.size,
+          view.getUint32(16, true),
+          view.getUint32(20, true),
+        ) ?? "GET";
+        const headers = readHeaderPairs(
+          reqPtr,
+          header.size,
+          view.getUint32(24, true),
+          view.getUint32(28, true),
+        );
+        const bodyBytes = readSpan(
+          memory,
+          reqPtr,
+          header.size,
+          view.getUint32(32, true),
+          view.getUint32(36, true),
+        );
+        if (url === null || headers === null || bodyBytes === null) {
+          return fetchError("invalid fetch request spans");
+        }
+        const redirect: FetchRedirectMode = view.getUint32(40, true) === 1
           ? "manual"
           : "follow";
+        const body = bodyBytes.byteLength > 0
+          ? new TextDecoder().decode(bodyBytes)
+          : undefined;
 
         // Use async fetch if available (browser), otherwise fall back to sync (SAB bridge)
         const result = opts.networkBridge.fetchAsync
@@ -1876,14 +2001,15 @@ export function createKernelImports(
             redirect,
           )
           : opts.networkBridge.fetchSync(url, method, headers, body, redirect);
-        return writeJson(memory, outPtr, outCap, {
-          ok: !result.error && result.status >= 200 && result.status < 400,
-          status: result.status,
-          headers: result.headers,
-          body: result.body,
-          body_base64: result.body_base64 ?? null,
-          error: result.error ?? null,
-        });
+        const responseBody = result.body_base64
+          ? base64ToBytes(result.body_base64)
+          : new TextEncoder().encode(result.body);
+        return writeFetchResponse(
+          result.status,
+          result.headers,
+          responseBody,
+          result.error ?? null,
+        );
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return fetchError(msg);

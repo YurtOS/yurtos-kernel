@@ -7,199 +7,39 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define YURT_FETCH_REQ_CAP 8192
 #define YURT_FETCH_RESP_INITIAL_CAP 65536
+#define YURT_FETCH_REDIRECT_MANUAL 1u
 
-static int append_raw(char *dst, size_t cap, size_t *used, const char *value) {
-  size_t len = strlen(value);
-  if (*used + len >= cap) {
-    errno = EOVERFLOW;
-    return -1;
-  }
-  memcpy(dst + *used, value, len);
-  *used += len;
-  dst[*used] = '\0';
-  return 0;
-}
+typedef struct yurt_fetch_request_native_v1 {
+  uint32_t size;
+  uint16_t version;
+  uint16_t flags;
+  uint32_t url_offset;
+  uint32_t url_length;
+  uint32_t method_offset;
+  uint32_t method_length;
+  uint32_t headers_offset;
+  uint32_t headers_count;
+  uint32_t body_offset;
+  uint32_t body_length;
+  uint32_t redirect_mode;
+} yurt_fetch_request_native_v1;
 
-static int append_json_string(char *dst, size_t cap, size_t *used, const char *value) {
-  if (append_raw(dst, cap, used, "\"") != 0) {
-    return -1;
-  }
+typedef struct yurt_fetch_response_native_v1 {
+  uint32_t size;
+  uint16_t version;
+  uint16_t flags;
+  uint32_t status;
+  uint32_t headers_offset;
+  uint32_t headers_count;
+  uint32_t body_offset;
+  uint32_t body_length;
+  uint32_t error_offset;
+  uint32_t error_length;
+} yurt_fetch_response_native_v1;
 
-  for (const unsigned char *p = (const unsigned char *)(value ? value : ""); *p != '\0'; ++p) {
-    const char *escape = NULL;
-    switch (*p) {
-      case '\\':
-        escape = "\\\\";
-        break;
-      case '"':
-        escape = "\\\"";
-        break;
-      case '\n':
-        escape = "\\n";
-        break;
-      case '\r':
-        escape = "\\r";
-        break;
-      case '\t':
-        escape = "\\t";
-        break;
-      default:
-        break;
-    }
-
-    if (escape) {
-      if (append_raw(dst, cap, used, escape) != 0) {
-        return -1;
-      }
-      continue;
-    }
-    if (*p < 0x20) {
-      errno = EINVAL;
-      return -1;
-    }
-    if (*used + 1 >= cap) {
-      errno = EOVERFLOW;
-      return -1;
-    }
-    dst[(*used)++] = (char)*p;
-    dst[*used] = '\0';
-  }
-
-  return append_raw(dst, cap, used, "\"");
-}
-
-static const char *find_json_field(const char *json, size_t json_len, const char *field) {
-  char needle[64];
-  int written = snprintf(needle, sizeof(needle), "\"%s\":", field);
-  size_t needle_len;
-
-  if (written <= 0 || (size_t)written >= sizeof(needle)) {
-    return NULL;
-  }
-  needle_len = (size_t)written;
-  if (needle_len > json_len) {
-    return NULL;
-  }
-
-  for (size_t offset = 0; offset + needle_len <= json_len; ++offset) {
-    if (memcmp(json + offset, needle, needle_len) == 0) {
-      return json + offset + needle_len;
-    }
-  }
-  return NULL;
-}
-
-static int hex_digit_value(char ch) {
-  if (ch >= '0' && ch <= '9') {
-    return ch - '0';
-  }
-  if (ch >= 'a' && ch <= 'f') {
-    return 10 + (ch - 'a');
-  }
-  if (ch >= 'A' && ch <= 'F') {
-    return 10 + (ch - 'A');
-  }
-  return -1;
-}
-
-static char *dup_json_string_field(const char *json, size_t json_len, const char *field_name) {
-  const char *field = find_json_field(json, json_len, field_name);
-  const char *end = json + json_len;
-  char *out;
-  size_t used = 0;
-
-  if (!field) {
-    return NULL;
-  }
-  while (field < end && (*field == ' ' || *field == '\n' || *field == '\r' || *field == '\t')) {
-    field++;
-  }
-  if ((size_t)(end - field) >= 4 && memcmp(field, "null", 4) == 0) {
-    return NULL;
-  }
-  if (field >= end || *field != '"') {
-    errno = EIO;
-    return NULL;
-  }
-  field++;
-
-  out = malloc((size_t)(end - field) + 1);
-  if (!out) {
-    return NULL;
-  }
-
-  while (field < end) {
-    char ch = *field++;
-    if (ch == '"') {
-      out[used] = '\0';
-      return out;
-    }
-    if (ch == '\\') {
-      if (field >= end) {
-        free(out);
-        errno = EIO;
-        return NULL;
-      }
-      ch = *field++;
-      switch (ch) {
-        case '"':
-        case '\\':
-        case '/':
-          break;
-        case 'n':
-          ch = '\n';
-          break;
-        case 'r':
-          ch = '\r';
-          break;
-        case 't':
-          ch = '\t';
-          break;
-        case 'b':
-          ch = '\b';
-          break;
-        case 'f':
-          ch = '\f';
-          break;
-        case 'u': {
-          int codepoint = 0;
-          for (int i = 0; i < 4; ++i) {
-            int digit;
-            if (field >= end) {
-              free(out);
-              errno = EIO;
-              return NULL;
-            }
-            digit = hex_digit_value(*field++);
-            if (digit < 0) {
-              free(out);
-              errno = EIO;
-              return NULL;
-            }
-            codepoint = (codepoint << 4) | digit;
-          }
-          if (codepoint > 0x7f) {
-            free(out);
-            errno = ENOTSUP;
-            return NULL;
-          }
-          ch = (char)codepoint;
-          break;
-        }
-        default:
-          free(out);
-          errno = EIO;
-          return NULL;
-      }
-    }
-    out[used++] = ch;
-  }
-
-  free(out);
-  errno = EIO;
-  return NULL;
+static int span_is_valid(uint32_t offset, uint32_t length, uint32_t size) {
+  return offset <= size && length <= size - offset;
 }
 
 static int build_fetch_request(
@@ -207,29 +47,72 @@ static int build_fetch_request(
   const char *method,
   const char *headers_json,
   const char *body,
-  char *dst,
-  size_t cap
+  uint8_t **out_req,
+  size_t *out_len
 ) {
-  size_t used = 0;
-  dst[0] = '\0';
+  const char *effective_method = method ? method : "GET";
+  size_t header_size = sizeof(yurt_fetch_request_native_v1);
+  size_t url_len = strlen(url);
+  size_t method_len = strlen(effective_method);
+  size_t body_len = body ? strlen(body) : 0;
+  size_t size = header_size + url_len + method_len + body_len;
+  yurt_fetch_request_native_v1 *req;
+  uint8_t *bytes;
+  size_t cursor;
 
-  if (append_raw(dst, cap, &used, "{\"url\":") != 0 ||
-      append_json_string(dst, cap, &used, url) != 0 ||
-      append_raw(dst, cap, &used, ",\"method\":") != 0 ||
-      append_json_string(dst, cap, &used, method ? method : "GET") != 0 ||
-      append_raw(dst, cap, &used, ",\"headers\":") != 0 ||
-      append_raw(dst, cap, &used, headers_json ? headers_json : "{}") != 0 ||
-      append_raw(dst, cap, &used, ",\"body\":") != 0) {
+  if (headers_json && strcmp(headers_json, "{}") != 0) {
+    errno = ENOTSUP;
     return -1;
   }
-  if (body) {
-    if (append_json_string(dst, cap, &used, body) != 0) {
-      return -1;
-    }
-  } else if (append_raw(dst, cap, &used, "null") != 0) {
+
+  bytes = calloc(1, size);
+  if (!bytes) {
     return -1;
   }
-  return append_raw(dst, cap, &used, ",\"redirect\":\"manual\"}");
+
+  req = (yurt_fetch_request_native_v1 *)bytes;
+  req->size = (uint32_t)size;
+  req->version = YURT_ABI_RECORD_VERSION_1;
+  req->url_offset = (uint32_t)header_size;
+  req->url_length = (uint32_t)url_len;
+  req->method_offset = (uint32_t)(header_size + url_len);
+  req->method_length = (uint32_t)method_len;
+  req->headers_offset = sizeof(yurt_fetch_request_native_v1);
+  req->headers_count = 0;
+  req->body_offset = (uint32_t)(header_size + url_len + method_len);
+  req->body_length = (uint32_t)body_len;
+  req->redirect_mode = YURT_FETCH_REDIRECT_MANUAL;
+
+  cursor = header_size;
+  memcpy(bytes + cursor, url, url_len);
+  cursor += url_len;
+  memcpy(bytes + cursor, effective_method, method_len);
+  cursor += method_len;
+  if (body_len > 0) {
+    memcpy(bytes + cursor, body, body_len);
+  }
+
+  *out_req = bytes;
+  *out_len = size;
+  return 0;
+}
+
+static char *dup_fetch_span(
+  const uint8_t *record,
+  uint32_t size,
+  uint32_t offset,
+  uint32_t length
+) {
+  char *out;
+  if (!span_is_valid(offset, length, size)) {
+    errno = EIO;
+    return NULL;
+  }
+  out = malloc((size_t)length + 1);
+  if (!out) return NULL;
+  memcpy(out, record + offset, length);
+  out[length] = '\0';
+  return out;
 }
 
 int yurt_fetch_text(
@@ -239,11 +122,12 @@ int yurt_fetch_text(
   const char *body,
   char **out_body
 ) {
-  char req[YURT_FETCH_REQ_CAP];
+  uint8_t *req = NULL;
+  size_t req_len = 0;
   char *resp;
   int cap = YURT_FETCH_RESP_INITIAL_CAP;
   int written;
-  char *error;
+  yurt_fetch_response_native_v1 *header;
   char *text;
 
   if (!url || !out_body) {
@@ -252,46 +136,60 @@ int yurt_fetch_text(
   }
   *out_body = NULL;
 
-  if (build_fetch_request(url, method, headers_json, body, req, sizeof(req)) != 0) {
+  if (build_fetch_request(url, method, headers_json, body, &req, &req_len) != 0) {
     return -1;
   }
 
   resp = malloc((size_t)cap + 1);
   if (!resp) {
+    free(req);
     return -1;
   }
 
-  written = yurt_host_network_fetch((int)(uintptr_t)req, (int)strlen(req), (int)(uintptr_t)resp, cap);
+  written = yurt_host_network_fetch((int)(uintptr_t)req, (int)req_len, (int)(uintptr_t)resp, cap);
   if (written > cap) {
     cap = written;
     char *retry = realloc(resp, (size_t)cap + 1);
     if (!retry) {
+      free(req);
       free(resp);
       return -1;
     }
     resp = retry;
-    written = yurt_host_network_fetch((int)(uintptr_t)req, (int)strlen(req), (int)(uintptr_t)resp, cap);
+    written = yurt_host_network_fetch((int)(uintptr_t)req, (int)req_len, (int)(uintptr_t)resp, cap);
   }
+  free(req);
   if (written < 0) {
     free(resp);
     return -1;
   }
-  resp[written] = '\0';
-
-  error = dup_json_string_field(resp, (size_t)written, "error");
-  if (error && error[0] != '\0') {
-    free(error);
+  if (written < (int)sizeof(yurt_fetch_response_native_v1)) {
     free(resp);
     errno = EIO;
     return -1;
   }
-  free(error);
 
-  text = dup_json_string_field(resp, (size_t)written, "body");
-  if (!text) {
-    text = strdup("");
+  header = (yurt_fetch_response_native_v1 *)resp;
+  if (header->version != YURT_ABI_RECORD_VERSION_1 ||
+      header->size != (uint32_t)written ||
+      header->size < sizeof(yurt_fetch_response_native_v1)) {
+    free(resp);
+    errno = EIO;
+    return -1;
   }
 
+  if (header->error_length > 0) {
+    free(resp);
+    errno = EIO;
+    return -1;
+  }
+
+  text = dup_fetch_span(
+    (const uint8_t *)resp,
+    header->size,
+    header->body_offset,
+    header->body_length
+  );
   free(resp);
   if (!text) {
     return -1;
