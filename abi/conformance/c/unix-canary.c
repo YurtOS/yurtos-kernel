@@ -869,6 +869,122 @@ static int case_dgram_bind_rollback(void) {
   return 0;
 }
 
+/* P1: recvmsg with a control buffer smaller than CMSG_LEN(0) must not
+ * underflow the capacity computation and write past the caller's buffer. */
+static int case_recvmsg_ctrunc_tiny_ctrl(void) {
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    emit("recvmsg_ctrunc_tiny_ctrl", 1, NULL, 1, errno); return 1;
+  }
+  int pfd[2];
+  if (pipe(pfd) != 0) {
+    close(sv[0]); close(sv[1]);
+    emit("recvmsg_ctrunc_tiny_ctrl", 1, "pipe-fail", 1, errno); return 1;
+  }
+  /* Send 1 fd via SCM_RIGHTS */
+  struct iovec siov = { .iov_base = (void *)"x", .iov_len = 1 };
+  char scmsg_buf[CMSG_SPACE(sizeof(int))];
+  struct msghdr smsg = {
+    .msg_iov = &siov, .msg_iovlen = 1,
+    .msg_control = scmsg_buf, .msg_controllen = sizeof(scmsg_buf),
+  };
+  struct cmsghdr *scm = CMSG_FIRSTHDR(&smsg);
+  scm->cmsg_level = SOL_SOCKET;
+  scm->cmsg_type  = SCM_RIGHTS;
+  scm->cmsg_len   = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(scm), &pfd[0], sizeof(int));
+  smsg.msg_controllen = scm->cmsg_len;
+  if (sendmsg(sv[0], &smsg, 0) < 0) {
+    close(sv[0]); close(sv[1]); close(pfd[0]); close(pfd[1]);
+    emit("recvmsg_ctrunc_tiny_ctrl", 1, "sendmsg-fail", 1, errno); return 1;
+  }
+  close(pfd[0]); close(pfd[1]);
+  /* Receive with a 4-byte control buffer: smaller than any CMSG_LEN(0).
+   * A correct implementation must clamp max_fds to 0, not underflow. */
+  char tiny_ctrl[4];
+  char rbuf[4];
+  struct iovec riov = { .iov_base = rbuf, .iov_len = sizeof(rbuf) };
+  struct msghdr rmsg = {
+    .msg_iov = &riov, .msg_iovlen = 1,
+    .msg_control    = tiny_ctrl,
+    .msg_controllen = sizeof(tiny_ctrl),
+  };
+  memset(tiny_ctrl, 0xAB, sizeof(tiny_ctrl));
+  ssize_t n = recvmsg(sv[1], &rmsg, 0);
+  close(sv[0]); close(sv[1]);
+  if (n < 0) {
+    emit("recvmsg_ctrunc_tiny_ctrl", 1, "recvmsg-fail", 1, errno); return 1;
+  }
+  /* Must not have written a cmsghdr into the 4-byte buffer (MSG_CTRUNC or
+   * msg_controllen==0 are both acceptable; the key is no OOB write). */
+  if (rmsg.msg_controllen > sizeof(tiny_ctrl)) {
+    emit("recvmsg_ctrunc_tiny_ctrl", 1, "controllen-overflow", 0, 0); return 1;
+  }
+  emit("recvmsg_ctrunc_tiny_ctrl", 0, "ctrunc-tiny=ok", 0, 0);
+  return 0;
+}
+
+/* P2: bind() on an abstract AF_UNIX address must be rejected when
+ * the sandbox policy does not allow AF_UNIX (allowUnixDomain: false).
+ * This case is always run with a restrictive serverSockets policy. */
+static int case_abstract_bind_policy_denied(void) {
+  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (fd < 0) {
+    emit("abstract_bind_policy_denied", 1, "socket-fail", 1, errno); return 1;
+  }
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  /* abstract: leading NUL + name */
+  const char name[] = "deny-policy";
+  memcpy(addr.sun_path + 1, name, sizeof(name) - 1);
+  socklen_t addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + sizeof(name) - 1);
+  int rc = bind(fd, (struct sockaddr *)&addr, addrlen);
+  int saved_errno = errno;
+  close(fd);
+  if (rc != 0) {
+    emit("abstract_bind_policy_denied", 0, "bind-denied=ok", 0, 0);
+    return 0;
+  }
+  emit("abstract_bind_policy_denied", 1, "bind-succeeded-should-fail", 1, saved_errno);
+  return 1;
+}
+
+/* P3: close() on a listening pathname socket must NOT unlink the socket
+ * inode — only an explicit unlink() should remove it. */
+static int case_stat_after_listener_close(void) {
+  const char *path = "/tmp/yurt-stat-close.sock";
+  unlink(path);
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+  socklen_t addrlen = (socklen_t)sizeof(addr);
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) { emit("stat_after_listener_close", 1, NULL, 1, errno); return 1; }
+  if (bind(fd, (struct sockaddr *)&addr, addrlen) != 0) {
+    close(fd);
+    emit("stat_after_listener_close", 1, "bind-fail", 1, errno); return 1;
+  }
+  if (listen(fd, 1) != 0) {
+    close(fd); unlink(path);
+    emit("stat_after_listener_close", 1, "listen-fail", 1, errno); return 1;
+  }
+  close(fd); /* must NOT unlink the path */
+  struct stat st;
+  int rc = stat(path, &st);
+  int saved_errno = errno;
+  unlink(path); /* cleanup */
+  if (rc != 0) {
+    emit("stat_after_listener_close", 1, "stat-fail-after-close", 1, saved_errno); return 1;
+  }
+  if (!S_ISSOCK(st.st_mode)) {
+    emit("stat_after_listener_close", 1, "not-a-socket", 0, 0); return 1;
+  }
+  emit("stat_after_listener_close", 0, "inode-persists=ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "pair_basic") == 0)                 return case_pair_basic();
   if (strcmp(name, "bind_listen_accept") == 0)         return case_bind_listen_accept();
@@ -886,7 +1002,10 @@ static int run_case(const char *name) {
   if (strcmp(name, "dgram_bind_rollback") == 0)        return case_dgram_bind_rollback();
   if (strcmp(name, "dgram_so_type") == 0)              return case_dgram_so_type();
   if (strcmp(name, "dgram_nonblocking_recv") == 0)     return case_dgram_nonblocking_recv();
-  if (strcmp(name, "peercred_uid_gid") == 0)           return case_peercred_uid_gid();
+  if (strcmp(name, "peercred_uid_gid") == 0)               return case_peercred_uid_gid();
+  if (strcmp(name, "recvmsg_ctrunc_tiny_ctrl") == 0)       return case_recvmsg_ctrunc_tiny_ctrl();
+  if (strcmp(name, "abstract_bind_policy_denied") == 0)    return case_abstract_bind_policy_denied();
+  if (strcmp(name, "stat_after_listener_close") == 0)      return case_stat_after_listener_close();
   fprintf(stderr, "unix-canary: unknown case %s\n", name);
   return 2;
 }
@@ -909,6 +1028,9 @@ static int list_cases(void) {
   puts("dgram_so_type");
   puts("dgram_nonblocking_recv");
   puts("peercred_uid_gid");
+  puts("recvmsg_ctrunc_tiny_ctrl");
+  puts("abstract_bind_policy_denied");
+  puts("stat_after_listener_close");
   return 0;
 }
 

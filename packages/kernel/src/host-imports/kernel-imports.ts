@@ -2080,52 +2080,6 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
-        // AF_UNIX abstract connect: req.abstract is present
-        if (typeof req.abstract === "string") {
-          const registry = socketBackend?.registry;
-          if (!registry) {
-            return writeJson(memory, outPtr, outCap, {
-              ok: false,
-              error: "AF_UNIX sockets require a loopback socket backend",
-            });
-          }
-          const unixResult = registry.connectToAbstract(req.abstract);
-          if (!unixResult.ok) {
-            return writeJson(memory, outPtr, outCap, { ok: false, error: unixResult.error });
-          }
-          const jsonConnCreds = opts.kernel?.getCredentials(callerPid ?? 0);
-          target.socket = -unixResult.socket; // negate for loopback convention
-          target.family = "AF_UNIX";
-          target.peerPath = `\0${req.abstract}`;
-          target.peerPid = callerPid ?? 0;
-          target.peerUid = jsonConnCreds?.euid ?? 0;
-          target.peerGid = jsonConnCreds?.egid ?? 0;
-          return writeJson(memory, outPtr, outCap, { ok: true });
-        }
-
-        // AF_UNIX pathname connect: req.path is present
-        if (typeof req.path === "string") {
-          const registry = socketBackend?.registry;
-          if (!registry) {
-            return writeJson(memory, outPtr, outCap, {
-              ok: false,
-              error: "AF_UNIX sockets require a loopback socket backend",
-            });
-          }
-          const jsonConnCreds2 = opts.kernel?.getCredentials(callerPid ?? 0);
-          const unixResult = registry.connectToPath(req.path, callerPid, jsonConnCreds2?.euid, jsonConnCreds2?.egid);
-          if (!unixResult.ok) {
-            return writeJson(memory, outPtr, outCap, { ok: false, error: unixResult.error });
-          }
-          target.socket = -unixResult.socket; // negate for loopback convention
-          target.family = "AF_UNIX";
-          target.peerPath = req.path;
-          target.peerPid = callerPid ?? 0;
-          target.peerUid = jsonConnCreds2?.euid ?? 0;
-          target.peerGid = jsonConnCreds2?.egid ?? 0;
-          return writeJson(memory, outPtr, outCap, { ok: true });
-        }
-
         // AF_INET connect
         const result = socketBackend.connect({
           host: req.host,
@@ -2187,42 +2141,6 @@ export function createKernelImports(
           });
         }
 
-        // AF_UNIX abstract bind: req.abstract is present (no VFS inode)
-        if (typeof req.abstract === "string") {
-          target.family = "AF_UNIX";
-          target.boundPath = `\0${req.abstract}`; // leading NUL marks abstract internally
-          return writeJson(memory, outPtr, outCap, { ok: true });
-        }
-
-        // AF_UNIX pathname bind: req.path is present
-        if (typeof req.path === "string") {
-          target.family = "AF_UNIX";
-          target.boundPath = req.path;
-          // For SOCK_DGRAM, register in the dgram route table
-          if (target.isDgram) {
-            const registry = socketBackend?.registry;
-            if (!registry) {
-              return writeJson(memory, outPtr, outCap, { ok: false, error: "AF_UNIX dgram requires loopback backend" });
-            }
-            // raw handle is -target.socket (negated back)
-            const rawHandle = -(target.socket as number);
-            try {
-              registry.bindDgramToPath(rawHandle, req.path);
-            } catch (e: unknown) {
-              const msg = e instanceof Error ? e.message : String(e);
-              return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
-            }
-            return writeJson(memory, outPtr, outCap, { ok: true });
-          }
-          try {
-            opts.vfs?.createSocket?.(req.path);
-          } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
-          }
-          return writeJson(memory, outPtr, outCap, { ok: true });
-        }
-
         // AF_INET bind
         const host = req.host;
         if (
@@ -2266,6 +2184,8 @@ export function createKernelImports(
       );
       target.family = "AF_UNIX";
       if (isAbstract) {
+        const abstractAuth = authorizeUnixAbstract(opts.serverSockets, name);
+        if (!abstractAuth.ok) return -1;
         target.boundPath = `\0${name}`;
         // Abstract DGRAM sockets also register in the dgram route table
         if (target.isDgram) {
@@ -2500,7 +2420,6 @@ export function createKernelImports(
           const boundPath = path;
           target.closeListener = () => {
             registry.closePathListener(boundPath);
-            try { opts.vfs?.unlink(boundPath); } catch { /* already gone */ }
           };
         }
         return 0;
@@ -2651,52 +2570,6 @@ export function createKernelImports(
         const backlog = typeof req.backlog === "number" && req.backlog > 0
           ? req.backlog
           : 128;
-
-        // AF_UNIX listen (pathname or abstract)
-        if (target.family === "AF_UNIX" || typeof target.boundPath === "string") {
-          const path = target.boundPath!;
-          const registry = socketBackend?.registry;
-          if (!registry) {
-            return writeJson(memory, outPtr, outCap, {
-              ok: false,
-              error: "AF_UNIX sockets require a loopback socket backend",
-            });
-          }
-          // Abstract socket: boundPath starts with NUL
-          if (path.startsWith("\0")) {
-            const abstractName = path.slice(1);
-            const auth = authorizeUnixAbstract(opts.serverSockets, abstractName);
-            if (!auth.ok) return writeJson(memory, outPtr, outCap, auth);
-            try {
-              const rawHandle = registry.listenOnAbstract(abstractName, backlog);
-              target.listener = -rawHandle;
-              target.closeListener = (_listener) => {
-                registry.closeAbstractListener(abstractName);
-              };
-            } catch (e: unknown) {
-              const msg = e instanceof Error ? e.message : String(e);
-              return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
-            }
-            return writeJson(memory, outPtr, outCap, { ok: true });
-          }
-          // Pathname socket
-          const auth = authorizeUnixListen(opts.serverSockets, path);
-          if (!auth.ok) return writeJson(memory, outPtr, outCap, auth);
-          try {
-            const rawHandle = registry.listenOnPath(path, backlog);
-            // Negate to follow the loopback backend's negative-handle convention.
-            target.listener = -rawHandle;
-            const boundPath = path;
-            target.closeListener = (_listener) => {
-              registry.closePathListener(boundPath);
-              try { opts.vfs?.unlink(boundPath); } catch { /* already gone */ }
-            };
-          } catch (e: unknown) {
-            const msg = e instanceof Error ? e.message : String(e);
-            return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
-          }
-          return writeJson(memory, outPtr, outCap, { ok: true });
-        }
 
         // AF_INET listen
         const host = target.boundHost ?? "127.0.0.1";
@@ -3211,15 +3084,6 @@ export function createKernelImports(
           return writeJson(memory, outPtr, outCap, {
             ok: false,
             error: `not a socket fd: ${req.fd}`,
-          });
-        }
-        if (req.option === "peercred") {
-          // SO_PEERCRED — return peer credentials (Slice 6)
-          return writeJson(memory, outPtr, outCap, {
-            ok: true,
-            pid: target.peerPid ?? 0,
-            uid: target.peerUid ?? 0,
-            gid: target.peerGid ?? 0,
           });
         }
         if (req.option !== "no_delay") {

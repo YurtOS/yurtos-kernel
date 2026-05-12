@@ -1148,8 +1148,8 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
 
   size_t orig_controllen = msg->msg_controllen;
   int max_fds = 0;
-  if (msg->msg_control && orig_controllen > 0) {
-    max_fds = (int)((orig_controllen - CMSG_LEN(0)) / sizeof(int));
+  if (msg->msg_control && orig_controllen >= CMSG_SPACE(0)) {
+    max_fds = (int)((orig_controllen - CMSG_SPACE(0)) / sizeof(int));
     if (max_fds > 64) max_fds = 64;
   }
 
@@ -1192,7 +1192,8 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
       msg->msg_controllen = needed;
     } else {
       /* Control buffer too small: fit as many fds as possible, flag truncation */
-      int fit = (int)((orig_controllen - CMSG_LEN(0)) / sizeof(int));
+      int fit = orig_controllen >= CMSG_SPACE(0)
+        ? (int)((orig_controllen - CMSG_SPACE(0)) / sizeof(int)) : 0;
       if (fit > 0) {
         cmsg->cmsg_len = (socklen_t)CMSG_LEN((size_t)fit * sizeof(int));
         cmsg->cmsg_level = SOL_SOCKET;

@@ -309,6 +309,43 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toContain('{"case":"peercred_uid_gid","exit":0,"stdout":"uid-gid=ok"}');
   });
+
+  it("recvmsg_ctrunc_tiny_ctrl: control buffer < CMSG_LEN(0) must not write past buffer", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case recvmsg_ctrunc_tiny_ctrl");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"recvmsg_ctrunc_tiny_ctrl","exit":0,"stdout":"ctrunc-tiny=ok"}');
+  });
+
+  it("abstract_bind_policy_denied: abstract AF_UNIX bind is rejected when name is not in abstract allowlist", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      // allowlist permits nothing matching "deny-policy"
+      serverSockets: { allowUnixDomain: true, unixAbstractAllowlist: [/^allowed-only$/] },
+    });
+    const result = await sandbox.run("unix-canary --case abstract_bind_policy_denied");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"abstract_bind_policy_denied","exit":0,"stdout":"bind-denied=ok"}');
+  });
+
+  it("stat_after_listener_close: close() on listening socket must not unlink the socket inode", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case stat_after_listener_close");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"stat_after_listener_close","exit":0,"stdout":"inode-persists=ok"}');
+  });
 });
 
 describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }, () => {
