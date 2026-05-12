@@ -2314,6 +2314,7 @@ export function createKernelImports(
         return -107;
       }
       const local = which === 0;
+      if (!local && target.socket === null) return -107;
       return writeSocketAddrResult(
         outPtr,
         outCap,
