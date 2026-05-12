@@ -904,8 +904,22 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         "host_list_processes",
         |mut c: Caller<'_, StoreData>, out_ptr: u32, out_cap: u32| -> i32 {
             let list = c.data().kernel.list();
-            let j = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_owned());
-            write_out(&mut c, out_ptr, out_cap, j.as_bytes())
+            let header_size = 16usize;
+            let entry_size = 20usize;
+            let size = header_size + list.len() * entry_size;
+            let mut out = vec![0u8; size];
+            out[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+            out[4..6].copy_from_slice(&1u16.to_le_bytes());
+            out[8..12].copy_from_slice(&(header_size as u32).to_le_bytes());
+            out[12..16].copy_from_slice(&(list.len() as u32).to_le_bytes());
+            for (idx, proc) in list.iter().enumerate() {
+                let at = header_size + idx * entry_size;
+                out[at..at + 4].copy_from_slice(&proc.pid.to_le_bytes());
+                out[at + 4..at + 8].copy_from_slice(&0i32.to_le_bytes());
+                let state = if proc.state == "running" { 1u32 } else { 2u32 };
+                out[at + 8..at + 12].copy_from_slice(&state.to_le_bytes());
+            }
+            write_out(&mut c, out_ptr, out_cap, &out)
         },
     )?;
 
@@ -951,22 +965,47 @@ fn add_network_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     linker.func_wrap(
         "yurt",
         "host_socket_connect",
-        |_: Caller<'_, StoreData>, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
+        "host_socket_bind",
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
+        "host_socket_listen",
+        |_: Caller<'_, StoreData>, _: i32, _: i32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
+        "host_socket_accept",
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
+        "host_socket_addr",
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
     )?;
     linker.func_wrap(
         "yurt",
         "host_socket_send",
-        |_: Caller<'_, StoreData>, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
     )?;
     linker.func_wrap(
         "yurt",
         "host_socket_recv",
-        |_: Caller<'_, StoreData>, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
+        "host_socket_option",
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: i32| -> i32 { -3 },
     )?;
     linker.func_wrap(
         "yurt",
         "host_socket_close",
-        |_: Caller<'_, StoreData>, _: u32, _: u32| -> i32 { 0 },
+        |_: Caller<'_, StoreData>, _: i32| -> i32 { 0 },
     )?;
 
     Ok(())
