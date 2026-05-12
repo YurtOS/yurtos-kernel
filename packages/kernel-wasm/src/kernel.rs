@@ -204,6 +204,10 @@ pub struct Process {
     /// waitstatus encoding). The microkernel sets this via
     /// `kernel_record_exit`; sys_wait reads it.
     pub exit_status: Option<i32>,
+    /// Opaque wasm-instance handle owned by the KH adapter. Kernel
+    /// policy owns the process record; the host interface owns the
+    /// engine mechanism addressed by this handle.
+    pub host_instance_handle: Option<i32>,
 }
 
 impl Default for Process {
@@ -228,6 +232,7 @@ impl Default for Process {
             ppid: 0,
             children: Vec::new(),
             exit_status: None,
+            host_instance_handle: None,
         }
     }
 }
@@ -394,12 +399,18 @@ impl Kernel {
         pid
     }
 
-    pub fn register_host_process(&mut self, parent_pid: Pid, argv: Vec<Vec<u8>>) -> Pid {
+    pub fn register_host_process(
+        &mut self,
+        parent_pid: Pid,
+        argv: Vec<Vec<u8>>,
+        host_instance_handle: Option<i32>,
+    ) -> Pid {
         let pid = self.alloc_host_pid();
         {
             let p = self.process_mut(pid);
             p.ppid = parent_pid;
             p.argv = argv;
+            p.host_instance_handle = host_instance_handle;
         }
         if parent_pid != 0 {
             let parent = self.process_mut(parent_pid);
@@ -663,5 +674,16 @@ mod tests {
         with_kernel(|k| k.process_mut(2).umask = 0o022);
         assert_eq!(with_kernel(|k| k.process_mut(1).umask), 0o077);
         assert_eq!(with_kernel(|k| k.process_mut(2).umask), 0o022);
+    }
+
+    #[test]
+    fn host_instance_handles_are_kernel_owned_process_state() {
+        let _g = TestGuard::acquire();
+        let pid = with_kernel(|k| k.register_host_process(0, vec![b"/bin/app".to_vec()], Some(11)));
+        assert_eq!(pid, 1);
+        assert_eq!(
+            with_kernel(|k| k.process(pid).host_instance_handle),
+            Some(11)
+        );
     }
 }

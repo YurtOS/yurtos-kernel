@@ -194,10 +194,14 @@ Initial exports:
   host-instantiated Yurt process. Request bytes are a sequence of
   `u32 arg_len + arg_bytes` records. The kernel allocates PID, records
   parentage and argv, and returns the new pid; the microkernel still performs
-  the host mechanism of instantiating the wasm module. This is the current
-  host-control spawn step. A later version will accept the full binary spawn
-  request and call `kh_spawn_process` once process instantiation is fully
-  kernel-driven.
+  the host mechanism of instantiating the wasm module. This remains as a
+  compatibility host-control spawn step.
+- `kernel_spawn_process(parent_pid, module_id_ptr, module_id_len, argv_ptr,
+  argv_len) -> i64` — kernel-driven cached-module spawn. The module id names a
+  wasm module already cached in the KH adapter. Kernel.wasm calls
+  `kh_spawn_process`, records the returned opaque instance handle in its process
+  table, allocates the pid, stores parentage and argv, and returns the pid. This
+  is the forward path for moving process instantiation behind kernel policy.
 - `kernel_kill(pid, signal) -> i64` — apply signal/permission policy and route
   termination to the process instance through the host mechanism when needed.
 - `kernel_wait(caller_pid, child_pid, flags, out_ptr, out_cap) -> i64` —

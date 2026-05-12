@@ -741,6 +741,21 @@ function decodeProcessList(bytes: Uint8Array): ProcessSnapshot[] {
   return entries;
 }
 
+function encodeArgv(argv: Uint8Array[]): Uint8Array {
+  let argvSize = 0;
+  for (const a of argv) argvSize += 4 + a.byteLength;
+  const argvReq = new Uint8Array(argvSize);
+  const argvView = new DataView(argvReq.buffer);
+  let cursor = 0;
+  for (const a of argv) {
+    argvView.setUint32(cursor, a.byteLength >>> 0, true);
+    cursor += 4;
+    argvReq.set(a, cursor);
+    cursor += a.byteLength;
+  }
+  return argvReq;
+}
+
 // Asyncify state value exposed by the binaryen --asyncify pass.
 const ASYNCIFY_UNWINDING = 1;
 
@@ -964,6 +979,15 @@ export class KernelInstance {
     readonly kernelSpawn:
       | ((parentPid: number, argvPtr: number, argvLen: number) => bigint)
       | null = null,
+    readonly kernelSpawnProcess:
+      | ((
+        parentPid: number,
+        moduleIdPtr: number,
+        moduleIdLen: number,
+        argvPtr: number,
+        argvLen: number,
+      ) => bigint)
+      | null = null,
   ) {}
 
   private stage(
@@ -1077,6 +1101,28 @@ export class KernelInstance {
     }
     const { inPtr, inLen } = this.stage(argv, 0);
     return this.kernelSpawn(parentPid, inPtr, inLen);
+  }
+
+  spawnCachedProcess(
+    parentPid: number,
+    moduleId: Uint8Array,
+    argv: Uint8Array,
+  ): bigint {
+    if (!this.kernelSpawnProcess) {
+      throw new Error("kernel.wasm missing kernel_spawn_process export");
+    }
+    const request = new Uint8Array(moduleId.byteLength + argv.byteLength);
+    request.set(moduleId, 0);
+    request.set(argv, moduleId.byteLength);
+    const { inPtr } = this.stage(request, 0);
+    const argvPtr = inPtr + moduleId.byteLength;
+    return this.kernelSpawnProcess(
+      parentPid,
+      inPtr,
+      moduleId.byteLength,
+      argvPtr,
+      argv.byteLength,
+    );
   }
 }
 
@@ -2163,6 +2209,15 @@ export class Microkernel {
     const kernelSpawn = instance.exports.kernel_spawn as
       | ((parentPid: number, argvPtr: number, argvLen: number) => bigint)
       | undefined;
+    const kernelSpawnProcess = instance.exports.kernel_spawn_process as
+      | ((
+        parentPid: number,
+        moduleIdPtr: number,
+        moduleIdLen: number,
+        argvPtr: number,
+        argvLen: number,
+      ) => bigint)
+      | undefined;
 
     // promising-wrap returns a function that returns Promise<i64>;
     // the underlying call may suspend via any Suspending import.
@@ -2210,6 +2265,7 @@ export class Microkernel {
       kernelKill ?? null,
       kernelWait ?? null,
       kernelSpawn ?? null,
+      kernelSpawnProcess ?? null,
     );
     hostBox.state = hostState;
     const mk = new Microkernel(kernel, hostState, processEngine);
@@ -2245,6 +2301,15 @@ export class Microkernel {
 
   cacheProcessModule(moduleId: Uint8Array, wasmBytes: Uint8Array): void {
     this.processEngine.cacheModule(moduleId, wasmBytes);
+  }
+
+  spawnCachedProcess(moduleId: Uint8Array, argv: Uint8Array[]): number {
+    const argvReq = encodeArgv(argv);
+    const pid = Number(
+      this.kernel.spawnCachedProcess(KERNEL_PID, moduleId, argvReq),
+    );
+    if (pid < 0) throw new Error(`kernel_spawn_process failed: rc=${pid}`);
+    return pid;
   }
 
   listProcesses(): ProcessSnapshot[] {
@@ -2306,17 +2371,7 @@ export class Microkernel {
 
     // Ask the kernel to allocate the pid and store argv so /proc
     // and process ownership stay inside kernel.wasm.
-    let argvSize = 0;
-    for (const a of argv) argvSize += 4 + a.byteLength;
-    const argvReq = new Uint8Array(argvSize);
-    const argvView = new DataView(argvReq.buffer);
-    let cursor = 0;
-    for (const a of argv) {
-      argvView.setUint32(cursor, a.byteLength >>> 0, true);
-      cursor += 4;
-      argvReq.set(a, cursor);
-      cursor += a.byteLength;
-    }
+    const argvReq = encodeArgv(argv);
     const pid = Number(this.kernel.spawnProcess(KERNEL_PID, argvReq));
     if (pid < 0) throw new Error(`kernel_spawn failed: rc=${pid}`);
 

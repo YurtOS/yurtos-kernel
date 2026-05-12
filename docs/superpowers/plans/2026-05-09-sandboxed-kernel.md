@@ -100,12 +100,14 @@ records.
 - Define the host-control exports in `packages/kernel-wasm` before changing TS
   compatibility shims. `kernel_list_processes`, `kernel_kill`, and
   `kernel_wait` now exist. `kernel_spawn` now allocates/registers
-  host-instantiated process pids and argv in the Rust kernel; the later
-  full-spawn version still needs to move wasm instantiation behind
-  `kh_spawn_process`. Rust `kh` wrappers and portable JS microkernel bindings
-  now exist for the wasm-engine import family (`kh_spawn_process`,
+  host-instantiated process pids and argv in the Rust kernel. The first
+  kernel-driven cached-module spawn path now exists as `kernel_spawn_process`:
+  it calls `kh_spawn_process`, records the returned opaque instance handle in
+  the kernel-owned process record, allocates the pid, and stores argv. Rust
+  `kh` wrappers and portable JS KH-adapter bindings now exist for the
+  wasm-engine import family (`kh_spawn_process`,
   `kh_destroy_instance`, `kh_process_mem_read`, `kh_process_mem_write`,
-  `kh_process_resume`). The portable JS microkernel now has a host module cache
+  `kh_process_resume`). The portable JS KH adapter now has a host module cache
   and opaque instance-handle table for cached modules, including process memory
   read/write and destroy. `kh_process_resume` still returns `-ENOSYS` until the
   scheduler/resume loop lands. The remaining reserved export is

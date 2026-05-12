@@ -856,7 +856,19 @@ pub fn spawn_host_process(parent_pid: u32, request: &[u8]) -> i64 {
         Ok(argv) => argv,
         Err(rc) => return rc,
     };
-    with_kernel(|k| k.register_host_process(parent_pid, argv) as i64)
+    with_kernel(|k| k.register_host_process(parent_pid, argv, None) as i64)
+}
+
+pub fn spawn_cached_process(parent_pid: u32, module_id: &[u8], argv_request: &[u8]) -> i64 {
+    let argv = match parse_argv_records(argv_request) {
+        Ok(argv) => argv,
+        Err(rc) => return rc,
+    };
+    let handle = kh::spawn_process(module_id, argv_request, &[]);
+    if handle < 0 {
+        return handle as i64;
+    }
+    with_kernel(|k| k.register_host_process(parent_pid, argv, Some(handle)) as i64)
 }
 
 /// `kernel_register_child(parent_pid, child_pid)`. Microkernel-

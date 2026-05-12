@@ -168,6 +168,37 @@ pub unsafe extern "C" fn kernel_spawn(
     dispatch::spawn_host_process(parent_pid, request)
 }
 
+/// Host-control export: ask the kernel to spawn a cached process module.
+///
+/// The module id names a wasm module already cached in the KH adapter. The
+/// kernel calls `kh_spawn_process`, records the returned opaque instance handle
+/// in its process table, allocates the pid, stores argv, and returns the pid.
+///
+/// # Safety
+///
+/// The microkernel guarantees both pointer/length pairs are valid readable
+/// ranges in this kernel instance's linear memory.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_spawn_process(
+    parent_pid: u32,
+    module_id_ptr: *const u8,
+    module_id_len: usize,
+    argv_ptr: *const u8,
+    argv_len: usize,
+) -> i64 {
+    let module_id = if module_id_ptr.is_null() || module_id_len == 0 {
+        &[][..]
+    } else {
+        core::slice::from_raw_parts(module_id_ptr, module_id_len)
+    };
+    let argv = if argv_ptr.is_null() || argv_len == 0 {
+        &[][..]
+    } else {
+        core::slice::from_raw_parts(argv_ptr, argv_len)
+    };
+    dispatch::spawn_cached_process(parent_pid, module_id, argv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

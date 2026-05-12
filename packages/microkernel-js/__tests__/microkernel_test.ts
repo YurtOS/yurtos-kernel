@@ -240,6 +240,29 @@ Deno.test("kh_spawn_process manages cached wasm instance handles", async () => {
   assertEquals(new TextDecoder().decode(response.subarray(0, 2)), "ok");
 });
 
+Deno.test("kernel_spawn_process allocates pid through kernel and kh adapter", async () => {
+  const processWasm = await wat2wasm(`
+    (module
+      (memory (export "memory") 1))
+  `);
+  const mk = await freshMicrokernel();
+  mk.cacheProcessModule(s("kernel-owned-process"), processWasm);
+
+  const pid = mk.spawnCachedProcess(
+    s("kernel-owned-process"),
+    [s("/bin/kernel-owned-process")],
+  );
+
+  assertEquals(pid, 1);
+  const [proc] = mk.listProcesses();
+  assertEquals(proc.pid, 1);
+  assertEquals(proc.ppid, 0);
+  assertEquals(
+    new TextDecoder().decode(proc.command),
+    "/bin/kernel-owned-process",
+  );
+});
+
 Deno.test("memory-mediated request/response round-trips bytes", async () => {
   const mk = await freshMicrokernel();
   const request = new TextEncoder().encode("trampoline-validates-arch");
