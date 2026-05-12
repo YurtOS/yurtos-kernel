@@ -200,6 +200,9 @@ int yurt_host_socket_addr(int fd, unsigned which, int out_ptr, int out_cap);
 __attribute__((import_module("yurt"), import_name("host_socket_option")))
 int yurt_host_socket_option(int fd, unsigned option, unsigned has_value, int value);
 
+__attribute__((import_module("yurt"), import_name("host_socket_set_no_delay")))
+int yurt_host_socket_set_no_delay(int fd, int enabled);
+
 __attribute__((import_module("yurt"), import_name("host_socket_close")))
 int yurt_host_socket_close(int fd);
 

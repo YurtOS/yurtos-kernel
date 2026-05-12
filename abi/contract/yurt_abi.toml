@@ -490,6 +490,14 @@ args = [
   { name = "out_cap", type = "usize" },
 ]
 
+[import.host_socket_set_no_delay]
+doc = "Set or clear TCP_NODELAY on a connected socket fd. Returns 0 or negated errno."
+return = "stream_io"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "enabled", type = "i32" },
+]
+
 [import.host_idb_get]
 doc = "Read a durable KV entry. Request is u8 store_len + store + key bytes. Writes value bytes into (out_ptr, out_cap)."
 return = "record_out"

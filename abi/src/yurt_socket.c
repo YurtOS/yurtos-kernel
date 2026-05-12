@@ -297,6 +297,12 @@ static int yurt_connect_impl(int sockfd, const struct sockaddr *addr, socklen_t 
     return -1;
   }
   entry->host_fd = host_fd;
+  if (entry->no_delay && yurt_host_socket_set_no_delay(host_fd, 1) < 0) {
+    yurt_host_socket_close(host_fd);
+    entry->host_fd = -1;
+    errno = EIO;
+    return -1;
+  }
   strncpy(entry->peer_host, host, sizeof(entry->peer_host) - 1);
   entry->peer_host[sizeof(entry->peer_host) - 1] = '\0';
   entry->peer_port = (int)ntohs(in->sin_port);
@@ -687,6 +693,10 @@ static int yurt_setsockopt_impl(
 
     if (!entry) { errno = EBADF; return -1; }
     entry->no_delay = enabled;
+    if (entry->host_fd >= 0 && yurt_host_socket_set_no_delay(entry->host_fd, enabled) < 0) {
+      errno = EIO;
+      return -1;
+    }
     return 0;
   }
 

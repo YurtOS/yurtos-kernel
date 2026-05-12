@@ -1074,6 +1074,11 @@ fn add_network_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     )?;
     linker.func_wrap(
         "yurt",
+        "host_socket_set_no_delay",
+        |_: Caller<'_, StoreData>, _: u32, _: u32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
         "host_socket_close",
         |_: Caller<'_, StoreData>, _: i32| -> i32 { 0 },
     )?;
