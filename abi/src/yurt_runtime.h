@@ -219,6 +219,38 @@ int yurt_host_socket_bind_unix(int sockfd, int path_ptr, int path_len, int is_ab
 __attribute__((import_module("yurt"), import_name("host_socket_connect_unix")))
 int yurt_host_socket_connect_unix(int sockfd, int path_ptr, int path_len, int is_abstract);
 
+/* host_socket_sendto_unix(sockfd, buf_ptr, buf_len, path_ptr, path_len, is_abstract) -> bytes | -1
+ * Sends a datagram to the AF_UNIX SOCK_DGRAM socket bound at the given path.
+ * is_abstract=1: abstract namespace (bytes after the leading NUL).
+ * is_abstract=0: filesystem path. Returns -1 on error. */
+__attribute__((import_module("yurt"), import_name("host_socket_sendto_unix")))
+int yurt_host_socket_sendto_unix(int sockfd, int buf_ptr, int buf_len,
+                                  int path_ptr, int path_len, int is_abstract);
+
+/* host_socket_recvfrom_unix(sockfd, buf_ptr, buf_cap,
+ *                           from_path_ptr, from_path_cap,
+ *                           from_path_len_ptr, from_is_abstract_ptr) -> bytes | -1 | -2
+ * Receives a datagram from an AF_UNIX SOCK_DGRAM socket. Writes sender path
+ * bytes (without leading NUL for abstract) to [from_path_ptr, from_path_cap).
+ * Sets *from_path_len_ptr to byte count (0 = sender unbound).
+ * Sets *from_is_abstract_ptr = 1 for abstract namespace sender.
+ * Returns -1 if sockfd is not an AF_UNIX dgram socket (caller falls back).
+ * Returns -2 for EAGAIN. Async (JSPI). */
+__attribute__((import_module("yurt"), import_name("host_socket_recvfrom_unix")))
+int yurt_host_socket_recvfrom_unix(int sockfd, int buf_ptr, int buf_cap,
+                                    int from_path_ptr, int from_path_cap,
+                                    int from_path_len_ptr, int from_is_abstract_ptr);
+
+/* host_socket_addr_unix(sockfd, is_peer, path_ptr, path_cap, is_abstract_ptr) -> path_len | -1 | -2
+ * Returns the bound (is_peer=0) or peer (is_peer=1) AF_UNIX path bytes.
+ * Writes path bytes (without leading NUL for abstract) to [path_ptr, path_cap).
+ * Sets *is_abstract_ptr = 1 for abstract namespace sockets.
+ * Returns -1 if the socket is not AF_UNIX.
+ * Returns -2 for ENOTCONN (is_peer=1, socket not yet connected). */
+__attribute__((import_module("yurt"), import_name("host_socket_addr_unix")))
+int yurt_host_socket_addr_unix(int sockfd, int is_peer,
+                                int path_ptr, int path_cap, int is_abstract_ptr);
+
 /* host_socket_sendmsg(sockfd, data_ptr, data_len, fds_ptr, fds_count) -> bytes | -1
  * Reads data_len bytes from data_ptr; reads fds_count i32 fd numbers from
  * fds_ptr (pass 0 when there are no ancillary fds). */

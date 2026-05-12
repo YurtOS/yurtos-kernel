@@ -31,13 +31,6 @@
 #define IP_BIND_ADDRESS_NO_PORT 24
 #endif
 
-/* Our sys/socket.h pins SOCK_DGRAM=2 and SOCK_STREAM=1 independent of WASI
- * values. The host_socket_socketpair wire protocol relies on these values.
- * Fire a compile error if the toolchain redefines them unexpectedly. */
-_Static_assert(SOCK_DGRAM == 2,
-  "SOCK_DGRAM != 2: update the socketpair wire protocol on both C and host sides");
-_Static_assert(SOCK_STREAM == 1,
-  "SOCK_STREAM != 1: update the socketpair wire protocol on both C and host sides");
 
 #define YURT_SO_REUSEADDR 0x0004
 #define YURT_SO_ERROR 0x1007
@@ -398,10 +391,8 @@ static int yurt_fill_sockaddr_un(
   un.sun_family = AF_UNIX;
   if (path[0] == '\0') {
     /* abstract address: copy name (after leading NUL) into sun_path[1..] */
-    size_t namelen = strlen(path + 1);
     un.sun_path[0] = '\0';
     strncpy(un.sun_path + 1, path + 1, sizeof(un.sun_path) - 2);
-    (void)namelen;
   } else {
     strncpy(un.sun_path, path, sizeof(un.sun_path) - 1);
   }
@@ -470,72 +461,60 @@ static int yurt_sockname_impl(
   const char *host_field,
   const char *port_field
 ) {
-  char req[64];
-  char resp[YURT_SOCKET_RESP_CAP];
-  char host[256];
-  int port = 0;
-  int req_len;
-  int n;
+  int is_peer = (host_field[0] == 'p') ? 1 : 0;
 
-  /* Pass "op":"local" for getsockname, "op":"peer" for getpeername so the
-   * host can return ENOTCONN when the peer address is not available. */
+  /* Try typed AF_UNIX path first: avoids JSON for the common AF_UNIX case. */
   {
-    const char *op = (host_field[0] == 'p') ? "peer" : "local";
-    req_len = snprintf(req, sizeof(req), "{\"fd\":%d,\"op\":\"%s\"}", sockfd, op);
-  }
-  if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
-    errno = EOVERFLOW;
-    return -1;
-  }
-
-  n = yurt_host_socket_addr((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
-  if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-    errno = ENOTCONN;
-    return -1;
-  }
-
-  /* Check for AF_UNIX path fields (local_path / peer_path) or abstract fields
-   * (local_abstract / peer_abstract). host_field for getsockname is "local_host"
-   * → path field is "local_path", abstract field is "local_abstract";
-   * for getpeername it is "peer_host" → "peer_path" / "peer_abstract". */
-  {
-    /* Derive the path field name: replace trailing "_host" with "_path". */
-    char path_field[64];
-    char abstract_field[64];
-    size_t hf_len = strlen(host_field);
-    /* host_field ends in "_host"; replace with "_path" and "_abstract". */
-    if (hf_len > 5 && memcmp(host_field + hf_len - 5, "_host", 5) == 0) {
-      snprintf(path_field, sizeof(path_field), "%.*s_path", (int)(hf_len - 5), host_field);
-      snprintf(abstract_field, sizeof(abstract_field), "%.*s_abstract", (int)(hf_len - 5), host_field);
-    } else {
-      path_field[0] = '\0';
-      abstract_field[0] = '\0';
-    }
-    if (abstract_field[0] != '\0') {
-      char abstract_name[107]; /* 108 - 1 for NUL prefix */
-      if (parse_json_string_field(resp, (size_t)n, abstract_field, abstract_name, sizeof(abstract_name)) == 0) {
-        /* Reconstruct path with leading NUL: "\0name" */
-        char unix_path[109];
+    char path_buf[108];
+    int is_abstract = 0;
+    int plen = yurt_host_socket_addr_unix(sockfd, is_peer,
+                  (int)(intptr_t)path_buf, (int)sizeof(path_buf),
+                  (int)(intptr_t)&is_abstract);
+    if (plen >= 0) {
+      char unix_path[109];
+      if (is_abstract) {
+        int n = plen < 107 ? plen : 107;
         unix_path[0] = '\0';
-        strncpy(unix_path + 1, abstract_name, sizeof(unix_path) - 2);
-        unix_path[sizeof(unix_path) - 1] = '\0';
-        return yurt_fill_sockaddr_un(addr, addrlen, unix_path);
+        memcpy(unix_path + 1, path_buf, (size_t)n);
+        unix_path[1 + n] = '\0';
+      } else {
+        int n = plen < 108 ? plen : 107;
+        memcpy(unix_path, path_buf, (size_t)n);
+        unix_path[n] = '\0';
       }
+      return yurt_fill_sockaddr_un(addr, addrlen, unix_path);
     }
-    if (path_field[0] != '\0') {
-      char unix_path[108];
-      if (parse_json_string_field(resp, (size_t)n, path_field, unix_path, sizeof(unix_path)) == 0) {
-        return yurt_fill_sockaddr_un(addr, addrlen, unix_path);
-      }
+    if (plen == -2) {
+      errno = ENOTCONN;
+      return -1;
     }
+    /* plen == -1: not AF_UNIX — fall through to JSON for AF_INET */
   }
 
-  if (parse_json_string_field(resp, (size_t)n, host_field, host, sizeof(host)) != 0 ||
-      parse_json_int(resp, (size_t)n, port_field, &port) != 0) {
-    return -1;
-  }
+  {
+    char req[64];
+    char resp[YURT_SOCKET_RESP_CAP];
+    char host[256];
+    int port = 0;
+    int req_len;
+    int n;
 
-  return yurt_fill_sockaddr_from_host(addr, addrlen, host, port);
+    req_len = snprintf(req, sizeof(req), "{\"fd\":%d}", sockfd);
+    if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
+      errno = EOVERFLOW;
+      return -1;
+    }
+    n = yurt_host_socket_addr((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
+    if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
+      errno = ENOTCONN;
+      return -1;
+    }
+    if (parse_json_string_field(resp, (size_t)n, host_field, host, sizeof(host)) != 0 ||
+        parse_json_int(resp, (size_t)n, port_field, &port) != 0) {
+      return -1;
+    }
+    return yurt_fill_sockaddr_from_host(addr, addrlen, host, port);
+  }
 }
 
 int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
@@ -659,20 +638,27 @@ static int yurt_accept_impl(int sockfd, struct sockaddr *addr, socklen_t *addrle
     return -1;
   }
   if (addr && addrlen) {
-    char peer_path[108];
-    char peer_abstract[107];
-    /* AF_UNIX accept: response carries peer_path or peer_abstract instead
-     * of peer_host/peer_port. Check for the path fields first. */
-    if (parse_json_string_field(resp, (size_t)n, "peer_abstract", peer_abstract, sizeof(peer_abstract)) == 0) {
+    /* Try typed AF_UNIX peer path first. */
+    char path_buf[108];
+    int is_abstract = 0;
+    int plen = yurt_host_socket_addr_unix(accepted_fd, 1,
+                  (int)(intptr_t)path_buf, (int)sizeof(path_buf),
+                  (int)(intptr_t)&is_abstract);
+    if (plen >= 0) {
       char unix_path[109];
-      unix_path[0] = '\0';
-      strncpy(unix_path + 1, peer_abstract, sizeof(unix_path) - 2);
-      unix_path[sizeof(unix_path) - 1] = '\0';
+      if (is_abstract) {
+        int k = plen < 107 ? plen : 107;
+        unix_path[0] = '\0';
+        memcpy(unix_path + 1, path_buf, (size_t)k);
+        unix_path[1 + k] = '\0';
+      } else {
+        int k = plen < 108 ? plen : 107;
+        memcpy(unix_path, path_buf, (size_t)k);
+        unix_path[k] = '\0';
+      }
       if (yurt_fill_sockaddr_un(addr, addrlen, unix_path) != 0) return -1;
-    } else if (parse_json_string_field(resp, (size_t)n, "peer_path", peer_path, sizeof(peer_path)) == 0) {
-      if (yurt_fill_sockaddr_un(addr, addrlen, peer_path) != 0) return -1;
     } else if (*addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
-      /* AF_INET accept */
+      /* AF_INET: parse peer_host/peer_port from the accept JSON response. */
       if (parse_json_string_field(resp, (size_t)n, "peer_host", peer_host, sizeof(peer_host)) != 0 ||
           parse_json_int(resp, (size_t)n, "peer_port", &peer_port) != 0 ||
           yurt_fill_sockaddr_from_host(addr, addrlen, peer_host, peer_port) != 0) {
@@ -802,44 +788,24 @@ ssize_t sendto(
   socklen_t addrlen
 ) {
   if (dest_addr != NULL && dest_addr->sa_family == AF_UNIX) {
-    /* AF_UNIX SOCK_DGRAM sendto: encode path and data in JSON */
+    /* AF_UNIX SOCK_DGRAM sendto: typed binary call — no JSON, no base64 */
     const struct sockaddr_un *un = (const struct sockaddr_un *)dest_addr;
-    char *encoded;
-    char *req;
-    char resp[YURT_SOCKET_RESP_CAP];
-    int req_len;
-    int n;
-    int bytes_sent = 0;
-    size_t pathlen;
-
+    int sent;
     (void)flags;
-    encoded = malloc(((len + 2) / 3) * 4 + 1);
-    req = malloc(((len + 2) / 3) * 4 + 256);
-    if (!encoded || !req) {
-      free(encoded);
-      free(req);
-      errno = ENOMEM;
-      return -1;
+    if (un->sun_path[0] == '\0') {
+      size_t namelen = (size_t)addrlen > offsetof(struct sockaddr_un, sun_path) + 1
+        ? (size_t)addrlen - offsetof(struct sockaddr_un, sun_path) - 1 : 0;
+      sent = yurt_host_socket_sendto_unix(sockfd,
+               (int)(intptr_t)buf, (int)len,
+               (int)(intptr_t)(un->sun_path + 1), (int)namelen, 1);
+    } else {
+      size_t pathlen = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
+      sent = yurt_host_socket_sendto_unix(sockfd,
+               (int)(intptr_t)buf, (int)len,
+               (int)(intptr_t)un->sun_path, (int)pathlen, 0);
     }
-    if (base64_encode((const unsigned char *)buf, len, encoded, ((len + 2) / 3) * 4 + 1) < 0) {
-      free(encoded);
-      free(req);
-      return -1;
-    }
-    pathlen = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
-    req_len = sprintf(req, "{\"fd\":%d,\"data_b64\":\"%s\",\"to\":\"%.*s\"}",
-                      sockfd, encoded, (int)pathlen, un->sun_path);
-    n = yurt_host_socket_send((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
-    free(encoded);
-    free(req);
-    if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-      errno = EIO;
-      return -1;
-    }
-    if (parse_json_int(resp, (size_t)n, "bytesSent", &bytes_sent) != 0) {
-      bytes_sent = (int)len; /* assume all sent on success */
-    }
-    return (ssize_t)bytes_sent;
+    if (sent < 0) { errno = ENOENT; return -1; }
+    return (ssize_t)sent;
   }
   if (dest_addr != NULL) {
     errno = EOPNOTSUPP;
@@ -856,49 +822,39 @@ ssize_t recvfrom(
   struct sockaddr *src_addr,
   socklen_t *addrlen
 ) {
-  /* For AF_UNIX SOCK_DGRAM with src_addr, request from_addr info */
-  if (src_addr && addrlen) {
-    char req[128];
-    char resp[YURT_SOCKET_RESP_CAP];
-    char data_b64[YURT_SOCKET_RESP_CAP];
-    int req_len;
-    int n;
-    ssize_t nbytes;
-
+  /* Try typed AF_UNIX SOCK_DGRAM recvfrom first. */
+  {
+    char from_path_buf[108];
+    int from_path_len = 0;
+    int from_is_abstract = 0;
     if (len > YURT_SOCKET_RECV_MAX_RAW) len = YURT_SOCKET_RECV_MAX_RAW;
-
-    req_len = snprintf(req, sizeof(req),
-      "{\"fd\":%d,\"max_bytes\":%zu,\"from_addr\":true}",
-      sockfd, len);
-    if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
-      errno = EOVERFLOW;
-      return -1;
-    }
-    n = yurt_host_socket_recv((int)(intptr_t)req, req_len,
-                               (int)(intptr_t)resp, (int)sizeof(resp));
-    if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-      if (n > 0 && json_contains(resp, (size_t)n, "\"error\":\"EAGAIN\"")) {
-        errno = EAGAIN;
-        return -1;
+    int rc = yurt_host_socket_recvfrom_unix(sockfd,
+               (int)(intptr_t)buf, (int)len,
+               (int)(intptr_t)from_path_buf, (int)sizeof(from_path_buf),
+               (int)(intptr_t)&from_path_len, (int)(intptr_t)&from_is_abstract);
+    if (rc >= 0) {
+      if (src_addr && addrlen) {
+        if (from_path_len > 0) {
+          char unix_path[109];
+          if (from_is_abstract) {
+            int n = from_path_len < 107 ? from_path_len : 107;
+            unix_path[0] = '\0';
+            memcpy(unix_path + 1, from_path_buf, (size_t)n);
+            unix_path[1 + n] = '\0';
+          } else {
+            int n = from_path_len < 108 ? from_path_len : 107;
+            memcpy(unix_path, from_path_buf, (size_t)n);
+            unix_path[n] = '\0';
+          }
+          yurt_fill_sockaddr_un(src_addr, addrlen, unix_path);
+        } else {
+          *addrlen = 0;
+        }
       }
-      errno = EIO;
-      return -1;
+      return (ssize_t)rc;
     }
-    if (parse_json_string_field(resp, (size_t)n, "data_b64", data_b64, sizeof(data_b64)) != 0) {
-      return -1;
-    }
-    nbytes = base64_decode(data_b64, (unsigned char *)buf, len);
-    /* Try to fill src_addr if from_path is present */
-    {
-      char from_path[108];
-      if (parse_json_string_field(resp, (size_t)n, "from_path", from_path, sizeof(from_path)) == 0
-          && from_path[0] != '\0') {
-        yurt_fill_sockaddr_un(src_addr, addrlen, from_path);
-      } else {
-        *addrlen = 0;
-      }
-    }
-    return nbytes;
+    if (rc == -2) { errno = EAGAIN; return -1; }
+    /* rc == -1: not an AF_UNIX dgram socket — fall through to recv() */
   }
   return recv(sockfd, buf, len, flags);
 }

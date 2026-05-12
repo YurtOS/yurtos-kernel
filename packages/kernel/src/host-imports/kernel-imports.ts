@@ -1976,10 +1976,10 @@ export function createKernelImports(
       _protocol: number,
     ): number {
       if (!opts.kernel) return -1;
-      // Our abi/include/sys/socket.h pins these to Linux/POSIX values —
-      // matching the _Static_asserts in yurt_socket.c.
-      const AF_UNIX = 1;
-      const SOCK_DGRAM = 2;
+      // wasi-sdk-30 defines AF_UNIX=3, SOCK_DGRAM=5. C passes these values
+      // directly (sys/socket.h #include_next runs before our #ifndef overrides).
+      const AF_UNIX = 3;
+      const SOCK_DGRAM = 5;
       const SOCK_CLOEXEC = 0x2000;
       const SOCK_NONBLOCK = 0x4000;
       const baseType = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
@@ -2266,6 +2266,9 @@ export function createKernelImports(
         }
         return 0;
       }
+      // Enforce path allowlist at bind time (same policy as listen).
+      const bindAuth = authorizeUnixListen(opts.serverSockets, name);
+      if (!bindAuth.ok) return -1;
       target.boundPath = name;
       if (target.isDgram) {
         const registry = socketBackend?.registry;
@@ -2322,6 +2325,112 @@ export function createKernelImports(
       target.peerUid = 0;
       target.peerGid = 0;
       return 0;
+    },
+
+    // host_socket_sendto_unix(sockfd, buf_ptr, buf_len, path_ptr, path_len, is_abstract) -> bytes | -1
+    // Sends a SOCK_DGRAM to a bound path. is_abstract=1 for abstract namespace.
+    host_socket_sendto_unix(
+      sockfd: number,
+      bufPtr: number,
+      bufLen: number,
+      pathPtr: number,
+      pathLen: number,
+      isAbstract: number,
+    ): number {
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket" || !target.isDgram) return -1;
+      const bytes = new Uint8Array(memory.buffer, bufPtr, bufLen);
+      const toPath = new TextDecoder().decode(
+        new Uint8Array(memory.buffer, pathPtr, pathLen),
+      );
+      if (isAbstract) return -1; // abstract dgram sendto not yet supported
+      const result = registry.sendDgramToPath(
+        toPath,
+        bytes,
+        target.boundPath ?? undefined,
+      );
+      return result.ok ? bufLen : -1;
+    },
+
+    // host_socket_recvfrom_unix(sockfd, buf_ptr, buf_cap, from_path_ptr, from_path_cap,
+    //   from_path_len_ptr, from_is_abstract_ptr) -> bytes | -1 | -2
+    // Async dgram recv. Returns byte count, -1 on error, -2 for EAGAIN (no data yet).
+    async host_socket_recvfrom_unix(
+      sockfd: number,
+      bufPtr: number,
+      bufCap: number,
+      fromPathPtr: number,
+      fromPathCap: number,
+      fromPathLenPtr: number,
+      fromIsAbstractPtr: number,
+    ): Promise<number> {
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket" || !target.isDgram) return -1;
+      if (target.socket == null) return -1;
+      const rawHandle = -(target.socket as number);
+      const result = await registry.recvDgramAsync(rawHandle, bufCap);
+      if (!result.ok) return -2;
+      const bytes = (result as { ok: true; bytes: Uint8Array }).bytes;
+      const recvLen = Math.min(bytes.length, bufCap);
+      new Uint8Array(memory.buffer, bufPtr, recvLen).set(bytes.subarray(0, recvLen));
+      if (result.fromPath || result.fromAbstract) {
+        const senderName = result.fromAbstract ?? result.fromPath ?? "";
+        const isAbs = result.fromAbstract != null ? 1 : 0;
+        const pathBytes = new TextEncoder().encode(senderName);
+        const writeLen = Math.min(pathBytes.length, fromPathCap);
+        if (fromPathPtr && fromPathCap > 0) {
+          new Uint8Array(memory.buffer, fromPathPtr, writeLen).set(
+            pathBytes.subarray(0, writeLen),
+          );
+        }
+        new Int32Array(memory.buffer, fromPathLenPtr, 1)[0] = writeLen;
+        new Int32Array(memory.buffer, fromIsAbstractPtr, 1)[0] = isAbs;
+      } else {
+        new Int32Array(memory.buffer, fromPathLenPtr, 1)[0] = 0;
+        new Int32Array(memory.buffer, fromIsAbstractPtr, 1)[0] = 0;
+      }
+      return recvLen;
+    },
+
+    // host_socket_addr_unix(sockfd, is_peer, path_ptr, path_cap, is_abstract_ptr)
+    //   -> path_len | -1 (not AF_UNIX) | -2 (ENOTCONN)
+    // Writes path bytes (no leading NUL for abstract) to path_ptr; sets *is_abstract_ptr.
+    host_socket_addr_unix(
+      sockfd: number,
+      isPeer: number,
+      pathPtr: number,
+      pathCap: number,
+      isAbstractPtr: number,
+    ): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -1;
+      if (target.family !== "AF_UNIX") return -1;
+      const rawPath = isPeer ? target.peerPath : target.boundPath;
+      if (rawPath == null) return isPeer ? -2 : 0;
+      let path: string;
+      let isAbstract: number;
+      if (rawPath.startsWith("\0")) {
+        path = rawPath.slice(1);
+        isAbstract = 1;
+      } else {
+        path = rawPath;
+        isAbstract = 0;
+      }
+      const pathBytes = new TextEncoder().encode(path);
+      const writeLen = Math.min(pathBytes.length, pathCap);
+      if (pathPtr && pathCap > 0) {
+        new Uint8Array(memory.buffer, pathPtr, writeLen).set(
+          pathBytes.subarray(0, writeLen),
+        );
+      }
+      if (isAbstractPtr) {
+        new Int32Array(memory.buffer, isAbstractPtr, 1)[0] = isAbstract;
+      }
+      return writeLen;
     },
 
     // host_socket_listen(req_ptr, req_len, out_ptr, out_cap) -> i32
@@ -2487,12 +2596,8 @@ export function createKernelImports(
             setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
             close: (socket) => { socketBackend.close(socket); },
           });
-          return writeJson(memory, outPtr, outCap, {
-            ok: true,
-            fd: acceptedFd,
-            peer_path: unixAccepted.peerPath ?? "",
-            local_path: unixAccepted.localPath ?? "",
-          });
+          // C side calls host_socket_addr_unix for peer/local path — no paths here.
+          return writeJson(memory, outPtr, outCap, { ok: true, fd: acceptedFd });
         }
 
         // AF_INET accept: prefer backend suspension; legacy backends fall back to accept().
@@ -2657,13 +2762,21 @@ export function createKernelImports(
           // sendto with destination path
           if (typeof req.to === "string") {
             const senderBoundPath = target.boundPath;
-            const result = registry.sendDgramToPath(req.to, bytes, senderBoundPath);
-            return writeJson(memory, outPtr, outCap, result);
+            const r = registry.sendDgramToPath(req.to, bytes, senderBoundPath);
+            if (!r.ok) return writeJson(memory, outPtr, outCap, r);
+            return writeJson(memory, outPtr, outCap, {
+              ok: true,
+              bytes_sent: (r as { ok: true; bytesSent: number }).bytesSent,
+            });
           }
           // socketpair DGRAM — send to peer
           const rawHandle = -(target.socket as number);
           const result = registry.sendDgramToPeer(rawHandle, bytes);
-          return writeJson(memory, outPtr, outCap, result);
+          if (!result.ok) return writeJson(memory, outPtr, outCap, result);
+          return writeJson(memory, outPtr, outCap, {
+            ok: true,
+            bytes_sent: (result as { ok: true; bytesSent: number }).bytesSent,
+          });
         }
         if (target.socket === null) {
           return writeJson(memory, outPtr, outCap, {
@@ -2953,7 +3066,7 @@ export function createKernelImports(
       try {
         if (!opts.kernel || !socketBackend?.registry) return -1;
         const registry = socketBackend.registry;
-        const SOCK_DGRAM = 2;
+        const SOCK_DGRAM = 5; // wasi-sdk-30 value passed by C via base_type
         let fdA: number, fdB: number;
         if (sockType === SOCK_DGRAM) {
           const { a, b } = registry.openDgramPair();
