@@ -388,16 +388,23 @@ function pollReventsForTarget(target: FdTarget, events: number): number {
       if (wantsWrite) revents |= POLLOUT;
       break;
     case "static":
-      if (wantsRead && target.offset < target.data.byteLength) {
-        revents |= POLLIN;
-      }
+      if (wantsRead) revents |= POLLIN;
       break;
     case "socket":
-      if (
-        wantsRead &&
-        ((target.peekBuffer?.byteLength ?? 0) > 0 || target.readShutdown)
-      ) {
-        revents |= POLLIN;
+      if (wantsRead) {
+        if ((target.peekBuffer?.byteLength ?? 0) > 0 || target.readShutdown) {
+          revents |= POLLIN;
+        } else if (target.socket !== null) {
+          const probe = target.recv(target.socket, 1, { nonblocking: true });
+          if (probe.ok) {
+            const data = probe.data ?? new Uint8Array(0);
+            if (data.byteLength > 0) target.peekBuffer = data;
+            else target.readShutdown = true;
+            revents |= POLLIN;
+          } else if (probe.error !== "EAGAIN") {
+            revents |= POLLERR;
+          }
+        }
       }
       if (wantsWrite && target.socket !== null && !target.writeShutdown) {
         revents |= POLLOUT;

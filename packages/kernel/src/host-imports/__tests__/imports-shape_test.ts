@@ -1733,16 +1733,22 @@ Deno.test("host_poll reports pipe readiness, capacity, and hangup", () => {
   kernel.dispose();
 });
 
-Deno.test("host_poll only reports socket read readiness for peeked data", () => {
+Deno.test("host_poll probes sockets and preserves queued read bytes", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const kernel = new ProcessKernel();
   const pid = kernel.allocPid(1, "poller");
+  let queued = encoder.encode("x");
   const socketTarget: FdTarget & { type: "socket" } = {
     type: "socket",
     socket: 1,
     refs: 1,
     send: () => ({ ok: true, bytes_sent: 0 }),
-    recv: () => ({ ok: false, error: "EAGAIN" }),
+    recv: () => {
+      if (queued.byteLength === 0) return { ok: false, error: "EAGAIN" };
+      const data = queued.slice(0, 1);
+      queued = queued.slice(1);
+      return { ok: true, data };
+    },
     recvAsync: () => Promise.resolve({ ok: false, error: "EAGAIN" }),
     close: () => {},
   };
@@ -1754,13 +1760,33 @@ Deno.test("host_poll only reports socket read readiness for peeked data", () => 
     (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
     1,
   );
-  assertEquals(readPollRevents(memory, 256), POLLOUT);
+  assertEquals(readPollRevents(memory, 256), POLLIN | POLLOUT);
+  assertEquals(socketTarget.peekBuffer, encoder.encode("x"));
 
-  socketTarget.peekBuffer = encoder.encode("x");
   assertEquals(
     (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
     1,
   );
   assertEquals(readPollRevents(memory, 256), POLLIN | POLLOUT);
+  kernel.dispose();
+});
+
+Deno.test("host_poll reports exhausted static input as readable EOF", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  kernel.setFdTarget(pid, 0, {
+    type: "static",
+    data: encoder.encode("stdin"),
+    offset: 5,
+  });
+  writePollFd(memory, 256, 0, POLLIN);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 256), POLLIN);
   kernel.dispose();
 });

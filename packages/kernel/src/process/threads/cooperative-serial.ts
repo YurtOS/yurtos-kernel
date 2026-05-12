@@ -123,9 +123,7 @@ export class CooperativeSerialBackend implements ThreadsBackend {
       .finally(() => {
         slot.finished = true;
       });
-    setTimeout(() => {
-      if (!slot.detached) slot.start();
-    }, 0);
+    setTimeout(() => slot.start(), 0);
     return tid;
   }
 
@@ -142,6 +140,7 @@ export class CooperativeSerialBackend implements ThreadsBackend {
     if (!slot || slot.reaped) return -1;
     slot.detached = true;
     slot.reaped = true;
+    slot.start();
     return 0;
   }
 

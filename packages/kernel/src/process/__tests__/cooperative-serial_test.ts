@@ -114,6 +114,23 @@ Deno.test("cooperative serial backend does not let detached threads block later 
   await backend.yield_();
 });
 
+Deno.test("cooperative serial backend starts immediately detached threads", async () => {
+  const backend = new CooperativeSerialBackend();
+  let started = false;
+  backend.setIndirectCallTable({
+    call() {
+      started = true;
+      return Promise.resolve(0);
+    },
+  });
+
+  const tid = await backend.spawn(1, 0);
+  assertEquals(await backend.detach(tid), 0);
+  await Promise.resolve();
+
+  assertEquals(started, true);
+});
+
 Deno.test("cooperative serial backend keeps spawned thread stack growth bounded", async () => {
   const backend = new CooperativeSerialBackend();
   const memory = new WebAssembly.Memory({ initial: 2 });
