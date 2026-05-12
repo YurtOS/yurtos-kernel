@@ -411,6 +411,7 @@ const EFAULT = 14;
 const EACCES = 13;
 const EBADF = 9;
 const EEXIST = 17;
+const EINVAL = 22;
 const E2BIG = 7;
 const EIO = 5;
 const ENOSYS = 38;
@@ -754,6 +755,21 @@ function encodeArgv(argv: Uint8Array[]): Uint8Array {
     cursor += a.byteLength;
   }
   return argvReq;
+}
+
+function decodeArgv(bytes: Uint8Array): Uint8Array[] | number {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const argv: Uint8Array[] = [];
+  let cursor = 0;
+  while (cursor < bytes.byteLength) {
+    if (bytes.byteLength - cursor < 4) return -EINVAL;
+    const len = view.getUint32(cursor, true);
+    cursor += 4;
+    if (bytes.byteLength - cursor < len) return -EINVAL;
+    argv.push(bytes.subarray(cursor, cursor + len).slice());
+    cursor += len;
+  }
+  return argv;
 }
 
 // Asyncify state value exposed by the binaryen --asyncify pass.
@@ -1131,14 +1147,19 @@ function byteKey(bytes: Uint8Array): string {
 }
 
 interface CachedProcessInstance {
+  pid: number;
   instance: WebAssembly.Instance;
   memory?: WebAssembly.Memory;
+  userMemoryRef: { memory?: WebAssembly.Memory };
 }
 
 class CachedProcessEngine {
   private readonly modules = new Map<string, WebAssembly.Module>();
   private readonly instances = new Map<number, CachedProcessInstance>();
+  private readonly handlesByPid = new Map<number, number>();
   private nextHandle = 1;
+
+  constructor(private readonly kernelRef: { kernel?: KernelInstance }) {}
 
   cacheModule(moduleId: Uint8Array, wasmBytes: Uint8Array): void {
     const module = new WebAssembly.Module(
@@ -1151,6 +1172,8 @@ class CachedProcessEngine {
     kernelMemory: WebAssembly.Memory,
     moduleIdPtr: number,
     moduleIdLen: number,
+    contextPtr: number,
+    contextLen: number,
   ): number {
     const moduleId = new Uint8Array(
       kernelMemory.buffer,
@@ -1159,12 +1182,28 @@ class CachedProcessEngine {
     ).slice();
     const module = this.modules.get(byteKey(moduleId));
     if (!module) return -ENOENT;
+    const context = this.parseSpawnContext(
+      kernelMemory,
+      contextPtr,
+      contextLen,
+    );
+    if (typeof context === "number") return context;
+    const kernel = this.kernelRef.kernel;
+    if (!kernel) return -EIO;
 
     let instance: WebAssembly.Instance;
+    const userMemoryRef: { memory?: WebAssembly.Memory } = {};
     try {
+      const sysImports = buildSysImports(context.pid, kernel, userMemoryRef);
+      const wasiShim = buildWasiShim(
+        context.pid,
+        kernel,
+        context.argv,
+        userMemoryRef,
+      );
       instance = new WebAssembly.Instance(module, {
-        env: {},
-        wasi_snapshot_preview1: {},
+        env: sysImports,
+        wasi_snapshot_preview1: wasiShim,
       });
     } catch {
       return -EIO;
@@ -1173,14 +1212,37 @@ class CachedProcessEngine {
     const memory = instance.exports.memory instanceof WebAssembly.Memory
       ? instance.exports.memory
       : undefined;
+    userMemoryRef.memory = memory ?? new WebAssembly.Memory({ initial: 0 });
     const handle = this.nextHandle++;
-    this.instances.set(handle, { instance, memory });
+    this.instances.set(handle, {
+      pid: context.pid,
+      instance,
+      memory: userMemoryRef.memory,
+      userMemoryRef,
+    });
+    this.handlesByPid.set(context.pid, handle);
     return handle;
   }
 
   destroy(handle: number): number {
-    if (!this.instances.delete(handle)) return -EBADF;
+    const proc = this.instances.get(handle);
+    if (!proc) return -EBADF;
+    this.instances.delete(handle);
+    this.handlesByPid.delete(proc.pid);
     return 0;
+  }
+
+  userProcessByPid(pid: number, kernel: KernelInstance): UserProcess | null {
+    const handle = this.handlesByPid.get(pid);
+    if (handle == null) return null;
+    const proc = this.instances.get(handle);
+    if (!proc) return null;
+    return new UserProcess(
+      pid,
+      proc.instance,
+      proc.userMemoryRef.memory!,
+      kernel,
+    );
   }
 
   memRead(
@@ -1226,6 +1288,30 @@ class CachedProcessEngine {
     if (ptr < 0 || len < 0) return false;
     return ptr <= memory.buffer.byteLength &&
       len <= memory.buffer.byteLength - ptr;
+  }
+
+  private parseSpawnContext(
+    kernelMemory: WebAssembly.Memory,
+    contextPtr: number,
+    contextLen: number,
+  ): { pid: number; argv: Uint8Array[] } | number {
+    if (!this.boundsOk(kernelMemory, contextPtr, contextLen)) return -EFAULT;
+    if (contextLen < 12) return -EINVAL;
+    const bytes = new Uint8Array(
+      kernelMemory.buffer,
+      contextPtr,
+      contextLen,
+    ).slice();
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const version = view.getUint16(0, true);
+    if (version !== 1) return -EINVAL;
+    const pid = view.getUint32(4, true);
+    const argvLen = view.getUint32(8, true);
+    if (argvLen > bytes.byteLength - 12) return -EINVAL;
+    const argvBytes = bytes.subarray(12, 12 + argvLen);
+    const argv = decodeArgv(argvBytes);
+    if (typeof argv === "number") return argv;
+    return { pid, argv };
   }
 }
 
@@ -1325,7 +1411,8 @@ export class Microkernel {
   ): Promise<Microkernel> {
     const memoryRef: { memory?: WebAssembly.Memory } = {};
     const hostBox = { state: hostState };
-    const processEngine = new CachedProcessEngine();
+    const kernelRef: { kernel?: KernelInstance } = {};
+    const processEngine = new CachedProcessEngine(kernelRef);
 
     const khImports = {
       kh_now_realtime: (outPtr: number): number => {
@@ -1735,12 +1822,16 @@ export class Microkernel {
       kh_spawn_process: (
         moduleIdPtr: number,
         moduleIdLen: number,
-        _argvPtr: number,
-        _argvLen: number,
-        _envpPtr: number,
-        _envpLen: number,
+        contextPtr: number,
+        contextLen: number,
       ): number =>
-        processEngine.spawn(memoryRef.memory!, moduleIdPtr, moduleIdLen),
+        processEngine.spawn(
+          memoryRef.memory!,
+          moduleIdPtr,
+          moduleIdLen,
+          contextPtr,
+          contextLen,
+        ),
       kh_destroy_instance: (handle: number): number =>
         processEngine.destroy(handle),
       kh_process_mem_read: (
@@ -2267,6 +2358,7 @@ export class Microkernel {
       kernelSpawn ?? null,
       kernelSpawnProcess ?? null,
     );
+    kernelRef.kernel = kernel;
     hostBox.state = hostState;
     const mk = new Microkernel(kernel, hostState, processEngine);
     (mk as unknown as { hostBox: typeof hostBox }).hostBox = hostBox;
@@ -2310,6 +2402,20 @@ export class Microkernel {
     );
     if (pid < 0) throw new Error(`kernel_spawn_process failed: rc=${pid}`);
     return pid;
+  }
+
+  spawnCachedUserProcess(
+    moduleId: Uint8Array,
+    argv: Uint8Array[],
+  ): UserProcess {
+    const pid = this.spawnCachedProcess(moduleId, argv);
+    const user = this.processEngine.userProcessByPid(pid, this.kernel);
+    if (!user) {
+      throw new Error(
+        `kernel_spawn_process did not publish process handle: pid=${pid}`,
+      );
+    }
+    return user;
   }
 
   listProcesses(): ProcessSnapshot[] {

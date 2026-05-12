@@ -322,15 +322,13 @@ args = [
 # ── Wasm engine ops ──────────────────────────────────────────────────────────
 
 [import.kh_spawn_process]
-doc = "Instantiate a process module already loaded into the host module cache. Returns a non-negative instance handle."
+doc = "Instantiate a process module already loaded into the host module cache. context is spawn_context_v1: u16 version, u16 flags, u32 pid, u32 argv_len, argv records. Returns a non-negative instance handle."
 return = "scalar"
 args = [
   { name = "module_id_ptr", type = "ptr" },
   { name = "module_id_len", type = "usize" },
-  { name = "argv_ptr", type = "ptr" },
-  { name = "argv_len", type = "usize" },
-  { name = "envp_ptr", type = "ptr" },
-  { name = "envp_len", type = "usize" },
+  { name = "context_ptr", type = "ptr" },
+  { name = "context_len", type = "usize" },
 ]
 
 [import.kh_destroy_instance]

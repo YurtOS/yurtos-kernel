@@ -140,7 +140,7 @@ Deno.test("microkernel binds wasm-engine kh imports", async () => {
   const fakeKernel = await wat2wasm(`
     (module
       (import "kh" "kh_spawn_process"
-        (func $spawn (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (func $spawn (param i32 i32 i32 i32) (result i32)))
       (import "kh" "kh_destroy_instance"
         (func $destroy (param i32) (result i32)))
       (import "kh" "kh_process_mem_read"
@@ -159,7 +159,6 @@ Deno.test("microkernel binds wasm-engine kh imports", async () => {
           (i64.add
             (i64.extend_i32_s
               (call $spawn
-                (i32.const 0) (i32.const 0)
                 (i32.const 0) (i32.const 0)
                 (i32.const 0) (i32.const 0)))
             (i64.extend_i32_s (call $destroy (i32.const 0))))
@@ -186,7 +185,7 @@ Deno.test("kh_spawn_process manages cached wasm instance handles", async () => {
   const fakeKernel = await wat2wasm(`
     (module
       (import "kh" "kh_spawn_process"
-        (func $spawn (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (func $spawn (param i32 i32 i32 i32) (result i32)))
       (import "kh" "kh_destroy_instance"
         (func $destroy (param i32) (result i32)))
       (import "kh" "kh_process_mem_read"
@@ -196,6 +195,7 @@ Deno.test("kh_spawn_process manages cached wasm instance handles", async () => {
       (memory (export "memory") 1)
       (data (i32.const 2048) "mem-proc")
       (data (i32.const 2064) "ok")
+      (data (i32.const 2072) "\\01\\00\\00\\00\\01\\00\\00\\00\\00\\00\\00\\00")
       (func (export "kernel_scratch_ptr") (result i32) (i32.const 1024))
       (func (export "kernel_scratch_len") (result i32) (i32.const 4096))
       (func (export "kernel_dispatch")
@@ -208,8 +208,7 @@ Deno.test("kh_spawn_process manages cached wasm instance handles", async () => {
         (local.set $handle
           (call $spawn
             (i32.const 2048) (i32.const 8)
-            (i32.const 0) (i32.const 0)
-            (i32.const 0) (i32.const 0)))
+            (i32.const 2072) (i32.const 12)))
         (if (result i64) (i32.lt_s (local.get $handle) (i32.const 0))
           (then (return (i64.extend_i32_s (local.get $handle))))
           (else (i64.const 0)))
@@ -243,17 +242,20 @@ Deno.test("kh_spawn_process manages cached wasm instance handles", async () => {
 Deno.test("kernel_spawn_process allocates pid through kernel and kh adapter", async () => {
   const processWasm = await wat2wasm(`
     (module
-      (memory (export "memory") 1))
+      (import "env" "sys_getpid" (func $getpid (result i32)))
+      (memory (export "memory") 1)
+      (func (export "run") (result i32) (call $getpid)))
   `);
   const mk = await freshMicrokernel();
   mk.cacheProcessModule(s("kernel-owned-process"), processWasm);
 
-  const pid = mk.spawnCachedProcess(
+  const user = mk.spawnCachedUserProcess(
     s("kernel-owned-process"),
     [s("/bin/kernel-owned-process")],
   );
 
-  assertEquals(pid, 1);
+  assertEquals(user.pid, 1);
+  assertEquals(user.callExportI32("run"), 1);
   const [proc] = mk.listProcesses();
   assertEquals(proc.pid, 1);
   assertEquals(proc.ppid, 0);
@@ -261,8 +263,8 @@ Deno.test("kernel_spawn_process allocates pid through kernel and kh adapter", as
     new TextDecoder().decode(proc.command),
     "/bin/kernel-owned-process",
   );
-  assertEquals(mk.killProcess(pid, 15), 0);
-  assertEquals(mk.killProcess(pid, 15), 0);
+  assertEquals(mk.killProcess(user.pid, 15), 0);
+  assertEquals(mk.killProcess(user.pid, 15), 0);
 });
 
 Deno.test("memory-mediated request/response round-trips bytes", async () => {

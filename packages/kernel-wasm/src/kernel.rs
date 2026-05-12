@@ -421,6 +421,27 @@ impl Kernel {
         pid
     }
 
+    pub fn insert_host_process(
+        &mut self,
+        pid: Pid,
+        parent_pid: Pid,
+        argv: Vec<Vec<u8>>,
+        host_instance_handle: Option<i32>,
+    ) {
+        {
+            let p = self.process_mut(pid);
+            p.ppid = parent_pid;
+            p.argv = argv;
+            p.host_instance_handle = host_instance_handle;
+        }
+        if parent_pid != 0 {
+            let parent = self.process_mut(parent_pid);
+            if !parent.children.contains(&pid) {
+                parent.children.push(pid);
+            }
+        }
+    }
+
     /// Allocate the next pid for a sys_spawn child and bump the
     /// counter. Pids stay above 1000 to leave room for host-
     /// allocated user processes.

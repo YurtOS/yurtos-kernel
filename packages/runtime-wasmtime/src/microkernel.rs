@@ -2662,10 +2662,8 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
         |_caller: Caller<'_, KernelStoreData>,
          _module_id_ptr: u32,
          _module_id_len: u32,
-         _argv_ptr: u32,
-         _argv_len: u32,
-         _envp_ptr: u32,
-         _envp_len: u32|
+         _context_ptr: u32,
+         _context_len: u32|
          -> i32 { -(ENOSYS as i32) },
     )?;
     linker.func_wrap(

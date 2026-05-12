@@ -102,9 +102,10 @@ records.
   `kernel_wait` now exist. `kernel_spawn` now allocates/registers
   host-instantiated process pids and argv in the Rust kernel. The first
   kernel-driven cached-module spawn path now exists as `kernel_spawn_process`:
-  it calls `kh_spawn_process`, records the returned opaque instance handle in
-  the kernel-owned process record, allocates the pid, and stores argv. Rust
-  `kh` wrappers and portable JS KH-adapter bindings now exist for the
+  it allocates the pid before calling `kh_spawn_process`, passes that pid in a
+  binary `spawn_context_v1` record, records the returned opaque instance handle
+  in the kernel-owned process record, and stores argv. Rust `kh` wrappers and
+  portable JS KH-adapter bindings now exist for the
   wasm-engine import family (`kh_spawn_process`,
   `kh_destroy_instance`, `kh_process_mem_read`, `kh_process_mem_write`,
   `kh_process_resume`). The portable JS KH adapter now has a host module cache
@@ -114,12 +115,11 @@ records.
   `kh_process_resume` still returns `-ENOSYS` until the scheduler/resume loop
   lands. The remaining reserved export is
   `kernel_snapshot`.
-- Before replacing `spawnUserProcessWithArgs` with `kernel_spawn_process`, fix
-  the spawn context ordering: real user-process imports need the kernel pid
-  while the KH adapter instantiates the wasm module. The next ABI slice should
-  allocate the pid in kernel.wasm before `kh_spawn_process` and pass that pid in
-  an explicit binary spawn context (not JSON, not argv/envp overloading). On KH
-  failure, the reserved pid/process record must be rolled back or marked failed.
+- The portable JS KH adapter can now instantiate cached user modules with
+  pid-bound syscall imports through `spawnCachedUserProcess`. Next, migrate
+  `spawnUserProcessWithArgs` to cache the module and use this path by default,
+  then remove the older host-instantiated registration path once parity tests
+  cover it.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the

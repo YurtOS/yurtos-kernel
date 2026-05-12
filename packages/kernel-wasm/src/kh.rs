@@ -82,10 +82,8 @@ extern "C" {
     fn kh_spawn_process(
         module_id_ptr: *const u8,
         module_id_len: usize,
-        argv_ptr: *const u8,
-        argv_len: usize,
-        envp_ptr: *const u8,
-        envp_len: usize,
+        context_ptr: *const u8,
+        context_len: usize,
     ) -> i32;
     fn kh_destroy_instance(handle: i32) -> i32;
     fn kh_process_mem_read(handle: i32, addr: u32, dst_ptr: *mut u8, len: usize) -> i64;
@@ -274,10 +272,8 @@ unsafe fn kh_idb_list(
 unsafe fn kh_spawn_process(
     _module_id_ptr: *const u8,
     _module_id_len: usize,
-    _argv_ptr: *const u8,
-    _argv_len: usize,
-    _envp_ptr: *const u8,
-    _envp_len: usize,
+    _context_ptr: *const u8,
+    _context_len: usize,
 ) -> i32 {
     -38
 }
@@ -492,17 +488,16 @@ pub fn idb_list(store: &[u8], prefix: &[u8], out: &mut [u8]) -> i64 {
 
 #[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
 /// Ask the microkernel to instantiate a process module already present
-/// in the host module cache. The argv/envp bytes are kernel-owned
-/// binary records; the host only interprets the module identifier.
-pub fn spawn_process(module_id: &[u8], argv: &[u8], envp: &[u8]) -> i32 {
+/// in the host module cache. `context` is a kernel-authored binary
+/// spawn-context record; the host only interprets module ids and
+/// engine mechanics.
+pub fn spawn_process(module_id: &[u8], context: &[u8]) -> i32 {
     unsafe {
         kh_spawn_process(
             module_id.as_ptr(),
             module_id.len(),
-            argv.as_ptr(),
-            argv.len(),
-            envp.as_ptr(),
-            envp.len(),
+            context.as_ptr(),
+            context.len(),
         )
     }
 }
@@ -575,7 +570,7 @@ mod tests {
 
     #[test]
     fn native_wasm_engine_ops_are_explicitly_unimplemented() {
-        assert_eq!(spawn_process(b"module", b"", b""), -abi::ENOSYS);
+        assert_eq!(spawn_process(b"module", b""), -abi::ENOSYS);
         assert_eq!(destroy_instance(7), -abi::ENOSYS);
 
         let mut dst = [0u8; 4];

@@ -875,11 +875,21 @@ pub fn spawn_cached_process(parent_pid: u32, module_id: &[u8], argv_request: &[u
         Ok(argv) => argv,
         Err(rc) => return rc,
     };
-    let handle = kh::spawn_process(module_id, argv_request, &[]);
+    let pid = with_kernel(|k| k.alloc_host_pid());
+    let mut context = Vec::with_capacity(12 + argv_request.len());
+    context.extend_from_slice(&1_u16.to_le_bytes()); // spawn_context_v1
+    context.extend_from_slice(&0_u16.to_le_bytes()); // flags
+    context.extend_from_slice(&pid.to_le_bytes());
+    context.extend_from_slice(&(argv_request.len() as u32).to_le_bytes());
+    context.extend_from_slice(argv_request);
+    let handle = kh::spawn_process(module_id, &context);
     if handle < 0 {
         return handle as i64;
     }
-    with_kernel(|k| k.register_host_process(parent_pid, argv, Some(handle)) as i64)
+    with_kernel(|k| {
+        k.insert_host_process(pid, parent_pid, argv, Some(handle));
+    });
+    pid as i64
 }
 
 /// `kernel_register_child(parent_pid, child_pid)`. Microkernel-

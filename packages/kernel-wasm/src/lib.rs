@@ -171,8 +171,9 @@ pub unsafe extern "C" fn kernel_spawn(
 /// Host-control export: ask the kernel to spawn a cached process module.
 ///
 /// The module id names a wasm module already cached in the KH adapter. The
-/// kernel calls `kh_spawn_process`, records the returned opaque instance handle
-/// in its process table, allocates the pid, stores argv, and returns the pid.
+/// kernel allocates the pid before calling `kh_spawn_process`, passes that pid
+/// in `spawn_context_v1`, records the returned opaque instance handle in its
+/// process table, stores argv, and returns the pid.
 ///
 /// # Safety
 ///
