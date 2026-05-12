@@ -98,22 +98,20 @@ records.
 ### Phase B2 — Kernel-Owned Process Control
 
 - Define the host-control exports in `packages/kernel-wasm` before changing TS
-  compatibility shims. `kernel_list_processes`, `kernel_kill`, and
-  `kernel_wait` now exist. The kernel-driven cached-module spawn path now exists
-  as `kernel_spawn_process`:
-  it allocates the pid before calling `kh_spawn_process`, passes that pid in a
-  binary `spawn_context_v1` record, records the returned opaque instance handle
-  in the kernel-owned process record, and stores argv. Rust `kh` wrappers and
-  portable JS KH-adapter bindings now exist for the
-  wasm-engine import family (`kh_spawn_process`,
+  compatibility shims. `kernel_list_processes`, `kernel_kill`, and `kernel_wait`
+  now exist. The kernel-driven cached-module spawn path now exists as
+  `kernel_spawn_process`: it allocates the pid before calling
+  `kh_spawn_process`, passes that pid in a binary `spawn_context_v1` record,
+  records the returned opaque instance handle in the kernel-owned process
+  record, and stores argv. Rust `kh` wrappers and portable JS KH-adapter
+  bindings now exist for the wasm-engine import family (`kh_spawn_process`,
   `kh_destroy_instance`, `kh_process_mem_read`, `kh_process_mem_write`,
   `kh_process_resume`). The portable JS KH adapter now has a host module cache
   and opaque instance-handle table for cached modules, including process memory
   read/write and destroy. Kernel `kill` now destroys an attached KH instance
   handle and clears it only after the KH adapter reports success.
   `kh_process_resume` still returns `-ENOSYS` until the scheduler/resume loop
-  lands. The remaining reserved export is
-  `kernel_snapshot`.
+  lands. The remaining reserved export is `kernel_snapshot`.
 - The portable JS KH adapter can now instantiate cached user modules with
   pid-bound syscall imports through `spawnCachedUserProcess`, and the public
   `spawnUserProcessWithArgs` helper now caches anonymous modules and uses that
@@ -130,8 +128,9 @@ records.
   `kernel_spawn_process`; it no longer spawns with parent 0 and patches
   parentage through `KERNEL_REGISTER_CHILD`.
 - `kernel_record_exit` and `kernel_drain_spawn` now exist as typed host-control
-  exports, and native wasmtime uses them instead of generic dispatch method ids
-  for process lifecycle notification and pending-spawn draining.
+  exports. The JS adapter and native wasmtime adapter use them instead of
+  generic dispatch method ids for process lifecycle notification and
+  pending-spawn draining.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the
@@ -142,8 +141,8 @@ records.
   expose decoded views backed by `kernel_list_processes`; remaining work is to
   delete old host-authored list surfaces that belong to the pre-sandboxed
   runtime path.
-- Expose host-control `kill` and `wait` through dedicated kernel exports in
-  each adapter. JS and native wasmtime now call `kernel_kill` / `kernel_wait`
+- Expose host-control `kill` and `wait` through dedicated kernel exports in each
+  adapter. JS and native wasmtime now call `kernel_kill` / `kernel_wait`
   directly; the KH adapter decodes return records but does not own process
   state.
 - Only after the Rust export and adapter path are covered, update the temporary

@@ -207,6 +207,12 @@ export interface WaitResult {
   status: number;
 }
 
+export interface PendingSpawn {
+  childPid: number;
+  wasmBytes: Uint8Array;
+  argv: Uint8Array[];
+}
+
 // ── Embedder-supplied traits ──────────────────────────────────────────────
 
 export interface ExtensionRegistry {
@@ -742,6 +748,38 @@ function decodeProcessList(bytes: Uint8Array): ProcessSnapshot[] {
   return entries;
 }
 
+function decodePendingSpawn(bytes: Uint8Array): PendingSpawn {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (bytes.byteLength < 12) throw new Error("short pending spawn");
+  const childPid = view.getUint32(0, true);
+  const wasmLen = view.getUint32(4, true);
+  let offset = 8;
+  if (bytes.byteLength < offset + wasmLen + 4) {
+    throw new Error("truncated pending spawn wasm body");
+  }
+  const wasmBytes = bytes.subarray(offset, offset + wasmLen).slice();
+  offset += wasmLen;
+  const argc = view.getUint32(offset, true);
+  offset += 4;
+  const argv: Uint8Array[] = [];
+  for (let i = 0; i < argc; i++) {
+    if (bytes.byteLength < offset + 4) {
+      throw new Error("truncated pending spawn argv header");
+    }
+    const len = view.getUint32(offset, true);
+    offset += 4;
+    if (bytes.byteLength < offset + len) {
+      throw new Error("truncated pending spawn argv body");
+    }
+    argv.push(bytes.subarray(offset, offset + len).slice());
+    offset += len;
+  }
+  if (offset !== bytes.byteLength) {
+    throw new Error("trailing pending spawn bytes");
+  }
+  return { childPid, wasmBytes, argv };
+}
+
 function encodeArgv(argv: Uint8Array[]): Uint8Array {
   let argvSize = 0;
   for (const a of argv) argvSize += 4 + a.byteLength;
@@ -1001,6 +1039,12 @@ export class KernelInstance {
         argvLen: number,
       ) => bigint)
       | null = null,
+    readonly kernelRecordExit:
+      | ((pid: number, exitStatus: number) => bigint)
+      | null = null,
+    readonly kernelDrainSpawn:
+      | ((outPtr: number, outCap: number) => bigint)
+      | null = null,
   ) {}
 
   private stage(
@@ -1105,6 +1149,23 @@ export class KernelInstance {
     const outPtr = this.scratchPtr;
     const outCap = 8;
     const rc = this.kernelWait(callerPid, childPid, flags, outPtr, outCap);
+    return { rc, response: this.collectResponse(outPtr, outCap) };
+  }
+
+  recordExit(pid: number, exitStatus: number): bigint {
+    if (!this.kernelRecordExit) {
+      throw new Error("kernel.wasm missing kernel_record_exit export");
+    }
+    return this.kernelRecordExit(pid, exitStatus);
+  }
+
+  drainPendingSpawnRaw(): { rc: bigint; response: Uint8Array } {
+    if (!this.kernelDrainSpawn) {
+      throw new Error("kernel.wasm missing kernel_drain_spawn export");
+    }
+    const outPtr = this.scratchPtr;
+    const outCap = this.scratchLen;
+    const rc = this.kernelDrainSpawn(outPtr, outCap);
     return { rc, response: this.collectResponse(outPtr, outCap) };
   }
 
@@ -2310,6 +2371,12 @@ export class Microkernel {
         argvLen: number,
       ) => bigint)
       | undefined;
+    const kernelRecordExit = instance.exports.kernel_record_exit as
+      | ((pid: number, exitStatus: number) => bigint)
+      | undefined;
+    const kernelDrainSpawn = instance.exports.kernel_drain_spawn as
+      | ((outPtr: number, outCap: number) => bigint)
+      | undefined;
 
     // promising-wrap returns a function that returns Promise<i64>;
     // the underlying call may suspend via any Suspending import.
@@ -2357,6 +2424,8 @@ export class Microkernel {
       kernelKill ?? null,
       kernelWait ?? null,
       kernelSpawnProcess ?? null,
+      kernelRecordExit ?? null,
+      kernelDrainSpawn ?? null,
     );
     kernelRef.kernel = kernel;
     hostBox.state = hostState;
@@ -2385,6 +2454,15 @@ export class Microkernel {
     responseCap: number,
   ): Promise<{ rc: bigint; response: Uint8Array }> {
     return this.kernel.syscallAsync(methodId, KERNEL_PID, request, responseCap);
+  }
+
+  kernelSyscall(
+    methodId: number,
+    callerPid: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): { rc: bigint; response: Uint8Array } {
+    return this.kernel.syscall(methodId, callerPid, request, responseCap);
   }
 
   hostStateMut(): HostState {
@@ -2443,6 +2521,23 @@ export class Microkernel {
       pid: view.getUint32(0, true),
       status: view.getInt32(4, true),
     };
+  }
+
+  recordExit(pid: number, exitStatus: number): void {
+    const rc = Number(this.kernel.recordExit(pid, exitStatus));
+    if (rc !== 0) throw new Error(`kernel_record_exit failed: rc=${rc}`);
+  }
+
+  drainPendingSpawn(): PendingSpawn | null {
+    const cap = this.kernel.scratchLen;
+    const { rc, response } = this.kernel.drainPendingSpawnRaw();
+    const n = Number(rc);
+    if (n === -ENOENT) return null;
+    if (n < 0) throw new Error(`kernel_drain_spawn failed: rc=${rc}`);
+    if (n > cap) {
+      throw new Error(`kernel_drain_spawn exceeded scratch capacity: ${n}`);
+    }
+    return decodePendingSpawn(response.subarray(0, n));
   }
 
   killProcess(pid: number, signal: number): number {

@@ -552,11 +552,7 @@ Deno.test("listProcesses reads the kernel-owned process snapshot", async () => {
   regView.setUint32(4, childPid, true);
   mk.syscall(METHOD.KERNEL_REGISTER_CHILD, reg, 0);
 
-  const exit = new Uint8Array(8);
-  const exitView = new DataView(exit.buffer);
-  exitView.setUint32(0, childPid, true);
-  exitView.setInt32(4, 2, true);
-  mk.syscall(METHOD.KERNEL_RECORD_EXIT, exit, 0);
+  mk.recordExit(childPid, 2);
 
   const procs = mk.listProcesses();
   const child = procs.find((p) => p.pid === childPid);
@@ -579,15 +575,53 @@ Deno.test("waitProcess and killProcess enter kernel-owned process control", asyn
   regView.setUint32(4, 8, true);
   mk.syscall(METHOD.KERNEL_REGISTER_CHILD, reg, 0);
 
-  const exit = new Uint8Array(8);
-  const exitView = new DataView(exit.buffer);
-  exitView.setUint32(0, 8, true);
-  exitView.setInt32(4, 17, true);
-  mk.syscall(METHOD.KERNEL_RECORD_EXIT, exit, 0);
+  mk.recordExit(8, 17);
 
   assertEquals(mk.waitProcess(1, 0, 0), { pid: 8, status: 17 });
   assertEquals(mk.killProcess(8, 15), 0);
   assertEquals(mk.killProcess(8, 64), -22);
+});
+
+Deno.test("drainPendingSpawn and recordExit use typed kernel lifecycle exports", async () => {
+  const mk = await freshMicrokernel();
+  const wasmBody = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 9, 9, 9]);
+  mk.registerRamfsFile(s("/bin/echo"), wasmBody);
+
+  const path = s("/bin/echo");
+  const arg0 = s("echo");
+  const arg1 = s("hi");
+  const spawnReq = new Uint8Array(
+    4 + path.byteLength + 4 + arg0.byteLength + 4 + arg1.byteLength,
+  );
+  const spawnView = new DataView(spawnReq.buffer);
+  let off = 0;
+  spawnView.setUint32(off, path.byteLength, true);
+  off += 4;
+  spawnReq.set(path, off);
+  off += path.byteLength;
+  for (const arg of [arg0, arg1]) {
+    spawnView.setUint32(off, arg.byteLength, true);
+    off += 4;
+    spawnReq.set(arg, off);
+    off += arg.byteLength;
+  }
+
+  const parentPid = 1;
+  const { rc } = mk.kernelSyscall(METHOD.SYS_SPAWN, parentPid, spawnReq, 0);
+  const childPid = Number(rc);
+  if (childPid < 1000) {
+    throw new Error(`expected kernel-allocated child pid, got ${childPid}`);
+  }
+
+  const pending = mk.drainPendingSpawn();
+  if (pending === null) throw new Error("expected pending spawn record");
+  assertEquals(pending.childPid, childPid);
+  assertEquals(pending.wasmBytes, wasmBody);
+  assertEquals(pending.argv, [arg0, arg1]);
+  assertEquals(mk.drainPendingSpawn(), null);
+
+  mk.recordExit(childPid, 7);
+  assertEquals(mk.waitProcess(parentPid, 0, 0), { pid: childPid, status: 7 });
 });
 
 // ── User-process tests via inline WAT (require wabt) ─────────────────────

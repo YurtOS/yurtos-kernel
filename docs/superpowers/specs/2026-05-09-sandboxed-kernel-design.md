@@ -35,9 +35,9 @@ not independent kernels.
 2. **Host-portable.** Browser, native, and CLI hosts each need a kernel today;
    only TypeScript covers them all. Compiling the kernel to wasm inverts this:
    every host instantiates the same `kernel.wasm`.
-3. **Smaller TCB.** The host interface becomes small enough to audit
-   thoroughly. Kernel logic that doesn't need ambient host authority (most of
-   it) runs sandboxed alongside user code.
+3. **Smaller TCB.** The host interface becomes small enough to audit thoroughly.
+   Kernel logic that doesn't need ambient host authority (most of it) runs
+   sandboxed alongside user code.
 
 ## Architecture
 
@@ -94,8 +94,8 @@ There is also a host-control surface in the opposite direction:
   process, send a signal or kill request, wait/reap, list process state, query
   fd/proc metadata, snapshot state, and eventually set resource limits. These
   calls are not `kh_*` imports because the microkernel is not implementing the
-  behavior. They enter kernel.wasm, where the process table, credentials,
-  signal policy, fd table, and VFS state live. The microkernel only copies
+  behavior. They enter kernel.wasm, where the process table, credentials, signal
+  policy, fd table, and VFS state live. The microkernel only copies
   request/response bytes and drives wasm instances.
 
 ## Trampoline Protocol
@@ -164,15 +164,15 @@ surface, grouped:
   handle), `kh_destroy_instance`,
   `kh_process_mem_read(handle, addr, dst_ptr, len)`,
   `kh_process_mem_write(handle, addr, src_ptr, len)`,
-  `kh_process_resume(handle)`.
-  This import family is now represented in `packages/kernel-wasm/src/kh.rs`,
-  `packages/microkernel-js/mod.ts`, and the native wasmtime KH adapter. The
-  portable JS backend has a host module cache and opaque instance-handle table
-  for cached wasm modules, including instance destroy and kernel↔process memory
-  copies. The native wasmtime backend now validates kernel-provided spawn
-  contexts and instantiates cached modules with the kernel-allocated pid.
-  `kh_process_resume` intentionally returns `-ENOSYS` until the scheduler/resume
-  loop is wired; the ABI bindings themselves are no longer spec-only.
+  `kh_process_resume(handle)`. This import family is now represented in
+  `packages/kernel-wasm/src/kh.rs`, `packages/microkernel-js/mod.ts`, and the
+  native wasmtime KH adapter. The portable JS backend has a host module cache
+  and opaque instance-handle table for cached wasm modules, including instance
+  destroy and kernel↔process memory copies. The native wasmtime backend now
+  validates kernel-provided spawn contexts and instantiates cached modules with
+  the kernel-allocated pid. `kh_process_resume` intentionally returns `-ENOSYS`
+  until the scheduler/resume loop is wired; the ABI bindings themselves are no
+  longer spec-only.
 - **Diagnostics:** `kh_log` (severity, ptr, len), `kh_panic` (ptr, len —
   microkernel must terminate the kernel instance and surface the message).
 - **Cooperative yield:** `kh_yield` — blocks the calling kernel computation
@@ -193,26 +193,32 @@ inside kernel.wasm.
 Initial exports:
 
 - `kernel_spawn_process(parent_pid, module_id_ptr, module_id_len, argv_ptr,
-  argv_len) -> i64` — kernel-driven cached-module spawn. The module id names a
-  wasm module already cached in the KH adapter. Kernel.wasm allocates/reserves
-  the pid first, builds `spawn_context_v1`, calls `kh_spawn_process`, records
-  the returned opaque instance handle in its process table, stores parentage and
-  argv, and returns the pid. `spawn_context_v1` is binary: `u16 version`, `u16
-  flags`, `u32 pid`, `u32 argv_len`, then the same `(u32 arg_len + arg_bytes)*`
-  argv record used by the host-control spawn request. If the KH adapter cannot instantiate the
-  module, the pid has not been published in the process table. This is the
-  forward path for moving process instantiation behind kernel policy.
+  argv_len) -> i64`
+  — kernel-driven cached-module spawn. The module id names a wasm module already
+  cached in the KH adapter. Kernel.wasm allocates/reserves the pid first, builds
+  `spawn_context_v1`, calls `kh_spawn_process`, records the returned opaque
+  instance handle in its process table, stores parentage and argv, and returns
+  the pid. `spawn_context_v1` is binary: `u16 version`, `u16
+  flags`,
+  `u32 pid`, `u32 argv_len`, then the same `(u32 arg_len + arg_bytes)*` argv
+  record used by the host-control spawn request. If the KH adapter cannot
+  instantiate the module, the pid has not been published in the process table.
+  This is the forward path for moving process instantiation behind kernel
+  policy.
 - User-facing `sys_spawn` likewise decodes argv into the child process record at
   pid allocation time before returning a pending spawn to the KH adapter. The
   host receives argv for WASI instantiation, but it does not author `/proc`
   command metadata afterward.
 - `kernel_record_exit(pid, status) -> i64` — KH adapter notification that a
   process instance has exited. It records the exit status in kernel-owned state
-  for later `kernel_wait` / user `sys_wait` reaping.
+  for later `kernel_wait` / user `sys_wait` reaping. JS and native wasmtime
+  adapters call this typed export directly rather than routing lifecycle
+  notification through generic dispatch method ids.
 - `kernel_drain_spawn(out_ptr, out_cap) -> i64` — typed host-control export for
   draining kernel-staged user `sys_spawn` work. The response remains the binary
   pending-spawn record: `u32 child_pid`, `u32 wasm_len`, wasm bytes, `u32 argc`,
-  then `(u32 arg_len + arg_bytes)*`.
+  then `(u32 arg_len + arg_bytes)*`. JS and native wasmtime adapters decode this
+  binary record without owning or synthesizing process state.
 - `kernel_kill(pid, signal) -> i64` — apply signal/permission policy and route
   termination to the process instance through the host mechanism when needed. If
   the process record has an attached KH instance handle, kernel.wasm calls
@@ -227,11 +233,11 @@ Initial exports:
 - `kernel_list_processes(out_ptr, out_cap) -> i64` — return a packed binary
   process snapshot from the kernel-owned table. At minimum each entry carries
   `pid`, `ppid`, `pgid`, `sid`, state, exit status, command bytes, and visible
-  fd numbers. The host may render this for users, but it does not author it.
-  The JS and native wasmtime KH adapters decode this binary snapshot for their
+  fd numbers. The host may render this for users, but it does not author it. The
+  JS and native wasmtime KH adapters decode this binary snapshot for their
   embedder APIs; the authoritative table remains inside kernel.wasm.
-- `kernel_snapshot(out_ptr, out_cap) -> i32` — reserved for persistence once
-  the Rust snapshot schema lands.
+- `kernel_snapshot(out_ptr, out_cap) -> i32` — reserved for persistence once the
+  Rust snapshot schema lands.
 
 Control/query responses use explicit binary records with little-endian scalar
 fields and length-prefixed byte strings. JSON is allowed for host-level
@@ -321,9 +327,9 @@ later need parallelism (e.g., one kernel instance per user process group), the
 model becomes one kernel instance per group with no shared state.
 
 Kernel state lives in kernel.wasm's linear memory. The microkernel treats kernel
-state as opaque except via `kernel_dispatch` and a
-small host-control export set (`kernel_spawn_process`, `kernel_kill`, `kernel_wait`,
-`kernel_list_processes`, `kernel_snapshot`).
+state as opaque except via `kernel_dispatch` and a small host-control export set
+(`kernel_spawn_process`, `kernel_kill`, `kernel_wait`, `kernel_list_processes`,
+`kernel_record_exit`, `kernel_drain_spawn`, `kernel_snapshot`).
 
 ## Migration Strategy
 
