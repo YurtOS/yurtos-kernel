@@ -22,6 +22,10 @@ const FIXTURES = resolve(
 );
 const HAS_BUSYBOX_FIXTURE = existsSync(resolve(FIXTURES, "busybox.wasm"));
 const shellIt = HAS_BUSYBOX_FIXTURE ? it : it.skip;
+// Rust std canaries are built by `make -C abi rust-canaries rust-std-canaries`
+// which requires a custom Rust std build; only present in CI.
+const HAS_RUST_CANARIES = existsSync(resolve(FIXTURES, "socket-rust-canary.wasm"));
+const rustIt = HAS_RUST_CANARIES ? it : it.skip;
 // Phase 1 shared-library smoke test: gated on the side-module fixture
 // being present. The fixture is built by `make -C abi side-module-canaries`
 // (requires WASI SDK), so locally the test runs only if the dev has
@@ -1050,7 +1054,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     }]);
   });
 
-  it("links Rust POSIX socket FFI calls through libyurt", async () => {
+  rustIt("links Rust POSIX socket FFI calls through libyurt", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1062,7 +1066,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe('{"case":"socket_surface","exit":0}');
   });
 
-  it("runs Rust std::env::temp_dir through the Yurt std patch", async () => {
+  rustIt("runs Rust std::env::temp_dir through the Yurt std patch", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1074,7 +1078,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe("/tmp");
   });
 
-  it("runs Rust std env/process helpers through the Yurt std patch", async () => {
+  rustIt("runs Rust std env/process helpers through the Yurt std patch", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1088,7 +1092,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout).toContain("pid=1");
   });
 
-  it("runs Rust std path list helpers through the Yurt std patch", async () => {
+  rustIt("runs Rust std path list helpers through the Yurt std patch", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1102,7 +1106,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     );
   });
 
-  it("runs Rust std filesystem helpers through the Yurt std patch", async () => {
+  rustIt("runs Rust std filesystem helpers through the Yurt std patch", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1116,7 +1120,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout).toContain("contents=yurt");
   });
 
-  it("runs Rust std file locks with real conflict behavior", async () => {
+  rustIt("runs Rust std file locks with real conflict behavior", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1128,7 +1132,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe("exclusive-blocks=true");
   });
 
-  it("runs Rust std thread spawn/join through the Yurt std patch", async () => {
+  rustIt("runs Rust std thread spawn/join through the Yurt std patch", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1142,7 +1146,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     );
   });
 
-  it("runs Rust std::process::Command status through libyurt spawn/wait", async () => {
+  rustIt("runs Rust std::process::Command status through libyurt spawn/wait", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1156,7 +1160,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     );
   });
 
-  it("runs Rust std::process::Command output through libyurt pipes", async () => {
+  rustIt("runs Rust std::process::Command output through libyurt pipes", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1170,7 +1174,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     );
   });
 
-  it("runs Rust std::process::Command env and cwd through libyurt spawn", async () => {
+  rustIt("runs Rust std::process::Command env and cwd through libyurt spawn", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1184,7 +1188,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout).toContain('cwd-stdout="marker.txt\\n"');
   });
 
-  it("runs Rust std::process::Command spawn with piped stdio", async () => {
+  rustIt("runs Rust std::process::Command spawn with piped stdio", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1198,7 +1202,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     );
   });
 
-  it("reads Rust std::process child stdout after wait", async () => {
+  rustIt("reads Rust std::process child stdout after wait", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1212,7 +1216,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     );
   });
 
-  it("routes Rust std::process::Stdio from a child stdout pipe", async () => {
+  rustIt("routes Rust std::process::Stdio from a child stdout pipe", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1226,7 +1230,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     );
   });
 
-  it("routes Rust std::net::TcpStream connect through libyurt sockets", async () => {
+  rustIt("routes Rust std::net::TcpStream connect through libyurt sockets", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1238,7 +1242,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe("kind=ConnectionRefused");
   });
 
-  it("routes Rust std::net::TcpStream read/write through socket fd I/O", async () => {
+  rustIt("routes Rust std::net::TcpStream read/write through socket fd I/O", async () => {
     const handle: SocketHandle = 101;
     const requests: Record<string, unknown>[] = [];
     let socketBackend: SocketBackend;
@@ -1291,7 +1295,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     });
   });
 
-  it("reports Rust std::net::TcpStream peer_addr for connected streams", async () => {
+  rustIt("reports Rust std::net::TcpStream peer_addr for connected streams", async () => {
     let socketBackend: SocketBackend;
     socketBackend = {
       connect: () => ({ ok: true, socket: 202 }),
@@ -1317,7 +1321,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe("peer=127.0.0.1:9");
   });
 
-  it("routes Rust std::net hostname connects through libyurt netdb", async () => {
+  rustIt("routes Rust std::net hostname connects through libyurt netdb", async () => {
     const handle: SocketHandle = 303;
     const requests: Record<string, unknown>[] = [];
     let socketBackend: SocketBackend;
@@ -1370,7 +1374,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     });
   });
 
-  it("routes Rust std::net::TcpStream shutdown through WASI socket shutdown", async () => {
+  rustIt("routes Rust std::net::TcpStream shutdown through WASI socket shutdown", async () => {
     const requests: Record<string, unknown>[] = [];
     let socketBackend: SocketBackend;
     socketBackend = {
@@ -1413,7 +1417,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(requests).toContainEqual({ op: "close", socket: 404 });
   });
 
-  it("duplicates Rust std::net::TcpStream fds through libyurt dup", async () => {
+  rustIt("duplicates Rust std::net::TcpStream fds through libyurt dup", async () => {
     const requests: Record<string, unknown>[] = [];
     let socketBackend: SocketBackend;
     socketBackend = {
@@ -1469,7 +1473,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     }]);
   });
 
-  it("reports Rust std::net::TcpStream socket_addr through libyurt getsockname", async () => {
+  rustIt("reports Rust std::net::TcpStream socket_addr through libyurt getsockname", async () => {
     let socketBackend: SocketBackend;
     socketBackend = {
       connect: () => ({ ok: true, socket: 707 }),
@@ -1495,7 +1499,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toMatch(/^local=10\.0\.2\.15:\d+$/);
   });
 
-  it("routes Rust std::net::TcpStream take_error through libyurt getsockopt", async () => {
+  rustIt("routes Rust std::net::TcpStream take_error through libyurt getsockopt", async () => {
     let socketBackend: SocketBackend;
     socketBackend = {
       connect: () => ({ ok: true, socket: 808 }),
@@ -1521,7 +1525,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe("take_error=none");
   });
 
-  it("routes Rust std::net::TcpStream nodelay through libyurt socket options", async () => {
+  rustIt("routes Rust std::net::TcpStream nodelay through libyurt socket options", async () => {
     const requests: unknown[] = [];
     let socketBackend: SocketBackend;
     socketBackend = {
@@ -1556,7 +1560,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     ]);
   });
 
-  it("routes Rust std::net::TcpStream peek through libyurt socket recv buffering", async () => {
+  rustIt("routes Rust std::net::TcpStream peek through libyurt socket recv buffering", async () => {
     const requests: unknown[] = [];
     let socketBackend: SocketBackend;
     socketBackend = {
@@ -1587,7 +1591,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(requests).toEqual([{ op: "recv", socket: 1001, maxBytes: 3 }]);
   });
 
-  it("routes Rust std::net::TcpStream nonblocking through WASI fd flags", async () => {
+  rustIt("routes Rust std::net::TcpStream nonblocking through WASI fd flags", async () => {
     const requests: unknown[] = [];
     let socketBackend: SocketBackend;
     socketBackend = {
@@ -1630,7 +1634,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     }]);
   });
 
-  it("runs Rust std::net::TcpListener through libyurt sockets", async () => {
+  rustIt("runs Rust std::net::TcpListener through libyurt sockets", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1644,7 +1648,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe("std-net-listener=ok");
   });
 
-  it("spawns a tool via absolute path to its /usr/bin stub", async () => {
+  shellIt("spawns a tool via absolute path to its /usr/bin stub", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -1673,7 +1677,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     );
   });
 
-  it("spawns a tool via a VFS symlink to a tool stub", async () => {
+  shellIt("spawns a tool via a VFS symlink to a tool stub", async () => {
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
