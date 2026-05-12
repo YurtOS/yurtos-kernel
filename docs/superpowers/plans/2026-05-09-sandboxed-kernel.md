@@ -125,7 +125,10 @@ records.
   decoder test close to the Rust kernel test so record drift fails locally.
 - Route microkernel process observability through the Rust export. In JS/Deno
   and wasmtime adapters, the host may render the returned snapshot, but it does
-  not create the process list.
+  not create the process list. The JS adapter and native wasmtime adapter now
+  expose decoded views backed by `kernel_list_processes`; remaining work is to
+  delete old host-authored list surfaces that belong to the pre-sandboxed
+  runtime path.
 - Only after the Rust export and adapter path are covered, update the temporary
   TS-kernel path to mirror the same binary record where existing userland still
   needs compatibility. Do not introduce new TS-owned process APIs.

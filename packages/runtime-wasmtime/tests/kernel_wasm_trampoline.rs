@@ -122,11 +122,43 @@ fn kernel_wasm_export_surface_is_locked() {
         exports,
         vec![
             "kernel_dispatch",
+            "kernel_kill",
+            "kernel_list_processes",
             "kernel_scratch_len",
             "kernel_scratch_ptr",
+            "kernel_spawn_process",
+            "kernel_wait",
             "memory",
         ]
     );
+}
+
+#[test]
+fn wasmtime_adapter_lists_kernel_owned_process_snapshot() {
+    let mk = fresh_microkernel(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 7))
+        "#,
+    )
+    .unwrap();
+
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/demo".as_slice(), b"--flag".as_slice()])
+        .unwrap();
+    let snapshots = mk.list_processes().unwrap();
+    let snapshot = snapshots.iter().find(|p| p.pid == proc.pid()).unwrap();
+
+    assert_eq!(snapshot.ppid, 0);
+    assert_eq!(snapshot.state, "running");
+    assert_eq!(snapshot.exit_status, None);
+    assert_eq!(snapshot.command, b"/bin/demo");
+    assert!(snapshot.fds.contains(&0));
+    assert!(snapshot.fds.contains(&1));
+    assert!(snapshot.fds.contains(&2));
 }
 
 #[test]
@@ -1340,6 +1372,7 @@ fn sys_socket_connect_send_recv_through_local_echo_server() {
     // Send a payload.
     let payload = b"hello tcp";
     let mut send_req = (handle as i32).to_le_bytes().to_vec();
+    send_req.extend_from_slice(&0_u32.to_le_bytes()); // flags=0
     send_req.extend_from_slice(payload);
     let n = mk
         .syscall(METHOD_SYS_SOCKET_SEND, &send_req, &mut [])

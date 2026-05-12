@@ -1211,6 +1211,7 @@ pub struct KernelInstance {
     pub(crate) scratch_ptr: u32,
     pub(crate) scratch_len: u32,
     pub(crate) dispatch: TypedFunc<(u32, u32, u32, u32, u32, u32), i64>,
+    pub(crate) list_processes: TypedFunc<(u32, u32), i64>,
 }
 
 impl KernelInstance {
@@ -1256,6 +1257,106 @@ impl KernelInstance {
         }
         Ok(rc)
     }
+
+    pub fn list_processes(&mut self) -> Result<Vec<ProcessSnapshot>> {
+        let rc = self
+            .list_processes
+            .call(&mut self.store, (self.scratch_ptr, self.scratch_len))
+            .context("kernel_list_processes")?;
+        if rc < 0 {
+            anyhow::bail!("kernel_list_processes failed: rc={rc}");
+        }
+        let used = rc as usize;
+        if used > self.scratch_len as usize {
+            anyhow::bail!(
+                "kernel_list_processes exceeded scratch capacity: used={used} cap={}",
+                self.scratch_len
+            );
+        }
+        let mut bytes = vec![0u8; used];
+        self.memory
+            .read(&self.store, self.scratch_ptr as usize, &mut bytes)
+            .context("read kernel process snapshot")?;
+        decode_process_list(&bytes)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessSnapshot {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+    pub sid: u32,
+    pub state: &'static str,
+    pub exit_status: Option<i32>,
+    pub command: Vec<u8>,
+    pub fds: Vec<u32>,
+}
+
+fn decode_process_list(bytes: &[u8]) -> Result<Vec<ProcessSnapshot>> {
+    if bytes.len() < 4 {
+        anyhow::bail!("short process list");
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")) as usize;
+    let mut offset = 4usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        if bytes.len() < offset + 25 {
+            anyhow::bail!("truncated process list entry");
+        }
+        let pid = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes"));
+        offset += 4;
+        let ppid = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes"));
+        offset += 4;
+        let pgid = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes"));
+        offset += 4;
+        let sid = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes"));
+        offset += 4;
+        let state = match bytes[offset] {
+            1 => "running",
+            2 => "exited",
+            other => anyhow::bail!("unknown process state byte: {other}"),
+        };
+        offset += 1;
+        let raw_exit_status =
+            i32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes"));
+        offset += 4;
+        let command_len =
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes")) as usize;
+        offset += 4;
+        if bytes.len() < offset + command_len + 4 {
+            anyhow::bail!("truncated process command");
+        }
+        let command = bytes[offset..offset + command_len].to_vec();
+        offset += command_len;
+        let fd_count =
+            u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes")) as usize;
+        offset += 4;
+        if bytes.len() < offset + fd_count * 4 {
+            anyhow::bail!("truncated process fd list");
+        }
+        let mut fds = Vec::with_capacity(fd_count);
+        for _ in 0..fd_count {
+            fds.push(u32::from_le_bytes(
+                bytes[offset..offset + 4].try_into().expect("4 bytes"),
+            ));
+            offset += 4;
+        }
+        entries.push(ProcessSnapshot {
+            pid,
+            ppid,
+            pgid,
+            sid,
+            state,
+            exit_status: (state == "exited").then_some(raw_exit_status),
+            command,
+            fds,
+        });
+    }
+    if offset != bytes.len() {
+        anyhow::bail!("trailing bytes in process list");
+    }
+    Ok(entries)
 }
 
 // ── Microkernel: orchestrates the kernel and user processes ───────────────
@@ -1301,6 +1402,8 @@ impl Microkernel {
             .call(&mut store, ())?;
         let dispatch = instance
             .get_typed_func::<(u32, u32, u32, u32, u32, u32), i64>(&mut store, "kernel_dispatch")?;
+        let list_processes =
+            instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_list_processes")?;
 
         let kernel = KernelInstance {
             store,
@@ -1308,6 +1411,7 @@ impl Microkernel {
             scratch_ptr,
             scratch_len,
             dispatch,
+            list_processes,
         };
         Ok(Self {
             engine,
@@ -1324,6 +1428,13 @@ impl Microkernel {
             .lock()
             .unwrap()
             .syscall(method_id, KERNEL_PID, request, response)
+    }
+
+    /// Return the kernel-owned process snapshot. The wasmtime adapter
+    /// decodes the binary record for embedders, but the process table
+    /// itself lives in kernel.wasm.
+    pub fn list_processes(&self) -> Result<Vec<ProcessSnapshot>> {
+        self.kernel.lock().unwrap().list_processes()
     }
 
     /// Invoke a kernel syscall as a specific caller pid. Used by

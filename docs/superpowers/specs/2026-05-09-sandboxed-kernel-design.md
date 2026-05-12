@@ -213,6 +213,8 @@ Initial exports:
   process snapshot from the kernel-owned table. At minimum each entry carries
   `pid`, `ppid`, `pgid`, `sid`, state, exit status, command bytes, and visible
   fd numbers. The host may render this for users, but it does not author it.
+  The JS and native wasmtime KH adapters decode this binary snapshot for their
+  embedder APIs; the authoritative table remains inside kernel.wasm.
 - `kernel_snapshot(out_ptr, out_cap) -> i32` — reserved for persistence once
   the Rust snapshot schema lands.
 
