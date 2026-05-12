@@ -166,6 +166,11 @@ surface, grouped:
   `kh_process_mem_read(handle, addr, dst_ptr, len)`,
   `kh_process_mem_write(handle, addr, src_ptr, len)`,
   `kh_process_resume(handle)`.
+  This import family is now represented in `packages/kernel-wasm/src/kh.rs` and
+  `packages/microkernel-js/mod.ts`. The portable JS backend intentionally
+  returns `-ENOSYS` for these calls until the host module cache, instance handle
+  table, and scheduler/resume loop are wired; the ABI bindings themselves are no
+  longer spec-only.
 - **Diagnostics:** `kh_log` (severity, ptr, len), `kh_panic` (ptr, len —
   microkernel must terminate the kernel instance and surface the message).
 - **Cooperative yield:** `kh_yield` — blocks the calling kernel computation

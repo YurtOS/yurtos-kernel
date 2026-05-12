@@ -102,7 +102,12 @@ records.
   `kernel_wait` now exist. `kernel_spawn` now allocates/registers
   host-instantiated process pids and argv in the Rust kernel; the later
   full-spawn version still needs to move wasm instantiation behind
-  `kh_spawn_process`. The remaining reserved export is `kernel_snapshot`.
+  `kh_spawn_process`. Rust `kh` wrappers and portable JS microkernel bindings
+  now exist for the wasm-engine import family (`kh_spawn_process`,
+  `kh_destroy_instance`, `kh_process_mem_read`, `kh_process_mem_write`,
+  `kh_process_resume`); they currently return `-ENOSYS` until the host module
+  cache and scheduler path are wired. The remaining reserved export is
+  `kernel_snapshot`.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the

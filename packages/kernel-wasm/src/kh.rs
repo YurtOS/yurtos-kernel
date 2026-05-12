@@ -79,6 +79,18 @@ extern "C" {
         out_ptr: *mut u8,
         out_cap: usize,
     ) -> i64;
+    fn kh_spawn_process(
+        module_id_ptr: *const u8,
+        module_id_len: usize,
+        argv_ptr: *const u8,
+        argv_len: usize,
+        envp_ptr: *const u8,
+        envp_len: usize,
+    ) -> i32;
+    fn kh_destroy_instance(handle: i32) -> i32;
+    fn kh_process_mem_read(handle: i32, addr: u32, dst_ptr: *mut u8, len: usize) -> i64;
+    fn kh_process_mem_write(handle: i32, addr: u32, src_ptr: *const u8, len: usize) -> i64;
+    fn kh_process_resume(handle: i32, result: i64) -> i64;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -254,6 +266,43 @@ unsafe fn kh_idb_list(
     _out_ptr: *mut u8,
     _out_cap: usize,
 ) -> i64 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
+unsafe fn kh_spawn_process(
+    _module_id_ptr: *const u8,
+    _module_id_len: usize,
+    _argv_ptr: *const u8,
+    _argv_len: usize,
+    _envp_ptr: *const u8,
+    _envp_len: usize,
+) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
+unsafe fn kh_destroy_instance(_handle: i32) -> i32 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
+unsafe fn kh_process_mem_read(_handle: i32, _addr: u32, _dst_ptr: *mut u8, _len: usize) -> i64 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
+unsafe fn kh_process_mem_write(_handle: i32, _addr: u32, _src_ptr: *const u8, _len: usize) -> i64 {
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
+unsafe fn kh_process_resume(_handle: i32, _result: i64) -> i64 {
     -38
 }
 
@@ -441,6 +490,49 @@ pub fn idb_list(store: &[u8], prefix: &[u8], out: &mut [u8]) -> i64 {
     }
 }
 
+#[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
+/// Ask the microkernel to instantiate a process module already present
+/// in the host module cache. The argv/envp bytes are kernel-owned
+/// binary records; the host only interprets the module identifier.
+pub fn spawn_process(module_id: &[u8], argv: &[u8], envp: &[u8]) -> i32 {
+    unsafe {
+        kh_spawn_process(
+            module_id.as_ptr(),
+            module_id.len(),
+            argv.as_ptr(),
+            argv.len(),
+            envp.as_ptr(),
+            envp.len(),
+        )
+    }
+}
+
+#[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
+/// Release a host wasm instance handle previously returned by
+/// `spawn_process`.
+pub fn destroy_instance(handle: i32) -> i32 {
+    unsafe { kh_destroy_instance(handle) }
+}
+
+#[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
+/// Copy bytes from process linear memory into `dst`.
+pub fn process_mem_read(handle: i32, addr: u32, dst: &mut [u8]) -> i64 {
+    unsafe { kh_process_mem_read(handle, addr, dst.as_mut_ptr(), dst.len()) }
+}
+
+#[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
+/// Copy bytes from `src` into process linear memory.
+pub fn process_mem_write(handle: i32, addr: u32, src: &[u8]) -> i64 {
+    unsafe { kh_process_mem_write(handle, addr, src.as_ptr(), src.len()) }
+}
+
+#[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
+/// Resume a suspended process instance with the scalar syscall result
+/// selected by the kernel.
+pub fn process_resume(handle: i32, result: i64) -> i64 {
+    unsafe { kh_process_resume(handle, result) }
+}
+
 /// Forward an HTTP fetch request to the host. The request bytes
 /// are a JSON document (see `host::network::fetch` for the
 /// schema); the response bytes (also JSON) get written into
@@ -474,4 +566,21 @@ pub fn real_stat_size(path: &[u8]) -> Result<u64, i32> {
     }
     let size = u64::from_le_bytes(buf[8..16].try_into().expect("8 bytes"));
     Ok(size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi;
+
+    #[test]
+    fn native_wasm_engine_ops_are_explicitly_unimplemented() {
+        assert_eq!(spawn_process(b"module", b"", b""), -abi::ENOSYS);
+        assert_eq!(destroy_instance(7), -abi::ENOSYS);
+
+        let mut dst = [0u8; 4];
+        assert_eq!(process_mem_read(7, 1024, &mut dst), -(abi::ENOSYS as i64));
+        assert_eq!(process_mem_write(7, 1024, b"data"), -(abi::ENOSYS as i64));
+        assert_eq!(process_resume(7, 0), -(abi::ENOSYS as i64));
+    }
 }

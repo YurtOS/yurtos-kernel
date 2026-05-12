@@ -413,6 +413,7 @@ const EBADF = 9;
 const EEXIST = 17;
 const E2BIG = 7;
 const EIO = 5;
+const ENOSYS = 38;
 
 class EmptyExtensionRegistry implements ExtensionRegistry {
   invoke(): number {
@@ -1575,6 +1576,31 @@ export class Microkernel {
         );
         return BigInt(result.byteLength);
       },
+      kh_spawn_process: (
+        _moduleIdPtr: number,
+        _moduleIdLen: number,
+        _argvPtr: number,
+        _argvLen: number,
+        _envpPtr: number,
+        _envpLen: number,
+      ): number => -ENOSYS,
+      kh_destroy_instance: (_handle: number): number => -ENOSYS,
+      kh_process_mem_read: (
+        _handle: number,
+        _addr: number,
+        _dstPtr: number,
+        _len: number,
+      ): bigint => BigInt(-ENOSYS),
+      kh_process_mem_write: (
+        _handle: number,
+        _addr: number,
+        _srcPtr: number,
+        _len: number,
+      ): bigint => BigInt(-ENOSYS),
+      kh_process_resume: (
+        _handle: number,
+        _result: bigint,
+      ): bigint => BigInt(-ENOSYS),
     };
 
     // std-on-wasi panic-infra stubs for kernel.wasm itself.

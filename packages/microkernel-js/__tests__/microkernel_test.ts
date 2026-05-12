@@ -136,6 +136,48 @@ Deno.test("unknown method returns -ENOSYS through the trampoline", async () => {
   assertEquals(rc, -38n);
 });
 
+Deno.test("microkernel binds wasm-engine kh imports", async () => {
+  const fakeKernel = await wat2wasm(`
+    (module
+      (import "kh" "kh_spawn_process"
+        (func $spawn (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "kh" "kh_destroy_instance"
+        (func $destroy (param i32) (result i32)))
+      (import "kh" "kh_process_mem_read"
+        (func $mem_read (param i32 i32 i32 i32) (result i64)))
+      (import "kh" "kh_process_mem_write"
+        (func $mem_write (param i32 i32 i32 i32) (result i64)))
+      (import "kh" "kh_process_resume"
+        (func $resume (param i32 i64) (result i64)))
+      (memory (export "memory") 1)
+      (func (export "kernel_scratch_ptr") (result i32) (i32.const 1024))
+      (func (export "kernel_scratch_len") (result i32) (i32.const 4096))
+      (func (export "kernel_dispatch")
+        (param i32 i32 i32 i32 i32 i32)
+        (result i64)
+        (i64.add
+          (i64.add
+            (i64.extend_i32_s
+              (call $spawn
+                (i32.const 0) (i32.const 0)
+                (i32.const 0) (i32.const 0)
+                (i32.const 0) (i32.const 0)))
+            (i64.extend_i32_s (call $destroy (i32.const 0))))
+          (i64.add
+            (i64.add
+              (call $mem_read
+                (i32.const 0) (i32.const 0)
+                (i32.const 0) (i32.const 0))
+              (call $mem_write
+                (i32.const 0) (i32.const 0)
+                (i32.const 0) (i32.const 0)))
+            (call $resume (i32.const 0) (i64.const 0))))))
+  `);
+  const mk = await Microkernel.load(fakeKernel, defaultHostState());
+  const { rc } = mk.syscall(0, new Uint8Array(0), 0);
+  assertEquals(rc, -190n);
+});
+
 Deno.test("memory-mediated request/response round-trips bytes", async () => {
   const mk = await freshMicrokernel();
   const request = new TextEncoder().encode("trampoline-validates-arch");
