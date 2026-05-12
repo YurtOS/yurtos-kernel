@@ -90,11 +90,6 @@ id = 13
 kind = "internal"
 doc = "Microkernel-only: record a parent/child relationship after the host has spawned a child user-process. Request bytes: u32 parent_pid LE + u32 child_pid LE. The kernel sets child's ppid and adds child to parent's child list so sys_wait can find it. Returns 0 on success."
 
-[method.kernel_record_exit]
-id = 14
-kind = "internal"
-doc = "Microkernel-only: mark a process as exited. Request bytes: u32 pid LE + i32 exit_status LE (POSIX exit codes; the high byte carries the signal number when the process was killed). The kernel transitions the process to zombie state; the next sys_wait from its parent reaps it. Returns 0 on success."
-
 [method.sys_wait]
 id = 0x1_002C
 kind = "syscall"
@@ -402,11 +397,6 @@ doc = "Outbound HTTP fetch. Request bytes: a JSON document {url, method, headers
 id = 0x1_002F
 kind = "syscall"
 doc = "POSIX-shaped spawn(path, argv) — the userland-facing fork+exec. Request bytes: u32 path_len LE + path_bytes + (u32 arg_len + arg_bytes)*. Reads the wasm image at `path` from the VFS, allocates a fresh child pid (kernel range starts at 1000 to avoid collision with the host's user-process pid allocator), records the parent/child relationship, and enqueues a PendingSpawn for the host to instantiate. The microkernel must call drain_pending_spawn between parent syscalls to actually run staged children — without that drain the child never runs. Returns the child pid on success, -ENOENT if path is missing, -ENOMEM if the file can't be read, or -EINVAL on a malformed request."
-
-[method.kernel_drain_spawn]
-id = 15
-kind = "internal"
-doc = "Microkernel-only: pop the next PendingSpawn enqueued by sys_spawn and serialize it for the host. Response: u32 child_pid + u32 wasm_len + wasm_bytes + u32 argc + (u32 arg_len + arg_bytes)*. Returns bytes-written on success, -ENOENT when the queue is empty. The host instantiates the child wasm with the returned pid, runs it to completion, and calls kernel_record_exit to make the parent's sys_wait reap it."
 
 [method.kernel_list_processes]
 id = 16

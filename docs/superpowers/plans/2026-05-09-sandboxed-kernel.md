@@ -130,7 +130,8 @@ records.
 - `kernel_record_exit` and `kernel_drain_spawn` now exist as typed host-control
   exports. The JS adapter and native wasmtime adapter use them instead of
   generic dispatch method ids for process lifecycle notification and
-  pending-spawn draining.
+  pending-spawn draining, and the old generic dispatch method ids have been
+  removed from the kernel ABI contract.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the

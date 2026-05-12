@@ -42,8 +42,6 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_INSTALL_HOST_FS_MOUNT => install_host_fs_mount(request),
         METHOD_KERNEL_INSTALL_YURTFS => install_yurtfs(request),
         METHOD_KERNEL_REGISTER_CHILD => register_child(request),
-        METHOD_KERNEL_RECORD_EXIT => record_exit(request),
-        METHOD_KERNEL_DRAIN_SPAWN => drain_spawn(response),
         METHOD_KERNEL_LIST_PROCESSES => list_processes_response(response),
         METHOD_SYS_WAIT => wait_response(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
@@ -3750,7 +3748,7 @@ mod tests {
 
         // Drain the queued spawn.
         let mut buf = vec![0u8; 1024];
-        let n = dispatch(METHOD_KERNEL_DRAIN_SPAWN, 0, &[], &mut buf);
+        let n = drain_spawn(&mut buf);
         assert!(n > 0, "drain_spawn returned {n}");
         let used = n as usize;
         assert_eq!(
@@ -3766,13 +3764,13 @@ mod tests {
         assert!(argc_off + 4 <= used);
 
         // After draining, queue is empty.
-        let n2 = dispatch(METHOD_KERNEL_DRAIN_SPAWN, 0, &[], &mut buf);
+        let n2 = drain_spawn(&mut buf);
         assert_eq!(n2, -(abi::ENOENT as i64));
 
         // Host pretends it ran the child and exited with code 7.
         let mut rex = child_pid_u32.to_le_bytes().to_vec();
         rex.extend_from_slice(&7_i32.to_le_bytes());
-        assert_eq!(dispatch(METHOD_KERNEL_RECORD_EXIT, 0, &rex, &mut []), 0);
+        assert_eq!(record_exit(&rex), 0);
 
         // Parent's sys_wait reaps the spawned child.
         let mut wreq = 0_u32.to_le_bytes().to_vec(); // wait for any
@@ -4135,7 +4133,7 @@ mod tests {
 
         let mut exit = 5_u32.to_le_bytes().to_vec();
         exit.extend_from_slice(&42_i32.to_le_bytes());
-        dispatch(METHOD_KERNEL_RECORD_EXIT, 0, &exit, &mut []);
+        record_exit(&exit);
 
         // Parent's sys_wait reaps the child. Request: child_pid=0 (any) + flags=0.
         let mut wreq = 0_u32.to_le_bytes().to_vec();
@@ -4197,7 +4195,7 @@ mod tests {
         }
         let mut exit = 11_u32.to_le_bytes().to_vec();
         exit.extend_from_slice(&7_i32.to_le_bytes());
-        dispatch(METHOD_KERNEL_RECORD_EXIT, 0, &exit, &mut []);
+        record_exit(&exit);
 
         // Wait specifically on pid 10 — running, not 11 (exited).
         // Should return -EAGAIN (would block) since 10 hasn't exited.
@@ -4231,7 +4229,7 @@ mod tests {
 
         let mut exit = 7_u32.to_le_bytes().to_vec();
         exit.extend_from_slice(&2_i32.to_le_bytes());
-        dispatch(METHOD_KERNEL_RECORD_EXIT, 0, &exit, &mut []);
+        record_exit(&exit);
 
         let mut out = [0u8; 128];
         let n = dispatch(METHOD_KERNEL_LIST_PROCESSES, 0, &[], &mut out);
@@ -4304,5 +4302,14 @@ mod tests {
                 "expected {required} in KNOWN_METHODS"
             );
         }
+    }
+
+    #[test]
+    fn lifecycle_host_control_is_not_available_through_generic_dispatch() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut exit = 7_u32.to_le_bytes().to_vec();
+        exit.extend_from_slice(&0_i32.to_le_bytes());
+        assert_eq!(dispatch(14, 0, &exit, &mut []), -(abi::ENOSYS as i64));
+        assert_eq!(dispatch(15, 0, &[], &mut [0u8; 32]), -(abi::ENOSYS as i64));
     }
 }
