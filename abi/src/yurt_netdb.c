@@ -20,6 +20,10 @@
 #include "yurt_markers.h"
 #include "yurt_runtime.h"
 
+#ifndef YURT_AF_INET
+#define YURT_AF_INET 2u
+#endif
+
 int h_errno = 1;  /* HOST_NOT_FOUND */
 
 YURT_DECLARE_MARKER(getaddrinfo);
@@ -423,7 +427,7 @@ uint32_t yurt_netdb_addr_for_host(const char *host) {
         (int)(intptr_t)host, (int)__builtin_strlen(host),
         (int)(intptr_t)&result, (int)sizeof(result)
     );
-    if (rc != (int)sizeof(result) || result.family != AF_INET) return 0;
+    if (rc != (int)sizeof(result) || result.family != YURT_AF_INET) return 0;
     yurt_addrmap_store(host, result.addr_be);
     return result.addr_be;
 }

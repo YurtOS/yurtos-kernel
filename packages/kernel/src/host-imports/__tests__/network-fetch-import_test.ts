@@ -23,7 +23,7 @@ class RecordingBridge implements NetworkBridgeLike {
     _url: string,
     _method: string,
     _headers: Record<string, string>,
-    _body?: string,
+    _body?: string | null,
     redirect?: FetchRedirectMode,
   ): SyncFetchResult {
     this.redirect = redirect;

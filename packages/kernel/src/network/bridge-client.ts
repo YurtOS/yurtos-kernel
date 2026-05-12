@@ -6,8 +6,13 @@
  * and waits synchronously for the response.
  */
 
-import type { FetchRedirectMode, NetworkBridgeLike, SyncFetchResult, SyncRequestResult } from './bridge.js';
-import type { NetworkGateway } from './gateway.js';
+import type {
+  FetchRedirectMode,
+  NetworkBridgeLike,
+  SyncFetchResult,
+  SyncRequestResult,
+} from "./bridge.js";
+import type { NetworkGateway } from "./gateway.js";
 
 const STATUS_IDLE = 0;
 const STATUS_REQUEST_READY = 1;
@@ -30,21 +35,21 @@ export class BridgeClient implements NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: string | null,
     redirect?: FetchRedirectMode,
   ): SyncFetchResult {
     // Check gateway policy synchronously first
     if (this.gateway) {
       const access = this.gateway.checkAccess(url, method);
       if (!access.allowed) {
-        return { status: 403, body: '', headers: {}, error: access.reason };
+        return { status: 403, body: "", headers: {}, error: access.reason };
       }
     }
 
     const reqJson = JSON.stringify({ url, method, headers, body, redirect });
     const reqEncoded = this.encoder.encode(reqJson);
     if (reqEncoded.byteLength > this.uint8.byteLength - 8) {
-      return { status: 413, body: '', headers: {}, error: 'request too large' };
+      return { status: 413, body: "", headers: {}, error: "request too large" };
     }
     this.uint8.set(reqEncoded, 8);
     Atomics.store(this.int32, 1, reqEncoded.byteLength);
@@ -52,10 +57,20 @@ export class BridgeClient implements NetworkBridgeLike {
     Atomics.notify(this.int32, 0);
 
     // Block until response (30-second timeout)
-    const waitResult = Atomics.wait(this.int32, 0, STATUS_REQUEST_READY, 30_000);
-    if (waitResult === 'timed-out') {
+    const waitResult = Atomics.wait(
+      this.int32,
+      0,
+      STATUS_REQUEST_READY,
+      30_000,
+    );
+    if (waitResult === "timed-out") {
       Atomics.store(this.int32, 0, STATUS_IDLE);
-      return { status: 0, body: '', headers: {}, error: 'network request timed out' };
+      return {
+        status: 0,
+        body: "",
+        headers: {},
+        error: "network request timed out",
+      };
     }
 
     const status = Atomics.load(this.int32, 0);
@@ -67,7 +82,7 @@ export class BridgeClient implements NetworkBridgeLike {
 
     const result = JSON.parse(respJson) as SyncFetchResult;
     if (status === STATUS_ERROR) {
-      result.error = result.error || 'unknown error';
+      result.error = result.error || "unknown error";
     }
     return result;
   }
@@ -76,17 +91,22 @@ export class BridgeClient implements NetworkBridgeLike {
     const reqJson = JSON.stringify(op);
     const reqEncoded = this.encoder.encode(reqJson);
     if (reqEncoded.byteLength > this.uint8.byteLength - 8) {
-      return { ok: false, error: 'request too large' };
+      return { ok: false, error: "request too large" };
     }
     this.uint8.set(reqEncoded, 8);
     Atomics.store(this.int32, 1, reqEncoded.byteLength);
     Atomics.store(this.int32, 0, STATUS_REQUEST_READY);
     Atomics.notify(this.int32, 0);
 
-    const waitResult = Atomics.wait(this.int32, 0, STATUS_REQUEST_READY, 30_000);
-    if (waitResult === 'timed-out') {
+    const waitResult = Atomics.wait(
+      this.int32,
+      0,
+      STATUS_REQUEST_READY,
+      30_000,
+    );
+    if (waitResult === "timed-out") {
       Atomics.store(this.int32, 0, STATUS_IDLE);
-      return { ok: false, error: 'request timed out' };
+      return { ok: false, error: "request timed out" };
     }
 
     const len = Atomics.load(this.int32, 1);

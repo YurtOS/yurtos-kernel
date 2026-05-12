@@ -59,7 +59,7 @@ export class BrowserNetworkBridge implements NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: string | null,
     redirect: FetchRedirectMode = "follow",
   ): Promise<SyncFetchResult> {
     // Check gateway policy

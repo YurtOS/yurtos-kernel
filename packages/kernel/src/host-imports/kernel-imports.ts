@@ -2056,7 +2056,7 @@ export function createKernelImports(
           : "follow";
         const body = bodyBytes.byteLength > 0
           ? new TextDecoder().decode(bodyBytes)
-          : undefined;
+          : null;
 
         // Use async fetch if available (browser), otherwise fall back to sync (SAB bridge)
         const result = opts.networkBridge.fetchAsync
@@ -2257,7 +2257,7 @@ export function createKernelImports(
       port: number,
       flags: number,
     ): number {
-      if (!socketBackend) return -5;
+      if (!socketBackend) return -111;
       const host = readString(memory, hostPtr, hostLen);
       if (!host || port < 0 || port > 65535) return -22;
       const target = opts.kernel?.getFdTarget(callerPid, fd);
