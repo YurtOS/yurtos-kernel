@@ -96,6 +96,17 @@ jobs:
         run: sudo apt-get update -y && sudo apt-get install -y wabt
       - name: Build kernel.wasm
         run: cargo build --release -p yurt-kernel-wasm --target wasm32-wasip1
+      - name: Build parity fixture wasm
+        run: |
+          cargo build --release --target wasm32-wasip1 \
+            -p hello-wasm \
+            -p echo-args-wasm \
+            -p cat-stdin-wasm \
+            -p cat-ramfs-wasm \
+            -p wc-bytes-wasm \
+            -p proc-cmdline-wasm \
+            -p true-cmd-wasm \
+            -p false-cmd-wasm
       - name: Format check
         run: deno fmt --check packages/microkernel-js/ packages/microkernel-deno/
       - name: Lint

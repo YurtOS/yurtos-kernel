@@ -221,6 +221,8 @@ static int yurt_socket_close_tracked(int fd) {
   return 0;
 }
 
+extern int __real_close(int fd);
+
 static int yurt_socket_addr_string(const char *host, int port, char *dst, size_t cap) {
   int n = snprintf(dst, cap, "%s:%d", host, port);
   if (n < 0 || (size_t)n >= cap) {
@@ -688,18 +690,9 @@ int shutdown(int sockfd, int how) {
   return yurt_socket_close_tracked(sockfd);
 }
 
-int close(int fd) {
-  if (yurt_socket_is_tracked_fd(fd)) return yurt_socket_close_tracked(fd);
-  __wasi_errno_t rc = __wasi_fd_close((__wasi_fd_t)fd);
-  if (rc != __WASI_ERRNO_SUCCESS) {
-    errno = EBADF;
-    return -1;
-  }
-  return 0;
-}
-
 int __wrap_close(int fd) {
-  return close(fd);
+  if (yurt_socket_is_tracked_fd(fd)) return yurt_socket_close_tracked(fd);
+  return __real_close(fd);
 }
 
 /* socketpair — wasi-libc lacks it (gated behind
