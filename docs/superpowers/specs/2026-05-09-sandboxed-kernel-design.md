@@ -202,6 +202,12 @@ Initial exports:
   `kh_spawn_process`, records the returned opaque instance handle in its process
   table, allocates the pid, stores parentage and argv, and returns the pid. This
   is the forward path for moving process instantiation behind kernel policy.
+  This first version is sufficient for modules that do not need pid-bound
+  syscall imports. Full user-process migration needs one more binary spawn
+  context: kernel.wasm must allocate/reserve the pid before calling
+  `kh_spawn_process`, pass that pid to the KH adapter in an explicit fixed
+  record, and roll back or mark failed if the KH adapter cannot instantiate the
+  module.
 - `kernel_kill(pid, signal) -> i64` — apply signal/permission policy and route
   termination to the process instance through the host mechanism when needed. If
   the process record has an attached KH instance handle, kernel.wasm calls

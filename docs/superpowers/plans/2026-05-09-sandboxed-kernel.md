@@ -114,6 +114,12 @@ records.
   `kh_process_resume` still returns `-ENOSYS` until the scheduler/resume loop
   lands. The remaining reserved export is
   `kernel_snapshot`.
+- Before replacing `spawnUserProcessWithArgs` with `kernel_spawn_process`, fix
+  the spawn context ordering: real user-process imports need the kernel pid
+  while the KH adapter instantiates the wasm module. The next ABI slice should
+  allocate the pid in kernel.wasm before `kh_spawn_process` and pass that pid in
+  an explicit binary spawn context (not JSON, not argv/envp overloading). On KH
+  failure, the reserved pid/process record must be rolled back or marked failed.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the
