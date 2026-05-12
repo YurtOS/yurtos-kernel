@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert@^1.0.19";
+import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.19";
 import { createKernelImports } from "../kernel-imports.ts";
 import { readString } from "../common.ts";
 import { VFS } from "../../vfs/vfs.ts";
@@ -33,8 +33,8 @@ function readWaitResult(memory: WebAssembly.Memory, ptr: number) {
 
 const POLLIN = 0x0001;
 const POLLOUT = 0x0002;
-const POLLHUP = 0x2000;
-const POLLNVAL = 0x4000;
+const POLLHUP = 0x0010;
+const POLLNVAL = 0x0020;
 
 function writePollFd(
   memory: WebAssembly.Memory,
@@ -1836,5 +1836,76 @@ Deno.test("host_poll reports exhausted static input as readable EOF", () => {
     1,
   );
   assertEquals(readPollRevents(memory, 256), POLLIN);
+  kernel.dispose();
+});
+
+Deno.test("host_poll cancels finite detached polls during teardown", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  const [readEnd] = createAsyncPipe(4);
+  kernel.setFdTarget(pid, 99, { type: "pipe_read", pipe: readEnd });
+  writePollFd(memory, 256, 99, POLLIN);
+  let cancelled = false;
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    threadsBackend: {
+      kind: "cooperative-serial",
+      setIndirectCallTable() {},
+      async spawn() {
+        return -1;
+      },
+      async join() {
+        return -1;
+      },
+      async detach() {
+        return -1;
+      },
+      isDetached: () => true,
+      detachedThreadsCancelled: () => cancelled,
+      exit(): never {
+        throw new Error("detached poll cancelled");
+      },
+      self() {
+        return 1;
+      },
+      async yield_() {
+        return 0;
+      },
+      async mutexLock() {
+        return 0;
+      },
+      mutexUnlock() {
+        return 0;
+      },
+      mutexTryLock() {
+        return 0;
+      },
+      async condWait() {
+        return 0;
+      },
+      condSignal() {
+        return 0;
+      },
+      condBroadcast() {
+        return 0;
+      },
+    },
+  });
+
+  const pending = (imports.host_poll as (...args: number[]) => Promise<number>)(
+    256,
+    1,
+    1000,
+  );
+  cancelled = true;
+
+  await assertRejects(
+    () => pending,
+    Error,
+    "detached poll cancelled",
+  );
   kernel.dispose();
 });

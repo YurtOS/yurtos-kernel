@@ -164,9 +164,9 @@ const PRIO_PROCESS = 0;
 const YURT_WAIT_NOHANG = 1;
 const POLLIN = 0x0001;
 const POLLOUT = 0x0002;
-const POLLERR = 0x1000;
-const POLLHUP = 0x2000;
-const POLLNVAL = 0x4000;
+const POLLERR = 0x0008;
+const POLLHUP = 0x0010;
+const POLLNVAL = 0x0020;
 const POLLFD_SIZE = 8;
 
 function writeI32(
@@ -395,6 +395,8 @@ function pollReventsForTarget(target: FdTarget, events: number): number {
         if ((target.peekBuffer?.byteLength ?? 0) > 0 || target.readShutdown) {
           revents |= POLLIN;
         } else if (target.socket !== null) {
+          // Socket readiness is probed by a nonblocking recv; any byte read
+          // here is cached so the following guest recv observes it.
           const probe = target.recv(target.socket, 1, { nonblocking: true });
           if (probe.ok) {
             const data = probe.data ?? new Uint8Array(0);
@@ -1015,11 +1017,23 @@ export function createKernelImports(
           new Promise<number>(() => {});
       }
 
-      return new Promise<number>((resolve) => {
+      return new Promise<number>((resolve, reject) => {
         const started = Date.now();
         // Cooperative runtimes have no host-side readiness notification yet,
         // so blocking poll/select wakes on this coarse timer.
         const interval = setInterval(() => {
+          if (
+            tid !== 0 && opts.threadsBackend?.isDetached?.(tid) &&
+            opts.threadsBackend.detachedThreadsCancelled?.()
+          ) {
+            clearInterval(interval);
+            try {
+              opts.threadsBackend.exit(0);
+            } catch (err) {
+              reject(err);
+            }
+            return;
+          }
           const ready = evaluate();
           const expired = timeoutMs >= 0 && Date.now() - started >= timeoutMs;
           if (ready !== 0 || expired) {
@@ -2397,7 +2411,9 @@ export function createKernelImports(
         const data = readBytes(memory, dataPtr, dataLen);
         const result = socketBackend.send(target.socket, data);
         if (!result.ok) return ERR_IO;
-        return result.bytes_sent ?? data.byteLength;
+        return typeof result.bytes_sent === "number"
+          ? result.bytes_sent
+          : ERR_IO;
       } catch {
         return ERR_IO;
       }

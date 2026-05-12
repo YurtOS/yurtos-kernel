@@ -63,6 +63,7 @@ YURT_DEFINE_MARKER(recv,     0x72656376u) /* "recv" */
 YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 
 #define YURT_SOCKET_RESP_CAP 4096
+/* Host import errors are opaque sentinels, not direct negative errno values. */
 #define YURT_HOST_ERR_NOT_FOUND -1
 #define YURT_HOST_ERR_IO -3
 #define YURT_HOST_ERR_AGAIN -11
