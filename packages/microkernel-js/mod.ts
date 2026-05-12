@@ -1195,6 +1195,20 @@ class CachedProcessEngine {
     const userMemoryRef: { memory?: WebAssembly.Memory } = {};
     try {
       const sysImports = buildSysImports(context.pid, kernel, userMemoryRef);
+      const sys_setrlimit = (
+        resource: number,
+        soft: bigint,
+        hard: bigint,
+      ): number => {
+        const req = new Uint8Array(20);
+        const v = new DataView(req.buffer);
+        v.setUint32(0, resource >>> 0, true);
+        v.setBigUint64(4, soft, true);
+        v.setBigUint64(12, hard, true);
+        return Number(
+          kernel.syscall(METHOD.SYS_SETRLIMIT, context.pid, req, 0).rc,
+        );
+      };
       const wasiShim = buildWasiShim(
         context.pid,
         kernel,
@@ -1202,7 +1216,7 @@ class CachedProcessEngine {
         userMemoryRef,
       );
       instance = new WebAssembly.Instance(module, {
-        env: sysImports,
+        env: { ...sysImports, sys_setrlimit },
         wasi_snapshot_preview1: wasiShim,
       });
     } catch {
@@ -1394,6 +1408,7 @@ export class Microkernel {
   private kernel: KernelInstance;
   private hostState: HostState;
   private processEngine: CachedProcessEngine;
+  private nextAnonymousModuleId = 1;
 
   private constructor(
     kernel: KernelInstance,
@@ -2473,51 +2488,9 @@ export class Microkernel {
     userWasmBytes: Uint8Array,
     argv: Uint8Array[],
   ): UserProcess {
-    const userMemoryRef: { memory?: WebAssembly.Memory } = {};
-
-    // Ask the kernel to allocate the pid and store argv so /proc
-    // and process ownership stay inside kernel.wasm.
-    const argvReq = encodeArgv(argv);
-    const pid = Number(this.kernel.spawnProcess(KERNEL_PID, argvReq));
-    if (pid < 0) throw new Error(`kernel_spawn failed: rc=${pid}`);
-
-    const sysImports = buildSysImports(pid, this.kernel, userMemoryRef);
-    // sys_setrlimit takes (i32, i64, i64); BigInt at the wasm boundary
-    // doesn't fit the unified signature in sys_shim, so it's wired
-    // here directly.
-    const sys_setrlimit = (
-      resource: number,
-      soft: bigint,
-      hard: bigint,
-    ): number => {
-      const req = new Uint8Array(20);
-      const v = new DataView(req.buffer);
-      v.setUint32(0, resource >>> 0, true);
-      v.setBigUint64(4, soft, true);
-      v.setBigUint64(12, hard, true);
-      return Number(this.kernel.syscall(METHOD.SYS_SETRLIMIT, pid, req, 0).rc);
-    };
-
-    const wasiShim = buildWasiShim(pid, this.kernel, argv, userMemoryRef);
-
-    const userModule = new WebAssembly.Module(
-      userWasmBytes as unknown as BufferSource,
-    );
-    const userInstance = new WebAssembly.Instance(userModule, {
-      env: { ...sysImports, sys_setrlimit },
-      wasi_snapshot_preview1: wasiShim,
-    });
-    const userMemory = userInstance.exports.memory as
-      | WebAssembly.Memory
-      | undefined;
-    userMemoryRef.memory = userMemory ??
-      new WebAssembly.Memory({ initial: 0 });
-    return new UserProcess(
-      pid,
-      userInstance,
-      userMemoryRef.memory,
-      this.kernel,
-    );
+    const moduleId = s(`anonymous:${this.nextAnonymousModuleId++}`);
+    this.cacheProcessModule(moduleId, userWasmBytes);
+    return this.spawnCachedUserProcess(moduleId, argv);
   }
 
   spawnUserProcessWithArgsAndStdin(

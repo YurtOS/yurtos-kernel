@@ -116,10 +116,10 @@ records.
   lands. The remaining reserved export is
   `kernel_snapshot`.
 - The portable JS KH adapter can now instantiate cached user modules with
-  pid-bound syscall imports through `spawnCachedUserProcess`. Next, migrate
-  `spawnUserProcessWithArgs` to cache the module and use this path by default,
-  then remove the older host-instantiated registration path once parity tests
-  cover it.
+  pid-bound syscall imports through `spawnCachedUserProcess`, and the public
+  `spawnUserProcessWithArgs` helper now caches anonymous modules and uses that
+  path by default. Next, remove the older host-instantiated registration path
+  once parity tests cover every caller that still reaches `kernel_spawn`.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the
