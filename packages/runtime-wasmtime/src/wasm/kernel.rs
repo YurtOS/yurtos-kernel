@@ -96,8 +96,16 @@ pub enum ChildState {
 #[derive(Serialize)]
 pub struct ProcessInfo {
     pub pid: i32,
+    pub ppid: i32,
     pub state: &'static str,
     pub exit_code: Option<i32>,
+    pub command: String,
+}
+
+#[derive(Clone)]
+struct ProcessMeta {
+    ppid: i32,
+    command: String,
 }
 
 // ── ProcessKernel ─────────────────────────────────────────────────────────────
@@ -108,6 +116,8 @@ pub struct ProcessKernel {
     fds: HashMap<i32, FdEntry>,
     /// pid → state.
     procs: HashMap<i32, ChildState>,
+    /// pid → metadata surfaced through host_list_processes.
+    process_meta: HashMap<i32, ProcessMeta>,
     next_fd: i32,
     next_pid: i32,
 }
@@ -117,6 +127,7 @@ impl Default for ProcessKernel {
         Self {
             fds: HashMap::new(),
             procs: HashMap::new(),
+            process_meta: HashMap::new(),
             next_fd: 3,
             next_pid: 1,
         }
@@ -193,9 +204,20 @@ impl ProcessKernel {
 
     /// Register a new child process.  Returns its PID.
     pub fn add_process(&mut self, rx: oneshot::Receiver<i32>) -> i32 {
+        self.add_process_with_metadata(rx, 0, String::new())
+    }
+
+    /// Register a new child process with metadata for process-list snapshots.
+    pub fn add_process_with_metadata(
+        &mut self,
+        rx: oneshot::Receiver<i32>,
+        ppid: i32,
+        command: String,
+    ) -> i32 {
         let pid = self.next_pid;
         self.next_pid += 1;
         self.procs.insert(pid, ChildState::Running(rx));
+        self.process_meta.insert(pid, ProcessMeta { ppid, command });
         pid
     }
 
@@ -234,6 +256,7 @@ impl ProcessKernel {
         for pid in pids {
             if let Some(code) = self.poll_exit(pid) {
                 self.procs.remove(&pid);
+                self.process_meta.remove(&pid);
                 return Some((pid, code));
             }
         }
@@ -245,16 +268,26 @@ impl ProcessKernel {
         self.procs
             .iter()
             .map(|(&pid, state)| match state {
-                ChildState::Running(_) => ProcessInfo {
-                    pid,
-                    state: "running",
-                    exit_code: None,
-                },
-                ChildState::Done(code) => ProcessInfo {
-                    pid,
-                    state: "done",
-                    exit_code: Some(*code),
-                },
+                ChildState::Running(_) => {
+                    let meta = self.process_meta.get(&pid);
+                    ProcessInfo {
+                        pid,
+                        ppid: meta.map_or(0, |m| m.ppid),
+                        state: "running",
+                        exit_code: None,
+                        command: meta.map_or_else(String::new, |m| m.command.clone()),
+                    }
+                }
+                ChildState::Done(code) => {
+                    let meta = self.process_meta.get(&pid);
+                    ProcessInfo {
+                        pid,
+                        ppid: meta.map_or(0, |m| m.ppid),
+                        state: "done",
+                        exit_code: Some(*code),
+                        command: meta.map_or_else(String::new, |m| m.command.clone()),
+                    }
+                }
             })
             .collect()
     }

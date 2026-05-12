@@ -519,14 +519,3 @@ return = "int"
 args = [
   { name = "stream", type = "FILE *" },
 ]
-
-[function.yurt_fetch_text]
-doc = "Compatibility fetch helper implemented through host_network_fetch."
-return = "int"
-args = [
-  { name = "url", type = "const char *" },
-  { name = "method", type = "const char *" },
-  { name = "headers_json", type = "const char *" },
-  { name = "body", type = "const char *" },
-  { name = "out_body", type = "char **" },
-]

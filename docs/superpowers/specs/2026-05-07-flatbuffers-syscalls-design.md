@@ -534,7 +534,7 @@ Migrate every existing `kernel-imports.ts` test to the FlatBuffers shape. Files 
 
 ### Layer 4 — C ABI conformance canaries
 
-Existing `abi/conformance/c/` canaries call high-level C ABI functions (`yurt_system`, `yurt_popen`, `yurt_fetch_text`); they don't speak the wire format directly and should pass unchanged after the C-side refactor. New canaries:
+Existing `abi/conformance/c/` canaries call high-level C ABI functions such as `yurt_system` and `yurt_popen`; fetch canaries speak the native fetch record directly so the syscall boundary stays JSON-free. New canaries:
 
 - `fetch-binary-canary.c` — fetch a known binary blob, verify bytes match. Was previously impossible due to base64 round-trip.
 - `spawn-large-env-canary.c` — `posix_spawn` with a 256-entry env vector. Validates the `[EnvVar]` path under realistic load.

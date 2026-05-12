@@ -42,3 +42,21 @@ Deno.test("scoped host imports do not use JSON as their syscall transport", asyn
 
   assertEquals(offenders, []);
 });
+
+Deno.test("fetch ABI exposes the native host primitive without JSON helper aliases", async () => {
+  const files = [
+    new URL("../../../../../abi/contract/yurt_abi.toml", import.meta.url),
+    new URL("../../../../../docs/abi/generated/yurt_abi.h", import.meta.url),
+    new URL("../../../../../docs/abi/native-syscall-abi.md", import.meta.url),
+    new URL("../../../../../abi/include/yurt_abi.h", import.meta.url),
+  ];
+  const offenders: string[] = [];
+  for (const file of files) {
+    const source = await Deno.readTextFile(file);
+    if (source.includes("yurt_fetch_text") || source.includes("headers_json")) {
+      offenders.push(file.pathname);
+    }
+  }
+
+  assertEquals(offenders, []);
+});
