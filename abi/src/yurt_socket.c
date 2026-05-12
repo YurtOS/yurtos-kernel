@@ -48,6 +48,8 @@ YURT_DECLARE_MARKER(listen);
 YURT_DECLARE_MARKER(accept);
 YURT_DECLARE_MARKER(send);
 YURT_DECLARE_MARKER(recv);
+YURT_DECLARE_MARKER(sendmsg);
+YURT_DECLARE_MARKER(recvmsg);
 YURT_DECLARE_MARKER(shutdown);
 
 YURT_DEFINE_MARKER(socket,     0x736f636bu) /* "sock" */
@@ -60,6 +62,8 @@ YURT_DEFINE_MARKER(listen,   0x6c73746eu) /* "lstn" */
 YURT_DEFINE_MARKER(accept,   0x61636370u) /* "accp" */
 YURT_DEFINE_MARKER(send,     0x73656e64u) /* "send" */
 YURT_DEFINE_MARKER(recv,     0x72656376u) /* "recv" */
+YURT_DEFINE_MARKER(sendmsg,  0x736d7367u) /* "smsg" */
+YURT_DEFINE_MARKER(recvmsg,  0x726d7367u) /* "rmsg" */
 YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 
 #define YURT_SOCKET_RESP_CAP 4096
@@ -1080,6 +1084,7 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
 
 /* ── sendmsg: gather iov, collect SCM_RIGHTS, call host_socket_sendmsg ── */
 ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
+  YURT_MARKER_CALL(sendmsg);
   /* Gather iovecs into one buffer */
   size_t total = 0;
   if (!msg) { errno = EINVAL; return -1; }
@@ -1159,6 +1164,7 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
 
 /* ── recvmsg: call host_socket_recvmsg, scatter data, write SCM_RIGHTS ── */
 ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
+  YURT_MARKER_CALL(recvmsg);
   char req[128];
   char resp[YURT_SOCKET_RESP_CAP];
   char data_b64[YURT_SOCKET_RESP_CAP];

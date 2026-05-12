@@ -30,7 +30,7 @@ tier1=(dup2 getgroups sched_getaffinity sched_setaffinity sched_getcpu \
        signal sigaction raise alarm \
        sigemptyset sigfillset sigaddset sigdelset sigismember \
        sigprocmask pthread_sigmask sigsuspend \
-       socketpair)
+       socketpair sendmsg recvmsg)
 nm_out="$("$NM" --defined-only "$ARCHIVE")"
 
 fail=0
