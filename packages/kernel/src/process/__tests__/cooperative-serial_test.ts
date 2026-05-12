@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert@^1.0.19";
+import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.19";
 import { CooperativeSerialBackend } from "../threads/cooperative-serial.ts";
 
 Deno.test("cooperative serial backend returns from spawn while spawned routines run", async () => {
@@ -126,9 +126,17 @@ Deno.test("cooperative serial backend starts immediately detached threads", asyn
 
   const tid = await backend.spawn(1, 0);
   assertEquals(await backend.detach(tid), 0);
-  await Promise.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
 
   assertEquals(started, true);
+});
+
+Deno.test("cooperative serial backend cancels parked detached threads", async () => {
+  const backend = new CooperativeSerialBackend();
+  const parked = backend.parkDetachedThread();
+  backend.cancelDetachedThreads();
+
+  await assertRejects(() => parked);
 });
 
 Deno.test("cooperative serial backend keeps spawned thread stack growth bounded", async () => {

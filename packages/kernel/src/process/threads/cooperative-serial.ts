@@ -123,7 +123,9 @@ export class CooperativeSerialBackend implements ThreadsBackend {
       .finally(() => {
         slot.finished = true;
       });
-    setTimeout(() => slot.start(), 0);
+    setTimeout(() => {
+      if (!this.detachedCancelled) slot.start();
+    }, 0);
     return tid;
   }
 
@@ -140,7 +142,6 @@ export class CooperativeSerialBackend implements ThreadsBackend {
     if (!slot || slot.reaped) return -1;
     slot.detached = true;
     slot.reaped = true;
-    slot.start();
     return 0;
   }
 
@@ -153,15 +154,18 @@ export class CooperativeSerialBackend implements ThreadsBackend {
   }
 
   parkDetachedThread(): Promise<number> {
-    if (this.detachedCancelled) return Promise.resolve(0);
-    return new Promise<number>((resolve) => {
-      const waiter = () => resolve(0);
+    if (this.detachedCancelled) return Promise.reject(new ThreadExit(0));
+    return new Promise<number>((_resolve, reject) => {
+      const waiter = () => reject(new ThreadExit(0));
       this.detachedWaiters.add(waiter);
     });
   }
 
   cancelDetachedThreads(): void {
     this.detachedCancelled = true;
+    for (const slot of this.slots) {
+      if (slot.detached && !slot.started) slot.finished = true;
+    }
     const waiters = [...this.detachedWaiters];
     this.detachedWaiters.clear();
     for (const waiter of waiters) waiter();
