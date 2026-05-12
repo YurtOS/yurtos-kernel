@@ -62,6 +62,14 @@ wraps `wasi-sdk`'s clang with the right `--target=wasm32-wasip1` /
 `yurt-cc` / `yurt-ar` / `yurt-ranlib` as `CC` / `AR` / `RANLIB` directly; see
 `test-fixtures/c-ports/busybox/Makefile`.
 
+`yurt-cc` preserves Clang's raw WASI personality (`__wasi__`) so upstream code
+that has WASI-specific portability branches keeps selecting them. It also
+defines `__yurt__` by default so ports can opt into Yurt's richer POSIX
+compatibility surface without confusing generic WASI detection. Callers can
+explicitly suppress that target marker with `-U__yurt__`. Yurt wrapper headers
+temporarily restore `__wasi__` while including wasi-sdk internals, which keeps
+those headers valid even when a caller deliberately changes the macro state.
+
 ## Phase A delivered
 
 - `stdio-canary`
@@ -81,7 +89,7 @@ wraps `wasi-sdk`'s clang with the right `--target=wasm32-wasip1` /
 The shared runtime currently ships these public headers in
 [`include/`](include):
 
-- [`yurt_abi.h`](include/yurt_abi.h): yurt-specific extension APIs such as `yurt_system()` and `yurt_popen()`
+- [`yurt_abi.h`](include/yurt_abi.h): yurt-specific extension APIs that are not standard libc/POSIX surfaces
 - [`sched.h`](include/sched.h): single-visible-CPU affinity compatibility (`sched_getaffinity`, `sched_setaffinity`, `sched_getcpu`, `CPU_*`)
 - [`unistd.h`](include/unistd.h): narrow POSIX fd, identity, process, and hostname compatibility
 - [`signal.h`](include/signal.h): narrow signal compatibility for `signal`, `sigaction`, `raise`, `alarm`, and basic signal-set helpers

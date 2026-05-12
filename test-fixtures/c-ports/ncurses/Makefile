@@ -2,7 +2,14 @@ REPO_ROOT := $(shell cd ../../.. && pwd)
 FIXTURES := $(REPO_ROOT)/packages/kernel/src/platform/__tests__/fixtures
 NCURSES_VERSION := 6.5
 NCURSES_ARCHIVE := ncurses-$(NCURSES_VERSION).tar.gz
+# Primary URL is Thomas Dickey's canonical archive; GNU's mirror is the
+# fallback. CI has seen invisible-mirror.net time out (both transient
+# outages and IP-range blocks for GitHub Actions runners). Both
+# upstream mirrors carry the same tarball bytes for a given version;
+# adding a SHA-256 pin is a follow-up that needs known-good bytes
+# captured against the maintainer's published hash.
 NCURSES_URL := https://invisible-mirror.net/archives/ncurses/$(NCURSES_ARCHIVE)
+NCURSES_URL_MIRROR := https://ftp.gnu.org/gnu/ncurses/$(NCURSES_ARCHIVE)
 BUILD_DIR := build
 SRC_DIR := src
 INSTALL_DIR := $(abspath $(BUILD_DIR)/install)
@@ -40,7 +47,22 @@ fetch: $(FETCH_STAMP)
 $(FETCH_STAMP):
 	mkdir -p $(BUILD_DIR) $(SRC_DIR)
 	if [ ! -f $(SRC_DIR)/configure ]; then \
-		curl -fL -o $(BUILD_DIR)/$(NCURSES_ARCHIVE) $(NCURSES_URL); \
+		set -e; \
+		ok=0; \
+		for url in $(NCURSES_URL) $(NCURSES_URL_MIRROR); do \
+			echo "fetching ncurses tarball: $$url"; \
+			if curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 \
+				-o $(BUILD_DIR)/$(NCURSES_ARCHIVE) "$$url"; then \
+				ok=1; break; \
+			else \
+				echo "fetch from $$url failed; trying next mirror" >&2; \
+				rm -f $(BUILD_DIR)/$(NCURSES_ARCHIVE); \
+			fi; \
+		done; \
+		if [ "$$ok" != 1 ]; then \
+			echo "all ncurses mirrors unreachable" >&2; \
+			exit 1; \
+		fi; \
 		tar -xzf $(BUILD_DIR)/$(NCURSES_ARCHIVE) -C $(SRC_DIR) --strip-components=1; \
 	fi
 	touch $@

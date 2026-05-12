@@ -21,7 +21,12 @@
 
 #define opendirat   __yurt_hidden_wasilibc_opendirat
 #define scandirat   __yurt_hidden_wasilibc_scandirat
+#pragma push_macro("__wasi__")
+#ifndef __wasi__
+#define __wasi__ 1
+#endif
 #include_next <dirent.h>
+#pragma pop_macro("__wasi__")
 #undef opendirat
 #undef scandirat
 

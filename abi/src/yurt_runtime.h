@@ -6,9 +6,6 @@
 
 #include <yurt_abi.h>
 
-__attribute__((import_module("yurt"), import_name("host_run_command")))
-int yurt_host_run_command(int req_ptr, int req_len, int out_ptr, int out_cap);
-
 __attribute__((import_module("yurt"), import_name("host_dup2")))
 int yurt_host_dup2(int src_fd, int dst_fd);
 
@@ -146,6 +143,9 @@ int yurt_host_thread_join(int tid);
 __attribute__((import_module("yurt"), import_name("host_thread_detach")))
 int yurt_host_thread_detach(int tid);
 
+__attribute__((import_module("yurt"), import_name("host_thread_exit")))
+void yurt_host_thread_exit(int retval) __attribute__((noreturn));
+
 __attribute__((import_module("yurt"), import_name("host_thread_self")))
 int yurt_host_thread_self(void);
 
@@ -279,8 +279,6 @@ int yurt_host_get_local_addr(int out_ptr, int out_cap);
 
 const char *yurt_netdb_host_for_addr(uint32_t addr_be);
 uint32_t yurt_netdb_addr_for_host(const char *host);
-
-int yurt_json_call(const char *json, char **out, size_t *out_len);
 
 /* Process groups and sessions ─────────────────────────────────────────────
  * host_getpgid / host_setpgid / host_getsid / host_setsid route through

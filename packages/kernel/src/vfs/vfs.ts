@@ -561,6 +561,23 @@ export class VFS {
     };
   }
 
+  setTimes(path: string, atime?: Date, mtime?: Date, followSymlinks = true): void {
+    if (this.isProviderMountPath(path)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${path}`);
+    }
+    const match = this.matchProvider(path);
+    if (match) {
+      throw new VfsError('EROFS', `virtual provider timestamps are read-only: ${path}`);
+    }
+
+    const inode = this.resolve(path, followSymlinks);
+    this.assertWritePermission(inode);
+    if (atime) inode.metadata.atime = atime;
+    if (mtime) inode.metadata.mtime = mtime;
+    inode.metadata.ctime = new Date();
+    this.notifyChange();
+  }
+
   readFile(path: string): Uint8Array {
     const match = this.matchProvider(path);
     if (match) {

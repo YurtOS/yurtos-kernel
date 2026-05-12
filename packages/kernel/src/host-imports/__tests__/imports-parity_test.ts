@@ -54,7 +54,6 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_longjmp",
   "host_fork",
   "host_yield",
-  "host_run_command",
   "host_stat",
   "host_read_file",
   "host_write_file",

@@ -3,6 +3,8 @@ import { expect } from '@std/expect';
 import { VFS } from '../vfs.js';
 import { FdTable } from '../fd-table.js';
 import { createPipe } from '../pipe.js';
+import { OverlayVFS } from '../overlay-vfs.ts';
+import { MemoryRoot } from './helpers.ts';
 
 describe('FdTable', () => {
   it('opens a file and returns an fd', () => {
@@ -165,6 +167,37 @@ describe('FdTable', () => {
     fdt.write(fd, new TextEncoder().encode('new'));
     fdt.close(fd);
     expect(new TextDecoder().decode(vfs.readFile('/home/user/test.txt'))).toBe('new');
+  });
+
+  it('flushes writes on close for files created through privileged overlay setup', () => {
+    const base = new MemoryRoot();
+    base.addDir('/tmp', { uid: 0, gid: 0, permissions: 0o777 });
+    const vfs = new OverlayVFS({ base, upper: new VFS() });
+
+    vfs.writeFile('/tmp/out.txt', new Uint8Array(0));
+    const fdt = new FdTable(vfs);
+    const fd = fdt.open('/tmp/out.txt', 'w');
+    fdt.write(fd, new TextEncoder().encode('buffered close flush'));
+    fdt.close(fd);
+
+    expect(new TextDecoder().decode(vfs.readFile('/tmp/out.txt'))).toBe(
+      'buffered close flush',
+    );
+  });
+
+  it('flushes dirty writes with the descriptor credentials, not privileged VFS access', () => {
+    const vfs = new VFS();
+    vfs.withWriteAccess(() => {
+      vfs.writeFile('/root-owned.txt', new TextEncoder().encode('original'), 0o444);
+      vfs.chown('/root-owned.txt', 0, 0);
+    });
+
+    const fdt = new FdTable(vfs, { uid: 1000, gid: 1000 });
+    const fd = fdt.open('/root-owned.txt', 'w');
+    fdt.write(fd, new TextEncoder().encode('bypass'));
+
+    expect(() => fdt.close(fd)).toThrow('permission denied');
+    expect(new TextDecoder().decode(vfs.readFile('/root-owned.txt'))).toBe('original');
   });
 });
 

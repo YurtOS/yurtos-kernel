@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <net/if.h>
 #include <stdio.h>
@@ -7,6 +8,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static void emit(const char *case_name, int exit_code, const char *stdout_line, int has_errno, int errno_value) {
@@ -456,6 +458,85 @@ static int case_fcntl_setfl_masks_access_mode(void) {
   return 0;
 }
 
+static int case_readdir_dot_entries(void) {
+  if (mkdir("/tmp/dirent-canary", 0777) != 0 && errno != EEXIST) {
+    emit("readdir_dot_entries", 1, "readdir_dot_entries:mkdir_failed", 1, errno);
+    return 1;
+  }
+  FILE *f = fopen("/tmp/dirent-canary/file.txt", "wb");
+  if (!f) {
+    emit("readdir_dot_entries", 1, "readdir_dot_entries:fopen_failed", 1, errno);
+    return 1;
+  }
+  if (fputs("ok", f) < 0 || fclose(f) != 0) {
+    emit("readdir_dot_entries", 1, "readdir_dot_entries:fwrite_failed", 1, errno);
+    return 1;
+  }
+
+  DIR *dir = opendir("/tmp/dirent-canary");
+  if (!dir) {
+    emit("readdir_dot_entries", 1, "readdir_dot_entries:opendir_failed", 1, errno);
+    return 1;
+  }
+  int saw_dot = 0;
+  int saw_dotdot = 0;
+  int saw_file = 0;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (strcmp(entry->d_name, ".") == 0) saw_dot = 1;
+    if (strcmp(entry->d_name, "..") == 0) saw_dotdot = 1;
+    if (strcmp(entry->d_name, "file.txt") == 0) saw_file = 1;
+  }
+  int close_rc = closedir(dir);
+  if (close_rc != 0) {
+    emit("readdir_dot_entries", 1, "readdir_dot_entries:closedir_failed", 1, errno);
+    return 1;
+  }
+  if (!saw_dot || !saw_dotdot || !saw_file) {
+    char out[96];
+    snprintf(out, sizeof(out), "readdir_dot_entries:%d:%d:%d", saw_dot, saw_dotdot, saw_file);
+    emit("readdir_dot_entries", 1, out, 0, 0);
+    return 1;
+  }
+  emit("readdir_dot_entries", 0, "readdir_dot_entries:ok", 0, 0);
+  return 0;
+}
+
+static int case_utimes_mtime(void) {
+  FILE *f = fopen("/tmp/utimes-canary.txt", "wb");
+  if (!f) {
+    emit("utimes_mtime", 1, "utimes_mtime:fopen_failed", 1, errno);
+    return 1;
+  }
+  if (fputs("ok", f) < 0 || fclose(f) != 0) {
+    emit("utimes_mtime", 1, "utimes_mtime:fwrite_failed", 1, errno);
+    return 1;
+  }
+
+  struct timeval times[2];
+  times[0].tv_sec = 10;
+  times[0].tv_usec = 0;
+  times[1].tv_sec = 10;
+  times[1].tv_usec = 0;
+  if (utimes("/tmp/utimes-canary.txt", times) != 0) {
+    emit("utimes_mtime", 1, "utimes_mtime:utimes_failed", 1, errno);
+    return 1;
+  }
+  struct stat st;
+  if (stat("/tmp/utimes-canary.txt", &st) != 0) {
+    emit("utimes_mtime", 1, "utimes_mtime:stat_failed", 1, errno);
+    return 1;
+  }
+  if (st.st_mtime != 10) {
+    char out[96];
+    snprintf(out, sizeof(out), "utimes_mtime:%lld", (long long)st.st_mtime);
+    emit("utimes_mtime", 1, out, 0, 0);
+    return 1;
+  }
+  emit("utimes_mtime", 0, "utimes_mtime:ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "hostname") == 0) return case_hostname();
   if (strcmp(name, "hostname_too_small") == 0) return case_hostname_too_small();
@@ -474,6 +555,8 @@ static int run_case(const char *name) {
   if (strcmp(name, "priority_unsupported") == 0) return case_priority_unsupported();
   if (strcmp(name, "fcntl_pipe_status_flags") == 0) return case_fcntl_pipe_status_flags();
   if (strcmp(name, "fcntl_setfl_masks_access_mode") == 0) return case_fcntl_setfl_masks_access_mode();
+  if (strcmp(name, "readdir_dot_entries") == 0) return case_readdir_dot_entries();
+  if (strcmp(name, "utimes_mtime") == 0) return case_utimes_mtime();
   fprintf(stderr, "posix-runtime-canary: unknown case %s\n", name);
   return 2;
 }
@@ -496,6 +579,8 @@ static int list_cases(void) {
   puts("priority_unsupported");
   puts("fcntl_pipe_status_flags");
   puts("fcntl_setfl_masks_access_mode");
+  puts("readdir_dot_entries");
+  puts("utimes_mtime");
   return 0;
 }
 

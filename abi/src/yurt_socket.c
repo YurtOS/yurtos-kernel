@@ -458,6 +458,7 @@ static int yurt_sockname_impl(
   int sockfd,
   struct sockaddr *addr,
   socklen_t *addrlen,
+  const char *kind,
   const char *host_field,
   const char *port_field
 ) {
@@ -499,7 +500,7 @@ static int yurt_sockname_impl(
     int req_len;
     int n;
 
-    req_len = snprintf(req, sizeof(req), "{\"fd\":%d}", sockfd);
+    req_len = snprintf(req, sizeof(req), "{\"fd\":%d,\"kind\":\"%s\"}", sockfd, kind);
     if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
       errno = EOVERFLOW;
       return -1;
@@ -519,12 +520,26 @@ static int yurt_sockname_impl(
 
 int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   YURT_MARKER_CALL(getpeername);
-  return yurt_sockname_impl(sockfd, addr, addrlen, "peer_host", "peer_port");
+  return yurt_sockname_impl(
+    sockfd,
+    addr,
+    addrlen,
+    "peer",
+    "peer_host",
+    "peer_port"
+  );
 }
 
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   YURT_MARKER_CALL(getsockname);
-  return yurt_sockname_impl(sockfd, addr, addrlen, "local_host", "local_port");
+  return yurt_sockname_impl(
+    sockfd,
+    addr,
+    addrlen,
+    "local",
+    "local_host",
+    "local_port"
+  );
 }
 
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {

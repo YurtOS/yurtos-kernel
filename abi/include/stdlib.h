@@ -2,7 +2,12 @@
 #define YURT_COMPAT_STDLIB_H
 
 /* Pull in the real wasi-sdk stdlib.h. */
+#pragma push_macro("__wasi__")
+#ifndef __wasi__
+#define __wasi__ 1
+#endif
 #include_next <stdlib.h>
+#pragma pop_macro("__wasi__")
 
 /* wasi-libc gates mktemp / mkstemp / mkostemp / mkdtemp behind
  * __wasilibc_unmodified_upstream and they are absent from the wasm32-wasip1
@@ -51,6 +56,10 @@ char *mkdtemp(char *tmpl);
 void qsort_r(void *base, size_t nmemb, size_t size,
              int (*compar)(const void *, const void *, void *),
              void *arg);
+
+/* system(3) — wasi-libc omits process creation.  libyurt_abi implements this
+ * with posix_spawn("/bin/sh", "-c", command) and waitpid(). */
+int system(const char *command);
 
 /* PTY helpers — wasi-libc has no /dev/ptmx; stubs let callers compile.
  * grantpt/unlockpt succeed silently; ptsname_r returns ENOSYS. */

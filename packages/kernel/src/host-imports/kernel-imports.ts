@@ -14,7 +14,6 @@
  *   Network / extensions:
  *   - host_network_fetch: HTTP fetch via NetworkBridge (async/JSPI)
  *   - host_extension_invoke: call a host extension (Python only; shell uses host_spawn)
- *   - host_run_command: run a shell command and collect output (async/JSPI, Python subprocess)
  */
 
 import type {
@@ -53,7 +52,7 @@ import {
   unsupportedRuntimeEngineBackend,
 } from "../engine/backend.js";
 import type { ProcessManager } from "../process/manager.js";
-import type { WasiHost } from "../wasi/wasi-host.js";
+import { WasiExitError, type WasiHost } from "../wasi/wasi-host.js";
 import type { ThreadsBackend } from "../process/threads/backend.js";
 import type { VfsLike } from "../vfs/vfs-like.js";
 import type { FdTarget } from "../wasi/fd-target.js";
@@ -67,8 +66,6 @@ import {
   writeString,
 } from "./common.js";
 import { resolveHostname } from "../platform/dns.js";
-import type { RunCommandHandler, RunRequest } from "../run-command.js";
-import type { Sandbox } from "../sandbox.js";
 
 export interface KernelImportsOptions {
   memory: WebAssembly.Memory;
@@ -110,18 +107,6 @@ export interface KernelImportsOptions {
    * extensionRegistry takes precedence.
    */
   extensionHandler?: (cmd: Record<string, unknown>) => Record<string, unknown>;
-
-  /** Run a shell command and collect output. Used by Python _yurt.spawn(). */
-  runCommand?: (
-    cmd: string,
-    stdin: string,
-  ) => Promise<{ exitCode: number; stdout: string; stderr: string }>;
-
-  /** Host-registered handler for guest-issued host_run_command. */
-  runCommandHandler?: RunCommandHandler;
-
-  /** Sandbox instance supplied to RunCommandContext when invoking runCommandHandler. */
-  sandbox?: Sandbox;
 
   /** Called by host_spawn to actually create and start a WASM process.
    *  `parentPid` is the PID of the in-sandbox process making the spawn
@@ -1527,7 +1512,7 @@ export function createKernelImports(
 
       if (nohang) {
         if (pid <= 0) {
-          const result = kernel.waitAnyChildNohang(callerPid);
+          const result = kernel.waitAnyChildStatusNohang(callerPid);
           if (result.state === "running") return ERR_AGAIN;
           if (result.state === "none") return ERR_CHILD;
           return writeWaitResult(
@@ -1536,12 +1521,21 @@ export function createKernelImports(
             outCap,
             result.pid,
             result.exitCode,
+            result.signal,
           );
         }
-        const exitCode = kernel.waitpidNohang(pid, callerPid);
-        if (exitCode === -1) return ERR_AGAIN;
-        if (exitCode < 0) return ERR_CHILD;
-        return writeWaitResult(memory, outPtr, outCap, pid, exitCode);
+        const result = kernel.waitpidStatusNohang(pid, callerPid);
+        if (result.state !== "exited") {
+          return result.code === -1 ? ERR_AGAIN : ERR_CHILD;
+        }
+        return writeWaitResult(
+          memory,
+          outPtr,
+          outCap,
+          pid,
+          result.exitCode,
+          result.signal,
+        );
       }
 
       return (async () => {
@@ -1550,14 +1544,14 @@ export function createKernelImports(
         const signalWait = opts.wasiHost?.waitForSignalDelivery();
         const interrupt = signalWait?.promise ?? new Promise<void>(() => {});
         if (pid <= 0) {
-          const waited = await kernel.waitAnyChildInterruptible(
+          const waited = await kernel.waitAnyChildStatusInterruptible(
             callerPid,
             interrupt,
           );
           signalWait?.cancel();
           if (waited.interrupted) {
             opts.wasiHost?.drainPendingSignals();
-            const result = kernel.waitAnyChildNohang(callerPid);
+            const result = kernel.waitAnyChildStatusNohang(callerPid);
             if (result.state === "exited") {
               return writeWaitResult(
                 memory,
@@ -1565,6 +1559,7 @@ export function createKernelImports(
                 outCap,
                 result.pid,
                 result.exitCode,
+                result.signal,
               );
             }
             return ERR_INTERRUPTED;
@@ -1577,9 +1572,10 @@ export function createKernelImports(
             outCap,
             result.pid,
             result.exitCode,
+            result.signal,
           );
         }
-        const waited = await kernel.waitpidInterruptible(
+        const waited = await kernel.waitpidStatusInterruptible(
           pid,
           callerPid,
           interrupt,
@@ -1587,14 +1583,28 @@ export function createKernelImports(
         signalWait?.cancel();
         if (waited.interrupted) {
           opts.wasiHost?.drainPendingSignals();
-          const exitCode = kernel.waitpidNohang(pid, callerPid);
-          if (exitCode >= 0) {
-            return writeWaitResult(memory, outPtr, outCap, pid, exitCode);
+          const result = kernel.waitpidStatusNohang(pid, callerPid);
+          if (result.state === "exited") {
+            return writeWaitResult(
+              memory,
+              outPtr,
+              outCap,
+              pid,
+              result.exitCode,
+              result.signal,
+            );
           }
           return ERR_INTERRUPTED;
         }
         if (waited.exitCode < 0) return ERR_CHILD;
-        return writeWaitResult(memory, outPtr, outCap, pid, waited.exitCode);
+        return writeWaitResult(
+          memory,
+          outPtr,
+          outCap,
+          pid,
+          waited.exitCode,
+          waited.signal,
+        );
       })();
     },
 
@@ -2639,7 +2649,7 @@ export function createKernelImports(
 
     // host_socket_addr(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Reports sandbox-visible socket address metadata.
-    // Request JSON: { fd }
+    // Request JSON: { fd, kind?: "local" | "peer" }
     // Response JSON: { ok, peer_host, peer_port, local_host, local_port } or { ok: false, error }
     host_socket_addr(
       reqPtr: number,
@@ -2662,7 +2672,8 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
-        const isPeer = req.op === "peer";
+        const kind = req.kind === "peer" ? "peer" : "local";
+        const isPeer = kind === "peer";
 
         // getpeername on an unconnected socket → ENOTCONN
         if (isPeer && !target.peerPath && !target.peerHost) {
@@ -3235,60 +3246,6 @@ export function createKernelImports(
       });
     },
 
-    // host_run_command(req_ptr, req_len, out_ptr, out_cap) -> i32 (async/JSPI)
-    // Runs a shell command and captures output. Used by Python _yurt.spawn().
-    async host_run_command(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
-    ): Promise<number> {
-      if (opts.runCommandHandler && opts.sandbox) {
-        try {
-          const req = JSON.parse(
-            readString(memory, reqPtr, reqLen),
-          ) as RunRequest;
-          const result = await opts.runCommandHandler(req, {
-            sandbox: opts.sandbox,
-          });
-          return writeJson(memory, outPtr, outCap, result);
-        } catch (e: unknown) {
-          const msg = e instanceof Error ? e.message : String(e);
-          return writeJson(memory, outPtr, outCap, {
-            exit_code: 1,
-            stdout: "",
-            stderr: `${msg}\n`,
-          });
-        }
-      }
-      if (!opts.runCommand) {
-        return writeJson(memory, outPtr, outCap, {
-          exit_code: 1,
-          stdout: "",
-          stderr: "subprocess not available\n",
-        });
-      }
-      try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen)) as {
-          cmd: string;
-          stdin?: string;
-        };
-        const result = await opts.runCommand(req.cmd, req.stdin ?? "");
-        return writeJson(memory, outPtr, outCap, {
-          exit_code: result.exitCode,
-          stdout: result.stdout,
-          stderr: result.stderr,
-        });
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, {
-          exit_code: 1,
-          stdout: "",
-          stderr: `${msg}\n`,
-        });
-      }
-    },
-
     // ── Filesystem ──
 
     host_has_tool(namePtr: number, nameLen: number): number {
@@ -3687,6 +3644,12 @@ export function createKernelImports(
       tb.join(tid)) as unknown as WebAssembly.ImportValue;
     imports.host_thread_detach = (async (tid: number) =>
       tb.detach(tid)) as unknown as WebAssembly.ImportValue;
+    imports.host_thread_exit = ((retval: number) => {
+      if (tb.self() === 0) {
+        throw new WasiExitError(0);
+      }
+      return tb.exit(retval);
+    }) as unknown as WebAssembly.ImportValue;
     imports.host_thread_self = (() =>
       tb.self()) as unknown as WebAssembly.ImportValue;
     imports.host_thread_yield = (async () =>

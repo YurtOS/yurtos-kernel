@@ -82,7 +82,6 @@ import {
   type FdTarget,
   TtyHandle,
 } from "./wasi/fd-target.js";
-import type { RunCommandHandler } from "./run-command.js";
 import {
   cooperativeRuntimeEngineBackend,
   normalizeNice,
@@ -134,8 +133,6 @@ export interface SandboxOptions {
   bootArgv?: string[];
   /** Userland-specific imports merged into PID 1's yurt import namespace. */
   bootImports?: (api: KernelApi) => Record<string, WebAssembly.ImportValue>;
-  /** Host callback for guest subprocess shims such as Python _yurt.spawn(). */
-  runCommandHandler?: RunCommandHandler;
   /** Network policy for guest programs. If omitted, network access is disabled. */
   network?: NetworkPolicy;
   /** Optional network bridge override. Primarily used by tests and alternate embeddings. */
@@ -189,7 +186,6 @@ interface SandboxParts {
   storage?: StorageCallbacks;
   bootArgv: string[];
   bootImports?: (api: KernelApi) => Record<string, WebAssembly.ImportValue>;
-  runCommandHandler?: RunCommandHandler;
 }
 
 interface PasswdEntry {
@@ -233,7 +229,6 @@ export class Sandbox {
   private bootImports:
     | ((api: KernelApi) => Record<string, WebAssembly.ImportValue>)
     | undefined;
-  private runCommandHandler: RunCommandHandler | undefined;
   private activeDeadlineMs: number | undefined;
   private envNeedsSync = false;
   /**
@@ -272,7 +267,6 @@ export class Sandbox {
     this.storage = parts.storage ?? null;
     this.bootArgv = parts.bootArgv;
     this.bootImports = parts.bootImports;
-    this.runCommandHandler = parts.runCommandHandler;
     this.envNeedsSync = parts.env.size > 0;
   }
 
@@ -467,8 +461,6 @@ export class Sandbox {
       serverSockets: options.serverSockets,
       runtimeBackend,
       extensionRegistry,
-      runCommandHandler: options.runCommandHandler,
-      getSandbox: () => sandboxRef,
       getDeadlineMs: () => sandboxRef?.activeDeadlineMs,
       memoryBytes: secLimits?.memoryBytes,
       stdoutLimit: secLimits?.stdoutBytes,
@@ -713,7 +705,6 @@ export class Sandbox {
       storage: options.storage,
       bootArgv,
       bootImports: options.bootImports,
-      runCommandHandler: options.runCommandHandler,
     });
     sandboxRef = sb;
 
@@ -1021,8 +1012,6 @@ export class Sandbox {
     serverSockets?: SocketListenPolicy;
     runtimeBackend: RuntimeEngineBackend;
     extensionRegistry: ExtensionRegistry;
-    runCommandHandler?: RunCommandHandler;
-    getSandbox: () => Sandbox | undefined;
     getDeadlineMs?: () => number | undefined;
     memoryBytes?: number;
     stdoutLimit?: number;
@@ -1041,8 +1030,6 @@ export class Sandbox {
       serverSockets,
       runtimeBackend,
       extensionRegistry,
-      runCommandHandler,
-      getSandbox,
       getDeadlineMs,
       memoryBytes,
       stdoutLimit,
@@ -1072,8 +1059,8 @@ export class Sandbox {
       adapter,
       kernel,
       allocatePid,
-      releasePid: (pid, exitCode) => {
-        kernel.releaseProcess(pid, exitCode);
+      releasePid: (pid, exitCode, signal) => {
+        kernel.releaseProcess(pid, exitCode, signal);
         processes.delete(pid);
       },
       buildWasiHost: (pid, argv, env, cwd) => {
@@ -1090,7 +1077,13 @@ export class Sandbox {
           socketRegistry: socketBackend?.registry,
         });
       },
-      buildKernelImports: (pid, memory, wasiHost, threadsBackend, mainInstance) => {
+      buildKernelImports: (
+        pid,
+        memory,
+        wasiHost,
+        threadsBackend,
+        mainInstance,
+      ) => {
         const kernelImports = createKernelImports({
           memory,
           callerPid: pid,
@@ -1105,32 +1098,12 @@ export class Sandbox {
           mgr,
           nativeModules: mgr.nativeModules,
           threadsBackend,
+          // Phase 1 shared-library loader reads this to call back into
+          // the main module's __alloc / __indirect_function_table.
+          // sandbox.ts used to drop this arg silently, leaving dlopen
+          // with "main module not ready" — see PR #23 + the abi_test
+          // dlopen-canary happy_path case.
           mainInstance,
-          runCommand: async (cmd, stdin) => {
-            const sandbox = getSandbox();
-            if (!sandbox) {
-              return { exitCode: 1, stdout: "", stderr: "sandbox not ready\n" };
-            }
-            if (runCommandHandler) {
-              const result = await runCommandHandler(
-                { cmd, stdin },
-                { sandbox },
-              );
-              return {
-                exitCode: result.exit_code,
-                stdout: result.stdout,
-                stderr: result.stderr,
-              };
-            }
-            const result = await sandbox.runBootCommandInFreshProcess(cmd, {
-              stdinData: stdin ? new TextEncoder().encode(stdin) : undefined,
-            });
-            return {
-              exitCode: result.exitCode,
-              stdout: result.stdout,
-              stderr: result.stderr,
-            };
-          },
           spawnProcess: (req, fdTable) => {
             const commandLabel = req.argv0 ?? req.prog;
             const childPid = kernel.allocPid(pid);
@@ -1241,13 +1214,15 @@ export class Sandbox {
       return { loaderArgv: argv, wasiArgv: argv };
     }
     const argv0Override = req.argv0;
+    const isShCommand = req.prog === "sh" || req.prog.endsWith("/sh");
     const overriddenShCommand = argv0Override !== undefined &&
-      (req.prog === "sh" || req.prog.endsWith("/sh")) &&
+      isShCommand &&
       req.args.length === 2 && req.args[0] === "-c";
+    const shellArgv0 = isShCommand ? req.prog.split("/").at(-1)! : prog;
     return {
       loaderArgv: [prog, ...req.args],
       wasiArgv: overriddenShCommand
-        ? [req.prog, "-c", req.args[1], argv0Override]
+        ? [shellArgv0, "-c", req.args[1], argv0Override]
         : [argv0Override ?? prog, ...req.args],
     };
   }
@@ -1514,22 +1489,6 @@ export class Sandbox {
     options?: { stdinData?: Uint8Array },
   ): Promise<RunResult> {
     return await this.callBootCommand(this.bootProcess, command, options);
-  }
-
-  private async runBootCommandInFreshProcess(
-    command: string,
-    options?: { stdinData?: Uint8Array },
-  ): Promise<RunResult> {
-    const child = await this.spawn(this.bootArgv, {
-      mode: "resident",
-      env: Object.fromEntries(this.env),
-      bootImports: this.bootImports,
-    });
-    try {
-      return await this.callBootCommand(child, command, options);
-    } finally {
-      await child.terminate();
-    }
   }
 
   private async callBootCommand(
@@ -1864,8 +1823,6 @@ export class Sandbox {
       serverSockets: this.serverSockets,
       runtimeBackend: this.runtimeBackend,
       extensionRegistry: this.extensionRegistry ?? new ExtensionRegistry(),
-      runCommandHandler: this.runCommandHandler,
-      getSandbox: () => this,
       getDeadlineMs: () => this.activeDeadlineMs,
       memoryBytes: this.security?.limits?.memoryBytes,
       stdoutLimit: this.security?.limits?.stdoutBytes,
@@ -2153,8 +2110,6 @@ export class Sandbox {
       serverSockets: this.serverSockets,
       runtimeBackend: this.runtimeBackend,
       extensionRegistry: this.extensionRegistry ?? new ExtensionRegistry(),
-      runCommandHandler: this.runCommandHandler,
-      getSandbox: () => childRef,
       getDeadlineMs: () => childRef?.activeDeadlineMs,
       memoryBytes: this.security?.limits?.memoryBytes,
       stdoutLimit: this.security?.limits?.stdoutBytes,
@@ -2218,7 +2173,6 @@ export class Sandbox {
       storage: this.storage ?? undefined,
       bootArgv: this.bootArgv,
       bootImports: this.bootImports,
-      runCommandHandler: this.runCommandHandler,
       moduleCache: this.moduleCache,
     });
     childRef = child;
@@ -2278,7 +2232,6 @@ export function createProcessLoaderContextForVfs(opts: {
     processes: opts.processes,
     runtimeBackend: opts.runtimeBackend ?? unsupportedRuntimeEngineBackend,
     extensionRegistry: new ExtensionRegistry(),
-    getSandbox: () => undefined,
     moduleCache: opts.moduleCache,
     stdoutLimit: opts.stdoutLimit,
     stderrLimit: opts.stderrLimit,
