@@ -39,6 +39,15 @@
 #define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 #endif
 
+/* SO_PEERCRED / struct ucred are Linux extensions absent in POSIX sysroots. */
+#ifndef SO_PEERCRED
+#define SO_PEERCRED 17
+#endif
+#ifndef _HAVE_STRUCT_UCRED
+#define _HAVE_STRUCT_UCRED
+struct ucred { pid_t pid; uid_t uid; gid_t gid; };
+#endif
+
 /* Print one JSONL trace line. Same convention as dup2-canary.c. */
 static void emit(const char *case_name,
                  int exit_code,
@@ -579,6 +588,157 @@ static int case_peercred_after_accept(void) {
   return 1;
 }
 
+/* sendto a dgram path after unlink() must fail, not silently deliver. */
+static int case_dgram_sendto_after_unlink(void) {
+  const char *path = "/tmp/yurt-dgram-unlink.sock";
+  struct sockaddr_un addr;
+  int server_fd, client_fd;
+  ssize_t n;
+
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+  socklen_t addrlen = (socklen_t)sizeof(addr);
+
+  server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (server_fd < 0) { emit("dgram_sendto_after_unlink", 1, NULL, 1, errno); return 1; }
+  client_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (client_fd < 0) {
+    emit("dgram_sendto_after_unlink", 1, NULL, 1, errno);
+    close(server_fd); return 1;
+  }
+
+  unlink(path);
+  if (bind(server_fd, (struct sockaddr *)&addr, addrlen) != 0) {
+    emit("dgram_sendto_after_unlink", 1, "bind-fail", 1, errno);
+    close(server_fd); close(client_fd); return 1;
+  }
+
+  /* Unlink the path — the route should be invalidated. */
+  unlink(path);
+
+  n = sendto(client_fd, "ping", 4, 0, (struct sockaddr *)&addr, addrlen);
+  close(server_fd);
+  close(client_fd);
+
+  if (n < 0) {
+    /* sendto failed as expected after unlink */
+    emit("dgram_sendto_after_unlink", 0, "dgram-unlink=ok", 0, 0);
+    return 0;
+  }
+  emit("dgram_sendto_after_unlink", 1, "sendto-succeeded-after-unlink", 0, 0);
+  return 1;
+}
+
+/* SCM_RIGHTS truncation: excess sender fds must not leak. Verifies the
+   received fd is valid and the truncated case does not crash. */
+static int case_scm_rights_truncation(void) {
+  int sv[2];
+  int pipefd[3][2]; /* 3 pipes, send write ends */
+  char buf[8];
+  ssize_t n;
+  int received_fd = -1;
+
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    emit("scm_rights_truncation", 1, NULL, 1, errno); return 1;
+  }
+  for (int i = 0; i < 3; i++) {
+    if (pipe(pipefd[i]) != 0) {
+      emit("scm_rights_truncation", 1, "pipe-fail", 1, errno);
+      close(sv[0]); close(sv[1]);
+      for (int j = 0; j < i; j++) { close(pipefd[j][0]); close(pipefd[j][1]); }
+      return 1;
+    }
+  }
+
+  /* Send all three write ends via SCM_RIGHTS */
+  {
+    struct msghdr mhdr;
+    struct iovec iov;
+    char ctrl[CMSG_SPACE(3 * sizeof(int))];
+    struct cmsghdr *cmsg;
+    char dummy = 'y';
+
+    memset(&mhdr, 0, sizeof(mhdr));
+    iov.iov_base = &dummy; iov.iov_len = 1;
+    mhdr.msg_iov = &iov; mhdr.msg_iovlen = 1;
+    mhdr.msg_control = ctrl;
+    mhdr.msg_controllen = sizeof(ctrl);
+
+    cmsg = CMSG_FIRSTHDR(&mhdr);
+    cmsg->cmsg_len = CMSG_LEN(3 * sizeof(int));
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    memcpy(CMSG_DATA(cmsg), &pipefd[0][1], sizeof(int));
+    memcpy(CMSG_DATA(cmsg) + sizeof(int), &pipefd[1][1], sizeof(int));
+    memcpy(CMSG_DATA(cmsg) + 2 * sizeof(int), &pipefd[2][1], sizeof(int));
+    mhdr.msg_controllen = cmsg->cmsg_len;
+
+    if (sendmsg(sv[0], &mhdr, 0) < 0) {
+      emit("scm_rights_truncation", 1, "sendmsg-fail", 1, errno);
+      close(sv[0]); close(sv[1]);
+      for (int i = 0; i < 3; i++) { close(pipefd[i][0]); close(pipefd[i][1]); }
+      return 1;
+    }
+    /* Sender closes its copies of the write ends */
+    for (int i = 0; i < 3; i++) close(pipefd[i][1]);
+  }
+
+  /* Receive with a control buffer that fits only 1 fd */
+  {
+    struct msghdr mhdr;
+    struct iovec iov;
+    char ctrl[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr *cmsg;
+    char dummy;
+
+    memset(&mhdr, 0, sizeof(mhdr));
+    iov.iov_base = &dummy; iov.iov_len = 1;
+    mhdr.msg_iov = &iov; mhdr.msg_iovlen = 1;
+    mhdr.msg_control = ctrl;
+    mhdr.msg_controllen = sizeof(ctrl);
+
+    n = recvmsg(sv[1], &mhdr, 0);
+    if (n < 0) {
+      emit("scm_rights_truncation", 1, "recvmsg-fail", 1, errno);
+      close(sv[0]); close(sv[1]);
+      for (int i = 0; i < 3; i++) close(pipefd[i][0]);
+      return 1;
+    }
+    cmsg = CMSG_FIRSTHDR(&mhdr);
+    if (cmsg && cmsg->cmsg_type == SCM_RIGHTS) {
+      memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+    }
+  }
+
+  close(sv[0]); close(sv[1]);
+
+  if (received_fd < 0) {
+    emit("scm_rights_truncation", 1, "no-fd-received", 0, 0);
+    for (int i = 0; i < 3; i++) close(pipefd[i][0]);
+    return 1;
+  }
+
+  /* Verify the received fd works */
+  if (write(received_fd, "ok", 2) != 2) {
+    emit("scm_rights_truncation", 1, "write-fail", 1, errno);
+    close(received_fd);
+    for (int i = 0; i < 3; i++) close(pipefd[i][0]);
+    return 1;
+  }
+  close(received_fd);
+
+  n = read(pipefd[0][0], buf, sizeof(buf));
+  for (int i = 0; i < 3; i++) close(pipefd[i][0]);
+
+  if (n == 2 && memcmp(buf, "ok", 2) == 0) {
+    emit("scm_rights_truncation", 0, "scm-trunc=ok", 0, 0);
+    return 0;
+  }
+  emit("scm_rights_truncation", 1, "pipe-mismatch", 0, 0);
+  return 1;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "pair_basic") == 0)                 return case_pair_basic();
   if (strcmp(name, "bind_listen_accept") == 0)         return case_bind_listen_accept();
@@ -591,6 +751,8 @@ static int run_case(const char *name) {
   if (strcmp(name, "dgram_path_sendto") == 0)          return case_dgram_path_sendto();
   if (strcmp(name, "scm_rights_pipe_handoff") == 0)    return case_scm_rights_pipe_handoff();
   if (strcmp(name, "peercred_after_accept") == 0)      return case_peercred_after_accept();
+  if (strcmp(name, "dgram_sendto_after_unlink") == 0)  return case_dgram_sendto_after_unlink();
+  if (strcmp(name, "scm_rights_truncation") == 0)      return case_scm_rights_truncation();
   fprintf(stderr, "unix-canary: unknown case %s\n", name);
   return 2;
 }
@@ -607,6 +769,8 @@ static int list_cases(void) {
   puts("dgram_path_sendto");
   puts("scm_rights_pipe_handoff");
   puts("peercred_after_accept");
+  puts("dgram_sendto_after_unlink");
+  puts("scm_rights_truncation");
   return 0;
 }
 

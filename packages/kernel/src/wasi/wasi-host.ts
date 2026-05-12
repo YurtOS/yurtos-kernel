@@ -2079,6 +2079,7 @@ export class WasiHost {
           const s = this.vfs.stat(absPath);
           if (s.type === 'socket') {
             this.socketRegistry.closePathListener(absPath);
+            this.socketRegistry.removeDgramRoute(absPath);
           }
         } catch {
           // stat failure is fine — unlink will surface the real error below

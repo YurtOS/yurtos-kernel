@@ -237,6 +237,30 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toContain('{"case":"peercred_after_accept","exit":0,"stdout":"peercred=ok"}');
   });
+
+  it("dgram_sendto_after_unlink: sendto a dgram path after unlink must fail", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case dgram_sendto_after_unlink");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"dgram_sendto_after_unlink","exit":0,"stdout":"dgram-unlink=ok"}');
+  });
+
+  it("scm_rights_truncation: recvmsg with small control buffer receives one fd and does not crash", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case scm_rights_truncation");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"scm_rights_truncation","exit":0,"stdout":"scm-trunc=ok"}');
+  });
 });
 
 describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }, () => {

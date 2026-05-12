@@ -644,6 +644,11 @@ export class ListenerRegistry {
     this.closeListener(listenerHandle);
   }
 
+  /** Remove a DGRAM route for a pathname without closing the socket fd. */
+  removeDgramRoute(path: string): void {
+    this.dgramRoutes.delete(`DGRAM:${path}`);
+  }
+
   /**
    * Create a socketpair() — two connected AF_UNIX sockets, no listener.
    * Returns raw registry handles (positive ints). Callers in kernel-imports

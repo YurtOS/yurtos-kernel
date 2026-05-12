@@ -3118,9 +3118,10 @@ export function createKernelImports(
         const anc = ancBefore ?? registry.popWaiterAnc(rawHandle);
         const view = new DataView(memory.buffer);
         let nFds = 0;
-        if (anc && fdsPtr !== 0 && fdsCap > 0) {
+        if (anc) {
           const senderPid = anc.senderPid;
-          for (const dupFd of anc.fds.slice(0, fdsCap)) {
+          const toReceive = fdsPtr !== 0 && fdsCap > 0 ? anc.fds.slice(0, fdsCap) : [];
+          for (const dupFd of toReceive) {
             try {
               const newFd = opts.kernel.dupFromProcess(callerPid, senderPid, dupFd);
               view.setInt32(fdsPtr + nFds * 4, newFd, true);
@@ -3128,6 +3129,10 @@ export function createKernelImports(
             } finally {
               opts.kernel.closeFd(senderPid, dupFd);
             }
+          }
+          // Close excess sender-side duplicates that didn't fit in the control buffer.
+          for (const dupFd of anc.fds.slice(toReceive.length)) {
+            opts.kernel.closeFd(senderPid, dupFd);
           }
         }
         if (nFdsPtr !== 0) view.setInt32(nFdsPtr, nFds, true);
