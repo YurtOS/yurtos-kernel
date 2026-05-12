@@ -102,8 +102,9 @@ jobs:
         run: deno lint packages/microkernel-js/ packages/microkernel-deno/
       - name: Test
         run: |
-          deno test --no-check --allow-read --allow-env --allow-run \
-            packages/microkernel-js/__tests__/
+          deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run \
+            packages/microkernel-js/__tests__/ \
+            packages/microkernel-deno/__tests__/
 
   # NOTE: a `hooks-self-check` job that runs `pre-commit run --all-files`
   # belongs in this file but is intentionally omitted from the initial gates

@@ -86,6 +86,13 @@ pub trait VfsBackend: Send {
     /// to `kh_real_open` so the write bit reaches the host.
     fn open(&mut self, path: &[u8], flags: u32) -> Option<u64>;
 
+    /// Optional errno from the last failed `open`. Most in-kernel
+    /// backends use `None` so the caller maps failure to ENOENT or
+    /// EPERM. HostFsBackend uses this to preserve host/policy errno.
+    fn take_open_error(&mut self) -> Option<i32> {
+        None
+    }
+
     /// Truncate the file's content to length zero.
     fn truncate(&mut self, inode: u64);
 
@@ -273,6 +280,17 @@ impl MountTable {
             .backend
             .open(&rel, flags)
             .map(|inode| (id, inode))
+    }
+
+    pub fn open_result(&mut self, path: &[u8], flags: u32) -> Result<(MountId, u64), i32> {
+        let Some((id, rel)) = self.resolve(path) else {
+            return Err(crate::abi::ENOENT);
+        };
+        let backend = &mut self.mounts[id as usize].backend;
+        match backend.open(&rel, flags) {
+            Some(inode) => Ok((id, inode)),
+            None => Err(backend.take_open_error().unwrap_or(crate::abi::ENOENT)),
+        }
     }
 
     pub fn truncate(&mut self, mount_id: MountId, inode: u64) {
@@ -1355,6 +1373,7 @@ pub struct HostFsBackend {
     /// open; lookups for the same path return the same fd until
     /// close.
     paths: BTreeMap<Vec<u8>, u64>,
+    last_open_error: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -1375,6 +1394,7 @@ impl HostFsBackend {
         Self {
             fds: BTreeMap::new(),
             paths: BTreeMap::new(),
+            last_open_error: None,
         }
     }
 }
@@ -1387,6 +1407,7 @@ impl Default for HostFsBackend {
 
 impl VfsBackend for HostFsBackend {
     fn open(&mut self, path: &[u8], flags: u32) -> Option<u64> {
+        self.last_open_error = None;
         // Cached: re-use the existing host-fd / inode mapping. The
         // cached fd was opened with whatever flags the *first*
         // caller used; subsequent opens with different flags share
@@ -1399,10 +1420,10 @@ impl VfsBackend for HostFsBackend {
         // Cold path: ask the host. The microkernel applies the
         // policy gate (`PolicyEnforcer::may_open_path`) and root
         // canonicalization before touching the real disk — a Deny
-        // returns -EACCES which we map to None (lookup miss →
-        // ENOENT in the syscall).
+        // returns a negative errno which sys_open must preserve.
         let host_fd = crate::kh::real_open(path, flags, 0);
         if host_fd < 0 {
+            self.last_open_error = Some(-host_fd);
             return None;
         }
         let inode = host_fd as u64;
@@ -1417,6 +1438,10 @@ impl VfsBackend for HostFsBackend {
             },
         );
         Some(inode)
+    }
+
+    fn take_open_error(&mut self) -> Option<i32> {
+        self.last_open_error.take()
     }
 
     fn truncate(&mut self, _inode: u64) {

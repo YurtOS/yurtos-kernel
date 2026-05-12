@@ -263,6 +263,9 @@ mod tests {
     #[test]
     fn kernel_kill_export_uses_kernel_signal_validation() {
         let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(7);
+        });
         assert_eq!(unsafe { kernel_kill(7, 15) }, 0);
         assert_eq!(unsafe { kernel_kill(7, 64) }, -(abi::EINVAL as i64));
     }

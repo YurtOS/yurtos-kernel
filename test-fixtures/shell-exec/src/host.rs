@@ -18,9 +18,8 @@ pub struct FetchResult {
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
     pub body: String,
-    /// Base64-encoded response body for lossless binary content.
-    #[serde(default)]
-    pub body_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_body: Vec<u8>,
     pub error: Option<String>,
 }
 
@@ -51,31 +50,46 @@ struct YurtSpawnResult {
 
 impl FetchResult {
     /// Decode the response body as raw bytes (lossless).
-    /// Uses body_base64 if available, falls back to body.as_bytes().
     pub fn body_bytes(&self) -> Vec<u8> {
-        if let Some(ref b64) = self.body_base64 {
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
-                .unwrap_or_else(|_| self.body.as_bytes().to_vec())
-        } else {
+        if self.raw_body.is_empty() {
             self.body.as_bytes().to_vec()
+        } else {
+            self.raw_body.clone()
         }
     }
 }
 
-#[cfg(target_arch = "wasm32")]
-const YURT_FETCH_REDIRECT_MANUAL: u32 = 1;
+#[cfg(test)]
+mod tests {
+    use super::FetchResult;
+
+    #[test]
+    fn fetch_result_body_bytes_preserves_raw_body() {
+        let result = FetchResult {
+            ok: true,
+            status: 200,
+            headers: Default::default(),
+            body: String::from_utf8_lossy(&[0xff, 0x00, 0x41]).into_owned(),
+            raw_body: vec![0xff, 0x00, 0x41],
+            error: None,
+        };
+
+        assert_eq!(result.body_bytes(), vec![0xff, 0x00, 0x41]);
+    }
+}
 
 #[cfg(target_arch = "wasm32")]
-const YURT_AF_INET: i32 = 1;
-
+const FETCH_RECORD_VERSION: u16 = 1;
 #[cfg(target_arch = "wasm32")]
-const YURT_SOCK_STREAM: i32 = 6;
-
+const FETCH_FLAG_MANUAL_REDIRECT: u16 = 1;
 #[cfg(target_arch = "wasm32")]
-const YURT_SOCKET_FLAG_TLS: i32 = 1;
-
+const FETCH_RESPONSE_FLAG_OK: u16 = 1;
 #[cfg(target_arch = "wasm32")]
-const YURT_MSG_NONE: i32 = 0;
+const FILETYPE_DIRECTORY: u32 = 3;
+#[cfg(target_arch = "wasm32")]
+const FILETYPE_REGULAR_FILE: u32 = 4;
+#[cfg(target_arch = "wasm32")]
+const FILETYPE_SYMBOLIC_LINK: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatInfo {
@@ -292,7 +306,7 @@ extern "C" {
         mode: u32,
     ) -> i32;
 
-    /// List directory entries as a native string-list record.
+    /// List directory entries as packed binary records.
     pub fn host_readdir(path_ptr: *const u8, path_len: u32, out_ptr: *mut u8, out_cap: u32) -> i32;
 
     /// Create a directory (and parents).
@@ -304,7 +318,7 @@ extern "C" {
     /// Set file mode bits.
     pub fn host_chmod(path_ptr: *const u8, path_len: u32, mode: u32) -> i32;
 
-    /// Glob pattern match as a native string-list record.
+    /// Glob pattern match as a packed binary string list.
     pub fn host_glob(
         pattern_ptr: *const u8,
         pattern_len: u32,
@@ -327,7 +341,7 @@ extern "C" {
     pub fn host_readlink(path_ptr: *const u8, path_len: u32, out_ptr: *mut u8, out_cap: u32)
         -> i32;
 
-    /// Perform an HTTP fetch. Native request/response via output buffer.
+    /// Perform an HTTP fetch. Binary fetch request/response via output buffer.
     /// Async on the host side; JSPI suspends/resumes WASM transparently.
     pub fn host_network_fetch(
         req_ptr: *const u8,
@@ -384,27 +398,18 @@ extern "C" {
     /// JSPI-suspending — allows other WASM stacks to run.
     fn host_yield();
 
-    /// List all processes. Writes yurt_process_list_response_v1 to output buffer.
+    /// List all processes. Writes JSON array to output buffer.
     fn host_list_processes(out_ptr: *mut u8, out_cap: u32) -> i32;
 
     // ----- Socket syscalls (full mode) -----
 
-    /// Open a socket and return a host fd.
-    fn host_socket_open(domain: i32, type_: i32, protocol: i32) -> i32;
+    /// Open a TCP socket from UTF-8 `host:port` bytes. Returns fd or -errno.
+    fn host_socket_connect(addr_ptr: *const u8, addr_len: u32, flags: i32) -> i32;
 
-    /// Connect a socket fd.
-    fn host_socket_connect(
-        fd: i32,
-        host_ptr: *const u8,
-        host_len: u32,
-        port: u32,
-        flags: u32,
-    ) -> i32;
-
-    /// Send raw bytes on a socket.
+    /// Send raw bytes on a socket. Returns bytes written or -errno.
     fn host_socket_send(fd: i32, data_ptr: *const u8, data_len: u32, flags: i32) -> i32;
 
-    /// Receive raw bytes from a socket.
+    /// Receive raw bytes from a socket. Returns bytes read or -errno.
     fn host_socket_recv(fd: i32, out_ptr: *mut u8, out_cap: u32, flags: i32) -> i32;
 
     /// Close a socket fd.
@@ -448,15 +453,6 @@ fn call_with_outbuf<F>(context: &str, f: F) -> Result<String, HostError>
 where
     F: Fn(*mut u8, u32) -> i32,
 {
-    let buf = call_with_outbuf_bytes(context, f)?;
-    String::from_utf8(buf).map_err(|e| HostError::Other(format!("invalid UTF-8 from host: {e}")))
-}
-
-#[cfg(target_arch = "wasm32")]
-fn call_with_outbuf_bytes<F>(context: &str, f: F) -> Result<Vec<u8>, HostError>
-where
-    F: Fn(*mut u8, u32) -> i32,
-{
     let mut buf: Vec<u8> = vec![0u8; DEFAULT_OUTBUF_CAP];
     let n = f(buf.as_mut_ptr(), buf.len() as u32);
     if n < 0 {
@@ -474,291 +470,206 @@ where
     } else {
         buf.truncate(n);
     }
+    String::from_utf8(buf).map_err(|e| HostError::Other(format!("invalid UTF-8 from host: {e}")))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn call_with_outbuf_bytes<F>(context: &str, f: F) -> Result<Vec<u8>, HostError>
+where
+    F: Fn(*mut u8, u32) -> i32,
+{
+    let mut buf: Vec<u8> = vec![0u8; DEFAULT_OUTBUF_CAP];
+    let n = f(buf.as_mut_ptr(), buf.len() as u32);
+    if n < 0 {
+        return Err(rc_to_error(n, context));
+    }
+    let n = n as usize;
+    if n > buf.len() {
+        buf.resize(n, 0);
+        let n2 = f(buf.as_mut_ptr(), buf.len() as u32);
+        if n2 < 0 {
+            return Err(rc_to_error(n2, context));
+        }
+        buf.truncate(n2 as usize);
+    } else {
+        buf.truncate(n);
+    }
     Ok(buf)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn read_u16_le(bytes: &[u8], offset: usize) -> Option<u16> {
-    bytes
-        .get(offset..offset + 2)
-        .map(|v| u16::from_le_bytes([v[0], v[1]]))
+fn write_u16(out: &mut [u8], offset: usize, value: u16) {
+    out[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
 
 #[cfg(target_arch = "wasm32")]
-fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
-    bytes
-        .get(offset..offset + 4)
-        .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+fn write_u32(out: &mut [u8], offset: usize, value: u32) {
+    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 #[cfg(target_arch = "wasm32")]
-fn read_i32_le(bytes: &[u8], offset: usize) -> Option<i32> {
-    bytes
-        .get(offset..offset + 4)
-        .map(|v| i32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
 
 #[cfg(target_arch = "wasm32")]
-fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
-    bytes
-        .get(offset..offset + 8)
-        .map(|v| u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]))
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }
 
 #[cfg(target_arch = "wasm32")]
-fn decode_stat_record(bytes: &[u8], context: &str) -> Result<StatInfo, HostError> {
-    let size = read_u32_le(bytes, 0).unwrap_or(0) as usize;
-    let version = read_u16_le(bytes, 4).unwrap_or(0);
-    if size != 32 || bytes.len() < size || version != 1 {
-        return Err(HostError::IoError(format!(
-            "stat {context}: invalid native stat record"
-        )));
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decode_stat_record(bytes: &[u8]) -> Result<StatInfo, HostError> {
+    if bytes.len() < 16 {
+        return Err(HostError::IoError("stat: short response".to_owned()));
     }
-    let type_bits = read_u32_le(bytes, 8).unwrap_or(0);
+    let size = read_u64(bytes, 0);
+    let filetype = read_u32(bytes, 8);
+    let mode = read_u32(bytes, 12);
     Ok(StatInfo {
         exists: true,
-        is_file: type_bits & 1 != 0,
-        is_dir: type_bits & 2 != 0,
-        is_symlink: type_bits & 4 != 0,
-        size: read_u64_le(bytes, 16).unwrap_or(0),
-        mode: read_u32_le(bytes, 12).unwrap_or(0),
-        mtime_ms: read_u64_le(bytes, 24).unwrap_or(0),
+        is_file: filetype == FILETYPE_REGULAR_FILE,
+        is_dir: filetype == FILETYPE_DIRECTORY,
+        is_symlink: filetype == FILETYPE_SYMBOLIC_LINK,
+        size,
+        mode,
+        mtime_ms: 0,
     })
 }
 
 #[cfg(target_arch = "wasm32")]
-fn decode_string_list_record(bytes: &[u8], context: &str) -> Result<Vec<String>, HostError> {
-    let size = read_u32_le(bytes, 0).unwrap_or(0) as usize;
-    let version = read_u16_le(bytes, 4).unwrap_or(0);
-    let count = read_u32_le(bytes, 8).unwrap_or(0) as usize;
-    let entries_offset = read_u32_le(bytes, 12).unwrap_or(0) as usize;
-    let strings_offset = read_u32_le(bytes, 16).unwrap_or(0) as usize;
-    let strings_len = read_u32_le(bytes, 20).unwrap_or(0) as usize;
-    if version != 1
-        || size > bytes.len()
-        || entries_offset + count.saturating_mul(8) > size
-        || strings_offset + strings_len > size
-    {
-        return Err(HostError::IoError(format!(
-            "{context}: invalid native string-list record"
-        )));
+fn decode_readdir_record(bytes: &[u8]) -> Result<Vec<String>, HostError> {
+    if bytes.len() < 4 {
+        return Err(HostError::IoError("readdir: short response".to_owned()));
     }
+    let count = read_u32(bytes, 0) as usize;
+    let mut offset = 4usize;
     let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let entry = entries_offset + i * 8;
-        let offset = read_u32_le(bytes, entry).unwrap_or(0) as usize;
-        let len = read_u32_le(bytes, entry + 4).unwrap_or(0) as usize;
-        if offset + len > strings_len {
-            return Err(HostError::IoError(format!(
-                "{context}: invalid native string span"
-            )));
+    for _ in 0..count {
+        if bytes.len() < offset + 5 {
+            return Err(HostError::IoError("readdir: truncated entry".to_owned()));
         }
-        let start = strings_offset + offset;
-        let end = start + len;
-        out.push(
-            String::from_utf8(bytes[start..end].to_vec())
-                .map_err(|e| HostError::IoError(format!("{context}: invalid UTF-8: {e}")))?,
-        );
+        let len = read_u32(bytes, offset) as usize;
+        offset += 5; // length + filetype byte
+        if bytes.len() < offset + len {
+            return Err(HostError::IoError("readdir: truncated name".to_owned()));
+        }
+        out.push(String::from_utf8_lossy(&bytes[offset..offset + len]).into_owned());
+        offset += len;
     }
     Ok(out)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn write_u16_le(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+fn decode_string_list_record(bytes: &[u8], context: &str) -> Result<Vec<String>, HostError> {
+    if bytes.len() < 4 {
+        return Err(HostError::IoError(format!("{context}: short response")));
+    }
+    let count = read_u32(bytes, 0) as usize;
+    let mut offset = 4usize;
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if bytes.len() < offset + 4 {
+            return Err(HostError::IoError(format!("{context}: truncated entry")));
+        }
+        let len = read_u32(bytes, offset) as usize;
+        offset += 4;
+        if bytes.len() < offset + len {
+            return Err(HostError::IoError(format!("{context}: truncated string")));
+        }
+        out.push(String::from_utf8_lossy(&bytes[offset..offset + len]).into_owned());
+        offset += len;
+    }
+    Ok(out)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn write_u32_le(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-#[cfg(target_arch = "wasm32")]
-fn native_span(bytes: &[u8], offset: u32, len: u32) -> Option<&[u8]> {
-    let start = usize::try_from(offset).ok()?;
-    let len = usize::try_from(len).ok()?;
-    let end = start.checked_add(len)?;
-    bytes.get(start..end)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn native_span_str(bytes: &[u8], offset: u32, len: u32) -> Option<String> {
-    let span = native_span(bytes, offset, len)?;
-    Some(String::from_utf8_lossy(span).into_owned())
-}
-
-#[cfg(target_arch = "wasm32")]
-fn build_native_fetch_request(
+fn encode_fetch_request(
     url: &str,
     method: &str,
     headers: &[(&str, &str)],
     body: Option<&str>,
 ) -> Vec<u8> {
-    const FETCH_REQUEST_HEADER_SIZE: usize = 44;
-    const FETCH_HEADER_PAIR_SIZE: usize = 16;
-
-    let body_bytes = body.unwrap_or_default().as_bytes();
-    let headers_offset = FETCH_REQUEST_HEADER_SIZE;
-    let string_offset = headers_offset + headers.len() * FETCH_HEADER_PAIR_SIZE;
-    let total_size = string_offset
-        + url.len()
-        + method.len()
-        + body_bytes.len()
-        + headers
-            .iter()
-            .map(|(key, value)| key.len() + value.len())
-            .sum::<usize>();
-
-    let mut req = vec![0u8; total_size];
-    write_u32_le(&mut req, 0, total_size as u32);
-    write_u16_le(&mut req, 4, 1);
-    write_u16_le(&mut req, 6, 0);
-    write_u32_le(&mut req, 24, headers_offset as u32);
-    write_u32_le(&mut req, 28, headers.len() as u32);
-    write_u32_le(&mut req, 40, YURT_FETCH_REDIRECT_MANUAL);
-
-    let mut cursor = string_offset;
-    let mut write_span = |req: &mut [u8], data: &[u8]| -> (u32, u32) {
-        let start = cursor;
-        req[start..start + data.len()].copy_from_slice(data);
-        cursor += data.len();
-        (start as u32, data.len() as u32)
-    };
-
-    let (url_offset, url_length) = write_span(&mut req, url.as_bytes());
-    let (method_offset, method_length) = write_span(&mut req, method.as_bytes());
-    let (body_offset, body_length) = write_span(&mut req, body_bytes);
-    write_u32_le(&mut req, 8, url_offset);
-    write_u32_le(&mut req, 12, url_length);
-    write_u32_le(&mut req, 16, method_offset);
-    write_u32_le(&mut req, 20, method_length);
-    write_u32_le(&mut req, 32, body_offset);
-    write_u32_le(&mut req, 36, body_length);
-
-    for (idx, (key, value)) in headers.iter().enumerate() {
-        let pair_offset = headers_offset + idx * FETCH_HEADER_PAIR_SIZE;
-        let (key_offset, key_length) = write_span(&mut req, key.as_bytes());
-        let (value_offset, value_length) = write_span(&mut req, value.as_bytes());
-        write_u32_le(&mut req, pair_offset, key_offset);
-        write_u32_le(&mut req, pair_offset + 4, key_length);
-        write_u32_le(&mut req, pair_offset + 8, value_offset);
-        write_u32_le(&mut req, pair_offset + 12, value_length);
-    }
-
-    req
+    let url = url.as_bytes();
+    let method = method.as_bytes();
+    let headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let headers = headers.as_bytes();
+    let body = body.unwrap_or("").as_bytes();
+    let mut out = vec![0u8; 20 + url.len() + method.len() + headers.len() + body.len()];
+    write_u16(&mut out, 0, FETCH_RECORD_VERSION);
+    write_u16(&mut out, 2, FETCH_FLAG_MANUAL_REDIRECT);
+    write_u32(&mut out, 4, url.len() as u32);
+    write_u32(&mut out, 8, method.len() as u32);
+    write_u32(&mut out, 12, headers.len() as u32);
+    write_u32(&mut out, 16, body.len() as u32);
+    let mut offset = 20;
+    out[offset..offset + url.len()].copy_from_slice(url);
+    offset += url.len();
+    out[offset..offset + method.len()].copy_from_slice(method);
+    offset += method.len();
+    out[offset..offset + headers.len()].copy_from_slice(headers);
+    offset += headers.len();
+    out[offset..].copy_from_slice(body);
+    out
 }
 
 #[cfg(target_arch = "wasm32")]
-fn decode_native_fetch_response(bytes: &[u8]) -> Result<FetchResult, HostError> {
-    const FETCH_RESPONSE_HEADER_SIZE: usize = 36;
-    const FETCH_HEADER_PAIR_SIZE: usize = 16;
-
-    if bytes.len() < FETCH_RESPONSE_HEADER_SIZE || read_u16_le(bytes, 4) != Some(1) {
-        return Err(HostError::IoError("fetch: invalid native response".into()));
+fn decode_fetch_response(bytes: &[u8]) -> Result<FetchResult, HostError> {
+    if bytes.len() < 20 {
+        return Err(HostError::IoError("fetch: short response".to_owned()));
     }
-
-    let status = read_u16_le(bytes, 8).unwrap_or(0);
-    let headers_offset = read_u32_le(bytes, 12).unwrap_or(0);
-    let headers_count = read_u32_le(bytes, 16).unwrap_or(0);
-    let body_offset = read_u32_le(bytes, 20).unwrap_or(0);
-    let body_length = read_u32_le(bytes, 24).unwrap_or(0);
-    let error_offset = read_u32_le(bytes, 28).unwrap_or(0);
-    let error_length = read_u32_le(bytes, 32).unwrap_or(0);
-
-    let mut headers = std::collections::HashMap::new();
-    let headers_offset = usize::try_from(headers_offset)
-        .map_err(|_| HostError::IoError("fetch: invalid headers offset".into()))?;
-    let headers_count = usize::try_from(headers_count)
-        .map_err(|_| HostError::IoError("fetch: invalid headers count".into()))?;
-    for idx in 0..headers_count {
-        let pair_offset = headers_offset + idx * FETCH_HEADER_PAIR_SIZE;
-        let key_offset = read_u32_le(bytes, pair_offset)
-            .ok_or_else(|| HostError::IoError("fetch: truncated header pair".into()))?;
-        let key_length = read_u32_le(bytes, pair_offset + 4)
-            .ok_or_else(|| HostError::IoError("fetch: truncated header pair".into()))?;
-        let value_offset = read_u32_le(bytes, pair_offset + 8)
-            .ok_or_else(|| HostError::IoError("fetch: truncated header pair".into()))?;
-        let value_length = read_u32_le(bytes, pair_offset + 12)
-            .ok_or_else(|| HostError::IoError("fetch: truncated header pair".into()))?;
-        let key = native_span_str(bytes, key_offset, key_length)
-            .ok_or_else(|| HostError::IoError("fetch: invalid header key span".into()))?;
-        let value = native_span_str(bytes, value_offset, value_length)
-            .ok_or_else(|| HostError::IoError("fetch: invalid header value span".into()))?;
-        headers.insert(key, value);
-    }
-
-    let body_bytes = native_span(bytes, body_offset, body_length)
-        .ok_or_else(|| HostError::IoError("fetch: invalid body span".into()))?;
-    let error = if error_length == 0 {
-        None
-    } else {
-        Some(
-            native_span_str(bytes, error_offset, error_length)
-                .ok_or_else(|| HostError::IoError("fetch: invalid error span".into()))?,
-        )
-    };
-    let ok = error.is_none() && (200..400).contains(&status);
-    Ok(FetchResult {
-        ok,
-        status,
-        headers,
-        body: String::from_utf8_lossy(body_bytes).into_owned(),
-        body_base64: Some(base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            body_bytes,
-        )),
-        error,
-    })
-}
-
-#[cfg(target_arch = "wasm32")]
-fn decode_native_process_list(bytes: &[u8]) -> Result<String, HostError> {
-    const PROCESS_LIST_HEADER_SIZE: usize = 16;
-    const PROCESS_ENTRY_SIZE: usize = 20;
-
-    if bytes.len() < PROCESS_LIST_HEADER_SIZE || read_u16_le(bytes, 4) != Some(1) {
+    if read_u16(bytes, 0) != FETCH_RECORD_VERSION {
         return Err(HostError::IoError(
-            "list_processes: invalid native response".into(),
+            "fetch: unsupported response version".to_owned(),
         ));
     }
-    let entries_offset = read_u32_le(bytes, 8)
-        .ok_or_else(|| HostError::IoError("list_processes: missing entries offset".into()))?;
-    let entries_count = read_u32_le(bytes, 12)
-        .ok_or_else(|| HostError::IoError("list_processes: missing entries count".into()))?;
-    let entries_offset = usize::try_from(entries_offset)
-        .map_err(|_| HostError::IoError("list_processes: invalid entries offset".into()))?;
-    let entries_count = usize::try_from(entries_count)
-        .map_err(|_| HostError::IoError("list_processes: invalid entries count".into()))?;
-
-    let mut processes = Vec::with_capacity(entries_count);
-    for idx in 0..entries_count {
-        let entry_offset = entries_offset + idx * PROCESS_ENTRY_SIZE;
-        let pid = read_i32_le(bytes, entry_offset)
-            .ok_or_else(|| HostError::IoError("list_processes: truncated entry".into()))?;
-        let ppid = read_i32_le(bytes, entry_offset + 4)
-            .ok_or_else(|| HostError::IoError("list_processes: truncated entry".into()))?;
-        let state_raw = read_u32_le(bytes, entry_offset + 8)
-            .ok_or_else(|| HostError::IoError("list_processes: truncated entry".into()))?;
-        let command_offset = read_u32_le(bytes, entry_offset + 12)
-            .ok_or_else(|| HostError::IoError("list_processes: truncated entry".into()))?;
-        let command_length = read_u32_le(bytes, entry_offset + 16)
-            .ok_or_else(|| HostError::IoError("list_processes: truncated entry".into()))?;
-        let state = match state_raw {
-            1 => "running",
-            2 => "exited",
-            _ => "unknown",
-        };
-        let command = native_span_str(bytes, command_offset, command_length).unwrap_or_default();
-        processes.push(serde_json::json!({
-            "pid": pid,
-            "ppid": ppid,
-            "state": state,
-            "command": command,
-        }));
+    let flags = read_u16(bytes, 2);
+    let status = read_u32(bytes, 4) as u16;
+    let headers_len = read_u32(bytes, 8) as usize;
+    let body_len = read_u32(bytes, 12) as usize;
+    let error_len = read_u32(bytes, 16) as usize;
+    let body_offset = 20 + headers_len;
+    let error_offset = body_offset + body_len;
+    if bytes.len() < error_offset + error_len {
+        return Err(HostError::IoError("fetch: truncated response".to_owned()));
     }
-
-    serde_json::to_string(&processes)
-        .map_err(|e| HostError::IoError(format!("list_processes: encode json: {e}")))
+    let raw_body = bytes[body_offset..error_offset].to_vec();
+    let body = String::from_utf8_lossy(&raw_body).into_owned();
+    let error = if error_len == 0 {
+        None
+    } else {
+        Some(String::from_utf8_lossy(&bytes[error_offset..error_offset + error_len]).into_owned())
+    };
+    Ok(FetchResult {
+        ok: (flags & FETCH_RESPONSE_FLAG_OK) != 0,
+        status,
+        headers: Default::default(),
+        body,
+        raw_body,
+        error,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -831,7 +742,7 @@ impl HostInterface for WasmHost {
         let output = call_with_outbuf_bytes(path, |out_ptr, out_cap| unsafe {
             host_stat(path.as_ptr(), path.len() as u32, out_ptr, out_cap)
         })?;
-        decode_stat_record(&output, path)
+        decode_stat_record(&output)
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, HostError> {
@@ -866,7 +777,7 @@ impl HostInterface for WasmHost {
         let output = call_with_outbuf_bytes(path, |out_ptr, out_cap| unsafe {
             host_readdir(path.as_ptr(), path.len() as u32, out_ptr, out_cap)
         })?;
-        decode_string_list_record(&output, path)
+        decode_readdir_record(&output)
     }
 
     fn mkdir(&self, path: &str) -> Result<(), HostError> {
@@ -906,7 +817,7 @@ impl HostInterface for WasmHost {
         let output = call_with_outbuf_bytes(pattern, |out_ptr, out_cap| unsafe {
             host_glob(pattern.as_ptr(), pattern.len() as u32, out_ptr, out_cap)
         })?;
-        decode_string_list_record(&output, pattern)
+        decode_string_list_record(&output, "glob")
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), HostError> {
@@ -954,25 +865,25 @@ impl HostInterface for WasmHost {
         headers: &[(&str, &str)],
         body: Option<&str>,
     ) -> FetchResult {
-        let req = build_native_fetch_request(url, method, headers, body);
+        let req = encode_fetch_request(url, method, headers, body);
         let output = call_with_outbuf_bytes("fetch", |out_ptr, out_cap| unsafe {
             host_network_fetch(req.as_ptr(), req.len() as u32, out_ptr, out_cap)
         });
         match output {
-            Ok(bytes) => decode_native_fetch_response(&bytes).unwrap_or_else(|e| FetchResult {
+            Ok(bytes) => decode_fetch_response(&bytes).unwrap_or_else(|e| FetchResult {
                 ok: false,
                 status: 0,
                 headers: Default::default(),
                 body: String::new(),
-                body_base64: None,
-                error: Some(format!("fetch: failed to deserialize response: {e}")),
+                raw_body: Vec::new(),
+                error: Some(format!("fetch: failed to decode response: {e}")),
             }),
             Err(e) => FetchResult {
                 ok: false,
                 status: 0,
                 headers: Default::default(),
                 body: String::new(),
-                body_base64: None,
+                raw_body: Vec::new(),
                 error: Some(format!("fetch: host error: {e}")),
             },
         }
@@ -1134,68 +1045,44 @@ impl HostInterface for WasmHost {
     }
 
     fn list_processes(&self) -> Result<String, HostError> {
-        let bytes = call_with_outbuf_bytes("list_processes", |out_ptr, out_cap| unsafe {
+        call_with_outbuf("list_processes", |out_ptr, out_cap| unsafe {
             host_list_processes(out_ptr, out_cap)
-        })?;
-        decode_native_process_list(&bytes)
+        })
     }
 
     // ----- Socket operations (full mode) -----
 
     fn socket_connect(&self, host: &str, port: u16, tls: bool) -> Result<u32, HostError> {
-        let fd = unsafe { host_socket_open(YURT_AF_INET, YURT_SOCK_STREAM, 0) };
-        if fd < 0 {
-            return Err(HostError::IoError(format!(
-                "socket_open: host error code {fd}"
-            )));
+        if tls {
+            return Err(HostError::IoError(
+                "TLS sockets are not supported".to_string(),
+            ));
         }
-        let flags = if tls { YURT_SOCKET_FLAG_TLS as u32 } else { 0 };
-        let rc = unsafe {
-            host_socket_connect(fd, host.as_ptr(), host.len() as u32, u32::from(port), flags)
-        };
+        let target = format!("{host}:{port}");
+        let rc = unsafe { host_socket_connect(target.as_ptr(), target.len() as u32, 0) };
         if rc < 0 {
-            let _ = unsafe { host_socket_close(fd) };
-            return Err(HostError::IoError(format!(
-                "socket_connect: host error code {rc}"
-            )));
+            return Err(HostError::IoError(format!("socket_connect: error {rc}")));
         }
-        Ok(fd as u32)
+        Ok(rc as u32)
     }
 
     fn socket_send(&self, socket_id: u32, data: &[u8]) -> Result<usize, HostError> {
-        let rc = unsafe {
-            host_socket_send(
-                socket_id as i32,
-                data.as_ptr(),
-                data.len() as u32,
-                YURT_MSG_NONE,
-            )
-        };
+        let rc = unsafe { host_socket_send(socket_id as i32, data.as_ptr(), data.len() as u32, 0) };
         if rc < 0 {
-            return Err(HostError::IoError(format!(
-                "socket_send: host error code {rc}"
-            )));
+            return Err(HostError::IoError(format!("socket_send: error {rc}")));
         }
         Ok(rc as usize)
     }
 
     fn socket_recv(&self, socket_id: u32, max_bytes: usize) -> Result<Vec<u8>, HostError> {
-        let mut buf = vec![0u8; max_bytes];
-        let rc = unsafe {
-            host_socket_recv(
-                socket_id as i32,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-                YURT_MSG_NONE,
-            )
-        };
+        let mut out = vec![0_u8; max_bytes];
+        let rc =
+            unsafe { host_socket_recv(socket_id as i32, out.as_mut_ptr(), out.len() as u32, 0) };
         if rc < 0 {
-            return Err(HostError::IoError(format!(
-                "socket_recv: host error code {rc}"
-            )));
+            return Err(HostError::IoError(format!("socket_recv: error {rc}")));
         }
-        buf.truncate(rc as usize);
-        Ok(buf)
+        out.truncate(rc as usize);
+        Ok(out)
     }
 
     fn socket_close(&self, socket_id: u32) -> Result<(), HostError> {

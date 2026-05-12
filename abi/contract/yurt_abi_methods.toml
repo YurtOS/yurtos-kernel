@@ -231,7 +231,7 @@ doc = "POSIX setsid(): make the calling process a new session leader. No request
 [method.sys_kill]
 id = 0x1_001B
 kind = "syscall"
-doc = "POSIX kill(pid, sig). Request bytes carry two little-endian u32s: target pid, signal number (1..=63). Phase 2 records the signal in the target's pending mask but does not deliver — actual delivery requires async unwind (asyncify or JSPI) which lands when the AsyncBridge integration does. Returns 0 on success, -ESRCH for unknown pids, -EINVAL for sig out of range. sig==0 is the POSIX 'is the pid alive?' probe; we always return 0 today (no process tree)."
+doc = "POSIX kill(pid, sig). Request bytes carry two little-endian u32s: target pid, signal number (0..=63). Phase 2 records nonzero signals in the target's pending mask but does not deliver — actual delivery requires async unwind (asyncify or JSPI) which lands when the AsyncBridge integration does. Returns 0 on success, -ESRCH for unknown pids, -EINVAL for sig out of range. sig==0 is the POSIX 'is the pid alive?' probe and succeeds only for an existing process."
 
 [method.sys_sigaction]
 id = 0x1_001C

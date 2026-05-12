@@ -151,11 +151,34 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     const mk = await freshMk();
     const fakeBuf = new ArrayBuffer(8);
     const imports = buildWasmKernelImports(mk, () => fakeBuf);
-    // sending signal 0 to a non-existent pid → -ESRCH. We're
-    // exercising the multi-scalar packing path, not the exact
-    // errno; any reasonable negative or zero is fine.
     const rc = await imports.host_kill(999_999, 0);
-    expect(typeof rc).toEqual("number");
+    expect(rc).toEqual(-3);
+  });
+
+  it("host_wait converts the kernel wait record to yurt_wait_result_v1", async () => {
+    const kernelWait = new Uint8Array(8);
+    const kernelView = new DataView(kernelWait.buffer);
+    kernelView.setUint32(0, 42, true);
+    kernelView.setInt32(4, 7, true);
+    const { mk, calls } = capturingMk(8, kernelWait);
+    const memory = new ArrayBuffer(64);
+    const imports = buildWasmKernelImports(mk, () => memory);
+
+    const rc = await imports.host_wait(0, 0, 16, 16);
+
+    expect(rc).toEqual(16);
+    expect(calls.length).toEqual(1);
+    expect(calls[0].method).toEqual(METHOD.SYS_WAIT);
+    expect(calls[0].responseCap).toEqual(8);
+    const req = new DataView(calls[0].request.buffer);
+    expect(req.getUint32(0, true)).toEqual(0);
+    expect(req.getUint32(4, true)).toEqual(0);
+
+    const result = new DataView(memory, 16, 16);
+    expect(result.getInt32(0, true)).toEqual(42);
+    expect(result.getInt32(4, true)).toEqual(7);
+    expect(result.getInt32(8, true)).toEqual(0);
+    expect(result.getInt32(12, true)).toEqual(0);
   });
 
   it("ptr_len arg: host_chdir reads bytes from user memory", async () => {

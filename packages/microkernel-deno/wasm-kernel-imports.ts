@@ -223,14 +223,44 @@ export const HOST_BINDINGS: HostBinding[] = [
   // grows a dedicated method.
 
   // ── Wait / process tree ───────────────────────────────────
-  // host_wait(pid, flags, outPtr, outCap) — sys_wait expects (pid, flags)
-  // as u32s and writes (u32 exited_pid + i32 status) = 8 bytes.
-  // Existing host_wait declares scalars + outPtr + outCap.
+  // host_wait(pid, flags, outPtr, outCap) — SYS_WAIT writes the kernel-internal
+  // 8-byte record (u32 pid + i32 status). The C ABI expects
+  // yurt_wait_result_v1: i32 pid + i32 exit_code + i32 signal + i32 flags.
   {
     name: "host_wait",
     method: METHOD.SYS_WAIT,
-    args: ["scalar", "scalar", "out_cap"],
-    returnsBytes: true,
+    args: [],
+    custom: (mk, memBuf) =>
+    async (
+      pid: number,
+      flags: number,
+      outPtr: number,
+      outCap: number,
+    ): Promise<number> => {
+      const req = new Uint8Array(8);
+      const reqView = new DataView(req.buffer);
+      reqView.setUint32(0, pid >>> 0, true);
+      reqView.setUint32(4, flags >>> 0, true);
+      const out = await mk.syscallAsync(METHOD.SYS_WAIT, req, 8);
+      const rc = Number(out.rc);
+      if (rc < 0) return rc;
+      if (rc !== 8 || outCap < 16) return -7; // -E2BIG/malformed for this ABI.
+      const kernelView = new DataView(
+        out.response.buffer,
+        out.response.byteOffset,
+        8,
+      );
+      const exitedPid = kernelView.getUint32(0, true);
+      const status = kernelView.getInt32(4, true);
+      const signal = (status >>> 8) & 0xff;
+      const exitCode = signal === 0 ? status : status & 0xff;
+      const result = new DataView(memBuf(), outPtr, 16);
+      result.setInt32(0, exitedPid, true);
+      result.setInt32(4, exitCode, true);
+      result.setInt32(8, signal, true);
+      result.setInt32(12, 0, true);
+      return 16;
+    },
   },
 
   // ── Extensions / native invoke ────────────────────────────

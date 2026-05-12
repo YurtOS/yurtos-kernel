@@ -5,6 +5,7 @@
 
 pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
+pub const ESRCH: i32 = 3;
 pub const ECHILD: i32 = 10;
 pub const EBADF: i32 = 9;
 pub const EIO: i32 = 5;

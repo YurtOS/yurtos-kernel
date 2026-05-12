@@ -436,16 +436,20 @@ Deno.test(
     ({ rc } = mk.syscall(METHOD.SYS_SIGACTION, sa2, 0));
     assertEquals(Number(rc), 1);
 
-    // kill(target=7, sig=0) succeeds (alive probe).
+    const targetPid = spawnFromRamfs(mk, 1, s("/bin/signal-target"), [
+      s("signal-target"),
+    ]);
+
+    // kill(sig=0) succeeds as an alive probe for an existing process.
     const k1 = new Uint8Array(8);
-    new DataView(k1.buffer).setUint32(0, 7, true);
+    new DataView(k1.buffer).setUint32(0, targetPid, true);
     ({ rc } = mk.syscall(METHOD.SYS_KILL, k1, 0));
     assertEquals(Number(rc), 0);
 
     // kill out-of-range → -EINVAL (-22).
     const k2 = new Uint8Array(8);
     const k2View = new DataView(k2.buffer);
-    k2View.setUint32(0, 7, true);
+    k2View.setUint32(0, targetPid, true);
     k2View.setUint32(4, 64, true);
     ({ rc } = mk.syscall(METHOD.SYS_KILL, k2, 0));
     assertEquals(Number(rc), -22);

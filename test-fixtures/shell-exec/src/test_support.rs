@@ -351,7 +351,7 @@ pub mod mock {
                 status: 0,
                 headers: Default::default(),
                 body: String::new(),
-                body_base64: None,
+                raw_body: Vec::new(),
                 error: Some("networking not configured".to_string()),
             }
         }

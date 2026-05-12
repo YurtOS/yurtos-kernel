@@ -32,21 +32,6 @@ args = [
   { name = "out_ptr", type = "ptr" },
 ]
 
-[import.kh_now_monotonic]
-doc = "Monotonic time in nanoseconds since an unspecified host epoch, written to *out_ptr (u64)."
-return = "scalar"
-args = [
-  { name = "out_ptr", type = "ptr" },
-]
-
-[import.kh_random]
-doc = "Fill (out_ptr, len) with cryptographically secure random bytes."
-return = "scalar"
-args = [
-  { name = "out_ptr", type = "ptr" },
-  { name = "len", type = "usize" },
-]
-
 # ── Real filesystem (only used by the kernel's host-fs-provider) ────────────
 
 [import.kh_real_open]
@@ -94,33 +79,44 @@ args = [
   { name = "out_cap", type = "usize" },
 ]
 
-[import.kh_real_readdir]
-doc = "Read directory entries. Writes a packed sequence of kh_dirent_v1 into (out_ptr, out_cap)."
-return = "fixed_out"
+[import.kh_real_unlink]
+doc = "Unlink a host path. Returns 0 or negated errno."
+return = "scalar"
 args = [
-  { name = "fd", type = "i32" },
-  { name = "out_ptr", type = "ptr" },
-  { name = "out_cap", type = "usize" },
+  { name = "path_ptr", type = "ptr" },
+  { name = "path_len", type = "usize" },
+]
+
+[import.kh_real_mkdir]
+doc = "Create a host directory. Returns 0 or negated errno."
+return = "scalar"
+args = [
+  { name = "path_ptr", type = "ptr" },
+  { name = "path_len", type = "usize" },
+  { name = "mode", type = "u32" },
+]
+
+[import.kh_real_symlink]
+doc = "Create a host symlink at link pointing to target. Returns 0 or negated errno."
+return = "scalar"
+args = [
+  { name = "target_ptr", type = "ptr" },
+  { name = "target_len", type = "usize" },
+  { name = "link_ptr", type = "ptr" },
+  { name = "link_len", type = "usize" },
+]
+
+[import.kh_real_rename]
+doc = "Rename a host path. Returns 0 or negated errno."
+return = "scalar"
+args = [
+  { name = "old_ptr", type = "ptr" },
+  { name = "old_len", type = "usize" },
+  { name = "new_ptr", type = "ptr" },
+  { name = "new_len", type = "usize" },
 ]
 
 # ── Network ──────────────────────────────────────────────────────────────────
-
-[import.kh_fetch_send]
-doc = "Submit an HTTP fetch. Request bytes follow the existing host_network_fetch encoding. Returns a non-negative request handle."
-return = "scalar"
-args = [
-  { name = "req_ptr", type = "ptr" },
-  { name = "req_len", type = "usize" },
-]
-
-[import.kh_fetch_poll]
-doc = "Poll a fetch handle. Writes kh_fetch_result_v1 if complete; returns 0 ready, -EAGAIN pending, or negated errno on error."
-return = "fixed_out"
-args = [
-  { name = "handle", type = "i32" },
-  { name = "out_ptr", type = "ptr" },
-  { name = "out_cap", type = "usize" },
-]
 
 [import.kh_fetch_blocking]
 doc = "Synchronous-from-the-kernel HTTP fetch. Request bytes use the same JSON encoding as host_network_fetch. Writes the JSON-encoded fetch result into (out_ptr, out_cap). Returns bytes-written on success, -EACCES when the embedder's PolicyEnforcer denies the request, -E2BIG when the response doesn't fit the output buffer. Implementations on JS hosts use JSPI/asyncify to suspend the kernel; native hosts may run the future on a shared blocking runtime."
@@ -132,85 +128,26 @@ args = [
   { name = "out_cap", type = "usize" },
 ]
 
-# Socket surface mirrors host_socket_* in yurt_abi.toml plus the
-# event-driven blocking semantics established by PR15
-# (`feat: kernel primitives for in-browser sandbox-listening servers`).
-# The blocking-by-default operations (`kh_socket_recv`, `kh_socket_accept`)
+# Socket surface is the direct KH interface the Rust kernel imports.
+# The blocking-by-default operations (`kh_socket_recv`,
+# `kh_socket_accept_blocking`)
 # suspend on the host until data is available; the host implementation
 # uses Tokio await on native, JSPI suspension in the browser/Deno, or
 # asyncify unwind/rewind as a fallback. A `flags & KH_SOCK_NONBLOCK` bit
-# returns -EAGAIN immediately when the operation would block.
+# returns -EAGAIN immediately when recv/accept would block.
 
 [constant.KH_SOCK_NONBLOCK]
 type = "u32"
 value = 1
 doc = "Non-blocking flag for kh_socket_recv / kh_socket_accept."
 
-[import.kh_socket_open]
-doc = "Allocate an unbound socket. Returns a non-negative socket handle."
-return = "scalar"
-args = [
-  { name = "family", type = "u32" },
-  { name = "sock_type", type = "u32" },
-  { name = "protocol", type = "u32" },
-]
-
-[import.kh_socket_bind]
-doc = "Bind a socket to a local address. Address bytes follow the existing host_socket_bind encoding."
-return = "scalar"
-args = [
-  { name = "handle", type = "i32" },
-  { name = "addr_ptr", type = "ptr" },
-  { name = "addr_len", type = "usize" },
-]
-
 [import.kh_socket_connect]
-doc = "Connect a socket to a remote address. Blocks until completion or error; -EAGAIN with KH_SOCK_NONBLOCK."
+doc = "Connect to a remote address. Address bytes are UTF-8 'host:port'. Returns a socket handle or negated errno; -EAGAIN with KH_SOCK_NONBLOCK."
 return = "scalar"
 args = [
-  { name = "handle", type = "i32" },
   { name = "addr_ptr", type = "ptr" },
   { name = "addr_len", type = "usize" },
   { name = "flags", type = "u32" },
-]
-
-[import.kh_socket_listen]
-doc = "Mark a bound socket as a listener with the given backlog."
-return = "scalar"
-args = [
-  { name = "handle", type = "i32" },
-  { name = "backlog", type = "u32" },
-]
-
-[import.kh_socket_accept]
-doc = "Accept the next inbound connection. Blocks until one arrives or the listener is closed; with KH_SOCK_NONBLOCK returns -EAGAIN immediately when none is queued. Writes the peer address into (out_ptr, out_cap) and returns a non-negative connected socket handle. Mirrors PR15's recvAsync/acceptAsync event-driven model."
-return = "fixed_out"
-args = [
-  { name = "handle", type = "i32" },
-  { name = "flags", type = "u32" },
-  { name = "out_ptr", type = "ptr" },
-  { name = "out_cap", type = "usize" },
-]
-
-[import.kh_socket_addr]
-doc = "Read the local or peer address of a socket. `which` is 0 for local, 1 for peer."
-return = "fixed_out"
-args = [
-  { name = "handle", type = "i32" },
-  { name = "which", type = "u32" },
-  { name = "out_ptr", type = "ptr" },
-  { name = "out_cap", type = "usize" },
-]
-
-[import.kh_socket_option]
-doc = "Get or set a socket option. Encoding matches host_socket_option."
-return = "fixed_out"
-args = [
-  { name = "handle", type = "i32" },
-  { name = "req_ptr", type = "ptr" },
-  { name = "req_len", type = "usize" },
-  { name = "out_ptr", type = "ptr" },
-  { name = "out_cap", type = "usize" },
 ]
 
 [import.kh_socket_send]
@@ -223,7 +160,7 @@ args = [
 ]
 
 [import.kh_socket_recv]
-doc = "Receive into (out_ptr, len). Blocks until data is available or peer closes; with KH_SOCK_NONBLOCK returns -EAGAIN immediately when none is queued. 0 = peer closed (EOF). Mirrors PR15's recvAsync."
+doc = "Receive into (out_ptr, len). Blocks until data is available or peer closes; with KH_SOCK_NONBLOCK returns -EAGAIN immediately when none is queued. 0 = peer closed (EOF)."
 return = "scalar"
 args = [
   { name = "handle", type = "i32" },
@@ -239,16 +176,8 @@ args = [
   { name = "handle", type = "i32" },
 ]
 
-# ── Durable KV (IndexedDB-shaped) ────────────────────────────────────
-#
-# Browser microkernels back this with IndexedDB; native ones use a
-# disk-backed key-value store or an in-memory map. The kernel
-# never sees where the bytes live — only the four primitive ops.
-# Stores are arbitrary opaque names (the embedder may forbid
-# certain prefixes via policy).
-
 [import.kh_socket_listen_at]
-doc = "Open + bind + listen in one shot. addr is UTF-8 'host:port'; port=0 lets the host pick. Returns a listener handle or negated errno. Use kh_socket_addr to fetch the actually-bound port."
+doc = "Open + bind + listen in one shot. addr is UTF-8 'host:port'; port=0 lets the host pick. Returns a listener handle or negated errno. Use kh_socket_local_addr to fetch the actually-bound port."
 return = "scalar"
 args = [
   { name = "addr_ptr", type = "ptr" },
@@ -265,13 +194,21 @@ args = [
 ]
 
 [import.kh_socket_local_addr]
-doc = "Write the bound address as u16 port LE + UTF-8 host bytes into (out_ptr, out_cap). Returns bytes-written or -EBADF."
+doc = "Write the bound address as u16 port LE + UTF-8 host bytes into (out_ptr, out_cap). Returns bytes-written or negated errno."
 return = "fixed_out"
 args = [
   { name = "handle", type = "i32" },
   { name = "out_ptr", type = "ptr" },
   { name = "out_cap", type = "usize" },
 ]
+
+# ── Durable KV (IndexedDB-shaped) ────────────────────────────────────
+#
+# Browser microkernels back this with IndexedDB; native ones use a
+# disk-backed key-value store or an in-memory map. The kernel
+# never sees where the bytes live — only the four primitive ops.
+# Stores are arbitrary opaque names (the embedder may forbid
+# certain prefixes via policy).
 
 [import.kh_idb_get]
 doc = "Read a value. Writes (out_ptr, out_cap) and returns bytes-written, or -ENOENT, -EACCES, -E2BIG."
@@ -397,19 +334,6 @@ args = [
   { name = "msg_ptr", type = "ptr" },
   { name = "msg_len", type = "usize" },
 ]
-
-[import.kh_panic]
-doc = "Terminate the kernel instance with a fatal message. Host must surface this to the operator."
-return = "scalar"
-args = [
-  { name = "msg_ptr", type = "ptr" },
-  { name = "msg_len", type = "usize" },
-]
-
-[import.kh_yield]
-doc = "Cooperatively yield to the host until it signals progress (used for blocking pipe reads, child wait, etc.)."
-return = "scalar"
-args = []
 
 # ── Host-side records ────────────────────────────────────────────────────────
 

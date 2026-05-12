@@ -709,13 +709,16 @@ fn setsid(caller_pid: u32) -> i64 {
 /// `kill(target_pid, sig)`. Records sig in target's pending mask.
 /// Phase 2: storage only — actual delivery requires asyncify/JSPI
 /// unwind from the AsyncBridge integration. sig==0 is the POSIX
-/// "is the pid alive?" probe; with no process tree we always say yes.
+/// "is the pid alive?" probe.
 pub fn kill_pid(target: u32, sig: u32) -> i64 {
+    if sig > 63 {
+        return -(abi::EINVAL as i64);
+    }
+    if !with_kernel(|k| k.has_process(target)) {
+        return -(abi::ESRCH as i64);
+    }
     if sig == 0 {
         return 0;
-    }
-    if !(1..=63).contains(&sig) {
-        return -(abi::EINVAL as i64);
     }
     let handle = with_kernel(|k| {
         let p = k.process_mut(target);
@@ -1112,15 +1115,15 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
         // open() handles both lookup and create-if-missing in one
         // call. The flags bits propagate to the backend so it knows
         // the caller's intent (writable opens vs read-only).
-        let (mount_id, inode) = match k.vfs.open(path, flags) {
-            Some(pair) => pair,
-            None => {
+        let (mount_id, inode) = match k.vfs.open_result(path, flags) {
+            Ok(pair) => pair,
+            Err(err) => {
+                if err != abi::ENOENT {
+                    return -(err as i64);
+                }
                 // Distinguish "create wasn't allowed" from "no such
                 // file": read-only backends (Tar, Proc, Dev) refuse
-                // the create bit and return None regardless. Phase 5
-                // surfaces both as ENOENT (no create) / EPERM (with
-                // create) — embedders that want richer signals plumb
-                // them later.
+                // the create bit and return the default ENOENT shape.
                 if create {
                     return -(abi::EPERM as i64);
                 } else {
@@ -2610,6 +2613,9 @@ mod tests {
     #[test]
     fn kill_sig_zero_is_alive_probe_and_succeeds() {
         let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(5);
+        });
         let mut req = Vec::new();
         req.extend_from_slice(&5_u32.to_le_bytes()); // target
         req.extend_from_slice(&0_u32.to_le_bytes()); // sig 0 = probe
@@ -2619,6 +2625,9 @@ mod tests {
     #[test]
     fn kill_records_signal_in_pending_mask() {
         let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(5);
+        });
         let mut req = Vec::new();
         req.extend_from_slice(&5_u32.to_le_bytes()); // target pid
         req.extend_from_slice(&15_u32.to_le_bytes()); // SIGTERM
@@ -2637,6 +2646,14 @@ mod tests {
         assert_eq!(kill_pid(5, 15), -(abi::ENOSYS as i64));
         let handle = crate::kernel::with_kernel(|k| k.process_mut(5).host_instance_handle);
         assert_eq!(handle, Some(42));
+    }
+
+    #[test]
+    fn kill_unknown_pid_is_esrch_and_does_not_create_process() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(kill_pid(999_999, 0), -(abi::ESRCH as i64));
+        assert_eq!(kill_pid(999_999, 15), -(abi::ESRCH as i64));
+        assert!(!crate::kernel::with_kernel(|k| k.has_process(999_999)));
     }
 
     #[test]
@@ -2759,6 +2776,19 @@ mod tests {
         assert_eq!(
             dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/no/such"), &mut []),
             -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
+    fn hostfs_open_propagates_host_errno() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(METHOD_KERNEL_INSTALL_HOST_FS_MOUNT, 0, b"/host", &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/host/missing"), &mut []),
+            -(abi::ENOSYS as i64)
         );
     }
 

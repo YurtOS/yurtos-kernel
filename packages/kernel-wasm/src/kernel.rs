@@ -604,6 +604,10 @@ impl Kernel {
     pub fn process(&mut self, pid: Pid) -> &Process {
         self.processes.entry(pid).or_default()
     }
+
+    pub fn has_process(&self, pid: Pid) -> bool {
+        self.processes.contains_key(&pid)
+    }
 }
 
 static KERNEL: LazyLock<Mutex<Kernel>> = LazyLock::new(|| Mutex::new(Kernel::new()));
