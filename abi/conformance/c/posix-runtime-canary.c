@@ -615,7 +615,7 @@ static int case_select_regular_fd(void) {
 
   errno = 0;
   int rc = select(fd + 1, &readfds, &writefds, NULL, &timeout);
-  if (rc != 2 || !FD_ISSET(fd, &readfds) || !FD_ISSET(fd, &writefds)) {
+  if (rc != 1 || !FD_ISSET(fd, &readfds) || !FD_ISSET(fd, &writefds)) {
     char out[128];
     snprintf(out, sizeof(out), "select_regular_fd:bad:%d:%d:%d", rc, FD_ISSET(fd, &readfds), FD_ISSET(fd, &writefds));
     close(fd);
@@ -624,8 +624,13 @@ static int case_select_regular_fd(void) {
   }
   close(fd);
 
+  int invalid_fd = open(path, O_RDONLY);
+  if (invalid_fd < 0) {
+    emit("select_regular_fd", 1, "select_regular_fd:invalid_open_failed", 1, errno);
+    return 1;
+  }
+  close(invalid_fd);
   FD_ZERO(&readfds);
-  int invalid_fd = FD_SETSIZE - 1;
   FD_SET(invalid_fd, &readfds);
   timeout.tv_sec = 0;
   timeout.tv_usec = 0;

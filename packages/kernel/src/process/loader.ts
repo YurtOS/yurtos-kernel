@@ -460,8 +460,8 @@ export async function loadProcess(
     exitCode = await wasi.startAsync(instance, startFn);
     threadsBackend.cancelDetachedThreads?.();
   } catch (e) {
-    threadsBackend.cancelDetachedThreads?.();
     rollback();
+    threadsBackend.cancelDetachedThreads?.();
     const stderr = proc.fdReadAndClear(2).data.trimEnd();
     if (stderr) {
       const message = e instanceof Error ? e.message : String(e);

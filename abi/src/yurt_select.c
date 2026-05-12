@@ -87,6 +87,7 @@ static int yurt_select_impl(
   for (int i = 0; i < active; i++) {
     int fd = indexes[i];
     short revents = pollfds[i].revents;
+    int fd_ready = 0;
     if ((revents & POLLNVAL) != 0) {
       errno = EBADF;
       return -1;
@@ -95,16 +96,17 @@ static int yurt_select_impl(
     if (readfds != NULL &&
         (revents & (POLLIN | POLLHUP | POLLERR)) != 0) {
       FD_SET(fd, readfds);
-      ready++;
+      fd_ready = 1;
     }
     if (writefds != NULL && (revents & (POLLOUT | POLLERR)) != 0) {
       FD_SET(fd, writefds);
-      ready++;
+      fd_ready = 1;
     }
     if (exceptfds != NULL && (revents & POLLERR) != 0) {
       FD_SET(fd, exceptfds);
-      ready++;
+      fd_ready = 1;
     }
+    if (fd_ready) ready++;
   }
 
   return ready;

@@ -150,16 +150,37 @@ export class FdTable {
       entry.offset + data.byteLength,
     );
 
-    this.mutateAndFlush(entry, () => {
-      if (newLength > entry.buffer.byteLength) {
-        const grown = new Uint8Array(newLength);
-        grown.set(entry.buffer);
-        entry.buffer = grown;
-      }
+    const previousOffset = entry.offset;
+    const previousDirty = entry.dirty;
+    const previousLength = entry.buffer.byteLength;
+    const overwriteStart = entry.offset;
+    const overwriteEnd = Math.min(
+      previousLength,
+      entry.offset + data.byteLength,
+    );
+    const overwritten = entry.buffer.slice(overwriteStart, overwriteEnd);
 
-      entry.buffer.set(data, entry.offset);
-      entry.offset += data.byteLength;
-    });
+    this.mutateAndFlush(
+      entry,
+      () => {
+        if (newLength > entry.buffer.byteLength) {
+          const grown = new Uint8Array(newLength);
+          grown.set(entry.buffer);
+          entry.buffer = grown;
+        }
+
+        entry.buffer.set(data, entry.offset);
+        entry.offset += data.byteLength;
+      },
+      () => {
+        this.restoreBufferLength(entry, previousLength);
+        if (overwritten.byteLength > 0) {
+          entry.buffer.set(overwritten, overwriteStart);
+        }
+        entry.offset = previousOffset;
+        entry.dirty = previousDirty;
+      },
+    );
     return data.byteLength;
   }
 
@@ -180,14 +201,29 @@ export class FdTable {
       entry.buffer.byteLength,
       offset + data.byteLength,
     );
-    this.mutateAndFlush(entry, () => {
-      if (newLength > entry.buffer.byteLength) {
-        const grown = new Uint8Array(newLength);
-        grown.set(entry.buffer);
-        entry.buffer = grown;
-      }
-      entry.buffer.set(data, offset);
-    });
+    const previousDirty = entry.dirty;
+    const previousLength = entry.buffer.byteLength;
+    const overwriteEnd = Math.min(previousLength, offset + data.byteLength);
+    const overwritten = entry.buffer.slice(offset, overwriteEnd);
+
+    this.mutateAndFlush(
+      entry,
+      () => {
+        if (newLength > entry.buffer.byteLength) {
+          const grown = new Uint8Array(newLength);
+          grown.set(entry.buffer);
+          entry.buffer = grown;
+        }
+        entry.buffer.set(data, offset);
+      },
+      () => {
+        this.restoreBufferLength(entry, previousLength);
+        if (overwritten.byteLength > 0) {
+          entry.buffer.set(overwritten, offset);
+        }
+        entry.dirty = previousDirty;
+      },
+    );
     return data.byteLength;
   }
 
@@ -195,14 +231,32 @@ export class FdTable {
   truncate(fd: number, size: number): void {
     const entry = this.getEntry(fd);
     if (size === entry.buffer.byteLength) return;
-    this.mutateAndFlush(entry, () => {
-      const newBuf = new Uint8Array(size);
-      newBuf.set(
-        entry.buffer.subarray(0, Math.min(size, entry.buffer.byteLength)),
-      );
-      entry.buffer = newBuf;
-      if (entry.offset > size) entry.offset = size;
-    });
+    const previousOffset = entry.offset;
+    const previousDirty = entry.dirty;
+    const previousLength = entry.buffer.byteLength;
+    const truncatedTail = size < previousLength
+      ? entry.buffer.slice(size)
+      : new Uint8Array(0);
+
+    this.mutateAndFlush(
+      entry,
+      () => {
+        const newBuf = new Uint8Array(size);
+        newBuf.set(
+          entry.buffer.subarray(0, Math.min(size, entry.buffer.byteLength)),
+        );
+        entry.buffer = newBuf;
+        if (entry.offset > size) entry.offset = size;
+      },
+      () => {
+        this.restoreBufferLength(entry, previousLength);
+        if (truncatedTail.byteLength > 0) {
+          entry.buffer.set(truncatedTail, size);
+        }
+        entry.offset = previousOffset;
+        entry.dirty = previousDirty;
+      },
+    );
   }
 
   /** Seek to a position in the file. Returns the new offset. */
@@ -386,23 +440,31 @@ export class FdTable {
     if (!entry.dirty) return;
     this.withEntryCredential(
       entry,
-      () => this.vfs.writeFile(entry.path, entry.buffer),
+      () => this.vfs.writeFile(entry.path, entry.buffer.slice()),
     );
     entry.dirty = false;
   }
 
-  private mutateAndFlush(entry: FdEntry, mutate: () => void): void {
-    const previousBuffer = new Uint8Array(entry.buffer);
-    const previousOffset = entry.offset;
-    const previousDirty = entry.dirty;
+  private restoreBufferLength(entry: FdEntry, length: number): void {
+    if (entry.buffer.byteLength === length) return;
+    const restored = new Uint8Array(length);
+    restored.set(
+      entry.buffer.subarray(0, Math.min(length, entry.buffer.byteLength)),
+    );
+    entry.buffer = restored;
+  }
+
+  private mutateAndFlush(
+    entry: FdEntry,
+    mutate: () => void,
+    rollback: () => void,
+  ): void {
     try {
       mutate();
       entry.dirty = true;
       this.flushEntry(entry);
     } catch (err) {
-      entry.buffer = previousBuffer;
-      entry.offset = previousOffset;
-      entry.dirty = previousDirty;
+      rollback();
       throw err;
     }
   }

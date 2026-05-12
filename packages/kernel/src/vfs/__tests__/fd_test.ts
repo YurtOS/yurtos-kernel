@@ -58,6 +58,24 @@ describe("FdTable", () => {
     expect(decode(vfs.readFile("/home/user/out.txt"))).toBe("abc");
   });
 
+  it("does not leak same-size failed writes into flushed VFS content", () => {
+    const vfs = new VFS();
+    const fdt = new FdTable(vfs);
+    const fd = fdt.open("/home/user/out.txt", "w");
+    fdt.write(fd, text.encode("abc"));
+    vfs.chmod("/home/user/out.txt", 0o444);
+
+    expect(() => fdt.pwrite(fd, text.encode("xyz"), 0)).toThrow(/EACCES/);
+
+    expect(decode(vfs.readFile("/home/user/out.txt"))).toBe("abc");
+    const buf = new Uint8Array(3);
+    const n = fdt.pread(fd, buf, 0);
+    expect(n).toBe(3);
+    expect(decode(buf)).toBe("abc");
+    vfs.chmod("/home/user/out.txt", 0o644);
+    fdt.close(fd);
+  });
+
   it("restores buffered pwrite state when immediate flush fails", () => {
     const vfs = new VFS({ fsLimitBytes: 3 });
     vfs.writeFile("/home/user/out.txt", text.encode("abc"));

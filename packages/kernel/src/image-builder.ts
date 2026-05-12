@@ -201,6 +201,8 @@ export class YurtImageBuilder {
       moduleCache: this.moduleCache,
       stdoutLimit: options.stdoutLimit,
       stderrLimit: options.stderrLimit,
+      // Build-time root is process-scoped: package-manager children inherit
+      // uid 0 through the normal spawn path for install scripts.
       processCredentials: options.user === "root"
         ? rootProcessCredentials()
         : undefined,
