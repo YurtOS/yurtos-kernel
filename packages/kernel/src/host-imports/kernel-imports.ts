@@ -1010,6 +1010,8 @@ export function createKernelImports(
 
       return new Promise<number>((resolve) => {
         const started = Date.now();
+        // Cooperative runtimes have no host-side readiness notification yet,
+        // so blocking poll/select wakes on this coarse timer.
         const interval = setInterval(() => {
           const ready = evaluate();
           const expired = timeoutMs >= 0 && Date.now() - started >= timeoutMs;

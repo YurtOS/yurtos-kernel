@@ -150,6 +150,8 @@ function socketResult(
     } = { ok: true };
     if (result.data instanceof Uint8Array) ok.data = result.data;
     if (Array.isArray(result.data)) {
+      // The SAB bridge serializes worker responses through JSON, so byte
+      // payloads arrive here as number arrays instead of typed arrays.
       ok.data = Uint8Array.from(result.data as number[]);
     }
     if (typeof result.bytes_sent === "number") {

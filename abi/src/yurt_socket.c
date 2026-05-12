@@ -63,7 +63,6 @@ YURT_DEFINE_MARKER(recv,     0x72656376u) /* "recv" */
 YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 
 #define YURT_SOCKET_RESP_CAP 4096
-#define YURT_SOCKET_RECV_MAX_RAW 3000
 #define YURT_HOST_ERR_NOT_FOUND -1
 #define YURT_HOST_ERR_IO -3
 #define YURT_HOST_ERR_AGAIN -11
@@ -539,9 +538,6 @@ static ssize_t yurt_recv_impl(int sockfd, void *buf, size_t len, int flags) {
     return -1;
   }
 
-  if (len > YURT_SOCKET_RECV_MAX_RAW) {
-    len = YURT_SOCKET_RECV_MAX_RAW;
-  }
   if (len > INT_MAX) {
     errno = EOVERFLOW;
     return -1;

@@ -341,7 +341,11 @@ export class NetworkBridge implements NetworkBridgeLike {
       async function handleSend(req) {
         const sock = sockets.get(req.socket_id);
         if (!sock) { writeErr('send: invalid socket_id'); return; }
-        const data = Buffer.from(Array.isArray(req.data) ? req.data : []);
+        if (!Array.isArray(req.data)) {
+          writeErr('send: data must be an array of bytes');
+          return;
+        }
+        const data = Buffer.from(req.data);
         return new Promise((resolve) => {
           sock.write(data, (err) => {
             if (err) { writeErr('send: ' + err.message); }
