@@ -2451,6 +2451,21 @@ export function createKernelImports(
       return writeLen;
     },
 
+    // host_socket_peercred(sockfd, pid_ptr, uid_ptr, gid_ptr) -> 0 | -1
+    host_socket_peercred(
+      sockfd: number,
+      pidPtr: number,
+      uidPtr: number,
+      gidPtr: number,
+    ): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -1;
+      new Int32Array(memory.buffer, pidPtr, 1)[0] = target.peerPid ?? 0;
+      new Int32Array(memory.buffer, uidPtr, 1)[0] = target.peerUid ?? 0;
+      new Int32Array(memory.buffer, gidPtr, 1)[0] = target.peerGid ?? 0;
+      return 0;
+    },
+
     // host_socket_is_dgram(sockfd) -> 1 (SOCK_DGRAM) | 0 (SOCK_STREAM) | -1 (not a socket)
     host_socket_is_dgram(sockfd: number): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);

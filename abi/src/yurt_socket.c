@@ -1039,8 +1039,8 @@ int shutdown(int sockfd, int how) {
 }
 
 /* socketpair — backed by the in-kernel UnixSocketRegistry via
- * host_socket_socketpair.  Returns a connected AF_UNIX SOCK_STREAM
- * pair.  Cleanup uses yurt_socketpair_release() so every early-exit
+ * host_socket_socketpair.  Returns a connected AF_UNIX SOCK_STREAM or
+ * SOCK_DGRAM pair.  Cleanup uses yurt_socketpair_release() so every early-exit
  * path frees any sockets already allocated. */
 static void yurt_socketpair_release(int fd) {
   if (fd < 0) return;
@@ -1074,7 +1074,7 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
   (void)protocol;
 
   int fds[2] = { -1, -1 };
-  if (yurt_host_socket_socketpair(1 /* AF_UNIX */, base_type,
+  if (yurt_host_socket_socketpair(AF_UNIX, base_type,
                                    (int)(intptr_t)fds) < 0) {
     errno = ENOTSUP;
     return -1;
@@ -1211,26 +1211,19 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
   return nbytes;
 }
 
-/* ── SO_PEERCRED getsockopt (Slice 6) ─────────────────────────────────── */
+/* ── SO_PEERCRED getsockopt ─────────────────────────────────────────────── */
 static int yurt_getsockopt_peercred(int sockfd, void *optval, socklen_t *optlen) {
-  char req[64];
-  char resp[YURT_SOCKET_RESP_CAP];
   struct ucred cred;
   int pid = 0, uid = 0, gid = 0;
-  int req_len, n;
 
   if (!optval || !optlen || *optlen < (socklen_t)sizeof(struct ucred)) {
     errno = EINVAL;
     return -1;
   }
-  req_len = snprintf(req, sizeof(req), "{\"fd\":%d,\"option\":\"peercred\"}", sockfd);
-  if (req_len < 0 || (size_t)req_len >= sizeof(req)) { errno = EOVERFLOW; return -1; }
-  n = yurt_host_socket_option((int)(intptr_t)req, req_len,
-                               (int)(intptr_t)resp, (int)sizeof(resp));
-  if (n <= 0 || !parse_json_ok(resp, (size_t)n)) { errno = EOPNOTSUPP; return -1; }
-  parse_json_int(resp, (size_t)n, "pid", &pid);
-  parse_json_int(resp, (size_t)n, "uid", &uid);
-  parse_json_int(resp, (size_t)n, "gid", &gid);
+  if (yurt_host_socket_peercred(sockfd, &pid, &uid, &gid) != 0) {
+    errno = EOPNOTSUPP;
+    return -1;
+  }
   cred.pid = (pid_t)pid;
   cred.uid = (uid_t)uid;
   cred.gid = (gid_t)gid;

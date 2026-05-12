@@ -251,6 +251,12 @@ __attribute__((import_module("yurt"), import_name("host_socket_addr_unix")))
 int yurt_host_socket_addr_unix(int sockfd, int is_peer,
                                 int path_ptr, int path_cap, int is_abstract_ptr);
 
+/* host_socket_peercred(sockfd, pid_ptr, uid_ptr, gid_ptr) -> 0 | -1
+ * Writes the peer's pid/uid/gid into the three out-params.
+ * Returns 0 on success, -1 if sockfd is not a socket or has no peer. */
+__attribute__((import_module("yurt"), import_name("host_socket_peercred")))
+int yurt_host_socket_peercred(int sockfd, int *pid_out, int *uid_out, int *gid_out);
+
 /* host_socket_is_dgram(sockfd) -> 1 (SOCK_DGRAM) | 0 (SOCK_STREAM) | -1 (not a socket) */
 __attribute__((import_module("yurt"), import_name("host_socket_is_dgram")))
 int yurt_host_socket_is_dgram(int sockfd);
