@@ -1537,7 +1537,11 @@ fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
 
         let child_pid = k.alloc_spawn_pid();
         // Wire the parent/child relationship so sys_wait can reap.
-        k.process_mut(child_pid).ppid = caller_pid;
+        {
+            let child = k.process_mut(child_pid);
+            child.ppid = caller_pid;
+            child.argv = argv.clone();
+        }
         let parent = k.process_mut(caller_pid);
         if !parent.children.contains(&child_pid) {
             parent.children.push(child_pid);
@@ -3736,6 +3740,13 @@ mod tests {
             "spawn pid must come from kernel range >= 1000: got {child_pid}",
         );
         let child_pid_u32 = child_pid as u32;
+        let child_command = with_kernel(|k| {
+            k.list_processes()
+                .into_iter()
+                .find(|p| p.pid == child_pid_u32)
+                .map(|p| p.command)
+        });
+        assert_eq!(child_command.as_deref(), Some(b"echo".as_slice()));
 
         // Drain the queued spawn.
         let mut buf = vec![0u8; 1024];

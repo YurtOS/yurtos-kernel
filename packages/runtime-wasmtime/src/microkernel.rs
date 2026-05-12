@@ -112,7 +112,6 @@ const METHOD_KERNEL_CLOSE_STDIN: u32 = 5;
 const METHOD_KERNEL_DRAIN_STDOUT: u32 = 6;
 const METHOD_KERNEL_DRAIN_STDERR: u32 = 7;
 const METHOD_KERNEL_REGISTER_FILE: u32 = 8;
-const METHOD_KERNEL_SET_ARGV: u32 = 9;
 const METHOD_KERNEL_INSTALL_HOST_FS_MOUNT: u32 = 11;
 const METHOD_KERNEL_INSTALL_YURTFS: u32 = 12;
 const METHOD_KERNEL_REGISTER_CHILD: u32 = 13;
@@ -1663,7 +1662,7 @@ impl Microkernel {
             .unwrap()
             .take_pending(pid)
             .ok_or_else(|| anyhow!("kh_spawn_process did not publish pid {pid}"))?;
-        self.instantiate_with_pid(pid, &spawn.wasm, spawn.argv, false)
+        self.instantiate_with_pid(pid, &spawn.wasm, spawn.argv)
     }
 
     /// Invoke a kernel syscall as a specific caller pid. Used by
@@ -1912,25 +1911,12 @@ impl Microkernel {
         pid: u32,
         wasm: &[u8],
         argv: Vec<Vec<u8>>,
-        register_argv: bool,
     ) -> Result<UserProcess> {
         let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
         let mut linker: Linker<UserState> = Linker::new(&self.engine);
         register_sys_imports(&mut linker)?;
         crate::wasi_shim::add_to_linker(&mut linker)
             .context("install WASI preview1 shim on user-process linker")?;
-
-        if register_argv {
-            // Push argv to the kernel so /proc/<pid>/cmdline + comm have
-            // content to serve. Format: u32 pid + (u32 len + bytes)*.
-            let mut req = Vec::with_capacity(4 + argv.iter().map(|a| 4 + a.len()).sum::<usize>());
-            req.extend_from_slice(&pid.to_le_bytes());
-            for a in &argv {
-                req.extend_from_slice(&(a.len() as u32).to_le_bytes());
-                req.extend_from_slice(a);
-            }
-            self.syscall(METHOD_KERNEL_SET_ARGV, &req, &mut [])?;
-        }
 
         let user_state = UserState {
             kernel: self.kernel.clone(),
@@ -1960,8 +1946,7 @@ impl Microkernel {
     pub fn run_pending_spawns(&self) -> Result<usize> {
         let mut count = 0usize;
         while let Some(spawn) = self.drain_pending_spawn()? {
-            let mut child =
-                self.instantiate_with_pid(spawn.child_pid, &spawn.wasm, spawn.argv, true)?;
+            let mut child = self.instantiate_with_pid(spawn.child_pid, &spawn.wasm, spawn.argv)?;
             // run_start traps when the child calls proc_exit; the
             // shim stashes the exit code in UserState first. A
             // clean return (non-WASI exit) leaves last_exit None,

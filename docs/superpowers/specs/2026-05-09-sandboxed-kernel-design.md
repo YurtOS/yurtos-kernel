@@ -202,6 +202,10 @@ Initial exports:
   argv record used by the host-control spawn request. If the KH adapter cannot instantiate the
   module, the pid has not been published in the process table. This is the
   forward path for moving process instantiation behind kernel policy.
+- User-facing `sys_spawn` likewise decodes argv into the child process record at
+  pid allocation time before returning a pending spawn to the KH adapter. The
+  host receives argv for WASI instantiation, but it does not author `/proc`
+  command metadata afterward.
 - `kernel_kill(pid, signal) -> i64` — apply signal/permission policy and route
   termination to the process instance through the host mechanism when needed. If
   the process record has an attached KH instance handle, kernel.wasm calls
