@@ -119,6 +119,10 @@ records.
   `spawnUserProcessWithArgs` helper now caches anonymous modules and uses that
   path by default. The old JS host-instantiated `kernel_spawn` wrapper has been
   removed.
+- The native wasmtime KH adapter mirrors that cached-spawn path:
+  `kh_spawn_process` validates `spawn_context_v1`, returns an opaque handle, and
+  `spawn_user_process_with_args` now reaches user instantiation through
+  `kernel_spawn_process` with an anonymous cached module id.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the

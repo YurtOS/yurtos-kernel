@@ -333,6 +333,10 @@ pub struct HostState {
     /// this with IndexedDB; native deployments use a disk-backed
     /// store or [`InMemoryKv`] for tests.
     pub kv: Option<Arc<dyn KvBackend>>,
+    /// Kernel-host process engine state for cached wasm modules.
+    /// The kernel owns pid allocation and process records; this
+    /// table is only the wasmtime adapter's module/handle storage.
+    pub process_engine: Arc<Mutex<CachedProcessEngine>>,
 }
 
 impl Default for HostState {
@@ -345,8 +349,95 @@ impl Default for HostState {
             host_fs: None,
             tcp: None,
             kv: None,
+            process_engine: Arc::new(Mutex::new(CachedProcessEngine::default())),
         }
     }
+}
+
+#[derive(Default)]
+pub struct CachedProcessEngine {
+    modules: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    pending: std::collections::BTreeMap<u32, CachedSpawn>,
+    live_handles: std::collections::BTreeSet<i32>,
+    next_handle: i32,
+}
+
+struct CachedSpawn {
+    handle: i32,
+    wasm: Vec<u8>,
+    argv: Vec<Vec<u8>>,
+}
+
+impl CachedProcessEngine {
+    fn cache_module(&mut self, module_id: &[u8], wasm: &[u8]) {
+        self.modules.insert(module_id.to_vec(), wasm.to_vec());
+    }
+
+    fn spawn(&mut self, module_id: &[u8], context: &[u8]) -> i32 {
+        let Some(wasm) = self.modules.get(module_id).cloned() else {
+            return -(ENOENT as i32);
+        };
+        let (pid, argv) = match decode_spawn_context(context) {
+            Ok(parsed) => parsed,
+            Err(rc) => return rc,
+        };
+        let handle = self.next_handle;
+        self.next_handle = self.next_handle.saturating_add(1);
+        self.pending.insert(pid, CachedSpawn { handle, wasm, argv });
+        handle
+    }
+
+    fn take_pending(&mut self, pid: u32) -> Option<CachedSpawn> {
+        let spawn = self.pending.remove(&pid)?;
+        self.live_handles.insert(spawn.handle);
+        Some(spawn)
+    }
+
+    fn destroy(&mut self, handle: i32) -> i32 {
+        if self.live_handles.remove(&handle) {
+            return 0;
+        }
+        let pending_pid = self
+            .pending
+            .iter()
+            .find_map(|(pid, spawn)| (spawn.handle == handle).then_some(*pid));
+        if let Some(pid) = pending_pid {
+            self.pending.remove(&pid);
+            return 0;
+        }
+        -EBADF as i32
+    }
+}
+
+fn decode_spawn_context(context: &[u8]) -> std::result::Result<(u32, Vec<Vec<u8>>), i32> {
+    if context.len() < 12 {
+        return Err(-EINVAL as i32);
+    }
+    let version = u16::from_le_bytes(context[0..2].try_into().expect("2 bytes"));
+    if version != 1 {
+        return Err(-EINVAL as i32);
+    }
+    let pid = u32::from_le_bytes(context[4..8].try_into().expect("4 bytes"));
+    let argv_len = u32::from_le_bytes(context[8..12].try_into().expect("4 bytes")) as usize;
+    if context.len() != 12 + argv_len {
+        return Err(-EINVAL as i32);
+    }
+    let mut offset = 12usize;
+    let mut argv = Vec::new();
+    while offset < context.len() {
+        if context.len() < offset + 4 {
+            return Err(-EINVAL as i32);
+        }
+        let len =
+            u32::from_le_bytes(context[offset..offset + 4].try_into().expect("4 bytes")) as usize;
+        offset += 4;
+        if context.len() < offset + len {
+            return Err(-EINVAL as i32);
+        }
+        argv.push(context[offset..offset + len].to_vec());
+        offset += len;
+    }
+    Ok((pid, argv))
 }
 
 /// Pluggable durable key-value store. Browser microkernels back
@@ -1214,6 +1305,7 @@ pub struct KernelInstance {
     pub(crate) list_processes: TypedFunc<(u32, u32), i64>,
     pub(crate) kill: TypedFunc<(u32, u32), i64>,
     pub(crate) wait: TypedFunc<(u32, u32, u32, u32, u32), i64>,
+    pub(crate) spawn_process: TypedFunc<(u32, u32, u32, u32, u32), i64>,
 }
 
 impl KernelInstance {
@@ -1316,6 +1408,40 @@ impl KernelInstance {
             status: i32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
         })
     }
+
+    pub fn spawn_process(&mut self, parent_pid: u32, module_id: &[u8], argv: &[u8]) -> Result<i64> {
+        if module_id.len() + argv.len() > self.scratch_len as usize {
+            anyhow::bail!(
+                "spawn request ({} bytes) exceeds scratch capacity ({})",
+                module_id.len() + argv.len(),
+                self.scratch_len
+            );
+        }
+        let module_ptr = self.scratch_ptr;
+        let argv_ptr = self.scratch_ptr + module_id.len() as u32;
+        if !module_id.is_empty() {
+            self.memory
+                .write(&mut self.store, module_ptr as usize, module_id)
+                .context("write spawn module id into kernel scratch")?;
+        }
+        if !argv.is_empty() {
+            self.memory
+                .write(&mut self.store, argv_ptr as usize, argv)
+                .context("write spawn argv into kernel scratch")?;
+        }
+        self.spawn_process
+            .call(
+                &mut self.store,
+                (
+                    parent_pid,
+                    module_ptr,
+                    module_id.len() as u32,
+                    argv_ptr,
+                    argv.len() as u32,
+                ),
+            )
+            .context("kernel_spawn_process")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1407,7 +1533,8 @@ fn decode_process_list(bytes: &[u8]) -> Result<Vec<ProcessSnapshot>> {
 pub struct Microkernel {
     engine: Engine,
     kernel: Arc<Mutex<KernelInstance>>,
-    next_pid: RefCell<u32>,
+    process_engine: Arc<Mutex<CachedProcessEngine>>,
+    next_anonymous_module_id: RefCell<u32>,
 }
 
 impl Microkernel {
@@ -1429,6 +1556,7 @@ impl Microkernel {
             host: host_state,
             wasi,
         };
+        let process_engine = store_data.host.process_engine.clone();
         let mut store = Store::new(&engine, store_data);
         let instance = linker
             .instantiate(&mut store, &module)
@@ -1450,6 +1578,8 @@ impl Microkernel {
         let kill = instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_kill")?;
         let wait =
             instance.get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_wait")?;
+        let spawn_process = instance
+            .get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_spawn_process")?;
 
         let kernel = KernelInstance {
             store,
@@ -1460,11 +1590,13 @@ impl Microkernel {
             list_processes,
             kill,
             wait,
+            spawn_process,
         };
         Ok(Self {
             engine,
             kernel: Arc::new(Mutex::new(kernel)),
-            next_pid: RefCell::new(1),
+            process_engine,
+            next_anonymous_module_id: RefCell::new(0),
         })
     }
 
@@ -1496,6 +1628,42 @@ impl Microkernel {
             .lock()
             .unwrap()
             .wait_process(caller_pid, child_pid, flags)
+    }
+
+    pub fn cache_process_module(&self, module_id: &[u8], wasm: &[u8]) -> Result<()> {
+        if module_id.is_empty() {
+            anyhow::bail!("module id must not be empty");
+        }
+        self.process_engine
+            .lock()
+            .unwrap()
+            .cache_module(module_id, wasm);
+        Ok(())
+    }
+
+    pub fn spawn_cached_user_process<S: AsRef<[u8]>>(
+        &self,
+        parent_pid: u32,
+        module_id: &[u8],
+        argv: &[S],
+    ) -> Result<UserProcess> {
+        let argv_request = encode_argv_records(argv);
+        let pid =
+            self.kernel
+                .lock()
+                .unwrap()
+                .spawn_process(parent_pid, module_id, &argv_request)?;
+        if pid < 0 {
+            anyhow::bail!("kernel_spawn_process failed: rc={pid}");
+        }
+        let pid = pid as u32;
+        let spawn = self
+            .process_engine
+            .lock()
+            .unwrap()
+            .take_pending(pid)
+            .ok_or_else(|| anyhow!("kh_spawn_process did not publish pid {pid}"))?;
+        self.instantiate_with_pid(pid, &spawn.wasm, spawn.argv, false)
     }
 
     /// Invoke a kernel syscall as a specific caller pid. Used by
@@ -1727,12 +1895,12 @@ impl Microkernel {
         wasm: &[u8],
         argv: &[S],
     ) -> Result<UserProcess> {
-        let mut next = self.next_pid.borrow_mut();
-        let pid = *next;
-        *next += 1;
+        let mut next = self.next_anonymous_module_id.borrow_mut();
+        let module_id = format!("anonymous:{}", *next).into_bytes();
+        *next = next.saturating_add(1);
         drop(next);
-        let argv: Vec<Vec<u8>> = argv.iter().map(|s| s.as_ref().to_vec()).collect();
-        self.instantiate_with_pid(pid, wasm, argv)
+        self.cache_process_module(&module_id, wasm)?;
+        self.spawn_cached_user_process(0, &module_id, argv)
     }
 
     /// Build a UserProcess with an explicit pid (used by
@@ -1744,6 +1912,7 @@ impl Microkernel {
         pid: u32,
         wasm: &[u8],
         argv: Vec<Vec<u8>>,
+        register_argv: bool,
     ) -> Result<UserProcess> {
         let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
         let mut linker: Linker<UserState> = Linker::new(&self.engine);
@@ -1751,15 +1920,17 @@ impl Microkernel {
         crate::wasi_shim::add_to_linker(&mut linker)
             .context("install WASI preview1 shim on user-process linker")?;
 
-        // Push argv to the kernel so /proc/<pid>/cmdline + comm have
-        // content to serve. Format: u32 pid + (u32 len + bytes)*.
-        let mut req = Vec::with_capacity(4 + argv.iter().map(|a| 4 + a.len()).sum::<usize>());
-        req.extend_from_slice(&pid.to_le_bytes());
-        for a in &argv {
-            req.extend_from_slice(&(a.len() as u32).to_le_bytes());
-            req.extend_from_slice(a);
+        if register_argv {
+            // Push argv to the kernel so /proc/<pid>/cmdline + comm have
+            // content to serve. Format: u32 pid + (u32 len + bytes)*.
+            let mut req = Vec::with_capacity(4 + argv.iter().map(|a| 4 + a.len()).sum::<usize>());
+            req.extend_from_slice(&pid.to_le_bytes());
+            for a in &argv {
+                req.extend_from_slice(&(a.len() as u32).to_le_bytes());
+                req.extend_from_slice(a);
+            }
+            self.syscall(METHOD_KERNEL_SET_ARGV, &req, &mut [])?;
         }
-        self.syscall(METHOD_KERNEL_SET_ARGV, &req, &mut [])?;
 
         let user_state = UserState {
             kernel: self.kernel.clone(),
@@ -1789,7 +1960,8 @@ impl Microkernel {
     pub fn run_pending_spawns(&self) -> Result<usize> {
         let mut count = 0usize;
         while let Some(spawn) = self.drain_pending_spawn()? {
-            let mut child = self.instantiate_with_pid(spawn.child_pid, &spawn.wasm, spawn.argv)?;
+            let mut child =
+                self.instantiate_with_pid(spawn.child_pid, &spawn.wasm, spawn.argv, true)?;
             // run_start traps when the child calls proc_exit; the
             // shim stashes the exit code in UserState first. A
             // clean return (non-WASI exit) leaves last_exit None,
@@ -1825,6 +1997,16 @@ pub struct PendingSpawn {
     pub child_pid: u32,
     pub wasm: Vec<u8>,
     pub argv: Vec<Vec<u8>>,
+}
+
+fn encode_argv_records<S: AsRef<[u8]>>(argv: &[S]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(argv.iter().map(|a| 4 + a.as_ref().len()).sum());
+    for arg in argv {
+        let bytes = arg.as_ref();
+        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out.extend_from_slice(bytes);
+    }
+    out
 }
 
 // ── User process ─────────────────────────────────────────────────────────────
@@ -2824,24 +3006,56 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     )?;
 
     // ── Wasm engine ops ────────────────────────────────────────────
-    // Native kernel-driven process instantiation is not wired here
-    // yet. Bind the documented KH surface so kernel.wasm can link;
-    // the JS KH adapter has the first concrete cached-module handle
-    // table. Wasmtime implementation follows in a dedicated slice.
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_spawn_process",
-        |_caller: Caller<'_, KernelStoreData>,
-         _module_id_ptr: u32,
-         _module_id_len: u32,
-         _context_ptr: u32,
-         _context_len: u32|
-         -> i32 { -(ENOSYS as i32) },
+        |mut caller: Caller<'_, KernelStoreData>,
+         module_id_ptr: u32,
+         module_id_len: u32,
+         context_ptr: u32,
+         context_len: u32|
+         -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT as i32,
+            };
+            let mut module_id = vec![0u8; module_id_len as usize];
+            if module_id_len > 0
+                && memory
+                    .read(&caller, module_id_ptr as usize, &mut module_id)
+                    .is_err()
+            {
+                return -EFAULT as i32;
+            }
+            let mut context = vec![0u8; context_len as usize];
+            if context_len > 0
+                && memory
+                    .read(&caller, context_ptr as usize, &mut context)
+                    .is_err()
+            {
+                return -EFAULT as i32;
+            }
+            caller
+                .data()
+                .host
+                .process_engine
+                .lock()
+                .unwrap()
+                .spawn(&module_id, &context)
+        },
     )?;
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_destroy_instance",
-        |_caller: Caller<'_, KernelStoreData>, _handle: i32| -> i32 { -(ENOSYS as i32) },
+        |caller: Caller<'_, KernelStoreData>, handle: i32| -> i32 {
+            caller
+                .data()
+                .host
+                .process_engine
+                .lock()
+                .unwrap()
+                .destroy(handle)
+        },
     )?;
     linker.func_wrap(
         KH_NAMESPACE,

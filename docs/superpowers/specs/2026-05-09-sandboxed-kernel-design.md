@@ -165,12 +165,14 @@ surface, grouped:
   `kh_process_mem_read(handle, addr, dst_ptr, len)`,
   `kh_process_mem_write(handle, addr, src_ptr, len)`,
   `kh_process_resume(handle)`.
-  This import family is now represented in `packages/kernel-wasm/src/kh.rs` and
-  `packages/microkernel-js/mod.ts`. The portable JS backend has a host module
-  cache and opaque instance-handle table for cached wasm modules, including
-  instance destroy and kernel↔process memory copies. `kh_process_resume`
-  intentionally returns `-ENOSYS` until the scheduler/resume loop is wired; the
-  ABI bindings themselves are no longer spec-only.
+  This import family is now represented in `packages/kernel-wasm/src/kh.rs`,
+  `packages/microkernel-js/mod.ts`, and the native wasmtime KH adapter. The
+  portable JS backend has a host module cache and opaque instance-handle table
+  for cached wasm modules, including instance destroy and kernel↔process memory
+  copies. The native wasmtime backend now validates kernel-provided spawn
+  contexts and instantiates cached modules with the kernel-allocated pid.
+  `kh_process_resume` intentionally returns `-ENOSYS` until the scheduler/resume
+  loop is wired; the ABI bindings themselves are no longer spec-only.
 - **Diagnostics:** `kh_log` (severity, ptr, len), `kh_panic` (ptr, len —
   microkernel must terminate the kernel instance and surface the message).
 - **Cooperative yield:** `kh_yield` — blocks the calling kernel computation

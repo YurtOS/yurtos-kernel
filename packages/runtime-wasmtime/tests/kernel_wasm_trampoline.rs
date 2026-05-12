@@ -210,6 +210,32 @@ fn wasmtime_adapter_kills_through_kernel_export() {
 }
 
 #[test]
+fn wasmtime_adapter_spawns_cached_process_through_kernel_export() {
+    let mk = fresh_microkernel(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (import "env" "sys_getpid" (func $getpid (result i32)))
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            call $getpid))
+        "#,
+    )
+    .unwrap();
+
+    mk.cache_process_module(b"demo-module", &module).unwrap();
+    let mut proc = mk
+        .spawn_cached_user_process(0, b"demo-module", &[b"/bin/demo".as_slice()])
+        .unwrap();
+
+    assert_eq!(proc.call_run().unwrap(), proc.pid() as i32);
+    let snapshots = mk.list_processes().unwrap();
+    let snapshot = snapshots.iter().find(|p| p.pid == proc.pid()).unwrap();
+    assert_eq!(snapshot.ppid, 0);
+    assert_eq!(snapshot.command, b"/bin/demo");
+}
+
+#[test]
 fn kernel_wasm_imports_match_documented_namespaces() {
     // Phase guard. kernel.wasm imports come from two namespaces:
     //   * `kh.*`     — the documented kernel→host ABI we own.
