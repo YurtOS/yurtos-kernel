@@ -1048,218 +1048,128 @@ static int yurt_socketpair_apply_type_flags(int fd, int type) {
 
 int socketpair(int domain, int type, int protocol, int sv[2]) {
   YURT_MARKER_CALL(socketpair);
-  char req[64];
-  char resp[YURT_SOCKET_RESP_CAP];
-  int n;
-
   if (!sv) { errno = EFAULT; return -1; }
   if (domain != AF_UNIX && domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
-  {
-    int base_type = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
-    if (base_type != SOCK_STREAM && base_type != SOCK_DGRAM) {
-      errno = EPROTOTYPE;
-      return -1;
-    }
-  }
+  int base_type = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
+  if (base_type != SOCK_STREAM && base_type != SOCK_DGRAM) { errno = EPROTOTYPE; return -1; }
   (void)protocol;
 
-  /* Ask the kernel to create a paired AF_UNIX socketpair.
-   * Pass the base type so the kernel can distinguish STREAM from DGRAM. */
-  {
-    int base_type = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
-    n = snprintf(req, sizeof(req), "{\"family\":1,\"type\":%d}", base_type);
+  int fds[2] = { -1, -1 };
+  if (yurt_host_socket_socketpair(1 /* AF_UNIX */, base_type,
+                                   (int)(intptr_t)fds) < 0) {
+    errno = ENOTSUP;
+    return -1;
   }
-  n = yurt_host_socket_socketpair((int)(intptr_t)req, n,
-                                   (int)(intptr_t)resp, (int)sizeof(resp));
-  if (n <= 0) { errno = ENOTSUP; return -1; }
+  if (fds[0] < 0 || fds[1] < 0) { errno = ENOTSUP; return -1; }
 
-  /* Parse { ok: true, fds: [fd0, fd1] } */
-  int fd0 = -1, fd1 = -1;
-  const char *p = strstr(resp, "\"fds\":[");
-  if (!p) { errno = ENOTSUP; return -1; }
-  p += 7; /* skip "fds":[ */
-  fd0 = (int)strtol(p, NULL, 10);
-  p = strchr(p, ',');
-  if (!p) { errno = ENOTSUP; return -1; }
-  fd1 = (int)strtol(p + 1, NULL, 10);
-  if (fd0 < 0 || fd1 < 0) { errno = ENOTSUP; return -1; }
-
-  /* Apply SOCK_NONBLOCK / SOCK_CLOEXEC bits. */
-  if (yurt_socketpair_apply_type_flags(fd0, type) < 0 ||
-      yurt_socketpair_apply_type_flags(fd1, type) < 0) {
+  if (yurt_socketpair_apply_type_flags(fds[0], type) < 0 ||
+      yurt_socketpair_apply_type_flags(fds[1], type) < 0) {
     int saved = errno;
-    yurt_socketpair_release(fd0); yurt_socketpair_release(fd1);
+    yurt_socketpair_release(fds[0]); yurt_socketpair_release(fds[1]);
     errno = saved; return -1;
   }
-
-  sv[0] = fd0;
-  sv[1] = fd1;
+  sv[0] = fds[0];
+  sv[1] = fds[1];
   return 0;
 }
 
 /* ── sendmsg: gather iov, collect SCM_RIGHTS, call host_socket_sendmsg ── */
 ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
   YURT_MARKER_CALL(sendmsg);
-  /* Gather iovecs into one buffer */
-  size_t total = 0;
   if (!msg) { errno = EINVAL; return -1; }
-  for (int i = 0; i < (int)msg->msg_iovlen; i++) {
-    total += msg->msg_iov[i].iov_len;
-  }
 
+  /* Gather iovecs into one contiguous buffer */
+  size_t total = 0;
+  for (int i = 0; i < (int)msg->msg_iovlen; i++) total += msg->msg_iov[i].iov_len;
   unsigned char *data = malloc(total ? total : 1);
-  char *encoded;
-  char *req;
-  char resp[YURT_SOCKET_RESP_CAP];
-  int req_len, n, bytes_sent = 0;
-
   if (!data) { errno = ENOMEM; return -1; }
-  {
-    size_t off = 0;
+  { size_t off = 0;
     for (int i = 0; i < (int)msg->msg_iovlen; i++) {
       memcpy(data + off, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
       off += msg->msg_iov[i].iov_len;
     }
   }
 
-  encoded = malloc(((total + 2) / 3) * 4 + 1);
-  if (!encoded) { free(data); errno = ENOMEM; return -1; }
-  if (base64_encode(data, total, encoded, ((total + 2) / 3) * 4 + 1) < 0) {
-    free(data); free(encoded); return -1;
-  }
-  free(data);
-
-  /* Collect SCM_RIGHTS fd numbers */
-  char fds_json[512];
-  fds_json[0] = '\0';
+  /* Collect SCM_RIGHTS fd numbers from ancillary data */
+  int fds_buf[64];
+  int fds_count = 0;
   if (msg->msg_control && msg->msg_controllen > 0) {
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg);
-    char *p = fds_json;
-    int first = 1;
-    while (cmsg) {
+    while (cmsg && fds_count < 64) {
       if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
         size_t fdcount = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
         int *cmsg_fds = (int *)CMSG_DATA(cmsg);
-        for (size_t i = 0; i < fdcount; i++) {
-          if (!first) { *p++ = ','; }
-          p += sprintf(p, "%d", cmsg_fds[i]);
-          first = 0;
-        }
+        for (size_t i = 0; i < fdcount && fds_count < 64; i++)
+          fds_buf[fds_count++] = cmsg_fds[i];
       }
       cmsg = CMSG_NXTHDR(msg, cmsg);
     }
   }
 
-  size_t req_cap = ((total + 2) / 3) * 4 + 256;
-  req = malloc(req_cap);
-  if (!req) { free(encoded); errno = ENOMEM; return -1; }
-  if (fds_json[0] != '\0') {
-    req_len = snprintf(req, req_cap, "{\"fd\":%d,\"data_b64\":\"%s\",\"fds\":[%s]}",
-                       sockfd, encoded, fds_json);
-  } else {
-    req_len = snprintf(req, req_cap, "{\"fd\":%d,\"data_b64\":\"%s\"}",
-                       sockfd, encoded);
-  }
-  free(encoded);
-  if (req_len < 0 || (size_t)req_len >= req_cap) { free(req); errno = EOVERFLOW; return -1; }
-
-  n = yurt_host_socket_sendmsg((int)(intptr_t)req, req_len,
-                                (int)(intptr_t)resp, (int)sizeof(resp));
-  free(req);
-  if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-    errno = EIO;
-    return -1;
-  }
-  if (parse_json_int(resp, (size_t)n, "bytes_sent", &bytes_sent) != 0) {
-    bytes_sent = (int)total;
-  }
+  int rc = yurt_host_socket_sendmsg(sockfd,
+    (int)(intptr_t)data, (int)total,
+    fds_count > 0 ? (int)(intptr_t)fds_buf : 0, fds_count);
+  free(data);
   (void)flags;
-  return (ssize_t)bytes_sent;
+  if (rc < 0) { errno = EIO; return -1; }
+  return (ssize_t)rc;
 }
 
 /* ── recvmsg: call host_socket_recvmsg, scatter data, write SCM_RIGHTS ── */
 ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
   YURT_MARKER_CALL(recvmsg);
-  char req[128];
-  char resp[YURT_SOCKET_RESP_CAP];
-  char data_b64[YURT_SOCKET_RESP_CAP];
-  int req_len, n;
-  size_t total_iov = 0;
-
   if (!msg) { errno = EINVAL; return -1; }
+
+  size_t total_iov = 0;
   for (int i = 0; i < (int)msg->msg_iovlen; i++) total_iov += msg->msg_iov[i].iov_len;
   if (total_iov > YURT_SOCKET_RECV_MAX_RAW) total_iov = YURT_SOCKET_RECV_MAX_RAW;
 
+  unsigned char *buf = malloc(total_iov ? total_iov : 1);
+  if (!buf) { errno = ENOMEM; return -1; }
+
   size_t orig_controllen = msg->msg_controllen;
-  size_t max_fds = 0;
+  int max_fds = 0;
   if (msg->msg_control && orig_controllen > 0) {
-    max_fds = (orig_controllen - CMSG_LEN(0)) / sizeof(int);
+    max_fds = (int)((orig_controllen - CMSG_LEN(0)) / sizeof(int));
     if (max_fds > 64) max_fds = 64;
   }
 
-  req_len = snprintf(req, sizeof(req),
-    "{\"fd\":%d,\"max_data\":%zu,\"max_fds\":%zu}",
-    sockfd, total_iov, max_fds);
-  if (req_len < 0 || (size_t)req_len >= sizeof(req)) { errno = EOVERFLOW; return -1; }
+  int recv_fds[64];
+  int n_fds = 0;
+  int rc = yurt_host_socket_recvmsg(sockfd,
+    (int)(intptr_t)buf, (int)total_iov,
+    max_fds > 0 ? (int)(intptr_t)recv_fds : 0, max_fds,
+    (int)(intptr_t)&n_fds);
 
-  n = yurt_host_socket_recvmsg((int)(intptr_t)req, req_len,
-                                (int)(intptr_t)resp, (int)sizeof(resp));
-  if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-    if (n > 0 && json_contains(resp, (size_t)n, "\"error\":\"EAGAIN\"")) {
-      errno = EAGAIN;
-      return -1;
-    }
-    errno = EIO;
+  if (rc < 0) {
+    free(buf);
+    errno = (rc == -2) ? EAGAIN : EIO;
     return -1;
   }
+  ssize_t nbytes = (ssize_t)rc;
 
-  if (parse_json_string_field(resp, (size_t)n, "data_b64", data_b64, sizeof(data_b64)) != 0) {
-    return -1;
-  }
-
-  /* Decode data into iov */
-  unsigned char *tmp = malloc(total_iov);
-  if (!tmp) { errno = ENOMEM; return -1; }
-  ssize_t nbytes = base64_decode(data_b64, tmp, total_iov);
-  if (nbytes < 0) { free(tmp); return -1; }
-  {
-    size_t off = 0;
+  /* Scatter received bytes into iov */
+  { size_t off = 0;
     for (int i = 0; i < (int)msg->msg_iovlen && off < (size_t)nbytes; i++) {
       size_t copy = msg->msg_iov[i].iov_len;
       if (off + copy > (size_t)nbytes) copy = (size_t)nbytes - off;
-      memcpy(msg->msg_iov[i].iov_base, tmp + off, copy);
+      memcpy(msg->msg_iov[i].iov_base, buf + off, copy);
       off += copy;
     }
   }
-  free(tmp);
+  free(buf);
 
   /* Write SCM_RIGHTS cmsg if fds were received */
   msg->msg_controllen = 0;
-  {
-    const char *fds_start = strstr(resp, "\"fds\":[");
-    if (fds_start && msg->msg_control && max_fds > 0) {
-      int recv_fds[64];
-      int count = 0;
-      const char *p = fds_start + 7;
-      while (*p && *p != ']' && (size_t)count < max_fds) {
-        char *end;
-        long fd_val = strtol(p, &end, 10);
-        if (end == p) break;
-        recv_fds[count++] = (int)fd_val;
-        p = end;
-        if (*p == ',') p++;
-      }
-      if (count > 0) {
-        struct cmsghdr *cmsg = (struct cmsghdr *)msg->msg_control;
-        size_t needed = CMSG_SPACE(count * sizeof(int));
-        if (needed <= orig_controllen || orig_controllen >= sizeof(struct cmsghdr)) {
-          cmsg->cmsg_len = (socklen_t)CMSG_LEN(count * sizeof(int));
-          cmsg->cmsg_level = SOL_SOCKET;
-          cmsg->cmsg_type = SCM_RIGHTS;
-          memcpy(CMSG_DATA(cmsg), recv_fds, count * sizeof(int));
-          msg->msg_controllen = needed;
-        }
-      }
+  if (n_fds > 0 && msg->msg_control && orig_controllen > 0) {
+    struct cmsghdr *cmsg = (struct cmsghdr *)msg->msg_control;
+    size_t needed = CMSG_SPACE(n_fds * sizeof(int));
+    if (needed <= orig_controllen) {
+      cmsg->cmsg_len = (socklen_t)CMSG_LEN(n_fds * sizeof(int));
+      cmsg->cmsg_level = SOL_SOCKET;
+      cmsg->cmsg_type = SCM_RIGHTS;
+      memcpy(CMSG_DATA(cmsg), recv_fds, n_fds * sizeof(int));
+      msg->msg_controllen = needed;
     }
   }
 

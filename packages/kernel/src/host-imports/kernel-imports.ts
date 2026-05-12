@@ -2697,98 +2697,87 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_sendmsg(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // SCM_RIGHTS: send bytes + ancillary fd handles (Slice 5).
-    // Request JSON: { fd, data_b64, fds: [int, ...] }
-    // Response JSON: { ok: true } or { ok: false, error }
+    // host_socket_sendmsg(sockfd, data_ptr, data_len, fds_ptr, fds_count) -> bytes | -1
+    // SCM_RIGHTS: send bytes + ancillary fd handles.
+    // Reads data_len bytes from data_ptr; reads fds_count i32 fd numbers from
+    // fds_ptr (fds_ptr == 0 means no ancillary fds).
     host_socket_sendmsg(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      sockfd: number,
+      dataPtr: number,
+      dataLen: number,
+      fdsPtr: number,
+      fdsCount: number,
     ): number {
       try {
-        if (!opts.kernel) return writeJson(memory, outPtr, outCap, { ok: false, error: "kernel not configured" });
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") return writeJson(memory, outPtr, outCap, { ok: false, error: "missing fd" });
-        const target = opts.kernel.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket" || target.socket === null) {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a connected socket fd: ${req.fd}` });
-        }
+        if (!opts.kernel) return -1;
+        const target = opts.kernel.getFdTarget(callerPid, sockfd);
+        if (!target || target.type !== "socket" || target.socket === null) return -1;
         const registry = socketBackend?.registry;
-        if (!registry) return writeJson(memory, outPtr, outCap, { ok: false, error: "loopback backend required" });
-        const bytes = base64ToBytes(req.data_b64 ?? "");
-        // Dup each ancillary fd so its lifetime is independent of the caller
-        // closing the original (e.g. close(pipefd[1]) before the receiver calls
-        // recvmsg). The duped fd numbers are stored in rxAnc; recvmsg dups them
-        // again for the receiver then closes the intermediates.
-        const ancFds: number[] | undefined = Array.isArray(req.fds) && req.fds.length > 0
-          ? req.fds.map((fd: number) => opts.kernel!.dup(callerPid, fd))
-          : undefined;
+        if (!registry) return -1;
+        const bytes = new Uint8Array(memory.buffer, dataPtr, dataLen).slice();
+        let ancFds: number[] | undefined;
+        if (fdsPtr !== 0 && fdsCount > 0) {
+          const view = new DataView(memory.buffer);
+          // Dup each ancillary fd so it survives the sender closing the original.
+          ancFds = Array.from({ length: fdsCount }, (_, i) =>
+            opts.kernel!.dup(callerPid, view.getInt32(fdsPtr + i * 4, true)));
+        }
         const rawHandle = -(target.socket);
         const result = registry.sendWithAnc(rawHandle, bytes, ancFds, callerPid);
-        return writeJson(memory, outPtr, outCap, result);
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+        return result.ok ? result.bytesSent : -1;
+      } catch {
+        return -1;
       }
     },
 
-    // host_socket_recvmsg(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // SCM_RIGHTS: receive bytes + ancillary fd handles (Slice 5).
-    // Request JSON: { fd, max_data, max_fds }
-    // Response JSON: { ok: true, data_b64, fds: [new_fd, ...] }
+    // host_socket_recvmsg(sockfd, buf_ptr, buf_cap, fds_ptr, fds_cap, n_fds_ptr)
+    //   -> bytes | -1 (EIO) | -2 (EAGAIN)
+    // Writes received bytes to buf_ptr; writes received fd numbers as i32 LE
+    // starting at fds_ptr; writes the fd count as i32 LE at n_fds_ptr.
+    // fds_ptr == 0 means the caller has no ancillary buffer. Async (JSPI).
     async host_socket_recvmsg(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      sockfd: number,
+      bufPtr: number,
+      bufCap: number,
+      fdsPtr: number,
+      fdsCap: number,
+      nFdsPtr: number,
     ): Promise<number> {
       try {
-        if (!opts.kernel) return writeJson(memory, outPtr, outCap, { ok: false, error: "kernel not configured" });
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") return writeJson(memory, outPtr, outCap, { ok: false, error: "missing fd" });
-        const target = opts.kernel.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket" || target.socket === null) {
-          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a connected socket fd: ${req.fd}` });
-        }
+        if (!opts.kernel) return -1;
+        const target = opts.kernel.getFdTarget(callerPid, sockfd);
+        if (!target || target.type !== "socket" || target.socket === null) return -1;
         const registry = socketBackend?.registry;
-        if (!registry) return writeJson(memory, outPtr, outCap, { ok: false, error: "loopback backend required" });
-        const maxData = req.max_data ?? 65536;
+        if (!registry) return -1;
         const rawHandle = -(target.socket);
-        // Peek at anc before recv to capture it for the queued-message case
-        // (recvAsync shifts rx and rxAnc together, so the peek must happen first).
-        // For the fast-path case (waiter parked, sender arrives concurrently)
-        // ancBefore is undefined; we pick up the anc via popWaiterAnc afterward.
+        // Peek anc before suspend (recvAsync shifts rx+rxAnc together, so
+        // the peek must precede the await for the queued-message case).
         const ancBefore = registry.peekAnc(rawHandle);
-        const result = await registry.recvAsync(rawHandle, maxData);
-        if (!result.ok) return writeJson(memory, outPtr, outCap, result);
+        const result = await registry.recvAsync(rawHandle, bufCap);
+        if (!result.ok) return result.error === "EAGAIN" ? -2 : -1;
+        const bytes = result.bytes;
+        const n = Math.min(bytes.length, bufCap);
+        new Uint8Array(memory.buffer, bufPtr, n).set(bytes.subarray(0, n));
+        // SCM_RIGHTS: get anc from queued path or fast-path waiter.
         const anc = ancBefore ?? registry.popWaiterAnc(rawHandle);
-        // Each ancFd is an intermediate dup created at sendmsg time in the
-        // sender's fd table. Dup it into the receiver's table (dupFromProcess
-        // crosses pid boundaries correctly), then close the intermediate.
-        const newFds: number[] = [];
-        if (anc) {
-          const maxFds = req.max_fds ?? 16;
-          const slice = anc.fds.slice(0, maxFds);
+        const view = new DataView(memory.buffer);
+        let nFds = 0;
+        if (anc && fdsPtr !== 0 && fdsCap > 0) {
           const senderPid = anc.senderPid;
-          for (const dupFd of slice) {
+          for (const dupFd of anc.fds.slice(0, fdsCap)) {
             try {
               const newFd = opts.kernel.dupFromProcess(callerPid, senderPid, dupFd);
-              newFds.push(newFd);
+              view.setInt32(fdsPtr + nFds * 4, newFd, true);
+              nFds++;
             } finally {
               opts.kernel.closeFd(senderPid, dupFd);
             }
           }
         }
-        return writeJson(memory, outPtr, outCap, {
-          ok: true,
-          data_b64: bytesToBase64(result.bytes),
-          fds: newFds,
-        });
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+        if (nFdsPtr !== 0) view.setInt32(nFdsPtr, nFds, true);
+        return n;
+      } catch {
+        return -1;
       }
     },
 
@@ -2857,39 +2846,24 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_socketpair(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // Creates a connected pair of AF_UNIX sockets (STREAM or DGRAM).
-    // Request JSON: { family, type }   (family=1=AF_UNIX, type=1=STREAM, 2=DGRAM)
-    // Response JSON: { ok: true, fds: [int, int] } or { ok: false, error }
+    // host_socket_socketpair(family, type, sv_ptr) -> 0 | -1
+    // Creates a connected AF_UNIX socket pair. Writes the two fd numbers as
+    // i32 LE at sv_ptr and sv_ptr+4.
     host_socket_socketpair(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      _family: number,
+      sockType: number,
+      svPtr: number,
     ): number {
       try {
-        if (!opts.kernel) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "kernel not configured",
-          });
-        }
-        const registry = socketBackend?.registry;
-        if (!registry) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "AF_UNIX sockets require a loopback socket backend",
-          });
-        }
-        const parsed = JSON.parse(readString(memory, reqPtr, reqLen));
-        const sockType = typeof parsed.type === "number" ? parsed.type : 1;
+        if (!opts.kernel || !socketBackend?.registry) return -1;
+        const registry = socketBackend.registry;
         const SOCK_DGRAM = 2;
+        let fdA: number, fdB: number;
         if (sockType === SOCK_DGRAM) {
-          // SOCK_DGRAM socketpair
           const { a, b } = registry.openDgramPair();
           const makeDgramTarget = (rawHandle: number): FdTarget => ({
             type: "socket",
-            socket: -rawHandle, // negate for loopback convention
+            socket: -rawHandle,
             family: "AF_UNIX",
             isDgram: true,
             refs: 1,
@@ -2903,36 +2877,34 @@ export function createKernelImports(
             setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
             close: (_socket) => { registry.closeDgramSocket(rawHandle); },
           });
-          const fdA = opts.kernel.allocFd(callerPid, makeDgramTarget(a));
-          const fdB = opts.kernel.allocFd(callerPid, makeDgramTarget(b));
-          return writeJson(memory, outPtr, outCap, { ok: true, fds: [fdA, fdB] });
+          fdA = opts.kernel.allocFd(callerPid, makeDgramTarget(a));
+          fdB = opts.kernel.allocFd(callerPid, makeDgramTarget(b));
+        } else {
+          const { a, b } = registry.openUnixPair();
+          const makeTarget = (rawHandle: number): FdTarget => ({
+            type: "socket",
+            socket: -rawHandle,
+            family: "AF_UNIX",
+            refs: 1,
+            peerPid: callerPid ?? 0,
+            peerUid: 0,
+            peerGid: 0,
+            send: socketBackend!.send.bind(socketBackend),
+            recv: socketBackend!.recv.bind(socketBackend),
+            recvAsync: (socket, maxBytes) =>
+              recvSocketAsync(socketBackend!, socket, maxBytes),
+            setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
+            close: (socket) => { socketBackend!.close(socket); },
+          });
+          fdA = opts.kernel.allocFd(callerPid, makeTarget(a));
+          fdB = opts.kernel.allocFd(callerPid, makeTarget(b));
         }
-        // SOCK_STREAM socketpair (existing behavior)
-        const { a, b } = registry.openUnixPair();
-        const makeTarget = (rawHandle: number): FdTarget => ({
-          type: "socket",
-          socket: -rawHandle, // negate for loopback convention
-          family: "AF_UNIX",
-          refs: 1,
-          peerPid: callerPid ?? 0,
-          peerUid: 0,
-          peerGid: 0,
-          send: socketBackend!.send.bind(socketBackend),
-          recv: socketBackend!.recv.bind(socketBackend),
-          recvAsync: (socket, maxBytes) =>
-            recvSocketAsync(socketBackend!, socket, maxBytes),
-          setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
-          close: (socket) => { socketBackend!.close(socket); },
-        });
-        const fdA = opts.kernel.allocFd(callerPid, makeTarget(a));
-        const fdB = opts.kernel.allocFd(callerPid, makeTarget(b));
-        return writeJson(memory, outPtr, outCap, {
-          ok: true,
-          fds: [fdA, fdB],
-        });
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+        const view = new DataView(memory.buffer);
+        view.setInt32(svPtr, fdA, true);
+        view.setInt32(svPtr + 4, fdB, true);
+        return 0;
+      } catch {
+        return -1;
       }
     },
 

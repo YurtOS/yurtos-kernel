@@ -200,14 +200,25 @@ int yurt_host_socket_option(int req_ptr, int req_len, int out_ptr, int out_cap);
 __attribute__((import_module("yurt"), import_name("host_socket_close")))
 int yurt_host_socket_close(int req_ptr, int req_len);
 
+/* host_socket_socketpair(family, type, sv_ptr) -> 0 | -1
+ * Writes two connected fd numbers as i32 LE at sv_ptr and sv_ptr+4. */
 __attribute__((import_module("yurt"), import_name("host_socket_socketpair")))
-int yurt_host_socket_socketpair(int req_ptr, int req_len, int out_ptr, int out_cap);
+int yurt_host_socket_socketpair(int family, int type, int sv_ptr);
 
+/* host_socket_sendmsg(sockfd, data_ptr, data_len, fds_ptr, fds_count) -> bytes | -1
+ * Reads data_len bytes from data_ptr; reads fds_count i32 fd numbers from
+ * fds_ptr (pass 0 when there are no ancillary fds). */
 __attribute__((import_module("yurt"), import_name("host_socket_sendmsg")))
-int yurt_host_socket_sendmsg(int req_ptr, int req_len, int out_ptr, int out_cap);
+int yurt_host_socket_sendmsg(int sockfd, int data_ptr, int data_len,
+                              int fds_ptr, int fds_count);
 
+/* host_socket_recvmsg(sockfd, buf_ptr, buf_cap, fds_ptr, fds_cap, n_fds_ptr) -> bytes | -1 | -2
+ * Writes up to buf_cap bytes at buf_ptr; writes up to fds_cap fd numbers as
+ * i32 LE at fds_ptr; writes the fd count as i32 LE at n_fds_ptr.
+ * Returns -2 for EAGAIN, -1 for other errors. Async (JSPI). */
 __attribute__((import_module("yurt"), import_name("host_socket_recvmsg")))
-int yurt_host_socket_recvmsg(int req_ptr, int req_len, int out_ptr, int out_cap);
+int yurt_host_socket_recvmsg(int sockfd, int buf_ptr, int buf_cap,
+                              int fds_ptr, int fds_cap, int n_fds_ptr);
 
 /* host_dns_resolve resolves a hostname to a dotted-decimal IPv4 string and
  * writes it to [out_ptr, out_cap).  Returns bytes written, or -1 on failure.
