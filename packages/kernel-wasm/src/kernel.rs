@@ -328,6 +328,10 @@ pub struct Kernel {
     /// the host's pid allocator must stay below 1000 for now (a
     /// proper unified allocator is a follow-up).
     next_spawn_pid: Pid,
+    /// Pid counter for host-created root/user processes. The host
+    /// asks kernel.wasm for these pids before instantiating a user
+    /// module; this keeps process identity owned by the kernel.
+    next_host_pid: Pid,
 }
 
 /// One staged sys_spawn waiting for the host to instantiate it.
@@ -371,7 +375,39 @@ impl Kernel {
             metadata_overrides: BTreeMap::new(),
             pending_spawns: VecDeque::new(),
             next_spawn_pid: 1000,
+            next_host_pid: 1,
         }
+    }
+
+    /// Allocate the next pid for a host-created process in the low
+    /// pid range. Skips occupied pids so tests that seed process
+    /// records manually don't collide.
+    pub fn alloc_host_pid(&mut self) -> Pid {
+        while self.processes.contains_key(&self.next_host_pid) || self.next_host_pid >= 1000 {
+            self.next_host_pid = self.next_host_pid.saturating_add(1);
+            if self.next_host_pid >= 1000 {
+                self.next_host_pid = 1;
+            }
+        }
+        let pid = self.next_host_pid;
+        self.next_host_pid = self.next_host_pid.saturating_add(1);
+        pid
+    }
+
+    pub fn register_host_process(&mut self, parent_pid: Pid, argv: Vec<Vec<u8>>) -> Pid {
+        let pid = self.alloc_host_pid();
+        {
+            let p = self.process_mut(pid);
+            p.ppid = parent_pid;
+            p.argv = argv;
+        }
+        if parent_pid != 0 {
+            let parent = self.process_mut(parent_pid);
+            if !parent.children.contains(&pid) {
+                parent.children.push(pid);
+            }
+        }
+        pid
     }
 
     /// Allocate the next pid for a sys_spawn child and bump the
@@ -576,6 +612,8 @@ pub fn reset_for_tests() {
     k.ofds.clear();
     k.next_ofd_id = 1;
     k.metadata_overrides.clear();
+    k.next_host_pid = 1;
+    k.next_spawn_pid = 1000;
 }
 
 /// Native unit tests share the same `static KERNEL` and run in

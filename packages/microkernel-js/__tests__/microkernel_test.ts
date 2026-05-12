@@ -488,6 +488,10 @@ Deno.test("each spawned process gets a unique pid", async () => {
   assertEquals(a.callExportI32("run"), 1);
   assertEquals(b.callExportI32("run"), 2);
   assertEquals(c.callExportI32("run"), 3);
+  assertEquals(
+    mk.listProcesses().map((p) => p.pid),
+    [1, 2, 3],
+  );
 });
 
 Deno.test("user process pipe round-trip within one process", async () => {

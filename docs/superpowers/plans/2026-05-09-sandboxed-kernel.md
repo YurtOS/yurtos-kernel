@@ -99,8 +99,10 @@ records.
 
 - Define the host-control exports in `packages/kernel-wasm` before changing TS
   compatibility shims. `kernel_list_processes`, `kernel_kill`, and
-  `kernel_wait` now exist; remaining exports are `kernel_spawn` and reserved
-  `kernel_snapshot`.
+  `kernel_wait` now exist. `kernel_spawn` now allocates/registers
+  host-instantiated process pids and argv in the Rust kernel; the later
+  full-spawn version still needs to move wasm instantiation behind
+  `kh_spawn_process`. The remaining reserved export is `kernel_snapshot`.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the

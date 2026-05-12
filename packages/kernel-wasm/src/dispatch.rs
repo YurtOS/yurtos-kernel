@@ -833,6 +833,32 @@ fn set_argv(request: &[u8]) -> i64 {
     0
 }
 
+fn parse_argv_records(request: &[u8]) -> Result<Vec<Vec<u8>>, i64> {
+    let mut cursor = 0usize;
+    let mut argv: Vec<Vec<u8>> = Vec::new();
+    while cursor < request.len() {
+        if request.len() - cursor < 4 {
+            return Err(-(abi::EINVAL as i64));
+        }
+        let len = u32::from_le_bytes(request[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        if request.len() - cursor < len {
+            return Err(-(abi::EINVAL as i64));
+        }
+        argv.push(request[cursor..cursor + len].to_vec());
+        cursor += len;
+    }
+    Ok(argv)
+}
+
+pub fn spawn_host_process(parent_pid: u32, request: &[u8]) -> i64 {
+    let argv = match parse_argv_records(request) {
+        Ok(argv) => argv,
+        Err(rc) => return rc,
+    };
+    with_kernel(|k| k.register_host_process(parent_pid, argv) as i64)
+}
+
 /// `kernel_register_child(parent_pid, child_pid)`. Microkernel-
 /// only; sets the child's ppid and adds it to parent's children
 /// list. Called after the host has spawned a child user-process.

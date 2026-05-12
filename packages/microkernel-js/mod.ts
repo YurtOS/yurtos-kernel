@@ -960,6 +960,9 @@ export class KernelInstance {
         outCap: number,
       ) => bigint)
       | null = null,
+    readonly kernelSpawn:
+      | ((parentPid: number, argvPtr: number, argvLen: number) => bigint)
+      | null = null,
   ) {}
 
   private stage(
@@ -1066,6 +1069,14 @@ export class KernelInstance {
     const rc = this.kernelWait(callerPid, childPid, flags, outPtr, outCap);
     return { rc, response: this.collectResponse(outPtr, outCap) };
   }
+
+  spawnProcess(parentPid: number, argv: Uint8Array): bigint {
+    if (!this.kernelSpawn) {
+      throw new Error("kernel.wasm missing kernel_spawn export");
+    }
+    const { inPtr, inLen } = this.stage(argv, 0);
+    return this.kernelSpawn(parentPid, inPtr, inLen);
+  }
 }
 
 // ── User process ──────────────────────────────────────────────────────────
@@ -1146,7 +1157,6 @@ export class UserProcess {
 export class Microkernel {
   private kernel: KernelInstance;
   private hostState: HostState;
-  private nextPid = 1;
 
   private constructor(kernel: KernelInstance, hostState: HostState) {
     this.kernel = kernel;
@@ -2010,6 +2020,9 @@ export class Microkernel {
         outCap: number,
       ) => bigint)
       | undefined;
+    const kernelSpawn = instance.exports.kernel_spawn as
+      | ((parentPid: number, argvPtr: number, argvLen: number) => bigint)
+      | undefined;
 
     // promising-wrap returns a function that returns Promise<i64>;
     // the underlying call may suspend via any Suspending import.
@@ -2056,6 +2069,7 @@ export class Microkernel {
       kernelListProcesses ?? null,
       kernelKill ?? null,
       kernelWait ?? null,
+      kernelSpawn ?? null,
     );
     hostBox.state = hostState;
     const mk = new Microkernel(kernel, hostState);
@@ -2144,24 +2158,23 @@ export class Microkernel {
     userWasmBytes: Uint8Array,
     argv: Uint8Array[],
   ): UserProcess {
-    const pid = this.nextPid++;
     const userMemoryRef: { memory?: WebAssembly.Memory } = {};
 
-    // Push argv to the kernel so /proc/<pid>/cmdline + comm have
-    // content to serve. Format: u32 pid + (u32 arg_len + arg_bytes)*.
-    let argvSize = 4;
+    // Ask the kernel to allocate the pid and store argv so /proc
+    // and process ownership stay inside kernel.wasm.
+    let argvSize = 0;
     for (const a of argv) argvSize += 4 + a.byteLength;
     const argvReq = new Uint8Array(argvSize);
     const argvView = new DataView(argvReq.buffer);
-    argvView.setUint32(0, pid >>> 0, true);
-    let cursor = 4;
+    let cursor = 0;
     for (const a of argv) {
       argvView.setUint32(cursor, a.byteLength >>> 0, true);
       cursor += 4;
       argvReq.set(a, cursor);
       cursor += a.byteLength;
     }
-    this.kernel.syscall(METHOD.KERNEL_SET_ARGV, KERNEL_PID, argvReq, 0);
+    const pid = Number(this.kernel.spawnProcess(KERNEL_PID, argvReq));
+    if (pid < 0) throw new Error(`kernel_spawn failed: rc=${pid}`);
 
     const sysImports = buildSysImports(pid, this.kernel, userMemoryRef);
     // sys_setrlimit takes (i32, i64, i64); BigInt at the wasm boundary
