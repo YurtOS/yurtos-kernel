@@ -402,6 +402,43 @@ Deno.test("microkernel direct syscalls use kernel pid 0", async () => {
   assertEquals(rc, 0n);
 });
 
+Deno.test("listProcesses reads the kernel-owned process snapshot", async () => {
+  const mk = await freshMicrokernel();
+  const childPid = 7;
+  const encoder = new TextEncoder();
+
+  const command = encoder.encode("/bin/wc");
+  const argvReq = new Uint8Array(4 + 4 + command.byteLength);
+  const argvView = new DataView(argvReq.buffer);
+  argvView.setUint32(0, childPid, true);
+  argvView.setUint32(4, command.byteLength, true);
+  argvReq.set(command, 8);
+  mk.syscall(METHOD.KERNEL_SET_ARGV, argvReq, 0);
+
+  const reg = new Uint8Array(8);
+  const regView = new DataView(reg.buffer);
+  regView.setUint32(0, 1, true);
+  regView.setUint32(4, childPid, true);
+  mk.syscall(METHOD.KERNEL_REGISTER_CHILD, reg, 0);
+
+  const exit = new Uint8Array(8);
+  const exitView = new DataView(exit.buffer);
+  exitView.setUint32(0, childPid, true);
+  exitView.setInt32(4, 2, true);
+  mk.syscall(METHOD.KERNEL_RECORD_EXIT, exit, 0);
+
+  const procs = mk.listProcesses();
+  const child = procs.find((p) => p.pid === childPid);
+  if (!child) throw new Error("child process missing from kernel snapshot");
+  assertEquals(child.ppid, 1);
+  assertEquals(child.pgid, childPid);
+  assertEquals(child.sid, childPid);
+  assertEquals(child.state, "exited");
+  assertEquals(child.exitStatus, 2);
+  assertEquals(new TextDecoder().decode(child.command), "/bin/wc");
+  assertEquals(child.fds, [0, 1, 2]);
+});
+
 // ── User-process tests via inline WAT (require wabt) ─────────────────────
 
 Deno.test("user process calls sys_getuid through the full trampoline", async () => {

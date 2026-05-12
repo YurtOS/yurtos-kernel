@@ -121,6 +121,13 @@ export const METHOD = {
   KERNEL_DRAIN_STDERR: 7,
   KERNEL_REGISTER_FILE: 8,
   KERNEL_SET_ARGV: 9,
+  KERNEL_INSTALL_TAR_LAYER: 10,
+  KERNEL_INSTALL_HOST_FS_MOUNT: 11,
+  KERNEL_INSTALL_YURTFS: 12,
+  KERNEL_REGISTER_CHILD: 13,
+  KERNEL_RECORD_EXIT: 14,
+  KERNEL_DRAIN_SPAWN: 15,
+  KERNEL_LIST_PROCESSES: 16,
   SYS_GETUID: 0x1_0001,
   SYS_GETEUID: 0x1_0002,
   SYS_GETGID: 0x1_0003,
@@ -183,6 +190,17 @@ export const METHOD = {
 } as const;
 
 export const KERNEL_PID = 0;
+
+export interface ProcessSnapshot {
+  pid: number;
+  ppid: number;
+  pgid: number;
+  sid: number;
+  state: "running" | "exited";
+  exitStatus: number;
+  command: Uint8Array;
+  fds: number[];
+}
 
 // ── Embedder-supplied traits ──────────────────────────────────────────────
 
@@ -661,6 +679,61 @@ export const noopAsyncBridge: AsyncBridge = {
     throw new Error("NOT_SUSPENDABLE");
   },
 };
+
+function decodeProcessList(bytes: Uint8Array): ProcessSnapshot[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (bytes.byteLength < 4) throw new Error("short process list");
+  const count = view.getUint32(0, true);
+  const entries: ProcessSnapshot[] = [];
+  let offset = 4;
+  for (let i = 0; i < count; i++) {
+    if (bytes.byteLength < offset + 25) {
+      throw new Error("truncated process list entry");
+    }
+    const pid = view.getUint32(offset, true);
+    offset += 4;
+    const ppid = view.getUint32(offset, true);
+    offset += 4;
+    const pgid = view.getUint32(offset, true);
+    offset += 4;
+    const sid = view.getUint32(offset, true);
+    offset += 4;
+    const stateByte = bytes[offset++];
+    const exitStatus = view.getInt32(offset, true);
+    offset += 4;
+    const commandLen = view.getUint32(offset, true);
+    offset += 4;
+    if (bytes.byteLength < offset + commandLen + 4) {
+      throw new Error("truncated process command");
+    }
+    const command = bytes.subarray(offset, offset + commandLen).slice();
+    offset += commandLen;
+    const fdCount = view.getUint32(offset, true);
+    offset += 4;
+    if (bytes.byteLength < offset + fdCount * 4) {
+      throw new Error("truncated process fd list");
+    }
+    const fds: number[] = [];
+    for (let j = 0; j < fdCount; j++) {
+      fds.push(view.getUint32(offset, true));
+      offset += 4;
+    }
+    entries.push({
+      pid,
+      ppid,
+      pgid,
+      sid,
+      state: stateByte === 2 ? "exited" : "running",
+      exitStatus,
+      command,
+      fds,
+    });
+  }
+  if (offset !== bytes.byteLength) {
+    throw new Error("trailing process list bytes");
+  }
+  return entries;
+}
 
 // Asyncify state value exposed by the binaryen --asyncify pass.
 const ASYNCIFY_UNWINDING = 1;
@@ -1945,6 +2018,21 @@ export class Microkernel {
 
   hostStateMut(): HostState {
     return this.hostState;
+  }
+
+  listProcesses(): ProcessSnapshot[] {
+    const cap = this.kernel.scratchLen;
+    const { rc, response } = this.syscall(
+      METHOD.KERNEL_LIST_PROCESSES,
+      new Uint8Array(0),
+      cap,
+    );
+    const n = Number(rc);
+    if (n < 0) throw new Error(`kernel_list_processes failed: rc=${rc}`);
+    if (n > cap) {
+      throw new Error(`kernel_list_processes exceeded scratch capacity: ${n}`);
+    }
+    return decodeProcessList(response.subarray(0, n));
   }
 
   /**

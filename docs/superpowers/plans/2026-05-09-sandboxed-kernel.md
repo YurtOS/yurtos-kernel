@@ -48,6 +48,20 @@ security checks, image semantics, and network policy. The microkernel owns
 mechanism: wasm engine/store management, host I/O, byte copies between
 instances, scheduling, JSPI/asyncify suspension, and native epoch preemption.
 
+Process control and sandbox observability are kernel APIs, not microkernel data
+structures. Host-facing operations such as spawn, kill, wait/reap, and
+list-processes must enter `kernel.wasm` through explicit control/query exports.
+The microkernel may expose those operations to the embedding host, but it must
+not keep a parallel process table or synthesize process state. For the
+transition, TS-kernel compatibility can mirror the ABI shape only where required
+by existing tests; new process ownership work starts in the Rust kernel.
+
+Control/query wire formats must be binary records. JSON remains acceptable for
+host JSON-RPC, manifests, persistence blobs until the Rust schema lands, and
+application payloads. It is not acceptable for kernel-owned process control,
+wait status, fd metadata, VFS metadata, sockets, fetch, or other syscall/control
+records.
+
 ## Implementation Plan
 
 ### Phase A — Branch Hygiene and Docs
@@ -80,6 +94,26 @@ instances, scheduling, JSPI/asyncify suspension, and native epoch preemption.
   userland coverage and deciding whether `host_socket_open` / `host_socket_bind`
   / `host_socket_option` are deleted from the C shim path or reintroduced as
   real Rust-kernel fd/socket-option operations.
+
+### Phase B2 — Kernel-Owned Process Control
+
+- Define the host-control exports in `packages/kernel-wasm` before changing TS
+  compatibility shims: `kernel_spawn`, `kernel_kill`, `kernel_wait`,
+  `kernel_list_processes`, and reserved `kernel_snapshot`.
+- Add a shared binary process-list record in Rust first. The first version
+  should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
+  `sid`, state, exit status, command bytes, and visible fd numbers. Keep the
+  decoder test close to the Rust kernel test so record drift fails locally.
+- Route microkernel process observability through the Rust export. In JS/Deno
+  and wasmtime adapters, the host may render the returned snapshot, but it does
+  not create the process list.
+- Only after the Rust export and adapter path are covered, update the temporary
+  TS-kernel path to mirror the same binary record where existing userland still
+  needs compatibility. Do not introduce new TS-owned process APIs.
+- Remove remaining JSON process-control paths incrementally:
+  `host_list_processes`, shell-fixture `ps` parsing, run-result transport, and
+  spawn compatibility fallbacks. Each removal gets a focused test proving the
+  binary record shape.
 
 ### Phase C — Parity Harness
 

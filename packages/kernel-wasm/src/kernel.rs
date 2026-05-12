@@ -338,6 +338,17 @@ pub struct PendingSpawn {
     pub argv: Vec<Vec<u8>>,
 }
 
+/// Kernel-owned process metadata for host-control snapshots.
+pub struct ProcessListEntry {
+    pub pid: Pid,
+    pub ppid: Pid,
+    pub pgid: Pid,
+    pub sid: Pid,
+    pub exit_status: Option<i32>,
+    pub command: Vec<u8>,
+    pub fds: Vec<u32>,
+}
+
 impl Kernel {
     fn new() -> Self {
         let mut vfs = crate::vfs::MountTable::new(Box::new(crate::vfs::RamfsBackend::new()));
@@ -469,7 +480,7 @@ impl Kernel {
             .iter()
             .map(|(pid, p)| crate::vfs::ProcessSnapshot {
                 pid: *pid,
-                ppid: 0, // no process tree yet — every process is a child of the kernel
+                ppid: p.ppid,
                 uid: p.credentials.uid,
                 euid: p.credentials.euid,
                 gid: p.credentials.gid,
@@ -481,6 +492,21 @@ impl Kernel {
             })
             .collect();
         self.vfs.refresh_processes(&snaps);
+    }
+
+    pub fn list_processes(&self) -> Vec<ProcessListEntry> {
+        self.processes
+            .iter()
+            .map(|(pid, p)| ProcessListEntry {
+                pid: *pid,
+                ppid: p.ppid,
+                pgid: if p.pgid == 0 { *pid } else { p.pgid },
+                sid: if p.sid == 0 { *pid } else { p.sid },
+                exit_status: p.exit_status,
+                command: p.argv.first().cloned().unwrap_or_default(),
+                fds: p.fd_table.entries.keys().copied().collect(),
+            })
+            .collect()
     }
 
     /// Decrement the refcount. Frees the OFD when it hits 0.

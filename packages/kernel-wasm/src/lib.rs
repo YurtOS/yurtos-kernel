@@ -85,6 +85,25 @@ pub unsafe extern "C" fn kernel_dispatch(
     dispatch::dispatch(method_id, caller_pid, request, response)
 }
 
+/// Host-control export: serialize the kernel-owned process table.
+///
+/// The microkernel may expose this to embedders for observability, but
+/// the table is authored here in kernel.wasm.
+///
+/// # Safety
+///
+/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid
+/// writable range in this kernel instance's linear memory.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_list_processes(out_ptr: *mut u8, out_cap: usize) -> i64 {
+    let response = if out_ptr.is_null() || out_cap == 0 {
+        &mut [][..]
+    } else {
+        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    };
+    dispatch::list_processes_response(response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

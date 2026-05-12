@@ -407,3 +407,8 @@ doc = "POSIX-shaped spawn(path, argv) — the userland-facing fork+exec. Request
 id = 15
 kind = "internal"
 doc = "Microkernel-only: pop the next PendingSpawn enqueued by sys_spawn and serialize it for the host. Response: u32 child_pid + u32 wasm_len + wasm_bytes + u32 argc + (u32 arg_len + arg_bytes)*. Returns bytes-written on success, -ENOENT when the queue is empty. The host instantiates the child wasm with the returned pid, runs it to completion, and calls kernel_record_exit to make the parent's sys_wait reap it."
+
+[method.kernel_list_processes]
+id = 16
+kind = "internal"
+doc = "Microkernel-only: serialize a kernel-owned process table snapshot. Response: u32 count + entries. Each entry is u32 pid, u32 ppid, u32 pgid, u32 sid, u8 state (1 running, 2 exited/zombie), i32 exit_status (-1 when running), u32 command_len, command bytes, u32 fd_count, and fd_count u32 fd numbers. Returns bytes-written or required size when the output buffer is too small."

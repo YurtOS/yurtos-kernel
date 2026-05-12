@@ -44,6 +44,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_REGISTER_CHILD => register_child(request),
         METHOD_KERNEL_RECORD_EXIT => record_exit(request),
         METHOD_KERNEL_DRAIN_SPAWN => drain_spawn(response),
+        METHOD_KERNEL_LIST_PROCESSES => list_processes_response(response),
         METHOD_SYS_WAIT => sys_wait(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
@@ -244,6 +245,47 @@ fn close_stdin(request: &[u8]) -> i64 {
         k.process_mut(pid).stdin_eof = true;
     });
     0
+}
+
+const PROCESS_STATE_RUNNING: u8 = 1;
+const PROCESS_STATE_EXITED: u8 = 2;
+
+fn encode_process_list(entries: &[crate::kernel::ProcessListEntry]) -> Vec<u8> {
+    let total = entries.iter().fold(4usize, |sum, entry| {
+        sum + 25 + entry.command.len() + 4 * entry.fds.len()
+    });
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        out.extend_from_slice(&entry.pid.to_le_bytes());
+        out.extend_from_slice(&entry.ppid.to_le_bytes());
+        out.extend_from_slice(&entry.pgid.to_le_bytes());
+        out.extend_from_slice(&entry.sid.to_le_bytes());
+        out.push(if entry.exit_status.is_some() {
+            PROCESS_STATE_EXITED
+        } else {
+            PROCESS_STATE_RUNNING
+        });
+        out.extend_from_slice(&entry.exit_status.unwrap_or(-1).to_le_bytes());
+        out.extend_from_slice(&(entry.command.len() as u32).to_le_bytes());
+        out.extend_from_slice(&entry.command);
+        out.extend_from_slice(&(entry.fds.len() as u32).to_le_bytes());
+        for fd in &entry.fds {
+            out.extend_from_slice(&fd.to_le_bytes());
+        }
+    }
+    out
+}
+
+pub fn list_processes_response(response: &mut [u8]) -> i64 {
+    with_kernel(|k| {
+        let encoded = encode_process_list(&k.list_processes());
+        if response.len() < encoded.len() {
+            return encoded.len() as i64;
+        }
+        response[..encoded.len()].copy_from_slice(&encoded);
+        encoded.len() as i64
+    })
 }
 
 /// `close(fd: u32) -> 0 / -EBADF`. Decrements pipe refcounts when
@@ -4097,6 +4139,74 @@ mod tests {
         assert_eq!(n, 8);
         assert_eq!(u32::from_le_bytes(wresp[0..4].try_into().unwrap()), 11);
         assert_eq!(i32::from_le_bytes(wresp[4..8].try_into().unwrap()), 7);
+    }
+
+    #[test]
+    fn kernel_list_processes_serializes_kernel_owned_snapshot() {
+        let _g = crate::kernel::TestGuard::acquire();
+
+        let argv = set_argv_req(7, &[b"/bin/wc", b"-l"]);
+        dispatch(METHOD_KERNEL_SET_ARGV, 0, &argv, &mut []);
+
+        let mut reg = 1_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(&7_u32.to_le_bytes());
+        dispatch(METHOD_KERNEL_REGISTER_CHILD, 0, &reg, &mut []);
+
+        let mut exit = 7_u32.to_le_bytes().to_vec();
+        exit.extend_from_slice(&2_i32.to_le_bytes());
+        dispatch(METHOD_KERNEL_RECORD_EXIT, 0, &exit, &mut []);
+
+        let mut out = [0u8; 128];
+        let n = dispatch(METHOD_KERNEL_LIST_PROCESSES, 0, &[], &mut out);
+        assert!(n > 0, "list_processes returned {n}");
+
+        let mut offset = 0usize;
+        let count = u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        assert_eq!(count, 2);
+
+        let mut found_child = false;
+        for _ in 0..count {
+            let pid = u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let ppid = u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let pgid = u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let sid = u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let state = out[offset];
+            offset += 1;
+            let exit_status = i32::from_le_bytes(out[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let command_len =
+                u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let command = &out[offset..offset + command_len];
+            offset += command_len;
+            let fd_count = u32::from_le_bytes(out[offset..offset + 4].try_into().unwrap());
+            offset += 4;
+            let mut fds = Vec::new();
+            for _ in 0..fd_count {
+                fds.push(u32::from_le_bytes(
+                    out[offset..offset + 4].try_into().unwrap(),
+                ));
+                offset += 4;
+            }
+
+            if pid == 7 {
+                found_child = true;
+                assert_eq!(ppid, 1);
+                assert_eq!(pgid, 7);
+                assert_eq!(sid, 7);
+                assert_eq!(state, 2);
+                assert_eq!(exit_status, 2);
+                assert_eq!(command, b"/bin/wc");
+                assert_eq!(fds, vec![0, 1, 2]);
+            }
+        }
+        assert!(found_child, "snapshot did not include child pid 7");
+        assert_eq!(offset, n as usize);
     }
 
     #[test]

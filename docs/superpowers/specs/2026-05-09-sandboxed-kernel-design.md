@@ -88,6 +88,17 @@ Two ABI surfaces:
 - **Kernel→Host** — `abi/contract/kernel_host_abi.toml`. New, small (~20
   functions). The kernel imports `kh_*` for things only the host can do.
 
+There is also a host-control surface in the opposite direction:
+
+- **Host→Kernel control/query** — exports on `kernel.wasm` used by the
+  microkernel and embedding host to operate the sandbox itself: create a
+  process, send a signal or kill request, wait/reap, list process state, query
+  fd/proc metadata, snapshot state, and eventually set resource limits. These
+  calls are not `kh_*` imports because the microkernel is not implementing the
+  behavior. They enter kernel.wasm, where the process table, credentials,
+  signal policy, fd table, and VFS state live. The microkernel only copies
+  request/response bytes and drives wasm instances.
+
 ## Trampoline Protocol
 
 A user syscall executes in five steps:
@@ -164,6 +175,37 @@ surface, grouped:
 All `kh_*` calls follow the same calling convention as the native ABI: scalars
 `>= 0` for success / `< 0` errno; structured returns into caller-provided
 fixed-size out buffers.
+
+## Host→Kernel Control API
+
+The process-control and observability API is owned by kernel.wasm. The
+microkernel exposes these operations to the embedding host, but it must not keep
+an independent process table or synthesize process state. The source of truth is
+inside kernel.wasm.
+
+Initial exports:
+
+- `kernel_spawn(req_ptr, req_len, out_ptr, out_cap) -> i32` — create a Yurt
+  process using the same binary spawn request record as userland. The kernel
+  allocates PID, validates policy, creates fd mappings, and calls
+  `kh_spawn_process` only for the host mechanism of instantiating/resuming the
+  wasm module.
+- `kernel_kill(pid, signal) -> i32` — apply signal/permission policy and route
+  termination to the process instance through the host mechanism when needed.
+- `kernel_wait(pid, flags, out_ptr, out_cap) -> i32` — wait/reap according to
+  kernel process ownership rules. This is the host-control equivalent of the
+  user-facing wait syscall, not a microkernel process-table operation.
+- `kernel_list_processes(out_ptr, out_cap) -> i32` — return a packed binary
+  process snapshot from the kernel-owned table. At minimum each entry carries
+  `pid`, `ppid`, `pgid`, `sid`, state, exit status, command bytes, and visible
+  fd numbers. The host may render this for users, but it does not author it.
+- `kernel_snapshot(out_ptr, out_cap) -> i32` — reserved for persistence once
+  the Rust snapshot schema lands.
+
+Control/query responses use explicit binary records with little-endian scalar
+fields and length-prefixed byte strings. JSON is allowed for host-level
+JSON-RPC, manifests, and application payloads, but not for kernel-owned
+process-control wire formats.
 
 ## Suspension Model
 
@@ -249,8 +291,8 @@ model becomes one kernel instance per group with no shared state.
 
 Kernel state lives in kernel.wasm's linear memory. The microkernel treats kernel
 state as opaque except via `kernel_dispatch` and a
-`kernel_snapshot(out_ptr, out_cap) -> i32` export reserved for the persistence
-layer.
+small host-control export set (`kernel_spawn`, `kernel_kill`, `kernel_wait`,
+`kernel_list_processes`, `kernel_snapshot`).
 
 ## Migration Strategy
 
