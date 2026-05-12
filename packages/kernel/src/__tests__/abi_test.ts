@@ -261,6 +261,18 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toContain('{"case":"scm_rights_truncation","exit":0,"stdout":"scm-trunc=ok"}');
   });
+
+  it("dgram_bind_rollback: failed dgram bind must not leak a stale dgram route", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case dgram_bind_rollback");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"dgram_bind_rollback","exit":0,"stdout":"dgram-rollback=ok"}');
+  });
 });
 
 describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }, () => {

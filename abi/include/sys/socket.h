@@ -65,14 +65,19 @@ extern "C" {
 #undef SO_ERROR
 #define SO_ERROR 0x1007
 
-/* Socket types that wasi-sysroot defines but may not propagate through
- * #include_next in all build configurations. */
-#ifndef SOCK_STREAM
-#define SOCK_STREAM    1
-#endif
-#ifndef SOCK_DGRAM
-#define SOCK_DGRAM     2
-#endif
+/* Socket types and address families — defined by wasi-sdk's
+ * __header_sys_socket.h (pulled in via #include_next above).
+ * WASI values differ from Linux; do NOT add #ifndef fallbacks here:
+ *
+ *   WASI  SOCK_STREAM = 6   AF_UNIX = 3
+ *   WASI  SOCK_DGRAM  = 5   AF_INET = 1
+ *   Linux SOCK_STREAM = 1   AF_UNIX = 1
+ *   Linux SOCK_DGRAM  = 2   AF_INET = 2
+ *
+ * Adding #ifndef guards with the Linux values would silently break
+ * if the include_next chain ever changed, producing guest↔kernel
+ * constant mismatches that are very hard to debug. */
+
 #ifndef SOCK_RAW
 #define SOCK_RAW       3
 #endif
@@ -83,20 +88,9 @@ extern "C" {
 #define SOCK_SEQPACKET 5
 #endif
 
-/* AF_UNIX — added for yurt AF_UNIX domain sockets. */
-#ifndef AF_UNIX
-#define AF_UNIX  1
-#endif
-#ifndef AF_LOCAL
-#define AF_LOCAL 1
-#endif
+/* PF_UNIX — alias for AF_UNIX; wasi-sdk may not expose it. */
 #ifndef PF_UNIX
-#define PF_UNIX  1
-#endif
-
-/* AF_INET — wasi-sdk defines this but may not propagate through #include_next. */
-#ifndef AF_INET
-#define AF_INET  2
+#define PF_UNIX AF_UNIX
 #endif
 
 #ifndef MSG_PEEK

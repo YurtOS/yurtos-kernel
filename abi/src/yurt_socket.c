@@ -275,7 +275,7 @@ int socket(int domain, int type, int protocol) {
   YURT_MARKER_CALL(socket);
 
   if (domain == AF_UNIX) {
-    /* AF_UNIX: allow SOCK_STREAM (1) and SOCK_DGRAM (2). */
+    /* AF_UNIX: allow SOCK_STREAM (WASI=6) and SOCK_DGRAM (WASI=5). */
     int base_type = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
     if (base_type != SOCK_STREAM && base_type != SOCK_DGRAM) {
       errno = EPROTOTYPE;

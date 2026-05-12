@@ -2280,21 +2280,22 @@ export function createKernelImports(
       const bindAuth = authorizeUnixListen(opts.serverSockets, name);
       if (!bindAuth.ok) return -1;
       target.boundPath = name;
+      // Create the VFS socket inode first to detect conflicts (EEXIST) atomically.
+      try {
+        opts.vfs?.createSocket?.(name);
+      } catch {
+        return -1;
+      }
       if (target.isDgram) {
         const registry = socketBackend?.registry;
         if (!registry) return -1;
         try {
           registry.bindDgramToPath(-(target.socket as number), name);
         } catch {
+          // Roll back the VFS inode we just created.
+          try { opts.vfs?.unlink(name); } catch { /* best-effort */ }
           return -1;
         }
-        // Fall through: also create a VFS socket inode so stat() sees S_IFSOCK
-        // and unlink() can clear the dgram route via the socket-inode hook.
-      }
-      try {
-        opts.vfs?.createSocket?.(name);
-      } catch {
-        return -1;
       }
       return 0;
     },
@@ -2326,7 +2327,7 @@ export function createKernelImports(
         target.peerGid = 0;
         return 0;
       }
-      result = registry.connectToPath(name);
+      result = registry.connectToPath(name, callerPid);
       if (!result.ok) return -1;
       target.socket = -(result.socket as number);
       target.family = "AF_UNIX";
@@ -2498,7 +2499,7 @@ export function createKernelImports(
         boundPath: accepted.localPath,
         peerPath: accepted.peerPath,
         refs: 1,
-        peerPid: callerPid ?? 0,
+        peerPid: accepted.peerPid ?? 0,
         peerUid: 0,
         peerGid: 0,
         send: socketBackend.send.bind(socketBackend),

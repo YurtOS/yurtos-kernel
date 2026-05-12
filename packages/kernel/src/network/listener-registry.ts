@@ -70,6 +70,8 @@ export interface UnixAcceptedConnection {
   socket: SocketHandle;
   peerPath?: string;
   localPath: string;
+  /** PID of the process that called connect() on this socket. */
+  peerPid?: number;
 }
 
 export type UnixConnectResult =
@@ -427,8 +429,10 @@ export class ListenerRegistry {
   /**
    * Connect to a unix pathname listener. Creates a paired socket and either
    * hands it to a parked acceptUnix waiter or pushes it to pendingUnix.
+   * @param connectingPid - PID of the process making the connect() call,
+   *   stored in the accepted connection so accept() can report it via SO_PEERCRED.
    */
-  connectToPath(path: string): UnixConnectResult {
+  connectToPath(path: string, connectingPid?: number): UnixConnectResult {
     const routeKey = `AF_UNIX:${path}`;
     const listenerHandle = this.routes.get(routeKey);
     const listener = listenerHandle !== undefined
@@ -484,6 +488,7 @@ export class ListenerRegistry {
       socket: serverHandle,
       localPath: path,
       peerPath: path,
+      peerPid: connectingPid,
     };
 
     const waiter = unixAcceptWaiters.shift();

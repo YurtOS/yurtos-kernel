@@ -18,6 +18,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -739,6 +740,61 @@ static int case_scm_rights_truncation(void) {
   return 1;
 }
 
+/* If a dgram bind fails, the route must not leak.
+ * Verify by: (1) create a regular file at the bind path, so createSocket
+ * returns EEXIST and bind fails; (2) unlink the file; (3) bind a fresh
+ * socket to the same path — must succeed with no stale route. */
+static int case_dgram_bind_rollback(void) {
+  const char *path = "/tmp/yurt-dgram-rollback.sock";
+  struct sockaddr_un addr;
+  int fd1, fd2;
+
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+  socklen_t addrlen = (socklen_t)sizeof(addr);
+
+  /* Create a regular file to block createSocket */
+  unlink(path);
+  int blocker = open(path, O_CREAT | O_WRONLY, 0644);
+  if (blocker < 0) {
+    emit("dgram_bind_rollback", 1, "open-fail", 1, errno); return 1;
+  }
+  close(blocker);
+
+  /* Bind attempt must fail (file already exists) */
+  fd1 = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (fd1 < 0) {
+    emit("dgram_bind_rollback", 1, "socket1-fail", 1, errno); return 1;
+  }
+  int rc = bind(fd1, (struct sockaddr *)&addr, addrlen);
+  close(fd1);
+
+  if (rc == 0) {
+    /* Bind succeeded against a regular file — unexpected */
+    unlink(path);
+    emit("dgram_bind_rollback", 1, "bind-should-fail", 0, 0); return 1;
+  }
+
+  /* Remove the blocker file */
+  unlink(path);
+
+  /* Now bind a fresh socket to the same path — must succeed */
+  fd2 = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (fd2 < 0) {
+    emit("dgram_bind_rollback", 1, "socket2-fail", 1, errno); return 1;
+  }
+  rc = bind(fd2, (struct sockaddr *)&addr, addrlen);
+  close(fd2);
+  if (rc != 0) {
+    unlink(path);
+    emit("dgram_bind_rollback", 1, "second-bind-fail", 1, errno); return 1;
+  }
+  unlink(path);
+  emit("dgram_bind_rollback", 0, "dgram-rollback=ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "pair_basic") == 0)                 return case_pair_basic();
   if (strcmp(name, "bind_listen_accept") == 0)         return case_bind_listen_accept();
@@ -753,6 +809,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "peercred_after_accept") == 0)      return case_peercred_after_accept();
   if (strcmp(name, "dgram_sendto_after_unlink") == 0)  return case_dgram_sendto_after_unlink();
   if (strcmp(name, "scm_rights_truncation") == 0)      return case_scm_rights_truncation();
+  if (strcmp(name, "dgram_bind_rollback") == 0)        return case_dgram_bind_rollback();
   fprintf(stderr, "unix-canary: unknown case %s\n", name);
   return 2;
 }
@@ -771,6 +828,7 @@ static int list_cases(void) {
   puts("peercred_after_accept");
   puts("dgram_sendto_after_unlink");
   puts("scm_rights_truncation");
+  puts("dgram_bind_rollback");
   return 0;
 }
 
