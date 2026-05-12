@@ -1969,12 +1969,49 @@ export function createKernelImports(
 
     // host_socket_open(domain, type, protocol) -> fd
     // Allocates a kernel-owned socket fd. connect() fills in the backend handle later.
+    // For AF_UNIX SOCK_DGRAM, allocates a dgram socket in the registry.
     host_socket_open(
-      _domain: number,
-      _type: number,
+      domain: number,
+      type: number,
       _protocol: number,
     ): number {
       if (!opts.kernel) return -1;
+      // Constants from wasm32-wasip1 __header_sys_socket.h (via yurt-cc / wasi-sdk-30).
+      // These differ from Linux/POSIX values (AF_UNIX=1, SOCK_DGRAM=2).
+      const AF_UNIX = 3;
+      const SOCK_DGRAM = 5;
+      const SOCK_CLOEXEC = 0x2000;
+      const SOCK_NONBLOCK = 0x4000;
+      const baseType = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
+      // AF_UNIX SOCK_DGRAM: allocate a registry dgram socket
+      if (domain === AF_UNIX && baseType === SOCK_DGRAM) {
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        const rawHandle = registry.openDgramSocket();
+        return opts.kernel.allocFd(callerPid, {
+          type: "socket",
+          socket: -rawHandle, // negate for loopback convention
+          family: "AF_UNIX",
+          isDgram: true,
+          refs: 1,
+          send: (socket, dataB64) =>
+            socketBackend?.send(socket, dataB64) ??
+              { ok: false, error: "networking not configured" },
+          recv: (socket, maxBytes, recvOpts) =>
+            socketBackend?.recv(socket, maxBytes, recvOpts) ??
+              { ok: false, error: "networking not configured" },
+          recvAsync: (socket, maxBytes) =>
+            socketBackend
+              ? recvSocketAsync(socketBackend, socket, maxBytes)
+              : Promise.resolve({ ok: false, error: "networking not configured" }),
+          setNoDelay: (socket, enabled) =>
+            socketBackend?.setNoDelay?.(socket, enabled) ??
+              { ok: false, error: "TCP_NODELAY not supported by socket backend" },
+          close: (_socket) => {
+            registry.closeDgramSocket(rawHandle);
+          },
+        });
+      }
       return opts.kernel.allocFd(callerPid, {
         type: "socket",
         socket: null,
@@ -2048,6 +2085,9 @@ export function createKernelImports(
           target.socket = -unixResult.socket; // negate for loopback convention
           target.family = "AF_UNIX";
           target.peerPath = `\0${req.abstract}`;
+          target.peerPid = callerPid ?? 0;
+          target.peerUid = 0;
+          target.peerGid = 0;
           return writeJson(memory, outPtr, outCap, { ok: true });
         }
 
@@ -2067,6 +2107,9 @@ export function createKernelImports(
           target.socket = -unixResult.socket; // negate for loopback convention
           target.family = "AF_UNIX";
           target.peerPath = req.path;
+          target.peerPid = callerPid ?? 0;
+          target.peerUid = 0;
+          target.peerGid = 0;
           return writeJson(memory, outPtr, outCap, { ok: true });
         }
 
@@ -2142,6 +2185,22 @@ export function createKernelImports(
         if (typeof req.path === "string") {
           target.family = "AF_UNIX";
           target.boundPath = req.path;
+          // For SOCK_DGRAM, register in the dgram route table
+          if (target.isDgram) {
+            const registry = socketBackend?.registry;
+            if (!registry) {
+              return writeJson(memory, outPtr, outCap, { ok: false, error: "AF_UNIX dgram requires loopback backend" });
+            }
+            // raw handle is -target.socket (negated back)
+            const rawHandle = -(target.socket as number);
+            try {
+              registry.bindDgramToPath(rawHandle, req.path);
+            } catch (e: unknown) {
+              const msg = e instanceof Error ? e.message : String(e);
+              return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+            }
+            return writeJson(memory, outPtr, outCap, { ok: true });
+          }
           try {
             opts.vfs?.createSocket?.(req.path);
           } catch (e: unknown) {
@@ -2332,6 +2391,9 @@ export function createKernelImports(
             boundPath: unixAccepted.localPath,
             peerPath: unixAccepted.peerPath,
             refs: 1,
+            peerPid: callerPid ?? 0,
+            peerUid: 0,
+            peerGid: 0,
             send: socketBackend.send.bind(socketBackend),
             recv: socketBackend.recv.bind(socketBackend),
             recvAsync: (socket, maxBytes) =>
@@ -2461,7 +2523,7 @@ export function createKernelImports(
 
     // host_socket_send(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Sends data on an open socket.
-    // Request JSON: { fd, data_b64 }
+    // Request JSON: { fd, data_b64 } or { fd, data_b64, to: "<path>" } for dgram sendto
     // Response JSON: { ok, bytes_sent } or { ok: false, error }
     host_socket_send(
       reqPtr: number,
@@ -2484,7 +2546,31 @@ export function createKernelImports(
           });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket" || target.socket === null) {
+        if (!target || target.type !== "socket") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `not a socket fd: ${req.fd}`,
+          });
+        }
+        // SOCK_DGRAM path
+        if (target.isDgram) {
+          const registry = socketBackend?.registry;
+          if (!registry) {
+            return writeJson(memory, outPtr, outCap, { ok: false, error: "AF_UNIX dgram requires loopback backend" });
+          }
+          const bytes = base64ToBytes(req.data_b64 ?? "");
+          // sendto with destination path
+          if (typeof req.to === "string") {
+            const senderBoundPath = target.boundPath;
+            const result = registry.sendDgramToPath(req.to, bytes, senderBoundPath);
+            return writeJson(memory, outPtr, outCap, result);
+          }
+          // socketpair DGRAM — send to peer
+          const rawHandle = -(target.socket as number);
+          const result = registry.sendDgramToPeer(rawHandle, bytes);
+          return writeJson(memory, outPtr, outCap, result);
+        }
+        if (target.socket === null) {
           return writeJson(memory, outPtr, outCap, {
             ok: false,
             error: `not a connected socket fd: ${req.fd}`,
@@ -2527,7 +2613,30 @@ export function createKernelImports(
           });
         }
         const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket" || target.socket === null) {
+        if (!target || target.type !== "socket") {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: `not a socket fd: ${req.fd}`,
+          });
+        }
+        // SOCK_DGRAM path
+        if (target.isDgram) {
+          const registry = socketBackend?.registry;
+          if (!registry) {
+            return writeJson(memory, outPtr, outCap, { ok: false, error: "AF_UNIX dgram requires loopback backend" });
+          }
+          const rawHandle = -(target.socket as number);
+          const maxBytes = req.max_bytes ?? 65536;
+          return registry.recvDgramAsync(rawHandle, maxBytes).then((result) => {
+            if (!result.ok) return writeJson(memory, outPtr, outCap, result);
+            return writeJson(memory, outPtr, outCap, {
+              ok: true,
+              data_b64: bytesToBase64(result.bytes),
+              from_path: result.fromPath,
+            });
+          });
+        }
+        if (target.socket === null) {
           return writeJson(memory, outPtr, outCap, {
             ok: false,
             error: `not a connected socket fd: ${req.fd}`,
@@ -2589,6 +2698,96 @@ export function createKernelImports(
       }
     },
 
+    // host_socket_sendmsg(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // SCM_RIGHTS: send bytes + ancillary fd handles (Slice 5).
+    // Request JSON: { fd, data_b64, fds: [int, ...] }
+    // Response JSON: { ok: true } or { ok: false, error }
+    host_socket_sendmsg(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
+      try {
+        if (!opts.kernel) return writeJson(memory, outPtr, outCap, { ok: false, error: "kernel not configured" });
+        const req = JSON.parse(readString(memory, reqPtr, reqLen));
+        if (typeof req.fd !== "number") return writeJson(memory, outPtr, outCap, { ok: false, error: "missing fd" });
+        const target = opts.kernel.getFdTarget(callerPid, req.fd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a connected socket fd: ${req.fd}` });
+        }
+        const registry = socketBackend?.registry;
+        if (!registry) return writeJson(memory, outPtr, outCap, { ok: false, error: "loopback backend required" });
+        const bytes = base64ToBytes(req.data_b64 ?? "");
+        // Dup each ancillary fd so its lifetime is independent of the caller
+        // closing the original (e.g. close(pipefd[1]) before the receiver calls
+        // recvmsg). The duped fd numbers are stored in rxAnc; recvmsg dups them
+        // again for the receiver then closes the intermediates.
+        const ancFds: number[] | undefined = Array.isArray(req.fds) && req.fds.length > 0
+          ? req.fds.map((fd: number) => opts.kernel!.dup(callerPid, fd))
+          : undefined;
+        const rawHandle = -(target.socket);
+        const result = registry.sendWithAnc(rawHandle, bytes, ancFds);
+        return writeJson(memory, outPtr, outCap, result);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+      }
+    },
+
+    // host_socket_recvmsg(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // SCM_RIGHTS: receive bytes + ancillary fd handles (Slice 5).
+    // Request JSON: { fd, max_data, max_fds }
+    // Response JSON: { ok: true, data_b64, fds: [new_fd, ...] }
+    async host_socket_recvmsg(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): Promise<number> {
+      try {
+        if (!opts.kernel) return writeJson(memory, outPtr, outCap, { ok: false, error: "kernel not configured" });
+        const req = JSON.parse(readString(memory, reqPtr, reqLen));
+        if (typeof req.fd !== "number") return writeJson(memory, outPtr, outCap, { ok: false, error: "missing fd" });
+        const target = opts.kernel.getFdTarget(callerPid, req.fd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return writeJson(memory, outPtr, outCap, { ok: false, error: `not a connected socket fd: ${req.fd}` });
+        }
+        const registry = socketBackend?.registry;
+        if (!registry) return writeJson(memory, outPtr, outCap, { ok: false, error: "loopback backend required" });
+        const maxData = req.max_data ?? 65536;
+        const rawHandle = -(target.socket);
+        // Peek at anc before recv to capture it (recv pops rx and rxAnc together)
+        const ancFdsBefore = registry.peekAnc(rawHandle);
+        const result = await registry.recvAsync(rawHandle, maxData);
+        if (!result.ok) return writeJson(memory, outPtr, outCap, result);
+        // Each ancFd is an intermediate dup created at sendmsg time.
+        // Dup it again to produce the receiver's copy, then close the
+        // intermediate so we don't leak the extra fd reference.
+        const newFds: number[] = [];
+        if (ancFdsBefore) {
+          const maxFds = req.max_fds ?? 16;
+          const slice = ancFdsBefore.slice(0, maxFds);
+          for (const dupFd of slice) {
+            try {
+              const newFd = opts.kernel.dup(callerPid, dupFd);
+              newFds.push(newFd);
+            } finally {
+              opts.kernel.closeFd(callerPid, dupFd);
+            }
+          }
+        }
+        return writeJson(memory, outPtr, outCap, {
+          ok: true,
+          data_b64: bytesToBase64(result.bytes),
+          fds: newFds,
+        });
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+      }
+    },
+
     // host_socket_option(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Applies or reports socket option state owned by the kernel.
     // Request JSON: { fd, option, value? }
@@ -2612,6 +2811,15 @@ export function createKernelImports(
           return writeJson(memory, outPtr, outCap, {
             ok: false,
             error: `not a socket fd: ${req.fd}`,
+          });
+        }
+        if (req.option === "peercred") {
+          // SO_PEERCRED — return peer credentials (Slice 6)
+          return writeJson(memory, outPtr, outCap, {
+            ok: true,
+            pid: target.peerPid ?? 0,
+            uid: target.peerUid ?? 0,
+            gid: target.peerGid ?? 0,
           });
         }
         if (req.option !== "no_delay") {
@@ -2646,8 +2854,8 @@ export function createKernelImports(
     },
 
     // host_socket_socketpair(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // Creates a connected pair of AF_UNIX sockets.
-    // Request JSON: { family, type }   (family=1=AF_UNIX, type=1=SOCK_STREAM)
+    // Creates a connected pair of AF_UNIX sockets (STREAM or DGRAM).
+    // Request JSON: { family, type }   (family=1=AF_UNIX, type=1=STREAM, 2=DGRAM)
     // Response JSON: { ok: true, fds: [int, int] } or { ok: false, error }
     host_socket_socketpair(
       reqPtr: number,
@@ -2669,13 +2877,42 @@ export function createKernelImports(
             error: "AF_UNIX sockets require a loopback socket backend",
           });
         }
-        JSON.parse(readString(memory, reqPtr, reqLen)); // validate JSON (family/type unused — STREAM only for now)
+        const parsed = JSON.parse(readString(memory, reqPtr, reqLen));
+        const sockType = typeof parsed.type === "number" ? parsed.type : 1;
+        const SOCK_DGRAM = 2;
+        if (sockType === SOCK_DGRAM) {
+          // SOCK_DGRAM socketpair
+          const { a, b } = registry.openDgramPair();
+          const makeDgramTarget = (rawHandle: number): FdTarget => ({
+            type: "socket",
+            socket: -rawHandle, // negate for loopback convention
+            family: "AF_UNIX",
+            isDgram: true,
+            refs: 1,
+            peerPid: callerPid ?? 0,
+            peerUid: 0,
+            peerGid: 0,
+            send: socketBackend!.send.bind(socketBackend),
+            recv: socketBackend!.recv.bind(socketBackend),
+            recvAsync: (socket, maxBytes) =>
+              recvSocketAsync(socketBackend!, socket, maxBytes),
+            setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
+            close: (_socket) => { registry.closeDgramSocket(rawHandle); },
+          });
+          const fdA = opts.kernel.allocFd(callerPid, makeDgramTarget(a));
+          const fdB = opts.kernel.allocFd(callerPid, makeDgramTarget(b));
+          return writeJson(memory, outPtr, outCap, { ok: true, fds: [fdA, fdB] });
+        }
+        // SOCK_STREAM socketpair (existing behavior)
         const { a, b } = registry.openUnixPair();
         const makeTarget = (rawHandle: number): FdTarget => ({
           type: "socket",
           socket: -rawHandle, // negate for loopback convention
           family: "AF_UNIX",
           refs: 1,
+          peerPid: callerPid ?? 0,
+          peerUid: 0,
+          peerGid: 0,
           send: socketBackend!.send.bind(socketBackend),
           recv: socketBackend!.recv.bind(socketBackend),
           recvAsync: (socket, maxBytes) =>

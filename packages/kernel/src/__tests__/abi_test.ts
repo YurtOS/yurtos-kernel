@@ -29,6 +29,7 @@ const HAS_BUSYBOX_FIXTURE = existsSync(resolve(FIXTURES, "busybox.wasm"));
 const HAS_DLCANARY_FIXTURE =
   existsSync(resolve(FIXTURES, "libyurt_dlcanary.wasm")) &&
   existsSync(resolve(FIXTURES, "dlopen-canary.wasm"));
+const HAS_UNIX_FIXTURE = existsSync(resolve(FIXTURES, "unix-canary.wasm"));
 
 class StaticFetchBridge implements NetworkBridgeLike {
   requests: Array<{
@@ -78,6 +79,7 @@ class StaticFetchBridge implements NetworkBridgeLike {
 // ─────────────────────────────────────────────────────────────────────
 describe("AF_UNIX (unix-canary)", () => {
   it("pair_basic: socketpair(AF_UNIX, SOCK_STREAM) returns two connected fds", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -89,6 +91,7 @@ describe("AF_UNIX (unix-canary)", () => {
   });
 
   it("bind_listen_accept: bind, listen, and accept on /tmp/foo.sock", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -100,6 +103,7 @@ describe("AF_UNIX (unix-canary)", () => {
   });
 
   it("stat_socket_inode: bind creates an S_IFSOCK inode visible to stat()", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -111,6 +115,7 @@ describe("AF_UNIX (unix-canary)", () => {
   });
 
   it("unlink_removes: unlink of the bound path makes subsequent connect() fail", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -122,6 +127,7 @@ describe("AF_UNIX (unix-canary)", () => {
   });
 
   it("connect_refused: connect to a path with no listener returns ECONNREFUSED", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -133,6 +139,7 @@ describe("AF_UNIX (unix-canary)", () => {
   });
 
   it("abstract_bind_connect: bind/connect with a \\0-prefixed name", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -144,6 +151,7 @@ describe("AF_UNIX (unix-canary)", () => {
   });
 
   it("abstract_invisible_to_stat: abstract names do not appear in the VFS", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -153,14 +161,50 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toContain('{"case":"abstract_invisible_to_stat","exit":0,"stdout":"invisible=ok"}');
   });
-  // TODO(af-unix slice 4): unskip — datagram socketpair preserves message boundaries.
-  it.skip("dgram_pair_message_framing: socketpair SOCK_DGRAM preserves message boundaries", () => {});
-  // TODO(af-unix slice 4): unskip — sendto by path.
-  it.skip("dgram_path_sendto: sendto delivers a datagram to a bound path", () => {});
-  // TODO(af-unix slice 5): unskip — fd passing via sendmsg/SCM_RIGHTS.
-  it.skip("scm_rights_pipe_handoff: sendmsg with SCM_RIGHTS passes a pipe read end", () => {});
-  // TODO(af-unix slice 6): unskip — SO_PEERCRED reads peer pid/uid/gid.
-  it.skip("peercred_after_accept: getsockopt(SO_PEERCRED) returns the peer's ucred", () => {});
+  it("dgram_pair_message_framing: socketpair SOCK_DGRAM preserves message boundaries", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case dgram_pair_message_framing");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"dgram_pair_message_framing","exit":0,"stdout":"dgram=ok"}');
+  });
+  it("dgram_path_sendto: sendto delivers a datagram to a bound path", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case dgram_path_sendto");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"dgram_path_sendto","exit":0,"stdout":"dgram-path=ok"}');
+  });
+  it("scm_rights_pipe_handoff: sendmsg with SCM_RIGHTS passes a pipe read end", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case scm_rights_pipe_handoff");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"scm_rights_pipe_handoff","exit":0,"stdout":"scm=ok"}');
+  });
+  it("peercred_after_accept: getsockopt(SO_PEERCRED) returns the peer's ucred", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case peercred_after_accept");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"peercred_after_accept","exit":0,"stdout":"peercred=ok"}');
+  });
 });
 
 describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }, () => {
