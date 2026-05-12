@@ -261,6 +261,8 @@ Deno.test("kernel_spawn_process allocates pid through kernel and kh adapter", as
     new TextDecoder().decode(proc.command),
     "/bin/kernel-owned-process",
   );
+  assertEquals(mk.killProcess(pid, 15), 0);
+  assertEquals(mk.killProcess(pid, 15), 0);
 });
 
 Deno.test("memory-mediated request/response round-trips bytes", async () => {

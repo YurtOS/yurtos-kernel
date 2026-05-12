@@ -109,8 +109,10 @@ records.
   `kh_destroy_instance`, `kh_process_mem_read`, `kh_process_mem_write`,
   `kh_process_resume`). The portable JS KH adapter now has a host module cache
   and opaque instance-handle table for cached modules, including process memory
-  read/write and destroy. `kh_process_resume` still returns `-ENOSYS` until the
-  scheduler/resume loop lands. The remaining reserved export is
+  read/write and destroy. Kernel `kill` now destroys an attached KH instance
+  handle and clears it only after the KH adapter reports success.
+  `kh_process_resume` still returns `-ENOSYS` until the scheduler/resume loop
+  lands. The remaining reserved export is
   `kernel_snapshot`.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,

@@ -722,9 +722,20 @@ pub fn kill_pid(target: u32, sig: u32) -> i64 {
     if !(1..=63).contains(&sig) {
         return -(abi::EINVAL as i64);
     }
-    with_kernel(|k| {
-        k.process_mut(target).pending_signals |= 1u64 << (sig - 1);
+    let handle = with_kernel(|k| {
+        let p = k.process_mut(target);
+        p.pending_signals |= 1u64 << (sig - 1);
+        p.host_instance_handle
     });
+    if let Some(handle) = handle {
+        let rc = kh::destroy_instance(handle);
+        if rc < 0 {
+            return rc as i64;
+        }
+        with_kernel(|k| {
+            k.process_mut(target).host_instance_handle = None;
+        });
+    }
     0
 }
 
@@ -2614,6 +2625,17 @@ mod tests {
         // Bit 14 (sig 15 - 1) should now be set on pid 5.
         let pending = crate::kernel::with_kernel(|k| k.process_mut(5).pending_signals);
         assert_eq!(pending, 1u64 << 14);
+    }
+
+    #[test]
+    fn kill_clears_host_instance_handle_after_destroy() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(5).host_instance_handle = Some(42);
+        });
+        assert_eq!(kill_pid(5, 15), -(abi::ENOSYS as i64));
+        let handle = crate::kernel::with_kernel(|k| k.process_mut(5).host_instance_handle);
+        assert_eq!(handle, Some(42));
     }
 
     #[test]

@@ -203,7 +203,10 @@ Initial exports:
   table, allocates the pid, stores parentage and argv, and returns the pid. This
   is the forward path for moving process instantiation behind kernel policy.
 - `kernel_kill(pid, signal) -> i64` — apply signal/permission policy and route
-  termination to the process instance through the host mechanism when needed.
+  termination to the process instance through the host mechanism when needed. If
+  the process record has an attached KH instance handle, kernel.wasm calls
+  `kh_destroy_instance` and clears the handle only after the KH adapter reports
+  success.
 - `kernel_wait(caller_pid, child_pid, flags, out_ptr, out_cap) -> i64` —
   wait/reap according to kernel process ownership rules. This is the
   host-control equivalent of the user-facing wait syscall, not a microkernel
