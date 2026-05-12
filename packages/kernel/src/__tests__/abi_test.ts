@@ -707,21 +707,15 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
   });
 
   it("exposes the POSIX socket compatibility header surface", async () => {
-    // socket-canary now exercises socketpair(), which emulates AF_UNIX
-    // SOCK_STREAM via a TCP-loopback listen/accept dance. Allow loopback
-    // listeners so that path can complete. The canary still verifies
-    // that listen() on 0.0.0.0 is denied (EOPNOTSUPP) before the
-    // socketpair section runs.
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
       network: { allowedHosts: ["127.0.0.1", "localhost"] },
-      serverSockets: { allowLoopback: true },
+      serverSockets: { allowUnixDomain: true },
     });
 
     const result = await sandbox.run("socket-canary");
 
-    console.error("DBG sock stdout:", JSON.stringify(result.stdout), "stderr:", JSON.stringify(result.stderr), "exit:", result.exitCode);
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe('{"case":"socket_surface","exit":0}');
   });

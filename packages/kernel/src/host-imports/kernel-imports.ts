@@ -2475,9 +2475,8 @@ export function createKernelImports(
         // that has been bound, connected, or is listening. Accept
         // connected sockets (target.socket !== null), listening sockets
         // (target.listener != null), and bound-but-not-yet-listening
-        // sockets (target.boundPort !== undefined). socketpair()'s
-        // loopback emulation reads back the ephemeral port assigned to
-        // a listener with this call, so listening sockets must work.
+        // sockets (target.boundPort !== undefined). AF_INET listeners
+        // need this so getsockname() can return their ephemeral port.
         if (
           target.socket === null && target.listener == null &&
           target.boundPort === undefined && target.boundPath === undefined

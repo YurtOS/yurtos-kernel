@@ -232,27 +232,28 @@ int main(void) {
 
   freeaddrinfo(res);
 
-  /* socketpair smoke. yurt emulates AF_UNIX/SOCK_STREAM via TCP
-   * loopback. Verify we get a valid pair back, that argument
-   * validation rejects unsupported types/families, and that release
-   * via shutdown(SHUT_RDWR) doesn't fault. */
+  /* socketpair smoke. Verify SOCK_STREAM and SOCK_DGRAM pairs both work,
+   * argument validation rejects invalid families, and shutdown on a stream
+   * pair doesn't fault. */
   int sv[2] = { -1, -1 };
   errno = 0;
   int sp_rc = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
-  int sp_errno = errno;
   if (sp_rc != 0 || sv[0] < 0 || sv[1] < 0) {
-    fprintf(stderr, "DBG socketpair rc=%d errno=%d sv=[%d,%d]\n", sp_rc, sp_errno, sv[0], sv[1]);
     emit("socketpair_basic", 1);
     return 1;
   }
   shutdown(sv[0], SHUT_RDWR);
   shutdown(sv[1], SHUT_RDWR);
 
-  /* Reject SOCK_DGRAM (current emulation is TCP-only). */
-  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != -1 || errno != EPROTOTYPE) {
-    emit("socketpair_rejects_dgram", 1);
+  /* SOCK_DGRAM socketpair (AF_UNIX slice 4+). */
+  int dv[2] = { -1, -1 };
+  errno = 0;
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, dv) != 0 || dv[0] < 0 || dv[1] < 0) {
+    emit("socketpair_dgram", 1);
     return 1;
   }
+  close(dv[0]);
+  close(dv[1]);
 
   /* Reject NULL output array. */
   errno = 0;
