@@ -32,6 +32,14 @@ export function deepCloneInode(inode: Inode): Inode {
     };
   }
 
+  if (inode.type === 'socket') {
+    return {
+      type: 'socket',
+      metadata: { ...inode.metadata },
+      listenerHandle: inode.listenerHandle,
+    };
+  }
+
   // Directory: recursively clone children into a new Map
   const cloned = createDirInode(inode.metadata.permissions);
   cloned.metadata = { ...inode.metadata };

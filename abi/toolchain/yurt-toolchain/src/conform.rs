@@ -109,6 +109,7 @@ pub fn canary_symbol_map() -> &'static [(&'static str, &'static [&'static str])]
                 "sigsuspend",
             ],
         ),
+        ("unix-canary", &["sendmsg", "recvmsg", "accept"]),
         ("sleep-canary", &["tzset"]),
         (
             "system-canary",

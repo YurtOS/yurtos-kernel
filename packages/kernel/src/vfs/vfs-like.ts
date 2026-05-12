@@ -4,7 +4,7 @@
  * Used by WasiHost, ProcessManager, and worker-side process runners so they can
  * accept either the real VFS (main thread) or VfsProxy (Worker thread).
  */
-import type { DirEntry, FsCredential, StatResult } from './inode.js';
+import type { DirEntry, FsCredential, SocketInode, StatResult } from './inode.js';
 import type { OverlayState } from './overlay-vfs.js';
 import type { ProcessInfo } from './proc-provider.js';
 import type { MountEntry, VirtualProvider } from './provider.js';
@@ -60,4 +60,8 @@ export interface VfsLike {
   exportOverlayState?(): OverlayState;
   importOverlayState?(state: OverlayState): void;
   exportUpperVfs?(): VfsLike;
+  /** Create a socket inode at the given path (AF_UNIX bind). */
+  createSocket?(path: string, permissions?: number): void;
+  /** Return the SocketInode at path, or null if absent/not a socket. */
+  getSocketInode?(path: string): SocketInode | null;
 }

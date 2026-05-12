@@ -88,6 +88,8 @@ For Wasmtime host embedding (Engine/Store/Module/Linker/fuel/epoch), WASI previe
 - Wasm guest crates target `wasm32-wasip1`. Build them explicitly: `cargo build --target wasm32-wasip1 -p <crate>`. They are excluded from default native builds intentionally — do not "fix" build errors by linking them natively.
 - Toolchain pieces (`yurt-toolchain`, `yurt-wasi-postlink`) and host shims live under `abi/`. Generated artifacts are checked in but kept out of live paths; see `.github/workflows/guest-compat.yml` for the canonical build commands.
 - For ABI / shim design questions, consult the design docs under `docs/superpowers/specs/` before changing exported symbols.
+- **No JSON at the guest↔kernel boundary.** Host imports are typed WASM function calls (i32/i64/ptr+len), not JSON-over-shared-memory. Complex in/out structs use a caller-allocated buffer with a fixed binary layout (like WASI preview1). `snprintf`+`JSON.parse` on every syscall is a hard antipattern — treat any new JSON serialization at this boundary as a bug.
+- **Buffer logic lives in safe Rust.** C files under `abi/` are thin shims that marshal arguments and forward to a Rust crate. Any code that formats a request, parses a response, or touches byte buffers belongs in Rust, not C.
 
 ## Tests
 

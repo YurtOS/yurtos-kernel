@@ -39,17 +39,26 @@ export type FdTarget =
     socket: SocketHandle | null;
     listener?: SocketListenerHandle | null;
     refs: number;
+    family?: "AF_INET" | "AF_UNIX";
     boundHost?: "127.0.0.1" | "localhost" | "0.0.0.0";
     boundPort?: number;
+    boundPath?: string;
     peerHost?: string;
     peerPort?: number;
     localHost?: string;
     localPort?: number;
+    peerPath?: string;
     noDelay?: boolean;
     peekBuffer?: Uint8Array;
     fdFlags?: number;
     readShutdown?: boolean;
     writeShutdown?: boolean;
+    /** SOCK_DGRAM socket — set when the fd is a datagram socket (Slice 4). */
+    isDgram?: boolean;
+    /** SO_PEERCRED fields (Slice 6) */
+    peerPid?: number;
+    peerUid?: number;
+    peerGid?: number;
     send: (socket: SocketHandle, dataB64: string) => SocketBackendResult;
     recv: (
       socket: SocketHandle,
