@@ -2443,6 +2443,142 @@ export function createKernelImports(
       return writeLen;
     },
 
+    // host_socket_listen_unix(sockfd, backlog) -> 0 | -1 | -2
+    // listen() for AF_UNIX sockets (pathname and abstract), bypassing JSON.
+    // Returns 0 on success, -1 on error, -2 if sockfd is not AF_UNIX (caller uses JSON path).
+    host_socket_listen_unix(sockfd: number, backlog: number): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -2;
+      if (target.family !== "AF_UNIX" && typeof target.boundPath !== "string") return -2;
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const path = target.boundPath!;
+      const cap = backlog > 0 ? backlog : 128;
+      try {
+        if (path.startsWith("\0")) {
+          const abstractName = path.slice(1);
+          const auth = authorizeUnixAbstract(opts.serverSockets, abstractName);
+          if (!auth.ok) return -1;
+          const rawHandle = registry.listenOnAbstract(abstractName, cap);
+          target.listener = -rawHandle;
+          target.closeListener = () => { registry.closeAbstractListener(abstractName); };
+        } else {
+          const auth = authorizeUnixListen(opts.serverSockets, path);
+          if (!auth.ok) return -1;
+          const rawHandle = registry.listenOnPath(path, cap);
+          target.listener = -rawHandle;
+          const boundPath = path;
+          target.closeListener = () => {
+            registry.closePathListener(boundPath);
+            try { opts.vfs?.unlink(boundPath); } catch { /* already gone */ }
+          };
+        }
+        return 0;
+      } catch {
+        return -1;
+      }
+    },
+
+    // host_socket_accept_unix(sockfd) -> new_fd | -1 | -2
+    // accept() for AF_UNIX sockets, bypassing JSON. Async (JSPI/Asyncify).
+    // Returns the new accepted fd on success, -1 on error, -2 if sockfd is not AF_UNIX.
+    async host_socket_accept_unix(sockfd: number): Promise<number> {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (
+        !target || target.type !== "socket" ||
+        target.family !== "AF_UNIX" || target.listener == null
+      ) return -2;
+      if (!opts.kernel || !socketBackend?.registry) return -1;
+      const rawHandle = -(target.listener);
+      const accepted = await socketBackend.registry.acceptUnix(rawHandle);
+      return opts.kernel.allocFd(callerPid, {
+        type: "socket",
+        socket: -(accepted.socket),
+        family: "AF_UNIX",
+        boundPath: accepted.localPath,
+        peerPath: accepted.peerPath,
+        refs: 1,
+        peerPid: callerPid ?? 0,
+        peerUid: 0,
+        peerGid: 0,
+        send: socketBackend.send.bind(socketBackend),
+        recv: socketBackend.recv.bind(socketBackend),
+        recvAsync: (socket, maxBytes) =>
+          recvSocketAsync(socketBackend, socket, maxBytes),
+        setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+        close: (socket) => { socketBackend.close(socket); },
+      });
+    },
+
+    // host_socket_send_unix(sockfd, buf_ptr, buf_len) -> bytes | -1 | -2
+    // send() for AF_UNIX STREAM sockets, passing raw bytes without base64. Synchronous.
+    // Returns byte count on success, -1 on error, -2 if sockfd is not AF_UNIX STREAM.
+    host_socket_send_unix(sockfd: number, bufPtr: number, bufLen: number): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -2;
+      if (target.family !== "AF_UNIX" || target.isDgram) return -2;
+      const socket = target.socket as number | null;
+      if (socket === null || socket >= 0) return -1; // registry sockets are stored negative
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const bytes = new Uint8Array(memory.buffer, bufPtr, bufLen);
+      const result = registry.send(-socket, new Uint8Array(bytes));
+      if (!result.ok) return -1;
+      return result.bytesSent;
+    },
+
+    // host_socket_recv_unix(sockfd, buf_ptr, buf_cap, peek) -> bytes | -1 | -2 | -3
+    // recv() for AF_UNIX STREAM sockets, writing raw bytes without base64. Async.
+    // Returns byte count on success, -1 on error, -2 for EAGAIN, -3 if not AF_UNIX STREAM.
+    async host_socket_recv_unix(
+      sockfd: number,
+      bufPtr: number,
+      bufCap: number,
+      peek: number,
+    ): Promise<number> {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -3;
+      if (target.family !== "AF_UNIX" || target.isDgram) return -3;
+      const socket = target.socket as number | null;
+      if (socket === null || socket >= 0) return -1;
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const regHandle = -socket;
+      const isPeek = peek !== 0;
+      const nonblocking = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+
+      function writeResult(bytes: Uint8Array): number {
+        const n = Math.min(bytes.byteLength, bufCap);
+        new Uint8Array(memory.buffer, bufPtr, n).set(bytes.subarray(0, n));
+        return n;
+      }
+
+      // Drain peekBuffer first (populated by a previous MSG_PEEK call).
+      if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
+        const chunk = target.peekBuffer.slice(0, bufCap);
+        if (!isPeek) target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+        return writeResult(chunk);
+      }
+
+      if (isPeek) {
+        // Nonblocking probe: stash result in peekBuffer for the next real recv.
+        const probe = registry.recv(regHandle, bufCap, { nonblocking: true });
+        if (!probe.ok) return -2;
+        target.peekBuffer = probe.bytes;
+        return writeResult(probe.bytes);
+      }
+
+      if (nonblocking) {
+        const probe = registry.recv(regHandle, bufCap, { nonblocking: true });
+        if (!probe.ok) return probe.error === "EAGAIN" ? -2 : -1;
+        return writeResult(probe.bytes);
+      }
+
+      const result = await registry.recvAsync(regHandle, bufCap);
+      if (!result.ok) return -1;
+      return writeResult(result.bytes);
+    },
+
     // host_socket_listen(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Creates a backend listener for a socket fd after sandbox policy authorizes it.
     host_socket_listen(

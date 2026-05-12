@@ -601,6 +601,12 @@ int listen(int sockfd, int backlog) {
   int req_len;
   int n;
 
+  /* Try typed AF_UNIX path first. */
+  int r = yurt_host_socket_listen_unix(sockfd, backlog);
+  if (r == 0) return 0;
+  if (r == -1) { errno = EADDRINUSE; return -1; }
+  /* r == -2: not AF_UNIX, fall through to JSON. */
+
   req_len = snprintf(req, sizeof(req), "{\"fd\":%d,\"backlog\":%d}", sockfd, backlog);
   if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
     errno = EOVERFLOW;
@@ -624,6 +630,15 @@ static int yurt_accept_impl(int sockfd, struct sockaddr *addr, socklen_t *addrle
   int req_len;
   int n;
   int attempts = 0;
+
+  /* Try typed AF_UNIX path first. */
+  int unix_fd = yurt_host_socket_accept_unix(sockfd);
+  if (unix_fd >= 0) {
+    accepted_fd = unix_fd;
+    goto fill_addr;
+  }
+  if (unix_fd == -1) { errno = EOPNOTSUPP; return -1; }
+  /* unix_fd == -2: not AF_UNIX, fall through to JSON spin-loop. */
 
   req_len = snprintf(req, sizeof(req), "{\"fd\":%d}", sockfd);
   if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
@@ -652,6 +667,8 @@ static int yurt_accept_impl(int sockfd, struct sockaddr *addr, socklen_t *addrle
   if (parse_json_int(resp, (size_t)n, "fd", &accepted_fd) != 0) {
     return -1;
   }
+
+fill_addr:
   if (addr && addrlen) {
     /* Try typed AF_UNIX peer path first. */
     char path_buf[108];
@@ -704,6 +721,14 @@ static ssize_t yurt_send_impl(int sockfd, const void *buf, size_t len, int flags
   int bytes_sent = 0;
 
   (void)flags;
+  /* Try typed AF_UNIX STREAM path first (avoids base64). */
+  {
+    int r = yurt_host_socket_send_unix(sockfd, (int)(intptr_t)buf, (int)len);
+    if (r >= 0) return (ssize_t)r;
+    if (r == -1) { errno = EIO; return -1; }
+    /* r == -2: not AF_UNIX STREAM, fall through to base64 JSON path. */
+  }
+
   encoded = malloc(((len + 2) / 3) * 4 + 1);
   req = malloc(((len + 2) / 3) * 4 + 128);
   if (!encoded || !req) {
@@ -755,6 +780,16 @@ static ssize_t yurt_recv_impl(int sockfd, void *buf, size_t len, int flags) {
 
   if (len > YURT_SOCKET_RECV_MAX_RAW) {
     len = YURT_SOCKET_RECV_MAX_RAW;
+  }
+
+  /* Try typed AF_UNIX STREAM path first (avoids base64). */
+  {
+    int is_peek = (flags == MSG_PEEK || flags == YURT_MSG_PEEK) ? 1 : 0;
+    int r = yurt_host_socket_recv_unix(sockfd, (int)(intptr_t)buf, (int)len, is_peek);
+    if (r >= 0) return (ssize_t)r;
+    if (r == -2) { errno = EAGAIN; return -1; }
+    if (r == -1) { errno = EIO; return -1; }
+    /* r == -3: not AF_UNIX STREAM, fall through to base64 JSON path. */
   }
 
   req_len = snprintf(

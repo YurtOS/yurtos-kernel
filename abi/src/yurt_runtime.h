@@ -251,6 +251,35 @@ __attribute__((import_module("yurt"), import_name("host_socket_addr_unix")))
 int yurt_host_socket_addr_unix(int sockfd, int is_peer,
                                 int path_ptr, int path_cap, int is_abstract_ptr);
 
+/* host_socket_listen_unix(sockfd, backlog) -> 0 | -1 | -2
+ * listen() for AF_UNIX sockets (pathname and abstract), bypassing JSON.
+ * Returns 0 on success, -1 on error (EADDRINUSE etc.), -2 if sockfd is not AF_UNIX
+ * (caller falls back to the JSON host_socket_listen path). */
+__attribute__((import_module("yurt"), import_name("host_socket_listen_unix")))
+int yurt_host_socket_listen_unix(int sockfd, int backlog);
+
+/* host_socket_accept_unix(sockfd) -> new_fd | -1 | -2
+ * accept() for AF_UNIX sockets. Blocks until a connection arrives (JSPI/Asyncify).
+ * Returns the new accepted fd, -1 on error, -2 if sockfd is not an AF_UNIX listener
+ * (caller falls back to the JSON host_socket_accept spin-loop path). */
+__attribute__((import_module("yurt"), import_name("host_socket_accept_unix")))
+int yurt_host_socket_accept_unix(int sockfd);
+
+/* host_socket_send_unix(sockfd, buf_ptr, buf_len) -> bytes | -1 | -2
+ * send() for AF_UNIX STREAM sockets, passing raw bytes (no base64). Synchronous.
+ * Returns byte count on success, -1 on error, -2 if sockfd is not AF_UNIX STREAM
+ * (caller falls back to the base64 JSON host_socket_send path). */
+__attribute__((import_module("yurt"), import_name("host_socket_send_unix")))
+int yurt_host_socket_send_unix(int sockfd, int buf_ptr, int buf_len);
+
+/* host_socket_recv_unix(sockfd, buf_ptr, buf_cap, peek) -> bytes | -1 | -2 | -3
+ * recv() for AF_UNIX STREAM sockets, writing raw bytes (no base64). Async (JSPI).
+ * Returns byte count on success, -1 on error, -2 for EAGAIN, -3 if sockfd is not
+ * AF_UNIX STREAM (caller falls back to the base64 JSON host_socket_recv path).
+ * peek=1 reads without consuming (MSG_PEEK semantics). */
+__attribute__((import_module("yurt"), import_name("host_socket_recv_unix")))
+int yurt_host_socket_recv_unix(int sockfd, int buf_ptr, int buf_cap, int peek);
+
 /* host_socket_sendmsg(sockfd, data_ptr, data_len, fds_ptr, fds_count) -> bytes | -1
  * Reads data_len bytes from data_ptr; reads fds_count i32 fd numbers from
  * fds_ptr (pass 0 when there are no ancillary fds). */
