@@ -2003,6 +2003,7 @@ export function createKernelImports(
           socket: -rawHandle, // negate for loopback convention
           family: "AF_UNIX",
           isDgram: true,
+          fdFlags: (type & SOCK_NONBLOCK) !== 0 ? WASI_FDFLAGS_NONBLOCK : 0,
           refs: 1,
           send: (socket, dataB64) =>
             socketBackend?.send(socket, dataB64) ??
@@ -2092,12 +2093,13 @@ export function createKernelImports(
           if (!unixResult.ok) {
             return writeJson(memory, outPtr, outCap, { ok: false, error: unixResult.error });
           }
+          const jsonConnCreds = opts.kernel?.getCredentials(callerPid ?? 0);
           target.socket = -unixResult.socket; // negate for loopback convention
           target.family = "AF_UNIX";
           target.peerPath = `\0${req.abstract}`;
           target.peerPid = callerPid ?? 0;
-          target.peerUid = 0;
-          target.peerGid = 0;
+          target.peerUid = jsonConnCreds?.euid ?? 0;
+          target.peerGid = jsonConnCreds?.egid ?? 0;
           return writeJson(memory, outPtr, outCap, { ok: true });
         }
 
@@ -2110,7 +2112,8 @@ export function createKernelImports(
               error: "AF_UNIX sockets require a loopback socket backend",
             });
           }
-          const unixResult = registry.connectToPath(req.path);
+          const jsonConnCreds2 = opts.kernel?.getCredentials(callerPid ?? 0);
+          const unixResult = registry.connectToPath(req.path, callerPid, jsonConnCreds2?.euid, jsonConnCreds2?.egid);
           if (!unixResult.ok) {
             return writeJson(memory, outPtr, outCap, { ok: false, error: unixResult.error });
           }
@@ -2118,8 +2121,8 @@ export function createKernelImports(
           target.family = "AF_UNIX";
           target.peerPath = req.path;
           target.peerPid = callerPid ?? 0;
-          target.peerUid = 0;
-          target.peerGid = 0;
+          target.peerUid = jsonConnCreds2?.euid ?? 0;
+          target.peerGid = jsonConnCreds2?.egid ?? 0;
           return writeJson(memory, outPtr, outCap, { ok: true });
         }
 
@@ -2316,6 +2319,7 @@ export function createKernelImports(
         new Uint8Array(memory.buffer, pathPtr, pathLen),
       );
       let result: { ok: boolean; socket?: number; error?: string };
+      const connCreds = opts.kernel?.getCredentials(callerPid ?? 0);
       if (isAbstract) {
         result = registry.connectToAbstract(name);
         if (!result.ok) return -1;
@@ -2323,18 +2327,18 @@ export function createKernelImports(
         target.family = "AF_UNIX";
         target.peerPath = `\0${name}`;
         target.peerPid = callerPid ?? 0;
-        target.peerUid = 0;
-        target.peerGid = 0;
+        target.peerUid = connCreds?.euid ?? 0;
+        target.peerGid = connCreds?.egid ?? 0;
         return 0;
       }
-      result = registry.connectToPath(name, callerPid);
+      result = registry.connectToPath(name, callerPid, connCreds?.euid, connCreds?.egid);
       if (!result.ok) return -1;
       target.socket = -(result.socket as number);
       target.family = "AF_UNIX";
       target.peerPath = name;
       target.peerPid = callerPid ?? 0;
-      target.peerUid = 0;
-      target.peerGid = 0;
+      target.peerUid = connCreds?.euid ?? 0;
+      target.peerGid = connCreds?.egid ?? 0;
       return 0;
     },
 
@@ -2383,7 +2387,10 @@ export function createKernelImports(
       if (!target || target.type !== "socket" || !target.isDgram) return -1;
       if (target.socket == null) return -1;
       const rawHandle = -(target.socket as number);
-      const result = await registry.recvDgramAsync(rawHandle, bufCap);
+      const nonblocking = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+      const result = nonblocking
+        ? registry.recvDgram(rawHandle, bufCap, true)
+        : await registry.recvDgramAsync(rawHandle, bufCap);
       if (!result.ok) return -2;
       const bytes = (result as { ok: true; bytes: Uint8Array }).bytes;
       const recvLen = Math.min(bytes.length, bufCap);
@@ -2444,6 +2451,13 @@ export function createKernelImports(
       return writeLen;
     },
 
+    // host_socket_is_dgram(sockfd) -> 1 (SOCK_DGRAM) | 0 (SOCK_STREAM) | -1 (not a socket)
+    host_socket_is_dgram(sockfd: number): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -1;
+      return target.isDgram ? 1 : 0;
+    },
+
     // host_socket_listen_unix(sockfd, backlog) -> 0 | -1 | -2
     // listen() for AF_UNIX sockets (pathname and abstract), bypassing JSON.
     // Returns 0 on success, -1 on error, -2 if sockfd is not AF_UNIX (caller uses JSON path).
@@ -2500,8 +2514,8 @@ export function createKernelImports(
         peerPath: accepted.peerPath,
         refs: 1,
         peerPid: accepted.peerPid ?? 0,
-        peerUid: 0,
-        peerGid: 0,
+        peerUid: accepted.peerUid ?? 0,
+        peerGid: accepted.peerGid ?? 0,
         send: socketBackend.send.bind(socketBackend),
         recv: socketBackend.recv.bind(socketBackend),
         recvAsync: (socket, maxBytes) =>
@@ -2539,7 +2553,23 @@ export function createKernelImports(
     ): Promise<number> {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -3;
-      if (target.family !== "AF_UNIX" || target.isDgram) return -3;
+      if (target.family !== "AF_UNIX") return -3;
+      // DGRAM sockets: use recvDgram / recvDgramAsync (ignores fromPath for plain recv)
+      if (target.isDgram) {
+        if (target.socket == null) return -1;
+        const rawHandle = -(target.socket as number);
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        const nonblockingDgram = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+        const dgramResult = nonblockingDgram
+          ? registry.recvDgram(rawHandle, bufCap, true)
+          : await registry.recvDgramAsync(rawHandle, bufCap);
+        if (!dgramResult.ok) return -2;
+        const dgramBytes = (dgramResult as { ok: true; bytes: Uint8Array }).bytes;
+        const n = Math.min(dgramBytes.length, bufCap);
+        new Uint8Array(memory.buffer, bufPtr, n).set(dgramBytes.subarray(0, n));
+        return n;
+      }
       const socket = target.socket as number | null;
       if (socket === null || socket >= 0) return -1;
       const registry = socketBackend?.registry;
@@ -2733,9 +2763,9 @@ export function createKernelImports(
             boundPath: unixAccepted.localPath,
             peerPath: unixAccepted.peerPath,
             refs: 1,
-            peerPid: callerPid ?? 0,
-            peerUid: 0,
-            peerGid: 0,
+            peerPid: unixAccepted.peerPid ?? 0,
+            peerUid: unixAccepted.peerUid ?? 0,
+            peerGid: unixAccepted.peerGid ?? 0,
             send: socketBackend.send.bind(socketBackend),
             recv: socketBackend.recv.bind(socketBackend),
             recvAsync: (socket, maxBytes) =>
@@ -3219,6 +3249,7 @@ export function createKernelImports(
       try {
         if (!opts.kernel || !socketBackend?.registry) return -1;
         const registry = socketBackend.registry;
+        const pairCreds = opts.kernel.getCredentials(callerPid ?? 0);
         const SOCK_DGRAM = 5; // wasi-sdk-30 value passed by C via base_type
         let fdA: number, fdB: number;
         if (sockType === SOCK_DGRAM) {
@@ -3230,8 +3261,8 @@ export function createKernelImports(
             isDgram: true,
             refs: 1,
             peerPid: callerPid ?? 0,
-            peerUid: 0,
-            peerGid: 0,
+            peerUid: pairCreds.euid,
+            peerGid: pairCreds.egid,
             send: socketBackend!.send.bind(socketBackend),
             recv: socketBackend!.recv.bind(socketBackend),
             recvAsync: (socket, maxBytes) =>
@@ -3249,8 +3280,8 @@ export function createKernelImports(
             family: "AF_UNIX",
             refs: 1,
             peerPid: callerPid ?? 0,
-            peerUid: 0,
-            peerGid: 0,
+            peerUid: pairCreds.euid,
+            peerGid: pairCreds.egid,
             send: socketBackend!.send.bind(socketBackend),
             recv: socketBackend!.recv.bind(socketBackend),
             recvAsync: (socket, maxBytes) =>

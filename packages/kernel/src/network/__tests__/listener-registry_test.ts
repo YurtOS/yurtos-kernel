@@ -424,6 +424,16 @@ describe("ListenerRegistry AF_UNIX abstract namespace", () => {
     const accepted = await acceptP;
     expect(accepted.peerPid).toBe(42);
   });
+
+  it("connectToPath carries connecting uid/gid in the accepted UnixAcceptedConnection", async () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnPath("/tmp/peercred-ugid.sock", 16);
+    const acceptP = reg.acceptUnix(handle);
+    reg.connectToPath("/tmp/peercred-ugid.sock", 7, 1000, 1000);
+    const accepted = await acceptP;
+    expect(accepted.peerUid).toBe(1000);
+    expect(accepted.peerGid).toBe(1000);
+  });
 });
 
 describe("ListenerRegistry AF_UNIX socketpair", () => {

@@ -972,7 +972,7 @@ static int yurt_getsockopt_impl(int sockfd, int level, int optname, void *optval
 
   switch (optname) {
     case SO_TYPE:
-      value = SOCK_STREAM;
+      value = (yurt_host_socket_is_dgram(sockfd) == 1) ? SOCK_DGRAM : SOCK_STREAM;
       break;
     case SO_ERROR:
 #if YURT_SO_ERROR != SO_ERROR

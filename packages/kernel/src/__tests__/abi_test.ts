@@ -273,6 +273,42 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toContain('{"case":"dgram_bind_rollback","exit":0,"stdout":"dgram-rollback=ok"}');
   });
+
+  it("dgram_so_type: getsockopt(SO_TYPE) on a SOCK_DGRAM socket returns SOCK_DGRAM", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case dgram_so_type");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"dgram_so_type","exit":0,"stdout":"so_type=ok"}');
+  });
+
+  it("dgram_nonblocking_recv: SOCK_NONBLOCK dgram recv returns EAGAIN immediately when empty", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case dgram_nonblocking_recv");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"dgram_nonblocking_recv","exit":0,"stdout":"nb-recv=ok"}');
+  });
+
+  it("peercred_uid_gid: SO_PEERCRED reports uid=1000/gid=1000 for sandbox processes", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case peercred_uid_gid");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"peercred_uid_gid","exit":0,"stdout":"uid-gid=ok"}');
+  });
 });
 
 describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }, () => {

@@ -740,6 +740,80 @@ static int case_scm_rights_truncation(void) {
   return 1;
 }
 
+/* getsockopt(SO_TYPE) on a SOCK_DGRAM socket must return SOCK_DGRAM, not SOCK_STREAM. */
+static int case_dgram_so_type(void) {
+  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (fd < 0) { emit("dgram_so_type", 1, NULL, 1, errno); return 1; }
+  int type = -1;
+  socklen_t optlen = sizeof(type);
+  if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &optlen) != 0) {
+    emit("dgram_so_type", 1, "getsockopt-fail", 1, errno);
+    close(fd); return 1;
+  }
+  close(fd);
+  if (type == SOCK_DGRAM) {
+    emit("dgram_so_type", 0, "so_type=ok", 0, 0);
+    return 0;
+  }
+  emit("dgram_so_type", 1, "wrong-type", 0, 0);
+  return 1;
+}
+
+/* A SOCK_NONBLOCK DGRAM socket with no queued data must return EAGAIN, not block. */
+static int case_dgram_nonblocking_recv(void) {
+  const char *path = "/tmp/yurt-dgram-nb.sock";
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+  socklen_t addrlen = (socklen_t)sizeof(addr);
+
+  int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+  if (fd < 0) { emit("dgram_nonblocking_recv", 1, NULL, 1, errno); return 1; }
+
+  unlink(path);
+  if (bind(fd, (struct sockaddr *)&addr, addrlen) != 0) {
+    emit("dgram_nonblocking_recv", 1, "bind-fail", 1, errno);
+    close(fd); return 1;
+  }
+
+  char buf[32];
+  ssize_t n = recv(fd, buf, sizeof(buf), 0);
+  int saved_errno = errno;
+  close(fd);
+  unlink(path);
+
+  if (n < 0 && saved_errno == EAGAIN) {
+    emit("dgram_nonblocking_recv", 0, "nb-recv=ok", 0, 0);
+    return 0;
+  }
+  emit("dgram_nonblocking_recv", 1, n < 0 ? "wrong-errno" : "unexpected-data", 1, saved_errno);
+  return 1;
+}
+
+/* SO_PEERCRED on a socket pair must report uid=1000/gid=1000 (the sandbox user). */
+static int case_peercred_uid_gid(void) {
+  int sv[2];
+  struct ucred cred;
+  socklen_t credlen = sizeof(cred);
+
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    emit("peercred_uid_gid", 1, NULL, 1, errno); return 1;
+  }
+  memset(&cred, 0xff, sizeof(cred));
+  if (getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &cred, &credlen) != 0) {
+    emit("peercred_uid_gid", 1, "getsockopt-fail", 1, errno);
+    close(sv[0]); close(sv[1]); return 1;
+  }
+  close(sv[0]); close(sv[1]);
+  if (cred.uid == 1000 && cred.gid == 1000) {
+    emit("peercred_uid_gid", 0, "uid-gid=ok", 0, 0);
+    return 0;
+  }
+  emit("peercred_uid_gid", 1, "wrong-uid-gid", 0, 0);
+  return 1;
+}
+
 /* If a dgram bind fails, the route must not leak.
  * Verify by: (1) create a regular file at the bind path, so createSocket
  * returns EEXIST and bind fails; (2) unlink the file; (3) bind a fresh
@@ -810,6 +884,9 @@ static int run_case(const char *name) {
   if (strcmp(name, "dgram_sendto_after_unlink") == 0)  return case_dgram_sendto_after_unlink();
   if (strcmp(name, "scm_rights_truncation") == 0)      return case_scm_rights_truncation();
   if (strcmp(name, "dgram_bind_rollback") == 0)        return case_dgram_bind_rollback();
+  if (strcmp(name, "dgram_so_type") == 0)              return case_dgram_so_type();
+  if (strcmp(name, "dgram_nonblocking_recv") == 0)     return case_dgram_nonblocking_recv();
+  if (strcmp(name, "peercred_uid_gid") == 0)           return case_peercred_uid_gid();
   fprintf(stderr, "unix-canary: unknown case %s\n", name);
   return 2;
 }
@@ -829,6 +906,9 @@ static int list_cases(void) {
   puts("dgram_sendto_after_unlink");
   puts("scm_rights_truncation");
   puts("dgram_bind_rollback");
+  puts("dgram_so_type");
+  puts("dgram_nonblocking_recv");
+  puts("peercred_uid_gid");
   return 0;
 }
 

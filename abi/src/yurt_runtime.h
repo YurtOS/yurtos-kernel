@@ -251,6 +251,10 @@ __attribute__((import_module("yurt"), import_name("host_socket_addr_unix")))
 int yurt_host_socket_addr_unix(int sockfd, int is_peer,
                                 int path_ptr, int path_cap, int is_abstract_ptr);
 
+/* host_socket_is_dgram(sockfd) -> 1 (SOCK_DGRAM) | 0 (SOCK_STREAM) | -1 (not a socket) */
+__attribute__((import_module("yurt"), import_name("host_socket_is_dgram")))
+int yurt_host_socket_is_dgram(int sockfd);
+
 /* host_socket_listen_unix(sockfd, backlog) -> 0 | -1 | -2
  * listen() for AF_UNIX sockets (pathname and abstract), bypassing JSON.
  * Returns 0 on success, -1 on error (EADDRINUSE etc.), -2 if sockfd is not AF_UNIX
