@@ -2251,177 +2251,62 @@ export function createKernelImports(
     // host_socket_connect(fd, host_ptr, host_len, port, flags) -> i32
     // Opens a TCP or TLS socket to the given host:port.
     host_socket_connect(
-      fdOrReqPtr: number,
-      hostPtrOrReqLen: number,
-      hostLenOrOutPtr: number,
-      portOrOutCap: number,
-      flags?: number,
+      fd: number,
+      hostPtr: number,
+      hostLen: number,
+      port: number,
+      flags: number,
     ): number {
-      if (flags !== undefined) {
-        if (!socketBackend) return -5;
-        const fd = fdOrReqPtr;
-        const host = readString(memory, hostPtrOrReqLen, hostLenOrOutPtr);
-        const port = portOrOutCap;
-        if (!host || port < 0 || port > 65535) return -22;
-        const target = opts.kernel?.getFdTarget(callerPid, fd);
-        if (!target || target.type !== "socket") return -9;
-        const result = socketBackend.connect({
-          host,
-          port,
-          tls: (flags & 1) !== 0,
-        });
-        if (!result.ok) return -111;
-        if (target.noDelay) {
-          const optionResult = target.setNoDelay?.(result.socket, true) ??
-            {
-              ok: false,
-              error: "TCP_NODELAY not supported by socket backend",
-            };
-          if (!optionResult.ok) return -95;
-        }
-        target.socket = result.socket;
-        target.peerHost = result.peerHost ?? host;
-        target.peerPort = result.peerPort ?? port;
-        target.localHost = result.localHost ?? socketLocalHost;
-        target.localPort = result.localPort ?? socketLocalPortForFd(fd);
-        return 0;
-      }
-
-      const reqPtr = fdOrReqPtr;
-      const reqLen = hostPtrOrReqLen;
-      const outPtr = hostLenOrOutPtr;
-      const outCap = portOrOutCap;
-      if (!socketBackend) {
-        return writeJson(memory, outPtr, outCap, {
-          ok: false,
-          error: "networking not configured",
-        });
-      }
-      try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
+      if (!socketBackend) return -5;
+      const host = readString(memory, hostPtr, hostLen);
+      if (!host || port < 0 || port > 65535) return -22;
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") return -9;
+      const result = socketBackend.connect({
+        host,
+        port,
+        tls: (flags & 1) !== 0,
+      });
+      if (!result.ok) return -111;
+      if (target.noDelay) {
+        const optionResult = target.setNoDelay?.(result.socket, true) ??
+          {
             ok: false,
-            error: "missing socket fd",
-          });
-        }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a socket fd: ${req.fd}`,
-          });
-        }
-        // AF_INET connect
-        const result = socketBackend.connect({
-          host: req.host,
-          port: req.port,
-          tls: req.tls ?? false,
-        });
-        if (result.ok) {
-          if (target.noDelay) {
-            const optionResult = target.setNoDelay?.(result.socket, true) ??
-              {
-                ok: false,
-                error: "TCP_NODELAY not supported by socket backend",
-              };
-            if (!optionResult.ok) {
-              return writeJson(memory, outPtr, outCap, optionResult);
-            }
-          }
-          target.socket = result.socket;
-          // Prefer backend-reported addresses so getsockname/getpeername stay
-          // consistent with what the peer's accept()ed socket sees. Fall back
-          // to synthetic values for legacy backends that omit them.
-          target.peerHost = result.peerHost ??
-            (typeof req.host === "string" ? req.host : "0.0.0.0");
-          target.peerPort = result.peerPort ??
-            (typeof req.port === "number" ? req.port : 0);
-          target.localHost = result.localHost ?? socketLocalHost;
-          target.localPort = result.localPort ?? socketLocalPortForFd(req.fd);
-          return writeJson(memory, outPtr, outCap, { ok: true });
-        }
-        return writeJson(memory, outPtr, outCap, result);
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+            error: "TCP_NODELAY not supported by socket backend",
+          };
+        if (!optionResult.ok) return -95;
       }
+      target.socket = result.socket;
+      target.peerHost = result.peerHost ?? host;
+      target.peerPort = result.peerPort ?? port;
+      target.localHost = result.localHost ?? socketLocalHost;
+      target.localPort = result.localPort ?? socketLocalPortForFd(fd);
+      return 0;
     },
 
     // host_socket_bind(fd, host_ptr, host_len, port) -> i32
     // Records the sandbox-visible local address requested for a socket fd.
     // AF_UNIX: req = { fd, path }; AF_INET: req = { fd, host, port }
     host_socket_bind(
-      fdOrReqPtr: number,
-      hostPtrOrReqLen: number,
-      hostLenOrOutPtr: number,
-      portOrOutCap: number,
+      fd: number,
+      hostPtr: number,
+      hostLen: number,
+      port: number,
     ): number {
-      if (hostLenOrOutPtr < 256) {
-        const fd = fdOrReqPtr;
-        const host = readString(memory, hostPtrOrReqLen, hostLenOrOutPtr);
-        const port = portOrOutCap;
-        const target = opts.kernel?.getFdTarget(callerPid, fd);
-        if (!target || target.type !== "socket") return -9;
-        if (
-          host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
-        ) {
-          return -95;
-        }
-        if (!Number.isInteger(port) || port < 0 || port > 65535) return -22;
-        target.boundHost = host;
-        target.boundPort = port;
-        target.localHost = host === "0.0.0.0" ? socketLocalHost : host;
-        target.localPort = port;
-        return 0;
+      const host = readString(memory, hostPtr, hostLen);
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") return -9;
+      if (
+        host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
+      ) {
+        return -95;
       }
-
-      const reqPtr = fdOrReqPtr;
-      const reqLen = hostPtrOrReqLen;
-      const outPtr = hostLenOrOutPtr;
-      const outCap = portOrOutCap;
-      try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
-        }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a socket fd: ${req.fd}`,
-          });
-        }
-
-        // AF_INET bind
-        const host = req.host;
-        if (
-          host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
-        ) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `unsupported bind host: ${String(req.host)}`,
-          });
-        }
-        if (typeof req.port !== "number" || req.port < 0 || req.port > 65535) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `invalid bind port: ${String(req.port)}`,
-          });
-        }
-        target.family = "AF_INET";
-        target.boundHost = host;
-        target.boundPort = req.port;
-        target.localHost = host === "0.0.0.0" ? socketLocalHost : host;
-        target.localPort = req.port;
-        return writeJson(memory, outPtr, outCap, { ok: true });
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
-      }
+      if (!Number.isInteger(port) || port < 0 || port > 65535) return -22;
+      target.boundHost = host;
+      target.boundPort = port;
+      target.localHost = host === "0.0.0.0" ? socketLocalHost : host;
+      target.localPort = port;
+      return 0;
     },
 
     // host_socket_bind_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
@@ -2802,429 +2687,122 @@ export function createKernelImports(
     // host_socket_listen(fd, backlog) -> i32
     // Creates a backend listener for a socket fd after sandbox policy authorizes it.
     host_socket_listen(
-      fdOrReqPtr: number,
-      backlogOrReqLen: number,
-      outPtr?: number,
-      outCap?: number,
+      fd: number,
+      backlogArg: number,
     ): number {
-      if (outPtr === undefined || outCap === undefined) {
-        const fd = fdOrReqPtr;
-        const target = opts.kernel?.getFdTarget(callerPid, fd);
-        if (!target || target.type !== "socket") return -9;
-        const host = target.boundHost ?? "127.0.0.1";
-        const port = target.boundPort ?? 0;
-        const backlog = backlogOrReqLen > 0 ? backlogOrReqLen : 128;
-        const auth = authorizeListen(opts.serverSockets, host, port, backlog);
-        if (!auth.ok) return -13;
-        if (!socketBackend?.listen) return -95;
-        const result = socketBackend.listen({
-          host,
-          port,
-          backlog,
-          mapping: auth.mapping,
-        });
-        if (!result.ok) return -5;
-        target.listener = result.listener;
-        target.boundHost = host;
-        target.boundPort = port;
-        target.localHost = result.host;
-        target.localPort = result.port;
-        target.closeListener = (listener) => {
-          socketBackend.closeListener?.(listener);
-        };
-        return 0;
-      }
-
-      const reqPtr = fdOrReqPtr;
-      const reqLen = backlogOrReqLen;
-      try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
-        }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a socket fd: ${req.fd}`,
-          });
-        }
-        const backlog = typeof req.backlog === "number" && req.backlog > 0
-          ? req.backlog
-          : 128;
-
-        // AF_INET listen
-        const host = target.boundHost ?? "127.0.0.1";
-        const port = target.boundPort ?? 0;
-        const auth = authorizeListen(opts.serverSockets, host, port, backlog);
-        if (!auth.ok) return writeJson(memory, outPtr, outCap, auth);
-        if (!socketBackend?.listen) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "server sockets are not supported by this backend",
-          });
-        }
-        const result = socketBackend.listen({
-          host,
-          port,
-          backlog,
-          mapping: auth.mapping,
-        });
-        if (!result.ok) return writeJson(memory, outPtr, outCap, result);
-        target.listener = result.listener;
-        target.boundHost = host;
-        target.boundPort = port;
-        target.localHost = result.host;
-        target.localPort = result.port;
-        target.closeListener = (listener) => {
-          socketBackend.closeListener?.(listener);
-        };
-        return writeJson(memory, outPtr, outCap, { ok: true });
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
-      }
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") return -9;
+      const host = target.boundHost ?? "127.0.0.1";
+      const port = target.boundPort ?? 0;
+      const backlog = backlogArg > 0 ? backlogArg : 128;
+      const auth = authorizeListen(opts.serverSockets, host, port, backlog);
+      if (!auth.ok) return -13;
+      if (!socketBackend?.listen) return -95;
+      const result = socketBackend.listen({
+        host,
+        port,
+        backlog,
+        mapping: auth.mapping,
+      });
+      if (!result.ok) return -5;
+      target.listener = result.listener;
+      target.boundHost = host;
+      target.boundPort = port;
+      target.localHost = result.host;
+      target.localPort = result.port;
+      target.closeListener = (listener) => {
+        socketBackend.closeListener?.(listener);
+      };
+      return 0;
     },
 
     // host_socket_accept(fd, out_ptr, out_cap) -> i32
     // Polls one accepted connection from a listening socket fd.
     async host_socket_accept(
-      fdOrReqPtr: number,
-      outPtrOrReqLen: number,
-      outPtrOrOutCap: number,
-      outCapMaybe?: number,
+      fd: number,
+      outPtr: number,
+      outCap: number,
     ): Promise<number> {
-      if (outCapMaybe === undefined) {
-        const fd = fdOrReqPtr;
-        const outPtr = outPtrOrReqLen;
-        const outCap = outPtrOrOutCap;
-        if (!socketBackend?.accept) return -95;
-        const target = opts.kernel?.getFdTarget(callerPid, fd);
-        if (!target || target.type !== "socket" || target.listener == null) {
-          return -9;
-        }
-        const accepted = await acceptSocketAsync(
-          socketBackend,
-          target.listener,
-        );
-        if (!accepted.ok) return accepted.error === "EAGAIN" ? -11 : -5;
-        if (!opts.kernel) return -5;
-        const acceptedFd = opts.kernel.allocFd(callerPid, {
-          type: "socket",
-          socket: accepted.socket,
-          refs: 1,
-          peerHost: accepted.peerHost,
-          peerPort: accepted.peerPort,
-          localHost: accepted.localHost,
-          localPort: accepted.localPort,
-          send: socketBackend.send.bind(socketBackend),
-          recv: socketBackend.recv.bind(socketBackend),
-          recvAsync: (socket, maxBytes) =>
-            recvSocketAsync(socketBackend, socket, maxBytes),
-          setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-          close: (socket) => {
-            socketBackend.close(socket);
-          },
-        });
-        return writeSocketAcceptResult(outPtr, outCap, {
-          fd: acceptedFd,
-          peerHost: accepted.peerHost,
-          peerPort: accepted.peerPort,
-          localHost: accepted.localHost,
-          localPort: accepted.localPort,
-        });
+      if (!socketBackend?.accept) return -95;
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket" || target.listener == null) {
+        return -9;
       }
-
-      const reqPtr = fdOrReqPtr;
-      const reqLen = outPtrOrReqLen;
-      const outPtr = outPtrOrOutCap;
-      const outCap = outCapMaybe;
-      if (!socketBackend?.accept && !socketBackend?.registry) {
-        return writeJson(memory, outPtr, outCap, {
-          ok: false,
-          error: "server sockets are not supported by this backend",
-        });
-      }
-      try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
-        }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket" || target.listener == null) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a listening socket fd: ${req.fd}`,
-          });
-        }
-        if (!opts.kernel) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "kernel not configured",
-          });
-        }
-
-        // AF_UNIX accept: use registry.acceptUnix directly.
-        if (target.family === "AF_UNIX" && socketBackend?.registry) {
-          const rawHandle = -(target.listener); // un-negate to get registry handle
-          const unixAccepted = await socketBackend.registry.acceptUnix(rawHandle);
-          const acceptedFd = opts.kernel.allocFd(callerPid, {
-            type: "socket",
-            socket: -(unixAccepted.socket), // negate for loopback convention
-            family: "AF_UNIX",
-            boundPath: unixAccepted.localPath,
-            peerPath: unixAccepted.peerPath,
-            refs: 1,
-            peerPid: unixAccepted.peerPid ?? 0,
-            peerUid: unixAccepted.peerUid ?? 0,
-            peerGid: unixAccepted.peerGid ?? 0,
-            send: socketBackend.send.bind(socketBackend),
-            recv: socketBackend.recv.bind(socketBackend),
-            recvAsync: (socket, maxBytes) =>
-              recvSocketAsync(socketBackend, socket, maxBytes),
-            setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-            close: (socket) => { socketBackend.close(socket); },
-          });
-          // C side calls host_socket_addr_unix for peer/local path — no paths here.
-          return writeJson(memory, outPtr, outCap, { ok: true, fd: acceptedFd });
-        }
-
-        // AF_INET accept: prefer backend suspension; legacy backends fall back to accept().
-        const accepted = await acceptSocketAsync(
-          socketBackend,
-          target.listener,
-        );
-        if (!accepted.ok) return writeJson(memory, outPtr, outCap, accepted);
-        const acceptedFd = opts.kernel.allocFd(callerPid, {
-          type: "socket",
-          socket: accepted.socket,
-          refs: 1,
-          peerHost: accepted.peerHost,
-          peerPort: accepted.peerPort,
-          localHost: accepted.localHost,
-          localPort: accepted.localPort,
-          send: socketBackend.send.bind(socketBackend),
-          recv: socketBackend.recv.bind(socketBackend),
-          recvAsync: (socket, maxBytes) =>
-            recvSocketAsync(socketBackend, socket, maxBytes),
-          setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-          close: (socket) => {
-            socketBackend.close(socket);
-          },
-        });
-        return writeJson(memory, outPtr, outCap, {
-          ok: true,
-          fd: acceptedFd,
-          peer_host: accepted.peerHost,
-          peer_port: accepted.peerPort,
-          local_host: accepted.localHost,
-          local_port: accepted.localPort,
-        });
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
-      }
+      const accepted = await acceptSocketAsync(socketBackend, target.listener);
+      if (!accepted.ok) return accepted.error === "EAGAIN" ? -11 : -5;
+      if (!opts.kernel) return -5;
+      const acceptedFd = opts.kernel.allocFd(callerPid, {
+        type: "socket",
+        socket: accepted.socket,
+        refs: 1,
+        peerHost: accepted.peerHost,
+        peerPort: accepted.peerPort,
+        localHost: accepted.localHost,
+        localPort: accepted.localPort,
+        send: socketBackend.send.bind(socketBackend),
+        recv: socketBackend.recv.bind(socketBackend),
+        recvAsync: (socket, maxBytes) =>
+          recvSocketAsync(socketBackend, socket, maxBytes),
+        setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+        close: (socket) => {
+          socketBackend.close(socket);
+        },
+      });
+      return writeSocketAcceptResult(outPtr, outCap, {
+        fd: acceptedFd,
+        peerHost: accepted.peerHost,
+        peerPort: accepted.peerPort,
+        localHost: accepted.localHost,
+        localPort: accepted.localPort,
+      });
     },
 
     // host_socket_addr(fd, which, out_ptr, out_cap) -> i32
     // Reports sandbox-visible socket address metadata.
     host_socket_addr(
-      fdOrReqPtr: number,
-      whichOrReqLen: number,
+      fd: number,
+      which: number,
       outPtr: number,
       outCap: number,
     ): number {
-      if (outCap <= 16) {
-        const fd = fdOrReqPtr;
-        const which = whichOrReqLen;
-        const target = opts.kernel?.getFdTarget(callerPid, fd);
-        if (!target || target.type !== "socket") return -9;
-        if (
-          target.socket === null && target.listener == null &&
-          target.boundPort === undefined
-        ) {
-          return -107;
-        }
-        const local = which === 0;
-        return writeSocketAddrResult(
-          outPtr,
-          outCap,
-          local
-            ? (target.localHost ?? socketLocalHost)
-            : (target.peerHost ?? "0.0.0.0"),
-          local
-            ? (target.localPort ?? socketLocalPortForFd(fd))
-            : (target.peerPort ?? 0),
-        );
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") return -9;
+      if (
+        target.socket === null && target.listener == null &&
+        target.boundPort === undefined
+      ) {
+        return -107;
       }
-
-      const reqPtr = fdOrReqPtr;
-      const reqLen = whichOrReqLen;
-      try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
-        }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a socket fd: ${req.fd}`,
-          });
-        }
-        const kind = req.kind === "peer" ? "peer" : "local";
-        const isPeer = kind === "peer";
-
-        // getpeername on an unconnected socket → ENOTCONN
-        if (isPeer && !target.peerPath && !target.peerHost) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "ENOTCONN",
-          });
-        }
-
-        // POSIX getsockname()/getpeername() are defined for any socket
-        // that has been bound, connected, or is listening. Accept
-        // connected sockets (target.socket !== null), listening sockets
-        // (target.listener != null), and bound-but-not-yet-listening
-        // sockets (target.boundPort !== undefined). AF_INET listeners
-        // need this so getsockname() can return their ephemeral port.
-        if (
-          target.socket === null && target.listener == null &&
-          target.boundPort === undefined && target.boundPath === undefined
-        ) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `socket not bound or connected: ${req.fd}`,
-          });
-        }
-        // AF_UNIX: return path-based address info
-        if (target.family === "AF_UNIX") {
-          const localPath = target.boundPath ?? "";
-          const peerPath = target.peerPath ?? "";
-          // Abstract sockets use a separate field to avoid NUL-in-JSON issues:
-          // local_abstract / peer_abstract carry the name WITHOUT leading NUL.
-          // Pathname sockets use local_path / peer_path as before.
-          const resp: Record<string, unknown> = { ok: true };
-          if (localPath.startsWith("\0")) {
-            resp.local_abstract = localPath.slice(1);
-          } else {
-            resp.local_path = localPath;
-          }
-          if (peerPath.startsWith("\0")) {
-            resp.peer_abstract = peerPath.slice(1);
-          } else {
-            resp.peer_path = peerPath;
-          }
-          return writeJson(memory, outPtr, outCap, resp);
-        }
-
-        return writeJson(memory, outPtr, outCap, {
-          ok: true,
-          peer_host: target.peerHost ?? "0.0.0.0",
-          peer_port: target.peerPort ?? 0,
-          local_host: target.localHost ?? socketLocalHost,
-          local_port: target.localPort ?? socketLocalPortForFd(req.fd),
-        });
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
-      }
+      const local = which === 0;
+      return writeSocketAddrResult(
+        outPtr,
+        outCap,
+        local
+          ? (target.localHost ?? socketLocalHost)
+          : (target.peerHost ?? "0.0.0.0"),
+        local
+          ? (target.localPort ?? socketLocalPortForFd(fd))
+          : (target.peerPort ?? 0),
+      );
     },
 
     // host_socket_send(fd, data_ptr, data_len, flags) -> i32
     // Sends data on an open socket.
     host_socket_send(
-      fdOrReqPtr: number,
-      dataPtrOrReqLen: number,
-      dataLenOrOutPtr: number,
-      flagsOrOutCap: number,
+      fd: number,
+      dataPtr: number,
+      dataLen: number,
+      _flags: number,
     ): number {
-      if (flagsOrOutCap <= 16) {
-        if (!socketBackend) return -5;
-        const fd = fdOrReqPtr;
-        const target = opts.kernel?.getFdTarget(callerPid, fd);
-        if (!target || target.type !== "socket" || target.socket === null) {
-          return -107;
-        }
-        const data = readBytes(memory, dataPtrOrReqLen, dataLenOrOutPtr);
-        const result = socketBackend.send(target.socket, bytesToBase64(data));
-        if (!result.ok) return result.error === "EAGAIN" ? -11 : -5;
-        return result.bytes_sent ?? data.byteLength;
+      if (!socketBackend) return -5;
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket" || target.socket === null) {
+        return -107;
       }
-
-      const reqPtr = fdOrReqPtr;
-      const reqLen = dataPtrOrReqLen;
-      const outPtr = dataLenOrOutPtr;
-      const outCap = flagsOrOutCap;
-      if (!socketBackend) {
-        return writeJson(memory, outPtr, outCap, {
-          ok: false,
-          error: "networking not configured",
-        });
-      }
-      try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
-        }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a socket fd: ${req.fd}`,
-          });
-        }
-        // SOCK_DGRAM path
-        if (target.isDgram) {
-          const registry = socketBackend?.registry;
-          if (!registry) {
-            return writeJson(memory, outPtr, outCap, { ok: false, error: "AF_UNIX dgram requires loopback backend" });
-          }
-          const bytes = base64ToBytes(req.data_b64 ?? "");
-          // sendto with destination path
-          if (typeof req.to === "string") {
-            const senderBoundPath = target.boundPath;
-            const r = registry.sendDgramToPath(req.to, bytes, senderBoundPath);
-            if (!r.ok) return writeJson(memory, outPtr, outCap, r);
-            return writeJson(memory, outPtr, outCap, {
-              ok: true,
-              bytes_sent: (r as { ok: true; bytesSent: number }).bytesSent,
-            });
-          }
-          // socketpair DGRAM — send to peer
-          const rawHandle = -(target.socket as number);
-          const result = registry.sendDgramToPeer(rawHandle, bytes);
-          if (!result.ok) return writeJson(memory, outPtr, outCap, result);
-          return writeJson(memory, outPtr, outCap, {
-            ok: true,
-            bytes_sent: (result as { ok: true; bytesSent: number }).bytesSent,
-          });
-        }
-        if (target.socket === null) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a connected socket fd: ${req.fd}`,
-          });
-        }
-        const result = socketBackend.send(target.socket, req.data_b64);
-        return writeJson(memory, outPtr, outCap, result);
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
-      }
+      const data = readBytes(memory, dataPtr, dataLen);
+      const result = socketBackend.send(target.socket, bytesToBase64(data));
+      if (!result.ok) return result.error === "EAGAIN" ? -11 : -5;
+      return result.bytes_sent ?? data.byteLength;
     },
 
     // host_socket_recv(fd, out_ptr, out_cap, flags) -> i32
@@ -3234,152 +2812,45 @@ export function createKernelImports(
     // registry) suspend the host import via JSPI/Asyncify until at
     // least one byte (or EOF) arrives.
     host_socket_recv(
-      fdOrReqPtr: number,
-      outPtrOrReqLen: number,
+      fd: number,
+      outDataPtr: number,
       outPtr: number,
-      flagsOrOutCap: number,
+      flags: number,
     ): number | Promise<number> {
-      if (flagsOrOutCap <= 16) {
-        if (!socketBackend) return -5;
-        const fd = fdOrReqPtr;
-        const outCap = outPtr;
-        const flags = flagsOrOutCap;
-        const target = opts.kernel?.getFdTarget(callerPid, fd);
-        if (!target || target.type !== "socket" || target.socket === null) {
-          return -107;
-        }
-        const maxBytes = outCap;
-        const peek = (flags & 2) !== 0;
-        const nonblocking =
-          ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
-        if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
-          const chunk = target.peekBuffer.slice(0, maxBytes);
-          if (!peek) {
-            target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
-          }
-          return writeBytes(memory, outPtrOrReqLen, outCap, chunk);
-        }
-        const writeProbe = (
-          probe: { ok: boolean; data_b64?: string; error?: string },
-        ) => {
-          if (!probe.ok) return probe.error === "EAGAIN" ? -11 : -5;
-          const data = base64ToBytes(probe.data_b64 ?? "");
-          if (peek) {
-            target.peekBuffer = target.peekBuffer
-              ? concatBytes(target.peekBuffer, data)
-              : data;
-          }
-          return writeBytes(memory, outPtrOrReqLen, outCap, data);
-        };
-        if (peek || nonblocking) {
-          return writeProbe(socketBackend.recv(target.socket, maxBytes, {
-            nonblocking: true,
-          }));
-        }
-        return target.recvAsync(target.socket, maxBytes).then(writeProbe);
+      if (!socketBackend) return -5;
+      const outCap = outPtr;
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket" || target.socket === null) {
+        return -107;
       }
-
-      const reqPtr = fdOrReqPtr;
-      const reqLen = outPtrOrReqLen;
-      const outCap = flagsOrOutCap;
-      if (!socketBackend) {
-        return writeJson(memory, outPtr, outCap, {
-          ok: false,
-          error: "networking not configured",
-        });
+      const maxBytes = outCap;
+      const peek = (flags & 2) !== 0;
+      const nonblocking = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+      if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
+        const chunk = target.peekBuffer.slice(0, maxBytes);
+        if (!peek) {
+          target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+        }
+        return writeBytes(memory, outDataPtr, outCap, chunk);
       }
-      try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
-        }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a socket fd: ${req.fd}`,
-          });
-        }
-        // SOCK_DGRAM path
-        if (target.isDgram) {
-          const registry = socketBackend?.registry;
-          if (!registry) {
-            return writeJson(memory, outPtr, outCap, { ok: false, error: "AF_UNIX dgram requires loopback backend" });
-          }
-          const rawHandle = -(target.socket as number);
-          const maxBytes = req.max_bytes ?? 65536;
-          return registry.recvDgramAsync(rawHandle, maxBytes).then((result) => {
-            if (!result.ok) return writeJson(memory, outPtr, outCap, result);
-            return writeJson(memory, outPtr, outCap, {
-              ok: true,
-              data_b64: bytesToBase64(result.bytes),
-              from_path: result.fromPath,
-            });
-          });
-        }
-        if (target.socket === null) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a connected socket fd: ${req.fd}`,
-          });
-        }
-        const maxBytes = req.max_bytes ?? 65536;
-        const peek = req.peek === true;
-        const nonblocking =
-          ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
-        if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
-          const chunk = target.peekBuffer.slice(0, maxBytes);
-          if (!peek) {
-            target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
-          }
-          return writeJson(memory, outPtr, outCap, {
-            ok: true,
-            data_b64: bytesToBase64(chunk),
-          });
-        }
-        // peekBuffer is empty.
+      const writeProbe = (
+        probe: { ok: boolean; data_b64?: string; error?: string },
+      ) => {
+        if (!probe.ok) return probe.error === "EAGAIN" ? -11 : -5;
+        const data = base64ToBytes(probe.data_b64 ?? "");
         if (peek) {
-          // Peek probes the backend without suspending and stashes any data
-          // into peekBuffer for the following non-peek recv. The probe is
-          // always nonblocking — even on a blocking fd a peek that finds
-          // nothing returns EAGAIN here rather than waiting for bytes.
-          // That diverges from a real `MSG_PEEK` on a blocking socket
-          // (which would block) but matches how peek is used in the libc
-          // shim today as a select()-style readiness check.
-          const probe = socketBackend.recv(target.socket, maxBytes, {
-            nonblocking: true,
-          });
-          if (probe.ok) {
-            const data = base64ToBytes(probe.data_b64 ?? "");
-            target.peekBuffer = target.peekBuffer
-              ? concatBytes(target.peekBuffer, data)
-              : data;
-            return writeJson(memory, outPtr, outCap, {
-              ok: true,
-              data_b64: bytesToBase64(data),
-            });
-          }
-          return writeJson(memory, outPtr, outCap, probe);
+          target.peekBuffer = target.peekBuffer
+            ? concatBytes(target.peekBuffer, data)
+            : data;
         }
-        if (nonblocking) {
-          // Poll the backend with the nonblocking flag. The backend either
-          // returns queued bytes, signals EAGAIN, or reports EOF/error;
-          // surface whatever it says directly.
-          const probe = socketBackend.recv(target.socket, maxBytes, {
-            nonblocking: true,
-          });
-          return writeJson(memory, outPtr, outCap, probe);
-        }
-        return target.recvAsync(target.socket, maxBytes).then((result) =>
-          writeJson(memory, outPtr, outCap, result)
-        );
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+        return writeBytes(memory, outDataPtr, outCap, data);
+      };
+      if (peek || nonblocking) {
+        return writeProbe(socketBackend.recv(target.socket, maxBytes, {
+          nonblocking: true,
+        }));
       }
+      return target.recvAsync(target.socket, maxBytes).then(writeProbe);
     },
 
     // host_socket_sendmsg(sockfd, data_ptr, data_len, fds_ptr, fds_count) -> bytes | -1
@@ -3474,78 +2945,24 @@ export function createKernelImports(
     // host_socket_option(fd, option, has_value, value) -> i32
     // Applies or reports socket option state owned by the kernel.
     host_socket_option(
-      fdOrReqPtr: number,
-      optionOrReqLen: number,
-      hasValueOrOutPtr: number,
-      valueOrOutCap: number,
+      fd: number,
+      option: number,
+      hasValueRaw: number,
+      value: number,
     ): number {
-      if (hasValueOrOutPtr <= 1) {
-        const fd = fdOrReqPtr;
-        const option = optionOrReqLen;
-        const hasValue = hasValueOrOutPtr !== 0;
-        const value = valueOrOutCap;
-        const target = opts.kernel?.getFdTarget(callerPid, fd);
-        if (!target || target.type !== "socket") return -9;
-        if (option !== 1) return -95;
-        if (!hasValue) return target.noDelay ? 1 : 0;
-        const enabled = value !== 0;
-        if (target.socket !== null) {
-          const result = target.setNoDelay?.(target.socket, enabled) ??
-            { ok: false, error: "TCP_NODELAY not supported by socket backend" };
-          if (!result.ok) return -95;
-        }
-        target.noDelay = enabled;
-        return 0;
+      const hasValue = hasValueRaw !== 0;
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") return -9;
+      if (option !== 1) return -95;
+      if (!hasValue) return target.noDelay ? 1 : 0;
+      const enabled = value !== 0;
+      if (target.socket !== null) {
+        const result = target.setNoDelay?.(target.socket, enabled) ??
+          { ok: false, error: "TCP_NODELAY not supported by socket backend" };
+        if (!result.ok) return -95;
       }
-
-      const reqPtr = fdOrReqPtr;
-      const reqLen = optionOrReqLen;
-      const outPtr = hasValueOrOutPtr;
-      const outCap = valueOrOutCap;
-      try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
-        }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a socket fd: ${req.fd}`,
-          });
-        }
-        if (req.option !== "no_delay") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `unsupported socket option: ${req.option}`,
-          });
-        }
-        if (!("value" in req)) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: true,
-            value: target.noDelay ? 1 : 0,
-          });
-        }
-        if (typeof req.value !== "boolean") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "socket option value must be boolean",
-          });
-        }
-        if (target.socket !== null) {
-          const result = target.setNoDelay?.(target.socket, req.value) ??
-            { ok: false, error: "TCP_NODELAY not supported by socket backend" };
-          if (!result.ok) return writeJson(memory, outPtr, outCap, result);
-        }
-        target.noDelay = req.value;
-        return writeJson(memory, outPtr, outCap, { ok: true });
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
-      }
+      target.noDelay = enabled;
+      return 0;
     },
 
     // host_socket_socketpair(family, type, sv_ptr) -> 0 | -1
@@ -3614,36 +3031,16 @@ export function createKernelImports(
     // host_socket_close(fd) -> i32
     // Closes an open socket.
     // Returns 0 on success, -1 on error.
-    host_socket_close(reqPtrOrFd: number, reqLen?: number): number {
-      if (reqLen === undefined) {
-        const fd = reqPtrOrFd;
-        const target = opts.kernel?.getFdTarget(callerPid, fd);
-        if (!target || target.type !== "socket") return -9;
-        if (target.socket !== null) {
-          if (!socketBackend) return -5;
-          const socket = target.socket;
-          target.socket = null;
-          socketBackend.close(socket);
-        }
-        return opts.kernel?.closeFd(callerPid, fd) ? 0 : -9;
+    host_socket_close(fd: number): number {
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") return -9;
+      if (target.socket !== null) {
+        if (!socketBackend) return -5;
+        const socket = target.socket;
+        target.socket = null;
+        socketBackend.close(socket);
       }
-
-      const reqPtr = reqPtrOrFd;
-      try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") return -1;
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket") return -1;
-        if (target.socket !== null) {
-          if (!socketBackend) return -1;
-          const socket = target.socket;
-          target.socket = null;
-          socketBackend.close(socket);
-        }
-        return opts.kernel?.closeFd(callerPid, req.fd) ? 0 : -1;
-      } catch {
-        return -1;
-      }
+      return opts.kernel?.closeFd(callerPid, fd) ? 0 : -9;
     },
 
     // ── Extensions (Python only — shell routes through host_spawn) ──
@@ -3660,86 +3057,188 @@ export function createKernelImports(
       outPtr: number,
       outCap: number,
     ): Promise<number> {
-      const reqJson = readString(memory, reqPtr, reqLen);
+      const readExtString = (
+        base: number,
+        size: number,
+        off: number,
+        len: number,
+      ): string | null => {
+        const bytes = readSpan(memory, base, size, off, len);
+        return bytes === null ? null : new TextDecoder().decode(bytes);
+      };
+      const readSpanVector = (
+        base: number,
+        size: number,
+        off: number,
+        count: number,
+      ): string[] | null => {
+        const bytes = readSpan(memory, base, size, off, count * 8);
+        if (bytes === null) return null;
+        const view = new DataView(bytes.buffer, bytes.byteOffset);
+        const out: string[] = [];
+        for (let i = 0; i < count; i++) {
+          const at = i * 8;
+          const value = readExtString(
+            base,
+            size,
+            view.getUint32(at, true),
+            view.getUint32(at + 4, true),
+          );
+          if (value === null) return null;
+          out.push(value);
+        }
+        return out;
+      };
+      const readPairVector = (
+        base: number,
+        size: number,
+        off: number,
+        count: number,
+      ): Record<string, string> | null => {
+        const bytes = readSpan(memory, base, size, off, count * 16);
+        if (bytes === null) return null;
+        const view = new DataView(bytes.buffer, bytes.byteOffset);
+        const out: Record<string, string> = {};
+        for (let i = 0; i < count; i++) {
+          const at = i * 16;
+          const key = readExtString(
+            base,
+            size,
+            view.getUint32(at, true),
+            view.getUint32(at + 4, true),
+          );
+          const value = readExtString(
+            base,
+            size,
+            view.getUint32(at + 8, true),
+            view.getUint32(at + 12, true),
+          );
+          if (key === null || value === null) return null;
+          out[key] = value;
+        }
+        return out;
+      };
+      const writeExtensionResponse = (
+        exitCode: number,
+        stdout: string,
+        stderr: string,
+        payload = new Uint8Array(),
+      ): number => {
+        const encoder = new TextEncoder();
+        const stdoutBytes = encoder.encode(stdout);
+        const stderrBytes = encoder.encode(stderr);
+        const headerSize = 36;
+        const stdoutOffset = headerSize;
+        const stderrOffset = stdoutOffset + stdoutBytes.byteLength;
+        const payloadOffset = stderrOffset + stderrBytes.byteLength;
+        const size = payloadOffset + payload.byteLength;
+        if (outCap < size) return size;
+        const out = new Uint8Array(memory.buffer, outPtr, size);
+        const view = new DataView(memory.buffer, outPtr, size);
+        out.fill(0);
+        view.setUint32(0, size, true);
+        view.setUint16(4, 1, true);
+        view.setUint16(6, 0, true);
+        view.setInt32(8, exitCode, true);
+        view.setUint32(12, stdoutOffset, true);
+        view.setUint32(16, stdoutBytes.byteLength, true);
+        view.setUint32(20, stderrOffset, true);
+        view.setUint32(24, stderrBytes.byteLength, true);
+        view.setUint32(28, payloadOffset, true);
+        view.setUint32(32, payload.byteLength, true);
+        out.set(stdoutBytes, stdoutOffset);
+        out.set(stderrBytes, stderrOffset);
+        out.set(payload, payloadOffset);
+        return size;
+      };
+      const decodeRequest = () => {
+        const header = readRecordHeader(memory, reqPtr, reqLen);
+        if (!header || header.version !== 1 || header.size < 56) {
+          return null;
+        }
+        const view = new DataView(memory.buffer, reqPtr, header.size);
+        const name = readExtString(
+          reqPtr,
+          header.size,
+          view.getUint32(8, true),
+          view.getUint32(12, true),
+        );
+        const args = readSpanVector(
+          reqPtr,
+          header.size,
+          view.getUint32(16, true),
+          view.getUint32(20, true),
+        );
+        const stdin = readExtString(
+          reqPtr,
+          header.size,
+          view.getUint32(24, true),
+          view.getUint32(28, true),
+        );
+        const cwd = readExtString(
+          reqPtr,
+          header.size,
+          view.getUint32(32, true),
+          view.getUint32(36, true),
+        );
+        const env = readPairVector(
+          reqPtr,
+          header.size,
+          view.getUint32(40, true),
+          view.getUint32(44, true),
+        );
+        if (name === null || args === null || stdin === null || env === null) {
+          return null;
+        }
+        return { name, args, stdin, env, cwd: cwd || getCallerCwd() };
+      };
+      const req = decodeRequest();
+      if (!req) {
+        return writeExtensionResponse(1, "", "invalid extension request\n");
+      }
 
       if (opts.extensionRegistry) {
         try {
-          const req = JSON.parse(reqJson) as {
-            name?: string;
-            extension?: string;
-            // When called from Python _yurt.extension_call(**kwargs), the entire
-            // kwargs dict is serialized as the `args` field. Unpack it here.
-            args?: string[] | Record<string, unknown>;
-            stdin?: string;
-            env?: [string, string][];
-            cwd?: string;
-          };
-
-          const name = (req.name ?? req.extension ?? "") as string;
-
-          // Python kwargs arrive as `args: {args: [...], stdin: "...", ...}`.
-          // Detect and unpack that shape; otherwise treat args as a string array.
-          let args: string[];
-          let stdin: string;
-          if (Array.isArray(req.args)) {
-            args = req.args as string[];
-            stdin = req.stdin ?? "";
-          } else if (req.args && typeof req.args === "object") {
-            const kw = req.args as Record<string, unknown>;
-            args = Array.isArray(kw.args) ? (kw.args as string[]) : [];
-            stdin = typeof kw.stdin === "string" ? kw.stdin : (req.stdin ?? "");
-          } else {
-            args = [];
-            stdin = req.stdin ?? "";
-          }
-
-          const envObj: Record<string, string> = {};
-          if (req.env) { for (const [k, v] of req.env) envObj[k] = v; }
-          const cwd = req.cwd ?? getCallerCwd();
-
-          const result = await opts.extensionRegistry.invoke(name, {
-            args,
-            stdin,
-            env: envObj,
-            cwd,
+          const result = await opts.extensionRegistry.invoke(req.name, {
+            args: req.args,
+            stdin: req.stdin,
+            env: req.env,
+            cwd: req.cwd,
           });
 
-          return writeJson(memory, outPtr, outCap, {
-            exit_code: result.exitCode,
-            stdout: result.stdout ?? "",
-            stderr: result.stderr ?? "",
-          });
+          return writeExtensionResponse(
+            result.exitCode,
+            result.stdout ?? "",
+            result.stderr ?? "",
+          );
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
-          return writeJson(memory, outPtr, outCap, {
-            exit_code: 1,
-            stdout: "",
-            stderr: `${msg}\n`,
-          });
+          return writeExtensionResponse(1, "", `${msg}\n`);
         }
       }
 
       // Fall back to legacy extensionHandler (sync)
       if (opts.extensionHandler) {
         try {
-          const req = JSON.parse(reqJson) as Record<string, unknown>;
           const result = opts.extensionHandler(req);
-          return writeJson(memory, outPtr, outCap, result);
+          const response = result as {
+            exitCode?: number;
+            exit_code?: number;
+            stdout?: string;
+            stderr?: string;
+          };
+          return writeExtensionResponse(
+            response.exitCode ?? response.exit_code ?? 0,
+            response.stdout ?? "",
+            response.stderr ?? "",
+          );
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
-          return writeJson(memory, outPtr, outCap, {
-            exit_code: 1,
-            stdout: "",
-            stderr: `${msg}\n`,
-          });
+          return writeExtensionResponse(1, "", `${msg}\n`);
         }
       }
 
-      return writeJson(memory, outPtr, outCap, {
-        exit_code: 1,
-        stdout: "",
-        stderr: "extensions not available\n",
-      });
+      return writeExtensionResponse(1, "", "extensions not available\n");
     },
 
     // ── Filesystem ──

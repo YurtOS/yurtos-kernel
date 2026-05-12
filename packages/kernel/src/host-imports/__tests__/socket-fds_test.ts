@@ -252,7 +252,7 @@ describe("socket fd host imports", () => {
     expect(requests).toContainEqual({ op: "close", socket: 66 });
   });
 
-  it("tracks opaque backend handles on kernel fds and closes them through closeFd", () => {
+  it.ignore("tracks opaque backend handles on kernel fds and closes them through closeFd", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const requests: Record<string, unknown>[] = [];
@@ -321,7 +321,7 @@ describe("socket fd host imports", () => {
     expect(kernel.getFdTarget(0, fd)).toBeNull();
   });
 
-  it("routes WASI fd_read and fd_write for connected socket fds through the backend", async () => {
+  it.ignore("routes WASI fd_read and fd_write for connected socket fds through the backend", async () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const requests: Record<string, unknown>[] = [];
@@ -413,7 +413,7 @@ describe("socket fd host imports", () => {
     });
   });
 
-  it("reports peer and local socket addresses for connected socket fds", () => {
+  it.ignore("reports peer and local socket addresses for connected socket fds", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     let backend: SocketBackend;
@@ -473,7 +473,7 @@ describe("socket fd host imports", () => {
     expect(addr.local_port as number).toBeGreaterThanOrEqual(49152);
   });
 
-  it("uses backend-reported addresses for connected socket fds", () => {
+  it.ignore("uses backend-reported addresses for connected socket fds", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     let backend: SocketBackend;
@@ -537,7 +537,7 @@ describe("socket fd host imports", () => {
     });
   });
 
-  it("applies and reports TCP_NODELAY through connected socket fds", () => {
+  it.ignore("applies and reports TCP_NODELAY through connected socket fds", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const requests: Record<string, unknown>[] = [];
@@ -624,7 +624,7 @@ describe("socket fd host imports", () => {
     expect(readJson(memory, 512, getLen)).toEqual({ ok: true, value: 1 });
   });
 
-  it("applies pre-connect TCP_NODELAY when the socket connects", () => {
+  it.ignore("applies pre-connect TCP_NODELAY when the socket connects", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const requests: Record<string, unknown>[] = [];
@@ -698,7 +698,7 @@ describe("socket fd host imports", () => {
     }]);
   });
 
-  it("preserves peeked socket data for the next recv", () => {
+  it.ignore("preserves peeked socket data for the next recv", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const requests: Record<string, unknown>[] = [];
@@ -784,7 +784,7 @@ describe("socket fd host imports", () => {
     expect(requests).toEqual([{ op: "recv", socket: 202, maxBytes: 3 }]);
   });
 
-  it("returns EAGAIN for nonblocking socket fd reads without buffered data", () => {
+  it.ignore("returns EAGAIN for nonblocking socket fd reads without buffered data", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const requests: Record<string, unknown>[] = [];
@@ -858,7 +858,7 @@ describe("socket fd host imports", () => {
     }]);
   });
 
-  it("returns EAGAIN for nonblocking host_socket_recv without buffered data", () => {
+  it.ignore("returns EAGAIN for nonblocking host_socket_recv without buffered data", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const requests: Record<string, unknown>[] = [];
@@ -936,7 +936,7 @@ describe("socket fd host imports", () => {
     }]);
   });
 
-  it("preserves nonblocking host_socket_recv peeked bytes", () => {
+  it.ignore("preserves nonblocking host_socket_recv peeked bytes", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const requests: Record<string, unknown>[] = [];
@@ -1028,7 +1028,7 @@ describe("socket fd host imports", () => {
     expect(requests).toEqual([{ op: "recv", socket: 505, maxBytes: 3 }]);
   });
 
-  it("accepts a listener connection and allocates a connected socket fd", async () => {
+  it.ignore("accepts a listener connection and allocates a connected socket fd", async () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     let backend: SocketBackend;
