@@ -215,7 +215,6 @@ static int case_unlink_removes(void) {
     return 1;
   }
   int rc = connect(client_fd, (struct sockaddr *)&addr, addrlen);
-  int saved_errno = errno;
   close(client_fd);
   close(server_fd);
 
@@ -224,7 +223,6 @@ static int case_unlink_removes(void) {
     return 0;
   }
   emit("unlink_removes", 1, "connect-succeeded", 0, 0);
-  (void)saved_errno;
   return 1;
 }
 

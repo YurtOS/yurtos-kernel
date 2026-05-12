@@ -766,8 +766,14 @@ export class ListenerRegistry {
     if (!local) return { ok: false, error: "recv: invalid socket" };
     const first = local.rx.shift();
     if (first) {
-      local.rxAnc.shift(); // keep rxAnc in sync
-      return takeFrom(first, max, local);
+      const result = takeFrom(first, max, local);
+      // Shift the ancillary slot AFTER takeFrom so we can detect whether it
+      // requeued a tail.  If the chunk was too large, takeFrom unshifted the
+      // remainder back into local.rx; push an empty slot for that tail so
+      // that the next read does not consume the following message's ancillary.
+      local.rxAnc.shift();
+      if (first.byteLength > max) local.rxAnc.unshift(undefined);
+      return result;
     }
     if (this.peerClosed(local)) return { ok: true, bytes: new Uint8Array(0) };
     if (opts.nonblocking) return { ok: false, error: "EAGAIN" };
@@ -783,8 +789,10 @@ export class ListenerRegistry {
     }
     const first = local.rx.shift();
     if (first) {
-      local.rxAnc.shift(); // keep rxAnc in sync
-      return Promise.resolve(takeFrom(first, max, local));
+      const result = takeFrom(first, max, local);
+      local.rxAnc.shift();
+      if (first.byteLength > max) local.rxAnc.unshift(undefined);
+      return Promise.resolve(result);
     }
     if (this.peerClosed(local)) {
       return Promise.resolve({ ok: true, bytes: new Uint8Array(0) });

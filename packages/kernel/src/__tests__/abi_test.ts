@@ -190,6 +190,7 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toContain('{"case":"abstract_invisible_to_stat","exit":0,"stdout":"invisible=ok"}');
   });
+
   it("dgram_pair_message_framing: socketpair SOCK_DGRAM preserves message boundaries", async () => {
     if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
@@ -201,6 +202,7 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toContain('{"case":"dgram_pair_message_framing","exit":0,"stdout":"dgram=ok"}');
   });
+
   it("dgram_path_sendto: sendto delivers a datagram to a bound path", async () => {
     if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
@@ -212,6 +214,7 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toContain('{"case":"dgram_path_sendto","exit":0,"stdout":"dgram-path=ok"}');
   });
+
   it("scm_rights_pipe_handoff: sendmsg with SCM_RIGHTS passes a pipe read end", async () => {
     if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
@@ -1641,12 +1644,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
   //
   // SKIP: the happy_path is currently skipped because the Phase 1
   // dlopen wiring on the sandbox.run() path is incomplete — the main
-  // canary does not export `__alloc` or `__wasi_init_tp`, and
-  // sandbox.ts:buildKernelImports drops the mainInstance accessor
-  // before reaching createKernelImports. Re-enable once Phase 1 slice
-  // 1F lands the host-side plumbing end-to-end.
-  void HAS_DLCANARY_FIXTURE;
-  const dlcanaryIt = it.skip;
+  const dlcanaryIt = HAS_DLCANARY_FIXTURE ? it : it.skip;
   describe("dlopen-canary (Phase 1 shared libraries — happy path)", () => {
     dlcanaryIt(
       "happy_path: load /lib/libyurt_dlcanary.wasm and call yurt_dlcanary_double(21) → 42",
