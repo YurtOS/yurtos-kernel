@@ -72,7 +72,7 @@ class StaticFetchBridge implements NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: string | null,
     redirect?: "follow" | "manual",
   ): SyncFetchResult {
     this.requests.push({ url, method, headers, body, redirect });

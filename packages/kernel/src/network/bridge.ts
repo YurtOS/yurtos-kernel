@@ -43,7 +43,7 @@ export interface NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: string | null,
     redirect?: FetchRedirectMode,
   ): SyncFetchResult;
   /** Async fetch — used in the browser where Atomics.wait() isn't available on the main thread. */
@@ -51,7 +51,7 @@ export interface NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: string | null,
     redirect?: FetchRedirectMode,
   ): Promise<SyncFetchResult>;
   /** Send a generic operation (connect/send/recv/close) through the bridge. */
@@ -520,7 +520,7 @@ export class NetworkBridge implements NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: string | null,
     redirect?: FetchRedirectMode,
   ): SyncFetchResult {
     if (!this.worker) {
