@@ -52,6 +52,94 @@ function readProcessList(memory: WebAssembly.Memory, ptr: number, len: number) {
   };
 }
 
+function buildExtensionRequest(opts: {
+  name: string;
+  args?: string[];
+  stdin?: string;
+  cwd?: string;
+  env?: Record<string, string>;
+}) {
+  const headerSize = 56;
+  const spanSize = 8;
+  const pairSize = 16;
+  const args = opts.args ?? [];
+  const env = Object.entries(opts.env ?? {});
+  const argsOffset = headerSize;
+  const envOffset = argsOffset + args.length * spanSize;
+  let cursor = envOffset + env.length * pairSize;
+  const strings: Uint8Array[] = [];
+  const pushString = (value: string) => {
+    const bytes = encoder.encode(value);
+    const offset = cursor;
+    cursor += bytes.byteLength;
+    strings.push(bytes);
+    return [offset, bytes.byteLength] as const;
+  };
+  const name = pushString(opts.name);
+  const argSpans = args.map(pushString);
+  const stdin = pushString(opts.stdin ?? "");
+  const cwd = pushString(opts.cwd ?? "/");
+  const envPairs = env.map(([key, value]) =>
+    [...pushString(key), ...pushString(value)] as const
+  );
+
+  const out = new Uint8Array(cursor);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, cursor, true);
+  view.setUint16(4, 1, true);
+  view.setUint16(6, 0, true);
+  view.setUint32(8, name[0], true);
+  view.setUint32(12, name[1], true);
+  view.setUint32(16, argsOffset, true);
+  view.setUint32(20, args.length, true);
+  view.setUint32(24, stdin[0], true);
+  view.setUint32(28, stdin[1], true);
+  view.setUint32(32, cwd[0], true);
+  view.setUint32(36, cwd[1], true);
+  view.setUint32(40, envOffset, true);
+  view.setUint32(44, env.length, true);
+  view.setUint32(48, cursor, true);
+  view.setUint32(52, 0, true);
+  for (let i = 0; i < argSpans.length; i++) {
+    const [offset, length] = argSpans[i];
+    view.setUint32(argsOffset + i * spanSize, offset, true);
+    view.setUint32(argsOffset + i * spanSize + 4, length, true);
+  }
+  for (let i = 0; i < envPairs.length; i++) {
+    const [keyOffset, keyLength, valueOffset, valueLength] = envPairs[i];
+    const at = envOffset + i * pairSize;
+    view.setUint32(at, keyOffset, true);
+    view.setUint32(at + 4, keyLength, true);
+    view.setUint32(at + 8, valueOffset, true);
+    view.setUint32(at + 12, valueLength, true);
+  }
+  cursor = envOffset + env.length * pairSize;
+  for (const bytes of strings) {
+    out.set(bytes, cursor);
+    cursor += bytes.byteLength;
+  }
+  return out;
+}
+
+function readExtensionResponse(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+) {
+  const view = new DataView(memory.buffer, ptr, len);
+  const stdoutOffset = view.getUint32(12, true);
+  const stdoutLength = view.getUint32(16, true);
+  const stderrOffset = view.getUint32(20, true);
+  const stderrLength = view.getUint32(24, true);
+  return {
+    size: view.getUint32(0, true),
+    version: view.getUint16(4, true),
+    exitCode: view.getInt32(8, true),
+    stdout: readString(memory, ptr + stdoutOffset, stdoutLength),
+    stderr: readString(memory, ptr + stderrOffset, stderrLength),
+  };
+}
+
 function readWaitResult(memory: WebAssembly.Memory, ptr: number) {
   const view = new DataView(memory.buffer);
   return {
@@ -534,6 +622,41 @@ Deno.test("kernel host_list_processes writes a native process record", () => {
     ),
     true,
   );
+});
+
+Deno.test("kernel host_extension_invoke accepts native request records", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const request = buildExtensionRequest({
+    name: "echo",
+    args: ["one", "two"],
+    stdin: "input",
+    cwd: "/tmp",
+    env: { A: "B" },
+  });
+  new Uint8Array(memory.buffer, 0, request.byteLength).set(request);
+  const imports = createKernelImports({
+    memory,
+    extensionHandler: (input) => {
+      assertEquals(input, {
+        name: "echo",
+        args: ["one", "two"],
+        stdin: "input",
+        cwd: "/tmp",
+        env: { A: "B" },
+      });
+      return { exitCode: 3, stdout: "ok", stderr: "warn" };
+    },
+  });
+
+  const written = await (imports.host_extension_invoke as (
+    ...args: number[]
+  ) => Promise<number>)(0, request.byteLength, 4096, 1024);
+  const response = readExtensionResponse(memory, 4096, written);
+
+  assertEquals(response.version, 1);
+  assertEquals(response.exitCode, 3);
+  assertEquals(response.stdout, "ok");
+  assertEquals(response.stderr, "warn");
 });
 
 Deno.test("host_chmod allows the file owner and denies non-owners", () => {
