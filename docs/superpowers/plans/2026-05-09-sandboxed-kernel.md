@@ -129,6 +129,10 @@ records.
   expose decoded views backed by `kernel_list_processes`; remaining work is to
   delete old host-authored list surfaces that belong to the pre-sandboxed
   runtime path.
+- Expose host-control `kill` and `wait` through dedicated kernel exports in
+  each adapter. JS and native wasmtime now call `kernel_kill` / `kernel_wait`
+  directly; the KH adapter decodes return records but does not own process
+  state.
 - Only after the Rust export and adapter path are covered, update the temporary
   TS-kernel path to mirror the same binary record where existing userland still
   needs compatibility. Do not introduce new TS-owned process APIs.

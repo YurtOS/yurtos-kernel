@@ -204,11 +204,13 @@ Initial exports:
   termination to the process instance through the host mechanism when needed. If
   the process record has an attached KH instance handle, kernel.wasm calls
   `kh_destroy_instance` and clears the handle only after the KH adapter reports
-  success.
+  success. The JS and native wasmtime adapters expose this as a host-control
+  wrapper; the kernel still owns signal validation and process state mutation.
 - `kernel_wait(caller_pid, child_pid, flags, out_ptr, out_cap) -> i64` —
   wait/reap according to kernel process ownership rules. This is the
-  host-control equivalent of the user-facing wait syscall, not a microkernel
-  process-table operation.
+  host-control equivalent of the user-facing wait syscall, not a KH adapter
+  process-table operation. JS and native wasmtime wrappers decode only the
+  returned `(pid, status)` record.
 - `kernel_list_processes(out_ptr, out_cap) -> i64` — return a packed binary
   process snapshot from the kernel-owned table. At minimum each entry carries
   `pid`, `ppid`, `pgid`, `sid`, state, exit status, command bytes, and visible

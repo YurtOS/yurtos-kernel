@@ -162,6 +162,54 @@ fn wasmtime_adapter_lists_kernel_owned_process_snapshot() {
 }
 
 #[test]
+fn wasmtime_adapter_waits_through_kernel_export() {
+    let mk = fresh_microkernel(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 0))
+        "#,
+    )
+    .unwrap();
+
+    let parent = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/parent".as_slice()])
+        .unwrap();
+    let child = mk
+        .spawn_child(parent.pid(), &module, &[b"/bin/child".as_slice()])
+        .unwrap();
+    mk.record_exit(child.pid(), 17).unwrap();
+
+    let waited = mk.wait_process(parent.pid(), child.pid(), 0).unwrap();
+
+    assert_eq!(waited.pid, child.pid());
+    assert_eq!(waited.status, 17);
+}
+
+#[test]
+fn wasmtime_adapter_kills_through_kernel_export() {
+    let mk = fresh_microkernel(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 0))
+        "#,
+    )
+    .unwrap();
+
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/kill-target".as_slice()])
+        .unwrap();
+
+    assert_eq!(mk.kill_process(proc.pid(), 0).unwrap(), 0);
+    assert_eq!(mk.kill_process(proc.pid(), 64).unwrap(), -22);
+}
+
+#[test]
 fn kernel_wasm_imports_match_documented_namespaces() {
     // Phase guard. kernel.wasm imports come from two namespaces:
     //   * `kh.*`     — the documented kernel→host ABI we own.

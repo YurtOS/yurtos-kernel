@@ -1212,6 +1212,8 @@ pub struct KernelInstance {
     pub(crate) scratch_len: u32,
     pub(crate) dispatch: TypedFunc<(u32, u32, u32, u32, u32, u32), i64>,
     pub(crate) list_processes: TypedFunc<(u32, u32), i64>,
+    pub(crate) kill: TypedFunc<(u32, u32), i64>,
+    pub(crate) wait: TypedFunc<(u32, u32, u32, u32, u32), i64>,
 }
 
 impl KernelInstance {
@@ -1279,6 +1281,41 @@ impl KernelInstance {
             .context("read kernel process snapshot")?;
         decode_process_list(&bytes)
     }
+
+    pub fn kill_process(&mut self, pid: u32, signal: u32) -> Result<i64> {
+        self.kill
+            .call(&mut self.store, (pid, signal))
+            .context("kernel_kill")
+    }
+
+    pub fn wait_process(
+        &mut self,
+        caller_pid: u32,
+        child_pid: u32,
+        flags: u32,
+    ) -> Result<WaitResult> {
+        let rc = self
+            .wait
+            .call(
+                &mut self.store,
+                (caller_pid, child_pid, flags, self.scratch_ptr, 8),
+            )
+            .context("kernel_wait")?;
+        if rc < 0 {
+            anyhow::bail!("kernel_wait failed: rc={rc}");
+        }
+        if rc != 8 {
+            anyhow::bail!("kernel_wait wrote unexpected size: {rc}");
+        }
+        let mut bytes = [0u8; 8];
+        self.memory
+            .read(&self.store, self.scratch_ptr as usize, &mut bytes)
+            .context("read kernel wait result")?;
+        Ok(WaitResult {
+            pid: u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")),
+            status: i32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1291,6 +1328,12 @@ pub struct ProcessSnapshot {
     pub exit_status: Option<i32>,
     pub command: Vec<u8>,
     pub fds: Vec<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WaitResult {
+    pub pid: u32,
+    pub status: i32,
 }
 
 fn decode_process_list(bytes: &[u8]) -> Result<Vec<ProcessSnapshot>> {
@@ -1404,6 +1447,9 @@ impl Microkernel {
             .get_typed_func::<(u32, u32, u32, u32, u32, u32), i64>(&mut store, "kernel_dispatch")?;
         let list_processes =
             instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_list_processes")?;
+        let kill = instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_kill")?;
+        let wait =
+            instance.get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_wait")?;
 
         let kernel = KernelInstance {
             store,
@@ -1412,6 +1458,8 @@ impl Microkernel {
             scratch_len,
             dispatch,
             list_processes,
+            kill,
+            wait,
         };
         Ok(Self {
             engine,
@@ -1435,6 +1483,19 @@ impl Microkernel {
     /// itself lives in kernel.wasm.
     pub fn list_processes(&self) -> Result<Vec<ProcessSnapshot>> {
         self.kernel.lock().unwrap().list_processes()
+    }
+
+    /// Route signal delivery through kernel.wasm's host-control export.
+    pub fn kill_process(&self, pid: u32, signal: u32) -> Result<i64> {
+        self.kernel.lock().unwrap().kill_process(pid, signal)
+    }
+
+    /// Wait/reap through kernel.wasm's host-control export.
+    pub fn wait_process(&self, caller_pid: u32, child_pid: u32, flags: u32) -> Result<WaitResult> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .wait_process(caller_pid, child_pid, flags)
     }
 
     /// Invoke a kernel syscall as a specific caller pid. Used by
