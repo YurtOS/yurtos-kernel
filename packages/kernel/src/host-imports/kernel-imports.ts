@@ -1934,7 +1934,7 @@ export function createKernelImports(
     // ── DNS ──
 
     // host_dns_resolve(host_ptr, host_len, out_ptr, out_cap) -> i32
-    // Resolves a hostname to a dotted-decimal IPv4 address string.
+    // Resolves a hostname to a native yurt_dns_addr_result_v1 record.
     // Returns bytes written into out_ptr, or -1 if the name cannot be resolved.
     // Async (JSPI): used by yurt_netdb_addr_for_host in the guest.
     async host_dns_resolve(
@@ -1943,37 +1943,31 @@ export function createKernelImports(
       outPtr: number,
       outCap: number,
     ): Promise<number> {
+      const writeDnsAddrResult = (addr: string): number => {
+        const size = 8;
+        if (outCap < size) return size;
+        const bytes = new Uint8Array(memory.buffer, outPtr, size);
+        const view = new DataView(memory.buffer, outPtr, size);
+        view.setUint32(0, 2, true);
+        bytes.set(ipv4ToBytes(addr), 4);
+        return size;
+      };
       const hostname = readString(memory, hostPtr, hostLen);
       if (!hostname) return -1;
       // Loopback — always resolved locally regardless of platform.
       if (hostname === "localhost" || hostname === "127.0.0.1") {
-        return writeBytes(
-          memory,
-          outPtr,
-          outCap,
-          new TextEncoder().encode("127.0.0.1"),
-        );
+        return writeDnsAddrResult("127.0.0.1");
       }
       // Sandbox's own address — matches the configured local IP without a syscall.
       if (hostname === socketLocalHost) {
-        return writeBytes(
-          memory,
-          outPtr,
-          outCap,
-          new TextEncoder().encode(socketLocalHost),
-        );
+        return writeDnsAddrResult(socketLocalHost);
       }
       const addr = await resolveHostname(hostname);
       if (!addr && socketBackend) {
-        return writeBytes(
-          memory,
-          outPtr,
-          outCap,
-          new TextEncoder().encode(syntheticAddressForHost(hostname)),
-        );
+        return writeDnsAddrResult(syntheticAddressForHost(hostname));
       }
       if (!addr) return -1;
-      return writeBytes(memory, outPtr, outCap, new TextEncoder().encode(addr));
+      return writeDnsAddrResult(addr);
     },
 
     // host_get_local_addr(out_ptr, out_cap) -> i32
