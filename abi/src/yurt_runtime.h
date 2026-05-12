@@ -205,6 +205,20 @@ int yurt_host_socket_close(int req_ptr, int req_len);
 __attribute__((import_module("yurt"), import_name("host_socket_socketpair")))
 int yurt_host_socket_socketpair(int family, int type, int sv_ptr);
 
+/* host_socket_bind_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
+ * Binds an AF_UNIX socket to the given name in linear memory.
+ * is_abstract=1: abstract namespace (no leading NUL in ptr, just the bytes).
+ * is_abstract=0: filesystem path. Returns -1 on EADDRINUSE. */
+__attribute__((import_module("yurt"), import_name("host_socket_bind_unix")))
+int yurt_host_socket_bind_unix(int sockfd, int path_ptr, int path_len, int is_abstract);
+
+/* host_socket_connect_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
+ * Connects an AF_UNIX socket to the given name in linear memory.
+ * is_abstract=1: abstract namespace; is_abstract=0: filesystem path.
+ * Returns -1 on ECONNREFUSED / ENOENT. */
+__attribute__((import_module("yurt"), import_name("host_socket_connect_unix")))
+int yurt_host_socket_connect_unix(int sockfd, int path_ptr, int path_len, int is_abstract);
+
 /* host_socket_sendmsg(sockfd, data_ptr, data_len, fds_ptr, fds_count) -> bytes | -1
  * Reads data_len bytes from data_ptr; reads fds_count i32 fd numbers from
  * fds_ptr (pass 0 when there are no ancillary fds). */

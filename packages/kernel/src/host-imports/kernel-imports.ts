@@ -1976,10 +1976,10 @@ export function createKernelImports(
       _protocol: number,
     ): number {
       if (!opts.kernel) return -1;
-      // Constants from wasm32-wasip1 __header_sys_socket.h (via yurt-cc / wasi-sdk-30).
-      // These differ from Linux/POSIX values (AF_UNIX=1, SOCK_DGRAM=2).
-      const AF_UNIX = 3;
-      const SOCK_DGRAM = 5;
+      // Our abi/include/sys/socket.h pins these to Linux/POSIX values —
+      // matching the _Static_asserts in yurt_socket.c.
+      const AF_UNIX = 1;
+      const SOCK_DGRAM = 2;
       const SOCK_CLOEXEC = 0x2000;
       const SOCK_NONBLOCK = 0x4000;
       const baseType = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
@@ -2238,6 +2238,92 @@ export function createKernelImports(
       }
     },
 
+    // host_socket_bind_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
+    // Binds an AF_UNIX socket without JSON. is_abstract=1 for abstract namespace.
+    host_socket_bind_unix(
+      sockfd: number,
+      pathPtr: number,
+      pathLen: number,
+      isAbstract: number,
+    ): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -1;
+      const name = new TextDecoder().decode(
+        new Uint8Array(memory.buffer, pathPtr, pathLen),
+      );
+      target.family = "AF_UNIX";
+      if (isAbstract) {
+        target.boundPath = `\0${name}`;
+        // Abstract DGRAM sockets also register in the dgram route table
+        if (target.isDgram) {
+          const registry = socketBackend?.registry;
+          if (!registry) return -1;
+          try {
+            registry.bindDgramToPath(-(target.socket as number), `\0${name}`);
+          } catch {
+            return -1;
+          }
+        }
+        return 0;
+      }
+      target.boundPath = name;
+      if (target.isDgram) {
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        try {
+          registry.bindDgramToPath(-(target.socket as number), name);
+        } catch {
+          return -1;
+        }
+        // Fall through: also create a VFS socket inode so stat() sees S_IFSOCK
+        // and unlink() can clear the dgram route via the socket-inode hook.
+      }
+      try {
+        opts.vfs?.createSocket?.(name);
+      } catch {
+        return -1;
+      }
+      return 0;
+    },
+
+    // host_socket_connect_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
+    // Connects an AF_UNIX socket without JSON. is_abstract=1 for abstract namespace.
+    host_socket_connect_unix(
+      sockfd: number,
+      pathPtr: number,
+      pathLen: number,
+      isAbstract: number,
+    ): number {
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -1;
+      const name = new TextDecoder().decode(
+        new Uint8Array(memory.buffer, pathPtr, pathLen),
+      );
+      let result: { ok: boolean; socket?: number; error?: string };
+      if (isAbstract) {
+        result = registry.connectToAbstract(name);
+        if (!result.ok) return -1;
+        target.socket = -(result.socket as number);
+        target.family = "AF_UNIX";
+        target.peerPath = `\0${name}`;
+        target.peerPid = callerPid ?? 0;
+        target.peerUid = 0;
+        target.peerGid = 0;
+        return 0;
+      }
+      result = registry.connectToPath(name);
+      if (!result.ok) return -1;
+      target.socket = -(result.socket as number);
+      target.family = "AF_UNIX";
+      target.peerPath = name;
+      target.peerPid = callerPid ?? 0;
+      target.peerUid = 0;
+      target.peerGid = 0;
+      return 0;
+    },
+
     // host_socket_listen(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Creates a backend listener for a socket fd after sandbox policy authorizes it.
     host_socket_listen(
@@ -2471,6 +2557,16 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
+        const isPeer = req.op === "peer";
+
+        // getpeername on an unconnected socket → ENOTCONN
+        if (isPeer && !target.peerPath && !target.peerHost) {
+          return writeJson(memory, outPtr, outCap, {
+            ok: false,
+            error: "ENOTCONN",
+          });
+        }
+
         // POSIX getsockname()/getpeername() are defined for any socket
         // that has been bound, connected, or is listening. Accept
         // connected sockets (target.socket !== null), listening sockets

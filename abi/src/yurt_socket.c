@@ -31,6 +31,14 @@
 #define IP_BIND_ADDRESS_NO_PORT 24
 #endif
 
+/* Our sys/socket.h pins SOCK_DGRAM=2 and SOCK_STREAM=1 independent of WASI
+ * values. The host_socket_socketpair wire protocol relies on these values.
+ * Fire a compile error if the toolchain redefines them unexpectedly. */
+_Static_assert(SOCK_DGRAM == 2,
+  "SOCK_DGRAM != 2: update the socketpair wire protocol on both C and host sides");
+_Static_assert(SOCK_STREAM == 1,
+  "SOCK_STREAM != 1: update the socketpair wire protocol on both C and host sides");
+
 #define YURT_SO_REUSEADDR 0x0004
 #define YURT_SO_ERROR 0x1007
 #define YURT_SO_KEEPALIVE 9
@@ -310,27 +318,27 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return -1;
   }
 
-  /* AF_UNIX: send { fd, path } or { fd, abstract } request */
+  /* AF_UNIX: typed binary call — no JSON */
   if (addr->sa_family == AF_UNIX) {
     const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
     if (un->sun_path[0] == '\0') {
-      /* abstract address: name is sun_path[1..addrlen-offsetof(sun_path)-1] */
+      /* abstract address: bytes after the leading NUL */
       size_t namelen = (size_t)addrlen > offsetof(struct sockaddr_un, sun_path) + 1
         ? (size_t)addrlen - offsetof(struct sockaddr_un, sun_path) - 1
         : 0;
-      n = snprintf(req, sizeof(req),
-        "{\"fd\":%d,\"abstract\":\"%.*s\"}",
-        sockfd, (int)namelen, un->sun_path + 1);
+      if (yurt_host_socket_connect_unix(sockfd,
+            (int)(intptr_t)(un->sun_path + 1), (int)namelen, 1) < 0) {
+        errno = ECONNREFUSED;
+        return -1;
+      }
     } else {
       size_t pathlen = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
-      n = snprintf(req, sizeof(req),
-        "{\"fd\":%d,\"path\":\"%.*s\"}",
-        sockfd, (int)pathlen, un->sun_path);
+      if (yurt_host_socket_connect_unix(sockfd,
+            (int)(intptr_t)un->sun_path, (int)pathlen, 0) < 0) {
+        errno = ECONNREFUSED;
+        return -1;
+      }
     }
-    if (n < 0 || (size_t)n >= sizeof(req)) { errno = EOVERFLOW; return -1; }
-    n = yurt_host_socket_connect((int)(intptr_t)req, n,
-                                  (int)(intptr_t)resp, (int)sizeof(resp));
-    if (n <= 0 || !parse_json_ok(resp, (size_t)n)) { errno = ECONNREFUSED; return -1; }
     return 0;
   }
 
@@ -469,7 +477,12 @@ static int yurt_sockname_impl(
   int req_len;
   int n;
 
-  req_len = snprintf(req, sizeof(req), "{\"fd\":%d}", sockfd);
+  /* Pass "op":"local" for getsockname, "op":"peer" for getpeername so the
+   * host can return ENOTCONN when the peer address is not available. */
+  {
+    const char *op = (host_field[0] == 'p') ? "peer" : "local";
+    req_len = snprintf(req, sizeof(req), "{\"fd\":%d,\"op\":\"%s\"}", sockfd, op);
+  }
   if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
     errno = EOVERFLOW;
     return -1;
@@ -546,27 +559,27 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
   if (!addr || addrlen < 2) { errno = EINVAL; return -1; }
 
-  /* AF_UNIX: send { fd, path } or { fd, abstract } request */
+  /* AF_UNIX: typed binary call — no JSON */
   if (addr->sa_family == AF_UNIX) {
     const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
     if (un->sun_path[0] == '\0') {
-      /* abstract address: name is sun_path[1..addrlen-offsetof(sun_path)-1] */
+      /* abstract address: bytes after the leading NUL */
       size_t namelen = (size_t)addrlen > offsetof(struct sockaddr_un, sun_path) + 1
         ? (size_t)addrlen - offsetof(struct sockaddr_un, sun_path) - 1
         : 0;
-      n = snprintf(req, sizeof(req),
-        "{\"fd\":%d,\"abstract\":\"%.*s\"}",
-        sockfd, (int)namelen, un->sun_path + 1);
+      if (yurt_host_socket_bind_unix(sockfd,
+            (int)(intptr_t)(un->sun_path + 1), (int)namelen, 1) < 0) {
+        errno = EADDRINUSE;
+        return -1;
+      }
     } else {
       size_t pathlen = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
-      n = snprintf(req, sizeof(req),
-        "{\"fd\":%d,\"path\":\"%.*s\"}",
-        sockfd, (int)pathlen, un->sun_path);
+      if (yurt_host_socket_bind_unix(sockfd,
+            (int)(intptr_t)un->sun_path, (int)pathlen, 0) < 0) {
+        errno = EADDRINUSE;
+        return -1;
+      }
     }
-    if (n < 0 || (size_t)n >= sizeof(req)) { errno = EOVERFLOW; return -1; }
-    n = yurt_host_socket_bind((int)(intptr_t)req, n,
-                               (int)(intptr_t)resp, (int)sizeof(resp));
-    if (n <= 0 || !parse_json_ok(resp, (size_t)n)) { errno = EADDRINUSE; return -1; }
     return 0;
   }
 
@@ -1161,6 +1174,7 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
 
   /* Write SCM_RIGHTS cmsg if fds were received */
   msg->msg_controllen = 0;
+  msg->msg_flags = 0;
   if (n_fds > 0 && msg->msg_control && orig_controllen > 0) {
     struct cmsghdr *cmsg = (struct cmsghdr *)msg->msg_control;
     size_t needed = CMSG_SPACE(n_fds * sizeof(int));
@@ -1170,7 +1184,21 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
       cmsg->cmsg_type = SCM_RIGHTS;
       memcpy(CMSG_DATA(cmsg), recv_fds, n_fds * sizeof(int));
       msg->msg_controllen = needed;
+    } else {
+      /* Control buffer too small: fit as many fds as possible, flag truncation */
+      int fit = (int)((orig_controllen - CMSG_LEN(0)) / sizeof(int));
+      if (fit > 0) {
+        cmsg->cmsg_len = (socklen_t)CMSG_LEN((size_t)fit * sizeof(int));
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        memcpy(CMSG_DATA(cmsg), recv_fds, (size_t)fit * sizeof(int));
+        msg->msg_controllen = CMSG_SPACE((size_t)fit * sizeof(int));
+      }
+      msg->msg_flags |= MSG_CTRUNC;
     }
+  } else if (n_fds > 0) {
+    /* Caller provided no control buffer but ancillary data arrived */
+    msg->msg_flags |= MSG_CTRUNC;
   }
 
   (void)flags;

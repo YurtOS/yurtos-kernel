@@ -933,8 +933,10 @@ export class ListenerRegistry {
   bindDgramToPath(handle: SocketHandle, path: string): void {
     const s = this.dgramSockets.get(handle);
     if (!s) throw new Error(`bindDgramToPath: unknown handle ${handle}`);
+    const key = `DGRAM:${path}`;
+    if (this.dgramRoutes.has(key)) throw new Error(`EADDRINUSE: ${path}`);
     s.boundPath = path;
-    this.dgramRoutes.set(`DGRAM:${path}`, handle);
+    this.dgramRoutes.set(key, handle);
   }
 
   /** Deliver a datagram to the socket bound at `toPath`. */
