@@ -110,6 +110,9 @@ export class FdTable {
       refs: 1,
       credential: this.credential,
     };
+    if (mode === "w") {
+      this.flushEntry(entry);
+    }
     this.entries.set(fd, entry);
 
     return fd;

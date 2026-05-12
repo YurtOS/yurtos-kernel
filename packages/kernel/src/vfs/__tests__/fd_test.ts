@@ -40,6 +40,18 @@ describe("FdTable", () => {
     );
   });
 
+  it("makes write-mode open truncation visible before close", () => {
+    const vfs = new VFS();
+    vfs.writeFile("/home/user/out.txt", text.encode("stale"));
+    const fdt = new FdTable(vfs);
+
+    const fd = fdt.open("/home/user/out.txt", "w");
+
+    expect(vfs.stat("/home/user/out.txt").size).toBe(0);
+    expect(decode(vfs.readFile("/home/user/out.txt"))).toBe("");
+    fdt.close(fd);
+  });
+
   it("restores buffered write state when immediate flush fails", () => {
     const vfs = new VFS({ fsLimitBytes: 3 });
     const fdt = new FdTable(vfs);
@@ -311,7 +323,7 @@ describe("FdTable", () => {
     });
 
     const fdt = new FdTable(vfs, { uid: 1000, gid: 1000 });
-    const fd = fdt.open("/root-owned.txt", "w");
+    const fd = fdt.open("/root-owned.txt", "rw");
 
     expect(() => fdt.write(fd, new TextEncoder().encode("bypass"))).toThrow(
       "permission denied",
@@ -319,7 +331,7 @@ describe("FdTable", () => {
     expect(new TextDecoder().decode(vfs.readFile("/root-owned.txt"))).toBe(
       "original",
     );
-    expect(() => fdt.close(fd)).toThrow("permission denied");
+    fdt.close(fd);
   });
 });
 
