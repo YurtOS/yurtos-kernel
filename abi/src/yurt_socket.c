@@ -88,6 +88,7 @@ static yurt_socket_entry yurt_sockets[YURT_SOCKET_MAX_TRACKED];
 static int yurt_next_guest_fd = YURT_SOCKET_FIRST_GUEST_FD;
 
 static yurt_socket_entry *yurt_socket_find(int fd) {
+  if (fd < YURT_SOCKET_FIRST_GUEST_FD) return NULL;
   for (size_t i = 0; i < YURT_SOCKET_MAX_TRACKED; i++) {
     if (yurt_sockets[i].guest_fd == fd) return &yurt_sockets[i];
   }
