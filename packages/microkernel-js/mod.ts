@@ -1080,6 +1080,109 @@ export class KernelInstance {
   }
 }
 
+function byteKey(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+interface CachedProcessInstance {
+  instance: WebAssembly.Instance;
+  memory?: WebAssembly.Memory;
+}
+
+class CachedProcessEngine {
+  private readonly modules = new Map<string, WebAssembly.Module>();
+  private readonly instances = new Map<number, CachedProcessInstance>();
+  private nextHandle = 1;
+
+  cacheModule(moduleId: Uint8Array, wasmBytes: Uint8Array): void {
+    const module = new WebAssembly.Module(
+      wasmBytes as unknown as BufferSource,
+    );
+    this.modules.set(byteKey(moduleId), module);
+  }
+
+  spawn(
+    kernelMemory: WebAssembly.Memory,
+    moduleIdPtr: number,
+    moduleIdLen: number,
+  ): number {
+    const moduleId = new Uint8Array(
+      kernelMemory.buffer,
+      moduleIdPtr,
+      moduleIdLen,
+    ).slice();
+    const module = this.modules.get(byteKey(moduleId));
+    if (!module) return -ENOENT;
+
+    let instance: WebAssembly.Instance;
+    try {
+      instance = new WebAssembly.Instance(module, {
+        env: {},
+        wasi_snapshot_preview1: {},
+      });
+    } catch {
+      return -EIO;
+    }
+
+    const memory = instance.exports.memory instanceof WebAssembly.Memory
+      ? instance.exports.memory
+      : undefined;
+    const handle = this.nextHandle++;
+    this.instances.set(handle, { instance, memory });
+    return handle;
+  }
+
+  destroy(handle: number): number {
+    if (!this.instances.delete(handle)) return -EBADF;
+    return 0;
+  }
+
+  memRead(
+    handle: number,
+    addr: number,
+    kernelMemory: WebAssembly.Memory,
+    dstPtr: number,
+    len: number,
+  ): bigint {
+    const proc = this.instances.get(handle);
+    if (!proc?.memory) return BigInt(-EBADF);
+    if (!this.boundsOk(proc.memory, addr, len)) return BigInt(-EFAULT);
+    if (!this.boundsOk(kernelMemory, dstPtr, len)) return BigInt(-EFAULT);
+    new Uint8Array(kernelMemory.buffer, dstPtr, len).set(
+      new Uint8Array(proc.memory.buffer, addr, len),
+    );
+    return BigInt(len);
+  }
+
+  memWrite(
+    handle: number,
+    addr: number,
+    kernelMemory: WebAssembly.Memory,
+    srcPtr: number,
+    len: number,
+  ): bigint {
+    const proc = this.instances.get(handle);
+    if (!proc?.memory) return BigInt(-EBADF);
+    if (!this.boundsOk(proc.memory, addr, len)) return BigInt(-EFAULT);
+    if (!this.boundsOk(kernelMemory, srcPtr, len)) return BigInt(-EFAULT);
+    new Uint8Array(proc.memory.buffer, addr, len).set(
+      new Uint8Array(kernelMemory.buffer, srcPtr, len),
+    );
+    return BigInt(len);
+  }
+
+  resume(_handle: number, _result: bigint): bigint {
+    return BigInt(-ENOSYS);
+  }
+
+  private boundsOk(memory: WebAssembly.Memory, ptr: number, len: number) {
+    if (!Number.isInteger(ptr) || !Number.isInteger(len)) return false;
+    if (ptr < 0 || len < 0) return false;
+    return ptr <= memory.buffer.byteLength &&
+      len <= memory.buffer.byteLength - ptr;
+  }
+}
+
 // ── User process ──────────────────────────────────────────────────────────
 
 export class UserProcess {
@@ -1158,10 +1261,16 @@ export class UserProcess {
 export class Microkernel {
   private kernel: KernelInstance;
   private hostState: HostState;
+  private processEngine: CachedProcessEngine;
 
-  private constructor(kernel: KernelInstance, hostState: HostState) {
+  private constructor(
+    kernel: KernelInstance,
+    hostState: HostState,
+    processEngine: CachedProcessEngine,
+  ) {
     this.kernel = kernel;
     this.hostState = hostState;
+    this.processEngine = processEngine;
   }
 
   static async load(
@@ -1170,6 +1279,7 @@ export class Microkernel {
   ): Promise<Microkernel> {
     const memoryRef: { memory?: WebAssembly.Memory } = {};
     const hostBox = { state: hostState };
+    const processEngine = new CachedProcessEngine();
 
     const khImports = {
       kh_now_realtime: (outPtr: number): number => {
@@ -1577,30 +1687,34 @@ export class Microkernel {
         return BigInt(result.byteLength);
       },
       kh_spawn_process: (
-        _moduleIdPtr: number,
-        _moduleIdLen: number,
+        moduleIdPtr: number,
+        moduleIdLen: number,
         _argvPtr: number,
         _argvLen: number,
         _envpPtr: number,
         _envpLen: number,
-      ): number => -ENOSYS,
-      kh_destroy_instance: (_handle: number): number => -ENOSYS,
+      ): number =>
+        processEngine.spawn(memoryRef.memory!, moduleIdPtr, moduleIdLen),
+      kh_destroy_instance: (handle: number): number =>
+        processEngine.destroy(handle),
       kh_process_mem_read: (
-        _handle: number,
-        _addr: number,
-        _dstPtr: number,
-        _len: number,
-      ): bigint => BigInt(-ENOSYS),
+        handle: number,
+        addr: number,
+        dstPtr: number,
+        len: number,
+      ): bigint =>
+        processEngine.memRead(handle, addr, memoryRef.memory!, dstPtr, len),
       kh_process_mem_write: (
-        _handle: number,
-        _addr: number,
-        _srcPtr: number,
-        _len: number,
-      ): bigint => BigInt(-ENOSYS),
+        handle: number,
+        addr: number,
+        srcPtr: number,
+        len: number,
+      ): bigint =>
+        processEngine.memWrite(handle, addr, memoryRef.memory!, srcPtr, len),
       kh_process_resume: (
-        _handle: number,
-        _result: bigint,
-      ): bigint => BigInt(-ENOSYS),
+        handle: number,
+        result: bigint,
+      ): bigint => processEngine.resume(handle, result),
     };
 
     // std-on-wasi panic-infra stubs for kernel.wasm itself.
@@ -2098,7 +2212,7 @@ export class Microkernel {
       kernelSpawn ?? null,
     );
     hostBox.state = hostState;
-    const mk = new Microkernel(kernel, hostState);
+    const mk = new Microkernel(kernel, hostState, processEngine);
     (mk as unknown as { hostBox: typeof hostBox }).hostBox = hostBox;
     return mk;
   }
@@ -2127,6 +2241,10 @@ export class Microkernel {
 
   hostStateMut(): HostState {
     return this.hostState;
+  }
+
+  cacheProcessModule(moduleId: Uint8Array, wasmBytes: Uint8Array): void {
+    this.processEngine.cacheModule(moduleId, wasmBytes);
   }
 
   listProcesses(): ProcessSnapshot[] {

@@ -175,7 +175,69 @@ Deno.test("microkernel binds wasm-engine kh imports", async () => {
   `);
   const mk = await Microkernel.load(fakeKernel, defaultHostState());
   const { rc } = mk.syscall(0, new Uint8Array(0), 0);
-  assertEquals(rc, -190n);
+  assertEquals(rc, -67n);
+});
+
+Deno.test("kh_spawn_process manages cached wasm instance handles", async () => {
+  const processWasm = await wat2wasm(`
+    (module
+      (memory (export "memory") 1))
+  `);
+  const fakeKernel = await wat2wasm(`
+    (module
+      (import "kh" "kh_spawn_process"
+        (func $spawn (param i32 i32 i32 i32 i32 i32) (result i32)))
+      (import "kh" "kh_destroy_instance"
+        (func $destroy (param i32) (result i32)))
+      (import "kh" "kh_process_mem_read"
+        (func $mem_read (param i32 i32 i32 i32) (result i64)))
+      (import "kh" "kh_process_mem_write"
+        (func $mem_write (param i32 i32 i32 i32) (result i64)))
+      (memory (export "memory") 1)
+      (data (i32.const 2048) "mem-proc")
+      (data (i32.const 2064) "ok")
+      (func (export "kernel_scratch_ptr") (result i32) (i32.const 1024))
+      (func (export "kernel_scratch_len") (result i32) (i32.const 4096))
+      (func (export "kernel_dispatch")
+        (param $method i32) (param $pid i32)
+        (param $in_ptr i32) (param $in_len i32)
+        (param $out_ptr i32) (param $out_cap i32)
+        (result i64)
+        (local $handle i32)
+        (local $rc i64)
+        (local.set $handle
+          (call $spawn
+            (i32.const 2048) (i32.const 8)
+            (i32.const 0) (i32.const 0)
+            (i32.const 0) (i32.const 0)))
+        (if (result i64) (i32.lt_s (local.get $handle) (i32.const 0))
+          (then (return (i64.extend_i32_s (local.get $handle))))
+          (else (i64.const 0)))
+        (drop)
+        (local.set $rc
+          (call $mem_write
+            (local.get $handle)
+            (i32.const 16)
+            (i32.const 2064)
+            (i32.const 2)))
+        (if (i64.ne (local.get $rc) (i64.const 2))
+          (then (return (local.get $rc))))
+        (local.set $rc
+          (call $mem_read
+            (local.get $handle)
+            (i32.const 16)
+            (local.get $out_ptr)
+            (i32.const 2)))
+        (if (i64.ne (local.get $rc) (i64.const 2))
+          (then (return (local.get $rc))))
+        (drop (call $destroy (local.get $handle)))
+        (i64.const 2)))
+  `);
+  const mk = await Microkernel.load(fakeKernel, defaultHostState());
+  mk.cacheProcessModule(s("mem-proc"), processWasm);
+  const { rc, response } = mk.syscall(0, new Uint8Array(0), 2);
+  assertEquals(rc, 2n);
+  assertEquals(new TextDecoder().decode(response.subarray(0, 2)), "ok");
 });
 
 Deno.test("memory-mediated request/response round-trips bytes", async () => {

@@ -5,28 +5,27 @@
 ## Summary
 
 Move the Yurt kernel out of host TypeScript and into a Rust crate compiled to
-`wasm32-wasip1`. Shrink the host to a "microkernel" that owns only the wasm
-engine and the outside world (real filesystem, network, clock, scheduling). Run
-the kernel in its own sandbox the same way user processes already run, so the
-kernel and user processes share an isolation model and the same Rust source
-serves every host (native wasmtime, browser via JSPI/asyncify, Deno, bare
-`wasmtime run`).
+`wasm32-wasip1`. Shrink the host side to a kernel-host interface that owns only
+the wasm engine and the outside world (real filesystem, network, clock,
+scheduling). Run the kernel in its own sandbox the same way user processes
+already run, so the kernel and user processes share an isolation model and the
+same Rust source serves every host (native wasmtime, browser via JSPI/asyncify,
+Deno, bare `wasmtime run`).
 
-This is a true microkernel split. Kernel.wasm owns _policy_: VFS layout, process
-tree, fd table, signal routing, security checks, image semantics, network
-policy. The host owns _mechanism_: instantiate wasm modules, copy bytes between
-linear memories, perform real I/O, suspend/resume on JS hosts via JSPI or
-asyncify, preempt via wasmtime epochs.
+This is a kernel/host-interface split. Kernel.wasm owns _policy_: VFS layout,
+process tree, fd table, signal routing, security checks, image semantics,
+network policy. The host interface owns _mechanism_: instantiate wasm modules,
+copy bytes between linear memories, perform real I/O, suspend/resume on JS hosts
+via JSPI or asyncify, preempt via wasmtime epochs.
 
-The microkernel layer is therefore a **pluggable backend**: a runtime is defined
-entirely by its implementation of the kernel→host ABI plus a small
+The kernel-host interface is therefore a **pluggable backend**: a runtime is
+defined entirely by its implementation of the kernel→host ABI plus a small
 instantiation/dispatch contract. Any wasm runtime that can host the same `kh_*`
 imports and call `kernel_dispatch` is a supported backend — wasmtime, Wasmer,
 the browser engine via JSPI/asyncify, Wasmi for embedded, and future runtimes
-drop in without touching kernel.wasm or process. Each microkernel package
-(`microkernel-wasmtime` for native, `microkernel-js` for any JS engine plus
-`microkernel-deno` for Deno-only extensions, future runtimes, …) is a thin
-adapter that satisfies one well-defined interface.
+drop in without touching kernel.wasm or process. Existing package names such as
+`packages/microkernel-js` are historical; architecturally they are KH adapters,
+not independent kernels.
 
 ## Why
 
@@ -36,7 +35,7 @@ adapter that satisfies one well-defined interface.
 2. **Host-portable.** Browser, native, and CLI hosts each need a kernel today;
    only TypeScript covers them all. Compiling the kernel to wasm inverts this:
    every host instantiates the same `kernel.wasm`.
-3. **Smaller TCB.** The host microkernel becomes small enough to audit
+3. **Smaller TCB.** The host interface becomes small enough to audit
    thoroughly. Kernel logic that doesn't need ambient host authority (most of
    it) runs sandboxed alongside user code.
 
@@ -44,7 +43,7 @@ adapter that satisfies one well-defined interface.
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ Host Microkernel (per-platform)                              │
+│ Kernel-Host Interface / KH Adapter (per-platform)            │
 │  - wasmtime native     packages/microkernel-wasmtime         │
 │  - any JS engine       packages/microkernel-js               │
 │       (Deno, browsers, Node, Bun all share this)             │
@@ -62,7 +61,7 @@ adapter that satisfies one well-defined interface.
 ```
 
 (Throughout this document, "process" means a Yurt user process — a wasm module
-instantiated by the microkernel that imports `host_*` from `yurt_abi.toml`. The
+instantiated by the KH adapter that imports `host_*` from `yurt_abi.toml`. The
 repo is mid-rename from the older "guest" terminology.)
 
 ### Naming note: transitional `host_*`, eventual `sys_*`
@@ -167,10 +166,11 @@ surface, grouped:
   `kh_process_mem_write(handle, addr, src_ptr, len)`,
   `kh_process_resume(handle)`.
   This import family is now represented in `packages/kernel-wasm/src/kh.rs` and
-  `packages/microkernel-js/mod.ts`. The portable JS backend intentionally
-  returns `-ENOSYS` for these calls until the host module cache, instance handle
-  table, and scheduler/resume loop are wired; the ABI bindings themselves are no
-  longer spec-only.
+  `packages/microkernel-js/mod.ts`. The portable JS backend has a host module
+  cache and opaque instance-handle table for cached wasm modules, including
+  instance destroy and kernel↔process memory copies. `kh_process_resume`
+  intentionally returns `-ENOSYS` until the scheduler/resume loop is wired; the
+  ABI bindings themselves are no longer spec-only.
 - **Diagnostics:** `kh_log` (severity, ptr, len), `kh_panic` (ptr, len —
   microkernel must terminate the kernel instance and surface the message).
 - **Cooperative yield:** `kh_yield` — blocks the calling kernel computation

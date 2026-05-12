@@ -32,26 +32,26 @@ the adapter gaps that parity exposes.
 
 Two ABI surfaces stay separate:
 
-- **User process to kernel:** transitional userland still imports legacy
-  `host_*` symbols from `yurt_abi.toml`. In wasm-kernel mode the microkernel
+- **User process to kernel:** transitional userland still imports current
+  `host_*` symbols from `yurt_abi.toml`. In wasm-kernel mode the KH adapter
   implements those imports by copying request bytes into `kernel.wasm` and
   calling `kernel_dispatch(method_id, in_ptr, in_len, out_ptr, out_cap)`. New or
   rebuilt userland may move to `sys_*` names later, but that rename is not part
   of the parity gate.
-- **Kernel to microkernel:** `kernel.wasm` imports `kh_*` functions for real
+- **Kernel to host interface:** `kernel.wasm` imports `kh_*` functions for real
   host authority: clock, entropy, real filesystem, network sockets/fetch,
   process instantiation/memory copies, extension invocation, logging, and
   cooperative yield.
 
 Kernel.wasm owns policy and virtual state: process tree, fd table, VFS, signals,
-security checks, image semantics, and network policy. The microkernel owns
+security checks, image semantics, and network policy. The KH adapter owns
 mechanism: wasm engine/store management, host I/O, byte copies between
 instances, scheduling, JSPI/asyncify suspension, and native epoch preemption.
 
-Process control and sandbox observability are kernel APIs, not microkernel data
+Process control and sandbox observability are kernel APIs, not KH-adapter data
 structures. Host-facing operations such as spawn, kill, wait/reap, and
 list-processes must enter `kernel.wasm` through explicit control/query exports.
-The microkernel may expose those operations to the embedding host, but it must
+The KH adapter may expose those operations to the embedding host, but it must
 not keep a parallel process table or synthesize process state. For the
 transition, TS-kernel compatibility can mirror the ABI shape only where required
 by existing tests; new process ownership work starts in the Rust kernel.
@@ -105,8 +105,10 @@ records.
   `kh_spawn_process`. Rust `kh` wrappers and portable JS microkernel bindings
   now exist for the wasm-engine import family (`kh_spawn_process`,
   `kh_destroy_instance`, `kh_process_mem_read`, `kh_process_mem_write`,
-  `kh_process_resume`); they currently return `-ENOSYS` until the host module
-  cache and scheduler path are wired. The remaining reserved export is
+  `kh_process_resume`). The portable JS microkernel now has a host module cache
+  and opaque instance-handle table for cached modules, including process memory
+  read/write and destroy. `kh_process_resume` still returns `-ENOSYS` until the
+  scheduler/resume loop lands. The remaining reserved export is
   `kernel_snapshot`.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
