@@ -38,6 +38,46 @@ type = "u32"
 value = 1
 doc = "Return immediately from host_wait when no child has exited."
 
+[constant.YURT_SOCKET_ADDR_LOCAL]
+type = "u32"
+value = 0
+doc = "Select local socket address."
+
+[constant.YURT_SOCKET_ADDR_PEER]
+type = "u32"
+value = 1
+doc = "Select peer socket address."
+
+[constant.YURT_SOCKET_OPT_TCP_NODELAY]
+type = "u32"
+value = 1
+doc = "TCP_NODELAY socket option."
+
+[constant.YURT_SOCKET_FLAG_TLS]
+type = "u32"
+value = 1
+doc = "Connect using TLS."
+
+[constant.YURT_MSG_PEEK]
+type = "u32"
+value = 2
+doc = "Socket recv peek flag."
+
+[constant.YURT_AF_INET]
+type = "u32"
+value = 2
+doc = "IPv4 address family."
+
+[constant.YURT_FETCH_REDIRECT_FOLLOW]
+type = "u32"
+value = 0
+doc = "Follow HTTP redirects."
+
+[constant.YURT_FETCH_REDIRECT_MANUAL]
+type = "u32"
+value = 1
+doc = "Return manual redirect responses."
+
 [errno.EPERM]
 value = 1
 doc = "Operation not permitted."
@@ -152,6 +192,134 @@ fields = [
   { name = "pid", type = "i32", doc = "Spawned process id." },
 ]
 
+[struct.yurt_socket_addr_result_v1]
+doc = "Fixed IPv4 socket address result."
+fields = [
+  { name = "host_be", type = "u32", doc = "IPv4 address in network byte order." },
+  { name = "port_be", type = "u16", doc = "Port in network byte order." },
+  { name = "reserved", type = "u16", doc = "Reserved; must be zero." },
+]
+
+[struct.yurt_socket_accept_result_v1]
+doc = "Fixed accept result."
+fields = [
+  { name = "fd", type = "i32", doc = "Accepted socket fd." },
+  { name = "peer_host_be", type = "u32", doc = "Peer IPv4 address in network byte order." },
+  { name = "peer_port_be", type = "u16", doc = "Peer port in network byte order." },
+  { name = "local_port_be", type = "u16", doc = "Local port in network byte order." },
+  { name = "local_host_be", type = "u32", doc = "Local IPv4 address in network byte order." },
+]
+
+[struct.yurt_dns_addr_result_v1]
+doc = "Native DNS IPv4 address result."
+fields = [
+  { name = "family", type = "u32", doc = "Address family, currently YURT_AF_INET." },
+  { name = "addr_be", type = "u32", doc = "IPv4 address in network byte order." },
+]
+
+[struct.yurt_record_span_v1]
+doc = "Offset and length pair inside a variable native record."
+fields = [
+  { name = "offset", type = "u32", doc = "Byte offset from the start of the record." },
+  { name = "length", type = "u32", doc = "Byte length." },
+]
+
+[struct.yurt_record_pair_v1]
+doc = "Two string spans used for key/value vectors."
+fields = [
+  { name = "key_offset", type = "u32", doc = "Key byte offset from the start of the record." },
+  { name = "key_length", type = "u32", doc = "Key byte length." },
+  { name = "value_offset", type = "u32", doc = "Value byte offset from the start of the record." },
+  { name = "value_length", type = "u32", doc = "Value byte length." },
+]
+
+[struct.yurt_fetch_request_v1]
+doc = "Variable native fetch request record header."
+fields = [
+  { name = "size", type = "u32", doc = "Total logical record size." },
+  { name = "version", type = "u16", doc = "Record version." },
+  { name = "flags", type = "u16", doc = "Reserved flags." },
+  { name = "url_offset", type = "u32", doc = "URL byte offset." },
+  { name = "url_length", type = "u32", doc = "URL byte length." },
+  { name = "method_offset", type = "u32", doc = "HTTP method byte offset." },
+  { name = "method_length", type = "u32", doc = "HTTP method byte length." },
+  { name = "headers_offset", type = "u32", doc = "Offset of yurt_record_pair_v1 header entries." },
+  { name = "headers_count", type = "u32", doc = "Number of header entries." },
+  { name = "body_offset", type = "u32", doc = "Request body byte offset, or zero for none." },
+  { name = "body_length", type = "u32", doc = "Request body byte length." },
+  { name = "redirect_mode", type = "u32", doc = "YURT_FETCH_REDIRECT_* value." },
+]
+
+[struct.yurt_fetch_response_v1]
+doc = "Variable native fetch response record header."
+fields = [
+  { name = "size", type = "u32", doc = "Total logical record size." },
+  { name = "version", type = "u16", doc = "Record version." },
+  { name = "flags", type = "u16", doc = "Reserved flags." },
+  { name = "status", type = "u32", doc = "HTTP response status, or zero for transport error." },
+  { name = "headers_offset", type = "u32", doc = "Offset of yurt_record_pair_v1 response header entries." },
+  { name = "headers_count", type = "u32", doc = "Number of response header entries." },
+  { name = "body_offset", type = "u32", doc = "Response body byte offset." },
+  { name = "body_length", type = "u32", doc = "Response body byte length." },
+  { name = "error_offset", type = "u32", doc = "Error string byte offset, or zero for no error." },
+  { name = "error_length", type = "u32", doc = "Error string byte length." },
+]
+
+[struct.yurt_extension_request_v1]
+doc = "Variable native extension invocation request record header."
+fields = [
+  { name = "size", type = "u32", doc = "Total logical record size." },
+  { name = "version", type = "u16", doc = "Record version." },
+  { name = "flags", type = "u16", doc = "Reserved flags." },
+  { name = "name_offset", type = "u32", doc = "Extension name byte offset." },
+  { name = "name_length", type = "u32", doc = "Extension name byte length." },
+  { name = "argv_offset", type = "u32", doc = "Offset of yurt_record_span_v1 argv entries." },
+  { name = "argv_count", type = "u32", doc = "Number of argv entries." },
+  { name = "stdin_offset", type = "u32", doc = "Stdin byte offset." },
+  { name = "stdin_length", type = "u32", doc = "Stdin byte length." },
+  { name = "cwd_offset", type = "u32", doc = "Current directory byte offset." },
+  { name = "cwd_length", type = "u32", doc = "Current directory byte length." },
+  { name = "env_offset", type = "u32", doc = "Offset of yurt_record_pair_v1 environment entries." },
+  { name = "env_count", type = "u32", doc = "Number of environment entries." },
+  { name = "payload_offset", type = "u32", doc = "Opaque plugin payload byte offset." },
+  { name = "payload_length", type = "u32", doc = "Opaque plugin payload byte length." },
+]
+
+[struct.yurt_extension_response_v1]
+doc = "Variable native extension invocation response record header."
+fields = [
+  { name = "size", type = "u32", doc = "Total logical record size." },
+  { name = "version", type = "u16", doc = "Record version." },
+  { name = "flags", type = "u16", doc = "Reserved flags." },
+  { name = "exit_code", type = "i32", doc = "Extension process-style exit code." },
+  { name = "stdout_offset", type = "u32", doc = "Stdout byte offset." },
+  { name = "stdout_length", type = "u32", doc = "Stdout byte length." },
+  { name = "stderr_offset", type = "u32", doc = "Stderr byte offset." },
+  { name = "stderr_length", type = "u32", doc = "Stderr byte length." },
+  { name = "payload_offset", type = "u32", doc = "Opaque plugin response byte offset." },
+  { name = "payload_length", type = "u32", doc = "Opaque plugin response byte length." },
+]
+
+[struct.yurt_process_entry_v1]
+doc = "Fixed entry in a native process-list response."
+fields = [
+  { name = "pid", type = "i32", doc = "Process id." },
+  { name = "ppid", type = "i32", doc = "Parent process id." },
+  { name = "state", type = "u32", doc = "Kernel process state enum value." },
+  { name = "command_offset", type = "u32", doc = "Command string byte offset." },
+  { name = "command_length", type = "u32", doc = "Command string byte length." },
+]
+
+[struct.yurt_process_list_response_v1]
+doc = "Variable native process-list response record header."
+fields = [
+  { name = "size", type = "u32", doc = "Total logical record size." },
+  { name = "version", type = "u16", doc = "Record version." },
+  { name = "flags", type = "u16", doc = "Reserved flags." },
+  { name = "entries_offset", type = "u32", doc = "Offset of yurt_process_entry_v1 entries." },
+  { name = "entries_count", type = "u32", doc = "Number of process entries." },
+]
+
 [import.host_pipe]
 doc = "Create an anonymous pipe and write yurt_pipe_result_v1."
 return = "fixed_out"
@@ -227,6 +395,71 @@ args = [
   { name = "flags", type = "i32" },
 ]
 
+[import.host_socket_connect]
+doc = "Connect a socket fd to host:port. Flags may include YURT_SOCKET_FLAG_TLS."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "host_ptr", type = "ptr" },
+  { name = "host_len", type = "usize" },
+  { name = "port", type = "u32" },
+  { name = "flags", type = "u32" },
+]
+
+[import.host_socket_bind]
+doc = "Bind a socket fd to host:port."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "host_ptr", type = "ptr" },
+  { name = "host_len", type = "usize" },
+  { name = "port", type = "u32" },
+]
+
+[import.host_socket_listen]
+doc = "Listen on a bound socket fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "backlog", type = "i32" },
+]
+
+[import.host_socket_accept]
+doc = "Accept a connection and write yurt_socket_accept_result_v1."
+return = "fixed_out"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_socket_addr]
+doc = "Write yurt_socket_addr_result_v1 for local or peer address."
+return = "fixed_out"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "which", type = "u32" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_socket_option]
+doc = "Set or get a scalar socket option. Get returns the option value as a non-negative scalar."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "option", type = "u32" },
+  { name = "has_value", type = "u32" },
+  { name = "value", type = "i32" },
+]
+
+[import.host_socket_close]
+doc = "Close a socket fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+]
+
 [import.host_dns_resolve]
 doc = "Resolve a UTF-8 host name and write a native address record."
 return = "record_out"
@@ -245,6 +478,46 @@ args = [
   { name = "req_len", type = "usize" },
   { name = "out_ptr", type = "ptr" },
   { name = "out_cap", type = "usize" },
+]
+
+[import.host_extension_invoke]
+doc = "Invoke a registered host extension through a native extension request record and write a native extension response record."
+return = "record_out"
+args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_list_processes]
+doc = "Write a native process-list response record."
+return = "record_out"
+args = [
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[function.yurt_system]
+doc = "Compatibility helper implemented over spawn, pipes, fd I/O, and wait. Not a host import."
+return = "int"
+args = [
+  { name = "cmd", type = "const char *" },
+]
+
+[function.yurt_popen]
+doc = "Compatibility helper implemented over spawn, pipes, fd I/O, and wait. Not a host import."
+return = "FILE *"
+args = [
+  { name = "cmd", type = "const char *" },
+  { name = "mode", type = "const char *" },
+]
+
+[function.yurt_pclose]
+doc = "Close a stream returned by yurt_popen and return command status."
+return = "int"
+args = [
+  { name = "stream", type = "FILE *" },
 ]
 
 [function.yurt_fetch_text]

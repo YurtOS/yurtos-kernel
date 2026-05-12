@@ -30,6 +30,30 @@
 /* Return immediately from host_wait when no child has exited. */
 #define YURT_WAIT_NOHANG 1u
 
+/* Select local socket address. */
+#define YURT_SOCKET_ADDR_LOCAL 0u
+
+/* Select peer socket address. */
+#define YURT_SOCKET_ADDR_PEER 1u
+
+/* TCP_NODELAY socket option. */
+#define YURT_SOCKET_OPT_TCP_NODELAY 1u
+
+/* Connect using TLS. */
+#define YURT_SOCKET_FLAG_TLS 1u
+
+/* Socket recv peek flag. */
+#define YURT_MSG_PEEK 2u
+
+/* IPv4 address family. */
+#define YURT_AF_INET 2u
+
+/* Follow HTTP redirects. */
+#define YURT_FETCH_REDIRECT_FOLLOW 0u
+
+/* Return manual redirect responses. */
+#define YURT_FETCH_REDIRECT_MANUAL 1u
+
 /* Operation not permitted. */
 #define YURT_ERRNO_EPERM 1
 
@@ -112,6 +136,123 @@ typedef struct yurt_spawn_result_v1 {
   int pid;
 } yurt_spawn_result_v1;
 
+/* Fixed IPv4 socket address result. */
+typedef struct yurt_socket_addr_result_v1 {
+  uint32_t host_be;
+  uint16_t port_be;
+  uint16_t reserved;
+} yurt_socket_addr_result_v1;
+
+/* Fixed accept result. */
+typedef struct yurt_socket_accept_result_v1 {
+  int fd;
+  uint32_t peer_host_be;
+  uint16_t peer_port_be;
+  uint16_t local_port_be;
+  uint32_t local_host_be;
+} yurt_socket_accept_result_v1;
+
+/* Native DNS IPv4 address result. */
+typedef struct yurt_dns_addr_result_v1 {
+  uint32_t family;
+  uint32_t addr_be;
+} yurt_dns_addr_result_v1;
+
+/* Offset and length pair inside a variable native record. */
+typedef struct yurt_record_span_v1 {
+  uint32_t offset;
+  uint32_t length;
+} yurt_record_span_v1;
+
+/* Two string spans used for key/value vectors. */
+typedef struct yurt_record_pair_v1 {
+  uint32_t key_offset;
+  uint32_t key_length;
+  uint32_t value_offset;
+  uint32_t value_length;
+} yurt_record_pair_v1;
+
+/* Variable native fetch request record header. */
+typedef struct yurt_fetch_request_v1 {
+  uint32_t size;
+  uint16_t version;
+  uint16_t flags;
+  uint32_t url_offset;
+  uint32_t url_length;
+  uint32_t method_offset;
+  uint32_t method_length;
+  uint32_t headers_offset;
+  uint32_t headers_count;
+  uint32_t body_offset;
+  uint32_t body_length;
+  uint32_t redirect_mode;
+} yurt_fetch_request_v1;
+
+/* Variable native fetch response record header. */
+typedef struct yurt_fetch_response_v1 {
+  uint32_t size;
+  uint16_t version;
+  uint16_t flags;
+  uint32_t status;
+  uint32_t headers_offset;
+  uint32_t headers_count;
+  uint32_t body_offset;
+  uint32_t body_length;
+  uint32_t error_offset;
+  uint32_t error_length;
+} yurt_fetch_response_v1;
+
+/* Variable native extension invocation request record header. */
+typedef struct yurt_extension_request_v1 {
+  uint32_t size;
+  uint16_t version;
+  uint16_t flags;
+  uint32_t name_offset;
+  uint32_t name_length;
+  uint32_t argv_offset;
+  uint32_t argv_count;
+  uint32_t stdin_offset;
+  uint32_t stdin_length;
+  uint32_t cwd_offset;
+  uint32_t cwd_length;
+  uint32_t env_offset;
+  uint32_t env_count;
+  uint32_t payload_offset;
+  uint32_t payload_length;
+} yurt_extension_request_v1;
+
+/* Variable native extension invocation response record header. */
+typedef struct yurt_extension_response_v1 {
+  uint32_t size;
+  uint16_t version;
+  uint16_t flags;
+  int exit_code;
+  uint32_t stdout_offset;
+  uint32_t stdout_length;
+  uint32_t stderr_offset;
+  uint32_t stderr_length;
+  uint32_t payload_offset;
+  uint32_t payload_length;
+} yurt_extension_response_v1;
+
+/* Fixed entry in a native process-list response. */
+typedef struct yurt_process_entry_v1 {
+  int pid;
+  int ppid;
+  uint32_t state;
+  uint32_t command_offset;
+  uint32_t command_length;
+} yurt_process_entry_v1;
+
+/* Variable native process-list response record header. */
+typedef struct yurt_process_list_response_v1 {
+  uint32_t size;
+  uint16_t version;
+  uint16_t flags;
+  uint32_t entries_offset;
+  uint32_t entries_count;
+} yurt_process_list_response_v1;
+
 /* Create an anonymous pipe and write yurt_pipe_result_v1. */
 __attribute__((import_module("yurt"), import_name("host_pipe")))
 int yurt_host_pipe(int out_ptr, int out_cap);
@@ -144,6 +285,34 @@ int yurt_host_socket_send(int fd, int data_ptr, int data_len, int flags);
 __attribute__((import_module("yurt"), import_name("host_socket_recv")))
 int yurt_host_socket_recv(int fd, int out_ptr, int out_cap, int flags);
 
+/* Connect a socket fd to host:port. Flags may include YURT_SOCKET_FLAG_TLS. */
+__attribute__((import_module("yurt"), import_name("host_socket_connect")))
+int yurt_host_socket_connect(int fd, int host_ptr, int host_len, uint32_t port, uint32_t flags);
+
+/* Bind a socket fd to host:port. */
+__attribute__((import_module("yurt"), import_name("host_socket_bind")))
+int yurt_host_socket_bind(int fd, int host_ptr, int host_len, uint32_t port);
+
+/* Listen on a bound socket fd. */
+__attribute__((import_module("yurt"), import_name("host_socket_listen")))
+int yurt_host_socket_listen(int fd, int backlog);
+
+/* Accept a connection and write yurt_socket_accept_result_v1. */
+__attribute__((import_module("yurt"), import_name("host_socket_accept")))
+int yurt_host_socket_accept(int fd, int out_ptr, int out_cap);
+
+/* Write yurt_socket_addr_result_v1 for local or peer address. */
+__attribute__((import_module("yurt"), import_name("host_socket_addr")))
+int yurt_host_socket_addr(int fd, uint32_t which, int out_ptr, int out_cap);
+
+/* Set or get a scalar socket option. Get returns the option value as a non-negative scalar. */
+__attribute__((import_module("yurt"), import_name("host_socket_option")))
+int yurt_host_socket_option(int fd, uint32_t option, uint32_t has_value, int value);
+
+/* Close a socket fd. */
+__attribute__((import_module("yurt"), import_name("host_socket_close")))
+int yurt_host_socket_close(int fd);
+
 /* Resolve a UTF-8 host name and write a native address record. */
 __attribute__((import_module("yurt"), import_name("host_dns_resolve")))
 int yurt_host_dns_resolve(int host_ptr, int host_len, int out_ptr, int out_cap);
@@ -151,6 +320,14 @@ int yurt_host_dns_resolve(int host_ptr, int host_len, int out_ptr, int out_cap);
 /* Execute a network fetch described by a native request record and write a native response record. */
 __attribute__((import_module("yurt"), import_name("host_network_fetch")))
 int yurt_host_network_fetch(int req_ptr, int req_len, int out_ptr, int out_cap);
+
+/* Invoke a registered host extension through a native extension request record and write a native extension response record. */
+__attribute__((import_module("yurt"), import_name("host_extension_invoke")))
+int yurt_host_extension_invoke(int req_ptr, int req_len, int out_ptr, int out_cap);
+
+/* Write a native process-list response record. */
+__attribute__((import_module("yurt"), import_name("host_list_processes")))
+int yurt_host_list_processes(int out_ptr, int out_cap);
 
 /* Compatibility helper implemented over spawn, pipes, fd I/O, and wait. Not a host import. */
 int yurt_system(const char * cmd);

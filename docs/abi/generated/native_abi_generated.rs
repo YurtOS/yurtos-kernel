@@ -25,6 +25,30 @@ pub const YURT_VERSION_PATCH: u32 = 0;
 /// Return immediately from host_wait when no child has exited.
 pub const YURT_WAIT_NOHANG: u32 = 1;
 
+/// Select local socket address.
+pub const YURT_SOCKET_ADDR_LOCAL: u32 = 0;
+
+/// Select peer socket address.
+pub const YURT_SOCKET_ADDR_PEER: u32 = 1;
+
+/// TCP_NODELAY socket option.
+pub const YURT_SOCKET_OPT_TCP_NODELAY: u32 = 1;
+
+/// Connect using TLS.
+pub const YURT_SOCKET_FLAG_TLS: u32 = 1;
+
+/// Socket recv peek flag.
+pub const YURT_MSG_PEEK: u32 = 2;
+
+/// IPv4 address family.
+pub const YURT_AF_INET: u32 = 2;
+
+/// Follow HTTP redirects.
+pub const YURT_FETCH_REDIRECT_FOLLOW: u32 = 0;
+
+/// Return manual redirect responses.
+pub const YURT_FETCH_REDIRECT_MANUAL: u32 = 1;
+
 /// Operation not permitted.
 pub const EPERM: i32 = 1;
 
@@ -121,4 +145,216 @@ pub struct YurtPipeResultV1 {
 pub struct YurtSpawnResultV1 {
     /// Spawned process id.
     pub pid: i32,
+}
+
+/// Fixed IPv4 socket address result.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtSocketAddrResultV1 {
+    /// IPv4 address in network byte order.
+    pub host_be: u32,
+    /// Port in network byte order.
+    pub port_be: u16,
+    /// Reserved; must be zero.
+    pub reserved: u16,
+}
+
+/// Fixed accept result.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtSocketAcceptResultV1 {
+    /// Accepted socket fd.
+    pub fd: i32,
+    /// Peer IPv4 address in network byte order.
+    pub peer_host_be: u32,
+    /// Peer port in network byte order.
+    pub peer_port_be: u16,
+    /// Local port in network byte order.
+    pub local_port_be: u16,
+    /// Local IPv4 address in network byte order.
+    pub local_host_be: u32,
+}
+
+/// Native DNS IPv4 address result.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtDnsAddrResultV1 {
+    /// Address family, currently YURT_AF_INET.
+    pub family: u32,
+    /// IPv4 address in network byte order.
+    pub addr_be: u32,
+}
+
+/// Offset and length pair inside a variable native record.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtRecordSpanV1 {
+    /// Byte offset from the start of the record.
+    pub offset: u32,
+    /// Byte length.
+    pub length: u32,
+}
+
+/// Two string spans used for key/value vectors.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtRecordPairV1 {
+    /// Key byte offset from the start of the record.
+    pub key_offset: u32,
+    /// Key byte length.
+    pub key_length: u32,
+    /// Value byte offset from the start of the record.
+    pub value_offset: u32,
+    /// Value byte length.
+    pub value_length: u32,
+}
+
+/// Variable native fetch request record header.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtFetchRequestV1 {
+    /// Total logical record size.
+    pub size: u32,
+    /// Record version.
+    pub version: u16,
+    /// Reserved flags.
+    pub flags: u16,
+    /// URL byte offset.
+    pub url_offset: u32,
+    /// URL byte length.
+    pub url_length: u32,
+    /// HTTP method byte offset.
+    pub method_offset: u32,
+    /// HTTP method byte length.
+    pub method_length: u32,
+    /// Offset of yurt_record_pair_v1 header entries.
+    pub headers_offset: u32,
+    /// Number of header entries.
+    pub headers_count: u32,
+    /// Request body byte offset, or zero for none.
+    pub body_offset: u32,
+    /// Request body byte length.
+    pub body_length: u32,
+    /// YURT_FETCH_REDIRECT_* value.
+    pub redirect_mode: u32,
+}
+
+/// Variable native fetch response record header.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtFetchResponseV1 {
+    /// Total logical record size.
+    pub size: u32,
+    /// Record version.
+    pub version: u16,
+    /// Reserved flags.
+    pub flags: u16,
+    /// HTTP response status, or zero for transport error.
+    pub status: u32,
+    /// Offset of yurt_record_pair_v1 response header entries.
+    pub headers_offset: u32,
+    /// Number of response header entries.
+    pub headers_count: u32,
+    /// Response body byte offset.
+    pub body_offset: u32,
+    /// Response body byte length.
+    pub body_length: u32,
+    /// Error string byte offset, or zero for no error.
+    pub error_offset: u32,
+    /// Error string byte length.
+    pub error_length: u32,
+}
+
+/// Variable native extension invocation request record header.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtExtensionRequestV1 {
+    /// Total logical record size.
+    pub size: u32,
+    /// Record version.
+    pub version: u16,
+    /// Reserved flags.
+    pub flags: u16,
+    /// Extension name byte offset.
+    pub name_offset: u32,
+    /// Extension name byte length.
+    pub name_length: u32,
+    /// Offset of yurt_record_span_v1 argv entries.
+    pub argv_offset: u32,
+    /// Number of argv entries.
+    pub argv_count: u32,
+    /// Stdin byte offset.
+    pub stdin_offset: u32,
+    /// Stdin byte length.
+    pub stdin_length: u32,
+    /// Current directory byte offset.
+    pub cwd_offset: u32,
+    /// Current directory byte length.
+    pub cwd_length: u32,
+    /// Offset of yurt_record_pair_v1 environment entries.
+    pub env_offset: u32,
+    /// Number of environment entries.
+    pub env_count: u32,
+    /// Opaque plugin payload byte offset.
+    pub payload_offset: u32,
+    /// Opaque plugin payload byte length.
+    pub payload_length: u32,
+}
+
+/// Variable native extension invocation response record header.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtExtensionResponseV1 {
+    /// Total logical record size.
+    pub size: u32,
+    /// Record version.
+    pub version: u16,
+    /// Reserved flags.
+    pub flags: u16,
+    /// Extension process-style exit code.
+    pub exit_code: i32,
+    /// Stdout byte offset.
+    pub stdout_offset: u32,
+    /// Stdout byte length.
+    pub stdout_length: u32,
+    /// Stderr byte offset.
+    pub stderr_offset: u32,
+    /// Stderr byte length.
+    pub stderr_length: u32,
+    /// Opaque plugin response byte offset.
+    pub payload_offset: u32,
+    /// Opaque plugin response byte length.
+    pub payload_length: u32,
+}
+
+/// Fixed entry in a native process-list response.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtProcessEntryV1 {
+    /// Process id.
+    pub pid: i32,
+    /// Parent process id.
+    pub ppid: i32,
+    /// Kernel process state enum value.
+    pub state: u32,
+    /// Command string byte offset.
+    pub command_offset: u32,
+    /// Command string byte length.
+    pub command_length: u32,
+}
+
+/// Variable native process-list response record header.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YurtProcessListResponseV1 {
+    /// Total logical record size.
+    pub size: u32,
+    /// Record version.
+    pub version: u16,
+    /// Reserved flags.
+    pub flags: u16,
+    /// Offset of yurt_process_entry_v1 entries.
+    pub entries_offset: u32,
+    /// Number of process entries.
+    pub entries_count: u32,
 }
