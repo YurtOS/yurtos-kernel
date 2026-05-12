@@ -42,6 +42,7 @@ const ENOENT: i64 = 2;
 const EACCES: i64 = 13;
 const EBADF: i64 = 9;
 const EINVAL: i64 = 22;
+const ENOSYS: i64 = 38;
 
 /// Public re-export so the engine adapter (`engine::WasmtimeCtx`)
 /// can return the same EFAULT value our trampoline uses internally.
@@ -2648,6 +2649,54 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             }
             bytes.len() as i64
         },
+    )?;
+
+    // ── Wasm engine ops ────────────────────────────────────────────
+    // Native kernel-driven process instantiation is not wired here
+    // yet. Bind the documented KH surface so kernel.wasm can link;
+    // the JS KH adapter has the first concrete cached-module handle
+    // table. Wasmtime implementation follows in a dedicated slice.
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_spawn_process",
+        |_caller: Caller<'_, KernelStoreData>,
+         _module_id_ptr: u32,
+         _module_id_len: u32,
+         _argv_ptr: u32,
+         _argv_len: u32,
+         _envp_ptr: u32,
+         _envp_len: u32|
+         -> i32 { -(ENOSYS as i32) },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_destroy_instance",
+        |_caller: Caller<'_, KernelStoreData>, _handle: i32| -> i32 { -(ENOSYS as i32) },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_process_mem_read",
+        |_caller: Caller<'_, KernelStoreData>,
+         _handle: i32,
+         _addr: u32,
+         _dst_ptr: u32,
+         _len: u32|
+         -> i64 { -ENOSYS },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_process_mem_write",
+        |_caller: Caller<'_, KernelStoreData>,
+         _handle: i32,
+         _addr: u32,
+         _src_ptr: u32,
+         _len: u32|
+         -> i64 { -ENOSYS },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_process_resume",
+        |_caller: Caller<'_, KernelStoreData>, _handle: i32, _result: i64| -> i64 { -ENOSYS },
     )?;
 
     Ok(())

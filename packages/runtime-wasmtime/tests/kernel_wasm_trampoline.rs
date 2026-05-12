@@ -159,6 +159,7 @@ fn kernel_wasm_imports_match_documented_namespaces() {
     assert_eq!(
         kh_imports,
         vec![
+            "kh_destroy_instance",
             "kh_extension_invoke",
             "kh_fetch_blocking",
             "kh_idb_delete",
@@ -188,6 +189,7 @@ fn kernel_wasm_imports_match_documented_namespaces() {
             "kh_socket_local_addr",
             "kh_socket_recv",
             "kh_socket_send",
+            "kh_spawn_process",
         ],
         "documented kh_* surface"
     );
