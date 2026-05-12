@@ -1556,7 +1556,6 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
 
         const result = await sandbox.run("dlopen-canary --case happy_path");
 
-        console.error("DBG dlopen:", JSON.stringify(result.stdout), "stderr:", JSON.stringify(result.stderr), "exit:", result.exitCode);
         expect(result.exitCode).toBe(0);
         expect(result.stdout.trim()).toContain('"stdout":"dlcanary-ok"');
       },

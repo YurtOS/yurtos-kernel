@@ -2726,7 +2726,7 @@ export function createKernelImports(
           ? req.fds.map((fd: number) => opts.kernel!.dup(callerPid, fd))
           : undefined;
         const rawHandle = -(target.socket);
-        const result = registry.sendWithAnc(rawHandle, bytes, ancFds);
+        const result = registry.sendWithAnc(rawHandle, bytes, ancFds, callerPid);
         return writeJson(memory, outPtr, outCap, result);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -2756,23 +2756,28 @@ export function createKernelImports(
         if (!registry) return writeJson(memory, outPtr, outCap, { ok: false, error: "loopback backend required" });
         const maxData = req.max_data ?? 65536;
         const rawHandle = -(target.socket);
-        // Peek at anc before recv to capture it (recv pops rx and rxAnc together)
-        const ancFdsBefore = registry.peekAnc(rawHandle);
+        // Peek at anc before recv to capture it for the queued-message case
+        // (recvAsync shifts rx and rxAnc together, so the peek must happen first).
+        // For the fast-path case (waiter parked, sender arrives concurrently)
+        // ancBefore is undefined; we pick up the anc via popWaiterAnc afterward.
+        const ancBefore = registry.peekAnc(rawHandle);
         const result = await registry.recvAsync(rawHandle, maxData);
         if (!result.ok) return writeJson(memory, outPtr, outCap, result);
-        // Each ancFd is an intermediate dup created at sendmsg time.
-        // Dup it again to produce the receiver's copy, then close the
-        // intermediate so we don't leak the extra fd reference.
+        const anc = ancBefore ?? registry.popWaiterAnc(rawHandle);
+        // Each ancFd is an intermediate dup created at sendmsg time in the
+        // sender's fd table. Dup it into the receiver's table (dupFromProcess
+        // crosses pid boundaries correctly), then close the intermediate.
         const newFds: number[] = [];
-        if (ancFdsBefore) {
+        if (anc) {
           const maxFds = req.max_fds ?? 16;
-          const slice = ancFdsBefore.slice(0, maxFds);
+          const slice = anc.fds.slice(0, maxFds);
+          const senderPid = anc.senderPid;
           for (const dupFd of slice) {
             try {
-              const newFd = opts.kernel.dup(callerPid, dupFd);
+              const newFd = opts.kernel.dupFromProcess(callerPid, senderPid, dupFd);
               newFds.push(newFd);
             } finally {
-              opts.kernel.closeFd(callerPid, dupFd);
+              opts.kernel.closeFd(senderPid, dupFd);
             }
           }
         }

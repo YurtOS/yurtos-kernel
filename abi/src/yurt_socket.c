@@ -645,14 +645,29 @@ static int yurt_accept_impl(int sockfd, struct sockaddr *addr, socklen_t *addrle
   if (parse_json_int(resp, (size_t)n, "fd", &accepted_fd) != 0) {
     return -1;
   }
-  if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
-    if (parse_json_string_field(resp, (size_t)n, "peer_host", peer_host, sizeof(peer_host)) != 0 ||
-        parse_json_int(resp, (size_t)n, "peer_port", &peer_port) != 0 ||
-        yurt_fill_sockaddr_from_host(addr, addrlen, peer_host, peer_port) != 0) {
-      return -1;
+  if (addr && addrlen) {
+    char peer_path[108];
+    char peer_abstract[107];
+    /* AF_UNIX accept: response carries peer_path or peer_abstract instead
+     * of peer_host/peer_port. Check for the path fields first. */
+    if (parse_json_string_field(resp, (size_t)n, "peer_abstract", peer_abstract, sizeof(peer_abstract)) == 0) {
+      char unix_path[109];
+      unix_path[0] = '\0';
+      strncpy(unix_path + 1, peer_abstract, sizeof(unix_path) - 2);
+      unix_path[sizeof(unix_path) - 1] = '\0';
+      if (yurt_fill_sockaddr_un(addr, addrlen, unix_path) != 0) return -1;
+    } else if (parse_json_string_field(resp, (size_t)n, "peer_path", peer_path, sizeof(peer_path)) == 0) {
+      if (yurt_fill_sockaddr_un(addr, addrlen, peer_path) != 0) return -1;
+    } else if (*addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
+      /* AF_INET accept */
+      if (parse_json_string_field(resp, (size_t)n, "peer_host", peer_host, sizeof(peer_host)) != 0 ||
+          parse_json_int(resp, (size_t)n, "peer_port", &peer_port) != 0 ||
+          yurt_fill_sockaddr_from_host(addr, addrlen, peer_host, peer_port) != 0) {
+        return -1;
+      }
+    } else {
+      *addrlen = sizeof(struct sockaddr_in);
     }
-  } else if (addrlen) {
-    *addrlen = sizeof(struct sockaddr_in);
   }
   return accepted_fd;
 }

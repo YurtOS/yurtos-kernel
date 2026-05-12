@@ -103,6 +103,14 @@ export interface RecvOptions {
 
 type RegistryEvent = "listen" | "unlisten";
 
+/** Ancillary data entry for SCM_RIGHTS — carries intermediate fd numbers and
+ *  the pid of the process whose fd table they live in, so recvmsg can dup
+ *  across process boundaries. */
+export interface AncEntry {
+  fds: number[];
+  senderPid: number;
+}
+
 interface PairedSocket {
   handle: SocketHandle;
   peerHandle: SocketHandle;
@@ -110,7 +118,11 @@ interface PairedSocket {
   /** Parallel ancillary-fd array for SCM_RIGHTS (Slice 5).
    *  Each slot corresponds to the matching rx entry.
    *  undefined means no ancillary data for that message. */
-  rxAnc: Array<number[] | undefined>;
+  rxAnc: Array<AncEntry | undefined>;
+  /** Holds anc for messages delivered directly to a parked rxWaiter (fast path
+   *  in sendWithAnc). In this path the message bypasses rx/rxAnc entirely, so
+   *  the receiver must read this field after recvAsync resolves. */
+  pendingWaiterAnc?: AncEntry;
   rxWaiters: Array<{
     resolve: (r: RecvResult) => void;
     max: number;
@@ -686,7 +698,12 @@ export class ListenerRegistry {
   }
 
   /** Internal: send bytes + optional ancillary fds to the peer. */
-  sendWithAnc(handle: SocketHandle, bytes: Uint8Array, ancFds: number[] | undefined): SendResult {
+  sendWithAnc(
+    handle: SocketHandle,
+    bytes: Uint8Array,
+    ancFds: number[] | undefined,
+    senderPid?: number,
+  ): SendResult {
     const local = this.sockets.get(handle);
     if (!local || local.closed) {
       return { ok: false, error: "send: invalid socket" };
@@ -694,6 +711,9 @@ export class ListenerRegistry {
     const peer = this.sockets.get(local.peerHandle);
     if (!peer || peer.closed) return { ok: false, error: "send: peer closed" };
     if (bytes.length === 0 && !ancFds) return { ok: true, bytesSent: 0 };
+    const ancEntry: AncEntry | undefined = ancFds && ancFds.length > 0
+      ? { fds: ancFds, senderPid: senderPid ?? 0 }
+      : undefined;
     const waiter = peer.rxWaiters.shift();
     if (waiter) {
       const slice = bytes.length <= waiter.max
@@ -703,27 +723,42 @@ export class ListenerRegistry {
         peer.rx.unshift(bytes.subarray(waiter.max));
         peer.rxAnc.unshift(undefined);
       }
+      // Store anc in pendingWaiterAnc so recvmsg can retrieve it after
+      // recvAsync resolves (peekAnc runs before the await and sees nothing).
+      peer.pendingWaiterAnc = ancEntry;
       waiter.resolve({ ok: true, bytes: copy(slice) });
     } else {
       peer.rx.push(copy(bytes));
-      peer.rxAnc.push(ancFds);
+      peer.rxAnc.push(ancEntry);
     }
     return { ok: true, bytesSent: bytes.length };
   }
 
-  /** Pop ancillary fds for the next message. Must be called after recvAsync resolves
-   *  and before the next recv to get the fds for that message. */
-  peekAnc(handle: SocketHandle): number[] | undefined {
+  /** Peek at ancillary data for the next queued message (does not consume it).
+   *  Returns undefined if no message is queued — use popWaiterAnc instead when
+   *  recvAsync parks a waiter and the send arrives concurrently. */
+  peekAnc(handle: SocketHandle): AncEntry | undefined {
     const local = this.sockets.get(handle);
     if (!local) return undefined;
     return local.rxAnc[0];
   }
 
-  /** Pop ancillary fds for the most recently received message (shift off rxAnc[0]). */
-  popAnc(handle: SocketHandle): number[] | undefined {
+  /** Consume ancillary data for the most recently received message. */
+  popAnc(handle: SocketHandle): AncEntry | undefined {
     const local = this.sockets.get(handle);
     if (!local) return undefined;
     return local.rxAnc.shift();
+  }
+
+  /** Consume ancillary data that was delivered via the fast-path waiter route
+   *  (sendWithAnc resolved a parked recvAsync waiter directly). Must be called
+   *  at most once after each recvAsync completes, only when peekAnc was undefined. */
+  popWaiterAnc(handle: SocketHandle): AncEntry | undefined {
+    const local = this.sockets.get(handle);
+    if (!local) return undefined;
+    const anc = local.pendingWaiterAnc;
+    local.pendingWaiterAnc = undefined;
+    return anc;
   }
 
   recv(handle: SocketHandle, max: number, opts: RecvOptions = {}): RecvResult {
@@ -933,10 +968,11 @@ export class ListenerRegistry {
     return { ok: true, bytesSent: bytes.length };
   }
 
-  /** Synchronous dgram recv — pops one message or returns EAGAIN. */
+  /** Synchronous dgram recv — pops one message or returns EAGAIN.
+   *  Truncates the payload to maxBytes per POSIX SOCK_DGRAM semantics. */
   recvDgram(
     handle: SocketHandle,
-    _maxBytes: number,
+    maxBytes: number,
     nonblocking?: boolean,
   ): (RecvResult & { fromPath?: string; fromAbstract?: string }) | { ok: false; error: "EAGAIN" } {
     const s = this.dgramSockets.get(handle);
@@ -946,13 +982,15 @@ export class ListenerRegistry {
       if (nonblocking) return { ok: false, error: "EAGAIN" };
       return { ok: false, error: "EAGAIN" };
     }
-    return { ok: true, bytes: msg.bytes, fromPath: msg.fromPath, fromAbstract: msg.fromAbstract };
+    const bytes = msg.bytes.length <= maxBytes ? msg.bytes : msg.bytes.subarray(0, maxBytes);
+    return { ok: true, bytes, fromPath: msg.fromPath, fromAbstract: msg.fromAbstract };
   }
 
-  /** Async dgram recv — resolves when a message arrives. */
+  /** Async dgram recv — resolves when a message arrives.
+   *  Truncates the payload to maxBytes per POSIX SOCK_DGRAM semantics. */
   recvDgramAsync(
     handle: SocketHandle,
-    _maxBytes: number,
+    maxBytes: number,
   ): Promise<RecvResult & { fromPath?: string; fromAbstract?: string }> {
     const s = this.dgramSockets.get(handle);
     if (!s || s.closed) {
@@ -960,9 +998,10 @@ export class ListenerRegistry {
     }
     const msg = s.messages.shift();
     if (msg) {
+      const bytes = msg.bytes.length <= maxBytes ? msg.bytes : msg.bytes.subarray(0, maxBytes);
       return Promise.resolve({
         ok: true,
-        bytes: msg.bytes,
+        bytes,
         fromPath: msg.fromPath,
         fromAbstract: msg.fromAbstract,
       });
@@ -971,7 +1010,7 @@ export class ListenerRegistry {
       s.recvWaiters.push({
         resolve: (m: DgramMessage) => resolve({
           ok: true,
-          bytes: m.bytes,
+          bytes: m.bytes.length <= maxBytes ? m.bytes : m.bytes.subarray(0, maxBytes),
           fromPath: m.fromPath,
           fromAbstract: m.fromAbstract,
         }),
