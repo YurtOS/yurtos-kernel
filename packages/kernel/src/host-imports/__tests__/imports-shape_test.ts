@@ -20,6 +20,15 @@ function writeString(memory: WebAssembly.Memory, ptr: number, value: string) {
   return bytes.length;
 }
 
+function readDnsAddr(memory: WebAssembly.Memory, ptr: number) {
+  const view = new DataView(memory.buffer, ptr, 8);
+  const bytes = Array.from(new Uint8Array(memory.buffer, ptr + 4, 4));
+  return {
+    family: view.getUint32(0, true),
+    addr: bytes.join("."),
+  };
+}
+
 function readWaitResult(memory: WebAssembly.Memory, ptr: number) {
   const view = new DataView(memory.buffer);
   return {
@@ -419,7 +428,8 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
       4096,
       1024,
     );
-  assertEquals(readString(memory, 4096, written), "127.0.0.1");
+  assertEquals(written, 8);
+  assertEquals(readDnsAddr(memory, 4096), { family: 2, addr: "127.0.0.1" });
 
   hostLen = writeString(memory, 0, "10.8.0.42");
   written =
@@ -429,7 +439,8 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
       4096,
       1024,
     );
-  assertEquals(readString(memory, 4096, written), "10.8.0.42");
+  assertEquals(written, 8);
+  assertEquals(readDnsAddr(memory, 4096), { family: 2, addr: "10.8.0.42" });
 });
 
 Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for socket-backed guests", async () => {
@@ -454,7 +465,7 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
       4096,
       1024,
     );
-  const first = readString(memory, 4096, firstLen);
+  const first = readDnsAddr(memory, 4096).addr;
   const secondLen =
     await (imports.host_dns_resolve as (...args: number[]) => Promise<number>)(
       0,
@@ -462,8 +473,10 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
       8192,
       1024,
     );
-  const second = readString(memory, 8192, secondLen);
+  const second = readDnsAddr(memory, 8192).addr;
 
+  assertEquals(firstLen, 8);
+  assertEquals(secondLen, 8);
   assertEquals(first.startsWith("10.0.2."), true);
   assertEquals(second, first);
 });
