@@ -114,7 +114,6 @@ const METHOD_KERNEL_DRAIN_STDERR: u32 = 7;
 const METHOD_KERNEL_REGISTER_FILE: u32 = 8;
 const METHOD_KERNEL_INSTALL_HOST_FS_MOUNT: u32 = 11;
 const METHOD_KERNEL_INSTALL_YURTFS: u32 = 12;
-const METHOD_KERNEL_REGISTER_CHILD: u32 = 13;
 const METHOD_KERNEL_RECORD_EXIT: u32 = 14;
 const METHOD_KERNEL_DRAIN_SPAWN: u32 = 15;
 
@@ -1727,15 +1726,8 @@ impl Microkernel {
         wasm: &[u8],
         argv: &[S],
     ) -> Result<UserProcess> {
-        let user = self.spawn_user_process_with_args(wasm, argv)?;
-        let mut req = Vec::with_capacity(8);
-        req.extend_from_slice(&parent_pid.to_le_bytes());
-        req.extend_from_slice(&user.pid.to_le_bytes());
-        let rc = self.syscall(METHOD_KERNEL_REGISTER_CHILD, &req, &mut [])?;
-        if rc != 0 {
-            anyhow::bail!("kernel_register_child failed: rc={rc}");
-        }
-        Ok(user)
+        let module_id = self.cache_anonymous_process_module(wasm)?;
+        self.spawn_cached_user_process(parent_pid, &module_id, argv)
     }
 
     /// Record a process's exit status with the kernel so its
@@ -1894,11 +1886,7 @@ impl Microkernel {
         wasm: &[u8],
         argv: &[S],
     ) -> Result<UserProcess> {
-        let mut next = self.next_anonymous_module_id.borrow_mut();
-        let module_id = format!("anonymous:{}", *next).into_bytes();
-        *next = next.saturating_add(1);
-        drop(next);
-        self.cache_process_module(&module_id, wasm)?;
+        let module_id = self.cache_anonymous_process_module(wasm)?;
         self.spawn_cached_user_process(0, &module_id, argv)
     }
 
@@ -1934,6 +1922,15 @@ impl Microkernel {
             instance,
             pid,
         })
+    }
+
+    fn cache_anonymous_process_module(&self, wasm: &[u8]) -> Result<Vec<u8>> {
+        let mut next = self.next_anonymous_module_id.borrow_mut();
+        let module_id = format!("anonymous:{}", *next).into_bytes();
+        *next = next.saturating_add(1);
+        drop(next);
+        self.cache_process_module(&module_id, wasm)?;
+        Ok(module_id)
     }
 
     /// Drain every staged sys_spawn child, instantiate it with the

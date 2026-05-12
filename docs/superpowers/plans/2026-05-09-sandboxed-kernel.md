@@ -126,6 +126,9 @@ records.
 - `sys_spawn` now stores the decoded argv in the kernel-owned child process
   record before staging the pending spawn, so the wasmtime host no longer calls
   `KERNEL_SET_ARGV` after draining a child.
+- Native wasmtime `spawn_child` now passes the intended parent pid into
+  `kernel_spawn_process`; it no longer spawns with parent 0 and patches
+  parentage through `KERNEL_REGISTER_CHILD`.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the
