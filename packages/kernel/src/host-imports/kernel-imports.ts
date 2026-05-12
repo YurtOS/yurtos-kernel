@@ -1651,24 +1651,14 @@ export function createKernelImports(
     // host_read_fd(fd, out_ptr, out_cap) -> i32
     // Reads all available data from a pipe fd and writes it to the output buffer.
     host_read_fd(fd: number, outPtr: number, outCap: number): number {
-      if (!opts.kernel) {
-        return writeJson(memory, outPtr, outCap, {
-          error: "kernel not available",
-        });
-      }
+      if (!opts.kernel) return -38;
       const target = opts.kernel.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "pipe_read") {
-        return writeJson(memory, outPtr, outCap, {
-          error: `not a readable fd: ${fd}`,
-        });
-      }
+      if (!target || target.type !== "pipe_read") return -9;
       const data = target.pipe.drainSync();
-      const str = new TextDecoder().decode(data);
       const buf = new Uint8Array(memory.buffer, outPtr, outCap);
-      const encoded = new TextEncoder().encode(str);
-      if (encoded.length > outCap) return encoded.length; // signal retry with larger buffer
-      buf.set(encoded);
-      return encoded.length;
+      if (data.byteLength > outCap) return data.byteLength;
+      buf.set(data);
+      return data.byteLength;
     },
 
     // host_write_fd(fd, data_ptr, data_len) -> i32
@@ -1818,11 +1808,42 @@ export function createKernelImports(
     },
 
     // host_list_processes(out_ptr, out_cap) -> i32
-    // Returns JSON array of all processes.
+    // Returns a native yurt_process_list_response_v1 record.
     host_list_processes(outPtr: number, outCap: number): number {
-      if (!opts.kernel) return writeJson(memory, outPtr, outCap, []);
-      const procs = opts.kernel.listProcesses();
-      return writeJson(memory, outPtr, outCap, procs);
+      const encoder = new TextEncoder();
+      const procs = opts.kernel?.listProcesses() ?? [];
+      const headerSize = 16;
+      const entrySize = 20;
+      const entriesOffset = headerSize;
+      let stringsOffset = entriesOffset + procs.length * entrySize;
+      const commandBytes = procs.map((proc) => encoder.encode(proc.command));
+      const size = stringsOffset +
+        commandBytes.reduce((sum, bytes) => sum + bytes.byteLength, 0);
+      if (outCap < size) return size;
+
+      const out = new Uint8Array(memory.buffer, outPtr, size);
+      const view = new DataView(memory.buffer, outPtr, size);
+      out.fill(0);
+      view.setUint32(0, size, true);
+      view.setUint16(4, 1, true);
+      view.setUint16(6, 0, true);
+      view.setUint32(8, entriesOffset, true);
+      view.setUint32(12, procs.length, true);
+
+      let cursor = stringsOffset;
+      for (let i = 0; i < procs.length; i++) {
+        const proc = procs[i];
+        const bytes = commandBytes[i];
+        const entryOffset = entriesOffset + i * entrySize;
+        view.setInt32(entryOffset, proc.pid, true);
+        view.setInt32(entryOffset + 4, proc.ppid, true);
+        view.setUint32(entryOffset + 8, proc.state === "running" ? 1 : 2, true);
+        view.setUint32(entryOffset + 12, cursor, true);
+        view.setUint32(entryOffset + 16, bytes.byteLength, true);
+        out.set(bytes, cursor);
+        cursor += bytes.byteLength;
+      }
+      return size;
     },
 
     // ── Network ──

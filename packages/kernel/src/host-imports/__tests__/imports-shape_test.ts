@@ -29,6 +29,29 @@ function readDnsAddr(memory: WebAssembly.Memory, ptr: number) {
   };
 }
 
+function readProcessList(memory: WebAssembly.Memory, ptr: number, len: number) {
+  const view = new DataView(memory.buffer, ptr, len);
+  const entriesOffset = view.getUint32(8, true);
+  const entriesCount = view.getUint32(12, true);
+  const entries = [];
+  for (let i = 0; i < entriesCount; i++) {
+    const entryOffset = entriesOffset + i * 20;
+    const commandOffset = view.getUint32(entryOffset + 12, true);
+    const commandLength = view.getUint32(entryOffset + 16, true);
+    entries.push({
+      pid: view.getInt32(entryOffset, true),
+      ppid: view.getInt32(entryOffset + 4, true),
+      state: view.getUint32(entryOffset + 8, true),
+      command: readString(memory, ptr + commandOffset, commandLength),
+    });
+  }
+  return {
+    size: view.getUint32(0, true),
+    version: view.getUint16(4, true),
+    entries,
+  };
+}
+
 function readWaitResult(memory: WebAssembly.Memory, ptr: number) {
   const view = new DataView(memory.buffer);
   return {
@@ -479,6 +502,38 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
   assertEquals(secondLen, 8);
   assertEquals(first.startsWith("10.0.2."), true);
   assertEquals(second, first);
+});
+
+Deno.test("kernel host_list_processes writes a native process record", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel({ maxProcesses: 4 });
+  const parentPid = kernel.allocPid(1, "parent");
+  const childPid = kernel.allocPid(parentPid, "worker");
+  kernel.registerExited(childPid, 7, parentPid);
+  const imports = createKernelImports({ memory, kernel, callerPid: parentPid });
+
+  const written =
+    (imports.host_list_processes as (outPtr: number, outCap: number) => number)(
+      4096,
+      1024,
+    );
+  const list = readProcessList(memory, 4096, written);
+
+  assertEquals(list.version, 1);
+  assertEquals(
+    list.entries.some((entry) =>
+      entry.pid === parentPid && entry.ppid === 1 && entry.state === 1 &&
+      entry.command === "parent"
+    ),
+    true,
+  );
+  assertEquals(
+    list.entries.some((entry) =>
+      entry.pid === childPid && entry.ppid === parentPid && entry.state === 2 &&
+      entry.command === "worker"
+    ),
+    true,
+  );
 });
 
 Deno.test("host_chmod allows the file owner and denies non-owners", () => {
