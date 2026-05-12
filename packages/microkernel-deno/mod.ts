@@ -73,6 +73,11 @@ export class DenoHostFs implements HostFsImpl {
     this.rootCanon = Deno.realPathSync(root);
   }
 
+  private contains(resolved: string): boolean {
+    return resolved === this.rootCanon ||
+      resolved.startsWith(`${this.rootCanon}/`);
+  }
+
   /**
    * Resolve `path` (kernel-supplied, leading slash optional)
    * against the root, canonicalize, and reject any escape.
@@ -84,7 +89,7 @@ export class DenoHostFs implements HostFsImpl {
     const candidate = `${this.root}/${rel}`;
     try {
       const resolved = Deno.realPathSync(candidate);
-      if (!resolved.startsWith(this.rootCanon)) return -EACCES;
+      if (!this.contains(resolved)) return -EACCES;
       return resolved;
     } catch (_e) {
       if (!allowMissing) return -ENOENT;
@@ -96,7 +101,7 @@ export class DenoHostFs implements HostFsImpl {
       const leaf = candidate.slice(lastSlash + 1);
       try {
         const parentCanon = Deno.realPathSync(parent);
-        if (!parentCanon.startsWith(this.rootCanon)) return -EACCES;
+        if (!this.contains(parentCanon)) return -EACCES;
         return `${parentCanon}/${leaf}`;
       } catch {
         return -ENOENT;
@@ -241,10 +246,11 @@ function mapErrno(e: unknown): number {
 export { globalFetch as denoFetch } from "../microkernel-js/mod.ts";
 
 /**
- * Deno-backed [`TcpSocketImpl`]. Implements only the *Async
- * variants — Deno's TCP primitives are inherently async, so the
- * sync stubs return -ENOSYS. When the host has JSPI (Deno does)
- * the matching kh_socket_* imports are wrapped with
+ * Deno-backed [`TcpSocketImpl`]. Deno connect/read/write/accept are
+ * async, so those sync entrypoints return -ENOSYS and JSPI uses the
+ * *Async variants. Deno.listen is sync, so `listen` creates the
+ * listener directly. When the host has JSPI (Deno does), the matching
+ * kh_socket_* imports are wrapped with
  * `WebAssembly.Suspending` and userland's syscall actually
  * suspends until the I/O completes.
  *
@@ -257,7 +263,7 @@ export class DenoTcpSocket implements TcpSocketImpl {
   private conns = new Map<number, Deno.TcpConn>();
   private listeners = new Map<number, Deno.TcpListener>();
 
-  // Sync stubs — JSPI takes the *Async path.
+  // Sync stubs for async Deno primitives — JSPI takes the *Async path.
   connect(): number {
     return -38;
   }
@@ -267,8 +273,8 @@ export class DenoTcpSocket implements TcpSocketImpl {
   recv(): number {
     return -38;
   }
-  listen(): number {
-    return -38;
+  listen(host: string, port: number, _backlog: number): number {
+    return this.bindListener(host, port);
   }
   accept(): number {
     return -38;
@@ -334,6 +340,16 @@ export class DenoTcpSocket implements TcpSocketImpl {
     try {
       const n = await conn.read(buf);
       return n ?? 0;
+    } catch (e) {
+      return mapErrno(e);
+    }
+  }
+
+  async sendAsync(handle: number, data: Uint8Array): Promise<number> {
+    const conn = this.conns.get(handle);
+    if (!conn) return -EBADF;
+    try {
+      return await conn.write(data);
     } catch (e) {
       return mapErrno(e);
     }

@@ -414,13 +414,14 @@ export const HOST_BINDINGS: HostBinding[] = [
     returnsBytes: true,
   },
   // host_socket_send(fd, dataPtr, dataLen, flags) → bytes.
-  // SYS_SOCKET_SEND accepts u32 handle + u32 flags + payload
-  // bytes. The kernel currently ignores flags after decoding.
+  // SYS_SOCKET_SEND accepts u32 handle + payload bytes. The
+  // direct host ABI still carries flags, but this syscall method
+  // has no flags slot.
   {
     name: "host_socket_send",
     method: METHOD.SYS_SOCKET_SEND,
-    args: ["scalar", "scalar", "ptr_len"],
-    argOrder: [0, 3, 1, 2],
+    args: ["scalar", "ptr_len"],
+    argOrder: [0, 1, 2],
   },
   // host_socket_recv(fd, outPtr, outCap, flags) → bytes.
   // SYS_SOCKET_RECV accepts u32 handle + u32 flags and returns

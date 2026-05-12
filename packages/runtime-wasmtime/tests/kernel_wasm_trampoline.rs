@@ -1014,13 +1014,12 @@ fn host_fs_policy_can_deny_specific_paths() {
     let fd = mk.syscall(METHOD_SYS_OPEN, &ok, &mut []).unwrap();
     assert!(fd >= 0);
 
-    // Denied → policy returns -EACCES at kh_real_open → backend
-    // returns None → sys_open emits -ENOENT (the kernel doesn't
-    // see the policy verdict, only the lookup miss).
+    // Denied → policy returns -EACCES at kh_real_open and the
+    // kernel preserves the host errno.
     let mut deny = 0_u32.to_le_bytes().to_vec();
     deny.extend_from_slice(b"/host/secret.txt");
     let rc = mk.syscall(METHOD_SYS_OPEN, &deny, &mut []).unwrap();
-    assert_eq!(rc, -2, "policy-denied path → -ENOENT, got {rc}");
+    assert_eq!(rc, -13, "policy-denied path → -EACCES, got {rc}");
 
     let _ = fs::remove_dir_all(&dir);
 }
@@ -1448,7 +1447,6 @@ fn sys_socket_connect_send_recv_through_local_echo_server() {
     // Send a payload.
     let payload = b"hello tcp";
     let mut send_req = (handle as i32).to_le_bytes().to_vec();
-    send_req.extend_from_slice(&0_u32.to_le_bytes()); // flags=0
     send_req.extend_from_slice(payload);
     let n = mk
         .syscall(METHOD_SYS_SOCKET_SEND, &send_req, &mut [])
@@ -2196,12 +2194,13 @@ fn signal_storage_round_trips_through_trampoline() {
     let rc = mk.syscall(METHOD_SYS_SIGACTION, &req2, &mut []).unwrap();
     assert_eq!(rc, 1, "previous disposition was SIG_IGN");
 
-    // kill(target=7, sig=0) is the alive-probe; succeeds with no tree.
+    // kill(target=7, sig=0) is the alive-probe; nonexistent
+    // processes return -ESRCH.
     let mut req3 = Vec::new();
     req3.extend_from_slice(&7_u32.to_le_bytes());
     req3.extend_from_slice(&0_u32.to_le_bytes());
     let rc = mk.syscall(METHOD_SYS_KILL, &req3, &mut []).unwrap();
-    assert_eq!(rc, 0, "sig 0 is the existence probe; always 0 today");
+    assert_eq!(rc, -3, "sig 0 on a missing process returns -ESRCH");
 
     // kill out-of-range → -EINVAL.
     let mut req4 = Vec::new();

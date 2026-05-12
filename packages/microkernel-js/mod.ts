@@ -354,6 +354,7 @@ export interface TcpSocketImpl {
    * ignored and the sync variants run.
    */
   connectAsync?(host: string, port: number, flags: number): Promise<number>;
+  sendAsync?(handle: number, data: Uint8Array): Promise<number>;
   recvAsync?(handle: number, buf: Uint8Array, flags: number): Promise<number>;
   acceptAsync?(handle: number, flags: number): Promise<number>;
 }
@@ -2047,6 +2048,23 @@ export class Microkernel {
             );
           }
           return BigInt(n);
+        },
+      );
+    }
+    if (wantsAsync && tcpAsync?.sendAsync != null) {
+      const sendAsync = tcpAsync.sendAsync.bind(tcpAsync);
+      khImports.kh_socket_send = new W.Suspending(
+        async (
+          handle: number,
+          dataPtr: number,
+          dataLen: number,
+        ): Promise<bigint> => {
+          const data = new Uint8Array(
+            memoryRef.memory!.buffer,
+            dataPtr,
+            dataLen,
+          ).slice();
+          return BigInt(await sendAsync(handle, data));
         },
       );
     }

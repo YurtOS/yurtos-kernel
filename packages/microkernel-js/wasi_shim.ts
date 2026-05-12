@@ -61,6 +61,33 @@ export function buildWasiShim(
   userMemoryRef: { memory?: WebAssembly.Memory },
 ): Record<string, (...args: number[] | (number | bigint)[]) => number | never> {
   const um = () => userMemoryRef.memory!.buffer;
+  const dirFds = new Map<number, Uint8Array>([
+    [PREOPEN_ROOT_FD, new TextEncoder().encode(PREOPEN_ROOT_NAME)],
+  ]);
+
+  const preopenAbsPath = (pathPtr: number, pathLen: number): Uint8Array => {
+    const rel = new Uint8Array(um(), pathPtr, pathLen).slice();
+    const out = new Uint8Array(1 + rel.byteLength);
+    out[0] = 0x2f; // '/'
+    out.set(rel, 1);
+    return out;
+  };
+
+  const pathPairRequest = (
+    oldPathPtr: number,
+    oldPathLen: number,
+    newPathPtr: number,
+    newPathLen: number,
+  ): Uint8Array => {
+    const oldAbs = preopenAbsPath(oldPathPtr, oldPathLen);
+    const newAbs = preopenAbsPath(newPathPtr, newPathLen);
+    const req = new Uint8Array(4 + oldAbs.byteLength + newAbs.byteLength);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, oldAbs.byteLength, true);
+    req.set(oldAbs, 4);
+    req.set(newAbs, 4 + oldAbs.byteLength);
+    return req;
+  };
 
   // ── fd_write: read iovecs, sys_write payload (one syscall) ────
   const fd_write = (
@@ -158,6 +185,7 @@ export function buildWasiShim(
     const req = new Uint8Array(4);
     new DataView(req.buffer).setUint32(0, fd >>> 0, true);
     const rc = Number(kernel.syscall(METHOD.SYS_CLOSE, pid, req, 0).rc);
+    if (rc >= 0) dirFds.delete(fd);
     return errnoFromKernel(rc);
   };
 
@@ -282,7 +310,98 @@ export function buildWasiShim(
     const n = Number(rc);
     if (n < 0) return errnoFromKernel(n);
     new DataView(um()).setUint32(retFdPtr, n >>> 0, true);
+    let abs = req.slice(4);
+    if (abs.byteLength > 1 && abs[abs.byteLength - 1] === 0x2f) {
+      abs = abs.slice(0, abs.byteLength - 1);
+    }
+    dirFds.set(n, abs);
     return 0;
+  };
+
+  const fd_readdir = (
+    fd: number,
+    bufPtr: number,
+    bufLen: number,
+    cookie: bigint | number,
+    bufusedPtr: number,
+  ): number => {
+    const path = dirFds.get(fd);
+    if (!path) return EBADF;
+    const { rc, response } = kernel.syscall(
+      METHOD.SYS_READDIR,
+      pid,
+      path,
+      64 * 1024,
+    );
+    const n = Number(rc);
+    if (n < 0) return errnoFromKernel(n);
+    if (n < 4) return EINVAL;
+    const resp = response.subarray(0, n);
+    const responseView = new DataView(
+      resp.buffer,
+      resp.byteOffset,
+      resp.byteLength,
+    );
+    const count = responseView.getUint32(0, true);
+    const start = typeof cookie === "bigint" ? Number(cookie) : cookie;
+    let cur = 4;
+    let written = 0;
+    const mem = new Uint8Array(um());
+    const memView = new DataView(um());
+    for (let idx = 0; idx < count; idx++) {
+      if (cur + 5 > resp.byteLength) break;
+      const nameLen = responseView.getUint32(cur, true);
+      cur += 4;
+      const filetype = resp[cur++];
+      if (cur + nameLen > resp.byteLength) break;
+      const name = resp.subarray(cur, cur + nameLen);
+      cur += nameLen;
+      if (idx < start) continue;
+      const need = 24 + nameLen;
+      if (written + need > bufLen) break;
+      const out = bufPtr + written;
+      memView.setBigUint64(out, BigInt(idx + 1), true);
+      memView.setBigUint64(out + 8, 0n, true);
+      memView.setUint32(out + 16, nameLen, true);
+      mem[out + 20] = filetype;
+      mem.set(name, out + 24);
+      written += need;
+    }
+    memView.setUint32(bufusedPtr, written, true);
+    return 0;
+  };
+
+  const path_rename = (
+    oldDirfd: number,
+    oldPathPtr: number,
+    oldPathLen: number,
+    newDirfd: number,
+    newPathPtr: number,
+    newPathLen: number,
+  ): number => {
+    if (oldDirfd !== PREOPEN_ROOT_FD || newDirfd !== PREOPEN_ROOT_FD) {
+      return EBADF;
+    }
+    const req = pathPairRequest(oldPathPtr, oldPathLen, newPathPtr, newPathLen);
+    const rc = Number(kernel.syscall(METHOD.SYS_RENAME, pid, req, 0).rc);
+    return errnoFromKernel(rc);
+  };
+
+  const path_link = (
+    oldDirfd: number,
+    _oldFlags: number,
+    oldPathPtr: number,
+    oldPathLen: number,
+    newDirfd: number,
+    newPathPtr: number,
+    newPathLen: number,
+  ): number => {
+    if (oldDirfd !== PREOPEN_ROOT_FD || newDirfd !== PREOPEN_ROOT_FD) {
+      return EBADF;
+    }
+    const req = pathPairRequest(oldPathPtr, oldPathLen, newPathPtr, newPathLen);
+    const rc = Number(kernel.syscall(METHOD.SYS_LINK, pid, req, 0).rc);
+    return errnoFromKernel(rc);
   };
 
   // Typed ENOSYS stubs for calls that have non-no-arg signatures and
@@ -330,8 +449,11 @@ export function buildWasiShim(
     environ_sizes_get,
     fd_prestat_get,
     fd_prestat_dir_name,
+    fd_readdir,
     path_open,
     path_filestat_get,
+    path_link,
+    path_rename,
   };
 
   // Catch-all ENOSYS for the rest of preview1. Stays as data so
@@ -351,16 +473,13 @@ export function buildWasiShim(
       "fd_filestat_set_times",
       "fd_pread",
       "fd_pwrite",
-      "fd_readdir",
       "fd_renumber",
       "fd_sync",
       "fd_tell",
       "path_create_directory",
       "path_filestat_set_times",
-      "path_link",
       "path_readlink",
       "path_remove_directory",
-      "path_rename",
       "path_symlink",
       "path_unlink_file",
       "poll_oneoff",

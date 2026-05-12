@@ -57,6 +57,22 @@ describe("DenoHostFs", () => {
     }
   });
 
+  it("refuses traversal into a sibling whose path shares the root prefix", () => {
+    const parent = Deno.makeTempDirSync({
+      prefix: "yurt-deno-host-fs-prefix-",
+    });
+    try {
+      Deno.mkdirSync(`${parent}/root`, { recursive: true });
+      Deno.mkdirSync(`${parent}/root-escape`, { recursive: true });
+      Deno.writeTextFileSync(`${parent}/root-escape/secret.txt`, "no peeking");
+      const fs = new DenoHostFs(`${parent}/root`);
+      const rc = fs.open(enc("/../root-escape/secret.txt"), 0);
+      expect(rc).toBeLessThan(0);
+    } finally {
+      Deno.removeSync(parent, { recursive: true });
+    }
+  });
+
   it("mkdir + rename + unlink land on real disk", () => {
     const root = tempRoot();
     try {

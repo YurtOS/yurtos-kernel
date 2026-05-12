@@ -75,7 +75,12 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
     const listener = Deno.listen({ hostname: "127.0.0.1", port: 0 });
     const port = (listener.addr as Deno.NetAddr).port;
     const serverDone = (async () => {
-      const conn = await listener.accept();
+      let conn: Deno.TcpConn;
+      try {
+        conn = await listener.accept();
+      } catch {
+        return;
+      }
       const buf = new Uint8Array(64);
       const n = await conn.read(buf);
       if (n) await conn.write(buf.subarray(0, n));
@@ -103,35 +108,16 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
       const handle = Number(cOut.rc);
       expect(handle).toBeGreaterThan(0);
 
-      // sys_socket_send (send is sync — Deno.TcpConn.write is
-      // promise-shaped but our DenoTcpSocket sync `send` is a
-      // stub. So use the underlying tcp directly via
-      // hostStateMut.tcp.) Easier: write directly through the
-      // conn we have access to via the impl.
-      // For this slice we just test recv after the server pre-
-      // wrote; skip send by constructing a tcp where the conn
-      // already has data pending.
-      // Instead, send using sync syscall (will hit -ENOSYS) and
-      // confirm — then directly use a separate Deno client to
-      // push bytes for the recv path.
-      //
-      // Simpler plan: dial a separate raw client via Deno.connect
-      // and use it to send into the SAME server, then exercise
-      // recv on the server-side accepted handle. That requires
-      // exposing the listener handle path; too much.
-      //
-      // Easiest: just test recv where the server-side echo wrote
-      // bytes BEFORE we connected. Re-architect server to send
-      // immediately on accept:
+      const payload = new TextEncoder().encode("ping");
+      const sReq = new Uint8Array(4 + payload.byteLength);
+      new DataView(sReq.buffer).setUint32(0, handle, true);
+      sReq.set(payload, 4);
+      const sOut = await mk.syscallAsync(METHOD.SYS_SOCKET_SEND, sReq, 0);
+      expect(Number(sOut.rc)).toEqual(payload.byteLength);
 
       // sys_socket_recv — should pull the echoed bytes.
       const rReq = new Uint8Array(8);
       new DataView(rReq.buffer).setUint32(0, handle, true);
-      // Send something via raw Deno on the same conn.
-      const conn = (tcp as unknown as {
-        conns: Map<number, Deno.TcpConn>;
-      }).conns.get(handle)!;
-      await conn.write(new TextEncoder().encode("ping"));
       const rOut = await mk.syscallAsync(
         METHOD.SYS_SOCKET_RECV,
         rReq,
@@ -149,5 +135,22 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
       } catch { /* */ }
       await serverDone;
     }
+  });
+
+  it("DenoTcpSocket listen returns a real listener handle through the kernel", async () => {
+    if (!HAS_JSPI) return;
+    const tcp = new DenoTcpSocket();
+    const host = defaultHostState();
+    host.tcp = tcp;
+    const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+
+    const addr = "127.0.0.1:0";
+    const req = new Uint8Array(4 + addr.length);
+    new DataView(req.buffer).setUint32(0, 16, true);
+    new TextEncoder().encodeInto(addr, req.subarray(4));
+    const out = await mk.syscallAsync(METHOD.SYS_SOCKET_LISTEN, req, 0);
+    const handle = Number(out.rc);
+    expect(handle).toBeGreaterThan(0);
+    tcp.close(handle);
   });
 });

@@ -379,17 +379,13 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       method: METHOD.SYS_SOCKET_SEND,
       responseCap: 0,
     });
-    expect(Array.from(calls.at(-1)!.request.slice(0, 8))).toEqual([
+    expect(Array.from(calls.at(-1)!.request.slice(0, 4))).toEqual([
       7,
       0,
       0,
       0,
-      0x02,
-      0,
-      0,
-      0,
     ]);
-    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(8)))
+    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(4)))
       .toEqual("payload");
 
     const received = await imports.host_socket_recv(7, 64, 4, 0x04);
