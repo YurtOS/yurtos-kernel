@@ -23,7 +23,7 @@ class RecordingBridge implements NetworkBridgeLike {
     _url: string,
     _method: string,
     _headers: Record<string, string>,
-    _body?: string | null,
+    _body?: string | Uint8Array | null,
     redirect?: FetchRedirectMode,
   ): SyncFetchResult {
     this.redirect = redirect;
@@ -44,7 +44,7 @@ function buildFetchRequest(opts: {
   url: string;
   method?: string;
   headers?: Record<string, string>;
-  body?: string;
+  body?: string | Uint8Array;
   redirect?: FetchRedirectMode;
 }): Uint8Array {
   const headerSize = 44;
@@ -55,7 +55,9 @@ function buildFetchRequest(opts: {
   const method = opts.method ?? "GET";
   const urlBytes = encoder.encode(opts.url);
   const methodBytes = encoder.encode(method);
-  const bodyBytes = opts.body ? encoder.encode(opts.body) : new Uint8Array();
+  const bodyBytes = typeof opts.body === "string"
+    ? encoder.encode(opts.body)
+    : opts.body ?? new Uint8Array();
   const stringBytes: Uint8Array[] = [];
   const pairs: Array<[number, number, number, number]> = [];
   const urlOffset = cursor;
@@ -162,6 +164,45 @@ Deno.test("host_network_fetch passes manual redirect and preserves HTTP status",
   assertEquals(response.headersCount, 1);
   assertEquals(response.error, "");
   assertEquals(response.body, "moved");
+});
+
+Deno.test("host_network_fetch forwards native request body bytes without UTF-8 decoding", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  let capturedBody: string | Uint8Array | null | undefined;
+  const bridge: NetworkBridgeLike = {
+    fetchSync(
+      _url,
+      _method,
+      _headers,
+      body,
+      _redirect,
+    ): SyncFetchResult {
+      capturedBody = body;
+      return {
+        status: 200,
+        headers: {},
+        body: "ok",
+        body_base64: "b2s=",
+      };
+    },
+    requestSync(): SyncRequestResult {
+      return { ok: false, error: "not used" };
+    },
+  };
+  const imports = createKernelImports({ memory, networkBridge: bridge });
+  const rawBody = new Uint8Array([0xff, 0xfe, 0x00, 0x61]);
+  const req = buildFetchRequest({
+    url: "https://example.test/upload",
+    method: "POST",
+    body: rawBody,
+    redirect: "manual",
+  });
+  new Uint8Array(memory.buffer, 32, req.length).set(req);
+
+  const hostNetworkFetch = imports.host_network_fetch as HostNetworkFetch;
+  await hostNetworkFetch(32, req.length, 1024, 4096);
+
+  assertEquals(capturedBody, rawBody);
 });
 
 Deno.test("host_network_fetch error responses include body_base64", async () => {

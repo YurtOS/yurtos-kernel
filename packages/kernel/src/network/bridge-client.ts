@@ -8,6 +8,7 @@
 
 import type {
   FetchRedirectMode,
+  FetchRequestBody,
   NetworkBridgeLike,
   SyncFetchResult,
   SyncRequestResult,
@@ -35,7 +36,7 @@ export class BridgeClient implements NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string | null,
+    body?: FetchRequestBody,
     redirect?: FetchRedirectMode,
   ): SyncFetchResult {
     // Check gateway policy synchronously first
@@ -46,7 +47,14 @@ export class BridgeClient implements NetworkBridgeLike {
       }
     }
 
-    const reqJson = JSON.stringify({ url, method, headers, body, redirect });
+    const reqJson = JSON.stringify({
+      url,
+      method,
+      headers,
+      body: body instanceof Uint8Array ? undefined : body,
+      body_base64: body instanceof Uint8Array ? bytesToBase64(body) : undefined,
+      redirect,
+    });
     const reqEncoded = this.encoder.encode(reqJson);
     if (reqEncoded.byteLength > this.uint8.byteLength - 8) {
       return { status: 413, body: "", headers: {}, error: "request too large" };
@@ -114,4 +122,12 @@ export class BridgeClient implements NetworkBridgeLike {
     Atomics.store(this.int32, 0, STATUS_IDLE);
     return JSON.parse(respJson) as SyncRequestResult;
   }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 }

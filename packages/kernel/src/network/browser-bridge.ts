@@ -11,6 +11,7 @@
 
 import type {
   FetchRedirectMode,
+  FetchRequestBody,
   NetworkBridgeLike,
   SyncFetchResult,
   SyncRequestResult,
@@ -59,7 +60,7 @@ export class BrowserNetworkBridge implements NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string | null,
+    body?: FetchRequestBody,
     redirect: FetchRedirectMode = "follow",
   ): Promise<SyncFetchResult> {
     // Check gateway policy
@@ -72,7 +73,7 @@ export class BrowserNetworkBridge implements NetworkBridgeLike {
       const resp = await fetch(url, {
         method,
         headers,
-        body: body || undefined,
+        body: body ?? undefined,
         redirect,
       });
 

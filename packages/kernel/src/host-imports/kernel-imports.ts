@@ -1861,7 +1861,7 @@ export function createKernelImports(
       const headerSize = 16;
       const entrySize = 20;
       const entriesOffset = headerSize;
-      let stringsOffset = entriesOffset + procs.length * entrySize;
+      const stringsOffset = entriesOffset + procs.length * entrySize;
       const commandBytes = procs.map((proc) => encoder.encode(proc.command));
       const size = stringsOffset +
         commandBytes.reduce((sum, bytes) => sum + bytes.byteLength, 0);
@@ -2055,7 +2055,7 @@ export function createKernelImports(
           ? "manual"
           : "follow";
         const body = bodyBytes.byteLength > 0
-          ? new TextDecoder().decode(bodyBytes)
+          ? new Uint8Array(bodyBytes)
           : null;
 
         // Use async fetch if available (browser), otherwise fall back to sync (SAB bridge)

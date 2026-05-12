@@ -4,6 +4,7 @@ import { resolve } from "node:path";
 import { Sandbox } from "../sandbox.js";
 import { NodeAdapter } from "../platform/node-adapter.js";
 import type {
+  FetchRequestBody,
   NetworkBridgeLike,
   SyncFetchResult,
   SyncRequestResult,
@@ -16,14 +17,14 @@ const WASM_DIR = resolve(
 
 class StaticFetchBridge implements NetworkBridgeLike {
   requests: Array<
-    { url: string; method: string; redirect?: string; body?: string | null }
+    { url: string; method: string; redirect?: string; body?: FetchRequestBody }
   > = [];
 
   fetchSync(
     url: string,
     method: string,
     _headers: Record<string, string>,
-    body?: string | null,
+    body?: FetchRequestBody,
     redirect?: "follow" | "manual",
   ): SyncFetchResult {
     this.requests.push({ url, method, redirect, body });
