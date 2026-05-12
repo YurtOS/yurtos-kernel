@@ -190,12 +190,13 @@ Initial exports:
   allocates PID, validates policy, creates fd mappings, and calls
   `kh_spawn_process` only for the host mechanism of instantiating/resuming the
   wasm module.
-- `kernel_kill(pid, signal) -> i32` — apply signal/permission policy and route
+- `kernel_kill(pid, signal) -> i64` — apply signal/permission policy and route
   termination to the process instance through the host mechanism when needed.
-- `kernel_wait(pid, flags, out_ptr, out_cap) -> i32` — wait/reap according to
-  kernel process ownership rules. This is the host-control equivalent of the
-  user-facing wait syscall, not a microkernel process-table operation.
-- `kernel_list_processes(out_ptr, out_cap) -> i32` — return a packed binary
+- `kernel_wait(caller_pid, child_pid, flags, out_ptr, out_cap) -> i64` —
+  wait/reap according to kernel process ownership rules. This is the
+  host-control equivalent of the user-facing wait syscall, not a microkernel
+  process-table operation.
+- `kernel_list_processes(out_ptr, out_cap) -> i64` — return a packed binary
   process snapshot from the kernel-owned table. At minimum each entry carries
   `pid`, `ppid`, `pgid`, `sid`, state, exit status, command bytes, and visible
   fd numbers. The host may render this for users, but it does not author it.

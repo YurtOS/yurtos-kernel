@@ -439,6 +439,26 @@ Deno.test("listProcesses reads the kernel-owned process snapshot", async () => {
   assertEquals(child.fds, [0, 1, 2]);
 });
 
+Deno.test("waitProcess and killProcess enter kernel-owned process control", async () => {
+  const mk = await freshMicrokernel();
+
+  const reg = new Uint8Array(8);
+  const regView = new DataView(reg.buffer);
+  regView.setUint32(0, 1, true);
+  regView.setUint32(4, 8, true);
+  mk.syscall(METHOD.KERNEL_REGISTER_CHILD, reg, 0);
+
+  const exit = new Uint8Array(8);
+  const exitView = new DataView(exit.buffer);
+  exitView.setUint32(0, 8, true);
+  exitView.setInt32(4, 17, true);
+  mk.syscall(METHOD.KERNEL_RECORD_EXIT, exit, 0);
+
+  assertEquals(mk.waitProcess(1, 0, 0), { pid: 8, status: 17 });
+  assertEquals(mk.killProcess(8, 15), 0);
+  assertEquals(mk.killProcess(8, 64), -22);
+});
+
 // ── User-process tests via inline WAT (require wabt) ─────────────────────
 
 Deno.test("user process calls sys_getuid through the full trampoline", async () => {

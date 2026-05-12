@@ -104,6 +104,46 @@ pub unsafe extern "C" fn kernel_list_processes(out_ptr: *mut u8, out_cap: usize)
     dispatch::list_processes_response(response)
 }
 
+/// Host-control export: send a signal through kernel-owned process state.
+///
+/// # Safety
+///
+/// No pointer arguments. Marked unsafe to keep the exported host-control API
+/// uniform with the other raw C ABI entry points.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_kill(pid: u32, signal: u32) -> i64 {
+    dispatch::kill_pid(pid, signal)
+}
+
+/// Host-control export: wait/reap a child according to kernel process rules.
+///
+/// `caller_pid` is the process whose child set is being waited on. `child_pid`
+/// is `0` for any child or a specific child pid. `flags` uses the same bit
+/// layout as `sys_wait`; bit 0 is WNOHANG.
+///
+/// # Safety
+///
+/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid writable
+/// range in this kernel instance's linear memory.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_wait(
+    caller_pid: u32,
+    child_pid: u32,
+    flags: u32,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> i64 {
+    let mut request = [0u8; 8];
+    request[0..4].copy_from_slice(&child_pid.to_le_bytes());
+    request[4..8].copy_from_slice(&flags.to_le_bytes());
+    let response = if out_ptr.is_null() || out_cap == 0 {
+        &mut [][..]
+    } else {
+        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    };
+    dispatch::wait_response(caller_pid, &request, response)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +177,36 @@ mod tests {
             )
         };
         assert_eq!(rc, -(abi::ENOSYS as i64));
+    }
+
+    #[test]
+    fn kernel_wait_export_reaps_kernel_owned_child() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = 1_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(&7_u32.to_le_bytes());
+        assert_eq!(
+            dispatch::dispatch(dispatch::METHOD_KERNEL_REGISTER_CHILD, 0, &reg, &mut []),
+            0
+        );
+
+        let mut exit = 7_u32.to_le_bytes().to_vec();
+        exit.extend_from_slice(&23_i32.to_le_bytes());
+        assert_eq!(
+            dispatch::dispatch(dispatch::METHOD_KERNEL_RECORD_EXIT, 0, &exit, &mut []),
+            0
+        );
+
+        let mut out = [0u8; 8];
+        let rc = unsafe { kernel_wait(1, 0, 0, out.as_mut_ptr(), out.len()) };
+        assert_eq!(rc, 8);
+        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 7);
+        assert_eq!(i32::from_le_bytes(out[4..8].try_into().unwrap()), 23);
+    }
+
+    #[test]
+    fn kernel_kill_export_uses_kernel_signal_validation() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(unsafe { kernel_kill(7, 15) }, 0);
+        assert_eq!(unsafe { kernel_kill(7, 64) }, -(abi::EINVAL as i64));
     }
 }

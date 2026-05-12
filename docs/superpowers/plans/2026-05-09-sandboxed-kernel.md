@@ -98,8 +98,9 @@ records.
 ### Phase B2 — Kernel-Owned Process Control
 
 - Define the host-control exports in `packages/kernel-wasm` before changing TS
-  compatibility shims: `kernel_spawn`, `kernel_kill`, `kernel_wait`,
-  `kernel_list_processes`, and reserved `kernel_snapshot`.
+  compatibility shims. `kernel_list_processes`, `kernel_kill`, and
+  `kernel_wait` now exist; remaining exports are `kernel_spawn` and reserved
+  `kernel_snapshot`.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the

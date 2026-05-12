@@ -202,6 +202,11 @@ export interface ProcessSnapshot {
   fds: number[];
 }
 
+export interface WaitResult {
+  pid: number;
+  status: number;
+}
+
 // ── Embedder-supplied traits ──────────────────────────────────────────────
 
 export interface ExtensionRegistry {
@@ -940,6 +945,21 @@ export class KernelInstance {
         outCap: number,
       ) => Promise<bigint>)
       | null = null,
+    readonly kernelListProcesses:
+      | ((outPtr: number, outCap: number) => bigint)
+      | null = null,
+    readonly kernelKill:
+      | ((pid: number, signal: number) => bigint)
+      | null = null,
+    readonly kernelWait:
+      | ((
+        callerPid: number,
+        childPid: number,
+        flags: number,
+        outPtr: number,
+        outCap: number,
+      ) => bigint)
+      | null = null,
   ) {}
 
   private stage(
@@ -1014,6 +1034,37 @@ export class KernelInstance {
       responseCap,
     );
     return { rc, response: this.collectResponse(outPtr, responseCap) };
+  }
+
+  listProcessesRaw(): { rc: bigint; response: Uint8Array } {
+    if (!this.kernelListProcesses) {
+      throw new Error("kernel.wasm missing kernel_list_processes export");
+    }
+    const outPtr = this.scratchPtr;
+    const outCap = this.scratchLen;
+    const rc = this.kernelListProcesses(outPtr, outCap);
+    return { rc, response: this.collectResponse(outPtr, outCap) };
+  }
+
+  killProcess(pid: number, signal: number): bigint {
+    if (!this.kernelKill) {
+      throw new Error("kernel.wasm missing kernel_kill export");
+    }
+    return this.kernelKill(pid, signal);
+  }
+
+  waitProcess(
+    callerPid: number,
+    childPid: number,
+    flags: number,
+  ): { rc: bigint; response: Uint8Array } {
+    if (!this.kernelWait) {
+      throw new Error("kernel.wasm missing kernel_wait export");
+    }
+    const outPtr = this.scratchPtr;
+    const outCap = 8;
+    const rc = this.kernelWait(callerPid, childPid, flags, outPtr, outCap);
+    return { rc, response: this.collectResponse(outPtr, outCap) };
   }
 }
 
@@ -1944,6 +1995,21 @@ export class Microkernel {
       outPtr: number,
       outCap: number,
     ) => bigint;
+    const kernelListProcesses = instance.exports.kernel_list_processes as
+      | ((outPtr: number, outCap: number) => bigint)
+      | undefined;
+    const kernelKill = instance.exports.kernel_kill as
+      | ((pid: number, signal: number) => bigint)
+      | undefined;
+    const kernelWait = instance.exports.kernel_wait as
+      | ((
+        callerPid: number,
+        childPid: number,
+        flags: number,
+        outPtr: number,
+        outCap: number,
+      ) => bigint)
+      | undefined;
 
     // promising-wrap returns a function that returns Promise<i64>;
     // the underlying call may suspend via any Suspending import.
@@ -1987,6 +2053,9 @@ export class Microkernel {
       scratchLen,
       dispatch,
       dispatchAsync,
+      kernelListProcesses ?? null,
+      kernelKill ?? null,
+      kernelWait ?? null,
     );
     hostBox.state = hostState;
     const mk = new Microkernel(kernel, hostState);
@@ -2022,17 +2091,33 @@ export class Microkernel {
 
   listProcesses(): ProcessSnapshot[] {
     const cap = this.kernel.scratchLen;
-    const { rc, response } = this.syscall(
-      METHOD.KERNEL_LIST_PROCESSES,
-      new Uint8Array(0),
-      cap,
-    );
+    const { rc, response } = this.kernel.listProcessesRaw();
     const n = Number(rc);
     if (n < 0) throw new Error(`kernel_list_processes failed: rc=${rc}`);
     if (n > cap) {
       throw new Error(`kernel_list_processes exceeded scratch capacity: ${n}`);
     }
     return decodeProcessList(response.subarray(0, n));
+  }
+
+  waitProcess(callerPid: number, childPid = 0, flags = 0): WaitResult {
+    const { rc, response } = this.kernel.waitProcess(
+      callerPid,
+      childPid,
+      flags,
+    );
+    const n = Number(rc);
+    if (n < 0) throw new Error(`kernel_wait failed: rc=${rc}`);
+    if (n !== 8) throw new Error(`kernel_wait wrote unexpected size: ${n}`);
+    const view = new DataView(response.buffer, response.byteOffset, 8);
+    return {
+      pid: view.getUint32(0, true),
+      status: view.getInt32(4, true),
+    };
+  }
+
+  killProcess(pid: number, signal: number): number {
+    return Number(this.kernel.killProcess(pid, signal));
   }
 
   /**

@@ -45,7 +45,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_RECORD_EXIT => record_exit(request),
         METHOD_KERNEL_DRAIN_SPAWN => drain_spawn(response),
         METHOD_KERNEL_LIST_PROCESSES => list_processes_response(response),
-        METHOD_SYS_WAIT => sys_wait(caller_pid, request, response),
+        METHOD_SYS_WAIT => wait_response(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
@@ -75,7 +75,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SETPGID => setpgid(caller_pid, request),
         METHOD_SYS_GETSID => getsid(caller_pid, request),
         METHOD_SYS_SETSID => setsid(caller_pid),
-        METHOD_SYS_KILL => kill(request),
+        METHOD_SYS_KILL => kill_request(request),
         METHOD_SYS_SIGACTION => sigaction(caller_pid, request),
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
@@ -715,10 +715,7 @@ fn setsid(caller_pid: u32) -> i64 {
 /// Phase 2: storage only — actual delivery requires asyncify/JSPI
 /// unwind from the AsyncBridge integration. sig==0 is the POSIX
 /// "is the pid alive?" probe; with no process tree we always say yes.
-fn kill(request: &[u8]) -> i64 {
-    let Some([target, sig]) = read_u32_args::<2>(request) else {
-        return -(abi::EINVAL as i64);
-    };
+pub fn kill_pid(target: u32, sig: u32) -> i64 {
     if sig == 0 {
         return 0;
     }
@@ -729,6 +726,13 @@ fn kill(request: &[u8]) -> i64 {
         k.process_mut(target).pending_signals |= 1u64 << (sig - 1);
     });
     0
+}
+
+fn kill_request(request: &[u8]) -> i64 {
+    let Some([target, sig]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    kill_pid(target, sig)
 }
 
 /// `sigaction(sig, disposition) -> previous_disposition`. Disposition
@@ -865,7 +869,7 @@ fn record_exit(request: &[u8]) -> i64 {
 /// "any child". Returns 8 bytes (u32 pid + i32 status) on a
 /// successful reap, -EAGAIN if WNOHANG (flags bit 0) and no child
 /// has exited, -ECHILD if the caller has no waitable children.
-fn sys_wait(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+pub fn wait_response(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     let Some([want_pid, flags]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
