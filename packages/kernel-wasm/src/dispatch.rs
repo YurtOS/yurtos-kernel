@@ -37,11 +37,9 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_DRAIN_STDOUT => drain_stream(request, response, /*stdout=*/ true),
         METHOD_KERNEL_DRAIN_STDERR => drain_stream(request, response, /*stdout=*/ false),
         METHOD_KERNEL_REGISTER_FILE => register_file(request),
-        METHOD_KERNEL_SET_ARGV => set_argv(request),
         METHOD_KERNEL_INSTALL_TAR_LAYER => install_tar_layer(request),
         METHOD_KERNEL_INSTALL_HOST_FS_MOUNT => install_host_fs_mount(request),
         METHOD_KERNEL_INSTALL_YURTFS => install_yurtfs(request),
-        METHOD_KERNEL_REGISTER_CHILD => register_child(request),
         METHOD_KERNEL_LIST_PROCESSES => list_processes_response(response),
         METHOD_SYS_WAIT => wait_response(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
@@ -49,9 +47,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),
         METHOD_SYS_GETEGID => with_kernel(|k| k.process(caller_pid).credentials.egid as i64),
         METHOD_SYS_GETPID => caller_pid as i64,
-        // ppid comes from the Process record now that
-        // kernel_register_child wires parent/child links. Returns 0
-        // (KERNEL_PID) for the root user-process.
+        // ppid comes from the kernel-owned Process record. Returns
+        // 0 (KERNEL_PID) for the root user-process.
         METHOD_SYS_GETPPID => with_kernel(|k| k.process(caller_pid).ppid as i64),
         METHOD_SYS_UMASK => umask(caller_pid, request),
         METHOD_SYS_SETRESUID => setresuid(caller_pid, request),
@@ -814,9 +811,9 @@ fn register_file(request: &[u8]) -> i64 {
     0
 }
 
-/// `kernel_set_argv(target_pid, [(arg_len, arg_bytes)…])`. Microkernel-
-/// only; populates Process.argv so /proc/<pid>/cmdline + comm have
-/// content to serve.
+/// Test-only argv patch helper. Runtime spawn paths set Process.argv
+/// when the process is created.
+#[cfg(test)]
 fn set_argv(request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
@@ -882,10 +879,10 @@ pub fn spawn_cached_process(parent_pid: u32, module_id: &[u8], argv_request: &[u
     pid as i64
 }
 
-/// `kernel_register_child(parent_pid, child_pid)`. Microkernel-
-/// only; sets the child's ppid and adds it to parent's children
-/// list. Called after the host has spawned a child user-process.
-fn register_child(request: &[u8]) -> i64 {
+/// Test-only parentage patch helper. Runtime spawn paths set parent
+/// and child links when the process is created.
+#[cfg(test)]
+pub(crate) fn register_child(request: &[u8]) -> i64 {
     let Some([parent, child]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
@@ -3212,8 +3209,8 @@ mod tests {
         );
     }
 
-    /// Helper for set_argv: pack pid + (u32 len + bytes)* like the
-    /// kernel_set_argv wire format expects.
+    /// Helper for the test-only argv patch format: pack pid +
+    /// (u32 len + bytes)*.
     fn set_argv_req(pid: u32, args: &[&[u8]]) -> Vec<u8> {
         let mut req = pid.to_le_bytes().to_vec();
         for a in args {
@@ -3229,7 +3226,7 @@ mod tests {
         // Touch pid 4 to register it, then push argv.
         assert_eq!(dispatch(METHOD_SYS_GETUID, 4, &[], &mut []), 1000);
         let req = set_argv_req(4, &[b"/usr/bin/zsh", b"-l", b"-c", b"echo hi"]);
-        assert_eq!(dispatch(METHOD_KERNEL_SET_ARGV, 0, &req, &mut []), 0);
+        assert_eq!(set_argv(&req), 0);
 
         let fd = dispatch(
             METHOD_SYS_OPEN,
@@ -3250,7 +3247,7 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
         assert_eq!(dispatch(METHOD_SYS_GETUID, 8, &[], &mut []), 1000);
         let req = set_argv_req(8, &[b"/bin/cat"]);
-        dispatch(METHOD_KERNEL_SET_ARGV, 0, &req, &mut []);
+        set_argv(&req);
 
         let fd = dispatch(METHOD_SYS_OPEN, 8, &open_req(0, b"/proc/8/comm"), &mut []);
         let mut buf = [0u8; 32];
@@ -3275,7 +3272,7 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
         assert_eq!(dispatch(METHOD_SYS_GETUID, 6, &[], &mut []), 1000);
         let req = set_argv_req(6, &[b"/usr/bin/ls"]);
-        dispatch(METHOD_KERNEL_SET_ARGV, 0, &req, &mut []);
+        set_argv(&req);
 
         let fd = dispatch(METHOD_SYS_OPEN, 6, &open_req(0, b"/proc/6/status"), &mut []);
         let mut buf = [0u8; 256];
@@ -4117,7 +4114,7 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
         let mut req = 1_u32.to_le_bytes().to_vec();
         req.extend_from_slice(&7_u32.to_le_bytes());
-        assert_eq!(dispatch(METHOD_KERNEL_REGISTER_CHILD, 0, &req, &mut []), 0);
+        assert_eq!(register_child(&req), 0);
 
         // Child (pid 7) sees its ppid (1) via getppid.
         assert_eq!(dispatch(METHOD_SYS_GETPPID, 7, &[], &mut []), 1);
@@ -4129,7 +4126,7 @@ mod tests {
         // Register child 5 under parent 1, then record its exit.
         let mut reg = 1_u32.to_le_bytes().to_vec();
         reg.extend_from_slice(&5_u32.to_le_bytes());
-        dispatch(METHOD_KERNEL_REGISTER_CHILD, 0, &reg, &mut []);
+        register_child(&reg);
 
         let mut exit = 5_u32.to_le_bytes().to_vec();
         exit.extend_from_slice(&42_i32.to_le_bytes());
@@ -4173,7 +4170,7 @@ mod tests {
         // wait via AsyncBridge once it lands).
         let mut reg = 1_u32.to_le_bytes().to_vec();
         reg.extend_from_slice(&3_u32.to_le_bytes());
-        dispatch(METHOD_KERNEL_REGISTER_CHILD, 0, &reg, &mut []);
+        register_child(&reg);
 
         let mut wreq = 0_u32.to_le_bytes().to_vec();
         wreq.extend_from_slice(&1_u32.to_le_bytes()); // WNOHANG
@@ -4191,7 +4188,7 @@ mod tests {
         for c in [10u32, 11u32] {
             let mut reg = 1_u32.to_le_bytes().to_vec();
             reg.extend_from_slice(&c.to_le_bytes());
-            dispatch(METHOD_KERNEL_REGISTER_CHILD, 0, &reg, &mut []);
+            register_child(&reg);
         }
         let mut exit = 11_u32.to_le_bytes().to_vec();
         exit.extend_from_slice(&7_i32.to_le_bytes());
@@ -4221,11 +4218,11 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
 
         let argv = set_argv_req(7, &[b"/bin/wc", b"-l"]);
-        dispatch(METHOD_KERNEL_SET_ARGV, 0, &argv, &mut []);
+        set_argv(&argv);
 
         let mut reg = 1_u32.to_le_bytes().to_vec();
         reg.extend_from_slice(&7_u32.to_le_bytes());
-        dispatch(METHOD_KERNEL_REGISTER_CHILD, 0, &reg, &mut []);
+        register_child(&reg);
 
         let mut exit = 7_u32.to_le_bytes().to_vec();
         exit.extend_from_slice(&2_i32.to_le_bytes());
@@ -4311,5 +4308,16 @@ mod tests {
         exit.extend_from_slice(&0_i32.to_le_bytes());
         assert_eq!(dispatch(14, 0, &exit, &mut []), -(abi::ENOSYS as i64));
         assert_eq!(dispatch(15, 0, &[], &mut [0u8; 32]), -(abi::ENOSYS as i64));
+    }
+
+    #[test]
+    fn process_scaffolding_is_not_available_through_generic_dispatch() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let argv = set_argv_req(7, &[b"/bin/wc"]);
+        assert_eq!(dispatch(9, 0, &argv, &mut []), -(abi::ENOSYS as i64));
+
+        let mut reg = 1_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(&7_u32.to_le_bytes());
+        assert_eq!(dispatch(13, 0, &reg, &mut []), -(abi::ENOSYS as i64));
     }
 }

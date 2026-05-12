@@ -184,18 +184,17 @@ pub struct Process {
     /// in nanoseconds. Same Phase 2 observability rationale as
     /// `yield_count`.
     pub last_nanosleep_ns: u64,
-    /// argv as raw bytes per arg. Set at spawn time via
-    /// `kernel_set_argv`; surfaces through /proc/<pid>/cmdline and
-    /// /proc/<pid>/comm. Empty if the microkernel never registered
-    /// it (e.g. tests that hit the kernel directly).
+    /// argv as raw bytes per arg. Set at spawn time; surfaces
+    /// through /proc/<pid>/cmdline and /proc/<pid>/comm. Empty for
+    /// tests that create processes directly without spawn metadata.
     pub argv: Vec<Vec<u8>>,
     /// Parent pid. 0 means "no parent / kernel is parent" (the
     /// initial user process and any orphaned children point here).
-    /// Set by the microkernel via `kernel_register_child` after a
-    /// successful spawn.
+    /// Set by kernel-owned spawn paths when a child process is
+    /// created.
     pub ppid: Pid,
     /// Direct children's pids. Updated alongside ppid on
-    /// register_child; entries are removed when sys_wait reaps a
+    /// process creation; entries are removed when sys_wait reaps a
     /// child (zombie → fully gone).
     pub children: Vec<Pid>,
     /// POSIX exit status when the process has terminated; None

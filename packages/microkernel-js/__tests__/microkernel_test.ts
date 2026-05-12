@@ -71,6 +71,48 @@ async function freshMicrokernel(): Promise<Microkernel> {
   return await Microkernel.load(await kernelWasm(), defaultHostState());
 }
 
+function encodeSysSpawnRequest(
+  path: Uint8Array,
+  argv: Uint8Array[],
+): Uint8Array {
+  let len = 4 + path.byteLength;
+  for (const arg of argv) len += 4 + arg.byteLength;
+  const req = new Uint8Array(len);
+  const view = new DataView(req.buffer);
+  let off = 0;
+  view.setUint32(off, path.byteLength, true);
+  off += 4;
+  req.set(path, off);
+  off += path.byteLength;
+  for (const arg of argv) {
+    view.setUint32(off, arg.byteLength, true);
+    off += 4;
+    req.set(arg, off);
+    off += arg.byteLength;
+  }
+  return req;
+}
+
+function spawnFromRamfs(
+  mk: Microkernel,
+  parentPid: number,
+  path: Uint8Array,
+  argv: Uint8Array[],
+): number {
+  mk.registerRamfsFile(path, new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+  const { rc } = mk.kernelSyscall(
+    METHOD.SYS_SPAWN,
+    parentPid,
+    encodeSysSpawnRequest(path, argv),
+    0,
+  );
+  const pid = Number(rc);
+  if (pid < 1000) {
+    throw new Error(`expected kernel-allocated child pid, got ${pid}`);
+  }
+  return pid;
+}
+
 async function fixtureWasm(
   crateName: string,
   artifact: string,
@@ -535,22 +577,7 @@ Deno.test("microkernel direct syscalls use kernel pid 0", async () => {
 
 Deno.test("listProcesses reads the kernel-owned process snapshot", async () => {
   const mk = await freshMicrokernel();
-  const childPid = 7;
-  const encoder = new TextEncoder();
-
-  const command = encoder.encode("/bin/wc");
-  const argvReq = new Uint8Array(4 + 4 + command.byteLength);
-  const argvView = new DataView(argvReq.buffer);
-  argvView.setUint32(0, childPid, true);
-  argvView.setUint32(4, command.byteLength, true);
-  argvReq.set(command, 8);
-  mk.syscall(METHOD.KERNEL_SET_ARGV, argvReq, 0);
-
-  const reg = new Uint8Array(8);
-  const regView = new DataView(reg.buffer);
-  regView.setUint32(0, 1, true);
-  regView.setUint32(4, childPid, true);
-  mk.syscall(METHOD.KERNEL_REGISTER_CHILD, reg, 0);
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/wc"), [s("/bin/wc")]);
 
   mk.recordExit(childPid, 2);
 
@@ -568,18 +595,13 @@ Deno.test("listProcesses reads the kernel-owned process snapshot", async () => {
 
 Deno.test("waitProcess and killProcess enter kernel-owned process control", async () => {
   const mk = await freshMicrokernel();
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/child"), [s("child")]);
 
-  const reg = new Uint8Array(8);
-  const regView = new DataView(reg.buffer);
-  regView.setUint32(0, 1, true);
-  regView.setUint32(4, 8, true);
-  mk.syscall(METHOD.KERNEL_REGISTER_CHILD, reg, 0);
+  mk.recordExit(childPid, 17);
 
-  mk.recordExit(8, 17);
-
-  assertEquals(mk.waitProcess(1, 0, 0), { pid: 8, status: 17 });
-  assertEquals(mk.killProcess(8, 15), 0);
-  assertEquals(mk.killProcess(8, 64), -22);
+  assertEquals(mk.waitProcess(1, 0, 0), { pid: childPid, status: 17 });
+  assertEquals(mk.killProcess(childPid, 15), 0);
+  assertEquals(mk.killProcess(childPid, 64), -22);
 });
 
 Deno.test("drainPendingSpawn and recordExit use typed kernel lifecycle exports", async () => {
@@ -590,24 +612,13 @@ Deno.test("drainPendingSpawn and recordExit use typed kernel lifecycle exports",
   const path = s("/bin/echo");
   const arg0 = s("echo");
   const arg1 = s("hi");
-  const spawnReq = new Uint8Array(
-    4 + path.byteLength + 4 + arg0.byteLength + 4 + arg1.byteLength,
-  );
-  const spawnView = new DataView(spawnReq.buffer);
-  let off = 0;
-  spawnView.setUint32(off, path.byteLength, true);
-  off += 4;
-  spawnReq.set(path, off);
-  off += path.byteLength;
-  for (const arg of [arg0, arg1]) {
-    spawnView.setUint32(off, arg.byteLength, true);
-    off += 4;
-    spawnReq.set(arg, off);
-    off += arg.byteLength;
-  }
-
   const parentPid = 1;
-  const { rc } = mk.kernelSyscall(METHOD.SYS_SPAWN, parentPid, spawnReq, 0);
+  const { rc } = mk.kernelSyscall(
+    METHOD.SYS_SPAWN,
+    parentPid,
+    encodeSysSpawnRequest(path, [arg0, arg1]),
+    0,
+  );
   const childPid = Number(rc);
   if (childPid < 1000) {
     throw new Error(`expected kernel-allocated child pid, got ${childPid}`);

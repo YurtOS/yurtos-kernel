@@ -61,8 +61,8 @@ pub struct ProcessSnapshot {
     pub egid: u32,
     pub pgid: u32,
     pub sid: u32,
-    /// argv as raw bytes per arg. Empty if the microkernel never
-    /// pushed an argv for this pid via `kernel_set_argv`.
+    /// argv as raw bytes per arg. Empty if this pid was created
+    /// without a spawn argv record.
     pub argv: Vec<Vec<u8>>,
     /// Working directory raw bytes (no UTF-8 guarantee). Defaults to
     /// `/`.

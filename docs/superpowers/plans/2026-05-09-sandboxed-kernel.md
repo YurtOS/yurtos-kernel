@@ -123,10 +123,12 @@ records.
   `kernel_spawn_process` with an anonymous cached module id.
 - `sys_spawn` now stores the decoded argv in the kernel-owned child process
   record before staging the pending spawn, so the wasmtime host no longer calls
-  `KERNEL_SET_ARGV` after draining a child.
+  a post-spawn argv patch after draining a child. The old generic
+  `kernel_set_argv` method id has been removed from the kernel ABI contract.
 - Native wasmtime `spawn_child` now passes the intended parent pid into
   `kernel_spawn_process`; it no longer spawns with parent 0 and patches
-  parentage through `KERNEL_REGISTER_CHILD`.
+  parentage afterward. The old generic `kernel_register_child` method id has
+  been removed from the kernel ABI contract.
 - `kernel_record_exit` and `kernel_drain_spawn` now exist as typed host-control
   exports. The JS adapter and native wasmtime adapter use them instead of
   generic dispatch method ids for process lifecycle notification and

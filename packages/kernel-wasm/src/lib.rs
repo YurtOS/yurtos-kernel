@@ -249,10 +249,7 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
         let mut reg = 1_u32.to_le_bytes().to_vec();
         reg.extend_from_slice(&7_u32.to_le_bytes());
-        assert_eq!(
-            dispatch::dispatch(dispatch::METHOD_KERNEL_REGISTER_CHILD, 0, &reg, &mut []),
-            0
-        );
+        assert_eq!(dispatch::register_child(&reg), 0);
 
         assert_eq!(unsafe { kernel_record_exit(7, 23) }, 0);
 
