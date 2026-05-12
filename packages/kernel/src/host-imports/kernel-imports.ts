@@ -673,6 +673,64 @@ export function createKernelImports(
     return addr;
   }
 
+  function normalizeIpv4(host: string): string {
+    if (host === "localhost") return "127.0.0.1";
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return host;
+    return syntheticAddressForHost(host);
+  }
+
+  function ipv4ToBytes(host: string): [number, number, number, number] {
+    const normalized = normalizeIpv4(host);
+    const parts = normalized.split(".").map((part) => Number(part));
+    if (
+      parts.length !== 4 ||
+      parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+    ) {
+      return [0, 0, 0, 0];
+    }
+    return parts as [number, number, number, number];
+  }
+
+  function writeSocketAddrResult(
+    ptr: number,
+    cap: number,
+    host: string,
+    port: number,
+  ): number {
+    const size = 8;
+    if (cap < size) return size;
+    const bytes = new Uint8Array(memory.buffer, ptr, size);
+    const hostBytes = ipv4ToBytes(host);
+    bytes.set(hostBytes, 0);
+    const view = new DataView(memory.buffer, ptr, size);
+    view.setUint16(4, port & 0xffff, false);
+    view.setUint16(6, 0, true);
+    return size;
+  }
+
+  function writeSocketAcceptResult(
+    ptr: number,
+    cap: number,
+    accepted: {
+      fd: number;
+      peerHost: string;
+      peerPort: number;
+      localHost: string;
+      localPort: number;
+    },
+  ): number {
+    const size = 16;
+    if (cap < size) return size;
+    const bytes = new Uint8Array(memory.buffer, ptr, size);
+    const view = new DataView(memory.buffer, ptr, size);
+    view.setInt32(0, accepted.fd, true);
+    bytes.set(ipv4ToBytes(accepted.peerHost), 4);
+    view.setUint16(8, accepted.peerPort & 0xffff, false);
+    view.setUint16(10, accepted.localPort & 0xffff, false);
+    bytes.set(ipv4ToBytes(accepted.localHost), 12);
+    return size;
+  }
+
   function setFallbackUid(ruid: number, euid: number, suid: number): number {
     const current = new Set([fallbackUid]);
     for (const value of [ruid, euid, suid]) {
@@ -2049,16 +2107,49 @@ export function createKernelImports(
       });
     },
 
-    // host_socket_connect(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // host_socket_connect(fd, host_ptr, host_len, port, flags) -> i32
     // Opens a TCP or TLS socket to the given host:port.
-    // Request JSON: { fd, host, port, tls }
-    // Response JSON: { ok: true } or { ok: false, error }
     host_socket_connect(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      fdOrReqPtr: number,
+      hostPtrOrReqLen: number,
+      hostLenOrOutPtr: number,
+      portOrOutCap: number,
+      flags?: number,
     ): number {
+      if (flags !== undefined) {
+        if (!socketBackend) return -5;
+        const fd = fdOrReqPtr;
+        const host = readString(memory, hostPtrOrReqLen, hostLenOrOutPtr);
+        const port = portOrOutCap;
+        if (!host || port < 0 || port > 65535) return -22;
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket") return -9;
+        const result = socketBackend.connect({
+          host,
+          port,
+          tls: (flags & 1) !== 0,
+        });
+        if (!result.ok) return -111;
+        if (target.noDelay) {
+          const optionResult = target.setNoDelay?.(result.socket, true) ??
+            {
+              ok: false,
+              error: "TCP_NODELAY not supported by socket backend",
+            };
+          if (!optionResult.ok) return -95;
+        }
+        target.socket = result.socket;
+        target.peerHost = result.peerHost ?? host;
+        target.peerPort = result.peerPort ?? port;
+        target.localHost = result.localHost ?? socketLocalHost;
+        target.localPort = result.localPort ?? socketLocalPortForFd(fd);
+        return 0;
+      }
+
+      const reqPtr = fdOrReqPtr;
+      const reqLen = hostPtrOrReqLen;
+      const outPtr = hostLenOrOutPtr;
+      const outCap = portOrOutCap;
       if (!socketBackend) {
         return writeJson(memory, outPtr, outCap, {
           ok: false,
@@ -2116,15 +2207,38 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_bind(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // host_socket_bind(fd, host_ptr, host_len, port) -> i32
     // Records the sandbox-visible local address requested for a socket fd.
     // AF_UNIX: req = { fd, path }; AF_INET: req = { fd, host, port }
     host_socket_bind(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      fdOrReqPtr: number,
+      hostPtrOrReqLen: number,
+      hostLenOrOutPtr: number,
+      portOrOutCap: number,
     ): number {
+      if (hostLenOrOutPtr < 256) {
+        const fd = fdOrReqPtr;
+        const host = readString(memory, hostPtrOrReqLen, hostLenOrOutPtr);
+        const port = portOrOutCap;
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket") return -9;
+        if (
+          host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
+        ) {
+          return -95;
+        }
+        if (!Number.isInteger(port) || port < 0 || port > 65535) return -22;
+        target.boundHost = host;
+        target.boundPort = port;
+        target.localHost = host === "0.0.0.0" ? socketLocalHost : host;
+        target.localPort = port;
+        return 0;
+      }
+
+      const reqPtr = fdOrReqPtr;
+      const reqLen = hostPtrOrReqLen;
+      const outPtr = hostLenOrOutPtr;
+      const outCap = portOrOutCap;
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
         if (typeof req.fd !== "number") {
@@ -2544,14 +2658,44 @@ export function createKernelImports(
       return writeResult(result.bytes);
     },
 
-    // host_socket_listen(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // host_socket_listen(fd, backlog) -> i32
     // Creates a backend listener for a socket fd after sandbox policy authorizes it.
     host_socket_listen(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      fdOrReqPtr: number,
+      backlogOrReqLen: number,
+      outPtr?: number,
+      outCap?: number,
     ): number {
+      if (outPtr === undefined || outCap === undefined) {
+        const fd = fdOrReqPtr;
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket") return -9;
+        const host = target.boundHost ?? "127.0.0.1";
+        const port = target.boundPort ?? 0;
+        const backlog = backlogOrReqLen > 0 ? backlogOrReqLen : 128;
+        const auth = authorizeListen(opts.serverSockets, host, port, backlog);
+        if (!auth.ok) return -13;
+        if (!socketBackend?.listen) return -95;
+        const result = socketBackend.listen({
+          host,
+          port,
+          backlog,
+          mapping: auth.mapping,
+        });
+        if (!result.ok) return -5;
+        target.listener = result.listener;
+        target.boundHost = host;
+        target.boundPort = port;
+        target.localHost = result.host;
+        target.localPort = result.port;
+        target.closeListener = (listener) => {
+          socketBackend.closeListener?.(listener);
+        };
+        return 0;
+      }
+
+      const reqPtr = fdOrReqPtr;
+      const reqLen = backlogOrReqLen;
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
         if (typeof req.fd !== "number") {
@@ -2604,14 +2748,59 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_accept(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // host_socket_accept(fd, out_ptr, out_cap) -> i32
     // Polls one accepted connection from a listening socket fd.
     async host_socket_accept(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      fdOrReqPtr: number,
+      outPtrOrReqLen: number,
+      outPtrOrOutCap: number,
+      outCapMaybe?: number,
     ): Promise<number> {
+      if (outCapMaybe === undefined) {
+        const fd = fdOrReqPtr;
+        const outPtr = outPtrOrReqLen;
+        const outCap = outPtrOrOutCap;
+        if (!socketBackend?.accept) return -95;
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket" || target.listener == null) {
+          return -9;
+        }
+        const accepted = await acceptSocketAsync(
+          socketBackend,
+          target.listener,
+        );
+        if (!accepted.ok) return accepted.error === "EAGAIN" ? -11 : -5;
+        if (!opts.kernel) return -5;
+        const acceptedFd = opts.kernel.allocFd(callerPid, {
+          type: "socket",
+          socket: accepted.socket,
+          refs: 1,
+          peerHost: accepted.peerHost,
+          peerPort: accepted.peerPort,
+          localHost: accepted.localHost,
+          localPort: accepted.localPort,
+          send: socketBackend.send.bind(socketBackend),
+          recv: socketBackend.recv.bind(socketBackend),
+          recvAsync: (socket, maxBytes) =>
+            recvSocketAsync(socketBackend, socket, maxBytes),
+          setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+          close: (socket) => {
+            socketBackend.close(socket);
+          },
+        });
+        return writeSocketAcceptResult(outPtr, outCap, {
+          fd: acceptedFd,
+          peerHost: accepted.peerHost,
+          peerPort: accepted.peerPort,
+          localHost: accepted.localHost,
+          localPort: accepted.localPort,
+        });
+      }
+
+      const reqPtr = fdOrReqPtr;
+      const reqLen = outPtrOrReqLen;
+      const outPtr = outPtrOrOutCap;
+      const outCap = outCapMaybe;
       if (!socketBackend?.accept && !socketBackend?.registry) {
         return writeJson(memory, outPtr, outCap, {
           ok: false,
@@ -2702,16 +2891,40 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_addr(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // host_socket_addr(fd, which, out_ptr, out_cap) -> i32
     // Reports sandbox-visible socket address metadata.
-    // Request JSON: { fd, kind?: "local" | "peer" }
-    // Response JSON: { ok, peer_host, peer_port, local_host, local_port } or { ok: false, error }
     host_socket_addr(
-      reqPtr: number,
-      reqLen: number,
+      fdOrReqPtr: number,
+      whichOrReqLen: number,
       outPtr: number,
       outCap: number,
     ): number {
+      if (outCap <= 16) {
+        const fd = fdOrReqPtr;
+        const which = whichOrReqLen;
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket") return -9;
+        if (
+          target.socket === null && target.listener == null &&
+          target.boundPort === undefined
+        ) {
+          return -107;
+        }
+        const local = which === 0;
+        return writeSocketAddrResult(
+          outPtr,
+          outCap,
+          local
+            ? (target.localHost ?? socketLocalHost)
+            : (target.peerHost ?? "0.0.0.0"),
+          local
+            ? (target.localPort ?? socketLocalPortForFd(fd))
+            : (target.peerPort ?? 0),
+        );
+      }
+
+      const reqPtr = fdOrReqPtr;
+      const reqLen = whichOrReqLen;
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
         if (typeof req.fd !== "number") {
@@ -2787,16 +3000,31 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_send(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // host_socket_send(fd, data_ptr, data_len, flags) -> i32
     // Sends data on an open socket.
-    // Request JSON: { fd, data_b64 } or { fd, data_b64, to: "<path>" } for dgram sendto
-    // Response JSON: { ok, bytes_sent } or { ok: false, error }
     host_socket_send(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      fdOrReqPtr: number,
+      dataPtrOrReqLen: number,
+      dataLenOrOutPtr: number,
+      flagsOrOutCap: number,
     ): number {
+      if (flagsOrOutCap <= 16) {
+        if (!socketBackend) return -5;
+        const fd = fdOrReqPtr;
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return -107;
+        }
+        const data = readBytes(memory, dataPtrOrReqLen, dataLenOrOutPtr);
+        const result = socketBackend.send(target.socket, bytesToBase64(data));
+        if (!result.ok) return result.error === "EAGAIN" ? -11 : -5;
+        return result.bytes_sent ?? data.byteLength;
+      }
+
+      const reqPtr = fdOrReqPtr;
+      const reqLen = dataPtrOrReqLen;
+      const outPtr = dataLenOrOutPtr;
+      const outCap = flagsOrOutCap;
       if (!socketBackend) {
         return writeJson(memory, outPtr, outCap, {
           ok: false,
@@ -2858,20 +3086,61 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_recv(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // host_socket_recv(fd, out_ptr, out_cap, flags) -> i32
     // Receives data from an open socket. Returns synchronously for
     // peek-with-buffer and nonblocking reads; returns a Promise for
     // blocking reads, so backends with recvAsync (loopback, browser
     // registry) suspend the host import via JSPI/Asyncify until at
     // least one byte (or EOF) arrives.
-    // Request JSON: { fd, max_bytes }
-    // Response JSON: { ok, data_b64 } or { ok: false, error }
     host_socket_recv(
-      reqPtr: number,
-      reqLen: number,
+      fdOrReqPtr: number,
+      outPtrOrReqLen: number,
       outPtr: number,
-      outCap: number,
+      flagsOrOutCap: number,
     ): number | Promise<number> {
+      if (flagsOrOutCap <= 16) {
+        if (!socketBackend) return -5;
+        const fd = fdOrReqPtr;
+        const outCap = outPtr;
+        const flags = flagsOrOutCap;
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return -107;
+        }
+        const maxBytes = outCap;
+        const peek = (flags & 2) !== 0;
+        const nonblocking =
+          ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+        if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
+          const chunk = target.peekBuffer.slice(0, maxBytes);
+          if (!peek) {
+            target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+          }
+          return writeBytes(memory, outPtrOrReqLen, outCap, chunk);
+        }
+        const writeProbe = (
+          probe: { ok: boolean; data_b64?: string; error?: string },
+        ) => {
+          if (!probe.ok) return probe.error === "EAGAIN" ? -11 : -5;
+          const data = base64ToBytes(probe.data_b64 ?? "");
+          if (peek) {
+            target.peekBuffer = target.peekBuffer
+              ? concatBytes(target.peekBuffer, data)
+              : data;
+          }
+          return writeBytes(memory, outPtrOrReqLen, outCap, data);
+        };
+        if (peek || nonblocking) {
+          return writeProbe(socketBackend.recv(target.socket, maxBytes, {
+            nonblocking: true,
+          }));
+        }
+        return target.recvAsync(target.socket, maxBytes).then(writeProbe);
+      }
+
+      const reqPtr = fdOrReqPtr;
+      const reqLen = outPtrOrReqLen;
+      const outCap = flagsOrOutCap;
       if (!socketBackend) {
         return writeJson(memory, outPtr, outCap, {
           ok: false,
@@ -3061,16 +3330,37 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_option(req_ptr, req_len, out_ptr, out_cap) -> i32
+    // host_socket_option(fd, option, has_value, value) -> i32
     // Applies or reports socket option state owned by the kernel.
-    // Request JSON: { fd, option, value? }
-    // Response JSON: { ok: true, value? } or { ok: false, error }
     host_socket_option(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      fdOrReqPtr: number,
+      optionOrReqLen: number,
+      hasValueOrOutPtr: number,
+      valueOrOutCap: number,
     ): number {
+      if (hasValueOrOutPtr <= 1) {
+        const fd = fdOrReqPtr;
+        const option = optionOrReqLen;
+        const hasValue = hasValueOrOutPtr !== 0;
+        const value = valueOrOutCap;
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket") return -9;
+        if (option !== 1) return -95;
+        if (!hasValue) return target.noDelay ? 1 : 0;
+        const enabled = value !== 0;
+        if (target.socket !== null) {
+          const result = target.setNoDelay?.(target.socket, enabled) ??
+            { ok: false, error: "TCP_NODELAY not supported by socket backend" };
+          if (!result.ok) return -95;
+        }
+        target.noDelay = enabled;
+        return 0;
+      }
+
+      const reqPtr = fdOrReqPtr;
+      const reqLen = optionOrReqLen;
+      const outPtr = hasValueOrOutPtr;
+      const outCap = valueOrOutCap;
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
         if (typeof req.fd !== "number") {
@@ -3180,11 +3470,24 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_close(req_ptr, req_len) -> i32
+    // host_socket_close(fd) -> i32
     // Closes an open socket.
-    // Request JSON: { fd }
     // Returns 0 on success, -1 on error.
-    host_socket_close(reqPtr: number, reqLen: number): number {
+    host_socket_close(reqPtrOrFd: number, reqLen?: number): number {
+      if (reqLen === undefined) {
+        const fd = reqPtrOrFd;
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket") return -9;
+        if (target.socket !== null) {
+          if (!socketBackend) return -5;
+          const socket = target.socket;
+          target.socket = null;
+          socketBackend.close(socket);
+        }
+        return opts.kernel?.closeFd(callerPid, fd) ? 0 : -9;
+      }
+
+      const reqPtr = reqPtrOrFd;
       try {
         const req = JSON.parse(readString(memory, reqPtr, reqLen));
         if (typeof req.fd !== "number") return -1;
