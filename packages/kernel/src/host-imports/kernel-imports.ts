@@ -2441,6 +2441,9 @@ export function createKernelImports(
           }
           return writeSocketBytes(chunk);
         }
+        if (target.readShutdown) {
+          return writeSocketBytes(new Uint8Array(0));
+        }
         // peekBuffer is empty.
         if (peek) {
           // Peek probes the backend without suspending and stashes any data

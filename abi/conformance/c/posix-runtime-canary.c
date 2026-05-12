@@ -615,13 +615,14 @@ static int case_select_regular_fd(void) {
 
   errno = 0;
   int rc = select(fd + 1, &readfds, &writefds, NULL, &timeout);
-  close(fd);
   if (rc != 2 || !FD_ISSET(fd, &readfds) || !FD_ISSET(fd, &writefds)) {
     char out[128];
     snprintf(out, sizeof(out), "select_regular_fd:bad:%d:%d:%d", rc, FD_ISSET(fd, &readfds), FD_ISSET(fd, &writefds));
+    close(fd);
     emit("select_regular_fd", 1, out, 1, errno);
     return 1;
   }
+  close(fd);
 
   FD_ZERO(&readfds);
   int invalid_fd = FD_SETSIZE - 1;

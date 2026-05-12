@@ -1771,6 +1771,54 @@ Deno.test("host_poll probes sockets and preserves queued read bytes", () => {
   kernel.dispose();
 });
 
+Deno.test("host_poll socket EOF probe makes blocking recv return EOF", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  const socketTarget: FdTarget & { type: "socket" } = {
+    type: "socket",
+    socket: 1,
+    refs: 1,
+    send: () => ({ ok: true, bytes_sent: 0 }),
+    recv: () => ({ ok: true, data: new Uint8Array(0) }),
+    recvAsync: () => {
+      throw new Error("readShutdown recv should not block");
+    },
+    close: () => {},
+  };
+  kernel.setFdTarget(pid, 5, socketTarget);
+  writePollFd(memory, 256, 5, POLLIN);
+  const socketBackend: SocketBackend = {
+    connect: () => ({ ok: false, error: "unused" }),
+    send: () => ({ ok: false, error: "unused" }),
+    recv: () => ({ ok: false, error: "unused" }),
+    close: () => ({ ok: true }),
+    recvAsync: () => Promise.resolve({ ok: false, error: "unused" }),
+  };
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    socketBackend,
+  });
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 256), POLLIN);
+  assertEquals(socketTarget.readShutdown, true);
+
+  const recvLen = (imports.host_socket_recv as (...args: number[]) => number)(
+    5,
+    512,
+    16,
+    0,
+  );
+  assertEquals(recvLen, 0);
+  kernel.dispose();
+});
+
 Deno.test("host_poll reports exhausted static input as readable EOF", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const kernel = new ProcessKernel();

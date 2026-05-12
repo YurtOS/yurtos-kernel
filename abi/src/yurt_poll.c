@@ -9,6 +9,7 @@
 YURT_DECLARE_MARKER(poll);
 YURT_DEFINE_MARKER(poll, 0x706f6c6cu) /* "poll" */
 
+_Static_assert(sizeof(void *) == 4, "libyurt ABI requires wasm32 pointers");
 _Static_assert(sizeof(struct pollfd) == 8, "pollfd layout mismatch");
 
 static int yurt_poll_impl(struct pollfd *fds, nfds_t nfds, int timeout) {

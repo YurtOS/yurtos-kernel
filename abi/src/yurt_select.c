@@ -11,6 +11,9 @@
 YURT_DECLARE_MARKER(select);
 YURT_DEFINE_MARKER(select, 0x73656c65u) /* "sele" */
 
+_Static_assert(sizeof(void *) == 4, "libyurt ABI requires wasm32 pointers");
+_Static_assert(sizeof(struct pollfd) == 8, "pollfd layout mismatch");
+
 static int yurt_select_timeout_ms(const struct timeval *timeout) {
   if (timeout == NULL) return -1;
   if (timeout->tv_sec < 0 || timeout->tv_usec < 0 ||
