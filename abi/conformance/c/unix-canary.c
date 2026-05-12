@@ -4,17 +4,10 @@
  * Spec: docs/superpowers/specs/2026-05-11-af-unix-design.md
  * Plan: docs/superpowers/plans/2026-05-11-af-unix.md
  *
- * Slice 1 ships this source plus the test-side `describe.skip` block
- * that pins the contract in code. Each case stays in `it.skip` until
- * its owning slice lands the backing implementation. The canary itself
- * is intentionally pessimistic at this point: every case emits
- *
- *     {"case":"...","exit":99,"stdout":"pending-impl"}
- *
- * and returns 99, so the C source compiles cleanly against the current
- * libyurt (which still rejects AF_UNIX with EAFNOSUPPORT) and CI stays
- * green. Cases get real bodies as their slices land — slice 2 wires the
- * five core SOCK_STREAM cases, slice 3 the two abstract cases, etc.
+ * All slices (2-7) have landed. Each case runs a real implementation
+ * and emits a JSONL result line: {"case":"...","exit":0,"stdout":"..."}.
+ * Run a specific case with: unix-canary --case <name>
+ * List all cases with:      unix-canary --list-cases
  */
 
 #include <errno.h>
@@ -814,6 +807,29 @@ static int case_peercred_uid_gid(void) {
   return 1;
 }
 
+/* listen() on a SOCK_DGRAM socket must return EOPNOTSUPP, not EADDRINUSE.
+ * POSIX specifies EOPNOTSUPP for connection-oriented operations on connectionless
+ * sockets. Tests that the libyurt shim does not bleed its internal -1 → EADDRINUSE
+ * mapping into this case. */
+static int case_listen_dgram_eopnotsupp(void) {
+  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (fd < 0) { emit("listen_dgram_eopnotsupp", 1, NULL, 1, errno); return 1; }
+  errno = 0;
+  int rc = listen(fd, 1);
+  int saved_errno = errno;
+  close(fd);
+  if (rc == 0) {
+    emit("listen_dgram_eopnotsupp", 1, "listen-succeeded", 0, 0);
+    return 1;
+  }
+  if (saved_errno == EOPNOTSUPP) {
+    emit("listen_dgram_eopnotsupp", 0, "eopnotsupp=ok", 0, 0);
+    return 0;
+  }
+  emit("listen_dgram_eopnotsupp", 1, "wrong-errno", 1, saved_errno);
+  return 1;
+}
+
 /* If a dgram bind fails, the route must not leak.
  * Verify by: (1) create a regular file at the bind path, so createSocket
  * returns EEXIST and bind fails; (2) unlink the file; (3) bind a fresh
@@ -1000,6 +1016,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "dgram_sendto_after_unlink") == 0)  return case_dgram_sendto_after_unlink();
   if (strcmp(name, "scm_rights_truncation") == 0)      return case_scm_rights_truncation();
   if (strcmp(name, "dgram_bind_rollback") == 0)        return case_dgram_bind_rollback();
+  if (strcmp(name, "listen_dgram_eopnotsupp") == 0)   return case_listen_dgram_eopnotsupp();
   if (strcmp(name, "dgram_so_type") == 0)              return case_dgram_so_type();
   if (strcmp(name, "dgram_nonblocking_recv") == 0)     return case_dgram_nonblocking_recv();
   if (strcmp(name, "peercred_uid_gid") == 0)               return case_peercred_uid_gid();
@@ -1025,6 +1042,7 @@ static int list_cases(void) {
   puts("dgram_sendto_after_unlink");
   puts("scm_rights_truncation");
   puts("dgram_bind_rollback");
+  puts("listen_dgram_eopnotsupp");
   puts("dgram_so_type");
   puts("dgram_nonblocking_recv");
   puts("peercred_uid_gid");

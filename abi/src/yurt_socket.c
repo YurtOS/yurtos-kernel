@@ -462,7 +462,7 @@ static int yurt_sockname_impl(
   const char *host_field,
   const char *port_field
 ) {
-  int is_peer = (host_field[0] == 'p') ? 1 : 0;
+  int is_peer = (strcmp(kind, "peer") == 0) ? 1 : 0;
 
   /* Try typed AF_UNIX path first: avoids JSON for the common AF_UNIX case. */
   {
@@ -600,6 +600,9 @@ int listen(int sockfd, int backlog) {
   char resp[YURT_SOCKET_RESP_CAP];
   int req_len;
   int n;
+
+  /* SOCK_DGRAM sockets do not support listen(). */
+  if (yurt_host_socket_is_dgram(sockfd) == 1) { errno = EOPNOTSUPP; return -1; }
 
   /* Try typed AF_UNIX path first. */
   int r = yurt_host_socket_listen_unix(sockfd, backlog);
