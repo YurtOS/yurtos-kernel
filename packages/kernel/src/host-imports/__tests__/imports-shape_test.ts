@@ -14,11 +14,16 @@ import type { SocketBackend } from "../../network/socket-backend.ts";
 import { buildNativeSpawnRequest } from "./spawn-request-fixture.ts";
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 function writeString(memory: WebAssembly.Memory, ptr: number, value: string) {
   const bytes = encoder.encode(value);
   new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
   return bytes.length;
+}
+
+function readStringAt(memory: WebAssembly.Memory, ptr: number, len: number) {
+  return decoder.decode(new Uint8Array(memory.buffer, ptr, len));
 }
 
 function readWaitResult(memory: WebAssembly.Memory, ptr: number) {
@@ -1768,6 +1773,64 @@ Deno.test("host_poll probes sockets and preserves queued read bytes", () => {
     1,
   );
   assertEquals(readPollRevents(memory, 256), POLLIN | POLLOUT);
+  kernel.dispose();
+});
+
+Deno.test("host_poll socket probe bytes are returned by host_socket_recv", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  let queued = encoder.encode("xy");
+  const socketTarget: FdTarget & { type: "socket" } = {
+    type: "socket",
+    socket: 1,
+    refs: 1,
+    send: () => ({ ok: true, bytes_sent: 0 }),
+    recv: (_socket, maxBytes) => {
+      if (queued.byteLength === 0) return { ok: false, error: "EAGAIN" };
+      const data = queued.slice(0, maxBytes);
+      queued = queued.slice(data.byteLength);
+      return { ok: true, data };
+    },
+    recvAsync: () => Promise.resolve({ ok: false, error: "EAGAIN" }),
+    close: () => {},
+  };
+  kernel.setFdTarget(pid, 5, socketTarget);
+  writePollFd(memory, 256, 5, POLLIN);
+  const socketBackend: SocketBackend = {
+    connect: () => ({ ok: false, error: "unused" }),
+    send: () => ({ ok: false, error: "unused" }),
+    recv: () => {
+      throw new Error("peekBuffer recv should not call socket backend");
+    },
+    close: () => ({ ok: true }),
+    recvAsync: () => Promise.resolve({ ok: false, error: "unused" }),
+  };
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    socketBackend,
+  });
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 256), POLLIN);
+  assertEquals(socketTarget.peekBuffer, encoder.encode("x"));
+
+  const recvLen = (imports.host_socket_recv as (...args: number[]) => number)(
+    5,
+    512,
+    2,
+    0,
+  );
+
+  assertEquals(recvLen, 1);
+  assertEquals(readStringAt(memory, 512, recvLen), "x");
+  assertEquals(socketTarget.peekBuffer?.byteLength ?? 0, 0);
+  assertEquals(decoder.decode(queued), "y");
   kernel.dispose();
 });
 
