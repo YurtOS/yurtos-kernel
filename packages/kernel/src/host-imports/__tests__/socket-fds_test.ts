@@ -1141,61 +1141,38 @@ describe("socket fd host imports", () => {
       1,
       0,
     );
-    const bindLen = writeString(
-      memory,
-      16,
-      JSON.stringify({ fd, host: "127.0.0.1", port: 0 }),
-    );
+    const hostLen = writeString(memory, 16, "127.0.0.1");
     (imports.host_socket_bind as (...args: number[]) => number)(
+      fd,
       16,
-      bindLen,
-      256,
-      4096,
-    );
-    const listenLen = writeString(
-      memory,
-      16,
-      JSON.stringify({ fd, backlog: 1 }),
+      hostLen,
+      0,
     );
     (imports.host_socket_listen as (...args: number[]) => number)(
-      16,
-      listenLen,
-      256,
-      4096,
+      fd,
+      1,
     );
 
-    const localReqLen = writeString(
-      memory,
-      16,
-      JSON.stringify({ fd, kind: "local" }),
-    );
     const localLen =
       (imports.host_socket_addr as (...args: number[]) => number)(
-        16,
-        localReqLen,
+        fd,
+        0,
         512,
-        4096,
+        8,
       );
-    expect(readJson(memory, 512, localLen)).toMatchObject({
-      ok: true,
-      local_host: "127.0.0.1",
-      local_port: 51234,
+    expect(localLen).toBe(8);
+    expect(readSocketAddr(memory, 512)).toEqual({
+      host: "127.0.0.1",
+      port: 51234,
+      reserved: 0,
     });
 
-    const peerReqLen = writeString(
-      memory,
-      16,
-      JSON.stringify({ fd, kind: "peer" }),
-    );
     const peerLen = (imports.host_socket_addr as (...args: number[]) => number)(
-      16,
-      peerReqLen,
+      fd,
+      1,
       512,
-      4096,
+      8,
     );
-    expect(readJson(memory, 512, peerLen)).toMatchObject({
-      ok: false,
-      error: `socket not connected: ${fd}`,
-    });
+    expect(peerLen).toBe(-107);
   });
 });
