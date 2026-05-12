@@ -126,9 +126,11 @@ extern "C" {
 #define SO_TYPE 3
 #endif
 
-/* struct ucred — peer credentials returned by SO_PEERCRED. */
-#ifndef _HAVE_STRUCT_UCRED
+/* struct ucred — peer credentials returned by SO_PEERCRED.
+ * Guard against both our own and the WASI sysroot's guard symbol. */
+#if !defined(_HAVE_STRUCT_UCRED) && !defined(__ucred_defined)
 #define _HAVE_STRUCT_UCRED
+#define __ucred_defined
 struct ucred {
     pid_t pid;
     uid_t uid;
