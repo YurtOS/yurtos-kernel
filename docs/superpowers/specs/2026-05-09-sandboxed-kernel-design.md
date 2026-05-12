@@ -206,6 +206,13 @@ Initial exports:
   pid allocation time before returning a pending spawn to the KH adapter. The
   host receives argv for WASI instantiation, but it does not author `/proc`
   command metadata afterward.
+- `kernel_record_exit(pid, status) -> i64` — KH adapter notification that a
+  process instance has exited. It records the exit status in kernel-owned state
+  for later `kernel_wait` / user `sys_wait` reaping.
+- `kernel_drain_spawn(out_ptr, out_cap) -> i64` — typed host-control export for
+  draining kernel-staged user `sys_spawn` work. The response remains the binary
+  pending-spawn record: `u32 child_pid`, `u32 wasm_len`, wasm bytes, `u32 argc`,
+  then `(u32 arg_len + arg_bytes)*`.
 - `kernel_kill(pid, signal) -> i64` — apply signal/permission policy and route
   termination to the process instance through the host mechanism when needed. If
   the process record has an attached KH instance handle, kernel.wasm calls

@@ -904,7 +904,7 @@ fn register_child(request: &[u8]) -> i64 {
 /// `kernel_record_exit(pid, exit_status)`. Microkernel-only; marks
 /// `pid` as zombie with the given exit status. The next sys_wait
 /// from its parent will reap it.
-fn record_exit(request: &[u8]) -> i64 {
+pub fn record_exit(request: &[u8]) -> i64 {
     if request.len() < 8 {
         return -(abi::EINVAL as i64);
     }
@@ -1559,7 +1559,7 @@ fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
 /// host. Wire format: u32 child_pid + u32 wasm_len + wasm_bytes +
 /// u32 argc + (u32 arg_len + arg_bytes)*. Returns -ENOENT when
 /// the queue is empty.
-fn drain_spawn(response: &mut [u8]) -> i64 {
+pub fn drain_spawn(response: &mut [u8]) -> i64 {
     with_kernel(|k| {
         let Some(spawn) = k.drain_spawn() else {
             return -(abi::ENOENT as i64);

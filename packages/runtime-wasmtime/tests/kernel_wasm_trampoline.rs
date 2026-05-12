@@ -122,8 +122,10 @@ fn kernel_wasm_export_surface_is_locked() {
         exports,
         vec![
             "kernel_dispatch",
+            "kernel_drain_spawn",
             "kernel_kill",
             "kernel_list_processes",
+            "kernel_record_exit",
             "kernel_scratch_len",
             "kernel_scratch_ptr",
             "kernel_spawn_process",

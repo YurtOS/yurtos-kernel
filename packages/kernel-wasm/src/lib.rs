@@ -144,6 +144,39 @@ pub unsafe extern "C" fn kernel_wait(
     dispatch::wait_response(caller_pid, &request, response)
 }
 
+/// Host-control export: record process exit status in kernel-owned state.
+///
+/// This is the KH adapter notification used after a process instance returns
+/// or traps with an exit status. The next kernel-owned wait can reap it.
+///
+/// # Safety
+///
+/// No pointer arguments. Marked unsafe to keep the exported host-control API
+/// uniform with the other raw C ABI entry points.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_record_exit(pid: u32, exit_status: i32) -> i64 {
+    let mut request = [0u8; 8];
+    request[0..4].copy_from_slice(&pid.to_le_bytes());
+    request[4..8].copy_from_slice(&exit_status.to_le_bytes());
+    dispatch::record_exit(&request)
+}
+
+/// Host-control export: drain the next kernel-staged user `sys_spawn`.
+///
+/// # Safety
+///
+/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid writable
+/// range in this kernel instance's linear memory.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_drain_spawn(out_ptr: *mut u8, out_cap: usize) -> i64 {
+    let response = if out_ptr.is_null() || out_cap == 0 {
+        &mut [][..]
+    } else {
+        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    };
+    dispatch::drain_spawn(response)
+}
+
 /// Host-control export: ask the kernel to spawn a cached process module.
 ///
 /// The module id names a wasm module already cached in the KH adapter. The
@@ -221,12 +254,7 @@ mod tests {
             0
         );
 
-        let mut exit = 7_u32.to_le_bytes().to_vec();
-        exit.extend_from_slice(&23_i32.to_le_bytes());
-        assert_eq!(
-            dispatch::dispatch(dispatch::METHOD_KERNEL_RECORD_EXIT, 0, &exit, &mut []),
-            0
-        );
+        assert_eq!(unsafe { kernel_record_exit(7, 23) }, 0);
 
         let mut out = [0u8; 8];
         let rc = unsafe { kernel_wait(1, 0, 0, out.as_mut_ptr(), out.len()) };

@@ -114,8 +114,6 @@ const METHOD_KERNEL_DRAIN_STDERR: u32 = 7;
 const METHOD_KERNEL_REGISTER_FILE: u32 = 8;
 const METHOD_KERNEL_INSTALL_HOST_FS_MOUNT: u32 = 11;
 const METHOD_KERNEL_INSTALL_YURTFS: u32 = 12;
-const METHOD_KERNEL_RECORD_EXIT: u32 = 14;
-const METHOD_KERNEL_DRAIN_SPAWN: u32 = 15;
 
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
@@ -1303,6 +1301,8 @@ pub struct KernelInstance {
     pub(crate) list_processes: TypedFunc<(u32, u32), i64>,
     pub(crate) kill: TypedFunc<(u32, u32), i64>,
     pub(crate) wait: TypedFunc<(u32, u32, u32, u32, u32), i64>,
+    pub(crate) record_exit: TypedFunc<(u32, i32), i64>,
+    pub(crate) drain_spawn: TypedFunc<(u32, u32), i64>,
     pub(crate) spawn_process: TypedFunc<(u32, u32, u32, u32, u32), i64>,
 }
 
@@ -1405,6 +1405,43 @@ impl KernelInstance {
             pid: u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")),
             status: i32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes")),
         })
+    }
+
+    pub fn record_exit(&mut self, pid: u32, exit_status: i32) -> Result<i64> {
+        self.record_exit
+            .call(&mut self.store, (pid, exit_status))
+            .context("kernel_record_exit")
+    }
+
+    pub fn drain_spawn(&mut self, response: &mut [u8]) -> Result<i64> {
+        if response.len() > self.scratch_len as usize {
+            anyhow::bail!(
+                "drain_spawn response cap ({}) exceeds scratch capacity ({})",
+                response.len(),
+                self.scratch_len
+            );
+        }
+        let rc = self
+            .drain_spawn
+            .call(&mut self.store, (self.scratch_ptr, response.len() as u32))
+            .context("kernel_drain_spawn")?;
+        if rc > 0 {
+            let used = rc as usize;
+            if used > response.len() {
+                anyhow::bail!(
+                    "kernel_drain_spawn wrote beyond response cap: used={used} cap={}",
+                    response.len()
+                );
+            }
+            self.memory
+                .read(
+                    &self.store,
+                    self.scratch_ptr as usize,
+                    &mut response[..used],
+                )
+                .context("read kernel pending spawn")?;
+        }
+        Ok(rc)
     }
 
     pub fn spawn_process(&mut self, parent_pid: u32, module_id: &[u8], argv: &[u8]) -> Result<i64> {
@@ -1576,6 +1613,10 @@ impl Microkernel {
         let kill = instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_kill")?;
         let wait =
             instance.get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_wait")?;
+        let record_exit =
+            instance.get_typed_func::<(u32, i32), i64>(&mut store, "kernel_record_exit")?;
+        let drain_spawn =
+            instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_drain_spawn")?;
         let spawn_process = instance
             .get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_spawn_process")?;
 
@@ -1588,6 +1629,8 @@ impl Microkernel {
             list_processes,
             kill,
             wait,
+            record_exit,
+            drain_spawn,
             spawn_process,
         };
         Ok(Self {
@@ -1735,10 +1778,7 @@ impl Microkernel {
     /// this after a `UserProcess::run_start` returns (extracting
     /// the exit code from the proc_exit trap).
     pub fn record_exit(&self, pid: u32, exit_status: i32) -> Result<()> {
-        let mut req = Vec::with_capacity(8);
-        req.extend_from_slice(&pid.to_le_bytes());
-        req.extend_from_slice(&exit_status.to_le_bytes());
-        let rc = self.syscall(METHOD_KERNEL_RECORD_EXIT, &req, &mut [])?;
+        let rc = self.kernel.lock().unwrap().record_exit(pid, exit_status)?;
         if rc != 0 {
             anyhow::bail!("kernel_record_exit failed: rc={rc}");
         }
@@ -1757,7 +1797,7 @@ impl Microkernel {
         // a chunked transfer if/when individual children grow
         // beyond this.
         let mut buf = vec![0u8; 768 * 1024];
-        let rc = self.syscall(METHOD_KERNEL_DRAIN_SPAWN, &[], &mut buf)?;
+        let rc = self.kernel.lock().unwrap().drain_spawn(&mut buf)?;
         if rc == -2 {
             return Ok(None); // -ENOENT: queue empty
         }
