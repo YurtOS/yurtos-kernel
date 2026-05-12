@@ -221,28 +221,6 @@ function writeWaitResult(
   return required;
 }
 
-function legacyWaitStatus(exitCode: number): number {
-  if (exitCode < 0) return 0;
-  if (exitCode === 124) return 9;
-  return (exitCode & 0xff) << 8;
-}
-
-function writeLegacyWaitStatus(
-  memory: WebAssembly.Memory,
-  statusPtr: number,
-  exitCode: number,
-): number {
-  if (statusPtr === 0) return 0;
-  const end = statusPtr + 4;
-  if (statusPtr < 0 || end > memory.buffer.byteLength) return ERR_IO;
-  new DataView(memory.buffer).setInt32(
-    statusPtr,
-    legacyWaitStatus(exitCode),
-    true,
-  );
-  return 0;
-}
-
 function writeSpawnResult(
   memory: WebAssembly.Memory,
   ptr: number,
@@ -406,6 +384,7 @@ function pollReventsForTarget(target: FdTarget, events: number): number {
       if (target.state.masterClosed) revents |= POLLHUP;
       break;
     case "buffer":
+      // Buffer targets are write-only stdout/stderr captures.
       if (wantsWrite) revents |= POLLOUT;
       break;
     case "static":
@@ -413,8 +392,18 @@ function pollReventsForTarget(target: FdTarget, events: number): number {
         revents |= POLLIN;
       }
       break;
-    case "null":
     case "socket":
+      if (
+        wantsRead &&
+        ((target.peekBuffer?.byteLength ?? 0) > 0 || target.readShutdown)
+      ) {
+        revents |= POLLIN;
+      }
+      if (wantsWrite && target.socket !== null && !target.writeShutdown) {
+        revents |= POLLOUT;
+      }
+      break;
+    case "null":
     case "vfs_file":
     case "vfs_dir":
       if (wantsRead) revents |= POLLIN;
@@ -865,23 +854,6 @@ export function createKernelImports(
       if (bytes[i] !== 0) return ERR_INVALID;
     }
     return 0;
-  }
-
-  function bytesToBase64(data: Uint8Array): string {
-    let binary = "";
-    for (let i = 0; i < data.byteLength; i++) {
-      binary += String.fromCharCode(data[i]);
-    }
-    return btoa(binary);
-  }
-
-  function base64ToBytes(value: string): Uint8Array {
-    const binary = atob(value);
-    const out = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      out[i] = binary.charCodeAt(i);
-    }
-    return out;
   }
 
   function concatBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
@@ -1693,76 +1665,6 @@ export function createKernelImports(
       })();
     },
 
-    host_waitpid_nohang(
-      pid: number,
-      statusPtr: number,
-      _options: number,
-    ): number {
-      if (!opts.kernel) return ERR_CHILD;
-      opts.wasiHost?.drainPendingSignals();
-      if (pid <= 0) {
-        const result = opts.kernel.waitAnyChildNohang(callerPid);
-        if (result.state === "running") return 0;
-        if (result.state === "none") return ERR_CHILD;
-        const writeErr = writeLegacyWaitStatus(
-          memory,
-          statusPtr,
-          result.exitCode,
-        );
-        return writeErr < 0 ? writeErr : result.pid;
-      }
-      const exitCode = opts.kernel.waitpidNohang(pid, callerPid);
-      if (exitCode === -1) return 0;
-      if (exitCode < 0) return ERR_CHILD;
-      const writeErr = writeLegacyWaitStatus(memory, statusPtr, exitCode);
-      return writeErr < 0 ? writeErr : pid;
-    },
-
-    host_waitpid(
-      pid: number,
-      statusPtr: number,
-      _options: number,
-    ): Promise<number> | number {
-      if (!opts.kernel) return ERR_CHILD;
-      const kernel = opts.kernel;
-      return (async () => {
-        await yieldToScheduler();
-        opts.wasiHost?.drainPendingSignals();
-        const signalWait = opts.wasiHost?.waitForSignalDelivery();
-        const interrupt = signalWait?.promise ?? new Promise<void>(() => {});
-        if (pid <= 0) {
-          const waited = await kernel.waitAnyChildInterruptible(
-            callerPid,
-            interrupt,
-          );
-          signalWait?.cancel();
-          if (waited.interrupted) return ERR_INTERRUPTED;
-          const result = waited.result;
-          if (!result) return ERR_CHILD;
-          const writeErr = writeLegacyWaitStatus(
-            memory,
-            statusPtr,
-            result.exitCode,
-          );
-          return writeErr < 0 ? writeErr : result.pid;
-        }
-        const waited = await kernel.waitpidInterruptible(
-          pid,
-          callerPid,
-          interrupt,
-        );
-        signalWait?.cancel();
-        if (waited.interrupted) return ERR_INTERRUPTED;
-        if (waited.exitCode < 0) return ERR_CHILD;
-        const writeErr = writeLegacyWaitStatus(
-          memory,
-          statusPtr,
-          waited.exitCode,
-        );
-        return writeErr < 0 ? writeErr : pid;
-      })();
-    },
-
     // host_close_fd(fd) -> i32
     // Closes a file descriptor in the caller's fd table.
     host_close_fd(fd: number): number {
@@ -2467,93 +2369,68 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_send(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // Sends data on an open socket.
-    // Request JSON: { fd, data_b64 }
-    // Response JSON: { ok, bytes_sent } or { ok: false, error }
+    // host_socket_send(fd, data_ptr, data_len) -> i32
+    // Sends raw bytes from WASM linear memory on an open socket.
     host_socket_send(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      fd: number,
+      dataPtr: number,
+      dataLen: number,
     ): number {
-      if (!socketBackend) {
-        return writeJson(memory, outPtr, outCap, {
-          ok: false,
-          error: "networking not configured",
-        });
-      }
+      if (!socketBackend) return ERR_IO;
+      if (dataLen < 0 || dataPtr < 0) return ERR_INVALID;
+      const end = dataPtr + dataLen;
+      if (end > memory.buffer.byteLength) return ERR_IO;
       try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
-        }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
         if (!target || target.type !== "socket" || target.socket === null) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a connected socket fd: ${req.fd}`,
-          });
+          return ERR_NOT_FOUND;
         }
-        const result = socketBackend.send(target.socket, req.data_b64);
-        return writeJson(memory, outPtr, outCap, result);
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+        const data = readBytes(memory, dataPtr, dataLen);
+        const result = socketBackend.send(target.socket, data);
+        if (!result.ok) return ERR_IO;
+        return result.bytes_sent ?? data.byteLength;
+      } catch {
+        return ERR_IO;
       }
     },
 
-    // host_socket_recv(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // Receives data from an open socket. Returns synchronously for
+    // host_socket_recv(fd, out_ptr, out_cap, flags) -> i32
+    // Receives raw bytes into WASM linear memory. Returns synchronously for
     // peek-with-buffer and nonblocking reads; returns a Promise for
     // blocking reads, so backends with recvAsync (loopback, browser
     // registry) suspend the host import via JSPI/Asyncify until at
     // least one byte (or EOF) arrives.
-    // Request JSON: { fd, max_bytes }
-    // Response JSON: { ok, data_b64 } or { ok: false, error }
     host_socket_recv(
-      reqPtr: number,
-      reqLen: number,
+      fd: number,
       outPtr: number,
       outCap: number,
+      flags: number,
     ): number | Promise<number> {
-      if (!socketBackend) {
-        return writeJson(memory, outPtr, outCap, {
-          ok: false,
-          error: "networking not configured",
-        });
-      }
+      if (!socketBackend) return ERR_IO;
+      if (outCap < 0 || outPtr < 0) return ERR_INVALID;
+      const end = outPtr + outCap;
+      if (end > memory.buffer.byteLength) return ERR_IO;
+      const MSG_PEEK = 0x02;
+      if (flags !== 0 && flags !== MSG_PEEK) return ERR_UNSUPPORTED;
       try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
-        }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
         if (!target || target.type !== "socket" || target.socket === null) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a connected socket fd: ${req.fd}`,
-          });
+          return ERR_NOT_FOUND;
         }
-        const maxBytes = req.max_bytes ?? 65536;
-        const peek = req.peek === true;
+        const maxBytes = outCap;
+        const peek = flags === MSG_PEEK;
         const nonblocking =
           ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+        const writeSocketBytes = (data: Uint8Array): number => {
+          const chunk = data.slice(0, maxBytes);
+          return writeBytes(memory, outPtr, maxBytes, chunk);
+        };
         if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
           const chunk = target.peekBuffer.slice(0, maxBytes);
           if (!peek) {
             target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
           }
-          return writeJson(memory, outPtr, outCap, {
-            ok: true,
-            data_b64: bytesToBase64(chunk),
-          });
+          return writeSocketBytes(chunk);
         }
         // peekBuffer is empty.
         if (peek) {
@@ -2568,16 +2445,13 @@ export function createKernelImports(
             nonblocking: true,
           });
           if (probe.ok) {
-            const data = base64ToBytes(probe.data_b64 ?? "");
+            const data = probe.data ?? new Uint8Array(0);
             target.peekBuffer = target.peekBuffer
               ? concatBytes(target.peekBuffer, data)
               : data;
-            return writeJson(memory, outPtr, outCap, {
-              ok: true,
-              data_b64: bytesToBase64(data),
-            });
+            return writeSocketBytes(data);
           }
-          return writeJson(memory, outPtr, outCap, probe);
+          return probe.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
         }
         if (nonblocking) {
           // Poll the backend with the nonblocking flag. The backend either
@@ -2586,14 +2460,15 @@ export function createKernelImports(
           const probe = socketBackend.recv(target.socket, maxBytes, {
             nonblocking: true,
           });
-          return writeJson(memory, outPtr, outCap, probe);
+          if (!probe.ok) return probe.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+          return writeSocketBytes(probe.data ?? new Uint8Array(0));
         }
-        return target.recvAsync(target.socket, maxBytes).then((result) =>
-          writeJson(memory, outPtr, outCap, result)
-        );
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+        return target.recvAsync(target.socket, maxBytes).then((result) => {
+          if (!result.ok) return result.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+          return writeSocketBytes(result.data ?? new Uint8Array(0));
+        });
+      } catch {
+        return ERR_IO;
       }
     },
 

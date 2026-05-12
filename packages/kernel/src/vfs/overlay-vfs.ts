@@ -168,7 +168,10 @@ export class OverlayVFS implements VfsLike {
     this.ensureUpperParentDirectory(path);
     const writeUpper = () => {
       this.options.upper.writeFile(path, data, mode);
-      if (createsUpperEntry && !this.privileged && this.options.upper.chown) {
+      if (
+        createsUpperEntry && !shouldCopyUpMetadata && !this.privileged &&
+        this.options.upper.chown
+      ) {
         this.options.upper.chown(
           path,
           this.credential.uid,

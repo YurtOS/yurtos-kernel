@@ -222,23 +222,6 @@ export interface WasiHostForkSnapshot {
   nextDirFdCounter: number;
 }
 
-function bytesToBase64(data: Uint8Array): string {
-  let binary = "";
-  for (let i = 0; i < data.byteLength; i++) {
-    binary += String.fromCharCode(data[i]);
-  }
-  return btoa(binary);
-}
-
-function base64ToBytes(value: string): Uint8Array {
-  const binary = atob(value);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    out[i] = binary.charCodeAt(i);
-  }
-  return out;
-}
-
 /**
  * Decode an iovec array from Wasm linear memory.
  * Each iovec is 8 bytes: u32 buf_ptr + u32 buf_len.
@@ -1079,7 +1062,7 @@ export class WasiHost {
               this.deliverSigpipe();
               return WASI_EPIPE;
             }
-            const result = target.send(target.socket, bytesToBase64(data));
+            const result = target.send(target.socket, data);
             if (!result.ok) return WASI_EIO;
             totalWritten += result.bytes_sent ?? data.byteLength;
             break;
@@ -1282,9 +1265,7 @@ export class WasiHost {
               if (!result.ok) {
                 return result.error === "EAGAIN" ? WASI_EAGAIN : WASI_EIO;
               }
-              const data = result.data_b64 !== undefined
-                ? base64ToBytes(result.data_b64)
-                : this.encoder.encode(result.data ?? "");
+              const data = result.data ?? new Uint8Array(0);
               const toRead = Math.min(iov.len, data.byteLength);
               if (toRead > 0) {
                 const bytes = this.getBytes();
@@ -1361,9 +1342,7 @@ export class WasiHost {
     if (!result.ok) {
       return result.error === "EAGAIN" ? WASI_EAGAIN : WASI_EIO;
     }
-    const data = result.data_b64 !== undefined
-      ? base64ToBytes(result.data_b64)
-      : this.encoder.encode(result.data ?? "");
+    const data = result.data ?? new Uint8Array(0);
     const toRead = Math.min(iov.len, data.byteLength);
     if (toRead > 0) {
       const bytes = this.getBytes();

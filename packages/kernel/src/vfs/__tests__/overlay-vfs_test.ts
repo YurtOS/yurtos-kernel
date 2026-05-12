@@ -82,6 +82,23 @@ describe("OverlayVFS", () => {
     expect(dec.decode(upper.readFile("/opt/base/readme.txt"))).toBe("upper");
   });
 
+  it("preserves lower owner when group-writable files copy up", () => {
+    const base = new MemoryRoot();
+    base.addFile("/opt/shared/data.txt", "base", {
+      uid: 2000,
+      gid: 1000,
+      permissions: 0o660,
+    });
+    const upper = new VFS({ layout: "empty" });
+    const vfs = new OverlayVFS({ base, upper });
+
+    vfs.writeFile("/opt/shared/data.txt", enc.encode("upper"));
+
+    expect(dec.decode(upper.readFile("/opt/shared/data.txt"))).toBe("upper");
+    expect(upper.stat("/opt/shared/data.txt").uid).toBe(2000);
+    expect(upper.stat("/opt/shared/data.txt").gid).toBe(1000);
+  });
+
   it("materializes base parent directories in upper using setup authority", () => {
     const base = new MemoryRoot();
     base.addDir("/opt/base", { uid: 1000, gid: 1000, permissions: 0o755 });

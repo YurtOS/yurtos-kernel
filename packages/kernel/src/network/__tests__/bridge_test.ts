@@ -6,6 +6,10 @@ import { createNetworkBridgeSocketBackend } from "../socket-backend.js";
 import { type ChildProcess, spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
 
+function encode(value: string): Uint8Array {
+  return new TextEncoder().encode(value);
+}
+
 /**
  * These tests spin up an HTTP server in a CHILD PROCESS so that
  * the Worker's real fetch() can hit a controlled endpoint without
@@ -233,21 +237,21 @@ describe(
       expect(accepted.ok).toBe(true);
       if (!accepted.ok) throw new Error(accepted.error);
 
-      expect(backend.send(client.socket, btoa("ping"))).toEqual({
+      expect(backend.send(client.socket, encode("ping"))).toEqual({
         ok: true,
         bytes_sent: 4,
       });
       expect(backend.recv(accepted.socket, 4)).toEqual({
         ok: true,
-        data_b64: btoa("ping"),
+        data: encode("ping"),
       });
-      expect(backend.send(accepted.socket, btoa("pong"))).toEqual({
+      expect(backend.send(accepted.socket, encode("pong"))).toEqual({
         ok: true,
         bytes_sent: 4,
       });
       expect(backend.recv(client.socket, 4)).toEqual({
         ok: true,
-        data_b64: btoa("pong"),
+        data: encode("pong"),
       });
 
       backend.close(client.socket);
@@ -325,7 +329,6 @@ describe(
       const r = await acceptPromise;
       expect(r.ok).toBe(false);
     });
-
 
     it("binds mapped 0.0.0.0 sandbox listeners to configured host port", async () => {
       const gateway = new NetworkGateway({

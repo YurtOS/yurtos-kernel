@@ -50,7 +50,7 @@ export type FdTarget =
     fdFlags?: number;
     readShutdown?: boolean;
     writeShutdown?: boolean;
-    send: (socket: SocketHandle, dataB64: string) => SocketBackendResult;
+    send: (socket: SocketHandle, data: Uint8Array) => SocketBackendResult;
     recv: (
       socket: SocketHandle,
       maxBytes: number,

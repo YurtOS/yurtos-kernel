@@ -36,7 +36,7 @@ int munmap(void *addr, size_t len) {
   YURT_MARKER_CALL(munmap);
   (void)addr;
   (void)len;
-  errno = EINVAL;
+  errno = ENOSYS;
   return -1;
 }
 

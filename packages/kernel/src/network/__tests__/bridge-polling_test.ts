@@ -7,6 +7,10 @@ import { createNetworkBridgeSocketBackend } from "../socket-backend.js";
 // SAB worker is mocked so we can assert termination conditions without
 // the timing fragility of real Node streams in the bridge worker.
 
+function encode(value: string): Uint8Array {
+  return new TextEncoder().encode(value);
+}
+
 // deno-lint-ignore no-explicit-any
 function mockBridge(responses: Array<Record<string, unknown>>): any {
   const queue = [...responses];
@@ -28,11 +32,11 @@ describe("createNetworkBridgeSocketBackend polling", () => {
     const bridge = mockBridge([
       { ok: false, error: "EAGAIN" },
       { ok: false, error: "EAGAIN" },
-      { ok: true, data_b64: "cG9uZw==" }, // "pong"
+      { ok: true, data: Array.from(encode("pong")) },
     ]);
     const backend = createNetworkBridgeSocketBackend(bridge);
     const r = await backend.recvAsync!(1, 64);
-    expect(r).toEqual({ ok: true, data_b64: "cG9uZw==" });
+    expect(r).toEqual({ ok: true, data: encode("pong") });
   });
 
   it("recvAsync exits with EOF (ok+empty) on peer close", async () => {

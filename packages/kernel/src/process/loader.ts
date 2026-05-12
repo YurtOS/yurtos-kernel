@@ -194,7 +194,6 @@ export async function loadProcess(
     [
       "host_wait",
       "host_poll",
-      "host_waitpid",
       "host_kill",
       "host_killpg",
       "host_yield",
@@ -348,7 +347,6 @@ export async function loadProcess(
         [
           "host_wait",
           "host_poll",
-          "host_waitpid",
           "host_kill",
           "host_killpg",
           "host_yield",

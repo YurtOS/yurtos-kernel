@@ -189,10 +189,10 @@ __attribute__((import_module("yurt"), import_name("host_socket_accept")))
 int yurt_host_socket_accept(int req_ptr, int req_len, int out_ptr, int out_cap);
 
 __attribute__((import_module("yurt"), import_name("host_socket_send")))
-int yurt_host_socket_send(int req_ptr, int req_len, int out_ptr, int out_cap);
+int yurt_host_socket_send(int fd, int data_ptr, int data_len);
 
 __attribute__((import_module("yurt"), import_name("host_socket_recv")))
-int yurt_host_socket_recv(int req_ptr, int req_len, int out_ptr, int out_cap);
+int yurt_host_socket_recv(int fd, int out_ptr, int out_cap, int flags);
 
 __attribute__((import_module("yurt"), import_name("host_socket_addr")))
 int yurt_host_socket_addr(int req_ptr, int req_len, int out_ptr, int out_cap);

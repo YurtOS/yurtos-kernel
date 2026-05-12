@@ -413,6 +413,15 @@ Deno.test("kernel host_wait returns ECHILD for wait-any when no children remain"
   kernel.dispose();
 });
 
+Deno.test("kernel host imports do not expose legacy waitpid entry points", () => {
+  const imports = createKernelImports({
+    memory: new WebAssembly.Memory({ initial: 1 }),
+  });
+
+  assertEquals("host_waitpid" in imports, false);
+  assertEquals("host_waitpid_nohang" in imports, false);
+});
+
 Deno.test("kernel host_get_local_addr reports configured sandbox address", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const imports = createKernelImports({
@@ -1721,5 +1730,37 @@ Deno.test("host_poll reports pipe readiness, capacity, and hangup", () => {
     1,
   );
   assertEquals(readPollRevents(memory, 128), POLLHUP);
+  kernel.dispose();
+});
+
+Deno.test("host_poll only reports socket read readiness for peeked data", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  const socketTarget: FdTarget & { type: "socket" } = {
+    type: "socket",
+    socket: 1,
+    refs: 1,
+    send: () => ({ ok: true, bytes_sent: 0 }),
+    recv: () => ({ ok: false, error: "EAGAIN" }),
+    recvAsync: () => Promise.resolve({ ok: false, error: "EAGAIN" }),
+    close: () => {},
+  };
+  kernel.setFdTarget(pid, 5, socketTarget);
+  writePollFd(memory, 256, 5, POLLIN | POLLOUT);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 256), POLLOUT);
+
+  socketTarget.peekBuffer = encoder.encode("x");
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 256), POLLIN | POLLOUT);
   kernel.dispose();
 });

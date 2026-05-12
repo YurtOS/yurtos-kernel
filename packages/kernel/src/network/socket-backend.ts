@@ -41,7 +41,7 @@ export interface SocketListenPolicy {
 }
 
 export type SocketBackendResult =
-  | { ok: true; data?: string; bytes_sent?: number; data_b64?: string }
+  | { ok: true; data?: Uint8Array; bytes_sent?: number }
   | { ok: false; error: string };
 
 export type SocketListenBackendResult =
@@ -76,7 +76,7 @@ export interface SocketBackend {
       localPort?: number;
     }
     | { ok: false; error: string };
-  send(socket: SocketHandle, dataB64: string): SocketBackendResult;
+  send(socket: SocketHandle, data: Uint8Array): SocketBackendResult;
   recv(
     socket: SocketHandle,
     maxBytes: number,
@@ -145,12 +145,13 @@ function socketResult(
   if (result.ok) {
     const ok: {
       ok: true;
-      data?: string;
+      data?: Uint8Array;
       bytes_sent?: number;
-      data_b64?: string;
     } = { ok: true };
-    if (typeof result.data === "string") ok.data = result.data;
-    if (typeof result.data_b64 === "string") ok.data_b64 = result.data_b64;
+    if (result.data instanceof Uint8Array) ok.data = result.data;
+    if (Array.isArray(result.data)) {
+      ok.data = Uint8Array.from(result.data as number[]);
+    }
     if (typeof result.bytes_sent === "number") {
       ok.bytes_sent = result.bytes_sent;
     }
@@ -206,21 +207,6 @@ export function createLoopbackSocketBackend(
   const pub = (h: number) => -h;
   const reg = pub;
 
-  function bytesToBase64(data: Uint8Array): string {
-    if (data.byteLength === 0) return "";
-    let binary = "";
-    for (const byte of data) binary += String.fromCharCode(byte);
-    return btoa(binary);
-  }
-
-  function base64ToBytes(value: string): Uint8Array {
-    if (value === "") return new Uint8Array(0);
-    const binary = atob(value);
-    const out = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-    return out;
-  }
-
   function publishAccepted(a: AcceptedConnection): SocketAcceptBackendResult {
     return {
       ok: true,
@@ -250,14 +236,14 @@ export function createLoopbackSocketBackend(
       return delegate?.connect(req) ?? { ok: false, error: r.error };
     },
 
-    send(socket, dataB64) {
+    send(socket, data) {
       if (isLocal(socket)) {
-        const r = registry.send(reg(socket), base64ToBytes(dataB64));
+        const r = registry.send(reg(socket), data);
         return r.ok
           ? { ok: true, bytes_sent: r.bytesSent }
           : { ok: false, error: r.error };
       }
-      return delegate?.send(socket, dataB64) ??
+      return delegate?.send(socket, data) ??
         { ok: false, error: "send: invalid socket" };
     },
 
@@ -266,7 +252,7 @@ export function createLoopbackSocketBackend(
         const r = registry.recv(reg(socket), maxBytes, {
           nonblocking: true,
         });
-        if (r.ok) return { ok: true, data_b64: bytesToBase64(r.bytes) };
+        if (r.ok) return { ok: true, data: r.bytes };
         return { ok: false, error: r.error };
       }
       return delegate?.recv(socket, maxBytes, opts) ??
@@ -277,7 +263,7 @@ export function createLoopbackSocketBackend(
       if (isLocal(socket)) {
         const r = await registry.recvAsync(reg(socket), maxBytes);
         return r.ok
-          ? { ok: true, data_b64: bytesToBase64(r.bytes) }
+          ? { ok: true, data: r.bytes }
           : { ok: false, error: r.error };
       }
       if (!delegate) return { ok: false, error: "recv: invalid socket" };
@@ -390,11 +376,11 @@ export function createNetworkBridgeSocketBackend(
       };
     },
 
-    send(socket, dataB64) {
+    send(socket, data) {
       return socketResult(bridge.requestSync({
         op: "send",
         socket_id: socket,
-        data_b64: dataB64,
+        data: Array.from(data),
       }));
     },
 
