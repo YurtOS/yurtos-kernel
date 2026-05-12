@@ -615,7 +615,7 @@ static int case_select_regular_fd(void) {
 
   errno = 0;
   int rc = select(fd + 1, &readfds, &writefds, NULL, &timeout);
-  if (rc != 1 || !FD_ISSET(fd, &readfds) || !FD_ISSET(fd, &writefds)) {
+  if (rc != 2 || !FD_ISSET(fd, &readfds) || !FD_ISSET(fd, &writefds)) {
     char out[128];
     snprintf(out, sizeof(out), "select_regular_fd:bad:%d:%d:%d", rc, FD_ISSET(fd, &readfds), FD_ISSET(fd, &writefds));
     close(fd);
