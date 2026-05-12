@@ -29,7 +29,7 @@ Switching the wire format to FlatBuffers buys:
 - Rip-and-replace migration: no JSON code path retained, no version bump (the ABI is still being finalized; current consumers are internal).
 - Delete `host_native_invoke` outright. It's Python-bridge legacy; a purpose-built replacement will land with the CPython port.
 - **Normalize every non-scalar host import onto the standard `(req_ptr, req_len, out_ptr, out_cap) -> i32` calling convention.** Several calls today have non-standard shapes — `host_spawn` has a two-ABI split (the generic `(req_ptr, req_len) -> pid` form and the legacy 4-arg shell-test form); `host_socket_close` is `(req_ptr, req_len) -> i32` with no out buffer; the path-based mutating calls (`host_chmod`, `host_chdir`, `host_mkdir`, `host_remove`, `host_rename`, `host_symlink`, `host_register_tool`, `host_write_fd`, `host_write_file`, `host_write_result`) take raw `(path_ptr, path_len, …)` args and return scalars without a response buffer. All of these gain a 4-arg form with an FB response. See "Calling convention" below for the blast-radius list.
-- Update `test-fixtures/shell-exec/src/main.rs` and regenerate `bash.wasm` / `bash-asyncify.wasm` to consume/produce FlatBuffer payloads on the PID-1 protocol.
+- Update `test-fixtures/shell-exec/src/main.rs` and regenerate `yurt-shell-exec.wasm` / `yurt-shell-exec-asyncify.wasm` to consume/produce FlatBuffer payloads on the boot-runner protocol.
 - CI drift check that the committed generated artifacts match the schema.
 
 ### Out of scope
@@ -542,7 +542,7 @@ Existing `abi/conformance/c/` canaries call high-level C ABI functions such as `
 
 ### Layer 5 — Resident PID-1 fixture validation
 
-`test-fixtures/shell-exec/src/main.rs` is updated so `__set_env` and `__run_command` consume FB requests and produce FB responses. Rust unit tests for the round-trip. Existing kernel tests that drive these exports (e.g., the env-propagation cases introduced by PR #7) get switched to FB request construction. Two regenerated `.wasm` fixtures (`bash.wasm`, `bash-asyncify.wasm`) land in the same commit as the source change — same discipline as PR #7.
+`test-fixtures/shell-exec/src/main.rs` is updated so `__set_env` and `__run_command` consume FB requests and produce FB responses. Rust unit tests for the round-trip. Existing kernel tests that drive these exports (e.g., the env-propagation cases introduced by PR #7) get switched to FB request construction. Two regenerated `.wasm` fixtures (`yurt-shell-exec.wasm`, `yurt-shell-exec-asyncify.wasm`) land in the same commit as the source change — same discipline as PR #7.
 
 ### Layer 6 — Drift check
 
@@ -557,7 +557,7 @@ The full `deno test` over `packages/kernel` is the integration backstop. Pass cr
 - [ ] `cargo test -p yurt-abi-fb` green (Layers 1–2).
 - [ ] `cd abi && make canaries` green; new fetch-binary, spawn-large-env, socket-recv-binary canaries land.
 - [ ] `deno task test` over `packages/kernel` green (Layer 3, 7).
-- [ ] `bash.wasm` + `bash-asyncify.wasm` regenerated and committed; `__set_env` / `__run_command` tests pass.
+- [ ] `yurt-shell-exec.wasm` + `yurt-shell-exec-asyncify.wasm` regenerated and committed; `__set_env` / `__run_command` tests pass.
 - [ ] CI `abi-fb-drift` job green.
 - [ ] Manual: REPL `cli.ts -c 'echo hello'` still produces `hello` (smoke).
 
@@ -581,7 +581,7 @@ Single PR delivers the entire cutover on a worktree:
 6. Apply the **ABI-shape changes** from the table in "Calling convention" — every import in that table moves to `(req_ptr, req_len, out_ptr, out_cap) -> i32`. Update every C call site, the corresponding `kernel-imports.ts` handler, and any direct callers in the kernel/test surface.
 7. Apply the **wait-family fold** — replace `host_waitpid`, `host_waitpid_nohang`, `host_wait_any`, `host_wait_any_nohang` with a single `host_wait` and migrate all callers (C shims under `abi/src/yurt_process.c`, TS handlers in `kernel-imports.ts`, any test surface).
 8. Delete `host_native_invoke` end-to-end.
-9. Update `test-fixtures/shell-exec/src/main.rs`; regenerate `bash.wasm` and `bash-asyncify.wasm`.
+9. Update `test-fixtures/shell-exec/src/main.rs`; regenerate `yurt-shell-exec.wasm` and `yurt-shell-exec-asyncify.wasm`.
 10. Migrate and extend tests across all layers.
 11. Add the `abi-fb-drift` CI job.
 

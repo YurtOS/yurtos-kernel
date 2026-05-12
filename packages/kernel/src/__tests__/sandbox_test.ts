@@ -332,7 +332,7 @@ describe("Sandbox", { sanitizeResources: false, sanitizeOps: false }, () => {
   });
 
   it("VFS size limit enforces ENOSPC", async () => {
-    // Measure how many bytes the kernel installs during init (bash.wasm,
+    // Measure how many bytes the kernel installs during init (boot runner,
     // busybox.wasm, etc.) so the test stays robust as fixture sizes shift,
     // then size fsLimitBytes to permit the first write but trip the second.
     const probe = await Sandbox.create({

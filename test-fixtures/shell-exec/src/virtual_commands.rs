@@ -66,14 +66,36 @@ fn cmd_cat(
     args: &[String],
     stdin: &str,
 ) -> RunResult {
+    let read_stdin = || -> Result<String, String> {
+        if !stdin.is_empty() {
+            return Ok(stdin.to_string());
+        }
+        let bytes = host
+            .read_fd(state.stdin_fd)
+            .map_err(|err| err.to_string())?;
+        String::from_utf8(bytes).map_err(|err| format!("invalid UTF-8 from stdin: {err}"))
+    };
+
     if args.is_empty() {
-        shell_print!("{}", stdin);
+        match read_stdin() {
+            Ok(input) => shell_print!("{}", input),
+            Err(err) => {
+                shell_eprint!("cat: {err}\n");
+                return RunResult::exit(1);
+            }
+        }
         return RunResult::empty();
     }
 
     for arg in args {
         if arg == "-" {
-            shell_print!("{}", stdin);
+            match read_stdin() {
+                Ok(input) => shell_print!("{}", input),
+                Err(err) => {
+                    shell_eprint!("cat: {err}\n");
+                    return RunResult::exit(1);
+                }
+            }
             continue;
         }
         let resolved = state.resolve_path(arg);

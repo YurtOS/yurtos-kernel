@@ -1,7 +1,7 @@
 import type { ThreadsBackend } from "./backend.js";
 import type { IndirectCallTable } from "./indirect-call-table.js";
 import { NULL_INDIRECT_CALL_TABLE } from "./indirect-call-table.js";
-import { AsyncLocalStorage } from "node:async_hooks";
+import { ThreadIdScope } from "./thread-id-scope.js";
 import { WASI_EBUSY } from "../../wasi/types.js";
 
 interface SpawnSlot {
@@ -41,7 +41,7 @@ export class CooperativeSerialBackend implements ThreadsBackend {
   private readonly maxLiveSpawnedThreads = 1;
   private slots: SpawnSlot[] = [];
   private indirectTable: IndirectCallTable = NULL_INDIRECT_CALL_TABLE;
-  private tids = new AsyncLocalStorage<number>();
+  private tids = new ThreadIdScope();
   private mutexes = new Map<number, MutexState>();
   private condvars = new Map<number, CondvarState>();
   private detachedWaiters = new Set<() => void>();

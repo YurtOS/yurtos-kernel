@@ -233,20 +233,20 @@ function writeSpawnResult(
 }
 
 const NATIVE_RECORD_VERSION_1 = 1;
-const SPAWN_REQUEST_V1_MIN_SIZE = 80;
+const SPAWN_REQUEST_V1_SIZE = 88;
 const SPAN_SIZE = 8;
 const ENV_PAIR_SIZE = 16;
 const FD_MAP_PAIR_SIZE = 8;
 const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
-  if (bytes.byteLength < SPAWN_REQUEST_V1_MIN_SIZE) return null;
+  if (bytes.byteLength < SPAWN_REQUEST_V1_SIZE) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const logicalSize = view.getUint32(0, true);
   const version = view.getUint16(4, true);
   if (
     version !== NATIVE_RECORD_VERSION_1 ||
-    logicalSize < SPAWN_REQUEST_V1_MIN_SIZE
+    logicalSize < SPAWN_REQUEST_V1_SIZE
   ) return null;
   if (logicalSize > bytes.byteLength) {
     throw new Error("native spawn request exceeds buffer");
@@ -334,11 +334,10 @@ function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
     }
     return out;
   };
-
   const argv0 = readSpan(16);
   const cwd = readSpan(40);
   const stdinData = readSpan(68);
-  const fdMap = logicalSize >= 88 ? readFdMap(readU32(80), readU32(84)) : [];
+  const fdMap = readFdMap(readU32(80), readU32(84));
   return {
     prog: readRequiredSpan(8),
     ...(argv0 === undefined ? {} : { argv0 }),
@@ -1836,12 +1835,22 @@ export function createKernelImports(
     host_read_fd(fd: number, outPtr: number, outCap: number): number {
       if (!opts.kernel) return -38;
       const target = opts.kernel.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "pipe_read") return -9;
-      const data = target.pipe.drainSync();
-      const buf = new Uint8Array(memory.buffer, outPtr, outCap);
-      if (data.byteLength > outCap) return data.byteLength;
-      buf.set(data);
-      return data.byteLength;
+      if (target?.type === "pipe_read") {
+        const data = target.pipe.drainSync();
+        if (data.byteLength > outCap) return data.byteLength;
+        new Uint8Array(memory.buffer, outPtr, outCap).set(data);
+        return data.byteLength;
+      } else if (target?.type === "static") {
+        const data = target.data.subarray(target.offset);
+        if (data.byteLength > outCap) return data.byteLength;
+        new Uint8Array(memory.buffer, outPtr, outCap).set(data);
+        target.offset = target.data.byteLength;
+        return data.byteLength;
+      } else if (target?.type === "null") {
+        return 0;
+      } else {
+        return -9;
+      }
     },
 
     // host_write_fd(fd, data_ptr, data_len) -> i32
@@ -3884,11 +3893,11 @@ export function createKernelImports(
 
   if (opts.threadsBackend) {
     const tb = opts.threadsBackend;
-    imports.host_thread_spawn = (async (fnPtr: number, arg: number) =>
+    imports.host_thread_spawn = ((fnPtr: number, arg: number) =>
       tb.spawn(fnPtr, arg)) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_join = (async (tid: number) =>
+    imports.host_thread_join = ((tid: number) =>
       tb.join(tid)) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_detach = (async (tid: number) =>
+    imports.host_thread_detach = ((tid: number) =>
       tb.detach(tid)) as unknown as WebAssembly.ImportValue;
     imports.host_thread_exit = ((retval: number) => {
       if (tb.self() === 0) {
@@ -3898,15 +3907,15 @@ export function createKernelImports(
     }) as unknown as WebAssembly.ImportValue;
     imports.host_thread_self = (() =>
       tb.self()) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_yield = (async () =>
+    imports.host_thread_yield = (() =>
       tb.yield_()) as unknown as WebAssembly.ImportValue;
-    imports.host_mutex_lock = (async (mutexPtr: number) =>
+    imports.host_mutex_lock = ((mutexPtr: number) =>
       tb.mutexLock(mutexPtr)) as unknown as WebAssembly.ImportValue;
     imports.host_mutex_unlock = ((mutexPtr: number) =>
       tb.mutexUnlock(mutexPtr)) as unknown as WebAssembly.ImportValue;
     imports.host_mutex_trylock = ((mutexPtr: number) =>
       tb.mutexTryLock(mutexPtr)) as unknown as WebAssembly.ImportValue;
-    imports.host_cond_wait = (async (condPtr: number, mutexPtr: number) =>
+    imports.host_cond_wait = ((condPtr: number, mutexPtr: number) =>
       tb.condWait(condPtr, mutexPtr)) as unknown as WebAssembly.ImportValue;
     imports.host_cond_signal = ((condPtr: number) =>
       tb.condSignal(condPtr)) as unknown as WebAssembly.ImportValue;

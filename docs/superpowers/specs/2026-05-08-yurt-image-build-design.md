@@ -91,7 +91,7 @@ whole image.
 Command execution should use a small build runtime around `ProcessKernel`,
 `ProcessManager`, and `loadProcess`, or an equivalent `Sandbox` construction
 mode that skips default root population and resident boot. Empty builds cannot
-depend on `/bin/bash`, `/bin/true`, Python stdlib, or fixture tools existing
+depend on `/bin/sh`, `/bin/true`, Python stdlib, or fixture tools existing
 before the caller copies them into the VFS.
 
 The builder should expose operations in terms of VFS paths, not Docker concepts.

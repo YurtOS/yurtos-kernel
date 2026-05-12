@@ -5,8 +5,9 @@ import { Sandbox } from '../../sandbox.js';
 import { NodeAdapter } from '../../platform/node-adapter.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { Buffer } from 'node:buffer';
 
-const WASM_DIR = resolve(import.meta.dirname, '../../platform/__tests__/fixtures');
+const WASM_DIR = resolve(import.meta.dirname!, '../../platform/__tests__/fixtures');
 
 const PYTHON_WASM = resolve(WASM_DIR, 'python3.wasm');
 
@@ -93,7 +94,7 @@ print(resp.read().decode())
     } finally {
       sandbox.destroy();
     }
-  }, 60_000);
+  });
 
   it('GET request via http.client', { ignore: !hasPython }, async () => {
     const sandbox = await Sandbox.create({
@@ -120,7 +121,7 @@ conn.close()
     } finally {
       sandbox.destroy();
     }
-  }, 60_000);
+  });
 
   it('POST request with body', { ignore: !hasPython }, async () => {
     const sandbox = await Sandbox.create({
@@ -150,7 +151,7 @@ print(data['body'])
     } finally {
       sandbox.destroy();
     }
-  }, 60_000);
+  });
 
   it('blocked host returns error', { ignore: !hasPython }, async () => {
     const sandbox = await Sandbox.create({
@@ -176,7 +177,7 @@ except Exception as e:
     } finally {
       sandbox.destroy();
     }
-  }, 60_000);
+  });
 
   it('no networking without network config', { ignore: !hasPython }, async () => {
     const sandbox = await Sandbox.create({
@@ -206,5 +207,5 @@ except ImportError:
     } finally {
       sandbox.destroy();
     }
-  }, 60_000);
+  });
 });

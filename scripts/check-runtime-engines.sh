@@ -33,7 +33,7 @@ echo "==> Node JS-host smoke"
 node scripts/smoke-js-engine.mjs
 
 echo "==> Bun JS-host smoke"
-# Bun currently lacks JSPI. The basic resident bash path must pass; async
+# Bun currently lacks JSPI. The basic resident runner path must pass; async
 # pipe/waitpid subprocess paths are reported as known gaps until the asyncify
 # fallback reaches parity.
 YURT_ALLOW_KNOWN_BUN_ASYNC_GAPS=1 bun scripts/smoke-js-engine.mjs

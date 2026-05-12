@@ -62,7 +62,7 @@ describe('NetworkGateway', () => {
     });
 
     it('calls onRequest callback after static checks pass', async () => {
-      const onRequest = mock(async () => false);
+      const onRequest = mock(async () => false) as unknown as NonNullable<NetworkPolicy['onRequest']>;
       const gw = new NetworkGateway({
         allowedHosts: ['example.com'],
         onRequest,
@@ -80,9 +80,9 @@ describe('NetworkGateway', () => {
     });
 
     it('proceeds when onRequest returns true', async () => {
-      const onRequest = mock(async () => true);
+      const onRequest = mock(async () => true) as unknown as NonNullable<NetworkPolicy['onRequest']>;
       const originalFetch = globalThis.fetch;
-      globalThis.fetch = mock(async () => new Response('ok'));
+      globalThis.fetch = mock(async () => new Response('ok')) as unknown as typeof fetch;
       try {
         const gw = new NetworkGateway({
           allowedHosts: ['example.com'],
@@ -228,7 +228,7 @@ describe('NetworkGateway', () => {
       const onRequest = mock(async (req: { url: string }) => {
         onRequestUrls.push(req.url);
         return true;
-      });
+      }) as unknown as NonNullable<NetworkPolicy['onRequest']>;
       let fetchCallCount = 0;
       globalThis.fetch = mock(async (url: string | URL | Request) => {
         fetchCallCount++;

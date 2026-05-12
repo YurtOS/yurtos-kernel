@@ -6,7 +6,7 @@ import { NodeAdapter } from '../node-adapter.js';
 import { WasiHost } from '../../wasi/wasi-host.js';
 import { VFS } from '../../vfs/vfs.js';
 
-const FIXTURES = resolve(import.meta.dirname, 'fixtures');
+const FIXTURES = resolve(import.meta.dirname!, 'fixtures');
 
 describe('NodeAdapter', () => {
   it('loads a .wasm file from the filesystem', async () => {
