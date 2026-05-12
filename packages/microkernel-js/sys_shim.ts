@@ -10,6 +10,8 @@
 import { METHOD } from "./mod.ts";
 import type { KernelInstance } from "./mod.ts";
 
+const EFAULT = 14;
+
 /**
  * Build the env-namespace import object for a user-process linker.
  * `pid` is the caller_pid the kernel sees; `userMemoryRef.memory`
@@ -21,6 +23,24 @@ export function buildSysImports(
   userMemoryRef: { memory?: WebAssembly.Memory },
 ): Record<string, (...args: number[]) => number> {
   const um = () => userMemoryRef.memory!.buffer;
+  const boundsOk = (ptr: number, len: number): boolean => {
+    const buf = um();
+    ptr = ptr >>> 0;
+    len = len >>> 0;
+    return ptr <= buf.byteLength && len <= buf.byteLength - ptr;
+  };
+  const copyIn = (ptr: number, len: number): Uint8Array | number => {
+    ptr = ptr >>> 0;
+    len = len >>> 0;
+    if (!boundsOk(ptr, len)) return -EFAULT;
+    return new Uint8Array(um(), ptr, len).slice();
+  };
+  const copyOut = (ptr: number, bytes: Uint8Array): number => {
+    ptr = ptr >>> 0;
+    if (!boundsOk(ptr, bytes.byteLength)) return -EFAULT;
+    new Uint8Array(um(), ptr, bytes.byteLength).set(bytes);
+    return 0;
+  };
 
   const forwardScalar = (methodId: number): number =>
     Number(kernel.syscall(methodId, pid, new Uint8Array(0), 0).rc);
@@ -71,9 +91,8 @@ export function buildSysImports(
     },
 
     sys_chdir: (pathPtr, pathLen) => {
-      const buf = new Uint8Array(
-        new Uint8Array(um(), pathPtr, pathLen).slice().buffer,
-      );
+      const buf = copyIn(pathPtr, pathLen);
+      if (typeof buf === "number") return buf;
       return forwardRequestBytes(METHOD.SYS_CHDIR, buf);
     },
     sys_getcwd: (outPtr, outCap) => {
@@ -85,7 +104,8 @@ export function buildSysImports(
       );
       if (rc <= 0) return rc;
       const toCopy = Math.min(rc, cap);
-      new Uint8Array(um(), outPtr, toCopy).set(response.subarray(0, toCopy));
+      const outRc = copyOut(outPtr, response.subarray(0, toCopy));
+      if (outRc < 0) return outRc;
       return rc;
     },
 
@@ -96,7 +116,8 @@ export function buildSysImports(
         16,
       );
       if (rc === 16) {
-        new Uint8Array(um(), outPtr, 16).set(response.subarray(0, 16));
+        const outRc = copyOut(outPtr, response.subarray(0, 16));
+        if (outRc < 0) return outRc;
         return 0;
       }
       return rc;
@@ -122,7 +143,8 @@ export function buildSysImports(
         8,
       );
       if (rc === 8) {
-        new Uint8Array(um(), outPtr, 8).set(response.subarray(0, 8));
+        const outRc = copyOut(outPtr, response.subarray(0, 8));
+        if (outRc < 0) return outRc;
         return 0;
       }
       return rc;
@@ -135,13 +157,13 @@ export function buildSysImports(
         cap,
       );
       if (rc <= 0) return rc;
-      new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+      const outRc = copyOut(outPtr, response.subarray(0, rc));
+      if (outRc < 0) return outRc;
       return rc;
     },
     sys_write: (fd, bufPtr, len) => {
-      const payload = new Uint8Array(
-        new Uint8Array(um(), bufPtr, len).slice().buffer,
-      );
+      const payload = copyIn(bufPtr, len);
+      if (typeof payload === "number") return payload;
       const req = new Uint8Array(4 + payload.byteLength);
       new DataView(req.buffer).setUint32(0, fd >>> 0, true);
       req.set(payload, 4);
@@ -176,7 +198,8 @@ export function buildSysImports(
     sys_sched_yield: () =>
       forwardRequestBytes(METHOD.SYS_SCHED_YIELD, new Uint8Array(0)),
     sys_open: (flags, pathPtr, pathLen) => {
-      const path = new Uint8Array(um(), pathPtr, pathLen).slice();
+      const path = copyIn(pathPtr, pathLen);
+      if (typeof path === "number") return path;
       const req = new Uint8Array(4 + path.byteLength);
       new DataView(req.buffer).setUint32(0, flags >>> 0, true);
       req.set(path, 4);
@@ -195,7 +218,8 @@ export function buildSysImports(
         8,
       );
       if (rc !== 8) return rc;
-      new Uint8Array(um(), outPtr, 8).set(response.subarray(0, 8));
+      const outRc = copyOut(outPtr, response.subarray(0, 8));
+      if (outRc < 0) return outRc;
       return 0;
     },
     sys_fstat: (fd, outPtr) => {
@@ -205,7 +229,8 @@ export function buildSysImports(
         16,
       );
       if (rc !== 16) return rc;
-      new Uint8Array(um(), outPtr, 16).set(response.subarray(0, 16));
+      const outRc = copyOut(outPtr, response.subarray(0, 16));
+      if (outRc < 0) return outRc;
       return 0;
     },
     sys_nanosleep: (ns) => {
@@ -224,7 +249,8 @@ export function buildSysImports(
         8,
       );
       if (rc === 8) {
-        new Uint8Array(um(), outPtr, 8).set(response.subarray(0, 8));
+        const outRc = copyOut(outPtr, response.subarray(0, 8));
+        if (outRc < 0) return outRc;
         return 0;
       }
       return rc;
@@ -234,19 +260,22 @@ export function buildSysImports(
     // user processes call the same env-namespaced symbols on
     // either microkernel.
     sys_fetch: (reqPtr, reqLen, outPtr, outCap) => {
-      const req = new Uint8Array(um(), reqPtr, reqLen).slice();
+      const req = copyIn(reqPtr, reqLen);
+      if (typeof req === "number") return req;
       const { rc, response } = forwardRequestWithResponse(
         METHOD.SYS_FETCH,
         req,
         outCap,
       );
       if (rc > 0) {
-        new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+        const outRc = copyOut(outPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
       }
       return rc;
     },
     sys_socket_connect: (family, sockType, flags, addrPtr, addrLen) => {
-      const addr = new Uint8Array(um(), addrPtr, addrLen).slice();
+      const addr = copyIn(addrPtr, addrLen);
+      if (typeof addr === "number") return addr;
       const req = new Uint8Array(8 + addr.byteLength);
       const view = new DataView(req.buffer);
       req[0] = family & 0xff;
@@ -256,7 +285,8 @@ export function buildSysImports(
       return forwardRequestBytes(METHOD.SYS_SOCKET_CONNECT, req);
     },
     sys_socket_send: (fd, dataPtr, dataLen) => {
-      const data = new Uint8Array(um(), dataPtr, dataLen).slice();
+      const data = copyIn(dataPtr, dataLen);
+      if (typeof data === "number") return data;
       const req = new Uint8Array(4 + data.byteLength);
       new DataView(req.buffer).setUint32(0, fd >>> 0, true);
       req.set(data, 4);
@@ -273,14 +303,16 @@ export function buildSysImports(
         outCap,
       );
       if (rc > 0) {
-        new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+        const outRc = copyOut(outPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
       }
       return rc;
     },
     sys_socket_close: (fd) =>
       forwardRequestBytes(METHOD.SYS_SOCKET_CLOSE, u32(fd)),
     sys_socket_listen: (backlog, addrPtr, addrLen) => {
-      const addr = new Uint8Array(um(), addrPtr, addrLen).slice();
+      const addr = copyIn(addrPtr, addrLen);
+      if (typeof addr === "number") return addr;
       const req = new Uint8Array(4 + addr.byteLength);
       new DataView(req.buffer).setUint32(0, backlog >>> 0, true);
       req.set(addr, 4);
@@ -300,39 +332,46 @@ export function buildSysImports(
         outCap,
       );
       if (rc > 0) {
-        new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+        const outRc = copyOut(outPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
       }
       return rc;
     },
     sys_idb_get: (reqPtr, reqLen, outPtr, outCap) => {
-      const req = new Uint8Array(um(), reqPtr, reqLen).slice();
+      const req = copyIn(reqPtr, reqLen);
+      if (typeof req === "number") return req;
       const { rc, response } = forwardRequestWithResponse(
         METHOD.SYS_IDB_GET,
         req,
         outCap,
       );
       if (rc > 0) {
-        new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+        const outRc = copyOut(outPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
       }
       return rc;
     },
     sys_idb_put: (reqPtr, reqLen) => {
-      const req = new Uint8Array(um(), reqPtr, reqLen).slice();
+      const req = copyIn(reqPtr, reqLen);
+      if (typeof req === "number") return req;
       return forwardRequestBytes(METHOD.SYS_IDB_PUT, req);
     },
     sys_idb_delete: (reqPtr, reqLen) => {
-      const req = new Uint8Array(um(), reqPtr, reqLen).slice();
+      const req = copyIn(reqPtr, reqLen);
+      if (typeof req === "number") return req;
       return forwardRequestBytes(METHOD.SYS_IDB_DELETE, req);
     },
     sys_idb_list: (reqPtr, reqLen, outPtr, outCap) => {
-      const req = new Uint8Array(um(), reqPtr, reqLen).slice();
+      const req = copyIn(reqPtr, reqLen);
+      if (typeof req === "number") return req;
       const { rc, response } = forwardRequestWithResponse(
         METHOD.SYS_IDB_LIST,
         req,
         outCap,
       );
       if (rc > 0) {
-        new Uint8Array(um(), outPtr, rc).set(response.subarray(0, rc));
+        const outRc = copyOut(outPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
       }
       return rc;
     },

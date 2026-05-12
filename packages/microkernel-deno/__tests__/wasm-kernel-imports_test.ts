@@ -193,6 +193,23 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(rc).toEqual(0);
   });
 
+  it("ptr_len arg returns -EFAULT for out-of-bounds user memory", async () => {
+    const { mk } = capturingMk(0);
+    const buf = new ArrayBuffer(8);
+    const imports = buildWasmKernelImports(mk, () => buf);
+
+    let rc: number | undefined;
+    let threw = false;
+    try {
+      rc = await imports.host_chdir(16, 4);
+    } catch {
+      threw = true;
+    }
+
+    expect(threw).toEqual(false);
+    expect(rc).toEqual(-14);
+  });
+
   it("out_cap arg: host_getcwd writes bytes back into user memory", async () => {
     if (!HAS_JSPI) return;
     const mk = await freshMk();

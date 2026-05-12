@@ -31,6 +31,8 @@
 
 import { METHOD, type Microkernel } from "../microkernel-js/mod.ts";
 
+const EFAULT = 14;
+
 export type ArgSpec =
   | "scalar"
   | "scalar64"
@@ -254,11 +256,14 @@ export const HOST_BINDINGS: HostBinding[] = [
       const status = kernelView.getInt32(4, true);
       const signal = (status >>> 8) & 0xff;
       const exitCode = signal === 0 ? status : status & 0xff;
-      const result = new DataView(memBuf(), outPtr, 16);
+      const resultBytes = new Uint8Array(16);
+      const result = new DataView(resultBytes.buffer);
       result.setInt32(0, exitedPid, true);
       result.setInt32(4, exitCode, true);
       result.setInt32(8, signal, true);
       result.setInt32(12, 0, true);
+      const outRc = copyOut(memBuf, outPtr, resultBytes);
+      if (outRc < 0) return outRc;
       return 16;
     },
   },
@@ -383,7 +388,8 @@ export const HOST_BINDINGS: HostBinding[] = [
       addrLen: number,
       flags: number,
     ): Promise<number> => {
-      const addr = new Uint8Array(memBuf(), addrPtr, addrLen).slice();
+      const addr = copyIn(memBuf, addrPtr, addrLen);
+      if (typeof addr === "number") return addr;
       const req = new Uint8Array(8 + addr.length);
       new DataView(req.buffer).setUint32(4, flags >>> 0, true);
       req.set(addr, 8);
@@ -506,7 +512,8 @@ export const HOST_BINDINGS: HostBinding[] = [
       outPtr: number,
       outCap: number,
     ): Promise<number> => {
-      const path = new Uint8Array(memBuf(), pathPtr, pathLen).slice();
+      const path = copyIn(memBuf, pathPtr, pathLen);
+      if (typeof path === "number") return path;
       const openReq = new Uint8Array(4 + path.length);
       // flags=0 → read-only.
       openReq.set(path, 4);
@@ -519,9 +526,12 @@ export const HOST_BINDINGS: HostBinding[] = [
         const readOut = await mk.syscallAsync(METHOD.SYS_READ, readReq, outCap);
         const n = Number(readOut.rc);
         if (n > 0) {
-          new Uint8Array(memBuf(), outPtr, n).set(
+          const outRc = copyOut(
+            memBuf,
+            outPtr,
             readOut.response.subarray(0, n),
           );
+          if (outRc < 0) return outRc;
         }
         return n;
       } finally {
@@ -548,7 +558,8 @@ export const HOST_BINDINGS: HostBinding[] = [
       dataLen: number,
       mode: number,
     ): Promise<number> => {
-      const path = new Uint8Array(memBuf(), pathPtr, pathLen).slice();
+      const path = copyIn(memBuf, pathPtr, pathLen);
+      if (typeof path === "number") return path;
       // mode 0 = overwrite (truncate); mode 1 = append.
       const flags = mode === 1 ? 0b011 : 0b111; // W|C [|T]
       const openReq = new Uint8Array(4 + path.length);
@@ -568,7 +579,8 @@ export const HOST_BINDINGS: HostBinding[] = [
           lv.setUint32(12, 2, true);
           await mk.syscallAsync(METHOD.SYS_LSEEK, lseekReq, 8);
         }
-        const data = new Uint8Array(memBuf(), dataPtr, dataLen).slice();
+        const data = copyIn(memBuf, dataPtr, dataLen);
+        if (typeof data === "number") return data;
         const writeReq = new Uint8Array(4 + data.length);
         new DataView(writeReq.buffer).setUint32(0, fd, true);
         writeReq.set(data, 4);
@@ -615,6 +627,36 @@ export function buildWasmKernelImports(
   return imports;
 }
 
+function boundsOk(buffer: ArrayBuffer, ptr: number, len: number): boolean {
+  ptr = ptr >>> 0;
+  len = len >>> 0;
+  return ptr <= buffer.byteLength && len <= buffer.byteLength - ptr;
+}
+
+function copyIn(
+  memBuf: () => ArrayBuffer,
+  ptr: number,
+  len: number,
+): Uint8Array | number {
+  ptr = ptr >>> 0;
+  len = len >>> 0;
+  const buffer = memBuf();
+  if (!boundsOk(buffer, ptr, len)) return -EFAULT;
+  return new Uint8Array(buffer, ptr, len).slice();
+}
+
+function copyOut(
+  memBuf: () => ArrayBuffer,
+  ptr: number,
+  bytes: Uint8Array,
+): number {
+  ptr = ptr >>> 0;
+  const buffer = memBuf();
+  if (!boundsOk(buffer, ptr, bytes.byteLength)) return -EFAULT;
+  new Uint8Array(buffer, ptr, bytes.byteLength).set(bytes);
+  return 0;
+}
+
 function makeWrapper(
   b: HostBinding,
   mk: Microkernel,
@@ -646,15 +688,18 @@ function makeWrapper(
       } else if (spec === "ptr_len") {
         const ptr = ordered[ai++] >>> 0;
         const len = ordered[ai++] >>> 0;
-        const slice = new Uint8Array(memBuf(), ptr, len).slice();
+        const slice = copyIn(memBuf, ptr, len);
+        if (typeof slice === "number") return slice;
         reqParts.push(slice);
       } else if (spec === "prefixed_ptr_len") {
         const ptr = ordered[ai++] >>> 0;
         const len = ordered[ai++] >>> 0;
         const lenBytes = new Uint8Array(4);
         new DataView(lenBytes.buffer).setUint32(0, len, true);
+        const slice = copyIn(memBuf, ptr, len);
+        if (typeof slice === "number") return slice;
         reqParts.push(lenBytes);
-        reqParts.push(new Uint8Array(memBuf(), ptr, len).slice());
+        reqParts.push(slice);
       } else if (spec === "out_cap") {
         outPtr = ordered[ai++] >>> 0;
         outCap = ordered[ai++] >>> 0;
@@ -682,12 +727,16 @@ function makeWrapper(
     const out = await mk.syscallAsync(b.method, req, outCap);
     const rc = Number(out.rc);
     if (b.returnsBytes && rc > 0 && outCap > 0) {
-      new Uint8Array(memBuf(), outPtr, rc).set(out.response.subarray(0, rc));
+      const outRc = copyOut(memBuf, outPtr, out.response.subarray(0, rc));
+      if (outRc < 0) return outRc;
     }
     if (rcToOutPtr !== null) {
       if (rc >= 0 && rcToOutCap >= 4) {
-        const view = new DataView(memBuf(), rcToOutPtr, 4);
+        const buffer = new Uint8Array(4);
+        const view = new DataView(buffer.buffer);
         view.setInt32(0, rc, true);
+        const outRc = copyOut(memBuf, rcToOutPtr, buffer);
+        if (outRc < 0) return outRc;
         return 4;
       }
       return rc;

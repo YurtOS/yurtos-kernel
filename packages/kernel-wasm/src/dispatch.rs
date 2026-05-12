@@ -730,10 +730,12 @@ pub fn kill_pid(target: u32, sig: u32) -> i64 {
         if rc < 0 {
             return rc as i64;
         }
-        with_kernel(|k| {
-            k.process_mut(target).host_instance_handle = None;
-        });
     }
+    with_kernel(|k| {
+        let p = k.process_mut(target);
+        p.host_instance_handle = None;
+        p.exit_status = Some(128 + sig as i32);
+    });
     0
 }
 
@@ -4202,6 +4204,26 @@ mod tests {
             dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp),
             -(abi::EAGAIN as i64)
         );
+    }
+
+    #[test]
+    fn killed_child_is_waitable_by_parent() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = 1_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        register_child(&reg);
+
+        let mut kill = 3_u32.to_le_bytes().to_vec();
+        kill.extend_from_slice(&15_u32.to_le_bytes());
+        assert_eq!(dispatch(METHOD_SYS_KILL, 1, &kill, &mut []), 0);
+
+        let mut wreq = 0_u32.to_le_bytes().to_vec();
+        wreq.extend_from_slice(&0_u32.to_le_bytes());
+        let mut wresp = [0u8; 8];
+        let n = dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp);
+        assert_eq!(n, 8);
+        assert_eq!(u32::from_le_bytes(wresp[0..4].try_into().unwrap()), 3);
+        assert_eq!(i32::from_le_bytes(wresp[4..8].try_into().unwrap()), 143);
     }
 
     #[test]
