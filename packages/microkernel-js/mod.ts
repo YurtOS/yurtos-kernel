@@ -992,9 +992,6 @@ export class KernelInstance {
         outCap: number,
       ) => bigint)
       | null = null,
-    readonly kernelSpawn:
-      | ((parentPid: number, argvPtr: number, argvLen: number) => bigint)
-      | null = null,
     readonly kernelSpawnProcess:
       | ((
         parentPid: number,
@@ -1109,14 +1106,6 @@ export class KernelInstance {
     const outCap = 8;
     const rc = this.kernelWait(callerPid, childPid, flags, outPtr, outCap);
     return { rc, response: this.collectResponse(outPtr, outCap) };
-  }
-
-  spawnProcess(parentPid: number, argv: Uint8Array): bigint {
-    if (!this.kernelSpawn) {
-      throw new Error("kernel.wasm missing kernel_spawn export");
-    }
-    const { inPtr, inLen } = this.stage(argv, 0);
-    return this.kernelSpawn(parentPid, inPtr, inLen);
   }
 
   spawnCachedProcess(
@@ -2312,9 +2301,6 @@ export class Microkernel {
         outCap: number,
       ) => bigint)
       | undefined;
-    const kernelSpawn = instance.exports.kernel_spawn as
-      | ((parentPid: number, argvPtr: number, argvLen: number) => bigint)
-      | undefined;
     const kernelSpawnProcess = instance.exports.kernel_spawn_process as
       | ((
         parentPid: number,
@@ -2370,7 +2356,6 @@ export class Microkernel {
       kernelListProcesses ?? null,
       kernelKill ?? null,
       kernelWait ?? null,
-      kernelSpawn ?? null,
       kernelSpawnProcess ?? null,
     );
     kernelRef.kernel = kernel;
