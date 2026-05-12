@@ -862,14 +862,6 @@ fn parse_argv_records(request: &[u8]) -> Result<Vec<Vec<u8>>, i64> {
     Ok(argv)
 }
 
-pub fn spawn_host_process(parent_pid: u32, request: &[u8]) -> i64 {
-    let argv = match parse_argv_records(request) {
-        Ok(argv) => argv,
-        Err(rc) => return rc,
-    };
-    with_kernel(|k| k.register_host_process(parent_pid, argv, None) as i64)
-}
-
 pub fn spawn_cached_process(parent_pid: u32, module_id: &[u8], argv_request: &[u8]) -> i64 {
     let argv = match parse_argv_records(argv_request) {
         Ok(argv) => argv,

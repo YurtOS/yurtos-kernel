@@ -190,12 +190,6 @@ inside kernel.wasm.
 
 Initial exports:
 
-- `kernel_spawn(parent_pid, argv_ptr, argv_len) -> i64` — allocate/register a
-  host-instantiated Yurt process. Request bytes are a sequence of
-  `u32 arg_len + arg_bytes` records. The kernel allocates PID, records
-  parentage and argv, and returns the new pid; the microkernel still performs
-  the host mechanism of instantiating the wasm module. This remains as a
-  compatibility host-control spawn step.
 - `kernel_spawn_process(parent_pid, module_id_ptr, module_id_len, argv_ptr,
   argv_len) -> i64` — kernel-driven cached-module spawn. The module id names a
   wasm module already cached in the KH adapter. Kernel.wasm allocates/reserves
@@ -203,7 +197,7 @@ Initial exports:
   the returned opaque instance handle in its process table, stores parentage and
   argv, and returns the pid. `spawn_context_v1` is binary: `u16 version`, `u16
   flags`, `u32 pid`, `u32 argv_len`, then the same `(u32 arg_len + arg_bytes)*`
-  argv record used by `kernel_spawn`. If the KH adapter cannot instantiate the
+  argv record used by the host-control spawn request. If the KH adapter cannot instantiate the
   module, the pid has not been published in the process table. This is the
   forward path for moving process instantiation behind kernel policy.
 - `kernel_kill(pid, signal) -> i64` — apply signal/permission policy and route
@@ -311,7 +305,7 @@ model becomes one kernel instance per group with no shared state.
 
 Kernel state lives in kernel.wasm's linear memory. The microkernel treats kernel
 state as opaque except via `kernel_dispatch` and a
-small host-control export set (`kernel_spawn`, `kernel_kill`, `kernel_wait`,
+small host-control export set (`kernel_spawn_process`, `kernel_kill`, `kernel_wait`,
 `kernel_list_processes`, `kernel_snapshot`).
 
 ## Migration Strategy

@@ -99,9 +99,8 @@ records.
 
 - Define the host-control exports in `packages/kernel-wasm` before changing TS
   compatibility shims. `kernel_list_processes`, `kernel_kill`, and
-  `kernel_wait` now exist. `kernel_spawn` now allocates/registers
-  host-instantiated process pids and argv in the Rust kernel. The first
-  kernel-driven cached-module spawn path now exists as `kernel_spawn_process`:
+  `kernel_wait` now exist. The kernel-driven cached-module spawn path now exists
+  as `kernel_spawn_process`:
   it allocates the pid before calling `kh_spawn_process`, passes that pid in a
   binary `spawn_context_v1` record, records the returned opaque instance handle
   in the kernel-owned process record, and stores argv. Rust `kh` wrappers and
@@ -118,8 +117,8 @@ records.
 - The portable JS KH adapter can now instantiate cached user modules with
   pid-bound syscall imports through `spawnCachedUserProcess`, and the public
   `spawnUserProcessWithArgs` helper now caches anonymous modules and uses that
-  path by default. Next, remove the older host-instantiated registration path
-  once parity tests cover every caller that still reaches `kernel_spawn`.
+  path by default. The old JS host-instantiated `kernel_spawn` wrapper has been
+  removed.
 - Add a shared binary process-list record in Rust first. The first version
   should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
   `sid`, state, exit status, command bytes, and visible fd numbers. Keep the

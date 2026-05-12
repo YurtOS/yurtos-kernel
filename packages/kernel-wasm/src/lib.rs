@@ -144,30 +144,6 @@ pub unsafe extern "C" fn kernel_wait(
     dispatch::wait_response(caller_pid, &request, response)
 }
 
-/// Host-control export: allocate/register a host-instantiated process.
-///
-/// Request bytes are `(u32 arg_len + arg_bytes)*`. The kernel allocates the
-/// pid, stores argv, records parentage, and returns the new pid. The
-/// microkernel still performs the mechanism of instantiating the wasm module.
-///
-/// # Safety
-///
-/// The microkernel guarantees `argv_ptr..argv_ptr+argv_len` is a valid readable
-/// range in this kernel instance's linear memory.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_spawn(
-    parent_pid: u32,
-    argv_ptr: *const u8,
-    argv_len: usize,
-) -> i64 {
-    let request = if argv_ptr.is_null() || argv_len == 0 {
-        &[][..]
-    } else {
-        core::slice::from_raw_parts(argv_ptr, argv_len)
-    };
-    dispatch::spawn_host_process(parent_pid, request)
-}
-
 /// Host-control export: ask the kernel to spawn a cached process module.
 ///
 /// The module id names a wasm module already cached in the KH adapter. The
@@ -264,28 +240,5 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
         assert_eq!(unsafe { kernel_kill(7, 15) }, 0);
         assert_eq!(unsafe { kernel_kill(7, 64) }, -(abi::EINVAL as i64));
-    }
-
-    #[test]
-    fn kernel_spawn_export_allocates_pid_and_records_argv() {
-        let _g = crate::kernel::TestGuard::acquire();
-        let mut argv = Vec::new();
-        argv.extend_from_slice(&9_u32.to_le_bytes());
-        argv.extend_from_slice(b"/bin/echo");
-        let pid = unsafe { kernel_spawn(0, argv.as_ptr(), argv.len()) };
-        assert_eq!(pid, 1);
-
-        let mut out = [0u8; 64];
-        let n = unsafe { kernel_list_processes(out.as_mut_ptr(), out.len()) };
-        assert!(n > 0);
-        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 0);
-        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), 1);
-        assert_eq!(u32::from_le_bytes(out[16..20].try_into().unwrap()), 1);
-        assert_eq!(out[20], 1);
-        assert_eq!(i32::from_le_bytes(out[21..25].try_into().unwrap()), -1);
-        assert_eq!(u32::from_le_bytes(out[25..29].try_into().unwrap()), 9);
-        assert_eq!(&out[29..38], b"/bin/echo");
     }
 }

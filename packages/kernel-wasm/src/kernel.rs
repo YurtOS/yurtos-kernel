@@ -399,28 +399,6 @@ impl Kernel {
         pid
     }
 
-    pub fn register_host_process(
-        &mut self,
-        parent_pid: Pid,
-        argv: Vec<Vec<u8>>,
-        host_instance_handle: Option<i32>,
-    ) -> Pid {
-        let pid = self.alloc_host_pid();
-        {
-            let p = self.process_mut(pid);
-            p.ppid = parent_pid;
-            p.argv = argv;
-            p.host_instance_handle = host_instance_handle;
-        }
-        if parent_pid != 0 {
-            let parent = self.process_mut(parent_pid);
-            if !parent.children.contains(&pid) {
-                parent.children.push(pid);
-            }
-        }
-        pid
-    }
-
     pub fn insert_host_process(
         &mut self,
         pid: Pid,
@@ -700,7 +678,11 @@ mod tests {
     #[test]
     fn host_instance_handles_are_kernel_owned_process_state() {
         let _g = TestGuard::acquire();
-        let pid = with_kernel(|k| k.register_host_process(0, vec![b"/bin/app".to_vec()], Some(11)));
+        let pid = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/app".to_vec()], Some(11));
+            pid
+        });
         assert_eq!(pid, 1);
         assert_eq!(
             with_kernel(|k| k.process(pid).host_instance_handle),
