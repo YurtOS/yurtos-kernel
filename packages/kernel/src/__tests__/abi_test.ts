@@ -346,6 +346,18 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toContain('{"case":"stat_after_listener_close","exit":0,"stdout":"inode-persists=ok"}');
   });
+
+  it("listen_dgram_eopnotsupp: listen() on SOCK_DGRAM returns EOPNOTSUPP", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true },
+    });
+    const result = await sandbox.run("unix-canary --case listen_dgram_eopnotsupp");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"listen_dgram_eopnotsupp","exit":0,"stdout":"eopnotsupp=ok"}');
+  });
 });
 
 describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }, () => {
