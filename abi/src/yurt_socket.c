@@ -316,7 +316,7 @@ static int yurt_accept_impl(int sockfd, struct sockaddr *addr, socklen_t *addrle
   for (;;) {
     n = yurt_host_socket_accept(sockfd, (int)(intptr_t)&accepted, (int)sizeof(accepted));
     if (n == (int)sizeof(accepted)) break;
-    if (n == -EAGAIN) {
+    if (n == -YURT_HOST_EAGAIN) {
       if (++attempts > 100000) {
         errno = EAGAIN;
         return -1;

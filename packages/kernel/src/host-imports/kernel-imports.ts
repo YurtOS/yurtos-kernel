@@ -2263,11 +2263,11 @@ export function createKernelImports(
       outPtr: number,
       outCap: number,
     ): Promise<number> {
-      if (!socketBackend?.accept) return -95;
       const target = opts.kernel?.getFdTarget(callerPid, fd);
       if (!target || target.type !== "socket" || target.listener == null) {
         return -9;
       }
+      if (!socketBackend?.accept) return -95;
       const accepted = await acceptSocketAsync(socketBackend, target.listener);
       if (!accepted.ok) return accepted.error === "EAGAIN" ? -11 : -5;
       if (!opts.kernel) return -5;
@@ -2355,11 +2355,10 @@ export function createKernelImports(
     host_socket_recv(
       fd: number,
       outDataPtr: number,
-      outPtr: number,
+      outCap: number,
       flags: number,
     ): number | Promise<number> {
       if (!socketBackend) return -5;
-      const outCap = outPtr;
       const target = opts.kernel?.getFdTarget(callerPid, fd);
       if (!target || target.type !== "socket" || target.socket === null) {
         return -107;

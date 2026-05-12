@@ -755,7 +755,7 @@ describe("Kernel ABI canaries", () => {
     expect(result.stdout.trim()).toBe("socket-address=ok");
   });
 
-  it("routes C host_network_fetch through yurt_fetch_text", async () => {
+  it("routes C fetch canary through the native host_network_fetch primitive", async () => {
     const networkBridge = new StaticFetchBridge();
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,

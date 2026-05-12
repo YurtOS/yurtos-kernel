@@ -338,7 +338,4 @@ FILE * yurt_popen(const char * cmd, const char * mode);
 /* Close a stream returned by yurt_popen and return command status. */
 int yurt_pclose(FILE * stream);
 
-/* Compatibility fetch helper implemented through host_network_fetch. */
-int yurt_fetch_text(const char * url, const char * method, const char * headers_json, const char * body, char ** out_body);
-
 #endif
