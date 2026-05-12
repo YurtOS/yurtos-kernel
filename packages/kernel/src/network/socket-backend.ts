@@ -302,7 +302,7 @@ export function createLoopbackSocketBackend(
           port: req.port,
           backlog: req.backlog,
         });
-        const publishedHost = req.host === "0.0.0.0" ? "10.0.2.15" : r.host;
+        const publishedHost = req.host === "0.0.0.0" ? "10.0.2.15" : (r.host ?? req.host);
         return {
           ok: true,
           listener: pub(r.handle),

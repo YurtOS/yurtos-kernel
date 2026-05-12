@@ -203,6 +203,12 @@ int yurt_host_socket_close(int req_ptr, int req_len);
 __attribute__((import_module("yurt"), import_name("host_socket_socketpair")))
 int yurt_host_socket_socketpair(int req_ptr, int req_len, int out_ptr, int out_cap);
 
+__attribute__((import_module("yurt"), import_name("host_socket_sendmsg")))
+int yurt_host_socket_sendmsg(int req_ptr, int req_len, int out_ptr, int out_cap);
+
+__attribute__((import_module("yurt"), import_name("host_socket_recvmsg")))
+int yurt_host_socket_recvmsg(int req_ptr, int req_len, int out_ptr, int out_cap);
+
 /* host_dns_resolve resolves a hostname to a dotted-decimal IPv4 string and
  * writes it to [out_ptr, out_cap).  Returns bytes written, or -1 on failure.
  * Async (JSPI): the guest blocks until the host DNS lookup completes. */

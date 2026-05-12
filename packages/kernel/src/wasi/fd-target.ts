@@ -53,6 +53,12 @@ export type FdTarget =
     fdFlags?: number;
     readShutdown?: boolean;
     writeShutdown?: boolean;
+    /** SOCK_DGRAM socket — set when the fd is a datagram socket (Slice 4). */
+    isDgram?: boolean;
+    /** SO_PEERCRED fields (Slice 6) */
+    peerPid?: number;
+    peerUid?: number;
+    peerGid?: number;
     send: (socket: SocketHandle, dataB64: string) => SocketBackendResult;
     recv: (
       socket: SocketHandle,

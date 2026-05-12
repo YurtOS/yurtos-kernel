@@ -21,6 +21,23 @@
 export type ListenerHandle = number;
 export type SocketHandle = number;
 
+// ── SOCK_DGRAM support ────────────────────────────────────────────────────────
+
+export interface DgramMessage {
+  bytes: Uint8Array;
+  fromPath?: string;
+  fromAbstract?: string;
+}
+
+interface DgramSocket {
+  handle: SocketHandle;
+  messages: DgramMessage[];
+  recvWaiters: Array<{ resolve: (m: DgramMessage) => void; reject: (e: Error) => void }>;
+  boundPath?: string;     // set after bindDgramToPath
+  peerHandle?: SocketHandle; // set for socketpair DGRAM
+  closed: boolean;
+}
+
 export type ListenHost = "127.0.0.1" | "localhost" | "0.0.0.0";
 
 export interface ListenRequest {
@@ -31,8 +48,9 @@ export interface ListenRequest {
 
 export interface ListenerInfo {
   handle: ListenerHandle;
-  host: ListenHost;
-  port: number;
+  host?: ListenHost;   // undefined for AF_UNIX listeners
+  port: number;        // 0 for AF_UNIX listeners
+  localPath?: string;  // set for AF_UNIX listeners
 }
 
 export interface AcceptedConnection {
@@ -89,6 +107,10 @@ interface PairedSocket {
   handle: SocketHandle;
   peerHandle: SocketHandle;
   rx: Uint8Array[];
+  /** Parallel ancillary-fd array for SCM_RIGHTS (Slice 5).
+   *  Each slot corresponds to the matching rx entry.
+   *  undefined means no ancillary data for that message. */
+  rxAnc: Array<number[] | undefined>;
   rxWaiters: Array<{
     resolve: (r: RecvResult) => void;
     max: number;
@@ -104,11 +126,15 @@ interface PairedSocket {
   /** AF_UNIX path fields — only set for unix-domain connected sockets. */
   localPath?: string;
   peerPath?: string;
+  /** SO_PEERCRED fields (Slice 6) */
+  peerPid?: number;
+  peerUid?: number;
+  peerGid?: number;
 }
 
 interface ListenerState {
   handle: ListenerHandle;
-  host: ListenHost;
+  host?: ListenHost;     // undefined for AF_UNIX listeners
   port: number;
   backlog: number;
   pending: AcceptedConnection[];
@@ -151,6 +177,10 @@ export class ListenerRegistry {
   private nextEphemeralPort = EPHEMERAL_PORT_START;
   private listeners_ev = new Set<(info: ListenerInfo) => void>();
   private unlisteners_ev = new Set<(info: ListenerInfo) => void>();
+  /** SOCK_DGRAM sockets keyed by handle. */
+  private dgramSockets = new Map<SocketHandle, DgramSocket>();
+  /** Route key `DGRAM:${path}` → SocketHandle for bound dgram sockets. */
+  private dgramRoutes = new Map<string, SocketHandle>();
 
   listen(req: ListenRequest): ListenerInfo {
     const port = req.port === 0 ? this.allocEphemeralPort() : req.port;
@@ -241,6 +271,7 @@ export class ListenerRegistry {
       handle: clientHandle,
       peerHandle: serverHandle,
       rx: [],
+      rxAnc: [],
       rxWaiters: [],
       closed: false,
       peerHost: serverLocalHost,
@@ -253,6 +284,7 @@ export class ListenerRegistry {
       handle: serverHandle,
       peerHandle: clientHandle,
       rx: [],
+      rxAnc: [],
       rxWaiters: [],
       closed: false,
       peerHost: "127.0.0.1",
@@ -314,6 +346,7 @@ export class ListenerRegistry {
       handle,
       host: listener.host,
       port: listener.port,
+      localPath: listener.localPath,
     };
     for (const [key, value] of this.routes) {
       if (value === handle) this.routes.delete(key);
@@ -364,9 +397,6 @@ export class ListenerRegistry {
     const handle = this.nextListenerHandle++;
     const state: ListenerState = {
       handle,
-      // AF_UNIX listeners still need host/port fields to satisfy the type;
-      // use sentinel values that are clearly not AF_INET.
-      host: "127.0.0.1" as ListenHost,
       port: 0,
       backlog,
       pending: [],
@@ -411,6 +441,7 @@ export class ListenerRegistry {
       handle: clientHandle,
       peerHandle: serverHandle,
       rx: [],
+      rxAnc: [],
       rxWaiters: [],
       closed: false,
       peerHost: "",
@@ -424,6 +455,7 @@ export class ListenerRegistry {
       handle: serverHandle,
       peerHandle: clientHandle,
       rx: [],
+      rxAnc: [],
       rxWaiters: [],
       closed: false,
       peerHost: "",
@@ -488,7 +520,6 @@ export class ListenerRegistry {
     const handle = this.nextListenerHandle++;
     const state: ListenerState = {
       handle,
-      host: "127.0.0.1" as ListenHost,
       port: 0,
       backlog,
       pending: [],
@@ -534,6 +565,7 @@ export class ListenerRegistry {
       handle: clientHandle,
       peerHandle: serverHandle,
       rx: [],
+      rxAnc: [],
       rxWaiters: [],
       closed: false,
       peerHost: "",
@@ -547,6 +579,7 @@ export class ListenerRegistry {
       handle: serverHandle,
       peerHandle: clientHandle,
       rx: [],
+      rxAnc: [],
       rxWaiters: [],
       closed: false,
       peerHost: "",
@@ -604,13 +637,15 @@ export class ListenerRegistry {
    * Returns raw registry handles (positive ints). Callers in kernel-imports
    * negate them for the loopback backend convention.
    */
-  openUnixPair(_type: "STREAM" = "STREAM"): { a: SocketHandle; b: SocketHandle } {
+  openUnixPair(type: "STREAM" = "STREAM"): { a: SocketHandle; b: SocketHandle } {
+    if (type !== "STREAM") throw new Error(`openUnixPair: unsupported type ${type}`);
     const aHandle = this.nextSocketHandle++;
     const bHandle = this.nextSocketHandle++;
     const aSock: PairedSocket = {
       handle: aHandle,
       peerHandle: bHandle,
       rx: [],
+      rxAnc: [],
       rxWaiters: [],
       closed: false,
       peerHost: "",
@@ -622,6 +657,7 @@ export class ListenerRegistry {
       handle: bHandle,
       peerHandle: aHandle,
       rx: [],
+      rxAnc: [],
       rxWaiters: [],
       closed: false,
       peerHost: "",
@@ -646,13 +682,18 @@ export class ListenerRegistry {
   // ── existing methods continue ──────────────────────────────────────────────
 
   send(handle: SocketHandle, bytes: Uint8Array): SendResult {
+    return this.sendWithAnc(handle, bytes, undefined);
+  }
+
+  /** Internal: send bytes + optional ancillary fds to the peer. */
+  sendWithAnc(handle: SocketHandle, bytes: Uint8Array, ancFds: number[] | undefined): SendResult {
     const local = this.sockets.get(handle);
     if (!local || local.closed) {
       return { ok: false, error: "send: invalid socket" };
     }
     const peer = this.sockets.get(local.peerHandle);
     if (!peer || peer.closed) return { ok: false, error: "send: peer closed" };
-    if (bytes.length === 0) return { ok: true, bytesSent: 0 };
+    if (bytes.length === 0 && !ancFds) return { ok: true, bytesSent: 0 };
     const waiter = peer.rxWaiters.shift();
     if (waiter) {
       const slice = bytes.length <= waiter.max
@@ -660,19 +701,39 @@ export class ListenerRegistry {
         : bytes.subarray(0, waiter.max);
       if (bytes.length > waiter.max) {
         peer.rx.unshift(bytes.subarray(waiter.max));
+        peer.rxAnc.unshift(undefined);
       }
       waiter.resolve({ ok: true, bytes: copy(slice) });
     } else {
       peer.rx.push(copy(bytes));
+      peer.rxAnc.push(ancFds);
     }
     return { ok: true, bytesSent: bytes.length };
+  }
+
+  /** Pop ancillary fds for the next message. Must be called after recvAsync resolves
+   *  and before the next recv to get the fds for that message. */
+  peekAnc(handle: SocketHandle): number[] | undefined {
+    const local = this.sockets.get(handle);
+    if (!local) return undefined;
+    return local.rxAnc[0];
+  }
+
+  /** Pop ancillary fds for the most recently received message (shift off rxAnc[0]). */
+  popAnc(handle: SocketHandle): number[] | undefined {
+    const local = this.sockets.get(handle);
+    if (!local) return undefined;
+    return local.rxAnc.shift();
   }
 
   recv(handle: SocketHandle, max: number, opts: RecvOptions = {}): RecvResult {
     const local = this.sockets.get(handle);
     if (!local) return { ok: false, error: "recv: invalid socket" };
     const first = local.rx.shift();
-    if (first) return takeFrom(first, max, local);
+    if (first) {
+      local.rxAnc.shift(); // keep rxAnc in sync
+      return takeFrom(first, max, local);
+    }
     if (this.peerClosed(local)) return { ok: true, bytes: new Uint8Array(0) };
     if (opts.nonblocking) return { ok: false, error: "EAGAIN" };
     // Synchronous blocking recv is not supported by this layer; callers
@@ -686,7 +747,10 @@ export class ListenerRegistry {
       return Promise.resolve({ ok: false, error: "recv: invalid socket" });
     }
     const first = local.rx.shift();
-    if (first) return Promise.resolve(takeFrom(first, max, local));
+    if (first) {
+      local.rxAnc.shift(); // keep rxAnc in sync
+      return Promise.resolve(takeFrom(first, max, local));
+    }
     if (this.peerClosed(local)) {
       return Promise.resolve({ ok: true, bytes: new Uint8Array(0) });
     }
@@ -743,6 +807,7 @@ export class ListenerRegistry {
       handle: l.handle,
       host: l.host,
       port: l.port,
+      localPath: l.localPath,
     }));
   }
 
@@ -789,6 +854,148 @@ export class ListenerRegistry {
 
   private releaseClientPort(port: number): void {
     this.clientPorts.delete(port);
+  }
+
+  // ── SOCK_DGRAM methods (Slice 4) ──────────────────────────────────────────
+
+  /** Allocate a new SOCK_DGRAM socket. Returns the raw handle. */
+  openDgramSocket(): SocketHandle {
+    const handle = this.nextSocketHandle++;
+    const s: DgramSocket = {
+      handle,
+      messages: [],
+      recvWaiters: [],
+      closed: false,
+    };
+    this.dgramSockets.set(handle, s);
+    return handle;
+  }
+
+  /** Create a connected SOCK_DGRAM socketpair. Returns two linked handles. */
+  openDgramPair(): { a: SocketHandle; b: SocketHandle } {
+    const aHandle = this.nextSocketHandle++;
+    const bHandle = this.nextSocketHandle++;
+    const aSock: DgramSocket = {
+      handle: aHandle,
+      messages: [],
+      recvWaiters: [],
+      peerHandle: bHandle,
+      closed: false,
+    };
+    const bSock: DgramSocket = {
+      handle: bHandle,
+      messages: [],
+      recvWaiters: [],
+      peerHandle: aHandle,
+      closed: false,
+    };
+    this.dgramSockets.set(aHandle, aSock);
+    this.dgramSockets.set(bHandle, bSock);
+    return { a: aHandle, b: bHandle };
+  }
+
+  /** Bind a SOCK_DGRAM socket to a filesystem path. */
+  bindDgramToPath(handle: SocketHandle, path: string): void {
+    const s = this.dgramSockets.get(handle);
+    if (!s) throw new Error(`bindDgramToPath: unknown handle ${handle}`);
+    s.boundPath = path;
+    this.dgramRoutes.set(`DGRAM:${path}`, handle);
+  }
+
+  /** Deliver a datagram to the socket bound at `toPath`. */
+  sendDgramToPath(
+    toPath: string,
+    bytes: Uint8Array,
+    fromPath?: string,
+  ): SendResult {
+    const handle = this.dgramRoutes.get(`DGRAM:${toPath}`);
+    if (handle === undefined) return { ok: false, error: `no dgram socket at ${toPath}` };
+    const s = this.dgramSockets.get(handle);
+    if (!s || s.closed) return { ok: false, error: `dgram socket closed: ${toPath}` };
+    const msg: DgramMessage = { bytes: copy(bytes), fromPath };
+    const waiter = s.recvWaiters.shift();
+    if (waiter) waiter.resolve(msg);
+    else s.messages.push(msg);
+    return { ok: true, bytesSent: bytes.length };
+  }
+
+  /** Send a datagram to the peer of a socketpair DGRAM socket. */
+  sendDgramToPeer(handle: SocketHandle, bytes: Uint8Array): SendResult {
+    const s = this.dgramSockets.get(handle);
+    if (!s || s.closed) return { ok: false, error: "send: invalid dgram socket" };
+    if (s.peerHandle === undefined) return { ok: false, error: "send: no peer (unconnected)" };
+    const peer = this.dgramSockets.get(s.peerHandle);
+    if (!peer || peer.closed) return { ok: false, error: "send: dgram peer closed" };
+    const msg: DgramMessage = { bytes: copy(bytes) };
+    const waiter = peer.recvWaiters.shift();
+    if (waiter) waiter.resolve(msg);
+    else peer.messages.push(msg);
+    return { ok: true, bytesSent: bytes.length };
+  }
+
+  /** Synchronous dgram recv — pops one message or returns EAGAIN. */
+  recvDgram(
+    handle: SocketHandle,
+    _maxBytes: number,
+    nonblocking?: boolean,
+  ): (RecvResult & { fromPath?: string; fromAbstract?: string }) | { ok: false; error: "EAGAIN" } {
+    const s = this.dgramSockets.get(handle);
+    if (!s || s.closed) return { ok: false, error: "EAGAIN" };
+    const msg = s.messages.shift();
+    if (!msg) {
+      if (nonblocking) return { ok: false, error: "EAGAIN" };
+      return { ok: false, error: "EAGAIN" };
+    }
+    return { ok: true, bytes: msg.bytes, fromPath: msg.fromPath, fromAbstract: msg.fromAbstract };
+  }
+
+  /** Async dgram recv — resolves when a message arrives. */
+  recvDgramAsync(
+    handle: SocketHandle,
+    _maxBytes: number,
+  ): Promise<RecvResult & { fromPath?: string; fromAbstract?: string }> {
+    const s = this.dgramSockets.get(handle);
+    if (!s || s.closed) {
+      return Promise.resolve({ ok: false, error: "recv: invalid dgram socket" });
+    }
+    const msg = s.messages.shift();
+    if (msg) {
+      return Promise.resolve({
+        ok: true,
+        bytes: msg.bytes,
+        fromPath: msg.fromPath,
+        fromAbstract: msg.fromAbstract,
+      });
+    }
+    return new Promise<RecvResult & { fromPath?: string; fromAbstract?: string }>((resolve, reject) => {
+      s.recvWaiters.push({
+        resolve: (m: DgramMessage) => resolve({
+          ok: true,
+          bytes: m.bytes,
+          fromPath: m.fromPath,
+          fromAbstract: m.fromAbstract,
+        }),
+        reject,
+      });
+    });
+  }
+
+  /** Close a SOCK_DGRAM socket, removing route entries and rejecting waiters. */
+  closeDgramSocket(handle: SocketHandle): void {
+    const s = this.dgramSockets.get(handle);
+    if (!s) return;
+    s.closed = true;
+    if (s.boundPath) this.dgramRoutes.delete(`DGRAM:${s.boundPath}`);
+    this.dgramSockets.delete(handle);
+    const err = new Error("recv: dgram socket closed");
+    for (const w of s.recvWaiters.splice(0)) w.reject(err);
+  }
+
+  /** Get peerHandle for a dgram socket (used to detect socketpair dgram). */
+  dgramSocketInfo(handle: SocketHandle): { boundPath?: string; peerHandle?: SocketHandle } | null {
+    const s = this.dgramSockets.get(handle);
+    if (!s) return null;
+    return { boundPath: s.boundPath, peerHandle: s.peerHandle };
   }
 }
 

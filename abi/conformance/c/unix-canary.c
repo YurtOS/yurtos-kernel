@@ -18,6 +18,7 @@
  */
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -238,13 +239,20 @@ static int case_connect_refused(void) {
   int fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) { emit("connect_refused", 1, NULL, 1, errno); return 1; }
   int rc = connect(fd, (struct sockaddr *)&addr, addrlen);
+  int saved_errno = errno;
   close(fd);
 
-  if (rc != 0) {
+  /* YurtOS always returns ECONNREFUSED for missing paths (no ENOENT
+   * distinction); this is intentional — the registry has no VFS lookup. */
+  if (rc != 0 && saved_errno == ECONNREFUSED) {
     emit("connect_refused", 0, "refused=ok", 0, 0);
     return 0;
   }
-  emit("connect_refused", 1, "connect-succeeded", 0, 0);
+  if (rc == 0) {
+    emit("connect_refused", 1, "connect-succeeded", 0, 0);
+  } else {
+    emit("connect_refused", 1, "wrong-errno", 1, saved_errno);
+  }
   return 1;
 }
 static int case_abstract_bind_connect(void) {
@@ -306,7 +314,9 @@ static int case_abstract_bind_connect(void) {
 }
 
 static int case_abstract_invisible_to_stat(void) {
-  const char *abstract_name = "yurt-stat-test";
+  /* Use an abstract name that looks like a pathname so we can verify
+   * that no VFS inode is created at that path after bind(). */
+  const char *abstract_name = "/tmp/yurt-abstract-stat.sock";
   struct sockaddr_un addr;
   memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
@@ -321,25 +331,255 @@ static int case_abstract_invisible_to_stat(void) {
     return 1;
   }
 
-  /* The abstract name must NOT appear in the VFS — stat should fail */
-  char vfs_path[128];
-  snprintf(vfs_path, sizeof(vfs_path), "/%s", abstract_name);
+  /* The abstract bind must NOT create a VFS entry at the name's path */
   struct stat st;
-  int rc = stat(vfs_path, &st);
+  int rc = stat(abstract_name, &st);
   close(fd);
 
   if (rc != 0) {
-    /* stat failed as expected — abstract socket is invisible */
     emit("abstract_invisible_to_stat", 0, "invisible=ok", 0, 0);
     return 0;
   }
   emit("abstract_invisible_to_stat", 1, "stat-succeeded", 0, 0);
   return 1;
 }
-static int case_dgram_pair_message_framing(void) { return pending("dgram_pair_message_framing"); }
-static int case_dgram_path_sendto(void)          { return pending("dgram_path_sendto"); }
-static int case_scm_rights_pipe_handoff(void)    { return pending("scm_rights_pipe_handoff"); }
-static int case_peercred_after_accept(void)      { return pending("peercred_after_accept"); }
+static int case_dgram_pair_message_framing(void) {
+  int sv[2];
+  char buf[32];
+  ssize_t n;
+
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) {
+    emit("dgram_pair_message_framing", 1, NULL, 1, errno);
+    return 1;
+  }
+
+  /* Send two datagrams of different sizes on sv[0] */
+  if (send(sv[0], "hello", 5, 0) != 5) {
+    emit("dgram_pair_message_framing", 1, "send1-fail", 1, errno);
+    close(sv[0]); close(sv[1]);
+    return 1;
+  }
+  if (send(sv[0], "world!", 6, 0) != 6) {
+    emit("dgram_pair_message_framing", 1, "send2-fail", 1, errno);
+    close(sv[0]); close(sv[1]);
+    return 1;
+  }
+
+  /* Recv on sv[1] — must get exactly 5 bytes "hello" */
+  n = recv(sv[1], buf, sizeof(buf), 0);
+  if (n != 5 || memcmp(buf, "hello", 5) != 0) {
+    emit("dgram_pair_message_framing", 1, "recv1-mismatch", 0, 0);
+    close(sv[0]); close(sv[1]);
+    return 1;
+  }
+
+  /* Recv on sv[1] — must get exactly 6 bytes "world!" */
+  n = recv(sv[1], buf, sizeof(buf), 0);
+  if (n != 6 || memcmp(buf, "world!", 6) != 0) {
+    emit("dgram_pair_message_framing", 1, "recv2-mismatch", 0, 0);
+    close(sv[0]); close(sv[1]);
+    return 1;
+  }
+
+  close(sv[0]);
+  close(sv[1]);
+  emit("dgram_pair_message_framing", 0, "dgram=ok", 0, 0);
+  return 0;
+}
+
+static int case_dgram_path_sendto(void) {
+  const char *server_path = "/tmp/yurt-dgram-test.sock";
+  struct sockaddr_un server_addr;
+  socklen_t addrlen;
+  int server_fd, client_fd;
+  char buf[32];
+  ssize_t n;
+  struct sockaddr_un src_addr;
+  socklen_t src_len = sizeof(src_addr);
+
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sun_family = AF_UNIX;
+  strncpy(server_addr.sun_path, server_path, sizeof(server_addr.sun_path) - 1);
+  addrlen = (socklen_t)sizeof(server_addr);
+
+  server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (server_fd < 0) { emit("dgram_path_sendto", 1, NULL, 1, errno); return 1; }
+  client_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (client_fd < 0) { emit("dgram_path_sendto", 1, NULL, 1, errno); close(server_fd); return 1; }
+
+  unlink(server_path);
+  if (bind(server_fd, (struct sockaddr *)&server_addr, addrlen) != 0) {
+    emit("dgram_path_sendto", 1, "bind-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    return 1;
+  }
+
+  n = sendto(client_fd, "ping", 4, 0, (struct sockaddr *)&server_addr, addrlen);
+  if (n != 4) {
+    emit("dgram_path_sendto", 1, "sendto-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    unlink(server_path);
+    return 1;
+  }
+
+  n = recvfrom(server_fd, buf, sizeof(buf), 0, (struct sockaddr *)&src_addr, &src_len);
+  if (n != 4 || memcmp(buf, "ping", 4) != 0) {
+    emit("dgram_path_sendto", 1, "recvfrom-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    unlink(server_path);
+    return 1;
+  }
+
+  close(server_fd);
+  close(client_fd);
+  unlink(server_path);
+  emit("dgram_path_sendto", 0, "dgram-path=ok", 0, 0);
+  return 0;
+}
+
+static int case_scm_rights_pipe_handoff(void) {
+  int sv[2];
+  int pipefd[2];
+  int received_fd = -1;
+  char buf[16];
+  ssize_t n;
+
+  /* Create connected socketpair */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    emit("scm_rights_pipe_handoff", 1, NULL, 1, errno);
+    return 1;
+  }
+
+  /* Create a pipe */
+  if (pipe(pipefd) != 0) {
+    emit("scm_rights_pipe_handoff", 1, "pipe-fail", 1, errno);
+    close(sv[0]); close(sv[1]);
+    return 1;
+  }
+
+  /* Send pipefd[1] (write end) via SCM_RIGHTS on sv[0] */
+  {
+    struct msghdr mhdr;
+    struct iovec iov;
+    char ctrl[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr *cmsg;
+    char dummy = 'x';
+
+    memset(&mhdr, 0, sizeof(mhdr));
+    iov.iov_base = &dummy;
+    iov.iov_len = 1;
+    mhdr.msg_iov = &iov;
+    mhdr.msg_iovlen = 1;
+    mhdr.msg_control = ctrl;
+    mhdr.msg_controllen = sizeof(ctrl);
+
+    cmsg = CMSG_FIRSTHDR(&mhdr);
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    memcpy(CMSG_DATA(cmsg), &pipefd[1], sizeof(int));
+    mhdr.msg_controllen = cmsg->cmsg_len;
+
+    if (sendmsg(sv[0], &mhdr, 0) < 0) {
+      emit("scm_rights_pipe_handoff", 1, "sendmsg-fail", 1, errno);
+      close(sv[0]); close(sv[1]);
+      close(pipefd[0]); close(pipefd[1]);
+      return 1;
+    }
+    /* Close our copy of the write end */
+    close(pipefd[1]);
+  }
+
+  /* Receive on sv[1], extract the fd */
+  {
+    struct msghdr mhdr;
+    struct iovec iov;
+    char ctrl[CMSG_SPACE(sizeof(int))];
+    char dummy;
+
+    memset(&mhdr, 0, sizeof(mhdr));
+    iov.iov_base = &dummy;
+    iov.iov_len = 1;
+    mhdr.msg_iov = &iov;
+    mhdr.msg_iovlen = 1;
+    mhdr.msg_control = ctrl;
+    mhdr.msg_controllen = sizeof(ctrl);
+
+    if (recvmsg(sv[1], &mhdr, 0) < 0) {
+      emit("scm_rights_pipe_handoff", 1, "recvmsg-fail", 1, errno);
+      close(sv[0]); close(sv[1]);
+      close(pipefd[0]);
+      return 1;
+    }
+    {
+      struct cmsghdr *cmsg = CMSG_FIRSTHDR(&mhdr);
+      if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) {
+        emit("scm_rights_pipe_handoff", 1, "no-scm-rights", 0, 0);
+        close(sv[0]); close(sv[1]);
+        close(pipefd[0]);
+        return 1;
+      }
+      memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+    }
+  }
+
+  if (received_fd < 0) {
+    emit("scm_rights_pipe_handoff", 1, "bad-fd", 0, 0);
+    close(sv[0]); close(sv[1]);
+    close(pipefd[0]);
+    return 1;
+  }
+
+  /* Write "test" to the received write-end fd */
+  if (write(received_fd, "test", 4) != 4) {
+    emit("scm_rights_pipe_handoff", 1, "write-fail", 1, errno);
+    close(sv[0]); close(sv[1]);
+    close(pipefd[0]); close(received_fd);
+    return 1;
+  }
+  close(received_fd);
+
+  /* Read from pipefd[0] and verify */
+  n = read(pipefd[0], buf, sizeof(buf));
+  close(pipefd[0]);
+  close(sv[0]); close(sv[1]);
+
+  if (n == 4 && memcmp(buf, "test", 4) == 0) {
+    emit("scm_rights_pipe_handoff", 0, "scm=ok", 0, 0);
+    return 0;
+  }
+  emit("scm_rights_pipe_handoff", 1, "pipe-mismatch", 0, 0);
+  return 1;
+}
+
+static int case_peercred_after_accept(void) {
+  int sv[2];
+  struct ucred cred;
+  socklen_t credlen = sizeof(cred);
+
+  /* Create a socketpair — both ends belong to the same pid */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    emit("peercred_after_accept", 1, NULL, 1, errno);
+    return 1;
+  }
+
+  memset(&cred, 0, sizeof(cred));
+  if (getsockopt(sv[0], SOL_SOCKET, SO_PEERCRED, &cred, &credlen) != 0) {
+    emit("peercred_after_accept", 1, "getsockopt-fail", 1, errno);
+    close(sv[0]); close(sv[1]);
+    return 1;
+  }
+
+  close(sv[0]);
+  close(sv[1]);
+
+  if (cred.pid > 0) {
+    emit("peercred_after_accept", 0, "peercred=ok", 0, 0);
+    return 0;
+  }
+  emit("peercred_after_accept", 1, "bad-pid", 0, 0);
+  return 1;
+}
 
 static int run_case(const char *name) {
   if (strcmp(name, "pair_basic") == 0)                 return case_pair_basic();

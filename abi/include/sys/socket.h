@@ -102,6 +102,41 @@ extern "C" {
 #define SOMAXCONN 128
 #endif
 
+/* SCM_RIGHTS — ancillary message type for fd passing. */
+#ifndef SCM_RIGHTS
+#define SCM_RIGHTS 1
+#endif
+
+/* MSG_CTRUNC — control data was truncated. */
+#ifndef MSG_CTRUNC
+#define MSG_CTRUNC 0x08
+#endif
+
+/* MSG_TRUNC — data was truncated. */
+#ifndef MSG_TRUNC
+#define MSG_TRUNC 0x20
+#endif
+
+/* SO_PEERCRED — get peer credentials. */
+#ifndef SO_PEERCRED
+#define SO_PEERCRED 17
+#endif
+
+/* SO_TYPE — get socket type. */
+#ifndef SO_TYPE
+#define SO_TYPE 3
+#endif
+
+/* struct ucred — peer credentials returned by SO_PEERCRED. */
+#ifndef _HAVE_STRUCT_UCRED
+#define _HAVE_STRUCT_UCRED
+struct ucred {
+    pid_t pid;
+    uid_t uid;
+    gid_t gid;
+};
+#endif
+
 /* struct cmsghdr and CMSG_* macros — wasi-libc's __struct_msghdr.h only
  * defines struct msghdr, not struct cmsghdr.  Provide them unconditionally
  * so libbb/udp_io.c and similar files compile. */

@@ -94,15 +94,15 @@ existing `routes: Map<string, ListenerHandle>` with two additional key
 namespaces:
 
 ```
-AF_UNIX:<canonical-path>           → ListenerHandle    (pathname)
-AF_UNIX_ABSTRACT:<base64(name)>    → ListenerHandle    (abstract; no NUL)
+AF_UNIX:<canonical-path>    → ListenerHandle    (pathname)
+AF_UNIX_ABSTRACT:<name>     → ListenerHandle    (abstract; no NUL)
 ```
 
 The existing `<host>:<port>` namespace is unchanged. Path canonicalization
 follows POSIX rules: absolute path, no `..`, symlinks resolved at bind
-time (not connect time). Abstract names are length-prefixed by the
-kernel; the leading NUL byte is preserved through the wire format but
-not encoded in the registry key.
+time (not connect time). Abstract names are stored verbatim (matching Linux kernel behavior) —
+the leading NUL byte that marks the abstract namespace in `sun_path`
+is stripped at the ABI boundary and never appears in the registry key.
 
 `PairedSocket`, the per-half state for connected sockets, gains optional
 `family`, `peerPath`, `localPath`, `peerUid`, `peerGid`, `peerPid` fields.
@@ -170,6 +170,23 @@ deletes the inode and notifies the registry to drop the listener so
 subsequent `connect()` returns `ECONNREFUSED`. Abstract addresses do
 not appear in the VFS — that is the POSIX contract.
 
+> **`unlink()` drops the listener (YurtOS deviation):** On Linux,
+> `unlink()` removes the directory entry but the listener stays alive
+> until the bound fd is closed — clients can still `connect()` as long
+> as the server holds the fd. YurtOS eagerly drops the listener on
+> `unlink` because the registry keys by path: once the VFS inode is
+> gone the route key is removed too. Ports that rely on the Linux
+> guarantee (bind → listen → unlink → clients still connect until
+> close) will not work without holding the fd open across the unlink.
+
+> **ECONNREFUSED for missing paths (YurtOS deviation):** POSIX requires
+> `ENOENT` when `connect()` targets a path that has no socket file, and
+> `ECONNREFUSED` only when the file exists but no listener is open.
+> YurtOS returns `ECONNREFUSED` in both cases because the registry does
+> not perform a VFS lookup during connect — it routes by registry key
+> only. This is intentional for the current in-kernel socket model; a
+> future VFS-backed connect path could restore the POSIX distinction.
+
 ### Security boundary
 
 A new policy block on `Sandbox.create`:
@@ -179,9 +196,14 @@ serverSockets: {
   allowUnixDomain?: boolean,
   unixPathAllowlist?: RegExp[],
   unixAbstractAllowlist?: RegExp[],
-  onUnixListen?: (path: string, abstract: boolean) => boolean | Promise<boolean>,
+  onUnixListen?: (path: string, abstract: boolean) => boolean | Promise<boolean>,  // deferred; see below
 }
 ```
+
+> **`onUnixListen` deferred:** The hook field is declared in `SocketListenPolicy` but is
+> not yet invoked by `authorizeUnixListen`. The synchronous allowlist check is
+> sufficient for current use cases. The async hook will be wired in a later slice
+> when cross-sandbox or embedder-controlled policy is needed.
 
 `authorizeListen()`
 ([`packages/kernel/src/host-imports/kernel-imports.ts:835-878`](../../../packages/kernel/src/host-imports/kernel-imports.ts))
