@@ -25,6 +25,74 @@ const W = (globalThis as any).WebAssembly;
 const HAS_JSPI = typeof W?.Suspending === "function" &&
   typeof W?.promising === "function";
 
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+function nativeFetchRequest(url: string, method: string): Uint8Array {
+  const urlBytes = enc.encode(url);
+  const methodBytes = enc.encode(method);
+  const headerSize = 44;
+  const urlOffset = headerSize;
+  const methodOffset = urlOffset + urlBytes.byteLength;
+  const size = methodOffset + methodBytes.byteLength;
+  const record = new Uint8Array(size);
+  const view = new DataView(record.buffer);
+  view.setUint32(0, size, true);
+  view.setUint16(4, 1, true);
+  view.setUint32(8, urlOffset, true);
+  view.setUint32(12, urlBytes.byteLength, true);
+  view.setUint32(16, methodOffset, true);
+  view.setUint32(20, methodBytes.byteLength, true);
+  view.setUint32(24, headerSize, true);
+  view.setUint32(28, 0, true);
+  view.setUint32(32, size, true);
+  view.setUint32(36, 0, true);
+  record.set(urlBytes, urlOffset);
+  record.set(methodBytes, methodOffset);
+  return record;
+}
+
+function readSpan(record: Uint8Array, offset: number, len: number): Uint8Array {
+  return record.subarray(offset, offset + len);
+}
+
+function decodeNativeFetchResponse(record: Uint8Array): {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+} {
+  const view = new DataView(
+    record.buffer,
+    record.byteOffset,
+    record.byteLength,
+  );
+  expect(view.getUint32(0, true)).toEqual(record.byteLength);
+  expect(view.getUint16(4, true)).toEqual(1);
+  const headersOffset = view.getUint32(12, true);
+  const headersCount = view.getUint32(16, true);
+  const headers: Record<string, string> = {};
+  for (let idx = 0; idx < headersCount; idx++) {
+    const at = headersOffset + idx * 16;
+    const key = dec.decode(readSpan(
+      record,
+      view.getUint32(at, true),
+      view.getUint32(at + 4, true),
+    ));
+    headers[key] = dec.decode(readSpan(
+      record,
+      view.getUint32(at + 8, true),
+      view.getUint32(at + 12, true),
+    ));
+  }
+  const bodyOffset = view.getUint32(20, true);
+  const bodyLen = view.getUint32(24, true);
+  return {
+    status: view.getUint32(8, true),
+    headers,
+    body: dec.decode(readSpan(record, bodyOffset, bodyLen)),
+  };
+}
+
 describe("DenoFetch + DenoTcpSocket via JSPI", () => {
   it("denoFetch performs real HTTP and the wasm caller suspends", async () => {
     if (!HAS_JSPI) return;
@@ -45,21 +113,14 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
       host.fetch = denoFetch;
       const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
 
-      const reqJson = JSON.stringify({
-        url: `http://127.0.0.1:${port}/greeting`,
-        method: "GET",
-      });
       const out = await mk.syscallAsync(
         METHOD.SYS_FETCH,
-        new TextEncoder().encode(reqJson),
+        nativeFetchRequest(`http://127.0.0.1:${port}/greeting`, "GET"),
         16 * 1024,
       );
       const used = Number(out.rc);
       expect(used).toBeGreaterThan(0);
-      const resp = JSON.parse(
-        new TextDecoder().decode(out.response.subarray(0, used)),
-      );
-      expect(resp.ok).toEqual(true);
+      const resp = decodeNativeFetchResponse(out.response.subarray(0, used));
       expect(resp.status).toEqual(200);
       expect(resp.body).toEqual("hello /greeting");
       expect(resp.headers["x-test"]).toEqual("yes");
