@@ -124,12 +124,17 @@ Deno.test(
 );
 
 Deno.test(
-  "makeWorkerDispatcherBodies: kernelMutex serializes body invocations",
-  async () => {
-    // Even though current bodies are synchronous, the lock keeps a
-    // FIFO chain that any future async body will observe. Drive it
-    // through the chain with concurrent calls and verify the order
-    // they OBSERVE is the order they were issued.
+  "makeWorkerDispatcherBodies: writeFd delivers bytes to buffer target in invocation order",
+  () => {
+    // This is the property we guarantee today: bodies are synchronous,
+    // the main event loop serializes message-handler dispatch, and a
+    // sequence of writeFd calls against the same buffer target lands
+    // chunks in the buffer in the order the calls were issued. The
+    // assertion is by per-chunk identity (one chunk per write, in
+    // order) AND by concatenated payload — either alone would let a
+    // buggy implementation pass (a single coalesced write would pass
+    // the concat check; an out-of-order multi-chunk write would pass
+    // the count check).
     const kernel = new ProcessKernel();
     const pid = kernel.allocPid(0, "test");
     const buffer = createBufferTarget(Infinity);
@@ -142,16 +147,28 @@ Deno.test(
     });
 
     const ENC = (s: string) => new TextEncoder().encode(s);
-    bodies.writeFd(1, ENC("a"));
-    bodies.writeFd(1, ENC("b"));
-    bodies.writeFd(1, ENC("c"));
-    // Allow any chained Promise tails to settle.
-    await Promise.resolve();
-    await Promise.resolve();
+    const r1 = bodies.writeFd(1, ENC("alpha"));
+    const r2 = bodies.writeFd(1, ENC("beta"));
+    const r3 = bodies.writeFd(1, ENC("gamma"));
+    assertEquals(r1, 5);
+    assertEquals(r2, 4);
+    assertEquals(r3, 5);
+
+    // One chunk per writeFd call — the body pushes a copy per call,
+    // it does not coalesce.
     assertEquals(buffer.buf.length, 3);
-    assertEquals(new TextDecoder().decode(buffer.buf[0]), "a");
-    assertEquals(new TextDecoder().decode(buffer.buf[1]), "b");
-    assertEquals(new TextDecoder().decode(buffer.buf[2]), "c");
+    assertEquals(new TextDecoder().decode(buffer.buf[0]), "alpha");
+    assertEquals(new TextDecoder().decode(buffer.buf[1]), "beta");
+    assertEquals(new TextDecoder().decode(buffer.buf[2]), "gamma");
+
+    // Concatenated stream order matches issue order.
+    const joined = new Uint8Array(buffer.total);
+    let off = 0;
+    for (const chunk of buffer.buf) {
+      joined.set(chunk, off);
+      off += chunk.byteLength;
+    }
+    assertEquals(new TextDecoder().decode(joined), "alphabetagamma");
 
     kernel.dispose();
   },

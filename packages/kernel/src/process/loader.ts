@@ -198,14 +198,15 @@ export async function loadProcess(
   }));
   const workerSabMemory = resolveWorkerSabMemory(profile, opts.workerSabMemory);
   // Build worker-host dispatcher bodies once per process so every
-  // spawned pthread shares the same kernel-mutex closure. The bodies
-  // are passed through `defaultSpawnThread` so each Worker gets a
-  // per-thread SAB with the same main-side dispatcher attached.
+  // spawned pthread shares the same kernel/threads-backend references
+  // (and any future per-process lock state the bodies grow). The
+  // bodies are passed through `defaultSpawnThread` so each Worker gets
+  // a per-thread SAB with the same main-side dispatcher attached.
   //
   // Both `callerPid` (allocated later, after the backend is built so
   // pid-rollback semantics on threading-rejection are preserved) and
   // `threadsBackend` are late-bound via accessor closures. The body
-  // factory itself runs eagerly so the `kernelMutex` closure is
+  // factory itself runs eagerly so any per-process closure state is
   // shared across every worker that this process spawns.
   let pidRef: number | null = null;
   let threadsBackendRef: ThreadsBackend | null = null;
