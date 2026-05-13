@@ -127,18 +127,17 @@ extern "C" {
 #endif
 
 /* struct ucred — peer credentials returned by SO_PEERCRED.
- * With -D__linux__ (e.g. BusyBox), the WASI sysroot exposes a full struct
- * ucred via #include_next above; without it the sysroot gives only a forward
- * declaration, so we complete the type here. */
-#ifndef __linux__
-#ifndef _HAVE_STRUCT_UCRED
-#define _HAVE_STRUCT_UCRED
+ * The WASI sysroot defines struct ucred only inside #ifdef _GNU_SOURCE.
+ * yurt-cc always injects -D__linux__ but never -D_GNU_SOURCE, so without
+ * _GNU_SOURCE the sysroot provides nothing; we define it here instead.
+ * BusyBox activates _GNU_SOURCE through its own headers so the sysroot
+ * covers that case; guard on _GNU_SOURCE to avoid double-definition there. */
+#ifndef _GNU_SOURCE
 struct ucred {
     pid_t pid;
     uid_t uid;
     gid_t gid;
 };
-#endif
 #endif
 
 /* struct cmsghdr and CMSG_* macros — wasi-libc's __struct_msghdr.h only
