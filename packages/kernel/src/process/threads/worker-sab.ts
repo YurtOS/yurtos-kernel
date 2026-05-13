@@ -77,7 +77,7 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
     },
   ];
   private tids = new ThreadIdScope();
-  private readonly sab: SharedArrayBuffer;
+  private readonly memory: WebAssembly.Memory;
 
   constructor(
     private readonly options: WorkerSabThreadsBackendOptions,
@@ -88,7 +88,26 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
         "WorkerSabThreadsBackend requires a WebAssembly.Memory backed by SharedArrayBuffer",
       );
     }
-    this.sab = memory.buffer;
+    this.memory = memory;
+  }
+
+  /**
+   * Re-read `memory.buffer` on every access. With wasm32-wasip1-threads
+   * the guest grows linear memory at runtime (e.g. pthread stack alloc
+   * during CPython startup). On V8 each `memory.grow()` returns a NEW
+   * SharedArrayBuffer with the larger byteLength; the previously
+   * observed SAB stays at its old size. Caching `memory.buffer` once in
+   * the constructor (or anywhere outside the per-call path) leaves
+   * SabMutex/SabCondvar constructing `new Int32Array(staleSAB, ptr, 1)`
+   * with `ptr` past the stale byteLength once the guest moves a
+   * mutex/condvar into the grown region, raising
+   * "RangeError: Invalid typed array length: 1".
+   */
+  private get sab(): SharedArrayBuffer {
+    // Constructor verified `memory.buffer instanceof SharedArrayBuffer`.
+    // The `as unknown as` bounce satisfies TS5.7+'s stricter view that
+    // `ArrayBuffer` and `SharedArrayBuffer` no longer share an interface.
+    return this.memory.buffer as unknown as SharedArrayBuffer;
   }
 
   setIndirectCallTable(_table: IndirectCallTable): void {

@@ -142,6 +142,15 @@ export interface LoaderContext {
     wasiHost: WasiHost,
     threadsBackend: ThreadsBackend,
     mainInstance: () => WebAssembly.Instance | null,
+    /**
+     * For threaded modules, the actual `WebAssembly.Memory` bound to
+     * `env.memory` (SAB-backed). `null` for non-threaded modules,
+     * which export their own memory. The Phase 1 dlopen loader uses
+     * this when the main module imports memory (no exported `memory`
+     * on the instance) to satisfy a side module's `env.memory`
+     * import.
+     */
+    mainImportedMemory: WebAssembly.Memory | null,
   ): Record<string, WebAssembly.ImportValue>;
   makeFdReadAndClear(
     pid: number,
@@ -304,6 +313,7 @@ export async function loadProcess(
       wasi,
       threadsBackend,
       () => mainInstanceRef,
+      workerSabMemory ?? null,
     ),
     ...(opts.extraYurtImports?.(memoryProxy, wasi) ?? {}),
   };
@@ -489,6 +499,10 @@ export async function loadProcess(
           childWasi,
           childThreadsBackend,
           () => childInstanceRef,
+          // Child processes (fork+exec) under the cooperative-serial
+          // backend export their own memory; no imported-memory
+          // accessor needed.
+          null,
         ),
         ...(opts.extraYurtImports?.(childMemoryProxy, childWasi) ?? {}),
       };

@@ -1090,6 +1090,7 @@ export class Sandbox {
         wasiHost,
         threadsBackend,
         mainInstance,
+        mainImportedMemory,
       ) => {
         const kernelImports = createKernelImports({
           memory,
@@ -1110,6 +1111,13 @@ export class Sandbox {
           // with "main module not ready" — see PR #23 + the abi_test
           // dlopen-canary happy_path case.
           mainInstance,
+          // For threaded main modules (target=wasm32-wasip1-threads +
+          // --import-memory), `mainInstance.exports.memory` is undefined
+          // because the module imports `env.memory` rather than exporting.
+          // The dlopen loader needs the SAB-backed `WebAssembly.Memory`
+          // to satisfy the side module's `env.memory` import; we pass it
+          // through here from loader.ts where workerSabMemory was bound.
+          mainImportedMemory,
           spawnProcess: (req, fdTable) => {
             const commandLabel = req.argv0 ?? req.prog;
             const childPid = kernel.allocPid(pid);

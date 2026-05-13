@@ -142,6 +142,19 @@ export interface KernelImportsOptions {
    * error). See packages/kernel/src/process/dynlink.ts.
    */
   mainInstance?: () => WebAssembly.Instance | null;
+
+  /**
+   * The `WebAssembly.Memory` instance the main module imports from
+   * `env.memory`, or `null` when the main module exports its own
+   * memory. Threaded modules (target=wasm32-wasip1-threads with
+   * `-Wl,--import-memory --shared-memory`) import a SAB-backed
+   * memory and don't export `memory` — the Phase 1 dlopen loader
+   * needs this reference to satisfy side modules' `env.memory`
+   * imports, since `mainInstance.exports.memory` is undefined.
+   * Defaults to `null` for backwards-compatibility with non-threaded
+   * callers.
+   */
+  mainImportedMemory?: WebAssembly.Memory | null;
 }
 
 const ERR_NOT_FOUND = -1;
@@ -3857,7 +3870,17 @@ export function createKernelImports(
           yurtImports: getYurtImportSnapshot(),
           mainAccess: () => {
             const inst = opts.mainInstance?.() ?? null;
-            return inst === null ? undefined : mainAccessFromInstance(inst);
+            if (inst === null) return undefined;
+            // Thread-capable main modules import memory rather than
+            // exporting it (target=wasm32-wasip1-threads + --import-memory).
+            // `opts.mainImportedMemory` holds the SAB-backed reference
+            // the kernel bound to `env.memory`; passing it lets the
+            // loader satisfy the side module's `env.memory` import
+            // even though `inst.exports.memory` is undefined.
+            return mainAccessFromInstance(
+              inst,
+              opts.mainImportedMemory ?? undefined,
+            );
           },
         });
         lastDlError = "";

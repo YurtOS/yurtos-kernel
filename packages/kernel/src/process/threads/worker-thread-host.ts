@@ -78,7 +78,7 @@ workerSelf.onmessage = async (e: MessageEvent<StartMessage>) => {
     wasi_snapshot_preview1: {},
   };
   for (const imp of WebAssembly.Module.imports(module)) {
-    const ns = (imports[imp.module] ?? {}) as Record<string, unknown>;
+    const ns = (imports[imp.module] ?? {}) as WebAssembly.ModuleImports;
     imports[imp.module] = ns;
     if (imp.name in ns) continue;
     if (imp.kind === "function") {

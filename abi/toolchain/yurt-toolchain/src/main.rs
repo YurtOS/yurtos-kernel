@@ -231,20 +231,31 @@ fn build_clang_invocation(
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
     argv.push(format!("--sysroot={}", sdk.sysroot().display()).into());
+    // Threads-by-default: every yurt-cc invocation now targets
+    // wasm32-wasip1-threads and emits thread-capable wasm. Only the
+    // asyncify continuation runtime opts back out
+    // (YURT_CC_USE_CONTINUATION=1) — asyncify and the Worker/SAB threads
+    // backend are mutually exclusive (the kernel routes them via
+    // `analyzeYurtModule` ⇒ mutually-exclusive backends in
+    // packages/kernel/src/process/module-profile.ts).
+    //
+    // Side modules (`yurt-cc -shared`) also use the threaded target so
+    // their `env.memory` import matches the always-threaded main
+    // module's shared memory. wasi-sdk-33's wasm32-wasip1-threads
+    // `__init_tls.c.obj` is not PIC-clean, so side modules MUST be
+    // built with `-nostdlib -Wl,--no-entry` — that's the caller's
+    // responsibility (see abi/Makefile libyurt_dlcanary rule).
+    //
     // wasi-libc's TLS-bound symbols (errno, locale state) live only in
     // the wasm32-wasip1-threads sysroot. The non-threaded sysroot
     // declares errno in .bss; linking it against -pthread-compiled
     // objects (which emit R_WASM_MEMORY_ADDR_TLS_SLEB relocations on
     // errno) produces "relocation cannot be used against non-TLS
-    // symbol" link errors. Switch target so wasi-libc supplies TLS
-    // variants when threads are enabled.
-    if env.use_threads {
+    // symbol" link errors. The threads sysroot supplies TLS variants
+    // so -pthread-compiled objects link cleanly.
+    let emit_threads = !env.use_continuation;
+    if emit_threads {
         argv.push("--target=wasm32-wasip1-threads".into());
-    } else {
-        argv.push("--target=wasm32-wasip1".into());
-    }
-    if env.use_threads {
-        // YURT_CC_USE_THREADS=1: coerce clang to emit thread-capable wasm.
         // -pthread defines _REENTRANT and enables pthread-aware libc paths;
         // -matomics emits wasm atomics ops (memory.atomic.*, i32.atomic.rmw,
         // …) required for pthread_mutex_t init etc.; -mbulk-memory enables
@@ -253,6 +264,8 @@ fn build_clang_invocation(
         argv.push("-pthread".into());
         argv.push("-matomics".into());
         argv.push("-mbulk-memory".into());
+    } else {
+        argv.push("--target=wasm32-wasip1".into());
     }
     if final_yurt_link {
         argv.push("-O2".into());
@@ -425,7 +438,7 @@ fn build_clang_invocation(
         argv.push("-DYURT_USE_CONTINUATION=1".into());
         argv.push("-DYURT_USE_SETJMP=1".into());
     }
-    if env.use_threads && final_yurt_link {
+    if emit_threads && final_yurt_link {
         // Final-link only: declare memory as an import (not an export) and
         // mark it shared (SAB-backed). The kernel's WorkerSabThreadsBackend
         // binds a SharedArrayBuffer-backed WebAssembly.Memory to env.memory
@@ -437,10 +450,11 @@ fn build_clang_invocation(
         // diagnostic between libyurt_abi.a (built without threads) and the
         // canary (built with threads). yurt_pthread.c itself doesn't emit
         // atomics — it delegates to host_thread_* host imports — so the
-        // mismatch is benign for the threading surface. Rebuilding
-        // libyurt_abi.a with -matomics -mbulk-memory is the cleaner long-
-        // term fix; we start with --no-check-features and tighten later
-        // if needed.
+        // mismatch is benign for the threading surface. With abi/Makefile
+        // now baking -pthread -matomics -mbulk-memory into the standard
+        // YURT_CFLAGS, the archive and canaries align, but we keep
+        // --no-check-features as a belt-and-braces guard for builds that
+        // mix in objects from outside the archive (e.g., yurt-ports).
         if !contains_exact_arg(user_args, "-Wl,--import-memory") {
             argv.push("-Wl,--import-memory".into());
         }
@@ -552,8 +566,12 @@ fn main() -> Result<ExitCode> {
             wasm_opt::maybe_run(&out_path, &env.wasm_opt, env.use_continuation)?;
             if env.use_continuation {
                 features::append_continuation_features(&out_path)?;
-            }
-            if env.use_threads {
+            } else {
+                // Threads-by-default: every non-continuation build stamps
+                // `yurt.features = ["threads"]` so the kernel's
+                // `analyzeYurtModule` routes the module through
+                // `WorkerSabThreadsBackend`. Continuations and threads are
+                // mutually exclusive (asyncify vs. Workers).
                 features::append_threads_features(&out_path)?;
             }
         }
@@ -644,7 +662,6 @@ mod tests {
             preserve_pre_opt: None,
             wasm_opt: env::WasmOptMode::Default,
             use_continuation: false,
-            use_threads: false,
             markers_enabled: false,
             instrumentation,
         }

@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::Result;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -17,14 +17,11 @@ pub struct Env {
     /// YURT_CC_USE_CONTINUATION=1 opts this linked module into the Asyncify
     /// continuation runtime used by setjmp/longjmp and fork. This flag makes
     /// yurt-cc asyncify the output and mark the wasm with yurt.features.
+    ///
+    /// Mutually exclusive with threads (the default build). Asyncify and the
+    /// Worker/SAB threads backend cannot coexist in a single module — see
+    /// packages/kernel/src/process/module-profile.ts.
     pub use_continuation: bool,
-    /// YURT_CC_USE_THREADS=1 opts this linked module into the Worker/SAB
-    /// pthread backend. yurt-cc stamps `yurt.features = ["threads"]` so
-    /// the kernel's `analyzeYurtModule` routes the module through
-    /// `WorkerSabThreadsBackend`. Mutually exclusive with
-    /// `use_continuation` (asyncify vs. Workers — see
-    /// packages/kernel/src/process/module-profile.ts).
-    pub use_threads: bool,
     /// YURT_CC_MARKERS=1 enables instrumented mode: yurt-cc passes
     /// `-DYURT_ABI_MARKERS=1` to clang and forces
     /// `__yurt_abi_marker_*` exports at link time.
@@ -90,9 +87,11 @@ impl Env {
             use_continuation: var_os(["YURT_CC_USE_CONTINUATION", "YURT_CC_USE_SETJMP"])
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false),
-            use_threads: var_os(["YURT_CC_USE_THREADS"])
-                .map(|v| v != "0" && !v.is_empty())
-                .unwrap_or(false),
+            // YURT_CC_USE_THREADS is intentionally NOT read: every yurt-cc
+            // invocation now emits thread-capable wasm by default
+            // (target=wasm32-wasip1-threads, -pthread, imported shared
+            // memory, yurt.features:["threads"]). Build scripts that still
+            // set `YURT_CC_USE_THREADS=1` are harmless no-ops.
             // Off by default.  CI / production builds use structural
             // verification; flip to "1" while iterating on the compat
             // layer to enable marker-based per-symbol verification.
@@ -103,19 +102,14 @@ impl Env {
         }
     }
 
-    /// Feature-flag invariants. Continuations and threads are mutually
-    /// exclusive at the runtime layer: continuations are implemented via
-    /// asyncify (single-thread) while threads requires a non-asyncified
-    /// module routed through `WorkerSabThreadsBackend`. The kernel's
-    /// `analyzeYurtModule` would still detect the conflict downstream,
-    /// but failing early at link time gives a cleaner error.
+    /// Feature-flag invariants. Threads are on by default and implicit
+    /// (no `use_threads` field — see the doc comment on this struct).
+    /// `use_continuation` is the only remaining feature toggle; it opts a
+    /// build into the asyncify continuation runtime, which is mutually
+    /// exclusive with the Worker/SAB threads backend. main.rs handles the
+    /// mutual exclusion by suppressing the threads codegen path whenever
+    /// `use_continuation` is set; no env-time validation is needed today.
     pub fn validate_feature_flags(&self) -> Result<()> {
-        if self.use_continuation && self.use_threads {
-            bail!(
-                "YURT_CC_USE_CONTINUATION and YURT_CC_USE_THREADS are mutually exclusive \
-                 (asyncify and Worker/SAB backends cannot coexist in a single module)"
-            );
-        }
         Ok(())
     }
 }

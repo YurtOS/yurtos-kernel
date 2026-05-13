@@ -375,12 +375,34 @@ export interface MainModuleAccess {
 
 export function mainAccessFromInstance(
   instance: WebAssembly.Instance,
+  /**
+   * Fallback memory when the main module imports memory instead of
+   * exporting it. Thread-capable modules (target=wasm32-wasip1-threads,
+   * `-Wl,--import-memory --shared-memory`) bind the SAB-backed memory
+   * through `env.memory` rather than emitting it as an export, so
+   * `instance.exports.memory` is undefined on those modules. The kernel
+   * holds the same memory reference and can pass it in here.
+   *
+   * The caller asserts this argument refers to a valid memory; the
+   * type is intentionally permissive (a memory-shaped object) because
+   * the host wires it through `memoryProxy` in loader.ts, which
+   * forwards `.buffer` / `.grow()` to the real `WebAssembly.Memory`
+   * but does NOT satisfy `instanceof WebAssembly.Memory`. The loader
+   * only ever uses `memory.buffer` and `memory.grow()` on this object.
+   *
+   * Backwards-compatible: non-threaded main modules still expose
+   * memory via exports, so this argument is optional.
+   */
+  importedMemory?: WebAssembly.Memory,
 ): MainModuleAccess | undefined {
-  const memory = instance.exports.memory;
+  const exportedMemory = instance.exports.memory;
+  const memory = exportedMemory instanceof WebAssembly.Memory
+    ? exportedMemory
+    : importedMemory;
   const table = instance.exports.__indirect_function_table;
   const alloc = instance.exports.__alloc;
   if (
-    !(memory instanceof WebAssembly.Memory) ||
+    !memory ||
     !(table instanceof WebAssembly.Table) ||
     typeof alloc !== "function"
   ) {
