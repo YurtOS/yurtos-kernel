@@ -2696,6 +2696,109 @@ export function createKernelImports(
       return target.recvAsync(target.socket, outCap).then(writeRecv);
     },
 
+    // host_socket_sendmsg(sockfd, data_ptr, data_len, fds_ptr, fds_count) -> bytes | -1
+    // SCM_RIGHTS: send bytes + ancillary fd handles.
+    // Reads data_len bytes from data_ptr; reads fds_count i32 fd numbers from
+    // fds_ptr (fds_ptr == 0 means no ancillary fds).
+    host_socket_sendmsg(
+      sockfd: number,
+      dataPtr: number,
+      dataLen: number,
+      fdsPtr: number,
+      fdsCount: number,
+    ): number {
+      try {
+        if (!opts.kernel) return -1;
+        const target = opts.kernel.getFdTarget(callerPid, sockfd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return -1;
+        }
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        const bytes = new Uint8Array(memory.buffer, dataPtr, dataLen).slice();
+        let ancFds: number[] | undefined;
+        if (fdsPtr !== 0 && fdsCount > 0) {
+          const view = new DataView(memory.buffer);
+          // Dup each ancillary fd so it survives the sender closing the original.
+          ancFds = Array.from(
+            { length: fdsCount },
+            (_, i) =>
+              opts.kernel!.dup(callerPid, view.getInt32(fdsPtr + i * 4, true)),
+          );
+        }
+        const rawHandle = -(target.socket);
+        const result = registry.sendWithAnc(
+          rawHandle,
+          bytes,
+          ancFds,
+          callerPid,
+        );
+        return result.ok ? result.bytesSent : -1;
+      } catch {
+        return -1;
+      }
+    },
+
+    // host_socket_recvmsg(sockfd, buf_ptr, buf_cap, fds_ptr, fds_cap, n_fds_ptr)
+    //   -> bytes | -1 (EIO) | -2 (EAGAIN)
+    // Writes received bytes to buf_ptr; writes received fd numbers as i32 LE
+    // starting at fds_ptr; writes the fd count as i32 LE at n_fds_ptr.
+    // fds_ptr == 0 means the caller has no ancillary buffer. Async (JSPI).
+    async host_socket_recvmsg(
+      sockfd: number,
+      bufPtr: number,
+      bufCap: number,
+      fdsPtr: number,
+      fdsCap: number,
+      nFdsPtr: number,
+    ): Promise<number> {
+      try {
+        if (!opts.kernel) return -1;
+        const target = opts.kernel.getFdTarget(callerPid, sockfd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return -1;
+        }
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        const rawHandle = -(target.socket);
+        const ancBefore = registry.peekAnc(rawHandle);
+        const result = await registry.recvAsync(rawHandle, bufCap);
+        if (!result.ok) return result.error === "EAGAIN" ? -2 : -1;
+        const bytes = result.bytes;
+        const n = Math.min(bytes.length, bufCap);
+        new Uint8Array(memory.buffer, bufPtr, n).set(bytes.subarray(0, n));
+        const anc = ancBefore ?? registry.popWaiterAnc(rawHandle);
+        const view = new DataView(memory.buffer);
+        let nFds = 0;
+        if (anc) {
+          const senderPid = anc.senderPid;
+          const toReceive = fdsPtr !== 0 && fdsCap > 0
+            ? anc.fds.slice(0, fdsCap)
+            : [];
+          for (const dupFd of toReceive) {
+            try {
+              const newFd = opts.kernel.dupFromProcess(
+                callerPid,
+                senderPid,
+                dupFd,
+              );
+              view.setInt32(fdsPtr + nFds * 4, newFd, true);
+              nFds++;
+            } finally {
+              opts.kernel.closeFd(senderPid, dupFd);
+            }
+          }
+          for (const dupFd of anc.fds.slice(toReceive.length)) {
+            opts.kernel.closeFd(senderPid, dupFd);
+          }
+        }
+        if (nFdsPtr !== 0) view.setInt32(nFdsPtr, nFds, true);
+        return n;
+      } catch {
+        return -1;
+      }
+    },
+
     // host_socket_close(fd) -> 0 / -errno
     host_socket_close(fd: number): number {
       const target = opts.kernel?.getFdTarget(callerPid, fd);

@@ -12,6 +12,8 @@ const scopedImports = [
   "host_socket_addr",
   "host_socket_send",
   "host_socket_recv",
+  "host_socket_sendmsg",
+  "host_socket_recvmsg",
   "host_socket_close",
   "host_extension_invoke",
   "host_stat",

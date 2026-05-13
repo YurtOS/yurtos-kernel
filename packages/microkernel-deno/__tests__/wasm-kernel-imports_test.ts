@@ -408,7 +408,7 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(got).toEqual("hello");
   });
 
-  it("does not expose the defunct host_native_invoke wrapper", async () => {
+  it("does not expose the defunct host_native_invoke wrapper", () => {
     const { mk } = capturingMk(0);
     const imports = buildWasmKernelImports(mk, () => new ArrayBuffer(64));
 

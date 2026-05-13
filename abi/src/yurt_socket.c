@@ -48,6 +48,8 @@ YURT_DECLARE_MARKER(listen);
 YURT_DECLARE_MARKER(accept);
 YURT_DECLARE_MARKER(send);
 YURT_DECLARE_MARKER(recv);
+YURT_DECLARE_MARKER(sendmsg);
+YURT_DECLARE_MARKER(recvmsg);
 YURT_DECLARE_MARKER(shutdown);
 
 YURT_DEFINE_MARKER(socket,     0x736f636bu) /* "sock" */
@@ -60,6 +62,8 @@ YURT_DEFINE_MARKER(listen,   0x6c73746eu) /* "lstn" */
 YURT_DEFINE_MARKER(accept,   0x61636370u) /* "accp" */
 YURT_DEFINE_MARKER(send,     0x73656e64u) /* "send" */
 YURT_DEFINE_MARKER(recv,     0x72656376u) /* "recv" */
+YURT_DEFINE_MARKER(sendmsg,  0x736d7367u) /* "smsg" */
+YURT_DEFINE_MARKER(recvmsg,  0x726d7367u) /* "rmsg" */
 YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 
 #define YURT_SOCKET_RESP_CAP 4096
@@ -894,4 +898,131 @@ int socketpair(int domain, int type, int protocol, int sv[2]) {
   sv[0] = acceptor;
   sv[1] = connector;
   return 0;
+}
+
+ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
+  YURT_MARKER_CALL(sendmsg);
+  if (!msg) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  size_t total = 0;
+  for (int i = 0; i < (int)msg->msg_iovlen; i++) total += msg->msg_iov[i].iov_len;
+
+  unsigned char *data = malloc(total ? total : 1);
+  if (!data) {
+    errno = ENOMEM;
+    return -1;
+  }
+
+  size_t off = 0;
+  for (int i = 0; i < (int)msg->msg_iovlen; i++) {
+    memcpy(data + off, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
+    off += msg->msg_iov[i].iov_len;
+  }
+
+  int fds_buf[64];
+  int fds_count = 0;
+  if (msg->msg_control && msg->msg_controllen > 0) {
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(msg);
+    while (cmsg && fds_count < 64) {
+      if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS) {
+        size_t fdcount = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        int *cmsg_fds = (int *)CMSG_DATA(cmsg);
+        for (size_t i = 0; i < fdcount && fds_count < 64; i++) {
+          fds_buf[fds_count++] = cmsg_fds[i];
+        }
+      }
+      cmsg = CMSG_NXTHDR(msg, cmsg);
+    }
+  }
+
+  int rc = yurt_host_socket_sendmsg(sockfd, (int)(intptr_t)data, (int)total,
+                                    fds_count > 0 ? (int)(intptr_t)fds_buf : 0,
+                                    fds_count);
+  free(data);
+  (void)flags;
+  if (rc < 0) {
+    errno = EIO;
+    return -1;
+  }
+  return (ssize_t)rc;
+}
+
+ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
+  YURT_MARKER_CALL(recvmsg);
+  if (!msg) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  size_t total_iov = 0;
+  for (int i = 0; i < (int)msg->msg_iovlen; i++) total_iov += msg->msg_iov[i].iov_len;
+  if (total_iov > YURT_SOCKET_RECV_MAX_RAW) total_iov = YURT_SOCKET_RECV_MAX_RAW;
+
+  unsigned char *buf = malloc(total_iov ? total_iov : 1);
+  if (!buf) {
+    errno = ENOMEM;
+    return -1;
+  }
+
+  size_t orig_controllen = msg->msg_controllen;
+  int max_fds = 0;
+  if (msg->msg_control && orig_controllen >= CMSG_SPACE(0)) {
+    max_fds = (int)((orig_controllen - CMSG_SPACE(0)) / sizeof(int));
+    if (max_fds > 64) max_fds = 64;
+  }
+
+  int recv_fds[64];
+  int n_fds = 0;
+  int rc = yurt_host_socket_recvmsg(sockfd, (int)(intptr_t)buf, (int)total_iov,
+                                    max_fds > 0 ? (int)(intptr_t)recv_fds : 0,
+                                    max_fds, (int)(intptr_t)&n_fds);
+  if (rc < 0) {
+    free(buf);
+    errno = rc == -2 ? EAGAIN : EIO;
+    return -1;
+  }
+  ssize_t nbytes = (ssize_t)rc;
+
+  size_t scatter_off = 0;
+  for (int i = 0; i < (int)msg->msg_iovlen && scatter_off < (size_t)nbytes; i++) {
+    size_t copy = msg->msg_iov[i].iov_len;
+    if (scatter_off + copy > (size_t)nbytes) copy = (size_t)nbytes - scatter_off;
+    memcpy(msg->msg_iov[i].iov_base, buf + scatter_off, copy);
+    scatter_off += copy;
+  }
+  free(buf);
+
+  msg->msg_controllen = 0;
+  msg->msg_flags = 0;
+  if (n_fds > 0 && msg->msg_control && orig_controllen > 0) {
+    struct cmsghdr *cmsg = (struct cmsghdr *)msg->msg_control;
+    size_t needed = CMSG_SPACE((size_t)n_fds * sizeof(int));
+    if (needed <= orig_controllen) {
+      cmsg->cmsg_len = (socklen_t)CMSG_LEN((size_t)n_fds * sizeof(int));
+      cmsg->cmsg_level = SOL_SOCKET;
+      cmsg->cmsg_type = SCM_RIGHTS;
+      memcpy(CMSG_DATA(cmsg), recv_fds, (size_t)n_fds * sizeof(int));
+      msg->msg_controllen = needed;
+    } else {
+      int fit = orig_controllen >= CMSG_SPACE(0)
+        ? (int)((orig_controllen - CMSG_SPACE(0)) / sizeof(int))
+        : 0;
+      if (fit > 0) {
+        cmsg->cmsg_len = (socklen_t)CMSG_LEN((size_t)fit * sizeof(int));
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        memcpy(CMSG_DATA(cmsg), recv_fds, (size_t)fit * sizeof(int));
+        msg->msg_controllen = CMSG_SPACE((size_t)fit * sizeof(int));
+      }
+      msg->msg_flags |= MSG_CTRUNC;
+    }
+  } else if (n_fds > 0) {
+    msg->msg_flags |= MSG_CTRUNC;
+  }
+
+  (void)flags;
+  return nbytes;
 }
