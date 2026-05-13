@@ -477,6 +477,9 @@ export class Sandbox {
       env: Object.fromEntries(env),
       stdoutLimit: secLimits?.stdoutBytes,
       stderrLimit: secLimits?.stderrBytes,
+      // Sandbox host supports SAB+Atomics+Worker — opt threaded modules
+      // into `WorkerSabThreadsBackend`.
+      workerSabAvailable: true,
       extraYurtImports: Sandbox.createBootImportFactory(
         vfs,
         mgr,
@@ -1162,6 +1165,9 @@ export class Sandbox {
               memoryBytes,
               stdoutLimit,
               stderrLimit,
+              // Sandbox host supports SAB+Atomics+Worker — opt threaded
+              // children into `WorkerSabThreadsBackend`.
+              workerSabAvailable: true,
               rollbackOnFailure: false,
             }).then(async (proc) => {
               processes.set(childPid, proc);
@@ -1843,6 +1849,12 @@ export class Sandbox {
       stderrToStdout: opts.stderrToStdout,
       stdoutLimit: this.security?.limits?.stdoutBytes,
       stderrLimit: this.security?.limits?.stderrBytes,
+      // Sandbox always runs on a host that supports SharedArrayBuffer +
+      // Atomics + Worker (Deno/Node). Opt in so threaded modules
+      // (yurt.features=["threads"]) route through
+      // `WorkerSabThreadsBackend` instead of being rejected by
+      // `validateYurtModuleProfile`.
+      workerSabAvailable: true,
       extraYurtImports: Sandbox.createBootImportFactory(
         this.vfs,
         this.mgr,
@@ -2129,6 +2141,9 @@ export class Sandbox {
       env: Object.fromEntries(childEnv),
       stdoutLimit: this.security?.limits?.stdoutBytes,
       stderrLimit: this.security?.limits?.stderrBytes,
+      // Sandbox host supports SAB+Atomics+Worker — opt threaded modules
+      // into `WorkerSabThreadsBackend`.
+      workerSabAvailable: true,
       extraYurtImports: Sandbox.createBootImportFactory(
         childVfs,
         childMgr,

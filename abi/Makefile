@@ -64,7 +64,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_version.o \
   $(BUILD_DIR)/yurt_write.o
 
-CANARY_NAMES := stdio sleep system popen affinity dup2 dlopen getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread pthread-main-exit unix
+CANARY_NAMES := stdio sleep system popen affinity dup2 dlopen getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread pthread-multi pthread-main-exit unix
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
 FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 
@@ -160,6 +160,25 @@ $(FORK_DEFAULT_CANARY): $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LI
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/fork-default-canary.pre-opt.wasm \
+	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
+
+# pthread canaries opt into the Worker/SAB threads backend so the kernel
+# routes them through `WorkerSabThreadsBackend` (see
+# packages/kernel/src/process/module-profile.ts — `hasThreadsFeature` ⇒
+# `threadsBackend: "worker-sab"`). YURT_CC_USE_THREADS=1 stamps the
+# `yurt.features = ["threads"]` custom section onto the output wasm.
+$(BUILD_DIR)/pthread-canary.wasm: $(CANARY_DIR)/pthread-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_USE_THREADS=1 \
+	YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/pthread-canary.pre-opt.wasm \
+	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
+
+$(BUILD_DIR)/pthread-multi-canary.wasm: $(CANARY_DIR)/pthread-multi-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_USE_THREADS=1 \
+	YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/pthread-multi-canary.pre-opt.wasm \
 	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
 
 $(BUILD_DIR)/%-canary.wasm: $(CANARY_DIR)/%-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain

@@ -449,6 +449,7 @@ fn main() -> Result<ExitCode> {
     let sdk = wasi_sdk::discover().context("locating wasi-sdk")?;
     let env = env::Env::from_process();
     validate_instrumentation(&env)?;
+    env.validate_feature_flags()?;
 
     if cli.print_sdk_path {
         println!("{}", sdk.root.display());
@@ -500,6 +501,9 @@ fn main() -> Result<ExitCode> {
             wasm_opt::maybe_run(&out_path, &env.wasm_opt, env.use_continuation)?;
             if env.use_continuation {
                 features::append_continuation_features(&out_path)?;
+            }
+            if env.use_threads {
+                features::append_threads_features(&out_path)?;
             }
         }
     }
@@ -589,6 +593,7 @@ mod tests {
             preserve_pre_opt: None,
             wasm_opt: env::WasmOptMode::Default,
             use_continuation: false,
+            use_threads: false,
             markers_enabled: false,
             instrumentation,
         }

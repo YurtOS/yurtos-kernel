@@ -1,3 +1,4 @@
+use anyhow::{bail, Result};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -17,6 +18,13 @@ pub struct Env {
     /// continuation runtime used by setjmp/longjmp and fork. This flag makes
     /// yurt-cc asyncify the output and mark the wasm with yurt.features.
     pub use_continuation: bool,
+    /// YURT_CC_USE_THREADS=1 opts this linked module into the Worker/SAB
+    /// pthread backend. yurt-cc stamps `yurt.features = ["threads"]` so
+    /// the kernel's `analyzeYurtModule` routes the module through
+    /// `WorkerSabThreadsBackend`. Mutually exclusive with
+    /// `use_continuation` (asyncify vs. Workers — see
+    /// packages/kernel/src/process/module-profile.ts).
+    pub use_threads: bool,
     /// YURT_CC_MARKERS=1 enables instrumented mode: yurt-cc passes
     /// `-DYURT_ABI_MARKERS=1` to clang and forces
     /// `__yurt_abi_marker_*` exports at link time.
@@ -82,6 +90,9 @@ impl Env {
             use_continuation: var_os(["YURT_CC_USE_CONTINUATION", "YURT_CC_USE_SETJMP"])
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(false),
+            use_threads: var_os(["YURT_CC_USE_THREADS"])
+                .map(|v| v != "0" && !v.is_empty())
+                .unwrap_or(false),
             // Off by default.  CI / production builds use structural
             // verification; flip to "1" while iterating on the compat
             // layer to enable marker-based per-symbol verification.
@@ -90,6 +101,22 @@ impl Env {
                 .unwrap_or(false),
             instrumentation: InstrumentationMode::from_env_value(var_os(["YURT_CC_INSTRUMENT"])),
         }
+    }
+
+    /// Feature-flag invariants. Continuations and threads are mutually
+    /// exclusive at the runtime layer: continuations are implemented via
+    /// asyncify (single-thread) while threads requires a non-asyncified
+    /// module routed through `WorkerSabThreadsBackend`. The kernel's
+    /// `analyzeYurtModule` would still detect the conflict downstream,
+    /// but failing early at link time gives a cleaner error.
+    pub fn validate_feature_flags(&self) -> Result<()> {
+        if self.use_continuation && self.use_threads {
+            bail!(
+                "YURT_CC_USE_CONTINUATION and YURT_CC_USE_THREADS are mutually exclusive \
+                 (asyncify and Worker/SAB backends cannot coexist in a single module)"
+            );
+        }
+        Ok(())
     }
 }
 
