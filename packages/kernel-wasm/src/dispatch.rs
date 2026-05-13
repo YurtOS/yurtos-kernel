@@ -101,17 +101,17 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_RENAME => rename(caller_pid, request),
         METHOD_SYS_SPAWN => sys_spawn(caller_pid, request),
         METHOD_SYS_FETCH => sys_fetch(request, response),
-        METHOD_SYS_SOCKET_CONNECT => sys_socket_connect(request),
-        METHOD_SYS_SOCKET_SEND => sys_socket_send(request),
-        METHOD_SYS_SOCKET_RECV => sys_socket_recv(request, response),
-        METHOD_SYS_SOCKET_CLOSE => sys_socket_close(request),
+        METHOD_SYS_SOCKET_CONNECT => sys_socket_connect(caller_pid, request),
+        METHOD_SYS_SOCKET_SEND => sys_socket_send(caller_pid, request),
+        METHOD_SYS_SOCKET_RECV => sys_socket_recv(caller_pid, request, response),
+        METHOD_SYS_SOCKET_CLOSE => sys_socket_close(caller_pid, request),
         METHOD_SYS_IDB_GET => sys_idb_get(request, response),
         METHOD_SYS_IDB_PUT => sys_idb_put(request),
         METHOD_SYS_IDB_DELETE => sys_idb_delete(request),
         METHOD_SYS_IDB_LIST => sys_idb_list(request, response),
-        METHOD_SYS_SOCKET_LISTEN => sys_socket_listen(request),
-        METHOD_SYS_SOCKET_ACCEPT => sys_socket_accept(request),
-        METHOD_SYS_SOCKET_ADDR => sys_socket_addr(request, response),
+        METHOD_SYS_SOCKET_LISTEN => sys_socket_listen(caller_pid, request),
+        METHOD_SYS_SOCKET_ACCEPT => sys_socket_accept(caller_pid, request),
+        METHOD_SYS_SOCKET_ADDR => sys_socket_addr(caller_pid, request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -599,21 +599,72 @@ fn close_fd(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([fd]) = read_u32_args::<1>(request) else {
         return -(abi::EINVAL as i64);
     };
-    with_kernel(|k| {
-        let removed = k.process_mut(caller_pid).fd_table.remove(fd);
-        match removed {
-            None => -(abi::EBADF as i64),
-            Some(crate::kernel::FdEntry::Pipe { id, end }) => {
-                k.pipe_dec_ref(id, end);
-                0
-            }
-            Some(crate::kernel::FdEntry::File { ofd_id }) => {
-                k.ofd_dec_ref(ofd_id);
-                0
-            }
-            Some(_) => 0,
+    close_fd_number(caller_pid, fd)
+}
+
+fn close_entry(k: &mut Kernel, entry: FdEntry) -> Option<i32> {
+    match entry {
+        crate::kernel::FdEntry::Pipe { id, end } => {
+            k.pipe_dec_ref(id, end);
+            None
         }
-    })
+        crate::kernel::FdEntry::File { ofd_id } => {
+            k.ofd_dec_ref(ofd_id);
+            None
+        }
+        crate::kernel::FdEntry::Socket { id } => k.socket_dec_ref(id),
+        _ => None,
+    }
+}
+
+fn close_fd_number(caller_pid: u32, fd: u32) -> i64 {
+    match with_kernel(|k| {
+        let removed = k.process_mut(caller_pid).fd_table.remove(fd);
+        removed
+            .map(|entry| close_entry(k, entry))
+            .ok_or(-(abi::EBADF as i64))
+    }) {
+        Err(rc) => rc,
+        Ok(Some(handle)) => kh::socket_close(handle) as i64,
+        Ok(None) => 0,
+    }
+}
+
+fn inc_entry_ref(k: &mut Kernel, entry: &FdEntry) {
+    match entry {
+        crate::kernel::FdEntry::Pipe { id, end } => {
+            if let Some(buf) = k.pipe_buf_mut(*id) {
+                buf.inc_ref(*end);
+            }
+        }
+        crate::kernel::FdEntry::File { ofd_id } => k.ofd_inc_ref(*ofd_id),
+        crate::kernel::FdEntry::Socket { id } => k.socket_inc_ref(*id),
+        _ => {}
+    }
+}
+
+fn socket_handle_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32) -> Result<i32, i64> {
+    let entry = k.process_mut(caller_pid).fd_table.entry(fd).cloned();
+    let Some(FdEntry::Socket { id }) = entry else {
+        return Err(-(abi::EBADF as i64));
+    };
+    k.socket(id)
+        .map(|socket| socket.handle)
+        .ok_or(-(abi::EBADF as i64))
+}
+
+fn install_socket_fd(
+    k: &mut Kernel,
+    caller_pid: u32,
+    handle: i32,
+    domain: u8,
+    sock_type: u8,
+) -> u32 {
+    let id = k.create_socket(handle, domain, sock_type);
+    let p = k.process_mut(caller_pid);
+    let fd = p.fd_table.lowest_free_fd();
+    p.fd_table.install(fd, FdEntry::Socket { id });
+    fd
 }
 
 /// `dup(oldfd: u32) -> newfd / -EBADF`. Increments pipe refcount when
@@ -627,15 +678,7 @@ fn dup_fd(caller_pid: u32, request: &[u8]) -> i64 {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
-        match &entry {
-            crate::kernel::FdEntry::Pipe { id, end } => {
-                if let Some(buf) = k.pipe_buf_mut(*id) {
-                    buf.inc_ref(*end);
-                }
-            }
-            crate::kernel::FdEntry::File { ofd_id } => k.ofd_inc_ref(*ofd_id),
-            _ => {}
-        }
+        inc_entry_ref(k, &entry);
         let p = k.process_mut(caller_pid);
         let newfd = p.fd_table.lowest_free_fd();
         p.fd_table.install(newfd, entry);
@@ -660,23 +703,18 @@ fn dup2_fd(caller_pid: u32, request: &[u8]) -> i64 {
         }
         // POSIX: newfd is silently closed first. Decrement its
         // refcount based on what kind of entry was sitting at newfd.
-        let prev = k.process_mut(caller_pid).fd_table.entry(newfd).cloned();
-        match prev {
-            Some(crate::kernel::FdEntry::Pipe { id, end }) => k.pipe_dec_ref(id, end),
-            Some(crate::kernel::FdEntry::File { ofd_id }) => k.ofd_dec_ref(ofd_id),
-            _ => {}
-        }
+        let close_handle = k
+            .process_mut(caller_pid)
+            .fd_table
+            .entry(newfd)
+            .cloned()
+            .and_then(|prev| close_entry(k, prev));
         // Increment the refcount for the new alias.
-        match &entry {
-            crate::kernel::FdEntry::Pipe { id, end } => {
-                if let Some(buf) = k.pipe_buf_mut(*id) {
-                    buf.inc_ref(*end);
-                }
-            }
-            crate::kernel::FdEntry::File { ofd_id } => k.ofd_inc_ref(*ofd_id),
-            _ => {}
-        }
+        inc_entry_ref(k, &entry);
         k.process_mut(caller_pid).fd_table.install(newfd, entry);
+        if let Some(handle) = close_handle {
+            let _ = kh::socket_close(handle);
+        }
         newfd as i64
     })
 }
@@ -771,6 +809,13 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                 }
                 n
             }
+            crate::kernel::FdEntry::Socket { id } => {
+                let handle = match k.socket(id) {
+                    Some(socket) => socket.handle,
+                    None => return -(abi::EBADF as i64),
+                };
+                kh::socket_recv(handle, response, 0)
+            }
         }
     })
 }
@@ -835,6 +880,13 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
                     }
                 }
                 n
+            }
+            crate::kernel::FdEntry::Socket { id } => {
+                let handle = match k.socket(id) {
+                    Some(socket) => socket.handle,
+                    None => return -(abi::EBADF as i64),
+                };
+                kh::socket_send(handle, payload)
             }
         }
     })
@@ -935,6 +987,15 @@ fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) ->
             };
             if buf.read_ends == 0 {
                 POLLERR
+            } else if wants_write {
+                POLLOUT
+            } else {
+                0
+            }
+        }
+        FdEntry::Socket { id } => {
+            if k.socket(id).is_none() {
+                POLLNVAL
             } else if wants_write {
                 POLLOUT
             } else {
@@ -1722,6 +1783,7 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             | crate::kernel::FdEntry::Stdout
             | crate::kernel::FdEntry::Stderr => (0, 2, 0o020_666),
             crate::kernel::FdEntry::Pipe { .. } => (0, 6, 0o010_600),
+            crate::kernel::FdEntry::Socket { .. } => (0, 6, 0o140_666),
             crate::kernel::FdEntry::File { ofd_id } => {
                 let (mount_id, inode) = match k.ofd(ofd_id) {
                     Some(o) => (o.mount_id, o.inode),
@@ -1906,11 +1968,11 @@ fn sys_idb_list(request: &[u8], response: &mut [u8]) -> i64 {
     kh::idb_list(store, prefix, response)
 }
 
-/// `sys_socket_listen(backlog, addr) -> handle`. Combines
+/// `sys_socket_listen(backlog, addr) -> fd`. Combines
 /// open+bind+listen so userland gets a usable listener in one
 /// hop. Request: u32 backlog LE + addr ('host:port', port=0
 /// = host-chosen).
-fn sys_socket_listen(request: &[u8]) -> i64 {
+fn sys_socket_listen(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
@@ -1919,77 +1981,129 @@ fn sys_socket_listen(request: &[u8]) -> i64 {
     if addr.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    kh::socket_listen_at(addr, backlog) as i64
+    let handle = kh::socket_listen_at(addr, backlog);
+    if handle < 0 {
+        return handle as i64;
+    }
+    with_kernel(|k| install_socket_fd(k, caller_pid, handle, 2, 1) as i64)
 }
 
-fn sys_socket_accept(request: &[u8]) -> i64 {
+fn sys_socket_accept(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 8 {
         return -(abi::EINVAL as i64);
     }
-    let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
-    kh::socket_accept(handle, flags) as i64
+    let (handle, domain, sock_type) =
+        match with_kernel(|k| socket_handle_domain_type_for_fd(k, caller_pid, fd)) {
+            Ok(triple) => triple,
+            Err(rc) => return rc,
+        };
+    let accepted = kh::socket_accept(handle, flags);
+    if accepted < 0 {
+        return accepted as i64;
+    }
+    with_kernel(|k| install_socket_fd(k, caller_pid, accepted, domain, sock_type) as i64)
 }
 
-fn sys_socket_addr(request: &[u8], response: &mut [u8]) -> i64 {
+fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     if response.is_empty() {
         return -(abi::EINVAL as i64);
     }
+    let handle = match with_kernel(|k| socket_handle_for_fd(k, caller_pid, fd)) {
+        Ok(handle) => handle,
+        Err(rc) => return rc,
+    };
     kh::socket_local_addr(handle, response)
 }
 
-/// `sys_socket_connect(addr_bytes) -> handle`. Request layout
+/// `sys_socket_connect(addr_bytes) -> fd`. Request layout
 /// matches the toml: u8 family + u8 sock_type + u16 _pad + u32
 /// flags + addr bytes (UTF-8 "host:port"). Returns the host
-/// handle directly — userland passes it to subsequent
-/// sys_socket_send/recv/close.
-fn sys_socket_connect(request: &[u8]) -> i64 {
+/// socket as a kernel fd — userland passes it to subsequent
+/// sys_socket_send/recv/close/read/write.
+fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 8 {
         return -(abi::EINVAL as i64);
     }
     // u8 family + u8 sock_type + u16 pad — currently unused; kept
     // in the wire format so future AF_INET6 / SOCK_DGRAM fits.
-    let _family = request[0];
-    let _sock_type = request[1];
+    let family = request[0];
+    let sock_type = request[1];
     let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
     let addr = &request[8..];
     if addr.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    kh::socket_connect(addr, flags) as i64
+    let handle = kh::socket_connect(addr, flags);
+    if handle < 0 {
+        return handle as i64;
+    }
+    with_kernel(|k| install_socket_fd(k, caller_pid, handle, family, sock_type) as i64)
 }
 
-fn sys_socket_send(request: &[u8]) -> i64 {
+fn socket_handle_domain_type_for_fd(
+    k: &mut Kernel,
+    caller_pid: u32,
+    fd: u32,
+) -> Result<(i32, u8, u8), i64> {
+    let entry = k.process_mut(caller_pid).fd_table.entry(fd).cloned();
+    let Some(FdEntry::Socket { id }) = entry else {
+        return Err(-(abi::EBADF as i64));
+    };
+    k.socket(id)
+        .map(|socket| (socket.handle, socket.domain, socket.sock_type))
+        .ok_or(-(abi::EBADF as i64))
+}
+
+fn sys_socket_send(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let data = &request[4..];
+    let handle = match with_kernel(|k| socket_handle_for_fd(k, caller_pid, fd)) {
+        Ok(handle) => handle,
+        Err(rc) => return rc,
+    };
     kh::socket_send(handle, data)
 }
 
-fn sys_socket_recv(request: &[u8], response: &mut [u8]) -> i64 {
+fn sys_socket_recv(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if request.len() < 8 {
         return -(abi::EINVAL as i64);
     }
-    let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
     if response.is_empty() {
         return -(abi::EINVAL as i64);
     }
+    let handle = match with_kernel(|k| socket_handle_for_fd(k, caller_pid, fd)) {
+        Ok(handle) => handle,
+        Err(rc) => return rc,
+    };
     kh::socket_recv(handle, response, flags)
 }
 
-fn sys_socket_close(request: &[u8]) -> i64 {
+fn sys_socket_close(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    let handle = i32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
-    kh::socket_close(handle) as i64
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let is_socket = with_kernel(|k| {
+        matches!(
+            k.process_mut(caller_pid).fd_table.entry(fd),
+            Some(FdEntry::Socket { .. })
+        )
+    });
+    if !is_socket {
+        return -(abi::EBADF as i64);
+    }
+    close_fd_number(caller_pid, fd)
 }
 
 /// `sys_fetch(yurt_fetch_request_v1) -> yurt_fetch_response_v1`. Forwards the
@@ -2363,6 +2477,34 @@ mod tests {
     fn poll_revents(response: &[u8], index: usize) -> i16 {
         let offset = index * 8 + 6;
         i16::from_le_bytes(response[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn socket_connect_req(family: u8, sock_type: u8, flags: u32, addr: &[u8]) -> Vec<u8> {
+        let mut req = vec![family, sock_type, 0, 0];
+        req.extend_from_slice(&flags.to_le_bytes());
+        req.extend_from_slice(addr);
+        req
+    }
+
+    fn socket_fd_req(fd: u32) -> [u8; 4] {
+        fd.to_le_bytes()
+    }
+
+    fn socket_accept_req(fd: u32, flags: u32) -> [u8; 8] {
+        let mut req = [0u8; 8];
+        req[0..4].copy_from_slice(&fd.to_le_bytes());
+        req[4..8].copy_from_slice(&flags.to_le_bytes());
+        req
+    }
+
+    fn socket_recv_req(fd: u32, flags: u32) -> [u8; 8] {
+        socket_accept_req(fd, flags)
+    }
+
+    fn socket_send_req(fd: u32, data: &[u8]) -> Vec<u8> {
+        let mut req = fd.to_le_bytes().to_vec();
+        req.extend_from_slice(data);
+        req
     }
 
     #[test]
@@ -2919,6 +3061,225 @@ mod tests {
             dispatch(METHOD_SYS_CLOSE, 2, &0_u32.to_le_bytes(), &mut []),
             -(abi::EBADF as i64)
         );
+    }
+
+    #[test]
+    fn socket_connect_allocates_kernel_fd_and_close_closes_host_handle() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+        crate::kh::test_support::push_socket_connect_result(77);
+
+        let req = socket_connect_req(2, 1, 0, b"127.0.0.1:1234");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 3);
+
+        assert_eq!(
+            crate::kh::test_support::socket_connect_calls(),
+            vec![(b"127.0.0.1:1234".to_vec(), 0)]
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_CLOSE, 1, &socket_fd_req(3), &mut []),
+            0
+        );
+        assert_eq!(crate::kh::test_support::socket_close_calls(), vec![77]);
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_CLOSE, 1, &socket_fd_req(3), &mut []),
+            -(abi::EBADF as i64)
+        );
+    }
+
+    #[test]
+    fn socket_dup_refcount_delays_host_close_until_last_fd() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+        crate::kh::test_support::push_socket_connect_result(88);
+
+        let req = socket_connect_req(2, 1, 0, b"127.0.0.1:1235");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 3);
+        assert_eq!(
+            dispatch(METHOD_SYS_DUP, 1, &3_u32.to_le_bytes(), &mut []),
+            4
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
+            0
+        );
+        assert!(crate::kh::test_support::socket_close_calls().is_empty());
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &4_u32.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(crate::kh::test_support::socket_close_calls(), vec![88]);
+    }
+
+    #[test]
+    fn socket_syscalls_resolve_kernel_fd_to_host_handle() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+        crate::kh::test_support::push_socket_connect_result(91);
+        crate::kh::test_support::push_socket_recv_result(b"pong");
+        crate::kh::test_support::push_socket_addr_result(b"127.0.0.1:6000");
+
+        let req = socket_connect_req(2, 1, 0, b"127.0.0.1:6000");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 3);
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SEND,
+                1,
+                &socket_send_req(3, b"ping"),
+                &mut []
+            ),
+            4
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_send_calls(),
+            vec![(91, b"ping".to_vec())]
+        );
+
+        let mut recv = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(3, 2), &mut recv),
+            4
+        );
+        assert_eq!(&recv[..4], b"pong");
+        assert_eq!(
+            crate::kh::test_support::socket_recv_calls(),
+            vec![(91, 8, 2)]
+        );
+
+        let mut addr = [0u8; 32];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_fd_req(3), &mut addr),
+            14
+        );
+        assert_eq!(&addr[..14], b"127.0.0.1:6000");
+        assert_eq!(crate::kh::test_support::socket_addr_calls(), vec![(91, 32)]);
+    }
+
+    #[test]
+    fn read_write_on_socket_fd_route_to_socket_recv_send() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+        crate::kh::test_support::push_socket_connect_result(95);
+        crate::kh::test_support::push_socket_recv_result(b"read-reply");
+
+        let req = socket_connect_req(2, 1, 0, b"127.0.0.1:6001");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 3);
+
+        let mut write_req = 3_u32.to_le_bytes().to_vec();
+        write_req.extend_from_slice(b"write-payload");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []),
+            b"write-payload".len() as i64
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_send_calls(),
+            vec![(95, b"write-payload".to_vec())]
+        );
+
+        let mut read_buf = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &3_u32.to_le_bytes(), &mut read_buf),
+            b"read-reply".len() as i64
+        );
+        assert_eq!(&read_buf[..10], b"read-reply");
+        assert_eq!(
+            crate::kh::test_support::socket_recv_calls(),
+            vec![(95, 16, 0)]
+        );
+    }
+
+    #[test]
+    fn socket_accept_returns_kernel_fd_for_accepted_host_handle() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+        crate::kh::test_support::push_socket_listen_result(101);
+        crate::kh::test_support::push_socket_accept_result(102);
+
+        let mut listen_req = 16_u32.to_le_bytes().to_vec();
+        listen_req.extend_from_slice(b"127.0.0.1:0");
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_LISTEN, 1, &listen_req, &mut []),
+            3
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_ACCEPT,
+                1,
+                &socket_accept_req(3, 1),
+                &mut []
+            ),
+            4
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_accept_calls(),
+            vec![(101, 1)]
+        );
+    }
+
+    #[test]
+    fn socket_operations_reject_non_socket_fds() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SEND,
+                1,
+                &socket_send_req(1, b"x"),
+                &mut []
+            ),
+            -(abi::EBADF as i64)
+        );
+        let mut buf = [0u8; 4];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(1, 0), &mut buf),
+            -(abi::EBADF as i64)
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_ACCEPT,
+                1,
+                &socket_accept_req(1, 0),
+                &mut []
+            ),
+            -(abi::EBADF as i64)
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_send_calls(),
+            Vec::<(i32, Vec<u8>)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_recv_calls(),
+            Vec::<(i32, usize, u32)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_accept_calls(),
+            Vec::<(i32, u32)>::new()
+        );
+    }
+
+    #[test]
+    fn poll_reports_socket_write_readiness_and_closed_fd_invalid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+        crate::kh::test_support::push_socket_connect_result(111);
+
+        let req = socket_connect_req(2, 1, 0, b"127.0.0.1:7000");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 3);
+
+        let req = poll_req(0, &[(3, POLLIN | POLLOUT)]);
+        let mut out = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_POLL, 1, &req, &mut out), 1);
+        assert_eq!(poll_revents(&out, 0), POLLOUT);
+
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
+            0
+        );
+        let req = poll_req(0, &[(3, POLLOUT)]);
+        let mut out = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_POLL, 1, &req, &mut out), 1);
+        assert_eq!(poll_revents(&out, 0), POLLNVAL);
     }
 
     #[test]
@@ -3924,12 +4285,15 @@ mod tests {
     }
 
     #[test]
-    fn socket_send_accepts_fd_plus_payload_contract() {
+    fn socket_send_rejects_unknown_kernel_fd() {
         let _g = crate::kernel::TestGuard::acquire();
         let mut req = Vec::new();
         req.extend_from_slice(&7_u32.to_le_bytes());
         req.extend_from_slice(b"abc");
-        assert_eq!(dispatch(METHOD_SYS_SOCKET_SEND, 1, &req, &mut []), -38);
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_SEND, 1, &req, &mut []),
+            -(abi::EBADF as i64)
+        );
     }
 
     #[test]

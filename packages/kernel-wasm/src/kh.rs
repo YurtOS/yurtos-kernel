@@ -188,37 +188,91 @@ unsafe fn kh_real_rename(
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_socket_connect(_addr_ptr: *const u8, _addr_len: usize, _flags: u32) -> i32 {
-    -38
+    #[cfg(test)]
+    {
+        let addr = std::slice::from_raw_parts(_addr_ptr, _addr_len);
+        test_support::socket_connect(addr, _flags)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_socket_send(_handle: i32, _data_ptr: *const u8, _data_len: usize) -> i64 {
-    -38
+    #[cfg(test)]
+    {
+        let data = std::slice::from_raw_parts(_data_ptr, _data_len);
+        test_support::socket_send(_handle, data)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_socket_recv(_handle: i32, _out_ptr: *mut u8, _len: usize, _flags: u32) -> i64 {
-    -38
+    #[cfg(test)]
+    {
+        let out = std::slice::from_raw_parts_mut(_out_ptr, _len);
+        test_support::socket_recv(_handle, out, _flags)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_socket_close(_handle: i32) -> i32 {
-    -38
+    #[cfg(test)]
+    {
+        test_support::socket_close(_handle)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_socket_listen_at(_addr_ptr: *const u8, _addr_len: usize, _backlog: u32) -> i32 {
-    -38
+    #[cfg(test)]
+    {
+        let addr = std::slice::from_raw_parts(_addr_ptr, _addr_len);
+        test_support::socket_listen_at(addr, _backlog)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_socket_accept_blocking(_handle: i32, _flags: u32) -> i32 {
-    -38
+    #[cfg(test)]
+    {
+        test_support::socket_accept(_handle, _flags)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_socket_local_addr(_handle: i32, _out_ptr: *mut u8, _out_cap: usize) -> i64 {
-    -38
+    #[cfg(test)]
+    {
+        let out = std::slice::from_raw_parts_mut(_out_ptr, _out_cap);
+        test_support::socket_local_addr(_handle, out)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -441,6 +495,141 @@ pub fn socket_accept(handle: i32, flags: u32) -> i32 {
 
 pub fn socket_local_addr(handle: i32, out: &mut [u8]) -> i64 {
     unsafe { kh_socket_local_addr(handle, out.as_mut_ptr(), out.len()) }
+}
+
+#[cfg(test)]
+pub mod test_support {
+    use std::collections::VecDeque;
+    use std::sync::{LazyLock, Mutex};
+
+    #[derive(Default)]
+    struct SocketMock {
+        connect_results: VecDeque<i32>,
+        listen_results: VecDeque<i32>,
+        accept_results: VecDeque<i32>,
+        recv_results: VecDeque<Vec<u8>>,
+        addr_results: VecDeque<Vec<u8>>,
+        connect_calls: Vec<(Vec<u8>, u32)>,
+        listen_calls: Vec<(Vec<u8>, u32)>,
+        accept_calls: Vec<(i32, u32)>,
+        send_calls: Vec<(i32, Vec<u8>)>,
+        recv_calls: Vec<(i32, usize, u32)>,
+        addr_calls: Vec<(i32, usize)>,
+        close_calls: Vec<i32>,
+    }
+
+    static SOCKET_MOCK: LazyLock<Mutex<SocketMock>> =
+        LazyLock::new(|| Mutex::new(SocketMock::default()));
+
+    pub fn reset_socket_mock() {
+        *SOCKET_MOCK.lock().unwrap() = SocketMock::default();
+    }
+
+    pub fn push_socket_connect_result(handle: i32) {
+        SOCKET_MOCK
+            .lock()
+            .unwrap()
+            .connect_results
+            .push_back(handle);
+    }
+
+    pub fn push_socket_listen_result(handle: i32) {
+        SOCKET_MOCK.lock().unwrap().listen_results.push_back(handle);
+    }
+
+    pub fn push_socket_accept_result(handle: i32) {
+        SOCKET_MOCK.lock().unwrap().accept_results.push_back(handle);
+    }
+
+    pub fn push_socket_recv_result(bytes: &[u8]) {
+        SOCKET_MOCK
+            .lock()
+            .unwrap()
+            .recv_results
+            .push_back(bytes.to_vec());
+    }
+
+    pub fn push_socket_addr_result(bytes: &[u8]) {
+        SOCKET_MOCK
+            .lock()
+            .unwrap()
+            .addr_results
+            .push_back(bytes.to_vec());
+    }
+
+    pub fn socket_connect_calls() -> Vec<(Vec<u8>, u32)> {
+        SOCKET_MOCK.lock().unwrap().connect_calls.clone()
+    }
+
+    pub fn socket_send_calls() -> Vec<(i32, Vec<u8>)> {
+        SOCKET_MOCK.lock().unwrap().send_calls.clone()
+    }
+
+    pub fn socket_recv_calls() -> Vec<(i32, usize, u32)> {
+        SOCKET_MOCK.lock().unwrap().recv_calls.clone()
+    }
+
+    pub fn socket_addr_calls() -> Vec<(i32, usize)> {
+        SOCKET_MOCK.lock().unwrap().addr_calls.clone()
+    }
+
+    pub fn socket_accept_calls() -> Vec<(i32, u32)> {
+        SOCKET_MOCK.lock().unwrap().accept_calls.clone()
+    }
+
+    pub fn socket_close_calls() -> Vec<i32> {
+        SOCKET_MOCK.lock().unwrap().close_calls.clone()
+    }
+
+    pub(super) fn socket_connect(addr: &[u8], flags: u32) -> i32 {
+        let mut mock = SOCKET_MOCK.lock().unwrap();
+        mock.connect_calls.push((addr.to_vec(), flags));
+        mock.connect_results.pop_front().unwrap_or(-38)
+    }
+
+    pub(super) fn socket_send(handle: i32, data: &[u8]) -> i64 {
+        SOCKET_MOCK
+            .lock()
+            .unwrap()
+            .send_calls
+            .push((handle, data.to_vec()));
+        data.len() as i64
+    }
+
+    pub(super) fn socket_recv(handle: i32, out: &mut [u8], flags: u32) -> i64 {
+        let mut mock = SOCKET_MOCK.lock().unwrap();
+        mock.recv_calls.push((handle, out.len(), flags));
+        let bytes = mock.recv_results.pop_front().unwrap_or_default();
+        let n = bytes.len().min(out.len());
+        out[..n].copy_from_slice(&bytes[..n]);
+        n as i64
+    }
+
+    pub(super) fn socket_close(handle: i32) -> i32 {
+        SOCKET_MOCK.lock().unwrap().close_calls.push(handle);
+        0
+    }
+
+    pub(super) fn socket_listen_at(addr: &[u8], backlog: u32) -> i32 {
+        let mut mock = SOCKET_MOCK.lock().unwrap();
+        mock.listen_calls.push((addr.to_vec(), backlog));
+        mock.listen_results.pop_front().unwrap_or(-38)
+    }
+
+    pub(super) fn socket_accept(handle: i32, flags: u32) -> i32 {
+        let mut mock = SOCKET_MOCK.lock().unwrap();
+        mock.accept_calls.push((handle, flags));
+        mock.accept_results.pop_front().unwrap_or(-38)
+    }
+
+    pub(super) fn socket_local_addr(handle: i32, out: &mut [u8]) -> i64 {
+        let mut mock = SOCKET_MOCK.lock().unwrap();
+        mock.addr_calls.push((handle, out.len()));
+        let bytes = mock.addr_results.pop_front().unwrap_or_default();
+        let n = bytes.len().min(out.len());
+        out[..n].copy_from_slice(&bytes[..n]);
+        n as i64
+    }
 }
 
 pub fn idb_get(store: &[u8], key: &[u8], out: &mut [u8]) -> i64 {

@@ -110,7 +110,11 @@ pub enum FdEntry {
     File {
         ofd_id: u64,
     },
-    // Future: Socket { id: u64 }
+    /// Kernel-owned POSIX socket. `id` references a [`SocketEntry`] in
+    /// `Kernel::sockets`; the entry owns the KH socket handle and refcount.
+    Socket {
+        id: u64,
+    },
 }
 
 /// Per-pid file-descriptor table. Sparse — closed fds are absent.
@@ -372,6 +376,13 @@ pub struct OpenFileDescription {
     pub writable: bool,
 }
 
+pub struct SocketEntry {
+    pub handle: i32,
+    pub refs: u32,
+    pub domain: u8,
+    pub sock_type: u8,
+}
+
 pub struct Kernel {
     processes: BTreeMap<Pid, Process>,
     pipes: BTreeMap<u64, PipeBuf>,
@@ -381,6 +392,8 @@ pub struct Kernel {
     pub vfs: crate::vfs::MountTable,
     ofds: BTreeMap<u64, OpenFileDescription>,
     next_ofd_id: u64,
+    sockets: BTreeMap<u64, SocketEntry>,
+    next_socket_id: u64,
     /// MetadataOverlay — `(mount_id, inode) → Metadata`.
     /// chmod/chown/utimens write here; fstat reads composed
     /// override → backend default → kernel fallback. Survives the
@@ -467,6 +480,8 @@ impl Kernel {
             vfs,
             ofds: BTreeMap::new(),
             next_ofd_id: 1,
+            sockets: BTreeMap::new(),
+            next_socket_id: 1,
             metadata_overrides: BTreeMap::new(),
             pending_spawns: VecDeque::new(),
             next_spawn_pid: 1000,
@@ -610,6 +625,44 @@ impl Kernel {
 
     pub fn ofd(&self, id: u64) -> Option<&OpenFileDescription> {
         self.ofds.get(&id)
+    }
+
+    pub fn create_socket(&mut self, handle: i32, domain: u8, sock_type: u8) -> u64 {
+        let id = self.next_socket_id;
+        self.next_socket_id += 1;
+        self.sockets.insert(
+            id,
+            SocketEntry {
+                handle,
+                refs: 1,
+                domain,
+                sock_type,
+            },
+        );
+        id
+    }
+
+    pub fn socket(&self, id: u64) -> Option<&SocketEntry> {
+        self.sockets.get(&id)
+    }
+
+    pub fn socket_inc_ref(&mut self, id: u64) {
+        if let Some(socket) = self.sockets.get_mut(&id) {
+            socket.refs += 1;
+        }
+    }
+
+    pub fn socket_dec_ref(&mut self, id: u64) -> Option<i32> {
+        let close_handle = if let Some(socket) = self.sockets.get_mut(&id) {
+            socket.refs = socket.refs.saturating_sub(1);
+            (socket.refs == 0).then_some(socket.handle)
+        } else {
+            None
+        };
+        if close_handle.is_some() {
+            self.sockets.remove(&id);
+        }
+        close_handle
     }
 
     /// Increment the refcount on an OFD (dup / dup2).
@@ -866,6 +919,8 @@ pub fn reset_for_tests() {
     k.vfs.clear();
     k.ofds.clear();
     k.next_ofd_id = 1;
+    k.sockets.clear();
+    k.next_socket_id = 1;
     k.metadata_overrides.clear();
     k.next_host_pid = 1;
     k.next_spawn_pid = 1000;

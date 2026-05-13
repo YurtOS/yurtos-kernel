@@ -346,17 +346,17 @@ doc = "Close a socket fd previously returned from sys_socket_connect. Request by
 [method.sys_socket_listen]
 id = 0x1_0039
 kind = "syscall"
-doc = "Bind to `host:port` and start accepting. Request: u32 backlog LE + addr (UTF-8 'host:port' — port=0 lets the kernel pick). Returns a non-negative listener handle or negated errno. Use sys_socket_addr to retrieve the actually-bound port (matches the existing TS bridge's actualPort surface — cross-sandbox loopback routes the user-requested port to the actual one)."
+doc = "Bind to `host:port` and start accepting. Request: u32 backlog LE + addr (UTF-8 'host:port' — port=0 lets the kernel pick). Returns a non-negative listener fd or negated errno. Use sys_socket_addr to retrieve the actually-bound port (matches the existing TS bridge's actualPort surface — cross-sandbox loopback routes the user-requested port to the actual one)."
 
 [method.sys_socket_accept]
 id = 0x1_003A
 kind = "syscall"
-doc = "Block until an incoming connection arrives on `listener_handle`. Request: u32 handle LE + u32 flags LE (KH_SOCK_NONBLOCK = 1). Returns the new connection's socket fd (the same kind sys_socket_connect returns), -EAGAIN with NONBLOCK, or other negated errno."
+doc = "Block until an incoming connection arrives on `listener_fd`. Request: u32 fd LE + u32 flags LE (KH_SOCK_NONBLOCK = 1). Returns the new connection's socket fd (the same kind sys_socket_connect returns), -EAGAIN with NONBLOCK, or other negated errno."
 
 [method.sys_socket_addr]
 id = 0x1_003B
 kind = "syscall"
-doc = "Return the bound address of `handle`. Request: u32 handle LE. Response: u16 port LE + addr bytes (UTF-8 'host'). Returns bytes-written or -EBADF. Used after listen() with port=0 to discover which concrete port the host actually bound."
+doc = "Return the bound address of a socket fd. Request: u32 fd LE. Response: u16 port LE + addr bytes (UTF-8 'host'). Returns bytes-written or -EBADF. Used after listen() with port=0 to discover which concrete port the host actually bound."
 
 [method.sys_realpath]
 id = 0x1_003C
