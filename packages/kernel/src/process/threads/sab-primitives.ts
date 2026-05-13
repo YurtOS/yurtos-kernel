@@ -11,6 +11,14 @@ export class SabMutex {
     return Atomics.compareExchange(this.view, 0, 0, tid) === 0;
   }
 
+  lock(tid: number): void {
+    while (true) {
+      const previous = Atomics.compareExchange(this.view, 0, 0, tid);
+      if (previous === 0) return;
+      Atomics.wait(this.view, 0, previous);
+    }
+  }
+
   unlock(tid: number): void {
     if (Atomics.compareExchange(this.view, 0, tid, 0) !== tid) {
       throw new Error("SabMutex.unlock: not the owner");
