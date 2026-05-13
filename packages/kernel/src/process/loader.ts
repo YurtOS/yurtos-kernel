@@ -19,7 +19,10 @@ import {
 } from "../async-bridge.js";
 import { CooperativeSerialBackend } from "./threads/cooperative-serial.js";
 import { createThreadsBackend } from "./threads/backend-factory.js";
-import type { WorkerSabThreadsBackendOptions } from "./threads/worker-sab.js";
+import {
+  defaultSpawnThread,
+  type WorkerSabThreadsBackendOptions,
+} from "./threads/worker-sab.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
 import type {
   LinearStackSwitchingThreadsBackend,
@@ -35,7 +38,65 @@ import {
   moduleNeedsAsyncifyBridge,
   validateYurtModuleProfile,
   validateYurtThreadMemory,
+  type YurtModuleProfile,
 } from "./module-profile.js";
+
+/**
+ * Default size (in 64KB wasm pages) for a SAB-backed memory allocated when a
+ * threaded module imports `env.memory` but the caller didn't supply one. The
+ * initial reservation matches a typical libc-style heap; the maximum is the
+ * 32-bit wasm limit (4GB) so brk()/sbrk()/mmap() can grow up to that bound.
+ */
+const DEFAULT_WORKER_SAB_INITIAL_PAGES = 16;
+const DEFAULT_WORKER_SAB_MAXIMUM_PAGES = 16384;
+
+/**
+ * Decide which SharedArrayBuffer-backed `WebAssembly.Memory` to hand to a
+ * threaded module's import object and to the WorkerSabThreadsBackend.
+ *
+ * - If the profile isn't a threaded module with a memory import, returns
+ *   undefined (caller may still pass workerSabMemory through, but the loader
+ *   won't consume it for thread wiring).
+ * - If the caller supplied `provided`, validate it has a SharedArrayBuffer
+ *   backing and return it as-is.
+ * - Otherwise allocate a fresh shared memory sized for a libc-style heap.
+ */
+export function resolveWorkerSabMemory(
+  profile: YurtModuleProfile,
+  provided: WebAssembly.Memory | undefined,
+): WebAssembly.Memory | undefined {
+  if (!profile.requiresSharedMemory || !profile.memoryImport) {
+    return provided;
+  }
+  if (provided) {
+    validateYurtThreadMemory(profile, provided);
+    return provided;
+  }
+  return new WebAssembly.Memory({
+    initial: DEFAULT_WORKER_SAB_INITIAL_PAGES,
+    maximum: DEFAULT_WORKER_SAB_MAXIMUM_PAGES,
+    shared: true,
+  });
+}
+
+/**
+ * Decide which WorkerSabThreadsBackendOptions to pass to the backend factory.
+ *
+ * If the caller supplied options, use them. Otherwise, for a threaded module
+ * with a resolved SAB-backed memory, default-construct a spawner that boots a
+ * Worker hosting a cloned WASM instance via `defaultSpawnThread(module,
+ * memory)`. Returns undefined when there's no memory to back the spawner.
+ */
+export function resolveWorkerSabThreads(
+  profile: YurtModuleProfile,
+  module: WebAssembly.Module,
+  memory: WebAssembly.Memory | undefined,
+  provided: WorkerSabThreadsBackendOptions | undefined,
+): WorkerSabThreadsBackendOptions | undefined {
+  if (provided) return provided;
+  if (!profile.requiresSharedMemory || !memory) return undefined;
+  return { spawnThread: defaultSpawnThread(module, memory) };
+}
 
 type WasmCallable = (...args: unknown[]) => unknown;
 
@@ -119,22 +180,25 @@ export async function loadProcess(
   const digest = await sha256Hex(bytes);
   const module = await (ctx.moduleCache ?? defaultWasmModuleCache)
     .getOrCompile(digest, bytes);
-  const workerSabAvailable = Boolean(opts.workerSabThreads) &&
-    (opts.workerSabAvailable ?? true);
+  // Worker/SAB capability gating: callers opt in either explicitly via
+  // `workerSabAvailable`, or implicitly by supplying a SAB memory or a
+  // `WorkerSabThreadsBackend` spawner. Unopted callers (most of today's
+  // code) leave the profile in `unsupported` for threaded modules.
+  const workerSabAvailable = opts.workerSabAvailable ??
+    Boolean(opts.workerSabMemory || opts.workerSabThreads);
   const profile = validateYurtModuleProfile(analyzeYurtModule(module, {
     workerSabAvailable,
   }));
-  if (profile.requiresSharedMemory && profile.memoryImport) {
-    if (!opts.workerSabMemory) {
-      throw new Error(
-        "module imports shared memory for yurt.features threads but no Worker/SAB memory was provided",
-      );
-    }
-    validateYurtThreadMemory(profile, opts.workerSabMemory);
-  }
+  const workerSabMemory = resolveWorkerSabMemory(profile, opts.workerSabMemory);
+  const workerSabThreads = resolveWorkerSabThreads(
+    profile,
+    module,
+    workerSabMemory,
+    opts.workerSabThreads,
+  );
   const threadsBackend = createThreadsBackend(profile, {
-    workerSab: opts.workerSabThreads,
-    workerSabMemory: opts.workerSabMemory,
+    workerSab: workerSabThreads,
+    workerSabMemory,
   });
   const wasiArgv = opts.wasiArgv ?? argv;
   const cwd = opts.cwd ?? "/";
@@ -251,11 +315,11 @@ export async function loadProcess(
       wasi_snapshot_preview1: wasiImports,
       yurt: yurtImports,
     };
-    if (profile.memoryImport && opts.workerSabMemory) {
+    if (profile.memoryImport && workerSabMemory) {
       const namespace = imports[profile.memoryImport.module] ?? {};
       imports[profile.memoryImport.module] = {
         ...namespace,
-        [profile.memoryImport.name]: opts.workerSabMemory,
+        [profile.memoryImport.name]: workerSabMemory,
       };
     }
     instance = await ctx.adapter.instantiate(module, imports);
@@ -279,7 +343,7 @@ export async function loadProcess(
   memoryRef = exportedMemory instanceof WebAssembly.Memory
     ? exportedMemory
     : profile.memoryImport
-    ? opts.workerSabMemory ?? null
+    ? workerSabMemory ?? null
     : null;
   if (!memoryRef) {
     rollback();
