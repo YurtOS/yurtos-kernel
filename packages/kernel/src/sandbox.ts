@@ -1100,7 +1100,6 @@ export class Sandbox {
           runtimeBackend,
           extensionRegistry,
           mgr,
-          nativeModules: mgr.nativeModules,
           threadsBackend,
           // Phase 1 shared-library loader reads this to call back into
           // the main module's __alloc / __indirect_function_table.

@@ -104,7 +104,7 @@ impl Inode {
     }
 }
 
-/// Result of a stat call (matches TypeScript `StatResult` + host_stat JSON).
+/// Result of a stat call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatResult {
     pub is_file: bool,

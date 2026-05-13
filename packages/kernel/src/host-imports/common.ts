@@ -2,7 +2,7 @@
  * Buffer read/write helpers for WASM linear memory.
  *
  * These utilities are shared by host import modules.
- * They handle the low-level task of moving strings, JSON, and raw bytes
+ * They handle the low-level task of moving strings and raw bytes
  * between the TypeScript host and the WASM guest's linear memory.
  */
 
@@ -56,26 +56,6 @@ export function readSpan(
   if (len === 0) return new Uint8Array();
   if (off < 0 || len < 0 || off > size || len > size - off) return null;
   return new Uint8Array(memory.buffer, base + off, len).slice();
-}
-
-/**
- * Write a JSON-serialized object into the WASM output buffer.
- * Returns bytes written on success, or the required size if the buffer
- * is too small (caller should allocate a larger buffer and retry).
- */
-export function writeJson(
-  memory: WebAssembly.Memory,
-  ptr: number,
-  cap: number,
-  obj: unknown,
-): number {
-  const json = JSON.stringify(obj);
-  const encoded = new TextEncoder().encode(json);
-  if (encoded.length > cap) {
-    return encoded.length; // signal "need more space"
-  }
-  new Uint8Array(memory.buffer, ptr, encoded.length).set(encoded);
-  return encoded.length;
 }
 
 /**

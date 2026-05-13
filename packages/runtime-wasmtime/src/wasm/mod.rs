@@ -29,7 +29,6 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bytes::Bytes;
-use serde_json::json;
 use wasmtime::{Caller, Config, Engine, Linker, Store};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 use wasmtime_wasi::{async_trait, ResourceTable, WasiCtx, WasiCtxBuilder, WasiView};
@@ -67,6 +66,54 @@ fn encode_process_list_record(list: &[kernel::ProcessInfo]) -> Vec<u8> {
         out[at + 16..at + 20].copy_from_slice(&(command.len() as u32).to_le_bytes());
         out[cursor..cursor + command.len()].copy_from_slice(command);
         cursor += command.len();
+    }
+    out
+}
+
+fn encode_stat_record(s: &crate::vfs::StatResult) -> Vec<u8> {
+    let size = 32usize;
+    let mut out = vec![0u8; size];
+    let mut type_bits = 0u32;
+    if s.is_file {
+        type_bits |= 1;
+    }
+    if s.is_dir {
+        type_bits |= 2;
+    }
+    if s.is_symlink {
+        type_bits |= 4;
+    }
+    out[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+    out[4..6].copy_from_slice(&1u16.to_le_bytes());
+    out[8..12].copy_from_slice(&type_bits.to_le_bytes());
+    out[12..16].copy_from_slice(&s.permissions.to_le_bytes());
+    out[16..24].copy_from_slice(&(s.size as u64).to_le_bytes());
+    out[24..32].copy_from_slice(&s.mtime.to_le_bytes());
+    out
+}
+
+fn encode_string_list_record(values: &[String]) -> Vec<u8> {
+    let header_size = 24usize;
+    let entry_size = 8usize;
+    let entries_offset = header_size;
+    let strings_offset = entries_offset + values.len() * entry_size;
+    let strings_len = values.iter().map(|value| value.len()).sum::<usize>();
+    let size = strings_offset + strings_len;
+    let mut out = vec![0u8; size];
+    out[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+    out[4..6].copy_from_slice(&1u16.to_le_bytes());
+    out[8..12].copy_from_slice(&(values.len() as u32).to_le_bytes());
+    out[12..16].copy_from_slice(&(entries_offset as u32).to_le_bytes());
+    out[16..20].copy_from_slice(&(strings_offset as u32).to_le_bytes());
+    out[20..24].copy_from_slice(&(strings_len as u32).to_le_bytes());
+    let mut cursor = 0usize;
+    for (idx, value) in values.iter().enumerate() {
+        let at = entries_offset + idx * entry_size;
+        let bytes = value.as_bytes();
+        out[at..at + 4].copy_from_slice(&(cursor as u32).to_le_bytes());
+        out[at + 4..at + 8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        out[strings_offset + cursor..strings_offset + cursor + bytes.len()].copy_from_slice(bytes);
+        cursor += bytes.len();
     }
     out
 }
@@ -394,30 +441,8 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
             let path = read_str(&mut c, path_ptr, path_len);
             match c.data().vfs.stat(&path) {
                 Ok(s) => {
-                    let j = json!({
-                        "exists": true,
-                        "is_file": s.is_file,
-                        "is_dir": s.is_dir,
-                        "is_symlink": s.is_symlink,
-                        "size": s.size as u64,
-                        "mode": s.permissions,
-                        "mtime_ms": s.mtime,
-                    })
-                    .to_string();
-                    write_out(&mut c, out_ptr, out_cap, j.as_bytes())
-                }
-                Err(VfsError::NotFound(_)) => {
-                    let j = json!({
-                        "exists": false,
-                        "is_file": false,
-                        "is_dir": false,
-                        "is_symlink": false,
-                        "size": 0u64,
-                        "mode": 0u32,
-                        "mtime_ms": 0u64,
-                    })
-                    .to_string();
-                    write_out(&mut c, out_ptr, out_cap, j.as_bytes())
+                    let record = encode_stat_record(&s);
+                    write_out(&mut c, out_ptr, out_cap, &record)
                 }
                 Err(e) => vfs_rc(&e),
             }
@@ -479,9 +504,9 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
             let path = read_str(&mut c, path_ptr, path_len);
             match c.data().vfs.readdir(&path) {
                 Ok(entries) => {
-                    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-                    let j = serde_json::to_string(&names).unwrap_or_default();
-                    write_out(&mut c, out_ptr, out_cap, j.as_bytes())
+                    let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+                    let record = encode_string_list_record(&names);
+                    write_out(&mut c, out_ptr, out_cap, &record)
                 }
                 Err(e) => vfs_rc(&e),
             }
@@ -550,8 +575,8 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
          -> i32 {
             let pattern = read_str(&mut c, pat_ptr, pat_len);
             let paths = c.data().vfs.glob_paths(&pattern);
-            let j = serde_json::to_string(&paths).unwrap_or_default();
-            write_out(&mut c, out_ptr, out_cap, j.as_bytes())
+            let record = encode_string_list_record(&paths);
+            write_out(&mut c, out_ptr, out_cap, &record)
         },
     )?;
 
@@ -813,10 +838,28 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         "yurt",
         "host_spawn_async",
         |mut c: Caller<'_, StoreData>, req_ptr: u32, req_len: u32| -> i32 {
-            let req_str = read_str(&mut c, req_ptr, req_len);
-            let req: SpawnRequest = match serde_json::from_str(&req_str) {
-                Ok(r) => r,
-                Err(_) => return -3,
+            let req_bytes = read_mem(&mut c, req_ptr, req_len);
+            let native_req = match decode_spawn_request(&req_bytes) {
+                Ok(req) => req,
+                Err(e) => return e.errno(),
+            };
+            if !native_req.fd_map.is_empty() {
+                return -38;
+            }
+            let req = SpawnRequest {
+                prog: native_req.prog,
+                args: native_req.args,
+                env: native_req
+                    .env
+                    .into_iter()
+                    .map(|(key, value)| [key, value])
+                    .collect(),
+                cwd: native_req.cwd.unwrap_or_else(|| "/home/user".to_owned()),
+                stdin_fd: native_req.stdin_fd,
+                stdout_fd: native_req.stdout_fd,
+                stderr_fd: native_req.stderr_fd,
+                stdin_data: native_req.stdin_data.unwrap_or_default(),
+                nice: native_req.nice.clamp(0, 19) as u8,
             };
 
             let spawn_ctx = match c.data().spawn_ctx.clone() {

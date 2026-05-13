@@ -312,7 +312,6 @@ class WorkerResidentRunner {
           wasiHost,
           networkBridge: this.networkBridge,
           extensionHandler: this.extensionHandler,
-          nativeModules: mgr.nativeModules,
           threadsBackend,
           mainInstance,
           spawnProcess: (req, fdTable) => {

@@ -38,7 +38,6 @@ import {
   mainAccessFromInstance,
 } from "../process/dynlink.js";
 import type { ExtensionRegistry } from "../extension/registry.js";
-import type { NativeModuleRegistry } from "../process/native-modules.js";
 import type {
   ProcessCredentials,
   ProcessKernel,
@@ -64,7 +63,6 @@ import {
   readSpan,
   readString,
   writeBytes,
-  writeJson,
   writeString,
 } from "./common.js";
 import { resolveHostname } from "../platform/dns.js";
@@ -119,9 +117,6 @@ export interface KernelImportsOptions {
     fdTable: Map<number, FdTarget>,
     parentPid: number,
   ) => number;
-
-  /** Registry of dynamically loaded native Python module WASMs. */
-  nativeModules?: NativeModuleRegistry;
 
   /** Active WASI host for guest-side fd operations such as dup2 on stdio. */
   wasiHost?: WasiHost;
@@ -233,11 +228,79 @@ function writeSpawnResult(
 }
 
 const NATIVE_RECORD_VERSION_1 = 1;
+const STAT_RECORD_SIZE = 32;
+const FILE_TYPE_FILE = 1;
+const FILE_TYPE_DIR = 2;
+const FILE_TYPE_SYMLINK = 4;
 const SPAWN_REQUEST_V1_SIZE = 88;
 const SPAN_SIZE = 8;
 const ENV_PAIR_SIZE = 16;
 const FD_MAP_PAIR_SIZE = 8;
 const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
+
+function writeStatRecord(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  stat: { type: string; permissions: number; size: number; mtime?: Date },
+): number {
+  if (cap < STAT_RECORD_SIZE) return STAT_RECORD_SIZE;
+  const end = ptr + STAT_RECORD_SIZE;
+  if (ptr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+  const view = new DataView(memory.buffer);
+  let typeBits = 0;
+  if (stat.type === "file") typeBits |= FILE_TYPE_FILE;
+  if (stat.type === "dir") typeBits |= FILE_TYPE_DIR;
+  if (stat.type === "symlink") typeBits |= FILE_TYPE_SYMLINK;
+  view.setUint32(ptr, STAT_RECORD_SIZE, true);
+  view.setUint16(ptr + 4, NATIVE_RECORD_VERSION_1, true);
+  view.setUint16(ptr + 6, 0, true);
+  view.setUint32(ptr + 8, typeBits, true);
+  view.setUint32(ptr + 12, stat.permissions >>> 0, true);
+  view.setBigUint64(ptr + 16, BigInt(stat.size), true);
+  view.setBigUint64(ptr + 24, BigInt(stat.mtime?.getTime() ?? 0), true);
+  return STAT_RECORD_SIZE;
+}
+
+function writeStringListRecord(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  values: string[],
+): number {
+  const encoded = values.map((value) => new TextEncoder().encode(value));
+  const headerSize = 24;
+  const entriesOffset = headerSize;
+  const stringsOffset = entriesOffset + encoded.length * SPAN_SIZE;
+  const stringsLength = encoded.reduce(
+    (sum, bytes) => sum + bytes.byteLength,
+    0,
+  );
+  const required = stringsOffset + stringsLength;
+  if (cap < required) return required;
+  const end = ptr + required;
+  if (ptr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+  const out = new Uint8Array(memory.buffer, ptr, required);
+  const view = new DataView(memory.buffer, ptr, required);
+  out.fill(0);
+  view.setUint32(0, required, true);
+  view.setUint16(4, NATIVE_RECORD_VERSION_1, true);
+  view.setUint16(6, 0, true);
+  view.setUint32(8, encoded.length, true);
+  view.setUint32(12, entriesOffset, true);
+  view.setUint32(16, stringsOffset, true);
+  view.setUint32(20, stringsLength, true);
+  let cursor = 0;
+  for (let i = 0; i < encoded.length; i++) {
+    const entry = entriesOffset + i * SPAN_SIZE;
+    const bytes = encoded[i];
+    view.setUint32(entry, cursor, true);
+    view.setUint32(entry + 4, bytes.byteLength, true);
+    out.set(bytes, stringsOffset + cursor);
+    cursor += bytes.byteLength;
+  }
+  return required;
+}
 
 function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
   if (bytes.byteLength < SPAWN_REQUEST_V1_SIZE) return null;
@@ -1163,7 +1226,7 @@ export function createKernelImports(
     // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32
     // Native-only: the request bytes must decode as a yurt_spawn_request_v1
     // record. The 4-argument form writes yurt_spawn_result_v1; the 2-argument
-    // form (host_spawn_async) returns the pid directly. There is no JSON
+    // form (host_spawn_async) returns the pid directly. No text serialization
     // fallback — a decode failure is a hard error.
     host_spawn(
       reqPtr: number,
@@ -2229,47 +2292,6 @@ export function createKernelImports(
       }
     },
 
-    // ── Native module bridge ──
-
-    // host_native_invoke(module_ptr, module_len, method_ptr, method_len,
-    //                    args_ptr, args_len, out_ptr, out_cap) -> i32
-    // Dynamic native module dispatch. Currently consumed by RustPython's
-    // native-module bridge; this is Python-coupled debt scheduled to clear
-    // with the CPython port. New userlands should not depend on Python-specific
-    // module invocation from the kernel.
-    host_native_invoke(
-      modulePtr: number,
-      moduleLen: number,
-      methodPtr: number,
-      methodLen: number,
-      argsPtr: number,
-      argsLen: number,
-      outPtr: number,
-      outCap: number,
-    ): number {
-      if (!opts.nativeModules) {
-        return writeJson(memory, outPtr, outCap, {
-          error: "native modules not available",
-        });
-      }
-      const moduleName = readString(memory, modulePtr, moduleLen);
-      const method = readString(memory, methodPtr, methodLen);
-      const argsJson = readString(memory, argsPtr, argsLen);
-
-      try {
-        const result = opts.nativeModules.invoke(moduleName, method, argsJson);
-        const encoded = new TextEncoder().encode(result);
-        if (encoded.length > outCap) {
-          return encoded.length; // signal need more space
-        }
-        new Uint8Array(memory.buffer, outPtr, encoded.length).set(encoded);
-        return encoded.length;
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { error: msg });
-      }
-    },
-
     // ── DNS ──
 
     // host_dns_resolve(host_ptr, host_len, out_ptr, out_cap) -> i32
@@ -2462,7 +2484,7 @@ export function createKernelImports(
     },
 
     // host_socket_bind_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
-    // Binds an AF_UNIX socket without JSON. is_abstract=1 for abstract namespace.
+    // Binds an AF_UNIX socket. is_abstract=1 for abstract namespace.
     host_socket_bind_unix(
       sockfd: number,
       pathPtr: number,
@@ -2518,7 +2540,7 @@ export function createKernelImports(
     },
 
     // host_socket_connect_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
-    // Connects an AF_UNIX socket without JSON. is_abstract=1 for abstract namespace.
+    // Connects an AF_UNIX socket. is_abstract=1 for abstract namespace.
     host_socket_connect_unix(
       sockfd: number,
       pathPtr: number,
@@ -2695,8 +2717,8 @@ export function createKernelImports(
     },
 
     // host_socket_listen_unix(sockfd, backlog) -> 0 | -1 | -2
-    // listen() for AF_UNIX sockets (pathname and abstract), bypassing JSON.
-    // Returns 0 on success, -1 on error, -2 if sockfd is not AF_UNIX (caller uses JSON path).
+    // listen() for AF_UNIX sockets (pathname and abstract).
+    // Returns 0 on success, -1 on error, -2 if sockfd is not AF_UNIX.
     host_socket_listen_unix(sockfd: number, backlog: number): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -2;
@@ -2734,7 +2756,7 @@ export function createKernelImports(
     },
 
     // host_socket_accept_unix(sockfd) -> new_fd | -1 | -2
-    // accept() for AF_UNIX sockets, bypassing JSON. Async (JSPI/Asyncify).
+    // accept() for AF_UNIX sockets. Async (JSPI/Asyncify).
     // Returns the new accepted fd on success, -1 on error, -2 if sockfd is not AF_UNIX.
     async host_socket_accept_unix(sockfd: number): Promise<number> {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
@@ -3522,15 +3544,7 @@ export function createKernelImports(
       const path = readString(memory, pathPtr, pathLen);
       try {
         const s = opts.vfs.stat(path);
-        return writeJson(memory, outPtr, outCap, {
-          exists: true,
-          is_file: s.type === "file",
-          is_dir: s.type === "dir",
-          is_symlink: s.type === "symlink",
-          size: s.size,
-          mode: s.permissions,
-          mtime_ms: s.mtime ? s.mtime.getTime() : 0,
-        });
+        return writeStatRecord(memory, outPtr, outCap, s);
       } catch {
         return ERR_NOT_FOUND;
       }
@@ -3592,7 +3606,7 @@ export function createKernelImports(
       const path = readString(memory, pathPtr, pathLen);
       try {
         const entries = opts.vfs.readdir(path).map((e) => e.name);
-        return writeJson(memory, outPtr, outCap, entries);
+        return writeStringListRecord(memory, outPtr, outCap, entries);
       } catch {
         return ERR_NOT_FOUND;
       }
@@ -3725,12 +3739,17 @@ export function createKernelImports(
       outPtr: number,
       outCap: number,
     ): number {
-      if (!opts.vfs) return writeJson(memory, outPtr, outCap, []);
+      if (!opts.vfs) return writeStringListRecord(memory, outPtr, outCap, []);
       const pattern = readString(memory, patternPtr, patternLen);
       try {
-        return writeJson(memory, outPtr, outCap, globMatch(opts.vfs, pattern));
+        return writeStringListRecord(
+          memory,
+          outPtr,
+          outCap,
+          globMatch(opts.vfs, pattern),
+        );
       } catch {
-        return writeJson(memory, outPtr, outCap, []);
+        return writeStringListRecord(memory, outPtr, outCap, []);
       }
     },
 
