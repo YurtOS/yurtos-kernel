@@ -1,6 +1,6 @@
 /** Inode types and metadata for the in-memory VFS. */
 
-export type InodeType = 'file' | 'dir' | 'symlink' | 'char';
+export type InodeType = 'file' | 'dir' | 'symlink' | 'char' | 'socket';
 
 export interface InodeMetadata {
   permissions: number;
@@ -29,7 +29,14 @@ export interface SymlinkInode {
   target: string;
 }
 
-export type Inode = FileInode | DirInode | SymlinkInode;
+export interface SocketInode {
+  type: 'socket';
+  metadata: InodeMetadata;
+  /** back-pointer set at bind-time, cleared when socket closes or path is unlinked */
+  listenerHandle?: number;
+}
+
+export type Inode = FileInode | DirInode | SymlinkInode | SocketInode;
 
 export type Errno =
   | 'ENOENT'
@@ -40,7 +47,8 @@ export type Errno =
   | 'ENOSPC'
   | 'EROFS'
   | 'EACCES'
-  | 'ENXIO';
+  | 'ENXIO'
+  | 'EOPNOTSUPP';
 
 export class VfsError extends Error {
   errno: Errno;
@@ -100,5 +108,12 @@ export function createSymlinkInode(target: string, uid = 1000, gid = 1000): Syml
     type: 'symlink',
     metadata: createMetadata(0o777, uid, gid),
     target,
+  };
+}
+
+export function createSocketInode(permissions = 0o666, uid = 1000, gid = 1000): SocketInode {
+  return {
+    type: 'socket',
+    metadata: createMetadata(permissions, uid, gid),
   };
 }

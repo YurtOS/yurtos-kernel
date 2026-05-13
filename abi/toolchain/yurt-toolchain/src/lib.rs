@@ -69,6 +69,8 @@ pub const TIER1: &[&str] = &[
     "if_indextoname",
     "if_nametoindex",
     "socketpair",
+    "sendmsg",
+    "recvmsg",
     "sendfile",
     "posix_spawn",
     "posix_spawnp",

@@ -937,7 +937,7 @@ describe("socket fd host imports", () => {
     );
     expect(readJson(memory, 512, peerLen)).toMatchObject({
       ok: false,
-      error: `socket not connected: ${fd}`,
+      error: "ENOTCONN",
     });
   });
 });

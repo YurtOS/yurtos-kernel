@@ -38,6 +38,12 @@ export interface SocketListenPolicy {
    * stores the hook but still rejects listen because server sockets are deferred.
    */
   onListen?: (request: SocketListenRequest) => boolean | Promise<boolean>;
+  /** Allow AF_UNIX pathname and abstract domain sockets. */
+  allowUnixDomain?: boolean;
+  /** If set, only allow bind() on paths matching one of these patterns. */
+  unixPathAllowlist?: RegExp[];
+  /** If set, only allow abstract-namespace bind() on names matching one of these patterns. */
+  unixAbstractAllowlist?: RegExp[];
 }
 
 export type SocketBackendResult =
@@ -284,7 +290,7 @@ export function createLoopbackSocketBackend(
           port: req.port,
           backlog: req.backlog,
         });
-        const publishedHost = req.host === "0.0.0.0" ? "10.0.2.15" : r.host;
+        const publishedHost = req.host === "0.0.0.0" ? "10.0.2.15" : (r.host ?? req.host);
         return {
           ok: true,
           listener: pub(r.handle),

@@ -203,6 +203,111 @@ int yurt_host_socket_option(int req_ptr, int req_len, int out_ptr, int out_cap);
 __attribute__((import_module("yurt"), import_name("host_socket_close")))
 int yurt_host_socket_close(int req_ptr, int req_len);
 
+/* host_socket_socketpair(family, type, sv_ptr) -> 0 | -1
+ * Writes two connected fd numbers as i32 LE at sv_ptr and sv_ptr+4. */
+__attribute__((import_module("yurt"), import_name("host_socket_socketpair")))
+int yurt_host_socket_socketpair(int family, int type, int sv_ptr);
+
+/* host_socket_bind_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
+ * Binds an AF_UNIX socket to the given name in linear memory.
+ * is_abstract=1: abstract namespace (no leading NUL in ptr, just the bytes).
+ * is_abstract=0: filesystem path. Returns -1 on EADDRINUSE. */
+__attribute__((import_module("yurt"), import_name("host_socket_bind_unix")))
+int yurt_host_socket_bind_unix(int sockfd, int path_ptr, int path_len, int is_abstract);
+
+/* host_socket_connect_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
+ * Connects an AF_UNIX socket to the given name in linear memory.
+ * is_abstract=1: abstract namespace; is_abstract=0: filesystem path.
+ * Returns -1 on ECONNREFUSED / ENOENT. */
+__attribute__((import_module("yurt"), import_name("host_socket_connect_unix")))
+int yurt_host_socket_connect_unix(int sockfd, int path_ptr, int path_len, int is_abstract);
+
+/* host_socket_sendto_unix(sockfd, buf_ptr, buf_len, path_ptr, path_len, is_abstract) -> bytes | -1
+ * Sends a datagram to the AF_UNIX SOCK_DGRAM socket bound at the given path.
+ * is_abstract=1: abstract namespace (bytes after the leading NUL).
+ * is_abstract=0: filesystem path. Returns -1 on error. */
+__attribute__((import_module("yurt"), import_name("host_socket_sendto_unix")))
+int yurt_host_socket_sendto_unix(int sockfd, int buf_ptr, int buf_len,
+                                  int path_ptr, int path_len, int is_abstract);
+
+/* host_socket_recvfrom_unix(sockfd, buf_ptr, buf_cap,
+ *                           from_path_ptr, from_path_cap,
+ *                           from_path_len_ptr, from_is_abstract_ptr) -> bytes | -1 | -2
+ * Receives a datagram from an AF_UNIX SOCK_DGRAM socket. Writes sender path
+ * bytes (without leading NUL for abstract) to [from_path_ptr, from_path_cap).
+ * Sets *from_path_len_ptr to byte count (0 = sender unbound).
+ * Sets *from_is_abstract_ptr = 1 for abstract namespace sender.
+ * Returns -1 if sockfd is not an AF_UNIX dgram socket (caller falls back).
+ * Returns -2 for EAGAIN. Async (JSPI). */
+__attribute__((import_module("yurt"), import_name("host_socket_recvfrom_unix")))
+int yurt_host_socket_recvfrom_unix(int sockfd, int buf_ptr, int buf_cap,
+                                    int from_path_ptr, int from_path_cap,
+                                    int from_path_len_ptr, int from_is_abstract_ptr);
+
+/* host_socket_addr_unix(sockfd, is_peer, path_ptr, path_cap, is_abstract_ptr) -> path_len | -1 | -2
+ * Returns the bound (is_peer=0) or peer (is_peer=1) AF_UNIX path bytes.
+ * Writes path bytes (without leading NUL for abstract) to [path_ptr, path_cap).
+ * Sets *is_abstract_ptr = 1 for abstract namespace sockets.
+ * Returns -1 if the socket is not AF_UNIX.
+ * Returns -2 for ENOTCONN (is_peer=1, socket not yet connected). */
+__attribute__((import_module("yurt"), import_name("host_socket_addr_unix")))
+int yurt_host_socket_addr_unix(int sockfd, int is_peer,
+                                int path_ptr, int path_cap, int is_abstract_ptr);
+
+/* host_socket_peercred(sockfd, pid_ptr, uid_ptr, gid_ptr) -> 0 | -1
+ * Writes the peer's pid/uid/gid into the three out-params.
+ * Returns 0 on success, -1 if sockfd is not a socket or has no peer. */
+__attribute__((import_module("yurt"), import_name("host_socket_peercred")))
+int yurt_host_socket_peercred(int sockfd, int *pid_out, int *uid_out, int *gid_out);
+
+/* host_socket_is_dgram(sockfd) -> 1 (SOCK_DGRAM) | 0 (SOCK_STREAM) | -1 (not a socket) */
+__attribute__((import_module("yurt"), import_name("host_socket_is_dgram")))
+int yurt_host_socket_is_dgram(int sockfd);
+
+/* host_socket_listen_unix(sockfd, backlog) -> 0 | -1 | -2
+ * listen() for AF_UNIX sockets (pathname and abstract), bypassing JSON.
+ * Returns 0 on success, -1 on error (EADDRINUSE etc.), -2 if sockfd is not AF_UNIX
+ * (caller falls back to the JSON host_socket_listen path). */
+__attribute__((import_module("yurt"), import_name("host_socket_listen_unix")))
+int yurt_host_socket_listen_unix(int sockfd, int backlog);
+
+/* host_socket_accept_unix(sockfd) -> new_fd | -1 | -2
+ * accept() for AF_UNIX sockets. Blocks until a connection arrives (JSPI/Asyncify).
+ * Returns the new accepted fd, -1 on error, -2 if sockfd is not an AF_UNIX listener
+ * (caller falls back to the JSON host_socket_accept spin-loop path). */
+__attribute__((import_module("yurt"), import_name("host_socket_accept_unix")))
+int yurt_host_socket_accept_unix(int sockfd);
+
+/* host_socket_send_unix(sockfd, buf_ptr, buf_len) -> bytes | -1 | -2
+ * send() for AF_UNIX STREAM sockets, passing raw bytes (no base64). Synchronous.
+ * Returns byte count on success, -1 on error, -2 if sockfd is not AF_UNIX STREAM
+ * (caller falls back to the base64 JSON host_socket_send path). */
+__attribute__((import_module("yurt"), import_name("host_socket_send_unix")))
+int yurt_host_socket_send_unix(int sockfd, int buf_ptr, int buf_len);
+
+/* host_socket_recv_unix(sockfd, buf_ptr, buf_cap, peek) -> bytes | -1 | -2 | -3
+ * recv() for AF_UNIX STREAM sockets, writing raw bytes (no base64). Async (JSPI).
+ * Returns byte count on success, -1 on error, -2 for EAGAIN, -3 if sockfd is not
+ * AF_UNIX STREAM (caller falls back to the base64 JSON host_socket_recv path).
+ * peek=1 reads without consuming (MSG_PEEK semantics). */
+__attribute__((import_module("yurt"), import_name("host_socket_recv_unix")))
+int yurt_host_socket_recv_unix(int sockfd, int buf_ptr, int buf_cap, int peek);
+
+/* host_socket_sendmsg(sockfd, data_ptr, data_len, fds_ptr, fds_count) -> bytes | -1
+ * Reads data_len bytes from data_ptr; reads fds_count i32 fd numbers from
+ * fds_ptr (pass 0 when there are no ancillary fds). */
+__attribute__((import_module("yurt"), import_name("host_socket_sendmsg")))
+int yurt_host_socket_sendmsg(int sockfd, int data_ptr, int data_len,
+                              int fds_ptr, int fds_count);
+
+/* host_socket_recvmsg(sockfd, buf_ptr, buf_cap, fds_ptr, fds_cap, n_fds_ptr) -> bytes | -1 | -2
+ * Writes up to buf_cap bytes at buf_ptr; writes up to fds_cap fd numbers as
+ * i32 LE at fds_ptr; writes the fd count as i32 LE at n_fds_ptr.
+ * Returns -2 for EAGAIN, -1 for other errors. Async (JSPI). */
+__attribute__((import_module("yurt"), import_name("host_socket_recvmsg")))
+int yurt_host_socket_recvmsg(int sockfd, int buf_ptr, int buf_cap,
+                              int fds_ptr, int fds_cap, int n_fds_ptr);
+
 /* host_dns_resolve resolves a hostname to a dotted-decimal IPv4 string and
  * writes it to [out_ptr, out_cap).  Returns bytes written, or -1 on failure.
  * Async (JSPI): the guest blocks until the host DNS lookup completes. */

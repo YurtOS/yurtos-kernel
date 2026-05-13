@@ -13,6 +13,7 @@ import { KERNEL_FD_BASE, type ProcessKernel } from "../process/kernel.ts";
 import { VfsError } from "../vfs/inode.js";
 import type { InodeType } from "../vfs/inode.js";
 import type { VfsLike } from "../vfs/vfs-like.js";
+import type { ListenerRegistry } from "../network/listener-registry.js";
 import { fdErrorToWasi, vfsErrnoToWasi } from "./errors.js";
 import type { FdTarget } from "./fd-target.js";
 import {
@@ -205,6 +206,12 @@ export interface WasiHostOptions {
    * the loader enables it for modules that are Asyncify-instrumented.
    */
   canSuspendPipeReads?: boolean;
+  /**
+   * Optional listener registry. When provided, unlinking a socket inode
+   * automatically closes the corresponding AF_UNIX path listener so that
+   * subsequent connect() attempts fail as expected.
+   */
+  socketRegistry?: ListenerRegistry;
 }
 
 export interface PreopenEntry {
@@ -251,6 +258,8 @@ function inodeTypeToWasiFiletype(type: InodeType): number {
       return WASI_FILETYPE_SYMBOLIC_LINK;
     case "char":
       return WASI_FILETYPE_CHARACTER_DEVICE;
+    case "socket":
+      return WASI_FILETYPE_SOCKET_STREAM;
     default:
       return 0;
   }
@@ -325,6 +334,7 @@ export class WasiHost {
   private kernel?: ProcessKernel;
   private pid?: number;
   private canSuspendPipeReads = false;
+  private socketRegistry?: ListenerRegistry;
   private signalDeliverer: ((sig: number) => void) | null = null;
   private pendingSignals: number[] = [];
   private signalWaiters: Array<() => void> = [];
@@ -342,6 +352,7 @@ export class WasiHost {
     this.kernel = options.kernel;
     this.pid = options.pid;
     this.canSuspendPipeReads = options.canSuspendPipeReads ?? false;
+    this.socketRegistry = options.socketRegistry;
     this.preopens = [];
 
     // Build I/O fd table: use provided ioFds or build from legacy options.
@@ -2046,6 +2057,19 @@ export class WasiHost {
     try {
       const relativePath = this.readString(pathPtr, pathLen);
       const absPath = this.resolvePath(dirFd, relativePath);
+      // If unlinking a socket inode, close the AF_UNIX path listener in the
+      // registry so that subsequent connect() to this path fails as expected.
+      if (this.socketRegistry) {
+        try {
+          const s = this.vfs.stat(absPath);
+          if (s.type === 'socket') {
+            this.socketRegistry.closePathListener(absPath);
+            this.socketRegistry.removeDgramRoute(absPath);
+          }
+        } catch {
+          // stat failure is fine — unlink will surface the real error below
+        }
+      }
       this.withVfsCredentials(() => this.vfs.unlink(absPath));
       return WASI_ESUCCESS;
     } catch (err) {

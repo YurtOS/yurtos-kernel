@@ -1,6 +1,9 @@
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
-import { type ListenerInfo, ListenerRegistry } from "../listener-registry.js";
+import {
+  type ListenerInfo,
+  ListenerRegistry,
+} from "../listener-registry.js";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -229,5 +232,238 @@ describe("ListenerRegistry socket I/O", () => {
     reg.closeSocket(accepted.socket);
     const r = reg.send(c.socket, enc.encode("x"));
     expect(r.ok).toBe(false);
+  });
+});
+
+describe("ListenerRegistry AF_UNIX pathname sockets", () => {
+  it("listenOnPath returns a handle and sets localPath", () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnPath("/tmp/test.sock", 16);
+    expect(typeof handle).toBe("number");
+    const list = reg.listListeners();
+    const entry = list.find((l: ListenerInfo) => l.localPath === "/tmp/test.sock");
+    expect(entry).toBeDefined();
+    expect(entry!.host).toBeUndefined();
+    expect(entry!.port).toBe(0);
+  });
+
+  it("listenOnPath twice on the same path throws EADDRINUSE", () => {
+    const reg = new ListenerRegistry();
+    reg.listenOnPath("/tmp/dup.sock", 16);
+    expect(() => reg.listenOnPath("/tmp/dup.sock", 16)).toThrow(/in use/i);
+  });
+
+  it("connectToPath fails when no listener is bound", () => {
+    const reg = new ListenerRegistry();
+    const r = reg.connectToPath("/tmp/nobody.sock");
+    expect(r.ok).toBe(false);
+  });
+
+  it("connectToPath succeeds and returns matching path info", () => {
+    const reg = new ListenerRegistry();
+    reg.listenOnPath("/tmp/conn.sock", 16);
+    const r = reg.connectToPath("/tmp/conn.sock");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.peerPath).toBe("/tmp/conn.sock");
+    expect(r.localPath).toBe("/tmp/conn.sock");
+  });
+
+  it("acceptUnix resolves when connect arrives after await", async () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnPath("/tmp/accept-async.sock", 16);
+    const acceptP = reg.acceptUnix(handle);
+    const conn = reg.connectToPath("/tmp/accept-async.sock");
+    expect(conn.ok).toBe(true);
+    const accepted = await acceptP;
+    expect(accepted.localPath).toBe("/tmp/accept-async.sock");
+    expect(typeof accepted.socket).toBe("number");
+  });
+
+  it("acceptNowUnix returns immediately when connect already queued", () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnPath("/tmp/accept-now.sock", 16);
+    reg.connectToPath("/tmp/accept-now.sock");
+    const accepted = reg.acceptNowUnix(handle);
+    expect(accepted).not.toBeNull();
+    expect(accepted!.localPath).toBe("/tmp/accept-now.sock");
+  });
+
+  it("acceptNowUnix returns null when queue is empty", () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnPath("/tmp/accept-empty.sock", 16);
+    expect(reg.acceptNowUnix(handle)).toBeNull();
+  });
+
+  it("backlog enforcement: connects beyond backlog fail", () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnPath("/tmp/backlog.sock", 1);
+    const c1 = reg.connectToPath("/tmp/backlog.sock");
+    expect(c1.ok).toBe(true);
+    const c2 = reg.connectToPath("/tmp/backlog.sock");
+    expect(c2.ok).toBe(false);
+    if (!c2.ok) expect(c2.error).toMatch(/backlog/i);
+    // after draining one, a new connect succeeds
+    reg.acceptNowUnix(handle);
+    const c3 = reg.connectToPath("/tmp/backlog.sock");
+    expect(c3.ok).toBe(true);
+  });
+
+  it("closePathListener rejects pending acceptUnix waiters", async () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnPath("/tmp/close-path.sock", 16);
+    const acceptP = reg.acceptUnix(handle);
+    reg.closePathListener("/tmp/close-path.sock");
+    await expect(acceptP).rejects.toThrow(/closed/i);
+  });
+
+  it("closePathListener makes subsequent connectToPath fail", () => {
+    const reg = new ListenerRegistry();
+    reg.listenOnPath("/tmp/close-conn.sock", 16);
+    reg.closePathListener("/tmp/close-conn.sock");
+    const r = reg.connectToPath("/tmp/close-conn.sock");
+    expect(r.ok).toBe(false);
+  });
+
+  it("data flows between connectToPath client and acceptUnix server", async () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnPath("/tmp/data.sock", 16);
+    const connResult = reg.connectToPath("/tmp/data.sock");
+    if (!connResult.ok) throw new Error("connect failed");
+    const accepted = await reg.acceptUnix(handle);
+    reg.send(connResult.socket, enc.encode("ping"));
+    const got = await reg.recvAsync(accepted.socket, 1024);
+    if (!got.ok) throw new Error("recv failed");
+    expect(dec.decode(got.bytes)).toBe("ping");
+  });
+
+  it("listListeners includes unix listeners with no host/port", () => {
+    const reg = new ListenerRegistry();
+    reg.listen({ host: "127.0.0.1", port: 8100, backlog: 16 });
+    reg.listenOnPath("/tmp/list.sock", 16);
+    const list = reg.listListeners();
+    const tcp = list.find((l: ListenerInfo) => l.port === 8100);
+    const unix = list.find((l: ListenerInfo) => l.localPath === "/tmp/list.sock");
+    expect(tcp!.host).toBe("127.0.0.1");
+    expect(unix!.host).toBeUndefined();
+    expect(unix!.port).toBe(0); // AF_UNIX listeners have no port
+  });
+});
+
+describe("ListenerRegistry AF_UNIX abstract namespace", () => {
+  it("listenOnAbstract returns a handle with NUL-prefixed localPath", () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnAbstract("myservice", 16);
+    expect(typeof handle).toBe("number");
+    const list = reg.listListeners();
+    const entry = list.find((l: ListenerInfo) => l.localPath === "\0myservice");
+    expect(entry).toBeDefined();
+  });
+
+  it("listenOnAbstract twice on the same name throws", () => {
+    const reg = new ListenerRegistry();
+    reg.listenOnAbstract("dup-abstract", 16);
+    expect(() => reg.listenOnAbstract("dup-abstract", 16)).toThrow(/in use/i);
+  });
+
+  it("connectToAbstract fails when no listener is bound", () => {
+    const reg = new ListenerRegistry();
+    const r = reg.connectToAbstract("nobody");
+    expect(r.ok).toBe(false);
+  });
+
+  it("connectToAbstract succeeds and both paths carry the NUL prefix", () => {
+    const reg = new ListenerRegistry();
+    reg.listenOnAbstract("svc", 16);
+    const r = reg.connectToAbstract("svc");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.peerPath).toBe("\0svc");
+    expect(r.localPath).toBe("\0svc");
+  });
+
+  it("acceptUnix resolves for abstract listener", async () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnAbstract("async-svc", 16);
+    const acceptP = reg.acceptUnix(handle);
+    reg.connectToAbstract("async-svc");
+    const accepted = await acceptP;
+    expect(accepted.localPath).toBe("\0async-svc");
+  });
+
+  it("closeAbstractListener rejects pending acceptUnix waiters", async () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnAbstract("close-svc", 16);
+    const acceptP = reg.acceptUnix(handle);
+    reg.closeAbstractListener("close-svc");
+    await expect(acceptP).rejects.toThrow(/closed/i);
+  });
+
+  it("closeAbstractListener makes subsequent connectToAbstract fail", () => {
+    const reg = new ListenerRegistry();
+    reg.listenOnAbstract("gone-svc", 16);
+    reg.closeAbstractListener("gone-svc");
+    expect(reg.connectToAbstract("gone-svc").ok).toBe(false);
+  });
+
+  it("abstract and pathname listeners with matching names are independent", () => {
+    const reg = new ListenerRegistry();
+    reg.listenOnPath("/tmp/overlap.sock", 16);
+    reg.listenOnAbstract("/tmp/overlap.sock", 16); // same string, different namespace
+    const rPath = reg.connectToPath("/tmp/overlap.sock");
+    const rAbstract = reg.connectToAbstract("/tmp/overlap.sock");
+    expect(rPath.ok).toBe(true);
+    expect(rAbstract.ok).toBe(true);
+  });
+
+  it("connectToPath carries the connecting pid in the accepted UnixAcceptedConnection", async () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnPath("/tmp/peercred-pid.sock", 16);
+    const acceptP = reg.acceptUnix(handle);
+    reg.connectToPath("/tmp/peercred-pid.sock", 42);
+    const accepted = await acceptP;
+    expect(accepted.peerPid).toBe(42);
+  });
+
+  it("connectToPath carries connecting uid/gid in the accepted UnixAcceptedConnection", async () => {
+    const reg = new ListenerRegistry();
+    const handle = reg.listenOnPath("/tmp/peercred-ugid.sock", 16);
+    const acceptP = reg.acceptUnix(handle);
+    reg.connectToPath("/tmp/peercred-ugid.sock", 7, 1000, 1000);
+    const accepted = await acceptP;
+    expect(accepted.peerUid).toBe(1000);
+    expect(accepted.peerGid).toBe(1000);
+  });
+});
+
+describe("ListenerRegistry AF_UNIX socketpair", () => {
+  it("openUnixPair returns two different socket handles", () => {
+    const reg = new ListenerRegistry();
+    const { a, b } = reg.openUnixPair();
+    expect(typeof a).toBe("number");
+    expect(typeof b).toBe("number");
+    expect(a).not.toBe(b);
+  });
+
+  it("openUnixPair sockets carry bytes in both directions", async () => {
+    const reg = new ListenerRegistry();
+    const { a, b } = reg.openUnixPair();
+    reg.send(a, enc.encode("hello"));
+    reg.send(b, enc.encode("world"));
+    const fromA = await reg.recvAsync(b, 1024);
+    const fromB = await reg.recvAsync(a, 1024);
+    if (!fromA.ok || !fromB.ok) throw new Error("recv failed");
+    expect(dec.decode(fromA.bytes)).toBe("hello");
+    expect(dec.decode(fromB.bytes)).toBe("world");
+  });
+
+  it("openUnixPair: closing one end delivers EOF to the other", async () => {
+    const reg = new ListenerRegistry();
+    const { a, b } = reg.openUnixPair();
+    const recvP = reg.recvAsync(b, 1024);
+    reg.closeSocket(a);
+    const got = await recvP;
+    if (!got.ok) throw new Error("expected EOF");
+    expect(got.bytes.length).toBe(0);
   });
 });

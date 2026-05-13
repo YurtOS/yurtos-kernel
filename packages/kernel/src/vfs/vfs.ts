@@ -6,11 +6,12 @@
  * (for fork simulation) and extensible with pipes (for shell pipelines).
  */
 
-import type { DirEntry, DirInode, FsCredential, Inode, StatResult } from './inode.js';
+import type { DirEntry, DirInode, FsCredential, Inode, SocketInode, StatResult } from './inode.js';
 import {
   VfsError,
   createDirInode,
   createFileInode,
+  createSocketInode,
   createSymlinkInode,
 } from './inode.js';
 import { deepCloneRoot } from './snapshot.js';
@@ -509,8 +510,10 @@ export class VFS {
       size = inode.content.byteLength;
     } else if (inode.type === 'dir') {
       size = inode.children.size;
-    } else {
+    } else if (inode.type === 'symlink') {
       size = inode.target.length;
+    } else {
+      size = 0;
     }
 
     return {
@@ -540,8 +543,10 @@ export class VFS {
       size = inode.content.byteLength;
     } else if (inode.type === 'dir') {
       size = inode.children.size;
-    } else {
+    } else if (inode.type === 'symlink') {
       size = inode.target.length;
+    } else {
+      size = 0;
     }
 
     return {
@@ -583,6 +588,9 @@ export class VFS {
 
     if (inode.type === 'dir') {
       throw new VfsError('EISDIR', `is a directory: ${path}`);
+    }
+    if (inode.type === 'socket') {
+      throw new VfsError('EOPNOTSUPP', `cannot read a socket: ${path}`);
     }
     if (inode.type === 'symlink') {
       // Should not happen after resolve with followSymlinks, but guard anyway
@@ -683,6 +691,38 @@ export class VFS {
     parent.children.set(name, createDirInode(normalizeMode(mode), owner.uid, owner.gid));
     this.currentFileCount++;
     this.notifyChange();
+  }
+
+  /**
+   * Create a socket inode at the given path (created by AF_UNIX bind).
+   * Throws EEXIST if anything already exists at that path.
+   */
+  createSocket(path: string, permissions = 0o666): void {
+    if (this.isProviderMountPath(path)) {
+      throw new VfsError('EROFS', `virtual mount path is read-only: ${path}`);
+    }
+    const { parent, name } = this.resolveParent(path);
+
+    if (parent.children.has(name)) {
+      throw new VfsError('EEXIST', `file exists: ${path}`);
+    }
+
+    this.assertDirectoryMutationPermission(parent);
+    this.assertFileCountLimit();
+    const owner = this.currentOwner();
+    parent.children.set(name, createSocketInode(normalizeMode(permissions), owner.uid, owner.gid));
+    this.currentFileCount++;
+    this.notifyChange();
+  }
+
+  /** Return the SocketInode at path, or null if absent or not a socket. */
+  getSocketInode(path: string): SocketInode | null {
+    try {
+      const inode = this.resolve(path);
+      return inode.type === 'socket' ? inode : null;
+    } catch {
+      return null;
+    }
   }
 
   mkdirp(path: string): void {

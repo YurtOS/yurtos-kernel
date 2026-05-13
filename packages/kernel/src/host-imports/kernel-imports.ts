@@ -917,6 +917,54 @@ export function createKernelImports(
     return { ok: true, mapping };
   }
 
+  function authorizeUnixListen(
+    policy: SocketListenPolicy | undefined,
+    path: string,
+  ): { ok: true } | { ok: false; error: string } {
+    if (!policy?.allowUnixDomain) {
+      return {
+        ok: false,
+        error: `AF_UNIX listen on ${path} is not allowed by sandbox policy`,
+      };
+    }
+    const allowlist = policy.unixPathAllowlist;
+    if (allowlist && allowlist.length > 0) {
+      const allowed = allowlist.some((re) => re.test(path));
+      if (!allowed) {
+        return {
+          ok: false,
+          error: `AF_UNIX path ${path} is not in the sandbox allowlist`,
+        };
+      }
+    }
+    return { ok: true };
+  }
+
+  function authorizeUnixAbstract(
+    policy: SocketListenPolicy | undefined,
+    name: string,
+  ): { ok: true } | { ok: false; error: string } {
+    if (!policy?.allowUnixDomain) {
+      return {
+        ok: false,
+        error:
+          `AF_UNIX abstract listen on @${name} is not allowed by sandbox policy`,
+      };
+    }
+    const allowlist = policy.unixAbstractAllowlist;
+    if (allowlist && allowlist.length > 0) {
+      const allowed = allowlist.some((re) => re.test(name));
+      if (!allowed) {
+        return {
+          ok: false,
+          error:
+            `AF_UNIX abstract name @${name} is not in the sandbox allowlist`,
+        };
+      }
+    }
+    return { ok: true };
+  }
+
   // ── Phase 1 dlopen state (per-sandbox) ──
   // Spec: docs/superpowers/specs/2026-05-09-shared-libraries-design.md.
   // The handle table owns loaded side-module instances; lastDlError
@@ -2059,18 +2107,62 @@ export function createKernelImports(
 
     // host_socket_open(domain, type, protocol) -> fd
     // Allocates a kernel-owned socket fd. connect() fills in the backend handle later.
+    // For AF_UNIX SOCK_DGRAM, allocates a dgram socket in the registry.
     host_socket_open(
-      _domain: number,
-      _type: number,
+      domain: number,
+      type: number,
       _protocol: number,
     ): number {
       if (!opts.kernel) return -1;
+      // wasi-sdk-30 defines AF_UNIX=3, SOCK_DGRAM=5. C passes these values
+      // directly (sys/socket.h #include_next runs before our #ifndef overrides).
+      const AF_UNIX = 3;
+      const SOCK_DGRAM = 5;
+      const SOCK_CLOEXEC = 0x2000;
+      const SOCK_NONBLOCK = 0x4000;
+      const baseType = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
+      // AF_UNIX SOCK_DGRAM: allocate a registry dgram socket
+      if (domain === AF_UNIX && baseType === SOCK_DGRAM) {
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        const rawHandle = registry.openDgramSocket();
+        return opts.kernel.allocFd(callerPid, {
+          type: "socket",
+          socket: -rawHandle, // negate for loopback convention
+          family: "AF_UNIX",
+          isDgram: true,
+          fdFlags: (type & SOCK_NONBLOCK) !== 0 ? WASI_FDFLAGS_NONBLOCK : 0,
+          refs: 1,
+          send: (socket, data) =>
+            socketBackend?.send(socket, data) ??
+              { ok: false, error: "networking not configured" },
+          recv: (socket, maxBytes, recvOpts) =>
+            socketBackend?.recv(socket, maxBytes, recvOpts) ??
+              { ok: false, error: "networking not configured" },
+          recvAsync: (socket, maxBytes) =>
+            socketBackend
+              ? recvSocketAsync(socketBackend, socket, maxBytes)
+              : Promise.resolve({
+                ok: false,
+                error: "networking not configured",
+              }),
+          setNoDelay: (socket, enabled) =>
+            socketBackend?.setNoDelay?.(socket, enabled) ??
+              {
+                ok: false,
+                error: "TCP_NODELAY not supported by socket backend",
+              },
+          close: (_socket) => {
+            registry.closeDgramSocket(rawHandle);
+          },
+        });
+      }
       return opts.kernel.allocFd(callerPid, {
         type: "socket",
         socket: null,
         refs: 1,
-        send: (socket, dataB64) =>
-          socketBackend?.send(socket, dataB64) ??
+        send: (socket, data) =>
+          socketBackend?.send(socket, data) ??
             { ok: false, error: "networking not configured" },
         recv: (socket, maxBytes, recvOpts) =>
           socketBackend?.recv(socket, maxBytes, recvOpts) ??
@@ -2122,6 +2214,7 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
+        // AF_INET connect
         const result = socketBackend.connect({
           host: req.host,
           port: req.port,
@@ -2159,6 +2252,7 @@ export function createKernelImports(
 
     // host_socket_bind(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Records the sandbox-visible local address requested for a socket fd.
+    // AF_UNIX: req = { fd, path }; AF_INET: req = { fd, host, port }
     host_socket_bind(
       reqPtr: number,
       reqLen: number,
@@ -2180,6 +2274,8 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
+
+        // AF_INET bind
         const host = req.host;
         if (
           host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
@@ -2195,6 +2291,7 @@ export function createKernelImports(
             error: `invalid bind port: ${String(req.port)}`,
           });
         }
+        target.family = "AF_INET";
         target.boundHost = host;
         target.boundPort = req.port;
         target.localHost = host === "0.0.0.0" ? socketLocalHost : host;
@@ -2204,6 +2301,404 @@ export function createKernelImports(
         const msg = e instanceof Error ? e.message : String(e);
         return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
       }
+    },
+
+    // host_socket_bind_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
+    // Binds an AF_UNIX socket without JSON. is_abstract=1 for abstract namespace.
+    host_socket_bind_unix(
+      sockfd: number,
+      pathPtr: number,
+      pathLen: number,
+      isAbstract: number,
+    ): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -1;
+      const name = new TextDecoder().decode(
+        new Uint8Array(memory.buffer, pathPtr, pathLen),
+      );
+      target.family = "AF_UNIX";
+      if (isAbstract) {
+        const abstractAuth = authorizeUnixAbstract(opts.serverSockets, name);
+        if (!abstractAuth.ok) return -1;
+        target.boundPath = `\0${name}`;
+        // Abstract DGRAM sockets also register in the dgram route table
+        if (target.isDgram) {
+          const registry = socketBackend?.registry;
+          if (!registry) return -1;
+          try {
+            registry.bindDgramToPath(-(target.socket as number), `\0${name}`);
+          } catch {
+            return -1;
+          }
+        }
+        return 0;
+      }
+      // Enforce path allowlist at bind time (same policy as listen).
+      const bindAuth = authorizeUnixListen(opts.serverSockets, name);
+      if (!bindAuth.ok) return -1;
+      target.boundPath = name;
+      // Create the VFS socket inode first to detect conflicts (EEXIST) atomically.
+      try {
+        opts.vfs?.createSocket?.(name);
+      } catch {
+        return -1;
+      }
+      if (target.isDgram) {
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        try {
+          registry.bindDgramToPath(-(target.socket as number), name);
+        } catch {
+          // Roll back the VFS inode we just created.
+          try {
+            opts.vfs?.unlink(name);
+          } catch { /* best-effort */ }
+          return -1;
+        }
+      }
+      return 0;
+    },
+
+    // host_socket_connect_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
+    // Connects an AF_UNIX socket without JSON. is_abstract=1 for abstract namespace.
+    host_socket_connect_unix(
+      sockfd: number,
+      pathPtr: number,
+      pathLen: number,
+      isAbstract: number,
+    ): number {
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -1;
+      const name = new TextDecoder().decode(
+        new Uint8Array(memory.buffer, pathPtr, pathLen),
+      );
+      let result: { ok: boolean; socket?: number; error?: string };
+      const connCreds = opts.kernel?.getCredentials(callerPid ?? 0);
+      if (isAbstract) {
+        result = registry.connectToAbstract(name);
+        if (!result.ok) return -1;
+        target.socket = -(result.socket as number);
+        target.family = "AF_UNIX";
+        target.peerPath = `\0${name}`;
+        target.peerPid = callerPid ?? 0;
+        target.peerUid = connCreds?.euid ?? 0;
+        target.peerGid = connCreds?.egid ?? 0;
+        return 0;
+      }
+      result = registry.connectToPath(
+        name,
+        callerPid,
+        connCreds?.euid,
+        connCreds?.egid,
+      );
+      if (!result.ok) return -1;
+      target.socket = -(result.socket as number);
+      target.family = "AF_UNIX";
+      target.peerPath = name;
+      target.peerPid = callerPid ?? 0;
+      target.peerUid = connCreds?.euid ?? 0;
+      target.peerGid = connCreds?.egid ?? 0;
+      return 0;
+    },
+
+    // host_socket_sendto_unix(sockfd, buf_ptr, buf_len, path_ptr, path_len, is_abstract) -> bytes | -1
+    // Sends a SOCK_DGRAM to a bound path. is_abstract=1 for abstract namespace.
+    host_socket_sendto_unix(
+      sockfd: number,
+      bufPtr: number,
+      bufLen: number,
+      pathPtr: number,
+      pathLen: number,
+      isAbstract: number,
+    ): number {
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket" || !target.isDgram) return -1;
+      const bytes = new Uint8Array(memory.buffer, bufPtr, bufLen);
+      const toPath = new TextDecoder().decode(
+        new Uint8Array(memory.buffer, pathPtr, pathLen),
+      );
+      if (isAbstract) return -1; // abstract dgram sendto not yet supported
+      const result = registry.sendDgramToPath(
+        toPath,
+        bytes,
+        target.boundPath ?? undefined,
+      );
+      return result.ok ? bufLen : -1;
+    },
+
+    // host_socket_recvfrom_unix(sockfd, buf_ptr, buf_cap, from_path_ptr, from_path_cap,
+    //   from_path_len_ptr, from_is_abstract_ptr) -> bytes | -1 | -2
+    // Async dgram recv. Returns byte count, -1 on error, -2 for EAGAIN (no data yet).
+    async host_socket_recvfrom_unix(
+      sockfd: number,
+      bufPtr: number,
+      bufCap: number,
+      fromPathPtr: number,
+      fromPathCap: number,
+      fromPathLenPtr: number,
+      fromIsAbstractPtr: number,
+    ): Promise<number> {
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket" || !target.isDgram) return -1;
+      if (target.socket == null) return -1;
+      const rawHandle = -(target.socket as number);
+      const nonblocking = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+      const result = nonblocking
+        ? registry.recvDgram(rawHandle, bufCap, true)
+        : await registry.recvDgramAsync(rawHandle, bufCap);
+      if (!result.ok) return -2;
+      const bytes = (result as { ok: true; bytes: Uint8Array }).bytes;
+      const recvLen = Math.min(bytes.length, bufCap);
+      new Uint8Array(memory.buffer, bufPtr, recvLen).set(
+        bytes.subarray(0, recvLen),
+      );
+      if (result.fromPath || result.fromAbstract) {
+        const senderName = result.fromAbstract ?? result.fromPath ?? "";
+        const isAbs = result.fromAbstract != null ? 1 : 0;
+        const pathBytes = new TextEncoder().encode(senderName);
+        const writeLen = Math.min(pathBytes.length, fromPathCap);
+        if (fromPathPtr && fromPathCap > 0) {
+          new Uint8Array(memory.buffer, fromPathPtr, writeLen).set(
+            pathBytes.subarray(0, writeLen),
+          );
+        }
+        new Int32Array(memory.buffer, fromPathLenPtr, 1)[0] = writeLen;
+        new Int32Array(memory.buffer, fromIsAbstractPtr, 1)[0] = isAbs;
+      } else {
+        new Int32Array(memory.buffer, fromPathLenPtr, 1)[0] = 0;
+        new Int32Array(memory.buffer, fromIsAbstractPtr, 1)[0] = 0;
+      }
+      return recvLen;
+    },
+
+    // host_socket_addr_unix(sockfd, is_peer, path_ptr, path_cap, is_abstract_ptr)
+    //   -> path_len | -1 (not AF_UNIX) | -2 (ENOTCONN)
+    // Writes path bytes (no leading NUL for abstract) to path_ptr; sets *is_abstract_ptr.
+    host_socket_addr_unix(
+      sockfd: number,
+      isPeer: number,
+      pathPtr: number,
+      pathCap: number,
+      isAbstractPtr: number,
+    ): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -1;
+      if (target.family !== "AF_UNIX") return -1;
+      const rawPath = isPeer ? target.peerPath : target.boundPath;
+      if (rawPath == null) return isPeer ? -2 : 0;
+      let path: string;
+      let isAbstract: number;
+      if (rawPath.startsWith("\0")) {
+        path = rawPath.slice(1);
+        isAbstract = 1;
+      } else {
+        path = rawPath;
+        isAbstract = 0;
+      }
+      const pathBytes = new TextEncoder().encode(path);
+      const writeLen = Math.min(pathBytes.length, pathCap);
+      if (pathPtr && pathCap > 0) {
+        new Uint8Array(memory.buffer, pathPtr, writeLen).set(
+          pathBytes.subarray(0, writeLen),
+        );
+      }
+      if (isAbstractPtr) {
+        new Int32Array(memory.buffer, isAbstractPtr, 1)[0] = isAbstract;
+      }
+      return writeLen;
+    },
+
+    // host_socket_peercred(sockfd, pid_ptr, uid_ptr, gid_ptr) -> 0 | -1
+    host_socket_peercred(
+      sockfd: number,
+      pidPtr: number,
+      uidPtr: number,
+      gidPtr: number,
+    ): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -1;
+      new Int32Array(memory.buffer, pidPtr, 1)[0] = target.peerPid ?? 0;
+      new Int32Array(memory.buffer, uidPtr, 1)[0] = target.peerUid ?? 0;
+      new Int32Array(memory.buffer, gidPtr, 1)[0] = target.peerGid ?? 0;
+      return 0;
+    },
+
+    // host_socket_is_dgram(sockfd) -> 1 (SOCK_DGRAM) | 0 (SOCK_STREAM) | -1 (not a socket)
+    host_socket_is_dgram(sockfd: number): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -1;
+      return target.isDgram ? 1 : 0;
+    },
+
+    // host_socket_listen_unix(sockfd, backlog) -> 0 | -1 | -2
+    // listen() for AF_UNIX sockets (pathname and abstract), bypassing JSON.
+    // Returns 0 on success, -1 on error, -2 if sockfd is not AF_UNIX (caller uses JSON path).
+    host_socket_listen_unix(sockfd: number, backlog: number): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -2;
+      if (target.family !== "AF_UNIX" && typeof target.boundPath !== "string") {
+        return -2;
+      }
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const path = target.boundPath!;
+      const cap = backlog > 0 ? backlog : 128;
+      try {
+        if (path.startsWith("\0")) {
+          const abstractName = path.slice(1);
+          const auth = authorizeUnixAbstract(opts.serverSockets, abstractName);
+          if (!auth.ok) return -1;
+          const rawHandle = registry.listenOnAbstract(abstractName, cap);
+          target.listener = -rawHandle;
+          target.closeListener = () => {
+            registry.closeAbstractListener(abstractName);
+          };
+        } else {
+          const auth = authorizeUnixListen(opts.serverSockets, path);
+          if (!auth.ok) return -1;
+          const rawHandle = registry.listenOnPath(path, cap);
+          target.listener = -rawHandle;
+          const boundPath = path;
+          target.closeListener = () => {
+            registry.closePathListener(boundPath);
+          };
+        }
+        return 0;
+      } catch {
+        return -1;
+      }
+    },
+
+    // host_socket_accept_unix(sockfd) -> new_fd | -1 | -2
+    // accept() for AF_UNIX sockets, bypassing JSON. Async (JSPI/Asyncify).
+    // Returns the new accepted fd on success, -1 on error, -2 if sockfd is not AF_UNIX.
+    async host_socket_accept_unix(sockfd: number): Promise<number> {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (
+        !target || target.type !== "socket" ||
+        target.family !== "AF_UNIX" || target.listener == null
+      ) return -2;
+      if (!opts.kernel || !socketBackend?.registry) return -1;
+      const rawHandle = -(target.listener);
+      const accepted = await socketBackend.registry.acceptUnix(rawHandle);
+      return opts.kernel.allocFd(callerPid, {
+        type: "socket",
+        socket: -(accepted.socket),
+        family: "AF_UNIX",
+        boundPath: accepted.localPath,
+        peerPath: accepted.peerPath,
+        refs: 1,
+        peerPid: accepted.peerPid ?? 0,
+        peerUid: accepted.peerUid ?? 0,
+        peerGid: accepted.peerGid ?? 0,
+        send: socketBackend.send.bind(socketBackend),
+        recv: socketBackend.recv.bind(socketBackend),
+        recvAsync: (socket, maxBytes) =>
+          recvSocketAsync(socketBackend, socket, maxBytes),
+        setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+        close: (socket) => {
+          socketBackend.close(socket);
+        },
+      });
+    },
+
+    // host_socket_send_unix(sockfd, buf_ptr, buf_len) -> bytes | -1 | -2
+    // send() for AF_UNIX STREAM sockets, passing raw bytes without base64. Synchronous.
+    // Returns byte count on success, -1 on error, -2 if sockfd is not AF_UNIX STREAM.
+    host_socket_send_unix(
+      sockfd: number,
+      bufPtr: number,
+      bufLen: number,
+    ): number {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -2;
+      if (target.family !== "AF_UNIX" || target.isDgram) return -2;
+      const socket = target.socket as number | null;
+      if (socket === null || socket >= 0) return -1; // registry sockets are stored negative
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const bytes = new Uint8Array(memory.buffer, bufPtr, bufLen);
+      const result = registry.send(-socket, new Uint8Array(bytes));
+      if (!result.ok) return -1;
+      return result.bytesSent;
+    },
+
+    // host_socket_recv_unix(sockfd, buf_ptr, buf_cap, peek) -> bytes | -1 | -2 | -3
+    // recv() for AF_UNIX STREAM sockets, writing raw bytes without base64. Async.
+    // Returns byte count on success, -1 on error, -2 for EAGAIN, -3 if not AF_UNIX STREAM.
+    async host_socket_recv_unix(
+      sockfd: number,
+      bufPtr: number,
+      bufCap: number,
+      peek: number,
+    ): Promise<number> {
+      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
+      if (!target || target.type !== "socket") return -3;
+      if (target.family !== "AF_UNIX") return -3;
+      // DGRAM sockets: use recvDgram / recvDgramAsync (ignores fromPath for plain recv)
+      if (target.isDgram) {
+        if (target.socket == null) return -1;
+        const rawHandle = -(target.socket as number);
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        const nonblockingDgram =
+          ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+        const dgramResult = nonblockingDgram
+          ? registry.recvDgram(rawHandle, bufCap, true)
+          : await registry.recvDgramAsync(rawHandle, bufCap);
+        if (!dgramResult.ok) return -2;
+        const dgramBytes =
+          (dgramResult as { ok: true; bytes: Uint8Array }).bytes;
+        const n = Math.min(dgramBytes.length, bufCap);
+        new Uint8Array(memory.buffer, bufPtr, n).set(dgramBytes.subarray(0, n));
+        return n;
+      }
+      const socket = target.socket as number | null;
+      if (socket === null || socket >= 0) return -1;
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const regHandle = -socket;
+      const isPeek = peek !== 0;
+      const nonblocking = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+
+      function writeResult(bytes: Uint8Array): number {
+        const n = Math.min(bytes.byteLength, bufCap);
+        new Uint8Array(memory.buffer, bufPtr, n).set(bytes.subarray(0, n));
+        return n;
+      }
+
+      // Drain peekBuffer first (populated by a previous MSG_PEEK call).
+      if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
+        const chunk = target.peekBuffer.slice(0, bufCap);
+        if (!isPeek) {
+          target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+        }
+        return writeResult(chunk);
+      }
+
+      if (isPeek) {
+        // Nonblocking probe: stash result in peekBuffer for the next real recv.
+        const probe = registry.recv(regHandle, bufCap, { nonblocking: true });
+        if (!probe.ok) return -2;
+        target.peekBuffer = probe.bytes;
+        return writeResult(probe.bytes);
+      }
+
+      if (nonblocking) {
+        const probe = registry.recv(regHandle, bufCap, { nonblocking: true });
+        if (!probe.ok) return probe.error === "EAGAIN" ? -2 : -1;
+        return writeResult(probe.bytes);
+      }
+
+      const result = await registry.recvAsync(regHandle, bufCap);
+      if (!result.ok) return -1;
+      return writeResult(result.bytes);
     },
 
     // host_socket_listen(req_ptr, req_len, out_ptr, out_cap) -> i32
@@ -2229,11 +2724,13 @@ export function createKernelImports(
             error: `not a socket fd: ${req.fd}`,
           });
         }
-        const host = target.boundHost ?? "127.0.0.1";
-        const port = target.boundPort ?? 0;
         const backlog = typeof req.backlog === "number" && req.backlog > 0
           ? req.backlog
           : 128;
+
+        // AF_INET listen
+        const host = target.boundHost ?? "127.0.0.1";
+        const port = target.boundPort ?? 0;
         const auth = authorizeListen(opts.serverSockets, host, port, backlog);
         if (!auth.ok) return writeJson(memory, outPtr, outCap, auth);
         if (!socketBackend?.listen) {
@@ -2272,7 +2769,7 @@ export function createKernelImports(
       outPtr: number,
       outCap: number,
     ): Promise<number> {
-      if (!socketBackend?.accept) {
+      if (!socketBackend?.accept && !socketBackend?.registry) {
         return writeJson(memory, outPtr, outCap, {
           ok: false,
           error: "server sockets are not supported by this backend",
@@ -2293,18 +2790,51 @@ export function createKernelImports(
             error: `not a listening socket fd: ${req.fd}`,
           });
         }
-        // Prefer backend suspension; legacy backends fall back to accept().
-        const accepted = await acceptSocketAsync(
-          socketBackend,
-          target.listener,
-        );
-        if (!accepted.ok) return writeJson(memory, outPtr, outCap, accepted);
         if (!opts.kernel) {
           return writeJson(memory, outPtr, outCap, {
             ok: false,
             error: "kernel not configured",
           });
         }
+
+        // AF_UNIX accept: use registry.acceptUnix directly.
+        if (target.family === "AF_UNIX" && socketBackend?.registry) {
+          const rawHandle = -(target.listener); // un-negate to get registry handle
+          const unixAccepted = await socketBackend.registry.acceptUnix(
+            rawHandle,
+          );
+          const acceptedFd = opts.kernel.allocFd(callerPid, {
+            type: "socket",
+            socket: -(unixAccepted.socket), // negate for loopback convention
+            family: "AF_UNIX",
+            boundPath: unixAccepted.localPath,
+            peerPath: unixAccepted.peerPath,
+            refs: 1,
+            peerPid: unixAccepted.peerPid ?? 0,
+            peerUid: unixAccepted.peerUid ?? 0,
+            peerGid: unixAccepted.peerGid ?? 0,
+            send: socketBackend.send.bind(socketBackend),
+            recv: socketBackend.recv.bind(socketBackend),
+            recvAsync: (socket, maxBytes) =>
+              recvSocketAsync(socketBackend, socket, maxBytes),
+            setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+            close: (socket) => {
+              socketBackend.close(socket);
+            },
+          });
+          // C side calls host_socket_addr_unix for peer/local path — no paths here.
+          return writeJson(memory, outPtr, outCap, {
+            ok: true,
+            fd: acceptedFd,
+          });
+        }
+
+        // AF_INET accept: prefer backend suspension; legacy backends fall back to accept().
+        const accepted = await acceptSocketAsync(
+          socketBackend,
+          target.listener,
+        );
+        if (!accepted.ok) return writeJson(memory, outPtr, outCap, accepted);
         const acceptedFd = opts.kernel.allocFd(callerPid, {
           type: "socket",
           socket: accepted.socket,
@@ -2362,23 +2892,52 @@ export function createKernelImports(
           });
         }
         const kind = req.kind === "peer" ? "peer" : "local";
-        if (kind === "peer" && target.socket === null) {
+        const isPeer = kind === "peer";
+
+        // getpeername on an unconnected socket → ENOTCONN
+        if (isPeer && !target.peerPath && !target.peerHost) {
           return writeJson(memory, outPtr, outCap, {
             ok: false,
-            error: `socket not connected: ${req.fd}`,
+            error: "ENOTCONN",
           });
         }
-        // getsockname() is defined for connected, listening, and bound sockets.
-        // socketpair() reads back the ephemeral listener port via getsockname().
+
+        // POSIX getsockname()/getpeername() are defined for any socket
+        // that has been bound, connected, or is listening. Accept
+        // connected sockets (target.socket !== null), listening sockets
+        // (target.listener != null), and bound-but-not-yet-listening
+        // sockets (target.boundPort !== undefined). AF_INET listeners
+        // need this so getsockname() can return their ephemeral port.
         if (
-          kind === "local" && target.socket === null &&
-          target.listener == null && target.boundPort === undefined
+          target.socket === null && target.listener == null &&
+          target.boundPort === undefined && target.boundPath === undefined
         ) {
           return writeJson(memory, outPtr, outCap, {
             ok: false,
             error: `socket not bound or connected: ${req.fd}`,
           });
         }
+        // AF_UNIX: return path-based address info
+        if (target.family === "AF_UNIX") {
+          const localPath = target.boundPath ?? "";
+          const peerPath = target.peerPath ?? "";
+          // Abstract sockets use a separate field to avoid NUL-in-JSON issues:
+          // local_abstract / peer_abstract carry the name WITHOUT leading NUL.
+          // Pathname sockets use local_path / peer_path as before.
+          const resp: Record<string, unknown> = { ok: true };
+          if (localPath.startsWith("\0")) {
+            resp.local_abstract = localPath.slice(1);
+          } else {
+            resp.local_path = localPath;
+          }
+          if (peerPath.startsWith("\0")) {
+            resp.peer_abstract = peerPath.slice(1);
+          } else {
+            resp.peer_path = peerPath;
+          }
+          return writeJson(memory, outPtr, outCap, resp);
+        }
+
         return writeJson(memory, outPtr, outCap, {
           ok: true,
           peer_host: target.peerHost ?? "0.0.0.0",
@@ -2409,6 +2968,13 @@ export function createKernelImports(
           return ERR_NOT_FOUND;
         }
         const data = readBytes(memory, dataPtr, dataLen);
+        if (target.isDgram) {
+          const registry = socketBackend.registry;
+          if (!registry) return ERR_IO;
+          const rawHandle = -(target.socket as number);
+          const result = registry.sendDgramToPeer(rawHandle, data);
+          return result.ok ? result.bytesSent : ERR_IO;
+        }
         const result = socketBackend.send(target.socket, data);
         if (!result.ok) return ERR_IO;
         return typeof result.bytes_sent === "number"
@@ -2444,6 +3010,14 @@ export function createKernelImports(
         }
         const maxBytes = outCap;
         const peek = flags === MSG_PEEK;
+        if (target.isDgram) {
+          const registry = socketBackend.registry;
+          if (!registry) return ERR_IO;
+          const rawHandle = -(target.socket as number);
+          const result = registry.recvDgram(rawHandle, maxBytes, true);
+          if (!result.ok) return ERR_AGAIN;
+          return writeBytes(memory, outPtr, maxBytes, result.bytes);
+        }
         const nonblocking =
           ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
         const writeSocketBytes = (data: Uint8Array): number => {
@@ -2500,6 +3074,113 @@ export function createKernelImports(
       }
     },
 
+    // host_socket_sendmsg(sockfd, data_ptr, data_len, fds_ptr, fds_count) -> bytes | -1
+    // SCM_RIGHTS: send bytes + ancillary fd handles.
+    // Reads data_len bytes from data_ptr; reads fds_count i32 fd numbers from
+    // fds_ptr (fds_ptr == 0 means no ancillary fds).
+    host_socket_sendmsg(
+      sockfd: number,
+      dataPtr: number,
+      dataLen: number,
+      fdsPtr: number,
+      fdsCount: number,
+    ): number {
+      try {
+        if (!opts.kernel) return -1;
+        const target = opts.kernel.getFdTarget(callerPid, sockfd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return -1;
+        }
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        const bytes = new Uint8Array(memory.buffer, dataPtr, dataLen).slice();
+        let ancFds: number[] | undefined;
+        if (fdsPtr !== 0 && fdsCount > 0) {
+          const view = new DataView(memory.buffer);
+          // Dup each ancillary fd so it survives the sender closing the original.
+          ancFds = Array.from(
+            { length: fdsCount },
+            (_, i) =>
+              opts.kernel!.dup(callerPid, view.getInt32(fdsPtr + i * 4, true)),
+          );
+        }
+        const rawHandle = -(target.socket);
+        const result = registry.sendWithAnc(
+          rawHandle,
+          bytes,
+          ancFds,
+          callerPid,
+        );
+        return result.ok ? result.bytesSent : -1;
+      } catch {
+        return -1;
+      }
+    },
+
+    // host_socket_recvmsg(sockfd, buf_ptr, buf_cap, fds_ptr, fds_cap, n_fds_ptr)
+    //   -> bytes | -1 (EIO) | -2 (EAGAIN)
+    // Writes received bytes to buf_ptr; writes received fd numbers as i32 LE
+    // starting at fds_ptr; writes the fd count as i32 LE at n_fds_ptr.
+    // fds_ptr == 0 means the caller has no ancillary buffer. Async (JSPI).
+    async host_socket_recvmsg(
+      sockfd: number,
+      bufPtr: number,
+      bufCap: number,
+      fdsPtr: number,
+      fdsCap: number,
+      nFdsPtr: number,
+    ): Promise<number> {
+      try {
+        if (!opts.kernel) return -1;
+        const target = opts.kernel.getFdTarget(callerPid, sockfd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return -1;
+        }
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        const rawHandle = -(target.socket);
+        // Peek anc before suspend (recvAsync shifts rx+rxAnc together, so
+        // the peek must precede the await for the queued-message case).
+        const ancBefore = registry.peekAnc(rawHandle);
+        const result = await registry.recvAsync(rawHandle, bufCap);
+        if (!result.ok) return result.error === "EAGAIN" ? -2 : -1;
+        const bytes = result.bytes;
+        const n = Math.min(bytes.length, bufCap);
+        new Uint8Array(memory.buffer, bufPtr, n).set(bytes.subarray(0, n));
+        // SCM_RIGHTS: get anc from queued path or fast-path waiter.
+        const anc = ancBefore ?? registry.popWaiterAnc(rawHandle);
+        const view = new DataView(memory.buffer);
+        let nFds = 0;
+        if (anc) {
+          const senderPid = anc.senderPid;
+          const toReceive = fdsPtr !== 0 && fdsCap > 0
+            ? anc.fds.slice(0, fdsCap)
+            : [];
+          for (const dupFd of toReceive) {
+            try {
+              const newFd = opts.kernel.dupFromProcess(
+                callerPid,
+                senderPid,
+                dupFd,
+              );
+              view.setInt32(fdsPtr + nFds * 4, newFd, true);
+              nFds++;
+            } finally {
+              opts.kernel.closeFd(senderPid, dupFd);
+            }
+          }
+          // Close excess sender-side duplicates that didn't fit in the control buffer.
+          for (const dupFd of anc.fds.slice(toReceive.length)) {
+            opts.kernel.closeFd(senderPid, dupFd);
+          }
+        }
+        if (nFdsPtr !== 0) view.setInt32(nFdsPtr, nFds, true);
+        return n;
+      } catch {
+        return -1;
+      }
+    },
+
     // host_socket_option(req_ptr, req_len, out_ptr, out_cap) -> i32
     // Applies or reports socket option state owned by the kernel.
     // Request JSON: { fd, option, value? }
@@ -2553,6 +3234,73 @@ export function createKernelImports(
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+      }
+    },
+
+    // host_socket_socketpair(family, type, sv_ptr) -> 0 | -1
+    // Creates a connected AF_UNIX socket pair. Writes the two fd numbers as
+    // i32 LE at sv_ptr and sv_ptr+4.
+    host_socket_socketpair(
+      _family: number,
+      sockType: number,
+      svPtr: number,
+    ): number {
+      try {
+        if (!opts.kernel || !socketBackend?.registry) return -1;
+        const registry = socketBackend.registry;
+        const pairCreds = opts.kernel.getCredentials(callerPid ?? 0);
+        const SOCK_DGRAM = 5; // wasi-sdk-30 value passed by C via base_type
+        let fdA: number, fdB: number;
+        if (sockType === SOCK_DGRAM) {
+          const { a, b } = registry.openDgramPair();
+          const makeDgramTarget = (rawHandle: number): FdTarget => ({
+            type: "socket",
+            socket: -rawHandle,
+            family: "AF_UNIX",
+            isDgram: true,
+            refs: 1,
+            peerPid: callerPid ?? 0,
+            peerUid: pairCreds.euid,
+            peerGid: pairCreds.egid,
+            send: socketBackend!.send.bind(socketBackend),
+            recv: socketBackend!.recv.bind(socketBackend),
+            recvAsync: (socket, maxBytes) =>
+              recvSocketAsync(socketBackend!, socket, maxBytes),
+            setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
+            close: (_socket) => {
+              registry.closeDgramSocket(rawHandle);
+            },
+          });
+          fdA = opts.kernel.allocFd(callerPid, makeDgramTarget(a));
+          fdB = opts.kernel.allocFd(callerPid, makeDgramTarget(b));
+        } else {
+          const { a, b } = registry.openUnixPair();
+          const makeTarget = (rawHandle: number): FdTarget => ({
+            type: "socket",
+            socket: -rawHandle,
+            family: "AF_UNIX",
+            refs: 1,
+            peerPid: callerPid ?? 0,
+            peerUid: pairCreds.euid,
+            peerGid: pairCreds.egid,
+            send: socketBackend!.send.bind(socketBackend),
+            recv: socketBackend!.recv.bind(socketBackend),
+            recvAsync: (socket, maxBytes) =>
+              recvSocketAsync(socketBackend!, socket, maxBytes),
+            setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
+            close: (socket) => {
+              socketBackend!.close(socket);
+            },
+          });
+          fdA = opts.kernel.allocFd(callerPid, makeTarget(a));
+          fdB = opts.kernel.allocFd(callerPid, makeTarget(b));
+        }
+        const view = new DataView(memory.buffer);
+        view.setInt32(svPtr, fdA, true);
+        view.setInt32(svPtr + 4, fdB, true);
+        return 0;
+      } catch {
+        return -1;
       }
     },
 

@@ -65,14 +65,19 @@ extern "C" {
 #undef SO_ERROR
 #define SO_ERROR 0x1007
 
-/* Socket types that wasi-sysroot defines but may not propagate through
- * #include_next in all build configurations. */
-#ifndef SOCK_STREAM
-#define SOCK_STREAM    1
-#endif
-#ifndef SOCK_DGRAM
-#define SOCK_DGRAM     2
-#endif
+/* Socket types and address families — defined by wasi-sdk's
+ * __header_sys_socket.h (pulled in via #include_next above).
+ * WASI values differ from Linux; do NOT add #ifndef fallbacks here:
+ *
+ *   WASI  SOCK_STREAM = 6   AF_UNIX = 3
+ *   WASI  SOCK_DGRAM  = 5   AF_INET = 1
+ *   Linux SOCK_STREAM = 1   AF_UNIX = 1
+ *   Linux SOCK_DGRAM  = 2   AF_INET = 2
+ *
+ * Adding #ifndef guards with the Linux values would silently break
+ * if the include_next chain ever changed, producing guest↔kernel
+ * constant mismatches that are very hard to debug. */
+
 #ifndef SOCK_RAW
 #define SOCK_RAW       3
 #endif
@@ -83,12 +88,57 @@ extern "C" {
 #define SOCK_SEQPACKET 5
 #endif
 
+/* PF_UNIX — alias for AF_UNIX; wasi-sdk may not expose it. */
+#ifndef PF_UNIX
+#define PF_UNIX AF_UNIX
+#endif
+
 #ifndef MSG_PEEK
 #define MSG_PEEK 0x02
 #endif
 
 #ifndef SOMAXCONN
 #define SOMAXCONN 128
+#endif
+
+/* SCM_RIGHTS — ancillary message type for fd passing. */
+#ifndef SCM_RIGHTS
+#define SCM_RIGHTS 1
+#endif
+
+/* MSG_CTRUNC — control data was truncated. */
+#ifndef MSG_CTRUNC
+#define MSG_CTRUNC 0x08
+#endif
+
+/* MSG_TRUNC — data was truncated. */
+#ifndef MSG_TRUNC
+#define MSG_TRUNC 0x20
+#endif
+
+/* SO_PEERCRED — get peer credentials. */
+#ifndef SO_PEERCRED
+#define SO_PEERCRED 17
+#endif
+
+/* SO_TYPE — get socket type. */
+#ifndef SO_TYPE
+#define SO_TYPE 3
+#endif
+
+/* struct ucred — peer credentials returned by SO_PEERCRED.
+ * With -D__linux__ (e.g. BusyBox), the WASI sysroot exposes a full struct
+ * ucred via #include_next above; without it the sysroot gives only a forward
+ * declaration, so we complete the type here. */
+#ifndef __linux__
+#ifndef _HAVE_STRUCT_UCRED
+#define _HAVE_STRUCT_UCRED
+struct ucred {
+    pid_t pid;
+    uid_t uid;
+    gid_t gid;
+};
+#endif
 #endif
 
 /* struct cmsghdr and CMSG_* macros — wasi-libc's __struct_msghdr.h only
@@ -122,10 +172,8 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags);
 ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
 
 int socket(int domain, int type, int protocol);
-/* socketpair: emulated via TCP loopback (yurt has no AF_UNIX). The
- * resulting pair behaves like an opaque connected pair for libzmq's
- * signaler and similar use cases; consumers should not assume
- * Unix-domain semantics (no SCM_RIGHTS fd passing, etc.). */
+/* socketpair: AF_UNIX domain socket pair. Backed by the in-kernel
+ * UnixSocketRegistry; supports SOCK_STREAM. */
 int socketpair(int domain, int type, int protocol, int sv[2]);
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
