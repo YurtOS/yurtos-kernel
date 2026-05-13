@@ -21,6 +21,9 @@
  * call host imports concurrently (e.g. libzmq's single signaler).
  */
 
+import { WASI_EBUSY } from "../../wasi/types.js";
+import { SabCondvar, SabMutex } from "./sab-primitives.js";
+
 // Op codes. i32 wire format.
 export const enum WorkerHostOp {
   ThreadSelf = 1,
@@ -104,6 +107,13 @@ export function createWorkerYurtImports(
   const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
   const payloadBytes = new Uint8Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_BYTES);
   const memoryBytes = () => new Uint8Array(memory.buffer);
+  const sharedBuffer = memory.buffer instanceof SharedArrayBuffer
+    ? memory.buffer
+    : null;
+  const mutex = (ptr: number) =>
+    sharedBuffer ? new SabMutex(sharedBuffer, ptr) : null;
+  const condvar = (ptr: number) =>
+    sharedBuffer ? new SabCondvar(sharedBuffer, ptr) : null;
 
   function call(
     op: WorkerHostOp,
@@ -170,6 +180,50 @@ export function createWorkerYurtImports(
     host_socket_send: (fd: number, ptr: number, len: number) => {
       const data = memoryBytes().subarray(ptr, ptr + len);
       return call(WorkerHostOp.SocketSend, [fd, len], data);
+    },
+    host_mutex_lock: (ptr: number) => {
+      const m = mutex(ptr);
+      if (!m || m.owner() === tid) return -1;
+      m.lock(tid);
+      return 0;
+    },
+    host_mutex_unlock: (ptr: number) => {
+      try {
+        const m = mutex(ptr);
+        if (!m) return -1;
+        m.unlock(tid);
+        return 0;
+      } catch {
+        return -1;
+      }
+    },
+    host_mutex_trylock: (ptr: number) => {
+      const m = mutex(ptr);
+      if (!m) return -1;
+      return m.tryLock(tid) ? 0 : WASI_EBUSY;
+    },
+    host_cond_wait: (condPtr: number, mutexPtr: number) => {
+      try {
+        const cv = condvar(condPtr);
+        const m = mutex(mutexPtr);
+        if (!cv || !m) return -1;
+        cv.wait(m, tid);
+        return 0;
+      } catch {
+        return -1;
+      }
+    },
+    host_cond_signal: (ptr: number) => {
+      const cv = condvar(ptr);
+      if (!cv) return -1;
+      cv.signal();
+      return 0;
+    },
+    host_cond_broadcast: (ptr: number) => {
+      const cv = condvar(ptr);
+      if (!cv) return -1;
+      cv.broadcast();
+      return 0;
     },
   };
 }

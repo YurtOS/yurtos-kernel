@@ -161,6 +161,15 @@ function makeThreadedImportedSharedMemoryModule(
   initialPages = 1,
   maximumPages = 1,
 ): WebAssembly.Module {
+  return new WebAssembly.Module(
+    makeThreadedImportedSharedMemoryBytes(initialPages, maximumPages),
+  );
+}
+
+function makeThreadedImportedSharedMemoryBytes(
+  initialPages = 1,
+  maximumPages = 1,
+): Uint8Array<ArrayBuffer> {
   const typeSection = wasmSection(1, wasmVec([[0x60, 0x00, 0x00]]));
   const importSection = wasmSection(
     2,
@@ -186,27 +195,26 @@ function makeThreadedImportedSharedMemoryModule(
     ]]),
   );
   const codeSection = wasmSection(10, wasmVec([[0x02, 0x00, 0x0b]]));
-  return new WebAssembly.Module(
-    new Uint8Array([
-      0x00,
-      0x61,
-      0x73,
-      0x6d,
-      0x01,
-      0x00,
-      0x00,
-      0x00,
-      ...customSection(
-        "yurt.features",
-        JSON.stringify({ features: ["threads"] }),
-      ),
-      ...typeSection,
-      ...importSection,
-      ...functionSection,
-      ...exportSection,
-      ...codeSection,
-    ]),
-  );
+  const bytes = new Uint8Array([
+    0x00,
+    0x61,
+    0x73,
+    0x6d,
+    0x01,
+    0x00,
+    0x00,
+    0x00,
+    ...customSection(
+      "yurt.features",
+      JSON.stringify({ features: ["threads"] }),
+    ),
+    ...typeSection,
+    ...importSection,
+    ...functionSection,
+    ...exportSection,
+    ...codeSection,
+  ]);
+  return bytes as Uint8Array<ArrayBuffer>;
 }
 
 function fixedModuleCache(module: WebAssembly.Module): WasmModuleCache {
@@ -550,6 +558,26 @@ Deno.test("loadProcess auto-allocates SAB memory + spawner for a threaded module
     moduleCache: fixedModuleCache(
       makeThreadedImportedSharedMemoryModule(16, 16384),
     ),
+  });
+
+  const proc = await loadProcess(ctx, {
+    argv: ["/bin/true"],
+    mode: "cli",
+    workerSabAvailable: true,
+  });
+
+  assertEquals(proc.exitCode, 0);
+  assertEquals(proc.memory?.buffer instanceof SharedArrayBuffer, true);
+  await proc.terminate();
+});
+
+Deno.test("loadProcess auto-allocates SAB memory compatible with imported memory limits", async () => {
+  const bytes = makeThreadedImportedSharedMemoryBytes(1, 1);
+  const ctx = await makeLoaderContext({
+    moduleCache: fixedModuleCache(new WebAssembly.Module(bytes)),
+  });
+  ctx.vfs.withWriteAccess(() => {
+    ctx.vfs.writeFile("/bin/true", bytes);
   });
 
   const proc = await loadProcess(ctx, {

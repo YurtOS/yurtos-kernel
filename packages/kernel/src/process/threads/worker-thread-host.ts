@@ -43,9 +43,14 @@ interface DoneMessage {
   retval: number;
 }
 
-declare const self: DedicatedWorkerGlobalScope & typeof globalThis;
+const workerSelf = self as unknown as {
+  onmessage:
+    | ((event: MessageEvent<StartMessage>) => void | Promise<void>)
+    | null;
+  postMessage(message: unknown): void;
+};
 
-self.onmessage = async (e: MessageEvent<StartMessage>) => {
+workerSelf.onmessage = async (e: MessageEvent<StartMessage>) => {
   if (e.data?.type !== "start") return;
   const { tid, fnPtr, arg, module, memory, requestSab } = e.data;
 
@@ -54,7 +59,7 @@ self.onmessage = async (e: MessageEvent<StartMessage>) => {
     const proxy: WorkerHostImportProxy = {
       requestSab,
       postHostCall: (_op: WorkerHostOp) =>
-        self.postMessage({ type: "host-call" }),
+        workerSelf.postMessage({ type: "host-call" }),
     };
     yurtImports = createWorkerYurtImports(tid, memory, proxy);
   }
@@ -85,5 +90,5 @@ self.onmessage = async (e: MessageEvent<StartMessage>) => {
   }
 
   const msg: DoneMessage = { type: "done", tid, retval };
-  self.postMessage(msg);
+  workerSelf.postMessage(msg);
 };

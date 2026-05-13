@@ -66,6 +66,7 @@ const DEFAULT_WORKER_SAB_MAXIMUM_PAGES = 16384;
 export function resolveWorkerSabMemory(
   profile: YurtModuleProfile,
   provided: WebAssembly.Memory | undefined,
+  importLimits?: { initial: number; maximum?: number } | null,
 ): WebAssembly.Memory | undefined {
   if (!profile.requiresSharedMemory || !profile.memoryImport) {
     return provided;
@@ -74,9 +75,14 @@ export function resolveWorkerSabMemory(
     validateYurtThreadMemory(profile, provided);
     return provided;
   }
+  const maximum = importLimits?.maximum ?? DEFAULT_WORKER_SAB_MAXIMUM_PAGES;
+  const initial = Math.min(
+    maximum,
+    Math.max(DEFAULT_WORKER_SAB_INITIAL_PAGES, importLimits?.initial ?? 1),
+  );
   return new WebAssembly.Memory({
-    initial: DEFAULT_WORKER_SAB_INITIAL_PAGES,
-    maximum: DEFAULT_WORKER_SAB_MAXIMUM_PAGES,
+    initial,
+    maximum,
     shared: true,
   });
 }
@@ -196,7 +202,13 @@ export async function loadProcess(
   const profile = validateYurtModuleProfile(analyzeYurtModule(module, {
     workerSabAvailable,
   }));
-  const workerSabMemory = resolveWorkerSabMemory(profile, opts.workerSabMemory);
+  const workerSabMemory = resolveWorkerSabMemory(
+    profile,
+    opts.workerSabMemory,
+    profile.memoryImport
+      ? findMemoryImportLimits(bytes, profile.memoryImport)
+      : null,
+  );
   // Build worker-host dispatcher bodies once per process so every
   // spawned pthread shares the same kernel/threads-backend references
   // (and any future per-process lock state the bodies grow). The
@@ -731,6 +743,107 @@ function initAsyncifyBridge(
   view.setUint32(dataAddr + 4, dataAddr + asyncifyBufSize, true);
   bridge.initFromInstance(instance, dataAddr, asyncifyBufSize);
   return true;
+}
+
+function findMemoryImportLimits(
+  bytes: Uint8Array,
+  memoryImport: { module: string; name: string },
+): { initial: number; maximum?: number } | null {
+  let offset = 8;
+  while (offset < bytes.length) {
+    const sectionId = bytes[offset++];
+    const sectionSize = readVarUint32(bytes, offset);
+    offset = sectionSize.next;
+    const sectionEnd = offset + sectionSize.value;
+    if (sectionId !== 2) {
+      offset = sectionEnd;
+      continue;
+    }
+
+    const count = readVarUint32(bytes, offset);
+    offset = count.next;
+    for (let i = 0; i < count.value; i++) {
+      const module = readName(bytes, offset);
+      offset = module.next;
+      const name = readName(bytes, offset);
+      offset = name.next;
+      const kind = bytes[offset++];
+      if (kind === 2) {
+        const flags = readVarUint32(bytes, offset);
+        offset = flags.next;
+        const initial = readVarUint32(bytes, offset);
+        offset = initial.next;
+        let maximum: number | undefined;
+        if ((flags.value & 0x01) !== 0) {
+          const max = readVarUint32(bytes, offset);
+          offset = max.next;
+          maximum = max.value;
+        }
+        if (
+          module.value === memoryImport.module &&
+          name.value === memoryImport.name
+        ) {
+          return { initial: initial.value, maximum };
+        }
+        continue;
+      }
+
+      if (kind === 0) {
+        const typeIndex = readVarUint32(bytes, offset);
+        offset = typeIndex.next;
+      } else if (kind === 1) {
+        const elementType = readVarUint32(bytes, offset);
+        offset = elementType.next;
+        const limits = readLimits(bytes, offset);
+        offset = limits.next;
+      } else if (kind === 3) {
+        offset++;
+      } else {
+        return null;
+      }
+    }
+    return null;
+  }
+  return null;
+}
+
+function readLimits(bytes: Uint8Array, offset: number): { next: number } {
+  const flags = readVarUint32(bytes, offset);
+  offset = flags.next;
+  const initial = readVarUint32(bytes, offset);
+  offset = initial.next;
+  if ((flags.value & 0x01) !== 0) {
+    const maximum = readVarUint32(bytes, offset);
+    offset = maximum.next;
+  }
+  return { next: offset };
+}
+
+function readName(
+  bytes: Uint8Array,
+  offset: number,
+): { value: string; next: number } {
+  const length = readVarUint32(bytes, offset);
+  const start = length.next;
+  const end = start + length.value;
+  return {
+    value: new TextDecoder().decode(bytes.subarray(start, end)),
+    next: end,
+  };
+}
+
+function readVarUint32(
+  bytes: Uint8Array,
+  offset: number,
+): { value: number; next: number } {
+  let value = 0;
+  let shift = 0;
+  while (true) {
+    const byte = bytes[offset++];
+    value |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) return { value: value >>> 0, next: offset };
+    shift += 7;
+  }
 }
 
 function shouldAsyncifyWrapExport(name: string): boolean {
