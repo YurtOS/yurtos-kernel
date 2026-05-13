@@ -231,17 +231,25 @@ fn build_clang_invocation(
 ) -> Vec<OsString> {
     let mut argv: Vec<OsString> = Vec::new();
     argv.push(format!("--sysroot={}", sdk.sysroot().display()).into());
-    argv.push("--target=wasm32-wasip1".into());
+    // wasi-libc's TLS-bound symbols (errno, locale state) live only in
+    // the wasm32-wasip1-threads sysroot. The non-threaded sysroot
+    // declares errno in .bss; linking it against -pthread-compiled
+    // objects (which emit R_WASM_MEMORY_ADDR_TLS_SLEB relocations on
+    // errno) produces "relocation cannot be used against non-TLS
+    // symbol" link errors. Switch target so wasi-libc supplies TLS
+    // variants when threads are enabled.
     if env.use_threads {
-        // YURT_CC_USE_THREADS=1: coerce clang to emit thread-capable wasm
-        // against the wasm32-wasip1 target. -pthread defines _REENTRANT and
-        // enables pthread-aware libc paths; -matomics emits wasm atomics ops
-        // (memory.atomic.*, i32.atomic.rmw, …) required for pthread_mutex_t
-        // init etc.; -mbulk-memory enables the bulk-memory ops (memcpy /
-        // memset) that some threaded codegen paths assume. We deliberately
-        // stay on wasm32-wasip1 rather than wasm32-wasip1-threads — the
-        // threaded sysroot ships a different libc that we don't link
-        // against (yurt-libc supplies the threading surface).
+        argv.push("--target=wasm32-wasip1-threads".into());
+    } else {
+        argv.push("--target=wasm32-wasip1".into());
+    }
+    if env.use_threads {
+        // YURT_CC_USE_THREADS=1: coerce clang to emit thread-capable wasm.
+        // -pthread defines _REENTRANT and enables pthread-aware libc paths;
+        // -matomics emits wasm atomics ops (memory.atomic.*, i32.atomic.rmw,
+        // …) required for pthread_mutex_t init etc.; -mbulk-memory enables
+        // the bulk-memory ops (memcpy / memset) that some threaded codegen
+        // paths assume.
         argv.push("-pthread".into());
         argv.push("-matomics".into());
         argv.push("-mbulk-memory".into());
