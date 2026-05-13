@@ -30,6 +30,30 @@ class ThreadExit {
   constructor(readonly retval: number) {}
 }
 
+/**
+ * Worker/SAB threads backend.
+ *
+ * Two tid namespaces coexist here, intentionally:
+ *
+ *   1. Guest-visible `host_thread_self()` — the tid the WASM module
+ *      sees when it calls the import. Main thread returns 0; spawned
+ *      threads return the tid captured into their worker's closure
+ *      (see worker-host-proxy.ts:createWorkerYurtImports).
+ *
+ *   2. Kernel-internal `tidForLockOps()` — the tid used as the
+ *      SabMutex/SabCondvar owner field. Main thread maps to 1
+ *      (reserved slot[1]); spawned threads use their spawn-allocated
+ *      tid (>= 2). This keeps main and spawned tids disjoint so
+ *      SabMutex.owner uniquely identifies the holder across the
+ *      main/worker boundary.
+ *
+ * Why the asymmetry: pthread_self() and pthread_mutex_t.owner are
+ * different concepts. The guest's pthread_self() returns 0 on main
+ * (POSIX-shaped); the mutex owner field is a wire-level token that
+ * must be non-zero and unique across all threads. Trying to unify
+ * these would either break POSIX semantics (main can't be tid 0
+ * in pthread_self) or break SabMutex's tid-0-means-unlocked invariant.
+ */
 export class WorkerSabThreadsBackend implements ThreadsBackend {
   readonly kind = "worker-sab" as const;
 

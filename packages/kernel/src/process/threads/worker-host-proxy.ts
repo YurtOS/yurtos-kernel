@@ -246,8 +246,19 @@ export function createWorkerYurtImports(
  * (result/errno). Read-ish ops (ReadFd, SocketRecv) also return the
  * bytes to copy into the response payload.
  *
- * Task 10 will wrap callers around these to acquire a kernel-state
- * mutex; for Task 9 they're called directly.
+ * **Sync-only contract.** Method return types are deliberately
+ * `number` (not `number | Promise<number>`). The dispatcher invokes
+ * each body inside the JS event loop's serialized message-handler
+ * dispatch; no body may `await` mid-flight, because doing so would
+ * let a peer worker's message handler interleave and observe a
+ * partially-mutated kernel state. If a future op genuinely needs
+ * an async body (e.g. blocking socket recv with backpressure), the
+ * dispatcher itself must first be promoted to `await` body results
+ * AND a real serialization primitive (Promise-chain mutex or
+ * Atomics-based main-side lock) must be reintroduced. Until then,
+ * keep these signatures sync — TypeScript will reject any attempt
+ * to return a Promise without an explicit cast, which is the
+ * load-bearing guard against silent correctness regressions.
  */
 export interface WorkerHostDispatcherBodies {
   threadYield(): number;
