@@ -188,4 +188,65 @@ maybeDescribe("cpython3 + pyzmq runtime smoke", () => {
       sandbox.destroy();
     }
   });
+
+  it("exchanges a ZMQ message over inproc:// with IO_THREADS=0", async () => {
+    // The first test that exercises a real ZMQ socket end-to-end in
+    // the sandbox, not just an `import zmq`. The shape is constrained
+    // by two of yurt's current realities:
+    //
+    //   1. libzmq's signaler calls `socketpair(AF_UNIX, …)`, which the
+    //      yurt ABI shim implements via bind/listen/connect/accept on
+    //      AF_INET loopback (abi/src/yurt_socket.c). That listen() is
+    //      denied unless the host opts in — hence
+    //      `serverSockets.allowLoopback`. Without it the test fails
+    //      at `ctx.socket(...)` with "Not supported (src/ip.cpp:773)".
+    //
+    //   2. The default libzmq Context spawns a separate I/O reactor
+    //      thread the first time a socket is allocated. yurt's
+    //      `threadsBackend` is a cooperative single-threaded JS
+    //      event loop and rejects the pthread_create — libzmq then
+    //      bails with "Resource temporarily unavailable
+    //      (src/thread.cpp:241)". `set(IO_THREADS, 0)` keeps libzmq
+    //      synchronous and skips the reactor spawn. The catch is
+    //      that `IO_THREADS=0` disables TCP transports (which need
+    //      the reactor for poll/select); only `inproc://` (in-
+    //      process queues) works. Sufficient to prove the pyzmq
+    //      bindings are alive and the socket wire is real.
+    //
+    // When the kernel grows preemptive threads (`host_thread_spawn`
+    // actually spawning a parallel execution context), this test can
+    // bump to TCP + default IO_THREADS and the same shape covers
+    // the Jupyter wire pattern.
+    const sandbox = await Sandbox.create({
+      wasmDir: WASM_DIR,
+      adapter: new NodeAdapter(),
+      network: { allowedHosts: ["127.0.0.1", "localhost"] },
+      serverSockets: { allowLoopback: true },
+    });
+    try {
+      const result = await runPython(sandbox, [
+        "import zmq",
+        "ctx = zmq.Context()",
+        "ctx.set(zmq.IO_THREADS, 0)",
+        "p = ctx.socket(zmq.PAIR); p.bind('inproc://yurt-test')",
+        "s = ctx.socket(zmq.PAIR); s.connect('inproc://yurt-test')",
+        "s.send_string('jupyter-shape')",
+        "print(p.recv_string())",
+      ]);
+      if (result.exitCode !== 0) {
+        console.log("--- zmq inproc: exit", result.exitCode);
+        console.log("--- zmq inproc stderr:", result.stderr);
+      }
+      // Note: Context.term() at process teardown currently trips a
+      // "memory access out of bounds" in libzmq's shutdown path on
+      // wasi (suspected interaction with the no-thread context).
+      // The actual send/recv completes synchronously before that,
+      // so the message lands on stdout and the assertion below
+      // checks the visible part. Exit code is loose for the same
+      // reason — assert payload, not exit.
+      expect(result.stdout).toContain("jupyter-shape");
+    } finally {
+      sandbox.destroy();
+    }
+  });
 });
