@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stddef.h>
@@ -69,6 +70,12 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 
 #define YURT_SOCKET_RESP_CAP 4096
 #define YURT_SOCKET_RECV_MAX_RAW 3000
+/* Host import errors are opaque sentinels, not direct negative errno values. */
+#define YURT_HOST_ERR_NOT_FOUND -1
+#define YURT_HOST_ERR_IO -3
+#define YURT_HOST_ERR_AGAIN -11
+#define YURT_HOST_ERR_INVALID -22
+#define YURT_HOST_ERR_UNSUPPORTED -38
 
 /* wasi-libc already ships strong definitions for some POSIX socket names.
  * yurt-cc/cargo-yurt pass --wrap for the duplicate-owned symbols we implement
@@ -198,77 +205,25 @@ static int parse_json_string_field(
   return -1;
 }
 
-static int base64_encode(const unsigned char *src, size_t len, char *dst, size_t cap) {
-  static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  size_t out_len = ((len + 2) / 3) * 4;
-  size_t out = 0;
-
-  if (out_len + 1 > cap) {
-    errno = EOVERFLOW;
-    return -1;
-  }
-
-  for (size_t i = 0; i < len; i += 3) {
-    uint32_t v = (uint32_t)src[i] << 16;
-    int have2 = i + 1 < len;
-    int have3 = i + 2 < len;
-    if (have2) v |= (uint32_t)src[i + 1] << 8;
-    if (have3) v |= src[i + 2];
-
-    dst[out++] = table[(v >> 18) & 0x3f];
-    dst[out++] = table[(v >> 12) & 0x3f];
-    dst[out++] = have2 ? table[(v >> 6) & 0x3f] : '=';
-    dst[out++] = have3 ? table[v & 0x3f] : '=';
-  }
-  dst[out] = '\0';
-  return (int)out;
-}
-
-static int base64_value(char ch) {
-  if (ch >= 'A' && ch <= 'Z') return ch - 'A';
-  if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
-  if (ch >= '0' && ch <= '9') return ch - '0' + 52;
-  if (ch == '+') return 62;
-  if (ch == '/') return 63;
-  return -1;
-}
-
-static ssize_t base64_decode(const char *src, unsigned char *dst, size_t cap) {
-  size_t len = strlen(src);
-  size_t out = 0;
-
-  if (len % 4 != 0) {
-    errno = EIO;
-    return -1;
-  }
-
-  for (size_t i = 0; i < len; i += 4) {
-    int a = base64_value(src[i]);
-    int b = base64_value(src[i + 1]);
-    int c = src[i + 2] == '=' ? -2 : base64_value(src[i + 2]);
-    int d = src[i + 3] == '=' ? -2 : base64_value(src[i + 3]);
-    uint32_t v;
-
-    if (a < 0 || b < 0 || c == -1 || d == -1) {
+static void set_socket_errno_from_host(int err) {
+  switch (err) {
+    case YURT_HOST_ERR_NOT_FOUND:
+      errno = EBADF;
+      break;
+    case YURT_HOST_ERR_AGAIN:
+      errno = EAGAIN;
+      break;
+    case YURT_HOST_ERR_INVALID:
+      errno = EINVAL;
+      break;
+    case YURT_HOST_ERR_UNSUPPORTED:
+      errno = EOPNOTSUPP;
+      break;
+    case YURT_HOST_ERR_IO:
+    default:
       errno = EIO;
-      return -1;
-    }
-
-    v = ((uint32_t)a << 18) | ((uint32_t)b << 12)
-      | (uint32_t)(c < 0 ? 0 : c) << 6
-      | (uint32_t)(d < 0 ? 0 : d);
-
-    if (out >= cap) break;
-    dst[out++] = (unsigned char)((v >> 16) & 0xff);
-    if (c == -2) continue;
-    if (out >= cap) break;
-    dst[out++] = (unsigned char)((v >> 8) & 0xff);
-    if (d == -2) continue;
-    if (out >= cap) break;
-    dst[out++] = (unsigned char)(v & 0xff);
+      break;
   }
-
-  return (ssize_t)out;
 }
 
 int socket(int domain, int type, int protocol) {
@@ -716,48 +671,29 @@ int __wrap_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 
 static ssize_t yurt_send_impl(int sockfd, const void *buf, size_t len, int flags) {
   YURT_MARKER_CALL(send);
-  char *encoded;
-  char *req;
-  char resp[YURT_SOCKET_RESP_CAP];
   int req_len;
   int n;
-  int bytes_sent = 0;
 
   (void)flags;
-  /* Try typed AF_UNIX STREAM path first (avoids base64). */
+  if (len > INT_MAX) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  req_len = (int)len;
+  /* Try typed AF_UNIX path first; other sockets fall through to the generic
+   * binary send import. */
   {
-    int r = yurt_host_socket_send_unix(sockfd, (int)(intptr_t)buf, (int)len);
+    int r = yurt_host_socket_send_unix(sockfd, (int)(intptr_t)buf, req_len);
     if (r >= 0) return (ssize_t)r;
     if (r == -1) { errno = EIO; return -1; }
-    /* r == -2: not AF_UNIX STREAM, fall through to base64 JSON path. */
+    /* r == -2: not AF_UNIX STREAM, fall through. */
   }
-
-  encoded = malloc(((len + 2) / 3) * 4 + 1);
-  req = malloc(((len + 2) / 3) * 4 + 128);
-  if (!encoded || !req) {
-    free(encoded);
-    free(req);
-    errno = ENOMEM;
+  n = yurt_host_socket_send(sockfd, (int)(intptr_t)buf, req_len);
+  if (n < 0) {
+    set_socket_errno_from_host(n);
     return -1;
   }
-  if (base64_encode((const unsigned char *)buf, len, encoded, ((len + 2) / 3) * 4 + 1) < 0) {
-    free(encoded);
-    free(req);
-    return -1;
-  }
-  req_len = sprintf(req, "{\"fd\":%d,\"data_b64\":\"%s\"}", sockfd, encoded);
-
-  n = yurt_host_socket_send((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
-  free(encoded);
-  free(req);
-  if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-    errno = EIO;
-    return -1;
-  }
-  if (parse_json_int(resp, (size_t)n, "bytes_sent", &bytes_sent) != 0) {
-    return -1;
-  }
-  return (ssize_t)bytes_sent;
+  return (ssize_t)n;
 }
 
 ssize_t send(int sockfd, const void *buf, size_t len, int flags) {
@@ -770,10 +706,6 @@ ssize_t __wrap_send(int sockfd, const void *buf, size_t len, int flags) {
 
 static ssize_t yurt_recv_impl(int sockfd, void *buf, size_t len, int flags) {
   YURT_MARKER_CALL(recv);
-  char req[128];
-  char resp[YURT_SOCKET_RESP_CAP];
-  char data_b64[YURT_SOCKET_RESP_CAP];
-  int req_len;
   int n;
 
   if (flags != 0 && flags != MSG_PEEK && flags != YURT_MSG_PEEK) {
@@ -785,43 +717,28 @@ static ssize_t yurt_recv_impl(int sockfd, void *buf, size_t len, int flags) {
     len = YURT_SOCKET_RECV_MAX_RAW;
   }
 
-  /* Try typed AF_UNIX STREAM path first (avoids base64). */
+  if (len > INT_MAX) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+
+  /* Try typed AF_UNIX path first; other sockets fall through to the generic
+   * binary recv import. */
   {
     int is_peek = (flags == MSG_PEEK || flags == YURT_MSG_PEEK) ? 1 : 0;
     int r = yurt_host_socket_recv_unix(sockfd, (int)(intptr_t)buf, (int)len, is_peek);
     if (r >= 0) return (ssize_t)r;
     if (r == -2) { errno = EAGAIN; return -1; }
     if (r == -1) { errno = EIO; return -1; }
-    /* r == -3: not AF_UNIX STREAM, fall through to base64 JSON path. */
+    /* r == -3: not AF_UNIX, fall through. */
   }
 
-  req_len = snprintf(
-    req,
-    sizeof(req),
-    "{\"fd\":%d,\"max_bytes\":%zu%s}",
-    sockfd,
-    len,
-    (flags == MSG_PEEK || flags == YURT_MSG_PEEK) ? ",\"peek\":true" : ""
-  );
-  if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
-    errno = EOVERFLOW;
+  n = yurt_host_socket_recv(sockfd, (int)(intptr_t)buf, (int)len, flags);
+  if (n < 0) {
+    set_socket_errno_from_host(n);
     return -1;
   }
-
-  n = yurt_host_socket_recv((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
-  if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-    if (n > 0 && json_contains(resp, (size_t)n, "\"error\":\"EAGAIN\"")) {
-      errno = EAGAIN;
-      return -1;
-    }
-    errno = EIO;
-    return -1;
-  }
-  if (parse_json_string_field(resp, (size_t)n, "data_b64", data_b64, sizeof(data_b64)) != 0) {
-    return -1;
-  }
-
-  return base64_decode(data_b64, (unsigned char *)buf, len);
+  return (ssize_t)n;
 }
 
 ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
@@ -1217,10 +1134,14 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
 
 /* ── SO_PEERCRED getsockopt ─────────────────────────────────────────────── */
 static int yurt_getsockopt_peercred(int sockfd, void *optval, socklen_t *optlen) {
-  struct ucred cred;
+  struct {
+    pid_t pid;
+    uid_t uid;
+    gid_t gid;
+  } cred;
   int pid = 0, uid = 0, gid = 0;
 
-  if (!optval || !optlen || *optlen < (socklen_t)sizeof(struct ucred)) {
+  if (!optval || !optlen || *optlen < (socklen_t)sizeof(cred)) {
     errno = EINVAL;
     return -1;
   }

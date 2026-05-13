@@ -59,7 +59,7 @@ export type FdTarget =
     peerPid?: number;
     peerUid?: number;
     peerGid?: number;
-    send: (socket: SocketHandle, dataB64: string) => SocketBackendResult;
+    send: (socket: SocketHandle, data: Uint8Array) => SocketBackendResult;
     recv: (
       socket: SocketHandle,
       maxBytes: number,

@@ -1,0 +1,9 @@
+canary = "posix-runtime-canary"
+symbol = "select"
+
+[[cases]]
+name = "select_regular_fd"
+inputs = "select() over a regular file descriptor and an invalid descriptor"
+expected.exit = 0
+expected.stdout = "select_regular_fd:ok"
+expected.note = "regular files are immediately readable/writable; invalid positive fds report EBADF"

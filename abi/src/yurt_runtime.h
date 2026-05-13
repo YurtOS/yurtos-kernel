@@ -18,6 +18,9 @@ void yurt_host_yield(void);
 __attribute__((import_module("yurt"), import_name("host_file_lock")))
 int yurt_host_file_lock(int fd, int operation);
 
+__attribute__((import_module("yurt"), import_name("host_poll")))
+int yurt_host_poll(int fds_ptr, int nfds, int timeout_ms);
+
 __attribute__((import_module("yurt"), import_name("host_chmod")))
 int yurt_host_chmod(int path_ptr, int path_len, int mode);
 
@@ -186,10 +189,10 @@ __attribute__((import_module("yurt"), import_name("host_socket_accept")))
 int yurt_host_socket_accept(int req_ptr, int req_len, int out_ptr, int out_cap);
 
 __attribute__((import_module("yurt"), import_name("host_socket_send")))
-int yurt_host_socket_send(int req_ptr, int req_len, int out_ptr, int out_cap);
+int yurt_host_socket_send(int fd, int data_ptr, int data_len);
 
 __attribute__((import_module("yurt"), import_name("host_socket_recv")))
-int yurt_host_socket_recv(int req_ptr, int req_len, int out_ptr, int out_cap);
+int yurt_host_socket_recv(int fd, int out_ptr, int out_cap, int flags);
 
 __attribute__((import_module("yurt"), import_name("host_socket_addr")))
 int yurt_host_socket_addr(int req_ptr, int req_len, int out_ptr, int out_cap);

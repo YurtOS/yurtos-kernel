@@ -65,6 +65,7 @@ $(SRC_DIR)/config.status: $(PATCH_STAMP) $(NCURSES_LIB) | ensure-toolchain ensur
 		CFLAGS="$(YURT_CFLAGS)" \
 		LIBS="$(NCURSES_LIB)" \
 		ac_cv_func_getrusage=yes \
+		ac_cv_func_select=yes \
 		zsh_cv_use_getcwd=yes \
 		zsh_cv_64_bit_type="long long" \
 		zsh_cv_64_bit_utype="unsigned long long" \

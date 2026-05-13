@@ -82,7 +82,7 @@ export function createPipe(): [PipeReadEnd, PipeWriteEnd] {
   const writeEnd: PipeWriteEnd = {
     write(data: Uint8Array): number {
       if (shared.writeClosed) {
-        throw new Error('write to closed pipe');
+        throw new Error("write to closed pipe");
       }
       if (data.byteLength === 0) {
         return 0;
@@ -130,6 +130,10 @@ export interface AsyncPipeReadEnd {
   /** Increment reference count (for sharing across fd tables). */
   addRef(): void;
   readonly closed: boolean;
+  /** Whether all write-end references are closed. */
+  readonly writeClosed: boolean;
+  /** Whether the pipe has buffered bytes available for a non-blocking read. */
+  readonly hasBufferedData: boolean;
   /** Whether the pipe has buffered data available for a non-blocking read. */
   readonly hasData: boolean;
 }
@@ -241,13 +245,21 @@ export function createAsyncPipe(
       return shared.readClosed;
     },
 
+    get writeClosed() {
+      return shared.writeClosed;
+    },
+
+    get hasBufferedData() {
+      return shared.totalBytes > 0;
+    },
+
     get hasData() {
       return shared.totalBytes > 0 || shared.writeClosed;
     },
 
     async read(buf: Uint8Array): Promise<number> {
       if (shared.pendingReader) {
-        throw new Error('concurrent read on async pipe');
+        throw new Error("concurrent read on async pipe");
       }
       // Data available — drain immediately.
       if (shared.totalBytes > 0) {
@@ -348,14 +360,16 @@ export function createAsyncPipe(
       if (shared.readClosed) return -1;
       if (shared.writeClosed) return -1;
       if (shared.pendingWriter) {
-        throw new Error('concurrent writeAsync on async pipe');
+        throw new Error("concurrent writeAsync on async pipe");
       }
       const spaceAvailable = shared.capacity - shared.totalBytes;
       if (spaceAvailable >= data.length) {
         const n = this.write(data);
         // Forward-progress invariant: n>0 whenever data.length>0.
         if (data.length > 0 && n === 0) {
-          throw new Error('writeAsync: write() returned 0 for a non-empty buffer');
+          throw new Error(
+            "writeAsync: write() returned 0 for a non-empty buffer",
+          );
         }
         return n;
       }
@@ -373,7 +387,9 @@ export function createAsyncPipe(
           // Net result must be ≥ 1 for non-empty inputs.
           const result = n === -1 ? -1 : written + n;
           if (result === 0) {
-            throw new Error('writeAsync: pending resolve produced 0 for a non-empty buffer');
+            throw new Error(
+              "writeAsync: pending resolve produced 0 for a non-empty buffer",
+            );
           }
           resolve(result);
         };

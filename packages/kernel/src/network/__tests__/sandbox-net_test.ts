@@ -54,13 +54,13 @@ describe("SandboxNet ↔ SocketBackend round trip", () => {
     hostSock.send(enc.encode("GET / HTTP/1.1\r\n\r\n"));
     const guestRecv = await backend.recvAsync!(accepted.socket, 4096);
     if (!guestRecv.ok) throw new Error("guest recv failed");
-    expect(dec.decode(base64ToBytes(guestRecv.data_b64 ?? ""))).toBe(
+    expect(dec.decode(guestRecv.data ?? new Uint8Array(0))).toBe(
       "GET / HTTP/1.1\r\n\r\n",
     );
 
     // Sandbox → host.
     const reply = enc.encode("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
-    backend.send(accepted.socket, bytesToBase64(reply));
+    backend.send(accepted.socket, reply);
     const hostRecv = await hostSock.recv(4096);
     expect(dec.decode(hostRecv)).toBe(
       "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
@@ -132,22 +132,7 @@ describe("SandboxNet ↔ SocketBackend round trip", () => {
     const r1 = await backend.recvAsync!(a1.socket, 1024);
     const r2 = await backend.recvAsync!(a2.socket, 1024);
     if (!r1.ok || !r2.ok) throw new Error("recv failed");
-    expect(dec.decode(base64ToBytes(r1.data_b64 ?? ""))).toBe("one");
-    expect(dec.decode(base64ToBytes(r2.data_b64 ?? ""))).toBe("two");
+    expect(dec.decode(r1.data ?? new Uint8Array(0))).toBe("one");
+    expect(dec.decode(r2.data ?? new Uint8Array(0))).toBe("two");
   });
 });
-
-function bytesToBase64(b: Uint8Array): string {
-  if (b.byteLength === 0) return "";
-  let s = "";
-  for (const x of b) s += String.fromCharCode(x);
-  return btoa(s);
-}
-
-function base64ToBytes(s: string): Uint8Array {
-  if (s === "") return new Uint8Array(0);
-  const bin = atob(s);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-}

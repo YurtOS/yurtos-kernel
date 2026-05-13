@@ -162,6 +162,12 @@ const USER_UID = 1000;
 const USER_GID = 1000;
 const PRIO_PROCESS = 0;
 const YURT_WAIT_NOHANG = 1;
+const POLLIN = 0x0001;
+const POLLOUT = 0x0002;
+const POLLERR = 0x0008;
+const POLLHUP = 0x0010;
+const POLLNVAL = 0x0020;
+const POLLFD_SIZE = 8;
 
 function writeI32(
   memory: WebAssembly.Memory,
@@ -349,6 +355,72 @@ function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
 
 function yieldToScheduler(): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+function pollReventsForTarget(target: FdTarget, events: number): number {
+  let revents = 0;
+  const wantsRead = (events & POLLIN) !== 0;
+  const wantsWrite = (events & POLLOUT) !== 0;
+
+  switch (target.type) {
+    case "pipe_read":
+      if (wantsRead && target.pipe.hasBufferedData) revents |= POLLIN;
+      if (target.pipe.writeClosed && !target.pipe.hasBufferedData) {
+        revents |= POLLHUP;
+      }
+      break;
+    case "pipe_write":
+      if (target.pipe.closed) revents |= POLLERR;
+      else if (wantsWrite && target.pipe.hasCapacity) revents |= POLLOUT;
+      break;
+    case "tty_slave":
+      if (wantsRead && target.state.toSlave.length > 0) revents |= POLLIN;
+      if (target.state.masterClosed) revents |= POLLHUP;
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+    case "tty_master":
+      if (wantsRead && target.state.toMaster.length > 0) revents |= POLLIN;
+      if (wantsWrite && !target.state.masterClosed) revents |= POLLOUT;
+      if (target.state.masterClosed) revents |= POLLHUP;
+      break;
+    case "buffer":
+      // Buffer targets are write-only stdout/stderr captures.
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+    case "static":
+      if (wantsRead) revents |= POLLIN;
+      break;
+    case "socket":
+      if (wantsRead) {
+        if ((target.peekBuffer?.byteLength ?? 0) > 0 || target.readShutdown) {
+          revents |= POLLIN;
+        } else if (target.socket !== null) {
+          // Socket readiness is probed by a nonblocking recv; any byte read
+          // here is cached so the following guest recv observes it.
+          const probe = target.recv(target.socket, 1, { nonblocking: true });
+          if (probe.ok) {
+            const data = probe.data ?? new Uint8Array(0);
+            if (data.byteLength > 0) target.peekBuffer = data;
+            else target.readShutdown = true;
+            revents |= POLLIN;
+          } else if (probe.error !== "EAGAIN") {
+            revents |= POLLERR;
+          }
+        }
+      }
+      if (wantsWrite && target.socket !== null && !target.writeShutdown) {
+        revents |= POLLOUT;
+      }
+      break;
+    case "null":
+    case "vfs_file":
+    case "vfs_dir":
+      if (wantsRead) revents |= POLLIN;
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+  }
+
+  return revents;
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -793,23 +865,6 @@ export function createKernelImports(
     return 0;
   }
 
-  function bytesToBase64(data: Uint8Array): string {
-    let binary = "";
-    for (let i = 0; i < data.byteLength; i++) {
-      binary += String.fromCharCode(data[i]);
-    }
-    return btoa(binary);
-  }
-
-  function base64ToBytes(value: string): Uint8Array {
-    const binary = atob(value);
-    const out = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      out[i] = binary.charCodeAt(i);
-    }
-    return out;
-  }
-
   function concatBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
     const out = new Uint8Array(left.byteLength + right.byteLength);
     out.set(left, 0);
@@ -892,7 +947,8 @@ export function createKernelImports(
     if (!policy?.allowUnixDomain) {
       return {
         ok: false,
-        error: `AF_UNIX abstract listen on @${name} is not allowed by sandbox policy`,
+        error:
+          `AF_UNIX abstract listen on @${name} is not allowed by sandbox policy`,
       };
     }
     const allowlist = policy.unixAbstractAllowlist;
@@ -901,7 +957,8 @@ export function createKernelImports(
       if (!allowed) {
         return {
           ok: false,
-          error: `AF_UNIX abstract name @${name} is not in the sandbox allowlist`,
+          error:
+            `AF_UNIX abstract name @${name} is not in the sandbox allowlist`,
         };
       }
     }
@@ -962,6 +1019,77 @@ export function createKernelImports(
         if (writeTarget) ioFds.set(writeFd, writeTarget);
       }
       return writePipeResult(memory, outPtr, outCap, readFd, writeFd);
+    },
+
+    // host_poll(fds_ptr, nfds, timeout_ms) -> i32 | Promise<i32>
+    // Updates pollfd.revents in-place and returns the number of ready fds.
+    host_poll(
+      fdsPtr: number,
+      nfds: number,
+      timeoutMs: number,
+    ): number | Promise<number> {
+      if (!opts.kernel) return ERR_IO;
+      if (nfds < 0 || !Number.isInteger(nfds)) return ERR_INVALID;
+
+      const evaluate = (): number => {
+        const end = fdsPtr + nfds * POLLFD_SIZE;
+        if (fdsPtr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+        const view = new DataView(memory.buffer);
+        let ready = 0;
+        for (let i = 0; i < nfds; i++) {
+          const base = fdsPtr + i * POLLFD_SIZE;
+          const fd = view.getInt32(base, true);
+          const events = view.getInt16(base + 4, true);
+          let revents = 0;
+          if (fd >= 0) {
+            const target = opts.kernel!.getFdTarget(callerPid, fd);
+            revents = target ? pollReventsForTarget(target, events) : POLLNVAL;
+          }
+          view.setInt16(base + 6, revents, true);
+          if (revents !== 0) ready++;
+        }
+        return ready;
+      };
+
+      const immediate = evaluate();
+      if (immediate !== 0 || timeoutMs === 0) return immediate;
+
+      const tid = opts.threadsBackend?.self() ?? 0;
+      if (
+        tid !== 0 && timeoutMs < 0 && opts.threadsBackend?.isDetached?.(tid)
+      ) {
+        if (opts.threadsBackend.detachedThreadsCancelled?.()) {
+          opts.threadsBackend.exit(0);
+        }
+        return opts.threadsBackend.parkDetachedThread?.() ??
+          new Promise<number>(() => {});
+      }
+
+      return new Promise<number>((resolve, reject) => {
+        const started = Date.now();
+        // Cooperative runtimes have no host-side readiness notification yet,
+        // so blocking poll/select wakes on this coarse timer.
+        const interval = setInterval(() => {
+          if (
+            tid !== 0 && opts.threadsBackend?.isDetached?.(tid) &&
+            opts.threadsBackend.detachedThreadsCancelled?.()
+          ) {
+            clearInterval(interval);
+            try {
+              opts.threadsBackend.exit(0);
+            } catch (err) {
+              reject(err);
+            }
+            return;
+          }
+          const ready = evaluate();
+          const expired = timeoutMs >= 0 && Date.now() - started >= timeoutMs;
+          if (ready !== 0 || expired) {
+            clearInterval(interval);
+            resolve(ready > 0 ? ready : 0);
+          }
+        }, 10);
+      });
     },
 
     // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32
@@ -2005,8 +2133,8 @@ export function createKernelImports(
           isDgram: true,
           fdFlags: (type & SOCK_NONBLOCK) !== 0 ? WASI_FDFLAGS_NONBLOCK : 0,
           refs: 1,
-          send: (socket, dataB64) =>
-            socketBackend?.send(socket, dataB64) ??
+          send: (socket, data) =>
+            socketBackend?.send(socket, data) ??
               { ok: false, error: "networking not configured" },
           recv: (socket, maxBytes, recvOpts) =>
             socketBackend?.recv(socket, maxBytes, recvOpts) ??
@@ -2014,10 +2142,16 @@ export function createKernelImports(
           recvAsync: (socket, maxBytes) =>
             socketBackend
               ? recvSocketAsync(socketBackend, socket, maxBytes)
-              : Promise.resolve({ ok: false, error: "networking not configured" }),
+              : Promise.resolve({
+                ok: false,
+                error: "networking not configured",
+              }),
           setNoDelay: (socket, enabled) =>
             socketBackend?.setNoDelay?.(socket, enabled) ??
-              { ok: false, error: "TCP_NODELAY not supported by socket backend" },
+              {
+                ok: false,
+                error: "TCP_NODELAY not supported by socket backend",
+              },
           close: (_socket) => {
             registry.closeDgramSocket(rawHandle);
           },
@@ -2027,8 +2161,8 @@ export function createKernelImports(
         type: "socket",
         socket: null,
         refs: 1,
-        send: (socket, dataB64) =>
-          socketBackend?.send(socket, dataB64) ??
+        send: (socket, data) =>
+          socketBackend?.send(socket, data) ??
             { ok: false, error: "networking not configured" },
         recv: (socket, maxBytes, recvOpts) =>
           socketBackend?.recv(socket, maxBytes, recvOpts) ??
@@ -2216,7 +2350,9 @@ export function createKernelImports(
           registry.bindDgramToPath(-(target.socket as number), name);
         } catch {
           // Roll back the VFS inode we just created.
-          try { opts.vfs?.unlink(name); } catch { /* best-effort */ }
+          try {
+            opts.vfs?.unlink(name);
+          } catch { /* best-effort */ }
           return -1;
         }
       }
@@ -2251,7 +2387,12 @@ export function createKernelImports(
         target.peerGid = connCreds?.egid ?? 0;
         return 0;
       }
-      result = registry.connectToPath(name, callerPid, connCreds?.euid, connCreds?.egid);
+      result = registry.connectToPath(
+        name,
+        callerPid,
+        connCreds?.euid,
+        connCreds?.egid,
+      );
       if (!result.ok) return -1;
       target.socket = -(result.socket as number);
       target.family = "AF_UNIX";
@@ -2314,7 +2455,9 @@ export function createKernelImports(
       if (!result.ok) return -2;
       const bytes = (result as { ok: true; bytes: Uint8Array }).bytes;
       const recvLen = Math.min(bytes.length, bufCap);
-      new Uint8Array(memory.buffer, bufPtr, recvLen).set(bytes.subarray(0, recvLen));
+      new Uint8Array(memory.buffer, bufPtr, recvLen).set(
+        bytes.subarray(0, recvLen),
+      );
       if (result.fromPath || result.fromAbstract) {
         const senderName = result.fromAbstract ?? result.fromPath ?? "";
         const isAbs = result.fromAbstract != null ? 1 : 0;
@@ -2399,7 +2542,9 @@ export function createKernelImports(
     host_socket_listen_unix(sockfd: number, backlog: number): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -2;
-      if (target.family !== "AF_UNIX" && typeof target.boundPath !== "string") return -2;
+      if (target.family !== "AF_UNIX" && typeof target.boundPath !== "string") {
+        return -2;
+      }
       const registry = socketBackend?.registry;
       if (!registry) return -1;
       const path = target.boundPath!;
@@ -2411,7 +2556,9 @@ export function createKernelImports(
           if (!auth.ok) return -1;
           const rawHandle = registry.listenOnAbstract(abstractName, cap);
           target.listener = -rawHandle;
-          target.closeListener = () => { registry.closeAbstractListener(abstractName); };
+          target.closeListener = () => {
+            registry.closeAbstractListener(abstractName);
+          };
         } else {
           const auth = authorizeUnixListen(opts.serverSockets, path);
           if (!auth.ok) return -1;
@@ -2455,14 +2602,20 @@ export function createKernelImports(
         recvAsync: (socket, maxBytes) =>
           recvSocketAsync(socketBackend, socket, maxBytes),
         setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-        close: (socket) => { socketBackend.close(socket); },
+        close: (socket) => {
+          socketBackend.close(socket);
+        },
       });
     },
 
     // host_socket_send_unix(sockfd, buf_ptr, buf_len) -> bytes | -1 | -2
     // send() for AF_UNIX STREAM sockets, passing raw bytes without base64. Synchronous.
     // Returns byte count on success, -1 on error, -2 if sockfd is not AF_UNIX STREAM.
-    host_socket_send_unix(sockfd: number, bufPtr: number, bufLen: number): number {
+    host_socket_send_unix(
+      sockfd: number,
+      bufPtr: number,
+      bufLen: number,
+    ): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -2;
       if (target.family !== "AF_UNIX" || target.isDgram) return -2;
@@ -2494,12 +2647,14 @@ export function createKernelImports(
         const rawHandle = -(target.socket as number);
         const registry = socketBackend?.registry;
         if (!registry) return -1;
-        const nonblockingDgram = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+        const nonblockingDgram =
+          ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
         const dgramResult = nonblockingDgram
           ? registry.recvDgram(rawHandle, bufCap, true)
           : await registry.recvDgramAsync(rawHandle, bufCap);
         if (!dgramResult.ok) return -2;
-        const dgramBytes = (dgramResult as { ok: true; bytes: Uint8Array }).bytes;
+        const dgramBytes =
+          (dgramResult as { ok: true; bytes: Uint8Array }).bytes;
         const n = Math.min(dgramBytes.length, bufCap);
         new Uint8Array(memory.buffer, bufPtr, n).set(dgramBytes.subarray(0, n));
         return n;
@@ -2521,7 +2676,9 @@ export function createKernelImports(
       // Drain peekBuffer first (populated by a previous MSG_PEEK call).
       if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
         const chunk = target.peekBuffer.slice(0, bufCap);
-        if (!isPeek) target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+        if (!isPeek) {
+          target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+        }
         return writeResult(chunk);
       }
 
@@ -2643,7 +2800,9 @@ export function createKernelImports(
         // AF_UNIX accept: use registry.acceptUnix directly.
         if (target.family === "AF_UNIX" && socketBackend?.registry) {
           const rawHandle = -(target.listener); // un-negate to get registry handle
-          const unixAccepted = await socketBackend.registry.acceptUnix(rawHandle);
+          const unixAccepted = await socketBackend.registry.acceptUnix(
+            rawHandle,
+          );
           const acceptedFd = opts.kernel.allocFd(callerPid, {
             type: "socket",
             socket: -(unixAccepted.socket), // negate for loopback convention
@@ -2659,10 +2818,15 @@ export function createKernelImports(
             recvAsync: (socket, maxBytes) =>
               recvSocketAsync(socketBackend, socket, maxBytes),
             setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-            close: (socket) => { socketBackend.close(socket); },
+            close: (socket) => {
+              socketBackend.close(socket);
+            },
           });
           // C side calls host_socket_addr_unix for peer/local path — no paths here.
-          return writeJson(memory, outPtr, outCap, { ok: true, fd: acceptedFd });
+          return writeJson(memory, outPtr, outCap, {
+            ok: true,
+            fd: acceptedFd,
+          });
         }
 
         // AF_INET accept: prefer backend suspension; legacy backends fall back to accept().
@@ -2787,148 +2951,88 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_send(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // Sends data on an open socket.
-    // Request JSON: { fd, data_b64 } or { fd, data_b64, to: "<path>" } for dgram sendto
-    // Response JSON: { ok, bytes_sent } or { ok: false, error }
+    // host_socket_send(fd, data_ptr, data_len) -> i32
+    // Sends raw bytes from WASM linear memory on an open socket.
     host_socket_send(
-      reqPtr: number,
-      reqLen: number,
-      outPtr: number,
-      outCap: number,
+      fd: number,
+      dataPtr: number,
+      dataLen: number,
     ): number {
-      if (!socketBackend) {
-        return writeJson(memory, outPtr, outCap, {
-          ok: false,
-          error: "networking not configured",
-        });
-      }
+      if (!socketBackend) return ERR_IO;
+      if (dataLen < 0 || dataPtr < 0) return ERR_INVALID;
+      const end = dataPtr + dataLen;
+      if (end > memory.buffer.byteLength) return ERR_IO;
       try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return ERR_NOT_FOUND;
         }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a socket fd: ${req.fd}`,
-          });
-        }
-        // SOCK_DGRAM path
+        const data = readBytes(memory, dataPtr, dataLen);
         if (target.isDgram) {
-          const registry = socketBackend?.registry;
-          if (!registry) {
-            return writeJson(memory, outPtr, outCap, { ok: false, error: "AF_UNIX dgram requires loopback backend" });
-          }
-          const bytes = base64ToBytes(req.data_b64 ?? "");
-          // sendto with destination path
-          if (typeof req.to === "string") {
-            const senderBoundPath = target.boundPath;
-            const r = registry.sendDgramToPath(req.to, bytes, senderBoundPath);
-            if (!r.ok) return writeJson(memory, outPtr, outCap, r);
-            return writeJson(memory, outPtr, outCap, {
-              ok: true,
-              bytes_sent: (r as { ok: true; bytesSent: number }).bytesSent,
-            });
-          }
-          // socketpair DGRAM — send to peer
+          const registry = socketBackend.registry;
+          if (!registry) return ERR_IO;
           const rawHandle = -(target.socket as number);
-          const result = registry.sendDgramToPeer(rawHandle, bytes);
-          if (!result.ok) return writeJson(memory, outPtr, outCap, result);
-          return writeJson(memory, outPtr, outCap, {
-            ok: true,
-            bytes_sent: (result as { ok: true; bytesSent: number }).bytesSent,
-          });
+          const result = registry.sendDgramToPeer(rawHandle, data);
+          return result.ok ? result.bytesSent : ERR_IO;
         }
-        if (target.socket === null) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a connected socket fd: ${req.fd}`,
-          });
-        }
-        const result = socketBackend.send(target.socket, req.data_b64);
-        return writeJson(memory, outPtr, outCap, result);
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+        const result = socketBackend.send(target.socket, data);
+        if (!result.ok) return ERR_IO;
+        return typeof result.bytes_sent === "number"
+          ? result.bytes_sent
+          : ERR_IO;
+      } catch {
+        return ERR_IO;
       }
     },
 
-    // host_socket_recv(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // Receives data from an open socket. Returns synchronously for
+    // host_socket_recv(fd, out_ptr, out_cap, flags) -> i32
+    // Receives raw bytes into WASM linear memory. Returns synchronously for
     // peek-with-buffer and nonblocking reads; returns a Promise for
     // blocking reads, so backends with recvAsync (loopback, browser
     // registry) suspend the host import via JSPI/Asyncify until at
     // least one byte (or EOF) arrives.
-    // Request JSON: { fd, max_bytes }
-    // Response JSON: { ok, data_b64 } or { ok: false, error }
     host_socket_recv(
-      reqPtr: number,
-      reqLen: number,
+      fd: number,
       outPtr: number,
       outCap: number,
+      flags: number,
     ): number | Promise<number> {
-      if (!socketBackend) {
-        return writeJson(memory, outPtr, outCap, {
-          ok: false,
-          error: "networking not configured",
-        });
-      }
+      if (!socketBackend) return ERR_IO;
+      if (outCap < 0 || outPtr < 0) return ERR_INVALID;
+      const end = outPtr + outCap;
+      if (end > memory.buffer.byteLength) return ERR_IO;
+      const MSG_PEEK = 0x02;
+      if (flags !== 0 && flags !== MSG_PEEK) return ERR_UNSUPPORTED;
       try {
-        const req = JSON.parse(readString(memory, reqPtr, reqLen));
-        if (typeof req.fd !== "number") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: "missing socket fd",
-          });
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return ERR_NOT_FOUND;
         }
-        const target = opts.kernel?.getFdTarget(callerPid, req.fd);
-        if (!target || target.type !== "socket") {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a socket fd: ${req.fd}`,
-          });
-        }
-        // SOCK_DGRAM path
+        const maxBytes = outCap;
+        const peek = flags === MSG_PEEK;
         if (target.isDgram) {
-          const registry = socketBackend?.registry;
-          if (!registry) {
-            return writeJson(memory, outPtr, outCap, { ok: false, error: "AF_UNIX dgram requires loopback backend" });
-          }
+          const registry = socketBackend.registry;
+          if (!registry) return ERR_IO;
           const rawHandle = -(target.socket as number);
-          const maxBytes = req.max_bytes ?? 65536;
-          return registry.recvDgramAsync(rawHandle, maxBytes).then((result) => {
-            if (!result.ok) return writeJson(memory, outPtr, outCap, result);
-            return writeJson(memory, outPtr, outCap, {
-              ok: true,
-              data_b64: bytesToBase64(result.bytes),
-              from_path: result.fromPath,
-            });
-          });
+          const result = registry.recvDgram(rawHandle, maxBytes, true);
+          if (!result.ok) return ERR_AGAIN;
+          return writeBytes(memory, outPtr, maxBytes, result.bytes);
         }
-        if (target.socket === null) {
-          return writeJson(memory, outPtr, outCap, {
-            ok: false,
-            error: `not a connected socket fd: ${req.fd}`,
-          });
-        }
-        const maxBytes = req.max_bytes ?? 65536;
-        const peek = req.peek === true;
         const nonblocking =
           ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+        const writeSocketBytes = (data: Uint8Array): number => {
+          const chunk = data.slice(0, maxBytes);
+          return writeBytes(memory, outPtr, maxBytes, chunk);
+        };
         if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
           const chunk = target.peekBuffer.slice(0, maxBytes);
           if (!peek) {
             target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
           }
-          return writeJson(memory, outPtr, outCap, {
-            ok: true,
-            data_b64: bytesToBase64(chunk),
-          });
+          return writeSocketBytes(chunk);
+        }
+        if (target.readShutdown) {
+          return writeSocketBytes(new Uint8Array(0));
         }
         // peekBuffer is empty.
         if (peek) {
@@ -2943,16 +3047,13 @@ export function createKernelImports(
             nonblocking: true,
           });
           if (probe.ok) {
-            const data = base64ToBytes(probe.data_b64 ?? "");
+            const data = probe.data ?? new Uint8Array(0);
             target.peekBuffer = target.peekBuffer
               ? concatBytes(target.peekBuffer, data)
               : data;
-            return writeJson(memory, outPtr, outCap, {
-              ok: true,
-              data_b64: bytesToBase64(data),
-            });
+            return writeSocketBytes(data);
           }
-          return writeJson(memory, outPtr, outCap, probe);
+          return probe.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
         }
         if (nonblocking) {
           // Poll the backend with the nonblocking flag. The backend either
@@ -2961,14 +3062,15 @@ export function createKernelImports(
           const probe = socketBackend.recv(target.socket, maxBytes, {
             nonblocking: true,
           });
-          return writeJson(memory, outPtr, outCap, probe);
+          if (!probe.ok) return probe.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+          return writeSocketBytes(probe.data ?? new Uint8Array(0));
         }
-        return target.recvAsync(target.socket, maxBytes).then((result) =>
-          writeJson(memory, outPtr, outCap, result)
-        );
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { ok: false, error: msg });
+        return target.recvAsync(target.socket, maxBytes).then((result) => {
+          if (!result.ok) return result.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+          return writeSocketBytes(result.data ?? new Uint8Array(0));
+        });
+      } catch {
+        return ERR_IO;
       }
     },
 
@@ -2986,7 +3088,9 @@ export function createKernelImports(
       try {
         if (!opts.kernel) return -1;
         const target = opts.kernel.getFdTarget(callerPid, sockfd);
-        if (!target || target.type !== "socket" || target.socket === null) return -1;
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return -1;
+        }
         const registry = socketBackend?.registry;
         if (!registry) return -1;
         const bytes = new Uint8Array(memory.buffer, dataPtr, dataLen).slice();
@@ -2994,11 +3098,19 @@ export function createKernelImports(
         if (fdsPtr !== 0 && fdsCount > 0) {
           const view = new DataView(memory.buffer);
           // Dup each ancillary fd so it survives the sender closing the original.
-          ancFds = Array.from({ length: fdsCount }, (_, i) =>
-            opts.kernel!.dup(callerPid, view.getInt32(fdsPtr + i * 4, true)));
+          ancFds = Array.from(
+            { length: fdsCount },
+            (_, i) =>
+              opts.kernel!.dup(callerPid, view.getInt32(fdsPtr + i * 4, true)),
+          );
         }
         const rawHandle = -(target.socket);
-        const result = registry.sendWithAnc(rawHandle, bytes, ancFds, callerPid);
+        const result = registry.sendWithAnc(
+          rawHandle,
+          bytes,
+          ancFds,
+          callerPid,
+        );
         return result.ok ? result.bytesSent : -1;
       } catch {
         return -1;
@@ -3021,7 +3133,9 @@ export function createKernelImports(
       try {
         if (!opts.kernel) return -1;
         const target = opts.kernel.getFdTarget(callerPid, sockfd);
-        if (!target || target.type !== "socket" || target.socket === null) return -1;
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return -1;
+        }
         const registry = socketBackend?.registry;
         if (!registry) return -1;
         const rawHandle = -(target.socket);
@@ -3039,10 +3153,16 @@ export function createKernelImports(
         let nFds = 0;
         if (anc) {
           const senderPid = anc.senderPid;
-          const toReceive = fdsPtr !== 0 && fdsCap > 0 ? anc.fds.slice(0, fdsCap) : [];
+          const toReceive = fdsPtr !== 0 && fdsCap > 0
+            ? anc.fds.slice(0, fdsCap)
+            : [];
           for (const dupFd of toReceive) {
             try {
-              const newFd = opts.kernel.dupFromProcess(callerPid, senderPid, dupFd);
+              const newFd = opts.kernel.dupFromProcess(
+                callerPid,
+                senderPid,
+                dupFd,
+              );
               view.setInt32(fdsPtr + nFds * 4, newFd, true);
               nFds++;
             } finally {
@@ -3147,7 +3267,9 @@ export function createKernelImports(
             recvAsync: (socket, maxBytes) =>
               recvSocketAsync(socketBackend!, socket, maxBytes),
             setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
-            close: (_socket) => { registry.closeDgramSocket(rawHandle); },
+            close: (_socket) => {
+              registry.closeDgramSocket(rawHandle);
+            },
           });
           fdA = opts.kernel.allocFd(callerPid, makeDgramTarget(a));
           fdB = opts.kernel.allocFd(callerPid, makeDgramTarget(b));
@@ -3166,7 +3288,9 @@ export function createKernelImports(
             recvAsync: (socket, maxBytes) =>
               recvSocketAsync(socketBackend!, socket, maxBytes),
             setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
-            close: (socket) => { socketBackend!.close(socket); },
+            close: (socket) => {
+              socketBackend!.close(socket);
+            },
           });
           fdA = opts.kernel.allocFd(callerPid, makeTarget(a));
           fdB = opts.kernel.allocFd(callerPid, makeTarget(b));

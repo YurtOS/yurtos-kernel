@@ -34,6 +34,7 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_list_processes",
   "host_read_fd",
   "host_write_fd",
+  "host_poll",
   "host_dup",
   "host_dup_min",
   "host_dup2",

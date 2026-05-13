@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert@^1.0.19";
+import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.19";
 import { createKernelImports } from "../kernel-imports.ts";
 import { readString } from "../common.ts";
 import { VFS } from "../../vfs/vfs.ts";
@@ -8,16 +8,22 @@ import { ProcessKernel } from "../../process/kernel.ts";
 import { FdTable } from "../../vfs/fd-table.ts";
 import { createVfsFileTarget, type FdTarget } from "../../wasi/fd-target.ts";
 import { WasiExitError, WasiHost } from "../../wasi/wasi-host.ts";
+import { createAsyncPipe } from "../../vfs/pipe.ts";
 import type { RuntimeEngineBackend } from "../../engine/backend.ts";
 import type { SocketBackend } from "../../network/socket-backend.ts";
 import { buildNativeSpawnRequest } from "./spawn-request-fixture.ts";
 
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 function writeString(memory: WebAssembly.Memory, ptr: number, value: string) {
   const bytes = encoder.encode(value);
   new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
   return bytes.length;
+}
+
+function readStringAt(memory: WebAssembly.Memory, ptr: number, len: number) {
+  return decoder.decode(new Uint8Array(memory.buffer, ptr, len));
 }
 
 function readWaitResult(memory: WebAssembly.Memory, ptr: number) {
@@ -28,6 +34,27 @@ function readWaitResult(memory: WebAssembly.Memory, ptr: number) {
     signal: view.getInt32(ptr + 8, true),
     flags: view.getInt32(ptr + 12, true),
   };
+}
+
+const POLLIN = 0x0001;
+const POLLOUT = 0x0002;
+const POLLHUP = 0x0010;
+const POLLNVAL = 0x0020;
+
+function writePollFd(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  fd: number,
+  events: number,
+) {
+  const view = new DataView(memory.buffer);
+  view.setInt32(ptr, fd, true);
+  view.setInt16(ptr + 4, events, true);
+  view.setInt16(ptr + 6, 0, true);
+}
+
+function readPollRevents(memory: WebAssembly.Memory, ptr: number): number {
+  return new DataView(memory.buffer).getInt16(ptr + 6, true);
 }
 
 Deno.test("kernel host_spawn accepts native spawn request records", () => {
@@ -389,6 +416,15 @@ Deno.test("kernel host_wait returns ECHILD for wait-any when no children remain"
     -10,
   );
   kernel.dispose();
+});
+
+Deno.test("kernel host imports do not expose legacy waitpid entry points", () => {
+  const imports = createKernelImports({
+    memory: new WebAssembly.Memory({ initial: 1 }),
+  });
+
+  assertEquals("host_waitpid" in imports, false);
+  assertEquals("host_waitpid_nohang" in imports, false);
 });
 
 Deno.test("kernel host_get_local_addr reports configured sandbox address", () => {
@@ -1633,4 +1669,306 @@ Deno.test("host_thread_exit maps main-thread pthread_exit to process exit", () =
     assertEquals(err instanceof WasiExitError, true);
     assertEquals((err as WasiExitError).code, 0);
   }
+});
+
+Deno.test("host_poll reports regular file readiness and invalid fds", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS();
+  const fdTable = new FdTable(vfs);
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  vfs.writeFile("/tmp/data.txt", encoder.encode("data"));
+  const fd = fdTable.open("/tmp/data.txt", "r");
+  kernel.setFdTarget(pid, fd, createVfsFileTarget(fdTable, fd));
+  writePollFd(memory, 64, fd, POLLIN | POLLOUT);
+  writePollFd(memory, 72, 999, POLLIN);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  const ready = (imports.host_poll as (...args: number[]) => number)(
+    64,
+    2,
+    0,
+  );
+
+  assertEquals(ready, 2);
+  assertEquals(readPollRevents(memory, 64), POLLIN | POLLOUT);
+  assertEquals(readPollRevents(memory, 72), POLLNVAL);
+  kernel.dispose();
+});
+
+Deno.test("host_poll reports pipe readiness, capacity, and hangup", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  const [readEnd, writeEnd] = createAsyncPipe(4);
+  kernel.setFdTarget(pid, 3, { type: "pipe_read", pipe: readEnd });
+  kernel.setFdTarget(pid, 4, { type: "pipe_write", pipe: writeEnd });
+  writePollFd(memory, 128, 3, POLLIN);
+  writePollFd(memory, 136, 4, POLLOUT);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(128, 2, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 128), 0);
+  assertEquals(readPollRevents(memory, 136), POLLOUT);
+
+  assertEquals(writeEnd.write(encoder.encode("abcd")), 4);
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(128, 2, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 128), POLLIN);
+  assertEquals(readPollRevents(memory, 136), 0);
+
+  writeEnd.close();
+  writePollFd(memory, 136, -1, POLLOUT);
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(128, 2, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 128), POLLIN);
+  readEnd.drainSync();
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(128, 2, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 128), POLLHUP);
+  kernel.dispose();
+});
+
+Deno.test("host_poll probes sockets and preserves queued read bytes", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  let queued = encoder.encode("x");
+  const socketTarget: FdTarget & { type: "socket" } = {
+    type: "socket",
+    socket: 1,
+    refs: 1,
+    send: () => ({ ok: true, bytes_sent: 0 }),
+    recv: () => {
+      if (queued.byteLength === 0) return { ok: false, error: "EAGAIN" };
+      const data = queued.slice(0, 1);
+      queued = queued.slice(1);
+      return { ok: true, data };
+    },
+    recvAsync: () => Promise.resolve({ ok: false, error: "EAGAIN" }),
+    close: () => {},
+  };
+  kernel.setFdTarget(pid, 5, socketTarget);
+  writePollFd(memory, 256, 5, POLLIN | POLLOUT);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 256), POLLIN | POLLOUT);
+  assertEquals(socketTarget.peekBuffer, encoder.encode("x"));
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 256), POLLIN | POLLOUT);
+  kernel.dispose();
+});
+
+Deno.test("host_poll socket probe bytes are returned by host_socket_recv", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  let queued = encoder.encode("xy");
+  const socketTarget: FdTarget & { type: "socket" } = {
+    type: "socket",
+    socket: 1,
+    refs: 1,
+    send: () => ({ ok: true, bytes_sent: 0 }),
+    recv: (_socket, maxBytes) => {
+      if (queued.byteLength === 0) return { ok: false, error: "EAGAIN" };
+      const data = queued.slice(0, maxBytes);
+      queued = queued.slice(data.byteLength);
+      return { ok: true, data };
+    },
+    recvAsync: () => Promise.resolve({ ok: false, error: "EAGAIN" }),
+    close: () => {},
+  };
+  kernel.setFdTarget(pid, 5, socketTarget);
+  writePollFd(memory, 256, 5, POLLIN);
+  const socketBackend: SocketBackend = {
+    connect: () => ({ ok: false, error: "unused" }),
+    send: () => ({ ok: false, error: "unused" }),
+    recv: () => {
+      throw new Error("peekBuffer recv should not call socket backend");
+    },
+    close: () => ({ ok: true }),
+    recvAsync: () => Promise.resolve({ ok: false, error: "unused" }),
+  };
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    socketBackend,
+  });
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 256), POLLIN);
+  assertEquals(socketTarget.peekBuffer, encoder.encode("x"));
+
+  const recvLen = (imports.host_socket_recv as (...args: number[]) => number)(
+    5,
+    512,
+    2,
+    0,
+  );
+
+  assertEquals(recvLen, 1);
+  assertEquals(readStringAt(memory, 512, recvLen), "x");
+  assertEquals(socketTarget.peekBuffer?.byteLength ?? 0, 0);
+  assertEquals(decoder.decode(queued), "y");
+  kernel.dispose();
+});
+
+Deno.test("host_poll socket EOF probe makes blocking recv return EOF", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  const socketTarget: FdTarget & { type: "socket" } = {
+    type: "socket",
+    socket: 1,
+    refs: 1,
+    send: () => ({ ok: true, bytes_sent: 0 }),
+    recv: () => ({ ok: true, data: new Uint8Array(0) }),
+    recvAsync: () => {
+      throw new Error("readShutdown recv should not block");
+    },
+    close: () => {},
+  };
+  kernel.setFdTarget(pid, 5, socketTarget);
+  writePollFd(memory, 256, 5, POLLIN);
+  const socketBackend: SocketBackend = {
+    connect: () => ({ ok: false, error: "unused" }),
+    send: () => ({ ok: false, error: "unused" }),
+    recv: () => ({ ok: false, error: "unused" }),
+    close: () => ({ ok: true }),
+    recvAsync: () => Promise.resolve({ ok: false, error: "unused" }),
+  };
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    socketBackend,
+  });
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 256), POLLIN);
+  assertEquals(socketTarget.readShutdown, true);
+
+  const recvLen = (imports.host_socket_recv as (...args: number[]) => number)(
+    5,
+    512,
+    16,
+    0,
+  );
+  assertEquals(recvLen, 0);
+  kernel.dispose();
+});
+
+Deno.test("host_poll reports exhausted static input as readable EOF", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  kernel.setFdTarget(pid, 0, {
+    type: "static",
+    data: encoder.encode("stdin"),
+    offset: 5,
+  });
+  writePollFd(memory, 256, 0, POLLIN);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  assertEquals(
+    (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
+    1,
+  );
+  assertEquals(readPollRevents(memory, 256), POLLIN);
+  kernel.dispose();
+});
+
+Deno.test("host_poll cancels finite detached polls during teardown", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  const [readEnd] = createAsyncPipe(4);
+  kernel.setFdTarget(pid, 99, { type: "pipe_read", pipe: readEnd });
+  writePollFd(memory, 256, 99, POLLIN);
+  let cancelled = false;
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    threadsBackend: {
+      kind: "cooperative-serial",
+      setIndirectCallTable() {},
+      async spawn() {
+        return -1;
+      },
+      async join() {
+        return -1;
+      },
+      async detach() {
+        return -1;
+      },
+      isDetached: () => true,
+      detachedThreadsCancelled: () => cancelled,
+      exit(): never {
+        throw new Error("detached poll cancelled");
+      },
+      self() {
+        return 1;
+      },
+      async yield_() {
+        return 0;
+      },
+      async mutexLock() {
+        return 0;
+      },
+      mutexUnlock() {
+        return 0;
+      },
+      mutexTryLock() {
+        return 0;
+      },
+      async condWait() {
+        return 0;
+      },
+      condSignal() {
+        return 0;
+      },
+      condBroadcast() {
+        return 0;
+      },
+    },
+  });
+
+  const pending = (imports.host_poll as (...args: number[]) => Promise<number>)(
+    256,
+    1,
+    1000,
+  );
+  cancelled = true;
+
+  await assertRejects(
+    () => pending,
+    Error,
+    "detached poll cancelled",
+  );
+  kernel.dispose();
 });

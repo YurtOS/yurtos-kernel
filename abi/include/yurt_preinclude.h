@@ -2,6 +2,9 @@
 #define YURT_COMPAT_PREINCLUDE_H
 
 #if !defined(__ASSEMBLER__)
+#include <sys/mman.h>
+#include <wasm32-wasip1/time.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
