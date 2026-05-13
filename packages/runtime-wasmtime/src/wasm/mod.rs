@@ -986,6 +986,11 @@ fn add_network_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     // Socket stubs (Phase 5+)
     linker.func_wrap(
         "yurt",
+        "host_socket_open",
+        |_: Caller<'_, StoreData>, _: i32, _: i32, _: i32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
         "host_socket_connect",
         |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
     )?;
