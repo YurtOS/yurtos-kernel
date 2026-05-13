@@ -28,6 +28,8 @@ import type {
   LinearStackSwitchingThreadsBackend,
   ThreadsBackend,
 } from "./threads/backend.js";
+import type { WorkerHostDispatcherBodies } from "./threads/worker-host-proxy.js";
+import { makeWorkerDispatcherBodies } from "../host-imports/worker-bodies.js";
 import {
   defaultWasmModuleCache,
   sha256Hex,
@@ -85,17 +87,22 @@ export function resolveWorkerSabMemory(
  * If the caller supplied options, use them. Otherwise, for a threaded module
  * with a resolved SAB-backed memory, default-construct a spawner that boots a
  * Worker hosting a cloned WASM instance via `defaultSpawnThread(module,
- * memory)`. Returns undefined when there's no memory to back the spawner.
+ * memory, bodies)`. When `bodies` is supplied, each spawned worker also gets a
+ * per-thread request SAB with the main-side dispatcher attached so it can
+ * proxy host imports back to main; without `bodies` the worker instantiates
+ * with `yurt: {}` (Task 4 behavior). Returns undefined when there's no memory
+ * to back the spawner.
  */
 export function resolveWorkerSabThreads(
   profile: YurtModuleProfile,
   module: WebAssembly.Module,
   memory: WebAssembly.Memory | undefined,
   provided: WorkerSabThreadsBackendOptions | undefined,
+  bodies?: WorkerHostDispatcherBodies,
 ): WorkerSabThreadsBackendOptions | undefined {
   if (provided) return provided;
   if (!profile.requiresSharedMemory || !memory) return undefined;
-  return { spawnThread: defaultSpawnThread(module, memory) };
+  return { spawnThread: defaultSpawnThread(module, memory, bodies) };
 }
 
 type WasmCallable = (...args: unknown[]) => unknown;
@@ -190,21 +197,47 @@ export async function loadProcess(
     workerSabAvailable,
   }));
   const workerSabMemory = resolveWorkerSabMemory(profile, opts.workerSabMemory);
+  // Build worker-host dispatcher bodies once per process so every
+  // spawned pthread shares the same kernel-mutex closure. The bodies
+  // are passed through `defaultSpawnThread` so each Worker gets a
+  // per-thread SAB with the same main-side dispatcher attached.
+  //
+  // Both `callerPid` (allocated later, after the backend is built so
+  // pid-rollback semantics on threading-rejection are preserved) and
+  // `threadsBackend` are late-bound via accessor closures. The body
+  // factory itself runs eagerly so the `kernelMutex` closure is
+  // shared across every worker that this process spawns.
+  let pidRef: number | null = null;
+  let threadsBackendRef: ThreadsBackend | null = null;
+  const workerHostBodies: WorkerHostDispatcherBodies | undefined =
+    profile.requiresSharedMemory
+      ? makeWorkerDispatcherBodies({
+        kernel: ctx.kernel,
+        // The bodies pull callerPid through a closure rather than a
+        // direct argument so we can finish building before pid alloc.
+        // See `callerPid` doc-comment on MakeWorkerDispatcherBodiesOptions.
+        callerPid: () => pidRef ?? 0,
+        threadsBackend: () => threadsBackendRef,
+      })
+      : undefined;
   const workerSabThreads = resolveWorkerSabThreads(
     profile,
     module,
     workerSabMemory,
     opts.workerSabThreads,
+    workerHostBodies,
   );
   const threadsBackend = createThreadsBackend(profile, {
     workerSab: workerSabThreads,
     workerSabMemory,
   });
+  threadsBackendRef = threadsBackend;
   const wasiArgv = opts.wasiArgv ?? argv;
   const cwd = opts.cwd ?? "/";
   const env = { ...(opts.env ?? {}), PWD: cwd };
   const rollbackOnFailure = opts.rollbackOnFailure ?? true;
   const pid = ctx.allocatePid(argv);
+  pidRef = pid;
   const rollback = () => {
     if (rollbackOnFailure) ctx.kernel.discardProcess(pid);
   };
