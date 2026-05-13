@@ -2,6 +2,8 @@ import { assertEquals } from "@std/assert";
 
 const scopedImports = [
   "host_read_fd",
+  "host_poll",
+  "host_list_processes",
   "host_network_fetch",
   "host_dns_resolve",
   "host_socket_connect",
@@ -94,6 +96,7 @@ Deno.test("kernel and ABI boundary files do not mention JSON transport", async (
     ),
     new URL("../../process/kernel.ts", import.meta.url),
     new URL("../kernel-imports.ts", import.meta.url),
+    new URL("../../../../../abi/src/yurt_runtime.h", import.meta.url),
   ];
   const offenders: string[] = [];
   for (const file of files) {
