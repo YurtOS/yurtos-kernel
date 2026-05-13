@@ -134,6 +134,7 @@ export async function loadProcess(
   }
   const threadsBackend = createThreadsBackend(profile, {
     workerSab: opts.workerSabThreads,
+    workerSabMemory: opts.workerSabMemory,
   });
   const wasiArgv = opts.wasiArgv ?? argv;
   const cwd = opts.cwd ?? "/";

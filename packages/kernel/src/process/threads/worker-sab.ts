@@ -1,6 +1,7 @@
 import { WASI_EBUSY } from "../../wasi/types.js";
 import type { ThreadsBackend } from "./backend.js";
 import type { IndirectCallTable } from "./indirect-call-table.js";
+import { SabCondvar, SabMutex } from "./sab-primitives.js";
 import { ThreadIdScope } from "./thread-id-scope.js";
 
 export interface WorkerSabThreadStart {
@@ -20,20 +21,6 @@ interface SpawnSlot {
   finished: boolean;
 }
 
-interface MutexState {
-  owner: number | null;
-  waiters: Waiter[];
-}
-
-interface CondvarState {
-  waiters: Waiter[];
-}
-
-interface Waiter {
-  tid: number;
-  wake: () => void;
-}
-
 class ThreadExit {
   constructor(readonly retval: number) {}
 }
@@ -48,10 +35,19 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
     finished: true,
   }];
   private tids = new ThreadIdScope();
-  private mutexes = new Map<number, MutexState>();
-  private condvars = new Map<number, CondvarState>();
+  private readonly sab: SharedArrayBuffer;
 
-  constructor(private readonly options: WorkerSabThreadsBackendOptions) {}
+  constructor(
+    private readonly options: WorkerSabThreadsBackendOptions,
+    memory: WebAssembly.Memory,
+  ) {
+    if (!(memory.buffer instanceof SharedArrayBuffer)) {
+      throw new Error(
+        "WorkerSabThreadsBackend requires a WebAssembly.Memory backed by SharedArrayBuffer",
+      );
+    }
+    this.sab = memory.buffer;
+  }
 
   setIndirectCallTable(_table: IndirectCallTable): void {
     // Worker/SAB pthreads instantiate worker-side modules with shared memory.
@@ -108,87 +104,90 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
   }
 
   async mutexLock(mutexPtr: number): Promise<number> {
-    const tid = this.self();
-    const state = this.mutexState(mutexPtr);
-    while (true) {
-      if (state.owner === null) {
-        state.owner = tid;
-        return 0;
-      }
-      if (state.owner === tid) return -1;
-      await new Promise<void>((resolve) =>
-        state.waiters.push({
-          tid,
-          wake: resolve,
-        })
-      );
-    }
+    const m = new SabMutex(this.sab, mutexPtr);
+    m.lock(this.tidForLockOps());
+    return 0;
   }
 
   mutexUnlock(mutexPtr: number): number {
-    const state = this.mutexes.get(mutexPtr);
-    if (!state || state.owner === null) return -1;
-    state.owner = null;
-    this.wake(state.waiters.shift());
-    return 0;
+    const m = new SabMutex(this.sab, mutexPtr);
+    try {
+      m.unlock(this.tidForLockOps());
+      return 0;
+    } catch {
+      return -1;
+    }
   }
 
   mutexTryLock(mutexPtr: number): number {
-    const state = this.mutexState(mutexPtr);
-    if (state.owner !== null) return WASI_EBUSY;
-    state.owner = this.self();
-    return 0;
+    const m = new SabMutex(this.sab, mutexPtr);
+    return m.tryLock(this.tidForLockOps()) ? 0 : WASI_EBUSY;
   }
 
   async condWait(condPtr: number, mutexPtr: number): Promise<number> {
-    const state = this.condvarState(condPtr);
-    const tid = this.self();
-    const wait = new Promise<void>((resolve) =>
-      state.waiters.push({
-        tid,
-        wake: resolve,
-      })
-    );
-    const unlock = this.mutexUnlock(mutexPtr);
-    if (unlock !== 0) return unlock;
-    await wait;
-    return await this.mutexLock(mutexPtr);
+    const m = new SabMutex(this.sab, mutexPtr);
+    const cv = new SabCondvar(this.sab, condPtr);
+    cv.wait(m, this.tidForLockOps());
+    return 0;
   }
 
   condSignal(condPtr: number): number {
-    this.wake(this.condvars.get(condPtr)?.waiters.shift());
+    new SabCondvar(this.sab, condPtr).signal();
     return 0;
   }
 
   condBroadcast(condPtr: number): number {
-    const state = this.condvars.get(condPtr);
-    if (state) {
-      const waiters = state.waiters.splice(0);
-      for (const waiter of waiters) this.wake(waiter);
-    }
+    new SabCondvar(this.sab, condPtr).broadcast();
     return 0;
   }
 
-  private mutexState(ptr: number): MutexState {
-    let state = this.mutexes.get(ptr);
-    if (!state) {
-      state = { owner: null, waiters: [] };
-      this.mutexes.set(ptr, state);
-    }
-    return state;
+  /**
+   * Resolve the current logical tid for SabMutex/SabCondvar calls.
+   *
+   * SabMutex disallows tid 0 (reserved for "unlocked"). The current
+   * `ThreadIdScope`-based `self()` returns 0 for the main thread when no
+   * scope is active, which would trip SabMutex's guard. Map 0 -> 1 here
+   * as a temporary hack; Task 8 introduces a SAB-backed tid table that
+   * resolves this cleanly.
+   */
+  private tidForLockOps(): number {
+    return Math.max(this.self(), 1);
   }
+}
 
-  private condvarState(ptr: number): CondvarState {
-    let state = this.condvars.get(ptr);
-    if (!state) {
-      state = { waiters: [] };
-      this.condvars.set(ptr, state);
-    }
-    return state;
-  }
-
-  private wake(waiter: Waiter | undefined): void {
-    if (!waiter) return;
-    this.tids.run(waiter.tid, waiter.wake);
-  }
+/**
+ * Default `spawnThread` implementation: constructs a Worker hosting the
+ * cloned WASM instance (via worker-thread-host.ts), posts the start
+ * message, awaits the done message. The caller-provided `spawnThread`
+ * option in WorkerSabThreadsBackendOptions overrides this default.
+ *
+ * `module` and `memory` are the SAME objects passed to the main-thread
+ * instance; structured-clone passes them as references when the memory's
+ * buffer is a SharedArrayBuffer.
+ */
+export function defaultSpawnThread(
+  module: WebAssembly.Module,
+  memory: WebAssembly.Memory,
+): WorkerSabThreadsBackendOptions["spawnThread"] {
+  const hostUrl = new URL("./worker-thread-host.ts", import.meta.url).href;
+  return ({ tid, fnPtr, arg }) =>
+    new Promise<number>((resolve) => {
+      const worker = new Worker(hostUrl, { type: "module" });
+      worker.onmessage = (e: MessageEvent) => {
+        if (
+          e.data && typeof e.data === "object" && e.data.type === "done"
+        ) {
+          resolve((e.data.retval as number) | 0);
+          worker.terminate();
+        }
+      };
+      worker.postMessage({
+        type: "start",
+        tid,
+        fnPtr,
+        arg,
+        module,
+        memory,
+      });
+    });
 }

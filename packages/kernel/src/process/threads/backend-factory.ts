@@ -8,7 +8,10 @@ import {
 
 export function createThreadsBackend(
   profile: YurtModuleProfile,
-  options: { workerSab?: WorkerSabThreadsBackendOptions } = {},
+  options: {
+    workerSab?: WorkerSabThreadsBackendOptions;
+    workerSabMemory?: WebAssembly.Memory;
+  } = {},
 ): ThreadsBackend {
   switch (profile.threadsBackend) {
     case "cooperative-serial":
@@ -18,8 +21,11 @@ export function createThreadsBackend(
         "module declares yurt.features threads but host lacks Worker/SAB threads support",
       );
     case "worker-sab":
-      if (options.workerSab) {
-        return new WorkerSabThreadsBackend(options.workerSab);
+      if (options.workerSab && options.workerSabMemory) {
+        return new WorkerSabThreadsBackend(
+          options.workerSab,
+          options.workerSabMemory,
+        );
       }
       throw new Error(
         "module declares yurt.features threads but Worker/SAB threads backend is not wired into the loader yet",
