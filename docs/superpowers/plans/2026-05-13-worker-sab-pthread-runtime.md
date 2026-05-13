@@ -4,7 +4,7 @@
 
 **Goal:** Replace `CooperativeSerialBackend`'s single-threaded JS event-loop deadlock with a real `WorkerSabThreadsBackend` that hosts each `pthread_create` in a new Worker against a `SharedArrayBuffer`-backed `WebAssembly.Memory`, with mutex/condvar primitives synchronised via `Atomics.wait`/`notify`. This is the load-bearing kernel-side gate that today blocks libzmq's I/O reactor (and therefore `IPKernelApp.initialize()` in Jupyter).
 
-**Architecture:** Each call to `host_thread_spawn(fnPtr, arg)` posts a `start` message to a new `Worker` running `worker-thread-host.ts`. The worker instantiates the *same* `WebAssembly.Module` against the *same* `WebAssembly.Memory` (whose buffer is a `SharedArrayBuffer`), looks up `fnPtr` in `__indirect_function_table`, calls it with `arg`, and posts back its return value. Mutex/condvar are SAB-backed `i32` cells synchronised with `Atomics.wait`/`Atomics.notify`. `host_thread_self()` returns the tid that the spawning side stamped into a small per-thread SAB region. Host imports that mutate shared kernel state (fd table, listener registry) gain a coarse mutex around the critical sections; the existing kernel imports run only on the main JS thread (Workers proxy through `postMessage` into the host's import-handler queue), so the lock is uncontended in the common case and only matters when a worker invokes a host call.
+**Architecture:** Each call to `host_thread_spawn(fnPtr, arg)` posts a `start` message to a new `Worker` running `worker-thread-host.ts`. The worker instantiates the *same* `WebAssembly.Module` against the *same* `WebAssembly.Memory` (whose buffer is a `SharedArrayBuffer`), looks up `fnPtr` in `__indirect_function_table`, calls it with `arg`, and posts back its return value. Mutex/condvar are SAB-backed `i32` cells synchronised with `Atomics.wait`/`Atomics.notify`. `host_thread_self()` returns the worker tid captured by the worker host's import closures; the main thread returns tid `0`. Host imports that mutate shared kernel state (fd table, listener registry) gain a coarse mutex around the critical sections; worker-side host imports proxy through `postMessage` into the main thread using typed operation ids plus fixed binary argument/result cells, never JSON at the guest↔kernel boundary.
 
 **Tech Stack:** TypeScript on Deno + Node `worker_threads`, WebAssembly shared memory + `WebAssembly.Module.imports/exports`, `Atomics.wait`/`Atomics.notify`/`Atomics.load`/`Atomics.store`/`Atomics.compareExchange`, `yurt-cc` for the C pthread canary build.
 
@@ -16,7 +16,7 @@
 - SAB+Atomics implementation of `mutexLock`/`mutexUnlock`/`mutexTryLock`/`condWait`/`condSignal`/`condBroadcast` in `WorkerSabThreadsBackend`.
 - New `worker-thread-host.ts` Worker-side bootstrap that instantiates a cloned WASM instance against shared memory.
 - `LoadProcessOptions.workerSabThreads` constructed by the loader from `profile`, and a `SharedArrayBuffer`-backed `WebAssembly.Memory` threaded through the `workerSabMemory` option.
-- Per-thread `host_thread_self()` via a SAB-backed tid table.
+- Per-thread `host_thread_self()` via worker-local tid capture in the worker host import closures; main-thread calls return tid `0`.
 - Coarse-grained lock around kernel-side state mutations in `kernel-imports.ts` that worker threads can reach (`host_socket_*`, `host_thread_*`, `host_mutex_*`, `host_cond_*`).
 - A new C pthread canary that spawns ≥4 worker threads, contends on a shared mutex, signals via condvar, and asserts the counter.
 - `abi_test.ts` step that loads the canary and verifies it exits 0.
@@ -31,7 +31,8 @@
 ## File Structure
 
 **Create:**
-- `packages/kernel/src/process/threads/worker-thread-host.ts` (~120 LOC) — Worker entry point. Receives `start({tid, fnPtr, arg, module, memory, imports})`, instantiates, calls table entry, posts back result.
+- `packages/kernel/src/process/threads/worker-thread-host.ts` (~120 LOC) — Worker entry point. Receives `start({tid, fnPtr, arg, module, memory, importProxy})`, instantiates, calls table entry, posts back result.
+- `packages/kernel/src/process/threads/worker-host-proxy.ts` (~180 LOC) — Main-thread dispatcher and worker-side typed binary proxy helpers for host imports reachable from Workers. No `JSON.parse`/`JSON.stringify`.
 - `packages/kernel/src/process/threads/sab-primitives.ts` (~140 LOC) — Pure SAB+Atomics mutex and condvar implementation. No Worker code; just the lock cell layout and the wait/notify dance. Reusable on both sides.
 - `packages/kernel/src/process/threads/__tests__/sab-primitives_test.ts` (~150 LOC) — Tests the mutex/condvar with a real `Worker` doing concurrent acquires.
 - `packages/kernel/src/process/threads/__tests__/worker-thread-host_test.ts` (~80 LOC) — Tests the worker bootstrap end-to-end with a minimal threaded WASM canary.
@@ -43,7 +44,7 @@
 - `packages/kernel/src/process/threads/backend-factory.ts` — Default-construct a `WorkerSabThreadsBackendOptions` if caller didn't supply one, using `worker-thread-host.ts`.
 - `packages/kernel/src/process/loader.ts:135` — Construct `workerSabThreads` for threaded profiles; allocate `SharedArrayBuffer`-backed `WebAssembly.Memory` when `profile.requiresSharedMemory && profile.memoryImport`.
 - `packages/kernel/src/sandbox.ts` — Pass `workerSabAvailable` and the per-process workerSab options into `loadProcess`.
-- `packages/kernel/src/host-imports/kernel-imports.ts` — Wrap the kernel-state-mutating bodies of socket/thread/mutex/cond imports in a mutex acquired before entry; release on return.
+- `packages/kernel/src/host-imports/kernel-imports.ts` — Export a reusable import dispatch surface for `worker-host-proxy.ts`; wrap the kernel-state-mutating bodies of socket/thread/mutex/cond imports in a mutex acquired before entry and released on return.
 - `abi/conformance/c/pthread-canary.c:8` — Bump `NUM_THREADS` from `1` to `4` (existing canary).
 - `abi/Makefile` — Add `pthread-multi-canary` to `CANARY_NAMES`.
 - `packages/kernel/src/__tests__/abi_test.ts` — New step covering pthread-multi-canary; uplift the existing `runs the pthread-canary single-thread compatibility test` to assert NUM_THREADS=4.
@@ -241,29 +242,63 @@ git commit -m "feat(threads): SabMutex.lock() blocks across Workers via Atomics.
 
 - [ ] **Step 1: Write the failing test**
 
-```ts
-Deno.test("SabCondvar: signal wakes one waiter; broadcast wakes all", async () => {
-  const sab = new SharedArrayBuffer(SabMutex.BYTES + SabCondvar.BYTES);
-  const m = new SabMutex(sab, 0);
-  const cv = new SabCondvar(sab, SabMutex.BYTES);
+Create `packages/kernel/src/process/threads/__tests__/_fixtures/condvar-worker.ts`:
 
-  const workerCode = (tid: number) => `
-    import { SabMutex, SabCondvar } from "${new URL("../../sab-primitives.ts", import.meta.url).href}";
-    self.onmessage = (e) => {
-      const m = new SabMutex(e.data.sab, 0);
-      const cv = new SabCondvar(e.data.sab, SabMutex.BYTES);
-      m.lock(${tid});
-      cv.wait(m, ${tid});
-      m.unlock(${tid});
-      self.postMessage(${tid});
-    };
-  `;
-  // ... spawn two workers, await both register as waiters via a small barrier,
-  //     call cv.broadcast(), assert both reply with their tid.
-});
+```ts
+import { SabCondvar, SabMutex } from "../../sab-primitives.ts";
+
+self.onmessage = (e: MessageEvent) => {
+  const { sab, tid, mutexOffset, condOffset, readyOffset } = e.data;
+  const m = new SabMutex(sab, mutexOffset);
+  const cv = new SabCondvar(sab, condOffset);
+  const ready = new Int32Array(sab, readyOffset, 1);
+  m.lock(tid);
+  Atomics.add(ready, 0, 1);
+  Atomics.notify(ready, 0);
+  cv.wait(m, tid);
+  m.unlock(tid);
+  (self as unknown as Worker).postMessage(tid);
+};
 ```
 
-(Full test body in the actual implementation — kept terse here to avoid duplicating ~40 lines of harness boilerplate.)
+Add this test body to `sab-primitives_test.ts`:
+
+```ts
+Deno.test("SabCondvar: broadcast wakes all waiters", async () => {
+  const mutexOffset = 0;
+  const condOffset = SabMutex.BYTES;
+  const readyOffset = SabMutex.BYTES + SabCondvar.BYTES;
+  const sab = new SharedArrayBuffer(readyOffset + 4);
+  const m = new SabMutex(sab, mutexOffset);
+  const cv = new SabCondvar(sab, condOffset);
+  const ready = new Int32Array(sab, readyOffset, 1);
+  const makeWorker = (tid: number) => {
+    const worker = new Worker(
+      new URL("./_fixtures/condvar-worker.ts", import.meta.url).href,
+      { type: "module" },
+    );
+    const done = new Promise<number>((resolve) => {
+      worker.onmessage = (e) => resolve(e.data);
+    });
+    worker.postMessage({ sab, tid, mutexOffset, condOffset, readyOffset });
+    return { worker, done };
+  };
+
+  const w2 = makeWorker(2);
+  const w3 = makeWorker(3);
+  while (Atomics.load(ready, 0) < 2) {
+    Atomics.wait(ready, 0, Atomics.load(ready, 0), 100);
+  }
+
+  m.lock(1);
+  cv.broadcast();
+  m.unlock(1);
+
+  assertEquals((await Promise.all([w2.done, w3.done])).sort(), [2, 3]);
+  w2.worker.terminate();
+  w3.worker.terminate();
+});
+```
 
 - [ ] **Step 2: Run, verify it fails (`SabCondvar not defined`)**
 
@@ -373,6 +408,11 @@ Deno.test("worker-thread-host: instantiates module and calls fnPtr", async () =>
 
 ```ts
 // packages/kernel/src/process/threads/worker-thread-host.ts
+import {
+  createWorkerYurtImports,
+  type WorkerHostImportProxy,
+} from "./worker-host-proxy.ts";
+
 interface StartMessage {
   type: "start";
   tid: number;
@@ -380,17 +420,17 @@ interface StartMessage {
   arg: number;
   module: WebAssembly.Module;
   memory: WebAssembly.Memory;
+  importProxy?: WorkerHostImportProxy;
 }
 
 self.onmessage = async (e: MessageEvent<StartMessage>) => {
   if (e.data.type !== "start") return;
-  const { tid, fnPtr, arg, module, memory } = e.data;
+  const { tid, fnPtr, arg, module, memory, importProxy } = e.data;
 
   // Instantiate the same module against the shared memory.
   const instance = await WebAssembly.instantiate(module, {
     env: { memory },
-    // TODO Phase 4: forward yurt host imports here so worker-side host calls
-    // can postMessage back to the main thread's import handler.
+    yurt: importProxy ? createWorkerYurtImports(tid, memory, importProxy) : {},
   });
   const table = instance.exports.__indirect_function_table as WebAssembly.Table;
   const fn = table.get(fnPtr) as ((arg: number) => number) | null;
@@ -479,9 +519,28 @@ git commit -am "feat(threads): WorkerSabThreadsBackend uses SAB primitives + Wor
 
 ```ts
 Deno.test("loader: threaded module gets SharedArrayBuffer-backed memory", async () => {
-  const bytes = await Deno.readFile(/* fixture path */);
-  // ... build LoaderContext, call loadProcess({ ... })
-  // Assert the instance's imported memory has SharedArrayBuffer buffer
+  const memory = new WebAssembly.Memory({
+    initial: 1,
+    maximum: 1,
+    shared: true,
+  });
+  const ctx = await makeLoaderContext({
+    moduleCache: fixedModuleCache(makeThreadedImportedSharedMemoryModule()),
+  });
+
+  const proc = await loadProcess(ctx, {
+    argv: ["/bin/true"],
+    mode: "cli",
+    workerSabAvailable: true,
+    workerSabMemory: memory,
+    workerSabThreads: {
+      spawnThread: () => Promise.resolve(0),
+    },
+  });
+
+  assertEquals(proc.memory, memory);
+  assertEquals(proc.memory?.buffer instanceof SharedArrayBuffer, true);
+  await proc.terminate();
 });
 ```
 
@@ -527,7 +586,7 @@ Build `workerSabThreads` from a new `defaultSpawnThread(module, workerSabMemory)
 
 - [ ] **Step 1: Failing test** — spawn 2 workers via the backend, each calls `host_thread_self()` (a stub indirect call exposed for testing), assert they return different tids.
 
-- [ ] **Step 2: Implement.** The current `WorkerSabThreadsBackend.self()` uses `ThreadIdScope` which is JS-async-context scoped — won't survive a Worker boundary. Replace: at `spawn` time, write the tid into a small SAB region indexed by some worker-local key. From the worker side (in `worker-thread-host.ts`), the start message carries `tid` directly; worker-side host imports (added in Phase 4) close over that tid when calling back into main.
+- [ ] **Step 2: Implement.** The current `WorkerSabThreadsBackend.self()` uses `ThreadIdScope` which is JS-async-context scoped — it is only meaningful inside the main JS isolate. Keep it for main-thread compatibility, but make the Worker path independent of async context: the `start` message carries `tid`, and `createWorkerYurtImports(tid, memory, importProxy)` closes over that tid when implementing `host_thread_self`.
 
 For *main-thread* `self()`, return 0 (main is always tid 0). Worker-side `self()` is implemented in the worker host script's closure.
 
@@ -540,14 +599,46 @@ For *main-thread* `self()`, return 0 (main is always tid 0). Worker-side `self()
 ### Task 9: Audit which host imports worker threads can reach
 
 **Files:**
+- Create: `packages/kernel/src/process/threads/worker-host-proxy.ts`
 - Modify: `packages/kernel/src/host-imports/kernel-imports.ts`
 - Modify: `packages/kernel/src/process/threads/worker-thread-host.ts`
 
-- [ ] **Step 1: Route worker-side host imports through `postMessage` back to main.** Workers cannot directly call into `kernel-imports.ts` closures (those live in the main JS context). Instead, the worker host script provides stub imports that `postMessage({op, args})` to main and `Atomics.wait` on a per-thread response SAB. Main has a `message` handler that dispatches into the existing import bodies and writes the response.
+- [ ] **Step 1: Route worker-side host imports through `postMessage` back to main.** Workers cannot directly call into `kernel-imports.ts` closures (those live in the main JS context). Instead, `createWorkerYurtImports(tid, memory, importProxy)` provides stub imports that send `{ type: "host-call", op, request }` messages to main and `Atomics.wait` on a per-thread response SAB. Main has a `message` handler that dispatches into the existing import bodies and writes the response.
 
 - [ ] **Step 2: Build the per-thread request/response SAB** (one per worker, allocated when the worker is spawned). Layout: 8 bytes header (status, length) + 4096 bytes payload. Worker writes request, calls `Atomics.notify`, then `Atomics.wait`s on response status.
 
-- [ ] **Step 3: Add a JSON-like (or native binary; reuse the same encoding used by the existing native ABI) request/response codec** for the most common host imports first: `host_socket_open`/`close`/`recv`/`send`, `host_write_fd`, `host_read_fd`.
+- [ ] **Step 3: Add a typed binary request/response codec. Do not use JSON.** Encode the operation id and scalar arguments in fixed `i32` slots, and pass byte payloads by copying from the worker's shared linear memory into the request payload region. Start with the worker-reachable imports needed by pthread canaries and pyzmq bootstrap:
+
+```ts
+export const enum WorkerHostOp {
+  ThreadSelf = 1,
+  ThreadYield = 2,
+  ThreadExit = 3,
+  WriteFd = 10,
+  ReadFd = 11,
+  SocketOpen = 20,
+  SocketClose = 21,
+  SocketRecv = 22,
+  SocketSend = 23,
+}
+
+export interface WorkerHostImportProxy {
+  requestSab: SharedArrayBuffer;
+  postHostCall(op: WorkerHostOp): void;
+}
+```
+
+Request payload layout:
+
+```text
+header[0] status: 0 idle, 1 request-ready, 2 response-ready, -1 error
+header[1] errno_or_result
+payload[0..3] op
+payload[4..7] argc
+payload[8..] fixed i32 args, followed by copied byte payload when needed
+```
+
+`host_write_fd(fd, ptr, len)` writes `{ op=WriteFd, argc=3, fd, ptr, len }`, copies `memory.buffer[ptr..ptr+len]` after the fixed args, and the main dispatcher calls the existing `host_write_fd` body with the original pid/kernel state.
 
 - [ ] **Step 4: Write a test** that spawns a worker, has it call `host_write_fd(1, "hello")`, asserts main's fd 1 received "hello".
 
@@ -703,8 +794,8 @@ deno test --allow-all --no-check packages/kernel/src/process/__tests__/loader_te
 ## Self-Review Checklist
 
 - [ ] **Spec coverage:** Every IN-scope item maps to a task: SAB mutex (Tasks 1-2), SAB condvar (Task 3), Worker host script (Task 4), `spawnThread` wiring (Task 5), shared memory in loader (Task 6), backend ↔ shared memory (Task 7), `host_thread_self` (Task 8), worker-side host imports (Task 9), main-thread lock (Task 10), 4-thread canary (Task 11), condvar canary (Task 12), full gate + push (Task 13). All present.
-- [ ] **Placeholder scan:** Two known gaps for the executing engineer to expand: (a) Task 3 test body is sketched but full harness boilerplate is left to fill in; (b) Task 9's request/response codec list is "the most common host imports first" rather than enumerating all 30+ — that's deliberate, because the cpython rebuild plan will pin down exactly which imports need worker-side stubs based on which cpython modules end up cross-thread. Flagged here so the executor knows it's intentional.
-- [ ] **Type consistency:** `SabMutex`/`SabCondvar` constructor signatures consistent across Tasks 1-7. `WorkerSabThreadsBackendOptions.spawnThread` matches the type in the existing `worker-sab.ts` (file at HEAD). `LoadProcessOptions.workerSabThreads` matches the existing field added in PR #37.
+- [ ] **Placeholder scan:** No placeholder markers, incomplete test bodies, or open codec choices remain. Task 3 includes a concrete condvar Worker fixture and test body. Task 9 names the initial worker-reachable import set and fixes the request/response channel to a typed binary layout with no JSON.
+- [ ] **Type consistency:** `SabMutex`/`SabCondvar` constructor signatures consistent across Tasks 1-7. `WorkerSabThreadsBackendOptions.spawnThread` matches the type in the existing `worker-sab.ts` (file at HEAD). `LoadProcessOptions.workerSabThreads` matches the existing field added in PR #37. `WorkerHostImportProxy` is introduced before `worker-thread-host.ts` depends on it.
 - [ ] **Validation:** Each phase has a runnable test that exits 0 before proceeding to the next phase. Final task runs the full local gate.
 
 ---
