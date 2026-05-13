@@ -22,11 +22,7 @@
 
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
-import {
-  defaultHostState,
-  Microkernel,
-  s,
-} from "../mod.ts";
+import { defaultHostState, Microkernel, s } from "../mod.ts";
 
 const KERNEL_WASM = new URL(
   "../../../target/wasm32-wasip1/release/yurt_kernel_wasm.wasm",

@@ -31,6 +31,8 @@ extern "C" {
 
 #define YURT_WAIT_NOHANG 1u
 #define YURT_ABI_RECORD_VERSION_1 1u
+#define YURT_FETCH_REDIRECT_FOLLOW 0u
+#define YURT_FETCH_REDIRECT_MANUAL 1u
 
 typedef struct {
   uint32_t size;
@@ -92,6 +94,37 @@ typedef struct {
 } yurt_spawn_result_v1;
 
 extern uint32_t yurt_abi_version;
+
+typedef struct {
+  uint32_t size;
+  uint16_t version;
+  uint16_t flags;
+  uint32_t url_offset;
+  uint32_t url_length;
+  uint32_t method_offset;
+  uint32_t method_length;
+  uint32_t headers_offset;
+  uint32_t headers_count;
+  uint32_t body_offset;
+  uint32_t body_length;
+  uint32_t redirect_mode;
+} yurt_fetch_request_v1;
+
+typedef struct {
+  uint32_t size;
+  uint16_t version;
+  uint16_t flags;
+  uint32_t status;
+  uint32_t headers_offset;
+  uint32_t headers_count;
+  uint32_t body_offset;
+  uint32_t body_length;
+  uint32_t error_offset;
+  uint32_t error_length;
+} yurt_fetch_response_v1;
+
+__attribute__((import_module("yurt"), import_name("host_network_fetch")))
+int yurt_host_network_fetch(int req_ptr, int req_len, int out_ptr, int out_cap);
 
 #ifdef __cplusplus
 }

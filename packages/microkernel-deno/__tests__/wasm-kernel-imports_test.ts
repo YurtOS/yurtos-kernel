@@ -413,7 +413,9 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     const imports = buildWasmKernelImports(mk, () => new ArrayBuffer(64));
 
     expect("host_native_invoke" in imports).toEqual(false);
-    expect(HOST_BINDINGS.some((binding) => binding.name === "host_native_invoke"))
+    expect(
+      HOST_BINDINGS.some((binding) => binding.name === "host_native_invoke"),
+    )
       .toEqual(false);
   });
 
