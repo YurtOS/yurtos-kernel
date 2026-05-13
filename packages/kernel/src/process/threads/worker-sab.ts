@@ -3,6 +3,10 @@ import type { ThreadsBackend } from "./backend.js";
 import type { IndirectCallTable } from "./indirect-call-table.js";
 import { SabCondvar, SabMutex } from "./sab-primitives.ts";
 import { ThreadIdScope } from "./thread-id-scope.js";
+import type {
+  WorkerHostImportProxy,
+  WorkerHostOp,
+} from "./worker-host-proxy.ts";
 
 export interface WorkerSabThreadStart {
   tid: number;
@@ -15,15 +19,37 @@ export interface WorkerSabThreadsBackendOptions {
   spawnThread(start: WorkerSabThreadStart): Promise<number>;
 }
 
+export interface DefaultSpawnThreadOptions {
+  createImportProxy?(tid: number): WorkerHostImportProxy;
+  handleHostCall?(
+    call: { tid: number; op: WorkerHostOp },
+    proxy: WorkerHostImportProxy,
+  ): void;
+}
+
 export function defaultSpawnThread(
   module: WebAssembly.Module,
   memory: WebAssembly.Memory,
+  options: DefaultSpawnThreadOptions = {},
 ): WorkerSabThreadsBackendOptions["spawnThread"] {
   const hostUrl = new URL("./worker-thread-host.ts", import.meta.url).href;
   return ({ tid, fnPtr, arg }) =>
     new Promise<number>((resolve) => {
       const worker = new Worker(hostUrl, { type: "module" });
+      const importProxy = options.createImportProxy?.(tid);
       worker.onmessage = (event: MessageEvent) => {
+        if (event.data?.type === "host-call") {
+          if (importProxy && options.handleHostCall) {
+            options.handleHostCall(
+              {
+                tid: event.data.tid as number,
+                op: event.data.op as WorkerHostOp,
+              },
+              importProxy,
+            );
+          }
+          return;
+        }
         if (event.data?.type !== "done") return;
         resolve(event.data.retval as number);
         worker.terminate();
@@ -32,7 +58,15 @@ export function defaultSpawnThread(
         resolve(-1);
         worker.terminate();
       };
-      worker.postMessage({ type: "start", tid, fnPtr, arg, module, memory });
+      worker.postMessage({
+        type: "start",
+        tid,
+        fnPtr,
+        arg,
+        module,
+        memory,
+        importProxy,
+      });
     });
 }
 

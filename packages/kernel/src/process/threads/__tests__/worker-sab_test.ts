@@ -1,4 +1,5 @@
 import { assertEquals } from "@std/assert";
+import { WORKER_HOST_RESPONSE_BYTES } from "../worker-host-proxy.ts";
 import { defaultSpawnThread, WorkerSabThreadsBackend } from "../worker-sab.ts";
 
 Deno.test("default worker SAB spawner runs fnPtr in worker-thread-host", async () => {
@@ -14,6 +15,39 @@ Deno.test("default worker SAB spawner runs fnPtr in worker-thread-host", async (
   const spawnThread = defaultSpawnThread(module, memory);
 
   assertEquals(await spawnThread({ tid: 1, fnPtr: 0, arg: 41 }), 42);
+});
+
+Deno.test("default worker SAB spawner routes worker host calls through import proxy", async () => {
+  const wasmBytes = await Deno.readFile(
+    new URL("./_fixtures/thread-write-fd.wasm", import.meta.url),
+  );
+  const module = await WebAssembly.compile(wasmBytes);
+  const memory = new WebAssembly.Memory({
+    initial: 1,
+    maximum: 1,
+    shared: true,
+  });
+  const requestSab = new SharedArrayBuffer(WORKER_HOST_RESPONSE_BYTES);
+  const header = new Int32Array(requestSab, 0, 2);
+  const payload = new Int32Array(requestSab, 8);
+  const payloadBytes = new Uint8Array(requestSab, 8);
+  const written: number[] = [];
+  const spawnThread = defaultSpawnThread(module, memory, {
+    createImportProxy: () => ({ requestSab }),
+    handleHostCall: () => {
+      assertEquals(payload[0], 10);
+      assertEquals(payload[1], 3);
+      assertEquals(payload[2], 1);
+      assertEquals(payload[4], 5);
+      written.push(...payloadBytes.slice(20, 25));
+      Atomics.store(header, 1, 5);
+      Atomics.store(header, 0, 2);
+      Atomics.notify(header, 0);
+    },
+  });
+
+  assertEquals(await spawnThread({ tid: 1, fnPtr: 0, arg: 256 }), 5);
+  assertEquals(new TextDecoder().decode(new Uint8Array(written)), "hello");
 });
 
 Deno.test("worker SAB backend allows multiple live spawned threads", async () => {
