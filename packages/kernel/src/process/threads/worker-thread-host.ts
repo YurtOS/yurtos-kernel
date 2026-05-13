@@ -20,7 +20,9 @@ workerSelf.onmessage = async (event: MessageEvent<StartMessage>) => {
 
   const instance = await WebAssembly.instantiate(module, {
     env: { memory },
-    yurt: {},
+    yurt: {
+      host_thread_self: () => tid,
+    },
   });
   const table = instance.exports
     .__indirect_function_table as WebAssembly.Table;
