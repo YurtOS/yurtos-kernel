@@ -54,6 +54,45 @@ function readProcessList(memory: WebAssembly.Memory, ptr: number, len: number) {
   };
 }
 
+function readStatRecord(memory: WebAssembly.Memory, ptr: number, len: number) {
+  const view = new DataView(memory.buffer, ptr, len);
+  return {
+    size: view.getUint32(0, true),
+    version: view.getUint16(4, true),
+    flags: view.getUint16(6, true),
+    typeBits: view.getUint32(8, true),
+    mode: view.getUint32(12, true),
+    fileSize: Number(view.getBigUint64(16, true)),
+    mtimeMs: Number(view.getBigUint64(24, true)),
+  };
+}
+
+function readStringListRecord(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+) {
+  const view = new DataView(memory.buffer, ptr, len);
+  const count = view.getUint32(8, true);
+  const entriesOffset = view.getUint32(12, true);
+  const stringsOffset = view.getUint32(16, true);
+  const stringsLength = view.getUint32(20, true);
+  const values: string[] = [];
+  for (let i = 0; i < count; i++) {
+    const entry = entriesOffset + i * 8;
+    const offset = view.getUint32(entry, true);
+    const length = view.getUint32(entry + 4, true);
+    values.push(readString(memory, ptr + stringsOffset + offset, length));
+  }
+  return {
+    size: view.getUint32(0, true),
+    version: view.getUint16(4, true),
+    flags: view.getUint16(6, true),
+    stringsLength,
+    values,
+  };
+}
+
 function buildExtensionRequest(opts: {
   name: string;
   args?: string[];
@@ -1885,6 +1924,72 @@ Deno.test("host_poll reports regular file readiness and invalid fds", () => {
   assertEquals(readPollRevents(memory, 64), POLLIN | POLLOUT);
   assertEquals(readPollRevents(memory, 72), POLLNVAL);
   kernel.dispose();
+});
+
+Deno.test("host_stat writes a native stat record", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS();
+  vfs.writeFile("/tmp/data.txt", encoder.encode("data"));
+  const pathLen = writeString(memory, 16, "/tmp/data.txt");
+  const imports = createKernelImports({ memory, vfs });
+
+  const written = (imports.host_stat as (...args: number[]) => number)(
+    16,
+    pathLen,
+    256,
+    64,
+  );
+
+  assertEquals(written, 32);
+  const record = readStatRecord(memory, 256, written);
+  assertEquals(record.size, 32);
+  assertEquals(record.version, 1);
+  assertEquals(record.flags, 0);
+  assertEquals(record.typeBits & 1, 1);
+  assertEquals(record.fileSize, 4);
+});
+
+Deno.test("host_readdir writes a native string-list record", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS();
+  vfs.mkdir("/tmp/list");
+  vfs.writeFile("/tmp/list/a.txt", new Uint8Array());
+  vfs.writeFile("/tmp/list/b.txt", new Uint8Array());
+  const pathLen = writeString(memory, 16, "/tmp/list");
+  const imports = createKernelImports({ memory, vfs });
+
+  const written = (imports.host_readdir as (...args: number[]) => number)(
+    16,
+    pathLen,
+    256,
+    128,
+  );
+
+  const record = readStringListRecord(memory, 256, written);
+  assertEquals(record.version, 1);
+  assertEquals(record.flags, 0);
+  assertEquals(record.values.sort(), ["a.txt", "b.txt"]);
+});
+
+Deno.test("host_glob writes a native string-list record", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS();
+  vfs.mkdirp("/tmp/glob");
+  vfs.writeFile("/tmp/glob/a.txt", new Uint8Array());
+  vfs.writeFile("/tmp/glob/b.log", new Uint8Array());
+  const patternLen = writeString(memory, 16, "/tmp/glob/*.txt");
+  const imports = createKernelImports({ memory, vfs });
+
+  const written = (imports.host_glob as (...args: number[]) => number)(
+    16,
+    patternLen,
+    256,
+    128,
+  );
+
+  const record = readStringListRecord(memory, 256, written);
+  assertEquals(record.version, 1);
+  assertEquals(record.values, ["/tmp/glob/a.txt"]);
 });
 
 Deno.test("host_poll reports pipe readiness, capacity, and hangup", () => {

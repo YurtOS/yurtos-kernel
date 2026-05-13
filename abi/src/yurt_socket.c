@@ -193,7 +193,7 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return -1;
   }
 
-  /* AF_UNIX: typed binary call — no JSON */
+  /* AF_UNIX: typed binary call */
   if (addr->sa_family == AF_UNIX) {
     const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
     if (un->sun_path[0] == '\0') {
@@ -331,7 +331,7 @@ static int yurt_sockname_impl(
     ? YURT_SOCKET_ADDR_LOCAL
     : YURT_SOCKET_ADDR_PEER;
 
-  /* Try typed AF_UNIX path first: avoids JSON for the common AF_UNIX case. */
+  /* Try typed AF_UNIX path first for the common AF_UNIX case. */
   {
     char path_buf[108];
     int is_abstract = 0;
@@ -405,7 +405,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
   if (!addr || addrlen < 2) { errno = EINVAL; return -1; }
 
-  /* AF_UNIX: typed binary call — no JSON */
+  /* AF_UNIX: typed binary call */
   if (addr->sa_family == AF_UNIX) {
     const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
     if (un->sun_path[0] == '\0') {
@@ -629,7 +629,7 @@ ssize_t sendto(
   socklen_t addrlen
 ) {
   if (dest_addr != NULL && dest_addr->sa_family == AF_UNIX) {
-    /* AF_UNIX SOCK_DGRAM sendto: typed binary call — no JSON, no base64 */
+    /* AF_UNIX SOCK_DGRAM sendto: typed binary call */
     const struct sockaddr_un *un = (const struct sockaddr_un *)dest_addr;
     int sent;
     (void)flags;

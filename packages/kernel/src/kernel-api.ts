@@ -2,10 +2,9 @@ import {
   readBytes,
   readString,
   writeBytes,
-  writeJson,
   writeString,
-} from './host-imports/common.js';
-import type { VfsLike } from './vfs/vfs-like.js';
+} from "./host-imports/common.js";
+import type { VfsLike } from "./vfs/vfs-like.js";
 
 export interface KernelApiProcessManager {
   registerTool(name: string, impl: unknown): void;
@@ -26,7 +25,6 @@ export interface KernelApiMemory {
   readBytes(ptr: number, len: number): Uint8Array;
   writeString(s: string, outPtr: number, outCap: number): number;
   writeBytes(b: Uint8Array, outPtr: number, outCap: number): number;
-  writeJson(obj: unknown, outPtr: number, outCap: number): number;
 }
 
 export interface KernelApi {
@@ -41,7 +39,7 @@ export class MemoryProxy implements KernelApiMemory {
 
   private require(): WebAssembly.Memory {
     if (!this.current) {
-      throw new Error('KernelApi.memory not yet bound (memory not yet bound)');
+      throw new Error("KernelApi.memory not yet bound (memory not yet bound)");
     }
     return this.current;
   }
@@ -60,9 +58,5 @@ export class MemoryProxy implements KernelApiMemory {
 
   writeBytes(b: Uint8Array, outPtr: number, outCap: number): number {
     return writeBytes(this.require(), outPtr, outCap, b);
-  }
-
-  writeJson(obj: unknown, outPtr: number, outCap: number): number {
-    return writeJson(this.require(), outPtr, outCap, obj);
   }
 }

@@ -292,7 +292,7 @@ extern "C" {
         mode: u32,
     ) -> i32;
 
-    /// List directory entries (JSON array of strings).
+    /// List directory entries as a native string-list record.
     pub fn host_readdir(path_ptr: *const u8, path_len: u32, out_ptr: *mut u8, out_cap: u32) -> i32;
 
     /// Create a directory (and parents).
@@ -304,7 +304,7 @@ extern "C" {
     /// Set file mode bits.
     pub fn host_chmod(path_ptr: *const u8, path_len: u32, mode: u32) -> i32;
 
-    /// Glob pattern match (JSON array of matching paths).
+    /// Glob pattern match as a native string-list record.
     pub fn host_glob(
         pattern_ptr: *const u8,
         pattern_len: u32,
@@ -496,6 +496,71 @@ fn read_i32_le(bytes: &[u8], offset: usize) -> Option<i32> {
     bytes
         .get(offset..offset + 4)
         .map(|v| i32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
+    bytes
+        .get(offset..offset + 8)
+        .map(|v| u64::from_le_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]]))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decode_stat_record(bytes: &[u8], context: &str) -> Result<StatInfo, HostError> {
+    let size = read_u32_le(bytes, 0).unwrap_or(0) as usize;
+    let version = read_u16_le(bytes, 4).unwrap_or(0);
+    if size != 32 || bytes.len() < size || version != 1 {
+        return Err(HostError::IoError(format!(
+            "stat {context}: invalid native stat record"
+        )));
+    }
+    let type_bits = read_u32_le(bytes, 8).unwrap_or(0);
+    Ok(StatInfo {
+        exists: true,
+        is_file: type_bits & 1 != 0,
+        is_dir: type_bits & 2 != 0,
+        is_symlink: type_bits & 4 != 0,
+        size: read_u64_le(bytes, 16).unwrap_or(0),
+        mode: read_u32_le(bytes, 12).unwrap_or(0),
+        mtime_ms: read_u64_le(bytes, 24).unwrap_or(0),
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn decode_string_list_record(bytes: &[u8], context: &str) -> Result<Vec<String>, HostError> {
+    let size = read_u32_le(bytes, 0).unwrap_or(0) as usize;
+    let version = read_u16_le(bytes, 4).unwrap_or(0);
+    let count = read_u32_le(bytes, 8).unwrap_or(0) as usize;
+    let entries_offset = read_u32_le(bytes, 12).unwrap_or(0) as usize;
+    let strings_offset = read_u32_le(bytes, 16).unwrap_or(0) as usize;
+    let strings_len = read_u32_le(bytes, 20).unwrap_or(0) as usize;
+    if version != 1
+        || size > bytes.len()
+        || entries_offset + count.saturating_mul(8) > size
+        || strings_offset + strings_len > size
+    {
+        return Err(HostError::IoError(format!(
+            "{context}: invalid native string-list record"
+        )));
+    }
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let entry = entries_offset + i * 8;
+        let offset = read_u32_le(bytes, entry).unwrap_or(0) as usize;
+        let len = read_u32_le(bytes, entry + 4).unwrap_or(0) as usize;
+        if offset + len > strings_len {
+            return Err(HostError::IoError(format!(
+                "{context}: invalid native string span"
+            )));
+        }
+        let start = strings_offset + offset;
+        let end = start + len;
+        out.push(
+            String::from_utf8(bytes[start..end].to_vec())
+                .map_err(|e| HostError::IoError(format!("{context}: invalid UTF-8: {e}")))?,
+        );
+    }
+    Ok(out)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -763,10 +828,10 @@ impl HostInterface for WasmHost {
     }
 
     fn stat(&self, path: &str) -> Result<StatInfo, HostError> {
-        let output = call_with_outbuf(path, |out_ptr, out_cap| unsafe {
+        let output = call_with_outbuf_bytes(path, |out_ptr, out_cap| unsafe {
             host_stat(path.as_ptr(), path.len() as u32, out_ptr, out_cap)
         })?;
-        serde_json::from_str(&output).map_err(|e| HostError::IoError(format!("stat {path}: {e}")))
+        decode_stat_record(&output, path)
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, HostError> {
@@ -798,11 +863,10 @@ impl HostInterface for WasmHost {
     }
 
     fn readdir(&self, path: &str) -> Result<Vec<String>, HostError> {
-        let output = call_with_outbuf(path, |out_ptr, out_cap| unsafe {
+        let output = call_with_outbuf_bytes(path, |out_ptr, out_cap| unsafe {
             host_readdir(path.as_ptr(), path.len() as u32, out_ptr, out_cap)
         })?;
-        serde_json::from_str(&output)
-            .map_err(|e| HostError::IoError(format!("readdir {path}: {e}")))
+        decode_string_list_record(&output, path)
     }
 
     fn mkdir(&self, path: &str) -> Result<(), HostError> {
@@ -839,11 +903,10 @@ impl HostInterface for WasmHost {
     }
 
     fn glob(&self, pattern: &str) -> Result<Vec<String>, HostError> {
-        let output = call_with_outbuf(pattern, |out_ptr, out_cap| unsafe {
+        let output = call_with_outbuf_bytes(pattern, |out_ptr, out_cap| unsafe {
             host_glob(pattern.as_ptr(), pattern.len() as u32, out_ptr, out_cap)
         })?;
-        serde_json::from_str(&output)
-            .map_err(|e| HostError::IoError(format!("glob {pattern}: {e}")))
+        decode_string_list_record(&output, pattern)
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<(), HostError> {

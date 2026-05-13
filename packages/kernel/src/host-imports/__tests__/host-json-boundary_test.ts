@@ -15,6 +15,9 @@ const scopedImports = [
   "host_socket_option",
   "host_socket_close",
   "host_extension_invoke",
+  "host_stat",
+  "host_readdir",
+  "host_glob",
 ];
 
 function extractImportBody(source: string, name: string): string {
@@ -39,6 +42,23 @@ Deno.test("scoped host imports do not use JSON as their syscall transport", asyn
   const offenders = scopedImports.filter((name) =>
     /\bJSON\.parse\b|\bwriteJson\b/.test(extractImportBody(source, name))
   );
+
+  assertEquals(offenders, []);
+});
+
+Deno.test("production host-import helpers do not expose JSON transport utilities", async () => {
+  const files = [
+    new URL("../common.ts", import.meta.url),
+    new URL("../kernel-imports.ts", import.meta.url),
+  ];
+  const offenders: string[] = [];
+  const jsonTransport = /\bwriteJson\b|\bJSON\.parse\b|\bJSON\.stringify\b/;
+  for (const file of files) {
+    const source = await Deno.readTextFile(file);
+    if (jsonTransport.test(source)) {
+      offenders.push(file.pathname);
+    }
+  }
 
   assertEquals(offenders, []);
 });

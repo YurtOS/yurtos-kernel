@@ -50,7 +50,6 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_socket_option",
   "host_socket_close",
   "host_extension_invoke",
-  "host_native_invoke",
   "host_setjmp",
   "host_longjmp",
   "host_fork",

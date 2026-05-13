@@ -41,35 +41,20 @@ impl SpawnContext {
 
 // ── SpawnRequest ──────────────────────────────────────────────────────────────
 
-/// JSON spawn request from the guest (`host_spawn_async`).
-#[derive(Deserialize, Debug)]
+/// Native spawn request decoded from the guest.
+#[derive(Debug)]
 pub struct SpawnRequest {
     pub prog: String,
-    #[serde(default)]
     pub args: Vec<String>,
-    /// Env pairs as `[[key, value], ...]`.
-    #[serde(default)]
+    /// Environment key/value pairs.
     pub env: Vec<[String; 2]>,
-    #[serde(default = "default_cwd")]
     pub cwd: String,
-    #[serde(default = "neg_one")]
     pub stdin_fd: i32,
-    #[serde(default = "neg_one")]
     pub stdout_fd: i32,
-    #[serde(default = "neg_one")]
     pub stderr_fd: i32,
-    #[serde(default)]
     pub stdin_data: String,
-    /// Scheduling priority for this child process. 0–19; inherits from parent if absent.
-    #[serde(default)]
+    /// Scheduling priority for this child process. 0-19.
     pub nice: u8,
-}
-
-fn default_cwd() -> String {
-    "/home/user".to_owned()
-}
-fn neg_one() -> i32 {
-    -1
 }
 
 impl SpawnRequest {

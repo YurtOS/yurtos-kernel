@@ -290,7 +290,6 @@ export class ProcessManager {
         wasiHost: host,
         networkBridge: this.networkBridge ?? undefined,
         extensionHandler: this.extensionHandler ?? undefined,
-        nativeModules: this.nativeModules,
         mainInstance: () => mainInstanceRef,
       });
       if (setjmpBridge) {
@@ -521,7 +520,6 @@ export class ProcessManager {
         memory: memoryProxy,
         networkBridge: this.networkBridge ?? undefined,
         extensionHandler: this.extensionHandler ?? undefined,
-        nativeModules: this.nativeModules,
         mainInstance: () => mainInstanceRef,
       });
       if (setjmpBridge) {
