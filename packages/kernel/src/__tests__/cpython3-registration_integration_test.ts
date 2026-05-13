@@ -14,6 +14,10 @@ const CPYTHON_WASM = resolve(WASM_DIR, "cpython3.wasm");
 
 const maybeDescribe = existsSync(CPYTHON_WASM) ? describe : describe.skip;
 
+function encode(value: string): Uint8Array {
+  return new TextEncoder().encode(value);
+}
+
 // yurt's shell currently rejects the `VAR=val cmd` env-prefix form
 // with EINVAL when spawning, so cpython3 is always invoked bare.
 // The interpreter finds its stdlib via the default --prefix=/usr/local
@@ -105,13 +109,13 @@ maybeDescribe("CPython bring-up registration", () => {
         requests.push({ op: "connect", ...req });
         return { ok: true, socket: handle };
       },
-      send(socket, dataB64) {
-        requests.push({ op: "send", socket, data_b64: dataB64 });
+      send(socket, data) {
+        requests.push({ op: "send", socket, data: Array.from(data) });
         return { ok: true, bytes_sent: 4 };
       },
       recv(socket, maxBytes) {
         requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data_b64: btoa("pong") };
+        return { ok: true, data: encode("pong") };
       },
       close(socket) {
         requests.push({ op: "close", socket });
@@ -140,7 +144,7 @@ maybeDescribe("CPython bring-up registration", () => {
       expect(result.stdout.trim()).toBe("pong");
       expect(requests).toEqual([
         { op: "connect", host: "example.test", port: 80, tls: false },
-        { op: "send", socket: handle, data_b64: "cGluZw==" },
+        { op: "send", socket: handle, data: Array.from(encode("ping")) },
         { op: "recv", socket: handle, max_bytes: 4 },
         { op: "close", socket: handle },
       ]);

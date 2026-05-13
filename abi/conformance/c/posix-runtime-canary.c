@@ -2,10 +2,12 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <net/if.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/sendfile.h>
 #include <sys/time.h>
@@ -537,6 +539,114 @@ static int case_utimes_mtime(void) {
   return 0;
 }
 
+static int case_poll_regular_fd(void) {
+  const char *path = "/tmp/yurt-poll-canary.txt";
+  unlink(path);
+  int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+  if (fd < 0) {
+    emit("poll_regular_fd", 1, "poll_regular_fd:open_failed", 1, errno);
+    return 1;
+  }
+  if (write(fd, "x", 1) != 1) {
+    int e = errno;
+    close(fd);
+    emit("poll_regular_fd", 1, "poll_regular_fd:write_failed", 1, e);
+    return 1;
+  }
+
+  struct pollfd fds[2];
+  fds[0].fd = fd;
+  fds[0].events = POLLIN | POLLOUT;
+  fds[0].revents = 0;
+  fds[1].fd = -123;
+  fds[1].events = POLLIN;
+  fds[1].revents = 0;
+
+  errno = 0;
+  int rc = poll(fds, 2, 0);
+  close(fd);
+  if (rc != 1 ||
+      (fds[0].revents & (POLLIN | POLLOUT)) != (POLLIN | POLLOUT) ||
+      fds[1].revents != 0) {
+    char out[128];
+    snprintf(out, sizeof(out), "poll_regular_fd:bad:%d:%d:%d", rc, fds[0].revents, fds[1].revents);
+    emit("poll_regular_fd", 1, out, 1, errno);
+    return 1;
+  }
+
+  fds[0].fd = 9999;
+  fds[0].events = POLLIN;
+  fds[0].revents = 0;
+  errno = 0;
+  rc = poll(fds, 1, 0);
+  if (rc != 1 || fds[0].revents != POLLNVAL) {
+    char out[128];
+    snprintf(out, sizeof(out), "poll_regular_fd:bad_invalid:%d:%d", rc, fds[0].revents);
+    emit("poll_regular_fd", 1, out, 1, errno);
+    return 1;
+  }
+
+  emit("poll_regular_fd", 0, "poll_regular_fd:ok", 0, 0);
+  return 0;
+}
+
+static int case_select_regular_fd(void) {
+  const char *path = "/tmp/yurt-select-canary.txt";
+  unlink(path);
+  int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+  if (fd < 0) {
+    emit("select_regular_fd", 1, "select_regular_fd:open_failed", 1, errno);
+    return 1;
+  }
+  if (write(fd, "x", 1) != 1) {
+    int e = errno;
+    close(fd);
+    emit("select_regular_fd", 1, "select_regular_fd:write_failed", 1, e);
+    return 1;
+  }
+
+  fd_set readfds;
+  fd_set writefds;
+  FD_ZERO(&readfds);
+  FD_ZERO(&writefds);
+  FD_SET(fd, &readfds);
+  FD_SET(fd, &writefds);
+  struct timeval timeout = {0, 0};
+
+  errno = 0;
+  int rc = select(fd + 1, &readfds, &writefds, NULL, &timeout);
+  if (rc != 2 || !FD_ISSET(fd, &readfds) || !FD_ISSET(fd, &writefds)) {
+    char out[128];
+    snprintf(out, sizeof(out), "select_regular_fd:bad:%d:%d:%d", rc, FD_ISSET(fd, &readfds), FD_ISSET(fd, &writefds));
+    close(fd);
+    emit("select_regular_fd", 1, out, 1, errno);
+    return 1;
+  }
+  close(fd);
+
+  int invalid_fd = open(path, O_RDONLY);
+  if (invalid_fd < 0) {
+    emit("select_regular_fd", 1, "select_regular_fd:invalid_open_failed", 1, errno);
+    return 1;
+  }
+  close(invalid_fd);
+  FD_ZERO(&readfds);
+  FD_SET(invalid_fd, &readfds);
+  timeout.tv_sec = 0;
+  timeout.tv_usec = 0;
+  errno = 0;
+  rc = select(invalid_fd + 1, &readfds, NULL, NULL, &timeout);
+  if (rc != -1 || errno != EBADF) {
+    char out[128];
+    snprintf(out, sizeof(out), "select_regular_fd:bad_invalid:%d:%d", rc, errno);
+    emit("select_regular_fd", 1, out, 1, errno);
+    return 1;
+  }
+
+  emit("select_regular_fd", 0, "select_regular_fd:ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "hostname") == 0) return case_hostname();
   if (strcmp(name, "hostname_too_small") == 0) return case_hostname_too_small();
@@ -557,6 +667,8 @@ static int run_case(const char *name) {
   if (strcmp(name, "fcntl_setfl_masks_access_mode") == 0) return case_fcntl_setfl_masks_access_mode();
   if (strcmp(name, "readdir_dot_entries") == 0) return case_readdir_dot_entries();
   if (strcmp(name, "utimes_mtime") == 0) return case_utimes_mtime();
+  if (strcmp(name, "poll_regular_fd") == 0) return case_poll_regular_fd();
+  if (strcmp(name, "select_regular_fd") == 0) return case_select_regular_fd();
   fprintf(stderr, "posix-runtime-canary: unknown case %s\n", name);
   return 2;
 }
@@ -581,6 +693,8 @@ static int list_cases(void) {
   puts("fcntl_setfl_masks_access_mode");
   puts("readdir_dot_entries");
   puts("utimes_mtime");
+  puts("poll_regular_fd");
+  puts("select_regular_fd");
   return 0;
 }
 

@@ -1,11 +1,19 @@
-import type { IndirectCallTable } from './indirect-call-table.js';
+import type { IndirectCallTable } from "./indirect-call-table.js";
 
 export interface ThreadsBackend {
-  readonly kind: 'cooperative-serial' | 'wasi-threads' | 'worker-sab' | 'wasi-p2';
+  readonly kind:
+    | "cooperative-serial"
+    | "wasi-threads"
+    | "worker-sab"
+    | "wasi-p2";
   setIndirectCallTable(table: IndirectCallTable): void;
   spawn(fnPtr: number, arg: number): Promise<number>;
   join(tid: number): Promise<number>;
   detach(tid: number): Promise<number>;
+  isDetached?(tid: number): boolean;
+  detachedThreadsCancelled?(): boolean;
+  parkDetachedThread?(): Promise<number>;
+  cancelDetachedThreads?(): void;
   exit(retval: number): never;
   self(): number;
   yield_(): Promise<number>;

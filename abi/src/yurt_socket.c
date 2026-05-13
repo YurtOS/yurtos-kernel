@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stddef.h>
@@ -72,6 +73,12 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 #define YURT_SOCKET_ADDR_PEER 1u
 #define YURT_SOCKET_OPT_TCP_NODELAY 1u
 
+#define YURT_HOST_ERR_NOT_FOUND -1
+#define YURT_HOST_ERR_IO -3
+#define YURT_HOST_ERR_AGAIN -11
+#define YURT_HOST_ERR_INVALID -22
+#define YURT_HOST_ERR_UNSUPPORTED -38
+
 #define YURT_HOST_EPERM 1
 #define YURT_HOST_EIO 5
 #define YURT_HOST_EBADF 9
@@ -124,6 +131,27 @@ static int yurt_errno_from_host(int rc, int fallback) {
       return EOPNOTSUPP;
     default:
       return fallback;
+  }
+}
+
+static void set_socket_errno_from_host(int err) {
+  switch (err) {
+    case YURT_HOST_ERR_NOT_FOUND:
+      errno = EBADF;
+      break;
+    case YURT_HOST_ERR_AGAIN:
+      errno = EAGAIN;
+      break;
+    case YURT_HOST_ERR_INVALID:
+      errno = EINVAL;
+      break;
+    case YURT_HOST_ERR_UNSUPPORTED:
+      errno = EOPNOTSUPP;
+      break;
+    case YURT_HOST_ERR_IO:
+    default:
+      errno = EIO;
+      break;
   }
 }
 
@@ -515,23 +543,25 @@ int __wrap_accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 
 static ssize_t yurt_send_impl(int sockfd, const void *buf, size_t len, int flags) {
   YURT_MARKER_CALL(send);
+  int req_len;
   int n;
 
-  /* Try typed AF_UNIX STREAM path first (avoids base64). */
-  {
-    int r = yurt_host_socket_send_unix(sockfd, (int)(intptr_t)buf, (int)len);
-    if (r >= 0) return (ssize_t)r;
-    if (r == -1) { errno = EIO; return -1; }
-    /* r == -2: not AF_UNIX STREAM, fall through to native AF_INET path. */
-  }
-
-  if (len > (size_t)INT32_MAX) {
+  if (len > INT_MAX) {
     errno = EOVERFLOW;
     return -1;
   }
-  n = yurt_host_socket_send(sockfd, (int)(intptr_t)buf, (int)len, flags);
+  req_len = (int)len;
+  /* Try typed AF_UNIX path first; other sockets fall through to the generic
+   * binary send import. */
+  {
+    int r = yurt_host_socket_send_unix(sockfd, (int)(intptr_t)buf, req_len);
+    if (r >= 0) return (ssize_t)r;
+    if (r == -1) { errno = EIO; return -1; }
+    /* r == -2: not AF_UNIX, fall through. */
+  }
+  n = yurt_host_socket_send(sockfd, (int)(intptr_t)buf, req_len, flags);
   if (n < 0) {
-    errno = yurt_errno_from_host(n, EIO);
+    set_socket_errno_from_host(n);
     return -1;
   }
   return (ssize_t)n;
@@ -558,23 +588,25 @@ static ssize_t yurt_recv_impl(int sockfd, void *buf, size_t len, int flags) {
     len = YURT_SOCKET_RECV_MAX_RAW;
   }
 
-  /* Try typed AF_UNIX STREAM path first (avoids base64). */
+  if (len > INT_MAX) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+
+  /* Try typed AF_UNIX path first; other sockets fall through to the generic
+   * binary recv import. */
   {
     int is_peek = (flags == MSG_PEEK || flags == YURT_MSG_PEEK) ? 1 : 0;
     int r = yurt_host_socket_recv_unix(sockfd, (int)(intptr_t)buf, (int)len, is_peek);
     if (r >= 0) return (ssize_t)r;
     if (r == -2) { errno = EAGAIN; return -1; }
     if (r == -1) { errno = EIO; return -1; }
-    /* r == -3: not AF_UNIX STREAM, fall through to native AF_INET path. */
+    /* r == -3: not AF_UNIX, fall through. */
   }
 
-  if (len > (size_t)INT32_MAX) {
-    errno = EOVERFLOW;
-    return -1;
-  }
   n = yurt_host_socket_recv(sockfd, (int)(intptr_t)buf, (int)len, flags);
   if (n < 0) {
-    errno = yurt_errno_from_host(n, EIO);
+    set_socket_errno_from_host(n);
     return -1;
   }
   return (ssize_t)n;

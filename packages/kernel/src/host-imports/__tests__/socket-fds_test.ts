@@ -14,6 +14,10 @@ import {
 } from "../../wasi/types.js";
 import { VFS } from "../../vfs/vfs.js";
 
+function encode(value: string): Uint8Array {
+  return new TextEncoder().encode(value);
+}
+
 function writeString(
   memory: WebAssembly.Memory,
   ptr: number,
@@ -44,6 +48,14 @@ function readSocketAddr(memory: WebAssembly.Memory, ptr: number) {
   };
 }
 
+function readStringAt(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+): string {
+  return new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len));
+}
+
 describe("socket fd host imports", () => {
   it("connects, sends, receives, and reports addresses through native socket imports", async () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
@@ -63,13 +75,13 @@ describe("socket fd host imports", () => {
           localPort: 50123,
         };
       },
-      send(socket, dataB64) {
-        requests.push({ op: "send", socket, data_b64: dataB64 });
+      send(socket, data) {
+        requests.push({ op: "send", socket, data: [...data] });
         return { ok: true, bytes_sent: 4 };
       },
       recv(socket, maxBytes) {
         requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data_b64: btoa("pong") };
+        return { ok: true, data: new TextEncoder().encode("pong") };
       },
       close(socket) {
         requests.push({ op: "close", socket });
@@ -135,7 +147,7 @@ describe("socket fd host imports", () => {
     expect(requests).toContainEqual({
       op: "send",
       socket: handle,
-      data_b64: btoa("ping"),
+      data: [...new TextEncoder().encode("ping")],
     });
   });
 
@@ -147,7 +159,7 @@ describe("socket fd host imports", () => {
     backend = {
       connect: () => ({ ok: false, error: "not used" }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array() }),
       close(socket) {
         requests.push({ op: "close", socket });
         return { ok: true };
@@ -263,13 +275,13 @@ describe("socket fd host imports", () => {
         requests.push({ op: "connect", ...req });
         return { ok: true, socket: handle };
       },
-      send(socket, dataB64) {
-        requests.push({ op: "send", socket, data_b64: dataB64 });
+      send(socket, data) {
+        requests.push({ op: "send", socket, data: Array.from(data) });
         return { ok: true, bytes_sent: 3 };
       },
       recv(socket, maxBytes) {
         requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data_b64: "" };
+        return { ok: true, data: new Uint8Array(0) };
       },
       close(socket) {
         requests.push({ op: "close", socket });
@@ -332,13 +344,13 @@ describe("socket fd host imports", () => {
         requests.push({ op: "connect", ...req });
         return { ok: true, socket: handle };
       },
-      send(socket, dataB64) {
-        requests.push({ op: "send", socket, data_b64: dataB64 });
+      send(socket, data) {
+        requests.push({ op: "send", socket, data: Array.from(data) });
         return { ok: true, bytes_sent: 4 };
       },
       recv(socket, maxBytes) {
         requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data_b64: btoa("pong") };
+        return { ok: true, data: encode("pong") };
       },
       close(socket) {
         requests.push({ op: "close", socket });
@@ -398,7 +410,7 @@ describe("socket fd host imports", () => {
     expect(requests.at(-1)).toEqual({
       op: "send",
       socket: handle,
-      data_b64: btoa("ping"),
+      data: Array.from(encode("ping")),
     });
 
     view.setUint32(40, 600, true);
@@ -420,7 +432,7 @@ describe("socket fd host imports", () => {
     backend = {
       connect: () => ({ ok: true, socket: 88 }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
       recvAsync: (socket, maxBytes) =>
@@ -487,7 +499,7 @@ describe("socket fd host imports", () => {
         localPort: 50321,
       }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
       recvAsync: (socket, maxBytes) =>
@@ -545,7 +557,7 @@ describe("socket fd host imports", () => {
     backend = {
       connect: () => ({ ok: true, socket: 99 }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       setNoDelay(socket, enabled) {
         requests.push({ op: "setNoDelay", socket, enabled });
@@ -632,7 +644,7 @@ describe("socket fd host imports", () => {
     backend = {
       connect: () => ({ ok: true, socket: 101 }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       setNoDelay(socket, enabled) {
         requests.push({ op: "setNoDelay", socket, enabled });
@@ -708,7 +720,7 @@ describe("socket fd host imports", () => {
       send: () => ({ ok: true, bytes_sent: 0 }),
       recv: (socket, maxBytes) => {
         requests.push({ op: "recv", socket, maxBytes });
-        return { ok: true, data_b64: btoa("abc") };
+        return { ok: true, data: encode("abc") };
       },
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
@@ -743,44 +755,23 @@ describe("socket fd host imports", () => {
       4096,
     );
 
-    const peekReqLen = writeString(
-      memory,
-      16,
-      JSON.stringify({
-        fd,
-        max_bytes: 3,
-        peek: true,
-      }),
-    );
     const peekLen = (imports.host_socket_recv as (...args: number[]) => number)(
-      16,
-      peekReqLen,
+      fd,
       512,
-      4096,
+      3,
+      0x02,
     );
-    expect(readJson(memory, 512, peekLen)).toEqual({
-      ok: true,
-      data_b64: btoa("abc"),
-    });
+    expect(peekLen).toBe(3);
+    expect(readStringAt(memory, 512, peekLen)).toBe("abc");
 
-    const recvReqLen = writeString(
-      memory,
-      16,
-      JSON.stringify({
-        fd,
-        max_bytes: 3,
-      }),
-    );
     const recvLen = (imports.host_socket_recv as (...args: number[]) => number)(
-      16,
-      recvReqLen,
+      fd,
       512,
-      4096,
+      3,
+      0,
     );
-    expect(readJson(memory, 512, recvLen)).toEqual({
-      ok: true,
-      data_b64: btoa("abc"),
-    });
+    expect(recvLen).toBe(3);
+    expect(readStringAt(memory, 512, recvLen)).toBe("abc");
     expect(requests).toEqual([{ op: "recv", socket: 202, maxBytes: 3 }]);
   });
 
@@ -909,25 +900,14 @@ describe("socket fd host imports", () => {
     }
     target.fdFlags = WASI_FDFLAGS_NONBLOCK;
 
-    const recvReqLen = writeString(
-      memory,
-      16,
-      JSON.stringify({
-        fd,
-        max_bytes: 3,
-      }),
-    );
     const recvLen = (imports.host_socket_recv as (...args: number[]) => number)(
-      16,
-      recvReqLen,
+      fd,
       512,
-      4096,
+      3,
+      0,
     );
 
-    expect(readJson(memory, 512, recvLen)).toEqual({
-      ok: false,
-      error: "EAGAIN",
-    });
+    expect(recvLen).toBe(-11);
     expect(requests).toEqual([{
       op: "recv",
       socket: 404,
@@ -946,7 +926,7 @@ describe("socket fd host imports", () => {
       send: () => ({ ok: true, bytes_sent: 0 }),
       recv: (socket, maxBytes) => {
         requests.push({ op: "recv", socket, maxBytes });
-        return { ok: true, data_b64: btoa("abc") };
+        return { ok: true, data: encode("abc") };
       },
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
@@ -987,44 +967,23 @@ describe("socket fd host imports", () => {
     }
     target.fdFlags = WASI_FDFLAGS_NONBLOCK;
 
-    const peekReqLen = writeString(
-      memory,
-      16,
-      JSON.stringify({
-        fd,
-        max_bytes: 3,
-        peek: true,
-      }),
-    );
     const peekLen = (imports.host_socket_recv as (...args: number[]) => number)(
-      16,
-      peekReqLen,
+      fd,
       512,
-      4096,
+      3,
+      0x02,
     );
-    expect(readJson(memory, 512, peekLen)).toEqual({
-      ok: true,
-      data_b64: btoa("abc"),
-    });
+    expect(peekLen).toBe(3);
+    expect(readStringAt(memory, 512, peekLen)).toBe("abc");
 
-    const recvReqLen = writeString(
-      memory,
-      16,
-      JSON.stringify({
-        fd,
-        max_bytes: 3,
-      }),
-    );
     const recvLen = (imports.host_socket_recv as (...args: number[]) => number)(
-      16,
-      recvReqLen,
+      fd,
       512,
-      4096,
+      3,
+      0,
     );
-    expect(readJson(memory, 512, recvLen)).toEqual({
-      ok: true,
-      data_b64: btoa("abc"),
-    });
+    expect(recvLen).toBe(3);
+    expect(readStringAt(memory, 512, recvLen)).toBe("abc");
     expect(requests).toEqual([{ op: "recv", socket: 505, maxBytes: 3 }]);
   });
 
@@ -1035,7 +994,7 @@ describe("socket fd host imports", () => {
     backend = {
       connect: () => ({ ok: false, error: "not used" }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       listen: () => ({
         ok: true,
@@ -1115,7 +1074,7 @@ describe("socket fd host imports", () => {
     backend = {
       connect: () => ({ ok: false, error: "not used" }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       listen: () => ({
         ok: true,

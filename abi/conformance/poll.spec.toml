@@ -1,0 +1,9 @@
+canary = "posix-runtime-canary"
+symbol = "poll"
+
+[[cases]]
+name = "poll_regular_fd"
+inputs = "poll() over a regular file descriptor and an invalid descriptor"
+expected.exit = 0
+expected.stdout = "poll_regular_fd:ok"
+expected.note = "regular files are immediately readable/writable; invalid positive fds report POLLNVAL"

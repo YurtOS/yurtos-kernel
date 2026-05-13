@@ -313,7 +313,7 @@ int chroot(const char *path) {
   return -1;
 }
 
-int chmod(const char *path, mode_t mode) {
+static int yurt_chmod_impl(const char *path, mode_t mode) {
   YURT_MARKER_CALL(chmod);
   if (!path) {
     errno = EFAULT;
@@ -323,6 +323,14 @@ int chmod(const char *path, mode_t mode) {
   if (rc == 0) return 0;
   errno = (rc == -1) ? ENOENT : (rc == -2) ? EPERM : EIO;
   return -1;
+}
+
+int chmod(const char *path, mode_t mode) {
+  return yurt_chmod_impl(path, mode);
+}
+
+int __wrap_chmod(const char *path, mode_t mode) {
+  return yurt_chmod_impl(path, mode);
 }
 
 int getpriority(int which, id_t who) {

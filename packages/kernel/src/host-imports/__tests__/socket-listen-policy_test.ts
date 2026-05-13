@@ -33,7 +33,7 @@ describe("socket listener policy preparation", () => {
     backend = {
       connect: () => ({ ok: false, error: "not used" }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       listen(req) {
         calls.push(req);
@@ -103,7 +103,7 @@ describe("socket listener policy preparation", () => {
     backend = {
       connect: () => ({ ok: false, error: "not used" }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       listen: () => {
         throw new Error("policy denial must happen before backend.listen");
@@ -149,7 +149,7 @@ describe("socket listener policy preparation", () => {
     backend = {
       connect: () => ({ ok: false, error: "not used" }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       listen(req) {
         calls.push(req);

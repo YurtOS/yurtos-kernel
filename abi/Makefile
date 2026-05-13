@@ -46,11 +46,13 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_netdb.o \
   $(BUILD_DIR)/yurt_netif.o \
   $(BUILD_DIR)/yurt_pipe.o \
+  $(BUILD_DIR)/yurt_poll.o \
   $(BUILD_DIR)/yurt_process.o \
   $(BUILD_DIR)/yurt_pthread.o \
   $(BUILD_DIR)/yurt_pthread_rs.o \
   $(BUILD_DIR)/yurt_resource.o \
   $(BUILD_DIR)/yurt_sched.o \
+  $(BUILD_DIR)/yurt_select.o \
   $(BUILD_DIR)/yurt_sendfile.o \
   $(BUILD_DIR)/yurt_signal.o \
   $(BUILD_DIR)/yurt_socket.o \

@@ -37,6 +37,10 @@ const HAS_DLCANARY_FIXTURE =
   existsSync(resolve(FIXTURES, "dlopen-canary.wasm"));
 const HAS_UNIX_FIXTURE = existsSync(resolve(FIXTURES, "unix-canary.wasm"));
 
+function encode(value: string): Uint8Array {
+  return new TextEncoder().encode(value);
+}
+
 function installTestShell(sandbox: Sandbox): void {
   const vfs = (sandbox as unknown as {
     vfs: {
@@ -829,6 +833,38 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
         '{"case":"utimes_mtime","exit":0,"stdout":"utimes_mtime:ok"}',
       );
     });
+
+    it("reports poll readiness for regular and invalid descriptors", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run(
+        "posix-runtime-canary --case poll_regular_fd",
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"poll_regular_fd","exit":0,"stdout":"poll_regular_fd:ok"}',
+      );
+    });
+
+    it("reports select readiness for regular and invalid descriptors", async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
+
+      const result = await sandbox.run(
+        "posix-runtime-canary --case select_regular_fd",
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        '{"case":"select_regular_fd","exit":0,"stdout":"select_regular_fd:ok"}',
+      );
+    });
   });
 
   it("exposes the narrow signal compatibility header surface", async () => {
@@ -1008,14 +1044,14 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     let socketBackend: SocketBackend;
     socketBackend = {
       connect: () => ({ ok: true, socket: 606 }),
-      send: (_socket, dataB64) => ({
+      send: (_socket, data) => ({
         ok: true,
-        bytes_sent: atob(dataB64).length,
+        bytes_sent: data.byteLength,
       }),
       recv: (_socket, _maxBytes, opts) =>
         opts?.nonblocking
           ? { ok: false, error: "EAGAIN" }
-          : { ok: true, data_b64: "" },
+          : { ok: true, data: new Uint8Array(0) },
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
       recvAsync: (socket, maxBytes) =>
@@ -1252,13 +1288,13 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
         requests.push({ op: "connect", ...req });
         return { ok: true, socket: handle };
       },
-      send(socket, dataB64) {
-        requests.push({ op: "send", socket, data_b64: dataB64 });
+      send(socket, data) {
+        requests.push({ op: "send", socket, data: Array.from(data) });
         return { ok: true, bytes_sent: 4 };
       },
       recv(socket, maxBytes) {
         requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data_b64: btoa("pong") };
+        return { ok: true, data: encode("pong") };
       },
       close(socket) {
         requests.push({ op: "close", socket });
@@ -1287,7 +1323,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(requests).toContainEqual({
       op: "send",
       socket: handle,
-      data_b64: btoa("ping"),
+      data: Array.from(encode("ping")),
     });
     expect(requests).toContainEqual({
       op: "recv",
@@ -1300,11 +1336,11 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     let socketBackend: SocketBackend;
     socketBackend = {
       connect: () => ({ ok: true, socket: 202 }),
-      send: (_socket, dataB64) => ({
+      send: (_socket, data) => ({
         ok: true,
-        bytes_sent: atob(dataB64).length,
+        bytes_sent: data.byteLength,
       }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
       recvAsync: (socket, maxBytes) =>
@@ -1331,13 +1367,13 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
         requests.push({ op: "connect", ...req });
         return { ok: true, socket: handle };
       },
-      send(socket, dataB64) {
-        requests.push({ op: "send", socket, data_b64: dataB64 });
-        return { ok: true, bytes_sent: atob(dataB64).length };
+      send(socket, data) {
+        requests.push({ op: "send", socket, data: Array.from(data) });
+        return { ok: true, bytes_sent: data.byteLength };
       },
       recv(socket, maxBytes) {
         requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data_b64: btoa("pong") };
+        return { ok: true, data: encode("pong") };
       },
       close(socket) {
         requests.push({ op: "close", socket });
@@ -1366,7 +1402,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(requests).toContainEqual({
       op: "send",
       socket: handle,
-      data_b64: btoa("ping"),
+      data: Array.from(encode("ping")),
     });
     expect(requests).toContainEqual({
       op: "recv",
@@ -1383,13 +1419,13 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
         requests.push({ op: "connect", ...req });
         return { ok: true, socket: 404 };
       },
-      send(socket, dataB64) {
-        requests.push({ op: "send", socket, data_b64: dataB64 });
-        return { ok: true, bytes_sent: atob(dataB64).length };
+      send(socket, data) {
+        requests.push({ op: "send", socket, data: Array.from(data) });
+        return { ok: true, bytes_sent: data.byteLength };
       },
       recv(socket, maxBytes) {
         requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data_b64: "" };
+        return { ok: true, data: new Uint8Array(0) };
       },
       close(socket) {
         requests.push({ op: "close", socket });
@@ -1426,13 +1462,13 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
         requests.push({ op: "connect", ...req });
         return { ok: true, socket: 505 };
       },
-      send(socket, dataB64) {
-        requests.push({ op: "send", socket, data_b64: dataB64 });
-        return { ok: true, bytes_sent: atob(dataB64).length };
+      send(socket, data) {
+        requests.push({ op: "send", socket, data: Array.from(data) });
+        return { ok: true, bytes_sent: data.byteLength };
       },
       recv(socket, maxBytes) {
         requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data_b64: "" };
+        return { ok: true, data: new Uint8Array(0) };
       },
       close(socket) {
         requests.push({ op: "close", socket });
@@ -1461,12 +1497,12 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(requests).toContainEqual({
       op: "send",
       socket: 505,
-      data_b64: btoa("one"),
+      data: Array.from(encode("one")),
     });
     expect(requests).toContainEqual({
       op: "send",
       socket: 505,
-      data_b64: btoa("two"),
+      data: Array.from(encode("two")),
     });
     expect(requests.filter((req) => req.op === "close")).toEqual([{
       op: "close",
@@ -1478,11 +1514,11 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     let socketBackend: SocketBackend;
     socketBackend = {
       connect: () => ({ ok: true, socket: 707 }),
-      send: (_socket, dataB64) => ({
+      send: (_socket, data) => ({
         ok: true,
-        bytes_sent: atob(dataB64).length,
+        bytes_sent: data.byteLength,
       }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
       recvAsync: (socket, maxBytes) =>
@@ -1504,11 +1540,11 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     let socketBackend: SocketBackend;
     socketBackend = {
       connect: () => ({ ok: true, socket: 808 }),
-      send: (_socket, dataB64) => ({
+      send: (_socket, data) => ({
         ok: true,
-        bytes_sent: atob(dataB64).length,
+        bytes_sent: data.byteLength,
       }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
       recvAsync: (socket, maxBytes) =>
@@ -1531,11 +1567,11 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     let socketBackend: SocketBackend;
     socketBackend = {
       connect: () => ({ ok: true, socket: 909 }),
-      send: (_socket, dataB64) => ({
+      send: (_socket, data) => ({
         ok: true,
-        bytes_sent: atob(dataB64).length,
+        bytes_sent: data.byteLength,
       }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
       close: () => ({ ok: true }),
       setNoDelay: (socket, enabled) => {
         requests.push({ op: "setNoDelay", socket, enabled });
@@ -1566,13 +1602,13 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     let socketBackend: SocketBackend;
     socketBackend = {
       connect: () => ({ ok: true, socket: 1001 }),
-      send: (_socket, dataB64) => ({
+      send: (_socket, data) => ({
         ok: true,
-        bytes_sent: atob(dataB64).length,
+        bytes_sent: data.byteLength,
       }),
       recv: (socket, maxBytes) => {
         requests.push({ op: "recv", socket, maxBytes });
-        return { ok: true, data_b64: btoa("abc") };
+        return { ok: true, data: encode("abc") };
       },
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
@@ -1597,9 +1633,9 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     let socketBackend: SocketBackend;
     socketBackend = {
       connect: () => ({ ok: true, socket: 1002 }),
-      send: (_socket, dataB64) => ({
+      send: (_socket, data) => ({
         ok: true,
-        bytes_sent: atob(dataB64).length,
+        bytes_sent: data.byteLength,
       }),
       recv: (socket, maxBytes, opts) => {
         requests.push({
@@ -1610,7 +1646,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
         });
         return opts?.nonblocking
           ? { ok: false, error: "EAGAIN" }
-          : { ok: true, data_b64: btoa("abc") };
+          : { ok: true, data: encode("abc") };
       },
       close: () => ({ ok: true }),
       acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),

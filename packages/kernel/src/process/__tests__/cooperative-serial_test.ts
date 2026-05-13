@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert@^1.0.19";
+import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.19";
 import { CooperativeSerialBackend } from "../threads/cooperative-serial.ts";
 
 Deno.test("cooperative serial backend returns from spawn while spawned routines run", async () => {
@@ -81,6 +81,62 @@ Deno.test("cooperative serial backend maps thread exit to join retval", async ()
   const tid = await backend.spawn(1, 0);
   assertEquals(tid, 1);
   assertEquals(await backend.join(tid), 42);
+});
+
+Deno.test("cooperative serial backend does not let detached threads block later spawns", async () => {
+  const backend = new CooperativeSerialBackend();
+  let releaseThread!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    backend.setIndirectCallTable({
+      async call(_fnPtr, arg) {
+        if (arg === 1) {
+          resolve();
+          await new Promise<void>((release) => {
+            releaseThread = release;
+          });
+        }
+        return arg;
+      },
+    });
+  });
+
+  const firstTid = await backend.spawn(1, 1);
+  assertEquals(firstTid, 1);
+  assertEquals(await backend.detach(firstTid), 0);
+  await backend.yield_();
+  await firstStarted;
+
+  const secondTid = await backend.spawn(1, 2);
+  assertEquals(secondTid, 2);
+  assertEquals(await backend.join(secondTid), 2);
+
+  releaseThread();
+  await backend.yield_();
+});
+
+Deno.test("cooperative serial backend starts immediately detached threads", async () => {
+  const backend = new CooperativeSerialBackend();
+  let started = false;
+  backend.setIndirectCallTable({
+    call() {
+      started = true;
+      return Promise.resolve(0);
+    },
+  });
+
+  const tid = await backend.spawn(1, 0);
+  assertEquals(await backend.detach(tid), 0);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assertEquals(started, true);
+});
+
+Deno.test("cooperative serial backend cancels parked detached threads", async () => {
+  const backend = new CooperativeSerialBackend();
+  const parked = backend.parkDetachedThread();
+  backend.cancelDetachedThreads();
+
+  await assertRejects(() => parked);
 });
 
 Deno.test("cooperative serial backend keeps spawned thread stack growth bounded", async () => {

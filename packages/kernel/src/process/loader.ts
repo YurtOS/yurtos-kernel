@@ -193,6 +193,7 @@ export async function loadProcess(
     yurtImports,
     [
       "host_wait",
+      "host_poll",
       "host_kill",
       "host_killpg",
       "host_yield",
@@ -353,6 +354,7 @@ export async function loadProcess(
         childYurtImports,
         [
           "host_wait",
+          "host_poll",
           "host_kill",
           "host_killpg",
           "host_yield",
@@ -472,8 +474,10 @@ export async function loadProcess(
   let exitCode: number;
   try {
     exitCode = await wasi.startAsync(instance, startFn);
+    threadsBackend.cancelDetachedThreads?.();
   } catch (e) {
     rollback();
+    threadsBackend.cancelDetachedThreads?.();
     const stderr = proc.fdReadAndClear(2).data.trimEnd();
     if (stderr) {
       const message = e instanceof Error ? e.message : String(e);
@@ -508,6 +512,7 @@ export async function loadProcess(
 
   proc.__setTerminate(async () => {
     wasi.cancelExecution();
+    threadsBackend.cancelDetachedThreads?.();
     ctx.releasePid(pid, proc.exitCode ?? 0, wasi.getExitSignal());
   });
 

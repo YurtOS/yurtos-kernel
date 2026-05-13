@@ -164,6 +164,12 @@ const USER_UID = 1000;
 const USER_GID = 1000;
 const PRIO_PROCESS = 0;
 const YURT_WAIT_NOHANG = 1;
+const POLLIN = 0x0001;
+const POLLOUT = 0x0002;
+const POLLERR = 0x0008;
+const POLLHUP = 0x0010;
+const POLLNVAL = 0x0020;
+const POLLFD_SIZE = 8;
 
 function writeI32(
   memory: WebAssembly.Memory,
@@ -351,6 +357,72 @@ function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
 
 function yieldToScheduler(): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+function pollReventsForTarget(target: FdTarget, events: number): number {
+  let revents = 0;
+  const wantsRead = (events & POLLIN) !== 0;
+  const wantsWrite = (events & POLLOUT) !== 0;
+
+  switch (target.type) {
+    case "pipe_read":
+      if (wantsRead && target.pipe.hasBufferedData) revents |= POLLIN;
+      if (target.pipe.writeClosed && !target.pipe.hasBufferedData) {
+        revents |= POLLHUP;
+      }
+      break;
+    case "pipe_write":
+      if (target.pipe.closed) revents |= POLLERR;
+      else if (wantsWrite && target.pipe.hasCapacity) revents |= POLLOUT;
+      break;
+    case "tty_slave":
+      if (wantsRead && target.state.toSlave.length > 0) revents |= POLLIN;
+      if (target.state.masterClosed) revents |= POLLHUP;
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+    case "tty_master":
+      if (wantsRead && target.state.toMaster.length > 0) revents |= POLLIN;
+      if (wantsWrite && !target.state.masterClosed) revents |= POLLOUT;
+      if (target.state.masterClosed) revents |= POLLHUP;
+      break;
+    case "buffer":
+      // Buffer targets are write-only stdout/stderr captures.
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+    case "static":
+      if (wantsRead) revents |= POLLIN;
+      break;
+    case "socket":
+      if (wantsRead) {
+        if ((target.peekBuffer?.byteLength ?? 0) > 0 || target.readShutdown) {
+          revents |= POLLIN;
+        } else if (target.socket !== null) {
+          // Socket readiness is probed by a nonblocking recv; any byte read
+          // here is cached so the following guest recv observes it.
+          const probe = target.recv(target.socket, 1, { nonblocking: true });
+          if (probe.ok) {
+            const data = probe.data ?? new Uint8Array(0);
+            if (data.byteLength > 0) target.peekBuffer = data;
+            else target.readShutdown = true;
+            revents |= POLLIN;
+          } else if (probe.error !== "EAGAIN") {
+            revents |= POLLERR;
+          }
+        }
+      }
+      if (wantsWrite && target.socket !== null && !target.writeShutdown) {
+        revents |= POLLOUT;
+      }
+      break;
+    case "null":
+    case "vfs_file":
+    case "vfs_dir":
+      if (wantsRead) revents |= POLLIN;
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+  }
+
+  return revents;
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -853,14 +925,6 @@ export function createKernelImports(
     return 0;
   }
 
-  function bytesToBase64(data: Uint8Array): string {
-    let binary = "";
-    for (let i = 0; i < data.byteLength; i++) {
-      binary += String.fromCharCode(data[i]);
-    }
-    return btoa(binary);
-  }
-
   function base64ToBytes(value: string): Uint8Array {
     const binary = atob(value);
     const out = new Uint8Array(binary.length);
@@ -1024,6 +1088,77 @@ export function createKernelImports(
         if (writeTarget) ioFds.set(writeFd, writeTarget);
       }
       return writePipeResult(memory, outPtr, outCap, readFd, writeFd);
+    },
+
+    // host_poll(fds_ptr, nfds, timeout_ms) -> i32 | Promise<i32>
+    // Updates pollfd.revents in-place and returns the number of ready fds.
+    host_poll(
+      fdsPtr: number,
+      nfds: number,
+      timeoutMs: number,
+    ): number | Promise<number> {
+      if (!opts.kernel) return ERR_IO;
+      if (nfds < 0 || !Number.isInteger(nfds)) return ERR_INVALID;
+
+      const evaluate = (): number => {
+        const end = fdsPtr + nfds * POLLFD_SIZE;
+        if (fdsPtr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+        const view = new DataView(memory.buffer);
+        let ready = 0;
+        for (let i = 0; i < nfds; i++) {
+          const base = fdsPtr + i * POLLFD_SIZE;
+          const fd = view.getInt32(base, true);
+          const events = view.getInt16(base + 4, true);
+          let revents = 0;
+          if (fd >= 0) {
+            const target = opts.kernel!.getFdTarget(callerPid, fd);
+            revents = target ? pollReventsForTarget(target, events) : POLLNVAL;
+          }
+          view.setInt16(base + 6, revents, true);
+          if (revents !== 0) ready++;
+        }
+        return ready;
+      };
+
+      const immediate = evaluate();
+      if (immediate !== 0 || timeoutMs === 0) return immediate;
+
+      const tid = opts.threadsBackend?.self() ?? 0;
+      if (
+        tid !== 0 && timeoutMs < 0 && opts.threadsBackend?.isDetached?.(tid)
+      ) {
+        if (opts.threadsBackend.detachedThreadsCancelled?.()) {
+          opts.threadsBackend.exit(0);
+        }
+        return opts.threadsBackend.parkDetachedThread?.() ??
+          new Promise<number>(() => {});
+      }
+
+      return new Promise<number>((resolve, reject) => {
+        const started = Date.now();
+        // Cooperative runtimes have no host-side readiness notification yet,
+        // so blocking poll/select wakes on this coarse timer.
+        const interval = setInterval(() => {
+          if (
+            tid !== 0 && opts.threadsBackend?.isDetached?.(tid) &&
+            opts.threadsBackend.detachedThreadsCancelled?.()
+          ) {
+            clearInterval(interval);
+            try {
+              opts.threadsBackend.exit(0);
+            } catch (err) {
+              reject(err);
+            }
+            return;
+          }
+          const ready = evaluate();
+          const expired = timeoutMs >= 0 && Date.now() - started >= timeoutMs;
+          if (ready !== 0 || expired) {
+            clearInterval(interval);
+            resolve(ready > 0 ? ready : 0);
+          }
+        }, 10);
+      });
     },
 
     // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32
@@ -2206,8 +2341,8 @@ export function createKernelImports(
           isDgram: true,
           fdFlags: (type & SOCK_NONBLOCK) !== 0 ? WASI_FDFLAGS_NONBLOCK : 0,
           refs: 1,
-          send: (socket, dataB64) =>
-            socketBackend?.send(socket, dataB64) ??
+          send: (socket, data) =>
+            socketBackend?.send(socket, data) ??
               { ok: false, error: "networking not configured" },
           recv: (socket, maxBytes, recvOpts) =>
             socketBackend?.recv(socket, maxBytes, recvOpts) ??
@@ -2234,8 +2369,8 @@ export function createKernelImports(
         type: "socket",
         socket: null,
         refs: 1,
-        send: (socket, dataB64) =>
-          socketBackend?.send(socket, dataB64) ??
+        send: (socket, data) =>
+          socketBackend?.send(socket, data) ??
             { ok: false, error: "networking not configured" },
         recv: (socket, maxBytes, recvOpts) =>
           socketBackend?.recv(socket, maxBytes, recvOpts) ??
@@ -2824,69 +2959,127 @@ export function createKernelImports(
     },
 
     // host_socket_send(fd, data_ptr, data_len, flags) -> i32
-    // Sends data on an open socket.
+    // Sends raw bytes from WASM linear memory on an open socket.
     host_socket_send(
       fd: number,
       dataPtr: number,
       dataLen: number,
       _flags: number,
     ): number {
-      if (!socketBackend) return -5;
-      const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket" || target.socket === null) {
-        return -107;
+      if (!socketBackend) return ERR_IO;
+      if (dataLen < 0 || dataPtr < 0) return ERR_INVALID;
+      const end = dataPtr + dataLen;
+      if (end > memory.buffer.byteLength) return ERR_IO;
+      try {
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return ERR_NOT_FOUND;
+        }
+        const data = readBytes(memory, dataPtr, dataLen);
+        if (target.isDgram) {
+          const registry = socketBackend.registry;
+          if (!registry) return ERR_IO;
+          const rawHandle = -(target.socket as number);
+          const result = registry.sendDgramToPeer(rawHandle, data);
+          return result.ok ? result.bytesSent : ERR_IO;
+        }
+        const result = socketBackend.send(target.socket, data);
+        if (!result.ok) return ERR_IO;
+        return typeof result.bytes_sent === "number"
+          ? result.bytes_sent
+          : ERR_IO;
+      } catch {
+        return ERR_IO;
       }
-      const data = readBytes(memory, dataPtr, dataLen);
-      const result = socketBackend.send(target.socket, bytesToBase64(data));
-      if (!result.ok) return result.error === "EAGAIN" ? -11 : -5;
-      return result.bytes_sent ?? data.byteLength;
     },
 
     // host_socket_recv(fd, out_ptr, out_cap, flags) -> i32
-    // Receives data from an open socket. Returns synchronously for
+    // Receives raw bytes into WASM linear memory. Returns synchronously for
     // peek-with-buffer and nonblocking reads; returns a Promise for
     // blocking reads, so backends with recvAsync (loopback, browser
     // registry) suspend the host import via JSPI/Asyncify until at
     // least one byte (or EOF) arrives.
     host_socket_recv(
       fd: number,
-      outDataPtr: number,
+      outPtr: number,
       outCap: number,
       flags: number,
     ): number | Promise<number> {
-      if (!socketBackend) return -5;
-      const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket" || target.socket === null) {
-        return -107;
-      }
-      const maxBytes = outCap;
-      const peek = (flags & 2) !== 0;
-      const nonblocking = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
-      if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
-        const chunk = target.peekBuffer.slice(0, maxBytes);
-        if (!peek) {
-          target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+      if (!socketBackend) return ERR_IO;
+      if (outCap < 0 || outPtr < 0) return ERR_INVALID;
+      const end = outPtr + outCap;
+      if (end > memory.buffer.byteLength) return ERR_IO;
+      const MSG_PEEK = 0x02;
+      if (flags !== 0 && flags !== MSG_PEEK) return ERR_UNSUPPORTED;
+      try {
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return ERR_NOT_FOUND;
         }
-        return writeBytes(memory, outDataPtr, outCap, chunk);
-      }
-      const writeProbe = (
-        probe: { ok: boolean; data_b64?: string; error?: string },
-      ) => {
-        if (!probe.ok) return probe.error === "EAGAIN" ? -11 : -5;
-        const data = base64ToBytes(probe.data_b64 ?? "");
+        const maxBytes = outCap;
+        const peek = flags === MSG_PEEK;
+        if (target.isDgram) {
+          const registry = socketBackend.registry;
+          if (!registry) return ERR_IO;
+          const rawHandle = -(target.socket as number);
+          const result = registry.recvDgram(rawHandle, maxBytes, true);
+          if (!result.ok) return ERR_AGAIN;
+          return writeBytes(memory, outPtr, maxBytes, result.bytes);
+        }
+        const nonblocking =
+          ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+        const writeSocketBytes = (data: Uint8Array): number => {
+          const chunk = data.slice(0, maxBytes);
+          return writeBytes(memory, outPtr, maxBytes, chunk);
+        };
+        if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
+          const chunk = target.peekBuffer.slice(0, maxBytes);
+          if (!peek) {
+            target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+          }
+          return writeSocketBytes(chunk);
+        }
+        if (target.readShutdown) {
+          return writeSocketBytes(new Uint8Array(0));
+        }
+        // peekBuffer is empty.
         if (peek) {
-          target.peekBuffer = target.peekBuffer
-            ? concatBytes(target.peekBuffer, data)
-            : data;
+          // Peek probes the backend without suspending and stashes any data
+          // into peekBuffer for the following non-peek recv. The probe is
+          // always nonblocking — even on a blocking fd a peek that finds
+          // nothing returns EAGAIN here rather than waiting for bytes.
+          // That diverges from a real `MSG_PEEK` on a blocking socket
+          // (which would block) but matches how peek is used in the libc
+          // shim today as a select()-style readiness check.
+          const probe = socketBackend.recv(target.socket, maxBytes, {
+            nonblocking: true,
+          });
+          if (probe.ok) {
+            const data = probe.data ?? new Uint8Array(0);
+            target.peekBuffer = target.peekBuffer
+              ? concatBytes(target.peekBuffer, data)
+              : data;
+            return writeSocketBytes(data);
+          }
+          return probe.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
         }
-        return writeBytes(memory, outDataPtr, outCap, data);
-      };
-      if (peek || nonblocking) {
-        return writeProbe(socketBackend.recv(target.socket, maxBytes, {
-          nonblocking: true,
-        }));
+        if (nonblocking) {
+          // Poll the backend with the nonblocking flag. The backend either
+          // returns queued bytes, signals EAGAIN, or reports EOF/error;
+          // surface whatever it says directly.
+          const probe = socketBackend.recv(target.socket, maxBytes, {
+            nonblocking: true,
+          });
+          if (!probe.ok) return probe.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+          return writeSocketBytes(probe.data ?? new Uint8Array(0));
+        }
+        return target.recvAsync(target.socket, maxBytes).then((result) => {
+          if (!result.ok) return result.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+          return writeSocketBytes(result.data ?? new Uint8Array(0));
+        });
+      } catch {
+        return ERR_IO;
       }
-      return target.recvAsync(target.socket, maxBytes).then(writeProbe);
     },
 
     // host_socket_sendmsg(sockfd, data_ptr, data_len, fds_ptr, fds_count) -> bytes | -1

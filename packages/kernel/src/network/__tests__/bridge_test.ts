@@ -7,6 +7,10 @@ import { type ChildProcess, spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
 import process from "node:process";
 
+function encode(value: string): Uint8Array {
+  return new TextEncoder().encode(value);
+}
+
 /**
  * These tests spin up an HTTP server in a CHILD PROCESS so that
  * the Worker's real fetch() can hit a controlled endpoint without
@@ -257,21 +261,30 @@ describe(
       expect(accepted.ok).toBe(true);
       if (!accepted.ok) throw new Error(accepted.error);
 
-      expect(backend.send(client.socket, btoa("ping"))).toEqual({
+      expect(bridge.requestSync({
+        op: "send",
+        socket_id: client.socket,
+        data: "ping",
+      })).toEqual({
+        ok: false,
+        error: "send: data must be an array of bytes",
+      });
+
+      expect(backend.send(client.socket, encode("ping"))).toEqual({
         ok: true,
         bytes_sent: 4,
       });
       expect(backend.recv(accepted.socket, 4)).toEqual({
         ok: true,
-        data_b64: btoa("ping"),
+        data: encode("ping"),
       });
-      expect(backend.send(accepted.socket, btoa("pong"))).toEqual({
+      expect(backend.send(accepted.socket, encode("pong"))).toEqual({
         ok: true,
         bytes_sent: 4,
       });
       expect(backend.recv(client.socket, 4)).toEqual({
         ok: true,
-        data_b64: btoa("pong"),
+        data: encode("pong"),
       });
 
       backend.close(client.socket);

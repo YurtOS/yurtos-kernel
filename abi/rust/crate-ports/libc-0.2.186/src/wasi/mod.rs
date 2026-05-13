@@ -333,9 +333,9 @@ pub const W_OK: c_int = 2;
 pub const X_OK: c_int = 1;
 pub const POLLIN: c_short = 0x1;
 pub const POLLOUT: c_short = 0x2;
-pub const POLLERR: c_short = 0x1000;
-pub const POLLHUP: c_short = 0x2000;
-pub const POLLNVAL: c_short = 0x4000;
+pub const POLLERR: c_short = 0x8;
+pub const POLLHUP: c_short = 0x10;
+pub const POLLNVAL: c_short = 0x20;
 pub const POLLRDNORM: c_short = 0x1;
 pub const POLLWRNORM: c_short = 0x2;
 

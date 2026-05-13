@@ -344,7 +344,11 @@ export class NetworkBridge implements NetworkBridgeLike {
       async function handleSend(req) {
         const sock = sockets.get(req.socket_id);
         if (!sock) { writeErr('send: invalid socket_id'); return; }
-        const data = Buffer.from(req.data_b64, 'base64');
+        if (!Array.isArray(req.data)) {
+          writeErr('send: data must be an array of bytes');
+          return;
+        }
+        const data = Buffer.from(req.data);
         return new Promise((resolve) => {
           sock.write(data, (err) => {
             if (err) { writeErr('send: ' + err.message); }
@@ -361,7 +365,7 @@ export class NetworkBridge implements NetworkBridgeLike {
         return new Promise((resolve) => {
           const chunk = sock.read(maxBytes);
           if (chunk) {
-            writeOk({ ok: true, data_b64: chunk.toString('base64') });
+            writeOk({ ok: true, data: Array.from(chunk) });
             resolve();
             return;
           }
@@ -371,7 +375,7 @@ export class NetworkBridge implements NetworkBridgeLike {
             // (ok with empty bytes) so polling callers don't spin
             // forever after the peer closes.
             if (sock.readableEnded || sock.destroyed) {
-              writeOk({ ok: true, data_b64: '' });
+              writeOk({ ok: true, data: [] });
             } else {
               writeErr('EAGAIN');
             }
@@ -385,14 +389,14 @@ export class NetworkBridge implements NetworkBridgeLike {
             settled = true;
             cleanup();
             const c = sock.read(maxBytes);
-            writeOk({ ok: true, data_b64: c ? c.toString('base64') : '' });
+            writeOk({ ok: true, data: c ? Array.from(c) : [] });
             resolve();
           };
           const onEnd = () => {
             if (settled) return;
             settled = true;
             cleanup();
-            writeOk({ ok: true, data_b64: '' });
+            writeOk({ ok: true, data: [] });
             resolve();
           };
           const onError = (err) => {
