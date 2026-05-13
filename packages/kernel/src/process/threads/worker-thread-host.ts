@@ -1,4 +1,4 @@
-import { SabMutex } from "./sab-primitives.ts";
+import { SabCondvar, SabMutex } from "./sab-primitives.ts";
 import { WASI_EBUSY } from "../../wasi/types.ts";
 
 interface StartMessage {
@@ -26,6 +26,7 @@ workerSelf.onmessage = async (event: MessageEvent<StartMessage>) => {
     return;
   }
   const mutex = (ptr: number) => new SabMutex(sharedBuffer, ptr);
+  const condvar = (ptr: number) => new SabCondvar(sharedBuffer, ptr);
 
   const instance = await WebAssembly.instantiate(module, {
     env: { memory },
@@ -46,6 +47,22 @@ workerSelf.onmessage = async (event: MessageEvent<StartMessage>) => {
       },
       host_mutex_trylock: (ptr: number) =>
         mutex(ptr).tryLock(tid) ? 0 : WASI_EBUSY,
+      host_cond_wait: (condPtr: number, mutexPtr: number) => {
+        try {
+          condvar(condPtr).wait(mutex(mutexPtr), tid);
+          return 0;
+        } catch {
+          return -1;
+        }
+      },
+      host_cond_signal: (ptr: number) => {
+        condvar(ptr).signal();
+        return 0;
+      },
+      host_cond_broadcast: (ptr: number) => {
+        condvar(ptr).broadcast();
+        return 0;
+      },
     },
   });
   const table = instance.exports
