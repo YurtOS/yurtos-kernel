@@ -30,9 +30,10 @@
  *      When the threadsBackend rewrite lands, the test
  *      automatically follows the clean Python-caught path.
  *
- * Skipped when the staged fixtures are absent — run
- * `scripts/stage-jupyter-fixtures.sh` first (which itself depends
- * on `../yurt-jupyter` having extract'd its yurtpkg).
+ * Skipped when the staged fixtures are absent — run both
+ * `scripts/stage-cpython-fixtures.sh` and
+ * `scripts/stage-jupyter-fixtures.sh` first. The Jupyter staging
+ * itself depends on `../yurt-jupyter` having extract'd its yurtpkg.
  */
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
@@ -48,9 +49,15 @@ const FIXTURES = resolve(
 const JUPYTER_ROOT = resolve(FIXTURES, "yurt-jupyter");
 const SITE_PACKAGES_HOST = resolve(JUPYTER_ROOT, "site-packages");
 const USR_SHARE_HOST = resolve(JUPYTER_ROOT, "usr-share");
+const CPYTHON_WASM = resolve(FIXTURES, "cpython3.wasm");
+const PYZMQ_INIT = resolve(
+  FIXTURES,
+  "cpython3-lib/site-packages/zmq/__init__.py",
+);
 const HAS_FIXTURES = existsSync(
   resolve(SITE_PACKAGES_HOST, "ipykernel/__init__.py"),
-) && existsSync(resolve(USR_SHARE_HOST, "psutil.py"));
+) && existsSync(resolve(USR_SHARE_HOST, "psutil.py")) &&
+  existsSync(CPYTHON_WASM) && existsSync(PYZMQ_INIT);
 
 const maybeDescribe = HAS_FIXTURES ? describe : describe.skip;
 
@@ -89,7 +96,7 @@ async function makeSandbox(): Promise<Sandbox> {
   const sitePackages = readDirRecursiveSync(SITE_PACKAGES_HOST);
   const usrShare = readDirRecursiveSync(USR_SHARE_HOST);
 
-  return await Sandbox.create({
+  const sandbox = await Sandbox.create({
     wasmDir: FIXTURES,
     adapter: new NodeAdapter(),
     // libzmq's internal signaler does bind/listen on AF_INET loopback
@@ -113,6 +120,8 @@ async function makeSandbox(): Promise<Sandbox> {
       },
     ],
   });
+  sandbox.setEnv("PYTHONPATH", PYTHONPATH);
+  return sandbox;
 }
 
 maybeDescribe("yurt-jupyter ipykernel runtime smoke", () => {
@@ -120,7 +129,7 @@ maybeDescribe("yurt-jupyter ipykernel runtime smoke", () => {
     const sandbox = await makeSandbox();
     try {
       const result = await sandbox.run(
-        `PYTHONPATH=${PYTHONPATH} cpython3 -c 'import ipykernel, IPython; print(f"ipykernel={ipykernel.__version__} IPython={IPython.__version__}")'`,
+        `cpython3 -c 'import ipykernel, IPython; print(f"ipykernel={ipykernel.__version__} IPython={IPython.__version__}")'`,
       );
       if (result.exitCode !== 0) {
         console.log("--- ipykernel import: exit", result.exitCode);
@@ -178,7 +187,7 @@ maybeDescribe("yurt-jupyter ipykernel runtime smoke", () => {
     const sandbox = await makeSandbox();
     try {
       const result = await sandbox.run(
-        `PYTHONPATH=${PYTHONPATH} cpython3 /usr/share/yurt-jupyter/ipykernel-launch-dry-run.py`,
+        "cpython3 /usr/share/yurt-jupyter/ipykernel-launch-dry-run.py",
       );
       expect(result.stdout).toMatch(/ipykernel \d+\.\d+\.\d+/);
       expect(result.stdout).toMatch(/inproc PAIR-PAIR roundtrip ok/);
