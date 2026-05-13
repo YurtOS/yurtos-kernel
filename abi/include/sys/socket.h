@@ -126,17 +126,8 @@ extern "C" {
 #define SO_TYPE 3
 #endif
 
-/* struct ucred — peer credentials returned by SO_PEERCRED.
- * Guard against both our own and the WASI sysroot's guard symbol. */
-#if !defined(_HAVE_STRUCT_UCRED) && !defined(__ucred_defined)
-#define _HAVE_STRUCT_UCRED
-#define __ucred_defined
-struct ucred {
-    pid_t pid;
-    uid_t uid;
-    gid_t gid;
-};
-#endif
+/* struct ucred — provided by the WASI sysroot's sys/socket.h (pulled in via
+ * #include_next above); do not redefine here. */
 
 /* struct cmsghdr and CMSG_* macros — wasi-libc's __struct_msghdr.h only
  * defines struct msghdr, not struct cmsghdr.  Provide them unconditionally
