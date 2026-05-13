@@ -68,3 +68,59 @@ export class SabMutex {
     return Atomics.load(this.view, 0);
   }
 }
+
+/**
+ * SAB-backed condition variable, paired with a SabMutex.
+ *
+ * Cell layout: one i32 (4 bytes) at `byteOffset` — a sequence counter
+ * that signal()/broadcast() bump atomically. wait() snapshots the seq
+ * with the mutex held, releases the mutex, Atomics.wait()s for the seq
+ * to change away from the snapshot, and re-acquires the mutex.
+ *
+ * Lost-wakeup safety: because the snapshot is taken while the mutex is
+ * still held, any signal racing with the wait either (a) ran before the
+ * snapshot — in which case its notify is irrelevant and the waiter sees
+ * the new state when it re-locks, or (b) ran after the snapshot — in
+ * which case Atomics.wait observes the seq change and returns "not-
+ * equal" without sleeping. Spurious wakes are handled by callers via
+ * the conventional while(predicate) wait pattern.
+ *
+ * Must be called from a context where Atomics.wait is allowed
+ * (Worker / worker_threads / Deno worker; NOT main browser thread).
+ */
+export class SabCondvar {
+  static readonly BYTES = 4;
+  private readonly view: Int32Array;
+
+  constructor(sab: SharedArrayBuffer, byteOffset: number) {
+    this.view = new Int32Array(sab, byteOffset, 1);
+  }
+
+  /**
+   * Atomically: unlock the paired mutex, wait for a signal, re-lock.
+   * `tid` must match the lock owner; callers MUST hold the mutex on entry.
+   */
+  wait(m: SabMutex, tid: number): void {
+    const seq = Atomics.load(this.view, 0);
+    m.unlock(tid);
+    Atomics.wait(this.view, 0, seq);
+    m.lock(tid);
+  }
+
+  /** Wake at most one waiter. Safe to call without holding the mutex. */
+  signal(): void {
+    Atomics.add(this.view, 0, 1);
+    Atomics.notify(this.view, 0, 1);
+  }
+
+  /** Wake every waiter. Safe to call without holding the mutex. */
+  broadcast(): void {
+    Atomics.add(this.view, 0, 1);
+    Atomics.notify(this.view, 0, Number.MAX_SAFE_INTEGER);
+  }
+
+  /** Current seq counter — exposed for tests. */
+  seq(): number {
+    return Atomics.load(this.view, 0);
+  }
+}

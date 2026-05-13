@@ -1,5 +1,5 @@
 import { assertEquals, assertThrows } from "@std/assert";
-import { SabMutex } from "../sab-primitives.ts";
+import { SabCondvar, SabMutex } from "../sab-primitives.ts";
 
 Deno.test("SabMutex: uncontended lock takes ownership and unlock releases it", () => {
   const sab = new SharedArrayBuffer(SabMutex.BYTES);
@@ -89,3 +89,80 @@ Deno.test({
 // Task 4 (worker-thread-host.ts). The atomicity invariant is exercised
 // implicitly there when libzmq's signaler hits the SAB cell from two
 // threads at once.
+
+Deno.test("SabCondvar: signal() increments seq and is a no-op without waiters", () => {
+  const sab = new SharedArrayBuffer(SabMutex.BYTES + SabCondvar.BYTES);
+  const cv = new SabCondvar(sab, SabMutex.BYTES);
+  const before = cv.seq();
+  cv.signal();
+  assertEquals(cv.seq(), before + 1);
+});
+
+Deno.test("SabCondvar: broadcast() increments seq and is a no-op without waiters", () => {
+  const sab = new SharedArrayBuffer(SabMutex.BYTES + SabCondvar.BYTES);
+  const cv = new SabCondvar(sab, SabMutex.BYTES);
+  cv.broadcast();
+  cv.broadcast();
+  assertEquals(cv.seq(), 2);
+});
+
+Deno.test({
+  name: "SabCondvar: broadcast wakes multiple Worker waiters",
+  permissions: { read: true, net: true },
+  fn: async () => {
+    const sab = new SharedArrayBuffer(SabMutex.BYTES + SabCondvar.BYTES);
+    const cv = new SabCondvar(sab, SabMutex.BYTES);
+
+    const workers = [2, 3, 4].map((tid) => {
+      const w = new Worker(
+        new URL("./_fixtures/cv-waiter-worker.ts", import.meta.url).href,
+        { type: "module" },
+      );
+      w.postMessage({
+        sab,
+        tid,
+        mutexOffset: 0,
+        condvarOffset: SabMutex.BYTES,
+      });
+      return { tid, worker: w };
+    });
+
+    // Wait for all 3 workers to enter cv.wait (they each post "ready"
+    // BEFORE calling wait, but cv.wait happens immediately after, so
+    // by the time we've received 3 "ready" messages all 3 are either
+    // waiting or about to). Give one tick for them to reach Atomics.wait.
+    const ready = workers.map(({ worker }) =>
+      new Promise<{ tid: number }>((resolve) => {
+        worker.addEventListener("message", function once(e) {
+          const data = (e as MessageEvent).data;
+          if (data.type === "ready") {
+            worker.removeEventListener("message", once as EventListener);
+            resolve(data);
+          }
+        });
+      })
+    );
+    await Promise.all(ready);
+    await new Promise((r) => setTimeout(r, 50));
+
+    cv.broadcast();
+
+    const woke = await Promise.all(
+      workers.map(({ worker }) =>
+        new Promise<{ tid: number }>((resolve) => {
+          worker.addEventListener("message", function once(e) {
+            const data = (e as MessageEvent).data;
+            if (data.type === "woke") {
+              worker.removeEventListener("message", once as EventListener);
+              resolve(data);
+            }
+          });
+        })
+      ),
+    );
+    const tids = woke.map((w) => w.tid).sort();
+    assertEquals(tids, [2, 3, 4]);
+
+    for (const { worker } of workers) worker.terminate();
+  },
+});
