@@ -952,7 +952,8 @@ export function createKernelImports(
     if (!policy?.allowUnixDomain) {
       return {
         ok: false,
-        error: `AF_UNIX abstract listen on @${name} is not allowed by sandbox policy`,
+        error:
+          `AF_UNIX abstract listen on @${name} is not allowed by sandbox policy`,
       };
     }
     const allowlist = policy.unixAbstractAllowlist;
@@ -961,7 +962,8 @@ export function createKernelImports(
       if (!allowed) {
         return {
           ok: false,
-          error: `AF_UNIX abstract name @${name} is not in the sandbox allowlist`,
+          error:
+            `AF_UNIX abstract name @${name} is not in the sandbox allowlist`,
         };
       }
     }
@@ -2213,10 +2215,16 @@ export function createKernelImports(
           recvAsync: (socket, maxBytes) =>
             socketBackend
               ? recvSocketAsync(socketBackend, socket, maxBytes)
-              : Promise.resolve({ ok: false, error: "networking not configured" }),
+              : Promise.resolve({
+                ok: false,
+                error: "networking not configured",
+              }),
           setNoDelay: (socket, enabled) =>
             socketBackend?.setNoDelay?.(socket, enabled) ??
-              { ok: false, error: "TCP_NODELAY not supported by socket backend" },
+              {
+                ok: false,
+                error: "TCP_NODELAY not supported by socket backend",
+              },
           close: (_socket) => {
             registry.closeDgramSocket(rawHandle);
           },
@@ -2356,7 +2364,9 @@ export function createKernelImports(
           registry.bindDgramToPath(-(target.socket as number), name);
         } catch {
           // Roll back the VFS inode we just created.
-          try { opts.vfs?.unlink(name); } catch { /* best-effort */ }
+          try {
+            opts.vfs?.unlink(name);
+          } catch { /* best-effort */ }
           return -1;
         }
       }
@@ -2391,7 +2401,12 @@ export function createKernelImports(
         target.peerGid = connCreds?.egid ?? 0;
         return 0;
       }
-      result = registry.connectToPath(name, callerPid, connCreds?.euid, connCreds?.egid);
+      result = registry.connectToPath(
+        name,
+        callerPid,
+        connCreds?.euid,
+        connCreds?.egid,
+      );
       if (!result.ok) return -1;
       target.socket = -(result.socket as number);
       target.family = "AF_UNIX";
@@ -2454,7 +2469,9 @@ export function createKernelImports(
       if (!result.ok) return -2;
       const bytes = (result as { ok: true; bytes: Uint8Array }).bytes;
       const recvLen = Math.min(bytes.length, bufCap);
-      new Uint8Array(memory.buffer, bufPtr, recvLen).set(bytes.subarray(0, recvLen));
+      new Uint8Array(memory.buffer, bufPtr, recvLen).set(
+        bytes.subarray(0, recvLen),
+      );
       if (result.fromPath || result.fromAbstract) {
         const senderName = result.fromAbstract ?? result.fromPath ?? "";
         const isAbs = result.fromAbstract != null ? 1 : 0;
@@ -2539,7 +2556,9 @@ export function createKernelImports(
     host_socket_listen_unix(sockfd: number, backlog: number): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -2;
-      if (target.family !== "AF_UNIX" && typeof target.boundPath !== "string") return -2;
+      if (target.family !== "AF_UNIX" && typeof target.boundPath !== "string") {
+        return -2;
+      }
       const registry = socketBackend?.registry;
       if (!registry) return -1;
       const path = target.boundPath!;
@@ -2551,7 +2570,9 @@ export function createKernelImports(
           if (!auth.ok) return -1;
           const rawHandle = registry.listenOnAbstract(abstractName, cap);
           target.listener = -rawHandle;
-          target.closeListener = () => { registry.closeAbstractListener(abstractName); };
+          target.closeListener = () => {
+            registry.closeAbstractListener(abstractName);
+          };
         } else {
           const auth = authorizeUnixListen(opts.serverSockets, path);
           if (!auth.ok) return -1;
@@ -2595,14 +2616,20 @@ export function createKernelImports(
         recvAsync: (socket, maxBytes) =>
           recvSocketAsync(socketBackend, socket, maxBytes),
         setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-        close: (socket) => { socketBackend.close(socket); },
+        close: (socket) => {
+          socketBackend.close(socket);
+        },
       });
     },
 
     // host_socket_send_unix(sockfd, buf_ptr, buf_len) -> bytes | -1 | -2
     // send() for AF_UNIX STREAM sockets, passing raw bytes without base64. Synchronous.
     // Returns byte count on success, -1 on error, -2 if sockfd is not AF_UNIX STREAM.
-    host_socket_send_unix(sockfd: number, bufPtr: number, bufLen: number): number {
+    host_socket_send_unix(
+      sockfd: number,
+      bufPtr: number,
+      bufLen: number,
+    ): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -2;
       if (target.family !== "AF_UNIX" || target.isDgram) return -2;
@@ -2634,12 +2661,14 @@ export function createKernelImports(
         const rawHandle = -(target.socket as number);
         const registry = socketBackend?.registry;
         if (!registry) return -1;
-        const nonblockingDgram = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+        const nonblockingDgram =
+          ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
         const dgramResult = nonblockingDgram
           ? registry.recvDgram(rawHandle, bufCap, true)
           : await registry.recvDgramAsync(rawHandle, bufCap);
         if (!dgramResult.ok) return -2;
-        const dgramBytes = (dgramResult as { ok: true; bytes: Uint8Array }).bytes;
+        const dgramBytes =
+          (dgramResult as { ok: true; bytes: Uint8Array }).bytes;
         const n = Math.min(dgramBytes.length, bufCap);
         new Uint8Array(memory.buffer, bufPtr, n).set(dgramBytes.subarray(0, n));
         return n;
@@ -2661,7 +2690,9 @@ export function createKernelImports(
       // Drain peekBuffer first (populated by a previous MSG_PEEK call).
       if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
         const chunk = target.peekBuffer.slice(0, bufCap);
-        if (!isPeek) target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+        if (!isPeek) {
+          target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+        }
         return writeResult(chunk);
       }
 
@@ -2867,7 +2898,9 @@ export function createKernelImports(
       try {
         if (!opts.kernel) return -1;
         const target = opts.kernel.getFdTarget(callerPid, sockfd);
-        if (!target || target.type !== "socket" || target.socket === null) return -1;
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return -1;
+        }
         const registry = socketBackend?.registry;
         if (!registry) return -1;
         const bytes = new Uint8Array(memory.buffer, dataPtr, dataLen).slice();
@@ -2875,11 +2908,19 @@ export function createKernelImports(
         if (fdsPtr !== 0 && fdsCount > 0) {
           const view = new DataView(memory.buffer);
           // Dup each ancillary fd so it survives the sender closing the original.
-          ancFds = Array.from({ length: fdsCount }, (_, i) =>
-            opts.kernel!.dup(callerPid, view.getInt32(fdsPtr + i * 4, true)));
+          ancFds = Array.from(
+            { length: fdsCount },
+            (_, i) =>
+              opts.kernel!.dup(callerPid, view.getInt32(fdsPtr + i * 4, true)),
+          );
         }
         const rawHandle = -(target.socket);
-        const result = registry.sendWithAnc(rawHandle, bytes, ancFds, callerPid);
+        const result = registry.sendWithAnc(
+          rawHandle,
+          bytes,
+          ancFds,
+          callerPid,
+        );
         return result.ok ? result.bytesSent : -1;
       } catch {
         return -1;
@@ -2902,7 +2943,9 @@ export function createKernelImports(
       try {
         if (!opts.kernel) return -1;
         const target = opts.kernel.getFdTarget(callerPid, sockfd);
-        if (!target || target.type !== "socket" || target.socket === null) return -1;
+        if (!target || target.type !== "socket" || target.socket === null) {
+          return -1;
+        }
         const registry = socketBackend?.registry;
         if (!registry) return -1;
         const rawHandle = -(target.socket);
@@ -2920,10 +2963,16 @@ export function createKernelImports(
         let nFds = 0;
         if (anc) {
           const senderPid = anc.senderPid;
-          const toReceive = fdsPtr !== 0 && fdsCap > 0 ? anc.fds.slice(0, fdsCap) : [];
+          const toReceive = fdsPtr !== 0 && fdsCap > 0
+            ? anc.fds.slice(0, fdsCap)
+            : [];
           for (const dupFd of toReceive) {
             try {
-              const newFd = opts.kernel.dupFromProcess(callerPid, senderPid, dupFd);
+              const newFd = opts.kernel.dupFromProcess(
+                callerPid,
+                senderPid,
+                dupFd,
+              );
               view.setInt32(fdsPtr + nFds * 4, newFd, true);
               nFds++;
             } finally {
@@ -2995,7 +3044,9 @@ export function createKernelImports(
             recvAsync: (socket, maxBytes) =>
               recvSocketAsync(socketBackend!, socket, maxBytes),
             setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
-            close: (_socket) => { registry.closeDgramSocket(rawHandle); },
+            close: (_socket) => {
+              registry.closeDgramSocket(rawHandle);
+            },
           });
           fdA = opts.kernel.allocFd(callerPid, makeDgramTarget(a));
           fdB = opts.kernel.allocFd(callerPid, makeDgramTarget(b));
@@ -3014,7 +3065,9 @@ export function createKernelImports(
             recvAsync: (socket, maxBytes) =>
               recvSocketAsync(socketBackend!, socket, maxBytes),
             setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
-            close: (socket) => { socketBackend!.close(socket); },
+            close: (socket) => {
+              socketBackend!.close(socket);
+            },
           });
           fdA = opts.kernel.allocFd(callerPid, makeTarget(a));
           fdB = opts.kernel.allocFd(callerPid, makeTarget(b));
