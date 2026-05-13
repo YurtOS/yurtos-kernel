@@ -944,10 +944,14 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
 
 /* ── SO_PEERCRED getsockopt ─────────────────────────────────────────────── */
 static int yurt_getsockopt_peercred(int sockfd, void *optval, socklen_t *optlen) {
-  struct ucred cred;
+  struct yurt_ucred {
+    pid_t pid;
+    uid_t uid;
+    gid_t gid;
+  } cred;
   int pid = 0, uid = 0, gid = 0;
 
-  if (!optval || !optlen || *optlen < (socklen_t)sizeof(struct ucred)) {
+  if (!optval || !optlen || *optlen < (socklen_t)sizeof(cred)) {
     errno = EINVAL;
     return -1;
   }
