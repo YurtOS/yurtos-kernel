@@ -78,3 +78,25 @@ Deno.test("worker SAB backend preserves self across overlapping async thread sco
   assertEquals(await first, 7);
   assertEquals(backend.self(), 0);
 });
+
+Deno.test("worker SAB backend mutex operations use shared linear memory cells", async () => {
+  const memory = new WebAssembly.Memory({
+    initial: 1,
+    maximum: 1,
+    shared: true,
+  });
+  const backend = new WorkerSabThreadsBackend({
+    memory,
+    spawnThread: () => Promise.resolve(0),
+  });
+  const mutexPtr = 64;
+  const cells = new Int32Array(memory.buffer, mutexPtr, 1);
+
+  assertEquals(
+    await backend.runAsThread(7, () => backend.mutexLock(mutexPtr)),
+    0,
+  );
+  assertEquals(Atomics.load(cells, 0), 7);
+  assertEquals(backend.runAsThread(7, () => backend.mutexUnlock(mutexPtr)), 0);
+  assertEquals(Atomics.load(cells, 0), 0);
+});

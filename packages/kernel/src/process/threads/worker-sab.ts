@@ -1,6 +1,7 @@
 import { WASI_EBUSY } from "../../wasi/types.js";
 import type { ThreadsBackend } from "./backend.js";
 import type { IndirectCallTable } from "./indirect-call-table.js";
+import { SabCondvar, SabMutex } from "./sab-primitives.ts";
 import { ThreadIdScope } from "./thread-id-scope.js";
 
 export interface WorkerSabThreadStart {
@@ -10,6 +11,7 @@ export interface WorkerSabThreadStart {
 }
 
 export interface WorkerSabThreadsBackendOptions {
+  memory?: WebAssembly.Memory;
   spawnThread(start: WorkerSabThreadStart): Promise<number>;
 }
 
@@ -130,6 +132,12 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
 
   async mutexLock(mutexPtr: number): Promise<number> {
     const tid = this.self();
+    const mutex = this.sabMutex(mutexPtr);
+    if (mutex) {
+      if (mutex.owner() === tid) return -1;
+      mutex.lock(tid);
+      return 0;
+    }
     const state = this.mutexState(mutexPtr);
     while (true) {
       if (state.owner === null) {
@@ -147,6 +155,16 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
   }
 
   mutexUnlock(mutexPtr: number): number {
+    const tid = this.self();
+    const mutex = this.sabMutex(mutexPtr);
+    if (mutex) {
+      try {
+        mutex.unlock(tid);
+        return 0;
+      } catch {
+        return -1;
+      }
+    }
     const state = this.mutexes.get(mutexPtr);
     if (!state || state.owner === null) return -1;
     state.owner = null;
@@ -155,6 +173,8 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
   }
 
   mutexTryLock(mutexPtr: number): number {
+    const mutex = this.sabMutex(mutexPtr);
+    if (mutex) return mutex.tryLock(this.self()) ? 0 : WASI_EBUSY;
     const state = this.mutexState(mutexPtr);
     if (state.owner !== null) return WASI_EBUSY;
     state.owner = this.self();
@@ -162,6 +182,16 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
   }
 
   async condWait(condPtr: number, mutexPtr: number): Promise<number> {
+    const condvar = this.sabCondvar(condPtr);
+    const mutex = this.sabMutex(mutexPtr);
+    if (condvar && mutex) {
+      try {
+        condvar.wait(mutex, this.self());
+        return 0;
+      } catch {
+        return -1;
+      }
+    }
     const state = this.condvarState(condPtr);
     const tid = this.self();
     const wait = new Promise<void>((resolve) =>
@@ -177,11 +207,21 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
   }
 
   condSignal(condPtr: number): number {
+    const condvar = this.sabCondvar(condPtr);
+    if (condvar) {
+      condvar.signal();
+      return 0;
+    }
     this.wake(this.condvars.get(condPtr)?.waiters.shift());
     return 0;
   }
 
   condBroadcast(condPtr: number): number {
+    const condvar = this.sabCondvar(condPtr);
+    if (condvar) {
+      condvar.broadcast();
+      return 0;
+    }
     const state = this.condvars.get(condPtr);
     if (state) {
       const waiters = state.waiters.splice(0);
@@ -211,5 +251,22 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
   private wake(waiter: Waiter | undefined): void {
     if (!waiter) return;
     this.tids.run(waiter.tid, waiter.wake);
+  }
+
+  private sharedBuffer(): SharedArrayBuffer | null {
+    const buffer = this.options.memory?.buffer;
+    return buffer instanceof SharedArrayBuffer ? buffer : null;
+  }
+
+  private sabMutex(ptr: number): SabMutex | null {
+    const buffer = this.sharedBuffer();
+    if (!buffer) return null;
+    return new SabMutex(buffer, ptr);
+  }
+
+  private sabCondvar(ptr: number): SabCondvar | null {
+    const buffer = this.sharedBuffer();
+    if (!buffer) return null;
+    return new SabCondvar(buffer, ptr);
   }
 }
