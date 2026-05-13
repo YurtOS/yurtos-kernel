@@ -11,7 +11,7 @@ import { resolve } from 'node:path';
 import { Sandbox } from '../sandbox.js';
 import { NodeAdapter } from '../platform/node-adapter.js';
 
-const WASM_DIR = resolve(import.meta.dirname, '../platform/__tests__/fixtures');
+const WASM_DIR = resolve(import.meta.dirname!, '../platform/__tests__/fixtures');
 
 describe('file (c-port)', { sanitizeResources: false, sanitizeOps: false }, () => {
   let sandbox: Sandbox;

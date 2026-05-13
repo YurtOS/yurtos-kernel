@@ -36,7 +36,6 @@ impl NativeAbiError {
 }
 
 const RECORD_VERSION_1: u16 = 1;
-const SPAWN_REQUEST_V1_MIN_SIZE: usize = 80;
 const SPAWN_REQUEST_V1_SIZE: usize = 88;
 const HEADER_SIZE_OFF: usize = 0;
 const HEADER_VERSION_OFF: usize = 4;
@@ -61,12 +60,12 @@ const ENV_PAIR_SIZE: usize = 16;
 const FD_MAP_PAIR_SIZE: usize = 8;
 
 pub fn decode_spawn_request(bytes: &[u8]) -> Result<NativeSpawnRequest, NativeAbiError> {
-    if bytes.len() < SPAWN_REQUEST_V1_MIN_SIZE {
+    if bytes.len() < SPAWN_REQUEST_V1_SIZE {
         return Err(NativeAbiError::Invalid);
     }
     let logical_size = read_u32(bytes, HEADER_SIZE_OFF)? as usize;
     let version = read_u16(bytes, HEADER_VERSION_OFF)?;
-    if version != RECORD_VERSION_1 || logical_size < SPAWN_REQUEST_V1_MIN_SIZE {
+    if version != RECORD_VERSION_1 || logical_size < SPAWN_REQUEST_V1_SIZE {
         return Err(NativeAbiError::Invalid);
     }
     if logical_size > bytes.len() {
@@ -93,15 +92,11 @@ pub fn decode_spawn_request(bytes: &[u8]) -> Result<NativeSpawnRequest, NativeAb
         read_u32(record, PASS_FDS_OFF)?,
         read_u32(record, PASS_FDS_COUNT_OFF)?,
     )?;
-    let fd_map = if logical_size >= SPAWN_REQUEST_V1_SIZE {
-        read_fd_map_vec(
-            record,
-            read_u32(record, FD_MAP_OFF)?,
-            read_u32(record, FD_MAP_COUNT_OFF)?,
-        )?
-    } else {
-        Vec::new()
-    };
+    let fd_map = read_fd_map_vec(
+        record,
+        read_u32(record, FD_MAP_OFF)?,
+        read_u32(record, FD_MAP_COUNT_OFF)?,
+    )?;
 
     Ok(NativeSpawnRequest {
         prog,

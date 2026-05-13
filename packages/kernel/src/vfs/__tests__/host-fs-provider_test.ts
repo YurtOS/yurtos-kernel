@@ -1,5 +1,6 @@
 import { describe, it, beforeAll, afterAll } from '@std/testing/bdd';
 import { expect } from '@std/expect';
+import { Buffer } from 'node:buffer';
 import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';

@@ -62,7 +62,9 @@ repos:
 
       - id: deno-test-fast
         name: deno test (fast tier)
-        entry: bash -c 'deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run "packages/**/*_test.ts"'
+        entry: >-
+          deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run
+          packages/**/*_test.ts
         language: system
         types_or: [ts, tsx, javascript]
         pass_filenames: false

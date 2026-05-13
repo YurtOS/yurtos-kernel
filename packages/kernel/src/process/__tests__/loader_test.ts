@@ -12,8 +12,9 @@ import {
 } from "../../wasi/fd-target.ts";
 import { WasiHost } from "../../wasi/wasi-host.ts";
 import { INIT_PID, ProcessKernel } from "../kernel.ts";
-import { loadProcess, type LoaderContext } from "../loader.ts";
+import { type LoaderContext, loadProcess } from "../loader.ts";
 import { Sandbox } from "../../sandbox.ts";
+import type { WasmModuleCache } from "../module-cache.ts";
 
 const WASM_DIR = resolve(
   import.meta.dirname!,
@@ -97,6 +98,155 @@ function throwingInstantiateAdapter(base: PlatformAdapter): PlatformAdapter {
   };
 }
 
+function encodeU32(value: number): number[] {
+  const out: number[] = [];
+  do {
+    let byte = value & 0x7f;
+    value >>>= 7;
+    if (value !== 0) byte |= 0x80;
+    out.push(byte);
+  } while (value !== 0);
+  return out;
+}
+
+function wasmBytes(value: string): number[] {
+  return [...new TextEncoder().encode(value)];
+}
+
+function wasmSection(id: number, payload: number[]): number[] {
+  return [id, ...encodeU32(payload.length), ...payload];
+}
+
+function customSection(name: string, payload: string): number[] {
+  const body = [
+    ...encodeU32(name.length),
+    ...wasmBytes(name),
+    ...wasmBytes(payload),
+  ];
+  return wasmSection(0, body);
+}
+
+function wasmVec(items: number[][]): number[] {
+  return [...encodeU32(items.length), ...items.flat()];
+}
+
+function makeModuleWithFeatures(features: string[]): WebAssembly.Module {
+  return new WebAssembly.Module(
+    new Uint8Array([
+      0x00,
+      0x61,
+      0x73,
+      0x6d,
+      0x01,
+      0x00,
+      0x00,
+      0x00,
+      ...customSection("yurt.features", JSON.stringify({ features })),
+    ]),
+  );
+}
+
+function makeThreadedSharedMemoryModule(): WebAssembly.Module {
+  const typeSection = wasmSection(1, wasmVec([[0x60, 0x00, 0x00]]));
+  const functionSection = wasmSection(3, wasmVec([[0x00]]));
+  const memorySection = wasmSection(5, wasmVec([[0x03, 0x01, 0x01]]));
+  const exportSection = wasmSection(
+    7,
+    wasmVec([
+      [
+        ...encodeU32("memory".length),
+        ...wasmBytes("memory"),
+        0x02,
+        0x00,
+      ],
+      [
+        ...encodeU32("_start".length),
+        ...wasmBytes("_start"),
+        0x00,
+        0x00,
+      ],
+    ]),
+  );
+  const codeSection = wasmSection(10, wasmVec([[0x02, 0x00, 0x0b]]));
+  return new WebAssembly.Module(
+    new Uint8Array([
+      0x00,
+      0x61,
+      0x73,
+      0x6d,
+      0x01,
+      0x00,
+      0x00,
+      0x00,
+      ...customSection(
+        "yurt.features",
+        JSON.stringify({ features: ["threads"] }),
+      ),
+      ...typeSection,
+      ...functionSection,
+      ...memorySection,
+      ...exportSection,
+      ...codeSection,
+    ]),
+  );
+}
+
+function makeThreadedImportedSharedMemoryModule(): WebAssembly.Module {
+  const typeSection = wasmSection(1, wasmVec([[0x60, 0x00, 0x00]]));
+  const importSection = wasmSection(
+    2,
+    wasmVec([[
+      ...encodeU32("env".length),
+      ...wasmBytes("env"),
+      ...encodeU32("memory".length),
+      ...wasmBytes("memory"),
+      0x02,
+      0x03,
+      0x01,
+      0x01,
+    ]]),
+  );
+  const functionSection = wasmSection(3, wasmVec([[0x00]]));
+  const exportSection = wasmSection(
+    7,
+    wasmVec([[
+      ...encodeU32("_start".length),
+      ...wasmBytes("_start"),
+      0x00,
+      0x00,
+    ]]),
+  );
+  const codeSection = wasmSection(10, wasmVec([[0x02, 0x00, 0x0b]]));
+  return new WebAssembly.Module(
+    new Uint8Array([
+      0x00,
+      0x61,
+      0x73,
+      0x6d,
+      0x01,
+      0x00,
+      0x00,
+      0x00,
+      ...customSection(
+        "yurt.features",
+        JSON.stringify({ features: ["threads"] }),
+      ),
+      ...typeSection,
+      ...importSection,
+      ...functionSection,
+      ...exportSection,
+      ...codeSection,
+    ]),
+  );
+}
+
+function fixedModuleCache(module: WebAssembly.Module): WasmModuleCache {
+  return {
+    getOrCompile: () => Promise.resolve(module),
+    stats: () => ({ modules: 1 }),
+  };
+}
+
 Deno.test("loadProcess instantiates a CLI wasm at a VFS path and returns a Process", async () => {
   const ctx = await makeLoaderContext();
   const proc = await loadProcess(ctx, {
@@ -129,6 +279,87 @@ Deno.test("loadProcess rolls back pid and fd state when instantiation fails", as
   assertEquals(ctx.kernel.getReservedProcessCount(), 0);
   assertEquals(ctx.kernel.canReserveProcessSlot(), true);
   assertEquals(ctx.kernel.getFdTarget(2, 0), null);
+});
+
+Deno.test("loadProcess rejects threaded modules when Worker/SAB is unavailable", async () => {
+  const ctx = await makeLoaderContext({
+    moduleCache: fixedModuleCache(makeModuleWithFeatures(["threads"])),
+  });
+
+  await assertRejects(
+    () =>
+      loadProcess(ctx, {
+        argv: ["/bin/true"],
+        mode: "cli",
+        workerSabAvailable: false,
+      }),
+    Error,
+    "module declares yurt.features threads but host lacks Worker/SAB threads support",
+  );
+
+  assertEquals(ctx.kernel.getReservedProcessCount(), 0);
+});
+
+Deno.test("loadProcess accepts threaded modules when Worker/SAB spawner is wired", async () => {
+  const ctx = await makeLoaderContext({
+    moduleCache: fixedModuleCache(makeThreadedSharedMemoryModule()),
+  });
+
+  const proc = await loadProcess(ctx, {
+    argv: ["/bin/true"],
+    mode: "cli",
+    workerSabAvailable: true,
+    workerSabThreads: {
+      spawnThread: () => Promise.resolve(0),
+    },
+  });
+
+  assertEquals(proc.exitCode, 0);
+  assertEquals(proc.memory?.buffer instanceof SharedArrayBuffer, true);
+  await proc.terminate();
+});
+
+Deno.test("loadProcess wires imported shared memory for threaded modules", async () => {
+  const memory = new WebAssembly.Memory({
+    initial: 1,
+    maximum: 1,
+    shared: true,
+  });
+  const ctx = await makeLoaderContext({
+    moduleCache: fixedModuleCache(makeThreadedImportedSharedMemoryModule()),
+  });
+
+  const proc = await loadProcess(ctx, {
+    argv: ["/bin/true"],
+    mode: "cli",
+    workerSabAvailable: true,
+    workerSabMemory: memory,
+    workerSabThreads: {
+      spawnThread: () => Promise.resolve(0),
+    },
+  });
+
+  assertEquals(proc.memory, memory);
+  await proc.terminate();
+});
+
+Deno.test("loadProcess rejects threaded modules until Worker/SAB backend is wired", async () => {
+  const ctx = await makeLoaderContext({
+    moduleCache: fixedModuleCache(makeModuleWithFeatures(["threads"])),
+  });
+
+  await assertRejects(
+    () =>
+      loadProcess(ctx, {
+        argv: ["/bin/true"],
+        mode: "cli",
+        workerSabAvailable: true,
+      }),
+    Error,
+    "module declares yurt.features threads but host lacks Worker/SAB threads support",
+  );
+
+  assertEquals(ctx.kernel.getReservedProcessCount(), 0);
 });
 
 Deno.test("loadProcess can preserve pre-registered child state when caller owns rollback", async () => {

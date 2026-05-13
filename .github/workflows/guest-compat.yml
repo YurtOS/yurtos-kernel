@@ -78,7 +78,15 @@ jobs:
           set -euxo pipefail
           cargo build --release --target wasm32-wasip1 -p yurt-shell-exec
           cp target/wasm32-wasip1/release/yurt-shell-exec.wasm \
-            packages/kernel/src/platform/__tests__/fixtures/bash.wasm
+            packages/kernel/src/platform/__tests__/fixtures/yurt-shell-exec.wasm
+          cp target/wasm32-wasip1/release/yurt-shell-exec.wasm \
+            packages/kernel/src/platform/__tests__/fixtures/yurt-shell-exec-asyncify.wasm
+          wasm-opt --asyncify -O2 \
+            --enable-bulk-memory \
+            --enable-sign-ext \
+            --enable-nontrapping-float-to-int \
+            packages/kernel/src/platform/__tests__/fixtures/yurt-shell-exec-asyncify.wasm \
+            -o packages/kernel/src/platform/__tests__/fixtures/yurt-shell-exec-asyncify.wasm
 
       - name: Build BusyBox fixture
         run: make -C test-fixtures/c-ports/busybox copy-fixtures
