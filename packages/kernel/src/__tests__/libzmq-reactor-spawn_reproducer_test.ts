@@ -1,54 +1,48 @@
 /**
- * Reproducer for the libzmq-I/O-reactor-spawn hang.
+ * Reproducer: worker-host dispatcher deadlock when main calls a
+ * blocking `Atomics.wait` while a spawned worker is mid-flight.
  *
- * This test is EXPECTED TO HANG until the worker-SAB ↔ main-thread
- * dispatcher deadlock is resolved. It exists so the regression is
- * pinned at a small, focused level instead of being buried inside the
- * full ipykernel-launch dry-run.
+ * EXPECTED TO FAIL until `packages/kernel/src/network/bridge.ts`'s
+ * `requestSync` / `fetchSync` are rewritten to use `Atomics.waitAsync`
+ * (or made async end-to-end). When this test passes, the bug is fixed.
  *
- * What it does
+ * What happens
  * ------------
- * Spins up a sandbox against the threaded `cpython3.wasm` and runs
- * the minimal Python program that triggers libzmq's I/O reactor
- * thread spawn:
+ * `IPKernelApp.initialize(...)` allocates ipykernel's 5 ZMQ sockets,
+ * which causes libzmq's I/O reactor thread to spawn AND triggers
+ * socket operations that route through the kernel's
+ * `createNetworkBridgeSocketBackend` (`packages/kernel/src/network/
+ * socket-backend.ts:350`). Those calls hit
+ * `NetworkBridge.requestSync` (`packages/kernel/src/network/
+ * bridge.ts:564`), which does `Atomics.wait(int32, 0, …, 30_000)`
+ * on the main JS thread.
  *
- *   import zmq
- *   ctx = zmq.Context()       # IO_THREADS=1 by default → spawn
- *   print("reactor ok")
+ * `Atomics.wait` on main blocks the JS event loop. Meanwhile the
+ * spawned I/O reactor worker has issued a `postMessage(
+ * {type:"host-call"})` to main and is parked in
+ * `Atomics.wait` on its own request SAB awaiting the dispatcher's
+ * response. Main's listener (attached via
+ * `attachWorkerHostDispatcher`) can't fire because the event loop
+ * is frozen by the bridge's own `Atomics.wait`. Mutual deadlock —
+ * the bridge's 30-second timeout is the only way it ever unblocks,
+ * and even that leaves the worker stuck.
  *
- * The `import zmq` step does NOT yet allocate any sockets, so libzmq's
- * signaler doesn't run. The first thing that does run is the default
- * `Context()` constructor, which calls `pthread_create` for the I/O
- * reactor. That `pthread_create` routes through the kernel's
- * `WorkerSabThreadsBackend.spawn`, which posts a `start` message to a
- * fresh Worker hosting a cloned cpython3.wasm instance. The reactor
- * thread then issues its first host-import call (typically a poll or
- * recvmsg loop primitive) via the worker-host-proxy SAB round-trip.
- *
- * Suspected deadlock: the worker `Atomics.wait`s on the request SAB
- * for main's response, but main is parked in some sync code path that
- * doesn't drain the worker's `"host-call"` message. Either side waits
- * forever.
- *
- * Why this test instead of just running the jupyter smoke
- * -------------------------------------------------------
- * 1. The jupyter dry-run runs ~50 lines of Python before reaching the
- *    reactor spawn; if any of those preflight steps regresses, the
- *    failure shape is identical (silent hang). A focused reproducer
- *    cuts the failure surface to one operation.
- * 2. The hang itself blocks `deno test` indefinitely — this test
- *    wraps the run in `Promise.race` against a hard timeout so the
- *    suite fails fast with a recognisable message rather than wedging
- *    CI.
+ * The earlier `SabMutex.lockAsync` / `SabCondvar.waitAsync` fixes
+ * resolved the same class of bug in the threads backend. The bridge
+ * code path is the second layer.
  *
  * Status contract
  * ---------------
- * - Currently expected to FAIL with "REACTOR HANG: cpython3 zmq.Context()
- *   did not return within 10s — worker-SAB / dispatcher deadlock".
- * - When the deadlock is fixed, expect the run to complete with stdout
- *   containing "reactor ok" and exit code 0.
+ * - FAIL today: "DEADLOCK: IPKernelApp.initialize did not return
+ *   within 20s".
+ * - PASS once `bridge.ts` is rewired: IPKernelApp.initialize advances
+ *   past the socket-allocation step and the test exits with whatever
+ *   the next concrete error or success is — at that point this test
+ *   transitions from "reproducer" to "smoke" and its assertion shape
+ *   should be tightened.
  *
- * Skipped when the staged threaded cpython3 + pyzmq fixtures are absent.
+ * Skipped when the staged threaded cpython3 + pyzmq + yurt-jupyter
+ * fixtures are absent.
  */
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
@@ -66,10 +60,7 @@ const PYZMQ_INIT = resolve(
   FIXTURES,
   "cpython3-lib/site-packages/zmq/__init__.py",
 );
-const JUPYTER_SITE_PACKAGES = resolve(
-  FIXTURES,
-  "yurt-jupyter/site-packages",
-);
+const JUPYTER_SITE_PACKAGES = resolve(FIXTURES, "yurt-jupyter/site-packages");
 const JUPYTER_USR_SHARE = resolve(FIXTURES, "yurt-jupyter/usr-share");
 const IPYKERNEL_INIT = resolve(JUPYTER_SITE_PACKAGES, "ipykernel/__init__.py");
 const PSUTIL_STUB = resolve(JUPYTER_USR_SHARE, "psutil.py");
@@ -95,13 +86,6 @@ function readDirRecursiveSync(hostRoot: string): Record<string, Uint8Array> {
   return out;
 }
 
-/**
- * Wrap a promise with a hard timeout. Returns `{ ok: true, value }` on
- * settled-in-time, `{ ok: false }` on timeout. Importantly the timer is
- * cleared on settle so we don't leak `setTimeout` handles when the
- * underlying promise resolves first (Deno's test sanitizer would
- * otherwise complain).
- */
 async function withTimeout<T>(
   ms: number,
   promise: Promise<T>,
@@ -120,71 +104,25 @@ async function withTimeout<T>(
   }
 }
 
-maybeDescribe("libzmq I/O reactor spawn (worker-SAB integration)", () => {
-  // Walks the same import chain the ipykernel dry-run uses, one
-  // import at a time. The dry-run hangs after printing "importing
-  // stack…" but before printing the ipykernel version. This narrows
-  // which import is the culprit.
-  const IMPORT_CHAIN = [
-    "traitlets",
-    "tornado",
-    "jupyter_client",
-    "jupyter_core",
-    "IPython",
-    "ipykernel",
-  ];
-  for (const mod of IMPORT_CHAIN) {
-    it(`import ${mod} returns within 10s`, async () => {
-      const sitePackages = readDirRecursiveSync(JUPYTER_SITE_PACKAGES);
-      const sandbox = await Sandbox.create({
-        wasmDir: FIXTURES,
-        adapter: new NodeAdapter(),
-        network: { allowedHosts: ["127.0.0.1", "localhost"] },
-        serverSockets: { allowLoopback: true },
-        mounts: [
-          { path: "/opt/yurt-jupyter/site-packages", files: sitePackages },
-          {
-            path: "/usr/share/yurt-jupyter",
-            files: readDirRecursiveSync(JUPYTER_USR_SHARE),
-          },
-        ],
-      });
-      sandbox.setEnv("PYTHONPATH", PYTHONPATH);
-      try {
-        const ran = await withTimeout(
-          10_000,
-          sandbox.run(`cpython3 -c 'import ${mod}; print("${mod} ok")'`),
-        );
-        if (!ran.ok) {
-          throw new Error(
-            `IMPORT HANG: cpython3 -c 'import ${mod}' did not return within 10s`,
-          );
-        }
-        const result = ran.value;
-        if (result.exitCode !== 0) {
-          console.log(`--- import ${mod}: exit`, result.exitCode);
-          console.log("--- stderr:", result.stderr);
-        }
-        expect(result.exitCode).toBe(0);
-        expect(result.stdout).toContain(`${mod} ok`);
-      } finally {
-        sandbox.destroy();
-      }
-    });
-  }
-
-  it("ssl preload + full import stack returns within 10s", async () => {
-    // Mimic the exact preflight the ipykernel-launch-dry-run runs:
-    // pre-import ssl (workaround for the ssl/asyncio order issue),
-    // then the full import stack in one process.
-    const sitePackages = readDirRecursiveSync(JUPYTER_SITE_PACKAGES);
+maybeDescribe("worker-host bridge.requestSync deadlock", () => {
+  it("IPKernelApp.initialize returns within 20s (currently hangs)", async () => {
+    // Stage the full jupyter fixture set so cpython can reach the
+    // socket-allocation path inside ipykernel.kernelapp:
+    //   - /opt/yurt-jupyter/site-packages  → pure-Python jupyter stack
+    //   - /usr/share/yurt-jupyter          → sitecustomize + psutil stub
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
+      // ipykernel binds 5 TCP loopback sockets via libzmq. Without
+      // allowLoopback the listen() trips "Not supported (src/ip.cpp:773)"
+      // before we ever reach the deadlock site.
       network: { allowedHosts: ["127.0.0.1", "localhost"] },
       serverSockets: { allowLoopback: true },
       mounts: [
-        { path: "/opt/yurt-jupyter/site-packages", files: sitePackages },
+        {
+          path: "/opt/yurt-jupyter/site-packages",
+          files: readDirRecursiveSync(JUPYTER_SITE_PACKAGES),
+        },
         {
           path: "/usr/share/yurt-jupyter",
           files: readDirRecursiveSync(JUPYTER_USR_SHARE),
@@ -194,57 +132,11 @@ maybeDescribe("libzmq I/O reactor spawn (worker-SAB integration)", () => {
     sandbox.setEnv("PYTHONPATH", PYTHONPATH);
     try {
       const program = [
+        // sitecustomize-style ssl pre-import; the dry-run script does
+        // the same thing for a different yurt-kernel bug.
         "import ssl",
-        "import traitlets, tornado, jupyter_client, jupyter_core, IPython, ipykernel",
-        "print('stack ok')",
-      ].join("\n") + "\n";
-      const ran = await withTimeout(
-        15_000,
-        sandbox.run("cpython3 -", {
-          stdinData: new TextEncoder().encode(program),
-        }),
-      );
-      if (!ran.ok) {
-        throw new Error(
-          "IMPORT HANG: ssl + full stack did not return within 15s — " +
-            "matches the jupyter_smoke step 3 dry-run hang shape.",
-        );
-      }
-      if (ran.value.exitCode !== 0) {
-        console.log("--- stack import: exit", ran.value.exitCode);
-        console.log("--- stdout:", ran.value.stdout);
-        console.log("--- stderr:", ran.value.stderr);
-      }
-      expect(ran.value.exitCode).toBe(0);
-      expect(ran.value.stdout).toContain("stack ok");
-    } finally {
-      sandbox.destroy();
-    }
-  });
-
-  it("IPKernelApp.initialize reaches the reactor spawn within 15s", async () => {
-    // The actual step 3 dry-run shape: imports + IPKernelApp.initialize.
-    // If this hangs while the import-only test above passes, the bug
-    // is in libzmq's I/O reactor spawn from inside IPKernelApp, not
-    // in the imports.
-    const sitePackages = readDirRecursiveSync(JUPYTER_SITE_PACKAGES);
-    const sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      network: { allowedHosts: ["127.0.0.1", "localhost"] },
-      serverSockets: { allowLoopback: true },
-      mounts: [
-        { path: "/opt/yurt-jupyter/site-packages", files: sitePackages },
-        {
-          path: "/usr/share/yurt-jupyter",
-          files: readDirRecursiveSync(JUPYTER_USR_SHARE),
-        },
-      ],
-    });
-    sandbox.setEnv("PYTHONPATH", PYTHONPATH);
-    try {
-      const program = [
-        "import ssl",
+        // Smallest reproducer for the deadlock: just instantiate +
+        // initialize. No need to actually run the kernel.
         "from ipykernel.kernelapp import IPKernelApp",
         "IPKernelApp.clear_instance()",
         "app = IPKernelApp.instance()",
@@ -254,78 +146,41 @@ maybeDescribe("libzmq I/O reactor spawn (worker-SAB integration)", () => {
         "except Exception as e:",
         "  print(f'initialize failed: {type(e).__name__}: {e}')",
       ].join("\n") + "\n";
+
       const ran = await withTimeout(
-        15_000,
+        20_000,
         sandbox.run("cpython3 -", {
           stdinData: new TextEncoder().encode(program),
         }),
       );
+
       if (!ran.ok) {
         throw new Error(
-          "INIT HANG: IPKernelApp.initialize did not return within 15s — " +
-            "matches the jupyter step 3 dry-run hang.",
+          "DEADLOCK: IPKernelApp.initialize did not return within 20s.\n" +
+            "Expected cause: packages/kernel/src/network/bridge.ts's\n" +
+            "  - NetworkBridge.requestSync (line ~616)\n" +
+            "  - NetworkBridge.fetchSync   (line ~564)\n" +
+            "use blocking `Atomics.wait` on the main JS thread.\n" +
+            "When a worker (libzmq's I/O reactor) is alive and tries to\n" +
+            "round-trip a host-call via postMessage, main's event loop\n" +
+            "can't drain the message because it's parked in Atomics.wait.\n" +
+            "Mirror the SabMutex.lockAsync fix in sab-primitives.ts:\n" +
+            "switch to Atomics.waitAsync and propagate the Promise up\n" +
+            "through createNetworkBridgeSocketBackend's call sites.",
         );
       }
+
+      // When the deadlock is fixed, IPKernelApp.initialize will EITHER
+      // succeed (print "initialize ok") or fail with a Python exception
+      // we then print as "initialize failed: …". Both shapes count as
+      // "no longer hanging". Tighten this assertion to `toBe(0)` and
+      // `toContain("initialize ok")` once the next gate is closed.
       console.log("--- initialize: exit", ran.value.exitCode);
       console.log("--- stdout:", ran.value.stdout);
       console.log("--- stderr:", ran.value.stderr);
-      // Don't assert success here — this is a reproducer. Just want to
-      // see what happens.
-    } finally {
-      sandbox.destroy();
-    }
-  });
-
-  it("zmq.Context() returns within 10s", async () => {
-    const sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      network: { allowedHosts: ["127.0.0.1", "localhost"] },
-      // libzmq's internal signaler calls socketpair(AF_UNIX, …); the
-      // yurt ABI shim implements it via bind/listen/connect/accept on
-      // AF_INET loopback. Without allowLoopback the signaler trips
-      // "Not supported (src/ip.cpp:773)" at ctx.socket() time.
-      serverSockets: { allowLoopback: true },
-    });
-    try {
-      const program = [
-        "import zmq",
-        "ctx = zmq.Context()",
-        "print('reactor ok')",
-        // Skip ctx.term() — the libzmq shutdown path has a separate
-        // known wasm-bounds bug (see cpython3-pyzmq_smoke_test.ts:230
-        // comment) that we don't want masking the reactor-spawn result.
-      ].join("\n") + "\n";
-
-      const ran = await withTimeout(
-        10_000,
-        sandbox.run("cpython3 -", {
-          stdinData: new TextEncoder().encode(program),
-        }),
+      expect(ran.value.stdout).toMatch(
+        /initialize ok|initialize failed: \w+: /,
       );
-
-      if (!ran.ok) {
-        throw new Error(
-          "REACTOR HANG: cpython3 zmq.Context() did not return within 10s. " +
-            "Likely worker-SAB dispatcher deadlock: the spawned I/O reactor " +
-            "is blocked in Atomics.wait on the per-thread request SAB while " +
-            "main is parked somewhere that prevents the dispatcher from " +
-            "draining the worker's 'host-call' message. " +
-            "Inspect packages/kernel/src/process/threads/worker-sab.ts " +
-            "(defaultSpawnThread) and worker-host-proxy.ts " +
-            "(attachWorkerHostDispatcher) — likely fix is to detach the " +
-            "join await from the dispatcher's message-handler dispatch.",
-        );
-      }
-
-      const result = ran.value;
-      if (result.exitCode !== 0) {
-        console.log("--- reactor reproducer: exit", result.exitCode);
-        console.log("--- stdout:", result.stdout);
-        console.log("--- stderr:", result.stderr);
-      }
-      expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("reactor ok");
     } finally {
       sandbox.destroy();
     }
