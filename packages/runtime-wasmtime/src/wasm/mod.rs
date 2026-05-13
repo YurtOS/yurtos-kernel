@@ -40,84 +40,6 @@ use spawn::{SpawnContext, SpawnRequest};
 
 use crate::vfs::{MemVfs, VfsError};
 
-fn encode_process_list_record(list: &[kernel::ProcessInfo]) -> Vec<u8> {
-    let header_size = 16usize;
-    let entry_size = 20usize;
-    let entries_offset = header_size;
-    let mut cursor = entries_offset + list.len() * entry_size;
-    let command_bytes = list
-        .iter()
-        .map(|proc| proc.command.as_bytes())
-        .collect::<Vec<_>>();
-    let size = cursor + command_bytes.iter().map(|bytes| bytes.len()).sum::<usize>();
-    let mut out = vec![0u8; size];
-    out[0..4].copy_from_slice(&(size as u32).to_le_bytes());
-    out[4..6].copy_from_slice(&1u16.to_le_bytes());
-    out[8..12].copy_from_slice(&(entries_offset as u32).to_le_bytes());
-    out[12..16].copy_from_slice(&(list.len() as u32).to_le_bytes());
-    for (idx, proc) in list.iter().enumerate() {
-        let at = entries_offset + idx * entry_size;
-        let command = command_bytes[idx];
-        out[at..at + 4].copy_from_slice(&proc.pid.to_le_bytes());
-        out[at + 4..at + 8].copy_from_slice(&proc.ppid.to_le_bytes());
-        let state = if proc.state == "running" { 1u32 } else { 2u32 };
-        out[at + 8..at + 12].copy_from_slice(&state.to_le_bytes());
-        out[at + 12..at + 16].copy_from_slice(&(cursor as u32).to_le_bytes());
-        out[at + 16..at + 20].copy_from_slice(&(command.len() as u32).to_le_bytes());
-        out[cursor..cursor + command.len()].copy_from_slice(command);
-        cursor += command.len();
-    }
-    out
-}
-
-fn encode_stat_record(s: &crate::vfs::StatResult) -> Vec<u8> {
-    let size = 32usize;
-    let mut out = vec![0u8; size];
-    let mut type_bits = 0u32;
-    if s.is_file {
-        type_bits |= 1;
-    }
-    if s.is_dir {
-        type_bits |= 2;
-    }
-    if s.is_symlink {
-        type_bits |= 4;
-    }
-    out[0..4].copy_from_slice(&(size as u32).to_le_bytes());
-    out[4..6].copy_from_slice(&1u16.to_le_bytes());
-    out[8..12].copy_from_slice(&type_bits.to_le_bytes());
-    out[12..16].copy_from_slice(&s.permissions.to_le_bytes());
-    out[16..24].copy_from_slice(&(s.size as u64).to_le_bytes());
-    out[24..32].copy_from_slice(&s.mtime.to_le_bytes());
-    out
-}
-
-fn encode_string_list_record(values: &[String]) -> Vec<u8> {
-    let header_size = 24usize;
-    let entry_size = 8usize;
-    let entries_offset = header_size;
-    let strings_offset = entries_offset + values.len() * entry_size;
-    let strings_len = values.iter().map(|value| value.len()).sum::<usize>();
-    let size = strings_offset + strings_len;
-    let mut out = vec![0u8; size];
-    out[0..4].copy_from_slice(&(size as u32).to_le_bytes());
-    out[4..6].copy_from_slice(&1u16.to_le_bytes());
-    out[8..12].copy_from_slice(&(values.len() as u32).to_le_bytes());
-    out[12..16].copy_from_slice(&(entries_offset as u32).to_le_bytes());
-    out[16..20].copy_from_slice(&(strings_offset as u32).to_le_bytes());
-    out[20..24].copy_from_slice(&(strings_len as u32).to_le_bytes());
-    let mut cursor = 0usize;
-    for (idx, value) in values.iter().enumerate() {
-        let at = entries_offset + idx * entry_size;
-        let bytes = value.as_bytes();
-        out[at..at + 4].copy_from_slice(&(cursor as u32).to_le_bytes());
-        out[at + 4..at + 8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
-        out[strings_offset + cursor..strings_offset + cursor + bytes.len()].copy_from_slice(bytes);
-        cursor += bytes.len();
-    }
-    out
-}
-
 // ── DrainablePipe ─────────────────────────────────────────────────────────────
 
 /// An output pipe whose contents can be atomically taken (drained).
@@ -389,6 +311,51 @@ fn write_out(caller: &mut Caller<'_, StoreData>, out_ptr: u32, out_cap: u32, dat
     data.len() as i32
 }
 
+fn filetype_for_vfs_stat(s: &crate::vfs::StatResult) -> u32 {
+    if s.is_dir {
+        3
+    } else if s.is_symlink {
+        7
+    } else {
+        4
+    }
+}
+
+fn encode_stat_record(size: u64, filetype: u32, mode: u32) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    out[0..8].copy_from_slice(&size.to_le_bytes());
+    out[8..12].copy_from_slice(&filetype.to_le_bytes());
+    out[12..16].copy_from_slice(&mode.to_le_bytes());
+    out
+}
+
+fn encode_string_list(entries: &[String]) -> Vec<u8> {
+    let total = entries.iter().map(|entry| 4 + entry.len()).sum::<usize>() + 4;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        out.extend_from_slice(&(entry.len() as u32).to_le_bytes());
+        out.extend_from_slice(entry.as_bytes());
+    }
+    out
+}
+
+fn encode_readdir_entries(entries: &[crate::vfs::DirEntry]) -> Vec<u8> {
+    let total = entries
+        .iter()
+        .map(|entry| 4 + 1 + entry.name.len())
+        .sum::<usize>()
+        + 4;
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        out.extend_from_slice(&(entry.name.len() as u32).to_le_bytes());
+        out.push(if entry.is_dir { 3 } else { 4 });
+        out.extend_from_slice(entry.name.as_bytes());
+    }
+    out
+}
+
 // ── VfsError → return code ────────────────────────────────────────────────────
 
 /// Map a VFS error to the return-code convention used by Yurt host functions.
@@ -441,8 +408,9 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
             let path = read_str(&mut c, path_ptr, path_len);
             match c.data().vfs.stat(&path) {
                 Ok(s) => {
-                    let record = encode_stat_record(&s);
-                    write_out(&mut c, out_ptr, out_cap, &record)
+                    let out =
+                        encode_stat_record(s.size as u64, filetype_for_vfs_stat(&s), s.permissions);
+                    write_out(&mut c, out_ptr, out_cap, &out)
                 }
                 Err(e) => vfs_rc(&e),
             }
@@ -504,9 +472,8 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
             let path = read_str(&mut c, path_ptr, path_len);
             match c.data().vfs.readdir(&path) {
                 Ok(entries) => {
-                    let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
-                    let record = encode_string_list_record(&names);
-                    write_out(&mut c, out_ptr, out_cap, &record)
+                    let out = encode_readdir_entries(&entries);
+                    write_out(&mut c, out_ptr, out_cap, &out)
                 }
                 Err(e) => vfs_rc(&e),
             }
@@ -575,8 +542,8 @@ fn add_fs_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
          -> i32 {
             let pattern = read_str(&mut c, pat_ptr, pat_len);
             let paths = c.data().vfs.glob_paths(&pattern);
-            let record = encode_string_list_record(&paths);
-            write_out(&mut c, out_ptr, out_cap, &record)
+            let out = encode_string_list(&paths);
+            write_out(&mut c, out_ptr, out_cap, &out)
         },
     )?;
 
@@ -824,11 +791,7 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                 &req,
                 parent_nice,
             );
-            let command = req.to_shell_cmd();
-            let pid = c
-                .data_mut()
-                .kernel
-                .add_process_with_metadata(rx, 1, command);
+            let pid = c.data_mut().kernel.add_process(rx);
             write_out(&mut c, out_ptr, out_cap, &pid.to_le_bytes())
         },
     )?;
@@ -838,28 +801,10 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         "yurt",
         "host_spawn_async",
         |mut c: Caller<'_, StoreData>, req_ptr: u32, req_len: u32| -> i32 {
-            let req_bytes = read_mem(&mut c, req_ptr, req_len);
-            let native_req = match decode_spawn_request(&req_bytes) {
-                Ok(req) => req,
-                Err(e) => return e.errno(),
-            };
-            if !native_req.fd_map.is_empty() {
-                return -38;
-            }
-            let req = SpawnRequest {
-                prog: native_req.prog,
-                args: native_req.args,
-                env: native_req
-                    .env
-                    .into_iter()
-                    .map(|(key, value)| [key, value])
-                    .collect(),
-                cwd: native_req.cwd.unwrap_or_else(|| "/home/user".to_owned()),
-                stdin_fd: native_req.stdin_fd,
-                stdout_fd: native_req.stdout_fd,
-                stderr_fd: native_req.stderr_fd,
-                stdin_data: native_req.stdin_data.unwrap_or_default(),
-                nice: native_req.nice.clamp(0, 19) as u8,
+            let req_str = read_str(&mut c, req_ptr, req_len);
+            let req: SpawnRequest = match serde_json::from_str(&req_str) {
+                Ok(r) => r,
+                Err(_) => return -3,
             };
 
             let spawn_ctx = match c.data().spawn_ctx.clone() {
@@ -911,10 +856,7 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
             );
 
             // Register the child in the kernel's process table.
-            let command = req.to_shell_cmd();
-            c.data_mut()
-                .kernel
-                .add_process_with_metadata(rx, 1, command)
+            c.data_mut().kernel.add_process(rx)
         },
     )?;
 
@@ -978,16 +920,6 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         Box::new(async move { tokio::task::yield_now().await })
     })?;
 
-    // host_list_processes(out_ptr, out_cap) -> i32
-    linker.func_wrap(
-        "yurt",
-        "host_list_processes",
-        |mut c: Caller<'_, StoreData>, out_ptr: u32, out_cap: u32| -> i32 {
-            let out = encode_process_list_record(&c.data().kernel.list());
-            write_out(&mut c, out_ptr, out_cap, &out)
-        },
-    )?;
-
     // host_register_tool(name_ptr, name_len, path_ptr, path_len) -> i32
     // Registers a host-supplied tool name without adding kernel-only flags to VFS metadata.
     linker.func_wrap(
@@ -1029,48 +961,18 @@ fn add_network_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     // Socket stubs (Phase 5+)
     linker.func_wrap(
         "yurt",
-        "host_socket_open",
-        |_: Caller<'_, StoreData>, _: i32, _: i32, _: i32| -> i32 { -3 },
-    )?;
-    linker.func_wrap(
-        "yurt",
         "host_socket_connect",
-        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
-    )?;
-    linker.func_wrap(
-        "yurt",
-        "host_socket_bind",
-        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
-    )?;
-    linker.func_wrap(
-        "yurt",
-        "host_socket_listen",
-        |_: Caller<'_, StoreData>, _: i32, _: i32| -> i32 { -3 },
-    )?;
-    linker.func_wrap(
-        "yurt",
-        "host_socket_accept",
-        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32| -> i32 { -3 },
-    )?;
-    linker.func_wrap(
-        "yurt",
-        "host_socket_addr",
-        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
+        |_: Caller<'_, StoreData>, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
     )?;
     linker.func_wrap(
         "yurt",
         "host_socket_send",
-        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
+        |_: Caller<'_, StoreData>, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
     )?;
     linker.func_wrap(
         "yurt",
         "host_socket_recv",
-        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
-    )?;
-    linker.func_wrap(
-        "yurt",
-        "host_socket_option",
-        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: i32| -> i32 { -3 },
+        |_: Caller<'_, StoreData>, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
     )?;
     linker.func_wrap(
         "yurt",
@@ -1080,7 +982,7 @@ fn add_network_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     linker.func_wrap(
         "yurt",
         "host_socket_close",
-        |_: Caller<'_, StoreData>, _: i32| -> i32 { 0 },
+        |_: Caller<'_, StoreData>, _: u32, _: u32| -> i32 { 0 },
     )?;
 
     Ok(())
@@ -1118,38 +1020,4 @@ fn add_misc_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     })?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::kernel::ProcessInfo;
-    use super::*;
-
-    #[test]
-    fn process_list_record_includes_command_spans() {
-        let procs = vec![ProcessInfo {
-            pid: 42,
-            ppid: 7,
-            state: "running",
-            exit_code: None,
-            command: "python -m app".to_owned(),
-        }];
-
-        let record = encode_process_list_record(&procs);
-
-        assert_eq!(
-            u32::from_le_bytes(record[0..4].try_into().unwrap()) as usize,
-            record.len()
-        );
-        assert_eq!(u32::from_le_bytes(record[12..16].try_into().unwrap()), 1);
-        assert_eq!(i32::from_le_bytes(record[16..20].try_into().unwrap()), 42);
-        assert_eq!(i32::from_le_bytes(record[20..24].try_into().unwrap()), 7);
-        assert_eq!(u32::from_le_bytes(record[24..28].try_into().unwrap()), 1);
-        let command_offset = u32::from_le_bytes(record[28..32].try_into().unwrap()) as usize;
-        let command_len = u32::from_le_bytes(record[32..36].try_into().unwrap()) as usize;
-        assert_eq!(
-            std::str::from_utf8(&record[command_offset..command_offset + command_len]).unwrap(),
-            "python -m app"
-        );
-    }
 }

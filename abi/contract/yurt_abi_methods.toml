@@ -358,6 +358,41 @@ id = 0x1_003B
 kind = "syscall"
 doc = "Return the bound address of `handle`. Request: u32 handle LE. Response: u16 port LE + addr bytes (UTF-8 'host'). Returns bytes-written or -EBADF. Used after listen() with port=0 to discover which concrete port the host actually bound."
 
+[method.sys_realpath]
+id = 0x1_003C
+kind = "syscall"
+doc = "Canonicalize a path in the kernel-owned VFS. Request bytes are an absolute path or a caller-cwd-relative path. Response is the canonical absolute path plus a trailing NUL byte. Returns required bytes-written on success, required size when out_cap is too small, -ENOENT if the target does not exist, -ENOTDIR for non-directory path components, or -EINVAL for malformed paths or symlink loops."
+
+[method.sys_getpriority]
+id = 0x1_003D
+kind = "syscall"
+doc = "POSIX getpriority(PRIO_PROCESS, who). Request bytes: u32 which + u32 who, where who=0 means the caller. Returns the kernel-owned nice value or -EINVAL/-ESRCH."
+
+[method.sys_setpriority]
+id = 0x1_003E
+kind = "syscall"
+doc = "POSIX setpriority(PRIO_PROCESS, who, prio). Request bytes: u32 which + u32 who + i32 prio. Kernel clamps prio to [-20, 19]. Non-root callers may only increase their numeric nice value; lowering nice requires root credentials. Returns 0 or -EINVAL/-ESRCH/-EPERM."
+
+[method.sys_sched_getscheduler]
+id = 0x1_003F
+kind = "syscall"
+doc = "POSIX sched_getscheduler(pid). Request bytes: u32 pid where 0 means the caller. Returns the kernel-owned scheduler policy, or -ESRCH for a missing target."
+
+[method.sys_sched_getparam]
+id = 0x1_0040
+kind = "syscall"
+doc = "POSIX sched_getparam(pid). Request bytes: u32 pid where 0 means the caller. Returns the kernel-owned sched_priority, or -ESRCH for a missing target."
+
+[method.sys_sched_setscheduler]
+id = 0x1_0041
+kind = "syscall"
+doc = "POSIX sched_setscheduler(pid, policy, priority). Request bytes: u32 pid + i32 policy + i32 priority. Only SCHED_OTHER policy 0 with priority 0 is accepted for unprivileged kernel scheduling; realtime policies are rejected with -EPERM. Returns 0 or -EINVAL/-ESRCH/-EPERM."
+
+[method.sys_sched_setparam]
+id = 0x1_0042
+kind = "syscall"
+doc = "POSIX sched_setparam(pid, priority). Request bytes: u32 pid + i32 priority. For SCHED_OTHER the only valid priority is 0. Returns 0 or -EINVAL/-ESRCH/-EPERM."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"
@@ -392,3 +427,13 @@ doc = "POSIX-shaped spawn(path, argv) — the userland-facing fork+exec. Request
 id = 16
 kind = "internal"
 doc = "Microkernel-only: serialize a kernel-owned process table snapshot. Response: u32 count + entries. Each entry is u32 pid, u32 ppid, u32 pgid, u32 sid, u8 state (1 running, 2 exited/zombie), i32 exit_status (-1 when running), u32 command_len, command bytes, u32 fd_count, and fd_count u32 fd numbers. Returns bytes-written or required size when the output buffer is too small."
+
+[method.kernel_list_threads]
+id = 17
+kind = "internal"
+doc = "Microkernel-only: serialize a kernel-owned thread snapshot for one process. Request: u32 pid. Response: u32 count + entries. Each entry is u32 tid, u8 state (1 runnable, 2 blocked, 3 exited), u8 detached, u16 reserved, i32 exit_value (-1 when not exited), and i32 host_thread_handle (-1 when none). Returns bytes-written or required size when the output buffer is too small."
+
+[method.kernel_schedule_next]
+id = 18
+kind = "internal"
+doc = "Microkernel-only: ask the kernel scheduler for the next runnable thread. Response: u32 pid, u32 tid, i32 host_thread_handle (-1 when none), u32 flags, u64 budget_ns. Returns bytes-written, -EAGAIN when no runnable thread exists, or required size when the output buffer is too small."

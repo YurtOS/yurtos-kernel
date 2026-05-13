@@ -183,6 +183,13 @@ export const METHOD = {
   SYS_SOCKET_LISTEN: 0x1_0039,
   SYS_SOCKET_ACCEPT: 0x1_003A,
   SYS_SOCKET_ADDR: 0x1_003B,
+  SYS_REALPATH: 0x1_003C,
+  SYS_GETPRIORITY: 0x1_003D,
+  SYS_SETPRIORITY: 0x1_003E,
+  SYS_SCHED_GETSCHEDULER: 0x1_003F,
+  SYS_SCHED_GETPARAM: 0x1_0040,
+  SYS_SCHED_SETSCHEDULER: 0x1_0041,
+  SYS_SCHED_SETPARAM: 0x1_0042,
 } as const;
 
 export const KERNEL_PID = 0;
@@ -198,9 +205,25 @@ export interface ProcessSnapshot {
   fds: number[];
 }
 
+export interface ThreadSnapshot {
+  tid: number;
+  state: "runnable" | "blocked" | "exited";
+  detached: boolean;
+  exitValue: number;
+  hostThreadHandle: number;
+}
+
 export interface WaitResult {
   pid: number;
   status: number;
+}
+
+export interface ScheduleDecision {
+  pid: number;
+  tid: number;
+  hostThreadHandle: number;
+  flags: number;
+  budgetNs: bigint;
 }
 
 export interface PendingSpawn {
@@ -418,6 +441,102 @@ const EINVAL = 22;
 const E2BIG = 7;
 const EIO = 5;
 const ENOSYS = 38;
+
+const USER_YURT_STUB_IMPORTS = [
+  "host_chown",
+  "host_chmod",
+  "host_clock_gettime",
+  "host_close_fd",
+  "host_cond_broadcast",
+  "host_cond_signal",
+  "host_cond_wait",
+  "host_dns_resolve",
+  "host_dup",
+  "host_dup2",
+  "host_dup_min",
+  "host_fchdir",
+  "host_fchown",
+  "host_file_lock",
+  "host_fork",
+  "host_getegid",
+  "host_geteuid",
+  "host_getgid",
+  "host_get_local_addr",
+  "host_getpid",
+  "host_getpgid",
+  "host_getppid",
+  "host_getpriority",
+  "host_getrlimit",
+  "host_getsid",
+  "host_getuid",
+  "host_glob",
+  "host_has_tool",
+  "host_idb_delete",
+  "host_idb_get",
+  "host_idb_list",
+  "host_idb_put",
+  "host_isatty",
+  "host_kill",
+  "host_killpg",
+  "host_longjmp",
+  "host_mark_exec_child",
+  "host_mkdir",
+  "host_mutex_lock",
+  "host_mutex_unlock",
+  "host_nanosleep",
+  "host_network_fetch",
+  "host_pipe",
+  "host_read_command",
+  "host_read_fd",
+  "host_read_file",
+  "host_readdir",
+  "host_readlink",
+  "host_register_tool",
+  "host_remove",
+  "host_rename",
+  "host_sched_getaffinity",
+  "host_sched_getparam",
+  "host_sched_getscheduler",
+  "host_sched_setaffinity",
+  "host_sched_setparam",
+  "host_sched_setscheduler",
+  "host_set_fd_descriptor_flags",
+  "host_setpgid",
+  "host_setpriority",
+  "host_setresgid",
+  "host_setresuid",
+  "host_setrlimit",
+  "host_setsid",
+  "host_setjmp",
+  "host_socket_accept",
+  "host_socket_addr",
+  "host_socket_close",
+  "host_socket_connect",
+  "host_socket_listen",
+  "host_socket_recv",
+  "host_socket_send",
+  "host_socket_set_no_delay",
+  "host_spawn",
+  "host_symlink",
+  "host_tcgetattr",
+  "host_tcgetpgrp",
+  "host_tcsetattr",
+  "host_tcsetpgrp",
+  "host_thread_detach",
+  "host_thread_exit",
+  "host_thread_join",
+  "host_thread_self",
+  "host_thread_spawn",
+  "host_tiocsctty",
+  "host_umask",
+  "host_wait",
+  "host_winsize",
+  "host_write_command",
+  "host_write_fd",
+  "host_write_file",
+  "host_write_result",
+  "host_yield",
+];
 
 class EmptyExtensionRegistry implements ExtensionRegistry {
   invoke(): number {
@@ -745,6 +864,55 @@ function decodeProcessList(bytes: Uint8Array): ProcessSnapshot[] {
   return entries;
 }
 
+function decodeThreadList(bytes: Uint8Array): ThreadSnapshot[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (bytes.byteLength < 4) throw new Error("short thread list");
+  const count = view.getUint32(0, true);
+  const entries: ThreadSnapshot[] = [];
+  let offset = 4;
+  for (let i = 0; i < count; i++) {
+    if (bytes.byteLength < offset + 16) {
+      throw new Error("truncated thread list entry");
+    }
+    const tid = view.getUint32(offset, true);
+    offset += 4;
+    const stateByte = bytes[offset++];
+    const detached = bytes[offset++] !== 0;
+    offset += 2; // reserved
+    const exitValue = view.getInt32(offset, true);
+    offset += 4;
+    const hostThreadHandle = view.getInt32(offset, true);
+    offset += 4;
+    entries.push({
+      tid,
+      state: stateByte === 3
+        ? "exited"
+        : stateByte === 2
+        ? "blocked"
+        : "runnable",
+      detached,
+      exitValue,
+      hostThreadHandle,
+    });
+  }
+  if (offset !== bytes.byteLength) {
+    throw new Error("trailing thread list bytes");
+  }
+  return entries;
+}
+
+function decodeScheduleDecision(bytes: Uint8Array): ScheduleDecision {
+  if (bytes.byteLength !== 24) throw new Error("invalid schedule decision");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return {
+    pid: view.getUint32(0, true),
+    tid: view.getUint32(4, true),
+    hostThreadHandle: view.getInt32(8, true),
+    flags: view.getUint32(12, true),
+    budgetNs: view.getBigUint64(16, true),
+  };
+}
+
 function decodePendingSpawn(bytes: Uint8Array): PendingSpawn {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   if (bytes.byteLength < 12) throw new Error("short pending spawn");
@@ -1015,6 +1183,30 @@ export class KernelInstance {
     readonly kernelListProcesses:
       | ((outPtr: number, outCap: number) => bigint)
       | null = null,
+    readonly kernelListThreads:
+      | ((pid: number, outPtr: number, outCap: number) => bigint)
+      | null = null,
+    readonly kernelSnapshot:
+      | ((outPtr: number, outCap: number) => bigint)
+      | null = null,
+    readonly kernelScheduleNext:
+      | ((outPtr: number, outCap: number) => bigint)
+      | null = null,
+    readonly kernelSpawnThread:
+      | ((pid: number, hostThreadHandle: number) => bigint)
+      | null = null,
+    readonly kernelDetachThread:
+      | ((pid: number, tid: number) => bigint)
+      | null = null,
+    readonly kernelRecordThreadExit:
+      | ((pid: number, tid: number, exitValue: number) => bigint)
+      | null = null,
+    readonly kernelBlockThread:
+      | ((pid: number, tid: number) => bigint)
+      | null = null,
+    readonly kernelUnblockThread:
+      | ((pid: number, tid: number) => bigint)
+      | null = null,
     readonly kernelKill:
       | ((pid: number, signal: number) => bigint)
       | null = null,
@@ -1128,6 +1320,71 @@ export class KernelInstance {
     return { rc, response: this.collectResponse(outPtr, outCap) };
   }
 
+  listThreadsRaw(pid: number): { rc: bigint; response: Uint8Array } {
+    if (!this.kernelListThreads) {
+      throw new Error("kernel.wasm missing kernel_list_threads export");
+    }
+    const outPtr = this.scratchPtr;
+    const outCap = this.scratchLen;
+    const rc = this.kernelListThreads(pid, outPtr, outCap);
+    return { rc, response: this.collectResponse(outPtr, outCap) };
+  }
+
+  snapshotRaw(): { rc: bigint; response: Uint8Array } {
+    if (!this.kernelSnapshot) {
+      throw new Error("kernel.wasm missing kernel_snapshot export");
+    }
+    const outPtr = this.scratchPtr;
+    const outCap = this.scratchLen;
+    const rc = this.kernelSnapshot(outPtr, outCap);
+    return { rc, response: this.collectResponse(outPtr, outCap) };
+  }
+
+  scheduleNextRaw(): { rc: bigint; response: Uint8Array } {
+    if (!this.kernelScheduleNext) {
+      throw new Error("kernel.wasm missing kernel_schedule_next export");
+    }
+    const outPtr = this.scratchPtr;
+    const outCap = 24;
+    const rc = this.kernelScheduleNext(outPtr, outCap);
+    return { rc, response: this.collectResponse(outPtr, outCap) };
+  }
+
+  spawnThread(pid: number, hostThreadHandle: number): bigint {
+    if (!this.kernelSpawnThread) {
+      throw new Error("kernel.wasm missing kernel_spawn_thread export");
+    }
+    return this.kernelSpawnThread(pid, hostThreadHandle);
+  }
+
+  detachThread(pid: number, tid: number): bigint {
+    if (!this.kernelDetachThread) {
+      throw new Error("kernel.wasm missing kernel_detach_thread export");
+    }
+    return this.kernelDetachThread(pid, tid);
+  }
+
+  recordThreadExit(pid: number, tid: number, exitValue: number): bigint {
+    if (!this.kernelRecordThreadExit) {
+      throw new Error("kernel.wasm missing kernel_record_thread_exit export");
+    }
+    return this.kernelRecordThreadExit(pid, tid, exitValue);
+  }
+
+  blockThread(pid: number, tid: number): bigint {
+    if (!this.kernelBlockThread) {
+      throw new Error("kernel.wasm missing kernel_block_thread export");
+    }
+    return this.kernelBlockThread(pid, tid);
+  }
+
+  unblockThread(pid: number, tid: number): bigint {
+    if (!this.kernelUnblockThread) {
+      throw new Error("kernel.wasm missing kernel_unblock_thread export");
+    }
+    return this.kernelUnblockThread(pid, tid);
+  }
+
   killProcess(pid: number, signal: number): bigint {
     if (!this.kernelKill) {
       throw new Error("kernel.wasm missing kernel_kill export");
@@ -1191,6 +1448,124 @@ export class KernelInstance {
 
 function byteKey(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function buildUserYurtImports(
+  pid: number,
+  kernel: KernelInstance,
+  userMemoryRef: { memory?: WebAssembly.Memory },
+): Record<string, (...args: (number | bigint)[]) => number> {
+  const memoryBuffer = () => userMemoryRef.memory!.buffer;
+  const boundsOk = (ptr: number, len: number): boolean => {
+    const buf = memoryBuffer();
+    ptr = ptr >>> 0;
+    len = len >>> 0;
+    return ptr <= buf.byteLength && len <= buf.byteLength - ptr;
+  };
+  const copyIn = (ptr: number, len: number): Uint8Array | number => {
+    ptr = ptr >>> 0;
+    len = len >>> 0;
+    if (!boundsOk(ptr, len)) return -EFAULT;
+    return new Uint8Array(memoryBuffer(), ptr, len).slice();
+  };
+  const copyOut = (ptr: number, bytes: Uint8Array): number => {
+    ptr = ptr >>> 0;
+    if (!boundsOk(ptr, bytes.byteLength)) return -EFAULT;
+    new Uint8Array(memoryBuffer(), ptr, bytes.byteLength).set(bytes);
+    return 0;
+  };
+  const responseBytes = (
+    method: number,
+    request: Uint8Array,
+    outPtr: number,
+    outCap: number,
+  ): number => {
+    const cap = Math.min(outCap >>> 0, kernel.scratchLen - request.byteLength);
+    const { rc, response } = kernel.syscall(method, pid, request, cap);
+    const n = Number(rc);
+    if (n <= 0) return n;
+    const copied = copyOut(outPtr, response.subarray(0, Math.min(n, cap)));
+    return copied < 0 ? copied : n;
+  };
+  const imports: Record<string, (...args: (number | bigint)[]) => number> = {};
+  for (const name of USER_YURT_STUB_IMPORTS) {
+    imports[name] = () => -ENOSYS;
+  }
+  const scalar = (method: number) => () =>
+    Number(kernel.syscall(method, pid, new Uint8Array(0), 0).rc);
+  imports.host_getuid = scalar(METHOD.SYS_GETUID);
+  imports.host_geteuid = scalar(METHOD.SYS_GETEUID);
+  imports.host_getgid = scalar(METHOD.SYS_GETGID);
+  imports.host_getegid = scalar(METHOD.SYS_GETEGID);
+  imports.host_getpid = scalar(METHOD.SYS_GETPID);
+  imports.host_getppid = scalar(METHOD.SYS_GETPPID);
+  imports.host_getpriority = (which, who) => {
+    const req = new Uint8Array(8);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, Number(which) >>> 0, true);
+    view.setUint32(4, Number(who) >>> 0, true);
+    return Number(kernel.syscall(METHOD.SYS_GETPRIORITY, pid, req, 0).rc);
+  };
+  imports.host_setpriority = (which, who, nice) => {
+    const req = new Uint8Array(12);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, Number(which) >>> 0, true);
+    view.setUint32(4, Number(who) >>> 0, true);
+    view.setInt32(8, Number(nice) | 0, true);
+    return Number(kernel.syscall(METHOD.SYS_SETPRIORITY, pid, req, 0).rc);
+  };
+  imports.host_sched_getscheduler = (targetPid) => {
+    const req = new Uint8Array(4);
+    new DataView(req.buffer).setUint32(0, Number(targetPid) >>> 0, true);
+    return Number(
+      kernel.syscall(METHOD.SYS_SCHED_GETSCHEDULER, pid, req, 0).rc,
+    );
+  };
+  imports.host_sched_getparam = (targetPid) => {
+    const req = new Uint8Array(4);
+    new DataView(req.buffer).setUint32(0, Number(targetPid) >>> 0, true);
+    return Number(kernel.syscall(METHOD.SYS_SCHED_GETPARAM, pid, req, 0).rc);
+  };
+  imports.host_sched_setscheduler = (targetPid, policy, priority) => {
+    const req = new Uint8Array(12);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, Number(targetPid) >>> 0, true);
+    view.setInt32(4, Number(policy) | 0, true);
+    view.setInt32(8, Number(priority) | 0, true);
+    return Number(
+      kernel.syscall(METHOD.SYS_SCHED_SETSCHEDULER, pid, req, 0).rc,
+    );
+  };
+  imports.host_sched_setparam = (targetPid, priority) => {
+    const req = new Uint8Array(8);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, Number(targetPid) >>> 0, true);
+    view.setInt32(4, Number(priority) | 0, true);
+    return Number(kernel.syscall(METHOD.SYS_SCHED_SETPARAM, pid, req, 0).rc);
+  };
+  imports.host_chdir = (pathPtr, pathLen) => {
+    const path = copyIn(Number(pathPtr), Number(pathLen));
+    if (typeof path === "number") return path;
+    return Number(kernel.syscall(METHOD.SYS_CHDIR, pid, path, 0).rc);
+  };
+  imports.host_getcwd = (outPtr, outCap) =>
+    responseBytes(
+      METHOD.SYS_GETCWD,
+      new Uint8Array(0),
+      Number(outPtr),
+      Number(outCap),
+    );
+  imports.host_realpath = (pathPtr, pathLen, outPtr, outCap) => {
+    const path = copyIn(Number(pathPtr), Number(pathLen));
+    if (typeof path === "number") return path;
+    return responseBytes(
+      METHOD.SYS_REALPATH,
+      path,
+      Number(outPtr),
+      Number(outCap),
+    );
+  };
+  return imports;
 }
 
 interface CachedProcessInstance {
@@ -1262,9 +1637,15 @@ class CachedProcessEngine {
         context.argv,
         userMemoryRef,
       );
+      const yurtImports = buildUserYurtImports(
+        context.pid,
+        kernel,
+        userMemoryRef,
+      );
       instance = new WebAssembly.Instance(module, {
         env: { ...sysImports, sys_setrlimit },
         wasi_snapshot_preview1: wasiShim,
+        yurt: yurtImports,
       });
     } catch {
       return -EIO;
@@ -1340,7 +1721,7 @@ class CachedProcessEngine {
     return BigInt(len);
   }
 
-  resume(_handle: number, _result: bigint): bigint {
+  resume(_handle: number, _result: bigint, _budgetNs: bigint): bigint {
     return BigInt(-ENOSYS);
   }
 
@@ -1913,7 +2294,8 @@ export class Microkernel {
       kh_process_resume: (
         handle: number,
         result: bigint,
-      ): bigint => processEngine.resume(handle, result),
+        budgetNs: bigint,
+      ): bigint => processEngine.resume(handle, result, budgetNs),
     };
 
     // std-on-wasi panic-infra stubs for kernel.wasm itself.
@@ -2364,6 +2746,30 @@ export class Microkernel {
     const kernelListProcesses = instance.exports.kernel_list_processes as
       | ((outPtr: number, outCap: number) => bigint)
       | undefined;
+    const kernelListThreads = instance.exports.kernel_list_threads as
+      | ((pid: number, outPtr: number, outCap: number) => bigint)
+      | undefined;
+    const kernelSnapshot = instance.exports.kernel_snapshot as
+      | ((outPtr: number, outCap: number) => bigint)
+      | undefined;
+    const kernelScheduleNext = instance.exports.kernel_schedule_next as
+      | ((outPtr: number, outCap: number) => bigint)
+      | undefined;
+    const kernelSpawnThread = instance.exports.kernel_spawn_thread as
+      | ((pid: number, hostThreadHandle: number) => bigint)
+      | undefined;
+    const kernelDetachThread = instance.exports.kernel_detach_thread as
+      | ((pid: number, tid: number) => bigint)
+      | undefined;
+    const kernelRecordThreadExit = instance.exports.kernel_record_thread_exit as
+      | ((pid: number, tid: number, exitValue: number) => bigint)
+      | undefined;
+    const kernelBlockThread = instance.exports.kernel_block_thread as
+      | ((pid: number, tid: number) => bigint)
+      | undefined;
+    const kernelUnblockThread = instance.exports.kernel_unblock_thread as
+      | ((pid: number, tid: number) => bigint)
+      | undefined;
     const kernelKill = instance.exports.kernel_kill as
       | ((pid: number, signal: number) => bigint)
       | undefined;
@@ -2435,6 +2841,14 @@ export class Microkernel {
       dispatch,
       dispatchAsync,
       kernelListProcesses ?? null,
+      kernelListThreads ?? null,
+      kernelSnapshot ?? null,
+      kernelScheduleNext ?? null,
+      kernelSpawnThread ?? null,
+      kernelDetachThread ?? null,
+      kernelRecordThreadExit ?? null,
+      kernelBlockThread ?? null,
+      kernelUnblockThread ?? null,
       kernelKill ?? null,
       kernelWait ?? null,
       kernelSpawnProcess ?? null,
@@ -2479,6 +2893,15 @@ export class Microkernel {
     return this.kernel.syscall(methodId, callerPid, request, responseCap);
   }
 
+  kernelSyscallAsync(
+    methodId: number,
+    callerPid: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): Promise<{ rc: bigint; response: Uint8Array }> {
+    return this.kernel.syscallAsync(methodId, callerPid, request, responseCap);
+  }
+
   hostStateMut(): HostState {
     return this.hostState;
   }
@@ -2519,6 +2942,65 @@ export class Microkernel {
       throw new Error(`kernel_list_processes exceeded scratch capacity: ${n}`);
     }
     return decodeProcessList(response.subarray(0, n));
+  }
+
+  listThreads(pid: number): ThreadSnapshot[] {
+    const cap = this.kernel.scratchLen;
+    const { rc, response } = this.kernel.listThreadsRaw(pid);
+    const n = Number(rc);
+    if (n < 0) throw new Error(`kernel_list_threads failed: rc=${rc}`);
+    if (n > cap) {
+      throw new Error(`kernel_list_threads exceeded scratch capacity: ${n}`);
+    }
+    return decodeThreadList(response.subarray(0, n));
+  }
+
+  snapshotKernelState(): Uint8Array {
+    const cap = this.kernel.scratchLen;
+    const { rc, response } = this.kernel.snapshotRaw();
+    const n = Number(rc);
+    if (n < 0) throw new Error(`kernel_snapshot failed: rc=${rc}`);
+    if (n > cap) {
+      throw new Error(`kernel_snapshot exceeded scratch capacity: ${n}`);
+    }
+    return response.subarray(0, n);
+  }
+
+  scheduleNext(): ScheduleDecision | undefined {
+    const { rc, response } = this.kernel.scheduleNextRaw();
+    const n = Number(rc);
+    if (n === -11) return undefined;
+    if (n < 0) throw new Error(`kernel_schedule_next failed: rc=${rc}`);
+    if (n !== 24) throw new Error(`kernel_schedule_next malformed: rc=${rc}`);
+    return decodeScheduleDecision(response.subarray(0, n));
+  }
+
+  spawnThread(pid: number, hostThreadHandle = -1): number {
+    const tid = Number(this.kernel.spawnThread(pid, hostThreadHandle));
+    if (tid < 0) throw new Error(`kernel_spawn_thread failed: rc=${tid}`);
+    return tid;
+  }
+
+  detachThread(pid: number, tid: number): void {
+    const rc = Number(this.kernel.detachThread(pid, tid));
+    if (rc !== 0) throw new Error(`kernel_detach_thread failed: rc=${rc}`);
+  }
+
+  recordThreadExit(pid: number, tid: number, exitValue: number): void {
+    const rc = Number(this.kernel.recordThreadExit(pid, tid, exitValue));
+    if (rc !== 0) {
+      throw new Error(`kernel_record_thread_exit failed: rc=${rc}`);
+    }
+  }
+
+  blockThread(pid: number, tid: number): void {
+    const rc = Number(this.kernel.blockThread(pid, tid));
+    if (rc !== 0) throw new Error(`kernel_block_thread failed: rc=${rc}`);
+  }
+
+  unblockThread(pid: number, tid: number): void {
+    const rc = Number(this.kernel.unblockThread(pid, tid));
+    if (rc !== 0) throw new Error(`kernel_unblock_thread failed: rc=${rc}`);
   }
 
   waitProcess(callerPid: number, childPid = 0, flags = 0): WaitResult {

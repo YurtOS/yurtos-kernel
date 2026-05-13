@@ -145,6 +145,8 @@ export interface SandboxOptions {
    */
   wasmHostImports?: (
     memory: WebAssembly.Memory,
+    callerPid: number,
+    cwd: string,
   ) => Record<string, (...args: number[]) => Promise<number>>;
   /** Names of host_* imports covered by `wasmHostImports`. */
   wasmOverrideNames?: string[];
@@ -228,6 +230,8 @@ interface SandboxParts {
   runCommandHandler?: RunCommandHandler;
   wasmHostImports?: (
     memory: WebAssembly.Memory,
+    callerPid: number,
+    cwd: string,
   ) => Record<string, (...args: number[]) => Promise<number>>;
   wasmOverrideNames?: string[];
 }
@@ -277,6 +281,8 @@ export class Sandbox {
   private wasmHostImports:
     | ((
       memory: WebAssembly.Memory,
+      callerPid: number,
+      cwd: string,
     ) => Record<string, (...args: number[]) => Promise<number>>)
     | undefined;
   private wasmOverrideNames: string[] | undefined;
@@ -1123,6 +1129,8 @@ export class Sandbox {
      */
     wasmHostImports?: (
       memory: WebAssembly.Memory,
+      callerPid: number,
+      cwd: string,
     ) => Record<string, (...args: number[]) => Promise<number>>;
     wasmOverrideNames?: string[];
   }): LoaderContext {
@@ -1291,7 +1299,7 @@ export class Sandbox {
           // Overlay Microkernel-backed wrappers. Each wrapper is
           // Promise<number>; the loader's wrap list wraps them
           // with Suspending/asyncify before instantiation.
-          const overlay = wasmHostImports(memory);
+          const overlay = wasmHostImports(memory, pid, kernel.getCwd(pid));
           for (const [name, fn] of Object.entries(overlay)) {
             base[name] = fn as unknown as WebAssembly.ImportValue;
           }

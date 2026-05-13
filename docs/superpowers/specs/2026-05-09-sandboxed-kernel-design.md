@@ -164,15 +164,21 @@ surface, grouped:
   handle), `kh_destroy_instance`,
   `kh_process_mem_read(handle, addr, dst_ptr, len)`,
   `kh_process_mem_write(handle, addr, src_ptr, len)`,
-  `kh_process_resume(handle)`. This import family is now represented in
+  `kh_process_resume(handle, result, budget_ns)`. This import family is now represented in
   `packages/kernel-wasm/src/kh.rs`, `packages/microkernel-js/mod.ts`, and the
   native wasmtime KH adapter. The portable JS backend has a host module cache
   and opaque instance-handle table for cached wasm modules, including instance
   destroy and kernel↔process memory copies. The native wasmtime backend now
   validates kernel-provided spawn contexts and instantiates cached modules with
-  the kernel-allocated pid. `kh_process_resume` intentionally returns `-ENOSYS`
-  until the scheduler/resume loop is wired; the ABI bindings themselves are no
-  longer spec-only.
+  the kernel-allocated pid. POSIX priority and scheduler syscalls are
+  kernel-authored state: `getpriority`/`setpriority` and the `sched_*`
+  policy/param calls read and update kernel process records, while the host
+  only applies the resulting execution decision. `budget_ns` is an abstract
+  kernel scheduler budget: native wasmtime maps it to fuel/epoch deadlines, JS
+  backends map it to safepoint cadence/AsyncBridge policy, and kernel.wasm
+  never exposes engine-specific scheduling internals. `kh_process_resume` intentionally
+  returns `-ENOSYS` until the scheduler/resume loop is wired; the ABI bindings
+  themselves are no longer spec-only.
 - **Diagnostics:** `kh_log` (severity, ptr, len), `kh_panic` (ptr, len —
   microkernel must terminate the kernel instance and surface the message).
 - **Cooperative yield:** `kh_yield` — blocks the calling kernel computation
@@ -236,8 +242,18 @@ Initial exports:
   fd numbers. The host may render this for users, but it does not author it. The
   JS and native wasmtime KH adapters decode this binary snapshot for their
   embedder APIs; the authoritative table remains inside kernel.wasm.
-- `kernel_snapshot(out_ptr, out_cap) -> i32` — reserved for persistence once the
-  Rust snapshot schema lands.
+- `kernel_snapshot(out_ptr, out_cap) -> i64` — return a versioned binary
+  `.yurtsnap` envelope authored by kernel.wasm. V1 starts with
+  `YURTSNP\0`, `u16 version = 1`, `u16 section_count`, `u32 flags`, followed by
+  section records (`u32 section_type`, `u32 section_len`, bytes). V1 contains
+  the existing process-list record (`section_type = 1`), per-process
+  thread-group records (`section_type = 2`), and kernel-owned wait records
+  (`section_type = 3`), and runnable-thread records (`section_type = 4`). Wait
+  records are count-prefixed entries of `u32 pid`, `u32 tid`, `u32 reason`,
+  `u32 detail`; reason `1` means a host-interface block point. Runnable-thread
+  records are count-prefixed `u32 pid`, `u32 tid` pairs. Later versions add
+  richer scheduler queues, fd/VFS/pipe state, module identities, and memory
+  sections without moving ownership back into the host.
 
 Control/query responses use explicit binary records with little-endian scalar
 fields and length-prefixed byte strings. JSON is allowed for host-level
@@ -321,15 +337,52 @@ selects the right artifact at instantiation time (matches the existing
 
 ## Memory & Concurrency
 
-Kernel.wasm is single-threaded by default. The microkernel serializes syscall
-dispatch by holding a per-kernel-instance lock around `kernel_dispatch`. If we
-later need parallelism (e.g., one kernel instance per user process group), the
-model becomes one kernel instance per group with no shared state.
+Kernel.wasm is single-threaded for kernel execution: the microkernel serializes
+syscall dispatch by holding a per-kernel-instance lock around `kernel_dispatch`.
+User processes, however, may be truly multi-threaded. The kernel owns the thread
+group model even when the host interface uses Worker/SAB or native host threads
+to execute those user threads.
+
+Each process has a kernel-authored thread group. Tid 1 is the main thread.
+Thread records carry `tid`, runnable/blocked/exited state, detached/joinable
+state, exit value, and an opaque host-thread/instance handle when the KH adapter
+has one. Scheduler queues, pthread join state, mutex ownership, condvar wait
+queues, and poll/select waiters live in kernel.wasm. The KH adapter may create
+workers, shared memories, wasmtime tasks, and wake/suspend host execution, but
+it does not author thread lifecycle or synchronization state.
+
+PR37's Worker/SAB pthread backend is the host-interface prototype for JS/Deno:
+module feature detection, shared-memory validation, worker creation, and async
+import wrapping are reusable. Its TS-owned thread slots, mutex maps, and condvar
+queues are transitional; wasm-kernel mode moves those records into the Rust
+kernel and exposes host-rendered views through binary kernel snapshots.
 
 Kernel state lives in kernel.wasm's linear memory. The microkernel treats kernel
 state as opaque except via `kernel_dispatch` and a small host-control export set
 (`kernel_spawn_process`, `kernel_kill`, `kernel_wait`, `kernel_list_processes`,
-`kernel_record_exit`, `kernel_drain_spawn`, `kernel_snapshot`).
+`kernel_list_threads`, `kernel_schedule_next`, `kernel_spawn_thread`,
+`kernel_detach_thread`, `kernel_record_thread_exit`, `kernel_block_thread`,
+`kernel_unblock_thread`, `kernel_record_exit`, `kernel_drain_spawn`,
+`kernel_snapshot`). `kernel_schedule_next` returns a binary decision record
+(`pid`, `tid`, opaque host-thread/instance handle, flags, and `budget_ns`) so the
+host can resume the selected execution unit without owning scheduler policy.
+
+### Suspend, Resume, and Teleport
+
+Live-state images are a separate binary artifact, `.yurtsnap`, not a `.yurtimg`
+extension. A snapshot is authored by kernel.wasm after a stop-the-world barrier:
+new process/thread creation is paused, runnable threads must reach a
+syscall/import safepoint, and blocked threads must be represented as
+kernel-owned wait records. V1 returns busy rather than serializing opaque JSPI
+continuations, Promises, Worker objects, wasmtime Stores, or native file/socket
+handles.
+
+The `.yurtsnap` format is sectioned and versioned. It contains kernel process
+and thread records, scheduler queues, wait reasons, fd/VFS/pipe state, module
+identities, linear memory bytes, shared-memory bytes, and portable resource
+descriptors. Cross-host resume is required only when the target host supports
+the snapshot's feature set and can recreate instances from the recorded module
+identities and memory sections.
 
 ## Migration Strategy
 

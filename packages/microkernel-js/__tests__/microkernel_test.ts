@@ -140,6 +140,21 @@ async function fixtureWasm(
   }
 }
 
+async function checkedInFixtureWasm(name: string): Promise<Uint8Array> {
+  return await Deno.readFile(
+    join(
+      workspaceRoot(),
+      "packages",
+      "kernel",
+      "src",
+      "platform",
+      "__tests__",
+      "fixtures",
+      name,
+    ),
+  );
+}
+
 async function wat2wasm(wat: string): Promise<Uint8Array> {
   const cmd = new Deno.Command("wat2wasm", {
     args: ["-", "--output=-"],
@@ -190,7 +205,7 @@ Deno.test("microkernel binds wasm-engine kh imports", async () => {
       (import "kh" "kh_process_mem_write"
         (func $mem_write (param i32 i32 i32 i32) (result i64)))
       (import "kh" "kh_process_resume"
-        (func $resume (param i32 i64) (result i64)))
+        (func $resume (param i32 i64 i64) (result i64)))
       (memory (export "memory") 1)
       (func (export "kernel_scratch_ptr") (result i32) (i32.const 1024))
       (func (export "kernel_scratch_len") (result i32) (i32.const 4096))
@@ -212,7 +227,7 @@ Deno.test("microkernel binds wasm-engine kh imports", async () => {
               (call $mem_write
                 (i32.const 0) (i32.const 0)
                 (i32.const 0) (i32.const 0)))
-            (call $resume (i32.const 0) (i64.const 0))))))
+            (call $resume (i32.const 0) (i64.const 0) (i64.const 1000000))))))
   `);
   const mk = await Microkernel.load(fakeKernel, defaultHostState());
   const { rc } = mk.syscall(0, new Uint8Array(0), 0);
@@ -597,6 +612,165 @@ Deno.test("listProcesses reads the kernel-owned process snapshot", async () => {
   assertEquals(child.fds, [0, 1, 2]);
 });
 
+Deno.test("listThreads reads the kernel-owned thread snapshot", async () => {
+  const mk = await freshMicrokernel();
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
+
+  const threads = mk.listThreads(childPid);
+  assertEquals(threads, [{
+    tid: 1,
+    state: "runnable",
+    detached: false,
+    exitValue: -1,
+    hostThreadHandle: -1,
+  }]);
+});
+
+Deno.test("thread lifecycle controls mutate the kernel-owned thread snapshot", async () => {
+  const mk = await freshMicrokernel();
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
+
+  const tid = mk.spawnThread(childPid, 91);
+  assertEquals(tid, 2);
+  assertEquals(mk.listThreads(childPid).find((t) => t.tid === tid), {
+    tid,
+    state: "runnable",
+    detached: false,
+    exitValue: -1,
+    hostThreadHandle: 91,
+  });
+
+  mk.blockThread(childPid, tid);
+  assertEquals(
+    mk.listThreads(childPid).find((t) => t.tid === tid)?.state,
+    "blocked",
+  );
+
+  mk.unblockThread(childPid, tid);
+  assertEquals(
+    mk.listThreads(childPid).find((t) => t.tid === tid)?.state,
+    "runnable",
+  );
+
+  mk.detachThread(childPid, tid);
+  assertEquals(
+    mk.listThreads(childPid).find((t) => t.tid === tid)?.detached,
+    true,
+  );
+
+  mk.recordThreadExit(childPid, tid, 123);
+  assertEquals(mk.listThreads(childPid).find((t) => t.tid === tid), {
+    tid,
+    state: "exited",
+    detached: true,
+    exitValue: 123,
+    hostThreadHandle: 91,
+  });
+});
+
+Deno.test("scheduleNext reads kernel-owned runnable decisions with budgets", async () => {
+  const mk = await freshMicrokernel();
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
+  const tid = mk.spawnThread(childPid, 91);
+  mk.recordThreadExit(1, 1, 0);
+
+  assertEquals(mk.scheduleNext(), {
+    pid: childPid,
+    tid: 1,
+    hostThreadHandle: -1,
+    flags: 0,
+    budgetNs: 20_000_000n,
+  });
+  assertEquals(mk.scheduleNext(), {
+    pid: childPid,
+    tid,
+    hostThreadHandle: 91,
+    flags: 0,
+    budgetNs: 20_000_000n,
+  });
+
+  mk.blockThread(childPid, tid);
+  mk.recordThreadExit(childPid, 1, 0);
+  assertEquals(mk.scheduleNext(), undefined);
+});
+
+Deno.test("kernel snapshot returns a versioned binary state envelope", async () => {
+  const mk = await freshMicrokernel();
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
+  const tid = mk.spawnThread(childPid, 91);
+  mk.blockThread(childPid, tid);
+
+  const snapshot = mk.snapshotKernelState();
+  const magic = new TextDecoder().decode(snapshot.subarray(0, 7));
+  const view = new DataView(
+    snapshot.buffer,
+    snapshot.byteOffset,
+    snapshot.byteLength,
+  );
+  assertEquals(magic, "YURTSNP");
+  assertEquals(snapshot[7], 0);
+  assertEquals(view.getUint16(8, true), 1);
+  assertEquals(view.getUint16(10, true), 4);
+  assertEquals(view.getUint32(12, true), 0);
+
+  let offset = 16;
+  let sawProcessSection = false;
+  let sawThreadSection = false;
+  let sawWaitSection = false;
+  let sawRunnableSection = false;
+  for (let i = 0; i < 4; i++) {
+    const sectionType = view.getUint32(offset, true);
+    offset += 4;
+    const sectionLen = view.getUint32(offset, true);
+    offset += 4;
+    const section = snapshot.subarray(offset, offset + sectionLen);
+    offset += sectionLen;
+    if (sectionType === 1) {
+      sawProcessSection = true;
+      assertEquals(section.includes(childPid & 0xff), true);
+    } else if (sectionType === 2) {
+      sawThreadSection = true;
+      assertEquals(section.includes(tid), true);
+      assertEquals(section.includes(2), true);
+    } else if (sectionType === 3) {
+      sawWaitSection = true;
+      const waitView = new DataView(
+        section.buffer,
+        section.byteOffset,
+        section.byteLength,
+      );
+      assertEquals(waitView.getUint32(0, true), 1);
+      assertEquals(waitView.getUint32(4, true), childPid);
+      assertEquals(waitView.getUint32(8, true), tid);
+      assertEquals(waitView.getUint32(12, true), 1);
+      assertEquals(waitView.getUint32(16, true), 0);
+    } else if (sectionType === 4) {
+      sawRunnableSection = true;
+      const runnableView = new DataView(
+        section.buffer,
+        section.byteOffset,
+        section.byteLength,
+      );
+      const runnableCount = runnableView.getUint32(0, true);
+      let sawMainThread = false;
+      for (let j = 0; j < runnableCount; j++) {
+        const entryOffset = 4 + j * 8;
+        const runnablePid = runnableView.getUint32(entryOffset, true);
+        const runnableTid = runnableView.getUint32(entryOffset + 4, true);
+        if (runnablePid === childPid && runnableTid === 1) {
+          sawMainThread = true;
+        }
+      }
+      assertEquals(sawMainThread, true);
+    }
+  }
+  assertEquals(offset, snapshot.byteLength);
+  assertEquals(sawProcessSection, true);
+  assertEquals(sawThreadSection, true);
+  assertEquals(sawWaitSection, true);
+  assertEquals(sawRunnableSection, true);
+});
+
 Deno.test("waitProcess and killProcess enter kernel-owned process control", async () => {
   const mk = await freshMicrokernel();
   const childPid = spawnFromRamfs(mk, 1, s("/bin/child"), [s("child")]);
@@ -697,6 +871,66 @@ Deno.test("user process pipe round-trip within one process", async () => {
   assertEquals(new TextDecoder().decode(got), "hello pipe");
 });
 
+Deno.test("user process priority imports route through kernel scheduler state", async () => {
+  const mk = await freshMicrokernel();
+  const userWasm = await wat2wasm(`
+    (module
+      (import "yurt" "host_getpriority"
+        (func $getpriority (param i32 i32) (result i32)))
+      (import "yurt" "host_setpriority"
+        (func $setpriority (param i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "get") (result i32)
+        (call $getpriority (i32.const 0) (i32.const 0)))
+      (func (export "set10") (result i32)
+        (call $setpriority (i32.const 0) (i32.const 0) (i32.const 10)))
+      (func (export "raise_priority") (result i32)
+        (call $setpriority (i32.const 0) (i32.const 0) (i32.const -1))))
+  `);
+  const user = mk.spawnUserProcess(userWasm);
+
+  assertEquals(user.callExportI32("get"), 0);
+  assertEquals(user.callExportI32("set10"), 0);
+  assertEquals(user.callExportI32("get"), 10);
+  assertEquals(user.callExportI32("raise_priority"), -1);
+});
+
+Deno.test("user process scheduler imports route through kernel scheduler state", async () => {
+  const mk = await freshMicrokernel();
+  const userWasm = await wat2wasm(`
+    (module
+      (import "yurt" "host_sched_getscheduler"
+        (func $getscheduler (param i32) (result i32)))
+      (import "yurt" "host_sched_getparam"
+        (func $getparam (param i32) (result i32)))
+      (import "yurt" "host_sched_setscheduler"
+        (func $setscheduler (param i32 i32 i32) (result i32)))
+      (import "yurt" "host_sched_setparam"
+        (func $setparam (param i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "get_policy") (result i32)
+        (call $getscheduler (i32.const 0)))
+      (func (export "get_param") (result i32)
+        (call $getparam (i32.const 0)))
+      (func (export "setscheduler_other") (result i32)
+        (call $setscheduler (i32.const 0) (i32.const 0) (i32.const 0)))
+      (func (export "setparam_zero") (result i32)
+        (call $setparam (i32.const 0) (i32.const 0)))
+      (func (export "setparam_nonzero") (result i32)
+        (call $setparam (i32.const 0) (i32.const 1)))
+      (func (export "setscheduler_fifo") (result i32)
+        (call $setscheduler (i32.const 0) (i32.const 1) (i32.const 1))))
+  `);
+  const user = mk.spawnUserProcess(userWasm);
+
+  assertEquals(user.callExportI32("get_policy"), 0);
+  assertEquals(user.callExportI32("get_param"), 0);
+  assertEquals(user.callExportI32("setscheduler_other"), 0);
+  assertEquals(user.callExportI32("setparam_zero"), 0);
+  assertEquals(user.callExportI32("setparam_nonzero"), -22);
+  assertEquals(user.callExportI32("setscheduler_fifo"), -1);
+});
+
 // ── Real-fixture parity tests (mirror Rust fixture_parity.rs) ─────────────
 
 Deno.test("hello-wasm prints via sys_write through kernel.wasm", async () => {
@@ -780,6 +1014,17 @@ Deno.test("wc-bytes fixture counts stdin bytes", async () => {
   );
   captureProcExit(user);
   assertEquals(new TextDecoder().decode(user.capturedStdout()), "10\n");
+});
+
+Deno.test("std-fs fixture creates, stats, reads, and unlinks a file", async () => {
+  const wasm = await checkedInFixtureWasm("std-fs-canary.wasm");
+  const mk = await freshMicrokernel();
+  const user = mk.spawnUserProcessWithArgs(wasm, [s("std-fs-canary")]);
+  captureProcExit(user);
+  assertEquals(
+    new TextDecoder().decode(user.capturedStdout()),
+    "canonical=/yurt-std-fs-canary.txt\ncontents=yurt\n",
+  );
 });
 
 Deno.test("true-cmd fixture proc_exits zero", async () => {

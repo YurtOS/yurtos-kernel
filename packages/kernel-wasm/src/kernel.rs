@@ -24,6 +24,7 @@ use std::sync::{LazyLock, Mutex};
 use crate::state::Credentials;
 
 pub type Pid = u32;
+pub type Tid = u32;
 
 pub const DEFAULT_UMASK: u16 = 0o022;
 
@@ -33,6 +34,48 @@ pub type ResourceLimit = (u64, u64);
 /// Number of POSIX rlimit slots tracked. Matches the TS kernel's
 /// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
 pub const RLIMIT_SLOTS: usize = 8;
+
+/// Kernel-owned execution state for one user thread. Host backends may
+/// map this to a Worker, a wasmtime task, or a cooperative stack, but
+/// the lifecycle state belongs to kernel.wasm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadState {
+    Runnable,
+    // Reserved for the scheduler/poll/pthread ABI wiring that will
+    // consume the kernel-owned transition methods below.
+    #[allow(dead_code)]
+    Blocked,
+    #[allow(dead_code)]
+    Exited,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitReason {
+    HostBlock,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadRecord {
+    pub tid: Tid,
+    pub state: ThreadState,
+    pub detached: bool,
+    pub exit_value: Option<i32>,
+    pub host_thread_handle: Option<i32>,
+    pub wait_reason: Option<WaitReason>,
+}
+
+impl ThreadRecord {
+    fn main(host_thread_handle: Option<i32>) -> Self {
+        Self {
+            tid: 1,
+            state: ThreadState::Runnable,
+            detached: false,
+            exit_value: None,
+            host_thread_handle,
+            wait_reason: None,
+        }
+    }
+}
 
 // ── File descriptor table ──────────────────────────────────────────────────
 
@@ -159,6 +202,13 @@ pub struct Process {
     pub stdout_buffer: Vec<u8>,
     /// Bytes this process has written to stderr (FdEntry::Stderr).
     pub stderr_buffer: Vec<u8>,
+    /// POSIX nice value used by the kernel-owned scheduler policy.
+    /// Lower numeric values have higher priority. Clamped to -20..=19.
+    pub nice: i32,
+    /// POSIX scheduler policy. Phase B2 supports SCHED_OTHER only.
+    pub scheduler_policy: i32,
+    /// POSIX sched_param.sched_priority. For SCHED_OTHER this must be 0.
+    pub scheduler_priority: i32,
     /// POSIX process group id. New processes inherit pgid==pid until
     /// `setpgid` moves them; we approximate that here by initializing
     /// to the pid on first observation (caller responsibility — the
@@ -207,6 +257,11 @@ pub struct Process {
     /// policy owns the process record; the host interface owns the
     /// engine mechanism addressed by this handle.
     pub host_instance_handle: Option<i32>,
+    /// Kernel-owned thread group. Tid 1 is the main thread. Host
+    /// handles are opaque KH adapter ids; lifecycle and joinability
+    /// are authored here.
+    pub threads: BTreeMap<Tid, ThreadRecord>,
+    pub next_tid: Tid,
 }
 
 impl Default for Process {
@@ -221,6 +276,9 @@ impl Default for Process {
             stdin_eof: false,
             stdout_buffer: Vec::new(),
             stderr_buffer: Vec::new(),
+            nice: 0,
+            scheduler_policy: 0,
+            scheduler_priority: 0,
             pgid: 0,
             sid: 0,
             pending_signals: 0,
@@ -232,7 +290,18 @@ impl Default for Process {
             children: Vec::new(),
             exit_status: None,
             host_instance_handle: None,
+            threads: BTreeMap::new(),
+            next_tid: 1,
         }
+    }
+}
+
+impl Process {
+    fn ensure_main_thread(&mut self, host_thread_handle: Option<i32>) {
+        self.threads
+            .entry(1)
+            .or_insert_with(|| ThreadRecord::main(host_thread_handle));
+        self.next_tid = self.next_tid.max(2);
     }
 }
 
@@ -336,6 +405,9 @@ pub struct Kernel {
     /// asks kernel.wasm for these pids before instantiating a user
     /// module; this keeps process identity owned by the kernel.
     next_host_pid: Pid,
+    /// Last `(pid, tid)` handed to the host scheduler. The next pick rotates
+    /// after this entry among runnable threads.
+    last_scheduled: Option<(Pid, Tid)>,
 }
 
 /// One staged sys_spawn waiting for the host to instantiate it.
@@ -355,6 +427,25 @@ pub struct ProcessListEntry {
     pub exit_status: Option<i32>,
     pub command: Vec<u8>,
     pub fds: Vec<u32>,
+}
+
+pub struct WaitRecord {
+    pub pid: Pid,
+    pub tid: Tid,
+    pub reason: WaitReason,
+    pub detail: u32,
+}
+
+pub struct RunnableThread {
+    pub pid: Pid,
+    pub tid: Tid,
+}
+
+pub struct ScheduleDecision {
+    pub pid: Pid,
+    pub tid: Tid,
+    pub host_thread_handle: Option<i32>,
+    pub budget_ns: u64,
 }
 
 impl Kernel {
@@ -380,6 +471,7 @@ impl Kernel {
             pending_spawns: VecDeque::new(),
             next_spawn_pid: 1000,
             next_host_pid: 1,
+            last_scheduled: None,
         }
     }
 
@@ -405,11 +497,23 @@ impl Kernel {
         argv: Vec<Vec<u8>>,
         host_instance_handle: Option<i32>,
     ) {
+        let (parent_nice, parent_policy, parent_priority) = self
+            .processes
+            .get(&parent_pid)
+            .map(|p| (p.nice, p.scheduler_policy, p.scheduler_priority))
+            .unwrap_or((0, 0, 0));
         {
             let p = self.process_mut(pid);
             p.ppid = parent_pid;
             p.argv = argv;
+            p.nice = parent_nice;
+            p.scheduler_policy = parent_policy;
+            p.scheduler_priority = parent_priority;
             p.host_instance_handle = host_instance_handle;
+            p.threads.clear();
+            p.threads
+                .insert(1, ThreadRecord::main(host_instance_handle));
+            p.next_tid = 2;
         }
         if parent_pid != 0 {
             let parent = self.process_mut(parent_pid);
@@ -554,6 +658,140 @@ impl Kernel {
             .collect()
     }
 
+    pub fn list_threads(&self, pid: Pid) -> Vec<ThreadRecord> {
+        self.processes
+            .get(&pid)
+            .map(|p| p.threads.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn list_waits(&self) -> Vec<WaitRecord> {
+        self.processes
+            .iter()
+            .flat_map(|(pid, p)| {
+                p.threads.iter().filter_map(move |(tid, t)| {
+                    t.wait_reason.map(|reason| WaitRecord {
+                        pid: *pid,
+                        tid: *tid,
+                        reason,
+                        detail: 0,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    pub fn list_runnable_threads(&self) -> Vec<RunnableThread> {
+        self.processes
+            .iter()
+            .flat_map(|(pid, p)| {
+                p.threads.iter().filter_map(move |(tid, t)| {
+                    (t.state == ThreadState::Runnable).then_some(RunnableThread {
+                        pid: *pid,
+                        tid: *tid,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    pub fn schedule_next(&mut self) -> Option<ScheduleDecision> {
+        let runnable: Vec<(Pid, Tid, Option<i32>, i32)> = self
+            .processes
+            .iter()
+            .flat_map(|(pid, p)| {
+                p.threads.iter().filter_map(move |(tid, t)| {
+                    (t.state == ThreadState::Runnable).then_some((
+                        *pid,
+                        *tid,
+                        t.host_thread_handle,
+                        p.nice,
+                    ))
+                })
+            })
+            .collect();
+        if runnable.is_empty() {
+            self.last_scheduled = None;
+            return None;
+        }
+
+        let mut index = 0usize;
+        if let Some(last) = self.last_scheduled {
+            if let Some(pos) = runnable
+                .iter()
+                .position(|(pid, tid, _, _)| (*pid, *tid) == last)
+            {
+                index = (pos + 1) % runnable.len();
+            }
+        }
+
+        let (pid, tid, host_thread_handle, nice) = runnable[index];
+        self.last_scheduled = Some((pid, tid));
+        Some(ScheduleDecision {
+            pid,
+            tid,
+            host_thread_handle,
+            budget_ns: scheduler_budget_ns(nice),
+        })
+    }
+
+    // Reserved for pthread host-import wiring; tests pin the kernel-owned
+    // lifecycle before host backends start calling into it.
+    #[allow(dead_code)]
+    pub fn spawn_thread(&mut self, pid: Pid, host_thread_handle: Option<i32>) -> Option<Tid> {
+        let p = self.processes.get_mut(&pid)?;
+        let tid = p.next_tid.max(1);
+        p.next_tid = tid.saturating_add(1);
+        p.threads.insert(
+            tid,
+            ThreadRecord {
+                tid,
+                state: ThreadState::Runnable,
+                detached: false,
+                exit_value: None,
+                host_thread_handle,
+                wait_reason: None,
+            },
+        );
+        Some(tid)
+    }
+
+    #[allow(dead_code)]
+    pub fn detach_thread(&mut self, pid: Pid, tid: Tid) -> Option<()> {
+        let thread = self.processes.get_mut(&pid)?.threads.get_mut(&tid)?;
+        thread.detached = true;
+        Some(())
+    }
+
+    #[allow(dead_code)]
+    pub fn exit_thread(&mut self, pid: Pid, tid: Tid, exit_value: i32) -> Option<()> {
+        let thread = self.processes.get_mut(&pid)?.threads.get_mut(&tid)?;
+        thread.state = ThreadState::Exited;
+        thread.exit_value = Some(exit_value);
+        thread.wait_reason = None;
+        Some(())
+    }
+
+    #[allow(dead_code)]
+    pub fn block_thread(&mut self, pid: Pid, tid: Tid) -> Option<()> {
+        let thread = self.processes.get_mut(&pid)?.threads.get_mut(&tid)?;
+        if thread.state != ThreadState::Exited {
+            thread.state = ThreadState::Blocked;
+            thread.wait_reason = Some(WaitReason::HostBlock);
+        }
+        Some(())
+    }
+
+    #[allow(dead_code)]
+    pub fn unblock_thread(&mut self, pid: Pid, tid: Tid) -> Option<()> {
+        let thread = self.processes.get_mut(&pid)?.threads.get_mut(&tid)?;
+        if thread.state == ThreadState::Blocked {
+            thread.state = ThreadState::Runnable;
+            thread.wait_reason = None;
+        }
+        Some(())
+    }
+
     /// Decrement the refcount. Frees the OFD when it hits 0.
     pub fn ofd_dec_ref(&mut self, id: u64) {
         let drop = if let Some(ofd) = self.ofds.get_mut(&id) {
@@ -596,13 +834,17 @@ impl Kernel {
     /// Get a mutable reference to the process record for `pid`.
     /// Lazily inserts a default `Process` if no entry exists yet.
     pub fn process_mut(&mut self, pid: Pid) -> &mut Process {
-        self.processes.entry(pid).or_default()
+        let p = self.processes.entry(pid).or_default();
+        p.ensure_main_thread(None);
+        p
     }
 
     /// Get an immutable reference to the process record for `pid`.
     /// Lazily inserts a default `Process` if no entry exists yet.
     pub fn process(&mut self, pid: Pid) -> &Process {
-        self.processes.entry(pid).or_default()
+        let p = self.processes.entry(pid).or_default();
+        p.ensure_main_thread(None);
+        p
     }
 
     pub fn has_process(&self, pid: Pid) -> bool {
@@ -627,6 +869,7 @@ pub fn reset_for_tests() {
     k.metadata_overrides.clear();
     k.next_host_pid = 1;
     k.next_spawn_pid = 1000;
+    k.last_scheduled = None;
 }
 
 /// Native unit tests share the same `static KERNEL` and run in
@@ -646,6 +889,12 @@ impl TestGuard {
         reset_for_tests();
         Self { _guard: guard }
     }
+}
+
+pub fn scheduler_budget_ns(nice: i32) -> u64 {
+    let clamped = nice.clamp(-20, 19);
+    let budget_ms = 20_i32.saturating_sub(clamped).clamp(1, 40);
+    (budget_ms as u64) * 1_000_000
 }
 
 #[cfg(test)]
@@ -691,5 +940,116 @@ mod tests {
             with_kernel(|k| k.process(pid).host_instance_handle),
             Some(11)
         );
+    }
+
+    #[test]
+    fn host_process_starts_with_kernel_owned_main_thread() {
+        let _g = TestGuard::acquire();
+        let pid = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(22));
+            pid
+        });
+
+        let threads = with_kernel(|k| k.list_threads(pid));
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].tid, 1);
+        assert_eq!(threads[0].state, ThreadState::Runnable);
+        assert_eq!(threads[0].host_thread_handle, Some(22));
+        assert!(!threads[0].detached);
+        assert_eq!(threads[0].exit_value, None);
+    }
+
+    #[test]
+    fn spawned_threads_are_kernel_owned_joinable_records() {
+        let _g = TestGuard::acquire();
+        let (pid, tid) = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(30));
+            let tid = k.spawn_thread(pid, Some(31)).expect("thread spawn");
+            (pid, tid)
+        });
+
+        assert_eq!(tid, 2);
+        let threads = with_kernel(|k| k.list_threads(pid));
+        assert_eq!(threads.len(), 2);
+        let worker = threads
+            .iter()
+            .find(|t| t.tid == tid)
+            .expect("worker thread");
+        assert_eq!(worker.state, ThreadState::Runnable);
+        assert_eq!(worker.host_thread_handle, Some(31));
+        assert!(!worker.detached);
+        assert_eq!(worker.exit_value, None);
+    }
+
+    #[test]
+    fn exited_threads_remain_joinable_until_reaped() {
+        let _g = TestGuard::acquire();
+        let (pid, tid) = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(40));
+            let tid = k.spawn_thread(pid, Some(41)).expect("thread spawn");
+            k.exit_thread(pid, tid, 123).expect("thread exit");
+            (pid, tid)
+        });
+
+        let threads = with_kernel(|k| k.list_threads(pid));
+        let worker = threads
+            .iter()
+            .find(|t| t.tid == tid)
+            .expect("worker thread");
+        assert_eq!(worker.state, ThreadState::Exited);
+        assert_eq!(worker.exit_value, Some(123));
+        assert!(!worker.detached);
+    }
+
+    #[test]
+    fn detached_threads_are_marked_in_kernel_state() {
+        let _g = TestGuard::acquire();
+        let (pid, tid) = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(50));
+            let tid = k.spawn_thread(pid, Some(51)).expect("thread spawn");
+            k.detach_thread(pid, tid).expect("thread detach");
+            (pid, tid)
+        });
+
+        let threads = with_kernel(|k| k.list_threads(pid));
+        let worker = threads
+            .iter()
+            .find(|t| t.tid == tid)
+            .expect("worker thread");
+        assert!(worker.detached);
+        assert_eq!(worker.state, ThreadState::Runnable);
+    }
+
+    #[test]
+    fn blocked_threads_can_be_made_runnable_again_by_scheduler() {
+        let _g = TestGuard::acquire();
+        let (pid, tid) = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(60));
+            let tid = k.spawn_thread(pid, Some(61)).expect("thread spawn");
+            k.block_thread(pid, tid).expect("thread block");
+            (pid, tid)
+        });
+
+        let blocked = with_kernel(|k| {
+            k.list_threads(pid)
+                .into_iter()
+                .find(|t| t.tid == tid)
+                .expect("worker thread")
+        });
+        assert_eq!(blocked.state, ThreadState::Blocked);
+
+        with_kernel(|k| k.unblock_thread(pid, tid).expect("thread unblock"));
+        let runnable = with_kernel(|k| {
+            k.list_threads(pid)
+                .into_iter()
+                .find(|t| t.tid == tid)
+                .expect("worker thread")
+        });
+        assert_eq!(runnable.state, ThreadState::Runnable);
     }
 }

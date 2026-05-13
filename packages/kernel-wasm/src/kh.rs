@@ -88,7 +88,7 @@ extern "C" {
     fn kh_destroy_instance(handle: i32) -> i32;
     fn kh_process_mem_read(handle: i32, addr: u32, dst_ptr: *mut u8, len: usize) -> i64;
     fn kh_process_mem_write(handle: i32, addr: u32, src_ptr: *const u8, len: usize) -> i64;
-    fn kh_process_resume(handle: i32, result: i64) -> i64;
+    fn kh_process_resume(handle: i32, result: i64, budget_ns: u64) -> i64;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -298,7 +298,7 @@ unsafe fn kh_process_mem_write(_handle: i32, _addr: u32, _src_ptr: *const u8, _l
 
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
-unsafe fn kh_process_resume(_handle: i32, _result: i64) -> i64 {
+unsafe fn kh_process_resume(_handle: i32, _result: i64, _budget_ns: u64) -> i64 {
     -38
 }
 
@@ -522,18 +522,19 @@ pub fn process_mem_write(handle: i32, addr: u32, src: &[u8]) -> i64 {
 }
 
 #[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
-/// Resume a suspended process instance with the scalar syscall result
-/// selected by the kernel.
-pub fn process_resume(handle: i32, result: i64) -> i64 {
-    unsafe { kh_process_resume(handle, result) }
+/// Resume a suspended process instance with the scalar syscall result selected
+/// by the kernel and an abstract run budget in nanoseconds. Hosts translate
+/// this into their own preemption mechanism; the kernel never speaks fuel or
+/// engine-specific epoch counts.
+pub fn process_resume(handle: i32, result: i64, budget_ns: u64) -> i64 {
+    unsafe { kh_process_resume(handle, result, budget_ns) }
 }
 
-/// Forward an HTTP fetch request to the host. The request bytes
-/// are a JSON document (see `host::network::fetch` for the
-/// schema); the response bytes (also JSON) get written into
-/// `response`. Returns bytes-written on success or a negated
-/// POSIX errno (-EACCES from the policy gate, -E2BIG when the
-/// response is larger than `response.len()`).
+/// Forward an HTTP fetch request to the host. The request bytes are a
+/// `fetch_record_v1` binary record; the host writes a `fetch_response_v1`
+/// binary record into `response`. Returns bytes-written on success or a
+/// negated POSIX errno (-EACCES from the policy gate, -E2BIG when the response
+/// is larger than `response.len()`).
 pub fn fetch_blocking(request: &[u8], response: &mut [u8]) -> i64 {
     unsafe {
         kh_fetch_blocking(
@@ -576,6 +577,6 @@ mod tests {
         let mut dst = [0u8; 4];
         assert_eq!(process_mem_read(7, 1024, &mut dst), -(abi::ENOSYS as i64));
         assert_eq!(process_mem_write(7, 1024, b"data"), -(abi::ENOSYS as i64));
-        assert_eq!(process_resume(7, 0), -(abi::ENOSYS as i64));
+        assert_eq!(process_resume(7, 0, 1_000_000), -(abi::ENOSYS as i64));
     }
 }

@@ -17,14 +17,13 @@ import {
   AsyncifyAsyncBridge,
   type AsyncifyForkSnapshot,
 } from "../async-bridge.js";
-import { CooperativeSerialBackend } from "./threads/cooperative-serial.js";
 import { createThreadsBackend } from "./threads/backend-factory.js";
-import type { WorkerSabThreadsBackendOptions } from "./threads/worker-sab.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
 import type {
   LinearStackSwitchingThreadsBackend,
   ThreadsBackend,
 } from "./threads/backend.js";
+import type { WorkerSabThreadsBackendOptions } from "./threads/worker-sab.js";
 import {
   defaultWasmModuleCache,
   sha256Hex,
@@ -192,6 +191,7 @@ export async function loadProcess(
       typeof WebAssembly.Suspending !== "function"
     ? new AsyncifyAsyncBridge()
     : null;
+
   let mainInstanceRef: WebAssembly.Instance | null = null;
   const yurtImports: Record<string, WebAssembly.ImportValue> = {
     ...ctx.buildKernelImports(
@@ -215,8 +215,6 @@ export async function loadProcess(
     yurtImports,
     [
       "host_wait",
-      "host_poll",
-      "host_waitpid",
       "host_kill",
       "host_killpg",
       "host_yield",
@@ -225,16 +223,7 @@ export async function loadProcess(
       "host_register_tool",
       "host_socket_accept",
       "host_socket_recv",
-      "host_socket_recvmsg",
-      "host_socket_sendmsg",
-      "host_socket_socketpair",
-      "host_socket_bind_unix",
-      "host_socket_connect_unix",
-      "host_socket_recvfrom_unix",
-      "host_socket_accept_unix",
-      "host_socket_recv_unix",
       "host_extension_invoke",
-      "host_run_command",
       "host_thread_spawn",
       "host_thread_join",
       "host_thread_detach",
@@ -363,7 +352,7 @@ export async function loadProcess(
       childWasi.setCanSuspendPipeReads(true);
 
       const childBridge = new AsyncifyAsyncBridge();
-      const childThreadsBackend = new CooperativeSerialBackend();
+      const childThreadsBackend = createThreadsBackend(profile);
       let childMemoryRef: WebAssembly.Memory | null = null;
       const childMemoryProxy = new Proxy({} as WebAssembly.Memory, {
         get(_target, prop) {
@@ -396,8 +385,6 @@ export async function loadProcess(
         childYurtImports,
         [
           "host_wait",
-          "host_poll",
-          "host_waitpid",
           "host_kill",
           "host_killpg",
           "host_yield",
@@ -405,16 +392,7 @@ export async function loadProcess(
           "host_register_tool",
           "host_socket_accept",
           "host_socket_recv",
-          "host_socket_recvmsg",
-          "host_socket_sendmsg",
-          "host_socket_socketpair",
-          "host_socket_bind_unix",
-          "host_socket_connect_unix",
-          "host_socket_recvfrom_unix",
-          "host_socket_accept_unix",
-          "host_socket_recv_unix",
           "host_extension_invoke",
-          "host_run_command",
           "host_thread_spawn",
           "host_thread_join",
           "host_thread_detach",
@@ -518,10 +496,8 @@ export async function loadProcess(
   let exitCode: number;
   try {
     exitCode = await wasi.startAsync(instance, startFn);
-    threadsBackend.cancelDetachedThreads?.();
   } catch (e) {
     rollback();
-    threadsBackend.cancelDetachedThreads?.();
     const stderr = proc.fdReadAndClear(2).data.trimEnd();
     if (stderr) {
       const message = e instanceof Error ? e.message : String(e);
@@ -556,7 +532,6 @@ export async function loadProcess(
 
   proc.__setTerminate(async () => {
     wasi.cancelExecution();
-    threadsBackend.cancelDetachedThreads?.();
     ctx.releasePid(pid, proc.exitCode ?? 0, wasi.getExitSignal());
   });
 

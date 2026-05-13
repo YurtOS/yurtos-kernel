@@ -43,6 +43,7 @@ async function freshMk(): Promise<Microkernel> {
 
 interface CapturedCall {
   method: number;
+  callerPid: number;
   request: Uint8Array;
   responseCap: number;
 }
@@ -53,12 +54,22 @@ function capturingMk(rc = 0, response = new Uint8Array()): {
 } {
   const calls: CapturedCall[] = [];
   const mk = {
-    syscallAsync(
+    kernelSyscall(
       method: number,
+      callerPid: number,
+      request: Uint8Array,
+      responseCap: number,
+    ): { rc: bigint; response: Uint8Array } {
+      calls.push({ method, callerPid, request: request.slice(), responseCap });
+      return { rc: BigInt(rc), response };
+    },
+    kernelSyscallAsync(
+      method: number,
+      callerPid: number,
       request: Uint8Array,
       responseCap: number,
     ): Promise<{ rc: bigint; response: Uint8Array }> {
-      calls.push({ method, request: request.slice(), responseCap });
+      calls.push({ method, callerPid, request: request.slice(), responseCap });
       return Promise.resolve({ rc: BigInt(rc), response });
     },
   } as unknown as Microkernel;
@@ -134,6 +145,11 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     }
   });
 
+  it("covers host_realpath through a Rust-kernel syscall", () => {
+    const names = new Set(HOST_BINDINGS.map((b) => b.name));
+    expect(names.has("host_realpath")).toEqual(true);
+  });
+
   it("scalar-zero-arg: host_getuid → sys_getuid via factory", async () => {
     if (!HAS_JSPI) return;
     const mk = await freshMk();
@@ -144,6 +160,21 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     // zero-arg scalar-return path returns the syscall's actual
     // value, not a stub.
     expect(uid).toEqual(1000);
+  });
+
+  it("initializes the Rust-kernel caller cwd for Sandbox-hosted guests", async () => {
+    const { mk, calls } = capturingMk();
+    const fakeBuf = new ArrayBuffer(8);
+    const imports = buildWasmKernelImports(mk, () => fakeBuf, 77, "/tmp");
+
+    await imports.host_getuid();
+
+    expect(calls.length).toEqual(2);
+    expect(calls[0].method).toEqual(METHOD.SYS_CHDIR);
+    expect(calls[0].callerPid).toEqual(77);
+    expect(new TextDecoder().decode(calls[0].request)).toEqual("/tmp");
+    expect(calls[1].method).toEqual(METHOD.SYS_GETUID);
+    expect(calls[1].callerPid).toEqual(77);
   });
 
   it("multi-scalar-arg: host_kill with args packed inline", async () => {
@@ -232,6 +263,32 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     while (end > 0 && raw[end - 1] === 0) end--;
     const got = new TextDecoder().decode(raw.subarray(0, end));
     expect(got).toEqual("/");
+  });
+
+  it("out_cap arg: host_realpath canonicalizes through the Rust kernel", async () => {
+    if (!HAS_JSPI) return;
+    const mk = await freshMk();
+    const buf = new ArrayBuffer(128);
+    const u = new Uint8Array(buf);
+    const imports = buildWasmKernelImports(mk, () => buf);
+
+    u.set(new TextEncoder().encode("/work"), 0);
+    expect(await imports.host_mkdir(0, 5)).toEqual(0);
+    expect(await imports.host_chdir(0, 5)).toEqual(0);
+    u.fill(0);
+    u.set(new TextEncoder().encode("/work/file.txt"), 0);
+    u.set(new TextEncoder().encode("hello"), 32);
+    expect(await imports.host_write_file(0, 14, 32, 5, 0)).toEqual(5);
+
+    u.fill(0);
+    u.set(new TextEncoder().encode("./file.txt"), 0);
+    const n = await imports.host_realpath(0, 10, 64, 64);
+
+    expect(n).toEqual("/work/file.txt".length + 1);
+    expect(
+      new TextDecoder().decode(new Uint8Array(buf, 64, n - 1)),
+    ).toEqual("/work/file.txt");
+    expect(new Uint8Array(buf)[64 + n - 1]).toEqual(0);
   });
 
   it("out_cap arg: host_pipe writes 8 bytes (read_fd + write_fd)", async () => {
@@ -351,18 +408,13 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(got).toEqual("hello");
   });
 
-  it("host_native_invoke forwards bytes via sys_extension_invoke", async () => {
-    if (!HAS_JSPI) return;
-    const mk = await freshMk();
-    const buf = new ArrayBuffer(64);
-    // Stage a request — anything; the empty registry rejects.
-    new Uint8Array(buf).set(new TextEncoder().encode("{}"));
-    const imports = buildWasmKernelImports(mk, () => buf);
-    // host_native_invoke(reqPtr=0, reqLen=2, outPtr=8, outCap=56)
-    const rc = await imports.host_native_invoke(0, 2, 8, 56);
-    // -ENOENT from the empty extension registry — proves the
-    // bytes round-tripped through the trampoline.
-    expect(rc).toEqual(-2);
+  it("does not expose the defunct host_native_invoke wrapper", async () => {
+    const { mk } = capturingMk(0);
+    const imports = buildWasmKernelImports(mk, () => new ArrayBuffer(64));
+
+    expect("host_native_invoke" in imports).toEqual(false);
+    expect(HOST_BINDINGS.some((binding) => binding.name === "host_native_invoke"))
+      .toEqual(false);
   });
 
   it("socket wrappers use the direct yurt_abi socket signatures", async () => {

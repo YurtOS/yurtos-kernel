@@ -61,6 +61,8 @@ export function buildWasiShim(
   userMemoryRef: { memory?: WebAssembly.Memory },
 ): Record<string, (...args: number[] | (number | bigint)[]) => number | never> {
   const um = () => userMemoryRef.memory!.buffer;
+  let nextGuestFd = PREOPEN_ROOT_FD + 1;
+  const guestToKernelFd = new Map<number, number>();
   const dirFds = new Map<number, Uint8Array>([
     [PREOPEN_ROOT_FD, new TextEncoder().encode(PREOPEN_ROOT_NAME)],
   ]);
@@ -89,6 +91,38 @@ export function buildWasiShim(
     return req;
   };
 
+  const kernelFd = (fd: number): number | undefined => {
+    if (fd >= 0 && fd <= 2) return fd;
+    return guestToKernelFd.get(fd);
+  };
+
+  const allocGuestFd = (kfd: number): number => {
+    while (
+      guestToKernelFd.has(nextGuestFd) || nextGuestFd === PREOPEN_ROOT_FD
+    ) {
+      nextGuestFd++;
+    }
+    const guestFd = nextGuestFd++;
+    guestToKernelFd.set(guestFd, kfd);
+    return guestFd;
+  };
+
+  const writeFilestat = (
+    filestatPtr: number,
+    response: Uint8Array,
+  ): number => {
+    const responseView = new DataView(response.buffer, response.byteOffset);
+    const size = responseView.getBigUint64(0, true);
+    const filetype = responseView.getUint32(8, true);
+    const buf = new Uint8Array(64);
+    const view = new DataView(buf.buffer);
+    buf[16] = filetype & 0xff;
+    view.setBigUint64(24, 1n, true); // nlink = 1
+    view.setBigUint64(32, size, true);
+    new Uint8Array(um(), filestatPtr, 64).set(buf);
+    return 0;
+  };
+
   // ── fd_write: read iovecs, sys_write payload (one syscall) ────
   const fd_write = (
     fd: number,
@@ -96,6 +130,8 @@ export function buildWasiShim(
     iovsLen: number,
     nwrittenPtr: number,
   ): number => {
+    const kfd = kernelFd(fd);
+    if (kfd === undefined) return EBADF;
     const view = new DataView(um());
     const payload: number[] = [];
     for (let i = 0; i < iovsLen; i++) {
@@ -105,7 +141,7 @@ export function buildWasiShim(
       for (let j = 0; j < bufLen; j++) payload.push(chunk[j]);
     }
     const req = new Uint8Array(4 + payload.length);
-    new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+    new DataView(req.buffer).setUint32(0, kfd >>> 0, true);
     req.set(Uint8Array.from(payload), 4);
     const rc = Number(kernel.syscall(METHOD.SYS_WRITE, pid, req, 0).rc);
     if (rc < 0) return errnoFromKernel(rc);
@@ -120,6 +156,8 @@ export function buildWasiShim(
     iovsLen: number,
     nreadPtr: number,
   ): number => {
+    const kfd = kernelFd(fd);
+    if (kfd === undefined) return EBADF;
     const view = new DataView(um());
     const iovs: { ptr: number; len: number }[] = [];
     let totalCap = 0;
@@ -130,7 +168,7 @@ export function buildWasiShim(
       totalCap += bufLen;
     }
     const req = new Uint8Array(4);
-    new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+    new DataView(req.buffer).setUint32(0, kfd >>> 0, true);
     const cap = Math.min(totalCap, kernel.scratchLen - 4);
     const { rc, response } = kernel.syscall(METHOD.SYS_READ, pid, req, cap);
     const n = Number(rc);
@@ -182,10 +220,15 @@ export function buildWasiShim(
 
   // ── fd_close → sys_close ──────────────────────────────────────
   const fd_close = (fd: number): number => {
+    const kfd = kernelFd(fd);
+    if (kfd === undefined) return EBADF;
     const req = new Uint8Array(4);
-    new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+    new DataView(req.buffer).setUint32(0, kfd >>> 0, true);
     const rc = Number(kernel.syscall(METHOD.SYS_CLOSE, pid, req, 0).rc);
-    if (rc >= 0) dirFds.delete(fd);
+    if (rc >= 0) {
+      dirFds.delete(fd);
+      guestToKernelFd.delete(fd);
+    }
     return errnoFromKernel(rc);
   };
 
@@ -196,10 +239,12 @@ export function buildWasiShim(
     whence: number,
     newOffsetPtr: number,
   ): number => {
+    const kfd = kernelFd(fd);
+    if (kfd === undefined) return EBADF;
     const off64 = typeof offset === "bigint" ? offset : BigInt(offset);
     const req = new Uint8Array(16);
     const view = new DataView(req.buffer);
-    view.setUint32(0, fd >>> 0, true);
+    view.setUint32(0, kfd >>> 0, true);
     view.setBigInt64(4, off64, true);
     view.setUint32(12, whence >>> 0, true);
     const { rc, response } = kernel.syscall(METHOD.SYS_LSEEK, pid, req, 8);
@@ -211,6 +256,21 @@ export function buildWasiShim(
     new Uint8Array(um(), newOffsetPtr, 8).set(response.subarray(0, 8));
     return 0;
   };
+  const fd_tell = (fd: number, offsetPtr: number): number => {
+    const kfd = kernelFd(fd);
+    if (kfd === undefined) return EBADF;
+    const req = new Uint8Array(16);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, kfd >>> 0, true);
+    view.setBigInt64(4, 0n, true);
+    view.setUint32(12, 1, true); // SEEK_CUR
+    const { rc, response } = kernel.syscall(METHOD.SYS_LSEEK, pid, req, 8);
+    const n = Number(rc);
+    if (n !== 8) return errnoFromKernel(n);
+    new Uint8Array(um(), offsetPtr, 8).set(response.subarray(0, 8));
+    return 0;
+  };
+  const fd_fdstat_set_flags = (_fd: number, _fdflags: number): number => 0;
   const fd_fdstat_get = (fd: number, statbuf: number): number => {
     const buf = new Uint8Array(um(), statbuf, 24);
     buf.fill(0);
@@ -224,6 +284,12 @@ export function buildWasiShim(
     }
     if (fd === PREOPEN_ROOT_FD) {
       buf[0] = 3; // DIRECTORY
+      view.setBigUint64(statbuf + 8, 0xffffffffffffffffn, true);
+      view.setBigUint64(statbuf + 16, 0xffffffffffffffffn, true);
+      return 0;
+    }
+    if (guestToKernelFd.has(fd)) {
+      buf[0] = 4; // REGULAR_FILE
       view.setBigUint64(statbuf + 8, 0xffffffffffffffffn, true);
       view.setBigUint64(statbuf + 16, 0xffffffffffffffffn, true);
       return 0;
@@ -309,12 +375,13 @@ export function buildWasiShim(
     const { rc } = kernel.syscall(METHOD.SYS_OPEN, pid, req, 0);
     const n = Number(rc);
     if (n < 0) return errnoFromKernel(n);
-    new DataView(um()).setUint32(retFdPtr, n >>> 0, true);
+    const guestFd = allocGuestFd(n);
+    new DataView(um()).setUint32(retFdPtr, guestFd >>> 0, true);
     let abs = req.slice(4);
     if (abs.byteLength > 1 && abs[abs.byteLength - 1] === 0x2f) {
       abs = abs.slice(0, abs.byteLength - 1);
     }
-    dirFds.set(n, abs);
+    dirFds.set(guestFd, abs);
     return 0;
   };
 
@@ -404,42 +471,139 @@ export function buildWasiShim(
     return errnoFromKernel(rc);
   };
 
+  const path_unlink_file = (
+    dirfd: number,
+    pathPtr: number,
+    pathLen: number,
+  ): number => {
+    if (dirfd !== PREOPEN_ROOT_FD) return EBADF;
+    const rc = Number(
+      kernel.syscall(
+        METHOD.SYS_UNLINK,
+        pid,
+        preopenAbsPath(pathPtr, pathLen),
+        0,
+      )
+        .rc,
+    );
+    return errnoFromKernel(rc);
+  };
+
+  const path_create_directory = (
+    dirfd: number,
+    pathPtr: number,
+    pathLen: number,
+  ): number => {
+    if (dirfd !== PREOPEN_ROOT_FD) return EBADF;
+    const rc = Number(
+      kernel.syscall(
+        METHOD.SYS_MKDIR,
+        pid,
+        preopenAbsPath(pathPtr, pathLen),
+        0,
+      ).rc,
+    );
+    return errnoFromKernel(rc);
+  };
+
+  const path_remove_directory = (
+    dirfd: number,
+    pathPtr: number,
+    pathLen: number,
+  ): number => {
+    if (dirfd !== PREOPEN_ROOT_FD) return EBADF;
+    const rc = Number(
+      kernel.syscall(
+        METHOD.SYS_RMDIR,
+        pid,
+        preopenAbsPath(pathPtr, pathLen),
+        0,
+      ).rc,
+    );
+    return errnoFromKernel(rc);
+  };
+
+  const path_symlink = (
+    oldPathPtr: number,
+    oldPathLen: number,
+    dirfd: number,
+    newPathPtr: number,
+    newPathLen: number,
+  ): number => {
+    if (dirfd !== PREOPEN_ROOT_FD) return EBADF;
+    const target = new Uint8Array(um(), oldPathPtr, oldPathLen).slice();
+    const linkPath = preopenAbsPath(newPathPtr, newPathLen);
+    const req = new Uint8Array(4 + target.byteLength + linkPath.byteLength);
+    new DataView(req.buffer).setUint32(0, target.byteLength >>> 0, true);
+    req.set(target, 4);
+    req.set(linkPath, 4 + target.byteLength);
+    const rc = Number(kernel.syscall(METHOD.SYS_SYMLINK, pid, req, 0).rc);
+    return errnoFromKernel(rc);
+  };
+
+  const path_readlink = (
+    dirfd: number,
+    pathPtr: number,
+    pathLen: number,
+    outPtr: number,
+    outCap: number,
+    outLenPtr: number,
+  ): number => {
+    if (dirfd !== PREOPEN_ROOT_FD) return EBADF;
+    const { rc, response } = kernel.syscall(
+      METHOD.SYS_READLINK,
+      pid,
+      preopenAbsPath(pathPtr, pathLen),
+      outCap,
+    );
+    const n = Number(rc);
+    if (n < 0) return errnoFromKernel(n);
+    new Uint8Array(um(), outPtr, n).set(response.subarray(0, n));
+    new DataView(um()).setUint32(outLenPtr, n >>> 0, true);
+    return 0;
+  };
+
   // Typed ENOSYS stubs for calls that have non-no-arg signatures and
   // get invoked by wasi-libc but aren't yet implemented. std::fs::read
   // calls fd_filestat_get to size the buffer; ENOSYS is fine since std
   // falls back to chunked reads.
   const fd_filestat_get = (fd: number, filestatPtr: number): number => {
+    const kfd = kernelFd(fd);
+    if (kfd === undefined) return EBADF;
     const req = new Uint8Array(4);
-    new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+    new DataView(req.buffer).setUint32(0, kfd >>> 0, true);
     const { rc, response } = kernel.syscall(METHOD.SYS_FSTAT, pid, req, 16);
     const n = Number(rc);
     if (n !== 16) return errnoFromKernel(n);
-    const size = new DataView(response.buffer, response.byteOffset)
-      .getBigUint64(0, true);
-    const filetype = new DataView(response.buffer, response.byteOffset)
-      .getUint32(8, true);
-    const buf = new Uint8Array(64);
-    const view = new DataView(buf.buffer);
-    buf[16] = filetype & 0xff;
-    view.setBigUint64(24, 1n, true); // nlink = 1
-    view.setBigUint64(32, size, true);
-    new Uint8Array(um(), filestatPtr, 64).set(buf);
-    return 0;
+    return writeFilestat(filestatPtr, response);
   };
   const path_filestat_get = (
-    _dirfd: number,
+    dirfd: number,
     _flags: number,
-    _pathPtr: number,
-    _pathLen: number,
-    _filestatPtr: number,
-  ): number => ENOSYS;
+    pathPtr: number,
+    pathLen: number,
+    filestatPtr: number,
+  ): number => {
+    if (dirfd !== PREOPEN_ROOT_FD) return EBADF;
+    const { rc, response } = kernel.syscall(
+      METHOD.SYS_STAT,
+      pid,
+      preopenAbsPath(pathPtr, pathLen),
+      16,
+    );
+    const n = Number(rc);
+    if (n !== 16) return errnoFromKernel(n);
+    return writeFilestat(filestatPtr, response);
+  };
 
   const implemented = {
     fd_write,
     fd_read,
     fd_close,
     fd_seek,
+    fd_tell,
     fd_fdstat_get,
+    fd_fdstat_set_flags,
     fd_filestat_get,
     proc_exit,
     clock_time_get,
@@ -451,9 +615,14 @@ export function buildWasiShim(
     fd_prestat_dir_name,
     fd_readdir,
     path_open,
+    path_create_directory,
     path_filestat_get,
     path_link,
+    path_readlink,
+    path_remove_directory,
     path_rename,
+    path_symlink,
+    path_unlink_file,
   };
 
   // Catch-all ENOSYS for the rest of preview1. Stays as data so
@@ -467,7 +636,6 @@ export function buildWasiShim(
       "fd_advise",
       "fd_allocate",
       "fd_datasync",
-      "fd_fdstat_set_flags",
       "fd_fdstat_set_rights",
       "fd_filestat_set_size",
       "fd_filestat_set_times",
@@ -475,13 +643,7 @@ export function buildWasiShim(
       "fd_pwrite",
       "fd_renumber",
       "fd_sync",
-      "fd_tell",
-      "path_create_directory",
       "path_filestat_set_times",
-      "path_readlink",
-      "path_remove_directory",
-      "path_symlink",
-      "path_unlink_file",
       "poll_oneoff",
       "proc_raise",
       "random_get",

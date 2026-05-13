@@ -296,23 +296,23 @@ args = [
 ]
 
 [import.kh_process_resume]
-doc = "Resume a suspended process instance with a scalar return value for its in-flight host import call."
+doc = "Resume a suspended process instance with a scalar return value for its in-flight host import call and an abstract run budget in nanoseconds. Hosts translate the budget into their own preemption mechanism (for example wasmtime epochs/fuel or JS safepoint cadence); kernel.wasm never exposes host-specific scheduling internals."
 return = "scalar"
 args = [
   { name = "handle", type = "i32" },
   { name = "result", type = "i64" },
+  { name = "budget_ns", type = "u64" },
 ]
 
 # ── Extension dispatch ───────────────────────────────────────────────────────
 #
 # The kernel forwards `host_extension_invoke` bytes verbatim to the
-# microkernel-side extension registry. Wire format is opaque to
-# kernel.wasm — currently JSON, but the kernel only shuttles bytes
-# between the calling process's request and the response buffer. This
-# is the architectural escape hatch for "syscalls implemented via a
-# plugin": database access, custom RPC, language-runtime hooks. Adding
-# a new extension is a microkernel-side registration, never a
-# kernel.wasm change.
+# microkernel-side extension registry. Wire format is opaque byte payloads to
+# kernel.wasm; the kernel only shuttles bytes between the calling process's
+# request and the response buffer. This is the architectural escape hatch for
+# "syscalls implemented via a plugin": database access, custom RPC,
+# language-runtime hooks. Adding a new extension is a microkernel-side
+# registration, never a kernel.wasm change.
 
 [import.kh_extension_invoke]
 doc = "Forward an extension request to the host registry. (req_ptr, req_len) is opaque guest-supplied bytes; the host writes the response bytes into (out_ptr, out_cap) and returns the number of bytes written, or negated errno (-ENOENT if no handler is registered for the requested name)."

@@ -41,6 +41,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_KERNEL_INSTALL_HOST_FS_MOUNT => install_host_fs_mount(request),
         METHOD_KERNEL_INSTALL_YURTFS => install_yurtfs(request),
         METHOD_KERNEL_LIST_PROCESSES => list_processes_response(response),
+        METHOD_KERNEL_LIST_THREADS => list_threads_response(request, response),
+        METHOD_KERNEL_SCHEDULE_NEXT => schedule_next_response(response),
         METHOD_SYS_WAIT => wait_response(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
@@ -57,6 +59,12 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_GETCWD => getcwd(caller_pid, response),
         METHOD_SYS_GETRLIMIT => getrlimit(caller_pid, request, response),
         METHOD_SYS_SETRLIMIT => setrlimit(caller_pid, request),
+        METHOD_SYS_GETPRIORITY => getpriority(caller_pid, request),
+        METHOD_SYS_SETPRIORITY => setpriority(caller_pid, request),
+        METHOD_SYS_SCHED_GETSCHEDULER => sched_getscheduler(caller_pid, request),
+        METHOD_SYS_SCHED_GETPARAM => sched_getparam(caller_pid, request),
+        METHOD_SYS_SCHED_SETSCHEDULER => sched_setscheduler(caller_pid, request),
+        METHOD_SYS_SCHED_SETPARAM => sched_setparam(caller_pid, request),
         METHOD_SYS_CLOSE => close_fd(caller_pid, request),
         METHOD_SYS_DUP => dup_fd(caller_pid, request),
         METHOD_SYS_DUP2 => dup2_fd(caller_pid, request),
@@ -87,6 +95,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_MKDIR => mkdir(caller_pid, request),
         METHOD_SYS_RMDIR => rmdir(caller_pid, request),
         METHOD_SYS_READDIR => readdir(caller_pid, request, response),
+        METHOD_SYS_REALPATH => realpath(caller_pid, request, response),
         METHOD_SYS_LINK => hard_link(caller_pid, request),
         METHOD_SYS_RENAME => rename(caller_pid, request),
         METHOD_SYS_SPAWN => sys_spawn(caller_pid, request),
@@ -153,6 +162,159 @@ fn setresgid(caller_pid: u32, request: &[u8]) -> i64 {
         p.credentials.gid = rgid;
         p.credentials.egid = egid;
         let _ = sgid;
+    });
+    0
+}
+
+const PRIO_PROCESS: u32 = 0;
+const NICE_MIN: i32 = -20;
+const NICE_MAX: i32 = 19;
+const SCHED_OTHER: i32 = 0;
+
+fn normalize_nice(nice: i32) -> i32 {
+    nice.clamp(NICE_MIN, NICE_MAX)
+}
+
+fn read_i32_at(request: &[u8], offset: usize) -> Option<i32> {
+    (request.len() >= offset + 4)
+        .then(|| i32::from_le_bytes(request[offset..offset + 4].try_into().expect("4 bytes")))
+}
+
+fn priority_target_pid(caller_pid: u32, which: u32, who: u32) -> Result<u32, i64> {
+    if which != PRIO_PROCESS {
+        return Err(-(abi::EINVAL as i64));
+    }
+    Ok(if who == 0 { caller_pid } else { who })
+}
+
+fn getpriority(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([which, who]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = match priority_target_pid(caller_pid, which, who) {
+        Ok(pid) => pid,
+        Err(rc) => return rc,
+    };
+    with_kernel(|k| {
+        if who != 0 && !k.has_process(target) {
+            return -(abi::ESRCH as i64);
+        }
+        k.process_mut(target).nice as i64
+    })
+}
+
+fn setpriority(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([which, who]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let Some(raw_nice) = read_i32_at(request, 8) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = match priority_target_pid(caller_pid, which, who) {
+        Ok(pid) => pid,
+        Err(rc) => return rc,
+    };
+    with_kernel(|k| {
+        if who != 0 && !k.has_process(target) {
+            return -(abi::ESRCH as i64);
+        }
+        let requested = normalize_nice(raw_nice);
+        let caller_euid = k.process_mut(caller_pid).credentials.euid;
+        let current = k.process_mut(target).nice;
+        if requested < current && caller_euid != 0 {
+            return -(abi::EPERM as i64);
+        }
+        k.process_mut(target).nice = requested;
+        0
+    })
+}
+
+fn scheduler_target_pid(caller_pid: u32, pid: u32) -> u32 {
+    if pid == 0 {
+        caller_pid
+    } else {
+        pid
+    }
+}
+
+fn scheduler_target_exists(caller_pid: u32, target: u32) -> bool {
+    target == caller_pid || with_kernel(|k| k.has_process(target))
+}
+
+fn sched_getscheduler(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([pid]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = scheduler_target_pid(caller_pid, pid);
+    if !scheduler_target_exists(caller_pid, target) {
+        return -(abi::ESRCH as i64);
+    }
+    with_kernel(|k| k.process_mut(target).scheduler_policy as i64)
+}
+
+fn sched_getparam(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([pid]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = scheduler_target_pid(caller_pid, pid);
+    if !scheduler_target_exists(caller_pid, target) {
+        return -(abi::ESRCH as i64);
+    }
+    with_kernel(|k| k.process_mut(target).scheduler_priority as i64)
+}
+
+fn validate_scheduler(policy: i32, priority: i32) -> Result<(), i64> {
+    if policy != SCHED_OTHER {
+        return Err(-(abi::EPERM as i64));
+    }
+    if priority != 0 {
+        return Err(-(abi::EINVAL as i64));
+    }
+    Ok(())
+}
+
+fn sched_setscheduler(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([pid]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let Some(policy) = read_i32_at(request, 4) else {
+        return -(abi::EINVAL as i64);
+    };
+    let Some(priority) = read_i32_at(request, 8) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = scheduler_target_pid(caller_pid, pid);
+    if !scheduler_target_exists(caller_pid, target) {
+        return -(abi::ESRCH as i64);
+    }
+    if let Err(rc) = validate_scheduler(policy, priority) {
+        return rc;
+    }
+    with_kernel(|k| {
+        let p = k.process_mut(target);
+        p.scheduler_policy = policy;
+        p.scheduler_priority = priority;
+    });
+    0
+}
+
+fn sched_setparam(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([pid]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let Some(priority) = read_i32_at(request, 4) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = scheduler_target_pid(caller_pid, pid);
+    if !scheduler_target_exists(caller_pid, target) {
+        return -(abi::ESRCH as i64);
+    }
+    let policy = with_kernel(|k| k.process_mut(target).scheduler_policy);
+    if let Err(rc) = validate_scheduler(policy, priority) {
+        return rc;
+    }
+    with_kernel(|k| {
+        k.process_mut(target).scheduler_priority = priority;
     });
     0
 }
@@ -275,6 +437,153 @@ fn encode_process_list(entries: &[crate::kernel::ProcessListEntry]) -> Vec<u8> {
 pub fn list_processes_response(response: &mut [u8]) -> i64 {
     with_kernel(|k| {
         let encoded = encode_process_list(&k.list_processes());
+        if response.len() < encoded.len() {
+            return encoded.len() as i64;
+        }
+        response[..encoded.len()].copy_from_slice(&encoded);
+        encoded.len() as i64
+    })
+}
+
+fn encode_thread_list(entries: &[crate::kernel::ThreadRecord]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + entries.len() * 16);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        out.extend_from_slice(&entry.tid.to_le_bytes());
+        out.push(match entry.state {
+            crate::kernel::ThreadState::Runnable => 1,
+            crate::kernel::ThreadState::Blocked => 2,
+            crate::kernel::ThreadState::Exited => 3,
+        });
+        out.push(u8::from(entry.detached));
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&entry.exit_value.unwrap_or(-1).to_le_bytes());
+        out.extend_from_slice(&entry.host_thread_handle.unwrap_or(-1).to_le_bytes());
+    }
+    out
+}
+
+pub fn list_threads_response(request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([pid]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let encoded = encode_thread_list(&k.list_threads(pid));
+        if response.len() < encoded.len() {
+            return encoded.len() as i64;
+        }
+        response[..encoded.len()].copy_from_slice(&encoded);
+        encoded.len() as i64
+    })
+}
+
+pub fn schedule_next_response(response: &mut [u8]) -> i64 {
+    const NEED: usize = 24;
+    if response.len() < NEED {
+        return NEED as i64;
+    }
+    with_kernel(|k| {
+        let Some(decision) = k.schedule_next() else {
+            return -(abi::EAGAIN as i64);
+        };
+        response[0..4].copy_from_slice(&decision.pid.to_le_bytes());
+        response[4..8].copy_from_slice(&decision.tid.to_le_bytes());
+        response[8..12].copy_from_slice(&decision.host_thread_handle.unwrap_or(-1).to_le_bytes());
+        response[12..16].copy_from_slice(&0u32.to_le_bytes());
+        response[16..24].copy_from_slice(&decision.budget_ns.to_le_bytes());
+        NEED as i64
+    })
+}
+
+const SNAPSHOT_MAGIC: &[u8; 8] = b"YURTSNP\0";
+const SNAPSHOT_VERSION: u16 = 1;
+const SNAPSHOT_SECTION_PROCESSES: u32 = 1;
+const SNAPSHOT_SECTION_THREAD_GROUPS: u32 = 2;
+const SNAPSHOT_SECTION_WAITS: u32 = 3;
+const SNAPSHOT_SECTION_RUNNABLE_THREADS: u32 = 4;
+
+fn wait_reason_code(reason: crate::kernel::WaitReason) -> u32 {
+    match reason {
+        crate::kernel::WaitReason::HostBlock => 1,
+    }
+}
+
+fn encode_thread_groups(
+    k: &crate::kernel::Kernel,
+    processes: &[crate::kernel::ProcessListEntry],
+) -> Vec<u8> {
+    let mut groups = Vec::new();
+    groups.extend_from_slice(&(processes.len() as u32).to_le_bytes());
+    for process in processes {
+        let threads = encode_thread_list(&k.list_threads(process.pid));
+        groups.extend_from_slice(&process.pid.to_le_bytes());
+        groups.extend_from_slice(&(threads.len() as u32).to_le_bytes());
+        groups.extend_from_slice(&threads);
+    }
+    groups
+}
+
+fn encode_wait_records(entries: &[crate::kernel::WaitRecord]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + entries.len() * 16);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        out.extend_from_slice(&entry.pid.to_le_bytes());
+        out.extend_from_slice(&entry.tid.to_le_bytes());
+        out.extend_from_slice(&wait_reason_code(entry.reason).to_le_bytes());
+        out.extend_from_slice(&entry.detail.to_le_bytes());
+    }
+    out
+}
+
+fn encode_runnable_threads(entries: &[crate::kernel::RunnableThread]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + entries.len() * 8);
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for entry in entries {
+        out.extend_from_slice(&entry.pid.to_le_bytes());
+        out.extend_from_slice(&entry.tid.to_le_bytes());
+    }
+    out
+}
+
+fn push_snapshot_section(out: &mut Vec<u8>, section_type: u32, body: &[u8]) {
+    out.extend_from_slice(&section_type.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(body);
+}
+
+pub fn snapshot_response(response: &mut [u8]) -> i64 {
+    with_kernel(|k| {
+        let processes = k.list_processes();
+        let process_section = encode_process_list(&processes);
+        let thread_section = encode_thread_groups(k, &processes);
+        let wait_section = encode_wait_records(&k.list_waits());
+        let runnable_section = encode_runnable_threads(&k.list_runnable_threads());
+        let mut encoded = Vec::with_capacity(
+            16 + 8
+                + process_section.len()
+                + 8
+                + thread_section.len()
+                + 8
+                + wait_section.len()
+                + 8
+                + runnable_section.len(),
+        );
+        encoded.extend_from_slice(SNAPSHOT_MAGIC);
+        encoded.extend_from_slice(&SNAPSHOT_VERSION.to_le_bytes());
+        encoded.extend_from_slice(&4u16.to_le_bytes());
+        encoded.extend_from_slice(&0u32.to_le_bytes());
+        push_snapshot_section(&mut encoded, SNAPSHOT_SECTION_PROCESSES, &process_section);
+        push_snapshot_section(
+            &mut encoded,
+            SNAPSHOT_SECTION_THREAD_GROUPS,
+            &thread_section,
+        );
+        push_snapshot_section(&mut encoded, SNAPSHOT_SECTION_WAITS, &wait_section);
+        push_snapshot_section(
+            &mut encoded,
+            SNAPSHOT_SECTION_RUNNABLE_THREADS,
+            &runnable_section,
+        );
         if response.len() < encoded.len() {
             return encoded.len() as i64;
         }
@@ -1079,6 +1388,108 @@ fn proc_self_rewrite<'a>(caller_pid: u32, path: &'a [u8]) -> std::borrow::Cow<'a
     std::borrow::Cow::Borrowed(path)
 }
 
+fn join_components(components: &[Vec<u8>]) -> Vec<u8> {
+    if components.is_empty() {
+        return b"/".to_vec();
+    }
+    let mut out = Vec::new();
+    for component in components {
+        out.push(b'/');
+        out.extend_from_slice(component);
+    }
+    out
+}
+
+fn split_components(path: &[u8]) -> std::collections::VecDeque<Vec<u8>> {
+    path.split(|b| *b == b'/')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_vec())
+        .collect()
+}
+
+fn absolute_from_cwd(cwd: &[u8], path: &[u8]) -> Vec<u8> {
+    if path.starts_with(b"/") {
+        return path.to_vec();
+    }
+    let mut out = if cwd.is_empty() {
+        b"/".to_vec()
+    } else {
+        cwd.to_vec()
+    };
+    if !out.ends_with(b"/") {
+        out.push(b'/');
+    }
+    out.extend_from_slice(path);
+    out
+}
+
+fn append_rest(mut base: Vec<u8>, rest: &std::collections::VecDeque<Vec<u8>>) -> Vec<u8> {
+    for component in rest {
+        if !base.ends_with(b"/") {
+            base.push(b'/');
+        }
+        base.extend_from_slice(component);
+    }
+    base
+}
+
+fn resolve_realpath(
+    k: &mut crate::kernel::Kernel,
+    cwd: &[u8],
+    path: &[u8],
+) -> Result<Vec<u8>, i32> {
+    if path.is_empty() || path.contains(&0) {
+        return Err(abi::EINVAL);
+    }
+    let mut pending = split_components(&absolute_from_cwd(cwd, path));
+    let mut resolved: Vec<Vec<u8>> = Vec::new();
+    let mut hops = 0u32;
+
+    while let Some(component) = pending.pop_front() {
+        if component == b"." {
+            continue;
+        }
+        if component == b".." {
+            resolved.pop();
+            continue;
+        }
+
+        let mut candidate_components = resolved.clone();
+        candidate_components.push(component.clone());
+        let candidate = join_components(&candidate_components);
+        if let Some(target) = k.vfs.readlink(&candidate) {
+            hops += 1;
+            if hops > 40 {
+                return Err(abi::EINVAL);
+            }
+            let target_path = if target.starts_with(b"/") {
+                target
+            } else {
+                let base = join_components(&resolved);
+                append_rest(base, &std::collections::VecDeque::from([target]))
+            };
+            pending = split_components(&append_rest(target_path, &pending));
+            resolved.clear();
+            continue;
+        }
+
+        let ty = k.vfs.entry_type(&candidate);
+        if ty == 0 {
+            return Err(abi::ENOENT);
+        }
+        if !pending.is_empty() && ty != 3 {
+            return Err(abi::ENOTDIR);
+        }
+        resolved.push(component);
+    }
+
+    let final_path = join_components(&resolved);
+    if k.vfs.entry_type(&final_path) == 0 {
+        return Err(abi::ENOENT);
+    }
+    Ok(final_path)
+}
+
 /// `sys_open(flags, path) -> fd`. Request: u32 flags LE + path bytes.
 /// Flags bits: 0=writable, 1=create-if-missing (O_CREAT),
 /// 2=truncate-if-exists (O_TRUNC).
@@ -1536,10 +1947,21 @@ fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
 
         let child_pid = k.alloc_spawn_pid();
         // Wire the parent/child relationship so sys_wait can reap.
+        let (parent_nice, parent_policy, parent_priority) = {
+            let parent = k.process_mut(caller_pid);
+            (
+                parent.nice,
+                parent.scheduler_policy,
+                parent.scheduler_priority,
+            )
+        };
         {
             let child = k.process_mut(child_pid);
             child.ppid = caller_pid;
             child.argv = argv.clone();
+            child.nice = parent_nice;
+            child.scheduler_policy = parent_policy;
+            child.scheduler_priority = parent_priority;
         }
         let parent = k.process_mut(caller_pid);
         if !parent.children.contains(&child_pid) {
@@ -1645,6 +2067,28 @@ fn readlink(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         let n = target.len().min(response.len());
         response[..n].copy_from_slice(&target[..n]);
         n as i64
+    })
+}
+
+/// `realpath(path) -> canonical absolute path + NUL`. The response
+/// mirrors the transitional `host_realpath` contract: return the
+/// required byte count, including the trailing NUL, even when the
+/// caller's output buffer is too small.
+fn realpath(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let path = proc_self_rewrite(caller_pid, request);
+    with_kernel(|k| {
+        let cwd = k.process(caller_pid).cwd.clone();
+        let resolved = match resolve_realpath(k, &cwd, &path) {
+            Ok(path) => path,
+            Err(errno) => return -(errno as i64),
+        };
+        let required = resolved.len() + 1;
+        if response.len() < required {
+            return required as i64;
+        }
+        response[..resolved.len()].copy_from_slice(&resolved);
+        response[resolved.len()] = 0;
+        required as i64
     })
 }
 
@@ -1934,6 +2378,185 @@ mod tests {
     fn umask_rejects_short_request() {
         assert_eq!(
             dispatch(METHOD_SYS_UMASK, 1, &[1, 2], &mut []),
+            -(abi::EINVAL as i64)
+        );
+    }
+
+    fn priority_req(which: u32, who: u32) -> Vec<u8> {
+        let mut req = which.to_le_bytes().to_vec();
+        req.extend_from_slice(&who.to_le_bytes());
+        req
+    }
+
+    fn setpriority_req(which: u32, who: u32, nice: i32) -> Vec<u8> {
+        let mut req = priority_req(which, who);
+        req.extend_from_slice(&nice.to_le_bytes());
+        req
+    }
+
+    fn sched_target_req(pid: u32) -> Vec<u8> {
+        pid.to_le_bytes().to_vec()
+    }
+
+    fn sched_setscheduler_req(pid: u32, policy: i32, priority: i32) -> Vec<u8> {
+        let mut req = pid.to_le_bytes().to_vec();
+        req.extend_from_slice(&policy.to_le_bytes());
+        req.extend_from_slice(&priority.to_le_bytes());
+        req
+    }
+
+    fn sched_setparam_req(pid: u32, priority: i32) -> Vec<u8> {
+        let mut req = pid.to_le_bytes().to_vec();
+        req.extend_from_slice(&priority.to_le_bytes());
+        req
+    }
+
+    #[test]
+    fn priority_syscalls_are_kernel_owned_per_process_state() {
+        let _g = crate::kernel::TestGuard::acquire();
+
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPRIORITY, 7, &priority_req(0, 0), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SETPRIORITY,
+                7,
+                &setpriority_req(0, 0, 10),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPRIORITY, 7, &priority_req(0, 0), &mut []),
+            10
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPRIORITY, 8, &priority_req(0, 0), &mut []),
+            0
+        );
+    }
+
+    #[test]
+    fn priority_syscalls_validate_target_and_permissions() {
+        let _g = crate::kernel::TestGuard::acquire();
+
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPRIORITY, 7, &priority_req(1, 0), &mut []),
+            -(abi::EINVAL as i64)
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPRIORITY, 7, &priority_req(0, 99), &mut []),
+            -(abi::ESRCH as i64)
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SETPRIORITY,
+                7,
+                &setpriority_req(0, 0, -1),
+                &mut []
+            ),
+            -(abi::EPERM as i64)
+        );
+
+        let root_req = [
+            0_u32.to_le_bytes(),
+            0_u32.to_le_bytes(),
+            0_u32.to_le_bytes(),
+        ]
+        .concat();
+        assert_eq!(dispatch(METHOD_SYS_SETRESUID, 7, &root_req, &mut []), 0);
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SETPRIORITY,
+                7,
+                &setpriority_req(0, 0, -20),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPRIORITY, 7, &priority_req(0, 0), &mut []),
+            -20
+        );
+    }
+
+    #[test]
+    fn scheduler_syscalls_are_kernel_owned_per_process_state() {
+        let _g = crate::kernel::TestGuard::acquire();
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SCHED_GETSCHEDULER,
+                7,
+                &sched_target_req(0),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_SCHED_GETPARAM, 7, &sched_target_req(0), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SCHED_SETSCHEDULER,
+                7,
+                &sched_setscheduler_req(0, 0, 0),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SCHED_SETPARAM,
+                7,
+                &sched_setparam_req(0, 0),
+                &mut []
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn scheduler_syscalls_validate_target_policy_and_param() {
+        let _g = crate::kernel::TestGuard::acquire();
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SCHED_GETSCHEDULER,
+                7,
+                &sched_target_req(99),
+                &mut []
+            ),
+            -(abi::ESRCH as i64)
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SCHED_SETSCHEDULER,
+                7,
+                &sched_setscheduler_req(0, 0, 1),
+                &mut []
+            ),
+            -(abi::EINVAL as i64)
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SCHED_SETSCHEDULER,
+                7,
+                &sched_setscheduler_req(0, 1, 1),
+                &mut []
+            ),
+            -(abi::EPERM as i64)
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SCHED_SETPARAM,
+                7,
+                &sched_setparam_req(0, 1),
+                &mut []
+            ),
             -(abi::EINVAL as i64)
         );
     }
@@ -4017,6 +4640,52 @@ mod tests {
     }
 
     #[test]
+    fn realpath_canonicalizes_relative_path_from_cwd() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/work", &mut []), 0);
+        assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/work", &mut []), 0);
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&14_u32.to_le_bytes());
+        reg.extend_from_slice(b"/work/file.txt");
+        reg.extend_from_slice(b"hello");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let mut out = [0u8; 64];
+        let n = dispatch(METHOD_SYS_REALPATH, 1, b"./file.txt", &mut out);
+
+        assert_eq!(n, "/work/file.txt".len() as i64 + 1);
+        assert_eq!(&out[..n as usize], b"/work/file.txt\0");
+    }
+
+    #[test]
+    fn realpath_follows_symlink_components_and_parent_traversal() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp", &mut []), 0);
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp/real", &mut []), 0);
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp/sub", &mut []), 0);
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&14_u32.to_le_bytes());
+        reg.extend_from_slice(b"/tmp/real/file");
+        reg.extend_from_slice(b"hello");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+        let mut sreq = 9_u32.to_le_bytes().to_vec();
+        sreq.extend_from_slice(b"/tmp/real");
+        sreq.extend_from_slice(b"/tmp/sub/link");
+        assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+        let mut out = [0u8; 64];
+        let n = dispatch(
+            METHOD_SYS_REALPATH,
+            1,
+            b"/tmp/sub/link/../real/file",
+            &mut out,
+        );
+
+        assert_eq!(n, "/tmp/real/file".len() as i64 + 1);
+        assert_eq!(&out[..n as usize], b"/tmp/real/file\0");
+    }
+
+    #[test]
     fn mkdir_creates_directory_and_readdir_lists_children() {
         let _g = crate::kernel::TestGuard::acquire();
         // mkdir /etc
@@ -4324,6 +4993,201 @@ mod tests {
         }
         assert!(found_child, "snapshot did not include child pid 7");
         assert_eq!(offset, n as usize);
+    }
+
+    #[test]
+    fn kernel_list_threads_serializes_kernel_owned_thread_snapshot() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let (pid, tid) = crate::kernel::with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(70));
+            let tid = k.spawn_thread(pid, Some(71)).expect("thread spawn");
+            k.block_thread(pid, tid).expect("thread block");
+            (pid, tid)
+        });
+
+        let mut out = [0u8; 64];
+        let n = dispatch(METHOD_KERNEL_LIST_THREADS, 0, &pid.to_le_bytes(), &mut out);
+        assert_eq!(n, 36);
+
+        let count = u32::from_le_bytes(out[0..4].try_into().unwrap());
+        assert_eq!(count, 2);
+
+        let main_tid = u32::from_le_bytes(out[4..8].try_into().unwrap());
+        let main_state = out[8];
+        let main_detached = out[9];
+        let main_exit = i32::from_le_bytes(out[12..16].try_into().unwrap());
+        assert_eq!(main_tid, 1);
+        assert_eq!(main_state, 1);
+        assert_eq!(main_detached, 0);
+        assert_eq!(main_exit, -1);
+
+        let main_handle = i32::from_le_bytes(out[16..20].try_into().unwrap());
+        assert_eq!(main_handle, 70);
+
+        let worker_tid = u32::from_le_bytes(out[20..24].try_into().unwrap());
+        let worker_state = out[24];
+        let worker_detached = out[25];
+        let worker_exit = i32::from_le_bytes(out[28..32].try_into().unwrap());
+        let worker_handle = i32::from_le_bytes(out[32..36].try_into().unwrap());
+        assert_eq!(worker_tid, tid);
+        assert_eq!(worker_state, 2);
+        assert_eq!(worker_detached, 0);
+        assert_eq!(worker_exit, -1);
+        assert_eq!(worker_handle, 71);
+    }
+
+    #[test]
+    fn kernel_schedule_next_returns_runnable_thread_with_abstract_budget() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let pid = crate::kernel::with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(80));
+            k.process_mut(pid).nice = -5;
+            let tid = k.spawn_thread(pid, Some(81)).expect("thread spawn");
+            k.block_thread(pid, tid).expect("thread block");
+            pid
+        });
+
+        let mut out = [0u8; 24];
+        let n = dispatch(METHOD_KERNEL_SCHEDULE_NEXT, 0, &[], &mut out);
+        assert_eq!(n, 24);
+        assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), pid);
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 1);
+        assert_eq!(i32::from_le_bytes(out[8..12].try_into().unwrap()), 80);
+        assert_eq!(u32::from_le_bytes(out[12..16].try_into().unwrap()), 0);
+        assert_eq!(
+            u64::from_le_bytes(out[16..24].try_into().unwrap()),
+            crate::kernel::scheduler_budget_ns(-5)
+        );
+    }
+
+    #[test]
+    fn kernel_schedule_next_rotates_and_reports_no_runnable_threads() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let (pid, tid) = crate::kernel::with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(90));
+            let tid = k.spawn_thread(pid, Some(91)).expect("thread spawn");
+            (pid, tid)
+        });
+
+        let mut out = [0u8; 24];
+        assert_eq!(dispatch(METHOD_KERNEL_SCHEDULE_NEXT, 0, &[], &mut out), 24);
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 1);
+        assert_eq!(dispatch(METHOD_KERNEL_SCHEDULE_NEXT, 0, &[], &mut out), 24);
+        assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), tid);
+
+        crate::kernel::with_kernel(|k| {
+            k.block_thread(pid, tid).expect("block worker");
+            k.exit_thread(pid, 1, 0).expect("exit main");
+        });
+        assert_eq!(
+            dispatch(METHOD_KERNEL_SCHEDULE_NEXT, 0, &[], &mut out),
+            -(abi::EAGAIN as i64)
+        );
+    }
+
+    #[test]
+    fn kernel_snapshot_serializes_versioned_process_and_thread_sections() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let (pid, tid) = crate::kernel::with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(80));
+            let tid = k.spawn_thread(pid, Some(81)).expect("thread spawn");
+            k.block_thread(pid, tid).expect("thread block");
+            (pid, tid)
+        });
+
+        let mut out = [0u8; 256];
+        let n = snapshot_response(&mut out);
+        assert!(n > 0, "kernel snapshot returned {n}");
+        let bytes = &out[..n as usize];
+        assert_eq!(&bytes[0..8], b"YURTSNP\0");
+        assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(bytes[10..12].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 0);
+
+        let mut offset = 16usize;
+        let first_type = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let first_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        assert_eq!(first_type, SNAPSHOT_SECTION_PROCESSES);
+        assert!(first_len > 4);
+        offset += first_len;
+
+        let second_type = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let second_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        assert_eq!(second_type, SNAPSHOT_SECTION_THREAD_GROUPS);
+        let second = &bytes[offset..offset + second_len];
+        let group_count = u32::from_le_bytes(second[0..4].try_into().unwrap());
+        assert!(group_count >= 1);
+
+        let mut group_offset = 4usize;
+        let mut found_child_thread = false;
+        for _ in 0..group_count {
+            let group_pid =
+                u32::from_le_bytes(second[group_offset..group_offset + 4].try_into().unwrap());
+            group_offset += 4;
+            let thread_len =
+                u32::from_le_bytes(second[group_offset..group_offset + 4].try_into().unwrap())
+                    as usize;
+            group_offset += 4;
+            let threads = &second[group_offset..group_offset + thread_len];
+            group_offset += thread_len;
+            if group_pid == pid {
+                assert_eq!(u32::from_le_bytes(threads[0..4].try_into().unwrap()), 2);
+                assert_eq!(u32::from_le_bytes(threads[20..24].try_into().unwrap()), tid);
+                assert_eq!(threads[24], 2);
+                found_child_thread = true;
+            }
+        }
+        assert!(found_child_thread, "snapshot did not include child thread");
+        offset += second_len;
+
+        let third_type = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let third_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        assert_eq!(third_type, SNAPSHOT_SECTION_WAITS);
+        let third = &bytes[offset..offset + third_len];
+        assert_eq!(u32::from_le_bytes(third[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(third[4..8].try_into().unwrap()), pid);
+        assert_eq!(u32::from_le_bytes(third[8..12].try_into().unwrap()), tid);
+        assert_eq!(u32::from_le_bytes(third[12..16].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(third[16..20].try_into().unwrap()), 0);
+        offset += third_len;
+
+        let fourth_type = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        offset += 4;
+        let fourth_len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        assert_eq!(fourth_type, SNAPSHOT_SECTION_RUNNABLE_THREADS);
+        let fourth = &bytes[offset..offset + fourth_len];
+        let runnable_count = u32::from_le_bytes(fourth[0..4].try_into().unwrap());
+        let mut found_main_thread = false;
+        for i in 0..runnable_count as usize {
+            let entry_offset = 4 + i * 8;
+            let runnable_pid =
+                u32::from_le_bytes(fourth[entry_offset..entry_offset + 4].try_into().unwrap());
+            let runnable_tid = u32::from_le_bytes(
+                fourth[entry_offset + 4..entry_offset + 8]
+                    .try_into()
+                    .unwrap(),
+            );
+            if runnable_pid == pid && runnable_tid == 1 {
+                found_main_thread = true;
+            }
+        }
+        assert!(
+            found_main_thread,
+            "snapshot did not include runnable main thread"
+        );
+        offset += fourth_len;
+        assert_eq!(offset, bytes.len());
     }
 
     #[test]

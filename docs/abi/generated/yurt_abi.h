@@ -201,7 +201,4 @@ FILE * yurt_popen(const char * cmd, const char * mode);
 /* Close a stream returned by yurt_popen and return command status. */
 int yurt_pclose(FILE * stream);
 
-/* Fetch helper implemented through host_network_fetch and the binary fetch record. */
-int yurt_fetch_text(const char * url, const char * method, const char * headers, const char * body, char ** out_body);
-
 #endif

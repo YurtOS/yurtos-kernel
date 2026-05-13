@@ -12,6 +12,7 @@ pub const EIO: i32 = 5;
 pub const EAGAIN: i32 = 11;
 pub const EXDEV: i32 = 18;
 pub const EEXIST: i32 = 17;
+pub const ENOTDIR: i32 = 20;
 pub const EINVAL: i32 = 22;
 pub const ENOSYS: i32 = 38;
 pub const EPIPE: i32 = 32;

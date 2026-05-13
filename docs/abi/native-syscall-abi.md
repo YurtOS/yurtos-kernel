@@ -332,4 +332,3 @@ Return convention: `record_out`
 - `int yurt_system(const char * cmd)`: Compatibility helper implemented over spawn, pipes, fd I/O, and wait. Not a host import.
 - `FILE * yurt_popen(const char * cmd, const char * mode)`: Compatibility helper implemented over spawn, pipes, fd I/O, and wait. Not a host import.
 - `int yurt_pclose(FILE * stream)`: Close a stream returned by yurt_popen and return command status.
-- `int yurt_fetch_text(const char * url, const char * method, const char * headers, const char * body, char ** out_body)`: Fetch helper implemented through host_network_fetch and the binary fetch record.

@@ -81,6 +81,7 @@ export type ArgSpec =
 export type CustomBuilder = (
   mk: Microkernel,
   memBuf: () => ArrayBuffer,
+  callerPid: number,
 ) => (...args: number[]) => Promise<number>;
 
 export interface HostBinding {
@@ -145,6 +146,36 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["scalar", "scalar", "scalar"],
   },
   { name: "host_kill", method: METHOD.SYS_KILL, args: ["scalar", "scalar"] },
+  {
+    name: "host_getpriority",
+    method: METHOD.SYS_GETPRIORITY,
+    args: ["scalar", "scalar"],
+  },
+  {
+    name: "host_setpriority",
+    method: METHOD.SYS_SETPRIORITY,
+    args: ["scalar", "scalar", "scalar"],
+  },
+  {
+    name: "host_sched_getscheduler",
+    method: METHOD.SYS_SCHED_GETSCHEDULER,
+    args: ["scalar"],
+  },
+  {
+    name: "host_sched_getparam",
+    method: METHOD.SYS_SCHED_GETPARAM,
+    args: ["scalar"],
+  },
+  {
+    name: "host_sched_setscheduler",
+    method: METHOD.SYS_SCHED_SETSCHEDULER,
+    args: ["scalar", "scalar", "scalar"],
+  },
+  {
+    name: "host_sched_setparam",
+    method: METHOD.SYS_SCHED_SETPARAM,
+    args: ["scalar", "scalar"],
+  },
   { name: "host_getpgid", method: METHOD.SYS_GETPGID, args: ["scalar"] },
   {
     name: "host_setpgid",
@@ -220,9 +251,12 @@ export const HOST_BINDINGS: HostBinding[] = [
 
   // ── File ops via path ─────────────────────────────────────
   // host_realpath(pathPtr, pathLen, outPtr, outCap) → bytes
-  // No exact sys_* equivalent yet — kernel's path resolution stays
-  // string-shaped within open(). Leave out until the kernel side
-  // grows a dedicated method.
+  {
+    name: "host_realpath",
+    method: METHOD.SYS_REALPATH,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
 
   // ── Wait / process tree ───────────────────────────────────
   // host_wait(pid, flags, outPtr, outCap) — SYS_WAIT writes the kernel-internal
@@ -232,7 +266,7 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_wait",
     method: METHOD.SYS_WAIT,
     args: [],
-    custom: (mk, memBuf) =>
+    custom: (mk, memBuf, callerPid) =>
     async (
       pid: number,
       flags: number,
@@ -243,7 +277,12 @@ export const HOST_BINDINGS: HostBinding[] = [
       const reqView = new DataView(req.buffer);
       reqView.setUint32(0, pid >>> 0, true);
       reqView.setUint32(4, flags >>> 0, true);
-      const out = await mk.syscallAsync(METHOD.SYS_WAIT, req, 8);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_WAIT,
+        callerPid,
+        req,
+        8,
+      );
       const rc = Number(out.rc);
       if (rc < 0) return rc;
       if (rc !== 8 || outCap < 16) return -7; // -E2BIG/malformed for this ABI.
@@ -266,16 +305,6 @@ export const HOST_BINDINGS: HostBinding[] = [
       if (outRc < 0) return outRc;
       return 16;
     },
-  },
-
-  // ── Extensions / native invoke ────────────────────────────
-  // host_native_invoke(reqPtr, reqLen, outPtr, outCap) — same wire
-  // shape as kh_extension_invoke (just forwards bytes).
-  {
-    name: "host_native_invoke",
-    method: METHOD.SYS_EXTENSION_INVOKE,
-    args: ["ptr_len", "out_cap"],
-    returnsBytes: true,
   },
 
   // ── fd duplication ────────────────────────────────────────
@@ -366,8 +395,8 @@ export const HOST_BINDINGS: HostBinding[] = [
 
   // ── Networking ────────────────────────────────────────────
   // host_network_fetch(reqPtr, reqLen, outPtr, outCap) → bytes.
-  // Same wire shape as host_native_invoke; SYS_FETCH consumes
-  // the JSON request and writes the JSON response.
+  // SYS_FETCH consumes the native fetch request record and writes
+  // the native fetch response record.
   {
     name: "host_network_fetch",
     method: METHOD.SYS_FETCH,
@@ -382,7 +411,7 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_socket_connect",
     method: METHOD.SYS_SOCKET_CONNECT,
     args: [],
-    custom: (mk, memBuf) =>
+    custom: (mk, memBuf, callerPid) =>
     async (
       addrPtr: number,
       addrLen: number,
@@ -393,7 +422,12 @@ export const HOST_BINDINGS: HostBinding[] = [
       const req = new Uint8Array(8 + addr.length);
       new DataView(req.buffer).setUint32(4, flags >>> 0, true);
       req.set(addr, 8);
-      const out = await mk.syscallAsync(METHOD.SYS_SOCKET_CONNECT, req, 0);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_CONNECT,
+        callerPid,
+        req,
+        0,
+      );
       return Number(out.rc);
     },
   },
@@ -485,9 +519,14 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_time",
     method: METHOD.SYS_CLOCK_GETTIME,
     args: [],
-    custom: (mk) => async (): Promise<number> => {
+    custom: (mk, _memBuf, callerPid) => async (): Promise<number> => {
       const req = new Uint8Array(4); // CLOCK_REALTIME = 0
-      const out = await mk.syscallAsync(METHOD.SYS_CLOCK_GETTIME, req, 8);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_CLOCK_GETTIME,
+        callerPid,
+        req,
+        8,
+      );
       if (Number(out.rc) !== 8) return 0;
       const ns = new DataView(
         out.response.buffer,
@@ -505,7 +544,7 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_read_file",
     method: METHOD.SYS_OPEN, // first hop; documentation only
     args: [],
-    custom: (mk, memBuf) =>
+    custom: (mk, memBuf, callerPid) =>
     async (
       pathPtr: number,
       pathLen: number,
@@ -517,13 +556,23 @@ export const HOST_BINDINGS: HostBinding[] = [
       const openReq = new Uint8Array(4 + path.length);
       // flags=0 → read-only.
       openReq.set(path, 4);
-      const openOut = await mk.syscallAsync(METHOD.SYS_OPEN, openReq, 0);
+      const openOut = await mk.kernelSyscallAsync(
+        METHOD.SYS_OPEN,
+        callerPid,
+        openReq,
+        0,
+      );
       const fd = Number(openOut.rc);
       if (fd < 0) return fd;
       try {
         const readReq = new Uint8Array(4);
         new DataView(readReq.buffer).setUint32(0, fd, true);
-        const readOut = await mk.syscallAsync(METHOD.SYS_READ, readReq, outCap);
+        const readOut = await mk.kernelSyscallAsync(
+          METHOD.SYS_READ,
+          callerPid,
+          readReq,
+          outCap,
+        );
         const n = Number(readOut.rc);
         if (n > 0) {
           const outRc = copyOut(
@@ -537,7 +586,7 @@ export const HOST_BINDINGS: HostBinding[] = [
       } finally {
         const closeReq = new Uint8Array(4);
         new DataView(closeReq.buffer).setUint32(0, fd, true);
-        await mk.syscallAsync(METHOD.SYS_CLOSE, closeReq, 0);
+        await mk.kernelSyscallAsync(METHOD.SYS_CLOSE, callerPid, closeReq, 0);
       }
     },
   },
@@ -550,7 +599,7 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_write_file",
     method: METHOD.SYS_OPEN,
     args: [],
-    custom: (mk, memBuf) =>
+    custom: (mk, memBuf, callerPid) =>
     async (
       pathPtr: number,
       pathLen: number,
@@ -565,7 +614,12 @@ export const HOST_BINDINGS: HostBinding[] = [
       const openReq = new Uint8Array(4 + path.length);
       new DataView(openReq.buffer).setUint32(0, flags, true);
       openReq.set(path, 4);
-      const openOut = await mk.syscallAsync(METHOD.SYS_OPEN, openReq, 0);
+      const openOut = await mk.kernelSyscallAsync(
+        METHOD.SYS_OPEN,
+        callerPid,
+        openReq,
+        0,
+      );
       const fd = Number(openOut.rc);
       if (fd < 0) return fd;
       try {
@@ -577,19 +631,29 @@ export const HOST_BINDINGS: HostBinding[] = [
           lv.setUint32(0, fd, true);
           lv.setBigInt64(4, 0n, true);
           lv.setUint32(12, 2, true);
-          await mk.syscallAsync(METHOD.SYS_LSEEK, lseekReq, 8);
+          await mk.kernelSyscallAsync(
+            METHOD.SYS_LSEEK,
+            callerPid,
+            lseekReq,
+            8,
+          );
         }
         const data = copyIn(memBuf, dataPtr, dataLen);
         if (typeof data === "number") return data;
         const writeReq = new Uint8Array(4 + data.length);
         new DataView(writeReq.buffer).setUint32(0, fd, true);
         writeReq.set(data, 4);
-        const writeOut = await mk.syscallAsync(METHOD.SYS_WRITE, writeReq, 0);
+        const writeOut = await mk.kernelSyscallAsync(
+          METHOD.SYS_WRITE,
+          callerPid,
+          writeReq,
+          0,
+        );
         return Number(writeOut.rc);
       } finally {
         const closeReq = new Uint8Array(4);
         new DataView(closeReq.buffer).setUint32(0, fd, true);
-        await mk.syscallAsync(METHOD.SYS_CLOSE, closeReq, 0);
+        await mk.kernelSyscallAsync(METHOD.SYS_CLOSE, callerPid, closeReq, 0);
       }
     },
   },
@@ -617,12 +681,22 @@ export const HOST_BINDINGS: HostBinding[] = [
 export function buildWasmKernelImports(
   mk: Microkernel,
   memBuf: () => ArrayBuffer,
+  callerPid = 0,
+  initialCwd?: string,
 ): Record<string, (...args: number[]) => Promise<number>> {
+  if (initialCwd) {
+    mk.kernelSyscall(
+      METHOD.SYS_CHDIR,
+      callerPid,
+      new TextEncoder().encode(initialCwd),
+      0,
+    );
+  }
   const imports: Record<string, (...args: number[]) => Promise<number>> = {};
   for (const b of HOST_BINDINGS) {
     imports[b.name] = b.custom
-      ? b.custom(mk, memBuf)
-      : makeWrapper(b, mk, memBuf);
+      ? b.custom(mk, memBuf, callerPid)
+      : makeWrapper(b, mk, memBuf, callerPid);
   }
   return imports;
 }
@@ -661,6 +735,7 @@ function makeWrapper(
   b: HostBinding,
   mk: Microkernel,
   memBuf: () => ArrayBuffer,
+  callerPid: number,
 ): (...args: number[]) => Promise<number> {
   return async (...args: number[]): Promise<number> => {
     // Apply optional argument permutation. The reordered view is
@@ -724,7 +799,7 @@ function makeWrapper(
       req.set(p, cursor);
       cursor += p.byteLength;
     }
-    const out = await mk.syscallAsync(b.method, req, outCap);
+    const out = await mk.kernelSyscallAsync(b.method, callerPid, req, outCap);
     const rc = Number(out.rc);
     if (b.returnsBytes && rc > 0 && outCap > 0) {
       const outRc = copyOut(memBuf, outPtr, out.response.subarray(0, rc));

@@ -88,6 +88,12 @@ const METHOD_SYS_IDB_LIST: u32 = 0x1_0038;
 const METHOD_SYS_SOCKET_LISTEN: u32 = 0x1_0039;
 const METHOD_SYS_SOCKET_ACCEPT: u32 = 0x1_003A;
 const METHOD_SYS_SOCKET_ADDR: u32 = 0x1_003B;
+const METHOD_SYS_GETPRIORITY: u32 = 0x1_003D;
+const METHOD_SYS_SETPRIORITY: u32 = 0x1_003E;
+const METHOD_SYS_SCHED_GETSCHEDULER: u32 = 0x1_003F;
+const METHOD_SYS_SCHED_GETPARAM: u32 = 0x1_0040;
+const METHOD_SYS_SCHED_SETSCHEDULER: u32 = 0x1_0041;
+const METHOD_SYS_SCHED_SETPARAM: u32 = 0x1_0042;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -121,14 +127,22 @@ fn kernel_wasm_export_surface_is_locked() {
     assert_eq!(
         exports,
         vec![
+            "kernel_block_thread",
+            "kernel_detach_thread",
             "kernel_dispatch",
             "kernel_drain_spawn",
             "kernel_kill",
             "kernel_list_processes",
+            "kernel_list_threads",
             "kernel_record_exit",
+            "kernel_record_thread_exit",
+            "kernel_schedule_next",
             "kernel_scratch_len",
             "kernel_scratch_ptr",
+            "kernel_snapshot",
             "kernel_spawn_process",
+            "kernel_spawn_thread",
+            "kernel_unblock_thread",
             "kernel_wait",
             "memory",
         ]
@@ -161,6 +175,154 @@ fn wasmtime_adapter_lists_kernel_owned_process_snapshot() {
     assert!(snapshot.fds.contains(&0));
     assert!(snapshot.fds.contains(&1));
     assert!(snapshot.fds.contains(&2));
+}
+
+#[test]
+fn wasmtime_adapter_lists_kernel_owned_thread_snapshot() {
+    let mk = fresh_microkernel(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 7))
+        "#,
+    )
+    .unwrap();
+
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+    let threads = mk.list_threads(proc.pid()).unwrap();
+
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].tid, 1);
+    assert_eq!(threads[0].state, "runnable");
+    assert!(!threads[0].detached);
+    assert_eq!(threads[0].exit_value, None);
+}
+
+#[test]
+fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
+    let mk = fresh_microkernel(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 7))
+        "#,
+    )
+    .unwrap();
+
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+    let tid = mk.spawn_thread(proc.pid(), 91).unwrap();
+    assert_eq!(tid, 2);
+
+    mk.block_thread(proc.pid(), tid).unwrap();
+    let blocked = mk
+        .list_threads(proc.pid())
+        .unwrap()
+        .into_iter()
+        .find(|thread| thread.tid == tid)
+        .unwrap();
+    assert_eq!(blocked.state, "blocked");
+    assert_eq!(blocked.host_thread_handle, Some(91));
+
+    mk.unblock_thread(proc.pid(), tid).unwrap();
+    mk.detach_thread(proc.pid(), tid).unwrap();
+    mk.record_thread_exit(proc.pid(), tid, 123).unwrap();
+
+    let exited = mk
+        .list_threads(proc.pid())
+        .unwrap()
+        .into_iter()
+        .find(|thread| thread.tid == tid)
+        .unwrap();
+    assert_eq!(exited.state, "exited");
+    assert!(exited.detached);
+    assert_eq!(exited.exit_value, Some(123));
+}
+
+#[test]
+fn wasmtime_adapter_reads_kernel_scheduler_decisions() {
+    let mk = fresh_microkernel(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 7))
+        "#,
+    )
+    .unwrap();
+
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+    let tid = mk.spawn_thread(proc.pid(), 91).unwrap();
+
+    let first = mk.schedule_next().unwrap().unwrap();
+    assert_eq!(first.pid, proc.pid());
+    assert_eq!(first.tid, 1);
+    assert_eq!(first.budget_ns, 20_000_000);
+
+    let second = mk.schedule_next().unwrap().unwrap();
+    assert_eq!(second.pid, proc.pid());
+    assert_eq!(second.tid, tid);
+    assert_eq!(second.host_thread_handle, Some(91));
+    assert_eq!(second.flags, 0);
+}
+
+#[test]
+fn wasmtime_user_process_applies_kernel_schedule_budget() {
+    let mk = fresh_microkernel(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 7))
+        "#,
+    )
+    .unwrap();
+
+    let mut proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/budgeted".as_slice()])
+        .unwrap();
+    let decision = mk.schedule_next().unwrap().unwrap();
+
+    assert!(proc.apply_schedule_decision(decision).unwrap());
+    assert_eq!(proc.last_scheduler_budget_ns(), Some(decision.budget_ns));
+    assert_eq!(proc.last_scheduler_epoch_quantum(), Some(20));
+}
+
+#[test]
+fn wasmtime_adapter_reads_binary_kernel_snapshot() {
+    let mk = fresh_microkernel(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 7))
+        "#,
+    )
+    .unwrap();
+
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+    let tid = mk.spawn_thread(proc.pid(), 91).unwrap();
+    mk.block_thread(proc.pid(), tid).unwrap();
+
+    let snapshot = mk.snapshot_kernel_state().unwrap();
+    assert_eq!(&snapshot[0..8], b"YURTSNP\0");
+    assert_eq!(u16::from_le_bytes(snapshot[8..10].try_into().unwrap()), 1);
+    assert_eq!(u16::from_le_bytes(snapshot[10..12].try_into().unwrap()), 4);
+    assert_eq!(u32::from_le_bytes(snapshot[12..16].try_into().unwrap()), 0);
 }
 
 #[test]
@@ -1950,6 +2112,40 @@ fn user_process_setresgid_changes_subsequent_getgid() {
 }
 
 #[test]
+fn user_process_scheduler_imports_route_through_kernel_state() {
+    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_sched_getscheduler" (func $getscheduler (param i32) (result i32)))
+          (import "env" "sys_sched_getparam" (func $getparam (param i32) (result i32)))
+          (import "env" "sys_sched_setscheduler" (func $setscheduler (param i32 i32 i32) (result i32)))
+          (import "env" "sys_sched_setparam" (func $setparam (param i32 i32) (result i32)))
+          (func (export "get_policy") (result i32)
+            (call $getscheduler (i32.const 0)))
+          (func (export "get_param") (result i32)
+            (call $getparam (i32.const 0)))
+          (func (export "setscheduler_other") (result i32)
+            (call $setscheduler (i32.const 0) (i32.const 0) (i32.const 0)))
+          (func (export "setparam_zero") (result i32)
+            (call $setparam (i32.const 0) (i32.const 0)))
+          (func (export "setparam_nonzero") (result i32)
+            (call $setparam (i32.const 0) (i32.const 1)))
+          (func (export "setscheduler_fifo") (result i32)
+            (call $setscheduler (i32.const 0) (i32.const 1) (i32.const 1))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    assert_eq!(user.call_export_i32("get_policy").unwrap(), 0);
+    assert_eq!(user.call_export_i32("get_param").unwrap(), 0);
+    assert_eq!(user.call_export_i32("setscheduler_other").unwrap(), 0);
+    assert_eq!(user.call_export_i32("setparam_zero").unwrap(), 0);
+    assert_eq!(user.call_export_i32("setparam_nonzero").unwrap(), -22);
+    assert_eq!(user.call_export_i32("setscheduler_fifo").unwrap(), -1);
+}
+
+#[test]
 fn user_process_can_call_kernel_multiple_times() {
     // The Rc<RefCell<KernelInstance>> sharing pattern must support
     // repeated borrow_mut acquisitions without deadlock or panic.
@@ -2018,6 +2214,36 @@ fn microkernel_method_ids_match_yurt_abi_methods_toml() {
             "sys_setrlimit",
             METHOD_SYS_SETRLIMIT,
             METHOD_SYS_SETRLIMIT as i64,
+        ),
+        (
+            "sys_getpriority",
+            METHOD_SYS_GETPRIORITY,
+            METHOD_SYS_GETPRIORITY as i64,
+        ),
+        (
+            "sys_setpriority",
+            METHOD_SYS_SETPRIORITY,
+            METHOD_SYS_SETPRIORITY as i64,
+        ),
+        (
+            "sys_sched_getscheduler",
+            METHOD_SYS_SCHED_GETSCHEDULER,
+            METHOD_SYS_SCHED_GETSCHEDULER as i64,
+        ),
+        (
+            "sys_sched_getparam",
+            METHOD_SYS_SCHED_GETPARAM,
+            METHOD_SYS_SCHED_GETPARAM as i64,
+        ),
+        (
+            "sys_sched_setscheduler",
+            METHOD_SYS_SCHED_SETSCHEDULER,
+            METHOD_SYS_SCHED_SETSCHEDULER as i64,
+        ),
+        (
+            "sys_sched_setparam",
+            METHOD_SYS_SCHED_SETPARAM,
+            METHOD_SYS_SCHED_SETPARAM as i64,
         ),
         ("sys_close", METHOD_SYS_CLOSE, METHOD_SYS_CLOSE as i64),
         ("sys_dup", METHOD_SYS_DUP, METHOD_SYS_DUP as i64),

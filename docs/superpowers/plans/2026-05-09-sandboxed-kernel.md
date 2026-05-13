@@ -28,6 +28,24 @@ many syscall families; the work now is to make those routes selectable from the
 existing sandbox, run the same fixtures through TS and wasm kernels, and close
 the adapter gaps that parity exposes.
 
+Current Phase C status:
+`packages/kernel/src/__tests__/sandbox-wasm-kernel_test.ts` now runs
+deterministic fixtures through both `Sandbox.create()`'s TS-kernel default and
+`kernelImpl: "wasm"` mode, comparing exit code, stdout, and stderr for
+argv/stdout, zero exit, nonzero exit, std env/process, and std paths canary
+coverage. The portable JS WASI shim now keeps guest fd numbers distinct from
+kernel fd numbers, reserves WASI preopen fd 3, and forwards `fd_tell`,
+`path_create_directory`, `path_filestat_get`, `path_readlink`,
+`path_remove_directory`, `path_symlink`, and `path_unlink_file` to Rust-kernel
+syscalls. The Rust kernel now owns `SYS_REALPATH`, and both the Deno
+host-wrapper table and portable JS user-process `yurt.host_realpath` import
+route postlinked Rust `std::fs::canonicalize` through that syscall. Direct JS
+microkernel coverage now runs the checked-in `std-fs-canary.wasm`, and
+sandbox-level parity coverage now runs the same std-fs canary through both the
+TS kernel and wasm kernel from a writable cwd. The Sandbox wasm-kernel adapter
+now mirrors each TS loader pid and cwd into the Rust kernel before Rust-owned
+`host_realpath` runs.
+
 ## Architecture To Preserve
 
 Two ABI surfaces stay separate:
@@ -97,21 +115,28 @@ records.
 
 ### Phase B2 — Kernel-Owned Process Control
 
-- Define the host-control exports in `packages/kernel-wasm` before changing TS
+Status: substantially implemented for process/thread ownership and first
+binary snapshot surface. Remaining B2 work is integration of real pthread
+backends and removal of old TS-owned compatibility surfaces where they still
+exist outside wasm-kernel mode.
+
+- The host-control exports in `packages/kernel-wasm` are defined before TS
   compatibility shims. `kernel_list_processes`, `kernel_kill`, and `kernel_wait`
-  now exist. The kernel-driven cached-module spawn path now exists as
+  exist. The kernel-driven cached-module spawn path exists as
   `kernel_spawn_process`: it allocates the pid before calling
   `kh_spawn_process`, passes that pid in a binary `spawn_context_v1` record,
   records the returned opaque instance handle in the kernel-owned process
   record, and stores argv. Rust `kh` wrappers and portable JS KH-adapter
   bindings now exist for the wasm-engine import family (`kh_spawn_process`,
   `kh_destroy_instance`, `kh_process_mem_read`, `kh_process_mem_write`,
-  `kh_process_resume`). The portable JS KH adapter now has a host module cache
-  and opaque instance-handle table for cached modules, including process memory
-  read/write and destroy. Kernel `kill` now destroys an attached KH instance
-  handle and clears it only after the KH adapter reports success.
-  `kh_process_resume` still returns `-ENOSYS` until the scheduler/resume loop
-  lands. The remaining reserved export is `kernel_snapshot`.
+  `kh_process_resume`). `kh_process_resume` now accepts a kernel-authored
+  abstract `budget_ns`, so wasmtime can translate the scheduler decision into
+  fuel/epoch configuration without exposing those internals through the kernel
+  ABI. The portable JS KH adapter now has a host module cache and opaque
+  instance-handle table for cached modules, including process memory read/write
+  and destroy. Kernel `kill` now destroys an attached KH instance handle and
+  clears it only after the KH adapter reports success. `kh_process_resume`
+  still returns `-ENOSYS` until the scheduler/resume loop lands.
 - The portable JS KH adapter can now instantiate cached user modules with
   pid-bound syscall imports through `spawnCachedUserProcess`, and the public
   `spawnUserProcessWithArgs` helper now caches anonymous modules and uses that
@@ -134,10 +159,10 @@ records.
   generic dispatch method ids for process lifecycle notification and
   pending-spawn draining, and the old generic dispatch method ids have been
   removed from the kernel ABI contract.
-- Add a shared binary process-list record in Rust first. The first version
-  should encode count-prefixed process entries with `pid`, `ppid`, `pgid`,
-  `sid`, state, exit status, command bytes, and visible fd numbers. Keep the
-  decoder test close to the Rust kernel test so record drift fails locally.
+- The shared binary process-list record exists in Rust. It encodes
+  count-prefixed process entries with `pid`, `ppid`, `pgid`, `sid`, state, exit
+  status, command bytes, and visible fd numbers. Rust, JS, and native wasmtime
+  tests cover the record shape.
 - Route microkernel process observability through the Rust export. In JS/Deno
   and wasmtime adapters, the host may render the returned snapshot, but it does
   not create the process list. The JS adapter and native wasmtime adapter now
@@ -148,27 +173,82 @@ records.
   adapter. JS and native wasmtime now call `kernel_kill` / `kernel_wait`
   directly; the KH adapter decodes return records but does not own process
   state.
-- Only after the Rust export and adapter path are covered, update the temporary
-  TS-kernel path to mirror the same binary record where existing userland still
-  needs compatibility. Do not introduce new TS-owned process APIs.
-- Remove remaining JSON process-control paths incrementally:
-  `host_list_processes`, shell-fixture `ps` parsing, run-result transport, and
-  spawn compatibility fallbacks. Each removal gets a focused test proving the
-  binary record shape.
+- Start the kernel-owned thread model before wiring PR37's Worker/SAB backend
+  into wasm-kernel mode. The Rust kernel now records per-process thread groups
+  with main-thread initialization, spawned thread records, runnable/blocked/
+  exited state, detached status, exit values, and opaque host-thread handles.
+  `kernel_list_threads` serializes those records as a binary host-control
+  snapshot, and the JS/native microkernels decode it for embedder
+  observability.
+- Expose typed host-control thread lifecycle hooks before binding PR37's
+  Worker/SAB backend: `kernel_spawn_thread`, `kernel_block_thread`,
+  `kernel_unblock_thread`, `kernel_detach_thread`, and
+  `kernel_record_thread_exit` now mutate the Rust kernel's thread table, and
+  the JS/native microkernel wrappers keep the host out of thread-state
+  ownership.
+- Move nice/priority policy into kernel.wasm. `sys_getpriority`,
+  `sys_setpriority`, `sys_sched_getscheduler`, `sys_sched_getparam`,
+  `sys_sched_setscheduler`, and `sys_sched_setparam` now mutate or read
+  kernel-owned process scheduling state. The kernel enforces the root-only
+  priority raise rule, accepts the current SCHED_OTHER/priority-0 contract, and
+  rejects unsupported realtime policy without delegating policy ownership to
+  the host. Child process creation inherits the parent nice/scheduler values.
+  `kernel_schedule_next` returns a binary schedule decision with `pid/tid`, an
+  opaque host handle, flags, and `budget_ns`; JS and native wasmtime adapters
+  decode that record but do not author scheduler policy.
+- Add the first concrete `kernel_snapshot` export. V1 returns a versioned
+  `YURTSNP\0` binary envelope with process-list, thread-group, wait-record, and
+  runnable-thread sections. Blocked threads now carry a kernel-owned wait
+  reason, and the snapshot serializes that as count-prefixed
+  `pid/tid/reason/detail` records. Runnable threads serialize as
+  count-prefixed `pid/tid` records. This is not full suspend/resume yet; it is
+  the stable kernel-authored container that future richer scheduler queues,
+  fd/VFS/pipe state, module identities, and memory sections will extend.
+- Treat PR37's Worker/SAB pthread backend as host-interface machinery, not final
+  ownership. Its module detection, shared-memory setup, Worker creation, and
+  async import wrapping are reusable; thread slots, mutex/condvar queues,
+  pthread join state, and poll/select waiters move into kernel.wasm. PR37 has
+  landed on `main`; this branch now carries its relevant loader/profile/backend
+  tests so future Rust-kernel threading work preserves the same guest-facing
+  behavior while moving ownership out of TypeScript.
+- Temporary TS-kernel compatibility should only mirror binary records where
+  existing userland still needs compatibility. Do not introduce new TS-owned
+  process APIs.
+- The old TS host import `host_list_processes` has been removed, and the
+  shell-exec fixture no longer parses a JSON process list for `ps`. Remaining
+  cleanup is to remove old process/run transport compatibility and spawn
+  compatibility fallbacks incrementally. Each removal gets a focused test
+  proving the binary record shape or absence of the legacy import.
 
 ### Phase C — Parity Harness
 
+Status: partial. The first sandbox-level TS-vs-wasm fixture parity tests exist
+for exit code/stdout/stderr and selected std canaries. Filesystem side effects,
+process-status comparison, socket/fetch parity, and shell/BusyBox parity remain
+open.
+
 - Add a focused parity runner that executes the same deterministic fixture
   through TS kernel mode and wasm kernel mode and compares exit code, stdout,
-  stderr, cwd/filesystem side effects, and relevant process status.
+  stderr, cwd/filesystem side effects, and relevant process status. The first
+  Sandbox-level runner exists for exit/stdout/stderr comparisons; filesystem
+  side-effect and process-status comparisons are still pending.
 - Start with smoke commands that exercise already-ported syscall families:
   `true`, `false`, `echo`, `cat`, `wc`, simple pipes, cwd/stat/read/write,
   procfs reads, and basic fetch/socket tests where host support exists.
 - Promote `Sandbox.create({ kernelImpl: "wasm" })` tests from a probe-only
   integration check to fixture parity. Existing TS-kernel tests remain the
-  source of truth until wasm mode matches them.
+  source of truth until wasm mode matches them. The probe test remains, but the
+  file now also covers real fixture execution through both kernels.
+- Add Rust-kernel realpath/canonicalize support and route transitional
+  `host_realpath` through it. Direct JS microkernel and Deno wrapper coverage
+  now exercise this path. Sandbox wasm-kernel coverage mirrors per-process cwd
+  into `kernel.wasm`, and the parity runner now compares `std-fs-canary.wasm`
+  against the TS kernel from a writable cwd.
 
 ### Phase D — Standard Image and BusyBox
+
+Status: not complete. A local standard image artifact may exist in this
+worktree, but it is not part of the committed kernel-as-wasm slice yet.
 
 - Build `standard.yurtimg` and run representative BusyBox commands through wasm
   kernel mode: shell startup, `printf | wc -l`, file writes, directory
@@ -178,6 +258,9 @@ records.
   the same failure reproduces under `kernelImpl: "wasm"`.
 
 ### Phase E — CI Rollout and TS Deletion
+
+Status: not started. TS remains the default until the wasm kernel passes the
+full parity and guest-compat matrix.
 
 - Add non-default CI coverage for wasm-kernel parity after the focused local
   suite is reliable.

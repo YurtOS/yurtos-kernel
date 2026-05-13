@@ -85,11 +85,7 @@ const FETCH_FLAG_MANUAL_REDIRECT: u16 = 1;
 #[cfg(target_arch = "wasm32")]
 const FETCH_RESPONSE_FLAG_OK: u16 = 1;
 #[cfg(target_arch = "wasm32")]
-const FILETYPE_DIRECTORY: u32 = 3;
-#[cfg(target_arch = "wasm32")]
-const FILETYPE_REGULAR_FILE: u32 = 4;
-#[cfg(target_arch = "wasm32")]
-const FILETYPE_SYMBOLIC_LINK: u32 = 7;
+const STAT_RECORD_SIZE: usize = 32;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatInfo {
@@ -247,9 +243,6 @@ pub trait HostInterface {
     /// Returns exit code if done, -1 if still running.
     fn waitpid_nohang(&self, pid: i32) -> Result<i32, HostError>;
 
-    /// Get a JSON-encoded list of all processes in the kernel.
-    fn list_processes(&self) -> Result<String, HostError>;
-
     // ----- Socket operations (full mode) -----
 
     /// Open a TCP or TLS socket to host:port. Returns a socket_id.
@@ -306,7 +299,7 @@ extern "C" {
         mode: u32,
     ) -> i32;
 
-    /// List directory entries as packed binary records.
+    /// List directory entries as a native string-list record.
     pub fn host_readdir(path_ptr: *const u8, path_len: u32, out_ptr: *mut u8, out_cap: u32) -> i32;
 
     /// Create a directory (and parents).
@@ -318,7 +311,7 @@ extern "C" {
     /// Set file mode bits.
     pub fn host_chmod(path_ptr: *const u8, path_len: u32, mode: u32) -> i32;
 
-    /// Glob pattern match as a packed binary string list.
+    /// Glob pattern match as a native string-list record.
     pub fn host_glob(
         pattern_ptr: *const u8,
         pattern_len: u32,
@@ -397,9 +390,6 @@ extern "C" {
     /// Yield to the JS microtask queue (cooperative scheduling: sleep(0)).
     /// JSPI-suspending — allows other WASM stacks to run.
     fn host_yield();
-
-    /// List all processes. Writes JSON array to output buffer.
-    fn host_list_processes(out_ptr: *mut u8, out_cap: u32) -> i32;
 
     // ----- Socket syscalls (full mode) -----
 
@@ -537,66 +527,70 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn decode_stat_record(bytes: &[u8]) -> Result<StatInfo, HostError> {
-    if bytes.len() < 16 {
-        return Err(HostError::IoError("stat: short response".to_owned()));
+fn decode_stat_record(bytes: &[u8], context: &str) -> Result<StatInfo, HostError> {
+    if bytes.len() < STAT_RECORD_SIZE {
+        return Err(HostError::IoError(format!(
+            "stat {context}: short native stat record"
+        )));
     }
-    let size = read_u64(bytes, 0);
-    let filetype = read_u32(bytes, 8);
+    let record_size = read_u32(bytes, 0) as usize;
+    let version = read_u16(bytes, 4);
+    if record_size != STAT_RECORD_SIZE || version != 1 {
+        return Err(HostError::IoError(format!(
+            "stat {context}: invalid native stat record"
+        )));
+    }
+    let type_bits = read_u32(bytes, 8);
     let mode = read_u32(bytes, 12);
     Ok(StatInfo {
         exists: true,
-        is_file: filetype == FILETYPE_REGULAR_FILE,
-        is_dir: filetype == FILETYPE_DIRECTORY,
-        is_symlink: filetype == FILETYPE_SYMBOLIC_LINK,
-        size,
+        is_file: type_bits & 1 != 0,
+        is_dir: type_bits & 2 != 0,
+        is_symlink: type_bits & 4 != 0,
+        size: read_u64(bytes, 16),
         mode,
-        mtime_ms: 0,
+        mtime_ms: read_u64(bytes, 24),
     })
 }
 
 #[cfg(target_arch = "wasm32")]
-fn decode_readdir_record(bytes: &[u8]) -> Result<Vec<String>, HostError> {
-    if bytes.len() < 4 {
-        return Err(HostError::IoError("readdir: short response".to_owned()));
-    }
-    let count = read_u32(bytes, 0) as usize;
-    let mut offset = 4usize;
-    let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        if bytes.len() < offset + 5 {
-            return Err(HostError::IoError("readdir: truncated entry".to_owned()));
-        }
-        let len = read_u32(bytes, offset) as usize;
-        offset += 5; // length + filetype byte
-        if bytes.len() < offset + len {
-            return Err(HostError::IoError("readdir: truncated name".to_owned()));
-        }
-        out.push(String::from_utf8_lossy(&bytes[offset..offset + len]).into_owned());
-        offset += len;
-    }
-    Ok(out)
-}
-
-#[cfg(target_arch = "wasm32")]
 fn decode_string_list_record(bytes: &[u8], context: &str) -> Result<Vec<String>, HostError> {
-    if bytes.len() < 4 {
-        return Err(HostError::IoError(format!("{context}: short response")));
+    if bytes.len() < 24 {
+        return Err(HostError::IoError(format!(
+            "{context}: short native string-list record"
+        )));
     }
-    let count = read_u32(bytes, 0) as usize;
-    let mut offset = 4usize;
+    let size = read_u32(bytes, 0) as usize;
+    let version = read_u16(bytes, 4);
+    let count = read_u32(bytes, 8) as usize;
+    let entries_offset = read_u32(bytes, 12) as usize;
+    let strings_offset = read_u32(bytes, 16) as usize;
+    let strings_len = read_u32(bytes, 20) as usize;
+    if version != 1
+        || size > bytes.len()
+        || entries_offset + count.saturating_mul(8) > size
+        || strings_offset + strings_len > size
+    {
+        return Err(HostError::IoError(format!(
+            "{context}: invalid native string-list record"
+        )));
+    }
     let mut out = Vec::with_capacity(count);
-    for _ in 0..count {
-        if bytes.len() < offset + 4 {
-            return Err(HostError::IoError(format!("{context}: truncated entry")));
+    for i in 0..count {
+        let entry = entries_offset + i * 8;
+        let offset = read_u32(bytes, entry) as usize;
+        let len = read_u32(bytes, entry + 4) as usize;
+        if offset + len > strings_len {
+            return Err(HostError::IoError(format!(
+                "{context}: invalid native string span"
+            )));
         }
-        let len = read_u32(bytes, offset) as usize;
-        offset += 4;
-        if bytes.len() < offset + len {
-            return Err(HostError::IoError(format!("{context}: truncated string")));
-        }
-        out.push(String::from_utf8_lossy(&bytes[offset..offset + len]).into_owned());
-        offset += len;
+        let start = strings_offset + offset;
+        let end = start + len;
+        out.push(
+            String::from_utf8(bytes[start..end].to_vec())
+                .map_err(|e| HostError::IoError(format!("{context}: invalid UTF-8: {e}")))?,
+        );
     }
     Ok(out)
 }
@@ -742,7 +736,7 @@ impl HostInterface for WasmHost {
         let output = call_with_outbuf_bytes(path, |out_ptr, out_cap| unsafe {
             host_stat(path.as_ptr(), path.len() as u32, out_ptr, out_cap)
         })?;
-        decode_stat_record(&output)
+        decode_stat_record(&output, path)
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, HostError> {
@@ -777,7 +771,7 @@ impl HostInterface for WasmHost {
         let output = call_with_outbuf_bytes(path, |out_ptr, out_cap| unsafe {
             host_readdir(path.as_ptr(), path.len() as u32, out_ptr, out_cap)
         })?;
-        decode_readdir_record(&output)
+        decode_string_list_record(&output, path)
     }
 
     fn mkdir(&self, path: &str) -> Result<(), HostError> {
@@ -1042,12 +1036,6 @@ impl HostInterface for WasmHost {
             return Ok(-2);
         }
         Ok(result.exit_code)
-    }
-
-    fn list_processes(&self) -> Result<String, HostError> {
-        call_with_outbuf("list_processes", |out_ptr, out_cap| unsafe {
-            host_list_processes(out_ptr, out_cap)
-        })
     }
 
     // ----- Socket operations (full mode) -----

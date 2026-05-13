@@ -18,6 +18,7 @@ import {
   HOST_BINDINGS,
 } from "../../../microkernel-deno/wasm-kernel-imports.ts";
 import { NodeAdapter } from "../platform/node-adapter.ts";
+import type { RunResult } from "../run-result.ts";
 import { Sandbox } from "../sandbox.ts";
 
 const WASM_DIR = resolve(
@@ -51,6 +52,66 @@ function probeBytes(): Uint8Array {
   );
 }
 
+async function createTsSandbox(
+  fixtureName: string,
+  mountedFixture: Uint8Array,
+): Promise<Sandbox> {
+  return await Sandbox.create({
+    wasmDir: WASM_DIR,
+    adapter: new NodeAdapter(),
+    mounts: [{ path: "/fixtures", files: { [fixtureName]: mountedFixture } }],
+  });
+}
+
+async function createWasmSandbox(
+  kernelBytes: Uint8Array,
+  fixtureName: string,
+  mountedFixture: Uint8Array,
+): Promise<Sandbox> {
+  const mk = await Microkernel.load(kernelBytes, defaultHostState());
+  return await Sandbox.create({
+    wasmDir: WASM_DIR,
+    adapter: new NodeAdapter(),
+    kernelImpl: "wasm",
+    wasmKernelBytes: kernelBytes,
+    wasmHostImports: (memory, callerPid, cwd) =>
+      buildWasmKernelImports(mk, () => memory.buffer, callerPid, cwd),
+    wasmOverrideNames: HOST_BINDINGS.map((b) => b.name),
+    mounts: [{ path: "/fixtures", files: { [fixtureName]: mountedFixture } }],
+  });
+}
+
+async function runWithBothKernels(
+  argv: string[],
+  options?: { cwd?: string },
+): Promise<{ ts: RunResult; wasm: RunResult }> {
+  const kernelBytes = await Deno.readFile(KERNEL_WASM_URL);
+  const fixtureName = argv[0].split("/").at(-1);
+  if (!fixtureName) throw new Error(`invalid argv[0]: ${argv[0]}`);
+  const fixture = await Deno.readFile(`${WASM_DIR}/${fixtureName}`);
+  const tsSandbox = await createTsSandbox(fixtureName, fixture);
+  const wasmSandbox = await createWasmSandbox(
+    kernelBytes,
+    fixtureName,
+    fixture,
+  );
+  try {
+    return {
+      ts: await tsSandbox.runArgv(argv, options),
+      wasm: await wasmSandbox.runArgv(argv, options),
+    };
+  } finally {
+    tsSandbox.destroy();
+    wasmSandbox.destroy();
+  }
+}
+
+function expectSameRunResult(got: { ts: RunResult; wasm: RunResult }) {
+  expect(got.wasm.exitCode).toBe(got.ts.exitCode);
+  expect(got.wasm.stdout).toBe(got.ts.stdout);
+  expect(got.wasm.stderr).toBe(got.ts.stderr);
+}
+
 describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
   it("rejects kernelImpl='wasm' without wasmHostImports", async () => {
     await expect(
@@ -68,12 +129,21 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
     const mk = await Microkernel.load(kernelBytes, defaultHostState());
     const overrideNames = HOST_BINDINGS.map((b) => b.name);
     let getuidCalls = 0;
-    const wasmHostImports = (memory: WebAssembly.Memory) => {
-      const base = buildWasmKernelImports(mk, () => memory.buffer);
+    const wasmHostImports = (
+      memory: WebAssembly.Memory,
+      callerPid: number,
+      cwd: string,
+    ) => {
+      const base = buildWasmKernelImports(
+        mk,
+        () => memory.buffer,
+        callerPid,
+        cwd,
+      );
       const original = base.host_getuid;
       base.host_getuid = async (...args: number[]) => {
         getuidCalls++;
-        return original(...args);
+        return await original(...args);
       };
       return base;
     };
@@ -92,6 +162,51 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
       const proc = await sandbox.spawn(["/probe/probe.wasm"]);
       await proc.terminate();
       expect(getuidCalls).toBeGreaterThan(0);
+    } finally {
+      sandbox.destroy();
+    }
+  });
+
+  for (
+    const { name, argv, options } of [
+      {
+        name: "argv/stdout fixture",
+        argv: ["/fixtures/echo-args.wasm", "alpha", "beta", "gamma"],
+      },
+      { name: "zero exit fixture", argv: ["/fixtures/true-cmd.wasm"] },
+      { name: "nonzero exit fixture", argv: ["/fixtures/false-cmd.wasm"] },
+      {
+        name: "std env/process fixture",
+        argv: ["/fixtures/std-env-process-canary.wasm"],
+      },
+      { name: "std paths fixture", argv: ["/fixtures/std-paths-canary.wasm"] },
+      {
+        name: "std fs fixture",
+        argv: ["/fixtures/std-fs-canary.wasm"],
+        options: { cwd: "/tmp" },
+      },
+    ]
+  ) {
+    it(`matches the TS kernel for ${name}`, async () => {
+      if (!HAS_JSPI) return;
+      expectSameRunResult(await runWithBothKernels(argv, options));
+    });
+  }
+
+  it("runs the std fs fixture through the wasm kernel", async () => {
+    if (!HAS_JSPI) return;
+    const fixtureName = "std-fs-canary.wasm";
+    const kernelBytes = await Deno.readFile(KERNEL_WASM_URL);
+    const fixture = await Deno.readFile(`${WASM_DIR}/${fixtureName}`);
+    const sandbox = await createWasmSandbox(kernelBytes, fixtureName, fixture);
+    try {
+      const result = await sandbox.runArgv([`/fixtures/${fixtureName}`], {
+        cwd: "/tmp",
+      });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toBe(
+        "canonical=/tmp/yurt-std-fs-canary.txt\ncontents=yurt\n",
+      );
     } finally {
       sandbox.destroy();
     }

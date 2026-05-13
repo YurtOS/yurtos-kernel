@@ -23,7 +23,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
-use wasmtime::{Caller, Engine, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, TypedFunc};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 use wasmtime_wasi::WasiCtxBuilder;
 
@@ -41,8 +41,10 @@ const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
 const EACCES: i64 = 13;
 const EBADF: i64 = 9;
+const EAGAIN: i64 = 11;
 const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
+const DEFAULT_EPOCH_DEADLINE: u64 = u64::MAX / 2;
 
 /// Public re-export so the engine adapter (`engine::WasmtimeCtx`)
 /// can return the same EFAULT value our trampoline uses internally.
@@ -98,6 +100,12 @@ mod sys_method_id {
     pub const SOCKET_LISTEN: u32 = 0x1_0039;
     pub const SOCKET_ACCEPT: u32 = 0x1_003A;
     pub const SOCKET_ADDR: u32 = 0x1_003B;
+    pub const GETPRIORITY: u32 = 0x1_003D;
+    pub const SETPRIORITY: u32 = 0x1_003E;
+    pub const SCHED_GETSCHEDULER: u32 = 0x1_003F;
+    pub const SCHED_GETPARAM: u32 = 0x1_0040;
+    pub const SCHED_SETSCHEDULER: u32 = 0x1_0041;
+    pub const SCHED_SETPARAM: u32 = 0x1_0042;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -213,9 +221,9 @@ pub trait PolicyEnforcer: Send + Sync {
         PolicyDecision::Allow
     }
 
-    /// Gate outbound HTTP fetches. `request` is the JSON document
-    /// the kernel forwarded — embedders inspect the URL, method,
-    /// or headers and Allow/Deny. Default: Allow.
+    /// Gate outbound HTTP fetches. `request` is the binary fetch record the
+    /// kernel forwarded; embedders inspect the URL, method, or headers and
+    /// Allow/Deny. Default: Allow.
     fn may_fetch(&self, _request: &[u8]) -> PolicyDecision {
         PolicyDecision::Allow
     }
@@ -1299,6 +1307,14 @@ pub struct KernelInstance {
     pub(crate) scratch_len: u32,
     pub(crate) dispatch: TypedFunc<(u32, u32, u32, u32, u32, u32), i64>,
     pub(crate) list_processes: TypedFunc<(u32, u32), i64>,
+    pub(crate) list_threads: TypedFunc<(u32, u32, u32), i64>,
+    pub(crate) snapshot: TypedFunc<(u32, u32), i64>,
+    pub(crate) schedule_next: TypedFunc<(u32, u32), i64>,
+    pub(crate) spawn_thread: TypedFunc<(u32, i32), i64>,
+    pub(crate) detach_thread: TypedFunc<(u32, u32), i64>,
+    pub(crate) record_thread_exit: TypedFunc<(u32, u32, i32), i64>,
+    pub(crate) block_thread: TypedFunc<(u32, u32), i64>,
+    pub(crate) unblock_thread: TypedFunc<(u32, u32), i64>,
     pub(crate) kill: TypedFunc<(u32, u32), i64>,
     pub(crate) wait: TypedFunc<(u32, u32, u32, u32, u32), i64>,
     pub(crate) record_exit: TypedFunc<(u32, i32), i64>,
@@ -1370,6 +1386,126 @@ impl KernelInstance {
             .read(&self.store, self.scratch_ptr as usize, &mut bytes)
             .context("read kernel process snapshot")?;
         decode_process_list(&bytes)
+    }
+
+    pub fn list_threads(&mut self, pid: u32) -> Result<Vec<ThreadSnapshot>> {
+        let rc = self
+            .list_threads
+            .call(&mut self.store, (pid, self.scratch_ptr, self.scratch_len))
+            .context("kernel_list_threads")?;
+        if rc < 0 {
+            anyhow::bail!("kernel_list_threads failed: rc={rc}");
+        }
+        let used = rc as usize;
+        if used > self.scratch_len as usize {
+            anyhow::bail!(
+                "kernel_list_threads exceeded scratch capacity: used={used} cap={}",
+                self.scratch_len
+            );
+        }
+        let mut bytes = vec![0u8; used];
+        self.memory
+            .read(&self.store, self.scratch_ptr as usize, &mut bytes)
+            .context("read kernel thread snapshot")?;
+        decode_thread_list(&bytes)
+    }
+
+    pub fn snapshot_kernel_state(&mut self) -> Result<Vec<u8>> {
+        let rc = self
+            .snapshot
+            .call(&mut self.store, (self.scratch_ptr, self.scratch_len))
+            .context("kernel_snapshot")?;
+        if rc < 0 {
+            anyhow::bail!("kernel_snapshot failed: rc={rc}");
+        }
+        let used = rc as usize;
+        if used > self.scratch_len as usize {
+            anyhow::bail!(
+                "kernel_snapshot exceeded scratch capacity: used={used} cap={}",
+                self.scratch_len
+            );
+        }
+        let mut bytes = vec![0u8; used];
+        self.memory
+            .read(&self.store, self.scratch_ptr as usize, &mut bytes)
+            .context("read kernel snapshot")?;
+        Ok(bytes)
+    }
+
+    pub fn schedule_next(&mut self) -> Result<Option<ScheduleDecision>> {
+        let rc = self
+            .schedule_next
+            .call(&mut self.store, (self.scratch_ptr, 24))
+            .context("kernel_schedule_next")?;
+        if rc == -EAGAIN {
+            return Ok(None);
+        }
+        if rc < 0 {
+            anyhow::bail!("kernel_schedule_next failed: rc={rc}");
+        }
+        if rc != 24 {
+            anyhow::bail!("kernel_schedule_next malformed: rc={rc}");
+        }
+        let mut bytes = [0u8; 24];
+        self.memory
+            .read(&self.store, self.scratch_ptr as usize, &mut bytes)
+            .context("read kernel schedule decision")?;
+        Ok(Some(decode_schedule_decision(&bytes)))
+    }
+
+    pub fn spawn_thread(&mut self, pid: u32, host_thread_handle: i32) -> Result<u32> {
+        let rc = self
+            .spawn_thread
+            .call(&mut self.store, (pid, host_thread_handle))
+            .context("kernel_spawn_thread")?;
+        if rc < 0 {
+            anyhow::bail!("kernel_spawn_thread failed: rc={rc}");
+        }
+        Ok(rc as u32)
+    }
+
+    pub fn detach_thread(&mut self, pid: u32, tid: u32) -> Result<()> {
+        let rc = self
+            .detach_thread
+            .call(&mut self.store, (pid, tid))
+            .context("kernel_detach_thread")?;
+        if rc != 0 {
+            anyhow::bail!("kernel_detach_thread failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    pub fn record_thread_exit(&mut self, pid: u32, tid: u32, exit_value: i32) -> Result<()> {
+        let rc = self
+            .record_thread_exit
+            .call(&mut self.store, (pid, tid, exit_value))
+            .context("kernel_record_thread_exit")?;
+        if rc != 0 {
+            anyhow::bail!("kernel_record_thread_exit failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    pub fn block_thread(&mut self, pid: u32, tid: u32) -> Result<()> {
+        let rc = self
+            .block_thread
+            .call(&mut self.store, (pid, tid))
+            .context("kernel_block_thread")?;
+        if rc != 0 {
+            anyhow::bail!("kernel_block_thread failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    pub fn unblock_thread(&mut self, pid: u32, tid: u32) -> Result<()> {
+        let rc = self
+            .unblock_thread
+            .call(&mut self.store, (pid, tid))
+            .context("kernel_unblock_thread")?;
+        if rc != 0 {
+            anyhow::bail!("kernel_unblock_thread failed: rc={rc}");
+        }
+        Ok(())
     }
 
     pub fn kill_process(&mut self, pid: u32, signal: u32) -> Result<i64> {
@@ -1491,6 +1627,24 @@ pub struct ProcessSnapshot {
     pub fds: Vec<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadSnapshot {
+    pub tid: u32,
+    pub state: &'static str,
+    pub detached: bool,
+    pub exit_value: Option<i32>,
+    pub host_thread_handle: Option<i32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduleDecision {
+    pub pid: u32,
+    pub tid: u32,
+    pub host_thread_handle: Option<i32>,
+    pub flags: u32,
+    pub budget_ns: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WaitResult {
     pub pid: u32,
@@ -1563,6 +1717,67 @@ fn decode_process_list(bytes: &[u8]) -> Result<Vec<ProcessSnapshot>> {
     Ok(entries)
 }
 
+fn decode_thread_list(bytes: &[u8]) -> Result<Vec<ThreadSnapshot>> {
+    if bytes.len() < 4 {
+        anyhow::bail!("short thread list");
+    }
+    let count = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes")) as usize;
+    let mut offset = 4usize;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        if bytes.len() < offset + 16 {
+            anyhow::bail!("truncated thread list entry");
+        }
+        let tid = u32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes"));
+        offset += 4;
+        let state = match bytes[offset] {
+            1 => "runnable",
+            2 => "blocked",
+            3 => "exited",
+            other => anyhow::bail!("unknown thread state byte: {other}"),
+        };
+        offset += 1;
+        let detached = bytes[offset] != 0;
+        offset += 3;
+        let raw_exit_value =
+            i32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes"));
+        offset += 4;
+        let raw_host_thread_handle =
+            i32::from_le_bytes(bytes[offset..offset + 4].try_into().expect("4 bytes"));
+        offset += 4;
+        entries.push(ThreadSnapshot {
+            tid,
+            state,
+            detached,
+            exit_value: (state == "exited").then_some(raw_exit_value),
+            host_thread_handle: (raw_host_thread_handle >= 0).then_some(raw_host_thread_handle),
+        });
+    }
+    if offset != bytes.len() {
+        anyhow::bail!("trailing bytes in thread list");
+    }
+    Ok(entries)
+}
+
+fn decode_schedule_decision(bytes: &[u8; 24]) -> ScheduleDecision {
+    let pid = u32::from_le_bytes(bytes[0..4].try_into().expect("4 bytes"));
+    let tid = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
+    let raw_handle = i32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
+    let flags = u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes"));
+    let budget_ns = u64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes"));
+    ScheduleDecision {
+        pid,
+        tid,
+        host_thread_handle: (raw_handle >= 0).then_some(raw_handle),
+        flags,
+        budget_ns,
+    }
+}
+
+pub fn budget_ns_to_epoch_quantum(budget_ns: u64) -> u64 {
+    budget_ns.div_ceil(1_000_000).max(1)
+}
+
 // ── Microkernel: orchestrates the kernel and user processes ───────────────
 
 pub struct Microkernel {
@@ -1578,7 +1793,9 @@ impl Microkernel {
     pub fn load(path: &Path, host_state: HostState) -> Result<Self> {
         let wasm = std::fs::read(path)
             .with_context(|| format!("read kernel.wasm at {}", path.display()))?;
-        let engine = Engine::default();
+        let mut config = Config::new();
+        config.epoch_interruption(true);
+        let engine = Engine::new(&config).context("create wasmtime engine")?;
         let module = Module::new(&engine, &wasm).context("compile kernel.wasm")?;
 
         let mut linker: Linker<KernelStoreData> = Linker::new(&engine);
@@ -1593,6 +1810,7 @@ impl Microkernel {
         };
         let process_engine = store_data.host.process_engine.clone();
         let mut store = Store::new(&engine, store_data);
+        store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
         let instance = linker
             .instantiate(&mut store, &module)
             .context("instantiate kernel.wasm")?;
@@ -1610,6 +1828,21 @@ impl Microkernel {
             .get_typed_func::<(u32, u32, u32, u32, u32, u32), i64>(&mut store, "kernel_dispatch")?;
         let list_processes =
             instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_list_processes")?;
+        let list_threads =
+            instance.get_typed_func::<(u32, u32, u32), i64>(&mut store, "kernel_list_threads")?;
+        let snapshot = instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_snapshot")?;
+        let schedule_next =
+            instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_schedule_next")?;
+        let spawn_thread =
+            instance.get_typed_func::<(u32, i32), i64>(&mut store, "kernel_spawn_thread")?;
+        let detach_thread =
+            instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_detach_thread")?;
+        let record_thread_exit = instance
+            .get_typed_func::<(u32, u32, i32), i64>(&mut store, "kernel_record_thread_exit")?;
+        let block_thread =
+            instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_block_thread")?;
+        let unblock_thread =
+            instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_unblock_thread")?;
         let kill = instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_kill")?;
         let wait =
             instance.get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_wait")?;
@@ -1627,6 +1860,14 @@ impl Microkernel {
             scratch_len,
             dispatch,
             list_processes,
+            list_threads,
+            snapshot,
+            schedule_next,
+            spawn_thread,
+            detach_thread,
+            record_thread_exit,
+            block_thread,
+            unblock_thread,
             kill,
             wait,
             record_exit,
@@ -1656,6 +1897,49 @@ impl Microkernel {
     /// itself lives in kernel.wasm.
     pub fn list_processes(&self) -> Result<Vec<ProcessSnapshot>> {
         self.kernel.lock().unwrap().list_processes()
+    }
+
+    /// Return the kernel-owned thread snapshot for one process.
+    pub fn list_threads(&self, pid: u32) -> Result<Vec<ThreadSnapshot>> {
+        self.kernel.lock().unwrap().list_threads(pid)
+    }
+
+    /// Return the versioned binary kernel-state snapshot envelope.
+    pub fn snapshot_kernel_state(&self) -> Result<Vec<u8>> {
+        self.kernel.lock().unwrap().snapshot_kernel_state()
+    }
+
+    /// Ask kernel.wasm which runnable thread should resume next. The returned
+    /// budget is engine-neutral; wasmtime translates it into epoch/fuel policy.
+    pub fn schedule_next(&self) -> Result<Option<ScheduleDecision>> {
+        self.kernel.lock().unwrap().schedule_next()
+    }
+
+    /// Register a host-created thread in kernel-owned state.
+    pub fn spawn_thread(&self, pid: u32, host_thread_handle: i32) -> Result<u32> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .spawn_thread(pid, host_thread_handle)
+    }
+
+    pub fn detach_thread(&self, pid: u32, tid: u32) -> Result<()> {
+        self.kernel.lock().unwrap().detach_thread(pid, tid)
+    }
+
+    pub fn record_thread_exit(&self, pid: u32, tid: u32, exit_value: i32) -> Result<()> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .record_thread_exit(pid, tid, exit_value)
+    }
+
+    pub fn block_thread(&self, pid: u32, tid: u32) -> Result<()> {
+        self.kernel.lock().unwrap().block_thread(pid, tid)
+    }
+
+    pub fn unblock_thread(&self, pid: u32, tid: u32) -> Result<()> {
+        self.kernel.lock().unwrap().unblock_thread(pid, tid)
     }
 
     /// Route signal delivery through kernel.wasm's host-control export.
@@ -1952,8 +2236,11 @@ impl Microkernel {
             argv,
             dir_fds: std::collections::BTreeMap::new(),
             last_exit: None,
+            last_scheduler_budget_ns: None,
+            last_scheduler_epoch_quantum: None,
         };
         let mut store = Store::new(&self.engine, user_state);
+        store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
         let instance = linker
             .instantiate(&mut store, &module)
             .context("instantiate user-process wasm")?;
@@ -2067,6 +2354,12 @@ pub struct UserState {
     /// typed exit code to `run_pending_spawns` so it can call
     /// `record_exit` without parsing the trap string.
     pub last_exit: Option<i32>,
+    /// Last kernel scheduler budget applied to this wasmtime Store.
+    /// Observability only; the kernel owns the policy.
+    pub last_scheduler_budget_ns: Option<u64>,
+    /// Wasmtime-specific mechanism derived from `last_scheduler_budget_ns`.
+    /// This stays host-local and is not exposed through the kernel ABI.
+    pub last_scheduler_epoch_quantum: Option<u64>,
 }
 
 impl yurt_microkernel_core::HasCallerPid for UserState {
@@ -2110,6 +2403,26 @@ impl UserProcess {
     /// haven't run yet.
     pub fn last_exit(&self) -> Option<i32> {
         self.store.data().last_exit
+    }
+
+    pub fn apply_schedule_decision(&mut self, decision: ScheduleDecision) -> Result<bool> {
+        if decision.pid != self.pid {
+            return Ok(false);
+        }
+        let quantum = budget_ns_to_epoch_quantum(decision.budget_ns);
+        self.store.set_epoch_deadline(quantum);
+        let state = self.store.data_mut();
+        state.last_scheduler_budget_ns = Some(decision.budget_ns);
+        state.last_scheduler_epoch_quantum = Some(quantum);
+        Ok(true)
+    }
+
+    pub fn last_scheduler_budget_ns(&self) -> Option<u64> {
+        self.store.data().last_scheduler_budget_ns
+    }
+
+    pub fn last_scheduler_epoch_quantum(&self) -> Option<u64> {
+        self.store.data().last_scheduler_epoch_quantum
     }
 
     /// Run the standard WASI entry point (`_start`). Returns Ok(()) on
@@ -3102,7 +3415,11 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_process_resume",
-        |_caller: Caller<'_, KernelStoreData>, _handle: i32, _result: i64| -> i64 { -ENOSYS },
+        |_caller: Caller<'_, KernelStoreData>,
+         _handle: i32,
+         _result: i64,
+         _budget_ns: u64|
+         -> i64 { -ENOSYS },
     )?;
 
     Ok(())
@@ -3218,6 +3535,35 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::SETRESGID,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_getpriority",
+        |mut caller: Caller<'_, UserState>, which: i32, who: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(which as u32).to_le_bytes());
+            req.extend_from_slice(&(who as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::GETPRIORITY,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_setpriority",
+        |mut caller: Caller<'_, UserState>, which: i32, who: i32, nice: i32| -> i32 {
+            let mut req = Vec::with_capacity(12);
+            req.extend_from_slice(&(which as u32).to_le_bytes());
+            req.extend_from_slice(&(who as u32).to_le_bytes());
+            req.extend_from_slice(&nice.to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SETPRIORITY,
                 &req,
             ) as i32
         },
@@ -3495,6 +3841,57 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::SCHED_YIELD,
                 &[],
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_sched_getscheduler",
+        |mut caller: Caller<'_, UserState>, pid: i32| -> i32 {
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SCHED_GETSCHEDULER,
+                pid as u32,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_sched_getparam",
+        |mut caller: Caller<'_, UserState>, pid: i32| -> i32 {
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SCHED_GETPARAM,
+                pid as u32,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_sched_setscheduler",
+        |mut caller: Caller<'_, UserState>, pid: i32, policy: i32, priority: i32| -> i32 {
+            let mut req = Vec::with_capacity(12);
+            req.extend_from_slice(&(pid as u32).to_le_bytes());
+            req.extend_from_slice(&policy.to_le_bytes());
+            req.extend_from_slice(&priority.to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SCHED_SETSCHEDULER,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_sched_setparam",
+        |mut caller: Caller<'_, UserState>, pid: i32, priority: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(pid as u32).to_le_bytes());
+            req.extend_from_slice(&priority.to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SCHED_SETPARAM,
+                &req,
             ) as i32
         },
     )?;

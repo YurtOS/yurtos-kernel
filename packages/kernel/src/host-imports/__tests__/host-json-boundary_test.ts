@@ -2,17 +2,14 @@ import { assertEquals } from "jsr:@std/assert@^1.0.19";
 
 const scopedImports = [
   "host_read_fd",
-  "host_list_processes",
   "host_network_fetch",
   "host_dns_resolve",
   "host_socket_connect",
-  "host_socket_bind",
   "host_socket_listen",
   "host_socket_accept",
   "host_socket_addr",
   "host_socket_send",
   "host_socket_recv",
-  "host_socket_option",
   "host_socket_close",
   "host_extension_invoke",
   "host_stat",

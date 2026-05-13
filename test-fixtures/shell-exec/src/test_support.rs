@@ -448,10 +448,6 @@ pub mod mock {
             }
         }
 
-        fn list_processes(&self) -> Result<String, HostError> {
-            Ok("[]".to_string())
-        }
-
         fn socket_connect(&self, _host: &str, _port: u16, _tls: bool) -> Result<u32, HostError> {
             Err(HostError::IoError("sockets not available in test".into()))
         }

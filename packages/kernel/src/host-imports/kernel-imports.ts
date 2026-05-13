@@ -38,7 +38,6 @@ import {
   mainAccessFromInstance,
 } from "../process/dynlink.js";
 import type { ExtensionRegistry } from "../extension/registry.js";
-import type { NativeModuleRegistry } from "../process/native-modules.js";
 import type {
   ProcessCredentials,
   ProcessKernel,
@@ -60,9 +59,10 @@ import { createStaticTarget } from "../wasi/fd-target.js";
 import { WASI_FDFLAGS_NONBLOCK } from "../wasi/types.ts";
 import {
   readBytes,
+  readRecordHeader,
+  readSpan,
   readString,
   writeBytes,
-  writeJson,
   writeString,
 } from "./common.js";
 import { resolveHostname } from "../platform/dns.js";
@@ -117,9 +117,6 @@ export interface KernelImportsOptions {
     fdTable: Map<number, FdTarget>,
     parentPid: number,
   ) => number;
-
-  /** Registry of dynamically loaded native Python module WASMs. */
-  nativeModules?: NativeModuleRegistry;
 
   /** Active WASI host for guest-side fd operations such as dup2 on stdio. */
   wasiHost?: WasiHost;
@@ -225,6 +222,10 @@ function writeSpawnResult(
 }
 
 const NATIVE_RECORD_VERSION_1 = 1;
+const STAT_RECORD_SIZE = 32;
+const FILE_TYPE_FILE = 1;
+const FILE_TYPE_DIR = 2;
+const FILE_TYPE_SYMLINK = 4;
 const SPAWN_REQUEST_V1_MIN_SIZE = 80;
 const SPAN_SIZE = 8;
 const ENV_PAIR_SIZE = 16;
@@ -235,10 +236,6 @@ const FETCH_FLAG_MANUAL_REDIRECT = 1;
 const FETCH_RESPONSE_FLAG_OK = 1;
 const FETCH_REQUEST_HEADER_SIZE = 20;
 const FETCH_RESPONSE_HEADER_SIZE = 20;
-const WASI_FILETYPE_CHARACTER_DEVICE = 2;
-const WASI_FILETYPE_DIRECTORY = 3;
-const WASI_FILETYPE_REGULAR_FILE = 4;
-const WASI_FILETYPE_SYMBOLIC_LINK = 7;
 
 interface FetchRequestRecord {
   url: string;
@@ -349,79 +346,68 @@ function decodeBase64Bytes(value: string): Uint8Array {
   return out;
 }
 
-function filetypeForVfsType(type: string): number {
-  switch (type) {
-    case "dir":
-      return WASI_FILETYPE_DIRECTORY;
-    case "symlink":
-      return WASI_FILETYPE_SYMBOLIC_LINK;
-    case "char":
-      return WASI_FILETYPE_CHARACTER_DEVICE;
-    default:
-      return WASI_FILETYPE_REGULAR_FILE;
-  }
-}
-
 function writeStatRecord(
   memory: WebAssembly.Memory,
   ptr: number,
   cap: number,
-  size: number,
-  filetype: number,
-  mode: number,
+  stat: { type: string; permissions: number; size: number; mtime?: Date },
 ): number {
-  const required = 16;
+  if (cap < STAT_RECORD_SIZE) return STAT_RECORD_SIZE;
+  const end = ptr + STAT_RECORD_SIZE;
+  if (ptr < 0 || end > memory.buffer.byteLength) return ERR_IO;
+  const view = new DataView(memory.buffer);
+  let typeBits = 0;
+  if (stat.type === "file") typeBits |= FILE_TYPE_FILE;
+  if (stat.type === "dir") typeBits |= FILE_TYPE_DIR;
+  if (stat.type === "symlink") typeBits |= FILE_TYPE_SYMLINK;
+  view.setUint32(ptr, STAT_RECORD_SIZE, true);
+  view.setUint16(ptr + 4, NATIVE_RECORD_VERSION_1, true);
+  view.setUint16(ptr + 6, 0, true);
+  view.setUint32(ptr + 8, typeBits, true);
+  view.setUint32(ptr + 12, stat.permissions >>> 0, true);
+  view.setBigUint64(ptr + 16, BigInt(stat.size), true);
+  view.setBigUint64(ptr + 24, BigInt(stat.mtime?.getTime() ?? 0), true);
+  return STAT_RECORD_SIZE;
+}
+
+function writeStringListRecord(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  values: string[],
+): number {
+  const encoded = values.map((value) => new TextEncoder().encode(value));
+  const headerSize = 24;
+  const entriesOffset = headerSize;
+  const stringsOffset = entriesOffset + encoded.length * SPAN_SIZE;
+  const stringsLength = encoded.reduce(
+    (sum, bytes) => sum + bytes.byteLength,
+    0,
+  );
+  const required = stringsOffset + stringsLength;
   if (cap < required) return required;
   const end = ptr + required;
   if (ptr < 0 || end > memory.buffer.byteLength) return ERR_IO;
-  const view = new DataView(memory.buffer);
-  view.setBigUint64(ptr, BigInt(size), true);
-  view.setUint32(ptr + 8, filetype, true);
-  view.setUint32(ptr + 12, mode, true);
+  const out = new Uint8Array(memory.buffer, ptr, required);
+  const view = new DataView(memory.buffer, ptr, required);
+  out.fill(0);
+  view.setUint32(0, required, true);
+  view.setUint16(4, NATIVE_RECORD_VERSION_1, true);
+  view.setUint16(6, 0, true);
+  view.setUint32(8, encoded.length, true);
+  view.setUint32(12, entriesOffset, true);
+  view.setUint32(16, stringsOffset, true);
+  view.setUint32(20, stringsLength, true);
+  let cursor = 0;
+  for (let i = 0; i < encoded.length; i++) {
+    const entry = entriesOffset + i * SPAN_SIZE;
+    const bytes = encoded[i];
+    view.setUint32(entry, cursor, true);
+    view.setUint32(entry + 4, bytes.byteLength, true);
+    out.set(bytes, stringsOffset + cursor);
+    cursor += bytes.byteLength;
+  }
   return required;
-}
-
-function encodeStringList(entries: string[]): Uint8Array {
-  const encoded = entries.map((entry) => new TextEncoder().encode(entry));
-  const total = encoded.reduce((sum, entry) => sum + 4 + entry.byteLength, 4);
-  const out = new Uint8Array(total);
-  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
-  view.setUint32(0, encoded.length, true);
-  let offset = 4;
-  for (const entry of encoded) {
-    view.setUint32(offset, entry.byteLength, true);
-    offset += 4;
-    out.set(entry, offset);
-    offset += entry.byteLength;
-  }
-  return out;
-}
-
-function encodeDirEntries(
-  entries: Array<{ name: string; type: string }>,
-  maxBytes?: number,
-): Uint8Array {
-  const chunks: Array<{ name: Uint8Array; filetype: number }> = [];
-  let total = 4;
-  for (const entry of entries) {
-    const name = new TextEncoder().encode(entry.name);
-    const need = 4 + 1 + name.byteLength;
-    if (maxBytes !== undefined && total + need > maxBytes) break;
-    chunks.push({ name, filetype: filetypeForVfsType(entry.type) });
-    total += need;
-  }
-  const out = new Uint8Array(total);
-  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
-  view.setUint32(0, chunks.length, true);
-  let offset = 4;
-  for (const entry of chunks) {
-    view.setUint32(offset, entry.name.byteLength, true);
-    offset += 4;
-    out[offset++] = entry.filetype;
-    out.set(entry.name, offset);
-    offset += entry.name.byteLength;
-  }
-  return out;
 }
 
 function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
@@ -1398,14 +1384,8 @@ export function createKernelImports(
       let req: SpawnRequest;
       try {
         const decoded = decodeNativeSpawnRequest(reqBytes);
-        if (!decoded) {
-          // Fallback: legacy busybox sends JSON spawn requests.
-          const json = new TextDecoder().decode(reqBytes);
-          const parsed = JSON.parse(json) as SpawnRequest;
-          req = parsed;
-        } else {
-          req = decoded;
-        }
+        if (!decoded) return ERR_INVALID;
+        req = decoded;
       } catch {
         return ERR_INVALID;
       }
@@ -2117,24 +2097,24 @@ export function createKernelImports(
     // host_read_fd(fd, out_ptr, out_cap) -> i32
     // Reads all available data from a pipe fd and writes it to the output buffer.
     host_read_fd(fd: number, outPtr: number, outCap: number): number {
-      if (!opts.kernel) {
-        return writeJson(memory, outPtr, outCap, {
-          error: "kernel not available",
-        });
-      }
+      if (!opts.kernel) return -38;
       const target = opts.kernel.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "pipe_read") {
-        return writeJson(memory, outPtr, outCap, {
-          error: `not a readable fd: ${fd}`,
-        });
+      if (target?.type === "pipe_read") {
+        const data = target.pipe.drainSync();
+        if (data.byteLength > outCap) return data.byteLength;
+        new Uint8Array(memory.buffer, outPtr, outCap).set(data);
+        return data.byteLength;
+      } else if (target?.type === "static") {
+        const data = target.data.subarray(target.offset);
+        if (data.byteLength > outCap) return data.byteLength;
+        new Uint8Array(memory.buffer, outPtr, outCap).set(data);
+        target.offset = target.data.byteLength;
+        return data.byteLength;
+      } else if (target?.type === "null") {
+        return 0;
+      } else {
+        return -9;
       }
-      const data = target.pipe.drainSync();
-      const str = new TextDecoder().decode(data);
-      const buf = new Uint8Array(memory.buffer, outPtr, outCap);
-      const encoded = new TextEncoder().encode(str);
-      if (encoded.length > outCap) return encoded.length; // signal retry with larger buffer
-      buf.set(encoded);
-      return encoded.length;
     },
 
     // host_write_fd(fd, data_ptr, data_len) -> i32
@@ -2282,14 +2262,6 @@ export function createKernelImports(
       opts.wasiHost?.drainPendingSignals();
     },
 
-    // host_list_processes(out_ptr, out_cap) -> i32
-    // Returns JSON array of all processes.
-    host_list_processes(outPtr: number, outCap: number): number {
-      if (!opts.kernel) return writeJson(memory, outPtr, outCap, []);
-      const procs = opts.kernel.listProcesses();
-      return writeJson(memory, outPtr, outCap, procs);
-    },
-
     // ── Network ──
 
     // host_network_fetch(req_ptr, req_len, out_ptr, out_cap) -> i32
@@ -2355,47 +2327,6 @@ export function createKernelImports(
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         return fetchError(msg);
-      }
-    },
-
-    // ── Native module bridge ──
-
-    // host_native_invoke(module_ptr, module_len, method_ptr, method_len,
-    //                    args_ptr, args_len, out_ptr, out_cap) -> i32
-    // Dynamic native module dispatch. Currently consumed by RustPython's
-    // native-module bridge; this is Python-coupled debt scheduled to clear
-    // with the CPython port. New userlands should not depend on Python-specific
-    // module invocation from the kernel.
-    host_native_invoke(
-      modulePtr: number,
-      moduleLen: number,
-      methodPtr: number,
-      methodLen: number,
-      argsPtr: number,
-      argsLen: number,
-      outPtr: number,
-      outCap: number,
-    ): number {
-      if (!opts.nativeModules) {
-        return writeJson(memory, outPtr, outCap, {
-          error: "native modules not available",
-        });
-      }
-      const moduleName = readString(memory, modulePtr, moduleLen);
-      const method = readString(memory, methodPtr, methodLen);
-      const argsJson = readString(memory, argsPtr, argsLen);
-
-      try {
-        const result = opts.nativeModules.invoke(moduleName, method, argsJson);
-        const encoded = new TextEncoder().encode(result);
-        if (encoded.length > outCap) {
-          return encoded.length; // signal need more space
-        }
-        new Uint8Array(memory.buffer, outPtr, encoded.length).set(encoded);
-        return encoded.length;
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        return writeJson(memory, outPtr, outCap, { error: msg });
       }
     },
 
@@ -2715,86 +2646,188 @@ export function createKernelImports(
       outPtr: number,
       outCap: number,
     ): Promise<number> {
-      const reqJson = readString(memory, reqPtr, reqLen);
+      const readExtString = (
+        base: number,
+        size: number,
+        off: number,
+        len: number,
+      ): string | null => {
+        const bytes = readSpan(memory, base, size, off, len);
+        return bytes === null ? null : new TextDecoder().decode(bytes);
+      };
+      const readSpanVector = (
+        base: number,
+        size: number,
+        off: number,
+        count: number,
+      ): string[] | null => {
+        const bytes = readSpan(memory, base, size, off, count * 8);
+        if (bytes === null) return null;
+        const view = new DataView(bytes.buffer, bytes.byteOffset);
+        const out: string[] = [];
+        for (let i = 0; i < count; i++) {
+          const at = i * 8;
+          const value = readExtString(
+            base,
+            size,
+            view.getUint32(at, true),
+            view.getUint32(at + 4, true),
+          );
+          if (value === null) return null;
+          out.push(value);
+        }
+        return out;
+      };
+      const readPairVector = (
+        base: number,
+        size: number,
+        off: number,
+        count: number,
+      ): Record<string, string> | null => {
+        const bytes = readSpan(memory, base, size, off, count * 16);
+        if (bytes === null) return null;
+        const view = new DataView(bytes.buffer, bytes.byteOffset);
+        const out: Record<string, string> = {};
+        for (let i = 0; i < count; i++) {
+          const at = i * 16;
+          const key = readExtString(
+            base,
+            size,
+            view.getUint32(at, true),
+            view.getUint32(at + 4, true),
+          );
+          const value = readExtString(
+            base,
+            size,
+            view.getUint32(at + 8, true),
+            view.getUint32(at + 12, true),
+          );
+          if (key === null || value === null) return null;
+          out[key] = value;
+        }
+        return out;
+      };
+      const writeExtensionResponse = (
+        exitCode: number,
+        stdout: string,
+        stderr: string,
+        payload = new Uint8Array(),
+      ): number => {
+        const encoder = new TextEncoder();
+        const stdoutBytes = encoder.encode(stdout);
+        const stderrBytes = encoder.encode(stderr);
+        const headerSize = 36;
+        const stdoutOffset = headerSize;
+        const stderrOffset = stdoutOffset + stdoutBytes.byteLength;
+        const payloadOffset = stderrOffset + stderrBytes.byteLength;
+        const size = payloadOffset + payload.byteLength;
+        if (outCap < size) return size;
+        const out = new Uint8Array(memory.buffer, outPtr, size);
+        const view = new DataView(memory.buffer, outPtr, size);
+        out.fill(0);
+        view.setUint32(0, size, true);
+        view.setUint16(4, 1, true);
+        view.setUint16(6, 0, true);
+        view.setInt32(8, exitCode, true);
+        view.setUint32(12, stdoutOffset, true);
+        view.setUint32(16, stdoutBytes.byteLength, true);
+        view.setUint32(20, stderrOffset, true);
+        view.setUint32(24, stderrBytes.byteLength, true);
+        view.setUint32(28, payloadOffset, true);
+        view.setUint32(32, payload.byteLength, true);
+        out.set(stdoutBytes, stdoutOffset);
+        out.set(stderrBytes, stderrOffset);
+        out.set(payload, payloadOffset);
+        return size;
+      };
+      const decodeRequest = () => {
+        const header = readRecordHeader(memory, reqPtr, reqLen);
+        if (!header || header.version !== 1 || header.size < 56) {
+          return null;
+        }
+        const view = new DataView(memory.buffer, reqPtr, header.size);
+        const name = readExtString(
+          reqPtr,
+          header.size,
+          view.getUint32(8, true),
+          view.getUint32(12, true),
+        );
+        const args = readSpanVector(
+          reqPtr,
+          header.size,
+          view.getUint32(16, true),
+          view.getUint32(20, true),
+        );
+        const stdin = readExtString(
+          reqPtr,
+          header.size,
+          view.getUint32(24, true),
+          view.getUint32(28, true),
+        );
+        const cwd = readExtString(
+          reqPtr,
+          header.size,
+          view.getUint32(32, true),
+          view.getUint32(36, true),
+        );
+        const env = readPairVector(
+          reqPtr,
+          header.size,
+          view.getUint32(40, true),
+          view.getUint32(44, true),
+        );
+        if (name === null || args === null || stdin === null || env === null) {
+          return null;
+        }
+        return { name, args, stdin, env, cwd: cwd || getCallerCwd() };
+      };
+      const req = decodeRequest();
+      if (!req) {
+        return writeExtensionResponse(1, "", "invalid extension request\n");
+      }
 
       if (opts.extensionRegistry) {
         try {
-          const req = JSON.parse(reqJson) as {
-            name?: string;
-            extension?: string;
-            // When called from Python _yurt.extension_call(**kwargs), the entire
-            // kwargs dict is serialized as the `args` field. Unpack it here.
-            args?: string[] | Record<string, unknown>;
-            stdin?: string;
-            env?: [string, string][];
-            cwd?: string;
-          };
-
-          const name = (req.name ?? req.extension ?? "") as string;
-
-          // Python kwargs arrive as `args: {args: [...], stdin: "...", ...}`.
-          // Detect and unpack that shape; otherwise treat args as a string array.
-          let args: string[];
-          let stdin: string;
-          if (Array.isArray(req.args)) {
-            args = req.args as string[];
-            stdin = req.stdin ?? "";
-          } else if (req.args && typeof req.args === "object") {
-            const kw = req.args as Record<string, unknown>;
-            args = Array.isArray(kw.args) ? (kw.args as string[]) : [];
-            stdin = typeof kw.stdin === "string" ? kw.stdin : (req.stdin ?? "");
-          } else {
-            args = [];
-            stdin = req.stdin ?? "";
-          }
-
-          const envObj: Record<string, string> = {};
-          if (req.env) { for (const [k, v] of req.env) envObj[k] = v; }
-          const cwd = req.cwd ?? getCallerCwd();
-
-          const result = await opts.extensionRegistry.invoke(name, {
-            args,
-            stdin,
-            env: envObj,
-            cwd,
+          const result = await opts.extensionRegistry.invoke(req.name, {
+            args: req.args,
+            stdin: req.stdin,
+            env: req.env,
+            cwd: req.cwd,
           });
 
-          return writeJson(memory, outPtr, outCap, {
-            exit_code: result.exitCode,
-            stdout: result.stdout ?? "",
-            stderr: result.stderr ?? "",
-          });
+          return writeExtensionResponse(
+            result.exitCode,
+            result.stdout ?? "",
+            result.stderr ?? "",
+          );
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
-          return writeJson(memory, outPtr, outCap, {
-            exit_code: 1,
-            stdout: "",
-            stderr: `${msg}\n`,
-          });
+          return writeExtensionResponse(1, "", `${msg}\n`);
         }
       }
 
       // Fall back to legacy extensionHandler (sync)
       if (opts.extensionHandler) {
         try {
-          const req = JSON.parse(reqJson) as Record<string, unknown>;
           const result = opts.extensionHandler(req);
-          return writeJson(memory, outPtr, outCap, result);
+          const response = result as {
+            exitCode?: number;
+            exit_code?: number;
+            stdout?: string;
+            stderr?: string;
+          };
+          return writeExtensionResponse(
+            response.exitCode ?? response.exit_code ?? 0,
+            response.stdout ?? "",
+            response.stderr ?? "",
+          );
         } catch (e: unknown) {
           const msg = e instanceof Error ? e.message : String(e);
-          return writeJson(memory, outPtr, outCap, {
-            exit_code: 1,
-            stdout: "",
-            stderr: `${msg}\n`,
-          });
+          return writeExtensionResponse(1, "", `${msg}\n`);
         }
       }
 
-      return writeJson(memory, outPtr, outCap, {
-        exit_code: 1,
-        stdout: "",
-        stderr: "extensions not available\n",
-      });
+      return writeExtensionResponse(1, "", "extensions not available\n");
     },
 
     // ── Filesystem ──
@@ -2818,14 +2851,7 @@ export function createKernelImports(
       const path = readString(memory, pathPtr, pathLen);
       try {
         const s = opts.vfs.stat(path);
-        return writeStatRecord(
-          memory,
-          outPtr,
-          outCap,
-          s.size,
-          filetypeForVfsType(s.type),
-          s.permissions,
-        );
+        return writeStatRecord(memory, outPtr, outCap, s);
       } catch {
         return ERR_NOT_FOUND;
       }
@@ -2887,11 +2913,11 @@ export function createKernelImports(
       const path = readString(memory, pathPtr, pathLen);
       try {
         const entries = opts.vfs.readdir(path);
-        return writeBytes(
+        return writeStringListRecord(
           memory,
           outPtr,
           outCap,
-          encodeDirEntries(entries, outCap),
+          entries.map((entry) => entry.name),
         );
       } catch {
         return ERR_NOT_FOUND;
@@ -3026,18 +3052,18 @@ export function createKernelImports(
       outCap: number,
     ): number {
       if (!opts.vfs) {
-        return writeBytes(memory, outPtr, outCap, encodeStringList([]));
+        return writeStringListRecord(memory, outPtr, outCap, []);
       }
       const pattern = readString(memory, patternPtr, patternLen);
       try {
-        return writeBytes(
+        return writeStringListRecord(
           memory,
           outPtr,
           outCap,
-          encodeStringList(globMatch(opts.vfs, pattern)),
+          globMatch(opts.vfs, pattern),
         );
       } catch {
-        return writeBytes(memory, outPtr, outCap, encodeStringList([]));
+        return writeStringListRecord(memory, outPtr, outCap, []);
       }
     },
 

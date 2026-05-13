@@ -104,6 +104,147 @@ pub unsafe extern "C" fn kernel_list_processes(out_ptr: *mut u8, out_cap: usize)
     dispatch::list_processes_response(response)
 }
 
+/// Host-control export: serialize one kernel-owned thread group.
+///
+/// # Safety
+///
+/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid writable
+/// range in this kernel instance's linear memory.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_list_threads(pid: u32, out_ptr: *mut u8, out_cap: usize) -> i64 {
+    let request = pid.to_le_bytes();
+    let response = if out_ptr.is_null() || out_cap == 0 {
+        &mut [][..]
+    } else {
+        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    };
+    dispatch::list_threads_response(&request, response)
+}
+
+/// Host-control export: serialize a versioned kernel-state snapshot envelope.
+///
+/// V1 contains kernel-authored process and thread records. Later sections add
+/// scheduler queues, wait records, VFS state, and portable process memory.
+///
+/// # Safety
+///
+/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid writable
+/// range in this kernel instance's linear memory.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_snapshot(out_ptr: *mut u8, out_cap: usize) -> i64 {
+    let response = if out_ptr.is_null() || out_cap == 0 {
+        &mut [][..]
+    } else {
+        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    };
+    dispatch::snapshot_response(response)
+}
+
+/// Host-control export: ask the kernel scheduler for the next runnable thread.
+///
+/// The response is a binary schedule decision: `u32 pid`, `u32 tid`, `i32
+/// host_thread_handle`, `u32 flags`, `u64 budget_ns`. Hosts translate
+/// `budget_ns` into their own preemption mechanism.
+///
+/// # Safety
+///
+/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid writable
+/// range in this kernel instance's linear memory.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_schedule_next(out_ptr: *mut u8, out_cap: usize) -> i64 {
+    let response = if out_ptr.is_null() || out_cap == 0 {
+        &mut [][..]
+    } else {
+        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    };
+    dispatch::schedule_next_response(response)
+}
+
+/// Host-control export: register a host-created thread in kernel-owned state.
+///
+/// `host_thread_handle` is an opaque adapter handle. Pass a negative value when
+/// the adapter has no durable handle to persist in snapshots.
+///
+/// # Safety
+///
+/// No pointer arguments. Marked unsafe to keep the exported host-control API
+/// uniform with the other raw C ABI entry points.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_spawn_thread(pid: u32, host_thread_handle: i32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.spawn_thread(
+            pid,
+            if host_thread_handle < 0 {
+                None
+            } else {
+                Some(host_thread_handle)
+            },
+        )
+        .map(i64::from)
+        .unwrap_or(-(abi::ESRCH as i64))
+    })
+}
+
+/// Host-control export: mark a thread detached in kernel-owned state.
+///
+/// # Safety
+///
+/// No pointer arguments. Marked unsafe to keep the exported host-control API
+/// uniform with the other raw C ABI entry points.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_detach_thread(pid: u32, tid: u32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.detach_thread(pid, tid)
+            .map(|()| 0)
+            .unwrap_or(-(abi::ESRCH as i64))
+    })
+}
+
+/// Host-control export: record a thread exit value in kernel-owned state.
+///
+/// # Safety
+///
+/// No pointer arguments. Marked unsafe to keep the exported host-control API
+/// uniform with the other raw C ABI entry points.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_record_thread_exit(pid: u32, tid: u32, exit_value: i32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.exit_thread(pid, tid, exit_value)
+            .map(|()| 0)
+            .unwrap_or(-(abi::ESRCH as i64))
+    })
+}
+
+/// Host-control export: mark a thread blocked in kernel-owned state.
+///
+/// # Safety
+///
+/// No pointer arguments. Marked unsafe to keep the exported host-control API
+/// uniform with the other raw C ABI entry points.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_block_thread(pid: u32, tid: u32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.block_thread(pid, tid)
+            .map(|()| 0)
+            .unwrap_or(-(abi::ESRCH as i64))
+    })
+}
+
+/// Host-control export: mark a blocked thread runnable in kernel-owned state.
+///
+/// # Safety
+///
+/// No pointer arguments. Marked unsafe to keep the exported host-control API
+/// uniform with the other raw C ABI entry points.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_unblock_thread(pid: u32, tid: u32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.unblock_thread(pid, tid)
+            .map(|()| 0)
+            .unwrap_or(-(abi::ESRCH as i64))
+    })
+}
+
 /// Host-control export: send a signal through kernel-owned process state.
 ///
 /// # Safety
