@@ -22,6 +22,11 @@ import {
   defaultSpawnThread,
   type WorkerSabThreadsBackendOptions,
 } from "./threads/worker-sab.js";
+import {
+  createWorkerHostImportProxy,
+  dispatchWorkerHostCall,
+  type WorkerHostDispatchImports,
+} from "./threads/worker-host-proxy.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
 import type {
   LinearStackSwitchingThreadsBackend,
@@ -144,11 +149,19 @@ export async function loadProcess(
     }
     validateYurtThreadMemory(profile, workerSabMemory);
   }
+  let yurtImports: Record<string, WebAssembly.ImportValue> = {};
   const workerSabThreads = opts.workerSabThreads ??
     (profile.threadsBackend === "worker-sab" && workerSabMemory
       ? {
         memory: workerSabMemory,
-        spawnThread: defaultSpawnThread(module, workerSabMemory),
+        spawnThread: defaultSpawnThread(module, workerSabMemory, {
+          createImportProxy: () => createWorkerHostImportProxy(),
+          handleHostCall: (_call, proxy) =>
+            dispatchWorkerHostCall(
+              proxy,
+              yurtImports as unknown as WorkerHostDispatchImports,
+            ),
+        }),
       }
       : undefined);
   const threadsBackend = createThreadsBackend(profile, {
@@ -206,7 +219,7 @@ export async function loadProcess(
     : null;
 
   let mainInstanceRef: WebAssembly.Instance | null = null;
-  const yurtImports: Record<string, WebAssembly.ImportValue> = {
+  yurtImports = {
     ...ctx.buildKernelImports(
       pid,
       memoryProxy,

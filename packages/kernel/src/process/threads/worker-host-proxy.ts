@@ -28,6 +28,43 @@ export interface WorkerHostProxyImports {
   host_write_fd(fd: number, dataPtr: number, dataLen: number): number;
 }
 
+export type WorkerHostDispatchImports = Partial<WorkerHostProxyImports>;
+
+export function createWorkerHostImportProxy(): WorkerHostImportProxy {
+  return { requestSab: new SharedArrayBuffer(WORKER_HOST_RESPONSE_BYTES) };
+}
+
+export function dispatchWorkerHostCall(
+  proxy: WorkerHostImportProxy,
+  imports: WorkerHostDispatchImports,
+): void {
+  const header = new Int32Array(proxy.requestSab, 0, 2);
+  const payload = new Int32Array(proxy.requestSab, HEADER_BYTES);
+  let result = -38;
+
+  try {
+    if (Atomics.load(header, HEADER_STATUS) !== STATUS_REQUEST_READY) {
+      result = -22;
+    } else {
+      switch (payload[0]) {
+        case WorkerHostOp.WriteFd:
+          if (payload[1] !== 3 || !imports.host_write_fd) {
+            result = -38;
+          } else {
+            result = imports.host_write_fd(payload[2], payload[3], payload[4]);
+          }
+          break;
+      }
+    }
+    Atomics.store(header, HEADER_RESULT, result);
+    Atomics.store(header, HEADER_STATUS, STATUS_RESPONSE_READY);
+  } catch {
+    Atomics.store(header, HEADER_RESULT, -1);
+    Atomics.store(header, HEADER_STATUS, STATUS_ERROR);
+  }
+  Atomics.notify(header, HEADER_STATUS);
+}
+
 export function createWorkerHostProxyImports(
   memory: WebAssembly.Memory,
   proxy: WorkerHostImportProxy | undefined,
