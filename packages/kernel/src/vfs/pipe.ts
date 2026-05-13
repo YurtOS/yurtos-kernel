@@ -143,6 +143,8 @@ export interface AsyncPipeWriteEnd {
   write(data: Uint8Array): number;
   /** Write data, waiting for space if pipe is full. Returns total bytes written, or -1 on EPIPE. */
   writeAsync(data: Uint8Array): Promise<number>;
+  /** Suspend until a non-blocking write would make progress or fail. */
+  waitWritable(): Promise<void>;
   close(): void;
   /** Increment reference count (for sharing across fd tables). */
   addRef(): void;
@@ -164,6 +166,7 @@ interface AsyncPipeBuffer {
   pendingWriter: ((n: number) => void) | null;
   pendingWriterData: Uint8Array | null;
   readWaiters: Array<() => void>;
+  writeWaiters: Array<() => void>;
 }
 
 /**
@@ -191,10 +194,15 @@ export function createAsyncPipe(
     pendingWriter: null,
     pendingWriterData: null,
     readWaiters: [],
+    writeWaiters: [],
   };
 
   function wakeReadWaiters(): void {
     for (const resolve of shared.readWaiters.splice(0)) resolve();
+  }
+
+  function wakeWriteWaiters(): void {
+    for (const resolve of shared.writeWaiters.splice(0)) resolve();
   }
 
   /** Drain buffered chunks into `buf`, returning bytes copied. */
@@ -225,6 +233,7 @@ export function createAsyncPipe(
       const resolve = shared.pendingWriter;
       shared.pendingWriter = null;
       shared.pendingWriterData = null;
+      wakeWriteWaiters();
       resolve(-1); // EPIPE
       return;
     }
@@ -237,6 +246,7 @@ export function createAsyncPipe(
     const resolve = shared.pendingWriter;
     shared.pendingWriter = null;
     shared.pendingWriterData = null;
+    wakeWriteWaiters();
     resolve(toWrite);
   }
 
@@ -265,6 +275,7 @@ export function createAsyncPipe(
       if (shared.totalBytes > 0) {
         const n = drainChunks(buf);
         tryFlushPendingWriter();
+        wakeWriteWaiters();
         return n;
       }
       // No data and write end closed — EOF.
@@ -287,6 +298,7 @@ export function createAsyncPipe(
       if (shared.totalBytes > 0) {
         const n = drainChunks(buf);
         tryFlushPendingWriter();
+        wakeWriteWaiters();
         return n;
       }
       // No data: return 0 (EOF) for both closed and open write end.
@@ -298,12 +310,14 @@ export function createAsyncPipe(
       const buf = new Uint8Array(shared.totalBytes);
       drainChunks(buf);
       tryFlushPendingWriter();
+      wakeWriteWaiters();
       return buf;
     },
 
     close() {
       if (--shared.readRefs > 0) return;
       shared.readClosed = true;
+      wakeWriteWaiters();
       // Wake blocked writer with EPIPE.
       if (shared.pendingWriter) {
         const resolve = shared.pendingWriter;
@@ -346,6 +360,18 @@ export function createAsyncPipe(
         resolve(n);
       }
       return toWrite;
+    },
+
+    waitWritable(): Promise<void> {
+      if (
+        shared.totalBytes < shared.capacity || shared.readClosed ||
+        shared.writeClosed
+      ) {
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        shared.writeWaiters.push(resolve);
+      });
     },
 
     async writeAsync(data: Uint8Array): Promise<number> {
@@ -400,6 +426,7 @@ export function createAsyncPipe(
     close() {
       if (--shared.writeRefs > 0) return;
       shared.writeClosed = true;
+      wakeWriteWaiters();
       wakeReadWaiters();
       // Wake a pending reader with EOF.
       if (shared.pendingReader) {

@@ -6,7 +6,12 @@ import { OverlayVFS } from "../../vfs/overlay-vfs.ts";
 import { MemoryRoot } from "../../vfs/__tests__/helpers.ts";
 import { ProcessKernel } from "../../process/kernel.ts";
 import { FdTable } from "../../vfs/fd-table.ts";
-import { createVfsFileTarget, type FdTarget } from "../../wasi/fd-target.ts";
+import {
+  createTtySlaveTarget,
+  createTtyState,
+  createVfsFileTarget,
+  type FdTarget,
+} from "../../wasi/fd-target.ts";
 import { WasiExitError, WasiHost } from "../../wasi/wasi-host.ts";
 import { createAsyncPipe } from "../../vfs/pipe.ts";
 import type { RuntimeEngineBackend } from "../../engine/backend.ts";
@@ -55,6 +60,23 @@ function writePollFd(
 
 function readPollRevents(memory: WebAssembly.Memory, ptr: number): number {
   return new DataView(memory.buffer).getInt16(ptr + 6, true);
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+): Promise<T | "timeout"> {
+  let timeoutId: number | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<"timeout">((resolve) => {
+        timeoutId = setTimeout(() => resolve("timeout"), ms);
+      }),
+    ]);
+  } finally {
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+  }
 }
 
 Deno.test("kernel host_spawn accepts native spawn request records", () => {
@@ -1898,6 +1920,112 @@ Deno.test("host_poll reports exhausted static input as readable EOF", () => {
     (imports.host_poll as (...args: number[]) => number)(256, 1, 0),
     1,
   );
+  assertEquals(readPollRevents(memory, 256), POLLIN);
+  kernel.dispose();
+});
+
+Deno.test("host_poll wakes when pipe read readiness changes", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  const [readEnd, writeEnd] = createAsyncPipe(4);
+  kernel.setFdTarget(pid, 3, { type: "pipe_read", pipe: readEnd });
+  writePollFd(memory, 256, 3, POLLIN);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  const pending = (imports.host_poll as (...args: number[]) => Promise<number>)(
+    256,
+    1,
+    1000,
+  );
+  writeEnd.write(encoder.encode("x"));
+
+  const ready = await withTimeout(pending, 5);
+  assertEquals(ready, 1);
+  assertEquals(readPollRevents(memory, 256), POLLIN);
+  kernel.dispose();
+});
+
+Deno.test("host_poll wakes when pipe write readiness changes", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  const [readEnd, writeEnd] = createAsyncPipe(4);
+  assertEquals(writeEnd.write(encoder.encode("full")), 4);
+  kernel.setFdTarget(pid, 4, { type: "pipe_write", pipe: writeEnd });
+  writePollFd(memory, 256, 4, POLLOUT);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  const pending = (imports.host_poll as (...args: number[]) => Promise<number>)(
+    256,
+    1,
+    1000,
+  );
+  const buf = new Uint8Array(1);
+  assertEquals(await readEnd.read(buf), 1);
+
+  const ready = await withTimeout(pending, 5);
+  assertEquals(ready, 1);
+  assertEquals(readPollRevents(memory, 256), POLLOUT);
+  kernel.dispose();
+});
+
+Deno.test("host_poll wakes when socket read readiness changes", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  let resolveRecv:
+    | ((result: { ok: true; data: Uint8Array }) => void)
+    | undefined;
+  const socketTarget: FdTarget & { type: "socket" } = {
+    type: "socket",
+    socket: 1,
+    refs: 1,
+    send: () => ({ ok: true, bytes_sent: 0 }),
+    recv: () => ({ ok: false, error: "EAGAIN" }),
+    recvAsync: () =>
+      new Promise((resolve) => {
+        resolveRecv = resolve;
+      }),
+    close: () => {},
+  };
+  kernel.setFdTarget(pid, 5, socketTarget);
+  writePollFd(memory, 256, 5, POLLIN);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  const pending = (imports.host_poll as (...args: number[]) => Promise<number>)(
+    256,
+    1,
+    1000,
+  );
+  resolveRecv?.({ ok: true, data: encoder.encode("z") });
+
+  const ready = await withTimeout(pending, 5);
+  assertEquals(ready, 1);
+  assertEquals(readPollRevents(memory, 256), POLLIN);
+  assertEquals(socketTarget.peekBuffer, encoder.encode("z"));
+  kernel.dispose();
+});
+
+Deno.test("host_poll wakes when tty slave input arrives", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "poller");
+  const tty = createTtyState(1);
+  kernel.setFdTarget(pid, 0, createTtySlaveTarget(tty));
+  writePollFd(memory, 256, 0, POLLIN);
+  const imports = createKernelImports({ memory, kernel, callerPid: pid });
+
+  const pending = (imports.host_poll as (...args: number[]) => Promise<number>)(
+    256,
+    1,
+    1000,
+  );
+  tty.toSlave.push(encoder.encode("x"));
+  for (const waiter of tty.toSlaveWaiters.splice(0)) waiter();
+
+  const ready = await withTimeout(pending, 5);
+  assertEquals(ready, 1);
   assertEquals(readPollRevents(memory, 256), POLLIN);
   kernel.dispose();
 });
