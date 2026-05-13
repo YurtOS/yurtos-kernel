@@ -150,10 +150,11 @@ describe("browser-friendly impls", () => {
   it("globalFetch consumes and returns native fetch records", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (input, init) => {
+      const requestInit = init as globalThis.RequestInit | undefined;
       expect(String(input)).toEqual("https://example.invalid/");
-      expect(init?.method).toEqual("POST");
-      expect(init?.headers).toEqual({ "X-Test": "1" });
-      expect(init?.body).toEqual(enc.encode("ping"));
+      expect(requestInit?.method).toEqual("POST");
+      expect(requestInit?.headers).toEqual({ "X-Test": "1" });
+      expect(requestInit?.body).toEqual(enc.encode("ping"));
       return Promise.resolve(
         new Response(enc.encode("pong"), {
           status: 201,

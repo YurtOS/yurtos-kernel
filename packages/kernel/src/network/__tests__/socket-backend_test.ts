@@ -9,12 +9,8 @@ import { ListenerRegistry } from "../listener-registry.js";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-function base64(s: string): string {
-  return btoa(s);
-}
-
-function decodeB64(b: string): string {
-  return atob(b);
+function bytes(s: string): Uint8Array {
+  return enc.encode(s);
 }
 
 /**
@@ -52,11 +48,11 @@ describe("createLoopbackSocketBackend: AF_UNIX parity with delegate", () => {
     const ha = -a;
     const hb = -b;
 
-    backend.send(ha, base64("ping"));
+    backend.send(ha, bytes("ping"));
     const got = await backend.recvAsync!(hb, 1024);
     expect(got.ok).toBe(true);
-    if (got.ok && got.data_b64 !== undefined) {
-      expect(decodeB64(got.data_b64)).toBe("ping");
+    if (got.ok && got.data !== undefined) {
+      expect(dec.decode(got.data)).toBe("ping");
     }
   });
 
@@ -67,11 +63,11 @@ describe("createLoopbackSocketBackend: AF_UNIX parity with delegate", () => {
     const ha = -a;
     const hb = -b;
 
-    backend.send(hb, base64("pong"));
+    backend.send(hb, bytes("pong"));
     const got = await backend.recvAsync!(ha, 1024);
     expect(got.ok).toBe(true);
-    if (got.ok && got.data_b64 !== undefined) {
-      expect(decodeB64(got.data_b64)).toBe("pong");
+    if (got.ok && got.data !== undefined) {
+      expect(dec.decode(got.data)).toBe("pong");
     }
   });
 
@@ -119,18 +115,18 @@ describe("createLoopbackSocketBackend: AF_UNIX parity with delegate", () => {
     const clientSocket = connectR.ok ? -connectR.socket : 0;
     const serverSocket = acceptR.socket;
 
-    backend.send(clientSocket, base64("hello-from-client"));
+    backend.send(clientSocket, bytes("hello-from-client"));
     const recv = await backend.recvAsync!(serverSocket, 1024);
     expect(recv.ok).toBe(true);
-    if (recv.ok && recv.data_b64 !== undefined) {
-      expect(decodeB64(recv.data_b64)).toBe("hello-from-client");
+    if (recv.ok && recv.data !== undefined) {
+      expect(dec.decode(recv.data)).toBe("hello-from-client");
     }
   });
 
   it("positive handles (TCP) are forwarded to the delegate", () => {
     const backend = createLoopbackSocketBackend(stubDelegate());
     // Positive socket handle → delegate (stub) → error
-    const result = backend.send(42, base64("data"));
+    const result = backend.send(42, bytes("data"));
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toContain("stub");

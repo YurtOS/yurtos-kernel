@@ -63,7 +63,7 @@ describe("socket fd host imports", () => {
         };
       },
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array() }),
       close(socket) {
         requests.push({ op: "close", socket });
         return { ok: true };
@@ -105,12 +105,12 @@ describe("socket fd host imports", () => {
     const sent: string[] = [];
     const backend: SocketBackend = {
       connect: () => ({ ok: true, socket: 88 }),
-      send(_socket, dataB64) {
-        sent.push(atob(dataB64));
-        return { ok: true, bytes_sent: atob(dataB64).length };
+      send(_socket, data) {
+        sent.push(new TextDecoder().decode(data));
+        return { ok: true, bytes_sent: data.byteLength };
       },
       recv() {
-        return { ok: true, data_b64: btoa("pong") };
+        return { ok: true, data: new TextEncoder().encode("pong") };
       },
       close: () => ({ ok: true }),
       recvAsync(socket, maxBytes) {
@@ -156,7 +156,7 @@ describe("socket fd host imports", () => {
     const backend: SocketBackend = {
       connect: () => ({ ok: true, socket: 77 }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array() }),
       setNoDelay(socket, enabled) {
         calls.push({ socket, enabled });
         return { ok: true };
@@ -204,7 +204,7 @@ describe("socket fd host imports", () => {
         localPort: 45678,
       }),
       send: () => ({ ok: true, bytes_sent: 0 }),
-      recv: () => ({ ok: true, data_b64: "" }),
+      recv: () => ({ ok: true, data: new Uint8Array() }),
       close: () => ({ ok: true }),
     };
     const imports = createKernelImports({
@@ -239,7 +239,7 @@ describe("socket fd host imports", () => {
       send: () => ({ ok: true, bytes_sent: 0 }),
       recv() {
         calls += 1;
-        return { ok: true, data_b64: btoa("abc") };
+        return { ok: true, data: new TextEncoder().encode("abc") };
       },
       close: () => ({ ok: true }),
     };
