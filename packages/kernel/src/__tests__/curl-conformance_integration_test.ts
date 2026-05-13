@@ -53,7 +53,10 @@ class StaticFetchBridge implements NetworkBridgeLike {
       };
     }
 
-    const text = method === "POST" ? `posted:${body ?? ""}` : "hello curl";
+    const bodyText = body instanceof Uint8Array
+      ? new TextDecoder().decode(body)
+      : (body ?? "");
+    const text = method === "POST" ? `posted:${bodyText}` : "hello curl";
     return {
       status: 200,
       headers: { "content-type": "text/plain" },
@@ -208,7 +211,9 @@ describe("curl/libcurl conformance", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toContain("posted:a=1");
     expect(bridge.requests[0].method).toBe("POST");
-    expect(bridge.requests[0].body).toContain("a=1");
+    expect(bridge.requests[0].body).toBeInstanceOf(Uint8Array);
+    expect(new TextDecoder().decode(bridge.requests[0].body as Uint8Array))
+      .toBe("a=1");
   });
 
   it("fetch-forced curl writes binary response to VFS", async () => {
