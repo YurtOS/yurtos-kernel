@@ -2,7 +2,7 @@
  *
  * isatty(3), tcgetattr(3), tcsetattr(3), tcflush(3), tcdrain(3), tcflow(3),
  * cfget/cfset ispeed/ospeed: all route through yurt_host_* imports so that
- * job-control shells (ash/bash) and any C program that links libcompat gets
+ * job-control shells (for example BusyBox ash) and any C program that links libcompat gets
  * sensible terminal behaviour instead of ENOSYS stubs.
  *
  * We do NOT implement a line discipline on the host side; the kernel passes
@@ -128,4 +128,3 @@ int yurt_tty_winsize(int fd, void *ws_out) {
     }
     return 0;
 }
-

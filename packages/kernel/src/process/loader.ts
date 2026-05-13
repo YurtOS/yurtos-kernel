@@ -18,6 +18,8 @@ import {
   type AsyncifyForkSnapshot,
 } from "../async-bridge.js";
 import { CooperativeSerialBackend } from "./threads/cooperative-serial.js";
+import { createThreadsBackend } from "./threads/backend-factory.js";
+import type { WorkerSabThreadsBackendOptions } from "./threads/worker-sab.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
 import type {
   LinearStackSwitchingThreadsBackend,
@@ -28,6 +30,14 @@ import {
   sha256Hex,
   type WasmModuleCache,
 } from "./module-cache.js";
+import {
+  analyzeYurtModule,
+  moduleNeedsAsyncifyBridge,
+  validateYurtModuleProfile,
+  validateYurtThreadMemory,
+} from "./module-profile.js";
+
+type WasmCallable = (...args: unknown[]) => unknown;
 
 function bindSignalDeliverer(
   wasi: WasiHost,
@@ -75,6 +85,9 @@ export interface LoadProcessOptions {
   stdoutLimit?: number;
   stderrLimit?: number;
   stderrToStdout?: boolean;
+  workerSabAvailable?: boolean;
+  workerSabMemory?: WebAssembly.Memory;
+  workerSabThreads?: WorkerSabThreadsBackendOptions;
   extraYurtImports?: (
     memory: WebAssembly.Memory,
     wasiHost: WasiHost,
@@ -106,18 +119,22 @@ export async function loadProcess(
   const digest = await sha256Hex(bytes);
   const module = await (ctx.moduleCache ?? defaultWasmModuleCache)
     .getOrCompile(digest, bytes);
-  const importsSetjmp = moduleImportsSetjmp(module);
-  const continuationMarked = moduleHasContinuationFeature(module);
-  if (importsSetjmp && !continuationMarked) {
-    throw new Error(
-      "module imports host_setjmp/host_longjmp but lacks yurt.features continuations marker; rebuild with yurt-cc YURT_CC_USE_CONTINUATION=1",
-    );
+  const workerSabAvailable = Boolean(opts.workerSabThreads) &&
+    (opts.workerSabAvailable ?? true);
+  const profile = validateYurtModuleProfile(analyzeYurtModule(module, {
+    workerSabAvailable,
+  }));
+  if (profile.requiresSharedMemory && profile.memoryImport) {
+    if (!opts.workerSabMemory) {
+      throw new Error(
+        "module imports shared memory for yurt.features threads but no Worker/SAB memory was provided",
+      );
+    }
+    validateYurtThreadMemory(profile, opts.workerSabMemory);
   }
-  if (continuationMarked && !moduleHasAsyncify(module)) {
-    throw new Error(
-      "module declares yurt.features continuations but is not asyncify-instrumented",
-    );
-  }
+  const threadsBackend = createThreadsBackend(profile, {
+    workerSab: opts.workerSabThreads,
+  });
   const wasiArgv = opts.wasiArgv ?? argv;
   const cwd = opts.cwd ?? "/";
   const env = { ...(opts.env ?? {}), PWD: cwd };
@@ -164,12 +181,10 @@ export async function loadProcess(
     },
   });
 
-  const asyncifyBridge = needsSetjmpBridge(module) ||
+  const asyncifyBridge = moduleNeedsAsyncifyBridge(profile) ||
       typeof WebAssembly.Suspending !== "function"
     ? new AsyncifyAsyncBridge()
     : null;
-  const threadsBackend = new CooperativeSerialBackend();
-
   let mainInstanceRef: WebAssembly.Instance | null = null;
   const yurtImports: Record<string, WebAssembly.ImportValue> = {
     ...ctx.buildKernelImports(
@@ -231,10 +246,18 @@ export async function loadProcess(
 
   let instance: WebAssembly.Instance;
   try {
-    instance = await ctx.adapter.instantiate(module, {
+    const imports: WebAssembly.Imports = {
       wasi_snapshot_preview1: wasiImports,
       yurt: yurtImports,
-    });
+    };
+    if (profile.memoryImport && opts.workerSabMemory) {
+      const namespace = imports[profile.memoryImport.module] ?? {};
+      imports[profile.memoryImport.module] = {
+        ...namespace,
+        [profile.memoryImport.name]: opts.workerSabMemory,
+      };
+    }
+    instance = await ctx.adapter.instantiate(module, imports);
   } catch (e) {
     rollback();
     throw e;
@@ -244,14 +267,24 @@ export async function loadProcess(
   const table = instance.exports.__indirect_function_table;
   if (table instanceof WebAssembly.Table) {
     const promising = typeof WebAssembly.promising === "function"
-      ? ((fn: unknown) => WebAssembly.promising(fn as Function))
+      ? ((fn: unknown) => WebAssembly.promising(fn as WasmCallable))
       : ((fn: unknown) => fn);
     threadsBackend.setIndirectCallTable(
       makeIndirectCallTable(table, promising),
     );
   }
 
-  memoryRef = instance.exports.memory as WebAssembly.Memory;
+  const exportedMemory = instance.exports.memory;
+  memoryRef = exportedMemory instanceof WebAssembly.Memory
+    ? exportedMemory
+    : profile.memoryImport
+    ? opts.workerSabMemory ?? null
+    : null;
+  if (!memoryRef) {
+    rollback();
+    throw new Error("module did not export memory");
+  }
+  validateYurtThreadMemory(profile, memoryRef);
   if (
     instance.exports.__stack_pointer instanceof WebAssembly.Global &&
     "bindLinearStack" in threadsBackend
@@ -433,7 +466,7 @@ export async function loadProcess(
       const table = childInstance.exports.__indirect_function_table;
       if (table instanceof WebAssembly.Table) {
         const promising = typeof WebAssembly.promising === "function"
-          ? ((fn: unknown) => WebAssembly.promising(fn as Function))
+          ? ((fn: unknown) => WebAssembly.promising(fn as WasmCallable))
           : ((fn: unknown) => fn);
         childThreadsBackend.setIndirectCallTable(
           makeIndirectCallTable(table, promising),
@@ -556,64 +589,6 @@ function wrapAsyncImports(
       ) as unknown as WebAssembly.ImportValue;
     }
   }
-}
-
-function needsSetjmpBridge(module: WebAssembly.Module): boolean {
-  if (!moduleHasContinuationFeature(module)) return false;
-  return moduleHasAsyncify(module);
-}
-
-function moduleHasAsyncify(module: WebAssembly.Module): boolean {
-  const exports = WebAssembly.Module.exports(module);
-  return [
-    "asyncify_start_unwind",
-    "asyncify_stop_unwind",
-    "asyncify_start_rewind",
-    "asyncify_stop_rewind",
-    "asyncify_get_state",
-  ].every((name) =>
-    exports.some((exp: WebAssembly.ModuleExportDescriptor) =>
-      exp.kind === "function" && exp.name === name
-    )
-  );
-}
-
-function moduleImportsSetjmp(module: WebAssembly.Module): boolean {
-  return WebAssembly.Module.imports(module).some((imp) =>
-    imp.module === "yurt" &&
-    (imp.name === "host_setjmp" ||
-      imp.name === "host_longjmp" ||
-      imp.name === "host_fork")
-  );
-}
-
-function moduleHasYurtFeature(
-  module: WebAssembly.Module,
-  feature: string,
-): boolean {
-  for (
-    const section of WebAssembly.Module.customSections(module, "yurt.features")
-  ) {
-    try {
-      const decoded = JSON.parse(new TextDecoder().decode(section)) as {
-        features?: unknown;
-      };
-      if (
-        Array.isArray(decoded.features) && decoded.features.includes(feature)
-      ) {
-        return true;
-      }
-    } catch {
-      // Malformed custom sections are ignored here; required-feature checks
-      // still fail closed when the marker is absent.
-    }
-  }
-  return false;
-}
-
-function moduleHasContinuationFeature(module: WebAssembly.Module): boolean {
-  return moduleHasYurtFeature(module, "continuations") ||
-    moduleHasYurtFeature(module, "setjmp");
 }
 
 function initAsyncifyBridge(

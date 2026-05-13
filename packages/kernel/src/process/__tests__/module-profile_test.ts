@@ -3,6 +3,7 @@ import {
   analyzeYurtModule,
   moduleNeedsAsyncifyBridge,
   validateYurtModuleProfile,
+  validateYurtThreadMemory,
 } from "../module-profile.ts";
 
 function encodeU32(value: number): number[] {
@@ -177,4 +178,103 @@ Deno.test("plain modules choose JSPI when available", () => {
   assertEquals(profile.requiresAsyncify, false);
   assertEquals(profile.bridge, "jspi");
   assertEquals(moduleNeedsAsyncifyBridge(profile), false);
+});
+
+Deno.test("plain modules use the cooperative pthread backend", () => {
+  const module = makeModule({});
+
+  const profile = validateYurtModuleProfile(analyzeYurtModule(module, {
+    jspiAvailable: true,
+    workerSabAvailable: true,
+  }));
+
+  assertEquals(profile.hasThreadsFeature, false);
+  assertEquals(profile.requiresSharedMemory, false);
+  assertEquals(profile.threadsBackend, "cooperative-serial");
+});
+
+Deno.test("threaded modules choose worker-sab when the host supports it", () => {
+  const module = makeModule({ features: ["threads"] });
+
+  const profile = validateYurtModuleProfile(analyzeYurtModule(module, {
+    jspiAvailable: true,
+    workerSabAvailable: true,
+  }));
+
+  assertEquals(profile.hasThreadsFeature, true);
+  assertEquals(profile.requiresSharedMemory, true);
+  assertEquals(profile.threadsBackend, "worker-sab");
+});
+
+Deno.test("module profiles record imported memory", () => {
+  const module = new WebAssembly.Module(
+    new Uint8Array([
+      0x00,
+      0x61,
+      0x73,
+      0x6d,
+      0x01,
+      0x00,
+      0x00,
+      0x00,
+      ...section(
+        2,
+        vec([[
+          ...encodeU32("env".length),
+          ...bytes("env"),
+          ...encodeU32("memory".length),
+          ...bytes("memory"),
+          0x02,
+          0x03,
+          0x01,
+          0x01,
+        ]]),
+      ),
+    ]),
+  );
+
+  const profile = validateYurtModuleProfile(analyzeYurtModule(module));
+
+  assertEquals(profile.memoryImport, { module: "env", name: "memory" });
+});
+
+Deno.test("threaded modules are unsupported without Worker/SAB capability", () => {
+  const module = makeModule({ features: ["threads"] });
+
+  const profile = validateYurtModuleProfile(analyzeYurtModule(module, {
+    jspiAvailable: true,
+    workerSabAvailable: false,
+  }));
+
+  assertEquals(profile.hasThreadsFeature, true);
+  assertEquals(profile.requiresSharedMemory, true);
+  assertEquals(profile.threadsBackend, "unsupported");
+});
+
+Deno.test("threaded modules require shared memory at instantiation", () => {
+  const module = makeModule({ features: ["threads"] });
+  const profile = validateYurtModuleProfile(analyzeYurtModule(module, {
+    workerSabAvailable: true,
+  }));
+
+  assertThrows(
+    () =>
+      validateYurtThreadMemory(profile, new WebAssembly.Memory({ initial: 1 })),
+    Error,
+    "module declares yurt.features threads but did not instantiate with shared memory",
+  );
+});
+
+Deno.test("threaded modules accept shared memory at instantiation", () => {
+  const module = makeModule({ features: ["threads"] });
+  const profile = validateYurtModuleProfile(analyzeYurtModule(module, {
+    workerSabAvailable: true,
+  }));
+  const memory = new WebAssembly.Memory({
+    initial: 1,
+    maximum: 1,
+    shared: true,
+  });
+
+  validateYurtThreadMemory(profile, memory);
 });

@@ -1,4 +1,13 @@
 export type YurtBridgeKind = "asyncify" | "jspi" | "sync";
+export type YurtThreadsBackendKind =
+  | "cooperative-serial"
+  | "worker-sab"
+  | "unsupported";
+
+export interface YurtMemoryImport {
+  readonly module: string;
+  readonly name: string;
+}
 
 export interface YurtModuleProfile {
   readonly importsSetjmp: boolean;
@@ -6,12 +15,17 @@ export interface YurtModuleProfile {
   readonly hasAsyncify: boolean;
   readonly hasSetjmpFeature: boolean;
   readonly hasContinuationsFeature: boolean;
+  readonly hasThreadsFeature: boolean;
   readonly requiresAsyncify: boolean;
+  readonly requiresSharedMemory: boolean;
   readonly bridge: YurtBridgeKind;
+  readonly threadsBackend: YurtThreadsBackendKind;
+  readonly memoryImport: YurtMemoryImport | null;
 }
 
 export interface AnalyzeYurtModuleOptions {
   readonly jspiAvailable?: boolean;
+  readonly workerSabAvailable?: boolean;
 }
 
 const ASYNCIFY_EXPORTS = [
@@ -37,11 +51,16 @@ export function analyzeYurtModule(
   const hasAsyncify = moduleHasAsyncify(module);
   const hasSetjmpFeature = moduleHasYurtFeature(module, "setjmp");
   const hasContinuationsFeature = moduleHasYurtFeature(module, "continuations");
+  const hasThreadsFeature = moduleHasYurtFeature(module, "threads");
   const requiresAsyncify = importsFork || hasSetjmpFeature ||
     hasContinuationsFeature;
+  const requiresSharedMemory = hasThreadsFeature;
   const jspiAvailable = opts.jspiAvailable ??
     typeof (WebAssembly as unknown as { Suspending?: unknown }).Suspending ===
       "function";
+  const workerSabAvailable = opts.workerSabAvailable ??
+    detectWorkerSabAvailable();
+  const memoryImport = imports.find((imp) => imp.kind === "memory") ?? null;
 
   return {
     importsSetjmp,
@@ -49,8 +68,16 @@ export function analyzeYurtModule(
     hasAsyncify,
     hasSetjmpFeature,
     hasContinuationsFeature,
+    hasThreadsFeature,
     requiresAsyncify,
+    requiresSharedMemory,
     bridge: requiresAsyncify ? "asyncify" : jspiAvailable ? "jspi" : "sync",
+    threadsBackend: hasThreadsFeature
+      ? workerSabAvailable ? "worker-sab" : "unsupported"
+      : "cooperative-serial",
+    memoryImport: memoryImport
+      ? { module: memoryImport.module, name: memoryImport.name }
+      : null,
   };
 }
 
@@ -75,6 +102,20 @@ export function validateYurtModuleProfile(
 
 export function moduleNeedsAsyncifyBridge(profile: YurtModuleProfile): boolean {
   return profile.requiresAsyncify && profile.hasAsyncify;
+}
+
+export function validateYurtThreadMemory(
+  profile: YurtModuleProfile,
+  memory: WebAssembly.Memory,
+): void {
+  if (
+    profile.requiresSharedMemory &&
+    !(memory.buffer instanceof SharedArrayBuffer)
+  ) {
+    throw new Error(
+      "module declares yurt.features threads but did not instantiate with shared memory",
+    );
+  }
 }
 
 export function moduleHasAsyncify(module: WebAssembly.Module): boolean {
@@ -110,4 +151,10 @@ export function moduleHasYurtFeature(
 
 function hasAnyAsyncifyFeature(profile: YurtModuleProfile): boolean {
   return profile.hasSetjmpFeature || profile.hasContinuationsFeature;
+}
+
+function detectWorkerSabAvailable(): boolean {
+  if (typeof SharedArrayBuffer !== "function") return false;
+  if (typeof Atomics.wait !== "function") return false;
+  return typeof Worker === "function";
 }

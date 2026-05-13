@@ -6,7 +6,7 @@ import { ProcessManager } from '../manager.js';
 import { VFS } from '../../vfs/vfs.js';
 import { NodeAdapter } from '../../platform/node-adapter.js';
 
-const FIXTURES = resolve(import.meta.dirname, '../../platform/__tests__/fixtures');
+const FIXTURES = resolve(import.meta.dirname!, '../../platform/__tests__/fixtures');
 
 describe('ProcessManager', () => {
   let vfs: VFS;

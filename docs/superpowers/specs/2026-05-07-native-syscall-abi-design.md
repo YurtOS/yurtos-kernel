@@ -32,7 +32,7 @@ The ABI should be easy to call from C, Rust, and TypeScript without runtime sche
 - Keep buffer/pointer processing at the host boundary. Rust/Wasmtime decodes through `wasmtime::Caller`; TypeScript decodes in the Deno/browser fallback. Guest code only calls imports and uses small local libc wrappers/builders where needed.
 - Keep pure scalar imports scalar.
 - Convert canaries and runtime shims to the new ABI. No legacy JSON canaries.
-- Keep shell/bash as a normal guest process. The only special fact is that TypeScript may start it from outside with a TTY; it does not get a separate ABI.
+- Keep shells as normal guest processes. The only special fact is that TypeScript may start one from outside with a TTY; it does not get a separate ABI.
 - Preserve POSIX errno behavior: success returns non-negative values; failures return negative errno at the host import boundary or set guest `errno` in C wrappers as appropriate.
 
 ### Out of scope
@@ -172,7 +172,7 @@ On success, host writes `yurt_spawn_result_v1 { int32_t pid; }` and returns its 
 
 ### Command Execution
 
-`host_run_command` is **not** part of the native kernel ABI. Shell execution is represented by spawning a normal guest process such as `/bin/sh`, `/bin/bash`, or another registered executable with pipes for stdin/stdout/stderr.
+`host_run_command` is **not** part of the native kernel ABI. Shell execution is represented by spawning a normal guest process such as `/bin/sh`, BusyBox `ash`, or another registered executable with pipes for stdin/stdout/stderr.
 
 The existing `yurt_system`, `yurt_popen`, Python subprocess shim, and PID-1 command helpers are compatibility layers. They must be implemented in terms of `host_spawn`, `host_pipe`, `host_write_fd`, `host_read_fd`, and `host_wait`, not by adding a command-execution syscall at the host boundary.
 
@@ -239,7 +239,7 @@ Rust std patches call the same imports through `extern "C"` declarations or thro
 6. Remove `host_run_command` from the kernel ABI and implement command compatibility through spawn/pipe/wait.
 7. Delete FlatBuffers helpers and generated bindings once no import uses them.
 8. Delete JSON helpers, `writeJson`, and all legacy JSON host branches.
-9. Rebuild C canaries, Rust canaries, Rust std canaries, and bash fixtures.
+9. Rebuild C canaries, Rust canaries, Rust std canaries, and shell runner fixtures.
 10. Run ABI, host-import, fixture, and shell/process tests.
 11. Add grep-based CI checks that reject `writeJson`, ABI-boundary `JSON.parse`, FlatBuffers host imports, `host_run_command`, and old wait imports.
 

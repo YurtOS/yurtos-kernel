@@ -5,18 +5,18 @@
  * requests over SharedArrayBuffer, and handles timeout/kill.
  */
 
-import type { Worker } from 'node:worker_threads';
-import type { VFS } from '../vfs/vfs.js';
-import type { RunResult } from '../run-result.js';
+import type { Worker } from "node:worker_threads";
+import type { VFS } from "../vfs/vfs.js";
+import type { RunResult } from "../run-result.js";
 import {
-  SAB_SIZE,
-  STATUS_RESPONSE,
-  STATUS_ERROR,
   decodeRequest,
   encodeResponse,
-} from './proxy-protocol.js';
-import { VfsError } from '../vfs/inode.js';
-import type { ExtensionRegistry } from '../extension/registry.js';
+  SAB_SIZE,
+  STATUS_ERROR,
+  STATUS_RESPONSE,
+} from "./proxy-protocol.js";
+import { VfsError } from "../vfs/inode.js";
+import type { ExtensionRegistry } from "../extension/registry.js";
 
 export interface WorkerConfig {
   vfs: VFS;
@@ -55,7 +55,11 @@ export class WorkerExecutor {
     this.int32 = new Int32Array(this.sab);
   }
 
-  async run(command: string, env: Map<string, string>, timeoutMs: number): Promise<WorkerRunResult> {
+  async run(
+    command: string,
+    env: Map<string, string>,
+    timeoutMs: number,
+  ): Promise<WorkerRunResult> {
     if (!this.worker) {
       await this.createWorker();
     }
@@ -68,15 +72,15 @@ export class WorkerExecutor {
       this.timeoutTimer = setTimeout(() => {
         this.terminateWorker({
           exitCode: 124,
-          stdout: '',
-          stderr: 'command timeout\n',
+          stdout: "",
+          stderr: "command timeout\n",
           executionTimeMs: timeoutMs,
-          errorClass: 'TIMEOUT',
+          errorClass: "TIMEOUT",
         });
       }, timeoutMs);
 
       this.worker!.postMessage({
-        type: 'run',
+        type: "run",
         command,
         env: Array.from(env.entries()),
         timeoutMs,
@@ -89,10 +93,10 @@ export class WorkerExecutor {
   kill(): void {
     this.terminateWorker({
       exitCode: 125,
-      stdout: '',
-      stderr: 'command cancelled\n',
+      stdout: "",
+      stderr: "command cancelled\n",
       executionTimeMs: 0,
-      errorClass: 'CANCELLED',
+      errorClass: "CANCELLED",
     });
   }
 
@@ -115,7 +119,10 @@ export class WorkerExecutor {
       const resolve = this.pendingResolve;
       this.pendingResolve = null;
       resolve({
-        exitCode: 1, stdout: '', stderr: 'disposed\n', executionTimeMs: 0,
+        exitCode: 1,
+        stdout: "",
+        stderr: "disposed\n",
+        executionTimeMs: 0,
       });
     }
     if (this.worker) {
@@ -127,7 +134,7 @@ export class WorkerExecutor {
   }
 
   private async createWorker(): Promise<void> {
-    const { Worker } = await import('node:worker_threads');
+    const { Worker } = await import("node:worker_threads");
 
     // Fresh SAB for each Worker to avoid data races with terminated Workers
     // whose threads may still be lingering on the old SAB.
@@ -137,7 +144,9 @@ export class WorkerExecutor {
 
     // Source runs can load TS directly; built Node packages load the emitted JS worker.
     const workerPath = new URL(
-      import.meta.url.endsWith('.ts') ? './execution-worker.ts' : './execution-worker.js',
+      import.meta.url.endsWith(".ts")
+        ? "./execution-worker.ts"
+        : "./execution-worker.js",
       import.meta.url,
     ).pathname;
     this.worker = new Worker(workerPath, { execArgv: [] });
@@ -146,12 +155,12 @@ export class WorkerExecutor {
     this.worker.unref();
 
     // Handle messages from Worker
-    this.worker.on('message', (msg: any) => {
-      if (msg === 'proxy-request') {
+    this.worker.on("message", (msg: any) => {
+      if (msg === "proxy-request") {
         this.handleProxyRequest();
         return;
       }
-      if (msg?.type === 'result') {
+      if (msg?.type === "result") {
         this.running = false;
         if (this.timeoutTimer) {
           clearTimeout(this.timeoutTimer);
@@ -173,10 +182,10 @@ export class WorkerExecutor {
       }
     });
 
-    this.worker.on('error', (err) => {
+    this.worker.on("error", (err) => {
       this.terminateWorker({
         exitCode: 1,
-        stdout: '',
+        stdout: "",
         stderr: `Worker error: ${err.message}\n`,
         executionTimeMs: 0,
       });
@@ -185,31 +194,31 @@ export class WorkerExecutor {
     // Send init message and wait for ready
     const readyPromise = new Promise<void>((resolve, reject) => {
       const onMsg = (msg: any) => {
-        if (msg?.type === 'ready') {
-          this.worker!.off('error', onError);
-          this.worker!.off('exit', onExit);
-          this.worker!.off('message', onMsg);
+        if (msg?.type === "ready") {
+          this.worker!.off("error", onError);
+          this.worker!.off("exit", onExit);
+          this.worker!.off("message", onMsg);
           resolve();
         }
       };
       const onError = (err: Error) => {
-        this.worker?.off('message', onMsg);
-        this.worker?.off('exit', onExit);
+        this.worker?.off("message", onMsg);
+        this.worker?.off("exit", onExit);
         reject(err);
       };
       const onExit = (code: number) => {
         if (code === 0) return;
-        this.worker?.off('message', onMsg);
-        this.worker?.off('error', onError);
+        this.worker?.off("message", onMsg);
+        this.worker?.off("error", onError);
         reject(new Error(`Worker exited before ready with code ${code}`));
       };
-      this.worker!.on('message', onMsg);
-      this.worker!.once('error', onError);
-      this.worker!.once('exit', onExit);
+      this.worker!.on("message", onMsg);
+      this.worker!.once("error", onError);
+      this.worker!.once("exit", onExit);
     });
 
     this.worker.postMessage({
-      type: 'init',
+      type: "init",
       sab: this.sab,
       wasmDir: this.config.wasmDir,
       shellExecWasmPath: this.config.shellExecWasmPath,
@@ -230,19 +239,19 @@ export class WorkerExecutor {
 
   private async ensureBootBinary(): Promise<void> {
     try {
-      this.config.vfs.stat('/bin/bash');
+      this.config.vfs.stat("/bin/yurt-shell-exec");
       return;
     } catch {
       // Missing in direct WorkerExecutor tests/usage. Sandbox.create installs
       // this already, so never overwrite an existing sandbox boot binary.
     }
 
-    const { readFile } = await import('node:fs/promises');
+    const { readFile } = await import("node:fs/promises");
     const shellWasmBytes = await readFile(this.config.shellExecWasmPath);
     this.config.vfs.withWriteAccess(() => {
-      this.config.vfs.mkdirp('/bin');
-      this.config.vfs.writeFile('/bin/bash', shellWasmBytes);
-      this.config.vfs.chmod('/bin/bash', 0o755);
+      this.config.vfs.mkdirp("/bin");
+      this.config.vfs.writeFile("/bin/yurt-shell-exec", shellWasmBytes);
+      this.config.vfs.chmod("/bin/yurt-shell-exec", 0o755);
     });
   }
 
@@ -251,46 +260,50 @@ export class WorkerExecutor {
     const op = metadata.op as string;
 
     // Extension invocations are async — main thread is free while worker blocks
-    if (op === 'extensionInvoke') {
+    if (op === "extensionInvoke") {
       this.handleExtensionProxy(metadata).then(() => {
         Atomics.notify(this.int32, 0);
       }).catch((err) => {
-        encodeResponse(this.sab, { ok: false, error: (err as Error).message ?? 'extension handler error' });
+        encodeResponse(this.sab, {
+          ok: false,
+          error: (err as Error).message ?? "extension handler error",
+        });
         Atomics.store(this.int32, 0, STATUS_ERROR);
         Atomics.notify(this.int32, 0);
       });
       return; // Don't notify yet — async handler will notify
     }
 
-    const path = (metadata.path as string) ?? '';
+    const path = (metadata.path as string) ?? "";
     const vfs = this.config.vfs;
 
     // Only use withWriteAccess for write operations targeting tool stub paths.
     // Restrict elevation to /usr/bin (tool stubs only) and /.wasi (WASI internals).
     // Never elevate writes to /usr/lib, /usr/share, or /bin to prevent
     // overwriting security-critical files (e.g. Python socket shim).
-    const READ_OPS = new Set(['readFile', 'stat', 'lstat', 'readdir']);
-    const ELEVATED_WRITE_PREFIXES = ['/usr/bin/', '/.wasi/'];
-    const ELEVATED_WRITE_PATHS = new Set(['/.wasi-preopen-sentinel']);
+    const READ_OPS = new Set(["readFile", "stat", "lstat", "readdir"]);
+    const ELEVATED_WRITE_PREFIXES = ["/usr/bin/", "/.wasi/"];
+    const ELEVATED_WRITE_PATHS = new Set(["/.wasi-preopen-sentinel"]);
     const isRead = READ_OPS.has(op);
-    const isElevatedPath = ELEVATED_WRITE_PATHS.has(path) || ELEVATED_WRITE_PREFIXES.some(p => path.startsWith(p));
+    const isElevatedPath = ELEVATED_WRITE_PATHS.has(path) ||
+      ELEVATED_WRITE_PREFIXES.some((p) => path.startsWith(p));
     const needsElevation = !isRead && isElevatedPath;
 
     const exec = () => {
       switch (op) {
-        case 'readFile': {
+        case "readFile": {
           const content = vfs.readFile(metadata.path as string);
           encodeResponse(this.sab, {}, content);
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'writeFile': {
+        case "writeFile": {
           vfs.writeFile(metadata.path as string, binary ?? new Uint8Array(0));
           encodeResponse(this.sab, { ok: true });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'stat': {
+        case "stat": {
           const st = vfs.stat(metadata.path as string);
           encodeResponse(this.sab, {
             type: st.type,
@@ -305,7 +318,7 @@ export class WorkerExecutor {
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'lstat': {
+        case "lstat": {
           const lst = vfs.lstat(metadata.path as string);
           encodeResponse(this.sab, {
             type: lst.type,
@@ -320,49 +333,49 @@ export class WorkerExecutor {
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'readdir': {
+        case "readdir": {
           const entries = vfs.readdir(metadata.path as string);
           encodeResponse(this.sab, { entries });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'mkdir': {
+        case "mkdir": {
           vfs.mkdir(metadata.path as string);
           encodeResponse(this.sab, { ok: true });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'mkdirp': {
+        case "mkdirp": {
           vfs.mkdirp(metadata.path as string);
           encodeResponse(this.sab, { ok: true });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'unlink': {
+        case "unlink": {
           vfs.unlink(metadata.path as string);
           encodeResponse(this.sab, { ok: true });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'rmdir': {
+        case "rmdir": {
           vfs.rmdir(metadata.path as string);
           encodeResponse(this.sab, { ok: true });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'rename': {
+        case "rename": {
           vfs.rename(metadata.oldPath as string, metadata.newPath as string);
           encodeResponse(this.sab, { ok: true });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'chmod': {
+        case "chmod": {
           vfs.chmod(metadata.path as string, metadata.mode as number);
           encodeResponse(this.sab, { ok: true });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'chown': {
+        case "chown": {
           vfs.withWriteAccess(() => {
             vfs.chown(
               metadata.path as string,
@@ -375,13 +388,13 @@ export class WorkerExecutor {
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'symlink': {
+        case "symlink": {
           vfs.symlink(metadata.target as string, metadata.path as string);
           encodeResponse(this.sab, { ok: true });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
           break;
         }
-        case 'readlink': {
+        case "readlink": {
           const target = vfs.readlink(metadata.path as string);
           encodeResponse(this.sab, { target });
           Atomics.store(this.int32, 0, STATUS_RESPONSE);
@@ -390,7 +403,7 @@ export class WorkerExecutor {
         default: {
           encodeResponse(this.sab, {
             error: true,
-            code: 'ENOSYS',
+            code: "ENOSYS",
             message: `Unknown op: ${op}`,
           });
           Atomics.store(this.int32, 0, STATUS_ERROR);
@@ -415,7 +428,7 @@ export class WorkerExecutor {
       } else {
         encodeResponse(this.sab, {
           error: true,
-          code: 'EIO',
+          code: "EIO",
           message: (err as Error).message,
         });
       }
@@ -425,13 +438,18 @@ export class WorkerExecutor {
     Atomics.notify(this.int32, 0);
   }
 
-  private async handleExtensionProxy(metadata: Record<string, unknown>): Promise<void> {
+  private async handleExtensionProxy(
+    metadata: Record<string, unknown>,
+  ): Promise<void> {
     const extName = metadata.extension as string;
     const method = metadata.method as string;
     const kwargs = metadata.kwargs as Record<string, unknown>;
 
     if (!this.config.extensionRegistry) {
-      encodeResponse(this.sab, { ok: false, error: 'no extension registry configured' });
+      encodeResponse(this.sab, {
+        ok: false,
+        error: "no extension registry configured",
+      });
       Atomics.store(this.int32, 0, STATUS_RESPONSE);
       return;
     }
@@ -439,9 +457,9 @@ export class WorkerExecutor {
     try {
       const result = await this.config.extensionRegistry.invoke(extName, {
         args: [method, JSON.stringify(kwargs)],
-        stdin: '',
+        stdin: "",
         env: {},
-        cwd: '/',
+        cwd: "/",
       });
       encodeResponse(this.sab, { ok: true, result: result.stdout });
       Atomics.store(this.int32, 0, STATUS_RESPONSE);

@@ -2,7 +2,8 @@
  * Sandbox: high-level facade wrapping VFS + the generic process kernel.
  *
  * The boot program is just a resident WASM process loaded from the VFS. The
- * default embedding boots /bin/bash, but the kernel path is not bash-specific.
+ * default embedding boots /bin/yurt-shell-exec, but the kernel path is not
+ * runner-specific.
  */
 
 import { VFS } from "./vfs/vfs.js";
@@ -126,11 +127,11 @@ export interface SandboxOptions {
   image?: string | Uint8Array;
   /** Directory for decompressed image tar cache entries. Node/Deno path loads only. */
   imageCacheDir?: string;
-  /** Path/URL to the default boot WASM. Defaults to `${wasmDir}/bash.wasm`. */
+  /** Path/URL to the default boot WASM. Defaults to `${wasmDir}/yurt-shell-exec.wasm`. */
   bootWasmPath?: string;
   /** Deprecated alias for bootWasmPath. */
   shellExecWasmPath?: string;
-  /** Resident process boot argv. Defaults to ['/bin/bash']; argv[0] is the VFS executable path. */
+  /** Resident process boot argv. Defaults to ['/bin/yurt-shell-exec']; argv[0] is the VFS executable path. */
   bootArgv?: string[];
   /** Userland-specific imports merged into PID 1's yurt import namespace. */
   bootImports?: (api: KernelApi) => Record<string, WebAssembly.ImportValue>;
@@ -423,14 +424,14 @@ export class Sandbox {
 
     const baseBootWasmPath = options.bootWasmPath ??
       options.shellExecWasmPath ??
-      `${options.wasmDir}/bash.wasm`;
+      `${options.wasmDir}/yurt-shell-exec.wasm`;
     // When JSPI is unavailable, prefer the asyncify-instrumented variant.
     const jspiAvailable = typeof WebAssembly.Suspending === "function";
     const asyncifyPath = baseBootWasmPath.replace(/\.wasm$/, "-asyncify.wasm");
     const bootWasmPath = !jspiAvailable
       ? await Sandbox.tryPath(adapter, asyncifyPath) ?? baseBootWasmPath
       : baseBootWasmPath;
-    const bootArgv = options.bootArgv ?? ["/bin/bash"];
+    const bootArgv = options.bootArgv ?? ["/bin/yurt-shell-exec"];
 
     if (!hasBaseRoot) {
       await Sandbox.installBootProgram(
@@ -1877,7 +1878,7 @@ export class Sandbox {
    * Returns a `TtyHandle` the host can use to write input and read output.
    *
    * Call this once after `Sandbox.create()` when running an interactive shell
-   * (ash/bash in TTY mode). The boot process must already be loaded.
+   * (for example BusyBox ash in TTY mode). The boot process must already be loaded.
    *
    * Writing input: `tty.write(new TextEncoder().encode("ls\n"))`
    * Reading output: `const chunk = await tty.read()`

@@ -204,7 +204,6 @@ fn resolve_command_args(
 ///   `#!/usr/bin/env python3` -> Some("python3")
 ///   `#!/usr/bin/python3`     -> Some("python3")
 ///   `#!/bin/sh`              -> Some("sh")
-///   `#!/bin/bash`            -> Some("bash")
 ///   (no shebang)             -> None
 fn parse_shebang(first_line: &str) -> Option<String> {
     if !first_line.starts_with("#!") {
@@ -347,7 +346,7 @@ fn exec_path(
         }
     }
 
-    // Default: run as shell script (covers #!/bin/sh, #!/bin/bash, and no shebang)
+    // Default: run as shell script (covers #!/bin/sh and no shebang)
     exec_shell_script(state, host, &text, args)
 }
 
@@ -383,10 +382,10 @@ fn exec_shell_script(
     result
 }
 
-/// Handle `sh`/`bash` command dispatch.
-/// - `sh -c 'cmd'` -> parse and execute cmd string
-/// - `sh script.sh` -> read and execute script via exec_path
-/// - bare `sh`/`bash` -> succeed silently
+/// Handle `sh`/`ash` command dispatch.
+/// - `sh -c 'cmd'` / `ash -c 'cmd'` -> parse and execute cmd string
+/// - `sh script.sh` / `ash script.sh` -> read and execute script via exec_path
+/// - bare `sh`/`ash` -> succeed silently
 fn exec_shell_command(
     state: &mut ShellState,
     host: &dyn HostInterface,
@@ -403,7 +402,7 @@ fn exec_shell_command(
     if !args.is_empty() && !args[0].starts_with('-') {
         return exec_path(state, host, args[0], &args[1..], stdin_data);
     }
-    // Bare sh/bash with no args — not interactive, just succeed
+    // Bare sh with no args — not interactive, just succeed
     Ok(ControlFlow::Normal(RunResult::empty()))
 }
 
@@ -415,7 +414,7 @@ fn exec_shell_command(
 ///     PATH must run with `argv[0] = "grep"` but dispatch the `busybox`
 ///     multicall binary).  `None` means "use program as argv[0]".
 ///   * `args` are the resolved trailing arguments.
-/// If the command was fully handled (shebang, sh/bash dispatch),
+/// If the command was fully handled (shebang, sh/ash dispatch),
 /// returns Err(ControlFlow) instead.
 fn dispatch_external_command(
     state: &mut ShellState,
@@ -435,8 +434,8 @@ fn dispatch_external_command(
         }
     }
 
-    // 2. Shell command dispatch — if cmd_name is `sh` or `bash`
-    if cmd_name == "sh" || cmd_name == "bash" {
+    // 2. Shell command dispatch — if cmd_name is `sh`/`ash`
+    if cmd_name == "sh" || cmd_name == "ash" {
         match exec_shell_command(state, host, args, stdin_data) {
             Ok(flow) => return Err(flow),
             Err(e) => {
@@ -797,7 +796,7 @@ pub fn exec_command(
 
             if words.is_empty() {
                 // Assignment-only command; nothing to spawn.
-                // In bash, $? reflects the exit code of the last command
+                // In POSIX shells, $? reflects the exit code of the last command
                 // substitution that ran during the assignment (e.g. x=$(false) → $?=1).
                 if let Some(err) = assign_err {
                     state.last_exit_code = 1;
@@ -1100,7 +1099,7 @@ pub fn exec_command(
                 match dispatch_external_command(state, host, cmd_name, &args, &stdin_data) {
                     Ok((prog, argv0, resolved)) => (prog, argv0, resolved),
                     Err(flow) => {
-                        // Command was handled by dispatch (shebang, sh/bash)
+                        // Command was handled by dispatch (shebang, sh/ash)
                         let run = match flow {
                             ControlFlow::Normal(r) => r,
                             other => return Ok(other),
@@ -1474,7 +1473,7 @@ pub fn exec_command(
 
                             match dispatch_result {
                                 Err(flow) => {
-                                    // Command was handled by dispatch (shebang, sh/bash)
+                                    // Command was handled by dispatch (shebang, sh/ash)
                                     match flow {
                                         ControlFlow::Normal(r) => {
                                             state.last_exit_code = r.exit_code;
@@ -1840,7 +1839,7 @@ pub fn exec_command(
 
                                     match dispatch_result {
                                         Err(flow) => {
-                                            // Command was handled by dispatch (shebang, sh/bash)
+                                            // Command was handled by dispatch (shebang, sh/ash)
                                             // These run inline — they already completed.
                                             match flow {
                                                 ControlFlow::Normal(r) => {
@@ -5907,11 +5906,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_shebang_bash() {
-        assert_eq!(parse_shebang("#!/bin/bash"), Some("bash".to_string()));
-    }
-
-    #[test]
     fn parse_shebang_no_shebang() {
         assert_eq!(parse_shebang("echo hello"), None);
         assert_eq!(parse_shebang(""), None);
@@ -5943,7 +5937,7 @@ mod tests {
     #[test]
     fn is_python_interpreter_not_python() {
         assert!(!is_python_interpreter("sh"));
-        assert!(!is_python_interpreter("bash"));
+        assert!(!is_python_interpreter("ash"));
         assert!(!is_python_interpreter("node"));
     }
 
@@ -6253,15 +6247,6 @@ mod tests {
     }
 
     #[test]
-    fn bash_minus_c_executes_command() {
-        let host = MockHost::new();
-        let mut state = ShellState::new_default();
-        let cmd = yurt_shell::parser::parse("bash -c 'echo world'");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
-        assert_eq!(stdout, "world\n");
-    }
-
-    #[test]
     fn sh_script_file() {
         let host =
             MockHost::new().with_file("/home/user/test.sh", b"#!/bin/sh\necho from_script\n");
@@ -6284,15 +6269,13 @@ mod tests {
     }
 
     #[test]
-    fn bare_bash_succeeds() {
+    fn ash_minus_c_executes_command() {
         let host = MockHost::new();
         let mut state = ShellState::new_default();
-        let cmd = yurt_shell::parser::parse("bash");
-        let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
-            panic!("expected Normal")
-        };
-        assert_eq!(run.exit_code, 0);
+        let cmd = yurt_shell::parser::parse("ash -c 'echo hello'");
+        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout, "hello\n");
     }
 
     // ---- shell script positional parameters ----
@@ -6515,7 +6498,7 @@ mod tests {
         let (read_fd, write_fd) = host.pipe().expect("pipe() failed");
         let saved = state.stdout_fd;
         state.stdout_fd = write_fd;
-        let result = exec_shell_script(&mut state, &host, "#!/bin/bash\necho stripped\n", &[]);
+        let result = exec_shell_script(&mut state, &host, "#!/bin/sh\necho stripped\n", &[]);
         state.stdout_fd = saved;
         let _ = host.close_fd(write_fd);
         let captured = host.read_fd(read_fd).unwrap_or_default();

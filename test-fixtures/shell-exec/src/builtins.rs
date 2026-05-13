@@ -3218,7 +3218,7 @@ mod tests {
     #[test]
     fn source_strips_shebang() {
         let mut state = ShellState::new_default();
-        let host = MockHost::new().with_file("/tmp/script.sh", b"#!/bin/bash\necho sourced");
+        let host = MockHost::new().with_file("/tmp/script.sh", b"#!/bin/sh\necho sourced");
         let run_fn = |_state: &mut ShellState, cmd: &str| -> RunResult {
             // Should NOT contain shebang
             assert!(!cmd.contains("#!"));
