@@ -28,12 +28,25 @@ class ThreadExit {
 export class WorkerSabThreadsBackend implements ThreadsBackend {
   readonly kind = "worker-sab" as const;
 
-  private slots: SpawnSlot[] = [{
-    result: Promise.resolve(0),
-    reaped: true,
-    detached: false,
-    finished: true,
-  }];
+  private slots: SpawnSlot[] = [
+    // slot[0]: tid 0 — "unset" sentinel for guest-visible host_thread_self.
+    {
+      result: Promise.resolve(0),
+      reaped: true,
+      detached: false,
+      finished: true,
+    },
+    // slot[1]: tid 1 — reserved for main thread's kernel-side SabMutex
+    // owner tag. Main never has a real SpawnSlot, but this entry keeps
+    // spawn-allocated tids >= 2 so main and spawned threads have disjoint
+    // SabMutex owner identities. See tidForLockOps() doc-comment.
+    {
+      result: Promise.resolve(0),
+      reaped: true,
+      detached: false,
+      finished: true,
+    },
+  ];
   private tids = new ThreadIdScope();
   private readonly sab: SharedArrayBuffer;
 
@@ -142,13 +155,18 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
   }
 
   /**
-   * Resolve the current logical tid for SabMutex/SabCondvar calls.
+   * Resolve the tid used as the SabMutex/SabCondvar owner field.
    *
-   * SabMutex disallows tid 0 (reserved for "unlocked"). The current
-   * `ThreadIdScope`-based `self()` returns 0 for the main thread when no
-   * scope is active, which would trip SabMutex's guard. Map 0 -> 1 here
-   * as a temporary hack; Task 8 introduces a SAB-backed tid table that
-   * resolves this cleanly.
+   * Main thread: returns 1 (reserved slot[1]). Spawned threads: returns
+   * their spawn-allocated tid (>= 2). This keeps main and spawned tids
+   * disjoint so SabMutex.owner correctly identifies the holder across
+   * the main/worker boundary.
+   *
+   * Worker-side `host_thread_self` (when wired in Task 9) will report
+   * the start-message tid directly via closure — the guest sees its
+   * own tid >= 2 there. Main-side `host_thread_self` will report 0
+   * (per revised plan). The mapping here is kernel-internal, only for
+   * the SabMutex owner field.
    */
   private tidForLockOps(): number {
     return Math.max(this.self(), 1);

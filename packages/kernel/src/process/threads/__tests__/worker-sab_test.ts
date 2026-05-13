@@ -18,8 +18,9 @@ Deno.test("worker SAB backend allows multiple live spawned threads", async () =>
   const first = await backend.spawn(1, 1);
   const second = await backend.spawn(1, 2);
 
-  assertEquals(first, 1);
-  assertEquals(second, 2);
+  // Task 8: spawned tids start at 2 (slot[0]=tid-0 sentinel, slot[1]=main).
+  assertEquals(first, 2);
+  assertEquals(second, 3);
 
   pending.shift()!();
   pending.shift()!();
@@ -105,4 +106,49 @@ Deno.test("WorkerSabThreadsBackend: rejects non-shared memory", () => {
       throw new Error(`unexpected error: ${e}`);
     }
   }
+});
+
+Deno.test("WorkerSabThreadsBackend: first spawned tid is 2 (main reserves tid 1)", async () => {
+  const memory = new WebAssembly.Memory({
+    initial: 1,
+    maximum: 1,
+    shared: true,
+  });
+  const backend = new WorkerSabThreadsBackend({
+    spawnThread: () => Promise.resolve(0),
+  }, memory);
+
+  const first = await backend.spawn(0, 0);
+  const second = await backend.spawn(0, 0);
+
+  assertEquals(first, 2); // was 1 before Task 8
+  assertEquals(second, 3); // was 2 before Task 8
+});
+
+Deno.test("WorkerSabThreadsBackend: main's mutex owner doesn't collide with first spawned thread", async () => {
+  const memory = new WebAssembly.Memory({
+    initial: 1,
+    maximum: 1,
+    shared: true,
+  });
+  const backend = new WorkerSabThreadsBackend({
+    spawnThread: () => Promise.resolve(0),
+  }, memory);
+
+  // Main acquires the mutex at ptr=0
+  await backend.mutexLock(0);
+
+  // Spawn a thread (tid will be 2 after the fix)
+  const tid = await backend.spawn(0, 0);
+  assertEquals(tid, 2);
+
+  // Inspect the SabMutex cell directly: owner should be 1 (main's
+  // lock-ops tid), not 2 (the spawned thread's tid).
+  const view = new SabMutex(memory.buffer as SharedArrayBuffer, 0);
+  assertEquals(view.owner(), 1);
+
+  // Unlock and verify the cell is released
+  const rc = backend.mutexUnlock(0);
+  assertEquals(rc, 0);
+  assertEquals(view.owner(), 0);
 });
