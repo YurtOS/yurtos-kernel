@@ -18,8 +18,8 @@ void yurt_host_yield(void);
 __attribute__((import_module("yurt"), import_name("host_file_lock")))
 int yurt_host_file_lock(int fd, int operation);
 
-__attribute__((import_module("yurt"), import_name("host_poll")))
-int yurt_host_poll(int fds_ptr, int nfds, int timeout_ms);
+__attribute__((import_module("env"), import_name("sys_poll")))
+int yurt_sys_poll(int fds_ptr, int nfds, int timeout_ms);
 
 __attribute__((import_module("yurt"), import_name("host_chmod")))
 int yurt_host_chmod(int path_ptr, int path_len, int mode);
