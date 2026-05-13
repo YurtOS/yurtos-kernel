@@ -166,7 +166,11 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
 
   async mutexLock(mutexPtr: number): Promise<number> {
     const m = new SabMutex(this.sab, mutexPtr);
-    m.lock(this.tidForLockOps());
+    // Use the async variant: a blocking `Atomics.wait` here freezes
+    // main's event loop and prevents the worker-host dispatcher from
+    // draining incoming "host-call" messages — the canonical worker-
+    // SAB deadlock observed by libzmq-reactor-spawn_reproducer_test.ts.
+    await m.lockAsync(this.tidForLockOps());
     return 0;
   }
 
@@ -188,7 +192,8 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
   async condWait(condPtr: number, mutexPtr: number): Promise<number> {
     const m = new SabMutex(this.sab, mutexPtr);
     const cv = new SabCondvar(this.sab, condPtr);
-    cv.wait(m, this.tidForLockOps());
+    // Async variant — see mutexLock for the event-loop-freeze rationale.
+    await cv.waitAsync(m, this.tidForLockOps());
     return 0;
   }
 

@@ -49,6 +49,33 @@ export class SabMutex {
     }
   }
 
+  /**
+   * Async lock that uses `Atomics.waitAsync` instead of `Atomics.wait`,
+   * so it never freezes the event loop. Required on the main JS thread:
+   * the blocking `lock()` would stall the message queue, preventing
+   * incoming `"host-call"` postMessages from any spawned worker from
+   * ever being drained, which is the canonical worker-SAB deadlock.
+   *
+   * Worker threads should keep using the blocking `lock()` — they have
+   * their own event loop, and blocking is the cheaper primitive.
+   */
+  async lockAsync(tid: number): Promise<void> {
+    if (!Number.isInteger(tid) || tid <= 0) {
+      throw new Error(
+        `SabMutex.lockAsync: tid must be a positive integer (got ${tid})`,
+      );
+    }
+    while (true) {
+      const prev = Atomics.compareExchange(this.view, 0, 0, tid);
+      if (prev === 0) return;
+      const res = Atomics.waitAsync(this.view, 0, prev);
+      // waitAsync.async === false means the value already moved away
+      // from `prev` (Atomics.wait would have returned "not-equal" with
+      // no sleep) — re-CAS without awaiting.
+      if (res.async) await res.value;
+    }
+  }
+
   unlock(tid: number): void {
     if (!Number.isInteger(tid) || tid <= 0) {
       throw new Error(
@@ -105,6 +132,21 @@ export class SabCondvar {
     m.unlock(tid);
     Atomics.wait(this.view, 0, seq);
     m.lock(tid);
+  }
+
+  /**
+   * Async variant of `wait()` for use on the main JS thread. Mirrors
+   * `wait`'s semantics (unlock-mutex / wait-on-seq / re-lock-mutex)
+   * but routes both the seq-wait AND the mutex re-acquire through
+   * `Atomics.waitAsync` so the event loop stays drained. See
+   * `SabMutex.lockAsync` for why this matters on main.
+   */
+  async waitAsync(m: SabMutex, tid: number): Promise<void> {
+    const seq = Atomics.load(this.view, 0);
+    m.unlock(tid);
+    const res = Atomics.waitAsync(this.view, 0, seq);
+    if (res.async) await res.value;
+    await m.lockAsync(tid);
   }
 
   /** Wake at most one waiter. Safe to call without holding the mutex. */
