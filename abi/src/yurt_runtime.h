@@ -177,16 +177,16 @@ __attribute__((import_module("yurt"), import_name("host_socket_open")))
 int yurt_host_socket_open(int domain, int type, int protocol);
 
 __attribute__((import_module("yurt"), import_name("host_socket_connect")))
-int yurt_host_socket_connect(int addr_ptr, int addr_len, unsigned flags);
+int yurt_host_socket_connect(int fd, int host_ptr, int host_len, unsigned port, unsigned flags);
 
 __attribute__((import_module("yurt"), import_name("host_socket_bind")))
 int yurt_host_socket_bind(int fd, int host_ptr, int host_len, unsigned port);
 
 __attribute__((import_module("yurt"), import_name("host_socket_listen")))
-int yurt_host_socket_listen(int backlog, int addr_ptr, int addr_len);
+int yurt_host_socket_listen(int fd, int backlog);
 
 __attribute__((import_module("yurt"), import_name("host_socket_accept")))
-int yurt_host_socket_accept(int fd, int flags);
+int yurt_host_socket_accept(int fd, int out_ptr, int out_cap);
 
 __attribute__((import_module("yurt"), import_name("host_socket_send")))
 int yurt_host_socket_send(int fd, int data_ptr, int data_len, int flags);
@@ -195,24 +195,13 @@ __attribute__((import_module("yurt"), import_name("host_socket_recv")))
 int yurt_host_socket_recv(int fd, int out_ptr, int out_cap, int flags);
 
 __attribute__((import_module("yurt"), import_name("host_socket_addr")))
-int yurt_host_socket_addr(int fd, int out_ptr, int out_cap);
+int yurt_host_socket_addr(int fd, unsigned which, int out_ptr, int out_cap);
 
 __attribute__((import_module("yurt"), import_name("host_socket_option")))
 int yurt_host_socket_option(int fd, unsigned option, unsigned has_value, int value);
 
-__attribute__((import_module("yurt"), import_name("host_socket_set_no_delay")))
-int yurt_host_socket_set_no_delay(int fd, int enabled);
-
 __attribute__((import_module("yurt"), import_name("host_socket_close")))
 int yurt_host_socket_close(int fd);
-
-int yurt_socket_is_tracked_fd(int fd);
-int yurt_socket_dup_fd_min(int fd, int min_fd);
-int yurt_socket_dup_fd(int fd);
-int yurt_socket_get_status_flags(int fd);
-int yurt_socket_set_status_flags(int fd, int flags);
-int yurt_socket_get_descriptor_flags(int fd);
-int yurt_socket_set_descriptor_flags(int fd, int flags);
 
 /* host_socket_socketpair(family, type, sv_ptr) -> 0 | -1
  * Writes two connected fd numbers as i32 LE at sv_ptr and sv_ptr+4. */

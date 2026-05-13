@@ -7,6 +7,8 @@
 #include <unistd.h>
 #include <wasi/api.h>
 
+int yurt_socket_is_tracked_fd(int fd);
+
 static ssize_t yurt_read_impl(int fd, void *buf, size_t count) {
   if (yurt_socket_is_tracked_fd(fd)) {
     return recv(fd, buf, count, 0);

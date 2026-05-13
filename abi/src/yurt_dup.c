@@ -71,12 +71,24 @@ static int yurt_fd_apply_descriptor_flags(int fd, int flags) {
   return 0;
 }
 
+int yurt_socket_is_tracked_fd(int fd);
+int yurt_socket_is_guest_fd(int fd);
+int yurt_socket_dup_fd(int fd);
+int yurt_socket_dup_fd_min(int fd, int min_fd);
+int yurt_socket_get_status_flags(int fd);
+int yurt_socket_set_status_flags(int fd, int flags);
+int yurt_socket_get_descriptor_flags(int fd);
+int yurt_socket_set_descriptor_flags(int fd, int flags);
+
 int dup(int oldfd) {
   YURT_MARKER_CALL(dup);
 
   if (oldfd < 0) {
     errno = EBADF;
     return -1;
+  }
+  if (yurt_socket_is_guest_fd(oldfd)) {
+    return yurt_socket_dup_fd(oldfd);
   }
 
   int32_t new_fd = -1;
@@ -131,15 +143,22 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
         return -1;
       }
 
-      int new_fd = yurt_host_dup_min(fd, min_fd);
+      int new_fd = yurt_socket_is_guest_fd(fd)
+        ? yurt_socket_dup_fd_min(fd, min_fd)
+        : yurt_host_dup_min(fd, min_fd);
       if (new_fd < 0) {
         errno = EBADF;
         return -1;
       }
 #ifdef F_DUPFD_CLOEXEC
-      if (cmd == F_DUPFD_CLOEXEC && yurt_fd_apply_descriptor_flags(new_fd, FD_CLOEXEC) != 0) {
-        close(new_fd);
-        return -1;
+      if (cmd == F_DUPFD_CLOEXEC) {
+        int rc = yurt_socket_is_guest_fd(new_fd)
+          ? yurt_socket_set_descriptor_flags(new_fd, FD_CLOEXEC)
+          : yurt_fd_apply_descriptor_flags(new_fd, FD_CLOEXEC);
+        if (rc != 0) {
+          close(new_fd);
+          return -1;
+        }
       }
 #endif
       return new_fd;
@@ -150,6 +169,9 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
         errno = EBADF;
         return -1;
       }
+      if (yurt_socket_is_tracked_fd(fd)) {
+        return yurt_socket_get_descriptor_flags(fd);
+      }
       return yurt_fd_get_descriptor_flags(fd);
 
     case F_SETFD: {
@@ -158,6 +180,9 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
         errno = EBADF;
         return -1;
       }
+      if (yurt_socket_is_tracked_fd(fd)) {
+        return yurt_socket_set_descriptor_flags(fd, flags);
+      }
       if (yurt_fd_apply_descriptor_flags(fd, flags) != 0) {
         return -1;
       }
@@ -165,6 +190,9 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
     }
 
     case F_GETFL: {
+      if (yurt_socket_is_tracked_fd(fd)) {
+        return O_RDWR | yurt_socket_get_status_flags(fd);
+      }
       __wasi_fdstat_t st;
       __wasi_errno_t rc = __wasi_fd_fdstat_get((__wasi_fd_t)fd, &st);
       if (rc != __WASI_ERRNO_SUCCESS) {
@@ -185,6 +213,12 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
 
     case F_SETFL: {
       int flags = va_arg(ap, int);
+      if (yurt_socket_is_tracked_fd(fd)) {
+        return yurt_socket_set_status_flags(
+          fd,
+          flags & (O_APPEND | O_NONBLOCK | O_DSYNC | O_SYNC | O_RSYNC)
+        );
+      }
       __wasi_fdstat_t st;
       __wasi_errno_t rc = __wasi_fd_fdstat_get((__wasi_fd_t)fd, &st);
       if (rc != __WASI_ERRNO_SUCCESS) {
