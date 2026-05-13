@@ -87,6 +87,30 @@ async fn binary_response_is_raw_body_bytes() {
     assert_eq!(result.body, [0xff, 0xfe]);
 }
 
+#[tokio::test]
+async fn manual_redirect_mode_returns_redirect_response() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/redirect"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", "/final")
+                .set_body_bytes(b"redirect body"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/final"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"final body"))
+        .mount(&server)
+        .await;
+
+    let req = request_record(&format!("{}/redirect", server.uri()), "GET", &[], b"");
+    let result = decode_response(&network::fetch(&req).await);
+    assert_eq!(result.status, 302);
+    assert_eq!(result.body, b"redirect body");
+}
+
 struct FetchResponse {
     status: u32,
     body: Vec<u8>,

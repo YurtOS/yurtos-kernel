@@ -10,11 +10,22 @@ use std::time::Duration;
 // ── Shared HTTP client ────────────────────────────────────────────────────────
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+static MANUAL_REDIRECT_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client")
+    })
+}
+
+fn manual_redirect_client() -> &'static reqwest::Client {
+    MANUAL_REDIRECT_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("failed to build HTTP client")
     })
@@ -28,6 +39,7 @@ pub struct FetchRequest {
     method: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
+    redirect_mode: u32,
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
@@ -105,12 +117,14 @@ pub fn decode_fetch_request(record: &[u8]) -> Result<FetchRequest, String> {
     )
     .ok_or_else(|| "invalid fetch body span".to_owned())?
     .to_vec();
+    let redirect_mode = read_u32(record, 40).unwrap_or(0);
 
     Ok(FetchRequest {
         url,
         method,
         headers,
         body,
+        redirect_mode,
     })
 }
 
@@ -143,7 +157,12 @@ async fn do_fetch(req: FetchRequest) -> Vec<u8> {
         },
     };
 
-    let mut builder = client().request(method, &req.url);
+    let http_client = if req.redirect_mode == 1 {
+        manual_redirect_client()
+    } else {
+        client()
+    };
+    let mut builder = http_client.request(method, &req.url);
 
     for (k, v) in &req.headers {
         builder = builder.header(k.as_str(), v.as_str());
