@@ -194,8 +194,15 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
       expect(used).toEqual(4);
       expect(new TextDecoder().decode(rOut.response.subarray(0, used)))
         .toEqual("ping");
-      // Close client-side handle so Deno's leak checker is happy.
-      tcp.close(handle);
+      const closeReq = new Uint8Array(4);
+      new DataView(closeReq.buffer).setUint32(0, handle, true);
+      expect(Number(
+        await mk.syscallAsync(
+          METHOD.SYS_SOCKET_CLOSE,
+          closeReq,
+          0,
+        ).then((out) => out.rc),
+      )).toEqual(0);
     } finally {
       try {
         listener.close();
@@ -221,6 +228,9 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
     const out = await mk.syscallAsync(METHOD.SYS_SOCKET_LISTEN, req, 0);
     const handle = Number(out.rc);
     expect(handle).toBeGreaterThan(0);
-    tcp.close(handle);
+    const closeReq = new Uint8Array(4);
+    new DataView(closeReq.buffer).setUint32(0, handle, true);
+    const closed = await mk.syscallAsync(METHOD.SYS_SOCKET_CLOSE, closeReq, 0);
+    expect(Number(closed.rc)).toEqual(0);
   });
 });

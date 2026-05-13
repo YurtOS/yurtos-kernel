@@ -85,7 +85,7 @@ class FakeAsyncTcp implements TcpSocketImpl {
 }
 
 describe("JSPI / kh_socket_*", () => {
-  it("syscallAsync(SYS_SOCKET_CONNECT) suspends + returns the handle", async () => {
+  it("syscallAsync(SYS_SOCKET_CONNECT) suspends + returns the kernel fd", async () => {
     if (!HAS_JSPI) return;
     const tcp = new FakeAsyncTcp();
     const host = defaultHostState();
@@ -104,12 +104,16 @@ describe("JSPI / kh_socket_*", () => {
     new TextEncoder().encodeInto(addr, req.subarray(8));
     const out = await mk.syscallAsync(METHOD.SYS_SOCKET_CONNECT, req, 0);
     expect(Number(out.rc)).toBeGreaterThan(0);
+    await mk.syscallAsync(
+      METHOD.SYS_SOCKET_CLOSE,
+      new Uint8Array(new Uint32Array([Number(out.rc)]).buffer),
+      0,
+    );
   });
 
   it("syscallAsync(SYS_SOCKET_RECV) suspends + returns enqueued bytes", async () => {
     if (!HAS_JSPI) return;
     const tcp = new FakeAsyncTcp();
-    tcp.enqueue(7, new TextEncoder().encode("hello-async"));
     const host = defaultHostState();
     host.tcp = tcp;
     const mk = await KernelHostInterface.load(
@@ -117,14 +121,33 @@ describe("JSPI / kh_socket_*", () => {
       host,
     );
 
-    // sys_socket_recv request: u32 fd + u32 flags. Use handle=7
-    // (matches our enqueue above).
+    const addr = "127.0.0.1:0";
+    const connectReq = new Uint8Array(8 + addr.length);
+    connectReq[0] = 2; // AF_INET
+    connectReq[1] = 1; // SOCK_STREAM
+    new TextEncoder().encodeInto(addr, connectReq.subarray(8));
+    const connected = await mk.syscallAsync(
+      METHOD.SYS_SOCKET_CONNECT,
+      connectReq,
+      0,
+    );
+    const fd = Number(connected.rc);
+    expect(fd).toBeGreaterThan(0);
+
+    tcp.enqueue(1, new TextEncoder().encode("hello-async"));
+
+    // sys_socket_recv request: u32 fd + u32 flags.
     const req = new Uint8Array(8);
-    new DataView(req.buffer).setUint32(0, 7, true);
+    new DataView(req.buffer).setUint32(0, fd, true);
     const out = await mk.syscallAsync(METHOD.SYS_SOCKET_RECV, req, 64);
     const used = Number(out.rc);
     expect(used).toEqual("hello-async".length);
     expect(new TextDecoder().decode(out.response.subarray(0, used)))
       .toEqual("hello-async");
+    await mk.syscallAsync(
+      METHOD.SYS_SOCKET_CLOSE,
+      new Uint8Array(new Uint32Array([fd]).buffer),
+      0,
+    );
   });
 });
