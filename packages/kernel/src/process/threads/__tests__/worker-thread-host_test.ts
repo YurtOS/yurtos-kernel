@@ -1,6 +1,8 @@
 import { assertEquals } from "@std/assert";
 import { SabCondvar } from "../sab-primitives.ts";
 
+const WORKER_HOST_RESPONSE_BYTES = 8 + 4096;
+
 Deno.test("worker-thread-host: instantiates module and calls fnPtr", async () => {
   const wasmBytes = await Deno.readFile(
     new URL("./_fixtures/echo-thread.wasm", import.meta.url),
@@ -134,5 +136,57 @@ Deno.test("worker-thread-host: condvar wait uses shared memory cells", async () 
 
   assertEquals(await result, 7);
   assertEquals(Atomics.load(mutex, 0), 0);
+  worker.terminate();
+});
+
+Deno.test("worker-thread-host: host_write_fd proxies through typed binary request cells", async () => {
+  const wasmBytes = await Deno.readFile(
+    new URL("./_fixtures/thread-write-fd.wasm", import.meta.url),
+  );
+  const module = await WebAssembly.compile(wasmBytes);
+  const memory = new WebAssembly.Memory({
+    initial: 1,
+    maximum: 1,
+    shared: true,
+  });
+  const requestSab = new SharedArrayBuffer(WORKER_HOST_RESPONSE_BYTES);
+  const header = new Int32Array(requestSab, 0, 2);
+  const payload = new Int32Array(requestSab, 8);
+  const payloadBytes = new Uint8Array(requestSab, 8);
+  const written: number[] = [];
+
+  const worker = new Worker(
+    new URL("../worker-thread-host.ts", import.meta.url).href,
+    { type: "module" },
+  );
+  const result = new Promise<number>((resolve, reject) => {
+    worker.onerror = (event) => reject(event.error);
+    worker.onmessage = (event) => {
+      if (event.data.type === "host-call") {
+        assertEquals(payload[0], 10);
+        assertEquals(payload[1], 3);
+        assertEquals(payload[2], 1);
+        assertEquals(payload[4], 5);
+        written.push(...payloadBytes.slice(20, 25));
+        Atomics.store(header, 1, 5);
+        Atomics.store(header, 0, 2);
+        Atomics.notify(header, 0);
+        return;
+      }
+      resolve(event.data.retval);
+    };
+    worker.postMessage({
+      type: "start",
+      tid: 8,
+      fnPtr: 0,
+      arg: 256,
+      module,
+      memory,
+      importProxy: { requestSab },
+    });
+  });
+
+  assertEquals(await result, 5);
+  assertEquals(new TextDecoder().decode(new Uint8Array(written)), "hello");
   worker.terminate();
 });

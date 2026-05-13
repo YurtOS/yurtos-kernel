@@ -1,4 +1,8 @@
 import { SabCondvar, SabMutex } from "./sab-primitives.ts";
+import {
+  createWorkerHostProxyImports,
+  type WorkerHostImportProxy,
+} from "./worker-host-proxy.ts";
 import { WASI_EBUSY } from "../../wasi/types.ts";
 
 interface StartMessage {
@@ -8,6 +12,7 @@ interface StartMessage {
   arg: number;
   module: WebAssembly.Module;
   memory: WebAssembly.Memory;
+  importProxy?: WorkerHostImportProxy;
 }
 
 const workerSelf = self as unknown as {
@@ -19,7 +24,7 @@ const workerSelf = self as unknown as {
 
 workerSelf.onmessage = async (event: MessageEvent<StartMessage>) => {
   if (event.data.type !== "start") return;
-  const { tid, fnPtr, arg, module, memory } = event.data;
+  const { tid, fnPtr, arg, module, memory, importProxy } = event.data;
   const sharedBuffer = memory.buffer;
   if (!(sharedBuffer instanceof SharedArrayBuffer)) {
     workerSelf.postMessage({ type: "done", tid, retval: -1 });
@@ -31,6 +36,9 @@ workerSelf.onmessage = async (event: MessageEvent<StartMessage>) => {
   const instance = await WebAssembly.instantiate(module, {
     env: { memory },
     yurt: {
+      ...createWorkerHostProxyImports(memory, importProxy, (op) => {
+        workerSelf.postMessage({ type: "host-call", tid, op });
+      }),
       host_thread_self: () => tid,
       host_mutex_lock: (ptr: number) => {
         if (mutex(ptr).owner() === tid) return -1;
