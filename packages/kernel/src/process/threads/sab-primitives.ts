@@ -18,12 +18,25 @@ export class SabMutex {
   }
 
   tryLock(tid: number): boolean {
+    if (!Number.isInteger(tid) || tid <= 0) {
+      throw new Error(
+        `SabMutex.tryLock: tid must be a positive integer (got ${tid})`,
+      );
+    }
     return Atomics.compareExchange(this.view, 0, 0, tid) === 0;
   }
 
   unlock(tid: number): void {
-    if (Atomics.compareExchange(this.view, 0, tid, 0) !== tid) {
-      throw new Error("SabMutex.unlock: not the owner");
+    if (!Number.isInteger(tid) || tid <= 0) {
+      throw new Error(
+        `SabMutex.unlock: tid must be a positive integer (got ${tid})`,
+      );
+    }
+    const prev = Atomics.compareExchange(this.view, 0, tid, 0);
+    if (prev !== tid) {
+      throw new Error(
+        `SabMutex.unlock: tid ${tid} is not the owner (owner=${prev})`,
+      );
     }
     Atomics.notify(this.view, 0, 1);
   }
