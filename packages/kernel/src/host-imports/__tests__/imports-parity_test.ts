@@ -1,4 +1,4 @@
-import { assertArrayIncludes, assertFalse } from "jsr:@std/assert@^1.0.19";
+import { assertArrayIncludes } from "jsr:@std/assert@^1.0.19";
 import { createKernelImports } from "../kernel-imports.ts";
 
 const KERNEL_IMPORTS_BASELINE = [
@@ -51,6 +51,7 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_longjmp",
   "host_fork",
   "host_yield",
+  "host_list_processes",
   "host_stat",
   "host_read_file",
   "host_write_file",
@@ -98,12 +99,4 @@ Deno.test("kernel-imports baseline export names", () => {
   for (const expected of KERNEL_IMPORTS_BASELINE) {
     assertArrayIncludes(names, [expected]);
   }
-});
-
-Deno.test("kernel-imports do not expose defunct JSON process listing", () => {
-  const imports = createKernelImports({
-    memory: new WebAssembly.Memory({ initial: 1 }),
-  });
-
-  assertFalse("host_list_processes" in imports);
 });

@@ -159,6 +159,12 @@ const USER_UID = 1000;
 const USER_GID = 1000;
 const PRIO_PROCESS = 0;
 const YURT_WAIT_NOHANG = 1;
+const POLLIN = 0x0001;
+const POLLOUT = 0x0002;
+const POLLERR = 0x0008;
+const POLLHUP = 0x0010;
+const POLLNVAL = 0x0020;
+const POLLFD_SIZE = 8;
 
 function writeI32(
   memory: WebAssembly.Memory,
@@ -528,6 +534,69 @@ function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
 
 function yieldToScheduler(): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, 0));
+}
+
+function pollReventsForTarget(target: FdTarget, events: number): number {
+  let revents = 0;
+  const wantsRead = (events & POLLIN) !== 0;
+  const wantsWrite = (events & POLLOUT) !== 0;
+
+  switch (target.type) {
+    case "pipe_read":
+      if (wantsRead && target.pipe.hasBufferedData) revents |= POLLIN;
+      if (target.pipe.writeClosed && !target.pipe.hasBufferedData) {
+        revents |= POLLHUP;
+      }
+      break;
+    case "pipe_write":
+      if (target.pipe.closed) revents |= POLLERR;
+      else if (wantsWrite && target.pipe.hasCapacity) revents |= POLLOUT;
+      break;
+    case "tty_slave":
+      if (wantsRead && target.state.toSlave.length > 0) revents |= POLLIN;
+      if (target.state.masterClosed) revents |= POLLHUP;
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+    case "tty_master":
+      if (wantsRead && target.state.toMaster.length > 0) revents |= POLLIN;
+      if (wantsWrite && !target.state.masterClosed) revents |= POLLOUT;
+      if (target.state.masterClosed) revents |= POLLHUP;
+      break;
+    case "buffer":
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+    case "static":
+      if (wantsRead) revents |= POLLIN;
+      break;
+    case "socket":
+      if (wantsRead) {
+        if ((target.peekBuffer?.byteLength ?? 0) > 0 || target.readShutdown) {
+          revents |= POLLIN;
+        } else if (target.socket !== null) {
+          const probe = target.recv(target.socket, 1, { nonblocking: true });
+          if (probe.ok) {
+            const data = probe.data ?? new Uint8Array(0);
+            if (data.byteLength > 0) target.peekBuffer = data;
+            else target.readShutdown = true;
+            revents |= POLLIN;
+          } else if (probe.error !== "EAGAIN") {
+            revents |= POLLERR;
+          }
+        }
+      }
+      if (wantsWrite && target.socket !== null && !target.writeShutdown) {
+        revents |= POLLOUT;
+      }
+      break;
+    case "null":
+    case "vfs_file":
+    case "vfs_dir":
+      if (wantsRead) revents |= POLLIN;
+      if (wantsWrite) revents |= POLLOUT;
+      break;
+  }
+
+  return revents;
 }
 
 function globToRegExp(pattern: string): RegExp {
@@ -2231,6 +2300,45 @@ export function createKernelImports(
       opts.wasiHost?.drainPendingSignals();
     },
 
+    // host_list_processes(out_ptr, out_cap) -> i32
+    // Returns a native yurt_process_list_response_v1 record.
+    host_list_processes(outPtr: number, outCap: number): number {
+      const encoder = new TextEncoder();
+      const procs = opts.kernel?.listProcesses() ?? [];
+      const headerSize = 16;
+      const entrySize = 20;
+      const entriesOffset = headerSize;
+      const stringsOffset = entriesOffset + procs.length * entrySize;
+      const commandBytes = procs.map((proc) => encoder.encode(proc.command));
+      const size = stringsOffset +
+        commandBytes.reduce((sum, bytes) => sum + bytes.byteLength, 0);
+      if (outCap < size) return size;
+
+      const out = new Uint8Array(memory.buffer, outPtr, size);
+      const view = new DataView(memory.buffer, outPtr, size);
+      out.fill(0);
+      view.setUint32(0, size, true);
+      view.setUint16(4, 1, true);
+      view.setUint16(6, 0, true);
+      view.setUint32(8, entriesOffset, true);
+      view.setUint32(12, procs.length, true);
+
+      let cursor = stringsOffset;
+      for (let i = 0; i < procs.length; i++) {
+        const proc = procs[i];
+        const bytes = commandBytes[i];
+        const entryOffset = entriesOffset + i * entrySize;
+        view.setInt32(entryOffset, proc.pid, true);
+        view.setInt32(entryOffset + 4, proc.ppid, true);
+        view.setUint32(entryOffset + 8, proc.state === "running" ? 1 : 2, true);
+        view.setUint32(entryOffset + 12, cursor, true);
+        view.setUint32(entryOffset + 16, bytes.byteLength, true);
+        out.set(bytes, cursor);
+        cursor += bytes.byteLength;
+      }
+      return size;
+    },
+
     // ── Network ──
 
     // host_network_fetch(req_ptr, req_len, out_ptr, out_cap) -> i32
@@ -2564,6 +2672,9 @@ export function createKernelImports(
           target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
         }
         return writeBytes(memory, outPtr, outCap, chunk);
+      }
+      if (target.readShutdown) {
+        return writeBytes(memory, outPtr, outCap, new Uint8Array(0));
       }
       if (peek) {
         const probe = socketBackend.recv(target.socket, outCap, {
