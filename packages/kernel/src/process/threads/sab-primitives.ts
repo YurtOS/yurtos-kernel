@@ -30,3 +30,30 @@ export class SabMutex {
     return Atomics.load(this.view, 0);
   }
 }
+
+export class SabCondvar {
+  static readonly BYTES = 4;
+
+  private readonly view: Int32Array;
+
+  constructor(sab: SharedArrayBuffer, byteOffset: number) {
+    this.view = new Int32Array(sab, byteOffset, 1);
+  }
+
+  wait(mutex: SabMutex, tid: number): void {
+    const sequence = Atomics.load(this.view, 0);
+    mutex.unlock(tid);
+    Atomics.wait(this.view, 0, sequence);
+    mutex.lock(tid);
+  }
+
+  signal(): void {
+    Atomics.add(this.view, 0, 1);
+    Atomics.notify(this.view, 0, 1);
+  }
+
+  broadcast(): void {
+    Atomics.add(this.view, 0, 1);
+    Atomics.notify(this.view, 0);
+  }
+}
