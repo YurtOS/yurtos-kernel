@@ -66,7 +66,7 @@ export interface SpawnRequest {
   env: [string, string][];
   cwd: string;
   nice?: number;
-  // snake_case to match JSON from Rust's serde_json
+  // snake_case to match the native spawn ABI field names
   stdin_fd: number;
   stdout_fd: number;
   stderr_fd: number;

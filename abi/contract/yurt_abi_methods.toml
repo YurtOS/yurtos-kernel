@@ -416,7 +416,7 @@ doc = "List keys in a store with an optional prefix. Request bytes: u8 store_len
 [method.sys_fetch]
 id = 0x1_0030
 kind = "syscall"
-doc = "Outbound HTTP fetch. Request bytes: a JSON document {url, method, headers, body} (UTF-8). Response bytes: a JSON document {ok, status, headers, body, body_base64?, error?} written into the response buffer up to its capacity. Returns bytes-written (>= 0) on success, or -EACCES when the embedder's PolicyEnforcer denies the request, -ENOSYS when the host has no network backend, -E2BIG when the response doesn't fit. The kernel forwards the request bytes verbatim to kh_fetch — wire-format changes happen in `network::fetch` on the host side."
+doc = "Outbound HTTP fetch. Request bytes are yurt_fetch_request_v1. Response bytes are yurt_fetch_response_v1 written into the response buffer up to its capacity. Returns bytes-written (>= 0) on success, or -EACCES when the embedder's PolicyEnforcer denies the request, -ENOSYS when the host has no network backend, -E2BIG when the response doesn't fit. The kernel forwards the request bytes verbatim to kh_fetch_blocking."
 
 [method.sys_spawn]
 id = 0x1_002F

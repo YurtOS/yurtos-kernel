@@ -1887,10 +1887,9 @@ fn sys_socket_close(request: &[u8]) -> i64 {
     kh::socket_close(handle) as i64
 }
 
-/// `sys_fetch(json_request_bytes) -> json_response_bytes`. Forwards
-/// the request bytes verbatim to `kh_fetch_blocking` and writes the
-/// response bytes back. Wire format is whatever `network::fetch`
-/// accepts on the host.
+/// `sys_fetch(yurt_fetch_request_v1) -> yurt_fetch_response_v1`. Forwards the
+/// request bytes verbatim to `kh_fetch_blocking` and writes the response bytes
+/// back.
 fn sys_fetch(request: &[u8], response: &mut [u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);

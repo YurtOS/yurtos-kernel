@@ -276,7 +276,7 @@ export interface PolicyEnforcer {
   mayLog?(severity: number, message: string): PolicyDecision;
   /** Gate kh_now_realtime. */
   mayGetRealtime?(): PolicyDecision;
-  /** Gate kh_fetch_blocking. `request` is the JSON document. */
+  /** Gate kh_fetch_blocking. `request` is yurt_fetch_request_v1. */
   mayFetch?(request: Uint8Array): PolicyDecision;
   /** Gate kh_idb_*. `write` distinguishes mutating ops. */
   mayIdb?(store: Uint8Array, write: boolean): PolicyDecision;
@@ -401,10 +401,10 @@ export interface HostState {
    * JSPI (Safari today, Node/Deno without --jspi), the slot is
    * ignored and `kh_fetch_blocking` returns -ENOSYS.
    *
-   * The function takes the JSON request bytes, returns the JSON
-   * response bytes (same shape as the existing `host_network_fetch`
-   * encoding). Browser microkernels wrap `globalThis.fetch`; Deno
-   * embedders wrap `globalThis.fetch` too (it's in the platform).
+   * The function takes yurt_fetch_request_v1 bytes and returns
+   * yurt_fetch_response_v1 bytes. Browser microkernels wrap
+   * `globalThis.fetch`; Deno embedders wrap `globalThis.fetch` too
+   * (it's in the platform).
    */
   fetch?: (request: Uint8Array) => Promise<Uint8Array>;
   /**
@@ -3094,58 +3094,188 @@ export function s(value: string): Uint8Array {
 // Browser-only APIs (IndexedDB, OPFS) feature-detect at construction
 // time and throw a clear error in environments where they're absent.
 
+interface NativeFetchRequest {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body: Uint8Array;
+  redirectMode: number;
+}
+
+const nativeFetchDecoder = new TextDecoder("utf-8", { fatal: true });
+const nativeFetchEncoder = new TextEncoder();
+
+function readU16(bytes: Uint8Array, offset: number): number {
+  if (offset < 0 || offset + 2 > bytes.byteLength) {
+    throw new Error("invalid fetch record u16");
+  }
+  return new DataView(bytes.buffer, bytes.byteOffset + offset, 2).getUint16(
+    0,
+    true,
+  );
+}
+
+function readU32(bytes: Uint8Array, offset: number): number {
+  if (offset < 0 || offset + 4 > bytes.byteLength) {
+    throw new Error("invalid fetch record u32");
+  }
+  return new DataView(bytes.buffer, bytes.byteOffset + offset, 4).getUint32(
+    0,
+    true,
+  );
+}
+
+function readNativeSpan(
+  bytes: Uint8Array,
+  offset: number,
+  len: number,
+): Uint8Array {
+  if (offset < 0 || len < 0 || offset + len > bytes.byteLength) {
+    throw new Error("invalid fetch record span");
+  }
+  return bytes.subarray(offset, offset + len);
+}
+
+function readNativeString(
+  bytes: Uint8Array,
+  offset: number,
+  len: number,
+): string {
+  return nativeFetchDecoder.decode(readNativeSpan(bytes, offset, len));
+}
+
+function decodeNativeFetchRequest(record: Uint8Array): NativeFetchRequest {
+  if (record.byteLength < 44) throw new Error("fetch request record too small");
+  const size = readU32(record, 0);
+  const version = readU16(record, 4);
+  if (version !== 1 || size !== record.byteLength) {
+    throw new Error("invalid fetch request record header");
+  }
+
+  const url = readNativeString(record, readU32(record, 8), readU32(record, 12));
+  const methodLen = readU32(record, 20);
+  const method = methodLen === 0
+    ? "GET"
+    : readNativeString(record, readU32(record, 16), methodLen);
+  const headersOffset = readU32(record, 24);
+  const headersCount = readU32(record, 28);
+  readNativeSpan(record, headersOffset, headersCount * 16);
+  const headers: Record<string, string> = {};
+  for (let idx = 0; idx < headersCount; idx++) {
+    const at = headersOffset + idx * 16;
+    const key = readNativeString(
+      record,
+      readU32(record, at),
+      readU32(record, at + 4),
+    );
+    const value = readNativeString(
+      record,
+      readU32(record, at + 8),
+      readU32(record, at + 12),
+    );
+    headers[key] = value;
+  }
+  return {
+    url,
+    method,
+    headers,
+    body: readNativeSpan(record, readU32(record, 32), readU32(record, 36)),
+    redirectMode: readU32(record, 40),
+  };
+}
+
+function encodeNativeFetchResponse(
+  status: number,
+  headers: Array<[string, string]>,
+  body: Uint8Array,
+  error: string | null,
+): Uint8Array {
+  const headerSize = 36;
+  const pairSize = 16;
+  const pairsOffset = headerSize;
+  let cursor = pairsOffset + headers.length * pairSize;
+  const strings: Uint8Array[] = [];
+  const pairs: Array<[number, number, number, number]> = [];
+  for (const [key, value] of headers) {
+    const keyBytes = nativeFetchEncoder.encode(key);
+    const valueBytes = nativeFetchEncoder.encode(value);
+    const keyOffset = cursor;
+    cursor += keyBytes.byteLength;
+    const valueOffset = cursor;
+    cursor += valueBytes.byteLength;
+    strings.push(keyBytes, valueBytes);
+    pairs.push([
+      keyOffset,
+      keyBytes.byteLength,
+      valueOffset,
+      valueBytes.byteLength,
+    ]);
+  }
+  const bodyOffset = cursor;
+  cursor += body.byteLength;
+  const errorBytes = error == null
+    ? new Uint8Array()
+    : nativeFetchEncoder.encode(error);
+  const errorOffset = cursor;
+  cursor += errorBytes.byteLength;
+
+  const record = new Uint8Array(cursor);
+  const view = new DataView(record.buffer);
+  view.setUint32(0, cursor, true);
+  view.setUint16(4, 1, true);
+  view.setUint32(8, status, true);
+  view.setUint32(12, pairsOffset, true);
+  view.setUint32(16, pairs.length, true);
+  view.setUint32(20, bodyOffset, true);
+  view.setUint32(24, body.byteLength, true);
+  view.setUint32(28, errorOffset, true);
+  view.setUint32(32, errorBytes.byteLength, true);
+  for (let idx = 0; idx < pairs.length; idx++) {
+    const [keyOffset, keyLen, valueOffset, valueLen] = pairs[idx];
+    const at = pairsOffset + idx * pairSize;
+    view.setUint32(at, keyOffset, true);
+    view.setUint32(at + 4, keyLen, true);
+    view.setUint32(at + 8, valueOffset, true);
+    view.setUint32(at + 12, valueLen, true);
+  }
+  let writeCursor = pairsOffset + pairs.length * pairSize;
+  for (const bytes of strings) {
+    record.set(bytes, writeCursor);
+    writeCursor += bytes.byteLength;
+  }
+  record.set(body, bodyOffset);
+  record.set(errorBytes, errorOffset);
+  return record;
+}
+
 /**
  * Universal `HostState.fetch` impl that wraps `globalThis.fetch`
- * with the JSON request/response encoding `network::fetch` speaks.
+ * with the native fetch request/response records.
  * Works in browsers, Deno, Bun, Node 18+. When installed with
  * JSPI available, kh_fetch_blocking suspends the calling wasm.
  */
 export async function globalFetch(
   request: Uint8Array,
 ): Promise<Uint8Array> {
-  const reqStr = new TextDecoder().decode(request);
-  let req: {
-    url: string;
-    method?: string;
-    headers?: Record<string, string>;
-    body?: string;
-  };
+  let req: NativeFetchRequest;
   try {
-    req = JSON.parse(reqStr);
+    req = decodeNativeFetchRequest(request);
   } catch (e) {
-    return new TextEncoder().encode(JSON.stringify({
-      ok: false,
-      status: 0,
-      headers: {},
-      body: "",
-      error: `invalid request JSON: ${e}`,
-    }));
+    return encodeNativeFetchResponse(0, [], new Uint8Array(), `${e}`);
   }
   try {
     const resp = await fetch(req.url, {
       method: req.method ?? "GET",
       headers: req.headers,
-      body: req.body,
+      body: req.body.byteLength === 0 ? undefined : req.body,
+      redirect: req.redirectMode === 1 ? "manual" : "follow",
     });
-    const headers: Record<string, string> = {};
-    for (const [k, v] of resp.headers.entries()) headers[k] = v;
+    const headers: Array<[string, string]> = [];
+    for (const [k, v] of resp.headers.entries()) headers.push([k, v]);
     const bodyBytes = new Uint8Array(await resp.arrayBuffer());
-    const body = new TextDecoder("utf-8", { fatal: false }).decode(bodyBytes);
-    return new TextEncoder().encode(JSON.stringify({
-      ok: resp.ok,
-      status: resp.status,
-      headers,
-      body,
-      error: null,
-    }));
+    return encodeNativeFetchResponse(resp.status, headers, bodyBytes, null);
   } catch (e) {
-    return new TextEncoder().encode(JSON.stringify({
-      ok: false,
-      status: 0,
-      headers: {},
-      body: "",
-      error: `${e}`,
-    }));
+    return encodeNativeFetchResponse(0, [], new Uint8Array(), `${e}`);
   }
 }
 

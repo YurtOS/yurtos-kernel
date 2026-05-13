@@ -3311,10 +3311,6 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             if caller.data().host.policy.may_fetch(&request) == PolicyDecision::Deny {
                 return -EACCES;
             }
-            let req_str = match std::str::from_utf8(&request) {
-                Ok(s) => s.to_owned(),
-                Err(_) => return -EINVAL,
-            };
             // Run the async fetch on a fresh OS thread so the
             // implementation is the same whether the caller is
             // inside a tokio runtime (`#[tokio::test]`, embedder
@@ -3325,11 +3321,11 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                     .enable_all()
                     .build()
                     .expect("kh_fetch_blocking: build current-thread tokio runtime");
-                rt.block_on(crate::wasm::network::fetch(&req_str))
+                rt.block_on(crate::wasm::network::fetch(&request))
             })
             .join()
-            .unwrap_or_else(|_| r#"{"ok":false,"error":"fetch worker panicked"}"#.to_owned());
-            let bytes = response.as_bytes();
+            .unwrap_or_else(|_| Vec::new());
+            let bytes = response.as_slice();
             if (bytes.len() as u32) > out_cap {
                 return -7_i64; // -E2BIG
             }

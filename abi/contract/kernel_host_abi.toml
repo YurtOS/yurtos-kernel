@@ -119,7 +119,7 @@ args = [
 # ── Network ──────────────────────────────────────────────────────────────────
 
 [import.kh_fetch_blocking]
-doc = "Synchronous-from-the-kernel HTTP fetch. Request bytes use the same JSON encoding as host_network_fetch. Writes the JSON-encoded fetch result into (out_ptr, out_cap). Returns bytes-written on success, -EACCES when the embedder's PolicyEnforcer denies the request, -E2BIG when the response doesn't fit the output buffer. Implementations on JS hosts use JSPI/asyncify to suspend the kernel; native hosts may run the future on a shared blocking runtime."
+doc = "Synchronous-from-the-kernel HTTP fetch. Request bytes are yurt_fetch_request_v1. Writes yurt_fetch_response_v1 into (out_ptr, out_cap). Returns bytes-written on success, -EACCES when the embedder's PolicyEnforcer denies the request, -E2BIG when the response doesn't fit the output buffer. Implementations on JS hosts use JSPI/asyncify to suspend the kernel; native hosts may run the future on a shared blocking runtime."
 return = "fixed_out"
 args = [
   { name = "req_ptr", type = "ptr" },

@@ -227,7 +227,6 @@ interface SandboxParts {
   storage?: StorageCallbacks;
   bootArgv: string[];
   bootImports?: (api: KernelApi) => Record<string, WebAssembly.ImportValue>;
-  runCommandHandler?: RunCommandHandler;
   wasmHostImports?: (
     memory: WebAssembly.Memory,
     callerPid: number,
@@ -277,7 +276,6 @@ export class Sandbox {
   private bootImports:
     | ((api: KernelApi) => Record<string, WebAssembly.ImportValue>)
     | undefined;
-  private runCommandHandler: RunCommandHandler | undefined;
   private wasmHostImports:
     | ((
       memory: WebAssembly.Memory,
@@ -324,7 +322,6 @@ export class Sandbox {
     this.storage = parts.storage ?? null;
     this.bootArgv = parts.bootArgv;
     this.bootImports = parts.bootImports;
-    this.runCommandHandler = parts.runCommandHandler;
     this.wasmHostImports = parts.wasmHostImports;
     this.wasmOverrideNames = parts.wasmOverrideNames;
     this.envNeedsSync = parts.env.size > 0;
@@ -804,7 +801,6 @@ export class Sandbox {
       storage: options.storage,
       bootArgv,
       bootImports: options.bootImports,
-      runCommandHandler: options.runCommandHandler,
       wasmHostImports: options.wasmHostImports,
       wasmOverrideNames: options.wasmOverrideNames,
     });

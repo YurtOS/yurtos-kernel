@@ -1,4 +1,4 @@
-import { assertEquals } from "jsr:@std/assert@^1.0.19";
+import { assertEquals } from "@std/assert";
 
 const scopedImports = [
   "host_read_fd",
@@ -71,6 +71,34 @@ Deno.test("fetch ABI exposes the native host primitive without JSON helper alias
   for (const file of files) {
     const source = await Deno.readTextFile(file);
     if (source.includes("yurt_fetch_text") || source.includes("headers_json")) {
+      offenders.push(file.pathname);
+    }
+  }
+
+  assertEquals(offenders, []);
+});
+
+Deno.test("kernel and ABI boundary files do not mention JSON transport", async () => {
+  const files = [
+    new URL(
+      "../../../../../abi/contract/yurt_abi_methods.toml",
+      import.meta.url,
+    ),
+    new URL(
+      "../../../../../abi/contract/kernel_host_abi.toml",
+      import.meta.url,
+    ),
+    new URL(
+      "../../../../../packages/kernel-wasm/src/dispatch.rs",
+      import.meta.url,
+    ),
+    new URL("../../process/kernel.ts", import.meta.url),
+    new URL("../kernel-imports.ts", import.meta.url),
+  ];
+  const offenders: string[] = [];
+  for (const file of files) {
+    const source = await Deno.readTextFile(file);
+    if (/\bJSON\b|\bjson\b|\bserde_json\b/.test(source)) {
       offenders.push(file.pathname);
     }
   }

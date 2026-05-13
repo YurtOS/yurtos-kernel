@@ -229,5 +229,4 @@ impl ProcessKernel {
         }
         None
     }
-
 }

@@ -801,15 +801,33 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         "yurt",
         "host_spawn_async",
         |mut c: Caller<'_, StoreData>, req_ptr: u32, req_len: u32| -> i32 {
-            let req_str = read_str(&mut c, req_ptr, req_len);
-            let req: SpawnRequest = match serde_json::from_str(&req_str) {
-                Ok(r) => r,
-                Err(_) => return -3,
+            let req_bytes = read_mem(&mut c, req_ptr, req_len);
+            let native_req = match decode_spawn_request(&req_bytes) {
+                Ok(req) => req,
+                Err(e) => return e.errno(),
+            };
+            if !native_req.fd_map.is_empty() {
+                return -38;
+            }
+            let req = SpawnRequest {
+                prog: native_req.prog,
+                args: native_req.args,
+                env: native_req
+                    .env
+                    .into_iter()
+                    .map(|(key, value)| [key, value])
+                    .collect(),
+                cwd: native_req.cwd.unwrap_or_else(|| "/home/user".to_owned()),
+                stdin_fd: native_req.stdin_fd,
+                stdout_fd: native_req.stdout_fd,
+                stderr_fd: native_req.stderr_fd,
+                stdin_data: native_req.stdin_data.unwrap_or_default(),
+                nice: native_req.nice.clamp(0, 19) as u8,
             };
 
             let spawn_ctx = match c.data().spawn_ctx.clone() {
                 Some(ctx) => ctx,
-                None => return -3,
+                None => return -38,
             };
 
             // Gather stdin: from stdin_data or from a pipe fd.

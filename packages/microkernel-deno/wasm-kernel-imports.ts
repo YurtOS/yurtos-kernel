@@ -787,7 +787,7 @@ function makeWrapper(
       } else if (spec === "ignore_scalar") {
         ai++;
       } else {
-        throw new Error(`unknown arg spec ${JSON.stringify(spec)}`);
+        throw new Error(`unknown arg spec ${String(spec)}`);
       }
     }
     // Concatenate request parts.

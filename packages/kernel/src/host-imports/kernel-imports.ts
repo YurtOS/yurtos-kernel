@@ -972,23 +972,6 @@ export function createKernelImports(
     return 0;
   }
 
-  function bytesToBase64(data: Uint8Array): string {
-    let binary = "";
-    for (let i = 0; i < data.byteLength; i++) {
-      binary += String.fromCharCode(data[i]);
-    }
-    return btoa(binary);
-  }
-
-  function base64ToBytes(value: string): Uint8Array {
-    const binary = atob(value);
-    const out = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) {
-      out[i] = binary.charCodeAt(i);
-    }
-    return out;
-  }
-
   function concatBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
     const out = new Uint8Array(left.byteLength + right.byteLength);
     out.set(left, 0);
@@ -1082,10 +1065,8 @@ export function createKernelImports(
 
     // host_pipe(out_ptr, out_cap) -> i32
     // Creates a pipe and writes yurt_pipe_result_v1 to the output buffer.
-    // Supports two output formats depending on capacity:
-    //   - cap >= 8: binary struct {read_fd: i32, write_fd: i32} (new ABI, returns 8)
-    //   - cap >= 16 AND old-ABI probe: ASCII "READ_FD\nWRITE_FD\n" (legacy busybox, returns byte count)
-    // Legacy busybox passes cap=64 and expects ASCII decimal text.
+    // ABI:
+    //   - cap >= 8: binary struct {read_fd: i32, write_fd: i32}, returns 8
     host_pipe(outPtr: number, outCap: number): number {
       if (!opts.kernel) {
         return ERR_IO;
@@ -1097,18 +1078,6 @@ export function createKernelImports(
         const writeTarget = opts.kernel.getFdTarget(callerPid, writeFd);
         if (readTarget) ioFds.set(readFd, readTarget);
         if (writeTarget) ioFds.set(writeFd, writeTarget);
-      }
-      // Legacy binaries (busybox in standard image) pass outCap=64 and expect
-      // JSON {"read_fd":N,"write_fd":M}. Detect via cap > 8.
-      if (outCap > 8) {
-        const json = `{"read_fd":${readFd},"write_fd":${writeFd}}`;
-        const bytes = new TextEncoder().encode(json);
-        if (outCap < bytes.length) return ERR_IO;
-        if (outPtr < 0 || outPtr + bytes.length > memory.buffer.byteLength) {
-          return ERR_IO;
-        }
-        new Uint8Array(memory.buffer, outPtr, bytes.length).set(bytes);
-        return bytes.length;
       }
       return writePipeResult(memory, outPtr, outCap, readFd, writeFd);
     },
@@ -1329,8 +1298,8 @@ export function createKernelImports(
     // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32
     // Native-only: the request bytes must decode as a yurt_spawn_request_v1
     // record. The 4-argument form writes yurt_spawn_result_v1; the 2-argument
-    // form (host_spawn_async) returns the pid directly. There is no JSON
-    // fallback — a decode failure is a hard error.
+    // form (host_spawn_async) returns the pid directly. Decode failures are
+    // hard errors.
     host_spawn(
       reqPtr: number,
       reqLen: number,
@@ -2558,7 +2527,7 @@ export function createKernelImports(
         return ERR_INVALID;
       }
       const data = readBytes(memory, dataPtr, dataLen);
-      const result = socketBackend.send(target.socket, bytesToBase64(data));
+      const result = socketBackend.send(target.socket, data);
       if (!result.ok) return ERR_IO;
       return result.bytes_sent ?? data.byteLength;
     },
@@ -2586,7 +2555,7 @@ export function createKernelImports(
       );
       const writeRecv = (result: ReturnType<SocketBackend["recv"]>): number => {
         if (!result.ok) return result.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
-        const data = base64ToBytes(result.data_b64 ?? "");
+        const data = result.data ?? new Uint8Array();
         return writeBytes(memory, outPtr, outCap, data);
       };
       if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
@@ -2601,7 +2570,7 @@ export function createKernelImports(
           nonblocking: true,
         });
         if (probe.ok) {
-          const data = base64ToBytes(probe.data_b64 ?? "");
+          const data = probe.data ?? new Uint8Array();
           target.peekBuffer = target.peekBuffer
             ? concatBytes(target.peekBuffer, data)
             : data;
