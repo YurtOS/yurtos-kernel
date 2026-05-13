@@ -1,3 +1,6 @@
+import { SabMutex } from "./sab-primitives.ts";
+import { WASI_EBUSY } from "../../wasi/types.ts";
+
 interface StartMessage {
   type: "start";
   tid: number;
@@ -17,11 +20,32 @@ const workerSelf = self as unknown as {
 workerSelf.onmessage = async (event: MessageEvent<StartMessage>) => {
   if (event.data.type !== "start") return;
   const { tid, fnPtr, arg, module, memory } = event.data;
+  const sharedBuffer = memory.buffer;
+  if (!(sharedBuffer instanceof SharedArrayBuffer)) {
+    workerSelf.postMessage({ type: "done", tid, retval: -1 });
+    return;
+  }
+  const mutex = (ptr: number) => new SabMutex(sharedBuffer, ptr);
 
   const instance = await WebAssembly.instantiate(module, {
     env: { memory },
     yurt: {
       host_thread_self: () => tid,
+      host_mutex_lock: (ptr: number) => {
+        if (mutex(ptr).owner() === tid) return -1;
+        mutex(ptr).lock(tid);
+        return 0;
+      },
+      host_mutex_unlock: (ptr: number) => {
+        try {
+          mutex(ptr).unlock(tid);
+          return 0;
+        } catch {
+          return -1;
+        }
+      },
+      host_mutex_trylock: (ptr: number) =>
+        mutex(ptr).tryLock(tid) ? 0 : WASI_EBUSY,
     },
   });
   const table = instance.exports
