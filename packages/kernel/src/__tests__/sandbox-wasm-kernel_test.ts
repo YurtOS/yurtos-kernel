@@ -1,22 +1,25 @@
 /**
  * Phase 7.2c integration — proves Sandbox.create({kernelImpl:"wasm"})
- * overlays host_* imports with Microkernel-backed wrappers and the
+ * overlays host_* imports with KernelHostInterface-backed wrappers and the
  * boot guest's calls land in the Rust kernel.wasm.
  *
  * Loads a tiny probe wasm (one `host_getuid` import, `_start` calls
  * it once) via Sandbox.spawn(). A spy on the overlay's host_getuid
- * confirms the call routed through the Microkernel, not the TS
+ * confirms the call routed through the KernelHostInterface, not the TS
  * kernel implementation.
  */
 
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
 import { resolve } from "node:path";
-import { defaultHostState, Microkernel } from "@yurt/microkernel-js";
+import {
+  defaultHostState,
+  KernelHostInterface,
+} from "@yurt/kernel-host-interface-js";
 import {
   buildWasmKernelImports,
   HOST_BINDINGS,
-} from "../../../microkernel-deno/wasm-kernel-imports.ts";
+} from "../../../kernel-host-interface-deno/wasm-kernel-imports.ts";
 import { NodeAdapter } from "../platform/node-adapter.ts";
 import type { RunResult } from "../run-result.ts";
 import { Sandbox } from "../sandbox.ts";
@@ -68,7 +71,7 @@ async function createWasmSandbox(
   fixtureName: string,
   mountedFixture: Uint8Array,
 ): Promise<Sandbox> {
-  const mk = await Microkernel.load(kernelBytes, defaultHostState());
+  const mk = await KernelHostInterface.load(kernelBytes, defaultHostState());
   return await Sandbox.create({
     wasmDir: WASM_DIR,
     adapter: new NodeAdapter(),
@@ -123,10 +126,10 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
     ).rejects.toThrow(/wasmHostImports/);
   });
 
-  it("routes a probe wasm's host_getuid through the Microkernel", async () => {
+  it("routes a probe wasm's host_getuid through the KernelHostInterface", async () => {
     if (!HAS_JSPI) return;
     const kernelBytes = await Deno.readFile(KERNEL_WASM_URL);
-    const mk = await Microkernel.load(kernelBytes, defaultHostState());
+    const mk = await KernelHostInterface.load(kernelBytes, defaultHostState());
     const overrideNames = HOST_BINDINGS.map((b) => b.name);
     let getuidCalls = 0;
     const wasmHostImports = (

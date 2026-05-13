@@ -71,16 +71,16 @@ jobs:
           deno-version: v2.x
       - run: deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run $IMAGE_RUNTIME_TESTS
 
-  microkernel-js:
-    # Sandboxed-kernel: the portable JS+wasm microkernel
-    # (packages/microkernel-js/) runs the same kernel.wasm artifact
+  kernel-host-interface-js:
+    # Sandboxed-kernel: the portable JS+wasm kernel-host interface
+    # (packages/kernel-host-interface-js/) runs the same kernel.wasm artifact
     # the wasmtime backend uses, validating that the contract
     # (`kernel_dispatch` + `kh_*` imports) is genuinely runtime-
     # agnostic. The Deno-only extensions (real fs / sockets /
-    # subprocess) live in packages/microkernel-deno/ (currently a
+    # subprocess) live in packages/kernel-host-interface-deno/ (currently a
     # re-export of -js, will fill in as we port the relevant
-    # syscalls). Browsers consume packages/microkernel-js/ directly —
-    # there is no separate microkernel-browser. See
+    # syscalls). Browsers consume packages/kernel-host-interface-js/ directly —
+    # there is no separate browser kernel-host-interface package. See
     # docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md.
     runs-on: ubuntu-latest
     steps:
@@ -108,14 +108,14 @@ jobs:
             -p true-cmd-wasm \
             -p false-cmd-wasm
       - name: Format check
-        run: deno fmt --check packages/microkernel-js/ packages/microkernel-deno/
+        run: deno fmt --check packages/kernel-host-interface-js/ packages/kernel-host-interface-deno/
       - name: Lint
-        run: deno lint packages/microkernel-js/ packages/microkernel-deno/
+        run: deno lint packages/kernel-host-interface-js/ packages/kernel-host-interface-deno/
       - name: Test
         run: |
           deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run \
-            packages/microkernel-js/__tests__/ \
-            packages/microkernel-deno/__tests__/
+            packages/kernel-host-interface-js/__tests__/ \
+            packages/kernel-host-interface-deno/__tests__/
 
   # NOTE: a `hooks-self-check` job that runs `pre-commit run --all-files`
   # belongs in this file but is intentionally omitted from the initial gates

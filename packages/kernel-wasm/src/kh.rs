@@ -1,6 +1,6 @@
 //! Kernel→Host imports (`kh_*`).
 //!
-//! Wasm imports are namespaced under `"kh"`; any microkernel must
+//! Wasm imports are namespaced under `"kh"`; any kernel_host_interface must
 //! provide them. Native builds (used only for unit tests) supply
 //! deterministic stubs so the dispatch layer can be exercised without a
 //! wasmtime host. See `abi/contract/kernel_host_abi.toml` for the
@@ -107,7 +107,7 @@ unsafe fn kh_extension_invoke(
     _out_cap: usize,
 ) -> i64 {
     // Native unit tests don't exercise this path; the wasm trampoline
-    // tests cover it end-to-end through a real microkernel.
+    // tests cover it end-to-end through a real kernel_host_interface.
     -38 // -ENOSYS
 }
 
@@ -313,7 +313,7 @@ pub fn now_realtime_ns() -> Result<u64, i32> {
     }
 }
 
-/// Forward an opaque extension-invoke request to the microkernel
+/// Forward an opaque extension-invoke request to the kernel_host_interface
 /// registry; the host writes the response bytes into `response`.
 /// Returns bytes written (non-negative) or negated POSIX errno.
 pub fn extension_invoke(request: &[u8], response: &mut [u8]) -> i64 {
@@ -349,7 +349,7 @@ pub fn log(severity: LogSeverity, msg: &str) {
     }
 }
 
-/// Open a host-fs path via the microkernel. Returns a non-negative
+/// Open a host-fs path via the kernel_host_interface. Returns a non-negative
 /// host-fd handle or a negated POSIX errno (e.g. -EACCES from the
 /// policy gate, -ENOENT from the host filesystem). flags / mode use
 /// POSIX values; bit 0 = writable, identical to sys_open.
@@ -487,7 +487,7 @@ pub fn idb_list(store: &[u8], prefix: &[u8], out: &mut [u8]) -> i64 {
 }
 
 #[allow(dead_code)] // Staged wasm-engine ABI; consumed when kernel-driven spawn lands.
-/// Ask the microkernel to instantiate a process module already present
+/// Ask the kernel_host_interface to instantiate a process module already present
 /// in the host module cache. `context` is a kernel-authored binary
 /// spawn-context record; the host only interprets module ids and
 /// engine mechanics.
@@ -547,7 +547,7 @@ pub fn fetch_blocking(request: &[u8], response: &mut [u8]) -> i64 {
 }
 
 /// Stat a host path. Returns the file size on success (in bytes),
-/// or a negated POSIX errno. The microkernel writes a kh_stat_v1
+/// or a negated POSIX errno. The kernel_host_interface writes a kh_stat_v1
 /// record into `out`; this helper only surfaces the size field
 /// since that's what HostFsBackend currently needs.
 pub fn real_stat_size(path: &[u8]) -> Result<u64, i32> {

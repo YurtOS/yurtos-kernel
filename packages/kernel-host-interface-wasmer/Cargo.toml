@@ -1,0 +1,13 @@
+[package]
+name = "yurt-kernel-host-interface-wasmer"
+version = "0.1.0"
+edition = "2021"
+description = "Wasmer-backed kernel-host interface — STUB. Validates the WasmEngine trait shape; real impl pulls wasmer."
+
+[lib]
+name = "yurt_kernel_host_interface_wasmer"
+path = "src/lib.rs"
+
+[dependencies]
+yurt-kernel-host-interface-core = { path = "../kernel-host-interface-core" }
+thiserror = "2"

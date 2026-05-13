@@ -115,8 +115,8 @@ export interface SandboxOptions {
    * Which kernel handles syscalls. Default is "ts" (the legacy
    * TS kernel runtime in this package). Set to "wasm" to route
    * the subset of host_* imports listed in
-   * `microkernel-deno/wasm-kernel-imports.ts` through the Rust
-   * kernel.wasm via microkernel-deno's Microkernel. Imports not
+   * `kernel-host-interface-deno/wasm-kernel-imports.ts` through the Rust
+   * kernel.wasm via kernel-host-interface-deno's KernelHostInterface. Imports not
    * in HOST_BINDINGS keep their TS implementation, so the mode
    * is a *hybrid* — porting more host_* shifts the mix toward
    * the Rust kernel without breaking unrelated paths.
@@ -134,14 +134,14 @@ export interface SandboxOptions {
   wasmKernelBytes?: Uint8Array;
   /**
    * Factory invoked per-guest-instance to overlay
-   * Microkernel-backed wrappers for the host_* imports listed in
+   * KernelHostInterface-backed wrappers for the host_* imports listed in
    * `wasmOverrideNames`. Each wrapper returns Promise<number>;
    * the loader wraps them with WebAssembly.Suspending (JSPI) or
    * AsyncifyAsyncBridge (asyncify fallback) before instantiation.
    *
    * Required when `kernelImpl: "wasm"`. Typically constructed via
-   * microkernel-deno's `buildWasmKernelImports` against a
-   * Microkernel loaded from `wasmKernelBytes`.
+   * kernel-host-interface-deno's `buildWasmKernelImports` against a
+   * KernelHostInterface loaded from `wasmKernelBytes`.
    */
   wasmHostImports?: (
     memory: WebAssembly.Memory,
@@ -362,8 +362,8 @@ export class Sandbox {
     if (options.kernelImpl === "wasm" && !options.wasmHostImports) {
       throw new Error(
         "Sandbox.create({kernelImpl:'wasm'}) requires wasmHostImports. " +
-          "Construct via microkernel-deno's buildWasmKernelImports against " +
-          "a Microkernel loaded from wasmKernelBytes.",
+          "Construct via kernel-host-interface-deno's buildWasmKernelImports against " +
+          "a KernelHostInterface loaded from wasmKernelBytes.",
       );
     }
     const adapter = options.adapter ?? await Sandbox.detectAdapter();
@@ -1119,7 +1119,7 @@ export class Sandbox {
     processCredentials?: ProcessCredentials;
     /**
      * When kernelImpl="wasm", a factory that returns the
-     * Microkernel-backed host_* overlay for a given guest memory.
+     * KernelHostInterface-backed host_* overlay for a given guest memory.
      * Wrappers are Promise-returning; the loader wraps them with
      * Suspending/asyncify alongside the existing async list.
      */
@@ -1292,7 +1292,7 @@ export class Sandbox {
           host_spawn_async: kernelImports.host_spawn,
         };
         if (wasmHostImports) {
-          // Overlay Microkernel-backed wrappers. Each wrapper is
+          // Overlay KernelHostInterface-backed wrappers. Each wrapper is
           // Promise<number>; the loader's wrap list wraps them
           // with Suspending/asyncify before instantiation.
           const overlay = wasmHostImports(memory, pid, kernel.getCwd(pid));

@@ -8,7 +8,7 @@
 //!
 //!   0          — reserved for negotiation / health
 //!   1..=0xFFFF — kernel-internal methods (echo, now_realtime; used
-//!                only by the microkernel to validate trampoline
+//!                only by the kernel_host_interface to validate trampoline
 //!                plumbing)
 //!   0x1_0000+  — `host_*` syscalls from `yurt_abi.toml`
 
@@ -19,7 +19,7 @@ use crate::kh;
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
 
 /// Reserved pid for direct calls from outside any user process — i.e.
-/// the microkernel itself driving the kernel for tests, bootstrapping,
+/// the kernel-host interface itself driving the kernel for tests, bootstrapping,
 /// or its own bookkeeping. Real user processes start at pid 1.
 #[allow(dead_code)]
 pub const KERNEL_PID: u32 = 0;
@@ -355,7 +355,7 @@ fn getrlimit(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     })
 }
 
-/// `kernel_provide_stdin(target_pid, payload)`. Microkernel-only;
+/// `kernel_provide_stdin(target_pid, payload)`. KernelHostInterface-only;
 /// appends bytes to the target process's stdin buffer.
 fn provide_stdin(request: &[u8]) -> i64 {
     if request.len() < 4 {
@@ -369,7 +369,7 @@ fn provide_stdin(request: &[u8]) -> i64 {
     payload.len() as i64
 }
 
-/// `kernel_drain_stdout|stderr(target_pid)`. Microkernel-only;
+/// `kernel_drain_stdout|stderr(target_pid)`. KernelHostInterface-only;
 /// drains the target process's stdout (or stderr) buffer into the
 /// response. Returns bytes read.
 fn drain_stream(request: &[u8], response: &mut [u8], stdout: bool) -> i64 {
@@ -392,7 +392,7 @@ fn drain_stream(request: &[u8], response: &mut [u8], stdout: bool) -> i64 {
     })
 }
 
-/// `kernel_close_stdin(target_pid)`. Microkernel-only; marks the
+/// `kernel_close_stdin(target_pid)`. KernelHostInterface-only; marks the
 /// target process's stdin as EOF.
 fn close_stdin(request: &[u8]) -> i64 {
     let Some([pid]) = read_u32_args::<1>(request) else {
@@ -1097,7 +1097,7 @@ fn nanosleep(caller_pid: u32, request: &[u8]) -> i64 {
 }
 
 /// `kernel_register_file(path_len: u32, path_bytes, content_bytes)`.
-/// Microkernel-only; installs (or replaces) a file at `path`. Returns
+/// KernelHostInterface-only; installs (or replaces) a file at `path`. Returns
 /// 0 on success, -EINVAL if the request is malformed.
 fn register_file(request: &[u8]) -> i64 {
     if request.len() < 4 {
@@ -1110,7 +1110,7 @@ fn register_file(request: &[u8]) -> i64 {
     let path = request[4..4 + path_len].to_vec();
     let content = request[4 + path_len..].to_vec();
     with_kernel(|k| {
-        // Microkernel-only: install or replace the file at `path`.
+        // KernelHostInterface-only: install or replace the file at `path`.
         // open() with the create+write bits returns the inode on
         // the root mount; ramfs's open creates a fresh empty file
         // when the path is missing, then a subsequent write puts
@@ -1210,7 +1210,7 @@ pub(crate) fn register_child(request: &[u8]) -> i64 {
     0
 }
 
-/// `kernel_record_exit(pid, exit_status)`. Microkernel-only; marks
+/// `kernel_record_exit(pid, exit_status)`. KernelHostInterface-only; marks
 /// `pid` as zombie with the given exit status. The next sys_wait
 /// from its parent will reap it.
 pub fn record_exit(request: &[u8]) -> i64 {
@@ -1275,7 +1275,7 @@ pub fn wait_response(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
     })
 }
 
-/// `kernel_install_host_fs_mount(prefix)`. Microkernel-only; mounts
+/// `kernel_install_host_fs_mount(prefix)`. KernelHostInterface-only; mounts
 /// a fresh [`HostFsBackend`] at `prefix`. Embedders pick where the
 /// host fs lives. Returns 0 on success, -EINVAL for empty prefix.
 fn install_host_fs_mount(request: &[u8]) -> i64 {
@@ -1290,7 +1290,7 @@ fn install_host_fs_mount(request: &[u8]) -> i64 {
 }
 
 /// `kernel_install_yurtfs(prefix_len, prefix, tar_bytes)`.
-/// Microkernel-only; mounts an [`OverlayBackend`] composing a
+/// KernelHostInterface-only; mounts an [`OverlayBackend`] composing a
 /// [`TarLayerBackend`] (lower / image) and a fresh
 /// [`RamfsBackend`] (upper / overlay) at `prefix`. One call wires
 /// the L1+L2 union the user reads about as YURTFS.
@@ -1345,7 +1345,7 @@ fn maybe_decompress_zstd(bytes: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 /// `kernel_install_tar_layer(prefix_len, prefix_bytes, tar_bytes)`.
-/// Microkernel-only; mounts a [`TarLayerBackend`] at `prefix`. The
+/// KernelHostInterface-only; mounts a [`TarLayerBackend`] at `prefix`. The
 /// archive is indexed at install time so subsequent reads slice into
 /// the in-memory bytes. Read-only mount.
 fn install_tar_layer(request: &[u8]) -> i64 {

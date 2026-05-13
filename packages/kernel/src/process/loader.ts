@@ -84,7 +84,7 @@ export interface LoaderContext {
    * Extra import names whose values are Promise-returning and must
    * be wrapped with WebAssembly.Suspending (or AsyncifyBridge).
    * Populated by Sandbox when kernelImpl="wasm" overlays host_*
-   * imports with Microkernel-backed wrappers.
+   * imports with KernelHostInterface-backed wrappers.
    */
   extraAsyncImports?: string[];
 }

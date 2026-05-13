@@ -1,7 +1,7 @@
 //! End-to-end smoke tests for the sandboxed-kernel architecture.
 //!
 //! Builds `yurt-kernel-wasm` for `wasm32-wasip1`, loads it through the
-//! [`Microkernel`] skeleton, and exercises the trampoline in both
+//! [`KernelHostInterface`] skeleton, and exercises the trampoline in both
 //! directions: user→kernel via `kernel_dispatch`, and kernel→host via
 //! the `kh_*` import surface. See
 //! `docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md`.
@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use wasmtime::{Engine, Module};
 
-use yurt_runtime_wasmtime::microkernel::{
+use yurt_runtime_wasmtime::kernel_host_interface::{
     build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, InMemoryHostFs,
-    InMemoryKv, LogSink, Microkernel, NativeHostFs, NativeTcpSocket, RedbKv,
+    InMemoryKv, KernelHostInterface, LogSink, NativeHostFs, NativeTcpSocket, RedbKv,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -97,8 +97,8 @@ const METHOD_SYS_SCHED_SETPARAM: u32 = 0x1_0042;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
-fn fresh_microkernel(now_ns: u64) -> Microkernel {
-    Microkernel::load(
+fn fresh_kernel_host_interface(now_ns: u64) -> KernelHostInterface {
+    KernelHostInterface::load(
         ensure_kernel_wasm_built(),
         HostState {
             now_realtime_ns: now_ns,
@@ -110,7 +110,7 @@ fn fresh_microkernel(now_ns: u64) -> Microkernel {
 
 #[test]
 fn unknown_method_returns_negated_enosys() {
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let rc = mk.syscall(0xDEAD_BEEF, &[], &mut []).unwrap();
     assert_eq!(rc, -ENOSYS);
 }
@@ -118,7 +118,7 @@ fn unknown_method_returns_negated_enosys() {
 #[test]
 fn kernel_wasm_export_surface_is_locked() {
     // Architectural invariant: kernel.wasm exposes exactly the contract
-    // the microkernel relies on, nothing more.
+    // the kernel_host_interface relies on, nothing more.
     let wasm = std::fs::read(ensure_kernel_wasm_built()).unwrap();
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
@@ -151,7 +151,7 @@ fn kernel_wasm_export_surface_is_locked() {
 
 #[test]
 fn wasmtime_adapter_lists_kernel_owned_process_snapshot() {
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let module = wat::parse_str(
         r#"
         (module
@@ -179,7 +179,7 @@ fn wasmtime_adapter_lists_kernel_owned_process_snapshot() {
 
 #[test]
 fn wasmtime_adapter_lists_kernel_owned_thread_snapshot() {
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let module = wat::parse_str(
         r#"
         (module
@@ -204,7 +204,7 @@ fn wasmtime_adapter_lists_kernel_owned_thread_snapshot() {
 
 #[test]
 fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let module = wat::parse_str(
         r#"
         (module
@@ -248,7 +248,7 @@ fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
 
 #[test]
 fn wasmtime_adapter_reads_kernel_scheduler_decisions() {
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let module = wat::parse_str(
         r#"
         (module
@@ -278,7 +278,7 @@ fn wasmtime_adapter_reads_kernel_scheduler_decisions() {
 
 #[test]
 fn wasmtime_user_process_applies_kernel_schedule_budget() {
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let module = wat::parse_str(
         r#"
         (module
@@ -301,7 +301,7 @@ fn wasmtime_user_process_applies_kernel_schedule_budget() {
 
 #[test]
 fn wasmtime_adapter_reads_binary_kernel_snapshot() {
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let module = wat::parse_str(
         r#"
         (module
@@ -327,7 +327,7 @@ fn wasmtime_adapter_reads_binary_kernel_snapshot() {
 
 #[test]
 fn wasmtime_adapter_waits_through_kernel_export() {
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let module = wat::parse_str(
         r#"
         (module
@@ -354,7 +354,7 @@ fn wasmtime_adapter_waits_through_kernel_export() {
 
 #[test]
 fn wasmtime_adapter_kills_through_kernel_export() {
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let module = wat::parse_str(
         r#"
         (module
@@ -375,7 +375,7 @@ fn wasmtime_adapter_kills_through_kernel_export() {
 
 #[test]
 fn wasmtime_adapter_spawns_cached_process_through_kernel_export() {
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let module = wat::parse_str(
         r#"
         (module
@@ -407,11 +407,11 @@ fn kernel_wasm_imports_match_documented_namespaces() {
     //     wasm32-wasip1 for panic / abort infrastructure (fd_write,
     //     proc_exit, environ_*). The kernel doesn't *use* WASI for
     //     real I/O — that goes through kh_log / kh_real_* — but std
-    //     needs these symbols to resolve, so the microkernel's kernel
+    //     needs these symbols to resolve, so the kernel_host_interface's kernel
     //     linker satisfies them via wasmtime-wasi.
     //
     // When a new `kh_*` import lands without being added to the
-    // microkernel Linker (or vice versa), this test catches it.
+    // kernel_host_interface Linker (or vice versa), this test catches it.
     let wasm = std::fs::read(ensure_kernel_wasm_built()).unwrap();
     let engine = Engine::default();
     let module = Module::new(&engine, &wasm).unwrap();
@@ -484,11 +484,11 @@ fn kernel_wasm_imports_match_documented_namespaces() {
 }
 
 #[test]
-fn microkernel_round_trips_request_and_response_through_kernel_memory() {
+fn kernel_host_interface_round_trips_request_and_response_through_kernel_memory() {
     // Memory-mediated trampoline: ECHO copies request → response in
-    // kernel memory; the microkernel reads it back. Architectural
+    // kernel memory; the kernel_host_interface reads it back. Architectural
     // primitive every variable-size syscall builds on.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let request = b"trampoline-validates-the-architecture";
     let mut response = vec![0xAA_u8; request.len()];
     let rc = mk.syscall(METHOD_ECHO, request, &mut response).unwrap();
@@ -497,12 +497,12 @@ fn microkernel_round_trips_request_and_response_through_kernel_memory() {
 }
 
 #[test]
-fn microkernel_serves_kh_call_during_kernel_dispatch() {
+fn kernel_host_interface_serves_kh_call_during_kernel_dispatch() {
     // Kernel→host direction: NOW_REALTIME calls back into the
-    // microkernel via kh_now_realtime; the host serves the value out
+    // kernel_host_interface via kh_now_realtime; the host serves the value out
     // of HostState; the kernel writes it into the response.
     let now_ns: u64 = 1_715_000_000_000_000_000;
-    let mk = fresh_microkernel(now_ns);
+    let mk = fresh_kernel_host_interface(now_ns);
     let mut response = [0u8; 8];
     let rc = mk.syscall(METHOD_NOW_REALTIME, &[], &mut response).unwrap();
     assert_eq!(rc, 8);
@@ -510,10 +510,10 @@ fn microkernel_serves_kh_call_during_kernel_dispatch() {
 }
 
 #[test]
-fn microkernel_serves_fresh_kh_value_each_dispatch() {
+fn kernel_host_interface_serves_fresh_kh_value_each_dispatch() {
     // The kernel must not cache the kh result. Mutating HostState
     // between dispatches changes the response.
-    let mk = fresh_microkernel(100);
+    let mk = fresh_kernel_host_interface(100);
     let mut response = [0u8; 8];
 
     mk.syscall(METHOD_NOW_REALTIME, &[], &mut response).unwrap();
@@ -541,13 +541,13 @@ impl LogSink for RecordingLogSink {
 #[test]
 fn kernel_log_test_emits_message_through_kh_log() {
     // Validates kh_log end-to-end: kernel.wasm calls kh_log via the
-    // kernel-internal METHOD_KERNEL_LOG_TEST method; the microkernel
+    // kernel-internal METHOD_KERNEL_LOG_TEST method; the kernel_host_interface
     // routes the bytes to the configured LogSink. Future kernel-side
     // diagnostics ride on this exact wire.
     let sink = Arc::new(RecordingLogSink {
         messages: Mutex::new(Vec::new()),
     });
-    let mk = Microkernel::load(
+    let mk = KernelHostInterface::load(
         ensure_kernel_wasm_built(),
         HostState {
             log_sink: sink.clone(),
@@ -584,10 +584,10 @@ impl ExtensionRegistry for EchoExtension {
 }
 
 #[test]
-fn sys_extension_invoke_forwards_bytes_through_microkernel() {
+fn sys_extension_invoke_forwards_bytes_through_kernel_host_interface() {
     // Architectural test for the extension escape hatch:
     //   user → kernel.wasm (METHOD_SYS_EXTENSION_INVOKE) → kh_extension_invoke
-    //                                                     → microkernel registry
+    //                                                     → kernel_host_interface registry
     //                                                     → response back
     // The kernel is a byte courier; wire format (currently JSON) is
     // entirely the registry's concern.
@@ -596,7 +596,7 @@ fn sys_extension_invoke_forwards_bytes_through_microkernel() {
         last_request: Mutex::new(Vec::new()),
         response: br#"{"exit_code":0,"stdout":"hello from extension\n","stderr":""}"#.to_vec(),
     });
-    let mk = Microkernel::load(
+    let mk = KernelHostInterface::load(
         ensure_kernel_wasm_built(),
         HostState {
             extensions: registry.clone(),
@@ -621,13 +621,13 @@ fn sys_extension_invoke_forwards_bytes_through_microkernel() {
     assert_eq!(
         &response[..written_usize],
         registry.response.as_slice(),
-        "microkernel wrote registry response back into kernel memory"
+        "kernel_host_interface wrote registry response back into kernel memory"
     );
 }
 
 #[test]
 fn policy_can_deny_extension_invoke_at_kh_boundary() {
-    use yurt_runtime_wasmtime::microkernel::{PolicyDecision, PolicyEnforcer};
+    use yurt_runtime_wasmtime::kernel_host_interface::{PolicyDecision, PolicyEnforcer};
     // Embedder rejects any extension request whose body contains
     // the literal "evil". The "ask the human" use-case slots in
     // here; this test stubs that with a string match for
@@ -650,7 +650,7 @@ fn policy_can_deny_extension_invoke_at_kh_boundary() {
         last_request: Mutex::new(Vec::new()),
         response: b"{}".to_vec(),
     });
-    let mk = Microkernel::load(
+    let mk = KernelHostInterface::load(
         ensure_kernel_wasm_built(),
         HostState {
             extensions: registry.clone(),
@@ -714,7 +714,7 @@ fn host_fs_backend_reads_real_file_via_kh_real_open() {
         host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
 
@@ -739,10 +739,10 @@ fn host_fs_backend_reads_real_file_via_kh_real_open() {
 #[test]
 fn host_fs_in_memory_impl_round_trips_without_real_disk() {
     // Same kernel.wasm, different host_fs impl. The InMemoryHostFs
-    // is the shape browser microkernels use while OPFS isn't yet
+    // is the shape browser kernel-host interfaces use while OPFS isn't yet
     // wired (it satisfies HostFsImpl without touching real disk):
     // sandbox tests can exercise the full kh_real_* surface here
-    // and the browser microkernel can later swap in OPFS without
+    // and the browser kernel_host_interface can later swap in OPFS without
     // changing kernel.wasm.
     build_kernel_wasm().unwrap();
     let memfs = Arc::new(InMemoryHostFs::new());
@@ -752,7 +752,7 @@ fn host_fs_in_memory_impl_round_trips_without_real_disk() {
         host_fs: Some(memfs.clone()),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/host").unwrap();
 
     // Read the pre-installed file via the user-facing sys_open +
@@ -812,7 +812,7 @@ fn host_fs_traversal_outside_root_is_eacces() {
         host_fs: Some(Arc::new(NativeHostFs::new(parent.join("inner")))),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/host").unwrap();
 
     // Read attempt: /host/../outside/secret.txt — should miss.
@@ -866,7 +866,7 @@ fn host_fs_writable_ops_create_then_rename_then_unlink() {
         host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/host").unwrap();
 
     // mkdir /host/sub
@@ -919,7 +919,7 @@ fn host_fs_fstat_reports_real_file_size() {
         host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
 
@@ -957,7 +957,7 @@ fn host_fs_writes_create_a_real_file() {
         host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
 
@@ -1009,7 +1009,7 @@ fn host_fs_mount_prefix_is_arbitrary() {
         host_fs: Some(Arc::new(NativeHostFs::new(dir.clone()))),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
     mk.mount_host_fs(b"/users/user").unwrap();
 
     // /host is no longer auto-mounted — open returns -ENOENT.
@@ -1040,7 +1040,7 @@ fn yurtfs_mount_overlays_image_with_writable_upper() {
     // The user's canonical example: /bin/python is in the image
     // (lower); a process with permissions overwrites it (upper).
     // Verifies the full L1+L2 + copy-up flow through the
-    // microkernel's `mount_yurtfs` API.
+    // kernel_host_interface's `mount_yurtfs` API.
     use std::process::Command;
     build_kernel_wasm().unwrap();
 
@@ -1062,7 +1062,7 @@ fn yurtfs_mount_overlays_image_with_writable_upper() {
         buf
     };
 
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     mk.mount_yurtfs(b"/img", &tar_bytes).unwrap();
 
     // Read /img/bin/python — content comes from the lower (tar).
@@ -1124,7 +1124,7 @@ fn host_fs_returns_enoent_without_a_root_configured() {
     // Default HostState has host_fs_root = None → kh_real_open
     // returns -EACCES → HostFsBackend.lookup returns None → sys_open
     // sees -ENOENT.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let mut req = 0_u32.to_le_bytes().to_vec();
     req.extend_from_slice(b"/host/anywhere");
     let rc = mk.syscall(METHOD_SYS_OPEN, &req, &mut []).unwrap();
@@ -1133,7 +1133,7 @@ fn host_fs_returns_enoent_without_a_root_configured() {
 
 #[test]
 fn host_fs_policy_can_deny_specific_paths() {
-    use yurt_runtime_wasmtime::microkernel::{PolicyDecision, PolicyEnforcer};
+    use yurt_runtime_wasmtime::kernel_host_interface::{PolicyDecision, PolicyEnforcer};
     // Policy that says yes to "greeting.txt" and no to "secret.txt".
     struct Allowlist;
     impl PolicyEnforcer for Allowlist {
@@ -1166,7 +1166,7 @@ fn host_fs_policy_can_deny_specific_paths() {
         policy: Arc::new(Allowlist),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
     mk.mount_host_fs(b"/host").unwrap();
 
@@ -1188,13 +1188,13 @@ fn host_fs_policy_can_deny_specific_paths() {
 
 #[test]
 fn deny_all_policy_blocks_realtime_clock() {
-    use yurt_runtime_wasmtime::microkernel::DenyAllPolicy;
+    use yurt_runtime_wasmtime::kernel_host_interface::DenyAllPolicy;
     // When a policy denies kh_now_realtime, kernel.wasm sees
     // -EACCES from kh_now_realtime, which sys_clock_gettime
     // forwards back to the caller. (Constant for ergonomic
     // matching: -13 = -EACCES.)
     build_kernel_wasm().unwrap();
-    let mk = Microkernel::load(
+    let mk = KernelHostInterface::load(
         ensure_kernel_wasm_built(),
         HostState {
             policy: Arc::new(DenyAllPolicy),
@@ -1221,7 +1221,7 @@ fn sys_spawn_stages_child_and_drain_pending_returns_it() {
     // exit and the parent's sys_wait reaps. Doesn't actually
     // instantiate the wasm — that's the next slice; this validates
     // the full kernel-stage / host-drain / record-exit / wait loop.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let body = b"\0asm\x01\x00\x00\x00fake".to_vec();
     let path: &[u8] = b"/bin/echo";
     mk.register_ramfs_file(path, &body).unwrap();
@@ -1280,7 +1280,7 @@ fn run_pending_spawns_runs_real_wasm_child_and_parent_reaps() {
     // in ramfs, parent calls sys_spawn, run_pending_spawns
     // instantiates + runs + record_exits, parent's sys_wait reaps
     // the actual exit code from the child's proc_exit.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let target_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
@@ -1323,14 +1323,14 @@ fn run_pending_spawns_runs_real_wasm_child_and_parent_reaps() {
 }
 
 #[test]
-fn redb_kv_persists_across_microkernel_restarts() {
+fn redb_kv_persists_across_kernel_host_interface_restarts() {
     // RedbKv is one concrete impl behind the pluggable KvBackend
     // trait. Embedders may swap in sled / rocksdb / SQLite / S3
     // by writing their own KvBackend impl — this test just
     // exercises the in-tree redb-backed one.
     //
-    // Phase 1: write entries through one Microkernel instance.
-    // Phase 2: drop it, build a fresh Microkernel pointing at the
+    // Phase 1: write entries through one KernelHostInterface instance.
+    // Phase 2: drop it, build a fresh KernelHostInterface pointing at the
     // same redb file, and confirm the entries are still readable.
     use std::fs;
     let dir = std::env::temp_dir().join(format!("yurt-redb-test-{}", std::process::id()));
@@ -1345,7 +1345,7 @@ fn redb_kv_persists_across_microkernel_restarts() {
             kv: Some(kv),
             ..Default::default()
         };
-        let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+        let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
         let mut put_req = vec![5_u8];
         put_req.extend_from_slice(b"users");
@@ -1364,7 +1364,7 @@ fn redb_kv_persists_across_microkernel_restarts() {
             kv: Some(kv),
             ..Default::default()
         };
-        let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+        let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
         let mut get_req = vec![5_u8];
         get_req.extend_from_slice(b"users");
@@ -1382,13 +1382,13 @@ fn redb_kv_persists_across_microkernel_restarts() {
 fn sys_idb_put_get_delete_list_round_trips() {
     // Full kv loop through the trampoline. InMemoryKv satisfies
     // KvBackend without disk I/O — same shape browser
-    // microkernels will use against IndexedDB.
+    // kernel-host interfaces will use against IndexedDB.
     build_kernel_wasm().unwrap();
     let host = HostState {
         kv: Some(Arc::new(InMemoryKv::new())),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
     let store: &[u8] = b"sessions";
     // put: u8 store_len + store + u32 key_len LE + key + value
@@ -1454,9 +1454,9 @@ fn sys_idb_put_get_delete_list_round_trips() {
 
 #[test]
 fn sys_idb_denied_by_policy_returns_eacces() {
-    use yurt_runtime_wasmtime::microkernel::DenyAllPolicy;
+    use yurt_runtime_wasmtime::kernel_host_interface::DenyAllPolicy;
     build_kernel_wasm().unwrap();
-    let mk = Microkernel::load(
+    let mk = KernelHostInterface::load(
         ensure_kernel_wasm_built(),
         HostState {
             policy: Arc::new(DenyAllPolicy),
@@ -1486,7 +1486,7 @@ fn sys_socket_listen_accept_round_trips_through_kernel() {
         tcp: Some(Arc::new(NativeTcpSocket::new())),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
     // sys_socket_listen request: u32 backlog + addr.
     let mut req = 16_u32.to_le_bytes().to_vec();
@@ -1552,9 +1552,9 @@ fn sys_socket_listen_accept_round_trips_through_kernel() {
 
 #[test]
 fn sys_socket_listen_denied_by_policy_returns_eacces() {
-    use yurt_runtime_wasmtime::microkernel::DenyAllPolicy;
+    use yurt_runtime_wasmtime::kernel_host_interface::DenyAllPolicy;
     build_kernel_wasm().unwrap();
-    let mk = Microkernel::load(
+    let mk = KernelHostInterface::load(
         ensure_kernel_wasm_built(),
         HostState {
             policy: Arc::new(DenyAllPolicy),
@@ -1593,7 +1593,7 @@ fn sys_socket_connect_send_recv_through_local_echo_server() {
         tcp: Some(Arc::new(NativeTcpSocket::new())),
         ..Default::default()
     };
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), host).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
     // sys_socket_connect request: u8 family + u8 sock_type + u16
     // pad + u32 flags + addr ("host:port" UTF-8).
@@ -1637,9 +1637,9 @@ fn sys_socket_connect_send_recv_through_local_echo_server() {
 
 #[test]
 fn sys_socket_connect_denied_by_policy_returns_eacces() {
-    use yurt_runtime_wasmtime::microkernel::DenyAllPolicy;
+    use yurt_runtime_wasmtime::kernel_host_interface::DenyAllPolicy;
     build_kernel_wasm().unwrap();
-    let mk = Microkernel::load(
+    let mk = KernelHostInterface::load(
         ensure_kernel_wasm_built(),
         HostState {
             policy: Arc::new(DenyAllPolicy),
@@ -1672,7 +1672,7 @@ async fn sys_fetch_round_trips_through_kh_fetch_blocking() {
     // OnceLock and `block_on`s the future; calling that from inside
     // a multi-thread tokio context is fine because we're not inside
     // the runtime itself when the kernel syscall fires.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let req = serde_json::json!({
         "url": format!("{}/hello", server.uri()),
         "method": "GET",
@@ -1690,9 +1690,9 @@ async fn sys_fetch_round_trips_through_kh_fetch_blocking() {
 
 #[test]
 fn sys_fetch_denied_by_policy_returns_eacces() {
-    use yurt_runtime_wasmtime::microkernel::DenyAllPolicy;
+    use yurt_runtime_wasmtime::kernel_host_interface::DenyAllPolicy;
     build_kernel_wasm().unwrap();
-    let mk = Microkernel::load(
+    let mk = KernelHostInterface::load(
         ensure_kernel_wasm_built(),
         HostState {
             policy: Arc::new(DenyAllPolicy),
@@ -1710,7 +1710,7 @@ fn sys_fetch_denied_by_policy_returns_eacces() {
 fn sys_extension_invoke_returns_negated_enoent_when_no_registry() {
     // Default registry is empty; -ENOENT propagates back through the
     // trampoline as a negative scalar.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let mut response = [0u8; 64];
     let rc = mk
         .syscall(METHOD_SYS_EXTENSION_INVOKE, b"{}", &mut response)
@@ -1723,14 +1723,14 @@ fn user_process_calls_kernel_through_full_trampoline() {
     // The whole architecture, end to end, in one test:
     //
     //   user.wasm calls sys_getuid
-    //     → microkernel forwards to kernel.wasm via kernel_dispatch
+    //     → kernel_host_interface forwards to kernel.wasm via kernel_dispatch
     //         → kernel handles METHOD_SYS_GETUID, returns 1000
-    //     ← microkernel writes scalar back into user.wasm
+    //     ← kernel_host_interface writes scalar back into user.wasm
     //   user.wasm receives 1000 and returns it from `run`
     //
     // No previous test actually instantiated a user-process wasm.
     // This is the missing architectural piece.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
 
     let user_wat = r#"
         (module
@@ -1746,20 +1746,20 @@ fn user_process_calls_kernel_through_full_trampoline() {
 }
 
 #[test]
-fn microkernel_direct_syscall_uses_kernel_pid_zero() {
-    // Microkernel-owned syscalls (no user process in flight) see the
+fn kernel_host_interface_direct_syscall_uses_kernel_pid_zero() {
+    // KernelHostInterface-owned syscalls (no user process in flight) see the
     // kernel as their caller — pid 0. sys_getpid via dispatch
     // therefore returns 0.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let rc = mk.syscall(METHOD_SYS_GETPID, &[], &mut []).unwrap();
-    assert_eq!(rc, 0, "microkernel direct call sees KERNEL_PID");
+    assert_eq!(rc, 0, "kernel_host_interface direct call sees KERNEL_PID");
 }
 
 #[test]
 fn user_process_sees_its_assigned_pid() {
     // First spawned process is pid 1; getpid returns it through the
     // full trampoline. Validates caller_pid plumbing end-to-end.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_getpid" (func $getpid (result i32)))
@@ -1775,7 +1775,7 @@ fn user_process_sees_its_assigned_pid() {
 
 #[test]
 fn each_spawned_process_gets_a_unique_pid() {
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_getpid" (func $getpid (result i32)))
@@ -1799,7 +1799,7 @@ fn each_spawned_process_gets_a_unique_pid() {
 fn getppid_returns_kernel_pid_for_first_user_process() {
     // No process tree yet — until host_spawn lands, every process is
     // a direct child of the kernel.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_getppid" (func $getppid (result i32)))
@@ -1818,7 +1818,7 @@ fn user_process_umask_persists_across_calls_for_same_pid() {
     // twice — first sets a new mask and reads back the default, second
     // call reads back what the first set. State lives in
     // kernel.wasm's static Mutex<Kernel>, keyed by caller_pid.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     // 0o077 = 63, 0o007 = 7 (WAT i32.const doesn't accept octal).
     let user_wat = r#"
         (module
@@ -1841,7 +1841,7 @@ fn user_process_setresuid_changes_subsequent_getuid() {
     // Multi-arg syscall (3 u32s) marshalled into kernel scratch as
     // 12 bytes. Validates the multi-arg encoding plus per-pid
     // credential mutation visible across syscalls.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_setresuid" (func $setresuid (param i32 i32 i32) (result i32)))
@@ -1864,7 +1864,7 @@ fn user_process_chdir_then_getcwd_round_trip() {
     // Variable-size request (path bytes from user memory) + variable-
     // size response (cwd bytes back into user memory). Exercises
     // forward_user_ptr_len and forward_response_to_user.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     // The WAT module hard-codes a path string at offset 16 in its
     // memory and a getcwd output buffer at offset 64. `chdir` reads
     // path bytes, `getcwd` writes the cwd to the buffer; the test
@@ -1905,7 +1905,7 @@ fn user_process_getrlimit_then_setrlimit_round_trip() {
     // Validates a per-pid table-state syscall that takes a u32 arg and
     // writes a 16-byte struct back into user memory, plus a 3-arg
     // setrlimit (u32 + 2*u64) round-trip.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_getrlimit"
@@ -1950,7 +1950,7 @@ fn user_process_pipe_round_trip_within_one_process() {
     // The full single-process pipe lifecycle through the trampoline:
     // pipe() returns two fds, write() to the writer end, read() from
     // the reader end, close both, second read returns -EBADF.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_pipe"  (func $pipe  (param i32) (result i32)))
@@ -2003,7 +2003,7 @@ fn user_process_pipe_round_trip_within_one_process() {
 fn user_process_pipe_dup_keeps_writer_alive() {
     // dup() on a pipe end must increment the kernel-side refcount;
     // closing the original fd should not collapse the buffer.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_pipe"  (func $pipe  (param i32) (result i32)))
@@ -2039,7 +2039,7 @@ fn user_process_fd_table_dup_close_lifecycle() {
     // free slot, dup2() can install at an arbitrary fd, and close()
     // frees the slot for re-allocation. Closing an already-closed fd
     // surfaces -EBADF (= -9).
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_dup"   (func $dup   (param i32) (result i32)))
@@ -2074,7 +2074,7 @@ fn user_process_fd_table_dup_close_lifecycle() {
 fn user_process_fd_table_is_per_process() {
     // Closing fd 0 in one process must not affect another process's
     // fd table.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_close" (func $close (param i32) (result i32)))
@@ -2093,7 +2093,7 @@ fn user_process_fd_table_is_per_process() {
 
 #[test]
 fn user_process_setresgid_changes_subsequent_getgid() {
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_setresgid" (func $setresgid (param i32 i32 i32) (result i32)))
@@ -2113,7 +2113,7 @@ fn user_process_setresgid_changes_subsequent_getgid() {
 
 #[test]
 fn user_process_scheduler_imports_route_through_kernel_state() {
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_sched_getscheduler" (func $getscheduler (param i32) (result i32)))
@@ -2149,7 +2149,7 @@ fn user_process_scheduler_imports_route_through_kernel_state() {
 fn user_process_can_call_kernel_multiple_times() {
     // The Rc<RefCell<KernelInstance>> sharing pattern must support
     // repeated borrow_mut acquisitions without deadlock or panic.
-    let mk = Microkernel::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_getuid" (func $sys_getuid (result i32)))
@@ -2163,7 +2163,7 @@ fn user_process_can_call_kernel_multiple_times() {
 }
 
 #[test]
-fn microkernel_method_ids_match_yurt_abi_methods_toml() {
+fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
     // Contract test: every method ID this test file hardcodes must
     // match the authoritative pinning in
     // `abi/contract/yurt_abi_methods.toml`. Catches drift in either
@@ -2371,7 +2371,7 @@ fn process_group_and_session_round_trip_through_trampoline() {
     //   (3) getsid(target=42) lazily primes sid to the target pid.
     // KERNEL_PID is the caller for direct .syscall() calls, so we use
     // an explicit non-zero target pid throughout.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
 
     // Default getpgid(42) → 42.
     let rc = mk
@@ -2404,7 +2404,7 @@ fn signal_storage_round_trips_through_trampoline() {
     // Phase 2 stubs: sys_kill records pending bits, sys_sigaction
     // returns the previous disposition. Actual delivery requires
     // asyncify/JSPI unwind and lands with the AsyncBridge integration.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
 
     // sigaction(SIGTERM=15, SIG_IGN=1) → previous SIG_DFL=0.
     let mut req = Vec::new();
@@ -2441,7 +2441,7 @@ fn sched_yield_and_nanosleep_round_trip_through_trampoline() {
     // Phase 2 acknowledge-and-return stubs. We can't observe per-pid
     // counters from outside the kernel.wasm sandbox, so this test
     // just asserts the trampoline paths work end-to-end and return 0.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     let rc = mk.syscall(METHOD_SYS_SCHED_YIELD, &[], &mut []).unwrap();
     assert_eq!(rc, 0);
     let req = 1_500_000_u64.to_le_bytes(); // 1.5ms
@@ -2456,9 +2456,9 @@ fn sched_yield_and_nanosleep_round_trip_through_trampoline() {
 
 #[test]
 fn ramfs_open_then_read_round_trips_content_through_trampoline() {
-    // End-to-end: microkernel → kernel_register_file → kernel.wasm
-    // ramfs → microkernel.syscall(SYS_OPEN, …) → fd → SYS_READ.
-    let mk = fresh_microkernel(0);
+    // End-to-end: kernel_host_interface → kernel_register_file → kernel.wasm
+    // ramfs → kernel_host_interface.syscall(SYS_OPEN, …) → fd → SYS_READ.
+    let mk = fresh_kernel_host_interface(0);
     mk.register_ramfs_file(b"/etc/motd", b"hello ramfs\n")
         .unwrap();
 
@@ -2494,7 +2494,7 @@ fn credentials_syscalls_round_trip_through_trampoline() {
     // First user-facing syscall family. Pure scalar return; no memory
     // copies. With no process kernel yet, all four resolve to the TS
     // kernel's USER_UID/USER_GID = 1000 fallback.
-    let mk = fresh_microkernel(0);
+    let mk = fresh_kernel_host_interface(0);
     for (name, method) in [
         ("getuid", METHOD_SYS_GETUID),
         ("geteuid", METHOD_SYS_GETEUID),

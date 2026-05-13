@@ -11,8 +11,8 @@ import {
   defaultHostState,
   denoFetch,
   DenoTcpSocket,
+  KernelHostInterface,
   METHOD,
-  Microkernel,
 } from "../mod.ts";
 
 const KERNEL_WASM = new URL(
@@ -111,7 +111,10 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
     try {
       const host = defaultHostState();
       host.fetch = denoFetch;
-      const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+      const mk = await KernelHostInterface.load(
+        await Deno.readFile(KERNEL_WASM),
+        host,
+      );
 
       const out = await mk.syscallAsync(
         METHOD.SYS_FETCH,
@@ -153,7 +156,10 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
       const tcp = new DenoTcpSocket();
       const host = defaultHostState();
       host.tcp = tcp;
-      const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+      const mk = await KernelHostInterface.load(
+        await Deno.readFile(KERNEL_WASM),
+        host,
+      );
 
       // sys_socket_connect.
       const addr = `127.0.0.1:${port}`;
@@ -203,7 +209,10 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
     const tcp = new DenoTcpSocket();
     const host = defaultHostState();
     host.tcp = tcp;
-    const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+    const mk = await KernelHostInterface.load(
+      await Deno.readFile(KERNEL_WASM),
+      host,
+    );
 
     const addr = "127.0.0.1:0";
     const req = new Uint8Array(4 + addr.length);

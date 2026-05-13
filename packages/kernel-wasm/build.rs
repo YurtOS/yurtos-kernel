@@ -59,7 +59,7 @@ fn main() {
             id
         ));
     }
-    // KNOWN_METHODS is consumed by tests and by future microkernel-side
+    // KNOWN_METHODS is consumed by tests and by future host-interface-side
     // introspection helpers; allow dead_code for the wasm release build
     // where neither is compiled in.
     out.push_str("\n#[allow(dead_code)]\npub const KNOWN_METHODS: &[(&str, u32)] = &[\n");

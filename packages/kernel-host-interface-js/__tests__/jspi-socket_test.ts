@@ -9,8 +9,8 @@ import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
 import {
   defaultHostState,
+  KernelHostInterface,
   METHOD,
-  Microkernel,
   type TcpSocketImpl,
 } from "../mod.ts";
 
@@ -90,7 +90,10 @@ describe("JSPI / kh_socket_*", () => {
     const tcp = new FakeAsyncTcp();
     const host = defaultHostState();
     host.tcp = tcp;
-    const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+    const mk = await KernelHostInterface.load(
+      await Deno.readFile(KERNEL_WASM),
+      host,
+    );
 
     // sys_socket_connect request: u8 family + u8 sock_type + u16 pad +
     // u32 flags + addr "host:port".
@@ -109,7 +112,10 @@ describe("JSPI / kh_socket_*", () => {
     tcp.enqueue(7, new TextEncoder().encode("hello-async"));
     const host = defaultHostState();
     host.tcp = tcp;
-    const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+    const mk = await KernelHostInterface.load(
+      await Deno.readFile(KERNEL_WASM),
+      host,
+    );
 
     // sys_socket_recv request: u32 fd + u32 flags. Use handle=7
     // (matches our enqueue above).

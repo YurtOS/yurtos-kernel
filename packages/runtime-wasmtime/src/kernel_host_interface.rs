@@ -1,4 +1,4 @@
-//! Sandboxed-kernel microkernel skeleton.
+//! Sandboxed-kernel kernel-host interface skeleton.
 //!
 //! Loads `yurt-kernel-wasm` (compiled to `wasm32-wasip1`) into a
 //! wasmtime engine, satisfies the documented `kh_*` import surface,
@@ -7,10 +7,10 @@
 //! are wired back through the kernel.
 //!
 //! Sibling backends sharing this contract:
-//! - `packages/microkernel-wasmtime` (this code; native perf path).
-//! - `packages/microkernel-js` (portable JS+wasm; runs in Deno,
+//! - `packages/kernel-host-interface-wasmtime` (this code; native perf path).
+//! - `packages/kernel-host-interface-js` (portable JS+wasm; runs in Deno,
 //!   browsers, Node, Bun unchanged).
-//! - `packages/microkernel-deno` (Deno-only extensions: real fs,
+//! - `packages/kernel-host-interface-deno` (Deno-only extensions: real fs,
 //!   real sockets, subprocess).
 //!
 //! Any wasm runtime that hosts the same `kh_*` imports and calls
@@ -53,7 +53,7 @@ pub(crate) const EFAULT_PUB: i64 = EFAULT;
 /// Method ids that the user-process linker forwards. Generated
 /// constants live inside `yurt-kernel-wasm`'s build artifact, not in
 /// the host crate, so we mirror the ones we forward here. Drift is
-/// caught by the `microkernel_method_ids_match_yurt_abi_methods_toml`
+/// caught by the `kernel_host_interface_method_ids_match_yurt_abi_methods_toml`
 /// trampoline test.
 mod sys_method_id {
     pub const GETUID: u32 = 0x1_0001;
@@ -109,11 +109,11 @@ mod sys_method_id {
 }
 
 /// Reserved pid for direct calls from outside any user process — the
-/// microkernel itself driving the kernel for tests, bootstrapping, or
+/// kernel-host interface itself driving the kernel for tests, bootstrapping, or
 /// internal bookkeeping. Real user processes start at `1`.
 pub const KERNEL_PID: u32 = 0;
 
-/// Kernel-internal method ids the microkernel calls during process
+/// Kernel-internal method ids the kernel-host interface calls during process
 /// setup (mirrors `abi/contract/yurt_abi_methods.toml`).
 const METHOD_KERNEL_PROVIDE_STDIN: u32 = 4;
 const METHOD_KERNEL_CLOSE_STDIN: u32 = 5;
@@ -125,7 +125,7 @@ const METHOD_KERNEL_INSTALL_YURTFS: u32 = 12;
 
 // ── Host-side traits embedders implement ─────────────────────────────────────
 
-/// Microkernel-side handler for `sys_extension_invoke`. Receives the
+/// Host-interface-side handler for `sys_extension_invoke`. Receives the
 /// opaque request bytes the calling process supplied; writes the
 /// response bytes into `response`. Returns bytes written or negated
 /// POSIX errno (e.g. `-ENOENT` if no handler matches).
@@ -143,7 +143,7 @@ impl ExtensionRegistry for EmptyExtensionRegistry {
     }
 }
 
-/// Microkernel-side sink for `kh_log` messages from kernel.wasm.
+/// Host-interface-side sink for `kh_log` messages from kernel.wasm.
 /// Severity values mirror `LogSeverity` in the kernel: 0 = debug,
 /// 1 = info, 2 = warn, 3 = error.
 pub trait LogSink: Send + Sync {
@@ -161,7 +161,7 @@ pub enum PolicyDecision {
 }
 
 /// Embedder-supplied gate that sits at every `kh_*` crossing where
-/// kernel.wasm is about to reach the outside world. The microkernel
+/// kernel.wasm is about to reach the outside world. The kernel-host interface
 /// consults the policy before invoking real I/O; a Deny decision
 /// turns into a kernel-side `-EACCES`.
 ///
@@ -303,7 +303,7 @@ pub struct HostState {
     pub log_sink: Arc<dyn LogSink>,
     /// Policy gate consulted at every `kh_*` boundary that touches
     /// the outside world. Defaults to AllowAllPolicy; embedders
-    /// override via `Microkernel::with_host_state_mut` or by
+    /// override via `KernelHostInterface::with_host_state_mut` or by
     /// constructing a custom HostState.
     pub policy: Arc<dyn PolicyEnforcer>,
     /// The host filesystem the `kh_real_*` imports route to. *All*
@@ -317,7 +317,7 @@ pub struct HostState {
     /// - [`NativeHostFs::new(root)`] — local disk under `root`
     ///   with canonicalize-and-contain protection.
     /// - [`InMemoryHostFs::new()`] — in-process map, useful for
-    ///   tests and for browser microkernels that haven't wired up
+    ///   tests and for browser kernel-host interfaces that haven't wired up
     ///   OPFS yet.
     /// - Embedder-provided impls for S3, OPFS, IndexedDB, etc.
     pub host_fs: Option<Arc<dyn HostFsImpl>>,
@@ -329,11 +329,11 @@ pub struct HostState {
     /// In-tree implementations:
     /// - [`NativeTcpSocket::new`] — std::net::TcpStream, blocking,
     ///   subject to the embedder's `may_connect` policy gate.
-    /// - Browser microkernels plug in a WebSocket-backed impl
+    /// - Browser kernel-host interfaces plug in a WebSocket-backed impl
     ///   here (browsers can't open raw TCP).
     pub tcp: Option<Arc<dyn TcpSocketImpl>>,
     /// Durable key-value backend for the `kh_idb_*` imports.
-    /// `None` denies every access. Browser microkernels back
+    /// `None` denies every access. Browser kernel-host interfaces back
     /// this with IndexedDB; native deployments use a disk-backed
     /// store or [`InMemoryKv`] for tests.
     pub kv: Option<Arc<dyn KvBackend>>,
@@ -444,7 +444,7 @@ fn decode_spawn_context(context: &[u8]) -> std::result::Result<(u32, Vec<Vec<u8>
     Ok((pid, argv))
 }
 
-/// Pluggable durable key-value store. Browser microkernels back
+/// Pluggable durable key-value store. Browser kernel-host interfaces back
 /// this with IndexedDB (one IDB store per `store` name); native
 /// deployments use an on-disk store or [`InMemoryKv`].
 pub trait KvBackend: Send + Sync {
@@ -570,7 +570,7 @@ impl KvBackend for RedbKv {
 
 /// In-process [`KvBackend`] implementation. Map of
 /// (store, key) → bytes. Useful for tests and as the placeholder
-/// browser microkernels point at while IndexedDB wiring is in
+/// browser kernel-host interfaces point at while IndexedDB wiring is in
 /// flight.
 pub struct InMemoryKv {
     inner: std::sync::Mutex<KvMap>,
@@ -631,7 +631,7 @@ impl KvBackend for InMemoryKv {
 
 /// Pluggable outbound TCP backend. The embedder picks an
 /// implementation; kernel.wasm's `kh_socket_*` imports route here.
-/// Browser microkernels plug in a WebSocket-backed impl since
+/// Browser kernel-host interfaces plug in a WebSocket-backed impl since
 /// browsers can't open raw TCP; native deployments use
 /// [`NativeTcpSocket`]. Containment is the embedder's job — the
 /// `may_connect` policy gate fires before this trait sees any
@@ -651,7 +651,7 @@ pub trait TcpSocketImpl: Send + Sync {
     /// Bind to `host:port` (port=0 lets the host pick) and start
     /// accepting. Returns a listener handle or negated errno.
     /// Default: -ENOSYS — embedders that want listen wire it up
-    /// in their TcpSocketImpl. (Browser microkernels typically
+    /// in their TcpSocketImpl. (Browser kernel-host interfaces typically
     /// implement this via Service Worker / WebSocket relay; see
     /// the project_listen_port_mapping memory note.)
     fn listen(&self, _host: &str, _port: u16, _backlog: u32) -> i32 {
@@ -674,7 +674,7 @@ pub trait TcpSocketImpl: Send + Sync {
 /// std::net::TcpStream-backed [`TcpSocketImpl`]. Blocking I/O;
 /// each `connect` issues a fresh DNS resolve + TCP handshake with
 /// a configurable timeout. Suitable for native CLI / server
-/// embedders. Browser microkernels need their own impl.
+/// embedders. Browser kernel-host interfaces need their own impl.
 pub struct NativeTcpSocket {
     connect_timeout: std::time::Duration,
     inner: std::sync::Mutex<NativeTcpState>,
@@ -851,7 +851,7 @@ fn tcp_io_errno(e: std::io::Error) -> i32 {
 
 /// Pluggable host-fs backend. *Every* host-fs access goes through
 /// this trait — local disk, OPFS, S3, in-memory, all the same
-/// surface. The microkernel calls these methods from inside each
+/// surface. The kernel-host interface calls these methods from inside each
 /// `kh_real_*` import after the policy gate has Allowed the call;
 /// implementations are responsible for their own rooting/
 /// containment (e.g. [`NativeHostFs`] canonicalizes against its
@@ -1087,7 +1087,7 @@ impl HostFsImpl for NativeHostFs {
 /// separate map of target bytes; directories track only
 /// existence. Reads use a per-fd cursor. No size cap, no
 /// pagination, no concurrent-handle edge cases — this is here so
-/// browser microkernels (and tests that don't want a temp dir)
+/// browser kernel-host interfaces (and tests that don't want a temp dir)
 /// have a working backend to point at while OPFS is being wired
 /// up.
 pub struct InMemoryHostFs {
@@ -1116,7 +1116,7 @@ impl InMemoryHostFs {
     }
 
     /// Pre-populate a regular file. Useful for tests: install
-    /// fixtures before the microkernel touches them.
+    /// fixtures before the kernel_host_interface touches them.
     pub fn install_file(&self, path: &[u8], content: Vec<u8>) {
         let mut s = self.inner.lock().unwrap();
         s.files.insert(path.to_vec(), content);
@@ -1295,7 +1295,7 @@ pub struct KernelStoreData {
 // ── Kernel instance: the loaded kernel.wasm + its wasmtime handles ─────────
 
 /// The loaded kernel.wasm plus the typed handles needed to drive it.
-/// Kept behind `Arc<Mutex<…>>` so that both the [`Microkernel`] and
+/// Kept behind `Arc<Mutex<…>>` so that both the [`KernelHostInterface`] and
 /// any spawned [`UserProcess`] can call into it. (`Arc<Mutex<…>>`
 /// rather than `Rc<RefCell<…>>` so the type satisfies `Send`, which
 /// `wasmtime_wasi::preview1::add_to_linker_sync` requires for the
@@ -1326,7 +1326,7 @@ impl KernelInstance {
     /// Run a syscall. Stages `request` in the kernel scratch buffer,
     /// invokes `kernel_dispatch`, copies the response back out.
     /// `caller_pid` identifies the originating user process (or
-    /// [`KERNEL_PID`] for direct microkernel-internal calls).
+    /// [`KERNEL_PID`] for direct kernel-host-interface-internal calls).
     pub fn syscall(
         &mut self,
         method_id: u32,
@@ -1778,16 +1778,16 @@ pub fn budget_ns_to_epoch_quantum(budget_ns: u64) -> u64 {
     budget_ns.div_ceil(1_000_000).max(1)
 }
 
-// ── Microkernel: orchestrates the kernel and user processes ───────────────
+// ── KernelHostInterface: orchestrates the kernel and user processes ───────────────
 
-pub struct Microkernel {
+pub struct KernelHostInterface {
     engine: Engine,
     kernel: Arc<Mutex<KernelInstance>>,
     process_engine: Arc<Mutex<CachedProcessEngine>>,
     next_anonymous_module_id: RefCell<u32>,
 }
 
-impl Microkernel {
+impl KernelHostInterface {
     /// Load `kernel.wasm` from `path` into a fresh wasmtime engine and
     /// instantiate it with the documented `kh_*` import surface.
     pub fn load(path: &Path, host_state: HostState) -> Result<Self> {
@@ -1884,7 +1884,7 @@ impl Microkernel {
 
     /// Invoke a kernel syscall directly (no user process). The kernel
     /// sees `KERNEL_PID` (0) as the caller. Useful for tests and for
-    /// operations that originate inside the microkernel itself.
+    /// operations that originate inside the kernel-host interface itself.
     pub fn syscall(&self, method_id: u32, request: &[u8], response: &mut [u8]) -> Result<i64> {
         self.kernel
             .lock()
@@ -2301,7 +2301,7 @@ impl Microkernel {
 pub struct ProcessIo;
 
 /// One sys_spawn-staged child waiting for the host to instantiate
-/// and run it. Returned from [`Microkernel::drain_pending_spawn`].
+/// and run it. Returned from [`KernelHostInterface::drain_pending_spawn`].
 pub struct PendingSpawn {
     pub child_pid: u32,
     pub wasm: Vec<u8>,
@@ -2333,7 +2333,7 @@ fn encode_argv_records<S: AsRef<[u8]>>(argv: &[S]) -> Vec<u8> {
 /// `kernel.wasm` rather than wasmtime-wasi, and once cross-process
 /// pipes work, `cmd1 | cmd2` is the same pipe object on both sides.
 ///
-/// Note on argv: keeping it in microkernel-side state for now is
+/// Note on argv: keeping it in host-interface-side state for now is
 /// fine — the kernel's process tree is not tracking argv yet. Once
 /// `sys_spawn` lands and the kernel allocates pids itself, argv
 /// migrates into `Process` so it's preserved across exec.
@@ -2362,7 +2362,7 @@ pub struct UserState {
     pub last_scheduler_epoch_quantum: Option<u64>,
 }
 
-impl yurt_microkernel_core::HasCallerPid for UserState {
+impl yurt_kernel_host_interface_core::HasCallerPid for UserState {
     fn caller_pid(&self) -> u32 {
         self.pid
     }
@@ -2530,9 +2530,9 @@ impl UserProcess {
 /// - `register_sys_imports` for the `sys_*` shims
 /// - `wasi_shim::add_to_linker` for `fd_write` / `fd_close`
 // Trampoline helpers (`forward_*`, `trampoline_request*`) live in
-// `yurt_microkernel_core` now — they're engine-agnostic. We re-export
+// `yurt_kernel_host_interface_core` now — they're engine-agnostic. We re-export
 // the two `pub` ones the WASI shim uses for backwards compatibility.
-pub use yurt_microkernel_core::{trampoline_request, trampoline_request_with_response};
+pub use yurt_kernel_host_interface_core::{trampoline_request, trampoline_request_with_response};
 
 // ── Linker registration ──────────────────────────────────────────────────────
 
@@ -3425,11 +3425,11 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
 /// import forwards into `kernel_dispatch` with the appropriate method
 /// id from `yurt_abi_methods.toml`. The wasm import names match the architectural reality: these are syscalls.
 fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
-    // Trampoline helpers are now in `microkernel-core` — they're
+    // Trampoline helpers are now in `kernel-host-interface-core` — they're
     // engine-agnostic and shared by every native engine impl. The
     // `register_sys_imports` body just wires the typed wasmtime
     // closures to those helpers.
-    use yurt_microkernel_core::{
+    use yurt_kernel_host_interface_core::{
         forward_request_bytes, forward_request_with_user_response, forward_response_to_user,
         forward_scalar, forward_u32_arg, forward_user_ptr_len,
     };

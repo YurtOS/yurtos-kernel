@@ -3,14 +3,14 @@
 # This file is the *authoritative* mapping between the user-facing
 # syscall names declared in `yurt_abi.toml` (and the kernel-internal
 # methods exposed by `kernel.wasm`) and the stable u32 method IDs the
-# microkernel passes to `kernel_dispatch`.
+# kernel-host interface passes to `kernel_dispatch`.
 #
 # Rules:
 #   - IDs are stable. Never reuse, never renumber. New entries append.
 #   - 0 is reserved for negotiation / health.
 #   - 1..=0xFFFF is the kernel-internal range (echo, now_realtime, …).
 #     These methods are not part of `yurt_abi.toml`; they exist only so
-#     the microkernel can validate trampoline plumbing without a real
+#     the kernel-host interface can validate trampoline plumbing without a real
 #     syscall.
 #   - 0x1_0000+ is the yurt_abi.toml syscall range. One entry per
 #     `[import.<name>]` in `yurt_abi.toml` — this file lags slightly as
@@ -43,42 +43,42 @@ doc = "Emit a fixed log line via kh_log at INFO severity; validates the host log
 [method.kernel_provide_stdin]
 id = 4
 kind = "internal"
-doc = "Microkernel-only: append bytes to the target process's stdin buffer. Request bytes are u32 target_pid + payload. Used at spawn time to seed standard input for fixtures and shells."
+doc = "KernelHostInterface-only: append bytes to the target process's stdin buffer. Request bytes are u32 target_pid + payload. Used at spawn time to seed standard input for fixtures and shells."
 
 [method.kernel_close_stdin]
 id = 5
 kind = "internal"
-doc = "Microkernel-only: mark the target process's stdin as EOF. Subsequent sys_read on Stdin returns 0 once the buffer drains. Request bytes are u32 target_pid."
+doc = "KernelHostInterface-only: mark the target process's stdin as EOF. Subsequent sys_read on Stdin returns 0 once the buffer drains. Request bytes are u32 target_pid."
 
 [method.kernel_drain_stdout]
 id = 6
 kind = "internal"
-doc = "Microkernel-only: drain the target process's stdout buffer into the response. Request bytes are u32 target_pid. Returns bytes read (which empties the buffer)."
+doc = "KernelHostInterface-only: drain the target process's stdout buffer into the response. Request bytes are u32 target_pid. Returns bytes read (which empties the buffer)."
 
 [method.kernel_drain_stderr]
 id = 7
 kind = "internal"
-doc = "Microkernel-only: drain the target process's stderr buffer into the response. Request bytes are u32 target_pid. Returns bytes read."
+doc = "KernelHostInterface-only: drain the target process's stderr buffer into the response. Request bytes are u32 target_pid. Returns bytes read."
 
 [method.kernel_register_file]
 id = 8
 kind = "internal"
-doc = "Microkernel-only: install a file blob into the in-memory ramfs at the given path. Request bytes are u32 path_len (LE) + path_bytes + content_bytes. The path namespace is flat (no directory creation). Returns 0 on success, -EINVAL for malformed input. Phase 2 ramfs is read-only from userland; writes / unlink / mkdir land later."
+doc = "KernelHostInterface-only: install a file blob into the in-memory ramfs at the given path. Request bytes are u32 path_len (LE) + path_bytes + content_bytes. The path namespace is flat (no directory creation). Returns 0 on success, -EINVAL for malformed input. Phase 2 ramfs is read-only from userland; writes / unlink / mkdir land later."
 
 [method.kernel_install_tar_layer]
 id = 10
 kind = "internal"
-doc = "Microkernel-only: mount a TarLayerBackend at the given prefix. Request bytes: u32 prefix_len LE + prefix_bytes + tar_archive_bytes. The kernel walks the tar at install time and indexes regular-file entries; subsequent sys_open under the prefix serves slices of the archive. Read-only — image layers refuse create/write. Returns 0 on success, -EINVAL for malformed input."
+doc = "KernelHostInterface-only: mount a TarLayerBackend at the given prefix. Request bytes: u32 prefix_len LE + prefix_bytes + tar_archive_bytes. The kernel walks the tar at install time and indexes regular-file entries; subsequent sys_open under the prefix serves slices of the archive. Read-only — image layers refuse create/write. Returns 0 on success, -EINVAL for malformed input."
 
 [method.kernel_install_host_fs_mount]
 id = 11
 kind = "internal"
-doc = "Microkernel-only: mount a HostFsBackend at the given prefix. Request bytes are the prefix path (no length header — the entire request is the prefix). Embedders pick where the host fs lives ('/host', '/users/user', '/', whatever); the auto-mount at /host has been removed because the right prefix is workload-specific. Real-disk reads/writes still gate through PolicyEnforcer + HostState.host_fs_root. Returns 0 on success, -EINVAL for empty prefix."
+doc = "KernelHostInterface-only: mount a HostFsBackend at the given prefix. Request bytes are the prefix path (no length header — the entire request is the prefix). Embedders pick where the host fs lives ('/host', '/users/user', '/', whatever); the auto-mount at /host has been removed because the right prefix is workload-specific. Real-disk reads/writes still gate through PolicyEnforcer + HostState.host_fs_root. Returns 0 on success, -EINVAL for empty prefix."
 
 [method.kernel_install_yurtfs]
 id = 12
 kind = "internal"
-doc = "Microkernel-only: mount a full YURTFS L1+L2 overlay at the given prefix in one call. Request bytes are u32 prefix_len LE + prefix_bytes + tar_archive_bytes. The kernel walks the tar (lower / image), creates a fresh ramfs (upper / overlay), composes them via OverlayBackend, and mounts the result. Reads fall through to lower; writes go to upper; first write of a lower-only file copies up. Phase 6 surface — uncompressed tar, no whiteouts, no metadata copy-up, ramfs-backed upper. Returns 0 on success, -EINVAL for malformed input."
+doc = "KernelHostInterface-only: mount a full YURTFS L1+L2 overlay at the given prefix in one call. Request bytes are u32 prefix_len LE + prefix_bytes + tar_archive_bytes. The kernel walks the tar (lower / image), creates a fresh ramfs (upper / overlay), composes them via OverlayBackend, and mounts the result. Reads fall through to lower; writes go to upper; first write of a lower-only file copies up. Phase 6 surface — uncompressed tar, no whiteouts, no metadata copy-up, ramfs-backed upper. Returns 0 on success, -EINVAL for malformed input."
 
 [method.sys_wait]
 id = 0x1_002C
@@ -91,7 +91,7 @@ doc = "POSIX waitpid-style wait. Request bytes: u32 child_pid LE (0 = wait for a
 # the architectural reality (the call lands inside kernel.wasm). The
 # legacy wasm import symbols in `yurt_abi.toml` are still `host_*` for
 # binary compatibility with already-built userland (BusyBox, zsh, …);
-# the microkernel maps each legacy `host_*` import to its `sys_*`
+# the kernel-host interface maps each legacy `host_*` import to its `sys_*`
 # method id when forwarding the trampoline call. A future sweep will
 # rename the wasm symbols and recompile userland.
 #
@@ -206,7 +206,7 @@ doc = "POSIX clock_gettime. Request bytes carry the u32 clock_id (0 = REALTIME, 
 [method.sys_extension_invoke]
 id = 0x1_0010
 kind = "syscall"
-doc = "Forward an opaque request to the microkernel-side extension registry. The kernel acts as a byte courier; wire format is the registry's concern."
+doc = "Forward an opaque request to the host-interface-side extension registry. The kernel acts as a byte courier; wire format is the registry's concern."
 
 [method.sys_getpgid]
 id = 0x1_0017
@@ -271,7 +271,7 @@ doc = "POSIX chmod(path, mode). Request bytes: u32 mode LE + path bytes. Writes 
 [method.sys_chown]
 id = 0x1_0023
 kind = "syscall"
-doc = "POSIX chown(path, uid, gid). Request bytes: u32 uid LE + u32 gid LE + path bytes. Writes uid/gid to the MetadataOverlay; underlying storage's owner is unchanged (host fs file stays owned by the microkernel's host user — this is sandbox-view ownership only). Phase 6: no permission checks. Returns 0 on success, -ENOENT for unresolvable path."
+doc = "POSIX chown(path, uid, gid). Request bytes: u32 uid LE + u32 gid LE + path bytes. Writes uid/gid to the MetadataOverlay; underlying storage's owner is unchanged (host fs file stays owned by the kernel-host interface's host user — this is sandbox-view ownership only). Phase 6: no permission checks. Returns 0 on success, -ENOENT for unresolvable path."
 
 [method.sys_utimens]
 id = 0x1_0024
@@ -421,19 +421,19 @@ doc = "Outbound HTTP fetch. Request bytes are yurt_fetch_request_v1. Response by
 [method.sys_spawn]
 id = 0x1_002F
 kind = "syscall"
-doc = "POSIX-shaped spawn(path, argv) — the userland-facing fork+exec. Request bytes: u32 path_len LE + path_bytes + (u32 arg_len + arg_bytes)*. Reads the wasm image at `path` from the VFS, allocates a fresh child pid (kernel range starts at 1000 to avoid collision with the host's user-process pid allocator), records the parent/child relationship, and enqueues a PendingSpawn for the host to instantiate. The microkernel must call drain_pending_spawn between parent syscalls to actually run staged children — without that drain the child never runs. Returns the child pid on success, -ENOENT if path is missing, -ENOMEM if the file can't be read, or -EINVAL on a malformed request."
+doc = "POSIX-shaped spawn(path, argv) — the userland-facing fork+exec. Request bytes: u32 path_len LE + path_bytes + (u32 arg_len + arg_bytes)*. Reads the wasm image at `path` from the VFS, allocates a fresh child pid (kernel range starts at 1000 to avoid collision with the host's user-process pid allocator), records the parent/child relationship, and enqueues a PendingSpawn for the host to instantiate. The kernel-host interface must call drain_pending_spawn between parent syscalls to actually run staged children — without that drain the child never runs. Returns the child pid on success, -ENOENT if path is missing, -ENOMEM if the file can't be read, or -EINVAL on a malformed request."
 
 [method.kernel_list_processes]
 id = 16
 kind = "internal"
-doc = "Microkernel-only: serialize a kernel-owned process table snapshot. Response: u32 count + entries. Each entry is u32 pid, u32 ppid, u32 pgid, u32 sid, u8 state (1 running, 2 exited/zombie), i32 exit_status (-1 when running), u32 command_len, command bytes, u32 fd_count, and fd_count u32 fd numbers. Returns bytes-written or required size when the output buffer is too small."
+doc = "KernelHostInterface-only: serialize a kernel-owned process table snapshot. Response: u32 count + entries. Each entry is u32 pid, u32 ppid, u32 pgid, u32 sid, u8 state (1 running, 2 exited/zombie), i32 exit_status (-1 when running), u32 command_len, command bytes, u32 fd_count, and fd_count u32 fd numbers. Returns bytes-written or required size when the output buffer is too small."
 
 [method.kernel_list_threads]
 id = 17
 kind = "internal"
-doc = "Microkernel-only: serialize a kernel-owned thread snapshot for one process. Request: u32 pid. Response: u32 count + entries. Each entry is u32 tid, u8 state (1 runnable, 2 blocked, 3 exited), u8 detached, u16 reserved, i32 exit_value (-1 when not exited), and i32 host_thread_handle (-1 when none). Returns bytes-written or required size when the output buffer is too small."
+doc = "KernelHostInterface-only: serialize a kernel-owned thread snapshot for one process. Request: u32 pid. Response: u32 count + entries. Each entry is u32 tid, u8 state (1 runnable, 2 blocked, 3 exited), u8 detached, u16 reserved, i32 exit_value (-1 when not exited), and i32 host_thread_handle (-1 when none). Returns bytes-written or required size when the output buffer is too small."
 
 [method.kernel_schedule_next]
 id = 18
 kind = "internal"
-doc = "Microkernel-only: ask the kernel scheduler for the next runnable thread. Response: u32 pid, u32 tid, i32 host_thread_handle (-1 when none), u32 flags, u64 budget_ns. Returns bytes-written, -EAGAIN when no runnable thread exists, or required size when the output buffer is too small."
+doc = "KernelHostInterface-only: ask the kernel scheduler for the next runnable thread. Response: u32 pid, u32 tid, i32 host_thread_handle (-1 when none), u32 flags, u64 budget_ns. Returns bytes-written, -EAGAIN when no runnable thread exists, or required size when the output buffer is too small."

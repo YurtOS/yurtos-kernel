@@ -3,7 +3,7 @@ name = "yurt-kernel-wasm"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "Yurt kernel compiled to wasm32-wasip1; runs inside any microkernel host."
+description = "Yurt kernel compiled to wasm32-wasip1; runs inside any kernel-host-interface host."
 
 [lib]
 crate-type = ["cdylib", "rlib"]

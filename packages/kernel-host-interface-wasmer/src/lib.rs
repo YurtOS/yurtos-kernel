@@ -1,7 +1,7 @@
-//! Wasmer-backed microkernel — **stub impl**.
+//! Wasmer-backed kernel-host interface — **stub impl**.
 //!
-//! Validates the [`yurt_microkernel_core::WasmEngine`] +
-//! [`yurt_microkernel_core::HostCallCtx`] trait surface against a
+//! Validates the [`yurt_kernel_host_interface_core::WasmEngine`] +
+//! [`yurt_kernel_host_interface_core::HostCallCtx`] trait surface against a
 //! third engine without yet pulling the `wasmer` dependency. Same
 //! "compile cleanly == architecture is right" proof as the wasmedge
 //! stub.
@@ -30,11 +30,11 @@
 //! - Caller-side state: wasmer passes `&FunctionEnvMut<'_, S>` to
 //!   import functions; that's the analog of `wasmtime::Caller`.
 //!   Wrap it in `WasmerCtx<'_>` so the shared trampoline helpers
-//!   in `yurt_microkernel_core` work unchanged.
+//!   in `yurt_kernel_host_interface_core` work unchanged.
 //! - Optional: enable wasmer's JSPI feature when the AsyncBridge
 //!   integration lands.
 
-use yurt_microkernel_core::{
+use yurt_kernel_host_interface_core::{
     CompiledModule, EngineError, HasCallerPid, HostCallCtx, KernelDispatchOutcome, WasmEngine,
 };
 

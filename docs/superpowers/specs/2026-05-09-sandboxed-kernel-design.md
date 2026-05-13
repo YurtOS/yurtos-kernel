@@ -24,7 +24,7 @@ instantiation/dispatch contract. Any wasm runtime that can host the same `kh_*`
 imports and call `kernel_dispatch` is a supported backend — wasmtime, Wasmer,
 the browser engine via JSPI/asyncify, Wasmi for embedded, and future runtimes
 drop in without touching kernel.wasm or process. Existing package names such as
-`packages/microkernel-js` are historical; architecturally they are KH adapters,
+`packages/kernel-host-interface-js` are historical; architecturally they are KH adapters,
 not independent kernels.
 
 ## Why
@@ -44,10 +44,10 @@ not independent kernels.
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │ Kernel-Host Interface / KH Adapter (per-platform)            │
-│  - wasmtime native     packages/microkernel-wasmtime         │
-│  - any JS engine       packages/microkernel-js               │
+│  - wasmtime native     packages/kernel-host-interface-wasmtime         │
+│  - any JS engine       packages/kernel-host-interface-js               │
 │       (Deno, browsers, Node, Bun all share this)             │
-│  - Deno-only adds      packages/microkernel-deno             │
+│  - Deno-only adds      packages/kernel-host-interface-deno             │
 │       (real fs / sockets / subprocess on top of -js)         │
 │  - bare CLI            wasmtime run kernel.wasm              │
 └────────┬──────────────────────────────────┬──────────────────┘
@@ -72,7 +72,7 @@ names for that reason.
 
 The migration does **not** rename every existing user process import as part of
 the parity gate. Transitional userland still imports legacy `host_*` symbols
-from `yurt_abi.toml`, and the microkernel implements those names by forwarding
+from `yurt_abi.toml`, and the kernel-host interface implements those names by forwarding
 into `kernel_dispatch`. Once parity is reached, new or rebuilt userland can move
 to `sys_*` imports as a dedicated ABI cleanup. Until then, `host_*` is a
 compatibility spelling, not an architectural boundary.
@@ -80,7 +80,7 @@ compatibility spelling, not an architectural boundary.
 Two ABI surfaces:
 
 - **User→Kernel** — `abi/contract/yurt_abi.toml`. Unchanged for the transition.
-  The microkernel re-exports each `host_*` import to the calling process; the
+  The kernel-host interface re-exports each `host_*` import to the calling process; the
   implementation copies the request out of process memory, calls
   `kernel_dispatch(method_id, in_ptr, in_len, out_ptr, out_cap)` exported by
   kernel.wasm, then copies the response back into process memory.
@@ -90,12 +90,12 @@ Two ABI surfaces:
 There is also a host-control surface in the opposite direction:
 
 - **Host→Kernel control/query** — exports on `kernel.wasm` used by the
-  microkernel and embedding host to operate the sandbox itself: create a
+  kernel-host interface and embedding host to operate the sandbox itself: create a
   process, send a signal or kill request, wait/reap, list process state, query
   fd/proc metadata, snapshot state, and eventually set resource limits. These
-  calls are not `kh_*` imports because the microkernel is not implementing the
+  calls are not `kh_*` imports because the kernel-host interface is not implementing the
   behavior. They enter kernel.wasm, where the process table, credentials, signal
-  policy, fd table, and VFS state live. The microkernel only copies
+  policy, fd table, and VFS state live. The kernel-host interface only copies
   request/response bytes and drives wasm instances.
 
 ## Trampoline Protocol
@@ -104,9 +104,9 @@ A user syscall executes in five steps:
 
 1. User wasm calls a `host_*` import. On JS hosts this is a JSPI suspend point;
    on native wasmtime it is a normal host call.
-2. Microkernel reads the request bytes from user linear memory using
+2. KernelHostInterface reads the request bytes from user linear memory using
    pointer/length args defined by `yurt_abi.toml`.
-3. Microkernel writes those bytes into kernel.wasm linear memory at a
+3. KernelHostInterface writes those bytes into kernel.wasm linear memory at a
    pre-arranged scratch region (or via `kh_user_mem_*`-style copy primitive —
    TBD: see Open Question 1) and calls
    `kernel_dispatch(method_id, in_ptr, in_len, out_ptr, out_cap)`. `method_id`
@@ -119,7 +119,7 @@ A user syscall executes in five steps:
    POSIX errno. Variable-size results land in the caller-provided out buffer
    using the same fixed-record layouts the native ABI already defines
    (`yurt_*_result_v1` structs).
-5. Microkernel copies the response from kernel memory back into user memory and
+5. KernelHostInterface copies the response from kernel memory back into user memory and
    returns the scalar result to the process.
 
 On native wasmtime steps 2 and 5 can collapse to direct slice borrows between
@@ -158,14 +158,14 @@ surface, grouped:
   `-EAGAIN` when the operation would block. There is no polling loop on any
   path. PR15 also adds a host-page `sandbox.net` facade and a `ListenerRegistry`
   for routing in-tab fetch/WS into the sandbox; those live above the kernel↔host
-  ABI and are the microkernel-js adapter's concern, not kernel.wasm's.
+  ABI and are the kernel-host-interface-js adapter's concern, not kernel.wasm's.
 - **Wasm engine ops:** `kh_spawn_process` (creates a new process instance from a
   module already loaded into the host's module cache, returns an instance
   handle), `kh_destroy_instance`,
   `kh_process_mem_read(handle, addr, dst_ptr, len)`,
   `kh_process_mem_write(handle, addr, src_ptr, len)`,
   `kh_process_resume(handle, result, budget_ns)`. This import family is now represented in
-  `packages/kernel-wasm/src/kh.rs`, `packages/microkernel-js/mod.ts`, and the
+  `packages/kernel-wasm/src/kh.rs`, `packages/kernel-host-interface-js/mod.ts`, and the
   native wasmtime KH adapter. The portable JS backend has a host module cache
   and opaque instance-handle table for cached wasm modules, including instance
   destroy and kernel↔process memory copies. The native wasmtime backend now
@@ -180,7 +180,7 @@ surface, grouped:
   returns `-ENOSYS` until the scheduler/resume loop is wired; the ABI bindings
   themselves are no longer spec-only.
 - **Diagnostics:** `kh_log` (severity, ptr, len), `kh_panic` (ptr, len —
-  microkernel must terminate the kernel instance and surface the message).
+  kernel-host interface must terminate the kernel instance and surface the message).
 - **Cooperative yield:** `kh_yield` — blocks the calling kernel computation
   until the host signals progress (used for blocking pipe reads, wait for child
   exit, etc.). On JS hosts this is JSPI; on native it is a Tokio await.
@@ -192,7 +192,7 @@ fixed-size out buffers.
 ## Host→Kernel Control API
 
 The process-control and observability API is owned by kernel.wasm. The
-microkernel exposes these operations to the embedding host, but it must not keep
+kernel-host interface exposes these operations to the embedding host, but it must not keep
 an independent process table or synthesize process state. The source of truth is
 inside kernel.wasm.
 
@@ -267,13 +267,13 @@ The sandboxed-kernel reuses the existing `AsyncBridge` infrastructure in
 already implements all three modes the migration needs — `jspi`, `asyncify`
 (with snapshot/fork), and `threads` — and is currently driving the TS kernel's
 user-process loaders, setjmp/longjmp, and process manager. The Rust
-kernel.wasm + microkernel split slots into the same bridge:
+kernel.wasm + kernel-host interface split slots into the same bridge:
 
 - **Native wasmtime:** Both the process and the kernel wasm run in Tokio-driven
   async stores with `epoch_interruption` enabled. Syscalls from process execute
   inline; the kernel's `kh_yield` is a real `tokio::task::yield_now`. No JS-side
   bridge required.
-- **Browser / Deno, JSPI:** the microkernel-side `kh_*` host functions that
+- **Browser / Deno, JSPI:** the host-interface-side `kh_*` host functions that
   perform async work are wrapped with `bridge.wrapImport(asyncFn)`, which
   returns a `WebAssembly.Suspending`. The `kernel_dispatch` export is wrapped
   with `bridge.wrapExport(...)`, which returns `WebAssembly.promising(...)` so
@@ -288,7 +288,7 @@ kernel.wasm + microkernel split slots into the same bridge:
   protocol stubbed.
 
 When the first blocking `kh_*` call lands (likely `kh_yield` for pipe/wait), the
-microkernel-deno integrates `AsyncBridge`. The existing implementation stays —
+kernel-host-interface-deno integrates `AsyncBridge`. The existing implementation stays —
 the migration's job is to consume it, not replace it.
 
 ### Two architectural absolutes for JS-hosted backends
@@ -317,7 +317,7 @@ unaffected because epoch interruption + Tokio cover them.
 
    On the native wasmtime backend the equivalent is wasmtime's epoch
    interruption — every N quanta of guest execution, any process can be
-   preempted regardless of whether it called a syscall. The Rust microkernel
+   preempted regardless of whether it called a syscall. The Rust kernel-host interface
    does _not_ need to wrap every `sys_*` for scheduling; epochs handle it. This
    is the one architectural difference between the JS-hosted and native
    backends.
@@ -331,13 +331,13 @@ unaffected because epoch interruption + Tokio cover them.
    asyncify regardless of which suspension mode is otherwise active.
 
 Consequence for the build pipeline: kernel.wasm and any user-process binary that
-uses setjmp/longjmp must have an `-asyncify` variant available. The microkernel
+uses setjmp/longjmp must have an `-asyncify` variant available. The kernel-host interface
 selects the right artifact at instantiation time (matches the existing
 `binarySuffix` logic on `AsyncBridge`).
 
 ## Memory & Concurrency
 
-Kernel.wasm is single-threaded for kernel execution: the microkernel serializes
+Kernel.wasm is single-threaded for kernel execution: the kernel-host interface serializes
 syscall dispatch by holding a per-kernel-instance lock around `kernel_dispatch`.
 User processes, however, may be truly multi-threaded. The kernel owns the thread
 group model even when the host interface uses Worker/SAB or native host threads
@@ -357,7 +357,7 @@ import wrapping are reusable. Its TS-owned thread slots, mutex maps, and condvar
 queues are transitional; wasm-kernel mode moves those records into the Rust
 kernel and exposes host-rendered views through binary kernel snapshots.
 
-Kernel state lives in kernel.wasm's linear memory. The microkernel treats kernel
+Kernel state lives in kernel.wasm's linear memory. The kernel-host interface treats kernel
 state as opaque except via `kernel_dispatch` and a small host-control export set
 (`kernel_spawn_process`, `kernel_kill`, `kernel_wait`, `kernel_list_processes`,
 `kernel_list_threads`, `kernel_schedule_next`, `kernel_spawn_thread`,
@@ -394,7 +394,7 @@ YURT_KERNEL=ts    (default during transition)
 YURT_KERNEL=wasm  (parity testing and incremental rollout)
 ```
 
-Routing happens inside the microkernel: when `YURT_KERNEL=ts`, host_* calls
+Routing happens inside the kernel-host interface: when `YURT_KERNEL=ts`, host_* calls
 forward to the existing TS kernel via the current JSON-RPC callback path. When
 `YURT_KERNEL=wasm`, they forward into kernel.wasm. Per-syscall routing is
 allowed (`YURT_KERNEL_OVERRIDE=pipes:wasm,vfs:ts`) so we can land the Rust port
@@ -421,11 +421,11 @@ every supported host.
    version or write a one-shot migrator. Locked to "bump version, no migration"
    pending stakeholder review.
 5. **Image loader bootstrapping.** Does the kernel read images via `kh_real_*`
-   from inside the sandbox, or does the microkernel pre-mount images into
+   from inside the sandbox, or does the kernel-host interface pre-mount images into
    kernel.wasm memory at boot? Default: through `kh_real_*`; revisit if startup
    cost is unacceptable.
 
-## Extensions Live in the Microkernel, Not the Kernel
+## Extensions Live in the KernelHostInterface, Not the Kernel
 
 The TS kernel exposes `host_extension_invoke` as the user-facing escape hatch
 for "syscalls implemented via a plugin" — database access, custom host
@@ -434,14 +434,14 @@ adding new syscall-shaped functionality without changing the ABI.
 
 In the sandboxed-kernel split this means: **kernel.wasm does not host
 extensions.** It forwards `host_extension_invoke` straight through to the
-microkernel via a `kh_extension_invoke` import (TBD; will be added to
-`kernel_host_abi.toml` when we port the syscall). Each microkernel embedder owns
+kernel-host interface via a `kh_extension_invoke` import (TBD; will be added to
+`kernel_host_abi.toml` when we port the syscall). Each kernel-host interface embedder owns
 its own extension registry — wasmtime hosts register native Rust handlers, the
-browser microkernel registers JS/TS handlers via JSPI, and so on. The kernel
+browser kernel-host interface registers JS/TS handlers via JSPI, and so on. The kernel
 only carries bytes between the calling process and the host-side handler.
 
 Consequence: adding a new domain capability ("access a database", "call a custom
-RPC", "invoke a TS callback") is an extension registration on the microkernel
+RPC", "invoke a TS callback") is an extension registration on the kernel-host interface
 side, never a kernel.wasm change. New user-facing syscalls inside
 `yurt_abi.toml` remain rare — they're reserved for genuinely kernel-resident
 concerns (process tree, fd table, signals, VFS).

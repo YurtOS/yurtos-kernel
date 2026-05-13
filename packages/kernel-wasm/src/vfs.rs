@@ -505,7 +505,7 @@ impl RamfsBackend {
         }
     }
 
-    /// Install or replace a path's content. Used by the microkernel
+    /// Install or replace a path's content. Used by the kernel_host_interface
     /// via `kernel_register_file`.
     pub fn install(&mut self, path: Vec<u8>, content: Vec<u8>) -> u64 {
         if let Some(&id) = self.paths.get(&path) {
@@ -1355,7 +1355,7 @@ impl VfsBackend for ProcBackend {
 //
 // Mounts a real-disk subtree at a given prefix (e.g. /host/data).
 // Path lookups translate to `kh_real_open` calls; reads to
-// `kh_real_read`; close to `kh_real_close`. The host (microkernel)
+// `kh_real_read`; close to `kh_real_close`. The host (kernel_host_interface)
 // gates every open through `PolicyEnforcer::may_open_path` and
 // translates the relative path against an embedder-supplied root —
 // the kernel never sees absolute host paths.
@@ -1417,7 +1417,7 @@ impl VfsBackend for HostFsBackend {
         if let Some(&inode) = self.paths.get(path) {
             return Some(inode);
         }
-        // Cold path: ask the host. The microkernel applies the
+        // Cold path: ask the host. The kernel_host_interface applies the
         // policy gate (`PolicyEnforcer::may_open_path`) and root
         // canonicalization before touching the real disk — a Deny
         // returns a negative errno which sys_open must preserve.
@@ -1529,7 +1529,7 @@ impl HostFsHandle {
 // ── Tar image-layer backend ───────────────────────────────────────
 //
 // Read-only mount served from an in-memory tar archive. The
-// microkernel pushes the tar bytes once via
+// kernel_host_interface pushes the tar bytes once via
 // `kernel_install_tar_layer`; we walk them at install time and
 // build a path → (offset, len) index. Reads slice into the
 // archive bytes — O(1) per read, zero copy beyond the response

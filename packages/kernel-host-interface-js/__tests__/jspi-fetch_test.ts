@@ -9,7 +9,7 @@
 
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
-import { defaultHostState, METHOD, Microkernel } from "../mod.ts";
+import { defaultHostState, KernelHostInterface, METHOD } from "../mod.ts";
 
 const KERNEL_WASM = new URL(
   "../../../target/wasm32-wasip1/release/yurt_kernel_wasm.wasm",
@@ -107,7 +107,7 @@ describe("JSPI / kh_fetch_blocking", () => {
         enc.encode(`echoed:${fetchRequestUrl(req)}`),
       );
     };
-    const mk = await Microkernel.load(bytes, host);
+    const mk = await KernelHostInterface.load(bytes, host);
 
     const reqBytes = fetchRequestRecord("https://example.invalid/test", "GET");
     const out = await mk.syscallAsync(
@@ -131,7 +131,7 @@ describe("JSPI / kh_fetch_blocking", () => {
       throw new Error("fetch should not be reached on deny");
     };
     host.policy = { mayFetch: () => "deny" };
-    const mk = await Microkernel.load(bytes, host);
+    const mk = await KernelHostInterface.load(bytes, host);
     const reqBytes = fetchRequestRecord("https://x", "GET");
     const out = await mk.syscallAsync(METHOD.SYS_FETCH, reqBytes, 1024);
     expect(Number(out.rc)).toEqual(-13);

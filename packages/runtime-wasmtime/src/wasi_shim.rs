@@ -25,7 +25,7 @@
 use anyhow::{anyhow, Result};
 use wasmtime::{Caller, Linker};
 
-use crate::microkernel::UserState;
+use crate::kernel_host_interface::UserState;
 
 const WASI: &str = "wasi_snapshot_preview1";
 
@@ -108,7 +108,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = Vec::with_capacity(4 + payload.len());
             req.extend_from_slice(&(fd as u32).to_le_bytes());
             req.extend_from_slice(&payload);
-            let rc = crate::microkernel::trampoline_request(
+            let rc = crate::kernel_host_interface::trampoline_request(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_WRITE,
                 &req,
@@ -164,7 +164,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             // scatter back into iovecs.
             let req = (fd as u32).to_le_bytes();
             let mut buf = vec![0u8; total_cap as usize];
-            let rc = crate::microkernel::trampoline_request_with_response(
+            let rc = crate::kernel_host_interface::trampoline_request_with_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_READ,
                 &req,
@@ -209,7 +209,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
             caller.data_mut().dir_fds.remove(&fd);
             let req = (fd as u32).to_le_bytes();
-            let rc = crate::microkernel::trampoline_request(
+            let rc = crate::kernel_host_interface::trampoline_request(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_CLOSE,
                 &req,
@@ -336,7 +336,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&offset.to_le_bytes());
             req.extend_from_slice(&(whence as u32).to_le_bytes());
             let mut resp = [0u8; 8];
-            let rc = crate::microkernel::trampoline_request_with_response(
+            let rc = crate::kernel_host_interface::trampoline_request_with_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_LSEEK,
                 &req,
@@ -423,7 +423,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             };
             let req = mapped.to_le_bytes();
             let mut resp = [0u8; 8];
-            let rc = crate::microkernel::trampoline_request_with_response(
+            let rc = crate::kernel_host_interface::trampoline_request_with_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_CLOCK_GETTIME,
                 &req,
@@ -525,7 +525,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             // bump this; the kernel surface returns the actual byte
             // count it filled.
             let mut resp = vec![0u8; 64 * 1024];
-            let rc = crate::microkernel::trampoline_request_with_response(
+            let rc = crate::kernel_host_interface::trampoline_request_with_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_SYS_READDIR,
                 &path,
@@ -651,7 +651,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(old_abs.len() as u32).to_le_bytes());
             req.extend_from_slice(&old_abs);
             req.extend_from_slice(&new_abs);
-            let rc = crate::microkernel::trampoline_request(
+            let rc = crate::kernel_host_interface::trampoline_request(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_SYS_RENAME,
                 &req,
@@ -712,7 +712,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&(target.len() as u32).to_le_bytes());
             req.extend_from_slice(&target);
             req.extend_from_slice(&link_path);
-            let rc = crate::microkernel::trampoline_request(
+            let rc = crate::kernel_host_interface::trampoline_request(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_SYS_LINK,
                 &req,
@@ -766,7 +766,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             req.extend_from_slice(&k_flags.to_le_bytes());
             req.push(b'/');
             req.extend_from_slice(&rel);
-            let rc = crate::microkernel::trampoline_request_with_response(
+            let rc = crate::kernel_host_interface::trampoline_request_with_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_OPEN,
                 &req,
@@ -810,7 +810,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         |mut caller: Caller<'_, UserState>, fd: i32, filestat_ptr: u32| -> i32 {
             let req = (fd as u32).to_le_bytes();
             let mut resp = [0u8; 16];
-            let rc = crate::microkernel::trampoline_request_with_response(
+            let rc = crate::kernel_host_interface::trampoline_request_with_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_FSTAT,
                 &req,
@@ -897,7 +897,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
     Ok(())
 }
 
-// Method ids we need; mirrors `microkernel::sys_method_id`.
+// Method ids we need; mirrors `kernel_host_interface::sys_method_id`.
 const METHOD_WRITE: u32 = 0x1_0014;
 const METHOD_READ: u32 = 0x1_0013;
 const METHOD_CLOSE: u32 = 0x1_000E;

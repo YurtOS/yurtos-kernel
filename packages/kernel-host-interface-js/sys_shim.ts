@@ -3,7 +3,7 @@
  *
  * One TS function per syscall, each forwarding to `kernel_dispatch`
  * via the kernel handle. Method ids and request/response shapes
- * mirror `packages/runtime-wasmtime/src/microkernel.rs::register_sys_imports`
+ * mirror `packages/runtime-wasmtime/src/kernel_host_interface.rs::register_sys_imports`
  * — same byte layouts, same scalar conventions.
  */
 
@@ -124,7 +124,7 @@ export function buildSysImports(
     },
     // setrlimit takes (i32, i64, i64) at the wasm import boundary.
     // BigInts aren't representable in this Record signature, so the
-    // microkernel registers it directly. See mod.ts.
+    // kernel_host_interface registers it directly. See mod.ts.
 
     sys_close: (fd) => forwardRequestBytes(METHOD.SYS_CLOSE, u32(fd)),
     sys_dup: (oldfd) => forwardRequestBytes(METHOD.SYS_DUP, u32(oldfd)),
@@ -258,7 +258,7 @@ export function buildSysImports(
     // ── Networking + KV imports ──────────────────────────────────
     // Mirror the wasmtime side's register_sys_imports surface so
     // user processes call the same env-namespaced symbols on
-    // either microkernel.
+    // either kernel_host_interface.
     sys_fetch: (reqPtr, reqLen, outPtr, outCap) => {
       const req = copyIn(reqPtr, reqLen);
       if (typeof req === "number") return req;

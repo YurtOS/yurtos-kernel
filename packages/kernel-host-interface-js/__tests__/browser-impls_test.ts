@@ -15,8 +15,8 @@ import {
   defaultHostState,
   globalFetch,
   IndexedDbKv,
+  KernelHostInterface,
   METHOD,
-  Microkernel,
 } from "../mod.ts";
 
 const KERNEL_WASM = new URL(
@@ -193,7 +193,10 @@ describe("browser-friendly impls", () => {
     try {
       const host = defaultHostState();
       host.fetch = globalFetch;
-      const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+      const mk = await KernelHostInterface.load(
+        await Deno.readFile(KERNEL_WASM),
+        host,
+      );
       const out = await mk.syscallAsync(
         METHOD.SYS_FETCH,
         fetchRequestRecord("https://example.invalid/", "GET"),

@@ -9,9 +9,9 @@ import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
 import {
   defaultHostState,
+  KernelHostInterface,
   type KvBackend,
   METHOD,
-  Microkernel,
 } from "../mod.ts";
 
 const KERNEL_WASM = new URL(
@@ -71,7 +71,10 @@ describe("JSPI / kh_idb_*", () => {
     if (!HAS_JSPI) return;
     const host = defaultHostState();
     host.kv = new FakeAsyncKv();
-    const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+    const mk = await KernelHostInterface.load(
+      await Deno.readFile(KERNEL_WASM),
+      host,
+    );
 
     // sys_idb_put request: u8 store_len + store + u32 key_len LE + key + value
     const store = new TextEncoder().encode("sessions");

@@ -15,14 +15,14 @@
  * etc.).
  *
  * The cross-kernel switch (`Sandbox.create({kernelImpl:"wasm"})`)
- * that lets the legacy TS-kernel tests run through microkernel-
+ * that lets the legacy TS-kernel tests run through kernel_host_interface-
  * deno is its own multi-slice initiative — see
  * project_phase7_parity_gate memory.
  */
 
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
-import { defaultHostState, Microkernel, s } from "../mod.ts";
+import { defaultHostState, KernelHostInterface, s } from "../mod.ts";
 
 const KERNEL_WASM = new URL(
   "../../../target/wasm32-wasip1/release/yurt_kernel_wasm.wasm",
@@ -118,7 +118,10 @@ describe("parity snapshots — Rust kernel.wasm path", () => {
       const expected = await loadSnapshot(fix.snapshot);
       const wasm = await loadFixture(fix.wasm);
       const kernelBytes = await Deno.readFile(KERNEL_WASM);
-      const mk = await Microkernel.load(kernelBytes, defaultHostState());
+      const mk = await KernelHostInterface.load(
+        kernelBytes,
+        defaultHostState(),
+      );
 
       // Stage ramfs files before spawn so they're visible to the
       // user process at sys_open time.

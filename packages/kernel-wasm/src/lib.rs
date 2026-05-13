@@ -1,7 +1,7 @@
 //! Yurt kernel, sandboxed.
 //!
-//! Compiled to `wasm32-wasip1` and instantiated by any microkernel host
-//! (`microkernel-wasmtime`, `microkernel-js`, `microkernel-deno`,
+//! Compiled to `wasm32-wasip1` and instantiated by any kernel-host-interface host
+//! (`kernel-host-interface-wasmtime`, `kernel-host-interface-js`, `kernel-host-interface-deno`,
 //! bare `wasmtime run`, …). The host forwards each user `host_*` syscall
 //! into [`kernel_dispatch`] after copying the request bytes into kernel
 //! linear memory; the kernel writes the response back into the same
@@ -22,9 +22,9 @@ mod vfs;
 
 pub use dispatch::dispatch;
 
-/// Microkernel-shared scratch buffer.
+/// Kernel-host-interface-shared scratch buffer.
 ///
-/// The microkernel uses this region to stage syscall request and response
+/// The kernel-host interface uses this region to stage syscall request and response
 /// bytes for [`kernel_dispatch`] without needing a kernel-side allocator
 /// in the hot path. Capacity is intentionally generous; individual
 /// syscalls cap their own usage. See the trampoline protocol in
@@ -36,7 +36,7 @@ static mut SCRATCH: [u8; SCRATCH_LEN] = [0; SCRATCH_LEN];
 #[no_mangle]
 pub extern "C" fn kernel_scratch_ptr() -> u32 {
     // No Rust reference to SCRATCH is ever formed outside the dispatch
-    // path, where the microkernel passes its bounds back explicitly via
+    // path, where the kernel-host interface passes its bounds back explicitly via
     // (in_ptr, in_len) / (out_ptr, out_cap). `&raw const` produces a
     // pointer without taking a reference and needs no unsafe block.
     (&raw const SCRATCH) as u32
@@ -52,16 +52,16 @@ pub extern "C" fn kernel_scratch_len() -> u32 {
 ///
 /// `method_id` is the stable u32 assigned in
 /// `abi/contract/yurt_abi_methods.toml`. `caller_pid` identifies the
-/// originating user process — `0` is reserved for the microkernel
+/// originating user process — `0` is reserved for the kernel-host interface
 /// itself (direct calls from outside any user process); user processes
 /// start at `1`. `(in_ptr, in_len)` points at the request bytes the
-/// microkernel copied out of the caller; the kernel writes the
+/// kernel-host interface copied out of the caller; the kernel writes the
 /// response into `(out_ptr, out_cap)`. Return value is the syscall
 /// scalar (`>= 0` success / `< 0` negated POSIX errno).
 ///
 /// # Safety
 ///
-/// The microkernel guarantees both slices live entirely inside this
+/// The kernel-host interface guarantees both slices live entirely inside this
 /// kernel instance's linear memory and do not overlap.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_dispatch(
@@ -87,12 +87,12 @@ pub unsafe extern "C" fn kernel_dispatch(
 
 /// Host-control export: serialize the kernel-owned process table.
 ///
-/// The microkernel may expose this to embedders for observability, but
+/// The kernel_host_interface may expose this to embedders for observability, but
 /// the table is authored here in kernel.wasm.
 ///
 /// # Safety
 ///
-/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid
+/// The kernel_host_interface guarantees `out_ptr..out_ptr+out_cap` is a valid
 /// writable range in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_list_processes(out_ptr: *mut u8, out_cap: usize) -> i64 {
@@ -108,7 +108,7 @@ pub unsafe extern "C" fn kernel_list_processes(out_ptr: *mut u8, out_cap: usize)
 ///
 /// # Safety
 ///
-/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid writable
+/// The kernel_host_interface guarantees `out_ptr..out_ptr+out_cap` is a valid writable
 /// range in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_list_threads(pid: u32, out_ptr: *mut u8, out_cap: usize) -> i64 {
@@ -128,7 +128,7 @@ pub unsafe extern "C" fn kernel_list_threads(pid: u32, out_ptr: *mut u8, out_cap
 ///
 /// # Safety
 ///
-/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid writable
+/// The kernel_host_interface guarantees `out_ptr..out_ptr+out_cap` is a valid writable
 /// range in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_snapshot(out_ptr: *mut u8, out_cap: usize) -> i64 {
@@ -148,7 +148,7 @@ pub unsafe extern "C" fn kernel_snapshot(out_ptr: *mut u8, out_cap: usize) -> i6
 ///
 /// # Safety
 ///
-/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid writable
+/// The kernel_host_interface guarantees `out_ptr..out_ptr+out_cap` is a valid writable
 /// range in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_schedule_next(out_ptr: *mut u8, out_cap: usize) -> i64 {
@@ -264,7 +264,7 @@ pub unsafe extern "C" fn kernel_kill(pid: u32, signal: u32) -> i64 {
 ///
 /// # Safety
 ///
-/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid writable
+/// The kernel_host_interface guarantees `out_ptr..out_ptr+out_cap` is a valid writable
 /// range in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_wait(
@@ -306,7 +306,7 @@ pub unsafe extern "C" fn kernel_record_exit(pid: u32, exit_status: i32) -> i64 {
 ///
 /// # Safety
 ///
-/// The microkernel guarantees `out_ptr..out_ptr+out_cap` is a valid writable
+/// The kernel_host_interface guarantees `out_ptr..out_ptr+out_cap` is a valid writable
 /// range in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_drain_spawn(out_ptr: *mut u8, out_cap: usize) -> i64 {
@@ -327,7 +327,7 @@ pub unsafe extern "C" fn kernel_drain_spawn(out_ptr: *mut u8, out_cap: usize) ->
 ///
 /// # Safety
 ///
-/// The microkernel guarantees both pointer/length pairs are valid readable
+/// The kernel_host_interface guarantees both pointer/length pairs are valid readable
 /// ranges in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_spawn_process(

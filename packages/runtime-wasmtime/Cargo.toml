@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Engine-agnostic kernel-host scaffolding (WasmEngine trait, etc.)
-yurt-microkernel-core = { path = "../microkernel-core" }
+yurt-kernel-host-interface-core = { path = "../kernel-host-interface-core" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -1,13 +1,13 @@
-//! Engine-agnostic scaffolding for the native microkernel.
+//! Engine-agnostic scaffolding for the native kernel-host interface.
 //!
 //! The kernel-host code (process spawning, syscall trampoline, WASI
 //! shim) shouldn't care which WASM engine is hosting `kernel.wasm` and
 //! the user processes. This crate defines the [`WasmEngine`] trait and
-//! companion types that engine-specific microkernel crates implement
-//! (today: `microkernel-wasmtime`; future: `microkernel-wasmedge`,
-//! `microkernel-wasmer`).
+//! companion types that engine-specific kernel-host-interface crates implement
+//! (today: `kernel-host-interface-wasmtime`; future: `kernel-host-interface-wasmedge`,
+//! `kernel-host-interface-wasmer`).
 //!
-//! The split mirrors the JS side: `microkernel-js` is the portable
+//! The split mirrors the JS side: `kernel-host-interface-js` is the portable
 //! kernel-host code, with Deno/browser specifics (real sockets, OPFS)
 //! living in extension crates. On native we want the same
 //! engine-agnostic shape: drop in a different `WasmEngine` impl to run
@@ -27,8 +27,8 @@
 //! ## Phase status
 //!
 //! Phase 5 (this crate's first appearance): trait skeleton + error
-//! type. The wasmtime microkernel doesn't yet route through the
-//! trait — that's a follow-up refactor where `microkernel.rs` stops
+//! type. The wasmtime kernel-host interface doesn't yet route through the
+//! trait — that's a follow-up refactor where `kernel_host_interface.rs` stops
 //! talking to `wasmtime::*` directly and instead takes a
 //! `&dyn WasmEngine`. Once that lands the second engine can be
 //! added without touching kernel-host code.
@@ -177,7 +177,7 @@ impl AsyncBridge for NoopAsyncBridge {
 /// (WasmEdge, wasmer) plugs into.
 ///
 /// User-state type `S` is supplied by kernel-host code (today
-/// [`UserState`] in microkernel-wasmtime: `pid`, `argv`, the kernel
+/// [`UserState`] in kernel-host-interface-wasmtime: `pid`, `argv`, the kernel
 /// handle).
 pub trait HostCallCtx<S> {
     /// Read `buf.len()` bytes from the user process's linear memory
@@ -231,7 +231,7 @@ pub trait WasmEngine {
 
 /// Opaque compiled module. Engine-specific bytes live behind it; only
 /// the engine that produced it knows how to instantiate it. The
-/// microkernel passes these around without inspecting them.
+/// kernel_host_interface passes these around without inspecting them.
 ///
 /// Phase 5 representation is a `Box<dyn Any + Send + Sync>` so engine
 /// implementations can stash whatever they need (e.g. wasmtime stores

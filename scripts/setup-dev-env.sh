@@ -8,7 +8,7 @@
 #
 #   - Rust toolchain (the version pinned in rust-toolchain.toml or the
 #     fallback below) plus the wasm32-wasip1 target.
-#   - Deno (for the TypeScript microkernel tests).
+#   - Deno (for the TypeScript kernel-host interface tests).
 #   - wabt (provides wat2wasm; needed by the Deno backend tests).
 #   - wasm-tools (used to inspect kernel.wasm imports/exports).
 #   - pre-commit (the hooks the repo uses).
@@ -252,4 +252,4 @@ echo
 info "next steps:"
 echo "  cargo test -p yurt-kernel-wasm --lib"
 echo "  cargo test -p yurt-runtime-wasmtime --test kernel_wasm_trampoline"
-echo "  deno test --allow-read --allow-env --allow-run packages/microkernel-deno/"
+echo "  deno test --allow-read --allow-env --allow-run packages/kernel-host-interface-deno/"

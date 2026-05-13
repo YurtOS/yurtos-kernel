@@ -1,7 +1,7 @@
 # Kernel→Host ABI (kh_*)
 #
-# The interface kernel.wasm imports from any host microkernel
-# (microkernel-wasmtime, microkernel-browser, microkernel-deno, bare
+# The interface kernel.wasm imports from any host kernel-host interface
+# (kernel-host-interface-wasmtime, browser kernel-host-interface, kernel-host-interface-deno, bare
 # `wasmtime run`, future runtimes). Implementing this surface plus the
 # `kernel_dispatch` calling contract is sufficient to be a supported
 # backend.
@@ -204,7 +204,7 @@ args = [
 
 # ── Durable KV (IndexedDB-shaped) ────────────────────────────────────
 #
-# Browser microkernels back this with IndexedDB; native ones use a
+# Browser kernel-host interfaces back this with IndexedDB; native ones use a
 # disk-backed key-value store or an in-memory map. The kernel
 # never sees where the bytes live — only the four primitive ops.
 # Stores are arbitrary opaque names (the embedder may forbid
@@ -307,11 +307,11 @@ args = [
 # ── Extension dispatch ───────────────────────────────────────────────────────
 #
 # The kernel forwards `host_extension_invoke` bytes verbatim to the
-# microkernel-side extension registry. Wire format is opaque byte payloads to
+# host-interface-side extension registry. Wire format is opaque byte payloads to
 # kernel.wasm; the kernel only shuttles bytes between the calling process's
 # request and the response buffer. This is the architectural escape hatch for
 # "syscalls implemented via a plugin": database access, custom RPC,
-# language-runtime hooks. Adding a new extension is a microkernel-side
+# language-runtime hooks. Adding a new extension is a host-interface-side
 # registration, never a kernel.wasm change.
 
 [import.kh_extension_invoke]

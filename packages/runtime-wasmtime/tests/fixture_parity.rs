@@ -1,7 +1,7 @@
 //! Real-fixture parity tests.
 //!
 //! Builds existing wasm fixtures from `test-fixtures/wasm/` and runs
-//! them through the sandboxed-kernel microkernel. Captures each
+//! them through the sandboxed-kernel kernel_host_interface. Captures each
 //! process's stdout/stderr from the kernel's per-pid buffer (drained
 //! via `METHOD_KERNEL_DRAIN_STDOUT` after the run completes), so
 //! tests assert on bytes the *kernel* observed, not on a host-side
@@ -10,7 +10,7 @@
 //! End-to-end byte path validated by every test below:
 //!
 //!   user wasm fd_write(1, ...)
-//!     → microkernel WASI shim
+//!     → kernel_host_interface WASI shim
 //!         → trampoline_request(METHOD_SYS_WRITE, [fd|payload])
 //!             → kernel.wasm sys_write on FdEntry::Stdout
 //!                 → Process.stdout_buffer (per-pid)
@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use yurt_runtime_wasmtime::microkernel::{
-    build_kernel_wasm, default_kernel_wasm_path, HostState, Microkernel,
+use yurt_runtime_wasmtime::kernel_host_interface::{
+    build_kernel_wasm, default_kernel_wasm_path, HostState, KernelHostInterface,
 };
 
 fn workspace_root() -> &'static Path {
@@ -72,15 +72,15 @@ fn ensure_kernel_wasm() -> &'static PathBuf {
     })
 }
 
-fn fresh_microkernel() -> Microkernel {
-    Microkernel::load(ensure_kernel_wasm(), HostState::default()).unwrap()
+fn fresh_kernel_host_interface() -> KernelHostInterface {
+    KernelHostInterface::load(ensure_kernel_wasm(), HostState::default()).unwrap()
 }
 
 #[test]
 fn hello_wasm_prints_via_sys_write_through_kernel_wasm() {
     ensure_fixture_built("hello-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("hello-wasm")).unwrap();
-    let mk = fresh_microkernel();
+    let mk = fresh_kernel_host_interface();
     let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
     let _ = user.run_start(); // proc_exit traps; that's fine
 
@@ -95,7 +95,7 @@ fn hello_wasm_prints_via_sys_write_through_kernel_wasm() {
 fn echo_args_fixture_emits_argv_one_per_line() {
     ensure_fixture_built("echo-args-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("echo-args-wasm")).unwrap();
-    let mk = fresh_microkernel();
+    let mk = fresh_kernel_host_interface();
     let argv: Vec<&[u8]> = vec![b"echo-args", b"alpha", b"beta", b"gamma"];
     let mut user = mk.spawn_user_process_with_args(&wasm_bytes, &argv).unwrap();
     let _ = user.run_start();
@@ -111,7 +111,7 @@ fn echo_args_fixture_emits_argv_one_per_line() {
 fn cat_stdin_fixture_echoes_stdin_to_stdout() {
     ensure_fixture_built("cat-stdin-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("cat-stdin-wasm")).unwrap();
-    let mk = fresh_microkernel();
+    let mk = fresh_kernel_host_interface();
     let argv: Vec<&[u8]> = vec![b"cat-stdin"];
     let mut user = mk
         .spawn_user_process_with_args_and_stdin(
@@ -131,7 +131,7 @@ fn cat_stdin_fixture_echoes_stdin_to_stdout() {
 fn wc_bytes_fixture_counts_stdin_bytes() {
     ensure_fixture_built("wc-bytes-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("wc-bytes-wasm")).unwrap();
-    let mk = fresh_microkernel();
+    let mk = fresh_kernel_host_interface();
     let argv: Vec<&[u8]> = vec![b"wc-bytes"];
     let mut user = mk
         .spawn_user_process_with_args_and_stdin(&wasm_bytes, &argv, b"0123456789", true)
@@ -146,7 +146,7 @@ fn wc_bytes_fixture_counts_stdin_bytes() {
 fn true_cmd_fixture_runs_and_proc_exits_zero() {
     ensure_fixture_built("true-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("true-cmd-wasm")).unwrap();
-    let mk = fresh_microkernel();
+    let mk = fresh_kernel_host_interface();
     let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
     let err = user.run_start().unwrap_err();
     let msg = format!("{err:#}");
@@ -164,12 +164,12 @@ fn cat_ramfs_fixture_reads_through_wasi_path_open() {
     //   user wasm  fs::read("/etc/motd")
     //     → wasi-libc fd_prestat_get walk → fd 3 = "/" preopen
     //     → wasi-libc path_open(dirfd=3, "etc/motd", …)
-    //       → microkernel path_open shim → sys_open("/etc/motd")
+    //       → kernel_host_interface path_open shim → sys_open("/etc/motd")
     //         → kernel.wasm sys_open → FdEntry::File at fd 3
     //     → fd_read(fd=3, …) → sys_read → file bytes
     ensure_fixture_built("cat-ramfs-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("cat-ramfs-wasm")).unwrap();
-    let mk = fresh_microkernel();
+    let mk = fresh_kernel_host_interface();
     mk.register_ramfs_file(b"/etc/motd", b"hello ramfs\n")
         .unwrap();
     let argv: Vec<&[u8]> = vec![b"cat-ramfs"];
@@ -184,12 +184,12 @@ fn cat_ramfs_fixture_reads_through_wasi_path_open() {
 
 #[test]
 fn proc_cmdline_fixture_round_trips_argv() {
-    // End-to-end: spawn a real wasm with argv → microkernel pushes
+    // End-to-end: spawn a real wasm with argv → kernel_host_interface pushes
     // argv to kernel via kernel_set_argv → /proc/self/cmdline serves
     // it back NUL-separated → process prints it through fd_write.
     ensure_fixture_built("proc-cmdline-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("proc-cmdline-wasm")).unwrap();
-    let mk = fresh_microkernel();
+    let mk = fresh_kernel_host_interface();
     let argv: Vec<&[u8]> = vec![b"/usr/bin/proc-cmdline", b"--flag", b"value"];
     let mut user = mk.spawn_user_process_with_args(&wasm_bytes, &argv).unwrap();
     let _ = user.run_start();
@@ -205,7 +205,7 @@ fn proc_cmdline_fixture_round_trips_argv() {
 fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     ensure_fixture_built("false-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("false-cmd-wasm")).unwrap();
-    let mk = fresh_microkernel();
+    let mk = fresh_kernel_host_interface();
     let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
     let err = user.run_start().unwrap_err();
     let msg = format!("{err:#}");

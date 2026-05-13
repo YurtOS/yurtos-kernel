@@ -2,7 +2,7 @@
  * Phase 7.2 macro layer — direct tests of the wrapper functions
  * buildWasmKernelImports produces. Each binding is exercised by
  * calling the generated function with the right shape of args
- * and asserting the result equals what Microkernel.syscallAsync
+ * and asserting the result equals what KernelHostInterface.syscallAsync
  * would return on its own. No probe wasm needed; the wrappers
  * are JS functions.
  *
@@ -15,10 +15,10 @@ import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
 import {
   defaultHostState,
+  KernelHostInterface,
   type KvBackend,
   METHOD,
-  Microkernel,
-} from "../../microkernel-js/mod.ts";
+} from "../../kernel-host-interface-js/mod.ts";
 import {
   buildWasmKernelImports,
   HOST_BINDINGS,
@@ -34,8 +34,8 @@ const W = (globalThis as any).WebAssembly;
 const HAS_JSPI = typeof W?.Suspending === "function" &&
   typeof W?.promising === "function";
 
-async function freshMk(): Promise<Microkernel> {
-  return await Microkernel.load(
+async function freshMk(): Promise<KernelHostInterface> {
+  return await KernelHostInterface.load(
     await Deno.readFile(KERNEL_WASM),
     defaultHostState(),
   );
@@ -49,7 +49,7 @@ interface CapturedCall {
 }
 
 function capturingMk(rc = 0, response = new Uint8Array()): {
-  mk: Microkernel;
+  mk: KernelHostInterface;
   calls: CapturedCall[];
 } {
   const calls: CapturedCall[] = [];
@@ -72,7 +72,7 @@ function capturingMk(rc = 0, response = new Uint8Array()): {
       calls.push({ method, callerPid, request: request.slice(), responseCap });
       return Promise.resolve({ rc: BigInt(rc), response });
     },
-  } as unknown as Microkernel;
+  } as unknown as KernelHostInterface;
   return { mk, calls };
 }
 
@@ -375,11 +375,11 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
 
   it("custom builder: host_time returns seconds-as-float from SYS_CLOCK_GETTIME", async () => {
     if (!HAS_JSPI) return;
-    // Build a Microkernel with a pinned now-time so the test is
+    // Build a KernelHostInterface with a pinned now-time so the test is
     // deterministic. defaultHostState() supplies 0 by default;
     // we want a non-zero ns value to confirm the conversion.
     const bytes = await Deno.readFile(KERNEL_WASM);
-    const mk = await Microkernel.load(bytes, {
+    const mk = await KernelHostInterface.load(bytes, {
       ...defaultHostState(),
       nowRealtimeNs: 1_500_000_000n, // 1.5 seconds
     });
@@ -521,7 +521,10 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     if (!HAS_JSPI) return;
     const host = defaultHostState();
     host.kv = new FakeKv();
-    const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+    const mk = await KernelHostInterface.load(
+      await Deno.readFile(KERNEL_WASM),
+      host,
+    );
     const buf = new ArrayBuffer(256);
     const u = new Uint8Array(buf);
     const imports = buildWasmKernelImports(mk, () => buf);

@@ -194,11 +194,11 @@ pub struct Process {
     /// `sys_read` on `FdEntry::Stdin` consumes them. When empty and
     /// `stdin_eof` is set, reads return 0 (EOF); otherwise -EAGAIN.
     pub stdin_buffer: std::collections::VecDeque<u8>,
-    /// Set by the microkernel via `METHOD_KERNEL_STDIN_EOF` once it
+    /// Set by the kernel_host_interface via `METHOD_KERNEL_STDIN_EOF` once it
     /// has no more bytes to feed.
     pub stdin_eof: bool,
     /// Bytes this process has written to stdout (FdEntry::Stdout).
-    /// The microkernel drains this via `METHOD_KERNEL_DRAIN_STDOUT`.
+    /// The kernel_host_interface drains this via `METHOD_KERNEL_DRAIN_STDOUT`.
     pub stdout_buffer: Vec<u8>,
     /// Bytes this process has written to stderr (FdEntry::Stderr).
     pub stderr_buffer: Vec<u8>,
@@ -250,7 +250,7 @@ pub struct Process {
     /// POSIX exit status when the process has terminated; None
     /// while running. Bits 0..=7 carry the exit code, bits 8..=15
     /// carry the signal number when killed (matches Linux
-    /// waitstatus encoding). The microkernel sets this via
+    /// waitstatus encoding). The kernel_host_interface sets this via
     /// `kernel_record_exit`; sys_wait reads it.
     pub exit_status: Option<i32>,
     /// Opaque wasm-instance handle owned by the KH adapter. Kernel
@@ -389,7 +389,7 @@ pub struct Kernel {
     /// storage on HostFs / YURTFS L2.
     metadata_overrides: BTreeMap<(crate::vfs::MountId, u64), crate::vfs::Metadata>,
     /// FIFO of children that sys_spawn has accepted but the host
-    /// hasn't yet instantiated. Microkernel drains via the
+    /// hasn't yet instantiated. KernelHostInterface drains via the
     /// `kernel_drain_spawn` internal method between syscalls and
     /// runs each child synchronously, then calls
     /// `kernel_record_exit`. Necessary because re-entering kernel
@@ -457,7 +457,7 @@ impl Kernel {
         vfs.add_mount(b"/proc".to_vec(), Box::new(crate::vfs::ProcBackend::new()));
         // No auto-mount for HostFs — the right prefix is workload-
         // specific. Embedders that want host-fs access call
-        // `kernel_install_host_fs_mount(prefix)` (or, microkernel-
+        // `kernel_install_host_fs_mount(prefix)` (or, kernel_host_interface-
         // side, `mk.mount_host_fs(prefix)`) and pick where it lives:
         // /host, /users/user, /, whatever fits their sandbox shape.
         Self {

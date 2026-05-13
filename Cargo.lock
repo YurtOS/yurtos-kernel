@@ -3979,6 +3979,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "yurt-kernel-host-interface-core"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "yurt-kernel-host-interface-wasmedge"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "yurt-kernel-host-interface-core",
+]
+
+[[package]]
+name = "yurt-kernel-host-interface-wasmer"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "yurt-kernel-host-interface-core",
+]
+
+[[package]]
 name = "yurt-kernel-wasm"
 version = "0.0.0"
 dependencies = [
@@ -3986,29 +4009,6 @@ dependencies = [
  "tar",
  "toml",
  "zstd",
-]
-
-[[package]]
-name = "yurt-microkernel-core"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "yurt-microkernel-wasmedge"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.18",
- "yurt-microkernel-core",
-]
-
-[[package]]
-name = "yurt-microkernel-wasmer"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.18",
- "yurt-microkernel-core",
 ]
 
 [[package]]
@@ -4038,7 +4038,7 @@ dependencies = [
  "wasmtime-wasi",
  "wat",
  "wiremock",
- "yurt-microkernel-core",
+ "yurt-kernel-host-interface-core",
 ]
 
 [[package]]

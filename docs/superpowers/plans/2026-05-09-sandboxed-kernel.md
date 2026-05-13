@@ -6,7 +6,7 @@ The migration is no longer in the skeleton phase. `packages/kernel-wasm`
 contains an active Rust `kernel.wasm` implementation with syscall dispatch,
 process primitives, fd/pipe handling, VFS layers, proc/dev/hostfs/yurtfs
 mounting, fetch/socket forwarding, durable KV hooks, and host extension
-forwarding. `packages/microkernel-js` and `packages/microkernel-deno` exist, and
+forwarding. `packages/kernel-host-interface-js` and `packages/kernel-host-interface-deno` exist, and
 the native host path still lives in `packages/runtime-wasmtime`.
 
 The TypeScript kernel remains the default and must continue running in parallel
@@ -40,7 +40,7 @@ kernel fd numbers, reserves WASI preopen fd 3, and forwards `fd_tell`,
 syscalls. The Rust kernel now owns `SYS_REALPATH`, and both the Deno
 host-wrapper table and portable JS user-process `yurt.host_realpath` import
 route postlinked Rust `std::fs::canonicalize` through that syscall. Direct JS
-microkernel coverage now runs the checked-in `std-fs-canary.wasm`, and
+kernel-host interface coverage now runs the checked-in `std-fs-canary.wasm`, and
 sandbox-level parity coverage now runs the same std-fs canary through both the
 TS kernel and wasm kernel from a writable cwd. The Sandbox wasm-kernel adapter
 now mirrors each TS loader pid and cwd into the Rust kernel before Rust-owned
@@ -90,14 +90,14 @@ records.
 - Update this plan and the companion design spec whenever implementation status
   changes; stale phase lists are now a migration risk.
 - Keep `packages/runtime-wasmtime` named as-is for now. Any rename to
-  `packages/microkernel-wasmtime` should be a dedicated mechanical PR after
+  `packages/kernel-host-interface-wasmtime` should be a dedicated mechanical PR after
   parity is healthier.
 
 ### Phase B — Adapter Coverage
 
 - Audit `packages/kernel/src/host-imports/kernel-imports.ts` and
   `packages/kernel/src/process/loader.ts` against
-  `packages/microkernel-deno/wasm-kernel-imports.ts`.
+  `packages/kernel-host-interface-deno/wasm-kernel-imports.ts`.
 - Add thin wrapper rows only for Rust syscalls that already exist in `METHOD`
   and `packages/kernel-wasm/src/dispatch.rs`; leave unsupported calls absent so
   link/test failures expose real gaps.
@@ -163,7 +163,7 @@ exist outside wasm-kernel mode.
   count-prefixed process entries with `pid`, `ppid`, `pgid`, `sid`, state, exit
   status, command bytes, and visible fd numbers. Rust, JS, and native wasmtime
   tests cover the record shape.
-- Route microkernel process observability through the Rust export. In JS/Deno
+- Route kernel-host interface process observability through the Rust export. In JS/Deno
   and wasmtime adapters, the host may render the returned snapshot, but it does
   not create the process list. The JS adapter and native wasmtime adapter now
   expose decoded views backed by `kernel_list_processes`; remaining work is to
@@ -178,13 +178,13 @@ exist outside wasm-kernel mode.
   with main-thread initialization, spawned thread records, runnable/blocked/
   exited state, detached status, exit values, and opaque host-thread handles.
   `kernel_list_threads` serializes those records as a binary host-control
-  snapshot, and the JS/native microkernels decode it for embedder
+  snapshot, and the JS/native kernel-host interfaces decode it for embedder
   observability.
 - Expose typed host-control thread lifecycle hooks before binding PR37's
   Worker/SAB backend: `kernel_spawn_thread`, `kernel_block_thread`,
   `kernel_unblock_thread`, `kernel_detach_thread`, and
   `kernel_record_thread_exit` now mutate the Rust kernel's thread table, and
-  the JS/native microkernel wrappers keep the host out of thread-state
+  the JS/native kernel-host interface wrappers keep the host out of thread-state
   ownership.
 - Move nice/priority policy into kernel.wasm. `sys_getpriority`,
   `sys_setpriority`, `sys_sched_getscheduler`, `sys_sched_getparam`,
@@ -240,7 +240,7 @@ open.
   source of truth until wasm mode matches them. The probe test remains, but the
   file now also covers real fixture execution through both kernels.
 - Add Rust-kernel realpath/canonicalize support and route transitional
-  `host_realpath` through it. Direct JS microkernel and Deno wrapper coverage
+  `host_realpath` through it. Direct JS kernel-host interface and Deno wrapper coverage
   now exercise this path. Sandbox wasm-kernel coverage mirrors per-process cwd
   into `kernel.wasm`, and the parity runner now compares `std-fs-canary.wasm`
   against the TS kernel from a writable cwd.
@@ -286,7 +286,7 @@ Focused gates while iterating:
 
 - `cargo test -p yurt-kernel-wasm`
 - `cargo test -p yurt-runtime-wasmtime`
-- `deno test --allow-read --allow-write --allow-run --allow-env --allow-net --no-check packages/microkernel-js/__tests__ packages/microkernel-deno/__tests__`
+- `deno test --allow-read --allow-write --allow-run --allow-env --allow-net --no-check packages/kernel-host-interface-js/__tests__ packages/kernel-host-interface-deno/__tests__`
 - wasm-kernel parity runner once Phase C lands.
 
 Final acceptance is unchanged: the TS kernel can be removed only when the wasm
@@ -296,7 +296,7 @@ kernel passes the full guest-compat matrix without behavioral regressions.
 
 - Keep TS kernel as the default during migration.
 - Keep `packages/runtime-wasmtime` name until a dedicated rename.
-- Keep extensions hosted by the microkernel; `kernel.wasm` forwards bytes.
+- Keep extensions hosted by the kernel-host interface; `kernel.wasm` forwards bytes.
 - Use a format bump for Rust persistence unless compatibility is explicitly
   required.
 - Keep asyncify as the fallback for engines without JSPI.

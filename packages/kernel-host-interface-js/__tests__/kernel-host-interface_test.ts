@@ -1,15 +1,15 @@
 /**
- * JS-microkernel parity tests for the sandboxed-kernel architecture.
+ * JS-kernel-host interface parity tests for the sandboxed-kernel architecture.
  *
- * Tests the portable JS+wasm core in `packages/microkernel-js/`. The
+ * Tests the portable JS+wasm core in `packages/kernel-host-interface-js/`. The
  * code under test runs in any JS engine; Deno is the convenient
  * test driver because it has a stock test runner and WebAssembly
  * ready out of the box. The same code runs unchanged in browsers —
  * the only delta there is the loading path (fetch vs Deno.readFile),
- * which lives in the application layer above the microkernel.
+ * which lives in the application layer above the kernel-host interface.
  *
  * Loads the same `yurt-kernel-wasm` artifact the Rust tests build and
- * exercises the trampoline through the JS microkernel. Mirrors the
+ * exercises the trampoline through the JS kernel-host interface. Mirrors the
  * Rust integration tests in `packages/runtime-wasmtime/tests/` —
  * every architectural assertion that runs there should run here, on
  * the same kernel.wasm.
@@ -20,9 +20,9 @@ import {
   defaultHostState,
   denyAllPolicy,
   type ExtensionRegistry,
+  KernelHostInterface,
   type LogSink,
   METHOD,
-  Microkernel,
   s,
   type UserProcess,
 } from "../mod.ts";
@@ -67,8 +67,8 @@ async function kernelWasm(): Promise<Uint8Array> {
   }
 }
 
-async function freshMicrokernel(): Promise<Microkernel> {
-  return await Microkernel.load(await kernelWasm(), defaultHostState());
+async function freshKernelHostInterface(): Promise<KernelHostInterface> {
+  return await KernelHostInterface.load(await kernelWasm(), defaultHostState());
 }
 
 function encodeSysSpawnRequest(
@@ -94,7 +94,7 @@ function encodeSysSpawnRequest(
 }
 
 function spawnFromRamfs(
-  mk: Microkernel,
+  mk: KernelHostInterface,
   parentPid: number,
   path: Uint8Array,
   argv: Uint8Array[],
@@ -195,12 +195,12 @@ function captureProcExit(user: UserProcess): { error?: Error } {
 // ── Kernel-side trampoline tests ──────────────────────────────────────────
 
 Deno.test("unknown method returns -ENOSYS through the trampoline", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const { rc } = mk.syscall(0xDEAD_BEEF, new Uint8Array(0), 0);
   assertEquals(rc, -38n);
 });
 
-Deno.test("microkernel binds wasm-engine kh imports", async () => {
+Deno.test("kernel-host interface binds wasm-engine kh imports", async () => {
   const fakeKernel = await wat2wasm(`
     (module
       (import "kh" "kh_spawn_process"
@@ -236,7 +236,7 @@ Deno.test("microkernel binds wasm-engine kh imports", async () => {
                 (i32.const 0) (i32.const 0)))
             (call $resume (i32.const 0) (i64.const 0) (i64.const 1000000))))))
   `);
-  const mk = await Microkernel.load(fakeKernel, defaultHostState());
+  const mk = await KernelHostInterface.load(fakeKernel, defaultHostState());
   const { rc } = mk.syscall(0, new Uint8Array(0), 0);
   assertEquals(rc, -67n);
 });
@@ -296,7 +296,7 @@ Deno.test("kh_spawn_process manages cached wasm instance handles", async () => {
         (drop (call $destroy (local.get $handle)))
         (i64.const 2)))
   `);
-  const mk = await Microkernel.load(fakeKernel, defaultHostState());
+  const mk = await KernelHostInterface.load(fakeKernel, defaultHostState());
   mk.cacheProcessModule(s("mem-proc"), processWasm);
   const { rc, response } = mk.syscall(0, new Uint8Array(0), 2);
   assertEquals(rc, 2n);
@@ -310,7 +310,7 @@ Deno.test("kernel_spawn_process allocates pid through kernel and kh adapter", as
       (memory (export "memory") 1)
       (func (export "run") (result i32) (call $getpid)))
   `);
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   mk.cacheProcessModule(s("kernel-owned-process"), processWasm);
 
   const user = mk.spawnCachedUserProcess(
@@ -332,7 +332,7 @@ Deno.test("kernel_spawn_process allocates pid through kernel and kh adapter", as
 });
 
 Deno.test("memory-mediated request/response round-trips bytes", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const request = new TextEncoder().encode("trampoline-validates-arch");
   const { rc, response } = mk.syscall(
     METHOD.KERNEL_ECHO,
@@ -344,7 +344,7 @@ Deno.test("memory-mediated request/response round-trips bytes", async () => {
 });
 
 Deno.test("kh_now_realtime serves host clock", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   mk.hostStateMut().nowRealtimeNs = 1_715_000_000_000_000_000n;
   const { rc, response } = mk.syscall(
     METHOD.KERNEL_NOW_REALTIME,
@@ -365,7 +365,7 @@ Deno.test("kh_log routes kernel messages to the configured LogSink", async () =>
       collected.push({ severity, message });
     },
   };
-  const mk = await Microkernel.load(await kernelWasm(), {
+  const mk = await KernelHostInterface.load(await kernelWasm(), {
     ...defaultHostState(),
     logSink: sink,
   });
@@ -386,7 +386,7 @@ Deno.test("sys_extension_invoke forwards bytes through the registry", async () =
       );
     },
   };
-  const mk = await Microkernel.load(await kernelWasm(), {
+  const mk = await KernelHostInterface.load(await kernelWasm(), {
     ...defaultHostState(),
     extensions: registry,
   });
@@ -409,7 +409,7 @@ Deno.test(
     // Mirror of fixture_parity / kernel_wasm_trampoline equivalents on
     // the wasmtime side. Each direct .syscall() call passes KERNEL_PID
     // (0) as the caller, so we use an explicit non-zero target pid.
-    const mk = await freshMicrokernel();
+    const mk = await freshKernelHostInterface();
 
     const targetPid = 42;
     const target = new Uint8Array(4);
@@ -440,7 +440,7 @@ Deno.test(
 Deno.test(
   "signal stubs (kill + sigaction) round-trip through the trampoline",
   async () => {
-    const mk = await freshMicrokernel();
+    const mk = await freshKernelHostInterface();
 
     // sigaction(SIGTERM=15, SIG_IGN=1) → previous SIG_DFL=0.
     const sa1 = new Uint8Array(8);
@@ -481,7 +481,7 @@ Deno.test(
 Deno.test(
   "sched_yield + nanosleep round-trip through the trampoline",
   async () => {
-    const mk = await freshMicrokernel();
+    const mk = await freshKernelHostInterface();
     let { rc } = mk.syscall(METHOD.SYS_SCHED_YIELD, new Uint8Array(0), 0);
     assertEquals(Number(rc), 0);
 
@@ -499,7 +499,7 @@ Deno.test(
 Deno.test(
   "ramfs register_file + sys_open + sys_read round-trip content",
   async () => {
-    const mk = await freshMicrokernel();
+    const mk = await freshKernelHostInterface();
     const enc = new TextEncoder();
     mk.registerRamfsFile(enc.encode("/etc/motd"), enc.encode("hello ramfs\n"));
 
@@ -550,7 +550,7 @@ Deno.test(
         return new TextEncoder().encode("ok");
       },
     };
-    const mk = await Microkernel.load(await kernelWasm(), {
+    const mk = await KernelHostInterface.load(await kernelWasm(), {
       ...defaultHostState(),
       extensions: registry,
       policy: {
@@ -580,7 +580,7 @@ Deno.test(
 Deno.test(
   "denyAllPolicy blocks kh_now_realtime → sys_clock_gettime",
   async () => {
-    const mk = await Microkernel.load(await kernelWasm(), {
+    const mk = await KernelHostInterface.load(await kernelWasm(), {
       ...defaultHostState(),
       policy: denyAllPolicy,
     });
@@ -595,14 +595,14 @@ Deno.test(
   },
 );
 
-Deno.test("microkernel direct syscalls use kernel pid 0", async () => {
-  const mk = await freshMicrokernel();
+Deno.test("kernel-host interface direct syscalls use kernel pid 0", async () => {
+  const mk = await freshKernelHostInterface();
   const { rc } = mk.syscall(METHOD.SYS_GETPID, new Uint8Array(0), 0);
   assertEquals(rc, 0n);
 });
 
 Deno.test("listProcesses reads the kernel-owned process snapshot", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const childPid = spawnFromRamfs(mk, 1, s("/bin/wc"), [s("/bin/wc")]);
 
   mk.recordExit(childPid, 2);
@@ -620,7 +620,7 @@ Deno.test("listProcesses reads the kernel-owned process snapshot", async () => {
 });
 
 Deno.test("listThreads reads the kernel-owned thread snapshot", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
 
   const threads = mk.listThreads(childPid);
@@ -634,7 +634,7 @@ Deno.test("listThreads reads the kernel-owned thread snapshot", async () => {
 });
 
 Deno.test("thread lifecycle controls mutate the kernel-owned thread snapshot", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
 
   const tid = mk.spawnThread(childPid, 91);
@@ -676,7 +676,7 @@ Deno.test("thread lifecycle controls mutate the kernel-owned thread snapshot", a
 });
 
 Deno.test("scheduleNext reads kernel-owned runnable decisions with budgets", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
   const tid = mk.spawnThread(childPid, 91);
   mk.recordThreadExit(1, 1, 0);
@@ -702,7 +702,7 @@ Deno.test("scheduleNext reads kernel-owned runnable decisions with budgets", asy
 });
 
 Deno.test("kernel snapshot returns a versioned binary state envelope", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
   const tid = mk.spawnThread(childPid, 91);
   mk.blockThread(childPid, tid);
@@ -779,7 +779,7 @@ Deno.test("kernel snapshot returns a versioned binary state envelope", async () 
 });
 
 Deno.test("waitProcess and killProcess enter kernel-owned process control", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const childPid = spawnFromRamfs(mk, 1, s("/bin/child"), [s("child")]);
 
   mk.recordExit(childPid, 17);
@@ -790,7 +790,7 @@ Deno.test("waitProcess and killProcess enter kernel-owned process control", asyn
 });
 
 Deno.test("drainPendingSpawn and recordExit use typed kernel lifecycle exports", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const wasmBody = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 9, 9, 9]);
   mk.registerRamfsFile(s("/bin/echo"), wasmBody);
 
@@ -823,7 +823,7 @@ Deno.test("drainPendingSpawn and recordExit use typed kernel lifecycle exports",
 // ── User-process tests via inline WAT (require wabt) ─────────────────────
 
 Deno.test("user process calls sys_getuid through the full trampoline", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const userWasm = await wat2wasm(`
     (module
       (import "env" "sys_getuid" (func $getuid (result i32)))
@@ -834,7 +834,7 @@ Deno.test("user process calls sys_getuid through the full trampoline", async () 
 });
 
 Deno.test("each spawned process gets a unique pid", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const userWasm = await wat2wasm(`
     (module
       (import "env" "sys_getpid" (func $getpid (result i32)))
@@ -856,7 +856,7 @@ Deno.test("each spawned process gets a unique pid", async () => {
 });
 
 Deno.test("user process pipe round-trip within one process", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const userWasm = await wat2wasm(`
     (module
       (import "env" "sys_pipe"  (func $pipe  (param i32) (result i32)))
@@ -879,7 +879,7 @@ Deno.test("user process pipe round-trip within one process", async () => {
 });
 
 Deno.test("user process priority imports route through kernel scheduler state", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const userWasm = await wat2wasm(`
     (module
       (import "yurt" "host_getpriority"
@@ -903,7 +903,7 @@ Deno.test("user process priority imports route through kernel scheduler state", 
 });
 
 Deno.test("user process scheduler imports route through kernel scheduler state", async () => {
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const userWasm = await wat2wasm(`
     (module
       (import "yurt" "host_sched_getscheduler"
@@ -942,7 +942,7 @@ Deno.test("user process scheduler imports route through kernel scheduler state",
 
 Deno.test("hello-wasm prints via sys_write through kernel.wasm", async () => {
   const wasm = await fixtureWasm("hello-wasm", "hello-wasm");
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const user = mk.spawnUserProcess(wasm);
   captureProcExit(user); // proc_exit traps; that's expected
   const stdout = new TextDecoder().decode(user.capturedStdout());
@@ -951,7 +951,7 @@ Deno.test("hello-wasm prints via sys_write through kernel.wasm", async () => {
 
 Deno.test("echo-args fixture emits argv one per line", async () => {
   const wasm = await fixtureWasm("echo-args-wasm", "echo-args-wasm");
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const user = mk.spawnUserProcessWithArgs(wasm, [
     s("echo-args"),
     s("alpha"),
@@ -967,7 +967,7 @@ Deno.test(
   "cat-ramfs fixture reads /etc/motd via WASI path_open + sys_open",
   async () => {
     const wasm = await fixtureWasm("cat-ramfs-wasm", "cat-ramfs-wasm");
-    const mk = await freshMicrokernel();
+    const mk = await freshKernelHostInterface();
     mk.registerRamfsFile(s("/etc/motd"), s("hello ramfs\n"));
     const user = mk.spawnUserProcessWithArgs(wasm, [s("cat-ramfs")]);
     captureProcExit(user);
@@ -979,7 +979,7 @@ Deno.test(
   "proc-cmdline fixture reads /proc/self/cmdline through the WASI shim",
   async () => {
     const wasm = await fixtureWasm("proc-cmdline-wasm", "proc-cmdline-wasm");
-    const mk = await freshMicrokernel();
+    const mk = await freshKernelHostInterface();
     const argv = [
       s("/usr/bin/proc-cmdline"),
       s("--flag"),
@@ -996,7 +996,7 @@ Deno.test(
 
 Deno.test("cat-stdin fixture echoes stdin to stdout", async () => {
   const wasm = await fixtureWasm("cat-stdin-wasm", "cat-stdin-wasm");
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const user = mk.spawnUserProcessWithArgsAndStdin(
     wasm,
     [s("cat-stdin")],
@@ -1012,7 +1012,7 @@ Deno.test("cat-stdin fixture echoes stdin to stdout", async () => {
 
 Deno.test("wc-bytes fixture counts stdin bytes", async () => {
   const wasm = await fixtureWasm("wc-bytes-wasm", "wc-bytes-wasm");
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const user = mk.spawnUserProcessWithArgsAndStdin(
     wasm,
     [s("wc-bytes")],
@@ -1026,7 +1026,7 @@ Deno.test("wc-bytes fixture counts stdin bytes", async () => {
 Deno.test("std-fs fixture creates, stats, reads, and unlinks a file", async () => {
   const wasm = await optionalGeneratedFixtureWasm("std-fs-canary.wasm");
   if (!wasm) return;
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const user = mk.spawnUserProcessWithArgs(wasm, [s("std-fs-canary")]);
   captureProcExit(user);
   assertEquals(
@@ -1037,7 +1037,7 @@ Deno.test("std-fs fixture creates, stats, reads, and unlinks a file", async () =
 
 Deno.test("true-cmd fixture proc_exits zero", async () => {
   const wasm = await fixtureWasm("true-cmd-wasm", "true-cmd-wasm");
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const user = mk.spawnUserProcess(wasm);
   const { error } = captureProcExit(user);
   if (!error) throw new Error("expected proc_exit trap");
@@ -1048,7 +1048,7 @@ Deno.test("true-cmd fixture proc_exits zero", async () => {
 
 Deno.test("false-cmd fixture proc_exits non-zero", async () => {
   const wasm = await fixtureWasm("false-cmd-wasm", "false-cmd-wasm");
-  const mk = await freshMicrokernel();
+  const mk = await freshKernelHostInterface();
   const user = mk.spawnUserProcess(wasm);
   const { error } = captureProcExit(user);
   if (!error) throw new Error("expected proc_exit trap");

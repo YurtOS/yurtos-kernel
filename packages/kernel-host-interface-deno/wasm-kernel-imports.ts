@@ -1,7 +1,7 @@
 /**
  * Phase 7.2 macro layer: factory that builds the legacy
  * TS-kernel-shaped `host_*` import object from the Rust
- * kernel.wasm via microkernel-deno's Microkernel. Hand-writing
+ * kernel.wasm via kernel-host-interface-deno's KernelHostInterface. Hand-writing
  * each of the ~60 host_* wrappers would be a lot of code; this
  * module instead reads a small declarative table (HOST_BINDINGS)
  * and generates the wrapper functions.
@@ -19,7 +19,7 @@
  *                   bytes-written
  *
  * Bindings are async by construction — every wrapper returns
- * Promise<number> because the underlying Microkernel.syscallAsync
+ * Promise<number> because the underlying KernelHostInterface.syscallAsync
  * is async (JSPI / asyncify). The legacy TS Sandbox's
  * `WebAssembly.Suspending` wrap of host_* imports already
  * accepts Promise-returning functions.
@@ -29,7 +29,10 @@
  * methods land on the Rust side, more rows go here.
  */
 
-import { METHOD, type Microkernel } from "../microkernel-js/mod.ts";
+import {
+  type KernelHostInterface,
+  METHOD,
+} from "../kernel-host-interface-js/mod.ts";
 
 const EFAULT = 14;
 
@@ -79,7 +82,7 @@ export type ArgSpec =
  * uses the builder's returned function directly.
  */
 export type CustomBuilder = (
-  mk: Microkernel,
+  mk: KernelHostInterface,
   memBuf: () => ArrayBuffer,
   callerPid: number,
 ) => (...args: number[]) => Promise<number>;
@@ -669,7 +672,7 @@ export const HOST_BINDINGS: HostBinding[] = [
 
 /**
  * Build the host_*-shaped import object that drives the Rust
- * kernel via the supplied Microkernel. Each entry in
+ * kernel via the supplied KernelHostInterface. Each entry in
  * HOST_BINDINGS is materialized as one Promise-returning
  * wrapper. Imports not in the table are *absent* — callers
  * should fill any required gaps with their own stubs (or
@@ -679,7 +682,7 @@ export const HOST_BINDINGS: HostBinding[] = [
  * call time (it's set after instantiation).
  */
 export function buildWasmKernelImports(
-  mk: Microkernel,
+  mk: KernelHostInterface,
   memBuf: () => ArrayBuffer,
   callerPid = 0,
   initialCwd?: string,
@@ -733,7 +736,7 @@ function copyOut(
 
 function makeWrapper(
   b: HostBinding,
-  mk: Microkernel,
+  mk: KernelHostInterface,
   memBuf: () => ArrayBuffer,
   callerPid: number,
 ): (...args: number[]) => Promise<number> {

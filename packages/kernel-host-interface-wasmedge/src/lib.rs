@@ -1,7 +1,7 @@
-//! WasmEdge-backed microkernel — **stub impl**.
+//! WasmEdge-backed kernel-host interface — **stub impl**.
 //!
-//! Validates the [`yurt_microkernel_core::WasmEngine`] +
-//! [`yurt_microkernel_core::HostCallCtx`] trait surface against a
+//! Validates the [`yurt_kernel_host_interface_core::WasmEngine`] +
+//! [`yurt_kernel_host_interface_core::HostCallCtx`] trait surface against a
 //! second engine without yet pulling the `wasmedge-sdk` dependency.
 //! Every method bodies-out to `todo!()` with a comment naming the
 //! corresponding wasmedge-sdk API. The crate compiling cleanly is
@@ -32,13 +32,13 @@
 //! - Caller-side state: WasmEdge passes `&CallingFrame` to import
 //!   functions; that's the analog of `wasmtime::Caller`. Wrap it in
 //!   `WasmEdgeCtx<'_>` so the shared trampoline helpers in
-//!   `yurt_microkernel_core` work unchanged.
+//!   `yurt_kernel_host_interface_core` work unchanged.
 //! - Wire `kh_thread_spawn` (new) to wasi-threads' thread-spawn
 //!   callback so user processes can spawn POSIX-shaped threads.
 //!   This is the slice that needs `Tid`/`Thread` plumbing in
 //!   kernel.wasm.
 
-use yurt_microkernel_core::{
+use yurt_kernel_host_interface_core::{
     CompiledModule, EngineError, HasCallerPid, HostCallCtx, KernelDispatchOutcome, WasmEngine,
 };
 
@@ -71,7 +71,7 @@ impl WasmEngine for WasmEdgeEngine {
 }
 
 /// Per-process state threaded through every wasmedge import callback.
-/// Mirrors [`crate::microkernel::UserState`] in microkernel-wasmtime
+/// Mirrors [`crate::kernel_host_interface::UserState`] in kernel-host-interface-wasmtime
 /// shape — distinct concrete type because the kernel handle (the
 /// reference to the wasmedge `Vm` hosting kernel.wasm) is engine-
 /// specific.
@@ -91,7 +91,7 @@ impl HasCallerPid for WasmEdgeUserState {
 
 /// Adapter that wraps WasmEdge's `&CallingFrame` (or the SDK
 /// equivalent) and impls [`HostCallCtx<WasmEdgeUserState>`]. The
-/// shared trampoline helpers in `yurt_microkernel_core` use this —
+/// shared trampoline helpers in `yurt_kernel_host_interface_core` use this —
 /// no changes to those when we wire the real impl.
 pub struct WasmEdgeCtx<'a> {
     // Real impl: `frame: &'a wasmedge_sdk::CallingFrame`
@@ -154,7 +154,7 @@ mod tests {
 
     /// Architectural test: the stub crate compiles and the trait
     /// types match. If this crate ever fails to typecheck, a recent
-    /// change to `microkernel-core` leaked engine-specific
+    /// change to `kernel-host-interface-core` leaked engine-specific
     /// assumptions into the trait — fix the trait, not the engine.
     #[test]
     fn stub_satisfies_trait_shape() {

@@ -14,8 +14,8 @@ import {
   defaultHostState,
   type HostFsImpl,
   type HostFsStat,
+  KernelHostInterface,
   METHOD,
-  Microkernel,
 } from "../mod.ts";
 
 const KERNEL_WASM = new URL(
@@ -114,7 +114,10 @@ describe("JSPI / kh_real_*", () => {
     );
     const host = defaultHostState();
     host.hostFs = fs;
-    const mk = await Microkernel.load(await Deno.readFile(KERNEL_WASM), host);
+    const mk = await KernelHostInterface.load(
+      await Deno.readFile(KERNEL_WASM),
+      host,
+    );
     // Mount the host fs at /host, exactly as wasmtime tests do.
     const mountReq = new TextEncoder().encode("/host");
     // METHOD_KERNEL_INSTALL_HOST_FS_MOUNT in the toml is id 11.

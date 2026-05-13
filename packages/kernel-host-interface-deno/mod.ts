@@ -1,5 +1,5 @@
 /**
- * Sandboxed-kernel microkernel — Deno-specific extensions.
+ * Sandboxed-kernel kernel-host interface — Deno-specific extensions.
  *
  * This package is for capabilities only Deno (and Node) can provide
  * natively:
@@ -8,13 +8,13 @@
  *   - subprocess invocation (`Deno.Command`)
  *   - terminal / TTY integration
  *
- * The portable JS+wasm core lives in `packages/microkernel-js/` and
- * is what browsers use directly — there is no `microkernel-browser`,
+ * The portable JS+wasm core lives in `packages/kernel-host-interface-js/` and
+ * is what browsers use directly — there is no browser kernel-host-interface package,
  * because browsers and Deno share the JS engine, WebAssembly, fetch,
  * crypto, IndexedDB, and WebSocket. Anything genuinely browser-only
  * (Service-Worker fetch routing into a sandbox, OPFS persistence,
  * postMessage glue to a host page) belongs in the application layer
- * above the microkernel, not as a parallel microkernel.
+ * above the kernel-host interface, not as a parallel kernel-host-interface package.
  *
  * Today this file is a thin re-export — every existing fixture parity
  * test runs through the portable core. Deno-only extensions land here
@@ -31,21 +31,21 @@ export {
   InMemoryHostFs,
   InMemoryKv,
   KERNEL_PID,
+  KernelHostInterface,
   KernelInstance,
   type KvBackend,
   type LogSink,
   METHOD,
-  Microkernel,
   s,
   type TcpSocketImpl,
   UserProcess,
-} from "../microkernel-js/mod.ts";
+} from "../kernel-host-interface-js/mod.ts";
 
 import type {
   HostFsImpl,
   HostFsStat,
   TcpSocketImpl,
-} from "../microkernel-js/mod.ts";
+} from "../kernel-host-interface-js/mod.ts";
 
 const ENOENT = 2;
 const EBADF = 9;
@@ -239,11 +239,11 @@ function mapErrno(e: unknown): number {
 /**
  * Deno-backed implementation of `HostState.fetch`. The Deno
  * impl is identical to the universal `globalFetch` in
- * microkernel-js (both wrap `globalThis.fetch`), so this is
+ * kernel-host-interface-js (both wrap `globalThis.fetch`), so this is
  * just a re-export under the Deno-named alias for embedder
  * ergonomics. Embedders writing portable JS can use either name.
  */
-export { globalFetch as denoFetch } from "../microkernel-js/mod.ts";
+export { globalFetch as denoFetch } from "../kernel-host-interface-js/mod.ts";
 
 /**
  * Deno-backed [`TcpSocketImpl`]. Deno connect/read/write/accept are

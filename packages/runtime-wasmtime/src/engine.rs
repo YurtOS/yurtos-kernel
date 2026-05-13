@@ -1,21 +1,21 @@
-//! [`yurt_microkernel_core::WasmEngine`] impl backed by `wasmtime`.
+//! [`yurt_kernel_host_interface_core::WasmEngine`] impl backed by `wasmtime`.
 //!
 //! Phase 5 surface is intentionally narrow — just `compile`. The
-//! existing `microkernel.rs` still talks to `wasmtime::*` types
+//! existing `kernel_host_interface.rs` still talks to `wasmtime::*` types
 //! directly; the next refactor slice will route those calls through
 //! the trait so a second engine (WasmEdge or wasmer) can be dropped
 //! in by adding a sibling impl.
 //!
 //! Cross-references:
-//!   - `packages/microkernel-core/src/lib.rs` — the trait definition
+//!   - `packages/kernel-host-interface-core/src/lib.rs` — the trait definition
 //!   - project memory `project_pluggable_wasm_runtime.md` — design
 //!     direction the user flagged on 2026-05-10
 
-use yurt_microkernel_core::{
+use yurt_kernel_host_interface_core::{
     CompiledModule, EngineError, HostCallCtx, KernelDispatchOutcome, WasmEngine,
 };
 
-use crate::microkernel::UserState;
+use crate::kernel_host_interface::UserState;
 use wasmtime::Caller;
 
 /// Wraps a `wasmtime::Caller` plus its inferred user-process memory
@@ -104,7 +104,7 @@ impl<'a, 'b> HostCallCtx<UserState> for WasmtimeCtx<'a, 'b> {
                 .is_err()
         {
             return KernelDispatchOutcome {
-                rc: -(crate::microkernel::EFAULT_PUB),
+                rc: -(crate::kernel_host_interface::EFAULT_PUB),
                 response: Vec::new(),
             };
         }
@@ -115,7 +115,7 @@ impl<'a, 'b> HostCallCtx<UserState> for WasmtimeCtx<'a, 'b> {
             Ok(rc) => rc,
             Err(_) => {
                 return KernelDispatchOutcome {
-                    rc: -(crate::microkernel::EFAULT_PUB),
+                    rc: -(crate::kernel_host_interface::EFAULT_PUB),
                     response: Vec::new(),
                 };
             }
@@ -134,7 +134,7 @@ impl<'a, 'b> HostCallCtx<UserState> for WasmtimeCtx<'a, 'b> {
                 .is_err()
         {
             return KernelDispatchOutcome {
-                rc: -(crate::microkernel::EFAULT_PUB),
+                rc: -(crate::kernel_host_interface::EFAULT_PUB),
                 response: Vec::new(),
             };
         }

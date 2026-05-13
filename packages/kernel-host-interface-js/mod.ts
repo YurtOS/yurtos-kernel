@@ -1,10 +1,10 @@
 /**
- * Sandboxed-kernel microkernel — portable JS / WebAssembly core.
+ * Sandboxed-kernel kernel-host interface — portable JS / WebAssembly core.
  *
  * Runs unchanged in every JS engine: Deno, browsers (with JSPI or
  * asyncify when blocking syscalls land), Node, Bun. Browsers and
  * Deno share enough — WebAssembly, fetch, crypto, IndexedDB,
- * WebSocket — that there's no separate `microkernel-browser`. They
+ * WebSocket — that there's no separate browser kernel-host-interface package. They
  * use *this* package directly.
  *
  * No host-specific APIs (no `Deno.*`, no `fs`, no `Worker`); only
@@ -17,13 +17,13 @@
  * Where engines actually differ:
  *   - **Real TCP sockets, real filesystem, real subprocess.** Only
  *     Deno (and Node) have these natively. They live in
- *     `packages/microkernel-deno/` as a thin extension consumed on
+ *     `packages/kernel-host-interface-deno/` as a thin extension consumed on
  *     top of this core.
  *   - **Service-Worker fetch routing, OPFS, IndexedDB persistence,**
  *     **postMessage to a host page.** Those are browser-page concerns
- *     above the microkernel — they live in the application layer
+ *     above the kernel-host interface — they live in the application layer
  *     (e.g. PR15's `sandbox.net` / `ListenerRegistry`), not as a
- *     parallel microkernel package.
+ *     parallel kernel-host-interface package.
  *
  * User-process syscall plumbing lives in two sibling files inside
  * this package:
@@ -35,7 +35,7 @@
  * Async / suspension story (future):
  *   The TS kernel ships `AsyncBridge` at
  *   `packages/kernel/src/async-bridge.ts` with jspi / asyncify /
- *   threads modes. When this microkernel grows blocking syscalls or
+ *   threads modes. When this kernel-host interface grows blocking syscalls or
  *   a scheduler with multiple concurrent processes, the sys_*
  *   wrappers in `sys_shim.ts` become `bridge.wrapImport(asyncFn)` and
  *   `kernel_dispatch` is wrapped with `bridge.wrapExport(...)`. Every
@@ -253,7 +253,7 @@ export type PolicyDecision = "allow" | "deny";
  * Embedder-supplied gate that sits at every `kh_*` crossing where
  * kernel.wasm is about to reach the outside world. Mirrors the
  * Rust-side `PolicyEnforcer` trait exactly so the same harness can
- * gate either microkernel backend.
+ * gate either kernel-host interface backend.
  *
  * Defaults to Allow on every hook so embedders that don't care
  * about policy don't have to implement it. Embedders that do care
@@ -285,7 +285,7 @@ export interface PolicyEnforcer {
 /**
  * Pluggable host filesystem. Mirrors the Rust `HostFsImpl` trait
  * — every kh_real_* import goes through this interface when
- * `HostState.hostFs` is set. Browser microkernels back this with
+ * `HostState.hostFs` is set. Browser kernel-host interfaces back this with
  * OPFS, Deno embedders with Deno.openSync, etc.
  */
 export interface HostFsImpl {
@@ -328,7 +328,7 @@ export interface HostFsStat {
 
 /**
  * Pluggable durable KV. Mirrors the Rust `KvBackend` trait. Browser
- * microkernels back this with IndexedDB; native deployments with
+ * kernel-host interfaces back this with IndexedDB; native deployments with
  * redb / sled / rocksdb / SQLite.
  */
 export interface KvBackend {
@@ -356,7 +356,7 @@ export interface KvBackend {
 
 /**
  * Pluggable outbound TCP backend. Mirrors the Rust `TcpSocketImpl`
- * trait. Browser microkernels relay through WebSocket / Service
+ * trait. Browser kernel-host interfaces relay through WebSocket / Service
  * Worker; Deno wraps Deno.connect / Deno.listen.
  */
 export interface TcpSocketImpl {
@@ -402,7 +402,7 @@ export interface HostState {
    * ignored and `kh_fetch_blocking` returns -ENOSYS.
    *
    * The function takes yurt_fetch_request_v1 bytes and returns
-   * yurt_fetch_response_v1 bytes. Browser microkernels wrap
+   * yurt_fetch_response_v1 bytes. Browser kernel-host interfaces wrap
    * `globalThis.fetch`; Deno embedders wrap `globalThis.fetch` too
    * (it's in the platform).
    */
@@ -550,7 +550,7 @@ class DiscardLogSink implements LogSink {
 
 /**
  * Map-backed [`HostFsImpl`]. Useful for tests and for browser
- * microkernels that haven't wired up OPFS yet.
+ * kernel-host interfaces that haven't wired up OPFS yet.
  */
 export class InMemoryHostFs implements HostFsImpl {
   private files = new Map<string, Uint8Array>();
@@ -1830,9 +1830,9 @@ export class UserProcess {
   }
 }
 
-// ── Microkernel ───────────────────────────────────────────────────────────
+// ── KernelHostInterface ───────────────────────────────────────────────────────────
 
-export class Microkernel {
+export class KernelHostInterface {
   private kernel: KernelInstance;
   private hostState: HostState;
   private processEngine: CachedProcessEngine;
@@ -1851,7 +1851,7 @@ export class Microkernel {
   static async load(
     kernelWasmBytes: Uint8Array,
     hostState: HostState = defaultHostState(),
-  ): Promise<Microkernel> {
+  ): Promise<KernelHostInterface> {
     const memoryRef: { memory?: WebAssembly.Memory } = {};
     const hostBox = { state: hostState };
     const kernelRef: { kernel?: KernelInstance } = {};
@@ -1884,10 +1884,10 @@ export class Microkernel {
         hostBox.state.logSink.emit(severity, message);
         return 0;
       },
-      // Real-disk imports. Phase 5 in microkernel-js: stubs that
+      // Real-disk imports. Phase 5 in kernel-host-interface-js: stubs that
       // return -EACCES until the host-fs bridge is wired (Deno
       // can serve these via Deno.openSync; browsers via OPFS).
-      // Same shape as the Rust microkernel-wasmtime impl.
+      // Same shape as the Rust kernel-host-interface-wasmtime impl.
       // Pluggable kh_real_*. When HostState.hostFs is set, delegate
       // through the trait-equivalent interface; otherwise -EACCES.
       // Default kept restrictive so embedders that forget to wire
@@ -2014,7 +2014,7 @@ export class Microkernel {
         _outCap: number,
       ): bigint => BigInt(-38), // -ENOSYS
       // Pluggable TCP socket surface. When HostState.tcp is set,
-      // delegate; otherwise -EACCES. Browser microkernels install
+      // delegate; otherwise -EACCES. Browser kernel-host interfaces install
       // a WebSocket-relay impl; Deno wires Deno.connect/listen.
       kh_socket_connect: (
         addrPtr: number,
@@ -2113,7 +2113,7 @@ export class Microkernel {
         new Uint8Array(memoryRef.memory!.buffer, outPtr, need).set(buf);
         return BigInt(need);
       },
-      // Durable KV (IndexedDB-shaped). Browser microkernels back
+      // Durable KV (IndexedDB-shaped). Browser kernel-host interfaces back
       // this with IndexedDB; Deno with redb-shaped storage; stub
       // returns -EACCES so kernel.wasm callers see the policy
       // shape consistently.
@@ -2857,7 +2857,7 @@ export class Microkernel {
     );
     kernelRef.kernel = kernel;
     hostBox.state = hostState;
-    const mk = new Microkernel(kernel, hostState, processEngine);
+    const mk = new KernelHostInterface(kernel, hostState, processEngine);
     (mk as unknown as { hostBox: typeof hostBox }).hostBox = hostBox;
     return mk;
   }
