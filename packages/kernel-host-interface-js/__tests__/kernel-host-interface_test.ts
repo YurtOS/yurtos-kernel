@@ -878,6 +878,52 @@ Deno.test("user process pipe round-trip within one process", async () => {
   assertEquals(new TextDecoder().decode(got), "hello pipe");
 });
 
+Deno.test("user process poll reports pipe write readiness", async () => {
+  const mk = await freshKernelHostInterface();
+  const userWasm = await wat2wasm(`
+    (module
+      (import "env" "sys_pipe" (func $pipe (param i32) (result i32)))
+      (import "env" "sys_poll" (func $poll (param i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "setup") (result i32)
+        (call $pipe (i32.const 16)))
+      (func (export "poll_writer") (result i32)
+        (i32.store (i32.const 32) (i32.load (i32.const 20)))
+        (i32.store16 (i32.const 36) (i32.const 2))
+        (i32.store16 (i32.const 38) (i32.const 0))
+        (call $poll (i32.const 32) (i32.const 1) (i32.const 0)))
+      (func (export "writer_revents") (result i32)
+        (i32.load16_u (i32.const 38))))
+  `);
+  const user = mk.spawnUserProcess(userWasm);
+  assertEquals(user.callExportI32("setup"), 0);
+  assertEquals(user.callExportI32("poll_writer"), 1);
+  assertEquals(user.callExportI32("writer_revents"), 2);
+});
+
+Deno.test("legacy yurt host_poll routes to kernel poll", async () => {
+  const mk = await freshKernelHostInterface();
+  const userWasm = await wat2wasm(`
+    (module
+      (import "env" "sys_pipe" (func $pipe (param i32) (result i32)))
+      (import "yurt" "host_poll" (func $poll (param i32 i32 i32) (result i32)))
+      (memory (export "memory") 1)
+      (func (export "setup") (result i32)
+        (call $pipe (i32.const 16)))
+      (func (export "poll_writer") (result i32)
+        (i32.store (i32.const 32) (i32.load (i32.const 20)))
+        (i32.store16 (i32.const 36) (i32.const 2))
+        (i32.store16 (i32.const 38) (i32.const 0))
+        (call $poll (i32.const 32) (i32.const 1) (i32.const 0)))
+      (func (export "writer_revents") (result i32)
+        (i32.load16_u (i32.const 38))))
+  `);
+  const user = mk.spawnUserProcess(userWasm);
+  assertEquals(user.callExportI32("setup"), 0);
+  assertEquals(user.callExportI32("poll_writer"), 1);
+  assertEquals(user.callExportI32("writer_revents"), 2);
+});
+
 Deno.test("user process priority imports route through kernel scheduler state", async () => {
   const mk = await freshKernelHostInterface();
   const userWasm = await wat2wasm(`

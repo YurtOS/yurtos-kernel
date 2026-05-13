@@ -13,7 +13,7 @@
 //!   0x1_0000+  — `host_*` syscalls from `yurt_abi.toml`
 
 use crate::abi;
-use crate::kernel::with_kernel;
+use crate::kernel::{with_kernel, FdEntry, Kernel, PipeEnd};
 use crate::kh;
 
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
@@ -71,6 +71,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
+        METHOD_SYS_POLL => poll_fds(caller_pid, request, response),
         METHOD_SYS_ISATTY => isatty(caller_pid, request),
         METHOD_SYS_CLOCK_GETTIME => clock_gettime(request, response),
         METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
@@ -837,6 +838,110 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
             }
         }
     })
+}
+
+const POLLIN: i16 = 0x0001;
+const POLLOUT: i16 = 0x0002;
+const POLLERR: i16 = 0x0008;
+const POLLHUP: i16 = 0x0010;
+const POLLNVAL: i16 = 0x0020;
+const POLLFD_SIZE: usize = 8;
+
+fn poll_fds(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 4 || (request.len() - 4) % POLLFD_SIZE != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let records = &request[4..];
+    if response.len() < records.len() {
+        return -(abi::EINVAL as i64);
+    }
+
+    response[..records.len()].copy_from_slice(records);
+    with_kernel(|k| {
+        let mut ready = 0;
+        for (index, record) in records.chunks_exact(POLLFD_SIZE).enumerate() {
+            let fd = i32::from_le_bytes(record[0..4].try_into().expect("poll fd"));
+            let events = i16::from_le_bytes(record[4..6].try_into().expect("poll events"));
+            let revents = if fd < 0 {
+                0
+            } else {
+                poll_revents_for_fd(k, caller_pid, fd as u32, events)
+            };
+            let out = index * POLLFD_SIZE + 6;
+            response[out..out + 2].copy_from_slice(&revents.to_le_bytes());
+            if revents != 0 {
+                ready += 1;
+            }
+        }
+        ready
+    })
+}
+
+fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) -> i16 {
+    let wants_read = events & POLLIN != 0;
+    let wants_write = events & POLLOUT != 0;
+    let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+        Some(e) => e.clone(),
+        None => return POLLNVAL,
+    };
+
+    match entry {
+        FdEntry::Stdin => {
+            let p = k.process_mut(caller_pid);
+            if wants_read && (!p.stdin_buffer.is_empty() || p.stdin_eof) {
+                POLLIN
+            } else {
+                0
+            }
+        }
+        FdEntry::Stdout | FdEntry::Stderr => {
+            if wants_write {
+                POLLOUT
+            } else {
+                0
+            }
+        }
+        FdEntry::File { .. } => {
+            let mut revents = 0;
+            if wants_read {
+                revents |= POLLIN;
+            }
+            if wants_write {
+                revents |= POLLOUT;
+            }
+            revents
+        }
+        FdEntry::Pipe {
+            id,
+            end: PipeEnd::Read,
+        } => {
+            let Some(buf) = k.pipe_buf_mut(id) else {
+                return POLLNVAL;
+            };
+            if wants_read && !buf.bytes.is_empty() {
+                POLLIN
+            } else if buf.write_ends == 0 {
+                POLLHUP
+            } else {
+                0
+            }
+        }
+        FdEntry::Pipe {
+            id,
+            end: PipeEnd::Write,
+        } => {
+            let Some(buf) = k.pipe_buf_mut(id) else {
+                return POLLNVAL;
+            };
+            if buf.read_ends == 0 {
+                POLLERR
+            } else if wants_write {
+                POLLOUT
+            } else {
+                0
+            }
+        }
+    }
 }
 
 /// `setrlimit(resource: u32, soft: u64, hard: u64) -> 0 / -EINVAL / -EPERM`.
@@ -2240,6 +2345,26 @@ mod tests {
     const O_CREAT: u32 = 0b010;
     const O_TRUNC: u32 = 0b100;
 
+    const POLLIN: i16 = 0x0001;
+    const POLLOUT: i16 = 0x0002;
+    const POLLHUP: i16 = 0x0010;
+    const POLLNVAL: i16 = 0x0020;
+
+    fn poll_req(timeout_ms: i32, fds: &[(i32, i16)]) -> Vec<u8> {
+        let mut req = timeout_ms.to_le_bytes().to_vec();
+        for (fd, events) in fds {
+            req.extend_from_slice(&fd.to_le_bytes());
+            req.extend_from_slice(&events.to_le_bytes());
+            req.extend_from_slice(&0_i16.to_le_bytes());
+        }
+        req
+    }
+
+    fn poll_revents(response: &[u8], index: usize) -> i16 {
+        let offset = index * 8 + 6;
+        i16::from_le_bytes(response[offset..offset + 2].try_into().unwrap())
+    }
+
     #[test]
     fn echo_copies_min_of_request_and_response_lengths() {
         let mut out = [0u8; 4];
@@ -2937,6 +3062,76 @@ mod tests {
         let n = dispatch(METHOD_SYS_READ, 1, &read_fd.to_le_bytes(), &mut rest);
         assert_eq!(n, 6);
         assert_eq!(&rest[..6], b"efghij");
+    }
+
+    #[test]
+    fn poll_reports_file_pipe_hangup_and_invalid_fd_readiness() {
+        let _g = crate::kernel::TestGuard::acquire();
+
+        let mut reg = 9_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(b"/poll.txt");
+        reg.extend_from_slice(b"data");
+        assert_eq!(dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []), 0);
+        let file_fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/poll.txt"), &mut []);
+        assert!(file_fd >= 0);
+        let file_fd = file_fd as i32;
+
+        let mut pipe_fds = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_fds), 8);
+        let read_fd = u32::from_le_bytes(pipe_fds[0..4].try_into().unwrap());
+        let write_fd = u32::from_le_bytes(pipe_fds[4..8].try_into().unwrap());
+
+        let req = poll_req(
+            0,
+            &[
+                (file_fd, POLLIN | POLLOUT),
+                (read_fd as i32, POLLIN),
+                (write_fd as i32, POLLOUT),
+                (999, POLLIN),
+                (-1, POLLIN),
+            ],
+        );
+        let mut out = [0u8; 40];
+        assert_eq!(dispatch(METHOD_SYS_POLL, 1, &req, &mut out), 3);
+        assert_eq!(poll_revents(&out, 0), POLLIN | POLLOUT);
+        assert_eq!(poll_revents(&out, 1), 0);
+        assert_eq!(poll_revents(&out, 2), POLLOUT);
+        assert_eq!(poll_revents(&out, 3), POLLNVAL);
+        assert_eq!(poll_revents(&out, 4), 0);
+
+        let mut wreq = write_fd.to_le_bytes().to_vec();
+        wreq.extend_from_slice(b"x");
+        assert_eq!(dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []), 1);
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_POLL,
+                1,
+                &poll_req(0, &[(read_fd as i32, POLLIN)]),
+                &mut out[..8],
+            ),
+            1
+        );
+        assert_eq!(poll_revents(&out, 0), POLLIN);
+
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &read_fd.to_le_bytes(), &mut byte),
+            1
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &write_fd.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_POLL,
+                1,
+                &poll_req(0, &[(read_fd as i32, POLLIN)]),
+                &mut out[..8],
+            ),
+            1
+        );
+        assert_eq!(poll_revents(&out, 0), POLLHUP);
     }
 
     #[test]

@@ -11,6 +11,8 @@ import { METHOD } from "./mod.ts";
 import type { KernelInstance } from "./mod.ts";
 
 const EFAULT = 14;
+const EINVAL = 22;
+const POLLFD_SIZE = 8;
 
 /**
  * Build the env-namespace import object for a user-process linker.
@@ -168,6 +170,27 @@ export function buildSysImports(
       new DataView(req.buffer).setUint32(0, fd >>> 0, true);
       req.set(payload, 4);
       return forwardRequestBytes(METHOD.SYS_WRITE, req);
+    },
+    sys_poll: (fdsPtr, nfds, timeoutMs) => {
+      if (nfds < 0) return -EINVAL;
+      const len = nfds * POLLFD_SIZE;
+      if (!Number.isSafeInteger(len)) return -EINVAL;
+      const fds = copyIn(fdsPtr, len);
+      if (typeof fds === "number") return fds;
+      const req = new Uint8Array(4 + fds.byteLength);
+      const view = new DataView(req.buffer);
+      view.setInt32(0, timeoutMs | 0, true);
+      req.set(fds, 4);
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_POLL,
+        req,
+        fds.byteLength,
+      );
+      if (rc >= 0) {
+        const outRc = copyOut(fdsPtr, response.subarray(0, fds.byteLength));
+        if (outRc < 0) return outRc;
+      }
+      return rc;
     },
 
     sys_isatty: (fd) => forwardRequestBytes(METHOD.SYS_ISATTY, u32(fd)),

@@ -393,6 +393,11 @@ id = 0x1_0042
 kind = "syscall"
 doc = "POSIX sched_setparam(pid, priority). Request bytes: u32 pid + i32 priority. For SCHED_OTHER the only valid priority is 0. Returns 0 or -EINVAL/-ESRCH/-EPERM."
 
+[method.sys_poll]
+id = 0x1_0043
+kind = "syscall"
+doc = "POSIX poll over the caller's fd table. Request bytes: i32 timeout_ms LE followed by pollfd records (i32 fd, i16 events, i16 revents ignored). Response overwrites the pollfd records with revents. Returns ready count, or -EINVAL for malformed request/too-small response."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"

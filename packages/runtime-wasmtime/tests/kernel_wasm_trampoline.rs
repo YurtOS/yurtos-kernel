@@ -94,6 +94,7 @@ const METHOD_SYS_SCHED_GETSCHEDULER: u32 = 0x1_003F;
 const METHOD_SYS_SCHED_GETPARAM: u32 = 0x1_0040;
 const METHOD_SYS_SCHED_SETSCHEDULER: u32 = 0x1_0041;
 const METHOD_SYS_SCHED_SETPARAM: u32 = 0x1_0042;
+const METHOD_SYS_POLL: u32 = 0x1_0043;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -2000,6 +2001,33 @@ fn user_process_pipe_round_trip_within_one_process() {
 }
 
 #[test]
+fn user_process_poll_reports_pipe_write_readiness() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_pipe" (func $pipe (param i32) (result i32)))
+          (import "env" "sys_poll" (func $poll (param i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "setup") (result i32)
+            (call $pipe (i32.const 16)))
+          (func (export "poll_writer") (result i32)
+            (i32.store (i32.const 32) (i32.load (i32.const 20)))
+            (i32.store16 (i32.const 36) (i32.const 2))
+            (i32.store16 (i32.const 38) (i32.const 0))
+            (call $poll (i32.const 32) (i32.const 1) (i32.const 0)))
+          (func (export "writer_revents") (result i32)
+            (i32.load16_u (i32.const 38))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    assert_eq!(user.call_export_i32("setup").unwrap(), 0);
+    assert_eq!(user.call_export_i32("poll_writer").unwrap(), 1);
+    assert_eq!(user.call_export_i32("writer_revents").unwrap(), 2);
+}
+
+#[test]
 fn user_process_pipe_dup_keeps_writer_alive() {
     // dup() on a pipe end must increment the kernel-side refcount;
     // closing the original fd should not collapse the buffer.
@@ -2245,6 +2273,7 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_SCHED_SETPARAM,
             METHOD_SYS_SCHED_SETPARAM as i64,
         ),
+        ("sys_poll", METHOD_SYS_POLL, METHOD_SYS_POLL as i64),
         ("sys_close", METHOD_SYS_CLOSE, METHOD_SYS_CLOSE as i64),
         ("sys_dup", METHOD_SYS_DUP, METHOD_SYS_DUP as i64),
         ("sys_dup2", METHOD_SYS_DUP2, METHOD_SYS_DUP2 as i64),

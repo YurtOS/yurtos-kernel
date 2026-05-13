@@ -106,6 +106,7 @@ mod sys_method_id {
     pub const SCHED_GETPARAM: u32 = 0x1_0040;
     pub const SCHED_SETSCHEDULER: u32 = 0x1_0041;
     pub const SCHED_SETPARAM: u32 = 0x1_0042;
+    pub const POLL: u32 = 0x1_0043;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -3722,6 +3723,53 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 sys_method_id::WRITE,
                 &req,
             ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_poll",
+        |mut caller: Caller<'_, UserState>, fds_ptr: u32, nfds: i32, timeout_ms: i32| -> i32 {
+            if nfds < 0 {
+                return -(EINVAL as i32);
+            }
+            let len = match (nfds as usize).checked_mul(8) {
+                Some(n) => n,
+                None => return -(EINVAL as i32),
+            };
+            let user_memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -(EFAULT as i32),
+            };
+            let mut fds = vec![0u8; len];
+            if len > 0
+                && user_memory
+                    .read(&caller, fds_ptr as usize, &mut fds)
+                    .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+            let mut req = Vec::with_capacity(4 + fds.len());
+            req.extend_from_slice(&timeout_ms.to_le_bytes());
+            req.extend_from_slice(&fds);
+            let mut response = vec![0u8; len];
+            let pid = caller.data().pid;
+            let kernel = caller.data().kernel.clone();
+            let rc = {
+                let mut kernel = kernel.lock().unwrap();
+                match kernel.syscall(sys_method_id::POLL, pid, &req, &mut response) {
+                    Ok(rc) => rc,
+                    Err(_) => return -(EFAULT as i32),
+                }
+            };
+            if rc >= 0
+                && len > 0
+                && user_memory
+                    .write(&mut caller, fds_ptr as usize, &response)
+                    .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+            rc as i32
         },
     )?;
     linker.func_wrap(

@@ -190,6 +190,7 @@ export const METHOD = {
   SYS_SCHED_GETPARAM: 0x1_0040,
   SYS_SCHED_SETSCHEDULER: 0x1_0041,
   SYS_SCHED_SETPARAM: 0x1_0042,
+  SYS_POLL: 0x1_0043,
 } as const;
 
 export const KERNEL_PID = 0;
@@ -486,6 +487,7 @@ const USER_YURT_STUB_IMPORTS = [
   "host_nanosleep",
   "host_network_fetch",
   "host_pipe",
+  "host_poll",
   "host_read_command",
   "host_read_fd",
   "host_read_file",
@@ -1542,6 +1544,33 @@ function buildUserYurtImports(
     view.setUint32(0, Number(targetPid) >>> 0, true);
     view.setInt32(4, Number(priority) | 0, true);
     return Number(kernel.syscall(METHOD.SYS_SCHED_SETPARAM, pid, req, 0).rc);
+  };
+  imports.host_poll = (fdsPtr, nfds, timeoutMs) => {
+    nfds = Number(nfds);
+    if (nfds < 0) return -EINVAL;
+    const len = nfds * 8;
+    if (!Number.isSafeInteger(len)) return -EINVAL;
+    const fds = copyIn(Number(fdsPtr), len);
+    if (typeof fds === "number") return fds;
+    const req = new Uint8Array(4 + fds.byteLength);
+    const view = new DataView(req.buffer);
+    view.setInt32(0, Number(timeoutMs) | 0, true);
+    req.set(fds, 4);
+    const { rc, response } = kernel.syscall(
+      METHOD.SYS_POLL,
+      pid,
+      req,
+      fds.byteLength,
+    );
+    const n = Number(rc);
+    if (n >= 0) {
+      const copied = copyOut(
+        Number(fdsPtr),
+        response.subarray(0, fds.byteLength),
+      );
+      if (copied < 0) return copied;
+    }
+    return n;
   };
   imports.host_chdir = (pathPtr, pathLen) => {
     const path = copyIn(Number(pathPtr), Number(pathLen));
