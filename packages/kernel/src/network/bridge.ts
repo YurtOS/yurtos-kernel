@@ -30,6 +30,7 @@ export interface SyncFetchResult {
 }
 
 export type FetchRedirectMode = "follow" | "manual";
+export type FetchRequestBody = string | Uint8Array | null;
 
 /** Generic sync request/response for any bridge operation. */
 export interface SyncRequestResult {
@@ -43,7 +44,7 @@ export interface NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: FetchRequestBody,
     redirect?: FetchRedirectMode,
   ): SyncFetchResult;
   /** Async fetch — used in the browser where Atomics.wait() isn't available on the main thread. */
@@ -51,7 +52,7 @@ export interface NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: FetchRequestBody,
     redirect?: FetchRedirectMode,
   ): Promise<SyncFetchResult>;
   /** Send a generic operation (connect/send/recv/close) through the bridge. */
@@ -161,7 +162,9 @@ export class NetworkBridge implements NetworkBridgeLike {
         const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
         let currentUrl = req.url;
         let currentMethod = req.method;
-        let currentBody = req.body || undefined;
+        let currentBody = req.body_base64
+          ? Uint8Array.from(atob(req.body_base64), (c) => c.charCodeAt(0))
+          : (req.body || undefined);
         let resp;
         let redirectCount = 0;
 
@@ -524,7 +527,7 @@ export class NetworkBridge implements NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: FetchRequestBody,
     redirect?: FetchRedirectMode,
   ): SyncFetchResult {
     if (!this.worker) {
@@ -540,7 +543,14 @@ export class NetworkBridge implements NetworkBridgeLike {
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
 
-    const reqJson = JSON.stringify({ url, method, headers, body, redirect });
+    const reqJson = JSON.stringify({
+      url,
+      method,
+      headers,
+      body: body instanceof Uint8Array ? undefined : body,
+      body_base64: body instanceof Uint8Array ? bytesToBase64(body) : undefined,
+      redirect,
+    });
     const reqEncoded = encoder.encode(reqJson);
     if (reqEncoded.byteLength > SAB_SIZE - 8) {
       return { status: 413, body: "", headers: {}, error: "request too large" };
@@ -626,4 +636,12 @@ export class NetworkBridge implements NetworkBridgeLike {
       this.worker = null;
     }
   }
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 }

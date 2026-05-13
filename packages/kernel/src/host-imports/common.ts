@@ -9,7 +9,11 @@
 /**
  * Read a UTF-8 string from WASM linear memory.
  */
-export function readString(memory: WebAssembly.Memory, ptr: number, len: number): string {
+export function readString(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+): string {
   const bytes = new Uint8Array(memory.buffer, ptr, len);
   return new TextDecoder().decode(bytes);
 }
@@ -18,8 +22,40 @@ export function readString(memory: WebAssembly.Memory, ptr: number, len: number)
  * Read raw bytes from WASM linear memory.
  * Returns a copy (not a view) so the data survives memory growth.
  */
-export function readBytes(memory: WebAssembly.Memory, ptr: number, len: number): Uint8Array {
+export function readBytes(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+): Uint8Array {
   return new Uint8Array(memory.buffer, ptr, len).slice();
+}
+
+export function readRecordHeader(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+): { size: number; version: number; flags: number } | null {
+  if (len < 8) return null;
+  const view = new DataView(memory.buffer, ptr, len);
+  const size = view.getUint32(0, true);
+  if (size > len || size < 8) return null;
+  return {
+    size,
+    version: view.getUint16(4, true),
+    flags: view.getUint16(6, true),
+  };
+}
+
+export function readSpan(
+  memory: WebAssembly.Memory,
+  base: number,
+  size: number,
+  off: number,
+  len: number,
+): Uint8Array | null {
+  if (len === 0) return new Uint8Array();
+  if (off < 0 || len < 0 || off > size || len > size - off) return null;
+  return new Uint8Array(memory.buffer, base + off, len).slice();
 }
 
 /**
@@ -27,7 +63,12 @@ export function readBytes(memory: WebAssembly.Memory, ptr: number, len: number):
  * Returns bytes written on success, or the required size if the buffer
  * is too small (caller should allocate a larger buffer and retry).
  */
-export function writeJson(memory: WebAssembly.Memory, ptr: number, cap: number, obj: unknown): number {
+export function writeJson(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  obj: unknown,
+): number {
   const json = JSON.stringify(obj);
   const encoded = new TextEncoder().encode(json);
   if (encoded.length > cap) {
@@ -42,7 +83,12 @@ export function writeJson(memory: WebAssembly.Memory, ptr: number, cap: number, 
  * Returns bytes written on success, or the required size if the buffer
  * is too small.
  */
-export function writeString(memory: WebAssembly.Memory, ptr: number, cap: number, s: string): number {
+export function writeString(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  s: string,
+): number {
   const encoded = new TextEncoder().encode(s);
   if (encoded.length > cap) {
     return encoded.length;
@@ -56,7 +102,12 @@ export function writeString(memory: WebAssembly.Memory, ptr: number, cap: number
  * Returns bytes written on success, or the required size if the buffer
  * is too small.
  */
-export function writeBytes(memory: WebAssembly.Memory, ptr: number, cap: number, data: Uint8Array): number {
+export function writeBytes(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  cap: number,
+  data: Uint8Array,
+): number {
   if (data.length > cap) {
     return data.length;
   }

@@ -20,6 +20,10 @@
 #include "yurt_markers.h"
 #include "yurt_runtime.h"
 
+#ifndef YURT_AF_INET
+#define YURT_AF_INET 2u
+#endif
+
 int h_errno = 1;  /* HOST_NOT_FOUND */
 
 YURT_DECLARE_MARKER(getaddrinfo);
@@ -402,6 +406,11 @@ const char *yurt_netdb_host_for_addr(uint32_t addr_be) {
     return yurt_addrmap_lookup_addr(addr_be);
 }
 
+typedef struct yurt_dns_addr_result_v1 {
+    uint32_t family;
+    uint32_t addr_be;
+} yurt_dns_addr_result_v1;
+
 /* yurt_netdb_addr_for_host — forward lookup via host_dns_resolve (JSPI async).
  * Returns the IPv4 address in network byte order, or 0 on failure. */
 uint32_t yurt_netdb_addr_for_host(const char *host) {
@@ -413,17 +422,14 @@ uint32_t yurt_netdb_addr_for_host(const char *host) {
     }
     uint32_t cached = yurt_addrmap_lookup_host(host);
     if (cached != 0) return cached;
-    char buf[16]; /* "255.255.255.255\0" */
+    yurt_dns_addr_result_v1 result;
     int rc = yurt_host_dns_resolve(
         (int)(intptr_t)host, (int)__builtin_strlen(host),
-        (int)(intptr_t)buf, (int)(sizeof(buf) - 1)
+        (int)(intptr_t)&result, (int)sizeof(result)
     );
-    if (rc <= 0 || rc >= (int)sizeof(buf)) return 0;
-    buf[rc] = '\0';
-    struct in_addr a;
-    if (inet_pton(AF_INET, buf, &a) != 1) return 0;
-    yurt_addrmap_store(host, a.s_addr);
-    return a.s_addr;
+    if (rc != (int)sizeof(result) || result.family != YURT_AF_INET) return 0;
+    yurt_addrmap_store(host, result.addr_be);
+    return result.addr_be;
 }
 
 /* getlogin_r — POSIX: copy the login name into buf.  We don't track

@@ -10,6 +10,7 @@ import { Sandbox } from "../sandbox.js";
 import { NodeAdapter } from "../platform/node-adapter.js";
 import { unsupportedRuntimeEngineBackend } from "../engine/backend.js";
 import type {
+  FetchRequestBody,
   NetworkBridgeLike,
   SyncFetchResult,
   SyncRequestResult,
@@ -73,7 +74,7 @@ class StaticFetchBridge implements NetworkBridgeLike {
     url: string;
     method: string;
     headers: Record<string, string>;
-    body?: string | null;
+    body?: FetchRequestBody;
     redirect?: "follow" | "manual";
   }> = [];
 
@@ -81,7 +82,7 @@ class StaticFetchBridge implements NetworkBridgeLike {
     url: string,
     method: string,
     headers: Record<string, string>,
-    body?: string,
+    body?: FetchRequestBody,
     redirect?: "follow" | "manual",
   ): SyncFetchResult {
     this.requests.push({ url, method, headers, body, redirect });
@@ -1068,7 +1069,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe("socket-address=ok");
   });
 
-  it("routes C host_network_fetch through yurt_fetch_text", async () => {
+  it("routes C fetch canary through the native host_network_fetch primitive", async () => {
     const networkBridge = new StaticFetchBridge();
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,

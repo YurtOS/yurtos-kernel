@@ -5,6 +5,7 @@ import { NetworkGateway } from "../gateway.js";
 import { createNetworkBridgeSocketBackend } from "../socket-backend.js";
 import { type ChildProcess, spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
+import process from "node:process";
 
 function encode(value: string): Uint8Array {
   return new TextEncoder().encode(value);
@@ -63,6 +64,17 @@ describe(
         for (let i = 0; i < 256; i++) buf[i] = i;
         res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
         res.end(buf);
+        return;
+      }
+
+      if (url.pathname === '/echo-body') {
+        const chunks = [];
+        req.on('data', (chunk) => chunks.push(chunk));
+        req.on('end', () => {
+          const body = Buffer.concat(chunks);
+          res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
+          res.end(body);
+        });
         return;
       }
 
@@ -150,6 +162,18 @@ describe(
       for (let i = 0; i < 256; i++) {
         expect(binary.charCodeAt(i)).toBe(i);
       }
+    });
+
+    it("sends Uint8Array request bodies without UTF-8 decoding", async () => {
+      const gateway = new NetworkGateway({ allowedHosts: ["127.0.0.1"] });
+      bridge = new NetworkBridge(gateway);
+      await bridge.start();
+
+      const body = new Uint8Array([0xff, 0xfe, 0x00, 0x61]);
+      const result = bridge.fetchSync(`${baseUrl}/echo-body`, "POST", {}, body);
+
+      expect(result.status).toBe(200);
+      expect(result.body_base64).toBe("//4AYQ==");
     });
 
     it("text body still works for UTF-8 content", async () => {

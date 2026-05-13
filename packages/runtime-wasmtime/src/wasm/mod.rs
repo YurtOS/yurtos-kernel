@@ -41,6 +41,36 @@ use spawn::{SpawnContext, SpawnRequest};
 
 use crate::vfs::{MemVfs, VfsError};
 
+fn encode_process_list_record(list: &[kernel::ProcessInfo]) -> Vec<u8> {
+    let header_size = 16usize;
+    let entry_size = 20usize;
+    let entries_offset = header_size;
+    let mut cursor = entries_offset + list.len() * entry_size;
+    let command_bytes = list
+        .iter()
+        .map(|proc| proc.command.as_bytes())
+        .collect::<Vec<_>>();
+    let size = cursor + command_bytes.iter().map(|bytes| bytes.len()).sum::<usize>();
+    let mut out = vec![0u8; size];
+    out[0..4].copy_from_slice(&(size as u32).to_le_bytes());
+    out[4..6].copy_from_slice(&1u16.to_le_bytes());
+    out[8..12].copy_from_slice(&(entries_offset as u32).to_le_bytes());
+    out[12..16].copy_from_slice(&(list.len() as u32).to_le_bytes());
+    for (idx, proc) in list.iter().enumerate() {
+        let at = entries_offset + idx * entry_size;
+        let command = command_bytes[idx];
+        out[at..at + 4].copy_from_slice(&proc.pid.to_le_bytes());
+        out[at + 4..at + 8].copy_from_slice(&proc.ppid.to_le_bytes());
+        let state = if proc.state == "running" { 1u32 } else { 2u32 };
+        out[at + 8..at + 12].copy_from_slice(&state.to_le_bytes());
+        out[at + 12..at + 16].copy_from_slice(&(cursor as u32).to_le_bytes());
+        out[at + 16..at + 20].copy_from_slice(&(command.len() as u32).to_le_bytes());
+        out[cursor..cursor + command.len()].copy_from_slice(command);
+        cursor += command.len();
+    }
+    out
+}
+
 // ── DrainablePipe ─────────────────────────────────────────────────────────────
 
 /// An output pipe whose contents can be atomically taken (drained).
@@ -769,7 +799,11 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
                 &req,
                 parent_nice,
             );
-            let pid = c.data_mut().kernel.add_process(rx);
+            let command = req.to_shell_cmd();
+            let pid = c
+                .data_mut()
+                .kernel
+                .add_process_with_metadata(rx, 1, command);
             write_out(&mut c, out_ptr, out_cap, &pid.to_le_bytes())
         },
     )?;
@@ -834,7 +868,10 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
             );
 
             // Register the child in the kernel's process table.
-            c.data_mut().kernel.add_process(rx)
+            let command = req.to_shell_cmd();
+            c.data_mut()
+                .kernel
+                .add_process_with_metadata(rx, 1, command)
         },
     )?;
 
@@ -903,9 +940,8 @@ fn add_process_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         "yurt",
         "host_list_processes",
         |mut c: Caller<'_, StoreData>, out_ptr: u32, out_cap: u32| -> i32 {
-            let list = c.data().kernel.list();
-            let j = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_owned());
-            write_out(&mut c, out_ptr, out_cap, j.as_bytes())
+            let out = encode_process_list_record(&c.data().kernel.list());
+            write_out(&mut c, out_ptr, out_cap, &out)
         },
     )?;
 
@@ -940,9 +976,9 @@ fn add_network_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
         |mut caller: Caller<'_, StoreData>,
          (req_ptr, req_len, out_ptr, out_cap): (u32, u32, u32, u32)| {
             Box::new(async move {
-                let req_str = read_str(&mut caller, req_ptr, req_len);
-                let resp = network::fetch(&req_str).await;
-                write_out(&mut caller, out_ptr, out_cap, resp.as_bytes())
+                let req = read_mem(&mut caller, req_ptr, req_len);
+                let resp = network::fetch(&req).await;
+                write_out(&mut caller, out_ptr, out_cap, &resp)
             })
         },
     )?;
@@ -950,23 +986,53 @@ fn add_network_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     // Socket stubs (Phase 5+)
     linker.func_wrap(
         "yurt",
+        "host_socket_open",
+        |_: Caller<'_, StoreData>, _: i32, _: i32, _: i32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
         "host_socket_connect",
-        |_: Caller<'_, StoreData>, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
+        "host_socket_bind",
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
+        "host_socket_listen",
+        |_: Caller<'_, StoreData>, _: i32, _: i32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
+        "host_socket_accept",
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
+        "host_socket_addr",
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
     )?;
     linker.func_wrap(
         "yurt",
         "host_socket_send",
-        |_: Caller<'_, StoreData>, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
     )?;
     linker.func_wrap(
         "yurt",
         "host_socket_recv",
-        |_: Caller<'_, StoreData>, _: u32, _: u32, _: u32, _: u32| -> i32 { -3 },
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: u32| -> i32 { -3 },
+    )?;
+    linker.func_wrap(
+        "yurt",
+        "host_socket_option",
+        |_: Caller<'_, StoreData>, _: i32, _: u32, _: u32, _: i32| -> i32 { -3 },
     )?;
     linker.func_wrap(
         "yurt",
         "host_socket_close",
-        |_: Caller<'_, StoreData>, _: u32, _: u32| -> i32 { 0 },
+        |_: Caller<'_, StoreData>, _: i32| -> i32 { 0 },
     )?;
 
     Ok(())
@@ -1004,4 +1070,38 @@ fn add_misc_imports(linker: &mut Linker<StoreData>) -> anyhow::Result<()> {
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kernel::ProcessInfo;
+    use super::*;
+
+    #[test]
+    fn process_list_record_includes_command_spans() {
+        let procs = vec![ProcessInfo {
+            pid: 42,
+            ppid: 7,
+            state: "running",
+            exit_code: None,
+            command: "python -m app".to_owned(),
+        }];
+
+        let record = encode_process_list_record(&procs);
+
+        assert_eq!(
+            u32::from_le_bytes(record[0..4].try_into().unwrap()) as usize,
+            record.len()
+        );
+        assert_eq!(u32::from_le_bytes(record[12..16].try_into().unwrap()), 1);
+        assert_eq!(i32::from_le_bytes(record[16..20].try_into().unwrap()), 42);
+        assert_eq!(i32::from_le_bytes(record[20..24].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(record[24..28].try_into().unwrap()), 1);
+        let command_offset = u32::from_le_bytes(record[28..32].try_into().unwrap()) as usize;
+        let command_len = u32::from_le_bytes(record[32..36].try_into().unwrap()) as usize;
+        assert_eq!(
+            std::str::from_utf8(&record[command_offset..command_offset + command_len]).unwrap(),
+            "python -m app"
+        );
+    }
 }

@@ -68,14 +68,25 @@ YURT_DEFINE_MARKER(sendmsg,  0x736d7367u) /* "smsg" */
 YURT_DEFINE_MARKER(recvmsg,  0x726d7367u) /* "rmsg" */
 YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 
-#define YURT_SOCKET_RESP_CAP 4096
 #define YURT_SOCKET_RECV_MAX_RAW 3000
-/* Host import errors are opaque sentinels, not direct negative errno values. */
+#define YURT_SOCKET_ADDR_LOCAL 0u
+#define YURT_SOCKET_ADDR_PEER 1u
+#define YURT_SOCKET_OPT_TCP_NODELAY 1u
+
 #define YURT_HOST_ERR_NOT_FOUND -1
 #define YURT_HOST_ERR_IO -3
 #define YURT_HOST_ERR_AGAIN -11
 #define YURT_HOST_ERR_INVALID -22
 #define YURT_HOST_ERR_UNSUPPORTED -38
+
+#define YURT_HOST_EPERM 1
+#define YURT_HOST_EIO 5
+#define YURT_HOST_EBADF 9
+#define YURT_HOST_EACCES 13
+#define YURT_HOST_EINVAL 22
+#define YURT_HOST_EAGAIN 11
+#define YURT_HOST_ECONNREFUSED 111
+#define YURT_HOST_EOPNOTSUPP 95
 
 /* wasi-libc already ships strong definitions for some POSIX socket names.
  * yurt-cc/cargo-yurt pass --wrap for the duplicate-owned symbols we implement
@@ -85,124 +96,42 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 /* Forward declaration for SO_PEERCRED helper (Slice 6) */
 static int yurt_getsockopt_peercred(int sockfd, void *optval, socklen_t *optlen);
 
-static const char *find_json_field(const char *json, size_t json_len, const char *field) {
-  char needle[64];
-  int written = snprintf(needle, sizeof(needle), "\"%s\":", field);
-  size_t needle_len;
+typedef struct yurt_socket_addr_result_v1 {
+  uint32_t host_be;
+  uint16_t port_be;
+  uint16_t reserved;
+} yurt_socket_addr_result_v1;
 
-  if (written <= 0 || (size_t)written >= sizeof(needle)) {
-    return NULL;
+typedef struct yurt_socket_accept_result_v1 {
+  int fd;
+  uint32_t peer_host_be;
+  uint16_t peer_port_be;
+  uint16_t local_port_be;
+  uint32_t local_host_be;
+} yurt_socket_accept_result_v1;
+
+static int yurt_errno_from_host(int rc, int fallback) {
+  if (rc >= 0) return fallback;
+  switch (-rc) {
+    case YURT_HOST_EPERM:
+      return EPERM;
+    case YURT_HOST_EIO:
+      return EIO;
+    case YURT_HOST_EBADF:
+      return EBADF;
+    case YURT_HOST_EACCES:
+      return EACCES;
+    case YURT_HOST_EINVAL:
+      return EINVAL;
+    case YURT_HOST_EAGAIN:
+      return EAGAIN;
+    case YURT_HOST_ECONNREFUSED:
+      return ECONNREFUSED;
+    case YURT_HOST_EOPNOTSUPP:
+      return EOPNOTSUPP;
+    default:
+      return fallback;
   }
-  needle_len = (size_t)written;
-  if (needle_len > json_len) {
-    return NULL;
-  }
-
-  for (size_t offset = 0; offset + needle_len <= json_len; ++offset) {
-    if (memcmp(json + offset, needle, needle_len) == 0) {
-      return json + offset + needle_len;
-    }
-  }
-
-  return NULL;
-}
-
-static int parse_json_int(const char *json, size_t json_len, const char *field_name, int *out) {
-  const char *field = find_json_field(json, json_len, field_name);
-  char *end = NULL;
-  long value;
-
-  if (!field) {
-    errno = EIO;
-    return -1;
-  }
-  value = strtol(field, &end, 10);
-  if (end == field) {
-    errno = EIO;
-    return -1;
-  }
-  *out = (int)value;
-  return 0;
-}
-
-static int parse_json_ok(const char *json, size_t json_len) {
-  const char *field = find_json_field(json, json_len, "ok");
-  if (!field) {
-    return 0;
-  }
-  return field + 4 <= json + json_len && memcmp(field, "true", 4) == 0;
-}
-
-static int json_contains(const char *json, size_t json_len, const char *needle) {
-  size_t needle_len = strlen(needle);
-  if (needle_len == 0 || needle_len > json_len) {
-    return 0;
-  }
-  for (size_t offset = 0; offset + needle_len <= json_len; ++offset) {
-    if (memcmp(json + offset, needle, needle_len) == 0) {
-      return 1;
-    }
-  }
-  return 0;
-}
-
-static int parse_json_string_field(
-  const char *json,
-  size_t json_len,
-  const char *field_name,
-  char *dst,
-  size_t cap
-) {
-  const char *field = find_json_field(json, json_len, field_name);
-  const char *end = json + json_len;
-  size_t used = 0;
-
-  if (!field || cap == 0 || field >= end || *field != '"') {
-    errno = EIO;
-    return -1;
-  }
-  field += 1;
-
-  while (field < end) {
-    char ch = *field++;
-    if (ch == '"') {
-      dst[used] = '\0';
-      return 0;
-    }
-    if (ch == '\\') {
-      if (field >= end) {
-        errno = EIO;
-        return -1;
-      }
-      ch = *field++;
-      switch (ch) {
-        case '"':
-        case '\\':
-        case '/':
-          break;
-        case 'n':
-          ch = '\n';
-          break;
-        case 'r':
-          ch = '\r';
-          break;
-        case 't':
-          ch = '\t';
-          break;
-        default:
-          errno = EIO;
-          return -1;
-      }
-    }
-    if (used + 1 >= cap) {
-      errno = EOVERFLOW;
-      return -1;
-    }
-    dst[used++] = ch;
-  }
-
-  errno = EIO;
-  return -1;
 }
 
 static void set_socket_errno_from_host(int err) {
@@ -257,9 +186,7 @@ int socket(int domain, int type, int protocol) {
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   YURT_MARKER_CALL(connect);
   char host[256];
-  char req[256];
-  char resp[YURT_SOCKET_RESP_CAP];
-  int n;
+  int rc;
 
   if (!addr || addrlen < 2) {
     errno = EINVAL;
@@ -310,26 +237,15 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     }
   }
 
-  n = snprintf(
-    req, sizeof(req),
-    "{\"fd\":%d,\"host\":\"%s\",\"port\":%u,\"tls\":false}",
+  rc = yurt_host_socket_connect(
     sockfd,
-    host,
-    (unsigned)ntohs(in->sin_port)
+    (int)(intptr_t)host,
+    (int)strlen(host),
+    (unsigned)ntohs(in->sin_port),
+    0
   );
-  if (n < 0 || (size_t)n >= sizeof(req)) {
-    errno = EOVERFLOW;
-    return -1;
-  }
-
-  n = yurt_host_socket_connect(
-    (int)(intptr_t)req,
-    n,
-    (int)(intptr_t)resp,
-    (int)sizeof(resp)
-  );
-  if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-    errno = ECONNREFUSED;
+  if (rc < 0) {
+    errno = yurt_errno_from_host(rc, ECONNREFUSED);
     return -1;
   }
   return 0;
@@ -357,14 +273,13 @@ static int yurt_fill_sockaddr_un(
   return 0;
 }
 
-static int yurt_fill_sockaddr_from_host(
+static int yurt_fill_sockaddr_from_native(
   struct sockaddr *addr,
   socklen_t *addrlen,
-  const char *host,
-  int port
+  uint32_t host_be,
+  uint16_t port_be
 ) {
   struct sockaddr_in in;
-  uint32_t synthetic;
 
   if (!addr || !addrlen || *addrlen < (socklen_t)sizeof(in)) {
     errno = EINVAL;
@@ -373,16 +288,8 @@ static int yurt_fill_sockaddr_from_host(
 
   memset(&in, 0, sizeof(in));
   in.sin_family = AF_INET;
-  in.sin_port = htons((uint16_t)port);
-  if (inet_pton(AF_INET, host, &in.sin_addr) != 1) {
-    synthetic = yurt_netdb_addr_for_host(host);
-    if (synthetic == 0) {
-      errno = EINVAL;
-      return -1;
-    }
-    in.sin_addr.s_addr = synthetic;
-  }
-
+  in.sin_port = port_be;
+  in.sin_addr.s_addr = host_be;
   memcpy(addr, &in, sizeof(in));
   *addrlen = (socklen_t)sizeof(in);
   return 0;
@@ -418,6 +325,11 @@ static int yurt_sockname_impl(
   const char *port_field
 ) {
   int is_peer = (strcmp(kind, "peer") == 0) ? 1 : 0;
+  yurt_socket_addr_result_v1 result;
+  int n;
+  unsigned which = strcmp(host_field, "local_host") == 0
+    ? YURT_SOCKET_ADDR_LOCAL
+    : YURT_SOCKET_ADDR_PEER;
 
   /* Try typed AF_UNIX path first: avoids JSON for the common AF_UNIX case. */
   {
@@ -444,33 +356,21 @@ static int yurt_sockname_impl(
       errno = ENOTCONN;
       return -1;
     }
-    /* plen == -1: not AF_UNIX — fall through to JSON for AF_INET */
+    /* plen == -1: not AF_UNIX; fall through to AF_INET native address. */
   }
 
-  {
-    char req[64];
-    char resp[YURT_SOCKET_RESP_CAP];
-    char host[256];
-    int port = 0;
-    int req_len;
-    int n;
-
-    req_len = snprintf(req, sizeof(req), "{\"fd\":%d,\"kind\":\"%s\"}", sockfd, kind);
-    if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
-      errno = EOVERFLOW;
-      return -1;
-    }
-    n = yurt_host_socket_addr((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
-    if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-      errno = ENOTCONN;
-      return -1;
-    }
-    if (parse_json_string_field(resp, (size_t)n, host_field, host, sizeof(host)) != 0 ||
-        parse_json_int(resp, (size_t)n, port_field, &port) != 0) {
-      return -1;
-    }
-    return yurt_fill_sockaddr_from_host(addr, addrlen, host, port);
+  (void)port_field;
+  n = yurt_host_socket_addr(
+    sockfd,
+    which,
+    (int)(intptr_t)&result,
+    (int)sizeof(result)
+  );
+  if (n != (int)sizeof(result)) {
+    errno = yurt_errno_from_host(n, ENOTCONN);
+    return -1;
   }
+  return yurt_fill_sockaddr_from_native(addr, addrlen, result.host_be, result.port_be);
 }
 
 int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
@@ -501,10 +401,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   YURT_MARKER_CALL(bind);
   char host[INET_ADDRSTRLEN];
   int port;
-  char req[256];
-  char resp[YURT_SOCKET_RESP_CAP];
-  int req_len;
-  int n;
+  int rc;
 
   if (!addr || addrlen < 2) { errno = EINVAL; return -1; }
 
@@ -536,14 +433,14 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   if (yurt_sockaddr_to_host_port(addr, addrlen, host, sizeof(host), &port) != 0) {
     return -1;
   }
-  req_len = snprintf(req, sizeof(req), "{\"fd\":%d,\"host\":\"%s\",\"port\":%d}", sockfd, host, port);
-  if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
-    errno = EOVERFLOW;
-    return -1;
-  }
-  n = yurt_host_socket_bind((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
-  if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-    errno = EOPNOTSUPP;
+  rc = yurt_host_socket_bind(
+    sockfd,
+    (int)(intptr_t)host,
+    (int)strlen(host),
+    (unsigned)port
+  );
+  if (rc < 0) {
+    errno = yurt_errno_from_host(rc, EOPNOTSUPP);
     return -1;
   }
   return 0;
@@ -551,10 +448,6 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
 int listen(int sockfd, int backlog) {
   YURT_MARKER_CALL(listen);
-  char req[128];
-  char resp[YURT_SOCKET_RESP_CAP];
-  int req_len;
-  int n;
 
   /* SOCK_DGRAM sockets do not support listen(). */
   if (yurt_host_socket_is_dgram(sockfd) == 1) { errno = EOPNOTSUPP; return -1; }
@@ -563,16 +456,17 @@ int listen(int sockfd, int backlog) {
   int r = yurt_host_socket_listen_unix(sockfd, backlog);
   if (r == 0) return 0;
   if (r == -1) { errno = EADDRINUSE; return -1; }
-  /* r == -2: not AF_UNIX, fall through to JSON. */
+  /* r == -2: not AF_UNIX, fall through to AF_INET native listen. */
 
-  req_len = snprintf(req, sizeof(req), "{\"fd\":%d,\"backlog\":%d}", sockfd, backlog);
-  if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
-    errno = EOVERFLOW;
-    return -1;
-  }
-  n = yurt_host_socket_listen((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
-  if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-    errno = EOPNOTSUPP;
+  int rc = yurt_host_socket_listen(sockfd, backlog);
+  if (rc < 0) {
+    if (rc == -YURT_HOST_EACCES ||
+        rc == -YURT_HOST_EPERM ||
+        rc == -YURT_HOST_EOPNOTSUPP) {
+      errno = EOPNOTSUPP;
+    } else {
+      errno = yurt_errno_from_host(rc, EOPNOTSUPP);
+    }
     return -1;
   }
   return 0;
@@ -580,38 +474,45 @@ int listen(int sockfd, int backlog) {
 
 static int yurt_accept_impl(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   YURT_MARKER_CALL(accept);
-  char req[128];
-  char resp[YURT_SOCKET_RESP_CAP];
-  char peer_host[64];
-  int peer_port = 0;
-  int accepted_fd = -1;
-  int req_len;
+  yurt_socket_accept_result_v1 accepted;
   int n;
   int attempts = 0;
 
   /* Try typed AF_UNIX path first. */
   int unix_fd = yurt_host_socket_accept_unix(sockfd);
   if (unix_fd >= 0) {
-    accepted_fd = unix_fd;
-    goto fill_addr;
+    if (addr && addrlen) {
+      char path_buf[108];
+      int is_abstract = 0;
+      int plen = yurt_host_socket_addr_unix(unix_fd, 1,
+                    (int)(intptr_t)path_buf, (int)sizeof(path_buf),
+                    (int)(intptr_t)&is_abstract);
+      if (plen >= 0) {
+        char unix_path[109];
+        if (is_abstract) {
+          int k = plen < 107 ? plen : 107;
+          unix_path[0] = '\0';
+          memcpy(unix_path + 1, path_buf, (size_t)k);
+          unix_path[1 + k] = '\0';
+        } else {
+          int k = plen < 108 ? plen : 107;
+          memcpy(unix_path, path_buf, (size_t)k);
+          unix_path[k] = '\0';
+        }
+        if (yurt_fill_sockaddr_un(addr, addrlen, unix_path) != 0) return -1;
+      } else {
+        *addrlen = sizeof(struct sockaddr_un);
+      }
+    }
+    return unix_fd;
   }
   if (unix_fd == -1) { errno = EOPNOTSUPP; return -1; }
-  /* unix_fd == -2: not AF_UNIX, fall through to JSON spin-loop. */
+  /* unix_fd == -2: not AF_UNIX, fall through to AF_INET accept. */
 
-  req_len = snprintf(req, sizeof(req), "{\"fd\":%d}", sockfd);
-  if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
-    errno = EOVERFLOW;
-    return -1;
-  }
   for (;;) {
-    n = yurt_host_socket_accept((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
-    if (n <= 0) {
-      errno = EOPNOTSUPP;
-      return -1;
-    }
-    if (parse_json_ok(resp, (size_t)n)) break;
-    if (json_contains(resp, (size_t)n, "\"wouldBlock\":true") ||
-        json_contains(resp, (size_t)n, "\"would_block\":true")) {
+    n = yurt_host_socket_accept(sockfd, (int)(intptr_t)&accepted, (int)sizeof(accepted));
+    if (n == (int)sizeof(accepted)) break;
+    if (n == -YURT_HOST_EAGAIN) {
       if (++attempts > 100000) {
         errno = EAGAIN;
         return -1;
@@ -619,46 +520,17 @@ static int yurt_accept_impl(int sockfd, struct sockaddr *addr, socklen_t *addrle
       yurt_host_yield();
       continue;
     }
-    errno = EOPNOTSUPP;
+    errno = yurt_errno_from_host(n, EOPNOTSUPP);
     return -1;
   }
-  if (parse_json_int(resp, (size_t)n, "fd", &accepted_fd) != 0) {
-    return -1;
-  }
-
-fill_addr:
-  if (addr && addrlen) {
-    /* Try typed AF_UNIX peer path first. */
-    char path_buf[108];
-    int is_abstract = 0;
-    int plen = yurt_host_socket_addr_unix(accepted_fd, 1,
-                  (int)(intptr_t)path_buf, (int)sizeof(path_buf),
-                  (int)(intptr_t)&is_abstract);
-    if (plen >= 0) {
-      char unix_path[109];
-      if (is_abstract) {
-        int k = plen < 107 ? plen : 107;
-        unix_path[0] = '\0';
-        memcpy(unix_path + 1, path_buf, (size_t)k);
-        unix_path[1 + k] = '\0';
-      } else {
-        int k = plen < 108 ? plen : 107;
-        memcpy(unix_path, path_buf, (size_t)k);
-        unix_path[k] = '\0';
-      }
-      if (yurt_fill_sockaddr_un(addr, addrlen, unix_path) != 0) return -1;
-    } else if (*addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
-      /* AF_INET: parse peer_host/peer_port from the accept JSON response. */
-      if (parse_json_string_field(resp, (size_t)n, "peer_host", peer_host, sizeof(peer_host)) != 0 ||
-          parse_json_int(resp, (size_t)n, "peer_port", &peer_port) != 0 ||
-          yurt_fill_sockaddr_from_host(addr, addrlen, peer_host, peer_port) != 0) {
-        return -1;
-      }
-    } else {
-      *addrlen = sizeof(struct sockaddr_in);
+  if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
+    if (yurt_fill_sockaddr_from_native(addr, addrlen, accepted.peer_host_be, accepted.peer_port_be) != 0) {
+      return -1;
     }
+  } else if (addrlen) {
+    *addrlen = sizeof(struct sockaddr_in);
   }
-  return accepted_fd;
+  return accepted.fd;
 }
 
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
@@ -674,7 +546,6 @@ static ssize_t yurt_send_impl(int sockfd, const void *buf, size_t len, int flags
   int req_len;
   int n;
 
-  (void)flags;
   if (len > INT_MAX) {
     errno = EOVERFLOW;
     return -1;
@@ -686,9 +557,9 @@ static ssize_t yurt_send_impl(int sockfd, const void *buf, size_t len, int flags
     int r = yurt_host_socket_send_unix(sockfd, (int)(intptr_t)buf, req_len);
     if (r >= 0) return (ssize_t)r;
     if (r == -1) { errno = EIO; return -1; }
-    /* r == -2: not AF_UNIX STREAM, fall through. */
+    /* r == -2: not AF_UNIX, fall through. */
   }
-  n = yurt_host_socket_send(sockfd, (int)(intptr_t)buf, req_len);
+  n = yurt_host_socket_send(sockfd, (int)(intptr_t)buf, req_len, flags);
   if (n < 0) {
     set_socket_errno_from_host(n);
     return -1;
@@ -847,25 +718,10 @@ int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t
 
   if ((level == IPPROTO_TCP || level == YURT_IPPROTO_TCP)
       && (optname == TCP_NODELAY || optname == YURT_TCP_NODELAY)) {
-    char req[160];
-    char resp[YURT_SOCKET_RESP_CAP];
     int enabled = (*(const int *)optval) != 0;
-    int req_len = snprintf(
-      req,
-      sizeof(req),
-      "{\"fd\":%d,\"option\":\"no_delay\",\"value\":%s}",
-      sockfd,
-      enabled ? "true" : "false"
-    );
-    int n;
-
-    if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
-      errno = EOVERFLOW;
-      return -1;
-    }
-    n = yurt_host_socket_option((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
-    if (n <= 0 || !parse_json_ok(resp, (size_t)n)) {
-      errno = EOPNOTSUPP;
+    int rc = yurt_host_socket_option(sockfd, YURT_SOCKET_OPT_TCP_NODELAY, 1, enabled);
+    if (rc < 0) {
+      errno = yurt_errno_from_host(rc, EOPNOTSUPP);
       return -1;
     }
     return 0;
@@ -905,20 +761,12 @@ static int yurt_getsockopt_impl(int sockfd, int level, int optname, void *optval
     case YURT_TCP_NODELAY:
 #endif
     {
-      char req[128];
-      char resp[YURT_SOCKET_RESP_CAP];
-      int req_len = snprintf(req, sizeof(req), "{\"fd\":%d,\"option\":\"no_delay\"}", sockfd);
-      int n;
-
-      if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
-        errno = EOVERFLOW;
+      int rc = yurt_host_socket_option(sockfd, YURT_SOCKET_OPT_TCP_NODELAY, 0, 0);
+      if (rc < 0) {
+        errno = yurt_errno_from_host(rc, EOPNOTSUPP);
         return -1;
       }
-      n = yurt_host_socket_option((int)(intptr_t)req, req_len, (int)(intptr_t)resp, (int)sizeof(resp));
-      if (n <= 0 || !parse_json_ok(resp, (size_t)n) || parse_json_int(resp, (size_t)n, "value", &value) != 0) {
-        errno = EOPNOTSUPP;
-        return -1;
-      }
+      value = rc;
       break;
     }
     default:
@@ -942,17 +790,11 @@ int __wrap_getsockopt(int sockfd, int level, int optname, void *optval, socklen_
 
 int shutdown(int sockfd, int how) {
   YURT_MARKER_CALL(shutdown);
-  char req[64];
-  int req_len;
 
   (void)how;
-  req_len = snprintf(req, sizeof(req), "{\"fd\":%d}", sockfd);
-  if (req_len < 0 || (size_t)req_len >= sizeof(req)) {
-    errno = EOVERFLOW;
-    return -1;
-  }
-  if (yurt_host_socket_close((int)(intptr_t)req, req_len) != 0) {
-    errno = EIO;
+  int rc = yurt_host_socket_close(sockfd);
+  if (rc < 0) {
+    errno = yurt_errno_from_host(rc, EIO);
     return -1;
   }
   return 0;
@@ -1134,7 +976,7 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
 
 /* ── SO_PEERCRED getsockopt ─────────────────────────────────────────────── */
 static int yurt_getsockopt_peercred(int sockfd, void *optval, socklen_t *optlen) {
-  struct {
+  struct yurt_ucred {
     pid_t pid;
     uid_t uid;
     gid_t gid;

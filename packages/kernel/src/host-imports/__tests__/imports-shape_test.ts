@@ -22,6 +22,126 @@ function writeString(memory: WebAssembly.Memory, ptr: number, value: string) {
   return bytes.length;
 }
 
+function readDnsAddr(memory: WebAssembly.Memory, ptr: number) {
+  const view = new DataView(memory.buffer, ptr, 8);
+  const bytes = Array.from(new Uint8Array(memory.buffer, ptr + 4, 4));
+  return {
+    family: view.getUint32(0, true),
+    addr: bytes.join("."),
+  };
+}
+
+function readProcessList(memory: WebAssembly.Memory, ptr: number, len: number) {
+  const view = new DataView(memory.buffer, ptr, len);
+  const entriesOffset = view.getUint32(8, true);
+  const entriesCount = view.getUint32(12, true);
+  const entries = [];
+  for (let i = 0; i < entriesCount; i++) {
+    const entryOffset = entriesOffset + i * 20;
+    const commandOffset = view.getUint32(entryOffset + 12, true);
+    const commandLength = view.getUint32(entryOffset + 16, true);
+    entries.push({
+      pid: view.getInt32(entryOffset, true),
+      ppid: view.getInt32(entryOffset + 4, true),
+      state: view.getUint32(entryOffset + 8, true),
+      command: readString(memory, ptr + commandOffset, commandLength),
+    });
+  }
+  return {
+    size: view.getUint32(0, true),
+    version: view.getUint16(4, true),
+    entries,
+  };
+}
+
+function buildExtensionRequest(opts: {
+  name: string;
+  args?: string[];
+  stdin?: string;
+  cwd?: string;
+  env?: Record<string, string>;
+}) {
+  const headerSize = 56;
+  const spanSize = 8;
+  const pairSize = 16;
+  const args = opts.args ?? [];
+  const env = Object.entries(opts.env ?? {});
+  const argsOffset = headerSize;
+  const envOffset = argsOffset + args.length * spanSize;
+  let cursor = envOffset + env.length * pairSize;
+  const strings: Uint8Array[] = [];
+  const pushString = (value: string) => {
+    const bytes = encoder.encode(value);
+    const offset = cursor;
+    cursor += bytes.byteLength;
+    strings.push(bytes);
+    return [offset, bytes.byteLength] as const;
+  };
+  const name = pushString(opts.name);
+  const argSpans = args.map(pushString);
+  const stdin = pushString(opts.stdin ?? "");
+  const cwd = pushString(opts.cwd ?? "/");
+  const envPairs = env.map(([key, value]) =>
+    [...pushString(key), ...pushString(value)] as const
+  );
+
+  const out = new Uint8Array(cursor);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, cursor, true);
+  view.setUint16(4, 1, true);
+  view.setUint16(6, 0, true);
+  view.setUint32(8, name[0], true);
+  view.setUint32(12, name[1], true);
+  view.setUint32(16, argsOffset, true);
+  view.setUint32(20, args.length, true);
+  view.setUint32(24, stdin[0], true);
+  view.setUint32(28, stdin[1], true);
+  view.setUint32(32, cwd[0], true);
+  view.setUint32(36, cwd[1], true);
+  view.setUint32(40, envOffset, true);
+  view.setUint32(44, env.length, true);
+  view.setUint32(48, cursor, true);
+  view.setUint32(52, 0, true);
+  for (let i = 0; i < argSpans.length; i++) {
+    const [offset, length] = argSpans[i];
+    view.setUint32(argsOffset + i * spanSize, offset, true);
+    view.setUint32(argsOffset + i * spanSize + 4, length, true);
+  }
+  for (let i = 0; i < envPairs.length; i++) {
+    const [keyOffset, keyLength, valueOffset, valueLength] = envPairs[i];
+    const at = envOffset + i * pairSize;
+    view.setUint32(at, keyOffset, true);
+    view.setUint32(at + 4, keyLength, true);
+    view.setUint32(at + 8, valueOffset, true);
+    view.setUint32(at + 12, valueLength, true);
+  }
+  cursor = envOffset + env.length * pairSize;
+  for (const bytes of strings) {
+    out.set(bytes, cursor);
+    cursor += bytes.byteLength;
+  }
+  return out;
+}
+
+function readExtensionResponse(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+) {
+  const view = new DataView(memory.buffer, ptr, len);
+  const stdoutOffset = view.getUint32(12, true);
+  const stdoutLength = view.getUint32(16, true);
+  const stderrOffset = view.getUint32(20, true);
+  const stderrLength = view.getUint32(24, true);
+  return {
+    size: view.getUint32(0, true),
+    version: view.getUint16(4, true),
+    exitCode: view.getInt32(8, true),
+    stdout: readString(memory, ptr + stdoutOffset, stdoutLength),
+    stderr: readString(memory, ptr + stderrOffset, stderrLength),
+  };
+}
+
 function readStringAt(memory: WebAssembly.Memory, ptr: number, len: number) {
   return decoder.decode(new Uint8Array(memory.buffer, ptr, len));
 }
@@ -455,7 +575,8 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
       4096,
       1024,
     );
-  assertEquals(readString(memory, 4096, written), "127.0.0.1");
+  assertEquals(written, 8);
+  assertEquals(readDnsAddr(memory, 4096), { family: 2, addr: "127.0.0.1" });
 
   hostLen = writeString(memory, 0, "10.8.0.42");
   written =
@@ -465,7 +586,8 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
       4096,
       1024,
     );
-  assertEquals(readString(memory, 4096, written), "10.8.0.42");
+  assertEquals(written, 8);
+  assertEquals(readDnsAddr(memory, 4096), { family: 2, addr: "10.8.0.42" });
 });
 
 Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for socket-backed guests", async () => {
@@ -490,7 +612,7 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
       4096,
       1024,
     );
-  const first = readString(memory, 4096, firstLen);
+  const first = readDnsAddr(memory, 4096).addr;
   const secondLen =
     await (imports.host_dns_resolve as (...args: number[]) => Promise<number>)(
       0,
@@ -498,10 +620,79 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
       8192,
       1024,
     );
-  const second = readString(memory, 8192, secondLen);
+  const second = readDnsAddr(memory, 8192).addr;
 
+  assertEquals(firstLen, 8);
+  assertEquals(secondLen, 8);
   assertEquals(first.startsWith("10.0.2."), true);
   assertEquals(second, first);
+});
+
+Deno.test("kernel host_list_processes writes a native process record", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const kernel = new ProcessKernel({ maxProcesses: 4 });
+  const parentPid = kernel.allocPid(1, "parent");
+  const childPid = kernel.allocPid(parentPid, "worker");
+  kernel.registerExited(childPid, 7, parentPid);
+  const imports = createKernelImports({ memory, kernel, callerPid: parentPid });
+
+  const written =
+    (imports.host_list_processes as (outPtr: number, outCap: number) => number)(
+      4096,
+      1024,
+    );
+  const list = readProcessList(memory, 4096, written);
+
+  assertEquals(list.version, 1);
+  assertEquals(
+    list.entries.some((entry) =>
+      entry.pid === parentPid && entry.ppid === 1 && entry.state === 1 &&
+      entry.command === "parent"
+    ),
+    true,
+  );
+  assertEquals(
+    list.entries.some((entry) =>
+      entry.pid === childPid && entry.ppid === parentPid && entry.state === 2 &&
+      entry.command === "worker"
+    ),
+    true,
+  );
+});
+
+Deno.test("kernel host_extension_invoke accepts native request records", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const request = buildExtensionRequest({
+    name: "echo",
+    args: ["one", "two"],
+    stdin: "input",
+    cwd: "/tmp",
+    env: { A: "B" },
+  });
+  new Uint8Array(memory.buffer, 0, request.byteLength).set(request);
+  const imports = createKernelImports({
+    memory,
+    extensionHandler: (input) => {
+      assertEquals(input, {
+        name: "echo",
+        args: ["one", "two"],
+        stdin: "input",
+        cwd: "/tmp",
+        env: { A: "B" },
+      });
+      return { exitCode: 3, stdout: "ok", stderr: "warn" };
+    },
+  });
+
+  const written = await (imports.host_extension_invoke as (
+    ...args: number[]
+  ) => Promise<number>)(0, request.byteLength, 4096, 1024);
+  const response = readExtensionResponse(memory, 4096, written);
+
+  assertEquals(response.version, 1);
+  assertEquals(response.exitCode, 3);
+  assertEquals(response.stdout, "ok");
+  assertEquals(response.stderr, "warn");
 });
 
 Deno.test("host_chmod allows the file owner and denies non-owners", () => {

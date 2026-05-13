@@ -21,16 +21,6 @@ function writeString(
   return bytes.length;
 }
 
-function readJson(
-  memory: WebAssembly.Memory,
-  ptr: number,
-  len: number,
-): unknown {
-  return JSON.parse(
-    new TextDecoder().decode(new Uint8Array(memory.buffer, ptr, len)),
-  );
-}
-
 describe("socket listener policy preparation", () => {
   it("authorizes loopback listen and stores listener handle on the socket fd", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
@@ -77,37 +67,22 @@ describe("socket listener policy preparation", () => {
       1,
       0,
     );
-    const bindLen = writeString(
-      memory,
-      16,
-      JSON.stringify({
-        fd,
-        host: "127.0.0.1",
-        port: 18081,
-      }),
-    );
+    const bindLen = writeString(memory, 16, "127.0.0.1");
     const bindOut = (imports.host_socket_bind as (...args: number[]) => number)(
+      fd,
       16,
       bindLen,
-      256,
-      4096,
+      18081,
     );
-    expect(readJson(memory, 256, bindOut)).toEqual({ ok: true });
+    expect(bindOut).toBe(0);
 
-    const listenLen = writeString(
-      memory,
-      16,
-      JSON.stringify({ fd, backlog: 8 }),
-    );
     const listenOut =
       (imports.host_socket_listen as (...args: number[]) => number)(
-        16,
-        listenLen,
-        256,
-        4096,
+        fd,
+        8,
       );
 
-    expect(readJson(memory, 256, listenOut)).toEqual({ ok: true });
+    expect(listenOut).toBe(0);
     expect(calls).toEqual([{
       host: "127.0.0.1",
       port: 18081,
@@ -150,34 +125,20 @@ describe("socket listener policy preparation", () => {
       1,
       0,
     );
-    const bindLen = writeString(
-      memory,
-      16,
-      JSON.stringify({ fd, host: "127.0.0.1", port: 18081 }),
-    );
+    const bindLen = writeString(memory, 16, "127.0.0.1");
     (imports.host_socket_bind as (...args: number[]) => number)(
+      fd,
       16,
       bindLen,
-      256,
-      4096,
-    );
-    const listenLen = writeString(
-      memory,
-      16,
-      JSON.stringify({ fd, backlog: 8 }),
+      18081,
     );
 
     const out = (imports.host_socket_listen as (...args: number[]) => number)(
-      16,
-      listenLen,
-      256,
-      4096,
+      fd,
+      8,
     );
 
-    expect(readJson(memory, 256, out)).toEqual({
-      ok: false,
-      error: "listen on 127.0.0.1:18081 is not allowed by sandbox policy",
-    });
+    expect(out).toBe(-13);
   });
 
   it("allows mapped 0.0.0.0 listen only for configured mapped ports", () => {
@@ -219,37 +180,22 @@ describe("socket listener policy preparation", () => {
       1,
       0,
     );
-    const bindLen = writeString(
-      memory,
-      16,
-      JSON.stringify({ fd, host: "0.0.0.0", port: 8080 }),
-    );
+    const bindLen = writeString(memory, 16, "0.0.0.0");
     expect(
-      readJson(
-        memory,
-        256,
-        (imports.host_socket_bind as (...args: number[]) => number)(
-          16,
-          bindLen,
-          256,
-          4096,
-        ),
+      (imports.host_socket_bind as (...args: number[]) => number)(
+        fd,
+        16,
+        bindLen,
+        8080,
       ),
-    ).toEqual({ ok: true });
+    ).toBe(0);
 
-    const listenLen = writeString(
-      memory,
-      16,
-      JSON.stringify({ fd, backlog: 8 }),
-    );
     const out = (imports.host_socket_listen as (...args: number[]) => number)(
-      16,
-      listenLen,
-      256,
-      4096,
+      fd,
+      8,
     );
 
-    expect(readJson(memory, 256, out)).toEqual({ ok: true });
+    expect(out).toBe(0);
     expect(calls).toEqual([{
       host: "0.0.0.0",
       port: 8080,
