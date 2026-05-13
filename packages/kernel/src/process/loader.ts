@@ -281,6 +281,9 @@ export async function loadProcess(
   let instance: WebAssembly.Instance;
   try {
     const imports: WebAssembly.Imports = {
+      env: {
+        sys_poll: yurtImports.host_poll,
+      },
       wasi_snapshot_preview1: wasiImports,
       yurt: yurtImports,
     };
@@ -461,6 +464,9 @@ export async function loadProcess(
       );
 
       const childInstance = await ctx.adapter.instantiate(module, {
+        env: {
+          sys_poll: childYurtImports.host_poll,
+        },
         wasi_snapshot_preview1: childWasiImports,
         yurt: childYurtImports,
       });
