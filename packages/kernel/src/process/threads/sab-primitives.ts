@@ -26,6 +26,29 @@ export class SabMutex {
     return Atomics.compareExchange(this.view, 0, 0, tid) === 0;
   }
 
+  /**
+   * Acquire the mutex, blocking the current thread until it can.
+   *
+   * Uses a CAS-and-wait loop: attempt the CAS; on failure, `Atomics.wait`
+   * until the cell is observed to change, then retry. Spurious wakes are
+   * handled by the retry loop. Safe to call from any thread that shares
+   * the SAB; the call site MUST be running where `Atomics.wait` is allowed
+   * (Web Workers / Node worker_threads / Deno workers — NOT the main
+   * window thread on the web, where Atomics.wait throws TypeError).
+   */
+  lock(tid: number): void {
+    if (!Number.isInteger(tid) || tid <= 0) {
+      throw new Error(
+        `SabMutex.lock: tid must be a positive integer (got ${tid})`,
+      );
+    }
+    while (true) {
+      const prev = Atomics.compareExchange(this.view, 0, 0, tid);
+      if (prev === 0) return;
+      Atomics.wait(this.view, 0, prev);
+    }
+  }
+
   unlock(tid: number): void {
     if (!Number.isInteger(tid) || tid <= 0) {
       throw new Error(

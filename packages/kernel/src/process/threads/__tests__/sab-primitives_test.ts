@@ -37,6 +37,52 @@ Deno.test("SabMutex: unlock(0) throws (reserved for unlocked)", () => {
   assertThrows(() => m.unlock(0), Error, "must be a positive integer");
 });
 
+Deno.test("SabMutex: lock() acquires when uncontended", () => {
+  const sab = new SharedArrayBuffer(SabMutex.BYTES);
+  const m = new SabMutex(sab, 0);
+  m.lock(1);
+  assertEquals(m.owner(), 1);
+  m.unlock(1);
+});
+
+Deno.test("SabMutex: lock(0) throws (reserved for unlocked)", () => {
+  const sab = new SharedArrayBuffer(SabMutex.BYTES);
+  const m = new SabMutex(sab, 0);
+  assertThrows(() => m.lock(0), Error, "must be a positive integer");
+});
+
+Deno.test({
+  name: "SabMutex: lock() from a Worker blocks until main unlocks",
+  // Allow the Worker to do dynamic imports.
+  permissions: { read: true, net: true },
+  fn: async () => {
+    const sab = new SharedArrayBuffer(SabMutex.BYTES);
+    const m = new SabMutex(sab, 0);
+    m.tryLock(1); // main holds it as tid 1
+
+    const worker = new Worker(
+      new URL("./_fixtures/lock-worker.ts", import.meta.url).href,
+      { type: "module" },
+    );
+    const acquired = new Promise<{ tid: number }>((resolve) => {
+      worker.onmessage = (e: MessageEvent) =>
+        resolve(e.data as { tid: number });
+    });
+    worker.postMessage({ sab, tid: 2 });
+
+    // Worker is now blocked in Atomics.wait. Give the event loop a tick
+    // to make sure the worker reached the wait call before we unlock.
+    await new Promise((r) => setTimeout(r, 50));
+
+    m.unlock(1);
+
+    const got = await acquired;
+    assertEquals(got.tid, 2);
+    assertEquals(m.owner(), 2);
+    worker.terminate();
+  },
+});
+
 // TODO(Task 4): The tests above run on a single isolate and would pass
 // even against a non-atomic plain-load/store implementation of SabMutex.
 // Real CAS contention testing requires a Worker spawn, which lands in
