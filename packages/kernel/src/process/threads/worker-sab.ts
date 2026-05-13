@@ -3,6 +3,11 @@ import type { ThreadsBackend } from "./backend.js";
 import type { IndirectCallTable } from "./indirect-call-table.js";
 import { SabCondvar, SabMutex } from "./sab-primitives.js";
 import { ThreadIdScope } from "./thread-id-scope.js";
+import {
+  attachWorkerHostDispatcher,
+  REQUEST_SAB_BYTES,
+  type WorkerHostDispatcherBodies,
+} from "./worker-host-proxy.js";
 
 export interface WorkerSabThreadStart {
   tid: number;
@@ -182,15 +187,31 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
  * `module` and `memory` are the SAME objects passed to the main-thread
  * instance; structured-clone passes them as references when the memory's
  * buffer is a SharedArrayBuffer.
+ *
+ * Task 9: when `bodies` is supplied, each spawned worker gets a
+ * per-thread request SAB and the main-side dispatcher is attached
+ * before the start message is posted. The SAB is forwarded to the
+ * worker as `requestSab` (a bare SharedArrayBuffer; the worker builds
+ * its own `WorkerHostImportProxy` locally because the `postHostCall`
+ * closure cannot be structured-cloned). When `bodies` is undefined the
+ * worker still receives the SAB if we wanted, but here we simply skip
+ * the dispatcher and the SAB so the worker instantiates with `yurt:{}`
+ * (Task 4 behavior). Task 10 wires real kernel-imports bodies through.
  */
 export function defaultSpawnThread(
   module: WebAssembly.Module,
   memory: WebAssembly.Memory,
+  bodies?: WorkerHostDispatcherBodies,
 ): WorkerSabThreadsBackendOptions["spawnThread"] {
   const hostUrl = new URL("./worker-thread-host.ts", import.meta.url).href;
   return ({ tid, fnPtr, arg }) =>
     new Promise<number>((resolve) => {
       const worker = new Worker(hostUrl, { type: "module" });
+      let requestSab: SharedArrayBuffer | undefined;
+      if (bodies) {
+        requestSab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
+        attachWorkerHostDispatcher(worker, requestSab, bodies);
+      }
       worker.onmessage = (e: MessageEvent) => {
         if (
           e.data && typeof e.data === "object" && e.data.type === "done"
@@ -206,6 +227,7 @@ export function defaultSpawnThread(
         arg,
         module,
         memory,
+        requestSab,
       });
     });
 }

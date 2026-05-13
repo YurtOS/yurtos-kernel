@@ -7,11 +7,19 @@
  * same module against the shared memory, calls the indexed function,
  * and posts back `{type:"done", tid, retval}`.
  *
- * This file runs INSIDE a Worker. It has no access to the main thread's
- * kernel imports — those are proxied through postMessage in Task 9.
- * For Task 4 we only need to prove that the module can run inside a
- * Worker against shared memory with an indirect-table call.
+ * Task 9: if the start message includes `requestSab`, the worker
+ * constructs a `WorkerHostImportProxy` and builds the yurt-namespace
+ * host imports via `createWorkerYurtImports`. The proxy's
+ * `postHostCall` is built locally (functions don't structured-clone),
+ * and just calls `self.postMessage({type:"host-call"})` so the
+ * main-side dispatcher runs.
  */
+
+import {
+  createWorkerYurtImports,
+  type WorkerHostImportProxy,
+  WorkerHostOp,
+} from "./worker-host-proxy.ts";
 
 interface StartMessage {
   type: "start";
@@ -20,6 +28,13 @@ interface StartMessage {
   arg: number;
   module: WebAssembly.Module;
   memory: WebAssembly.Memory;
+  /**
+   * Optional per-thread request SAB. When present, the worker wires
+   * yurt-namespace host imports through the SAB; main attaches a
+   * dispatcher to handle the requests. When absent, the worker
+   * instantiates with `yurt: {}` (Task 4 behavior).
+   */
+  requestSab?: SharedArrayBuffer;
 }
 
 interface DoneMessage {
@@ -32,12 +47,23 @@ declare const self: DedicatedWorkerGlobalScope & typeof globalThis;
 
 self.onmessage = async (e: MessageEvent<StartMessage>) => {
   if (e.data?.type !== "start") return;
-  const { tid, fnPtr, arg, module, memory } = e.data;
+  const { tid, fnPtr, arg, module, memory, requestSab } = e.data;
+
+  let yurtImports: WebAssembly.ModuleImports = {};
+  if (requestSab) {
+    const proxy: WorkerHostImportProxy = {
+      requestSab,
+      postHostCall: (_op: WorkerHostOp) =>
+        self.postMessage({ type: "host-call" }),
+    };
+    yurtImports = createWorkerYurtImports(tid, memory, proxy);
+  }
 
   let retval: number;
   try {
     const instance = await WebAssembly.instantiate(module, {
       env: { memory },
+      yurt: yurtImports,
     });
     const table = instance.exports.__indirect_function_table;
     if (!(table instanceof WebAssembly.Table)) {
@@ -53,8 +79,8 @@ self.onmessage = async (e: MessageEvent<StartMessage>) => {
   } catch {
     // Instantiation failure or trap: report -1 and let the joining
     // side handle it. We don't propagate the error object across the
-    // postMessage boundary in this scaffold; structured-clone of
-    // WebAssembly errors is fiddly and not needed for Task 4.
+    // postMessage boundary; structured-clone of WebAssembly errors is
+    // fiddly and not needed for the scaffold.
     retval = -1;
   }
 
