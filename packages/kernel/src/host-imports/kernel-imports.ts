@@ -2623,8 +2623,8 @@ export function createKernelImports(
     },
 
     // host_socket_send_unix(sockfd, buf_ptr, buf_len) -> bytes | -1 | -2
-    // send() for AF_UNIX STREAM sockets, passing raw bytes without base64. Synchronous.
-    // Returns byte count on success, -1 on error, -2 if sockfd is not AF_UNIX STREAM.
+    // send() for AF_UNIX sockets, passing raw bytes without base64. Synchronous.
+    // Returns byte count on success, -1 on error, -2 if sockfd is not AF_UNIX.
     host_socket_send_unix(
       sockfd: number,
       bufPtr: number,
@@ -2632,12 +2632,17 @@ export function createKernelImports(
     ): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -2;
-      if (target.family !== "AF_UNIX" || target.isDgram) return -2;
+      if (target.family !== "AF_UNIX") return -2;
       const socket = target.socket as number | null;
       if (socket === null || socket >= 0) return -1; // registry sockets are stored negative
       const registry = socketBackend?.registry;
       if (!registry) return -1;
       const bytes = new Uint8Array(memory.buffer, bufPtr, bufLen);
+      if (target.isDgram) {
+        const result = registry.sendDgramToPeer(-socket, new Uint8Array(bytes));
+        if (!result.ok) return -1;
+        return result.bytesSent;
+      }
       const result = registry.send(-socket, new Uint8Array(bytes));
       if (!result.ok) return -1;
       return result.bytesSent;
