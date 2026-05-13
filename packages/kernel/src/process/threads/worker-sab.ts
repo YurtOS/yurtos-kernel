@@ -13,6 +13,27 @@ export interface WorkerSabThreadsBackendOptions {
   spawnThread(start: WorkerSabThreadStart): Promise<number>;
 }
 
+export function defaultSpawnThread(
+  module: WebAssembly.Module,
+  memory: WebAssembly.Memory,
+): WorkerSabThreadsBackendOptions["spawnThread"] {
+  const hostUrl = new URL("./worker-thread-host.ts", import.meta.url).href;
+  return ({ tid, fnPtr, arg }) =>
+    new Promise<number>((resolve) => {
+      const worker = new Worker(hostUrl, { type: "module" });
+      worker.onmessage = (event: MessageEvent) => {
+        if (event.data?.type !== "done") return;
+        resolve(event.data.retval as number);
+        worker.terminate();
+      };
+      worker.onerror = () => {
+        resolve(-1);
+        worker.terminate();
+      };
+      worker.postMessage({ type: "start", tid, fnPtr, arg, module, memory });
+    });
+}
+
 interface SpawnSlot {
   result: Promise<number>;
   reaped: boolean;

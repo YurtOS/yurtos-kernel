@@ -1,5 +1,20 @@
 import { assertEquals } from "@std/assert";
-import { WorkerSabThreadsBackend } from "../worker-sab.ts";
+import { defaultSpawnThread, WorkerSabThreadsBackend } from "../worker-sab.ts";
+
+Deno.test("default worker SAB spawner runs fnPtr in worker-thread-host", async () => {
+  const wasmBytes = await Deno.readFile(
+    new URL("./_fixtures/echo-thread.wasm", import.meta.url),
+  );
+  const module = await WebAssembly.compile(wasmBytes);
+  const memory = new WebAssembly.Memory({
+    initial: 1,
+    maximum: 1,
+    shared: true,
+  });
+  const spawnThread = defaultSpawnThread(module, memory);
+
+  assertEquals(await spawnThread({ tid: 1, fnPtr: 0, arg: 41 }), 42);
+});
 
 Deno.test("worker SAB backend allows multiple live spawned threads", async () => {
   const pending: Array<() => void> = [];
