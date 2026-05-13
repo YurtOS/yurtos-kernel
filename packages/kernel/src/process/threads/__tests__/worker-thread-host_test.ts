@@ -110,7 +110,10 @@ Deno.test("worker-thread-host: condvar wait uses shared memory cells", async () 
   const base = 128;
   const mutex = new Int32Array(memory.buffer, base, 1);
   const ready = new Int32Array(memory.buffer, base + 8, 1);
-  const condvar = new SabCondvar(memory.buffer as SharedArrayBuffer, base + 4);
+  const condvar = new SabCondvar(
+    memory.buffer as unknown as SharedArrayBuffer,
+    base + 4,
+  );
 
   const worker = new Worker(
     new URL("../worker-thread-host.ts", import.meta.url).href,
