@@ -415,6 +415,10 @@ export async function loadProcess(
     );
   }
   proc.__setMemory(memoryRef);
+  // Pre-bind WasiHost to the resolved memory. For threaded modules the memory
+  // is imported (not exported), so WasiHost.startAsync can't infer it from
+  // instance.exports.memory; binding here makes the resolution authoritative.
+  wasi.setMemory(memoryRef);
   proc.__setFdReadAndClear(ctx.makeFdReadAndClear(pid));
   proc.__setStdin((data) => {
     ctx.kernel.setFdTarget(

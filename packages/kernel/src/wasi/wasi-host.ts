@@ -703,7 +703,14 @@ export class WasiHost {
    * (e.g. traps) are re-thrown to the caller.
    */
   start(instance: WebAssembly.Instance, startFn?: () => unknown): number {
-    this.setMemory(instance.exports.memory as WebAssembly.Memory);
+    const exportedMem = instance.exports.memory;
+    if (exportedMem instanceof WebAssembly.Memory) {
+      this.setMemory(exportedMem);
+    } else if (!this.memory) {
+      throw new Error(
+        "WasiHost: no memory available (neither exported nor pre-bound)",
+      );
+    }
     try {
       (startFn ?? (instance.exports._start as Function))();
       // Normal return from _start means exit code 0
@@ -737,7 +744,14 @@ export class WasiHost {
     instance: WebAssembly.Instance,
     startFn?: () => unknown | Promise<unknown>,
   ): Promise<number> {
-    this.setMemory(instance.exports.memory as WebAssembly.Memory);
+    const exportedMem = instance.exports.memory;
+    if (exportedMem instanceof WebAssembly.Memory) {
+      this.setMemory(exportedMem);
+    } else if (!this.memory) {
+      throw new Error(
+        "WasiHost: no memory available (neither exported nor pre-bound)",
+      );
+    }
     try {
       await (startFn ?? (instance.exports._start as Function))();
       // Normal return from _start means exit code 0

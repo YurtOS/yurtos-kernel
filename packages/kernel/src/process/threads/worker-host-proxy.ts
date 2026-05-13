@@ -24,6 +24,19 @@
 import { WASI_EBUSY } from "../../wasi/types.js";
 import { SabCondvar, SabMutex } from "./sab-primitives.js";
 
+/**
+ * Sentinel thrown by the worker-side `host_thread_exit` import to unwind
+ * the wasm call frame while carrying the supplied retval. The worker
+ * host entry point recognises this and reports the retval back to the
+ * joining thread.
+ */
+export class WorkerThreadExit extends Error {
+  constructor(readonly retval: number) {
+    super("pthread_exit");
+    this.name = "WorkerThreadExit";
+  }
+}
+
 // Op codes. i32 wire format.
 export const enum WorkerHostOp {
   ThreadSelf = 1,
@@ -155,10 +168,10 @@ export function createWorkerYurtImports(
     host_thread_yield: () => call(WorkerHostOp.ThreadYield, []),
     host_thread_exit: (retval: number) => {
       call(WorkerHostOp.ThreadExit, [retval]);
-      // ThreadExit doesn't return from main; throw to unwind the wasm
-      // call frame. Task 10/loader work may replace this with a host
-      // trap so the worker terminates cleanly.
-      throw new Error("thread exit");
+      // ThreadExit doesn't return from main; throw a tagged sentinel so
+      // worker-thread-host.ts can surface the supplied retval back to
+      // the joining thread instead of treating the unwind as failure.
+      throw new WorkerThreadExit(retval);
     },
     host_write_fd: (fd: number, ptr: number, len: number) => {
       const data = memoryBytes().subarray(ptr, ptr + len);

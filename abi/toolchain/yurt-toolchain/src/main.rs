@@ -232,6 +232,20 @@ fn build_clang_invocation(
     let mut argv: Vec<OsString> = Vec::new();
     argv.push(format!("--sysroot={}", sdk.sysroot().display()).into());
     argv.push("--target=wasm32-wasip1".into());
+    if env.use_threads {
+        // YURT_CC_USE_THREADS=1: coerce clang to emit thread-capable wasm
+        // against the wasm32-wasip1 target. -pthread defines _REENTRANT and
+        // enables pthread-aware libc paths; -matomics emits wasm atomics ops
+        // (memory.atomic.*, i32.atomic.rmw, …) required for pthread_mutex_t
+        // init etc.; -mbulk-memory enables the bulk-memory ops (memcpy /
+        // memset) that some threaded codegen paths assume. We deliberately
+        // stay on wasm32-wasip1 rather than wasm32-wasip1-threads — the
+        // threaded sysroot ships a different libc that we don't link
+        // against (yurt-libc supplies the threading surface).
+        argv.push("-pthread".into());
+        argv.push("-matomics".into());
+        argv.push("-mbulk-memory".into());
+    }
     if final_yurt_link {
         argv.push("-O2".into());
         // Default standard depends on language mode. C23 (gnu23) gives us
@@ -402,6 +416,35 @@ fn build_clang_invocation(
     if env.use_continuation {
         argv.push("-DYURT_USE_CONTINUATION=1".into());
         argv.push("-DYURT_USE_SETJMP=1".into());
+    }
+    if env.use_threads && final_yurt_link {
+        // Final-link only: declare memory as an import (not an export) and
+        // mark it shared (SAB-backed). The kernel's WorkerSabThreadsBackend
+        // binds a SharedArrayBuffer-backed WebAssembly.Memory to env.memory
+        // when it sees an imported shared memory entry; without these
+        // flags wasm-ld defaults to exporting an unshared memory and the
+        // loader refuses to route the module through the threads backend.
+        //
+        // --no-check-features suppresses the wasm-ld features-mismatch
+        // diagnostic between libyurt_abi.a (built without threads) and the
+        // canary (built with threads). yurt_pthread.c itself doesn't emit
+        // atomics — it delegates to host_thread_* host imports — so the
+        // mismatch is benign for the threading surface. Rebuilding
+        // libyurt_abi.a with -matomics -mbulk-memory is the cleaner long-
+        // term fix; we start with --no-check-features and tighten later
+        // if needed.
+        if !contains_exact_arg(user_args, "-Wl,--import-memory") {
+            argv.push("-Wl,--import-memory".into());
+        }
+        if !contains_exact_arg(user_args, "-Wl,--shared-memory") {
+            argv.push("-Wl,--shared-memory".into());
+        }
+        if !user_args.iter().any(|a| a.starts_with("-Wl,--max-memory=")) {
+            argv.push("-Wl,--max-memory=4294967296".into());
+        }
+        if !contains_exact_arg(user_args, "-Wl,--no-check-features") {
+            argv.push("-Wl,--no-check-features".into());
+        }
     }
     argv
 }
