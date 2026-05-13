@@ -85,18 +85,18 @@ class StaticFetchBridge implements NetworkBridgeLike {
     headers: Record<string, string>,
     body?: FetchRequestBody,
     redirect?: "follow" | "manual",
-  ): SyncFetchResult {
+  ): Promise<SyncFetchResult> {
     this.requests.push({ url, method, headers, body, redirect });
-    return {
+    return Promise.resolve({
       status: 200,
       headers: {},
       body: "fetch-canary-ok",
       body_base64: "ZmV0Y2gtY2FuYXJ5LW9r",
-    };
+    });
   }
 
-  requestSync(): SyncRequestResult {
-    return { ok: false, error: "not used" };
+  requestSync(): Promise<SyncRequestResult> {
+    return Promise.resolve({ ok: false, error: "not used" });
   }
 }
 

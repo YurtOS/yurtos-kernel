@@ -1,5 +1,6 @@
 import type { AsyncPipeReadEnd, AsyncPipeWriteEnd } from "../vfs/pipe.js";
 import type {
+  Awaitable,
   SocketBackendResult,
   SocketHandle,
   SocketListenerHandle,
@@ -59,12 +60,15 @@ export type FdTarget =
     peerPid?: number;
     peerUid?: number;
     peerGid?: number;
-    send: (socket: SocketHandle, data: Uint8Array) => SocketBackendResult;
+    send: (
+      socket: SocketHandle,
+      data: Uint8Array,
+    ) => Awaitable<SocketBackendResult>;
     recv: (
       socket: SocketHandle,
       maxBytes: number,
       opts?: { nonblocking?: boolean },
-    ) => SocketBackendResult;
+    ) => Awaitable<SocketBackendResult>;
     recvAsync: (
       socket: SocketHandle,
       maxBytes: number,
@@ -72,9 +76,9 @@ export type FdTarget =
     setNoDelay?: (
       socket: SocketHandle,
       enabled: boolean,
-    ) => SocketBackendResult;
-    close: (socket: SocketHandle) => void;
-    closeListener?: (listener: SocketListenerHandle) => void;
+    ) => Awaitable<SocketBackendResult>;
+    close: (socket: SocketHandle) => Awaitable<void>;
+    closeListener?: (listener: SocketListenerHandle) => Awaitable<void>;
   }
   | { type: "static"; data: Uint8Array; offset: number }
   | { type: "null" }

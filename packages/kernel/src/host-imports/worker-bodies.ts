@@ -57,6 +57,29 @@
 import type { ProcessKernel } from "../process/kernel.js";
 import type { ThreadsBackend } from "../process/threads/backend.js";
 import type { WorkerHostDispatcherBodies } from "../process/threads/worker-host-proxy.js";
+import type { SocketBackendResult } from "../network/socket-backend.js";
+
+/**
+ * The worker-host dispatcher is sync (see worker-host-proxy.ts:249).
+ * After the bridge async-fication, `target.send/recv/close` may return
+ * Promises when the underlying SocketBackend is the network bridge.
+ * Workers only ever hit this path for inherited sockets that already
+ * resolved through the loopback registry (sync), so a Promise here
+ * means the dispatcher is being asked to do work it can't satisfy
+ * synchronously. Report an I/O error rather than corrupting the
+ * worker's view of kernel state.
+ */
+function requireSyncSocketResult(
+  v: SocketBackendResult | Promise<SocketBackendResult>,
+): SocketBackendResult {
+  if (typeof (v as Promise<SocketBackendResult>).then === "function") {
+    return {
+      ok: false,
+      error: "worker dispatcher cannot await async socket backend",
+    };
+  }
+  return v as SocketBackendResult;
+}
 
 export interface MakeWorkerDispatcherBodiesOptions {
   kernel: ProcessKernel;
@@ -168,7 +191,10 @@ export function makeWorkerDispatcherBodies(
       if (target.socket !== null) {
         const socket = target.socket;
         target.socket = null;
-        target.close(socket);
+        // Loopback close is sync; bridge close returns a Promise that
+        // the worker dispatcher can't await. Fire it and ignore — the
+        // bridge worker still tears down its side asynchronously.
+        void target.close(socket);
       }
       return kernel.closeFd(getPid(), fd) ? 0 : -9;
     },
@@ -178,7 +204,9 @@ export function makeWorkerDispatcherBodies(
         return -1;
       }
       const copy = new Uint8Array(data); // copy out of SAB before send
-      const result = target.send(target.socket, copy);
+      const result = requireSyncSocketResult(
+        target.send(target.socket, copy),
+      );
       if (!result.ok) return -1;
       return typeof result.bytes_sent === "number" ? result.bytes_sent : -1;
     },
@@ -193,7 +221,9 @@ export function makeWorkerDispatcherBodies(
       // future task can extend the dispatcher to await recvAsync;
       // see the file header for the lock work that must accompany
       // that change.
-      const probe = target.recv(target.socket, cap, { nonblocking: true });
+      const probe = requireSyncSocketResult(
+        target.recv(target.socket, cap, { nonblocking: true }),
+      );
       if (!probe.ok) {
         return { result: probe.error === "EAGAIN" ? -11 : -1 };
       }

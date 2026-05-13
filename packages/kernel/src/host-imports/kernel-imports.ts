@@ -474,14 +474,30 @@ function pollReventsForTarget(target: FdTarget, events: number): number {
         } else if (target.socket !== null) {
           // Socket readiness is probed by a nonblocking recv; any byte read
           // here is cached so the following guest recv observes it.
-          const probe = target.recv(target.socket, 1, { nonblocking: true });
-          if (probe.ok) {
-            const data = probe.data ?? new Uint8Array(0);
-            if (data.byteLength > 0) target.peekBuffer = data;
-            else target.readShutdown = true;
-            revents |= POLLIN;
-          } else if (probe.error !== "EAGAIN") {
-            revents |= POLLERR;
+          // After the bridge async-fication, recv returns Awaitable: for
+          // the loopback fast-path it's still sync, for the bridge it's
+          // a Promise. poll() is a sync helper, so if we get a Promise
+          // we conservatively treat the fd as not-ready-yet; the next
+          // poll cycle will retry.
+          const probeAwaitable = target.recv(target.socket, 1, {
+            nonblocking: true,
+          });
+          if (
+            typeof (probeAwaitable as Promise<unknown>).then !== "function"
+          ) {
+            const probe = probeAwaitable as { ok: boolean } & Record<
+              string,
+              unknown
+            >;
+            if (probe.ok) {
+              const data = (probe.data as Uint8Array | undefined) ??
+                new Uint8Array(0);
+              if (data.byteLength > 0) target.peekBuffer = data;
+              else target.readShutdown = true;
+              revents |= POLLIN;
+            } else if (probe.error !== "EAGAIN") {
+              revents |= POLLERR;
+            }
           }
         }
       }
@@ -778,11 +794,15 @@ export function createKernelImports(
       target.refs--;
       if (target.refs <= 0) {
         if (target.listener != null && target.closeListener) {
-          target.closeListener(target.listener);
+          // Fire-and-forget: bridge-backed closes are async but
+          // closeFdTarget is sync. The bridge worker tears down its
+          // side independently; we only care that the kernel-side fd
+          // table is reaped here.
+          void target.closeListener(target.listener);
           target.listener = null;
         }
         if (target.socket !== null) {
-          target.close(target.socket);
+          void target.close(target.socket);
           target.socket = null;
         }
       }
@@ -2280,7 +2300,9 @@ export function createKernelImports(
           ? new Uint8Array(bodyBytes)
           : null;
 
-        // Use async fetch if available (browser), otherwise fall back to sync (SAB bridge)
+        // Both fetchAsync (browser) and fetchSync (node bridge) return
+        // Promises — the latter's name is legacy from when the bridge
+        // blocked on Atomics.wait.
         const result = opts.networkBridge.fetchAsync
           ? await opts.networkBridge.fetchAsync(
             url,
@@ -2289,7 +2311,13 @@ export function createKernelImports(
             body,
             redirect,
           )
-          : opts.networkBridge.fetchSync(url, method, headers, body, redirect);
+          : await opts.networkBridge.fetchSync(
+            url,
+            method,
+            headers,
+            body,
+            redirect,
+          );
         const responseBody = result.body_base64
           ? base64ToBytes(result.body_base64)
           : new TextEncoder().encode(result.body);
@@ -2436,39 +2464,59 @@ export function createKernelImports(
     },
 
     // host_socket_connect(fd, host_ptr, host_len, port, flags) -> i32
-    // Opens a TCP or TLS socket to the given host:port.
+    // Opens a TCP or TLS socket to the given host:port. Returns sync
+    // (number) when the backend resolves synchronously (loopback) and a
+    // Promise<number> when it doesn't (network bridge). JSPI/Asyncify
+    // handles the suspension on the Promise path.
     host_socket_connect(
       fd: number,
       hostPtr: number,
       hostLen: number,
       port: number,
       flags: number,
-    ): number {
+    ): number | Promise<number> {
       if (!socketBackend) return -111;
       const host = readString(memory, hostPtr, hostLen);
       if (!host || port < 0 || port > 65535) return -22;
       const target = opts.kernel?.getFdTarget(callerPid, fd);
       if (!target || target.type !== "socket") return -9;
-      const result = socketBackend.connect({
+      const applyConnect = (
+        result: Awaited<ReturnType<typeof socketBackend.connect>>,
+      ): number | Promise<number> => {
+        if (!result.ok) return -111;
+        const finalise = (): number => {
+          target.socket = result.socket;
+          target.peerHost = result.peerHost ?? host;
+          target.peerPort = result.peerPort ?? port;
+          target.localHost = result.localHost ?? socketLocalHost;
+          target.localPort = result.localPort ?? socketLocalPortForFd(fd);
+          return 0;
+        };
+        if (target.noDelay) {
+          const optR = target.setNoDelay?.(result.socket, true) ??
+            { ok: false as const, error: "TCP_NODELAY not supported" };
+          if (typeof (optR as Promise<unknown>).then === "function") {
+            return (optR as Promise<{ ok: boolean }>).then((opt) =>
+              opt.ok ? finalise() : -95
+            );
+          }
+          return (optR as { ok: boolean }).ok ? finalise() : -95;
+        }
+        return finalise();
+      };
+      const connectResult = socketBackend.connect({
         host,
         port,
         tls: (flags & 1) !== 0,
       });
-      if (!result.ok) return -111;
-      if (target.noDelay) {
-        const optionResult = target.setNoDelay?.(result.socket, true) ??
-          {
-            ok: false,
-            error: "TCP_NODELAY not supported by socket backend",
-          };
-        if (!optionResult.ok) return -95;
+      if (typeof (connectResult as Promise<unknown>).then === "function") {
+        return (connectResult as Promise<
+          Awaited<ReturnType<typeof socketBackend.connect>>
+        >).then(applyConnect);
       }
-      target.socket = result.socket;
-      target.peerHost = result.peerHost ?? host;
-      target.peerPort = result.peerPort ?? port;
-      target.localHost = result.localHost ?? socketLocalHost;
-      target.localPort = result.localPort ?? socketLocalPortForFd(fd);
-      return 0;
+      return applyConnect(
+        connectResult as Awaited<ReturnType<typeof socketBackend.connect>>,
+      );
     },
 
     // host_socket_bind(fd, host_ptr, host_len, port) -> i32
@@ -2900,11 +2948,13 @@ export function createKernelImports(
     },
 
     // host_socket_listen(fd, backlog) -> i32
-    // Creates a backend listener for a socket fd after sandbox policy authorizes it.
+    // Creates a backend listener for a socket fd after sandbox policy
+    // authorizes it. Returns sync for loopback, a Promise for the
+    // network bridge backend — JSPI/Asyncify handles either shape.
     host_socket_listen(
       fd: number,
       backlogArg: number,
-    ): number {
+    ): number | Promise<number> {
       const target = opts.kernel?.getFdTarget(callerPid, fd);
       if (!target || target.type !== "socket") return -9;
       const host = target.boundHost ?? "127.0.0.1";
@@ -2913,22 +2963,38 @@ export function createKernelImports(
       const auth = authorizeListen(opts.serverSockets, host, port, backlog);
       if (!auth.ok) return -13;
       if (!socketBackend?.listen) return -95;
-      const result = socketBackend.listen({
+      const apply = (
+        result: Awaited<ReturnType<NonNullable<typeof socketBackend.listen>>>,
+      ): number => {
+        if (!result.ok) return -5;
+        target.listener = result.listener;
+        target.boundHost = host;
+        target.boundPort = port;
+        target.localHost = result.host;
+        target.localPort = result.port;
+        target.closeListener = (listener) => {
+          // Fire-and-forget: closeListener's host-side return is void;
+          // bridge close runs async in the bridge worker regardless.
+          void socketBackend.closeListener?.(listener);
+        };
+        return 0;
+      };
+      const listenResult = socketBackend.listen({
         host,
         port,
         backlog,
         mapping: auth.mapping,
       });
-      if (!result.ok) return -5;
-      target.listener = result.listener;
-      target.boundHost = host;
-      target.boundPort = port;
-      target.localHost = result.host;
-      target.localPort = result.port;
-      target.closeListener = (listener) => {
-        socketBackend.closeListener?.(listener);
-      };
-      return 0;
+      if (typeof (listenResult as Promise<unknown>).then === "function") {
+        return (listenResult as Promise<
+          Awaited<ReturnType<NonNullable<typeof socketBackend.listen>>>
+        >).then(apply);
+      }
+      return apply(
+        listenResult as Awaited<
+          ReturnType<NonNullable<typeof socketBackend.listen>>
+        >,
+      );
     },
 
     // host_socket_accept(fd, out_ptr, out_cap) -> i32
@@ -3004,12 +3070,14 @@ export function createKernelImports(
 
     // host_socket_send(fd, data_ptr, data_len, flags) -> i32
     // Sends raw bytes from WASM linear memory on an open socket.
+    // Returns sync for loopback backends, a Promise for the network
+    // bridge — JSPI/Asyncify handles the suspension either way.
     host_socket_send(
       fd: number,
       dataPtr: number,
       dataLen: number,
       _flags: number,
-    ): number {
+    ): number | Promise<number> {
       if (!socketBackend) return ERR_IO;
       if (dataLen < 0 || dataPtr < 0) return ERR_INVALID;
       const end = dataPtr + dataLen;
@@ -3027,22 +3095,32 @@ export function createKernelImports(
           const result = registry.sendDgramToPeer(rawHandle, data);
           return result.ok ? result.bytesSent : ERR_IO;
         }
-        const result = socketBackend.send(target.socket, data);
-        if (!result.ok) return ERR_IO;
-        return typeof result.bytes_sent === "number"
-          ? result.bytes_sent
-          : ERR_IO;
+        const interpret = (
+          r: Awaited<ReturnType<typeof socketBackend.send>>,
+        ): number => {
+          if (!r.ok) return ERR_IO;
+          return typeof r.bytes_sent === "number" ? r.bytes_sent : ERR_IO;
+        };
+        const sendResult = socketBackend.send(target.socket, data);
+        if (typeof (sendResult as Promise<unknown>).then === "function") {
+          return (sendResult as Promise<
+            Awaited<ReturnType<typeof socketBackend.send>>
+          >).then(interpret);
+        }
+        return interpret(
+          sendResult as Awaited<ReturnType<typeof socketBackend.send>>,
+        );
       } catch {
         return ERR_IO;
       }
     },
 
     // host_socket_recv(fd, out_ptr, out_cap, flags) -> i32
-    // Receives raw bytes into WASM linear memory. Returns synchronously for
-    // peek-with-buffer and nonblocking reads; returns a Promise for
-    // blocking reads, so backends with recvAsync (loopback, browser
-    // registry) suspend the host import via JSPI/Asyncify until at
-    // least one byte (or EOF) arrives.
+    // Receives raw bytes into WASM linear memory. Returns sync for
+    // peek-with-buffer and the loopback fast-path; returns a Promise
+    // when the backend (network bridge) is async, when target.recvAsync
+    // is needed for blocking semantics, or when a nonblocking probe
+    // routes through the bridge — JSPI/Asyncify handles the suspension.
     host_socket_recv(
       fd: number,
       outPtr: number,
@@ -3089,33 +3167,40 @@ export function createKernelImports(
         // peekBuffer is empty.
         if (peek) {
           // Peek probes the backend without suspending and stashes any data
-          // into peekBuffer for the following non-peek recv. The probe is
-          // always nonblocking — even on a blocking fd a peek that finds
-          // nothing returns EAGAIN here rather than waiting for bytes.
-          // That diverges from a real `MSG_PEEK` on a blocking socket
-          // (which would block) but matches how peek is used in the libc
-          // shim today as a select()-style readiness check.
+          // into peekBuffer for the following non-peek recv.
           const probe = socketBackend.recv(target.socket, maxBytes, {
             nonblocking: true,
           });
-          if (probe.ok) {
-            const data = probe.data ?? new Uint8Array(0);
-            target.peekBuffer = target.peekBuffer
-              ? concatBytes(target.peekBuffer, data)
-              : data;
-            return writeSocketBytes(data);
+          const finishPeek = (
+            r: Awaited<typeof probe>,
+          ): number => {
+            if (r.ok) {
+              const data = r.data ?? new Uint8Array(0);
+              target.peekBuffer = target.peekBuffer
+                ? concatBytes(target.peekBuffer, data)
+                : data;
+              return writeSocketBytes(data);
+            }
+            return r.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+          };
+          if (typeof (probe as Promise<unknown>).then === "function") {
+            return (probe as Promise<Awaited<typeof probe>>).then(finishPeek);
           }
-          return probe.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+          return finishPeek(probe as Awaited<typeof probe>);
         }
         if (nonblocking) {
-          // Poll the backend with the nonblocking flag. The backend either
-          // returns queued bytes, signals EAGAIN, or reports EOF/error;
-          // surface whatever it says directly.
+          // Poll the backend with the nonblocking flag.
           const probe = socketBackend.recv(target.socket, maxBytes, {
             nonblocking: true,
           });
-          if (!probe.ok) return probe.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
-          return writeSocketBytes(probe.data ?? new Uint8Array(0));
+          const finishProbe = (r: Awaited<typeof probe>): number => {
+            if (!r.ok) return r.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+            return writeSocketBytes(r.data ?? new Uint8Array(0));
+          };
+          if (typeof (probe as Promise<unknown>).then === "function") {
+            return (probe as Promise<Awaited<typeof probe>>).then(finishProbe);
+          }
+          return finishProbe(probe as Awaited<typeof probe>);
         }
         return target.recvAsync(target.socket, maxBytes).then((result) => {
           if (!result.ok) return result.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
@@ -3235,12 +3320,15 @@ export function createKernelImports(
 
     // host_socket_option(fd, option, has_value, value) -> i32
     // Applies or reports socket option state owned by the kernel.
+    // Returns sync for the in-memory loopback fast-path and a Promise
+    // when the bridge backend's setNoDelay routes through the bridge
+    // worker — JSPI/Asyncify handles the suspension on the Promise path.
     host_socket_option(
       fd: number,
       option: number,
       hasValueRaw: number,
       value: number,
-    ): number {
+    ): number | Promise<number> {
       const hasValue = hasValueRaw !== 0;
       const target = opts.kernel?.getFdTarget(callerPid, fd);
       if (!target || target.type !== "socket") return -9;
@@ -3248,9 +3336,16 @@ export function createKernelImports(
       if (!hasValue) return target.noDelay ? 1 : 0;
       const enabled = value !== 0;
       if (target.socket !== null) {
-        const result = target.setNoDelay?.(target.socket, enabled) ??
-          { ok: false, error: "TCP_NODELAY not supported by socket backend" };
-        if (!result.ok) return -95;
+        const setR = target.setNoDelay?.(target.socket, enabled) ??
+          { ok: false as const, error: "TCP_NODELAY not supported" };
+        if (typeof (setR as Promise<unknown>).then === "function") {
+          return (setR as Promise<{ ok: boolean }>).then((r) => {
+            if (!r.ok) return -95;
+            target.noDelay = enabled;
+            return 0;
+          });
+        }
+        if (!(setR as { ok: boolean }).ok) return -95;
       }
       target.noDelay = enabled;
       return 0;
@@ -3324,18 +3419,23 @@ export function createKernelImports(
     },
 
     // host_socket_close(fd) -> i32
-    // Closes an open socket.
-    // Returns 0 on success, -1 on error.
-    host_socket_close(fd: number): number {
+    // Closes an open socket. Returns sync for loopback, Promise for
+    // bridge. Returns 0 on success, -1 on error.
+    host_socket_close(fd: number): number | Promise<number> {
       const target = opts.kernel?.getFdTarget(callerPid, fd);
       if (!target || target.type !== "socket") return -9;
+      const reap = (): number =>
+        opts.kernel?.closeFd(callerPid, fd) ? 0 : -9;
       if (target.socket !== null) {
         if (!socketBackend) return -5;
         const socket = target.socket;
         target.socket = null;
-        socketBackend.close(socket);
+        const closeResult = socketBackend.close(socket);
+        if (typeof (closeResult as Promise<unknown>).then === "function") {
+          return (closeResult as Promise<unknown>).then(reap, reap);
+        }
       }
-      return opts.kernel?.closeFd(callerPid, fd) ? 0 : -9;
+      return reap();
     },
 
     // ── Extensions (Python only — shell routes through host_spawn) ──

@@ -26,47 +26,49 @@ class StaticFetchBridge implements NetworkBridgeLike {
     _headers: Record<string, string>,
     body?: FetchRequestBody,
     redirect?: "follow" | "manual",
-  ): SyncFetchResult {
+  ): Promise<SyncFetchResult> {
     this.requests.push({ url, method, redirect, body });
     if (url.endsWith("/denied")) {
-      return {
+      return Promise.resolve({
         status: 0,
         headers: {},
         body: "",
         error: "blocked by test policy",
-      };
+      });
     }
     if (url.endsWith("/redirect")) {
-      return {
+      return Promise.resolve({
         status: 302,
         headers: { location: "http://example.test/final" },
         body: "",
         body_base64: "",
-      };
+      });
     }
     if (url.endsWith("/binary")) {
-      return {
+      return Promise.resolve<SyncFetchResult>({
         status: 200,
         headers: { "content-type": "application/octet-stream" },
         body: "\u0000\u0001\u0002",
         body_base64: "AAEC",
-      };
+      });
     }
 
     const bodyText = body instanceof Uint8Array
       ? new TextDecoder().decode(body)
       : (body ?? "");
     const text = method === "POST" ? `posted:${bodyText}` : "hello curl";
-    return {
+    return Promise.resolve({
       status: 200,
       headers: { "content-type": "text/plain" },
       body: text,
       body_base64: btoa(text),
-    };
+    });
   }
 
-  requestSync(_op: Record<string, unknown>): SyncRequestResult {
-    return { ok: false, error: "socket path not used in this test" };
+  requestSync(_op: Record<string, unknown>): Promise<SyncRequestResult> {
+    return Promise.resolve(
+      { ok: false, error: "socket path not used in this test" },
+    );
   }
 }
 

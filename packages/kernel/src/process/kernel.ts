@@ -1299,11 +1299,14 @@ export class ProcessKernel {
       target.refs--;
       if (target.refs <= 0) {
         if (target.listener != null && target.closeListener) {
-          target.closeListener(target.listener);
+          // Bridge-backed closeListener is async; fire-and-forget keeps
+          // the sync release path sync. Bridge worker tears down its
+          // side independently.
+          void target.closeListener(target.listener);
           target.listener = null;
         }
         if (target.socket !== null) {
-          target.close(target.socket);
+          void target.close(target.socket);
           target.socket = null;
         }
       }

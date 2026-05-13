@@ -14,6 +14,7 @@ import { VfsError } from "../vfs/inode.js";
 import type { InodeType } from "../vfs/inode.js";
 import type { VfsLike } from "../vfs/vfs-like.js";
 import type { ListenerRegistry } from "../network/listener-registry.js";
+import type { SocketBackendResult } from "../network/socket-backend.js";
 import { fdErrorToWasi, vfsErrnoToWasi } from "./errors.js";
 import type { FdTarget } from "./fd-target.js";
 import {
@@ -86,11 +87,14 @@ function closeFdTarget(target: FdTarget): void {
     target.refs--;
     if (target.refs <= 0) {
       if (target.listener != null && target.closeListener) {
-        target.closeListener(target.listener);
+        // Bridge-backed closeListener is async; fire-and-forget so the
+        // sync teardown path stays sync. The bridge worker tears down
+        // its side independently.
+        void target.closeListener(target.listener);
         target.listener = null;
       }
       if (target.socket !== null) {
-        target.close(target.socket);
+        void target.close(target.socket);
         target.socket = null;
       }
     }
@@ -1087,9 +1091,30 @@ export class WasiHost {
               this.deliverSigpipe();
               return WASI_EPIPE;
             }
-            const result = target.send(target.socket, data);
-            if (!result.ok) return WASI_EIO;
-            totalWritten += result.bytes_sent ?? data.byteLength;
+            const sendResult = target.send(target.socket, data) as
+              | SocketBackendResult
+              | Promise<SocketBackendResult>;
+            // After bridge async-fication, target.send returns Awaitable.
+            // Loopback resolves synchronously; bridge returns a Promise
+            // — JSPI/Asyncify handles the suspension when we surface it.
+            if (
+              typeof (sendResult as Promise<SocketBackendResult>).then ===
+                "function"
+            ) {
+              const dataLen = data.byteLength;
+              return (sendResult as Promise<SocketBackendResult>).then(
+                (r) => {
+                  if (!r.ok) return WASI_EIO;
+                  totalWritten += r.bytes_sent ?? dataLen;
+                  const viewAfter = this.getView();
+                  viewAfter.setUint32(nwrittenPtr, totalWritten, true);
+                  return 0;
+                },
+              );
+            }
+            const sync = sendResult as SocketBackendResult;
+            if (!sync.ok) return WASI_EIO;
+            totalWritten += sync.bytes_sent ?? data.byteLength;
             break;
           }
           case "tty_slave": {
@@ -1284,13 +1309,43 @@ export class WasiHost {
               // with the nonblocking flag — if data is queued, deliver
               // it; if the backend signals EAGAIN, surface it; on EOF
               // (ok with no bytes) return success with totalRead=0.
-              const result = target.recv(target.socket, iov.len, {
+              const recvResult = target.recv(target.socket, iov.len, {
                 nonblocking: true,
-              });
-              if (!result.ok) {
-                return result.error === "EAGAIN" ? WASI_EAGAIN : WASI_EIO;
+              }) as SocketBackendResult | Promise<SocketBackendResult>;
+              // After bridge async-fication, target.recv returns Awaitable.
+              // Bridge-backed nonblocking probes are async; JSPI/Asyncify
+              // suspends WASM around the returned Promise.
+              if (
+                typeof (recvResult as Promise<SocketBackendResult>).then ===
+                  "function"
+              ) {
+                const iovLen = iov.len;
+                const iovBuf = iov.buf;
+                const startTotal = totalRead;
+                return (recvResult as Promise<SocketBackendResult>).then(
+                  (r) => {
+                    if (!r.ok) {
+                      return r.error === "EAGAIN" ? WASI_EAGAIN : WASI_EIO;
+                    }
+                    const data = r.data ?? new Uint8Array(0);
+                    const toRead = Math.min(iovLen, data.byteLength);
+                    let nowTotal = startTotal;
+                    if (toRead > 0) {
+                      const bytes = this.getBytes();
+                      bytes.set(data.subarray(0, toRead), iovBuf);
+                      nowTotal += toRead;
+                    }
+                    const viewAfter = this.getView();
+                    viewAfter.setUint32(nreadPtr, nowTotal, true);
+                    return WASI_ESUCCESS;
+                  },
+                );
               }
-              const data = result.data ?? new Uint8Array(0);
+              const sync = recvResult as SocketBackendResult;
+              if (!sync.ok) {
+                return sync.error === "EAGAIN" ? WASI_EAGAIN : WASI_EIO;
+              }
+              const data = sync.data ?? new Uint8Array(0);
               const toRead = Math.min(iov.len, data.byteLength);
               if (toRead > 0) {
                 const bytes = this.getBytes();
@@ -2453,7 +2508,8 @@ export class WasiHost {
     if ((flags & validFlags) === validFlags) {
       const socket = target.socket;
       target.socket = null;
-      target.close(socket);
+      // Bridge close is async; fire-and-forget keeps sock_shutdown sync.
+      void target.close(socket);
     }
 
     return WASI_ESUCCESS;
