@@ -18,12 +18,15 @@ import {
   type AsyncifyForkSnapshot,
 } from "../async-bridge.js";
 import { createThreadsBackend } from "./threads/backend-factory.js";
+import {
+  defaultSpawnThread,
+  type WorkerSabThreadsBackendOptions,
+} from "./threads/worker-sab.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
 import type {
   LinearStackSwitchingThreadsBackend,
   ThreadsBackend,
 } from "./threads/backend.js";
-import type { WorkerSabThreadsBackendOptions } from "./threads/worker-sab.js";
 import {
   defaultWasmModuleCache,
   sha256Hex,
@@ -125,21 +128,31 @@ export async function loadProcess(
   const digest = await sha256Hex(bytes);
   const module = await (ctx.moduleCache ?? defaultWasmModuleCache)
     .getOrCompile(digest, bytes);
-  const workerSabAvailable = Boolean(opts.workerSabThreads) &&
-    (opts.workerSabAvailable ?? true);
+  const workerSabAvailable = opts.workerSabAvailable ??
+    Boolean(opts.workerSabThreads);
   const profile = validateYurtModuleProfile(analyzeYurtModule(module, {
     workerSabAvailable,
   }));
+  let workerSabMemory = opts.workerSabMemory;
   if (profile.requiresSharedMemory && profile.memoryImport) {
-    if (!opts.workerSabMemory) {
-      throw new Error(
-        "module imports shared memory for yurt.features threads but no Worker/SAB memory was provided",
-      );
+    if (!workerSabMemory) {
+      workerSabMemory = new WebAssembly.Memory({
+        initial: 1,
+        maximum: 1,
+        shared: true,
+      });
     }
-    validateYurtThreadMemory(profile, opts.workerSabMemory);
+    validateYurtThreadMemory(profile, workerSabMemory);
   }
+  const workerSabThreads = opts.workerSabThreads ??
+    (profile.threadsBackend === "worker-sab" && workerSabMemory
+      ? {
+        memory: workerSabMemory,
+        spawnThread: defaultSpawnThread(module, workerSabMemory),
+      }
+      : undefined);
   const threadsBackend = createThreadsBackend(profile, {
-    workerSab: opts.workerSabThreads,
+    workerSab: workerSabThreads,
   });
   const wasiArgv = opts.wasiArgv ?? argv;
   const cwd = opts.cwd ?? "/";
@@ -248,11 +261,11 @@ export async function loadProcess(
       wasi_snapshot_preview1: wasiImports,
       yurt: yurtImports,
     };
-    if (profile.memoryImport && opts.workerSabMemory) {
+    if (profile.memoryImport && workerSabMemory) {
       const namespace = imports[profile.memoryImport.module] ?? {};
       imports[profile.memoryImport.module] = {
         ...namespace,
-        [profile.memoryImport.name]: opts.workerSabMemory,
+        [profile.memoryImport.name]: workerSabMemory,
       };
     }
     instance = await ctx.adapter.instantiate(module, imports);
@@ -276,7 +289,7 @@ export async function loadProcess(
   memoryRef = exportedMemory instanceof WebAssembly.Memory
     ? exportedMemory
     : profile.memoryImport
-    ? opts.workerSabMemory ?? null
+    ? workerSabMemory ?? null
     : null;
   if (!memoryRef) {
     rollback();

@@ -343,6 +343,22 @@ Deno.test("loadProcess wires imported shared memory for threaded modules", async
   await proc.terminate();
 });
 
+Deno.test("loadProcess creates shared imported memory and Worker/SAB backend for threaded modules", async () => {
+  const ctx = await makeLoaderContext({
+    moduleCache: fixedModuleCache(makeThreadedImportedSharedMemoryModule()),
+  });
+
+  const proc = await loadProcess(ctx, {
+    argv: ["/bin/true"],
+    mode: "cli",
+    workerSabAvailable: true,
+  });
+
+  assertEquals(proc.exitCode, 0);
+  assertEquals(proc.memory?.buffer instanceof SharedArrayBuffer, true);
+  await proc.terminate();
+});
+
 Deno.test("loadProcess rejects threaded modules until Worker/SAB backend is wired", async () => {
   const ctx = await makeLoaderContext({
     moduleCache: fixedModuleCache(makeModuleWithFeatures(["threads"])),
@@ -356,7 +372,7 @@ Deno.test("loadProcess rejects threaded modules until Worker/SAB backend is wire
         workerSabAvailable: true,
       }),
     Error,
-    "module declares yurt.features threads but host lacks Worker/SAB threads support",
+    "module declares yurt.features threads but Worker/SAB threads backend is not wired into the loader yet",
   );
 
   assertEquals(ctx.kernel.getReservedProcessCount(), 0);

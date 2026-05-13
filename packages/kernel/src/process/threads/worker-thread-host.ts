@@ -7,7 +7,14 @@ interface StartMessage {
   memory: WebAssembly.Memory;
 }
 
-self.onmessage = async (event: MessageEvent<StartMessage>) => {
+const workerSelf = self as unknown as {
+  onmessage:
+    | ((event: MessageEvent<StartMessage>) => void | Promise<void>)
+    | null;
+  postMessage(message: unknown): void;
+};
+
+workerSelf.onmessage = async (event: MessageEvent<StartMessage>) => {
   if (event.data.type !== "start") return;
   const { tid, fnPtr, arg, module, memory } = event.data;
 
@@ -19,9 +26,9 @@ self.onmessage = async (event: MessageEvent<StartMessage>) => {
     .__indirect_function_table as WebAssembly.Table;
   const fn = table.get(fnPtr) as ((arg: number) => number) | null;
   if (!fn) {
-    self.postMessage({ type: "done", tid, retval: -1 });
+    workerSelf.postMessage({ type: "done", tid, retval: -1 });
     return;
   }
 
-  self.postMessage({ type: "done", tid, retval: fn(arg) });
+  workerSelf.postMessage({ type: "done", tid, retval: fn(arg) });
 };
