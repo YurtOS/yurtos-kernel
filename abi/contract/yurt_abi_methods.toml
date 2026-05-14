@@ -403,6 +403,21 @@ id = 0x1_0044
 kind = "syscall"
 doc = "Create a connected AF_UNIX socket pair in the caller's fd table. Request bytes: u8 family + u8 sock_type + u16 _pad + u32 flags. Response: u32 fd0 LE + u32 fd1 LE. Returns 8 on success, -EAFNOSUPPORT for non-AF_UNIX, -EPROTOTYPE for unsupported types, or -EINVAL for malformed request/too-small response."
 
+[method.sys_socket_open]
+id = 0x1_0045
+kind = "syscall"
+doc = "Open a kernel-owned socket in the caller's fd table. Request bytes: u8 family + u8 sock_type + u16 _pad + u32 flags. This currently supports AF_UNIX datagram sockets for pathname sendto/recv paths."
+
+[method.sys_socket_bind]
+id = 0x1_0046
+kind = "syscall"
+doc = "Bind a kernel-owned socket to an address. Request bytes: u32 fd LE + address bytes. AF_UNIX addresses use the same unix:<path> binary address convention as socket connect/listen."
+
+[method.sys_socket_sendto]
+id = 0x1_0047
+kind = "syscall"
+doc = "Send one datagram from a kernel-owned socket to an address. Request bytes: u32 fd LE + u32 flags LE + u32 addr_len LE + address bytes + payload bytes."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"

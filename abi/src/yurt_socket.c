@@ -90,6 +90,9 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 #define YURT_HOST_EAGAIN 11
 #define YURT_HOST_ECONNREFUSED 111
 #define YURT_HOST_EOPNOTSUPP 95
+#define YURT_HOST_EPROTOTYPE 91
+#define YURT_HOST_EAFNOSUPPORT 97
+#define YURT_HOST_EADDRINUSE 98
 
 /* wasi-libc already ships strong definitions for some POSIX socket names.
  * yurt-cc/cargo-yurt pass --wrap for the duplicate-owned symbols we implement
@@ -110,6 +113,7 @@ static yurt_socket_entry yurt_sockets[YURT_SOCKET_MAX_TRACKED];
 static int yurt_next_guest_fd = YURT_SOCKET_FIRST_GUEST_FD;
 static int yurt_socket_direct_status_flags[YURT_SOCKET_DIRECT_FLAGS_MAX];
 static int yurt_socket_direct_descriptor_flags[YURT_SOCKET_DIRECT_FLAGS_MAX];
+static int yurt_socket_direct_type[YURT_SOCKET_DIRECT_FLAGS_MAX];
 
 static yurt_socket_entry *yurt_socket_find(int fd) {
   if (fd < YURT_SOCKET_FIRST_GUEST_FD) return NULL;
@@ -159,6 +163,14 @@ static int yurt_socket_host_ref_count(int host_fd) {
   return count;
 }
 
+static int yurt_socket_type_for_fd(int fd) {
+  if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
+      yurt_socket_direct_type[fd] != 0) {
+    return yurt_socket_direct_type[fd];
+  }
+  return (yurt_host_socket_is_dgram(yurt_socket_host_fd(fd)) == 1) ? SOCK_DGRAM : SOCK_STREAM;
+}
+
 int yurt_socket_dup_fd_min(int fd, int min_fd) {
   yurt_socket_entry *src = yurt_socket_find(fd);
   if (!src || min_fd < 0) {
@@ -182,6 +194,10 @@ int yurt_socket_get_status_flags(int fd) {
   yurt_socket_entry *entry = yurt_socket_find(fd);
   if (entry) return entry->status_flags;
   if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
+      yurt_socket_direct_type[fd] != 0) {
+    return yurt_socket_direct_status_flags[fd];
+  }
+  if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
       yurt_host_socket_is_dgram(fd) >= 0) {
     return yurt_socket_direct_status_flags[fd];
   }
@@ -192,6 +208,11 @@ int yurt_socket_set_status_flags(int fd, int flags) {
   yurt_socket_entry *entry = yurt_socket_find(fd);
   if (entry) {
     entry->status_flags = flags;
+    return 0;
+  }
+  if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
+      yurt_socket_direct_type[fd] != 0) {
+    yurt_socket_direct_status_flags[fd] = flags;
     return 0;
   }
   if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
@@ -207,6 +228,10 @@ int yurt_socket_get_descriptor_flags(int fd) {
   yurt_socket_entry *entry = yurt_socket_find(fd);
   if (entry) return entry->descriptor_flags;
   if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
+      yurt_socket_direct_type[fd] != 0) {
+    return yurt_socket_direct_descriptor_flags[fd];
+  }
+  if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
       yurt_host_socket_is_dgram(fd) >= 0) {
     return yurt_socket_direct_descriptor_flags[fd];
   }
@@ -217,6 +242,11 @@ int yurt_socket_set_descriptor_flags(int fd, int flags) {
   yurt_socket_entry *entry = yurt_socket_find(fd);
   if (entry) {
     entry->descriptor_flags = flags & FD_CLOEXEC;
+    return 0;
+  }
+  if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
+      yurt_socket_direct_type[fd] != 0) {
+    yurt_socket_direct_descriptor_flags[fd] = flags & FD_CLOEXEC;
     return 0;
   }
   if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
@@ -234,6 +264,7 @@ static void yurt_socket_forget(int fd) {
   if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX) {
     yurt_socket_direct_status_flags[fd] = 0;
     yurt_socket_direct_descriptor_flags[fd] = 0;
+    yurt_socket_direct_type[fd] = 0;
   }
 }
 
@@ -270,9 +301,43 @@ static int yurt_errno_from_host(int rc, int fallback) {
       return ECONNREFUSED;
     case YURT_HOST_EOPNOTSUPP:
       return EOPNOTSUPP;
+    case YURT_HOST_EPROTOTYPE:
+      return EPROTOTYPE;
+    case YURT_HOST_EAFNOSUPPORT:
+      return EAFNOSUPPORT;
+    case YURT_HOST_EADDRINUSE:
+      return EADDRINUSE;
     default:
       return fallback;
   }
+}
+
+static int yurt_unix_addr_bytes(
+  const struct sockaddr_un *un,
+  socklen_t addrlen,
+  char *out,
+  size_t out_cap
+) {
+  const char prefix[] = "unix:";
+  size_t prefix_len = sizeof(prefix) - 1;
+  size_t payload_len;
+
+  if (!un || out_cap < prefix_len + 1) return -1;
+  memcpy(out, prefix, prefix_len);
+  if (un->sun_path[0] == '\0') {
+    payload_len = (size_t)addrlen > offsetof(struct sockaddr_un, sun_path) + 1
+      ? (size_t)addrlen - offsetof(struct sockaddr_un, sun_path) - 1
+      : 0;
+    if (prefix_len + 1 + payload_len > out_cap) return -1;
+    out[prefix_len] = '\0';
+    memcpy(out + prefix_len + 1, un->sun_path + 1, payload_len);
+    return (int)(prefix_len + 1 + payload_len);
+  }
+
+  payload_len = strnlen(un->sun_path, sizeof(un->sun_path) - 1);
+  if (payload_len == 0 || prefix_len + payload_len > out_cap) return -1;
+  memcpy(out + prefix_len, un->sun_path, payload_len);
+  return (int)(prefix_len + payload_len);
 }
 
 static void set_socket_errno_from_host(int err) {
@@ -306,7 +371,18 @@ int socket(int domain, int type, int protocol) {
       errno = EPROTOTYPE;
       return -1;
     }
-    /* Allocate via the host socket open call. */
+    if (base_type == SOCK_DGRAM) {
+      int fd = yurt_sys_socket_open(AF_UNIX, base_type, 0);
+      if (fd < 0) {
+        errno = yurt_errno_from_host(fd, EMFILE);
+        return -1;
+      }
+      if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX) {
+        yurt_socket_direct_type[fd] = SOCK_DGRAM;
+      }
+      return fd;
+    }
+    /* Stream sockets stay on the legacy route until bind/listen/connect move. */
     int fd = yurt_host_socket_open(AF_UNIX, type, 0);
     if (fd < 0) { errno = EMFILE; return -1; }
     return fd;
@@ -554,6 +630,18 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   /* AF_UNIX: typed binary call */
   if (addr->sa_family == AF_UNIX) {
     const struct sockaddr_un *un = (const struct sockaddr_un *)addr;
+    char unix_addr[sizeof("unix:") + sizeof(un->sun_path)];
+    int unix_addr_len = yurt_unix_addr_bytes(un, addrlen, unix_addr, sizeof(unix_addr));
+    if (unix_addr_len < 0) {
+      errno = EINVAL;
+      return -1;
+    }
+    rc = yurt_sys_socket_bind(sockfd, unix_addr, unix_addr_len);
+    if (rc == 0) return 0;
+    if (rc < 0 && rc != -YURT_HOST_EBADF) {
+      errno = yurt_errno_from_host(rc, EADDRINUSE);
+      return -1;
+    }
     if (un->sun_path[0] == '\0') {
       /* abstract address: bytes after the leading NUL */
       size_t namelen = (size_t)addrlen > offsetof(struct sockaddr_un, sun_path) + 1
@@ -596,7 +684,7 @@ int listen(int sockfd, int backlog) {
   YURT_MARKER_CALL(listen);
 
   /* SOCK_DGRAM sockets do not support listen(). */
-  if (yurt_host_socket_is_dgram(yurt_socket_host_fd(sockfd)) == 1) { errno = EOPNOTSUPP; return -1; }
+  if (yurt_socket_type_for_fd(sockfd) == SOCK_DGRAM) { errno = EOPNOTSUPP; return -1; }
 
   /* Try typed AF_UNIX path first. */
   int r = yurt_host_socket_listen_unix(sockfd, backlog);
@@ -710,6 +798,15 @@ static ssize_t yurt_send_impl(int sockfd, const void *buf, size_t len, int flags
     if (r == -1) { errno = EIO; return -1; }
     /* r == -2: not AF_UNIX, fall through. */
   }
+  if (sockfd >= 0 && sockfd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
+      yurt_socket_direct_type[sockfd] != 0) {
+    n = yurt_sys_socket_send(sockfd, buf, req_len);
+    if (n < 0) {
+      errno = yurt_errno_from_host(n, EIO);
+      return -1;
+    }
+    return (ssize_t)n;
+  }
   n = yurt_host_socket_send(yurt_socket_host_fd(sockfd), (int)(intptr_t)buf, req_len, flags);
   if (n < 0) {
     set_socket_errno_from_host(n);
@@ -755,6 +852,17 @@ static ssize_t yurt_recv_impl(int sockfd, void *buf, size_t len, int flags) {
     /* r == -3: not AF_UNIX, fall through. */
   }
 
+  if (sockfd >= 0 && sockfd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
+      yurt_socket_direct_type[sockfd] != 0) {
+    int sys_flags = (flags == MSG_PEEK || flags == YURT_MSG_PEEK) ? MSG_PEEK : 0;
+    n = yurt_sys_socket_recv(sockfd, buf, (int)len, sys_flags);
+    if (n < 0) {
+      errno = yurt_errno_from_host(n, EAGAIN);
+      return -1;
+    }
+    return (ssize_t)n;
+  }
+
   if ((yurt_socket_get_status_flags(sockfd) & O_NONBLOCK) != 0) {
     flags |= 0x04;
   }
@@ -785,8 +893,19 @@ ssize_t sendto(
   if (dest_addr != NULL && dest_addr->sa_family == AF_UNIX) {
     /* AF_UNIX SOCK_DGRAM sendto: typed binary call */
     const struct sockaddr_un *un = (const struct sockaddr_un *)dest_addr;
+    char unix_addr[sizeof("unix:") + sizeof(un->sun_path)];
+    int unix_addr_len = yurt_unix_addr_bytes(un, addrlen, unix_addr, sizeof(unix_addr));
     int sent;
-    (void)flags;
+    if (unix_addr_len < 0) {
+      errno = EINVAL;
+      return -1;
+    }
+    sent = yurt_sys_socket_sendto(sockfd, buf, (int)len, flags, unix_addr, unix_addr_len);
+    if (sent >= 0) return (ssize_t)sent;
+    if (sent != -YURT_HOST_EBADF) {
+      errno = yurt_errno_from_host(sent, ENOENT);
+      return -1;
+    }
     if (un->sun_path[0] == '\0') {
       size_t namelen = (size_t)addrlen > offsetof(struct sockaddr_un, sun_path) + 1
         ? (size_t)addrlen - offsetof(struct sockaddr_un, sun_path) - 1 : 0;
@@ -902,7 +1021,7 @@ static int yurt_getsockopt_impl(int sockfd, int level, int optname, void *optval
 
   switch (optname) {
     case SO_TYPE:
-      value = (yurt_host_socket_is_dgram(yurt_socket_host_fd(sockfd)) == 1) ? SOCK_DGRAM : SOCK_STREAM;
+      value = yurt_socket_type_for_fd(sockfd);
       break;
     case SO_ERROR:
 #if YURT_SO_ERROR != SO_ERROR
@@ -946,6 +1065,16 @@ int shutdown(int sockfd, int how) {
   YURT_MARKER_CALL(shutdown);
 
   (void)how;
+  if (sockfd >= 0 && sockfd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
+      yurt_socket_direct_type[sockfd] != 0) {
+    int rc = yurt_sys_socket_close(sockfd);
+    if (rc < 0) {
+      errno = yurt_errno_from_host(rc, EIO);
+      return -1;
+    }
+    yurt_socket_forget(sockfd);
+    return 0;
+  }
   int host_fd = yurt_socket_host_fd(sockfd);
   int rc = yurt_host_socket_close(host_fd);
   if (rc < 0) {
@@ -1158,7 +1287,9 @@ static int yurt_getsockopt_peercred(int sockfd, void *optval, socklen_t *optlen)
 extern int __real_close(int fd);
 
 int yurt_socket_is_tracked_fd(int fd) {
-  return yurt_socket_find(fd) != NULL || yurt_host_socket_is_dgram(fd) >= 0;
+  return yurt_socket_find(fd) != NULL ||
+         (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX && yurt_socket_direct_type[fd] != 0) ||
+         yurt_host_socket_is_dgram(fd) >= 0;
 }
 
 int yurt_socket_is_guest_fd(int fd) {
@@ -1200,9 +1331,19 @@ int __wrap_close(int fd) {
     yurt_socket_forget(fd);
     return 0;
   }
+  if (fd >= 0 && fd < YURT_SOCKET_DIRECT_FLAGS_MAX &&
+      yurt_socket_direct_type[fd] != 0) {
+    int rc = yurt_sys_socket_close(fd);
+    if (rc == 0) {
+      yurt_socket_forget(fd);
+      return 0;
+    }
+  }
   if (yurt_host_socket_close(fd) == 0) {
     yurt_socket_forget(fd);
     return 0;
   }
-  return __real_close(fd);
+  int rc = __real_close(fd);
+  if (rc == 0) yurt_socket_forget(fd);
+  return rc;
 }

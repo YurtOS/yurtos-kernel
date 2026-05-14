@@ -391,7 +391,8 @@ pub enum SocketKind {
         peer_open: bool,
     },
     UnixDatagram {
-        peer_id: u64,
+        peer_id: Option<u64>,
+        bound_path: Option<Vec<u8>>,
         rx: VecDeque<Vec<u8>>,
         peer_open: bool,
     },
@@ -416,6 +417,7 @@ pub struct Kernel {
     sockets: BTreeMap<u64, SocketEntry>,
     next_socket_id: u64,
     unix_listeners: BTreeMap<Vec<u8>, u64>,
+    unix_datagrams: BTreeMap<Vec<u8>, u64>,
     /// MetadataOverlay — `(mount_id, inode) → Metadata`.
     /// chmod/chown/utimens write here; fstat reads composed
     /// override → backend default → kernel fallback. Survives the
@@ -505,6 +507,7 @@ impl Kernel {
             sockets: BTreeMap::new(),
             next_socket_id: 1,
             unix_listeners: BTreeMap::new(),
+            unix_datagrams: BTreeMap::new(),
             metadata_overrides: BTreeMap::new(),
             pending_spawns: VecDeque::new(),
             next_spawn_pid: 1000,
@@ -709,7 +712,8 @@ impl Kernel {
                 domain: 1,
                 sock_type: 2,
                 kind: SocketKind::UnixDatagram {
-                    peer_id: right,
+                    peer_id: Some(right),
+                    bound_path: None,
                     rx: VecDeque::new(),
                     peer_open: true,
                 },
@@ -722,13 +726,58 @@ impl Kernel {
                 domain: 1,
                 sock_type: 2,
                 kind: SocketKind::UnixDatagram {
-                    peer_id: left,
+                    peer_id: Some(left),
+                    bound_path: None,
                     rx: VecDeque::new(),
                     peer_open: true,
                 },
             },
         );
         (left, right)
+    }
+
+    pub fn create_unix_datagram_socket(&mut self) -> u64 {
+        let id = self.next_socket_id;
+        self.next_socket_id += 1;
+        self.sockets.insert(
+            id,
+            SocketEntry {
+                refs: 1,
+                domain: 1,
+                sock_type: 2,
+                kind: SocketKind::UnixDatagram {
+                    peer_id: None,
+                    bound_path: None,
+                    rx: VecDeque::new(),
+                    peer_open: true,
+                },
+            },
+        );
+        id
+    }
+
+    pub fn bind_unix_datagram(&mut self, id: u64, path: &[u8]) -> Result<(), i32> {
+        if self.unix_datagrams.contains_key(path) {
+            return Err(crate::abi::EADDRINUSE);
+        }
+        let Some(socket) = self.sockets.get_mut(&id) else {
+            return Err(crate::abi::EBADF);
+        };
+        match &mut socket.kind {
+            SocketKind::UnixDatagram { bound_path, .. } => {
+                if let Some(old_path) = bound_path.take() {
+                    self.unix_datagrams.remove(&old_path);
+                }
+                *bound_path = Some(path.to_vec());
+                self.unix_datagrams.insert(path.to_vec(), id);
+                Ok(())
+            }
+            _ => Err(crate::abi::EINVAL),
+        }
+    }
+
+    pub fn unix_datagram_id_for_path(&self, path: &[u8]) -> Option<u64> {
+        self.unix_datagrams.get(path).copied()
     }
 
     pub fn create_unix_listener(&mut self, path: &[u8], backlog: u32) -> Result<u64, i32> {
@@ -814,19 +863,24 @@ impl Kernel {
             socket.refs = socket.refs.saturating_sub(1);
             if socket.refs == 0 {
                 match &socket.kind {
-                    SocketKind::Host { handle } => Some((Some(*handle), None, None, Vec::new())),
+                    SocketKind::Host { handle } => {
+                        Some((Some(*handle), None, None, None, Vec::new()))
+                    }
                     SocketKind::UnixListener { path, pending, .. } => Some((
                         None,
                         None,
                         Some(path.clone()),
+                        None,
                         pending.iter().copied().collect(),
                     )),
                     SocketKind::UnixStream { peer_id, .. } => {
-                        Some((None, Some(*peer_id), None, Vec::new()))
+                        Some((None, Some(*peer_id), None, None, Vec::new()))
                     }
-                    SocketKind::UnixDatagram { peer_id, .. } => {
-                        Some((None, Some(*peer_id), None, Vec::new()))
-                    }
+                    SocketKind::UnixDatagram {
+                        peer_id,
+                        bound_path,
+                        ..
+                    } => Some((None, *peer_id, None, bound_path.clone(), Vec::new())),
                 }
             } else {
                 None
@@ -834,9 +888,12 @@ impl Kernel {
         } else {
             None
         };
-        let (close_handle, peer_id, listener_path, pending_ids) = drop_kind?;
+        let (close_handle, peer_id, listener_path, datagram_path, pending_ids) = drop_kind?;
         if let Some(path) = listener_path {
             self.unix_listeners.remove(&path);
+        }
+        if let Some(path) = datagram_path {
+            self.unix_datagrams.remove(&path);
         }
         for pending_id in pending_ids {
             self.socket_dec_ref(pending_id);

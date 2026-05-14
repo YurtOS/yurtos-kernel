@@ -21,6 +21,25 @@ int yurt_host_file_lock(int fd, int operation);
 __attribute__((import_module("env"), import_name("sys_poll")))
 int yurt_sys_poll(int fds_ptr, int nfds, int timeout_ms);
 
+__attribute__((import_module("env"), import_name("sys_socket_open")))
+int yurt_sys_socket_open(int family, int sock_type, int flags);
+
+__attribute__((import_module("env"), import_name("sys_socket_send")))
+int yurt_sys_socket_send(int fd, const void *buf, int buf_len);
+
+__attribute__((import_module("env"), import_name("sys_socket_recv")))
+int yurt_sys_socket_recv(int fd, void *buf, int buf_cap, int flags);
+
+__attribute__((import_module("env"), import_name("sys_socket_close")))
+int yurt_sys_socket_close(int fd);
+
+__attribute__((import_module("env"), import_name("sys_socket_bind")))
+int yurt_sys_socket_bind(int fd, const void *addr, int addr_len);
+
+__attribute__((import_module("env"), import_name("sys_socket_sendto")))
+int yurt_sys_socket_sendto(int fd, const void *buf, int buf_len, int flags,
+                           const void *addr, int addr_len);
+
 __attribute__((import_module("yurt"), import_name("host_chmod")))
 int yurt_host_chmod(int path_ptr, int path_len, int mode);
 

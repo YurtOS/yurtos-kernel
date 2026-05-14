@@ -350,6 +350,36 @@ export function buildSysImports(
       }
       return rc;
     },
+    sys_socket_open: (family, sockType, flags) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      req[0] = family & 0xff;
+      req[1] = sockType & 0xff;
+      view.setUint32(4, flags >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_SOCKET_OPEN, req);
+    },
+    sys_socket_bind: (fd, addrPtr, addrLen) => {
+      const addr = copyIn(addrPtr, addrLen);
+      if (typeof addr === "number") return addr;
+      const req = new Uint8Array(4 + addr.byteLength);
+      new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+      req.set(addr, 4);
+      return forwardRequestBytes(METHOD.SYS_SOCKET_BIND, req);
+    },
+    sys_socket_sendto: (fd, dataPtr, dataLen, flags, addrPtr, addrLen) => {
+      const data = copyIn(dataPtr, dataLen);
+      if (typeof data === "number") return data;
+      const addr = copyIn(addrPtr, addrLen);
+      if (typeof addr === "number") return addr;
+      const req = new Uint8Array(12 + addr.byteLength + data.byteLength);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, flags >>> 0, true);
+      view.setUint32(8, addr.byteLength >>> 0, true);
+      req.set(addr, 12);
+      req.set(data, 12 + addr.byteLength);
+      return forwardRequestBytes(METHOD.SYS_SOCKET_SENDTO, req);
+    },
     sys_socket_listen: (backlog, addrPtr, addrLen) => {
       const addr = copyIn(addrPtr, addrLen);
       if (typeof addr === "number") return addr;

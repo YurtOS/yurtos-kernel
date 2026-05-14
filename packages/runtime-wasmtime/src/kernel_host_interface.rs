@@ -108,6 +108,9 @@ mod sys_method_id {
     pub const SCHED_SETPARAM: u32 = 0x1_0042;
     pub const POLL: u32 = 0x1_0043;
     pub const SOCKETPAIR: u32 = 0x1_0044;
+    pub const SOCKET_OPEN: u32 = 0x1_0045;
+    pub const SOCKET_BIND: u32 = 0x1_0046;
+    pub const SOCKET_SENDTO: u32 = 0x1_0047;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -4164,6 +4167,80 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 out_ptr,
                 8,
             ) as i32
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_open",
+        |mut caller: Caller<'_, UserState>, family: i32, sock_type: i32, flags: i32| -> i32 {
+            let mut req = [0u8; 8];
+            req[0] = family as u8;
+            req[1] = sock_type as u8;
+            req[4..8].copy_from_slice(&(flags as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_OPEN,
+                &req,
+            ) as i32
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_bind",
+        |mut caller: Caller<'_, UserState>, fd: i32, addr_ptr: u32, addr_len: u32| -> i32 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut addr = vec![0u8; addr_len as usize];
+            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
+                return -22;
+            }
+            let mut req = (fd as u32).to_le_bytes().to_vec();
+            req.extend_from_slice(&addr);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_BIND,
+                &req,
+            ) as i32
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_sendto",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         data_ptr: u32,
+         data_len: u32,
+         flags: i32,
+         addr_ptr: u32,
+         addr_len: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut data = vec![0u8; data_len as usize];
+            if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut data).is_err() {
+                return -22;
+            }
+            let mut addr = vec![0u8; addr_len as usize];
+            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
+                return -22;
+            }
+            let mut req = (fd as u32).to_le_bytes().to_vec();
+            req.extend_from_slice(&(flags as u32).to_le_bytes());
+            req.extend_from_slice(&(addr_len as u32).to_le_bytes());
+            req.extend_from_slice(&addr);
+            req.extend_from_slice(&data);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_SENDTO,
+                &req,
+            )
         },
     )?;
 
