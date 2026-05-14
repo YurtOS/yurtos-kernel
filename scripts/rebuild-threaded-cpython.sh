@@ -5,8 +5,9 @@
 # from the env or defaults to the canonical local checkouts.
 #
 # Usage:
-#   ./scripts/rebuild-threaded-cpython.sh           # full rebuild
-#   ./scripts/rebuild-threaded-cpython.sh stage     # skip the build, just re-stage
+#   ./scripts/rebuild-threaded-cpython.sh           # full rebuild + verify
+#   ./scripts/rebuild-threaded-cpython.sh stage     # skip the build, just re-stage + verify
+#   ./scripts/rebuild-threaded-cpython.sh verify    # skip the build AND staging, run smokes only
 #
 # What it does (in order):
 #   1. cargo build --release for yurt-cc + yurt-ar + yurt-ranlib
@@ -18,11 +19,34 @@
 #   4. Rebuild cpython3.wasm + package it as a .yurtpkg
 #   5. Stage cpython3.wasm + cpython3-lib into the kernel fixtures
 #   6. Stage yurt-jupyter fixtures
-#   7. Run the cpython3-pyzmq + jupyter smoke tests
+#   7. Verify staged cpython3.wasm has the threads shape (memory import +
+#      yurt.features section)
+#   8. Run the regression smokes:
+#       - cpython3-pyzmq smoke (5 steps, should be 5/5 green)
+#       - file-conformance integration test (sunny's guard on the WASI
+#         async-wrap surface — adding path_* to ASYNC_WASI_IMPORTS in
+#         loader.ts must keep this green)
+#       - libzmq-reactor-spawn reproducer (currently FAILS — expected;
+#         flips to green when the WASI path_* async-wrap lands; see the
+#         comment block in loader.ts about ASYNC_WASI_IMPORTS)
+#       - jupyter smoke (steps 1+2 should pass; step 3 currently hangs
+#         on the same gate the reproducer pins)
 #
 # All builds set YURT_CC_USE_THREADS=1 explicitly even though yurt-cc
 # now defaults to threads — this future-proofs against a yurt-cc that
 # regains the toggle.
+#
+# On the JSPI / asyncify-imports prerequisite:
+#   - cpython3 (threaded build) uses JSPI, not asyncify. yurt-cc only
+#     runs the --asyncify pass when YURT_CC_USE_CONTINUATION=1, which
+#     is mutually exclusive with threads (see abi/toolchain/.../env.rs).
+#   - JSPI suspends any WASM import that returns a Promise, with no
+#     per-import declaration needed.
+#   - The one remaining JSPI concern for path_*: i64 argument handling.
+#     If you flip ASYNC_WASI_IMPORTS in loader.ts to include path_open,
+#     this script's file-conformance smoke is the regression test that
+#     catches an i64-arg JSPI bug (or proves it's safe). See sunny's
+#     guard comment in packages/kernel/src/process/loader.ts:115.
 
 set -euo pipefail
 
@@ -52,15 +76,23 @@ unset CC LD AR RANLIB   # let yurt-cc paths resolve from build.sh defaults
 
 step() { echo; echo "==> $*"; }
 
-if [[ "${1:-}" == "stage" ]]; then
-  step "Skip-build mode: re-staging existing artifacts only"
+MODE="${1:-full}"
+case "$MODE" in
+  full|stage|verify) ;;
+  *) echo "error: unknown mode '$MODE' (expected: full, stage, verify)" >&2; exit 2 ;;
+esac
+
+if [[ "$MODE" == "verify" ]]; then
+  step "Verify-only mode: skipping build + staging, running smokes only"
+elif [[ "$MODE" == "stage" ]]; then
+  step "Stage-only mode: skipping build, re-staging existing artifacts"
 else
-  step "1/7  Build yurt-cc + libyurt_abi.a"
+  step "1/8  Build yurt-cc + libyurt_abi.a"
   cd "$KERNEL_ROOT"
   cargo build --release -p yurt-toolchain --bin yurt-cc --bin yurt-ar --bin yurt-ranlib
   make -C abi clean lib
 
-  step "2/7  Rebuild dependent ports (in dependency order)"
+  step "2/8  Rebuild dependent ports (in dependency order)"
   cd "$PORTS_ROOT"
   for port in zlib openssl libzmq pyzmq; do
     if [[ -x "ports/$port/scripts/build.sh" ]]; then
@@ -71,27 +103,30 @@ else
     fi
   done
 
-  step "3/7  Rebuild cpython3.wasm"
+  step "3/8  Rebuild cpython3.wasm"
   ports/cpython/scripts/build.sh
 
-  step "4/7  Package cpython3 as .yurtpkg"
+  step "4/8  Package cpython3 as .yurtpkg"
   ports/cpython/scripts/package.sh
 fi
 
-step "5/7  Stage cpython3 fixtures into the kernel"
-cd "$KERNEL_ROOT"
-scripts/stage-cpython-fixtures.sh
+if [[ "$MODE" != "verify" ]]; then
+  step "5/8  Stage cpython3 fixtures into the kernel"
+  cd "$KERNEL_ROOT"
+  scripts/stage-cpython-fixtures.sh
 
-if [[ -d "$JUPYTER_ROOT/dist/extracted" ]]; then
-  step "6/7  Stage yurt-jupyter fixtures"
-  YURT_JUPYTER_ROOT="$JUPYTER_ROOT" scripts/stage-jupyter-fixtures.sh
-else
-  echo
-  echo "==> 6/7  Skip yurt-jupyter staging — $JUPYTER_ROOT/dist/extracted absent"
-  echo "         Build it: (cd $JUPYTER_ROOT && ./scripts/stage-jupyter-site-packages.sh && ./scripts/package.sh && ./scripts/extract.sh)"
+  if [[ -d "$JUPYTER_ROOT/dist/extracted" ]]; then
+    step "6/8  Stage yurt-jupyter fixtures"
+    YURT_JUPYTER_ROOT="$JUPYTER_ROOT" scripts/stage-jupyter-fixtures.sh
+  else
+    echo
+    echo "==> 6/8  Skip yurt-jupyter staging — $JUPYTER_ROOT/dist/extracted absent"
+    echo "         Build it: (cd $JUPYTER_ROOT && ./scripts/stage-jupyter-site-packages.sh && ./scripts/package.sh && ./scripts/extract.sh)"
+  fi
 fi
 
-step "7/7  Verify staged cpython3.wasm is thread-capable"
+cd "$KERNEL_ROOT"
+step "7/8  Verify staged cpython3.wasm is thread-capable"
 deno eval --no-check '
 const b = await Deno.readFile("packages/kernel/src/platform/__tests__/fixtures/cpython3.wasm");
 const m = await WebAssembly.compile(b);
@@ -110,7 +145,51 @@ if (!feats.some(f => f.includes("threads"))) {
 console.log("ok: cpython3.wasm is thread-capable");
 '
 
-step "Done. To run the smokes:"
-echo "    cd $KERNEL_ROOT"
-echo "    deno test --allow-all packages/kernel/src/__tests__/cpython3-pyzmq_smoke_test.ts"
-echo "    deno test --allow-all packages/kernel/src/__tests__/jupyter_smoke_test.ts"
+step "8/8  Run regression smokes + the deadlock reproducer"
+
+# Track pass/fail of each smoke so the summary at the bottom is honest.
+# Each one runs even if the previous failed — they're independent gates.
+PASS=()
+FAIL=()
+run_smoke() {
+  local name="$1"
+  local path="$2"
+  step "  smoke: $name"
+  if deno test --allow-all "$path"; then
+    PASS+=("$name")
+  else
+    FAIL+=("$name")
+  fi
+}
+
+run_smoke "cpython3-pyzmq (must stay 5/5 green)" \
+  packages/kernel/src/__tests__/cpython3-pyzmq_smoke_test.ts
+
+run_smoke "file-conformance integration (regression gate for adding path_* to ASYNC_WASI_IMPORTS)" \
+  packages/kernel/src/__tests__/file-conformance_integration_test.ts
+
+# The reproducer is the canonical gate for the next layer of the
+# worker-host deadlock chain. Today it FAILS by design — that's the
+# bug it pins. It flips green when packages/kernel/src/process/
+# loader.ts's ASYNC_WASI_IMPORTS gains path_* (after the
+# file-conformance smoke above confirms JSPI i64-arg behavior is
+# safe). See the PR #42 status comment for the full layering.
+run_smoke "libzmq-reactor-spawn reproducer (currently FAILS — expected; flips green when path_* async-wrap lands)" \
+  packages/kernel/src/__tests__/libzmq-reactor-spawn_reproducer_test.ts
+
+if [[ -d packages/kernel/src/platform/__tests__/fixtures/yurt-jupyter ]]; then
+  run_smoke "jupyter (step 3 currently hangs on the same gate the reproducer pins)" \
+    packages/kernel/src/__tests__/jupyter_smoke_test.ts
+fi
+
+step "Summary"
+for t in "${PASS[@]}"; do echo "  ✅ $t"; done
+for t in "${FAIL[@]}"; do echo "  ❌ $t"; done
+echo
+if [[ ${#FAIL[@]} -eq 0 ]]; then
+  echo "All smokes green. If the libzmq-reactor-spawn reproducer is in PASS"
+  echo "and it WAS hanging before, the deadlock chain is fully resolved."
+else
+  echo "${#FAIL[@]} smoke(s) failed. Expected today: the reproducer (and"
+  echo "jupyter step 3) until the WASI path_* async-wrap lands."
+fi
