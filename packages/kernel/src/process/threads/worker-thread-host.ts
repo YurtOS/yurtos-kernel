@@ -163,9 +163,39 @@ workerSelf.onmessage = async (e: MessageEvent<StartMessage>) => {
       }
     }
 
-    // wasi-libc thread-pointer initialiser. Runs AFTER `__tls_base` is
-    // valid because wasi-libc's pthread struct lives inside the TLS
-    // region we just wired up.
+    // Per-worker stack pointer. wasi-threads modules normally export a
+    // `wasi_thread_start(tid, start_arg)` shim that the host invokes;
+    // that shim allocates a fresh stack region and writes its top into
+    // the new instance's `__stack_pointer` global. yurt-cc doesn't
+    // emit `wasi_thread_start` (we dispatch via the indirect call
+    // table instead), so without setting `__stack_pointer` here every
+    // worker pthread keeps the module's data-section default — the
+    // top of the linker-reserved stack region. With multiple
+    // concurrent worker pthreads alive (cpython spawns iopub +
+    // heartbeat + libzmq I/O reactor at minimum) their stacks
+    // overlap in shared linear memory and one worker's stack writes
+    // corrupt another's, eventually surfacing as "memory access out
+    // of bounds" wasm traps. Allocating a per-worker region and
+    // setting the stack pointer to its top fixes this.
+    //
+    // Stack grows down on wasm32 — set pointer to base + size.
+    // Sized at 2 MiB to match what wasi-libc's threaded build
+    // typically reserves per pthread.
+    const PTHREAD_STACK_SIZE = 2 * 1024 * 1024;
+    const stackPointerGlobal = instance.exports.__stack_pointer as
+      | WebAssembly.Global
+      | undefined;
+    if (stackPointerGlobal !== undefined && typeof alloc === "function") {
+      const stackBase = alloc(PTHREAD_STACK_SIZE) | 0;
+      if (stackBase > 0) {
+        stackPointerGlobal.value = stackBase + PTHREAD_STACK_SIZE;
+      }
+    }
+
+    // wasi-libc thread-pointer initialiser. Runs AFTER `__tls_base`
+    // AND `__stack_pointer` are valid because wasi-libc's pthread
+    // struct lives inside the TLS region we just wired up and the
+    // init routine itself uses C-stack.
     const initTp = instance.exports.__wasi_init_tp;
     if (typeof initTp === "function") {
       (initTp as () => void)();
