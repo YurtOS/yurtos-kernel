@@ -1834,7 +1834,10 @@ export class WasiHost {
     return WASI_ESUCCESS;
   }
 
-  private fdFilestatGet(fd: number, bufPtr: number): number {
+  private fdFilestatGet(fd: number, bufPtr: number): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) return this.fdFilestatGetAsync(fd, bufPtr, asyncVfs);
+
     this.checkDeadline();
     // For preopened / directory fds, stat the directory path
     const dirPath = this.dirFds.get(fd);
@@ -1860,13 +1863,51 @@ export class WasiHost {
     return WASI_EBADF;
   }
 
+  private async fdFilestatGetAsync(
+    fd: number,
+    bufPtr: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    const dirPath = this.dirFds.get(fd);
+    if (dirPath !== undefined) {
+      return await this.writeFilestatAsync(bufPtr, dirPath, true, vfs);
+    }
+
+    const target = this.fdTarget(fd);
+    if (target && target.type !== "vfs_file" && target.type !== "vfs_dir") {
+      return this.writeCharDeviceStat(bufPtr);
+    }
+
+    const filePath = this.kernel && this.pid !== undefined
+      ? this.kernel.vfsFilePath(this.pid, fd) ?? this.fdTable.getPath(fd)
+      : this.fdTable.getPath(fd);
+    if (filePath !== undefined) {
+      return await this.writeFilestatAsync(bufPtr, filePath, true, vfs);
+    }
+
+    return WASI_EBADF;
+  }
+
   private fdReaddir(
     fd: number,
     bufPtr: number,
     bufLen: number,
     cookie: bigint,
     bufUsedPtr: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.fdReaddirAsync(
+        fd,
+        bufPtr,
+        bufLen,
+        cookie,
+        bufUsedPtr,
+        asyncVfs,
+      );
+    }
+
     this.checkDeadline();
     const dirPath = this.dirFds.get(fd);
     if (dirPath === undefined) {
@@ -1879,68 +1920,7 @@ export class WasiHost {
         { name: "..", type: "dir" as const },
         ...this.vfs.readdir(dirPath),
       ];
-      const view = this.getView();
-      const bytes = this.getBytes();
-
-      let offset = 0;
-      const startIndex = Number(cookie);
-
-      for (let i = startIndex; i < entries.length; i++) {
-        const entry = entries[i];
-        const nameBytes = this.encodePathName(entry.name);
-
-        // dirent layout: u64 d_next, u64 d_ino, u32 d_namlen, u8 d_type, padding
-        // Total header: 24 bytes, followed by name
-        const entrySize = 24 + nameBytes.byteLength;
-
-        if (offset + entrySize > bufLen) {
-          // Per WASI spec: write as much of the entry as fits so that
-          // bufUsed == bufLen, signaling that there are more entries.
-          const remaining = bufLen - offset;
-          if (remaining > 0) {
-            // Build the full entry in a temp buffer, then copy what fits
-            const tmp = new Uint8Array(entrySize);
-            const tmpView = new DataView(tmp.buffer);
-            tmpView.setBigUint64(0, BigInt(i + 1), true); // d_next
-            tmpView.setBigUint64(8, BigInt(i + 1), true); // d_ino
-            tmpView.setUint32(16, nameBytes.byteLength, true); // d_namlen
-            tmpView.setUint8(20, inodeTypeToWasiFiletype(entry.type)); // d_type
-            tmp.set(nameBytes, 24); // name
-            bytes.set(tmp.subarray(0, remaining), bufPtr + offset);
-            offset += remaining;
-          }
-          break;
-        }
-
-        // d_next: cookie value for next entry
-        view.setBigUint64(bufPtr + offset, BigInt(i + 1), true);
-        offset += 8;
-
-        // d_ino: we don't track real inodes, use index
-        view.setBigUint64(bufPtr + offset, BigInt(i + 1), true);
-        offset += 8;
-
-        // d_namlen
-        view.setUint32(bufPtr + offset, nameBytes.byteLength, true);
-        offset += 4;
-
-        // d_type
-        view.setUint8(bufPtr + offset, inodeTypeToWasiFiletype(entry.type));
-        offset += 1;
-
-        // 3 bytes padding to align to 8 bytes
-        view.setUint8(bufPtr + offset, 0);
-        view.setUint8(bufPtr + offset + 1, 0);
-        view.setUint8(bufPtr + offset + 2, 0);
-        offset += 3;
-
-        // name (not null-terminated)
-        bytes.set(nameBytes, bufPtr + offset);
-        offset += nameBytes.byteLength;
-      }
-
-      const viewAfter = this.getView();
-      viewAfter.setUint32(bufUsedPtr, offset, true);
+      this.writeDirents(entries, bufPtr, bufLen, cookie, bufUsedPtr);
       return WASI_ESUCCESS;
     } catch (err) {
       if (err instanceof VfsError) {
@@ -1948,6 +1928,96 @@ export class WasiHost {
       }
       return fdErrorToWasi(err);
     }
+  }
+
+  private async fdReaddirAsync(
+    fd: number,
+    bufPtr: number,
+    bufLen: number,
+    cookie: bigint,
+    bufUsedPtr: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    const dirPath = this.dirFds.get(fd);
+    if (dirPath === undefined) {
+      return WASI_EBADF;
+    }
+
+    try {
+      const entries = [
+        { name: ".", type: "dir" as const },
+        { name: "..", type: "dir" as const },
+        ...(vfs.readdirAsync
+          ? await vfs.readdirAsync(dirPath)
+          : vfs.readdir(dirPath)),
+      ];
+      this.writeDirents(entries, bufPtr, bufLen, cookie, bufUsedPtr);
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
+  private writeDirents(
+    entries: DirEntry[],
+    bufPtr: number,
+    bufLen: number,
+    cookie: bigint,
+    bufUsedPtr: number,
+  ): void {
+    const view = this.getView();
+    const bytes = this.getBytes();
+
+    let offset = 0;
+    const startIndex = Number(cookie);
+
+    for (let i = startIndex; i < entries.length; i++) {
+      const entry = entries[i];
+      const nameBytes = this.encodePathName(entry.name);
+
+      // dirent layout: u64 d_next, u64 d_ino, u32 d_namlen, u8 d_type, padding
+      // Total header: 24 bytes, followed by name.
+      const entrySize = 24 + nameBytes.byteLength;
+
+      if (offset + entrySize > bufLen) {
+        // Per WASI spec: write as much of the entry as fits so that
+        // bufUsed == bufLen, signaling that there are more entries.
+        const remaining = bufLen - offset;
+        if (remaining > 0) {
+          const tmp = new Uint8Array(entrySize);
+          const tmpView = new DataView(tmp.buffer);
+          tmpView.setBigUint64(0, BigInt(i + 1), true);
+          tmpView.setBigUint64(8, BigInt(i + 1), true);
+          tmpView.setUint32(16, nameBytes.byteLength, true);
+          tmpView.setUint8(20, inodeTypeToWasiFiletype(entry.type));
+          tmp.set(nameBytes, 24);
+          bytes.set(tmp.subarray(0, remaining), bufPtr + offset);
+          offset += remaining;
+        }
+        break;
+      }
+
+      view.setBigUint64(bufPtr + offset, BigInt(i + 1), true);
+      offset += 8;
+      view.setBigUint64(bufPtr + offset, BigInt(i + 1), true);
+      offset += 8;
+      view.setUint32(bufPtr + offset, nameBytes.byteLength, true);
+      offset += 4;
+      view.setUint8(bufPtr + offset, inodeTypeToWasiFiletype(entry.type));
+      offset += 1;
+      view.setUint8(bufPtr + offset, 0);
+      view.setUint8(bufPtr + offset + 1, 0);
+      view.setUint8(bufPtr + offset + 2, 0);
+      offset += 3;
+      bytes.set(nameBytes, bufPtr + offset);
+      offset += nameBytes.byteLength;
+    }
+
+    this.getView().setUint32(bufUsedPtr, offset, true);
   }
 
   private pathOpen(

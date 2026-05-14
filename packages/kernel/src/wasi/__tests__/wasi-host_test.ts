@@ -429,6 +429,51 @@ describe("WasiHost", () => {
     });
   });
 
+  describe("fd_filestat_get", () => {
+    it("awaits async VFS stat operations for directory fds", async () => {
+      const asyncVfs = Object.create(vfs) as VfsLike & {
+        isAsyncVfs: true;
+        stat(path: string): ReturnType<VFS["stat"]>;
+        statAsync(path: string): Promise<ReturnType<VFS["stat"]>>;
+      };
+      asyncVfs.isAsyncVfs = true;
+      asyncVfs.stat = () => {
+        throw new Error("sync stat should not be used");
+      };
+      asyncVfs.statAsync = (path: string) => Promise.resolve(vfs.stat(path));
+      host = new WasiHost({
+        vfs: asyncVfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+      });
+      host.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = "home";
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+      const openErrno = wasi.path_open(
+        3,
+        0,
+        500,
+        pathStr.length,
+        2,
+        BigInt(0),
+        BigInt(0),
+        0,
+        400,
+      );
+      expect(openErrno).toBeInstanceOf(Promise);
+      expect(await openErrno).toBe(WASI_ESUCCESS);
+      const dirFd = view.getUint32(400, true);
+
+      const errno = wasi.fd_filestat_get(dirFd, 520);
+      expect(errno).toBeInstanceOf(Promise);
+      expect(await errno).toBe(WASI_ESUCCESS);
+      expect(view.getUint8(536)).toBe(WASI_FILETYPE_DIRECTORY);
+    });
+  });
+
   describe("clock_time_get", () => {
     it("returns a nanosecond timestamp for realtime clock", () => {
       const { wasi, view } = getImportsAndView(host, memory);
@@ -1278,6 +1323,54 @@ describe("WasiHost", () => {
 
       const errno = wasi.fd_readdir(dirFd, 1000, 4096, BigInt(0), 900);
       expect(errno).toBe(WASI_ESUCCESS);
+      const bufused = view.getUint32(900, true);
+      expect(bufused).toBeGreaterThan(0);
+    });
+
+    it("awaits async VFS readdir operations", async () => {
+      vfs.writeFile("/home/user/a.txt", new Uint8Array(0));
+      const asyncVfs = Object.create(vfs) as VfsLike & {
+        isAsyncVfs: true;
+        statAsync(path: string): Promise<ReturnType<VFS["stat"]>>;
+        readdir(path: string): ReturnType<VFS["readdir"]>;
+        readdirAsync(path: string): Promise<ReturnType<VFS["readdir"]>>;
+      };
+      asyncVfs.isAsyncVfs = true;
+      asyncVfs.statAsync = (path: string) => Promise.resolve(vfs.stat(path));
+      asyncVfs.readdir = () => {
+        throw new Error("sync readdir should not be used");
+      };
+      asyncVfs.readdirAsync = (path: string) =>
+        Promise.resolve(vfs.readdir(path));
+      host = new WasiHost({
+        vfs: asyncVfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+      });
+      host.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = "home/user";
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+      const openErrno = wasi.path_open(
+        3,
+        0,
+        500,
+        pathStr.length,
+        2,
+        BigInt(0),
+        BigInt(0),
+        0,
+        400,
+      );
+      expect(openErrno).toBeInstanceOf(Promise);
+      expect(await openErrno).toBe(WASI_ESUCCESS);
+      const dirFd = view.getUint32(400, true);
+
+      const errno = wasi.fd_readdir(dirFd, 1000, 4096, BigInt(0), 900);
+      expect(errno).toBeInstanceOf(Promise);
+      expect(await errno).toBe(WASI_ESUCCESS);
       const bufused = view.getUint32(900, true);
       expect(bufused).toBeGreaterThan(0);
     });

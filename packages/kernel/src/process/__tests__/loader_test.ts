@@ -504,6 +504,8 @@ Deno.test("loadProcess keeps JSPI WASI wrapping to imports proven safe", async (
   }
   for (
     const name of [
+      "fd_filestat_get",
+      "fd_readdir",
       "path_create_directory",
       "path_filestat_get",
       "path_filestat_set_times",
