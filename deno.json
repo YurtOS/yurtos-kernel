@@ -1,6 +1,9 @@
 {
   "unstable": ["sloppy-imports"],
   "nodeModulesDir": "auto",
+  "exclude": [
+    "packages/kernel/src/platform/__tests__/fixtures/yurt-jupyter/site-packages"
+  ],
   "imports": {
     "@yurt/kernel": "./packages/kernel/src/index.ts",
     "@yurt/kernel-host-interface-js": "./packages/kernel-host-interface-js/mod.ts",

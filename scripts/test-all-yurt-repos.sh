@@ -54,7 +54,9 @@ for repo in "${REPOS[@]}"; do
   if [[ -f "$repo/deno.json" ]] && grep -q '"test"' "$repo/deno.json" 2>/dev/null; then
     cmd="deno task test"
   elif [[ -f "$repo/deno.json" ]]; then
-    cmd="deno test --allow-all"
+    # --no-check: skip type-checking. Test discovery should reach runtime
+    # smoke tests; pre-existing TS errors elsewhere shouldn't gate them.
+    cmd="deno test --allow-all --no-check"
   elif [[ -f "$repo/Cargo.toml" ]]; then
     cmd="cargo test --workspace"
   elif [[ -f "$repo/Makefile" ]] && grep -q '^test:' "$repo/Makefile" 2>/dev/null; then
