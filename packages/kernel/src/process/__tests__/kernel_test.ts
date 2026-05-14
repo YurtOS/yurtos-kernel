@@ -136,7 +136,9 @@ describe("ProcessKernel", () => {
     });
 
     expect(childTable.get(second.readFd)?.type).toBe("pipe_read");
-    expect(childTable.get(second.readFd)).toBe(kernel.getFdTarget(pid, first.readFd));
+    expect(childTable.get(second.readFd)).toBe(
+      kernel.getFdTarget(pid, first.readFd),
+    );
     kernel.dispose();
   });
 
@@ -323,6 +325,34 @@ describe("ProcessKernel", () => {
 
     expect(await kernel.waitpid(child, parent)).toBe(4);
     expect(kernel.hasProcess(child)).toBe(false);
+    kernel.dispose();
+  });
+
+  it("queues SIGCHLD before a waiting parent reaps the child", async () => {
+    const kernel = new ProcessKernel();
+    const parent = kernel.allocPid(1, "parent");
+    const child = kernel.allocPid(parent, "child");
+    const queuedSignals: number[] = [];
+    kernel.attachWasiHost(
+      parent,
+      {
+        queueSignal(sig: number) {
+          queuedSignals.push(sig);
+          return true;
+        },
+        cancelExecution() {},
+      } as unknown as Parameters<ProcessKernel["attachWasiHost"]>[1],
+    );
+
+    const wait = kernel.waitpidInterruptible(
+      child,
+      parent,
+      new Promise<void>(() => {}),
+    );
+    kernel.releaseProcess(child, 0);
+
+    expect(await wait).toEqual({ interrupted: false, exitCode: 0 });
+    expect(queuedSignals).toEqual([17]);
     kernel.dispose();
   });
 

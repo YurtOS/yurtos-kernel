@@ -303,6 +303,43 @@ int sigsuspend(const sigset_t *mask) {
   return -1;
 }
 
+int sigtimedwait(
+  const sigset_t *restrict set,
+  siginfo_t *restrict info,
+  const struct timespec *restrict timeout
+) {
+  YURT_MARKER_CALL(sigsuspend);
+  (void)timeout;
+
+  yurt_signal_init();
+  if (set == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  for (int sig = 1; sig < NSIG; ++sig) {
+    unsigned long long pending_bit;
+    sigset_t mask_bit;
+    if (yurt_pending_signal_bit(sig, &pending_bit) != 0 ||
+        yurt_sigset_mask_bit(sig, &mask_bit) != 0 ||
+        ((*set & mask_bit) == 0) ||
+        ((yurt_pending_signal_mask & pending_bit) == 0)) {
+      continue;
+    }
+
+    yurt_pending_signal_mask &= ~pending_bit;
+    if (info != NULL) {
+      memset(info, 0, sizeof(*info));
+      info->si_signo = sig;
+    }
+    return sig;
+  }
+
+  yurt_host_yield();
+  errno = EAGAIN;
+  return -1;
+}
+
 int pause(void) {
   sigset_t mask;
   sigprocmask(SIG_SETMASK, NULL, &mask);

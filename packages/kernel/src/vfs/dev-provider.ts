@@ -11,6 +11,11 @@
  * - /dev/random, /dev/urandom — endless cryptographically random
  *                bytes via crypto.getRandomValues.  read returns
  *                exactly the requested length; writes are EROFS.
+ * - /dev/tty   — controlling terminal alias (opened via kernel.getControllingTtyState).
+ * - /dev/ttyN, /dev/console — named TTY devices backed by ProcessKernel.
+ *                getNamedTtyState("ttyN"). Open is handled by wasi-host
+ *                path_open before the VFS is consulted; the VFS entries
+ *                exist for stat/readdir visibility only.
  *
  * All four "endless" devices implement streamRead so the FdTable
  * doesn't try to materialize an infinite buffer at open time.  The
@@ -26,10 +31,18 @@ import type { VirtualProvider } from './provider.js';
 /** Compatibility chunk size for the readFile fallback. */
 const LEGACY_READ_SIZE = 4096;
 
-const DEVICES = new Set(['null', 'zero', 'random', 'urandom', 'full', 'tty']);
+const STATIC_DEVICES = new Set(['null', 'zero', 'random', 'urandom', 'full', 'tty']);
+
+// Standard named TTY devices always visible in /dev (open succeeds only when
+// the kernel has registered the tty via createNamedTty).
+const NAMED_TTYS = ['console', 'tty0', 'tty1', 'tty2', 'tty3'];
 
 export class DevProvider implements VirtualProvider {
   readonly fsType = 'devtmpfs';
+
+  private isTtyDevice(subpath: string): boolean {
+    return /^(tty\d+|console)$/.test(subpath);
+  }
 
   readFile(subpath: string): Uint8Array {
     switch (subpath) {
@@ -47,6 +60,7 @@ export class DevProvider implements VirtualProvider {
         return buf;
       }
       default:
+        if (this.isTtyDevice(subpath)) return new Uint8Array(0);
         throw new VfsError('ENOENT', `no such file or directory: /dev/${subpath}`);
     }
   }
@@ -81,6 +95,7 @@ export class DevProvider implements VirtualProvider {
         return out;
       }
       default:
+        if (this.isTtyDevice(subpath)) return new Uint8Array(0);
         throw new VfsError('ENOENT', `no such file or directory: /dev/${subpath}`);
     }
   }
@@ -118,21 +133,25 @@ export class DevProvider implements VirtualProvider {
       case 'tty':
         throw new VfsError('ENXIO', `no controlling terminal: /dev/${subpath}`);
       default:
+        if (this.isTtyDevice(subpath)) {
+          // Named TTY I/O is routed through wasi-host via TtyState;
+          // reaching the VFS layer is unexpected.
+          throw new VfsError('ENXIO', `no tty device: /dev/${subpath}`);
+        }
         throw new VfsError('ENOENT', `no such file or directory: /dev/${subpath}`);
     }
   }
 
   exists(subpath: string): boolean {
     if (subpath === '') return true; // /dev itself
-    return DEVICES.has(subpath);
+    return STATIC_DEVICES.has(subpath) || this.isTtyDevice(subpath);
   }
 
   stat(subpath: string): { type: 'file' | 'dir' | 'char'; size: number } {
     if (subpath === '') {
-      return { type: 'dir', size: DEVICES.size };
+      return { type: 'dir', size: STATIC_DEVICES.size + NAMED_TTYS.length };
     }
-    if (DEVICES.has(subpath)) {
-      // Linux reports 0 for character devices in stat.st_size.
+    if (STATIC_DEVICES.has(subpath) || this.isTtyDevice(subpath)) {
       return { type: 'char', size: 0 };
     }
     throw new VfsError('ENOENT', `no such file or directory: /dev/${subpath}`);
@@ -142,6 +161,9 @@ export class DevProvider implements VirtualProvider {
     if (subpath !== '') {
       throw new VfsError('ENOTDIR', `not a directory: /dev/${subpath}`);
     }
-    return Array.from(DEVICES).map(name => ({ name, type: 'char' as const }));
+    const entries: Array<{ name: string; type: 'char' }> = [];
+    for (const name of STATIC_DEVICES) entries.push({ name, type: 'char' });
+    for (const name of NAMED_TTYS) entries.push({ name, type: 'char' });
+    return entries;
   }
 }

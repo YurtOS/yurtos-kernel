@@ -1,0 +1,474 @@
+# Method-id assignments for the user→kernel trampoline.
+#
+# This file is the *authoritative* mapping between the user-facing
+# syscall names declared in `yurt_abi.toml` (and the kernel-internal
+# methods exposed by `kernel.wasm`) and the stable u32 method IDs the
+# kernel-host interface passes to `kernel_dispatch`.
+#
+# Rules:
+#   - IDs are stable. Never reuse, never renumber. New entries append.
+#   - 0 is reserved for negotiation / health.
+#   - 1..=0xFFFF is the kernel-internal range (echo, now_realtime, …).
+#     These methods are not part of `yurt_abi.toml`; they exist only so
+#     the kernel-host interface can validate trampoline plumbing without a real
+#     syscall.
+#   - 0x1_0000+ is the yurt_abi.toml syscall range. One entry per
+#     `[import.<name>]` in `yurt_abi.toml` — this file lags slightly as
+#     syscalls move from the TS kernel into kernel.wasm.
+#
+# Consumed by `packages/kernel-wasm/build.rs` to emit Rust constants
+# (`METHOD_<UPPERCASE_NAME>: u32`).
+
+[constant.YURT_KERNEL_DISPATCH_NEGOTIATION]
+type = "u32"
+value = 0
+doc = "Reserved method id for protocol negotiation / health checks."
+
+# Kernel-internal methods (1..=0xFFFF range).
+[method.kernel_echo]
+id = 1
+kind = "internal"
+doc = "Round-trip request bytes into the response buffer; validates memory-mediated trampoline."
+
+[method.kernel_now_realtime]
+id = 2
+kind = "internal"
+doc = "Round-trip a kh_now_realtime call into the response buffer; validates kernel→host direction."
+
+[method.kernel_log_test]
+id = 3
+kind = "internal"
+doc = "Emit a fixed log line via kh_log at INFO severity; validates the host log sink wiring."
+
+[method.kernel_provide_stdin]
+id = 4
+kind = "internal"
+doc = "KernelHostInterface-only: append bytes to the target process's stdin buffer. Request bytes are u32 target_pid + payload. Used at spawn time to seed standard input for fixtures and shells."
+
+[method.kernel_close_stdin]
+id = 5
+kind = "internal"
+doc = "KernelHostInterface-only: mark the target process's stdin as EOF. Subsequent sys_read on Stdin returns 0 once the buffer drains. Request bytes are u32 target_pid."
+
+[method.kernel_drain_stdout]
+id = 6
+kind = "internal"
+doc = "KernelHostInterface-only: drain the target process's stdout buffer into the response. Request bytes are u32 target_pid. Returns bytes read (which empties the buffer)."
+
+[method.kernel_drain_stderr]
+id = 7
+kind = "internal"
+doc = "KernelHostInterface-only: drain the target process's stderr buffer into the response. Request bytes are u32 target_pid. Returns bytes read."
+
+[method.kernel_register_file]
+id = 8
+kind = "internal"
+doc = "KernelHostInterface-only: install a file blob into the in-memory ramfs at the given path. Request bytes are u32 path_len (LE) + path_bytes + content_bytes. The path namespace is flat (no directory creation). Returns 0 on success, -EINVAL for malformed input. Phase 2 ramfs is read-only from userland; writes / unlink / mkdir land later."
+
+[method.kernel_install_tar_layer]
+id = 10
+kind = "internal"
+doc = "KernelHostInterface-only: mount a TarLayerBackend at the given prefix. Request bytes: u32 prefix_len LE + prefix_bytes + tar_archive_bytes. The kernel walks the tar at install time and indexes regular-file entries; subsequent sys_open under the prefix serves slices of the archive. Read-only — image layers refuse create/write. Returns 0 on success, -EINVAL for malformed input."
+
+[method.kernel_install_host_fs_mount]
+id = 11
+kind = "internal"
+doc = "KernelHostInterface-only: mount a HostFsBackend at the given prefix. Request bytes are the prefix path (no length header — the entire request is the prefix). Embedders pick where the host fs lives ('/host', '/users/user', '/', whatever); the auto-mount at /host has been removed because the right prefix is workload-specific. Real-disk reads/writes still gate through PolicyEnforcer + HostState.host_fs_root. Returns 0 on success, -EINVAL for empty prefix."
+
+[method.kernel_install_yurtfs]
+id = 12
+kind = "internal"
+doc = "KernelHostInterface-only: mount a full YURTFS L1+L2 overlay at the given prefix in one call. Request bytes are u32 prefix_len LE + prefix_bytes + tar_archive_bytes. The kernel walks the tar (lower / image), creates a fresh ramfs (upper / overlay), composes them via OverlayBackend, and mounts the result. Reads fall through to lower; writes go to upper; first write of a lower-only file copies up. Phase 6 surface — uncompressed tar, no whiteouts, no metadata copy-up, ramfs-backed upper. Returns 0 on success, -EINVAL for malformed input."
+
+[method.sys_wait]
+id = 0x1_002C
+kind = "syscall"
+doc = "POSIX waitpid-style wait. Request bytes: u32 child_pid LE (0 = wait for any child) + u32 flags LE (bit 0 = WNOHANG). Response: 8 bytes — u32 exited_pid LE + i32 exit_status LE. Returns 8 on success, -ECHILD if no children to wait on, -EAGAIN if WNOHANG and no child has exited yet."
+
+# Syscall methods (0x1_0000+ range).
+#
+# These are the real user-process-facing syscalls — `sys_*` names match
+# the architectural reality (the call lands inside kernel.wasm). The
+# current wasm import symbols in `yurt_abi.toml` are still `host_*`
+# while the port is in flight; the kernel-host interface maps each
+# `host_*` import to its `sys_*` method id when forwarding the trampoline
+# call. This is not a compatibility promise for old binaries: current
+# userland should be rebuilt or updated as the ABI names move.
+#
+# Methods land here as they get ported from the TS kernel into
+# kernel.wasm.
+
+[method.sys_getuid]
+id = 0x1_0001
+kind = "syscall"
+doc = "Real user id of the calling process."
+
+[method.sys_geteuid]
+id = 0x1_0002
+kind = "syscall"
+doc = "Effective user id of the calling process."
+
+[method.sys_getgid]
+id = 0x1_0003
+kind = "syscall"
+doc = "Real group id of the calling process."
+
+[method.sys_getegid]
+id = 0x1_0004
+kind = "syscall"
+doc = "Effective group id of the calling process."
+
+[method.sys_getpid]
+id = 0x1_0005
+kind = "syscall"
+doc = "Pid of the calling process. Threaded through kernel_dispatch via caller_pid."
+
+[method.sys_getppid]
+id = 0x1_0006
+kind = "syscall"
+doc = "Parent pid of the calling process. Returns 0 (kernel pid) until the spawn syscall lands and the kernel tracks parent/child relationships."
+
+[method.sys_umask]
+id = 0x1_0007
+kind = "syscall"
+doc = "Set the file-mode-creation mask for the calling process; returns the previous value. Request bytes carry the new mask as a little-endian u32 (only the low 9 bits are meaningful)."
+
+[method.sys_setresuid]
+id = 0x1_0008
+kind = "syscall"
+doc = "Set the calling process's real, effective, and saved uid. Request bytes carry three little-endian u32s: ruid, euid, suid. Phase 2 has no permission checks; security policy comes later. Returns 0 or negated POSIX errno."
+
+[method.sys_setresgid]
+id = 0x1_0009
+kind = "syscall"
+doc = "Set the calling process's real, effective, and saved gid. Request bytes carry three little-endian u32s: rgid, egid, sgid. Returns 0 or negated POSIX errno."
+
+[method.sys_chdir]
+id = 0x1_000A
+kind = "syscall"
+doc = "Change the calling process's working directory. Request bytes carry the path. Phase 2 has no VFS validation — the path is stored verbatim. Returns 0 or negated POSIX errno."
+
+[method.sys_getcwd]
+id = 0x1_000B
+kind = "syscall"
+doc = "Write the calling process's working directory (NUL-terminated) into the response buffer. Returns required size (path length + 1) on success — caller checks against out_cap to detect a too-small buffer (matches the TS host_getcwd convention)."
+
+[method.sys_getrlimit]
+id = 0x1_000C
+kind = "syscall"
+doc = "Read a POSIX resource limit. Request bytes carry the u32 resource id; response is 16 bytes — soft (le u64) followed by hard (le u64). u64::MAX = RLIM_INFINITY. Returns 16 on success, -EINVAL for unsupported resource ids."
+
+[method.sys_setrlimit]
+id = 0x1_000D
+kind = "syscall"
+doc = "Set a POSIX resource limit. Request bytes carry u32 resource id + le u64 soft + le u64 hard (20 bytes). Returns 0 on success, -EINVAL for unsupported resources, -EPERM if the new limit exceeds the existing hard limit (POSIX rule)."
+
+[method.sys_close]
+id = 0x1_000E
+kind = "syscall"
+doc = "Close an open file descriptor. Request bytes carry the u32 fd. Returns 0 on success, -EBADF if the fd is not open."
+
+[method.sys_dup]
+id = 0x1_000F
+kind = "syscall"
+doc = "Duplicate an fd to the lowest unused number. Request bytes carry the u32 oldfd. Returns the new fd (non-negative) on success, -EBADF if oldfd is not open."
+
+[method.sys_dup2]
+id = 0x1_0011
+kind = "syscall"
+doc = "Duplicate oldfd to exactly newfd, silently closing newfd first if it was open. Request bytes carry two u32s: oldfd, newfd. Returns newfd on success, -EBADF if oldfd is not open."
+
+[method.sys_pipe]
+id = 0x1_0012
+kind = "syscall"
+doc = "Create an anonymous pipe. No request. Response is 8 bytes: read_fd (u32 LE) followed by write_fd (u32 LE). Both fds reference the same kernel-side PipeBuf. Returns 8 on success."
+
+[method.sys_read]
+id = 0x1_0013
+kind = "syscall"
+doc = "Read up to response capacity bytes from fd. Request bytes carry the u32 fd. Returns bytes-read on success, 0 for EOF (writers all closed), -EAGAIN if no data and writers still attached, -EBADF for bad fd, -EINVAL for non-readable fd type."
+
+[method.sys_write]
+id = 0x1_0014
+kind = "syscall"
+doc = "Write payload bytes to fd. Request bytes are: u32 fd LE + payload. Returns bytes-written on success, -EPIPE if all readers have closed (pipes), -EBADF for bad fd, -EINVAL for non-writable fd type. Stdout/stderr writes are routed through kh_log."
+
+[method.sys_isatty]
+id = 0x1_0015
+kind = "syscall"
+doc = "POSIX isatty(fd). Request bytes carry the u32 fd. Returns 1 if the fd refers to a terminal (Stdin/Stdout/Stderr today), 0 if it does not, -EBADF if the fd isn't open."
+
+[method.sys_clock_gettime]
+id = 0x1_0016
+kind = "syscall"
+doc = "POSIX clock_gettime. Request bytes carry the u32 clock_id (0 = REALTIME, 1 = MONOTONIC; others -EINVAL). Response is 8 bytes — u64 nanoseconds little-endian. Returns 8 on success, negated POSIX errno on error."
+
+[method.sys_extension_invoke]
+id = 0x1_0010
+kind = "syscall"
+doc = "Forward an opaque request to the host-interface-side extension registry. The kernel acts as a byte courier; wire format is the registry's concern."
+
+[method.sys_getpgid]
+id = 0x1_0017
+kind = "syscall"
+doc = "POSIX getpgid(pid). Request bytes carry the u32 target pid (0 = self). Returns the target's process-group id (>=0) or -ESRCH for unknown pids. Process groups default to the pid itself until setpgid moves them."
+
+[method.sys_setpgid]
+id = 0x1_0018
+kind = "syscall"
+doc = "POSIX setpgid(pid, pgid). Request bytes carry two little-endian u32s: target pid (0 = self), new pgid (0 = use target pid). Phase 2 has no permission checks; security policy comes later. Returns 0 on success or -ESRCH for unknown target."
+
+[method.sys_getsid]
+id = 0x1_0019
+kind = "syscall"
+doc = "POSIX getsid(pid). Request bytes carry the u32 target pid (0 = self). Returns the target's session id (>=0) or -ESRCH for unknown pids. Sessions default to the pid itself until setsid creates a new one."
+
+[method.sys_setsid]
+id = 0x1_001A
+kind = "syscall"
+doc = "POSIX setsid(): make the calling process a new session leader. No request bytes. Sets sid = pgid = caller_pid. Returns the new sid on success, -EPERM if the caller is already a process-group leader (POSIX: a session leader cannot already lead a group)."
+
+[method.sys_kill]
+id = 0x1_001B
+kind = "syscall"
+doc = "POSIX kill(pid, sig). Request bytes carry two little-endian u32s: target pid, signal number (0..=63). Phase 2 records nonzero signals in the target's pending mask but does not deliver — actual delivery requires async unwind (asyncify or JSPI) which lands when the AsyncBridge integration does. Returns 0 on success, -ESRCH for unknown pids, -EINVAL for sig out of range. sig==0 is the POSIX 'is the pid alive?' probe and succeeds only for an existing process."
+
+[method.sys_sigaction]
+id = 0x1_001C
+kind = "syscall"
+doc = "POSIX sigaction(sig, disposition). Request bytes carry two little-endian u32s: signal number (1..=63), disposition. Disposition encoding: 0 = SIG_DFL, 1 = SIG_IGN, anything else is treated as a user-provided wasm function index/pointer (kernel stores it; user-side libc maintains the actual mapping). Phase 2 stores per-pid only; delivery comes with AsyncBridge. Returns the previous disposition on success, -EINVAL for sig out of range."
+
+[method.sys_sched_yield]
+id = 0x1_001D
+kind = "syscall"
+doc = "POSIX sched_yield(). No request bytes. On JS hosts this is the natural AsyncBridge yield point; Phase 2 always returns 0. The kernel records a per-pid yield counter so tests can observe that the syscall reached the kernel. Real cooperative scheduling lands when the AsyncBridge integration does."
+
+[method.sys_nanosleep]
+id = 0x1_001E
+kind = "syscall"
+doc = "POSIX nanosleep(req). Request bytes are 8 bytes — duration in little-endian u64 nanoseconds. Phase 2 returns 0 immediately without actually blocking; real wall-clock sleep needs the AsyncBridge to suspend the process. The kernel still records the most recently requested duration per-pid so tests can observe the value reached the kernel. Returns 0 on success, -EINVAL for short request."
+
+[method.sys_open]
+id = 0x1_001F
+kind = "syscall"
+doc = "Open a file in the in-memory ramfs. Request bytes are u32 flags LE + path bytes (no NUL terminator). Flags bitfield: bit 0 = writable (O_WRONLY/O_RDWR), bit 1 = create-if-missing (O_CREAT), bit 2 = truncate-if-exists (O_TRUNC). Read-only opens (flags=0) require a pre-installed path; CREAT installs an empty file. Returns the new fd (>=0) on success, -ENOENT if no file and no CREAT. The fd points to a fresh open-file-description; dup'd fds share its cursor (POSIX-correct)."
+
+[method.sys_lseek]
+id = 0x1_0020
+kind = "syscall"
+doc = "POSIX lseek. Request bytes: u32 fd LE + i64 offset LE + u32 whence (0=SET, 1=CUR, 2=END). Response: 8 bytes — new offset as i64 LE. Returns 8 on success, -EBADF for closed/non-file fd, -EINVAL for bad whence or negative resulting offset."
+
+[method.sys_fstat]
+id = 0x1_0021
+kind = "syscall"
+doc = "POSIX fstat (subset). Request bytes: u32 fd LE. Response: 16 bytes — u64 size LE + u32 filetype + u32 mode. filetype matches WASI preview1 (2=CHARACTER_DEVICE, 3=DIRECTORY, 4=REGULAR_FILE). Mode comes from the kernel's MetadataOverlay (override → backend default → 0o644 fallback). Returns 16 on success, -EBADF for closed fd."
+
+[method.sys_chmod]
+id = 0x1_0022
+kind = "syscall"
+doc = "POSIX chmod(path, mode). Request bytes: u32 mode LE + path bytes. Writes to the kernel's MetadataOverlay so subsequent fstat reflects the new mode regardless of underlying storage (matters for HostFs / YURTFS L2 where on-disk metadata is the host user's). Phase 6: no permission checks — userland can chmod any path it can open. Returns 0 on success, -ENOENT if the path doesn't resolve."
+
+[method.sys_chown]
+id = 0x1_0023
+kind = "syscall"
+doc = "POSIX chown(path, uid, gid). Request bytes: u32 uid LE + u32 gid LE + path bytes. Writes uid/gid to the MetadataOverlay; underlying storage's owner is unchanged (host fs file stays owned by the kernel-host interface's host user — this is sandbox-view ownership only). Phase 6: no permission checks. Returns 0 on success, -ENOENT for unresolvable path."
+
+[method.sys_utimens]
+id = 0x1_0024
+kind = "syscall"
+doc = "POSIX utimens-style mtime update. Request bytes: u64 mtime_ns LE + path bytes. Writes mtime to the MetadataOverlay. atime is not tracked separately yet — Phase 6 only surfaces mtime through fstat. Returns 0 on success, -ENOENT for unresolvable path."
+
+[method.sys_unlink]
+id = 0x1_0025
+kind = "syscall"
+doc = "POSIX unlink(path). Request bytes: path. Removes the path's user-visible binding: ramfs / overlay-upper drop the entry; overlay marks the path as a whiteout so any underlying lower-layer file is hidden too. HostFs unlink hits kh_real_unlink (not yet wired — returns -EROFS). Tar/Dev/Proc are read-only; unlink returns -EROFS. Returns 0 on success, -ENOENT if the path doesn't resolve, -EROFS if the backend refuses."
+
+[method.sys_stat]
+id = 0x1_0026
+kind = "syscall"
+doc = "POSIX stat(path). Path-based version of sys_fstat. Request bytes: path. Response: same 16-byte layout as sys_fstat (u64 size + u32 filetype + u32 mode). Returns 16 on success, -ENOENT if the path doesn't resolve."
+
+[method.sys_symlink]
+id = 0x1_0027
+kind = "syscall"
+doc = "POSIX symlink(target, link_path). Request bytes: u32 target_len LE + target_bytes + link_path_bytes. Creates a symlink at link_path pointing at target (target may be absolute or relative — the kernel stores the bytes verbatim and resolves at open time). Backends that support symlinks (Ramfs and Overlay-upper) install the link; read-only backends (Tar / Proc / Dev / HostFs without write) return -EROFS. Returns 0 / -EROFS / -EEXIST / -EINVAL."
+
+[method.sys_readlink]
+id = 0x1_0028
+kind = "syscall"
+doc = "POSIX readlink(path). Request bytes: path. Response: target bytes. Returns bytes-written on success, -ENOENT if no symlink at that path, -EINVAL if the path is a regular file."
+
+[method.sys_mkdir]
+id = 0x1_0029
+kind = "syscall"
+doc = "POSIX mkdir(path). Request bytes: path. Creates a directory record. Returns 0 / -EEXIST if path already exists / -EROFS if the backend is read-only."
+
+[method.sys_rmdir]
+id = 0x1_002A
+kind = "syscall"
+doc = "POSIX rmdir(path). Request bytes: path. Removes an empty directory. Returns 0 / -ENOENT / -ENOTEMPTY / -EROFS."
+
+[method.sys_readdir]
+id = 0x1_002B
+kind = "syscall"
+doc = "POSIX-shaped getdents. Request bytes: path. Response: count_le (u32) + (name_len_le u32, type u8, name_bytes)*. Type byte is a WASI filetype (0=UNKNOWN, 3=DIRECTORY, 4=REGULAR_FILE, 7=SYMBOLIC_LINK); userland fills d_type from it and avoids per-entry stat. Truncated when out_cap exceeded; the returned count reflects only what fit. Returns bytes-written on success, -ENOENT for unknown directory, -ENOTDIR if the path is a regular file."
+
+[method.sys_link]
+id = 0x1_002D
+kind = "syscall"
+doc = "POSIX link(target, linkpath). Request bytes: u32 target_len LE + target_bytes + linkpath_bytes. Creates a hard link `linkpath` pointing at the same inode as `target`. Returns 0 on success, -ENOENT if target is missing, -EEXIST if linkpath exists, -EXDEV when the two paths fall on different mounts (cross-mount hard links are not supported), -EPERM when the backend is read-only, or other negated POSIX errno from the backend."
+
+[method.sys_rename]
+id = 0x1_002E
+kind = "syscall"
+doc = "POSIX rename(oldpath, newpath). Request bytes: u32 old_len LE + old_bytes + new_bytes. Atomically moves the entry at `oldpath` to `newpath` within the same mount; if `newpath` exists it is replaced (regular files only — directory replacement is -EEXIST). Returns 0 on success, -ENOENT if old is missing, -EXDEV across mounts, -EISDIR/-ENOTDIR on type mismatch, -EROFS on a read-only backend, or other negated POSIX errno."
+
+[method.sys_socket_connect]
+id = 0x1_0031
+kind = "syscall"
+doc = "Connect an existing socket fd. Request bytes: u32 fd LE + addr bytes (UTF-8 'host:port' or unix:<path>). Returns 0 on success, -EBADF for an invalid fd, -ENOTSOCK for a valid non-socket fd, or a negated connection errno (-EACCES policy denial, -ECONNREFUSED, -EHOSTUNREACH)."
+
+[method.sys_socket_send]
+id = 0x1_0032
+kind = "syscall"
+doc = "Send bytes on a socket fd. Request bytes: u32 fd LE + payload bytes. Returns bytes-sent or -EBADF / -EPIPE / -EAGAIN. Blocking unless the socket was opened with KH_SOCK_NONBLOCK."
+
+[method.sys_socket_recv]
+id = 0x1_0033
+kind = "syscall"
+doc = "Receive bytes on a socket fd into the response buffer. Request bytes: u32 fd LE + u32 flags LE. Returns bytes-read into the response (0 = peer closed / EOF) or -EBADF / -EAGAIN."
+
+[method.sys_socket_close]
+id = 0x1_0034
+kind = "syscall"
+doc = "Close a socket fd previously returned from sys_socket_connect. Request bytes: u32 fd LE. Returns 0 or -EBADF."
+
+[method.sys_socket_listen]
+id = 0x1_0039
+kind = "syscall"
+doc = "Start accepting on an existing bound socket fd. Request: u32 fd LE + u32 backlog LE. Returns 0 on success, -EBADF for an invalid fd, -ENOTSOCK for a valid non-socket fd, or a negated listen errno. Use sys_socket_addr to retrieve the actually-bound port for host TCP listeners."
+
+[method.sys_socket_accept]
+id = 0x1_003A
+kind = "syscall"
+doc = "Block until an incoming connection arrives on `listener_fd`. Request: u32 fd LE + u32 flags LE (KH_SOCK_NONBLOCK = 1). Returns the new connection's socket fd (the same kind sys_socket_connect returns), -EAGAIN with NONBLOCK, or other negated errno."
+
+[method.sys_socket_addr]
+id = 0x1_003B
+kind = "syscall"
+doc = "Return the bound address of a socket fd. Request: u32 fd LE. Response: u16 port LE + addr bytes (UTF-8 'host'). Returns bytes-written or -EBADF. Used after listen() with port=0 to discover which concrete port the host actually bound."
+
+[method.sys_realpath]
+id = 0x1_003C
+kind = "syscall"
+doc = "Canonicalize a path in the kernel-owned VFS. Request bytes are an absolute path or a caller-cwd-relative path. Response is the canonical absolute path plus a trailing NUL byte. Returns required bytes-written on success, required size when out_cap is too small, -ENOENT if the target does not exist, -ENOTDIR for non-directory path components, or -EINVAL for malformed paths or symlink loops."
+
+[method.sys_getpriority]
+id = 0x1_003D
+kind = "syscall"
+doc = "POSIX getpriority(PRIO_PROCESS, who). Request bytes: u32 which + u32 who, where who=0 means the caller. Returns the kernel-owned nice value or -EINVAL/-ESRCH."
+
+[method.sys_setpriority]
+id = 0x1_003E
+kind = "syscall"
+doc = "POSIX setpriority(PRIO_PROCESS, who, prio). Request bytes: u32 which + u32 who + i32 prio. Kernel clamps prio to [-20, 19]. Non-root callers may only increase their numeric nice value; lowering nice requires root credentials. Returns 0 or -EINVAL/-ESRCH/-EPERM."
+
+[method.sys_sched_getscheduler]
+id = 0x1_003F
+kind = "syscall"
+doc = "POSIX sched_getscheduler(pid). Request bytes: u32 pid where 0 means the caller. Returns the kernel-owned scheduler policy, or -ESRCH for a missing target."
+
+[method.sys_sched_getparam]
+id = 0x1_0040
+kind = "syscall"
+doc = "POSIX sched_getparam(pid). Request bytes: u32 pid where 0 means the caller. Returns the kernel-owned sched_priority, or -ESRCH for a missing target."
+
+[method.sys_sched_setscheduler]
+id = 0x1_0041
+kind = "syscall"
+doc = "POSIX sched_setscheduler(pid, policy, priority). Request bytes: u32 pid + i32 policy + i32 priority. Only SCHED_OTHER policy 0 with priority 0 is accepted for unprivileged kernel scheduling; realtime policies are rejected with -EPERM. Returns 0 or -EINVAL/-ESRCH/-EPERM."
+
+[method.sys_sched_setparam]
+id = 0x1_0042
+kind = "syscall"
+doc = "POSIX sched_setparam(pid, priority). Request bytes: u32 pid + i32 priority. For SCHED_OTHER the only valid priority is 0. Returns 0 or -EINVAL/-ESRCH/-EPERM."
+
+[method.sys_poll]
+id = 0x1_0043
+kind = "syscall"
+doc = "POSIX poll over the caller's fd table. Request bytes: i32 timeout_ms LE followed by pollfd records (i32 fd, i16 events, i16 revents ignored). Response overwrites the pollfd records with revents. Returns ready count, or -EINVAL for malformed request/too-small response."
+
+[method.sys_socketpair]
+id = 0x1_0044
+kind = "syscall"
+doc = "Create a connected AF_UNIX socket pair in the caller's fd table. Request bytes: u8 family + u8 sock_type + u16 _pad + u32 flags. Response: u32 fd0 LE + u32 fd1 LE. Returns 8 on success, -EAFNOSUPPORT for non-AF_UNIX, -EPROTOTYPE for unsupported types, or -EINVAL for malformed request/too-small response."
+
+[method.sys_socket_open]
+id = 0x1_0045
+kind = "syscall"
+doc = "Open a kernel-owned socket in the caller's fd table. Request bytes: u8 family + u8 sock_type + u16 _pad + u32 flags. The returned fd shares the same process-local descriptor namespace as files, pipes, and stdio."
+
+[method.sys_socket_bind]
+id = 0x1_0046
+kind = "syscall"
+doc = "Bind a kernel-owned socket to an address. Request bytes: u32 fd LE + address bytes. AF_UNIX addresses use the same unix:<path> binary address convention as socket connect/listen. Returns 0, -EBADF, -ENOTSOCK, or a negated bind errno."
+
+[method.sys_socket_sendto]
+id = 0x1_0047
+kind = "syscall"
+doc = "Send one datagram from a kernel-owned socket to an address. Request bytes: u32 fd LE + u32 flags LE + u32 addr_len LE + address bytes + payload bytes."
+
+[method.sys_socket_sendmsg]
+id = 0x1_0048
+kind = "syscall"
+doc = "Send payload bytes and optional SCM_RIGHTS fd entries on a kernel-owned AF_UNIX socket. Request bytes: u32 fd LE + u32 data_len LE + u32 fd_count LE + data bytes + fd_count*u32 fd numbers."
+
+[method.sys_socket_recvmsg]
+id = 0x1_0049
+kind = "syscall"
+doc = "Receive payload bytes and optional SCM_RIGHTS fd entries from a kernel-owned AF_UNIX socket. Request bytes: u32 fd LE + u32 flags LE + u32 data_cap LE. Response bytes: data_cap payload area followed by u32 fd_count LE + fd_count*u32 received fd numbers. Return value is payload byte count."
+
+[method.sys_idb_get]
+id = 0x1_0035
+kind = "syscall"
+doc = "Read a durable KV entry. Request bytes: u8 store_len + store_name + key bytes (UTF-8). Response: the value bytes (any length). Returns bytes-written on success, -ENOENT if the key isn't present, -EACCES if the embedder denies the access."
+
+[method.sys_idb_put]
+id = 0x1_0036
+kind = "syscall"
+doc = "Write a durable KV entry. Request bytes: u8 store_len + store_name + u32 key_len LE + key_bytes + value_bytes. Returns 0 on success, -EACCES on policy denial, -EIO on backend failure."
+
+[method.sys_idb_delete]
+id = 0x1_0037
+kind = "syscall"
+doc = "Remove a durable KV entry. Request bytes: u8 store_len + store_name + key_bytes. Returns 0 (whether or not the key existed) or -EACCES."
+
+[method.sys_idb_list]
+id = 0x1_0038
+kind = "syscall"
+doc = "List keys in a store with an optional prefix. Request bytes: u8 store_len + store_name + prefix_bytes (empty = all keys). Response: u32 count_le + (u32 key_len_le + key_bytes)*. Returns bytes-written on success, -EACCES on policy denial. Truncated when out_cap exceeded; returned count reflects only what fit."
+
+[method.sys_fetch]
+id = 0x1_0030
+kind = "syscall"
+doc = "Outbound HTTP fetch. Request bytes are yurt_fetch_request_v1. Response bytes are yurt_fetch_response_v1 written into the response buffer up to its capacity. Returns bytes-written (>= 0) on success, or -EACCES when the embedder's PolicyEnforcer denies the request, -ENOSYS when the host has no network backend, -E2BIG when the response doesn't fit. The kernel forwards the request bytes verbatim to kh_fetch_blocking."
+
+[method.sys_spawn]
+id = 0x1_002F
+kind = "syscall"
+doc = "POSIX-shaped spawn(path, argv) — the userland-facing fork+exec. Request bytes: u32 path_len LE + path_bytes + (u32 arg_len + arg_bytes)*. Reads the wasm image at `path` from the VFS, allocates a fresh child pid (kernel range starts at 1000 to avoid collision with the host's user-process pid allocator), records the parent/child relationship, and enqueues a PendingSpawn for the host to instantiate. The kernel-host interface must call drain_pending_spawn between parent syscalls to actually run staged children — without that drain the child never runs. Returns the child pid on success, -ENOENT if path is missing, -ENOMEM if the file can't be read, or -EINVAL on a malformed request."
+
+[method.kernel_list_processes]
+id = 16
+kind = "internal"
+doc = "KernelHostInterface-only: serialize a kernel-owned process table snapshot. Response: u32 count + entries. Each entry is u32 pid, u32 ppid, u32 pgid, u32 sid, u8 state (1 running, 2 exited/zombie), i32 exit_status (-1 when running), u32 command_len, command bytes, u32 fd_count, and fd_count u32 fd numbers. Returns bytes-written or required size when the output buffer is too small."
+
+[method.kernel_list_threads]
+id = 17
+kind = "internal"
+doc = "KernelHostInterface-only: serialize a kernel-owned thread snapshot for one process. Request: u32 pid. Response: u32 count + entries. Each entry is u32 tid, u8 state (1 runnable, 2 blocked, 3 exited), u8 detached, u16 reserved, i32 exit_value (-1 when not exited), and i32 host_thread_handle (-1 when none). Returns bytes-written or required size when the output buffer is too small."
+
+[method.kernel_schedule_next]
+id = 18
+kind = "internal"
+doc = "KernelHostInterface-only: ask the kernel scheduler for the next runnable thread. Response: u32 pid, u32 tid, i32 host_thread_handle (-1 when none), u32 flags, u64 budget_ns. Returns bytes-written, -EAGAIN when no runnable thread exists, or required size when the output buffer is too small."

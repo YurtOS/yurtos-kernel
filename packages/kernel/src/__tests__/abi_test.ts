@@ -1815,11 +1815,10 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
       expect(bbGrep.exitCode).toBe(0);
       expect(bbGrep.stdout.trim()).toBe("foo");
 
-      // Absolute path through the symlink also dispatches.  argv[0]
-      // is the basename of the path the user typed ("grep"), and
-      // BusyBox routes on that — the symlink resolution to busybox.wasm
-      // is what the kernel-side spawn picks, but the dispatcher reads
-      // argv[0], not the resolved path.
+      // Absolute path through the symlink also dispatches. The caller
+      // supplies argv[0] and the kernel must not rewrite it to the
+      // resolved executable path; BusyBox routes on the argv bytes it
+      // receives from the shell/spawn caller.
       const bbAbsGrep = await sandbox.run("/usr/bin/grep foo /tmp/data.txt");
       expect(bbAbsGrep.exitCode).toBe(0);
       expect(bbAbsGrep.stdout.trim()).toBe("foo");

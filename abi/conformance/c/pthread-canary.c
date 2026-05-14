@@ -13,6 +13,7 @@ static int shared_counter = 0;
 static pthread_mutex_t shared_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_key_t tls_key;
 static int exit_poll_pipe[2] = { -1, -1 };
+static pthread_t observed_thread_self;
 
 static void *exit_poll_blocker(void *arg) {
   (void)arg;
@@ -25,6 +26,12 @@ static void *exit_poll_blocker(void *arg) {
 
 static void *return_arg_worker(void *arg) {
   return arg;
+}
+
+static void *record_self_worker(void *arg) {
+  (void)arg;
+  observed_thread_self = pthread_self();
+  return NULL;
 }
 
 static void *pthread_exit_worker(void *arg) {
@@ -64,7 +71,66 @@ static void *worker(void *arg) {
   return NULL;
 }
 
+static int check_posix_thread_identity(void) {
+  pthread_t main_tid = pthread_self();
+  pthread_t created_tid;
+
+  if (pthread_create(&created_tid, NULL, record_self_worker, NULL) != 0) {
+    fprintf(stderr, "pthread-canary: identity pthread_create failed\n");
+    return 1;
+  }
+  if (pthread_join(created_tid, NULL) != 0) {
+    fprintf(stderr, "pthread-canary: identity pthread_join failed\n");
+    return 1;
+  }
+  if (pthread_equal(created_tid, observed_thread_self) == 0) {
+    fprintf(stderr, "pthread-canary: created pthread_t did not match child pthread_self\n");
+    return 1;
+  }
+  if (pthread_equal(created_tid, main_tid) != 0) {
+    fprintf(stderr, "pthread-canary: child pthread_t matched main pthread_self\n");
+    return 1;
+  }
+  if (pthread_equal(main_tid, pthread_self()) == 0) {
+    fprintf(stderr, "pthread-canary: pthread_self not stable in main thread\n");
+    return 1;
+  }
+
+  pthread_t first_tid;
+  pthread_t second_tid;
+  if (pthread_create(&first_tid, NULL, return_arg_worker, NULL) != 0 ||
+      pthread_create(&second_tid, NULL, return_arg_worker, NULL) != 0) {
+    fprintf(stderr, "pthread-canary: distinct-id pthread_create failed\n");
+    return 1;
+  }
+  if (pthread_equal(first_tid, second_tid) != 0) {
+    fprintf(stderr, "pthread-canary: two live threads reported equal pthread_t values\n");
+    return 1;
+  }
+  if (pthread_join(first_tid, NULL) != 0 || pthread_join(second_tid, NULL) != 0) {
+    fprintf(stderr, "pthread-canary: distinct-id pthread_join failed\n");
+    return 1;
+  }
+
+  pthread_t default_attr_tid;
+  void *default_attr_value = NULL;
+  if (pthread_create(&default_attr_tid, NULL, return_arg_worker, (void *)123) != 0) {
+    fprintf(stderr, "pthread-canary: default-attr pthread_create failed\n");
+    return 1;
+  }
+  if (pthread_join(default_attr_tid, &default_attr_value) != 0 || default_attr_value != (void *)123) {
+    fprintf(stderr, "pthread-canary: NULL attr thread was not joinable by default\n");
+    return 1;
+  }
+
+  return 0;
+}
+
 int main(void) {
+  if (check_posix_thread_identity() != 0) {
+    return 1;
+  }
+
   pthread_mutex_t try_lock = PTHREAD_MUTEX_INITIALIZER;
   int try_rc = pthread_mutex_trylock(&try_lock);
   if (try_rc != 0) {
@@ -78,6 +144,19 @@ int main(void) {
   }
   if (pthread_mutex_unlock(&try_lock) != 0) {
     fprintf(stderr, "pthread-canary: pthread_mutex_unlock after trylock failed\n");
+    return 1;
+  }
+
+  pthread_mutexattr_t mutex_attr;
+  int mutex_type = PTHREAD_MUTEX_NORMAL;
+  if (pthread_mutexattr_init(&mutex_attr) != 0 ||
+      pthread_mutexattr_gettype(&mutex_attr, &mutex_type) != 0 ||
+      mutex_type != PTHREAD_MUTEX_NORMAL ||
+      pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE) != 0 ||
+      pthread_mutexattr_gettype(&mutex_attr, &mutex_type) != 0 ||
+      mutex_type != PTHREAD_MUTEX_RECURSIVE ||
+      pthread_mutexattr_destroy(&mutex_attr) != 0) {
+    fprintf(stderr, "pthread-canary: pthread_mutexattr type round-trip failed\n");
     return 1;
   }
 
@@ -101,6 +180,10 @@ int main(void) {
   clockid_t cond_clock = CLOCK_REALTIME;
   if (pthread_condattr_init(&cond_attr) != 0) {
     fprintf(stderr, "pthread-canary: pthread_condattr_init failed\n");
+    return 1;
+  }
+  if (pthread_condattr_getclock(&cond_attr, &cond_clock) != 0 || cond_clock != CLOCK_REALTIME) {
+    fprintf(stderr, "pthread-canary: pthread_condattr default clock failed\n");
     return 1;
   }
   if (pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC) != 0) {
@@ -193,8 +276,13 @@ int main(void) {
   }
   void *detached_return_value = NULL;
   detached_return_rc = pthread_join(detached_return_tid, &detached_return_value);
-  if (detached_return_rc != ESRCH) {
-    fprintf(stderr, "pthread-canary: detached pthread_join returned %d, expected ESRCH=%d\n", detached_return_rc, ESRCH);
+  if (detached_return_rc != EINVAL) {
+    fprintf(stderr, "pthread-canary: detached pthread_join returned %d, expected EINVAL=%d\n", detached_return_rc, EINVAL);
+    return 1;
+  }
+  detached_return_rc = pthread_detach(detached_return_tid);
+  if (detached_return_rc != EINVAL) {
+    fprintf(stderr, "pthread-canary: detached pthread_detach returned %d, expected EINVAL=%d\n", detached_return_rc, EINVAL);
     return 1;
   }
   sched_yield();

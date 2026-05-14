@@ -1,0 +1,12 @@
+[package]
+name = "yurt-kernel-host-interface-core"
+version = "0.1.0"
+edition = "2021"
+description = "Engine-agnostic kernel-host scaffolding shared by kernel-host-interface-wasmtime / kernel-host-interface-wasmedge / kernel-host-interface-wasmer."
+
+[lib]
+name = "yurt_kernel_host_interface_core"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"

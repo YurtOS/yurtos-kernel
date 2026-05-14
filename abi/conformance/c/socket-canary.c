@@ -101,6 +101,14 @@ int main(void) {
     return 1;
   }
 
+  int saved_stdin = fcntl(STDIN_FILENO, F_DUPFD, 10);
+  if (saved_stdin >= 10000) {
+    emit("stdio_not_socket", 1);
+    freeaddrinfo(res);
+    return 1;
+  }
+  if (saved_stdin >= 0) close(saved_stdin);
+
   int flags = fcntl(fd, F_GETFL);
   if (flags < 0 || (flags & O_NONBLOCK) != 0) {
     emit("fcntl_getfl", 1);

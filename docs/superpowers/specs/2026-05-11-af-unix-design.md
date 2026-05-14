@@ -44,7 +44,7 @@ existing `ListenerRegistry`
 ([`packages/kernel/src/network/listener-registry.ts`](../../../packages/kernel/src/network/listener-registry.ts))
 — paired-socket model, rx queues, async/sync rendezvous, refcounted
 fd-table integration — but keyed by pathname / abstract address instead
-of `host:port`. The browser microkernel inherits AF_UNIX for free
+of `host:port`. The browser kernel-host interface inherits AF_UNIX for free
 because it already shares the `ListenerRegistry` instance with
 `BrowserNetworkBridge`
 ([`packages/kernel/src/network/browser-bridge.ts:26-46`](../../../packages/kernel/src/network/browser-bridge.ts)).
@@ -76,7 +76,7 @@ because it already shares the `ListenerRegistry` instance with
 - **`SOCK_SEQPACKET`.** Rarely needed outside DRBD/SCTP; add when a port
   asks.
 - **Fd-passing across the host/sandbox boundary.** A guest sending an
-  fd to the host would require the microkernel to expose host fds as
+  fd to the host would require the kernel-host interface to expose host fds as
   guest fds. Out of scope.
 - **Filesystem-permission gating of AF_UNIX paths.** POSIX gates
   `connect()` on the socket file's mode bits; YurtOS routes the check

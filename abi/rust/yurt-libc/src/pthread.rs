@@ -94,6 +94,9 @@ pub extern "C" fn pthread_join(thread: *mut c_void, retval: *mut *mut c_void) ->
     // SAFETY: imports are provided by the Yurt host. Invalid thread ids are
     // reported as negative return values by the host backend.
     let rv = unsafe { yurt_host_thread_join(pthread_to_thread_id(thread)) };
+    if rv == -EINVAL {
+        return EINVAL;
+    }
     if rv < 0 {
         return ESRCH;
     }
@@ -111,7 +114,10 @@ pub extern "C" fn pthread_join(thread: *mut c_void, retval: *mut *mut c_void) ->
 pub extern "C" fn pthread_detach(thread: *mut c_void) -> c_int {
     // SAFETY: imports are provided by the Yurt host. Invalid thread ids are
     // reported as negative return values by the host backend.
-    if unsafe { yurt_host_thread_detach(pthread_to_thread_id(thread)) } < 0 {
+    let rv = unsafe { yurt_host_thread_detach(pthread_to_thread_id(thread)) };
+    if rv == -EINVAL {
+        EINVAL
+    } else if rv < 0 {
         ESRCH
     } else {
         0

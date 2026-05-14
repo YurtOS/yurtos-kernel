@@ -111,6 +111,45 @@ export interface MountConfig {
 }
 
 export interface SandboxOptions {
+  /**
+   * Which kernel handles syscalls. Default is "ts" (the legacy
+   * TS kernel runtime in this package). Set to "wasm" to route
+   * the subset of host_* imports listed in
+   * `kernel-host-interface-deno/wasm-kernel-imports.ts` through the Rust
+   * kernel.wasm via kernel-host-interface-deno's KernelHostInterface. Imports not
+   * in HOST_BINDINGS keep their TS implementation, so the mode
+   * is a *hybrid* — porting more host_* shifts the mix toward
+   * the Rust kernel without breaking unrelated paths.
+   *
+   * Requires `wasmKernelBytes` when set to "wasm".
+   */
+  kernelImpl?: "ts" | "wasm";
+  /**
+   * kernel.wasm bytes used when `kernelImpl: "wasm"`. Embedders
+   * typically `await Deno.readFile(...)` the artifact built by
+   * `cargo build -p yurt-kernel-wasm --target wasm32-wasip1
+   * --release`. Optional metadata only — the actual wiring is
+   * supplied via `wasmHostImports`.
+   */
+  wasmKernelBytes?: Uint8Array;
+  /**
+   * Factory invoked per-guest-instance to overlay
+   * KernelHostInterface-backed wrappers for the host_* imports listed in
+   * `wasmOverrideNames`. Each wrapper returns Promise<number>;
+   * the loader wraps them with WebAssembly.Suspending (JSPI) or
+   * AsyncifyAsyncBridge (asyncify fallback) before instantiation.
+   *
+   * Required when `kernelImpl: "wasm"`. Typically constructed via
+   * kernel-host-interface-deno's `buildWasmKernelImports` against a
+   * KernelHostInterface loaded from `wasmKernelBytes`.
+   */
+  wasmHostImports?: (
+    memory: WebAssembly.Memory,
+    callerPid: number,
+    cwd: string,
+  ) => Record<string, (...args: number[]) => Promise<number>>;
+  /** Names of host_* imports covered by `wasmHostImports`. */
+  wasmOverrideNames?: string[];
   /** Directory (Node) or URL base (browser) containing .wasm files. */
   wasmDir: string;
   /** Platform adapter. Auto-detected if not provided (Node vs browser). */
@@ -188,6 +227,12 @@ interface SandboxParts {
   storage?: StorageCallbacks;
   bootArgv: string[];
   bootImports?: (api: KernelApi) => Record<string, WebAssembly.ImportValue>;
+  wasmHostImports?: (
+    memory: WebAssembly.Memory,
+    callerPid: number,
+    cwd: string,
+  ) => Record<string, (...args: number[]) => Promise<number>>;
+  wasmOverrideNames?: string[];
 }
 
 interface PasswdEntry {
@@ -231,6 +276,14 @@ export class Sandbox {
   private bootImports:
     | ((api: KernelApi) => Record<string, WebAssembly.ImportValue>)
     | undefined;
+  private wasmHostImports:
+    | ((
+      memory: WebAssembly.Memory,
+      callerPid: number,
+      cwd: string,
+    ) => Record<string, (...args: number[]) => Promise<number>>)
+    | undefined;
+  private wasmOverrideNames: string[] | undefined;
   private activeDeadlineMs: number | undefined;
   private envNeedsSync = false;
   /**
@@ -269,6 +322,8 @@ export class Sandbox {
     this.storage = parts.storage ?? null;
     this.bootArgv = parts.bootArgv;
     this.bootImports = parts.bootImports;
+    this.wasmHostImports = parts.wasmHostImports;
+    this.wasmOverrideNames = parts.wasmOverrideNames;
     this.envNeedsSync = parts.env.size > 0;
   }
 
@@ -302,6 +357,13 @@ export class Sandbox {
     if (options.baseRoot && options.image) {
       throw new Error(
         "Sandbox.create accepts either baseRoot or image, not both",
+      );
+    }
+    if (options.kernelImpl === "wasm" && !options.wasmHostImports) {
+      throw new Error(
+        "Sandbox.create({kernelImpl:'wasm'}) requires wasmHostImports. " +
+          "Construct via kernel-host-interface-deno's buildWasmKernelImports against " +
+          "a KernelHostInterface loaded from wasmKernelBytes.",
       );
     }
     const adapter = options.adapter ?? await Sandbox.detectAdapter();
@@ -448,6 +510,11 @@ export class Sandbox {
     const secLimits = options.security?.limits;
     const kernel = new ProcessKernel({ maxProcesses: secLimits?.processes });
     vfs.setProcessListProvider?.(() => kernel.listProcesses());
+    // Pre-create standard named TTY devices so /dev/ttyN opens work.
+    kernel.createNamedTty("console");
+    kernel.createNamedTty("tty0");
+    kernel.createNamedTty("tty1");
+    kernel.createNamedTty("tty2");
     const processes = new Map<number, Process>();
     const env = new Map<string, string>();
     let sandboxRef: Sandbox | undefined;
@@ -469,6 +536,8 @@ export class Sandbox {
       stderrLimit: secLimits?.stderrBytes,
       toolAllowlist: options.security?.toolAllowlist,
       moduleCache,
+      wasmHostImports: options.wasmHostImports,
+      wasmOverrideNames: options.wasmOverrideNames,
     });
 
     const bootProcess = await loadProcess(loaderCtx, {
@@ -615,8 +684,11 @@ export class Sandbox {
           "/etc/passwd",
           enc.encode(
             [
-              "root:x:0:0:root:/root:/bin/sh",
-              "user:x:1000:1000:user:/home/user/:/bin/sh",
+              // Empty password field (not 'x') → busybox login accepts
+              // blank password without consulting /etc/shadow, which we
+              // don't ship.  root stays locked so login guards the tty.
+              "root:!:0:0:root:/root:/bin/sh",
+              "user::1000:1000:user:/home/user:/bin/sh",
             ].join("\n") + "\n",
           ),
         );
@@ -629,6 +701,27 @@ export class Sandbox {
             ].join("\n") + "\n",
           ),
         );
+        // busybox init reads /etc/inittab to learn which programs to run on
+        // each TTY.  tty1 runs getty which prompts for login; the user entry in
+        // /etc/passwd has an empty password field so no password is required.
+        vfs.writeFile(
+          "/etc/inittab",
+          enc.encode(
+            [
+              "# /etc/inittab — busybox init",
+              "::sysinit:/bin/sh -c 'true'",
+              "tty1::respawn:/sbin/getty 38400 tty1",
+              "::restart:/sbin/init",
+              "::ctrlaltdel:/bin/sh -c 'true'",
+            ].join("\n") + "\n",
+          ),
+        );
+        // /sbin/init is the canonical init location; also link /init for
+        // kernels that look there.  Both point to the same busybox binary.
+        try {
+          vfs.mkdirp("/sbin");
+        } catch { /* exists */ }
+
         for (
           const f of [
             "/etc/os-release",
@@ -636,6 +729,7 @@ export class Sandbox {
             "/etc/hosts",
             "/etc/passwd",
             "/etc/group",
+            "/etc/inittab",
           ]
         ) {
           vfs.chmod(f, 0o444);
@@ -710,6 +804,8 @@ export class Sandbox {
       storage: options.storage,
       bootArgv,
       bootImports: options.bootImports,
+      wasmHostImports: options.wasmHostImports,
+      wasmOverrideNames: options.wasmOverrideNames,
     });
     sandboxRef = sb;
 
@@ -1063,6 +1159,18 @@ export class Sandbox {
     toolAllowlist?: string[];
     moduleCache?: WasmModuleCache;
     processCredentials?: ProcessCredentials;
+    /**
+     * When kernelImpl="wasm", a factory that returns the
+     * KernelHostInterface-backed host_* overlay for a given guest memory.
+     * Wrappers are Promise-returning; the loader wraps them with
+     * Suspending/asyncify alongside the existing async list.
+     */
+    wasmHostImports?: (
+      memory: WebAssembly.Memory,
+      callerPid: number,
+      cwd: string,
+    ) => Record<string, (...args: number[]) => Promise<number>>;
+    wasmOverrideNames?: string[];
   }): LoaderContext {
     const {
       vfs,
@@ -1082,6 +1190,8 @@ export class Sandbox {
       toolAllowlist,
       moduleCache,
       processCredentials,
+      wasmHostImports,
+      wasmOverrideNames,
     } = opts;
     const allowedTools = toolAllowlist ? new Set(toolAllowlist) : null;
 
@@ -1231,13 +1341,24 @@ export class Sandbox {
             return childPid;
           },
         });
-        return {
+        const base: Record<string, WebAssembly.ImportValue> = {
           ...kernelImports,
           host_spawn_async: kernelImports.host_spawn,
         };
+        if (wasmHostImports) {
+          // Overlay KernelHostInterface-backed wrappers. Each wrapper is
+          // Promise<number>; the loader's wrap list wraps them
+          // with Suspending/asyncify before instantiation.
+          const overlay = wasmHostImports(memory, pid, kernel.getCwd(pid));
+          for (const [name, fn] of Object.entries(overlay)) {
+            base[name] = fn as unknown as WebAssembly.ImportValue;
+          }
+        }
+        return base;
       },
       makeFdReadAndClear,
       moduleCache,
+      extraAsyncImports: wasmOverrideNames,
     });
 
     return makeContextWithAllocator((argv) => {
@@ -1559,7 +1680,67 @@ export class Sandbox {
     command: string,
     options?: { stdinData?: Uint8Array },
   ): Promise<RunResult> {
-    return await this.callBootCommand(this.bootProcess, command, options);
+    // If the boot process exports the bash-specific __run_command ABI, use
+    // the legacy callBootCommand path.  Otherwise (e.g. when booting init)
+    // fall through to the POSIX spawn path: read /etc/passwd, pick the
+    // user's shell, and spawn [shell, "-c", command].
+    const hasRunCommand =
+      typeof this.bootProcess.exports.__run_command === "function";
+    if (hasRunCommand) {
+      return await this.callBootCommand(this.bootProcess, command, options);
+    }
+    return await this.runPosixCommand(command, options);
+  }
+
+  private async runPosixCommand(
+    command: string,
+    options?: { stdinData?: Uint8Array },
+  ): Promise<RunResult> {
+    const uid = 1000;
+    const passwdEntry = this.readPasswdEntryForUid(uid);
+    const shell = passwdEntry?.shell || "/bin/sh";
+    const home = passwdEntry?.home || "/home/user";
+    const username = passwdEntry?.username || "user";
+    const env: Record<string, string> = {
+      ...Object.fromEntries(this.env),
+      HOME: home,
+      USER: username,
+      LOGNAME: username,
+      SHELL: shell,
+      PWD: this.env.get("PWD") ?? home,
+    };
+    const startTime = performance.now();
+    let proc: import("./process/handle.js").Process;
+    try {
+      proc = await this.spawn([shell, "-c", command], {
+        mode: "cli",
+        env,
+        cwd: env.PWD,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const isNoEnt = msg.includes("ENOENT") || msg.includes("no such file");
+      return {
+        exitCode: 127,
+        stdout: "",
+        stderr: isNoEnt ? `${shell}: not found\n` : `spawn error: ${msg}\n`,
+        executionTimeMs: performance.now() - startTime,
+      };
+    }
+    if (options?.stdinData) {
+      proc.setStdin(options.stdinData);
+    }
+    const stdout = proc.fdReadAndClear(1);
+    const stderr = proc.fdReadAndClear(2);
+    return {
+      exitCode: proc.exitCode ?? 0,
+      stdout: stdout.data,
+      stderr: stderr.data,
+      executionTimeMs: performance.now() - startTime,
+      ...(stdout.truncated || stderr.truncated
+        ? { truncated: { stdout: stdout.truncated, stderr: stderr.truncated } }
+        : {}),
+    };
   }
 
   private async callBootCommand(
@@ -1837,6 +2018,11 @@ export class Sandbox {
     };
   }
 
+  lstat(path: string): StatResult {
+    this.assertAlive();
+    return this.vfs.lstat(path);
+  }
+
   process(pid: number): Process | undefined {
     this.assertAlive();
     return this.processes.get(pid);
@@ -1900,6 +2086,8 @@ export class Sandbox {
       stderrLimit: this.security?.limits?.stderrBytes,
       toolAllowlist: this.security?.toolAllowlist,
       moduleCache: this.moduleCache,
+      wasmHostImports: this.wasmHostImports,
+      wasmOverrideNames: this.wasmOverrideNames,
     });
     const proc = await loadProcess(loaderCtx, {
       argv,
@@ -1973,6 +2161,23 @@ export class Sandbox {
     state.rows = rows;
     state.cols = cols;
     return new TtyHandle(state);
+  }
+
+  /**
+   * Return the master-side TtyHandle for a named TTY device (e.g. "tty1").
+   *
+   * Named TTYs are pre-created at Sandbox.create() time (console, tty0–tty2).
+   * The guest side (getty, login, shell) opens /dev/ttyN as a slave fd via the
+   * normal path_open path.  The host uses this handle to feed keystrokes to the
+   * guest and read output back — the same interface as openTty() but without
+   * wiring the boot-process fds.
+   *
+   * Returns null if the name is not registered (e.g. "tty9").
+   */
+  getNamedTtyHandle(name: string): TtyHandle | null {
+    this.assertAlive();
+    const state = this.kernel.getNamedTtyState(name);
+    return state ? new TtyHandle(state) : null;
   }
 
   rm(path: string): void {
@@ -2193,6 +2398,8 @@ export class Sandbox {
       stderrLimit: this.security?.limits?.stderrBytes,
       toolAllowlist: this.security?.toolAllowlist,
       moduleCache: this.moduleCache,
+      wasmHostImports: this.wasmHostImports,
+      wasmOverrideNames: this.wasmOverrideNames,
     });
     const childEnv = this.getEnvMap();
     const childBootProcess = await loadProcess(childCtx, {

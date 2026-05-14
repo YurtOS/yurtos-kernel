@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <termios.h>
@@ -150,10 +151,21 @@ int ioctl(int fd, unsigned long request, ...) {
         rc = 0;
         break;
     }
-    case FIONBIO:
+    case FIONBIO: {
+        const int *enabled = va_arg(ap, const int *);
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags < 0) {
+            rc = -1;
+            break;
+        }
+        if (enabled && *enabled) flags |= O_NONBLOCK;
+        else flags &= ~O_NONBLOCK;
+        rc = fcntl(fd, F_SETFL, flags);
+        break;
+    }
     case FIOCLEX:
     case FIONCLEX: {
-        /* Non-blocking mode and close-on-exec flags: accept silently. */
+        /* Close-on-exec is process-local metadata; accept it for now. */
         (void)va_arg(ap, int);
         rc = 0;
         break;

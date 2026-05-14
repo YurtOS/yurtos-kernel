@@ -1,0 +1,382 @@
+# Kernel→Host ABI (kh_*)
+#
+# The interface kernel.wasm imports from any host kernel-host interface
+# (kernel-host-interface-wasmtime, browser kernel-host-interface, kernel-host-interface-deno, bare
+# `wasmtime run`, future runtimes). Implementing this surface plus the
+# `kernel_dispatch` calling contract is sufficient to be a supported
+# backend.
+#
+# Calling convention mirrors yurt_abi.toml:
+#   - Scalars: `>= 0` success, `< 0` negated POSIX errno.
+#   - Variable-size results: caller provides (out_ptr, out_cap); the host
+#     writes a fixed-size record (versioned header for forward compat).
+#   - Strings/bytes: (ptr, len) pairs in kernel.wasm linear memory; never
+#     NUL-terminated at the boundary.
+
+[constant.KH_ABI_VERSION_MAJOR]
+type = "u32"
+value = 0
+doc = "Major version of the kernel↔host ABI. 0 = unstable, pre-1.0."
+
+[constant.KH_ABI_VERSION_MINOR]
+type = "u32"
+value = 1
+doc = "Minor version of the kernel↔host ABI."
+
+# ── Time & entropy ───────────────────────────────────────────────────────────
+
+[import.kh_now_realtime]
+doc = "Wall-clock time in nanoseconds since the Unix epoch, written to *out_ptr (u64)."
+return = "scalar"
+args = [
+  { name = "out_ptr", type = "ptr" },
+]
+
+# ── Real filesystem (only used by the kernel's host-fs-provider) ────────────
+
+[import.kh_real_open]
+doc = "Open a host path. Returns a non-negative kh-fd handle or negated errno."
+return = "scalar"
+args = [
+  { name = "path_ptr", type = "ptr" },
+  { name = "path_len", type = "usize" },
+  { name = "flags", type = "u32" },
+  { name = "mode", type = "u32" },
+]
+
+[import.kh_real_read]
+doc = "Read up to len bytes from a kh-fd into (out_ptr, len). Returns bytes read or negated errno."
+return = "scalar"
+args = [
+  { name = "fd", type = "i32" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "len", type = "usize" },
+]
+
+[import.kh_real_write]
+doc = "Write (data_ptr, data_len) to a kh-fd. Returns bytes written or negated errno."
+return = "scalar"
+args = [
+  { name = "fd", type = "i32" },
+  { name = "data_ptr", type = "ptr" },
+  { name = "data_len", type = "usize" },
+]
+
+[import.kh_real_close]
+doc = "Close a kh-fd."
+return = "scalar"
+args = [
+  { name = "fd", type = "i32" },
+]
+
+[import.kh_real_stat]
+doc = "Stat a host path. Writes a kh_stat_v1 into (out_ptr, out_cap)."
+return = "fixed_out"
+args = [
+  { name = "path_ptr", type = "ptr" },
+  { name = "path_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.kh_real_unlink]
+doc = "Unlink a host path. Returns 0 or negated errno."
+return = "scalar"
+args = [
+  { name = "path_ptr", type = "ptr" },
+  { name = "path_len", type = "usize" },
+]
+
+[import.kh_real_mkdir]
+doc = "Create a host directory. Returns 0 or negated errno."
+return = "scalar"
+args = [
+  { name = "path_ptr", type = "ptr" },
+  { name = "path_len", type = "usize" },
+  { name = "mode", type = "u32" },
+]
+
+[import.kh_real_symlink]
+doc = "Create a host symlink at link pointing to target. Returns 0 or negated errno."
+return = "scalar"
+args = [
+  { name = "target_ptr", type = "ptr" },
+  { name = "target_len", type = "usize" },
+  { name = "link_ptr", type = "ptr" },
+  { name = "link_len", type = "usize" },
+]
+
+[import.kh_real_rename]
+doc = "Rename a host path. Returns 0 or negated errno."
+return = "scalar"
+args = [
+  { name = "old_ptr", type = "ptr" },
+  { name = "old_len", type = "usize" },
+  { name = "new_ptr", type = "ptr" },
+  { name = "new_len", type = "usize" },
+]
+
+# ── Network ──────────────────────────────────────────────────────────────────
+
+[import.kh_fetch_blocking]
+doc = "Synchronous-from-the-kernel HTTP fetch. Request bytes are yurt_fetch_request_v1. Writes yurt_fetch_response_v1 into (out_ptr, out_cap). Returns bytes-written on success, -EACCES when the embedder's PolicyEnforcer denies the request, -E2BIG when the response doesn't fit the output buffer. Implementations on JS hosts use JSPI/asyncify to suspend the kernel; native hosts may run the future on a shared blocking runtime."
+return = "fixed_out"
+args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+# Socket surface is the direct KH interface the Rust kernel imports.
+# The blocking-by-default operations (`kh_socket_recv`,
+# `kh_socket_accept_blocking`)
+# suspend on the host until data is available; the host implementation
+# uses Tokio await on native, JSPI suspension in the browser/Deno, or
+# asyncify unwind/rewind as a fallback. A `flags & KH_SOCK_NONBLOCK` bit
+# returns -EAGAIN immediately when recv/accept would block.
+
+[constant.KH_SOCK_NONBLOCK]
+type = "u32"
+value = 1
+doc = "Non-blocking flag for kh_socket_recv / kh_socket_accept."
+
+[import.kh_socket_connect]
+doc = "Connect to a remote address. Address bytes are UTF-8 'host:port'. Returns a socket handle or negated errno; -EAGAIN with KH_SOCK_NONBLOCK."
+return = "scalar"
+args = [
+  { name = "addr_ptr", type = "ptr" },
+  { name = "addr_len", type = "usize" },
+  { name = "flags", type = "u32" },
+]
+
+[import.kh_socket_send]
+doc = "Send bytes on a socket handle. Returns bytes sent or negated errno."
+return = "scalar"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "data_ptr", type = "ptr" },
+  { name = "data_len", type = "usize" },
+]
+
+[import.kh_socket_recv]
+doc = "Receive into (out_ptr, len). Blocks until data is available or peer closes; with KH_SOCK_NONBLOCK returns -EAGAIN immediately when none is queued. 0 = peer closed (EOF)."
+return = "scalar"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "len", type = "usize" },
+  { name = "flags", type = "u32" },
+]
+
+[import.kh_socket_close]
+doc = "Close a socket handle. Triggers EOF for any in-flight blocking recv/accept on this handle."
+return = "scalar"
+args = [
+  { name = "handle", type = "i32" },
+]
+
+[import.kh_socket_listen_at]
+doc = "Open + bind + listen in one shot. addr is UTF-8 'host:port'; port=0 lets the host pick. Returns a listener handle or negated errno. Use kh_socket_local_addr to fetch the actually-bound port."
+return = "scalar"
+args = [
+  { name = "addr_ptr", type = "ptr" },
+  { name = "addr_len", type = "usize" },
+  { name = "backlog", type = "u32" },
+]
+
+[import.kh_socket_accept_blocking]
+doc = "Block until a connection arrives on `handle`. Returns the connection's socket handle (usable with kh_socket_send/recv/close), -EAGAIN with KH_SOCK_NONBLOCK, or other errno."
+return = "scalar"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "flags", type = "u32" },
+]
+
+[import.kh_socket_local_addr]
+doc = "Write yurt_socket_addr_result_v1 (u32 IPv4 host bytes in network order + u16 port in network order + u16 reserved) for the local address into (out_ptr, out_cap). Returns 8 or negated errno."
+return = "fixed_out"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.kh_socket_peer_addr]
+doc = "Write yurt_socket_addr_result_v1 (u32 IPv4 host bytes in network order + u16 port in network order + u16 reserved) for the connected peer address into (out_ptr, out_cap). Returns 8 or negated errno."
+return = "fixed_out"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+# ── Durable KV (IndexedDB-shaped) ────────────────────────────────────
+#
+# Browser kernel-host interfaces back this with IndexedDB; native ones use a
+# disk-backed key-value store or an in-memory map. The kernel
+# never sees where the bytes live — only the four primitive ops.
+# Stores are arbitrary opaque names (the embedder may forbid
+# certain prefixes via policy).
+
+[import.kh_idb_get]
+doc = "Read a value. Writes (out_ptr, out_cap) and returns bytes-written, or -ENOENT, -EACCES, -E2BIG."
+return = "fixed_out"
+args = [
+  { name = "store_ptr", type = "ptr" },
+  { name = "store_len", type = "usize" },
+  { name = "key_ptr", type = "ptr" },
+  { name = "key_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.kh_idb_put]
+doc = "Write a value. Returns 0 or negated errno."
+return = "scalar"
+args = [
+  { name = "store_ptr", type = "ptr" },
+  { name = "store_len", type = "usize" },
+  { name = "key_ptr", type = "ptr" },
+  { name = "key_len", type = "usize" },
+  { name = "value_ptr", type = "ptr" },
+  { name = "value_len", type = "usize" },
+]
+
+[import.kh_idb_delete]
+doc = "Remove a value. Returns 0 (idempotent) or negated errno."
+return = "scalar"
+args = [
+  { name = "store_ptr", type = "ptr" },
+  { name = "store_len", type = "usize" },
+  { name = "key_ptr", type = "ptr" },
+  { name = "key_len", type = "usize" },
+]
+
+[import.kh_idb_list]
+doc = "List keys with an optional prefix. Writes count + (len, bytes)* into (out_ptr, out_cap). Returns bytes-written or negated errno."
+return = "fixed_out"
+args = [
+  { name = "store_ptr", type = "ptr" },
+  { name = "store_len", type = "usize" },
+  { name = "prefix_ptr", type = "ptr" },
+  { name = "prefix_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+# ── Wasm engine ops ──────────────────────────────────────────────────────────
+
+[import.kh_spawn_process]
+doc = "Instantiate a process module already loaded into the host module cache. context is spawn_context_v1: u16 version, u16 flags, u32 pid, u32 argv_len, argv records. Returns a non-negative instance handle."
+return = "scalar"
+args = [
+  { name = "module_id_ptr", type = "ptr" },
+  { name = "module_id_len", type = "usize" },
+  { name = "context_ptr", type = "ptr" },
+  { name = "context_len", type = "usize" },
+]
+
+[import.kh_destroy_instance]
+doc = "Destroy a process instance, releasing its store."
+return = "scalar"
+args = [
+  { name = "handle", type = "i32" },
+]
+
+[import.kh_process_mem_read]
+doc = "Copy len bytes from process linear memory at addr into kernel memory at dst_ptr."
+return = "scalar"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "addr", type = "u32" },
+  { name = "dst_ptr", type = "ptr" },
+  { name = "len", type = "usize" },
+]
+
+[import.kh_process_mem_write]
+doc = "Copy len bytes from kernel memory at src_ptr into process linear memory at addr."
+return = "scalar"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "addr", type = "u32" },
+  { name = "src_ptr", type = "ptr" },
+  { name = "len", type = "usize" },
+]
+
+[import.kh_process_resume]
+doc = "Resume a suspended process instance with a scalar return value for its in-flight host import call and an abstract run budget in nanoseconds. Hosts translate the budget into their own preemption mechanism (for example wasmtime epochs/fuel or JS safepoint cadence); kernel.wasm never exposes host-specific scheduling internals."
+return = "scalar"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "result", type = "i64" },
+  { name = "budget_ns", type = "u64" },
+]
+
+# ── Extension dispatch ───────────────────────────────────────────────────────
+#
+# The kernel forwards `host_extension_invoke` bytes verbatim to the
+# host-interface-side extension registry. Wire format is opaque byte payloads to
+# kernel.wasm; the kernel only shuttles bytes between the calling process's
+# request and the response buffer. This is the architectural escape hatch for
+# "syscalls implemented via a plugin": database access, custom RPC,
+# language-runtime hooks. Adding a new extension is a host-interface-side
+# registration, never a kernel.wasm change.
+
+[import.kh_extension_invoke]
+doc = "Forward an extension request to the host registry. (req_ptr, req_len) is opaque guest-supplied bytes; the host writes the response bytes into (out_ptr, out_cap) and returns the number of bytes written, or negated errno (-ENOENT if no handler is registered for the requested name)."
+return = "fixed_out"
+args = [
+  { name = "req_ptr", type = "ptr" },
+  { name = "req_len", type = "usize" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+# ── Diagnostics & cooperative yield ──────────────────────────────────────────
+
+[import.kh_log]
+doc = "Emit a structured log message at the given severity (0=debug, 1=info, 2=warn, 3=error)."
+return = "scalar"
+args = [
+  { name = "severity", type = "u32" },
+  { name = "msg_ptr", type = "ptr" },
+  { name = "msg_len", type = "usize" },
+]
+
+# ── Host-side records ────────────────────────────────────────────────────────
+
+[struct.kh_stat_v1]
+doc = "Result of kh_real_stat."
+fields = [
+  { name = "version", type = "u16" },
+  { name = "_pad", type = "u16" },
+  { name = "mode", type = "u32" },
+  { name = "size", type = "u64" },
+  { name = "mtime_ns", type = "u64" },
+  { name = "is_dir", type = "u8" },
+  { name = "is_symlink", type = "u8" },
+  { name = "_reserved", type = "u8[6]" },
+]
+
+[struct.kh_dirent_v1]
+doc = "Single directory entry; readdir returns a packed sequence of these."
+fields = [
+  { name = "version", type = "u16" },
+  { name = "kind", type = "u8" },
+  { name = "_pad", type = "u8" },
+  { name = "name_len", type = "u32" },
+  # Followed by name_len bytes of UTF-8 name, then padded to 4 bytes.
+]
+
+[struct.kh_fetch_result_v1]
+doc = "Result of a completed kh_fetch_send / kh_fetch_poll cycle."
+fields = [
+  { name = "version", type = "u16" },
+  { name = "_pad", type = "u16" },
+  { name = "status", type = "u32" },
+  { name = "body_len", type = "u64" },
+  { name = "headers_len", type = "u32" },
+  { name = "_reserved", type = "u32" },
+  # Followed by body_len bytes, then headers_len bytes (CRLF-delimited).
+]

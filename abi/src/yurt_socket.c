@@ -155,7 +155,7 @@ static void set_socket_errno_from_host(int err) {
   }
 }
 
-int socket(int domain, int type, int protocol) {
+static int yurt_socket_impl(int domain, int type, int protocol) {
   YURT_MARKER_CALL(socket);
 
   if (domain == AF_UNIX) {
@@ -183,7 +183,15 @@ int socket(int domain, int type, int protocol) {
   return fd;
 }
 
-int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+int socket(int domain, int type, int protocol) {
+  return yurt_socket_impl(domain, type, protocol);
+}
+
+int __wrap_socket(int domain, int type, int protocol) {
+  return yurt_socket_impl(domain, type, protocol);
+}
+
+static int yurt_connect_impl(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   YURT_MARKER_CALL(connect);
   char host[256];
   int rc;
@@ -249,6 +257,14 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return -1;
   }
   return 0;
+}
+
+int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+  return yurt_connect_impl(sockfd, addr, addrlen);
+}
+
+int __wrap_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+  return yurt_connect_impl(sockfd, addr, addrlen);
 }
 
 static int yurt_fill_sockaddr_un(
@@ -385,6 +401,18 @@ int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   );
 }
 
+int __wrap_getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+  YURT_MARKER_CALL(getpeername);
+  return yurt_sockname_impl(
+    sockfd,
+    addr,
+    addrlen,
+    "peer",
+    "peer_host",
+    "peer_port"
+  );
+}
+
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   YURT_MARKER_CALL(getsockname);
   return yurt_sockname_impl(
@@ -397,7 +425,19 @@ int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   );
 }
 
-int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+int __wrap_getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+  YURT_MARKER_CALL(getsockname);
+  return yurt_sockname_impl(
+    sockfd,
+    addr,
+    addrlen,
+    "local",
+    "local_host",
+    "local_port"
+  );
+}
+
+static int yurt_bind_impl(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   YURT_MARKER_CALL(bind);
   char host[INET_ADDRSTRLEN];
   int port;
@@ -446,7 +486,15 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   return 0;
 }
 
-int listen(int sockfd, int backlog) {
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+  return yurt_bind_impl(sockfd, addr, addrlen);
+}
+
+int __wrap_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+  return yurt_bind_impl(sockfd, addr, addrlen);
+}
+
+static int yurt_listen_impl(int sockfd, int backlog) {
   YURT_MARKER_CALL(listen);
 
   /* SOCK_DGRAM sockets do not support listen(). */
@@ -470,6 +518,14 @@ int listen(int sockfd, int backlog) {
     return -1;
   }
   return 0;
+}
+
+int listen(int sockfd, int backlog) {
+  return yurt_listen_impl(sockfd, backlog);
+}
+
+int __wrap_listen(int sockfd, int backlog) {
+  return yurt_listen_impl(sockfd, backlog);
 }
 
 static int yurt_accept_impl(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
@@ -700,7 +756,7 @@ ssize_t recvfrom(
   return recv(sockfd, buf, len, flags);
 }
 
-int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+static int yurt_setsockopt_impl(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
   if (!optval || optlen < (socklen_t)sizeof(int)) {
     errno = EINVAL;
     return -1;
@@ -737,6 +793,14 @@ int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t
 
   errno = EOPNOTSUPP;
   return -1;
+}
+
+int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+  return yurt_setsockopt_impl(sockfd, level, optname, optval, optlen);
+}
+
+int __wrap_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+  return yurt_setsockopt_impl(sockfd, level, optname, optval, optlen);
 }
 
 static int yurt_getsockopt_impl(int sockfd, int level, int optname, void *optval, socklen_t *optlen) {
@@ -796,7 +860,7 @@ int __wrap_getsockopt(int sockfd, int level, int optname, void *optval, socklen_
   return yurt_getsockopt_impl(sockfd, level, optname, optval, optlen);
 }
 
-int shutdown(int sockfd, int how) {
+static int yurt_shutdown_impl(int sockfd, int how) {
   YURT_MARKER_CALL(shutdown);
 
   (void)how;
@@ -806,6 +870,14 @@ int shutdown(int sockfd, int how) {
     return -1;
   }
   return 0;
+}
+
+int shutdown(int sockfd, int how) {
+  return yurt_shutdown_impl(sockfd, how);
+}
+
+int __wrap_shutdown(int sockfd, int how) {
+  return yurt_shutdown_impl(sockfd, how);
 }
 
 /* socketpair — backed by the in-kernel UnixSocketRegistry via

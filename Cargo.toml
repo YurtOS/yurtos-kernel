@@ -1,6 +1,10 @@
 [workspace]
 members = [
   "packages/runtime-wasmtime",
+  "packages/kernel-host-interface-core",
+  "packages/kernel-host-interface-wasmedge",
+  "packages/kernel-host-interface-wasmer",
+  "packages/kernel-wasm",
   "test-fixtures/yurt-process",
   "test-fixtures/shell",
   "test-fixtures/shell-exec",
@@ -16,6 +20,8 @@ members = [
   "test-fixtures/wasm/wc-bytes",
   "test-fixtures/wasm/true-cmd",
   "test-fixtures/wasm/false-cmd",
+  "test-fixtures/wasm/cat-ramfs",
+  "test-fixtures/wasm/proc-cmdline",
   "abi/conformance/rust/dup2-canary",
   "abi/conformance/rust/getgroups-canary",
   "abi/conformance/rust/affinity-canary",

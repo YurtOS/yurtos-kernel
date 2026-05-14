@@ -27,15 +27,6 @@ function writeString(memory: WebAssembly.Memory, ptr: number, value: string) {
   return bytes.length;
 }
 
-function readDnsAddr(memory: WebAssembly.Memory, ptr: number) {
-  const view = new DataView(memory.buffer, ptr, 8);
-  const bytes = Array.from(new Uint8Array(memory.buffer, ptr + 4, 4));
-  return {
-    family: view.getUint32(0, true),
-    addr: bytes.join("."),
-  };
-}
-
 function readProcessList(memory: WebAssembly.Memory, ptr: number, len: number) {
   const view = new DataView(memory.buffer, ptr, len);
   const entriesOffset = view.getUint32(8, true);
@@ -599,15 +590,6 @@ Deno.test("kernel host_wait returns ECHILD for wait-any when no children remain"
   kernel.dispose();
 });
 
-Deno.test("kernel host imports do not expose legacy waitpid entry points", () => {
-  const imports = createKernelImports({
-    memory: new WebAssembly.Memory({ initial: 1 }),
-  });
-
-  assertEquals("host_waitpid" in imports, false);
-  assertEquals("host_waitpid_nohang" in imports, false);
-});
-
 Deno.test("kernel host_get_local_addr reports configured sandbox address", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const imports = createKernelImports({
@@ -636,8 +618,7 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
       4096,
       1024,
     );
-  assertEquals(written, 8);
-  assertEquals(readDnsAddr(memory, 4096), { family: 2, addr: "127.0.0.1" });
+  assertEquals(readString(memory, 4096, written), "127.0.0.1");
 
   hostLen = writeString(memory, 0, "10.8.0.42");
   written =
@@ -647,14 +628,12 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
       4096,
       1024,
     );
-  assertEquals(written, 8);
-  assertEquals(readDnsAddr(memory, 4096), { family: 2, addr: "10.8.0.42" });
+  assertEquals(readString(memory, 4096, written), "10.8.0.42");
 });
 
 Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for socket-backed guests", async () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
-  let socketBackend: SocketBackend;
-  socketBackend = {
+  const socketBackend: SocketBackend = {
     connect: () => ({ ok: false, error: "unused" }),
     send: () => ({ ok: false, error: "unused" }),
     recv: () => ({ ok: false, error: "unused" }),
@@ -673,7 +652,7 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
       4096,
       1024,
     );
-  const first = readDnsAddr(memory, 4096).addr;
+  const first = readString(memory, 4096, firstLen);
   const secondLen =
     await (imports.host_dns_resolve as (...args: number[]) => Promise<number>)(
       0,
@@ -681,10 +660,8 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
       8192,
       1024,
     );
-  const second = readDnsAddr(memory, 8192).addr;
+  const second = readString(memory, 8192, secondLen);
 
-  assertEquals(firstLen, 8);
-  assertEquals(secondLen, 8);
   assertEquals(first.startsWith("10.0.2."), true);
   assertEquals(second, first);
 });

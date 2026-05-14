@@ -12,7 +12,23 @@ Current contents:
   `cargo-yurt` and the Yurt-built standard library.
 - `*.spec.toml` — behavioral traces for deterministic cases that should be
   stable across the C and Rust frontends.
+- `scripts/open-posix-harness.ts` — an opt-in runner for a curated subset of
+  Bytecode Alliance's `open-posix-test-suite`. The upstream checkout and built
+  wasm outputs live under ignored `test-fixtures/open-posix-*` paths.
 
 Specs are intentionally selective. A symbol can be Tier 1 signature-covered
 without a TOML spec when its behavior depends on host process state, networking,
 or follow-up kernel work that is not deterministic enough for the trace harness.
+
+Run the external POSIX subset manually with:
+
+```bash
+deno run -A scripts/open-posix-harness.ts
+```
+
+The default subset is intentionally small and green: `pthread_self/1-1`,
+`pthread_equal/1-1`, and `pthread_create/1-1`. Process probes such as
+`fork/4-1`, `fork/6-1`, and `fork/9-1` are wired for explicit `--cases` runs
+while the fork/exec surface is still being brought up. Promote cases into the
+default only when the corresponding kernel surface has deterministic behavior
+and failures are actionable.
