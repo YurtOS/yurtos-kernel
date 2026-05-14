@@ -24,6 +24,20 @@ include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
 #[allow(dead_code)]
 pub const KERNEL_PID: u32 = 0;
 
+fn has_buffer_capacity(current: usize, additional: usize) -> bool {
+    additional <= crate::kernel::KERNEL_BUFFER_CAP
+        && current <= crate::kernel::KERNEL_BUFFER_CAP - additional
+}
+
+fn datagram_queue_bytes(rx: &std::collections::VecDeque<Vec<u8>>) -> usize {
+    rx.iter().map(Vec::len).sum()
+}
+
+fn rights_queue_full(rights: &Option<Vec<FdEntry>>, queue_len: usize) -> bool {
+    !rights.as_ref().is_some_and(Vec::is_empty)
+        && queue_len >= crate::kernel::KERNEL_RIGHTS_QUEUE_CAP
+}
+
 pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     match method_id {
         METHOD_KERNEL_ECHO => echo(request, response),
@@ -371,9 +385,15 @@ fn provide_stdin(request: &[u8]) -> i64 {
     let pid = u32::from_le_bytes([request[0], request[1], request[2], request[3]]);
     let payload = &request[4..];
     with_kernel(|k| {
-        k.process_mut(pid).stdin_buffer.extend(payload);
-    });
-    payload.len() as i64
+        let Some(p) = k.process_existing_mut(pid) else {
+            return -(abi::ESRCH as i64);
+        };
+        if !has_buffer_capacity(p.stdin_buffer.len(), payload.len()) {
+            return -(abi::EAGAIN as i64);
+        }
+        p.stdin_buffer.extend(payload);
+        payload.len() as i64
+    })
 }
 
 /// `kernel_drain_stdout|stderr(target_pid)`. KernelHostInterface-only;
@@ -384,7 +404,9 @@ fn drain_stream(request: &[u8], response: &mut [u8], stdout: bool) -> i64 {
         return -(abi::EINVAL as i64);
     };
     with_kernel(|k| {
-        let p = k.process_mut(pid);
+        let Some(p) = k.process_existing_mut(pid) else {
+            return -(abi::ESRCH as i64);
+        };
         let buf = if stdout {
             &mut p.stdout_buffer
         } else {
@@ -406,9 +428,12 @@ fn close_stdin(request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     };
     with_kernel(|k| {
-        k.process_mut(pid).stdin_eof = true;
-    });
-    0
+        let Some(p) = k.process_existing_mut(pid) else {
+            return -(abi::ESRCH as i64);
+        };
+        p.stdin_eof = true;
+        0
+    })
 }
 
 const PROCESS_STATE_RUNNING: u8 = 1;
@@ -742,6 +767,9 @@ fn socket_send_id(k: &mut Kernel, id: u64, data: &[u8]) -> i64 {
             let SocketKind::UnixStream { rx, .. } = &mut peer.kind else {
                 return -(abi::EPIPE as i64);
             };
+            if !has_buffer_capacity(rx.len(), data.len()) {
+                return -(abi::EAGAIN as i64);
+            }
             rx.extend(data);
             data.len() as i64
         }
@@ -755,6 +783,9 @@ fn socket_send_id(k: &mut Kernel, id: u64, data: &[u8]) -> i64 {
             let SocketKind::UnixDatagram { rx, .. } = &mut peer.kind else {
                 return -(abi::EPIPE as i64);
             };
+            if !has_buffer_capacity(datagram_queue_bytes(rx), data.len()) {
+                return -(abi::EAGAIN as i64);
+            }
             rx.push_back(data.to_vec());
             data.len() as i64
         }
@@ -784,6 +815,9 @@ fn socket_sendto_id(k: &mut Kernel, id: u64, addr: &[u8], data: &[u8]) -> i64 {
     let SocketKind::UnixDatagram { rx, .. } = &mut target.kind else {
         return -(abi::ECONNREFUSED as i64);
     };
+    if !has_buffer_capacity(datagram_queue_bytes(rx), data.len()) {
+        return -(abi::EAGAIN as i64);
+    }
     rx.push_back(data.to_vec());
     data.len() as i64
 }
@@ -837,11 +871,16 @@ fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>)
                 let SocketKind::UnixStream { rx, rights: q, .. } = &mut peer.kind else {
                     return -(abi::EPIPE as i64);
                 };
-                rx.extend(data);
-                if !rights.as_ref().is_some_and(Vec::is_empty) {
-                    q.push_back(rights.take().expect("rights present"));
+                if !has_buffer_capacity(rx.len(), data.len()) || rights_queue_full(&rights, q.len())
+                {
+                    -(abi::EAGAIN as i64)
+                } else {
+                    rx.extend(data);
+                    if !rights.as_ref().is_some_and(Vec::is_empty) {
+                        q.push_back(rights.take().expect("rights present"));
+                    }
+                    data.len() as i64
                 }
-                data.len() as i64
             }
         }
         Some(SocketKind::UnixDatagram {
@@ -858,11 +897,17 @@ fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>)
                 let SocketKind::UnixDatagram { rx, rights: q, .. } = &mut peer.kind else {
                     return -(abi::EPIPE as i64);
                 };
-                rx.push_back(data.to_vec());
-                if !rights.as_ref().is_some_and(Vec::is_empty) {
-                    q.push_back(rights.take().expect("rights present"));
+                if !has_buffer_capacity(datagram_queue_bytes(rx), data.len())
+                    || rights_queue_full(&rights, q.len())
+                {
+                    -(abi::EAGAIN as i64)
+                } else {
+                    rx.push_back(data.to_vec());
+                    if !rights.as_ref().is_some_and(Vec::is_empty) {
+                        q.push_back(rights.take().expect("rights present"));
+                    }
+                    data.len() as i64
                 }
-                data.len() as i64
             }
         }
         Some(SocketKind::Open { .. }) | Some(SocketKind::Host { .. }) => -(abi::EOPNOTSUPP as i64),
@@ -1087,15 +1132,19 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
         match entry {
             crate::kernel::FdEntry::Stdin => -(abi::EINVAL as i64),
             crate::kernel::FdEntry::Stdout => {
-                k.process_mut(caller_pid)
-                    .stdout_buffer
-                    .extend_from_slice(payload);
+                let p = k.process_mut(caller_pid);
+                if !has_buffer_capacity(p.stdout_buffer.len(), payload.len()) {
+                    return -(abi::EAGAIN as i64);
+                }
+                p.stdout_buffer.extend_from_slice(payload);
                 payload.len() as i64
             }
             crate::kernel::FdEntry::Stderr => {
-                k.process_mut(caller_pid)
-                    .stderr_buffer
-                    .extend_from_slice(payload);
+                let p = k.process_mut(caller_pid);
+                if !has_buffer_capacity(p.stderr_buffer.len(), payload.len()) {
+                    return -(abi::EAGAIN as i64);
+                }
+                p.stderr_buffer.extend_from_slice(payload);
                 payload.len() as i64
             }
             crate::kernel::FdEntry::Pipe {
@@ -1108,6 +1157,9 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
                 };
                 if buf.read_ends == 0 {
                     return -(abi::EPIPE as i64);
+                }
+                if !has_buffer_capacity(buf.bytes.len(), payload.len()) {
+                    return -(abi::EAGAIN as i64);
                 }
                 buf.bytes.extend(payload);
                 payload.len() as i64
@@ -4611,6 +4663,50 @@ mod tests {
     }
 
     #[test]
+    fn unix_stream_send_over_full_peer_buffer_is_eagain() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut fds = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 1, 0), &mut fds),
+            8
+        );
+        let left = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let right = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+
+        let fill = vec![b'z'; crate::kernel::KERNEL_BUFFER_CAP];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SEND,
+                1,
+                &socket_send_req(left, &fill),
+                &mut []
+            ),
+            crate::kernel::KERNEL_BUFFER_CAP as i64
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SEND,
+                1,
+                &socket_send_req(left, b"!"),
+                &mut []
+            ),
+            -(abi::EAGAIN as i64)
+        );
+
+        let mut out = vec![0u8; crate::kernel::KERNEL_BUFFER_CAP + 1];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECV,
+                1,
+                &socket_recv_req(right, 0),
+                &mut out
+            ),
+            crate::kernel::KERNEL_BUFFER_CAP as i64
+        );
+        assert_eq!(&out[..crate::kernel::KERNEL_BUFFER_CAP], fill.as_slice());
+    }
+
+    #[test]
     fn socketpair_accepts_wasi_af_unix_stream_constants() {
         let _g = crate::kernel::TestGuard::acquire();
         let mut fds = [0u8; 8];
@@ -4888,6 +4984,47 @@ mod tests {
     }
 
     #[test]
+    fn socket_sendmsg_rights_queue_over_cap_is_eagain() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut socket_fds = [0u8; 8];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKETPAIR,
+                1,
+                &socketpair_req(1, 1, 0),
+                &mut socket_fds
+            ),
+            8
+        );
+        let left = u32::from_le_bytes(socket_fds[0..4].try_into().unwrap());
+
+        let mut pipe_fds = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_fds), 8);
+        let pipe_read = u32::from_le_bytes(pipe_fds[0..4].try_into().unwrap());
+
+        for _ in 0..crate::kernel::KERNEL_RIGHTS_QUEUE_CAP {
+            assert_eq!(
+                dispatch(
+                    METHOD_SYS_SOCKET_SENDMSG,
+                    1,
+                    &socket_sendmsg_req(left, b"", &[pipe_read]),
+                    &mut []
+                ),
+                0
+            );
+        }
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SENDMSG,
+                1,
+                &socket_sendmsg_req(left, b"", &[pipe_read]),
+                &mut []
+            ),
+            -(abi::EAGAIN as i64)
+        );
+    }
+
+    #[test]
     fn socketpair_close_reports_hangup_and_eof_to_peer() {
         let _g = crate::kernel::TestGuard::acquire();
         let mut fds = [0u8; 8];
@@ -5039,6 +5176,37 @@ mod tests {
             dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []),
             -(abi::EPIPE as i64)
         );
+    }
+
+    #[test]
+    fn pipe_write_over_full_buffer_is_eagain_and_preserves_existing_bytes() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut fds = [0u8; 8];
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds);
+        let read_fd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let write_fd = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+
+        let fill = vec![b'a'; crate::kernel::KERNEL_BUFFER_CAP];
+        let mut wreq = write_fd.to_le_bytes().to_vec();
+        wreq.extend_from_slice(&fill);
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []),
+            crate::kernel::KERNEL_BUFFER_CAP as i64
+        );
+
+        let mut extra = write_fd.to_le_bytes().to_vec();
+        extra.extend_from_slice(b"b");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &extra, &mut []),
+            -(abi::EAGAIN as i64)
+        );
+
+        let mut out = vec![0u8; crate::kernel::KERNEL_BUFFER_CAP + 1];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &read_fd.to_le_bytes(), &mut out),
+            crate::kernel::KERNEL_BUFFER_CAP as i64
+        );
+        assert_eq!(&out[..crate::kernel::KERNEL_BUFFER_CAP], fill.as_slice());
     }
 
     #[test]
@@ -5200,6 +5368,43 @@ mod tests {
     }
 
     #[test]
+    fn stdout_buffer_over_cap_is_eagain() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let fill = vec![b'x'; crate::kernel::KERNEL_BUFFER_CAP];
+        let mut wreq = 1_u32.to_le_bytes().to_vec();
+        wreq.extend_from_slice(&fill);
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &wreq, &mut []),
+            crate::kernel::KERNEL_BUFFER_CAP as i64
+        );
+
+        let mut extra = 1_u32.to_le_bytes().to_vec();
+        extra.extend_from_slice(b"y");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &extra, &mut []),
+            -(abi::EAGAIN as i64)
+        );
+    }
+
+    #[test]
+    fn provide_stdin_over_cap_is_eagain() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let pid = 9_u32;
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(pid);
+        });
+
+        let fill = vec![b'x'; crate::kernel::KERNEL_BUFFER_CAP];
+        let mut req = pid.to_le_bytes().to_vec();
+        req.extend_from_slice(&fill);
+        assert_eq!(provide_stdin(&req), crate::kernel::KERNEL_BUFFER_CAP as i64);
+
+        let mut extra = pid.to_le_bytes().to_vec();
+        extra.extend_from_slice(b"y");
+        assert_eq!(provide_stdin(&extra), -(abi::EAGAIN as i64));
+    }
+
+    #[test]
     fn write_to_stderr_uses_separate_per_pid_buffer() {
         let _g = crate::kernel::TestGuard::acquire();
         let mut w = Vec::new();
@@ -5262,6 +5467,9 @@ mod tests {
     #[test]
     fn read_from_empty_stdin_with_eof_is_zero() {
         let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(1);
+        });
         let close_req = 1_u32.to_le_bytes();
         assert_eq!(
             dispatch(METHOD_KERNEL_CLOSE_STDIN, 0, &close_req, &mut []),
@@ -5277,6 +5485,9 @@ mod tests {
     #[test]
     fn provided_stdin_drains_then_reaches_eof() {
         let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(1);
+        });
         let mut req = Vec::new();
         req.extend_from_slice(&1_u32.to_le_bytes());
         req.extend_from_slice(b"abcdefg");
@@ -5314,6 +5525,10 @@ mod tests {
     #[test]
     fn stdin_is_per_pid() {
         let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(1);
+            k.process_mut(2);
+        });
         let mut r1 = Vec::new();
         r1.extend_from_slice(&1_u32.to_le_bytes());
         r1.extend_from_slice(b"alpha");
@@ -7264,6 +7479,23 @@ mod tests {
             dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp),
             -(abi::ECHILD as i64)
         );
+    }
+
+    #[test]
+    fn host_control_stream_ops_reject_unknown_pid_without_creating_it() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let pid = 77_u32;
+        let mut provide = pid.to_le_bytes().to_vec();
+        provide.extend_from_slice(b"input");
+
+        assert_eq!(provide_stdin(&provide), -(abi::ESRCH as i64));
+        assert_eq!(close_stdin(&pid.to_le_bytes()), -(abi::ESRCH as i64));
+        let mut out = [0u8; 8];
+        assert_eq!(
+            drain_stream(&pid.to_le_bytes(), &mut out, true),
+            -(abi::ESRCH as i64)
+        );
+        assert!(!crate::kernel::with_kernel(|k| k.has_process(pid)));
     }
 
     #[test]

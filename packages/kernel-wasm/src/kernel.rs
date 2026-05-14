@@ -31,6 +31,16 @@ pub const DEFAULT_UMASK: u16 = 0o022;
 /// `(soft, hard)` resource limits. `u64::MAX` means RLIM_INFINITY.
 pub type ResourceLimit = (u64, u64);
 
+/// Maximum bytes buffered inside one kernel-owned stream queue.
+///
+/// Applies to process stdio capture, anonymous pipes, and AF_UNIX socket
+/// receive queues. Writers that would exceed this cap get `-EAGAIN` so a
+/// stalled reader cannot grow kernel.wasm memory without bound.
+pub const KERNEL_BUFFER_CAP: usize = 64 * 1024;
+
+/// Maximum queued descriptor-rights records on one AF_UNIX socket.
+pub const KERNEL_RIGHTS_QUEUE_CAP: usize = 1024;
+
 /// Number of POSIX rlimit slots tracked. Matches the TS kernel's
 /// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
 pub const RLIMIT_SLOTS: usize = 8;
@@ -1220,15 +1230,27 @@ impl Kernel {
         p
     }
 
+    pub fn process_existing_mut(&mut self, pid: Pid) -> Option<&mut Process> {
+        let p = self.processes.get_mut(&pid)?;
+        p.ensure_main_thread(None);
+        Some(p)
+    }
+
+    pub fn process_existing(&self, pid: Pid) -> Option<&Process> {
+        self.processes.get(&pid)
+    }
+
     pub fn has_process(&self, pid: Pid) -> bool {
-        self.processes.contains_key(&pid)
+        self.process_existing(pid).is_some()
     }
 }
 
 static KERNEL: LazyLock<Mutex<Kernel>> = LazyLock::new(|| Mutex::new(Kernel::new()));
 
 pub fn with_kernel<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
-    let mut k = KERNEL.lock().expect("kernel state poisoned");
+    let mut k = KERNEL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     f(&mut k)
 }
 
