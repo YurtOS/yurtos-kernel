@@ -63,6 +63,7 @@ import type {
 } from "../network/socket-backend.js";
 import {
   allocUnixSocketPair,
+  netLog,
   POLLFD_SIZE,
   POLLNVAL,
   pollReventsForTarget,
@@ -219,18 +220,23 @@ export function makeWorkerDispatcherBodies(
     socketSend: (fd, data) => {
       const target = kernel.getFdTarget(getPid(), fd);
       if (!target || target.type !== "socket" || target.socket === null) {
+        netLog("pthread.send", { fd, result: "EBADF" });
         return -1;
       }
       const copy = new Uint8Array(data); // copy out of SAB before send
       const result = requireSyncSocketResult(
         target.send(target.socket, copy),
       );
-      if (!result.ok) return -1;
+      if (!result.ok) {
+        netLog("pthread.send", { fd, len: data.byteLength, result: "EIO" });
+        return -1;
+      }
       return typeof result.bytes_sent === "number" ? result.bytes_sent : -1;
     },
     socketRecv: (fd, cap) => {
       const target = kernel.getFdTarget(getPid(), fd);
       if (!target || target.type !== "socket" || target.socket === null) {
+        netLog("pthread.recv", { fd, result: "EBADF" });
         return { result: -1 };
       }
       // Synchronous best-effort: peek/nonblocking via target.recv.
@@ -243,6 +249,9 @@ export function makeWorkerDispatcherBodies(
         target.recv(target.socket, cap, { nonblocking: true }),
       );
       if (!probe.ok) {
+        if (probe.error !== "EAGAIN") {
+          netLog("pthread.recv", { fd, cap, result: "EIO" });
+        }
         return { result: probe.error === "EAGAIN" ? -11 : -1 };
       }
       const bytes = probe.data ?? new Uint8Array(0);
@@ -250,33 +259,67 @@ export function makeWorkerDispatcherBodies(
     },
     getPid: () => kernel.getVisiblePid(getPid()),
     socketSendUnix: (fd, data) => {
-      if (!opts.socketBackend) return -1;
+      if (!opts.socketBackend) {
+        netLog("pthread.send_unix", {
+          fd,
+          result: "EIO",
+          reason: "no backend",
+        });
+        return -1;
+      }
       const copy = new Uint8Array(data);
-      return sendUnixSocket(
+      const r = sendUnixSocket(
         kernel,
         opts.socketBackend,
         getPid(),
         fd,
         copy,
       );
+      if (r < 0) {
+        netLog("pthread.send_unix", {
+          fd,
+          len: data.byteLength,
+          result: r === -2 ? "EAFNOSUPPORT" : "EIO",
+        });
+      }
+      return r;
     },
     socketPair: (_family, sockType) => {
-      if (!opts.socketBackend) return { result: -1 };
+      if (!opts.socketBackend) {
+        netLog("pthread.socketpair", { result: "EIO", reason: "no backend" });
+        return { result: -1 };
+      }
       const pair = allocUnixSocketPair(
         kernel,
         opts.socketBackend,
         getPid(),
         sockType,
       );
-      if (!pair) return { result: -1 };
+      if (!pair) {
+        netLog("pthread.socketpair", { sockType, result: "EIO" });
+        return { result: -1 };
+      }
+      netLog("pthread.socketpair", {
+        sockType,
+        fdA: pair.fdA,
+        fdB: pair.fdB,
+        result: "ok",
+      });
       const out = new Uint8Array(8);
       new DataView(out.buffer).setInt32(0, pair.fdA, true);
       new DataView(out.buffer).setInt32(4, pair.fdB, true);
       return { result: 0, bytes: out };
     },
     socketRecvUnix: (fd, cap, peek) => {
-      if (!opts.socketBackend) return { result: -1 };
-      return recvUnixSocketNonblocking(
+      if (!opts.socketBackend) {
+        netLog("pthread.recv_unix", {
+          fd,
+          result: "EIO",
+          reason: "no backend",
+        });
+        return { result: -1 };
+      }
+      const r = recvUnixSocketNonblocking(
         kernel,
         opts.socketBackend,
         getPid(),
@@ -284,6 +327,10 @@ export function makeWorkerDispatcherBodies(
         cap,
         peek !== 0,
       );
+      if (r.result < 0 && r.result !== -2) {
+        netLog("pthread.recv_unix", { fd, cap, result: r.result });
+      }
+      return r;
     },
     setFdDescriptorFlags: (fd, flags) => {
       if (!kernel.getFdTarget(getPid(), fd)) return -1;
@@ -294,10 +341,20 @@ export function makeWorkerDispatcherBodies(
       const tb = threadsBackend() as
         | (ThreadsBackend & { spawnSync?: (fp: number, a: number) => number })
         | null;
-      if (!tb || typeof tb.spawnSync !== "function") return -1;
+      if (!tb || typeof tb.spawnSync !== "function") {
+        netLog("pthread.spawn", { result: "ENOTSUP" });
+        return -1;
+      }
       try {
-        return tb.spawnSync(fnPtr, arg);
-      } catch {
+        const tid = tb.spawnSync(fnPtr, arg);
+        netLog("pthread.spawn", { fnPtr, tid });
+        return tid;
+      } catch (e) {
+        netLog("pthread.spawn", {
+          fnPtr,
+          result: "EIO",
+          reason: e instanceof Error ? e.message : String(e),
+        });
         return -1;
       }
     },

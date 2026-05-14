@@ -204,7 +204,7 @@ const YURT_NET_DEBUG = (() => {
   return false;
 })();
 
-function netLog(op: string, fields: Record<string, unknown>): void {
+export function netLog(op: string, fields: Record<string, unknown>): void {
   if (!YURT_NET_DEBUG) return;
   const parts: string[] = [];
   for (const [k, v] of Object.entries(fields)) {

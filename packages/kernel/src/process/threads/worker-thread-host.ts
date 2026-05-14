@@ -70,7 +70,9 @@ workerSelf.onmessage = async (e: MessageEvent<StartMessage>) => {
   // loops, proc_exit on unrecoverable error, fd_write for libc abort
   // messages on stderr). Anything else still falls through to the trap
   // stub below so unhandled imports remain observable.
-  const wasiImports = createPthreadWasiImports(memory);
+  const { imports: wasiImports, flushStdio } = createPthreadWasiImports(
+    memory,
+  );
 
   // The wasm module imports more functions than the worker actively
   // provides (the parent instance wires all of them on main). Build a
@@ -143,6 +145,12 @@ workerSelf.onmessage = async (e: MessageEvent<StartMessage>) => {
     retval = -1;
   }
 
+  // Drain any partial stdio line still sitting in the per-fd buffers
+  // before terminating. Python tracebacks (e.g. ipykernel's Heartbeat
+  // thread) often end without a trailing newline; without this flush
+  // they'd be lost when the Worker is terminated by the joining side.
+  flushStdio();
+
   const msg: DoneMessage = { type: "done", tid, retval };
   workerSelf.postMessage(msg);
 };
@@ -154,7 +162,7 @@ const WASI_RIGHTS_ALL = 0x1fffffffn;
 
 function createPthreadWasiImports(
   memory: WebAssembly.Memory,
-): WebAssembly.ModuleImports {
+): { imports: WebAssembly.ModuleImports; flushStdio: () => void } {
   const view = () => new DataView(memory.buffer);
   const bytes = () => new Uint8Array(memory.buffer);
 
@@ -205,7 +213,14 @@ function createPthreadWasiImports(
     lineBuffers.set(fd, combined.slice(cursor));
   };
 
-  return {
+  const flushStdio = (): void => {
+    for (const [fd, remainder] of lineBuffers) {
+      if (remainder.length > 0) flushPthreadLine(fd, remainder);
+    }
+    lineBuffers.clear();
+  };
+
+  const imports: WebAssembly.ModuleImports = {
     // Optimistic stub: report every fd as a stream socket with no
     // flags so libzmq's signaler can read O_NONBLOCK state and then
     // set it via fd_fdstat_set_flags. cpython's threading paths that
@@ -286,4 +301,6 @@ function createPthreadWasiImports(
       return WASI_ESUCCESS;
     },
   };
+
+  return { imports, flushStdio };
 }
