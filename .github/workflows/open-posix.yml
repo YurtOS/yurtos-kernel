@@ -1,0 +1,57 @@
+name: Open POSIX Test Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: "Comma-separated Open POSIX interface/assertion ids"
+        required: false
+        default: "pthread_self/1-1,pthread_equal/1-1,pthread_create/1-1"
+
+jobs:
+  curated:
+    name: Curated upstream POSIX subset
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-wasip1
+
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Binaryen
+        run: |
+          set -euxo pipefail
+          BINARYEN_VER=119
+          curl -sSL -o /tmp/binaryen.tar.gz \
+            "https://github.com/WebAssembly/binaryen/releases/download/version_${BINARYEN_VER}/binaryen-version_${BINARYEN_VER}-x86_64-linux.tar.gz"
+          mkdir -p "$HOME/.binaryen"
+          tar -xzf /tmp/binaryen.tar.gz -C "$HOME/.binaryen" --strip-components=1
+          echo "$HOME/.binaryen/bin" >> "$GITHUB_PATH"
+
+      - name: Install WASI SDK
+        run: |
+          set -euxo pipefail
+          WASI_SDK_VER=30.0
+          curl -sSL -o /tmp/wasi-sdk.tar.gz \
+            "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VER%%.*}/wasi-sdk-${WASI_SDK_VER}-x86_64-linux.tar.gz"
+          mkdir -p "$HOME/.local/share"
+          tar -xzf /tmp/wasi-sdk.tar.gz -C "$HOME/.local/share"
+          mv "$HOME/.local/share"/wasi-sdk-${WASI_SDK_VER}* "$HOME/.local/share/wasi-sdk"
+          echo "WASI_SDK_PATH=$HOME/.local/share/wasi-sdk" >> "$GITHUB_ENV"
+
+      - name: Build Yurt ABI archive
+        run: make -C abi lib
+
+      - name: Run curated Open POSIX subset
+        run: deno run -A scripts/open-posix-harness.ts --cases "${{ inputs.cases }}"

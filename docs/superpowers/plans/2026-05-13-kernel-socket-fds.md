@@ -164,12 +164,19 @@ same errno values through POSIX APIs. Start with:
 - `recv()`/`read()` on an unconnected stream socket returns `ENOTCONN`.
 - `accept()` on an unlistened stream socket returns `EINVAL`.
 
-- [ ] **Step 5: Add an optional formal POSIX suite harness**
+- [x] **Step 5: Add an optional formal POSIX suite harness**
 
 Evaluate `bytecodealliance/open-posix-test-suite` as a slow-tier POSIX
 conformance source. Keep it outside the fast pre-push tests; run it as a
 guest-compat or manually triggered CI job once the syscall surface is broad
 enough to make failures actionable.
+
+Result: added `scripts/open-posix-harness.ts` plus a manual
+`open-posix.yml` workflow. The harness clones the upstream GPL-2.0 suite into
+ignored `test-fixtures/open-posix-test-suite/`, builds selected tests through
+`yurt-cc`, runs them through the Yurt sandbox, and treats non-`PTS_PASS` result
+codes as failures. The initial curated subset is pthread-focused:
+`pthread_self/1-1`, `pthread_equal/1-1`, and `pthread_create/1-1`.
 
 ### Task 6: Mine Open POSIX Suite For Threading Coverage
 
