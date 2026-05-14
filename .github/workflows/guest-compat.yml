@@ -76,6 +76,7 @@ jobs:
       - name: Build shell runner fixture
         run: |
           set -euxo pipefail
+          cargo clean -p yurt-shell-exec --target wasm32-wasip1
           cargo build --release --target wasm32-wasip1 -p yurt-shell-exec
           cp target/wasm32-wasip1/release/yurt-shell-exec.wasm \
             packages/kernel/src/platform/__tests__/fixtures/yurt-shell-exec.wasm
