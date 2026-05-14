@@ -1,4 +1,4 @@
-import { WASI_EBUSY } from "../../wasi/types.js";
+import { WASI_EBUSY, WASI_EINVAL, WASI_ESRCH } from "../../wasi/types.js";
 import type { ThreadsBackend } from "./backend.js";
 import type { IndirectCallTable } from "./indirect-call-table.js";
 import { SabCondvar, SabMutex } from "./sab-primitives.ts";
@@ -134,14 +134,18 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
 
   async join(tid: number): Promise<number> {
     const slot = this.slots[tid];
-    if (!slot || slot.reaped || slot.detached) return -1;
+    if (!slot) return -WASI_ESRCH;
+    if (slot.detached) return -WASI_EINVAL;
+    if (slot.reaped) return -WASI_ESRCH;
     slot.reaped = true;
     return await slot.result;
   }
 
   detach(tid: number): Promise<number> {
     const slot = this.slots[tid];
-    if (!slot || slot.reaped) return Promise.resolve(-1);
+    if (!slot) return Promise.resolve(-WASI_ESRCH);
+    if (slot.reaped && slot.detached) return Promise.resolve(-WASI_EINVAL);
+    if (slot.reaped) return Promise.resolve(-WASI_ESRCH);
     slot.detached = true;
     slot.reaped = true;
     return Promise.resolve(0);

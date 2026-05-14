@@ -2,7 +2,7 @@ import type { ThreadsBackend } from "./backend.js";
 import type { IndirectCallTable } from "./indirect-call-table.js";
 import { NULL_INDIRECT_CALL_TABLE } from "./indirect-call-table.js";
 import { ThreadIdScope } from "./thread-id-scope.js";
-import { WASI_EBUSY } from "../../wasi/types.js";
+import { WASI_EBUSY, WASI_EINVAL, WASI_ESRCH } from "../../wasi/types.js";
 
 interface SpawnSlot {
   result: Promise<number>;
@@ -127,7 +127,9 @@ export class CooperativeSerialBackend implements ThreadsBackend {
 
   async join(tid: number): Promise<number> {
     const slot = this.slots[tid];
-    if (!slot || slot.reaped || slot.detached) return -1;
+    if (!slot) return -WASI_ESRCH;
+    if (slot.detached) return -WASI_EINVAL;
+    if (slot.reaped) return -WASI_ESRCH;
     slot.reaped = true;
     slot.start();
     return await slot.result;
@@ -135,7 +137,9 @@ export class CooperativeSerialBackend implements ThreadsBackend {
 
   async detach(tid: number): Promise<number> {
     const slot = this.slots[tid];
-    if (!slot || slot.reaped) return -1;
+    if (!slot) return -WASI_ESRCH;
+    if (slot.reaped && slot.detached) return -WASI_EINVAL;
+    if (slot.reaped) return -WASI_ESRCH;
     slot.detached = true;
     slot.reaped = true;
     return 0;

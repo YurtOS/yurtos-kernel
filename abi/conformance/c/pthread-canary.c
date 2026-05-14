@@ -259,8 +259,13 @@ int main(void) {
   }
   void *detached_return_value = NULL;
   detached_return_rc = pthread_join(detached_return_tid, &detached_return_value);
-  if (detached_return_rc != ESRCH) {
-    fprintf(stderr, "pthread-canary: detached pthread_join returned %d, expected ESRCH=%d\n", detached_return_rc, ESRCH);
+  if (detached_return_rc != EINVAL) {
+    fprintf(stderr, "pthread-canary: detached pthread_join returned %d, expected EINVAL=%d\n", detached_return_rc, EINVAL);
+    return 1;
+  }
+  detached_return_rc = pthread_detach(detached_return_tid);
+  if (detached_return_rc != EINVAL) {
+    fprintf(stderr, "pthread-canary: detached pthread_detach returned %d, expected EINVAL=%d\n", detached_return_rc, EINVAL);
     return 1;
   }
   sched_yield();

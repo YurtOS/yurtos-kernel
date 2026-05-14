@@ -1,6 +1,9 @@
 import { assertEquals, assertRejects } from "jsr:@std/assert@^1.0.19";
 import { CooperativeSerialBackend } from "../threads/cooperative-serial.ts";
 
+const EINVAL = 28;
+const ESRCH = 71;
+
 Deno.test("cooperative serial backend returns from spawn while spawned routines run", async () => {
   const backend = new CooperativeSerialBackend();
   let releaseThread!: () => void;
@@ -129,6 +132,41 @@ Deno.test("cooperative serial backend does not let detached threads block later 
 
   releaseThread();
   await backend.yield_();
+});
+
+Deno.test("cooperative serial backend distinguishes not-joinable and missing thread errors", async () => {
+  const backend = new CooperativeSerialBackend();
+  let releaseThread!: () => void;
+  const firstStarted = new Promise<void>((resolve) => {
+    backend.setIndirectCallTable({
+      async call(_fnPtr, arg) {
+        if (arg === 1) {
+          resolve();
+          await new Promise<void>((release) => {
+            releaseThread = release;
+          });
+        }
+        return arg;
+      },
+    });
+  });
+
+  const detachedTid = await backend.spawn(1, 1);
+  assertEquals(detachedTid, 1);
+  assertEquals(await backend.detach(detachedTid), 0);
+  assertEquals(await backend.detach(detachedTid), -EINVAL);
+  assertEquals(await backend.join(detachedTid), -EINVAL);
+  await backend.yield_();
+  await firstStarted;
+  releaseThread();
+  await backend.yield_();
+
+  const joinableTid = await backend.spawn(1, 2);
+  assertEquals(await backend.join(joinableTid), 2);
+  assertEquals(await backend.join(joinableTid), -ESRCH);
+  assertEquals(await backend.detach(joinableTid), -ESRCH);
+  assertEquals(await backend.join(99), -ESRCH);
+  assertEquals(await backend.detach(99), -ESRCH);
 });
 
 Deno.test("cooperative serial backend starts immediately detached threads", async () => {

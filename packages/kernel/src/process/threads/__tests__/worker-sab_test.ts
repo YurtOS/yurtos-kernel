@@ -2,6 +2,9 @@ import { assertEquals } from "@std/assert";
 import { WORKER_HOST_RESPONSE_BYTES } from "../worker-host-proxy.ts";
 import { defaultSpawnThread, WorkerSabThreadsBackend } from "../worker-sab.ts";
 
+const EINVAL = 28;
+const ESRCH = 71;
+
 Deno.test("default worker SAB spawner runs fnPtr in worker-thread-host", async () => {
   const wasmBytes = await Deno.readFile(
     new URL("./_fixtures/echo-thread.wasm", import.meta.url),
@@ -79,11 +82,15 @@ Deno.test("worker SAB backend rejects double join and detached join", async () =
 
   const joined = await backend.spawn(1, 7);
   assertEquals(await backend.join(joined), 7);
-  assertEquals(await backend.join(joined), -1);
+  assertEquals(await backend.join(joined), -ESRCH);
+  assertEquals(await backend.detach(joined), -ESRCH);
 
   const detached = await backend.spawn(1, 8);
   assertEquals(await backend.detach(detached), 0);
-  assertEquals(await backend.join(detached), -1);
+  assertEquals(await backend.detach(detached), -EINVAL);
+  assertEquals(await backend.join(detached), -EINVAL);
+  assertEquals(await backend.join(99), -ESRCH);
+  assertEquals(await backend.detach(99), -ESRCH);
 });
 
 Deno.test("worker SAB backend preserves self across overlapping async thread scopes", async () => {
