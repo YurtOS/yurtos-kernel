@@ -109,6 +109,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SOCKET_OPEN => sys_socket_open(caller_pid, request),
         METHOD_SYS_SOCKET_BIND => sys_socket_bind(caller_pid, request),
         METHOD_SYS_SOCKET_SENDTO => sys_socket_sendto(caller_pid, request),
+        METHOD_SYS_SOCKET_SENDMSG => sys_socket_sendmsg(caller_pid, request),
+        METHOD_SYS_SOCKET_RECVMSG => sys_socket_recvmsg(caller_pid, request, response),
         METHOD_SYS_IDB_GET => sys_idb_get(request, response),
         METHOD_SYS_IDB_PUT => sys_idb_put(request),
         METHOD_SYS_IDB_DELETE => sys_idb_delete(request),
@@ -766,6 +768,98 @@ fn socket_sendto_id(k: &mut Kernel, id: u64, addr: &[u8], data: &[u8]) -> i64 {
     };
     rx.push_back(data.to_vec());
     data.len() as i64
+}
+
+fn clone_fd_rights(k: &mut Kernel, caller_pid: u32, fds: &[u32]) -> Result<Vec<FdEntry>, i64> {
+    let mut rights = Vec::with_capacity(fds.len());
+    for fd in fds {
+        let Some(entry) = k.process_mut(caller_pid).fd_table.entry(*fd).cloned() else {
+            for entry in rights {
+                close_entry(k, entry);
+            }
+            return Err(-(abi::EBADF as i64));
+        };
+        inc_entry_ref(k, &entry);
+        rights.push(entry);
+    }
+    Ok(rights)
+}
+
+fn install_fd_rights(k: &mut Kernel, caller_pid: u32, rights: Vec<FdEntry>, out: &mut [u8]) -> i64 {
+    if out.len() < 4 + rights.len() * 4 {
+        for entry in rights {
+            close_entry(k, entry);
+        }
+        return -(abi::EINVAL as i64);
+    }
+    let count = rights.len() as u32;
+    out[0..4].copy_from_slice(&count.to_le_bytes());
+    for (index, entry) in rights.into_iter().enumerate() {
+        let p = k.process_mut(caller_pid);
+        let fd = p.fd_table.lowest_free_fd();
+        p.fd_table.install(fd, entry);
+        let start = 4 + index * 4;
+        out[start..start + 4].copy_from_slice(&fd.to_le_bytes());
+    }
+    (4 + count as usize * 4) as i64
+}
+
+fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>) -> i64 {
+    let mut rights = Some(rights);
+    let rc = match k.socket(id).map(|socket| &socket.kind) {
+        Some(SocketKind::UnixStream {
+            peer_id, peer_open, ..
+        }) => {
+            if !*peer_open {
+                -(abi::EPIPE as i64)
+            } else {
+                let Some(peer) = k.socket_mut(*peer_id) else {
+                    return -(abi::EPIPE as i64);
+                };
+                let SocketKind::UnixStream { rx, rights: q, .. } = &mut peer.kind else {
+                    return -(abi::EPIPE as i64);
+                };
+                rx.extend(data);
+                if !rights.as_ref().is_some_and(Vec::is_empty) {
+                    q.push_back(rights.take().expect("rights present"));
+                }
+                data.len() as i64
+            }
+        }
+        Some(SocketKind::UnixDatagram {
+            peer_id: Some(peer_id),
+            peer_open,
+            ..
+        }) => {
+            if !*peer_open {
+                -(abi::EPIPE as i64)
+            } else {
+                let Some(peer) = k.socket_mut(*peer_id) else {
+                    return -(abi::EPIPE as i64);
+                };
+                let SocketKind::UnixDatagram { rx, rights: q, .. } = &mut peer.kind else {
+                    return -(abi::EPIPE as i64);
+                };
+                rx.push_back(data.to_vec());
+                if !rights.as_ref().is_some_and(Vec::is_empty) {
+                    q.push_back(rights.take().expect("rights present"));
+                }
+                data.len() as i64
+            }
+        }
+        Some(SocketKind::Host { .. }) => -(abi::EOPNOTSUPP as i64),
+        Some(SocketKind::UnixDatagram { peer_id: None, .. }) => -(abi::EINVAL as i64),
+        Some(SocketKind::UnixListener { .. }) => -(abi::EOPNOTSUPP as i64),
+        None => -(abi::EBADF as i64),
+    };
+    if rc < 0 {
+        if let Some(rights) = rights {
+            for entry in rights {
+                close_entry(k, entry);
+            }
+        }
+    }
+    rc
 }
 
 fn socket_recv_id(k: &mut Kernel, id: u64, response: &mut [u8], flags: u32) -> i64 {
@@ -2380,6 +2474,76 @@ fn sys_socket_sendto(caller_pid: u32, request: &[u8]) -> i64 {
     })
 }
 
+fn sys_socket_sendmsg(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let data_len = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes")) as usize;
+    let fd_count = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) as usize;
+    let data_start = 12;
+    let fds_start = data_start + data_len;
+    let required = fds_start + fd_count * 4;
+    if request.len() < required {
+        return -(abi::EINVAL as i64);
+    }
+    let data = &request[data_start..fds_start];
+    with_kernel(|k| {
+        let mut fds = Vec::with_capacity(fd_count);
+        for chunk in request[fds_start..required].chunks_exact(4) {
+            fds.push(u32::from_le_bytes(chunk.try_into().expect("4 bytes")));
+        }
+        let rights = match clone_fd_rights(k, caller_pid, &fds) {
+            Ok(rights) => rights,
+            Err(rc) => return rc,
+        };
+        match socket_id_for_fd(k, caller_pid, fd) {
+            Ok(id) => socket_sendmsg_id(k, id, data, rights),
+            Err(rc) => {
+                for entry in rights {
+                    close_entry(k, entry);
+                }
+                rc
+            }
+        }
+    })
+}
+
+fn sys_socket_recvmsg(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let data_cap = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) as usize;
+    if response.len() < data_cap + 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let n = with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
+        Ok(id) => socket_recv_id(k, id, &mut response[..data_cap], flags),
+        Err(rc) => rc,
+    });
+    if n < 0 {
+        return n;
+    }
+    let rights = with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
+        Ok(id) => match k.socket_mut(id).map(|socket| &mut socket.kind) {
+            Some(SocketKind::UnixStream { rights, .. })
+            | Some(SocketKind::UnixDatagram { rights, .. }) => {
+                rights.pop_front().unwrap_or_default()
+            }
+            _ => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    });
+    let install_rc =
+        with_kernel(|k| install_fd_rights(k, caller_pid, rights, &mut response[data_cap..]));
+    if install_rc < 0 {
+        return install_rc;
+    }
+    n
+}
+
 fn sys_socket_close(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
@@ -2640,7 +2804,15 @@ fn unlink(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let path = proc_self_rewrite(caller_pid, request);
-    with_kernel(|k| k.vfs.unlink(&path) as i64)
+    with_kernel(|k| {
+        let removed_socket = k.unlink_unix_socket_inode(&path);
+        let rc = k.vfs.unlink(&path);
+        if rc == -(abi::ENOENT) && removed_socket {
+            0
+        } else {
+            rc as i64
+        }
+    })
 }
 
 /// `stat(path) -> 16-byte fstat-shaped record`. Same wire format as
@@ -2655,6 +2827,12 @@ fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     }
     let path = proc_self_rewrite(caller_pid, request);
     with_kernel(|k| {
+        if k.has_unix_socket_inode(&path) {
+            response[0..8].copy_from_slice(&0u64.to_le_bytes());
+            response[8..12].copy_from_slice(&6u32.to_le_bytes());
+            response[12..16].copy_from_slice(&0o140_666u32.to_le_bytes());
+            return 16;
+        }
         let (mount_id, inode) = match k.vfs.open(&path, 0) {
             Some(pair) => pair,
             None => return -(abi::ENOENT as i64),
@@ -2849,6 +3027,25 @@ mod tests {
         req.extend_from_slice(&(addr.len() as u32).to_le_bytes());
         req.extend_from_slice(addr);
         req.extend_from_slice(data);
+        req
+    }
+
+    fn socket_sendmsg_req(fd: u32, data: &[u8], fds: &[u32]) -> Vec<u8> {
+        let mut req = fd.to_le_bytes().to_vec();
+        req.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        req.extend_from_slice(&(fds.len() as u32).to_le_bytes());
+        req.extend_from_slice(data);
+        for fd in fds {
+            req.extend_from_slice(&fd.to_le_bytes());
+        }
+        req
+    }
+
+    fn socket_recvmsg_req(fd: u32, flags: u32, data_cap: u32) -> [u8; 12] {
+        let mut req = [0u8; 12];
+        req[0..4].copy_from_slice(&fd.to_le_bytes());
+        req[4..8].copy_from_slice(&flags.to_le_bytes());
+        req[8..12].copy_from_slice(&data_cap.to_le_bytes());
         req
     }
 
@@ -3958,6 +4155,61 @@ mod tests {
     }
 
     #[test]
+    fn af_unix_path_datagram_unlink_removes_route_but_close_keeps_inode() {
+        let _g = crate::kernel::TestGuard::acquire();
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            3
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(3, b"unix:/tmp/dgram-unlink.sock"),
+                &mut []
+            ),
+            0
+        );
+        let mut stat = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_STAT, 1, b"/tmp/dgram-unlink.sock", &mut stat),
+            16
+        );
+        assert_eq!(u32::from_le_bytes(stat[8..12].try_into().unwrap()), 6);
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &3u32.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_STAT, 1, b"/tmp/dgram-unlink.sock", &mut stat),
+            16
+        );
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            3
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SENDTO,
+                1,
+                &socket_sendto_req(3, 0, b"unix:/tmp/dgram-unlink.sock", b"x"),
+                &mut []
+            ),
+            -(abi::ECONNREFUSED as i64)
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_UNLINK, 1, b"/tmp/dgram-unlink.sock", &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_STAT, 1, b"/tmp/dgram-unlink.sock", &mut stat),
+            -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
     fn socketpair_accepts_linux_af_unix_datagram_constants() {
         let _g = crate::kernel::TestGuard::acquire();
         let mut fds = [0u8; 8];
@@ -3968,6 +4220,66 @@ mod tests {
         let left = u32::from_le_bytes(fds[0..4].try_into().unwrap());
         let right = u32::from_le_bytes(fds[4..8].try_into().unwrap());
         assert_eq!((left, right), (3, 4));
+    }
+
+    #[test]
+    fn socket_sendmsg_recvmsg_transfers_fd_rights() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut socket_fds = [0u8; 8];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKETPAIR,
+                1,
+                &socketpair_req(1, 1, 0),
+                &mut socket_fds
+            ),
+            8
+        );
+        let left = u32::from_le_bytes(socket_fds[0..4].try_into().unwrap());
+        let right = u32::from_le_bytes(socket_fds[4..8].try_into().unwrap());
+
+        let mut pipe_fds = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_fds), 8);
+        let pipe_read = u32::from_le_bytes(pipe_fds[0..4].try_into().unwrap());
+        let pipe_write = u32::from_le_bytes(pipe_fds[4..8].try_into().unwrap());
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SENDMSG,
+                1,
+                &socket_sendmsg_req(left, b"x", &[pipe_write]),
+                &mut []
+            ),
+            1
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &pipe_write.to_le_bytes(), &mut []),
+            0
+        );
+
+        let mut recv = [0u8; 1 + 4 + 4];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECVMSG,
+                1,
+                &socket_recvmsg_req(right, 0, 1),
+                &mut recv
+            ),
+            1
+        );
+        assert_eq!(recv[0], b'x');
+        assert_eq!(u32::from_le_bytes(recv[1..5].try_into().unwrap()), 1);
+        let received_write = u32::from_le_bytes(recv[5..9].try_into().unwrap());
+
+        let mut write_req = received_write.to_le_bytes().to_vec();
+        write_req.extend_from_slice(b"ok");
+        assert_eq!(dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []), 2);
+        let mut read_buf = [0u8; 2];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &pipe_read.to_le_bytes(), &mut read_buf),
+            2
+        );
+        assert_eq!(&read_buf, b"ok");
     }
 
     #[test]

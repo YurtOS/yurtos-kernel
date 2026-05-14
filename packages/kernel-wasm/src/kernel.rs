@@ -18,7 +18,7 @@
 // which violates the architectural invariant that the kernel only
 // imports `kh_*`. BTreeMap is deterministic and trivially fast at the
 // process counts we actually run.
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{LazyLock, Mutex};
 
 use crate::state::Credentials;
@@ -388,12 +388,14 @@ pub enum SocketKind {
     UnixStream {
         peer_id: u64,
         rx: VecDeque<u8>,
+        rights: VecDeque<Vec<FdEntry>>,
         peer_open: bool,
     },
     UnixDatagram {
         peer_id: Option<u64>,
         bound_path: Option<Vec<u8>>,
         rx: VecDeque<Vec<u8>>,
+        rights: VecDeque<Vec<FdEntry>>,
         peer_open: bool,
     },
 }
@@ -418,6 +420,7 @@ pub struct Kernel {
     next_socket_id: u64,
     unix_listeners: BTreeMap<Vec<u8>, u64>,
     unix_datagrams: BTreeMap<Vec<u8>, u64>,
+    unix_socket_inodes: BTreeSet<Vec<u8>>,
     /// MetadataOverlay — `(mount_id, inode) → Metadata`.
     /// chmod/chown/utimens write here; fstat reads composed
     /// override → backend default → kernel fallback. Survives the
@@ -508,6 +511,7 @@ impl Kernel {
             next_socket_id: 1,
             unix_listeners: BTreeMap::new(),
             unix_datagrams: BTreeMap::new(),
+            unix_socket_inodes: BTreeSet::new(),
             metadata_overrides: BTreeMap::new(),
             pending_spawns: VecDeque::new(),
             next_spawn_pid: 1000,
@@ -681,6 +685,7 @@ impl Kernel {
                 kind: SocketKind::UnixStream {
                     peer_id: right,
                     rx: VecDeque::new(),
+                    rights: VecDeque::new(),
                     peer_open: true,
                 },
             },
@@ -694,6 +699,7 @@ impl Kernel {
                 kind: SocketKind::UnixStream {
                     peer_id: left,
                     rx: VecDeque::new(),
+                    rights: VecDeque::new(),
                     peer_open: true,
                 },
             },
@@ -715,6 +721,7 @@ impl Kernel {
                     peer_id: Some(right),
                     bound_path: None,
                     rx: VecDeque::new(),
+                    rights: VecDeque::new(),
                     peer_open: true,
                 },
             },
@@ -729,6 +736,7 @@ impl Kernel {
                     peer_id: Some(left),
                     bound_path: None,
                     rx: VecDeque::new(),
+                    rights: VecDeque::new(),
                     peer_open: true,
                 },
             },
@@ -749,6 +757,7 @@ impl Kernel {
                     peer_id: None,
                     bound_path: None,
                     rx: VecDeque::new(),
+                    rights: VecDeque::new(),
                     peer_open: true,
                 },
             },
@@ -770,6 +779,9 @@ impl Kernel {
                 }
                 *bound_path = Some(path.to_vec());
                 self.unix_datagrams.insert(path.to_vec(), id);
+                if !path.starts_with(b"\0") {
+                    self.unix_socket_inodes.insert(path.to_vec());
+                }
                 Ok(())
             }
             _ => Err(crate::abi::EINVAL),
@@ -778,6 +790,16 @@ impl Kernel {
 
     pub fn unix_datagram_id_for_path(&self, path: &[u8]) -> Option<u64> {
         self.unix_datagrams.get(path).copied()
+    }
+
+    pub fn has_unix_socket_inode(&self, path: &[u8]) -> bool {
+        self.unix_socket_inodes.contains(path)
+    }
+
+    pub fn unlink_unix_socket_inode(&mut self, path: &[u8]) -> bool {
+        self.unix_listeners.remove(path);
+        self.unix_datagrams.remove(path);
+        self.unix_socket_inodes.remove(path)
     }
 
     pub fn create_unix_listener(&mut self, path: &[u8], backlog: u32) -> Result<u64, i32> {
@@ -801,6 +823,9 @@ impl Kernel {
             },
         );
         self.unix_listeners.insert(path.to_vec(), id);
+        if !path.starts_with(b"\0") {
+            self.unix_socket_inodes.insert(path.to_vec());
+        }
         Ok(id)
     }
 

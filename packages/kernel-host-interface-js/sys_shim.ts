@@ -380,6 +380,50 @@ export function buildSysImports(
       req.set(data, 12 + addr.byteLength);
       return forwardRequestBytes(METHOD.SYS_SOCKET_SENDTO, req);
     },
+    sys_socket_sendmsg: (fd, dataPtr, dataLen, fdsPtr, fdsCount) => {
+      const data = copyIn(dataPtr, dataLen);
+      if (typeof data === "number") return data;
+      const fdsBytes = fdsCount > 0
+        ? copyIn(fdsPtr, fdsCount * 4)
+        : new Uint8Array();
+      if (typeof fdsBytes === "number") return fdsBytes;
+      const req = new Uint8Array(12 + data.byteLength + fdsBytes.byteLength);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, data.byteLength >>> 0, true);
+      view.setUint32(8, fdsCount >>> 0, true);
+      req.set(data, 12);
+      req.set(fdsBytes, 12 + data.byteLength);
+      return forwardRequestBytes(METHOD.SYS_SOCKET_SENDMSG, req);
+    },
+    sys_socket_recvmsg: (fd, outPtr, outCap, fdsPtr, fdsCap, nFdsPtr) => {
+      const req = new Uint8Array(12);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, 0, true);
+      view.setUint32(8, outCap >>> 0, true);
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_SOCKET_RECVMSG,
+        req,
+        outCap + 4 + fdsCap * 4,
+      );
+      if (rc < 0) return rc;
+      const outRc = copyOut(outPtr, response.subarray(0, rc));
+      if (outRc < 0) return outRc;
+      const rights = response.subarray(outCap);
+      const nFds = new DataView(
+        rights.buffer,
+        rights.byteOffset,
+        rights.byteLength,
+      )
+        .getUint32(0, true);
+      const copyFds = Math.min(nFds, fdsCap);
+      const fdsRc = copyOut(fdsPtr, rights.subarray(4, 4 + copyFds * 4));
+      if (fdsRc < 0) return fdsRc;
+      const countRc = copyOut(nFdsPtr, u32(copyFds));
+      if (countRc < 0) return countRc;
+      return rc;
+    },
     sys_socket_listen: (backlog, addrPtr, addrLen) => {
       const addr = copyIn(addrPtr, addrLen);
       if (typeof addr === "number") return addr;

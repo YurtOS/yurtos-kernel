@@ -30,36 +30,6 @@ pub enum FdEntry {
     Null,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn reap_any_exit_reaps_any_completed_child() {
-        let mut kernel = ProcessKernel::default();
-        let (_running_tx, running_rx) = oneshot::channel();
-        let (done_tx, done_rx) = oneshot::channel();
-        let running_pid = kernel.add_process(running_rx);
-        let done_pid = kernel.add_process(done_rx);
-
-        done_tx.send(23).unwrap();
-
-        assert_eq!(kernel.reap_any_exit(), Some((done_pid, 23)));
-        assert_eq!(kernel.poll_exit(done_pid), None);
-        assert_eq!(kernel.poll_exit(running_pid), None);
-    }
-
-    #[test]
-    fn reap_any_exit_reports_none_when_children_are_still_running() {
-        let mut kernel = ProcessKernel::default();
-        let (_tx, rx) = oneshot::channel();
-        kernel.add_process(rx);
-
-        assert!(kernel.has_children());
-        assert_eq!(kernel.reap_any_exit(), None);
-    }
-}
-
 impl FdEntry {
     /// Append `data` to this fd (for pipes: appends to shared buffer).
     pub fn write(&self, data: &[u8]) {
@@ -228,5 +198,35 @@ impl ProcessKernel {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reap_any_exit_reaps_any_completed_child() {
+        let mut kernel = ProcessKernel::default();
+        let (_running_tx, running_rx) = oneshot::channel();
+        let (done_tx, done_rx) = oneshot::channel();
+        let running_pid = kernel.add_process(running_rx);
+        let done_pid = kernel.add_process(done_rx);
+
+        done_tx.send(23).unwrap();
+
+        assert_eq!(kernel.reap_any_exit(), Some((done_pid, 23)));
+        assert_eq!(kernel.poll_exit(done_pid), None);
+        assert_eq!(kernel.poll_exit(running_pid), None);
+    }
+
+    #[test]
+    fn reap_any_exit_reports_none_when_children_are_still_running() {
+        let mut kernel = ProcessKernel::default();
+        let (_tx, rx) = oneshot::channel();
+        kernel.add_process(rx);
+
+        assert!(kernel.has_children());
+        assert_eq!(kernel.reap_any_exit(), None);
     }
 }

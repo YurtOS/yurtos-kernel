@@ -111,6 +111,8 @@ mod sys_method_id {
     pub const SOCKET_OPEN: u32 = 0x1_0045;
     pub const SOCKET_BIND: u32 = 0x1_0046;
     pub const SOCKET_SENDTO: u32 = 0x1_0047;
+    pub const SOCKET_SENDMSG: u32 = 0x1_0048;
+    pub const SOCKET_RECVMSG: u32 = 0x1_0049;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -3436,7 +3438,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     // closures to those helpers.
     use yurt_kernel_host_interface_core::{
         forward_request_bytes, forward_request_with_user_response, forward_response_to_user,
-        forward_scalar, forward_u32_arg, forward_user_ptr_len,
+        forward_scalar, forward_u32_arg, forward_user_ptr_len, trampoline_request_with_response,
     };
 
     linker.func_wrap(
@@ -4233,7 +4235,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             }
             let mut req = (fd as u32).to_le_bytes().to_vec();
             req.extend_from_slice(&(flags as u32).to_le_bytes());
-            req.extend_from_slice(&(addr_len as u32).to_le_bytes());
+            req.extend_from_slice(&addr_len.to_le_bytes());
             req.extend_from_slice(&addr);
             req.extend_from_slice(&data);
             forward_request_bytes(
@@ -4241,6 +4243,100 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 sys_method_id::SOCKET_SENDTO,
                 &req,
             )
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_sendmsg",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         data_ptr: u32,
+         data_len: u32,
+         fds_ptr: u32,
+         fds_count: u32|
+         -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            let mut data = vec![0u8; data_len as usize];
+            if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut data).is_err() {
+                return -22;
+            }
+            let mut fds = vec![0u8; fds_count as usize * 4];
+            if !fds.is_empty() && memory.read(&caller, fds_ptr as usize, &mut fds).is_err() {
+                return -22;
+            }
+            let mut req = (fd as u32).to_le_bytes().to_vec();
+            req.extend_from_slice(&data_len.to_le_bytes());
+            req.extend_from_slice(&fds_count.to_le_bytes());
+            req.extend_from_slice(&data);
+            req.extend_from_slice(&fds);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_SENDMSG,
+                &req,
+            )
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_recvmsg",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         out_ptr: u32,
+         out_cap: u32,
+         fds_ptr: u32,
+         fds_cap: u32,
+         n_fds_ptr: u32|
+         -> i64 {
+            let mut req = (fd as u32).to_le_bytes().to_vec();
+            req.extend_from_slice(&0u32.to_le_bytes());
+            req.extend_from_slice(&out_cap.to_le_bytes());
+            let mut response = vec![0u8; out_cap as usize + 4 + fds_cap as usize * 4];
+            let rc = trampoline_request_with_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_RECVMSG,
+                &req,
+                &mut response,
+            );
+            if rc < 0 {
+                return rc;
+            }
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -22,
+            };
+            if rc > 0
+                && memory
+                    .write(&mut caller, out_ptr as usize, &response[..rc as usize])
+                    .is_err()
+            {
+                return -22;
+            }
+            let rights = &response[out_cap as usize..];
+            let n_fds = u32::from_le_bytes(rights[0..4].try_into().expect("fd count"));
+            let copy_fds = n_fds.min(fds_cap);
+            if copy_fds > 0
+                && memory
+                    .write(
+                        &mut caller,
+                        fds_ptr as usize,
+                        &rights[4..4 + copy_fds as usize * 4],
+                    )
+                    .is_err()
+            {
+                return -22;
+            }
+            if memory
+                .write(&mut caller, n_fds_ptr as usize, &copy_fds.to_le_bytes())
+                .is_err()
+            {
+                return -22;
+            }
+            rc
         },
     )?;
 

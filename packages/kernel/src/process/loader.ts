@@ -251,12 +251,6 @@ export async function loadProcess(
       "host_socket_accept",
       "host_socket_recv",
       "host_socket_sendmsg",
-      "host_socket_socketpair",
-      "host_socket_bind_unix",
-      "host_socket_connect_unix",
-      "host_socket_recvfrom_unix",
-      "host_socket_accept_unix",
-      "host_socket_recv_unix",
       "host_run_command",
       "host_socket_recvmsg",
       "host_extension_invoke",
@@ -281,21 +275,7 @@ export async function loadProcess(
   let instance: WebAssembly.Instance;
   try {
     const imports: WebAssembly.Imports = {
-      env: {
-        sys_poll: yurtImports.host_poll,
-        sys_socket_open: yurtImports.host_socket_open,
-        sys_socket_send: (fd: number, dataPtr: number, dataLen: number) =>
-          (yurtImports.host_socket_send as (...args: number[]) => number)(
-            fd,
-            dataPtr,
-            dataLen,
-            0,
-          ),
-        sys_socket_recv: yurtImports.host_socket_recv,
-        sys_socket_close: yurtImports.host_socket_close,
-        sys_socket_bind: () => -9,
-        sys_socket_sendto: () => -9,
-      },
+      env: {},
       wasi_snapshot_preview1: wasiImports,
       yurt: yurtImports,
     };
@@ -446,12 +426,6 @@ export async function loadProcess(
           "host_socket_accept",
           "host_socket_recv",
           "host_socket_sendmsg",
-          "host_socket_socketpair",
-          "host_socket_bind_unix",
-          "host_socket_connect_unix",
-          "host_socket_recvfrom_unix",
-          "host_socket_accept_unix",
-          "host_socket_recv_unix",
           "host_run_command",
           "host_socket_recvmsg",
           "host_extension_invoke",
@@ -476,23 +450,7 @@ export async function loadProcess(
       );
 
       const childInstance = await ctx.adapter.instantiate(module, {
-        env: {
-          sys_poll: childYurtImports.host_poll,
-          sys_socket_open: childYurtImports.host_socket_open,
-          sys_socket_send: (fd: number, dataPtr: number, dataLen: number) =>
-            (childYurtImports.host_socket_send as (
-              ...args: number[]
-            ) => number)(
-              fd,
-              dataPtr,
-              dataLen,
-              0,
-            ),
-          sys_socket_recv: childYurtImports.host_socket_recv,
-          sys_socket_close: childYurtImports.host_socket_close,
-          sys_socket_bind: () => -9,
-          sys_socket_sendto: () => -9,
-        },
+        env: {},
         wasi_snapshot_preview1: childWasiImports,
         yurt: childYurtImports,
       });
