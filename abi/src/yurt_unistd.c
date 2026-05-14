@@ -16,6 +16,12 @@ YURT_DEFINE_MARKER(dup2, 0x64703200u)      /* "dp2\0" */
 YURT_DEFINE_MARKER(getgroups, 0x67677270u) /* "ggrp" */
 YURT_DEFINE_MARKER(gethostname, 0x67686e6du) /* "ghnm" */
 
+extern int __real_close(int fd);
+
+int __wrap_close(int fd) {
+  return __real_close(fd);
+}
+
 int dup2(int oldfd, int newfd) {
   YURT_MARKER_CALL(dup2);
 

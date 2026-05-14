@@ -4,7 +4,13 @@
 #include <unistd.h>
 #include <wasi/api.h>
 
-ssize_t write(int fd, const void *buf, size_t count) {
+extern ssize_t __real_read(int fd, void *buf, size_t count);
+
+ssize_t __wrap_read(int fd, void *buf, size_t count) {
+  return __real_read(fd, buf, count);
+}
+
+static ssize_t yurt_write_impl(int fd, const void *buf, size_t count) {
   __wasi_ciovec_t iov;
   __wasi_size_t written = 0;
   __wasi_errno_t rc;
@@ -20,4 +26,12 @@ ssize_t write(int fd, const void *buf, size_t count) {
     return -1;
   }
   return (ssize_t)written;
+}
+
+ssize_t write(int fd, const void *buf, size_t count) {
+  return yurt_write_impl(fd, buf, count);
+}
+
+ssize_t __wrap_write(int fd, const void *buf, size_t count) {
+  return yurt_write_impl(fd, buf, count);
 }

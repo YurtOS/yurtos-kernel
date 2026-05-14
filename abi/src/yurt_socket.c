@@ -183,6 +183,10 @@ int socket(int domain, int type, int protocol) {
   return fd;
 }
 
+int __wrap_socket(int domain, int type, int protocol) {
+  return socket(domain, type, protocol);
+}
+
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   YURT_MARKER_CALL(connect);
   char host[256];
@@ -249,6 +253,10 @@ int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     return -1;
   }
   return 0;
+}
+
+int __wrap_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+  return connect(sockfd, addr, addrlen);
 }
 
 static int yurt_fill_sockaddr_un(
@@ -385,6 +393,10 @@ int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   );
 }
 
+int __wrap_getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+  return getpeername(sockfd, addr, addrlen);
+}
+
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   YURT_MARKER_CALL(getsockname);
   return yurt_sockname_impl(
@@ -395,6 +407,10 @@ int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
     "local_host",
     "local_port"
   );
+}
+
+int __wrap_getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+  return getsockname(sockfd, addr, addrlen);
 }
 
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
@@ -446,6 +462,10 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   return 0;
 }
 
+int __wrap_bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+  return bind(sockfd, addr, addrlen);
+}
+
 int listen(int sockfd, int backlog) {
   YURT_MARKER_CALL(listen);
 
@@ -470,6 +490,10 @@ int listen(int sockfd, int backlog) {
     return -1;
   }
   return 0;
+}
+
+int __wrap_listen(int sockfd, int backlog) {
+  return listen(sockfd, backlog);
 }
 
 static int yurt_accept_impl(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
@@ -731,6 +755,10 @@ int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t
   return -1;
 }
 
+int __wrap_setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen) {
+  return setsockopt(sockfd, level, optname, optval, optlen);
+}
+
 static int yurt_getsockopt_impl(int sockfd, int level, int optname, void *optval, socklen_t *optlen) {
   int value = 0;
 
@@ -798,6 +826,10 @@ int shutdown(int sockfd, int how) {
     return -1;
   }
   return 0;
+}
+
+int __wrap_shutdown(int sockfd, int how) {
+  return shutdown(sockfd, how);
 }
 
 /* socketpair — backed by the in-kernel UnixSocketRegistry via
