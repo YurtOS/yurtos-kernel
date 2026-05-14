@@ -2083,11 +2083,7 @@ impl KernelHostInterface {
     /// instantiates each child via `spawn_child` + run-to-
     /// completion + `record_exit`.
     pub fn drain_pending_spawn(&self) -> Result<Option<PendingSpawn>> {
-        // Sized to leave room in the kernel scratch buffer (1 MiB
-        // total). Real wasm fixtures need to fit; we'll switch to
-        // a chunked transfer if/when individual children grow
-        // beyond this.
-        let mut buf = vec![0u8; 768 * 1024];
+        let mut buf = vec![0u8; self.kernel.lock().unwrap().scratch_len as usize];
         let rc = self.kernel.lock().unwrap().drain_spawn(&mut buf)?;
         if rc == -2 {
             return Ok(None); // -ENOENT: queue empty
@@ -2096,6 +2092,12 @@ impl KernelHostInterface {
             anyhow::bail!("kernel_drain_spawn failed: rc={rc}");
         }
         let used = rc as usize;
+        if used > buf.len() {
+            anyhow::bail!(
+                "kernel_drain_spawn record exceeds scratch capacity: used={used} cap={}",
+                buf.len()
+            );
+        }
         if used < 8 {
             anyhow::bail!("kernel_drain_spawn returned malformed record (len={used})");
         }

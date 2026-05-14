@@ -433,7 +433,6 @@ fn kernel_wasm_imports_match_documented_namespaces() {
     assert_eq!(
         kh_imports,
         vec![
-            "kh_destroy_instance",
             "kh_extension_invoke",
             "kh_fetch_blocking",
             "kh_idb_delete",
@@ -1276,6 +1275,28 @@ fn sys_spawn_stages_child_and_drain_pending_returns_it() {
         pending.child_pid
     );
     assert_eq!(i32::from_le_bytes(wresp[4..8].try_into().unwrap()), 7);
+}
+
+#[test]
+fn drain_pending_spawn_handles_wasm_larger_than_legacy_buffer() {
+    let mk = fresh_kernel_host_interface(0);
+    let body = vec![0x61; 800 * 1024];
+    let path: &[u8] = b"/bin/large";
+    mk.register_ramfs_file(path, &body).unwrap();
+
+    let mut sreq = (path.len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(path);
+    sreq.extend_from_slice(&5_u32.to_le_bytes());
+    sreq.extend_from_slice(b"large");
+
+    let child_pid = mk.syscall_as(1, METHOD_SYS_SPAWN, &sreq, &mut []).unwrap();
+    let pending = mk.drain_pending_spawn().unwrap().expect("staged spawn");
+
+    assert_eq!(pending.child_pid as i64, child_pid);
+    assert_eq!(pending.wasm.len(), body.len());
+    assert_eq!(pending.wasm, body);
+    assert_eq!(pending.argv, vec![b"large".to_vec()]);
+    assert!(mk.drain_pending_spawn().unwrap().is_none());
 }
 
 #[test]

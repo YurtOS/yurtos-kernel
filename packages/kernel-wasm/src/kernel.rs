@@ -537,19 +537,30 @@ impl Kernel {
         }
     }
 
-    /// Allocate the next pid for a host-created process in the low
+    /// Try to allocate the next pid for a host-created process in the low
     /// pid range. Skips occupied pids so tests that seed process
     /// records manually don't collide.
-    pub fn alloc_host_pid(&mut self) -> Pid {
-        while self.processes.contains_key(&self.next_host_pid) || self.next_host_pid >= 1000 {
-            self.next_host_pid = self.next_host_pid.saturating_add(1);
+    pub fn try_alloc_host_pid(&mut self) -> Option<Pid> {
+        for _ in 1..1000 {
             if self.next_host_pid >= 1000 {
                 self.next_host_pid = 1;
             }
+            let pid = self.next_host_pid;
+            self.next_host_pid = self.next_host_pid.saturating_add(1);
+            if !self.processes.contains_key(&pid) {
+                return Some(pid);
+            }
         }
-        let pid = self.next_host_pid;
-        self.next_host_pid = self.next_host_pid.saturating_add(1);
-        pid
+        None
+    }
+
+    /// Test-only convenience wrapper for low-pid allocation paths
+    /// where exhaustion is impossible by construction. Production
+    /// paths use [`Kernel::try_alloc_host_pid`] and map exhaustion to
+    /// errno.
+    #[cfg(test)]
+    pub fn alloc_host_pid(&mut self) -> Pid {
+        self.try_alloc_host_pid().expect("host pid range exhausted")
     }
 
     pub fn insert_host_process(
@@ -1310,6 +1321,18 @@ mod tests {
             with_kernel(|k| k.process(pid).host_instance_handle),
             Some(11)
         );
+    }
+
+    #[test]
+    fn try_alloc_host_pid_returns_none_when_low_pid_range_is_exhausted() {
+        let _g = TestGuard::acquire();
+        let exhausted = with_kernel(|k| {
+            for pid in 1..1000 {
+                k.process_mut(pid);
+            }
+            k.try_alloc_host_pid()
+        });
+        assert_eq!(exhausted, None);
     }
 
     #[test]

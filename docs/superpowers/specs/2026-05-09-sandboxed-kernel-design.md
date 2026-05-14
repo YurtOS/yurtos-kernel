@@ -161,7 +161,7 @@ surface, grouped:
   ABI and are the kernel-host-interface-js adapter's concern, not kernel.wasm's.
 - **Wasm engine ops:** `kh_spawn_process` (creates a new process instance from a
   module already loaded into the host's module cache, returns an instance
-  handle), `kh_destroy_instance`,
+  handle),
   `kh_process_mem_read(handle, addr, dst_ptr, len)`,
   `kh_process_mem_write(handle, addr, src_ptr, len)`,
   `kh_process_resume(handle, result, budget_ns)`. This import family is now represented in
@@ -225,12 +225,10 @@ Initial exports:
   pending-spawn record: `u32 child_pid`, `u32 wasm_len`, wasm bytes, `u32 argc`,
   then `(u32 arg_len + arg_bytes)*`. JS and native wasmtime adapters decode this
   binary record without owning or synthesizing process state.
-- `kernel_kill(pid, signal) -> i64` — apply signal/permission policy and route
-  termination to the process instance through the host mechanism when needed. If
-  the process record has an attached KH instance handle, kernel.wasm calls
-  `kh_destroy_instance` and clears the handle only after the KH adapter reports
-  success. The JS and native wasmtime adapters expose this as a host-control
-  wrapper; the kernel still owns signal validation and process state mutation.
+- `kernel_kill(pid, signal) -> i64` — apply signal/permission policy and record
+  pending signals in kernel-owned process state. Signal delivery and any process
+  teardown are separate scheduler/async-bridge work; `kill` itself does not
+  destroy host instances or mark the target waitable.
 - `kernel_wait(caller_pid, child_pid, flags, out_ptr, out_cap) -> i64` —
   wait/reap according to kernel process ownership rules. This is the
   host-control equivalent of the user-facing wait syscall, not a KH adapter

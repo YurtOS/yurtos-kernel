@@ -1485,21 +1485,9 @@ pub fn kill_pid(target: u32, sig: u32) -> i64 {
     if sig == 0 {
         return 0;
     }
-    let handle = with_kernel(|k| {
-        let p = k.process_mut(target);
-        p.pending_signals |= 1u64 << (sig - 1);
-        p.host_instance_handle
-    });
-    if let Some(handle) = handle {
-        let rc = kh::destroy_instance(handle);
-        if rc < 0 {
-            return rc as i64;
-        }
-    }
     with_kernel(|k| {
         let p = k.process_mut(target);
-        p.host_instance_handle = None;
-        p.exit_status = Some(128 + sig as i32);
+        p.pending_signals |= 1u64 << (sig - 1);
     });
     0
 }
@@ -1632,7 +1620,9 @@ pub fn spawn_cached_process(parent_pid: u32, module_id: &[u8], argv_request: &[u
         Ok(argv) => argv,
         Err(rc) => return rc,
     };
-    let pid = with_kernel(|k| k.alloc_host_pid());
+    let Some(pid) = with_kernel(|k| k.try_alloc_host_pid()) else {
+        return -(abi::EAGAIN as i64);
+    };
     let mut context = Vec::with_capacity(12 + argv_request.len());
     context.extend_from_slice(&1_u16.to_le_bytes()); // spawn_context_v1
     context.extend_from_slice(&0_u16.to_le_bytes()); // flags
@@ -2859,7 +2849,7 @@ pub fn drain_spawn(response: &mut [u8]) -> i64 {
         if response.len() < need {
             // Re-enqueue at front so the next call picks it up.
             k.pending_spawns_push_front(spawn);
-            return -(abi::EINVAL as i64);
+            return need as i64;
         }
         let mut cur = 0usize;
         response[cur..cur + 4].copy_from_slice(&spawn.child_pid.to_le_bytes());
@@ -5503,14 +5493,36 @@ mod tests {
     }
 
     #[test]
-    fn kill_clears_host_instance_handle_after_destroy() {
+    fn kill_records_nonfatal_signal_without_exiting_process() {
         let _g = crate::kernel::TestGuard::acquire();
         crate::kernel::with_kernel(|k| {
             k.process_mut(5).host_instance_handle = Some(42);
         });
-        assert_eq!(kill_pid(5, 15), -(abi::ENOSYS as i64));
-        let handle = crate::kernel::with_kernel(|k| k.process_mut(5).host_instance_handle);
+
+        assert_eq!(kill_pid(5, 17), 0); // SIGCHLD is not fatal.
+
+        let (pending, handle, exit_status) = crate::kernel::with_kernel(|k| {
+            let p = k.process_mut(5);
+            (p.pending_signals, p.host_instance_handle, p.exit_status)
+        });
+        assert_eq!(pending, 1u64 << 16);
         assert_eq!(handle, Some(42));
+        assert_eq!(exit_status, None);
+    }
+
+    #[test]
+    fn kill_leaves_host_instance_handle_until_signal_delivery() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(5).host_instance_handle = Some(42);
+        });
+        assert_eq!(kill_pid(5, 15), 0);
+        let (handle, exit_status) = crate::kernel::with_kernel(|k| {
+            let p = k.process_mut(5);
+            (p.host_instance_handle, p.exit_status)
+        });
+        assert_eq!(handle, Some(42));
+        assert_eq!(exit_status, None);
     }
 
     #[test]
@@ -6675,6 +6687,32 @@ mod tests {
     }
 
     #[test]
+    fn drain_spawn_reports_required_size_and_preserves_queue_when_buffer_is_small() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let body = vec![0xCC; 1024];
+        let child_pid = 1001;
+        crate::kernel::with_kernel(|k| {
+            k.enqueue_spawn(crate::kernel::PendingSpawn {
+                child_pid,
+                wasm: body.clone(),
+                argv: vec![b"big".to_vec()],
+            });
+        });
+
+        let mut small = vec![0u8; 16];
+        let required = drain_spawn(&mut small);
+        assert!(required > small.len() as i64);
+
+        let mut enough = vec![0u8; required as usize];
+        let written = drain_spawn(&mut enough);
+        assert_eq!(written, required);
+        assert_eq!(
+            u32::from_le_bytes(enough[0..4].try_into().unwrap()),
+            child_pid,
+        );
+    }
+
+    #[test]
     fn sys_spawn_follows_executable_symlink_without_rewriting_argv0() {
         let _g = crate::kernel::TestGuard::acquire();
         let body: &[u8] = b"\0asm\x01\x00\x00\x00fake-wasm-through-symlink";
@@ -7245,7 +7283,7 @@ mod tests {
     }
 
     #[test]
-    fn killed_child_is_waitable_by_parent() {
+    fn killed_child_is_not_waitable_until_signal_delivery_records_exit() {
         let _g = crate::kernel::TestGuard::acquire();
         let mut reg = 1_u32.to_le_bytes().to_vec();
         reg.extend_from_slice(&3_u32.to_le_bytes());
@@ -7256,12 +7294,10 @@ mod tests {
         assert_eq!(dispatch(METHOD_SYS_KILL, 1, &kill, &mut []), 0);
 
         let mut wreq = 0_u32.to_le_bytes().to_vec();
-        wreq.extend_from_slice(&0_u32.to_le_bytes());
+        wreq.extend_from_slice(&1_u32.to_le_bytes()); // WNOHANG
         let mut wresp = [0u8; 8];
         let n = dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp);
-        assert_eq!(n, 8);
-        assert_eq!(u32::from_le_bytes(wresp[0..4].try_into().unwrap()), 3);
-        assert_eq!(i32::from_le_bytes(wresp[4..8].try_into().unwrap()), 143);
+        assert_eq!(n, -(abi::EAGAIN as i64));
     }
 
     #[test]
