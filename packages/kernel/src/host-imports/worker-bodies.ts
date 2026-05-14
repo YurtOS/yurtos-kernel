@@ -478,6 +478,7 @@ export function makeWorkerDispatcherBodies(
       }
     },
     poll: (nfds, fds) => {
+      netLog("pthread.poll.req", { nfds, byteLen: fds.byteLength });
       // Single-shot readiness probe — the worker-side `host_poll`
       // import owns the retry/timeout loop. Each pollfd is 8 bytes:
       // i32 fd, i16 events, i16 revents (revents zeroed on input,
@@ -495,6 +496,8 @@ export function makeWorkerDispatcherBodies(
       const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
       let ready = 0;
       void POLLNVAL;
+      const fdSummary: number[] = [];
+      const reventsSummary: number[] = [];
       for (let i = 0; i < nfds; i++) {
         const base = i * POLLFD_SIZE;
         const fd = view.getInt32(base, true);
@@ -505,8 +508,15 @@ export function makeWorkerDispatcherBodies(
           revents = target ? pollReventsForTarget(target, events) : 0;
         }
         view.setInt16(base + 6, revents, true);
+        fdSummary.push(fd);
+        reventsSummary.push(revents);
         if (revents !== 0) ready++;
       }
+      netLog("pthread.poll.resp", {
+        fds: fdSummary,
+        revents: reventsSummary,
+        ready,
+      });
       return { result: ready, bytes: out };
     },
   };
