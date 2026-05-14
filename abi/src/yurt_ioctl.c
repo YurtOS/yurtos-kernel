@@ -53,9 +53,6 @@
 #ifndef TIOCSCTTY
 #define TIOCSCTTY   0x540E
 #endif
-#ifndef TIOCNOTTY
-#define TIOCNOTTY   0x5422
-#endif
 
 /* -- File-descriptor ioctl numbers -- */
 #ifndef FIONREAD
@@ -137,10 +134,6 @@ int ioctl(int fd, unsigned long request, ...) {
          * Failure is non-fatal — some programs probe TIOCSCTTY before setuid. */
         rc = yurt_host_tiocsctty(fd) >= 0 ? 0 : -1;
         if (rc < 0) errno = EPERM;
-        break;
-    }
-    case TIOCNOTTY: {
-        rc = 0;
         break;
     }
     case TIOCGEXCL: {

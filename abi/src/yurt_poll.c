@@ -26,7 +26,7 @@ static int yurt_poll_impl(struct pollfd *fds, nfds_t nfds, int timeout) {
     return -1;
   }
 
-  int rc = yurt_sys_poll((int)(intptr_t)fds, (int)nfds, timeout);
+  int rc = yurt_host_poll((int)(intptr_t)fds, (int)nfds, timeout);
   if (rc < 0) {
     errno = -rc;
     return -1;

@@ -9,8 +9,12 @@ import { ListenerRegistry } from "../listener-registry.js";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
-function bytes(s: string): Uint8Array {
-  return enc.encode(s);
+function base64(s: string): string {
+  return btoa(s);
+}
+
+function decodeB64(b: string): string {
+  return atob(b);
 }
 
 /**
@@ -37,7 +41,7 @@ function stubDelegate(): SocketBackend {
 describe("createLoopbackSocketBackend: AF_UNIX parity with delegate", () => {
   it("STREAM socketpair works with a stub delegate (browser setup)", async () => {
     const backend = createLoopbackSocketBackend(stubDelegate());
-    const r = backend.connect({ host: "127.0.0.1", port: 0, tls: false });
+    const r = await backend.connect({ host: "127.0.0.1", port: 0, tls: false });
     // TCP connect to unregistered port falls through to delegate → fails
     expect(r.ok).toBe(false);
 
@@ -48,11 +52,11 @@ describe("createLoopbackSocketBackend: AF_UNIX parity with delegate", () => {
     const ha = -a;
     const hb = -b;
 
-    backend.send(ha, bytes("ping"));
+    await backend.send(ha, base64("ping"));
     const got = await backend.recvAsync!(hb, 1024);
     expect(got.ok).toBe(true);
-    if (got.ok && got.data !== undefined) {
-      expect(dec.decode(got.data)).toBe("ping");
+    if (got.ok && got.data_b64 !== undefined) {
+      expect(decodeB64(got.data_b64)).toBe("ping");
     }
   });
 
@@ -63,11 +67,11 @@ describe("createLoopbackSocketBackend: AF_UNIX parity with delegate", () => {
     const ha = -a;
     const hb = -b;
 
-    backend.send(hb, bytes("pong"));
+    await backend.send(hb, base64("pong"));
     const got = await backend.recvAsync!(ha, 1024);
     expect(got.ok).toBe(true);
-    if (got.ok && got.data !== undefined) {
-      expect(dec.decode(got.data)).toBe("pong");
+    if (got.ok && got.data_b64 !== undefined) {
+      expect(decodeB64(got.data_b64)).toBe("pong");
     }
   });
 
@@ -91,7 +95,7 @@ describe("createLoopbackSocketBackend: AF_UNIX parity with delegate", () => {
     const reg = backend.registry;
 
     // Listener
-    const listenR = backend.listen!({
+    const listenR = await backend.listen!({
       host: "127.0.0.1",
       port: 0,
       backlog: 5,
@@ -115,18 +119,18 @@ describe("createLoopbackSocketBackend: AF_UNIX parity with delegate", () => {
     const clientSocket = connectR.ok ? -connectR.socket : 0;
     const serverSocket = acceptR.socket;
 
-    backend.send(clientSocket, bytes("hello-from-client"));
+    await backend.send(clientSocket, base64("hello-from-client"));
     const recv = await backend.recvAsync!(serverSocket, 1024);
     expect(recv.ok).toBe(true);
-    if (recv.ok && recv.data !== undefined) {
-      expect(dec.decode(recv.data)).toBe("hello-from-client");
+    if (recv.ok && recv.data_b64 !== undefined) {
+      expect(decodeB64(recv.data_b64)).toBe("hello-from-client");
     }
   });
 
-  it("positive handles (TCP) are forwarded to the delegate", () => {
+  it("positive handles (TCP) are forwarded to the delegate", async () => {
     const backend = createLoopbackSocketBackend(stubDelegate());
     // Positive socket handle → delegate (stub) → error
-    const result = backend.send(42, bytes("data"));
+    const result = await backend.send(42, base64("data"));
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error).toContain("stub");

@@ -32,13 +32,21 @@ export class BridgeClient implements NetworkBridgeLike {
     this.gateway = gateway ?? null;
   }
 
-  fetchSync(
+  // BridgeClient runs in the execution-worker. That worker is ALSO the
+  // worker-host dispatcher for any pthreads cpython spawns (libzmq's
+  // I/O reactor, etc.). A blocking `Atomics.wait` here would freeze the
+  // execution-worker's event loop and prevent it from draining
+  // "host-call" postMessages from those nested workers — the same
+  // dispatcher deadlock the SabMutex.lockAsync fix (dc58e1c) addressed
+  // at the main thread. Use `Atomics.waitAsync` so the event loop stays
+  // drained while we wait for the bridge worker's response.
+  async fetchSync(
     url: string,
     method: string,
     headers: Record<string, string>,
     body?: FetchRequestBody,
     redirect?: FetchRedirectMode,
-  ): SyncFetchResult {
+  ): Promise<SyncFetchResult> {
     // Check gateway policy synchronously first
     if (this.gateway) {
       const access = this.gateway.checkAccess(url, method);
@@ -64,13 +72,13 @@ export class BridgeClient implements NetworkBridgeLike {
     Atomics.store(this.int32, 0, STATUS_REQUEST_READY);
     Atomics.notify(this.int32, 0);
 
-    // Block until response (30-second timeout)
-    const waitResult = Atomics.wait(
+    const wait = Atomics.waitAsync(
       this.int32,
       0,
       STATUS_REQUEST_READY,
       30_000,
     );
+    const waitResult = wait.async ? await wait.value : "not-equal";
     if (waitResult === "timed-out") {
       Atomics.store(this.int32, 0, STATUS_IDLE);
       return {
@@ -95,7 +103,7 @@ export class BridgeClient implements NetworkBridgeLike {
     return result;
   }
 
-  requestSync(op: Record<string, unknown>): SyncRequestResult {
+  async requestSync(op: Record<string, unknown>): Promise<SyncRequestResult> {
     const reqJson = JSON.stringify(op);
     const reqEncoded = this.encoder.encode(reqJson);
     if (reqEncoded.byteLength > this.uint8.byteLength - 8) {
@@ -106,12 +114,13 @@ export class BridgeClient implements NetworkBridgeLike {
     Atomics.store(this.int32, 0, STATUS_REQUEST_READY);
     Atomics.notify(this.int32, 0);
 
-    const waitResult = Atomics.wait(
+    const wait = Atomics.waitAsync(
       this.int32,
       0,
       STATUS_REQUEST_READY,
       30_000,
     );
+    const waitResult = wait.async ? await wait.value : "not-equal";
     if (waitResult === "timed-out") {
       Atomics.store(this.int32, 0, STATUS_IDLE);
       return { ok: false, error: "request timed out" };

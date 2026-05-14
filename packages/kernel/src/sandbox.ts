@@ -546,6 +546,9 @@ export class Sandbox {
       env: Object.fromEntries(env),
       stdoutLimit: secLimits?.stdoutBytes,
       stderrLimit: secLimits?.stderrBytes,
+      // Sandbox host supports SAB+Atomics+Worker — opt threaded modules
+      // into `WorkerSabThreadsBackend`.
+      workerSabAvailable: true,
       extraYurtImports: Sandbox.createBootImportFactory(
         vfs,
         mgr,
@@ -1172,6 +1175,7 @@ export class Sandbox {
       vfs,
       adapter,
       kernel,
+      socketBackend,
       allocatePid,
       releasePid: (pid, exitCode, signal) => {
         kernel.releaseProcess(pid, exitCode, signal);
@@ -1197,6 +1201,7 @@ export class Sandbox {
         wasiHost,
         threadsBackend,
         mainInstance,
+        mainImportedMemory,
       ) => {
         const kernelImports = createKernelImports({
           memory,
@@ -1217,6 +1222,13 @@ export class Sandbox {
           // with "main module not ready" — see PR #23 + the abi_test
           // dlopen-canary happy_path case.
           mainInstance,
+          // For threaded main modules (target=wasm32-wasip1-threads +
+          // --import-memory), `mainInstance.exports.memory` is undefined
+          // because the module imports `env.memory` rather than exporting.
+          // The dlopen loader needs the SAB-backed `WebAssembly.Memory`
+          // to satisfy the side module's `env.memory` import; we pass it
+          // through here from loader.ts where workerSabMemory was bound.
+          mainImportedMemory,
           spawnProcess: (req, fdTable) => {
             const commandLabel = req.argv0 ?? req.prog;
             const childPid = kernel.allocPid(pid);
@@ -1272,6 +1284,9 @@ export class Sandbox {
               memoryBytes,
               stdoutLimit,
               stderrLimit,
+              // Sandbox host supports SAB+Atomics+Worker — opt threaded
+              // children into `WorkerSabThreadsBackend`.
+              workerSabAvailable: true,
               rollbackOnFailure: false,
             }).then(async (proc) => {
               processes.set(childPid, proc);
@@ -2031,6 +2046,12 @@ export class Sandbox {
       stderrToStdout: opts.stderrToStdout,
       stdoutLimit: this.security?.limits?.stdoutBytes,
       stderrLimit: this.security?.limits?.stderrBytes,
+      // Sandbox always runs on a host that supports SharedArrayBuffer +
+      // Atomics + Worker (Deno/Node). Opt in so threaded modules
+      // (yurt.features=["threads"]) route through
+      // `WorkerSabThreadsBackend` instead of being rejected by
+      // `validateYurtModuleProfile`.
+      workerSabAvailable: true,
       extraYurtImports: Sandbox.createBootImportFactory(
         this.vfs,
         this.mgr,
@@ -2336,6 +2357,9 @@ export class Sandbox {
       env: Object.fromEntries(childEnv),
       stdoutLimit: this.security?.limits?.stdoutBytes,
       stderrLimit: this.security?.limits?.stderrBytes,
+      // Sandbox host supports SAB+Atomics+Worker — opt threaded modules
+      // into `WorkerSabThreadsBackend`.
+      workerSabAvailable: true,
       extraYurtImports: Sandbox.createBootImportFactory(
         childVfs,
         childMgr,

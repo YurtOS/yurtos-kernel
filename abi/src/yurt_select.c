@@ -47,7 +47,7 @@ static int yurt_select_impl(
   if (timeout_ms == -2) return -1;
 
   if (nfds == 0) {
-    int rc = yurt_sys_poll(0, 0, timeout_ms);
+    int rc = yurt_host_poll(0, 0, timeout_ms);
     if (rc < 0) {
       errno = -rc;
       return -1;
@@ -73,7 +73,7 @@ static int yurt_select_impl(
     active++;
   }
 
-  int rc = yurt_sys_poll((int)(intptr_t)pollfds, active, timeout_ms);
+  int rc = yurt_host_poll((int)(intptr_t)pollfds, active, timeout_ms);
   if (rc < 0) {
     errno = -rc;
     return -1;

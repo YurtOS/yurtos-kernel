@@ -76,7 +76,9 @@ class WorkerResidentRunner {
     private readonly mgr: ProcessManager,
     private readonly networkBridge: NetworkBridgeLike | undefined,
     private readonly extensionHandler:
-      | ((cmd: Record<string, unknown>) => Record<string, unknown>)
+      | ((
+        cmd: Record<string, unknown>,
+      ) => Record<string, unknown> | Promise<Record<string, unknown>>)
       | undefined,
     maxProcesses?: number,
   ) {
@@ -451,20 +453,23 @@ parentPort.on("message", async (msg: InitMessage | RunMessage) => {
       mgr.registerTool(name, path);
     }
 
-    // Set up extension handler proxy: worker blocks on Atomics.wait while
-    // main thread runs the async extension handler, then notifies.
+    // Set up extension handler proxy: worker suspends on Atomics.waitAsync
+    // while main thread runs the async extension handler, then notifies.
     let extensionProxy:
-      | ((cmd: Record<string, unknown>) => Record<string, unknown>)
+      | ((
+        cmd: Record<string, unknown>,
+      ) => Promise<Record<string, unknown>>)
       | undefined;
     if (msg.hasExtensions) {
       const extInt32 = new Int32Array(sab);
-      extensionProxy = (
+      extensionProxy = async (
         cmd: Record<string, unknown>,
-      ): Record<string, unknown> => {
+      ): Promise<Record<string, unknown>> => {
         encodeRequest(sab, { op: "extensionInvoke", ...cmd });
         Atomics.store(extInt32, 0, STATUS_REQUEST);
         parentPort!.postMessage("proxy-request");
-        Atomics.wait(extInt32, 0, STATUS_REQUEST);
+        const wait = Atomics.waitAsync(extInt32, 0, STATUS_REQUEST);
+        await wait.value;
         const status = Atomics.load(extInt32, 0);
         const resp = decodeResponse(sab);
         Atomics.store(extInt32, 0, 0); // STATUS_IDLE

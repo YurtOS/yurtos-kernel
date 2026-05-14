@@ -46,10 +46,16 @@ Deno.test("thread backend factory rejects threaded modules until Worker/SAB back
 });
 
 Deno.test("thread backend factory creates Worker/SAB backend when a spawner is wired", () => {
+  const memory = new WebAssembly.Memory({
+    initial: 1,
+    maximum: 1,
+    shared: true,
+  });
   const backend = createThreadsBackend(profile("worker-sab"), {
     workerSab: {
       spawnThread: () => Promise.resolve(0),
     },
+    workerSabMemory: memory,
   });
 
   assertInstanceOf(backend, WorkerSabThreadsBackend);

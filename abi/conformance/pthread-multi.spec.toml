@@ -1,0 +1,9 @@
+canary = "pthread-multi-canary"
+symbol = "pthread_cond_broadcast"
+
+[[case]]
+name = "pthread_multi_condvar_barrier"
+inputs = "4 threads wait on a condvar; main broadcasts and joins each with its arg"
+expected.exit = 0
+expected.stdout = "OK"
+expected.note = "exercises WorkerSabThreadsBackend's SAB condvar broadcast wake path"

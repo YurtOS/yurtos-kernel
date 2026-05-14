@@ -38,7 +38,17 @@ export interface SyncRequestResult {
   [key: string]: unknown;
 }
 
-/** Minimal interface for network access from WASM host imports. */
+/** Minimal interface for network access from WASM host imports.
+ *
+ * Both methods return Promises even though the legacy naming (`fetchSync`,
+ * `requestSync`) hints at synchronous calls. The names are kept to avoid a
+ * sprawling rename across host imports; semantically these are async after
+ * the bridge moved from `Atomics.wait` to `Atomics.waitAsync` (the
+ * second-layer fix for the worker-host dispatcher deadlock pinned by
+ * `libzmq-reactor-spawn_reproducer_test.ts`). The async transport lets
+ * main's event loop drain `host-call` postMessages from spawned workers
+ * while the bridge worker fulfils the request.
+ */
 export interface NetworkBridgeLike {
   fetchSync(
     url: string,
@@ -46,7 +56,7 @@ export interface NetworkBridgeLike {
     headers: Record<string, string>,
     body?: FetchRequestBody,
     redirect?: FetchRedirectMode,
-  ): SyncFetchResult;
+  ): Promise<SyncFetchResult>;
   /** Async fetch — used in the browser where Atomics.wait() isn't available on the main thread. */
   fetchAsync?(
     url: string,
@@ -56,7 +66,7 @@ export interface NetworkBridgeLike {
     redirect?: FetchRedirectMode,
   ): Promise<SyncFetchResult>;
   /** Send a generic operation (connect/send/recv/close) through the bridge. */
-  requestSync(op: Record<string, unknown>): SyncRequestResult;
+  requestSync(op: Record<string, unknown>): Promise<SyncRequestResult>;
 }
 
 export class NetworkBridge implements NetworkBridgeLike {
@@ -520,16 +530,20 @@ export class NetworkBridge implements NetworkBridgeLike {
   }
 
   /**
-   * Synchronous fetch -- blocks the calling thread until the worker completes.
-   * Safe to call from WASI host functions.
+   * Fetch through the bridge worker — async on the main JS thread so the
+   * event loop stays drained for `host-call` postMessages while the
+   * worker fulfils the request. Safe to call from WASI host functions
+   * because all host imports already flow through JSPI/Asyncify. Name
+   * is `fetchSync` for historical reasons (callers used to be sync); the
+   * return is a Promise.
    */
-  fetchSync(
+  async fetchSync(
     url: string,
     method: string,
     headers: Record<string, string>,
     body?: FetchRequestBody,
     redirect?: FetchRedirectMode,
-  ): SyncFetchResult {
+  ): Promise<SyncFetchResult> {
     if (!this.worker) {
       return { status: 0, body: "", headers: {}, error: "bridge not started" };
     }
@@ -560,13 +574,15 @@ export class NetworkBridge implements NetworkBridgeLike {
     Atomics.store(this.int32, 0, STATUS_REQUEST_READY);
     Atomics.notify(this.int32, 0);
 
-    // Block until response (30-second timeout to avoid hanging if worker crashes)
-    const waitResult = Atomics.wait(
+    // Non-blocking wait so the main event loop keeps draining
+    // worker-host postMessages. Mirrors SabMutex.lockAsync (dc58e1c).
+    const wait = Atomics.waitAsync(
       this.int32,
       0,
       STATUS_REQUEST_READY,
       30_000,
     );
+    const waitResult = wait.async ? await wait.value : "not-equal";
     if (waitResult === "timed-out") {
       Atomics.store(this.int32, 0, STATUS_IDLE);
       return {
@@ -592,10 +608,12 @@ export class NetworkBridge implements NetworkBridgeLike {
   }
 
   /**
-   * Generic sync request — sends any operation through the bridge.
-   * Used for socket operations (connect, send, recv, close).
+   * Generic request through the bridge — async on the main JS thread.
+   * Used for socket operations (connect, send, recv, close, listen,
+   * accept, …). See `fetchSync` for the rationale; the name keeps the
+   * `Sync` suffix for callsite continuity but the return is a Promise.
    */
-  requestSync(op: Record<string, unknown>): SyncRequestResult {
+  async requestSync(op: Record<string, unknown>): Promise<SyncRequestResult> {
     if (!this.worker) {
       return { ok: false, error: "bridge not started" };
     }
@@ -613,12 +631,13 @@ export class NetworkBridge implements NetworkBridgeLike {
     Atomics.store(this.int32, 0, STATUS_REQUEST_READY);
     Atomics.notify(this.int32, 0);
 
-    const waitResult = Atomics.wait(
+    const wait = Atomics.waitAsync(
       this.int32,
       0,
       STATUS_REQUEST_READY,
       30_000,
     );
+    const waitResult = wait.async ? await wait.value : "not-equal";
     if (waitResult === "timed-out") {
       Atomics.store(this.int32, 0, STATUS_IDLE);
       return { ok: false, error: "request timed out" };

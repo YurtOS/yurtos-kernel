@@ -351,7 +351,7 @@ pub mod mock {
                 status: 0,
                 headers: Default::default(),
                 body: String::new(),
-                raw_body: Vec::new(),
+                body_base64: None,
                 error: Some("networking not configured".to_string()),
             }
         }
@@ -446,6 +446,10 @@ pub mod mock {
                 Some(result) => Ok(result.exit_code),
                 None => Ok(-1),
             }
+        }
+
+        fn list_processes(&self) -> Result<String, HostError> {
+            Ok("[]".to_string())
         }
 
         fn socket_connect(&self, _host: &str, _port: u16, _tls: bool) -> Result<u32, HostError> {

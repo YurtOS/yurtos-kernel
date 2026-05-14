@@ -2148,9 +2148,25 @@ fn builtin_jobs(state: &mut ShellState, host: &dyn HostInterface) -> BuiltinResu
     BuiltinResult::Result(0)
 }
 
-fn builtin_ps(_host: &dyn HostInterface) -> BuiltinResult {
-    shell_eprintln!("ps: process listing moved to kernel_snapshot");
-    BuiltinResult::Result(1)
+fn builtin_ps(host: &dyn HostInterface) -> BuiltinResult {
+    match host.list_processes() {
+        Ok(json) => {
+            if let Ok(procs) = serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                shell_println!("{:<8} {:<10} {}", "PID", "STATE", "COMMAND");
+                for p in &procs {
+                    let pid = p["pid"].as_i64().unwrap_or(0);
+                    let st = p["state"].as_str().unwrap_or("unknown");
+                    let cmd = p["command"].as_str().unwrap_or("");
+                    shell_println!("{:<8} {:<10} {}", pid, st, cmd);
+                }
+            }
+            BuiltinResult::Result(0)
+        }
+        Err(e) => {
+            shell_eprintln!("ps: {}", e);
+            BuiltinResult::Result(1)
+        }
+    }
 }
 
 // -- kill -----------------------------------------------------------------

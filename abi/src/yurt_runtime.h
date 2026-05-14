@@ -18,50 +18,8 @@ void yurt_host_yield(void);
 __attribute__((import_module("yurt"), import_name("host_file_lock")))
 int yurt_host_file_lock(int fd, int operation);
 
-__attribute__((import_module("env"), import_name("sys_poll")))
-int yurt_sys_poll(int fds_ptr, int nfds, int timeout_ms);
-
-__attribute__((import_module("env"), import_name("sys_socket_open")))
-int yurt_sys_socket_open(int family, int sock_type, int flags);
-
-__attribute__((import_module("env"), import_name("sys_socket_connect")))
-int yurt_sys_socket_connect(int fd, const void *addr, int addr_len);
-
-__attribute__((import_module("env"), import_name("sys_socket_send")))
-int yurt_sys_socket_send(int fd, const void *buf, int buf_len);
-
-__attribute__((import_module("env"), import_name("sys_socket_recv")))
-int yurt_sys_socket_recv(int fd, void *buf, int buf_cap, int flags);
-
-__attribute__((import_module("env"), import_name("sys_socket_close")))
-int yurt_sys_socket_close(int fd);
-
-__attribute__((import_module("env"), import_name("sys_socketpair")))
-int yurt_sys_socketpair(int family, int sock_type, int flags, int out_ptr);
-
-__attribute__((import_module("env"), import_name("sys_socket_bind")))
-int yurt_sys_socket_bind(int fd, const void *addr, int addr_len);
-
-__attribute__((import_module("env"), import_name("sys_socket_sendto")))
-int yurt_sys_socket_sendto(int fd, const void *buf, int buf_len, int flags,
-                           const void *addr, int addr_len);
-
-__attribute__((import_module("env"), import_name("sys_socket_listen")))
-int yurt_sys_socket_listen(int fd, int backlog);
-
-__attribute__((import_module("env"), import_name("sys_socket_accept")))
-int yurt_sys_socket_accept(int fd, int flags);
-
-__attribute__((import_module("env"), import_name("sys_socket_addr")))
-int yurt_sys_socket_addr(int fd, void *out, int out_cap);
-
-__attribute__((import_module("env"), import_name("sys_socket_sendmsg")))
-int yurt_sys_socket_sendmsg(int fd, const void *buf, int buf_len,
-                            const int *fds, int fds_count);
-
-__attribute__((import_module("env"), import_name("sys_socket_recvmsg")))
-int yurt_sys_socket_recvmsg(int fd, void *buf, int buf_cap,
-                            int *fds, int fds_cap, int *n_fds);
+__attribute__((import_module("yurt"), import_name("host_poll")))
+int yurt_host_poll(int fds_ptr, int nfds, int timeout_ms);
 
 __attribute__((import_module("yurt"), import_name("host_chmod")))
 int yurt_host_chmod(int path_ptr, int path_len, int mode);

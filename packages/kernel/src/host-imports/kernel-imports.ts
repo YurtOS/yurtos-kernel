@@ -102,11 +102,13 @@ export interface KernelImportsOptions {
   extensionRegistry?: ExtensionRegistry;
 
   /**
-   * Legacy extension handler (sync, used by Worker proxy).
+   * Legacy extension handler (used by Worker proxy).
    * If both extensionRegistry and extensionHandler are provided,
    * extensionRegistry takes precedence.
    */
-  extensionHandler?: (cmd: Record<string, unknown>) => Record<string, unknown>;
+  extensionHandler?: (
+    cmd: Record<string, unknown>,
+  ) => Record<string, unknown> | Promise<Record<string, unknown>>;
 
   /** Called by host_spawn to actually create and start a WASM process.
    *  `parentPid` is the PID of the in-sandbox process making the spawn
@@ -142,6 +144,19 @@ export interface KernelImportsOptions {
    * error). See packages/kernel/src/process/dynlink.ts.
    */
   mainInstance?: () => WebAssembly.Instance | null;
+
+  /**
+   * The `WebAssembly.Memory` instance the main module imports from
+   * `env.memory`, or `null` when the main module exports its own
+   * memory. Threaded modules (target=wasm32-wasip1-threads with
+   * `-Wl,--import-memory --shared-memory`) import a SAB-backed
+   * memory and don't export `memory` — the Phase 1 dlopen loader
+   * needs this reference to satisfy side modules' `env.memory`
+   * imports, since `mainInstance.exports.memory` is undefined.
+   * Defaults to `null` for backwards-compatibility with non-threaded
+   * callers.
+   */
+  mainImportedMemory?: WebAssembly.Memory | null;
 }
 
 const ERR_NOT_FOUND = -1;
@@ -159,12 +174,44 @@ const USER_UID = 1000;
 const USER_GID = 1000;
 const PRIO_PROCESS = 0;
 const YURT_WAIT_NOHANG = 1;
-const POLLIN = 0x0001;
-const POLLOUT = 0x0002;
-const POLLERR = 0x0008;
-const POLLHUP = 0x0010;
-const POLLNVAL = 0x0020;
-const POLLFD_SIZE = 8;
+export const POLLIN = 0x0001;
+export const POLLOUT = 0x0002;
+export const POLLERR = 0x0008;
+export const POLLHUP = 0x0010;
+export const POLLNVAL = 0x0020;
+export const POLLFD_SIZE = 8;
+
+/**
+ * Net-debug channel: enabled by `YURT_NET_DEBUG=1` in the host
+ * environment. Emits structured-ish lines on stderr around socket
+ * bind / listen / accept so we can see why ipykernel's TCP setup
+ * fails or stalls. No-op when the env var isn't set; safe in both
+ * Deno and browser (where neither env source exists).
+ */
+const YURT_NET_DEBUG = (() => {
+  try {
+    const denoEnv = (globalThis as {
+      Deno?: { env: { get(k: string): string | undefined } };
+    }).Deno?.env;
+    if (denoEnv?.get("YURT_NET_DEBUG")) return true;
+  } catch { /* Deno.env may throw on insufficient permissions */ }
+  try {
+    const procEnv = (globalThis as {
+      process?: { env: Record<string, string | undefined> };
+    }).process?.env;
+    if (procEnv?.YURT_NET_DEBUG) return true;
+  } catch { /* no-op */ }
+  return false;
+})();
+
+function netLog(op: string, fields: Record<string, unknown>): void {
+  if (!YURT_NET_DEBUG) return;
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(fields)) {
+    parts.push(`${k}=${typeof v === "string" ? v : JSON.stringify(v)}`);
+  }
+  console.error(`[yurt-net] ${op} ${parts.join(" ")}`);
+}
 
 function writeI32(
   memory: WebAssembly.Memory,
@@ -232,260 +279,11 @@ const STAT_RECORD_SIZE = 32;
 const FILE_TYPE_FILE = 1;
 const FILE_TYPE_DIR = 2;
 const FILE_TYPE_SYMLINK = 4;
-const SPAWN_REQUEST_V1_MIN_SIZE = 80;
+const SPAWN_REQUEST_V1_SIZE = 88;
 const SPAN_SIZE = 8;
 const ENV_PAIR_SIZE = 16;
 const FD_MAP_PAIR_SIZE = 8;
 const fatalUtf8Decoder = new TextDecoder("utf-8", { fatal: true });
-const FETCH_RECORD_VERSION_1 = 1;
-const FETCH_FLAG_MANUAL_REDIRECT = 1;
-const FETCH_RESPONSE_FLAG_OK = 1;
-const FETCH_REQUEST_HEADER_SIZE = 20;
-const FETCH_RESPONSE_HEADER_SIZE = 20;
-
-interface FetchRequestRecord {
-  url: string;
-  method: string;
-  headers: Record<string, string>;
-  body?: string | null;
-  redirect: FetchRedirectMode;
-}
-
-function parseHeaderLines(bytes: Uint8Array): Record<string, string> {
-  const text = new TextDecoder().decode(bytes);
-  const headers: Record<string, string> = {};
-  for (const line of text.split("\n")) {
-    if (line.length === 0) continue;
-    const sep = line.indexOf(":");
-    if (sep <= 0) throw new Error("invalid fetch header line");
-    headers[line.slice(0, sep).trim()] = line.slice(sep + 1).trimStart();
-  }
-  return headers;
-}
-
-function encodeHeaderLines(headers: Record<string, string>): Uint8Array {
-  return new TextEncoder().encode(
-    Object.entries(headers).map(([name, value]) => `${name}: ${value}`).join(
-      "\n",
-    ),
-  );
-}
-
-function decodeFetchRequest(bytes: Uint8Array): FetchRequestRecord {
-  if (bytes.byteLength < FETCH_REQUEST_HEADER_SIZE) {
-    throw new Error("fetch request too short");
-  }
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const version = view.getUint16(0, true);
-  if (version !== FETCH_RECORD_VERSION_1) {
-    throw new Error(`unsupported fetch request version: ${version}`);
-  }
-  const flags = view.getUint16(2, true);
-  const urlLen = view.getUint32(4, true);
-  const methodLen = view.getUint32(8, true);
-  const headersLen = view.getUint32(12, true);
-  const bodyLen = view.getUint32(16, true);
-  const total = FETCH_REQUEST_HEADER_SIZE + urlLen + methodLen + headersLen +
-    bodyLen;
-  if (total > bytes.byteLength) throw new Error("truncated fetch request");
-  let offset = FETCH_REQUEST_HEADER_SIZE;
-  const decode = (len: number): string => {
-    const value = new TextDecoder().decode(
-      bytes.subarray(offset, offset + len),
-    );
-    offset += len;
-    return value;
-  };
-  const url = decode(urlLen);
-  const method = methodLen === 0 ? "GET" : decode(methodLen);
-  const headers = parseHeaderLines(bytes.subarray(offset, offset + headersLen));
-  offset += headersLen;
-  const body = bodyLen === 0 ? undefined : decode(bodyLen);
-  return {
-    url,
-    method,
-    headers,
-    body,
-    redirect: (flags & FETCH_FLAG_MANUAL_REDIRECT) !== 0 ? "manual" : "follow",
-  };
-}
-
-function encodeFetchResponse(record: {
-  ok: boolean;
-  status: number;
-  headers: Record<string, string>;
-  body: string | Uint8Array;
-  error?: string | null;
-}): Uint8Array {
-  const headers = encodeHeaderLines(record.headers);
-  const body = typeof record.body === "string"
-    ? new TextEncoder().encode(record.body)
-    : record.body;
-  const error = record.error == null ? new Uint8Array() : new TextEncoder()
-    .encode(record.error);
-  const bytes = new Uint8Array(
-    FETCH_RESPONSE_HEADER_SIZE + headers.byteLength + body.byteLength +
-      error.byteLength,
-  );
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  view.setUint16(0, FETCH_RECORD_VERSION_1, true);
-  view.setUint16(2, record.ok ? FETCH_RESPONSE_FLAG_OK : 0, true);
-  view.setUint32(4, record.status, true);
-  view.setUint32(8, headers.byteLength, true);
-  view.setUint32(12, body.byteLength, true);
-  view.setUint32(16, error.byteLength, true);
-  let offset = FETCH_RESPONSE_HEADER_SIZE;
-  bytes.set(headers, offset);
-  offset += headers.byteLength;
-  bytes.set(body, offset);
-  offset += body.byteLength;
-  bytes.set(error, offset);
-  return bytes;
-}
-
-function decodeBase64Bytes(value: string): Uint8Array {
-  const binary = atob(value);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    out[i] = binary.charCodeAt(i);
-  }
-  return out;
-}
-
-function encodeNativeFetchResponse(record: {
-  status: number;
-  headers: Record<string, string>;
-  body: Uint8Array;
-  error?: string | null;
-}): Uint8Array {
-  const encoder = new TextEncoder();
-  const entries = Object.entries(record.headers);
-  const headerSize = 36;
-  const pairSize = 16;
-  const pairsOffset = headerSize;
-  let cursor = pairsOffset + entries.length * pairSize;
-  const strings: Uint8Array[] = [];
-  const pairs: Array<[number, number, number, number]> = [];
-  for (const [key, value] of entries) {
-    const keyBytes = encoder.encode(key);
-    const valueBytes = encoder.encode(value);
-    const keyOffset = cursor;
-    cursor += keyBytes.byteLength;
-    const valueOffset = cursor;
-    cursor += valueBytes.byteLength;
-    strings.push(keyBytes, valueBytes);
-    pairs.push([
-      keyOffset,
-      keyBytes.byteLength,
-      valueOffset,
-      valueBytes.byteLength,
-    ]);
-  }
-  const bodyOffset = cursor;
-  cursor += record.body.byteLength;
-  const errorBytes = record.error
-    ? encoder.encode(record.error)
-    : new Uint8Array();
-  const errorOffset = cursor;
-  cursor += errorBytes.byteLength;
-  const bytes = new Uint8Array(cursor);
-  const view = new DataView(bytes.buffer);
-  view.setUint32(0, bytes.byteLength, true);
-  view.setUint16(4, NATIVE_RECORD_VERSION_1, true);
-  view.setUint16(6, 0, true);
-  view.setUint32(8, record.status >>> 0, true);
-  view.setUint32(12, pairsOffset, true);
-  view.setUint32(16, entries.length, true);
-  view.setUint32(20, bodyOffset, true);
-  view.setUint32(24, record.body.byteLength, true);
-  view.setUint32(28, errorOffset, true);
-  view.setUint32(32, errorBytes.byteLength, true);
-  for (let i = 0; i < pairs.length; i++) {
-    const at = pairsOffset + i * pairSize;
-    const [keyOffset, keyLength, valueOffset, valueLength] = pairs[i];
-    view.setUint32(at, keyOffset, true);
-    view.setUint32(at + 4, keyLength, true);
-    view.setUint32(at + 8, valueOffset, true);
-    view.setUint32(at + 12, valueLength, true);
-  }
-  cursor = pairsOffset + entries.length * pairSize;
-  for (const part of strings) {
-    bytes.set(part, cursor);
-    cursor += part.byteLength;
-  }
-  bytes.set(record.body, bodyOffset);
-  bytes.set(errorBytes, errorOffset);
-  return bytes;
-}
-
-function decodeNativeFetchRequest(
-  memory: WebAssembly.Memory,
-  ptr: number,
-  len: number,
-): FetchRequestRecord | null {
-  const header = readRecordHeader(memory, ptr, len);
-  if (
-    !header || header.version !== NATIVE_RECORD_VERSION_1 || header.size < 44
-  ) {
-    return null;
-  }
-  const view = new DataView(memory.buffer, ptr, header.size);
-  const readFetchString = (off: number, strLen: number): string | null => {
-    const bytes = readSpan(memory, ptr, header.size, off, strLen);
-    return bytes === null ? null : new TextDecoder().decode(bytes);
-  };
-  const readHeaderPairs = (
-    off: number,
-    count: number,
-  ): Record<string, string> | null => {
-    const pairBytes = readSpan(memory, ptr, header.size, off, count * 16);
-    if (pairBytes === null) return null;
-    const pairView = new DataView(pairBytes.buffer, pairBytes.byteOffset);
-    const headers: Record<string, string> = {};
-    for (let i = 0; i < count; i++) {
-      const at = i * 16;
-      const key = readFetchString(
-        pairView.getUint32(at, true),
-        pairView.getUint32(at + 4, true),
-      );
-      const value = readFetchString(
-        pairView.getUint32(at + 8, true),
-        pairView.getUint32(at + 12, true),
-      );
-      if (key === null || value === null) return null;
-      headers[key] = value;
-    }
-    return headers;
-  };
-  const url = readFetchString(
-    view.getUint32(8, true),
-    view.getUint32(12, true),
-  );
-  const method =
-    readFetchString(view.getUint32(16, true), view.getUint32(20, true)) ??
-      "GET";
-  const headers = readHeaderPairs(
-    view.getUint32(24, true),
-    view.getUint32(28, true),
-  );
-  const bodyBytes = readSpan(
-    memory,
-    ptr,
-    header.size,
-    view.getUint32(32, true),
-    view.getUint32(36, true),
-  );
-  if (url === null || headers === null || bodyBytes === null) return null;
-  return {
-    url,
-    method,
-    headers,
-    body: bodyBytes.byteLength === 0
-      ? null
-      : new TextDecoder().decode(bodyBytes),
-    redirect: view.getUint32(40, true) === 1 ? "manual" : "follow",
-  };
-}
 
 function writeStatRecord(
   memory: WebAssembly.Memory,
@@ -552,13 +350,13 @@ function writeStringListRecord(
 }
 
 function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
-  if (bytes.byteLength < SPAWN_REQUEST_V1_MIN_SIZE) return null;
+  if (bytes.byteLength < SPAWN_REQUEST_V1_SIZE) return null;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const logicalSize = view.getUint32(0, true);
   const version = view.getUint16(4, true);
   if (
     version !== NATIVE_RECORD_VERSION_1 ||
-    logicalSize < SPAWN_REQUEST_V1_MIN_SIZE
+    logicalSize < SPAWN_REQUEST_V1_SIZE
   ) return null;
   if (logicalSize > bytes.byteLength) {
     throw new Error("native spawn request exceeds buffer");
@@ -646,11 +444,10 @@ function decodeNativeSpawnRequest(bytes: Uint8Array): SpawnRequest | null {
     }
     return out;
   };
-
   const argv0 = readSpan(16);
   const cwd = readSpan(40);
   const stdinData = readSpan(68);
-  const fdMap = logicalSize >= 88 ? readFdMap(readU32(80), readU32(84)) : [];
+  const fdMap = readFdMap(readU32(80), readU32(84));
   return {
     prog: readRequiredSpan(8),
     ...(argv0 === undefined ? {} : { argv0 }),
@@ -671,7 +468,151 @@ function yieldToScheduler(): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
-function pollReventsForTarget(target: FdTarget, events: number): number {
+/**
+ * Allocate a connected AF_UNIX socket pair (stream or dgram) and
+ * register both sides as kernel fds for the caller process. Shared
+ * between `host_socket_socketpair` on main and the worker-host
+ * dispatcher's `socketPair` body, so pthread workers reach the same
+ * kernel state through the proxy.
+ */
+export function allocUnixSocketPair(
+  kernel: ProcessKernel,
+  socketBackend: SocketBackend,
+  callerPid: number,
+  sockType: number,
+): { fdA: number; fdB: number } | null {
+  try {
+    const registry = socketBackend.registry;
+    if (!registry) return null;
+    const pairCreds = kernel.getCredentials(callerPid);
+    const SOCK_DGRAM = 5; // wasi-sdk-30 value passed by C via base_type
+    if (sockType === SOCK_DGRAM) {
+      const { a, b } = registry.openDgramPair();
+      const makeDgramTarget = (rawHandle: number): FdTarget => ({
+        type: "socket",
+        socket: -rawHandle,
+        family: "AF_UNIX",
+        isDgram: true,
+        refs: 1,
+        peerPid: callerPid,
+        peerUid: pairCreds.euid,
+        peerGid: pairCreds.egid,
+        send: socketBackend.send.bind(socketBackend),
+        recv: socketBackend.recv.bind(socketBackend),
+        recvAsync: (socket, maxBytes) =>
+          recvSocketAsync(socketBackend, socket, maxBytes),
+        setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+        close: (_socket) => {
+          registry.closeDgramSocket(rawHandle);
+        },
+      });
+      const fdA = kernel.allocFd(callerPid, makeDgramTarget(a));
+      const fdB = kernel.allocFd(callerPid, makeDgramTarget(b));
+      return { fdA, fdB };
+    }
+    const { a, b } = registry.openUnixPair();
+    const makeTarget = (rawHandle: number): FdTarget => ({
+      type: "socket",
+      socket: -rawHandle,
+      family: "AF_UNIX",
+      refs: 1,
+      peerPid: callerPid,
+      peerUid: pairCreds.euid,
+      peerGid: pairCreds.egid,
+      send: socketBackend.send.bind(socketBackend),
+      recv: socketBackend.recv.bind(socketBackend),
+      recvAsync: (socket, maxBytes) =>
+        recvSocketAsync(socketBackend, socket, maxBytes),
+      setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+      close: (socket) => {
+        socketBackend.close(socket);
+      },
+    });
+    const fdA = kernel.allocFd(callerPid, makeTarget(a));
+    const fdB = kernel.allocFd(callerPid, makeTarget(b));
+    return { fdA, fdB };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Nonblocking AF_UNIX recv for pthread workers. Mirrors the
+ * sync-friendly fast-path of `host_socket_recv_unix`: probes the
+ * registry without awaiting and returns {-3} for wrong family,
+ * {-2} for EAGAIN, {-1} for hard errors, or {bytes-read, bytes}.
+ * The pthread side decides whether to retry on -2.
+ */
+export function recvUnixSocketNonblocking(
+  kernel: ProcessKernel,
+  socketBackend: SocketBackend,
+  callerPid: number,
+  sockfd: number,
+  bufCap: number,
+  peek: boolean,
+): { result: number; bytes?: Uint8Array } {
+  const target = kernel.getFdTarget(callerPid, sockfd);
+  if (!target || target.type !== "socket") return { result: -3 };
+  if (target.family !== "AF_UNIX") return { result: -3 };
+  const registry = socketBackend.registry;
+  if (!registry) return { result: -1 };
+
+  if (target.isDgram) {
+    if (target.socket == null) return { result: -1 };
+    const rawHandle = -(target.socket as number);
+    const r = registry.recvDgram(rawHandle, bufCap, true);
+    if (!r.ok) return { result: -2 };
+    const b = (r as { ok: true; bytes: Uint8Array }).bytes;
+    const n = Math.min(b.length, bufCap);
+    return { result: n, bytes: b.subarray(0, n) };
+  }
+
+  const socket = target.socket as number | null;
+  if (socket === null || socket >= 0) return { result: -1 };
+  const regHandle = -socket;
+
+  if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
+    const chunk = target.peekBuffer.slice(0, bufCap);
+    if (!peek) target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+    return { result: chunk.byteLength, bytes: chunk };
+  }
+
+  const probe = registry.recv(regHandle, bufCap, { nonblocking: true });
+  if (!probe.ok) return { result: probe.error === "EAGAIN" ? -2 : -1 };
+  if (peek) target.peekBuffer = probe.bytes;
+  return { result: probe.bytes.byteLength, bytes: probe.bytes };
+}
+
+/**
+ * AF_UNIX send for pthread workers. Mirrors the synchronous fast-path of
+ * `host_socket_send_unix` so the worker-host dispatcher can satisfy
+ * libzmq signaler writes without crossing back to main's async surface.
+ */
+export function sendUnixSocket(
+  kernel: ProcessKernel,
+  socketBackend: SocketBackend,
+  callerPid: number,
+  sockfd: number,
+  data: Uint8Array,
+): number {
+  const target = kernel.getFdTarget(callerPid, sockfd);
+  if (!target || target.type !== "socket") return -2;
+  if (target.family !== "AF_UNIX") return -2;
+  const socket = target.socket as number | null;
+  if (socket === null || socket >= 0) return -1;
+  const registry = socketBackend.registry;
+  if (!registry) return -1;
+  if (target.isDgram) {
+    const result = registry.sendDgramToPeer(-socket, new Uint8Array(data));
+    if (!result.ok) return -1;
+    return result.bytesSent;
+  }
+  const result = registry.send(-socket, new Uint8Array(data));
+  if (!result.ok) return -1;
+  return result.bytesSent;
+}
+
+export function pollReventsForTarget(target: FdTarget, events: number): number {
   let revents = 0;
   const wantsRead = (events & POLLIN) !== 0;
   const wantsWrite = (events & POLLOUT) !== 0;
@@ -698,6 +639,7 @@ function pollReventsForTarget(target: FdTarget, events: number): number {
       if (target.state.masterClosed) revents |= POLLHUP;
       break;
     case "buffer":
+      // Buffer targets are write-only stdout/stderr captures.
       if (wantsWrite) revents |= POLLOUT;
       break;
     case "static":
@@ -708,14 +650,34 @@ function pollReventsForTarget(target: FdTarget, events: number): number {
         if ((target.peekBuffer?.byteLength ?? 0) > 0 || target.readShutdown) {
           revents |= POLLIN;
         } else if (target.socket !== null) {
-          const probe = target.recv(target.socket, 1, { nonblocking: true });
-          if (probe.ok) {
-            const data = probe.data ?? new Uint8Array(0);
-            if (data.byteLength > 0) target.peekBuffer = data;
-            else target.readShutdown = true;
-            revents |= POLLIN;
-          } else if (probe.error !== "EAGAIN") {
-            revents |= POLLERR;
+          // Socket readiness is probed by a nonblocking recv; any byte read
+          // here is cached so the following guest recv observes it.
+          // After the bridge async-fication, recv returns Awaitable: for
+          // the loopback fast-path it's still sync, for the bridge it's
+          // a Promise. poll() is a sync helper, so if we get a Promise
+          // we conservatively treat the fd as not-ready-yet; the next
+          // poll cycle will retry.
+          const probeAwaitable = target.recv(target.socket, 1, {
+            nonblocking: true,
+          });
+          if (
+            typeof (probeAwaitable as Promise<unknown>).then !== "function"
+          ) {
+            const probe = probeAwaitable as
+              & { ok: boolean }
+              & Record<
+                string,
+                unknown
+              >;
+            if (probe.ok) {
+              const data = (probe.data as Uint8Array | undefined) ??
+                new Uint8Array(0);
+              if (data.byteLength > 0) target.peekBuffer = data;
+              else target.readShutdown = true;
+              revents |= POLLIN;
+            } else if (probe.error !== "EAGAIN") {
+              revents |= POLLERR;
+            }
           }
         }
       }
@@ -816,6 +778,37 @@ function globMatch(vfs: VfsLike, pattern: string): string[] {
   return matches;
 }
 
+async function walkVfsAsync(vfs: AsyncHostVfs, dir: string): Promise<string[]> {
+  const results: string[] = [];
+  let entries: ReturnType<VfsLike["readdir"]>;
+  try {
+    entries = vfs.readdirAsync ? await vfs.readdirAsync(dir) : vfs.readdir(dir);
+  } catch {
+    return results;
+  }
+  for (const entry of entries) {
+    const fullPath = dir === "/" ? "/" + entry.name : dir + "/" + entry.name;
+    results.push(fullPath);
+    if (entry.type === "dir") {
+      results.push(...await walkVfsAsync(vfs, fullPath));
+    }
+  }
+  return results;
+}
+
+async function globMatchAsync(
+  vfs: AsyncHostVfs,
+  pattern: string,
+): Promise<string[]> {
+  const absPattern = pattern.startsWith("/") ? pattern : "/" + pattern;
+  const baseDir = globBaseDir(absPattern);
+  const regex = globToRegExp(absPattern);
+  const allPaths = await walkVfsAsync(vfs, baseDir);
+  const matches = allPaths.filter((p) => regex.test(p));
+  matches.sort();
+  return matches;
+}
+
 function normalizeImportPath(path: string): string {
   const parts: string[] = [];
   for (const part of path.split("/")) {
@@ -879,6 +872,37 @@ function splitResolutionPath(path: string): string[] {
   return path.split("/").filter((part) => part !== "" && part !== ".");
 }
 
+type AsyncHostVfs = VfsLike & {
+  isAsyncVfs?: boolean;
+  readFileAsync?: (path: string) => Promise<Uint8Array>;
+  writeFileAsync?: (
+    path: string,
+    data: Uint8Array,
+    mode?: number,
+  ) => Promise<void>;
+  statAsync?: (path: string) => Promise<ReturnType<VfsLike["stat"]>>;
+  lstatAsync?: (path: string) => Promise<ReturnType<VfsLike["lstat"]>>;
+  readdirAsync?: (path: string) => Promise<ReturnType<VfsLike["readdir"]>>;
+  mkdirAsync?: (path: string, mode?: number) => Promise<void>;
+  unlinkAsync?: (path: string) => Promise<void>;
+  rmdirAsync?: (path: string) => Promise<void>;
+  renameAsync?: (oldPath: string, newPath: string) => Promise<void>;
+  symlinkAsync?: (target: string, path: string) => Promise<void>;
+  readlinkAsync?: (path: string) => Promise<string>;
+  chmodAsync?: (path: string, mode: number) => Promise<void>;
+  chownAsync?: (
+    path: string,
+    uid: number,
+    gid: number,
+    followSymlinks?: boolean,
+  ) => Promise<void>;
+};
+
+function asyncHostVfs(vfs: VfsLike | undefined): AsyncHostVfs | null {
+  const candidate = vfs as AsyncHostVfs | undefined;
+  return candidate?.isAsyncVfs ? candidate : null;
+}
+
 function resolveRealpath(vfs: VfsLike, cwd: string, rawPath: string): string {
   if (rawPath === "") throw new Error("ENOENT: empty path");
   const startPath = rawPath.startsWith("/")
@@ -916,6 +940,55 @@ function resolveRealpath(vfs: VfsLike, cwd: string, rawPath: string): string {
 
   const real = "/" + resolved.join("/");
   vfs.stat(real);
+  return real === "" ? "/" : real;
+}
+
+async function resolveRealpathAsync(
+  vfs: AsyncHostVfs,
+  cwd: string,
+  rawPath: string,
+): Promise<string> {
+  if (rawPath === "") throw new Error("ENOENT: empty path");
+  const startPath = rawPath.startsWith("/")
+    ? rawPath
+    : cwd === "/"
+    ? `/${rawPath}`
+    : `${cwd}/${rawPath}`;
+  let queue = splitResolutionPath(startPath);
+  const resolved: string[] = [];
+  let symlinkDepth = 0;
+
+  while (queue.length > 0) {
+    const part = queue.shift()!;
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      resolved.pop();
+      continue;
+    }
+
+    const candidate = "/" + [...resolved, part].join("/");
+    const stat = vfs.lstatAsync
+      ? await vfs.lstatAsync(candidate)
+      : vfs.lstat(candidate);
+    if (stat.type !== "symlink") {
+      resolved.push(part);
+      continue;
+    }
+    if (++symlinkDepth > 40) throw new Error("ELOOP: too many symlink levels");
+
+    const target = vfs.readlinkAsync
+      ? await vfs.readlinkAsync(candidate)
+      : vfs.readlink(candidate);
+    const targetPath = target.startsWith("/")
+      ? target
+      : `${dirnameOfPath(candidate)}/${target}`;
+    queue = [...splitResolutionPath(targetPath), ...queue];
+    resolved.length = 0;
+  }
+
+  const real = "/" + resolved.join("/");
+  if (vfs.statAsync) await vfs.statAsync(real);
+  else vfs.stat(real);
   return real === "" ? "/" : real;
 }
 
@@ -974,6 +1047,17 @@ export function createKernelImports(
       : fn();
   }
 
+  async function getCallerPhysicalCwdAsync(vfs: AsyncHostVfs): Promise<string> {
+    const cwd = getCallerCwd();
+    try {
+      return await withVfsCallerCredentials(() =>
+        resolveRealpathAsync(vfs, cwd, ".")
+      );
+    } catch {
+      return normalizeImportPath(cwd);
+    }
+  }
+
   function authorizeChown(
     path: string,
     uid: number,
@@ -996,6 +1080,44 @@ export function createKernelImports(
     }
   }
 
+  async function authorizeChownAsync(
+    vfs: AsyncHostVfs,
+    path: string,
+    uid: number,
+    gid: number,
+    followSymlinks = true,
+  ): Promise<number> {
+    const credentials = getCallerCredentials();
+    if (credentials.euid === ROOT_UID) return 0;
+    if (gid !== -1 && gid !== credentials.egid) return ERR_PERMISSION;
+    if (uid === -1) return 0;
+    try {
+      const stat = followSymlinks
+        ? vfs.statAsync ? await vfs.statAsync(path) : vfs.stat(path)
+        : vfs.lstatAsync
+        ? await vfs.lstatAsync(path)
+        : vfs.lstat(path);
+      return stat.uid === credentials.euid && uid === stat.uid
+        ? 0
+        : ERR_PERMISSION;
+    } catch {
+      return ERR_PERMISSION;
+    }
+  }
+
+  function writeCStringResult(
+    value: string,
+    outPtr: number,
+    outCap: number,
+  ): number {
+    const bytes = new TextEncoder().encode(value);
+    const required = bytes.byteLength + 1;
+    if (outCap < required) return required;
+    new Uint8Array(memory.buffer, outPtr, bytes.byteLength).set(bytes);
+    new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
+    return required;
+  }
+
   function limitToBigUint64(limit: number): bigint {
     if (!Number.isFinite(limit)) return 0xffff_ffff_ffff_ffffn;
     return BigInt(Math.max(0, Math.trunc(limit)));
@@ -1012,11 +1134,15 @@ export function createKernelImports(
       target.refs--;
       if (target.refs <= 0) {
         if (target.listener != null && target.closeListener) {
-          target.closeListener(target.listener);
+          // Fire-and-forget: bridge-backed closes are async but
+          // closeFdTarget is sync. The bridge worker tears down its
+          // side independently; we only care that the kernel-side fd
+          // table is reaped here.
+          void target.closeListener(target.listener);
           target.listener = null;
         }
         if (target.socket !== null) {
-          target.close(target.socket);
+          void target.close(target.socket);
           target.socket = null;
         }
       }
@@ -1063,7 +1189,8 @@ export function createKernelImports(
   }
 
   function ipv4ToBytes(host: string): [number, number, number, number] {
-    const parts = normalizeIpv4(host).split(".").map((part) => Number(part));
+    const normalized = normalizeIpv4(host);
+    const parts = normalized.split(".").map((part) => Number(part));
     if (
       parts.length !== 4 ||
       parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
@@ -1071,6 +1198,46 @@ export function createKernelImports(
       return [0, 0, 0, 0];
     }
     return parts as [number, number, number, number];
+  }
+
+  function writeSocketAddrResult(
+    ptr: number,
+    cap: number,
+    host: string,
+    port: number,
+  ): number {
+    const size = 8;
+    if (cap < size) return size;
+    const bytes = new Uint8Array(memory.buffer, ptr, size);
+    const hostBytes = ipv4ToBytes(host);
+    bytes.set(hostBytes, 0);
+    const view = new DataView(memory.buffer, ptr, size);
+    view.setUint16(4, port & 0xffff, false);
+    view.setUint16(6, 0, true);
+    return size;
+  }
+
+  function writeSocketAcceptResult(
+    ptr: number,
+    cap: number,
+    accepted: {
+      fd: number;
+      peerHost: string;
+      peerPort: number;
+      localHost: string;
+      localPort: number;
+    },
+  ): number {
+    const size = 16;
+    if (cap < size) return size;
+    const bytes = new Uint8Array(memory.buffer, ptr, size);
+    const view = new DataView(memory.buffer, ptr, size);
+    view.setInt32(0, accepted.fd, true);
+    bytes.set(ipv4ToBytes(accepted.peerHost), 4);
+    view.setUint16(8, accepted.peerPort & 0xffff, false);
+    view.setUint16(10, accepted.localPort & 0xffff, false);
+    bytes.set(ipv4ToBytes(accepted.localHost), 12);
+    return size;
   }
 
   function setFallbackUid(ruid: number, euid: number, suid: number): number {
@@ -1193,6 +1360,15 @@ export function createKernelImports(
     return 0;
   }
 
+  function base64ToBytes(value: string): Uint8Array {
+    const binary = atob(value);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      out[i] = binary.charCodeAt(i);
+    }
+    return out;
+  }
+
   function concatBytes(left: Uint8Array, right: Uint8Array): Uint8Array {
     const out = new Uint8Array(left.byteLength + right.byteLength);
     out.set(left, 0);
@@ -1250,13 +1426,20 @@ export function createKernelImports(
     path: string,
   ): { ok: true } | { ok: false; error: string } {
     if (!policy?.allowUnixDomain) {
-      return { ok: false, error: "AF_UNIX listen is not allowed" };
+      return {
+        ok: false,
+        error: `AF_UNIX listen on ${path} is not allowed by sandbox policy`,
+      };
     }
-    if (
-      policy.unixPathAllowlist &&
-      !policy.unixPathAllowlist.some((pattern) => pattern.test(path))
-    ) {
-      return { ok: false, error: `AF_UNIX path ${path} is not allowed` };
+    const allowlist = policy.unixPathAllowlist;
+    if (allowlist && allowlist.length > 0) {
+      const allowed = allowlist.some((re) => re.test(path));
+      if (!allowed) {
+        return {
+          ok: false,
+          error: `AF_UNIX path ${path} is not in the sandbox allowlist`,
+        };
+      }
     }
     return { ok: true };
   }
@@ -1266,54 +1449,24 @@ export function createKernelImports(
     name: string,
   ): { ok: true } | { ok: false; error: string } {
     if (!policy?.allowUnixDomain) {
-      return { ok: false, error: "AF_UNIX listen is not allowed" };
+      return {
+        ok: false,
+        error:
+          `AF_UNIX abstract listen on @${name} is not allowed by sandbox policy`,
+      };
     }
-    if (
-      policy.unixAbstractAllowlist &&
-      !policy.unixAbstractAllowlist.some((pattern) => pattern.test(name))
-    ) {
-      return { ok: false, error: `AF_UNIX abstract ${name} is not allowed` };
+    const allowlist = policy.unixAbstractAllowlist;
+    if (allowlist && allowlist.length > 0) {
+      const allowed = allowlist.some((re) => re.test(name));
+      if (!allowed) {
+        return {
+          ok: false,
+          error:
+            `AF_UNIX abstract name @${name} is not in the sandbox allowlist`,
+        };
+      }
     }
     return { ok: true };
-  }
-
-  function writeSocketAddrResult(
-    ptr: number,
-    cap: number,
-    host: string,
-    port: number,
-  ): number {
-    const size = 8;
-    if (cap < size) return size;
-    const bytes = new Uint8Array(memory.buffer, ptr, size);
-    bytes.set(ipv4ToBytes(host), 0);
-    const view = new DataView(memory.buffer, ptr, size);
-    view.setUint16(4, port & 0xffff, false);
-    view.setUint16(6, 0, true);
-    return size;
-  }
-
-  function writeSocketAcceptResult(
-    ptr: number,
-    cap: number,
-    accepted: {
-      fd: number;
-      peerHost: string;
-      peerPort: number;
-      localHost: string;
-      localPort: number;
-    },
-  ): number {
-    const size = 16;
-    if (cap < size) return size;
-    const bytes = new Uint8Array(memory.buffer, ptr, size);
-    const view = new DataView(memory.buffer, ptr, size);
-    view.setInt32(0, accepted.fd, true);
-    bytes.set(ipv4ToBytes(accepted.peerHost), 4);
-    view.setUint16(8, accepted.peerPort & 0xffff, false);
-    view.setUint16(10, accepted.localPort & 0xffff, false);
-    bytes.set(ipv4ToBytes(accepted.localHost), 12);
-    return size;
   }
 
   // ── Phase 1 dlopen state (per-sandbox) ──
@@ -1357,8 +1510,6 @@ export function createKernelImports(
 
     // host_pipe(out_ptr, out_cap) -> i32
     // Creates a pipe and writes yurt_pipe_result_v1 to the output buffer.
-    // ABI:
-    //   - cap >= 8: binary struct {read_fd: i32, write_fd: i32}, returns 8
     host_pipe(outPtr: number, outCap: number): number {
       if (!opts.kernel) {
         return ERR_IO;
@@ -1590,8 +1741,8 @@ export function createKernelImports(
     // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32
     // Native-only: the request bytes must decode as a yurt_spawn_request_v1
     // record. The 4-argument form writes yurt_spawn_result_v1; the 2-argument
-    // form (host_spawn_async) returns the pid directly. Decode failures are
-    // hard errors.
+    // form (host_spawn_async) returns the pid directly. No text serialization
+    // fallback — a decode failure is a hard error.
     host_spawn(
       reqPtr: number,
       reqLen: number,
@@ -1837,14 +1988,16 @@ export function createKernelImports(
       return ERR_INVALID;
     },
 
-    host_getcwd(outPtr: number, outCap: number): number {
+    host_getcwd(outPtr: number, outCap: number): number | Promise<number> {
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          const cwd = await getCallerPhysicalCwdAsync(asyncVfs);
+          return writeCStringResult(cwd, outPtr, outCap);
+        })();
+      }
       const cwd = getCallerPhysicalCwd();
-      const bytes = new TextEncoder().encode(cwd);
-      const required = bytes.byteLength + 1;
-      if (outCap < required) return required;
-      new Uint8Array(memory.buffer, outPtr, bytes.byteLength).set(bytes);
-      new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
-      return required;
+      return writeCStringResult(cwd, outPtr, outCap);
     },
 
     host_realpath(
@@ -1852,19 +2005,38 @@ export function createKernelImports(
       pathLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const real = await withVfsCallerCredentials(() =>
+              resolveRealpathAsync(asyncVfs, getCallerCwd(), rawPath)
+            );
+            return writeCStringResult(real, outPtr, outCap);
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            if (msg.includes("ENOTDIR") || msg.includes("not a directory")) {
+              return ERR_NOT_DIR;
+            }
+            if (msg.includes("ELOOP")) return ERR_INVALID;
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         const real = withVfsCallerCredentials(() =>
           resolveRealpath(opts.vfs!, getCallerCwd(), rawPath)
         );
-        const bytes = new TextEncoder().encode(real);
-        const required = bytes.byteLength + 1;
-        if (outCap < required) return required;
-        new Uint8Array(memory.buffer, outPtr, bytes.byteLength).set(bytes);
-        new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
-        return required;
+        return writeCStringResult(real, outPtr, outCap);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "";
         if (msg.includes("ENOENT") || msg.includes("no such file")) {
@@ -1881,10 +2053,32 @@ export function createKernelImports(
       }
     },
 
-    host_chdir(pathPtr: number, pathLen: number): number {
+    host_chdir(pathPtr: number, pathLen: number): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
       const path = resolveCwdPath(getCallerCwd(), rawPath);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const stat = asyncVfs.statAsync
+              ? await asyncVfs.statAsync(path)
+              : asyncVfs.stat(path);
+            if (stat.type !== "dir") return ERR_NOT_DIR;
+            setCallerCwd(resolveLogicalCwdPath(getCallerCwd(), rawPath));
+            return 0;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         const stat = opts.vfs.stat(path);
         if (stat.type !== "dir") return ERR_NOT_DIR;
@@ -1902,7 +2096,7 @@ export function createKernelImports(
       }
     },
 
-    host_fchdir(fd: number): number {
+    host_fchdir(fd: number): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       let path = opts.wasiHost?.getDirectoryFdPath(fd) ?? null;
       if (path === null && opts.kernel) {
@@ -1914,6 +2108,28 @@ export function createKernelImports(
         }
       }
       if (path === null) return ERR_NOT_FOUND;
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const stat = asyncVfs.statAsync
+              ? await asyncVfs.statAsync(path!)
+              : asyncVfs.stat(path!);
+            if (stat.type !== "dir") return ERR_NOT_DIR;
+            setCallerCwd(path!);
+            return 0;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         const stat = opts.vfs.stat(path);
         if (stat.type !== "dir") return ERR_NOT_DIR;
@@ -2231,104 +2447,6 @@ export function createKernelImports(
       })();
     },
 
-    // host_waitpid_nohang(pid, wstatus_ptr, wstatus_len) -> i32
-    // Non-blocking waitpid: returns waited pid, 0 if no child exited yet, or -errno.
-    // Writes POSIX wstatus (exitCode << 8) to wstatus_ptr if non-zero and child exited.
-    host_waitpid_nohang(
-      pid: number,
-      wstatusPtr: number,
-      wstatusLen: number,
-    ): number {
-      if (!opts.kernel) return ERR_CHILD;
-      opts.wasiHost?.drainPendingSignals();
-      const kernel = opts.kernel;
-      if (pid <= 0) {
-        const result = kernel.waitAnyChildNohang(callerPid);
-        if (result.state === "running") return 0;
-        if (result.state === "none") return ERR_CHILD;
-        if (wstatusPtr !== 0 && wstatusLen >= 4) {
-          new DataView(memory.buffer).setInt32(
-            wstatusPtr,
-            result.exitCode << 8,
-            true,
-          );
-        }
-        return result.pid!;
-      }
-      const exitCode = kernel.waitpidNohang(pid, callerPid);
-      if (exitCode === -1) return 0;
-      if (exitCode < 0) return ERR_CHILD;
-      if (wstatusPtr !== 0 && wstatusLen >= 4) {
-        new DataView(memory.buffer).setInt32(wstatusPtr, exitCode << 8, true);
-      }
-      return pid;
-    },
-
-    // host_waitpid(pid, wstatus_ptr, wstatus_len) -> i32 | Promise<i32>
-    // Blocking waitpid: suspends until child exits. Returns waited pid or -errno.
-    // Writes POSIX wstatus (exitCode << 8) to wstatus_ptr if non-zero.
-    host_waitpid(
-      pid: number,
-      wstatusPtr: number,
-      wstatusLen: number,
-    ): number | Promise<number> {
-      if (!opts.kernel) return ERR_CHILD;
-      const kernel = opts.kernel;
-
-      return (async () => {
-        await yieldToScheduler();
-        const signalWait = opts.wasiHost?.waitForSignalDelivery();
-        const interrupt = signalWait?.promise ?? new Promise<void>(() => {});
-
-        const writeStatus = (waitedPid: number, code: number): number => {
-          if (wstatusPtr !== 0 && wstatusLen >= 4) {
-            new DataView(memory.buffer).setInt32(wstatusPtr, code << 8, true);
-          }
-          return waitedPid;
-        };
-
-        if (pid <= 0) {
-          // Do NOT call drainPendingSignals() here: the asyncify buffer holds a
-          // saved WASM stack.  If the SIGCHLD handler calls host_waitpid (async),
-          // wrapImport would overwrite the buffer and corrupt the outer waitpid
-          // resume point.  The interrupt promise (from waitForSignalDelivery) is
-          // sufficient — it fires when any signal is queued.
-          const waitedPromise = kernel.waitAnyChildInterruptible(
-            callerPid,
-            interrupt,
-          );
-          const waited = await waitedPromise;
-          signalWait?.cancel();
-          if (waited.interrupted) {
-            const result = kernel.waitAnyChildNohang(callerPid);
-            if (result.state === "exited") {
-              return writeStatus(result.pid!, result.exitCode);
-            }
-            return ERR_INTERRUPTED;
-          }
-          const result = waited.result;
-          if (!result) return ERR_CHILD;
-          return writeStatus(result.pid, result.exitCode);
-        }
-
-        // Same safety rule: no drainPendingSignals() while asyncify buffer is live.
-        const waitedPromise = kernel.waitpidInterruptible(
-          pid,
-          callerPid,
-          interrupt,
-        );
-        const waited = await waitedPromise;
-        signalWait?.cancel();
-        if (waited.interrupted) {
-          const exitCode = kernel.waitpidNohang(pid, callerPid);
-          if (exitCode >= 0) return writeStatus(pid, exitCode);
-          return ERR_INTERRUPTED;
-        }
-        if (waited.exitCode < 0) return ERR_CHILD;
-        return writeStatus(pid, waited.exitCode);
-      })();
-    },
-
     // host_close_fd(fd) -> i32
     // Closes a file descriptor in the caller's fd table.
     host_close_fd(fd: number): number {
@@ -2470,6 +2588,7 @@ export function createKernelImports(
     // Stores POSIX descriptor flags such as FD_CLOEXEC in the kernel fd table.
     host_set_fd_descriptor_flags(fd: number, flags: number): number {
       if (!opts.kernel) return -1;
+      if (!opts.kernel.getFdTarget(callerPid, fd)) return -1;
       opts.kernel.setFdDescriptorFlags(callerPid, fd, flags);
       return 0;
     },
@@ -2565,81 +2684,195 @@ export function createKernelImports(
     // ── Network ──
 
     // host_network_fetch(req_ptr, req_len, out_ptr, out_cap) -> i32
-    // HTTP fetch via NetworkBridge. Async (JSPI) to support both SAB-based
-    // bridges (Node/Deno) and direct fetch() in the browser.
+    // HTTP fetch via native yurt_fetch_request_v1/yurt_fetch_response_v1 records.
+    // Async (JSPI) to support both SAB-based bridges (Node/Deno) and direct
+    // fetch() in the browser.
     async host_network_fetch(
       reqPtr: number,
       reqLen: number,
       outPtr: number,
       outCap: number,
     ): Promise<number> {
+      const readFetchString = (
+        base: number,
+        size: number,
+        off: number,
+        len: number,
+      ): string | null => {
+        const bytes = readSpan(memory, base, size, off, len);
+        return bytes === null ? null : new TextDecoder().decode(bytes);
+      };
+      const readHeaderPairs = (
+        base: number,
+        size: number,
+        off: number,
+        count: number,
+      ): Record<string, string> | null => {
+        const pairBytes = readSpan(memory, base, size, off, count * 16);
+        if (pairBytes === null) return null;
+        const view = new DataView(pairBytes.buffer, pairBytes.byteOffset);
+        const headers: Record<string, string> = {};
+        for (let i = 0; i < count; i++) {
+          const at = i * 16;
+          const key = readFetchString(
+            base,
+            size,
+            view.getUint32(at, true),
+            view.getUint32(at + 4, true),
+          );
+          const value = readFetchString(
+            base,
+            size,
+            view.getUint32(at + 8, true),
+            view.getUint32(at + 12, true),
+          );
+          if (key === null || value === null) return null;
+          headers[key] = value;
+        }
+        return headers;
+      };
+      const writeFetchResponse = (
+        status: number,
+        headers: Record<string, string>,
+        body: Uint8Array,
+        error: string | null,
+      ): number => {
+        const encoder = new TextEncoder();
+        const entries = Object.entries(headers);
+        const headerSize = 36;
+        const pairSize = 16;
+        const pairsOffset = headerSize;
+        let cursor = pairsOffset + entries.length * pairSize;
+        const strings: Uint8Array[] = [];
+        const pairs: Array<[number, number, number, number]> = [];
+        for (const [key, value] of entries) {
+          const keyBytes = encoder.encode(key);
+          const valueBytes = encoder.encode(value);
+          const keyOffset = cursor;
+          cursor += keyBytes.byteLength;
+          const valueOffset = cursor;
+          cursor += valueBytes.byteLength;
+          strings.push(keyBytes, valueBytes);
+          pairs.push([
+            keyOffset,
+            keyBytes.byteLength,
+            valueOffset,
+            valueBytes.byteLength,
+          ]);
+        }
+        const bodyOffset = cursor;
+        cursor += body.byteLength;
+        const errorBytes = error ? encoder.encode(error) : new Uint8Array();
+        const errorOffset = cursor;
+        cursor += errorBytes.byteLength;
+        const size = cursor;
+        if (outCap < size) return size;
+
+        const out = new Uint8Array(memory.buffer, outPtr, size);
+        out.fill(0);
+        const view = new DataView(memory.buffer, outPtr, size);
+        view.setUint32(0, size, true);
+        view.setUint16(4, 1, true);
+        view.setUint16(6, 0, true);
+        view.setUint32(8, status >>> 0, true);
+        view.setUint32(12, pairsOffset, true);
+        view.setUint32(16, entries.length, true);
+        view.setUint32(20, bodyOffset, true);
+        view.setUint32(24, body.byteLength, true);
+        view.setUint32(28, errorOffset, true);
+        view.setUint32(32, errorBytes.byteLength, true);
+        for (let i = 0; i < pairs.length; i++) {
+          const at = pairsOffset + i * pairSize;
+          const [keyOffset, keyLength, valueOffset, valueLength] = pairs[i];
+          view.setUint32(at, keyOffset, true);
+          view.setUint32(at + 4, keyLength, true);
+          view.setUint32(at + 8, valueOffset, true);
+          view.setUint32(at + 12, valueLength, true);
+        }
+        cursor = pairsOffset + entries.length * pairSize;
+        for (const bytes of strings) {
+          out.set(bytes, cursor);
+          cursor += bytes.byteLength;
+        }
+        out.set(body, bodyOffset);
+        out.set(errorBytes, errorOffset);
+        return size;
+      };
+
       const fetchError = (error: string) =>
-        writeBytes(
-          memory,
-          outPtr,
-          outCap,
-          encodeFetchResponse({
-            ok: false,
-            status: 0,
-            headers: {},
-            body: "",
-            error,
-          }),
-        );
+        writeFetchResponse(0, {}, new Uint8Array(), error);
 
       if (!opts.networkBridge) {
         return fetchError("networking not configured");
       }
 
       try {
-        const nativeReq = decodeNativeFetchRequest(memory, reqPtr, reqLen);
-        const req = nativeReq ??
-          decodeFetchRequest(readBytes(memory, reqPtr, reqLen));
+        const header = readRecordHeader(memory, reqPtr, reqLen);
+        if (!header || header.version !== 1 || header.size < 44) {
+          return fetchError("invalid fetch request record");
+        }
+        const view = new DataView(memory.buffer, reqPtr, header.size);
+        const url = readFetchString(
+          reqPtr,
+          header.size,
+          view.getUint32(8, true),
+          view.getUint32(12, true),
+        );
+        const method = readFetchString(
+          reqPtr,
+          header.size,
+          view.getUint32(16, true),
+          view.getUint32(20, true),
+        ) ?? "GET";
+        const headers = readHeaderPairs(
+          reqPtr,
+          header.size,
+          view.getUint32(24, true),
+          view.getUint32(28, true),
+        );
+        const bodyBytes = readSpan(
+          memory,
+          reqPtr,
+          header.size,
+          view.getUint32(32, true),
+          view.getUint32(36, true),
+        );
+        if (url === null || headers === null || bodyBytes === null) {
+          return fetchError("invalid fetch request spans");
+        }
+        const redirect: FetchRedirectMode = view.getUint32(40, true) === 1
+          ? "manual"
+          : "follow";
+        const body = bodyBytes.byteLength > 0
+          ? new Uint8Array(bodyBytes)
+          : null;
 
-        // Use async fetch if available (browser), otherwise fall back to sync (SAB bridge)
+        // Both fetchAsync (browser) and fetchSync (node bridge) return
+        // Promises — the latter's name is legacy from when the bridge
+        // blocked on Atomics.wait.
         const result = opts.networkBridge.fetchAsync
           ? await opts.networkBridge.fetchAsync(
-            req.url,
-            req.method,
-            req.headers,
-            req.body,
-            req.redirect,
+            url,
+            method,
+            headers,
+            body,
+            redirect,
           )
-          : opts.networkBridge.fetchSync(
-            req.url,
-            req.method,
-            req.headers,
-            req.body,
-            req.redirect,
+          : await opts.networkBridge.fetchSync(
+            url,
+            method,
+            headers,
+            body,
+            redirect,
           );
-        if (nativeReq) {
-          return writeBytes(
-            memory,
-            outPtr,
-            outCap,
-            encodeNativeFetchResponse({
-              status: result.status,
-              headers: result.headers,
-              body: result.body_base64 == null
-                ? new TextEncoder().encode(result.body)
-                : decodeBase64Bytes(result.body_base64),
-              error: result.error ?? null,
-            }),
-          );
-        }
-        return writeBytes(
-          memory,
-          outPtr,
-          outCap,
-          encodeFetchResponse({
-            ok: !result.error && result.status >= 200 && result.status < 400,
-            status: result.status,
-            headers: result.headers,
-            body: result.body_base64 == null
-              ? result.body
-              : decodeBase64Bytes(result.body_base64),
-            error: result.error ?? null,
-          }),
+        const responseBody = result.body_base64
+          ? base64ToBytes(result.body_base64)
+          : new TextEncoder().encode(result.body);
+        return writeFetchResponse(
+          result.status,
+          result.headers,
+          responseBody,
+          result.error ?? null,
         );
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
@@ -2650,7 +2883,7 @@ export function createKernelImports(
     // ── DNS ──
 
     // host_dns_resolve(host_ptr, host_len, out_ptr, out_cap) -> i32
-    // Resolves a hostname to a dotted-decimal IPv4 address string.
+    // Resolves a hostname to a native yurt_dns_addr_result_v1 record.
     // Returns bytes written into out_ptr, or -1 if the name cannot be resolved.
     // Async (JSPI): used by yurt_netdb_addr_for_host in the guest.
     async host_dns_resolve(
@@ -2660,14 +2893,6 @@ export function createKernelImports(
       outCap: number,
     ): Promise<number> {
       const writeDnsAddrResult = (addr: string): number => {
-        if (outCap > 8) {
-          return writeBytes(
-            memory,
-            outPtr,
-            outCap,
-            new TextEncoder().encode(addr),
-          );
-        }
         const size = 8;
         if (outCap < size) return size;
         const bytes = new Uint8Array(memory.buffer, outPtr, size);
@@ -2707,114 +2932,30 @@ export function createKernelImports(
 
     // ── Sockets (full mode only) ──
 
-    // host_socket_connect(addr_ptr, addr_len, flags) -> fd / -errno
-    // Legacy ABI: host_socket_connect(fd, host_ptr, host_len, port, flags) -> 0 / -errno.
-    host_socket_connect(
-      fdOrAddrPtr: number,
-      hostPtrOrAddrLen: number,
-      hostLenOrFlags: number,
-      port?: number,
-      flags?: number,
+    // host_socket_open(domain, type, protocol) -> fd
+    // Allocates a kernel-owned socket fd. connect() fills in the backend handle later.
+    // For AF_UNIX SOCK_DGRAM, allocates a dgram socket in the registry.
+    host_socket_open(
+      domain: number,
+      type: number,
+      _protocol: number,
     ): number {
-      if (!opts.kernel || !socketBackend) return ERR_IO;
-      if (port !== undefined && flags !== undefined) {
-        const host = readString(memory, hostPtrOrAddrLen, hostLenOrFlags);
-        if (!host || port < 0 || port > 65535) return -22;
-        const target = opts.kernel.getFdTarget(callerPid, fdOrAddrPtr);
-        if (!target || target.type !== "socket") return -9;
-        const result = socketBackend.connect({
-          host,
-          port,
-          tls: (flags & 1) !== 0,
-        });
-        if (!result.ok) return -111;
-        if (target.noDelay) {
-          const optionResult = target.setNoDelay?.(result.socket, true) ?? {
-            ok: false,
-            error: "TCP_NODELAY not supported by socket backend",
-          };
-          if (!optionResult.ok) return -95;
-        }
-        target.socket = result.socket;
-        target.peerHost = result.peerHost ?? host;
-        target.peerPort = result.peerPort ?? port;
-        target.localHost = result.localHost ?? socketLocalHost;
-        target.localPort = result.localPort ??
-          socketLocalPortForFd(fdOrAddrPtr);
-        return 0;
-      }
-
-      const targetText = readString(memory, fdOrAddrPtr, hostPtrOrAddrLen);
-      const sep = targetText.lastIndexOf(":");
-      if (sep <= 0 || sep === targetText.length - 1) return ERR_INVALID;
-      const host = targetText.slice(0, sep);
-      const parsedPort = Number.parseInt(targetText.slice(sep + 1), 10);
-      if (
-        !Number.isInteger(parsedPort) || parsedPort < 0 || parsedPort > 65535
-      ) {
-        return ERR_INVALID;
-      }
-      const result = socketBackend.connect({
-        host,
-        port: parsedPort,
-        tls: false,
-      });
-      if (!result.ok) return ERR_IO;
-      return opts.kernel.allocFd(callerPid, {
-        type: "socket",
-        socket: result.socket,
-        refs: 1,
-        peerHost: result.peerHost ?? host,
-        peerPort: result.peerPort ?? parsedPort,
-        localHost: result.localHost ?? socketLocalHost,
-        localPort: result.localPort ?? socketLocalPortForFd(result.socket),
-        send: socketBackend.send.bind(socketBackend),
-        recv: socketBackend.recv.bind(socketBackend),
-        recvAsync: (socket, maxBytes) =>
-          recvSocketAsync(socketBackend, socket, maxBytes),
-        setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-        close: (socket) => {
-          socketBackend.close(socket);
-        },
-      });
-    },
-
-    host_socket_bind(
-      fd: number,
-      hostPtr: number,
-      hostLen: number,
-      port: number,
-    ): number {
-      const host = readString(memory, hostPtr, hostLen);
-      const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket") return -9;
-      if (
-        host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
-      ) {
-        return -95;
-      }
-      if (!Number.isInteger(port) || port < 0 || port > 65535) return -22;
-      target.boundHost = host;
-      target.boundPort = port;
-      target.localHost = host === "0.0.0.0" ? socketLocalHost : host;
-      target.localPort = port;
-      return 0;
-    },
-
-    host_socket_open(domain: number, type: number, _protocol: number): number {
       if (!opts.kernel) return -1;
+      // wasi-sdk-30 defines AF_UNIX=3, SOCK_DGRAM=5. C passes these values
+      // directly (sys/socket.h #include_next runs before our #ifndef overrides).
       const AF_UNIX = 3;
       const SOCK_DGRAM = 5;
       const SOCK_CLOEXEC = 0x2000;
       const SOCK_NONBLOCK = 0x4000;
       const baseType = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
+      // AF_UNIX SOCK_DGRAM: allocate a registry dgram socket
       if (domain === AF_UNIX && baseType === SOCK_DGRAM) {
         const registry = socketBackend?.registry;
         if (!registry) return -1;
         const rawHandle = registry.openDgramSocket();
         return opts.kernel.allocFd(callerPid, {
           type: "socket",
-          socket: -rawHandle,
+          socket: -rawHandle, // negate for loopback convention
           family: "AF_UNIX",
           isDgram: true,
           fdFlags: (type & SOCK_NONBLOCK) !== 0 ? WASI_FDFLAGS_NONBLOCK : 0,
@@ -2832,8 +2973,13 @@ export function createKernelImports(
                 ok: false,
                 error: "networking not configured",
               }),
-          setNoDelay: socketBackend?.setNoDelay?.bind(socketBackend),
-          close: () => {
+          setNoDelay: (socket, enabled) =>
+            socketBackend?.setNoDelay?.(socket, enabled) ??
+              {
+                ok: false,
+                error: "TCP_NODELAY not supported by socket backend",
+              },
+          close: (_socket) => {
             registry.closeDgramSocket(rawHandle);
           },
         });
@@ -2855,302 +3001,130 @@ export function createKernelImports(
               ok: false,
               error: "networking not configured",
             }),
-        setNoDelay: socketBackend?.setNoDelay?.bind(socketBackend),
+        setNoDelay: (socket, enabled) =>
+          socketBackend?.setNoDelay?.(socket, enabled) ??
+            { ok: false, error: "TCP_NODELAY not supported by socket backend" },
         close: (socket) => {
           socketBackend?.close(socket);
         },
       });
     },
 
-    // host_socket_listen(backlog, addr_ptr, addr_len) -> fd / -errno
-    // Legacy ABI: host_socket_listen(fd, backlog) -> 0 / -errno.
-    host_socket_listen(
-      fdOrBacklog: number,
-      backlogOrAddrPtr: number,
-      addrLen?: number,
-    ): number {
-      if (!opts.kernel || !socketBackend?.listen) return ERR_IO;
-      if (addrLen === undefined) {
-        const fd = fdOrBacklog;
-        const target = opts.kernel.getFdTarget(callerPid, fd);
-        if (!target || target.type !== "socket") return -9;
-        const host = target.boundHost ?? "127.0.0.1";
-        const port = target.boundPort ?? 0;
-        const backlog = backlogOrAddrPtr > 0 ? backlogOrAddrPtr : 128;
-        const auth = authorizeListen(opts.serverSockets, host, port, backlog);
-        if (!auth.ok) return -13;
-        const result = socketBackend.listen({
-          host,
-          port,
-          backlog,
-          mapping: auth.mapping,
-        });
-        if (!result.ok) return -5;
-        target.listener = result.listener;
-        target.boundHost = host;
-        target.boundPort = port;
-        target.localHost = result.host;
-        target.localPort = result.port;
-        target.closeListener = (listener) => {
-          socketBackend.closeListener?.(listener);
-        };
-        return 0;
+    // host_socket_connect(fd, host_ptr, host_len, port, flags) -> i32
+    // Opens a TCP or TLS socket to the given host:port. Returns sync
+    // (number) when the backend resolves synchronously (loopback) and a
+    // Promise<number> when it doesn't (network bridge). JSPI/Asyncify
+    // handles the suspension on the Promise path.
+    host_socket_connect(
+      fd: number,
+      hostPtr: number,
+      hostLen: number,
+      port: number,
+      flags: number,
+    ): number | Promise<number> {
+      if (!socketBackend) {
+        netLog("connect", { fd, result: "ECONNREFUSED", reason: "no backend" });
+        return -111;
       }
-
-      const backlogRaw = fdOrBacklog;
-      const addrPtr = backlogOrAddrPtr;
-      const targetText = readString(memory, addrPtr, addrLen);
-      const sep = targetText.lastIndexOf(":");
-      if (sep <= 0 || sep === targetText.length - 1) return ERR_INVALID;
-      const hostText = targetText.slice(0, sep);
-      if (
-        hostText !== "127.0.0.1" && hostText !== "localhost" &&
-        hostText !== "0.0.0.0"
-      ) {
-        return ERR_PERMISSION;
+      const host = readString(memory, hostPtr, hostLen);
+      if (!host || port < 0 || port > 65535) {
+        netLog("connect", { fd, host, port, result: "EINVAL" });
+        return -22;
       }
-      const host = hostText as "127.0.0.1" | "localhost" | "0.0.0.0";
-      const port = Number.parseInt(targetText.slice(sep + 1), 10);
-      if (!Number.isInteger(port) || port < 0 || port > 65535) {
-        return ERR_INVALID;
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") {
+        netLog("connect", { fd, host, port, result: "EBADF" });
+        return -9;
       }
-      const backlog = Number.isInteger(backlogRaw) && backlogRaw > 0
-        ? backlogRaw
-        : 128;
-      const auth = authorizeListen(opts.serverSockets, host, port, backlog);
-      if (!auth.ok) return ERR_PERMISSION;
-      const result = socketBackend.listen({
+      netLog("connect", {
+        fd,
         host,
         port,
-        backlog,
-        mapping: auth.mapping,
+        tls: (flags & 1) !== 0,
       });
-      if (!result.ok) return ERR_IO;
-      return opts.kernel.allocFd(callerPid, {
-        type: "socket",
-        socket: null,
-        listener: result.listener,
-        refs: 1,
-        boundHost: host,
-        boundPort: port,
-        localHost: result.host,
-        localPort: result.port,
-        send: socketBackend.send.bind(socketBackend),
-        recv: socketBackend.recv.bind(socketBackend),
-        recvAsync: (socket, maxBytes) =>
-          recvSocketAsync(socketBackend, socket, maxBytes),
-        setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-        close: (socket) => {
-          socketBackend.close(socket);
-        },
-        closeListener: (listener) => {
-          socketBackend.closeListener?.(listener);
-        },
-      });
-    },
-
-    // host_socket_accept(fd, flags) -> fd / -errno
-    // Legacy ABI: host_socket_accept(fd, out_ptr, out_cap) -> bytes / -errno.
-    async host_socket_accept(
-      fd: number,
-      flagsOrOutPtr: number,
-      outCap?: number,
-    ): Promise<number> {
-      if (!opts.kernel || !socketBackend?.accept) return ERR_IO;
-      const target = opts.kernel.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket" || target.listener == null) {
-        return ERR_INVALID;
-      }
-      const accepted = await acceptSocketAsync(socketBackend, target.listener);
-      if (!accepted.ok) {
-        return "wouldBlock" in accepted && accepted.wouldBlock
-          ? ERR_AGAIN
-          : ERR_IO;
-      }
-      const acceptedFd = opts.kernel.allocFd(callerPid, {
-        type: "socket",
-        socket: accepted.socket,
-        refs: 1,
-        peerHost: accepted.peerHost,
-        peerPort: accepted.peerPort,
-        localHost: accepted.localHost,
-        localPort: accepted.localPort,
-        send: socketBackend.send.bind(socketBackend),
-        recv: socketBackend.recv.bind(socketBackend),
-        recvAsync: (socket, maxBytes) =>
-          recvSocketAsync(socketBackend, socket, maxBytes),
-        setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-        close: (socket) => {
-          socketBackend.close(socket);
-        },
-      });
-      if (outCap !== undefined) {
-        return writeSocketAcceptResult(flagsOrOutPtr, outCap, {
-          fd: acceptedFd,
-          peerHost: accepted.peerHost,
-          peerPort: accepted.peerPort,
-          localHost: accepted.localHost,
-          localPort: accepted.localPort,
-        });
-      }
-      return acceptedFd;
-    },
-
-    // host_socket_addr(fd, out_ptr, out_cap) -> bytes / -errno
-    // Legacy ABI: host_socket_addr(fd, which, out_ptr, out_cap) -> bytes / -errno.
-    host_socket_addr(
-      fd: number,
-      whichOrOutPtr: number,
-      outPtrOrOutCap: number,
-      outCap?: number,
-    ): number {
-      const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket") return ERR_INVALID;
-      if (outCap !== undefined) {
-        if (
-          target.socket === null && target.listener == null &&
-          target.boundPort === undefined
-        ) {
-          return -107;
+      const applyConnect = (
+        result: Awaited<ReturnType<typeof socketBackend.connect>>,
+      ): number | Promise<number> => {
+        if (!result.ok) {
+          netLog("connect", {
+            fd,
+            host,
+            port,
+            result: "ECONNREFUSED",
+            reason: result.error,
+          });
+          return -111;
         }
-        const local = whichOrOutPtr === 0;
-        if (!local && target.socket === null) return -107;
-        return writeSocketAddrResult(
-          outPtrOrOutCap,
-          outCap,
-          local
-            ? (target.localHost ?? socketLocalHost)
-            : (target.peerHost ?? "0.0.0.0"),
-          local
-            ? (target.localPort ?? socketLocalPortForFd(fd))
-            : (target.peerPort ?? 0),
-        );
-      }
-      const outPtr = whichOrOutPtr;
-      const compactOutCap = outPtrOrOutCap;
-      const host = target.localHost ?? socketLocalHost;
-      const port = target.localPort ?? socketLocalPortForFd(fd);
-      const hostBytes = new TextEncoder().encode(host);
-      const out = new Uint8Array(2 + hostBytes.byteLength);
-      new DataView(out.buffer).setUint16(0, port, true);
-      out.set(hostBytes, 2);
-      return writeBytes(memory, outPtr, compactOutCap, out);
-    },
-
-    // host_socket_set_no_delay(fd, enabled) -> 0 / -errno
-    host_socket_set_no_delay(fd: number, enabledRaw: number): number {
-      const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (
-        !socketBackend || !target || target.type !== "socket" ||
-        target.socket === null
-      ) {
-        return ERR_INVALID;
-      }
-      const enabled = enabledRaw !== 0;
-      target.noDelay = enabled;
-      const result = target.setNoDelay?.(target.socket, enabled) ?? {
-        ok: true as const,
-      };
-      return result.ok ? 0 : ERR_IO;
-    },
-
-    host_socket_option(
-      fd: number,
-      option: number,
-      hasValueRaw: number,
-      value: number,
-    ): number {
-      const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket") return -9;
-      if (option !== 1) return -95;
-      if (hasValueRaw === 0) return target.noDelay ? 1 : 0;
-      const enabled = value !== 0;
-      target.noDelay = enabled;
-      if (target.socket !== null) {
-        const result = target.setNoDelay?.(target.socket, enabled) ?? {
-          ok: true as const,
+        const finalise = (): number => {
+          target.socket = result.socket;
+          target.peerHost = result.peerHost ?? host;
+          target.peerPort = result.peerPort ?? port;
+          target.localHost = result.localHost ?? socketLocalHost;
+          target.localPort = result.localPort ?? socketLocalPortForFd(fd);
+          return 0;
         };
-        if (!result.ok) return -95;
+        if (target.noDelay) {
+          const optR = target.setNoDelay?.(result.socket, true) ??
+            { ok: false as const, error: "TCP_NODELAY not supported" };
+          if (typeof (optR as Promise<unknown>).then === "function") {
+            return (optR as Promise<{ ok: boolean }>).then((opt) =>
+              opt.ok ? finalise() : -95
+            );
+          }
+          return (optR as { ok: boolean }).ok ? finalise() : -95;
+        }
+        return finalise();
+      };
+      const connectResult = socketBackend.connect({
+        host,
+        port,
+        tls: (flags & 1) !== 0,
+      });
+      if (typeof (connectResult as Promise<unknown>).then === "function") {
+        return (connectResult as Promise<
+          Awaited<ReturnType<typeof socketBackend.connect>>
+        >).then(applyConnect);
       }
+      return applyConnect(
+        connectResult as Awaited<ReturnType<typeof socketBackend.connect>>,
+      );
+    },
+
+    // host_socket_bind(fd, host_ptr, host_len, port) -> i32
+    // Records the sandbox-visible local address requested for a socket fd.
+    // AF_UNIX: req = { fd, path }; AF_INET: req = { fd, host, port }
+    host_socket_bind(
+      fd: number,
+      hostPtr: number,
+      hostLen: number,
+      port: number,
+    ): number {
+      const host = readString(memory, hostPtr, hostLen);
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") {
+        netLog("bind", { fd, host, port, result: "EBADF" });
+        return -9;
+      }
+      if (
+        host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
+      ) {
+        netLog("bind", { fd, host, port, result: "EAFNOSUPPORT" });
+        return -95;
+      }
+      if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        netLog("bind", { fd, host, port, result: "EINVAL" });
+        return -22;
+      }
+      target.boundHost = host;
+      target.boundPort = port;
+      target.localHost = host === "0.0.0.0" ? socketLocalHost : host;
+      target.localPort = port;
+      netLog("bind", { fd, host, port, result: "ok" });
       return 0;
     },
 
-    // host_socket_send(fd, data_ptr, data_len, flags) -> bytes / -errno
-    host_socket_send(
-      fd: number,
-      dataPtr: number,
-      dataLen: number,
-      _flags: number,
-    ): number {
-      const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (
-        !socketBackend || !target || target.type !== "socket" ||
-        target.socket === null
-      ) {
-        return ERR_INVALID;
-      }
-      const data = readBytes(memory, dataPtr, dataLen);
-      const result = socketBackend.send(target.socket, data);
-      if (!result.ok) return ERR_IO;
-      return result.bytes_sent ?? data.byteLength;
-    },
-
-    // host_socket_recv(fd, out_ptr, out_cap, flags) -> bytes / -errno
-    host_socket_recv(
-      fd: number,
-      outPtr: number,
-      outCap: number,
-      flags: number,
-    ): number | Promise<number> {
-      const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (
-        !socketBackend || !target || target.type !== "socket" ||
-        target.socket === null
-      ) {
-        return ERR_INVALID;
-      }
-      const peek = (flags & 0x02) !== 0;
-      const nonblocking = (flags & 0x04) !== 0 || Boolean(
-        (
-          opts.kernel?.getFdDescriptorFlags(callerPid, fd) ??
-            target.fdFlags ?? 0
-        ) & WASI_FDFLAGS_NONBLOCK,
-      );
-      const writeRecv = (result: ReturnType<SocketBackend["recv"]>): number => {
-        if (!result.ok) return result.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
-        const data = result.data ?? new Uint8Array();
-        return writeBytes(memory, outPtr, outCap, data);
-      };
-      if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
-        const chunk = target.peekBuffer.slice(0, outCap);
-        if (!peek) {
-          target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
-        }
-        return writeBytes(memory, outPtr, outCap, chunk);
-      }
-      if (target.readShutdown) {
-        return writeBytes(memory, outPtr, outCap, new Uint8Array(0));
-      }
-      if (peek) {
-        const probe = socketBackend.recv(target.socket, outCap, {
-          nonblocking: true,
-        });
-        if (probe.ok) {
-          const data = probe.data ?? new Uint8Array();
-          target.peekBuffer = target.peekBuffer
-            ? concatBytes(target.peekBuffer, data)
-            : data;
-        }
-        return writeRecv(probe);
-      }
-      if (nonblocking) {
-        return writeRecv(socketBackend.recv(target.socket, outCap, {
-          nonblocking: true,
-        }));
-      }
-      return target.recvAsync(target.socket, outCap).then(writeRecv);
-    },
-
+    // host_socket_bind_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
+    // Binds an AF_UNIX socket. is_abstract=1 for abstract namespace.
     host_socket_bind_unix(
       sockfd: number,
       pathPtr: number,
@@ -3159,24 +3133,31 @@ export function createKernelImports(
     ): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -1;
-      const name = readString(memory, pathPtr, pathLen);
+      const name = new TextDecoder().decode(
+        new Uint8Array(memory.buffer, pathPtr, pathLen),
+      );
       target.family = "AF_UNIX";
       if (isAbstract) {
-        if (!authorizeUnixAbstract(opts.serverSockets, name).ok) return -1;
+        const abstractAuth = authorizeUnixAbstract(opts.serverSockets, name);
+        if (!abstractAuth.ok) return -1;
         target.boundPath = `\0${name}`;
+        // Abstract DGRAM sockets also register in the dgram route table
         if (target.isDgram) {
           const registry = socketBackend?.registry;
-          if (!registry || target.socket == null) return -1;
+          if (!registry) return -1;
           try {
-            registry.bindDgramToPath(-(target.socket), `\0${name}`);
+            registry.bindDgramToPath(-(target.socket as number), `\0${name}`);
           } catch {
             return -1;
           }
         }
         return 0;
       }
-      if (!authorizeUnixListen(opts.serverSockets, name).ok) return -1;
+      // Enforce path allowlist at bind time (same policy as listen).
+      const bindAuth = authorizeUnixListen(opts.serverSockets, name);
+      if (!bindAuth.ok) return -1;
       target.boundPath = name;
+      // Create the VFS socket inode first to detect conflicts (EEXIST) atomically.
       try {
         opts.vfs?.createSocket?.(name);
       } catch {
@@ -3184,10 +3165,11 @@ export function createKernelImports(
       }
       if (target.isDgram) {
         const registry = socketBackend?.registry;
-        if (!registry || target.socket == null) return -1;
+        if (!registry) return -1;
         try {
-          registry.bindDgramToPath(-(target.socket), name);
+          registry.bindDgramToPath(-(target.socket as number), name);
         } catch {
+          // Roll back the VFS inode we just created.
           try {
             opts.vfs?.unlink(name);
           } catch { /* best-effort */ }
@@ -3197,6 +3179,8 @@ export function createKernelImports(
       return 0;
     },
 
+    // host_socket_connect_unix(sockfd, path_ptr, path_len, is_abstract) -> 0 | -1
+    // Connects an AF_UNIX socket. is_abstract=1 for abstract namespace.
     host_socket_connect_unix(
       sockfd: number,
       pathPtr: number,
@@ -3207,21 +3191,40 @@ export function createKernelImports(
       if (!registry) return -1;
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -1;
-      const name = readString(memory, pathPtr, pathLen);
-      const creds = opts.kernel?.getCredentials(callerPid ?? 0);
-      const result = isAbstract
-        ? registry.connectToAbstract(name)
-        : registry.connectToPath(name, callerPid, creds?.euid, creds?.egid);
+      const name = new TextDecoder().decode(
+        new Uint8Array(memory.buffer, pathPtr, pathLen),
+      );
+      let result: { ok: boolean; socket?: number; error?: string };
+      const connCreds = opts.kernel?.getCredentials(callerPid ?? 0);
+      if (isAbstract) {
+        result = registry.connectToAbstract(name);
+        if (!result.ok) return -1;
+        target.socket = -(result.socket as number);
+        target.family = "AF_UNIX";
+        target.peerPath = `\0${name}`;
+        target.peerPid = callerPid ?? 0;
+        target.peerUid = connCreds?.euid ?? 0;
+        target.peerGid = connCreds?.egid ?? 0;
+        return 0;
+      }
+      result = registry.connectToPath(
+        name,
+        callerPid,
+        connCreds?.euid,
+        connCreds?.egid,
+      );
       if (!result.ok) return -1;
       target.socket = -(result.socket as number);
       target.family = "AF_UNIX";
-      target.peerPath = isAbstract ? `\0${name}` : name;
+      target.peerPath = name;
       target.peerPid = callerPid ?? 0;
-      target.peerUid = creds?.euid ?? 0;
-      target.peerGid = creds?.egid ?? 0;
+      target.peerUid = connCreds?.euid ?? 0;
+      target.peerGid = connCreds?.egid ?? 0;
       return 0;
     },
 
+    // host_socket_sendto_unix(sockfd, buf_ptr, buf_len, path_ptr, path_len, is_abstract) -> bytes | -1
+    // Sends a SOCK_DGRAM to a bound path. is_abstract=1 for abstract namespace.
     host_socket_sendto_unix(
       sockfd: number,
       bufPtr: number,
@@ -3234,9 +3237,11 @@ export function createKernelImports(
       if (!registry) return -1;
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket" || !target.isDgram) return -1;
-      if (isAbstract) return -1;
       const bytes = new Uint8Array(memory.buffer, bufPtr, bufLen);
-      const toPath = readString(memory, pathPtr, pathLen);
+      const toPath = new TextDecoder().decode(
+        new Uint8Array(memory.buffer, pathPtr, pathLen),
+      );
+      if (isAbstract) return -1; // abstract dgram sendto not yet supported
       const result = registry.sendDgramToPath(
         toPath,
         bytes,
@@ -3245,6 +3250,9 @@ export function createKernelImports(
       return result.ok ? bufLen : -1;
     },
 
+    // host_socket_recvfrom_unix(sockfd, buf_ptr, buf_cap, from_path_ptr, from_path_cap,
+    //   from_path_len_ptr, from_is_abstract_ptr) -> bytes | -1 | -2
+    // Async dgram recv. Returns byte count, -1 on error, -2 for EAGAIN (no data yet).
     async host_socket_recvfrom_unix(
       sockfd: number,
       bufPtr: number,
@@ -3265,26 +3273,33 @@ export function createKernelImports(
         ? registry.recvDgram(rawHandle, bufCap, true)
         : await registry.recvDgramAsync(rawHandle, bufCap);
       if (!result.ok) return -2;
-      const bytes = result.bytes;
+      const bytes = (result as { ok: true; bytes: Uint8Array }).bytes;
       const recvLen = Math.min(bytes.length, bufCap);
       new Uint8Array(memory.buffer, bufPtr, recvLen).set(
         bytes.subarray(0, recvLen),
       );
-      const senderName = result.fromAbstract ?? result.fromPath ?? "";
-      const isAbs = result.fromAbstract != null ? 1 : 0;
-      const pathBytes = new TextEncoder().encode(senderName);
-      const writeLen = Math.min(pathBytes.length, fromPathCap);
-      if (fromPathPtr && fromPathCap > 0) {
-        new Uint8Array(memory.buffer, fromPathPtr, writeLen).set(
-          pathBytes.subarray(0, writeLen),
-        );
+      if (result.fromPath || result.fromAbstract) {
+        const senderName = result.fromAbstract ?? result.fromPath ?? "";
+        const isAbs = result.fromAbstract != null ? 1 : 0;
+        const pathBytes = new TextEncoder().encode(senderName);
+        const writeLen = Math.min(pathBytes.length, fromPathCap);
+        if (fromPathPtr && fromPathCap > 0) {
+          new Uint8Array(memory.buffer, fromPathPtr, writeLen).set(
+            pathBytes.subarray(0, writeLen),
+          );
+        }
+        new Int32Array(memory.buffer, fromPathLenPtr, 1)[0] = writeLen;
+        new Int32Array(memory.buffer, fromIsAbstractPtr, 1)[0] = isAbs;
+      } else {
+        new Int32Array(memory.buffer, fromPathLenPtr, 1)[0] = 0;
+        new Int32Array(memory.buffer, fromIsAbstractPtr, 1)[0] = 0;
       }
-      const view = new DataView(memory.buffer);
-      view.setInt32(fromPathLenPtr, writeLen, true);
-      view.setInt32(fromIsAbstractPtr, isAbs, true);
       return recvLen;
     },
 
+    // host_socket_addr_unix(sockfd, is_peer, path_ptr, path_cap, is_abstract_ptr)
+    //   -> path_len | -1 (not AF_UNIX) | -2 (ENOTCONN)
+    // Writes path bytes (no leading NUL for abstract) to path_ptr; sets *is_abstract_ptr.
     host_socket_addr_unix(
       sockfd: number,
       isPeer: number,
@@ -3293,13 +3308,19 @@ export function createKernelImports(
       isAbstractPtr: number,
     ): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
-      if (!target || target.type !== "socket" || target.family !== "AF_UNIX") {
-        return -1;
-      }
+      if (!target || target.type !== "socket") return -1;
+      if (target.family !== "AF_UNIX") return -1;
       const rawPath = isPeer ? target.peerPath : target.boundPath;
       if (rawPath == null) return isPeer ? -2 : 0;
-      const isAbstract = rawPath.startsWith("\0");
-      const path = isAbstract ? rawPath.slice(1) : rawPath;
+      let path: string;
+      let isAbstract: number;
+      if (rawPath.startsWith("\0")) {
+        path = rawPath.slice(1);
+        isAbstract = 1;
+      } else {
+        path = rawPath;
+        isAbstract = 0;
+      }
       const pathBytes = new TextEncoder().encode(path);
       const writeLen = Math.min(pathBytes.length, pathCap);
       if (pathPtr && pathCap > 0) {
@@ -3308,15 +3329,12 @@ export function createKernelImports(
         );
       }
       if (isAbstractPtr) {
-        new DataView(memory.buffer).setInt32(
-          isAbstractPtr,
-          isAbstract ? 1 : 0,
-          true,
-        );
+        new Int32Array(memory.buffer, isAbstractPtr, 1)[0] = isAbstract;
       }
       return writeLen;
     },
 
+    // host_socket_peercred(sockfd, pid_ptr, uid_ptr, gid_ptr) -> 0 | -1
     host_socket_peercred(
       sockfd: number,
       pidPtr: number,
@@ -3325,19 +3343,22 @@ export function createKernelImports(
     ): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -1;
-      const view = new DataView(memory.buffer);
-      view.setInt32(pidPtr, target.peerPid ?? 0, true);
-      view.setInt32(uidPtr, target.peerUid ?? 0, true);
-      view.setInt32(gidPtr, target.peerGid ?? 0, true);
+      new Int32Array(memory.buffer, pidPtr, 1)[0] = target.peerPid ?? 0;
+      new Int32Array(memory.buffer, uidPtr, 1)[0] = target.peerUid ?? 0;
+      new Int32Array(memory.buffer, gidPtr, 1)[0] = target.peerGid ?? 0;
       return 0;
     },
 
+    // host_socket_is_dgram(sockfd) -> 1 (SOCK_DGRAM) | 0 (SOCK_STREAM) | -1 (not a socket)
     host_socket_is_dgram(sockfd: number): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -1;
       return target.isDgram ? 1 : 0;
     },
 
+    // host_socket_listen_unix(sockfd, backlog) -> 0 | -1 | -2
+    // listen() for AF_UNIX sockets (pathname and abstract).
+    // Returns 0 on success, -1 on error, -2 if sockfd is not AF_UNIX.
     host_socket_listen_unix(sockfd: number, backlog: number): number {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -2;
@@ -3350,17 +3371,23 @@ export function createKernelImports(
       const cap = backlog > 0 ? backlog : 128;
       try {
         if (path.startsWith("\0")) {
-          const name = path.slice(1);
-          if (!authorizeUnixAbstract(opts.serverSockets, name).ok) return -1;
-          const rawHandle = registry.listenOnAbstract(name, cap);
+          const abstractName = path.slice(1);
+          const auth = authorizeUnixAbstract(opts.serverSockets, abstractName);
+          if (!auth.ok) return -1;
+          const rawHandle = registry.listenOnAbstract(abstractName, cap);
           target.listener = -rawHandle;
-          target.closeListener = () => registry.closeAbstractListener(name);
+          target.closeListener = () => {
+            registry.closeAbstractListener(abstractName);
+          };
         } else {
-          if (!authorizeUnixListen(opts.serverSockets, path).ok) return -1;
+          const auth = authorizeUnixListen(opts.serverSockets, path);
+          if (!auth.ok) return -1;
           const rawHandle = registry.listenOnPath(path, cap);
           target.listener = -rawHandle;
           const boundPath = path;
-          target.closeListener = () => registry.closePathListener(boundPath);
+          target.closeListener = () => {
+            registry.closePathListener(boundPath);
+          };
         }
         return 0;
       } catch {
@@ -3368,16 +3395,18 @@ export function createKernelImports(
       }
     },
 
+    // host_socket_accept_unix(sockfd) -> new_fd | -1 | -2
+    // accept() for AF_UNIX sockets. Async (JSPI/Asyncify).
+    // Returns the new accepted fd on success, -1 on error, -2 if sockfd is not AF_UNIX.
     async host_socket_accept_unix(sockfd: number): Promise<number> {
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (
-        !target || target.type !== "socket" || target.family !== "AF_UNIX" ||
-        target.listener == null
+        !target || target.type !== "socket" ||
+        target.family !== "AF_UNIX" || target.listener == null
       ) return -2;
       if (!opts.kernel || !socketBackend?.registry) return -1;
-      const accepted = await socketBackend.registry.acceptUnix(
-        -(target.listener),
-      );
+      const rawHandle = -(target.listener);
+      const accepted = await socketBackend.registry.acceptUnix(rawHandle);
       return opts.kernel.allocFd(callerPid, {
         type: "socket",
         socket: -(accepted.socket),
@@ -3393,29 +3422,34 @@ export function createKernelImports(
         recvAsync: (socket, maxBytes) =>
           recvSocketAsync(socketBackend, socket, maxBytes),
         setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-        close: (socket) => socketBackend.close(socket),
+        close: (socket) => {
+          socketBackend.close(socket);
+        },
       });
     },
 
+    // host_socket_send_unix(sockfd, buf_ptr, buf_len) -> bytes | -1 | -2
+    // send() for AF_UNIX sockets, passing raw bytes without base64. Synchronous.
+    // Returns byte count on success, -1 on error, -2 if sockfd is not AF_UNIX.
     host_socket_send_unix(
       sockfd: number,
       bufPtr: number,
       bufLen: number,
     ): number {
-      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
-      if (!target || target.type !== "socket") return -2;
-      if (target.family !== "AF_UNIX") return -2;
-      const socket = target.socket as number | null;
-      if (socket === null || socket >= 0) return -1;
-      const registry = socketBackend?.registry;
-      if (!registry) return -1;
+      if (!opts.kernel || !socketBackend) return -1;
       const bytes = new Uint8Array(memory.buffer, bufPtr, bufLen);
-      const result = target.isDgram
-        ? registry.sendDgramToPeer(-socket, new Uint8Array(bytes))
-        : registry.send(-socket, new Uint8Array(bytes));
-      return result.ok ? result.bytesSent : -1;
+      return sendUnixSocket(
+        opts.kernel,
+        socketBackend,
+        callerPid,
+        sockfd,
+        bytes,
+      );
     },
 
+    // host_socket_recv_unix(sockfd, buf_ptr, buf_cap, peek) -> bytes | -1 | -2 | -3
+    // recv() for AF_UNIX STREAM sockets, writing raw bytes without base64. Async.
+    // Returns byte count on success, -1 on error, -2 for EAGAIN, -3 if not AF_UNIX STREAM.
     async host_socket_recv_unix(
       sockfd: number,
       bufPtr: number,
@@ -3425,29 +3459,39 @@ export function createKernelImports(
       const target = opts.kernel?.getFdTarget(callerPid, sockfd);
       if (!target || target.type !== "socket") return -3;
       if (target.family !== "AF_UNIX") return -3;
-      const registry = socketBackend?.registry;
-      if (!registry || target.socket == null) return -1;
-      const rawHandle = -(target.socket as number);
+      // DGRAM sockets: use recvDgram / recvDgramAsync (ignores fromPath for plain recv)
       if (target.isDgram) {
-        const nonblocking =
+        if (target.socket == null) return -1;
+        const rawHandle = -(target.socket as number);
+        const registry = socketBackend?.registry;
+        if (!registry) return -1;
+        const nonblockingDgram =
           ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
-        const dgramResult = nonblocking
+        const dgramResult = nonblockingDgram
           ? registry.recvDgram(rawHandle, bufCap, true)
           : await registry.recvDgramAsync(rawHandle, bufCap);
         if (!dgramResult.ok) return -2;
-        const n = Math.min(dgramResult.bytes.length, bufCap);
-        new Uint8Array(memory.buffer, bufPtr, n).set(
-          dgramResult.bytes.subarray(0, n),
-        );
+        const dgramBytes =
+          (dgramResult as { ok: true; bytes: Uint8Array }).bytes;
+        const n = Math.min(dgramBytes.length, bufCap);
+        new Uint8Array(memory.buffer, bufPtr, n).set(dgramBytes.subarray(0, n));
         return n;
       }
+      const socket = target.socket as number | null;
+      if (socket === null || socket >= 0) return -1;
+      const registry = socketBackend?.registry;
+      if (!registry) return -1;
+      const regHandle = -socket;
       const isPeek = peek !== 0;
       const nonblocking = ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
-      const writeResult = (bytes: Uint8Array): number => {
+
+      function writeResult(bytes: Uint8Array): number {
         const n = Math.min(bytes.byteLength, bufCap);
         new Uint8Array(memory.buffer, bufPtr, n).set(bytes.subarray(0, n));
         return n;
-      };
+      }
+
+      // Drain peekBuffer first (populated by a previous MSG_PEEK call).
       if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
         const chunk = target.peekBuffer.slice(0, bufCap);
         if (!isPeek) {
@@ -3455,67 +3499,366 @@ export function createKernelImports(
         }
         return writeResult(chunk);
       }
+
       if (isPeek) {
-        const probe = registry.recv(rawHandle, bufCap, { nonblocking: true });
+        // Nonblocking probe: stash result in peekBuffer for the next real recv.
+        const probe = registry.recv(regHandle, bufCap, { nonblocking: true });
         if (!probe.ok) return -2;
         target.peekBuffer = probe.bytes;
         return writeResult(probe.bytes);
       }
+
       if (nonblocking) {
-        const probe = registry.recv(rawHandle, bufCap, { nonblocking: true });
+        const probe = registry.recv(regHandle, bufCap, { nonblocking: true });
         if (!probe.ok) return probe.error === "EAGAIN" ? -2 : -1;
         return writeResult(probe.bytes);
       }
-      const result = await registry.recvAsync(rawHandle, bufCap);
+
+      const result = await registry.recvAsync(regHandle, bufCap);
       if (!result.ok) return -1;
       return writeResult(result.bytes);
     },
 
-    host_socket_socketpair(
-      _family: number,
-      sockType: number,
-      svPtr: number,
-    ): number {
-      try {
-        if (!opts.kernel || !socketBackend?.registry) return -1;
-        const registry = socketBackend.registry;
-        const creds = opts.kernel.getCredentials(callerPid ?? 0);
-        const SOCK_DGRAM = 5;
-        const makeTarget = (rawHandle: number, isDgram: boolean): FdTarget => ({
-          type: "socket",
-          socket: -rawHandle,
-          family: "AF_UNIX",
-          ...(isDgram ? { isDgram: true } : {}),
-          refs: 1,
-          peerPid: callerPid ?? 0,
-          peerUid: creds.euid,
-          peerGid: creds.egid,
-          send: socketBackend.send.bind(socketBackend),
-          recv: socketBackend.recv.bind(socketBackend),
-          recvAsync: (socket, maxBytes) =>
-            recvSocketAsync(socketBackend, socket, maxBytes),
-          setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
-          close: isDgram
-            ? () => registry.closeDgramSocket(rawHandle)
-            : (socket) => socketBackend.close(socket),
+    // host_socket_listen(fd, backlog) -> i32
+    // Creates a backend listener for a socket fd after sandbox policy
+    // authorizes it. Returns sync for loopback, a Promise for the
+    // network bridge backend — JSPI/Asyncify handles either shape.
+    host_socket_listen(
+      fd: number,
+      backlogArg: number,
+    ): number | Promise<number> {
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") {
+        netLog("listen", { fd, result: "EBADF" });
+        return -9;
+      }
+      const host = target.boundHost ?? "127.0.0.1";
+      const port = target.boundPort ?? 0;
+      const backlog = backlogArg > 0 ? backlogArg : 128;
+      const auth = authorizeListen(opts.serverSockets, host, port, backlog);
+      if (!auth.ok) {
+        netLog("listen", {
+          fd,
+          host,
+          port,
+          backlog,
+          result: "EACCES",
+          reason: "authorizeListen denied",
         });
-        const pair = sockType === SOCK_DGRAM
-          ? registry.openDgramPair()
-          : registry.openUnixPair();
-        const fdA = opts.kernel.allocFd(
-          callerPid,
-          makeTarget(pair.a, sockType === SOCK_DGRAM),
-        );
-        const fdB = opts.kernel.allocFd(
-          callerPid,
-          makeTarget(pair.b, sockType === SOCK_DGRAM),
-        );
-        const view = new DataView(memory.buffer);
-        view.setInt32(svPtr, fdA, true);
-        view.setInt32(svPtr + 4, fdB, true);
+        return -13;
+      }
+      if (!socketBackend?.listen) {
+        netLog("listen", {
+          fd,
+          host,
+          port,
+          backlog,
+          result: "ENOTSUP",
+          reason: "socketBackend.listen is undefined",
+        });
+        return -95;
+      }
+      netLog("listen", {
+        fd,
+        host,
+        port,
+        backlog,
+        backend: socketBackend.constructor?.name ?? "(unknown)",
+      });
+      const apply = (
+        result: Awaited<ReturnType<NonNullable<typeof socketBackend.listen>>>,
+      ): number => {
+        if (!result.ok) {
+          netLog("listen", {
+            fd,
+            host,
+            port,
+            result: "EIO",
+            reason: result.error ?? "backend listen rejected",
+          });
+          return -5;
+        }
+        target.listener = result.listener;
+        target.boundHost = host;
+        target.boundPort = port;
+        target.localHost = result.host;
+        target.localPort = result.port;
+        target.closeListener = (listener) => {
+          // Fire-and-forget: closeListener's host-side return is void;
+          // bridge close runs async in the bridge worker regardless.
+          void socketBackend.closeListener?.(listener);
+        };
+        netLog("listen", {
+          fd,
+          host,
+          port,
+          result: "ok",
+          assignedHost: result.host,
+          assignedPort: result.port,
+        });
         return 0;
+      };
+      const listenResult = socketBackend.listen({
+        host,
+        port,
+        backlog,
+        mapping: auth.mapping,
+      });
+      if (typeof (listenResult as Promise<unknown>).then === "function") {
+        return (listenResult as Promise<
+          Awaited<ReturnType<NonNullable<typeof socketBackend.listen>>>
+        >).then(apply);
+      }
+      return apply(
+        listenResult as Awaited<
+          ReturnType<NonNullable<typeof socketBackend.listen>>
+        >,
+      );
+    },
+
+    // host_socket_accept(fd, out_ptr, out_cap) -> i32
+    // Polls one accepted connection from a listening socket fd.
+    async host_socket_accept(
+      fd: number,
+      outPtr: number,
+      outCap: number,
+    ): Promise<number> {
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket" || target.listener == null) {
+        netLog("accept", { fd, result: "EBADF" });
+        return -9;
+      }
+      if (!socketBackend?.accept) {
+        netLog("accept", { fd, result: "ENOTSUP" });
+        return -95;
+      }
+      const accepted = await acceptSocketAsync(socketBackend, target.listener);
+      if (!accepted.ok) {
+        netLog("accept", {
+          fd,
+          result: accepted.error === "EAGAIN" ? "EAGAIN" : "EIO",
+          reason: accepted.error,
+        });
+        return accepted.error === "EAGAIN" ? -11 : -5;
+      }
+      netLog("accept", {
+        fd,
+        peerHost: accepted.peerHost,
+        peerPort: accepted.peerPort,
+        result: "ok",
+      });
+      if (!opts.kernel) return -5;
+      const acceptedFd = opts.kernel.allocFd(callerPid, {
+        type: "socket",
+        socket: accepted.socket,
+        refs: 1,
+        peerHost: accepted.peerHost,
+        peerPort: accepted.peerPort,
+        localHost: accepted.localHost,
+        localPort: accepted.localPort,
+        send: socketBackend.send.bind(socketBackend),
+        recv: socketBackend.recv.bind(socketBackend),
+        recvAsync: (socket, maxBytes) =>
+          recvSocketAsync(socketBackend, socket, maxBytes),
+        setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+        close: (socket) => {
+          socketBackend.close(socket);
+        },
+      });
+      return writeSocketAcceptResult(outPtr, outCap, {
+        fd: acceptedFd,
+        peerHost: accepted.peerHost,
+        peerPort: accepted.peerPort,
+        localHost: accepted.localHost,
+        localPort: accepted.localPort,
+      });
+    },
+
+    // host_socket_addr(fd, which, out_ptr, out_cap) -> i32
+    // Reports sandbox-visible socket address metadata.
+    host_socket_addr(
+      fd: number,
+      which: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") return -9;
+      if (
+        target.socket === null && target.listener == null &&
+        target.boundPort === undefined
+      ) {
+        return -107;
+      }
+      const local = which === 0;
+      if (!local && target.socket === null) return -107;
+      return writeSocketAddrResult(
+        outPtr,
+        outCap,
+        local
+          ? (target.localHost ?? socketLocalHost)
+          : (target.peerHost ?? "0.0.0.0"),
+        local
+          ? (target.localPort ?? socketLocalPortForFd(fd))
+          : (target.peerPort ?? 0),
+      );
+    },
+
+    // host_socket_send(fd, data_ptr, data_len, flags) -> i32
+    // Sends raw bytes from WASM linear memory on an open socket.
+    // Returns sync for loopback backends, a Promise for the network
+    // bridge — JSPI/Asyncify handles the suspension either way.
+    host_socket_send(
+      fd: number,
+      dataPtr: number,
+      dataLen: number,
+      _flags: number,
+    ): number | Promise<number> {
+      if (!socketBackend) {
+        netLog("send", { fd, result: "EIO", reason: "no backend" });
+        return ERR_IO;
+      }
+      if (dataLen < 0 || dataPtr < 0) return ERR_INVALID;
+      const end = dataPtr + dataLen;
+      if (end > memory.buffer.byteLength) return ERR_IO;
+      try {
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          netLog("send", { fd, result: "EBADF" });
+          return ERR_NOT_FOUND;
+        }
+        const data = readBytes(memory, dataPtr, dataLen);
+        if (target.isDgram) {
+          const registry = socketBackend.registry;
+          if (!registry) return ERR_IO;
+          const rawHandle = -(target.socket as number);
+          const result = registry.sendDgramToPeer(rawHandle, data);
+          if (!result.ok) netLog("send", { fd, len: dataLen, result: "EIO" });
+          return result.ok ? result.bytesSent : ERR_IO;
+        }
+        const interpret = (
+          r: Awaited<ReturnType<typeof socketBackend.send>>,
+        ): number => {
+          if (!r.ok) {
+            netLog("send", { fd, len: dataLen, result: "EIO" });
+            return ERR_IO;
+          }
+          return typeof r.bytes_sent === "number" ? r.bytes_sent : ERR_IO;
+        };
+        const sendResult = socketBackend.send(target.socket, data);
+        if (typeof (sendResult as Promise<unknown>).then === "function") {
+          return (sendResult as Promise<
+            Awaited<ReturnType<typeof socketBackend.send>>
+          >).then(interpret);
+        }
+        return interpret(
+          sendResult as Awaited<ReturnType<typeof socketBackend.send>>,
+        );
       } catch {
-        return -1;
+        return ERR_IO;
+      }
+    },
+
+    // host_socket_recv(fd, out_ptr, out_cap, flags) -> i32
+    // Receives raw bytes into WASM linear memory. Returns sync for
+    // peek-with-buffer and the loopback fast-path; returns a Promise
+    // when the backend (network bridge) is async, when target.recvAsync
+    // is needed for blocking semantics, or when a nonblocking probe
+    // routes through the bridge — JSPI/Asyncify handles the suspension.
+    host_socket_recv(
+      fd: number,
+      outPtr: number,
+      outCap: number,
+      flags: number,
+    ): number | Promise<number> {
+      if (!socketBackend) {
+        netLog("recv", { fd, result: "EIO", reason: "no backend" });
+        return ERR_IO;
+      }
+      if (outCap < 0 || outPtr < 0) return ERR_INVALID;
+      const end = outPtr + outCap;
+      if (end > memory.buffer.byteLength) return ERR_IO;
+      const MSG_PEEK = 0x02;
+      if (flags !== 0 && flags !== MSG_PEEK) {
+        netLog("recv", { fd, flags, result: "ENOTSUP" });
+        return ERR_UNSUPPORTED;
+      }
+      try {
+        const target = opts.kernel?.getFdTarget(callerPid, fd);
+        if (!target || target.type !== "socket" || target.socket === null) {
+          netLog("recv", { fd, result: "EBADF" });
+          return ERR_NOT_FOUND;
+        }
+        const maxBytes = outCap;
+        const peek = flags === MSG_PEEK;
+        if (target.isDgram) {
+          const registry = socketBackend.registry;
+          if (!registry) return ERR_IO;
+          const rawHandle = -(target.socket as number);
+          const result = registry.recvDgram(rawHandle, maxBytes, true);
+          if (!result.ok) return ERR_AGAIN;
+          return writeBytes(memory, outPtr, maxBytes, result.bytes);
+        }
+        const nonblocking =
+          ((target.fdFlags ?? 0) & WASI_FDFLAGS_NONBLOCK) !== 0;
+        const writeSocketBytes = (data: Uint8Array): number => {
+          const chunk = data.slice(0, maxBytes);
+          return writeBytes(memory, outPtr, maxBytes, chunk);
+        };
+        if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
+          const chunk = target.peekBuffer.slice(0, maxBytes);
+          if (!peek) {
+            target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+          }
+          return writeSocketBytes(chunk);
+        }
+        if (target.readShutdown) {
+          return writeSocketBytes(new Uint8Array(0));
+        }
+        // peekBuffer is empty.
+        if (peek) {
+          // Peek probes the backend without suspending and stashes any data
+          // into peekBuffer for the following non-peek recv.
+          const probe = socketBackend.recv(target.socket, maxBytes, {
+            nonblocking: true,
+          });
+          const finishPeek = (
+            r: Awaited<typeof probe>,
+          ): number => {
+            if (r.ok) {
+              const data = r.data ?? new Uint8Array(0);
+              target.peekBuffer = target.peekBuffer
+                ? concatBytes(target.peekBuffer, data)
+                : data;
+              return writeSocketBytes(data);
+            }
+            return r.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+          };
+          if (typeof (probe as Promise<unknown>).then === "function") {
+            return (probe as Promise<Awaited<typeof probe>>).then(finishPeek);
+          }
+          return finishPeek(probe as Awaited<typeof probe>);
+        }
+        if (nonblocking) {
+          // Poll the backend with the nonblocking flag.
+          const probe = socketBackend.recv(target.socket, maxBytes, {
+            nonblocking: true,
+          });
+          const finishProbe = (r: Awaited<typeof probe>): number => {
+            if (!r.ok) return r.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+            return writeSocketBytes(r.data ?? new Uint8Array(0));
+          };
+          if (typeof (probe as Promise<unknown>).then === "function") {
+            return (probe as Promise<Awaited<typeof probe>>).then(finishProbe);
+          }
+          return finishProbe(probe as Awaited<typeof probe>);
+        }
+        return target.recvAsync(target.socket, maxBytes).then((result) => {
+          if (!result.ok) return result.error === "EAGAIN" ? ERR_AGAIN : ERR_IO;
+          return writeSocketBytes(result.data ?? new Uint8Array(0));
+        });
+      } catch {
+        return ERR_IO;
       }
     },
 
@@ -3584,12 +3927,15 @@ export function createKernelImports(
         const registry = socketBackend?.registry;
         if (!registry) return -1;
         const rawHandle = -(target.socket);
+        // Peek anc before suspend (recvAsync shifts rx+rxAnc together, so
+        // the peek must precede the await for the queued-message case).
         const ancBefore = registry.peekAnc(rawHandle);
         const result = await registry.recvAsync(rawHandle, bufCap);
         if (!result.ok) return result.error === "EAGAIN" ? -2 : -1;
         const bytes = result.bytes;
         const n = Math.min(bytes.length, bufCap);
         new Uint8Array(memory.buffer, bufPtr, n).set(bytes.subarray(0, n));
+        // SCM_RIGHTS: get anc from queued path or fast-path waiter.
         const anc = ancBefore ?? registry.popWaiterAnc(rawHandle);
         const view = new DataView(memory.buffer);
         let nFds = 0;
@@ -3611,6 +3957,7 @@ export function createKernelImports(
               opts.kernel.closeFd(senderPid, dupFd);
             }
           }
+          // Close excess sender-side duplicates that didn't fit in the control buffer.
           for (const dupFd of anc.fds.slice(toReceive.length)) {
             opts.kernel.closeFd(senderPid, dupFd);
           }
@@ -3622,20 +3969,78 @@ export function createKernelImports(
       }
     },
 
-    // host_socket_close(fd) -> 0 / -errno
-    host_socket_close(fd: number): number {
+    // host_socket_option(fd, option, has_value, value) -> i32
+    // Applies or reports socket option state owned by the kernel.
+    // Returns sync for the in-memory loopback fast-path and a Promise
+    // when the bridge backend's setNoDelay routes through the bridge
+    // worker — JSPI/Asyncify handles the suspension on the Promise path.
+    host_socket_option(
+      fd: number,
+      option: number,
+      hasValueRaw: number,
+      value: number,
+    ): number | Promise<number> {
+      const hasValue = hasValueRaw !== 0;
       const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket") return ERR_INVALID;
+      if (!target || target.type !== "socket") return -9;
+      if (option !== 1) return -95;
+      if (!hasValue) return target.noDelay ? 1 : 0;
+      const enabled = value !== 0;
       if (target.socket !== null) {
-        if (!socketBackend) return ERR_IO;
+        const setR = target.setNoDelay?.(target.socket, enabled) ??
+          { ok: false as const, error: "TCP_NODELAY not supported" };
+        if (typeof (setR as Promise<unknown>).then === "function") {
+          return (setR as Promise<{ ok: boolean }>).then((r) => {
+            if (!r.ok) return -95;
+            target.noDelay = enabled;
+            return 0;
+          });
+        }
+        if (!(setR as { ok: boolean }).ok) return -95;
+      }
+      target.noDelay = enabled;
+      return 0;
+    },
+
+    // host_socket_socketpair(family, type, sv_ptr) -> 0 | -1
+    // Creates a connected AF_UNIX socket pair. Writes the two fd numbers as
+    // i32 LE at sv_ptr and sv_ptr+4.
+    host_socket_socketpair(
+      _family: number,
+      sockType: number,
+      svPtr: number,
+    ): number {
+      if (!opts.kernel || !socketBackend) return -1;
+      const fds = allocUnixSocketPair(
+        opts.kernel,
+        socketBackend,
+        callerPid ?? 0,
+        sockType,
+      );
+      if (!fds) return -1;
+      const view = new DataView(memory.buffer);
+      view.setInt32(svPtr, fds.fdA, true);
+      view.setInt32(svPtr + 4, fds.fdB, true);
+      return 0;
+    },
+
+    // host_socket_close(fd) -> i32
+    // Closes an open socket. Returns sync for loopback, Promise for
+    // bridge. Returns 0 on success, -1 on error.
+    host_socket_close(fd: number): number | Promise<number> {
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") return -9;
+      const reap = (): number => opts.kernel?.closeFd(callerPid, fd) ? 0 : -9;
+      if (target.socket !== null) {
+        if (!socketBackend) return -5;
         const socket = target.socket;
         target.socket = null;
-        socketBackend.close(socket);
+        const closeResult = socketBackend.close(socket);
+        if (typeof (closeResult as Promise<unknown>).then === "function") {
+          return (closeResult as Promise<unknown>).then(reap, reap);
+        }
       }
-      if (target.listener != null) {
-        target.closeListener?.(target.listener);
-      }
-      return opts.kernel?.closeFd(callerPid, fd) ? 0 : ERR_INVALID;
+      return reap();
     },
 
     // ── Extensions (Python only — shell routes through host_spawn) ──
@@ -3812,10 +4217,10 @@ export function createKernelImports(
         }
       }
 
-      // Fall back to legacy extensionHandler (sync)
+      // Fall back to legacy extensionHandler.
       if (opts.extensionHandler) {
         try {
-          const result = opts.extensionHandler(req);
+          const result = await opts.extensionHandler(req);
           const response = result as {
             exitCode?: number;
             exit_code?: number;
@@ -3852,9 +4257,22 @@ export function createKernelImports(
       pathLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const s = asyncVfs.statAsync
+              ? await asyncVfs.statAsync(path)
+              : asyncVfs.stat(path);
+            return writeStatRecord(memory, outPtr, outCap, s);
+          } catch {
+            return ERR_NOT_FOUND;
+          }
+        })();
+      }
       try {
         const s = opts.vfs.stat(path);
         return writeStatRecord(memory, outPtr, outCap, s);
@@ -3868,9 +4286,22 @@ export function createKernelImports(
       pathLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const data = asyncVfs.readFileAsync
+              ? await asyncVfs.readFileAsync(path)
+              : asyncVfs.readFile(path);
+            return writeBytes(memory, outPtr, outCap, data);
+          } catch {
+            return ERR_NOT_FOUND;
+          }
+        })();
+      }
       try {
         const data = opts.vfs.readFile(path);
         return writeBytes(memory, outPtr, outCap, data);
@@ -3885,10 +4316,45 @@ export function createKernelImports(
       dataPtr: number,
       dataLen: number,
       mode: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const path = readString(memory, pathPtr, pathLen);
       const data = readBytes(memory, dataPtr, dataLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            if (mode === 1) {
+              try {
+                const existing = asyncVfs.readFileAsync
+                  ? await asyncVfs.readFileAsync(path)
+                  : asyncVfs.readFile(path);
+                const combined = new Uint8Array(existing.length + data.length);
+                combined.set(existing);
+                combined.set(data, existing.length);
+                if (asyncVfs.writeFileAsync) {
+                  await asyncVfs.writeFileAsync(path, combined);
+                } else {
+                  asyncVfs.writeFile(path, combined);
+                }
+              } catch {
+                if (asyncVfs.writeFileAsync) {
+                  await asyncVfs.writeFileAsync(path, data);
+                } else {
+                  asyncVfs.writeFile(path, data);
+                }
+              }
+            } else if (asyncVfs.writeFileAsync) {
+              await asyncVfs.writeFileAsync(path, data);
+            } else {
+              asyncVfs.writeFile(path, data);
+            }
+            return 0;
+          } catch {
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         if (mode === 1) {
           try {
@@ -3914,25 +4380,50 @@ export function createKernelImports(
       pathLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const entries = asyncVfs.readdirAsync
+              ? await asyncVfs.readdirAsync(path)
+              : asyncVfs.readdir(path);
+            return writeStringListRecord(
+              memory,
+              outPtr,
+              outCap,
+              entries.map((e) => e.name),
+            );
+          } catch {
+            return ERR_NOT_FOUND;
+          }
+        })();
+      }
       try {
-        const entries = opts.vfs.readdir(path);
-        return writeStringListRecord(
-          memory,
-          outPtr,
-          outCap,
-          entries.map((entry) => entry.name),
-        );
+        const entries = opts.vfs.readdir(path).map((e) => e.name);
+        return writeStringListRecord(memory, outPtr, outCap, entries);
       } catch {
         return ERR_NOT_FOUND;
       }
     },
 
-    host_mkdir(pathPtr: number, pathLen: number): number {
+    host_mkdir(pathPtr: number, pathLen: number): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            if (asyncVfs.mkdirAsync) await asyncVfs.mkdirAsync(path);
+            else asyncVfs.mkdir(path);
+            return 0;
+          } catch {
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         opts.vfs.mkdir(path);
         return 0;
@@ -3941,9 +4432,35 @@ export function createKernelImports(
       }
     },
 
-    host_remove(pathPtr: number, pathLen: number, recursive: number): number {
+    host_remove(
+      pathPtr: number,
+      pathLen: number,
+      recursive: number,
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            if (recursive) {
+              if (asyncVfs.rmdirAsync) await asyncVfs.rmdirAsync(path);
+              else asyncVfs.rmdir(path);
+            } else {
+              try {
+                if (asyncVfs.unlinkAsync) await asyncVfs.unlinkAsync(path);
+                else asyncVfs.unlink(path);
+              } catch {
+                if (asyncVfs.rmdirAsync) await asyncVfs.rmdirAsync(path);
+                else asyncVfs.rmdir(path);
+              }
+            }
+            return 0;
+          } catch {
+            return ERR_NOT_FOUND;
+          }
+        })();
+      }
       try {
         if (recursive) {
           opts.vfs.rmdir(path);
@@ -3960,10 +4477,46 @@ export function createKernelImports(
       }
     },
 
-    host_chmod(pathPtr: number, pathLen: number, mode: number): number {
+    host_chmod(
+      pathPtr: number,
+      pathLen: number,
+      mode: number,
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
       const path = resolveCwdPath(getCallerCwd(), rawPath);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const credentials = getCallerCredentials();
+            const authorized = await withVfsCallerCredentials(async () => {
+              const stat = asyncVfs.statAsync
+                ? await asyncVfs.statAsync(path)
+                : asyncVfs.stat(path);
+              if (
+                credentials.euid !== ROOT_UID && stat.uid !== credentials.euid
+              ) {
+                return false;
+              }
+              if (asyncVfs.chmodAsync) await asyncVfs.chmodAsync(path, mode);
+              else asyncVfs.chmod(path, mode);
+              return true;
+            });
+            if (!authorized) return ERR_PERMISSION;
+            return 0;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         const credentials = getCallerCredentials();
         const authorized = withVfsCallerCredentials(() => {
@@ -3994,12 +4547,54 @@ export function createKernelImports(
       uid: number,
       gid: number,
       followSymlinks: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
       const path = resolveCwdPath(getCallerCwd(), rawPath);
       const targetUid = uid | 0;
       const targetGid = gid | 0;
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          const authorized = await authorizeChownAsync(
+            asyncVfs,
+            path,
+            targetUid,
+            targetGid,
+            followSymlinks !== 0,
+          );
+          if (authorized !== 0) return authorized;
+          try {
+            await withVfsCallerCredentials(async () => {
+              if (asyncVfs.chownAsync) {
+                await asyncVfs.chownAsync(
+                  path,
+                  targetUid,
+                  targetGid,
+                  followSymlinks !== 0,
+                );
+              } else {
+                asyncVfs.chown(
+                  path,
+                  targetUid,
+                  targetGid,
+                  followSymlinks !== 0,
+                );
+              }
+            });
+            return 0;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            return ERR_IO;
+          }
+        })();
+      }
       const authorized = authorizeChown(
         path,
         targetUid,
@@ -4024,7 +4619,11 @@ export function createKernelImports(
       }
     },
 
-    host_fchown(fd: number, uid: number, gid: number): number {
+    host_fchown(
+      fd: number,
+      uid: number,
+      gid: number,
+    ): number | Promise<number> {
       if (!opts.vfs || !opts.kernel) return ERR_IO;
       const targetUid = uid | 0;
       const targetGid = gid | 0;
@@ -4032,6 +4631,37 @@ export function createKernelImports(
       if (!target || target.type !== "vfs_file") return ERR_NOT_FOUND;
       const path = target.fdTable.getPath(target.fd);
       if (!path) return ERR_NOT_FOUND;
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          const authorized = await authorizeChownAsync(
+            asyncVfs,
+            path,
+            targetUid,
+            targetGid,
+          );
+          if (authorized !== 0) return authorized;
+          try {
+            await withVfsCallerCredentials(async () => {
+              if (asyncVfs.chownAsync) {
+                await asyncVfs.chownAsync(path, targetUid, targetGid);
+              } else {
+                asyncVfs.chown(path, targetUid, targetGid);
+              }
+            });
+            return 0;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            return ERR_IO;
+          }
+        })();
+      }
       const authorized = authorizeChown(path, targetUid, targetGid);
       if (authorized !== 0) return authorized;
       try {
@@ -4056,11 +4686,24 @@ export function createKernelImports(
       patternLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
-      if (!opts.vfs) {
-        return writeStringListRecord(memory, outPtr, outCap, []);
-      }
+    ): number | Promise<number> {
+      if (!opts.vfs) return writeStringListRecord(memory, outPtr, outCap, []);
       const pattern = readString(memory, patternPtr, patternLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            return writeStringListRecord(
+              memory,
+              outPtr,
+              outCap,
+              await globMatchAsync(asyncVfs, pattern),
+            );
+          } catch {
+            return writeStringListRecord(memory, outPtr, outCap, []);
+          }
+        })();
+      }
       try {
         return writeStringListRecord(
           memory,
@@ -4078,10 +4721,23 @@ export function createKernelImports(
       fromLen: number,
       toPtr: number,
       toLen: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const from = readString(memory, fromPtr, fromLen);
       const to = readString(memory, toPtr, toLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            if (asyncVfs.renameAsync) await asyncVfs.renameAsync(from, to);
+            else asyncVfs.rename(from, to);
+            opts.kernel?.remapCwdAfterRename(from, to);
+            return 0;
+          } catch {
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         opts.vfs.rename(from, to);
         opts.kernel?.remapCwdAfterRename(from, to);
@@ -4096,10 +4752,23 @@ export function createKernelImports(
       targetLen: number,
       linkPtr: number,
       linkLen: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const target = readString(memory, targetPtr, targetLen);
       const link = readString(memory, linkPtr, linkLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            if (asyncVfs.symlinkAsync) {
+              await asyncVfs.symlinkAsync(target, link);
+            } else asyncVfs.symlink(target, link);
+            return 0;
+          } catch {
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         opts.vfs.symlink(target, link);
         return 0;
@@ -4113,9 +4782,22 @@ export function createKernelImports(
       pathLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const target = asyncVfs.readlinkAsync
+              ? await asyncVfs.readlinkAsync(path)
+              : asyncVfs.readlink(path);
+            return writeString(memory, outPtr, outCap, target);
+          } catch {
+            return ERR_NOT_FOUND;
+          }
+        })();
+      }
       try {
         return writeString(memory, outPtr, outCap, opts.vfs.readlink(path));
       } catch {
@@ -4135,7 +4817,10 @@ export function createKernelImports(
       try {
         if (name.startsWith("__native__")) {
           const moduleName = name.slice("__native__".length);
-          const wasmBytes = opts.vfs.readFile(path);
+          const asyncVfs = asyncHostVfs(opts.vfs);
+          const wasmBytes = asyncVfs?.readFileAsync
+            ? await asyncVfs.readFileAsync(path)
+            : opts.vfs.readFile(path);
           await opts.mgr.registerNativeModule(moduleName, wasmBytes);
           return 0;
         }
@@ -4177,7 +4862,17 @@ export function createKernelImports(
           yurtImports: getYurtImportSnapshot(),
           mainAccess: () => {
             const inst = opts.mainInstance?.() ?? null;
-            return inst === null ? undefined : mainAccessFromInstance(inst);
+            if (inst === null) return undefined;
+            // Thread-capable main modules import memory rather than
+            // exporting it (target=wasm32-wasip1-threads + --import-memory).
+            // `opts.mainImportedMemory` holds the SAB-backed reference
+            // the kernel bound to `env.memory`; passing it lets the
+            // loader satisfy the side module's `env.memory` import
+            // even though `inst.exports.memory` is undefined.
+            return mainAccessFromInstance(
+              inst,
+              opts.mainImportedMemory ?? undefined,
+            );
           },
         });
         lastDlError = "";
@@ -4232,11 +4927,11 @@ export function createKernelImports(
 
   if (opts.threadsBackend) {
     const tb = opts.threadsBackend;
-    imports.host_thread_spawn = (async (fnPtr: number, arg: number) =>
+    imports.host_thread_spawn = ((fnPtr: number, arg: number) =>
       tb.spawn(fnPtr, arg)) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_join = (async (tid: number) =>
+    imports.host_thread_join = ((tid: number) =>
       tb.join(tid)) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_detach = (async (tid: number) =>
+    imports.host_thread_detach = ((tid: number) =>
       tb.detach(tid)) as unknown as WebAssembly.ImportValue;
     imports.host_thread_exit = ((retval: number) => {
       if (tb.self() === 0) {
@@ -4246,15 +4941,15 @@ export function createKernelImports(
     }) as unknown as WebAssembly.ImportValue;
     imports.host_thread_self = (() =>
       tb.self()) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_yield = (async () =>
+    imports.host_thread_yield = (() =>
       tb.yield_()) as unknown as WebAssembly.ImportValue;
-    imports.host_mutex_lock = (async (mutexPtr: number) =>
+    imports.host_mutex_lock = ((mutexPtr: number) =>
       tb.mutexLock(mutexPtr)) as unknown as WebAssembly.ImportValue;
     imports.host_mutex_unlock = ((mutexPtr: number) =>
       tb.mutexUnlock(mutexPtr)) as unknown as WebAssembly.ImportValue;
     imports.host_mutex_trylock = ((mutexPtr: number) =>
       tb.mutexTryLock(mutexPtr)) as unknown as WebAssembly.ImportValue;
-    imports.host_cond_wait = (async (condPtr: number, mutexPtr: number) =>
+    imports.host_cond_wait = ((condPtr: number, mutexPtr: number) =>
       tb.condWait(condPtr, mutexPtr)) as unknown as WebAssembly.ImportValue;
     imports.host_cond_signal = ((condPtr: number) =>
       tb.condSignal(condPtr)) as unknown as WebAssembly.ImportValue;

@@ -25,18 +25,18 @@ class RecordingBridge implements NetworkBridgeLike {
     _headers: Record<string, string>,
     _body?: string | Uint8Array | null,
     redirect?: FetchRedirectMode,
-  ): SyncFetchResult {
+  ): Promise<SyncFetchResult> {
     this.redirect = redirect;
-    return {
+    return Promise.resolve({
       status: 302,
       headers: { location: "/next" },
       body: "moved",
       body_base64: "bW92ZWQ=",
-    };
+    });
   }
 
-  requestSync(_op: Record<string, unknown>): SyncRequestResult {
-    return { ok: false, error: "not used" };
+  requestSync(_op: Record<string, unknown>): Promise<SyncRequestResult> {
+    return Promise.resolve({ ok: false, error: "not used" });
   }
 }
 
@@ -176,17 +176,17 @@ Deno.test("host_network_fetch forwards native request body bytes without UTF-8 d
       _headers,
       body,
       _redirect,
-    ): SyncFetchResult {
+    ): Promise<SyncFetchResult> {
       capturedBody = body;
-      return {
+      return Promise.resolve({
         status: 200,
         headers: {},
         body: "ok",
         body_base64: "b2s=",
-      };
+      });
     },
-    requestSync(): SyncRequestResult {
-      return { ok: false, error: "not used" };
+    requestSync(): Promise<SyncRequestResult> {
+      return Promise.resolve({ ok: false, error: "not used" });
     },
   };
   const imports = createKernelImports({ memory, networkBridge: bridge });

@@ -18,7 +18,6 @@ YURT_DECLARE_MARKER(sigismember);
 YURT_DECLARE_MARKER(sigprocmask);
 YURT_DECLARE_MARKER(pthread_sigmask);
 YURT_DECLARE_MARKER(sigsuspend);
-YURT_DECLARE_MARKER(sigtimedwait);
 
 YURT_DEFINE_MARKER(signal,       0x73676e6cu) /* sgnl */
 YURT_DEFINE_MARKER(sigaction,    0x73676163u) /* sgac */
@@ -32,7 +31,6 @@ YURT_DEFINE_MARKER(sigismember,  0x7369736du) /* sism */
 YURT_DEFINE_MARKER(sigprocmask,  0x7370726du) /* sprm */
 YURT_DEFINE_MARKER(pthread_sigmask, 0x70736d6bu) /* psmk */
 YURT_DEFINE_MARKER(sigsuspend,   0x73737370u) /* sssp */
-YURT_DEFINE_MARKER(sigtimedwait, 0x73747774u) /* stwt */
 
 #ifndef NSIG
 #define NSIG 64
@@ -302,41 +300,6 @@ int sigsuspend(const sigset_t *mask) {
   yurt_signal_mask = old_mask;
   yurt_signal_deliver_pending();
   errno = EINTR;
-  return -1;
-}
-
-int sigtimedwait(const sigset_t *restrict set, siginfo_t *restrict info, const struct timespec *restrict timeout) {
-  (void)timeout;
-  YURT_MARKER_CALL(sigtimedwait);
-
-  if (set == NULL) {
-    errno = EINVAL;
-    return -1;
-  }
-
-  yurt_signal_init();
-  for (int sig = 1; sig < NSIG; ++sig) {
-    unsigned long long pending_bit;
-    if (yurt_pending_signal_bit(sig, &pending_bit) != 0) {
-      continue;
-    }
-    if ((yurt_pending_signal_mask & pending_bit) == 0) {
-      continue;
-    }
-    if (sigismember(set, sig) != 1) {
-      continue;
-    }
-
-    yurt_pending_signal_mask &= ~pending_bit;
-    if (info) {
-      memset(info, 0, sizeof(*info));
-      info->si_signo = sig;
-    }
-    return sig;
-  }
-
-  yurt_host_yield();
-  errno = EAGAIN;
   return -1;
 }
 

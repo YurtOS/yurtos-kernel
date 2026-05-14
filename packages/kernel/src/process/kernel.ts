@@ -297,6 +297,34 @@ export class ProcessKernel {
     return fd;
   }
 
+  async openVfsFileAsync(
+    pid: number,
+    vfs: VfsLike,
+    path: string,
+    mode: OpenMode,
+    preferredFd?: number,
+  ): Promise<number> {
+    const processFds = this.getFdTable(pid);
+    const fd = preferredFd !== undefined && !processFds.has(preferredFd)
+      ? preferredFd
+      : this.nextLowestFd(pid, 0);
+    const credentials = this.getCredentials(pid);
+    const openFile = new FdTable(vfs, {
+      uid: credentials.euid,
+      gid: credentials.egid,
+    });
+    let vfsFd = await openFile.openAsync(path, mode);
+    if (vfsFd !== fd) {
+      openFile.renumber(vfsFd, fd);
+      vfsFd = fd;
+    }
+    processFds.set(fd, createVfsFileTarget(openFile, vfsFd));
+    this.fdDescriptorFlags.get(pid)?.delete(fd);
+    const nextFd = this.nextFds.get(pid) ?? KERNEL_FD_BASE;
+    if (fd >= nextFd) this.nextFds.set(pid, fd + 1);
+    return fd;
+  }
+
   vfsFilePath(pid: number, fd: number): string | null {
     return this.vfsPathForFd(pid, fd);
   }
@@ -315,6 +343,15 @@ export class ProcessKernel {
   writeVfsFile(pid: number, fd: number, data: Uint8Array): number {
     const target = this.requireVfsFileTarget(pid, fd);
     return target.fdTable.write(target.fd, data);
+  }
+
+  async writeVfsFileAsync(
+    pid: number,
+    fd: number,
+    data: Uint8Array,
+  ): Promise<number> {
+    const target = this.requireVfsFileTarget(pid, fd);
+    return await target.fdTable.writeAsync(target.fd, data);
   }
 
   preadVfsFile(
@@ -337,6 +374,16 @@ export class ProcessKernel {
     return target.fdTable.pwrite(target.fd, data, offset);
   }
 
+  async pwriteVfsFileAsync(
+    pid: number,
+    fd: number,
+    data: Uint8Array,
+    offset: number,
+  ): Promise<number> {
+    const target = this.requireVfsFileTarget(pid, fd);
+    return await target.fdTable.pwriteAsync(target.fd, data, offset);
+  }
+
   seekVfsFile(
     pid: number,
     fd: number,
@@ -355,6 +402,15 @@ export class ProcessKernel {
   truncateVfsFile(pid: number, fd: number, size: number): void {
     const target = this.requireVfsFileTarget(pid, fd);
     target.fdTable.truncate(target.fd, size);
+  }
+
+  async truncateVfsFileAsync(
+    pid: number,
+    fd: number,
+    size: number,
+  ): Promise<void> {
+    const target = this.requireVfsFileTarget(pid, fd);
+    await target.fdTable.truncateAsync(target.fd, size);
   }
 
   private nextLowestFd(pid: number, startFd: number): number {
@@ -1173,6 +1229,21 @@ export class ProcessKernel {
     return true;
   }
 
+  async closeFdAsync(pid: number, fd: number): Promise<boolean> {
+    const fdTable = this.fdTables.get(pid);
+    if (!fdTable) return false;
+    const target = fdTable.get(fd);
+    if (!target) {
+      fdTable.delete(fd);
+      return false;
+    }
+    this.unlockFile(pid, fd);
+    await this.closeTargetAsync(target);
+    fdTable.delete(fd);
+    this.fdDescriptorFlags.get(pid)?.delete(fd);
+    return true;
+  }
+
   lockFile(pid: number, fd: number, exclusive: boolean): number {
     const path = this.vfsPathForFd(pid, fd);
     if (!path) return 9; // EBADF
@@ -1300,15 +1371,29 @@ export class ProcessKernel {
       target.refs--;
       if (target.refs <= 0) {
         if (target.listener != null && target.closeListener) {
-          target.closeListener(target.listener);
+          // Bridge-backed closeListener is async; fire-and-forget keeps
+          // the sync release path sync. Bridge worker tears down its
+          // side independently.
+          void target.closeListener(target.listener);
           target.listener = null;
         }
         if (target.socket !== null) {
-          target.close(target.socket);
+          void target.close(target.socket);
           target.socket = null;
         }
       }
     }
+  }
+
+  private async closeTargetAsync(target: FdTarget): Promise<void> {
+    if (target.type !== "vfs_file") {
+      this.closeTarget(target);
+      return;
+    }
+    if (target.fdTable.isOpen(target.fd)) {
+      await target.fdTable.closeAsync(target.fd);
+    }
+    target.refs = Math.max(0, target.refs - 1);
   }
 
   private retainTarget(target: FdTarget): void {

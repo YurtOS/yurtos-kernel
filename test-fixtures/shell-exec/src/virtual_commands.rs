@@ -66,14 +66,36 @@ fn cmd_cat(
     args: &[String],
     stdin: &str,
 ) -> RunResult {
+    let read_stdin = || -> Result<String, String> {
+        if !stdin.is_empty() {
+            return Ok(stdin.to_string());
+        }
+        let bytes = host
+            .read_fd(state.stdin_fd)
+            .map_err(|err| err.to_string())?;
+        String::from_utf8(bytes).map_err(|err| format!("invalid UTF-8 from stdin: {err}"))
+    };
+
     if args.is_empty() {
-        shell_print!("{}", stdin);
+        match read_stdin() {
+            Ok(input) => shell_print!("{}", input),
+            Err(err) => {
+                shell_eprint!("cat: {err}\n");
+                return RunResult::exit(1);
+            }
+        }
         return RunResult::empty();
     }
 
     for arg in args {
         if arg == "-" {
-            shell_print!("{}", stdin);
+            match read_stdin() {
+                Ok(input) => shell_print!("{}", input),
+                Err(err) => {
+                    shell_eprint!("cat: {err}\n");
+                    return RunResult::exit(1);
+                }
+            }
             continue;
         }
         let resolved = state.resolve_path(arg);
@@ -228,7 +250,7 @@ fn cmd_curl(
 
     if let Some(ref file) = output_file {
         let resolved = state.resolve_path(file);
-        if let Err(e) = host.write_file(&resolved, &result.body_bytes(), WriteMode::Truncate) {
+        if let Err(e) = host.write_file(&resolved, result.body.as_bytes(), WriteMode::Truncate) {
             shell_eprint!("curl: failed to write {file}: {e}\n");
             return RunResult::exit(1);
         }
@@ -354,7 +376,7 @@ fn cmd_wget(state: &mut ShellState, host: &dyn HostInterface, args: &[String]) -
     };
 
     let resolved = state.resolve_path(&filename);
-    if let Err(e) = host.write_file(&resolved, &result.body_bytes(), WriteMode::Truncate) {
+    if let Err(e) = host.write_file(&resolved, result.body.as_bytes(), WriteMode::Truncate) {
         shell_eprint!("wget: failed to write {filename}: {e}\n");
         return RunResult::exit(1);
     }
@@ -385,7 +407,7 @@ mod tests {
                 status: 200,
                 headers: HashMap::new(),
                 body: "body".to_string(),
-                raw_body: Vec::new(),
+                body_base64: None,
                 error: None,
             },
         );

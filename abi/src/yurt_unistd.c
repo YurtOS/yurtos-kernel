@@ -3,7 +3,6 @@
 
 #include <errno.h>
 #include <string.h>
-#include <sys/reboot.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 
@@ -12,12 +11,10 @@
 YURT_DECLARE_MARKER(dup2);
 YURT_DECLARE_MARKER(getgroups);
 YURT_DECLARE_MARKER(gethostname);
-YURT_DECLARE_MARKER(reboot);
 
 YURT_DEFINE_MARKER(dup2, 0x64703200u)      /* "dp2\0" */
 YURT_DEFINE_MARKER(getgroups, 0x67677270u) /* "ggrp" */
 YURT_DEFINE_MARKER(gethostname, 0x67686e6du) /* "ghnm" */
-YURT_DEFINE_MARKER(reboot, 0x72627400u)    /* "rbt\0" */
 
 int dup2(int oldfd, int newfd) {
   YURT_MARKER_CALL(dup2);
@@ -76,13 +73,6 @@ int gethostname(char *name, size_t len) {
 
   memcpy(name, hostname, sizeof(hostname));
   return 0;
-}
-
-int reboot(int cmd) {
-  YURT_MARKER_CALL(reboot);
-  (void)cmd;
-  errno = ENOSYS;
-  return -1;
 }
 
 /* uname(2) — wasi-libc's default identifies the system as "wasi",
