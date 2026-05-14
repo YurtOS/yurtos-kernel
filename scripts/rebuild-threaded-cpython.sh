@@ -190,8 +190,11 @@ if [[ -d packages/kernel/src/platform/__tests__/fixtures/yurt-jupyter ]]; then
 fi
 
 step "Summary"
-for t in "${PASS[@]}"; do echo "  ✅ $t"; done
-for t in "${FAIL[@]}"; do echo "  ❌ $t"; done
+# `set -u` makes empty array expansion fatal under bash <4.4; guard each
+# loop so an all-pass run (PASS populated, FAIL empty — or vice-versa)
+# doesn't trip "unbound variable".
+for t in "${PASS[@]+"${PASS[@]}"}"; do echo "  ✅ $t"; done
+for t in "${FAIL[@]+"${FAIL[@]}"}"; do echo "  ❌ $t"; done
 echo
 if [[ ${#FAIL[@]} -eq 0 ]]; then
   echo "All smokes green. If the libzmq-reactor-spawn reproducer is in PASS"

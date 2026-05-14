@@ -3982,8 +3982,31 @@ export function createKernelImports(
     ): number | Promise<number> {
       const hasValue = hasValueRaw !== 0;
       const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket") return -9;
-      if (option !== 1) return -95;
+      if (!target || target.type !== "socket") {
+        netLog("setsockopt", { fd, option, result: "EBADF" });
+        return -9;
+      }
+      if (option !== 1) {
+        // Many sockopt knobs (SO_LINGER, SO_REUSEADDR, SO_KEEPALIVE,
+        // SO_RCVBUF, SO_SNDBUF, …) are advisory — ipykernel's
+        // jupyter_client sets SO_LINGER to "off" before binding, which
+        // is a no-op on our loopback registry. Accept the set silently
+        // and return 0; reject only the read path where the caller
+        // expects a real value back. This trades a strict POSIX
+        // contract for not crashing every server that touches a
+        // setsockopt we don't model yet.
+        if (hasValue) {
+          netLog("setsockopt", {
+            fd,
+            option,
+            value,
+            result: "ok (stubbed)",
+          });
+          return 0;
+        }
+        netLog("setsockopt", { fd, option, result: "ENOTSUP (get)" });
+        return -95;
+      }
       if (!hasValue) return target.noDelay ? 1 : 0;
       const enabled = value !== 0;
       if (target.socket !== null) {

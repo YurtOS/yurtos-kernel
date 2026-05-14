@@ -193,10 +193,23 @@ maybeDescribe("yurt-jupyter ipykernel runtime smoke", () => {
       // it hangs forever. Until we either teach the kernel to force-
       // terminate orphan pthreads on main-thread exit or patch the
       // dry-run to call os._exit(), accept the hang as a third
-      // success shape.
+      // success shape. Stream stdout/stderr through the new onChunk
+      // hook so we can see exactly how far the dry-run got before
+      // hanging.
+      const streamedStdout: string[] = [];
+      const streamedStderr: string[] = [];
+      const onStdout = (chunk: string) => {
+        streamedStdout.push(chunk);
+        console.log(`[dry-run stdout] ${chunk.trimEnd()}`);
+      };
+      const onStderr = (chunk: string) => {
+        streamedStderr.push(chunk);
+        console.log(`[dry-run stderr] ${chunk.trimEnd()}`);
+      };
       const ran = await Promise.race([
         sandbox.run(
           "cpython3 /usr/share/yurt-jupyter/ipykernel-launch-dry-run.py",
+          { onStdout, onStderr },
         )
           .then((value) => ({ kind: "complete" as const, value })),
         new Promise<{ kind: "timeout" }>((resolve) =>
@@ -205,11 +218,15 @@ maybeDescribe("yurt-jupyter ipykernel runtime smoke", () => {
       ]);
 
       if (ran.kind === "timeout") {
-        // Stdout/stderr are only available once sandbox.run resolves;
-        // the timeout path can't expose progress markers. Accept the
-        // hang here — sandbox.destroy() in finally tears the wasm
-        // instance down. Treat this as "post-init threads ran" which
-        // is itself proof the threadsBackend + TLS init both work.
+        console.log("--- dry-run timed out after 30s");
+        console.log(
+          "--- last streamed stdout chunk:",
+          streamedStdout.at(-1) ?? "(none)",
+        );
+        console.log(
+          "--- last streamed stderr chunk:",
+          streamedStderr.at(-1) ?? "(none)",
+        );
         return;
       }
 
