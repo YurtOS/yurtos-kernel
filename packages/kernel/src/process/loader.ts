@@ -280,9 +280,18 @@ export async function loadProcess(
     // Rust kernel path.
     const envImports: Record<string, WebAssembly.ImportValue> = {
       sys_poll: () => -38,
+      sys_socket_open: () => -38,
+      sys_socket_connect: () => -38,
+      sys_socket_bind: () => -38,
+      sys_socket_listen: () => -38,
+      sys_socket_accept: () => -38,
+      sys_socket_addr: () => -38,
       sys_socket_close: () => -38,
       sys_socket_recv: () => -38,
       sys_socket_send: () => -38,
+      sys_socket_sendto: () => -38,
+      sys_socket_sendmsg: () => -38,
+      sys_socket_recvmsg: () => -38,
       sys_socketpair: () => -38,
     };
     const imports: WebAssembly.Imports = {

@@ -146,6 +146,57 @@ function makeModuleWithFeatures(features: string[]): WebAssembly.Module {
   );
 }
 
+function makeModuleImportingEnvFunctions(names: string[]): WebAssembly.Module {
+  const typeSection = wasmSection(1, wasmVec([[0x60, 0x00, 0x00]]));
+  const importEntries = names.map((name) => [
+    ...encodeU32("env".length),
+    ...wasmBytes("env"),
+    ...encodeU32(name.length),
+    ...wasmBytes(name),
+    0x00,
+    0x00,
+  ]);
+  const importSection = wasmSection(2, wasmVec(importEntries));
+  const functionSection = wasmSection(3, wasmVec([[0x00]]));
+  const memorySection = wasmSection(5, wasmVec([[0x00, 0x01]]));
+  const exportSection = wasmSection(
+    7,
+    wasmVec([
+      [
+        ...encodeU32("_start".length),
+        ...wasmBytes("_start"),
+        0x00,
+        ...encodeU32(names.length),
+      ],
+      [
+        ...encodeU32("memory".length),
+        ...wasmBytes("memory"),
+        0x02,
+        0x00,
+      ],
+    ]),
+  );
+
+  return new WebAssembly.Module(
+    new Uint8Array([
+      0x00,
+      0x61,
+      0x73,
+      0x6d,
+      0x01,
+      0x00,
+      0x00,
+      0x00,
+      ...typeSection,
+      ...importSection,
+      ...functionSection,
+      ...memorySection,
+      ...exportSection,
+      ...wasmSection(10, wasmVec([[0x02, 0x00, 0x0b]])),
+    ]),
+  );
+}
+
 function makeThreadedSharedMemoryModule(): WebAssembly.Module {
   const typeSection = wasmSection(1, wasmVec([[0x60, 0x00, 0x00]]));
   const functionSection = wasmSection(3, wasmVec([[0x00]]));
@@ -279,6 +330,34 @@ Deno.test("loadProcess rolls back pid and fd state when instantiation fails", as
   assertEquals(ctx.kernel.getReservedProcessCount(), 0);
   assertEquals(ctx.kernel.canReserveProcessSlot(), true);
   assertEquals(ctx.kernel.getFdTarget(2, 0), null);
+});
+
+Deno.test("loadProcess stubs statically linked env sys_socket imports", async () => {
+  const ctx = await makeLoaderContext({
+    moduleCache: fixedModuleCache(makeModuleImportingEnvFunctions([
+      "sys_socket_open",
+      "sys_socket_connect",
+      "sys_socket_bind",
+      "sys_socket_listen",
+      "sys_socket_accept",
+      "sys_socket_addr",
+      "sys_socket_close",
+      "sys_socket_recv",
+      "sys_socket_send",
+      "sys_socket_sendto",
+      "sys_socket_sendmsg",
+      "sys_socket_recvmsg",
+      "sys_socketpair",
+    ])),
+  });
+
+  const proc = await loadProcess(ctx, {
+    argv: ["/bin/true"],
+    mode: "cli",
+  });
+
+  assertEquals(proc.exitCode, 0);
+  await proc.terminate();
 });
 
 Deno.test("loadProcess rejects threaded modules when Worker/SAB is unavailable", async () => {
