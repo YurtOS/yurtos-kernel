@@ -43,6 +43,7 @@ const EACCES: i64 = 13;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
 const EINVAL: i64 = 22;
+const E2BIG: i64 = 7;
 const ENOSYS: i64 = 38;
 const DEFAULT_EPOCH_DEADLINE: u64 = u64::MAX / 2;
 
@@ -676,6 +677,10 @@ pub trait TcpSocketImpl: Send + Sync {
     fn local_addr(&self, _handle: i32) -> Option<(String, u16)> {
         None
     }
+    /// Return the connected peer (host, port) of `handle`.
+    fn peer_addr(&self, _handle: i32) -> Option<(String, u16)> {
+        None
+    }
 }
 
 /// std::net::TcpStream-backed [`TcpSocketImpl`]. Blocking I/O;
@@ -839,6 +844,14 @@ impl TcpSocketImpl for NativeTcpSocket {
         }
         None
     }
+
+    fn peer_addr(&self, handle: i32) -> Option<(String, u16)> {
+        let s = self.inner.lock().unwrap();
+        s.sockets
+            .get(&handle)
+            .and_then(|stream| stream.peer_addr().ok())
+            .map(|a| (a.ip().to_string(), a.port()))
+    }
 }
 
 fn tcp_io_errno(e: std::io::Error) -> i32 {
@@ -854,6 +867,15 @@ fn tcp_io_errno(e: std::io::Error) -> i32 {
         PermissionDenied => -13_i32,
         _ => -5_i32, // -EIO
     }
+}
+
+fn socket_addr_record(host: &str, port: u16) -> [u8; 8] {
+    let mut out = [0_u8; 8];
+    if let Ok(addr) = host.parse::<std::net::Ipv4Addr>() {
+        out[0..4].copy_from_slice(&addr.octets());
+    }
+    out[4..6].copy_from_slice(&port.to_be_bytes());
+    out
 }
 
 /// Pluggable host-fs backend. *Every* host-fs access goes through
@@ -3078,20 +3100,44 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             };
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
-                None => return -9_i64,
+                None => return -EBADF,
             };
             let (host, port) = match tcp.local_addr(handle) {
                 Some(p) => p,
-                None => return -9_i64,
+                None => return -EBADF,
             };
-            let host_bytes = host.as_bytes();
-            let need = 2 + host_bytes.len();
+            let buf = socket_addr_record(&host, port);
+            let need = buf.len();
             if (need as u32) > out_cap {
-                return -7_i64; // -E2BIG
+                return -E2BIG;
             }
-            let mut buf = Vec::with_capacity(need);
-            buf.extend_from_slice(&port.to_le_bytes());
-            buf.extend_from_slice(host_bytes);
+            if memory.write(&mut caller, out_ptr as usize, &buf).is_err() {
+                return -EFAULT;
+            }
+            need as i64
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_socket_peer_addr",
+        |mut caller: Caller<'_, KernelStoreData>, handle: i32, out_ptr: u32, out_cap: u32| -> i64 {
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -EFAULT,
+            };
+            let tcp = match caller.data().host.tcp.clone() {
+                Some(t) => t,
+                None => return -EBADF,
+            };
+            let (host, port) = match tcp.peer_addr(handle) {
+                Some(p) => p,
+                None => return -EBADF,
+            };
+            let buf = socket_addr_record(&host, port);
+            let need = buf.len();
+            if (need as u32) > out_cap {
+                return -E2BIG;
+            }
             if memory.write(&mut caller, out_ptr as usize, &buf).is_err() {
                 return -EFAULT;
             }

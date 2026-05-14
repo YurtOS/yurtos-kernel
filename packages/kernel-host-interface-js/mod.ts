@@ -378,6 +378,7 @@ export interface TcpSocketImpl {
   listen(host: string, port: number, backlog: number): number;
   accept(handle: number, flags: number): number;
   localAddr(handle: number): { host: string; port: number } | null;
+  peerAddr?(handle: number): { host: string; port: number } | null;
   /**
    * Optional async variants for hosts where the underlying
    * primitive (Deno.connect, fetch + WebSocket, ...) returns a
@@ -452,6 +453,19 @@ const EINVAL = 22;
 const E2BIG = 7;
 const EIO = 5;
 const ENOSYS = 38;
+
+function ipv4SocketAddrRecord(host: string, port: number): Uint8Array {
+  const out = new Uint8Array(8);
+  const parts = host.split(".").map((part) => Number(part));
+  if (
+    parts.length === 4 &&
+    parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)
+  ) {
+    out.set(parts as [number, number, number, number], 0);
+  }
+  new DataView(out.buffer).setUint16(4, port & 0xffff, false);
+  return out;
+}
 
 const USER_YURT_STUB_IMPORTS = [
   "host_chown",
@@ -2118,13 +2132,25 @@ export class KernelHostInterface {
         if (!tcp) return BigInt(-EBADF);
         const addr = tcp.localAddr(handle);
         if (!addr) return BigInt(-EBADF);
-        const hostBytes = new TextEncoder().encode(addr.host);
-        const need = 2 + hostBytes.byteLength;
+        const record = ipv4SocketAddrRecord(addr.host, addr.port);
+        const need = record.byteLength;
         if (need > outCap) return BigInt(-E2BIG);
-        const buf = new Uint8Array(need);
-        new DataView(buf.buffer).setUint16(0, addr.port, true);
-        buf.set(hostBytes, 2);
-        new Uint8Array(memoryRef.memory!.buffer, outPtr, need).set(buf);
+        new Uint8Array(memoryRef.memory!.buffer, outPtr, need).set(record);
+        return BigInt(need);
+      },
+      kh_socket_peer_addr: (
+        handle: number,
+        outPtr: number,
+        outCap: number,
+      ): bigint => {
+        const tcp = hostBox.state.tcp;
+        if (!tcp) return BigInt(-EBADF);
+        const addr = tcp.peerAddr?.(handle);
+        if (!addr) return BigInt(-EBADF);
+        const record = ipv4SocketAddrRecord(addr.host, addr.port);
+        const need = record.byteLength;
+        if (need > outCap) return BigInt(-E2BIG);
+        new Uint8Array(memoryRef.memory!.buffer, outPtr, need).set(record);
         return BigInt(need);
       },
       // Durable KV (IndexedDB-shaped). Browser kernel-host interfaces back
@@ -3367,6 +3393,9 @@ export class WebSocketTcp implements TcpSocketImpl {
     return -38;
   }
   localAddr(): { host: string; port: number } | null {
+    return null;
+  }
+  peerAddr(): { host: string; port: number } | null {
     return null;
   }
 

@@ -49,6 +49,7 @@ extern "C" {
     fn kh_socket_listen_at(addr_ptr: *const u8, addr_len: usize, backlog: u32) -> i32;
     fn kh_socket_accept_blocking(handle: i32, flags: u32) -> i32;
     fn kh_socket_local_addr(handle: i32, out_ptr: *mut u8, out_cap: usize) -> i64;
+    fn kh_socket_peer_addr(handle: i32, out_ptr: *mut u8, out_cap: usize) -> i64;
     fn kh_idb_get(
         store_ptr: *const u8,
         store_len: usize,
@@ -288,6 +289,17 @@ unsafe fn kh_idb_get(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_socket_peer_addr(_handle: i32, _out_ptr: *mut u8, _out_cap: usize) -> i64 {
+    #[cfg(test)]
+    {
+        let out = std::slice::from_raw_parts_mut(_out_ptr, _out_cap);
+        test_support::socket_peer_addr(_handle, out)
+    }
+    #[cfg(not(test))]
+    -38
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_idb_put(
     _store_ptr: *const u8,
     _store_len: usize,
@@ -497,6 +509,10 @@ pub fn socket_local_addr(handle: i32, out: &mut [u8]) -> i64 {
     unsafe { kh_socket_local_addr(handle, out.as_mut_ptr(), out.len()) }
 }
 
+pub fn socket_peer_addr(handle: i32, out: &mut [u8]) -> i64 {
+    unsafe { kh_socket_peer_addr(handle, out.as_mut_ptr(), out.len()) }
+}
+
 #[cfg(test)]
 pub mod test_support {
     use std::collections::VecDeque;
@@ -509,12 +525,14 @@ pub mod test_support {
         accept_results: VecDeque<i32>,
         recv_results: VecDeque<Vec<u8>>,
         addr_results: VecDeque<Vec<u8>>,
+        peer_addr_results: VecDeque<Vec<u8>>,
         connect_calls: Vec<(Vec<u8>, u32)>,
         listen_calls: Vec<(Vec<u8>, u32)>,
         accept_calls: Vec<(i32, u32)>,
         send_calls: Vec<(i32, Vec<u8>)>,
         recv_calls: Vec<(i32, usize, u32)>,
         addr_calls: Vec<(i32, usize)>,
+        peer_addr_calls: Vec<(i32, usize)>,
         close_calls: Vec<i32>,
     }
 
@@ -557,6 +575,14 @@ pub mod test_support {
             .push_back(bytes.to_vec());
     }
 
+    pub fn push_socket_peer_addr_result(bytes: &[u8]) {
+        SOCKET_MOCK
+            .lock()
+            .unwrap()
+            .peer_addr_results
+            .push_back(bytes.to_vec());
+    }
+
     pub fn socket_connect_calls() -> Vec<(Vec<u8>, u32)> {
         SOCKET_MOCK.lock().unwrap().connect_calls.clone()
     }
@@ -575,6 +601,10 @@ pub mod test_support {
 
     pub fn socket_addr_calls() -> Vec<(i32, usize)> {
         SOCKET_MOCK.lock().unwrap().addr_calls.clone()
+    }
+
+    pub fn socket_peer_addr_calls() -> Vec<(i32, usize)> {
+        SOCKET_MOCK.lock().unwrap().peer_addr_calls.clone()
     }
 
     pub fn socket_accept_calls() -> Vec<(i32, u32)> {
@@ -630,6 +660,15 @@ pub mod test_support {
         let mut mock = SOCKET_MOCK.lock().unwrap();
         mock.addr_calls.push((handle, out.len()));
         let bytes = mock.addr_results.pop_front().unwrap_or_default();
+        let n = bytes.len().min(out.len());
+        out[..n].copy_from_slice(&bytes[..n]);
+        n as i64
+    }
+
+    pub(super) fn socket_peer_addr(handle: i32, out: &mut [u8]) -> i64 {
+        let mut mock = SOCKET_MOCK.lock().unwrap();
+        mock.peer_addr_calls.push((handle, out.len()));
+        let bytes = mock.peer_addr_results.pop_front().unwrap_or_default();
         let n = bytes.len().min(out.len());
         out[..n].copy_from_slice(&bytes[..n]);
         n as i64

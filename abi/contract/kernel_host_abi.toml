@@ -194,7 +194,16 @@ args = [
 ]
 
 [import.kh_socket_local_addr]
-doc = "Write the bound address as u16 port LE + UTF-8 host bytes into (out_ptr, out_cap). Returns bytes-written or negated errno."
+doc = "Write yurt_socket_addr_result_v1 (u32 IPv4 host bytes in network order + u16 port in network order + u16 reserved) for the local address into (out_ptr, out_cap). Returns 8 or negated errno."
+return = "fixed_out"
+args = [
+  { name = "handle", type = "i32" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.kh_socket_peer_addr]
+doc = "Write yurt_socket_addr_result_v1 (u32 IPv4 host bytes in network order + u16 port in network order + u16 reserved) for the connected peer address into (out_ptr, out_cap). Returns 8 or negated errno."
 return = "fixed_out"
 args = [
   { name = "handle", type = "i32" },

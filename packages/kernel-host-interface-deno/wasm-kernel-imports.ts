@@ -35,6 +35,11 @@ import {
 } from "../kernel-host-interface-js/mod.ts";
 
 const EFAULT = 14;
+const EIO = 5;
+const EAGAIN = 11;
+const EOPNOTSUPP = 95;
+const HOST_UNIX_NOT_AF_UNIX = -1;
+const HOST_ASYNC_EAGAIN = -2;
 
 export type ArgSpec =
   | "scalar"
@@ -490,10 +495,70 @@ export const HOST_BINDINGS: HostBinding[] = [
       return Number(out.rc);
     },
   },
+  // host_socket_bind_unix(fd, pathPtr, pathLen, isAbstract) -> 0/-errno.
+  // SYS_SOCKET_BIND uses the Rust kernel's unified fd table and accepts
+  // u32 fd + "unix:<path>" bytes.
+  {
+    name: "host_socket_bind_unix",
+    method: METHOD.SYS_SOCKET_BIND,
+    args: [],
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      pathPtr: number,
+      pathLen: number,
+      isAbstract: number,
+    ): Promise<number> => {
+      const addr = unixSocketAddrBytes(memBuf, pathPtr, pathLen, isAbstract);
+      if (typeof addr === "number") return addr;
+      const req = new Uint8Array(4 + addr.length);
+      new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+      req.set(addr, 4);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_BIND,
+        callerPid,
+        req,
+        0,
+      );
+      return Number(out.rc);
+    },
+  },
+  // host_socket_connect_unix(fd, pathPtr, pathLen, isAbstract) -> 0/-errno.
+  {
+    name: "host_socket_connect_unix",
+    method: METHOD.SYS_SOCKET_CONNECT,
+    args: [],
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      pathPtr: number,
+      pathLen: number,
+      isAbstract: number,
+    ): Promise<number> => {
+      const addr = unixSocketAddrBytes(memBuf, pathPtr, pathLen, isAbstract);
+      if (typeof addr === "number") return addr;
+      const req = new Uint8Array(4 + addr.length);
+      new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+      req.set(addr, 4);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_CONNECT,
+        callerPid,
+        req,
+        0,
+      );
+      return Number(out.rc);
+    },
+  },
   // host_socket_listen(fd, backlog) -> 0/-errno.
   // SYS_SOCKET_LISTEN accepts u32 fd + u32 backlog.
   {
     name: "host_socket_listen",
+    method: METHOD.SYS_SOCKET_LISTEN,
+    args: ["scalar", "scalar"],
+  },
+  // host_socket_listen_unix(fd, backlog) -> 0/-errno.
+  {
+    name: "host_socket_listen_unix",
     method: METHOD.SYS_SOCKET_LISTEN,
     args: ["scalar", "scalar"],
   },
@@ -532,9 +597,22 @@ export const HOST_BINDINGS: HostBinding[] = [
   {
     name: "host_socket_addr",
     method: METHOD.SYS_SOCKET_ADDR,
-    args: ["scalar", "out_cap"],
-    argOrder: [0, 2, 3],
+    args: ["scalar", "scalar", "out_cap"],
     returnsBytes: true,
+  },
+  // host_socket_addr_unix(fd, isPeer, pathPtr, pathCap, isAbstractPtr).
+  // Pathname metadata for connected AF_UNIX sockets is a follow-up. Keep
+  // this import present so wasm-mode never falls back into the TS kernel
+  // with a Rust fd; returning -1 lets libc fall through to host_socket_addr
+  // for non-AF_UNIX sockets.
+  {
+    name: "host_socket_addr_unix",
+    method: METHOD.SYS_SOCKET_ADDR,
+    args: [],
+    custom: () => async (): Promise<number> => {
+      await Promise.resolve();
+      return HOST_UNIX_NOT_AF_UNIX;
+    },
   },
   // host_socket_send(fd, dataPtr, dataLen, flags) → bytes.
   // SYS_SOCKET_SEND accepts u32 handle + payload bytes. The
@@ -555,6 +633,233 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["scalar", "scalar", "out_cap"],
     argOrder: [0, 3, 1, 2],
     returnsBytes: true,
+  },
+  // host_socket_sendto_unix(fd, bufPtr, bufLen, pathPtr, pathLen, isAbstract).
+  {
+    name: "host_socket_sendto_unix",
+    method: METHOD.SYS_SOCKET_SENDTO,
+    args: [],
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      dataPtr: number,
+      dataLen: number,
+      pathPtr: number,
+      pathLen: number,
+      isAbstract: number,
+    ): Promise<number> => {
+      const data = copyIn(memBuf, dataPtr, dataLen);
+      if (typeof data === "number") return data;
+      const addr = unixSocketAddrBytes(memBuf, pathPtr, pathLen, isAbstract);
+      if (typeof addr === "number") return addr;
+      const req = new Uint8Array(12 + addr.length + data.length);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, 0, true);
+      view.setUint32(8, addr.length >>> 0, true);
+      req.set(addr, 12);
+      req.set(data, 12 + addr.length);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_SENDTO,
+        callerPid,
+        req,
+        0,
+      );
+      return Number(out.rc);
+    },
+  },
+  // host_socket_recvfrom_unix currently maps to the Rust recv path and
+  // reports an empty source address. This keeps fd state in the Rust kernel.
+  {
+    name: "host_socket_recvfrom_unix",
+    method: METHOD.SYS_SOCKET_RECV,
+    args: [],
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      outPtr: number,
+      outCap: number,
+      _fromPathPtr: number,
+      _fromPathCap: number,
+      fromPathLenPtr: number,
+      fromIsAbstractPtr: number,
+    ): Promise<number> => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, 0, true);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_RECV,
+        callerPid,
+        req,
+        outCap >>> 0,
+      );
+      const rc = Number(out.rc);
+      if (rc === -EAGAIN) return HOST_ASYNC_EAGAIN;
+      if (rc < 0) return rc;
+      if (rc > 0) {
+        const outRc = copyOut(memBuf, outPtr, out.response.subarray(0, rc));
+        if (outRc < 0) return outRc;
+      }
+      const zero = new Uint8Array(4);
+      if (fromPathLenPtr) {
+        const outRc = copyOut(memBuf, fromPathLenPtr, zero);
+        if (outRc < 0) return outRc;
+      }
+      if (fromIsAbstractPtr) {
+        const outRc = copyOut(memBuf, fromIsAbstractPtr, zero);
+        if (outRc < 0) return outRc;
+      }
+      return rc;
+    },
+  },
+  // host_socket_socketpair(family, type, svPtr) -> 0/-errno.
+  {
+    name: "host_socket_socketpair",
+    method: METHOD.SYS_SOCKETPAIR,
+    args: [],
+    custom:
+      (mk, memBuf, callerPid) =>
+      async (family: number, type: number, svPtr: number): Promise<number> => {
+        const req = new Uint8Array(8);
+        const view = new DataView(req.buffer);
+        req[0] = family & 0xff;
+        req[1] = type & 0xff;
+        view.setUint32(4, (type & ~0xff) >>> 0, true);
+        const out = await mk.kernelSyscallAsync(
+          METHOD.SYS_SOCKETPAIR,
+          callerPid,
+          req,
+          8,
+        );
+        const rc = Number(out.rc);
+        if (rc < 0) return rc;
+        if (rc !== 8 || out.response.byteLength < 8) return -5;
+        const outRc = copyOut(memBuf, svPtr, out.response.subarray(0, 8));
+        return outRc < 0 ? outRc : 0;
+      },
+  },
+  // host_socket_sendmsg(fd, dataPtr, dataLen, fdsPtr, fdsCount).
+  {
+    name: "host_socket_sendmsg",
+    method: METHOD.SYS_SOCKET_SENDMSG,
+    args: [],
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      dataPtr: number,
+      dataLen: number,
+      fdsPtr: number,
+      fdsCount: number,
+    ): Promise<number> => {
+      const data = copyIn(memBuf, dataPtr, dataLen);
+      if (typeof data === "number") return data;
+      const fdBytes = fdsCount > 0
+        ? copyIn(memBuf, fdsPtr, (fdsCount >>> 0) * 4)
+        : new Uint8Array();
+      if (typeof fdBytes === "number") return fdBytes;
+      const req = new Uint8Array(12 + data.length + fdBytes.length);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, data.length >>> 0, true);
+      view.setUint32(8, fdsCount >>> 0, true);
+      req.set(data, 12);
+      req.set(fdBytes, 12 + data.length);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_SENDMSG,
+        callerPid,
+        req,
+        0,
+      );
+      return Number(out.rc);
+    },
+  },
+  // host_socket_recvmsg(fd, bufPtr, bufCap, fdsPtr, fdsCap, nFdsPtr).
+  {
+    name: "host_socket_recvmsg",
+    method: METHOD.SYS_SOCKET_RECVMSG,
+    args: [],
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      bufPtr: number,
+      bufCap: number,
+      fdsPtr: number,
+      fdsCap: number,
+      nFdsPtr: number,
+    ): Promise<number> => {
+      const req = new Uint8Array(12);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, 0, true);
+      view.setUint32(8, bufCap >>> 0, true);
+      const responseCap = (bufCap >>> 0) + 4 + (fdsCap >>> 0) * 4;
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_RECVMSG,
+        callerPid,
+        req,
+        responseCap,
+      );
+      const rc = Number(out.rc);
+      if (rc === -EAGAIN) return HOST_ASYNC_EAGAIN;
+      if (rc < 0) return -EIO;
+      if (rc > 0) {
+        const outRc = copyOut(memBuf, bufPtr, out.response.subarray(0, rc));
+        if (outRc < 0) return outRc;
+      }
+      const rightsStart = bufCap >>> 0;
+      const totalFds = out.response.byteLength >= rightsStart + 4
+        ? new DataView(
+          out.response.buffer,
+          out.response.byteOffset + rightsStart,
+          4,
+        ).getUint32(0, true)
+        : 0;
+      const fit = Math.min(totalFds, fdsCap >>> 0);
+      if (fit > 0 && fdsPtr !== 0) {
+        const start = rightsStart + 4;
+        const outRc = copyOut(
+          memBuf,
+          fdsPtr,
+          out.response.subarray(start, start + fit * 4),
+        );
+        if (outRc < 0) return outRc;
+      }
+      if (nFdsPtr !== 0) {
+        const count = new Uint8Array(4);
+        new DataView(count.buffer).setUint32(0, totalFds, true);
+        const outRc = copyOut(memBuf, nFdsPtr, count);
+        if (outRc < 0) return outRc;
+      }
+      return rc;
+    },
+  },
+  {
+    name: "host_socket_is_dgram",
+    method: 0,
+    args: [],
+    custom: () => async () => {
+      await Promise.resolve();
+      return -EIO;
+    },
+  },
+  {
+    name: "host_socket_peercred",
+    method: 0,
+    args: [],
+    custom: () => async () => {
+      await Promise.resolve();
+      return -EIO;
+    },
+  },
+  {
+    name: "host_socket_option",
+    method: 0,
+    args: [],
+    custom: () => async () => {
+      await Promise.resolve();
+      return -EOPNOTSUPP;
+    },
   },
   // host_socket_close(fd) → 0 / -errno.
   // SYS_SOCKET_CLOSE: u32 handle in request, no response.
@@ -826,6 +1131,23 @@ function socketEndpointBytes(
   const out = new Uint8Array(host.byteLength + suffix.byteLength);
   out.set(host, 0);
   out.set(suffix, host.byteLength);
+  return out;
+}
+
+function unixSocketAddrBytes(
+  memBuf: () => ArrayBuffer,
+  pathPtr: number,
+  pathLen: number,
+  isAbstract: number,
+): Uint8Array | number {
+  const path = copyIn(memBuf, pathPtr, pathLen);
+  if (typeof path === "number") return path;
+  const prefix = isAbstract
+    ? new Uint8Array([0x75, 0x6e, 0x69, 0x78, 0x3a, 0x00])
+    : new TextEncoder().encode("unix:");
+  const out = new Uint8Array(prefix.byteLength + path.byteLength);
+  out.set(prefix, 0);
+  out.set(path, prefix.byteLength);
   return out;
 }
 

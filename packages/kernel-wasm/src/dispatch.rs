@@ -837,8 +837,13 @@ fn clone_fd_rights(k: &mut Kernel, caller_pid: u32, fds: &[u32]) -> Result<Vec<F
     Ok(rights)
 }
 
-fn install_fd_rights(k: &mut Kernel, caller_pid: u32, rights: Vec<FdEntry>, out: &mut [u8]) -> i64 {
-    if out.len() < 4 + rights.len() * 4 {
+fn install_fd_rights_truncated(
+    k: &mut Kernel,
+    caller_pid: u32,
+    rights: Vec<FdEntry>,
+    out: &mut [u8],
+) -> i64 {
+    if out.len() < 4 {
         for entry in rights {
             close_entry(k, entry);
         }
@@ -846,14 +851,19 @@ fn install_fd_rights(k: &mut Kernel, caller_pid: u32, rights: Vec<FdEntry>, out:
     }
     let count = rights.len() as u32;
     out[0..4].copy_from_slice(&count.to_le_bytes());
+    let fit = (out.len() - 4) / 4;
     for (index, entry) in rights.into_iter().enumerate() {
-        let p = k.process_mut(caller_pid);
-        let fd = p.fd_table.lowest_free_fd();
-        p.fd_table.install(fd, entry);
-        let start = 4 + index * 4;
-        out[start..start + 4].copy_from_slice(&fd.to_le_bytes());
+        if index < fit {
+            let p = k.process_mut(caller_pid);
+            let fd = p.fd_table.lowest_free_fd();
+            p.fd_table.install(fd, entry);
+            let start = 4 + index * 4;
+            out[start..start + 4].copy_from_slice(&fd.to_le_bytes());
+        } else {
+            close_entry(k, entry);
+        }
     }
-    (4 + count as usize * 4) as i64
+    (4 + count.min(fit as u32) as usize * 4) as i64
 }
 
 fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>) -> i64 {
@@ -2410,6 +2420,11 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
         return -(abi::EINVAL as i64);
     }
     let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let which = if request.len() >= 8 {
+        u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"))
+    } else {
+        0
+    };
     if response.is_empty() {
         return -(abi::EINVAL as i64);
     }
@@ -2446,7 +2461,11 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
         Ok(handle) => handle,
         Err(rc) => return rc,
     };
-    kh::socket_local_addr(handle, response)
+    if which == 0 {
+        kh::socket_local_addr(handle, response)
+    } else {
+        kh::socket_peer_addr(handle, response)
+    }
 }
 
 /// `sys_socket_connect(fd, addr_bytes) -> 0`. Request layout:
@@ -2702,8 +2721,9 @@ fn sys_socket_recvmsg(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i
         },
         Err(_) => Vec::new(),
     });
-    let install_rc =
-        with_kernel(|k| install_fd_rights(k, caller_pid, rights, &mut response[data_cap..]));
+    let install_rc = with_kernel(|k| {
+        install_fd_rights_truncated(k, caller_pid, rights, &mut response[data_cap..])
+    });
     if install_rc < 0 {
         return install_rc;
     }
@@ -3210,6 +3230,20 @@ mod tests {
 
     fn socket_fd_req(fd: u32) -> [u8; 4] {
         fd.to_le_bytes()
+    }
+
+    fn socket_addr_req(fd: u32, which: u32) -> [u8; 8] {
+        let mut req = [0u8; 8];
+        req[0..4].copy_from_slice(&fd.to_le_bytes());
+        req[4..8].copy_from_slice(&which.to_le_bytes());
+        req
+    }
+
+    fn socket_addr_record(host: [u8; 4], port: u16) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0..4].copy_from_slice(&host);
+        out[4..6].copy_from_slice(&port.to_be_bytes());
+        out
     }
 
     fn socket_accept_req(fd: u32, flags: u32) -> [u8; 8] {
@@ -3899,7 +3933,7 @@ mod tests {
         crate::kh::test_support::reset_socket_mock();
         crate::kh::test_support::push_socket_connect_result(91);
         crate::kh::test_support::push_socket_recv_result(b"pong");
-        crate::kh::test_support::push_socket_addr_result(b"127.0.0.1:6000");
+        crate::kh::test_support::push_socket_addr_result(&socket_addr_record([127, 0, 0, 1], 6000));
 
         assert_eq!(
             dispatch(
@@ -3940,9 +3974,9 @@ mod tests {
         let mut addr = [0u8; 32];
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_fd_req(3), &mut addr),
-            14
+            8
         );
-        assert_eq!(&addr[..14], b"127.0.0.1:6000");
+        assert_eq!(&addr[..8], &socket_addr_record([127, 0, 0, 1], 6000));
         assert_eq!(crate::kh::test_support::socket_addr_calls(), vec![(91, 32)]);
     }
 
@@ -4981,6 +5015,96 @@ mod tests {
             2
         );
         assert_eq!(&read_buf, b"ok");
+    }
+
+    #[test]
+    fn socket_recvmsg_with_tiny_rights_buffer_returns_data_and_truncates_rights() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut socket_fds = [0u8; 8];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKETPAIR,
+                1,
+                &socketpair_req(1, 1, 0),
+                &mut socket_fds
+            ),
+            8
+        );
+        let left = u32::from_le_bytes(socket_fds[0..4].try_into().unwrap());
+        let right = u32::from_le_bytes(socket_fds[4..8].try_into().unwrap());
+
+        let mut pipe_fds = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_fds), 8);
+        let pipe_write = u32::from_le_bytes(pipe_fds[4..8].try_into().unwrap());
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SENDMSG,
+                1,
+                &socket_sendmsg_req(left, b"x", &[pipe_write]),
+                &mut []
+            ),
+            1
+        );
+
+        let mut recv = [0u8; 1 + 4];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECVMSG,
+                1,
+                &socket_recvmsg_req(right, 0, 1),
+                &mut recv
+            ),
+            1
+        );
+        assert_eq!(recv[0], b'x');
+        assert_eq!(u32::from_le_bytes(recv[1..5].try_into().unwrap()), 1);
+
+        let mut empty = [0u8; 12];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECVMSG,
+                1,
+                &socket_recvmsg_req(right, 0, 8),
+                &mut empty
+            ),
+            -(abi::EAGAIN as i64)
+        );
+    }
+
+    #[test]
+    fn host_socket_addr_honors_peer_selector() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+        crate::kh::test_support::push_socket_connect_result(91);
+        crate::kh::test_support::push_socket_addr_result(&socket_addr_record([127, 0, 0, 1], 6000));
+        crate::kh::test_support::push_socket_peer_addr_result(&socket_addr_record(
+            [127, 0, 0, 1],
+            7000,
+        ));
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(2, 1, 0),
+                &mut []
+            ),
+            3
+        );
+        let req = socket_connect_req(3, b"127.0.0.1:6000");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
+
+        let mut addr = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_addr_req(3, 1), &mut addr),
+            8
+        );
+        assert_eq!(&addr[..8], &socket_addr_record([127, 0, 0, 1], 7000));
+        assert_eq!(
+            crate::kh::test_support::socket_peer_addr_calls(),
+            vec![(91, 16)]
+        );
     }
 
     #[test]

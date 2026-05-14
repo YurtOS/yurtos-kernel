@@ -460,6 +460,7 @@ fn kernel_wasm_imports_match_documented_namespaces() {
             "kh_socket_connect",
             "kh_socket_listen_at",
             "kh_socket_local_addr",
+            "kh_socket_peer_addr",
             "kh_socket_recv",
             "kh_socket_send",
             "kh_spawn_process",

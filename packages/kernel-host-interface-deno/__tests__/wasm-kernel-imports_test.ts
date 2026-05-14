@@ -127,6 +127,12 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
         "host_socket_send",
         "host_socket_recv",
         "host_socket_close",
+        "host_socket_bind_unix",
+        "host_socket_connect_unix",
+        "host_socket_listen_unix",
+        "host_socket_socketpair",
+        "host_socket_sendmsg",
+        "host_socket_recvmsg",
       ]
     ) {
       expect(names.has(name)).toEqual(true);
@@ -567,7 +573,16 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       method: METHOD.SYS_SOCKET_ADDR,
       responseCap: 16,
     });
-    expect(Array.from(calls.at(-1)!.request)).toEqual([9, 0, 0, 0]);
+    expect(Array.from(calls.at(-1)!.request)).toEqual([
+      9,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+    ]);
 
     await imports.host_socket_close(9);
     expect(calls.at(-1)).toMatchObject({
