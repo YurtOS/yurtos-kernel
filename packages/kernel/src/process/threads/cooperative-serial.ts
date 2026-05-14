@@ -35,10 +35,6 @@ class ThreadExit {
 export class CooperativeSerialBackend implements ThreadsBackend {
   readonly kind = "cooperative-serial" as const;
 
-  // FIXME: This backend is only a compatibility bridge for one spawned thread at a
-  // time. Real Rayon/std::thread parallelism requires a shared-memory + atomics
-  // backend such as wasi-threads, worker-SAB, WASIp2 threads, or WASIX.
-  private readonly maxLiveSpawnedThreads = 1;
   private slots: SpawnSlot[] = [];
   private indirectTable: IndirectCallTable = NULL_INDIRECT_CALL_TABLE;
   private tids = new ThreadIdScope();
@@ -81,7 +77,7 @@ export class CooperativeSerialBackend implements ThreadsBackend {
 
   async spawn(fnPtr: number, arg: number): Promise<number> {
     this.ensureMainSlot();
-    if (this.liveSpawnedThreads() >= this.maxLiveSpawnedThreads) return -1;
+    if (this.liveSpawnedThreads() >= this.maxSpawnSlots) return -1;
     const canAllocateSlot = this.slots.length <= this.maxSpawnSlots;
     const reusableTid = canAllocateSlot
       ? -1

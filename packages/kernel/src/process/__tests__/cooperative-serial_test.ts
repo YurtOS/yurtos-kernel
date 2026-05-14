@@ -83,6 +83,23 @@ Deno.test("cooperative serial backend maps thread exit to join retval", async ()
   assertEquals(await backend.join(tid), 42);
 });
 
+Deno.test("cooperative serial backend can create multiple live joinable threads", async () => {
+  const backend = new CooperativeSerialBackend();
+  backend.setIndirectCallTable({
+    call(_fnPtr, arg) {
+      return Promise.resolve(arg);
+    },
+  });
+
+  const firstTid = await backend.spawn(1, 11);
+  const secondTid = await backend.spawn(1, 12);
+
+  assertEquals(firstTid, 1);
+  assertEquals(secondTid, 2);
+  assertEquals(await backend.join(firstTid), 11);
+  assertEquals(await backend.join(secondTid), 12);
+});
+
 Deno.test("cooperative serial backend does not let detached threads block later spawns", async () => {
   const backend = new CooperativeSerialBackend();
   let releaseThread!: () => void;

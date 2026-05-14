@@ -170,3 +170,35 @@ Evaluate `bytecodealliance/open-posix-test-suite` as a slow-tier POSIX
 conformance source. Keep it outside the fast pre-push tests; run it as a
 guest-compat or manually triggered CI job once the syscall surface is broad
 enough to make failures actionable.
+
+### Task 6: Mine Open POSIX Suite For Threading Coverage
+
+**Files:**
+- Modify: `abi/conformance/c/pthread-canary.c`
+- Modify: `packages/kernel/src/process/threads/cooperative-serial.ts`
+- Test: `packages/kernel/src/process/__tests__/cooperative-serial_test.ts`
+
+- [x] **Step 1: Inventory the upstream suite surface**
+
+`bytecodealliance/open-posix-test-suite` currently emphasizes pthreads,
+signals, sched, semaphores, mqueues, and timers rather than sockets. The first
+useful pthread assertions are `pthread_self`, `pthread_equal`, `pthread_create`,
+and default joinability.
+
+- [x] **Step 2: Port pthread identity assertions into the local canary**
+
+Extend `pthread-canary` with equivalent local checks:
+
+- a child thread's `pthread_self()` equals the `pthread_t` returned by
+  `pthread_create()`;
+- child and main `pthread_t` values are distinct;
+- two live joinable threads have distinct `pthread_t` values;
+- a thread created with `attr == NULL` is joinable by default.
+
+- [x] **Step 3: Fix the cooperative backend gap exposed by the canary**
+
+The two-live-thread assertion failed because `CooperativeSerialBackend` capped
+live spawned threads at one even though it already has bounded per-thread slot
+and stack allocation. Replace that artificial limit with the existing slot
+limit and add a backend regression test that creates two joinable threads before
+joining either one.
