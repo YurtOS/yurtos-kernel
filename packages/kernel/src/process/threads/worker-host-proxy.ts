@@ -48,7 +48,17 @@ export const enum WorkerHostOp {
   SocketClose = 21,
   SocketRecv = 22,
   SocketSend = 23,
+  Poll = 30,
+  GetPid = 40,
+  SocketSendUnix = 41,
+  SocketPair = 42,
+  SocketRecvUnix = 43,
+  SetFdDescriptorFlags = 44,
+  ThreadSpawn = 45,
 }
+
+// pollfd struct on the wasm side: { fd: i32, events: i16, revents: i16 } — 8 bytes.
+const POLLFD_BYTES = 8;
 
 /**
  * Caller-provided handle for a worker's per-thread request SAB. The
@@ -194,6 +204,83 @@ export function createWorkerYurtImports(
       const data = memoryBytes().subarray(ptr, ptr + len);
       return call(WorkerHostOp.SocketSend, [fd, len], data);
     },
+    host_getpid: () => call(WorkerHostOp.GetPid, []),
+    host_socket_send_unix: (fd: number, ptr: number, len: number) => {
+      const data = memoryBytes().subarray(ptr, ptr + len);
+      return call(WorkerHostOp.SocketSendUnix, [fd, len], data);
+    },
+    host_socket_socketpair: (
+      family: number,
+      sockType: number,
+      svPtr: number,
+    ) => {
+      const r = call(WorkerHostOp.SocketPair, [family, sockType]);
+      if (r === 0) {
+        const byteStart = (PAYLOAD_ARGS_WORD + 1) * 4;
+        // Response payload: 2 × i32 (fdA, fdB) starting at byteStart.
+        memoryBytes().set(
+          payloadBytes.subarray(byteStart, byteStart + 8),
+          svPtr,
+        );
+      }
+      return r;
+    },
+    host_socket_recv_unix: (
+      fd: number,
+      bufPtr: number,
+      bufCap: number,
+      peek: number,
+    ) => {
+      // Body is a single nonblocking probe; if the caller wanted a
+      // blocking recv we'd loop, but libzmq's signaler always opens
+      // its mailbox fd as nonblocking and polls externally, so a
+      // single shot matches the call site. EAGAIN (-2) and peek (-3)
+      // returns flow straight through.
+      const n = call(WorkerHostOp.SocketRecvUnix, [fd, bufCap, peek | 0]);
+      if (n > 0) {
+        const byteStart = (PAYLOAD_ARGS_WORD + 1) * 4;
+        memoryBytes().set(
+          payloadBytes.subarray(byteStart, byteStart + n),
+          bufPtr,
+        );
+      }
+      return n;
+    },
+    host_set_fd_descriptor_flags: (fd: number, flags: number) =>
+      call(WorkerHostOp.SetFdDescriptorFlags, [fd, flags]),
+    host_thread_spawn: (fnPtr: number, arg: number) =>
+      call(WorkerHostOp.ThreadSpawn, [fnPtr, arg]),
+    host_poll: (fdsPtr: number, nfds: number, timeoutMs: number) => {
+      // The dispatcher body is sync (one evaluate per round-trip). We
+      // implement the blocking semantics on the worker side: probe via
+      // a host-call, sleep briefly between rounds using Atomics.wait on
+      // a private cell (workers may block synchronously), and write the
+      // returned revents back into wasm memory each round so callers
+      // observe ready bits as they appear.
+      const totalBytes = nfds * POLLFD_BYTES;
+      if (nfds <= 0 || totalBytes > PAYLOAD_BYTES) return -1;
+      const sleepCell = new Int32Array(new SharedArrayBuffer(4));
+      const start = Date.now();
+      while (true) {
+        const input = memoryBytes().subarray(fdsPtr, fdsPtr + totalBytes);
+        const ready = call(WorkerHostOp.Poll, [nfds], input);
+        const byteStart = (PAYLOAD_ARGS_WORD + 1) * 4;
+        memoryBytes().set(
+          payloadBytes.subarray(byteStart, byteStart + totalBytes),
+          fdsPtr,
+        );
+        if (ready < 0) return ready;
+        if (ready > 0) return ready;
+        if (timeoutMs === 0) return 0;
+        if (timeoutMs > 0) {
+          const elapsed = Date.now() - start;
+          if (elapsed >= timeoutMs) return 0;
+          Atomics.wait(sleepCell, 0, 0, Math.min(10, timeoutMs - elapsed));
+        } else {
+          Atomics.wait(sleepCell, 0, 0, 10);
+        }
+      }
+    },
     host_mutex_lock: (ptr: number) => {
       const m = mutex(ptr);
       if (!m || m.owner() === tid) return -1;
@@ -269,6 +356,40 @@ export interface WorkerHostDispatcherBodies {
   socketClose(fd: number): number;
   socketRecv(fd: number, cap: number): { result: number; bytes?: Uint8Array };
   socketSend(fd: number, data: Uint8Array): number;
+  /**
+   * One synchronous evaluation of a pollfd array. The worker-side
+   * `host_poll` import drives its own retry/sleep loop and re-invokes
+   * this body each round until it returns >0 or the timeout fires;
+   * the body itself does not block.
+   */
+  poll(nfds: number, fds: Uint8Array): { result: number; bytes?: Uint8Array };
+  getPid(): number;
+  socketSendUnix(fd: number, data: Uint8Array): number;
+  /**
+   * AF_UNIX socketpair() for the pthread worker. Returns 0 on success
+   * with two consecutive i32 fd numbers in `bytes`; -1 on error.
+   */
+  socketPair(
+    family: number,
+    sockType: number,
+  ): { result: number; bytes?: Uint8Array };
+  /**
+   * Nonblocking AF_UNIX recv for libzmq signaler / mailbox fds.
+   * Returns >0 with bytes on data, -2 on EAGAIN, -1 on error,
+   * -3 on wrong family.
+   */
+  socketRecvUnix(
+    fd: number,
+    cap: number,
+    peek: number,
+  ): { result: number; bytes?: Uint8Array };
+  setFdDescriptorFlags(fd: number, flags: number): number;
+  /**
+   * Synchronous pthread spawn for nested `host_thread_spawn` calls
+   * from a pthread worker. Returns the new tid immediately; the
+   * spawn itself runs asynchronously in the background.
+   */
+  threadSpawn(fnPtr: number, arg: number): number;
 }
 
 /**
@@ -364,6 +485,56 @@ export function attachWorkerHostDispatcher(
           result = bodies.socketSend(fd, data);
           break;
         }
+        case WorkerHostOp.Poll: {
+          const nfds = payload[PAYLOAD_ARGS_WORD + 0];
+          const byteStart = (PAYLOAD_ARGS_WORD + 1) * 4;
+          const totalBytes = nfds * POLLFD_BYTES;
+          const data = payloadBytes.slice(byteStart, byteStart + totalBytes);
+          const r = bodies.poll(nfds, data);
+          result = r.result;
+          outBytes = r.bytes;
+          break;
+        }
+        case WorkerHostOp.GetPid:
+          result = bodies.getPid();
+          break;
+        case WorkerHostOp.SocketSendUnix: {
+          const fd = payload[PAYLOAD_ARGS_WORD + 0];
+          const len = payload[PAYLOAD_ARGS_WORD + 1];
+          const byteStart = (PAYLOAD_ARGS_WORD + 2) * 4;
+          const data = payloadBytes.subarray(byteStart, byteStart + len);
+          result = bodies.socketSendUnix(fd, data);
+          break;
+        }
+        case WorkerHostOp.SocketPair: {
+          const family = payload[PAYLOAD_ARGS_WORD + 0];
+          const sockType = payload[PAYLOAD_ARGS_WORD + 1];
+          const r = bodies.socketPair(family, sockType);
+          result = r.result;
+          outBytes = r.bytes;
+          break;
+        }
+        case WorkerHostOp.SocketRecvUnix: {
+          const fd = payload[PAYLOAD_ARGS_WORD + 0];
+          const cap = payload[PAYLOAD_ARGS_WORD + 1];
+          const peek = payload[PAYLOAD_ARGS_WORD + 2];
+          const r = bodies.socketRecvUnix(fd, cap, peek);
+          result = r.result;
+          outBytes = r.bytes;
+          break;
+        }
+        case WorkerHostOp.SetFdDescriptorFlags:
+          result = bodies.setFdDescriptorFlags(
+            payload[PAYLOAD_ARGS_WORD + 0],
+            payload[PAYLOAD_ARGS_WORD + 1],
+          );
+          break;
+        case WorkerHostOp.ThreadSpawn:
+          result = bodies.threadSpawn(
+            payload[PAYLOAD_ARGS_WORD + 0],
+            payload[PAYLOAD_ARGS_WORD + 1],
+          );
+          break;
         default:
           result = -1;
       }

@@ -115,7 +115,14 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
     // The main instance's table is not callable across Workers.
   }
 
-  spawn(fnPtr: number, arg: number): Promise<number> {
+  /**
+   * Synchronous spawn variant for callers (e.g. the worker-host
+   * dispatcher serving a nested `host_thread_spawn` from a pthread
+   * worker) that must obtain the new tid without awaiting. The
+   * Worker creation itself stays async; the slot is allocated
+   * eagerly so the returned tid is immediately observable.
+   */
+  spawnSync(fnPtr: number, arg: number): number {
     const tid = this.slots.length;
     const slot: SpawnSlot = {
       result: Promise.resolve(-1),
@@ -129,7 +136,11 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
       .finally(() => {
         slot.finished = true;
       });
-    return Promise.resolve(tid);
+    return tid;
+  }
+
+  spawn(fnPtr: number, arg: number): Promise<number> {
+    return Promise.resolve(this.spawnSync(fnPtr, arg));
   }
 
   async join(tid: number): Promise<number> {

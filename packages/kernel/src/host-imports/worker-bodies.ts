@@ -57,7 +57,18 @@
 import type { ProcessKernel } from "../process/kernel.js";
 import type { ThreadsBackend } from "../process/threads/backend.js";
 import type { WorkerHostDispatcherBodies } from "../process/threads/worker-host-proxy.js";
-import type { SocketBackendResult } from "../network/socket-backend.js";
+import type {
+  SocketBackend,
+  SocketBackendResult,
+} from "../network/socket-backend.js";
+import {
+  allocUnixSocketPair,
+  POLLFD_SIZE,
+  POLLNVAL,
+  pollReventsForTarget,
+  recvUnixSocketNonblocking,
+  sendUnixSocket,
+} from "./kernel-imports.js";
 
 /**
  * The worker-host dispatcher is sync (see worker-host-proxy.ts:249).
@@ -100,6 +111,13 @@ export interface MakeWorkerDispatcherBodiesOptions {
    * circuits yield/exit handlers to no-ops.
    */
   threadsBackend: () => ThreadsBackend | null;
+  /**
+   * Socket backend reachable from the dispatcher. Required for the
+   * AF_UNIX socketpair / send_unix bodies that libzmq's signaler
+   * pthread calls on bootstrap; null disables those ops (they'll
+   * return -1 instead of trapping).
+   */
+  socketBackend?: SocketBackend | null;
 }
 
 /**
@@ -229,6 +247,91 @@ export function makeWorkerDispatcherBodies(
       }
       const bytes = probe.data ?? new Uint8Array(0);
       return { result: bytes.byteLength, bytes };
+    },
+    getPid: () => kernel.getVisiblePid(getPid()),
+    socketSendUnix: (fd, data) => {
+      if (!opts.socketBackend) return -1;
+      const copy = new Uint8Array(data);
+      return sendUnixSocket(
+        kernel,
+        opts.socketBackend,
+        getPid(),
+        fd,
+        copy,
+      );
+    },
+    socketPair: (_family, sockType) => {
+      if (!opts.socketBackend) return { result: -1 };
+      const pair = allocUnixSocketPair(
+        kernel,
+        opts.socketBackend,
+        getPid(),
+        sockType,
+      );
+      if (!pair) return { result: -1 };
+      const out = new Uint8Array(8);
+      new DataView(out.buffer).setInt32(0, pair.fdA, true);
+      new DataView(out.buffer).setInt32(4, pair.fdB, true);
+      return { result: 0, bytes: out };
+    },
+    socketRecvUnix: (fd, cap, peek) => {
+      if (!opts.socketBackend) return { result: -1 };
+      return recvUnixSocketNonblocking(
+        kernel,
+        opts.socketBackend,
+        getPid(),
+        fd,
+        cap,
+        peek !== 0,
+      );
+    },
+    setFdDescriptorFlags: (fd, flags) => {
+      if (!kernel.getFdTarget(getPid(), fd)) return -1;
+      kernel.setFdDescriptorFlags(getPid(), fd, flags);
+      return 0;
+    },
+    threadSpawn: (fnPtr, arg) => {
+      const tb = threadsBackend() as
+        | (ThreadsBackend & { spawnSync?: (fp: number, a: number) => number })
+        | null;
+      if (!tb || typeof tb.spawnSync !== "function") return -1;
+      try {
+        return tb.spawnSync(fnPtr, arg);
+      } catch {
+        return -1;
+      }
+    },
+    poll: (nfds, fds) => {
+      // Single-shot readiness probe — the worker-side `host_poll`
+      // import owns the retry/timeout loop. Each pollfd is 8 bytes:
+      // i32 fd, i16 events, i16 revents (revents zeroed on input,
+      // written here, returned to the worker which copies back into
+      // wasm memory). Unknown fds report as not-ready rather than
+      // POLLNVAL: libzmq's poll.cpp asserts `!(revents & POLLNVAL)`
+      // and aborts the whole pthread on a transient lookup miss, so
+      // surfacing the POSIX error here trades a recoverable spin for
+      // an unrecoverable trap. Real "fd never existed" still surfaces
+      // via the syscalls that opened it.
+      const totalBytes = nfds * POLLFD_SIZE;
+      if (fds.byteLength < totalBytes) return { result: -1 };
+      const out = new Uint8Array(totalBytes);
+      out.set(fds.subarray(0, totalBytes));
+      const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+      let ready = 0;
+      void POLLNVAL;
+      for (let i = 0; i < nfds; i++) {
+        const base = i * POLLFD_SIZE;
+        const fd = view.getInt32(base, true);
+        const events = view.getInt16(base + 4, true);
+        let revents = 0;
+        if (fd >= 0) {
+          const target = kernel.getFdTarget(getPid(), fd);
+          revents = target ? pollReventsForTarget(target, events) : 0;
+        }
+        view.setInt16(base + 6, revents, true);
+        if (revents !== 0) ready++;
+      }
+      return { result: ready, bytes: out };
     },
   };
 }

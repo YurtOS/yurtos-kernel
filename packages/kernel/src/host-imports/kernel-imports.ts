@@ -174,12 +174,12 @@ const USER_UID = 1000;
 const USER_GID = 1000;
 const PRIO_PROCESS = 0;
 const YURT_WAIT_NOHANG = 1;
-const POLLIN = 0x0001;
-const POLLOUT = 0x0002;
-const POLLERR = 0x0008;
-const POLLHUP = 0x0010;
-const POLLNVAL = 0x0020;
-const POLLFD_SIZE = 8;
+export const POLLIN = 0x0001;
+export const POLLOUT = 0x0002;
+export const POLLERR = 0x0008;
+export const POLLHUP = 0x0010;
+export const POLLNVAL = 0x0020;
+export const POLLFD_SIZE = 8;
 
 function writeI32(
   memory: WebAssembly.Memory,
@@ -436,7 +436,151 @@ function yieldToScheduler(): Promise<void> {
   return new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
-function pollReventsForTarget(target: FdTarget, events: number): number {
+/**
+ * Allocate a connected AF_UNIX socket pair (stream or dgram) and
+ * register both sides as kernel fds for the caller process. Shared
+ * between `host_socket_socketpair` on main and the worker-host
+ * dispatcher's `socketPair` body, so pthread workers reach the same
+ * kernel state through the proxy.
+ */
+export function allocUnixSocketPair(
+  kernel: ProcessKernel,
+  socketBackend: SocketBackend,
+  callerPid: number,
+  sockType: number,
+): { fdA: number; fdB: number } | null {
+  try {
+    const registry = socketBackend.registry;
+    if (!registry) return null;
+    const pairCreds = kernel.getCredentials(callerPid);
+    const SOCK_DGRAM = 5; // wasi-sdk-30 value passed by C via base_type
+    if (sockType === SOCK_DGRAM) {
+      const { a, b } = registry.openDgramPair();
+      const makeDgramTarget = (rawHandle: number): FdTarget => ({
+        type: "socket",
+        socket: -rawHandle,
+        family: "AF_UNIX",
+        isDgram: true,
+        refs: 1,
+        peerPid: callerPid,
+        peerUid: pairCreds.euid,
+        peerGid: pairCreds.egid,
+        send: socketBackend.send.bind(socketBackend),
+        recv: socketBackend.recv.bind(socketBackend),
+        recvAsync: (socket, maxBytes) =>
+          recvSocketAsync(socketBackend, socket, maxBytes),
+        setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+        close: (_socket) => {
+          registry.closeDgramSocket(rawHandle);
+        },
+      });
+      const fdA = kernel.allocFd(callerPid, makeDgramTarget(a));
+      const fdB = kernel.allocFd(callerPid, makeDgramTarget(b));
+      return { fdA, fdB };
+    }
+    const { a, b } = registry.openUnixPair();
+    const makeTarget = (rawHandle: number): FdTarget => ({
+      type: "socket",
+      socket: -rawHandle,
+      family: "AF_UNIX",
+      refs: 1,
+      peerPid: callerPid,
+      peerUid: pairCreds.euid,
+      peerGid: pairCreds.egid,
+      send: socketBackend.send.bind(socketBackend),
+      recv: socketBackend.recv.bind(socketBackend),
+      recvAsync: (socket, maxBytes) =>
+        recvSocketAsync(socketBackend, socket, maxBytes),
+      setNoDelay: socketBackend.setNoDelay?.bind(socketBackend),
+      close: (socket) => {
+        socketBackend.close(socket);
+      },
+    });
+    const fdA = kernel.allocFd(callerPid, makeTarget(a));
+    const fdB = kernel.allocFd(callerPid, makeTarget(b));
+    return { fdA, fdB };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Nonblocking AF_UNIX recv for pthread workers. Mirrors the
+ * sync-friendly fast-path of `host_socket_recv_unix`: probes the
+ * registry without awaiting and returns {-3} for wrong family,
+ * {-2} for EAGAIN, {-1} for hard errors, or {bytes-read, bytes}.
+ * The pthread side decides whether to retry on -2.
+ */
+export function recvUnixSocketNonblocking(
+  kernel: ProcessKernel,
+  socketBackend: SocketBackend,
+  callerPid: number,
+  sockfd: number,
+  bufCap: number,
+  peek: boolean,
+): { result: number; bytes?: Uint8Array } {
+  const target = kernel.getFdTarget(callerPid, sockfd);
+  if (!target || target.type !== "socket") return { result: -3 };
+  if (target.family !== "AF_UNIX") return { result: -3 };
+  const registry = socketBackend.registry;
+  if (!registry) return { result: -1 };
+
+  if (target.isDgram) {
+    if (target.socket == null) return { result: -1 };
+    const rawHandle = -(target.socket as number);
+    const r = registry.recvDgram(rawHandle, bufCap, true);
+    if (!r.ok) return { result: -2 };
+    const b = (r as { ok: true; bytes: Uint8Array }).bytes;
+    const n = Math.min(b.length, bufCap);
+    return { result: n, bytes: b.subarray(0, n) };
+  }
+
+  const socket = target.socket as number | null;
+  if (socket === null || socket >= 0) return { result: -1 };
+  const regHandle = -socket;
+
+  if (target.peekBuffer && target.peekBuffer.byteLength > 0) {
+    const chunk = target.peekBuffer.slice(0, bufCap);
+    if (!peek) target.peekBuffer = target.peekBuffer.slice(chunk.byteLength);
+    return { result: chunk.byteLength, bytes: chunk };
+  }
+
+  const probe = registry.recv(regHandle, bufCap, { nonblocking: true });
+  if (!probe.ok) return { result: probe.error === "EAGAIN" ? -2 : -1 };
+  if (peek) target.peekBuffer = probe.bytes;
+  return { result: probe.bytes.byteLength, bytes: probe.bytes };
+}
+
+/**
+ * AF_UNIX send for pthread workers. Mirrors the synchronous fast-path of
+ * `host_socket_send_unix` so the worker-host dispatcher can satisfy
+ * libzmq signaler writes without crossing back to main's async surface.
+ */
+export function sendUnixSocket(
+  kernel: ProcessKernel,
+  socketBackend: SocketBackend,
+  callerPid: number,
+  sockfd: number,
+  data: Uint8Array,
+): number {
+  const target = kernel.getFdTarget(callerPid, sockfd);
+  if (!target || target.type !== "socket") return -2;
+  if (target.family !== "AF_UNIX") return -2;
+  const socket = target.socket as number | null;
+  if (socket === null || socket >= 0) return -1;
+  const registry = socketBackend.registry;
+  if (!registry) return -1;
+  if (target.isDgram) {
+    const result = registry.sendDgramToPeer(-socket, new Uint8Array(data));
+    if (!result.ok) return -1;
+    return result.bytesSent;
+  }
+  const result = registry.send(-socket, new Uint8Array(data));
+  if (!result.ok) return -1;
+  return result.bytesSent;
+}
+
+export function pollReventsForTarget(target: FdTarget, events: number): number {
   let revents = 0;
   const wantsRead = (events & POLLIN) !== 0;
   const wantsWrite = (events & POLLOUT) !== 0;
@@ -2861,22 +3005,15 @@ export function createKernelImports(
       bufPtr: number,
       bufLen: number,
     ): number {
-      const target = opts.kernel?.getFdTarget(callerPid, sockfd);
-      if (!target || target.type !== "socket") return -2;
-      if (target.family !== "AF_UNIX") return -2;
-      const socket = target.socket as number | null;
-      if (socket === null || socket >= 0) return -1; // registry sockets are stored negative
-      const registry = socketBackend?.registry;
-      if (!registry) return -1;
+      if (!opts.kernel || !socketBackend) return -1;
       const bytes = new Uint8Array(memory.buffer, bufPtr, bufLen);
-      if (target.isDgram) {
-        const result = registry.sendDgramToPeer(-socket, new Uint8Array(bytes));
-        if (!result.ok) return -1;
-        return result.bytesSent;
-      }
-      const result = registry.send(-socket, new Uint8Array(bytes));
-      if (!result.ok) return -1;
-      return result.bytesSent;
+      return sendUnixSocket(
+        opts.kernel,
+        socketBackend,
+        callerPid,
+        sockfd,
+        bytes,
+      );
     },
 
     // host_socket_recv_unix(sockfd, buf_ptr, buf_cap, peek) -> bytes | -1 | -2 | -3
@@ -3363,63 +3500,18 @@ export function createKernelImports(
       sockType: number,
       svPtr: number,
     ): number {
-      try {
-        if (!opts.kernel || !socketBackend?.registry) return -1;
-        const registry = socketBackend.registry;
-        const pairCreds = opts.kernel.getCredentials(callerPid ?? 0);
-        const SOCK_DGRAM = 5; // wasi-sdk-30 value passed by C via base_type
-        let fdA: number, fdB: number;
-        if (sockType === SOCK_DGRAM) {
-          const { a, b } = registry.openDgramPair();
-          const makeDgramTarget = (rawHandle: number): FdTarget => ({
-            type: "socket",
-            socket: -rawHandle,
-            family: "AF_UNIX",
-            isDgram: true,
-            refs: 1,
-            peerPid: callerPid ?? 0,
-            peerUid: pairCreds.euid,
-            peerGid: pairCreds.egid,
-            send: socketBackend!.send.bind(socketBackend),
-            recv: socketBackend!.recv.bind(socketBackend),
-            recvAsync: (socket, maxBytes) =>
-              recvSocketAsync(socketBackend!, socket, maxBytes),
-            setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
-            close: (_socket) => {
-              registry.closeDgramSocket(rawHandle);
-            },
-          });
-          fdA = opts.kernel.allocFd(callerPid, makeDgramTarget(a));
-          fdB = opts.kernel.allocFd(callerPid, makeDgramTarget(b));
-        } else {
-          const { a, b } = registry.openUnixPair();
-          const makeTarget = (rawHandle: number): FdTarget => ({
-            type: "socket",
-            socket: -rawHandle,
-            family: "AF_UNIX",
-            refs: 1,
-            peerPid: callerPid ?? 0,
-            peerUid: pairCreds.euid,
-            peerGid: pairCreds.egid,
-            send: socketBackend!.send.bind(socketBackend),
-            recv: socketBackend!.recv.bind(socketBackend),
-            recvAsync: (socket, maxBytes) =>
-              recvSocketAsync(socketBackend!, socket, maxBytes),
-            setNoDelay: socketBackend!.setNoDelay?.bind(socketBackend),
-            close: (socket) => {
-              socketBackend!.close(socket);
-            },
-          });
-          fdA = opts.kernel.allocFd(callerPid, makeTarget(a));
-          fdB = opts.kernel.allocFd(callerPid, makeTarget(b));
-        }
-        const view = new DataView(memory.buffer);
-        view.setInt32(svPtr, fdA, true);
-        view.setInt32(svPtr + 4, fdB, true);
-        return 0;
-      } catch {
-        return -1;
-      }
+      if (!opts.kernel || !socketBackend) return -1;
+      const fds = allocUnixSocketPair(
+        opts.kernel,
+        socketBackend,
+        callerPid ?? 0,
+        sockType,
+      );
+      if (!fds) return -1;
+      const view = new DataView(memory.buffer);
+      view.setInt32(svPtr, fds.fdA, true);
+      view.setInt32(svPtr + 4, fds.fdB, true);
+      return 0;
     },
 
     // host_socket_close(fd) -> i32

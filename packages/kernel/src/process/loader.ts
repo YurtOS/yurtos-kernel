@@ -7,6 +7,7 @@ import { Process, type ProcessMode } from "./handle.js";
 import type { PlatformAdapter } from "../platform/adapter.js";
 import type { VfsLike } from "../vfs/vfs-like.js";
 import type { ProcessKernel } from "./kernel.js";
+import type { SocketBackend } from "../network/socket-backend.js";
 import { WasiHost } from "../wasi/wasi-host.js";
 import {
   createBufferTarget,
@@ -157,6 +158,13 @@ export interface LoaderContext {
   vfs: VfsLike;
   adapter: PlatformAdapter;
   kernel: ProcessKernel;
+  /**
+   * Socket backend (registry-based loopback or network bridge). The
+   * loader forwards this to `makeWorkerDispatcherBodies` so pthread
+   * workers can satisfy AF_UNIX socketpair / send_unix via the same
+   * registry the main thread uses.
+   */
+  socketBackend?: SocketBackend;
   allocatePid(argv: string[]): number;
   releasePid(pid: number, exitCode: number, signal?: number): void;
   buildWasiHost(
@@ -269,6 +277,7 @@ export async function loadProcess(
         // See `callerPid` doc-comment on MakeWorkerDispatcherBodiesOptions.
         callerPid: () => pidRef ?? 0,
         threadsBackend: () => threadsBackendRef,
+        socketBackend: ctx.socketBackend ?? null,
       })
       : undefined;
   const workerSabThreads = resolveWorkerSabThreads(

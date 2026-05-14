@@ -349,7 +349,7 @@ export class Sandbox {
     // else can see — clients (and Sandbox.net) would fail to connect.
     const socketBackend: SocketBackend | undefined = options.socketBackend ??
       (options.serverSockets?.allowLoopback === true ||
-        options.serverSockets?.allowUnixDomain === true
+          options.serverSockets?.allowUnixDomain === true
         ? createLoopbackSocketBackend(
           bridge ? createNetworkBridgeSocketBackend(bridge) : undefined,
         )
@@ -1065,6 +1065,7 @@ export class Sandbox {
       vfs,
       adapter,
       kernel,
+      socketBackend,
       allocatePid,
       releasePid: (pid, exitCode, signal) => {
         kernel.releaseProcess(pid, exitCode, signal);
