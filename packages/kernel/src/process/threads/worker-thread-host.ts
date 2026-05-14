@@ -118,6 +118,17 @@ workerSelf.onmessage = async (e: MessageEvent<StartMessage>) => {
   let retval: number;
   try {
     const instance = await WebAssembly.instantiate(module, imports);
+    // wasi-libc threading initialiser. Without this each pthread
+    // Worker's wasm instance keeps the default (zero / main-inherited)
+    // thread-pointer global, so any TLS-keyed runtime — including
+    // cpython's PyThreadState slot — sees the parent thread's value.
+    // ipykernel's heartbeat / iostream threads trip
+    // `_PyThreadState_Attach: non-NULL old thread state` immediately
+    // without it.
+    const initTp = instance.exports.__wasi_init_tp;
+    if (typeof initTp === "function") {
+      (initTp as () => void)();
+    }
     const table = instance.exports.__indirect_function_table;
     if (!(table instanceof WebAssembly.Table)) {
       retval = -1;
