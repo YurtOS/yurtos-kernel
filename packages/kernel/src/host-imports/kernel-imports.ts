@@ -102,11 +102,13 @@ export interface KernelImportsOptions {
   extensionRegistry?: ExtensionRegistry;
 
   /**
-   * Legacy extension handler (sync, used by Worker proxy).
+   * Legacy extension handler (used by Worker proxy).
    * If both extensionRegistry and extensionHandler are provided,
    * extensionRegistry takes precedence.
    */
-  extensionHandler?: (cmd: Record<string, unknown>) => Record<string, unknown>;
+  extensionHandler?: (
+    cmd: Record<string, unknown>,
+  ) => Record<string, unknown> | Promise<Record<string, unknown>>;
 
   /** Called by host_spawn to actually create and start a WASM process.
    *  `parentPid` is the PID of the in-sandbox process making the spawn
@@ -485,10 +487,12 @@ function pollReventsForTarget(target: FdTarget, events: number): number {
           if (
             typeof (probeAwaitable as Promise<unknown>).then !== "function"
           ) {
-            const probe = probeAwaitable as { ok: boolean } & Record<
-              string,
-              unknown
-            >;
+            const probe = probeAwaitable as
+              & { ok: boolean }
+              & Record<
+                string,
+                unknown
+              >;
             if (probe.ok) {
               const data = (probe.data as Uint8Array | undefined) ??
                 new Uint8Array(0);
@@ -3424,8 +3428,7 @@ export function createKernelImports(
     host_socket_close(fd: number): number | Promise<number> {
       const target = opts.kernel?.getFdTarget(callerPid, fd);
       if (!target || target.type !== "socket") return -9;
-      const reap = (): number =>
-        opts.kernel?.closeFd(callerPid, fd) ? 0 : -9;
+      const reap = (): number => opts.kernel?.closeFd(callerPid, fd) ? 0 : -9;
       if (target.socket !== null) {
         if (!socketBackend) return -5;
         const socket = target.socket;
@@ -3612,10 +3615,10 @@ export function createKernelImports(
         }
       }
 
-      // Fall back to legacy extensionHandler (sync)
+      // Fall back to legacy extensionHandler.
       if (opts.extensionHandler) {
         try {
-          const result = opts.extensionHandler(req);
+          const result = await opts.extensionHandler(req);
           const response = result as {
             exitCode?: number;
             exit_code?: number;

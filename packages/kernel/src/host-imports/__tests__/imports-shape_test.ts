@@ -734,6 +734,34 @@ Deno.test("kernel host_extension_invoke accepts native request records", async (
   assertEquals(response.stderr, "warn");
 });
 
+Deno.test("kernel host_extension_invoke awaits async extension handlers", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const request = buildExtensionRequest({
+    name: "async-echo",
+    args: [],
+    stdin: "",
+    cwd: "/tmp",
+    env: {},
+  });
+  new Uint8Array(memory.buffer, 0, request.byteLength).set(request);
+  const imports = createKernelImports({
+    memory,
+    extensionHandler: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      return { exitCode: 0, stdout: "async-ok", stderr: "" };
+    },
+  });
+
+  const written = await (imports.host_extension_invoke as (
+    ...args: number[]
+  ) => Promise<number>)(0, request.byteLength, 4096, 1024);
+  const response = readExtensionResponse(memory, 4096, written);
+
+  assertEquals(response.exitCode, 0);
+  assertEquals(response.stdout, "async-ok");
+  assertEquals(response.stderr, "");
+});
+
 Deno.test("host_chmod allows the file owner and denies non-owners", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const vfs = new VFS({ uid: 1000, gid: 1000 });
