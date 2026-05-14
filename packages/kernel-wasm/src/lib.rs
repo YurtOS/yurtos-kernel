@@ -262,6 +262,11 @@ pub unsafe extern "C" fn kernel_kill(pid: u32, signal: u32) -> i64 {
 /// is `0` for any child or a specific child pid. `flags` uses the same bit
 /// layout as `sys_wait`; bit 0 is WNOHANG.
 ///
+/// This host-control export is currently a nonblocking kernel state query:
+/// when a matching child exists but has not recorded exit yet, it returns
+/// `-EAGAIN` even without WNOHANG. Embedders that need POSIX blocking wait
+/// must suspend at the adapter layer and retry after child progress/exit.
+///
 /// # Safety
 ///
 /// The kernel_host_interface guarantees `out_ptr..out_ptr+out_cap` is a valid writable

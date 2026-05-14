@@ -1666,9 +1666,12 @@ pub fn record_exit(request: &[u8]) -> i64 {
     let pid = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let status = i32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
     with_kernel(|k| {
+        if !k.has_process(pid) {
+            return -(abi::ESRCH as i64);
+        }
         k.process_mut(pid).exit_status = Some(status);
-    });
-    0
+        0
+    })
 }
 
 /// `wait(child_pid, flags) -> (pid, status)`. child_pid==0 means
@@ -7264,6 +7267,16 @@ mod tests {
     }
 
     #[test]
+    fn record_exit_unknown_pid_is_esrch_and_does_not_create_process() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut exit = 1234_u32.to_le_bytes().to_vec();
+        exit.extend_from_slice(&9_i32.to_le_bytes());
+
+        assert_eq!(record_exit(&exit), -(abi::ESRCH as i64));
+        assert!(!crate::kernel::with_kernel(|k| k.has_process(1234)));
+    }
+
+    #[test]
     fn sys_wait_running_child_is_eagain_with_wnohang() {
         let _g = crate::kernel::TestGuard::acquire();
         // Register child but don't record exit — wait returns -EAGAIN
@@ -7275,6 +7288,22 @@ mod tests {
 
         let mut wreq = 0_u32.to_le_bytes().to_vec();
         wreq.extend_from_slice(&1_u32.to_le_bytes()); // WNOHANG
+        let mut wresp = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp),
+            -(abi::EAGAIN as i64)
+        );
+    }
+
+    #[test]
+    fn sys_wait_running_child_without_wnohang_is_documented_eagain_for_now() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut reg = 1_u32.to_le_bytes().to_vec();
+        reg.extend_from_slice(&3_u32.to_le_bytes());
+        register_child(&reg);
+
+        let mut wreq = 0_u32.to_le_bytes().to_vec();
+        wreq.extend_from_slice(&0_u32.to_le_bytes());
         let mut wresp = [0u8; 8];
         assert_eq!(
             dispatch(METHOD_SYS_WAIT, 1, &wreq, &mut wresp),

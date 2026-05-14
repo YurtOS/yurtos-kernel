@@ -123,6 +123,28 @@ describe("JSPI / kh_fetch_blocking", () => {
     );
   });
 
+  it("syscallAsync(SYS_FETCH) preserves non-UTF8 response body bytes", async () => {
+    if (!HAS_JSPI) return;
+    const bytes = await Deno.readFile(KERNEL_WASM);
+    const body = new Uint8Array([0x00, 0x80, 0xff, 0x41, 0x0a]);
+    const host = defaultHostState();
+    host.fetch = async (): Promise<Uint8Array> => {
+      await new Promise<void>((r) => queueMicrotask(r));
+      return fetchResponseRecord(200, body);
+    };
+    const mk = await KernelHostInterface.load(bytes, host);
+
+    const out = await mk.syscallAsync(
+      METHOD.SYS_FETCH,
+      fetchRequestRecord("https://example.invalid/binary", "GET"),
+      8 * 1024,
+    );
+
+    expect(Number(out.rc)).toBeGreaterThan(0);
+    const resp = out.response.subarray(0, Number(out.rc));
+    expect([...fetchResponseBody(resp)]).toEqual([...body]);
+  });
+
   it("fetch denied by mayFetch policy returns -EACCES", async () => {
     if (!HAS_JSPI) return;
     const bytes = await Deno.readFile(KERNEL_WASM);

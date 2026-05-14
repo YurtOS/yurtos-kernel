@@ -263,7 +263,8 @@ export const HOST_BINDINGS: HostBinding[] = [
 
   // ── Wait / process tree ───────────────────────────────────
   // host_wait(pid, flags, outPtr, outCap) — SYS_WAIT writes the kernel-internal
-  // 8-byte record (u32 pid + i32 status). The C ABI expects
+  // 8-byte record (u32 pid + normalized i32 exit status). POSIX wait-status
+  // bit packing is done later in abi/src/yurt_process.c. The C ABI expects
   // yurt_wait_result_v1: i32 pid + i32 exit_code + i32 signal + i32 flags.
   {
     name: "host_wait",
