@@ -93,6 +93,17 @@ function encodeSysSpawnRequest(
   return req;
 }
 
+function encodeTwoPathRequest(
+  first: Uint8Array,
+  second: Uint8Array,
+): Uint8Array {
+  const req = new Uint8Array(4 + first.byteLength + second.byteLength);
+  new DataView(req.buffer).setUint32(0, first.byteLength, true);
+  req.set(first, 4);
+  req.set(second, 4 + first.byteLength);
+  return req;
+}
+
 function spawnFromRamfs(
   mk: KernelHostInterface,
   parentPid: number,
@@ -818,6 +829,45 @@ Deno.test("drainPendingSpawn and recordExit use typed kernel lifecycle exports",
 
   mk.recordExit(childPid, 7);
   assertEquals(mk.waitProcess(parentPid, 0, 0), { pid: childPid, status: 7 });
+});
+
+Deno.test("sys_spawn follows executable symlinks without rewriting argv0", async () => {
+  const mk = await freshKernelHostInterface();
+  const wasmBody = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 2, 3]);
+  mk.registerRamfsFile(s("/usr/bin/hello"), wasmBody);
+  assertEquals(
+    Number(
+      mk.kernelSyscall(
+        METHOD.SYS_SYMLINK,
+        1,
+        encodeTwoPathRequest(s("/usr/bin/hello"), s("/bin/hello-link")),
+        0,
+      ).rc,
+    ),
+    0,
+  );
+
+  const path = s("/bin/hello-link");
+  const argv0 = s("/bin/hello-link");
+  const arg1 = s("world");
+  const parentPid = 1;
+  const childPid = Number(
+    mk.kernelSyscall(
+      METHOD.SYS_SPAWN,
+      parentPid,
+      encodeSysSpawnRequest(path, [argv0, arg1]),
+      0,
+    ).rc,
+  );
+  if (childPid < 1000) {
+    throw new Error(`expected kernel-allocated child pid, got ${childPid}`);
+  }
+
+  const pending = mk.drainPendingSpawn();
+  if (pending === null) throw new Error("expected pending spawn record");
+  assertEquals(pending.childPid, childPid);
+  assertEquals(pending.wasmBytes, wasmBody);
+  assertEquals(pending.argv, [argv0, arg1]);
 });
 
 // ── User-process tests via inline WAT (require wabt) ─────────────────────

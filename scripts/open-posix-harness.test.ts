@@ -3,8 +3,10 @@ import {
   classifyExitCode,
   DEFAULT_CASES,
   outputPathForCase,
+  PROCESS_PROBE_CASES,
   resolveCases,
   yurtCcArgsForCase,
+  yurtCcEnvForCase,
 } from "./open-posix-harness.ts";
 
 Deno.test("open POSIX harness resolves curated cases inside the source tree", async () => {
@@ -77,4 +79,30 @@ Deno.test("open POSIX harness default cases start with pthread smoke coverage", 
   assertStringIncludes(DEFAULT_CASES.join("\n"), "pthread_self/1-1");
   assertStringIncludes(DEFAULT_CASES.join("\n"), "pthread_equal/1-1");
   assertStringIncludes(DEFAULT_CASES.join("\n"), "pthread_create/1-1");
+});
+
+Deno.test("open POSIX harness exposes process conformance probe cases", () => {
+  assertStringIncludes(PROCESS_PROBE_CASES.join("\n"), "fork/4-1");
+  assertStringIncludes(PROCESS_PROBE_CASES.join("\n"), "fork/6-1");
+  assertStringIncludes(PROCESS_PROBE_CASES.join("\n"), "fork/9-1");
+});
+
+Deno.test("open POSIX harness links fork-family cases with the continuation runtime", async () => {
+  const root = await Deno.makeTempDir();
+  await Deno.mkdir(`${root}/conformance/interfaces/fork`, {
+    recursive: true,
+  });
+  await Deno.writeTextFile(
+    `${root}/conformance/interfaces/fork/4-1.c`,
+    "int main(void) { return 0; }\n",
+  );
+  const [testCase] = await resolveCases(root, ["fork/4-1"]);
+
+  const env = yurtCcEnvForCase("/repo", testCase);
+
+  assertEquals(env.YURT_CC_USE_CONTINUATION, "1");
+  assertEquals(
+    env.YURT_CC_CONTINUATION_ARCHIVE,
+    "/repo/abi/build/libyurt_continuation.a",
+  );
 });

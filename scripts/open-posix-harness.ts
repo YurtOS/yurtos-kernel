@@ -12,6 +12,12 @@ export const DEFAULT_CASES = [
   "pthread_create/1-1",
 ];
 
+export const PROCESS_PROBE_CASES = [
+  "fork/4-1",
+  "fork/6-1",
+  "fork/9-1",
+];
+
 export type PosixStatus =
   | "PASS"
   | "FAIL"
@@ -125,6 +131,26 @@ export function yurtCcArgsForCase(input: YurtCcArgsInput): string[] {
   ];
 }
 
+export function yurtCcEnvForCase(
+  repoRootPath: string,
+  testCase: OpenPosixCase,
+): Record<string, string> {
+  const env: Record<string, string> = {
+    YURT_CC_ARCHIVE: resolve(repoRootPath, "abi/build/libyurt_abi.a"),
+  };
+  if (
+    testCase.interfaceName === "fork" ||
+    testCase.interfaceName === "pthread_atfork"
+  ) {
+    env.YURT_CC_CONTINUATION_ARCHIVE = resolve(
+      repoRootPath,
+      "abi/build/libyurt_continuation.a",
+    );
+    env.YURT_CC_USE_CONTINUATION = "1";
+  }
+  return env;
+}
+
 function parseArgs(args: string[]): CliOptions {
   let sourceRoot = Deno.env.get("OPEN_POSIX_SOURCE") ??
     resolve(repoRoot, "test-fixtures/open-posix-test-suite");
@@ -229,9 +255,7 @@ async function buildCase(
   const [command, ...commandArgs] = args;
   const result = await runCommand(command, commandArgs, {
     cwd: repoRoot,
-    env: {
-      YURT_CC_ARCHIVE: resolve(repoRoot, "abi/build/libyurt_abi.a"),
-    },
+    env: yurtCcEnvForCase(repoRoot, testCase),
   });
   if (result.code !== 0) {
     throw new Error(

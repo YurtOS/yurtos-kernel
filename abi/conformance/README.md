@@ -26,7 +26,9 @@ Run the external POSIX subset manually with:
 deno run -A scripts/open-posix-harness.ts
 ```
 
-The default subset is intentionally small and pthread-focused:
-`pthread_self/1-1`, `pthread_equal/1-1`, and `pthread_create/1-1`. Expand it
-only when the corresponding kernel surface has deterministic behavior and
-failures are actionable.
+The default subset is intentionally small and green: `pthread_self/1-1`,
+`pthread_equal/1-1`, and `pthread_create/1-1`. Process probes such as
+`fork/4-1`, `fork/6-1`, and `fork/9-1` are wired for explicit `--cases` runs
+while the fork/exec surface is still being brought up. Promote cases into the
+default only when the corresponding kernel surface has deterministic behavior
+and failures are actionable.

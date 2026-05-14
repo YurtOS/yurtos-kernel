@@ -2759,7 +2759,16 @@ fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
 
     with_kernel(|k| {
         // Read the image bytes from VFS.
-        let Some((mount_id, inode)) = k.vfs.open(&path, 0) else {
+        let mut exec_path: Vec<u8> = path.to_vec();
+        let mut hops = 0u32;
+        while let Some(target) = k.vfs.readlink(&exec_path) {
+            hops += 1;
+            if hops > 40 {
+                return -(abi::EINVAL as i64);
+            }
+            exec_path = target;
+        }
+        let Some((mount_id, inode)) = k.vfs.open(&exec_path, 0) else {
             return -(abi::ENOENT as i64);
         };
         let size = k.vfs.size(mount_id, inode).unwrap_or(0) as usize;
@@ -6628,6 +6637,54 @@ mod tests {
             child_pid_u32,
         );
         assert_eq!(i32::from_le_bytes(wresp[4..8].try_into().unwrap()), 7);
+    }
+
+    #[test]
+    fn sys_spawn_follows_executable_symlink_without_rewriting_argv0() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let body: &[u8] = b"\0asm\x01\x00\x00\x00fake-wasm-through-symlink";
+        let target: &[u8] = b"/usr/bin/hello";
+        let link_path: &[u8] = b"/bin/hello-link";
+        let argv0: &[u8] = b"/bin/hello-link";
+
+        let mut reg = (target.len() as u32).to_le_bytes().to_vec();
+        reg.extend_from_slice(target);
+        reg.extend_from_slice(body);
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let mut symlink_req = (target.len() as u32).to_le_bytes().to_vec();
+        symlink_req.extend_from_slice(target);
+        symlink_req.extend_from_slice(link_path);
+        assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &symlink_req, &mut []), 0);
+
+        let mut sreq = (link_path.len() as u32).to_le_bytes().to_vec();
+        sreq.extend_from_slice(link_path);
+        for arg in [argv0, b"world".as_slice()] {
+            sreq.extend_from_slice(&(arg.len() as u32).to_le_bytes());
+            sreq.extend_from_slice(arg);
+        }
+
+        let child_pid = dispatch(METHOD_SYS_SPAWN, 1, &sreq, &mut []);
+        assert!(
+            child_pid >= 1000,
+            "spawn pid must come from kernel range >= 1000: got {child_pid}",
+        );
+
+        let mut buf = vec![0u8; 1024];
+        let n = drain_spawn(&mut buf);
+        assert!(n > 0, "drain_spawn returned {n}");
+        let wasm_len = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+        assert_eq!(&buf[8..8 + wasm_len], body);
+        let argc_off = 8 + wasm_len;
+        assert_eq!(
+            u32::from_le_bytes(buf[argc_off..argc_off + 4].try_into().unwrap()),
+            2,
+        );
+        let argv0_len_off = argc_off + 4;
+        let argv0_len =
+            u32::from_le_bytes(buf[argv0_len_off..argv0_len_off + 4].try_into().unwrap()) as usize;
+        let argv0_off = argv0_len_off + 4;
+        assert_eq!(&buf[argv0_off..argv0_off + argv0_len], argv0);
     }
 
     #[test]

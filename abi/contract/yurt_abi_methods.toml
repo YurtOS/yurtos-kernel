@@ -89,11 +89,11 @@ doc = "POSIX waitpid-style wait. Request bytes: u32 child_pid LE (0 = wait for a
 #
 # These are the real user-process-facing syscalls — `sys_*` names match
 # the architectural reality (the call lands inside kernel.wasm). The
-# legacy wasm import symbols in `yurt_abi.toml` are still `host_*` for
-# binary compatibility with already-built userland (BusyBox, zsh, …);
-# the kernel-host interface maps each legacy `host_*` import to its `sys_*`
-# method id when forwarding the trampoline call. A future sweep will
-# rename the wasm symbols and recompile userland.
+# current wasm import symbols in `yurt_abi.toml` are still `host_*`
+# while the port is in flight; the kernel-host interface maps each
+# `host_*` import to its `sys_*` method id when forwarding the trampoline
+# call. This is not a compatibility promise for old binaries: current
+# userland should be rebuilt or updated as the ABI names move.
 #
 # Methods land here as they get ported from the TS kernel into
 # kernel.wasm.
