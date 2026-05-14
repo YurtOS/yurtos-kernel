@@ -537,6 +537,47 @@ export function allocUnixSocketPair(
 }
 
 /**
+ * Allocate a fresh AF_INET stream socket fd with the same backend-
+ * wired closures `host_socket_open` installs on the main thread.
+ * Shared between the wasm import and the worker-host dispatcher so
+ * pthread Workers (e.g. ipykernel's Heartbeat thread, libzmq's I/O
+ * reactor) can `socket()` + `bind()` + `accept()` against the same
+ * loopback registry main uses.
+ */
+export function allocInetStreamSocket(
+  kernel: ProcessKernel,
+  socketBackend: SocketBackend | null,
+  callerPid: number,
+  nonblocking = false,
+): number {
+  return kernel.allocFd(callerPid, {
+    type: "socket",
+    socket: null,
+    refs: 1,
+    fdFlags: nonblocking ? WASI_FDFLAGS_NONBLOCK : 0,
+    send: (socket, data) =>
+      socketBackend?.send(socket, data) ??
+        { ok: false, error: "networking not configured" },
+    recv: (socket, maxBytes, recvOpts) =>
+      socketBackend?.recv(socket, maxBytes, recvOpts) ??
+        { ok: false, error: "networking not configured" },
+    recvAsync: (socket, maxBytes) =>
+      socketBackend
+        ? recvSocketAsync(socketBackend, socket, maxBytes)
+        : Promise.resolve({
+          ok: false,
+          error: "networking not configured",
+        }),
+    setNoDelay: (socket, enabled) =>
+      socketBackend?.setNoDelay?.(socket, enabled) ??
+        { ok: false, error: "TCP_NODELAY not supported by socket backend" },
+    close: (socket) => {
+      socketBackend?.close(socket);
+    },
+  });
+}
+
+/**
  * Nonblocking AF_UNIX recv for pthread workers. Mirrors the
  * sync-friendly fast-path of `host_socket_recv_unix`: probes the
  * registry without awaiting and returns {-3} for wrong family,
@@ -2984,30 +3025,12 @@ export function createKernelImports(
           },
         });
       }
-      return opts.kernel.allocFd(callerPid, {
-        type: "socket",
-        socket: null,
-        refs: 1,
-        send: (socket, data) =>
-          socketBackend?.send(socket, data) ??
-            { ok: false, error: "networking not configured" },
-        recv: (socket, maxBytes, recvOpts) =>
-          socketBackend?.recv(socket, maxBytes, recvOpts) ??
-            { ok: false, error: "networking not configured" },
-        recvAsync: (socket, maxBytes) =>
-          socketBackend
-            ? recvSocketAsync(socketBackend, socket, maxBytes)
-            : Promise.resolve({
-              ok: false,
-              error: "networking not configured",
-            }),
-        setNoDelay: (socket, enabled) =>
-          socketBackend?.setNoDelay?.(socket, enabled) ??
-            { ok: false, error: "TCP_NODELAY not supported by socket backend" },
-        close: (socket) => {
-          socketBackend?.close(socket);
-        },
-      });
+      return allocInetStreamSocket(
+        opts.kernel,
+        socketBackend ?? null,
+        callerPid,
+        (type & SOCK_NONBLOCK) !== 0,
+      );
     },
 
     // host_socket_connect(fd, host_ptr, host_len, port, flags) -> i32

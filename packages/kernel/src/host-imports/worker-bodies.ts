@@ -62,6 +62,7 @@ import type {
   SocketBackendResult,
 } from "../network/socket-backend.js";
 import {
+  allocInetStreamSocket,
   allocUnixSocketPair,
   netLog,
   POLLFD_SIZE,
@@ -196,12 +197,40 @@ export function makeWorkerDispatcherBodies(
       if (target?.type === "null") return { result: 0 };
       return { result: -9 };
     },
-    socketOpen: (_domain, _type, _protocol) => {
-      // Worker-side socket creation isn't wired today: libzmq's
-      // signaler thread (the only worker callsite for now) inherits
-      // the socket fd from the main thread. Returning -1 keeps the
-      // dispatcher response well-defined; Task 11+ canaries don't
-      // exercise this path.
+    socketOpen: (domain, type, _protocol) => {
+      // wasi-sdk-30 / yurt-cc abi/include/sys/socket.h numbering:
+      //   AF_INET = 1, AF_UNIX = 3, SOCK_STREAM = 6, SOCK_DGRAM = 5.
+      //   SOCK_NONBLOCK=0x4000 / SOCK_CLOEXEC=0x2000 are OR'd into
+      //   `type`. ipykernel's heartbeat pthread asks for
+      //   AF_INET SOCK_STREAM here (the heartbeat channel binds its
+      //   own ROUTER socket); without this branch libzmq's underlying
+      //   socket() returns -1 and the bind throws "No file
+      //   descriptors available". AF_UNIX paths still go through
+      //   socketpair / socket_open on main today.
+      const AF_INET = 1;
+      const SOCK_STREAM = 6;
+      const SOCK_NONBLOCK = 0x4000;
+      const baseType = type & ~SOCK_NONBLOCK & ~0x2000; // also strip CLOEXEC
+      if (domain === AF_INET && baseType === SOCK_STREAM) {
+        const fd = allocInetStreamSocket(
+          kernel,
+          opts.socketBackend ?? null,
+          getPid(),
+          (type & SOCK_NONBLOCK) !== 0,
+        );
+        netLog("pthread.socket_open", {
+          domain,
+          type,
+          fd,
+          result: "ok",
+        });
+        return fd;
+      }
+      netLog("pthread.socket_open", {
+        domain,
+        type,
+        result: "ENOTSUP (worker)",
+      });
       return -1;
     },
     socketClose: (fd) => {
