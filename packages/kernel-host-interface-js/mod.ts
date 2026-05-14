@@ -243,6 +243,10 @@ export interface PendingSpawn {
 
 export interface ExtensionRegistry {
   invoke(request: Uint8Array, responseCap: number): Uint8Array | number;
+  invokeAsync?(
+    request: Uint8Array,
+    responseCap: number,
+  ): Promise<Uint8Array | number>;
 }
 
 export interface LogSink {
@@ -2369,6 +2373,37 @@ export class KernelHostInterface {
     // that's the gating that matters for "will any specific kh
     // call actually suspend."
     const wantsAsync = hasJspi;
+    if (wantsAsync && hostState.extensions.invokeAsync != null) {
+      const invokeAsync = hostState.extensions.invokeAsync.bind(
+        hostState.extensions,
+      );
+      khImports.kh_extension_invoke = new W.Suspending(
+        async (
+          reqPtr: number,
+          reqLen: number,
+          outPtr: number,
+          outCap: number,
+        ): Promise<bigint> => {
+          const memBuf = () => memoryRef.memory!.buffer;
+          const request = new Uint8Array(memBuf(), reqPtr, reqLen).slice();
+          if (
+            hostBox.state.policy.mayInvokeExtension?.(request) === "deny"
+          ) {
+            return BigInt(-EACCES);
+          }
+          let result: Uint8Array | number;
+          try {
+            result = await invokeAsync(request, outCap);
+          } catch (_e) {
+            return BigInt(-EIO);
+          }
+          if (typeof result === "number") return BigInt(result);
+          if (result.byteLength > outCap) return BigInt(-EFAULT);
+          new Uint8Array(memBuf(), outPtr, result.byteLength).set(result);
+          return BigInt(result.byteLength);
+        },
+      );
+    }
     if (wantsAsync && hostState.fetch != null) {
       const fetchImpl = hostState.fetch;
       // The Suspending wrapper takes an async function; the wasm
