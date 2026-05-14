@@ -296,6 +296,34 @@ export class ProcessKernel {
     return fd;
   }
 
+  async openVfsFileAsync(
+    pid: number,
+    vfs: VfsLike,
+    path: string,
+    mode: OpenMode,
+    preferredFd?: number,
+  ): Promise<number> {
+    const processFds = this.getFdTable(pid);
+    const fd = preferredFd !== undefined && !processFds.has(preferredFd)
+      ? preferredFd
+      : this.nextLowestFd(pid, 0);
+    const credentials = this.getCredentials(pid);
+    const openFile = new FdTable(vfs, {
+      uid: credentials.euid,
+      gid: credentials.egid,
+    });
+    let vfsFd = await openFile.openAsync(path, mode);
+    if (vfsFd !== fd) {
+      openFile.renumber(vfsFd, fd);
+      vfsFd = fd;
+    }
+    processFds.set(fd, createVfsFileTarget(openFile, vfsFd));
+    this.fdDescriptorFlags.get(pid)?.delete(fd);
+    const nextFd = this.nextFds.get(pid) ?? KERNEL_FD_BASE;
+    if (fd >= nextFd) this.nextFds.set(pid, fd + 1);
+    return fd;
+  }
+
   vfsFilePath(pid: number, fd: number): string | null {
     return this.vfsPathForFd(pid, fd);
   }
@@ -314,6 +342,15 @@ export class ProcessKernel {
   writeVfsFile(pid: number, fd: number, data: Uint8Array): number {
     const target = this.requireVfsFileTarget(pid, fd);
     return target.fdTable.write(target.fd, data);
+  }
+
+  async writeVfsFileAsync(
+    pid: number,
+    fd: number,
+    data: Uint8Array,
+  ): Promise<number> {
+    const target = this.requireVfsFileTarget(pid, fd);
+    return await target.fdTable.writeAsync(target.fd, data);
   }
 
   preadVfsFile(

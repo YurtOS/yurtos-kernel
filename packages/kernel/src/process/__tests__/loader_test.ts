@@ -524,6 +524,98 @@ Deno.test("loadProcess keeps JSPI WASI wrapping to imports proven safe", async (
   }
 });
 
+Deno.test("loadProcess wraps threaded JSPI WASI path imports", async () => {
+  const ctx = await makeLoaderContext({
+    moduleCache: fixedModuleCache(makeThreadedImportedSharedMemoryModule()),
+  });
+  const originalSuspending = WebAssembly.Suspending;
+  const originalPromising = WebAssembly.promising;
+  type ImportFunction = (...args: unknown[]) => unknown;
+  const wrapped = new WeakSet<ImportFunction>();
+  class FakeSuspending {
+    constructor(fn: ImportFunction) {
+      wrapped.add(fn);
+      return fn;
+    }
+  }
+  Object.defineProperty(WebAssembly, "Suspending", {
+    value: FakeSuspending,
+    configurable: true,
+  });
+  Object.defineProperty(WebAssembly, "promising", {
+    value: undefined,
+    configurable: true,
+  });
+
+  let wasiImports:
+    | Record<string, WebAssembly.ImportValue>
+    | undefined;
+  const adapter: PlatformAdapter = {
+    ...ctx.adapter,
+    instantiate: (_module, imports) => {
+      wasiImports = imports.wasi_snapshot_preview1 as Record<
+        string,
+        WebAssembly.ImportValue
+      >;
+      return Promise.resolve({
+        exports: {
+          memory: new WebAssembly.Memory({
+            initial: 1,
+            maximum: 1,
+            shared: true,
+          }),
+          _start: () => {},
+        },
+      } as WebAssembly.Instance);
+    },
+  };
+
+  try {
+    await loadProcess({ ...ctx, adapter }, {
+      argv: ["/bin/true"],
+      mode: "cli",
+      workerSabAvailable: true,
+      workerSabMemory: new WebAssembly.Memory({
+        initial: 1,
+        maximum: 1,
+        shared: true,
+      }),
+      workerSabThreads: {
+        spawnThread: () => Promise.resolve(0),
+      },
+    });
+  } finally {
+    Object.defineProperty(WebAssembly, "Suspending", {
+      value: originalSuspending,
+      configurable: true,
+    });
+    Object.defineProperty(WebAssembly, "promising", {
+      value: originalPromising,
+      configurable: true,
+    });
+  }
+
+  assert(wasiImports);
+  for (
+    const name of [
+      "path_create_directory",
+      "path_filestat_get",
+      "path_open",
+      "path_readlink",
+      "path_remove_directory",
+      "path_rename",
+      "path_symlink",
+      "path_unlink_file",
+    ]
+  ) {
+    assertEquals(
+      wrapped.has(wasiImports[name] as ImportFunction),
+      true,
+      `${name} should be wrapped for threaded JSPI suspension`,
+    );
+  }
+});
+
 function nonThreadedProfile(): YurtModuleProfile {
   return {
     importsSetjmp: false,

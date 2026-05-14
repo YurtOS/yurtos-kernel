@@ -38,6 +38,15 @@ interface FdEntry {
 
 const FIRST_FD = 3; // 0 = stdin, 1 = stdout, 2 = stderr
 
+type AsyncFdVfs = VfsLike & {
+  readFileAsync?: (path: string) => Promise<Uint8Array>;
+  writeFileAsync?: (
+    path: string,
+    data: Uint8Array,
+    mode?: number,
+  ) => Promise<void>;
+};
+
 /**
  * File descriptor table that maps integer fds to open file state.
  *
@@ -118,6 +127,53 @@ export class FdTable {
     return fd;
   }
 
+  /** Async variant for worker-side VFS proxies. */
+  async openAsync(path: string, mode: OpenMode): Promise<number> {
+    const stream = this.vfs.streamFile?.(path) ?? null;
+    if (stream) {
+      return this.open(path, mode);
+    }
+
+    const vfs = this.vfs as AsyncFdVfs;
+    let buffer: Uint8Array;
+
+    if (mode === "r" || mode === "rw") {
+      const data = vfs.readFileAsync
+        ? await vfs.readFileAsync(path)
+        : vfs.readFile(path);
+      buffer = new Uint8Array(data);
+    } else if (mode === "a") {
+      try {
+        const existing = vfs.readFileAsync
+          ? await vfs.readFileAsync(path)
+          : vfs.readFile(path);
+        buffer = new Uint8Array(existing);
+      } catch {
+        buffer = new Uint8Array(0);
+      }
+    } else {
+      buffer = new Uint8Array(0);
+    }
+
+    const offset = mode === "a" ? buffer.byteLength : 0;
+    const fd = this.nextFd++;
+    const entry: FdEntry = {
+      path,
+      mode,
+      buffer,
+      offset,
+      dirty: mode === "w" || mode === "a",
+      refs: 1,
+      credential: this.credential,
+    };
+    if (mode === "w") {
+      await this.flushEntryAsync(entry);
+    }
+    this.entries.set(fd, entry);
+
+    return fd;
+  }
+
   /** Read from an open fd into buf. Returns the number of bytes read. */
   read(fd: number, buf: Uint8Array): number {
     const entry = this.getEntry(fd);
@@ -184,6 +240,50 @@ export class FdTable {
         entry.dirty = previousDirty;
       },
     );
+    return data.byteLength;
+  }
+
+  /** Async write variant for worker-side VFS proxies. */
+  async writeAsync(fd: number, data: Uint8Array): Promise<number> {
+    const entry = this.getEntry(fd);
+    if (entry.streamWrite) {
+      return entry.streamWrite(data);
+    }
+    const newLength = Math.max(
+      entry.buffer.byteLength,
+      entry.offset + data.byteLength,
+    );
+
+    const previousOffset = entry.offset;
+    const previousDirty = entry.dirty;
+    const previousLength = entry.buffer.byteLength;
+    const overwriteStart = entry.offset;
+    const overwriteEnd = Math.min(
+      previousLength,
+      entry.offset + data.byteLength,
+    );
+    const overwritten = entry.buffer.slice(overwriteStart, overwriteEnd);
+
+    try {
+      if (newLength > entry.buffer.byteLength) {
+        const grown = new Uint8Array(newLength);
+        grown.set(entry.buffer);
+        entry.buffer = grown;
+      }
+
+      entry.buffer.set(data, entry.offset);
+      entry.offset += data.byteLength;
+      entry.dirty = true;
+      await this.flushEntryAsync(entry);
+    } catch (err) {
+      this.restoreBufferLength(entry, previousLength);
+      if (overwritten.byteLength > 0) {
+        entry.buffer.set(overwritten, overwriteStart);
+      }
+      entry.offset = previousOffset;
+      entry.dirty = previousDirty;
+      throw err;
+    }
     return data.byteLength;
   }
 
@@ -445,6 +545,25 @@ export class FdTable {
       entry,
       () => this.vfs.writeFile(entry.path, entry.buffer.slice()),
     );
+    entry.dirty = false;
+  }
+
+  private async flushEntryAsync(entry: FdEntry): Promise<void> {
+    if (!entry.dirty) return;
+    const vfs = this.vfs as AsyncFdVfs;
+    if (entry.credential && this.vfs.withCredential) {
+      await this.vfs.withCredential(
+        entry.credential,
+        () =>
+          vfs.writeFileAsync
+            ? vfs.writeFileAsync(entry.path, entry.buffer.slice())
+            : vfs.writeFile(entry.path, entry.buffer.slice()),
+      );
+    } else if (vfs.writeFileAsync) {
+      await vfs.writeFileAsync(entry.path, entry.buffer.slice());
+    } else {
+      vfs.writeFile(entry.path, entry.buffer.slice());
+    }
     entry.dirty = false;
   }
 

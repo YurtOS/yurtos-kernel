@@ -4,6 +4,7 @@ import { WasiExitError, WasiHost } from "../wasi-host.js";
 import { VFS } from "../../vfs/vfs.js";
 import { ProcessKernel } from "../../process/kernel.js";
 import { createAsyncPipe } from "../../vfs/pipe.js";
+import type { VfsLike } from "../../vfs/vfs-like.js";
 import type { FdTarget } from "../fd-target.js";
 import {
   WASI_EBADF,
@@ -172,7 +173,7 @@ describe("WasiHost", () => {
       const writePromise = wasi.fd_write(4, 100, 1, 300) as Promise<number>;
       const received: number[] = [];
       for (let i = 0; i < 3; i++) {
-        await new Promise(resolve => setTimeout(resolve, 0));
+        await new Promise((resolve) => setTimeout(resolve, 0));
         const chunk = new Uint8Array(8);
         const n = await readEnd.read(chunk);
         received.push(...chunk.subarray(0, n));
@@ -181,7 +182,9 @@ describe("WasiHost", () => {
       const errno = await writePromise;
       expect(errno).toBe(WASI_ESUCCESS);
       expect(view.getUint32(300, true)).toBe(payload.length);
-      expect(new TextDecoder().decode(new Uint8Array(received))).toBe("abcdefghijklmnopqrst");
+      expect(new TextDecoder().decode(new Uint8Array(received))).toBe(
+        "abcdefghijklmnopqrst",
+      );
     });
 
     it("delivers SIGPIPE when the read end is closed", async () => {
@@ -544,6 +547,113 @@ describe("WasiHost", () => {
       expect(fd).toBeGreaterThanOrEqual(4);
     });
 
+    it("awaits async VFS path operations when opening a file", async () => {
+      vfs.writeFile("/tmp/async.txt", new TextEncoder().encode("content"));
+      const asyncVfs = Object.create(vfs) as VfsLike & {
+        isAsyncVfs: true;
+        statAsync(path: string): Promise<ReturnType<VFS["stat"]>>;
+        readFileAsync(path: string): Promise<Uint8Array>;
+        writeFileAsync(
+          path: string,
+          data: Uint8Array,
+          mode?: number,
+        ): Promise<void>;
+      };
+      asyncVfs.isAsyncVfs = true;
+      asyncVfs.statAsync = (path: string) => Promise.resolve(vfs.stat(path));
+      asyncVfs.readFileAsync = (path: string) =>
+        Promise.resolve(vfs.readFile(path));
+      asyncVfs.writeFileAsync = (
+        path: string,
+        data: Uint8Array,
+        mode?: number,
+      ) => Promise.resolve(vfs.writeFile(path, data, mode));
+      host = new WasiHost({
+        vfs: asyncVfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+      });
+      host.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = "tmp/async.txt";
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+
+      const errno = wasi.path_open(
+        3,
+        0,
+        500,
+        pathStr.length,
+        0,
+        BigInt(0),
+        BigInt(0),
+        0,
+        400,
+      );
+      expect(errno).toBeInstanceOf(Promise);
+      expect(await errno).toBe(WASI_ESUCCESS);
+      const fd = view.getUint32(400, true);
+      expect(fd).toBeGreaterThanOrEqual(4);
+    });
+
+    it("awaits async VFS writes for files opened through path_open", async () => {
+      const asyncVfs = Object.create(vfs) as VfsLike & {
+        isAsyncVfs: true;
+        statAsync(path: string): Promise<ReturnType<VFS["stat"]>>;
+        readFileAsync(path: string): Promise<Uint8Array>;
+        writeFileAsync(
+          path: string,
+          data: Uint8Array,
+          mode?: number,
+        ): Promise<void>;
+      };
+      asyncVfs.isAsyncVfs = true;
+      asyncVfs.statAsync = (path: string) => Promise.resolve(vfs.stat(path));
+      asyncVfs.readFileAsync = (path: string) =>
+        Promise.resolve(vfs.readFile(path));
+      asyncVfs.writeFileAsync = (
+        path: string,
+        data: Uint8Array,
+        mode?: number,
+      ) => Promise.resolve(vfs.writeFile(path, data, mode));
+      host = new WasiHost({
+        vfs: asyncVfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+      });
+      host.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = "tmp/async-write.txt";
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+      const openErrno = wasi.path_open(
+        3,
+        0,
+        500,
+        pathStr.length,
+        9,
+        BigInt(0),
+        BigInt(0),
+        0,
+        400,
+      );
+      expect(await openErrno).toBe(WASI_ESUCCESS);
+      const fd = view.getUint32(400, true);
+
+      bytes.set(new TextEncoder().encode("hello"), 700);
+      view.setUint32(600, 700, true);
+      view.setUint32(604, 5, true);
+      const writeErrno = wasi.fd_write(fd, 600, 1, 800);
+
+      expect(writeErrno).toBeInstanceOf(Promise);
+      expect(await writeErrno).toBe(WASI_ESUCCESS);
+      expect(view.getUint32(800, true)).toBe(5);
+      expect(new TextDecoder().decode(vfs.readFile("/tmp/async-write.txt")))
+        .toBe("hello");
+    });
+
     it("creates a new file with CREAT flag", () => {
       const { wasi, view, bytes } = getImportsAndView(host, memory);
 
@@ -875,6 +985,44 @@ describe("WasiHost", () => {
       expect(Number((meta >> 40n) & 0xffffffn)).toBe(1000);
     });
 
+    it("awaits async VFS stat operations", async () => {
+      vfs.writeFile("/tmp/async-stat.txt", new TextEncoder().encode("content"));
+      const asyncVfs = Object.create(vfs) as VfsLike & {
+        isAsyncVfs: true;
+        statAsync(path: string): Promise<ReturnType<VFS["stat"]>>;
+        lstatAsync(path: string): Promise<ReturnType<VFS["lstat"]>>;
+        readlinkAsync(path: string): Promise<string>;
+      };
+      asyncVfs.isAsyncVfs = true;
+      asyncVfs.statAsync = (path: string) => Promise.resolve(vfs.stat(path));
+      asyncVfs.lstatAsync = (path: string) => Promise.resolve(vfs.lstat(path));
+      asyncVfs.readlinkAsync = (path: string) =>
+        Promise.resolve(vfs.readlink(path));
+      host = new WasiHost({
+        vfs: asyncVfs,
+        args: ["program"],
+        env: {},
+        preopens: { "/": "/" },
+      });
+      host.setMemory(memory);
+      const { wasi, view, bytes } = getImportsAndView(host, memory);
+
+      const pathStr = "tmp/async-stat.txt";
+      bytes.set(new TextEncoder().encode(pathStr), 500);
+      const errno = wasi.path_filestat_get(
+        3,
+        1,
+        500,
+        pathStr.length,
+        520,
+      );
+
+      expect(errno).toBeInstanceOf(Promise);
+      expect(await errno).toBe(WASI_ESUCCESS);
+      expect(view.getUint8(536)).toBe(WASI_FILETYPE_REGULAR_FILE);
+      expect(view.getBigUint64(552, true)).toBe(BigInt(7));
+    });
+
     it("returns stat info for a directory", () => {
       const { wasi, view, bytes } = getImportsAndView(host, memory);
 
@@ -901,7 +1049,13 @@ describe("WasiHost", () => {
       bytes.set(new TextEncoder().encode("tmp/stat-cwd"), 500);
       bytes.set(new TextEncoder().encode("/"), 600);
 
-      const dotErrno = wasi.path_filestat_get(3, 0, 500, "tmp/stat-cwd".length, 100);
+      const dotErrno = wasi.path_filestat_get(
+        3,
+        0,
+        500,
+        "tmp/stat-cwd".length,
+        100,
+      );
       const rootErrno = wasi.path_filestat_get(3, 0, 600, 1, 200);
 
       expect(dotErrno).toBe(WASI_ESUCCESS);
@@ -927,7 +1081,13 @@ describe("WasiHost", () => {
       bytes.set(new TextEncoder().encode("/tmp/stat-dot-cwd"), 600);
 
       const dotErrno = wasi.path_filestat_get(3, 0, 500, 1, 100);
-      const cwdErrno = wasi.path_filestat_get(3, 0, 600, "/tmp/stat-dot-cwd".length, 200);
+      const cwdErrno = wasi.path_filestat_get(
+        3,
+        0,
+        600,
+        "/tmp/stat-dot-cwd".length,
+        200,
+      );
 
       expect(dotErrno).toBe(WASI_ESUCCESS);
       expect(cwdErrno).toBe(WASI_ESUCCESS);
@@ -968,7 +1128,13 @@ describe("WasiHost", () => {
       bytes.set(new TextEncoder().encode(targetPath), 500);
       bytes.set(new TextEncoder().encode(linkPath), 600);
 
-      const targetErrno = wasi.path_filestat_get(3, 1, 500, targetPath.length, 100);
+      const targetErrno = wasi.path_filestat_get(
+        3,
+        1,
+        500,
+        targetPath.length,
+        100,
+      );
       const linkErrno = wasi.path_filestat_get(3, 1, 600, linkPath.length, 200);
 
       expect(targetErrno).toBe(WASI_ESUCCESS);

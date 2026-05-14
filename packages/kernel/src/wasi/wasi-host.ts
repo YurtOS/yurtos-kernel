@@ -12,6 +12,7 @@ import type { OpenMode, SeekWhence } from "../vfs/fd-table.js";
 import { KERNEL_FD_BASE, type ProcessKernel } from "../process/kernel.ts";
 import { VfsError } from "../vfs/inode.js";
 import type { InodeType } from "../vfs/inode.js";
+import type { DirEntry, StatResult } from "../vfs/inode.js";
 import type { VfsLike } from "../vfs/vfs-like.js";
 import type { ListenerRegistry } from "../network/listener-registry.js";
 import type { SocketBackendResult } from "../network/socket-backend.js";
@@ -75,6 +76,26 @@ const YURT_STAT_MODE_BITS = 16n;
 const YURT_STAT_UID_BITS = 24n;
 const YURT_STAT_MODE_MASK = (1n << YURT_STAT_MODE_BITS) - 1n;
 const YURT_STAT_ID_MASK = (1n << YURT_STAT_UID_BITS) - 1n;
+
+type AsyncVfsLike = VfsLike & {
+  isAsyncVfs?: true;
+  readFileAsync?: (path: string) => Promise<Uint8Array>;
+  writeFileAsync?: (
+    path: string,
+    data: Uint8Array,
+    mode?: number,
+  ) => Promise<void>;
+  statAsync?: (path: string) => Promise<StatResult>;
+  lstatAsync?: (path: string) => Promise<StatResult>;
+  readdirAsync?: (path: string) => Promise<DirEntry[]>;
+  mkdirAsync?: (path: string, mode?: number) => Promise<void>;
+  mkdirpAsync?: (path: string) => Promise<void>;
+  unlinkAsync?: (path: string) => Promise<void>;
+  rmdirAsync?: (path: string) => Promise<void>;
+  renameAsync?: (oldPath: string, newPath: string) => Promise<void>;
+  symlinkAsync?: (target: string, path: string) => Promise<void>;
+  readlinkAsync?: (path: string) => Promise<string>;
+};
 
 function closeFdTarget(target: FdTarget): void {
   if (target.type === "pipe_write") target.pipe.close();
@@ -176,6 +197,44 @@ function canonicalStatPath(vfs: VfsLike, absPath: string): string {
 
   const canonical = "/" + resolved.join("/");
   vfs.stat(canonical);
+  return canonical === "" ? "/" : canonical;
+}
+
+async function canonicalStatPathAsync(
+  vfs: AsyncVfsLike,
+  absPath: string,
+): Promise<string> {
+  let queue = splitVfsPath(absPath);
+  const resolved: string[] = [];
+  let symlinkDepth = 0;
+
+  while (queue.length > 0) {
+    const part = queue.shift()!;
+    const candidate = "/" + [...resolved, part].join("/");
+    const stat = vfs.lstatAsync
+      ? await vfs.lstatAsync(candidate)
+      : vfs.lstat(candidate);
+    if (stat.type !== "symlink") {
+      resolved.push(part);
+      continue;
+    }
+    if (++symlinkDepth > 40) throw new Error("ELOOP: too many symlink levels");
+    const target = vfs.readlinkAsync
+      ? await vfs.readlinkAsync(candidate)
+      : vfs.readlink(candidate);
+    const targetPath = target.startsWith("/")
+      ? target
+      : `${dirnameOfVfsPath(candidate)}/${target}`;
+    queue = [...splitVfsPath(targetPath), ...queue];
+    resolved.length = 0;
+  }
+
+  const canonical = "/" + resolved.join("/");
+  if (vfs.statAsync) {
+    await vfs.statAsync(canonical);
+  } else {
+    vfs.stat(canonical);
+  }
   return canonical === "" ? "/" : canonical;
 }
 
@@ -944,6 +1003,24 @@ export class WasiHost {
     }
   }
 
+  private async pathExistsAsync(
+    path: string,
+    vfs: AsyncVfsLike,
+  ): Promise<boolean> {
+    try {
+      if (vfs.statAsync) await vfs.statAsync(path);
+      else vfs.stat(path);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private asyncVfs(): AsyncVfsLike | null {
+    const vfs = this.vfs as AsyncVfsLike;
+    return vfs.isAsyncVfs ? vfs : null;
+  }
+
   private currentCwd(): string {
     return this.kernel && this.pid !== undefined
       ? this.kernel.getCwd(this.pid)
@@ -1075,11 +1152,24 @@ export class WasiHost {
           }
           case "vfs_file": {
             try {
-              totalWritten += this.withVfsCredentials(() =>
-                this.kernel && this.pid !== undefined
-                  ? this.kernel.writeVfsFile(this.pid, fd, data)
-                  : target.fdTable.write(target.fd, data)
-              );
+              const asyncVfs = this.asyncVfs();
+              if (asyncVfs) {
+                const written = this.kernel && this.pid !== undefined
+                  ? this.kernel.writeVfsFileAsync(this.pid, fd, data)
+                  : target.fdTable.writeAsync(target.fd, data);
+                return written.then((n) => {
+                  totalWritten += n;
+                  const viewAfter = this.getView();
+                  viewAfter.setUint32(nwrittenPtr, totalWritten, true);
+                  return WASI_ESUCCESS;
+                }, fdErrorToWasi);
+              } else {
+                totalWritten += this.withVfsCredentials(() =>
+                  this.kernel && this.pid !== undefined
+                    ? this.kernel.writeVfsFile(this.pid, fd, data)
+                    : target.fdTable.write(target.fd, data)
+                );
+              }
             } catch (err) {
               return fdErrorToWasi(err);
             }
@@ -1143,9 +1233,19 @@ export class WasiHost {
       } else {
         // No I/O target — fall through to VFS file write
         try {
-          totalWritten += this.withVfsCredentials(() =>
-            this.fdTable.write(fd, data)
-          );
+          const asyncVfs = this.asyncVfs();
+          if (asyncVfs) {
+            return this.fdTable.writeAsync(fd, data).then((n) => {
+              totalWritten += n;
+              const viewAfter = this.getView();
+              viewAfter.setUint32(nwrittenPtr, totalWritten, true);
+              return WASI_ESUCCESS;
+            }, fdErrorToWasi);
+          } else {
+            totalWritten += this.withVfsCredentials(() =>
+              this.fdTable.write(fd, data)
+            );
+          }
         } catch (err) {
           return fdErrorToWasi(err);
         }
@@ -1860,7 +1960,19 @@ export class WasiHost {
     _rightsInheriting: bigint,
     fdflags: number,
     fdPtr: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.pathOpenAsync(
+        dirFd,
+        pathPtr,
+        pathLen,
+        oflags,
+        fdflags,
+        fdPtr,
+        asyncVfs,
+      );
+    }
     this.checkDeadline();
     try {
       const relativePath = this.readString(pathPtr, pathLen);
@@ -2010,6 +2122,185 @@ export class WasiHost {
     }
   }
 
+  private async pathOpenAsync(
+    dirFd: number,
+    pathPtr: number,
+    pathLen: number,
+    oflags: number,
+    fdflags: number,
+    fdPtr: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    try {
+      const relativePath = this.readString(pathPtr, pathLen);
+      let absPath = this.resolvePath(dirFd, relativePath);
+
+      const wantCreate = (oflags & WASI_OFLAGS_CREAT) !== 0;
+      const wantTrunc = (oflags & WASI_OFLAGS_TRUNC) !== 0;
+      const wantExcl = (oflags & WASI_OFLAGS_EXCL) !== 0;
+      const wantDir = (oflags & WASI_OFLAGS_DIRECTORY) !== 0;
+      const wantAppend = (fdflags & WASI_FDFLAGS_APPEND) !== 0;
+
+      if (absPath === "/dev/tty") {
+        if (wantDir || wantCreate || wantTrunc) return WASI_EINVAL;
+        if (!this.kernel || this.pid === undefined) return WASI_ENOENT;
+        const state = this.kernel.getControllingTtyState(this.pid);
+        if (!state) return WASI_ENOENT;
+        if (this.openFdCount() >= this.nofileSoftLimit()) return WASI_EMFILE;
+
+        const fd = this.allocateIoFd(createTtySlaveTarget(state));
+        const view = this.getView();
+        view.setUint32(fdPtr, fd, true);
+        return WASI_ESUCCESS;
+      }
+
+      const procFd = this.resolveProcFdAlias(absPath);
+      if (procFd !== null) {
+        if (wantDir) return WASI_EINVAL;
+        if (!this.kernel || this.pid === undefined) return WASI_ENOENT;
+        try {
+          const fd = this.kernel.dupFromProcess(
+            this.pid,
+            procFd.pid,
+            procFd.fd,
+          );
+          const view = this.getView();
+          view.setUint32(fdPtr, fd, true);
+          return WASI_ESUCCESS;
+        } catch {
+          return WASI_EBADF;
+        }
+      }
+
+      if (wantDir) {
+        const stat = vfs.statAsync
+          ? await vfs.statAsync(absPath)
+          : vfs.stat(absPath);
+        if (stat.type !== "dir") {
+          return WASI_EINVAL;
+        }
+        const fakeFd = this.allocateDirFd(absPath);
+        const view = this.getView();
+        view.setUint32(fdPtr, fakeFd, true);
+        return WASI_ESUCCESS;
+      }
+
+      let mode: OpenMode;
+      if (wantAppend) {
+        if (!wantCreate && !(await this.pathExistsAsync(absPath, vfs))) {
+          return WASI_ENOENT;
+        }
+        mode = "a";
+      } else if (wantCreate && wantTrunc) {
+        if (wantExcl && await this.pathExistsAsync(absPath, vfs)) {
+          return WASI_EEXIST;
+        }
+        mode = "w";
+      } else if (wantCreate) {
+        if (wantExcl && await this.pathExistsAsync(absPath, vfs)) {
+          return WASI_EEXIST;
+        }
+        mode = "rw";
+        try {
+          if (vfs.statAsync) await vfs.statAsync(absPath);
+          else vfs.stat(absPath);
+        } catch {
+          if (vfs.writeFileAsync) {
+            await vfs.writeFileAsync(
+              absPath,
+              new Uint8Array(0),
+              this.creationMode(0o666),
+            );
+          } else {
+            vfs.writeFile(
+              absPath,
+              new Uint8Array(0),
+              this.creationMode(0o666),
+            );
+          }
+        }
+      } else {
+        mode = "r";
+      }
+
+      if (mode === "w" || mode === "a") {
+        if ((oflags & WASI_OFLAGS_DIRECTORY) === 0) {
+          try {
+            const stat = vfs.statAsync
+              ? await vfs.statAsync(absPath)
+              : vfs.stat(absPath);
+            if (
+              stat.type === "dir" &&
+              !relativePath.includes("/") &&
+              this.currentCwd() !== "/"
+            ) {
+              const cwdCandidate = joinVfsPath(
+                this.currentCwd(),
+                relativePath,
+              );
+              if (
+                cwdCandidate !== absPath &&
+                await this.pathExistsAsync(parentPath(cwdCandidate), vfs)
+              ) {
+                absPath = cwdCandidate;
+              }
+            }
+          } catch {
+            // Missing targets are created below after the final path is chosen.
+          }
+        }
+        try {
+          if (vfs.statAsync) await vfs.statAsync(absPath);
+          else vfs.stat(absPath);
+        } catch {
+          if (vfs.writeFileAsync) {
+            await vfs.writeFileAsync(
+              absPath,
+              new Uint8Array(0),
+              this.creationMode(0o666),
+            );
+          } else {
+            vfs.writeFile(
+              absPath,
+              new Uint8Array(0),
+              this.creationMode(0o666),
+            );
+          }
+        }
+      }
+
+      if (this.openFdCount() >= this.nofileSoftLimit()) {
+        return WASI_EMFILE;
+      }
+      let fd: number;
+      const stdioSlot = this.firstAvailableStdioFd();
+      if (this.kernel && this.pid !== undefined) {
+        fd = await this.kernel.openVfsFileAsync(
+          this.pid,
+          this.vfs,
+          absPath,
+          mode,
+          stdioSlot ?? undefined,
+        );
+      } else {
+        fd = await this.fdTable.openAsync(absPath, mode);
+        if (stdioSlot !== null) {
+          this.fdTable.renumber(fd, stdioSlot);
+          fd = stdioSlot;
+        }
+      }
+      const view = this.getView();
+      view.setUint32(fdPtr, fd, true);
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
   private firstAvailableStdioFd(): number | null {
     for (let fd = 0; fd <= 2; fd++) {
       if (!this.hasOpenFd(fd)) {
@@ -2025,7 +2316,18 @@ export class WasiHost {
     pathPtr: number,
     pathLen: number,
     bufPtr: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.pathFilestatGetAsync(
+        dirFd,
+        flags,
+        pathPtr,
+        pathLen,
+        bufPtr,
+        asyncVfs,
+      );
+    }
     this.checkDeadline();
     try {
       const relativePath = this.readString(pathPtr, pathLen);
@@ -2043,11 +2345,42 @@ export class WasiHost {
     }
   }
 
+  private async pathFilestatGetAsync(
+    dirFd: number,
+    flags: number,
+    pathPtr: number,
+    pathLen: number,
+    bufPtr: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    try {
+      const relativePath = this.readString(pathPtr, pathLen);
+      const absPath = this.resolvePath(dirFd, relativePath);
+      const followSymlinks = (flags & 1) !== 0;
+      return await this.writeFilestatAsync(
+        bufPtr,
+        absPath,
+        followSymlinks,
+        vfs,
+      );
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
   private pathCreateDirectory(
     dirFd: number,
     pathPtr: number,
     pathLen: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.pathCreateDirectoryAsync(dirFd, pathPtr, pathLen, asyncVfs);
+    }
     this.checkDeadline();
     try {
       const relativePath = this.readString(pathPtr, pathLen);
@@ -2056,6 +2389,29 @@ export class WasiHost {
       this.withVfsCredentials(() =>
         this.vfs.mkdir(absPath, this.creationMode(0o777))
       );
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
+  private async pathCreateDirectoryAsync(
+    dirFd: number,
+    pathPtr: number,
+    pathLen: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    try {
+      const relativePath = this.readString(pathPtr, pathLen);
+      const absPath = this.resolvePath(dirFd, relativePath);
+      if (absPath === "/") return WASI_EEXIST;
+      if (vfs.mkdirAsync) {
+        await vfs.mkdirAsync(absPath, this.creationMode(0o777));
+      } else vfs.mkdir(absPath, this.creationMode(0o777));
       return WASI_ESUCCESS;
     } catch (err) {
       if (err instanceof VfsError) {
@@ -2103,7 +2459,11 @@ export class WasiHost {
     dirFd: number,
     pathPtr: number,
     pathLen: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.pathRemoveDirectoryAsync(dirFd, pathPtr, pathLen, asyncVfs);
+    }
     try {
       const relativePath = this.readString(pathPtr, pathLen);
       const absPath = this.resolvePath(dirFd, relativePath);
@@ -2117,11 +2477,35 @@ export class WasiHost {
     }
   }
 
+  private async pathRemoveDirectoryAsync(
+    dirFd: number,
+    pathPtr: number,
+    pathLen: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    try {
+      const relativePath = this.readString(pathPtr, pathLen);
+      const absPath = this.resolvePath(dirFd, relativePath);
+      if (vfs.rmdirAsync) await vfs.rmdirAsync(absPath);
+      else vfs.rmdir(absPath);
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
   private pathUnlinkFile(
     dirFd: number,
     pathPtr: number,
     pathLen: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.pathUnlinkFileAsync(dirFd, pathPtr, pathLen, asyncVfs);
+    }
     this.checkDeadline();
     try {
       const relativePath = this.readString(pathPtr, pathLen);
@@ -2131,7 +2515,7 @@ export class WasiHost {
       if (this.socketRegistry) {
         try {
           const s = this.vfs.stat(absPath);
-          if (s.type === 'socket') {
+          if (s.type === "socket") {
             this.socketRegistry.closePathListener(absPath);
             this.socketRegistry.removeDgramRoute(absPath);
           }
@@ -2149,6 +2533,40 @@ export class WasiHost {
     }
   }
 
+  private async pathUnlinkFileAsync(
+    dirFd: number,
+    pathPtr: number,
+    pathLen: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    try {
+      const relativePath = this.readString(pathPtr, pathLen);
+      const absPath = this.resolvePath(dirFd, relativePath);
+      if (this.socketRegistry) {
+        try {
+          const s = vfs.statAsync
+            ? await vfs.statAsync(absPath)
+            : vfs.stat(absPath);
+          if (s.type === "socket") {
+            this.socketRegistry.closePathListener(absPath);
+            this.socketRegistry.removeDgramRoute(absPath);
+          }
+        } catch {
+          // stat failure is fine — unlink will surface the real error below
+        }
+      }
+      if (vfs.unlinkAsync) await vfs.unlinkAsync(absPath);
+      else vfs.unlink(absPath);
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
   private pathRename(
     oldDirFd: number,
     oldPathPtr: number,
@@ -2156,7 +2574,19 @@ export class WasiHost {
     newDirFd: number,
     newPathPtr: number,
     newPathLen: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.pathRenameAsync(
+        oldDirFd,
+        oldPathPtr,
+        oldPathLen,
+        newDirFd,
+        newPathPtr,
+        newPathLen,
+        asyncVfs,
+      );
+    }
     this.checkDeadline();
     try {
       const oldRelative = this.readString(oldPathPtr, oldPathLen);
@@ -2174,19 +2604,81 @@ export class WasiHost {
     }
   }
 
+  private async pathRenameAsync(
+    oldDirFd: number,
+    oldPathPtr: number,
+    oldPathLen: number,
+    newDirFd: number,
+    newPathPtr: number,
+    newPathLen: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    try {
+      const oldRelative = this.readString(oldPathPtr, oldPathLen);
+      const newRelative = this.readString(newPathPtr, newPathLen);
+      const oldAbs = this.resolvePath(oldDirFd, oldRelative);
+      const newAbs = this.resolvePath(newDirFd, newRelative);
+      if (vfs.renameAsync) await vfs.renameAsync(oldAbs, newAbs);
+      else vfs.rename(oldAbs, newAbs);
+      this.kernel?.remapCwdAfterRename(oldAbs, newAbs);
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
   private pathSymlink(
     oldPathPtr: number,
     oldPathLen: number,
     dirFd: number,
     newPathPtr: number,
     newPathLen: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.pathSymlinkAsync(
+        oldPathPtr,
+        oldPathLen,
+        dirFd,
+        newPathPtr,
+        newPathLen,
+        asyncVfs,
+      );
+    }
     this.checkDeadline();
     try {
       const target = this.readString(oldPathPtr, oldPathLen);
       const newRelative = this.readString(newPathPtr, newPathLen);
       const newAbs = this.resolvePath(dirFd, newRelative);
       this.withVfsCredentials(() => this.vfs.symlink(target, newAbs));
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
+  private async pathSymlinkAsync(
+    oldPathPtr: number,
+    oldPathLen: number,
+    dirFd: number,
+    newPathPtr: number,
+    newPathLen: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    try {
+      const target = this.readString(oldPathPtr, oldPathLen);
+      const newRelative = this.readString(newPathPtr, newPathLen);
+      const newAbs = this.resolvePath(dirFd, newRelative);
+      if (vfs.symlinkAsync) await vfs.symlinkAsync(target, newAbs);
+      else vfs.symlink(target, newAbs);
       return WASI_ESUCCESS;
     } catch (err) {
       if (err instanceof VfsError) {
@@ -2203,7 +2695,19 @@ export class WasiHost {
     bufPtr: number,
     bufLen: number,
     bufUsedPtr: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.pathReadlinkAsync(
+        dirFd,
+        pathPtr,
+        pathLen,
+        bufPtr,
+        bufLen,
+        bufUsedPtr,
+        asyncVfs,
+      );
+    }
     this.checkDeadline();
     try {
       const relativePath = this.readString(pathPtr, pathLen);
@@ -2218,6 +2722,46 @@ export class WasiHost {
         return WASI_ESUCCESS;
       }
       const target = this.vfs.readlink(absPath);
+      const encoded = this.encoder.encode(target);
+      const bytes = this.getBytes();
+      const view = this.getView();
+      const written = Math.min(encoded.length, bufLen);
+      bytes.set(encoded.subarray(0, written), bufPtr);
+      view.setUint32(bufUsedPtr, written, true);
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
+  private async pathReadlinkAsync(
+    dirFd: number,
+    pathPtr: number,
+    pathLen: number,
+    bufPtr: number,
+    bufLen: number,
+    bufUsedPtr: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    try {
+      const relativePath = this.readString(pathPtr, pathLen);
+      const absPath = this.resolvePath(dirFd, relativePath);
+      if (absPath === `/proc/${this.pid}`) {
+        const encoded = this.encoder.encode(String(this.pid));
+        const bytes = this.getBytes();
+        const view = this.getView();
+        const written = Math.min(encoded.length, bufLen);
+        bytes.set(encoded.subarray(0, written), bufPtr);
+        view.setUint32(bufUsedPtr, written, true);
+        return WASI_ESUCCESS;
+      }
+      const target = vfs.readlinkAsync
+        ? await vfs.readlinkAsync(absPath)
+        : vfs.readlink(absPath);
       const encoded = this.encoder.encode(target);
       const bytes = this.getBytes();
       const view = this.getView();
@@ -3026,6 +3570,55 @@ export class WasiHost {
         BigInt(stat.ctime.getTime()) * BigInt(1_000_000),
         true,
       ); // ctim
+
+      return WASI_ESUCCESS;
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
+  private async writeFilestatAsync(
+    bufPtr: number,
+    absPath: string,
+    followSymlinks = true,
+    vfs = this.asyncVfs()!,
+  ): Promise<number> {
+    try {
+      const stat = followSymlinks
+        ? vfs.statAsync ? await vfs.statAsync(absPath) : vfs.stat(absPath)
+        : vfs.lstatAsync
+        ? await vfs.lstatAsync(absPath)
+        : vfs.lstat(absPath);
+      const view = this.getView();
+      const inodePath = followSymlinks
+        ? await canonicalStatPathAsync(vfs, absPath)
+        : normalizeVfsPath(absPath);
+      view.setBigUint64(bufPtr, yurtStatDevice(stat), true);
+      view.setBigUint64(bufPtr + 8, stablePathInode(inodePath), true);
+      view.setUint8(bufPtr + 16, inodeTypeToWasiFiletype(stat.type));
+      for (let i = 17; i < 24; i++) {
+        view.setUint8(bufPtr + i, 0);
+      }
+      view.setBigUint64(bufPtr + 24, BigInt(1), true);
+      view.setBigUint64(bufPtr + 32, BigInt(stat.size), true);
+      view.setBigUint64(
+        bufPtr + 40,
+        BigInt(stat.atime.getTime()) * BigInt(1_000_000),
+        true,
+      );
+      view.setBigUint64(
+        bufPtr + 48,
+        BigInt(stat.mtime.getTime()) * BigInt(1_000_000),
+        true,
+      );
+      view.setBigUint64(
+        bufPtr + 56,
+        BigInt(stat.ctime.getTime()) * BigInt(1_000_000),
+        true,
+      );
 
       return WASI_ESUCCESS;
     } catch (err) {

@@ -123,6 +123,18 @@ const ASYNC_WASI_IMPORTS = [
   "poll_oneoff",
 ] as const;
 
+const THREADED_ASYNC_WASI_IMPORTS = [
+  ...ASYNC_WASI_IMPORTS,
+  "path_create_directory",
+  "path_filestat_get",
+  "path_open",
+  "path_readlink",
+  "path_remove_directory",
+  "path_rename",
+  "path_symlink",
+  "path_unlink_file",
+] as const;
+
 function bindSignalDeliverer(
   wasi: WasiHost,
   instance: WebAssembly.Instance,
@@ -370,7 +382,9 @@ export async function loadProcess(
   );
   wrapAsyncImports(
     wasiImports as Record<string, WebAssembly.ImportValue>,
-    ASYNC_WASI_IMPORTS,
+    profile.requiresSharedMemory
+      ? THREADED_ASYNC_WASI_IMPORTS
+      : ASYNC_WASI_IMPORTS,
     asyncifyBridge,
     threadsBackend,
   );
@@ -558,7 +572,9 @@ export async function loadProcess(
       const childWasiImports = childWasi.getImports().wasi_snapshot_preview1;
       wrapAsyncImports(
         childWasiImports as Record<string, WebAssembly.ImportValue>,
-        ASYNC_WASI_IMPORTS,
+        profile.requiresSharedMemory
+          ? THREADED_ASYNC_WASI_IMPORTS
+          : ASYNC_WASI_IMPORTS,
         childBridge,
         childThreadsBackend,
       );
