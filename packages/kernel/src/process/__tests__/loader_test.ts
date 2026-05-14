@@ -432,6 +432,98 @@ Deno.test("loader-backed resident shell supports Asyncify fallback without JSPI"
   }
 });
 
+Deno.test("loadProcess keeps JSPI WASI wrapping to imports proven safe", async () => {
+  const ctx = await makeLoaderContext();
+  const originalSuspending = WebAssembly.Suspending;
+  const originalPromising = WebAssembly.promising;
+  type ImportFunction = (...args: unknown[]) => unknown;
+  const wrapped = new WeakSet<ImportFunction>();
+  class FakeSuspending {
+    constructor(fn: ImportFunction) {
+      wrapped.add(fn);
+      return fn;
+    }
+  }
+  Object.defineProperty(WebAssembly, "Suspending", {
+    value: FakeSuspending,
+    configurable: true,
+  });
+  Object.defineProperty(WebAssembly, "promising", {
+    value: undefined,
+    configurable: true,
+  });
+
+  let wasiImports:
+    | Record<string, WebAssembly.ImportValue>
+    | undefined;
+  const adapter: PlatformAdapter = {
+    ...ctx.adapter,
+    instantiate: (_module, imports) => {
+      wasiImports = imports.wasi_snapshot_preview1 as Record<
+        string,
+        WebAssembly.ImportValue
+      >;
+      return Promise.resolve({
+        exports: {
+          memory: new WebAssembly.Memory({ initial: 1 }),
+          _start: () => {},
+        },
+      } as WebAssembly.Instance);
+    },
+  };
+
+  try {
+    await loadProcess({ ...ctx, adapter }, {
+      argv: ["/bin/true"],
+      mode: "cli",
+    });
+  } finally {
+    Object.defineProperty(WebAssembly, "Suspending", {
+      value: originalSuspending,
+      configurable: true,
+    });
+    Object.defineProperty(WebAssembly, "promising", {
+      value: originalPromising,
+      configurable: true,
+    });
+  }
+
+  assert(wasiImports);
+  for (
+    const name of [
+      "fd_read",
+      "fd_write",
+      "poll_oneoff",
+    ]
+  ) {
+    assertEquals(
+      wrapped.has(wasiImports[name] as ImportFunction),
+      true,
+      `${name} should be wrapped for JSPI suspension`,
+    );
+  }
+  for (
+    const name of [
+      "path_create_directory",
+      "path_filestat_get",
+      "path_filestat_set_times",
+      "path_link",
+      "path_open",
+      "path_readlink",
+      "path_remove_directory",
+      "path_rename",
+      "path_symlink",
+      "path_unlink_file",
+    ]
+  ) {
+    assertEquals(
+      wrapped.has(wasiImports[name] as ImportFunction),
+      false,
+      `${name} should stay sync under JSPI until path imports are JSPI-safe`,
+    );
+  }
+});
+
 function nonThreadedProfile(): YurtModuleProfile {
   return {
     importsSetjmp: false,

@@ -113,6 +113,16 @@ export function resolveWorkerSabThreads(
 
 type WasmCallable = (...args: unknown[]) => unknown;
 
+// Only imports proven safe for today's JSPI and Asyncify binaries belong here.
+// Do not add WASI path_* imports until the affected guests are built with those
+// imports in their asyncify-imports set and JSPI path_open/i64 behavior is
+// verified against file-conformance and ABI canaries.
+const ASYNC_WASI_IMPORTS = [
+  "fd_read",
+  "fd_write",
+  "poll_oneoff",
+] as const;
+
 function bindSignalDeliverer(
   wasi: WasiHost,
   instance: WebAssembly.Instance,
@@ -360,7 +370,7 @@ export async function loadProcess(
   );
   wrapAsyncImports(
     wasiImports as Record<string, WebAssembly.ImportValue>,
-    ["fd_read", "fd_write", "poll_oneoff"],
+    ASYNC_WASI_IMPORTS,
     asyncifyBridge,
     threadsBackend,
   );
@@ -548,7 +558,7 @@ export async function loadProcess(
       const childWasiImports = childWasi.getImports().wasi_snapshot_preview1;
       wrapAsyncImports(
         childWasiImports as Record<string, WebAssembly.ImportValue>,
-        ["fd_read", "fd_write", "poll_oneoff"],
+        ASYNC_WASI_IMPORTS,
         childBridge,
         childThreadsBackend,
       );
@@ -683,7 +693,7 @@ export async function loadProcess(
 
 function wrapAsyncImports(
   imports: Record<string, WebAssembly.ImportValue>,
-  names: string[],
+  names: readonly string[],
   asyncifyBridge: AsyncifyAsyncBridge | null,
   threadsBackend?: ThreadsBackend,
 ): void {
