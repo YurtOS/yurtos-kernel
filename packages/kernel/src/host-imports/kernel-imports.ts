@@ -602,6 +602,37 @@ function globMatch(vfs: VfsLike, pattern: string): string[] {
   return matches;
 }
 
+async function walkVfsAsync(vfs: AsyncHostVfs, dir: string): Promise<string[]> {
+  const results: string[] = [];
+  let entries: ReturnType<VfsLike["readdir"]>;
+  try {
+    entries = vfs.readdirAsync ? await vfs.readdirAsync(dir) : vfs.readdir(dir);
+  } catch {
+    return results;
+  }
+  for (const entry of entries) {
+    const fullPath = dir === "/" ? "/" + entry.name : dir + "/" + entry.name;
+    results.push(fullPath);
+    if (entry.type === "dir") {
+      results.push(...await walkVfsAsync(vfs, fullPath));
+    }
+  }
+  return results;
+}
+
+async function globMatchAsync(
+  vfs: AsyncHostVfs,
+  pattern: string,
+): Promise<string[]> {
+  const absPattern = pattern.startsWith("/") ? pattern : "/" + pattern;
+  const baseDir = globBaseDir(absPattern);
+  const regex = globToRegExp(absPattern);
+  const allPaths = await walkVfsAsync(vfs, baseDir);
+  const matches = allPaths.filter((p) => regex.test(p));
+  matches.sort();
+  return matches;
+}
+
 function normalizeImportPath(path: string): string {
   const parts: string[] = [];
   for (const part of path.split("/")) {
@@ -665,6 +696,37 @@ function splitResolutionPath(path: string): string[] {
   return path.split("/").filter((part) => part !== "" && part !== ".");
 }
 
+type AsyncHostVfs = VfsLike & {
+  isAsyncVfs?: boolean;
+  readFileAsync?: (path: string) => Promise<Uint8Array>;
+  writeFileAsync?: (
+    path: string,
+    data: Uint8Array,
+    mode?: number,
+  ) => Promise<void>;
+  statAsync?: (path: string) => Promise<ReturnType<VfsLike["stat"]>>;
+  lstatAsync?: (path: string) => Promise<ReturnType<VfsLike["lstat"]>>;
+  readdirAsync?: (path: string) => Promise<ReturnType<VfsLike["readdir"]>>;
+  mkdirAsync?: (path: string, mode?: number) => Promise<void>;
+  unlinkAsync?: (path: string) => Promise<void>;
+  rmdirAsync?: (path: string) => Promise<void>;
+  renameAsync?: (oldPath: string, newPath: string) => Promise<void>;
+  symlinkAsync?: (target: string, path: string) => Promise<void>;
+  readlinkAsync?: (path: string) => Promise<string>;
+  chmodAsync?: (path: string, mode: number) => Promise<void>;
+  chownAsync?: (
+    path: string,
+    uid: number,
+    gid: number,
+    followSymlinks?: boolean,
+  ) => Promise<void>;
+};
+
+function asyncHostVfs(vfs: VfsLike | undefined): AsyncHostVfs | null {
+  const candidate = vfs as AsyncHostVfs | undefined;
+  return candidate?.isAsyncVfs ? candidate : null;
+}
+
 function resolveRealpath(vfs: VfsLike, cwd: string, rawPath: string): string {
   if (rawPath === "") throw new Error("ENOENT: empty path");
   const startPath = rawPath.startsWith("/")
@@ -702,6 +764,55 @@ function resolveRealpath(vfs: VfsLike, cwd: string, rawPath: string): string {
 
   const real = "/" + resolved.join("/");
   vfs.stat(real);
+  return real === "" ? "/" : real;
+}
+
+async function resolveRealpathAsync(
+  vfs: AsyncHostVfs,
+  cwd: string,
+  rawPath: string,
+): Promise<string> {
+  if (rawPath === "") throw new Error("ENOENT: empty path");
+  const startPath = rawPath.startsWith("/")
+    ? rawPath
+    : cwd === "/"
+    ? `/${rawPath}`
+    : `${cwd}/${rawPath}`;
+  let queue = splitResolutionPath(startPath);
+  const resolved: string[] = [];
+  let symlinkDepth = 0;
+
+  while (queue.length > 0) {
+    const part = queue.shift()!;
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      resolved.pop();
+      continue;
+    }
+
+    const candidate = "/" + [...resolved, part].join("/");
+    const stat = vfs.lstatAsync
+      ? await vfs.lstatAsync(candidate)
+      : vfs.lstat(candidate);
+    if (stat.type !== "symlink") {
+      resolved.push(part);
+      continue;
+    }
+    if (++symlinkDepth > 40) throw new Error("ELOOP: too many symlink levels");
+
+    const target = vfs.readlinkAsync
+      ? await vfs.readlinkAsync(candidate)
+      : vfs.readlink(candidate);
+    const targetPath = target.startsWith("/")
+      ? target
+      : `${dirnameOfPath(candidate)}/${target}`;
+    queue = [...splitResolutionPath(targetPath), ...queue];
+    resolved.length = 0;
+  }
+
+  const real = "/" + resolved.join("/");
+  if (vfs.statAsync) await vfs.statAsync(real);
+  else vfs.stat(real);
   return real === "" ? "/" : real;
 }
 
@@ -760,6 +871,17 @@ export function createKernelImports(
       : fn();
   }
 
+  async function getCallerPhysicalCwdAsync(vfs: AsyncHostVfs): Promise<string> {
+    const cwd = getCallerCwd();
+    try {
+      return await withVfsCallerCredentials(() =>
+        resolveRealpathAsync(vfs, cwd, ".")
+      );
+    } catch {
+      return normalizeImportPath(cwd);
+    }
+  }
+
   function authorizeChown(
     path: string,
     uid: number,
@@ -780,6 +902,44 @@ export function createKernelImports(
     } catch {
       return ERR_PERMISSION;
     }
+  }
+
+  async function authorizeChownAsync(
+    vfs: AsyncHostVfs,
+    path: string,
+    uid: number,
+    gid: number,
+    followSymlinks = true,
+  ): Promise<number> {
+    const credentials = getCallerCredentials();
+    if (credentials.euid === ROOT_UID) return 0;
+    if (gid !== -1 && gid !== credentials.egid) return ERR_PERMISSION;
+    if (uid === -1) return 0;
+    try {
+      const stat = followSymlinks
+        ? vfs.statAsync ? await vfs.statAsync(path) : vfs.stat(path)
+        : vfs.lstatAsync
+        ? await vfs.lstatAsync(path)
+        : vfs.lstat(path);
+      return stat.uid === credentials.euid && uid === stat.uid
+        ? 0
+        : ERR_PERMISSION;
+    } catch {
+      return ERR_PERMISSION;
+    }
+  }
+
+  function writeCStringResult(
+    value: string,
+    outPtr: number,
+    outCap: number,
+  ): number {
+    const bytes = new TextEncoder().encode(value);
+    const required = bytes.byteLength + 1;
+    if (outCap < required) return required;
+    new Uint8Array(memory.buffer, outPtr, bytes.byteLength).set(bytes);
+    new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
+    return required;
   }
 
   function limitToBigUint64(limit: number): bigint {
@@ -1510,14 +1670,16 @@ export function createKernelImports(
       return ERR_INVALID;
     },
 
-    host_getcwd(outPtr: number, outCap: number): number {
+    host_getcwd(outPtr: number, outCap: number): number | Promise<number> {
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          const cwd = await getCallerPhysicalCwdAsync(asyncVfs);
+          return writeCStringResult(cwd, outPtr, outCap);
+        })();
+      }
       const cwd = getCallerPhysicalCwd();
-      const bytes = new TextEncoder().encode(cwd);
-      const required = bytes.byteLength + 1;
-      if (outCap < required) return required;
-      new Uint8Array(memory.buffer, outPtr, bytes.byteLength).set(bytes);
-      new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
-      return required;
+      return writeCStringResult(cwd, outPtr, outCap);
     },
 
     host_realpath(
@@ -1525,19 +1687,38 @@ export function createKernelImports(
       pathLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const real = await withVfsCallerCredentials(() =>
+              resolveRealpathAsync(asyncVfs, getCallerCwd(), rawPath)
+            );
+            return writeCStringResult(real, outPtr, outCap);
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            if (msg.includes("ENOTDIR") || msg.includes("not a directory")) {
+              return ERR_NOT_DIR;
+            }
+            if (msg.includes("ELOOP")) return ERR_INVALID;
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         const real = withVfsCallerCredentials(() =>
           resolveRealpath(opts.vfs!, getCallerCwd(), rawPath)
         );
-        const bytes = new TextEncoder().encode(real);
-        const required = bytes.byteLength + 1;
-        if (outCap < required) return required;
-        new Uint8Array(memory.buffer, outPtr, bytes.byteLength).set(bytes);
-        new Uint8Array(memory.buffer)[outPtr + bytes.byteLength] = 0;
-        return required;
+        return writeCStringResult(real, outPtr, outCap);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "";
         if (msg.includes("ENOENT") || msg.includes("no such file")) {
@@ -1554,10 +1735,32 @@ export function createKernelImports(
       }
     },
 
-    host_chdir(pathPtr: number, pathLen: number): number {
+    host_chdir(pathPtr: number, pathLen: number): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
       const path = resolveCwdPath(getCallerCwd(), rawPath);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const stat = asyncVfs.statAsync
+              ? await asyncVfs.statAsync(path)
+              : asyncVfs.stat(path);
+            if (stat.type !== "dir") return ERR_NOT_DIR;
+            setCallerCwd(resolveLogicalCwdPath(getCallerCwd(), rawPath));
+            return 0;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         const stat = opts.vfs.stat(path);
         if (stat.type !== "dir") return ERR_NOT_DIR;
@@ -1575,7 +1778,7 @@ export function createKernelImports(
       }
     },
 
-    host_fchdir(fd: number): number {
+    host_fchdir(fd: number): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       let path = opts.wasiHost?.getDirectoryFdPath(fd) ?? null;
       if (path === null && opts.kernel) {
@@ -1587,6 +1790,28 @@ export function createKernelImports(
         }
       }
       if (path === null) return ERR_NOT_FOUND;
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const stat = asyncVfs.statAsync
+              ? await asyncVfs.statAsync(path!)
+              : asyncVfs.stat(path!);
+            if (stat.type !== "dir") return ERR_NOT_DIR;
+            setCallerCwd(path!);
+            return 0;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         const stat = opts.vfs.stat(path);
         if (stat.type !== "dir") return ERR_NOT_DIR;
@@ -3655,9 +3880,22 @@ export function createKernelImports(
       pathLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const s = asyncVfs.statAsync
+              ? await asyncVfs.statAsync(path)
+              : asyncVfs.stat(path);
+            return writeStatRecord(memory, outPtr, outCap, s);
+          } catch {
+            return ERR_NOT_FOUND;
+          }
+        })();
+      }
       try {
         const s = opts.vfs.stat(path);
         return writeStatRecord(memory, outPtr, outCap, s);
@@ -3671,9 +3909,22 @@ export function createKernelImports(
       pathLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const data = asyncVfs.readFileAsync
+              ? await asyncVfs.readFileAsync(path)
+              : asyncVfs.readFile(path);
+            return writeBytes(memory, outPtr, outCap, data);
+          } catch {
+            return ERR_NOT_FOUND;
+          }
+        })();
+      }
       try {
         const data = opts.vfs.readFile(path);
         return writeBytes(memory, outPtr, outCap, data);
@@ -3688,10 +3939,45 @@ export function createKernelImports(
       dataPtr: number,
       dataLen: number,
       mode: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const path = readString(memory, pathPtr, pathLen);
       const data = readBytes(memory, dataPtr, dataLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            if (mode === 1) {
+              try {
+                const existing = asyncVfs.readFileAsync
+                  ? await asyncVfs.readFileAsync(path)
+                  : asyncVfs.readFile(path);
+                const combined = new Uint8Array(existing.length + data.length);
+                combined.set(existing);
+                combined.set(data, existing.length);
+                if (asyncVfs.writeFileAsync) {
+                  await asyncVfs.writeFileAsync(path, combined);
+                } else {
+                  asyncVfs.writeFile(path, combined);
+                }
+              } catch {
+                if (asyncVfs.writeFileAsync) {
+                  await asyncVfs.writeFileAsync(path, data);
+                } else {
+                  asyncVfs.writeFile(path, data);
+                }
+              }
+            } else if (asyncVfs.writeFileAsync) {
+              await asyncVfs.writeFileAsync(path, data);
+            } else {
+              asyncVfs.writeFile(path, data);
+            }
+            return 0;
+          } catch {
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         if (mode === 1) {
           try {
@@ -3717,9 +4003,27 @@ export function createKernelImports(
       pathLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const entries = asyncVfs.readdirAsync
+              ? await asyncVfs.readdirAsync(path)
+              : asyncVfs.readdir(path);
+            return writeStringListRecord(
+              memory,
+              outPtr,
+              outCap,
+              entries.map((e) => e.name),
+            );
+          } catch {
+            return ERR_NOT_FOUND;
+          }
+        })();
+      }
       try {
         const entries = opts.vfs.readdir(path).map((e) => e.name);
         return writeStringListRecord(memory, outPtr, outCap, entries);
@@ -3728,9 +4032,21 @@ export function createKernelImports(
       }
     },
 
-    host_mkdir(pathPtr: number, pathLen: number): number {
+    host_mkdir(pathPtr: number, pathLen: number): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            if (asyncVfs.mkdirAsync) await asyncVfs.mkdirAsync(path);
+            else asyncVfs.mkdir(path);
+            return 0;
+          } catch {
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         opts.vfs.mkdir(path);
         return 0;
@@ -3739,9 +4055,35 @@ export function createKernelImports(
       }
     },
 
-    host_remove(pathPtr: number, pathLen: number, recursive: number): number {
+    host_remove(
+      pathPtr: number,
+      pathLen: number,
+      recursive: number,
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            if (recursive) {
+              if (asyncVfs.rmdirAsync) await asyncVfs.rmdirAsync(path);
+              else asyncVfs.rmdir(path);
+            } else {
+              try {
+                if (asyncVfs.unlinkAsync) await asyncVfs.unlinkAsync(path);
+                else asyncVfs.unlink(path);
+              } catch {
+                if (asyncVfs.rmdirAsync) await asyncVfs.rmdirAsync(path);
+                else asyncVfs.rmdir(path);
+              }
+            }
+            return 0;
+          } catch {
+            return ERR_NOT_FOUND;
+          }
+        })();
+      }
       try {
         if (recursive) {
           opts.vfs.rmdir(path);
@@ -3758,10 +4100,46 @@ export function createKernelImports(
       }
     },
 
-    host_chmod(pathPtr: number, pathLen: number, mode: number): number {
+    host_chmod(
+      pathPtr: number,
+      pathLen: number,
+      mode: number,
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
       const path = resolveCwdPath(getCallerCwd(), rawPath);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const credentials = getCallerCredentials();
+            const authorized = await withVfsCallerCredentials(async () => {
+              const stat = asyncVfs.statAsync
+                ? await asyncVfs.statAsync(path)
+                : asyncVfs.stat(path);
+              if (
+                credentials.euid !== ROOT_UID && stat.uid !== credentials.euid
+              ) {
+                return false;
+              }
+              if (asyncVfs.chmodAsync) await asyncVfs.chmodAsync(path, mode);
+              else asyncVfs.chmod(path, mode);
+              return true;
+            });
+            if (!authorized) return ERR_PERMISSION;
+            return 0;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         const credentials = getCallerCredentials();
         const authorized = withVfsCallerCredentials(() => {
@@ -3792,12 +4170,54 @@ export function createKernelImports(
       uid: number,
       gid: number,
       followSymlinks: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const rawPath = readString(memory, pathPtr, pathLen);
       const path = resolveCwdPath(getCallerCwd(), rawPath);
       const targetUid = uid | 0;
       const targetGid = gid | 0;
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          const authorized = await authorizeChownAsync(
+            asyncVfs,
+            path,
+            targetUid,
+            targetGid,
+            followSymlinks !== 0,
+          );
+          if (authorized !== 0) return authorized;
+          try {
+            await withVfsCallerCredentials(async () => {
+              if (asyncVfs.chownAsync) {
+                await asyncVfs.chownAsync(
+                  path,
+                  targetUid,
+                  targetGid,
+                  followSymlinks !== 0,
+                );
+              } else {
+                asyncVfs.chown(
+                  path,
+                  targetUid,
+                  targetGid,
+                  followSymlinks !== 0,
+                );
+              }
+            });
+            return 0;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            return ERR_IO;
+          }
+        })();
+      }
       const authorized = authorizeChown(
         path,
         targetUid,
@@ -3822,7 +4242,11 @@ export function createKernelImports(
       }
     },
 
-    host_fchown(fd: number, uid: number, gid: number): number {
+    host_fchown(
+      fd: number,
+      uid: number,
+      gid: number,
+    ): number | Promise<number> {
       if (!opts.vfs || !opts.kernel) return ERR_IO;
       const targetUid = uid | 0;
       const targetGid = gid | 0;
@@ -3830,6 +4254,37 @@ export function createKernelImports(
       if (!target || target.type !== "vfs_file") return ERR_NOT_FOUND;
       const path = target.fdTable.getPath(target.fd);
       if (!path) return ERR_NOT_FOUND;
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          const authorized = await authorizeChownAsync(
+            asyncVfs,
+            path,
+            targetUid,
+            targetGid,
+          );
+          if (authorized !== 0) return authorized;
+          try {
+            await withVfsCallerCredentials(async () => {
+              if (asyncVfs.chownAsync) {
+                await asyncVfs.chownAsync(path, targetUid, targetGid);
+              } else {
+                asyncVfs.chown(path, targetUid, targetGid);
+              }
+            });
+            return 0;
+          } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : "";
+            if (msg.includes("ENOENT") || msg.includes("no such file")) {
+              return ERR_NOT_FOUND;
+            }
+            if (msg.includes("EACCES") || msg.includes("permission denied")) {
+              return ERR_PERMISSION;
+            }
+            return ERR_IO;
+          }
+        })();
+      }
       const authorized = authorizeChown(path, targetUid, targetGid);
       if (authorized !== 0) return authorized;
       try {
@@ -3854,9 +4309,24 @@ export function createKernelImports(
       patternLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return writeStringListRecord(memory, outPtr, outCap, []);
       const pattern = readString(memory, patternPtr, patternLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            return writeStringListRecord(
+              memory,
+              outPtr,
+              outCap,
+              await globMatchAsync(asyncVfs, pattern),
+            );
+          } catch {
+            return writeStringListRecord(memory, outPtr, outCap, []);
+          }
+        })();
+      }
       try {
         return writeStringListRecord(
           memory,
@@ -3874,10 +4344,23 @@ export function createKernelImports(
       fromLen: number,
       toPtr: number,
       toLen: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const from = readString(memory, fromPtr, fromLen);
       const to = readString(memory, toPtr, toLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            if (asyncVfs.renameAsync) await asyncVfs.renameAsync(from, to);
+            else asyncVfs.rename(from, to);
+            opts.kernel?.remapCwdAfterRename(from, to);
+            return 0;
+          } catch {
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         opts.vfs.rename(from, to);
         opts.kernel?.remapCwdAfterRename(from, to);
@@ -3892,10 +4375,23 @@ export function createKernelImports(
       targetLen: number,
       linkPtr: number,
       linkLen: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_IO;
       const target = readString(memory, targetPtr, targetLen);
       const link = readString(memory, linkPtr, linkLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            if (asyncVfs.symlinkAsync) {
+              await asyncVfs.symlinkAsync(target, link);
+            } else asyncVfs.symlink(target, link);
+            return 0;
+          } catch {
+            return ERR_IO;
+          }
+        })();
+      }
       try {
         opts.vfs.symlink(target, link);
         return 0;
@@ -3909,9 +4405,22 @@ export function createKernelImports(
       pathLen: number,
       outPtr: number,
       outCap: number,
-    ): number {
+    ): number | Promise<number> {
       if (!opts.vfs) return ERR_NOT_FOUND;
       const path = readString(memory, pathPtr, pathLen);
+      const asyncVfs = asyncHostVfs(opts.vfs);
+      if (asyncVfs) {
+        return (async () => {
+          try {
+            const target = asyncVfs.readlinkAsync
+              ? await asyncVfs.readlinkAsync(path)
+              : asyncVfs.readlink(path);
+            return writeString(memory, outPtr, outCap, target);
+          } catch {
+            return ERR_NOT_FOUND;
+          }
+        })();
+      }
       try {
         return writeString(memory, outPtr, outCap, opts.vfs.readlink(path));
       } catch {
@@ -3931,7 +4440,10 @@ export function createKernelImports(
       try {
         if (name.startsWith("__native__")) {
           const moduleName = name.slice("__native__".length);
-          const wasmBytes = opts.vfs.readFile(path);
+          const asyncVfs = asyncHostVfs(opts.vfs);
+          const wasmBytes = asyncVfs?.readFileAsync
+            ? await asyncVfs.readFileAsync(path)
+            : opts.vfs.readFile(path);
           await opts.mgr.registerNativeModule(moduleName, wasmBytes);
           return 0;
         }
