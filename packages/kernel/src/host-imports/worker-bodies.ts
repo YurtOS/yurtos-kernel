@@ -366,6 +366,96 @@ export function makeWorkerDispatcherBodies(
       kernel.setFdDescriptorFlags(getPid(), fd, flags);
       return 0;
     },
+    socketBind: (fd, host, port) => {
+      const target = kernel.getFdTarget(getPid(), fd);
+      if (!target || target.type !== "socket") {
+        netLog("pthread.bind", { fd, result: "EBADF" });
+        return -9;
+      }
+      const hostStr = new TextDecoder().decode(host);
+      if (
+        hostStr !== "127.0.0.1" && hostStr !== "localhost" &&
+        hostStr !== "0.0.0.0"
+      ) {
+        netLog("pthread.bind", {
+          fd,
+          host: hostStr,
+          port,
+          result: "EAFNOSUPPORT",
+        });
+        return -95;
+      }
+      if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        netLog("pthread.bind", { fd, host: hostStr, port, result: "EINVAL" });
+        return -22;
+      }
+      target.boundHost = hostStr as "127.0.0.1" | "localhost" | "0.0.0.0";
+      target.boundPort = port;
+      target.localHost = hostStr === "0.0.0.0" ? "10.0.2.15" : hostStr;
+      target.localPort = port;
+      netLog("pthread.bind", { fd, host: hostStr, port, result: "ok" });
+      return 0;
+    },
+    socketListen: (fd, backlogArg) => {
+      const target = kernel.getFdTarget(getPid(), fd);
+      if (!target || target.type !== "socket") {
+        netLog("pthread.listen", { fd, result: "EBADF" });
+        return -9;
+      }
+      if (!opts.socketBackend?.listen) {
+        netLog("pthread.listen", { fd, result: "ENOTSUP" });
+        return -95;
+      }
+      const host = target.boundHost ?? "127.0.0.1";
+      const port = target.boundPort ?? 0;
+      const backlog = backlogArg > 0 ? backlogArg : 128;
+      const listenResult = opts.socketBackend.listen({ host, port, backlog });
+      if (typeof (listenResult as Promise<unknown>).then === "function") {
+        // Network-bridge backends return a Promise here; the worker
+        // dispatcher can't await mid-flight. The loopback registry is
+        // sync, so as long as the sandbox uses it (serverSockets.
+        // allowLoopback) this branch never fires. Surface a clear
+        // failure rather than blocking — the heartbeat thread will
+        // retry via its own bind/listen loop.
+        netLog("pthread.listen", { fd, result: "EAGAIN (async backend)" });
+        return -5;
+      }
+      const r = listenResult as Awaited<
+        ReturnType<NonNullable<typeof opts.socketBackend.listen>>
+      >;
+      if (!r.ok) {
+        netLog("pthread.listen", {
+          fd,
+          host,
+          port,
+          result: "EIO",
+          reason: r.error,
+        });
+        return -5;
+      }
+      target.listener = r.listener;
+      target.boundHost = host;
+      target.boundPort = port;
+      target.localHost = r.host;
+      target.localPort = r.port;
+      target.closeListener = (listener) => {
+        void opts.socketBackend?.closeListener?.(listener);
+      };
+      netLog("pthread.listen", {
+        fd,
+        host,
+        port,
+        assignedHost: r.host,
+        assignedPort: r.port,
+        result: "ok",
+      });
+      return 0;
+    },
+    socketIsDgram: (fd) => {
+      const target = kernel.getFdTarget(getPid(), fd);
+      if (!target || target.type !== "socket") return -1;
+      return target.isDgram ? 1 : 0;
+    },
     threadSpawn: (fnPtr, arg) => {
       const tb = threadsBackend() as
         | (ThreadsBackend & { spawnSync?: (fp: number, a: number) => number })
