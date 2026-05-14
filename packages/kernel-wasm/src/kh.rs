@@ -561,6 +561,10 @@ pub mod test_support {
         SOCKET_MOCK.lock().unwrap().connect_calls.clone()
     }
 
+    pub fn socket_listen_calls() -> Vec<(Vec<u8>, u32)> {
+        SOCKET_MOCK.lock().unwrap().listen_calls.clone()
+    }
+
     pub fn socket_send_calls() -> Vec<(i32, Vec<u8>)> {
         SOCKET_MOCK.lock().unwrap().send_calls.clone()
     }

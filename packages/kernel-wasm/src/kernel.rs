@@ -380,6 +380,11 @@ pub enum SocketKind {
     Host {
         handle: i32,
     },
+    UnixListener {
+        path: Vec<u8>,
+        backlog: u32,
+        pending: VecDeque<u64>,
+    },
     UnixStream {
         peer_id: u64,
         rx: VecDeque<u8>,
@@ -405,6 +410,7 @@ pub struct Kernel {
     next_ofd_id: u64,
     sockets: BTreeMap<u64, SocketEntry>,
     next_socket_id: u64,
+    unix_listeners: BTreeMap<Vec<u8>, u64>,
     /// MetadataOverlay — `(mount_id, inode) → Metadata`.
     /// chmod/chown/utimens write here; fstat reads composed
     /// override → backend default → kernel fallback. Survives the
@@ -493,6 +499,7 @@ impl Kernel {
             next_ofd_id: 1,
             sockets: BTreeMap::new(),
             next_socket_id: 1,
+            unix_listeners: BTreeMap::new(),
             metadata_overrides: BTreeMap::new(),
             pending_spawns: VecDeque::new(),
             next_spawn_pid: 1000,
@@ -686,6 +693,70 @@ impl Kernel {
         (left, right)
     }
 
+    pub fn create_unix_listener(&mut self, path: &[u8], backlog: u32) -> Result<u64, i32> {
+        if self.unix_listeners.contains_key(path) {
+            return Err(crate::abi::EADDRINUSE);
+        }
+        let backlog = if backlog == 0 { 128 } else { backlog };
+        let id = self.next_socket_id;
+        self.next_socket_id += 1;
+        self.sockets.insert(
+            id,
+            SocketEntry {
+                refs: 1,
+                domain: 3,
+                sock_type: 6,
+                kind: SocketKind::UnixListener {
+                    path: path.to_vec(),
+                    backlog,
+                    pending: VecDeque::new(),
+                },
+            },
+        );
+        self.unix_listeners.insert(path.to_vec(), id);
+        Ok(id)
+    }
+
+    pub fn connect_unix_stream(&mut self, path: &[u8]) -> Result<u64, i32> {
+        let Some(listener_id) = self.unix_listeners.get(path).copied() else {
+            return Err(crate::abi::ECONNREFUSED);
+        };
+        let (backlog, pending_len) = match self.sockets.get(&listener_id).map(|s| &s.kind) {
+            Some(SocketKind::UnixListener {
+                backlog, pending, ..
+            }) => (*backlog, pending.len()),
+            _ => return Err(crate::abi::ECONNREFUSED),
+        };
+        if pending_len >= backlog as usize {
+            return Err(crate::abi::ECONNREFUSED);
+        }
+        let (client_id, server_id) = self.create_unix_stream_pair();
+        let Some(listener) = self.sockets.get_mut(&listener_id) else {
+            self.socket_dec_ref(client_id);
+            self.socket_dec_ref(server_id);
+            return Err(crate::abi::ECONNREFUSED);
+        };
+        let SocketKind::UnixListener { pending, .. } = &mut listener.kind else {
+            self.socket_dec_ref(client_id);
+            self.socket_dec_ref(server_id);
+            return Err(crate::abi::ECONNREFUSED);
+        };
+        pending.push_back(server_id);
+        Ok(client_id)
+    }
+
+    pub fn accept_unix_stream(&mut self, listener_id: u64) -> Result<u64, i32> {
+        let Some(listener) = self.sockets.get_mut(&listener_id) else {
+            return Err(crate::abi::EBADF);
+        };
+        match &mut listener.kind {
+            SocketKind::UnixListener { pending, .. } => {
+                pending.pop_front().ok_or(crate::abi::EAGAIN)
+            }
+            _ => Err(crate::abi::EINVAL),
+        }
+    }
+
     pub fn socket(&self, id: u64) -> Option<&SocketEntry> {
         self.sockets.get(&id)
     }
@@ -705,8 +776,16 @@ impl Kernel {
             socket.refs = socket.refs.saturating_sub(1);
             if socket.refs == 0 {
                 match &socket.kind {
-                    SocketKind::Host { handle } => Some((Some(*handle), None)),
-                    SocketKind::UnixStream { peer_id, .. } => Some((None, Some(*peer_id))),
+                    SocketKind::Host { handle } => Some((Some(*handle), None, None, Vec::new())),
+                    SocketKind::UnixListener { path, pending, .. } => Some((
+                        None,
+                        None,
+                        Some(path.clone()),
+                        pending.iter().copied().collect(),
+                    )),
+                    SocketKind::UnixStream { peer_id, .. } => {
+                        Some((None, Some(*peer_id), None, Vec::new()))
+                    }
                 }
             } else {
                 None
@@ -714,9 +793,15 @@ impl Kernel {
         } else {
             None
         };
-        let Some((close_handle, peer_id)) = drop_kind else {
+        let Some((close_handle, peer_id, listener_path, pending_ids)) = drop_kind else {
             return None;
         };
+        if let Some(path) = listener_path {
+            self.unix_listeners.remove(&path);
+        }
+        for pending_id in pending_ids {
+            self.socket_dec_ref(pending_id);
+        }
         if let Some(peer_id) = peer_id {
             if let Some(peer) = self.sockets.get_mut(&peer_id) {
                 if let SocketKind::UnixStream { peer_open, .. } = &mut peer.kind {
@@ -724,9 +809,7 @@ impl Kernel {
                 }
             }
         }
-        if close_handle.is_some() || peer_id.is_some() {
-            self.sockets.remove(&id);
-        }
+        self.sockets.remove(&id);
         close_handle
     }
 

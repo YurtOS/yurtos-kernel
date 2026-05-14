@@ -2065,6 +2065,56 @@ fn user_process_socketpair_round_trips_bytes_through_kernel() {
 }
 
 #[test]
+fn user_process_af_unix_path_stream_round_trips_through_kernel() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_socket_listen" (func $listen (param i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_connect" (func $connect (param i32 i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_accept" (func $accept (param i32 i32) (result i32)))
+          (import "env" "sys_socket_send" (func $send (param i32 i32 i32) (result i64)))
+          (import "env" "sys_socket_recv" (func $recv (param i32 i32 i32 i32) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 64) "unix:/tmp/trampoline.sock")
+          (data (i32.const 96) "from client")
+          (data (i32.const 128) "from server")
+          (global $listener (mut i32) (i32.const -1))
+          (global $client (mut i32) (i32.const -1))
+          (global $server (mut i32) (i32.const -1))
+          (func (export "setup") (result i32)
+            (global.set $listener (call $listen (i32.const 4) (i32.const 64) (i32.const 25)))
+            (global.set $client (call $connect (i32.const 3) (i32.const 6) (i32.const 0) (i32.const 64) (i32.const 25)))
+            (global.set $server (call $accept (global.get $listener) (i32.const 0)))
+            (i32.add
+              (i32.add (global.get $listener) (global.get $client))
+              (global.get $server)))
+          (func (export "send_client") (result i32)
+            (i32.wrap_i64
+              (call $send (global.get $client) (i32.const 96) (i32.const 11))))
+          (func (export "recv_server") (result i32)
+            (i32.wrap_i64
+              (call $recv (global.get $server) (i32.const 160) (i32.const 16) (i32.const 0))))
+          (func (export "send_server") (result i32)
+            (i32.wrap_i64
+              (call $send (global.get $server) (i32.const 128) (i32.const 11))))
+          (func (export "recv_client") (result i32)
+            (i32.wrap_i64
+              (call $recv (global.get $client) (i32.const 192) (i32.const 16) (i32.const 0)))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    assert_eq!(user.call_export_i32("setup").unwrap(), 12);
+    assert_eq!(user.call_export_i32("send_client").unwrap(), 11);
+    assert_eq!(user.call_export_i32("recv_server").unwrap(), 11);
+    assert_eq!(&user.read_memory(160, 11).unwrap(), b"from client");
+    assert_eq!(user.call_export_i32("send_server").unwrap(), 11);
+    assert_eq!(user.call_export_i32("recv_client").unwrap(), 11);
+    assert_eq!(&user.read_memory(192, 11).unwrap(), b"from server");
+}
+
+#[test]
 fn user_process_pipe_dup_keeps_writer_alive() {
     // dup() on a pipe end must increment the kernel-side refcount;
     // closing the original fd should not collapse the buffer.
