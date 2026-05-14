@@ -181,6 +181,38 @@ export const POLLHUP = 0x0010;
 export const POLLNVAL = 0x0020;
 export const POLLFD_SIZE = 8;
 
+/**
+ * Net-debug channel: enabled by `YURT_NET_DEBUG=1` in the host
+ * environment. Emits structured-ish lines on stderr around socket
+ * bind / listen / accept so we can see why ipykernel's TCP setup
+ * fails or stalls. No-op when the env var isn't set; safe in both
+ * Deno and browser (where neither env source exists).
+ */
+const YURT_NET_DEBUG = (() => {
+  try {
+    const denoEnv = (globalThis as {
+      Deno?: { env: { get(k: string): string | undefined } };
+    }).Deno?.env;
+    if (denoEnv?.get("YURT_NET_DEBUG")) return true;
+  } catch { /* Deno.env may throw on insufficient permissions */ }
+  try {
+    const procEnv = (globalThis as {
+      process?: { env: Record<string, string | undefined> };
+    }).process?.env;
+    if (procEnv?.YURT_NET_DEBUG) return true;
+  } catch { /* no-op */ }
+  return false;
+})();
+
+function netLog(op: string, fields: Record<string, unknown>): void {
+  if (!YURT_NET_DEBUG) return;
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(fields)) {
+    parts.push(`${k}=${typeof v === "string" ? v : JSON.stringify(v)}`);
+  }
+  console.error(`[yurt-net] ${op} ${parts.join(" ")}`);
+}
+
 function writeI32(
   memory: WebAssembly.Memory,
   ptr: number,
@@ -2848,15 +2880,39 @@ export function createKernelImports(
       port: number,
       flags: number,
     ): number | Promise<number> {
-      if (!socketBackend) return -111;
+      if (!socketBackend) {
+        netLog("connect", { fd, result: "ECONNREFUSED", reason: "no backend" });
+        return -111;
+      }
       const host = readString(memory, hostPtr, hostLen);
-      if (!host || port < 0 || port > 65535) return -22;
+      if (!host || port < 0 || port > 65535) {
+        netLog("connect", { fd, host, port, result: "EINVAL" });
+        return -22;
+      }
       const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket") return -9;
+      if (!target || target.type !== "socket") {
+        netLog("connect", { fd, host, port, result: "EBADF" });
+        return -9;
+      }
+      netLog("connect", {
+        fd,
+        host,
+        port,
+        tls: (flags & 1) !== 0,
+      });
       const applyConnect = (
         result: Awaited<ReturnType<typeof socketBackend.connect>>,
       ): number | Promise<number> => {
-        if (!result.ok) return -111;
+        if (!result.ok) {
+          netLog("connect", {
+            fd,
+            host,
+            port,
+            result: "ECONNREFUSED",
+            reason: result.error,
+          });
+          return -111;
+        }
         const finalise = (): number => {
           target.socket = result.socket;
           target.peerHost = result.peerHost ?? host;
@@ -2903,17 +2959,25 @@ export function createKernelImports(
     ): number {
       const host = readString(memory, hostPtr, hostLen);
       const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket") return -9;
+      if (!target || target.type !== "socket") {
+        netLog("bind", { fd, host, port, result: "EBADF" });
+        return -9;
+      }
       if (
         host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
       ) {
+        netLog("bind", { fd, host, port, result: "EAFNOSUPPORT" });
         return -95;
       }
-      if (!Number.isInteger(port) || port < 0 || port > 65535) return -22;
+      if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        netLog("bind", { fd, host, port, result: "EINVAL" });
+        return -22;
+      }
       target.boundHost = host;
       target.boundPort = port;
       target.localHost = host === "0.0.0.0" ? socketLocalHost : host;
       target.localPort = port;
+      netLog("bind", { fd, host, port, result: "ok" });
       return 0;
     },
 
@@ -3322,17 +3386,56 @@ export function createKernelImports(
       backlogArg: number,
     ): number | Promise<number> {
       const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket") return -9;
+      if (!target || target.type !== "socket") {
+        netLog("listen", { fd, result: "EBADF" });
+        return -9;
+      }
       const host = target.boundHost ?? "127.0.0.1";
       const port = target.boundPort ?? 0;
       const backlog = backlogArg > 0 ? backlogArg : 128;
       const auth = authorizeListen(opts.serverSockets, host, port, backlog);
-      if (!auth.ok) return -13;
-      if (!socketBackend?.listen) return -95;
+      if (!auth.ok) {
+        netLog("listen", {
+          fd,
+          host,
+          port,
+          backlog,
+          result: "EACCES",
+          reason: "authorizeListen denied",
+        });
+        return -13;
+      }
+      if (!socketBackend?.listen) {
+        netLog("listen", {
+          fd,
+          host,
+          port,
+          backlog,
+          result: "ENOTSUP",
+          reason: "socketBackend.listen is undefined",
+        });
+        return -95;
+      }
+      netLog("listen", {
+        fd,
+        host,
+        port,
+        backlog,
+        backend: socketBackend.constructor?.name ?? "(unknown)",
+      });
       const apply = (
         result: Awaited<ReturnType<NonNullable<typeof socketBackend.listen>>>,
       ): number => {
-        if (!result.ok) return -5;
+        if (!result.ok) {
+          netLog("listen", {
+            fd,
+            host,
+            port,
+            result: "EIO",
+            reason: result.error ?? "backend listen rejected",
+          });
+          return -5;
+        }
         target.listener = result.listener;
         target.boundHost = host;
         target.boundPort = port;
@@ -3343,6 +3446,14 @@ export function createKernelImports(
           // bridge close runs async in the bridge worker regardless.
           void socketBackend.closeListener?.(listener);
         };
+        netLog("listen", {
+          fd,
+          host,
+          port,
+          result: "ok",
+          assignedHost: result.host,
+          assignedPort: result.port,
+        });
         return 0;
       };
       const listenResult = socketBackend.listen({
@@ -3372,11 +3483,28 @@ export function createKernelImports(
     ): Promise<number> {
       const target = opts.kernel?.getFdTarget(callerPid, fd);
       if (!target || target.type !== "socket" || target.listener == null) {
+        netLog("accept", { fd, result: "EBADF" });
         return -9;
       }
-      if (!socketBackend?.accept) return -95;
+      if (!socketBackend?.accept) {
+        netLog("accept", { fd, result: "ENOTSUP" });
+        return -95;
+      }
       const accepted = await acceptSocketAsync(socketBackend, target.listener);
-      if (!accepted.ok) return accepted.error === "EAGAIN" ? -11 : -5;
+      if (!accepted.ok) {
+        netLog("accept", {
+          fd,
+          result: accepted.error === "EAGAIN" ? "EAGAIN" : "EIO",
+          reason: accepted.error,
+        });
+        return accepted.error === "EAGAIN" ? -11 : -5;
+      }
+      netLog("accept", {
+        fd,
+        peerHost: accepted.peerHost,
+        peerPort: accepted.peerPort,
+        result: "ok",
+      });
       if (!opts.kernel) return -5;
       const acceptedFd = opts.kernel.allocFd(callerPid, {
         type: "socket",
@@ -3444,13 +3572,17 @@ export function createKernelImports(
       dataLen: number,
       _flags: number,
     ): number | Promise<number> {
-      if (!socketBackend) return ERR_IO;
+      if (!socketBackend) {
+        netLog("send", { fd, result: "EIO", reason: "no backend" });
+        return ERR_IO;
+      }
       if (dataLen < 0 || dataPtr < 0) return ERR_INVALID;
       const end = dataPtr + dataLen;
       if (end > memory.buffer.byteLength) return ERR_IO;
       try {
         const target = opts.kernel?.getFdTarget(callerPid, fd);
         if (!target || target.type !== "socket" || target.socket === null) {
+          netLog("send", { fd, result: "EBADF" });
           return ERR_NOT_FOUND;
         }
         const data = readBytes(memory, dataPtr, dataLen);
@@ -3459,12 +3591,16 @@ export function createKernelImports(
           if (!registry) return ERR_IO;
           const rawHandle = -(target.socket as number);
           const result = registry.sendDgramToPeer(rawHandle, data);
+          if (!result.ok) netLog("send", { fd, len: dataLen, result: "EIO" });
           return result.ok ? result.bytesSent : ERR_IO;
         }
         const interpret = (
           r: Awaited<ReturnType<typeof socketBackend.send>>,
         ): number => {
-          if (!r.ok) return ERR_IO;
+          if (!r.ok) {
+            netLog("send", { fd, len: dataLen, result: "EIO" });
+            return ERR_IO;
+          }
           return typeof r.bytes_sent === "number" ? r.bytes_sent : ERR_IO;
         };
         const sendResult = socketBackend.send(target.socket, data);
@@ -3493,15 +3629,22 @@ export function createKernelImports(
       outCap: number,
       flags: number,
     ): number | Promise<number> {
-      if (!socketBackend) return ERR_IO;
+      if (!socketBackend) {
+        netLog("recv", { fd, result: "EIO", reason: "no backend" });
+        return ERR_IO;
+      }
       if (outCap < 0 || outPtr < 0) return ERR_INVALID;
       const end = outPtr + outCap;
       if (end > memory.buffer.byteLength) return ERR_IO;
       const MSG_PEEK = 0x02;
-      if (flags !== 0 && flags !== MSG_PEEK) return ERR_UNSUPPORTED;
+      if (flags !== 0 && flags !== MSG_PEEK) {
+        netLog("recv", { fd, flags, result: "ENOTSUP" });
+        return ERR_UNSUPPORTED;
+      }
       try {
         const target = opts.kernel?.getFdTarget(callerPid, fd);
         if (!target || target.type !== "socket" || target.socket === null) {
+          netLog("recv", { fd, result: "EBADF" });
           return ERR_NOT_FOUND;
         }
         const maxBytes = outCap;

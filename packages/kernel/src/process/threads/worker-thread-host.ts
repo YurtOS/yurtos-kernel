@@ -158,6 +158,53 @@ function createPthreadWasiImports(
   const view = () => new DataView(memory.buffer);
   const bytes = () => new Uint8Array(memory.buffer);
 
+  // Line-buffered per-fd stderr/stdout sinks. cpython often writes one
+  // byte at a time; without buffering each byte would land on its own
+  // line with a `[pthread]` prefix, fragmenting tracebacks. Buffer
+  // until a newline, then emit with a single prefix. Use synchronous
+  // Deno.stderr/stdout write when available so chunks don't get
+  // dropped when the Worker terminates before console.error flushes.
+  const lineBuffers = new Map<number, string>();
+  const denoStream = (fd: number):
+    | { writeSync(buf: Uint8Array): number }
+    | null => {
+    try {
+      const d = (globalThis as {
+        Deno?: {
+          stdout: { writeSync(b: Uint8Array): number };
+          stderr: { writeSync(b: Uint8Array): number };
+        };
+      }).Deno;
+      if (!d) return null;
+      return fd === 1 ? d.stdout : d.stderr;
+    } catch {
+      return null;
+    }
+  };
+  const encoder = new TextEncoder();
+  const flushPthreadLine = (fd: number, line: string): void => {
+    const out = `[pthread] ${line}\n`;
+    const stream = denoStream(fd);
+    if (stream) {
+      stream.writeSync(encoder.encode(out));
+      return;
+    }
+    const sink = fd === 2 ? console.error : console.log;
+    sink(`[pthread] ${line}`);
+  };
+  const appendPthreadStdio = (fd: number, text: string): void => {
+    const prev = lineBuffers.get(fd) ?? "";
+    const combined = prev + text;
+    let cursor = 0;
+    while (true) {
+      const nl = combined.indexOf("\n", cursor);
+      if (nl < 0) break;
+      flushPthreadLine(fd, combined.slice(cursor, nl));
+      cursor = nl + 1;
+    }
+    lineBuffers.set(fd, combined.slice(cursor));
+  };
+
   return {
     // Optimistic stub: report every fd as a stream socket with no
     // flags so libzmq's signaler can read O_NONBLOCK state and then
@@ -233,8 +280,7 @@ function createPthreadWasiImports(
             return joined;
           })(),
         );
-        const sink = fd === 2 ? console.error : console.log;
-        sink(`[pthread] ${text}`);
+        appendPthreadStdio(fd, text);
       }
       v.setUint32(nwrittenPtr, total, true);
       return WASI_ESUCCESS;
