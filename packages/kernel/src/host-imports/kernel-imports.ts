@@ -1555,6 +1555,78 @@ export function createKernelImports(
         return ready;
       };
 
+      const waitForSocketReadiness = (
+        target: FdTarget & { type: "socket" },
+      ): Promise<void> => {
+        if (target.socket === null) return Promise.resolve();
+        return target.recvAsync(target.socket, 1).then((result) => {
+          if (!result.ok) return;
+          const data = result.data ?? new Uint8Array(0);
+          if (data.byteLength > 0) {
+            target.peekBuffer = target.peekBuffer
+              ? concatBytes(target.peekBuffer, data)
+              : data;
+          } else {
+            target.readShutdown = true;
+          }
+        });
+      };
+
+      const collectReadinessWaits = (): Array<Promise<void>> | null => {
+        const end = fdsPtr + nfds * POLLFD_SIZE;
+        if (fdsPtr < 0 || end > memory.buffer.byteLength) return null;
+        const view = new DataView(memory.buffer);
+        const waits: Array<Promise<void>> = [];
+        for (let i = 0; i < nfds; i++) {
+          const base = fdsPtr + i * POLLFD_SIZE;
+          const fd = view.getInt32(base, true);
+          if (fd < 0) continue;
+          const target = opts.kernel!.getFdTarget(callerPid, fd);
+          if (!target) continue;
+          const events = view.getInt16(base + 4, true);
+          const wantsRead = (events & POLLIN) !== 0;
+          const wantsWrite = (events & POLLOUT) !== 0;
+
+          if (
+            target.type === "pipe_read" && wantsRead &&
+            !target.pipe.hasData
+          ) {
+            waits.push(target.pipe.waitReadable());
+          } else if (
+            target.type === "pipe_write" && wantsWrite &&
+            !target.pipe.closed && !target.pipe.hasCapacity
+          ) {
+            waits.push(target.pipe.waitWritable());
+          } else if (
+            target.type === "tty_slave" && wantsRead &&
+            target.state.toSlave.length === 0 && !target.state.masterClosed
+          ) {
+            waits.push(
+              new Promise<void>((resolve) => {
+                target.state.toSlaveWaiters.push(resolve);
+              }),
+            );
+          } else if (
+            target.type === "tty_master" && wantsRead &&
+            target.state.toMaster.length === 0 && !target.state.masterClosed
+          ) {
+            waits.push(
+              new Promise<void>((resolve) => {
+                target.state.toMasterWaiters.push(resolve);
+              }),
+            );
+          } else if (
+            target.type === "socket" && wantsRead &&
+            target.socket !== null &&
+            (target.peekBuffer?.byteLength ?? 0) === 0 &&
+            !target.readShutdown
+          ) {
+            waits.push(waitForSocketReadiness(target));
+          }
+        }
+        return waits;
+      };
+
       const immediate = evaluate();
       if (immediate !== 0 || timeoutMs === 0) return immediate;
 
@@ -1569,30 +1641,100 @@ export function createKernelImports(
           new Promise<number>(() => {});
       }
 
+      const readinessWaits = collectReadinessWaits();
+      if (readinessWaits === null) return ERR_IO;
+
       return new Promise<number>((resolve, reject) => {
         const started = Date.now();
-        // Cooperative runtimes have no host-side readiness notification yet,
-        // so blocking poll/select wakes on this coarse timer.
-        const interval = setInterval(() => {
+        let done = false;
+        let interval: number | undefined;
+        let timeout: number | undefined;
+        let cancellationInterval: number | undefined;
+
+        const cleanup = () => {
+          if (interval !== undefined) clearInterval(interval);
+          if (timeout !== undefined) clearTimeout(timeout);
+          if (cancellationInterval !== undefined) {
+            clearInterval(cancellationInterval);
+          }
+        };
+        const finish = (value: number) => {
+          if (done) return;
+          done = true;
+          cleanup();
+          resolve(value);
+        };
+        const fail = (err: unknown) => {
+          if (done) return;
+          done = true;
+          cleanup();
+          reject(err);
+        };
+        const checkDetachedCancellation = (): boolean => {
           if (
             tid !== 0 && opts.threadsBackend?.isDetached?.(tid) &&
             opts.threadsBackend.detachedThreadsCancelled?.()
           ) {
-            clearInterval(interval);
             try {
               opts.threadsBackend.exit(0);
             } catch (err) {
-              reject(err);
+              fail(err);
             }
-            return;
+            return true;
           }
-          const ready = evaluate();
-          const expired = timeoutMs >= 0 && Date.now() - started >= timeoutMs;
-          if (ready !== 0 || expired) {
-            clearInterval(interval);
-            resolve(ready > 0 ? ready : 0);
+          return false;
+        };
+        const startLegacyTimerPoll = () => {
+          interval = setInterval(() => {
+            if (checkDetachedCancellation()) return;
+            const ready = evaluate();
+            const expired = timeoutMs >= 0 &&
+              Date.now() - started >= timeoutMs;
+            if (ready !== 0 || expired) {
+              finish(ready > 0 ? ready : 0);
+            }
+          }, 10);
+        };
+
+        if (readinessWaits.length > 0) {
+          if (timeoutMs >= 0) {
+            timeout = setTimeout(() => {
+              if (checkDetachedCancellation()) return;
+              const ready = evaluate();
+              finish(ready > 0 ? ready : 0);
+            }, timeoutMs);
           }
-        }, 10);
+          if (tid !== 0 && opts.threadsBackend?.isDetached?.(tid)) {
+            cancellationInterval = setInterval(() => {
+              checkDetachedCancellation();
+            }, 10);
+          }
+          const armReadinessWait = (waits: Array<Promise<void>>) => {
+            Promise.race(waits).then(() => {
+              if (done) return;
+              if (checkDetachedCancellation()) return;
+              const ready = evaluate();
+              if (ready !== 0) {
+                finish(ready);
+                return;
+              }
+              const nextWaits = collectReadinessWaits();
+              if (nextWaits === null) {
+                finish(ERR_IO);
+              } else if (nextWaits.length > 0) {
+                armReadinessWait(nextWaits);
+              } else {
+                startLegacyTimerPoll();
+              }
+            }, fail);
+          };
+          armReadinessWait(readinessWaits);
+          return;
+        }
+
+        // Targets without host-side readiness notification still use the
+        // legacy cooperative timer path.
+        startLegacyTimerPoll();
       });
     },
 
