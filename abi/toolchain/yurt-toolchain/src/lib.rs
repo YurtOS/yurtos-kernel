@@ -176,3 +176,19 @@ pub const YURT_INTERNAL_EXPORTS: &[&str] = &[
     "__dealloc",
     "__wasi_init_tp",
 ];
+
+/// wasm thread-local-storage primitives. wasm-ld emits these only when
+/// the binary contains `__thread` variables (cpython's `_Py_tss_tstate`,
+/// ipykernel/libzmq locals, …); single-threaded binaries (file-conformance
+/// fixtures, simple ABI canaries) don't have them. Use `--export-if-defined`
+/// so the link doesn't fail on the non-TLS binaries.
+///
+/// Without these exports, every spawned pthread Worker shares the same
+/// TLS region in shared linear memory — `_Py_tss_tstate` collides across
+/// heartbeat / iostream threads → `_PyThreadState_Attach: non-NULL old
+/// thread state` fatal. Force-exporting these lets `worker-thread-host.ts`
+/// allocate per-pthread TLS, set `__tls_base`, and call
+/// `__wasm_init_tls(tls_base)` to copy the template — same contract the
+/// wasi-threads spec's `wasi_thread_start` shim would use if we exported
+/// one.
+pub const YURT_OPTIONAL_EXPORTS: &[&str] = &["__tls_size", "__tls_base", "__wasm_init_tls"];

@@ -118,13 +118,54 @@ workerSelf.onmessage = async (e: MessageEvent<StartMessage>) => {
   let retval: number;
   try {
     const instance = await WebAssembly.instantiate(module, imports);
-    // wasi-libc threading initialiser. Without this each pthread
-    // Worker's wasm instance keeps the default (zero / main-inherited)
-    // thread-pointer global, so any TLS-keyed runtime — including
-    // cpython's PyThreadState slot — sees the parent thread's value.
-    // ipykernel's heartbeat / iostream threads trip
-    // `_PyThreadState_Attach: non-NULL old thread state` immediately
-    // without it.
+
+    // wasm thread-local-storage bootstrap. wasm-ld emits `__thread`
+    // variables (cpython's `_Py_tss_tstate`, libzmq locals, …) at
+    // offsets from a per-instance `__tls_base` global, and a paired
+    // `__wasm_init_tls(addr)` export copies the linker-prepared TLS
+    // template into the per-thread region. Without doing this on
+    // each pthread Worker, every instance's `__tls_base` keeps its
+    // default value (typically 0) and every "thread-local" variable
+    // collides at the same shared-memory address — heartbeat /
+    // iostream threads then race on `_Py_tss_tstate` and trip
+    // `_PyThreadState_Attach: non-NULL old thread state` fatal.
+    //
+    // The three exports are emitted conditionally by wasm-ld (yurt-cc
+    // marks them `--export-if-defined` since single-threaded binaries
+    // don't have TLS variables). Skip the dance for those binaries —
+    // the canary tests, file-conformance fixture etc. don't need TLS.
+    const tlsSizeGlobal = instance.exports.__tls_size as
+      | WebAssembly.Global
+      | undefined;
+    const tlsBaseGlobal = instance.exports.__tls_base as
+      | WebAssembly.Global
+      | undefined;
+    const initTls = instance.exports.__wasm_init_tls as
+      | ((tlsBase: number) => void)
+      | undefined;
+    const alloc = instance.exports.__alloc as
+      | ((size: number) => number)
+      | undefined;
+    if (
+      tlsSizeGlobal !== undefined &&
+      tlsBaseGlobal !== undefined &&
+      typeof initTls === "function" &&
+      typeof alloc === "function"
+    ) {
+      const tlsSize = tlsSizeGlobal.value | 0;
+      if (tlsSize > 0) {
+        // wasi-libc malloc is mutex-protected and doesn't itself read
+        // TLS at allocation time, so this bootstrap call is safe even
+        // though `__wasi_init_tp` hasn't run yet.
+        const tlsBase = alloc(tlsSize) | 0;
+        tlsBaseGlobal.value = tlsBase;
+        initTls(tlsBase);
+      }
+    }
+
+    // wasi-libc thread-pointer initialiser. Runs AFTER `__tls_base` is
+    // valid because wasi-libc's pthread struct lives inside the TLS
+    // region we just wired up.
     const initTp = instance.exports.__wasi_init_tp;
     if (typeof initTp === "function") {
       (initTp as () => void)();
