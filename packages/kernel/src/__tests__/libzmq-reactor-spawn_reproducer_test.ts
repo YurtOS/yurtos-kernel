@@ -157,16 +157,31 @@ maybeDescribe("worker-host bridge.requestSync deadlock", () => {
       if (!ran.ok) {
         throw new Error(
           "DEADLOCK: IPKernelApp.initialize did not return within 20s.\n" +
-            "Expected cause: packages/kernel/src/network/bridge.ts's\n" +
-            "  - NetworkBridge.requestSync (line ~616)\n" +
-            "  - NetworkBridge.fetchSync   (line ~564)\n" +
-            "use blocking `Atomics.wait` on the main JS thread.\n" +
-            "When a worker (libzmq's I/O reactor) is alive and tries to\n" +
-            "round-trip a host-call via postMessage, main's event loop\n" +
-            "can't drain the message because it's parked in Atomics.wait.\n" +
-            "Mirror the SabMutex.lockAsync fix in sab-primitives.ts:\n" +
-            "switch to Atomics.waitAsync and propagate the Promise up\n" +
-            "through createNetworkBridgeSocketBackend's call sites.",
+            "\n" +
+            "Earlier layers already fixed (dc58e1c, dbaa1be): SabMutex/\n" +
+            "SabCondvar + NetworkBridge.requestSync/fetchSync now use\n" +
+            "Atomics.waitAsync. The remaining blocker is the WASI VFS path.\n" +
+            "\n" +
+            "Expected cause: packages/kernel/src/execution/vfs-proxy.ts:94\n" +
+            "still does `Atomics.wait(this.int32, 0, STATUS_REQUEST)` on the\n" +
+            "execution-worker thread (where cpython lives). cpython does\n" +
+            "many VFS ops during IPKernelApp.initialize (config dirs, log\n" +
+            "files, jupyter runtime paths) — each blocks the execution-\n" +
+            "worker event loop and stalls the pthread worker's dispatcher\n" +
+            "postMessages.\n" +
+            "\n" +
+            "Fix path (phased — order matters):\n" +
+            "  1. Add path_* WASI imports (path_open, path_filestat_get,\n" +
+            "     path_create_directory, path_unlink_file, path_rename,\n" +
+            "     path_symlink, path_readlink, path_remove_directory, …)\n" +
+            "     to ASYNC_WASI_IMPORTS in packages/kernel/src/process/\n" +
+            "     loader.ts:115. Verify against file-conformance smoke\n" +
+            "     (sunny's regression gate for JSPI i64-arg behavior).\n" +
+            "  2. Widen VfsLike interface in vfs/vfs-like.ts to return\n" +
+            "     `T | Promise<T>` for the affected methods.\n" +
+            "  3. Convert VfsProxy methods (and execution-worker.ts:467's\n" +
+            "     extension proxy) to use Atomics.waitAsync; cascade `await`\n" +
+            "     up through FdTable.open + the wrapped path_* imports.",
         );
       }
 

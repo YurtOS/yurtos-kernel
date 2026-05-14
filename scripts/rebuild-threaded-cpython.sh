@@ -104,7 +104,14 @@ else
   done
 
   step "3/8  Rebuild cpython3.wasm"
-  ports/cpython/scripts/build.sh
+  # Tee configure+make output to a log so the next config.site
+  # expansion can be auto-generated. After a successful build, run:
+  #   grep -oE 'checking for [a-zA-Z0-9_]+\.\.\. (yes|no)' /tmp/cpython-build.log \
+  #     | sort -u | sed -E 's/checking for ([a-zA-Z0-9_]+)\.\.\. (yes|no)/ac_cv_func_\1=\2/'
+  # Compare against existing ports/cpython/files/config.site; add new
+  # rows to kill future probe-storms. Same shape for `header` and
+  # `lib` checks (sed pattern needs adjusting).
+  ports/cpython/scripts/build.sh 2>&1 | tee /tmp/cpython-build.log
 
   step "4/8  Package cpython3 as .yurtpkg"
   ports/cpython/scripts/package.sh
