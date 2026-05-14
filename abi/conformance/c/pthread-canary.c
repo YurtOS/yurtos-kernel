@@ -147,6 +147,19 @@ int main(void) {
     return 1;
   }
 
+  pthread_mutexattr_t mutex_attr;
+  int mutex_type = PTHREAD_MUTEX_NORMAL;
+  if (pthread_mutexattr_init(&mutex_attr) != 0 ||
+      pthread_mutexattr_gettype(&mutex_attr, &mutex_type) != 0 ||
+      mutex_type != PTHREAD_MUTEX_NORMAL ||
+      pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE) != 0 ||
+      pthread_mutexattr_gettype(&mutex_attr, &mutex_type) != 0 ||
+      mutex_type != PTHREAD_MUTEX_RECURSIVE ||
+      pthread_mutexattr_destroy(&mutex_attr) != 0) {
+    fprintf(stderr, "pthread-canary: pthread_mutexattr type round-trip failed\n");
+    return 1;
+  }
+
   pthread_attr_t self_attr;
   void *stackaddr = (void *)1;
   size_t stacksize = 0;
@@ -167,6 +180,10 @@ int main(void) {
   clockid_t cond_clock = CLOCK_REALTIME;
   if (pthread_condattr_init(&cond_attr) != 0) {
     fprintf(stderr, "pthread-canary: pthread_condattr_init failed\n");
+    return 1;
+  }
+  if (pthread_condattr_getclock(&cond_attr, &cond_clock) != 0 || cond_clock != CLOCK_REALTIME) {
+    fprintf(stderr, "pthread-canary: pthread_condattr default clock failed\n");
     return 1;
   }
   if (pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC) != 0) {

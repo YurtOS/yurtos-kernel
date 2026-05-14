@@ -173,6 +173,8 @@ int pthread_once(pthread_once_t *once_control, void (*init_routine)(void)) {
 int pthread_mutexattr_init(pthread_mutexattr_t *attr) {
   if (!attr) return EINVAL;
   memset(attr, 0, sizeof(*attr));
+  int type = PTHREAD_MUTEX_NORMAL;
+  memcpy(attr, &type, sizeof(type));
   return 0;
 }
 
@@ -182,18 +184,22 @@ int pthread_mutexattr_destroy(pthread_mutexattr_t *attr) {
 
 int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int type) {
   if (!attr) return EINVAL;
-  return type >= PTHREAD_MUTEX_NORMAL && type <= PTHREAD_MUTEX_ERRORCHECK ? 0 : EINVAL;
+  if (type < PTHREAD_MUTEX_NORMAL || type > PTHREAD_MUTEX_ERRORCHECK) return EINVAL;
+  memcpy(attr, &type, sizeof(type));
+  return 0;
 }
 
 int pthread_mutexattr_gettype(const pthread_mutexattr_t *attr, int *type) {
   if (!attr || !type) return EINVAL;
-  *type = PTHREAD_MUTEX_NORMAL;
+  memcpy(type, attr, sizeof(*type));
   return 0;
 }
 
 int pthread_condattr_init(pthread_condattr_t *attr) {
   if (!attr) return EINVAL;
   memset(attr, 0, sizeof(*attr));
+  clockid_t clock_id = CLOCK_REALTIME;
+  memcpy(attr, &clock_id, sizeof(clock_id));
   return 0;
 }
 
@@ -204,12 +210,13 @@ int pthread_condattr_destroy(pthread_condattr_t *attr) {
 int pthread_condattr_setclock(pthread_condattr_t *attr, clockid_t clock_id) {
   if (!attr) return EINVAL;
   if (clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC) return EINVAL;
+  memcpy(attr, &clock_id, sizeof(clock_id));
   return 0;
 }
 
 int pthread_condattr_getclock(const pthread_condattr_t *attr, clockid_t *clock_id) {
   if (!attr || !clock_id) return EINVAL;
-  *clock_id = CLOCK_MONOTONIC;
+  memcpy(clock_id, attr, sizeof(*clock_id));
   return 0;
 }
 
