@@ -5,7 +5,7 @@
 #include <stdio.h>
 #include <unistd.h>
 
-#define NUM_THREADS 1
+#define NUM_THREADS 4
 #define ITERS_PER_THREAD 10000
 #define EXPECTED (NUM_THREADS * ITERS_PER_THREAD)
 

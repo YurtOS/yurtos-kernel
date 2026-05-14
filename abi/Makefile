@@ -26,7 +26,24 @@ DENO ?= deno
 # yurt-cc itself stays package-neutral. These flags preserve the curated ABI
 # build policy: gnulib-derived ports need C23 additions, and the ABI canaries
 # keep the historical warning/optimization profile here.
-YURT_CFLAGS := -O2 -std=gnu23 -Wall -Wextra
+#
+# Threads-by-default: every object the ABI build compiles is thread-capable
+# (-pthread enables _REENTRANT + pthread-aware libc paths; -matomics emits
+# wasm atomic ops required for pthread_mutex_t init; -mbulk-memory enables
+# the bulk-memory ops some threaded codegen paths assume). yurt-cc already
+# switches the target to wasm32-wasip1-threads to match. The single
+# libyurt_abi.a archive built from these objects pairs with the default
+# canary build (also threaded).
+#
+# YURT_CFLAGS_NOTHREADS is the legacy non-threaded profile, used ONLY for
+# the continuation (asyncify) canaries (setjmp-canary, fork-canary). Those
+# pair YURT_CC_USE_CONTINUATION=1 with target=wasm32-wasip1, where the
+# non-threads sysroot lacks TLS variants of errno so we must NOT pass
+# -pthread / atomics. Continuation builds happily link against the threaded
+# libyurt_abi.a — yurt-cc passes --no-check-features under the hood and
+# the ABI implementations don't emit thread-only opcodes themselves.
+YURT_CFLAGS_NOTHREADS := -O2 -std=gnu23 -Wall -Wextra
+YURT_CFLAGS := $(YURT_CFLAGS_NOTHREADS) -pthread -matomics -mbulk-memory
 LIB := $(BUILD_DIR)/libyurt_abi.a
 CONTINUATION_LIB := $(BUILD_DIR)/libyurt_continuation.a
 SETJMP_LIB := $(BUILD_DIR)/libyurt_setjmp.a
@@ -64,7 +81,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_version.o \
   $(BUILD_DIR)/yurt_write.o
 
-CANARY_NAMES := stdio sleep system popen affinity dup2 dlopen getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread pthread-main-exit unix
+CANARY_NAMES := stdio sleep system popen affinity dup2 dlopen getgroups posix-runtime locale signal setjmp fork pipe spawn spawn-wait resource exec socket socket-address socket-listen socket-listen-denied fetch pthread pthread-multi pthread-main-exit unix
 CANARIES := $(addprefix $(BUILD_DIR)/,$(addsuffix -canary.wasm,$(CANARY_NAMES)))
 FORK_DEFAULT_CANARY := $(BUILD_DIR)/fork-default-canary.wasm
 
@@ -130,6 +147,17 @@ CONTINUATION_OBJS := \
   $(BUILD_DIR)/yurt_setjmp.o \
   $(BUILD_DIR)/yurt_fork.o
 
+# Continuation objects must NOT be compiled with -pthread / atomics: they're
+# paired into libyurt_continuation.a, which is linked into asyncify (non-
+# threads) canaries via YURT_CC_USE_CONTINUATION=1 + target=wasm32-wasip1.
+# The non-threads wasi-libc supplies errno in .bss; pthread-compiled objects
+# would emit TLS relocations that won't resolve against that sysroot.
+$(BUILD_DIR)/yurt_setjmp.o: src/yurt_setjmp.c $(wildcard include/*.h) src/yurt_runtime.h src/yurt_markers.h | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) YURT_CC_USE_CONTINUATION=1 $(YURT_CC) $(YURT_CFLAGS_NOTHREADS) -c $< -o $@
+
+$(BUILD_DIR)/yurt_fork.o: src/yurt_fork.c $(wildcard include/*.h) src/yurt_runtime.h src/yurt_markers.h | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) YURT_CC_USE_CONTINUATION=1 $(YURT_CC) $(YURT_CFLAGS_NOTHREADS) -c $< -o $@
+
 $(LIB): $(LIB_OBJS) | $(BUILD_DIR) ensure-toolchain
 	rm -f $@
 	$(YURT_AR) rcs $@ $(LIB_OBJS)
@@ -146,7 +174,7 @@ $(BUILD_DIR)/setjmp-canary.wasm: $(CANARY_DIR)/setjmp-canary.c $(wildcard includ
 	YURT_CC_USE_CONTINUATION=1 \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/setjmp-canary.pre-opt.wasm \
-	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
+	$(YURT_CC) $(YURT_CFLAGS_NOTHREADS) $< -o $@
 
 $(BUILD_DIR)/fork-canary.wasm: $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) $(CONTINUATION_LIB) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
@@ -154,12 +182,31 @@ $(BUILD_DIR)/fork-canary.wasm: $(CANARY_DIR)/fork-canary.c $(wildcard include/*.
 	YURT_CC_USE_CONTINUATION=1 \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/fork-canary.pre-opt.wasm \
-	$(YURT_CC) $(YURT_CFLAGS) -DYURT_FORK_CANARY_CONTINUATION=1 $< -o $@
+	$(YURT_CC) $(YURT_CFLAGS_NOTHREADS) -DYURT_FORK_CANARY_CONTINUATION=1 $< -o $@
 
 $(FORK_DEFAULT_CANARY): $(CANARY_DIR)/fork-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
 	YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/fork-default-canary.pre-opt.wasm \
+	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
+
+# pthread canaries route through the Worker/SAB threads backend (see
+# packages/kernel/src/process/module-profile.ts — `hasThreadsFeature` ⇒
+# `threadsBackend: "worker-sab"`). All canaries do, now that yurt-cc is
+# threads-by-default; these rules exist only to override the generic
+# %-canary.wasm pattern's pre-opt path name. The `yurt.features =
+# ["threads"]` custom section is stamped automatically by yurt-cc unless
+# YURT_CC_USE_CONTINUATION=1 is set.
+$(BUILD_DIR)/pthread-canary.wasm: $(CANARY_DIR)/pthread-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/pthread-canary.pre-opt.wasm \
+	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
+
+$(BUILD_DIR)/pthread-multi-canary.wasm: $(CANARY_DIR)/pthread-multi-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
+	YURT_CC_ARCHIVE=$(abspath $(LIB)) \
+	YURT_CC_INCLUDE=$(INCLUDE) \
+	YURT_CC_PRESERVE_PRE_OPT=$(abspath $(BUILD_DIR))/pthread-multi-canary.pre-opt.wasm \
 	$(YURT_CC) $(YURT_CFLAGS) $< -o $@
 
 $(BUILD_DIR)/%-canary.wasm: $(CANARY_DIR)/%-canary.c $(wildcard include/*.h) $(LIB) | $(BUILD_DIR) ensure-toolchain
@@ -183,6 +230,13 @@ canaries: $(CANARIES) $(FORK_DEFAULT_CANARY)
 # to link against by definition. They DO depend on the headers in
 # include/ (currently only <stdint.h>-style standard headers, but the
 # rule wildcard keeps incremental rebuilds correct if a header is added).
+# Side modules compile against the threaded sysroot so they import a
+# shared `env.memory` matching their (always-threaded) main module.
+# wasi-sdk-33 ships a non-PIC `__init_tls.c.obj` in the threads sysroot
+# libc that wasm-ld --experimental-pic rejects, so we pass -nostdlib
+# + --no-entry on the link step: the dlcanary fixture is a leaf
+# function with no libc dependency, and side modules don't have an
+# entry point regardless.
 $(BUILD_DIR)/libyurt_dlcanary.o: $(CANARY_DIR)/libyurt_dlcanary.c $(wildcard include/*.h) | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) \
 	$(YURT_CC) $(YURT_CFLAGS) -fPIC -fvisibility=hidden -c $< -o $@
@@ -190,7 +244,7 @@ $(BUILD_DIR)/libyurt_dlcanary.o: $(CANARY_DIR)/libyurt_dlcanary.c $(wildcard inc
 $(BUILD_DIR)/libyurt_dlcanary.wasm: $(BUILD_DIR)/libyurt_dlcanary.o | $(BUILD_DIR) ensure-toolchain
 	YURT_CC_ARCHIVE= YURT_CC_INCLUDE=$(INCLUDE) \
 	YURT_CC_NO_WASM_OPT=1 \
-	$(YURT_CC) -shared $< -o $@
+	$(YURT_CC) -shared -nostdlib -Wl,--no-entry $< -o $@
 	# yurt-cc -shared automatically runs `yurt-wasi-postlink --side-module`
 	# at the end of the link, validating dylink.0 and emitting
 	# $@.yurtmeta.json. No separate postlink invocation needed.

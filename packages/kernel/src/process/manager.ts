@@ -35,7 +35,9 @@ export class ProcessManager {
   private currentHost: WasiHost | null = null;
   private toolAllowlist: Set<string> | null = null;
   private extensionHandler:
-    | ((cmd: Record<string, unknown>) => Record<string, unknown>)
+    | ((
+      cmd: Record<string, unknown>,
+    ) => Record<string, unknown> | Promise<Record<string, unknown>>)
     | null = null;
 
   /** Registry for dynamically loaded native Python module WASMs. */
@@ -130,7 +132,9 @@ export class ProcessManager {
 
   /** Set the extension handler for Python package → host extension bridge. */
   setExtensionHandler(
-    handler: (cmd: Record<string, unknown>) => Record<string, unknown>,
+    handler: (
+      cmd: Record<string, unknown>,
+    ) => Record<string, unknown> | Promise<Record<string, unknown>>,
   ): void {
     this.extensionHandler = handler;
   }

@@ -47,13 +47,13 @@ export class BrowserNetworkBridge implements NetworkBridgeLike {
     this.socketBackend = createLoopbackSocketBackend(undefined, this.registry);
   }
 
-  fetchSync(): SyncFetchResult {
-    return {
+  fetchSync(): Promise<SyncFetchResult> {
+    return Promise.resolve({
       status: 0,
       body: "",
       headers: {},
       error: "fetchSync not available in browser — use fetchAsync via JSPI",
-    };
+    });
   }
 
   async fetchAsync(
@@ -111,8 +111,10 @@ export class BrowserNetworkBridge implements NetworkBridgeLike {
     }
   }
 
-  requestSync(): SyncRequestResult {
-    return { ok: false, error: "requestSync not available in browser" };
+  requestSync(): Promise<SyncRequestResult> {
+    return Promise.resolve(
+      { ok: false, error: "requestSync not available in browser" },
+    );
   }
 
   async start(): Promise<void> {

@@ -66,10 +66,18 @@ export type SocketAcceptBackendResult =
   | { ok: false; wouldBlock: true; error: "accept would block" }
   | { ok: false; error: string };
 
+/**
+ * Method return type that lets backends pick the cheapest shape. Loopback
+ * stays sync (pure in-process registry calls); the network-bridge backend
+ * returns Promises because the bridge is itself async on main (see
+ * `NetworkBridge.requestSync`). Callers must `await` to handle both.
+ */
+export type Awaitable<T> = T | Promise<T>;
+
 export interface SocketBackend {
   connect(
     req: { host: string; port: number; tls: boolean },
-  ):
+  ): Awaitable<
     | {
       ok: true;
       socket: SocketHandle;
@@ -81,17 +89,25 @@ export interface SocketBackend {
       localHost?: string;
       localPort?: number;
     }
-    | { ok: false; error: string };
-  send(socket: SocketHandle, data: Uint8Array): SocketBackendResult;
+    | { ok: false; error: string }
+  >;
+  send(socket: SocketHandle, data: Uint8Array): Awaitable<SocketBackendResult>;
   recv(
     socket: SocketHandle,
     maxBytes: number,
     opts?: { nonblocking?: boolean },
-  ): SocketBackendResult;
-  setNoDelay?(socket: SocketHandle, enabled: boolean): SocketBackendResult;
-  listen?(req: SocketListenBackendRequest): SocketListenBackendResult;
+  ): Awaitable<SocketBackendResult>;
+  setNoDelay?(
+    socket: SocketHandle,
+    enabled: boolean,
+  ): Awaitable<SocketBackendResult>;
+  listen?(
+    req: SocketListenBackendRequest,
+  ): Awaitable<SocketListenBackendResult>;
   /** Polls for one accepted socket. Must not block the bridge request loop. */
-  accept?(listener: SocketListenerHandle): SocketAcceptBackendResult;
+  accept?(
+    listener: SocketListenerHandle,
+  ): Awaitable<SocketAcceptBackendResult>;
   /**
    * Optional blocking accept path. Backends that omit this fall back to
    * accept(), preserving older connect-only/mock implementations.
@@ -107,8 +123,10 @@ export interface SocketBackend {
     socket: SocketHandle,
     maxBytes: number,
   ): Promise<SocketBackendResult>;
-  closeListener?(listener: SocketListenerHandle): SocketBackendResult;
-  close(socket: SocketHandle): SocketBackendResult;
+  closeListener?(
+    listener: SocketListenerHandle,
+  ): Awaitable<SocketBackendResult>;
+  close(socket: SocketHandle): Awaitable<SocketBackendResult>;
   /**
    * Loopback backends expose their underlying ListenerRegistry so the host
    * can build a SandboxNet over the same routing tables the kernel sees.
@@ -178,8 +196,10 @@ export function recvSocketAsync(
   socket: SocketHandle,
   maxBytes: number,
 ): Promise<SocketBackendResult> {
-  return backend.recvAsync?.(socket, maxBytes) ??
-    Promise.resolve(backend.recv(socket, maxBytes, { nonblocking: false }));
+  return Promise.resolve(
+    backend.recvAsync?.(socket, maxBytes) ??
+      backend.recv(socket, maxBytes, { nonblocking: false }),
+  );
 }
 
 export function acceptSocketAsync(
@@ -351,8 +371,8 @@ export function createNetworkBridgeSocketBackend(
   bridge: NetworkBridgeLike,
 ): SocketBackend {
   return {
-    connect(req) {
-      const result = bridge.requestSync({
+    async connect(req) {
+      const result = await bridge.requestSync({
         op: "connect",
         host: req.host,
         port: req.port,
@@ -384,16 +404,16 @@ export function createNetworkBridgeSocketBackend(
       };
     },
 
-    send(socket, data) {
-      return socketResult(bridge.requestSync({
+    async send(socket, data) {
+      return socketResult(await bridge.requestSync({
         op: "send",
         socket_id: socket,
         data: Array.from(data),
       }));
     },
 
-    recv(socket, maxBytes, opts) {
-      return socketResult(bridge.requestSync({
+    async recv(socket, maxBytes, opts) {
+      return socketResult(await bridge.requestSync({
         op: "recv",
         socket_id: socket,
         max_bytes: maxBytes,
@@ -401,16 +421,16 @@ export function createNetworkBridgeSocketBackend(
       }));
     },
 
-    setNoDelay(socket, enabled) {
-      return socketResult(bridge.requestSync({
+    async setNoDelay(socket, enabled) {
+      return socketResult(await bridge.requestSync({
         op: "set_no_delay",
         socket_id: socket,
         enabled,
       }));
     },
 
-    listen(req) {
-      const result = bridge.requestSync({
+    async listen(req) {
+      const result = await bridge.requestSync({
         op: "listen",
         host: req.host,
         port: req.port,
@@ -433,8 +453,8 @@ export function createNetworkBridgeSocketBackend(
       };
     },
 
-    accept(listener) {
-      return parseAccept(bridge.requestSync({
+    async accept(listener) {
+      return parseAccept(await bridge.requestSync({
         op: "accept",
         listener_id: listener,
       }));
@@ -459,7 +479,7 @@ export function createNetworkBridgeSocketBackend(
       let delayMs = 5;
       // deno-lint-ignore no-constant-condition
       while (true) {
-        const r = parseAccept(bridge.requestSync({
+        const r = parseAccept(await bridge.requestSync({
           op: "accept",
           listener_id: listener,
         }));
@@ -482,7 +502,7 @@ export function createNetworkBridgeSocketBackend(
       let delayMs = 5;
       // deno-lint-ignore no-constant-condition
       while (true) {
-        const r = socketResult(bridge.requestSync({
+        const r = socketResult(await bridge.requestSync({
           op: "recv",
           socket_id: socket,
           max_bytes: maxBytes,
@@ -498,15 +518,15 @@ export function createNetworkBridgeSocketBackend(
       }
     },
 
-    closeListener(listener) {
-      return socketResult(bridge.requestSync({
+    async closeListener(listener) {
+      return socketResult(await bridge.requestSync({
         op: "close_listener",
         listener_id: listener,
       }));
     },
 
-    close(socket) {
-      return socketResult(bridge.requestSync({
+    async close(socket) {
+      return socketResult(await bridge.requestSync({
         op: "close",
         socket_id: socket,
       }));

@@ -9,6 +9,7 @@ import { resolve } from "node:path";
 import { Sandbox } from "../sandbox.js";
 import { NodeAdapter } from "../platform/node-adapter.js";
 import { unsupportedRuntimeEngineBackend } from "../engine/backend.js";
+import { analyzeYurtModule } from "../process/module-profile.ts";
 import type {
   FetchRequestBody,
   NetworkBridgeLike,
@@ -84,18 +85,18 @@ class StaticFetchBridge implements NetworkBridgeLike {
     headers: Record<string, string>,
     body?: FetchRequestBody,
     redirect?: "follow" | "manual",
-  ): SyncFetchResult {
+  ): Promise<SyncFetchResult> {
     this.requests.push({ url, method, headers, body, redirect });
-    return {
+    return Promise.resolve({
       status: 200,
       headers: {},
       body: "fetch-canary-ok",
       body_base64: "ZmV0Y2gtY2FuYXJ5LW9r",
-    };
+    });
   }
 
-  requestSync(): SyncRequestResult {
-    return { ok: false, error: "not used" };
+  requestSync(): Promise<SyncRequestResult> {
+    return Promise.resolve({ ok: false, error: "not used" });
   }
 }
 
@@ -959,7 +960,19 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     );
   });
 
-  it("runs the pthread-canary single-thread compatibility test", async () => {
+  it("runs the pthread-canary across 4 worker threads under the SAB backend", async () => {
+    // pthread-canary is built with YURT_CC_USE_THREADS=1 (see abi/Makefile).
+    // Verify the wasm carries yurt.features=["threads"] so the kernel
+    // routes the process through `WorkerSabThreadsBackend` rather than
+    // `CooperativeSerialBackend`. The C-side body now spawns
+    // NUM_THREADS=4 workers contending on a shared mutex; counter ==
+    // 4 * ITERS_PER_THREAD (40000) is the real multi-thread assertion.
+    const wasm = readFileSync(resolve(FIXTURES, "pthread-canary.wasm"));
+    const module = await WebAssembly.compile(wasm);
+    const profile = analyzeYurtModule(module, { workerSabAvailable: true });
+    expect(profile.hasThreadsFeature).toBe(true);
+    expect(profile.threadsBackend).toBe("worker-sab");
+
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
@@ -967,8 +980,34 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
 
     const result = await sandbox.run("pthread-canary");
 
+    if (result.exitCode !== 0) {
+      console.log("--- pthread-canary stdout ---\n" + result.stdout);
+      console.log("--- pthread-canary stderr ---\n" + result.stderr);
+    }
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toBe("pthread:ok");
+  });
+
+  it("runs the pthread-multi-canary condvar broadcast barrier", async () => {
+    // Spawns N=4 workers that block on a shared condvar; main flips
+    // `ready` under the lock and broadcasts. Each worker returns its
+    // own arg, joined back in main. Exercises the SAB condvar
+    // broadcast fan-out plus per-thread mutex/condvar views.
+    const wasm = readFileSync(resolve(FIXTURES, "pthread-multi-canary.wasm"));
+    const module = await WebAssembly.compile(wasm);
+    const profile = analyzeYurtModule(module, { workerSabAvailable: true });
+    expect(profile.hasThreadsFeature).toBe(true);
+    expect(profile.threadsBackend).toBe("worker-sab");
+
+    sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+    });
+
+    const result = await sandbox.run("pthread-multi-canary");
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("OK");
   });
 
   it("treats pthread_exit from main as a clean process exit", async () => {
