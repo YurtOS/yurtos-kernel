@@ -18,6 +18,8 @@ use crate::kh;
 
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
 
+const MSG_PEEK: u32 = 0x2;
+
 /// Reserved pid for direct calls from outside any user process — i.e.
 /// the kernel-host interface itself driving the kernel for tests, bootstrapping,
 /// or its own bookkeeping. Real user processes start at pid 1.
@@ -944,7 +946,7 @@ fn socket_recv_id(k: &mut Kernel, id: u64, response: &mut [u8], flags: u32) -> i
         SocketKind::Host { handle } => kh::socket_recv(*handle, response, flags),
         SocketKind::UnixListener { .. } => -(abi::EOPNOTSUPP as i64),
         SocketKind::UnixDatagram { rx, peer_open, .. } => {
-            if flags != 0 && flags != 2 {
+            if flags != 0 && flags != MSG_PEEK {
                 return -(abi::EOPNOTSUPP as i64);
             }
             let Some(packet) = rx.front() else {
@@ -952,20 +954,20 @@ fn socket_recv_id(k: &mut Kernel, id: u64, response: &mut [u8], flags: u32) -> i
             };
             let take = packet.len().min(response.len());
             response[..take].copy_from_slice(&packet[..take]);
-            if flags != 2 {
+            if flags != MSG_PEEK {
                 rx.pop_front();
             }
             take as i64
         }
         SocketKind::UnixStream { rx, peer_open, .. } => {
-            if flags != 0 && flags != 2 {
+            if flags != 0 && flags != MSG_PEEK {
                 return -(abi::EOPNOTSUPP as i64);
             }
             if rx.is_empty() {
                 return if *peer_open { -(abi::EAGAIN as i64) } else { 0 };
             }
             let take = rx.len().min(response.len());
-            if flags == 2 {
+            if flags == MSG_PEEK {
                 for (out, byte) in response.iter_mut().zip(rx.iter()).take(take) {
                     *out = *byte;
                 }
@@ -2709,6 +2711,10 @@ fn sys_socket_recvmsg(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i
         Err(rc) => rc,
     });
     if n < 0 {
+        return n;
+    }
+    if flags == MSG_PEEK {
+        response[data_cap..data_cap + 4].copy_from_slice(&0u32.to_le_bytes());
         return n;
     }
     let rights = with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
@@ -5070,6 +5076,79 @@ mod tests {
             ),
             -(abi::EAGAIN as i64)
         );
+    }
+
+    #[test]
+    fn socket_recvmsg_peek_preserves_fd_rights_for_real_receive() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut socket_fds = [0u8; 8];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKETPAIR,
+                1,
+                &socketpair_req(1, 1, 0),
+                &mut socket_fds
+            ),
+            8
+        );
+        let left = u32::from_le_bytes(socket_fds[0..4].try_into().unwrap());
+        let right = u32::from_le_bytes(socket_fds[4..8].try_into().unwrap());
+
+        let mut pipe_fds = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_fds), 8);
+        let pipe_read = u32::from_le_bytes(pipe_fds[0..4].try_into().unwrap());
+        let pipe_write = u32::from_le_bytes(pipe_fds[4..8].try_into().unwrap());
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SENDMSG,
+                1,
+                &socket_sendmsg_req(left, b"x", &[pipe_write]),
+                &mut []
+            ),
+            1
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &pipe_write.to_le_bytes(), &mut []),
+            0
+        );
+
+        let mut peek = [0u8; 1 + 4 + 4];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECVMSG,
+                1,
+                &socket_recvmsg_req(right, MSG_PEEK, 1),
+                &mut peek
+            ),
+            1
+        );
+        assert_eq!(peek[0], b'x');
+        assert_eq!(u32::from_le_bytes(peek[1..5].try_into().unwrap()), 0);
+
+        let mut recv = [0u8; 1 + 4 + 4];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECVMSG,
+                1,
+                &socket_recvmsg_req(right, 0, 1),
+                &mut recv
+            ),
+            1
+        );
+        assert_eq!(recv[0], b'x');
+        assert_eq!(u32::from_le_bytes(recv[1..5].try_into().unwrap()), 1);
+        let received_write = u32::from_le_bytes(recv[5..9].try_into().unwrap());
+
+        let mut write_req = received_write.to_le_bytes().to_vec();
+        write_req.extend_from_slice(b"ok");
+        assert_eq!(dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []), 2);
+        let mut read_buf = [0u8; 2];
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &pipe_read.to_le_bytes(), &mut read_buf),
+            2
+        );
+        assert_eq!(&read_buf, b"ok");
     }
 
     #[test]
