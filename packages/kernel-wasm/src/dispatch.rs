@@ -2780,22 +2780,57 @@ fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
         wasm.truncate(n as usize);
 
         let child_pid = k.alloc_spawn_pid();
-        // Wire the parent/child relationship so sys_wait can reap.
-        let (parent_nice, parent_policy, parent_priority) = {
+        // Wire POSIX fork-like inheritance before exec: cwd,
+        // credentials, resource limits, signal dispositions, process
+        // group/session, scheduler state, and the open fd table all
+        // come from the parent. The executable image and argv are
+        // then replaced by exec semantics.
+        let (
+            parent_umask,
+            parent_credentials,
+            parent_cwd,
+            parent_rlimits,
+            parent_fd_entries,
+            parent_nice,
+            parent_policy,
+            parent_priority,
+            parent_pgid,
+            parent_sid,
+            parent_signal_dispositions,
+        ) = {
             let parent = k.process_mut(caller_pid);
             (
+                parent.umask,
+                parent.credentials,
+                parent.cwd.clone(),
+                parent.rlimits,
+                parent.fd_table.entries(),
                 parent.nice,
                 parent.scheduler_policy,
                 parent.scheduler_priority,
+                parent.pgid,
+                parent.sid,
+                parent.signal_dispositions,
             )
         };
+        for (_, entry) in &parent_fd_entries {
+            inc_entry_ref(k, entry);
+        }
         {
             let child = k.process_mut(child_pid);
             child.ppid = caller_pid;
             child.argv = argv.clone();
+            child.umask = parent_umask;
+            child.credentials = parent_credentials;
+            child.cwd = parent_cwd;
+            child.rlimits = parent_rlimits;
+            child.fd_table = crate::kernel::FdTable::from_entries(parent_fd_entries);
             child.nice = parent_nice;
             child.scheduler_policy = parent_policy;
             child.scheduler_priority = parent_priority;
+            child.pgid = parent_pgid;
+            child.sid = parent_sid;
+            child.signal_dispositions = parent_signal_dispositions;
         }
         let parent = k.process_mut(caller_pid);
         if !parent.children.contains(&child_pid) {
@@ -6572,7 +6607,7 @@ mod tests {
         //   4. record_exit(child, 7) makes parent's sys_wait reap.
         let _g = crate::kernel::TestGuard::acquire();
         let body: &[u8] = b"\0asm\x01\x00\x00\x00fake-wasm-bytes";
-        let path: &[u8] = b"/bin/echo";
+        let path: &[u8] = b"/spawn-drain-reap-echo";
         let mut reg = (path.len() as u32).to_le_bytes().to_vec();
         reg.extend_from_slice(path);
         reg.extend_from_slice(body);
@@ -6685,6 +6720,83 @@ mod tests {
             u32::from_le_bytes(buf[argv0_len_off..argv0_len_off + 4].try_into().unwrap()) as usize;
         let argv0_off = argv0_len_off + 4;
         assert_eq!(&buf[argv0_off..argv0_off + argv0_len], argv0);
+    }
+
+    #[test]
+    fn sys_spawn_inherits_parent_cwd_and_fd_table() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let body: &[u8] = b"\0asm\x01\x00\x00\x00fake-wasm";
+        let exe: &[u8] = b"/spawn-inherit-child";
+        let mut reg = (exe.len() as u32).to_le_bytes().to_vec();
+        reg.extend_from_slice(exe);
+        reg.extend_from_slice(body);
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let parent_pid = 7;
+        assert_eq!(
+            dispatch(METHOD_SYS_CHDIR, parent_pid, b"/tmp/work", &mut []),
+            0
+        );
+
+        let out_fd = dispatch(
+            METHOD_SYS_OPEN,
+            parent_pid,
+            &open_req(O_WRITE | O_CREAT | O_TRUNC, b"/tmp/out"),
+            &mut [],
+        );
+        assert_eq!(out_fd, 3);
+        let mut dup2_req = (out_fd as u32).to_le_bytes().to_vec();
+        dup2_req.extend_from_slice(&1_u32.to_le_bytes());
+        assert_eq!(dispatch(METHOD_SYS_DUP2, parent_pid, &dup2_req, &mut []), 1);
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_CLOSE,
+                parent_pid,
+                &(out_fd as u32).to_le_bytes(),
+                &mut []
+            ),
+            0
+        );
+
+        let mut sreq = (exe.len() as u32).to_le_bytes().to_vec();
+        sreq.extend_from_slice(exe);
+        sreq.extend_from_slice(&5_u32.to_le_bytes());
+        sreq.extend_from_slice(b"child");
+        let child_pid = dispatch(METHOD_SYS_SPAWN, parent_pid, &sreq, &mut []);
+        assert!(child_pid >= 1000, "spawn pid got {child_pid}");
+        let child_pid = child_pid as u32;
+
+        let child_cwd = with_kernel(|k| k.process(child_pid).cwd.clone());
+        assert_eq!(child_cwd, b"/tmp/work");
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_WRITE,
+                child_pid,
+                &socket_send_req(1, b"child\n"),
+                &mut []
+            ),
+            6
+        );
+
+        let read_fd = dispatch(
+            METHOD_SYS_OPEN,
+            parent_pid,
+            &open_req(0, b"/tmp/out"),
+            &mut [],
+        );
+        assert_eq!(read_fd, 3);
+        let mut out = [0u8; 16];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_READ,
+                parent_pid,
+                &(read_fd as u32).to_le_bytes(),
+                &mut out
+            ),
+            6
+        );
+        assert_eq!(&out[..6], b"child\n");
     }
 
     #[test]

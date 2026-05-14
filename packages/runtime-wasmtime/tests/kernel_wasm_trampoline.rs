@@ -1327,6 +1327,81 @@ fn run_pending_spawns_runs_real_wasm_child_and_parent_reaps() {
 }
 
 #[test]
+fn run_pending_spawns_preserves_spawned_child_fd_inheritance() {
+    let mk = fresh_kernel_host_interface(0);
+    let child = wat::parse_str(
+        r#"
+        (module
+          (import "env" "sys_write" (func $write (param i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (data (i32.const 16) "child\n")
+          (func (export "_start")
+            (drop (call $write (i32.const 1) (i32.const 16) (i32.const 6)))))
+        "#,
+    )
+    .unwrap();
+    let child_path = b"/bin/write-child";
+    mk.register_ramfs_file(child_path, &child).unwrap();
+
+    let parent_pid = 1;
+    let mut open_req = (0b001_u32 | 0b010 | 0b100).to_le_bytes().to_vec();
+    open_req.extend_from_slice(b"/tmp/spawn-out");
+    let out_fd = mk
+        .syscall_as(parent_pid, METHOD_SYS_OPEN, &open_req, &mut [])
+        .unwrap();
+    assert_eq!(out_fd, 3);
+
+    let mut dup2_req = (out_fd as u32).to_le_bytes().to_vec();
+    dup2_req.extend_from_slice(&1_u32.to_le_bytes());
+    assert_eq!(
+        mk.syscall_as(parent_pid, METHOD_SYS_DUP2, &dup2_req, &mut [])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        mk.syscall_as(
+            parent_pid,
+            METHOD_SYS_CLOSE,
+            &(out_fd as u32).to_le_bytes(),
+            &mut [],
+        )
+        .unwrap(),
+        0
+    );
+
+    let mut spawn_req = (child_path.len() as u32).to_le_bytes().to_vec();
+    spawn_req.extend_from_slice(child_path);
+    spawn_req.extend_from_slice(&5_u32.to_le_bytes());
+    spawn_req.extend_from_slice(b"child");
+    let child_pid = mk
+        .syscall_as(parent_pid, METHOD_SYS_SPAWN, &spawn_req, &mut [])
+        .unwrap();
+    assert!(child_pid >= 1000, "kernel child pid expected: {child_pid}");
+
+    assert_eq!(mk.run_pending_spawns().unwrap(), 1);
+
+    let mut read_open = 0_u32.to_le_bytes().to_vec();
+    read_open.extend_from_slice(b"/tmp/spawn-out");
+    let read_fd = mk
+        .syscall_as(parent_pid, METHOD_SYS_OPEN, &read_open, &mut [])
+        .unwrap();
+    assert!(read_fd >= 3, "read fd expected, got {read_fd}");
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        mk.syscall_as(
+            parent_pid,
+            METHOD_SYS_READ,
+            &(read_fd as u32).to_le_bytes(),
+            &mut out,
+        )
+        .unwrap(),
+        6
+    );
+    assert_eq!(&out[..6], b"child\n");
+}
+
+#[test]
 fn redb_kv_persists_across_kernel_host_interface_restarts() {
     // RedbKv is one concrete impl behind the pluggable KvBackend
     // trait. Embedders may swap in sled / rocksdb / SQLite / S3

@@ -161,6 +161,19 @@ impl FdTable {
     pub fn remove(&mut self, fd: u32) -> Option<FdEntry> {
         self.entries.remove(&fd)
     }
+
+    pub fn entries(&self) -> Vec<(u32, FdEntry)> {
+        self.entries
+            .iter()
+            .map(|(fd, entry)| (*fd, entry.clone()))
+            .collect()
+    }
+
+    pub fn from_entries(entries: Vec<(u32, FdEntry)>) -> Self {
+        Self {
+            entries: entries.into_iter().collect(),
+        }
+    }
 }
 
 impl Default for FdTable {
@@ -1212,12 +1225,18 @@ pub fn with_kernel<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
 pub fn reset_for_tests() {
     let mut k = KERNEL.lock().unwrap();
     k.processes.clear();
+    k.pipes.clear();
+    k.next_pipe_id = 1;
     k.vfs.clear();
     k.ofds.clear();
     k.next_ofd_id = 1;
     k.sockets.clear();
     k.next_socket_id = 1;
+    k.unix_listeners.clear();
+    k.unix_datagrams.clear();
+    k.unix_socket_inodes.clear();
     k.metadata_overrides.clear();
+    k.pending_spawns.clear();
     k.next_host_pid = 1;
     k.next_spawn_pid = 1000;
     k.last_scheduled = None;
