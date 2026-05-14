@@ -377,6 +377,10 @@ pub struct OpenFileDescription {
 }
 
 pub enum SocketKind {
+    Open {
+        flags: u32,
+        bound_addr: Option<Vec<u8>>,
+    },
     Host {
         handle: i32,
     },
@@ -672,6 +676,24 @@ impl Kernel {
         id
     }
 
+    pub fn create_open_socket(&mut self, domain: u8, sock_type: u8, flags: u32) -> u64 {
+        let id = self.next_socket_id;
+        self.next_socket_id += 1;
+        self.sockets.insert(
+            id,
+            SocketEntry {
+                refs: 1,
+                domain,
+                sock_type,
+                kind: SocketKind::Open {
+                    flags,
+                    bound_addr: None,
+                },
+            },
+        );
+        id
+    }
+
     pub fn create_unix_stream_pair(&mut self) -> (u64, u64) {
         let left = self.next_socket_id;
         let right = self.next_socket_id + 1;
@@ -888,6 +910,7 @@ impl Kernel {
             socket.refs = socket.refs.saturating_sub(1);
             if socket.refs == 0 {
                 match &socket.kind {
+                    SocketKind::Open { .. } => Some((None, None, None, None, Vec::new())),
                     SocketKind::Host { handle } => {
                         Some((Some(*handle), None, None, None, Vec::new()))
                     }

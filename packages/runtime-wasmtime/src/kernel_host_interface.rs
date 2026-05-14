@@ -4066,13 +4066,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_socket_connect",
-        |mut caller: Caller<'_, UserState>,
-         family: i32,
-         sock_type: i32,
-         flags: i32,
-         addr_ptr: u32,
-         addr_len: u32|
-         -> i32 {
+        |mut caller: Caller<'_, UserState>, fd: i32, addr_ptr: u32, addr_len: u32| -> i32 {
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -22,
@@ -4081,9 +4075,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
                 return -22;
             }
-            // Wire format: u8 family + u8 sock_type + u16 _pad + u32 flags + addr.
-            let mut req: Vec<u8> = vec![family as u8, sock_type as u8, 0, 0];
-            req.extend_from_slice(&(flags as u32).to_le_bytes());
+            let mut req = (fd as u32).to_le_bytes().to_vec();
             req.extend_from_slice(&addr);
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
@@ -4343,17 +4335,9 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     linker.func_wrap(
         SYS_NAMESPACE,
         "sys_socket_listen",
-        |mut caller: Caller<'_, UserState>, backlog: i32, addr_ptr: u32, addr_len: u32| -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
-            };
-            let mut addr = vec![0u8; addr_len as usize];
-            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
-                return -22;
-            }
-            let mut req = (backlog as u32).to_le_bytes().to_vec();
-            req.extend_from_slice(&addr);
+        |mut caller: Caller<'_, UserState>, fd: i32, backlog: i32| -> i32 {
+            let mut req = (fd as u32).to_le_bytes().to_vec();
+            req.extend_from_slice(&(backlog as u32).to_le_bytes());
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::SOCKET_LISTEN,

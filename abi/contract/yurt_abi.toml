@@ -134,6 +134,10 @@ doc = "Invalid argument."
 value = 75
 doc = "Value too large for defined data type."
 
+[errno.ENOTSOCK]
+value = 88
+doc = "Socket operation on non-socket."
+
 [errno.ECONNRESET]
 value = 104
 doc = "Connection reset by peer."

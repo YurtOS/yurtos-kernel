@@ -96,6 +96,8 @@ const METHOD_SYS_SCHED_SETSCHEDULER: u32 = 0x1_0041;
 const METHOD_SYS_SCHED_SETPARAM: u32 = 0x1_0042;
 const METHOD_SYS_POLL: u32 = 0x1_0043;
 const METHOD_SYS_SOCKETPAIR: u32 = 0x1_0044;
+const METHOD_SYS_SOCKET_OPEN: u32 = 0x1_0045;
+const METHOD_SYS_SOCKET_BIND: u32 = 0x1_0046;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -1490,12 +1492,33 @@ fn sys_socket_listen_accept_round_trips_through_kernel() {
     };
     let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
-    // sys_socket_listen request: u32 backlog + addr.
-    let mut req = 16_u32.to_le_bytes().to_vec();
-    req.extend_from_slice(b"127.0.0.1:0");
-    let listener = mk.syscall(METHOD_SYS_SOCKET_LISTEN, &req, &mut []).unwrap();
-    assert!(listener >= 0, "listen failed: {listener}");
+    let listener = mk
+        .syscall(
+            METHOD_SYS_SOCKET_OPEN,
+            &[
+                2, /* AF_INET */
+                1, /* SOCK_STREAM */
+                0, 0, 0, 0, 0, 0,
+            ],
+            &mut [],
+        )
+        .unwrap();
+    assert!(listener >= 0, "socket failed: {listener}");
     let listener_handle = listener as i32;
+    let mut bind_req = listener_handle.to_le_bytes().to_vec();
+    bind_req.extend_from_slice(b"127.0.0.1:0");
+    assert_eq!(
+        mk.syscall(METHOD_SYS_SOCKET_BIND, &bind_req, &mut [])
+            .unwrap(),
+        0
+    );
+    let mut listen_req = listener_handle.to_le_bytes().to_vec();
+    listen_req.extend_from_slice(&16_u32.to_le_bytes());
+    assert_eq!(
+        mk.syscall(METHOD_SYS_SOCKET_LISTEN, &listen_req, &mut [])
+            .unwrap(),
+        0
+    );
 
     // Discover the actually-bound port.
     let mut addr_buf = [0u8; 64];
@@ -1565,8 +1588,26 @@ fn sys_socket_listen_denied_by_policy_returns_eacces() {
         },
     )
     .unwrap();
-    let mut req = 16_u32.to_le_bytes().to_vec();
-    req.extend_from_slice(b"127.0.0.1:0");
+    let socket = mk
+        .syscall(
+            METHOD_SYS_SOCKET_OPEN,
+            &[
+                2, /* AF_INET */
+                1, /* SOCK_STREAM */
+                0, 0, 0, 0, 0, 0,
+            ],
+            &mut [],
+        )
+        .unwrap();
+    let mut bind_req = (socket as i32).to_le_bytes().to_vec();
+    bind_req.extend_from_slice(b"127.0.0.1:0");
+    assert_eq!(
+        mk.syscall(METHOD_SYS_SOCKET_BIND, &bind_req, &mut [])
+            .unwrap(),
+        0
+    );
+    let mut req = (socket as i32).to_le_bytes().to_vec();
+    req.extend_from_slice(&16_u32.to_le_bytes());
     let rc = mk.syscall(METHOD_SYS_SOCKET_LISTEN, &req, &mut []).unwrap();
     assert_eq!(rc, -13, "deny → -EACCES, got {rc}");
 }
@@ -1597,16 +1638,27 @@ fn sys_socket_connect_send_recv_through_local_echo_server() {
     };
     let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
 
-    // sys_socket_connect request: u8 family + u8 sock_type + u16
-    // pad + u32 flags + addr ("host:port" UTF-8).
-    let addr = format!("127.0.0.1:{port}");
-    let mut req: Vec<u8> = vec![2 /*AF_INET*/, 1 /*SOCK_STREAM*/, 0, 0];
-    req.extend_from_slice(&0_u32.to_le_bytes()); // flags
-    req.extend_from_slice(addr.as_bytes());
     let handle = mk
+        .syscall(
+            METHOD_SYS_SOCKET_OPEN,
+            &[
+                2, /* AF_INET */
+                1, /* SOCK_STREAM */
+                0, 0, 0, 0, 0, 0,
+            ],
+            &mut [],
+        )
+        .unwrap();
+    assert!(handle >= 0, "socket failed: {handle}");
+
+    // sys_socket_connect request: u32 fd + addr ("host:port" UTF-8).
+    let addr = format!("127.0.0.1:{port}");
+    let mut req = (handle as i32).to_le_bytes().to_vec();
+    req.extend_from_slice(addr.as_bytes());
+    let rc = mk
         .syscall(METHOD_SYS_SOCKET_CONNECT, &req, &mut [])
         .unwrap();
-    assert!(handle >= 0, "connect failed: {handle}");
+    assert_eq!(rc, 0, "connect failed: {rc}");
 
     // Send a payload.
     let payload = b"hello tcp";
@@ -1650,8 +1702,10 @@ fn sys_socket_connect_denied_by_policy_returns_eacces() {
         },
     )
     .unwrap();
-    let mut req: Vec<u8> = vec![2, 1, 0, 0];
-    req.extend_from_slice(&0_u32.to_le_bytes());
+    let socket = mk
+        .syscall(METHOD_SYS_SOCKET_OPEN, &[2, 1, 0, 0, 0, 0, 0, 0], &mut [])
+        .unwrap();
+    let mut req = (socket as i32).to_le_bytes().to_vec();
     req.extend_from_slice(b"127.0.0.1:1");
     let rc = mk
         .syscall(METHOD_SYS_SOCKET_CONNECT, &req, &mut [])
@@ -2105,8 +2159,10 @@ fn user_process_af_unix_path_stream_round_trips_through_kernel() {
     let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
-          (import "env" "sys_socket_listen" (func $listen (param i32 i32 i32) (result i32)))
-          (import "env" "sys_socket_connect" (func $connect (param i32 i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_open" (func $open (param i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_bind" (func $bind (param i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_listen" (func $listen (param i32 i32) (result i32)))
+          (import "env" "sys_socket_connect" (func $connect (param i32 i32 i32) (result i32)))
           (import "env" "sys_socket_accept" (func $accept (param i32 i32) (result i32)))
           (import "env" "sys_socket_send" (func $send (param i32 i32 i32) (result i64)))
           (import "env" "sys_socket_recv" (func $recv (param i32 i32 i32 i32) (result i64)))
@@ -2118,8 +2174,11 @@ fn user_process_af_unix_path_stream_round_trips_through_kernel() {
           (global $client (mut i32) (i32.const -1))
           (global $server (mut i32) (i32.const -1))
           (func (export "setup") (result i32)
-            (global.set $listener (call $listen (i32.const 4) (i32.const 64) (i32.const 25)))
-            (global.set $client (call $connect (i32.const 3) (i32.const 6) (i32.const 0) (i32.const 64) (i32.const 25)))
+            (global.set $listener (call $open (i32.const 3) (i32.const 6) (i32.const 0)))
+            (drop (call $bind (global.get $listener) (i32.const 64) (i32.const 25)))
+            (drop (call $listen (global.get $listener) (i32.const 4)))
+            (global.set $client (call $open (i32.const 3) (i32.const 6) (i32.const 0)))
+            (drop (call $connect (global.get $client) (i32.const 64) (i32.const 25)))
             (global.set $server (call $accept (global.get $listener) (i32.const 0)))
             (i32.add
               (i32.add (global.get $listener) (global.get $client))

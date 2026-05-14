@@ -650,9 +650,12 @@ fn inc_entry_ref(k: &mut Kernel, entry: &FdEntry) {
 }
 
 fn socket_handle_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32) -> Result<i32, i64> {
-    let entry = k.process_mut(caller_pid).fd_table.entry(fd).cloned();
-    let Some(FdEntry::Socket { id }) = entry else {
-        return Err(-(abi::EBADF as i64));
+    let entry = match k.process_mut(caller_pid).fd_table.entry(fd).cloned() {
+        Some(entry) => entry,
+        None => return Err(-(abi::EBADF as i64)),
+    };
+    let FdEntry::Socket { id } = entry else {
+        return Err(-(abi::ENOTSOCK as i64));
     };
     match k.socket(id).map(|socket| &socket.kind) {
         Some(SocketKind::Host { handle }) => Ok(*handle),
@@ -661,9 +664,12 @@ fn socket_handle_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32) -> Result<i32,
 }
 
 fn socket_id_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32) -> Result<u64, i64> {
-    let entry = k.process_mut(caller_pid).fd_table.entry(fd).cloned();
-    let Some(FdEntry::Socket { id }) = entry else {
-        return Err(-(abi::EBADF as i64));
+    let entry = match k.process_mut(caller_pid).fd_table.entry(fd).cloned() {
+        Some(entry) => entry,
+        None => return Err(-(abi::EBADF as i64)),
+    };
+    let FdEntry::Socket { id } = entry else {
+        return Err(-(abi::ENOTSOCK as i64));
     };
     if k.socket(id).is_none() {
         return Err(-(abi::EBADF as i64));
@@ -692,6 +698,15 @@ fn install_socket_id_fd(k: &mut Kernel, caller_pid: u32, id: u64) -> u32 {
     fd
 }
 
+fn replace_socket_fd(k: &mut Kernel, caller_pid: u32, fd: u32, old_id: u64, new_id: u64) {
+    k.process_mut(caller_pid)
+        .fd_table
+        .install(fd, FdEntry::Socket { id: new_id });
+    if let Some(handle) = k.socket_dec_ref(old_id) {
+        kh::socket_close(handle);
+    }
+}
+
 fn unix_path_from_addr(addr: &[u8]) -> Option<&[u8]> {
     addr.strip_prefix(b"unix:").filter(|path| !path.is_empty())
 }
@@ -702,6 +717,7 @@ fn socket_send_id(k: &mut Kernel, id: u64, data: &[u8]) -> i64 {
         Datagram(u64, bool),
     }
     let peer = match k.socket(id).map(|socket| &socket.kind) {
+        Some(SocketKind::Open { .. }) => return -(abi::ENOTCONN as i64),
         Some(SocketKind::Host { handle }) => return kh::socket_send(*handle, data),
         Some(SocketKind::UnixStream {
             peer_id, peer_open, ..
@@ -754,7 +770,9 @@ fn socket_sendto_id(k: &mut Kernel, id: u64, addr: &[u8], data: &[u8]) -> i64 {
         Some(SocketKind::UnixStream { .. } | SocketKind::UnixListener { .. }) => {
             return -(abi::EOPNOTSUPP as i64);
         }
-        Some(SocketKind::Host { .. }) => return -(abi::EOPNOTSUPP as i64),
+        Some(SocketKind::Open { .. }) | Some(SocketKind::Host { .. }) => {
+            return -(abi::EOPNOTSUPP as i64);
+        }
         None => return -(abi::EBADF as i64),
     }
     let Some(target_id) = k.unix_datagram_id_for_path(path) else {
@@ -847,7 +865,7 @@ fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>)
                 data.len() as i64
             }
         }
-        Some(SocketKind::Host { .. }) => -(abi::EOPNOTSUPP as i64),
+        Some(SocketKind::Open { .. }) | Some(SocketKind::Host { .. }) => -(abi::EOPNOTSUPP as i64),
         Some(SocketKind::UnixDatagram { peer_id: None, .. }) => -(abi::EINVAL as i64),
         Some(SocketKind::UnixListener { .. }) => -(abi::EOPNOTSUPP as i64),
         None => -(abi::EBADF as i64),
@@ -867,6 +885,7 @@ fn socket_recv_id(k: &mut Kernel, id: u64, response: &mut [u8], flags: u32) -> i
         return -(abi::EBADF as i64);
     };
     match &mut socket.kind {
+        SocketKind::Open { .. } => -(abi::ENOTCONN as i64),
         SocketKind::Host { handle } => kh::socket_recv(*handle, response, flags),
         SocketKind::UnixListener { .. } => -(abi::EOPNOTSUPP as i64),
         SocketKind::UnixDatagram { rx, peer_open, .. } => {
@@ -1224,6 +1243,13 @@ fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) ->
                 return POLLNVAL;
             };
             match &socket.kind {
+                SocketKind::Open { .. } => {
+                    if wants_write {
+                        POLLOUT
+                    } else {
+                        0
+                    }
+                }
                 SocketKind::Host { .. } => {
                     if wants_write {
                         POLLOUT
@@ -2232,30 +2258,62 @@ fn sys_idb_list(request: &[u8], response: &mut [u8]) -> i64 {
     kh::idb_list(store, prefix, response)
 }
 
-/// `sys_socket_listen(backlog, addr) -> fd`. Combines
-/// open+bind+listen so userland gets a usable listener in one
-/// hop. Request: u32 backlog LE + addr ('host:port', port=0
-/// = host-chosen).
+/// `sys_socket_listen(fd, backlog) -> 0`. Request: u32 fd LE +
+/// u32 backlog LE. The fd must already refer to an opened stream
+/// socket; any bind address is stored on the socket entry.
 fn sys_socket_listen(caller_pid: u32, request: &[u8]) -> i64 {
-    if request.len() < 4 {
+    if request.len() < 8 {
         return -(abi::EINVAL as i64);
     }
-    let backlog = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
-    let addr = &request[4..];
-    if addr.is_empty() {
-        return -(abi::EINVAL as i64);
-    }
-    if let Some(path) = unix_path_from_addr(addr) {
-        return with_kernel(|k| match k.create_unix_listener(path, backlog) {
-            Ok(id) => install_socket_id_fd(k, caller_pid, id) as i64,
-            Err(errno) => -(errno as i64),
-        });
-    }
-    let handle = kh::socket_listen_at(addr, backlog);
-    if handle < 0 {
-        return handle as i64;
-    }
-    with_kernel(|k| install_socket_fd(k, caller_pid, handle, 2, 1) as i64)
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let backlog = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    with_kernel(|k| {
+        let id = match socket_id_for_fd(k, caller_pid, fd) {
+            Ok(id) => id,
+            Err(rc) => return rc,
+        };
+        let Some(socket) = k.socket(id) else {
+            return -(abi::EBADF as i64);
+        };
+        let (domain, sock_type, addr) = match &socket.kind {
+            SocketKind::Open { bound_addr, .. } => {
+                (socket.domain, socket.sock_type, bound_addr.clone())
+            }
+            SocketKind::UnixDatagram { .. } => return -(abi::EOPNOTSUPP as i64),
+            SocketKind::UnixListener { .. } | SocketKind::UnixStream { .. } => {
+                return -(abi::EOPNOTSUPP as i64);
+            }
+            SocketKind::Host { .. } => return -(abi::EOPNOTSUPP as i64),
+        };
+        if !matches!(sock_type, 1 | 6) {
+            return -(abi::EOPNOTSUPP as i64);
+        }
+        let addr = match addr {
+            Some(addr) => addr,
+            None if matches!(domain, 2) => b"0.0.0.0:0".to_vec(),
+            None => return -(abi::EINVAL as i64),
+        };
+        if let Some(path) = unix_path_from_addr(&addr) {
+            return match k.create_unix_listener(path, backlog) {
+                Ok(new_id) => {
+                    replace_socket_fd(k, caller_pid, fd, id, new_id);
+                    0
+                }
+                Err(errno) => -(errno as i64),
+            };
+        }
+        let handle = kh::socket_listen_at(&addr, backlog);
+        if handle < 0 {
+            return handle as i64;
+        }
+        match k.socket_mut(id) {
+            Some(socket) => {
+                socket.kind = SocketKind::Host { handle };
+                0
+            }
+            None => -(abi::EBADF as i64),
+        }
+    })
 }
 
 fn sys_socket_accept(caller_pid: u32, request: &[u8]) -> i64 {
@@ -2276,7 +2334,8 @@ fn sys_socket_accept(caller_pid: u32, request: &[u8]) -> i64 {
                 Ok(id)
             }
             Some(FdEntry::Socket { .. }) => Err(0),
-            _ => Err(-(abi::EBADF as i64)),
+            Some(_) => Err(-(abi::ENOTSOCK as i64)),
+            None => Err(-(abi::EBADF as i64)),
         }
     });
     match listener_id {
@@ -2310,13 +2369,20 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
         return -(abi::EINVAL as i64);
     }
     let unix_path = with_kernel(|k| {
-        let entry = k.process_mut(caller_pid).fd_table.entry(fd).cloned();
-        let Some(FdEntry::Socket { id }) = entry else {
-            return Err(-(abi::EBADF as i64));
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd).cloned() {
+            Some(entry) => entry,
+            None => return Err(-(abi::EBADF as i64)),
+        };
+        let FdEntry::Socket { id } = entry else {
+            return Err(-(abi::ENOTSOCK as i64));
         };
         match k.socket(id).map(|socket| &socket.kind) {
             Some(SocketKind::UnixListener { path, .. }) => Ok(Some(path.clone())),
-            Some(SocketKind::UnixStream { .. } | SocketKind::UnixDatagram { .. }) => Ok(None),
+            Some(
+                SocketKind::Open { .. }
+                | SocketKind::UnixStream { .. }
+                | SocketKind::UnixDatagram { .. },
+            ) => Ok(None),
             Some(SocketKind::Host { .. }) => Err(0),
             None => Err(-(abi::EBADF as i64)),
         }
@@ -2338,37 +2404,61 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
     kh::socket_local_addr(handle, response)
 }
 
-/// `sys_socket_connect(addr_bytes) -> fd`. Request layout
-/// matches the toml: u8 family + u8 sock_type + u16 _pad + u32
-/// flags + addr bytes (UTF-8 "host:port"). Returns the host
-/// socket as a kernel fd — userland passes it to subsequent
-/// sys_socket_send/recv/close/read/write.
+/// `sys_socket_connect(fd, addr_bytes) -> 0`. Request layout:
+/// u32 fd LE + addr bytes (UTF-8 "host:port" or "unix:...").
 fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
-    if request.len() < 8 {
+    if request.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    // u8 family + u8 sock_type + u16 pad — currently unused; kept
-    // in the wire format so future AF_INET6 / SOCK_DGRAM fits.
-    let family = request[0];
-    let sock_type = request[1];
-    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
-    let addr = &request[8..];
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let addr = &request[4..];
     if addr.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    if matches!(family, 1 | 3) && matches!(sock_type, 1 | 6) {
-        if let Some(path) = unix_path_from_addr(addr) {
-            return with_kernel(|k| match k.connect_unix_stream(path) {
-                Ok(id) => install_socket_id_fd(k, caller_pid, id) as i64,
-                Err(errno) => -(errno as i64),
-            });
+    with_kernel(|k| {
+        let id = match socket_id_for_fd(k, caller_pid, fd) {
+            Ok(id) => id,
+            Err(rc) => return rc,
+        };
+        let Some(socket) = k.socket(id) else {
+            return -(abi::EBADF as i64);
+        };
+        let (domain, sock_type, flags) = match &socket.kind {
+            SocketKind::Open { flags, .. } => (socket.domain, socket.sock_type, *flags),
+            SocketKind::UnixDatagram { .. } => return -(abi::EOPNOTSUPP as i64),
+            SocketKind::UnixStream { .. }
+            | SocketKind::UnixListener { .. }
+            | SocketKind::Host { .. } => return -(abi::EOPNOTSUPP as i64),
+        };
+        if matches!(domain, 1 | 3) && matches!(sock_type, 1 | 6) {
+            if let Some(path) = unix_path_from_addr(addr) {
+                return match k.connect_unix_stream(path) {
+                    Ok(new_id) => {
+                        replace_socket_fd(k, caller_pid, fd, id, new_id);
+                        0
+                    }
+                    Err(errno) => -(errno as i64),
+                };
+            }
         }
-    }
-    let handle = kh::socket_connect(addr, flags);
-    if handle < 0 {
-        return handle as i64;
-    }
-    with_kernel(|k| install_socket_fd(k, caller_pid, handle, family, sock_type) as i64)
+        if unix_path_from_addr(addr).is_some() {
+            return -(abi::EAFNOSUPPORT as i64);
+        }
+        if !matches!(domain, 2) {
+            return -(abi::EAFNOSUPPORT as i64);
+        }
+        let handle = kh::socket_connect(addr, flags);
+        if handle < 0 {
+            return handle as i64;
+        }
+        match k.socket_mut(id) {
+            Some(socket) => {
+                socket.kind = SocketKind::Host { handle };
+                0
+            }
+            None => -(abi::EBADF as i64),
+        }
+    })
 }
 
 fn socket_handle_domain_type_for_fd(
@@ -2376,16 +2466,19 @@ fn socket_handle_domain_type_for_fd(
     caller_pid: u32,
     fd: u32,
 ) -> Result<(i32, u8, u8), i64> {
-    let entry = k.process_mut(caller_pid).fd_table.entry(fd).cloned();
-    let Some(FdEntry::Socket { id }) = entry else {
-        return Err(-(abi::EBADF as i64));
+    let entry = match k.process_mut(caller_pid).fd_table.entry(fd).cloned() {
+        Some(entry) => entry,
+        None => return Err(-(abi::EBADF as i64)),
+    };
+    let FdEntry::Socket { id } = entry else {
+        return Err(-(abi::ENOTSOCK as i64));
     };
     let Some(socket) = k.socket(id) else {
         return Err(-(abi::EBADF as i64));
     };
     match &socket.kind {
         SocketKind::Host { handle } => Ok((*handle, socket.domain, socket.sock_type)),
-        SocketKind::UnixListener { .. } => Err(-(abi::EOPNOTSUPP as i64)),
+        SocketKind::Open { .. } | SocketKind::UnixListener { .. } => Err(-(abi::EOPNOTSUPP as i64)),
         SocketKind::UnixStream { .. } | SocketKind::UnixDatagram { .. } => {
             Err(-(abi::EOPNOTSUPP as i64))
         }
@@ -2425,15 +2518,22 @@ fn sys_socket_open(caller_pid: u32, request: &[u8]) -> i64 {
     }
     let family = request[0];
     let sock_type = request[1];
-    let _flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
-    if !matches!(family, 1 | 3) {
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    if !matches!(family, 1..=3) {
         return -(abi::EAFNOSUPPORT as i64);
     }
-    if !matches!(sock_type, 2 | 5) {
+    if !matches!(sock_type, 1 | 2 | 5 | 6) {
         return -(abi::EPROTOTYPE as i64);
     }
     with_kernel(|k| {
-        let id = k.create_unix_datagram_socket();
+        let id = if matches!(sock_type, 2 | 5) {
+            if !matches!(family, 1 | 3) {
+                return -(abi::EAFNOSUPPORT as i64);
+            }
+            k.create_unix_datagram_socket()
+        } else {
+            k.create_open_socket(family, sock_type, flags)
+        };
         install_socket_id_fd(k, caller_pid, id) as i64
     })
 }
@@ -2444,14 +2544,37 @@ fn sys_socket_bind(caller_pid: u32, request: &[u8]) -> i64 {
     }
     let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let addr = &request[4..];
-    let Some(path) = unix_path_from_addr(addr) else {
-        return -(abi::EINVAL as i64);
-    };
     with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
-        Ok(id) => match k.bind_unix_datagram(id, path) {
-            Ok(()) => 0,
-            Err(errno) => -(errno as i64),
-        },
+        Ok(id) => {
+            if let Some(path) = unix_path_from_addr(addr) {
+                let Some(socket) = k.socket(id) else {
+                    return -(abi::EBADF as i64);
+                };
+                if matches!(socket.kind, SocketKind::UnixDatagram { .. }) {
+                    return match k.bind_unix_datagram(id, path) {
+                        Ok(()) => 0,
+                        Err(errno) => -(errno as i64),
+                    };
+                }
+                if !matches!(socket.domain, 1 | 3) {
+                    return -(abi::EAFNOSUPPORT as i64);
+                }
+            }
+            match k.socket_mut(id) {
+                Some(socket) => match &mut socket.kind {
+                    SocketKind::Open { bound_addr, .. } => {
+                        if unix_path_from_addr(addr).is_none() && !matches!(socket.domain, 2) {
+                            return -(abi::EAFNOSUPPORT as i64);
+                        }
+                        *bound_addr = Some(addr.to_vec());
+                        0
+                    }
+                    SocketKind::UnixDatagram { .. } => -(abi::EINVAL as i64),
+                    _ => -(abi::EOPNOTSUPP as i64),
+                },
+                None => -(abi::EBADF as i64),
+            }
+        }
         Err(rc) => rc,
     })
 }
@@ -2979,10 +3102,22 @@ mod tests {
         i16::from_le_bytes(response[offset..offset + 2].try_into().unwrap())
     }
 
-    fn socket_connect_req(family: u8, sock_type: u8, flags: u32, addr: &[u8]) -> Vec<u8> {
+    fn socket_open_req(family: u8, sock_type: u8, flags: u32) -> Vec<u8> {
         let mut req = vec![family, sock_type, 0, 0];
         req.extend_from_slice(&flags.to_le_bytes());
+        req
+    }
+
+    fn socket_connect_req(fd: u32, addr: &[u8]) -> Vec<u8> {
+        let mut req = fd.to_le_bytes().to_vec();
         req.extend_from_slice(addr);
+        req
+    }
+
+    fn socket_listen_req(fd: u32, backlog: u32) -> [u8; 8] {
+        let mut req = [0u8; 8];
+        req[0..4].copy_from_slice(&fd.to_le_bytes());
+        req[4..8].copy_from_slice(&backlog.to_le_bytes());
         req
     }
 
@@ -3611,8 +3746,17 @@ mod tests {
         crate::kh::test_support::reset_socket_mock();
         crate::kh::test_support::push_socket_connect_result(77);
 
-        let req = socket_connect_req(2, 1, 0, b"127.0.0.1:1234");
-        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 3);
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(2, 1, 0),
+                &mut []
+            ),
+            3
+        );
+        let req = socket_connect_req(3, b"127.0.0.1:1234");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
 
         assert_eq!(
             crate::kh::test_support::socket_connect_calls(),
@@ -3635,8 +3779,17 @@ mod tests {
         crate::kh::test_support::reset_socket_mock();
         crate::kh::test_support::push_socket_connect_result(88);
 
-        let req = socket_connect_req(2, 1, 0, b"127.0.0.1:1235");
-        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 3);
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(2, 1, 0),
+                &mut []
+            ),
+            3
+        );
+        let req = socket_connect_req(3, b"127.0.0.1:1235");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
         assert_eq!(
             dispatch(METHOD_SYS_DUP, 1, &3_u32.to_le_bytes(), &mut []),
             4
@@ -3661,8 +3814,17 @@ mod tests {
         crate::kh::test_support::push_socket_recv_result(b"pong");
         crate::kh::test_support::push_socket_addr_result(b"127.0.0.1:6000");
 
-        let req = socket_connect_req(2, 1, 0, b"127.0.0.1:6000");
-        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 3);
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(2, 1, 0),
+                &mut []
+            ),
+            3
+        );
+        let req = socket_connect_req(3, b"127.0.0.1:6000");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
         assert_eq!(
             dispatch(
                 METHOD_SYS_SOCKET_SEND,
@@ -3704,8 +3866,17 @@ mod tests {
         crate::kh::test_support::push_socket_connect_result(95);
         crate::kh::test_support::push_socket_recv_result(b"read-reply");
 
-        let req = socket_connect_req(2, 1, 0, b"127.0.0.1:6001");
-        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 3);
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(2, 1, 0),
+                &mut []
+            ),
+            3
+        );
+        let req = socket_connect_req(3, b"127.0.0.1:6001");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
 
         let mut write_req = 3_u32.to_le_bytes().to_vec();
         write_req.extend_from_slice(b"write-payload");
@@ -3737,11 +3908,32 @@ mod tests {
         crate::kh::test_support::push_socket_listen_result(101);
         crate::kh::test_support::push_socket_accept_result(102);
 
-        let mut listen_req = 16_u32.to_le_bytes().to_vec();
-        listen_req.extend_from_slice(b"127.0.0.1:0");
         assert_eq!(
-            dispatch(METHOD_SYS_SOCKET_LISTEN, 1, &listen_req, &mut []),
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(2, 1, 0),
+                &mut []
+            ),
             3
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(3, b"127.0.0.1:0"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_LISTEN,
+                1,
+                &socket_listen_req(3, 16),
+                &mut []
+            ),
+            0
         );
         assert_eq!(
             dispatch(
@@ -3763,16 +3955,46 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
         crate::kh::test_support::reset_socket_mock();
 
-        let mut listen_req = 4_u32.to_le_bytes().to_vec();
-        listen_req.extend_from_slice(b"unix:/tmp/yurt.sock");
         assert_eq!(
-            dispatch(METHOD_SYS_SOCKET_LISTEN, 1, &listen_req, &mut []),
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
             3
         );
-        let connect_req = socket_connect_req(3, 6, 0, b"unix:/tmp/yurt.sock");
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(3, b"unix:/tmp/yurt.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_LISTEN,
+                1,
+                &socket_listen_req(3, 4),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
+            4
+        );
+        let connect_req = socket_connect_req(4, b"unix:/tmp/yurt.sock");
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &connect_req, &mut []),
-            4
+            0
         );
 
         let poll_req = poll_req(0, &[(3, POLLIN)]);
@@ -3841,39 +4063,110 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
         crate::kh::test_support::reset_socket_mock();
 
-        let missing = socket_connect_req(3, 6, 0, b"unix:/tmp/missing.sock");
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
+            3
+        );
+        let missing = socket_connect_req(3, b"unix:/tmp/missing.sock");
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &missing, &mut []),
             -(abi::ECONNREFUSED as i64)
         );
 
-        let mut listen_req = 1_u32.to_le_bytes().to_vec();
-        listen_req.extend_from_slice(b"unix:/tmp/backlog.sock");
         assert_eq!(
-            dispatch(METHOD_SYS_SOCKET_LISTEN, 1, &listen_req, &mut []),
-            3
-        );
-        let connect_req = socket_connect_req(3, 6, 0, b"unix:/tmp/backlog.sock");
-        assert_eq!(
-            dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &connect_req, &mut []),
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
             4
         );
         assert_eq!(
-            dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &connect_req, &mut []),
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(4, b"unix:/tmp/backlog.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_LISTEN,
+                1,
+                &socket_listen_req(4, 1),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
+            5
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_CONNECT,
+                1,
+                &socket_connect_req(5, b"unix:/tmp/backlog.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
+            6
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_CONNECT,
+                1,
+                &socket_connect_req(6, b"unix:/tmp/backlog.sock"),
+                &mut []
+            ),
             -(abi::ECONNREFUSED as i64)
         );
         assert_eq!(
             dispatch(
                 METHOD_SYS_SOCKET_ACCEPT,
                 1,
-                &socket_accept_req(3, 0),
+                &socket_accept_req(4, 0),
                 &mut []
             ),
-            5
+            7
         );
         assert_eq!(
-            dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &connect_req, &mut []),
-            6
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
+            8
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_CONNECT,
+                1,
+                &socket_connect_req(8, b"unix:/tmp/backlog.sock"),
+                &mut []
+            ),
+            0
         );
     }
 
@@ -3882,23 +4175,67 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
         crate::kh::test_support::reset_socket_mock();
 
-        let mut listen_req = 4_u32.to_le_bytes().to_vec();
-        listen_req.extend_from_slice(b"unix:/tmp/close.sock");
         assert_eq!(
-            dispatch(METHOD_SYS_SOCKET_LISTEN, 1, &listen_req, &mut []),
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
             3
         );
-        let connect_req = socket_connect_req(3, 6, 0, b"unix:/tmp/close.sock");
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(3, b"unix:/tmp/close.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_LISTEN,
+                1,
+                &socket_listen_req(3, 4),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
+            4
+        );
+        let connect_req = socket_connect_req(4, b"unix:/tmp/close.sock");
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &connect_req, &mut []),
-            4
+            0
         );
         assert_eq!(
             dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
             0
         );
         assert_eq!(
-            dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &connect_req, &mut []),
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
+            3
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_CONNECT,
+                1,
+                &socket_connect_req(3, b"unix:/tmp/close.sock"),
+                &mut []
+            ),
             -(abi::ECONNREFUSED as i64)
         );
 
@@ -3919,7 +4256,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_operations_reject_non_socket_fds() {
+    fn socket_operations_reject_non_socket_fds_with_enotsock() {
         let _g = crate::kernel::TestGuard::acquire();
         crate::kh::test_support::reset_socket_mock();
 
@@ -3930,12 +4267,12 @@ mod tests {
                 &socket_send_req(1, b"x"),
                 &mut []
             ),
-            -(abi::EBADF as i64)
+            -(abi::ENOTSOCK as i64)
         );
         let mut buf = [0u8; 4];
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(1, 0), &mut buf),
-            -(abi::EBADF as i64)
+            -(abi::ENOTSOCK as i64)
         );
         assert_eq!(
             dispatch(
@@ -3944,7 +4281,7 @@ mod tests {
                 &socket_accept_req(1, 0),
                 &mut []
             ),
-            -(abi::EBADF as i64)
+            -(abi::ENOTSOCK as i64)
         );
         assert_eq!(
             crate::kh::test_support::socket_send_calls(),
@@ -4329,8 +4666,17 @@ mod tests {
         crate::kh::test_support::reset_socket_mock();
         crate::kh::test_support::push_socket_connect_result(111);
 
-        let req = socket_connect_req(2, 1, 0, b"127.0.0.1:7000");
-        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 3);
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(2, 1, 0),
+                &mut []
+            ),
+            3
+        );
+        let req = socket_connect_req(3, b"127.0.0.1:7000");
+        assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
 
         let req = poll_req(0, &[(3, POLLIN | POLLOUT)]);
         let mut out = [0u8; 8];

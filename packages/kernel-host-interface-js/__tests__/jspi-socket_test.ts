@@ -95,18 +95,22 @@ describe("JSPI / kh_socket_*", () => {
       host,
     );
 
-    // sys_socket_connect request: u8 family + u8 sock_type + u16 pad +
-    // u32 flags + addr "host:port".
+    const openReq = new Uint8Array(8);
+    openReq[0] = 2; // AF_INET
+    openReq[1] = 1; // SOCK_STREAM
+    const open = await mk.syscallAsync(METHOD.SYS_SOCKET_OPEN, openReq, 0);
+    expect(Number(open.rc)).toBeGreaterThan(0);
+
+    // sys_socket_connect request: u32 fd + addr "host:port".
     const addr = "127.0.0.1:0";
-    const req = new Uint8Array(8 + addr.length);
-    req[0] = 2; // AF_INET
-    req[1] = 1; // SOCK_STREAM
-    new TextEncoder().encodeInto(addr, req.subarray(8));
+    const req = new Uint8Array(4 + addr.length);
+    new DataView(req.buffer).setUint32(0, Number(open.rc), true);
+    new TextEncoder().encodeInto(addr, req.subarray(4));
     const out = await mk.syscallAsync(METHOD.SYS_SOCKET_CONNECT, req, 0);
-    expect(Number(out.rc)).toBeGreaterThan(0);
+    expect(Number(out.rc)).toBe(0);
     await mk.syscallAsync(
       METHOD.SYS_SOCKET_CLOSE,
-      new Uint8Array(new Uint32Array([Number(out.rc)]).buffer),
+      new Uint8Array(new Uint32Array([Number(open.rc)]).buffer),
       0,
     );
   });
@@ -121,18 +125,23 @@ describe("JSPI / kh_socket_*", () => {
       host,
     );
 
+    const openReq = new Uint8Array(8);
+    openReq[0] = 2; // AF_INET
+    openReq[1] = 1; // SOCK_STREAM
+    const open = await mk.syscallAsync(METHOD.SYS_SOCKET_OPEN, openReq, 0);
+    expect(Number(open.rc)).toBeGreaterThan(0);
+
     const addr = "127.0.0.1:0";
-    const connectReq = new Uint8Array(8 + addr.length);
-    connectReq[0] = 2; // AF_INET
-    connectReq[1] = 1; // SOCK_STREAM
-    new TextEncoder().encodeInto(addr, connectReq.subarray(8));
+    const connectReq = new Uint8Array(4 + addr.length);
+    new DataView(connectReq.buffer).setUint32(0, Number(open.rc), true);
+    new TextEncoder().encodeInto(addr, connectReq.subarray(4));
     const connected = await mk.syscallAsync(
       METHOD.SYS_SOCKET_CONNECT,
       connectReq,
       0,
     );
-    const fd = Number(connected.rc);
-    expect(fd).toBeGreaterThan(0);
+    expect(Number(connected.rc)).toBe(0);
+    const fd = Number(open.rc);
 
     tcp.enqueue(1, new TextEncoder().encode("hello-async"));
 

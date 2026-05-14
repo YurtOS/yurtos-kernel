@@ -326,7 +326,7 @@ doc = "POSIX rename(oldpath, newpath). Request bytes: u32 old_len LE + old_bytes
 [method.sys_socket_connect]
 id = 0x1_0031
 kind = "syscall"
-doc = "Open a TCP socket and connect to `host:port`. Request bytes: u8 family + u8 sock_type + u16 _pad + u32 flags + addr bytes (UTF-8 'host:port', e.g. 'example.com:443'). Returns a non-negative socket fd or a negated errno (-EACCES policy denial, -ECONNREFUSED, -EHOSTUNREACH). The fd participates in the same kernel fd table as files; sys_close releases it."
+doc = "Connect an existing socket fd. Request bytes: u32 fd LE + addr bytes (UTF-8 'host:port' or unix:<path>). Returns 0 on success, -EBADF for an invalid fd, -ENOTSOCK for a valid non-socket fd, or a negated connection errno (-EACCES policy denial, -ECONNREFUSED, -EHOSTUNREACH)."
 
 [method.sys_socket_send]
 id = 0x1_0032
@@ -346,7 +346,7 @@ doc = "Close a socket fd previously returned from sys_socket_connect. Request by
 [method.sys_socket_listen]
 id = 0x1_0039
 kind = "syscall"
-doc = "Bind to `host:port` and start accepting. Request: u32 backlog LE + addr (UTF-8 'host:port' — port=0 lets the kernel pick). Returns a non-negative listener fd or negated errno. Use sys_socket_addr to retrieve the actually-bound port (matches the existing TS bridge's actualPort surface — cross-sandbox loopback routes the user-requested port to the actual one)."
+doc = "Start accepting on an existing bound socket fd. Request: u32 fd LE + u32 backlog LE. Returns 0 on success, -EBADF for an invalid fd, -ENOTSOCK for a valid non-socket fd, or a negated listen errno. Use sys_socket_addr to retrieve the actually-bound port for host TCP listeners."
 
 [method.sys_socket_accept]
 id = 0x1_003A
@@ -406,12 +406,12 @@ doc = "Create a connected AF_UNIX socket pair in the caller's fd table. Request 
 [method.sys_socket_open]
 id = 0x1_0045
 kind = "syscall"
-doc = "Open a kernel-owned socket in the caller's fd table. Request bytes: u8 family + u8 sock_type + u16 _pad + u32 flags. This currently supports AF_UNIX datagram sockets for pathname sendto/recv paths."
+doc = "Open a kernel-owned socket in the caller's fd table. Request bytes: u8 family + u8 sock_type + u16 _pad + u32 flags. The returned fd shares the same process-local descriptor namespace as files, pipes, and stdio."
 
 [method.sys_socket_bind]
 id = 0x1_0046
 kind = "syscall"
-doc = "Bind a kernel-owned socket to an address. Request bytes: u32 fd LE + address bytes. AF_UNIX addresses use the same unix:<path> binary address convention as socket connect/listen."
+doc = "Bind a kernel-owned socket to an address. Request bytes: u32 fd LE + address bytes. AF_UNIX addresses use the same unix:<path> binary address convention as socket connect/listen. Returns 0, -EBADF, -ENOTSOCK, or a negated bind errno."
 
 [method.sys_socket_sendto]
 id = 0x1_0047

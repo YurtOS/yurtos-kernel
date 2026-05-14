@@ -25,8 +25,7 @@ __attribute__((import_module("env"), import_name("sys_socket_open")))
 int yurt_sys_socket_open(int family, int sock_type, int flags);
 
 __attribute__((import_module("env"), import_name("sys_socket_connect")))
-int yurt_sys_socket_connect(int family, int sock_type, int flags,
-                            const void *addr, int addr_len);
+int yurt_sys_socket_connect(int fd, const void *addr, int addr_len);
 
 __attribute__((import_module("env"), import_name("sys_socket_send")))
 int yurt_sys_socket_send(int fd, const void *buf, int buf_len);
@@ -48,7 +47,7 @@ int yurt_sys_socket_sendto(int fd, const void *buf, int buf_len, int flags,
                            const void *addr, int addr_len);
 
 __attribute__((import_module("env"), import_name("sys_socket_listen")))
-int yurt_sys_socket_listen(int backlog, const void *addr, int addr_len);
+int yurt_sys_socket_listen(int fd, int backlog);
 
 __attribute__((import_module("env"), import_name("sys_socket_accept")))
 int yurt_sys_socket_accept(int fd, int flags);
