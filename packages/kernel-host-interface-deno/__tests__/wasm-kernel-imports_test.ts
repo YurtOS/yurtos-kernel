@@ -119,6 +119,8 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     for (
       const name of [
         "host_socket_connect",
+        "host_socket_open",
+        "host_socket_bind",
         "host_socket_listen",
         "host_socket_accept",
         "host_socket_addr",
@@ -444,24 +446,50 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     const { mk, calls } = capturingMk(0, new Uint8Array([9, 8, 7, 6]));
     const imports = buildWasmKernelImports(mk, () => buf);
 
-    u.set(new TextEncoder().encode("127.0.0.1:8080"), 0);
-    await imports.host_socket_connect(0, 14, 0x40);
+    await imports.host_socket_open(1, 6, 0);
     expect(calls.at(-1)).toMatchObject({
-      method: METHOD.SYS_SOCKET_CONNECT,
+      method: METHOD.SYS_SOCKET_OPEN,
       responseCap: 0,
     });
-    expect(Array.from(calls.at(-1)!.request.slice(0, 8))).toEqual([
+    expect(Array.from(calls.at(-1)!.request)).toEqual([
+      1,
+      6,
       0,
       0,
       0,
-      0,
-      0x40,
       0,
       0,
       0,
     ]);
-    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(8)))
+
+    u.set(new TextEncoder().encode("127.0.0.1"), 0);
+    await imports.host_socket_connect(7, 0, 9, 8080, 0x40);
+    expect(calls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_CONNECT,
+      responseCap: 0,
+    });
+    expect(Array.from(calls.at(-1)!.request.slice(0, 4))).toEqual([
+      7,
+      0,
+      0,
+      0,
+    ]);
+    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(4)))
       .toEqual("127.0.0.1:8080");
+
+    await imports.host_socket_bind(7, 0, 9, 9090);
+    expect(calls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_BIND,
+      responseCap: 0,
+    });
+    expect(Array.from(calls.at(-1)!.request.slice(0, 4))).toEqual([
+      7,
+      0,
+      0,
+      0,
+    ]);
+    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(4)))
+      .toEqual("127.0.0.1:9090");
 
     u.set(new TextEncoder().encode("payload"), 32);
     await imports.host_socket_send(7, 32, 7, 0x02);
@@ -495,33 +523,46 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       0,
     ]);
 
-    await imports.host_socket_listen(128, 0, 14);
+    await imports.host_socket_listen(7, 128);
     expect(calls.at(-1)).toMatchObject({
       method: METHOD.SYS_SOCKET_LISTEN,
       responseCap: 0,
     });
-    expect(new DataView(calls.at(-1)!.request.buffer).getUint32(0, true))
-      .toEqual(128);
-    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(4)))
-      .toEqual("127.0.0.1:8080");
-
-    await imports.host_socket_accept(9, 0x08);
-    expect(calls.at(-1)).toMatchObject({
-      method: METHOD.SYS_SOCKET_ACCEPT,
-      responseCap: 0,
-    });
     expect(Array.from(calls.at(-1)!.request)).toEqual([
-      9,
+      7,
       0,
       0,
       0,
-      0x08,
+      128,
       0,
       0,
       0,
     ]);
 
-    await imports.host_socket_addr(9, 80, 16);
+    const acceptOut = new Uint8Array(16);
+    new DataView(acceptOut.buffer).setInt32(0, 11, true);
+    const { mk: acceptMk, calls: acceptCalls } = capturingMk(11, acceptOut);
+    const acceptImports = buildWasmKernelImports(acceptMk, () => buf);
+    const acceptRc = await acceptImports.host_socket_accept(9, 80, 16);
+    expect(acceptRc).toEqual(16);
+    const accepted = new DataView(buf, 80, 16);
+    expect(accepted.getInt32(0, true)).toEqual(11);
+    expect(acceptCalls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_ACCEPT,
+      responseCap: 0,
+    });
+    expect(Array.from(acceptCalls.at(-1)!.request)).toEqual([
+      9,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+    ]);
+
+    await imports.host_socket_addr(9, 0, 80, 16);
     expect(calls.at(-1)).toMatchObject({
       method: METHOD.SYS_SOCKET_ADDR,
       responseCap: 16,
@@ -534,6 +575,20 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       responseCap: 0,
     });
     expect(Array.from(calls.at(-1)!.request)).toEqual([9, 0, 0, 0]);
+  });
+
+  it("returns required byte count without partial out_cap writes", async () => {
+    const response = new TextEncoder().encode("/too/long\0");
+    const { mk } = capturingMk(response.byteLength, response);
+    const buf = new ArrayBuffer(32);
+    const u = new Uint8Array(buf);
+    u.fill(0xAA, 8, 12);
+    const imports = buildWasmKernelImports(mk, () => buf);
+
+    const rc = await imports.host_getcwd(8, 4);
+
+    expect(rc).toEqual(response.byteLength);
+    expect(Array.from(u.slice(8, 12))).toEqual([0xAA, 0xAA, 0xAA, 0xAA]);
   });
 
   it("durable KV wrappers round-trip put/get/list/delete", async () => {

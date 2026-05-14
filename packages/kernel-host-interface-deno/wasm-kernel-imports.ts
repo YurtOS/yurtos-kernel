@@ -406,25 +406,53 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["ptr_len", "out_cap"],
     returnsBytes: true,
   },
-  // host_socket_connect(addrPtr, addrLen, flags) → handle / -errno.
-  // SYS_SOCKET_CONNECT currently keeps an 8-byte header for future
-  // family/type expansion: u8 family + u8 sock_type + u16 pad +
-  // u32 flags, followed by UTF-8 "host:port" bytes.
+  // host_socket_open(domain, type, protocol) -> fd / -errno.
+  // SYS_SOCKET_OPEN accepts u8 family + u8 sock_type + u16 pad +
+  // u32 flags. The native ABI passes flags ORed into type.
+  {
+    name: "host_socket_open",
+    method: METHOD.SYS_SOCKET_OPEN,
+    args: [],
+    custom: (mk, _memBuf, callerPid) =>
+    async (
+      domain: number,
+      type: number,
+      _protocol: number,
+    ): Promise<number> => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      req[0] = domain & 0xff;
+      req[1] = type & 0xff;
+      view.setUint32(4, (type & ~0xff) >>> 0, true);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_OPEN,
+        callerPid,
+        req,
+        0,
+      );
+      return Number(out.rc);
+    },
+  },
+  // host_socket_connect(fd, hostPtr, hostLen, port, flags) -> 0/-errno.
+  // SYS_SOCKET_CONNECT accepts u32 fd + UTF-8 "host:port" bytes.
   {
     name: "host_socket_connect",
     method: METHOD.SYS_SOCKET_CONNECT,
     args: [],
     custom: (mk, memBuf, callerPid) =>
     async (
+      fd: number,
       addrPtr: number,
       addrLen: number,
-      flags: number,
+      port: number,
+      _flags: number,
     ): Promise<number> => {
-      const addr = copyIn(memBuf, addrPtr, addrLen);
+      const addr = socketEndpointBytes(memBuf, addrPtr, addrLen, port);
       if (typeof addr === "number") return addr;
-      const req = new Uint8Array(8 + addr.length);
-      new DataView(req.buffer).setUint32(4, flags >>> 0, true);
-      req.set(addr, 8);
+      const req = new Uint8Array(4 + addr.length);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      req.set(addr, 4);
       const out = await mk.kernelSyscallAsync(
         METHOD.SYS_SOCKET_CONNECT,
         callerPid,
@@ -434,26 +462,77 @@ export const HOST_BINDINGS: HostBinding[] = [
       return Number(out.rc);
     },
   },
-  // host_socket_listen(backlog, addrPtr, addrLen) → handle / -errno.
-  // SYS_SOCKET_LISTEN accepts u32 backlog + UTF-8 "host:port" bytes.
+  // host_socket_bind(fd, hostPtr, hostLen, port) -> 0/-errno.
+  // SYS_SOCKET_BIND accepts u32 fd + UTF-8 "host:port" bytes.
+  {
+    name: "host_socket_bind",
+    method: METHOD.SYS_SOCKET_BIND,
+    args: [],
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      addrPtr: number,
+      addrLen: number,
+      port: number,
+    ): Promise<number> => {
+      const addr = socketEndpointBytes(memBuf, addrPtr, addrLen, port);
+      if (typeof addr === "number") return addr;
+      const req = new Uint8Array(4 + addr.length);
+      new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+      req.set(addr, 4);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_BIND,
+        callerPid,
+        req,
+        0,
+      );
+      return Number(out.rc);
+    },
+  },
+  // host_socket_listen(fd, backlog) -> 0/-errno.
+  // SYS_SOCKET_LISTEN accepts u32 fd + u32 backlog.
   {
     name: "host_socket_listen",
     method: METHOD.SYS_SOCKET_LISTEN,
-    args: ["scalar", "ptr_len"],
+    args: ["scalar", "scalar"],
   },
-  // host_socket_accept(fd, flags) → handle / -errno.
-  // SYS_SOCKET_ACCEPT accepts u32 handle + u32 flags.
+  // host_socket_accept(fd, outPtr, outCap) -> yurt_socket_accept_result_v1.
+  // SYS_SOCKET_ACCEPT returns the accepted fd as rc; this adapter writes
+  // the native ABI result struct expected by yurt_socket.c.
   {
     name: "host_socket_accept",
     method: METHOD.SYS_SOCKET_ACCEPT,
-    args: ["scalar", "scalar"],
+    args: [],
+    custom:
+      (mk, memBuf, callerPid) =>
+      async (fd: number, outPtr: number, outCap: number): Promise<number> => {
+        const req = new Uint8Array(8);
+        const view = new DataView(req.buffer);
+        view.setUint32(0, fd >>> 0, true);
+        view.setUint32(4, 0, true);
+        const out = await mk.kernelSyscallAsync(
+          METHOD.SYS_SOCKET_ACCEPT,
+          callerPid,
+          req,
+          0,
+        );
+        const rc = Number(out.rc);
+        if (rc < 0) return rc;
+        if (outCap < 16) return -7;
+        const result = new Uint8Array(16);
+        new DataView(result.buffer).setInt32(0, rc, true);
+        const outRc = copyOut(memBuf, outPtr, result);
+        if (outRc < 0) return outRc;
+        return 16;
+      },
   },
-  // host_socket_addr(fd, outPtr, outCap) → bytes.
+  // host_socket_addr(fd, which, outPtr, outCap) → bytes.
   // SYS_SOCKET_ADDR accepts u32 handle and writes the packed address record.
   {
     name: "host_socket_addr",
     method: METHOD.SYS_SOCKET_ADDR,
     args: ["scalar", "out_cap"],
+    argOrder: [0, 2, 3],
     returnsBytes: true,
   },
   // host_socket_send(fd, dataPtr, dataLen, flags) → bytes.
@@ -734,6 +813,21 @@ function copyOut(
   return 0;
 }
 
+function socketEndpointBytes(
+  memBuf: () => ArrayBuffer,
+  hostPtr: number,
+  hostLen: number,
+  port: number,
+): Uint8Array | number {
+  const host = copyIn(memBuf, hostPtr, hostLen);
+  if (typeof host === "number") return host;
+  const suffix = new TextEncoder().encode(`:${port >>> 0}`);
+  const out = new Uint8Array(host.byteLength + suffix.byteLength);
+  out.set(host, 0);
+  out.set(suffix, host.byteLength);
+  return out;
+}
+
 function makeWrapper(
   b: HostBinding,
   mk: KernelHostInterface,
@@ -804,7 +898,10 @@ function makeWrapper(
     }
     const out = await mk.kernelSyscallAsync(b.method, callerPid, req, outCap);
     const rc = Number(out.rc);
-    if (b.returnsBytes && rc > 0 && outCap > 0) {
+    if (
+      b.returnsBytes && rc > 0 && outCap > 0 && rc <= outCap &&
+      out.response.byteLength >= rc
+    ) {
       const outRc = copyOut(memBuf, outPtr, out.response.subarray(0, rc));
       if (outRc < 0) return outRc;
     }
