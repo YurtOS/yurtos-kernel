@@ -47,6 +47,10 @@ type AsyncFdVfs = VfsLike & {
   ) => Promise<void>;
 };
 
+function isPromiseLike<T>(value: T | Promise<T>): value is Promise<T> {
+  return typeof (value as Promise<T>)?.then === "function";
+}
+
 /**
  * File descriptor table that maps integer fds to open file state.
  *
@@ -330,6 +334,42 @@ export class FdTable {
     return data.byteLength;
   }
 
+  /** Async positional write variant for worker-side VFS proxies. */
+  async pwriteAsync(
+    fd: number,
+    data: Uint8Array,
+    offset: number,
+  ): Promise<number> {
+    const entry = this.getEntry(fd);
+    const newLength = Math.max(
+      entry.buffer.byteLength,
+      offset + data.byteLength,
+    );
+    const previousDirty = entry.dirty;
+    const previousLength = entry.buffer.byteLength;
+    const overwriteEnd = Math.min(previousLength, offset + data.byteLength);
+    const overwritten = entry.buffer.slice(offset, overwriteEnd);
+
+    try {
+      if (newLength > entry.buffer.byteLength) {
+        const grown = new Uint8Array(newLength);
+        grown.set(entry.buffer);
+        entry.buffer = grown;
+      }
+      entry.buffer.set(data, offset);
+      entry.dirty = true;
+      await this.flushEntryAsync(entry);
+    } catch (err) {
+      this.restoreBufferLength(entry, previousLength);
+      if (overwritten.byteLength > 0) {
+        entry.buffer.set(overwritten, offset);
+      }
+      entry.dirty = previousDirty;
+      throw err;
+    }
+    return data.byteLength;
+  }
+
   /** Truncate (or extend) an open fd's buffer to the given size. */
   truncate(fd: number, size: number): void {
     const entry = this.getEntry(fd);
@@ -362,6 +402,37 @@ export class FdTable {
     );
   }
 
+  /** Async truncate variant for worker-side VFS proxies. */
+  async truncateAsync(fd: number, size: number): Promise<void> {
+    const entry = this.getEntry(fd);
+    if (size === entry.buffer.byteLength) return;
+    const previousOffset = entry.offset;
+    const previousDirty = entry.dirty;
+    const previousLength = entry.buffer.byteLength;
+    const truncatedTail = size < previousLength
+      ? entry.buffer.slice(size)
+      : new Uint8Array(0);
+
+    try {
+      const newBuf = new Uint8Array(size);
+      newBuf.set(
+        entry.buffer.subarray(0, Math.min(size, entry.buffer.byteLength)),
+      );
+      entry.buffer = newBuf;
+      if (entry.offset > size) entry.offset = size;
+      entry.dirty = true;
+      await this.flushEntryAsync(entry);
+    } catch (err) {
+      this.restoreBufferLength(entry, previousLength);
+      if (truncatedTail.byteLength > 0) {
+        entry.buffer.set(truncatedTail, size);
+      }
+      entry.offset = previousOffset;
+      entry.dirty = previousDirty;
+      throw err;
+    }
+  }
+
   /** Seek to a position in the file. Returns the new offset. */
   seek(fd: number, offset: number, whence: SeekWhence): number {
     const entry = this.getEntry(fd);
@@ -391,6 +462,17 @@ export class FdTable {
 
     if (entry.dirty) {
       this.flushEntry(entry);
+    }
+  }
+
+  /** Async close variant for worker-side VFS proxies. */
+  async closeAsync(fd: number): Promise<void> {
+    const entry = this.getEntry(fd);
+    entry.refs--;
+    this.entries.delete(fd);
+
+    if (entry.dirty) {
+      await this.flushEntryAsync(entry);
     }
   }
 
@@ -449,6 +531,25 @@ export class FdTable {
     this.entries.delete(fromFd);
 
     // Prevent future open() from reusing toFd
+    if (toFd >= this.nextFd) {
+      this.nextFd = toFd + 1;
+    }
+  }
+
+  /** Async renumber variant for worker-side VFS proxies. */
+  async renumberAsync(fromFd: number, toFd: number): Promise<void> {
+    const entry = this.entries.get(fromFd);
+    if (entry === undefined) {
+      throw new Error(`EBADF: bad file descriptor ${fromFd}`);
+    }
+
+    if (this.entries.has(toFd)) {
+      await this.closeAsync(toFd);
+    }
+
+    this.entries.set(toFd, entry);
+    this.entries.delete(fromFd);
+
     if (toFd >= this.nextFd) {
       this.nextFd = toFd + 1;
     }
@@ -552,13 +653,14 @@ export class FdTable {
     if (!entry.dirty) return;
     const vfs = this.vfs as AsyncFdVfs;
     if (entry.credential && this.vfs.withCredential) {
-      await this.vfs.withCredential(
+      const result = this.vfs.withCredential(
         entry.credential,
         () =>
           vfs.writeFileAsync
             ? vfs.writeFileAsync(entry.path, entry.buffer.slice())
             : vfs.writeFile(entry.path, entry.buffer.slice()),
       );
+      if (isPromiseLike(result)) await result;
     } else if (vfs.writeFileAsync) {
       await vfs.writeFileAsync(entry.path, entry.buffer.slice());
     } else {

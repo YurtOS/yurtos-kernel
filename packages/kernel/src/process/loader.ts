@@ -125,10 +125,15 @@ const ASYNC_WASI_IMPORTS = [
 
 const THREADED_ASYNC_WASI_IMPORTS = [
   ...ASYNC_WASI_IMPORTS,
+  "fd_close",
   "fd_filestat_get",
+  "fd_filestat_set_size",
+  "fd_filestat_set_times",
+  "fd_pwrite",
   "fd_readdir",
   "path_create_directory",
   "path_filestat_get",
+  "path_filestat_set_times",
   "path_open",
   "path_readlink",
   "path_remove_directory",

@@ -373,6 +373,16 @@ export class ProcessKernel {
     return target.fdTable.pwrite(target.fd, data, offset);
   }
 
+  async pwriteVfsFileAsync(
+    pid: number,
+    fd: number,
+    data: Uint8Array,
+    offset: number,
+  ): Promise<number> {
+    const target = this.requireVfsFileTarget(pid, fd);
+    return await target.fdTable.pwriteAsync(target.fd, data, offset);
+  }
+
   seekVfsFile(
     pid: number,
     fd: number,
@@ -391,6 +401,15 @@ export class ProcessKernel {
   truncateVfsFile(pid: number, fd: number, size: number): void {
     const target = this.requireVfsFileTarget(pid, fd);
     target.fdTable.truncate(target.fd, size);
+  }
+
+  async truncateVfsFileAsync(
+    pid: number,
+    fd: number,
+    size: number,
+  ): Promise<void> {
+    const target = this.requireVfsFileTarget(pid, fd);
+    await target.fdTable.truncateAsync(target.fd, size);
   }
 
   private nextLowestFd(pid: number, startFd: number): number {
@@ -1209,6 +1228,21 @@ export class ProcessKernel {
     return true;
   }
 
+  async closeFdAsync(pid: number, fd: number): Promise<boolean> {
+    const fdTable = this.fdTables.get(pid);
+    if (!fdTable) return false;
+    const target = fdTable.get(fd);
+    if (!target) {
+      fdTable.delete(fd);
+      return false;
+    }
+    this.unlockFile(pid, fd);
+    await this.closeTargetAsync(target);
+    fdTable.delete(fd);
+    this.fdDescriptorFlags.get(pid)?.delete(fd);
+    return true;
+  }
+
   lockFile(pid: number, fd: number, exclusive: boolean): number {
     const path = this.vfsPathForFd(pid, fd);
     if (!path) return 9; // EBADF
@@ -1348,6 +1382,17 @@ export class ProcessKernel {
         }
       }
     }
+  }
+
+  private async closeTargetAsync(target: FdTarget): Promise<void> {
+    if (target.type !== "vfs_file") {
+      this.closeTarget(target);
+      return;
+    }
+    if (target.fdTable.isOpen(target.fd)) {
+      await target.fdTable.closeAsync(target.fd);
+    }
+    target.refs = Math.max(0, target.refs - 1);
   }
 
   private retainTarget(target: FdTarget): void {

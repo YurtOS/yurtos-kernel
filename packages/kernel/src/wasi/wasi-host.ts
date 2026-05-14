@@ -95,6 +95,12 @@ type AsyncVfsLike = VfsLike & {
   renameAsync?: (oldPath: string, newPath: string) => Promise<void>;
   symlinkAsync?: (target: string, path: string) => Promise<void>;
   readlinkAsync?: (path: string) => Promise<string>;
+  setTimesAsync?: (
+    path: string,
+    atime?: Date,
+    mtime?: Date,
+    followSymlinks?: boolean,
+  ) => Promise<void>;
 };
 
 function closeFdTarget(target: FdTarget): void {
@@ -124,6 +130,17 @@ function closeFdTarget(target: FdTarget): void {
     target.state.masterClosed = true;
     for (const waiter of target.state.toSlaveWaiters.splice(0)) waiter();
   }
+}
+
+async function closeFdTargetAsync(target: FdTarget): Promise<void> {
+  if (target.type !== "vfs_file") {
+    closeFdTarget(target);
+    return;
+  }
+  if (target.fdTable.isOpen(target.fd)) {
+    await target.fdTable.closeAsync(target.fd);
+  }
+  target.refs = Math.max(0, target.refs - 1);
 }
 
 function retainFdTarget(target: FdTarget): void {
@@ -1655,7 +1672,10 @@ export class WasiHost {
     return WASI_ESUCCESS;
   }
 
-  private fdClose(fd: number): number {
+  private fdClose(fd: number): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) return this.fdCloseAsync(fd);
+
     fd = this.resolveDisplayedProcDirFd(fd) ?? fd;
 
     if (this.isPreopenFd(fd)) return WASI_ESUCCESS;
@@ -1686,6 +1706,48 @@ export class WasiHost {
 
     try {
       this.withVfsCredentials(() => this.fdTable.close(fd));
+      this.dirFds.delete(fd);
+      return WASI_ESUCCESS;
+    } catch (err) {
+      return fdErrorToWasi(err);
+    }
+  }
+
+  private async fdCloseAsync(fd: number): Promise<number> {
+    fd = this.resolveDisplayedProcDirFd(fd) ?? fd;
+
+    if (this.isPreopenFd(fd)) return WASI_ESUCCESS;
+
+    if (this.kernel && this.pid !== undefined) {
+      const target = this.kernel.getFdTarget(this.pid, fd);
+      if (target) {
+        if (target.type === "vfs_dir") this.dirFds.delete(fd);
+        try {
+          const closed = await this.withVfsCredentials(() => {
+            if (target.type === "vfs_dir" && this.fdTable.isOpen(fd)) {
+              return this.fdTable.closeAsync(fd).then(() =>
+                this.kernel!.closeFdAsync(this.pid!, fd)
+              );
+            }
+            return this.kernel!.closeFdAsync(this.pid!, fd);
+          });
+          if (closed) this.ioFds.delete(fd);
+          return closed ? WASI_ESUCCESS : WASI_EBADF;
+        } catch (err) {
+          return fdErrorToWasi(err);
+        }
+      }
+    }
+
+    if (this.ioFds.has(fd)) {
+      const target = this.ioFds.get(fd);
+      if (target) await closeFdTargetAsync(target);
+      this.ioFds.delete(fd);
+      return WASI_ESUCCESS;
+    }
+
+    try {
+      await this.withVfsCredentials(() => this.fdTable.closeAsync(fd));
       this.dirFds.delete(fd);
       return WASI_ESUCCESS;
     } catch (err) {
@@ -2929,7 +2991,18 @@ export class WasiHost {
     iovsLen: number,
     offset: bigint,
     nwrittenPtr: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.fdPwriteAsync(
+        fd,
+        iovsPtr,
+        iovsLen,
+        offset,
+        nwrittenPtr,
+      );
+    }
+
     const target = this.fdTarget(fd);
     if (this.dirFds.has(fd) || (target && target.type !== "vfs_file")) {
       return WASI_EBADF;
@@ -2956,8 +3029,47 @@ export class WasiHost {
     return WASI_ESUCCESS;
   }
 
+  private async fdPwriteAsync(
+    fd: number,
+    iovsPtr: number,
+    iovsLen: number,
+    offset: bigint,
+    nwrittenPtr: number,
+  ): Promise<number> {
+    const target = this.fdTarget(fd);
+    if (this.dirFds.has(fd) || (target && target.type !== "vfs_file")) {
+      return WASI_EBADF;
+    }
+    const view = this.getView();
+    const iovecs = readIovecs(view, iovsPtr, iovsLen);
+    let totalWritten = 0;
+    let pos = Number(offset);
+    try {
+      for (const iov of iovecs) {
+        const data = this.getBytes().slice(iov.buf, iov.buf + iov.len);
+        const n = await this.withVfsCredentials(() =>
+          this.kernel && this.pid !== undefined && target?.type === "vfs_file"
+            ? this.kernel.pwriteVfsFileAsync(this.pid, fd, data, pos)
+            : this.fdTable.pwriteAsync(fd, data, pos)
+        );
+        totalWritten += n;
+        pos += n;
+      }
+    } catch (err) {
+      return fdErrorToWasi(err);
+    }
+    this.getView().setUint32(nwrittenPtr, totalWritten, true);
+    return WASI_ESUCCESS;
+  }
+
   /** fd_filestat_set_size — ftruncate. */
-  private fdFilestatSetSize(fd: number, size: bigint): number {
+  private fdFilestatSetSize(
+    fd: number,
+    size: bigint,
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) return this.fdFilestatSetSizeAsync(fd, size);
+
     const target = this.fdTarget(fd);
     if (this.dirFds.has(fd) || (target && target.type !== "vfs_file")) {
       return WASI_EBADF;
@@ -2978,12 +3090,43 @@ export class WasiHost {
     }
   }
 
+  private async fdFilestatSetSizeAsync(
+    fd: number,
+    size: bigint,
+  ): Promise<number> {
+    const target = this.fdTarget(fd);
+    if (this.dirFds.has(fd) || (target && target.type !== "vfs_file")) {
+      return WASI_EBADF;
+    }
+    try {
+      if (
+        this.kernel && this.pid !== undefined && target?.type === "vfs_file"
+      ) {
+        await this.withVfsCredentials(() =>
+          this.kernel!.truncateVfsFileAsync(this.pid!, fd, Number(size))
+        );
+      } else {
+        await this.withVfsCredentials(() =>
+          this.fdTable.truncateAsync(fd, Number(size))
+        );
+      }
+      return WASI_ESUCCESS;
+    } catch (err) {
+      return fdErrorToWasi(err);
+    }
+  }
+
   private fdFilestatSetTimes(
     fd: number,
     atim: bigint,
     mtim: bigint,
     fstFlags: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.fdFilestatSetTimesAsync(fd, atim, mtim, fstFlags, asyncVfs);
+    }
+
     this.checkDeadline();
     try {
       if (this.dirFds.has(fd)) return WASI_ESUCCESS;
@@ -2997,6 +3140,33 @@ export class WasiHost {
     }
   }
 
+  private async fdFilestatSetTimesAsync(
+    fd: number,
+    atim: bigint,
+    mtim: bigint,
+    fstFlags: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    try {
+      if (this.dirFds.has(fd)) return WASI_ESUCCESS;
+      const filePath = this.kernel && this.pid !== undefined
+        ? this.kernel.vfsFilePath(this.pid, fd) ?? this.fdTable.getPath(fd)
+        : this.fdTable.getPath(fd);
+      if (filePath === undefined) return WASI_EBADF;
+      return await this.setVfsTimesAsync(
+        filePath,
+        atim,
+        mtim,
+        fstFlags,
+        true,
+        vfs,
+      );
+    } catch (err) {
+      return fdErrorToWasi(err);
+    }
+  }
+
   private pathFilestatSetTimes(
     dirFd: number,
     flags: number,
@@ -3005,13 +3175,58 @@ export class WasiHost {
     atim: bigint,
     mtim: bigint,
     fstFlags: number,
-  ): number {
+  ): number | Promise<number> {
+    const asyncVfs = this.asyncVfs();
+    if (asyncVfs) {
+      return this.pathFilestatSetTimesAsync(
+        dirFd,
+        flags,
+        pathPtr,
+        pathLen,
+        atim,
+        mtim,
+        fstFlags,
+        asyncVfs,
+      );
+    }
+
     this.checkDeadline();
     try {
       const relativePath = this.readString(pathPtr, pathLen);
       const absPath = this.resolvePath(dirFd, relativePath);
       const followSymlinks = (flags & 1) !== 0;
       return this.setVfsTimes(absPath, atim, mtim, fstFlags, followSymlinks);
+    } catch (err) {
+      if (err instanceof VfsError) {
+        return vfsErrnoToWasi(err.errno);
+      }
+      return fdErrorToWasi(err);
+    }
+  }
+
+  private async pathFilestatSetTimesAsync(
+    dirFd: number,
+    flags: number,
+    pathPtr: number,
+    pathLen: number,
+    atim: bigint,
+    mtim: bigint,
+    fstFlags: number,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    this.checkDeadline();
+    try {
+      const relativePath = this.readString(pathPtr, pathLen);
+      const absPath = this.resolvePath(dirFd, relativePath);
+      const followSymlinks = (flags & 1) !== 0;
+      return await this.setVfsTimesAsync(
+        absPath,
+        atim,
+        mtim,
+        fstFlags,
+        followSymlinks,
+        vfs,
+      );
     } catch (err) {
       if (err instanceof VfsError) {
         return vfsErrnoToWasi(err.errno);
@@ -3053,6 +3268,43 @@ export class WasiHost {
       this.vfs.setTimes!(absPath, atime, mtime, followSymlinks);
     });
     return WASI_ESUCCESS;
+  }
+
+  private async setVfsTimesAsync(
+    absPath: string,
+    atim: bigint,
+    mtim: bigint,
+    fstFlags: number,
+    followSymlinks = true,
+    vfs: AsyncVfsLike,
+  ): Promise<number> {
+    const invalidAtim = (fstFlags & WASI_FSTFLAGS_ATIM) !== 0 &&
+      (fstFlags & WASI_FSTFLAGS_ATIM_NOW) !== 0;
+    const invalidMtim = (fstFlags & WASI_FSTFLAGS_MTIM) !== 0 &&
+      (fstFlags & WASI_FSTFLAGS_MTIM_NOW) !== 0;
+    if (invalidAtim || invalidMtim) return WASI_EINVAL;
+
+    const now = new Date();
+    const atime = (fstFlags & WASI_FSTFLAGS_ATIM_NOW) !== 0
+      ? now
+      : (fstFlags & WASI_FSTFLAGS_ATIM) !== 0
+      ? wasiTimestampToDate(atim)
+      : undefined;
+    const mtime = (fstFlags & WASI_FSTFLAGS_MTIM_NOW) !== 0
+      ? now
+      : (fstFlags & WASI_FSTFLAGS_MTIM) !== 0
+      ? wasiTimestampToDate(mtim)
+      : undefined;
+    if (!atime && !mtime) {
+      if (vfs.statAsync) await vfs.statAsync(absPath);
+      else vfs.stat(absPath);
+      return WASI_ESUCCESS;
+    }
+    if (vfs.setTimesAsync) {
+      await vfs.setTimesAsync(absPath, atime, mtime, followSymlinks);
+      return WASI_ESUCCESS;
+    }
+    return WASI_ENOSYS;
   }
 
   private clockResGet(clockId: number, resPtr: number): number {

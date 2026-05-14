@@ -600,8 +600,15 @@ Deno.test("loadProcess wraps threaded JSPI WASI path imports", async () => {
   assert(wasiImports);
   for (
     const name of [
+      "fd_close",
+      "fd_filestat_get",
+      "fd_filestat_set_size",
+      "fd_filestat_set_times",
+      "fd_pwrite",
+      "fd_readdir",
       "path_create_directory",
       "path_filestat_get",
+      "path_filestat_set_times",
       "path_open",
       "path_readlink",
       "path_remove_directory",
