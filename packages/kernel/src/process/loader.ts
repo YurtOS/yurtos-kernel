@@ -274,8 +274,19 @@ export async function loadProcess(
 
   let instance: WebAssembly.Instance;
   try {
+    // Legacy TS Sandbox guests may statically import the new env.sys_socket_*
+    // ABI because libyurt is linked in, even when the program never calls it.
+    // Do not route these through the TS kernel; real socket code must use the
+    // Rust kernel path.
+    const envImports: Record<string, WebAssembly.ImportValue> = {
+      sys_poll: () => -38,
+      sys_socket_close: () => -38,
+      sys_socket_recv: () => -38,
+      sys_socket_send: () => -38,
+      sys_socketpair: () => -38,
+    };
     const imports: WebAssembly.Imports = {
-      env: {},
+      env: envImports,
       wasi_snapshot_preview1: wasiImports,
       yurt: yurtImports,
     };

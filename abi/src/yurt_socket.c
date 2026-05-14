@@ -652,10 +652,7 @@ int listen(int sockfd, int backlog) {
 static int yurt_accept_impl(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
   YURT_MARKER_CALL(accept);
   int kernel_fd = yurt_socket_kernel_fd(sockfd);
-  if (kernel_fd < 0) {
-    errno = EBADF;
-    return -1;
-  }
+  if (kernel_fd < 0) kernel_fd = sockfd;
   int accepted = yurt_sys_socket_accept(kernel_fd, yurt_socket_get_status_flags(sockfd));
   if (accepted < 0) {
     errno = yurt_errno_from_host(accepted, EAGAIN);
@@ -688,6 +685,7 @@ static ssize_t yurt_send_impl(int sockfd, const void *buf, size_t len, int flags
   }
   req_len = (int)len;
   int kernel_fd = yurt_socket_kernel_fd(sockfd);
+  if (kernel_fd < 0 && !yurt_socket_is_host_fd(sockfd)) kernel_fd = sockfd;
   if (kernel_fd >= 0) {
     n = yurt_sys_socket_send(kernel_fd, buf, req_len);
     if (n < 0) {
@@ -735,6 +733,7 @@ static ssize_t yurt_recv_impl(int sockfd, void *buf, size_t len, int flags) {
   }
 
   int kernel_fd = yurt_socket_kernel_fd(sockfd);
+  if (kernel_fd < 0 && !yurt_socket_is_host_fd(sockfd)) kernel_fd = sockfd;
   if (kernel_fd >= 0) {
     int sys_flags = (flags == MSG_PEEK || flags == YURT_MSG_PEEK) ? MSG_PEEK : 0;
     n = yurt_sys_socket_recv(kernel_fd, buf, (int)len, sys_flags);

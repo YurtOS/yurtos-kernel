@@ -118,3 +118,55 @@ Expected: PASS.
 
 Run: `cargo test --tests`
 Expected: PASS.
+
+### Task 5: POSIX Socket Error Matrix
+
+**Files:**
+- Modify: `packages/kernel-wasm/src/dispatch.rs`
+- Follow-up integration target: `abi/conformance/c/`
+- Follow-up suite target: `https://github.com/bytecodealliance/open-posix-test-suite`
+
+- [x] **Step 1: Check POSIX error contracts**
+
+Use the POSIX man pages as the source of truth for common descriptor/socket
+errors:
+
+- `EBADF`: fd is not a valid open file descriptor.
+- `ENOTSOCK`: fd is valid, but does not refer to a socket.
+- `ENOTCONN`: connection-mode socket is not connected.
+- `EINVAL`: `accept()` is called on a socket that is not accepting connections.
+- `EOPNOTSUPP`: operation is unsupported for the socket type, such as
+  `listen()`/`accept()` on a datagram socket.
+
+- [x] **Step 2: Add fd-table unit coverage**
+
+Add Rust kernel tests that exercise all socket syscall entry points with
+unopened fds and valid file fds. The tests must assert both the errno and that
+no kernel-host socket backend call occurred.
+
+- [x] **Step 3: Add socket-state unit coverage**
+
+Add Rust kernel tests for ordinary POSIX misuse:
+
+- `recv()` on an open-but-unconnected stream socket returns `-ENOTCONN`.
+- `read()` on the same socket returns `-ENOTCONN` through the unified fd path.
+- `accept()` on an open stream socket that has not been listened on returns
+  `-EINVAL`.
+- `accept()` on a datagram socket returns `-EOPNOTSUPP`.
+
+- [x] **Step 4: Promote selected rows to C ABI canaries**
+
+Add C conformance cases under `abi/conformance/c/` so libc callers observe the
+same errno values through POSIX APIs. Start with:
+
+- `listen()` on a regular file fd returns `ENOTSOCK`.
+- `accept()` on a regular file fd returns `ENOTSOCK`.
+- `recv()`/`read()` on an unconnected stream socket returns `ENOTCONN`.
+- `accept()` on an unlistened stream socket returns `EINVAL`.
+
+- [ ] **Step 5: Add an optional formal POSIX suite harness**
+
+Evaluate `bytecodealliance/open-posix-test-suite` as a slow-tier POSIX
+conformance source. Keep it outside the fast pre-push tests; run it as a
+guest-compat or manually triggered CI job once the syscall surface is broad
+enough to make failures actionable.

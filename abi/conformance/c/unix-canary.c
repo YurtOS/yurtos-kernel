@@ -830,6 +830,72 @@ static int case_listen_dgram_eopnotsupp(void) {
   return 1;
 }
 
+/* POSIX fd/socket namespace checks: a valid regular-file fd must be rejected as
+ * ENOTSOCK, while an open-but-unconnected stream socket has state-specific
+ * errors for recv/read and accept. */
+static int case_socket_fd_posix_errors(void) {
+  char buf[4];
+  int file_fd = open("/dev/null", O_RDONLY);
+  if (file_fd < 0) {
+    emit("socket_fd_posix_errors", 1, "open-file-fail", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  int rc = listen(file_fd, 1);
+  int saved_errno = errno;
+  if (rc != -1 || saved_errno != ENOTSOCK) {
+    close(file_fd);
+    emit("socket_fd_posix_errors", 1, "listen-file-wrong-errno", 1, saved_errno);
+    return 1;
+  }
+
+  errno = 0;
+  rc = accept(file_fd, NULL, NULL);
+  saved_errno = errno;
+  close(file_fd);
+  if (rc != -1 || saved_errno != ENOTSOCK) {
+    emit("socket_fd_posix_errors", 1, "accept-file-wrong-errno", 1, saved_errno);
+    return 1;
+  }
+
+  int stream_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (stream_fd < 0) {
+    emit("socket_fd_posix_errors", 1, "socket-fail", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  ssize_t n = recv(stream_fd, buf, sizeof(buf), 0);
+  saved_errno = errno;
+  if (n != -1 || saved_errno != ENOTCONN) {
+    close(stream_fd);
+    emit("socket_fd_posix_errors", 1, "recv-open-wrong-errno", 1, saved_errno);
+    return 1;
+  }
+
+  errno = 0;
+  n = read(stream_fd, buf, sizeof(buf));
+  saved_errno = errno;
+  if (n != -1 || saved_errno != ENOTCONN) {
+    close(stream_fd);
+    emit("socket_fd_posix_errors", 1, "read-open-wrong-errno", 1, saved_errno);
+    return 1;
+  }
+
+  errno = 0;
+  rc = accept(stream_fd, NULL, NULL);
+  saved_errno = errno;
+  close(stream_fd);
+  if (rc != -1 || saved_errno != EINVAL) {
+    emit("socket_fd_posix_errors", 1, "accept-open-wrong-errno", 1, saved_errno);
+    return 1;
+  }
+
+  emit("socket_fd_posix_errors", 0, "errno-matrix=ok", 0, 0);
+  return 0;
+}
+
 /* If a dgram bind fails, the route must not leak.
  * Verify by: (1) create a regular file at the bind path, so createSocket
  * returns EEXIST and bind fails; (2) unlink the file; (3) bind a fresh
@@ -1017,6 +1083,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "scm_rights_truncation") == 0)      return case_scm_rights_truncation();
   if (strcmp(name, "dgram_bind_rollback") == 0)        return case_dgram_bind_rollback();
   if (strcmp(name, "listen_dgram_eopnotsupp") == 0)   return case_listen_dgram_eopnotsupp();
+  if (strcmp(name, "socket_fd_posix_errors") == 0)    return case_socket_fd_posix_errors();
   if (strcmp(name, "dgram_so_type") == 0)              return case_dgram_so_type();
   if (strcmp(name, "dgram_nonblocking_recv") == 0)     return case_dgram_nonblocking_recv();
   if (strcmp(name, "peercred_uid_gid") == 0)               return case_peercred_uid_gid();

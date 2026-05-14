@@ -2478,10 +2478,8 @@ fn socket_handle_domain_type_for_fd(
     };
     match &socket.kind {
         SocketKind::Host { handle } => Ok((*handle, socket.domain, socket.sock_type)),
-        SocketKind::Open { .. } | SocketKind::UnixListener { .. } => Err(-(abi::EOPNOTSUPP as i64)),
-        SocketKind::UnixStream { .. } | SocketKind::UnixDatagram { .. } => {
-            Err(-(abi::EOPNOTSUPP as i64))
-        }
+        _ if matches!(socket.sock_type, 1 | 6) => Err(-(abi::EINVAL as i64)),
+        _ => Err(-(abi::EOPNOTSUPP as i64)),
     }
 }
 
@@ -4287,6 +4285,239 @@ mod tests {
             crate::kh::test_support::socket_send_calls(),
             Vec::<(i32, Vec<u8>)>::new()
         );
+        assert_eq!(
+            crate::kh::test_support::socket_recv_calls(),
+            Vec::<(i32, usize, u32)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_accept_calls(),
+            Vec::<(i32, u32)>::new()
+        );
+    }
+
+    #[test]
+    fn socket_ops_reject_bad_fds_without_backend_calls() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        for fd in [3_u32, 7, 255, u32::MAX] {
+            let mut response = [0u8; 32];
+            let cases: Vec<(u32, Vec<u8>, usize)> = vec![
+                (
+                    METHOD_SYS_SOCKET_CONNECT,
+                    socket_connect_req(fd, b"127.0.0.1:1"),
+                    0,
+                ),
+                (
+                    METHOD_SYS_SOCKET_BIND,
+                    socket_bind_req(fd, b"127.0.0.1:0"),
+                    0,
+                ),
+                (
+                    METHOD_SYS_SOCKET_LISTEN,
+                    socket_listen_req(fd, 16).to_vec(),
+                    0,
+                ),
+                (METHOD_SYS_SOCKET_SEND, socket_send_req(fd, b"x"), 0),
+                (METHOD_SYS_SOCKET_RECV, socket_recv_req(fd, 0).to_vec(), 8),
+                (
+                    METHOD_SYS_SOCKET_ACCEPT,
+                    socket_accept_req(fd, 0).to_vec(),
+                    0,
+                ),
+                (METHOD_SYS_SOCKET_ADDR, socket_fd_req(fd).to_vec(), 32),
+                (
+                    METHOD_SYS_SOCKET_SENDTO,
+                    socket_sendto_req(fd, 0, b"unix:/tmp/nope", b"x"),
+                    0,
+                ),
+                (
+                    METHOD_SYS_SOCKET_SENDMSG,
+                    socket_sendmsg_req(fd, b"x", &[]),
+                    0,
+                ),
+                (
+                    METHOD_SYS_SOCKET_RECVMSG,
+                    socket_recvmsg_req(fd, 0, 8).to_vec(),
+                    12,
+                ),
+            ];
+
+            for (method, req, response_len) in cases {
+                assert_eq!(
+                    dispatch(method, 1, &req, &mut response[..response_len]),
+                    -(abi::EBADF as i64),
+                    "method {method:#x} should reject unopened fd {fd}"
+                );
+            }
+        }
+
+        assert_eq!(
+            crate::kh::test_support::socket_connect_calls(),
+            Vec::<(Vec<u8>, u32)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_listen_calls(),
+            Vec::<(Vec<u8>, u32)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_send_calls(),
+            Vec::<(i32, Vec<u8>)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_recv_calls(),
+            Vec::<(i32, usize, u32)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_addr_calls(),
+            Vec::<(i32, usize)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_accept_calls(),
+            Vec::<(i32, u32)>::new()
+        );
+    }
+
+    #[test]
+    fn socket_ops_reject_file_fds_with_enotsock() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/dev/null"), &mut []);
+        assert!(fd >= 0, "open /dev/null: fd = {fd}");
+        let fd = fd as u32;
+        let mut response = [0u8; 32];
+
+        let cases: Vec<(u32, Vec<u8>, usize)> = vec![
+            (
+                METHOD_SYS_SOCKET_CONNECT,
+                socket_connect_req(fd, b"127.0.0.1:1"),
+                0,
+            ),
+            (
+                METHOD_SYS_SOCKET_BIND,
+                socket_bind_req(fd, b"127.0.0.1:0"),
+                0,
+            ),
+            (
+                METHOD_SYS_SOCKET_LISTEN,
+                socket_listen_req(fd, 16).to_vec(),
+                0,
+            ),
+            (METHOD_SYS_SOCKET_SEND, socket_send_req(fd, b"x"), 0),
+            (METHOD_SYS_SOCKET_RECV, socket_recv_req(fd, 0).to_vec(), 8),
+            (
+                METHOD_SYS_SOCKET_ACCEPT,
+                socket_accept_req(fd, 0).to_vec(),
+                0,
+            ),
+            (METHOD_SYS_SOCKET_ADDR, socket_fd_req(fd).to_vec(), 32),
+            (
+                METHOD_SYS_SOCKET_SENDTO,
+                socket_sendto_req(fd, 0, b"unix:/tmp/nope", b"x"),
+                0,
+            ),
+            (
+                METHOD_SYS_SOCKET_SENDMSG,
+                socket_sendmsg_req(fd, b"x", &[]),
+                0,
+            ),
+            (
+                METHOD_SYS_SOCKET_RECVMSG,
+                socket_recvmsg_req(fd, 0, 8).to_vec(),
+                12,
+            ),
+        ];
+
+        for (method, req, response_len) in cases {
+            assert_eq!(
+                dispatch(method, 1, &req, &mut response[..response_len]),
+                -(abi::ENOTSOCK as i64),
+                "method {method:#x} should reject file fd {fd}"
+            );
+        }
+
+        assert_eq!(
+            crate::kh::test_support::socket_connect_calls(),
+            Vec::<(Vec<u8>, u32)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_listen_calls(),
+            Vec::<(Vec<u8>, u32)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_send_calls(),
+            Vec::<(i32, Vec<u8>)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_recv_calls(),
+            Vec::<(i32, usize, u32)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_addr_calls(),
+            Vec::<(i32, usize)>::new()
+        );
+        assert_eq!(
+            crate::kh::test_support::socket_accept_calls(),
+            Vec::<(i32, u32)>::new()
+        );
+    }
+
+    #[test]
+    fn socket_state_errors_match_posix_contract() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        let stream_fd = dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(2, 1, 0),
+            &mut [],
+        );
+        assert!(stream_fd >= 0, "socket open stream: fd = {stream_fd}");
+        let stream_fd = stream_fd as u32;
+        let mut response = [0u8; 8];
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECV,
+                1,
+                &socket_recv_req(stream_fd, 0),
+                &mut response
+            ),
+            -(abi::ENOTCONN as i64)
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &stream_fd.to_le_bytes(), &mut response),
+            -(abi::ENOTCONN as i64)
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_ACCEPT,
+                1,
+                &socket_accept_req(stream_fd, 0),
+                &mut []
+            ),
+            -(abi::EINVAL as i64)
+        );
+
+        let dgram_fd = dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(1, 5, 0),
+            &mut [],
+        );
+        assert!(dgram_fd >= 0, "socket open datagram: fd = {dgram_fd}");
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_ACCEPT,
+                1,
+                &socket_accept_req(dgram_fd as u32, 0),
+                &mut []
+            ),
+            -(abi::EOPNOTSUPP as i64)
+        );
+
         assert_eq!(
             crate::kh::test_support::socket_recv_calls(),
             Vec::<(i32, usize, u32)>::new()

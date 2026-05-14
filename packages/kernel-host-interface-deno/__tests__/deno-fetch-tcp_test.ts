@@ -161,19 +161,28 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
         host,
       );
 
+      const openReq = new Uint8Array(8);
+      openReq[0] = 2;
+      openReq[1] = 1;
+      const openOut = await mk.syscallAsync(
+        METHOD.SYS_SOCKET_OPEN,
+        openReq,
+        0,
+      );
+      const handle = Number(openOut.rc);
+      expect(handle).toBeGreaterThan(0);
+
       // sys_socket_connect.
       const addr = `127.0.0.1:${port}`;
-      const cReq = new Uint8Array(8 + addr.length);
-      cReq[0] = 2;
-      cReq[1] = 1;
-      new TextEncoder().encodeInto(addr, cReq.subarray(8));
+      const cReq = new Uint8Array(4 + addr.length);
+      new DataView(cReq.buffer).setUint32(0, handle, true);
+      new TextEncoder().encodeInto(addr, cReq.subarray(4));
       const cOut = await mk.syscallAsync(
         METHOD.SYS_SOCKET_CONNECT,
         cReq,
         0,
       );
-      const handle = Number(cOut.rc);
-      expect(handle).toBeGreaterThan(0);
+      expect(Number(cOut.rc)).toEqual(0);
 
       const payload = new TextEncoder().encode("ping");
       const sReq = new Uint8Array(4 + payload.byteLength);
@@ -221,13 +230,26 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
       host,
     );
 
-    const addr = "127.0.0.1:0";
-    const req = new Uint8Array(4 + addr.length);
-    new DataView(req.buffer).setUint32(0, 16, true);
-    new TextEncoder().encodeInto(addr, req.subarray(4));
-    const out = await mk.syscallAsync(METHOD.SYS_SOCKET_LISTEN, req, 0);
-    const handle = Number(out.rc);
+    const openReq = new Uint8Array(8);
+    openReq[0] = 2;
+    openReq[1] = 1;
+    const openOut = await mk.syscallAsync(METHOD.SYS_SOCKET_OPEN, openReq, 0);
+    const handle = Number(openOut.rc);
     expect(handle).toBeGreaterThan(0);
+
+    const addr = "127.0.0.1:0";
+    const bindReq = new Uint8Array(4 + addr.length);
+    new DataView(bindReq.buffer).setUint32(0, handle, true);
+    new TextEncoder().encodeInto(addr, bindReq.subarray(4));
+    const bindOut = await mk.syscallAsync(METHOD.SYS_SOCKET_BIND, bindReq, 0);
+    expect(Number(bindOut.rc)).toEqual(0);
+
+    const listenReq = new Uint8Array(8);
+    const listenView = new DataView(listenReq.buffer);
+    listenView.setUint32(0, handle, true);
+    listenView.setUint32(4, 16, true);
+    const out = await mk.syscallAsync(METHOD.SYS_SOCKET_LISTEN, listenReq, 0);
+    expect(Number(out.rc)).toEqual(0);
     const closeReq = new Uint8Array(4);
     new DataView(closeReq.buffer).setUint32(0, handle, true);
     const closed = await mk.syscallAsync(METHOD.SYS_SOCKET_CLOSE, closeReq, 0);
