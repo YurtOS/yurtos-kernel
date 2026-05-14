@@ -164,7 +164,7 @@ describe("Sandbox", { sanitizeResources: false, sanitizeOps: false }, () => {
     sandbox.openTty();
 
     const env = sandbox.getEnvMap();
-    expect(env.get("HOME")).toBe("/home/user/");
+    expect(env.get("HOME")).toBe("/home/user");
     expect(env.get("SHELL")).toBe("/bin/sh");
     expect(env.get("USER")).toBe("user");
     expect(env.get("LOGNAME")).toBe("user");
@@ -189,7 +189,7 @@ describe("Sandbox", { sanitizeResources: false, sanitizeOps: false }, () => {
     sandbox.startHostSession();
 
     const env = sandbox.getEnvMap();
-    expect(env.get("HOME")).toBe("/home/user/");
+    expect(env.get("HOME")).toBe("/home/user");
     expect(env.get("SHELL")).toBe("/bin/sh");
     expect(env.get("USER")).toBe("user");
     expect(env.get("LOGNAME")).toBe("user");
@@ -202,7 +202,7 @@ describe("Sandbox", { sanitizeResources: false, sanitizeOps: false }, () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim().split("\n")).toEqual([
       "/home/user",
-      "/home/user/",
+      "/home/user",
       "/bin/sh",
       "user",
       "user",

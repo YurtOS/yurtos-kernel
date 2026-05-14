@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <sys/types.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,12 @@ typedef unsigned char sigset_t;
 #endif
 
 typedef void (*sighandler_t)(int);
+
+typedef struct siginfo {
+  int si_signo;
+  int si_errno;
+  int si_code;
+} siginfo_t;
 
 #if !defined(__DEFINED_sig_atomic_t)
 typedef int sig_atomic_t;
@@ -128,6 +135,7 @@ int sigaction(int sig, const struct sigaction *restrict act, struct sigaction *r
 int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset);
 int pthread_sigmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset);
 int sigsuspend(const sigset_t *mask);
+int sigtimedwait(const sigset_t *restrict set, siginfo_t *restrict info, const struct timespec *restrict timeout);
 int raise(int sig);
 unsigned alarm(unsigned seconds);
 

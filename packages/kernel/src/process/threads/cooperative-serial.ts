@@ -2,7 +2,7 @@ import type { ThreadsBackend } from "./backend.js";
 import type { IndirectCallTable } from "./indirect-call-table.js";
 import { NULL_INDIRECT_CALL_TABLE } from "./indirect-call-table.js";
 import { ThreadIdScope } from "./thread-id-scope.js";
-import { WASI_EBUSY } from "../../wasi/types.js";
+import { WASI_EBUSY, WASI_EINVAL, WASI_ESRCH } from "../../wasi/types.js";
 
 interface SpawnSlot {
   result: Promise<number>;
@@ -35,10 +35,6 @@ class ThreadExit {
 export class CooperativeSerialBackend implements ThreadsBackend {
   readonly kind = "cooperative-serial" as const;
 
-  // FIXME: This backend is only a compatibility bridge for one spawned thread at a
-  // time. Real Rayon/std::thread parallelism requires a shared-memory + atomics
-  // backend such as wasi-threads, worker-SAB, WASIp2 threads, or WASIX.
-  private readonly maxLiveSpawnedThreads = 1;
   private slots: SpawnSlot[] = [];
   private indirectTable: IndirectCallTable = NULL_INDIRECT_CALL_TABLE;
   private tids = new ThreadIdScope();
@@ -81,7 +77,7 @@ export class CooperativeSerialBackend implements ThreadsBackend {
 
   async spawn(fnPtr: number, arg: number): Promise<number> {
     this.ensureMainSlot();
-    if (this.liveSpawnedThreads() >= this.maxLiveSpawnedThreads) return -1;
+    if (this.liveSpawnedThreads() >= this.maxSpawnSlots) return -1;
     const canAllocateSlot = this.slots.length <= this.maxSpawnSlots;
     const reusableTid = canAllocateSlot
       ? -1
@@ -131,7 +127,9 @@ export class CooperativeSerialBackend implements ThreadsBackend {
 
   async join(tid: number): Promise<number> {
     const slot = this.slots[tid];
-    if (!slot || slot.reaped || slot.detached) return -1;
+    if (!slot) return -WASI_ESRCH;
+    if (slot.detached) return -WASI_EINVAL;
+    if (slot.reaped) return -WASI_ESRCH;
     slot.reaped = true;
     slot.start();
     return await slot.result;
@@ -139,7 +137,9 @@ export class CooperativeSerialBackend implements ThreadsBackend {
 
   async detach(tid: number): Promise<number> {
     const slot = this.slots[tid];
-    if (!slot || slot.reaped) return -1;
+    if (!slot) return -WASI_ESRCH;
+    if (slot.reaped && slot.detached) return -WASI_EINVAL;
+    if (slot.reaped) return -WASI_ESRCH;
     slot.detached = true;
     slot.reaped = true;
     return 0;

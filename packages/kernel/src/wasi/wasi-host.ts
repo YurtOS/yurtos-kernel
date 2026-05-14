@@ -40,6 +40,7 @@ import {
   WASI_ENOSYS,
   WASI_ENOTSOCK,
   WASI_ENOTSUP,
+  WASI_ENXIO,
   WASI_EPIPE,
   WASI_ESUCCESS,
   WASI_EVENTRWFLAGS_FD_READWRITE_HANGUP,
@@ -531,7 +532,11 @@ export class WasiHost {
       if (oldIoTarget) closeFdTarget(oldIoTarget);
       this.ioFds.delete(dstFd);
       this.fdTable.dupToShared(srcFd, dstFd);
-      return createVfsFileTarget(this.fdTable, dstFd);
+      const vfsTarget = createVfsFileTarget(this.fdTable, dstFd);
+      if (this.kernel && this.pid !== undefined) {
+        this.kernel.setFdTarget(this.pid, dstFd, vfsTarget);
+      }
+      return vfsTarget;
     }
 
     const dirPath = this.dirFds.get(srcFd);
@@ -2123,6 +2128,21 @@ export class WasiHost {
         if (!state) return WASI_ENOENT;
         if (this.openFdCount() >= this.nofileSoftLimit()) return WASI_EMFILE;
 
+        const fd = this.allocateIoFd(createTtySlaveTarget(state));
+        const view = this.getView();
+        view.setUint32(fdPtr, fd, true);
+        return WASI_ESUCCESS;
+      }
+
+      // /dev/ttyN — named TTY devices (tty0, tty1, tty2, console)
+      const namedTtyMatch = absPath.match(/^\/dev\/(tty\d+|console)$/);
+      if (namedTtyMatch) {
+        if (wantDir || wantCreate || wantTrunc) return WASI_EINVAL;
+        if (!this.kernel || this.pid === undefined) return WASI_ENOENT;
+        const devName = namedTtyMatch[1];
+        const state = this.kernel.getNamedTtyState(devName);
+        if (!state) return WASI_ENXIO;
+        if (this.openFdCount() >= this.nofileSoftLimit()) return WASI_EMFILE;
         const fd = this.allocateIoFd(createTtySlaveTarget(state));
         const view = this.getView();
         view.setUint32(fdPtr, fd, true);

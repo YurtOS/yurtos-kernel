@@ -10,6 +10,7 @@ env:
     packages/kernel/src/image-loader.ts
     packages/kernel/src/image-exporter.ts
     packages/kernel/src/image-builder.ts
+    packages/kernel/src/pkg-installer.ts
     packages/cli/src/cli.ts
     packages/cli/src/image-build-file.ts
     packages/kernel/src/vfs/tar-image-root-provider.ts
@@ -17,6 +18,7 @@ env:
     packages/kernel/src/__tests__/image-exporter_test.ts
     packages/kernel/src/__tests__/image-builder_test.ts
     packages/kernel/src/__tests__/sandbox-image_test.ts
+    packages/kernel/src/__tests__/pkg-installer_test.ts
     packages/cli/src/__tests__/cli-image_test.ts
     packages/cli/src/__tests__/cli-image-build_test.ts
     packages/cli/src/__tests__/image-build-file_test.ts
@@ -26,6 +28,7 @@ env:
     packages/kernel/src/__tests__/image-exporter_test.ts
     packages/kernel/src/__tests__/image-builder_test.ts
     packages/kernel/src/__tests__/sandbox-image_test.ts
+    packages/kernel/src/__tests__/pkg-installer_test.ts
     packages/cli/src/__tests__/cli-image_test.ts
     packages/cli/src/__tests__/cli-image-build_test.ts
     packages/cli/src/__tests__/image-build-file_test.ts
@@ -67,6 +70,53 @@ jobs:
         with:
           deno-version: v2.x
       - run: deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run $IMAGE_RUNTIME_TESTS
+
+  kernel-host-interface-js:
+    if: ${{ vars.YURT_ENABLE_WASM_KERNEL_CI == '1' }}
+    # Sandboxed-kernel: the portable JS+wasm kernel-host interface
+    # (packages/kernel-host-interface-js/) runs the same kernel.wasm artifact
+    # the wasmtime backend uses, validating that the contract
+    # (`kernel_dispatch` + `kh_*` imports) is genuinely runtime-
+    # agnostic. The Deno-only extensions (real fs / sockets /
+    # subprocess) live in packages/kernel-host-interface-deno/ (currently a
+    # re-export of -js, will fill in as we port the relevant
+    # syscalls). Browsers consume packages/kernel-host-interface-js/ directly —
+    # there is no separate browser kernel-host-interface package. See
+    # docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Install wabt (wat2wasm)
+        run: sudo apt-get update -y && sudo apt-get install -y wabt
+      - name: Build kernel.wasm
+        run: cargo build --release -p yurt-kernel-wasm --target wasm32-wasip1
+      - name: Build parity fixture wasm
+        run: |
+          cargo build --release --target wasm32-wasip1 \
+            -p hello-wasm \
+            -p echo-args-wasm \
+            -p cat-stdin-wasm \
+            -p cat-ramfs-wasm \
+            -p wc-bytes-wasm \
+            -p proc-cmdline-wasm \
+            -p true-cmd-wasm \
+            -p false-cmd-wasm
+      - name: Format check
+        run: deno fmt --check packages/kernel-host-interface-js/ packages/kernel-host-interface-deno/
+      - name: Lint
+        run: deno lint packages/kernel-host-interface-js/ packages/kernel-host-interface-deno/
+      - name: Test
+        run: |
+          deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run \
+            packages/kernel-host-interface-js/__tests__/ \
+            packages/kernel-host-interface-deno/__tests__/
 
   # NOTE: a `hooks-self-check` job that runs `pre-commit run --all-files`
   # belongs in this file but is intentionally omitted from the initial gates

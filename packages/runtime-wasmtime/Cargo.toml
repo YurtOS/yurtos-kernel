@@ -13,6 +13,9 @@ name = "yurt_runtime_wasmtime"
 path = "src/lib.rs"
 
 [dependencies]
+# Engine-agnostic kernel-host scaffolding (WasmEngine trait, etc.)
+yurt-kernel-host-interface-core = { path = "../kernel-host-interface-core" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -43,6 +46,11 @@ base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
 bytes = "1"
 
+# Embedded KV used by RedbKv (durable backing for kh_idb_*)
+redb = "2"
+
 [dev-dependencies]
+tar = { version = "0.4", default-features = false }
+toml = "0.8"
 wat = "1"
 wiremock = "0.6"

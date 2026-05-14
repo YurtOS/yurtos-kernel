@@ -1,0 +1,30 @@
+[package]
+name = "yurt-kernel-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Yurt kernel compiled to wasm32-wasip1; runs inside any kernel-host-interface host."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Tar parsing for image-layer mounts. Pure Rust; works on
+# wasm32-wasip1 without features.
+tar = { version = "0.4", default-features = false }
+# Zstd decoder for image-layer mounts. Pure Rust; the existing TS
+# image-loader produces .tar.zst — install_yurtfs auto-detects the
+# zstd magic and decompresses before tar walking.
+ruzstd = { version = "0.7", default-features = false, features = ["std"] }
+
+[build-dependencies]
+toml = "0.8"
+
+[dev-dependencies]
+# Test-only: encode zstd to verify the decoder path. ruzstd is
+# decoder-only; the `zstd` crate provides both directions but
+# pulls a C library — fine for tests, not for the wasm crate.
+zstd = "0.13"
+
+[features]
+default = []

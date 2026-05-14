@@ -1,18 +1,19 @@
-import { assertEquals } from "jsr:@std/assert@^1.0.19";
+import { assertEquals } from "@std/assert";
 
 const scopedImports = [
   "host_read_fd",
+  "host_poll",
   "host_list_processes",
   "host_network_fetch",
   "host_dns_resolve",
   "host_socket_connect",
-  "host_socket_bind",
   "host_socket_listen",
   "host_socket_accept",
   "host_socket_addr",
   "host_socket_send",
   "host_socket_recv",
-  "host_socket_option",
+  "host_socket_sendmsg",
+  "host_socket_recvmsg",
   "host_socket_close",
   "host_extension_invoke",
   "host_stat",
@@ -74,6 +75,35 @@ Deno.test("fetch ABI exposes the native host primitive without JSON helper alias
   for (const file of files) {
     const source = await Deno.readTextFile(file);
     if (source.includes("yurt_fetch_text") || source.includes("headers_json")) {
+      offenders.push(file.pathname);
+    }
+  }
+
+  assertEquals(offenders, []);
+});
+
+Deno.test("kernel and ABI boundary files do not mention JSON transport", async () => {
+  const files = [
+    new URL(
+      "../../../../../abi/contract/yurt_abi_methods.toml",
+      import.meta.url,
+    ),
+    new URL(
+      "../../../../../abi/contract/kernel_host_abi.toml",
+      import.meta.url,
+    ),
+    new URL(
+      "../../../../../packages/kernel-wasm/src/dispatch.rs",
+      import.meta.url,
+    ),
+    new URL("../../process/kernel.ts", import.meta.url),
+    new URL("../kernel-imports.ts", import.meta.url),
+    new URL("../../../../../abi/src/yurt_runtime.h", import.meta.url),
+  ];
+  const offenders: string[] = [];
+  for (const file of files) {
+    const source = await Deno.readTextFile(file);
+    if (/\bJSON\b|\bjson\b|\bserde_json\b/.test(source)) {
       offenders.push(file.pathname);
     }
   }

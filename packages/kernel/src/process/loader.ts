@@ -193,6 +193,11 @@ export interface LoaderContext {
     pid: number,
   ): (fd: 1 | 2) => { data: string; truncated: boolean };
   moduleCache?: WasmModuleCache;
+  /**
+   * Extra Promise-returning yurt imports that must be wrapped for JSPI or
+   * Asyncify. Used by the opt-in Rust kernel host-interface overlay.
+   */
+  extraAsyncImports?: string[];
 }
 
 export interface LoadProcessOptions {
@@ -409,6 +414,7 @@ export async function loadProcess(
       "host_thread_yield",
       "host_mutex_lock",
       "host_cond_wait",
+      ...(ctx.extraAsyncImports ?? []),
     ],
     asyncifyBridge,
     threadsBackend,
@@ -614,6 +620,7 @@ export async function loadProcess(
           "host_thread_yield",
           "host_mutex_lock",
           "host_cond_wait",
+          ...(ctx.extraAsyncImports ?? []),
         ],
         childBridge,
         childThreadsBackend,

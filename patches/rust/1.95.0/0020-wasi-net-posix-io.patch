@@ -1,0 +1,145 @@
+--- a/library/std/src/sys/net/connection/wasip1.rs
++++ b/library/std/src/sys/net/connection/wasip1.rs
+@@ -73,6 +73,12 @@
+ const YURT_IPPROTO_TCP: i32 = 6;
+ const YURT_TCP_NODELAY: i32 = 1;
+ const YURT_MSG_PEEK: i32 = 0x02;
++const YURT_SHUT_RD: i32 = 0;
++const YURT_SHUT_WR: i32 = 1;
++const YURT_SHUT_RDWR: i32 = 2;
++const YURT_F_GETFL: i32 = 3;
++const YURT_F_SETFL: i32 = 4;
++const YURT_O_NONBLOCK: i32 = 0x04;
+ 
+ #[repr(C, align(16))]
+ struct YurtSockAddr {
+@@ -115,7 +121,10 @@
+     fn getsockname(fd: i32, addr: *mut YurtSockAddr, addr_len: *mut YurtSockLen) -> i32;
+     fn getsockopt(fd: i32, level: i32, optname: i32, optval: *mut c_int, optlen: *mut YurtSockLen) -> i32;
+     fn setsockopt(fd: i32, level: i32, optname: i32, optval: *const c_int, optlen: YurtSockLen) -> i32;
++    fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+     fn recv(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
++    fn send(fd: i32, buf: *const u8, len: usize, flags: i32) -> isize;
++    fn shutdown(fd: i32, how: i32) -> i32;
+     fn getaddrinfo(node: *const c_char, service: *const c_char, hints: *const YurtAddrInfo, res: *mut *mut YurtAddrInfo) -> c_int;
+     fn freeaddrinfo(res: *mut YurtAddrInfo);
+ }
+@@ -168,9 +177,19 @@
+ 
+ fn tcp_peek(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+     let rc = unsafe { recv(fd as i32, buf.as_mut_ptr(), buf.len(), YURT_MSG_PEEK) };
++    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(rc as usize) }
++}
++
++fn tcp_recv(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
++    let rc = unsafe { recv(fd as i32, buf.as_mut_ptr(), buf.len(), 0) };
+     if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(rc as usize) }
+ }
+ 
++fn tcp_send(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
++    let rc = unsafe { send(fd as i32, buf.as_ptr(), buf.len(), 0) };
++    if rc < 0 { Err(io::Error::last_os_error()) } else { Ok(rc as usize) }
++}
++
+ fn socket_addr_to_sockaddr_in(addr: &SocketAddr) -> io::Result<YurtSockAddrIn> {
+     let SocketAddr::V4(addr) = addr else {
+         return Err(io::Error::new(
+@@ -314,7 +333,7 @@
+     }
+ 
+     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+-        self.read_vectored(&mut [IoSliceMut::new(buf)])
++        tcp_recv(self.socket().as_raw_fd(), buf)
+     }
+ 
+     pub fn read_buf(&self, buf: BorrowedCursor<'_>) -> io::Result<()> {
+@@ -322,23 +341,31 @@
+     }
+ 
+     pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
+-        self.socket().as_inner().read_vectored(bufs)
++        if let Some(buf) = bufs.iter_mut().find(|buf| !buf.is_empty()) {
++            tcp_recv(self.socket().as_raw_fd(), buf)
++        } else {
++            Ok(0)
++        }
+     }
+ 
+     pub fn is_read_vectored(&self) -> bool {
+-        true
++        false
+     }
+ 
+     pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+-        self.write_vectored(&[IoSlice::new(buf)])
++        tcp_send(self.socket().as_raw_fd(), buf)
+     }
+ 
+     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+-        self.socket().as_inner().write_vectored(bufs)
++        if let Some(buf) = bufs.iter().find(|buf| !buf.is_empty()) {
++            tcp_send(self.socket().as_raw_fd(), buf)
++        } else {
++            Ok(0)
++        }
+     }
+ 
+     pub fn is_write_vectored(&self) -> bool {
+-        true
++        false
+     }
+ 
+     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+@@ -371,13 +398,13 @@
+     }
+ 
+     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+-        let wasi_how = match how {
+-            Shutdown::Read => wasi::SDFLAGS_RD,
+-            Shutdown::Write => wasi::SDFLAGS_WR,
+-            Shutdown::Both => wasi::SDFLAGS_RD | wasi::SDFLAGS_WR,
++        let posix_how = match how {
++            Shutdown::Read => YURT_SHUT_RD,
++            Shutdown::Write => YURT_SHUT_WR,
++            Shutdown::Both => YURT_SHUT_RDWR,
+         };
+-
+-        unsafe { wasi::sock_shutdown(self.socket().as_raw_fd() as _, wasi_how).map_err(err2io) }
++        let rc = unsafe { shutdown(self.socket().as_raw_fd() as i32, posix_how) };
++        if rc != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+     }
+ 
+     pub fn duplicate(&self) -> io::Result<TcpStream> {
+@@ -421,22 +448,18 @@
+     }
+ 
+     pub fn set_nonblocking(&self, state: bool) -> io::Result<()> {
+-        let fdstat = unsafe {
+-            wasi::fd_fdstat_get(self.socket().as_inner().as_raw_fd() as wasi::Fd).map_err(err2io)?
+-        };
+-
+-        let mut flags = fdstat.fs_flags;
+-
+-        if state {
+-            flags |= wasi::FDFLAGS_NONBLOCK;
++        let fd = self.socket().as_raw_fd() as i32;
++        let mut flags = unsafe { fcntl(fd, YURT_F_GETFL) };
++        if flags < 0 {
++            return Err(io::Error::last_os_error());
++        }
++        if state {
++            flags |= YURT_O_NONBLOCK;
+         } else {
+-            flags &= !wasi::FDFLAGS_NONBLOCK;
++            flags &= !YURT_O_NONBLOCK;
+         }
+-
+-        unsafe {
+-            wasi::fd_fdstat_set_flags(self.socket().as_inner().as_raw_fd() as wasi::Fd, flags)
+-                .map_err(err2io)
+-        }
++        let rc = unsafe { fcntl(fd, YURT_F_SETFL, flags) };
++        if rc != 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
+     }
+ 
+     #[inline]

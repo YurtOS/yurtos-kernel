@@ -45,6 +45,10 @@ int main(void) {
     printf("accept=%d\n", errno);
     return 1;
   }
+  if (accepted == listener || accepted == client) {
+    printf("accept-fd-collides=%d\n", accepted);
+    return 1;
+  }
   if (peer.sin_family != AF_INET || ntohs(peer.sin_port) == 0) {
     puts("peer=failed");
     return 1;

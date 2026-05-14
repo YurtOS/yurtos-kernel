@@ -83,6 +83,14 @@ int tcsendbreak(int fd, int duration) {
     return 0;
 }
 
+pid_t tcgetsid(int fd) {
+    if (yurt_host_isatty(fd) < 0) {
+        errno = ENOTTY;
+        return (pid_t)-1;
+    }
+    return getsid(0);
+}
+
 /* cfgetospeed / cfgetispeed: extract baud rate from c_cflag.
  * CBAUD = 0xf on Linux/musl — the low 4 bits of c_cflag hold the baud constant. */
 #ifndef CBAUD
