@@ -107,6 +107,7 @@ mod sys_method_id {
     pub const SCHED_SETSCHEDULER: u32 = 0x1_0041;
     pub const SCHED_SETPARAM: u32 = 0x1_0042;
     pub const POLL: u32 = 0x1_0043;
+    pub const SOCKETPAIR: u32 = 0x1_0044;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -4139,6 +4140,29 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::SOCKET_CLOSE,
                 &req,
+            ) as i32
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socketpair",
+        |mut caller: Caller<'_, UserState>,
+         family: i32,
+         sock_type: i32,
+         flags: i32,
+         out_ptr: u32|
+         -> i32 {
+            let mut req = [0u8; 8];
+            req[0] = family as u8;
+            req[1] = sock_type as u8;
+            req[4..8].copy_from_slice(&(flags as u32).to_le_bytes());
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKETPAIR,
+                &req,
+                out_ptr,
+                8,
             ) as i32
         },
     )?;

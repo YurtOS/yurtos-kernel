@@ -16,3 +16,6 @@ pub const ENOTDIR: i32 = 20;
 pub const EINVAL: i32 = 22;
 pub const ENOSYS: i32 = 38;
 pub const EPIPE: i32 = 32;
+pub const EPROTOTYPE: i32 = 91;
+pub const EOPNOTSUPP: i32 = 95;
+pub const EAFNOSUPPORT: i32 = 97;

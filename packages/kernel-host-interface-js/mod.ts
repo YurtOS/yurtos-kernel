@@ -191,6 +191,7 @@ export const METHOD = {
   SYS_SCHED_SETSCHEDULER: 0x1_0041,
   SYS_SCHED_SETPARAM: 0x1_0042,
   SYS_POLL: 0x1_0043,
+  SYS_SOCKETPAIR: 0x1_0044,
 } as const;
 
 export const KERNEL_PID = 0;

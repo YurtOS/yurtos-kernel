@@ -376,11 +376,22 @@ pub struct OpenFileDescription {
     pub writable: bool,
 }
 
+pub enum SocketKind {
+    Host {
+        handle: i32,
+    },
+    UnixStream {
+        peer_id: u64,
+        rx: VecDeque<u8>,
+        peer_open: bool,
+    },
+}
+
 pub struct SocketEntry {
-    pub handle: i32,
     pub refs: u32,
     pub domain: u8,
     pub sock_type: u8,
+    pub kind: SocketKind,
 }
 
 pub struct Kernel {
@@ -633,17 +644,54 @@ impl Kernel {
         self.sockets.insert(
             id,
             SocketEntry {
-                handle,
                 refs: 1,
                 domain,
                 sock_type,
+                kind: SocketKind::Host { handle },
             },
         );
         id
     }
 
+    pub fn create_unix_stream_pair(&mut self) -> (u64, u64) {
+        let left = self.next_socket_id;
+        let right = self.next_socket_id + 1;
+        self.next_socket_id += 2;
+        self.sockets.insert(
+            left,
+            SocketEntry {
+                refs: 1,
+                domain: 1,
+                sock_type: 1,
+                kind: SocketKind::UnixStream {
+                    peer_id: right,
+                    rx: VecDeque::new(),
+                    peer_open: true,
+                },
+            },
+        );
+        self.sockets.insert(
+            right,
+            SocketEntry {
+                refs: 1,
+                domain: 1,
+                sock_type: 1,
+                kind: SocketKind::UnixStream {
+                    peer_id: left,
+                    rx: VecDeque::new(),
+                    peer_open: true,
+                },
+            },
+        );
+        (left, right)
+    }
+
     pub fn socket(&self, id: u64) -> Option<&SocketEntry> {
         self.sockets.get(&id)
+    }
+
+    pub fn socket_mut(&mut self, id: u64) -> Option<&mut SocketEntry> {
+        self.sockets.get_mut(&id)
     }
 
     pub fn socket_inc_ref(&mut self, id: u64) {
@@ -653,13 +701,30 @@ impl Kernel {
     }
 
     pub fn socket_dec_ref(&mut self, id: u64) -> Option<i32> {
-        let close_handle = if let Some(socket) = self.sockets.get_mut(&id) {
+        let drop_kind = if let Some(socket) = self.sockets.get_mut(&id) {
             socket.refs = socket.refs.saturating_sub(1);
-            (socket.refs == 0).then_some(socket.handle)
+            if socket.refs == 0 {
+                match &socket.kind {
+                    SocketKind::Host { handle } => Some((Some(*handle), None)),
+                    SocketKind::UnixStream { peer_id, .. } => Some((None, Some(*peer_id))),
+                }
+            } else {
+                None
+            }
         } else {
             None
         };
-        if close_handle.is_some() {
+        let Some((close_handle, peer_id)) = drop_kind else {
+            return None;
+        };
+        if let Some(peer_id) = peer_id {
+            if let Some(peer) = self.sockets.get_mut(&peer_id) {
+                if let SocketKind::UnixStream { peer_open, .. } = &mut peer.kind {
+                    *peer_open = false;
+                }
+            }
+        }
+        if close_handle.is_some() || peer_id.is_some() {
             self.sockets.remove(&id);
         }
         close_handle

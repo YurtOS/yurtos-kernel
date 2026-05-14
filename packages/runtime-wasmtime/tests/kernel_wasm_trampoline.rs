@@ -95,6 +95,7 @@ const METHOD_SYS_SCHED_GETPARAM: u32 = 0x1_0040;
 const METHOD_SYS_SCHED_SETSCHEDULER: u32 = 0x1_0041;
 const METHOD_SYS_SCHED_SETPARAM: u32 = 0x1_0042;
 const METHOD_SYS_POLL: u32 = 0x1_0043;
+const METHOD_SYS_SOCKETPAIR: u32 = 0x1_0044;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -2028,6 +2029,42 @@ fn user_process_poll_reports_pipe_write_readiness() {
 }
 
 #[test]
+fn user_process_socketpair_round_trips_bytes_through_kernel() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_socketpair" (func $socketpair (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_send" (func $send (param i32 i32 i32) (result i64)))
+          (import "env" "sys_socket_recv" (func $recv (param i32 i32 i32 i32) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 64) "hello unix")
+          (func (export "setup") (result i32)
+            (call $socketpair (i32.const 1) (i32.const 1) (i32.const 0) (i32.const 16)))
+          (func (export "left_fd") (result i32)
+            (i32.load (i32.const 16)))
+          (func (export "right_fd") (result i32)
+            (i32.load (i32.const 20)))
+          (func (export "send_left") (result i32)
+            (i32.wrap_i64
+              (call $send (i32.load (i32.const 16)) (i32.const 64) (i32.const 10))))
+          (func (export "recv_right") (result i32)
+            (i32.wrap_i64
+              (call $recv (i32.load (i32.const 20)) (i32.const 128) (i32.const 16) (i32.const 0)))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    assert_eq!(user.call_export_i32("setup").unwrap(), 8);
+    assert_eq!(user.call_export_i32("left_fd").unwrap(), 3);
+    assert_eq!(user.call_export_i32("right_fd").unwrap(), 4);
+    assert_eq!(user.call_export_i32("send_left").unwrap(), 10);
+    assert_eq!(user.call_export_i32("recv_right").unwrap(), 10);
+    let got = user.read_memory(128, 10).unwrap();
+    assert_eq!(&got, b"hello unix");
+}
+
+#[test]
 fn user_process_pipe_dup_keeps_writer_alive() {
     // dup() on a pipe end must increment the kernel-side refcount;
     // closing the original fd should not collapse the buffer.
@@ -2379,6 +2416,11 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             "sys_socket_addr",
             METHOD_SYS_SOCKET_ADDR,
             METHOD_SYS_SOCKET_ADDR as i64,
+        ),
+        (
+            "sys_socketpair",
+            METHOD_SYS_SOCKETPAIR,
+            METHOD_SYS_SOCKETPAIR as i64,
         ),
     ] {
         let entry = methods

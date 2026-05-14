@@ -333,6 +333,23 @@ export function buildSysImports(
     },
     sys_socket_close: (fd) =>
       forwardRequestBytes(METHOD.SYS_SOCKET_CLOSE, u32(fd)),
+    sys_socketpair: (family, sockType, flags, outPtr) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      req[0] = family & 0xff;
+      req[1] = sockType & 0xff;
+      view.setUint32(4, flags >>> 0, true);
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_SOCKETPAIR,
+        req,
+        8,
+      );
+      if (rc > 0) {
+        const outRc = copyOut(outPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
+      }
+      return rc;
+    },
     sys_socket_listen: (backlog, addrPtr, addrLen) => {
       const addr = copyIn(addrPtr, addrLen);
       if (typeof addr === "number") return addr;
