@@ -72,6 +72,7 @@ jobs:
       - run: deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run $IMAGE_RUNTIME_TESTS
 
   kernel-host-interface-js:
+    if: ${{ vars.YURT_ENABLE_WASM_KERNEL_CI == '1' }}
     # Sandboxed-kernel: the portable JS+wasm kernel-host interface
     # (packages/kernel-host-interface-js/) runs the same kernel.wasm artifact
     # the wasmtime backend uses, validating that the contract

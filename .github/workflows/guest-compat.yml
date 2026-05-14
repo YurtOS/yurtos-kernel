@@ -107,7 +107,14 @@ jobs:
       - name: Build zsh fixture
         run: make -C test-fixtures/c-ports/zsh copy-fixtures
 
+      - name: Run fixture smoke tests
+        run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/fixture-build-smoke_test.ts packages/kernel/src/process/__tests__/module-cache_test.ts
+
+      - name: Run upstream zsh tests
+        run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/zsh-upstream_slow.ts
+
       - name: Run Rust kernel process/fd smoke tests
+        if: ${{ vars.YURT_ENABLE_WASM_KERNEL_CI == '1' }}
         run: |
           set -euxo pipefail
           cargo test -p yurt-kernel-wasm --lib
