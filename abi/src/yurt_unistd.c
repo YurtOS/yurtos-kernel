@@ -22,6 +22,12 @@ int __wrap_close(int fd) {
   return __real_close(fd);
 }
 
+int reboot(int cmd) {
+  (void)cmd;
+  errno = EPERM;
+  return -1;
+}
+
 int dup2(int oldfd, int newfd) {
   YURT_MARKER_CALL(dup2);
 
