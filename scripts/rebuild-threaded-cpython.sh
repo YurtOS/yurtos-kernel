@@ -50,7 +50,7 @@
 
 set -euo pipefail
 
-KERNEL_ROOT="${YURT_KERNEL_ROOT:-/Users/ofer/work/yurt/yurtos-kernel/.claude/worktrees/worker-sab-pthread-runtime}"
+KERNEL_ROOT="${YURT_KERNEL_ROOT:-/Users/ofer/work/yurt/yurtos-kernel}"
 PORTS_ROOT="${YURT_PORTS_ROOT:-/Users/ofer/work/yurt/yurt-ports}"
 JUPYTER_ROOT="${YURT_JUPYTER_ROOT:-/Users/ofer/work/yurt/yurt-jupyter}"
 
