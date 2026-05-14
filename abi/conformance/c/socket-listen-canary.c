@@ -45,7 +45,7 @@ int main(void) {
     printf("accept=%d\n", errno);
     return 1;
   }
-  if (accepted < 10000) {
+  if (accepted == listener || accepted == client) {
     printf("accept-fd-collides=%d\n", accepted);
     return 1;
   }

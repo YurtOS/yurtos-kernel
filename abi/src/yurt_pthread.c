@@ -34,6 +34,30 @@ YURT_DEFINE_MARKER(pthread_setspecific,  0x70737073u)
 YURT_DEFINE_MARKER(pthread_getspecific,  0x70677073u)
 YURT_DEFINE_MARKER(pthread_once,         0x706f6e63u)
 
+static int yurt_attr_store_int(void *attr, int value) {
+  if (!attr) return EINVAL;
+  memcpy(attr, &value, sizeof(value));
+  return 0;
+}
+
+static int yurt_attr_load_int(const void *attr, int *value) {
+  if (!attr || !value) return EINVAL;
+  memcpy(value, attr, sizeof(*value));
+  return 0;
+}
+
+static int yurt_attr_store_clock(void *attr, clockid_t value) {
+  if (!attr) return EINVAL;
+  memcpy(attr, &value, sizeof(value));
+  return 0;
+}
+
+static int yurt_attr_load_clock(const void *attr, clockid_t *value) {
+  if (!attr || !value) return EINVAL;
+  memcpy(value, attr, sizeof(*value));
+  return 0;
+}
+
 int pthread_equal(pthread_t a, pthread_t b) {
   return a == b;
 }
@@ -171,9 +195,8 @@ int pthread_once(pthread_once_t *once_control, void (*init_routine)(void)) {
 }
 
 int pthread_mutexattr_init(pthread_mutexattr_t *attr) {
-  if (!attr) return EINVAL;
   memset(attr, 0, sizeof(*attr));
-  return 0;
+  return yurt_attr_store_int(attr, PTHREAD_MUTEX_NORMAL);
 }
 
 int pthread_mutexattr_destroy(pthread_mutexattr_t *attr) {
@@ -181,20 +204,17 @@ int pthread_mutexattr_destroy(pthread_mutexattr_t *attr) {
 }
 
 int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int type) {
-  if (!attr) return EINVAL;
-  return type >= PTHREAD_MUTEX_NORMAL && type <= PTHREAD_MUTEX_ERRORCHECK ? 0 : EINVAL;
+  if (type < PTHREAD_MUTEX_NORMAL || type > PTHREAD_MUTEX_ERRORCHECK) return EINVAL;
+  return yurt_attr_store_int(attr, type);
 }
 
 int pthread_mutexattr_gettype(const pthread_mutexattr_t *attr, int *type) {
-  if (!attr || !type) return EINVAL;
-  *type = PTHREAD_MUTEX_NORMAL;
-  return 0;
+  return yurt_attr_load_int(attr, type);
 }
 
 int pthread_condattr_init(pthread_condattr_t *attr) {
-  if (!attr) return EINVAL;
   memset(attr, 0, sizeof(*attr));
-  return 0;
+  return yurt_attr_store_clock(attr, CLOCK_REALTIME);
 }
 
 int pthread_condattr_destroy(pthread_condattr_t *attr) {
@@ -202,15 +222,12 @@ int pthread_condattr_destroy(pthread_condattr_t *attr) {
 }
 
 int pthread_condattr_setclock(pthread_condattr_t *attr, clockid_t clock_id) {
-  if (!attr) return EINVAL;
   if (clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC) return EINVAL;
-  return 0;
+  return yurt_attr_store_clock(attr, clock_id);
 }
 
 int pthread_condattr_getclock(const pthread_condattr_t *attr, clockid_t *clock_id) {
-  if (!attr || !clock_id) return EINVAL;
-  *clock_id = CLOCK_MONOTONIC;
-  return 0;
+  return yurt_attr_load_clock(attr, clock_id);
 }
 
 int pthread_cancel(pthread_t thread) {

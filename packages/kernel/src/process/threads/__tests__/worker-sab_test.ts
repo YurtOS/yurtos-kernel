@@ -1,4 +1,5 @@
 import { assertEquals } from "@std/assert";
+import { WASI_EINVAL, WASI_ESRCH } from "../../../wasi/types.ts";
 import { SabMutex } from "../sab-primitives.ts";
 import { WorkerSabThreadsBackend } from "../worker-sab.ts";
 
@@ -36,11 +37,12 @@ Deno.test("worker SAB backend rejects double join and detached join", async () =
 
   const joined = await backend.spawn(1, 7);
   assertEquals(await backend.join(joined), 7);
-  assertEquals(await backend.join(joined), -1);
+  assertEquals(await backend.join(joined), -WASI_ESRCH);
 
   const detached = await backend.spawn(1, 8);
   assertEquals(await backend.detach(detached), 0);
-  assertEquals(await backend.join(detached), -1);
+  assertEquals(await backend.join(detached), -WASI_EINVAL);
+  assertEquals(await backend.detach(detached), -WASI_EINVAL);
 });
 
 Deno.test("worker SAB backend preserves self across overlapping async thread scopes", async () => {
