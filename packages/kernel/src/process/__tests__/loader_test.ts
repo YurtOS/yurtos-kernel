@@ -552,10 +552,17 @@ Deno.test("loadProcess wraps threaded JSPI WASI path imports", async () => {
   let wasiImports:
     | Record<string, WebAssembly.ImportValue>
     | undefined;
+  let yurtImports:
+    | Record<string, WebAssembly.ImportValue>
+    | undefined;
   const adapter: PlatformAdapter = {
     ...ctx.adapter,
     instantiate: (_module, imports) => {
       wasiImports = imports.wasi_snapshot_preview1 as Record<
+        string,
+        WebAssembly.ImportValue
+      >;
+      yurtImports = imports.yurt as Record<
         string,
         WebAssembly.ImportValue
       >;
@@ -619,6 +626,35 @@ Deno.test("loadProcess wraps threaded JSPI WASI path imports", async () => {
   ) {
     assertEquals(
       wrapped.has(wasiImports[name] as ImportFunction),
+      true,
+      `${name} should be wrapped for threaded JSPI suspension`,
+    );
+  }
+
+  assert(yurtImports);
+  for (
+    const name of [
+      "host_chdir",
+      "host_chmod",
+      "host_chown",
+      "host_fchdir",
+      "host_fchown",
+      "host_getcwd",
+      "host_glob",
+      "host_mkdir",
+      "host_read_file",
+      "host_readdir",
+      "host_readlink",
+      "host_realpath",
+      "host_remove",
+      "host_rename",
+      "host_stat",
+      "host_symlink",
+      "host_write_file",
+    ]
+  ) {
+    assertEquals(
+      wrapped.has(yurtImports[name] as ImportFunction),
       true,
       `${name} should be wrapped for threaded JSPI suspension`,
     );

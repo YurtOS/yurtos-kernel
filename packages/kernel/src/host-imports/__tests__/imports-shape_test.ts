@@ -1212,6 +1212,38 @@ Deno.test("host_chdir normalizes dot segments without resolving symlink names", 
   assertEquals(kernel.getCwd(pid), "/tmp/zsh-tests/cdtst.tmp/sub/fake");
 });
 
+Deno.test("host_chdir awaits async VFS stat operations", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.mkdir("/tmp/async-cwd");
+  const asyncVfs = Object.create(vfs) as VFS & {
+    isAsyncVfs: true;
+    stat(path: string): ReturnType<VFS["stat"]>;
+    statAsync(path: string): Promise<ReturnType<VFS["stat"]>>;
+  };
+  asyncVfs.isAsyncVfs = true;
+  asyncVfs.stat = () => {
+    throw new Error("sync stat should not be used");
+  };
+  asyncVfs.statAsync = (path: string) => Promise.resolve(vfs.stat(path));
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  const imports = createKernelImports({
+    memory,
+    vfs: asyncVfs,
+    kernel,
+    callerPid: pid,
+  });
+
+  const dirLen = writeString(memory, 0, "/tmp/async-cwd");
+  const result = (imports.host_chdir as (
+    ...args: number[]
+  ) => number | Promise<number>)(0, dirLen);
+  assertEquals(result instanceof Promise, true);
+  assertEquals(await result, 0);
+  assertEquals(kernel.getCwd(pid), "/tmp/async-cwd");
+});
+
 Deno.test("host_getcwd writes the caller cwd and reports required size", () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const kernel = new ProcessKernel();
@@ -1253,6 +1285,58 @@ Deno.test("host_getcwd returns the physical cwd for symlinked process cwd", () =
       new Uint8Array(memory.buffer, 0, "/tmp/cwd-real".length),
     ),
     "/tmp/cwd-real",
+  );
+});
+
+Deno.test("host_getcwd awaits async VFS cwd resolution operations", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.mkdir("/tmp/async-cwd-real");
+  vfs.symlink("async-cwd-real", "/tmp/async-cwd-link");
+  const asyncVfs = Object.create(vfs) as VFS & {
+    isAsyncVfs: true;
+    stat(path: string): ReturnType<VFS["stat"]>;
+    lstat(path: string): ReturnType<VFS["lstat"]>;
+    readlink(path: string): string;
+    statAsync(path: string): Promise<ReturnType<VFS["stat"]>>;
+    lstatAsync(path: string): Promise<ReturnType<VFS["lstat"]>>;
+    readlinkAsync(path: string): Promise<string>;
+  };
+  asyncVfs.isAsyncVfs = true;
+  asyncVfs.stat = () => {
+    throw new Error("sync stat should not be used");
+  };
+  asyncVfs.lstat = () => {
+    throw new Error("sync lstat should not be used");
+  };
+  asyncVfs.readlink = () => {
+    throw new Error("sync readlink should not be used");
+  };
+  asyncVfs.statAsync = (path: string) => Promise.resolve(vfs.stat(path));
+  asyncVfs.lstatAsync = (path: string) => Promise.resolve(vfs.lstat(path));
+  asyncVfs.readlinkAsync = (path: string) =>
+    Promise.resolve(vfs.readlink(path));
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  kernel.setCwd(pid, "/tmp/async-cwd-link");
+  const imports = createKernelImports({
+    memory,
+    vfs: asyncVfs,
+    kernel,
+    callerPid: pid,
+  });
+
+  const result = (imports.host_getcwd as (
+    ...args: number[]
+  ) => number | Promise<number>)(0, 64);
+  const expected = "/tmp/async-cwd-real";
+  assertEquals(result instanceof Promise, true);
+  assertEquals(await result, expected.length + 1);
+  assertEquals(
+    new TextDecoder().decode(
+      new Uint8Array(memory.buffer, 0, expected.length),
+    ),
+    expected,
   );
 });
 
@@ -1320,6 +1404,59 @@ Deno.test("host_realpath applies parent traversal after symlink path components"
     ),
     expected.length + 1,
   );
+  assertEquals(
+    new TextDecoder().decode(
+      new Uint8Array(memory.buffer, 128, expected.length),
+    ),
+    expected,
+  );
+});
+
+Deno.test("host_realpath awaits async VFS path resolution operations", async () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS({ uid: 1000, gid: 1000 });
+  vfs.mkdirp("/tmp/async-real");
+  vfs.mkdirp("/tmp/async-link-parent");
+  vfs.symlink("../async-real", "/tmp/async-link-parent/link");
+  const asyncVfs = Object.create(vfs) as VFS & {
+    isAsyncVfs: true;
+    stat(path: string): ReturnType<VFS["stat"]>;
+    lstat(path: string): ReturnType<VFS["lstat"]>;
+    readlink(path: string): string;
+    statAsync(path: string): Promise<ReturnType<VFS["stat"]>>;
+    lstatAsync(path: string): Promise<ReturnType<VFS["lstat"]>>;
+    readlinkAsync(path: string): Promise<string>;
+  };
+  asyncVfs.isAsyncVfs = true;
+  asyncVfs.stat = () => {
+    throw new Error("sync stat should not be used");
+  };
+  asyncVfs.lstat = () => {
+    throw new Error("sync lstat should not be used");
+  };
+  asyncVfs.readlink = () => {
+    throw new Error("sync readlink should not be used");
+  };
+  asyncVfs.statAsync = (path: string) => Promise.resolve(vfs.stat(path));
+  asyncVfs.lstatAsync = (path: string) => Promise.resolve(vfs.lstat(path));
+  asyncVfs.readlinkAsync = (path: string) =>
+    Promise.resolve(vfs.readlink(path));
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  const imports = createKernelImports({
+    memory,
+    vfs: asyncVfs,
+    kernel,
+    callerPid: pid,
+  });
+
+  const pathLen = writeString(memory, 0, "/tmp/async-link-parent/link");
+  const expected = "/tmp/async-real";
+  const result = (imports.host_realpath as (
+    ...args: number[]
+  ) => number | Promise<number>)(0, pathLen, 128, 64);
+  assertEquals(result instanceof Promise, true);
+  assertEquals(await result, expected.length + 1);
   assertEquals(
     new TextDecoder().decode(
       new Uint8Array(memory.buffer, 128, expected.length),
