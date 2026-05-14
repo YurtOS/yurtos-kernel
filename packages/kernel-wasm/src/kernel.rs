@@ -390,6 +390,11 @@ pub enum SocketKind {
         rx: VecDeque<u8>,
         peer_open: bool,
     },
+    UnixDatagram {
+        peer_id: u64,
+        rx: VecDeque<Vec<u8>>,
+        peer_open: bool,
+    },
 }
 
 pub struct SocketEntry {
@@ -693,6 +698,39 @@ impl Kernel {
         (left, right)
     }
 
+    pub fn create_unix_datagram_pair(&mut self) -> (u64, u64) {
+        let left = self.next_socket_id;
+        let right = self.next_socket_id + 1;
+        self.next_socket_id += 2;
+        self.sockets.insert(
+            left,
+            SocketEntry {
+                refs: 1,
+                domain: 1,
+                sock_type: 2,
+                kind: SocketKind::UnixDatagram {
+                    peer_id: right,
+                    rx: VecDeque::new(),
+                    peer_open: true,
+                },
+            },
+        );
+        self.sockets.insert(
+            right,
+            SocketEntry {
+                refs: 1,
+                domain: 1,
+                sock_type: 2,
+                kind: SocketKind::UnixDatagram {
+                    peer_id: left,
+                    rx: VecDeque::new(),
+                    peer_open: true,
+                },
+            },
+        );
+        (left, right)
+    }
+
     pub fn create_unix_listener(&mut self, path: &[u8], backlog: u32) -> Result<u64, i32> {
         if self.unix_listeners.contains_key(path) {
             return Err(crate::abi::EADDRINUSE);
@@ -786,6 +824,9 @@ impl Kernel {
                     SocketKind::UnixStream { peer_id, .. } => {
                         Some((None, Some(*peer_id), None, Vec::new()))
                     }
+                    SocketKind::UnixDatagram { peer_id, .. } => {
+                        Some((None, Some(*peer_id), None, Vec::new()))
+                    }
                 }
             } else {
                 None
@@ -793,9 +834,7 @@ impl Kernel {
         } else {
             None
         };
-        let Some((close_handle, peer_id, listener_path, pending_ids)) = drop_kind else {
-            return None;
-        };
+        let (close_handle, peer_id, listener_path, pending_ids) = drop_kind?;
         if let Some(path) = listener_path {
             self.unix_listeners.remove(&path);
         }
@@ -804,8 +843,12 @@ impl Kernel {
         }
         if let Some(peer_id) = peer_id {
             if let Some(peer) = self.sockets.get_mut(&peer_id) {
-                if let SocketKind::UnixStream { peer_open, .. } = &mut peer.kind {
-                    *peer_open = false;
+                match &mut peer.kind {
+                    SocketKind::UnixStream { peer_open, .. }
+                    | SocketKind::UnixDatagram { peer_open, .. } => {
+                        *peer_open = false;
+                    }
+                    _ => {}
                 }
             }
         }

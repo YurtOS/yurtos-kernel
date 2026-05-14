@@ -692,26 +692,49 @@ fn unix_path_from_addr(addr: &[u8]) -> Option<&[u8]> {
 }
 
 fn socket_send_id(k: &mut Kernel, id: u64, data: &[u8]) -> i64 {
-    let kind = match k.socket(id).map(|socket| &socket.kind) {
+    enum UnixPeer {
+        Stream(u64, bool),
+        Datagram(u64, bool),
+    }
+    let peer = match k.socket(id).map(|socket| &socket.kind) {
         Some(SocketKind::Host { handle }) => return kh::socket_send(*handle, data),
         Some(SocketKind::UnixStream {
             peer_id, peer_open, ..
-        }) => (*peer_id, *peer_open),
+        }) => UnixPeer::Stream(*peer_id, *peer_open),
+        Some(SocketKind::UnixDatagram {
+            peer_id, peer_open, ..
+        }) => UnixPeer::Datagram(*peer_id, *peer_open),
         Some(SocketKind::UnixListener { .. }) => return -(abi::EOPNOTSUPP as i64),
         None => return -(abi::EBADF as i64),
     };
-    let (peer_id, peer_open) = kind;
-    if !peer_open {
-        return -(abi::EPIPE as i64);
+    match peer {
+        UnixPeer::Stream(peer_id, peer_open) => {
+            if !peer_open {
+                return -(abi::EPIPE as i64);
+            }
+            let Some(peer) = k.socket_mut(peer_id) else {
+                return -(abi::EPIPE as i64);
+            };
+            let SocketKind::UnixStream { rx, .. } = &mut peer.kind else {
+                return -(abi::EPIPE as i64);
+            };
+            rx.extend(data);
+            data.len() as i64
+        }
+        UnixPeer::Datagram(peer_id, peer_open) => {
+            if !peer_open {
+                return -(abi::EPIPE as i64);
+            }
+            let Some(peer) = k.socket_mut(peer_id) else {
+                return -(abi::EPIPE as i64);
+            };
+            let SocketKind::UnixDatagram { rx, .. } = &mut peer.kind else {
+                return -(abi::EPIPE as i64);
+            };
+            rx.push_back(data.to_vec());
+            data.len() as i64
+        }
     }
-    let Some(peer) = k.socket_mut(peer_id) else {
-        return -(abi::EPIPE as i64);
-    };
-    let SocketKind::UnixStream { rx, .. } = &mut peer.kind else {
-        return -(abi::EPIPE as i64);
-    };
-    rx.extend(data);
-    data.len() as i64
 }
 
 fn socket_recv_id(k: &mut Kernel, id: u64, response: &mut [u8], flags: u32) -> i64 {
@@ -721,6 +744,20 @@ fn socket_recv_id(k: &mut Kernel, id: u64, response: &mut [u8], flags: u32) -> i
     match &mut socket.kind {
         SocketKind::Host { handle } => kh::socket_recv(*handle, response, flags),
         SocketKind::UnixListener { .. } => -(abi::EOPNOTSUPP as i64),
+        SocketKind::UnixDatagram { rx, peer_open, .. } => {
+            if flags != 0 && flags != 2 {
+                return -(abi::EOPNOTSUPP as i64);
+            }
+            let Some(packet) = rx.front() else {
+                return if *peer_open { -(abi::EAGAIN as i64) } else { 0 };
+            };
+            let take = packet.len().min(response.len());
+            response[..take].copy_from_slice(&packet[..take]);
+            if flags != 2 {
+                rx.pop_front();
+            }
+            take as i64
+        }
         SocketKind::UnixStream { rx, peer_open, .. } => {
             if flags != 0 && flags != 2 {
                 return -(abi::EOPNOTSUPP as i64);
@@ -964,7 +1001,7 @@ const POLLNVAL: i16 = 0x0020;
 const POLLFD_SIZE: usize = 8;
 
 fn poll_fds(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
-    if request.len() < 4 || (request.len() - 4) % POLLFD_SIZE != 0 {
+    if request.len() < 4 || !(request.len() - 4).is_multiple_of(POLLFD_SIZE) {
         return -(abi::EINVAL as i64);
     }
     let records = &request[4..];
@@ -1077,6 +1114,19 @@ fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) ->
                     }
                 }
                 SocketKind::UnixStream { rx, peer_open, .. } => {
+                    let mut revents = 0;
+                    if wants_read && !rx.is_empty() {
+                        revents |= POLLIN;
+                    }
+                    if wants_write && *peer_open {
+                        revents |= POLLOUT;
+                    }
+                    if !*peer_open && rx.is_empty() {
+                        revents |= POLLHUP;
+                    }
+                    revents
+                }
+                SocketKind::UnixDatagram { rx, peer_open, .. } => {
                     let mut revents = 0;
                     if wants_read && !rx.is_empty() {
                         revents |= POLLIN;
@@ -2141,7 +2191,7 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
         };
         match k.socket(id).map(|socket| &socket.kind) {
             Some(SocketKind::UnixListener { path, .. }) => Ok(Some(path.clone())),
-            Some(SocketKind::UnixStream { .. }) => Ok(None),
+            Some(SocketKind::UnixStream { .. } | SocketKind::UnixDatagram { .. }) => Ok(None),
             Some(SocketKind::Host { .. }) => Err(0),
             None => Err(-(abi::EBADF as i64)),
         }
@@ -2211,7 +2261,9 @@ fn socket_handle_domain_type_for_fd(
     match &socket.kind {
         SocketKind::Host { handle } => Ok((*handle, socket.domain, socket.sock_type)),
         SocketKind::UnixListener { .. } => Err(-(abi::EOPNOTSUPP as i64)),
-        SocketKind::UnixStream { .. } => Err(-(abi::EOPNOTSUPP as i64)),
+        SocketKind::UnixStream { .. } | SocketKind::UnixDatagram { .. } => {
+            Err(-(abi::EOPNOTSUPP as i64))
+        }
     }
 }
 
@@ -2223,7 +2275,7 @@ fn sys_socket_send(caller_pid: u32, request: &[u8]) -> i64 {
     let data = &request[4..];
     with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
         Ok(id) => socket_send_id(k, id, data),
-        Err(rc) => return rc,
+        Err(rc) => rc,
     })
 }
 
@@ -2238,7 +2290,7 @@ fn sys_socket_recv(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
     }
     with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
         Ok(id) => socket_recv_id(k, id, response, flags),
-        Err(rc) => return rc,
+        Err(rc) => rc,
     })
 }
 
@@ -2269,11 +2321,15 @@ fn sys_socketpair(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if !matches!(family, 1 | 3) {
         return -(abi::EAFNOSUPPORT as i64);
     }
-    if !matches!(sock_type, 1 | 6) {
+    if !matches!(sock_type, 1 | 2 | 5 | 6) {
         return -(abi::EPROTOTYPE as i64);
     }
     with_kernel(|k| {
-        let (left_id, right_id) = k.create_unix_stream_pair();
+        let (left_id, right_id) = if matches!(sock_type, 2 | 5) {
+            k.create_unix_datagram_pair()
+        } else {
+            k.create_unix_stream_pair()
+        };
         let p = k.process_mut(caller_pid);
         let left_fd = p.fd_table.lowest_free_fd();
         p.fd_table.install(left_fd, FdEntry::Socket { id: left_id });
@@ -3657,6 +3713,74 @@ mod tests {
         let mut fds = [0u8; 8];
         assert_eq!(
             dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(3, 6, 0), &mut fds),
+            8
+        );
+        let left = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let right = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+        assert_eq!((left, right), (3, 4));
+    }
+
+    #[test]
+    fn socketpair_preserves_af_unix_datagram_message_boundaries() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut fds = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(3, 5, 0), &mut fds),
+            8
+        );
+        let left = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let right = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SEND,
+                1,
+                &socket_send_req(left, b"first"),
+                &mut []
+            ),
+            5
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SEND,
+                1,
+                &socket_send_req(left, b"second"),
+                &mut []
+            ),
+            6
+        );
+
+        let mut small = [0u8; 3];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECV,
+                1,
+                &socket_recv_req(right, 0),
+                &mut small
+            ),
+            3
+        );
+        assert_eq!(&small, b"fir");
+
+        let mut next = [0u8; 16];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECV,
+                1,
+                &socket_recv_req(right, 0),
+                &mut next
+            ),
+            6
+        );
+        assert_eq!(&next[..6], b"second");
+    }
+
+    #[test]
+    fn socketpair_accepts_linux_af_unix_datagram_constants() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut fds = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 2, 0), &mut fds),
             8
         );
         let left = u32::from_le_bytes(fds[0..4].try_into().unwrap());

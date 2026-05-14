@@ -2065,6 +2065,42 @@ fn user_process_socketpair_round_trips_bytes_through_kernel() {
 }
 
 #[test]
+fn user_process_socketpair_datagram_preserves_message_boundaries() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_socketpair" (func $socketpair (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_send" (func $send (param i32 i32 i32) (result i64)))
+          (import "env" "sys_socket_recv" (func $recv (param i32 i32 i32 i32) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 64) "first")
+          (data (i32.const 80) "second")
+          (func (export "setup") (result i32)
+            (call $socketpair (i32.const 3) (i32.const 5) (i32.const 0) (i32.const 16)))
+          (func (export "send_messages") (result i32)
+            (drop (call $send (i32.load (i32.const 16)) (i32.const 64) (i32.const 5)))
+            (i32.wrap_i64
+              (call $send (i32.load (i32.const 16)) (i32.const 80) (i32.const 6))))
+          (func (export "recv_short") (result i32)
+            (i32.wrap_i64
+              (call $recv (i32.load (i32.const 20)) (i32.const 128) (i32.const 3) (i32.const 0))))
+          (func (export "recv_next") (result i32)
+            (i32.wrap_i64
+              (call $recv (i32.load (i32.const 20)) (i32.const 144) (i32.const 16) (i32.const 0)))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    assert_eq!(user.call_export_i32("setup").unwrap(), 8);
+    assert_eq!(user.call_export_i32("send_messages").unwrap(), 6);
+    assert_eq!(user.call_export_i32("recv_short").unwrap(), 3);
+    assert_eq!(&user.read_memory(128, 3).unwrap(), b"fir");
+    assert_eq!(user.call_export_i32("recv_next").unwrap(), 6);
+    assert_eq!(&user.read_memory(144, 6).unwrap(), b"second");
+}
+
+#[test]
 fn user_process_af_unix_path_stream_round_trips_through_kernel() {
     let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
