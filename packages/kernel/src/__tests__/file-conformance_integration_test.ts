@@ -7,17 +7,16 @@
  */
 import { afterEach, describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
-import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { Sandbox } from "../sandbox.js";
 import { NodeAdapter } from "../platform/node-adapter.js";
+import { hasFileConformanceFixtures } from "./file-conformance-fixtures.ts";
 
 const WASM_DIR = resolve(
   import.meta.dirname!,
   "../platform/__tests__/fixtures",
 );
-const HAS_FILE_FIXTURE = existsSync(resolve(WASM_DIR, "file.wasm")) &&
-  existsSync(resolve(WASM_DIR, "magic.mgc"));
+const HAS_FILE_FIXTURE = hasFileConformanceFixtures(WASM_DIR);
 const fileIt = HAS_FILE_FIXTURE ? it : it.skip;
 
 describe(
