@@ -2884,11 +2884,14 @@ fn sys_socket_sendto(caller_pid: u32, request: &[u8]) -> i64 {
     let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
     let addr_len = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) as usize;
-    if flags != 0 || request.len() < 12 + addr_len {
+    let Some(data_start) = 12usize.checked_add(addr_len) else {
+        return -(abi::EINVAL as i64);
+    };
+    if flags != 0 || request.len() < data_start {
         return -(abi::EINVAL as i64);
     }
-    let addr = &request[12..12 + addr_len];
-    let data = &request[12 + addr_len..];
+    let addr = &request[12..data_start];
+    let data = &request[data_start..];
     with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
         Ok(id) => socket_sendto_id(k, id, addr, data),
         Err(rc) => rc,
@@ -5559,6 +5562,19 @@ mod tests {
         let mut response = [0u8; 16];
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_RECVFROM, 1, &request, &mut response),
+            -(abi::EINVAL as i64)
+        );
+    }
+
+    #[test]
+    fn socket_sendto_rejects_wrapping_addr_len() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut request = Vec::new();
+        request.extend_from_slice(&3_u32.to_le_bytes());
+        request.extend_from_slice(&0_u32.to_le_bytes());
+        request.extend_from_slice(&0xffff_fff8_u32.to_le_bytes());
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_SENDTO, 1, &request, &mut []),
             -(abi::EINVAL as i64)
         );
     }
