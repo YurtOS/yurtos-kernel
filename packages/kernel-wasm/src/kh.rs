@@ -90,6 +90,9 @@ extern "C" {
     fn kh_process_mem_read(handle: i32, addr: u32, dst_ptr: *mut u8, len: usize) -> i64;
     fn kh_process_mem_write(handle: i32, addr: u32, src_ptr: *const u8, len: usize) -> i64;
     fn kh_process_resume(handle: i32, result: i64, budget_ns: u64) -> i64;
+    fn kh_thread_spawn(pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32;
+    fn kh_thread_release(host_thread_handle: i32) -> i32;
+    fn kh_thread_cancel(host_thread_handle: i32) -> i32;
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -368,6 +371,42 @@ unsafe fn kh_process_resume(_handle: i32, _result: i64, _budget_ns: u64) -> i64 
     -38
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_thread_spawn(_pid: u32, _tid: u32, _fn_ptr: u32, _arg: u32) -> i32 {
+    #[cfg(test)]
+    {
+        test_support::thread_spawn(_pid, _tid, _fn_ptr, _arg)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_thread_release(_host_thread_handle: i32) -> i32 {
+    #[cfg(test)]
+    {
+        test_support::thread_release(_host_thread_handle)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_thread_cancel(_host_thread_handle: i32) -> i32 {
+    #[cfg(test)]
+    {
+        test_support::thread_cancel(_host_thread_handle)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
+}
+
 /// Wall-clock time in nanoseconds since the Unix epoch.
 pub fn now_realtime_ns() -> Result<u64, i32> {
     let mut out: u64 = 0;
@@ -538,6 +577,61 @@ pub mod test_support {
 
     static SOCKET_MOCK: LazyLock<Mutex<SocketMock>> =
         LazyLock::new(|| Mutex::new(SocketMock::default()));
+
+    #[derive(Default)]
+    struct ThreadMock {
+        spawn_results: VecDeque<i32>,
+        spawn_calls: Vec<(u32, u32, u32, u32)>,
+        release_calls: Vec<i32>,
+        cancel_calls: Vec<i32>,
+    }
+
+    static THREAD_MOCK: LazyLock<Mutex<ThreadMock>> =
+        LazyLock::new(|| Mutex::new(ThreadMock::default()));
+
+    pub fn reset_thread_mock() {
+        *THREAD_MOCK.lock().unwrap() = ThreadMock::default();
+    }
+
+    pub fn push_thread_spawn_result(handle: i32) {
+        THREAD_MOCK.lock().unwrap().spawn_results.push_back(handle);
+    }
+
+    pub fn thread_spawn_calls() -> Vec<(u32, u32, u32, u32)> {
+        THREAD_MOCK.lock().unwrap().spawn_calls.clone()
+    }
+
+    pub fn thread_release_calls() -> Vec<i32> {
+        THREAD_MOCK.lock().unwrap().release_calls.clone()
+    }
+
+    pub fn thread_cancel_calls() -> Vec<i32> {
+        THREAD_MOCK.lock().unwrap().cancel_calls.clone()
+    }
+
+    pub(super) fn thread_spawn(pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32 {
+        let mut mock = THREAD_MOCK.lock().unwrap();
+        mock.spawn_calls.push((pid, tid, fn_ptr, arg));
+        mock.spawn_results.pop_front().unwrap_or(-38)
+    }
+
+    pub(super) fn thread_release(host_thread_handle: i32) -> i32 {
+        THREAD_MOCK
+            .lock()
+            .unwrap()
+            .release_calls
+            .push(host_thread_handle);
+        0
+    }
+
+    pub(super) fn thread_cancel(host_thread_handle: i32) -> i32 {
+        THREAD_MOCK
+            .lock()
+            .unwrap()
+            .cancel_calls
+            .push(host_thread_handle);
+        0
+    }
 
     pub fn reset_socket_mock() {
         *SOCKET_MOCK.lock().unwrap() = SocketMock::default();
@@ -762,6 +856,21 @@ pub fn process_resume(handle: i32, result: i64, budget_ns: u64) -> i64 {
     unsafe { kh_process_resume(handle, result, budget_ns) }
 }
 
+#[allow(dead_code)] // Consumed by Rust thread syscall dispatch in the next parity task.
+pub fn thread_spawn(pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32 {
+    unsafe { kh_thread_spawn(pid, tid, fn_ptr, arg) }
+}
+
+#[allow(dead_code)] // Consumed by Rust thread syscall dispatch in the next parity task.
+pub fn thread_release(host_thread_handle: i32) -> i32 {
+    unsafe { kh_thread_release(host_thread_handle) }
+}
+
+#[allow(dead_code)] // Consumed by Rust thread syscall dispatch in the next parity task.
+pub fn thread_cancel(host_thread_handle: i32) -> i32 {
+    unsafe { kh_thread_cancel(host_thread_handle) }
+}
+
 /// Forward an HTTP fetch request to the host. The request bytes are a
 /// `fetch_record_v1` binary record; the host writes a `fetch_response_v1`
 /// binary record into `response`. Returns bytes-written on success or a
@@ -810,5 +919,27 @@ mod tests {
         assert_eq!(process_mem_read(7, 1024, &mut dst), -(abi::ENOSYS as i64));
         assert_eq!(process_mem_write(7, 1024, b"data"), -(abi::ENOSYS as i64));
         assert_eq!(process_resume(7, 0, 1_000_000), -(abi::ENOSYS as i64));
+    }
+
+    #[test]
+    fn kh_thread_spawn_returns_host_handle() {
+        test_support::reset_thread_mock();
+        test_support::push_thread_spawn_result(77);
+
+        assert_eq!(thread_spawn(9, 2, 0x1234, 0x5678), 77);
+        assert_eq!(
+            test_support::thread_spawn_calls(),
+            vec![(9, 2, 0x1234, 0x5678)]
+        );
+    }
+
+    #[test]
+    fn kh_thread_release_and_cancel_record_handles() {
+        test_support::reset_thread_mock();
+
+        assert_eq!(thread_release(77), 0);
+        assert_eq!(thread_cancel(88), 0);
+        assert_eq!(test_support::thread_release_calls(), vec![77]);
+        assert_eq!(test_support::thread_cancel_calls(), vec![88]);
     }
 }
