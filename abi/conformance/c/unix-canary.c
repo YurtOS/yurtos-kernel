@@ -1111,6 +1111,67 @@ static int case_stream_socknames_path(void) {
   return 0;
 }
 
+static int case_stream_socknames_abstract(void) {
+  const char *name = "yurt-socknames-abstract";
+  size_t name_len = strlen(name);
+  struct sockaddr_un addr;
+  struct sockaddr_un got;
+  socklen_t got_len;
+  int server_fd, client_fd, accepted_fd;
+
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path + 1, name, sizeof(addr.sun_path) - 2);
+  socklen_t addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
+
+  server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (server_fd < 0) { emit("stream_socknames_abstract", 1, NULL, 1, errno); return 1; }
+  if (bind(server_fd, (struct sockaddr *)&addr, addrlen) != 0 ||
+      listen(server_fd, 1) != 0) {
+    emit("stream_socknames_abstract", 1, "bind-listen-fail", 1, errno);
+    close(server_fd); return 1;
+  }
+
+  client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (client_fd < 0) {
+    emit("stream_socknames_abstract", 1, NULL, 1, errno);
+    close(server_fd); return 1;
+  }
+  if (connect(client_fd, (struct sockaddr *)&addr, addrlen) != 0) {
+    emit("stream_socknames_abstract", 1, "connect-fail", 1, errno);
+    close(client_fd); close(server_fd); return 1;
+  }
+  accepted_fd = accept(server_fd, NULL, NULL);
+  if (accepted_fd < 0) {
+    emit("stream_socknames_abstract", 1, "accept-fail", 1, errno);
+    close(client_fd); close(server_fd); return 1;
+  }
+
+  memset(&got, 0, sizeof(got));
+  got_len = sizeof(got);
+  if (getpeername(client_fd, (struct sockaddr *)&got, &got_len) != 0 ||
+      got.sun_family != AF_UNIX ||
+      got.sun_path[0] != '\0' ||
+      memcmp(got.sun_path + 1, name, name_len) != 0) {
+    emit("stream_socknames_abstract", 1, "client-peername-fail", 1, errno);
+    close(accepted_fd); close(client_fd); close(server_fd); return 1;
+  }
+
+  memset(&got, 0, sizeof(got));
+  got_len = sizeof(got);
+  if (getsockname(accepted_fd, (struct sockaddr *)&got, &got_len) != 0 ||
+      got.sun_family != AF_UNIX ||
+      got.sun_path[0] != '\0' ||
+      memcmp(got.sun_path + 1, name, name_len) != 0) {
+    emit("stream_socknames_abstract", 1, "accepted-sockname-fail", 1, errno);
+    close(accepted_fd); close(client_fd); close(server_fd); return 1;
+  }
+
+  close(accepted_fd); close(client_fd); close(server_fd);
+  emit("stream_socknames_abstract", 0, "abstract-socknames=ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "pair_basic") == 0)                 return case_pair_basic();
   if (strcmp(name, "bind_listen_accept") == 0)         return case_bind_listen_accept();
@@ -1135,6 +1196,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "abstract_bind_policy_denied") == 0)    return case_abstract_bind_policy_denied();
   if (strcmp(name, "stat_after_listener_close") == 0)      return case_stat_after_listener_close();
   if (strcmp(name, "stream_socknames_path") == 0)          return case_stream_socknames_path();
+  if (strcmp(name, "stream_socknames_abstract") == 0)      return case_stream_socknames_abstract();
   fprintf(stderr, "unix-canary: unknown case %s\n", name);
   return 2;
 }
@@ -1162,6 +1224,7 @@ static int list_cases(void) {
   puts("abstract_bind_policy_denied");
   puts("stat_after_listener_close");
   puts("stream_socknames_path");
+  puts("stream_socknames_abstract");
   return 0;
 }
 

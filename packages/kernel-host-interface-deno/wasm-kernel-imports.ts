@@ -603,10 +603,9 @@ export const HOST_BINDINGS: HostBinding[] = [
     returnsBytes: true,
   },
   // host_socket_addr_unix(fd, isPeer, pathPtr, pathCap, isAbstractPtr).
-  // Pathname metadata for connected AF_UNIX sockets is a follow-up. Keep
-  // this import present so wasm-mode never falls back into the TS kernel
-  // with a Rust fd; returning -1 lets libc fall through to host_socket_addr
-  // for non-AF_UNIX sockets.
+  // SYS_SOCKET_ADDR returns raw AF_UNIX address bytes. Abstract addresses
+  // carry the kernel's leading NUL marker; this wrapper strips it and sets
+  // *isAbstractPtr for the C ABI.
   {
     name: "host_socket_addr_unix",
     method: METHOD.SYS_SOCKET_ADDR,
@@ -633,16 +632,24 @@ export const HOST_BINDINGS: HostBinding[] = [
       if (rc === -EAFNOSUPPORT) return HOST_UNIX_NOT_AF_UNIX;
       if (rc === -ENOTCONN) return HOST_ASYNC_EAGAIN;
       if (rc < 0) return rc;
-      if (rc > 0) {
-        const outRc = copyOut(memBuf, pathPtr, out.response.subarray(0, rc));
+      const isAbstract = rc > 0 && out.response[0] === 0;
+      const pathStart = isAbstract ? 1 : 0;
+      const pathLen = Math.max(0, rc - pathStart);
+      if (pathLen > 0) {
+        const outRc = copyOut(
+          memBuf,
+          pathPtr,
+          out.response.subarray(pathStart, pathStart + pathLen),
+        );
         if (outRc < 0) return outRc;
       }
       if (isAbstractPtr) {
-        const zero = new Uint8Array(4);
-        const outRc = copyOut(memBuf, isAbstractPtr, zero);
+        const flag = new Uint8Array(4);
+        new DataView(flag.buffer).setInt32(0, isAbstract ? 1 : 0, true);
+        const outRc = copyOut(memBuf, isAbstractPtr, flag);
         if (outRc < 0) return outRc;
       }
-      return rc;
+      return pathLen;
     },
   },
   // host_socket_send(fd, dataPtr, dataLen, flags) → bytes.

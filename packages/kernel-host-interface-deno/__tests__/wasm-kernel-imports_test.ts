@@ -620,6 +620,32 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       .toEqual("/tmp/yurt-name.sock");
     expect(new DataView(unixAddrBuf).getInt32(64, true)).toEqual(0);
 
+    const abstractName = new Uint8Array([
+      0,
+      ...new TextEncoder().encode("yurt-abstract"),
+    ]);
+    const { mk: abstractAddrMk } = capturingMk(
+      abstractName.byteLength,
+      abstractName,
+    );
+    const abstractAddrBuf = new ArrayBuffer(128);
+    const abstractAddrImports = buildWasmKernelImports(
+      abstractAddrMk,
+      () => abstractAddrBuf,
+    );
+    const abstractAddrRc = await abstractAddrImports.host_socket_addr_unix(
+      9,
+      1,
+      80,
+      32,
+      64,
+    );
+    expect(abstractAddrRc).toEqual("yurt-abstract".length);
+    expect(new TextDecoder().decode(
+      new Uint8Array(abstractAddrBuf, 80, "yurt-abstract".length),
+    )).toEqual("yurt-abstract");
+    expect(new DataView(abstractAddrBuf).getInt32(64, true)).toEqual(1);
+
     await imports.host_socket_close(9);
     expect(calls.at(-1)).toMatchObject({
       method: METHOD.SYS_SOCKET_CLOSE,
