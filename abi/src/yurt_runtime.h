@@ -141,7 +141,7 @@ __attribute__((import_module("yurt"), import_name("host_thread_spawn")))
 int yurt_host_thread_spawn(int fn_ptr, int arg);
 
 __attribute__((import_module("yurt"), import_name("host_thread_join")))
-int yurt_host_thread_join(int tid);
+int yurt_host_thread_join(int tid, uint32_t *out_retval);
 
 __attribute__((import_module("yurt"), import_name("host_thread_detach")))
 int yurt_host_thread_detach(int tid);
