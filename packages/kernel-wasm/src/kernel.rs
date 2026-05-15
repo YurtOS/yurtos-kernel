@@ -875,10 +875,12 @@ impl Kernel {
             SocketKind::UnixDatagram {
                 peer_id: id_slot,
                 peer_path,
+                peer_open,
                 ..
             } => {
                 *id_slot = Some(peer_id);
                 *peer_path = Some(path.to_vec());
+                *peer_open = true;
                 Ok(())
             }
             _ => Err(crate::abi::EOPNOTSUPP),

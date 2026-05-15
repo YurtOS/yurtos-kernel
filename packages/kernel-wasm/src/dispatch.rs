@@ -5400,6 +5400,68 @@ mod tests {
     }
 
     #[test]
+    fn af_unix_datagram_reconnect_after_old_peer_close_restores_writability() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        let mut fds = [0u8; 8];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(3, 5, 0), &mut fds),
+            8
+        );
+        let left = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+        let right = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &right.to_le_bytes(), &mut []),
+            0
+        );
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            4
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(4, b"unix:/tmp/dgram-reconnect.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_CONNECT,
+                1,
+                &socket_connect_req(left, b"unix:/tmp/dgram-reconnect.sock"),
+                &mut []
+            ),
+            0
+        );
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SEND,
+                1,
+                &socket_send_req(left, b"ping"),
+                &mut []
+            ),
+            4
+        );
+        let mut response = [0u8; 16];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECV,
+                1,
+                &socket_recv_req(4, 0),
+                &mut response
+            ),
+            4
+        );
+        assert_eq!(&response[..4], b"ping");
+    }
+
+    #[test]
     fn af_unix_path_datagram_unlink_removes_route_but_close_keeps_inode() {
         let _g = crate::kernel::TestGuard::acquire();
 

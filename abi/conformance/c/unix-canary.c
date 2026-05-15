@@ -520,6 +520,58 @@ static int case_getpeername_unconnected(void) {
   return 1;
 }
 
+static int case_dgram_reconnect_after_close(void) {
+  const char *server_path = "/tmp/yurt-dgram-reconnect.sock";
+  int sv[2];
+  int server_fd;
+  struct sockaddr_un server_addr;
+  char buf[16];
+
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) {
+    emit("dgram_reconnect_after_close", 1, "socketpair-fail", 1, errno);
+    return 1;
+  }
+  close(sv[1]);
+
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sun_family = AF_UNIX;
+  strncpy(server_addr.sun_path, server_path, sizeof(server_addr.sun_path) - 1);
+  socklen_t addrlen = (socklen_t)sizeof(server_addr);
+
+  server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (server_fd < 0) {
+    emit("dgram_reconnect_after_close", 1, "socket-fail", 1, errno);
+    close(sv[0]);
+    return 1;
+  }
+
+  unlink(server_path);
+  if (bind(server_fd, (struct sockaddr *)&server_addr, addrlen) != 0) {
+    emit("dgram_reconnect_after_close", 1, "bind-fail", 1, errno);
+    close(sv[0]); close(server_fd);
+    return 1;
+  }
+  if (connect(sv[0], (struct sockaddr *)&server_addr, addrlen) != 0) {
+    emit("dgram_reconnect_after_close", 1, "connect-fail", 1, errno);
+    close(sv[0]); close(server_fd); unlink(server_path);
+    return 1;
+  }
+  if (send(sv[0], "ping", 4, 0) != 4) {
+    emit("dgram_reconnect_after_close", 1, "send-fail", 1, errno);
+    close(sv[0]); close(server_fd); unlink(server_path);
+    return 1;
+  }
+  ssize_t n = recv(server_fd, buf, sizeof(buf), 0);
+  close(sv[0]); close(server_fd); unlink(server_path);
+
+  if (n == 4 && memcmp(buf, "ping", 4) == 0) {
+    emit("dgram_reconnect_after_close", 0, "reconnect=ok", 0, 0);
+    return 0;
+  }
+  emit("dgram_reconnect_after_close", 1, "recv-fail", 1, errno);
+  return 1;
+}
+
 static int case_scm_rights_pipe_handoff(void) {
   int sv[2];
   int pipefd[2];
@@ -1281,6 +1333,8 @@ static int run_case(const char *name) {
   if (strcmp(name, "dgram_path_sendto") == 0)          return case_dgram_path_sendto();
   if (strcmp(name, "dgram_connect_send") == 0)         return case_dgram_connect_send();
   if (strcmp(name, "getpeername_unconnected") == 0)    return case_getpeername_unconnected();
+  if (strcmp(name, "dgram_reconnect_after_close") == 0)
+    return case_dgram_reconnect_after_close();
   if (strcmp(name, "scm_rights_pipe_handoff") == 0)    return case_scm_rights_pipe_handoff();
   if (strcmp(name, "peercred_after_accept") == 0)      return case_peercred_after_accept();
   if (strcmp(name, "dgram_sendto_after_unlink") == 0)  return case_dgram_sendto_after_unlink();
@@ -1312,6 +1366,7 @@ static int list_cases(void) {
   puts("dgram_path_sendto");
   puts("dgram_connect_send");
   puts("getpeername_unconnected");
+  puts("dgram_reconnect_after_close");
   puts("scm_rights_pipe_handoff");
   puts("peercred_after_accept");
   puts("dgram_sendto_after_unlink");
