@@ -375,7 +375,9 @@ static int case_dgram_pair_message_framing(void) {
 
 static int case_dgram_path_sendto(void) {
   const char *server_path = "/tmp/yurt-dgram-test.sock";
+  const char *client_path = "/tmp/yurt-dgram-client.sock";
   struct sockaddr_un server_addr;
+  struct sockaddr_un client_addr;
   socklen_t addrlen;
   int server_fd, client_fd;
   char buf[32];
@@ -387,6 +389,9 @@ static int case_dgram_path_sendto(void) {
   server_addr.sun_family = AF_UNIX;
   strncpy(server_addr.sun_path, server_path, sizeof(server_addr.sun_path) - 1);
   addrlen = (socklen_t)sizeof(server_addr);
+  memset(&client_addr, 0, sizeof(client_addr));
+  client_addr.sun_family = AF_UNIX;
+  strncpy(client_addr.sun_path, client_path, sizeof(client_addr.sun_path) - 1);
 
   server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
   if (server_fd < 0) { emit("dgram_path_sendto", 1, NULL, 1, errno); return 1; }
@@ -394,9 +399,16 @@ static int case_dgram_path_sendto(void) {
   if (client_fd < 0) { emit("dgram_path_sendto", 1, NULL, 1, errno); close(server_fd); return 1; }
 
   unlink(server_path);
+  unlink(client_path);
   if (bind(server_fd, (struct sockaddr *)&server_addr, addrlen) != 0) {
     emit("dgram_path_sendto", 1, "bind-fail", 1, errno);
     close(server_fd); close(client_fd);
+    return 1;
+  }
+  if (bind(client_fd, (struct sockaddr *)&client_addr, (socklen_t)sizeof(client_addr)) != 0) {
+    emit("dgram_path_sendto", 1, "client-bind-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    unlink(server_path); unlink(client_path);
     return 1;
   }
 
@@ -404,21 +416,24 @@ static int case_dgram_path_sendto(void) {
   if (n != 4) {
     emit("dgram_path_sendto", 1, "sendto-fail", 1, errno);
     close(server_fd); close(client_fd);
-    unlink(server_path);
+    unlink(server_path); unlink(client_path);
     return 1;
   }
 
   n = recvfrom(server_fd, buf, sizeof(buf), 0, (struct sockaddr *)&src_addr, &src_len);
-  if (n != 4 || memcmp(buf, "ping", 4) != 0) {
+  if (n != 4 || memcmp(buf, "ping", 4) != 0 ||
+      src_addr.sun_family != AF_UNIX ||
+      strcmp(src_addr.sun_path, client_path) != 0) {
     emit("dgram_path_sendto", 1, "recvfrom-fail", 1, errno);
     close(server_fd); close(client_fd);
-    unlink(server_path);
+    unlink(server_path); unlink(client_path);
     return 1;
   }
 
   close(server_fd);
   close(client_fd);
   unlink(server_path);
+  unlink(client_path);
   emit("dgram_path_sendto", 0, "dgram-path=ok", 0, 0);
   return 0;
 }

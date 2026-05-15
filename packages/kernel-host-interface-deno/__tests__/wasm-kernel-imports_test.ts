@@ -669,6 +669,49 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(new DataView(infoBuf).getInt32(84, true)).toEqual(1000);
     expect(new DataView(infoBuf).getInt32(88, true)).toEqual(1000);
 
+    const recvFromResponse = new Uint8Array(64);
+    recvFromResponse.set(new TextEncoder().encode("pong"), 0);
+    const recvFromPath = new TextEncoder().encode("/tmp/sender.sock");
+    const recvFromView = new DataView(recvFromResponse.buffer);
+    recvFromView.setUint32(16, recvFromPath.byteLength, true);
+    recvFromView.setUint32(20, 0, true);
+    recvFromResponse.set(recvFromPath, 24);
+    const { mk: recvFromMk, calls: recvFromCalls } = capturingMk(
+      4,
+      recvFromResponse,
+    );
+    const recvFromBuf = new ArrayBuffer(256);
+    const recvFromMem = new Uint8Array(recvFromBuf);
+    recvFromMem.set(new TextEncoder().encode("unused"), 120);
+    const recvFromImports = buildWasmKernelImports(
+      recvFromMk,
+      () => recvFromBuf,
+    );
+    expect(
+      await recvFromImports.host_socket_recvfrom_unix(
+        9,
+        80,
+        16,
+        120,
+        64,
+        188,
+        192,
+      ),
+    ).toEqual(4);
+    expect(new TextDecoder().decode(new Uint8Array(recvFromBuf, 80, 4)))
+      .toEqual("pong");
+    expect(new TextDecoder().decode(
+      new Uint8Array(recvFromBuf, 120, recvFromPath.byteLength),
+    )).toEqual("/tmp/sender.sock");
+    expect(new DataView(recvFromBuf).getInt32(188, true)).toEqual(
+      recvFromPath.byteLength,
+    );
+    expect(new DataView(recvFromBuf).getInt32(192, true)).toEqual(0);
+    expect(recvFromCalls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_RECVFROM,
+      responseCap: 16 + 8 + 64,
+    });
+
     await imports.host_socket_close(9);
     expect(calls.at(-1)).toMatchObject({
       method: METHOD.SYS_SOCKET_CLOSE,

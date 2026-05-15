@@ -706,31 +706,33 @@ export const HOST_BINDINGS: HostBinding[] = [
       return Number(out.rc);
     },
   },
-  // host_socket_recvfrom_unix currently maps to the Rust recv path and
-  // reports an empty source address. This keeps fd state in the Rust kernel.
+  // host_socket_recvfrom_unix(fd, outPtr, outCap, fromPathPtr, fromPathCap,
+  // fromPathLenPtr, fromIsAbstractPtr).
   {
     name: "host_socket_recvfrom_unix",
-    method: METHOD.SYS_SOCKET_RECV,
+    method: METHOD.SYS_SOCKET_RECVFROM,
     args: [],
     custom: (mk, memBuf, callerPid) =>
     async (
       fd: number,
       outPtr: number,
       outCap: number,
-      _fromPathPtr: number,
-      _fromPathCap: number,
+      fromPathPtr: number,
+      fromPathCap: number,
       fromPathLenPtr: number,
       fromIsAbstractPtr: number,
     ): Promise<number> => {
-      const req = new Uint8Array(8);
+      const req = new Uint8Array(16);
       const view = new DataView(req.buffer);
       view.setUint32(0, fd >>> 0, true);
       view.setUint32(4, 0, true);
+      view.setUint32(8, outCap >>> 0, true);
+      view.setUint32(12, fromPathCap >>> 0, true);
       const out = await mk.kernelSyscallAsync(
-        METHOD.SYS_SOCKET_RECV,
+        METHOD.SYS_SOCKET_RECVFROM,
         callerPid,
         req,
-        outCap >>> 0,
+        (outCap + 8 + fromPathCap) >>> 0,
       );
       const rc = Number(out.rc);
       if (rc === -EAGAIN) return HOST_ASYNC_EAGAIN;
@@ -739,13 +741,42 @@ export const HOST_BINDINGS: HostBinding[] = [
         const outRc = copyOut(memBuf, outPtr, out.response.subarray(0, rc));
         if (outRc < 0) return outRc;
       }
-      const zero = new Uint8Array(4);
+      const metaOffset = outCap >>> 0;
+      const pathOffset = metaOffset + 8;
+      const responseView = new DataView(
+        out.response.buffer,
+        out.response.byteOffset,
+        out.response.byteLength,
+      );
+      const pathLen = out.response.byteLength >= pathOffset
+        ? responseView.getUint32(metaOffset, true)
+        : 0;
+      const isAbstract = out.response.byteLength >= pathOffset
+        ? responseView.getUint32(metaOffset + 4, true)
+        : 0;
+      const pathCopyLen = Math.min(
+        pathLen,
+        fromPathCap >>> 0,
+        Math.max(0, out.response.byteLength - pathOffset),
+      );
+      if (pathCopyLen > 0) {
+        const outRc = copyOut(
+          memBuf,
+          fromPathPtr,
+          out.response.subarray(pathOffset, pathOffset + pathCopyLen),
+        );
+        if (outRc < 0) return outRc;
+      }
+      const record = new Uint8Array(4);
+      const recordView = new DataView(record.buffer);
       if (fromPathLenPtr) {
-        const outRc = copyOut(memBuf, fromPathLenPtr, zero);
+        recordView.setUint32(0, pathLen, true);
+        const outRc = copyOut(memBuf, fromPathLenPtr, record);
         if (outRc < 0) return outRc;
       }
       if (fromIsAbstractPtr) {
-        const outRc = copyOut(memBuf, fromIsAbstractPtr, zero);
+        recordView.setUint32(0, isAbstract, true);
+        const outRc = copyOut(memBuf, fromIsAbstractPtr, record);
         if (outRc < 0) return outRc;
       }
       return rc;

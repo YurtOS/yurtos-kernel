@@ -13,7 +13,9 @@
 //!   0x1_0000+  — `host_*` syscalls from `yurt_abi.toml`
 
 use crate::abi;
-use crate::kernel::{with_kernel, FdEntry, Kernel, PipeEnd, SocketEntry, SocketKind};
+use crate::kernel::{
+    with_kernel, FdEntry, Kernel, PipeEnd, SocketEntry, SocketKind, UnixDatagramPacket,
+};
 use crate::kh;
 
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
@@ -31,8 +33,8 @@ fn has_buffer_capacity(current: usize, additional: usize) -> bool {
         && current <= crate::kernel::KERNEL_BUFFER_CAP - additional
 }
 
-fn datagram_queue_bytes(rx: &std::collections::VecDeque<Vec<u8>>) -> usize {
-    rx.iter().map(Vec::len).sum()
+fn datagram_queue_bytes(rx: &std::collections::VecDeque<UnixDatagramPacket>) -> usize {
+    rx.iter().map(|packet| packet.data.len()).sum()
 }
 
 fn rights_queue_full(rights: &Option<Vec<FdEntry>>, queue_len: usize) -> bool {
@@ -135,6 +137,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SOCKET_ACCEPT => sys_socket_accept(caller_pid, request),
         METHOD_SYS_SOCKET_ADDR => sys_socket_addr(caller_pid, request, response),
         METHOD_SYS_SOCKET_INFO => sys_socket_info(caller_pid, request, response),
+        METHOD_SYS_SOCKET_RECVFROM => sys_socket_recvfrom(caller_pid, request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -780,6 +783,10 @@ fn socket_send_id(k: &mut Kernel, id: u64, data: &[u8]) -> i64 {
             if !peer_open {
                 return -(abi::EPIPE as i64);
             }
+            let sender_path = k.socket(id).and_then(|socket| match &socket.kind {
+                SocketKind::UnixDatagram { bound_path, .. } => bound_path.clone(),
+                _ => None,
+            });
             let Some(peer) = k.socket_mut(peer_id) else {
                 return -(abi::EPIPE as i64);
             };
@@ -789,7 +796,10 @@ fn socket_send_id(k: &mut Kernel, id: u64, data: &[u8]) -> i64 {
             if !has_buffer_capacity(datagram_queue_bytes(rx), data.len()) {
                 return -(abi::EAGAIN as i64);
             }
-            rx.push_back(data.to_vec());
+            rx.push_back(UnixDatagramPacket {
+                data: data.to_vec(),
+                source_path: sender_path,
+            });
             data.len() as i64
         }
     }
@@ -812,6 +822,10 @@ fn socket_sendto_id(k: &mut Kernel, id: u64, addr: &[u8], data: &[u8]) -> i64 {
     let Some(target_id) = k.unix_datagram_id_for_path(path) else {
         return -(abi::ECONNREFUSED as i64);
     };
+    let sender_path = k.socket(id).and_then(|socket| match &socket.kind {
+        SocketKind::UnixDatagram { bound_path, .. } => bound_path.clone(),
+        _ => None,
+    });
     let Some(target) = k.socket_mut(target_id) else {
         return -(abi::ECONNREFUSED as i64);
     };
@@ -821,7 +835,10 @@ fn socket_sendto_id(k: &mut Kernel, id: u64, addr: &[u8], data: &[u8]) -> i64 {
     if !has_buffer_capacity(datagram_queue_bytes(rx), data.len()) {
         return -(abi::EAGAIN as i64);
     }
-    rx.push_back(data.to_vec());
+    rx.push_back(UnixDatagramPacket {
+        data: data.to_vec(),
+        source_path: sender_path,
+    });
     data.len() as i64
 }
 
@@ -915,7 +932,11 @@ fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>)
                 {
                     -(abi::EAGAIN as i64)
                 } else {
-                    rx.push_back(data.to_vec());
+                    let source_path = None;
+                    rx.push_back(UnixDatagramPacket {
+                        data: data.to_vec(),
+                        source_path,
+                    });
                     if !rights.as_ref().is_some_and(Vec::is_empty) {
                         q.push_back(rights.take().expect("rights present"));
                     }
@@ -953,8 +974,8 @@ fn socket_recv_id(k: &mut Kernel, id: u64, response: &mut [u8], flags: u32) -> i
             let Some(packet) = rx.front() else {
                 return if *peer_open { -(abi::EAGAIN as i64) } else { 0 };
             };
-            let take = packet.len().min(response.len());
-            response[..take].copy_from_slice(&packet[..take]);
+            let take = packet.data.len().min(response.len());
+            response[..take].copy_from_slice(&packet.data[..take]);
             if flags != MSG_PEEK {
                 rx.pop_front();
             }
@@ -2657,6 +2678,58 @@ fn sys_socket_recv(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
     })
 }
 
+fn sys_socket_recvfrom(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 16 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let data_cap = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) as usize;
+    let path_cap = u32::from_le_bytes(request[12..16].try_into().expect("4 bytes")) as usize;
+    let meta_offset = data_cap;
+    let path_offset = meta_offset + 8;
+    if response.len() < path_offset {
+        return -(abi::EINVAL as i64);
+    }
+    let path_fit = response.len().saturating_sub(path_offset).min(path_cap);
+    with_kernel(|k| {
+        let id = match socket_id_for_fd(k, caller_pid, fd) {
+            Ok(id) => id,
+            Err(rc) => return rc,
+        };
+        let Some(socket) = k.socket_mut(id) else {
+            return -(abi::EBADF as i64);
+        };
+        let SocketKind::UnixDatagram { rx, peer_open, .. } = &mut socket.kind else {
+            return -(abi::EOPNOTSUPP as i64);
+        };
+        if flags != 0 && flags != MSG_PEEK {
+            return -(abi::EOPNOTSUPP as i64);
+        }
+        let Some(packet) = rx.front() else {
+            return if *peer_open { -(abi::EAGAIN as i64) } else { 0 };
+        };
+        let take = packet.data.len().min(data_cap);
+        response[..take].copy_from_slice(&packet.data[..take]);
+        let (path, is_abstract) = packet
+            .source_path
+            .as_deref()
+            .map(|path| match path.strip_prefix(&[0]) {
+                Some(name) => (name, 1_u32),
+                None => (path, 0_u32),
+            })
+            .unwrap_or((&[][..], 0_u32));
+        response[meta_offset..meta_offset + 4].copy_from_slice(&(path.len() as u32).to_le_bytes());
+        response[meta_offset + 4..meta_offset + 8].copy_from_slice(&is_abstract.to_le_bytes());
+        let copy_len = path.len().min(path_fit);
+        response[path_offset..path_offset + copy_len].copy_from_slice(&path[..copy_len]);
+        if flags != MSG_PEEK {
+            rx.pop_front();
+        }
+        take as i64
+    })
+}
+
 fn sys_socket_open(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 8 {
         return -(abi::EINVAL as i64);
@@ -3342,6 +3415,15 @@ mod tests {
 
     fn socket_recv_req(fd: u32, flags: u32) -> [u8; 8] {
         socket_accept_req(fd, flags)
+    }
+
+    fn socket_recvfrom_req(fd: u32, flags: u32, data_cap: u32, path_cap: u32) -> [u8; 16] {
+        let mut req = [0u8; 16];
+        req[0..4].copy_from_slice(&fd.to_le_bytes());
+        req[4..8].copy_from_slice(&flags.to_le_bytes());
+        req[8..12].copy_from_slice(&data_cap.to_le_bytes());
+        req[12..16].copy_from_slice(&path_cap.to_le_bytes());
+        req
     }
 
     fn socket_send_req(fd: u32, data: &[u8]) -> Vec<u8> {
@@ -5118,6 +5200,65 @@ mod tests {
             crate::kh::test_support::socket_send_calls(),
             Vec::<(i32, Vec<u8>)>::new()
         );
+    }
+
+    #[test]
+    fn af_unix_datagram_recvfrom_reports_sender_path() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            3
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            4
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(3, b"unix:/tmp/dgram-recv.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(4, b"unix:/tmp/dgram-sender.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SENDTO,
+                1,
+                &socket_sendto_req(4, 0, b"unix:/tmp/dgram-recv.sock", b"ping"),
+                &mut []
+            ),
+            4
+        );
+
+        let mut response = [0u8; 4 + 8 + 108];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECVFROM,
+                1,
+                &socket_recvfrom_req(3, 0, 4, 108),
+                &mut response
+            ),
+            4
+        );
+        assert_eq!(&response[..4], b"ping");
+        let path_len = u32::from_le_bytes(response[4..8].try_into().unwrap()) as usize;
+        let is_abstract = u32::from_le_bytes(response[8..12].try_into().unwrap());
+        assert_eq!(path_len, b"/tmp/dgram-sender.sock".len());
+        assert_eq!(is_abstract, 0);
+        assert_eq!(&response[12..12 + path_len], b"/tmp/dgram-sender.sock");
     }
 
     #[test]

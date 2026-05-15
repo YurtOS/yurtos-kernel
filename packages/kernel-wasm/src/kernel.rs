@@ -423,10 +423,16 @@ pub enum SocketKind {
     UnixDatagram {
         peer_id: Option<u64>,
         bound_path: Option<Vec<u8>>,
-        rx: VecDeque<Vec<u8>>,
+        rx: VecDeque<UnixDatagramPacket>,
         rights: VecDeque<Vec<FdEntry>>,
         peer_open: bool,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnixDatagramPacket {
+    pub data: Vec<u8>,
+    pub source_path: Option<Vec<u8>>,
 }
 
 pub struct SocketEntry {
