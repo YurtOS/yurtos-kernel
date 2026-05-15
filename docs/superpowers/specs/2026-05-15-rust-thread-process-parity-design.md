@@ -82,6 +82,10 @@ Required additional behavior:
   Internally the Rust kernel may keep main as tid `1` for scheduler and
   mutex-owner bookkeeping, but that value is not exposed as main
   `pthread_self()`.
+- Tids are never reused during a process lifetime. `next_tid` overflow returns
+  `-EAGAIN` from `sys_thread_spawn`; it must not wrap to an earlier tid. Stale
+  worker messages are rejected because `(pid, tid, host_thread_handle)` no
+  longer matches a live Rust thread record.
 
 ## Caller Thread Identity
 
@@ -108,6 +112,15 @@ Implementation can add a `DispatchContext { caller_pid, caller_tid }`, a
 `dispatch_with_context(...)` entry point, or an equivalent trampoline-side
 context mechanism. The important invariant is that Rust thread lifecycle methods
 never infer the calling thread from guest-supplied bytes.
+
+Worker completion uses the same authentication rule. A completion report cannot
+be trusted because it contains `(pid, tid)` bytes or message fields. Before the
+adapter calls `kernel_record_thread_exit(pid, tid, retval)` or an equivalent
+Rust control path, it validates that the reporting worker/session owns the live
+`host_thread_handle` currently bound to that `(pid, tid)`. Rust then verifies
+the record is still live and that the supplied handle/session matches before
+transitioning the thread to `Exited`. Reports for unknown, already reaped, or
+mismatched threads return an error and do not mutate state.
 
 ## ABI Shape
 
@@ -140,6 +153,27 @@ same way `host_socket_set_no_delay` wraps `sys_socket_option`.
 Rust-backed wrapper calls `sys_thread_join`, reads the `u32 retval` response on
 success, and only then casts that value back to `void *` in the libc layer.
 
+## Join Suspend/Resume Protocol
+
+`sys_thread_join` must not spin inside kernel dispatch. When the target thread
+is still running:
+
+1. Rust validates the authenticated caller tid and the target tid, rejects
+   self-join, and records a `JoinWait { waiter_tid, target_tid }` wait record.
+2. Rust marks the caller thread `Blocked` with a join wait reason.
+3. Rust returns `-EAGAIN` with a kernel-visible wait record, or an equivalent
+   adapter-recognized suspended status, rather than blocking the dispatch call.
+4. The adapter parks the caller execution resource using the same suspend
+   mechanism used for other host-blocking operations.
+5. When worker completion records the target thread exit, Rust stores the
+   `u32 retval`, wakes matching join waiters, and marks them runnable.
+6. The adapter resumes each woken caller and retries or completes the pending
+   join by reading the structured join result.
+
+If the target is already exited when `sys_thread_join` runs, Rust writes the
+`u32 retval` response, releases the host handle, reaps the target record, and
+returns `0` without parking the caller.
+
 ## Kernel-to-Host Interface
 
 Add host imports for unsandboxable thread execution actions to
@@ -168,9 +202,12 @@ The ordering is: read the handle from `ThreadRecord`, call
 remove or tombstone the Rust record. The record must not be dropped first,
 because that can lose the only handle the adapter needs for cleanup.
 
-The host adapter reports normal completion by calling the existing
-`kernel_record_thread_exit(pid, tid, retval)` control export, or by a new
-syscall path if the implementation consolidates control exports behind dispatch.
+The host adapter reports normal completion by calling an authenticated
+thread-exit control path. This may wrap the existing
+`kernel_record_thread_exit(pid, tid, retval)` export, but the adapter must bind
+that call to the worker handle/session that Rust recorded for the thread. A new
+control export that accepts `host_thread_handle` explicitly is acceptable if it
+makes the authentication invariant simpler to enforce.
 
 ## Adapter Responsibilities
 
@@ -228,9 +265,11 @@ Required adapter tests:
 
 - Rust-backed `host_thread_spawn` calls `sys_thread_spawn` and does not allocate
   tid locally.
-- Worker completion records exit through Rust state.
+- Worker completion records exit through Rust state only when the reporting
+  worker/session matches the recorded `host_thread_handle`.
 - Worker-side nested `host_thread_spawn` routes through the same Rust path.
-- `host_thread_self` returns the Rust-owned tid for main and workers.
+- `host_thread_self` returns guest-visible `0` on the main thread and
+  Rust-allocated tids for worker threads.
 
 Required integration/conformance:
 
