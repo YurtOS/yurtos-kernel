@@ -797,8 +797,30 @@ fn replace_socket_fd(k: &mut Kernel, caller_pid: u32, fd: u32, old_id: u64, new_
     }
 }
 
+fn sockaddr_family(addr: &[u8]) -> Option<u16> {
+    Some(u16::from_le_bytes(addr.get(0..2)?.try_into().ok()?))
+}
+
 fn unix_path_from_addr(addr: &[u8]) -> Option<&[u8]> {
-    addr.strip_prefix(b"unix:").filter(|path| !path.is_empty())
+    if !matches!(sockaddr_family(addr), Some(1 | 3)) || addr.len() <= 2 {
+        return None;
+    }
+    let path = &addr[2..];
+    if path.first() == Some(&0) {
+        return (path.len() > 1).then_some(path);
+    }
+    let end = path.iter().position(|b| *b == 0).unwrap_or(path.len());
+    path.get(..end).filter(|path| !path.is_empty())
+}
+
+fn is_ipv4_sockaddr(addr: &[u8]) -> bool {
+    matches!(sockaddr_family(addr), Some(2)) && addr.len() >= 16
+}
+
+fn any_addr_ipv4_sockaddr() -> [u8; 16] {
+    let mut addr = [0u8; 16];
+    addr[0..2].copy_from_slice(&2u16.to_le_bytes());
+    addr
 }
 
 fn socket_send_id(k: &mut Kernel, id: u64, data: &[u8]) -> i64 {
@@ -2341,7 +2363,7 @@ fn sys_socket_listen(caller_pid: u32, request: &[u8]) -> i64 {
         }
         let addr = match addr {
             Some(addr) => addr,
-            None if matches!(domain, 2) => b"0.0.0.0:0".to_vec(),
+            None if matches!(domain, 2) => any_addr_ipv4_sockaddr().to_vec(),
             None => return -(abi::EINVAL as i64),
         };
         if let Some(path) = unix_path_from_addr(&addr) {
@@ -2565,7 +2587,7 @@ fn sys_socket_info(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
 }
 
 /// `sys_socket_connect(fd, addr_bytes) -> 0`. Request layout:
-/// u32 fd LE + addr bytes (UTF-8 "host:port" or "unix:...").
+/// u32 fd LE + POSIX sockaddr bytes.
 fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
@@ -2612,7 +2634,7 @@ fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
         if unix_path_from_addr(addr).is_some() {
             return -(abi::EAFNOSUPPORT as i64);
         }
-        if !matches!(domain, 2) {
+        if !matches!(domain, 2) || !is_ipv4_sockaddr(addr) {
             return -(abi::EAFNOSUPPORT as i64);
         }
         let handle = kh::socket_connect(addr, flags);
@@ -2783,7 +2805,9 @@ fn sys_socket_bind(caller_pid: u32, request: &[u8]) -> i64 {
             match k.socket_mut(id) {
                 Some(socket) => match &mut socket.kind {
                     SocketKind::Open { bound_addr, .. } => {
-                        if unix_path_from_addr(addr).is_none() && !matches!(socket.domain, 2) {
+                        if unix_path_from_addr(addr).is_none()
+                            && (!matches!(socket.domain, 2) || !is_ipv4_sockaddr(addr))
+                        {
                             return -(abi::EAFNOSUPPORT as i64);
                         }
                         *bound_addr = Some(addr.to_vec());
@@ -3472,6 +3496,28 @@ mod tests {
         out
     }
 
+    fn sockaddr_in(host: [u8; 4], port: u16) -> [u8; 16] {
+        let mut addr = [0u8; 16];
+        addr[0..2].copy_from_slice(&2u16.to_le_bytes());
+        addr[2..4].copy_from_slice(&port.to_be_bytes());
+        addr[4..8].copy_from_slice(&host);
+        addr
+    }
+
+    fn sockaddr_un(path: &[u8]) -> Vec<u8> {
+        let mut addr = 1u16.to_le_bytes().to_vec();
+        addr.extend_from_slice(path);
+        addr
+    }
+
+    fn socket_connect_unix_req(fd: u32, path: &[u8]) -> Vec<u8> {
+        socket_connect_req(fd, &sockaddr_un(path))
+    }
+
+    fn socket_bind_unix_req(fd: u32, path: &[u8]) -> Vec<u8> {
+        socket_bind_req(fd, &sockaddr_un(path))
+    }
+
     fn socket_accept_req(fd: u32, flags: u32) -> [u8; 8] {
         let mut req = [0u8; 8];
         req[0..4].copy_from_slice(&fd.to_le_bytes());
@@ -4152,12 +4198,12 @@ mod tests {
             ),
             3
         );
-        let req = socket_connect_req(3, b"127.0.0.1:1234");
+        let req = socket_connect_req(3, &sockaddr_in([127, 0, 0, 1], 1234));
         assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
 
         assert_eq!(
             crate::kh::test_support::socket_connect_calls(),
-            vec![(b"127.0.0.1:1234".to_vec(), 0)]
+            vec![(sockaddr_in([127, 0, 0, 1], 1234).to_vec(), 0)]
         );
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_CLOSE, 1, &socket_fd_req(3), &mut []),
@@ -4185,7 +4231,7 @@ mod tests {
             ),
             3
         );
-        let req = socket_connect_req(3, b"127.0.0.1:1235");
+        let req = socket_connect_req(3, &sockaddr_in([127, 0, 0, 1], 1235));
         assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
         assert_eq!(
             dispatch(METHOD_SYS_DUP, 1, &3_u32.to_le_bytes(), &mut []),
@@ -4220,7 +4266,7 @@ mod tests {
             ),
             3
         );
-        let req = socket_connect_req(3, b"127.0.0.1:6000");
+        let req = socket_connect_req(3, &sockaddr_in([127, 0, 0, 1], 6000));
         assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
         assert_eq!(
             dispatch(
@@ -4272,7 +4318,7 @@ mod tests {
             ),
             3
         );
-        let req = socket_connect_req(3, b"127.0.0.1:6001");
+        let req = socket_connect_req(3, &sockaddr_in([127, 0, 0, 1], 6001));
         assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
 
         let mut write_req = 3_u32.to_le_bytes().to_vec();
@@ -4318,7 +4364,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(3, b"127.0.0.1:0"),
+                &socket_bind_req(3, &sockaddr_in([127, 0, 0, 1], 0)),
                 &mut []
             ),
             0
@@ -4365,7 +4411,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(3, b"unix:/tmp/yurt.sock"),
+                &socket_bind_unix_req(3, b"/tmp/yurt.sock"),
                 &mut []
             ),
             0
@@ -4388,7 +4434,7 @@ mod tests {
             ),
             4
         );
-        let connect_req = socket_connect_req(4, b"unix:/tmp/yurt.sock");
+        let connect_req = socket_connect_unix_req(4, b"/tmp/yurt.sock");
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &connect_req, &mut []),
             0
@@ -4473,7 +4519,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(3, b"unix:/tmp/yurt-name.sock"),
+                &socket_bind_unix_req(3, b"/tmp/yurt-name.sock"),
                 &mut []
             ),
             0
@@ -4500,7 +4546,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_CONNECT,
                 1,
-                &socket_connect_req(4, b"unix:/tmp/yurt-name.sock"),
+                &socket_connect_unix_req(4, b"/tmp/yurt-name.sock"),
                 &mut []
             ),
             0
@@ -4613,7 +4659,7 @@ mod tests {
             ),
             3
         );
-        let missing = socket_connect_req(3, b"unix:/tmp/missing.sock");
+        let missing = socket_connect_unix_req(3, b"/tmp/missing.sock");
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &missing, &mut []),
             -(abi::ECONNREFUSED as i64)
@@ -4632,7 +4678,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(4, b"unix:/tmp/backlog.sock"),
+                &socket_bind_unix_req(4, b"/tmp/backlog.sock"),
                 &mut []
             ),
             0
@@ -4659,7 +4705,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_CONNECT,
                 1,
-                &socket_connect_req(5, b"unix:/tmp/backlog.sock"),
+                &socket_connect_unix_req(5, b"/tmp/backlog.sock"),
                 &mut []
             ),
             0
@@ -4677,7 +4723,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_CONNECT,
                 1,
-                &socket_connect_req(6, b"unix:/tmp/backlog.sock"),
+                &socket_connect_unix_req(6, b"/tmp/backlog.sock"),
                 &mut []
             ),
             -(abi::ECONNREFUSED as i64)
@@ -4704,7 +4750,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_CONNECT,
                 1,
-                &socket_connect_req(8, b"unix:/tmp/backlog.sock"),
+                &socket_connect_unix_req(8, b"/tmp/backlog.sock"),
                 &mut []
             ),
             0
@@ -4729,7 +4775,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(3, b"unix:/tmp/close.sock"),
+                &socket_bind_unix_req(3, b"/tmp/close.sock"),
                 &mut []
             ),
             0
@@ -4752,7 +4798,7 @@ mod tests {
             ),
             4
         );
-        let connect_req = socket_connect_req(4, b"unix:/tmp/close.sock");
+        let connect_req = socket_connect_unix_req(4, b"/tmp/close.sock");
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &connect_req, &mut []),
             0
@@ -4774,7 +4820,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_CONNECT,
                 1,
-                &socket_connect_req(3, b"unix:/tmp/close.sock"),
+                &socket_connect_unix_req(3, b"/tmp/close.sock"),
                 &mut []
             ),
             -(abi::ECONNREFUSED as i64)
@@ -4848,12 +4894,12 @@ mod tests {
             let cases: Vec<(u32, Vec<u8>, usize)> = vec![
                 (
                     METHOD_SYS_SOCKET_CONNECT,
-                    socket_connect_req(fd, b"127.0.0.1:1"),
+                    socket_connect_req(fd, &sockaddr_in([127, 0, 0, 1], 1)),
                     0,
                 ),
                 (
                     METHOD_SYS_SOCKET_BIND,
-                    socket_bind_req(fd, b"127.0.0.1:0"),
+                    socket_bind_req(fd, &sockaddr_in([127, 0, 0, 1], 0)),
                     0,
                 ),
                 (
@@ -4871,7 +4917,7 @@ mod tests {
                 (METHOD_SYS_SOCKET_ADDR, socket_fd_req(fd).to_vec(), 32),
                 (
                     METHOD_SYS_SOCKET_SENDTO,
-                    socket_sendto_req(fd, 0, b"unix:/tmp/nope", b"x"),
+                    socket_sendto_req(fd, 0, &sockaddr_un(b"/tmp/nope"), b"x"),
                     0,
                 ),
                 (
@@ -4934,12 +4980,12 @@ mod tests {
         let cases: Vec<(u32, Vec<u8>, usize)> = vec![
             (
                 METHOD_SYS_SOCKET_CONNECT,
-                socket_connect_req(fd, b"127.0.0.1:1"),
+                socket_connect_req(fd, &sockaddr_in([127, 0, 0, 1], 1)),
                 0,
             ),
             (
                 METHOD_SYS_SOCKET_BIND,
-                socket_bind_req(fd, b"127.0.0.1:0"),
+                socket_bind_req(fd, &sockaddr_in([127, 0, 0, 1], 0)),
                 0,
             ),
             (
@@ -4957,7 +5003,7 @@ mod tests {
             (METHOD_SYS_SOCKET_ADDR, socket_fd_req(fd).to_vec(), 32),
             (
                 METHOD_SYS_SOCKET_SENDTO,
-                socket_sendto_req(fd, 0, b"unix:/tmp/nope", b"x"),
+                socket_sendto_req(fd, 0, &sockaddr_un(b"/tmp/nope"), b"x"),
                 0,
             ),
             (
@@ -5245,7 +5291,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(3, b"unix:/tmp/dgram.sock"),
+                &socket_bind_unix_req(3, b"/tmp/dgram.sock"),
                 &mut []
             ),
             0
@@ -5255,7 +5301,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_SENDTO,
                 1,
-                &socket_sendto_req(4, 0, b"unix:/tmp/dgram.sock", b"first"),
+                &socket_sendto_req(4, 0, &sockaddr_un(b"/tmp/dgram.sock"), b"first"),
                 &mut []
             ),
             5
@@ -5264,7 +5310,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_SENDTO,
                 1,
-                &socket_sendto_req(4, 0, b"unix:/tmp/dgram.sock", b"second"),
+                &socket_sendto_req(4, 0, &sockaddr_un(b"/tmp/dgram.sock"), b"second"),
                 &mut []
             ),
             6
@@ -5298,7 +5344,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_SENDTO,
                 1,
-                &socket_sendto_req(4, 0, b"unix:/tmp/missing.sock", b"x"),
+                &socket_sendto_req(4, 0, &sockaddr_un(b"/tmp/missing.sock"), b"x"),
                 &mut []
             ),
             -(abi::ECONNREFUSED as i64)
@@ -5326,7 +5372,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(3, b"unix:/tmp/dgram-recv.sock"),
+                &socket_bind_unix_req(3, b"/tmp/dgram-recv.sock"),
                 &mut []
             ),
             0
@@ -5335,7 +5381,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(4, b"unix:/tmp/dgram-sender.sock"),
+                &socket_bind_unix_req(4, b"/tmp/dgram-sender.sock"),
                 &mut []
             ),
             0
@@ -5344,7 +5390,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_SENDTO,
                 1,
-                &socket_sendto_req(4, 0, b"unix:/tmp/dgram-recv.sock", b"ping"),
+                &socket_sendto_req(4, 0, &sockaddr_un(b"/tmp/dgram-recv.sock"), b"ping"),
                 &mut []
             ),
             4
@@ -5396,7 +5442,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(3, b"unix:/tmp/dgram-connect-server.sock"),
+                &socket_bind_unix_req(3, b"/tmp/dgram-connect-server.sock"),
                 &mut []
             ),
             0
@@ -5405,7 +5451,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_CONNECT,
                 1,
-                &socket_connect_req(4, b"unix:/tmp/dgram-connect-server.sock"),
+                &socket_connect_unix_req(4, b"/tmp/dgram-connect-server.sock"),
                 &mut []
             ),
             0
@@ -5450,7 +5496,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(3, b"unix:/tmp/dgram-peername-server.sock"),
+                &socket_bind_unix_req(3, b"/tmp/dgram-peername-server.sock"),
                 &mut []
             ),
             0
@@ -5459,7 +5505,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_CONNECT,
                 1,
-                &socket_connect_req(4, b"unix:/tmp/dgram-peername-server.sock"),
+                &socket_connect_unix_req(4, b"/tmp/dgram-peername-server.sock"),
                 &mut []
             ),
             0
@@ -5514,7 +5560,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(4, b"unix:/tmp/dgram-reconnect.sock"),
+                &socket_bind_unix_req(4, b"/tmp/dgram-reconnect.sock"),
                 &mut []
             ),
             0
@@ -5523,7 +5569,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_CONNECT,
                 1,
-                &socket_connect_req(left, b"unix:/tmp/dgram-reconnect.sock"),
+                &socket_connect_unix_req(left, b"/tmp/dgram-reconnect.sock"),
                 &mut []
             ),
             0
@@ -5568,7 +5614,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(3, b"unix:/tmp/dgram-sendmsg-server.sock"),
+                &socket_bind_unix_req(3, b"/tmp/dgram-sendmsg-server.sock"),
                 &mut []
             ),
             0
@@ -5577,7 +5623,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(4, b"unix:/tmp/dgram-sendmsg-client.sock"),
+                &socket_bind_unix_req(4, b"/tmp/dgram-sendmsg-client.sock"),
                 &mut []
             ),
             0
@@ -5586,7 +5632,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_CONNECT,
                 1,
-                &socket_connect_req(4, b"unix:/tmp/dgram-sendmsg-server.sock"),
+                &socket_connect_unix_req(4, b"/tmp/dgram-sendmsg-server.sock"),
                 &mut []
             ),
             0
@@ -5633,7 +5679,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_BIND,
                 1,
-                &socket_bind_req(3, b"unix:/tmp/dgram-unlink.sock"),
+                &socket_bind_unix_req(3, b"/tmp/dgram-unlink.sock"),
                 &mut []
             ),
             0
@@ -5661,7 +5707,7 @@ mod tests {
             dispatch(
                 METHOD_SYS_SOCKET_SENDTO,
                 1,
-                &socket_sendto_req(3, 0, b"unix:/tmp/dgram-unlink.sock", b"x"),
+                &socket_sendto_req(3, 0, &sockaddr_un(b"/tmp/dgram-unlink.sock"), b"x"),
                 &mut []
             ),
             -(abi::ECONNREFUSED as i64)
@@ -5897,7 +5943,7 @@ mod tests {
             ),
             3
         );
-        let req = socket_connect_req(3, b"127.0.0.1:6000");
+        let req = socket_connect_req(3, &sockaddr_in([127, 0, 0, 1], 6000));
         assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
 
         let mut addr = [0u8; 16];
@@ -6009,7 +6055,7 @@ mod tests {
             ),
             3
         );
-        let req = socket_connect_req(3, b"127.0.0.1:7000");
+        let req = socket_connect_req(3, &sockaddr_in([127, 0, 0, 1], 7000));
         assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
 
         let req = poll_req(0, &[(3, POLLIN | POLLOUT)]);

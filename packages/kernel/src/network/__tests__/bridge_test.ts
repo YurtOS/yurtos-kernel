@@ -1,8 +1,8 @@
 import { afterAll, afterEach, beforeAll, describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
-import { NetworkBridge } from "../bridge.js";
-import { NetworkGateway } from "../gateway.js";
-import { createNetworkBridgeSocketBackend } from "../socket-backend.js";
+import { NetworkBridge } from "../bridge.ts";
+import { NetworkGateway } from "../gateway.ts";
+import { createNetworkBridgeSocketBackend } from "../socket-backend.ts";
 import { type ChildProcess, spawn } from "node:child_process";
 import { Buffer } from "node:buffer";
 import process from "node:process";
@@ -142,7 +142,7 @@ describe(
       bridge = new NetworkBridge(gateway);
       await bridge.start();
 
-      const result = bridge.fetchSync(`${baseUrl}/data`, "GET", {});
+      const result = await bridge.fetchSync(`${baseUrl}/data`, "GET", {});
       expect(result.status).toBe(200);
       expect(result.body).toBe("bridge response");
     });
@@ -152,7 +152,7 @@ describe(
       bridge = new NetworkBridge(gateway);
       await bridge.start();
 
-      const result = bridge.fetchSync(`${baseUrl}/binary`, "GET", {});
+      const result = await bridge.fetchSync(`${baseUrl}/binary`, "GET", {});
       expect(result.status).toBe(200);
       expect(result.body_base64).toBeTruthy();
 
@@ -170,7 +170,12 @@ describe(
       await bridge.start();
 
       const body = new Uint8Array([0xff, 0xfe, 0x00, 0x61]);
-      const result = bridge.fetchSync(`${baseUrl}/echo-body`, "POST", {}, body);
+      const result = await bridge.fetchSync(
+        `${baseUrl}/echo-body`,
+        "POST",
+        {},
+        body,
+      );
 
       expect(result.status).toBe(200);
       expect(result.body_base64).toBe("//4AYQ==");
@@ -181,7 +186,7 @@ describe(
       bridge = new NetworkBridge(gateway);
       await bridge.start();
 
-      const result = bridge.fetchSync(`${baseUrl}/data`, "GET", {});
+      const result = await bridge.fetchSync(`${baseUrl}/data`, "GET", {});
       expect(result.status).toBe(200);
       expect(result.body).toBe("bridge response");
       // body_base64 should also be present and decode to the same text
@@ -197,7 +202,7 @@ describe(
       bridge = new NetworkBridge(gateway);
       await bridge.start();
 
-      const result = bridge.fetchSync(
+      const result = await bridge.fetchSync(
         `${baseUrl}/redirect`,
         "GET",
         {},
@@ -214,7 +219,7 @@ describe(
       bridge = new NetworkBridge(gateway);
       await bridge.start();
 
-      const result = bridge.fetchSync("https://evil.com", "GET", {});
+      const result = await bridge.fetchSync("https://evil.com", "GET", {});
       expect(result.status).toBeGreaterThanOrEqual(400);
       expect(result.error).toBeTruthy();
     });
@@ -235,7 +240,7 @@ describe(
       await bridge.start();
 
       const backend = createNetworkBridgeSocketBackend(bridge);
-      const listen = backend.listen!({
+      const listen = await backend.listen!({
         host: "127.0.0.1",
         port: 18081,
         backlog: 8,
@@ -243,21 +248,21 @@ describe(
       expect(listen.ok).toBe(true);
       if (!listen.ok) throw new Error(listen.error);
 
-      const emptyAccept = backend.accept!(listen.listener);
+      const emptyAccept = await backend.accept!(listen.listener);
       expect(emptyAccept).toEqual({
         ok: false,
         wouldBlock: true,
         error: "accept would block",
       });
 
-      const client = backend.connect({
+      const client = await backend.connect({
         host: "127.0.0.1",
         port: 18081,
         tls: false,
       });
       expect(client.ok).toBe(true);
       if (!client.ok) throw new Error(client.error);
-      const accepted = backend.accept!(listen.listener);
+      const accepted = await backend.accept!(listen.listener);
       expect(accepted.ok).toBe(true);
       if (!accepted.ok) throw new Error(accepted.error);
 
@@ -270,19 +275,19 @@ describe(
         error: "send: data must be an array of bytes",
       });
 
-      expect(backend.send(client.socket, encode("ping"))).toEqual({
+      expect(await backend.send(client.socket, encode("ping"))).toEqual({
         ok: true,
         bytes_sent: 4,
       });
-      expect(backend.recv(accepted.socket, 4)).toEqual({
+      expect(await backend.recv(accepted.socket, 4)).toEqual({
         ok: true,
         data: encode("ping"),
       });
-      expect(backend.send(accepted.socket, encode("pong"))).toEqual({
+      expect(await backend.send(accepted.socket, encode("pong"))).toEqual({
         ok: true,
         bytes_sent: 4,
       });
-      expect(backend.recv(client.socket, 4)).toEqual({
+      expect(await backend.recv(client.socket, 4)).toEqual({
         ok: true,
         data: encode("pong"),
       });
@@ -304,7 +309,7 @@ describe(
       await bridge.start();
 
       const backend = createNetworkBridgeSocketBackend(bridge);
-      const listen = backend.listen!({
+      const listen = await backend.listen!({
         host: "127.0.0.1",
         port: 18091,
         backlog: 8,
@@ -318,7 +323,7 @@ describe(
       // Connect from the same backend; this routes via loopbackRoutes and
       // the bridge worker's handleConnect awaits its own connectWaiters
       // entry — the accept waiter must not steal that wakeup.
-      const client = backend.connect({
+      const client = await backend.connect({
         host: "127.0.0.1",
         port: 18091,
         tls: false,
@@ -346,7 +351,7 @@ describe(
       await bridge.start();
 
       const backend = createNetworkBridgeSocketBackend(bridge);
-      const listen = backend.listen!({
+      const listen = await backend.listen!({
         host: "127.0.0.1",
         port: 18093,
         backlog: 8,
@@ -371,7 +376,7 @@ describe(
       await bridge.start();
 
       const backend = createNetworkBridgeSocketBackend(bridge);
-      const listen = backend.listen!({
+      const listen = await backend.listen!({
         host: "0.0.0.0",
         port: 8080,
         backlog: 8,

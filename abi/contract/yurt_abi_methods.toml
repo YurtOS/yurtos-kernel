@@ -326,7 +326,7 @@ doc = "POSIX rename(oldpath, newpath). Request bytes: u32 old_len LE + old_bytes
 [method.sys_socket_connect]
 id = 0x1_0031
 kind = "syscall"
-doc = "Connect an existing socket fd. Request bytes: u32 fd LE + addr bytes (UTF-8 'host:port' or unix:<path>). Returns 0 on success, -EBADF for an invalid fd, -ENOTSOCK for a valid non-socket fd, or a negated connection errno (-EACCES policy denial, -ECONNREFUSED, -EHOSTUNREACH)."
+doc = "Connect an existing socket fd. Request bytes: u32 fd LE + POSIX sockaddr bytes. Returns 0 on success, -EBADF for an invalid fd, -ENOTSOCK for a valid non-socket fd, or a negated connection errno (-EACCES policy denial, -ECONNREFUSED, -EHOSTUNREACH)."
 
 [method.sys_socket_send]
 id = 0x1_0032
@@ -411,7 +411,7 @@ doc = "Open a kernel-owned socket in the caller's fd table. Request bytes: u8 fa
 [method.sys_socket_bind]
 id = 0x1_0046
 kind = "syscall"
-doc = "Bind a kernel-owned socket to an address. Request bytes: u32 fd LE + address bytes. AF_UNIX addresses use the same unix:<path> binary address convention as socket connect/listen. Returns 0, -EBADF, -ENOTSOCK, or a negated bind errno."
+doc = "Bind a kernel-owned socket to an address. Request bytes: u32 fd LE + POSIX sockaddr bytes. Returns 0, -EBADF, -ENOTSOCK, or a negated bind errno."
 
 [method.sys_socket_sendto]
 id = 0x1_0047

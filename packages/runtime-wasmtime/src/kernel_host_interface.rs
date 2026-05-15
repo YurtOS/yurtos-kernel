@@ -337,6 +337,24 @@ pub trait PolicyEnforcer: Send + Sync {
         PolicyDecision::Allow
     }
 
+    /// Gate socket data transfer on already-created host socket handles.
+    /// Connect/listen decide whether a handle can be created; this hook
+    /// decides whether the kernel may use that handle for host I/O.
+    fn may_socket_io(&self, _handle: i32, _write: bool) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
+    /// Gate accepting a connection from a host listener handle.
+    fn may_accept_socket(&self, _handle: i32) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
+    /// Gate host socket address queries. `peer` distinguishes
+    /// `getpeername` from `getsockname`.
+    fn may_socket_addr(&self, _handle: i32, _peer: bool) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
     /// Gate `kh_log` emissions. Most embedders Allow these; some
     /// (e.g. embedded contexts that have no log sink) may Deny to
     /// drop noise without paying for the message format.
@@ -362,6 +380,22 @@ pub trait PolicyEnforcer: Send + Sync {
     /// distinguishes mutating ops (put/delete) from read-only
     /// (get/list). Embedders enforce per-store namespacing.
     fn may_idb(&self, _store: &[u8], _write: bool) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
+    /// Gate process instantiation requested by kernel.wasm.
+    fn may_spawn_process(&self, _module_id: &[u8], _context: &[u8]) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
+    /// Gate host process memory access. `write` distinguishes
+    /// `kh_process_mem_write` from `kh_process_mem_read`.
+    fn may_process_memory(&self, _handle: i32, _write: bool) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
+    /// Gate resuming a host process instance.
+    fn may_resume_process(&self, _handle: i32) -> PolicyDecision {
         PolicyDecision::Allow
     }
 }
@@ -391,6 +425,15 @@ impl PolicyEnforcer for DenyAllPolicy {
     fn may_listen(&self, _port: u16) -> PolicyDecision {
         PolicyDecision::Deny
     }
+    fn may_socket_io(&self, _handle: i32, _write: bool) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_accept_socket(&self, _handle: i32) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_socket_addr(&self, _handle: i32, _peer: bool) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
     fn may_log(&self, _severity: u32, _message: &str) -> PolicyDecision {
         PolicyDecision::Deny
     }
@@ -401,6 +444,15 @@ impl PolicyEnforcer for DenyAllPolicy {
         PolicyDecision::Deny
     }
     fn may_idb(&self, _store: &[u8], _write: bool) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_spawn_process(&self, _module_id: &[u8], _context: &[u8]) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_process_memory(&self, _handle: i32, _write: bool) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_resume_process(&self, _handle: i32) -> PolicyDecision {
         PolicyDecision::Deny
     }
 }
@@ -767,7 +819,7 @@ impl KvBackend for InMemoryKv {
 /// `may_connect` policy gate fires before this trait sees any
 /// request.
 pub trait TcpSocketImpl: Send + Sync {
-    /// Connect to `host:port` and return a non-negative socket
+    /// Connect to `host`/`port` and return a non-negative socket
     /// handle, or a negated POSIX errno.
     fn connect(&self, host: &str, port: u16, flags: u32) -> i32;
     /// Send up to `data.len()` bytes. Returns bytes sent or
@@ -778,7 +830,7 @@ pub trait TcpSocketImpl: Send + Sync {
     fn recv(&self, handle: i32, buf: &mut [u8], flags: u32) -> i64;
     /// Close the handle (listener or connection).
     fn close(&self, handle: i32) -> i32;
-    /// Bind to `host:port` (port=0 lets the host pick) and start
+    /// Bind to `host`/`port` (port=0 lets the host pick) and start
     /// accepting. Returns a listener handle or negated errno.
     /// Default: -ENOSYS — embedders that want listen wire it up
     /// in their TcpSocketImpl. (Browser kernel-host interfaces typically
@@ -903,14 +955,14 @@ impl TcpSocketImpl for NativeTcpSocket {
     }
 
     fn listen(&self, host: &str, port: u16, _backlog: u32) -> i32 {
-        let bind_addr = if host == "0.0.0.0" || host.is_empty() {
-            format!("0.0.0.0:{port}")
+        let bind_host = if host == "0.0.0.0" || host.is_empty() {
+            "0.0.0.0"
         } else if host == "localhost" {
-            format!("127.0.0.1:{port}")
+            "127.0.0.1"
         } else {
-            format!("{host}:{port}")
+            host
         };
-        let listener = match std::net::TcpListener::bind(&bind_addr) {
+        let listener = match std::net::TcpListener::bind((bind_host, port)) {
             Ok(l) => l,
             Err(e) => return tcp_io_errno(e),
         };
@@ -932,7 +984,7 @@ impl TcpSocketImpl for NativeTcpSocket {
             let mut s = self.inner.lock().unwrap();
             match s.listeners.remove(&handle) {
                 Some(l) => l,
-                None => return -9_i32, // -EBADF
+                None => return -EBADF as i32,
             }
         };
         let result = listener.accept();
@@ -998,6 +1050,19 @@ fn socket_addr_record(host: &str, port: u16) -> [u8; 8] {
     }
     out[4..6].copy_from_slice(&port.to_be_bytes());
     out
+}
+
+fn decode_ipv4_sockaddr(addr: &[u8]) -> std::result::Result<(String, u16), i32> {
+    if addr.len() < 16 {
+        return Err(-EINVAL as i32);
+    }
+    let family = u16::from_le_bytes(addr[0..2].try_into().map_err(|_| -EINVAL as i32)?);
+    if family != 2 {
+        return Err(-EINVAL as i32);
+    }
+    let port = u16::from_be_bytes(addr[2..4].try_into().map_err(|_| -EINVAL as i32)?);
+    let host = std::net::Ipv4Addr::new(addr[4], addr[5], addr[6], addr[7]).to_string();
+    Ok((host, port))
 }
 
 /// Pluggable host-fs backend. *Every* host-fs access goes through
@@ -3043,8 +3108,8 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
 
     // ── kh_socket_* (outbound TCP) ─────────────────────────────────
     //
-    // connect: parse "host:port", consult may_connect, delegate to
-    // HostState.tcp. send/recv/close pass the host handle through.
+    // connect: decode POSIX sockaddr bytes, consult may_connect, delegate
+    // to HostState.tcp. send/recv/close pass the host handle through.
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_socket_connect",
@@ -3057,26 +3122,18 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Ok(buf) => buf,
                 Err(rc) => return rc as i32,
             };
-            let addr_str = match std::str::from_utf8(&addr) {
-                Ok(s) => s,
-                Err(_) => return -EINVAL as i32,
+            let (host, port) = match decode_ipv4_sockaddr(&addr) {
+                Ok(addr) => addr,
+                Err(rc) => return rc,
             };
-            let (host, port_str) = match addr_str.rsplit_once(':') {
-                Some(p) => p,
-                None => return -EINVAL as i32,
-            };
-            let port: u16 = match port_str.parse() {
-                Ok(p) => p,
-                Err(_) => return -EINVAL as i32,
-            };
-            if caller.data().host.policy.may_connect(host, port) == PolicyDecision::Deny {
+            if caller.data().host.policy.may_connect(&host, port) == PolicyDecision::Deny {
                 return -EACCES as i32;
             }
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
                 None => return -EACCES as i32,
             };
-            tcp.connect(host, port, flags)
+            tcp.connect(&host, port, flags)
         },
     )?;
     linker.func_wrap(
@@ -3091,6 +3148,9 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Ok(buf) => buf,
                 Err(rc) => return rc,
             };
+            if caller.data().host.policy.may_socket_io(handle, true) == PolicyDecision::Deny {
+                return -EACCES;
+            }
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
                 None => return -EBADF,
@@ -3111,6 +3171,9 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Ok(m) => m,
                 Err(rc) => return rc,
             };
+            if caller.data().host.policy.may_socket_io(handle, false) == PolicyDecision::Deny {
+                return -EACCES;
+            }
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
                 None => return -EBADF,
@@ -3154,17 +3217,9 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Ok(buf) => buf,
                 Err(rc) => return rc as i32,
             };
-            let addr_str = match std::str::from_utf8(&addr) {
-                Ok(s) => s,
-                Err(_) => return -EINVAL as i32,
-            };
-            let (host, port_str) = match addr_str.rsplit_once(':') {
-                Some(p) => p,
-                None => return -EINVAL as i32,
-            };
-            let port: u16 = match port_str.parse() {
-                Ok(p) => p,
-                Err(_) => return -EINVAL as i32,
+            let (host, port) = match decode_ipv4_sockaddr(&addr) {
+                Ok(addr) => addr,
+                Err(rc) => return rc,
             };
             if caller.data().host.policy.may_listen(port) == PolicyDecision::Deny {
                 return -EACCES as i32;
@@ -3173,16 +3228,19 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Some(t) => t,
                 None => return -EACCES as i32,
             };
-            tcp.listen(host, port, backlog)
+            tcp.listen(&host, port, backlog)
         },
     )?;
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_socket_accept_blocking",
         |caller: Caller<'_, KernelStoreData>, handle: i32, flags: u32| -> i32 {
+            if caller.data().host.policy.may_accept_socket(handle) == PolicyDecision::Deny {
+                return -EACCES as i32;
+            }
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
-                None => return -9_i32, // -EBADF
+                None => return -EBADF as i32,
             };
             tcp.accept(handle, flags)
         },
@@ -3195,6 +3253,9 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Some(m) => m,
                 None => return -EFAULT,
             };
+            if caller.data().host.policy.may_socket_addr(handle, false) == PolicyDecision::Deny {
+                return -EACCES;
+            }
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
                 None => return -EBADF,
@@ -3222,6 +3283,9 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Some(m) => m,
                 None => return -EFAULT,
             };
+            if caller.data().host.policy.may_socket_addr(handle, true) == PolicyDecision::Deny {
+                return -EACCES;
+            }
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
                 None => return -EBADF,
@@ -3465,6 +3529,15 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Ok(buf) => buf,
                 Err(rc) => return rc as i32,
             };
+            if caller
+                .data()
+                .host
+                .policy
+                .may_spawn_process(&module_id, &context)
+                == PolicyDecision::Deny
+            {
+                return -EACCES as i32;
+            }
             caller
                 .data()
                 .host
@@ -3490,31 +3563,42 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_process_mem_read",
-        |_caller: Caller<'_, KernelStoreData>,
-         _handle: i32,
+        |caller: Caller<'_, KernelStoreData>,
+         handle: i32,
          _addr: u32,
          _dst_ptr: u32,
          _len: u32|
-         -> i64 { -ENOSYS },
+         -> i64 {
+            if caller.data().host.policy.may_process_memory(handle, false) == PolicyDecision::Deny {
+                return -EACCES;
+            }
+            -ENOSYS
+        },
     )?;
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_process_mem_write",
-        |_caller: Caller<'_, KernelStoreData>,
-         _handle: i32,
+        |caller: Caller<'_, KernelStoreData>,
+         handle: i32,
          _addr: u32,
          _src_ptr: u32,
          _len: u32|
-         -> i64 { -ENOSYS },
+         -> i64 {
+            if caller.data().host.policy.may_process_memory(handle, true) == PolicyDecision::Deny {
+                return -EACCES;
+            }
+            -ENOSYS
+        },
     )?;
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_process_resume",
-        |_caller: Caller<'_, KernelStoreData>,
-         _handle: i32,
-         _result: i64,
-         _budget_ns: u64|
-         -> i64 { -ENOSYS },
+        |caller: Caller<'_, KernelStoreData>, handle: i32, _result: i64, _budget_ns: u64| -> i64 {
+            if caller.data().host.policy.may_resume_process(handle) == PolicyDecision::Deny {
+                return -EACCES;
+            }
+            -ENOSYS
+        },
     )?;
 
     Ok(())

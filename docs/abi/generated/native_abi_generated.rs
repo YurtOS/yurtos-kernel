@@ -91,6 +91,9 @@ pub const EINVAL: i32 = 22;
 /// Value too large for defined data type.
 pub const EOVERFLOW: i32 = 75;
 
+/// Socket operation on non-socket.
+pub const ENOTSOCK: i32 = 88;
+
 /// Connection reset by peer.
 pub const ECONNRESET: i32 = 104;
 

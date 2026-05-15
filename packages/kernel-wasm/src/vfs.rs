@@ -471,11 +471,13 @@ pub struct RamfsBackend {
 
 impl RamfsBackend {
     pub fn new() -> Self {
+        let mut dirs = BTreeSet::new();
+        dirs.insert(b"/".to_vec());
         Self {
             inodes: BTreeMap::new(),
             paths: BTreeMap::new(),
             symlinks: BTreeMap::new(),
-            dirs: BTreeSet::new(),
+            dirs,
             refcount: BTreeMap::new(),
             next_id: 1,
         }
@@ -779,6 +781,10 @@ impl VfsBackend for RamfsBackend {
             || self.dirs.contains(path)
         {
             return -17; // -EEXIST
+        }
+        let parent = Self::parent_of(path);
+        if !self.dirs.contains(&parent) {
+            return -2; // -ENOENT
         }
         self.dirs.insert(path.to_vec());
         0

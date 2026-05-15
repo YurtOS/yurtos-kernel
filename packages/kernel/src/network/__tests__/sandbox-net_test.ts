@@ -1,8 +1,8 @@
 import { describe, it } from "@std/testing/bdd";
 import { expect } from "@std/expect";
-import { SandboxNet } from "../sandbox-net.js";
-import { type ListenerInfo, ListenerRegistry } from "../listener-registry.js";
-import { createLoopbackSocketBackend } from "../socket-backend.js";
+import { SandboxNet } from "../sandbox-net.ts";
+import { type ListenerInfo, ListenerRegistry } from "../listener-registry.ts";
+import { createLoopbackSocketBackend } from "../socket-backend.ts";
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -33,7 +33,7 @@ describe("SandboxNet ↔ SocketBackend round trip", () => {
     const { backend, net } = setup();
 
     // Sandbox-side: a guest opens a listener via the kernel SocketBackend.
-    const listen = backend.listen!({
+    const listen = await backend.listen!({
       host: "127.0.0.1",
       port: 8888,
       backlog: 16,
@@ -60,7 +60,7 @@ describe("SandboxNet ↔ SocketBackend round trip", () => {
 
     // Sandbox → host.
     const reply = enc.encode("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi");
-    backend.send(accepted.socket, reply);
+    await backend.send(accepted.socket, reply);
     const hostRecv = await hostSock.recv(4096);
     expect(dec.decode(hostRecv)).toBe(
       "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi",
@@ -74,7 +74,7 @@ describe("SandboxNet ↔ SocketBackend round trip", () => {
     backend.closeListener!(listen.listener);
   });
 
-  it("listListeners and lifecycle events expose sandbox state to the harness", () => {
+  it("listListeners and lifecycle events expose sandbox state to the harness", async () => {
     const { backend, net } = setup();
     const events: Array<["listen" | "unlisten", number]> = [];
     net.on(
@@ -86,8 +86,16 @@ describe("SandboxNet ↔ SocketBackend round trip", () => {
       (info: ListenerInfo) => events.push(["unlisten", info.port]),
     );
 
-    const a = backend.listen!({ host: "127.0.0.1", port: 9001, backlog: 16 });
-    const b = backend.listen!({ host: "127.0.0.1", port: 9002, backlog: 16 });
+    const a = await backend.listen!({
+      host: "127.0.0.1",
+      port: 9001,
+      backlog: 16,
+    });
+    const b = await backend.listen!({
+      host: "127.0.0.1",
+      port: 9002,
+      backlog: 16,
+    });
     if (!a.ok || !b.ok) throw new Error("listen failed");
 
     expect(net.listListeners().map((l: ListenerInfo) => l.port).sort())
@@ -113,7 +121,7 @@ describe("SandboxNet ↔ SocketBackend round trip", () => {
 
   it("multiple host connections each get their own accepted socket", async () => {
     const { backend, net } = setup();
-    const listen = backend.listen!({
+    const listen = await backend.listen!({
       host: "127.0.0.1",
       port: 9100,
       backlog: 16,

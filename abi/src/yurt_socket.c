@@ -228,7 +228,6 @@ int __wrap_socket(int domain, int type, int protocol) {
 
 static int yurt_connect_impl(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   YURT_MARKER_CALL(connect);
-  char host[256];
   int rc;
 
   if (!addr || addrlen < 2) {
@@ -265,26 +264,10 @@ static int yurt_connect_impl(int sockfd, const struct sockaddr *addr, socklen_t 
     return -1;
   }
 
-  const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
-  const char *mapped_host = yurt_netdb_host_for_addr(in->sin_addr.s_addr);
-  if (mapped_host) {
-    if (strlen(mapped_host) >= sizeof(host)) {
-      errno = EOVERFLOW;
-      return -1;
-    }
-    strcpy(host, mapped_host);
-  } else {
-    if (!inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host))) {
-      errno = EINVAL;
-      return -1;
-    }
-  }
-
   rc = yurt_host_socket_connect(
     sockfd,
-    (int)(intptr_t)host,
-    (int)strlen(host),
-    (unsigned)ntohs(in->sin_port),
+    (int)(intptr_t)addr,
+    (int)addrlen,
     0
   );
   if (rc < 0) {
@@ -343,27 +326,6 @@ static int yurt_fill_sockaddr_from_native(
   in.sin_addr.s_addr = host_be;
   memcpy(addr, &in, sizeof(in));
   *addrlen = (socklen_t)sizeof(in);
-  return 0;
-}
-
-static int yurt_sockaddr_to_host_port(
-  const struct sockaddr *addr,
-  socklen_t addrlen,
-  char *host,
-  size_t host_cap,
-  int *port
-) {
-  const struct sockaddr_in *in;
-  if (!addr || addrlen < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) {
-    errno = EAFNOSUPPORT;
-    return -1;
-  }
-  in = (const struct sockaddr_in *)addr;
-  if (!inet_ntop(AF_INET, &in->sin_addr, host, host_cap)) {
-    errno = EINVAL;
-    return -1;
-  }
-  *port = (int)ntohs(in->sin_port);
   return 0;
 }
 
@@ -474,8 +436,6 @@ int __wrap_getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 
 static int yurt_bind_impl(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   YURT_MARKER_CALL(bind);
-  char host[INET_ADDRSTRLEN];
-  int port;
   int rc;
 
   if (!addr || addrlen < 2) { errno = EINVAL; return -1; }
@@ -504,15 +464,15 @@ static int yurt_bind_impl(int sockfd, const struct sockaddr *addr, socklen_t add
     return 0;
   }
 
-  /* AF_INET path (existing) */
-  if (yurt_sockaddr_to_host_port(addr, addrlen, host, sizeof(host), &port) != 0) {
+  if (addrlen < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) {
+    errno = EAFNOSUPPORT;
     return -1;
   }
+
   rc = yurt_host_socket_bind(
     sockfd,
-    (int)(intptr_t)host,
-    (int)strlen(host),
-    (unsigned)port
+    (int)(intptr_t)addr,
+    (int)addrlen
   );
   if (rc < 0) {
     errno = yurt_errno_from_host(rc, EOPNOTSUPP);

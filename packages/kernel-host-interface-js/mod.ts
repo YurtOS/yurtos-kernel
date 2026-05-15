@@ -469,6 +469,19 @@ function ipv4SocketAddrRecord(host: string, port: number): Uint8Array {
   return out;
 }
 
+function decodeSockaddrIn(
+  bytes: Uint8Array,
+): { host: string; port: number } | number {
+  if (bytes.byteLength < 16) return -EINVAL;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const family = view.getUint16(0, true);
+  if (family !== 2) return -EINVAL;
+  return {
+    host: `${bytes[4]}.${bytes[5]}.${bytes[6]}.${bytes[7]}`,
+    port: view.getUint16(2, false),
+  };
+}
+
 const USER_YURT_STUB_IMPORTS = [
   "host_chown",
   "host_chmod",
@@ -2053,18 +2066,17 @@ export class KernelHostInterface {
       ): number => {
         const tcp = hostBox.state.tcp;
         if (!tcp) return -EACCES;
-        const addr = new TextDecoder().decode(
+        const decoded = decodeSockaddrIn(
           new Uint8Array(memoryRef.memory!.buffer, addrPtr, addrLen),
         );
-        const colon = addr.lastIndexOf(":");
-        if (colon < 0) return -22;
-        const host = addr.slice(0, colon);
-        const port = parseInt(addr.slice(colon + 1), 10);
-        if (!Number.isFinite(port)) return -22;
-        if (hostBox.state.policy.mayConnect?.(host, port) === "deny") {
+        if (typeof decoded === "number") return decoded;
+        if (
+          hostBox.state.policy.mayConnect?.(decoded.host, decoded.port) ===
+            "deny"
+        ) {
           return -EACCES;
         }
-        return tcp.connect(host, port, flags);
+        return tcp.connect(decoded.host, decoded.port, flags);
       },
       kh_socket_send: (
         handle: number,
@@ -2106,16 +2118,14 @@ export class KernelHostInterface {
       ): number => {
         const tcp = hostBox.state.tcp;
         if (!tcp) return -EACCES;
-        const addr = new TextDecoder().decode(
+        const decoded = decodeSockaddrIn(
           new Uint8Array(memoryRef.memory!.buffer, addrPtr, addrLen),
         );
-        const colon = addr.lastIndexOf(":");
-        if (colon < 0) return -22;
-        const host = addr.slice(0, colon);
-        const port = parseInt(addr.slice(colon + 1), 10);
-        if (!Number.isFinite(port)) return -22;
-        if (hostBox.state.policy.mayListen?.(port) === "deny") return -EACCES;
-        return tcp.listen(host, port, backlog);
+        if (typeof decoded === "number") return decoded;
+        if (hostBox.state.policy.mayListen?.(decoded.port) === "deny") {
+          return -EACCES;
+        }
+        return tcp.listen(decoded.host, decoded.port, backlog);
       },
       kh_socket_accept_blocking: (
         handle: number,
@@ -2471,18 +2481,15 @@ export class KernelHostInterface {
           addrLen: number,
           flags: number,
         ): Promise<number> => {
-          const addr = new TextDecoder().decode(
+          const decoded = decodeSockaddrIn(
             new Uint8Array(memoryRef.memory!.buffer, addrPtr, addrLen),
           );
-          const colon = addr.lastIndexOf(":");
-          if (colon < 0) return -22;
-          const host = addr.slice(0, colon);
-          const port = parseInt(addr.slice(colon + 1), 10);
-          if (!Number.isFinite(port)) return -22;
+          if (typeof decoded === "number") return decoded;
           if (
-            hostBox.state.policy.mayConnect?.(host, port) === "deny"
+            hostBox.state.policy.mayConnect?.(decoded.host, decoded.port) ===
+              "deny"
           ) return -EACCES;
-          return await connectAsync(host, port, flags);
+          return await connectAsync(decoded.host, decoded.port, flags);
         },
       );
     }
@@ -3356,7 +3363,7 @@ export async function globalFetch(
  * `TcpSocketImpl` that uses `WebSocket` as the transport. Suitable
  * for browsers (where raw TCP isn't available) and any host that
  * ships the WebSocket constructor. Connect maps the requested
- * `host:port` to a `ws://host:port/` URL by default; embedders
+ * endpoint to a WebSocket URL by default; embedders
  * that need a different URL scheme override `urlForAddr`.
  *
  * Outbound only. Inbound (listen / accept) requires a page-side
@@ -3373,7 +3380,7 @@ export class WebSocketTcp implements TcpSocketImpl {
   private closed = new Set<number>();
 
   constructor(
-    /** Override to map `host:port` to a ws:// or wss:// URL. */
+    /** Override to map an endpoint to a ws:// or wss:// URL. */
     private urlForAddr: (host: string, port: number) => string = (h, p) =>
       `ws://${h}:${p}/`,
   ) {}

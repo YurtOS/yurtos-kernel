@@ -46,17 +46,10 @@ static int yurt_attr_load_int(const void *attr, int *value) {
   return 0;
 }
 
-static int yurt_attr_store_clock(void *attr, clockid_t value) {
-  if (!attr) return EINVAL;
-  memcpy(attr, &value, sizeof(value));
-  return 0;
-}
-
-static int yurt_attr_load_clock(const void *attr, clockid_t *value) {
-  if (!attr || !value) return EINVAL;
-  memcpy(value, attr, sizeof(*value));
-  return 0;
-}
+extern int yurt_rs_pthread_key_create(pthread_key_t *key, void (*destructor)(void *));
+extern int yurt_rs_pthread_key_delete(pthread_key_t key);
+extern int yurt_rs_pthread_setspecific(pthread_key_t key, const void *value);
+extern void *yurt_rs_pthread_getspecific(pthread_key_t key);
 
 int pthread_equal(pthread_t a, pthread_t b) {
   return a == b;
@@ -124,47 +117,18 @@ int pthread_cond_broadcast(pthread_cond_t *cond) {
   return yurt_host_cond_broadcast((int)(intptr_t)cond);
 }
 
-#define YURT_TLS_KEYS_MAX 64
-#define YURT_TLS_THREADS_MAX 128
-
-typedef struct {
-  int in_use;
-  void (*destructor)(void *);
-  void *values[YURT_TLS_THREADS_MAX];
-} yurt_tls_key_t;
-
-static yurt_tls_key_t tls_keys[YURT_TLS_KEYS_MAX];
-
 int pthread_key_create(pthread_key_t *key, void (*destructor)(void *)) {
   YURT_MARKER_CALL(pthread_key_create);
-  if (!key) return EINVAL;
-  for (unsigned int i = 0; i < YURT_TLS_KEYS_MAX; i++) {
-    if (!tls_keys[i].in_use) {
-      tls_keys[i].in_use = 1;
-      tls_keys[i].destructor = destructor;
-      memset(tls_keys[i].values, 0, sizeof(tls_keys[i].values));
-      *key = (pthread_key_t)i;
-      return 0;
-    }
-  }
-  return EAGAIN;
+  return yurt_rs_pthread_key_create(key, destructor);
 }
 
 int pthread_key_delete(pthread_key_t key) {
-  if (key >= YURT_TLS_KEYS_MAX || !tls_keys[key].in_use) return EINVAL;
-  tls_keys[key].in_use = 0;
-  tls_keys[key].destructor = NULL;
-  memset(tls_keys[key].values, 0, sizeof(tls_keys[key].values));
-  return 0;
+  return yurt_rs_pthread_key_delete(key);
 }
 
 static int yurt_pthread_setspecific_impl(pthread_key_t key, const void *value) {
   YURT_MARKER_CALL(pthread_setspecific);
-  if (key >= YURT_TLS_KEYS_MAX || !tls_keys[key].in_use) return EINVAL;
-  int tid = yurt_host_thread_self();
-  if (tid < 0 || tid >= YURT_TLS_THREADS_MAX) return EINVAL;
-  tls_keys[key].values[tid] = (void *)value;
-  return 0;
+  return yurt_rs_pthread_setspecific(key, value);
 }
 
 int pthread_setspecific(pthread_key_t key, const void *value) {
@@ -177,10 +141,7 @@ int __wrap_pthread_setspecific(pthread_key_t key, const void *value) {
 
 void *pthread_getspecific(pthread_key_t key) {
   YURT_MARKER_CALL(pthread_getspecific);
-  if (key >= YURT_TLS_KEYS_MAX || !tls_keys[key].in_use) return NULL;
-  int tid = yurt_host_thread_self();
-  if (tid < 0 || tid >= YURT_TLS_THREADS_MAX) return NULL;
-  return tls_keys[key].values[tid];
+  return yurt_rs_pthread_getspecific(key);
 }
 
 int pthread_once(pthread_once_t *once_control, void (*init_routine)(void)) {
@@ -210,24 +171,6 @@ int pthread_mutexattr_settype(pthread_mutexattr_t *attr, int type) {
 
 int pthread_mutexattr_gettype(const pthread_mutexattr_t *attr, int *type) {
   return yurt_attr_load_int(attr, type);
-}
-
-int pthread_condattr_init(pthread_condattr_t *attr) {
-  memset(attr, 0, sizeof(*attr));
-  return yurt_attr_store_clock(attr, CLOCK_REALTIME);
-}
-
-int pthread_condattr_destroy(pthread_condattr_t *attr) {
-  return attr ? 0 : EINVAL;
-}
-
-int pthread_condattr_setclock(pthread_condattr_t *attr, clockid_t clock_id) {
-  if (clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC) return EINVAL;
-  return yurt_attr_store_clock(attr, clock_id);
-}
-
-int pthread_condattr_getclock(const pthread_condattr_t *attr, clockid_t *clock_id) {
-  return yurt_attr_load_clock(attr, clock_id);
 }
 
 int pthread_cancel(pthread_t thread) {

@@ -400,24 +400,22 @@ args = [
 ]
 
 [import.host_socket_connect]
-doc = "Connect a socket fd to host:port. Flags may include YURT_SOCKET_FLAG_TLS."
+doc = "Connect a socket fd to a POSIX sockaddr record. Flags may include YURT_SOCKET_FLAG_TLS."
 return = "scalar_errno"
 args = [
   { name = "fd", type = "fd" },
-  { name = "host_ptr", type = "ptr" },
-  { name = "host_len", type = "usize" },
-  { name = "port", type = "u32" },
+  { name = "addr_ptr", type = "ptr" },
+  { name = "addr_len", type = "usize" },
   { name = "flags", type = "u32" },
 ]
 
 [import.host_socket_bind]
-doc = "Bind a socket fd to host:port."
+doc = "Bind a socket fd to a POSIX sockaddr record."
 return = "scalar_errno"
 args = [
   { name = "fd", type = "fd" },
-  { name = "host_ptr", type = "ptr" },
-  { name = "host_len", type = "usize" },
-  { name = "port", type = "u32" },
+  { name = "addr_ptr", type = "ptr" },
+  { name = "addr_len", type = "usize" },
 ]
 
 [import.host_socket_listen]

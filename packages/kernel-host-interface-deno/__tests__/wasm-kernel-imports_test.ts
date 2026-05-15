@@ -80,6 +80,18 @@ function kvKey(store: Uint8Array, key: Uint8Array): string {
   return `${new TextDecoder().decode(store)}\0${new TextDecoder().decode(key)}`;
 }
 
+function sockaddrIn(
+  host: [number, number, number, number],
+  port: number,
+): Uint8Array {
+  const addr = new Uint8Array(16);
+  const view = new DataView(addr.buffer);
+  view.setUint16(0, 2, true);
+  view.setUint16(2, port & 0xffff, false);
+  addr.set(host, 4);
+  return addr;
+}
+
 class FakeKv implements KvBackend {
   private values = new Map<string, Uint8Array>();
 
@@ -468,8 +480,9 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       0,
     ]);
 
-    u.set(new TextEncoder().encode("127.0.0.1"), 0);
-    await imports.host_socket_connect(7, 0, 9, 8080, 0x40);
+    const connectAddr = sockaddrIn([127, 0, 0, 1], 8080);
+    u.set(connectAddr, 0);
+    await imports.host_socket_connect(7, 0, connectAddr.byteLength, 0x40);
     expect(calls.at(-1)).toMatchObject({
       method: METHOD.SYS_SOCKET_CONNECT,
       responseCap: 0,
@@ -480,10 +493,12 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       0,
       0,
     ]);
-    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(4)))
-      .toEqual("127.0.0.1:8080");
+    expect(Array.from(calls.at(-1)!.request.slice(4)))
+      .toEqual(Array.from(connectAddr));
 
-    await imports.host_socket_bind(7, 0, 9, 9090);
+    const bindAddr = sockaddrIn([127, 0, 0, 1], 9090);
+    u.set(bindAddr, 0);
+    await imports.host_socket_bind(7, 0, bindAddr.byteLength);
     expect(calls.at(-1)).toMatchObject({
       method: METHOD.SYS_SOCKET_BIND,
       responseCap: 0,
@@ -494,8 +509,8 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       0,
       0,
     ]);
-    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(4)))
-      .toEqual("127.0.0.1:9090");
+    expect(Array.from(calls.at(-1)!.request.slice(4)))
+      .toEqual(Array.from(bindAddr));
 
     u.set(new TextEncoder().encode("payload"), 32);
     await imports.host_socket_send(7, 32, 7, 0x02);

@@ -441,8 +441,8 @@ export const HOST_BINDINGS: HostBinding[] = [
       return Number(out.rc);
     },
   },
-  // host_socket_connect(fd, hostPtr, hostLen, port, flags) -> 0/-errno.
-  // SYS_SOCKET_CONNECT accepts u32 fd + UTF-8 "host:port" bytes.
+  // host_socket_connect(fd, addrPtr, addrLen, flags) -> 0/-errno.
+  // SYS_SOCKET_CONNECT accepts u32 fd + POSIX sockaddr bytes.
   {
     name: "host_socket_connect",
     method: METHOD.SYS_SOCKET_CONNECT,
@@ -452,10 +452,9 @@ export const HOST_BINDINGS: HostBinding[] = [
       fd: number,
       addrPtr: number,
       addrLen: number,
-      port: number,
       _flags: number,
     ): Promise<number> => {
-      const addr = socketEndpointBytes(memBuf, addrPtr, addrLen, port);
+      const addr = copyIn(memBuf, addrPtr, addrLen);
       if (typeof addr === "number") return addr;
       const req = new Uint8Array(4 + addr.length);
       const view = new DataView(req.buffer);
@@ -470,8 +469,8 @@ export const HOST_BINDINGS: HostBinding[] = [
       return Number(out.rc);
     },
   },
-  // host_socket_bind(fd, hostPtr, hostLen, port) -> 0/-errno.
-  // SYS_SOCKET_BIND accepts u32 fd + UTF-8 "host:port" bytes.
+  // host_socket_bind(fd, addrPtr, addrLen) -> 0/-errno.
+  // SYS_SOCKET_BIND accepts u32 fd + POSIX sockaddr bytes.
   {
     name: "host_socket_bind",
     method: METHOD.SYS_SOCKET_BIND,
@@ -481,9 +480,8 @@ export const HOST_BINDINGS: HostBinding[] = [
       fd: number,
       addrPtr: number,
       addrLen: number,
-      port: number,
     ): Promise<number> => {
-      const addr = socketEndpointBytes(memBuf, addrPtr, addrLen, port);
+      const addr = copyIn(memBuf, addrPtr, addrLen);
       if (typeof addr === "number") return addr;
       const req = new Uint8Array(4 + addr.length);
       new DataView(req.buffer).setUint32(0, fd >>> 0, true);
@@ -499,7 +497,7 @@ export const HOST_BINDINGS: HostBinding[] = [
   },
   // host_socket_bind_unix(fd, pathPtr, pathLen, isAbstract) -> 0/-errno.
   // SYS_SOCKET_BIND uses the Rust kernel's unified fd table and accepts
-  // u32 fd + "unix:<path>" bytes.
+  // u32 fd + POSIX sockaddr_un bytes.
   {
     name: "host_socket_bind_unix",
     method: METHOD.SYS_SOCKET_BIND,
@@ -1231,21 +1229,6 @@ function copyOut(
   return 0;
 }
 
-function socketEndpointBytes(
-  memBuf: () => ArrayBuffer,
-  hostPtr: number,
-  hostLen: number,
-  port: number,
-): Uint8Array | number {
-  const host = copyIn(memBuf, hostPtr, hostLen);
-  if (typeof host === "number") return host;
-  const suffix = new TextEncoder().encode(`:${port >>> 0}`);
-  const out = new Uint8Array(host.byteLength + suffix.byteLength);
-  out.set(host, 0);
-  out.set(suffix, host.byteLength);
-  return out;
-}
-
 function unixSocketAddrBytes(
   memBuf: () => ArrayBuffer,
   pathPtr: number,
@@ -1254,12 +1237,15 @@ function unixSocketAddrBytes(
 ): Uint8Array | number {
   const path = copyIn(memBuf, pathPtr, pathLen);
   if (typeof path === "number") return path;
-  const prefix = isAbstract
-    ? new Uint8Array([0x75, 0x6e, 0x69, 0x78, 0x3a, 0x00])
-    : new TextEncoder().encode("unix:");
-  const out = new Uint8Array(prefix.byteLength + path.byteLength);
-  out.set(prefix, 0);
-  out.set(path, prefix.byteLength);
+  const out = new Uint8Array(2 + (isAbstract ? 1 : 0) + path.byteLength);
+  new DataView(out.buffer, out.byteOffset, out.byteLength).setUint16(
+    0,
+    1,
+    true,
+  );
+  const pathOffset = isAbstract ? 3 : 2;
+  if (isAbstract) out[2] = 0;
+  out.set(path, pathOffset);
   return out;
 }
 
