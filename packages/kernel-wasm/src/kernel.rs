@@ -414,6 +414,8 @@ pub enum SocketKind {
     },
     UnixStream {
         peer_id: u64,
+        local_path: Option<Vec<u8>>,
+        peer_path: Option<Vec<u8>>,
         rx: VecDeque<u8>,
         rights: VecDeque<Vec<FdEntry>>,
         peer_open: bool,
@@ -740,6 +742,8 @@ impl Kernel {
                 sock_type: 1,
                 kind: SocketKind::UnixStream {
                     peer_id: right,
+                    local_path: None,
+                    peer_path: None,
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
                     peer_open: true,
@@ -754,6 +758,8 @@ impl Kernel {
                 sock_type: 1,
                 kind: SocketKind::UnixStream {
                     peer_id: left,
+                    local_path: None,
+                    peer_path: None,
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
                     peer_open: true,
@@ -910,6 +916,16 @@ impl Kernel {
             return Err(crate::abi::ECONNREFUSED);
         };
         pending.push_back(server_id);
+        if let Some(client) = self.sockets.get_mut(&client_id) {
+            if let SocketKind::UnixStream { peer_path, .. } = &mut client.kind {
+                *peer_path = Some(path.to_vec());
+            }
+        }
+        if let Some(server) = self.sockets.get_mut(&server_id) {
+            if let SocketKind::UnixStream { local_path, .. } = &mut server.kind {
+                *local_path = Some(path.to_vec());
+            }
+        }
         Ok(client_id)
     }
 

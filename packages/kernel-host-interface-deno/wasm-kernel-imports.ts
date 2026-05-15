@@ -37,6 +37,8 @@ import {
 const EFAULT = 14;
 const EIO = 5;
 const EAGAIN = 11;
+const EAFNOSUPPORT = 97;
+const ENOTCONN = 107;
 const EOPNOTSUPP = 95;
 const HOST_UNIX_NOT_AF_UNIX = -1;
 const HOST_ASYNC_EAGAIN = -2;
@@ -609,9 +611,38 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_socket_addr_unix",
     method: METHOD.SYS_SOCKET_ADDR,
     args: [],
-    custom: () => async (): Promise<number> => {
-      await Promise.resolve();
-      return HOST_UNIX_NOT_AF_UNIX;
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      isPeer: number,
+      pathPtr: number,
+      pathCap: number,
+      isAbstractPtr: number,
+    ): Promise<number> => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, isPeer ? 1 : 0, true);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_ADDR,
+        callerPid,
+        req,
+        pathCap >>> 0,
+      );
+      const rc = Number(out.rc);
+      if (rc === -EAFNOSUPPORT) return HOST_UNIX_NOT_AF_UNIX;
+      if (rc === -ENOTCONN) return HOST_ASYNC_EAGAIN;
+      if (rc < 0) return rc;
+      if (rc > 0) {
+        const outRc = copyOut(memBuf, pathPtr, out.response.subarray(0, rc));
+        if (outRc < 0) return outRc;
+      }
+      if (isAbstractPtr) {
+        const zero = new Uint8Array(4);
+        const outRc = copyOut(memBuf, isAbstractPtr, zero);
+        if (outRc < 0) return outRc;
+      }
+      return rc;
     },
   },
   // host_socket_send(fd, dataPtr, dataLen, flags) → bytes.

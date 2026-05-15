@@ -13,7 +13,7 @@
 //!   0x1_0000+  — `host_*` syscalls from `yurt_abi.toml`
 
 use crate::abi;
-use crate::kernel::{with_kernel, FdEntry, Kernel, PipeEnd, SocketKind};
+use crate::kernel::{with_kernel, FdEntry, Kernel, PipeEnd, SocketEntry, SocketKind};
 use crate::kh;
 
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
@@ -2438,14 +2438,49 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
         let FdEntry::Socket { id } = entry else {
             return Err(-(abi::ENOTSOCK as i64));
         };
-        match k.socket(id).map(|socket| &socket.kind) {
-            Some(SocketKind::UnixListener { path, .. }) => Ok(Some(path.clone())),
-            Some(
-                SocketKind::Open { .. }
-                | SocketKind::UnixStream { .. }
-                | SocketKind::UnixDatagram { .. },
-            ) => Ok(None),
-            Some(SocketKind::Host { .. }) => Err(0),
+        match k.socket(id) {
+            Some(SocketEntry {
+                kind: SocketKind::UnixListener { path, .. },
+                ..
+            }) => Ok(Some(path.clone())),
+            Some(SocketEntry {
+                kind:
+                    SocketKind::UnixStream {
+                        local_path,
+                        peer_path,
+                        ..
+                    },
+                ..
+            }) => {
+                if which == 0 {
+                    Ok(local_path.clone())
+                } else {
+                    Ok(peer_path.clone())
+                }
+            }
+            Some(SocketEntry {
+                kind: SocketKind::UnixDatagram { bound_path, .. },
+                ..
+            }) => {
+                if which == 0 {
+                    Ok(bound_path.clone())
+                } else {
+                    Ok(None)
+                }
+            }
+            Some(SocketEntry {
+                domain,
+                kind: SocketKind::Open { .. },
+                ..
+            }) if matches!(*domain, 1 | 3) => Ok(None),
+            Some(SocketEntry {
+                kind: SocketKind::Open { .. },
+                ..
+            }) => Err(-(abi::EAFNOSUPPORT as i64)),
+            Some(SocketEntry {
+                kind: SocketKind::Host { .. },
+                ..
+            }) => Err(0),
             None => Err(-(abi::EBADF as i64)),
         }
     });
@@ -4182,6 +4217,119 @@ mod tests {
         assert_eq!(
             crate::kh::test_support::socket_accept_calls(),
             Vec::<(i32, u32)>::new()
+        );
+    }
+
+    #[test]
+    fn af_unix_path_stream_reports_local_and_peer_paths() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
+            3
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(3, b"unix:/tmp/yurt-name.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_LISTEN,
+                1,
+                &socket_listen_req(3, 4),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(3, 6, 0),
+                &mut []
+            ),
+            4
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_CONNECT,
+                1,
+                &socket_connect_req(4, b"unix:/tmp/yurt-name.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_ACCEPT,
+                1,
+                &socket_accept_req(3, 0),
+                &mut []
+            ),
+            5
+        );
+
+        let mut path = [0u8; 108];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_addr_req(3, 0), &mut path),
+            19
+        );
+        assert_eq!(&path[..19], b"/tmp/yurt-name.sock");
+
+        path.fill(0);
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_addr_req(4, 1), &mut path),
+            19
+        );
+        assert_eq!(&path[..19], b"/tmp/yurt-name.sock");
+
+        path.fill(0);
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_addr_req(5, 0), &mut path),
+            19
+        );
+        assert_eq!(&path[..19], b"/tmp/yurt-name.sock");
+
+        path.fill(0);
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_addr_req(4, 0), &mut path),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_addr_req(5, 1), &mut path),
+            0
+        );
+    }
+
+    #[test]
+    fn af_unix_addr_query_rejects_unconnected_ipv4_socket() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(2, 1, 0),
+                &mut []
+            ),
+            3
+        );
+        let mut addr = [0u8; 108];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_addr_req(3, 0), &mut addr),
+            -(abi::EAFNOSUPPORT as i64)
         );
     }
 

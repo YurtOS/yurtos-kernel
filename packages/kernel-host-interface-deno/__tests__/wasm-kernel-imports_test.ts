@@ -584,6 +584,42 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       0,
     ]);
 
+    const unixPath = new TextEncoder().encode("/tmp/yurt-name.sock");
+    const { mk: unixAddrMk, calls: unixAddrCalls } = capturingMk(
+      unixPath.byteLength,
+      unixPath,
+    );
+    const unixAddrBuf = new ArrayBuffer(128);
+    const unixAddrImports = buildWasmKernelImports(
+      unixAddrMk,
+      () => unixAddrBuf,
+    );
+    const unixAddrRc = await unixAddrImports.host_socket_addr_unix(
+      9,
+      1,
+      80,
+      32,
+      64,
+    );
+    expect(unixAddrRc).toEqual(unixPath.byteLength);
+    expect(unixAddrCalls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_ADDR,
+      responseCap: 32,
+    });
+    expect(Array.from(unixAddrCalls.at(-1)!.request)).toEqual([
+      9,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+    ]);
+    expect(new TextDecoder().decode(new Uint8Array(unixAddrBuf, 80, 19)))
+      .toEqual("/tmp/yurt-name.sock");
+    expect(new DataView(unixAddrBuf).getInt32(64, true)).toEqual(0);
+
     await imports.host_socket_close(9);
     expect(calls.at(-1)).toMatchObject({
       method: METHOD.SYS_SOCKET_CLOSE,
