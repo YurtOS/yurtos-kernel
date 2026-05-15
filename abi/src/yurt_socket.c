@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/uio.h>
 #include <wasi/wasip1.h>
 
 #ifndef SO_ERROR
@@ -88,6 +89,9 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 #define YURT_HOST_ECONNREFUSED 111
 #define YURT_HOST_EOPNOTSUPP 95
 
+#define YURT_RS_SOCKET_IOV_EFAULT -1
+#define YURT_RS_SOCKET_IOV_EOVERFLOW -2
+
 /* wasi-libc already ships strong definitions for some POSIX socket names.
  * yurt-cc/cargo-yurt pass --wrap for the duplicate-owned symbols we implement
  * here (`accept`, `send`, `recv`, `getsockopt`) so Rust and C guests both route
@@ -95,6 +99,26 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 
 /* Forward declaration for SO_PEERCRED helper (Slice 6) */
 static int yurt_getsockopt_peercred(int sockfd, void *optval, socklen_t *optlen);
+
+extern int yurt_rs_socket_iov_total(
+  const struct iovec *iov,
+  size_t iovlen,
+  size_t *out_total
+);
+extern int yurt_rs_socket_iov_gather(
+  const struct iovec *iov,
+  size_t iovlen,
+  unsigned char *dst,
+  size_t dst_cap,
+  size_t *out_total
+);
+extern int yurt_rs_socket_iov_scatter(
+  const struct iovec *iov,
+  size_t iovlen,
+  const unsigned char *src,
+  size_t src_len,
+  size_t *out_copied
+);
 
 typedef struct yurt_socket_addr_result_v1 {
   uint32_t host_be;
@@ -152,6 +176,17 @@ static void set_socket_errno_from_host(int err) {
     default:
       errno = EIO;
       break;
+  }
+}
+
+static int yurt_errno_from_socket_iov_rc(int rc) {
+  switch (rc) {
+    case YURT_RS_SOCKET_IOV_EFAULT:
+      return EFAULT;
+    case YURT_RS_SOCKET_IOV_EOVERFLOW:
+      return EOVERFLOW;
+    default:
+      return EINVAL;
   }
 }
 
@@ -931,16 +966,29 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
   YURT_MARKER_CALL(sendmsg);
   if (!msg) { errno = EINVAL; return -1; }
 
-  /* Gather iovecs into one contiguous buffer */
   size_t total = 0;
-  for (int i = 0; i < (int)msg->msg_iovlen; i++) total += msg->msg_iov[i].iov_len;
+  int iov_rc = yurt_rs_socket_iov_total(msg->msg_iov, msg->msg_iovlen, &total);
+  if (iov_rc != 0) {
+    errno = yurt_errno_from_socket_iov_rc(iov_rc);
+    return -1;
+  }
+  if (total > INT_MAX) {
+    errno = EOVERFLOW;
+    return -1;
+  }
   unsigned char *data = malloc(total ? total : 1);
   if (!data) { errno = ENOMEM; return -1; }
-  { size_t off = 0;
-    for (int i = 0; i < (int)msg->msg_iovlen; i++) {
-      memcpy(data + off, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
-      off += msg->msg_iov[i].iov_len;
-    }
+  iov_rc = yurt_rs_socket_iov_gather(
+    msg->msg_iov,
+    msg->msg_iovlen,
+    data,
+    total,
+    &total
+  );
+  if (iov_rc != 0) {
+    free(data);
+    errno = yurt_errno_from_socket_iov_rc(iov_rc);
+    return -1;
   }
 
   /* Collect SCM_RIGHTS fd numbers from ancillary data */
@@ -974,7 +1022,11 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
   if (!msg) { errno = EINVAL; return -1; }
 
   size_t total_iov = 0;
-  for (int i = 0; i < (int)msg->msg_iovlen; i++) total_iov += msg->msg_iov[i].iov_len;
+  int iov_rc = yurt_rs_socket_iov_total(msg->msg_iov, msg->msg_iovlen, &total_iov);
+  if (iov_rc != 0) {
+    errno = yurt_errno_from_socket_iov_rc(iov_rc);
+    return -1;
+  }
   if (total_iov > YURT_SOCKET_RECV_MAX_RAW) total_iov = YURT_SOCKET_RECV_MAX_RAW;
 
   unsigned char *buf = malloc(total_iov ? total_iov : 1);
@@ -1001,14 +1053,18 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
   }
   ssize_t nbytes = (ssize_t)rc;
 
-  /* Scatter received bytes into iov */
-  { size_t off = 0;
-    for (int i = 0; i < (int)msg->msg_iovlen && off < (size_t)nbytes; i++) {
-      size_t copy = msg->msg_iov[i].iov_len;
-      if (off + copy > (size_t)nbytes) copy = (size_t)nbytes - off;
-      memcpy(msg->msg_iov[i].iov_base, buf + off, copy);
-      off += copy;
-    }
+  size_t copied = 0;
+  iov_rc = yurt_rs_socket_iov_scatter(
+    msg->msg_iov,
+    msg->msg_iovlen,
+    buf,
+    (size_t)nbytes,
+    &copied
+  );
+  if (iov_rc != 0) {
+    free(buf);
+    errno = yurt_errno_from_socket_iov_rc(iov_rc);
+    return -1;
   }
   free(buf);
 

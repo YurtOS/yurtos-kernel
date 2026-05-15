@@ -26,6 +26,9 @@ use anyhow::{anyhow, Context, Result};
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, TypedFunc};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 use wasmtime_wasi::WasiCtxBuilder;
+use yurt_kernel_host_interface_core::{
+    checked_guest_buffer_len, checked_guest_buffer_sum, MAX_GUEST_BUFFER_LEN,
+};
 
 /// Fully-qualified path of the `kh_*` import namespace.
 const KH_NAMESPACE: &str = "kh";
@@ -50,6 +53,48 @@ const DEFAULT_EPOCH_DEADLINE: u64 = u64::MAX / 2;
 /// Public re-export so the engine adapter (`engine::WasmtimeCtx`)
 /// can return the same EFAULT value our trampoline uses internally.
 pub(crate) const EFAULT_PUB: i64 = EFAULT;
+
+fn kernel_memory(caller: &mut Caller<'_, KernelStoreData>) -> std::result::Result<Memory, i64> {
+    caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or(-EFAULT)
+}
+
+fn user_memory(caller: &mut Caller<'_, UserState>) -> std::result::Result<Memory, i64> {
+    caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or(-EFAULT)
+}
+
+fn read_kernel_guest_bytes(
+    caller: &mut Caller<'_, KernelStoreData>,
+    ptr: u32,
+    len: u32,
+) -> std::result::Result<Vec<u8>, i64> {
+    let memory = kernel_memory(caller)?;
+    let len = checked_guest_buffer_len(len)?;
+    let mut buf = vec![0u8; len];
+    if len > 0 && memory.read(&*caller, ptr as usize, &mut buf).is_err() {
+        return Err(-EFAULT);
+    }
+    Ok(buf)
+}
+
+fn read_user_guest_bytes(
+    caller: &mut Caller<'_, UserState>,
+    ptr: u32,
+    len: u32,
+) -> std::result::Result<Vec<u8>, i64> {
+    let memory = user_memory(caller)?;
+    let len = checked_guest_buffer_len(len)?;
+    let mut buf = vec![0u8; len];
+    if len > 0 && memory.read(&*caller, ptr as usize, &mut buf).is_err() {
+        return Err(-EFAULT);
+    }
+    Ok(buf)
+}
 
 /// Method ids that the user-process linker forwards. Generated
 /// constants live inside `yurt-kernel-wasm`'s build artifact, not in
@@ -2543,7 +2588,9 @@ impl UserProcess {
             .instance
             .get_memory(&mut self.store, "memory")
             .ok_or_else(|| anyhow!("user-process missing 'memory' export"))?;
-        let mut buf = vec![0u8; len as usize];
+        let len =
+            checked_guest_buffer_len(len).map_err(|rc| anyhow!("read_memory failed: {rc}"))?;
+        let mut buf = vec![0u8; len];
         memory
             .read(&self.store, addr as usize, &mut buf)
             .context("read user-process memory")?;
@@ -2575,15 +2622,7 @@ fn read_path(
     path_ptr: u32,
     path_len: u32,
 ) -> std::result::Result<Vec<u8>, i32> {
-    let memory = caller
-        .get_export("memory")
-        .and_then(|e| e.into_memory())
-        .ok_or(-EFAULT as i32)?;
-    let mut path = vec![0u8; path_len as usize];
-    if path_len > 0 && memory.read(&*caller, path_ptr as usize, &mut path).is_err() {
-        return Err(-EFAULT as i32);
-    }
-    Ok(path)
+    read_kernel_guest_bytes(caller, path_ptr, path_len).map_err(|rc| rc as i32)
 }
 
 fn host_io_errno(e: std::io::Error) -> i32 {
@@ -2629,14 +2668,10 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          msg_ptr: u32,
          msg_len: u32|
          -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -(EFAULT as i32),
+            let buf = match read_kernel_guest_bytes(&mut caller, msg_ptr, msg_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut buf = vec![0u8; msg_len as usize];
-            if memory.read(&caller, msg_ptr as usize, &mut buf).is_err() {
-                return -(EFAULT as i32);
-            }
             let sink = caller.data().host.log_sink.clone();
             let policy = caller.data().host.policy.clone();
             if let Ok(s) = std::str::from_utf8(&buf) {
@@ -2658,24 +2693,25 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          out_ptr: u32,
          out_cap: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT,
+            let memory = match kernel_memory(&mut caller) {
+                Ok(m) => m,
+                Err(rc) => return rc,
             };
-            let mut request = vec![0u8; req_len as usize];
-            if memory
-                .read(&caller, req_ptr as usize, &mut request)
-                .is_err()
-            {
-                return -EFAULT;
-            }
+            let request = match read_kernel_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
             // Policy gate: embedders that don't trust extension
             // requests inspect the bytes here. Returning Deny short-
             // circuits the registry call with -EACCES.
             if caller.data().host.policy.may_invoke_extension(&request) == PolicyDecision::Deny {
                 return -EACCES;
             }
-            let mut response = vec![0u8; out_cap as usize];
+            let out_cap = match checked_guest_buffer_len(out_cap) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut response = vec![0u8; out_cap];
             let registry = caller.data().host.extensions.clone();
             let written = registry.invoke(&request, &mut response);
             if written < 0 {
@@ -2734,15 +2770,19 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
         KH_NAMESPACE,
         "kh_real_read",
         |mut caller: Caller<'_, KernelStoreData>, fd: i32, out_ptr: u32, len: u32| -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT,
+            let memory = match kernel_memory(&mut caller) {
+                Ok(m) => m,
+                Err(rc) => return rc,
             };
             let fs = match caller.data().host.host_fs.clone() {
                 Some(f) => f,
                 None => return -EBADF,
             };
-            let mut buf = vec![0u8; len as usize];
+            let len = match checked_guest_buffer_len(len) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut buf = vec![0u8; len];
             let n = fs.read(fd, &mut buf);
             if n > 0
                 && memory
@@ -2758,14 +2798,10 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
         KH_NAMESPACE,
         "kh_real_write",
         |mut caller: Caller<'_, KernelStoreData>, fd: i32, data_ptr: u32, data_len: u32| -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT,
+            let buf = match read_kernel_guest_bytes(&mut caller, data_ptr, data_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
             };
-            let mut buf = vec![0u8; data_len as usize];
-            if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut buf).is_err() {
-                return -EFAULT;
-            }
             let fs = match caller.data().host.host_fs.clone() {
                 Some(f) => f,
                 None => return -EBADF,
@@ -2879,18 +2915,10 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             // Read both byte ranges from kernel memory; target is
             // verbatim symlink content, link is a path subject to
             // the policy gate.
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT as i32,
+            let target = match read_kernel_guest_bytes(&mut caller, target_ptr, target_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut target = vec![0u8; target_len as usize];
-            if target_len > 0
-                && memory
-                    .read(&caller, target_ptr as usize, &mut target)
-                    .is_err()
-            {
-                return -EFAULT as i32;
-            }
             let link_path = match read_path(&mut caller, link_ptr, link_len) {
                 Ok(p) => p,
                 Err(rc) => return rc,
@@ -2948,14 +2976,10 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          addr_len: u32,
          flags: u32|
          -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT as i32,
+            let addr = match read_kernel_guest_bytes(&mut caller, addr_ptr, addr_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut addr = vec![0u8; addr_len as usize];
-            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
-                return -EFAULT as i32;
-            }
             let addr_str = match std::str::from_utf8(&addr) {
                 Ok(s) => s,
                 Err(_) => return -EINVAL as i32,
@@ -2986,14 +3010,10 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          data_ptr: u32,
          data_len: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT,
+            let buf = match read_kernel_guest_bytes(&mut caller, data_ptr, data_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
             };
-            let mut buf = vec![0u8; data_len as usize];
-            if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut buf).is_err() {
-                return -EFAULT;
-            }
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
                 None => return -EBADF,
@@ -3010,15 +3030,19 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          len: u32,
          flags: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT,
+            let memory = match kernel_memory(&mut caller) {
+                Ok(m) => m,
+                Err(rc) => return rc,
             };
             let tcp = match caller.data().host.tcp.clone() {
                 Some(t) => t,
                 None => return -EBADF,
             };
-            let mut buf = vec![0u8; len as usize];
+            let len = match checked_guest_buffer_len(len) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut buf = vec![0u8; len];
             let n = tcp.recv(handle, &mut buf, flags);
             if n > 0
                 && memory
@@ -3049,14 +3073,10 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          addr_len: u32,
          backlog: u32|
          -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT as i32,
+            let addr = match read_kernel_guest_bytes(&mut caller, addr_ptr, addr_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut addr = vec![0u8; addr_len as usize];
-            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
-                return -EFAULT as i32;
-            }
             let addr_str = match std::str::from_utf8(&addr) {
                 Ok(s) => s,
                 Err(_) => return -EINVAL as i32,
@@ -3161,22 +3181,18 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          out_ptr: u32,
          out_cap: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT,
+            let memory = match kernel_memory(&mut caller) {
+                Ok(m) => m,
+                Err(rc) => return rc,
             };
-            let mut store = vec![0u8; store_len as usize];
-            if store_len > 0
-                && memory
-                    .read(&caller, store_ptr as usize, &mut store)
-                    .is_err()
-            {
-                return -EFAULT;
-            }
-            let mut key = vec![0u8; key_len as usize];
-            if key_len > 0 && memory.read(&caller, key_ptr as usize, &mut key).is_err() {
-                return -EFAULT;
-            }
+            let store = match read_kernel_guest_bytes(&mut caller, store_ptr, store_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
+            let key = match read_kernel_guest_bytes(&mut caller, key_ptr, key_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
             if caller.data().host.policy.may_idb(&store, false) == PolicyDecision::Deny {
                 return -EACCES;
             }
@@ -3189,7 +3205,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 Err(rc) => return rc as i64,
             };
             if (value.len() as u32) > out_cap {
-                return -7_i64; // -E2BIG
+                return -E2BIG;
             }
             if memory.write(&mut caller, out_ptr as usize, &value).is_err() {
                 return -EFAULT;
@@ -3208,30 +3224,18 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          value_ptr: u32,
          value_len: u32|
          -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT as i32,
+            let store = match read_kernel_guest_bytes(&mut caller, store_ptr, store_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut store = vec![0u8; store_len as usize];
-            if store_len > 0
-                && memory
-                    .read(&caller, store_ptr as usize, &mut store)
-                    .is_err()
-            {
-                return -EFAULT as i32;
-            }
-            let mut key = vec![0u8; key_len as usize];
-            if key_len > 0 && memory.read(&caller, key_ptr as usize, &mut key).is_err() {
-                return -EFAULT as i32;
-            }
-            let mut value = vec![0u8; value_len as usize];
-            if value_len > 0
-                && memory
-                    .read(&caller, value_ptr as usize, &mut value)
-                    .is_err()
-            {
-                return -EFAULT as i32;
-            }
+            let key = match read_kernel_guest_bytes(&mut caller, key_ptr, key_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let value = match read_kernel_guest_bytes(&mut caller, value_ptr, value_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
             if caller.data().host.policy.may_idb(&store, true) == PolicyDecision::Deny {
                 return -EACCES as i32;
             }
@@ -3251,22 +3255,14 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          key_ptr: u32,
          key_len: u32|
          -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT as i32,
+            let store = match read_kernel_guest_bytes(&mut caller, store_ptr, store_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut store = vec![0u8; store_len as usize];
-            if store_len > 0
-                && memory
-                    .read(&caller, store_ptr as usize, &mut store)
-                    .is_err()
-            {
-                return -EFAULT as i32;
-            }
-            let mut key = vec![0u8; key_len as usize];
-            if key_len > 0 && memory.read(&caller, key_ptr as usize, &mut key).is_err() {
-                return -EFAULT as i32;
-            }
+            let key = match read_kernel_guest_bytes(&mut caller, key_ptr, key_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
             if caller.data().host.policy.may_idb(&store, true) == PolicyDecision::Deny {
                 return -EACCES as i32;
             }
@@ -3288,26 +3284,18 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          out_ptr: u32,
          out_cap: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT,
+            let memory = match kernel_memory(&mut caller) {
+                Ok(m) => m,
+                Err(rc) => return rc,
             };
-            let mut store = vec![0u8; store_len as usize];
-            if store_len > 0
-                && memory
-                    .read(&caller, store_ptr as usize, &mut store)
-                    .is_err()
-            {
-                return -EFAULT;
-            }
-            let mut prefix = vec![0u8; prefix_len as usize];
-            if prefix_len > 0
-                && memory
-                    .read(&caller, prefix_ptr as usize, &mut prefix)
-                    .is_err()
-            {
-                return -EFAULT;
-            }
+            let store = match read_kernel_guest_bytes(&mut caller, store_ptr, store_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
+            let prefix = match read_kernel_guest_bytes(&mut caller, prefix_ptr, prefix_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
             if caller.data().host.policy.may_idb(&store, false) == PolicyDecision::Deny {
                 return -EACCES;
             }
@@ -3316,13 +3304,17 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 None => return -EACCES,
             };
             let keys = kv.list(&store, &prefix);
+            let out_cap_len = match checked_guest_buffer_len(out_cap) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
             // Pack count + (len, bytes)*. Stop early when out of room.
-            let mut buf: Vec<u8> = Vec::with_capacity(out_cap as usize);
+            let mut buf: Vec<u8> = Vec::with_capacity(out_cap_len);
             buf.extend_from_slice(&0u32.to_le_bytes());
             let mut count: u32 = 0;
             for k in &keys {
                 let need = 4 + k.len();
-                if buf.len() + need > out_cap as usize {
+                if buf.len() + need > out_cap_len {
                     break;
                 }
                 buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
@@ -3351,18 +3343,14 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          out_ptr: u32,
          out_cap: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT,
+            let memory = match kernel_memory(&mut caller) {
+                Ok(m) => m,
+                Err(rc) => return rc,
             };
-            let mut request = vec![0u8; req_len as usize];
-            if req_len > 0
-                && memory
-                    .read(&caller, req_ptr as usize, &mut request)
-                    .is_err()
-            {
-                return -EFAULT;
-            }
+            let request = match read_kernel_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
             if caller.data().host.policy.may_fetch(&request) == PolicyDecision::Deny {
                 return -EACCES;
             }
@@ -3382,7 +3370,7 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             .unwrap_or_else(|_| Vec::new());
             let bytes = response.as_slice();
             if (bytes.len() as u32) > out_cap {
-                return -7_i64; // -E2BIG
+                return -E2BIG;
             }
             if memory.write(&mut caller, out_ptr as usize, bytes).is_err() {
                 return -EFAULT;
@@ -3401,26 +3389,15 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
          context_ptr: u32,
          context_len: u32|
          -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -EFAULT as i32,
+            let module_id = match read_kernel_guest_bytes(&mut caller, module_id_ptr, module_id_len)
+            {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut module_id = vec![0u8; module_id_len as usize];
-            if module_id_len > 0
-                && memory
-                    .read(&caller, module_id_ptr as usize, &mut module_id)
-                    .is_err()
-            {
-                return -EFAULT as i32;
-            }
-            let mut context = vec![0u8; context_len as usize];
-            if context_len > 0
-                && memory
-                    .read(&caller, context_ptr as usize, &mut context)
-                    .is_err()
-            {
-                return -EFAULT as i32;
-            }
+            let context = match read_kernel_guest_bytes(&mut caller, context_ptr, context_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
             caller
                 .data()
                 .host
@@ -3758,17 +3735,10 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "sys_write",
         |mut caller: Caller<'_, UserState>, fd: i32, buf_ptr: u32, count: u32| -> i32 {
             // Stage `(u32 fd LE | payload bytes)` in kernel scratch.
-            let user_memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -(EFAULT as i32),
+            let payload = match read_user_guest_bytes(&mut caller, buf_ptr, count) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut payload = vec![0u8; count as usize];
-            if user_memory
-                .read(&caller, buf_ptr as usize, &mut payload)
-                .is_err()
-            {
-                return -(EFAULT as i32);
-            }
             let mut req = Vec::with_capacity(4 + payload.len());
             req.extend_from_slice(&(fd as u32).to_le_bytes());
             req.extend_from_slice(&payload);
@@ -3790,6 +3760,9 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 Some(n) => n,
                 None => return -(EINVAL as i32),
             };
+            if len > MAX_GUEST_BUFFER_LEN as usize {
+                return -E2BIG as i32;
+            }
             let user_memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -(EFAULT as i32),
@@ -4011,14 +3984,10 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         |mut caller: Caller<'_, UserState>, flags: i32, path_ptr: u32, path_len: u32| -> i32 {
             // Read the path bytes out of user memory and prepend
             // u32 flags LE as the wire format expects.
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let path = match read_user_guest_bytes(&mut caller, path_ptr, path_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut path = vec![0u8; path_len as usize];
-            if path_len > 0 && memory.read(&caller, path_ptr as usize, &mut path).is_err() {
-                return -22;
-            }
             let mut req = Vec::with_capacity(4 + path.len());
             req.extend_from_slice(&(flags as u32).to_le_bytes());
             req.extend_from_slice(&path);
@@ -4093,14 +4062,10 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
          out_ptr: u32,
          out_cap: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
             };
-            let mut req = vec![0u8; req_len as usize];
-            if req_len > 0 && memory.read(&caller, req_ptr as usize, &mut req).is_err() {
-                return -22;
-            }
             forward_request_with_user_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::FETCH,
@@ -4115,14 +4080,10 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         SYS_NAMESPACE,
         "sys_socket_connect",
         |mut caller: Caller<'_, UserState>, fd: i32, addr_ptr: u32, addr_len: u32| -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let addr = match read_user_guest_bytes(&mut caller, addr_ptr, addr_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut addr = vec![0u8; addr_len as usize];
-            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
-                return -22;
-            }
             let mut req = (fd as u32).to_le_bytes().to_vec();
             req.extend_from_slice(&addr);
             forward_request_bytes(
@@ -4137,14 +4098,10 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         SYS_NAMESPACE,
         "sys_socket_send",
         |mut caller: Caller<'_, UserState>, fd: i32, data_ptr: u32, data_len: u32| -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let data = match read_user_guest_bytes(&mut caller, data_ptr, data_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
             };
-            let mut data = vec![0u8; data_len as usize];
-            if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut data).is_err() {
-                return -22;
-            }
             let mut req = (fd as u32).to_le_bytes().to_vec();
             req.extend_from_slice(&data);
             forward_request_bytes(
@@ -4232,14 +4189,10 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         SYS_NAMESPACE,
         "sys_socket_bind",
         |mut caller: Caller<'_, UserState>, fd: i32, addr_ptr: u32, addr_len: u32| -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let addr = match read_user_guest_bytes(&mut caller, addr_ptr, addr_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut addr = vec![0u8; addr_len as usize];
-            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
-                return -22;
-            }
             let mut req = (fd as u32).to_le_bytes().to_vec();
             req.extend_from_slice(&addr);
             forward_request_bytes(
@@ -4261,18 +4214,14 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
          addr_ptr: u32,
          addr_len: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let data = match read_user_guest_bytes(&mut caller, data_ptr, data_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
             };
-            let mut data = vec![0u8; data_len as usize];
-            if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut data).is_err() {
-                return -22;
-            }
-            let mut addr = vec![0u8; addr_len as usize];
-            if addr_len > 0 && memory.read(&caller, addr_ptr as usize, &mut addr).is_err() {
-                return -22;
-            }
+            let addr = match read_user_guest_bytes(&mut caller, addr_ptr, addr_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
             let mut req = (fd as u32).to_le_bytes().to_vec();
             req.extend_from_slice(&(flags as u32).to_le_bytes());
             req.extend_from_slice(&addr_len.to_le_bytes());
@@ -4296,18 +4245,18 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
          fds_ptr: u32,
          fds_count: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let data = match read_user_guest_bytes(&mut caller, data_ptr, data_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
             };
-            let mut data = vec![0u8; data_len as usize];
-            if data_len > 0 && memory.read(&caller, data_ptr as usize, &mut data).is_err() {
-                return -22;
-            }
-            let mut fds = vec![0u8; fds_count as usize * 4];
-            if !fds.is_empty() && memory.read(&caller, fds_ptr as usize, &mut fds).is_err() {
-                return -22;
-            }
+            let fds_len = match fds_count.checked_mul(4) {
+                Some(len) => len,
+                None => return -E2BIG,
+            };
+            let fds = match read_user_guest_bytes(&mut caller, fds_ptr, fds_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
             let mut req = (fd as u32).to_le_bytes().to_vec();
             req.extend_from_slice(&data_len.to_le_bytes());
             req.extend_from_slice(&fds_count.to_le_bytes());
@@ -4335,7 +4284,19 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut req = (fd as u32).to_le_bytes().to_vec();
             req.extend_from_slice(&0u32.to_le_bytes());
             req.extend_from_slice(&out_cap.to_le_bytes());
-            let mut response = vec![0u8; out_cap as usize + 4 + fds_cap as usize * 4];
+            let fds_bytes = match fds_cap.checked_mul(4) {
+                Some(n) => n,
+                None => return -E2BIG,
+            };
+            let response_len = match checked_guest_buffer_sum(&[out_cap, 4, fds_bytes]) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let out_cap_len = match checked_guest_buffer_len(out_cap) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut response = vec![0u8; response_len];
             let rc = trampoline_request_with_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::SOCKET_RECVMSG,
@@ -4345,18 +4306,22 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             if rc < 0 {
                 return rc;
             }
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let memory = match user_memory(&mut caller) {
+                Ok(m) => m,
+                Err(rc) => return rc,
+            };
+            let rc_len = match usize::try_from(rc) {
+                Ok(n) if n <= out_cap_len => n,
+                _ => return -EFAULT,
             };
             if rc > 0
                 && memory
-                    .write(&mut caller, out_ptr as usize, &response[..rc as usize])
+                    .write(&mut caller, out_ptr as usize, &response[..rc_len])
                     .is_err()
             {
-                return -22;
+                return -EFAULT;
             }
-            let rights = &response[out_cap as usize..];
+            let rights = &response[out_cap_len..];
             let n_fds = u32::from_le_bytes(rights[0..4].try_into().expect("fd count"));
             let copy_fds = n_fds.min(fds_cap);
             if copy_fds > 0
@@ -4368,13 +4333,13 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                     )
                     .is_err()
             {
-                return -22;
+                return -EFAULT;
             }
             if memory
                 .write(&mut caller, n_fds_ptr as usize, &copy_fds.to_le_bytes())
                 .is_err()
             {
-                return -22;
+                return -EFAULT;
             }
             rc
         },
@@ -4435,14 +4400,10 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
          out_ptr: u32,
          out_cap: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
             };
-            let mut req = vec![0u8; req_len as usize];
-            if req_len > 0 && memory.read(&caller, req_ptr as usize, &mut req).is_err() {
-                return -22;
-            }
             forward_request_with_user_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::IDB_GET,
@@ -4456,14 +4417,10 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         SYS_NAMESPACE,
         "sys_idb_put",
         |mut caller: Caller<'_, UserState>, req_ptr: u32, req_len: u32| -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut req = vec![0u8; req_len as usize];
-            if req_len > 0 && memory.read(&caller, req_ptr as usize, &mut req).is_err() {
-                return -22;
-            }
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::IDB_PUT,
@@ -4475,14 +4432,10 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         SYS_NAMESPACE,
         "sys_idb_delete",
         |mut caller: Caller<'_, UserState>, req_ptr: u32, req_len: u32| -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
             };
-            let mut req = vec![0u8; req_len as usize];
-            if req_len > 0 && memory.read(&caller, req_ptr as usize, &mut req).is_err() {
-                return -22;
-            }
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::IDB_DELETE,
@@ -4499,14 +4452,10 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
          out_ptr: u32,
          out_cap: u32|
          -> i64 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
-                Some(m) => m,
-                None => return -22,
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
             };
-            let mut req = vec![0u8; req_len as usize];
-            if req_len > 0 && memory.read(&caller, req_ptr as usize, &mut req).is_err() {
-                return -22;
-            }
             forward_request_with_user_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::IDB_LIST,
@@ -4556,4 +4505,36 @@ pub fn build_kernel_wasm() -> Result<()> {
         return Err(anyhow!("cargo build of yurt-kernel-wasm failed"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_buffer_lengths_are_capped_before_allocation() {
+        assert_eq!(checked_guest_buffer_len(0), Ok(0));
+        assert_eq!(
+            checked_guest_buffer_len(MAX_GUEST_BUFFER_LEN),
+            Ok(MAX_GUEST_BUFFER_LEN as usize)
+        );
+        assert_eq!(
+            checked_guest_buffer_len(MAX_GUEST_BUFFER_LEN + 1),
+            Err(-E2BIG)
+        );
+    }
+
+    #[test]
+    fn guest_buffer_sum_checks_overflow_and_cap() {
+        assert_eq!(checked_guest_buffer_sum(&[4, 8, 16]), Ok(28));
+        assert_eq!(
+            checked_guest_buffer_sum(&[MAX_GUEST_BUFFER_LEN - 4, 4]),
+            Ok(MAX_GUEST_BUFFER_LEN as usize)
+        );
+        assert_eq!(
+            checked_guest_buffer_sum(&[MAX_GUEST_BUFFER_LEN, 1]),
+            Err(-E2BIG)
+        );
+        assert_eq!(checked_guest_buffer_sum(&[u32::MAX, 1]), Err(-E2BIG));
+    }
 }
