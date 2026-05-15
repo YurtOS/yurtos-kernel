@@ -159,6 +159,8 @@ mod sys_method_id {
     pub const SOCKET_SENDTO: u32 = 0x1_0047;
     pub const SOCKET_SENDMSG: u32 = 0x1_0048;
     pub const SOCKET_RECVMSG: u32 = 0x1_0049;
+    pub const SOCKET_INFO: u32 = 0x1_004A;
+    pub const SOCKET_RECVFROM: u32 = 0x1_004B;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -4338,6 +4340,96 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             if memory
                 .write(&mut caller, n_fds_ptr as usize, &copy_fds.to_le_bytes())
                 .is_err()
+            {
+                return -EFAULT;
+            }
+            rc
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_info",
+        |mut caller: Caller<'_, UserState>, fd: i32, out_ptr: u32| -> i64 {
+            let req = (fd as u32).to_le_bytes();
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_INFO,
+                &req,
+                out_ptr,
+                24,
+            )
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_recvfrom",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         out_ptr: u32,
+         data_cap: u32,
+         path_ptr: u32,
+         path_cap: u32,
+         flags: i32|
+         -> i64 {
+            let path_bytes = match checked_guest_buffer_len(path_cap) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let response_len = match checked_guest_buffer_sum(&[data_cap, 8, path_cap]) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let data_len = match checked_guest_buffer_len(data_cap) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut req = (fd as u32).to_le_bytes().to_vec();
+            req.extend_from_slice(&(flags as u32).to_le_bytes());
+            req.extend_from_slice(&data_cap.to_le_bytes());
+            req.extend_from_slice(&path_cap.to_le_bytes());
+            let mut response = vec![0u8; response_len];
+            let rc = trampoline_request_with_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_RECVFROM,
+                &req,
+                &mut response,
+            );
+            if rc < 0 {
+                return rc;
+            }
+            let memory = match user_memory(&mut caller) {
+                Ok(m) => m,
+                Err(rc) => return rc,
+            };
+            let data_written = match usize::try_from(rc) {
+                Ok(n) if n <= data_len => n,
+                _ => return -EFAULT,
+            };
+            if data_written > 0
+                && memory
+                    .write(&mut caller, out_ptr as usize, &response[..data_written])
+                    .is_err()
+            {
+                return -EFAULT;
+            }
+            let meta_offset = data_len;
+            let path_offset = meta_offset + 8;
+            let path_len = u32::from_le_bytes(
+                response[meta_offset..meta_offset + 4]
+                    .try_into()
+                    .expect("path len"),
+            );
+            let path_copy = (path_len as usize).min(path_bytes);
+            if path_copy > 0
+                && memory
+                    .write(
+                        &mut caller,
+                        path_ptr as usize,
+                        &response[path_offset..path_offset + path_copy],
+                    )
+                    .is_err()
             {
                 return -EFAULT;
             }

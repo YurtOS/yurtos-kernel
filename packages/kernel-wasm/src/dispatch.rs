@@ -2687,7 +2687,9 @@ fn sys_socket_recvfrom(caller_pid: u32, request: &[u8], response: &mut [u8]) -> 
     let data_cap = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) as usize;
     let path_cap = u32::from_le_bytes(request[12..16].try_into().expect("4 bytes")) as usize;
     let meta_offset = data_cap;
-    let path_offset = meta_offset + 8;
+    let Some(path_offset) = meta_offset.checked_add(8) else {
+        return -(abi::EINVAL as i64);
+    };
     if response.len() < path_offset {
         return -(abi::EINVAL as i64);
     }
@@ -5362,6 +5364,17 @@ mod tests {
         assert_eq!(path_len, b"/tmp/dgram-sender.sock".len());
         assert_eq!(is_abstract, 0);
         assert_eq!(&response[12..12 + path_len], b"/tmp/dgram-sender.sock");
+    }
+
+    #[test]
+    fn socket_recvfrom_rejects_wrapping_layout() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let request = socket_recvfrom_req(3, 0, u32::MAX, 16);
+        let mut response = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_RECVFROM, 1, &request, &mut response),
+            -(abi::EINVAL as i64)
+        );
     }
 
     #[test]

@@ -98,6 +98,11 @@ const METHOD_SYS_POLL: u32 = 0x1_0043;
 const METHOD_SYS_SOCKETPAIR: u32 = 0x1_0044;
 const METHOD_SYS_SOCKET_OPEN: u32 = 0x1_0045;
 const METHOD_SYS_SOCKET_BIND: u32 = 0x1_0046;
+const METHOD_SYS_SOCKET_SENDTO: u32 = 0x1_0047;
+const METHOD_SYS_SOCKET_SENDMSG: u32 = 0x1_0048;
+const METHOD_SYS_SOCKET_RECVMSG: u32 = 0x1_0049;
+const METHOD_SYS_SOCKET_INFO: u32 = 0x1_004A;
+const METHOD_SYS_SOCKET_RECVFROM: u32 = 0x1_004B;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -2307,6 +2312,34 @@ fn user_process_af_unix_path_stream_round_trips_through_kernel() {
 }
 
 #[test]
+fn wasmtime_registers_new_af_unix_socket_syscalls() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_socket_info" (func $socket_info (param i32 i32) (result i64)))
+          (import "env" "sys_socket_recvfrom"
+            (func $recvfrom (param i32 i32 i32 i32 i32 i32) (result i64)))
+          (memory (export "memory") 1)
+          (func (export "info") (result i32)
+            (i32.wrap_i64 (call $socket_info (i32.const 404) (i32.const 0))))
+          (func (export "recvfrom") (result i32)
+            (i32.wrap_i64
+              (call $recvfrom
+                (i32.const 404)
+                (i32.const 32)
+                (i32.const 8)
+                (i32.const 64)
+                (i32.const 108)
+                (i32.const 108)))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.call_export_i32("info").unwrap(), -9);
+    assert_eq!(user.call_export_i32("recvfrom").unwrap(), -9);
+}
+
+#[test]
 fn user_process_pipe_dup_keeps_writer_alive() {
     // dup() on a pipe end must increment the kernel-side refcount;
     // closing the original fd should not collapse the buffer.
@@ -2658,6 +2691,31 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             "sys_socket_addr",
             METHOD_SYS_SOCKET_ADDR,
             METHOD_SYS_SOCKET_ADDR as i64,
+        ),
+        (
+            "sys_socket_sendto",
+            METHOD_SYS_SOCKET_SENDTO,
+            METHOD_SYS_SOCKET_SENDTO as i64,
+        ),
+        (
+            "sys_socket_sendmsg",
+            METHOD_SYS_SOCKET_SENDMSG,
+            METHOD_SYS_SOCKET_SENDMSG as i64,
+        ),
+        (
+            "sys_socket_recvmsg",
+            METHOD_SYS_SOCKET_RECVMSG,
+            METHOD_SYS_SOCKET_RECVMSG as i64,
+        ),
+        (
+            "sys_socket_info",
+            METHOD_SYS_SOCKET_INFO,
+            METHOD_SYS_SOCKET_INFO as i64,
+        ),
+        (
+            "sys_socket_recvfrom",
+            METHOD_SYS_SOCKET_RECVFROM,
+            METHOD_SYS_SOCKET_RECVFROM as i64,
         ),
         (
             "sys_socketpair",
