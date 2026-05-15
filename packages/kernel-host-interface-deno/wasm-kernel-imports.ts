@@ -39,7 +39,6 @@ const EIO = 5;
 const EAGAIN = 11;
 const EAFNOSUPPORT = 97;
 const ENOTCONN = 107;
-const EOPNOTSUPP = 95;
 const HOST_UNIX_NOT_AF_UNIX = -1;
 const HOST_ASYNC_EAGAIN = -2;
 
@@ -964,11 +963,28 @@ export const HOST_BINDINGS: HostBinding[] = [
   },
   {
     name: "host_socket_option",
-    method: 0,
+    method: METHOD.SYS_SOCKET_OPTION,
     args: [],
-    custom: () => async () => {
-      await Promise.resolve();
-      return -EOPNOTSUPP;
+    custom: (mk, _memBuf, callerPid) =>
+    async (
+      fd: number,
+      option: number,
+      hasValue: number,
+      value: number,
+    ): Promise<number> => {
+      const req = new Uint8Array(16);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, option >>> 0, true);
+      view.setUint32(8, hasValue >>> 0, true);
+      view.setInt32(12, value | 0, true);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_OPTION,
+        callerPid,
+        req,
+        0,
+      );
+      return Number(out.rc);
     },
   },
   // host_socket_close(fd) → 0 / -errno.

@@ -440,6 +440,7 @@ pub struct SocketEntry {
     pub refs: u32,
     pub domain: u8,
     pub sock_type: u8,
+    pub no_delay: bool,
     pub kind: SocketKind,
 }
 
@@ -731,6 +732,7 @@ impl Kernel {
                 refs: 1,
                 domain,
                 sock_type,
+                no_delay: false,
                 kind: SocketKind::Host { handle },
             },
         );
@@ -746,6 +748,7 @@ impl Kernel {
                 refs: 1,
                 domain,
                 sock_type,
+                no_delay: false,
                 kind: SocketKind::Open {
                     flags,
                     bound_addr: None,
@@ -765,6 +768,7 @@ impl Kernel {
                 refs: 1,
                 domain: 1,
                 sock_type: 1,
+                no_delay: false,
                 kind: SocketKind::UnixStream {
                     peer_id: right,
                     local_path: None,
@@ -781,6 +785,7 @@ impl Kernel {
                 refs: 1,
                 domain: 1,
                 sock_type: 1,
+                no_delay: false,
                 kind: SocketKind::UnixStream {
                     peer_id: left,
                     local_path: None,
@@ -804,6 +809,7 @@ impl Kernel {
                 refs: 1,
                 domain: 1,
                 sock_type: 2,
+                no_delay: false,
                 kind: SocketKind::UnixDatagram {
                     peer_id: Some(right),
                     peer_path: None,
@@ -820,6 +826,7 @@ impl Kernel {
                 refs: 1,
                 domain: 1,
                 sock_type: 2,
+                no_delay: false,
                 kind: SocketKind::UnixDatagram {
                     peer_id: Some(left),
                     peer_path: None,
@@ -842,6 +849,7 @@ impl Kernel {
                 refs: 1,
                 domain: 1,
                 sock_type: 2,
+                no_delay: false,
                 kind: SocketKind::UnixDatagram {
                     peer_id: None,
                     peer_path: None,
@@ -928,6 +936,7 @@ impl Kernel {
                 refs: 1,
                 domain: 3,
                 sock_type: 6,
+                no_delay: false,
                 kind: SocketKind::UnixListener {
                     path: path.to_vec(),
                     backlog,

@@ -200,6 +200,7 @@ const METHOD_SYS_SOCKET_SENDMSG: u32 = 0x1_0048;
 const METHOD_SYS_SOCKET_RECVMSG: u32 = 0x1_0049;
 const METHOD_SYS_SOCKET_INFO: u32 = 0x1_004A;
 const METHOD_SYS_SOCKET_RECVFROM: u32 = 0x1_004B;
+const METHOD_SYS_SOCKET_OPTION: u32 = 0x1_004C;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -1624,9 +1625,9 @@ fn redb_kv_rejects_non_utf8_store_names_without_fallback_collision() {
     let db_path = dir.join("kv.redb");
 
     let kv = RedbKv::open(db_path).unwrap();
-    assert_eq!(kv.put(b"\xff", b"k", b"bad"), -(EINVAL as i32));
-    assert_eq!(kv.get(b"\xff", b"k").unwrap_err(), -(EINVAL as i32));
-    assert_eq!(kv.delete(b"\xff", b"k"), -(EINVAL as i32));
+    assert_eq!(kv.put(b"\xff", b"k", b"bad"), -EINVAL);
+    assert_eq!(kv.get(b"\xff", b"k").unwrap_err(), -EINVAL);
+    assert_eq!(kv.delete(b"\xff", b"k"), -EINVAL);
     assert!(kv.list(b"\xff", b"").is_empty());
 
     let _ = fs::remove_dir_all(&dir);
@@ -2660,6 +2661,60 @@ fn wasmtime_registers_new_af_unix_socket_syscalls() {
 }
 
 #[test]
+fn user_process_socket_option_round_trips_through_kernel() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_socket_open" (func $open (param i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_option"
+            (func $socket_option (param i32 i32 i32 i32) (result i32)))
+          (global $fd (mut i32) (i32.const -1))
+          (func (export "open") (result i32)
+            (global.set $fd (call $open (i32.const 2) (i32.const 1) (i32.const 0)))
+            (global.get $fd))
+          (func (export "get_initial") (result i32)
+            (call $socket_option
+              (global.get $fd)
+              (i32.const 1)
+              (i32.const 0)
+              (i32.const 0)))
+          (func (export "set_enabled") (result i32)
+            (call $socket_option
+              (global.get $fd)
+              (i32.const 1)
+              (i32.const 1)
+              (i32.const 1)))
+          (func (export "get_enabled") (result i32)
+            (call $socket_option
+              (global.get $fd)
+              (i32.const 1)
+              (i32.const 0)
+              (i32.const 0)))
+          (func (export "set_linger_advisory") (result i32)
+            (call $socket_option
+              (global.get $fd)
+              (i32.const 13)
+              (i32.const 1)
+              (i32.const 0)))
+          (func (export "get_linger_unsupported") (result i32)
+            (call $socket_option
+              (global.get $fd)
+              (i32.const 13)
+              (i32.const 0)
+              (i32.const 0))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.call_export_i32("open").unwrap(), 3);
+    assert_eq!(user.call_export_i32("get_initial").unwrap(), 0);
+    assert_eq!(user.call_export_i32("set_enabled").unwrap(), 0);
+    assert_eq!(user.call_export_i32("get_enabled").unwrap(), 1);
+    assert_eq!(user.call_export_i32("set_linger_advisory").unwrap(), 0);
+    assert_eq!(user.call_export_i32("get_linger_unsupported").unwrap(), -95);
+}
+
+#[test]
 fn wasmtime_registers_all_vfs_process_syscall_imports() {
     let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
@@ -3071,6 +3126,11 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             "sys_socket_recvfrom",
             METHOD_SYS_SOCKET_RECVFROM,
             METHOD_SYS_SOCKET_RECVFROM as i64,
+        ),
+        (
+            "sys_socket_option",
+            METHOD_SYS_SOCKET_OPTION,
+            METHOD_SYS_SOCKET_OPTION as i64,
         ),
         (
             "sys_socketpair",

@@ -67,6 +67,15 @@ fn socket_fd_req(fd: u32) -> [u8; 4] {
     fd.to_le_bytes()
 }
 
+fn socket_option_req(fd: u32, option: u32, has_value: u32, value: i32) -> [u8; 16] {
+    let mut req = [0u8; 16];
+    req[0..4].copy_from_slice(&fd.to_le_bytes());
+    req[4..8].copy_from_slice(&option.to_le_bytes());
+    req[8..12].copy_from_slice(&has_value.to_le_bytes());
+    req[12..16].copy_from_slice(&value.to_le_bytes());
+    req
+}
+
 fn socket_addr_req(fd: u32, which: u32) -> [u8; 8] {
     let mut req = [0u8; 8];
     req[0..4].copy_from_slice(&fd.to_le_bytes());
@@ -2071,6 +2080,89 @@ fn socket_sendto_rejects_wrapping_addr_len() {
     assert_eq!(
         dispatch(METHOD_SYS_SOCKET_SENDTO, 1, &request, &mut []),
         -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn socket_option_tcp_nodelay_round_trips_on_kernel_socket() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_SOCKET_OPEN,
+        1,
+        &socket_open_req(2, 1, 0),
+        &mut [],
+    ) as u32;
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(fd, 1, 0, 0),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(fd, 1, 1, 1),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(fd, 1, 0, 0),
+            &mut []
+        ),
+        1
+    );
+}
+
+#[test]
+fn socket_option_accepts_advisory_sets_but_rejects_unknown_gets() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_SOCKET_OPEN,
+        1,
+        &socket_open_req(2, 1, 0),
+        &mut [],
+    ) as u32;
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(fd, 13, 1, 0),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(fd, 13, 0, 0),
+            &mut []
+        ),
+        -(abi::EOPNOTSUPP as i64)
+    );
+}
+
+#[test]
+fn socket_option_rejects_non_socket_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(1, 1, 1, 1),
+            &mut []
+        ),
+        -(abi::ENOTSOCK as i64)
     );
 }
 

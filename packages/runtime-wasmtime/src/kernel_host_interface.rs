@@ -236,6 +236,7 @@ mod sys_method_id {
     pub const SOCKET_RECVMSG: u32 = 0x1_0049;
     pub const SOCKET_INFO: u32 = 0x1_004A;
     pub const SOCKET_RECVFROM: u32 = 0x1_004B;
+    pub const SOCKET_OPTION: u32 = 0x1_004C;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -4657,6 +4658,28 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::SOCKET_BIND,
+                &req,
+            ) as i32
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_option",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         option: i32,
+         has_value: i32,
+         value: i32|
+         -> i32 {
+            let mut req = Vec::with_capacity(16);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&(option as u32).to_le_bytes());
+            req.extend_from_slice(&(has_value as u32).to_le_bytes());
+            req.extend_from_slice(&value.to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_OPTION,
                 &req,
             ) as i32
         },

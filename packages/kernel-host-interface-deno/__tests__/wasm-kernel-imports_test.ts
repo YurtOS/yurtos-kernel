@@ -684,6 +684,35 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(new DataView(infoBuf).getInt32(84, true)).toEqual(1000);
     expect(new DataView(infoBuf).getInt32(88, true)).toEqual(1000);
 
+    const { mk: optionMk, calls: optionCalls } = capturingMk(0);
+    const optionImports = buildWasmKernelImports(
+      optionMk,
+      () => new ArrayBuffer(64),
+    );
+    expect(await optionImports.host_socket_option(9, 1, 1, -7)).toEqual(0);
+    expect(optionCalls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_OPTION,
+      responseCap: 0,
+    });
+    expect(Array.from(optionCalls.at(-1)!.request)).toEqual([
+      9,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      249,
+      255,
+      255,
+      255,
+    ]);
+
     const recvFromResponse = new Uint8Array(64);
     recvFromResponse.set(new TextEncoder().encode("pong"), 0);
     const recvFromPath = new TextEncoder().encode("/tmp/sender.sock");

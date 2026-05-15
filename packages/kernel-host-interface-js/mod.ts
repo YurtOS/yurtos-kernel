@@ -199,6 +199,7 @@ export const METHOD = {
   SYS_SOCKET_RECVMSG: 0x1_0049,
   SYS_SOCKET_INFO: 0x1_004A,
   SYS_SOCKET_RECVFROM: 0x1_004B,
+  SYS_SOCKET_OPTION: 0x1_004C,
 } as const;
 
 export const KERNEL_PID = 0;

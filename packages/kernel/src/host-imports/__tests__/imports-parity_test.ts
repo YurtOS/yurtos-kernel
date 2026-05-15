@@ -1,8 +1,4 @@
-import {
-  assert,
-  assertArrayIncludes,
-  assertEquals,
-} from "jsr:@std/assert@^1.0.19";
+import { assert, assertArrayIncludes, assertEquals } from "@std/assert";
 import { createKernelImports } from "../kernel-imports.ts";
 
 const KERNEL_IMPORTS_BASELINE = [
@@ -112,7 +108,7 @@ const ABI_IMPORT_METHODS = new Map<string, string | null>([
   ["host_socket_listen", "sys_socket_listen"],
   ["host_socket_accept", "sys_socket_accept"],
   ["host_socket_addr", "sys_socket_addr"],
-  ["host_socket_option", null],
+  ["host_socket_option", "sys_socket_option"],
   ["host_socket_close", "sys_socket_close"],
   ["host_dns_resolve", null],
   ["host_network_fetch", "sys_fetch"],
