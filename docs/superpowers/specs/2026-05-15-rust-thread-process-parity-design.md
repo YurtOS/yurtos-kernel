@@ -87,10 +87,13 @@ Required additional behavior:
   Internally the Rust kernel may keep main as tid `1` for scheduler and
   mutex-owner bookkeeping, but that value is not exposed as main
   `pthread_self()`.
-- Tids are never reused during a process lifetime. `next_tid` overflow returns
-  `-EAGAIN` from `sys_thread_spawn`; it must not wrap to an earlier tid. Stale
-  worker messages are rejected because `(pid, tid, host_thread_handle)` no
-  longer matches a live Rust thread record.
+- Guest-visible tids are limited to `1..=i32::MAX` because `sys_thread_spawn`,
+  `sys_thread_self`, and the current pthread import surface use scalar
+  success-or-negated-errno return channels. Tids are never reused during a
+  process lifetime. `next_tid > i32::MAX` returns `-EAGAIN` from
+  `sys_thread_spawn`; it must not wrap to an earlier tid or return a value that
+  looks negative through `c_int`. Stale worker messages are rejected because
+  `(pid, tid, host_thread_handle)` no longer matches a live Rust thread record.
 
 ## Caller Thread Identity
 
@@ -134,10 +137,12 @@ No JSON is introduced at the guest-to-kernel boundary.
 Add `sys_thread_*` methods to `abi/contract/yurt_abi_methods.toml` for the
 thread lifecycle surface:
 
-- `sys_thread_spawn`: request `u32 fn_ptr LE + u32 arg LE`; returns tid or
-  negated errno.
+- `sys_thread_spawn`: request `u32 fn_ptr LE + u32 arg LE`; returns a positive
+  tid in `1..=i32::MAX` or negated errno. If the next guest-visible tid would
+  exceed `i32::MAX`, returns `-EAGAIN`.
 - `sys_thread_self`: no request; returns the current guest-visible pthread id
-  derived from authenticated `caller_tid`.
+  derived from authenticated `caller_tid`; returned worker tids are always in
+  `1..=i32::MAX`, while the main thread returns compatibility id `0`.
 - `sys_thread_join`: request `u32 tid LE`; response `u32 retval LE`; returns `0`
   on success or negated errno. The return value is not sent through the scalar
   return channel because valid wasm32 pointer-sized thread return values can
@@ -276,6 +281,8 @@ Required Rust tests:
 
 - `sys_thread_spawn` allocates tid in Rust state and rolls back on host spawn
   failure.
+- `sys_thread_spawn` succeeds when `next_tid == i32::MAX`, returning `i32::MAX`,
+  and the following spawn returns `-EAGAIN`.
 - `sys_thread_detach` updates Rust state and rejects unknown tid.
 - `sys_thread_exit` records exit values and wakes/reaps according to
   joinability.
