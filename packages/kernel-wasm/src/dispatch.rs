@@ -17,6 +17,7 @@ use crate::kernel::{
     with_kernel, FdEntry, Kernel, PipeEnd, SocketEntry, SocketKind, UnixDatagramPacket,
 };
 use crate::kh;
+use crate::path::PathResolver;
 
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
 
@@ -406,12 +407,14 @@ fn chdir(caller_pid: u32, request: &[u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    // Phase 2: no VFS, no validation. Store the path verbatim.
-    // VFS-backed validation lands when overlay-vfs gets ported.
     with_kernel(|k| {
-        k.process_mut(caller_pid).cwd = request.to_vec();
-    });
-    0
+        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        k.process_mut(caller_pid).cwd = path;
+        0
+    })
 }
 
 /// `getrlimit(resource: u32) -> (soft, hard) as 16 bytes LE`.
@@ -1783,6 +1786,7 @@ pub fn spawn_cached_process(parent_pid: u32, module_id: &[u8], argv_request: &[u
     context.extend_from_slice(argv_request);
     let handle = kh::spawn_process(module_id, &context);
     if handle < 0 {
+        with_kernel(|k| k.release_host_pid_reservation(pid));
         return handle as i64;
     }
     with_kernel(|k| {
@@ -1970,127 +1974,6 @@ fn install_tar_layer(request: &[u8]) -> i64 {
     0
 }
 
-/// `/proc/self/<x>` → `/proc/<caller_pid>/<x>`. Linux convention; the
-/// expansion happens at the dispatch layer so ProcBackend doesn't need
-/// to know the caller. Path bytes aren't guaranteed UTF-8; we rewrite
-/// as raw bytes. Returns the original slice when no rewrite is needed
-/// so common-case paths don't allocate.
-fn proc_self_rewrite<'a>(caller_pid: u32, path: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
-    if let Some(suffix) = path.strip_prefix(b"/proc/self") {
-        // Match only when the next byte is `/` or end-of-path so
-        // we don't rewrite paths like "/proc/selfish".
-        if suffix.is_empty() || suffix.starts_with(b"/") {
-            let prefix = format!("/proc/{caller_pid}");
-            let mut buf = prefix.into_bytes();
-            buf.extend_from_slice(suffix);
-            return std::borrow::Cow::Owned(buf);
-        }
-    }
-    std::borrow::Cow::Borrowed(path)
-}
-
-fn join_components(components: &[Vec<u8>]) -> Vec<u8> {
-    if components.is_empty() {
-        return b"/".to_vec();
-    }
-    let mut out = Vec::new();
-    for component in components {
-        out.push(b'/');
-        out.extend_from_slice(component);
-    }
-    out
-}
-
-fn split_components(path: &[u8]) -> std::collections::VecDeque<Vec<u8>> {
-    path.split(|b| *b == b'/')
-        .filter(|part| !part.is_empty())
-        .map(|part| part.to_vec())
-        .collect()
-}
-
-fn absolute_from_cwd(cwd: &[u8], path: &[u8]) -> Vec<u8> {
-    if path.starts_with(b"/") {
-        return path.to_vec();
-    }
-    let mut out = if cwd.is_empty() {
-        b"/".to_vec()
-    } else {
-        cwd.to_vec()
-    };
-    if !out.ends_with(b"/") {
-        out.push(b'/');
-    }
-    out.extend_from_slice(path);
-    out
-}
-
-fn append_rest(mut base: Vec<u8>, rest: &std::collections::VecDeque<Vec<u8>>) -> Vec<u8> {
-    for component in rest {
-        if !base.ends_with(b"/") {
-            base.push(b'/');
-        }
-        base.extend_from_slice(component);
-    }
-    base
-}
-
-fn resolve_realpath(
-    k: &mut crate::kernel::Kernel,
-    cwd: &[u8],
-    path: &[u8],
-) -> Result<Vec<u8>, i32> {
-    if path.is_empty() || path.contains(&0) {
-        return Err(abi::EINVAL);
-    }
-    let mut pending = split_components(&absolute_from_cwd(cwd, path));
-    let mut resolved: Vec<Vec<u8>> = Vec::new();
-    let mut hops = 0u32;
-
-    while let Some(component) = pending.pop_front() {
-        if component == b"." {
-            continue;
-        }
-        if component == b".." {
-            resolved.pop();
-            continue;
-        }
-
-        let mut candidate_components = resolved.clone();
-        candidate_components.push(component.clone());
-        let candidate = join_components(&candidate_components);
-        if let Some(target) = k.vfs.readlink(&candidate) {
-            hops += 1;
-            if hops > 40 {
-                return Err(abi::EINVAL);
-            }
-            let target_path = if target.starts_with(b"/") {
-                target
-            } else {
-                let base = join_components(&resolved);
-                append_rest(base, &std::collections::VecDeque::from([target]))
-            };
-            pending = split_components(&append_rest(target_path, &pending));
-            resolved.clear();
-            continue;
-        }
-
-        let ty = k.vfs.entry_type(&candidate);
-        if ty == 0 {
-            return Err(abi::ENOENT);
-        }
-        if !pending.is_empty() && ty != 3 {
-            return Err(abi::ENOTDIR);
-        }
-        resolved.push(component);
-    }
-
-    let final_path = join_components(&resolved);
-    if k.vfs.entry_type(&final_path) == 0 {
-        return Err(abi::ENOENT);
-    }
-    Ok(final_path)
-}
-
 /// `sys_open(flags, path) -> fd`. Request: u32 flags LE + path bytes.
 /// Flags bits: 0=writable, 1=create-if-missing (O_CREAT),
 /// 2=truncate-if-exists (O_TRUNC).
@@ -2103,20 +1986,25 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
     if raw_path.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let rewritten = proc_self_rewrite(caller_pid, raw_path);
-    let path: &[u8] = &rewritten;
     let writable = flags & 0b001 != 0;
     let create = flags & 0b010 != 0;
     let trunc = flags & 0b100 != 0;
     with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(raw_path) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
         // Refresh procfs snapshots so /proc/<N>/status reflects the
         // current process table at open time.
         k.publish_proc_snapshots();
+        if !k.can_read_proc_path(caller_pid, &path) {
+            return -(abi::EPERM as i64);
+        }
         // Symlink resolution: walk the path through readlink up to
         // 40 hops (POSIX SYMLOOP_MAX). Each hop replaces the path
         // verbatim — Phase 7 only handles final-component
         // symlinks; intermediate-dir resolution comes with mkdir.
-        let mut resolved: Vec<u8> = path.to_vec();
+        let mut resolved: Vec<u8> = path;
         let mut hops = 0u32;
         while let Some(target) = k.vfs.readlink(&resolved) {
             hops += 1;
@@ -2241,8 +2129,13 @@ fn mkdir(caller_pid: u32, request: &[u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let path = proc_self_rewrite(caller_pid, request);
-    with_kernel(|k| k.vfs.mkdir(&path) as i64)
+    with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        k.vfs.mkdir(&path) as i64
+    })
 }
 
 /// `rmdir(path) -> 0 / -ENOENT / -ENOTEMPTY / -EROFS`.
@@ -2250,8 +2143,13 @@ fn rmdir(caller_pid: u32, request: &[u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let path = proc_self_rewrite(caller_pid, request);
-    with_kernel(|k| k.vfs.rmdir(&path) as i64)
+    with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        k.vfs.rmdir(&path) as i64
+    })
 }
 
 /// `readdir(path) -> packed entries`. Response layout:
@@ -2264,8 +2162,11 @@ fn readdir(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if response.len() < 4 {
         return -(abi::EINVAL as i64);
     }
-    let path = proc_self_rewrite(caller_pid, request);
     with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
         let entries = match k.vfs.readdir(&path) {
             Some(e) => e,
             None => return -(abi::ENOENT as i64),
@@ -2323,8 +2224,13 @@ fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
     // Symlink target stays verbatim — it's content, not a path
     // resolved at install time. Only link_path goes through the
     // /proc/self rewrite.
-    let link_path = proc_self_rewrite(caller_pid, link_path_raw);
-    with_kernel(|k| k.vfs.symlink(target, &link_path) as i64)
+    with_kernel(|k| {
+        let link_path = match PathResolver::new(k, caller_pid).normalize(link_path_raw) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        k.vfs.symlink(target, &link_path) as i64
+    })
 }
 
 /// `sys_idb_get(store, key) -> bytes`. Request: u8 store_len +
@@ -3061,7 +2967,6 @@ fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
     if raw_path.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let path = proc_self_rewrite(caller_pid, raw_path);
     // Decode argv list from the trailing bytes.
     let mut argv: Vec<Vec<u8>> = Vec::new();
     let mut cursor = 4 + path_len;
@@ -3077,8 +2982,12 @@ fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
     }
 
     with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(raw_path) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
         // Read the image bytes from VFS.
-        let mut exec_path: Vec<u8> = path.to_vec();
+        let mut exec_path: Vec<u8> = path;
         let mut hops = 0u32;
         while let Some(target) = k.vfs.readlink(&exec_path) {
             hops += 1;
@@ -3214,9 +3123,17 @@ fn rename(caller_pid: u32, request: &[u8]) -> i64 {
     if new_raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let old_path = proc_self_rewrite(caller_pid, old_raw);
-    let new_path = proc_self_rewrite(caller_pid, new_raw);
-    with_kernel(|k| k.vfs.rename(&old_path, &new_path) as i64)
+    with_kernel(|k| {
+        let old_path = match PathResolver::new(k, caller_pid).normalize(old_raw) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        let new_path = match PathResolver::new(k, caller_pid).normalize(new_raw) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        k.vfs.rename(&old_path, &new_path) as i64
+    })
 }
 
 /// `link(target_len, target, link_path)`. Same wire format as
@@ -3235,9 +3152,17 @@ fn hard_link(caller_pid: u32, request: &[u8]) -> i64 {
     if link_raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let target = proc_self_rewrite(caller_pid, target_raw);
-    let link_path = proc_self_rewrite(caller_pid, link_raw);
-    with_kernel(|k| k.vfs.link(&target, &link_path) as i64)
+    with_kernel(|k| {
+        let target = match PathResolver::new(k, caller_pid).normalize(target_raw) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        let link_path = match PathResolver::new(k, caller_pid).normalize(link_raw) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        k.vfs.link(&target, &link_path) as i64
+    })
 }
 
 /// `readlink(path) -> bytes-written or -ENOENT/-EINVAL`. Writes
@@ -3247,8 +3172,11 @@ fn readlink(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let path = proc_self_rewrite(caller_pid, request);
     with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
         let Some(target) = k.vfs.readlink(&path) else {
             return -(abi::EINVAL as i64);
         };
@@ -3263,10 +3191,8 @@ fn readlink(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
 /// required byte count, including the trailing NUL, even when the
 /// caller's output buffer is too small.
 fn realpath(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
-    let path = proc_self_rewrite(caller_pid, request);
     with_kernel(|k| {
-        let cwd = k.process(caller_pid).cwd.clone();
-        let resolved = match resolve_realpath(k, &cwd, &path) {
+        let resolved = match PathResolver::new(k, caller_pid).realpath(request) {
             Ok(path) => path,
             Err(errno) => return -(errno as i64),
         };
@@ -3287,8 +3213,11 @@ fn unlink(caller_pid: u32, request: &[u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let path = proc_self_rewrite(caller_pid, request);
     with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
         let removed_socket = k.unlink_unix_socket_inode(&path);
         let rc = k.vfs.unlink(&path);
         if rc == -(abi::ENOENT) && removed_socket {
@@ -3309,8 +3238,11 @@ fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
-    let path = proc_self_rewrite(caller_pid, request);
     with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
         if k.has_unix_socket_inode(&path) {
             response[0..8].copy_from_slice(&0u64.to_le_bytes());
             response[8..12].copy_from_slice(&6u32.to_le_bytes());
@@ -3348,8 +3280,11 @@ fn chown(caller_pid: u32, request: &[u8]) -> i64 {
     if raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let path = proc_self_rewrite(caller_pid, raw);
     with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(raw) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
         let (mount_id, inode) = match k.vfs.open(&path, 0) {
             Some(pair) => pair,
             None => return -(abi::ENOENT as i64),
@@ -3381,8 +3316,11 @@ fn utimens(caller_pid: u32, request: &[u8]) -> i64 {
     if raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let path = proc_self_rewrite(caller_pid, raw);
     with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(raw) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
         let (mount_id, inode) = match k.vfs.open(&path, 0) {
             Some(pair) => pair,
             None => return -(abi::ENOENT as i64),
@@ -3410,8 +3348,11 @@ fn chmod(caller_pid: u32, request: &[u8]) -> i64 {
     if raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    let path = proc_self_rewrite(caller_pid, raw);
     with_kernel(|k| {
+        let path = match PathResolver::new(k, caller_pid).normalize(raw) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
         let (mount_id, inode) = match k.vfs.open(&path, 0) {
             Some(pair) => pair,
             None => return -(abi::ENOENT as i64),
@@ -7086,6 +7027,77 @@ mod tests {
     }
 
     #[test]
+    fn path_syscalls_normalize_parent_components_for_existing_paths() {
+        let _g = crate::kernel::TestGuard::acquire();
+        make_root(1);
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&7_u32.to_le_bytes());
+        reg.extend_from_slice(b"/target");
+        reg.extend_from_slice(b"payload");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/tmp/../target"), &mut []);
+        assert!(fd >= 0, "open through parent components failed: {fd}");
+
+        let mut stat = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_STAT, 1, b"/tmp/../target", &mut stat),
+            16
+        );
+
+        let mut chmod_req = 0o600_u32.to_le_bytes().to_vec();
+        chmod_req.extend_from_slice(b"/tmp/../target");
+        assert_eq!(dispatch(METHOD_SYS_CHMOD, 1, &chmod_req, &mut []), 0);
+
+        assert_eq!(
+            dispatch(METHOD_SYS_UNLINK, 1, b"/tmp/../target", &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/target"), &mut []),
+            -(abi::ENOENT as i64)
+        );
+    }
+
+    #[test]
+    fn path_syscalls_normalize_parent_components_for_created_paths() {
+        let _g = crate::kernel::TestGuard::acquire();
+
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp", &mut []), 0);
+        let fd = dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, b"/tmp/../made"),
+            &mut [],
+        );
+        assert!(fd >= 0, "create through parent components failed: {fd}");
+        assert!(
+            dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/made"), &mut []) >= 0,
+            "created file should live at normalized path"
+        );
+
+        let mut rename_req = (b"/made".len() as u32).to_le_bytes().to_vec();
+        rename_req.extend_from_slice(b"/made");
+        rename_req.extend_from_slice(b"/tmp/../renamed");
+        assert_eq!(dispatch(METHOD_SYS_RENAME, 1, &rename_req, &mut []), 0);
+        assert!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/renamed"), &mut []) >= 0);
+
+        let mut link_req = (b"/renamed".len() as u32).to_le_bytes().to_vec();
+        link_req.extend_from_slice(b"/renamed");
+        link_req.extend_from_slice(b"/tmp/../linked");
+        assert_eq!(dispatch(METHOD_SYS_LINK, 1, &link_req, &mut []), 0);
+        assert!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/linked"), &mut []) >= 0);
+
+        let mut symlink_req = (b"/renamed".len() as u32).to_le_bytes().to_vec();
+        symlink_req.extend_from_slice(b"/renamed");
+        symlink_req.extend_from_slice(b"/tmp/../alias");
+        assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &symlink_req, &mut []), 0);
+        let mut out = [0u8; 32];
+        let n = dispatch(METHOD_SYS_READLINK, 1, b"/alias", &mut out);
+        assert_eq!(&out[..n as usize], b"/renamed");
+    }
+
+    #[test]
     fn write_to_readonly_open_is_ebadf() {
         let _g = crate::kernel::TestGuard::acquire();
         let mut reg = Vec::new();
@@ -7281,6 +7293,22 @@ mod tests {
             text.contains("Uid:\t500\t501"),
             "uid update missing: {text}"
         );
+    }
+
+    #[test]
+    fn proc_other_pid_requires_same_process_or_root() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let argv = set_argv_req(2, &[b"/bin/other"]);
+        set_argv(&argv);
+
+        assert_eq!(
+            dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/proc/2/status"), &mut []),
+            -(abi::EPERM as i64)
+        );
+        assert!(dispatch(METHOD_SYS_OPEN, 2, &open_req(0, b"/proc/2/status"), &mut []) >= 0);
+
+        make_root(1);
+        assert!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/proc/2/status"), &mut []) >= 0);
     }
 
     #[test]
@@ -8942,6 +8970,21 @@ mod tests {
         let mut reg = 1_u32.to_le_bytes().to_vec();
         reg.extend_from_slice(&7_u32.to_le_bytes());
         assert_eq!(dispatch(13, 0, &reg, &mut []), -(abi::ENOSYS as i64));
+    }
+
+    #[test]
+    fn failed_cached_spawn_releases_reserved_host_pid() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut argv = Vec::new();
+        argv.extend_from_slice(&7_u32.to_le_bytes());
+        argv.extend_from_slice(b"/bin/wc");
+
+        assert_eq!(
+            spawn_cached_process(0, b"module", &argv),
+            -(abi::ENOSYS as i64)
+        );
+        let next_pid = crate::kernel::with_kernel(|k| k.try_alloc_host_pid());
+        assert_eq!(next_pid, Some(1));
     }
 
     #[test]

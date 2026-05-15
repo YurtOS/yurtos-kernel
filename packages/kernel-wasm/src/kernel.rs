@@ -573,6 +573,15 @@ impl Kernel {
         None
     }
 
+    /// Return an uncommitted low pid reservation to the allocator.
+    /// This is used when the host rejects a spawn after the kernel has
+    /// already put the reserved pid in the spawn context.
+    pub fn release_host_pid_reservation(&mut self, pid: Pid) {
+        if (1..1000).contains(&pid) && !self.processes.contains_key(&pid) {
+            self.next_host_pid = pid;
+        }
+    }
+
     /// Test-only convenience wrapper for low-pid allocation paths
     /// where exhaustion is impossible by construction. Production
     /// paths use [`Kernel::try_alloc_host_pid`] and map exhaustion to
@@ -1073,6 +1082,19 @@ impl Kernel {
             })
             .collect();
         self.vfs.refresh_processes(&snaps);
+    }
+
+    pub fn can_read_proc_path(&mut self, caller_pid: Pid, path: &[u8]) -> bool {
+        let Some(target_pid) = crate::path::proc_target_pid(path) else {
+            return true;
+        };
+        if target_pid == caller_pid {
+            return true;
+        }
+        if !self.has_process(target_pid) {
+            return true;
+        }
+        self.process(caller_pid).credentials.euid == 0
     }
 
     pub fn list_processes(&self) -> Vec<ProcessListEntry> {

@@ -17,6 +17,7 @@ mod abi;
 mod dispatch;
 mod kernel;
 mod kh;
+mod path;
 mod state;
 mod vfs;
 
