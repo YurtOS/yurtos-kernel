@@ -98,14 +98,194 @@ fn sort_indices(
     compar: QsortRComparator,
     arg: *mut c_void,
 ) {
-    indices.sort_unstable_by(|left, right| {
-        let rc = compar(
-            elem(base, *left, size).cast_const().cast(),
-            elem(base, *right, size).cast_const().cast(),
-            arg,
-        );
-        rc.cmp(&0)
-    });
+    quicksort_indices(indices, base, size, compar, arg);
+    insertion_sort_indices(indices, base, size, compar, arg);
+}
+
+const INSERTION_SORT_THRESHOLD: usize = 16;
+
+fn compare_element_indices(
+    left: usize,
+    right: usize,
+    base: *mut u8,
+    size: usize,
+    compar: QsortRComparator,
+    arg: *mut c_void,
+) -> c_int {
+    compar(
+        elem(base, left, size).cast_const().cast(),
+        elem(base, right, size).cast_const().cast(),
+        arg,
+    )
+}
+
+fn index_at(indices: &[usize], pos: usize) -> usize {
+    // SAFETY: all callers compute `pos` inside the active sort range.
+    unsafe { *indices.as_ptr().add(pos) }
+}
+
+fn set_index(indices: &mut [usize], pos: usize, value: usize) {
+    // SAFETY: all callers compute `pos` inside the active sort range.
+    unsafe {
+        *indices.as_mut_ptr().add(pos) = value;
+    }
+}
+
+fn swap_indices(indices: &mut [usize], left: usize, right: usize) {
+    if left == right {
+        return;
+    }
+    let left_value = index_at(indices, left);
+    let right_value = index_at(indices, right);
+    set_index(indices, left, right_value);
+    set_index(indices, right, left_value);
+}
+
+fn less_at(
+    indices: &[usize],
+    left: usize,
+    right: usize,
+    base: *mut u8,
+    size: usize,
+    compar: QsortRComparator,
+    arg: *mut c_void,
+) -> bool {
+    compare_element_indices(
+        index_at(indices, left),
+        index_at(indices, right),
+        base,
+        size,
+        compar,
+        arg,
+    ) < 0
+}
+
+fn median_of_three(
+    indices: &mut [usize],
+    lo: usize,
+    mid: usize,
+    hi: usize,
+    base: *mut u8,
+    size: usize,
+    compar: QsortRComparator,
+    arg: *mut c_void,
+) {
+    if less_at(indices, mid, lo, base, size, compar, arg) {
+        swap_indices(indices, lo, mid);
+    }
+    if less_at(indices, hi, mid, base, size, compar, arg) {
+        swap_indices(indices, mid, hi);
+    }
+    if less_at(indices, mid, lo, base, size, compar, arg) {
+        swap_indices(indices, lo, mid);
+    }
+}
+
+fn partition_indices(
+    indices: &mut [usize],
+    lo: usize,
+    hi: usize,
+    base: *mut u8,
+    size: usize,
+    compar: QsortRComparator,
+    arg: *mut c_void,
+) -> usize {
+    let mid = lo + ((hi - lo) / 2);
+    let last = hi - 1;
+    median_of_three(indices, lo, mid, last, base, size, compar, arg);
+    swap_indices(indices, mid, last);
+    let pivot = index_at(indices, last);
+    let mut store = lo;
+
+    for scan in lo..last {
+        if compare_element_indices(index_at(indices, scan), pivot, base, size, compar, arg) < 0 {
+            swap_indices(indices, store, scan);
+            store += 1;
+        }
+    }
+    swap_indices(indices, store, last);
+    store
+}
+
+fn quicksort_indices(
+    indices: &mut [usize],
+    base: *mut u8,
+    size: usize,
+    compar: QsortRComparator,
+    arg: *mut c_void,
+) {
+    let mut stack = [(0usize, 0usize); 64];
+    let mut depth = 0usize;
+    let mut lo = 0usize;
+    let mut hi = indices.len();
+
+    loop {
+        while hi.saturating_sub(lo) > INSERTION_SORT_THRESHOLD {
+            let pivot = partition_indices(indices, lo, hi, base, size, compar, arg);
+            let left_len = pivot - lo;
+            let right_lo = pivot + 1;
+            let right_len = hi - right_lo;
+
+            if left_len < right_len {
+                if right_len > INSERTION_SORT_THRESHOLD {
+                    set_stack_range(&mut stack, depth, (right_lo, hi));
+                    depth += 1;
+                }
+                hi = pivot;
+            } else {
+                if left_len > INSERTION_SORT_THRESHOLD {
+                    set_stack_range(&mut stack, depth, (lo, pivot));
+                    depth += 1;
+                }
+                lo = right_lo;
+            }
+        }
+
+        if depth == 0 {
+            break;
+        }
+        depth -= 1;
+        let (next_lo, next_hi) = stack_range(&stack, depth);
+        lo = next_lo;
+        hi = next_hi;
+    }
+}
+
+fn set_stack_range(stack: &mut [(usize, usize); 64], pos: usize, value: (usize, usize)) {
+    debug_assert!(pos < stack.len());
+    // SAFETY: quicksort always pushes the larger partition and continues with
+    // the smaller one, so the stack depth is bounded by log2(usize::MAX) < 64.
+    unsafe {
+        *stack.as_mut_ptr().add(pos) = value;
+    }
+}
+
+fn stack_range(stack: &[(usize, usize); 64], pos: usize) -> (usize, usize) {
+    debug_assert!(pos < stack.len());
+    // SAFETY: callers only pop ranges previously written by `set_stack_range`.
+    unsafe { *stack.as_ptr().add(pos) }
+}
+
+fn insertion_sort_indices(
+    indices: &mut [usize],
+    base: *mut u8,
+    size: usize,
+    compar: QsortRComparator,
+    arg: *mut c_void,
+) {
+    for pos in 1..indices.len() {
+        let value = index_at(indices, pos);
+        let mut insert = pos;
+        while insert > 0
+            && compare_element_indices(value, index_at(indices, insert - 1), base, size, compar, arg)
+                < 0
+        {
+            let previous = index_at(indices, insert - 1);
+            set_index(indices, insert, previous);
+            insert -= 1;
+        }
+        set_index(indices, insert, value);
+    }
 }
 
 fn write_sorted_copy(base: *mut u8, indices: &[usize], size: usize, sorted: *mut u8) {
@@ -226,9 +406,10 @@ mod tests {
     }
 
     #[test]
-    fn qsort_r_uses_rust_slice_sort() {
+    fn qsort_r_avoids_core_slice_sort_runtime_symbols() {
         let source = include_str!("sort.rs");
-        assert!(source.contains("sort_unstable_by"));
+        let forbidden = ["sort", "_", "unstable", "_", "by"].concat();
+        assert!(!source.contains(&forbidden));
     }
 
     #[test]
