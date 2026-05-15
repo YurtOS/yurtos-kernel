@@ -422,6 +422,7 @@ pub enum SocketKind {
     },
     UnixDatagram {
         peer_id: Option<u64>,
+        peer_path: Option<Vec<u8>>,
         bound_path: Option<Vec<u8>>,
         rx: VecDeque<UnixDatagramPacket>,
         rights: VecDeque<Vec<FdEntry>>,
@@ -787,6 +788,7 @@ impl Kernel {
                 sock_type: 2,
                 kind: SocketKind::UnixDatagram {
                     peer_id: Some(right),
+                    peer_path: None,
                     bound_path: None,
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
@@ -802,6 +804,7 @@ impl Kernel {
                 sock_type: 2,
                 kind: SocketKind::UnixDatagram {
                     peer_id: Some(left),
+                    peer_path: None,
                     bound_path: None,
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
@@ -823,6 +826,7 @@ impl Kernel {
                 sock_type: 2,
                 kind: SocketKind::UnixDatagram {
                     peer_id: None,
+                    peer_path: None,
                     bound_path: None,
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
@@ -868,8 +872,13 @@ impl Kernel {
             return Err(crate::abi::EBADF);
         };
         match &mut socket.kind {
-            SocketKind::UnixDatagram { peer_id: slot, .. } => {
-                *slot = Some(peer_id);
+            SocketKind::UnixDatagram {
+                peer_id: id_slot,
+                peer_path,
+                ..
+            } => {
+                *id_slot = Some(peer_id);
+                *peer_path = Some(path.to_vec());
                 Ok(())
             }
             _ => Err(crate::abi::EOPNOTSUPP),

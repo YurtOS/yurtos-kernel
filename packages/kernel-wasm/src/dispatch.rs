@@ -2481,13 +2481,18 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
                 }
             }
             Some(SocketEntry {
-                kind: SocketKind::UnixDatagram { bound_path, .. },
+                kind:
+                    SocketKind::UnixDatagram {
+                        bound_path,
+                        peer_path,
+                        ..
+                    },
                 ..
             }) => {
                 if which == 0 {
                     Ok(bound_path.clone())
                 } else {
-                    Ok(None)
+                    Ok(peer_path.clone())
                 }
             }
             Some(SocketEntry {
@@ -5321,6 +5326,46 @@ mod tests {
             4
         );
         assert_eq!(&response[..4], b"ping");
+    }
+
+    #[test]
+    fn af_unix_datagram_getpeername_reports_connected_path() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            3
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            4
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(3, b"unix:/tmp/dgram-peername-server.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_CONNECT,
+                1,
+                &socket_connect_req(4, b"unix:/tmp/dgram-peername-server.sock"),
+                &mut []
+            ),
+            0
+        );
+
+        let mut path = [0u8; 108];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_addr_req(4, 1), &mut path),
+            31
+        );
+        assert_eq!(&path[..31], b"/tmp/dgram-peername-server.sock");
     }
 
     #[test]

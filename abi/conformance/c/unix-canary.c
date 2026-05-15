@@ -441,6 +441,8 @@ static int case_dgram_path_sendto(void) {
 static int case_dgram_connect_send(void) {
   const char *server_path = "/tmp/yurt-dgram-connect.sock";
   struct sockaddr_un server_addr;
+  struct sockaddr_un got;
+  socklen_t got_len;
   int server_fd, client_fd;
   char buf[16];
 
@@ -464,6 +466,14 @@ static int case_dgram_connect_send(void) {
   }
   if (connect(client_fd, (struct sockaddr *)&server_addr, addrlen) != 0) {
     emit("dgram_connect_send", 1, "connect-fail", 1, errno);
+    close(server_fd); close(client_fd); unlink(server_path); return 1;
+  }
+  memset(&got, 0, sizeof(got));
+  got_len = sizeof(got);
+  if (getpeername(client_fd, (struct sockaddr *)&got, &got_len) != 0 ||
+      got.sun_family != AF_UNIX ||
+      strcmp(got.sun_path, server_path) != 0) {
+    emit("dgram_connect_send", 1, "peername-fail", 1, errno);
     close(server_fd); close(client_fd); unlink(server_path); return 1;
   }
   if (send(client_fd, "ping", 4, 0) != 4) {
