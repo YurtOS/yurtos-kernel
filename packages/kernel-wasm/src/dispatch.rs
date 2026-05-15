@@ -921,6 +921,10 @@ fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>)
             if !*peer_open {
                 -(abi::EPIPE as i64)
             } else {
+                let source_path = k.socket(id).and_then(|socket| match &socket.kind {
+                    SocketKind::UnixDatagram { bound_path, .. } => bound_path.clone(),
+                    _ => None,
+                });
                 let Some(peer) = k.socket_mut(*peer_id) else {
                     return -(abi::EPIPE as i64);
                 };
@@ -932,7 +936,6 @@ fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>)
                 {
                     -(abi::EAGAIN as i64)
                 } else {
-                    let source_path = None;
                     rx.push_back(UnixDatagramPacket {
                         data: data.to_vec(),
                         source_path,
@@ -5459,6 +5462,76 @@ mod tests {
             4
         );
         assert_eq!(&response[..4], b"ping");
+    }
+
+    #[test]
+    fn af_unix_datagram_sendmsg_preserves_sender_path_for_recvfrom() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            3
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            4
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(3, b"unix:/tmp/dgram-sendmsg-server.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(4, b"unix:/tmp/dgram-sendmsg-client.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_CONNECT,
+                1,
+                &socket_connect_req(4, b"unix:/tmp/dgram-sendmsg-server.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SENDMSG,
+                1,
+                &socket_sendmsg_req(4, b"ping", &[]),
+                &mut []
+            ),
+            4
+        );
+
+        let mut response = [0u8; 4 + 8 + 108];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECVFROM,
+                1,
+                &socket_recvfrom_req(3, 0, 4, 108),
+                &mut response
+            ),
+            4
+        );
+        let path_len = u32::from_le_bytes(response[4..8].try_into().unwrap()) as usize;
+        let is_abstract = u32::from_le_bytes(response[8..12].try_into().unwrap());
+        assert_eq!(path_len, b"/tmp/dgram-sendmsg-client.sock".len());
+        assert_eq!(is_abstract, 0);
+        assert_eq!(
+            &response[12..12 + path_len],
+            b"/tmp/dgram-sendmsg-client.sock"
+        );
     }
 
     #[test]

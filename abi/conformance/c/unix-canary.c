@@ -572,6 +572,81 @@ static int case_dgram_reconnect_after_close(void) {
   return 1;
 }
 
+static int case_dgram_sendmsg_recvfrom_source(void) {
+  const char *server_path = "/tmp/yurt-dgram-sendmsg-server.sock";
+  const char *client_path = "/tmp/yurt-dgram-sendmsg-client.sock";
+  struct sockaddr_un server_addr;
+  struct sockaddr_un client_addr;
+  struct sockaddr_un src_addr;
+  socklen_t src_len = sizeof(src_addr);
+  int server_fd, client_fd;
+  char buf[16];
+  char payload[] = "ping";
+  struct msghdr msg;
+  struct iovec iov;
+
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sun_family = AF_UNIX;
+  strncpy(server_addr.sun_path, server_path, sizeof(server_addr.sun_path) - 1);
+  memset(&client_addr, 0, sizeof(client_addr));
+  client_addr.sun_family = AF_UNIX;
+  strncpy(client_addr.sun_path, client_path, sizeof(client_addr.sun_path) - 1);
+
+  server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (server_fd < 0) {
+    emit("dgram_sendmsg_recvfrom_source", 1, "server-socket-fail", 1, errno);
+    return 1;
+  }
+  client_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (client_fd < 0) {
+    emit("dgram_sendmsg_recvfrom_source", 1, "client-socket-fail", 1, errno);
+    close(server_fd);
+    return 1;
+  }
+
+  unlink(server_path);
+  unlink(client_path);
+  if (bind(server_fd, (struct sockaddr *)&server_addr, (socklen_t)sizeof(server_addr)) != 0 ||
+      bind(client_fd, (struct sockaddr *)&client_addr, (socklen_t)sizeof(client_addr)) != 0) {
+    emit("dgram_sendmsg_recvfrom_source", 1, "bind-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    unlink(server_path); unlink(client_path);
+    return 1;
+  }
+  if (connect(client_fd, (struct sockaddr *)&server_addr, (socklen_t)sizeof(server_addr)) != 0) {
+    emit("dgram_sendmsg_recvfrom_source", 1, "connect-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    unlink(server_path); unlink(client_path);
+    return 1;
+  }
+
+  memset(&msg, 0, sizeof(msg));
+  iov.iov_base = payload;
+  iov.iov_len = 4;
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  if (sendmsg(client_fd, &msg, 0) != 4) {
+    emit("dgram_sendmsg_recvfrom_source", 1, "sendmsg-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    unlink(server_path); unlink(client_path);
+    return 1;
+  }
+
+  ssize_t n = recvfrom(server_fd, buf, sizeof(buf), 0,
+                       (struct sockaddr *)&src_addr, &src_len);
+  close(server_fd); close(client_fd);
+  unlink(server_path); unlink(client_path);
+
+  if (n == 4 && memcmp(buf, "ping", 4) == 0 &&
+      src_addr.sun_family == AF_UNIX &&
+      strcmp(src_addr.sun_path, client_path) == 0) {
+    emit("dgram_sendmsg_recvfrom_source", 0, "sendmsg-source=ok", 0, 0);
+    return 0;
+  }
+  emit("dgram_sendmsg_recvfrom_source", 1, "recvfrom-fail", 1, errno);
+  return 1;
+}
+
 static int case_scm_rights_pipe_handoff(void) {
   int sv[2];
   int pipefd[2];
@@ -1335,6 +1410,8 @@ static int run_case(const char *name) {
   if (strcmp(name, "getpeername_unconnected") == 0)    return case_getpeername_unconnected();
   if (strcmp(name, "dgram_reconnect_after_close") == 0)
     return case_dgram_reconnect_after_close();
+  if (strcmp(name, "dgram_sendmsg_recvfrom_source") == 0)
+    return case_dgram_sendmsg_recvfrom_source();
   if (strcmp(name, "scm_rights_pipe_handoff") == 0)    return case_scm_rights_pipe_handoff();
   if (strcmp(name, "peercred_after_accept") == 0)      return case_peercred_after_accept();
   if (strcmp(name, "dgram_sendto_after_unlink") == 0)  return case_dgram_sendto_after_unlink();
@@ -1367,6 +1444,7 @@ static int list_cases(void) {
   puts("dgram_connect_send");
   puts("getpeername_unconnected");
   puts("dgram_reconnect_after_close");
+  puts("dgram_sendmsg_recvfrom_source");
   puts("scm_rights_pipe_handoff");
   puts("peercred_after_accept");
   puts("dgram_sendto_after_unlink");
