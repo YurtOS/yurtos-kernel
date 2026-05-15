@@ -428,6 +428,11 @@ id = 0x1_0049
 kind = "syscall"
 doc = "Receive payload bytes and optional SCM_RIGHTS fd entries from a kernel-owned AF_UNIX socket. Request bytes: u32 fd LE + u32 flags LE + u32 data_cap LE. Response bytes: data_cap payload area followed by u32 fd_count LE + fd_count*u32 received fd numbers. Return value is payload byte count."
 
+[method.sys_socket_info]
+id = 0x1_004A
+kind = "syscall"
+doc = "Return metadata for a caller-owned socket fd. Request bytes: u32 fd LE. Response: u32 domain, u32 sock_type, u32 flags, i32 peer_pid, u32 peer_uid, u32 peer_gid. Returns 24 on success or a negated errno."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"

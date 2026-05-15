@@ -646,6 +646,29 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     )).toEqual("yurt-abstract");
     expect(new DataView(abstractAddrBuf).getInt32(64, true)).toEqual(1);
 
+    const socketInfo = new Uint8Array(24);
+    const socketInfoView = new DataView(socketInfo.buffer);
+    socketInfoView.setUint32(0, 3, true); // AF_UNIX
+    socketInfoView.setUint32(4, 5, true); // SOCK_DGRAM in WASI libc
+    socketInfoView.setUint32(8, 0, true);
+    socketInfoView.setInt32(12, 1234, true);
+    socketInfoView.setUint32(16, 1000, true);
+    socketInfoView.setUint32(20, 1000, true);
+    const { mk: infoMk, calls: infoCalls } = capturingMk(24, socketInfo);
+    const infoBuf = new ArrayBuffer(128);
+    const infoImports = buildWasmKernelImports(infoMk, () => infoBuf);
+    expect(await infoImports.host_socket_is_dgram(9)).toEqual(1);
+    expect(infoCalls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_INFO,
+      responseCap: 24,
+    });
+    expect(Array.from(infoCalls.at(-1)!.request)).toEqual([9, 0, 0, 0]);
+
+    expect(await infoImports.host_socket_peercred(9, 80, 84, 88)).toEqual(0);
+    expect(new DataView(infoBuf).getInt32(80, true)).toEqual(1234);
+    expect(new DataView(infoBuf).getInt32(84, true)).toEqual(1000);
+    expect(new DataView(infoBuf).getInt32(88, true)).toEqual(1000);
+
     await imports.host_socket_close(9);
     expect(calls.at(-1)).toMatchObject({
       method: METHOD.SYS_SOCKET_CLOSE,

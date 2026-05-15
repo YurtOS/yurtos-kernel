@@ -874,20 +874,63 @@ export const HOST_BINDINGS: HostBinding[] = [
   },
   {
     name: "host_socket_is_dgram",
-    method: 0,
+    method: METHOD.SYS_SOCKET_INFO,
     args: [],
-    custom: () => async () => {
-      await Promise.resolve();
-      return -EIO;
+    custom: (mk, _memBuf, callerPid) => async (fd: number) => {
+      const req = new Uint8Array(4);
+      new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_INFO,
+        callerPid,
+        req,
+        24,
+      );
+      if (Number(out.rc) !== 24 || out.response.byteLength < 8) return -1;
+      const sockType = new DataView(
+        out.response.buffer,
+        out.response.byteOffset,
+        out.response.byteLength,
+      ).getUint32(4, true);
+      return sockType === 2 || sockType === 5 ? 1 : 0;
     },
   },
   {
     name: "host_socket_peercred",
-    method: 0,
+    method: METHOD.SYS_SOCKET_INFO,
     args: [],
-    custom: () => async () => {
-      await Promise.resolve();
-      return -EIO;
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      pidPtr: number,
+      uidPtr: number,
+      gidPtr: number,
+    ): Promise<number> => {
+      const req = new Uint8Array(4);
+      new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_INFO,
+        callerPid,
+        req,
+        24,
+      );
+      if (Number(out.rc) !== 24 || out.response.byteLength < 24) return -1;
+      const view = new DataView(
+        out.response.buffer,
+        out.response.byteOffset,
+        out.response.byteLength,
+      );
+      const record = new Uint8Array(4);
+      const recordView = new DataView(record.buffer);
+      recordView.setInt32(0, view.getInt32(12, true), true);
+      let outRc = copyOut(memBuf, pidPtr, record);
+      if (outRc < 0) return outRc;
+      recordView.setInt32(0, view.getUint32(16, true), true);
+      outRc = copyOut(memBuf, uidPtr, record);
+      if (outRc < 0) return outRc;
+      recordView.setInt32(0, view.getUint32(20, true), true);
+      outRc = copyOut(memBuf, gidPtr, record);
+      if (outRc < 0) return outRc;
+      return 0;
     },
   },
   {

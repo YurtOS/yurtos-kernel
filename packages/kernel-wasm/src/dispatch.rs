@@ -134,6 +134,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SOCKET_LISTEN => sys_socket_listen(caller_pid, request),
         METHOD_SYS_SOCKET_ACCEPT => sys_socket_accept(caller_pid, request),
         METHOD_SYS_SOCKET_ADDR => sys_socket_addr(caller_pid, request, response),
+        METHOD_SYS_SOCKET_INFO => sys_socket_info(caller_pid, request, response),
         _ => -(abi::ENOSYS as i64),
     }
 }
@@ -2505,6 +2506,51 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
     }
 }
 
+fn sys_socket_info(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    const SOCKET_INFO_SIZE: usize = 24;
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    if response.len() < SOCKET_INFO_SIZE {
+        return SOCKET_INFO_SIZE as i64;
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let info = with_kernel(|k| {
+        let process = k.process_mut(caller_pid);
+        let entry = match process.fd_table.entry(fd).cloned() {
+            Some(entry) => entry,
+            None => return Err(-(abi::EBADF as i64)),
+        };
+        let credentials = process.credentials;
+        let FdEntry::Socket { id } = entry else {
+            return Err(-(abi::ENOTSOCK as i64));
+        };
+        let Some(socket) = k.socket(id) else {
+            return Err(-(abi::EBADF as i64));
+        };
+        let flags = match &socket.kind {
+            SocketKind::Open { flags, .. } => *flags,
+            _ => 0,
+        };
+        Ok([
+            socket.domain as u32,
+            socket.sock_type as u32,
+            flags,
+            caller_pid,
+            credentials.uid,
+            credentials.gid,
+        ])
+    });
+    let info = match info {
+        Ok(info) => info,
+        Err(rc) => return rc,
+    };
+    for (index, value) in info.iter().enumerate() {
+        response[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    SOCKET_INFO_SIZE as i64
+}
+
 /// `sys_socket_connect(fd, addr_bytes) -> 0`. Request layout:
 /// u32 fd LE + addr bytes (UTF-8 "host:port" or "unix:...").
 fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
@@ -4330,6 +4376,37 @@ mod tests {
         assert_eq!(
             dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_addr_req(3, 0), &mut addr),
             -(abi::EAFNOSUPPORT as i64)
+        );
+    }
+
+    #[test]
+    fn socket_info_reports_type_and_peer_credentials() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        let mut info = [0u8; 24];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKETPAIR,
+                1,
+                &socketpair_req(1, 2, 0),
+                &mut [0u8; 8]
+            ),
+            8
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_INFO, 1, &socket_fd_req(3), &mut info),
+            24
+        );
+        assert_eq!(u32::from_le_bytes(info[0..4].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(info[4..8].try_into().unwrap()), 2);
+        assert_eq!(i32::from_le_bytes(info[12..16].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(info[16..20].try_into().unwrap()), 1000);
+        assert_eq!(u32::from_le_bytes(info[20..24].try_into().unwrap()), 1000);
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_INFO, 1, &socket_fd_req(404), &mut info),
+            -(abi::EBADF as i64)
         );
     }
 
