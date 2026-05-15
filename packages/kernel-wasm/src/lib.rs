@@ -17,6 +17,7 @@ mod abi;
 mod dispatch;
 mod kernel;
 mod kh;
+mod path;
 mod state;
 mod vfs;
 
@@ -31,6 +32,65 @@ pub use dispatch::dispatch;
 /// `docs/superpowers/specs/2026-05-09-sandboxed-kernel-design.md`.
 const SCRATCH_LEN: usize = 1024 * 1024;
 static mut SCRATCH: [u8; SCRATCH_LEN] = [0; SCRATCH_LEN];
+
+fn raw_input<'a>(ptr: *const u8, len: usize) -> Result<&'a [u8], i64> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err(-(abi::EFAULT as i64));
+    }
+    // SAFETY: The exported C ABI caller guarantees that `ptr..ptr+len`
+    // is readable within this kernel instance's linear memory. We reject
+    // null for nonzero lengths above; the host/runtime enforces bounds.
+    Ok(unsafe { core::slice::from_raw_parts(ptr, len) })
+}
+
+fn raw_output<'a>(ptr: *mut u8, len: usize) -> Result<&'a mut [u8], i64> {
+    if len == 0 {
+        return Ok(&mut []);
+    }
+    if ptr.is_null() {
+        return Err(-(abi::EFAULT as i64));
+    }
+    // SAFETY: The exported C ABI caller guarantees that `ptr..ptr+len`
+    // is writable within this kernel instance's linear memory and not
+    // aliased for the duration of the call. We reject null for nonzero
+    // lengths above; the host/runtime enforces bounds.
+    Ok(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
+}
+
+fn scratch_bounds() -> (usize, usize) {
+    let start = (&raw const SCRATCH) as usize;
+    (start, SCRATCH_LEN)
+}
+
+fn range_within(start: usize, len: usize, base: usize, cap: usize) -> Result<bool, i64> {
+    if len == 0 {
+        return Ok(true);
+    }
+    let end = start.checked_add(len).ok_or(-(abi::EINVAL as i64))?;
+    let limit = base.checked_add(cap).ok_or(-(abi::EINVAL as i64))?;
+    Ok(start >= base && end <= limit)
+}
+
+fn validate_scratch_range(ptr: usize, len: usize) -> Result<(), i64> {
+    let (base, cap) = scratch_bounds();
+    if range_within(ptr, len, base, cap)? {
+        Ok(())
+    } else {
+        Err(-(abi::EINVAL as i64))
+    }
+}
+
+fn ranges_overlap(a_ptr: usize, a_len: usize, b_ptr: usize, b_len: usize) -> Result<bool, i64> {
+    if a_len == 0 || b_len == 0 {
+        return Ok(false);
+    }
+    let a_end = a_ptr.checked_add(a_len).ok_or(-(abi::EINVAL as i64))?;
+    let b_end = b_ptr.checked_add(b_len).ok_or(-(abi::EINVAL as i64))?;
+    Ok(a_ptr < b_end && b_ptr < a_end)
+}
 
 /// Offset of [`SCRATCH`] within this kernel instance's linear memory.
 #[no_mangle]
@@ -62,7 +122,8 @@ pub extern "C" fn kernel_scratch_len() -> u32 {
 /// # Safety
 ///
 /// The kernel-host interface guarantees both slices live entirely inside this
-/// kernel instance's linear memory and do not overlap.
+/// kernel instance's linear memory. The export rejects overlapping request and
+/// response ranges before forming Rust references.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_dispatch(
     method_id: u32,
@@ -72,15 +133,24 @@ pub unsafe extern "C" fn kernel_dispatch(
     out_ptr: *mut u8,
     out_cap: usize,
 ) -> i64 {
-    let request = if in_ptr.is_null() || in_len == 0 {
-        &[][..]
-    } else {
-        core::slice::from_raw_parts(in_ptr, in_len)
+    if let Err(rc) = validate_scratch_range(in_ptr as usize, in_len) {
+        return rc;
+    }
+    if let Err(rc) = validate_scratch_range(out_ptr as usize, out_cap) {
+        return rc;
+    }
+    match ranges_overlap(in_ptr as usize, in_len, out_ptr as usize, out_cap) {
+        Ok(false) => {}
+        Ok(true) => return -(abi::EINVAL as i64),
+        Err(rc) => return rc,
+    }
+    let request = match raw_input(in_ptr, in_len) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
     };
-    let response = if out_ptr.is_null() || out_cap == 0 {
-        &mut [][..]
-    } else {
-        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    let response = match raw_output(out_ptr, out_cap) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
     };
     dispatch::dispatch(method_id, caller_pid, request, response)
 }
@@ -96,10 +166,9 @@ pub unsafe extern "C" fn kernel_dispatch(
 /// writable range in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_list_processes(out_ptr: *mut u8, out_cap: usize) -> i64 {
-    let response = if out_ptr.is_null() || out_cap == 0 {
-        &mut [][..]
-    } else {
-        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    let response = match raw_output(out_ptr, out_cap) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
     };
     dispatch::list_processes_response(response)
 }
@@ -113,10 +182,9 @@ pub unsafe extern "C" fn kernel_list_processes(out_ptr: *mut u8, out_cap: usize)
 #[no_mangle]
 pub unsafe extern "C" fn kernel_list_threads(pid: u32, out_ptr: *mut u8, out_cap: usize) -> i64 {
     let request = pid.to_le_bytes();
-    let response = if out_ptr.is_null() || out_cap == 0 {
-        &mut [][..]
-    } else {
-        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    let response = match raw_output(out_ptr, out_cap) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
     };
     dispatch::list_threads_response(&request, response)
 }
@@ -132,10 +200,9 @@ pub unsafe extern "C" fn kernel_list_threads(pid: u32, out_ptr: *mut u8, out_cap
 /// range in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_snapshot(out_ptr: *mut u8, out_cap: usize) -> i64 {
-    let response = if out_ptr.is_null() || out_cap == 0 {
-        &mut [][..]
-    } else {
-        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    let response = match raw_output(out_ptr, out_cap) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
     };
     dispatch::snapshot_response(response)
 }
@@ -152,10 +219,9 @@ pub unsafe extern "C" fn kernel_snapshot(out_ptr: *mut u8, out_cap: usize) -> i6
 /// range in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_schedule_next(out_ptr: *mut u8, out_cap: usize) -> i64 {
-    let response = if out_ptr.is_null() || out_cap == 0 {
-        &mut [][..]
-    } else {
-        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    let response = match raw_output(out_ptr, out_cap) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
     };
     dispatch::schedule_next_response(response)
 }
@@ -165,12 +231,8 @@ pub unsafe extern "C" fn kernel_schedule_next(out_ptr: *mut u8, out_cap: usize) 
 /// `host_thread_handle` is an opaque adapter handle. Pass a negative value when
 /// the adapter has no durable handle to persist in snapshots.
 ///
-/// # Safety
-///
-/// No pointer arguments. Marked unsafe to keep the exported host-control API
-/// uniform with the other raw C ABI entry points.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_spawn_thread(pid: u32, host_thread_handle: i32) -> i64 {
+pub extern "C" fn kernel_spawn_thread(pid: u32, host_thread_handle: i32) -> i64 {
     crate::kernel::with_kernel(|k| {
         k.spawn_thread(
             pid,
@@ -187,12 +249,8 @@ pub unsafe extern "C" fn kernel_spawn_thread(pid: u32, host_thread_handle: i32) 
 
 /// Host-control export: mark a thread detached in kernel-owned state.
 ///
-/// # Safety
-///
-/// No pointer arguments. Marked unsafe to keep the exported host-control API
-/// uniform with the other raw C ABI entry points.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_detach_thread(pid: u32, tid: u32) -> i64 {
+pub extern "C" fn kernel_detach_thread(pid: u32, tid: u32) -> i64 {
     crate::kernel::with_kernel(|k| {
         k.detach_thread(pid, tid)
             .map(|()| 0)
@@ -202,12 +260,8 @@ pub unsafe extern "C" fn kernel_detach_thread(pid: u32, tid: u32) -> i64 {
 
 /// Host-control export: record a thread exit value in kernel-owned state.
 ///
-/// # Safety
-///
-/// No pointer arguments. Marked unsafe to keep the exported host-control API
-/// uniform with the other raw C ABI entry points.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_record_thread_exit(pid: u32, tid: u32, exit_value: i32) -> i64 {
+pub extern "C" fn kernel_record_thread_exit(pid: u32, tid: u32, exit_value: i32) -> i64 {
     crate::kernel::with_kernel(|k| {
         k.exit_thread(pid, tid, exit_value)
             .map(|()| 0)
@@ -217,12 +271,8 @@ pub unsafe extern "C" fn kernel_record_thread_exit(pid: u32, tid: u32, exit_valu
 
 /// Host-control export: mark a thread blocked in kernel-owned state.
 ///
-/// # Safety
-///
-/// No pointer arguments. Marked unsafe to keep the exported host-control API
-/// uniform with the other raw C ABI entry points.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_block_thread(pid: u32, tid: u32) -> i64 {
+pub extern "C" fn kernel_block_thread(pid: u32, tid: u32) -> i64 {
     crate::kernel::with_kernel(|k| {
         k.block_thread(pid, tid)
             .map(|()| 0)
@@ -232,12 +282,8 @@ pub unsafe extern "C" fn kernel_block_thread(pid: u32, tid: u32) -> i64 {
 
 /// Host-control export: mark a blocked thread runnable in kernel-owned state.
 ///
-/// # Safety
-///
-/// No pointer arguments. Marked unsafe to keep the exported host-control API
-/// uniform with the other raw C ABI entry points.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_unblock_thread(pid: u32, tid: u32) -> i64 {
+pub extern "C" fn kernel_unblock_thread(pid: u32, tid: u32) -> i64 {
     crate::kernel::with_kernel(|k| {
         k.unblock_thread(pid, tid)
             .map(|()| 0)
@@ -247,12 +293,8 @@ pub unsafe extern "C" fn kernel_unblock_thread(pid: u32, tid: u32) -> i64 {
 
 /// Host-control export: send a signal through kernel-owned process state.
 ///
-/// # Safety
-///
-/// No pointer arguments. Marked unsafe to keep the exported host-control API
-/// uniform with the other raw C ABI entry points.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_kill(pid: u32, signal: u32) -> i64 {
+pub extern "C" fn kernel_kill(pid: u32, signal: u32) -> i64 {
     dispatch::kill_pid(pid, signal)
 }
 
@@ -282,10 +324,9 @@ pub unsafe extern "C" fn kernel_wait(
     let mut request = [0u8; 8];
     request[0..4].copy_from_slice(&child_pid.to_le_bytes());
     request[4..8].copy_from_slice(&flags.to_le_bytes());
-    let response = if out_ptr.is_null() || out_cap == 0 {
-        &mut [][..]
-    } else {
-        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    let response = match raw_output(out_ptr, out_cap) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
     };
     dispatch::wait_response(caller_pid, &request, response)
 }
@@ -295,12 +336,8 @@ pub unsafe extern "C" fn kernel_wait(
 /// This is the KH adapter notification used after a process instance returns
 /// or traps with an exit status. The next kernel-owned wait can reap it.
 ///
-/// # Safety
-///
-/// No pointer arguments. Marked unsafe to keep the exported host-control API
-/// uniform with the other raw C ABI entry points.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_record_exit(pid: u32, exit_status: i32) -> i64 {
+pub extern "C" fn kernel_record_exit(pid: u32, exit_status: i32) -> i64 {
     let mut request = [0u8; 8];
     request[0..4].copy_from_slice(&pid.to_le_bytes());
     request[4..8].copy_from_slice(&exit_status.to_le_bytes());
@@ -315,10 +352,9 @@ pub unsafe extern "C" fn kernel_record_exit(pid: u32, exit_status: i32) -> i64 {
 /// range in this kernel instance's linear memory.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_drain_spawn(out_ptr: *mut u8, out_cap: usize) -> i64 {
-    let response = if out_ptr.is_null() || out_cap == 0 {
-        &mut [][..]
-    } else {
-        core::slice::from_raw_parts_mut(out_ptr, out_cap)
+    let response = match raw_output(out_ptr, out_cap) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
     };
     dispatch::drain_spawn(response)
 }
@@ -342,15 +378,19 @@ pub unsafe extern "C" fn kernel_spawn_process(
     argv_ptr: *const u8,
     argv_len: usize,
 ) -> i64 {
-    let module_id = if module_id_ptr.is_null() || module_id_len == 0 {
-        &[][..]
-    } else {
-        core::slice::from_raw_parts(module_id_ptr, module_id_len)
+    if let Err(rc) = validate_scratch_range(module_id_ptr as usize, module_id_len) {
+        return rc;
+    }
+    if let Err(rc) = validate_scratch_range(argv_ptr as usize, argv_len) {
+        return rc;
+    }
+    let module_id = match raw_input(module_id_ptr, module_id_len) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
     };
-    let argv = if argv_ptr.is_null() || argv_len == 0 {
-        &[][..]
-    } else {
-        core::slice::from_raw_parts(argv_ptr, argv_len)
+    let argv = match raw_input(argv_ptr, argv_len) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
     };
     dispatch::spawn_cached_process(parent_pid, module_id, argv)
 }
@@ -361,6 +401,37 @@ mod tests {
 
     #[test]
     fn unknown_method_returns_negated_enosys() {
+        let rc = unsafe {
+            kernel_dispatch(
+                0xDEAD_BEEF,
+                0,
+                core::ptr::null(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(rc, -(abi::ENOSYS as i64));
+    }
+
+    #[test]
+    fn kernel_dispatch_rejects_overlapping_request_and_response() {
+        let mut buf = [0u8; 16];
+        let rc = unsafe {
+            kernel_dispatch(
+                0xDEAD_BEEF,
+                0,
+                buf.as_ptr(),
+                8,
+                buf.as_mut_ptr().wrapping_add(4),
+                8,
+            )
+        };
+        assert_eq!(rc, -(abi::EINVAL as i64));
+    }
+
+    #[test]
+    fn kernel_dispatch_rejects_non_scratch_ranges() {
         let mut out = [0u8; 16];
         let rc = unsafe {
             kernel_dispatch(
@@ -372,7 +443,15 @@ mod tests {
                 out.len(),
             )
         };
-        assert_eq!(rc, -(abi::ENOSYS as i64));
+        assert_eq!(rc, -(abi::EINVAL as i64));
+    }
+
+    #[test]
+    fn kernel_spawn_process_rejects_non_scratch_ranges() {
+        let module = *b"module";
+        let rc =
+            unsafe { kernel_spawn_process(1, module.as_ptr(), module.len(), core::ptr::null(), 0) };
+        assert_eq!(rc, -(abi::EINVAL as i64));
     }
 
     #[test]
@@ -391,13 +470,32 @@ mod tests {
     }
 
     #[test]
+    fn null_pointer_with_nonzero_len_is_efault() {
+        let mut out = [0u8; 16];
+        let rc = unsafe {
+            kernel_dispatch(
+                0xDEAD_BEEF,
+                0,
+                core::ptr::null(),
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(rc, -(abi::EINVAL as i64));
+
+        let rc = unsafe { kernel_list_processes(core::ptr::null_mut(), 1) };
+        assert_eq!(rc, -(abi::EFAULT as i64));
+    }
+
+    #[test]
     fn kernel_wait_export_reaps_kernel_owned_child() {
         let _g = crate::kernel::TestGuard::acquire();
         let mut reg = 1_u32.to_le_bytes().to_vec();
         reg.extend_from_slice(&7_u32.to_le_bytes());
         assert_eq!(dispatch::register_child(&reg), 0);
 
-        assert_eq!(unsafe { kernel_record_exit(7, 23) }, 0);
+        assert_eq!(kernel_record_exit(7, 23), 0);
 
         let mut out = [0u8; 8];
         let rc = unsafe { kernel_wait(1, 0, 0, out.as_mut_ptr(), out.len()) };
@@ -412,7 +510,7 @@ mod tests {
         crate::kernel::with_kernel(|k| {
             k.process_mut(7);
         });
-        assert_eq!(unsafe { kernel_kill(7, 15) }, 0);
-        assert_eq!(unsafe { kernel_kill(7, 64) }, -(abi::EINVAL as i64));
+        assert_eq!(kernel_kill(7, 15), 0);
+        assert_eq!(kernel_kill(7, 64), -(abi::EINVAL as i64));
     }
 }

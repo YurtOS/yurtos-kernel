@@ -13,7 +13,7 @@ use wasmtime::{Engine, Module};
 
 use yurt_runtime_wasmtime::kernel_host_interface::{
     build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, InMemoryHostFs,
-    InMemoryKv, KernelHostInterface, LogSink, NativeHostFs, NativeTcpSocket, RedbKv,
+    InMemoryKv, KernelHostInterface, KvBackend, LogSink, NativeHostFs, NativeTcpSocket, RedbKv,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -27,7 +27,104 @@ fn ensure_kernel_wasm_built() -> &'static PathBuf {
     })
 }
 
+struct FetchResponse {
+    status: u32,
+    body: Vec<u8>,
+    error: String,
+}
+
+fn fetch_request_record(url: &str, method: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+    let header_size = 44usize;
+    let pair_size = 16usize;
+    let pairs_offset = header_size;
+    let mut cursor = pairs_offset + headers.len() * pair_size;
+    let url_offset = cursor;
+    cursor += url.len();
+    let method_offset = cursor;
+    cursor += method.len();
+    let mut pairs = Vec::new();
+    for (key, value) in headers {
+        let key_offset = cursor;
+        cursor += key.len();
+        let value_offset = cursor;
+        cursor += value.len();
+        pairs.push((key_offset, key.len(), value_offset, value.len()));
+    }
+    let body_offset = cursor;
+    let size = body_offset + body.len();
+    let mut record = vec![0u8; size];
+    write_u32(&mut record, 0, size as u32);
+    write_u16(&mut record, 4, 1);
+    write_u32(&mut record, 8, url_offset as u32);
+    write_u32(&mut record, 12, url.len() as u32);
+    write_u32(&mut record, 16, method_offset as u32);
+    write_u32(&mut record, 20, method.len() as u32);
+    write_u32(&mut record, 24, pairs_offset as u32);
+    write_u32(&mut record, 28, headers.len() as u32);
+    write_u32(&mut record, 32, body_offset as u32);
+    write_u32(&mut record, 36, body.len() as u32);
+    write_u32(&mut record, 40, 0);
+    for (idx, (key_offset, key_len, value_offset, value_len)) in pairs.iter().enumerate() {
+        let at = pairs_offset + idx * pair_size;
+        write_u32(&mut record, at, *key_offset as u32);
+        write_u32(&mut record, at + 4, *key_len as u32);
+        write_u32(&mut record, at + 8, *value_offset as u32);
+        write_u32(&mut record, at + 12, *value_len as u32);
+    }
+    let mut write_cursor = pairs_offset + headers.len() * pair_size;
+    record[write_cursor..write_cursor + url.len()].copy_from_slice(url.as_bytes());
+    write_cursor += url.len();
+    record[write_cursor..write_cursor + method.len()].copy_from_slice(method.as_bytes());
+    write_cursor += method.len();
+    for (key, value) in headers {
+        record[write_cursor..write_cursor + key.len()].copy_from_slice(key.as_bytes());
+        write_cursor += key.len();
+        record[write_cursor..write_cursor + value.len()].copy_from_slice(value.as_bytes());
+        write_cursor += value.len();
+    }
+    record[body_offset..].copy_from_slice(body);
+    record
+}
+
+fn decode_fetch_response(record: &[u8]) -> FetchResponse {
+    assert!(record.len() >= 36);
+    assert_eq!(read_u32(record, 0) as usize, record.len());
+    assert_eq!(u16::from_le_bytes(record[4..6].try_into().unwrap()), 1);
+    let status = read_u32(record, 8);
+    let body_offset = read_u32(record, 20) as usize;
+    let body_len = read_u32(record, 24) as usize;
+    let error_offset = read_u32(record, 28) as usize;
+    let error_len = read_u32(record, 32) as usize;
+    FetchResponse {
+        status,
+        body: record[body_offset..body_offset + body_len].to_vec(),
+        error: String::from_utf8(record[error_offset..error_offset + error_len].to_vec()).unwrap(),
+    }
+}
+
+fn read_u32(record: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(record[offset..offset + 4].try_into().unwrap())
+}
+
+fn write_u16(record: &mut [u8], offset: usize, value: u16) {
+    record[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(record: &mut [u8], offset: usize, value: u32) {
+    record[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn sockaddr_in_bytes(host: [u8; 4], port: u16) -> [u8; 16] {
+    let mut addr = [0u8; 16];
+    addr[0..2].copy_from_slice(&2u16.to_le_bytes());
+    addr[2..4].copy_from_slice(&port.to_be_bytes());
+    addr[4..8].copy_from_slice(&host);
+    addr
+}
+
 const ENOSYS: i64 = 38;
+const EACCES: i64 = 13;
+const EINVAL: i32 = 22;
 const METHOD_ECHO: u32 = 1;
 const METHOD_NOW_REALTIME: u32 = 2;
 const METHOD_SYS_GETUID: u32 = 0x1_0001;
@@ -98,6 +195,11 @@ const METHOD_SYS_POLL: u32 = 0x1_0043;
 const METHOD_SYS_SOCKETPAIR: u32 = 0x1_0044;
 const METHOD_SYS_SOCKET_OPEN: u32 = 0x1_0045;
 const METHOD_SYS_SOCKET_BIND: u32 = 0x1_0046;
+const METHOD_SYS_SOCKET_SENDTO: u32 = 0x1_0047;
+const METHOD_SYS_SOCKET_SENDMSG: u32 = 0x1_0048;
+const METHOD_SYS_SOCKET_RECVMSG: u32 = 0x1_0049;
+const METHOD_SYS_SOCKET_INFO: u32 = 0x1_004A;
+const METHOD_SYS_SOCKET_RECVFROM: u32 = 0x1_004B;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -401,6 +503,40 @@ fn wasmtime_adapter_spawns_cached_process_through_kernel_export() {
     let snapshot = snapshots.iter().find(|p| p.pid == proc.pid()).unwrap();
     assert_eq!(snapshot.ppid, 0);
     assert_eq!(snapshot.command, b"/bin/demo");
+}
+
+#[test]
+fn deny_all_policy_blocks_kernel_spawn_process() {
+    use yurt_runtime_wasmtime::kernel_host_interface::DenyAllPolicy;
+
+    build_kernel_wasm().unwrap();
+    let mk = KernelHostInterface::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            policy: Arc::new(DenyAllPolicy),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 0))
+        "#,
+    )
+    .unwrap();
+
+    mk.cache_process_module(b"demo-module", &module).unwrap();
+    let err = match mk.spawn_cached_user_process(0, b"demo-module", &[b"/bin/demo".as_slice()]) {
+        Ok(_) => panic!("deny-all policy must block kh_spawn_process"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("rc=-13"),
+        "expected -EACCES from denied kh_spawn_process, got {err:#}"
+    );
 }
 
 #[test]
@@ -1480,6 +1616,23 @@ fn redb_kv_persists_across_kernel_host_interface_restarts() {
 }
 
 #[test]
+fn redb_kv_rejects_non_utf8_store_names_without_fallback_collision() {
+    use std::fs;
+    let dir = std::env::temp_dir().join(format!("yurt-redb-nonutf8-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("kv.redb");
+
+    let kv = RedbKv::open(db_path).unwrap();
+    assert_eq!(kv.put(b"\xff", b"k", b"bad"), -(EINVAL as i32));
+    assert_eq!(kv.get(b"\xff", b"k").unwrap_err(), -(EINVAL as i32));
+    assert_eq!(kv.delete(b"\xff", b"k"), -(EINVAL as i32));
+    assert!(kv.list(b"\xff", b"").is_empty());
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn sys_idb_put_get_delete_list_round_trips() {
     // Full kv loop through the trampoline. InMemoryKv satisfies
     // KvBackend without disk I/O — same shape browser
@@ -1603,7 +1756,7 @@ fn sys_socket_listen_accept_round_trips_through_kernel() {
     assert!(listener >= 0, "socket failed: {listener}");
     let listener_handle = listener as i32;
     let mut bind_req = listener_handle.to_le_bytes().to_vec();
-    bind_req.extend_from_slice(b"127.0.0.1:0");
+    bind_req.extend_from_slice(&sockaddr_in_bytes([127, 0, 0, 1], 0));
     assert_eq!(
         mk.syscall(METHOD_SYS_SOCKET_BIND, &bind_req, &mut [])
             .unwrap(),
@@ -1627,7 +1780,7 @@ fn sys_socket_listen_accept_round_trips_through_kernel() {
         )
         .unwrap();
     assert!(n > 2, "addr response: {n}");
-    let port = u16::from_le_bytes(addr_buf[0..2].try_into().unwrap());
+    let port = u16::from_be_bytes(addr_buf[4..6].try_into().unwrap());
     assert!(port > 0, "kernel-chosen port must be non-zero");
 
     // Dial from a separate thread so accept() can complete.
@@ -1697,7 +1850,7 @@ fn sys_socket_listen_denied_by_policy_returns_eacces() {
         )
         .unwrap();
     let mut bind_req = (socket as i32).to_le_bytes().to_vec();
-    bind_req.extend_from_slice(b"127.0.0.1:0");
+    bind_req.extend_from_slice(&sockaddr_in_bytes([127, 0, 0, 1], 0));
     assert_eq!(
         mk.syscall(METHOD_SYS_SOCKET_BIND, &bind_req, &mut [])
             .unwrap(),
@@ -1748,10 +1901,9 @@ fn sys_socket_connect_send_recv_through_local_echo_server() {
         .unwrap();
     assert!(handle >= 0, "socket failed: {handle}");
 
-    // sys_socket_connect request: u32 fd + addr ("host:port" UTF-8).
-    let addr = format!("127.0.0.1:{port}");
+    // sys_socket_connect request: u32 fd + POSIX sockaddr_in bytes.
     let mut req = (handle as i32).to_le_bytes().to_vec();
-    req.extend_from_slice(addr.as_bytes());
+    req.extend_from_slice(&sockaddr_in_bytes([127, 0, 0, 1], port));
     let rc = mk
         .syscall(METHOD_SYS_SOCKET_CONNECT, &req, &mut [])
         .unwrap();
@@ -1803,11 +1955,186 @@ fn sys_socket_connect_denied_by_policy_returns_eacces() {
         .syscall(METHOD_SYS_SOCKET_OPEN, &[2, 1, 0, 0, 0, 0, 0, 0], &mut [])
         .unwrap();
     let mut req = (socket as i32).to_le_bytes().to_vec();
-    req.extend_from_slice(b"127.0.0.1:1");
+    req.extend_from_slice(&sockaddr_in_bytes([127, 0, 0, 1], 1));
     let rc = mk
         .syscall(METHOD_SYS_SOCKET_CONNECT, &req, &mut [])
         .unwrap();
     assert_eq!(rc, -13, "deny → -EACCES, got {rc}");
+}
+
+#[test]
+fn sys_socket_send_denied_by_policy_returns_eacces() {
+    use std::net::TcpListener;
+    use yurt_runtime_wasmtime::kernel_host_interface::{PolicyDecision, PolicyEnforcer};
+
+    struct DenySocketWrite;
+    impl PolicyEnforcer for DenySocketWrite {
+        fn may_socket_io(&self, _handle: i32, write: bool) -> PolicyDecision {
+            if write {
+                PolicyDecision::Deny
+            } else {
+                PolicyDecision::Allow
+            }
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let _ = listener.accept();
+    });
+
+    build_kernel_wasm().unwrap();
+    let mk = KernelHostInterface::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            policy: Arc::new(DenySocketWrite),
+            tcp: Some(Arc::new(NativeTcpSocket::new())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let handle = mk
+        .syscall(METHOD_SYS_SOCKET_OPEN, &[2, 1, 0, 0, 0, 0, 0, 0], &mut [])
+        .unwrap();
+    let mut connect_req = (handle as i32).to_le_bytes().to_vec();
+    connect_req.extend_from_slice(&sockaddr_in_bytes([127, 0, 0, 1], port));
+    assert_eq!(
+        mk.syscall(METHOD_SYS_SOCKET_CONNECT, &connect_req, &mut [])
+            .unwrap(),
+        0
+    );
+    let mut send_req = (handle as i32).to_le_bytes().to_vec();
+    send_req.extend_from_slice(b"blocked");
+    let rc = mk
+        .syscall(METHOD_SYS_SOCKET_SEND, &send_req, &mut [])
+        .unwrap();
+    assert_eq!(rc, -EACCES, "deny → -EACCES, got {rc}");
+    let _ = mk.syscall(
+        METHOD_SYS_SOCKET_CLOSE,
+        &(handle as i32).to_le_bytes(),
+        &mut [],
+    );
+    let _ = server.join();
+}
+
+#[test]
+fn sys_socket_recv_denied_by_policy_returns_eacces() {
+    use std::io::Write;
+    use std::net::TcpListener;
+    use yurt_runtime_wasmtime::kernel_host_interface::{PolicyDecision, PolicyEnforcer};
+
+    struct DenySocketRead;
+    impl PolicyEnforcer for DenySocketRead {
+        fn may_socket_io(&self, _handle: i32, write: bool) -> PolicyDecision {
+            if write {
+                PolicyDecision::Allow
+            } else {
+                PolicyDecision::Deny
+            }
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.write_all(b"blocked");
+        }
+    });
+
+    build_kernel_wasm().unwrap();
+    let mk = KernelHostInterface::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            policy: Arc::new(DenySocketRead),
+            tcp: Some(Arc::new(NativeTcpSocket::new())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let handle = mk
+        .syscall(METHOD_SYS_SOCKET_OPEN, &[2, 1, 0, 0, 0, 0, 0, 0], &mut [])
+        .unwrap();
+    let mut connect_req = (handle as i32).to_le_bytes().to_vec();
+    connect_req.extend_from_slice(&sockaddr_in_bytes([127, 0, 0, 1], port));
+    assert_eq!(
+        mk.syscall(METHOD_SYS_SOCKET_CONNECT, &connect_req, &mut [])
+            .unwrap(),
+        0
+    );
+    let mut recv_req = (handle as i32).to_le_bytes().to_vec();
+    recv_req.extend_from_slice(&0_u32.to_le_bytes());
+    let mut buf = [0u8; 16];
+    let rc = mk
+        .syscall(METHOD_SYS_SOCKET_RECV, &recv_req, &mut buf)
+        .unwrap();
+    assert_eq!(rc, -EACCES, "deny → -EACCES, got {rc}");
+    let _ = mk.syscall(
+        METHOD_SYS_SOCKET_CLOSE,
+        &(handle as i32).to_le_bytes(),
+        &mut [],
+    );
+    let _ = server.join();
+}
+
+#[test]
+fn sys_socket_accept_and_addr_denied_by_policy_return_eacces() {
+    use yurt_runtime_wasmtime::kernel_host_interface::{PolicyDecision, PolicyEnforcer};
+
+    struct DenyAcceptAndAddr;
+    impl PolicyEnforcer for DenyAcceptAndAddr {
+        fn may_accept_socket(&self, _handle: i32) -> PolicyDecision {
+            PolicyDecision::Deny
+        }
+
+        fn may_socket_addr(&self, _handle: i32, _peer: bool) -> PolicyDecision {
+            PolicyDecision::Deny
+        }
+    }
+
+    build_kernel_wasm().unwrap();
+    let mk = KernelHostInterface::load(
+        ensure_kernel_wasm_built(),
+        HostState {
+            policy: Arc::new(DenyAcceptAndAddr),
+            tcp: Some(Arc::new(NativeTcpSocket::new())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let socket = mk
+        .syscall(METHOD_SYS_SOCKET_OPEN, &[2, 1, 0, 0, 0, 0, 0, 0], &mut [])
+        .unwrap();
+    let socket = socket as i32;
+    let mut bind_req = socket.to_le_bytes().to_vec();
+    bind_req.extend_from_slice(&sockaddr_in_bytes([127, 0, 0, 1], 0));
+    assert_eq!(
+        mk.syscall(METHOD_SYS_SOCKET_BIND, &bind_req, &mut [])
+            .unwrap(),
+        0
+    );
+    let mut listen_req = socket.to_le_bytes().to_vec();
+    listen_req.extend_from_slice(&16_u32.to_le_bytes());
+    assert_eq!(
+        mk.syscall(METHOD_SYS_SOCKET_LISTEN, &listen_req, &mut [])
+            .unwrap(),
+        0
+    );
+
+    let mut addr_buf = [0u8; 32];
+    let addr_rc = mk
+        .syscall(METHOD_SYS_SOCKET_ADDR, &socket.to_le_bytes(), &mut addr_buf)
+        .unwrap();
+    assert_eq!(addr_rc, -EACCES, "deny → -EACCES, got {addr_rc}");
+
+    let mut accept_req = socket.to_le_bytes().to_vec();
+    accept_req.extend_from_slice(&0_u32.to_le_bytes());
+    let accept_rc = mk
+        .syscall(METHOD_SYS_SOCKET_ACCEPT, &accept_req, &mut [])
+        .unwrap();
+    assert_eq!(accept_rc, -EACCES, "deny → -EACCES, got {accept_rc}");
+    let _ = mk.syscall(METHOD_SYS_SOCKET_CLOSE, &socket.to_le_bytes(), &mut []);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1826,19 +2153,14 @@ async fn sys_fetch_round_trips_through_kh_fetch_blocking() {
     // a multi-thread tokio context is fine because we're not inside
     // the runtime itself when the kernel syscall fires.
     let mk = fresh_kernel_host_interface(0);
-    let req = serde_json::json!({
-        "url": format!("{}/hello", server.uri()),
-        "method": "GET",
-    });
-    let req_bytes = req.to_string().into_bytes();
+    let req_bytes = fetch_request_record(&format!("{}/hello", server.uri()), "GET", &[], b"");
     let mut resp = vec![0u8; 8 * 1024];
     let n = mk.syscall(METHOD_SYS_FETCH, &req_bytes, &mut resp).unwrap();
     assert!(n > 0, "sys_fetch returned {n}");
-    let body = std::str::from_utf8(&resp[..n as usize]).unwrap();
-    let v: serde_json::Value = serde_json::from_str(body).unwrap();
-    assert_eq!(v["ok"], true);
-    assert_eq!(v["status"], 200);
-    assert_eq!(v["body"], "world");
+    let fetch = decode_fetch_response(&resp[..n as usize]);
+    assert_eq!(fetch.status, 200);
+    assert_eq!(fetch.error, "");
+    assert_eq!(fetch.body, b"world");
 }
 
 #[test]
@@ -1990,7 +2312,7 @@ fn user_process_umask_persists_across_calls_for_same_pid() {
 }
 
 #[test]
-fn user_process_setresuid_changes_subsequent_getuid() {
+fn user_process_setresuid_allows_noop_and_rejects_unprivileged_escalation() {
     // Multi-arg syscall (3 u32s) marshalled into kernel scratch as
     // 12 bytes. Validates the multi-arg encoding plus per-pid
     // credential mutation visible across syscalls.
@@ -1999,7 +2321,9 @@ fn user_process_setresuid_changes_subsequent_getuid() {
         (module
           (import "env" "sys_setresuid" (func $setresuid (param i32 i32 i32) (result i32)))
           (import "env" "sys_getuid" (func $getuid (result i32)))
-          (func (export "set") (result i32)
+          (func (export "set_noop") (result i32)
+            (call $setresuid (i32.const 1000) (i32.const 1000) (i32.const 1000)))
+          (func (export "set_escalate") (result i32)
             (call $setresuid (i32.const 4242) (i32.const 4242) (i32.const 4242)))
           (func (export "get") (result i32)
             (call $getuid)))
@@ -2008,8 +2332,9 @@ fn user_process_setresuid_changes_subsequent_getuid() {
         .spawn_user_process(&wat::parse_str(user_wat).unwrap())
         .unwrap();
     assert_eq!(user.call_export_i32("get").unwrap(), 1000, "default uid");
-    assert_eq!(user.call_export_i32("set").unwrap(), 0);
-    assert_eq!(user.call_export_i32("get").unwrap(), 4242, "uid was set");
+    assert_eq!(user.call_export_i32("set_noop").unwrap(), 0);
+    assert_eq!(user.call_export_i32("set_escalate").unwrap(), -1);
+    assert_eq!(user.call_export_i32("get").unwrap(), 1000, "uid unchanged");
 }
 
 #[test]
@@ -2264,7 +2589,7 @@ fn user_process_af_unix_path_stream_round_trips_through_kernel() {
           (import "env" "sys_socket_send" (func $send (param i32 i32 i32) (result i64)))
           (import "env" "sys_socket_recv" (func $recv (param i32 i32 i32 i32) (result i64)))
           (memory (export "memory") 1)
-          (data (i32.const 64) "unix:/tmp/trampoline.sock")
+          (data (i32.const 64) "\01\00/tmp/trampoline.sock")
           (data (i32.const 96) "from client")
           (data (i32.const 128) "from server")
           (global $listener (mut i32) (i32.const -1))
@@ -2272,10 +2597,10 @@ fn user_process_af_unix_path_stream_round_trips_through_kernel() {
           (global $server (mut i32) (i32.const -1))
           (func (export "setup") (result i32)
             (global.set $listener (call $open (i32.const 3) (i32.const 6) (i32.const 0)))
-            (drop (call $bind (global.get $listener) (i32.const 64) (i32.const 25)))
+            (drop (call $bind (global.get $listener) (i32.const 64) (i32.const 22)))
             (drop (call $listen (global.get $listener) (i32.const 4)))
             (global.set $client (call $open (i32.const 3) (i32.const 6) (i32.const 0)))
-            (drop (call $connect (global.get $client) (i32.const 64) (i32.const 25)))
+            (drop (call $connect (global.get $client) (i32.const 64) (i32.const 22)))
             (global.set $server (call $accept (global.get $listener) (i32.const 0)))
             (i32.add
               (i32.add (global.get $listener) (global.get $client))
@@ -2304,6 +2629,66 @@ fn user_process_af_unix_path_stream_round_trips_through_kernel() {
     assert_eq!(user.call_export_i32("send_server").unwrap(), 11);
     assert_eq!(user.call_export_i32("recv_client").unwrap(), 11);
     assert_eq!(&user.read_memory(192, 11).unwrap(), b"from server");
+}
+
+#[test]
+fn wasmtime_registers_new_af_unix_socket_syscalls() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_socket_info" (func $socket_info (param i32 i32) (result i64)))
+          (import "env" "sys_socket_recvfrom"
+            (func $recvfrom (param i32 i32 i32 i32 i32 i32) (result i64)))
+          (memory (export "memory") 1)
+          (func (export "info") (result i32)
+            (i32.wrap_i64 (call $socket_info (i32.const 404) (i32.const 0))))
+          (func (export "recvfrom") (result i32)
+            (i32.wrap_i64
+              (call $recvfrom
+                (i32.const 404)
+                (i32.const 32)
+                (i32.const 8)
+                (i32.const 64)
+                (i32.const 108)
+                (i32.const 108)))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.call_export_i32("info").unwrap(), -9);
+    assert_eq!(user.call_export_i32("recvfrom").unwrap(), -9);
+}
+
+#[test]
+fn wasmtime_registers_all_vfs_process_syscall_imports() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_chmod" (func $chmod (param i32 i32 i32) (result i32)))
+          (import "env" "sys_chown" (func $chown (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_utimens" (func $utimens (param i64 i32 i32) (result i32)))
+          (import "env" "sys_unlink" (func $unlink (param i32 i32) (result i32)))
+          (import "env" "sys_stat" (func $stat (param i32 i32 i32) (result i32)))
+          (import "env" "sys_symlink" (func $symlink (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_readlink" (func $readlink (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_mkdir" (func $mkdir (param i32 i32) (result i32)))
+          (import "env" "sys_rmdir" (func $rmdir (param i32 i32) (result i32)))
+          (import "env" "sys_readdir" (func $readdir (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_wait" (func $wait (param i32 i32 i32) (result i32)))
+          (import "env" "sys_link" (func $link (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_rename" (func $rename (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_spawn" (func $spawn (param i32 i32) (result i32)))
+          (import "env" "sys_extension_invoke"
+            (func $extension_invoke (param i32 i32 i32 i32) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 32) "/missing")
+          (func (export "missing_stat") (result i32)
+            (call $stat (i32.const 32) (i32.const 8) (i32.const 64))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.call_export_i32("missing_stat").unwrap(), -2);
 }
 
 #[test]
@@ -2399,13 +2784,15 @@ fn user_process_fd_table_is_per_process() {
 }
 
 #[test]
-fn user_process_setresgid_changes_subsequent_getgid() {
+fn user_process_setresgid_allows_noop_and_rejects_unprivileged_escalation() {
     let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
         (module
           (import "env" "sys_setresgid" (func $setresgid (param i32 i32 i32) (result i32)))
           (import "env" "sys_getgid" (func $getgid (result i32)))
-          (func (export "set") (result i32)
+          (func (export "set_noop") (result i32)
+            (call $setresgid (i32.const 1000) (i32.const 1000) (i32.const 1000)))
+          (func (export "set_escalate") (result i32)
             (call $setresgid (i32.const 99) (i32.const 99) (i32.const 99)))
           (func (export "get") (result i32)
             (call $getgid)))
@@ -2414,8 +2801,9 @@ fn user_process_setresgid_changes_subsequent_getgid() {
         .spawn_user_process(&wat::parse_str(user_wat).unwrap())
         .unwrap();
     assert_eq!(user.call_export_i32("get").unwrap(), 1000);
-    assert_eq!(user.call_export_i32("set").unwrap(), 0);
-    assert_eq!(user.call_export_i32("get").unwrap(), 99);
+    assert_eq!(user.call_export_i32("set_noop").unwrap(), 0);
+    assert_eq!(user.call_export_i32("set_escalate").unwrap(), -1);
+    assert_eq!(user.call_export_i32("get").unwrap(), 1000);
 }
 
 #[test]
@@ -2658,6 +3046,31 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             "sys_socket_addr",
             METHOD_SYS_SOCKET_ADDR,
             METHOD_SYS_SOCKET_ADDR as i64,
+        ),
+        (
+            "sys_socket_sendto",
+            METHOD_SYS_SOCKET_SENDTO,
+            METHOD_SYS_SOCKET_SENDTO as i64,
+        ),
+        (
+            "sys_socket_sendmsg",
+            METHOD_SYS_SOCKET_SENDMSG,
+            METHOD_SYS_SOCKET_SENDMSG as i64,
+        ),
+        (
+            "sys_socket_recvmsg",
+            METHOD_SYS_SOCKET_RECVMSG,
+            METHOD_SYS_SOCKET_RECVMSG as i64,
+        ),
+        (
+            "sys_socket_info",
+            METHOD_SYS_SOCKET_INFO,
+            METHOD_SYS_SOCKET_INFO as i64,
+        ),
+        (
+            "sys_socket_recvfrom",
+            METHOD_SYS_SOCKET_RECVFROM,
+            METHOD_SYS_SOCKET_RECVFROM as i64,
         ),
         (
             "sys_socketpair",

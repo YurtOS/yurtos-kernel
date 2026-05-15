@@ -1434,7 +1434,7 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe("reply=pong");
     expect(requests).toContainEqual({
       op: "connect",
-      host: "example.test",
+      host: "10.0.2.185",
       port: 443,
       tls: false,
     });

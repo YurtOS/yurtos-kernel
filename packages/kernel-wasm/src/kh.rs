@@ -479,8 +479,8 @@ pub fn real_rename(old_path: &[u8], new_path: &[u8]) -> i32 {
     }
 }
 
-/// Open a TCP socket and connect to `addr` (a UTF-8 "host:port"
-/// string). Returns a non-negative socket handle or negated errno.
+/// Open a TCP socket and connect to a POSIX `sockaddr` byte record. Returns a
+/// non-negative socket handle or negated errno.
 pub fn socket_connect(addr: &[u8], flags: u32) -> i32 {
     unsafe { kh_socket_connect(addr.as_ptr(), addr.len(), flags) }
 }

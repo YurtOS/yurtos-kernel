@@ -10,7 +10,15 @@ export const YURT_ABI_CONSTANTS = {
   "YURT_VERSION_MAJOR": 0,
   "YURT_VERSION_MINOR": 1,
   "YURT_VERSION_PATCH": 0,
-  "YURT_WAIT_NOHANG": 1
+  "YURT_WAIT_NOHANG": 1,
+  "YURT_SOCKET_ADDR_LOCAL": 0,
+  "YURT_SOCKET_ADDR_PEER": 1,
+  "YURT_SOCKET_OPT_TCP_NODELAY": 1,
+  "YURT_SOCKET_FLAG_TLS": 1,
+  "YURT_MSG_PEEK": 2,
+  "YURT_AF_INET": 2,
+  "YURT_FETCH_REDIRECT_FOLLOW": 0,
+  "YURT_FETCH_REDIRECT_MANUAL": 1
 } as const;
 
 export const YURT_ABI_ERRNO = {
@@ -28,6 +36,7 @@ export const YURT_ABI_ERRNO = {
   "ENOTDIR": 20,
   "EINVAL": 22,
   "EOVERFLOW": 75,
+  "ENOTSOCK": 88,
   "ECONNRESET": 104,
   "ENOTCONN": 107,
   "ECONNREFUSED": 111,
@@ -227,6 +236,160 @@ export const YURT_ABI_IMPORTS = [
     ]
   },
   {
+    "name": "host_socket_connect",
+    "return": "scalar_errno",
+    "doc": "Connect a socket fd to a POSIX sockaddr record. Flags may include YURT_SOCKET_FLAG_TLS.",
+    "args": [
+      {
+        "name": "fd",
+        "type": "fd",
+        "doc": ""
+      },
+      {
+        "name": "addr_ptr",
+        "type": "ptr",
+        "doc": ""
+      },
+      {
+        "name": "addr_len",
+        "type": "usize",
+        "doc": ""
+      },
+      {
+        "name": "flags",
+        "type": "u32",
+        "doc": ""
+      }
+    ]
+  },
+  {
+    "name": "host_socket_bind",
+    "return": "scalar_errno",
+    "doc": "Bind a socket fd to a POSIX sockaddr record.",
+    "args": [
+      {
+        "name": "fd",
+        "type": "fd",
+        "doc": ""
+      },
+      {
+        "name": "addr_ptr",
+        "type": "ptr",
+        "doc": ""
+      },
+      {
+        "name": "addr_len",
+        "type": "usize",
+        "doc": ""
+      }
+    ]
+  },
+  {
+    "name": "host_socket_listen",
+    "return": "scalar_errno",
+    "doc": "Listen on a bound socket fd.",
+    "args": [
+      {
+        "name": "fd",
+        "type": "fd",
+        "doc": ""
+      },
+      {
+        "name": "backlog",
+        "type": "i32",
+        "doc": ""
+      }
+    ]
+  },
+  {
+    "name": "host_socket_accept",
+    "return": "fixed_out",
+    "doc": "Accept a connection and write yurt_socket_accept_result_v1.",
+    "args": [
+      {
+        "name": "fd",
+        "type": "fd",
+        "doc": ""
+      },
+      {
+        "name": "out_ptr",
+        "type": "ptr",
+        "doc": ""
+      },
+      {
+        "name": "out_cap",
+        "type": "usize",
+        "doc": ""
+      }
+    ]
+  },
+  {
+    "name": "host_socket_addr",
+    "return": "fixed_out",
+    "doc": "Write yurt_socket_addr_result_v1 for local or peer address.",
+    "args": [
+      {
+        "name": "fd",
+        "type": "fd",
+        "doc": ""
+      },
+      {
+        "name": "which",
+        "type": "u32",
+        "doc": ""
+      },
+      {
+        "name": "out_ptr",
+        "type": "ptr",
+        "doc": ""
+      },
+      {
+        "name": "out_cap",
+        "type": "usize",
+        "doc": ""
+      }
+    ]
+  },
+  {
+    "name": "host_socket_option",
+    "return": "scalar_errno",
+    "doc": "Set or get a scalar socket option. Get returns the option value as a non-negative scalar.",
+    "args": [
+      {
+        "name": "fd",
+        "type": "fd",
+        "doc": ""
+      },
+      {
+        "name": "option",
+        "type": "u32",
+        "doc": ""
+      },
+      {
+        "name": "has_value",
+        "type": "u32",
+        "doc": ""
+      },
+      {
+        "name": "value",
+        "type": "i32",
+        "doc": ""
+      }
+    ]
+  },
+  {
+    "name": "host_socket_close",
+    "return": "scalar_errno",
+    "doc": "Close a socket fd.",
+    "args": [
+      {
+        "name": "fd",
+        "type": "fd",
+        "doc": ""
+      }
+    ]
+  },
+  {
     "name": "host_dns_resolve",
     "return": "record_out",
     "doc": "Resolve a UTF-8 host name and write a native address record.",
@@ -281,86 +444,18 @@ export const YURT_ABI_IMPORTS = [
     ]
   },
   {
-    "name": "host_socket_connect",
-    "return": "stream_io",
-    "doc": "Open a TCP socket and connect to addr ('host:port' UTF-8). Returns a socket fd or negated errno.",
-    "args": [
-      {
-        "name": "addr_ptr",
-        "type": "ptr",
-        "doc": ""
-      },
-      {
-        "name": "addr_len",
-        "type": "usize",
-        "doc": ""
-      },
-      {
-        "name": "flags",
-        "type": "i32",
-        "doc": ""
-      }
-    ]
-  },
-  {
-    "name": "host_socket_close",
-    "return": "stream_io",
-    "doc": "Close a socket fd previously returned from host_socket_connect / host_socket_listen / host_socket_accept.",
-    "args": [
-      {
-        "name": "fd",
-        "type": "fd",
-        "doc": ""
-      }
-    ]
-  },
-  {
-    "name": "host_socket_listen",
-    "return": "stream_io",
-    "doc": "Bind to addr and start accepting. Returns a listener fd or negated errno. Use host_socket_addr to discover the actually-bound port when port=0.",
-    "args": [
-      {
-        "name": "backlog",
-        "type": "i32",
-        "doc": ""
-      },
-      {
-        "name": "addr_ptr",
-        "type": "ptr",
-        "doc": ""
-      },
-      {
-        "name": "addr_len",
-        "type": "usize",
-        "doc": ""
-      }
-    ]
-  },
-  {
-    "name": "host_socket_accept",
-    "return": "stream_io",
-    "doc": "Block until a connection arrives on the listener fd. Returns the new connection's fd.",
-    "args": [
-      {
-        "name": "fd",
-        "type": "fd",
-        "doc": ""
-      },
-      {
-        "name": "flags",
-        "type": "i32",
-        "doc": ""
-      }
-    ]
-  },
-  {
-    "name": "host_socket_addr",
+    "name": "host_extension_invoke",
     "return": "record_out",
-    "doc": "Write the bound address of fd as u16 port LE + UTF-8 host bytes into (out_ptr, out_cap). Returns bytes-written.",
+    "doc": "Invoke a registered host extension through a native extension request record and write a native extension response record.",
     "args": [
       {
-        "name": "fd",
-        "type": "fd",
+        "name": "req_ptr",
+        "type": "ptr",
+        "doc": ""
+      },
+      {
+        "name": "req_len",
+        "type": "usize",
         "doc": ""
       },
       {

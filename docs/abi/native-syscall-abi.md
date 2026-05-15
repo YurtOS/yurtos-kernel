@@ -22,6 +22,14 @@ This is the proposed target ABI for the native syscall migration. It is not inst
 - `YURT_VERSION_MINOR` = `1`: Yurt product minor version.
 - `YURT_VERSION_PATCH` = `0`: Yurt product patch version.
 - `YURT_WAIT_NOHANG` = `1`: Return immediately from host_wait when no child has exited.
+- `YURT_SOCKET_ADDR_LOCAL` = `0`: Select local socket address.
+- `YURT_SOCKET_ADDR_PEER` = `1`: Select peer socket address.
+- `YURT_SOCKET_OPT_TCP_NODELAY` = `1`: TCP_NODELAY socket option.
+- `YURT_SOCKET_FLAG_TLS` = `1`: Connect using TLS.
+- `YURT_MSG_PEEK` = `2`: Socket recv peek flag.
+- `YURT_AF_INET` = `2`: IPv4 address family.
+- `YURT_FETCH_REDIRECT_FOLLOW` = `0`: Follow HTTP redirects.
+- `YURT_FETCH_REDIRECT_MANUAL` = `1`: Return manual redirect responses.
 
 ## Errno
 
@@ -39,6 +47,7 @@ This is the proposed target ABI for the native syscall migration. It is not inst
 - `ENOTDIR` = `20`: Not a directory.
 - `EINVAL` = `22`: Invalid argument.
 - `EOVERFLOW` = `75`: Value too large for defined data type.
+- `ENOTSOCK` = `88`: Socket operation on non-socket.
 - `ECONNRESET` = `104`: Connection reset by peer.
 - `ENOTCONN` = `107`: Socket is not connected.
 - `ECONNREFUSED` = `111`: Connection refused.
@@ -83,6 +92,156 @@ Fixed output written by host_spawn.
 | Field | Type | Description |
 | --- | --- | --- |
 | `pid` | `i32` | Spawned process id. |
+
+### `yurt_socket_addr_result_v1`
+
+Fixed IPv4 socket address result.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `host_be` | `u32` | IPv4 address in network byte order. |
+| `port_be` | `u16` | Port in network byte order. |
+| `reserved` | `u16` | Reserved; must be zero. |
+
+### `yurt_socket_accept_result_v1`
+
+Fixed accept result.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `fd` | `i32` | Accepted socket fd. |
+| `peer_host_be` | `u32` | Peer IPv4 address in network byte order. |
+| `peer_port_be` | `u16` | Peer port in network byte order. |
+| `local_port_be` | `u16` | Local port in network byte order. |
+| `local_host_be` | `u32` | Local IPv4 address in network byte order. |
+
+### `yurt_dns_addr_result_v1`
+
+Native DNS IPv4 address result.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `family` | `u32` | Address family, currently YURT_AF_INET. |
+| `addr_be` | `u32` | IPv4 address in network byte order. |
+
+### `yurt_record_span_v1`
+
+Offset and length pair inside a variable native record.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `offset` | `u32` | Byte offset from the start of the record. |
+| `length` | `u32` | Byte length. |
+
+### `yurt_record_pair_v1`
+
+Two string spans used for key/value vectors.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `key_offset` | `u32` | Key byte offset from the start of the record. |
+| `key_length` | `u32` | Key byte length. |
+| `value_offset` | `u32` | Value byte offset from the start of the record. |
+| `value_length` | `u32` | Value byte length. |
+
+### `yurt_fetch_request_v1`
+
+Variable native fetch request record header.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `size` | `u32` | Total logical record size. |
+| `version` | `u16` | Record version. |
+| `flags` | `u16` | Reserved flags. |
+| `url_offset` | `u32` | URL byte offset. |
+| `url_length` | `u32` | URL byte length. |
+| `method_offset` | `u32` | HTTP method byte offset. |
+| `method_length` | `u32` | HTTP method byte length. |
+| `headers_offset` | `u32` | Offset of yurt_record_pair_v1 header entries. |
+| `headers_count` | `u32` | Number of header entries. |
+| `body_offset` | `u32` | Request body byte offset, or zero for none. |
+| `body_length` | `u32` | Request body byte length. |
+| `redirect_mode` | `u32` | YURT_FETCH_REDIRECT_* value. |
+
+### `yurt_fetch_response_v1`
+
+Variable native fetch response record header.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `size` | `u32` | Total logical record size. |
+| `version` | `u16` | Record version. |
+| `flags` | `u16` | Reserved flags. |
+| `status` | `u32` | HTTP response status, or zero for transport error. |
+| `headers_offset` | `u32` | Offset of yurt_record_pair_v1 response header entries. |
+| `headers_count` | `u32` | Number of response header entries. |
+| `body_offset` | `u32` | Response body byte offset. |
+| `body_length` | `u32` | Response body byte length. |
+| `error_offset` | `u32` | Error string byte offset, or zero for no error. |
+| `error_length` | `u32` | Error string byte length. |
+
+### `yurt_extension_request_v1`
+
+Variable native extension invocation request record header.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `size` | `u32` | Total logical record size. |
+| `version` | `u16` | Record version. |
+| `flags` | `u16` | Reserved flags. |
+| `name_offset` | `u32` | Extension name byte offset. |
+| `name_length` | `u32` | Extension name byte length. |
+| `argv_offset` | `u32` | Offset of yurt_record_span_v1 argv entries. |
+| `argv_count` | `u32` | Number of argv entries. |
+| `stdin_offset` | `u32` | Stdin byte offset. |
+| `stdin_length` | `u32` | Stdin byte length. |
+| `cwd_offset` | `u32` | Current directory byte offset. |
+| `cwd_length` | `u32` | Current directory byte length. |
+| `env_offset` | `u32` | Offset of yurt_record_pair_v1 environment entries. |
+| `env_count` | `u32` | Number of environment entries. |
+| `payload_offset` | `u32` | Opaque plugin payload byte offset. |
+| `payload_length` | `u32` | Opaque plugin payload byte length. |
+
+### `yurt_extension_response_v1`
+
+Variable native extension invocation response record header.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `size` | `u32` | Total logical record size. |
+| `version` | `u16` | Record version. |
+| `flags` | `u16` | Reserved flags. |
+| `exit_code` | `i32` | Extension process-style exit code. |
+| `stdout_offset` | `u32` | Stdout byte offset. |
+| `stdout_length` | `u32` | Stdout byte length. |
+| `stderr_offset` | `u32` | Stderr byte offset. |
+| `stderr_length` | `u32` | Stderr byte length. |
+| `payload_offset` | `u32` | Opaque plugin response byte offset. |
+| `payload_length` | `u32` | Opaque plugin response byte length. |
+
+### `yurt_process_entry_v1`
+
+Fixed entry in a native process-list response.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `pid` | `i32` | Process id. |
+| `ppid` | `i32` | Parent process id. |
+| `state` | `u32` | Kernel process state enum value. |
+| `command_offset` | `u32` | Command string byte offset. |
+| `command_length` | `u32` | Command string byte length. |
+
+### `yurt_process_list_response_v1`
+
+Variable native process-list response record header.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `size` | `u32` | Total logical record size. |
+| `version` | `u16` | Record version. |
+| `flags` | `u16` | Reserved flags. |
+| `entries_offset` | `u32` | Offset of yurt_process_entry_v1 entries. |
+| `entries_count` | `u32` | Number of process entries. |
 
 ## Imports
 
@@ -185,6 +344,90 @@ Return convention: `stream_io`
 | `out_cap` | `usize` |  |
 | `flags` | `i32` |  |
 
+### `host_socket_connect`
+
+Connect a socket fd to a POSIX sockaddr record. Flags may include YURT_SOCKET_FLAG_TLS.
+
+Return convention: `scalar_errno`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `fd` | `fd` |  |
+| `addr_ptr` | `ptr` |  |
+| `addr_len` | `usize` |  |
+| `flags` | `u32` |  |
+
+### `host_socket_bind`
+
+Bind a socket fd to a POSIX sockaddr record.
+
+Return convention: `scalar_errno`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `fd` | `fd` |  |
+| `addr_ptr` | `ptr` |  |
+| `addr_len` | `usize` |  |
+
+### `host_socket_listen`
+
+Listen on a bound socket fd.
+
+Return convention: `scalar_errno`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `fd` | `fd` |  |
+| `backlog` | `i32` |  |
+
+### `host_socket_accept`
+
+Accept a connection and write yurt_socket_accept_result_v1.
+
+Return convention: `fixed_out`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `fd` | `fd` |  |
+| `out_ptr` | `ptr` |  |
+| `out_cap` | `usize` |  |
+
+### `host_socket_addr`
+
+Write yurt_socket_addr_result_v1 for local or peer address.
+
+Return convention: `fixed_out`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `fd` | `fd` |  |
+| `which` | `u32` |  |
+| `out_ptr` | `ptr` |  |
+| `out_cap` | `usize` |  |
+
+### `host_socket_option`
+
+Set or get a scalar socket option. Get returns the option value as a non-negative scalar.
+
+Return convention: `scalar_errno`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `fd` | `fd` |  |
+| `option` | `u32` |  |
+| `has_value` | `u32` |  |
+| `value` | `i32` |  |
+
+### `host_socket_close`
+
+Close a socket fd.
+
+Return convention: `scalar_errno`
+
+| Argument | Type | Description |
+| --- | --- | --- |
+| `fd` | `fd` |  |
+
 ### `host_dns_resolve`
 
 Resolve a UTF-8 host name and write a native address record.
@@ -211,60 +454,16 @@ Return convention: `record_out`
 | `out_ptr` | `ptr` |  |
 | `out_cap` | `usize` |  |
 
-### `host_socket_connect`
+### `host_extension_invoke`
 
-Open a TCP socket and connect to addr ('host:port' UTF-8). Returns a socket fd or negated errno.
-
-Return convention: `stream_io`
-
-| Argument | Type | Description |
-| --- | --- | --- |
-| `addr_ptr` | `ptr` |  |
-| `addr_len` | `usize` |  |
-| `flags` | `i32` |  |
-
-### `host_socket_close`
-
-Close a socket fd previously returned from host_socket_connect / host_socket_listen / host_socket_accept.
-
-Return convention: `stream_io`
-
-| Argument | Type | Description |
-| --- | --- | --- |
-| `fd` | `fd` |  |
-
-### `host_socket_listen`
-
-Bind to addr and start accepting. Returns a listener fd or negated errno. Use host_socket_addr to discover the actually-bound port when port=0.
-
-Return convention: `stream_io`
-
-| Argument | Type | Description |
-| --- | --- | --- |
-| `backlog` | `i32` |  |
-| `addr_ptr` | `ptr` |  |
-| `addr_len` | `usize` |  |
-
-### `host_socket_accept`
-
-Block until a connection arrives on the listener fd. Returns the new connection's fd.
-
-Return convention: `stream_io`
-
-| Argument | Type | Description |
-| --- | --- | --- |
-| `fd` | `fd` |  |
-| `flags` | `i32` |  |
-
-### `host_socket_addr`
-
-Write the bound address of fd as u16 port LE + UTF-8 host bytes into (out_ptr, out_cap). Returns bytes-written.
+Invoke a registered host extension through a native extension request record and write a native extension response record.
 
 Return convention: `record_out`
 
 | Argument | Type | Description |
 | --- | --- | --- |
-| `fd` | `fd` |  |
+| `req_ptr` | `ptr` |  |
+| `req_len` | `usize` |  |
 | `out_ptr` | `ptr` |  |
 | `out_cap` | `usize` |  |
 

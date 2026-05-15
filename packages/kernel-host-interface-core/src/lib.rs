@@ -262,6 +262,27 @@ impl CompiledModule {
 /// POSIX EFAULT — kernel and helper return on host-side memory or
 /// engine-call failure. Same value as `abi/contract/yurt_abi.toml`.
 const EFAULT: i64 = 14;
+const E2BIG: i64 = 7;
+pub const MAX_GUEST_BUFFER_LEN: u32 = 1024 * 1024;
+
+pub fn checked_guest_buffer_len(len: u32) -> Result<usize, i64> {
+    if len > MAX_GUEST_BUFFER_LEN {
+        Err(-E2BIG)
+    } else {
+        Ok(len as usize)
+    }
+}
+
+pub fn checked_guest_buffer_sum(parts: &[u32]) -> Result<usize, i64> {
+    let mut total = 0u32;
+    for part in parts {
+        total = total.checked_add(*part).ok_or(-E2BIG)?;
+        if total > MAX_GUEST_BUFFER_LEN {
+            return Err(-E2BIG);
+        }
+    }
+    Ok(total as usize)
+}
 
 /// Forward a scalar-only syscall (no request bytes, no response
 /// capacity). Returns the i32 cast of the kernel's i64 result.
@@ -301,7 +322,11 @@ pub fn forward_user_ptr_len<S: HasCallerPid, C: HostCallCtx<S>>(
     user_ptr: u32,
     user_len: u32,
 ) -> i32 {
-    let mut buf = vec![0u8; user_len as usize];
+    let len = match checked_guest_buffer_len(user_len) {
+        Ok(n) => n,
+        Err(rc) => return rc as i32,
+    };
+    let mut buf = vec![0u8; len];
     if user_len > 0 && ctx.read_user_memory(user_ptr, &mut buf).is_err() {
         return -(EFAULT as i32);
     }
@@ -380,11 +405,47 @@ pub fn trampoline_request_with_response<S: HasCallerPid, C: HostCallCtx<S>>(
     response: &mut [u8],
 ) -> i64 {
     let pid = ctx.user_state().caller_pid();
-    let outcome = ctx.dispatch_kernel(method_id, pid, req_bytes, response.len() as u32);
+    let response_cap = match u32::try_from(response.len()) {
+        Ok(n) => n,
+        Err(_) => return -E2BIG,
+    };
+    let outcome = ctx.dispatch_kernel(method_id, pid, req_bytes, response_cap);
     if outcome.rc <= 0 {
         return outcome.rc;
     }
     let to_copy = outcome.response.len().min(response.len());
     response[..to_copy].copy_from_slice(&outcome.response[..to_copy]);
     outcome.rc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn core_guest_buffer_lengths_are_capped_before_allocation() {
+        assert_eq!(checked_guest_buffer_len(0), Ok(0));
+        assert_eq!(
+            checked_guest_buffer_len(MAX_GUEST_BUFFER_LEN),
+            Ok(MAX_GUEST_BUFFER_LEN as usize)
+        );
+        assert_eq!(
+            checked_guest_buffer_len(MAX_GUEST_BUFFER_LEN + 1),
+            Err(-E2BIG)
+        );
+    }
+
+    #[test]
+    fn core_guest_buffer_sum_checks_overflow_and_cap() {
+        assert_eq!(checked_guest_buffer_sum(&[4, 8, 16]), Ok(28));
+        assert_eq!(
+            checked_guest_buffer_sum(&[MAX_GUEST_BUFFER_LEN - 4, 4]),
+            Ok(MAX_GUEST_BUFFER_LEN as usize)
+        );
+        assert_eq!(
+            checked_guest_buffer_sum(&[MAX_GUEST_BUFFER_LEN, 1]),
+            Err(-E2BIG)
+        );
+        assert_eq!(checked_guest_buffer_sum(&[u32::MAX, 1]), Err(-E2BIG));
+    }
 }

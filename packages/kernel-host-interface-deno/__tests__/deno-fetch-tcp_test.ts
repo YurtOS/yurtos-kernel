@@ -28,6 +28,18 @@ const HAS_JSPI = typeof W?.Suspending === "function" &&
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+function sockaddrIn(
+  host: [number, number, number, number],
+  port: number,
+): Uint8Array {
+  const addr = new Uint8Array(16);
+  const view = new DataView(addr.buffer);
+  view.setUint16(0, 2, true);
+  view.setUint16(2, port & 0xffff, false);
+  addr.set(host, 4);
+  return addr;
+}
+
 function nativeFetchRequest(url: string, method: string): Uint8Array {
   const urlBytes = enc.encode(url);
   const methodBytes = enc.encode(method);
@@ -173,10 +185,10 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
       expect(handle).toBeGreaterThan(0);
 
       // sys_socket_connect.
-      const addr = `127.0.0.1:${port}`;
-      const cReq = new Uint8Array(4 + addr.length);
+      const addr = sockaddrIn([127, 0, 0, 1], port);
+      const cReq = new Uint8Array(4 + addr.byteLength);
       new DataView(cReq.buffer).setUint32(0, handle, true);
-      new TextEncoder().encodeInto(addr, cReq.subarray(4));
+      cReq.set(addr, 4);
       const cOut = await mk.syscallAsync(
         METHOD.SYS_SOCKET_CONNECT,
         cReq,
@@ -237,10 +249,10 @@ describe("DenoFetch + DenoTcpSocket via JSPI", () => {
     const handle = Number(openOut.rc);
     expect(handle).toBeGreaterThan(0);
 
-    const addr = "127.0.0.1:0";
-    const bindReq = new Uint8Array(4 + addr.length);
+    const addr = sockaddrIn([127, 0, 0, 1], 0);
+    const bindReq = new Uint8Array(4 + addr.byteLength);
     new DataView(bindReq.buffer).setUint32(0, handle, true);
-    new TextEncoder().encodeInto(addr, bindReq.subarray(4));
+    bindReq.set(addr, 4);
     const bindOut = await mk.syscallAsync(METHOD.SYS_SOCKET_BIND, bindReq, 0);
     expect(Number(bindOut.rc)).toEqual(0);
 

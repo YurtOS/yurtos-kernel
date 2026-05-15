@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/uio.h>
 #include <wasi/wasip1.h>
 
 #ifndef SO_ERROR
@@ -72,6 +73,12 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 #define YURT_SOCKET_ADDR_LOCAL 0u
 #define YURT_SOCKET_ADDR_PEER 1u
 #define YURT_SOCKET_OPT_TCP_NODELAY 1u
+#define YURT_WASI_AF_INET 1
+#define YURT_RUST_STD_AF_INET 2
+
+static int yurt_is_af_inet(int family) {
+  return family == YURT_WASI_AF_INET || family == YURT_RUST_STD_AF_INET;
+}
 
 #define YURT_HOST_ERR_NOT_FOUND -1
 #define YURT_HOST_ERR_IO -3
@@ -88,6 +95,9 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 #define YURT_HOST_ECONNREFUSED 111
 #define YURT_HOST_EOPNOTSUPP 95
 
+#define YURT_RS_SOCKET_IOV_EFAULT -1
+#define YURT_RS_SOCKET_IOV_EOVERFLOW -2
+
 /* wasi-libc already ships strong definitions for some POSIX socket names.
  * yurt-cc/cargo-yurt pass --wrap for the duplicate-owned symbols we implement
  * here (`accept`, `send`, `recv`, `getsockopt`) so Rust and C guests both route
@@ -95,6 +105,26 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 
 /* Forward declaration for SO_PEERCRED helper (Slice 6) */
 static int yurt_getsockopt_peercred(int sockfd, void *optval, socklen_t *optlen);
+
+extern int yurt_rs_socket_iov_total(
+  const struct iovec *iov,
+  size_t iovlen,
+  size_t *out_total
+);
+extern int yurt_rs_socket_iov_gather(
+  const struct iovec *iov,
+  size_t iovlen,
+  unsigned char *dst,
+  size_t dst_cap,
+  size_t *out_total
+);
+extern int yurt_rs_socket_iov_scatter(
+  const struct iovec *iov,
+  size_t iovlen,
+  const unsigned char *src,
+  size_t src_len,
+  size_t *out_copied
+);
 
 typedef struct yurt_socket_addr_result_v1 {
   uint32_t host_be;
@@ -155,6 +185,17 @@ static void set_socket_errno_from_host(int err) {
   }
 }
 
+static int yurt_errno_from_socket_iov_rc(int rc) {
+  switch (rc) {
+    case YURT_RS_SOCKET_IOV_EFAULT:
+      return EFAULT;
+    case YURT_RS_SOCKET_IOV_EOVERFLOW:
+      return EOVERFLOW;
+    default:
+      return EINVAL;
+  }
+}
+
 static int yurt_socket_impl(int domain, int type, int protocol) {
   YURT_MARKER_CALL(socket);
 
@@ -170,7 +211,7 @@ static int yurt_socket_impl(int domain, int type, int protocol) {
     if (fd < 0) { errno = EMFILE; return -1; }
     return fd;
   }
-  if (domain != AF_INET || (type & SOCK_STREAM) != SOCK_STREAM) {
+  if (!yurt_is_af_inet(domain) || (type & SOCK_STREAM) != SOCK_STREAM) {
     errno = EAFNOSUPPORT;
     return -1;
   }
@@ -193,7 +234,6 @@ int __wrap_socket(int domain, int type, int protocol) {
 
 static int yurt_connect_impl(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   YURT_MARKER_CALL(connect);
-  char host[256];
   int rc;
 
   if (!addr || addrlen < 2) {
@@ -225,31 +265,15 @@ static int yurt_connect_impl(int sockfd, const struct sockaddr *addr, socklen_t 
     return 0;
   }
 
-  if (addrlen < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) {
+  if (addrlen < sizeof(struct sockaddr_in) || !yurt_is_af_inet(addr->sa_family)) {
     errno = EAFNOSUPPORT;
     return -1;
   }
 
-  const struct sockaddr_in *in = (const struct sockaddr_in *)addr;
-  const char *mapped_host = yurt_netdb_host_for_addr(in->sin_addr.s_addr);
-  if (mapped_host) {
-    if (strlen(mapped_host) >= sizeof(host)) {
-      errno = EOVERFLOW;
-      return -1;
-    }
-    strcpy(host, mapped_host);
-  } else {
-    if (!inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host))) {
-      errno = EINVAL;
-      return -1;
-    }
-  }
-
   rc = yurt_host_socket_connect(
     sockfd,
-    (int)(intptr_t)host,
-    (int)strlen(host),
-    (unsigned)ntohs(in->sin_port),
+    (int)(intptr_t)addr,
+    (int)addrlen,
     0
   );
   if (rc < 0) {
@@ -308,27 +332,6 @@ static int yurt_fill_sockaddr_from_native(
   in.sin_addr.s_addr = host_be;
   memcpy(addr, &in, sizeof(in));
   *addrlen = (socklen_t)sizeof(in);
-  return 0;
-}
-
-static int yurt_sockaddr_to_host_port(
-  const struct sockaddr *addr,
-  socklen_t addrlen,
-  char *host,
-  size_t host_cap,
-  int *port
-) {
-  const struct sockaddr_in *in;
-  if (!addr || addrlen < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) {
-    errno = EAFNOSUPPORT;
-    return -1;
-  }
-  in = (const struct sockaddr_in *)addr;
-  if (!inet_ntop(AF_INET, &in->sin_addr, host, host_cap)) {
-    errno = EINVAL;
-    return -1;
-  }
-  *port = (int)ntohs(in->sin_port);
   return 0;
 }
 
@@ -439,8 +442,6 @@ int __wrap_getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
 
 static int yurt_bind_impl(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
   YURT_MARKER_CALL(bind);
-  char host[INET_ADDRSTRLEN];
-  int port;
   int rc;
 
   if (!addr || addrlen < 2) { errno = EINVAL; return -1; }
@@ -469,15 +470,15 @@ static int yurt_bind_impl(int sockfd, const struct sockaddr *addr, socklen_t add
     return 0;
   }
 
-  /* AF_INET path (existing) */
-  if (yurt_sockaddr_to_host_port(addr, addrlen, host, sizeof(host), &port) != 0) {
+  if (addrlen < sizeof(struct sockaddr_in) || !yurt_is_af_inet(addr->sa_family)) {
+    errno = EAFNOSUPPORT;
     return -1;
   }
+
   rc = yurt_host_socket_bind(
     sockfd,
-    (int)(intptr_t)host,
-    (int)strlen(host),
-    (unsigned)port
+    (int)(intptr_t)addr,
+    (int)addrlen
   );
   if (rc < 0) {
     errno = yurt_errno_from_host(rc, EOPNOTSUPP);
@@ -902,7 +903,7 @@ static int yurt_socketpair_apply_type_flags(int fd, int type) {
 int socketpair(int domain, int type, int protocol, int sv[2]) {
   YURT_MARKER_CALL(socketpair);
   if (!sv) { errno = EFAULT; return -1; }
-  if (domain != AF_UNIX && domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+  if (domain != AF_UNIX && !yurt_is_af_inet(domain)) { errno = EAFNOSUPPORT; return -1; }
   int base_type = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
   if (base_type != SOCK_STREAM && base_type != SOCK_DGRAM) { errno = EPROTOTYPE; return -1; }
   (void)protocol;
@@ -931,16 +932,29 @@ ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags) {
   YURT_MARKER_CALL(sendmsg);
   if (!msg) { errno = EINVAL; return -1; }
 
-  /* Gather iovecs into one contiguous buffer */
   size_t total = 0;
-  for (int i = 0; i < (int)msg->msg_iovlen; i++) total += msg->msg_iov[i].iov_len;
+  int iov_rc = yurt_rs_socket_iov_total(msg->msg_iov, msg->msg_iovlen, &total);
+  if (iov_rc != 0) {
+    errno = yurt_errno_from_socket_iov_rc(iov_rc);
+    return -1;
+  }
+  if (total > INT_MAX) {
+    errno = EOVERFLOW;
+    return -1;
+  }
   unsigned char *data = malloc(total ? total : 1);
   if (!data) { errno = ENOMEM; return -1; }
-  { size_t off = 0;
-    for (int i = 0; i < (int)msg->msg_iovlen; i++) {
-      memcpy(data + off, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
-      off += msg->msg_iov[i].iov_len;
-    }
+  iov_rc = yurt_rs_socket_iov_gather(
+    msg->msg_iov,
+    msg->msg_iovlen,
+    data,
+    total,
+    &total
+  );
+  if (iov_rc != 0) {
+    free(data);
+    errno = yurt_errno_from_socket_iov_rc(iov_rc);
+    return -1;
   }
 
   /* Collect SCM_RIGHTS fd numbers from ancillary data */
@@ -974,7 +988,11 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
   if (!msg) { errno = EINVAL; return -1; }
 
   size_t total_iov = 0;
-  for (int i = 0; i < (int)msg->msg_iovlen; i++) total_iov += msg->msg_iov[i].iov_len;
+  int iov_rc = yurt_rs_socket_iov_total(msg->msg_iov, msg->msg_iovlen, &total_iov);
+  if (iov_rc != 0) {
+    errno = yurt_errno_from_socket_iov_rc(iov_rc);
+    return -1;
+  }
   if (total_iov > YURT_SOCKET_RECV_MAX_RAW) total_iov = YURT_SOCKET_RECV_MAX_RAW;
 
   unsigned char *buf = malloc(total_iov ? total_iov : 1);
@@ -1001,14 +1019,18 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
   }
   ssize_t nbytes = (ssize_t)rc;
 
-  /* Scatter received bytes into iov */
-  { size_t off = 0;
-    for (int i = 0; i < (int)msg->msg_iovlen && off < (size_t)nbytes; i++) {
-      size_t copy = msg->msg_iov[i].iov_len;
-      if (off + copy > (size_t)nbytes) copy = (size_t)nbytes - off;
-      memcpy(msg->msg_iov[i].iov_base, buf + off, copy);
-      off += copy;
-    }
+  size_t copied = 0;
+  iov_rc = yurt_rs_socket_iov_scatter(
+    msg->msg_iov,
+    msg->msg_iovlen,
+    buf,
+    (size_t)nbytes,
+    &copied
+  );
+  if (iov_rc != 0) {
+    free(buf);
+    errno = yurt_errno_from_socket_iov_rc(iov_rc);
+    return -1;
   }
   free(buf);
 

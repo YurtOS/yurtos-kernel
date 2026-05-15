@@ -58,21 +58,6 @@ static void emit(const char *case_name,
   printf("}\n");
 }
 
-/* All cases share this body until their slice lands.
- *
- * Reading the case-implementation slices upstream:
- *   slice 2 — pair_basic, bind_listen_accept, stat_socket_inode,
- *             unlink_removes, connect_refused
- *   slice 3 — abstract_bind_connect, abstract_invisible_to_stat
- *   slice 4 — dgram_pair_message_framing, dgram_path_sendto
- *   slice 5 — scm_rights_pipe_handoff
- *   slice 6 — peercred_after_accept
- */
-static int pending(const char *case_name) {
-  emit(case_name, 99, "pending-impl", 0, 0);
-  return 99;
-}
-
 static int case_pair_basic(void) {
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
@@ -390,7 +375,9 @@ static int case_dgram_pair_message_framing(void) {
 
 static int case_dgram_path_sendto(void) {
   const char *server_path = "/tmp/yurt-dgram-test.sock";
+  const char *client_path = "/tmp/yurt-dgram-client.sock";
   struct sockaddr_un server_addr;
+  struct sockaddr_un client_addr;
   socklen_t addrlen;
   int server_fd, client_fd;
   char buf[32];
@@ -402,6 +389,9 @@ static int case_dgram_path_sendto(void) {
   server_addr.sun_family = AF_UNIX;
   strncpy(server_addr.sun_path, server_path, sizeof(server_addr.sun_path) - 1);
   addrlen = (socklen_t)sizeof(server_addr);
+  memset(&client_addr, 0, sizeof(client_addr));
+  client_addr.sun_family = AF_UNIX;
+  strncpy(client_addr.sun_path, client_path, sizeof(client_addr.sun_path) - 1);
 
   server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
   if (server_fd < 0) { emit("dgram_path_sendto", 1, NULL, 1, errno); return 1; }
@@ -409,9 +399,16 @@ static int case_dgram_path_sendto(void) {
   if (client_fd < 0) { emit("dgram_path_sendto", 1, NULL, 1, errno); close(server_fd); return 1; }
 
   unlink(server_path);
+  unlink(client_path);
   if (bind(server_fd, (struct sockaddr *)&server_addr, addrlen) != 0) {
     emit("dgram_path_sendto", 1, "bind-fail", 1, errno);
     close(server_fd); close(client_fd);
+    return 1;
+  }
+  if (bind(client_fd, (struct sockaddr *)&client_addr, (socklen_t)sizeof(client_addr)) != 0) {
+    emit("dgram_path_sendto", 1, "client-bind-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    unlink(server_path); unlink(client_path);
     return 1;
   }
 
@@ -419,23 +416,235 @@ static int case_dgram_path_sendto(void) {
   if (n != 4) {
     emit("dgram_path_sendto", 1, "sendto-fail", 1, errno);
     close(server_fd); close(client_fd);
-    unlink(server_path);
+    unlink(server_path); unlink(client_path);
     return 1;
   }
 
   n = recvfrom(server_fd, buf, sizeof(buf), 0, (struct sockaddr *)&src_addr, &src_len);
-  if (n != 4 || memcmp(buf, "ping", 4) != 0) {
+  if (n != 4 || memcmp(buf, "ping", 4) != 0 ||
+      src_addr.sun_family != AF_UNIX ||
+      strcmp(src_addr.sun_path, client_path) != 0) {
     emit("dgram_path_sendto", 1, "recvfrom-fail", 1, errno);
     close(server_fd); close(client_fd);
-    unlink(server_path);
+    unlink(server_path); unlink(client_path);
     return 1;
   }
 
   close(server_fd);
   close(client_fd);
   unlink(server_path);
+  unlink(client_path);
   emit("dgram_path_sendto", 0, "dgram-path=ok", 0, 0);
   return 0;
+}
+
+static int case_dgram_connect_send(void) {
+  const char *server_path = "/tmp/yurt-dgram-connect.sock";
+  struct sockaddr_un server_addr;
+  struct sockaddr_un got;
+  socklen_t got_len;
+  int server_fd, client_fd;
+  char buf[16];
+
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sun_family = AF_UNIX;
+  strncpy(server_addr.sun_path, server_path, sizeof(server_addr.sun_path) - 1);
+  socklen_t addrlen = (socklen_t)sizeof(server_addr);
+
+  server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (server_fd < 0) { emit("dgram_connect_send", 1, NULL, 1, errno); return 1; }
+  client_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (client_fd < 0) {
+    emit("dgram_connect_send", 1, NULL, 1, errno);
+    close(server_fd); return 1;
+  }
+
+  unlink(server_path);
+  if (bind(server_fd, (struct sockaddr *)&server_addr, addrlen) != 0) {
+    emit("dgram_connect_send", 1, "bind-fail", 1, errno);
+    close(server_fd); close(client_fd); return 1;
+  }
+  if (connect(client_fd, (struct sockaddr *)&server_addr, addrlen) != 0) {
+    emit("dgram_connect_send", 1, "connect-fail", 1, errno);
+    close(server_fd); close(client_fd); unlink(server_path); return 1;
+  }
+  memset(&got, 0, sizeof(got));
+  got_len = sizeof(got);
+  if (getpeername(client_fd, (struct sockaddr *)&got, &got_len) != 0 ||
+      got.sun_family != AF_UNIX ||
+      strcmp(got.sun_path, server_path) != 0) {
+    emit("dgram_connect_send", 1, "peername-fail", 1, errno);
+    close(server_fd); close(client_fd); unlink(server_path); return 1;
+  }
+  if (send(client_fd, "ping", 4, 0) != 4) {
+    emit("dgram_connect_send", 1, "send-fail", 1, errno);
+    close(server_fd); close(client_fd); unlink(server_path); return 1;
+  }
+  ssize_t n = recv(server_fd, buf, sizeof(buf), 0);
+  if (n != 4 || memcmp(buf, "ping", 4) != 0) {
+    emit("dgram_connect_send", 1, "recv-fail", 1, errno);
+    close(server_fd); close(client_fd); unlink(server_path); return 1;
+  }
+
+  close(server_fd); close(client_fd); unlink(server_path);
+  emit("dgram_connect_send", 0, "dgram-connect=ok", 0, 0);
+  return 0;
+}
+
+static int case_getpeername_unconnected(void) {
+  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  struct sockaddr_un got;
+  socklen_t got_len = sizeof(got);
+  int saved_errno;
+
+  if (fd < 0) {
+    emit("getpeername_unconnected", 1, "socket-fail", 1, errno);
+    return 1;
+  }
+
+  memset(&got, 0, sizeof(got));
+  errno = 0;
+  if (getpeername(fd, (struct sockaddr *)&got, &got_len) == 0) {
+    emit("getpeername_unconnected", 1, "peername-succeeded", 0, 0);
+    close(fd);
+    return 1;
+  }
+  saved_errno = errno;
+  close(fd);
+
+  if (saved_errno == ENOTCONN) {
+    emit("getpeername_unconnected", 0, "enotconn=ok", 0, 0);
+    return 0;
+  }
+  emit("getpeername_unconnected", 1, "wrong-errno", 1, saved_errno);
+  return 1;
+}
+
+static int case_dgram_reconnect_after_close(void) {
+  const char *server_path = "/tmp/yurt-dgram-reconnect.sock";
+  int sv[2];
+  int server_fd;
+  struct sockaddr_un server_addr;
+  char buf[16];
+
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) != 0) {
+    emit("dgram_reconnect_after_close", 1, "socketpair-fail", 1, errno);
+    return 1;
+  }
+  close(sv[1]);
+
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sun_family = AF_UNIX;
+  strncpy(server_addr.sun_path, server_path, sizeof(server_addr.sun_path) - 1);
+  socklen_t addrlen = (socklen_t)sizeof(server_addr);
+
+  server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (server_fd < 0) {
+    emit("dgram_reconnect_after_close", 1, "socket-fail", 1, errno);
+    close(sv[0]);
+    return 1;
+  }
+
+  unlink(server_path);
+  if (bind(server_fd, (struct sockaddr *)&server_addr, addrlen) != 0) {
+    emit("dgram_reconnect_after_close", 1, "bind-fail", 1, errno);
+    close(sv[0]); close(server_fd);
+    return 1;
+  }
+  if (connect(sv[0], (struct sockaddr *)&server_addr, addrlen) != 0) {
+    emit("dgram_reconnect_after_close", 1, "connect-fail", 1, errno);
+    close(sv[0]); close(server_fd); unlink(server_path);
+    return 1;
+  }
+  if (send(sv[0], "ping", 4, 0) != 4) {
+    emit("dgram_reconnect_after_close", 1, "send-fail", 1, errno);
+    close(sv[0]); close(server_fd); unlink(server_path);
+    return 1;
+  }
+  ssize_t n = recv(server_fd, buf, sizeof(buf), 0);
+  close(sv[0]); close(server_fd); unlink(server_path);
+
+  if (n == 4 && memcmp(buf, "ping", 4) == 0) {
+    emit("dgram_reconnect_after_close", 0, "reconnect=ok", 0, 0);
+    return 0;
+  }
+  emit("dgram_reconnect_after_close", 1, "recv-fail", 1, errno);
+  return 1;
+}
+
+static int case_dgram_sendmsg_recvfrom_source(void) {
+  const char *server_path = "/tmp/yurt-dgram-sendmsg-server.sock";
+  const char *client_path = "/tmp/yurt-dgram-sendmsg-client.sock";
+  struct sockaddr_un server_addr;
+  struct sockaddr_un client_addr;
+  struct sockaddr_un src_addr;
+  socklen_t src_len = sizeof(src_addr);
+  int server_fd, client_fd;
+  char buf[16];
+  char payload[] = "ping";
+  struct msghdr msg;
+  struct iovec iov;
+
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sun_family = AF_UNIX;
+  strncpy(server_addr.sun_path, server_path, sizeof(server_addr.sun_path) - 1);
+  memset(&client_addr, 0, sizeof(client_addr));
+  client_addr.sun_family = AF_UNIX;
+  strncpy(client_addr.sun_path, client_path, sizeof(client_addr.sun_path) - 1);
+
+  server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (server_fd < 0) {
+    emit("dgram_sendmsg_recvfrom_source", 1, "server-socket-fail", 1, errno);
+    return 1;
+  }
+  client_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (client_fd < 0) {
+    emit("dgram_sendmsg_recvfrom_source", 1, "client-socket-fail", 1, errno);
+    close(server_fd);
+    return 1;
+  }
+
+  unlink(server_path);
+  unlink(client_path);
+  if (bind(server_fd, (struct sockaddr *)&server_addr, (socklen_t)sizeof(server_addr)) != 0 ||
+      bind(client_fd, (struct sockaddr *)&client_addr, (socklen_t)sizeof(client_addr)) != 0) {
+    emit("dgram_sendmsg_recvfrom_source", 1, "bind-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    unlink(server_path); unlink(client_path);
+    return 1;
+  }
+  if (connect(client_fd, (struct sockaddr *)&server_addr, (socklen_t)sizeof(server_addr)) != 0) {
+    emit("dgram_sendmsg_recvfrom_source", 1, "connect-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    unlink(server_path); unlink(client_path);
+    return 1;
+  }
+
+  memset(&msg, 0, sizeof(msg));
+  iov.iov_base = payload;
+  iov.iov_len = 4;
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  if (sendmsg(client_fd, &msg, 0) != 4) {
+    emit("dgram_sendmsg_recvfrom_source", 1, "sendmsg-fail", 1, errno);
+    close(server_fd); close(client_fd);
+    unlink(server_path); unlink(client_path);
+    return 1;
+  }
+
+  ssize_t n = recvfrom(server_fd, buf, sizeof(buf), 0,
+                       (struct sockaddr *)&src_addr, &src_len);
+  close(server_fd); close(client_fd);
+  unlink(server_path); unlink(client_path);
+
+  if (n == 4 && memcmp(buf, "ping", 4) == 0 &&
+      src_addr.sun_family == AF_UNIX &&
+      strcmp(src_addr.sun_path, client_path) == 0) {
+    emit("dgram_sendmsg_recvfrom_source", 0, "sendmsg-source=ok", 0, 0);
+    return 0;
+  }
+  emit("dgram_sendmsg_recvfrom_source", 1, "recvfrom-fail", 1, errno);
+  return 1;
 }
 
 static int case_scm_rights_pipe_handoff(void) {
@@ -1067,6 +1276,126 @@ static int case_stat_after_listener_close(void) {
   return 0;
 }
 
+static int case_stream_socknames_path(void) {
+  const char *path = "/tmp/yurt-socknames.sock";
+  struct sockaddr_un addr;
+  struct sockaddr_un got;
+  socklen_t got_len;
+  int server_fd, client_fd, accepted_fd;
+
+  unlink(path);
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+  socklen_t addrlen = (socklen_t)sizeof(addr);
+
+  server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (server_fd < 0) { emit("stream_socknames_path", 1, NULL, 1, errno); return 1; }
+  if (bind(server_fd, (struct sockaddr *)&addr, addrlen) != 0 ||
+      listen(server_fd, 1) != 0) {
+    emit("stream_socknames_path", 1, "bind-listen-fail", 1, errno);
+    close(server_fd); unlink(path); return 1;
+  }
+
+  client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (client_fd < 0) {
+    emit("stream_socknames_path", 1, NULL, 1, errno);
+    close(server_fd); unlink(path); return 1;
+  }
+  if (connect(client_fd, (struct sockaddr *)&addr, addrlen) != 0) {
+    emit("stream_socknames_path", 1, "connect-fail", 1, errno);
+    close(client_fd); close(server_fd); unlink(path); return 1;
+  }
+  accepted_fd = accept(server_fd, NULL, NULL);
+  if (accepted_fd < 0) {
+    emit("stream_socknames_path", 1, "accept-fail", 1, errno);
+    close(client_fd); close(server_fd); unlink(path); return 1;
+  }
+
+  memset(&got, 0, sizeof(got));
+  got_len = sizeof(got);
+  if (getpeername(client_fd, (struct sockaddr *)&got, &got_len) != 0 ||
+      got.sun_family != AF_UNIX ||
+      strcmp(got.sun_path, path) != 0) {
+    emit("stream_socknames_path", 1, "client-peername-fail", 1, errno);
+    close(accepted_fd); close(client_fd); close(server_fd); unlink(path); return 1;
+  }
+
+  memset(&got, 0, sizeof(got));
+  got_len = sizeof(got);
+  if (getsockname(accepted_fd, (struct sockaddr *)&got, &got_len) != 0 ||
+      got.sun_family != AF_UNIX ||
+      strcmp(got.sun_path, path) != 0) {
+    emit("stream_socknames_path", 1, "accepted-sockname-fail", 1, errno);
+    close(accepted_fd); close(client_fd); close(server_fd); unlink(path); return 1;
+  }
+
+  close(accepted_fd); close(client_fd); close(server_fd); unlink(path);
+  emit("stream_socknames_path", 0, "socknames=ok", 0, 0);
+  return 0;
+}
+
+static int case_stream_socknames_abstract(void) {
+  const char *name = "yurt-socknames-abstract";
+  size_t name_len = strlen(name);
+  struct sockaddr_un addr;
+  struct sockaddr_un got;
+  socklen_t got_len;
+  int server_fd, client_fd, accepted_fd;
+
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path + 1, name, sizeof(addr.sun_path) - 2);
+  socklen_t addrlen = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
+
+  server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (server_fd < 0) { emit("stream_socknames_abstract", 1, NULL, 1, errno); return 1; }
+  if (bind(server_fd, (struct sockaddr *)&addr, addrlen) != 0 ||
+      listen(server_fd, 1) != 0) {
+    emit("stream_socknames_abstract", 1, "bind-listen-fail", 1, errno);
+    close(server_fd); return 1;
+  }
+
+  client_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (client_fd < 0) {
+    emit("stream_socknames_abstract", 1, NULL, 1, errno);
+    close(server_fd); return 1;
+  }
+  if (connect(client_fd, (struct sockaddr *)&addr, addrlen) != 0) {
+    emit("stream_socknames_abstract", 1, "connect-fail", 1, errno);
+    close(client_fd); close(server_fd); return 1;
+  }
+  accepted_fd = accept(server_fd, NULL, NULL);
+  if (accepted_fd < 0) {
+    emit("stream_socknames_abstract", 1, "accept-fail", 1, errno);
+    close(client_fd); close(server_fd); return 1;
+  }
+
+  memset(&got, 0, sizeof(got));
+  got_len = sizeof(got);
+  if (getpeername(client_fd, (struct sockaddr *)&got, &got_len) != 0 ||
+      got.sun_family != AF_UNIX ||
+      got.sun_path[0] != '\0' ||
+      memcmp(got.sun_path + 1, name, name_len) != 0) {
+    emit("stream_socknames_abstract", 1, "client-peername-fail", 1, errno);
+    close(accepted_fd); close(client_fd); close(server_fd); return 1;
+  }
+
+  memset(&got, 0, sizeof(got));
+  got_len = sizeof(got);
+  if (getsockname(accepted_fd, (struct sockaddr *)&got, &got_len) != 0 ||
+      got.sun_family != AF_UNIX ||
+      got.sun_path[0] != '\0' ||
+      memcmp(got.sun_path + 1, name, name_len) != 0) {
+    emit("stream_socknames_abstract", 1, "accepted-sockname-fail", 1, errno);
+    close(accepted_fd); close(client_fd); close(server_fd); return 1;
+  }
+
+  close(accepted_fd); close(client_fd); close(server_fd);
+  emit("stream_socknames_abstract", 0, "abstract-socknames=ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "pair_basic") == 0)                 return case_pair_basic();
   if (strcmp(name, "bind_listen_accept") == 0)         return case_bind_listen_accept();
@@ -1077,6 +1406,12 @@ static int run_case(const char *name) {
   if (strcmp(name, "abstract_invisible_to_stat") == 0) return case_abstract_invisible_to_stat();
   if (strcmp(name, "dgram_pair_message_framing") == 0) return case_dgram_pair_message_framing();
   if (strcmp(name, "dgram_path_sendto") == 0)          return case_dgram_path_sendto();
+  if (strcmp(name, "dgram_connect_send") == 0)         return case_dgram_connect_send();
+  if (strcmp(name, "getpeername_unconnected") == 0)    return case_getpeername_unconnected();
+  if (strcmp(name, "dgram_reconnect_after_close") == 0)
+    return case_dgram_reconnect_after_close();
+  if (strcmp(name, "dgram_sendmsg_recvfrom_source") == 0)
+    return case_dgram_sendmsg_recvfrom_source();
   if (strcmp(name, "scm_rights_pipe_handoff") == 0)    return case_scm_rights_pipe_handoff();
   if (strcmp(name, "peercred_after_accept") == 0)      return case_peercred_after_accept();
   if (strcmp(name, "dgram_sendto_after_unlink") == 0)  return case_dgram_sendto_after_unlink();
@@ -1090,6 +1425,8 @@ static int run_case(const char *name) {
   if (strcmp(name, "recvmsg_ctrunc_tiny_ctrl") == 0)       return case_recvmsg_ctrunc_tiny_ctrl();
   if (strcmp(name, "abstract_bind_policy_denied") == 0)    return case_abstract_bind_policy_denied();
   if (strcmp(name, "stat_after_listener_close") == 0)      return case_stat_after_listener_close();
+  if (strcmp(name, "stream_socknames_path") == 0)          return case_stream_socknames_path();
+  if (strcmp(name, "stream_socknames_abstract") == 0)      return case_stream_socknames_abstract();
   fprintf(stderr, "unix-canary: unknown case %s\n", name);
   return 2;
 }
@@ -1104,6 +1441,10 @@ static int list_cases(void) {
   puts("abstract_invisible_to_stat");
   puts("dgram_pair_message_framing");
   puts("dgram_path_sendto");
+  puts("dgram_connect_send");
+  puts("getpeername_unconnected");
+  puts("dgram_reconnect_after_close");
+  puts("dgram_sendmsg_recvfrom_source");
   puts("scm_rights_pipe_handoff");
   puts("peercred_after_accept");
   puts("dgram_sendto_after_unlink");
@@ -1116,6 +1457,8 @@ static int list_cases(void) {
   puts("recvmsg_ctrunc_tiny_ctrl");
   puts("abstract_bind_policy_denied");
   puts("stat_after_listener_close");
+  puts("stream_socknames_path");
+  puts("stream_socknames_abstract");
   return 0;
 }
 

@@ -177,10 +177,10 @@ __attribute__((import_module("yurt"), import_name("host_socket_open")))
 int yurt_host_socket_open(int domain, int type, int protocol);
 
 __attribute__((import_module("yurt"), import_name("host_socket_connect")))
-int yurt_host_socket_connect(int fd, int host_ptr, int host_len, unsigned port, unsigned flags);
+int yurt_host_socket_connect(int fd, int addr_ptr, int addr_len, unsigned flags);
 
 __attribute__((import_module("yurt"), import_name("host_socket_bind")))
-int yurt_host_socket_bind(int fd, int host_ptr, int host_len, unsigned port);
+int yurt_host_socket_bind(int fd, int addr_ptr, int addr_len);
 
 __attribute__((import_module("yurt"), import_name("host_socket_listen")))
 int yurt_host_socket_listen(int fd, int backlog);

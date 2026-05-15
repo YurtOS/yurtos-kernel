@@ -80,6 +80,18 @@ function kvKey(store: Uint8Array, key: Uint8Array): string {
   return `${new TextDecoder().decode(store)}\0${new TextDecoder().decode(key)}`;
 }
 
+function sockaddrIn(
+  host: [number, number, number, number],
+  port: number,
+): Uint8Array {
+  const addr = new Uint8Array(16);
+  const view = new DataView(addr.buffer);
+  view.setUint16(0, 2, true);
+  view.setUint16(2, port & 0xffff, false);
+  addr.set(host, 4);
+  return addr;
+}
+
 class FakeKv implements KvBackend {
   private values = new Map<string, Uint8Array>();
 
@@ -468,8 +480,9 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       0,
     ]);
 
-    u.set(new TextEncoder().encode("127.0.0.1"), 0);
-    await imports.host_socket_connect(7, 0, 9, 8080, 0x40);
+    const connectAddr = sockaddrIn([127, 0, 0, 1], 8080);
+    u.set(connectAddr, 0);
+    await imports.host_socket_connect(7, 0, connectAddr.byteLength, 0x40);
     expect(calls.at(-1)).toMatchObject({
       method: METHOD.SYS_SOCKET_CONNECT,
       responseCap: 0,
@@ -480,10 +493,12 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       0,
       0,
     ]);
-    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(4)))
-      .toEqual("127.0.0.1:8080");
+    expect(Array.from(calls.at(-1)!.request.slice(4)))
+      .toEqual(Array.from(connectAddr));
 
-    await imports.host_socket_bind(7, 0, 9, 9090);
+    const bindAddr = sockaddrIn([127, 0, 0, 1], 9090);
+    u.set(bindAddr, 0);
+    await imports.host_socket_bind(7, 0, bindAddr.byteLength);
     expect(calls.at(-1)).toMatchObject({
       method: METHOD.SYS_SOCKET_BIND,
       responseCap: 0,
@@ -494,8 +509,8 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       0,
       0,
     ]);
-    expect(new TextDecoder().decode(calls.at(-1)!.request.slice(4)))
-      .toEqual("127.0.0.1:9090");
+    expect(Array.from(calls.at(-1)!.request.slice(4)))
+      .toEqual(Array.from(bindAddr));
 
     u.set(new TextEncoder().encode("payload"), 32);
     await imports.host_socket_send(7, 32, 7, 0x02);
@@ -583,6 +598,134 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       0,
       0,
     ]);
+
+    const unixPath = new TextEncoder().encode("/tmp/yurt-name.sock");
+    const { mk: unixAddrMk, calls: unixAddrCalls } = capturingMk(
+      unixPath.byteLength,
+      unixPath,
+    );
+    const unixAddrBuf = new ArrayBuffer(128);
+    const unixAddrImports = buildWasmKernelImports(
+      unixAddrMk,
+      () => unixAddrBuf,
+    );
+    const unixAddrRc = await unixAddrImports.host_socket_addr_unix(
+      9,
+      1,
+      80,
+      32,
+      64,
+    );
+    expect(unixAddrRc).toEqual(unixPath.byteLength);
+    expect(unixAddrCalls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_ADDR,
+      responseCap: 32,
+    });
+    expect(Array.from(unixAddrCalls.at(-1)!.request)).toEqual([
+      9,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+    ]);
+    expect(new TextDecoder().decode(new Uint8Array(unixAddrBuf, 80, 19)))
+      .toEqual("/tmp/yurt-name.sock");
+    expect(new DataView(unixAddrBuf).getInt32(64, true)).toEqual(0);
+
+    const abstractName = new Uint8Array([
+      0,
+      ...new TextEncoder().encode("yurt-abstract"),
+    ]);
+    const { mk: abstractAddrMk } = capturingMk(
+      abstractName.byteLength,
+      abstractName,
+    );
+    const abstractAddrBuf = new ArrayBuffer(128);
+    const abstractAddrImports = buildWasmKernelImports(
+      abstractAddrMk,
+      () => abstractAddrBuf,
+    );
+    const abstractAddrRc = await abstractAddrImports.host_socket_addr_unix(
+      9,
+      1,
+      80,
+      32,
+      64,
+    );
+    expect(abstractAddrRc).toEqual("yurt-abstract".length);
+    expect(new TextDecoder().decode(
+      new Uint8Array(abstractAddrBuf, 80, "yurt-abstract".length),
+    )).toEqual("yurt-abstract");
+    expect(new DataView(abstractAddrBuf).getInt32(64, true)).toEqual(1);
+
+    const socketInfo = new Uint8Array(24);
+    const socketInfoView = new DataView(socketInfo.buffer);
+    socketInfoView.setUint32(0, 3, true); // AF_UNIX
+    socketInfoView.setUint32(4, 5, true); // SOCK_DGRAM in WASI libc
+    socketInfoView.setUint32(8, 0, true);
+    socketInfoView.setInt32(12, 1234, true);
+    socketInfoView.setUint32(16, 1000, true);
+    socketInfoView.setUint32(20, 1000, true);
+    const { mk: infoMk, calls: infoCalls } = capturingMk(24, socketInfo);
+    const infoBuf = new ArrayBuffer(128);
+    const infoImports = buildWasmKernelImports(infoMk, () => infoBuf);
+    expect(await infoImports.host_socket_is_dgram(9)).toEqual(1);
+    expect(infoCalls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_INFO,
+      responseCap: 24,
+    });
+    expect(Array.from(infoCalls.at(-1)!.request)).toEqual([9, 0, 0, 0]);
+
+    expect(await infoImports.host_socket_peercred(9, 80, 84, 88)).toEqual(0);
+    expect(new DataView(infoBuf).getInt32(80, true)).toEqual(1234);
+    expect(new DataView(infoBuf).getInt32(84, true)).toEqual(1000);
+    expect(new DataView(infoBuf).getInt32(88, true)).toEqual(1000);
+
+    const recvFromResponse = new Uint8Array(64);
+    recvFromResponse.set(new TextEncoder().encode("pong"), 0);
+    const recvFromPath = new TextEncoder().encode("/tmp/sender.sock");
+    const recvFromView = new DataView(recvFromResponse.buffer);
+    recvFromView.setUint32(16, recvFromPath.byteLength, true);
+    recvFromView.setUint32(20, 0, true);
+    recvFromResponse.set(recvFromPath, 24);
+    const { mk: recvFromMk, calls: recvFromCalls } = capturingMk(
+      4,
+      recvFromResponse,
+    );
+    const recvFromBuf = new ArrayBuffer(256);
+    const recvFromMem = new Uint8Array(recvFromBuf);
+    recvFromMem.set(new TextEncoder().encode("unused"), 120);
+    const recvFromImports = buildWasmKernelImports(
+      recvFromMk,
+      () => recvFromBuf,
+    );
+    expect(
+      await recvFromImports.host_socket_recvfrom_unix(
+        9,
+        80,
+        16,
+        120,
+        64,
+        188,
+        192,
+      ),
+    ).toEqual(4);
+    expect(new TextDecoder().decode(new Uint8Array(recvFromBuf, 80, 4)))
+      .toEqual("pong");
+    expect(new TextDecoder().decode(
+      new Uint8Array(recvFromBuf, 120, recvFromPath.byteLength),
+    )).toEqual("/tmp/sender.sock");
+    expect(new DataView(recvFromBuf).getInt32(188, true)).toEqual(
+      recvFromPath.byteLength,
+    );
+    expect(new DataView(recvFromBuf).getInt32(192, true)).toEqual(0);
+    expect(recvFromCalls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_RECVFROM,
+      responseCap: 16 + 8 + 64,
+    });
 
     await imports.host_socket_close(9);
     expect(calls.at(-1)).toMatchObject({

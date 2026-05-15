@@ -37,6 +37,8 @@ import {
 const EFAULT = 14;
 const EIO = 5;
 const EAGAIN = 11;
+const EAFNOSUPPORT = 97;
+const ENOTCONN = 107;
 const EOPNOTSUPP = 95;
 const HOST_UNIX_NOT_AF_UNIX = -1;
 const HOST_ASYNC_EAGAIN = -2;
@@ -439,8 +441,8 @@ export const HOST_BINDINGS: HostBinding[] = [
       return Number(out.rc);
     },
   },
-  // host_socket_connect(fd, hostPtr, hostLen, port, flags) -> 0/-errno.
-  // SYS_SOCKET_CONNECT accepts u32 fd + UTF-8 "host:port" bytes.
+  // host_socket_connect(fd, addrPtr, addrLen, flags) -> 0/-errno.
+  // SYS_SOCKET_CONNECT accepts u32 fd + POSIX sockaddr bytes.
   {
     name: "host_socket_connect",
     method: METHOD.SYS_SOCKET_CONNECT,
@@ -450,10 +452,9 @@ export const HOST_BINDINGS: HostBinding[] = [
       fd: number,
       addrPtr: number,
       addrLen: number,
-      port: number,
       _flags: number,
     ): Promise<number> => {
-      const addr = socketEndpointBytes(memBuf, addrPtr, addrLen, port);
+      const addr = copyIn(memBuf, addrPtr, addrLen);
       if (typeof addr === "number") return addr;
       const req = new Uint8Array(4 + addr.length);
       const view = new DataView(req.buffer);
@@ -468,8 +469,8 @@ export const HOST_BINDINGS: HostBinding[] = [
       return Number(out.rc);
     },
   },
-  // host_socket_bind(fd, hostPtr, hostLen, port) -> 0/-errno.
-  // SYS_SOCKET_BIND accepts u32 fd + UTF-8 "host:port" bytes.
+  // host_socket_bind(fd, addrPtr, addrLen) -> 0/-errno.
+  // SYS_SOCKET_BIND accepts u32 fd + POSIX sockaddr bytes.
   {
     name: "host_socket_bind",
     method: METHOD.SYS_SOCKET_BIND,
@@ -479,9 +480,8 @@ export const HOST_BINDINGS: HostBinding[] = [
       fd: number,
       addrPtr: number,
       addrLen: number,
-      port: number,
     ): Promise<number> => {
-      const addr = socketEndpointBytes(memBuf, addrPtr, addrLen, port);
+      const addr = copyIn(memBuf, addrPtr, addrLen);
       if (typeof addr === "number") return addr;
       const req = new Uint8Array(4 + addr.length);
       new DataView(req.buffer).setUint32(0, fd >>> 0, true);
@@ -497,7 +497,7 @@ export const HOST_BINDINGS: HostBinding[] = [
   },
   // host_socket_bind_unix(fd, pathPtr, pathLen, isAbstract) -> 0/-errno.
   // SYS_SOCKET_BIND uses the Rust kernel's unified fd table and accepts
-  // u32 fd + "unix:<path>" bytes.
+  // u32 fd + POSIX sockaddr_un bytes.
   {
     name: "host_socket_bind_unix",
     method: METHOD.SYS_SOCKET_BIND,
@@ -601,17 +601,53 @@ export const HOST_BINDINGS: HostBinding[] = [
     returnsBytes: true,
   },
   // host_socket_addr_unix(fd, isPeer, pathPtr, pathCap, isAbstractPtr).
-  // Pathname metadata for connected AF_UNIX sockets is a follow-up. Keep
-  // this import present so wasm-mode never falls back into the TS kernel
-  // with a Rust fd; returning -1 lets libc fall through to host_socket_addr
-  // for non-AF_UNIX sockets.
+  // SYS_SOCKET_ADDR returns raw AF_UNIX address bytes. Abstract addresses
+  // carry the kernel's leading NUL marker; this wrapper strips it and sets
+  // *isAbstractPtr for the C ABI.
   {
     name: "host_socket_addr_unix",
     method: METHOD.SYS_SOCKET_ADDR,
     args: [],
-    custom: () => async (): Promise<number> => {
-      await Promise.resolve();
-      return HOST_UNIX_NOT_AF_UNIX;
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      isPeer: number,
+      pathPtr: number,
+      pathCap: number,
+      isAbstractPtr: number,
+    ): Promise<number> => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, isPeer ? 1 : 0, true);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_ADDR,
+        callerPid,
+        req,
+        pathCap >>> 0,
+      );
+      const rc = Number(out.rc);
+      if (rc === -EAFNOSUPPORT) return HOST_UNIX_NOT_AF_UNIX;
+      if (rc === -ENOTCONN) return HOST_ASYNC_EAGAIN;
+      if (rc < 0) return rc;
+      const isAbstract = rc > 0 && out.response[0] === 0;
+      const pathStart = isAbstract ? 1 : 0;
+      const pathLen = Math.max(0, rc - pathStart);
+      if (pathLen > 0) {
+        const outRc = copyOut(
+          memBuf,
+          pathPtr,
+          out.response.subarray(pathStart, pathStart + pathLen),
+        );
+        if (outRc < 0) return outRc;
+      }
+      if (isAbstractPtr) {
+        const flag = new Uint8Array(4);
+        new DataView(flag.buffer).setInt32(0, isAbstract ? 1 : 0, true);
+        const outRc = copyOut(memBuf, isAbstractPtr, flag);
+        if (outRc < 0) return outRc;
+      }
+      return pathLen;
     },
   },
   // host_socket_send(fd, dataPtr, dataLen, flags) → bytes.
@@ -668,31 +704,33 @@ export const HOST_BINDINGS: HostBinding[] = [
       return Number(out.rc);
     },
   },
-  // host_socket_recvfrom_unix currently maps to the Rust recv path and
-  // reports an empty source address. This keeps fd state in the Rust kernel.
+  // host_socket_recvfrom_unix(fd, outPtr, outCap, fromPathPtr, fromPathCap,
+  // fromPathLenPtr, fromIsAbstractPtr).
   {
     name: "host_socket_recvfrom_unix",
-    method: METHOD.SYS_SOCKET_RECV,
+    method: METHOD.SYS_SOCKET_RECVFROM,
     args: [],
     custom: (mk, memBuf, callerPid) =>
     async (
       fd: number,
       outPtr: number,
       outCap: number,
-      _fromPathPtr: number,
-      _fromPathCap: number,
+      fromPathPtr: number,
+      fromPathCap: number,
       fromPathLenPtr: number,
       fromIsAbstractPtr: number,
     ): Promise<number> => {
-      const req = new Uint8Array(8);
+      const req = new Uint8Array(16);
       const view = new DataView(req.buffer);
       view.setUint32(0, fd >>> 0, true);
       view.setUint32(4, 0, true);
+      view.setUint32(8, outCap >>> 0, true);
+      view.setUint32(12, fromPathCap >>> 0, true);
       const out = await mk.kernelSyscallAsync(
-        METHOD.SYS_SOCKET_RECV,
+        METHOD.SYS_SOCKET_RECVFROM,
         callerPid,
         req,
-        outCap >>> 0,
+        (outCap + 8 + fromPathCap) >>> 0,
       );
       const rc = Number(out.rc);
       if (rc === -EAGAIN) return HOST_ASYNC_EAGAIN;
@@ -701,13 +739,42 @@ export const HOST_BINDINGS: HostBinding[] = [
         const outRc = copyOut(memBuf, outPtr, out.response.subarray(0, rc));
         if (outRc < 0) return outRc;
       }
-      const zero = new Uint8Array(4);
+      const metaOffset = outCap >>> 0;
+      const pathOffset = metaOffset + 8;
+      const responseView = new DataView(
+        out.response.buffer,
+        out.response.byteOffset,
+        out.response.byteLength,
+      );
+      const pathLen = out.response.byteLength >= pathOffset
+        ? responseView.getUint32(metaOffset, true)
+        : 0;
+      const isAbstract = out.response.byteLength >= pathOffset
+        ? responseView.getUint32(metaOffset + 4, true)
+        : 0;
+      const pathCopyLen = Math.min(
+        pathLen,
+        fromPathCap >>> 0,
+        Math.max(0, out.response.byteLength - pathOffset),
+      );
+      if (pathCopyLen > 0) {
+        const outRc = copyOut(
+          memBuf,
+          fromPathPtr,
+          out.response.subarray(pathOffset, pathOffset + pathCopyLen),
+        );
+        if (outRc < 0) return outRc;
+      }
+      const record = new Uint8Array(4);
+      const recordView = new DataView(record.buffer);
       if (fromPathLenPtr) {
-        const outRc = copyOut(memBuf, fromPathLenPtr, zero);
+        recordView.setUint32(0, pathLen, true);
+        const outRc = copyOut(memBuf, fromPathLenPtr, record);
         if (outRc < 0) return outRc;
       }
       if (fromIsAbstractPtr) {
-        const outRc = copyOut(memBuf, fromIsAbstractPtr, zero);
+        recordView.setUint32(0, isAbstract, true);
+        const outRc = copyOut(memBuf, fromIsAbstractPtr, record);
         if (outRc < 0) return outRc;
       }
       return rc;
@@ -836,20 +903,63 @@ export const HOST_BINDINGS: HostBinding[] = [
   },
   {
     name: "host_socket_is_dgram",
-    method: 0,
+    method: METHOD.SYS_SOCKET_INFO,
     args: [],
-    custom: () => async () => {
-      await Promise.resolve();
-      return -EIO;
+    custom: (mk, _memBuf, callerPid) => async (fd: number) => {
+      const req = new Uint8Array(4);
+      new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_INFO,
+        callerPid,
+        req,
+        24,
+      );
+      if (Number(out.rc) !== 24 || out.response.byteLength < 8) return -1;
+      const sockType = new DataView(
+        out.response.buffer,
+        out.response.byteOffset,
+        out.response.byteLength,
+      ).getUint32(4, true);
+      return sockType === 2 || sockType === 5 ? 1 : 0;
     },
   },
   {
     name: "host_socket_peercred",
-    method: 0,
+    method: METHOD.SYS_SOCKET_INFO,
     args: [],
-    custom: () => async () => {
-      await Promise.resolve();
-      return -EIO;
+    custom: (mk, memBuf, callerPid) =>
+    async (
+      fd: number,
+      pidPtr: number,
+      uidPtr: number,
+      gidPtr: number,
+    ): Promise<number> => {
+      const req = new Uint8Array(4);
+      new DataView(req.buffer).setUint32(0, fd >>> 0, true);
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_INFO,
+        callerPid,
+        req,
+        24,
+      );
+      if (Number(out.rc) !== 24 || out.response.byteLength < 24) return -1;
+      const view = new DataView(
+        out.response.buffer,
+        out.response.byteOffset,
+        out.response.byteLength,
+      );
+      const record = new Uint8Array(4);
+      const recordView = new DataView(record.buffer);
+      recordView.setInt32(0, view.getInt32(12, true), true);
+      let outRc = copyOut(memBuf, pidPtr, record);
+      if (outRc < 0) return outRc;
+      recordView.setInt32(0, view.getUint32(16, true), true);
+      outRc = copyOut(memBuf, uidPtr, record);
+      if (outRc < 0) return outRc;
+      recordView.setInt32(0, view.getUint32(20, true), true);
+      outRc = copyOut(memBuf, gidPtr, record);
+      if (outRc < 0) return outRc;
+      return 0;
     },
   },
   {
@@ -1119,21 +1229,6 @@ function copyOut(
   return 0;
 }
 
-function socketEndpointBytes(
-  memBuf: () => ArrayBuffer,
-  hostPtr: number,
-  hostLen: number,
-  port: number,
-): Uint8Array | number {
-  const host = copyIn(memBuf, hostPtr, hostLen);
-  if (typeof host === "number") return host;
-  const suffix = new TextEncoder().encode(`:${port >>> 0}`);
-  const out = new Uint8Array(host.byteLength + suffix.byteLength);
-  out.set(host, 0);
-  out.set(suffix, host.byteLength);
-  return out;
-}
-
 function unixSocketAddrBytes(
   memBuf: () => ArrayBuffer,
   pathPtr: number,
@@ -1142,12 +1237,15 @@ function unixSocketAddrBytes(
 ): Uint8Array | number {
   const path = copyIn(memBuf, pathPtr, pathLen);
   if (typeof path === "number") return path;
-  const prefix = isAbstract
-    ? new Uint8Array([0x75, 0x6e, 0x69, 0x78, 0x3a, 0x00])
-    : new TextEncoder().encode("unix:");
-  const out = new Uint8Array(prefix.byteLength + path.byteLength);
-  out.set(prefix, 0);
-  out.set(path, prefix.byteLength);
+  const out = new Uint8Array(2 + (isAbstract ? 1 : 0) + path.byteLength);
+  new DataView(out.buffer, out.byteOffset, out.byteLength).setUint16(
+    0,
+    1,
+    true,
+  );
+  const pathOffset = isAbstract ? 3 : 2;
+  if (isAbstract) out[2] = 0;
+  out.set(path, pathOffset);
   return out;
 }
 

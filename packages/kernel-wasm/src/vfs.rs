@@ -471,11 +471,13 @@ pub struct RamfsBackend {
 
 impl RamfsBackend {
     pub fn new() -> Self {
+        let mut dirs = BTreeSet::new();
+        dirs.insert(b"/".to_vec());
         Self {
             inodes: BTreeMap::new(),
             paths: BTreeMap::new(),
             symlinks: BTreeMap::new(),
-            dirs: BTreeSet::new(),
+            dirs,
             refcount: BTreeMap::new(),
             next_id: 1,
         }
@@ -702,7 +704,8 @@ impl VfsBackend for RamfsBackend {
             return -(crate::abi::EEXIST as i64) as i32;
         }
         self.paths.insert(link_path.to_vec(), id);
-        *self.refcount.entry(id).or_insert(0) += 1;
+        let refs = self.refcount.entry(id).or_insert(0);
+        *refs = refs.saturating_add(1);
         0
     }
 
@@ -779,6 +782,10 @@ impl VfsBackend for RamfsBackend {
             || self.dirs.contains(path)
         {
             return -17; // -EEXIST
+        }
+        let parent = Self::parent_of(path);
+        if !self.dirs.contains(&parent) {
+            return -2; // -ENOENT
         }
         self.dirs.insert(path.to_vec());
         0
@@ -876,6 +883,16 @@ mod tests {
         let mt = MountTable::new(Box::new(RamfsBackend::new()));
         assert_eq!(ROOT_MOUNT, 0);
         let _ = mt; // keep MountTable construction tested.
+    }
+
+    #[test]
+    fn ramfs_link_refcount_saturates() {
+        let mut ramfs = RamfsBackend::new();
+        let inode = ramfs.install(b"/a".to_vec(), b"x".to_vec());
+        ramfs.refcount.insert(inode, u32::MAX);
+
+        assert_eq!(ramfs.link(b"/a", b"/b"), 0);
+        assert_eq!(ramfs.refcount.get(&inode), Some(&u32::MAX));
     }
 
     #[test]
@@ -1317,6 +1334,50 @@ impl VfsBackend for ProcBackend {
             .iter()
             .find(|(_p, (id, _c))| *id == inode)
             .map(|(_p, (_id, c))| c.len() as u64)
+    }
+
+    fn readdir(&self, path: &[u8]) -> Option<Vec<Vec<u8>>> {
+        if path == b"/" {
+            let mut pids = Vec::new();
+            for key in self.entries.keys() {
+                let rest = key.strip_prefix(b"/")?;
+                let Some(end) = rest.iter().position(|b| *b == b'/') else {
+                    continue;
+                };
+                let pid = rest[..end].to_vec();
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+            return Some(pids);
+        }
+
+        let prefix = [path, b"/"].concat();
+        let mut names = Vec::new();
+        for key in self.entries.keys() {
+            let Some(rest) = key.strip_prefix(prefix.as_slice()) else {
+                continue;
+            };
+            if rest.contains(&b'/') {
+                continue;
+            }
+            names.push(rest.to_vec());
+        }
+        (!names.is_empty()).then_some(names)
+    }
+
+    fn entry_type(&self, path: &[u8]) -> u8 {
+        if self.entries.contains_key(path) {
+            return 4;
+        }
+        if path == b"/" {
+            return 3;
+        }
+        let prefix = [path, b"/"].concat();
+        if self.entries.keys().any(|key| key.starts_with(&prefix)) {
+            return 3;
+        }
+        0
     }
 
     fn refresh_processes(&mut self, snapshots: &[ProcessSnapshot]) {

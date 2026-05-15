@@ -10,6 +10,7 @@ pub const ECHILD: i32 = 10;
 pub const EBADF: i32 = 9;
 pub const EIO: i32 = 5;
 pub const EAGAIN: i32 = 11;
+pub const EFAULT: i32 = 14;
 pub const EXDEV: i32 = 18;
 pub const EEXIST: i32 = 17;
 pub const ENOTDIR: i32 = 20;

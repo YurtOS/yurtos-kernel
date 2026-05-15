@@ -142,7 +142,7 @@ value = 1
 doc = "Non-blocking flag for kh_socket_recv / kh_socket_accept."
 
 [import.kh_socket_connect]
-doc = "Connect to a remote address. Address bytes are UTF-8 'host:port'. Returns a socket handle or negated errno; -EAGAIN with KH_SOCK_NONBLOCK."
+doc = "Connect to a remote AF_INET endpoint. Address bytes are POSIX sockaddr_in. Returns a socket handle or negated errno; -EAGAIN with KH_SOCK_NONBLOCK."
 return = "scalar"
 args = [
   { name = "addr_ptr", type = "ptr" },
@@ -177,7 +177,7 @@ args = [
 ]
 
 [import.kh_socket_listen_at]
-doc = "Open + bind + listen in one shot. addr is UTF-8 'host:port'; port=0 lets the host pick. Returns a listener handle or negated errno. Use kh_socket_local_addr to fetch the actually-bound port."
+doc = "Open + bind + listen in one shot. Address bytes are POSIX sockaddr_in; port=0 lets the host pick. Returns a listener handle or negated errno. Use kh_socket_local_addr to fetch the actually-bound port."
 return = "scalar"
 args = [
   { name = "addr_ptr", type = "ptr" },

@@ -361,8 +361,8 @@ impl PipeBuf {
 
     pub fn inc_ref(&mut self, end: PipeEnd) {
         match end {
-            PipeEnd::Read => self.read_ends += 1,
-            PipeEnd::Write => self.write_ends += 1,
+            PipeEnd::Read => self.read_ends = self.read_ends.saturating_add(1),
+            PipeEnd::Write => self.write_ends = self.write_ends.saturating_add(1),
         }
     }
 
@@ -414,17 +414,26 @@ pub enum SocketKind {
     },
     UnixStream {
         peer_id: u64,
+        local_path: Option<Vec<u8>>,
+        peer_path: Option<Vec<u8>>,
         rx: VecDeque<u8>,
         rights: VecDeque<Vec<FdEntry>>,
         peer_open: bool,
     },
     UnixDatagram {
         peer_id: Option<u64>,
+        peer_path: Option<Vec<u8>>,
         bound_path: Option<Vec<u8>>,
-        rx: VecDeque<Vec<u8>>,
+        rx: VecDeque<UnixDatagramPacket>,
         rights: VecDeque<Vec<FdEntry>>,
         peer_open: bool,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnixDatagramPacket {
+    pub data: Vec<u8>,
+    pub source_path: Option<Vec<u8>>,
 }
 
 pub struct SocketEntry {
@@ -564,6 +573,15 @@ impl Kernel {
         None
     }
 
+    /// Return an uncommitted low pid reservation to the allocator.
+    /// This is used when the host rejects a spawn after the kernel has
+    /// already put the reserved pid in the spawn context.
+    pub fn release_host_pid_reservation(&mut self, pid: Pid) {
+        if (1..1000).contains(&pid) && !self.processes.contains_key(&pid) {
+            self.next_host_pid = pid;
+        }
+    }
+
     /// Test-only convenience wrapper for low-pid allocation paths
     /// where exhaustion is impossible by construction. Production
     /// paths use [`Kernel::try_alloc_host_pid`] and map exhaustion to
@@ -599,20 +617,29 @@ impl Kernel {
             p.next_tid = 2;
         }
         if parent_pid != 0 {
-            let parent = self.process_mut(parent_pid);
-            if !parent.children.contains(&pid) {
-                parent.children.push(pid);
+            if let Some(parent) = self.processes.get_mut(&parent_pid) {
+                if !parent.children.contains(&pid) {
+                    parent.children.push(pid);
+                }
             }
         }
     }
 
-    /// Allocate the next pid for a sys_spawn child and bump the
-    /// counter. Pids stay above 1000 to leave room for host-
-    /// allocated user processes.
-    pub fn alloc_spawn_pid(&mut self) -> Pid {
-        let pid = self.next_spawn_pid;
-        self.next_spawn_pid = self.next_spawn_pid.saturating_add(1);
-        pid
+    /// Try to allocate the next pid for a sys_spawn child. Pids stay
+    /// above 1000 to leave room for host-allocated user processes.
+    pub fn try_alloc_spawn_pid(&mut self) -> Option<Pid> {
+        let first = self.next_spawn_pid.max(1000);
+        let mut pid = first;
+        loop {
+            if !self.processes.contains_key(&pid) {
+                self.next_spawn_pid = pid.checked_add(1).unwrap_or(1000);
+                return Some(pid);
+            }
+            pid = pid.checked_add(1).unwrap_or(1000);
+            if pid == first {
+                return None;
+            }
+        }
     }
 
     /// Push a freshly-staged spawn onto the queue.
@@ -740,6 +767,8 @@ impl Kernel {
                 sock_type: 1,
                 kind: SocketKind::UnixStream {
                     peer_id: right,
+                    local_path: None,
+                    peer_path: None,
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
                     peer_open: true,
@@ -754,6 +783,8 @@ impl Kernel {
                 sock_type: 1,
                 kind: SocketKind::UnixStream {
                     peer_id: left,
+                    local_path: None,
+                    peer_path: None,
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
                     peer_open: true,
@@ -775,6 +806,7 @@ impl Kernel {
                 sock_type: 2,
                 kind: SocketKind::UnixDatagram {
                     peer_id: Some(right),
+                    peer_path: None,
                     bound_path: None,
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
@@ -790,6 +822,7 @@ impl Kernel {
                 sock_type: 2,
                 kind: SocketKind::UnixDatagram {
                     peer_id: Some(left),
+                    peer_path: None,
                     bound_path: None,
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
@@ -811,6 +844,7 @@ impl Kernel {
                 sock_type: 2,
                 kind: SocketKind::UnixDatagram {
                     peer_id: None,
+                    peer_path: None,
                     bound_path: None,
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
@@ -846,6 +880,29 @@ impl Kernel {
 
     pub fn unix_datagram_id_for_path(&self, path: &[u8]) -> Option<u64> {
         self.unix_datagrams.get(path).copied()
+    }
+
+    pub fn connect_unix_datagram(&mut self, id: u64, path: &[u8]) -> Result<(), i32> {
+        let Some(peer_id) = self.unix_datagrams.get(path).copied() else {
+            return Err(crate::abi::ECONNREFUSED);
+        };
+        let Some(socket) = self.sockets.get_mut(&id) else {
+            return Err(crate::abi::EBADF);
+        };
+        match &mut socket.kind {
+            SocketKind::UnixDatagram {
+                peer_id: id_slot,
+                peer_path,
+                peer_open,
+                ..
+            } => {
+                *id_slot = Some(peer_id);
+                *peer_path = Some(path.to_vec());
+                *peer_open = true;
+                Ok(())
+            }
+            _ => Err(crate::abi::EOPNOTSUPP),
+        }
     }
 
     pub fn has_unix_socket_inode(&self, path: &[u8]) -> bool {
@@ -910,6 +967,16 @@ impl Kernel {
             return Err(crate::abi::ECONNREFUSED);
         };
         pending.push_back(server_id);
+        if let Some(client) = self.sockets.get_mut(&client_id) {
+            if let SocketKind::UnixStream { peer_path, .. } = &mut client.kind {
+                *peer_path = Some(path.to_vec());
+            }
+        }
+        if let Some(server) = self.sockets.get_mut(&server_id) {
+            if let SocketKind::UnixStream { local_path, .. } = &mut server.kind {
+                *local_path = Some(path.to_vec());
+            }
+        }
         Ok(client_id)
     }
 
@@ -935,7 +1002,7 @@ impl Kernel {
 
     pub fn socket_inc_ref(&mut self, id: u64) {
         if let Some(socket) = self.sockets.get_mut(&id) {
-            socket.refs += 1;
+            socket.refs = socket.refs.saturating_add(1);
         }
     }
 
@@ -998,7 +1065,7 @@ impl Kernel {
     /// Increment the refcount on an OFD (dup / dup2).
     pub fn ofd_inc_ref(&mut self, id: u64) {
         if let Some(ofd) = self.ofds.get_mut(&id) {
-            ofd.refs += 1;
+            ofd.refs = ofd.refs.saturating_add(1);
         }
     }
 
@@ -1024,6 +1091,19 @@ impl Kernel {
             })
             .collect();
         self.vfs.refresh_processes(&snaps);
+    }
+
+    pub fn can_read_proc_path(&mut self, caller_pid: Pid, path: &[u8]) -> bool {
+        let Some(target_pid) = crate::path::proc_target_pid(path) else {
+            return true;
+        };
+        if target_pid == caller_pid {
+            return true;
+        }
+        if !self.has_process(target_pid) {
+            return true;
+        }
+        self.process(caller_pid).credentials.euid == 0
     }
 
     pub fn list_processes(&self) -> Vec<ProcessListEntry> {
@@ -1303,6 +1383,7 @@ pub fn scheduler_budget_ns(nice: i32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::ROOT_MOUNT;
 
     #[test]
     fn lazy_insert_yields_defaults() {
@@ -1346,6 +1427,17 @@ mod tests {
     }
 
     #[test]
+    fn insert_host_process_does_not_create_unknown_parent() {
+        let _g = TestGuard::acquire();
+        with_kernel(|k| {
+            k.insert_host_process(7, 999, vec![b"/bin/app".to_vec()], Some(11));
+        });
+
+        assert!(with_kernel(|k| k.has_process(7)));
+        assert!(!with_kernel(|k| k.has_process(999)));
+    }
+
+    #[test]
     fn try_alloc_host_pid_returns_none_when_low_pid_range_is_exhausted() {
         let _g = TestGuard::acquire();
         let exhausted = with_kernel(|k| {
@@ -1355,6 +1447,18 @@ mod tests {
             k.try_alloc_host_pid()
         });
         assert_eq!(exhausted, None);
+    }
+
+    #[test]
+    fn try_alloc_spawn_pid_wraps_without_reusing_occupied_max_pid() {
+        let _g = TestGuard::acquire();
+        let allocated = with_kernel(|k| {
+            k.next_spawn_pid = Pid::MAX;
+            k.process_mut(Pid::MAX);
+            k.try_alloc_spawn_pid()
+        });
+        assert_eq!(allocated, Some(1000));
+        assert!(!with_kernel(|k| k.has_process(1000)));
     }
 
     #[test]
@@ -1466,5 +1570,29 @@ mod tests {
                 .expect("worker thread")
         });
         assert_eq!(runnable.state, ThreadState::Runnable);
+    }
+
+    #[test]
+    fn registry_refcount_increments_saturate() {
+        let mut pipe = PipeBuf::new();
+        pipe.read_ends = u32::MAX;
+        pipe.write_ends = u32::MAX;
+        pipe.inc_ref(PipeEnd::Read);
+        pipe.inc_ref(PipeEnd::Write);
+        assert_eq!(pipe.read_ends, u32::MAX);
+        assert_eq!(pipe.write_ends, u32::MAX);
+
+        let _g = TestGuard::acquire();
+        with_kernel(|k| {
+            let ofd_id = k.create_ofd(ROOT_MOUNT, 1, true);
+            k.ofds.get_mut(&ofd_id).unwrap().refs = u32::MAX;
+            k.ofd_inc_ref(ofd_id);
+            assert_eq!(k.ofds.get(&ofd_id).unwrap().refs, u32::MAX);
+
+            let socket_id = k.create_socket(1, 1, 0);
+            k.sockets.get_mut(&socket_id).unwrap().refs = u32::MAX;
+            k.socket_inc_ref(socket_id);
+            assert_eq!(k.sockets.get(&socket_id).unwrap().refs, u32::MAX);
+        });
     }
 }

@@ -83,7 +83,10 @@ Deno.test("WorkerSabThreadsBackend: mutexLock/Unlock against shared memory cell"
   // mutexLock is async; await it
   return lockResult.then((rc) => {
     if (rc !== 0) throw new Error(`expected 0, got ${rc}`);
-    const view = new SabMutex(memory.buffer as SharedArrayBuffer, mutexPtr);
+    const view = new SabMutex(
+      memory.buffer as unknown as SharedArrayBuffer,
+      mutexPtr,
+    );
     if (view.owner() !== 1) {
       throw new Error(`expected owner=1, got ${view.owner()}`);
     }
@@ -146,7 +149,7 @@ Deno.test("WorkerSabThreadsBackend: main's mutex owner doesn't collide with firs
 
   // Inspect the SabMutex cell directly: owner should be 1 (main's
   // lock-ops tid), not 2 (the spawned thread's tid).
-  const view = new SabMutex(memory.buffer as SharedArrayBuffer, 0);
+  const view = new SabMutex(memory.buffer as unknown as SharedArrayBuffer, 0);
   assertEquals(view.owner(), 1);
 
   // Unlock and verify the cell is released

@@ -24,6 +24,18 @@ const W = (globalThis as any).WebAssembly;
 const HAS_JSPI = typeof W?.Suspending === "function" &&
   typeof W?.promising === "function";
 
+function sockaddrIn(
+  host: [number, number, number, number],
+  port: number,
+): Uint8Array {
+  const addr = new Uint8Array(16);
+  const view = new DataView(addr.buffer);
+  view.setUint16(0, 2, true);
+  view.setUint16(2, port & 0xffff, false);
+  addr.set(host, 4);
+  return addr;
+}
+
 class FakeAsyncTcp implements TcpSocketImpl {
   private nextHandle = 1;
   private connected = new Set<number>();
@@ -101,11 +113,11 @@ describe("JSPI / kh_socket_*", () => {
     const open = await mk.syscallAsync(METHOD.SYS_SOCKET_OPEN, openReq, 0);
     expect(Number(open.rc)).toBeGreaterThan(0);
 
-    // sys_socket_connect request: u32 fd + addr "host:port".
-    const addr = "127.0.0.1:0";
-    const req = new Uint8Array(4 + addr.length);
+    // sys_socket_connect request: u32 fd + POSIX sockaddr_in bytes.
+    const addr = sockaddrIn([127, 0, 0, 1], 0);
+    const req = new Uint8Array(4 + addr.byteLength);
     new DataView(req.buffer).setUint32(0, Number(open.rc), true);
-    new TextEncoder().encodeInto(addr, req.subarray(4));
+    req.set(addr, 4);
     const out = await mk.syscallAsync(METHOD.SYS_SOCKET_CONNECT, req, 0);
     expect(Number(out.rc)).toBe(0);
     await mk.syscallAsync(
@@ -131,10 +143,10 @@ describe("JSPI / kh_socket_*", () => {
     const open = await mk.syscallAsync(METHOD.SYS_SOCKET_OPEN, openReq, 0);
     expect(Number(open.rc)).toBeGreaterThan(0);
 
-    const addr = "127.0.0.1:0";
-    const connectReq = new Uint8Array(4 + addr.length);
+    const addr = sockaddrIn([127, 0, 0, 1], 0);
+    const connectReq = new Uint8Array(4 + addr.byteLength);
     new DataView(connectReq.buffer).setUint32(0, Number(open.rc), true);
-    new TextEncoder().encodeInto(addr, connectReq.subarray(4));
+    connectReq.set(addr, 4);
     const connected = await mk.syscallAsync(
       METHOD.SYS_SOCKET_CONNECT,
       connectReq,

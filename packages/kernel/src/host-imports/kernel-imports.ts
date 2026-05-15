@@ -169,6 +169,9 @@ const ERR_INTERRUPTED = -27;
 const ERR_PRIORITY_NOT_FOUND = -1001;
 const ERR_AGAIN = -11;
 const ERR_CHILD = -10;
+const ERR_BADF = -9;
+const ERR_OP_NOT_SUPPORTED = -95;
+const ERR_CONN_REFUSED = -111;
 const ROOT_UID = 0;
 const USER_UID = 1000;
 const USER_GID = 1000;
@@ -1198,6 +1201,24 @@ export function createKernelImports(
       return [0, 0, 0, 0];
     }
     return parts as [number, number, number, number];
+  }
+
+  const WASI_AF_INET = 1;
+  const RUST_STD_AF_INET = 2;
+  const SOCKADDR_IN_SIZE = 16;
+
+  function readSockaddrIn(ptr: number, len: number): {
+    host: "127.0.0.1" | "localhost" | "0.0.0.0" | string;
+    port: number;
+  } | null {
+    if (ptr === 0 || len < SOCKADDR_IN_SIZE) return null;
+    const view = new DataView(memory.buffer, ptr, len);
+    const family = view.getUint16(0, true);
+    if (family !== WASI_AF_INET && family !== RUST_STD_AF_INET) return null;
+    const port = view.getUint16(2, false);
+    const octets = new Uint8Array(memory.buffer, ptr + 4, 4);
+    const host = `${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}`;
+    return { host, port };
   }
 
   function writeSocketAddrResult(
@@ -3010,31 +3031,31 @@ export function createKernelImports(
       });
     },
 
-    // host_socket_connect(fd, host_ptr, host_len, port, flags) -> i32
-    // Opens a TCP or TLS socket to the given host:port. Returns sync
+    // host_socket_connect(fd, sockaddr_ptr, sockaddr_len, flags) -> i32
+    // Opens a TCP or TLS socket to the given AF_INET sockaddr. Returns sync
     // (number) when the backend resolves synchronously (loopback) and a
     // Promise<number> when it doesn't (network bridge). JSPI/Asyncify
     // handles the suspension on the Promise path.
     host_socket_connect(
       fd: number,
-      hostPtr: number,
-      hostLen: number,
-      port: number,
+      addrPtr: number,
+      addrLen: number,
       flags: number,
     ): number | Promise<number> {
       if (!socketBackend) {
         netLog("connect", { fd, result: "ECONNREFUSED", reason: "no backend" });
-        return -111;
+        return ERR_CONN_REFUSED;
       }
-      const host = readString(memory, hostPtr, hostLen);
-      if (!host || port < 0 || port > 65535) {
-        netLog("connect", { fd, host, port, result: "EINVAL" });
-        return -22;
+      const addr = readSockaddrIn(addrPtr, addrLen);
+      if (!addr) {
+        netLog("connect", { fd, result: "EINVAL" });
+        return ERR_INVALID;
       }
+      const { host, port } = addr;
       const target = opts.kernel?.getFdTarget(callerPid, fd);
       if (!target || target.type !== "socket") {
         netLog("connect", { fd, host, port, result: "EBADF" });
-        return -9;
+        return ERR_BADF;
       }
       netLog("connect", {
         fd,
@@ -3053,7 +3074,7 @@ export function createKernelImports(
             result: "ECONNREFUSED",
             reason: result.error,
           });
-          return -111;
+          return ERR_CONN_REFUSED;
         }
         const finalise = (): number => {
           target.socket = result.socket;
@@ -3068,10 +3089,12 @@ export function createKernelImports(
             { ok: false as const, error: "TCP_NODELAY not supported" };
           if (typeof (optR as Promise<unknown>).then === "function") {
             return (optR as Promise<{ ok: boolean }>).then((opt) =>
-              opt.ok ? finalise() : -95
+              opt.ok ? finalise() : ERR_OP_NOT_SUPPORTED
             );
           }
-          return (optR as { ok: boolean }).ok ? finalise() : -95;
+          return (optR as { ok: boolean }).ok
+            ? finalise()
+            : ERR_OP_NOT_SUPPORTED;
         }
         return finalise();
       };
@@ -3090,30 +3113,34 @@ export function createKernelImports(
       );
     },
 
-    // host_socket_bind(fd, host_ptr, host_len, port) -> i32
+    // host_socket_bind(fd, sockaddr_ptr, sockaddr_len) -> i32
     // Records the sandbox-visible local address requested for a socket fd.
-    // AF_UNIX: req = { fd, path }; AF_INET: req = { fd, host, port }
+    // AF_UNIX uses host_socket_bind_unix; AF_INET uses sockaddr_in bytes.
     host_socket_bind(
       fd: number,
-      hostPtr: number,
-      hostLen: number,
-      port: number,
+      addrPtr: number,
+      addrLen: number,
     ): number {
-      const host = readString(memory, hostPtr, hostLen);
+      const addr = readSockaddrIn(addrPtr, addrLen);
+      if (!addr) {
+        netLog("bind", { fd, result: "EINVAL" });
+        return ERR_INVALID;
+      }
+      const { host, port } = addr;
       const target = opts.kernel?.getFdTarget(callerPid, fd);
       if (!target || target.type !== "socket") {
         netLog("bind", { fd, host, port, result: "EBADF" });
-        return -9;
+        return ERR_BADF;
       }
       if (
         host !== "127.0.0.1" && host !== "localhost" && host !== "0.0.0.0"
       ) {
         netLog("bind", { fd, host, port, result: "EAFNOSUPPORT" });
-        return -95;
+        return ERR_OP_NOT_SUPPORTED;
       }
       if (!Number.isInteger(port) || port < 0 || port > 65535) {
         netLog("bind", { fd, host, port, result: "EINVAL" });
-        return -22;
+        return ERR_INVALID;
       }
       target.boundHost = host;
       target.boundPort = port;

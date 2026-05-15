@@ -399,27 +399,20 @@ int flock(int fd, int operation) {
 /* ── qsort_r — GNU-flavor (4-arg with arg-after-comparator) ──
  * wasi-libc has qsort but not qsort_r.  gnulib's lib/savedir.c uses
  * the GNU signature: qsort_r(base, nmemb, size, compar, arg).
- * Implement on top of qsort by stashing the user arg in a TLS-ish
- * static — fine here because yurt is single-threaded. */
+ * The implementation lives in Rust so the comparator arg is call-local
+ * instead of process-global state. */
 YURT_DECLARE_MARKER(qsort_r);
 YURT_DEFINE_MARKER(qsort_r, 0x71735f72u) /* "qs_r" */
 
-static int (*qsort_r_compar)(const void *, const void *, void *) = NULL;
-static void *qsort_r_arg = NULL;
-
-static int qsort_r_thunk(const void *a, const void *b) {
-  return qsort_r_compar(a, b, qsort_r_arg);
-}
+extern void yurt_rs_qsort_r(void *base, size_t nmemb, size_t size,
+                            int (*compar)(const void *, const void *, void *),
+                            void *arg);
 
 void qsort_r(void *base, size_t nmemb, size_t size,
              int (*compar)(const void *, const void *, void *),
              void *arg) {
   YURT_MARKER_CALL(qsort_r);
-  qsort_r_compar = compar;
-  qsort_r_arg = arg;
-  qsort(base, nmemb, size, qsort_r_thunk);
-  qsort_r_compar = NULL;
-  qsort_r_arg = NULL;
+  yurt_rs_qsort_r(base, nmemb, size, compar, arg);
 }
 
 /* ── uid/gid accessors and mutators ──

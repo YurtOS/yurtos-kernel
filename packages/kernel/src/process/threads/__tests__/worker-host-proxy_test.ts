@@ -33,6 +33,13 @@ function noopBodies(): WorkerHostDispatcherBodies {
     socketClose: () => 0,
     socketRecv: () => ({ result: 0 }),
     socketSend: () => 0,
+    poll: () => ({ result: 0 }),
+    getPid: () => 1,
+    socketSendUnix: () => 0,
+    socketPair: () => ({ result: 0 }),
+    socketRecvUnix: () => ({ result: 0 }),
+    setFdDescriptorFlags: () => 0,
+    threadSpawn: () => 2,
   };
 }
 
