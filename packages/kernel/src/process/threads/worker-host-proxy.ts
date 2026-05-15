@@ -55,6 +55,9 @@ export const enum WorkerHostOp {
   SocketRecvUnix = 43,
   SetFdDescriptorFlags = 44,
   ThreadSpawn = 45,
+  SocketBind = 46,
+  SocketListen = 47,
+  SocketIsDgram = 48,
 }
 
 // pollfd struct on the wasm side: { fd: i32, events: i16, revents: i16 } — 8 bytes.
@@ -250,6 +253,19 @@ export function createWorkerYurtImports(
       call(WorkerHostOp.SetFdDescriptorFlags, [fd, flags]),
     host_thread_spawn: (fnPtr: number, arg: number) =>
       call(WorkerHostOp.ThreadSpawn, [fnPtr, arg]),
+    host_socket_bind: (
+      fd: number,
+      hostPtr: number,
+      hostLen: number,
+      port: number,
+    ) => {
+      const host = memoryBytes().subarray(hostPtr, hostPtr + hostLen);
+      return call(WorkerHostOp.SocketBind, [fd, hostLen, port], host);
+    },
+    host_socket_listen: (fd: number, backlog: number) =>
+      call(WorkerHostOp.SocketListen, [fd, backlog]),
+    host_socket_is_dgram: (fd: number) =>
+      call(WorkerHostOp.SocketIsDgram, [fd]),
     host_poll: (fdsPtr: number, nfds: number, timeoutMs: number) => {
       // The dispatcher body is sync (one evaluate per round-trip). We
       // implement the blocking semantics on the worker side: probe via
@@ -390,6 +406,25 @@ export interface WorkerHostDispatcherBodies {
    * spawn itself runs asynchronously in the background.
    */
   threadSpawn(fnPtr: number, arg: number): number;
+  /**
+   * Record the bind address for an AF_INET socket fd from a pthread
+   * worker. Loopback only; rejects anything that isn't 127.0.0.1 /
+   * localhost / 0.0.0.0.
+   */
+  socketBind(fd: number, host: Uint8Array, port: number): number;
+  /**
+   * Start listening on a previously-bound AF_INET socket fd from a
+   * pthread worker. Synchronous fast-path only — the backend must
+   * resolve listen() synchronously for the pthread to observe the
+   * outcome in this dispatcher round-trip.
+   */
+  socketListen(fd: number, backlog: number): number;
+  /**
+   * Returns 1 for SOCK_DGRAM sockets, 0 for SOCK_STREAM, -1 for
+   * non-socket fds. libzmq's tcp/inproc setup checks this on every
+   * socket() return to decide which mailbox transport to wire up.
+   */
+  socketIsDgram(fd: number): number;
 }
 
 /**
@@ -534,6 +569,24 @@ export function attachWorkerHostDispatcher(
             payload[PAYLOAD_ARGS_WORD + 0],
             payload[PAYLOAD_ARGS_WORD + 1],
           );
+          break;
+        case WorkerHostOp.SocketBind: {
+          const fd = payload[PAYLOAD_ARGS_WORD + 0];
+          const hostLen = payload[PAYLOAD_ARGS_WORD + 1];
+          const port = payload[PAYLOAD_ARGS_WORD + 2];
+          const byteStart = (PAYLOAD_ARGS_WORD + 3) * 4;
+          const host = payloadBytes.slice(byteStart, byteStart + hostLen);
+          result = bodies.socketBind(fd, host, port);
+          break;
+        }
+        case WorkerHostOp.SocketListen:
+          result = bodies.socketListen(
+            payload[PAYLOAD_ARGS_WORD + 0],
+            payload[PAYLOAD_ARGS_WORD + 1],
+          );
+          break;
+        case WorkerHostOp.SocketIsDgram:
+          result = bodies.socketIsDgram(payload[PAYLOAD_ARGS_WORD + 0]);
           break;
         default:
           result = -1;

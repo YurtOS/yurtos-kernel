@@ -207,7 +207,7 @@ const YURT_NET_DEBUG = (() => {
   return false;
 })();
 
-function netLog(op: string, fields: Record<string, unknown>): void {
+export function netLog(op: string, fields: Record<string, unknown>): void {
   if (!YURT_NET_DEBUG) return;
   const parts: string[] = [];
   for (const [k, v] of Object.entries(fields)) {
@@ -537,6 +537,47 @@ export function allocUnixSocketPair(
   } catch {
     return null;
   }
+}
+
+/**
+ * Allocate a fresh AF_INET stream socket fd with the same backend-
+ * wired closures `host_socket_open` installs on the main thread.
+ * Shared between the wasm import and the worker-host dispatcher so
+ * pthread Workers (e.g. ipykernel's Heartbeat thread, libzmq's I/O
+ * reactor) can `socket()` + `bind()` + `accept()` against the same
+ * loopback registry main uses.
+ */
+export function allocInetStreamSocket(
+  kernel: ProcessKernel,
+  socketBackend: SocketBackend | null,
+  callerPid: number,
+  nonblocking = false,
+): number {
+  return kernel.allocFd(callerPid, {
+    type: "socket",
+    socket: null,
+    refs: 1,
+    fdFlags: nonblocking ? WASI_FDFLAGS_NONBLOCK : 0,
+    send: (socket, data) =>
+      socketBackend?.send(socket, data) ??
+        { ok: false, error: "networking not configured" },
+    recv: (socket, maxBytes, recvOpts) =>
+      socketBackend?.recv(socket, maxBytes, recvOpts) ??
+        { ok: false, error: "networking not configured" },
+    recvAsync: (socket, maxBytes) =>
+      socketBackend
+        ? recvSocketAsync(socketBackend, socket, maxBytes)
+        : Promise.resolve({
+          ok: false,
+          error: "networking not configured",
+        }),
+    setNoDelay: (socket, enabled) =>
+      socketBackend?.setNoDelay?.(socket, enabled) ??
+        { ok: false, error: "TCP_NODELAY not supported by socket backend" },
+    close: (socket) => {
+      socketBackend?.close(socket);
+    },
+  });
 }
 
 /**
@@ -3005,30 +3046,12 @@ export function createKernelImports(
           },
         });
       }
-      return opts.kernel.allocFd(callerPid, {
-        type: "socket",
-        socket: null,
-        refs: 1,
-        send: (socket, data) =>
-          socketBackend?.send(socket, data) ??
-            { ok: false, error: "networking not configured" },
-        recv: (socket, maxBytes, recvOpts) =>
-          socketBackend?.recv(socket, maxBytes, recvOpts) ??
-            { ok: false, error: "networking not configured" },
-        recvAsync: (socket, maxBytes) =>
-          socketBackend
-            ? recvSocketAsync(socketBackend, socket, maxBytes)
-            : Promise.resolve({
-              ok: false,
-              error: "networking not configured",
-            }),
-        setNoDelay: (socket, enabled) =>
-          socketBackend?.setNoDelay?.(socket, enabled) ??
-            { ok: false, error: "TCP_NODELAY not supported by socket backend" },
-        close: (socket) => {
-          socketBackend?.close(socket);
-        },
-      });
+      return allocInetStreamSocket(
+        opts.kernel,
+        socketBackend ?? null,
+        callerPid,
+        (type & SOCK_NONBLOCK) !== 0,
+      );
     },
 
     // host_socket_connect(fd, sockaddr_ptr, sockaddr_len, flags) -> i32
@@ -4009,8 +4032,31 @@ export function createKernelImports(
     ): number | Promise<number> {
       const hasValue = hasValueRaw !== 0;
       const target = opts.kernel?.getFdTarget(callerPid, fd);
-      if (!target || target.type !== "socket") return -9;
-      if (option !== 1) return -95;
+      if (!target || target.type !== "socket") {
+        netLog("setsockopt", { fd, option, result: "EBADF" });
+        return -9;
+      }
+      if (option !== 1) {
+        // Many sockopt knobs (SO_LINGER, SO_REUSEADDR, SO_KEEPALIVE,
+        // SO_RCVBUF, SO_SNDBUF, …) are advisory — ipykernel's
+        // jupyter_client sets SO_LINGER to "off" before binding, which
+        // is a no-op on our loopback registry. Accept the set silently
+        // and return 0; reject only the read path where the caller
+        // expects a real value back. This trades a strict POSIX
+        // contract for not crashing every server that touches a
+        // setsockopt we don't model yet.
+        if (hasValue) {
+          netLog("setsockopt", {
+            fd,
+            option,
+            value,
+            result: "ok (stubbed)",
+          });
+          return 0;
+        }
+        netLog("setsockopt", { fd, option, result: "ENOTSUP (get)" });
+        return -95;
+      }
       if (!hasValue) return target.noDelay ? 1 : 0;
       const enabled = value !== 0;
       if (target.socket !== null) {

@@ -70,7 +70,9 @@ workerSelf.onmessage = async (e: MessageEvent<StartMessage>) => {
   // loops, proc_exit on unrecoverable error, fd_write for libc abort
   // messages on stderr). Anything else still falls through to the trap
   // stub below so unhandled imports remain observable.
-  const wasiImports = createPthreadWasiImports(memory);
+  const { imports: wasiImports, flushStdio } = createPthreadWasiImports(
+    memory,
+  );
 
   // The wasm module imports more functions than the worker actively
   // provides (the parent instance wires all of them on main). Build a
@@ -116,6 +118,88 @@ workerSelf.onmessage = async (e: MessageEvent<StartMessage>) => {
   let retval: number;
   try {
     const instance = await WebAssembly.instantiate(module, imports);
+
+    // wasm thread-local-storage bootstrap. wasm-ld emits `__thread`
+    // variables (cpython's `_Py_tss_tstate`, libzmq locals, …) at
+    // offsets from a per-instance `__tls_base` global, and a paired
+    // `__wasm_init_tls(addr)` export copies the linker-prepared TLS
+    // template into the per-thread region. Without doing this on
+    // each pthread Worker, every instance's `__tls_base` keeps its
+    // default value (typically 0) and every "thread-local" variable
+    // collides at the same shared-memory address — heartbeat /
+    // iostream threads then race on `_Py_tss_tstate` and trip
+    // `_PyThreadState_Attach: non-NULL old thread state` fatal.
+    //
+    // The three exports are emitted conditionally by wasm-ld (yurt-cc
+    // marks them `--export-if-defined` since single-threaded binaries
+    // don't have TLS variables). Skip the dance for those binaries —
+    // the canary tests, file-conformance fixture etc. don't need TLS.
+    const tlsSizeGlobal = instance.exports.__tls_size as
+      | WebAssembly.Global
+      | undefined;
+    const tlsBaseGlobal = instance.exports.__tls_base as
+      | WebAssembly.Global
+      | undefined;
+    const initTls = instance.exports.__wasm_init_tls as
+      | ((tlsBase: number) => void)
+      | undefined;
+    const alloc = instance.exports.__alloc as
+      | ((size: number) => number)
+      | undefined;
+    if (
+      tlsSizeGlobal !== undefined &&
+      tlsBaseGlobal !== undefined &&
+      typeof initTls === "function" &&
+      typeof alloc === "function"
+    ) {
+      const tlsSize = tlsSizeGlobal.value | 0;
+      if (tlsSize > 0) {
+        // wasi-libc malloc is mutex-protected and doesn't itself read
+        // TLS at allocation time, so this bootstrap call is safe even
+        // though `__wasi_init_tp` hasn't run yet.
+        const tlsBase = alloc(tlsSize) | 0;
+        tlsBaseGlobal.value = tlsBase;
+        initTls(tlsBase);
+      }
+    }
+
+    // Per-worker stack pointer. wasi-threads modules normally export a
+    // `wasi_thread_start(tid, start_arg)` shim that the host invokes;
+    // that shim allocates a fresh stack region and writes its top into
+    // the new instance's `__stack_pointer` global. yurt-cc doesn't
+    // emit `wasi_thread_start` (we dispatch via the indirect call
+    // table instead), so without setting `__stack_pointer` here every
+    // worker pthread keeps the module's data-section default — the
+    // top of the linker-reserved stack region. With multiple
+    // concurrent worker pthreads alive (cpython spawns iopub +
+    // heartbeat + libzmq I/O reactor at minimum) their stacks
+    // overlap in shared linear memory and one worker's stack writes
+    // corrupt another's, eventually surfacing as "memory access out
+    // of bounds" wasm traps. Allocating a per-worker region and
+    // setting the stack pointer to its top fixes this.
+    //
+    // Stack grows down on wasm32 — set pointer to base + size.
+    // Sized at 2 MiB to match what wasi-libc's threaded build
+    // typically reserves per pthread.
+    const PTHREAD_STACK_SIZE = 2 * 1024 * 1024;
+    const stackPointerGlobal = instance.exports.__stack_pointer as
+      | WebAssembly.Global
+      | undefined;
+    if (stackPointerGlobal !== undefined && typeof alloc === "function") {
+      const stackBase = alloc(PTHREAD_STACK_SIZE) | 0;
+      if (stackBase > 0) {
+        stackPointerGlobal.value = stackBase + PTHREAD_STACK_SIZE;
+      }
+    }
+
+    // wasi-libc thread-pointer initialiser. Runs AFTER `__tls_base`
+    // AND `__stack_pointer` are valid because wasi-libc's pthread
+    // struct lives inside the TLS region we just wired up and the
+    // init routine itself uses C-stack.
+    const initTp = instance.exports.__wasi_init_tp;
+    if (typeof initTp === "function") {
+      (initTp as () => void)();
+    }
     const table = instance.exports.__indirect_function_table;
     if (!(table instanceof WebAssembly.Table)) {
       retval = -1;
@@ -143,6 +227,12 @@ workerSelf.onmessage = async (e: MessageEvent<StartMessage>) => {
     retval = -1;
   }
 
+  // Drain any partial stdio line still sitting in the per-fd buffers
+  // before terminating. Python tracebacks (e.g. ipykernel's Heartbeat
+  // thread) often end without a trailing newline; without this flush
+  // they'd be lost when the Worker is terminated by the joining side.
+  flushStdio();
+
   const msg: DoneMessage = { type: "done", tid, retval };
   workerSelf.postMessage(msg);
 };
@@ -154,7 +244,7 @@ const WASI_RIGHTS_ALL = 0x1fffffffn;
 
 function createPthreadWasiImports(
   memory: WebAssembly.Memory,
-): WebAssembly.ModuleImports {
+): { imports: WebAssembly.ModuleImports; flushStdio: () => void } {
   const view = () => new DataView(memory.buffer);
   const bytes = () => new Uint8Array(memory.buffer);
 
@@ -205,7 +295,14 @@ function createPthreadWasiImports(
     lineBuffers.set(fd, combined.slice(cursor));
   };
 
-  return {
+  const flushStdio = (): void => {
+    for (const [fd, remainder] of lineBuffers) {
+      if (remainder.length > 0) flushPthreadLine(fd, remainder);
+    }
+    lineBuffers.clear();
+  };
+
+  const imports: WebAssembly.ModuleImports = {
     // Optimistic stub: report every fd as a stream socket with no
     // flags so libzmq's signaler can read O_NONBLOCK state and then
     // set it via fd_fdstat_set_flags. cpython's threading paths that
@@ -286,4 +383,6 @@ function createPthreadWasiImports(
       return WASI_ESUCCESS;
     },
   };
+
+  return { imports, flushStdio };
 }

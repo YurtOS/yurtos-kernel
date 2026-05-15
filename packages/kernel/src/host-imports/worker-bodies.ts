@@ -62,7 +62,9 @@ import type {
   SocketBackendResult,
 } from "../network/socket-backend.js";
 import {
+  allocInetStreamSocket,
   allocUnixSocketPair,
+  netLog,
   POLLFD_SIZE,
   POLLNVAL,
   pollReventsForTarget,
@@ -195,12 +197,40 @@ export function makeWorkerDispatcherBodies(
       if (target?.type === "null") return { result: 0 };
       return { result: -9 };
     },
-    socketOpen: (_domain, _type, _protocol) => {
-      // Worker-side socket creation isn't wired today: libzmq's
-      // signaler thread (the only worker callsite for now) inherits
-      // the socket fd from the main thread. Returning -1 keeps the
-      // dispatcher response well-defined; Task 11+ canaries don't
-      // exercise this path.
+    socketOpen: (domain, type, _protocol) => {
+      // wasi-sdk-30 / yurt-cc abi/include/sys/socket.h numbering:
+      //   AF_INET = 1, AF_UNIX = 3, SOCK_STREAM = 6, SOCK_DGRAM = 5.
+      //   SOCK_NONBLOCK=0x4000 / SOCK_CLOEXEC=0x2000 are OR'd into
+      //   `type`. ipykernel's heartbeat pthread asks for
+      //   AF_INET SOCK_STREAM here (the heartbeat channel binds its
+      //   own ROUTER socket); without this branch libzmq's underlying
+      //   socket() returns -1 and the bind throws "No file
+      //   descriptors available". AF_UNIX paths still go through
+      //   socketpair / socket_open on main today.
+      const AF_INET = 1;
+      const SOCK_STREAM = 6;
+      const SOCK_NONBLOCK = 0x4000;
+      const baseType = type & ~SOCK_NONBLOCK & ~0x2000; // also strip CLOEXEC
+      if (domain === AF_INET && baseType === SOCK_STREAM) {
+        const fd = allocInetStreamSocket(
+          kernel,
+          opts.socketBackend ?? null,
+          getPid(),
+          (type & SOCK_NONBLOCK) !== 0,
+        );
+        netLog("pthread.socket_open", {
+          domain,
+          type,
+          fd,
+          result: "ok",
+        });
+        return fd;
+      }
+      netLog("pthread.socket_open", {
+        domain,
+        type,
+        result: "ENOTSUP (worker)",
+      });
       return -1;
     },
     socketClose: (fd) => {
@@ -219,18 +249,23 @@ export function makeWorkerDispatcherBodies(
     socketSend: (fd, data) => {
       const target = kernel.getFdTarget(getPid(), fd);
       if (!target || target.type !== "socket" || target.socket === null) {
+        netLog("pthread.send", { fd, result: "EBADF" });
         return -1;
       }
       const copy = new Uint8Array(data); // copy out of SAB before send
       const result = requireSyncSocketResult(
         target.send(target.socket, copy),
       );
-      if (!result.ok) return -1;
+      if (!result.ok) {
+        netLog("pthread.send", { fd, len: data.byteLength, result: "EIO" });
+        return -1;
+      }
       return typeof result.bytes_sent === "number" ? result.bytes_sent : -1;
     },
     socketRecv: (fd, cap) => {
       const target = kernel.getFdTarget(getPid(), fd);
       if (!target || target.type !== "socket" || target.socket === null) {
+        netLog("pthread.recv", { fd, result: "EBADF" });
         return { result: -1 };
       }
       // Synchronous best-effort: peek/nonblocking via target.recv.
@@ -243,6 +278,9 @@ export function makeWorkerDispatcherBodies(
         target.recv(target.socket, cap, { nonblocking: true }),
       );
       if (!probe.ok) {
+        if (probe.error !== "EAGAIN") {
+          netLog("pthread.recv", { fd, cap, result: "EIO" });
+        }
         return { result: probe.error === "EAGAIN" ? -11 : -1 };
       }
       const bytes = probe.data ?? new Uint8Array(0);
@@ -250,33 +288,67 @@ export function makeWorkerDispatcherBodies(
     },
     getPid: () => kernel.getVisiblePid(getPid()),
     socketSendUnix: (fd, data) => {
-      if (!opts.socketBackend) return -1;
+      if (!opts.socketBackend) {
+        netLog("pthread.send_unix", {
+          fd,
+          result: "EIO",
+          reason: "no backend",
+        });
+        return -1;
+      }
       const copy = new Uint8Array(data);
-      return sendUnixSocket(
+      const r = sendUnixSocket(
         kernel,
         opts.socketBackend,
         getPid(),
         fd,
         copy,
       );
+      if (r < 0) {
+        netLog("pthread.send_unix", {
+          fd,
+          len: data.byteLength,
+          result: r === -2 ? "EAFNOSUPPORT" : "EIO",
+        });
+      }
+      return r;
     },
     socketPair: (_family, sockType) => {
-      if (!opts.socketBackend) return { result: -1 };
+      if (!opts.socketBackend) {
+        netLog("pthread.socketpair", { result: "EIO", reason: "no backend" });
+        return { result: -1 };
+      }
       const pair = allocUnixSocketPair(
         kernel,
         opts.socketBackend,
         getPid(),
         sockType,
       );
-      if (!pair) return { result: -1 };
+      if (!pair) {
+        netLog("pthread.socketpair", { sockType, result: "EIO" });
+        return { result: -1 };
+      }
+      netLog("pthread.socketpair", {
+        sockType,
+        fdA: pair.fdA,
+        fdB: pair.fdB,
+        result: "ok",
+      });
       const out = new Uint8Array(8);
       new DataView(out.buffer).setInt32(0, pair.fdA, true);
       new DataView(out.buffer).setInt32(4, pair.fdB, true);
       return { result: 0, bytes: out };
     },
     socketRecvUnix: (fd, cap, peek) => {
-      if (!opts.socketBackend) return { result: -1 };
-      return recvUnixSocketNonblocking(
+      if (!opts.socketBackend) {
+        netLog("pthread.recv_unix", {
+          fd,
+          result: "EIO",
+          reason: "no backend",
+        });
+        return { result: -1 };
+      }
+      const r = recvUnixSocketNonblocking(
         kernel,
         opts.socketBackend,
         getPid(),
@@ -284,24 +356,129 @@ export function makeWorkerDispatcherBodies(
         cap,
         peek !== 0,
       );
+      if (r.result < 0 && r.result !== -2) {
+        netLog("pthread.recv_unix", { fd, cap, result: r.result });
+      }
+      return r;
     },
     setFdDescriptorFlags: (fd, flags) => {
       if (!kernel.getFdTarget(getPid(), fd)) return -1;
       kernel.setFdDescriptorFlags(getPid(), fd, flags);
       return 0;
     },
+    socketBind: (fd, host, port) => {
+      const target = kernel.getFdTarget(getPid(), fd);
+      if (!target || target.type !== "socket") {
+        netLog("pthread.bind", { fd, result: "EBADF" });
+        return -9;
+      }
+      const hostStr = new TextDecoder().decode(host);
+      if (
+        hostStr !== "127.0.0.1" && hostStr !== "localhost" &&
+        hostStr !== "0.0.0.0"
+      ) {
+        netLog("pthread.bind", {
+          fd,
+          host: hostStr,
+          port,
+          result: "EAFNOSUPPORT",
+        });
+        return -95;
+      }
+      if (!Number.isInteger(port) || port < 0 || port > 65535) {
+        netLog("pthread.bind", { fd, host: hostStr, port, result: "EINVAL" });
+        return -22;
+      }
+      target.boundHost = hostStr as "127.0.0.1" | "localhost" | "0.0.0.0";
+      target.boundPort = port;
+      target.localHost = hostStr === "0.0.0.0" ? "10.0.2.15" : hostStr;
+      target.localPort = port;
+      netLog("pthread.bind", { fd, host: hostStr, port, result: "ok" });
+      return 0;
+    },
+    socketListen: (fd, backlogArg) => {
+      const target = kernel.getFdTarget(getPid(), fd);
+      if (!target || target.type !== "socket") {
+        netLog("pthread.listen", { fd, result: "EBADF" });
+        return -9;
+      }
+      if (!opts.socketBackend?.listen) {
+        netLog("pthread.listen", { fd, result: "ENOTSUP" });
+        return -95;
+      }
+      const host = target.boundHost ?? "127.0.0.1";
+      const port = target.boundPort ?? 0;
+      const backlog = backlogArg > 0 ? backlogArg : 128;
+      const listenResult = opts.socketBackend.listen({ host, port, backlog });
+      if (typeof (listenResult as Promise<unknown>).then === "function") {
+        // Network-bridge backends return a Promise here; the worker
+        // dispatcher can't await mid-flight. The loopback registry is
+        // sync, so as long as the sandbox uses it (serverSockets.
+        // allowLoopback) this branch never fires. Surface a clear
+        // failure rather than blocking — the heartbeat thread will
+        // retry via its own bind/listen loop.
+        netLog("pthread.listen", { fd, result: "EAGAIN (async backend)" });
+        return -5;
+      }
+      const r = listenResult as Awaited<
+        ReturnType<NonNullable<typeof opts.socketBackend.listen>>
+      >;
+      if (!r.ok) {
+        netLog("pthread.listen", {
+          fd,
+          host,
+          port,
+          result: "EIO",
+          reason: r.error,
+        });
+        return -5;
+      }
+      target.listener = r.listener;
+      target.boundHost = host;
+      target.boundPort = port;
+      target.localHost = r.host;
+      target.localPort = r.port;
+      target.closeListener = (listener) => {
+        void opts.socketBackend?.closeListener?.(listener);
+      };
+      netLog("pthread.listen", {
+        fd,
+        host,
+        port,
+        assignedHost: r.host,
+        assignedPort: r.port,
+        result: "ok",
+      });
+      return 0;
+    },
+    socketIsDgram: (fd) => {
+      const target = kernel.getFdTarget(getPid(), fd);
+      if (!target || target.type !== "socket") return -1;
+      return target.isDgram ? 1 : 0;
+    },
     threadSpawn: (fnPtr, arg) => {
       const tb = threadsBackend() as
         | (ThreadsBackend & { spawnSync?: (fp: number, a: number) => number })
         | null;
-      if (!tb || typeof tb.spawnSync !== "function") return -1;
+      if (!tb || typeof tb.spawnSync !== "function") {
+        netLog("pthread.spawn", { result: "ENOTSUP" });
+        return -1;
+      }
       try {
-        return tb.spawnSync(fnPtr, arg);
-      } catch {
+        const tid = tb.spawnSync(fnPtr, arg);
+        netLog("pthread.spawn", { fnPtr, tid });
+        return tid;
+      } catch (e) {
+        netLog("pthread.spawn", {
+          fnPtr,
+          result: "EIO",
+          reason: e instanceof Error ? e.message : String(e),
+        });
         return -1;
       }
     },
     poll: (nfds, fds) => {
+      netLog("pthread.poll.req", { nfds, byteLen: fds.byteLength });
       // Single-shot readiness probe — the worker-side `host_poll`
       // import owns the retry/timeout loop. Each pollfd is 8 bytes:
       // i32 fd, i16 events, i16 revents (revents zeroed on input,
@@ -319,6 +496,8 @@ export function makeWorkerDispatcherBodies(
       const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
       let ready = 0;
       void POLLNVAL;
+      const fdSummary: number[] = [];
+      const reventsSummary: number[] = [];
       for (let i = 0; i < nfds; i++) {
         const base = i * POLLFD_SIZE;
         const fd = view.getInt32(base, true);
@@ -329,8 +508,15 @@ export function makeWorkerDispatcherBodies(
           revents = target ? pollReventsForTarget(target, events) : 0;
         }
         view.setInt16(base + 6, revents, true);
+        fdSummary.push(fd);
+        reventsSummary.push(revents);
         if (revents !== 0) ready++;
       }
+      netLog("pthread.poll.resp", {
+        fds: fdSummary,
+        revents: reventsSummary,
+        ready,
+      });
       return { result: ready, bytes: out };
     },
   };

@@ -765,7 +765,15 @@ static int yurt_setsockopt_impl(int sockfd, int level, int optname, const void *
 
   if (level == SOL_SOCKET
       && (optname == SO_REUSEADDR || optname == YURT_SO_REUSEADDR
-          || optname == SO_KEEPALIVE || optname == YURT_SO_KEEPALIVE)) {
+          || optname == SO_KEEPALIVE || optname == YURT_SO_KEEPALIVE
+          || optname == SO_LINGER
+          || optname == SO_RCVBUF || optname == SO_SNDBUF
+          || optname == SO_BROADCAST)) {
+    /* Loopback registry has no real socket beneath it: linger, rcv/snd
+     * buffer sizes, broadcast are all advisory or hard-coded. Accept
+     * the set as a no-op so server frameworks (jupyter_client's
+     * write_connection_file, libzmq's TCP setup, …) don't crash on an
+     * advisory tuning request. */
     return 0;
   }
 

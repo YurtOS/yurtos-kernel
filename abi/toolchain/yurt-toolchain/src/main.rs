@@ -8,7 +8,7 @@ use yurt_toolchain::{
     archive,
     env::{self, InstrumentationMode},
     features, preserve, wasi_sdk, wasm_opt, TIER1, WRAPPED_WASI_LIBC_SYMBOLS,
-    YURT_INTERNAL_EXPORTS,
+    YURT_INTERNAL_EXPORTS, YURT_OPTIONAL_EXPORTS,
 };
 
 #[derive(Parser, Debug)]
@@ -404,6 +404,9 @@ fn build_clang_invocation(
             }
             for sym in YURT_INTERNAL_EXPORTS {
                 argv.push(format!("-Wl,--export={sym}").into());
+            }
+            for sym in YURT_OPTIONAL_EXPORTS {
+                argv.push(format!("-Wl,--export-if-defined={sym}").into());
             }
         }
     }

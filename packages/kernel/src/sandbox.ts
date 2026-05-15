@@ -1057,6 +1057,45 @@ export class Sandbox {
     kernel.setFdTarget(pid, 2, createBufferTarget(stderrLimit ?? Infinity));
   }
 
+  /**
+   * Install a per-run onChunk callback on the boot process's stdout
+   * and stderr buffer targets that forwards each written chunk to the
+   * caller's streaming callbacks. Returns a `restore` thunk that
+   * removes the hooks; the caller MUST invoke it in a `finally` block
+   * so a follow-up sandbox.run without streaming doesn't fire stale
+   * callbacks against drained data from the previous run. A no-op when
+   * the caller didn't pass any callbacks.
+   */
+  private installStreamingChunkHooks(
+    callbacks: (StreamCallbacks & { stdinData?: Uint8Array }) | undefined,
+  ): () => void {
+    if (!callbacks?.onStdout && !callbacks?.onStderr) return () => {};
+    const pid = this.bootProcess.pid;
+    const decoder = new TextDecoder();
+    const hookFd = (
+      fd: 1 | 2,
+      cb: ((chunk: string) => void) | undefined,
+    ): (() => void) | null => {
+      if (!cb) return null;
+      const target = this.kernel.getFdTarget(pid, fd);
+      if (!target || target.type !== "buffer") return null;
+      const previous = target.onChunk;
+      target.onChunk = (data) => {
+        previous?.(data);
+        try {
+          cb(decoder.decode(data, { stream: true }));
+        } catch { /* swallow streaming-callback errors */ }
+      };
+      return () => { target.onChunk = previous; };
+    };
+    const restoreStdout = hookFd(1, callbacks.onStdout);
+    const restoreStderr = hookFd(2, callbacks.onStderr);
+    return () => {
+      restoreStdout?.();
+      restoreStderr?.();
+    };
+  }
+
   private static writeToFdTarget(
     target: FdTarget | undefined | null,
     text: string,
@@ -1555,6 +1594,13 @@ export class Sandbox {
       } else {
         // In-process execution: the sandbox facade speaks the resident process
         // command protocol, but the kernel only sees a generic Process.
+        // Install per-run onChunk hooks on the boot process's stdout/stderr
+        // buffer targets when the caller passed streaming callbacks, so the
+        // host can observe progress before __run_command returns. This is
+        // what lets a long-running cpython script surface print() output
+        // mid-flight (e.g. ipykernel bootstrap diagnostics) instead of
+        // appearing in a single blob at completion.
+        const restore = this.installStreamingChunkHooks(callbacks);
         try {
           result = await this.runBootCommand(command, {
             stdinData: callbacks?.stdinData,
@@ -1572,6 +1618,8 @@ export class Sandbox {
           } else {
             throw e;
           }
+        } finally {
+          restore();
         }
       }
 
@@ -1587,10 +1635,13 @@ export class Sandbox {
         result.errorClass = "TIMEOUT";
       }
 
-      if (callbacks?.onStdout && result.stdout) {
+      // Streaming hooks already surfaced output mid-run; only flush a
+      // trailing batch for the worker-executor / non-streaming paths
+      // where the buffer arrives in one piece.
+      if (callbacks?.onStdout && result.stdout && this.workerExecutor) {
         callbacks.onStdout(result.stdout);
       }
-      if (callbacks?.onStderr && result.stderr) {
+      if (callbacks?.onStderr && result.stderr && this.workerExecutor) {
         callbacks.onStderr(result.stderr);
       }
       // Post-execution audit
