@@ -491,6 +491,35 @@ static int case_dgram_connect_send(void) {
   return 0;
 }
 
+static int case_getpeername_unconnected(void) {
+  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  struct sockaddr_un got;
+  socklen_t got_len = sizeof(got);
+  int saved_errno;
+
+  if (fd < 0) {
+    emit("getpeername_unconnected", 1, "socket-fail", 1, errno);
+    return 1;
+  }
+
+  memset(&got, 0, sizeof(got));
+  errno = 0;
+  if (getpeername(fd, (struct sockaddr *)&got, &got_len) == 0) {
+    emit("getpeername_unconnected", 1, "peername-succeeded", 0, 0);
+    close(fd);
+    return 1;
+  }
+  saved_errno = errno;
+  close(fd);
+
+  if (saved_errno == ENOTCONN) {
+    emit("getpeername_unconnected", 0, "enotconn=ok", 0, 0);
+    return 0;
+  }
+  emit("getpeername_unconnected", 1, "wrong-errno", 1, saved_errno);
+  return 1;
+}
+
 static int case_scm_rights_pipe_handoff(void) {
   int sv[2];
   int pipefd[2];
@@ -1251,6 +1280,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "dgram_pair_message_framing") == 0) return case_dgram_pair_message_framing();
   if (strcmp(name, "dgram_path_sendto") == 0)          return case_dgram_path_sendto();
   if (strcmp(name, "dgram_connect_send") == 0)         return case_dgram_connect_send();
+  if (strcmp(name, "getpeername_unconnected") == 0)    return case_getpeername_unconnected();
   if (strcmp(name, "scm_rights_pipe_handoff") == 0)    return case_scm_rights_pipe_handoff();
   if (strcmp(name, "peercred_after_accept") == 0)      return case_peercred_after_accept();
   if (strcmp(name, "dgram_sendto_after_unlink") == 0)  return case_dgram_sendto_after_unlink();
@@ -1281,6 +1311,7 @@ static int list_cases(void) {
   puts("dgram_pair_message_framing");
   puts("dgram_path_sendto");
   puts("dgram_connect_send");
+  puts("getpeername_unconnected");
   puts("scm_rights_pipe_handoff");
   puts("peercred_after_accept");
   puts("dgram_sendto_after_unlink");

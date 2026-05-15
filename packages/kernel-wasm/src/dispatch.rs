@@ -2464,7 +2464,13 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
             Some(SocketEntry {
                 kind: SocketKind::UnixListener { path, .. },
                 ..
-            }) => Ok(Some(path.clone())),
+            }) => {
+                if which == 0 {
+                    Ok(Some(path.clone()))
+                } else {
+                    Err(-(abi::ENOTCONN as i64))
+                }
+            }
             Some(SocketEntry {
                 kind:
                     SocketKind::UnixStream {
@@ -2484,6 +2490,7 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
                 kind:
                     SocketKind::UnixDatagram {
                         bound_path,
+                        peer_id,
                         peer_path,
                         ..
                     },
@@ -2491,15 +2498,23 @@ fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 
             }) => {
                 if which == 0 {
                     Ok(bound_path.clone())
-                } else {
+                } else if peer_id.is_some() {
                     Ok(peer_path.clone())
+                } else {
+                    Err(-(abi::ENOTCONN as i64))
                 }
             }
             Some(SocketEntry {
                 domain,
                 kind: SocketKind::Open { .. },
                 ..
-            }) if matches!(*domain, 1 | 3) => Ok(None),
+            }) if matches!(*domain, 1 | 3) => {
+                if which == 0 {
+                    Ok(None)
+                } else {
+                    Err(-(abi::ENOTCONN as i64))
+                }
+            }
             Some(SocketEntry {
                 kind: SocketKind::Open { .. },
                 ..
@@ -5366,6 +5381,22 @@ mod tests {
             31
         );
         assert_eq!(&path[..31], b"/tmp/dgram-peername-server.sock");
+    }
+
+    #[test]
+    fn af_unix_getpeername_rejects_unconnected_socket() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            3
+        );
+        let mut path = [0u8; 108];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_ADDR, 1, &socket_addr_req(3, 1), &mut path),
+            -(abi::ENOTCONN as i64)
+        );
     }
 
     #[test]
