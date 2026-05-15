@@ -1571,10 +1571,64 @@ function buildUserYurtImports(
     const copied = copyOut(outPtr, response.subarray(0, Math.min(n, cap)));
     return copied < 0 ? copied : n;
   };
+  const mainTid = 1;
+  const scalarRequest = (...values: number[]): Uint8Array => {
+    const req = new Uint8Array(values.length * 4);
+    const view = new DataView(req.buffer);
+    values.forEach((value, index) => {
+      view.setUint32(index * 4, value >>> 0, true);
+    });
+    return req;
+  };
+  const threadSyscall = (
+    method: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): { rc: number; response: Uint8Array } => {
+    const out = kernel.threadSyscall(
+      method,
+      pid,
+      mainTid,
+      request,
+      responseCap,
+    );
+    return { rc: Number(out.rc), response: out.response };
+  };
   const imports: Record<string, (...args: (number | bigint)[]) => number> = {};
   for (const name of USER_YURT_STUB_IMPORTS) {
     imports[name] = () => -ENOSYS;
   }
+  imports.host_thread_spawn = (fnPtr, arg) =>
+    threadSyscall(
+      METHOD.SYS_THREAD_SPAWN,
+      scalarRequest(Number(fnPtr), Number(arg)),
+      0,
+    ).rc;
+  imports.host_thread_self = () =>
+    threadSyscall(METHOD.SYS_THREAD_SELF, new Uint8Array(0), 0).rc;
+  imports.host_thread_join = (tid, outRetvalPtr) => {
+    const out = threadSyscall(
+      METHOD.SYS_THREAD_JOIN,
+      scalarRequest(Number(tid)),
+      4,
+    );
+    if (out.rc !== 0) return out.rc;
+    return copyOut(Number(outRetvalPtr), out.response.subarray(0, 4));
+  };
+  imports.host_thread_detach = (tid) =>
+    threadSyscall(
+      METHOD.SYS_THREAD_DETACH,
+      scalarRequest(Number(tid)),
+      0,
+    ).rc;
+  imports.host_thread_exit = (retval) =>
+    threadSyscall(
+      METHOD.SYS_THREAD_EXIT,
+      scalarRequest(Number(retval)),
+      0,
+    ).rc;
+  imports.host_thread_yield = () =>
+    threadSyscall(METHOD.SYS_THREAD_YIELD, new Uint8Array(0), 0).rc;
   const scalar = (method: number) => () =>
     Number(kernel.syscall(method, pid, new Uint8Array(0), 0).rc);
   imports.host_getuid = scalar(METHOD.SYS_GETUID);

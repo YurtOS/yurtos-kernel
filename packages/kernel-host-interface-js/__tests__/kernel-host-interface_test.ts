@@ -701,6 +701,17 @@ Deno.test("thread dispatch authenticates main caller tid for pthread_self", asyn
   assertEquals(Number(out.rc), 0);
 });
 
+Deno.test("user-process host_thread_self routes through Rust thread dispatch", async () => {
+  const wasm = await wat2wasm(`(module
+    (import "yurt" "host_thread_self" (func $host_thread_self (result i32)))
+    (func (export "run") (result i32)
+      call $host_thread_self))`);
+  const mk = await freshKernelHostInterface();
+  const user = mk.spawnUserProcess(wasm);
+
+  assertEquals(user.callExportI32("run"), 0);
+});
+
 Deno.test("thread dispatch returns join status separately from raw retval bits", async () => {
   const mk = await freshKernelHostInterface();
   const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
