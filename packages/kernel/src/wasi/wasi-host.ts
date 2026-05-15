@@ -29,7 +29,9 @@ import {
 } from "./fd-target.js";
 import {
   WASI_CLOCK_MONOTONIC,
+  WASI_CLOCK_PROCESS_CPUTIME_ID,
   WASI_CLOCK_REALTIME,
+  WASI_CLOCK_THREAD_CPUTIME_ID,
   WASI_EAGAIN,
   WASI_EBADF,
   WASI_EEXIST,
@@ -3329,10 +3331,19 @@ export class WasiHost {
 
   private clockResGet(clockId: number, resPtr: number): number {
     const view = this.getView();
+    // All four standard WASI preview1 clocks (realtime, monotonic,
+    // process_cputime_id, thread_cputime_id) report the same 1ms
+    // resolution — that's the precision Date.now() gives us.
+    // Returning EINVAL for CPUTIME clocks breaks cpython's
+    // `time.get_clock_info`, which probes them while populating its
+    // info dict (and asyncio's BaseEventLoop.__init__ depends on
+    // that probe). Mirrors `clockTimeGet` which already ignores
+    // clockId.
     switch (clockId) {
       case WASI_CLOCK_REALTIME:
       case WASI_CLOCK_MONOTONIC:
-        // Date.now() precision is 1ms = 1,000,000 nanoseconds
+      case WASI_CLOCK_PROCESS_CPUTIME_ID:
+      case WASI_CLOCK_THREAD_CPUTIME_ID:
         view.setBigUint64(resPtr, BigInt(1_000_000), true);
         return WASI_ESUCCESS;
       default:
