@@ -408,7 +408,7 @@ fn chdir(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
-        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+        let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
@@ -2012,16 +2012,10 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
     let create = flags & 0b010 != 0;
     let trunc = flags & 0b100 != 0;
     with_kernel(|k| {
-        let path = match PathResolver::new(k, caller_pid).normalize(raw_path) {
+        let path = match normalize_readable_path(k, caller_pid, raw_path) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        // Refresh procfs snapshots so /proc/<N>/status reflects the
-        // current process table at open time.
-        k.publish_proc_snapshots();
-        if !k.can_read_proc_path(caller_pid, &path) {
-            return -(abi::EPERM as i64);
-        }
         // Symlink resolution: walk the path through readlink up to
         // 40 hops (POSIX SYMLOOP_MAX). Each hop replaces the path
         // verbatim — Phase 7 only handles final-component
@@ -2065,6 +2059,22 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             .install(fd, crate::kernel::FdEntry::File { ofd_id });
         fd as i64
     })
+}
+
+fn normalize_readable_path(
+    k: &mut Kernel,
+    caller_pid: u32,
+    raw_path: &[u8],
+) -> Result<Vec<u8>, i64> {
+    let path = PathResolver::new(k, caller_pid).normalize(raw_path)?;
+    // Refresh procfs snapshots so /proc/<N> views reflect the current
+    // process table at lookup time, then gate all read-like path
+    // surfaces consistently.
+    k.publish_proc_snapshots();
+    if !k.can_read_proc_path(caller_pid, &path) {
+        return Err(-(abi::EPERM as i64));
+    }
+    Ok(path)
 }
 
 /// `lseek(fd, offset, whence)`. POSIX semantics: SET=0, CUR=1, END=2.
@@ -2152,7 +2162,7 @@ fn mkdir(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
-        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+        let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
@@ -2166,7 +2176,7 @@ fn rmdir(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
-        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+        let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
@@ -2185,7 +2195,7 @@ fn readdir(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
-        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+        let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
@@ -3201,7 +3211,7 @@ fn readlink(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
-        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+        let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
@@ -3224,6 +3234,10 @@ fn realpath(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             Ok(path) => path,
             Err(errno) => return -(errno as i64),
         };
+        k.publish_proc_snapshots();
+        if !k.can_read_proc_path(caller_pid, &resolved) {
+            return -(abi::EPERM as i64);
+        }
         let required = resolved.len() + 1;
         if response.len() < required {
             return required as i64;
@@ -3242,7 +3256,7 @@ fn unlink(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
-        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+        let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
@@ -3267,7 +3281,7 @@ fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
-        let path = match PathResolver::new(k, caller_pid).normalize(request) {
+        let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
@@ -7381,6 +7395,41 @@ mod tests {
 
         make_root(1);
         assert!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/proc/2/status"), &mut []) >= 0);
+    }
+
+    #[test]
+    fn proc_other_pid_metadata_queries_are_gated() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let argv = set_argv_req(2, &[b"/bin/other"]);
+        set_argv(&argv);
+
+        let mut stat = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_STAT, 1, b"/proc/2/status", &mut stat),
+            -(abi::EPERM as i64)
+        );
+
+        let mut entries = [0u8; 128];
+        assert_eq!(
+            dispatch(METHOD_SYS_READDIR, 1, b"/proc/2", &mut entries),
+            -(abi::EPERM as i64)
+        );
+
+        let mut target = [0u8; 64];
+        assert_eq!(
+            dispatch(METHOD_SYS_READLINK, 1, b"/proc/2/cwd", &mut target),
+            -(abi::EPERM as i64)
+        );
+
+        assert_eq!(
+            dispatch(METHOD_SYS_STAT, 2, b"/proc/2/status", &mut stat),
+            16
+        );
+        make_root(1);
+        assert_eq!(
+            dispatch(METHOD_SYS_STAT, 1, b"/proc/2/status", &mut stat),
+            16
+        );
     }
 
     #[test]

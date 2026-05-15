@@ -11,8 +11,6 @@ const ESRCH: c_int = 71;
 const PTHREAD_CREATE_JOINABLE: c_int = 0;
 const PTHREAD_CREATE_DETACHED: c_int = 1;
 const STACK_SIZE: usize = 1024 * 1024;
-const CLOCK_REALTIME: c_int = 0;
-const CLOCK_MONOTONIC: c_int = 1;
 const TLS_KEYS_MAX: usize = 64;
 const TLS_THREADS_MAX: usize = 128;
 
@@ -62,6 +60,13 @@ struct TlsLockGuard;
 
 static TLS_LOCK: AtomicBool = AtomicBool::new(false);
 static mut TLS_KEYS: [TlsKey; TLS_KEYS_MAX] = [TlsKey::EMPTY; TLS_KEYS_MAX];
+
+#[allow(non_upper_case_globals)]
+#[no_mangle]
+pub static _CLOCK_REALTIME: u8 = 0;
+#[allow(non_upper_case_globals)]
+#[no_mangle]
+pub static _CLOCK_MONOTONIC: u8 = 0;
 
 #[link(wasm_import_module = "yurt")]
 extern "C" {
@@ -128,27 +133,35 @@ fn attr_detachstate_mut(attr: *mut PthreadAttr) -> Option<&'static mut c_int> {
     Some(unsafe { &mut (*attr).slots[ATTR_DETACHSTATE_SLOT] })
 }
 
-fn store_clock(attr: *mut c_void, value: c_int) -> c_int {
+fn realtime_clock_id() -> usize {
+    core::ptr::addr_of!(_CLOCK_REALTIME) as usize
+}
+
+fn monotonic_clock_id() -> usize {
+    core::ptr::addr_of!(_CLOCK_MONOTONIC) as usize
+}
+
+fn store_clock(attr: *mut c_void, value: usize) -> c_int {
     if attr.is_null() {
         return EINVAL;
     }
     // SAFETY: `attr` was checked non-null and points to caller-owned
     // pthread_condattr_t storage for this C ABI call. Condattr is opaque to C;
-    // this shim stores the clock id in the first int-sized slot.
+    // wasi-libc clockid_t is pointer-typed, so store a pointer-sized value.
     unsafe {
-        ptr::write_unaligned(attr.cast::<c_int>(), value);
+        ptr::write_unaligned(attr.cast::<usize>(), value);
     }
     0
 }
 
-fn load_clock(attr: *const c_void, value: *mut c_int) -> c_int {
+fn load_clock(attr: *const c_void, value: *mut usize) -> c_int {
     if attr.is_null() || value.is_null() {
         return EINVAL;
     }
     // SAFETY: pointers were checked non-null and refer to C ABI storage for
-    // this call. The clock id is stored unaligned in the first int-sized slot.
+    // this call. The clock id is stored unaligned in the first pointer-sized slot.
     unsafe {
-        *value = ptr::read_unaligned(attr.cast::<c_int>());
+        *value = ptr::read_unaligned(attr.cast::<usize>());
     }
     0
 }
@@ -439,7 +452,7 @@ pub extern "C" fn pthread_getattr_np(thread: *mut c_void, attr: *mut PthreadAttr
 
 #[no_mangle]
 pub extern "C" fn pthread_condattr_init(attr: *mut c_void) -> c_int {
-    store_clock(attr, CLOCK_REALTIME)
+    store_clock(attr, realtime_clock_id())
 }
 
 #[no_mangle]
@@ -452,14 +465,14 @@ pub extern "C" fn pthread_condattr_destroy(attr: *mut c_void) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn pthread_condattr_setclock(attr: *mut c_void, clock_id: c_int) -> c_int {
-    if clock_id != CLOCK_REALTIME && clock_id != CLOCK_MONOTONIC {
+pub extern "C" fn pthread_condattr_setclock(attr: *mut c_void, clock_id: usize) -> c_int {
+    if clock_id != realtime_clock_id() && clock_id != monotonic_clock_id() {
         return EINVAL;
     }
     store_clock(attr, clock_id)
 }
 
 #[no_mangle]
-pub extern "C" fn pthread_condattr_getclock(attr: *const c_void, clock_id: *mut c_int) -> c_int {
+pub extern "C" fn pthread_condattr_getclock(attr: *const c_void, clock_id: *mut usize) -> c_int {
     load_clock(attr, clock_id)
 }

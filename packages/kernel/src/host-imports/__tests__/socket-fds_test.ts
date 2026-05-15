@@ -36,12 +36,51 @@ function readBytes(
   return new Uint8Array(memory.buffer, ptr, len).slice();
 }
 
-function readSocketAddr(memory: WebAssembly.Memory, ptr: number, len: number) {
+function writeSockaddrIn(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  host: [number, number, number, number],
+  port: number,
+  family = 1,
+): number {
+  const bytes = new Uint8Array(memory.buffer, ptr, 16);
+  bytes.fill(0);
+  const view = new DataView(memory.buffer, ptr, 16);
+  view.setUint16(0, family, true);
+  view.setUint16(2, port, false);
+  bytes.set(host, 4);
+  return 16;
+}
+
+function readSocketAddrResult(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+) {
   const view = new DataView(memory.buffer, ptr, len);
+  const host = Array.from(readBytes(memory, ptr, 4)).join(".");
   return {
-    port: view.getUint16(0, true),
-    host: new TextDecoder().decode(readBytes(memory, ptr + 2, len - 2)),
+    host,
+    port: view.getUint16(4, false),
   };
+}
+
+function openTcpSocket(imports: Record<string, unknown>): number {
+  return (imports.host_socket_open as (...args: number[]) => number)(1, 6, 0);
+}
+
+function connectLoopback(
+  memory: WebAssembly.Memory,
+  imports: Record<string, unknown>,
+  fd: number,
+): number {
+  const addrLen = writeSockaddrIn(memory, 16, [127, 0, 0, 1], 9);
+  return (imports.host_socket_connect as (...args: number[]) => number)(
+    fd,
+    16,
+    addrLen,
+    0,
+  );
 }
 
 describe("socket fd host imports", () => {
@@ -75,14 +114,11 @@ describe("socket fd host imports", () => {
       socketBackend: backend,
     });
 
-    const len = writeString(memory, 16, "127.0.0.1:9");
-    const fd = (imports.host_socket_connect as (...args: number[]) => number)(
-      16,
-      len,
-      0,
-    );
+    const fd = openTcpSocket(imports);
+    const rc = connectLoopback(memory, imports, fd);
 
     expect(fd).toBeGreaterThanOrEqual(3);
+    expect(rc).toBe(0);
     expect(requests[0]).toEqual({
       op: "connect",
       host: "127.0.0.1",
@@ -97,6 +133,43 @@ describe("socket fd host imports", () => {
       .toBe(0);
     expect(requests.at(-1)).toEqual({ op: "close", socket: handle });
     expect(kernel.getFdTarget(0, fd)).toBeNull();
+  });
+
+  it("accepts Rust std AF_INET sockaddr bytes", () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    const kernel = new ProcessKernel();
+    const requests: Record<string, unknown>[] = [];
+    const backend: SocketBackend = {
+      connect(req) {
+        requests.push({ op: "connect", ...req });
+        return { ok: true, socket: 78 };
+      },
+      send: () => ({ ok: true, bytes_sent: 0 }),
+      recv: () => ({ ok: true, data: new Uint8Array() }),
+      close: () => ({ ok: true }),
+    };
+    const imports = createKernelImports({
+      memory,
+      kernel,
+      socketBackend: backend,
+    });
+    const fd = openTcpSocket(imports);
+    const len = writeSockaddrIn(memory, 16, [127, 0, 0, 1], 9, 2);
+
+    expect(
+      (imports.host_socket_connect as (...args: number[]) => number)(
+        fd,
+        16,
+        len,
+        0,
+      ),
+    ).toBe(0);
+    expect(requests).toContainEqual({
+      op: "connect",
+      host: "127.0.0.1",
+      port: 9,
+      tls: false,
+    });
   });
 
   it("sends and receives raw guest bytes through direct imports", async () => {
@@ -122,12 +195,8 @@ describe("socket fd host imports", () => {
       kernel,
       socketBackend: backend,
     });
-    const addrLen = writeString(memory, 16, "127.0.0.1:9");
-    const fd = (imports.host_socket_connect as (...args: number[]) => number)(
-      16,
-      addrLen,
-      0,
-    );
+    const fd = openTcpSocket(imports);
+    expect(connectLoopback(memory, imports, fd)).toBe(0);
     const pingLen = writeBytes(memory, 64, "ping");
 
     expect(
@@ -168,22 +237,22 @@ describe("socket fd host imports", () => {
       kernel,
       socketBackend: backend,
     });
-    const addrLen = writeString(memory, 16, "127.0.0.1:9");
-    const fd = (imports.host_socket_connect as (...args: number[]) => number)(
-      16,
-      addrLen,
-      0,
-    );
+    const fd = openTcpSocket(imports);
+    expect(connectLoopback(memory, imports, fd)).toBe(0);
 
     expect(
-      (imports.host_socket_set_no_delay as (...args: number[]) => number)(
+      (imports.host_socket_option as (...args: number[]) => number)(
         fd,
+        1,
+        1,
         1,
       ),
     ).toBe(0);
     expect(
-      (imports.host_socket_set_no_delay as (...args: number[]) => number)(
+      (imports.host_socket_option as (...args: number[]) => number)(
         fd,
+        1,
+        1,
         0,
       ),
     ).toBe(0);
@@ -193,7 +262,7 @@ describe("socket fd host imports", () => {
     ]);
   });
 
-  it("reports local address as u16 port plus UTF-8 host bytes", () => {
+  it("reports local address as binary IPv4 bytes plus network-order port", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const backend: SocketBackend = {
@@ -212,19 +281,16 @@ describe("socket fd host imports", () => {
       kernel,
       socketBackend: backend,
     });
-    const addrLen = writeString(memory, 16, "127.0.0.1:9");
-    const fd = (imports.host_socket_connect as (...args: number[]) => number)(
-      16,
-      addrLen,
-      0,
-    );
+    const fd = openTcpSocket(imports);
+    expect(connectLoopback(memory, imports, fd)).toBe(0);
     const outLen = (imports.host_socket_addr as (...args: number[]) => number)(
       fd,
+      0,
       256,
       64,
     );
 
-    expect(readSocketAddr(memory, 256, outLen)).toEqual({
+    expect(readSocketAddrResult(memory, 256, outLen)).toEqual({
       host: "10.0.2.15",
       port: 45678,
     });
@@ -248,12 +314,8 @@ describe("socket fd host imports", () => {
       kernel,
       socketBackend: backend,
     });
-    const addrLen = writeString(memory, 16, "127.0.0.1:9");
-    const fd = (imports.host_socket_connect as (...args: number[]) => number)(
-      16,
-      addrLen,
-      0,
-    );
+    const fd = openTcpSocket(imports);
+    expect(connectLoopback(memory, imports, fd)).toBe(0);
 
     const peekLen = await (imports.host_socket_recv as (
       ...args: number[]
@@ -269,7 +331,7 @@ describe("socket fd host imports", () => {
     expect(calls).toBe(1);
   });
 
-  it("returns EAGAIN for nonblocking direct recv without buffered data", () => {
+  it("returns EAGAIN for nonblocking direct recv without buffered data", async () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const backend: SocketBackend = {
@@ -283,21 +345,19 @@ describe("socket fd host imports", () => {
       kernel,
       socketBackend: backend,
     });
-    const addrLen = writeString(memory, 16, "127.0.0.1:9");
-    const fd = (imports.host_socket_connect as (...args: number[]) => number)(
-      16,
-      addrLen,
-      0,
-    );
+    const fd = openTcpSocket(imports);
+    expect(connectLoopback(memory, imports, fd)).toBe(0);
     kernel.setFdDescriptorFlags(0, fd, WASI_FDFLAGS_NONBLOCK);
 
-    expect(
-      (imports.host_socket_recv as (...args: number[]) => number)(
+    await expect(
+      (imports.host_socket_recv as (
+        ...args: number[]
+      ) => number | Promise<number>)(
         fd,
         128,
         8,
         0,
       ),
-    ).toBe(-11);
+    ).resolves.toBe(-11);
   });
 });

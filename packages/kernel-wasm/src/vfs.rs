@@ -1336,6 +1336,50 @@ impl VfsBackend for ProcBackend {
             .map(|(_p, (_id, c))| c.len() as u64)
     }
 
+    fn readdir(&self, path: &[u8]) -> Option<Vec<Vec<u8>>> {
+        if path == b"/" {
+            let mut pids = Vec::new();
+            for key in self.entries.keys() {
+                let rest = key.strip_prefix(b"/")?;
+                let Some(end) = rest.iter().position(|b| *b == b'/') else {
+                    continue;
+                };
+                let pid = rest[..end].to_vec();
+                if !pids.contains(&pid) {
+                    pids.push(pid);
+                }
+            }
+            return Some(pids);
+        }
+
+        let prefix = [path, b"/"].concat();
+        let mut names = Vec::new();
+        for key in self.entries.keys() {
+            let Some(rest) = key.strip_prefix(prefix.as_slice()) else {
+                continue;
+            };
+            if rest.contains(&b'/') {
+                continue;
+            }
+            names.push(rest.to_vec());
+        }
+        (!names.is_empty()).then_some(names)
+    }
+
+    fn entry_type(&self, path: &[u8]) -> u8 {
+        if self.entries.contains_key(path) {
+            return 4;
+        }
+        if path == b"/" {
+            return 3;
+        }
+        let prefix = [path, b"/"].concat();
+        if self.entries.keys().any(|key| key.starts_with(&prefix)) {
+            return 3;
+        }
+        0
+    }
+
     fn refresh_processes(&mut self, snapshots: &[ProcessSnapshot]) {
         // Drop entries for pids no longer in the snapshot, regenerate
         // content for those still present, leave the inode-id mapping

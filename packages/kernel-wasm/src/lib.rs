@@ -60,6 +60,29 @@ fn raw_output<'a>(ptr: *mut u8, len: usize) -> Result<&'a mut [u8], i64> {
     Ok(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
 }
 
+fn scratch_bounds() -> (usize, usize) {
+    let start = (&raw const SCRATCH) as usize;
+    (start, SCRATCH_LEN)
+}
+
+fn range_within(start: usize, len: usize, base: usize, cap: usize) -> Result<bool, i64> {
+    if len == 0 {
+        return Ok(true);
+    }
+    let end = start.checked_add(len).ok_or(-(abi::EINVAL as i64))?;
+    let limit = base.checked_add(cap).ok_or(-(abi::EINVAL as i64))?;
+    Ok(start >= base && end <= limit)
+}
+
+fn validate_scratch_range(ptr: usize, len: usize) -> Result<(), i64> {
+    let (base, cap) = scratch_bounds();
+    if range_within(ptr, len, base, cap)? {
+        Ok(())
+    } else {
+        Err(-(abi::EINVAL as i64))
+    }
+}
+
 fn ranges_overlap(a_ptr: usize, a_len: usize, b_ptr: usize, b_len: usize) -> Result<bool, i64> {
     if a_len == 0 || b_len == 0 {
         return Ok(false);
@@ -110,6 +133,12 @@ pub unsafe extern "C" fn kernel_dispatch(
     out_ptr: *mut u8,
     out_cap: usize,
 ) -> i64 {
+    if let Err(rc) = validate_scratch_range(in_ptr as usize, in_len) {
+        return rc;
+    }
+    if let Err(rc) = validate_scratch_range(out_ptr as usize, out_cap) {
+        return rc;
+    }
     match ranges_overlap(in_ptr as usize, in_len, out_ptr as usize, out_cap) {
         Ok(false) => {}
         Ok(true) => return -(abi::EINVAL as i64),
@@ -349,6 +378,12 @@ pub unsafe extern "C" fn kernel_spawn_process(
     argv_ptr: *const u8,
     argv_len: usize,
 ) -> i64 {
+    if let Err(rc) = validate_scratch_range(module_id_ptr as usize, module_id_len) {
+        return rc;
+    }
+    if let Err(rc) = validate_scratch_range(argv_ptr as usize, argv_len) {
+        return rc;
+    }
     let module_id = match raw_input(module_id_ptr, module_id_len) {
         Ok(slice) => slice,
         Err(rc) => return rc,
@@ -366,15 +401,14 @@ mod tests {
 
     #[test]
     fn unknown_method_returns_negated_enosys() {
-        let mut out = [0u8; 16];
         let rc = unsafe {
             kernel_dispatch(
                 0xDEAD_BEEF,
                 0,
                 core::ptr::null(),
                 0,
-                out.as_mut_ptr(),
-                out.len(),
+                core::ptr::null_mut(),
+                0,
             )
         };
         assert_eq!(rc, -(abi::ENOSYS as i64));
@@ -393,6 +427,30 @@ mod tests {
                 8,
             )
         };
+        assert_eq!(rc, -(abi::EINVAL as i64));
+    }
+
+    #[test]
+    fn kernel_dispatch_rejects_non_scratch_ranges() {
+        let mut out = [0u8; 16];
+        let rc = unsafe {
+            kernel_dispatch(
+                0xDEAD_BEEF,
+                0,
+                core::ptr::null(),
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(rc, -(abi::EINVAL as i64));
+    }
+
+    #[test]
+    fn kernel_spawn_process_rejects_non_scratch_ranges() {
+        let module = *b"module";
+        let rc =
+            unsafe { kernel_spawn_process(1, module.as_ptr(), module.len(), core::ptr::null(), 0) };
         assert_eq!(rc, -(abi::EINVAL as i64));
     }
 
@@ -424,7 +482,7 @@ mod tests {
                 out.len(),
             )
         };
-        assert_eq!(rc, -(abi::EFAULT as i64));
+        assert_eq!(rc, -(abi::EINVAL as i64));
 
         let rc = unsafe { kernel_list_processes(core::ptr::null_mut(), 1) };
         assert_eq!(rc, -(abi::EFAULT as i64));

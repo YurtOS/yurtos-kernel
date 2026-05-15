@@ -73,6 +73,12 @@ YURT_DEFINE_MARKER(shutdown, 0x73687574u) /* "shut" */
 #define YURT_SOCKET_ADDR_LOCAL 0u
 #define YURT_SOCKET_ADDR_PEER 1u
 #define YURT_SOCKET_OPT_TCP_NODELAY 1u
+#define YURT_WASI_AF_INET 1
+#define YURT_RUST_STD_AF_INET 2
+
+static int yurt_is_af_inet(int family) {
+  return family == YURT_WASI_AF_INET || family == YURT_RUST_STD_AF_INET;
+}
 
 #define YURT_HOST_ERR_NOT_FOUND -1
 #define YURT_HOST_ERR_IO -3
@@ -205,7 +211,7 @@ static int yurt_socket_impl(int domain, int type, int protocol) {
     if (fd < 0) { errno = EMFILE; return -1; }
     return fd;
   }
-  if (domain != AF_INET || (type & SOCK_STREAM) != SOCK_STREAM) {
+  if (!yurt_is_af_inet(domain) || (type & SOCK_STREAM) != SOCK_STREAM) {
     errno = EAFNOSUPPORT;
     return -1;
   }
@@ -259,7 +265,7 @@ static int yurt_connect_impl(int sockfd, const struct sockaddr *addr, socklen_t 
     return 0;
   }
 
-  if (addrlen < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) {
+  if (addrlen < sizeof(struct sockaddr_in) || !yurt_is_af_inet(addr->sa_family)) {
     errno = EAFNOSUPPORT;
     return -1;
   }
@@ -464,7 +470,7 @@ static int yurt_bind_impl(int sockfd, const struct sockaddr *addr, socklen_t add
     return 0;
   }
 
-  if (addrlen < sizeof(struct sockaddr_in) || addr->sa_family != AF_INET) {
+  if (addrlen < sizeof(struct sockaddr_in) || !yurt_is_af_inet(addr->sa_family)) {
     errno = EAFNOSUPPORT;
     return -1;
   }
@@ -897,7 +903,7 @@ static int yurt_socketpair_apply_type_flags(int fd, int type) {
 int socketpair(int domain, int type, int protocol, int sv[2]) {
   YURT_MARKER_CALL(socketpair);
   if (!sv) { errno = EFAULT; return -1; }
-  if (domain != AF_UNIX && domain != AF_INET) { errno = EAFNOSUPPORT; return -1; }
+  if (domain != AF_UNIX && !yurt_is_af_inet(domain)) { errno = EAFNOSUPPORT; return -1; }
   int base_type = type & ~SOCK_CLOEXEC & ~SOCK_NONBLOCK;
   if (base_type != SOCK_STREAM && base_type != SOCK_DGRAM) { errno = EPROTOTYPE; return -1; }
   (void)protocol;
