@@ -280,10 +280,13 @@ fn getpriority(caller_pid: u32, request: &[u8]) -> i64 {
         Err(rc) => return rc,
     };
     with_kernel(|k| {
-        if who != 0 && !k.has_process(target) {
-            return -(abi::ESRCH as i64);
+        if who == 0 || target == caller_pid {
+            k.process_mut(target).nice as i64
+        } else {
+            k.process_existing(target)
+                .map(|p| p.nice as i64)
+                .unwrap_or(-(abi::ESRCH as i64))
         }
-        k.process_mut(target).nice as i64
     })
 }
 
@@ -299,16 +302,26 @@ fn setpriority(caller_pid: u32, request: &[u8]) -> i64 {
         Err(rc) => return rc,
     };
     with_kernel(|k| {
-        if who != 0 && !k.has_process(target) {
-            return -(abi::ESRCH as i64);
-        }
         let requested = normalize_nice(raw_nice);
         let caller_euid = k.process_mut(caller_pid).credentials.euid;
-        let current = k.process_mut(target).nice;
-        if requested < current && caller_euid != 0 {
+        let Some(target_process) = (if who == 0 || target == caller_pid {
+            Some(k.process_mut(target))
+        } else {
+            k.process_existing_mut(target)
+        }) else {
+            return -(abi::ESRCH as i64);
+        };
+        if target != caller_pid
+            && caller_euid != 0
+            && caller_euid != target_process.credentials.uid
+            && caller_euid != target_process.credentials.euid
+        {
             return -(abi::EPERM as i64);
         }
-        k.process_mut(target).nice = requested;
+        if requested < target_process.nice && caller_euid != 0 {
+            return -(abi::EPERM as i64);
+        }
+        target_process.nice = requested;
         0
     })
 }
@@ -807,7 +820,11 @@ fn unix_path_from_addr(addr: &[u8]) -> Option<&[u8]> {
     }
     let path = &addr[2..];
     if path.first() == Some(&0) {
-        return (path.len() > 1).then_some(path);
+        let mut end = path.len();
+        while end > 1 && path[end - 1] == 0 {
+            end -= 1;
+        }
+        return path.get(..end).filter(|path| path.len() > 1);
     }
     let end = path.iter().position(|b| *b == 0).unwrap_or(path.len());
     path.get(..end).filter(|path| !path.is_empty())
@@ -976,21 +993,24 @@ fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>)
             if !*peer_open {
                 -(abi::EPIPE as i64)
             } else {
-                let Some(peer) = k.socket_mut(*peer_id) else {
-                    return -(abi::EPIPE as i64);
-                };
-                let SocketKind::UnixStream { rx, rights: q, .. } = &mut peer.kind else {
-                    return -(abi::EPIPE as i64);
-                };
-                if !has_buffer_capacity(rx.len(), data.len()) || rights_queue_full(&rights, q.len())
-                {
-                    -(abi::EAGAIN as i64)
-                } else {
-                    rx.extend(data);
-                    if !rights.as_ref().is_some_and(Vec::is_empty) {
-                        q.push_back(rights.take().expect("rights present"));
+                if let Some(peer) = k.socket_mut(*peer_id) {
+                    if let SocketKind::UnixStream { rx, rights: q, .. } = &mut peer.kind {
+                        if !has_buffer_capacity(rx.len(), data.len())
+                            || rights_queue_full(&rights, q.len())
+                        {
+                            -(abi::EAGAIN as i64)
+                        } else {
+                            rx.extend(data);
+                            if !rights.as_ref().is_some_and(Vec::is_empty) {
+                                q.push_back(rights.take().expect("rights present"));
+                            }
+                            data.len() as i64
+                        }
+                    } else {
+                        -(abi::EPIPE as i64)
                     }
-                    data.len() as i64
+                } else {
+                    -(abi::EPIPE as i64)
                 }
             }
         }
@@ -1006,25 +1026,27 @@ fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>)
                     SocketKind::UnixDatagram { bound_path, .. } => bound_path.clone(),
                     _ => None,
                 });
-                let Some(peer) = k.socket_mut(*peer_id) else {
-                    return -(abi::EPIPE as i64);
-                };
-                let SocketKind::UnixDatagram { rx, rights: q, .. } = &mut peer.kind else {
-                    return -(abi::EPIPE as i64);
-                };
-                if !has_buffer_capacity(datagram_queue_bytes(rx), data.len())
-                    || rights_queue_full(&rights, q.len())
-                {
-                    -(abi::EAGAIN as i64)
-                } else {
-                    rx.push_back(UnixDatagramPacket {
-                        data: data.to_vec(),
-                        source_path,
-                    });
-                    if !rights.as_ref().is_some_and(Vec::is_empty) {
-                        q.push_back(rights.take().expect("rights present"));
+                if let Some(peer) = k.socket_mut(*peer_id) {
+                    if let SocketKind::UnixDatagram { rx, rights: q, .. } = &mut peer.kind {
+                        if !has_buffer_capacity(datagram_queue_bytes(rx), data.len())
+                            || rights_queue_full(&rights, q.len())
+                        {
+                            -(abi::EAGAIN as i64)
+                        } else {
+                            rx.push_back(UnixDatagramPacket {
+                                data: data.to_vec(),
+                                source_path,
+                            });
+                            if !rights.as_ref().is_some_and(Vec::is_empty) {
+                                q.push_back(rights.take().expect("rights present"));
+                            }
+                            data.len() as i64
+                        }
+                    } else {
+                        -(abi::EPIPE as i64)
                     }
-                    data.len() as i64
+                } else {
+                    -(abi::EPIPE as i64)
                 }
             }
         }
@@ -1583,7 +1605,13 @@ fn getpgid(caller_pid: u32, request: &[u8]) -> i64 {
         target_arg
     };
     with_kernel(|k| {
-        let p = k.process_mut(target);
+        let Some(p) = (if target_arg == 0 || target == caller_pid {
+            Some(k.process_mut(target))
+        } else {
+            k.process_existing_mut(target)
+        }) else {
+            return -(abi::ESRCH as i64);
+        };
         if p.pgid == 0 {
             p.pgid = target;
         }
@@ -1605,9 +1633,16 @@ fn setpgid(caller_pid: u32, request: &[u8]) -> i64 {
     };
     let new_pgid = if pgid_arg == 0 { target } else { pgid_arg };
     with_kernel(|k| {
-        k.process_mut(target).pgid = new_pgid;
-    });
-    0
+        let Some(p) = (if target_arg == 0 || target == caller_pid {
+            Some(k.process_mut(target))
+        } else {
+            k.process_existing_mut(target)
+        }) else {
+            return -(abi::ESRCH as i64);
+        };
+        p.pgid = new_pgid;
+        0
+    })
 }
 
 fn getsid(caller_pid: u32, request: &[u8]) -> i64 {
@@ -1620,7 +1655,13 @@ fn getsid(caller_pid: u32, request: &[u8]) -> i64 {
         target_arg
     };
     with_kernel(|k| {
-        let p = k.process_mut(target);
+        let Some(p) = (if target_arg == 0 || target == caller_pid {
+            Some(k.process_mut(target))
+        } else {
+            k.process_existing_mut(target)
+        }) else {
+            return -(abi::ESRCH as i64);
+        };
         if p.sid == 0 {
             p.sid = target;
         }
@@ -2017,9 +2058,9 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             Err(rc) => return rc,
         };
         // Symlink resolution: walk the path through readlink up to
-        // 40 hops (POSIX SYMLOOP_MAX). Each hop replaces the path
-        // verbatim — Phase 7 only handles final-component
-        // symlinks; intermediate-dir resolution comes with mkdir.
+        // 40 hops (POSIX SYMLOOP_MAX). Each target is normalized and
+        // re-authorized before the next lookup so ramfs links cannot
+        // bypass procfs access checks.
         let mut resolved: Vec<u8> = path;
         let mut hops = 0u32;
         while let Some(target) = k.vfs.readlink(&resolved) {
@@ -2027,7 +2068,10 @@ fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             if hops > 40 {
                 return -(abi::EINVAL as i64); // -ELOOP shape
             }
-            resolved = target;
+            resolved = match normalize_readable_path(k, caller_pid, &target) {
+                Ok(path) => path,
+                Err(rc) => return rc,
+            };
         }
         let path: &[u8] = &resolved;
         // open() handles both lookup and create-if-missing in one
@@ -2858,9 +2902,16 @@ fn sys_socket_sendmsg(caller_pid: u32, request: &[u8]) -> i64 {
     let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let data_len = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes")) as usize;
     let fd_count = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) as usize;
-    let data_start = 12;
-    let fds_start = data_start + data_len;
-    let required = fds_start + fd_count * 4;
+    let data_start = 12usize;
+    let Some(fds_start) = data_start.checked_add(data_len) else {
+        return -(abi::EINVAL as i64);
+    };
+    let Some(fds_bytes) = fd_count.checked_mul(4) else {
+        return -(abi::EINVAL as i64);
+    };
+    let Some(required) = fds_start.checked_add(fds_bytes) else {
+        return -(abi::EINVAL as i64);
+    };
     if request.len() < required {
         return -(abi::EINVAL as i64);
     }
@@ -2893,7 +2944,10 @@ fn sys_socket_recvmsg(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i
     let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
     let data_cap = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) as usize;
-    if response.len() < data_cap + 4 {
+    let Some(rights_start) = data_cap.checked_add(4) else {
+        return -(abi::EINVAL as i64);
+    };
+    if response.len() < rights_start {
         return -(abi::EINVAL as i64);
     }
     let n = with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
@@ -2996,25 +3050,34 @@ fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let path_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
-    if request.len() < 4 + path_len {
+    let Some(path_end) = 4usize.checked_add(path_len) else {
+        return -(abi::EINVAL as i64);
+    };
+    if request.len() < path_end {
         return -(abi::EINVAL as i64);
     }
-    let raw_path = &request[4..4 + path_len];
+    let raw_path = &request[4..path_end];
     if raw_path.is_empty() {
         return -(abi::EINVAL as i64);
     }
     // Decode argv list from the trailing bytes.
     let mut argv: Vec<Vec<u8>> = Vec::new();
-    let mut cursor = 4 + path_len;
-    while cursor + 4 <= request.len() {
+    let mut cursor = path_end;
+    while cursor
+        .checked_add(4)
+        .is_some_and(|end| end <= request.len())
+    {
         let alen =
             u32::from_le_bytes(request[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
         cursor += 4;
-        if cursor + alen > request.len() {
+        let Some(arg_end) = cursor.checked_add(alen) else {
+            return -(abi::EINVAL as i64);
+        };
+        if arg_end > request.len() {
             return -(abi::EINVAL as i64);
         }
-        argv.push(request[cursor..cursor + alen].to_vec());
-        cursor += alen;
+        argv.push(request[cursor..arg_end].to_vec());
+        cursor = arg_end;
     }
 
     with_kernel(|k| {
@@ -3891,6 +3954,56 @@ mod tests {
             dispatch(METHOD_SYS_GETPRIORITY, 7, &priority_req(0, 0), &mut []),
             -20
         );
+    }
+
+    #[test]
+    fn setpriority_rejects_cross_user_targets() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            let credentials = &mut k.process_mut(8).credentials;
+            credentials.uid = 2000;
+            credentials.euid = 2000;
+        });
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SETPRIORITY,
+                7,
+                &setpriority_req(0, 8, 10),
+                &mut []
+            ),
+            -(abi::EPERM as i64)
+        );
+        make_root(7);
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SETPRIORITY,
+                7,
+                &setpriority_req(0, 8, 10),
+                &mut []
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn process_group_queries_do_not_create_unknown_target_pids() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(METHOD_SYS_GETPGID, 1, &99_u32.to_le_bytes(), &mut []),
+            -(abi::ESRCH as i64)
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_GETSID, 1, &99_u32.to_le_bytes(), &mut []),
+            -(abi::ESRCH as i64)
+        );
+        let mut req = Vec::new();
+        req.extend_from_slice(&99_u32.to_le_bytes());
+        req.extend_from_slice(&99_u32.to_le_bytes());
+        assert_eq!(
+            dispatch(METHOD_SYS_SETPGID, 1, &req, &mut []),
+            -(abi::ESRCH as i64)
+        );
+        assert!(!crate::kernel::with_kernel(|k| k.has_process(99)));
     }
 
     #[test]
@@ -5451,6 +5564,91 @@ mod tests {
     }
 
     #[test]
+    fn socket_message_syscalls_reject_wrapping_lengths() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut pair = [0u8; 8];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKETPAIR,
+                1,
+                &socketpair_req(1, 1, 0),
+                &mut pair
+            ),
+            8
+        );
+        let fd = u32::from_le_bytes(pair[0..4].try_into().unwrap());
+
+        let mut sendmsg = Vec::new();
+        sendmsg.extend_from_slice(&fd.to_le_bytes());
+        sendmsg.extend_from_slice(&u32::MAX.to_le_bytes());
+        sendmsg.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_SENDMSG, 1, &sendmsg, &mut []),
+            -(abi::EINVAL as i64)
+        );
+
+        let mut recvmsg = Vec::new();
+        recvmsg.extend_from_slice(&fd.to_le_bytes());
+        recvmsg.extend_from_slice(&0u32.to_le_bytes());
+        recvmsg.extend_from_slice(&u32::MAX.to_le_bytes());
+        let mut out = [0u8; 16];
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_RECVMSG, 1, &recvmsg, &mut out),
+            -(abi::EINVAL as i64)
+        );
+    }
+
+    #[test]
+    fn abstract_unix_paths_ignore_trailing_padding_nuls() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(1, 1, 0),
+                &mut []
+            ),
+            3
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_unix_req(3, b"\0abstract-service\0\0\0"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_LISTEN,
+                1,
+                &socket_listen_req(3, 4),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_OPEN,
+                1,
+                &socket_open_req(1, 1, 0),
+                &mut []
+            ),
+            4
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_CONNECT,
+                1,
+                &socket_connect_unix_req(4, b"\0abstract-service"),
+                &mut []
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn af_unix_datagram_connect_allows_send_without_destination() {
         let _g = crate::kernel::TestGuard::acquire();
         crate::kh::test_support::reset_socket_mock();
@@ -5946,6 +6144,53 @@ mod tests {
             2
         );
         assert_eq!(&read_buf, b"ok");
+    }
+
+    #[test]
+    fn socket_sendmsg_closes_cloned_rights_on_epipe() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut socket_fds = [0u8; 8];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKETPAIR,
+                1,
+                &socketpair_req(1, 1, 0),
+                &mut socket_fds
+            ),
+            8
+        );
+        let left = u32::from_le_bytes(socket_fds[0..4].try_into().unwrap());
+        let right = u32::from_le_bytes(socket_fds[4..8].try_into().unwrap());
+
+        let mut pipe_fds = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_fds), 8);
+        let pipe_read = u32::from_le_bytes(pipe_fds[0..4].try_into().unwrap());
+        let pipe_write = u32::from_le_bytes(pipe_fds[4..8].try_into().unwrap());
+
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &right.to_le_bytes(), &mut []),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SENDMSG,
+                1,
+                &socket_sendmsg_req(left, b"x", &[pipe_read]),
+                &mut []
+            ),
+            -(abi::EPIPE as i64)
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_CLOSE, 1, &pipe_read.to_le_bytes(), &mut []),
+            0
+        );
+
+        let mut write_req = pipe_write.to_le_bytes().to_vec();
+        write_req.extend_from_slice(b"x");
+        assert_eq!(
+            dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []),
+            -(abi::EPIPE as i64)
+        );
     }
 
     #[test]
@@ -6639,6 +6884,9 @@ mod tests {
     #[test]
     fn setpgid_pgid_zero_makes_target_a_group_leader() {
         let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(3);
+        });
         let mut req = Vec::new();
         req.extend_from_slice(&3_u32.to_le_bytes());
         req.extend_from_slice(&0_u32.to_le_bytes()); // pgid 0 → target's pid
@@ -6652,6 +6900,9 @@ mod tests {
     #[test]
     fn pgid_is_per_pid() {
         let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.process_mut(2);
+        });
         // pid 1 default sees pgid 1; setting pid 2's pgid doesn't move pid 1.
         let mut req = Vec::new();
         req.extend_from_slice(&2_u32.to_le_bytes());
@@ -7429,6 +7680,30 @@ mod tests {
         assert_eq!(
             dispatch(METHOD_SYS_STAT, 1, b"/proc/2/status", &mut stat),
             16
+        );
+    }
+
+    #[test]
+    fn proc_other_pid_open_gate_survives_symlink_resolution() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let argv = set_argv_req(2, &[b"/bin/other"]);
+        set_argv(&argv);
+
+        let target = b"/proc/2/cmdline";
+        let mut req = (target.len() as u32).to_le_bytes().to_vec();
+        req.extend_from_slice(target);
+        req.extend_from_slice(b"/tmp/leak");
+        assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &req, &mut []), 0);
+
+        assert_eq!(
+            dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/tmp/leak"), &mut []),
+            -(abi::EPERM as i64)
+        );
+
+        let fd = dispatch(METHOD_SYS_OPEN, 2, &open_req(0, b"/tmp/leak"), &mut []);
+        assert!(
+            fd >= 0,
+            "target process should read its own proc link: {fd}"
         );
     }
 
@@ -8261,6 +8536,17 @@ mod tests {
         assert_eq!(
             dispatch(METHOD_SYS_SPAWN, 1, &sreq, &mut []),
             -(abi::ENOENT as i64),
+        );
+    }
+
+    #[test]
+    fn sys_spawn_rejects_wrapping_lengths() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = u32::MAX.to_le_bytes().to_vec();
+        req.extend_from_slice(b"/bin/tool");
+        assert_eq!(
+            dispatch(METHOD_SYS_SPAWN, 1, &req, &mut []),
+            -(abi::EINVAL as i64)
         );
     }
 
