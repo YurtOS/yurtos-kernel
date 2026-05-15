@@ -4075,6 +4075,29 @@ export function createKernelImports(
       return 0;
     },
 
+    host_socket_set_no_delay(
+      fd: number,
+      enabledRaw: number,
+    ): number | Promise<number> {
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") return -9;
+      const enabled = enabledRaw !== 0;
+      if (target.socket !== null) {
+        const setR = target.setNoDelay?.(target.socket, enabled) ??
+          { ok: false as const, error: "TCP_NODELAY not supported" };
+        if (typeof (setR as Promise<unknown>).then === "function") {
+          return (setR as Promise<{ ok: boolean }>).then((r) => {
+            if (!r.ok) return -95;
+            target.noDelay = enabled;
+            return 0;
+          });
+        }
+        if (!(setR as { ok: boolean }).ok) return -95;
+      }
+      target.noDelay = enabled;
+      return 0;
+    },
+
     // host_socket_socketpair(family, type, sv_ptr) -> 0 | -1
     // Creates a connected AF_UNIX socket pair. Writes the two fd numbers as
     // i32 LE at sv_ptr and sv_ptr+4.
