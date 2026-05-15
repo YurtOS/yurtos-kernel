@@ -71,9 +71,14 @@ Required additional behavior:
 
 - Joining a joinable exited thread returns its exit value and reaps the record.
 - Joining a running joinable thread blocks the caller until exit.
+- Only one joiner may wait on a joinable target. A second concurrent join
+  returns `-EBUSY` while the first join is pending. After the first join reaps
+  the target, later joins return the unknown-thread error.
 - Joining the calling thread rejects with the pthread-compatible deadlock error.
 - Joining a detached or unknown thread returns the pthread-compatible error.
-- Detaching a running thread marks it detached.
+- Detaching a running thread marks it detached only when no join is pending.
+  Detach of a thread with a pending join returns `-EINVAL` and leaves the joiner
+  parked until the target exits.
 - Detaching an exited unjoined thread reaps it.
 - Exiting the main thread maps to process exit; exiting a worker thread records
   the thread exit value and wakes joiners.
@@ -138,7 +143,7 @@ thread lifecycle surface:
   return channel because valid wasm32 pointer-sized thread return values can
   have the high bit set and collide with negated errno.
 - `sys_thread_detach`: request `u32 tid LE`; returns `0` or negated errno.
-- `sys_thread_exit`: request `i32 retval LE`; does not return to guest on the
+- `sys_thread_exit`: request `u32 retval LE`; does not return to guest on the
   authenticated calling thread. In adapter paths where unwinding is required,
   the adapter may translate the successful syscall into its local unwind
   mechanism.
@@ -149,9 +154,13 @@ The current host import `host_thread_spawn(fn_ptr, arg)` should become a
 compatibility wrapper around `sys_thread_spawn` in the Rust-backed adapters, the
 same way `host_socket_set_no_delay` wraps `sys_socket_option`.
 
-`host_thread_join(tid)` remains the guest-facing compatibility import. Its
-Rust-backed wrapper calls `sys_thread_join`, reads the `u32 retval` response on
-success, and only then casts that value back to `void *` in the libc layer.
+The existing scalar `host_thread_join(tid) -> i32` import is not safe for the
+Rust-backed pthread path and must not be used by yurt-libc once this work lands.
+It cannot distinguish a successful high-bit `void *` return value from negated
+errno. Replace it with a structured compatibility import such as
+`host_thread_join(tid, out_retval_ptr) -> i32`, or have yurt-libc call a typed
+`sys_thread_join` wrapper directly. In both cases, the status is scalar and the
+pthread return value is written/read as raw `u32` bits.
 
 ## Join Suspend/Resume Protocol
 
@@ -159,20 +168,26 @@ success, and only then casts that value back to `void *` in the libc layer.
 is still running:
 
 1. Rust validates the authenticated caller tid and the target tid, rejects
-   self-join, and records a `JoinWait { waiter_tid, target_tid }` wait record.
-2. Rust marks the caller thread `Blocked` with a join wait reason.
-3. Rust returns `-EAGAIN` with a kernel-visible wait record, or an equivalent
+   self-join, rejects detached targets, and rejects a target that already has a
+   pending joiner with `-EBUSY`.
+2. Rust records a single `JoinWait { waiter_tid, target_tid }` wait record.
+3. Rust marks the caller thread `Blocked` with a join wait reason.
+4. Rust returns `-EAGAIN` with a kernel-visible wait record, or an equivalent
    adapter-recognized suspended status, rather than blocking the dispatch call.
-4. The adapter parks the caller execution resource using the same suspend
+5. The adapter parks the caller execution resource using the same suspend
    mechanism used for other host-blocking operations.
-5. When worker completion records the target thread exit, Rust stores the
-   `u32 retval`, wakes matching join waiters, and marks them runnable.
-6. The adapter resumes each woken caller and retries or completes the pending
-   join by reading the structured join result.
+6. When worker completion records the target thread exit, Rust stores the
+   `u32 retval`, wakes the single matching join waiter, and marks it runnable.
+7. The adapter resumes the single woken caller and retries or completes the join
+   by reading the structured join result.
 
 If the target is already exited when `sys_thread_join` runs, Rust writes the
 `u32 retval` response, releases the host handle, reaps the target record, and
 returns `0` without parking the caller.
+
+If another thread detaches a target while a join is pending, Rust returns
+`-EINVAL` from detach and leaves the existing join wait intact. The joiner is
+the only thread allowed to reap that target.
 
 ## Kernel-to-Host Interface
 
@@ -208,6 +223,14 @@ thread-exit control path. This may wrap the existing
 that call to the worker handle/session that Rust recorded for the thread. A new
 control export that accepts `host_thread_handle` explicitly is acceptable if it
 makes the authentication invariant simpler to enforce.
+
+If `kh_thread_spawn` returns a handle but the worker later fails during module
+instantiation, TLS setup, stack setup, or entry dispatch, the adapter reports an
+authenticated thread exit with `retval = u32::MAX`. Rust records that value as a
+normal exited-thread retval, wakes any joiner, and follows the same join/detach
+release rules as a guest-called `pthread_exit`. Startup failure after a handle
+exists is not converted into "spawn never happened"; the tid remains observable
+until joined or detached.
 
 ## Adapter Responsibilities
 
@@ -256,9 +279,13 @@ Required Rust tests:
 - `sys_thread_detach` updates Rust state and rejects unknown tid.
 - `sys_thread_exit` records exit values and wakes/reaps according to
   joinability.
+- `sys_thread_exit` and worker startup failure preserve `u32` return bits,
+  including high-bit values.
 - `sys_thread_join` returns `0` and writes exit values into the response buffer,
   blocks running threads using a kernel-visible wait record, rejects self-join,
-  and rejects detached/unknown tid.
+  rejects a second pending joiner, and rejects detached/unknown tid.
+- `sys_thread_detach` rejects a target with a pending join and does not wake or
+  reap that joiner's target.
 - Snapshot/list-thread encoders reflect lifecycle changes.
 
 Required adapter tests:
@@ -267,9 +294,13 @@ Required adapter tests:
   tid locally.
 - Worker completion records exit through Rust state only when the reporting
   worker/session matches the recorded `host_thread_handle`.
+- Worker startup failure after a handle exists reports `u32::MAX` through the
+  authenticated completion path and wakes a pending joiner.
 - Worker-side nested `host_thread_spawn` routes through the same Rust path.
 - `host_thread_self` returns guest-visible `0` on the main thread and
   Rust-allocated tids for worker threads.
+- yurt-libc no longer uses the scalar `host_thread_join(tid) -> i32` return
+  shape for Rust-backed pthreads; join status and retval bits are separated.
 
 Required integration/conformance:
 
