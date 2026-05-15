@@ -656,25 +656,21 @@ impl RedbKv {
         Ok(Self { db })
     }
 
-    fn table_def(store: &[u8]) -> redb::TableDefinition<'_, &'static [u8], &'static [u8]> {
-        // redb requires UTF-8 table names; if a store name isn't
-        // valid UTF-8 the embedder gets a single shared "_bin"
-        // table. Almost every real-world store name is UTF-8.
-        let name = std::str::from_utf8(store).unwrap_or("_bin");
-        // SAFETY: we leak the name string for the table definition
-        // — table defs are short-lived per call, but the Cow they
-        // hold needs a 'static lifetime. Real impl could use a
-        // store-name → 'static-string interner; for the slice we
-        // use a single shared static fallback above when names are
-        // non-UTF-8.
-        redb::TableDefinition::new(Box::leak(name.to_owned().into_boxed_str()))
+    fn table_def<'a>(
+        store: &'a [u8],
+    ) -> Result<redb::TableDefinition<'a, &'static [u8], &'static [u8]>, i32> {
+        // redb table names are UTF-8. Reject invalid names instead of
+        // collapsing unrelated byte stores into a shared fallback table.
+        let name = std::str::from_utf8(store).map_err(|_| -EINVAL as i32)?;
+        Ok(redb::TableDefinition::new(name))
     }
 }
 
 impl KvBackend for RedbKv {
     fn get(&self, store: &[u8], key: &[u8]) -> Result<Vec<u8>, i32> {
+        let table_def = Self::table_def(store)?;
         let txn = self.db.begin_read().map_err(|_| -5_i32)?;
-        let table = match txn.open_table(Self::table_def(store)) {
+        let table = match txn.open_table(table_def) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Err(-2_i32),
             Err(_) => return Err(-5_i32),
@@ -687,12 +683,16 @@ impl KvBackend for RedbKv {
     }
 
     fn put(&self, store: &[u8], key: &[u8], value: &[u8]) -> i32 {
+        let table_def = match Self::table_def(store) {
+            Ok(def) => def,
+            Err(rc) => return rc,
+        };
         let txn = match self.db.begin_write() {
             Ok(t) => t,
             Err(_) => return -5_i32,
         };
         {
-            let mut table = match txn.open_table(Self::table_def(store)) {
+            let mut table = match txn.open_table(table_def) {
                 Ok(t) => t,
                 Err(_) => return -5_i32,
             };
@@ -707,12 +707,16 @@ impl KvBackend for RedbKv {
     }
 
     fn delete(&self, store: &[u8], key: &[u8]) -> i32 {
+        let table_def = match Self::table_def(store) {
+            Ok(def) => def,
+            Err(rc) => return rc,
+        };
         let txn = match self.db.begin_write() {
             Ok(t) => t,
             Err(_) => return -5_i32,
         };
         {
-            let mut table = match txn.open_table(Self::table_def(store)) {
+            let mut table = match txn.open_table(table_def) {
                 Ok(t) => t,
                 Err(redb::TableError::TableDoesNotExist(_)) => return 0,
                 Err(_) => return -5_i32,
@@ -727,11 +731,15 @@ impl KvBackend for RedbKv {
 
     fn list(&self, store: &[u8], prefix: &[u8]) -> Vec<Vec<u8>> {
         use redb::ReadableTable;
+        let table_def = match Self::table_def(store) {
+            Ok(def) => def,
+            Err(_) => return Vec::new(),
+        };
         let txn = match self.db.begin_read() {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };
-        let table = match txn.open_table(Self::table_def(store)) {
+        let table = match txn.open_table(table_def) {
             Ok(t) => t,
             Err(_) => return Vec::new(),
         };

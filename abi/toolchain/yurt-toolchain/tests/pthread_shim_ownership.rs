@@ -51,3 +51,24 @@ fn pthread_condattr_state_lives_in_rust_not_c() {
         "pthread_condattr behavior should be implemented in Rust"
     );
 }
+
+#[test]
+fn qsort_r_state_lives_in_rust_not_c() {
+    let root = repo_root();
+    let c = fs::read_to_string(root.join("abi/src/yurt_fs.c")).expect("read yurt_fs.c");
+    let rust =
+        fs::read_to_string(root.join("abi/rust/yurt-libc/src/sort.rs")).expect("read sort.rs");
+
+    assert!(
+        !c.contains("qsort_r_compar"),
+        "qsort_r comparator state must not live in the C shim"
+    );
+    assert!(
+        !c.contains("qsort_r_arg"),
+        "qsort_r caller arg state must not live in the C shim"
+    );
+    assert!(
+        rust.contains("yurt_rs_qsort_r"),
+        "C may keep marker wrappers, but qsort_r behavior must delegate to Rust"
+    );
+}

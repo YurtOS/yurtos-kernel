@@ -13,7 +13,7 @@ use wasmtime::{Engine, Module};
 
 use yurt_runtime_wasmtime::kernel_host_interface::{
     build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, InMemoryHostFs,
-    InMemoryKv, KernelHostInterface, LogSink, NativeHostFs, NativeTcpSocket, RedbKv,
+    InMemoryKv, KernelHostInterface, KvBackend, LogSink, NativeHostFs, NativeTcpSocket, RedbKv,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -124,6 +124,7 @@ fn sockaddr_in_bytes(host: [u8; 4], port: u16) -> [u8; 16] {
 
 const ENOSYS: i64 = 38;
 const EACCES: i64 = 13;
+const EINVAL: i32 = 22;
 const METHOD_ECHO: u32 = 1;
 const METHOD_NOW_REALTIME: u32 = 2;
 const METHOD_SYS_GETUID: u32 = 0x1_0001;
@@ -1610,6 +1611,23 @@ fn redb_kv_persists_across_kernel_host_interface_restarts() {
         assert_eq!(n, 5);
         assert_eq!(&buf[..n as usize], b"alice");
     }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn redb_kv_rejects_non_utf8_store_names_without_fallback_collision() {
+    use std::fs;
+    let dir = std::env::temp_dir().join(format!("yurt-redb-nonutf8-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("kv.redb");
+
+    let kv = RedbKv::open(db_path).unwrap();
+    assert_eq!(kv.put(b"\xff", b"k", b"bad"), -(EINVAL as i32));
+    assert_eq!(kv.get(b"\xff", b"k").unwrap_err(), -(EINVAL as i32));
+    assert_eq!(kv.delete(b"\xff", b"k"), -(EINVAL as i32));
+    assert!(kv.list(b"\xff", b"").is_empty());
 
     let _ = fs::remove_dir_all(&dir);
 }

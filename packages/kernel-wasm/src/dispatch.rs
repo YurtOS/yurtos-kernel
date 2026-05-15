@@ -3277,20 +3277,30 @@ fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             response[12..16].copy_from_slice(&0o140_666u32.to_le_bytes());
             return 16;
         }
-        let (mount_id, inode) = match k.vfs.open(&path, 0) {
-            Some(pair) => pair,
-            None => return -(abi::ENOENT as i64),
+        let filetype = k.vfs.entry_type(&path) as u32;
+        if filetype == 0 {
+            return -(abi::ENOENT as i64);
+        }
+        let (size, mode) = if filetype == 4 {
+            let (mount_id, inode) = match k.vfs.open(&path, 0) {
+                Some(pair) => pair,
+                None => return -(abi::ENOENT as i64),
+            };
+            let size = k.vfs.size(mount_id, inode).unwrap_or(0);
+            let meta = k.resolve_metadata(mount_id, inode);
+            (size, meta.mode)
+        } else {
+            let mode = match filetype {
+                3 => 0o040_755,
+                7 => 0o120_777,
+                6 => 0o140_666,
+                _ => 0o100_644,
+            };
+            (0, mode)
         };
-        let size = k.vfs.size(mount_id, inode).unwrap_or(0);
-        let meta = k.resolve_metadata(mount_id, inode);
-        // Filetype always REGULAR_FILE for path-resolved entries
-        // (no directory or device-like backends route through here
-        // today; Dev's /null/zero return REGULAR_FILE which is
-        // close enough for Phase 6).
-        let filetype: u32 = 4;
         response[0..8].copy_from_slice(&size.to_le_bytes());
         response[8..12].copy_from_slice(&filetype.to_le_bytes());
-        response[12..16].copy_from_slice(&meta.mode.to_le_bytes());
+        response[12..16].copy_from_slice(&mode.to_le_bytes());
         16
     })
 }
@@ -3601,6 +3611,7 @@ mod tests {
 
     #[test]
     fn credentials_syscalls_return_default_uid_gid() {
+        let _g = crate::kernel::TestGuard::acquire();
         assert_eq!(dispatch(METHOD_SYS_GETUID, 1, &[], &mut []), 1000);
         assert_eq!(dispatch(METHOD_SYS_GETEUID, 1, &[], &mut []), 1000);
         assert_eq!(dispatch(METHOD_SYS_GETGID, 1, &[], &mut []), 1000);
@@ -8310,6 +8321,16 @@ mod tests {
         let mode = u32::from_le_bytes(out[12..16].try_into().unwrap());
         // Ramfs default — regular file, 0o644.
         assert_eq!(mode, 0o100_644);
+    }
+
+    #[test]
+    fn stat_path_reports_directory_filetype() {
+        let _g = crate::kernel::TestGuard::acquire();
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/dir", &mut []), 0);
+
+        let mut out = [0u8; 16];
+        assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/dir", &mut out), 16);
+        assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 3);
     }
 
     #[test]

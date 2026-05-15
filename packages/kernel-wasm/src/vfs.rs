@@ -704,7 +704,8 @@ impl VfsBackend for RamfsBackend {
             return -(crate::abi::EEXIST as i64) as i32;
         }
         self.paths.insert(link_path.to_vec(), id);
-        *self.refcount.entry(id).or_insert(0) += 1;
+        let refs = self.refcount.entry(id).or_insert(0);
+        *refs = refs.saturating_add(1);
         0
     }
 
@@ -882,6 +883,16 @@ mod tests {
         let mt = MountTable::new(Box::new(RamfsBackend::new()));
         assert_eq!(ROOT_MOUNT, 0);
         let _ = mt; // keep MountTable construction tested.
+    }
+
+    #[test]
+    fn ramfs_link_refcount_saturates() {
+        let mut ramfs = RamfsBackend::new();
+        let inode = ramfs.install(b"/a".to_vec(), b"x".to_vec());
+        ramfs.refcount.insert(inode, u32::MAX);
+
+        assert_eq!(ramfs.link(b"/a", b"/b"), 0);
+        assert_eq!(ramfs.refcount.get(&inode), Some(&u32::MAX));
     }
 
     #[test]

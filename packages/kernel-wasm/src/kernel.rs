@@ -361,8 +361,8 @@ impl PipeBuf {
 
     pub fn inc_ref(&mut self, end: PipeEnd) {
         match end {
-            PipeEnd::Read => self.read_ends += 1,
-            PipeEnd::Write => self.write_ends += 1,
+            PipeEnd::Read => self.read_ends = self.read_ends.saturating_add(1),
+            PipeEnd::Write => self.write_ends = self.write_ends.saturating_add(1),
         }
     }
 
@@ -1002,7 +1002,7 @@ impl Kernel {
 
     pub fn socket_inc_ref(&mut self, id: u64) {
         if let Some(socket) = self.sockets.get_mut(&id) {
-            socket.refs += 1;
+            socket.refs = socket.refs.saturating_add(1);
         }
     }
 
@@ -1065,7 +1065,7 @@ impl Kernel {
     /// Increment the refcount on an OFD (dup / dup2).
     pub fn ofd_inc_ref(&mut self, id: u64) {
         if let Some(ofd) = self.ofds.get_mut(&id) {
-            ofd.refs += 1;
+            ofd.refs = ofd.refs.saturating_add(1);
         }
     }
 
@@ -1383,6 +1383,7 @@ pub fn scheduler_budget_ns(nice: i32) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vfs::ROOT_MOUNT;
 
     #[test]
     fn lazy_insert_yields_defaults() {
@@ -1569,5 +1570,29 @@ mod tests {
                 .expect("worker thread")
         });
         assert_eq!(runnable.state, ThreadState::Runnable);
+    }
+
+    #[test]
+    fn registry_refcount_increments_saturate() {
+        let mut pipe = PipeBuf::new();
+        pipe.read_ends = u32::MAX;
+        pipe.write_ends = u32::MAX;
+        pipe.inc_ref(PipeEnd::Read);
+        pipe.inc_ref(PipeEnd::Write);
+        assert_eq!(pipe.read_ends, u32::MAX);
+        assert_eq!(pipe.write_ends, u32::MAX);
+
+        let _g = TestGuard::acquire();
+        with_kernel(|k| {
+            let ofd_id = k.create_ofd(ROOT_MOUNT, 1, true);
+            k.ofds.get_mut(&ofd_id).unwrap().refs = u32::MAX;
+            k.ofd_inc_ref(ofd_id);
+            assert_eq!(k.ofds.get(&ofd_id).unwrap().refs, u32::MAX);
+
+            let socket_id = k.create_socket(1, 1, 0);
+            k.sockets.get_mut(&socket_id).unwrap().refs = u32::MAX;
+            k.socket_inc_ref(socket_id);
+            assert_eq!(k.sockets.get(&socket_id).unwrap().refs, u32::MAX);
+        });
     }
 }
