@@ -139,6 +139,8 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
         "host_socket_send",
         "host_socket_recv",
         "host_socket_close",
+        "host_socket_option",
+        "host_socket_set_no_delay",
         "host_socket_bind_unix",
         "host_socket_connect_unix",
         "host_socket_listen_unix",
@@ -711,6 +713,35 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
       255,
       255,
       255,
+    ]);
+
+    const { mk: noDelayMk, calls: noDelayCalls } = capturingMk(0);
+    const noDelayImports = buildWasmKernelImports(
+      noDelayMk,
+      () => new ArrayBuffer(64),
+    );
+    expect(await noDelayImports.host_socket_set_no_delay(9, 1)).toEqual(0);
+    expect(noDelayCalls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_OPTION,
+      responseCap: 0,
+    });
+    expect(Array.from(noDelayCalls.at(-1)!.request)).toEqual([
+      9,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
+      1,
+      0,
+      0,
+      0,
     ]);
 
     const recvFromResponse = new Uint8Array(64);

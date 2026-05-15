@@ -127,6 +127,21 @@ export interface HostBinding {
   returnsBytes?: boolean;
 }
 
+function socketOptionRequest(
+  fd: number,
+  option: number,
+  hasValue: number,
+  value: number,
+): Uint8Array {
+  const req = new Uint8Array(16);
+  const view = new DataView(req.buffer);
+  view.setUint32(0, fd >>> 0, true);
+  view.setUint32(4, option >>> 0, true);
+  view.setUint32(8, hasValue >>> 0, true);
+  view.setInt32(12, value | 0, true);
+  return req;
+}
+
 /**
  * The starting binding table — covers the simple scalar surface
  * the Rust kernel already implements. The full surface fills
@@ -972,20 +987,30 @@ export const HOST_BINDINGS: HostBinding[] = [
       hasValue: number,
       value: number,
     ): Promise<number> => {
-      const req = new Uint8Array(16);
-      const view = new DataView(req.buffer);
-      view.setUint32(0, fd >>> 0, true);
-      view.setUint32(4, option >>> 0, true);
-      view.setUint32(8, hasValue >>> 0, true);
-      view.setInt32(12, value | 0, true);
       const out = await mk.kernelSyscallAsync(
         METHOD.SYS_SOCKET_OPTION,
         callerPid,
-        req,
+        socketOptionRequest(fd, option, hasValue, value),
         0,
       );
       return Number(out.rc);
     },
+  },
+  {
+    name: "host_socket_set_no_delay",
+    method: METHOD.SYS_SOCKET_OPTION,
+    args: [],
+    custom:
+      (mk, _memBuf, callerPid) =>
+      async (fd: number, enabled: number): Promise<number> => {
+        const out = await mk.kernelSyscallAsync(
+          METHOD.SYS_SOCKET_OPTION,
+          callerPid,
+          socketOptionRequest(fd, 1, 1, enabled),
+          0,
+        );
+        return Number(out.rc);
+      },
   },
   // host_socket_close(fd) → 0 / -errno.
   // SYS_SOCKET_CLOSE: u32 handle in request, no response.

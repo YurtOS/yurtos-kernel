@@ -113,7 +113,7 @@ const ABI_IMPORT_METHODS = new Map<string, string | null>([
   ["host_dns_resolve", null],
   ["host_network_fetch", "sys_fetch"],
   ["host_extension_invoke", "sys_extension_invoke"],
-  ["host_socket_set_no_delay", null],
+  ["host_socket_set_no_delay", "sys_socket_option"],
   ["host_idb_get", "sys_idb_get"],
   ["host_idb_put", "sys_idb_put"],
   ["host_idb_delete", "sys_idb_delete"],
