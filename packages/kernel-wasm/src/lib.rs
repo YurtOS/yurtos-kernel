@@ -320,6 +320,26 @@ pub extern "C" fn kernel_record_thread_exit(pid: u32, tid: u32, exit_value: i32)
     })
 }
 
+/// Host-control export: record thread exit after validating the live host
+/// execution handle for `(pid, tid)`.
+#[no_mangle]
+pub extern "C" fn kernel_record_thread_exit_authenticated(
+    pid: u32,
+    tid: u32,
+    host_thread_handle: i32,
+    exit_value: u32,
+) -> i64 {
+    let (result, release_handles) = crate::kernel::with_kernel(|k| {
+        let result = k.record_thread_exit_authenticated(pid, tid, host_thread_handle, exit_value);
+        let release_handles = k.drain_thread_releases();
+        (result, release_handles)
+    });
+    for handle in release_handles {
+        let _ = kh::thread_release(handle);
+    }
+    result.map_or_else(|errno| -(errno as i64), |_| 0)
+}
+
 /// Host-control export: mark a thread blocked in kernel-owned state.
 ///
 #[no_mangle]
@@ -563,5 +583,36 @@ mod tests {
         });
         assert_eq!(kernel_kill(7, 15), 0);
         assert_eq!(kernel_kill(7, 64), -(abi::EINVAL as i64));
+    }
+
+    #[test]
+    fn record_thread_exit_authenticated_rejects_wrong_host_handle() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.insert_host_process(9, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+            assert_eq!(k.spawn_thread(9, Some(44)), Some(2));
+        });
+
+        assert_eq!(
+            kernel_record_thread_exit_authenticated(9, 2, 45, 0x1234),
+            -(abi::EPERM as i64)
+        );
+    }
+
+    #[test]
+    fn record_thread_exit_authenticated_accepts_matching_host_handle() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.insert_host_process(9, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+            assert_eq!(k.spawn_thread(9, Some(44)), Some(2));
+        });
+
+        assert_eq!(
+            kernel_record_thread_exit_authenticated(9, 2, 44, 0x8000_0001),
+            0
+        );
+        let thread =
+            crate::kernel::with_kernel(|k| k.process(9).threads.get(&2).expect("thread").clone());
+        assert_eq!(thread.exit_value, Some(0x8000_0001));
     }
 }

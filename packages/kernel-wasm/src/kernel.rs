@@ -1336,6 +1336,25 @@ impl Kernel {
     }
 
     #[allow(dead_code)]
+    pub fn record_thread_exit_authenticated(
+        &mut self,
+        pid: Pid,
+        tid: Tid,
+        host_thread_handle: i32,
+        exit_value: u32,
+    ) -> Result<Option<Tid>, i32> {
+        let thread = self
+            .processes
+            .get(&pid)
+            .and_then(|p| p.threads.get(&tid))
+            .ok_or(crate::abi::ESRCH)?;
+        if thread.host_thread_handle != Some(host_thread_handle) {
+            return Err(crate::abi::EPERM);
+        }
+        self.exit_thread_authenticated(pid, tid, exit_value)
+    }
+
+    #[allow(dead_code)]
     pub fn begin_thread_join(
         &mut self,
         pid: Pid,

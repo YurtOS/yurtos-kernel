@@ -1538,6 +1538,7 @@ pub struct KernelInstance {
     pub(crate) spawn_thread: TypedFunc<(u32, i32), i64>,
     pub(crate) detach_thread: TypedFunc<(u32, u32), i64>,
     pub(crate) record_thread_exit: TypedFunc<(u32, u32, i32), i64>,
+    pub(crate) record_thread_exit_authenticated: TypedFunc<(u32, u32, i32, u32), i64>,
     pub(crate) block_thread: TypedFunc<(u32, u32), i64>,
     pub(crate) unblock_thread: TypedFunc<(u32, u32), i64>,
     pub(crate) kill: TypedFunc<(u32, u32), i64>,
@@ -1707,6 +1708,23 @@ impl KernelInstance {
             .context("kernel_record_thread_exit")?;
         if rc != 0 {
             anyhow::bail!("kernel_record_thread_exit failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    pub fn record_thread_exit_authenticated(
+        &mut self,
+        pid: u32,
+        tid: u32,
+        host_thread_handle: i32,
+        exit_value: u32,
+    ) -> Result<()> {
+        let rc = self
+            .record_thread_exit_authenticated
+            .call(&mut self.store, (pid, tid, host_thread_handle, exit_value))
+            .context("kernel_record_thread_exit_authenticated")?;
+        if rc != 0 {
+            anyhow::bail!("kernel_record_thread_exit_authenticated failed: rc={rc}");
         }
         Ok(())
     }
@@ -2064,6 +2082,11 @@ impl KernelHostInterface {
             instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_detach_thread")?;
         let record_thread_exit = instance
             .get_typed_func::<(u32, u32, i32), i64>(&mut store, "kernel_record_thread_exit")?;
+        let record_thread_exit_authenticated = instance
+            .get_typed_func::<(u32, u32, i32, u32), i64>(
+                &mut store,
+                "kernel_record_thread_exit_authenticated",
+            )?;
         let block_thread =
             instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_block_thread")?;
         let unblock_thread =
@@ -2091,6 +2114,7 @@ impl KernelHostInterface {
             spawn_thread,
             detach_thread,
             record_thread_exit,
+            record_thread_exit_authenticated,
             block_thread,
             unblock_thread,
             kill,
@@ -2157,6 +2181,19 @@ impl KernelHostInterface {
             .lock()
             .unwrap()
             .record_thread_exit(pid, tid, exit_value)
+    }
+
+    pub fn record_thread_exit_authenticated(
+        &self,
+        pid: u32,
+        tid: u32,
+        host_thread_handle: i32,
+        exit_value: u32,
+    ) -> Result<()> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .record_thread_exit_authenticated(pid, tid, host_thread_handle, exit_value)
     }
 
     pub fn block_thread(&self, pid: u32, tid: u32) -> Result<()> {
@@ -3608,6 +3645,23 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             }
             -ENOSYS
         },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_thread_spawn",
+        |_caller: Caller<'_, KernelStoreData>, _pid: u32, _tid: u32, _fn_ptr: u32, _arg: u32| {
+            -ENOSYS as i32
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_thread_release",
+        |_caller: Caller<'_, KernelStoreData>, _host_thread_handle: i32| 0_i32,
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_thread_cancel",
+        |_caller: Caller<'_, KernelStoreData>, _host_thread_handle: i32| 0_i32,
     )?;
 
     Ok(())

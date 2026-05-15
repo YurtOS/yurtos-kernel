@@ -237,12 +237,14 @@ fn kernel_wasm_export_surface_is_locked() {
             "kernel_block_thread",
             "kernel_detach_thread",
             "kernel_dispatch",
+            "kernel_dispatch_thread",
             "kernel_drain_spawn",
             "kernel_kill",
             "kernel_list_processes",
             "kernel_list_threads",
             "kernel_record_exit",
             "kernel_record_thread_exit",
+            "kernel_record_thread_exit_authenticated",
             "kernel_schedule_next",
             "kernel_scratch_len",
             "kernel_scratch_ptr",
@@ -342,6 +344,37 @@ fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
     mk.detach_thread(proc.pid(), tid).unwrap();
     mk.record_thread_exit(proc.pid(), tid, 123).unwrap();
 
+    assert!(mk
+        .list_threads(proc.pid())
+        .unwrap()
+        .into_iter()
+        .all(|thread| thread.tid != tid));
+}
+
+#[test]
+fn wasmtime_adapter_authenticates_thread_exit_handle() {
+    let mk = fresh_kernel_host_interface(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 7))
+        "#,
+    )
+    .unwrap();
+
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+    let tid = mk.spawn_thread(proc.pid(), 91).unwrap();
+
+    assert!(mk
+        .record_thread_exit_authenticated(proc.pid(), tid, 92, 123)
+        .is_err());
+    mk.record_thread_exit_authenticated(proc.pid(), tid, 91, 123)
+        .unwrap();
+
     let exited = mk
         .list_threads(proc.pid())
         .unwrap()
@@ -349,7 +382,6 @@ fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
         .find(|thread| thread.tid == tid)
         .unwrap();
     assert_eq!(exited.state, "exited");
-    assert!(exited.detached);
     assert_eq!(exited.exit_value, Some(123));
 }
 
