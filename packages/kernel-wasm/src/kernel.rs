@@ -27,6 +27,7 @@ pub type Pid = u32;
 pub type Tid = u32;
 
 pub const DEFAULT_UMASK: u16 = 0o022;
+pub const MAIN_THREAD_TID: Tid = 1;
 
 /// `(soft, hard)` resource limits. `u64::MAX` means RLIM_INFINITY.
 pub type ResourceLimit = (u64, u64);
@@ -77,7 +78,7 @@ pub struct ThreadRecord {
 impl ThreadRecord {
     fn main(host_thread_handle: Option<i32>) -> Self {
         Self {
-            tid: 1,
+            tid: MAIN_THREAD_TID,
             state: ThreadState::Runnable,
             detached: false,
             exit_value: None,

@@ -443,6 +443,36 @@ id = 0x1_004C
 kind = "syscall"
 doc = "Set or get a scalar socket option. Request bytes: u32 fd LE + u32 option LE + u32 has_value LE + i32 value LE. TCP_NODELAY round-trips through kernel socket state. Advisory set-only options succeed as no-ops; unsupported gets return -EOPNOTSUPP."
 
+[method.sys_thread_spawn]
+id = 0x1_004D
+kind = "syscall"
+doc = "Spawn a Rust-kernel-owned pthread. Request bytes: u32 fn_ptr LE + u32 arg LE. Returns tid in 1..=i32::MAX or negated errno."
+
+[method.sys_thread_self]
+id = 0x1_004E
+kind = "syscall"
+doc = "Return the authenticated caller's guest-visible pthread id. Main thread returns 0; workers return Rust-allocated tids >= 2."
+
+[method.sys_thread_join]
+id = 0x1_004F
+kind = "syscall"
+doc = "Join a Rust-kernel-owned pthread. Request bytes: u32 tid LE. Response bytes: u32 retval LE. Returns 0, -EAGAIN when the adapter must park the caller, or negated errno."
+
+[method.sys_thread_detach]
+id = 0x1_0050
+kind = "syscall"
+doc = "Detach a Rust-kernel-owned pthread. Request bytes: u32 tid LE. Returns 0 or negated errno."
+
+[method.sys_thread_exit]
+id = 0x1_0051
+kind = "syscall"
+doc = "Record exit for the authenticated caller thread. Request bytes: u32 retval LE. Does not return to the guest on the successful adapter path."
+
+[method.sys_thread_yield]
+id = 0x1_0052
+kind = "syscall"
+doc = "Yield the authenticated caller thread. No request bytes. Returns 0 or negated errno."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"

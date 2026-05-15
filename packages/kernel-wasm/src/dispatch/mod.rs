@@ -69,7 +69,28 @@ fn kernel_only(caller_pid: u32, f: impl FnOnce() -> i64) -> i64 {
     f()
 }
 
-pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchContext {
+    pub caller_pid: u32,
+    pub caller_tid: u32,
+}
+
+impl DispatchContext {
+    pub const fn main_thread(caller_pid: u32) -> Self {
+        Self {
+            caller_pid,
+            caller_tid: crate::kernel::MAIN_THREAD_TID,
+        }
+    }
+}
+
+pub fn dispatch_with_context(
+    method_id: u32,
+    ctx: DispatchContext,
+    request: &[u8],
+    response: &mut [u8],
+) -> i64 {
+    let caller_pid = ctx.caller_pid;
     match method_id {
         METHOD_KERNEL_ECHO => echo(request, response),
         METHOD_KERNEL_NOW_REALTIME => now_realtime(response),
@@ -98,6 +119,12 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
             kernel_only(caller_pid, || list_threads_response(request, response))
         }
         METHOD_KERNEL_SCHEDULE_NEXT => kernel_only(caller_pid, || schedule_next_response(response)),
+        METHOD_SYS_THREAD_SPAWN => -(abi::ENOSYS as i64),
+        METHOD_SYS_THREAD_SELF => -(abi::ENOSYS as i64),
+        METHOD_SYS_THREAD_JOIN => -(abi::ENOSYS as i64),
+        METHOD_SYS_THREAD_DETACH => -(abi::ENOSYS as i64),
+        METHOD_SYS_THREAD_EXIT => -(abi::ENOSYS as i64),
+        METHOD_SYS_THREAD_YIELD => -(abi::ENOSYS as i64),
         METHOD_SYS_WAIT => wait_response(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
@@ -178,6 +205,15 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SOCKET_RECVFROM => sys_socket_recvfrom(caller_pid, request, response),
         _ => -(abi::ENOSYS as i64),
     }
+}
+
+pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    dispatch_with_context(
+        method_id,
+        DispatchContext::main_thread(caller_pid),
+        request,
+        response,
+    )
 }
 
 fn echo(request: &[u8], response: &mut [u8]) -> i64 {

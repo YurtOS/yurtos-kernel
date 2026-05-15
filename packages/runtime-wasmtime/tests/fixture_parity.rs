@@ -100,6 +100,24 @@ fn sys_methods_from_contract() -> BTreeSet<String> {
         .collect()
 }
 
+fn method_id_from_contract(method_name: &str) -> i64 {
+    let path = workspace_root().join("abi/contract/yurt_abi_methods.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!("read {}: {err}", path.display());
+    });
+    let value: toml::Value = toml::from_str(&text).unwrap_or_else(|err| {
+        panic!("parse {}: {err}", path.display());
+    });
+    value
+        .get("method")
+        .and_then(toml::Value::as_table)
+        .and_then(|methods| methods.get(method_name))
+        .and_then(toml::Value::as_table)
+        .and_then(|method| method.get("id"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or_else(|| panic!("missing integer id for method.{method_name}"))
+}
+
 fn dispatch_sys_arms() -> BTreeSet<String> {
     let mut constants = BTreeSet::new();
     let dispatch_dir = workspace_root().join("packages/kernel-wasm/src/dispatch");
@@ -153,6 +171,16 @@ fn intentionally_deferred_sys_methods() -> BTreeSet<String> {
                 })
         })
         .collect()
+}
+
+#[test]
+fn thread_syscall_method_ids_are_stable() {
+    assert_eq!(method_id_from_contract("sys_thread_spawn"), 0x1_004D);
+    assert_eq!(method_id_from_contract("sys_thread_self"), 0x1_004E);
+    assert_eq!(method_id_from_contract("sys_thread_join"), 0x1_004F);
+    assert_eq!(method_id_from_contract("sys_thread_detach"), 0x1_0050);
+    assert_eq!(method_id_from_contract("sys_thread_exit"), 0x1_0051);
+    assert_eq!(method_id_from_contract("sys_thread_yield"), 0x1_0052);
 }
 
 #[test]

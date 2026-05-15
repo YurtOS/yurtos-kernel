@@ -155,6 +155,57 @@ pub unsafe extern "C" fn kernel_dispatch(
     dispatch::dispatch(method_id, caller_pid, request, response)
 }
 
+/// Host-callable entry point for thread-aware syscalls.
+///
+/// This has the same memory contract as [`kernel_dispatch`], but the host also
+/// supplies the authenticated caller thread id. Guest request bytes are not
+/// trusted to identify the calling thread.
+///
+/// # Safety
+///
+/// The kernel-host interface guarantees both slices live entirely inside this
+/// kernel instance's linear memory. The export rejects overlapping request and
+/// response ranges before forming Rust references.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_dispatch_thread(
+    method_id: u32,
+    caller_pid: u32,
+    caller_tid: u32,
+    in_ptr: *const u8,
+    in_len: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> i64 {
+    if let Err(rc) = validate_scratch_range(in_ptr as usize, in_len) {
+        return rc;
+    }
+    if let Err(rc) = validate_scratch_range(out_ptr as usize, out_cap) {
+        return rc;
+    }
+    match ranges_overlap(in_ptr as usize, in_len, out_ptr as usize, out_cap) {
+        Ok(false) => {}
+        Ok(true) => return -(abi::EINVAL as i64),
+        Err(rc) => return rc,
+    }
+    let request = match raw_input(in_ptr, in_len) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
+    };
+    let response = match raw_output(out_ptr, out_cap) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
+    };
+    dispatch::dispatch_with_context(
+        method_id,
+        dispatch::DispatchContext {
+            caller_pid,
+            caller_tid,
+        },
+        request,
+        response,
+    )
+}
+
 /// Host-control export: serialize the kernel-owned process table.
 ///
 /// The kernel_host_interface may expose this to embedders for observability, but
