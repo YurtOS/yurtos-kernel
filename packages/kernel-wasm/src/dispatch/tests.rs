@@ -5979,6 +5979,90 @@ fn lifecycle_host_control_is_not_available_through_generic_dispatch() {
 }
 
 #[test]
+fn sys_thread_self_maps_main_to_zero_and_worker_to_tid() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_THREAD_SELF, 9, &[], &mut []), 0);
+
+    let ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: 2,
+    };
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_SELF, ctx, &[], &mut []),
+        2
+    );
+}
+
+#[test]
+fn sys_thread_spawn_allocates_tid_and_calls_host() {
+    let _g = crate::kernel::TestGuard::acquire();
+    kh::test_support::reset_thread_mock();
+    kh::test_support::push_thread_spawn_result(77);
+    crate::kernel::with_kernel(|k| {
+        k.insert_host_process(9, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+    });
+
+    let mut req = 0x1234_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(&0x5678_u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_THREAD_SPAWN, 9, &req, &mut []), 2);
+    assert_eq!(
+        kh::test_support::thread_spawn_calls(),
+        vec![(9, 2, 0x1234, 0x5678)]
+    );
+    let worker = crate::kernel::with_kernel(|k| {
+        k.process(9)
+            .threads
+            .get(&2)
+            .expect("spawned thread")
+            .clone()
+    });
+    assert_eq!(worker.host_thread_handle, Some(77));
+}
+
+#[test]
+fn sys_thread_join_preserves_high_bit_retval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.insert_host_process(9, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+        let tid = k.spawn_thread(9, Some(77)).expect("thread spawn");
+        assert_eq!(tid, 2);
+        k.exit_thread_authenticated(9, tid, 0x8000_0001)
+            .expect("thread exit");
+    });
+
+    let ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+    let mut out = [0; 4];
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_JOIN, ctx, &2_u32.to_le_bytes(), &mut out),
+        0
+    );
+    assert_eq!(u32::from_le_bytes(out), 0x8000_0001);
+}
+
+#[test]
+fn sys_thread_join_running_thread_suspends_without_spinning() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.insert_host_process(9, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+        let tid = k.spawn_thread(9, Some(77)).expect("thread spawn");
+        assert_eq!(tid, 2);
+    });
+
+    let ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+    let mut out = [0; 4];
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_JOIN, ctx, &2_u32.to_le_bytes(), &mut out),
+        -(abi::EAGAIN as i64)
+    );
+}
+
+#[test]
 fn process_scaffolding_is_not_available_through_generic_dispatch() {
     let _g = crate::kernel::TestGuard::acquire();
     let argv = set_argv_req(7, &[b"/bin/wc"]);

@@ -19,6 +19,7 @@ use crate::kh;
 mod fs;
 mod process;
 mod socket;
+mod thread;
 
 use fs::{
     chdir, chmod, chown, getcwd, hard_link, mkdir, readdir, readlink, realpath, rename, rmdir,
@@ -119,12 +120,12 @@ pub fn dispatch_with_context(
             kernel_only(caller_pid, || list_threads_response(request, response))
         }
         METHOD_KERNEL_SCHEDULE_NEXT => kernel_only(caller_pid, || schedule_next_response(response)),
-        METHOD_SYS_THREAD_SPAWN => -(abi::ENOSYS as i64),
-        METHOD_SYS_THREAD_SELF => -(abi::ENOSYS as i64),
-        METHOD_SYS_THREAD_JOIN => -(abi::ENOSYS as i64),
-        METHOD_SYS_THREAD_DETACH => -(abi::ENOSYS as i64),
-        METHOD_SYS_THREAD_EXIT => -(abi::ENOSYS as i64),
-        METHOD_SYS_THREAD_YIELD => -(abi::ENOSYS as i64),
+        METHOD_SYS_THREAD_SPAWN => thread::sys_thread_spawn(ctx, request),
+        METHOD_SYS_THREAD_SELF => thread::sys_thread_self(ctx, request),
+        METHOD_SYS_THREAD_JOIN => thread::sys_thread_join(ctx, request, response),
+        METHOD_SYS_THREAD_DETACH => thread::sys_thread_detach(ctx, request),
+        METHOD_SYS_THREAD_EXIT => thread::sys_thread_exit(ctx, request),
+        METHOD_SYS_THREAD_YIELD => thread::sys_thread_yield(ctx, request),
         METHOD_SYS_WAIT => wait_response(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),

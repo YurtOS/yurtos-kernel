@@ -1395,9 +1395,13 @@ impl Kernel {
         Some(())
     }
 
+    pub fn drain_thread_releases(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.pending_thread_releases)
+    }
+
     #[cfg(test)]
     pub fn take_thread_releases_for_test(&mut self) -> Vec<i32> {
-        std::mem::take(&mut self.pending_thread_releases)
+        self.drain_thread_releases()
     }
 
     #[allow(dead_code)]
