@@ -21,6 +21,7 @@ use crate::kh;
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
 
 const MSG_PEEK: u32 = 0x2;
+const ID_NO_CHANGE: u32 = u32::MAX;
 
 /// Reserved pid for direct calls from outside any user process — i.e.
 /// the kernel-host interface itself driving the kernel for tests, bootstrapping,
@@ -182,19 +183,41 @@ fn read_u32_args<const N: usize>(request: &[u8]) -> Option<[u32; N]> {
     Some(out)
 }
 
+fn requested_id_allowed(requested: u32, allowed: &[u32]) -> bool {
+    requested == ID_NO_CHANGE || allowed.contains(&requested)
+}
+
+fn can_modify_owned_metadata(credentials: crate::state::Credentials, owner_uid: u32) -> bool {
+    credentials.euid == 0 || credentials.euid == owner_uid
+}
+
 fn setresuid(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([ruid, euid, suid]) = read_u32_args::<3>(request) else {
         return -(abi::EINVAL as i64);
     };
     with_kernel(|k| {
         let p = k.process_mut(caller_pid);
-        p.credentials.uid = ruid;
-        p.credentials.euid = euid;
-        // Saved-set-uid (suid) goes onto Process when we add the field;
-        // Phase 2 keeps Credentials with just real/effective.
-        let _ = suid;
-    });
-    0
+        let current = p.credentials;
+        if current.euid != 0 {
+            let allowed = [current.uid, current.euid, current.suid];
+            if ![ruid, euid, suid]
+                .iter()
+                .all(|id| requested_id_allowed(*id, &allowed))
+            {
+                return -(abi::EPERM as i64);
+            }
+        }
+        if ruid != ID_NO_CHANGE {
+            p.credentials.uid = ruid;
+        }
+        if euid != ID_NO_CHANGE {
+            p.credentials.euid = euid;
+        }
+        if suid != ID_NO_CHANGE {
+            p.credentials.suid = suid;
+        }
+        0
+    })
 }
 
 fn setresgid(caller_pid: u32, request: &[u8]) -> i64 {
@@ -203,11 +226,27 @@ fn setresgid(caller_pid: u32, request: &[u8]) -> i64 {
     };
     with_kernel(|k| {
         let p = k.process_mut(caller_pid);
-        p.credentials.gid = rgid;
-        p.credentials.egid = egid;
-        let _ = sgid;
-    });
-    0
+        let current = p.credentials;
+        if current.euid != 0 {
+            let allowed = [current.gid, current.egid, current.sgid];
+            if ![rgid, egid, sgid]
+                .iter()
+                .all(|id| requested_id_allowed(*id, &allowed))
+            {
+                return -(abi::EPERM as i64);
+            }
+        }
+        if rgid != ID_NO_CHANGE {
+            p.credentials.gid = rgid;
+        }
+        if egid != ID_NO_CHANGE {
+            p.credentials.egid = egid;
+        }
+        if sgid != ID_NO_CHANGE {
+            p.credentials.sgid = sgid;
+        }
+        0
+    })
 }
 
 const PRIO_PROCESS: u32 = 0;
@@ -3315,9 +3354,17 @@ fn chown(caller_pid: u32, request: &[u8]) -> i64 {
             Some(pair) => pair,
             None => return -(abi::ENOENT as i64),
         };
+        let caller_credentials = k.process_mut(caller_pid).credentials;
+        if caller_credentials.euid != 0 {
+            return -(abi::EPERM as i64);
+        }
         let mut meta = k.resolve_metadata(mount_id, inode);
-        meta.uid = uid;
-        meta.gid = gid;
+        if uid != ID_NO_CHANGE {
+            meta.uid = uid;
+        }
+        if gid != ID_NO_CHANGE {
+            meta.gid = gid;
+        }
         k.set_metadata_override(mount_id, inode, meta);
         0
     })
@@ -3341,6 +3388,10 @@ fn utimens(caller_pid: u32, request: &[u8]) -> i64 {
             None => return -(abi::ENOENT as i64),
         };
         let mut meta = k.resolve_metadata(mount_id, inode);
+        let caller_credentials = k.process_mut(caller_pid).credentials;
+        if !can_modify_owned_metadata(caller_credentials, meta.uid) {
+            return -(abi::EPERM as i64);
+        }
         meta.mtime_ns = mtime_ns;
         k.set_metadata_override(mount_id, inode, meta);
         0
@@ -3349,8 +3400,7 @@ fn utimens(caller_pid: u32, request: &[u8]) -> i64 {
 
 /// `chmod(mode, path) -> 0 or -ENOENT`. Request: u32 mode LE +
 /// path bytes. Writes to the kernel's MetadataOverlay; subsequent
-/// fstat sees the new mode. Phase 6 has no permission checks —
-/// any process that can resolve the path can chmod it.
+/// fstat sees the new mode. Caller must be root or the file owner.
 fn chmod(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 4 {
         return -(abi::EINVAL as i64);
@@ -3360,7 +3410,6 @@ fn chmod(caller_pid: u32, request: &[u8]) -> i64 {
     if raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
-    // future: use caller_pid for permission checks too
     let path = proc_self_rewrite(caller_pid, raw);
     with_kernel(|k| {
         let (mount_id, inode) = match k.vfs.open(&path, 0) {
@@ -3368,6 +3417,10 @@ fn chmod(caller_pid: u32, request: &[u8]) -> i64 {
             None => return -(abi::ENOENT as i64),
         };
         let mut meta = k.resolve_metadata(mount_id, inode);
+        let caller_credentials = k.process_mut(caller_pid).credentials;
+        if !can_modify_owned_metadata(caller_credentials, meta.uid) {
+            return -(abi::EPERM as i64);
+        }
         // Only update permission bits — high nibble (file type)
         // is fixed by the backend, not the user.
         meta.mode = (meta.mode & 0o170_000) | (mode & 0o007_777);
@@ -3400,6 +3453,19 @@ mod tests {
         req.extend_from_slice(path);
         req
     }
+
+    fn make_root(pid: u32) {
+        crate::kernel::with_kernel(|k| {
+            let credentials = &mut k.process_mut(pid).credentials;
+            credentials.uid = 0;
+            credentials.euid = 0;
+            credentials.suid = 0;
+            credentials.gid = 0;
+            credentials.egid = 0;
+            credentials.sgid = 0;
+        });
+    }
+
     const O_WRITE: u32 = 0b001;
     const O_CREAT: u32 = 0b010;
     const O_TRUNC: u32 = 0b100;
@@ -3582,6 +3648,7 @@ mod tests {
     #[test]
     fn setresuid_writes_per_pid_credentials() {
         let _g = crate::kernel::TestGuard::acquire();
+        make_root(1);
         let mut req = Vec::new();
         req.extend_from_slice(&500_u32.to_le_bytes()); // ruid
         req.extend_from_slice(&501_u32.to_le_bytes()); // euid
@@ -3591,6 +3658,35 @@ mod tests {
         assert_eq!(dispatch(METHOD_SYS_GETEUID, 1, &[], &mut []), 501);
         // Other pid still sees defaults.
         assert_eq!(dispatch(METHOD_SYS_GETUID, 2, &[], &mut []), 1000);
+    }
+
+    #[test]
+    fn setresuid_rejects_unprivileged_root_escalation() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&0_u32.to_le_bytes());
+        req.extend_from_slice(&0_u32.to_le_bytes());
+        req.extend_from_slice(&0_u32.to_le_bytes());
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SETRESUID, 1, &req, &mut []),
+            -(abi::EPERM as i64)
+        );
+        assert_eq!(dispatch(METHOD_SYS_GETUID, 1, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETEUID, 1, &[], &mut []), 1000);
+    }
+
+    #[test]
+    fn setresuid_minus_one_keeps_current_ids() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&u32::MAX.to_le_bytes());
+        req.extend_from_slice(&u32::MAX.to_le_bytes());
+        req.extend_from_slice(&u32::MAX.to_le_bytes());
+
+        assert_eq!(dispatch(METHOD_SYS_SETRESUID, 1, &req, &mut []), 0);
+        assert_eq!(dispatch(METHOD_SYS_GETUID, 1, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETEUID, 1, &[], &mut []), 1000);
     }
 
     #[test]
@@ -3605,6 +3701,7 @@ mod tests {
     #[test]
     fn setresgid_writes_per_pid_credentials() {
         let _g = crate::kernel::TestGuard::acquire();
+        make_root(1);
         let mut req = Vec::new();
         req.extend_from_slice(&77_u32.to_le_bytes());
         req.extend_from_slice(&78_u32.to_le_bytes());
@@ -3612,6 +3709,22 @@ mod tests {
         assert_eq!(dispatch(METHOD_SYS_SETRESGID, 1, &req, &mut []), 0);
         assert_eq!(dispatch(METHOD_SYS_GETGID, 1, &[], &mut []), 77);
         assert_eq!(dispatch(METHOD_SYS_GETEGID, 1, &[], &mut []), 78);
+    }
+
+    #[test]
+    fn setresgid_rejects_unprivileged_root_escalation() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut req = Vec::new();
+        req.extend_from_slice(&0_u32.to_le_bytes());
+        req.extend_from_slice(&0_u32.to_le_bytes());
+        req.extend_from_slice(&0_u32.to_le_bytes());
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SETRESGID, 1, &req, &mut []),
+            -(abi::EPERM as i64)
+        );
+        assert_eq!(dispatch(METHOD_SYS_GETGID, 1, &[], &mut []), 1000);
+        assert_eq!(dispatch(METHOD_SYS_GETEGID, 1, &[], &mut []), 1000);
     }
 
     #[test]
@@ -3748,13 +3861,7 @@ mod tests {
             -(abi::EPERM as i64)
         );
 
-        let root_req = [
-            0_u32.to_le_bytes(),
-            0_u32.to_le_bytes(),
-            0_u32.to_le_bytes(),
-        ]
-        .concat();
-        assert_eq!(dispatch(METHOD_SYS_SETRESUID, 7, &root_req, &mut []), 0);
+        make_root(7);
         assert_eq!(
             dispatch(
                 METHOD_SYS_SETPRIORITY,
@@ -7158,6 +7265,7 @@ mod tests {
         let _g = crate::kernel::TestGuard::acquire();
         // Touch pid 5 to register it, then change its uid.
         assert_eq!(dispatch(METHOD_SYS_GETUID, 5, &[], &mut []), 1000);
+        make_root(5);
         let mut req = Vec::new();
         req.extend_from_slice(&500_u32.to_le_bytes());
         req.extend_from_slice(&501_u32.to_le_bytes());
@@ -7480,6 +7588,7 @@ mod tests {
     #[test]
     fn chmod_writes_to_metadata_overlay_and_fstat_reflects_it() {
         let _g = crate::kernel::TestGuard::acquire();
+        make_root(1);
         let mut reg = Vec::new();
         reg.extend_from_slice(&3_u32.to_le_bytes());
         reg.extend_from_slice(b"/m2");
@@ -7511,8 +7620,27 @@ mod tests {
     }
 
     #[test]
+    fn chmod_rejects_unprivileged_non_owner() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let path = b"/root-mode";
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        reg.extend_from_slice(path);
+        reg.extend_from_slice(b"x");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let mut req = 0o777_u32.to_le_bytes().to_vec();
+        req.extend_from_slice(path);
+        assert_eq!(
+            dispatch(METHOD_SYS_CHMOD, 1, &req, &mut []),
+            -(abi::EPERM as i64)
+        );
+    }
+
+    #[test]
     fn chown_writes_uid_gid_to_overlay() {
         let _g = crate::kernel::TestGuard::acquire();
+        make_root(1);
         let mut reg = Vec::new();
         reg.extend_from_slice(&3_u32.to_le_bytes());
         reg.extend_from_slice(b"/co");
@@ -7535,8 +7663,29 @@ mod tests {
     }
 
     #[test]
+    fn chown_rejects_unprivileged_caller() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let path = b"/root-owner";
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        reg.extend_from_slice(path);
+        reg.extend_from_slice(b"x");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let mut req = Vec::new();
+        req.extend_from_slice(&1234_u32.to_le_bytes());
+        req.extend_from_slice(&5678_u32.to_le_bytes());
+        req.extend_from_slice(path);
+        assert_eq!(
+            dispatch(METHOD_SYS_CHOWN, 1, &req, &mut []),
+            -(abi::EPERM as i64)
+        );
+    }
+
+    #[test]
     fn utimens_writes_mtime_to_overlay() {
         let _g = crate::kernel::TestGuard::acquire();
+        make_root(1);
         let mut reg = Vec::new();
         reg.extend_from_slice(&3_u32.to_le_bytes());
         reg.extend_from_slice(b"/ut");
@@ -7554,6 +7703,25 @@ mod tests {
             k.resolve_metadata(pair.0, pair.1)
         });
         assert_eq!(meta.mtime_ns, want_ns);
+    }
+
+    #[test]
+    fn utimens_rejects_unprivileged_non_owner() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let path = b"/root-time";
+        let mut reg = Vec::new();
+        reg.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        reg.extend_from_slice(path);
+        reg.extend_from_slice(b"x");
+        dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+        let mut req = Vec::new();
+        req.extend_from_slice(&1_700_000_000_000_000_000_u64.to_le_bytes());
+        req.extend_from_slice(path);
+        assert_eq!(
+            dispatch(METHOD_SYS_UTIMENS, 1, &req, &mut []),
+            -(abi::EPERM as i64)
+        );
     }
 
     #[test]

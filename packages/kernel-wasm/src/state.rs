@@ -11,10 +11,10 @@
 pub struct Credentials {
     pub uid: u32,
     pub euid: u32,
+    pub suid: u32,
     pub gid: u32,
     pub egid: u32,
-    // suid / sgid are added when host_setresuid / host_setresgid get
-    // ported (they're the only callers that distinguish them).
+    pub sgid: u32,
 }
 
 impl Credentials {
@@ -25,7 +25,9 @@ impl Credentials {
     pub const DEFAULT: Credentials = Credentials {
         uid: 1000,
         euid: 1000,
+        suid: 1000,
         gid: 1000,
         egid: 1000,
+        sgid: 1000,
     };
 }
