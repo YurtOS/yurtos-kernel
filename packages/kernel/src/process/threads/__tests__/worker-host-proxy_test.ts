@@ -40,6 +40,9 @@ function noopBodies(): WorkerHostDispatcherBodies {
     socketRecvUnix: () => ({ result: 0 }),
     setFdDescriptorFlags: () => 0,
     threadSpawn: () => 2,
+    socketBind: () => 0,
+    socketListen: () => 0,
+    socketIsDgram: () => 0,
   };
 }
 

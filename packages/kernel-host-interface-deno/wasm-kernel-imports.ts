@@ -91,6 +91,7 @@ export type CustomBuilder = (
   mk: KernelHostInterface,
   memBuf: () => ArrayBuffer,
   callerPid: number,
+  callerTid: number,
 ) => (...args: number[]) => Promise<number>;
 
 export interface HostBinding {
@@ -142,6 +143,33 @@ function socketOptionRequest(
   return req;
 }
 
+function scalarRequest(...values: number[]): Uint8Array {
+  const req = new Uint8Array(values.length * 4);
+  const view = new DataView(req.buffer);
+  values.forEach((value, index) => {
+    view.setUint32(index * 4, value >>> 0, true);
+  });
+  return req;
+}
+
+function threadImport(
+  method: number,
+  request: Uint8Array,
+  responseCap: number,
+  mk: KernelHostInterface,
+  callerPid: number,
+  callerTid: number,
+): { rc: number; response: Uint8Array } {
+  const out = mk.kernelThreadSyscall(
+    method,
+    callerPid,
+    callerTid,
+    request,
+    responseCap,
+  );
+  return { rc: Number(out.rc), response: out.response };
+}
+
 /**
  * The starting binding table — covers the simple scalar surface
  * the Rust kernel already implements. The full surface fills
@@ -156,6 +184,94 @@ export const HOST_BINDINGS: HostBinding[] = [
   { name: "host_getegid", method: METHOD.SYS_GETEGID, args: [] },
   { name: "host_getpid", method: METHOD.SYS_GETPID, args: [] },
   { name: "host_getppid", method: METHOD.SYS_GETPPID, args: [] },
+
+  {
+    name: "host_thread_spawn",
+    method: METHOD.SYS_THREAD_SPAWN,
+    args: ["scalar", "scalar"],
+    custom: (mk, _memBuf, callerPid, callerTid) => async (fnPtr, arg) =>
+      threadImport(
+        METHOD.SYS_THREAD_SPAWN,
+        scalarRequest(fnPtr, arg),
+        0,
+        mk,
+        callerPid,
+        callerTid,
+      ).rc,
+  },
+  {
+    name: "host_thread_self",
+    method: METHOD.SYS_THREAD_SELF,
+    args: [],
+    custom: (mk, _memBuf, callerPid, callerTid) => async () =>
+      threadImport(
+        METHOD.SYS_THREAD_SELF,
+        new Uint8Array(0),
+        0,
+        mk,
+        callerPid,
+        callerTid,
+      ).rc,
+  },
+  {
+    name: "host_thread_join",
+    method: METHOD.SYS_THREAD_JOIN,
+    args: ["scalar", { kind: "fixed_out", cap: 4 }],
+    custom: (mk, memBuf, callerPid, callerTid) => async (tid, outRetvalPtr) => {
+      const out = threadImport(
+        METHOD.SYS_THREAD_JOIN,
+        scalarRequest(tid),
+        4,
+        mk,
+        callerPid,
+        callerTid,
+      );
+      if (out.rc !== 0) return out.rc;
+      return copyOut(memBuf, outRetvalPtr, out.response.subarray(0, 4));
+    },
+  },
+  {
+    name: "host_thread_detach",
+    method: METHOD.SYS_THREAD_DETACH,
+    args: ["scalar"],
+    custom: (mk, _memBuf, callerPid, callerTid) => async (tid) =>
+      threadImport(
+        METHOD.SYS_THREAD_DETACH,
+        scalarRequest(tid),
+        0,
+        mk,
+        callerPid,
+        callerTid,
+      ).rc,
+  },
+  {
+    name: "host_thread_exit",
+    method: METHOD.SYS_THREAD_EXIT,
+    args: ["scalar"],
+    custom: (mk, _memBuf, callerPid, callerTid) => async (retval) =>
+      threadImport(
+        METHOD.SYS_THREAD_EXIT,
+        scalarRequest(retval),
+        0,
+        mk,
+        callerPid,
+        callerTid,
+      ).rc,
+  },
+  {
+    name: "host_thread_yield",
+    method: METHOD.SYS_THREAD_YIELD,
+    args: [],
+    custom: (mk, _memBuf, callerPid, callerTid) => async () =>
+      threadImport(
+        METHOD.SYS_THREAD_YIELD,
+        new Uint8Array(0),
+        0,
+        mk,
+        callerPid,
+        callerTid,
+      ).rc,
+  },
 
   // Single-scalar args returning a scalar.
   { name: "host_umask", method: METHOD.SYS_UMASK, args: ["scalar"] },
@@ -1222,6 +1338,7 @@ export function buildWasmKernelImports(
   memBuf: () => ArrayBuffer,
   callerPid = 0,
   initialCwd?: string,
+  callerTid = 1,
 ): Record<string, (...args: number[]) => Promise<number>> {
   if (initialCwd) {
     mk.kernelSyscall(
@@ -1234,7 +1351,7 @@ export function buildWasmKernelImports(
   const imports: Record<string, (...args: number[]) => Promise<number>> = {};
   for (const b of HOST_BINDINGS) {
     imports[b.name] = b.custom
-      ? b.custom(mk, memBuf, callerPid)
+      ? b.custom(mk, memBuf, callerPid, callerTid)
       : makeWrapper(b, mk, memBuf, callerPid);
   }
   return imports;

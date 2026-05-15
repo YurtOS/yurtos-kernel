@@ -104,6 +104,12 @@ function encodeTwoPathRequest(
   return req;
 }
 
+function u32(value: number): Uint8Array {
+  const req = new Uint8Array(4);
+  new DataView(req.buffer).setUint32(0, value >>> 0, true);
+  return req;
+}
+
 function spawnFromRamfs(
   mk: KernelHostInterface,
   parentPid: number,
@@ -677,13 +683,46 @@ Deno.test("thread lifecycle controls mutate the kernel-owned thread snapshot", a
   );
 
   mk.recordThreadExit(childPid, tid, 123);
-  assertEquals(mk.listThreads(childPid).find((t) => t.tid === tid), {
-    tid,
-    state: "exited",
-    detached: true,
-    exitValue: 123,
-    hostThreadHandle: 91,
-  });
+  assertEquals(mk.listThreads(childPid).find((t) => t.tid === tid), undefined);
+});
+
+Deno.test("thread dispatch authenticates main caller tid for pthread_self", async () => {
+  const mk = await freshKernelHostInterface();
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
+
+  const out = mk.kernelThreadSyscall(
+    METHOD.SYS_THREAD_SELF,
+    childPid,
+    1,
+    new Uint8Array(0),
+    0,
+  );
+
+  assertEquals(Number(out.rc), 0);
+});
+
+Deno.test("thread dispatch returns join status separately from raw retval bits", async () => {
+  const mk = await freshKernelHostInterface();
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
+  const tid = mk.spawnThread(childPid, 91);
+  mk.recordThreadExit(childPid, tid, 0x8000_0000);
+
+  const out = mk.kernelThreadSyscall(
+    METHOD.SYS_THREAD_JOIN,
+    childPid,
+    1,
+    u32(tid),
+    4,
+  );
+
+  assertEquals(Number(out.rc), 0);
+  assertEquals(
+    new DataView(out.response.buffer, out.response.byteOffset, 4).getUint32(
+      0,
+      true,
+    ),
+    0x8000_0000,
+  );
 });
 
 Deno.test("scheduleNext reads kernel-owned runnable decisions with budgets", async () => {

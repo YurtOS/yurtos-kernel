@@ -44,6 +44,7 @@ async function freshMk(): Promise<KernelHostInterface> {
 interface CapturedCall {
   method: number;
   callerPid: number;
+  callerTid?: number;
   request: Uint8Array;
   responseCap: number;
 }
@@ -71,6 +72,22 @@ function capturingMk(rc = 0, response = new Uint8Array()): {
     ): Promise<{ rc: bigint; response: Uint8Array }> {
       calls.push({ method, callerPid, request: request.slice(), responseCap });
       return Promise.resolve({ rc: BigInt(rc), response });
+    },
+    kernelThreadSyscall(
+      method: number,
+      callerPid: number,
+      callerTid: number,
+      request: Uint8Array,
+      responseCap: number,
+    ): { rc: bigint; response: Uint8Array } {
+      calls.push({
+        method,
+        callerPid,
+        callerTid,
+        request: request.slice(),
+        responseCap,
+      });
+      return { rc: BigInt(rc), response };
     },
   } as unknown as KernelHostInterface;
   return { mk, calls };
@@ -172,6 +189,22 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(names.has("host_realpath")).toEqual(true);
   });
 
+  it("covers the pthread host import names that have Rust syscalls", () => {
+    const names = new Set(HOST_BINDINGS.map((b) => b.name));
+    for (
+      const name of [
+        "host_thread_spawn",
+        "host_thread_self",
+        "host_thread_join",
+        "host_thread_detach",
+        "host_thread_exit",
+        "host_thread_yield",
+      ]
+    ) {
+      expect(names.has(name)).toEqual(true);
+    }
+  });
+
   it("scalar-zero-arg: host_getuid → sys_getuid via factory", async () => {
     if (!HAS_JSPI) return;
     const mk = await freshMk();
@@ -197,6 +230,45 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(new TextDecoder().decode(calls[0].request)).toEqual("/tmp");
     expect(calls[1].method).toEqual(METHOD.SYS_GETUID);
     expect(calls[1].callerPid).toEqual(77);
+  });
+
+  it("host_thread_self routes through authenticated Rust thread dispatch", async () => {
+    const { mk, calls } = capturingMk(9);
+    const imports = buildWasmKernelImports(
+      mk,
+      () => new ArrayBuffer(8),
+      77,
+      undefined,
+      9,
+    );
+
+    const tid = await imports.host_thread_self();
+
+    expect(tid).toEqual(9);
+    expect(calls.length).toEqual(1);
+    expect(calls[0].method).toEqual(METHOD.SYS_THREAD_SELF);
+    expect(calls[0].callerPid).toEqual(77);
+    expect(calls[0].callerTid).toEqual(9);
+    expect(calls[0].request.byteLength).toEqual(0);
+  });
+
+  it("host_thread_join writes raw retval bits through the out pointer", async () => {
+    const response = new Uint8Array(4);
+    new DataView(response.buffer).setUint32(0, 0x8000_0000, true);
+    const { mk, calls } = capturingMk(0, response);
+    const memory = new ArrayBuffer(16);
+    const imports = buildWasmKernelImports(mk, () => memory, 77, undefined, 1);
+
+    const rc = await imports.host_thread_join(42, 4);
+
+    expect(rc).toEqual(0);
+    expect(calls.length).toEqual(1);
+    expect(calls[0].method).toEqual(METHOD.SYS_THREAD_JOIN);
+    expect(calls[0].callerTid).toEqual(1);
+    expect(new DataView(calls[0].request.buffer).getUint32(0, true)).toEqual(
+      42,
+    );
+    expect(new DataView(memory, 4, 4).getUint32(0, true)).toEqual(0x8000_0000);
   });
 
   it("multi-scalar-arg: host_kill with args packed inline", async () => {

@@ -200,6 +200,12 @@ export const METHOD = {
   SYS_SOCKET_INFO: 0x1_004A,
   SYS_SOCKET_RECVFROM: 0x1_004B,
   SYS_SOCKET_OPTION: 0x1_004C,
+  SYS_THREAD_SPAWN: 0x1_004D,
+  SYS_THREAD_SELF: 0x1_004E,
+  SYS_THREAD_JOIN: 0x1_004F,
+  SYS_THREAD_DETACH: 0x1_0050,
+  SYS_THREAD_EXIT: 0x1_0051,
+  SYS_THREAD_YIELD: 0x1_0052,
 } as const;
 
 export const KERNEL_PID = 0;
@@ -1207,6 +1213,17 @@ export class KernelInstance {
       outPtr: number,
       outCap: number,
     ) => bigint,
+    readonly dispatchThread:
+      | ((
+        methodId: number,
+        callerPid: number,
+        callerTid: number,
+        inPtr: number,
+        inLen: number,
+        outPtr: number,
+        outCap: number,
+      ) => bigint)
+      | null = null,
     /**
      * Promising-wrapped variant of `dispatch`. Present only when
      * the host supports JSPI and at least one kh_* import is
@@ -1317,6 +1334,29 @@ export class KernelInstance {
     const rc = this.dispatch(
       methodId,
       callerPid,
+      inPtr,
+      inLen,
+      outPtr,
+      responseCap,
+    );
+    return { rc, response: this.collectResponse(outPtr, responseCap) };
+  }
+
+  threadSyscall(
+    methodId: number,
+    callerPid: number,
+    callerTid: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): { rc: bigint; response: Uint8Array } {
+    if (!this.dispatchThread) {
+      throw new Error("kernel.wasm missing kernel_dispatch_thread export");
+    }
+    const { inPtr, inLen, outPtr } = this.stage(request, responseCap);
+    const rc = this.dispatchThread(
+      methodId,
+      callerPid,
+      callerTid,
       inPtr,
       inLen,
       outPtr,
@@ -2349,6 +2389,14 @@ export class KernelHostInterface {
         result: bigint,
         budgetNs: bigint,
       ): bigint => processEngine.resume(handle, result, budgetNs),
+      kh_thread_spawn: (
+        _pid: number,
+        _tid: number,
+        _fnPtr: number,
+        _arg: number,
+      ): number => -ENOSYS,
+      kh_thread_release: (_hostThreadHandle: number): number => 0,
+      kh_thread_cancel: (_hostThreadHandle: number): number => 0,
     };
 
     // std-on-wasi panic-infra stubs for kernel.wasm itself.
@@ -2824,6 +2872,17 @@ export class KernelHostInterface {
       outPtr: number,
       outCap: number,
     ) => bigint;
+    const dispatchThread = instance.exports.kernel_dispatch_thread as
+      | ((
+        methodId: number,
+        callerPid: number,
+        callerTid: number,
+        inPtr: number,
+        inLen: number,
+        outPtr: number,
+        outCap: number,
+      ) => bigint)
+      | undefined;
     const kernelListProcesses = instance.exports.kernel_list_processes as
       | ((outPtr: number, outCap: number) => bigint)
       | undefined;
@@ -2920,6 +2979,7 @@ export class KernelHostInterface {
       scratchPtr,
       scratchLen,
       dispatch,
+      dispatchThread ?? null,
       dispatchAsync,
       kernelListProcesses ?? null,
       kernelListThreads ?? null,
@@ -2972,6 +3032,22 @@ export class KernelHostInterface {
     responseCap: number,
   ): { rc: bigint; response: Uint8Array } {
     return this.kernel.syscall(methodId, callerPid, request, responseCap);
+  }
+
+  kernelThreadSyscall(
+    methodId: number,
+    callerPid: number,
+    callerTid: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): { rc: bigint; response: Uint8Array } {
+    return this.kernel.threadSyscall(
+      methodId,
+      callerPid,
+      callerTid,
+      request,
+      responseCap,
+    );
   }
 
   kernelSyscallAsync(
