@@ -71,12 +71,43 @@ Required additional behavior:
 
 - Joining a joinable exited thread returns its exit value and reaps the record.
 - Joining a running joinable thread blocks the caller until exit.
+- Joining the calling thread rejects with the pthread-compatible deadlock error.
 - Joining a detached or unknown thread returns the pthread-compatible error.
 - Detaching a running thread marks it detached.
 - Detaching an exited unjoined thread reaps it.
 - Exiting the main thread maps to process exit; exiting a worker thread records
   the thread exit value and wakes joiners.
-- Thread self returns the Rust-owned tid mapping expected by the guest ABI.
+- Thread self preserves the existing guest ABI: the main thread reports pthread
+  id `0`; worker threads report their Rust-allocated tid values (`>= 2`).
+  Internally the Rust kernel may keep main as tid `1` for scheduler and
+  mutex-owner bookkeeping, but that value is not exposed as main
+  `pthread_self()`.
+
+## Caller Thread Identity
+
+Thread syscalls need an authenticated caller thread id. `sys_thread_self`,
+`sys_thread_exit`, `sys_thread_yield`, and blocking `sys_thread_join` cannot be
+implemented from `caller_pid` alone.
+
+The dispatch path must be extended so Rust receives both:
+
+- `caller_pid`: authenticated process id, as today.
+- `caller_tid`: authenticated kernel thread id within that process.
+
+The guest must not be allowed to put `caller_tid` in the request body and have
+Rust trust it. The value comes from the host adapter context:
+
+- Main-thread calls use the process main thread record (`kernel tid 1`,
+  guest-visible pthread id `0`).
+- Worker calls use the tid assigned by Rust during `sys_thread_spawn`.
+- Worker host-call proxy messages may carry their known worker tid to the
+  adapter, but the adapter validates it against the worker handle/session before
+  passing it into Rust dispatch.
+
+Implementation can add a `DispatchContext { caller_pid, caller_tid }`, a
+`dispatch_with_context(...)` entry point, or an equivalent trampoline-side
+context mechanism. The important invariant is that Rust thread lifecycle methods
+never infer the calling thread from guest-supplied bytes.
 
 ## ABI Shape
 
@@ -87,18 +118,27 @@ thread lifecycle surface:
 
 - `sys_thread_spawn`: request `u32 fn_ptr LE + u32 arg LE`; returns tid or
   negated errno.
-- `sys_thread_self`: no request; returns current tid.
-- `sys_thread_join`: request `u32 tid LE`; returns joined thread exit value or
-  negated errno.
+- `sys_thread_self`: no request; returns the current guest-visible pthread id
+  derived from authenticated `caller_tid`.
+- `sys_thread_join`: request `u32 tid LE`; response `u32 retval LE`; returns `0`
+  on success or negated errno. The return value is not sent through the scalar
+  return channel because valid wasm32 pointer-sized thread return values can
+  have the high bit set and collide with negated errno.
 - `sys_thread_detach`: request `u32 tid LE`; returns `0` or negated errno.
 - `sys_thread_exit`: request `i32 retval LE`; does not return to guest on the
-  calling thread. In adapter paths where unwinding is required, the adapter may
-  translate the successful syscall into its local unwind mechanism.
-- `sys_thread_yield`: no request; returns `0` or negated errno.
+  authenticated calling thread. In adapter paths where unwinding is required,
+  the adapter may translate the successful syscall into its local unwind
+  mechanism.
+- `sys_thread_yield`: no request; yields the authenticated calling thread and
+  returns `0` or negated errno.
 
 The current host import `host_thread_spawn(fn_ptr, arg)` should become a
 compatibility wrapper around `sys_thread_spawn` in the Rust-backed adapters, the
 same way `host_socket_set_no_delay` wraps `sys_socket_option`.
+
+`host_thread_join(tid)` remains the guest-facing compatibility import. Its
+Rust-backed wrapper calls `sys_thread_join`, reads the `u32 retval` response on
+success, and only then casts that value back to `void *` in the libc layer.
 
 ## Kernel-to-Host Interface
 
@@ -107,7 +147,7 @@ Add host imports for unsandboxable thread execution actions to
 
 - `kh_thread_spawn(pid, tid, fn_ptr, arg) -> i32 host_thread_handle | -errno`
   creates the host execution resource and starts or schedules the guest thread.
-- `kh_thread_detach(host_thread_handle) -> i32` lets the adapter release join
+- `kh_thread_release(host_thread_handle) -> i32` lets the adapter release join
   bookkeeping it owns.
 - `kh_thread_cancel(host_thread_handle) -> i32` is used for teardown of detached
   workers or process termination.
@@ -115,6 +155,18 @@ Add host imports for unsandboxable thread execution actions to
 The Rust kernel allocates the tid before calling `kh_thread_spawn`. If the host
 spawn fails, the kernel removes the pending thread record and returns the host
 errno to the guest.
+
+Rust must release adapter bookkeeping before removing any thread record that has
+a `host_thread_handle`. That release path is required for:
+
+- successful join reaping;
+- detach of an already-exited unjoined thread;
+- process teardown of detached or unjoined worker threads.
+
+The ordering is: read the handle from `ThreadRecord`, call
+`kh_thread_release(handle)` or `kh_thread_cancel(handle)` as appropriate, then
+remove or tombstone the Rust record. The record must not be dropped first,
+because that can lose the only handle the adapter needs for cleanup.
 
 The host adapter reports normal completion by calling the existing
 `kernel_record_thread_exit(pid, tid, retval)` control export, or by a new
@@ -167,8 +219,9 @@ Required Rust tests:
 - `sys_thread_detach` updates Rust state and rejects unknown tid.
 - `sys_thread_exit` records exit values and wakes/reaps according to
   joinability.
-- `sys_thread_join` returns exit values, blocks running threads using a
-  kernel-visible wait record, and rejects detached/unknown tid.
+- `sys_thread_join` returns `0` and writes exit values into the response buffer,
+  blocks running threads using a kernel-visible wait record, rejects self-join,
+  and rejects detached/unknown tid.
 - Snapshot/list-thread encoders reflect lifecycle changes.
 
 Required adapter tests:
