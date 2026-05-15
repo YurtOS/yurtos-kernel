@@ -5025,8 +5025,18 @@ export function createKernelImports(
     const tb = opts.threadsBackend;
     imports.host_thread_spawn = ((fnPtr: number, arg: number) =>
       tb.spawn(fnPtr, arg)) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_join = ((tid: number) =>
-      tb.join(tid)) as unknown as WebAssembly.ImportValue;
+    imports.host_thread_join = (async (tid: number, outRetvalPtr: number) => {
+      const retval = await tb.join(tid);
+      if (retval < 0) {
+        return retval;
+      }
+      const end = outRetvalPtr + 4;
+      if (outRetvalPtr < 0 || end > memory.buffer.byteLength) {
+        return ERR_IO;
+      }
+      new DataView(memory.buffer).setUint32(outRetvalPtr, retval >>> 0, true);
+      return 0;
+    }) as unknown as WebAssembly.ImportValue;
     imports.host_thread_detach = ((tid: number) =>
       tb.detach(tid)) as unknown as WebAssembly.ImportValue;
     imports.host_thread_exit = ((retval: number) => {
