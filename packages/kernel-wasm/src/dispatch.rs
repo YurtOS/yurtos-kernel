@@ -42,6 +42,13 @@ fn rights_queue_full(rights: &Option<Vec<FdEntry>>, queue_len: usize) -> bool {
         && queue_len >= crate::kernel::KERNEL_RIGHTS_QUEUE_CAP
 }
 
+fn kernel_only(caller_pid: u32, f: impl FnOnce() -> i64) -> i64 {
+    if caller_pid != KERNEL_PID {
+        return -(abi::EPERM as i64);
+    }
+    f()
+}
+
 pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     match method_id {
         METHOD_KERNEL_ECHO => echo(request, response),
@@ -50,17 +57,27 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
             kh::log(kh::LogSeverity::Info, "kernel.wasm hello via kh_log");
             0
         }
-        METHOD_KERNEL_PROVIDE_STDIN => provide_stdin(request),
-        METHOD_KERNEL_CLOSE_STDIN => close_stdin(request),
-        METHOD_KERNEL_DRAIN_STDOUT => drain_stream(request, response, /*stdout=*/ true),
-        METHOD_KERNEL_DRAIN_STDERR => drain_stream(request, response, /*stdout=*/ false),
-        METHOD_KERNEL_REGISTER_FILE => register_file(request),
-        METHOD_KERNEL_INSTALL_TAR_LAYER => install_tar_layer(request),
-        METHOD_KERNEL_INSTALL_HOST_FS_MOUNT => install_host_fs_mount(request),
-        METHOD_KERNEL_INSTALL_YURTFS => install_yurtfs(request),
-        METHOD_KERNEL_LIST_PROCESSES => list_processes_response(response),
-        METHOD_KERNEL_LIST_THREADS => list_threads_response(request, response),
-        METHOD_KERNEL_SCHEDULE_NEXT => schedule_next_response(response),
+        METHOD_KERNEL_PROVIDE_STDIN => kernel_only(caller_pid, || provide_stdin(request)),
+        METHOD_KERNEL_CLOSE_STDIN => kernel_only(caller_pid, || close_stdin(request)),
+        METHOD_KERNEL_DRAIN_STDOUT => kernel_only(caller_pid, || {
+            drain_stream(request, response, /*stdout=*/ true)
+        }),
+        METHOD_KERNEL_DRAIN_STDERR => kernel_only(caller_pid, || {
+            drain_stream(request, response, /*stdout=*/ false)
+        }),
+        METHOD_KERNEL_REGISTER_FILE => kernel_only(caller_pid, || register_file(request)),
+        METHOD_KERNEL_INSTALL_TAR_LAYER => kernel_only(caller_pid, || install_tar_layer(request)),
+        METHOD_KERNEL_INSTALL_HOST_FS_MOUNT => {
+            kernel_only(caller_pid, || install_host_fs_mount(request))
+        }
+        METHOD_KERNEL_INSTALL_YURTFS => kernel_only(caller_pid, || install_yurtfs(request)),
+        METHOD_KERNEL_LIST_PROCESSES => {
+            kernel_only(caller_pid, || list_processes_response(response))
+        }
+        METHOD_KERNEL_LIST_THREADS => {
+            kernel_only(caller_pid, || list_threads_response(request, response))
+        }
+        METHOD_KERNEL_SCHEDULE_NEXT => kernel_only(caller_pid, || schedule_next_response(response)),
         METHOD_SYS_WAIT => wait_response(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
@@ -1116,7 +1133,10 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             crate::kernel::FdEntry::Stdout | crate::kernel::FdEntry::Stderr => {
                 -(abi::EINVAL as i64) // not readable
             }
-            crate::kernel::FdEntry::Pipe { id, end: _ } => {
+            crate::kernel::FdEntry::Pipe {
+                id,
+                end: crate::kernel::PipeEnd::Read,
+            } => {
                 let buf = match k.pipe_buf_mut(id) {
                     Some(b) => b,
                     None => return -(abi::EBADF as i64),
@@ -1135,6 +1155,10 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                 }
                 take as i64
             }
+            crate::kernel::FdEntry::Pipe {
+                end: crate::kernel::PipeEnd::Write,
+                ..
+            } => -(abi::EBADF as i64),
             crate::kernel::FdEntry::File { ofd_id } => {
                 let (mount_id, inode, offset) = match k.ofd(ofd_id) {
                     Some(o) => (o.mount_id, o.inode, o.offset),
@@ -5979,6 +6003,20 @@ mod tests {
     }
 
     #[test]
+    fn pipe_read_from_write_end_is_ebadf() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut fds = [0u8; 8];
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds);
+        let write_fd = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+        let mut buf = [0u8; 16];
+
+        assert_eq!(
+            dispatch(METHOD_SYS_READ, 1, &write_fd.to_le_bytes(), &mut buf),
+            -(abi::EBADF as i64)
+        );
+    }
+
+    #[test]
     fn pipe_read_after_writer_closed_and_drained_is_eof() {
         let _g = crate::kernel::TestGuard::acquire();
         let mut fds = [0u8; 8];
@@ -8736,5 +8774,32 @@ mod tests {
         let mut reg = 1_u32.to_le_bytes().to_vec();
         reg.extend_from_slice(&7_u32.to_le_bytes());
         assert_eq!(dispatch(13, 0, &reg, &mut []), -(abi::ENOSYS as i64));
+    }
+
+    #[test]
+    fn user_processes_cannot_call_kernel_only_methods() {
+        let _g = crate::kernel::TestGuard::acquire();
+        let mut response = [0u8; 64];
+        let methods = [
+            METHOD_KERNEL_PROVIDE_STDIN,
+            METHOD_KERNEL_CLOSE_STDIN,
+            METHOD_KERNEL_DRAIN_STDOUT,
+            METHOD_KERNEL_DRAIN_STDERR,
+            METHOD_KERNEL_REGISTER_FILE,
+            METHOD_KERNEL_INSTALL_TAR_LAYER,
+            METHOD_KERNEL_INSTALL_HOST_FS_MOUNT,
+            METHOD_KERNEL_INSTALL_YURTFS,
+            METHOD_KERNEL_LIST_PROCESSES,
+            METHOD_KERNEL_LIST_THREADS,
+            METHOD_KERNEL_SCHEDULE_NEXT,
+        ];
+
+        for method in methods {
+            assert_eq!(
+                dispatch(method, 1, &[], &mut response),
+                -(abi::EPERM as i64),
+                "method {method} should be kernel-only"
+            );
+        }
     }
 }
