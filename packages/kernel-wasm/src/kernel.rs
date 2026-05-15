@@ -860,6 +860,22 @@ impl Kernel {
         self.unix_datagrams.get(path).copied()
     }
 
+    pub fn connect_unix_datagram(&mut self, id: u64, path: &[u8]) -> Result<(), i32> {
+        let Some(peer_id) = self.unix_datagrams.get(path).copied() else {
+            return Err(crate::abi::ECONNREFUSED);
+        };
+        let Some(socket) = self.sockets.get_mut(&id) else {
+            return Err(crate::abi::EBADF);
+        };
+        match &mut socket.kind {
+            SocketKind::UnixDatagram { peer_id: slot, .. } => {
+                *slot = Some(peer_id);
+                Ok(())
+            }
+            _ => Err(crate::abi::EOPNOTSUPP),
+        }
+    }
+
     pub fn has_unix_socket_inode(&self, path: &[u8]) -> bool {
         self.unix_socket_inodes.contains(path)
     }

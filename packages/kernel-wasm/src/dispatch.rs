@@ -2593,7 +2593,15 @@ fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
         };
         let (domain, sock_type, flags) = match &socket.kind {
             SocketKind::Open { flags, .. } => (socket.domain, socket.sock_type, *flags),
-            SocketKind::UnixDatagram { .. } => return -(abi::EOPNOTSUPP as i64),
+            SocketKind::UnixDatagram { .. } => {
+                if let Some(path) = unix_path_from_addr(addr) {
+                    return match k.connect_unix_datagram(id, path) {
+                        Ok(()) => 0,
+                        Err(errno) => -(errno as i64),
+                    };
+                }
+                return -(abi::EAFNOSUPPORT as i64);
+            }
             SocketKind::UnixStream { .. }
             | SocketKind::UnixListener { .. }
             | SocketKind::Host { .. } => return -(abi::EOPNOTSUPP as i64),
@@ -5259,6 +5267,60 @@ mod tests {
         assert_eq!(path_len, b"/tmp/dgram-sender.sock".len());
         assert_eq!(is_abstract, 0);
         assert_eq!(&response[12..12 + path_len], b"/tmp/dgram-sender.sock");
+    }
+
+    #[test]
+    fn af_unix_datagram_connect_allows_send_without_destination() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            3
+        );
+        assert_eq!(
+            dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+            4
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_BIND,
+                1,
+                &socket_bind_req(3, b"unix:/tmp/dgram-connect-server.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_CONNECT,
+                1,
+                &socket_connect_req(4, b"unix:/tmp/dgram-connect-server.sock"),
+                &mut []
+            ),
+            0
+        );
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_SEND,
+                1,
+                &socket_send_req(4, b"ping"),
+                &mut []
+            ),
+            4
+        );
+
+        let mut response = [0u8; 16];
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_SOCKET_RECV,
+                1,
+                &socket_recv_req(3, 0),
+                &mut response
+            ),
+            4
+        );
+        assert_eq!(&response[..4], b"ping");
     }
 
     #[test]

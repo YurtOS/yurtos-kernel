@@ -438,6 +438,49 @@ static int case_dgram_path_sendto(void) {
   return 0;
 }
 
+static int case_dgram_connect_send(void) {
+  const char *server_path = "/tmp/yurt-dgram-connect.sock";
+  struct sockaddr_un server_addr;
+  int server_fd, client_fd;
+  char buf[16];
+
+  memset(&server_addr, 0, sizeof(server_addr));
+  server_addr.sun_family = AF_UNIX;
+  strncpy(server_addr.sun_path, server_path, sizeof(server_addr.sun_path) - 1);
+  socklen_t addrlen = (socklen_t)sizeof(server_addr);
+
+  server_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (server_fd < 0) { emit("dgram_connect_send", 1, NULL, 1, errno); return 1; }
+  client_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (client_fd < 0) {
+    emit("dgram_connect_send", 1, NULL, 1, errno);
+    close(server_fd); return 1;
+  }
+
+  unlink(server_path);
+  if (bind(server_fd, (struct sockaddr *)&server_addr, addrlen) != 0) {
+    emit("dgram_connect_send", 1, "bind-fail", 1, errno);
+    close(server_fd); close(client_fd); return 1;
+  }
+  if (connect(client_fd, (struct sockaddr *)&server_addr, addrlen) != 0) {
+    emit("dgram_connect_send", 1, "connect-fail", 1, errno);
+    close(server_fd); close(client_fd); unlink(server_path); return 1;
+  }
+  if (send(client_fd, "ping", 4, 0) != 4) {
+    emit("dgram_connect_send", 1, "send-fail", 1, errno);
+    close(server_fd); close(client_fd); unlink(server_path); return 1;
+  }
+  ssize_t n = recv(server_fd, buf, sizeof(buf), 0);
+  if (n != 4 || memcmp(buf, "ping", 4) != 0) {
+    emit("dgram_connect_send", 1, "recv-fail", 1, errno);
+    close(server_fd); close(client_fd); unlink(server_path); return 1;
+  }
+
+  close(server_fd); close(client_fd); unlink(server_path);
+  emit("dgram_connect_send", 0, "dgram-connect=ok", 0, 0);
+  return 0;
+}
+
 static int case_scm_rights_pipe_handoff(void) {
   int sv[2];
   int pipefd[2];
@@ -1197,6 +1240,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "abstract_invisible_to_stat") == 0) return case_abstract_invisible_to_stat();
   if (strcmp(name, "dgram_pair_message_framing") == 0) return case_dgram_pair_message_framing();
   if (strcmp(name, "dgram_path_sendto") == 0)          return case_dgram_path_sendto();
+  if (strcmp(name, "dgram_connect_send") == 0)         return case_dgram_connect_send();
   if (strcmp(name, "scm_rights_pipe_handoff") == 0)    return case_scm_rights_pipe_handoff();
   if (strcmp(name, "peercred_after_accept") == 0)      return case_peercred_after_accept();
   if (strcmp(name, "dgram_sendto_after_unlink") == 0)  return case_dgram_sendto_after_unlink();
@@ -1226,6 +1270,7 @@ static int list_cases(void) {
   puts("abstract_invisible_to_stat");
   puts("dgram_pair_message_framing");
   puts("dgram_path_sendto");
+  puts("dgram_connect_send");
   puts("scm_rights_pipe_handoff");
   puts("peercred_after_accept");
   puts("dgram_sendto_after_unlink");
