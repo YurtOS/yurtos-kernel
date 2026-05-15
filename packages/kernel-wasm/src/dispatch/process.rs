@@ -370,7 +370,13 @@ fn encode_thread_list(entries: &[crate::kernel::ThreadRecord]) -> Vec<u8> {
         });
         out.push(u8::from(entry.detached));
         out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&entry.exit_value.unwrap_or(-1).to_le_bytes());
+        out.extend_from_slice(
+            &entry
+                .exit_value
+                .map(|exit_value| exit_value as i32)
+                .unwrap_or(-1)
+                .to_le_bytes(),
+        );
         out.extend_from_slice(&entry.host_thread_handle.unwrap_or(-1).to_le_bytes());
     }
     out
@@ -418,6 +424,7 @@ pub(crate) const SNAPSHOT_SECTION_RUNNABLE_THREADS: u32 = 4;
 fn wait_reason_code(reason: crate::kernel::WaitReason) -> u32 {
     match reason {
         crate::kernel::WaitReason::HostBlock => 1,
+        crate::kernel::WaitReason::ThreadJoin { .. } => 2,
     }
 }
 

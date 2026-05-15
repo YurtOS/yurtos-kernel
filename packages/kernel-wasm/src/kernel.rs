@@ -28,6 +28,10 @@ pub type Tid = u32;
 
 pub const DEFAULT_UMASK: u16 = 0o022;
 pub const MAIN_THREAD_TID: Tid = 1;
+#[allow(dead_code)]
+pub const GUEST_MAIN_PTHREAD_ID: Tid = 0;
+pub const FIRST_WORKER_TID: Tid = 2;
+pub const MAX_GUEST_THREAD_ID: Tid = i32::MAX as u32;
 
 /// `(soft, hard)` resource limits. `u64::MAX` means RLIM_INFINITY.
 pub type ResourceLimit = (u64, u64);
@@ -63,6 +67,12 @@ pub enum ThreadState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WaitReason {
     HostBlock,
+    ThreadJoin { target_tid: Tid },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinResult {
+    Completed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,9 +80,10 @@ pub struct ThreadRecord {
     pub tid: Tid,
     pub state: ThreadState,
     pub detached: bool,
-    pub exit_value: Option<i32>,
+    pub exit_value: Option<u32>,
     pub host_thread_handle: Option<i32>,
     pub wait_reason: Option<WaitReason>,
+    pub waiter_tid: Option<Tid>,
 }
 
 impl ThreadRecord {
@@ -84,6 +95,7 @@ impl ThreadRecord {
             exit_value: None,
             host_thread_handle,
             wait_reason: None,
+            waiter_tid: None,
         }
     }
 }
@@ -486,6 +498,7 @@ pub struct Kernel {
     /// Last `(pid, tid)` handed to the host scheduler. The next pick rotates
     /// after this entry among runnable threads.
     last_scheduled: Option<(Pid, Tid)>,
+    pending_thread_releases: Vec<i32>,
 }
 
 /// One staged sys_spawn waiting for the host to instantiate it.
@@ -555,6 +568,7 @@ impl Kernel {
             next_spawn_pid: 1000,
             next_host_pid: 1,
             last_scheduled: None,
+            pending_thread_releases: Vec::new(),
         }
     }
 
@@ -1147,7 +1161,10 @@ impl Kernel {
                         pid: *pid,
                         tid: *tid,
                         reason,
-                        detail: 0,
+                        detail: match reason {
+                            WaitReason::HostBlock => 0,
+                            WaitReason::ThreadJoin { target_tid } => target_tid,
+                        },
                     })
                 })
             })
@@ -1212,9 +1229,43 @@ impl Kernel {
     // lifecycle before host backends start calling into it.
     #[allow(dead_code)]
     pub fn spawn_thread(&mut self, pid: Pid, host_thread_handle: Option<i32>) -> Option<Tid> {
-        let p = self.processes.get_mut(&pid)?;
-        let tid = p.next_tid.max(1);
+        let tid = self.reserve_thread_id(pid).ok()?;
+        self.bind_thread_handle(pid, tid, host_thread_handle).ok()?;
+        Some(tid)
+    }
+
+    #[allow(dead_code)]
+    pub fn reserve_thread_id(&mut self, pid: Pid) -> Result<Tid, i32> {
+        let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
+        p.ensure_main_thread(None);
+        let tid = p.next_tid.max(FIRST_WORKER_TID);
+        if tid > MAX_GUEST_THREAD_ID {
+            return Err(crate::abi::EAGAIN);
+        }
         p.next_tid = tid.saturating_add(1);
+        Ok(tid)
+    }
+
+    #[allow(dead_code)]
+    pub fn rollback_reserved_thread(&mut self, pid: Pid, tid: Tid) -> Result<(), i32> {
+        let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
+        if p.next_tid == tid.saturating_add(1) {
+            p.next_tid = tid;
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn bind_thread_handle(
+        &mut self,
+        pid: Pid,
+        tid: Tid,
+        host_thread_handle: Option<i32>,
+    ) -> Result<(), i32> {
+        let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
+        if p.threads.contains_key(&tid) {
+            return Err(crate::abi::EEXIST);
+        }
         p.threads.insert(
             tid,
             ThreadRecord {
@@ -1224,25 +1275,114 @@ impl Kernel {
                 exit_value: None,
                 host_thread_handle,
                 wait_reason: None,
+                waiter_tid: None,
             },
         );
-        Some(tid)
+        Ok(())
     }
 
     #[allow(dead_code)]
-    pub fn detach_thread(&mut self, pid: Pid, tid: Tid) -> Option<()> {
-        let thread = self.processes.get_mut(&pid)?.threads.get_mut(&tid)?;
-        thread.detached = true;
-        Some(())
+    pub fn detach_thread(&mut self, pid: Pid, tid: Tid) -> Result<(), i32> {
+        let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
+        let thread = p.threads.get_mut(&tid).ok_or(crate::abi::ESRCH)?;
+        if thread.waiter_tid.is_some() {
+            return Err(crate::abi::EINVAL);
+        }
+        if thread.state == ThreadState::Exited {
+            if let Some(handle) = thread.host_thread_handle {
+                self.pending_thread_releases.push(handle);
+            }
+            p.threads.remove(&tid);
+        } else {
+            thread.detached = true;
+        }
+        Ok(())
     }
 
     #[allow(dead_code)]
-    pub fn exit_thread(&mut self, pid: Pid, tid: Tid, exit_value: i32) -> Option<()> {
-        let thread = self.processes.get_mut(&pid)?.threads.get_mut(&tid)?;
+    pub fn exit_thread(&mut self, pid: Pid, tid: Tid, exit_value: i32) -> Result<(), i32> {
+        self.exit_thread_authenticated(pid, tid, exit_value as u32)
+            .map(|_| ())
+    }
+
+    #[allow(dead_code)]
+    pub fn exit_thread_authenticated(
+        &mut self,
+        pid: Pid,
+        tid: Tid,
+        exit_value: u32,
+    ) -> Result<Option<Tid>, i32> {
+        let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
+        let thread = p.threads.get_mut(&tid).ok_or(crate::abi::ESRCH)?;
         thread.state = ThreadState::Exited;
         thread.exit_value = Some(exit_value);
         thread.wait_reason = None;
-        Some(())
+        let waiter_tid = thread.waiter_tid;
+        let should_reap = thread.detached && waiter_tid.is_none();
+        let host_thread_handle = thread.host_thread_handle;
+        if let Some(waiter_tid) = waiter_tid {
+            if let Some(waiter) = p.threads.get_mut(&waiter_tid) {
+                waiter.state = ThreadState::Runnable;
+                waiter.wait_reason = None;
+            }
+        }
+        if should_reap {
+            if let Some(handle) = host_thread_handle {
+                self.pending_thread_releases.push(handle);
+            }
+            p.threads.remove(&tid);
+        }
+        Ok(waiter_tid)
+    }
+
+    #[allow(dead_code)]
+    pub fn begin_thread_join(
+        &mut self,
+        pid: Pid,
+        waiter_tid: Tid,
+        target_tid: Tid,
+        retval_out: &mut [u8],
+    ) -> Result<JoinResult, i32> {
+        if retval_out.len() < 4 {
+            return Err(crate::abi::EINVAL);
+        }
+        if waiter_tid == target_tid {
+            return Err(crate::abi::EDEADLK);
+        }
+
+        let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
+        let target = p.threads.get(&target_tid).ok_or(crate::abi::ESRCH)?;
+        if target.detached {
+            return Err(crate::abi::EINVAL);
+        }
+        if target.state == ThreadState::Exited {
+            let retval = target.exit_value.unwrap_or(0);
+            let host_thread_handle = target.host_thread_handle;
+            retval_out[..4].copy_from_slice(&retval.to_le_bytes());
+            if let Some(handle) = host_thread_handle {
+                self.pending_thread_releases.push(handle);
+            }
+            p.threads.remove(&target_tid);
+            return Ok(JoinResult::Completed);
+        }
+        if target.waiter_tid.is_some() {
+            return Err(crate::abi::EBUSY);
+        }
+        if !p.threads.contains_key(&waiter_tid) {
+            return Err(crate::abi::ESRCH);
+        }
+
+        p.threads
+            .get_mut(&target_tid)
+            .expect("target checked above")
+            .waiter_tid = Some(waiter_tid);
+        let waiter = p
+            .threads
+            .get_mut(&waiter_tid)
+            .expect("waiter checked above");
+        waiter.state = ThreadState::Blocked;
+        waiter.wait_reason = Some(WaitReason::ThreadJoin { target_tid });
+        Err(crate::abi::EAGAIN)
     }
 
     #[allow(dead_code)]
@@ -1253,6 +1393,11 @@ impl Kernel {
             thread.wait_reason = Some(WaitReason::HostBlock);
         }
         Some(())
+    }
+
+    #[cfg(test)]
+    pub fn take_thread_releases_for_test(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.pending_thread_releases)
     }
 
     #[allow(dead_code)]
@@ -1363,6 +1508,7 @@ pub fn reset_for_tests() {
     k.next_host_pid = 1;
     k.next_spawn_pid = 1000;
     k.last_scheduled = None;
+    k.pending_thread_releases.clear();
 }
 
 /// Native unit tests share the same `static KERNEL` and run in
@@ -1580,6 +1726,105 @@ mod tests {
                 .expect("worker thread")
         });
         assert_eq!(runnable.state, ThreadState::Runnable);
+    }
+
+    #[test]
+    fn thread_ids_stop_at_i32_max() {
+        let _g = TestGuard::acquire();
+        let pid = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(70));
+            k.process_existing_mut(pid).unwrap().next_tid = i32::MAX as u32;
+            pid
+        });
+
+        assert_eq!(
+            with_kernel(|k| k.reserve_thread_id(pid)),
+            Ok(i32::MAX as u32)
+        );
+        assert_eq!(
+            with_kernel(|k| k.reserve_thread_id(pid)),
+            Err(crate::abi::EAGAIN)
+        );
+    }
+
+    #[test]
+    fn join_running_thread_blocks_one_waiter() {
+        let _g = TestGuard::acquire();
+        let (pid, target) = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(80));
+            let target = k.spawn_thread(pid, Some(81)).expect("thread spawn");
+            (pid, target)
+        });
+
+        assert_eq!(
+            with_kernel(|k| k.begin_thread_join(pid, MAIN_THREAD_TID, target, &mut [0; 4])),
+            Err(crate::abi::EAGAIN)
+        );
+        assert_eq!(
+            with_kernel(|k| k.begin_thread_join(pid, 3, target, &mut [0; 4])),
+            Err(crate::abi::EBUSY)
+        );
+
+        let waiter = with_kernel(|k| {
+            k.process(pid)
+                .threads
+                .get(&MAIN_THREAD_TID)
+                .expect("waiter")
+                .clone()
+        });
+        assert_eq!(waiter.state, ThreadState::Blocked);
+        assert_eq!(
+            waiter.wait_reason,
+            Some(WaitReason::ThreadJoin { target_tid: target })
+        );
+    }
+
+    #[test]
+    fn exited_join_writes_u32_retval_and_releases_handle() {
+        let _g = TestGuard::acquire();
+        let (pid, target) = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(90));
+            let target = k.spawn_thread(pid, Some(91)).expect("thread spawn");
+            k.exit_thread_authenticated(pid, target, 0x8000_0001)
+                .expect("thread exit");
+            (pid, target)
+        });
+
+        let mut out = [0; 4];
+        assert_eq!(
+            with_kernel(|k| k.begin_thread_join(pid, MAIN_THREAD_TID, target, &mut out)),
+            Ok(JoinResult::Completed)
+        );
+        assert_eq!(u32::from_le_bytes(out), 0x8000_0001);
+        assert!(with_kernel(|k| k
+            .process(pid)
+            .threads
+            .get(&target)
+            .is_none()));
+        assert_eq!(with_kernel(|k| k.take_thread_releases_for_test()), vec![91]);
+    }
+
+    #[test]
+    fn detach_rejects_target_with_pending_join() {
+        let _g = TestGuard::acquire();
+        let (pid, target) = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(100));
+            let target = k.spawn_thread(pid, Some(101)).expect("thread spawn");
+            (pid, target)
+        });
+
+        assert_eq!(
+            with_kernel(|k| k.begin_thread_join(pid, MAIN_THREAD_TID, target, &mut [0; 4])),
+            Err(crate::abi::EAGAIN)
+        );
+        assert_eq!(
+            with_kernel(|k| k.detach_thread(pid, target)),
+            Err(crate::abi::EINVAL)
+        );
     }
 
     #[test]
