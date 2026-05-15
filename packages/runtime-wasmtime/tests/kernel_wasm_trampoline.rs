@@ -2340,6 +2340,38 @@ fn wasmtime_registers_new_af_unix_socket_syscalls() {
 }
 
 #[test]
+fn wasmtime_registers_all_vfs_process_syscall_imports() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_chmod" (func $chmod (param i32 i32 i32) (result i32)))
+          (import "env" "sys_chown" (func $chown (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_utimens" (func $utimens (param i64 i32 i32) (result i32)))
+          (import "env" "sys_unlink" (func $unlink (param i32 i32) (result i32)))
+          (import "env" "sys_stat" (func $stat (param i32 i32 i32) (result i32)))
+          (import "env" "sys_symlink" (func $symlink (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_readlink" (func $readlink (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_mkdir" (func $mkdir (param i32 i32) (result i32)))
+          (import "env" "sys_rmdir" (func $rmdir (param i32 i32) (result i32)))
+          (import "env" "sys_readdir" (func $readdir (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_wait" (func $wait (param i32 i32 i32) (result i32)))
+          (import "env" "sys_link" (func $link (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_rename" (func $rename (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_spawn" (func $spawn (param i32 i32) (result i32)))
+          (import "env" "sys_extension_invoke"
+            (func $extension_invoke (param i32 i32 i32 i32) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 32) "/missing")
+          (func (export "missing_stat") (result i32)
+            (call $stat (i32.const 32) (i32.const 8) (i32.const 64))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.call_export_i32("missing_stat").unwrap(), -2);
+}
+
+#[test]
 fn user_process_pipe_dup_keeps_writer_alive() {
     // dup() on a pipe end must increment the kernel-side refcount;
     // closing the original fd should not collapse the buffer.

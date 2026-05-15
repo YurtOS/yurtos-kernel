@@ -3009,7 +3009,9 @@ fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
         }
         wasm.truncate(n as usize);
 
-        let child_pid = k.alloc_spawn_pid();
+        let Some(child_pid) = k.try_alloc_spawn_pid() else {
+            return -(abi::EAGAIN as i64);
+        };
         // Wire POSIX fork-like inheritance before exec: cwd,
         // credentials, resource limits, signal dispositions, process
         // group/session, scheduler state, and the open fd table all

@@ -60,6 +60,15 @@ fn raw_output<'a>(ptr: *mut u8, len: usize) -> Result<&'a mut [u8], i64> {
     Ok(unsafe { core::slice::from_raw_parts_mut(ptr, len) })
 }
 
+fn ranges_overlap(a_ptr: usize, a_len: usize, b_ptr: usize, b_len: usize) -> Result<bool, i64> {
+    if a_len == 0 || b_len == 0 {
+        return Ok(false);
+    }
+    let a_end = a_ptr.checked_add(a_len).ok_or(-(abi::EINVAL as i64))?;
+    let b_end = b_ptr.checked_add(b_len).ok_or(-(abi::EINVAL as i64))?;
+    Ok(a_ptr < b_end && b_ptr < a_end)
+}
+
 /// Offset of [`SCRATCH`] within this kernel instance's linear memory.
 #[no_mangle]
 pub extern "C" fn kernel_scratch_ptr() -> u32 {
@@ -90,7 +99,8 @@ pub extern "C" fn kernel_scratch_len() -> u32 {
 /// # Safety
 ///
 /// The kernel-host interface guarantees both slices live entirely inside this
-/// kernel instance's linear memory and do not overlap.
+/// kernel instance's linear memory. The export rejects overlapping request and
+/// response ranges before forming Rust references.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_dispatch(
     method_id: u32,
@@ -100,6 +110,11 @@ pub unsafe extern "C" fn kernel_dispatch(
     out_ptr: *mut u8,
     out_cap: usize,
 ) -> i64 {
+    match ranges_overlap(in_ptr as usize, in_len, out_ptr as usize, out_cap) {
+        Ok(false) => {}
+        Ok(true) => return -(abi::EINVAL as i64),
+        Err(rc) => return rc,
+    }
     let request = match raw_input(in_ptr, in_len) {
         Ok(slice) => slice,
         Err(rc) => return rc,
@@ -363,6 +378,22 @@ mod tests {
             )
         };
         assert_eq!(rc, -(abi::ENOSYS as i64));
+    }
+
+    #[test]
+    fn kernel_dispatch_rejects_overlapping_request_and_response() {
+        let mut buf = [0u8; 16];
+        let rc = unsafe {
+            kernel_dispatch(
+                0xDEAD_BEEF,
+                0,
+                buf.as_ptr(),
+                8,
+                buf.as_mut_ptr().wrapping_add(4),
+                8,
+            )
+        };
+        assert_eq!(rc, -(abi::EINVAL as i64));
     }
 
     #[test]

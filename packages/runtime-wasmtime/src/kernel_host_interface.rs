@@ -20,7 +20,9 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::{anyhow, Context, Result};
 use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, TypedFunc};
@@ -47,12 +49,70 @@ const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
 const EINVAL: i64 = 22;
 const E2BIG: i64 = 7;
+const EIO: i64 = 5;
 const ENOSYS: i64 = 38;
 const DEFAULT_EPOCH_DEADLINE: u64 = u64::MAX / 2;
+const FETCH_EXECUTOR_QUEUE_CAP: usize = 64;
 
 /// Public re-export so the engine adapter (`engine::WasmtimeCtx`)
 /// can return the same EFAULT value our trampoline uses internally.
 pub(crate) const EFAULT_PUB: i64 = EFAULT;
+
+struct FetchJob {
+    request: Vec<u8>,
+    response: mpsc::Sender<Vec<u8>>,
+}
+
+struct FetchExecutor {
+    queue: mpsc::SyncSender<FetchJob>,
+}
+
+static FETCH_EXECUTOR: std::sync::OnceLock<std::result::Result<FetchExecutor, String>> =
+    std::sync::OnceLock::new();
+
+fn fetch_executor() -> std::result::Result<&'static FetchExecutor, i64> {
+    match FETCH_EXECUTOR.get_or_init(start_fetch_executor) {
+        Ok(executor) => Ok(executor),
+        Err(_) => Err(-EIO),
+    }
+}
+
+fn start_fetch_executor() -> std::result::Result<FetchExecutor, String> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("kh_fetch_blocking: build current-thread tokio runtime: {e}"))?;
+    let (queue, jobs) = mpsc::sync_channel::<FetchJob>(FETCH_EXECUTOR_QUEUE_CAP);
+    thread::Builder::new()
+        .name("yurt-kh-fetch".to_owned())
+        .spawn(move || {
+            while let Ok(job) = jobs.recv() {
+                let response = rt.block_on(crate::wasm::network::fetch(&job.request));
+                let _ = job.response.send(response);
+            }
+        })
+        .map_err(|e| format!("kh_fetch_blocking: spawn fetch worker: {e}"))?;
+    Ok(FetchExecutor { queue })
+}
+
+fn run_fetch_blocking(request: Vec<u8>) -> std::result::Result<Vec<u8>, i64> {
+    let executor = fetch_executor()?;
+    let (response_tx, response_rx) = mpsc::channel();
+    let job = FetchJob {
+        request,
+        response: response_tx,
+    };
+    match executor.queue.try_send(job) {
+        Ok(()) => response_rx.recv().map_err(|_| -EIO),
+        Err(mpsc::TrySendError::Full(_)) => Err(-EAGAIN),
+        Err(mpsc::TrySendError::Disconnected(_)) => Err(-EIO),
+    }
+}
+
+#[cfg(test)]
+fn fetch_executor_queue_capacity_for_tests() -> usize {
+    FETCH_EXECUTOR_QUEUE_CAP
+}
 
 fn kernel_memory(caller: &mut Caller<'_, KernelStoreData>) -> std::result::Result<Memory, i64> {
     caller
@@ -117,6 +177,7 @@ mod sys_method_id {
     pub const SETRLIMIT: u32 = 0x1_000D;
     pub const CLOSE: u32 = 0x1_000E;
     pub const DUP: u32 = 0x1_000F;
+    pub const EXTENSION_INVOKE: u32 = 0x1_0010;
     pub const DUP2: u32 = 0x1_0011;
     pub const PIPE: u32 = 0x1_0012;
     pub const READ: u32 = 0x1_0013;
@@ -134,6 +195,20 @@ mod sys_method_id {
     pub const OPEN: u32 = 0x1_001F;
     pub const LSEEK: u32 = 0x1_0020;
     pub const FSTAT: u32 = 0x1_0021;
+    pub const CHMOD: u32 = 0x1_0022;
+    pub const CHOWN: u32 = 0x1_0023;
+    pub const UTIMENS: u32 = 0x1_0024;
+    pub const UNLINK: u32 = 0x1_0025;
+    pub const STAT: u32 = 0x1_0026;
+    pub const SYMLINK: u32 = 0x1_0027;
+    pub const READLINK: u32 = 0x1_0028;
+    pub const MKDIR: u32 = 0x1_0029;
+    pub const RMDIR: u32 = 0x1_002A;
+    pub const READDIR: u32 = 0x1_002B;
+    pub const WAIT: u32 = 0x1_002C;
+    pub const LINK: u32 = 0x1_002D;
+    pub const RENAME: u32 = 0x1_002E;
+    pub const SPAWN: u32 = 0x1_002F;
     pub const FETCH: u32 = 0x1_0030;
     pub const SOCKET_CONNECT: u32 = 0x1_0031;
     pub const SOCKET_SEND: u32 = 0x1_0032;
@@ -3356,20 +3431,10 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             if caller.data().host.policy.may_fetch(&request) == PolicyDecision::Deny {
                 return -EACCES;
             }
-            // Run the async fetch on a fresh OS thread so the
-            // implementation is the same whether the caller is
-            // inside a tokio runtime (`#[tokio::test]`, embedder
-            // server context) or not. block_on inside an existing
-            // runtime is illegal; spawning a thread sidesteps it.
-            let response = std::thread::spawn(move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("kh_fetch_blocking: build current-thread tokio runtime");
-                rt.block_on(crate::wasm::network::fetch(&request))
-            })
-            .join()
-            .unwrap_or_else(|_| Vec::new());
+            let response = match run_fetch_blocking(request) {
+                Ok(response) => response,
+                Err(rc) => return rc,
+            };
             let bytes = response.as_slice();
             if (bytes.len() as u32) > out_cap {
                 return -E2BIG;
@@ -3656,6 +3721,28 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 sys_method_id::SETRLIMIT,
                 &req,
             ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_extension_invoke",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::EXTENSION_INVOKE,
+                &req,
+                out_ptr,
+                out_cap,
+            )
         },
     )?;
     linker.func_wrap(
@@ -4044,6 +4131,284 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             } else {
                 rc as i32
             }
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_chmod",
+        |mut caller: Caller<'_, UserState>, mode: i32, path_ptr: u32, path_len: u32| -> i32 {
+            let path = match read_user_guest_bytes(&mut caller, path_ptr, path_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let mut req = Vec::with_capacity(4 + path.len());
+            req.extend_from_slice(&(mode as u32).to_le_bytes());
+            req.extend_from_slice(&path);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::CHMOD,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_chown",
+        |mut caller: Caller<'_, UserState>,
+         uid: i32,
+         gid: i32,
+         path_ptr: u32,
+         path_len: u32|
+         -> i32 {
+            let path = match read_user_guest_bytes(&mut caller, path_ptr, path_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let mut req = Vec::with_capacity(8 + path.len());
+            req.extend_from_slice(&(uid as u32).to_le_bytes());
+            req.extend_from_slice(&(gid as u32).to_le_bytes());
+            req.extend_from_slice(&path);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::CHOWN,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_utimens",
+        |mut caller: Caller<'_, UserState>, mtime_ns: i64, path_ptr: u32, path_len: u32| -> i32 {
+            let path = match read_user_guest_bytes(&mut caller, path_ptr, path_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let mut req = Vec::with_capacity(8 + path.len());
+            req.extend_from_slice(&(mtime_ns as u64).to_le_bytes());
+            req.extend_from_slice(&path);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::UTIMENS,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_unlink",
+        |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32| -> i32 {
+            forward_user_ptr_len(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::UNLINK,
+                path_ptr,
+                path_len,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_stat",
+        |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32, out_ptr: u32| -> i32 {
+            let path = match read_user_guest_bytes(&mut caller, path_ptr, path_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let rc = forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::STAT,
+                &path,
+                out_ptr,
+                16,
+            );
+            if rc == 16 {
+                0
+            } else {
+                rc as i32
+            }
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_symlink",
+        |mut caller: Caller<'_, UserState>,
+         target_ptr: u32,
+         target_len: u32,
+         link_ptr: u32,
+         link_len: u32|
+         -> i32 {
+            let target = match read_user_guest_bytes(&mut caller, target_ptr, target_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let link = match read_user_guest_bytes(&mut caller, link_ptr, link_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let mut req = Vec::with_capacity(4 + target.len() + link.len());
+            req.extend_from_slice(&target_len.to_le_bytes());
+            req.extend_from_slice(&target);
+            req.extend_from_slice(&link);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SYMLINK,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_readlink",
+        |mut caller: Caller<'_, UserState>,
+         path_ptr: u32,
+         path_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 {
+            let path = match read_user_guest_bytes(&mut caller, path_ptr, path_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::READLINK,
+                &path,
+                out_ptr,
+                out_cap,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_mkdir",
+        |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32| -> i32 {
+            forward_user_ptr_len(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::MKDIR,
+                path_ptr,
+                path_len,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_rmdir",
+        |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32| -> i32 {
+            forward_user_ptr_len(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::RMDIR,
+                path_ptr,
+                path_len,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_readdir",
+        |mut caller: Caller<'_, UserState>,
+         path_ptr: u32,
+         path_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 {
+            let path = match read_user_guest_bytes(&mut caller, path_ptr, path_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::READDIR,
+                &path,
+                out_ptr,
+                out_cap,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_wait",
+        |mut caller: Caller<'_, UserState>, child_pid: i32, flags: i32, out_ptr: u32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(child_pid as u32).to_le_bytes());
+            req.extend_from_slice(&(flags as u32).to_le_bytes());
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::WAIT,
+                &req,
+                out_ptr,
+                8,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_link",
+        |mut caller: Caller<'_, UserState>,
+         target_ptr: u32,
+         target_len: u32,
+         link_ptr: u32,
+         link_len: u32|
+         -> i32 {
+            let target = match read_user_guest_bytes(&mut caller, target_ptr, target_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let link = match read_user_guest_bytes(&mut caller, link_ptr, link_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let mut req = Vec::with_capacity(4 + target.len() + link.len());
+            req.extend_from_slice(&target_len.to_le_bytes());
+            req.extend_from_slice(&target);
+            req.extend_from_slice(&link);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::LINK,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_rename",
+        |mut caller: Caller<'_, UserState>,
+         old_ptr: u32,
+         old_len: u32,
+         new_ptr: u32,
+         new_len: u32|
+         -> i32 {
+            let old_path = match read_user_guest_bytes(&mut caller, old_ptr, old_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let new_path = match read_user_guest_bytes(&mut caller, new_ptr, new_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let mut req = Vec::with_capacity(4 + old_path.len() + new_path.len());
+            req.extend_from_slice(&old_len.to_le_bytes());
+            req.extend_from_slice(&old_path);
+            req.extend_from_slice(&new_path);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::RENAME,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_spawn",
+        |mut caller: Caller<'_, UserState>, req_ptr: u32, req_len: u32| -> i32 {
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SPAWN,
+                &req,
+            ) as i32
         },
     )?;
 
@@ -4628,5 +4993,12 @@ mod tests {
             Err(-E2BIG)
         );
         assert_eq!(checked_guest_buffer_sum(&[u32::MAX, 1]), Err(-E2BIG));
+    }
+
+    #[test]
+    fn fetch_executor_uses_a_bounded_shared_worker_queue() {
+        let cap = fetch_executor_queue_capacity_for_tests();
+        assert!(cap > 0);
+        assert!(cap <= 128);
     }
 }

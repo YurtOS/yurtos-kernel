@@ -617,20 +617,29 @@ impl Kernel {
             p.next_tid = 2;
         }
         if parent_pid != 0 {
-            let parent = self.process_mut(parent_pid);
-            if !parent.children.contains(&pid) {
-                parent.children.push(pid);
+            if let Some(parent) = self.processes.get_mut(&parent_pid) {
+                if !parent.children.contains(&pid) {
+                    parent.children.push(pid);
+                }
             }
         }
     }
 
-    /// Allocate the next pid for a sys_spawn child and bump the
-    /// counter. Pids stay above 1000 to leave room for host-
-    /// allocated user processes.
-    pub fn alloc_spawn_pid(&mut self) -> Pid {
-        let pid = self.next_spawn_pid;
-        self.next_spawn_pid = self.next_spawn_pid.saturating_add(1);
-        pid
+    /// Try to allocate the next pid for a sys_spawn child. Pids stay
+    /// above 1000 to leave room for host-allocated user processes.
+    pub fn try_alloc_spawn_pid(&mut self) -> Option<Pid> {
+        let first = self.next_spawn_pid.max(1000);
+        let mut pid = first;
+        loop {
+            if !self.processes.contains_key(&pid) {
+                self.next_spawn_pid = pid.checked_add(1).unwrap_or(1000);
+                return Some(pid);
+            }
+            pid = pid.checked_add(1).unwrap_or(1000);
+            if pid == first {
+                return None;
+            }
+        }
     }
 
     /// Push a freshly-staged spawn onto the queue.
@@ -1417,6 +1426,17 @@ mod tests {
     }
 
     #[test]
+    fn insert_host_process_does_not_create_unknown_parent() {
+        let _g = TestGuard::acquire();
+        with_kernel(|k| {
+            k.insert_host_process(7, 999, vec![b"/bin/app".to_vec()], Some(11));
+        });
+
+        assert!(with_kernel(|k| k.has_process(7)));
+        assert!(!with_kernel(|k| k.has_process(999)));
+    }
+
+    #[test]
     fn try_alloc_host_pid_returns_none_when_low_pid_range_is_exhausted() {
         let _g = TestGuard::acquire();
         let exhausted = with_kernel(|k| {
@@ -1426,6 +1446,18 @@ mod tests {
             k.try_alloc_host_pid()
         });
         assert_eq!(exhausted, None);
+    }
+
+    #[test]
+    fn try_alloc_spawn_pid_wraps_without_reusing_occupied_max_pid() {
+        let _g = TestGuard::acquire();
+        let allocated = with_kernel(|k| {
+            k.next_spawn_pid = Pid::MAX;
+            k.process_mut(Pid::MAX);
+            k.try_alloc_spawn_pid()
+        });
+        assert_eq!(allocated, Some(1000));
+        assert!(!with_kernel(|k| k.has_process(1000)));
     }
 
     #[test]
