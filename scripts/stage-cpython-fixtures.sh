@@ -3,8 +3,8 @@
 # (packages/kernel/src/__tests__/cpython3-pyzmq_smoke_test.ts) needs.
 #
 # Inputs (built externally in the yurt-ports repo):
-#   ../yurt-ports/ports/cpython/build/dist/cpython-3.14.4-yurt_0.yurtpkg
-#   ../yurt-ports/ports/pyzmq/build/dist/pyzmq-26.4.0-yurt_0.yurtpkg
+#   $YURT_PORTS_ROOT/ports/cpython/build/dist/cpython-3.14.4-yurt_0.yurtpkg
+#   $YURT_PORTS_ROOT/ports/pyzmq/build/dist/pyzmq-26.4.0-yurt_0.yurtpkg
 #
 # Outputs (written under
 # packages/kernel/src/platform/__tests__/fixtures/, all gitignored):
@@ -18,8 +18,39 @@
 
 set -euo pipefail
 
-KERNEL_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PORTS_ROOT="${YURT_PORTS_ROOT:-"$KERNEL_ROOT/../yurt-ports"}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+KERNEL_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+
+resolve_path() {
+  local path="$1"
+  if [[ -d "$path" ]]; then
+    cd -- "$path" && pwd -P
+  else
+    local parent
+    parent="$(dirname -- "$path")"
+    if [[ -d "$parent" ]]; then
+      printf '%s/%s\n' "$(cd -- "$parent" && pwd -P)" "$(basename -- "$path")"
+    else
+      printf '%s\n' "$path"
+    fi
+  fi
+}
+
+default_sibling_root() {
+  local name="$1"
+  local base="$KERNEL_ROOT"
+  while [[ "$base" != "/" ]]; do
+    local candidate="$base/../$name"
+    if [[ -d "$candidate" ]]; then
+      resolve_path "$candidate"
+      return
+    fi
+    base="$(dirname -- "$base")"
+  done
+  resolve_path "$KERNEL_ROOT/../$name"
+}
+
+PORTS_ROOT="$(resolve_path "${YURT_PORTS_ROOT:-$(default_sibling_root yurt-ports)}")"
 FIXTURES="$KERNEL_ROOT/packages/kernel/src/platform/__tests__/fixtures"
 
 CPYTHON_PKG="$PORTS_ROOT/ports/cpython/build/dist/cpython-3.14.4-yurt_0.yurtpkg"

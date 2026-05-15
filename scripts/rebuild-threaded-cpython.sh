@@ -8,6 +8,7 @@
 #   ./scripts/rebuild-threaded-cpython.sh           # full rebuild + verify
 #   ./scripts/rebuild-threaded-cpython.sh stage     # skip the build, just re-stage + verify
 #   ./scripts/rebuild-threaded-cpython.sh verify    # skip the build AND staging, run smokes only
+#   ./scripts/rebuild-threaded-cpython.sh print-roots
 #
 # What it does (in order):
 #   1. cargo build --release for yurt-cc + yurt-ar + yurt-ranlib
@@ -50,9 +51,55 @@
 
 set -euo pipefail
 
-KERNEL_ROOT="${YURT_KERNEL_ROOT:-/Users/ofer/work/yurt/yurtos-kernel}"
-PORTS_ROOT="${YURT_PORTS_ROOT:-/Users/ofer/work/yurt/yurt-ports}"
-JUPYTER_ROOT="${YURT_JUPYTER_ROOT:-/Users/ofer/work/yurt/yurt-jupyter}"
+MODE="${1:-full}"
+case "$MODE" in
+  full|stage|verify|print-roots) ;;
+  *) echo "error: unknown mode '$MODE' (expected: full, stage, verify, print-roots)" >&2; exit 2 ;;
+esac
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+DEFAULT_KERNEL_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+
+resolve_path() {
+  local path="$1"
+  if [[ -d "$path" ]]; then
+    cd -- "$path" && pwd -P
+  else
+    local parent
+    parent="$(dirname -- "$path")"
+    if [[ -d "$parent" ]]; then
+      printf '%s/%s\n' "$(cd -- "$parent" && pwd -P)" "$(basename -- "$path")"
+    else
+      printf '%s\n' "$path"
+    fi
+  fi
+}
+
+KERNEL_ROOT="$(resolve_path "${YURT_KERNEL_ROOT:-$DEFAULT_KERNEL_ROOT}")"
+
+default_sibling_root() {
+  local name="$1"
+  local base="$KERNEL_ROOT"
+  while [[ "$base" != "/" ]]; do
+    local candidate="$base/../$name"
+    if [[ -d "$candidate" ]]; then
+      resolve_path "$candidate"
+      return
+    fi
+    base="$(dirname -- "$base")"
+  done
+  resolve_path "$KERNEL_ROOT/../$name"
+}
+
+PORTS_ROOT="$(resolve_path "${YURT_PORTS_ROOT:-$(default_sibling_root yurt-ports)}")"
+JUPYTER_ROOT="$(resolve_path "${YURT_JUPYTER_ROOT:-$(default_sibling_root yurt-jupyter)}")"
+
+if [[ "$MODE" == "print-roots" ]]; then
+  printf 'YURT_KERNEL_ROOT=%s\n' "$KERNEL_ROOT"
+  printf 'YURT_PORTS_ROOT=%s\n' "$PORTS_ROOT"
+  printf 'YURT_JUPYTER_ROOT=%s\n' "$JUPYTER_ROOT"
+  exit 0
+fi
 
 if [[ ! -d "$KERNEL_ROOT" ]]; then
   echo "error: YURT_KERNEL_ROOT not a directory: $KERNEL_ROOT" >&2
@@ -74,13 +121,13 @@ export YURT_CC_USE_THREADS=1
 export YURT_CC_ARCHIVE
 unset CC LD AR RANLIB   # let yurt-cc paths resolve from build.sh defaults
 
-step() { echo; echo "==> $*"; }
+DENO="${DENO:-$(command -v deno || true)}"
+if [[ -z "$DENO" ]]; then
+  echo "error: deno not found on PATH; set DENO=/path/to/deno" >&2
+  exit 1
+fi
 
-MODE="${1:-full}"
-case "$MODE" in
-  full|stage|verify) ;;
-  *) echo "error: unknown mode '$MODE' (expected: full, stage, verify)" >&2; exit 2 ;;
-esac
+step() { echo; echo "==> $*"; }
 
 if [[ "$MODE" == "verify" ]]; then
   step "Verify-only mode: skipping build + staging, running smokes only"
@@ -134,7 +181,7 @@ fi
 
 cd "$KERNEL_ROOT"
 step "7/8  Verify staged cpython3.wasm is thread-capable"
-deno eval --no-check '
+"$DENO" eval --no-check '
 const b = await Deno.readFile("packages/kernel/src/platform/__tests__/fixtures/cpython3.wasm");
 const m = await WebAssembly.compile(b);
 const imps = WebAssembly.Module.imports(m).filter(i => i.kind === "memory");
@@ -162,7 +209,7 @@ run_smoke() {
   local name="$1"
   local path="$2"
   step "  smoke: $name"
-  if deno test --allow-all "$path"; then
+  if "$DENO" test --allow-all "$path"; then
     PASS+=("$name")
   else
     FAIL+=("$name")
@@ -202,4 +249,5 @@ if [[ ${#FAIL[@]} -eq 0 ]]; then
 else
   echo "${#FAIL[@]} smoke(s) failed. Expected today: the reproducer (and"
   echo "jupyter step 3) until the WASI path_* async-wrap lands."
+  exit 1
 fi
