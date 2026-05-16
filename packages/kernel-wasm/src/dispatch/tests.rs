@@ -6825,3 +6825,89 @@ fn pread_pwrite_guards() {
         -(abi::EBADF as i64)
     );
 }
+
+// --- Slice B2.2: POSIX dup3 ---
+
+fn dup3_req(oldfd: u32, newfd: u32, flags: u32) -> Vec<u8> {
+    let mut req = oldfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&newfd.to_le_bytes());
+    req.extend_from_slice(&flags.to_le_bytes());
+    req
+}
+
+fn fd_is_inheritable(pid: u32, fd: u32) -> bool {
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(pid)
+            .fd_table
+            .inheritable_entries()
+            .iter()
+            .any(|(f, _)| *f == fd)
+    })
+}
+
+#[test]
+fn dup3_aliases_oldfd_to_newfd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let oldfd = open_rw(b"/dup3.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(oldfd, 20, 0), &mut []),
+        20
+    );
+    // newfd shares the OFD: write via 20, read it back via the alias.
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(20, 0, b"aliased"), &mut []),
+        7
+    );
+    let mut buf = [0u8; 16];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(oldfd, 0, &[]), &mut buf);
+    assert_eq!(&buf[..n as usize], b"aliased");
+}
+
+#[test]
+fn dup3_same_fd_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/dup3b.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(fd, fd, 0), &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn dup3_unknown_oldfd_is_ebadf() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(99, 20, 0), &mut []),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn dup3_unknown_flag_bits_are_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/dup3c.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(fd, 20, 0b10), &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn dup3_cloexec_flag_controls_newfd_inheritance() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let oldfd = open_rw(b"/dup3d.txt");
+
+    // flags=1 (FD_CLOEXEC): newfd must NOT be inheritable across exec.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(oldfd, 21, 1), &mut []),
+        21
+    );
+    assert!(!fd_is_inheritable(1, 21), "cloexec fd must be excluded");
+
+    // flags=0: newfd inherits normally.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(oldfd, 22, 0), &mut []),
+        22
+    );
+    assert!(fd_is_inheritable(1, 22), "non-cloexec fd inherits");
+}

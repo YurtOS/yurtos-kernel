@@ -153,6 +153,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_CLOSE => close_fd(caller_pid, request),
         METHOD_SYS_DUP => dup_fd(caller_pid, request),
         METHOD_SYS_DUP2 => dup2_fd(caller_pid, request),
+        METHOD_SYS_DUP3 => dup3_fd(caller_pid, request),
         METHOD_SYS_DUP_MIN => dup_min_fd(caller_pid, request),
         METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS => set_fd_descriptor_flags(caller_pid, request),
         METHOD_SYS_PIPE => pipe(caller_pid, response),
@@ -352,6 +353,46 @@ fn dup2_fd(caller_pid: u32, request: &[u8]) -> i64 {
         // Increment the refcount for the new alias.
         inc_entry_ref(k, &entry);
         k.process_mut(caller_pid).fd_table.install(newfd, entry);
+        if let Some(handle) = close_handle {
+            let _ = kh::socket_close(handle);
+        }
+        newfd as i64
+    })
+}
+
+/// `dup3(oldfd, newfd, flags)` — like `dup2` but `oldfd == newfd` is
+/// `-EINVAL` (not a no-op) and `flags` bit 0 sets `FD_CLOEXEC` on
+/// `newfd`. Unknown flag bits → `-EINVAL`. (B2.2)
+fn dup3_fd(caller_pid: u32, request: &[u8]) -> i64 {
+    const FD_CLOEXEC: u32 = 1;
+    let Some([oldfd, newfd, flags]) = read_u32_args::<3>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if flags & !FD_CLOEXEC != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    if oldfd == newfd {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(oldfd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        // newfd is silently closed first (POSIX), then aliases oldfd.
+        let close_handle = k
+            .process_mut(caller_pid)
+            .fd_table
+            .entry(newfd)
+            .cloned()
+            .and_then(|prev| close_entry(k, prev));
+        inc_entry_ref(k, &entry);
+        k.process_mut(caller_pid).fd_table.install(newfd, entry);
+        // dup3 carries the close-on-exec flag explicitly.
+        let _ = k
+            .process_mut(caller_pid)
+            .fd_table
+            .set_descriptor_flags(newfd, flags & FD_CLOEXEC);
         if let Some(handle) = close_handle {
             let _ = kh::socket_close(handle);
         }
