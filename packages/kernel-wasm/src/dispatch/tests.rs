@@ -6703,3 +6703,47 @@ fn user_processes_cannot_call_kernel_only_methods() {
         );
     }
 }
+
+// --- Slice B1.1: SIGCHLD delivered to the parent on child exit ---
+// POSIX: a process receives SIGCHLD when a child terminates. record_exit
+// must OR SIGCHLD into the parent's pending_signals (same bit convention
+// as kill_pid: 1 << (sig - 1)), and be a no-op when there is no parent.
+
+const SIGCHLD: u32 = 17;
+
+fn record_exit_req(pid: u32, status: i32) -> Vec<u8> {
+    let mut req = pid.to_le_bytes().to_vec();
+    req.extend_from_slice(&status.to_le_bytes());
+    req
+}
+
+#[test]
+fn record_exit_sets_sigchld_pending_on_parent() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // parent = 1, child = 7
+    let mut reg = 1u32.to_le_bytes().to_vec();
+    reg.extend_from_slice(&7u32.to_le_bytes());
+    assert_eq!(register_child(&reg), 0);
+
+    assert_eq!(record_exit(&record_exit_req(7, 23)), 0);
+
+    let parent_pending = crate::kernel::with_kernel(|k| k.process_mut(1).pending_signals);
+    assert_ne!(
+        parent_pending & (1u64 << (SIGCHLD - 1)),
+        0,
+        "parent must have SIGCHLD pending after a child exits"
+    );
+}
+
+#[test]
+fn record_exit_without_parent_does_not_panic_or_signal() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // child 8 exists but has no parent (ppid defaults to 0).
+    crate::kernel::with_kernel(|k| {
+        let _ = k.process_mut(8);
+    });
+    assert_eq!(record_exit(&record_exit_req(8, 0)), 0);
+    // No parent (pid 0) is ever materialised or signalled.
+    let phantom = crate::kernel::with_kernel(|k| k.has_process(0));
+    assert!(!phantom, "pid 0 must never be created as a signal target");
+}

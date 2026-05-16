@@ -903,6 +903,11 @@ pub(crate) fn register_child(request: &[u8]) -> i64 {
 /// `kernel_record_exit(pid, exit_status)`. KernelHostInterface-only; marks
 /// `pid` as zombie with the given exit status. The next sys_wait
 /// from its parent will reap it.
+/// POSIX signal number for child termination. Signal numbers are used
+/// as literals across this module (matching the kill path); the pending
+/// bitmask packs them as `1 << (sig - 1)`.
+const SIGCHLD: u32 = 17;
+
 pub fn record_exit(request: &[u8]) -> i64 {
     if request.len() < 8 {
         return -(abi::EINVAL as i64);
@@ -914,6 +919,13 @@ pub fn record_exit(request: &[u8]) -> i64 {
             return -(abi::ESRCH as i64);
         }
         k.process_mut(pid).exit_status = Some(status);
+        // POSIX: the parent receives SIGCHLD when a child terminates.
+        // ppid == 0 means "no parent / kernel is parent" — nothing to
+        // signal. Same pending-bit convention as kill_pid.
+        let ppid = k.process_mut(pid).ppid;
+        if ppid != 0 && k.has_process(ppid) {
+            k.process_mut(ppid).pending_signals |= 1u64 << (SIGCHLD - 1);
+        }
         0
     })
 }
