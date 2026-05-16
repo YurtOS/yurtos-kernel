@@ -24,8 +24,13 @@ deltas.
 2. **B2.2 dup3** — `dup2` semantics plus an explicit flags word (`O_CLOEXEC`);
    `-EINVAL` if `oldfd == newfd`, `-EINVAL` for unknown flags. Reuses the
    existing dup/cloexec machinery.
-3. **B2.3 fcntl flag completeness** — `F_GETFD`/`F_SETFD` beyond `FD_CLOEXEC`,
-   `F_GETFL`/`F_SETFL` status flags surfaced from the OFD.
+3. **B2.3 fcntl flag completeness** — `F_GETFD`/`F_SETFD` (landed) +
+   `F_GETFL`/`F_SETFL` storage on the OFD (B2.3b, landed, storage-only).
+   **Tracked follow-up (PR #55 review):** `F_GETFL` currently returns only the
+   `O_APPEND|O_NONBLOCK` subset, so `flags & O_ACCMODE` always reads `O_RDONLY`.
+   The gate-sequenced "honor flags" follow-up MUST also surface the access mode
+   from `OpenFileDescription.writable` (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) — musl /
+   CPython `os.get_blocking` / libuv probe it.
 4. **B2.4 openat** — open relative to a directory fd (`AT_FDCWD` → cwd). Landed
    (path-joined reuse of `sys_open`). **Open bug — issue #59:** dirfd must be
    inode-anchored, not path-snapshot (breaks across rename/unlink). The faithful
