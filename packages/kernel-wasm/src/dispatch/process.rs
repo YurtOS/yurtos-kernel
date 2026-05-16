@@ -1190,10 +1190,14 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
         if candidates.is_empty() {
             return -(abi::ECHILD as i64);
         }
-        let Some((pid, status)) = candidates
-            .iter()
-            .find_map(|&c| k.process_mut(c).exit_status.map(|s| (c, s)))
-        else {
+        let Some((pid, status)) = candidates.iter().find_map(|&c| {
+            // Non-vivifying, consistent with effective_pgid (PR #54
+            // review nit). Entries come from `children` so they always
+            // have a record; this just avoids the auto-vivify footgun.
+            k.process_existing(c)
+                .and_then(|p| p.exit_status)
+                .map(|s| (c, s))
+        }) else {
             // No matching child is in a waitable state. POSIX waitid:
             // with WNOHANG, return success with a zeroed siginfo
             // (si_signo == 0) — NOT an error. Without WNOHANG this
@@ -1205,7 +1209,10 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
             }
             return -(abi::EAGAIN as i64);
         };
-        let uid = k.process_mut(pid).credentials.uid;
+        let uid = k
+            .process_existing(pid)
+            .map(|p| p.credentials.uid)
+            .unwrap_or(0);
         if !nowait {
             // Reap = detach from the parent's children list, exactly as
             // sys_wait/wait_response does. The zombie `Process` record

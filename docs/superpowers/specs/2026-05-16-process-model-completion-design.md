@@ -119,6 +119,16 @@ gate-deferred consumer/blocking halves land:
   POSIX-correct (success + zeroed siginfo). `waitid(P_PGID, 0)` now matches
   default-inherited (`pgid==0`) children via the parent-walking
   `effective_pgid` resolver (PR #54 review P2, regression-tested).
+  **`waitid` / `sys_wait` WNOHANG asymmetry:** `waitid` + `WNOHANG` +
+  no waitable child → success with zeroed siginfo (POSIX-correct);
+  `sys_wait` (`waitpid`) + `WNOHANG` → `-EAGAIN`. Both match their own
+  contract; the gate-deferred libc/adapter half must NOT assume
+  symmetric `waitpid`/`waitid` WNOHANG semantics.
+- **`pthread_cancel` main-thread id:** `sys_thread_self` presents the
+  main thread to guests as `GUEST_MAIN_PTHREAD_ID` (0); `sys_thread_cancel`
+  normalizes 0 → `MAIN_THREAD_TID` so self-cancel works. `join`/`detach`
+  of the main thread is undefined in POSIX, so they intentionally do
+  NOT normalize (a guest id 0 there stays an ESRCH misuse signal).
 - **No signal-sender permission check (whole signal subsystem):** `kill`,
   `killpg`, and `sigqueue` let any guest target any pid — there is no
   `EPERM`/credential gate (real POSIX: a sender needs matching uid or

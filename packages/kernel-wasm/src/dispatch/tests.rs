@@ -7236,6 +7236,38 @@ fn thread_cancel_input_guards() {
     );
 }
 
+#[test]
+fn pthread_cancel_self_from_main_thread_normalizes_guest_id() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // spawn_worker(9) also creates process 9 with a MAIN_THREAD_TID
+    // record. PR #54 review P2: pthread_self() on main returns the
+    // guest main id (0); pthread_cancel(pthread_self()) must normalize
+    // 0 → MAIN_THREAD_TID and succeed, not -ESRCH.
+    spawn_worker(9);
+    let main_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+    let self_id = dispatch_with_context(METHOD_SYS_THREAD_SELF, main_ctx, &[], &mut []);
+    assert_eq!(self_id, crate::kernel::GUEST_MAIN_PTHREAD_ID as i64);
+    assert_eq!(
+        dispatch_with_context(
+            METHOD_SYS_THREAD_CANCEL,
+            main_ctx,
+            &(self_id as u32).to_le_bytes(),
+            &mut [],
+        ),
+        0,
+        "self-cancel of the main thread must succeed"
+    );
+    assert!(crate::kernel::with_kernel(|k| k
+        .process(9)
+        .threads
+        .get(&crate::kernel::MAIN_THREAD_TID)
+        .expect("main thread record")
+        .cancel_requested));
+}
+
 // --- Slice B1.8-a: POSIX sigqueue (additive RT-signal queue) ---
 
 fn sigqueue_req(target: u32, sig: u32, value: i32) -> Vec<u8> {
