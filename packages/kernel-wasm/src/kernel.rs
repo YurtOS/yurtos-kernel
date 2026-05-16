@@ -266,6 +266,15 @@ pub const DEFAULT_RLIMITS: [Option<ResourceLimit>; RLIMIT_SLOTS] = [
     Some((1024, 1024)),                         // 7 RLIMIT_NOFILE
 ];
 
+/// One queued POSIX real-time signal (`sigqueue`). Carries the payload
+/// and sender identity POSIX exposes via `siginfo_t` on delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtSignal {
+    pub signo: u32,
+    pub value: i32,
+    pub sender_pid: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Process {
     pub umask: u16,
@@ -309,6 +318,12 @@ pub struct Process {
     /// delivery requires asyncify/JSPI unwind which lands later. Sig
     /// numbers 1..=63 use bits 0..=62.
     pub pending_signals: u64,
+    /// POSIX real-time signal queue (`sigqueue`). Unlike the bitmask,
+    /// RT signals are *queued with multiplicity* and carry a payload +
+    /// sender. Additive: the matching bitmask bit is also set so
+    /// existing `pending_signals` readers keep working unchanged.
+    /// Consumption (`sigwaitinfo`/delivery) is gate-deferred (B1.8-b).
+    pub pending_rt: VecDeque<RtSignal>,
     /// Per-signal disposition. Index `sig - 1` for sig in 1..=63.
     /// 0 = SIG_DFL, 1 = SIG_IGN, anything else is an opaque user-side
     /// handler value (typically a wasm function table index).
@@ -374,6 +389,7 @@ impl Default for Process {
             pgid: 0,
             sid: 0,
             pending_signals: 0,
+            pending_rt: VecDeque::new(),
             signal_dispositions: [0; 63],
             yield_count: 0,
             last_nanosleep_ns: 0,

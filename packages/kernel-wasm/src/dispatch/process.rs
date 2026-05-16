@@ -740,6 +740,40 @@ pub fn kill_pid(target: u32, sig: u32) -> i64 {
     0
 }
 
+/// `sigqueue(pid, sig, value)` — POSIX real-time signal enqueue. The
+/// caller (`caller_pid`) is the sender. Additive: also sets the
+/// compat bitmask bit so existing `pending_signals` readers keep
+/// working. Consumption (`sigwaitinfo`/delivery) is gate-deferred.
+pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let target = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let sig = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let value = i32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
+    if sig > 63 {
+        return -(abi::EINVAL as i64);
+    }
+    if !with_kernel(|k| k.has_process(target)) {
+        return -(abi::ESRCH as i64);
+    }
+    if sig == 0 {
+        // Existence probe only — POSIX performs error checking but
+        // does not enqueue for sig 0.
+        return 0;
+    }
+    with_kernel(|k| {
+        let p = k.process_mut(target);
+        p.pending_rt.push_back(crate::kernel::RtSignal {
+            signo: sig,
+            value,
+            sender_pid: caller_pid,
+        });
+        p.pending_signals |= 1u64 << (sig - 1);
+    });
+    0
+}
+
 pub(super) fn kill_request(request: &[u8]) -> i64 {
     let Some([target, sig]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);

@@ -548,6 +548,11 @@ id = 0x1_0062
 kind = "syscall"
 doc = "POSIX pthread_testcancel cancellation point. No request bytes. Returns 1 if the authenticated caller thread has a pending cancel (and has not exited), else 0. The guest acts on a 1 by unwinding/exiting."
 
+[method.sys_sigqueue]
+id = 0x1_0063
+kind = "syscall"
+doc = "POSIX sigqueue(pid, sig, value). Request: u32 target pid LE + u32 sig LE + i32 value LE. Enqueues a real-time signal (queued with multiplicity, carries value + sender pid) onto the target and also sets the matching pending bitmask bit for compatibility. sig==0 is the existence probe (no enqueue). Returns 0, -ESRCH for unknown pid, -EINVAL for sig>63 or short request. Delivery/sigwaitinfo is gate-deferred (B1.8-b)."
+
 [method.sys_fchdir]
 id = 0x1_005F
 kind = "syscall"

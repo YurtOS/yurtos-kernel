@@ -7102,3 +7102,110 @@ fn thread_cancel_input_guards() {
         -(abi::EINVAL as i64)
     );
 }
+
+// --- Slice B1.8-a: POSIX sigqueue (additive RT-signal queue) ---
+
+fn sigqueue_req(target: u32, sig: u32, value: i32) -> Vec<u8> {
+    let mut req = target.to_le_bytes().to_vec();
+    req.extend_from_slice(&sig.to_le_bytes());
+    req.extend_from_slice(&value.to_le_bytes());
+    req
+}
+
+fn materialize(pid: u32) {
+    crate::kernel::with_kernel(|k| {
+        let _ = k.process_mut(pid);
+    });
+}
+
+#[test]
+fn sigqueue_enqueues_rt_signal_with_payload_and_sender() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    // caller (sender) = 1, target = 7, RT signal 40, value 99
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 99), &mut []),
+        0
+    );
+
+    let (queue, bitmask) = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(7);
+        (p.pending_rt.clone(), p.pending_signals)
+    });
+    assert_eq!(queue.len(), 1);
+    assert_eq!(
+        queue[0],
+        crate::kernel::RtSignal {
+            signo: 40,
+            value: 99,
+            sender_pid: 1
+        }
+    );
+    // Additive: the compat bitmask bit is also set.
+    assert_ne!(bitmask & (1u64 << (40 - 1)), 0);
+}
+
+#[test]
+fn sigqueue_queues_with_multiplicity_unlike_the_bitmask() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 41, 1), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 2, &sigqueue_req(7, 41, 2), &mut []),
+        0
+    );
+    let queue = crate::kernel::with_kernel(|k| k.process_mut(7).pending_rt.clone());
+    assert_eq!(queue.len(), 2, "RT signals queue with multiplicity");
+    assert_eq!(queue[0].value, 1);
+    assert_eq!(queue[0].sender_pid, 1);
+    assert_eq!(queue[1].value, 2);
+    assert_eq!(queue[1].sender_pid, 2);
+}
+
+#[test]
+fn sigqueue_sig_zero_is_probe_without_enqueue() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 0, 0), &mut []),
+        0
+    );
+    assert!(crate::kernel::with_kernel(|k| k
+        .process_mut(7)
+        .pending_rt
+        .is_empty()));
+    // Probe on a missing process is ESRCH.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(424242, 0, 0), &mut []),
+        -(abi::ESRCH as i64)
+    );
+}
+
+#[test]
+fn sigqueue_input_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    // sig out of range.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 64, 0), &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // short request (<12 bytes).
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &[0u8; 8], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // unknown target, real signal.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGQUEUE,
+            1,
+            &sigqueue_req(424242, 40, 0),
+            &mut []
+        ),
+        -(abi::ESRCH as i64)
+    );
+}
