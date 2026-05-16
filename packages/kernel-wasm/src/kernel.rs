@@ -45,6 +45,13 @@ pub const KERNEL_BUFFER_CAP: usize = 64 * 1024;
 /// Maximum queued descriptor-rights records on one AF_UNIX socket.
 pub const KERNEL_RIGHTS_QUEUE_CAP: usize = 1024;
 
+/// Sanity bound on a process's queued real-time signals (`pending_rt`),
+/// mirroring Linux `RLIMIT_SIGPENDING`. `sigqueue` returns `-EAGAIN`
+/// once a target is at this cap, so a guest looping `sigqueue` cannot
+/// grow kernel memory without bound while the consumer
+/// (`sigwaitinfo`/delivery) is gate-deferred.
+pub const KERNEL_RT_SIGNAL_QUEUE_CAP: usize = 1024;
+
 /// Number of POSIX rlimit slots tracked. Matches the TS kernel's
 /// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
 pub const RLIMIT_SLOTS: usize = 8;
@@ -79,6 +86,11 @@ pub struct ThreadRecord {
     pub host_thread_handle: Option<i32>,
     pub wait_reason: Option<WaitReason>,
     pub waiter_tid: Option<Tid>,
+    /// POSIX deferred cancellation: set by `pthread_cancel`, observed by
+    /// the target at a cancellation point (`pthread_testcancel`). The
+    /// guest performs the actual unwind/exit; the kernel only owns the
+    /// pending-cancel state.
+    pub cancel_requested: bool,
 }
 
 impl ThreadRecord {
@@ -91,6 +103,7 @@ impl ThreadRecord {
             host_thread_handle,
             wait_reason: None,
             waiter_tid: None,
+            cancel_requested: false,
         }
     }
 }
@@ -260,6 +273,15 @@ pub const DEFAULT_RLIMITS: [Option<ResourceLimit>; RLIMIT_SLOTS] = [
     Some((1024, 1024)),                         // 7 RLIMIT_NOFILE
 ];
 
+/// One queued POSIX real-time signal (`sigqueue`). Carries the payload
+/// and sender identity POSIX exposes via `siginfo_t` on delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RtSignal {
+    pub signo: u32,
+    pub value: i32,
+    pub sender_pid: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Process {
     pub umask: u16,
@@ -303,6 +325,14 @@ pub struct Process {
     /// delivery requires asyncify/JSPI unwind which lands later. Sig
     /// numbers 1..=63 use bits 0..=62.
     pub pending_signals: u64,
+    /// POSIX real-time signal queue (`sigqueue`). Unlike the bitmask,
+    /// RT signals are *queued with multiplicity* and carry a payload +
+    /// sender. Separated-producer model: this queue is the SOLE store
+    /// for RT signals — it does NOT also set `pending_signals` (that
+    /// bitmask is owned by kill/SIGCHLD). `sigpending()` returns the
+    /// read-time union of both, so neither producer clobbers the other.
+    /// Consumption (`sigwaitinfo`/delivery) is gate-deferred (B1.8-b).
+    pub pending_rt: VecDeque<RtSignal>,
     /// Per-signal disposition. Index `sig - 1` for sig in 1..=63.
     /// 0 = SIG_DFL, 1 = SIG_IGN, anything else is an opaque user-side
     /// handler value (typically a wasm function table index).
@@ -368,6 +398,7 @@ impl Default for Process {
             pgid: 0,
             sid: 0,
             pending_signals: 0,
+            pending_rt: VecDeque::new(),
             signal_dispositions: [0; 63],
             yield_count: 0,
             last_nanosleep_ns: 0,
@@ -669,7 +700,11 @@ impl Kernel {
         child.children.clear();
         child.exit_status = None;
         child.host_instance_handle = None;
+        // POSIX: the child starts with an EMPTY pending signal set —
+        // both the standard bitmask and the RT queue (PR #54 review P2;
+        // pending_rt was added after this clone path and was missed).
         child.pending_signals = 0;
+        child.pending_rt.clear();
         child.stdin_buffer.clear();
         child.stdout_buffer.clear();
         child.stderr_buffer.clear();
@@ -1464,6 +1499,7 @@ impl Kernel {
                 host_thread_handle,
                 wait_reason: None,
                 waiter_tid: None,
+                cancel_requested: false,
             },
         );
         Ok(())
@@ -1487,6 +1523,29 @@ impl Kernel {
             thread.detached = true;
         }
         Ok(())
+    }
+
+    /// `pthread_cancel`: mark the target thread for deferred
+    /// cancellation. ESRCH if the thread is unknown or already exited
+    /// (POSIX: cancelling a terminated thread is a no-op error). The
+    /// guest performs the actual unwind at the next cancellation point.
+    pub fn request_thread_cancel(&mut self, pid: Pid, tid: Tid) -> Result<(), i32> {
+        let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
+        let thread = p.threads.get_mut(&tid).ok_or(crate::abi::ESRCH)?;
+        if thread.state == ThreadState::Exited {
+            return Err(crate::abi::ESRCH);
+        }
+        thread.cancel_requested = true;
+        Ok(())
+    }
+
+    /// `pthread_testcancel`: true iff the thread has a pending cancel
+    /// and has not exited. Unknown thread → false (nothing to act on).
+    pub fn thread_cancel_pending(&self, pid: Pid, tid: Tid) -> bool {
+        self.processes
+            .get(&pid)
+            .and_then(|p| p.threads.get(&tid))
+            .is_some_and(|t| t.cancel_requested && t.state != ThreadState::Exited)
     }
 
     pub fn exit_thread(&mut self, pid: Pid, tid: Tid, exit_value: i32) -> Result<(), i32> {

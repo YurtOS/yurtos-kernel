@@ -106,3 +106,34 @@ pub fn sys_thread_yield(_ctx: DispatchContext, request: &[u8]) -> i64 {
         -(abi::EINVAL as i64)
     }
 }
+
+pub fn sys_thread_cancel(ctx: DispatchContext, request: &[u8]) -> i64 {
+    let target_tid = match read_u32_request(request) {
+        Ok(tid) => tid,
+        Err(rc) => return rc,
+    };
+    // `sys_thread_self` presents the main thread to guests as
+    // GUEST_MAIN_PTHREAD_ID (0), but the thread table stores it under
+    // MAIN_THREAD_TID. Map the guest-facing id back before lookup so
+    // pthread_cancel(pthread_self()) from the main thread works
+    // (PR #54 review P2). (join/detach of the main thread is undefined
+    // in POSIX, so only the cancel path needs this.)
+    let target_tid = if target_tid == kernel::GUEST_MAIN_PTHREAD_ID {
+        kernel::MAIN_THREAD_TID
+    } else {
+        target_tid
+    };
+    kernel::with_kernel(|k| k.request_thread_cancel(ctx.caller_pid, target_tid))
+        .map_or_else(|errno| -(errno as i64), |_| 0)
+}
+
+pub fn sys_thread_testcancel(ctx: DispatchContext, request: &[u8]) -> i64 {
+    if !request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    if kernel::with_kernel(|k| k.thread_cancel_pending(ctx.caller_pid, ctx.caller_tid)) {
+        1
+    } else {
+        0
+    }
+}

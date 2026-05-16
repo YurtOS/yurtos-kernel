@@ -740,6 +740,121 @@ pub fn kill_pid(target: u32, sig: u32) -> i64 {
     0
 }
 
+/// `sigqueue(pid, sig, value)` — POSIX real-time signal enqueue. The
+/// caller (`caller_pid`) is the sender. Separated-producer model: the
+/// RT signal lives ONLY in the target's `pending_rt` queue — it does
+/// NOT touch `pending_signals` (the kill/SIGCHLD bitmask), so a bit
+/// set by `kill()` for the same signo is never clobbered when the RT
+/// queue later drains. `sigpending()` reports the union of both.
+/// Consumption (`sigwaitinfo`/delivery) is gate-deferred.
+pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let target = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let sig = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let value = i32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
+    if sig > 63 {
+        return -(abi::EINVAL as i64);
+    }
+    if !with_kernel(|k| k.has_process(target)) {
+        return -(abi::ESRCH as i64);
+    }
+    if sig == 0 {
+        // Existence probe only — POSIX performs error checking but
+        // does not enqueue for sig 0.
+        return 0;
+    }
+    with_kernel(|k| {
+        let p = k.process_mut(target);
+        // Bound the queue (Linux RLIMIT_SIGPENDING). The consumer
+        // (sigwaitinfo/delivery) is gate-deferred, so without this an
+        // unprivileged guest looping sigqueue would grow kernel memory
+        // without bound.
+        if p.pending_rt.len() >= crate::kernel::KERNEL_RT_SIGNAL_QUEUE_CAP {
+            return -(abi::EAGAIN as i64);
+        }
+        p.pending_rt.push_back(crate::kernel::RtSignal {
+            signo: sig,
+            value,
+            sender_pid: caller_pid,
+        });
+        // RT signals live ONLY in pending_rt — do not touch
+        // pending_signals (the kill/SIGCHLD bitmask). sigpending()
+        // reports the union, so a bit set by kill() for the same signo
+        // is never clobbered when the RT queue later drains.
+        0
+    })
+}
+
+/// `sigwaitinfo(set)` — non-blocking RT-signal dequeue (B1.8-b).
+/// Returns the oldest queued signal whose bit is in `set` and its
+/// siginfo, removing it from the RT queue only. The kill/SIGCHLD
+/// bitmask is left untouched (separate producer). True blocking
+/// (suspend until a signal arrives) is gate-deferred — absent a
+/// pending match this is -EAGAIN.
+pub(super) fn sigwaitinfo(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 8 || response.len() < 16 {
+        return -(abi::EINVAL as i64);
+    }
+    let set = u64::from_le_bytes(request[0..8].try_into().expect("8 bytes"));
+    with_kernel(|k| {
+        if !k.has_process(caller_pid) {
+            return -(abi::ESRCH as i64);
+        }
+        let p = k.process_mut(caller_pid);
+        // The `1..=63` guard is defensive only: the sole producer
+        // (`sigqueue`) rejects signo>63 before push_back, so a stored
+        // entry is always in range — it can never reject a real entry.
+        let Some(idx) = p
+            .pending_rt
+            .iter()
+            .position(|s| (1..=63).contains(&s.signo) && (set & (1u64 << (s.signo - 1))) != 0)
+        else {
+            return -(abi::EAGAIN as i64);
+        };
+        let sig = p.pending_rt.remove(idx).expect("idx from position");
+        // Do NOT clear pending_signals here: that bitmask is owned by
+        // kill()/SIGCHLD, not by the RT queue. The same signo set by
+        // kill() must stay pending after the RT entry drains.
+        // sigpending() derives RT-pending from pending_rt directly.
+        const SI_QUEUE: i32 = -1;
+        response[0..4].copy_from_slice(&(sig.signo as i32).to_le_bytes());
+        response[4..8].copy_from_slice(&SI_QUEUE.to_le_bytes());
+        response[8..12].copy_from_slice(&sig.sender_pid.to_le_bytes());
+        response[12..16].copy_from_slice(&sig.value.to_le_bytes());
+        16
+    })
+}
+
+/// `sigpending()` — the caller's pending-signal set as a u64 bitmask
+/// (bit sig-1): the union of the kill/SIGCHLD bitmask and the RT
+/// queue (`pending_rt`). Pure read.
+pub(super) fn sigpending(caller_pid: u32, response: &mut [u8]) -> i64 {
+    if response.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        if !k.has_process(caller_pid) {
+            return -(abi::ESRCH as i64);
+        }
+        let p = k.process_mut(caller_pid);
+        // Union of the kill/SIGCHLD bitmask and RT-queued signals.
+        // RT pending is derived from pending_rt so it never collides
+        // with bits other producers set for the same signo.
+        let mut mask = p.pending_signals;
+        for s in &p.pending_rt {
+            // Defensive only — `sigqueue` enforces signo in 1..=63 at
+            // enqueue, so stored entries are always in range.
+            if (1..=63).contains(&s.signo) {
+                mask |= 1u64 << (s.signo - 1);
+            }
+        }
+        response[0..8].copy_from_slice(&mask.to_le_bytes());
+        8
+    })
+}
+
 pub(super) fn kill_request(request: &[u8]) -> i64 {
     let Some([target, sig]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
@@ -903,6 +1018,11 @@ pub(crate) fn register_child(request: &[u8]) -> i64 {
 /// `kernel_record_exit(pid, exit_status)`. KernelHostInterface-only; marks
 /// `pid` as zombie with the given exit status. The next sys_wait
 /// from its parent will reap it.
+/// POSIX signal number for child termination. Signal numbers are used
+/// as literals across this module (matching the kill path); the pending
+/// bitmask packs them as `1 << (sig - 1)`.
+const SIGCHLD: u32 = 17;
+
 pub fn record_exit(request: &[u8]) -> i64 {
     if request.len() < 8 {
         return -(abi::EINVAL as i64);
@@ -914,6 +1034,13 @@ pub fn record_exit(request: &[u8]) -> i64 {
             return -(abi::ESRCH as i64);
         }
         k.process_mut(pid).exit_status = Some(status);
+        // POSIX: the parent receives SIGCHLD when a child terminates.
+        // ppid == 0 means "no parent / kernel is parent" — nothing to
+        // signal. Same pending-bit convention as kill_pid.
+        let ppid = k.process_mut(pid).ppid;
+        if ppid != 0 && k.has_process(ppid) {
+            k.process_mut(ppid).pending_signals |= 1u64 << (SIGCHLD - 1);
+        }
         0
     })
 }
@@ -965,6 +1092,140 @@ pub fn wait_response(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
         response[0..4].copy_from_slice(&pid.to_le_bytes());
         response[4..8].copy_from_slice(&status.to_le_bytes());
         8
+    })
+}
+
+/// `waitid(idtype, id, infop, options)` — POSIX siginfo-returning wait.
+/// Request: u32 idtype LE (0=P_ALL, 1=P_PID, 2=P_PGID) + u32 id LE +
+/// u32 options LE. Response: 20 bytes — i32 si_signo + i32 si_code +
+/// u32 si_pid + u32 si_uid + i32 si_status, all LE.
+///
+/// First pass: terminated children only (si_code = CLD_EXITED). The
+/// kernel records a single `exit_status` with no kill/stop/continue
+/// discrimination, so killed-by-signal vs normal-exit and
+/// WSTOPPED/WCONTINUED are out of scope here (tracked: B1.2 siginfo
+/// needs record_exit to carry signal-vs-exit). Blocking behaves like
+/// the sys_wait path — no AsyncBridge yet, so "would block" is -EAGAIN.
+/// Effective process group of `pid` under the lazy-zero model: a
+/// stored `pgid` of 0 means "inherited", not "own group". A process
+/// spawned before its parent materialized a group inherits 0, and is
+/// in the *parent's* group — so walk parents until a concrete pgid is
+/// found; a process with no live parent (kernel-parented) is its own
+/// group leader. Non-vivifying (`process_existing`) so it never
+/// auto-creates a `Process`, and depth-bounded (ppid chains are
+/// shallow and acyclic).
+fn effective_pgid(k: &crate::kernel::Kernel, pid: u32) -> u32 {
+    let mut cur = pid;
+    for _ in 0..64 {
+        match k.process_existing(cur) {
+            Some(p) if p.pgid != 0 => return p.pgid,
+            Some(p) if p.ppid != 0 && p.ppid != cur => cur = p.ppid,
+            _ => return cur,
+        }
+    }
+    cur
+}
+
+pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    // Linux idtype values and option bits. P_ALL (0) is the `_` arm.
+    const P_PID: u32 = 1;
+    const P_PGID: u32 = 2;
+    const WNOHANG: u32 = 1;
+    const WEXITED: u32 = 4;
+    const WNOWAIT: u32 = 0x0100_0000;
+    const CLD_EXITED: i32 = 1;
+
+    let Some([idtype, id, options]) = read_u32_args::<3>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if response.len() < 20 {
+        return -(abi::EINVAL as i64);
+    }
+    if idtype > P_PGID {
+        return -(abi::EINVAL as i64);
+    }
+    // We only produce terminated-child events; POSIX requires at least
+    // one wait-type bit, and ours must be WEXITED.
+    if options & WEXITED == 0 {
+        return -(abi::EINVAL as i64);
+    }
+    // Reject any bit outside the supported set. WSTOPPED/WCONTINUED are
+    // real POSIX options we don't implement, and stale adapter garbage
+    // must not be silently accepted and reap a child — the contract
+    // promises -EINVAL for bad options (PR #54 review P2).
+    if options & !(WNOHANG | WEXITED | WNOWAIT) != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let nowait = options & WNOWAIT != 0;
+    with_kernel(|k| {
+        let children = k.process_mut(caller_pid).children.clone();
+        if children.is_empty() {
+            return -(abi::ECHILD as i64);
+        }
+        // POSIX: for P_PGID, id == 0 means the caller's own process
+        // group. Resolve both the wanted group and each child's group
+        // through the same lazy-zero-aware helper so a default-inherited
+        // child (pgid still 0) is matched to the caller's group instead
+        // of being treated as its own leader (PR #54 review P2).
+        let want_pgid = if idtype == P_PGID && id == 0 {
+            effective_pgid(k, caller_pid)
+        } else {
+            id
+        };
+        let candidates: Vec<u32> = match idtype {
+            P_PID => {
+                if children.contains(&id) {
+                    vec![id]
+                } else {
+                    return -(abi::ECHILD as i64);
+                }
+            }
+            P_PGID => children
+                .iter()
+                .copied()
+                .filter(|&c| effective_pgid(k, c) == want_pgid)
+                .collect(),
+            _ => children, // P_ALL
+        };
+        if candidates.is_empty() {
+            return -(abi::ECHILD as i64);
+        }
+        let Some((pid, status)) = candidates.iter().find_map(|&c| {
+            // Non-vivifying, consistent with effective_pgid (PR #54
+            // review nit). Entries come from `children` so they always
+            // have a record; this just avoids the auto-vivify footgun.
+            k.process_existing(c)
+                .and_then(|p| p.exit_status)
+                .map(|s| (c, s))
+        }) else {
+            // No matching child is in a waitable state. POSIX waitid:
+            // with WNOHANG, return success with a zeroed siginfo
+            // (si_signo == 0) — NOT an error. Without WNOHANG this
+            // would block; absent an AsyncBridge we report would-block
+            // as -EAGAIN, matching sys_wait.
+            if options & WNOHANG != 0 {
+                response[0..20].fill(0);
+                return 20;
+            }
+            return -(abi::EAGAIN as i64);
+        };
+        let uid = k
+            .process_existing(pid)
+            .map(|p| p.credentials.uid)
+            .unwrap_or(0);
+        if !nowait {
+            // Reap = detach from the parent's children list, exactly as
+            // sys_wait/wait_response does. The zombie `Process` record
+            // intentionally persists (shared pre-existing design); don't
+            // "fix" this asymmetry here without changing sys_wait too.
+            k.process_mut(caller_pid).children.retain(|&c| c != pid);
+        }
+        response[0..4].copy_from_slice(&(SIGCHLD as i32).to_le_bytes());
+        response[4..8].copy_from_slice(&CLD_EXITED.to_le_bytes());
+        response[8..12].copy_from_slice(&pid.to_le_bytes());
+        response[12..16].copy_from_slice(&uid.to_le_bytes());
+        response[16..20].copy_from_slice(&status.to_le_bytes());
+        20
     })
 }
 
