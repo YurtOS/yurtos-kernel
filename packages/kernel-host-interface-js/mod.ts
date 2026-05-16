@@ -1320,6 +1320,15 @@ export class KernelInstance {
         argvLen: number,
       ) => bigint)
       | null = null,
+    readonly kernelPrepareFork:
+      | ((parentPid: number) => bigint)
+      | null = null,
+    readonly kernelCommitFork:
+      | ((parentPid: number, childPid: number) => bigint)
+      | null = null,
+    readonly kernelRollbackFork:
+      | ((parentPid: number, childPid: number) => bigint)
+      | null = null,
     readonly kernelRecordExit:
       | ((pid: number, exitStatus: number) => bigint)
       | null = null,
@@ -1577,6 +1586,27 @@ export class KernelInstance {
       argvPtr,
       argv.byteLength,
     );
+  }
+
+  prepareFork(parentPid: number): bigint {
+    if (!this.kernelPrepareFork) {
+      throw new Error("kernel.wasm missing kernel_prepare_fork export");
+    }
+    return this.kernelPrepareFork(parentPid);
+  }
+
+  commitFork(parentPid: number, childPid: number): bigint {
+    if (!this.kernelCommitFork) {
+      throw new Error("kernel.wasm missing kernel_commit_fork export");
+    }
+    return this.kernelCommitFork(parentPid, childPid);
+  }
+
+  rollbackFork(parentPid: number, childPid: number): bigint {
+    if (!this.kernelRollbackFork) {
+      throw new Error("kernel.wasm missing kernel_rollback_fork export");
+    }
+    return this.kernelRollbackFork(parentPid, childPid);
   }
 }
 
@@ -3189,6 +3219,15 @@ export class KernelHostInterface {
         argvLen: number,
       ) => bigint)
       | undefined;
+    const kernelPrepareFork = instance.exports.kernel_prepare_fork as
+      | ((parentPid: number) => bigint)
+      | undefined;
+    const kernelCommitFork = instance.exports.kernel_commit_fork as
+      | ((parentPid: number, childPid: number) => bigint)
+      | undefined;
+    const kernelRollbackFork = instance.exports.kernel_rollback_fork as
+      | ((parentPid: number, childPid: number) => bigint)
+      | undefined;
     const kernelRecordExit = instance.exports.kernel_record_exit as
       | ((pid: number, exitStatus: number) => bigint)
       | undefined;
@@ -3252,6 +3291,9 @@ export class KernelHostInterface {
       kernelKill ?? null,
       kernelWait ?? null,
       kernelSpawnProcess ?? null,
+      kernelPrepareFork ?? null,
+      kernelCommitFork ?? null,
+      kernelRollbackFork ?? null,
       kernelRecordExit ?? null,
       kernelDrainSpawn ?? null,
     );
@@ -3347,6 +3389,24 @@ export class KernelHostInterface {
       );
     }
     return user;
+  }
+
+  prepareFork(parentPid: number): number {
+    const childPid = Number(this.kernel.prepareFork(parentPid));
+    if (childPid < 0) {
+      throw new Error(`kernel_prepare_fork failed: rc=${childPid}`);
+    }
+    return childPid;
+  }
+
+  commitFork(parentPid: number, childPid: number): void {
+    const rc = Number(this.kernel.commitFork(parentPid, childPid));
+    if (rc !== 0) throw new Error(`kernel_commit_fork failed: rc=${rc}`);
+  }
+
+  rollbackFork(parentPid: number, childPid: number): void {
+    const rc = Number(this.kernel.rollbackFork(parentPid, childPid));
+    if (rc !== 0) throw new Error(`kernel_rollback_fork failed: rc=${rc}`);
   }
 
   listProcesses(): ProcessSnapshot[] {

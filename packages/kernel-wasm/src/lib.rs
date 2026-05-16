@@ -277,6 +277,36 @@ pub unsafe extern "C" fn kernel_schedule_next(out_ptr: *mut u8, out_cap: usize) 
     dispatch::schedule_next_response(response)
 }
 
+/// Host-control export: reserve a fork child process in kernel-owned state.
+#[no_mangle]
+pub extern "C" fn kernel_prepare_fork(parent_pid: u32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.prepare_fork(parent_pid)
+            .map(i64::from)
+            .unwrap_or_else(|errno| -(errno as i64))
+    })
+}
+
+/// Host-control export: publish a prepared fork child after host startup.
+#[no_mangle]
+pub extern "C" fn kernel_commit_fork(parent_pid: u32, child_pid: u32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.commit_fork(parent_pid, child_pid)
+            .map(|()| 0)
+            .unwrap_or_else(|errno| -(errno as i64))
+    })
+}
+
+/// Host-control export: remove a prepared fork child after host startup failure.
+#[no_mangle]
+pub extern "C" fn kernel_rollback_fork(parent_pid: u32, child_pid: u32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.rollback_fork(parent_pid, child_pid)
+            .map(|()| 0)
+            .unwrap_or_else(|errno| -(errno as i64))
+    })
+}
+
 /// Host-control export: register a host-created thread in kernel-owned state.
 ///
 /// `host_thread_handle` is an opaque adapter handle. Pass a negative value when

@@ -72,7 +72,7 @@ Expected: pass.
 
 ## Task 2: Add Rust Kernel Fork State Transitions
 
-- [ ] **Step 1: Write failing kernel tests**
+- [x] **Step 1: Write failing kernel tests**
 
 Add tests in `packages/kernel-wasm/src/kernel.rs` or `packages/kernel-wasm/src/dispatch/tests.rs`:
 
@@ -100,7 +100,7 @@ Run: `cargo test -p yurt-kernel-wasm fork`
 
 Expected: fail because the methods do not exist.
 
-- [ ] **Step 2: Implement child process state**
+- [x] **Step 2: Implement child process state**
 
 Add a process fork state enum in `packages/kernel-wasm/src/kernel.rs`:
 
@@ -114,7 +114,7 @@ enum ProcessForkState {
 
 Add the state to `Process`.
 
-- [ ] **Step 3: Implement prepare/commit/rollback**
+- [x] **Step 3: Implement prepare/commit/rollback**
 
 Add:
 
@@ -126,7 +126,7 @@ pub fn rollback_fork(&mut self, parent_pid: Pid, child_pid: Pid) -> Result<(), i
 
 `prepare_fork` clones kernel-owned process metadata and fd table state from the parent but marks the child `ForkPreparing`. `commit_fork` changes the state to `Running`. `rollback_fork` removes only a matching prepared child.
 
-- [ ] **Step 4: Verify green**
+- [x] **Step 4: Verify green**
 
 Run: `cargo test -p yurt-kernel-wasm fork`
 
@@ -134,7 +134,7 @@ Expected: pass.
 
 ## Task 3: Export Fork Control Functions
 
-- [ ] **Step 1: Write failing export-surface test**
+- [x] **Step 1: Write failing export-surface test**
 
 Update `kernel_wasm_export_surface_is_locked` in `packages/runtime-wasmtime/tests/kernel_wasm_trampoline.rs` to include:
 
@@ -148,7 +148,7 @@ Run: `cargo test -p yurt-runtime-wasmtime kernel_wasm_export_surface_is_locked`
 
 Expected: fail because the exports are missing.
 
-- [ ] **Step 2: Add exports**
+- [x] **Step 2: Add exports**
 
 Add to `packages/kernel-wasm/src/lib.rs`:
 
@@ -165,7 +165,7 @@ pub extern "C" fn kernel_rollback_fork(parent_pid: u32, child_pid: u32) -> i64;
 
 Each wraps the matching `Kernel` method and returns `0`, child pid, or negated errno.
 
-- [ ] **Step 3: Verify green**
+- [x] **Step 3: Verify green**
 
 Run: `cargo test -p yurt-runtime-wasmtime kernel_wasm_export_surface_is_locked`
 
@@ -234,4 +234,3 @@ cargo test --tests
 - [ ] **Step 2: Run PR checks**
 
 Push the branch and verify Rust, Deno, and Guest Compat Fixtures are green on PR #47.
-

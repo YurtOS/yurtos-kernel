@@ -95,6 +95,12 @@ impl ThreadRecord {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProcessForkState {
+    Running,
+    ForkPreparing { parent_pid: Pid },
+}
+
 // ── File descriptor table ──────────────────────────────────────────────────
 
 /// One end of a pipe.
@@ -341,6 +347,7 @@ pub struct Process {
     /// are authored here.
     pub threads: BTreeMap<Tid, ThreadRecord>,
     pub next_tid: Tid,
+    fork_state: ProcessForkState,
 }
 
 impl Default for Process {
@@ -372,6 +379,7 @@ impl Default for Process {
             host_instance_handle: None,
             threads: BTreeMap::new(),
             next_tid: 1,
+            fork_state: ProcessForkState::Running,
         }
     }
 }
@@ -639,6 +647,76 @@ impl Kernel {
         if (1..1000).contains(&pid) && !self.processes.contains_key(&pid) {
             self.next_host_pid = pid;
         }
+    }
+
+    pub fn prepare_fork(&mut self, parent_pid: Pid) -> Result<Pid, i32> {
+        let parent = self.processes.get(&parent_pid).ok_or(crate::abi::ESRCH)?;
+        if parent.fork_state != ProcessForkState::Running || parent.exit_status.is_some() {
+            return Err(crate::abi::ESRCH);
+        }
+        if parent.threads.len() > 1 {
+            return Err(crate::abi::EAGAIN);
+        }
+        let mut child = parent.clone();
+        let Some(child_pid) = self.try_alloc_host_pid() else {
+            return Err(crate::abi::EAGAIN);
+        };
+
+        for entry in child.fd_table.entries.values() {
+            self.inc_fd_entry_ref(entry);
+        }
+        child.ppid = parent_pid;
+        child.children.clear();
+        child.exit_status = None;
+        child.host_instance_handle = None;
+        child.pending_signals = 0;
+        child.stdin_buffer.clear();
+        child.stdout_buffer.clear();
+        child.stderr_buffer.clear();
+        child.threads.clear();
+        child
+            .threads
+            .insert(MAIN_THREAD_TID, ThreadRecord::main(None));
+        child.next_tid = FIRST_WORKER_TID;
+        child.fork_state = ProcessForkState::ForkPreparing { parent_pid };
+
+        self.processes.insert(child_pid, child);
+        Ok(child_pid)
+    }
+
+    pub fn commit_fork(&mut self, parent_pid: Pid, child_pid: Pid) -> Result<(), i32> {
+        let child = self
+            .processes
+            .get_mut(&child_pid)
+            .ok_or(crate::abi::ESRCH)?;
+        if child.fork_state != (ProcessForkState::ForkPreparing { parent_pid }) {
+            return Err(crate::abi::EINVAL);
+        }
+        child.fork_state = ProcessForkState::Running;
+        let parent = self
+            .processes
+            .get_mut(&parent_pid)
+            .ok_or(crate::abi::ESRCH)?;
+        if !parent.children.contains(&child_pid) {
+            parent.children.push(child_pid);
+        }
+        Ok(())
+    }
+
+    pub fn rollback_fork(&mut self, parent_pid: Pid, child_pid: Pid) -> Result<(), i32> {
+        let child = self.processes.get(&child_pid).ok_or(crate::abi::ESRCH)?;
+        if child.fork_state != (ProcessForkState::ForkPreparing { parent_pid }) {
+            return Err(crate::abi::EINVAL);
+        }
+        let child = self.processes.remove(&child_pid).expect("child checked");
+        for entry in child.fd_table.entries.values() {
+            self.dec_fd_entry_ref(entry);
+        }
+        if let Some(parent) = self.processes.get_mut(&parent_pid) {
+            parent.children.retain(|&pid| pid != child_pid);
+        }
+        self.release_host_pid_reservation(child_pid);
+        Ok(())
     }
 
     /// Test-only convenience wrapper for low-pid allocation paths
@@ -1136,6 +1214,19 @@ impl Kernel {
         }
     }
 
+    fn inc_fd_entry_ref(&mut self, entry: &FdEntry) {
+        match entry {
+            FdEntry::Pipe { id, end } => {
+                if let Some(buf) = self.pipe_buf_mut(*id) {
+                    buf.inc_ref(*end);
+                }
+            }
+            FdEntry::File { ofd_id } => self.ofd_inc_ref(*ofd_id),
+            FdEntry::Socket { id } => self.socket_inc_ref(*id),
+            FdEntry::Directory { .. } | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => {}
+        }
+    }
+
     /// Build a snapshot of the live process table and push it to
     /// every mounted backend. Backends that don't care (everyone
     /// except procfs today) get a default no-op. Called from
@@ -1144,6 +1235,7 @@ impl Kernel {
         let snaps: Vec<crate::vfs::ProcessSnapshot> = self
             .processes
             .iter()
+            .filter(|(_, p)| p.fork_state == ProcessForkState::Running)
             .map(|(pid, p)| crate::vfs::ProcessSnapshot {
                 pid: *pid,
                 ppid: p.ppid,
@@ -1176,6 +1268,7 @@ impl Kernel {
     pub fn list_processes(&self) -> Vec<ProcessListEntry> {
         self.processes
             .iter()
+            .filter(|(_, p)| p.fork_state == ProcessForkState::Running)
             .map(|(pid, p)| ProcessListEntry {
                 pid: *pid,
                 ppid: p.ppid,
@@ -1198,6 +1291,9 @@ impl Kernel {
 
     pub fn process_group_session(&self, pgid: Pid) -> Option<Pid> {
         self.processes.iter().find_map(|(pid, process)| {
+            if process.fork_state != ProcessForkState::Running {
+                return None;
+            }
             let process_pgid = if process.pgid == 0 {
                 *pid
             } else {
@@ -1217,6 +1313,9 @@ impl Kernel {
         }
         let mut found = false;
         for (pid, process) in self.processes.iter_mut() {
+            if process.fork_state != ProcessForkState::Running {
+                continue;
+            }
             let process_pgid = if process.pgid == 0 {
                 *pid
             } else {
@@ -1240,6 +1339,7 @@ impl Kernel {
     pub fn list_threads(&self, pid: Pid) -> Vec<ThreadRecord> {
         self.processes
             .get(&pid)
+            .filter(|p| p.fork_state == ProcessForkState::Running)
             .map(|p| p.threads.values().cloned().collect())
             .unwrap_or_default()
     }
@@ -1247,6 +1347,7 @@ impl Kernel {
     pub fn list_waits(&self) -> Vec<WaitRecord> {
         self.processes
             .iter()
+            .filter(|(_, p)| p.fork_state == ProcessForkState::Running)
             .flat_map(|(pid, p)| {
                 p.threads.iter().filter_map(move |(tid, t)| {
                     t.wait_reason.map(|reason| WaitRecord {
@@ -1266,6 +1367,7 @@ impl Kernel {
     pub fn list_runnable_threads(&self) -> Vec<RunnableThread> {
         self.processes
             .iter()
+            .filter(|(_, p)| p.fork_state == ProcessForkState::Running)
             .flat_map(|(pid, p)| {
                 p.threads.iter().filter_map(move |(tid, t)| {
                     (t.state == ThreadState::Runnable).then_some(RunnableThread {
@@ -1557,6 +1659,17 @@ impl Kernel {
         }
     }
 
+    fn dec_fd_entry_ref(&mut self, entry: &FdEntry) {
+        match entry {
+            FdEntry::Pipe { id, end } => self.pipe_dec_ref(*id, *end),
+            FdEntry::File { ofd_id } => self.ofd_dec_ref(*ofd_id),
+            FdEntry::Socket { id } => {
+                let _ = self.socket_dec_ref(*id);
+            }
+            FdEntry::Directory { .. } | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => {}
+        }
+    }
+
     /// Get a mutable reference to the process record for `pid`.
     /// Lazily inserts a default `Process` if no entry exists yet.
     pub fn process_mut(&mut self, pid: Pid) -> &mut Process {
@@ -1585,6 +1698,17 @@ impl Kernel {
 
     pub fn has_process(&self, pid: Pid) -> bool {
         self.process_existing(pid).is_some()
+    }
+
+    #[cfg(test)]
+    pub fn is_waitable_child_for_test(&self, parent_pid: Pid, child_pid: Pid) -> bool {
+        self.processes
+            .get(&parent_pid)
+            .is_some_and(|parent| parent.children.contains(&child_pid))
+            && self
+                .processes
+                .get(&child_pid)
+                .is_some_and(|child| child.fork_state == ProcessForkState::Running)
     }
 }
 
@@ -1857,6 +1981,56 @@ mod tests {
     }
 
     #[test]
+    fn prepare_fork_allocates_hidden_child_until_commit() {
+        let _g = TestGuard::acquire();
+        let (parent_pid, child_pid) = with_kernel(|k| {
+            let parent_pid = k.alloc_host_pid();
+            k.insert_host_process(parent_pid, 0, vec![b"/bin/parent".to_vec()], Some(80));
+            let child_pid = k.prepare_fork(parent_pid).expect("prepare fork");
+            (parent_pid, child_pid)
+        });
+
+        assert!(child_pid > parent_pid);
+        assert!(!with_kernel(
+            |k| k.is_waitable_child_for_test(parent_pid, child_pid)
+        ));
+        assert!(!with_kernel(|k| k
+            .list_processes()
+            .iter()
+            .any(|entry| entry.pid == child_pid)));
+
+        with_kernel(|k| k.commit_fork(parent_pid, child_pid).expect("commit fork"));
+        assert!(with_kernel(
+            |k| k.is_waitable_child_for_test(parent_pid, child_pid)
+        ));
+        assert!(with_kernel(|k| k
+            .list_processes()
+            .iter()
+            .any(|entry| entry.pid == child_pid)));
+    }
+
+    #[test]
+    fn rollback_fork_removes_prepared_child() {
+        let _g = TestGuard::acquire();
+        let (parent_pid, child_pid) = with_kernel(|k| {
+            let parent_pid = k.alloc_host_pid();
+            k.insert_host_process(parent_pid, 0, vec![b"/bin/parent".to_vec()], Some(81));
+            let child_pid = k.prepare_fork(parent_pid).expect("prepare fork");
+            (parent_pid, child_pid)
+        });
+
+        with_kernel(|k| {
+            k.rollback_fork(parent_pid, child_pid)
+                .expect("rollback fork")
+        });
+        assert!(!with_kernel(|k| k.has_process(child_pid)));
+        assert!(!with_kernel(|k| k
+            .process(parent_pid)
+            .children
+            .contains(&child_pid)));
+    }
+
+    #[test]
     fn join_running_thread_blocks_one_waiter() {
         let _g = TestGuard::acquire();
         let (pid, target) = with_kernel(|k| {
@@ -1907,11 +2081,10 @@ mod tests {
             Ok(JoinResult::Completed)
         );
         assert_eq!(u32::from_le_bytes(out), 0x8000_0001);
-        assert!(with_kernel(|k| k
+        assert!(with_kernel(|k| !k
             .process(pid)
             .threads
-            .get(&target)
-            .is_none()));
+            .contains_key(&target)));
         assert_eq!(with_kernel(|k| k.take_thread_releases_for_test()), vec![91]);
     }
 

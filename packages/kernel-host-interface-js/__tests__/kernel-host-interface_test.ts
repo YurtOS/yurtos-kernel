@@ -1016,6 +1016,30 @@ Deno.test("waitProcess and killProcess enter kernel-owned process control", asyn
   assertEquals(mk.killProcess(childPid, 64), -22);
 });
 
+Deno.test("fork prepare commit and rollback use kernel-owned process control", async () => {
+  const mk = await freshKernelHostInterface();
+  const parentWasm = await wat2wasm(`(module
+    (memory (export "memory") 1)
+    (func (export "run") (result i32) i32.const 0))`);
+  mk.cacheProcessModule(s("fork-parent"), parentWasm);
+  const parent = mk.spawnCachedProcess(s("fork-parent"), [s("/bin/parent")]);
+  const forkControl = mk as unknown as {
+    prepareFork(parentPid: number): number;
+    commitFork(parentPid: number, childPid: number): void;
+    rollbackFork(parentPid: number, childPid: number): void;
+  };
+
+  const child = forkControl.prepareFork(parent);
+  assertEquals(mk.listProcesses().some((p) => p.pid === child), false);
+
+  forkControl.commitFork(parent, child);
+  assertEquals(mk.listProcesses().some((p) => p.pid === child), true);
+
+  const rolledBack = forkControl.prepareFork(parent);
+  forkControl.rollbackFork(parent, rolledBack);
+  assertEquals(mk.listProcesses().some((p) => p.pid === rolledBack), false);
+});
+
 Deno.test("drainPendingSpawn and recordExit use typed kernel lifecycle exports", async () => {
   const mk = await freshKernelHostInterface();
   const wasmBody = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 9, 9, 9]);

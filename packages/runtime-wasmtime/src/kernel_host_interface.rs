@@ -1866,6 +1866,9 @@ pub struct KernelInstance {
     pub(crate) record_exit: TypedFunc<(u32, i32), i64>,
     pub(crate) drain_spawn: TypedFunc<(u32, u32), i64>,
     pub(crate) spawn_process: TypedFunc<(u32, u32, u32, u32, u32), i64>,
+    pub(crate) prepare_fork: TypedFunc<u32, i64>,
+    pub(crate) commit_fork: TypedFunc<(u32, u32), i64>,
+    pub(crate) rollback_fork: TypedFunc<(u32, u32), i64>,
 }
 
 impl KernelInstance {
@@ -2221,6 +2224,39 @@ impl KernelInstance {
             )
             .context("kernel_spawn_process")
     }
+
+    pub fn prepare_fork(&mut self, parent_pid: u32) -> Result<u32> {
+        let rc = self
+            .prepare_fork
+            .call(&mut self.store, parent_pid)
+            .context("kernel_prepare_fork")?;
+        if rc < 0 {
+            anyhow::bail!("kernel_prepare_fork failed: rc={rc}");
+        }
+        Ok(rc as u32)
+    }
+
+    pub fn commit_fork(&mut self, parent_pid: u32, child_pid: u32) -> Result<()> {
+        let rc = self
+            .commit_fork
+            .call(&mut self.store, (parent_pid, child_pid))
+            .context("kernel_commit_fork")?;
+        if rc != 0 {
+            anyhow::bail!("kernel_commit_fork failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    pub fn rollback_fork(&mut self, parent_pid: u32, child_pid: u32) -> Result<()> {
+        let rc = self
+            .rollback_fork
+            .call(&mut self.store, (parent_pid, child_pid))
+            .context("kernel_rollback_fork")?;
+        if rc != 0 {
+            anyhow::bail!("kernel_rollback_fork failed: rc={rc}");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2470,6 +2506,12 @@ impl KernelHostInterface {
             instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_drain_spawn")?;
         let spawn_process = instance
             .get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_spawn_process")?;
+        let prepare_fork =
+            instance.get_typed_func::<u32, i64>(&mut store, "kernel_prepare_fork")?;
+        let commit_fork =
+            instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_commit_fork")?;
+        let rollback_fork =
+            instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_rollback_fork")?;
 
         let kernel = KernelInstance {
             store,
@@ -2493,6 +2535,9 @@ impl KernelHostInterface {
             record_exit,
             drain_spawn,
             spawn_process,
+            prepare_fork,
+            commit_fork,
+            rollback_fork,
         };
         let kernel = Arc::new(Mutex::new(kernel));
         {
@@ -2569,6 +2614,24 @@ impl KernelHostInterface {
 
     pub fn detach_thread(&self, pid: u32, tid: u32) -> Result<()> {
         self.kernel.lock().unwrap().detach_thread(pid, tid)
+    }
+
+    pub fn prepare_fork(&self, parent_pid: u32) -> Result<u32> {
+        self.kernel.lock().unwrap().prepare_fork(parent_pid)
+    }
+
+    pub fn commit_fork(&self, parent_pid: u32, child_pid: u32) -> Result<()> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .commit_fork(parent_pid, child_pid)
+    }
+
+    pub fn rollback_fork(&self, parent_pid: u32, child_pid: u32) -> Result<()> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .rollback_fork(parent_pid, child_pid)
     }
 
     pub fn record_thread_exit(&self, pid: u32, tid: u32, exit_value: i32) -> Result<()> {

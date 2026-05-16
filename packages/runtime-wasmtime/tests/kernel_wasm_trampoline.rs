@@ -250,6 +250,7 @@ fn kernel_wasm_export_surface_is_locked() {
         exports,
         vec![
             "kernel_block_thread",
+            "kernel_commit_fork",
             "kernel_detach_thread",
             "kernel_dispatch",
             "kernel_dispatch_thread",
@@ -257,9 +258,11 @@ fn kernel_wasm_export_surface_is_locked() {
             "kernel_kill",
             "kernel_list_processes",
             "kernel_list_threads",
+            "kernel_prepare_fork",
             "kernel_record_exit",
             "kernel_record_thread_exit",
             "kernel_record_thread_exit_authenticated",
+            "kernel_rollback_fork",
             "kernel_schedule_next",
             "kernel_scratch_len",
             "kernel_scratch_ptr",
@@ -3522,6 +3525,46 @@ fn process_group_and_session_round_trip_through_trampoline() {
         rc, target_pid as i64,
         "getsid lazy-primes independently of pgid"
     );
+}
+
+#[test]
+fn fork_prepare_commit_and_rollback_round_trip_through_wasmtime_exports() {
+    let mk = fresh_kernel_host_interface(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 0))
+        "#,
+    )
+    .unwrap();
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/fork-parent".as_slice()])
+        .unwrap();
+    let parent_pid = proc.pid();
+
+    let child_pid = mk.prepare_fork(parent_pid).unwrap();
+    assert!(!mk
+        .list_processes()
+        .unwrap()
+        .iter()
+        .any(|p| p.pid == child_pid));
+
+    mk.commit_fork(parent_pid, child_pid).unwrap();
+    assert!(mk
+        .list_processes()
+        .unwrap()
+        .iter()
+        .any(|p| p.pid == child_pid));
+
+    let rolled_back_pid = mk.prepare_fork(parent_pid).unwrap();
+    mk.rollback_fork(parent_pid, rolled_back_pid).unwrap();
+    assert!(!mk
+        .list_processes()
+        .unwrap()
+        .iter()
+        .any(|p| p.pid == rolled_back_pid));
 }
 
 #[test]
