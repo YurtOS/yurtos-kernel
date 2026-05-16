@@ -288,7 +288,17 @@ unsafe fn kh_idb_get(
     _out_ptr: *mut u8,
     _out_cap: usize,
 ) -> i64 {
-    -38
+    #[cfg(test)]
+    {
+        let store = std::slice::from_raw_parts(_store_ptr, _store_len);
+        let key = std::slice::from_raw_parts(_key_ptr, _key_len);
+        let out = std::slice::from_raw_parts_mut(_out_ptr, _out_cap);
+        test_support::idb_get(store, key, out)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -311,7 +321,17 @@ unsafe fn kh_idb_put(
     _value_ptr: *const u8,
     _value_len: usize,
 ) -> i32 {
-    -38
+    #[cfg(test)]
+    {
+        let store = std::slice::from_raw_parts(_store_ptr, _store_len);
+        let key = std::slice::from_raw_parts(_key_ptr, _key_len);
+        let value = std::slice::from_raw_parts(_value_ptr, _value_len);
+        test_support::idb_put(store, key, value)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -321,7 +341,16 @@ unsafe fn kh_idb_delete(
     _key_ptr: *const u8,
     _key_len: usize,
 ) -> i32 {
-    -38
+    #[cfg(test)]
+    {
+        let store = std::slice::from_raw_parts(_store_ptr, _store_len);
+        let key = std::slice::from_raw_parts(_key_ptr, _key_len);
+        test_support::idb_delete(store, key)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -333,7 +362,17 @@ unsafe fn kh_idb_list(
     _out_ptr: *mut u8,
     _out_cap: usize,
 ) -> i64 {
-    -38
+    #[cfg(test)]
+    {
+        let store = std::slice::from_raw_parts(_store_ptr, _store_len);
+        let prefix = std::slice::from_raw_parts(_prefix_ptr, _prefix_len);
+        let out = std::slice::from_raw_parts_mut(_out_ptr, _out_cap);
+        test_support::idb_list(store, prefix, out)
+    }
+    #[cfg(not(test))]
+    {
+        -38
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -554,7 +593,7 @@ pub fn socket_peer_addr(handle: i32, out: &mut [u8]) -> i64 {
 
 #[cfg(test)]
 pub mod test_support {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::{LazyLock, Mutex};
 
     #[derive(Default)]
@@ -607,6 +646,91 @@ pub mod test_support {
 
     pub fn thread_cancel_calls() -> Vec<i32> {
         THREAD_MOCK.lock().unwrap().cancel_calls.clone()
+    }
+
+    /// In-memory durable-KV emulation for the native `kh_idb_*` shims
+    /// (B4a — "natives emulate", project_kh_idb_kv). BTreeMap so `list`
+    /// is deterministically key-ordered.
+    #[derive(Default)]
+    struct IdbMock {
+        stores: BTreeMap<Vec<u8>, BTreeMap<Vec<u8>, Vec<u8>>>,
+    }
+
+    static IDB_MOCK: LazyLock<Mutex<IdbMock>> = LazyLock::new(|| Mutex::new(IdbMock::default()));
+
+    pub fn reset_idb_mock() {
+        *IDB_MOCK.lock().unwrap() = IdbMock::default();
+    }
+
+    pub(super) fn idb_get(store: &[u8], key: &[u8], out: &mut [u8]) -> i64 {
+        let mock = IDB_MOCK.lock().unwrap();
+        match mock.stores.get(store).and_then(|s| s.get(key)) {
+            Some(value) => {
+                if out.len() < value.len() {
+                    // KH ABI contract (abi/contract/kernel_host_abi.toml
+                    // kh_idb_get): too-small output is -E2BIG, NOT a
+                    // positive required-size. The Wasmtime and JS hosts
+                    // both return -E2BIG; the test emulation must match
+                    // so unit tests don't validate behavior real hosts
+                    // never produce. (PR #61 review P2.)
+                    return -(crate::abi::E2BIG as i64);
+                }
+                out[..value.len()].copy_from_slice(value);
+                value.len() as i64
+            }
+            None => -(crate::abi::ENOENT as i64),
+        }
+    }
+
+    pub(super) fn idb_put(store: &[u8], key: &[u8], value: &[u8]) -> i32 {
+        IDB_MOCK
+            .lock()
+            .unwrap()
+            .stores
+            .entry(store.to_vec())
+            .or_default()
+            .insert(key.to_vec(), value.to_vec());
+        0
+    }
+
+    pub(super) fn idb_delete(store: &[u8], key: &[u8]) -> i32 {
+        if let Some(s) = IDB_MOCK.lock().unwrap().stores.get_mut(store) {
+            s.remove(key);
+        }
+        0 // idempotent: 0 whether or not the key existed
+    }
+
+    pub(super) fn idb_list(store: &[u8], prefix: &[u8], out: &mut [u8]) -> i64 {
+        if out.len() < 4 {
+            // Deliberately NOT -E2BIG (unlike idb_get). kh_idb_list and
+            // kh_idb_get have different contracts: kh_idb_get returns
+            // -E2BIG on a too-small buffer, but kh_idb_list returns the
+            // positive byte count it would/did write (the 4-byte count
+            // header at minimum) — verified against BOTH real hosts
+            // (JS `kh_idb_list` mod.ts → `return BigInt(total)`;
+            // wasmtime kernel_host_interface.rs → `buf.len() as i64`),
+            // neither of which ever returns -E2BIG here. Matching the
+            // real hosts is the whole point of this emulation, so the
+            // get/list asymmetry is intentional, not a bug to "fix".
+            return 4; // count-header size; nothing written
+        }
+        let mock = IDB_MOCK.lock().unwrap();
+        let mut written = 4usize; // reserve the u32 count header
+        let mut count: u32 = 0;
+        if let Some(s) = mock.stores.get(store) {
+            for key in s.keys().filter(|k| k.starts_with(prefix)) {
+                let entry = 4 + key.len();
+                if written + entry > out.len() {
+                    break; // truncate — never a partial entry
+                }
+                out[written..written + 4].copy_from_slice(&(key.len() as u32).to_le_bytes());
+                out[written + 4..written + 4 + key.len()].copy_from_slice(key);
+                written += entry;
+                count += 1;
+            }
+        }
+        out[0..4].copy_from_slice(&count.to_le_bytes());
+        written as i64
     }
 
     pub(super) fn thread_spawn(pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32 {

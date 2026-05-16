@@ -112,6 +112,13 @@ const ABI_IMPORT_METHODS = new Map<string, string | null>([
   ["host_socket_addr", "sys_socket_addr"],
   ["host_socket_option", "sys_socket_option"],
   ["host_socket_close", "sys_socket_close"],
+  // Continuation-only host hook: there is no `[method.sys_fork]` —
+  // the kernel-side fork lifecycle is the host_fork hook plus
+  // sys_spawn, so this maps to no Rust dispatch method (documented).
+  // Pre-existing main discrepancy (host_fork in yurt_abi.toml since B1,
+  // never mapped here) — also fixed in #58; identical, self-heals on
+  // whichever lands first.
+  ["host_fork", null],
   ["host_dns_resolve", null],
   ["host_network_fetch", "sys_fetch"],
   ["host_extension_invoke", "sys_extension_invoke"],
