@@ -1451,7 +1451,7 @@ export const HOST_BINDINGS: HostBinding[] = [
   },
   {
     name: "host_socket_peercred",
-    method: METHOD.SYS_SOCKET_INFO,
+    method: METHOD.SYS_SOCKET_PEERCRED,
     args: [],
     custom: (mk, memBuf, callerPid) =>
     async (
@@ -1460,15 +1460,22 @@ export const HOST_BINDINGS: HostBinding[] = [
       uidPtr: number,
       gidPtr: number,
     ): Promise<number> => {
+      // Wire SO_PEERCRED to the dedicated kernel syscall (0x1_0081),
+      // NOT sys_socket_info — only sys_socket_peercred returns the
+      // *captured* peer pid/uid/gid for the accept/connect cases.
+      // Response is 12 bytes: i32 pid LE + i32 uid LE + i32 gid LE; the
+      // kernel returns the byte count (12) on success, negative errno
+      // on failure (the libc shim wants 0 on success, so map any
+      // non-negative return to 0).
       const req = new Uint8Array(4);
       new DataView(req.buffer).setUint32(0, fd >>> 0, true);
       const out = await mk.kernelSyscallAsync(
-        METHOD.SYS_SOCKET_INFO,
+        METHOD.SYS_SOCKET_PEERCRED,
         callerPid,
         req,
-        24,
+        12,
       );
-      if (Number(out.rc) !== 24 || out.response.byteLength < 24) return -1;
+      if (Number(out.rc) < 0 || out.response.byteLength < 12) return -1;
       const view = new DataView(
         out.response.buffer,
         out.response.byteOffset,
@@ -1476,13 +1483,13 @@ export const HOST_BINDINGS: HostBinding[] = [
       );
       const record = new Uint8Array(4);
       const recordView = new DataView(record.buffer);
-      recordView.setInt32(0, view.getInt32(12, true), true);
+      recordView.setInt32(0, view.getInt32(0, true), true);
       let outRc = copyOut(memBuf, pidPtr, record);
       if (outRc < 0) return outRc;
-      recordView.setInt32(0, view.getUint32(16, true), true);
+      recordView.setInt32(0, view.getInt32(4, true), true);
       outRc = copyOut(memBuf, uidPtr, record);
       if (outRc < 0) return outRc;
-      recordView.setInt32(0, view.getUint32(20, true), true);
+      recordView.setInt32(0, view.getInt32(8, true), true);
       outRc = copyOut(memBuf, gidPtr, record);
       if (outRc < 0) return outRc;
       return 0;

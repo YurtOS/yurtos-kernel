@@ -110,6 +110,16 @@ fn sockaddr_in(host: [u8; 4], port: u16) -> [u8; 16] {
     addr
 }
 
+/// 28-byte sockaddr_in6: family(2,LE)=10 + port(2,BE) + flowinfo(4) +
+/// addr(16) + scope_id(4).
+fn sockaddr_in6(host: [u8; 16], port: u16) -> [u8; 28] {
+    let mut addr = [0u8; 28];
+    addr[0..2].copy_from_slice(&10u16.to_le_bytes());
+    addr[2..4].copy_from_slice(&port.to_be_bytes());
+    addr[8..24].copy_from_slice(&host);
+    addr
+}
+
 fn sockaddr_un(path: &[u8]) -> Vec<u8> {
     let mut addr = 1u16.to_le_bytes().to_vec();
     addr.extend_from_slice(path);
@@ -8638,5 +8648,863 @@ fn idb_list_buffer_too_small_for_header_matches_host_count_size() {
     assert_eq!(
         tiny, [0xAAu8; 2],
         "nothing written when the header does not fit"
+    );
+}
+
+// --- Slice B3.1: POSIX shutdown(fd, how) ---
+
+fn shutdown_req(fd: u32, how: u32) -> Vec<u8> {
+    let mut r = fd.to_le_bytes().to_vec();
+    r.extend_from_slice(&how.to_le_bytes());
+    r
+}
+
+/// AF_UNIX SOCK_DGRAM socketpair (`socketpair_req(1, 2, 0)`) → connected
+/// fds 3 and 4. The caller already holds the `TestGuard`; do NOT
+/// re-acquire it here — the test lock is a non-reentrant Mutex, so a
+/// second acquire on this thread deadlocks (and would also reset kernel
+/// state mid-test).
+fn unix_dgram_pair() {
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKETPAIR,
+            1,
+            &socketpair_req(1, 2, 0),
+            &mut [0u8; 8]
+        ),
+        8
+    );
+}
+
+#[test]
+fn shutdown_wr_makes_send_epipe() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    unix_dgram_pair();
+    // Pre-shutdown send works.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SEND,
+            1,
+            &socket_send_req(3, b"hi"),
+            &mut []
+        ),
+        2
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(3, 1), &mut []),
+        0
+    );
+    // SHUT_WR → subsequent send is EPIPE.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SEND,
+            1,
+            &socket_send_req(3, b"x"),
+            &mut []
+        ),
+        -(abi::EPIPE as i64)
+    );
+}
+
+#[test]
+fn shutdown_rd_makes_recv_eof_even_with_queued_data() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    unix_dgram_pair();
+    // Peer (fd 4) sends to fd 3's rx queue.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SEND,
+            1,
+            &socket_send_req(4, b"data"),
+            &mut []
+        ),
+        4
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(3, 0), &mut []),
+        0
+    );
+    // SHUT_RD → recv returns 0 (EOF) despite queued bytes.
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(3, 0), &mut buf),
+        0
+    );
+}
+
+#[test]
+fn shutdown_rdwr_blocks_both_directions() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    unix_dgram_pair();
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(3, 2), &mut []),
+        0
+    );
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(3, 0), &mut buf),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SEND,
+            1,
+            &socket_send_req(3, b"x"),
+            &mut []
+        ),
+        -(abi::EPIPE as i64)
+    );
+}
+
+#[test]
+fn shutdown_is_idempotent_and_accumulates() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    unix_dgram_pair();
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(3, 0), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(3, 0), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(3, 1), &mut []),
+        0
+    );
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(3, 0), &mut buf),
+        0,
+        "SHUT_RD still in effect after also SHUT_WR"
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SEND,
+            1,
+            &socket_send_req(3, b"x"),
+            &mut []
+        ),
+        -(abi::EPIPE as i64)
+    );
+}
+
+#[test]
+fn shutdown_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    unix_dgram_pair();
+    // how out of range.
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(3, 3), &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // short request.
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &[0u8; 4], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // unknown fd.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SHUTDOWN,
+            1,
+            &shutdown_req(404, 0),
+            &mut []
+        ),
+        -(abi::EBADF as i64)
+    );
+    // not a socket (a regular file fd).
+    let ffd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"/sd.txt"),
+        &mut [],
+    );
+    assert!(ffd >= 3);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SHUTDOWN,
+            1,
+            &shutdown_req(ffd as u32, 0),
+            &mut []
+        ),
+        -(abi::ENOTSOCK as i64)
+    );
+}
+
+// --- Slice B3.1 (review P2): shutdown consistency across all I/O ---
+
+#[test]
+fn shutdown_wr_makes_sendto_epipe() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+        3
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+        4
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_BIND,
+            1,
+            &socket_bind_unix_req(3, b"/tmp/sd-to-rx.sock"),
+            &mut []
+        ),
+        0
+    );
+    // Pre-shutdown sendto works.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDTO,
+            1,
+            &socket_sendto_req(4, 0, &sockaddr_un(b"/tmp/sd-to-rx.sock"), b"hi"),
+            &mut []
+        ),
+        2
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(4, 1), &mut []),
+        0
+    );
+    // SHUT_WR must also stop sendto, not just send.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDTO,
+            1,
+            &socket_sendto_req(4, 0, &sockaddr_un(b"/tmp/sd-to-rx.sock"), b"x"),
+            &mut []
+        ),
+        -(abi::EPIPE as i64)
+    );
+}
+
+#[test]
+fn shutdown_rd_makes_recvfrom_eof_even_with_queued_data() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+        3
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+        4
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_BIND,
+            1,
+            &socket_bind_unix_req(3, b"/tmp/sd-from-rx.sock"),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDTO,
+            1,
+            &socket_sendto_req(4, 0, &sockaddr_un(b"/tmp/sd-from-rx.sock"), b"ping"),
+            &mut []
+        ),
+        4
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(3, 0), &mut []),
+        0
+    );
+    // SHUT_RD must also make recvfrom EOF (0), despite queued bytes.
+    let mut response = [0u8; 4 + 8 + 108];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVFROM,
+            1,
+            &socket_recvfrom_req(3, 0, 4, 108),
+            &mut response
+        ),
+        0
+    );
+}
+
+#[test]
+fn shutdown_wr_makes_sendmsg_epipe() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // AF_UNIX SOCK_STREAM pair on fds 3 and 4.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKETPAIR,
+            1,
+            &socketpair_req(1, 1, 0),
+            &mut [0u8; 8]
+        ),
+        8
+    );
+    // Pre-shutdown sendmsg works.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDMSG,
+            1,
+            &socket_sendmsg_req(3, b"hi", &[]),
+            &mut []
+        ),
+        2
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(3, 1), &mut []),
+        0
+    );
+    // SHUT_WR must also stop sendmsg.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDMSG,
+            1,
+            &socket_sendmsg_req(3, b"x", &[]),
+            &mut []
+        ),
+        -(abi::EPIPE as i64)
+    );
+}
+
+// --- Slice B3.2: SO_PEERCRED (sys_socket_peercred) ---
+
+/// Decode the 12-byte ucred response: (pid, uid, gid) as i32 LE.
+fn peercred(buf: &[u8]) -> (i32, i32, i32) {
+    (
+        i32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        i32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        i32::from_le_bytes(buf[8..12].try_into().unwrap()),
+    )
+}
+
+#[test]
+fn peercred_socketpair_reports_creating_process() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // AF_UNIX SOCK_STREAM (sock_type 1) pair on fds 3 and 4, created by
+    // pid 1. peer_cred only lives on UnixStream — a SOCK_DGRAM pair
+    // (sock_type 2, what unix_dgram_pair() builds) has no captured peer.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKETPAIR,
+            1,
+            &socketpair_req(1, 1, 0),
+            &mut [0u8; 8]
+        ),
+        8
+    );
+    let mut buf = [0u8; 12];
+    // fixed_out convention (cf. sys_socket_info / sys_socket_addr):
+    // success returns the byte count written, not 0. The host adapter
+    // maps any >=0 to the libc-level 0 the TS host_socket_peercred returns.
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_PEERCRED, 1, &socket_fd_req(3), &mut buf),
+        12
+    );
+    // Default credentials (Credentials::DEFAULT) are uid/gid 1000; the
+    // creating process is pid 1. Both ends see the creator.
+    assert_eq!(peercred(&buf), (1, 1000, 1000));
+    let mut buf2 = [0u8; 12];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_PEERCRED, 1, &socket_fd_req(4), &mut buf2),
+        12
+    );
+    assert_eq!(peercred(&buf2), (1, 1000, 1000));
+}
+
+#[test]
+fn peercred_non_unix_stream_socket_returns_zeros() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // AF_UNIX SOCK_DGRAM pair: a socket fd, but not a UnixStream — no
+    // captured peer creds, so zeros (mirrors TS host_socket_peercred `?? 0`).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKETPAIR,
+            1,
+            &socketpair_req(1, 2, 0),
+            &mut [0u8; 8]
+        ),
+        8
+    );
+    let mut buf = [0xFFu8; 12];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_PEERCRED, 1, &socket_fd_req(3), &mut buf),
+        12
+    );
+    assert_eq!(peercred(&buf), (0, 0, 0));
+}
+
+#[test]
+fn peercred_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    unix_dgram_pair();
+    // Short request.
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_PEERCRED, 1, &[], &mut [0u8; 12]),
+        -(abi::EINVAL as i64)
+    );
+    // Too-small response → required size (12), nothing written.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_PEERCRED,
+            1,
+            &socket_fd_req(3),
+            &mut [0u8; 4]
+        ),
+        12
+    );
+    // Deliberate ordering (PR #58 review): the response-size check
+    // short-circuits BEFORE fd validation, matching the fixed_out
+    // convention of sys_socket_info / sys_socket_addr. So small buffer
+    // + bad fd returns the required size (12), NOT -EBADF — pinned here
+    // so the ordering is an asserted choice, not an accident.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_PEERCRED,
+            1,
+            &socket_fd_req(404),
+            &mut [0u8; 4]
+        ),
+        12
+    );
+    // Unknown fd.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_PEERCRED,
+            1,
+            &socket_fd_req(404),
+            &mut [0u8; 12]
+        ),
+        -(abi::EBADF as i64)
+    );
+    // Not a socket (a regular file fd).
+    let ffd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"/pc.txt"),
+        &mut [],
+    );
+    assert!(ffd >= 3);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_PEERCRED,
+            1,
+            &socket_fd_req(ffd as u32),
+            &mut [0u8; 12]
+        ),
+        -(abi::ENOTSOCK as i64)
+    );
+}
+
+// --- Slice B3.4a: AF_INET6 socket() / sockaddr_in6 acceptance ---
+
+#[test]
+fn socket_open_af_inet6_succeeds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // Parity: TS host_socket_open does not validate the domain — any
+    // non-(AF_UNIX SOCK_DGRAM) allocates an inet stream socket. AF_INET6
+    // must not be rejected with EAFNOSUPPORT at the kernel boundary.
+    // NOTE: this slice only closes the AF_INET6 case. Rust intentionally
+    // remains stricter than TS for other families (e.g. AF_PACKET still
+    // → EAFNOSUPPORT); full domain-permissive parity is out of scope.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(10, 1, 0),
+            &mut []
+        ),
+        3
+    );
+}
+
+#[test]
+fn connect_af_inet6_reaches_host_seam() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    crate::kh::test_support::push_socket_connect_result(55);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(10, 1, 0),
+            &mut []
+        ),
+        3
+    );
+    let v6 = sockaddr_in6([0u8; 16], 8080); // ::, port 8080
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_CONNECT,
+            1,
+            &socket_connect_req(3, &v6),
+            &mut []
+        ),
+        0
+    );
+    // The sockaddr_in6 bytes are forwarded verbatim to the host adapter
+    // (same seam as IPv4) — not rejected as an unsupported family.
+    assert_eq!(
+        crate::kh::test_support::socket_connect_calls(),
+        vec![(v6.to_vec(), 0)]
+    );
+}
+
+#[test]
+fn bind_af_inet6_sockaddr_accepted() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(10, 1, 0),
+            &mut []
+        ),
+        3
+    );
+    let v6 = sockaddr_in6([0u8; 16], 9000);
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_BIND, 1, &socket_bind_req(3, &v6), &mut []),
+        0
+    );
+}
+
+#[test]
+fn af_inet_socket_still_rejects_inet6_sockaddr_family_mismatch() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // Additivity guard: an AF_INET (domain 2) socket given a v6
+    // sockaddr is still EAFNOSUPPORT — v6 acceptance must not loosen
+    // the v4 path's family/addr match.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(2, 1, 0),
+            &mut []
+        ),
+        3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_CONNECT,
+            1,
+            &socket_connect_req(3, &sockaddr_in6([0u8; 16], 80)),
+            &mut []
+        ),
+        -(abi::EAFNOSUPPORT as i64)
+    );
+}
+
+#[test]
+fn listen_af_inet6_unbound_uses_v6_wildcard() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    crate::kh::test_support::push_socket_listen_result(123);
+    // AF_INET6 stream socket, never bound → listen() must synthesize
+    // the v6 wildcard (any_addr_ipv6_sockaddr) and forward it to the
+    // host listen seam (PR #58 review: this branch was uncovered).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(10, 1, 0),
+            &mut []
+        ),
+        3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_LISTEN,
+            1,
+            &socket_listen_req(3, 8),
+            &mut []
+        ),
+        0
+    );
+    let calls = crate::kh::test_support::socket_listen_calls();
+    assert_eq!(calls.len(), 1);
+    let (addr, backlog) = &calls[0];
+    assert_eq!(*backlog, 8);
+    assert_eq!(addr.len(), 28, "sockaddr_in6 is 28 bytes");
+    assert_eq!(
+        u16::from_le_bytes([addr[0], addr[1]]),
+        10,
+        "AF_INET6 family"
+    );
+}
+
+// --- Slice B3.1 (review P2): shutdown must not corrupt socket state ---
+
+#[test]
+fn shutdown_rd_does_not_transfer_or_drain_scm_rights() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // AF_UNIX SOCK_STREAM pair.
+    let mut socket_fds = [0u8; 8];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKETPAIR,
+            1,
+            &socketpair_req(1, 1, 0),
+            &mut socket_fds
+        ),
+        8
+    );
+    let left = u32::from_le_bytes(socket_fds[0..4].try_into().unwrap());
+    let right = u32::from_le_bytes(socket_fds[4..8].try_into().unwrap());
+    // Queue a message carrying an SCM_RIGHTS fd on `right`'s rx queue.
+    let mut pipe_fds = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_fds), 8);
+    let pipe_write = u32::from_le_bytes(pipe_fds[4..8].try_into().unwrap());
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDMSG,
+            1,
+            &socket_sendmsg_req(left, b"x", &[pipe_write]),
+            &mut []
+        ),
+        1
+    );
+    // Close the read half of `right` BEFORE receiving.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SHUTDOWN,
+            1,
+            &shutdown_req(right, 0),
+            &mut []
+        ),
+        0
+    );
+    // recvmsg now reports EOF (0 bytes) and must NOT install the queued
+    // fd nor drain the ancillary queue — a shutdown EOF is not a
+    // zero-length message. Pre-fix this returned 0 yet still transferred
+    // the fd (rights count == 1). (PR #58 review P2)
+    let mut recv = [0u8; 1 + 4 + 4];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVMSG,
+            1,
+            &socket_recvmsg_req(right, 0, 1),
+            &mut recv
+        ),
+        0
+    );
+    assert_eq!(
+        u32::from_le_bytes(recv[1..5].try_into().unwrap()),
+        0,
+        "SHUT_RD EOF must not transfer SCM_RIGHTS fds"
+    );
+}
+
+#[test]
+fn shutdown_before_connect_does_not_poison_host_socket() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    crate::kh::test_support::push_socket_connect_result(91);
+    crate::kh::test_support::push_socket_recv_result(b"pong");
+    // AF_INET stream socket — still SocketKind::Open (unconnected).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(2, 1, 0),
+            &mut []
+        ),
+        3
+    );
+    // shutdown() on the unconnected Open socket records half-close bits
+    // (SHUT_RDWR). This must not survive the Open→Host conversion.
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(3, 2), &mut []),
+        0
+    );
+    // connect() reuses the same socket id, converting Open→Host.
+    let req = socket_connect_req(3, &sockaddr_in([127, 0, 0, 1], 6000));
+    assert_eq!(dispatch(METHOD_SYS_SOCKET_CONNECT, 1, &req, &mut []), 0);
+    // send must reach the live host socket, NOT return EPIPE from the
+    // stale pre-connect SHUT_WR bit. (PR #58 review P2)
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SEND,
+            1,
+            &socket_send_req(3, b"ping"),
+            &mut []
+        ),
+        4
+    );
+    assert_eq!(
+        crate::kh::test_support::socket_send_calls(),
+        vec![(91, b"ping".to_vec())]
+    );
+    // recv must reach the host socket, NOT return 0 from a stale SHUT_RD.
+    let mut recv = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(3, 0), &mut recv),
+        4
+    );
+    assert_eq!(&recv[..4], b"pong");
+}
+
+// --- Slice B3.1 (review): shutdown(SHUT_WR) gives the AF_UNIX peer EOF ---
+
+#[test]
+fn shutdown_wr_gives_unix_stream_peer_eof_after_drain_but_peer_can_still_send() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // AF_UNIX SOCK_STREAM pair: fd 3 (A) <-> fd 4 (B).
+    let mut fds = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 1, 0), &mut fds),
+        8
+    );
+    let a = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+    let b = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+    // A queues "hi" to B, then shuts its write half.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SEND,
+            1,
+            &socket_send_req(a, b"hi"),
+            &mut []
+        ),
+        2
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(a, 1), &mut []),
+        0
+    );
+    // POSIX: B drains the already-queued bytes first...
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(b, 0), &mut buf),
+        2
+    );
+    assert_eq!(&buf[..2], b"hi");
+    // ...then sees EOF (0), NOT EAGAIN — A's SHUT_WR reached the peer.
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(b, 0), &mut buf),
+        0,
+        "peer must observe EOF after draining following peer SHUT_WR"
+    );
+    // Asymmetry guard: B's write half is still open — B can still send
+    // to A, and A (only its write half shut) can still recv. This is
+    // why the fix is a distinct peer-write-closed bit, NOT peer_open
+    // = false (which would wrongly EPIPE B's send).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SEND,
+            1,
+            &socket_send_req(b, b"yo"),
+            &mut []
+        ),
+        2,
+        "peer SHUT_WR must not close the peer's own write half"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(a, 0), &mut buf),
+        2,
+        "the SHUT_WR socket can still read (only its write half closed)"
+    );
+    assert_eq!(&buf[..2], b"yo");
+}
+
+#[test]
+fn shutdown_wr_gives_unix_datagram_peer_eof_after_drain() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // AF_UNIX SOCK_DGRAM pair (sock_type 2): fd 3 (A) <-> fd 4 (B).
+    let mut fds = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 2, 0), &mut fds),
+        8
+    );
+    let a = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+    let b = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SEND,
+            1,
+            &socket_send_req(a, b"pkt"),
+            &mut []
+        ),
+        3
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(a, 1), &mut []),
+        0
+    );
+    let mut buf = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(b, 0), &mut buf),
+        3
+    );
+    assert_eq!(&buf[..3], b"pkt");
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_RECV, 1, &socket_recv_req(b, 0), &mut buf),
+        0,
+        "datagram peer must observe EOF after draining following peer SHUT_WR"
+    );
+}
+
+#[test]
+fn shutdown_wr_gives_unix_datagram_peer_recvfrom_eof_after_drain() {
+    // PR #58 review P2: recvfrom must honor the peer-write-closed bit
+    // exactly like recv, or callers using recvfrom never see EOF after
+    // a connected datagram peer's shutdown(SHUT_WR).
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    let mut fds = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 2, 0), &mut fds),
+        8
+    );
+    let a = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+    let b = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SEND,
+            1,
+            &socket_send_req(a, b"pkt"),
+            &mut []
+        ),
+        3
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SHUTDOWN, 1, &shutdown_req(a, 1), &mut []),
+        0
+    );
+    let mut resp = [0u8; 8 + 8 + 8]; // data_cap=8 + meta(8) + path_cap=8
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVFROM,
+            1,
+            &socket_recvfrom_req(b, 0, 8, 8),
+            &mut resp
+        ),
+        3
+    );
+    assert_eq!(&resp[..3], b"pkt");
+    // Empty queue + peer SHUT_WR → EOF (0), NOT -EAGAIN (recv-consistent).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVFROM,
+            1,
+            &socket_recvfrom_req(b, 0, 8, 8),
+            &mut resp
+        ),
+        0,
+        "recvfrom must observe EOF after peer SHUT_WR (consistent with recv)"
     );
 }
