@@ -190,6 +190,15 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
         Err(errno) => return -(errno as i64),
     };
 
+    // Invariant: a directory fd's stored path is absolute (PathResolver
+    // normalizes at open() time). The join below would otherwise be
+    // silently treated as cwd-relative by sys_open. Holds until the #59
+    // inode-anchored rewrite replaces this path snapshot (PR #55 review).
+    debug_assert!(
+        dir.first() == Some(&b'/'),
+        "dir fd path must be absolute, got {:?}",
+        String::from_utf8_lossy(&dir)
+    );
     let mut joined = dir;
     if joined.last() != Some(&b'/') {
         joined.push(b'/');

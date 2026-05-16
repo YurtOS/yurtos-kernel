@@ -6944,6 +6944,46 @@ fn dup3_unknown_flag_bits_are_einval() {
 }
 
 #[test]
+fn dup3_clears_cloexec_on_a_recycled_newfd() {
+    // PR #55 review #3: dup3 onto a newfd that ALREADY has FD_CLOEXEC,
+    // with flags=0, must clear the stale bit (deterministic, unlike
+    // dup2). Locks the recycled-fd path the other tests didn't cover.
+    let _g = crate::kernel::TestGuard::acquire();
+    let oldfd = open_rw(b"/dup3-old.txt");
+    let newfd = open_rw(b"/dup3-new.txt");
+    let mut set = newfd.to_le_bytes().to_vec();
+    set.extend_from_slice(&1u32.to_le_bytes()); // FD_CLOEXEC
+    assert_eq!(
+        dispatch(METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS, 1, &set, &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &newfd.to_le_bytes(),
+            &mut []
+        ),
+        1,
+        "precondition: newfd has FD_CLOEXEC set"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(oldfd, newfd, 0), &mut []),
+        newfd as i64
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &newfd.to_le_bytes(),
+            &mut []
+        ),
+        0,
+        "dup3 flags=0 must clear the recycled fd's stale FD_CLOEXEC"
+    );
+}
+
+#[test]
 fn dup3_cloexec_flag_controls_newfd_inheritance() {
     let _g = crate::kernel::TestGuard::acquire();
     let oldfd = open_rw(b"/dup3d.txt");

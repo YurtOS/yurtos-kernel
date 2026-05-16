@@ -770,6 +770,11 @@ fn pread_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                     Some(o) => (o.mount_id, o.inode),
                     None => return -(abi::EBADF as i64),
                 };
+                // FIXME(#60): POSIX pread on an O_WRONLY fd is -EBADF.
+                // We don't reject it (consistent with read_fd — a
+                // pre-existing gap, not a regression). The fix needs the
+                // same OFD access-mode field as #60's F_GETFL O_ACCMODE
+                // gap; folded there.
                 // Positional: read at the caller's offset; cursor unchanged.
                 k.vfs.read(mount_id, inode, offset, response)
             }
