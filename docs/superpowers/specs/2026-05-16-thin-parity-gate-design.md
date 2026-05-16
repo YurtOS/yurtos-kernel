@@ -155,8 +155,15 @@ slow-tier only.
    green in the fast tier — pure logic, no artifacts.
 2. **Done:** `parity-differ_test.ts` enumerates `abi/conformance/*.spec.toml`,
    runs each case through both kernels via the shared harness, applies
-   `evaluateGate`. Skips loudly (never false-green) when kernel.wasm / JSPI /
-   canaries are absent; verified locally to skip cleanly.
+   `evaluateGate`. When kernel.wasm / JSPI / canaries are absent the
+   affected `it()` `console.warn`s and early-returns — which in Deno's bdd
+   runner is a **logged green, not a red**: nothing turns "slow tier ran
+   with no artifacts" into a CI failure by itself. The fail-loud guarantee
+   is the gate logic, not the skip — an unevaluable case becomes
+   `unestablished-case` and fails against the committed (empty) baseline.
+   Residual risk (a misconfigured artifact-less slow tier logs green) is
+   accepted: the CI step builds artifacts immediately beforehand and the
+   job is env-gated. Verified locally to skip cleanly (logged-green path).
 3. **Done:** `YURT_KERNEL=ts|wasm` selector added to
    `scripts/run-wasm-test-in-sandbox.ts`; default `ts` unchanged, `both`
    rejected with guidance. `deno fmt/lint/check` clean.

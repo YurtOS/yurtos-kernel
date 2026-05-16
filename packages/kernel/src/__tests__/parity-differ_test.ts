@@ -11,8 +11,18 @@
  * can detect divergence; ts/wasm are single-kernel triage modes.
  *
  * Slow tier only — it needs built canaries + kernel.wasm. When those
- * artifacts (or JSPI) are absent it SKIPS loudly rather than passing
- * vacuously, so a green run without artifacts is never mistaken for parity.
+ * artifacts (or JSPI) are absent the affected `it()` `console.warn`s and
+ * early-returns. Be precise about what that means: an early-returning
+ * `it()` is a *passing* test in Deno's bdd runner, so this is a LOGGED
+ * GREEN, not a red — there is no mechanism that turns "ran the slow tier
+ * with missing artifacts" into a CI failure on its own. What does fail
+ * loud is the gate logic: any spec case that can't be evaluated becomes
+ * an `unestablished-case`, and with the committed (currently empty)
+ * baseline that fails the run. The residual risk — a misconfigured slow
+ * tier that builds no artifacts logs green — is real and accepted
+ * because the CI step builds the artifacts immediately beforehand and
+ * the job is env-gated. Do not read a green local run without
+ * kernel.wasm as evidence of parity.
  */
 
 import { describe, it } from "@std/testing/bdd";

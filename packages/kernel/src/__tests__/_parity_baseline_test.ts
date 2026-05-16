@@ -138,7 +138,10 @@ describe("evaluateOrphans", () => {
       [{ canary: "other", case: "k" }],
     );
     expect(failures.length).toBe(1);
-    expect(failures[0].kind).toBe("stale-allowlist-entry");
+    // Distinct from evaluateGate's now-matching `stale-allowlist-entry`
+    // (PR #53 review 🟢): an orphan is a renamed/removed case, a
+    // conceptually different failure mode, so it gets its own kind.
+    expect(failures[0].kind).toBe("orphan-allowlist-entry");
     expect(failures[0].canary).toBe("gone");
   });
 
@@ -158,12 +161,18 @@ describe("formatBaselineSeed", () => {
         kind: "unexpected-divergence",
         canary: "dup2-canary",
         case: "happy",
-        detail: "ts vs wasm",
+        detail: "ts exit=1 stdout=… vs wasm exit=0 stdout=…(long blob)",
       },
     ]);
     expect(seed).toContain("[[divergence]]");
     expect(seed).toContain(`canary = "dup2-canary"`);
     expect(seed).toContain(`case = "happy"`);
+    // PR #53 review 🟢: `reason` is a short copy-pasteable placeholder,
+    // NOT the full diff blob. The observed detail is preserved as a
+    // trimmed `# observed:` comment so no diagnostic is lost.
+    expect(seed).not.toContain(`reason = "ts exit=1 stdout=`);
+    expect(seed).toMatch(/reason = "TODO: /);
+    expect(seed).toContain("# observed: ts exit=1 stdout=");
     // Round-trips through parseBaseline once a slice is filled in.
     const filled = seed.replace(`"TODO"`, `"B2"`).replace(
       /^# .*$/gm,

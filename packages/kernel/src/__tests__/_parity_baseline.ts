@@ -41,7 +41,14 @@ export interface ParityRow {
 
 export type GateFailureKind =
   | "unexpected-divergence"
+  // An allowlisted (canary, case) that now matches — the allowlist must
+  // shrink, so the entry must be deleted (emitted by evaluateGate).
   | "stale-allowlist-entry"
+  // A baseline entry no run row or unestablished case produced this run
+  // (canary/case renamed or removed). Conceptually distinct from a
+  // now-matching entry — kept separate so diagnostics are precise
+  // (PR #53 review 🟢). Also must be deleted from the baseline.
+  | "orphan-allowlist-entry"
   // A case whose parity could not be established at all (harness error
   // spawning/instantiating, or its fixture wasn't built). Must be an
   // explicit baseline entry or it fails — never silently skipped.
@@ -182,12 +189,21 @@ export function formatBaselineSeed(failures: GateFailure[]): string {
       f.kind === "unexpected-divergence" || f.kind === "unestablished-case",
   );
   if (seedable.length === 0) return "";
+  // PR #53 review 🟢: keep the seed copy-pasteable. The full diff blob
+  // goes in a one-lined, length-capped `# observed:` comment (no
+  // diagnostic lost); `reason` is a short TODO placeholder the human
+  // replaces with the real justification.
+  const oneLine = (s: string) => {
+    const flat = s.replace(/\s+/g, " ").trim();
+    return flat.length > 160 ? `${flat.slice(0, 157)}...` : flat;
+  };
   const blocks = seedable.map((f) =>
     `[[divergence]]\n` +
     `canary = ${JSON.stringify(f.canary)}\n` +
     `case = ${JSON.stringify(f.case)}\n` +
     `slice = "TODO"  # owning slice that will fix this row\n` +
-    `reason = ${JSON.stringify(f.detail)}\n`
+    `# observed: ${oneLine(f.detail)}\n` +
+    `reason = "TODO: why this divergence is tolerated"\n`
   );
   return `# --- candidate parity-baseline.toml seed (review & set slice) ---\n` +
     blocks.join("\n");
@@ -209,7 +225,7 @@ export function evaluateOrphans(
   for (const e of baseline) {
     if (!seenKeys.has(key(e.canary, e.case))) {
       failures.push({
-        kind: "stale-allowlist-entry",
+        kind: "orphan-allowlist-entry",
         canary: e.canary,
         case: e.case,
         slice: e.slice,
