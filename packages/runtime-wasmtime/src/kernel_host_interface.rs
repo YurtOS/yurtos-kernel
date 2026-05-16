@@ -478,6 +478,12 @@ impl LogSink for StderrLogSink {
     }
 }
 
+pub trait ThreadHost: Send + Sync {
+    fn spawn(&self, pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32;
+    fn release(&self, host_thread_handle: i32) -> i32;
+    fn cancel(&self, host_thread_handle: i32) -> i32;
+}
+
 /// State threaded through every wasmtime host callback that runs
 /// during kernel.wasm execution.
 pub struct HostState {
@@ -520,6 +526,10 @@ pub struct HostState {
     /// this with IndexedDB; native deployments use a disk-backed
     /// store or [`InMemoryKv`] for tests.
     pub kv: Option<Arc<dyn KvBackend>>,
+    /// Host thread executor for Rust-owned `kh_thread_*` calls.
+    /// The kernel owns thread ids, join/detach/reap semantics, and
+    /// stores the opaque handle this adapter returns.
+    pub thread_host: Option<Arc<dyn ThreadHost>>,
     /// Kernel-host process engine state for cached wasm modules.
     /// The kernel owns pid allocation and process records; this
     /// table is only the wasmtime adapter's module/handle storage.
@@ -536,6 +546,7 @@ impl Default for HostState {
             host_fs: None,
             tcp: None,
             kv: None,
+            thread_host: None,
             process_engine: Arc::new(Mutex::new(CachedProcessEngine::default())),
         }
     }
@@ -1531,6 +1542,7 @@ pub struct KernelInstance {
     pub(crate) scratch_ptr: u32,
     pub(crate) scratch_len: u32,
     pub(crate) dispatch: TypedFunc<(u32, u32, u32, u32, u32, u32), i64>,
+    pub(crate) dispatch_thread: TypedFunc<(u32, u32, u32, u32, u32, u32, u32), i64>,
     pub(crate) list_processes: TypedFunc<(u32, u32), i64>,
     pub(crate) list_threads: TypedFunc<(u32, u32, u32), i64>,
     pub(crate) snapshot: TypedFunc<(u32, u32), i64>,
@@ -1588,6 +1600,51 @@ impl KernelInstance {
             self.memory
                 .read(&self.store, out_ptr as usize, response)
                 .context("read syscall response from kernel scratch")?;
+        }
+        Ok(rc)
+    }
+
+    /// Run a thread-aware syscall. The host supplies `caller_tid`
+    /// from trusted adapter state; guest request bytes are not allowed
+    /// to identify the calling thread.
+    pub fn thread_syscall(
+        &mut self,
+        method_id: u32,
+        caller_pid: u32,
+        caller_tid: u32,
+        request: &[u8],
+        response: &mut [u8],
+    ) -> Result<i64> {
+        if request.len() + response.len() > self.scratch_len as usize {
+            return Err(anyhow!(
+                "request+response ({} bytes) exceeds scratch capacity ({})",
+                request.len() + response.len(),
+                self.scratch_len
+            ));
+        }
+        let in_ptr = self.scratch_ptr;
+        let in_len = request.len() as u32;
+        let out_ptr = self.scratch_ptr + in_len;
+        let out_cap = response.len() as u32;
+
+        if !request.is_empty() {
+            self.memory
+                .write(&mut self.store, in_ptr as usize, request)
+                .context("write thread syscall request into kernel scratch")?;
+        }
+        let rc = self
+            .dispatch_thread
+            .call(
+                &mut self.store,
+                (
+                    method_id, caller_pid, caller_tid, in_ptr, in_len, out_ptr, out_cap,
+                ),
+            )
+            .context("kernel_dispatch_thread")?;
+        if !response.is_empty() {
+            self.memory
+                .read(&self.store, out_ptr as usize, response)
+                .context("read thread syscall response from kernel scratch")?;
         }
         Ok(rc)
     }
@@ -2069,6 +2126,10 @@ impl KernelHostInterface {
             .call(&mut store, ())?;
         let dispatch = instance
             .get_typed_func::<(u32, u32, u32, u32, u32, u32), i64>(&mut store, "kernel_dispatch")?;
+        let dispatch_thread = instance.get_typed_func::<(u32, u32, u32, u32, u32, u32, u32), i64>(
+            &mut store,
+            "kernel_dispatch_thread",
+        )?;
         let list_processes =
             instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_list_processes")?;
         let list_threads =
@@ -2107,6 +2168,7 @@ impl KernelHostInterface {
             scratch_ptr,
             scratch_len,
             dispatch,
+            dispatch_thread,
             list_processes,
             list_threads,
             snapshot,
@@ -2139,6 +2201,20 @@ impl KernelHostInterface {
             .lock()
             .unwrap()
             .syscall(method_id, KERNEL_PID, request, response)
+    }
+
+    pub fn thread_syscall(
+        &self,
+        method_id: u32,
+        caller_pid: u32,
+        caller_tid: u32,
+        request: &[u8],
+        response: &mut [u8],
+    ) -> Result<i64> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .thread_syscall(method_id, caller_pid, caller_tid, request, response)
     }
 
     /// Return the kernel-owned process snapshot. The wasmtime adapter
@@ -3649,19 +3725,32 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_thread_spawn",
-        |_caller: Caller<'_, KernelStoreData>, _pid: u32, _tid: u32, _fn_ptr: u32, _arg: u32| {
-            -ENOSYS as i32
+        |caller: Caller<'_, KernelStoreData>, pid: u32, tid: u32, fn_ptr: u32, arg: u32| {
+            let Some(thread_host) = caller.data().host.thread_host.as_ref() else {
+                return -ENOSYS as i32;
+            };
+            thread_host.spawn(pid, tid, fn_ptr, arg)
         },
     )?;
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_thread_release",
-        |_caller: Caller<'_, KernelStoreData>, _host_thread_handle: i32| 0_i32,
+        |caller: Caller<'_, KernelStoreData>, host_thread_handle: i32| {
+            let Some(thread_host) = caller.data().host.thread_host.as_ref() else {
+                return 0_i32;
+            };
+            thread_host.release(host_thread_handle)
+        },
     )?;
     linker.func_wrap(
         KH_NAMESPACE,
         "kh_thread_cancel",
-        |_caller: Caller<'_, KernelStoreData>, _host_thread_handle: i32| 0_i32,
+        |caller: Caller<'_, KernelStoreData>, host_thread_handle: i32| {
+            let Some(thread_host) = caller.data().host.thread_host.as_ref() else {
+                return 0_i32;
+            };
+            thread_host.cancel(host_thread_handle)
+        },
     )?;
 
     Ok(())

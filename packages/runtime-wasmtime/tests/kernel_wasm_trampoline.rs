@@ -14,6 +14,7 @@ use wasmtime::{Engine, Module};
 use yurt_runtime_wasmtime::kernel_host_interface::{
     build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, InMemoryHostFs,
     InMemoryKv, KernelHostInterface, KvBackend, LogSink, NativeHostFs, NativeTcpSocket, RedbKv,
+    ThreadHost,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -349,6 +350,91 @@ fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
         .unwrap()
         .into_iter()
         .all(|thread| thread.tid != tid));
+}
+
+#[derive(Default)]
+struct RecordingThreadHost {
+    spawns: Mutex<Vec<(u32, u32, u32, u32)>>,
+    releases: Mutex<Vec<i32>>,
+    cancels: Mutex<Vec<i32>>,
+}
+
+impl ThreadHost for RecordingThreadHost {
+    fn spawn(&self, pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32 {
+        self.spawns.lock().unwrap().push((pid, tid, fn_ptr, arg));
+        77
+    }
+
+    fn release(&self, host_thread_handle: i32) -> i32 {
+        self.releases.lock().unwrap().push(host_thread_handle);
+        0
+    }
+
+    fn cancel(&self, host_thread_handle: i32) -> i32 {
+        self.cancels.lock().unwrap().push(host_thread_handle);
+        0
+    }
+}
+
+#[test]
+fn wasmtime_thread_host_callbacks_execute_rust_owned_spawn_and_release() {
+    const METHOD_SYS_THREAD_SPAWN: u32 = 0x1_004D;
+    const METHOD_SYS_THREAD_JOIN: u32 = 0x1_004F;
+
+    let thread_host = Arc::new(RecordingThreadHost::default());
+    let host = HostState {
+        thread_host: Some(thread_host.clone()),
+        ..HostState::default()
+    };
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 7))
+        "#,
+    )
+    .unwrap();
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+
+    let mut spawn_req = Vec::new();
+    spawn_req.extend_from_slice(&123_u32.to_le_bytes());
+    spawn_req.extend_from_slice(&456_u32.to_le_bytes());
+    let rc = mk
+        .thread_syscall(METHOD_SYS_THREAD_SPAWN, proc.pid(), 1, &spawn_req, &mut [])
+        .unwrap();
+    assert_eq!(rc, 2);
+    assert_eq!(
+        thread_host.spawns.lock().unwrap().as_slice(),
+        &[(proc.pid(), 2, 123, 456)]
+    );
+    let spawned = mk
+        .list_threads(proc.pid())
+        .unwrap()
+        .into_iter()
+        .find(|thread| thread.tid == 2)
+        .unwrap();
+    assert_eq!(spawned.host_thread_handle, Some(77));
+
+    mk.record_thread_exit(proc.pid(), 2, 0x1234).unwrap();
+    let mut join_req = Vec::new();
+    join_req.extend_from_slice(&2_u32.to_le_bytes());
+    let mut join_out = [0u8; 4];
+    let rc = mk
+        .thread_syscall(
+            METHOD_SYS_THREAD_JOIN,
+            proc.pid(),
+            1,
+            &join_req,
+            &mut join_out,
+        )
+        .unwrap();
+    assert_eq!(rc, 0);
+    assert_eq!(u32::from_le_bytes(join_out), 0x1234);
+    assert_eq!(thread_host.releases.lock().unwrap().as_slice(), &[77]);
 }
 
 #[test]
