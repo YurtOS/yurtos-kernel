@@ -145,6 +145,8 @@ const METHOD_SYS_SETRLIMIT: u32 = 0x1_000D;
 const METHOD_SYS_CLOSE: u32 = 0x1_000E;
 const METHOD_SYS_DUP: u32 = 0x1_000F;
 const METHOD_SYS_DUP2: u32 = 0x1_0011;
+const METHOD_SYS_DUP_MIN: u32 = 0x1_0054;
+const METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS: u32 = 0x1_0055;
 const METHOD_SYS_PIPE: u32 = 0x1_0012;
 const METHOD_SYS_READ: u32 = 0x1_0013;
 const METHOD_SYS_WRITE: u32 = 0x1_0014;
@@ -3010,11 +3012,18 @@ fn user_process_fd_table_dup_close_lifecycle() {
         (module
           (import "env" "sys_dup"   (func $dup   (param i32) (result i32)))
           (import "env" "sys_dup2"  (func $dup2  (param i32 i32) (result i32)))
+          (import "env" "sys_dup_min"  (func $dup_min  (param i32 i32) (result i32)))
+          (import "env" "sys_set_fd_descriptor_flags"
+            (func $set_fd_descriptor_flags (param i32 i32) (result i32)))
           (import "env" "sys_close" (func $close (param i32) (result i32)))
           (func (export "dup_stdout") (result i32) (call $dup (i32.const 1)))
           (func (export "dup_unopened") (result i32) (call $dup (i32.const 99)))
           (func (export "dup2_into_50") (result i32)
             (call $dup2 (i32.const 1) (i32.const 50)))
+          (func (export "dup_min_10") (result i32)
+            (call $dup_min (i32.const 1) (i32.const 10)))
+          (func (export "set_cloexec_10") (result i32)
+            (call $set_fd_descriptor_flags (i32.const 10) (i32.const 1)))
           (func (export "close_50") (result i32) (call $close (i32.const 50)))
           (func (export "close_50_again") (result i32) (call $close (i32.const 50)))
           (func (export "close_3") (result i32) (call $close (i32.const 3))))
@@ -3029,6 +3038,9 @@ fn user_process_fd_table_dup_close_lifecycle() {
     assert_eq!(user.call_export_i32("dup_unopened").unwrap(), -9);
     // Dup2 to an arbitrary high fd.
     assert_eq!(user.call_export_i32("dup2_into_50").unwrap(), 50);
+    // F_DUPFD-style duplicate at or above a floor, then set FD_CLOEXEC.
+    assert_eq!(user.call_export_i32("dup_min_10").unwrap(), 10);
+    assert_eq!(user.call_export_i32("set_cloexec_10").unwrap(), 0);
     // Close the high fd; second close fails -EBADF.
     assert_eq!(user.call_export_i32("close_50").unwrap(), 0);
     assert_eq!(user.call_export_i32("close_50_again").unwrap(), -9);
@@ -3218,6 +3230,12 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
         ("sys_close", METHOD_SYS_CLOSE, METHOD_SYS_CLOSE as i64),
         ("sys_dup", METHOD_SYS_DUP, METHOD_SYS_DUP as i64),
         ("sys_dup2", METHOD_SYS_DUP2, METHOD_SYS_DUP2 as i64),
+        ("sys_dup_min", METHOD_SYS_DUP_MIN, METHOD_SYS_DUP_MIN as i64),
+        (
+            "sys_set_fd_descriptor_flags",
+            METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS,
+            METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS as i64,
+        ),
         ("sys_pipe", METHOD_SYS_PIPE, METHOD_SYS_PIPE as i64),
         ("sys_read", METHOD_SYS_READ, METHOD_SYS_READ as i64),
         ("sys_write", METHOD_SYS_WRITE, METHOD_SYS_WRITE as i64),

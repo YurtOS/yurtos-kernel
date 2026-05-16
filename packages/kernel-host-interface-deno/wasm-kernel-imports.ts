@@ -630,6 +630,16 @@ export const HOST_BINDINGS: HostBinding[] = [
   // ── fd duplication ────────────────────────────────────────
   // host_dup2(srcFd, dstFd) → newfd or -EBADF.
   { name: "host_dup2", method: METHOD.SYS_DUP2, args: ["scalar", "scalar"] },
+  {
+    name: "host_dup_min",
+    method: METHOD.SYS_DUP_MIN,
+    args: ["scalar", "scalar"],
+  },
+  {
+    name: "host_set_fd_descriptor_flags",
+    method: METHOD.SYS_SET_FD_DESCRIPTOR_FLAGS,
+    args: ["scalar", "scalar"],
+  },
 
   // ── Path-based fs ops (single path) ────────────────────────
   // host_mkdir(pathPtr, pathLen) → 0 / -errno.

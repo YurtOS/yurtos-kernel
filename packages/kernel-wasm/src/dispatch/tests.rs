@@ -809,6 +809,90 @@ fn dup2_oldfd_unopened_is_ebadf() {
 }
 
 #[test]
+fn dup_min_returns_lowest_unused_fd_at_or_above_minimum() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut req = Vec::new();
+    req.extend_from_slice(&1_u32.to_le_bytes());
+    req.extend_from_slice(&5_u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_DUP_MIN, 1, &req, &mut []), 5);
+
+    let mut req2 = Vec::new();
+    req2.extend_from_slice(&1_u32.to_le_bytes());
+    req2.extend_from_slice(&5_u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_DUP_MIN, 1, &req2, &mut []), 6);
+}
+
+#[test]
+fn dup_min_rejects_closed_source_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut req = Vec::new();
+    req.extend_from_slice(&42_u32.to_le_bytes());
+    req.extend_from_slice(&5_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP_MIN, 1, &req, &mut []),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn set_fd_descriptor_flags_rejects_closed_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut req = Vec::new();
+    req.extend_from_slice(&42_u32.to_le_bytes());
+    req.extend_from_slice(&1_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS, 1, &req, &mut []),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn sys_spawn_does_not_inherit_cloexec_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let parent_pid = 1;
+    let mut image = vec![];
+    image.extend_from_slice(b"\0asm");
+    image.extend_from_slice(&[1, 0, 0, 0]);
+    let mut reg = (b"/bin/child".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/bin/child");
+    reg.extend_from_slice(&image);
+    assert_eq!(dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []), 0);
+
+    let mut dup_min_req = Vec::new();
+    dup_min_req.extend_from_slice(&1_u32.to_le_bytes());
+    dup_min_req.extend_from_slice(&5_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP_MIN, parent_pid, &dup_min_req, &mut []),
+        5
+    );
+
+    let mut flags_req = Vec::new();
+    flags_req.extend_from_slice(&5_u32.to_le_bytes());
+    flags_req.extend_from_slice(&1_u32.to_le_bytes()); // FD_CLOEXEC
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS,
+            parent_pid,
+            &flags_req,
+            &mut []
+        ),
+        0
+    );
+
+    let mut spawn_req = Vec::new();
+    spawn_req.extend_from_slice(&(b"/bin/child".len() as u32).to_le_bytes());
+    spawn_req.extend_from_slice(b"/bin/child");
+    spawn_req.extend_from_slice(&(b"child".len() as u32).to_le_bytes());
+    spawn_req.extend_from_slice(b"child");
+    let child_pid = dispatch(METHOD_SYS_SPAWN, parent_pid, &spawn_req, &mut []);
+    assert!(child_pid >= 1000);
+
+    let child_has_fd5 =
+        crate::kernel::with_kernel(|k| k.process_mut(child_pid as u32).fd_table.entry(5).is_some());
+    assert!(!child_has_fd5);
+}
+
+#[test]
 fn fd_table_is_per_pid() {
     let _g = crate::kernel::TestGuard::acquire();
     // Close fd 0 in pid 1.

@@ -137,6 +137,20 @@ export function buildSysImports(
       v.setUint32(4, newfd >>> 0, true);
       return forwardRequestBytes(METHOD.SYS_DUP2, req);
     },
+    sys_dup_min: (oldfd, minfd) => {
+      const req = new Uint8Array(8);
+      const v = new DataView(req.buffer);
+      v.setUint32(0, oldfd >>> 0, true);
+      v.setUint32(4, minfd >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_DUP_MIN, req);
+    },
+    sys_set_fd_descriptor_flags: (fd, flags) => {
+      const req = new Uint8Array(8);
+      const v = new DataView(req.buffer);
+      v.setUint32(0, fd >>> 0, true);
+      v.setUint32(4, flags >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_SET_FD_DESCRIPTOR_FLAGS, req);
+    },
 
     sys_pipe: (outPtr) => {
       const { rc, response } = forwardRequestWithResponse(

@@ -455,6 +455,40 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(calls[0].request).toEqual(new Uint8Array([7, 0, 0, 0, 15, 0, 0, 0]));
   });
 
+  it("multi-scalar fd helpers pack dup_min and descriptor flags inline", async () => {
+    const calls: CapturedCall[] = [];
+    const rcs = [9, 0];
+    const mk = {
+      kernelSyscallAsync(
+        method: number,
+        callerPid: number,
+        request: Uint8Array,
+        responseCap: number,
+      ): Promise<{ rc: bigint; response: Uint8Array }> {
+        calls.push({
+          method,
+          callerPid,
+          request: request.slice(),
+          responseCap,
+        });
+        return Promise.resolve({
+          rc: BigInt(rcs.shift() ?? 0),
+          response: new Uint8Array(),
+        });
+      },
+    } as unknown as KernelHostInterface;
+    const fakeBuf = new ArrayBuffer(8);
+    const imports = buildWasmKernelImports(mk, () => fakeBuf);
+    expect(await imports.host_dup_min(3, 9)).toEqual(9);
+    expect(await imports.host_set_fd_descriptor_flags(9, 1)).toEqual(0);
+    expect(calls.map((call) => call.method)).toEqual([
+      METHOD.SYS_DUP_MIN,
+      METHOD.SYS_SET_FD_DESCRIPTOR_FLAGS,
+    ]);
+    expect(calls[0].request).toEqual(new Uint8Array([3, 0, 0, 0, 9, 0, 0, 0]));
+    expect(calls[1].request).toEqual(new Uint8Array([9, 0, 0, 0, 1, 0, 0, 0]));
+  });
+
   it("host_wait converts the kernel wait record to yurt_wait_result_v1", async () => {
     const kernelWait = new Uint8Array(8);
     const kernelView = new DataView(kernelWait.buffer);

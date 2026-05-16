@@ -151,6 +151,8 @@ pub fn dispatch_with_context(
         METHOD_SYS_CLOSE => close_fd(caller_pid, request),
         METHOD_SYS_DUP => dup_fd(caller_pid, request),
         METHOD_SYS_DUP2 => dup2_fd(caller_pid, request),
+        METHOD_SYS_DUP_MIN => dup_min_fd(caller_pid, request),
+        METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS => set_fd_descriptor_flags(caller_pid, request),
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
@@ -340,6 +342,41 @@ fn dup2_fd(caller_pid: u32, request: &[u8]) -> i64 {
             let _ = kh::socket_close(handle);
         }
         newfd as i64
+    })
+}
+
+/// `dup_min(oldfd: u32, minfd: u32) -> newfd / -EBADF / -EINVAL`.
+fn dup_min_fd(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([oldfd, minfd]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(oldfd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        let Some(newfd) = k.process_mut(caller_pid).fd_table.lowest_free_fd_at(minfd) else {
+            return -(abi::EINVAL as i64);
+        };
+        inc_entry_ref(k, &entry);
+        k.process_mut(caller_pid).fd_table.install(newfd, entry);
+        newfd as i64
+    })
+}
+
+fn set_fd_descriptor_flags(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd, flags]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        match k
+            .process_mut(caller_pid)
+            .fd_table
+            .set_descriptor_flags(fd, flags)
+        {
+            Ok(()) => 0,
+            Err(errno) => -(errno as i64),
+        }
     })
 }
 

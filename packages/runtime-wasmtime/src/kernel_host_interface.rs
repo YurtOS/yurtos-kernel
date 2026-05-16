@@ -222,6 +222,8 @@ mod sys_method_id {
     pub const DUP: u32 = 0x1_000F;
     pub const EXTENSION_INVOKE: u32 = 0x1_0010;
     pub const DUP2: u32 = 0x1_0011;
+    pub const DUP_MIN: u32 = 0x1_0054;
+    pub const SET_FD_DESCRIPTOR_FLAGS: u32 = 0x1_0055;
     pub const PIPE: u32 = 0x1_0012;
     pub const READ: u32 = 0x1_0013;
     pub const WRITE: u32 = 0x1_0014;
@@ -4413,6 +4415,34 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::DUP2,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_dup_min",
+        |mut caller: Caller<'_, UserState>, oldfd: i32, minfd: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(oldfd as u32).to_le_bytes());
+            req.extend_from_slice(&(minfd as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::DUP_MIN,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_set_fd_descriptor_flags",
+        |mut caller: Caller<'_, UserState>, fd: i32, flags: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&(flags as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SET_FD_DESCRIPTOR_FLAGS,
                 &req,
             ) as i32
         },

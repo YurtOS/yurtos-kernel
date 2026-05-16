@@ -144,18 +144,21 @@ pub enum FdEntry {
 #[derive(Clone, Debug)]
 pub struct FdTable {
     entries: BTreeMap<u32, FdEntry>,
+    descriptor_flags: BTreeMap<u32, u32>,
 }
 
 impl FdTable {
     /// Default table for a freshly-spawned process: stdin/stdout/stderr
-    /// pre-opened on fds 0/1/2. Real "inheritance from parent" plus
-    /// O_CLOEXEC handling lands when sys_spawn does.
+    /// pre-opened on fds 0/1/2.
     fn new() -> Self {
         let mut entries = BTreeMap::new();
         entries.insert(0, FdEntry::Stdin);
         entries.insert(1, FdEntry::Stdout);
         entries.insert(2, FdEntry::Stderr);
-        Self { entries }
+        Self {
+            entries,
+            descriptor_flags: BTreeMap::new(),
+        }
     }
 
     /// Read-only view of an entry. None if `fd` is closed.
@@ -165,36 +168,68 @@ impl FdTable {
 
     /// Lowest unused fd number. Used by `dup` and `pipe` to allocate.
     pub fn lowest_free_fd(&self) -> u32 {
-        let mut n = 0;
-        while self.entries.contains_key(&n) {
+        self.lowest_free_fd_at(0).expect("fd table exhausted")
+    }
+
+    pub fn lowest_free_fd_at(&self, min_fd: u32) -> Option<u32> {
+        let mut n = min_fd;
+        loop {
+            if !self.entries.contains_key(&n) {
+                return Some(n);
+            }
+            if n == u32::MAX {
+                return None;
+            }
             n += 1;
         }
-        n
+    }
+
+    pub fn set_descriptor_flags(&mut self, fd: u32, flags: u32) -> Result<(), i32> {
+        if !self.entries.contains_key(&fd) {
+            return Err(crate::abi::EBADF);
+        }
+        const FD_CLOEXEC: u32 = 1;
+        let flags = flags & FD_CLOEXEC;
+        if flags == 0 {
+            self.descriptor_flags.remove(&fd);
+        } else {
+            self.descriptor_flags.insert(fd, flags);
+        }
+        Ok(())
+    }
+
+    fn descriptor_flags(&self, fd: u32) -> u32 {
+        self.descriptor_flags.get(&fd).copied().unwrap_or(0)
+    }
+
+    pub fn inheritable_entries(&self) -> Vec<(u32, FdEntry)> {
+        const FD_CLOEXEC: u32 = 1;
+        self.entries
+            .iter()
+            .filter(|(fd, _)| self.descriptor_flags(**fd) & FD_CLOEXEC == 0)
+            .map(|(fd, entry)| (*fd, entry.clone()))
+            .collect()
     }
 
     /// Install `entry` at `fd`, returning the previous occupant (which
     /// the caller is responsible for cleaning up — pipe refcount,
     /// future file refcount, etc.).
     pub fn install(&mut self, fd: u32, entry: FdEntry) -> Option<FdEntry> {
+        self.descriptor_flags.remove(&fd);
         self.entries.insert(fd, entry)
     }
 
     /// Remove the entry at `fd`. Caller is responsible for any
     /// refcount cleanup on the returned entry.
     pub fn remove(&mut self, fd: u32) -> Option<FdEntry> {
+        self.descriptor_flags.remove(&fd);
         self.entries.remove(&fd)
-    }
-
-    pub fn entries(&self) -> Vec<(u32, FdEntry)> {
-        self.entries
-            .iter()
-            .map(|(fd, entry)| (*fd, entry.clone()))
-            .collect()
     }
 
     pub fn from_entries(entries: Vec<(u32, FdEntry)>) -> Self {
         Self {
             entries: entries.into_iter().collect(),
+            descriptor_flags: BTreeMap::new(),
         }
     }
 }

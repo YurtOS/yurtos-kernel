@@ -341,6 +341,22 @@ args = [
   { name = "out_cap", type = "usize" },
 ]
 
+[import.host_dup_min]
+doc = "Duplicate a file descriptor into the lowest free fd >= min_fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "min_fd", type = "i32" },
+]
+
+[import.host_set_fd_descriptor_flags]
+doc = "Set POSIX descriptor flags such as FD_CLOEXEC for an open fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "flags", type = "i32" },
+]
+
 [import.host_spawn]
 doc = "Spawn a guest process from a native spawn request record and write yurt_spawn_result_v1."
 return = "fixed_out"

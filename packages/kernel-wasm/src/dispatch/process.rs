@@ -1015,7 +1015,7 @@ pub(super) fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
                 parent.credentials,
                 parent.cwd.clone(),
                 parent.rlimits,
-                parent.fd_table.entries(),
+                parent.fd_table.inheritable_entries(),
                 parent.nice,
                 parent.scheduler_policy,
                 parent.scheduler_priority,

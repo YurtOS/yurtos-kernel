@@ -97,8 +97,10 @@ const KERNEL_IMPORTS_BASELINE = [
 const ABI_IMPORT_METHODS = new Map<string, string | null>([
   ["host_pipe", "sys_pipe"],
   ["host_dup", "sys_dup"],
+  ["host_dup_min", "sys_dup_min"],
   ["host_spawn", "sys_spawn"],
   ["host_wait", "sys_wait"],
+  ["host_set_fd_descriptor_flags", "sys_set_fd_descriptor_flags"],
   ["host_read_fd", "sys_read"],
   ["host_write_fd", "sys_write"],
   ["host_socket_send", "sys_socket_send"],
