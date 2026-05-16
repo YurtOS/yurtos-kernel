@@ -1145,6 +1145,16 @@ impl Kernel {
             .collect()
     }
 
+    pub fn process_group_session(&self, pgid: Pid) -> Option<Pid> {
+        self.processes.iter().find_map(|(pid, process)| {
+            (process.exit_status.is_none() && process.pgid == pgid).then_some(if process.sid == 0 {
+                *pid
+            } else {
+                process.sid
+            })
+        })
+    }
+
     pub fn list_threads(&self, pid: Pid) -> Vec<ThreadRecord> {
         self.processes
             .get(&pid)

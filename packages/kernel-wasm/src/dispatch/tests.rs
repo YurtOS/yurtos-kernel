@@ -3474,9 +3474,14 @@ fn getpgid_self_defaults_to_caller_pid() {
 #[test]
 fn setpgid_then_getpgid_round_trips() {
     let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let group = k.process_mut(5);
+        group.sid = 1;
+        group.pgid = 5;
+    });
     let mut req = Vec::new();
     req.extend_from_slice(&0_u32.to_le_bytes()); // target = self
-    req.extend_from_slice(&5_u32.to_le_bytes()); // new pgid
+    req.extend_from_slice(&5_u32.to_le_bytes()); // existing same-session pgid
     assert_eq!(dispatch(METHOD_SYS_SETPGID, 1, &req, &mut []), 0);
     assert_eq!(
         dispatch(METHOD_SYS_GETPGID, 1, &0_u32.to_le_bytes(), &mut []),
@@ -3501,6 +3506,61 @@ fn setpgid_pgid_zero_makes_target_a_group_leader() {
 }
 
 #[test]
+fn setpgid_rejects_session_leaders_and_cross_session_groups() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let parent = k.process_mut(1);
+        parent.sid = 1;
+        parent.pgid = 1;
+
+        let child = k.process_mut(2);
+        child.sid = 1;
+        child.pgid = 1;
+
+        let other = k.process_mut(3);
+        other.sid = 3;
+        other.pgid = 3;
+    });
+
+    let mut session_leader_req = Vec::new();
+    session_leader_req.extend_from_slice(&3_u32.to_le_bytes());
+    session_leader_req.extend_from_slice(&3_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SETPGID, 1, &session_leader_req, &mut []),
+        -(abi::EPERM as i64)
+    );
+
+    let mut cross_session_req = Vec::new();
+    cross_session_req.extend_from_slice(&2_u32.to_le_bytes());
+    cross_session_req.extend_from_slice(&3_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SETPGID, 1, &cross_session_req, &mut []),
+        -(abi::EPERM as i64)
+    );
+
+    let mut missing_group_req = Vec::new();
+    missing_group_req.extend_from_slice(&2_u32.to_le_bytes());
+    missing_group_req.extend_from_slice(&99_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SETPGID, 1, &missing_group_req, &mut []),
+        -(abi::EPERM as i64)
+    );
+}
+
+#[test]
+fn setsid_rejects_process_group_leader_after_group_is_observed() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_GETPGID, 9, &0_u32.to_le_bytes(), &mut []),
+        9
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SETSID, 9, &[], &mut []),
+        -(abi::EPERM as i64)
+    );
+}
+
+#[test]
 fn pgid_is_per_pid() {
     let _g = crate::kernel::TestGuard::acquire();
     crate::kernel::with_kernel(|k| {
@@ -3509,7 +3569,7 @@ fn pgid_is_per_pid() {
     // pid 1 default sees pgid 1; setting pid 2's pgid doesn't move pid 1.
     let mut req = Vec::new();
     req.extend_from_slice(&2_u32.to_le_bytes());
-    req.extend_from_slice(&99_u32.to_le_bytes());
+    req.extend_from_slice(&0_u32.to_le_bytes());
     dispatch(METHOD_SYS_SETPGID, 1, &req, &mut []);
     assert_eq!(
         dispatch(METHOD_SYS_GETPGID, 1, &0_u32.to_le_bytes(), &mut []),
@@ -3517,7 +3577,7 @@ fn pgid_is_per_pid() {
     );
     assert_eq!(
         dispatch(METHOD_SYS_GETPGID, 1, &2_u32.to_le_bytes(), &mut []),
-        99
+        2
     );
 }
 

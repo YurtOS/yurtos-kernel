@@ -588,8 +588,7 @@ pub(super) fn getpgid(caller_pid: u32, request: &[u8]) -> i64 {
 }
 
 /// `setpgid(pid, pgid)`. pid==0 → caller; pgid==0 → target's pid (i.e.
-/// make the target a new group leader). Phase 2 has no permission /
-/// session-membership checks.
+/// make the target a new group leader).
 pub(super) fn setpgid(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([target_arg, pgid_arg]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
@@ -601,6 +600,24 @@ pub(super) fn setpgid(caller_pid: u32, request: &[u8]) -> i64 {
     };
     let new_pgid = if pgid_arg == 0 { target } else { pgid_arg };
     with_kernel(|k| {
+        let Some((target_sid, is_session_leader)) = (if target_arg == 0 || target == caller_pid {
+            let p = k.process_mut(target);
+            Some((if p.sid == 0 { target } else { p.sid }, p.sid == target))
+        } else {
+            k.process_existing(target)
+                .map(|p| (if p.sid == 0 { target } else { p.sid }, p.sid == target))
+        }) else {
+            return -(abi::ESRCH as i64);
+        };
+        if is_session_leader {
+            return -(abi::EPERM as i64);
+        }
+        if new_pgid != target {
+            match k.process_group_session(new_pgid) {
+                Some(group_sid) if group_sid == target_sid => {}
+                _ => return -(abi::EPERM as i64),
+            }
+        }
         let Some(p) = (if target_arg == 0 || target == caller_pid {
             Some(k.process_mut(target))
         } else {
@@ -647,10 +664,10 @@ pub(super) fn getsid(caller_pid: u32, request: &[u8]) -> i64 {
 /// runs.
 pub(super) fn setsid(caller_pid: u32) -> i64 {
     with_kernel(|k| {
-        let p = k.process_mut(caller_pid);
-        if p.sid == caller_pid {
+        if k.process_group_session(caller_pid).is_some() {
             return -(abi::EPERM as i64);
         }
+        let p = k.process_mut(caller_pid);
         p.sid = caller_pid;
         p.pgid = caller_pid;
         caller_pid as i64

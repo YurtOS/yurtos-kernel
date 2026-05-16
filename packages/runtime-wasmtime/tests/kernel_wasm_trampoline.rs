@@ -125,6 +125,7 @@ fn sockaddr_in_bytes(host: [u8; 4], port: u16) -> [u8; 16] {
 
 const ENOSYS: i64 = 38;
 const EACCES: i64 = 13;
+const EPERM: i64 = 1;
 const EINVAL: i32 = 22;
 const METHOD_ECHO: u32 = 1;
 const METHOD_NOW_REALTIME: u32 = 2;
@@ -3369,37 +3370,60 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
 #[test]
 fn process_group_and_session_round_trip_through_trampoline() {
     // Exercises the pgid/sid family end-to-end:
-    //   (1) getpgid(target=42) lazily primes pgid to the target pid,
-    //   (2) setpgid(target=42, pgid=99) reassigns,
-    //   (3) getsid(target=42) lazily primes sid to the target pid.
-    // KERNEL_PID is the caller for direct .syscall() calls, so we use
-    // an explicit non-zero target pid throughout.
+    //   (1) getpgid(target) lazily primes pgid to the target pid,
+    //   (2) setpgid rejects a missing/cross-session group,
+    //   (3) setpgid(target, pgid=0) keeps the target as group leader,
+    //   (4) getsid(target) lazily primes sid to the target pid.
     let mk = fresh_kernel_host_interface(0);
-
-    // Default getpgid(42) → 42.
-    let rc = mk
-        .syscall(METHOD_SYS_GETPGID, &42_u32.to_le_bytes(), &mut [])
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 0))
+        "#,
+    )
+    .unwrap();
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/pgid".as_slice()])
         .unwrap();
-    assert_eq!(rc, 42, "lazy getpgid primes to target pid");
+    let target_pid = proc.pid();
 
-    // setpgid(42, 99).
+    // Default getpgid(target) → target pid.
+    let rc = mk
+        .syscall(METHOD_SYS_GETPGID, &target_pid.to_le_bytes(), &mut [])
+        .unwrap();
+    assert_eq!(rc, target_pid as i64, "lazy getpgid primes to target pid");
+
+    // setpgid(target, 99) rejects a process group that does not exist in
+    // the target's session.
     let mut req = Vec::new();
-    req.extend_from_slice(&42_u32.to_le_bytes());
+    req.extend_from_slice(&target_pid.to_le_bytes());
     req.extend_from_slice(&99_u32.to_le_bytes());
     let rc = mk.syscall(METHOD_SYS_SETPGID, &req, &mut []).unwrap();
-    assert_eq!(rc, 0, "setpgid succeeds");
+    assert_eq!(rc, -(EPERM as i64), "setpgid rejects missing group");
 
-    // getpgid now reflects 99.
-    let rc = mk
-        .syscall(METHOD_SYS_GETPGID, &42_u32.to_le_bytes(), &mut [])
-        .unwrap();
-    assert_eq!(rc, 99, "setpgid took effect across the trampoline");
+    // setpgid(target, 0) keeps the target as its own group leader.
+    let mut req = Vec::new();
+    req.extend_from_slice(&target_pid.to_le_bytes());
+    req.extend_from_slice(&0_u32.to_le_bytes());
+    let rc = mk.syscall(METHOD_SYS_SETPGID, &req, &mut []).unwrap();
+    assert_eq!(rc, 0, "setpgid self-group succeeds");
 
-    // getsid(42) lazily primes to 42 (separate from pgid).
+    // getpgid still reflects the target pid.
     let rc = mk
-        .syscall(METHOD_SYS_GETSID, &42_u32.to_le_bytes(), &mut [])
+        .syscall(METHOD_SYS_GETPGID, &target_pid.to_le_bytes(), &mut [])
         .unwrap();
-    assert_eq!(rc, 42, "getsid lazy-primes independently of pgid");
+    assert_eq!(rc, target_pid as i64, "setpgid self-group took effect");
+
+    // getsid(target) lazily primes to the target pid (separate from pgid).
+    let rc = mk
+        .syscall(METHOD_SYS_GETSID, &target_pid.to_le_bytes(), &mut [])
+        .unwrap();
+    assert_eq!(
+        rc, target_pid as i64,
+        "getsid lazy-primes independently of pgid"
+    );
 }
 
 #[test]

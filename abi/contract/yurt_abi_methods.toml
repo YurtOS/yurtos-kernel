@@ -216,7 +216,7 @@ doc = "POSIX getpgid(pid). Request bytes carry the u32 target pid (0 = self). Re
 [method.sys_setpgid]
 id = 0x1_0018
 kind = "syscall"
-doc = "POSIX setpgid(pid, pgid). Request bytes carry two little-endian u32s: target pid (0 = self), new pgid (0 = use target pid). Phase 2 has no permission checks; security policy comes later. Returns 0 on success or -ESRCH for unknown target."
+doc = "POSIX setpgid(pid, pgid). Request bytes carry two little-endian u32s: target pid (0 = self), new pgid (0 = use target pid). Rejects session leaders and groups outside the target session. Returns 0 on success or negated POSIX errno."
 
 [method.sys_getsid]
 id = 0x1_0019

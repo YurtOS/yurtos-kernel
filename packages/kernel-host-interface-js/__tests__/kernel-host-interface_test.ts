@@ -436,19 +436,25 @@ Deno.test(
     let { rc } = mk.syscall(METHOD.SYS_GETPGID, target, 0);
     assertEquals(Number(rc), targetPid);
 
-    // setpgid(42, 99).
+    // setpgid(target, 99) rejects a process group that does not exist in
+    // the target's session.
     const setReq = new Uint8Array(8);
     const setView = new DataView(setReq.buffer);
     setView.setUint32(0, targetPid, true);
     setView.setUint32(4, 99, true);
     ({ rc } = mk.syscall(METHOD.SYS_SETPGID, setReq, 0));
+    assertEquals(Number(rc), -1);
+
+    // setpgid(target, 0) keeps the target as its own group leader.
+    setView.setUint32(4, 0, true);
+    ({ rc } = mk.syscall(METHOD.SYS_SETPGID, setReq, 0));
     assertEquals(Number(rc), 0);
 
-    // getpgid now reflects 99.
+    // getpgid still reflects the target pid.
     ({ rc } = mk.syscall(METHOD.SYS_GETPGID, target, 0));
-    assertEquals(Number(rc), 99);
+    assertEquals(Number(rc), targetPid);
 
-    // getsid(42) lazily primes sid independently.
+    // getsid(target) lazily primes sid independently.
     ({ rc } = mk.syscall(METHOD.SYS_GETSID, target, 0));
     assertEquals(Number(rc), targetPid);
   },
