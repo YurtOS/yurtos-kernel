@@ -156,6 +156,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_DUP3 => dup3_fd(caller_pid, request),
         METHOD_SYS_DUP_MIN => dup_min_fd(caller_pid, request),
         METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS => set_fd_descriptor_flags(caller_pid, request),
+        METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS => get_fd_descriptor_flags(caller_pid, request),
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
@@ -433,6 +434,20 @@ fn set_fd_descriptor_flags(caller_pid: u32, request: &[u8]) -> i64 {
             Err(errno) => -(errno as i64),
         }
     })
+}
+
+/// `fcntl(F_GETFD)` — read an fd's descriptor flags (FD_CLOEXEC bit).
+/// Request: u32 fd LE. Companion to set_fd_descriptor_flags. (B2.3)
+fn get_fd_descriptor_flags(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(
+        |k| match k.process_mut(caller_pid).fd_table.get_descriptor_flags(fd) {
+            Ok(flags) => flags as i64,
+            Err(errno) => -(errno as i64),
+        },
+    )
 }
 
 /// `pipe() -> writes 8 bytes into response (read_fd, write_fd as u32 LE), returns 8 or -ENFILE`.

@@ -209,6 +209,15 @@ impl FdTable {
         self.descriptor_flags.get(&fd).copied().unwrap_or(0)
     }
 
+    /// `fcntl(F_GETFD)`: the descriptor flags (FD_CLOEXEC bit) for an
+    /// open fd, or `EBADF` if the fd is not open.
+    pub fn get_descriptor_flags(&self, fd: u32) -> Result<u32, i32> {
+        if !self.entries.contains_key(&fd) {
+            return Err(crate::abi::EBADF);
+        }
+        Ok(self.descriptor_flags(fd))
+    }
+
     pub fn inheritable_entries(&self) -> Vec<(u32, FdEntry)> {
         const FD_CLOEXEC: u32 = 1;
         self.entries

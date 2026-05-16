@@ -6911,3 +6911,88 @@ fn dup3_cloexec_flag_controls_newfd_inheritance() {
     );
     assert!(fd_is_inheritable(1, 22), "non-cloexec fd inherits");
 }
+
+// --- Slice B2.3: POSIX fcntl(F_GETFD) ---
+
+fn setfd_req(fd: u32, flags: u32) -> Vec<u8> {
+    let mut req = fd.to_le_bytes().to_vec();
+    req.extend_from_slice(&flags.to_le_bytes());
+    req
+}
+
+#[test]
+fn fcntl_getfd_defaults_to_zero_and_reflects_setfd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/getfd.txt");
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &fd.to_le_bytes(),
+            &mut []
+        ),
+        0,
+        "FD_CLOEXEC defaults clear"
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &setfd_req(fd, 1),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &fd.to_le_bytes(),
+            &mut []
+        ),
+        1,
+        "F_GETFD reflects the FD_CLOEXEC set via F_SETFD"
+    );
+    // Clearing it round-trips back to 0.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &setfd_req(fd, 0),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &fd.to_le_bytes(),
+            &mut []
+        ),
+        0
+    );
+}
+
+#[test]
+fn fcntl_getfd_unknown_fd_is_ebadf() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &99u32.to_le_bytes(),
+            &mut []
+        ),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn fcntl_getfd_short_request_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS, 1, &[1, 2], &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
