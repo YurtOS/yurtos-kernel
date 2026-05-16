@@ -82,6 +82,24 @@ evaluateGate(rows, baseline) → { failures: GateFailure[] }
 - `both` + identical, but allowlisted → `stale-allowlist-entry` (gate FAILS; the
   entry must be deleted — allowlist only shrinks).
 - single-kernel rows (`ts` or `wasm` only) → ignored (no peer to diff).
+- a case whose parity can't be evaluated (harness threw, or its fixture wasn't
+  built) → `unestablished-case`: it is **not** silently skipped — it fails the
+  gate unless it has a tracked baseline entry. The differ also flags **orphan**
+  baseline entries (no matching case) and prints a copy-pasteable
+  `[[divergence]]` seed for failures.
+
+> **`ts` / `wasm` modes are inert in B0.** The differ always runs
+> `runWithBothKernels` and nulls one side; single-kernel rows are then ignored
+> by the gate, so `ts`/`wasm` produce no signal and still need a built
+> `kernel.wasm` (+ JSPI). They are not a working triage mode in B0 — the real
+> single-kernel triage path is the POSIX runner. Making `ts`/`wasm` reduce
+> requirements/runtime is a tracked follow-up.
+>
+> **The baseline is never auto-populated.** Before `YURT_ENABLE_WASM_KERNEL_CI`
+> is treated as a blocking gate, the differ must be run once in capture mode;
+> `formatBaselineSeed` emits the exact `[[divergence]]` rows for a human to
+> review (set the owning slice) and commit. Empty baseline + gate enforced ==
+> full spec-corpus parity is being asserted.
 
 ### POSIX suite integration (reuse existing infra — corrected)
 
