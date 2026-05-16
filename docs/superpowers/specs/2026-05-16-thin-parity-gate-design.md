@@ -8,8 +8,10 @@ slice has a zero-diff signal. Two deliverables:
 1. A `YURT_KERNEL=ts|wasm|both` selection used by a **parity differ** that runs
    the existing `abi/conformance/*.spec.toml` corpus through one or both kernels
    and, in `both` mode, fails on any observable divergence.
-2. Vendor + wire the **Open POSIX Test Suite** under `abi/conformance/posix/`
-   (smoke subset green here; full corpus is the B5 gate).
+2. Extend the **existing** Open POSIX harness (`scripts/open-posix-harness.ts`
+   - `scripts/run-wasm-test-in-sandbox.ts`) with the same `YURT_KERNEL` selector
+     so its corpus runs under either kernel (curated-subset parity here; full
+     corpus is the B5 gate). No re-vendoring — see "POSIX suite integration".
 
 This slice adds **no kernel syscall behavior**. It is harness + CI only.
 
@@ -50,37 +52,36 @@ orchestration over the existing seam; no new kernel code.
 YURT_KERNEL ∈ {ts, wasm, both}        (default: both)
         │
         ▼
-parity-differ_test.ts
+parity-differ_test.ts          (conformance corpus)
   ├─ enumerate abi/conformance/*.spec.toml  → {canary, cases[]}
-  ├─ enumerate abi/conformance/posix/manifest.toml → POSIX smoke list
   ├─ for each (canary, case):
   │     run "<canary> --case <name>" through selected kernel(s)
-  │     parse observable result:
-  │       • spec mode  → JSONL trace {case,exit,stdout?,errno?} + proc exit
-  │       • posix mode → raw {exitCode, stdout, stderr} graded by suite codes
-  │  └─ both? assert ts-result deep-equals wasm-result; else just record
-  └─ emit a scoreboard (per-area PASS/FAIL/UNSUPPORTED/diff counts)
+  │       via the shared dual-kernel harness
+  │  └─ both? evaluateGate(rows, baseline); else just record
+  └─ fail on any divergence not in parity-baseline.toml
+
+open-posix-harness.ts          (POSIX corpus, separate driver)
+  └─ run curated subset twice (YURT_KERNEL=ts, =wasm) and diff
+     PASS/FAIL + observable output, same baseline discipline
 ```
 
-### Result model
+### Result model (as implemented in `_parity_baseline.ts`)
 
 ```
-ParityCase = {
-  suite: "conformance" | "posix",
-  canary: string, case: string, area: string,
-  ts?:  Observed,   // present unless YURT_KERNEL=wasm
-  wasm?: Observed,  // present unless YURT_KERNEL=ts
-  verdict: "pass" | "fail" | "unsupported" | "diff" | "single"
-}
-Observed = { exitCode: number, stdout: string, stderr: string,
-             trace?: {case,exit,stdout?,errno?} }  // trace only in spec mode
+Observed   = { exitCode: number; stdout: string; stderr: string }
+ParityRow  = { canary; case; ts?: Observed; wasm?: Observed }
+BaselineEntry = { canary; case; slice; reason }   // parity-baseline.toml
+GateFailure   = { kind: "unexpected-divergence" | "stale-allowlist-entry";
+                  canary; case; slice?; detail }
+evaluateGate(rows, baseline) → { failures: GateFailure[] }
 ```
 
-- `both` + identical → `pass` (or `unsupported` if suite code = 4 on both).
-- `both` + differ → `diff` (the gate **fails** the test, prints a minimal diff:
-  which field, ts vs wasm).
-- `ts`/`wasm` single mode → `single`; never fails on divergence (no peer), used
-  for triage / scoreboard, not as the merge gate.
+- `both` + identical, not allowlisted → pass.
+- `both` + differ, not allowlisted → `unexpected-divergence` (gate FAILS).
+- `both` + differ, allowlisted → tolerated (tracked, owned by a slice).
+- `both` + identical, but allowlisted → `stale-allowlist-entry` (gate FAILS; the
+  entry must be deleted — allowlist only shrinks).
+- single-kernel rows (`ts` or `wasm` only) → ignored (no peer to diff).
 
 ### POSIX suite integration (reuse existing infra — corrected)
 
@@ -113,33 +114,41 @@ re-vendor** it:
 step, gated by `vars.YURT_ENABLE_WASM_KERNEL_CI == '1'`:
 
 ```yaml
-- name: Parity differ (TS vs Rust) + POSIX smoke
+- name: Parity gate — TS vs Rust kernel over the conformance corpus (slice B0)
   if: ${{ vars.YURT_ENABLE_WASM_KERNEL_CI == '1' }}
   run: |
     set -euxo pipefail
-    make -C abi posix-smoke
+    cargo build --release -p yurt-kernel-wasm --target wasm32-wasip1
     YURT_KERNEL=both deno test --no-check \
       --allow-read --allow-env --allow-run \
       packages/kernel/src/__tests__/parity-differ_test.ts
 ```
 
-Fast tier is unchanged (this is slow-tier only — it builds wasm).
+Canaries/fixtures are already built earlier in the job
+(`make -C abi all copy-fixtures`). The POSIX-corpus parity invocation is driven
+separately via the existing `open-posix.yml` harness with the new `YURT_KERNEL`
+selector (curated subset; full corpus is B5). Fast tier is unchanged — this is
+slow-tier only.
 
-## Testing (TDD order)
+## Testing (TDD order — as executed)
 
-1. **Red:** differ harness asserting `both`-equality over a 2-spec subset
-   (`dup2`, `identity`) with the POSIX path stubbed — fails (module absent).
-2. **Green:** implement enumeration + dual-kernel run + JSONL parse +
-   deep-equal; subset passes (or surfaces a real, documented diff → recorded as
-   a matrix row, not silenced).
-3. **Red:** POSIX smoke manifest with one `pthread`/`sigsetops` test;
-   `make -C abi posix-smoke` target missing → fails.
-4. **Green:** vendor pinned upstream, add `manifest.toml` + make target, differ
-   runs the smoke test through both kernels.
-5. CI step added; full `abi/conformance/*.spec.toml` corpus run in `both` — any
-   diff is reported (expected: some `partial` rows diverge; those are logged as
-   the B1+ worklist, the gate is allowed a documented baseline allowlist that
-   only ever shrinks).
+1. **Red→Green (done):** `_parity_baseline_test.ts` locks the allowlist rule
+   (un-allowlisted divergence fails; allowlisted-but-now-matching fails). 9/9
+   green in the fast tier — pure logic, no artifacts.
+2. **Done:** `parity-differ_test.ts` enumerates `abi/conformance/*.spec.toml`,
+   runs each case through both kernels via the shared harness, applies
+   `evaluateGate`. Skips loudly (never false-green) when kernel.wasm / JSPI /
+   canaries are absent; verified locally to skip cleanly.
+3. **Done:** `YURT_KERNEL=ts|wasm` selector added to
+   `scripts/run-wasm-test-in-sandbox.ts`; default `ts` unchanged, `both`
+   rejected with guidance. `deno fmt/lint/check` clean.
+4. **Done:** `guest-compat.yml` slow-tier step builds kernel.wasm and runs the
+   differ in `both` over the full corpus, gated by `YURT_ENABLE_WASM_KERNEL_CI`.
+5. **CI-validated (deferred to first slow-tier run):** the full-corpus `both`
+   run populates `parity-baseline.toml` with the real current divergences, each
+   tagged to its owning slice (B1+). The end-to-end both-kernels execution
+   cannot be run without the wasm build, so this step is validated in CI by
+   design, not locally.
 
 Determinism: no time/network/hostname dependence in the differ itself; canaries
 already isolate these.
