@@ -158,11 +158,18 @@ describe("parity gate (TS vs Rust kernel over the conformance corpus)", () => {
     );
 
     if (ran === 0) {
-      console.warn(
-        "parity-differ: SKIP — no canary produced a paired result " +
-          "(canaries not built / copied into fixtures).",
+      // We only reach here with kernel.wasm + (for `both`) JSPI +
+      // a non-empty spec corpus — every legitimate skip already
+      // returned above. ran===0 now means a wiring/fixture-copy
+      // failure, not a legitimate skip. Fail loudly: a gate that
+      // greens having run nothing is the trap later slices would
+      // mistake for parity (PR #53 review #1).
+      throw new Error(
+        `parity-differ: ran=0 of ${specCases.length} cases ` +
+          `(skipped=${skipped}) with kernel.wasm present — canaries ` +
+          `were not built/copied into fixtures. This is a wiring bug, ` +
+          `not a legitimate skip; refusing to report vacuous parity.`,
       );
-      return;
     }
 
     const { failures } = evaluateGate(rows, baseline);

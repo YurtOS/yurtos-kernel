@@ -1,10 +1,14 @@
 /**
  * Shared dual-kernel test harness (slice B0).
  *
- * Extracted verbatim from sandbox-wasm-kernel_test.ts so the parity differ
- * and the existing Phase 7.2c integration test share one seam for running
- * the same workload through the TS kernel and the Rust kernel.wasm. No
- * behavior change — pure move + export.
+ * Extracted from sandbox-wasm-kernel_test.ts (and extended) so the
+ * parity differ and the existing Phase 7.2c integration test share one
+ * seam for running the same workload through the TS kernel and the Rust
+ * kernel.wasm. Behavior-preserving for existing callers, with one
+ * additive change: `readFixture` gained a third, last-checked fallback
+ * (`abi/build/<name>`) for C canaries; the prior lookup order is
+ * unchanged. `WASM_DIR` drops the no-op `resolve()` around an
+ * already-absolute URL pathname (functionally identical).
  *
  * Filename lacks the `_test.ts` suffix, so the fast-tier test glob does
  * not pick it up as a test.
