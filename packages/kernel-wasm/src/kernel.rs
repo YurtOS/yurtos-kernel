@@ -700,7 +700,11 @@ impl Kernel {
         child.children.clear();
         child.exit_status = None;
         child.host_instance_handle = None;
+        // POSIX: the child starts with an EMPTY pending signal set —
+        // both the standard bitmask and the RT queue (PR #54 review P2;
+        // pending_rt was added after this clone path and was missed).
         child.pending_signals = 0;
+        child.pending_rt.clear();
         child.stdin_buffer.clear();
         child.stdout_buffer.clear();
         child.stderr_buffer.clear();

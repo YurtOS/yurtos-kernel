@@ -223,6 +223,12 @@ fn getpid_returns_caller_pid() {
 
 #[test]
 fn getppid_returns_kernel_pid_until_process_tree_exists() {
+    // Must hold the TestGuard: this asserts on auto-vivified
+    // `process(1)`/`process(99)` ppid (default 0). Without the guard it
+    // races any guarded test that legitimately creates a process at pid
+    // 1 (e.g. a fork allocating host pid 1) and observes a non-zero
+    // ppid. Pre-existing isolation gap surfaced by the fork RT test.
+    let _g = crate::kernel::TestGuard::acquire();
     // Phase note: until host_spawn lands and the kernel tracks
     // parent/child relationships, every process is treated as a
     // direct child of the kernel.
@@ -7571,6 +7577,49 @@ fn sigpending_reports_the_pending_set() {
     let mask = u64::from_le_bytes(buf);
     assert_ne!(mask & (1u64 << (40 - 1)), 0, "sig 40 must show pending");
     assert_eq!(mask & (1u64 << (5 - 1)), 0, "unrelated sig must not");
+}
+
+#[test]
+fn fork_child_does_not_inherit_parent_pending_rt() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // PR #54 review P2. Parent 7 has a queued RT signal before fork.
+    materialize(7);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 42, 9), &mut []),
+        0
+    );
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(
+        u64::from_le_bytes(buf) & (1u64 << (42 - 1)),
+        0,
+        "sanity: parent has the queued RT signal"
+    );
+    // Fork: POSIX says the child starts with an EMPTY pending set
+    // (standard AND real-time).
+    let child = crate::kernel::with_kernel(|k| k.prepare_fork(7)).expect("prepare_fork");
+    crate::kernel::with_kernel(|k| k.commit_fork(7, child)).expect("commit_fork");
+    // sigpending() in the child must NOT show the parent's RT signal.
+    let mut cbuf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, child, &[], &mut cbuf), 8);
+    assert_eq!(
+        u64::from_le_bytes(cbuf) & (1u64 << (42 - 1)),
+        0,
+        "forked child must not inherit the parent's pending_rt"
+    );
+    // …and sigwaitinfo() in the child finds nothing to dequeue.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGWAITINFO,
+            child,
+            &sigset_mask(42),
+            &mut [0u8; 16]
+        ),
+        -(abi::EAGAIN as i64)
+    );
+    // The parent still has its signal (fork didn't disturb it).
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(u64::from_le_bytes(buf) & (1u64 << (42 - 1)), 0);
 }
 
 #[test]
