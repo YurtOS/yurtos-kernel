@@ -1,6 +1,7 @@
 # Process Model Completion (slice B1) — Design
 
-Part of the full-parity initiative (tracking #52, umbrella #51). Sequenced after
+Part of the full-parity initiative (tracking #52, umbrella #57; the original
+umbrella #51 was reverted via #56 and reopened as #57). Sequenced after
 B0 (the thin parity gate, PR #53): every behavior here is validated TS-vs-Rust
 through that gate. **This PR carries the design only** — the implementation
 lands as TDD sub-slices once B0 is CI-green, so nothing here is "unmeasured

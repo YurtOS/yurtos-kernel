@@ -6996,6 +6996,49 @@ fn waitid_input_guards() {
 }
 
 #[test]
+fn waitid_rejects_unsupported_option_bits_without_reaping() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // PR #54 review P2. Child 14 has exited and is waitable.
+    link_child(1, 14);
+    assert_eq!(record_exit(&record_exit_req(14, 5)), 0);
+    let mut buf = [0u8; 20];
+    // WEXITED | WSTOPPED(2): WSTOPPED is a real POSIX option we don't
+    // implement; the contract promises -EINVAL for bad options. It must
+    // be rejected BEFORE mutating `children` (no reap).
+    const WSTOPPED: u32 = 2;
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 14, WAITID_WEXITED | WSTOPPED),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64)
+    );
+    // Stale-adapter-garbage high bit is likewise rejected.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 14, WAITID_WEXITED | 0x8000_0000),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64)
+    );
+    // The child was NOT reaped by the rejected calls — a valid waitid
+    // still finds and reaps it.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 14, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
+    );
+}
+
+#[test]
 fn waitid_p_pgid_matches_childs_group() {
     let _g = crate::kernel::TestGuard::acquire();
     link_child(1, 10);

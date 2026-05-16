@@ -1149,6 +1149,13 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
     if options & WEXITED == 0 {
         return -(abi::EINVAL as i64);
     }
+    // Reject any bit outside the supported set. WSTOPPED/WCONTINUED are
+    // real POSIX options we don't implement, and stale adapter garbage
+    // must not be silently accepted and reap a child — the contract
+    // promises -EINVAL for bad options (PR #54 review P2).
+    if options & !(WNOHANG | WEXITED | WNOWAIT) != 0 {
+        return -(abi::EINVAL as i64);
+    }
     let nowait = options & WNOWAIT != 0;
     with_kernel(|k| {
         let children = k.process_mut(caller_pid).children.clone();
@@ -1200,6 +1207,10 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
         };
         let uid = k.process_mut(pid).credentials.uid;
         if !nowait {
+            // Reap = detach from the parent's children list, exactly as
+            // sys_wait/wait_response does. The zombie `Process` record
+            // intentionally persists (shared pre-existing design); don't
+            // "fix" this asymmetry here without changing sys_wait too.
             k.process_mut(caller_pid).children.retain(|&c| c != pid);
         }
         response[0..4].copy_from_slice(&(SIGCHLD as i32).to_le_bytes());
