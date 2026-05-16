@@ -73,14 +73,26 @@ Ordered by value/independence; each flips its matrix rows + ticks #52.
    contract; both kernels identical through the gate.
 6. **B1.6 true vfork** — parent-suspend-until-exec/_exit; continuation
    interplay; #49 fork-canary extended.
-7. **B1.7 pthread_cancel** — deferred cancellation + points.
+7. **B1.7 pthread_cancel** — ✅ **done (kernel, cargo-verified)**.
+   `ThreadRecord.cancel_requested`; `METHOD_SYS_THREAD_CANCEL` (0x1_0061)
+   - `METHOD_SYS_THREAD_TESTCANCEL` (0x1_0062); deferred model, ESRCH on
+     unknown/exited, 4 tests. Guest cancellation-point unwind = gate-deferred
+     half.
 8. **B1.8 RT signal queueing** — ordered per-process siginfo queue;
-   `sigqueue`/`rt_sigaction`/`sigwaitinfo`.
+   `sigqueue`/`rt_sigaction`/`sigwaitinfo`. **Not started**: this replaces the
+   `pending_signals: u64` bitmask representation, touching every reader/writer
+   (kill, B1.1 SIGCHLD, sigaction, wait/poll). It is the most invasive B1 item —
+   sequenced strictly after B0's gate so the regression surface is measured, not
+   asserted.
 
-B1.1–B1.4 are pure kernel-state changes, unit-testable via `cargo test --tests`
-with no wasm build (fast tier) — they can progress even before B0's CI is green,
-validated by Rust unit tests, then gate-confirmed once B0 lands. B1.5–B1.8 are
-larger and strictly gate-after-B0.
+**Kernel-side B1 status:** B1.1, B1.3, B1.4, B1.7 are ✅ done & cargo-verified
+(308/0, fmt, clippy); B1.2's kernel half is subsumed by B1.3. The remaining B1.5
+(blocking-wait/AsyncBridge), B1.6 (true vfork — continuation/host), B1.8
+(RT-signal representation change) are the genuinely larger cross-boundary items,
+strictly gate-after-B0 so their regression/parity surface is measured. Threads
+(pthread lifecycle, PR47)
+
+- pthread_cancel (B1.7) cover the thread half of the sub-goal.
 
 ## Non-goals (B1)
 
