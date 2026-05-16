@@ -26,10 +26,10 @@ use fs::{
     stat_path, symlink, sys_open, unlink, utimens,
 };
 use process::{
-    close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request, nanosleep,
-    provide_stdin, sched_getparam, sched_getscheduler, sched_setparam, sched_setscheduler,
-    sched_yield, setpgid, setpriority, setresgid, setresuid, setrlimit, setsid, sigaction,
-    sys_spawn, umask,
+    close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
+    killpg_request, nanosleep, provide_stdin, sched_getparam, sched_getscheduler, sched_setparam,
+    sched_setscheduler, sched_yield, setpgid, setpriority, setresgid, setresuid, setrlimit, setsid,
+    sigaction, sys_spawn, umask,
 };
 pub use process::{
     drain_spawn, kill_pid, list_processes_response, list_threads_response, record_exit,
@@ -163,6 +163,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_GETSID => getsid(caller_pid, request),
         METHOD_SYS_SETSID => setsid(caller_pid),
         METHOD_SYS_KILL => kill_request(request),
+        METHOD_SYS_KILLPG => killpg_request(caller_pid, request),
         METHOD_SYS_SIGACTION => sigaction(caller_pid, request),
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),

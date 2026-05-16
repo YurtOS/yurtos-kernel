@@ -155,6 +155,7 @@ const METHOD_SYS_SETPGID: u32 = 0x1_0018;
 const METHOD_SYS_GETSID: u32 = 0x1_0019;
 const METHOD_SYS_SETSID: u32 = 0x1_001A;
 const METHOD_SYS_KILL: u32 = 0x1_001B;
+const METHOD_SYS_KILLPG: u32 = 0x1_0053;
 const METHOD_SYS_SIGACTION: u32 = 0x1_001C;
 const METHOD_SYS_SCHED_YIELD: u32 = 0x1_001D;
 const METHOD_SYS_NANOSLEEP: u32 = 0x1_001E;
@@ -3236,6 +3237,7 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
         ("sys_getsid", METHOD_SYS_GETSID, METHOD_SYS_GETSID as i64),
         ("sys_setsid", METHOD_SYS_SETSID, METHOD_SYS_SETSID as i64),
         ("sys_kill", METHOD_SYS_KILL, METHOD_SYS_KILL as i64),
+        ("sys_killpg", METHOD_SYS_KILLPG, METHOD_SYS_KILLPG as i64),
         (
             "sys_sigaction",
             METHOD_SYS_SIGACTION,
@@ -3454,6 +3456,24 @@ fn signal_storage_round_trips_through_trampoline() {
     req3.extend_from_slice(&0_u32.to_le_bytes());
     let rc = mk.syscall(METHOD_SYS_KILL, &req3, &mut []).unwrap();
     assert_eq!(rc, -3, "sig 0 on a missing process returns -ESRCH");
+
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 0))
+        "#,
+    )
+    .unwrap();
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/killpg-target".as_slice()])
+        .unwrap();
+    let mut req_pg = Vec::new();
+    req_pg.extend_from_slice(&proc.pid().to_le_bytes());
+    req_pg.extend_from_slice(&0_u32.to_le_bytes());
+    let rc = mk.syscall(METHOD_SYS_KILLPG, &req_pg, &mut []).unwrap();
+    assert_eq!(rc, 0, "killpg sig 0 probes an existing process group");
 
     // kill out-of-range → -EINVAL.
     let mut req4 = Vec::new();

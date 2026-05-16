@@ -1147,12 +1147,43 @@ impl Kernel {
 
     pub fn process_group_session(&self, pgid: Pid) -> Option<Pid> {
         self.processes.iter().find_map(|(pid, process)| {
-            (process.exit_status.is_none() && process.pgid == pgid).then_some(if process.sid == 0 {
+            let process_pgid = if process.pgid == 0 {
+                *pid
+            } else {
+                process.pgid
+            };
+            (process.exit_status.is_none() && process_pgid == pgid).then_some(if process.sid == 0 {
                 *pid
             } else {
                 process.sid
             })
         })
+    }
+
+    pub fn kill_process_group(&mut self, pgid: Pid, sig: u32) -> Result<(), i32> {
+        if sig > 63 {
+            return Err(crate::abi::EINVAL);
+        }
+        let mut found = false;
+        for (pid, process) in self.processes.iter_mut() {
+            let process_pgid = if process.pgid == 0 {
+                *pid
+            } else {
+                process.pgid
+            };
+            if process.exit_status.is_some() || process_pgid != pgid {
+                continue;
+            }
+            found = true;
+            if sig != 0 {
+                process.pending_signals |= 1u64 << (sig - 1);
+            }
+        }
+        if found {
+            Ok(())
+        } else {
+            Err(crate::abi::ESRCH)
+        }
     }
 
     pub fn list_threads(&self, pid: Pid) -> Vec<ThreadRecord> {

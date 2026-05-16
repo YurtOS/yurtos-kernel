@@ -702,6 +702,30 @@ pub(super) fn kill_request(request: &[u8]) -> i64 {
     kill_pid(target, sig)
 }
 
+pub(super) fn killpg_request(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([pgid_arg, sig]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if sig > 63 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let pgid = if pgid_arg == 0 {
+            let caller = k.process_mut(caller_pid);
+            if caller.pgid == 0 {
+                caller.pgid = caller_pid;
+            }
+            caller.pgid
+        } else {
+            pgid_arg
+        };
+        match k.kill_process_group(pgid, sig) {
+            Ok(()) => 0,
+            Err(errno) => -(errno as i64),
+        }
+    })
+}
+
 /// `sigaction(sig, disposition) -> previous_disposition`. Disposition
 /// encoding is opaque to the kernel: 0/1 are SIG_DFL/SIG_IGN by
 /// convention, anything else is a user-side handler value (typically

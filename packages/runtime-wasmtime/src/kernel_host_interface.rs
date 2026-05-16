@@ -232,6 +232,7 @@ mod sys_method_id {
     pub const GETSID: u32 = 0x1_0019;
     pub const SETSID: u32 = 0x1_001A;
     pub const KILL: u32 = 0x1_001B;
+    pub const KILLPG: u32 = 0x1_0053;
     pub const SIGACTION: u32 = 0x1_001C;
     pub const SCHED_YIELD: u32 = 0x1_001D;
     pub const NANOSLEEP: u32 = 0x1_001E;
@@ -4610,6 +4611,20 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::KILL,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_killpg",
+        |mut caller: Caller<'_, UserState>, pgid: i32, sig: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(pgid as u32).to_le_bytes());
+            req.extend_from_slice(&(sig as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::KILLPG,
                 &req,
             ) as i32
         },

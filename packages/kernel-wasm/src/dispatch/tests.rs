@@ -3692,6 +3692,86 @@ fn kill_out_of_range_sig_is_einval() {
 }
 
 #[test]
+fn killpg_records_signal_for_live_group_members_only() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let caller = k.process_mut(1);
+        caller.pgid = 7;
+        caller.sid = 1;
+
+        let member = k.process_mut(2);
+        member.pgid = 7;
+        member.sid = 1;
+
+        let exited_member = k.process_mut(3);
+        exited_member.pgid = 7;
+        exited_member.sid = 1;
+        exited_member.exit_status = Some(0);
+
+        let other_group = k.process_mut(4);
+        other_group.pgid = 8;
+        other_group.sid = 1;
+    });
+
+    let mut req = Vec::new();
+    req.extend_from_slice(&7_u32.to_le_bytes());
+    req.extend_from_slice(&15_u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_KILLPG, 1, &req, &mut []), 0);
+
+    let (caller_pending, member_pending, exited_pending, other_pending) =
+        crate::kernel::with_kernel(|k| {
+            (
+                k.process_mut(1).pending_signals,
+                k.process_mut(2).pending_signals,
+                k.process_mut(3).pending_signals,
+                k.process_mut(4).pending_signals,
+            )
+        });
+    assert_eq!(caller_pending, 1u64 << 14);
+    assert_eq!(member_pending, 1u64 << 14);
+    assert_eq!(exited_pending, 0);
+    assert_eq!(other_pending, 0);
+}
+
+#[test]
+fn killpg_zero_uses_callers_process_group_as_alive_probe() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(11);
+    });
+
+    let mut req = Vec::new();
+    req.extend_from_slice(&0_u32.to_le_bytes()); // pgid 0 = caller's group
+    req.extend_from_slice(&0_u32.to_le_bytes()); // sig 0 = probe
+    assert_eq!(dispatch(METHOD_SYS_KILLPG, 11, &req, &mut []), 0);
+    assert_eq!(crate::kernel::with_kernel(|k| k.process_mut(11).pgid), 11);
+    assert_eq!(
+        crate::kernel::with_kernel(|k| k.process_mut(11).pending_signals),
+        0
+    );
+}
+
+#[test]
+fn killpg_missing_group_and_bad_signal_return_errors() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut missing = Vec::new();
+    missing.extend_from_slice(&99_u32.to_le_bytes());
+    missing.extend_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_KILLPG, 1, &missing, &mut []),
+        -(abi::ESRCH as i64)
+    );
+
+    let mut bad_sig = Vec::new();
+    bad_sig.extend_from_slice(&1_u32.to_le_bytes());
+    bad_sig.extend_from_slice(&64_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_KILLPG, 1, &bad_sig, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
 fn sigaction_returns_previous_disposition_and_persists_new() {
     let _g = crate::kernel::TestGuard::acquire();
     let mut req = Vec::new();

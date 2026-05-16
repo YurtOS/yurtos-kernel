@@ -211,6 +211,13 @@ export function buildSysImports(
       view.setUint32(4, sig >>> 0, true);
       return forwardRequestBytes(METHOD.SYS_KILL, req);
     },
+    sys_killpg: (pgid, sig) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, pgid >>> 0, true);
+      view.setUint32(4, sig >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_KILLPG, req);
+    },
     sys_sigaction: (sig, disposition) => {
       const req = new Uint8Array(8);
       const view = new DataView(req.buffer);

@@ -491,6 +491,12 @@ Deno.test(
     ({ rc } = mk.syscall(METHOD.SYS_KILL, k1, 0));
     assertEquals(Number(rc), 0);
 
+    // killpg(sig=0) succeeds as an alive probe for the target process group.
+    const kg1 = new Uint8Array(8);
+    new DataView(kg1.buffer).setUint32(0, targetPid, true);
+    ({ rc } = mk.syscall(METHOD.SYS_KILLPG, kg1, 0));
+    assertEquals(Number(rc), 0);
+
     // kill out-of-range → -EINVAL (-22).
     const k2 = new Uint8Array(8);
     const k2View = new DataView(k2.buffer);

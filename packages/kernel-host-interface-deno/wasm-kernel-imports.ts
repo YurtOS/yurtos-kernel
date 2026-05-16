@@ -461,6 +461,11 @@ export const HOST_BINDINGS: HostBinding[] = [
   },
   { name: "host_kill", method: METHOD.SYS_KILL, args: ["scalar", "scalar"] },
   {
+    name: "host_killpg",
+    method: METHOD.SYS_KILLPG,
+    args: ["scalar", "scalar"],
+  },
+  {
     name: "host_getpriority",
     method: METHOD.SYS_GETPRIORITY,
     args: ["scalar", "scalar"],

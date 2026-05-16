@@ -444,6 +444,17 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(rc).toEqual(-3);
   });
 
+  it("multi-scalar-arg: host_killpg with args packed inline", async () => {
+    const { mk, calls } = capturingMk(0);
+    const fakeBuf = new ArrayBuffer(8);
+    const imports = buildWasmKernelImports(mk, () => fakeBuf);
+    const rc = await imports.host_killpg(7, 15);
+    expect(rc).toEqual(0);
+    expect(calls.length).toEqual(1);
+    expect(calls[0].method).toEqual(METHOD.SYS_KILLPG);
+    expect(calls[0].request).toEqual(new Uint8Array([7, 0, 0, 0, 15, 0, 0, 0]));
+  });
+
   it("host_wait converts the kernel wait record to yurt_wait_result_v1", async () => {
     const kernelWait = new Uint8Array(8);
     const kernelView = new DataView(kernelWait.buffer);
