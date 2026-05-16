@@ -1,0 +1,25 @@
+# Parity baseline allowlist (slice B0).
+#
+# The parity gate (packages/kernel/src/__tests__/parity-differ_test.ts) runs
+# every conformance canary case through the TS kernel and the Rust
+# kernel.wasm and fails on any observable divergence (exit code / stdout /
+# stderr) NOT listed here.
+#
+# Rules (enforced by _parity_baseline.ts, unit-tested in
+# _parity_baseline_test.ts):
+#   - an un-allowlisted divergence FAILS the gate;
+#   - an allowlisted pair that has started MATCHING also FAILS the gate,
+#     so this file can only ever shrink. Fixing a row means deleting its
+#     entry here in the same slice PR.
+#
+# Every entry MUST name the owning slice (B1..B6) and a concrete reason.
+# This file starts empty: the first guest-compat slow-tier run with built
+# canaries + kernel.wasm populates the real, current divergence set, each
+# tagged to the slice that will close it. Empty == full spec-corpus parity.
+#
+# Schema:
+#   [[divergence]]
+#   canary = "<canary-name>"   # e.g. "dup2-canary"
+#   case   = "<case-name>"     # the spec.toml [[case]].name
+#   slice  = "B<n>"            # owning slice that will fix it
+#   reason = "<why ts and wasm differ today>"
