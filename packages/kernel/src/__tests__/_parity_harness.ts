@@ -21,6 +21,7 @@ import {
 } from "@yurt/kernel-host-interface-js";
 import {
   buildWasmKernelImports,
+  createWasmForkLifecycle,
   createWasmProcessHostRegistry,
   createWasmThreadHostRegistry,
   HOST_BINDINGS,
@@ -117,30 +118,14 @@ export async function createWasmSandbox(
       }),
     wasmOverrideNames: HOST_BINDINGS.map((b) => b.name),
     wasmThreadHostRegistry,
-    wasmForkLifecycle: forkEvents
-      ? {
-        prepareFork(parentPid: number): number {
-          const childPid = wasmProcessHostRegistry.prepareFork(parentPid);
-          forkEvents.push(`prepare:${parentPid}:${childPid}`);
-          return childPid;
-        },
-        commitFork(parentPid: number, childPid: number): number {
-          wasmProcessHostRegistry.commitFork(parentPid, childPid);
-          forkEvents.push(`commit:${parentPid}:${childPid}`);
-          return 0;
-        },
-        rollbackFork(parentPid: number, childPid: number): number {
-          wasmProcessHostRegistry.rollbackFork(parentPid, childPid);
-          forkEvents.push(`rollback:${parentPid}:${childPid}`);
-          return 0;
-        },
-        recordExit(pid: number, exitStatus: number): number {
-          wasmProcessHostRegistry.recordExit(pid, exitStatus);
-          forkEvents.push(`exit:${pid}:${exitStatus}`);
-          return 0;
-        },
-      }
-      : undefined,
+    // Always wire the substantive Rust-kernel fork sync; `forkEvents`
+    // only layers on test observation. Previously this was `undefined`
+    // when forkEvents was absent, which silently desynced fork-based
+    // parity runs (the differ never passes forkEvents).
+    wasmForkLifecycle: createWasmForkLifecycle(
+      wasmProcessHostRegistry,
+      forkEvents,
+    ),
     mounts: [{ path: "/fixtures", files: { [fixtureName]: mountedFixture } }],
   });
 }

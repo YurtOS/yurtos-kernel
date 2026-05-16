@@ -20,6 +20,7 @@ import {
 } from "@yurt/kernel-host-interface-js";
 import {
   buildWasmKernelImports,
+  createWasmForkLifecycle,
   createWasmProcessHostRegistry,
   createWasmThreadHostRegistry,
   HOST_BINDINGS,
@@ -95,6 +96,12 @@ async function createSelectedSandbox(): Promise<Sandbox> {
       }),
     wasmOverrideNames: HOST_BINDINGS.map((b) => b.name),
     wasmThreadHostRegistry,
+    // Keep the Rust kernel's process registry in sync with the TS
+    // ProcessKernel mirror across guest fork()/exit. Without this,
+    // fork / pthread_atfork POSIX cases under YURT_KERNEL=wasm diverge
+    // from TS even though the runner is meant to cover the same corpus
+    // under either kernel. (No forkEvents: substantive sync only.)
+    wasmForkLifecycle: createWasmForkLifecycle(wasmProcessHostRegistry),
   });
 }
 

@@ -21,8 +21,10 @@ import {
 } from "../../kernel-host-interface-js/mod.ts";
 import {
   buildWasmKernelImports,
+  createWasmForkLifecycle,
   createWasmThreadHostRegistry,
   HOST_BINDINGS,
+  type WasmProcessHostRegistry,
 } from "../wasm-kernel-imports.ts";
 
 const KERNEL_WASM = new URL(
@@ -1295,6 +1297,73 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(await imports.host_idb_delete(64, getReq.byteLength)).toEqual(0);
     expect(await imports.host_idb_get(64, getReq.byteLength, 128, 64))
       .toEqual(-2);
+  });
+});
+
+describe("createWasmForkLifecycle", () => {
+  // Minimal spy implementing WasmProcessHostRegistry; only the fork
+  // lifecycle methods matter here.
+  function spyRegistry() {
+    const calls: string[] = [];
+    const registry: WasmProcessHostRegistry = {
+      processExitVersion: () => 0,
+      waitForProcessExit: () => Promise.resolve(),
+      prepareFork(parentPid) {
+        calls.push(`prepareFork(${parentPid})`);
+        return 4242; // child pid
+      },
+      commitFork(parentPid, childPid) {
+        calls.push(`commitFork(${parentPid},${childPid})`);
+        return 0;
+      },
+      rollbackFork(parentPid, childPid) {
+        calls.push(`rollbackFork(${parentPid},${childPid})`);
+        return 0;
+      },
+      recordExit(pid, status) {
+        calls.push(`recordExit(${pid},${status})`);
+        return 0;
+      },
+    };
+    return { registry, calls };
+  }
+
+  it("without forkEvents delegates straight to the registry (substantive sync)", () => {
+    const { registry, calls } = spyRegistry();
+    const hooks = createWasmForkLifecycle(registry);
+    expect(hooks.prepareFork(7)).toBe(4242);
+    expect(hooks.commitFork(7, 4242)).toBe(0);
+    expect(hooks.recordExit?.(4242, 0)).toBe(0);
+    // Every call reached the Rust-kernel-backed registry.
+    expect(calls).toEqual([
+      "prepareFork(7)",
+      "commitFork(7,4242)",
+      "recordExit(4242,0)",
+    ]);
+  });
+
+  it("with forkEvents delegates AND records observation strings", () => {
+    const { registry, calls } = spyRegistry();
+    const forkEvents: string[] = [];
+    const hooks = createWasmForkLifecycle(registry, forkEvents);
+    expect(hooks.prepareFork(7)).toBe(4242);
+    hooks.commitFork(7, 4242);
+    hooks.rollbackFork(7, 4242);
+    hooks.recordExit?.(4242, 9);
+    // Registry still received every call (sync not bypassed)...
+    expect(calls).toEqual([
+      "prepareFork(7)",
+      "commitFork(7,4242)",
+      "rollbackFork(7,4242)",
+      "recordExit(4242,9)",
+    ]);
+    // ...and the observation side-channel saw them.
+    expect(forkEvents).toEqual([
+      "prepare:7:4242",
+      "commit:7:4242",
+      "rollback:7:4242",
+      "exit:4242:9",
+    ]);
   });
 });
 

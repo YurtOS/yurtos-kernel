@@ -405,6 +405,52 @@ export function createWasmProcessHostRegistry(
   };
 }
 
+/**
+ * Adapt a {@link WasmProcessHostRegistry} into the `wasmForkLifecycle`
+ * hooks `Sandbox.create` expects. This is the *substantive* sync that
+ * keeps the Rust kernel's process registry in step with the TS
+ * ProcessKernel mirror across guest fork()/exit. Without it, fork-based
+ * workloads run under `kernelImpl: "wasm"` desync the two kernels
+ * (the differ and the Open POSIX wasm runner both need this so the same
+ * corpus behaves identically under either kernel).
+ *
+ * The registry already implements the lifecycle shape, so with no
+ * `forkEvents` it is returned directly. When `forkEvents` is supplied
+ * (test observation only), calls are still delegated to the registry
+ * and additionally appended as `prepare|commit|rollback|exit:…` strings.
+ */
+export function createWasmForkLifecycle(
+  registry: WasmProcessHostRegistry,
+  forkEvents?: string[],
+): Pick<
+  WasmProcessHostRegistry,
+  "prepareFork" | "commitFork" | "rollbackFork" | "recordExit"
+> {
+  if (!forkEvents) return registry;
+  return {
+    prepareFork(parentPid) {
+      const childPid = registry.prepareFork(parentPid);
+      forkEvents.push(`prepare:${parentPid}:${childPid}`);
+      return childPid;
+    },
+    commitFork(parentPid, childPid) {
+      const result = registry.commitFork(parentPid, childPid);
+      forkEvents.push(`commit:${parentPid}:${childPid}`);
+      return result;
+    },
+    rollbackFork(parentPid, childPid) {
+      const result = registry.rollbackFork(parentPid, childPid);
+      forkEvents.push(`rollback:${parentPid}:${childPid}`);
+      return result;
+    },
+    recordExit(pid, exitStatus) {
+      const result = registry.recordExit(pid, exitStatus);
+      forkEvents.push(`exit:${pid}:${exitStatus}`);
+      return result;
+    },
+  };
+}
+
 function threadImport(
   method: number,
   request: Uint8Array,
