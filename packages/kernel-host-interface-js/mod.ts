@@ -217,6 +217,7 @@ export const METHOD = {
   SYS_TIOCSCTTY: 0x1_005B,
   SYS_SCHED_GETAFFINITY: 0x1_005C,
   SYS_SCHED_SETAFFINITY: 0x1_005D,
+  SYS_FCHOWN: 0x1_005E,
 } as const;
 
 export const KERNEL_PID = 0;
@@ -1759,6 +1760,24 @@ function buildUserYurtImports(
       Number(outPtr),
       Number(outCap),
     );
+  };
+  imports.host_chown = (pathPtr, pathLen, uid, gid) => {
+    const path = copyIn(Number(pathPtr), Number(pathLen));
+    if (typeof path === "number") return path;
+    const req = new Uint8Array(8 + path.byteLength);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, Number(uid) >>> 0, true);
+    view.setUint32(4, Number(gid) >>> 0, true);
+    req.set(path, 8);
+    return Number(kernel.syscall(METHOD.SYS_CHOWN, pid, req, 0).rc);
+  };
+  imports.host_fchown = (fd, uid, gid) => {
+    const req = new Uint8Array(12);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, Number(fd) >>> 0, true);
+    view.setUint32(4, Number(uid) >>> 0, true);
+    view.setUint32(8, Number(gid) >>> 0, true);
+    return Number(kernel.syscall(METHOD.SYS_FCHOWN, pid, req, 0).rc);
   };
   return imports;
 }

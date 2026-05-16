@@ -232,6 +232,7 @@ mod sys_method_id {
     pub const TIOCSCTTY: u32 = 0x1_005B;
     pub const SCHED_GETAFFINITY: u32 = 0x1_005C;
     pub const SCHED_SETAFFINITY: u32 = 0x1_005D;
+    pub const FCHOWN: u32 = 0x1_005E;
     pub const PIPE: u32 = 0x1_0012;
     pub const READ: u32 = 0x1_0013;
     pub const WRITE: u32 = 0x1_0014;
@@ -4973,6 +4974,21 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::CHOWN,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_fchown",
+        |mut caller: Caller<'_, UserState>, fd: i32, uid: i32, gid: i32| -> i32 {
+            let mut req = Vec::with_capacity(12);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&(uid as u32).to_le_bytes());
+            req.extend_from_slice(&(gid as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::FCHOWN,
                 &req,
             ) as i32
         },

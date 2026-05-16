@@ -228,6 +228,11 @@ id = 0x1_005D
 kind = "syscall"
 doc = "POSIX sched_setaffinity(pid, cpusetsize, mask). Request bytes carry u32 pid, u32 cpusetsize, then cpusetsize mask bytes. Yurt currently accepts only CPU 0. Returns 0, -EINVAL, or -ESRCH."
 
+[method.sys_fchown]
+id = 0x1_005E
+kind = "syscall"
+doc = "POSIX fchown(fd, uid, gid). Request bytes carry u32 fd, u32 uid, u32 gid. Updates sandbox-view metadata for the open file description's inode. Returns 0, -EBADF, or -EPERM."
+
 [method.sys_pipe]
 id = 0x1_0012
 kind = "syscall"

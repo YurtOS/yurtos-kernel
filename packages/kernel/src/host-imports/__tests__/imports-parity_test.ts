@@ -116,6 +116,8 @@ const ABI_IMPORT_METHODS = new Map<string, string | null>([
   ["host_network_fetch", "sys_fetch"],
   ["host_extension_invoke", "sys_extension_invoke"],
   ["host_socket_set_no_delay", "sys_socket_option"],
+  ["host_chown", "sys_chown"],
+  ["host_fchown", "sys_fchown"],
   ["host_sched_getaffinity", "sys_sched_getaffinity"],
   ["host_sched_setaffinity", "sys_sched_setaffinity"],
   ["host_tcgetpgrp", "sys_tcgetpgrp"],

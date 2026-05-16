@@ -410,6 +410,25 @@ args = [
   { name = "fd", type = "fd" },
 ]
 
+[import.host_chown]
+doc = "Change sandbox-visible path ownership metadata."
+return = "scalar_errno"
+args = [
+  { name = "path_ptr", type = "ptr" },
+  { name = "path_len", type = "usize" },
+  { name = "uid", type = "uid" },
+  { name = "gid", type = "gid" },
+]
+
+[import.host_fchown]
+doc = "Change sandbox-visible ownership metadata for an open file descriptor."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "uid", type = "uid" },
+  { name = "gid", type = "gid" },
+]
+
 [import.host_sched_getaffinity]
 doc = "Write the process CPU affinity mask. Yurt currently exposes a single CPU, bit 0."
 return = "fixed_out"

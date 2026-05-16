@@ -599,6 +599,38 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(new Uint8Array(memory, 32, 4)).toEqual(affinity);
   });
 
+  it("ownership helpers pack path and fd chown requests", async () => {
+    const { mk, calls } = capturingMk(0);
+    const memory = new ArrayBuffer(128);
+    const path = new TextEncoder().encode("/tmp/owned");
+    new Uint8Array(memory, 16, path.byteLength).set(path);
+    const imports = buildWasmKernelImports(mk, () => memory);
+
+    expect(await imports.host_chown(16, path.byteLength, 123, 456)).toEqual(0);
+    expect(await imports.host_fchown(7, 123, 456)).toEqual(0);
+
+    expect(calls.map((call) => call.method)).toEqual([
+      METHOD.SYS_CHOWN,
+      (METHOD as Record<string, number>).SYS_FCHOWN,
+    ]);
+    expect(calls[0].request).toEqual(
+      new Uint8Array([
+        123,
+        0,
+        0,
+        0,
+        200,
+        1,
+        0,
+        0,
+        ...path,
+      ]),
+    );
+    expect(calls[1].request).toEqual(
+      new Uint8Array([7, 0, 0, 0, 123, 0, 0, 0, 200, 1, 0, 0]),
+    );
+  });
+
   it("host_wait converts the kernel wait record to yurt_wait_result_v1", async () => {
     const kernelWait = new Uint8Array(8);
     const kernelView = new DataView(kernelWait.buffer);

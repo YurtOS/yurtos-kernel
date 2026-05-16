@@ -754,6 +754,17 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["scalar", "ptr_len"],
     argOrder: [2, 0, 1],
   },
+  {
+    name: "host_chown",
+    method: METHOD.SYS_CHOWN,
+    args: ["scalar", "scalar", "ptr_len"],
+    argOrder: [2, 3, 0, 1],
+  },
+  {
+    name: "host_fchown",
+    method: METHOD.SYS_FCHOWN,
+    args: ["scalar", "scalar", "scalar"],
+  },
 
   // ── Multi-path ops (rename, symlink, link) ────────────────
   // host_rename(fromPtr, fromLen, toPtr, toLen) → 0 / -errno.

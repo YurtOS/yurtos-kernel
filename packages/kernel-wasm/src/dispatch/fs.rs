@@ -441,6 +441,39 @@ pub(super) fn chown(caller_pid: u32, request: &[u8]) -> i64 {
     })
 }
 
+/// `fchown(fd, uid, gid) -> 0 or -errno`. Request: u32 fd + u32 uid + u32 gid.
+pub(super) fn fchown(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() != 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let uid = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let gid = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
+    with_kernel(|k| {
+        let ofd_id = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(crate::kernel::FdEntry::File { ofd_id }) => *ofd_id,
+            _ => return -(abi::EBADF as i64),
+        };
+        let (mount_id, inode) = match k.ofd(ofd_id) {
+            Some(ofd) => (ofd.mount_id, ofd.inode),
+            None => return -(abi::EBADF as i64),
+        };
+        let caller_credentials = k.process_mut(caller_pid).credentials;
+        if caller_credentials.euid != 0 {
+            return -(abi::EPERM as i64);
+        }
+        let mut meta = k.resolve_metadata(mount_id, inode);
+        if uid != ID_NO_CHANGE {
+            meta.uid = uid;
+        }
+        if gid != ID_NO_CHANGE {
+            meta.gid = gid;
+        }
+        k.set_metadata_override(mount_id, inode, meta);
+        0
+    })
+}
+
 /// `utimens(mtime_ns, path) -> 0 or -ENOENT`. Phase 6 surfaces
 /// mtime only; atime tracking lands later.
 pub(super) fn utimens(caller_pid: u32, request: &[u8]) -> i64 {

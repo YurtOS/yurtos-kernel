@@ -343,6 +343,24 @@ export function buildSysImports(
       if (outRc < 0) return outRc;
       return 0;
     },
+    sys_chown: (uid, gid, pathPtr, pathLen) => {
+      const path = copyIn(pathPtr, pathLen);
+      if (typeof path === "number") return path;
+      const req = new Uint8Array(8 + path.byteLength);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, uid >>> 0, true);
+      view.setUint32(4, gid >>> 0, true);
+      req.set(path, 8);
+      return forwardRequestBytes(METHOD.SYS_CHOWN, req);
+    },
+    sys_fchown: (fd, uid, gid) => {
+      const req = new Uint8Array(12);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, uid >>> 0, true);
+      view.setUint32(8, gid >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_FCHOWN, req);
+    },
     sys_nanosleep: (ns) => {
       // `ns` arrives as a JS bigint when the wasm import is declared
       // with an i64 parameter type; coerce defensively for hosts that

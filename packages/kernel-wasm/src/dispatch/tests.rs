@@ -36,6 +36,7 @@ const TEST_METHOD_SYS_WINSIZE: u32 = 0x1_005A;
 const TEST_METHOD_SYS_TIOCSCTTY: u32 = 0x1_005B;
 const TEST_METHOD_SYS_SCHED_GETAFFINITY: u32 = 0x1_005C;
 const TEST_METHOD_SYS_SCHED_SETAFFINITY: u32 = 0x1_005D;
+const TEST_METHOD_SYS_FCHOWN: u32 = 0x1_005E;
 const TEST_ENOTTY: i32 = 25;
 
 fn poll_req(timeout_ms: i32, fds: &[(i32, i16)]) -> Vec<u8> {
@@ -5142,6 +5143,65 @@ fn chown_rejects_unprivileged_caller() {
     assert_eq!(
         dispatch(METHOD_SYS_CHOWN, 1, &req, &mut []),
         -(abi::EPERM as i64)
+    );
+}
+
+#[test]
+fn fchown_updates_metadata_for_file_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    make_root(1);
+    let mut reg = Vec::new();
+    reg.extend_from_slice(&5_u32.to_le_bytes());
+    reg.extend_from_slice(b"/fco1");
+    reg.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/fco1"), &mut []) as u32;
+    let mut req = Vec::new();
+    req.extend_from_slice(&fd.to_le_bytes());
+    req.extend_from_slice(&123_u32.to_le_bytes());
+    req.extend_from_slice(&456_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHOWN, 1, &req, &mut []),
+        0,
+        "root can fchown an open file fd"
+    );
+
+    let meta = crate::kernel::with_kernel(|k| {
+        let pair = k.vfs.open(b"/fco1", 0).unwrap();
+        k.resolve_metadata(pair.0, pair.1)
+    });
+    assert_eq!(meta.uid, 123);
+    assert_eq!(meta.gid, 456);
+}
+
+#[test]
+fn fchown_rejects_invalid_fd_and_unprivileged_caller() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = Vec::new();
+    reg.extend_from_slice(&5_u32.to_le_bytes());
+    reg.extend_from_slice(b"/fco2");
+    reg.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/fco2"), &mut []) as u32;
+    let mut req = Vec::new();
+    req.extend_from_slice(&fd.to_le_bytes());
+    req.extend_from_slice(&123_u32.to_le_bytes());
+    req.extend_from_slice(&456_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHOWN, 1, &req, &mut []),
+        -(abi::EPERM as i64),
+        "non-root cannot fchown"
+    );
+
+    let mut bad_fd_req = Vec::new();
+    bad_fd_req.extend_from_slice(&999_u32.to_le_bytes());
+    bad_fd_req.extend_from_slice(&123_u32.to_le_bytes());
+    bad_fd_req.extend_from_slice(&456_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHOWN, 1, &bad_fd_req, &mut []),
+        -(abi::EBADF as i64)
     );
 }
 
