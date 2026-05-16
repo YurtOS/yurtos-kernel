@@ -425,14 +425,14 @@ Deno.test(
   async () => {
     // Mirror of fixture_parity / kernel_wasm_trampoline equivalents on
     // the wasmtime side. Each direct .syscall() call passes KERNEL_PID
-    // (0) as the caller, so we use an explicit non-zero target pid.
+    // (0) as the caller, so we create an explicit non-zero target pid.
     const mk = await freshKernelHostInterface();
 
-    const targetPid = 42;
+    const targetPid = spawnFromRamfs(mk, 1, s("/bin/pgid"), [s("pgid")]);
     const target = new Uint8Array(4);
     new DataView(target.buffer).setUint32(0, targetPid, true);
 
-    // getpgid(42) lazily primes pgid to the target pid.
+    // getpgid(pid) returns the process's initial pgid.
     let { rc } = mk.syscall(METHOD.SYS_GETPGID, target, 0);
     assertEquals(Number(rc), targetPid);
 
@@ -710,6 +710,72 @@ Deno.test("user-process host_thread_self routes through Rust thread dispatch", a
   const user = mk.spawnUserProcess(wasm);
 
   assertEquals(user.callExportI32("run"), 0);
+});
+
+Deno.test("user-process host_thread_spawn executes and joins through Rust state", async () => {
+  const wasm = await wat2wasm(`(module
+    (import "yurt" "host_thread_spawn" (func $spawn (param i32 i32) (result i32)))
+    (import "yurt" "host_thread_join" (func $join (param i32 i32) (result i32)))
+    (memory (export "memory") 1)
+    (global $tid (mut i32) (i32.const 0))
+    (func $worker (param i32) (result i32)
+      local.get 0)
+    (table (export "__indirect_function_table") 1 funcref)
+    (elem (i32.const 0) $worker)
+    (func (export "spawn") (result i32)
+      i32.const 0
+      i32.const 0x80000000
+      call $spawn
+      global.set $tid
+      global.get $tid)
+    (func (export "join") (result i32)
+      global.get $tid
+      i32.const 4
+      call $join))`);
+  const mk = await freshKernelHostInterface();
+  const user = mk.spawnUserProcess(wasm);
+
+  assertEquals(user.callExportI32("spawn"), 2);
+  await Promise.resolve();
+  assertEquals(user.callExportI32("join"), 0);
+  assertEquals(
+    new DataView(user.readMemory(4, 4).buffer).getUint32(0, true),
+    0x8000_0000,
+  );
+  assertEquals(mk.listThreads(user.pid).find((t) => t.tid === 2), undefined);
+});
+
+Deno.test("spawned user-process thread sees its Rust-owned tid", async () => {
+  const wasm = await wat2wasm(`(module
+    (import "yurt" "host_thread_spawn" (func $spawn (param i32 i32) (result i32)))
+    (import "yurt" "host_thread_join" (func $join (param i32 i32) (result i32)))
+    (import "yurt" "host_thread_self" (func $self (result i32)))
+    (memory (export "memory") 1)
+    (global $tid (mut i32) (i32.const 0))
+    (func $worker (param i32) (result i32)
+      call $self)
+    (table (export "__indirect_function_table") 1 funcref)
+    (elem (i32.const 0) $worker)
+    (func (export "spawn") (result i32)
+      i32.const 0
+      i32.const 0
+      call $spawn
+      global.set $tid
+      global.get $tid)
+    (func (export "join") (result i32)
+      global.get $tid
+      i32.const 4
+      call $join))`);
+  const mk = await freshKernelHostInterface();
+  const user = mk.spawnUserProcess(wasm);
+
+  assertEquals(user.callExportI32("spawn"), 2);
+  await Promise.resolve();
+  assertEquals(user.callExportI32("join"), 0);
+  assertEquals(
+    new DataView(user.readMemory(4, 4).buffer).getUint32(0, true),
+    2,
+  );
 });
 
 Deno.test("thread dispatch returns join status separately from raw retval bits", async () => {
