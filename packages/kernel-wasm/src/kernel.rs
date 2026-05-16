@@ -79,6 +79,11 @@ pub struct ThreadRecord {
     pub host_thread_handle: Option<i32>,
     pub wait_reason: Option<WaitReason>,
     pub waiter_tid: Option<Tid>,
+    /// POSIX deferred cancellation: set by `pthread_cancel`, observed by
+    /// the target at a cancellation point (`pthread_testcancel`). The
+    /// guest performs the actual unwind/exit; the kernel only owns the
+    /// pending-cancel state.
+    pub cancel_requested: bool,
 }
 
 impl ThreadRecord {
@@ -91,6 +96,7 @@ impl ThreadRecord {
             host_thread_handle,
             wait_reason: None,
             waiter_tid: None,
+            cancel_requested: false,
         }
     }
 }
@@ -1464,6 +1470,7 @@ impl Kernel {
                 host_thread_handle,
                 wait_reason: None,
                 waiter_tid: None,
+                cancel_requested: false,
             },
         );
         Ok(())
@@ -1487,6 +1494,29 @@ impl Kernel {
             thread.detached = true;
         }
         Ok(())
+    }
+
+    /// `pthread_cancel`: mark the target thread for deferred
+    /// cancellation. ESRCH if the thread is unknown or already exited
+    /// (POSIX: cancelling a terminated thread is a no-op error). The
+    /// guest performs the actual unwind at the next cancellation point.
+    pub fn request_thread_cancel(&mut self, pid: Pid, tid: Tid) -> Result<(), i32> {
+        let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
+        let thread = p.threads.get_mut(&tid).ok_or(crate::abi::ESRCH)?;
+        if thread.state == ThreadState::Exited {
+            return Err(crate::abi::ESRCH);
+        }
+        thread.cancel_requested = true;
+        Ok(())
+    }
+
+    /// `pthread_testcancel`: true iff the thread has a pending cancel
+    /// and has not exited. Unknown thread → false (nothing to act on).
+    pub fn thread_cancel_pending(&self, pid: Pid, tid: Tid) -> bool {
+        self.processes
+            .get(&pid)
+            .and_then(|p| p.threads.get(&tid))
+            .is_some_and(|t| t.cancel_requested && t.state != ThreadState::Exited)
     }
 
     pub fn exit_thread(&mut self, pid: Pid, tid: Tid, exit_value: i32) -> Result<(), i32> {

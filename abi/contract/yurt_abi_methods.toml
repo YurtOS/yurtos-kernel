@@ -538,6 +538,16 @@ id = 0x1_0052
 kind = "syscall"
 doc = "Yield the authenticated caller thread. No request bytes. Returns 0 or negated errno."
 
+[method.sys_thread_cancel]
+id = 0x1_0061
+kind = "syscall"
+doc = "POSIX pthread_cancel(target). Request: u32 target tid LE. Marks the target for deferred cancellation in the caller's process; the guest unwinds at the next cancellation point. Returns 0, -ESRCH for unknown/already-exited thread, -EINVAL on bad request. The kernel owns only the pending-cancel state; it does not force-terminate the thread."
+
+[method.sys_thread_testcancel]
+id = 0x1_0062
+kind = "syscall"
+doc = "POSIX pthread_testcancel cancellation point. No request bytes. Returns 1 if the authenticated caller thread has a pending cancel (and has not exited), else 0. The guest acts on a 1 by unwinding/exiting."
+
 [method.sys_fchdir]
 id = 0x1_005F
 kind = "syscall"

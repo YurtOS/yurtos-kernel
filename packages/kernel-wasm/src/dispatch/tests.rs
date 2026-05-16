@@ -6985,3 +6985,120 @@ fn waitid_p_pgid_matches_childs_group() {
     assert_eq!(pid, 11);
     assert_eq!(status, 9);
 }
+
+// --- Slice B1.7: POSIX pthread_cancel / pthread_testcancel (kernel) ---
+
+fn spawn_worker(pid: u32) -> u32 {
+    crate::kernel::with_kernel(|k| {
+        k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+        k.spawn_thread(pid, Some(77)).expect("thread spawn")
+    })
+}
+
+#[test]
+fn thread_cancel_marks_target_and_testcancel_observes_it() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let tid = spawn_worker(9);
+
+    let main_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+    assert_eq!(
+        dispatch_with_context(
+            METHOD_SYS_THREAD_CANCEL,
+            main_ctx,
+            &tid.to_le_bytes(),
+            &mut [],
+        ),
+        0
+    );
+    assert!(crate::kernel::with_kernel(|k| k
+        .process(9)
+        .threads
+        .get(&tid)
+        .expect("worker")
+        .cancel_requested));
+
+    let worker_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: tid,
+    };
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_TESTCANCEL, worker_ctx, &[], &mut []),
+        1
+    );
+}
+
+#[test]
+fn testcancel_is_zero_without_a_pending_cancel() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let tid = spawn_worker(9);
+    let worker_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: tid,
+    };
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_TESTCANCEL, worker_ctx, &[], &mut []),
+        0
+    );
+}
+
+#[test]
+fn thread_cancel_unknown_or_exited_thread_is_esrch() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let tid = spawn_worker(9);
+    let main_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+
+    assert_eq!(
+        dispatch_with_context(
+            METHOD_SYS_THREAD_CANCEL,
+            main_ctx,
+            &999u32.to_le_bytes(),
+            &mut [],
+        ),
+        -(abi::ESRCH as i64)
+    );
+
+    crate::kernel::with_kernel(|k| {
+        k.exit_thread_authenticated(9, tid, 0).expect("thread exit");
+    });
+    assert_eq!(
+        dispatch_with_context(
+            METHOD_SYS_THREAD_CANCEL,
+            main_ctx,
+            &tid.to_le_bytes(),
+            &mut [],
+        ),
+        -(abi::ESRCH as i64)
+    );
+    let worker_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: tid,
+    };
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_TESTCANCEL, worker_ctx, &[], &mut []),
+        0
+    );
+}
+
+#[test]
+fn thread_cancel_input_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let _ = spawn_worker(9);
+    let main_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_CANCEL, main_ctx, &[], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_TESTCANCEL, main_ctx, &[1, 2, 3], &mut [],),
+        -(abi::EINVAL as i64)
+    );
+}

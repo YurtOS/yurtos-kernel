@@ -127,6 +127,8 @@ pub fn dispatch_with_context(
         METHOD_SYS_THREAD_DETACH => thread::sys_thread_detach(ctx, request),
         METHOD_SYS_THREAD_EXIT => thread::sys_thread_exit(ctx, request),
         METHOD_SYS_THREAD_YIELD => thread::sys_thread_yield(ctx, request),
+        METHOD_SYS_THREAD_CANCEL => thread::sys_thread_cancel(ctx, request),
+        METHOD_SYS_THREAD_TESTCANCEL => thread::sys_thread_testcancel(ctx, request),
         METHOD_SYS_WAIT => wait_response(caller_pid, request, response),
         METHOD_SYS_WAITID => waitid(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),

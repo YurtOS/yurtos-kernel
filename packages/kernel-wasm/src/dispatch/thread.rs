@@ -106,3 +106,23 @@ pub fn sys_thread_yield(_ctx: DispatchContext, request: &[u8]) -> i64 {
         -(abi::EINVAL as i64)
     }
 }
+
+pub fn sys_thread_cancel(ctx: DispatchContext, request: &[u8]) -> i64 {
+    let target_tid = match read_u32_request(request) {
+        Ok(tid) => tid,
+        Err(rc) => return rc,
+    };
+    kernel::with_kernel(|k| k.request_thread_cancel(ctx.caller_pid, target_tid))
+        .map_or_else(|errno| -(errno as i64), |_| 0)
+}
+
+pub fn sys_thread_testcancel(ctx: DispatchContext, request: &[u8]) -> i64 {
+    if !request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    if kernel::with_kernel(|k| k.thread_cancel_pending(ctx.caller_pid, ctx.caller_tid)) {
+        1
+    } else {
+        0
+    }
+}
