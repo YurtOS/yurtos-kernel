@@ -466,12 +466,11 @@ fn get_fd_descriptor_flags(caller_pid: u32, request: &[u8]) -> i64 {
 const SETTABLE_STATUS_FLAGS: u32 = 0x400 /* O_APPEND */ | 0x800 /* O_NONBLOCK */;
 
 /// `fcntl(F_GETFL)` — read an fd's file status flags. Regular-file fds
-/// return their stored flags; other valid fds return 0 (none tracked
-/// yet); unknown fd → -EBADF. (B2.3b — storage only.)
-///
-/// FIXME(#60): the access-mode bits (O_ACCMODE) are not surfaced, so
-/// `flags & O_ACCMODE` always reads O_RDONLY even on a write fd.
-/// Correct fix needs an OFD access-mode field + a B0-measured slice.
+/// return `access_mode | stored_status_flags` (B2.8 / issue #60:
+/// O_RDONLY for read-only, O_RDWR for writable — the open ABI has only
+/// a writable bit so O_WRONLY is indistinguishable); other valid fds
+/// return 0 (none tracked yet); unknown fd → -EBADF. (Status flags are
+/// B2.3b storage-only — reads/writes don't yet honor O_APPEND/O_NONBLOCK.)
 fn get_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([fd]) = read_u32_args::<1>(request) else {
         return -(abi::EINVAL as i64);
@@ -483,7 +482,20 @@ fn get_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
         };
         match entry {
             FdEntry::File { ofd_id } => match k.ofd(ofd_id) {
-                Some(o) => o.status_flags as i64,
+                Some(o) => {
+                    // issue #60: surface the access mode. The open ABI
+                    // carries only a "writable" bit (O_WRONLY vs O_RDWR
+                    // is indistinguishable by construction), so report
+                    // O_RDONLY (0) for read-only and O_RDWR (2) for a
+                    // writable fd — fixes `flags & O_ACCMODE` always
+                    // reading O_RDONLY for musl/CPython/libuv.
+                    let accmode: u32 = if o.writable {
+                        2 /* O_RDWR */
+                    } else {
+                        0
+                    };
+                    (accmode | o.status_flags) as i64
+                }
                 None => -(abi::EBADF as i64),
             },
             // Valid but no per-OFD status tracked yet.
