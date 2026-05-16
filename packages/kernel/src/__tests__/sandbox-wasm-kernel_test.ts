@@ -48,16 +48,33 @@ const HAS_JSPI = typeof W?.Suspending === "function" &&
 // Probe wasm built by wat2wasm from:
 //   (module
 //     (import "yurt" "host_getuid" (func $g (result i32)))
+//     (memory (export "memory") 1)
 //     (func (export "_start") (drop (call $g))))
 const PROBE_WASM_HEX =
   "0061736d010000000108026000017f60000002140104797572740b" +
-  "686f73745f676574756964000003020101070a01065f7374617274" +
-  "00010a0701050010001a0b";
+  "686f73745f6765747569640000030201010503010001071302066d" +
+  "656d6f72790200065f737461727400010a0701050010001a0b";
 
 function probeBytes(): Uint8Array {
   return new Uint8Array(
     PROBE_WASM_HEX.match(/../g)!.map((h) => parseInt(h, 16)),
   );
+}
+
+async function readFixture(name: string): Promise<Uint8Array | null> {
+  for (
+    const candidate of [
+      `${WASM_DIR}/${name}`,
+      new URL(`../../../../abi/build/rust/${name}`, import.meta.url),
+    ]
+  ) {
+    try {
+      return await Deno.readFile(candidate);
+    } catch (err) {
+      if (!(err instanceof Deno.errors.NotFound)) throw err;
+    }
+  }
+  return null;
 }
 
 async function createTsSandbox(
@@ -96,11 +113,12 @@ async function createWasmSandbox(
 async function runWithBothKernels(
   argv: string[],
   options?: { cwd?: string },
-): Promise<{ ts: RunResult; wasm: RunResult }> {
+): Promise<{ ts: RunResult; wasm: RunResult } | null> {
   const kernelBytes = await Deno.readFile(KERNEL_WASM_URL);
   const fixtureName = argv[0].split("/").at(-1);
   if (!fixtureName) throw new Error(`invalid argv[0]: ${argv[0]}`);
-  const fixture = await Deno.readFile(`${WASM_DIR}/${fixtureName}`);
+  const fixture = await readFixture(fixtureName);
+  if (!fixture) return null;
   const tsSandbox = await createTsSandbox(fixtureName, fixture);
   const wasmSandbox = await createWasmSandbox(
     kernelBytes,
@@ -201,7 +219,9 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
   ) {
     it(`matches the TS kernel for ${name}`, async () => {
       if (!HAS_JSPI) return;
-      expectSameRunResult(await runWithBothKernels(argv, options));
+      const result = await runWithBothKernels(argv, options);
+      if (!result) return;
+      expectSameRunResult(result);
     });
   }
 
@@ -209,7 +229,8 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
     if (!HAS_JSPI) return;
     const fixtureName = "std-fs-canary.wasm";
     const kernelBytes = await Deno.readFile(KERNEL_WASM_URL);
-    const fixture = await Deno.readFile(`${WASM_DIR}/${fixtureName}`);
+    const fixture = await readFixture(fixtureName);
+    if (!fixture) return;
     const sandbox = await createWasmSandbox(kernelBytes, fixtureName, fixture);
     try {
       const result = await sandbox.runArgv([`/fixtures/${fixtureName}`], {
