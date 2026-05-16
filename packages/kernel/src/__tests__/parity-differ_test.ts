@@ -20,9 +20,14 @@ import { parse as parseToml } from "@std/toml";
 import {
   type BaselineEntry,
   evaluateGate,
+  evaluateOrphans,
+  evaluateUnestablished,
+  formatBaselineSeed,
+  type GateFailure,
   type Observed,
   type ParityRow,
   parseBaseline,
+  type UnestablishedCase,
 } from "./_parity_baseline.ts";
 import {
   HAS_JSPI,
@@ -64,8 +69,12 @@ async function enumerateSpecCases(): Promise<SpecCase[]> {
       if (typeof name === "string") out.push({ canary, caseName: name });
     }
   }
+  // Tuple compare (no delimiter-less concat — same smell the key()
+  // NUL avoids): canary first, then case.
   out.sort((a, b) =>
-    (a.canary + a.caseName).localeCompare(b.canary + b.caseName)
+    a.canary === b.canary
+      ? a.caseName.localeCompare(b.caseName)
+      : a.canary.localeCompare(b.canary)
   );
   return out;
 }
@@ -112,10 +121,17 @@ describe("parity gate (TS vs Rust kernel over the conformance corpus)", () => {
 
     const baseline = await loadBaseline();
     const rows: ParityRow[] = [];
+    // Every (canary, case) we ATTEMPTED — feeds orphan detection so a
+    // baseline entry that no longer corresponds to any case is flagged.
+    const seen: { canary: string; case: string }[] = [];
+    // Cases whose parity could not be evaluated (harness threw, or the
+    // fixture wasn't built). NOT silently skipped: each must be a
+    // tracked baseline entry or it fails the gate (PR #53 review P1).
+    const unestablished: UnestablishedCase[] = [];
     let ran = 0;
-    let skipped = 0;
 
     for (const { canary, caseName } of specCases) {
+      seen.push({ canary, case: caseName });
       const argv = [`/fixtures/${canary}.wasm`, "--case", caseName];
       let pair: { ts: unknown; wasm: unknown } | null = null;
       try {
@@ -123,20 +139,21 @@ describe("parity gate (TS vs Rust kernel over the conformance corpus)", () => {
           | { ts: unknown; wasm: unknown }
           | null;
       } catch (err) {
-        // A spawn/instantiate failure on one side is itself a divergence
-        // signal, but in B0 we conservatively skip+report rather than
-        // hard-fail on harness errors (e.g. continuation canaries that
-        // need bespoke wiring). These become explicit B5 worklist items.
-        console.warn(
-          `parity-differ: skip ${canary}::${caseName} — harness error: ${
+        unestablished.push({
+          canary,
+          case: caseName,
+          reason: `harness error: ${
             err instanceof Error ? err.message : String(err)
           }`,
-        );
-        skipped++;
+        });
         continue;
       }
       if (!pair) {
-        skipped++;
+        unestablished.push({
+          canary,
+          case: caseName,
+          reason: "fixture wasm not built/copied for this case",
+        });
         continue;
       }
       ran++;
@@ -153,34 +170,30 @@ describe("parity gate (TS vs Rust kernel over the conformance corpus)", () => {
     }
 
     console.log(
-      `parity-differ: mode=${mode} ran=${ran} skipped=${skipped} ` +
+      `parity-differ: mode=${mode} ran=${ran} ` +
+        `unestablished=${unestablished.length} ` +
         `cases=${specCases.length} baseline=${baseline.length}`,
     );
 
-    if (ran === 0) {
-      // We only reach here with kernel.wasm + (for `both`) JSPI +
-      // a non-empty spec corpus — every legitimate skip already
-      // returned above. ran===0 now means a wiring/fixture-copy
-      // failure, not a legitimate skip. Fail loudly: a gate that
-      // greens having run nothing is the trap later slices would
-      // mistake for parity (PR #53 review #1).
-      throw new Error(
-        `parity-differ: ran=0 of ${specCases.length} cases ` +
-          `(skipped=${skipped}) with kernel.wasm present — canaries ` +
-          `were not built/copied into fixtures. This is a wiring bug, ` +
-          `not a legitimate skip; refusing to report vacuous parity.`,
-      );
-    }
-
-    const { failures } = evaluateGate(rows, baseline);
+    // Three independent gate checks (no silent skipping anywhere):
+    //  - established rows diverge beyond the baseline,
+    //  - cases whose parity could not be established aren't tracked,
+    //  - baseline entries with no corresponding case (orphans).
+    const failures: GateFailure[] = [
+      ...evaluateGate(rows, baseline).failures,
+      ...evaluateUnestablished(unestablished, baseline).failures,
+      ...evaluateOrphans(baseline, seen).failures,
+    ];
     if (failures.length > 0) {
       const lines = failures.map((f) =>
         `  [${f.kind}] ${f.canary}::${f.case}` +
         (f.slice ? ` (slice ${f.slice})` : "") + ` — ${f.detail}`
       );
+      const seed = formatBaselineSeed(failures);
       throw new Error(
-        `parity gate: ${failures.length} divergence(s) not covered by ` +
-          `abi/conformance/parity-baseline.toml:\n${lines.join("\n")}`,
+        `parity gate: ${failures.length} issue(s) not covered by ` +
+          `abi/conformance/parity-baseline.toml:\n${lines.join("\n")}` +
+          (seed ? `\n\n${seed}` : ""),
       );
     }
   });

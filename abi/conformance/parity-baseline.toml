@@ -13,9 +13,16 @@
 #     entry here in the same slice PR.
 #
 # Every entry MUST name the owning slice (B1..B6) and a concrete reason.
-# This file starts empty: the first guest-compat slow-tier run with built
-# canaries + kernel.wasm populates the real, current divergence set, each
-# tagged to the slice that will close it. Empty == full spec-corpus parity.
+#
+# SEEDING (PR #53 review P2): nothing auto-populates this file — the gate
+# only READS it, and any unlisted divergence / unestablished case FAILS.
+# So before YURT_ENABLE_WASM_KERNEL_CI is treated as a blocking gate it
+# must be run ONCE in capture mode: the differ prints a copy-pasteable
+# [[divergence]] seed block (formatBaselineSeed) for every failing
+# (canary, case); a human reviews it, sets the owning slice per row, and
+# commits the result here. Only then is this a *baseline* gate rather
+# than an immediate full-parity requirement. Empty + gate enforced ==
+# full spec-corpus parity is being claimed.
 #
 # Schema:
 #   [[divergence]]
