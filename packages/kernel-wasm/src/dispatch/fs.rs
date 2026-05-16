@@ -148,6 +148,51 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
     })
 }
 
+/// `openat(dirfd, path, flags)` — relative-to-directory-fd open.
+/// Absolute paths and `dirfd == AT_FDCWD` behave exactly like
+/// `sys_open` (cwd-relative); otherwise the path is joined onto the
+/// directory fd's stored path and handed to `sys_open`, so symlink
+/// resolution / create / directory semantics stay identical. (B2.4)
+pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
+    const AT_FDCWD: u32 = u32::MAX;
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let dirfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let path = &request[8..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+
+    // Absolute path or AT_FDCWD → identical to plain open (cwd-relative).
+    if path[0] == b'/' || dirfd == AT_FDCWD {
+        let mut req = flags.to_le_bytes().to_vec();
+        req.extend_from_slice(path);
+        return sys_open(caller_pid, &req);
+    }
+
+    // Resolve the directory fd's path (no nested with_kernel: this
+    // closure returns before sys_open takes the lock again).
+    let dir = match with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(dirfd) {
+        Some(crate::kernel::FdEntry::Directory { path }) => Ok(path.clone()),
+        Some(_) => Err(abi::ENOTDIR),
+        None => Err(abi::EBADF),
+    }) {
+        Ok(d) => d,
+        Err(errno) => return -(errno as i64),
+    };
+
+    let mut joined = dir;
+    if joined.last() != Some(&b'/') {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(path);
+    let mut req = flags.to_le_bytes().to_vec();
+    req.extend_from_slice(&joined);
+    sys_open(caller_pid, &req)
+}
+
 fn normalize_readable_path(
     k: &mut Kernel,
     caller_pid: u32,

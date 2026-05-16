@@ -23,7 +23,7 @@ mod thread;
 
 use fs::{
     chdir, chmod, chown, fchdir, fchown, getcwd, hard_link, mkdir, readdir, readlink, realpath,
-    rename, rmdir, stat_path, symlink, sys_open, unlink, utimens,
+    rename, rmdir, stat_path, symlink, sys_open, sys_openat, unlink, utimens,
 };
 use process::{
     close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
@@ -182,6 +182,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
         METHOD_SYS_OPEN => sys_open(caller_pid, request),
+        METHOD_SYS_OPENAT => sys_openat(caller_pid, request),
         METHOD_SYS_LSEEK => lseek(caller_pid, request, response),
         METHOD_SYS_FSTAT => fstat(caller_pid, request, response),
         METHOD_SYS_CHMOD => chmod(caller_pid, request),

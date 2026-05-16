@@ -568,6 +568,11 @@ id = 0x1_0073
 kind = "syscall"
 doc = "POSIX fcntl(F_GETFD): read an fd's descriptor flags. Request: u32 fd LE. Returns the FD_CLOEXEC bit (0 or 1) for an open fd, -EBADF for an unknown fd, -EINVAL for a short request. Companion to sys_set_fd_descriptor_flags (F_SETFD); F_GETFL/F_SETFL status flags need an OFD status-flags field and are tracked separately (B2.3b, gate-sequenced as they affect I/O behavior)."
 
+[method.sys_openat]
+id = 0x1_0074
+kind = "syscall"
+doc = "POSIX openat(dirfd, path, flags). Request: u32 dirfd LE + u32 flags LE + path bytes. An absolute path, or dirfd == AT_FDCWD (0xFFFFFFFF in this ABI; the libc shim maps C's AT_FDCWD to it), resolves exactly like sys_open (cwd-relative). Otherwise the path is resolved against the directory fd's stored path: -ENOTDIR if dirfd is not a directory fd, -EBADF if unknown. Flags match sys_open (bit0 write, bit1 create, bit2 trunc, bit3 directory). Returns the new fd or a negated POSIX errno; -EINVAL for a short/empty request."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"

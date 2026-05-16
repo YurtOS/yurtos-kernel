@@ -6996,3 +6996,130 @@ fn fcntl_getfd_short_request_is_einval() {
         -(abi::EINVAL as i64)
     );
 }
+
+// --- Slice B2.4: POSIX openat ---
+
+const AT_FDCWD: u32 = u32::MAX;
+
+fn openat_req(dirfd: u32, flags: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&flags.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+fn open_dir(path: &[u8]) -> u32 {
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(O_DIRECTORY, path), &mut []);
+    assert!(fd >= 3, "open dir returned {fd}");
+    fd as u32
+}
+
+fn read_abs(path: &[u8]) -> Vec<u8> {
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, path), &mut []);
+    assert!(fd >= 3, "open {path:?} returned {fd}");
+    let mut buf = [0u8; 64];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd as u32, 0, &[]), &mut buf);
+    assert!(n >= 0, "pread returned {n}");
+    buf[..n as usize].to_vec()
+}
+
+#[test]
+fn openat_resolves_relative_to_the_directory_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dfd, O_CREAT | O_WRITE, b"rel.txt"),
+        &mut [],
+    );
+    assert!(fd >= 3, "openat returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"hi"), &mut []),
+        2
+    );
+    // It really landed at /base/rel.txt.
+    assert_eq!(read_abs(b"/base/rel.txt"), b"hi");
+}
+
+#[test]
+fn openat_absolute_path_ignores_dirfd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // dirfd is garbage, but an absolute path must still work.
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(999, O_CREAT | O_WRITE, b"/abs.txt"),
+        &mut [],
+    );
+    assert!(fd >= 3, "openat abs returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"A"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/abs.txt"), b"A");
+}
+
+#[test]
+fn openat_at_fdcwd_is_cwd_relative() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/cwd", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/cwd", &mut []), 0);
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(AT_FDCWD, O_CREAT | O_WRITE, b"c.txt"),
+        &mut [],
+    );
+    assert!(fd >= 3);
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"Z"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/cwd/c.txt"), b"Z");
+}
+
+#[test]
+fn openat_dirfd_not_a_directory_is_enotdir() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let ffd = open_rw(b"/notadir.txt");
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_OPENAT,
+            1,
+            &openat_req(ffd, O_CREAT | O_WRITE, b"x"),
+            &mut []
+        ),
+        -(abi::ENOTDIR as i64)
+    );
+}
+
+#[test]
+fn openat_unknown_dirfd_is_ebadf() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_OPENAT,
+            1,
+            &openat_req(99, O_CREAT | O_WRITE, b"x"),
+            &mut []
+        ),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn openat_short_or_empty_request_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_OPENAT, 1, &[0u8; 4], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // 8-byte header but no path.
+    assert_eq!(
+        dispatch(METHOD_SYS_OPENAT, 1, &openat_req(AT_FDCWD, 0, b""), &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
