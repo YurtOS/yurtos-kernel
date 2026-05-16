@@ -804,6 +804,13 @@ fn pwrite_fd(caller_pid: u32, request: &[u8]) -> i64 {
                 if !writable {
                     return -(abi::EBADF as i64);
                 }
+                // POSIX: a zero-byte pwrite returns 0 and does NOT
+                // change the file. Forwarding an empty payload to
+                // vfs.write would resize the file to `offset` (sparse
+                // extension) for a no-op write (PR #55 review P2).
+                if payload.is_empty() {
+                    return 0;
+                }
                 k.vfs.write(mount_id, inode, offset, payload)
             }
             crate::kernel::FdEntry::Directory { .. } => -(abi::EBADF as i64),

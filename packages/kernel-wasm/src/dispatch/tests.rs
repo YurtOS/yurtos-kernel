@@ -6801,6 +6801,28 @@ fn pwrite_past_eof_zero_fills_the_sparse_gap() {
 }
 
 #[test]
+fn pwrite_zero_length_past_eof_does_not_change_file_size() {
+    // PR #55 review P2: a 0-byte pwrite past EOF must return 0 and NOT
+    // resize the file (no sparse extension), per POSIX.
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/zlpw.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 0, b"abc"), &mut []),
+        3
+    );
+    // Zero-length pwrite far past EOF must be a true no-op.
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 100, b""), &mut []),
+        0
+    );
+    // The file is still exactly 3 bytes — not extended to 100.
+    let mut buf = [0xFFu8; 64];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd, 0, &[]), &mut buf);
+    assert_eq!(n, 3, "0-byte pwrite must not extend the file");
+    assert_eq!(&buf[..3], b"abc");
+}
+
+#[test]
 fn pread_pwrite_espipe_on_non_seekable_fds() {
     let _g = crate::kernel::TestGuard::acquire();
     // stdin (fd 0) / stdout (fd 1) are streams → ESPIPE.
