@@ -6747,3 +6747,46 @@ fn record_exit_without_parent_does_not_panic_or_signal() {
     let phantom = crate::kernel::with_kernel(|k| k.has_process(0));
     assert!(!phantom, "pid 0 must never be created as a signal target");
 }
+
+// --- Slice B1.4: POSIX getpgrp()/setpgrp() ---
+// Guest libc maps getpgrp() -> host_getpgid(0) and
+// setpgrp() -> host_setpgid(0,0); host_getpgid(0) (yurt_process.c).
+// There is no distinct getpgrp/setpgrp import, so B1.4 is a contract
+// lock over the target==0 path of getpgid/setpgid: a regression there
+// would silently break getpgrp()/setpgrp() for every guest.
+
+#[test]
+fn getpgrp_returns_callers_group_defaulting_to_pid() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let _ = k.process_mut(1234);
+    });
+    // getpgrp() == getpgid(0): a fresh process leads its own group.
+    let req_self = 0u32.to_le_bytes().to_vec();
+    assert_eq!(
+        getpgid(1234, &req_self),
+        1234,
+        "getpgrp() must return the caller's pgid (defaults to its pid)"
+    );
+}
+
+#[test]
+fn setpgrp_makes_caller_a_group_leader_and_getpgrp_is_stable() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let _ = k.process_mut(1234);
+    });
+    // setpgrp() == setpgid(0, 0): target=caller, new_pgid=caller pid.
+    let mut setpgrp_req = 0u32.to_le_bytes().to_vec();
+    setpgrp_req.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(setpgid(1234, &setpgrp_req), 0);
+
+    // Subsequent getpgrp() reflects it and is stable.
+    let req_self = 0u32.to_le_bytes().to_vec();
+    assert_eq!(getpgid(1234, &req_self), 1234);
+    assert_eq!(
+        getpgid(1234, &req_self),
+        1234,
+        "getpgrp() must be stable after setpgrp()"
+    );
+}
