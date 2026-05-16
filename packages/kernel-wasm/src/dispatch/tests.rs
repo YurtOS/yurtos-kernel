@@ -7248,3 +7248,120 @@ fn fcntl_getfl_setfl_short_request_is_einval() {
         -(abi::EINVAL as i64)
     );
 }
+
+// --- Slice B2.5: POSIX ioctl (FIONBIO / FIONREAD whitelist) ---
+
+const FIONBIO: u32 = 0x5421;
+const FIONREAD: u32 = 0x541B;
+
+fn ioctl_req(fd: u32, req: u32, arg: u32) -> Vec<u8> {
+    let mut r = fd.to_le_bytes().to_vec();
+    r.extend_from_slice(&req.to_le_bytes());
+    r.extend_from_slice(&arg.to_le_bytes());
+    r
+}
+
+#[test]
+fn ioctl_fionbio_toggles_o_nonblock_in_status_flags() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/fionbio.txt");
+    assert_eq!(getfl(fd), 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, FIONBIO, 1), &mut []),
+        0
+    );
+    assert_eq!(getfl(fd), O_NONBLOCK as i64, "FIONBIO set O_NONBLOCK");
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, FIONBIO, 0), &mut []),
+        0
+    );
+    assert_eq!(getfl(fd), 0, "FIONBIO arg=0 cleared O_NONBLOCK");
+}
+
+#[test]
+fn ioctl_fionread_file_reports_size_minus_offset() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/fionread.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 0, b"0123456789"), &mut []),
+        10
+    );
+    let mut buf = [0u8; 4];
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, FIONREAD, 0), &mut buf),
+        4
+    );
+    assert_eq!(u32::from_le_bytes(buf), 10);
+
+    // A regular read advances the OFD cursor; FIONREAD tracks remaining.
+    let mut rbuf = [0u8; 4];
+    assert_eq!(
+        dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut rbuf),
+        4
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, FIONREAD, 0), &mut buf),
+        4
+    );
+    assert_eq!(u32::from_le_bytes(buf), 6, "10 - 4 consumed");
+}
+
+#[test]
+fn ioctl_fionread_pipe_reports_buffered_bytes() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut pbuf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pbuf), 8);
+    let read_fd = u32::from_le_bytes(pbuf[0..4].try_into().unwrap());
+    let write_fd = u32::from_le_bytes(pbuf[4..8].try_into().unwrap());
+    assert_eq!(
+        dispatch(METHOD_SYS_WRITE, 1, &write_req(write_fd, b"hello"), &mut []),
+        5
+    );
+    let mut buf = [0u8; 4];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_IOCTL,
+            1,
+            &ioctl_req(read_fd, FIONREAD, 0),
+            &mut buf
+        ),
+        4
+    );
+    assert_eq!(u32::from_le_bytes(buf), 5);
+}
+
+#[test]
+fn ioctl_unknown_request_is_enotty() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/ioctl_x.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, 0x9999, 0), &mut []),
+        -(abi::ENOTTY as i64)
+    );
+}
+
+#[test]
+fn ioctl_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Unknown fd.
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(99, FIONBIO, 1), &mut []),
+        -(abi::EBADF as i64)
+    );
+    // Short request.
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &[0u8; 8], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // FIONREAD with too-small response.
+    let fd = open_rw(b"/ioctl_g.txt");
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_IOCTL,
+            1,
+            &ioctl_req(fd, FIONREAD, 0),
+            &mut [0u8; 2]
+        ),
+        -(abi::EINVAL as i64)
+    );
+}

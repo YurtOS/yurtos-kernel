@@ -159,6 +159,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS => get_fd_descriptor_flags(caller_pid, request),
         METHOD_SYS_GET_FILE_STATUS_FLAGS => get_file_status_flags(caller_pid, request),
         METHOD_SYS_SET_FILE_STATUS_FLAGS => set_file_status_flags(caller_pid, request),
+        METHOD_SYS_IOCTL => ioctl_fd(caller_pid, request, response),
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
@@ -502,6 +503,67 @@ fn set_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
                 None => -(abi::EBADF as i64),
             },
             _ => 0,
+        }
+    })
+}
+
+/// `ioctl(fd, request, arg)` — narrow whitelist (B2.5).
+/// FIONBIO toggles O_NONBLOCK in the OFD status_flags (storage only,
+/// like F_SETFL); FIONREAD writes the readable-byte count; anything
+/// else is -ENOTTY. Behavioral honoring of O_NONBLOCK is gate-sequenced.
+fn ioctl_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    const FIONBIO: u32 = 0x5421;
+    const FIONREAD: u32 = 0x541B;
+    const O_NONBLOCK: u32 = 0x800;
+    let Some([fd, req, arg]) = read_u32_args::<3>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match req {
+            FIONBIO => {
+                if let FdEntry::File { ofd_id } = entry {
+                    if let Some(o) = k.ofd_mut(ofd_id) {
+                        if arg != 0 {
+                            o.status_flags |= O_NONBLOCK;
+                        } else {
+                            o.status_flags &= !O_NONBLOCK;
+                        }
+                    } else {
+                        return -(abi::EBADF as i64);
+                    }
+                }
+                // Non-file valid fds: accepted no-op (not tracked yet).
+                0
+            }
+            FIONREAD => {
+                if response.len() < 4 {
+                    return -(abi::EINVAL as i64);
+                }
+                let readable: u32 = match entry {
+                    FdEntry::File { ofd_id } => match k.ofd(ofd_id) {
+                        Some(o) => {
+                            let size = k.vfs.size(o.mount_id, o.inode).unwrap_or(0);
+                            size.saturating_sub(o.offset).min(u32::MAX as u64) as u32
+                        }
+                        None => return -(abi::EBADF as i64),
+                    },
+                    FdEntry::Pipe {
+                        id,
+                        end: PipeEnd::Read,
+                    } => k
+                        .pipe_buf_mut(id)
+                        .map(|b| b.bytes.len().min(u32::MAX as usize) as u32)
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                response[0..4].copy_from_slice(&readable.to_le_bytes());
+                4
+            }
+            _ => -(abi::ENOTTY as i64),
         }
     })
 }

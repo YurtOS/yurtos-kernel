@@ -583,6 +583,11 @@ id = 0x1_0076
 kind = "syscall"
 doc = "POSIX fcntl(F_SETFL): set an fd's settable file status flags. Request: u32 fd LE + u32 flags LE. Only the POSIX-settable subset is persisted (O_APPEND=0x400 | O_NONBLOCK=0x800, Linux/musl values); access-mode/creation bits are ignored. Regular-file fd: stored on the OFD (shared by dup'd fds). Valid non-file fd: accepted as a no-op (not tracked yet). -EBADF unknown fd, -EINVAL short request. Behavioral honoring is gate-sequenced (B2.3b stores only)."
 
+[method.sys_ioctl]
+id = 0x1_0077
+kind = "syscall"
+doc = "POSIX ioctl(fd, request, arg) — narrow whitelist. Request: u32 fd LE + u32 request_code LE + u32 arg LE. FIONBIO (0x5421): arg!=0 sets / arg==0 clears O_NONBLOCK in the file fd's OFD status_flags (storage only, like F_SETFL; non-file valid fds are an accepted no-op). FIONREAD (0x541B): writes a u32 LE count of immediately-readable bytes into the response (regular file = size-offset; pipe read end = buffered bytes; otherwise 0) and returns 4. Any other request_code -> -ENOTTY. -EBADF unknown fd, -EINVAL short request / FIONREAD with a <4-byte response. Behavioral honoring of O_NONBLOCK is gate-sequenced."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"
