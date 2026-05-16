@@ -142,6 +142,25 @@ describe("ProcessKernel", () => {
     kernel.dispose();
   });
 
+  it("buildFdTableForSpawn keeps explicitly closed stdio fds closed", () => {
+    const kernel = new ProcessKernel();
+    const pid = kernel.allocPid();
+    const childTable = kernel.buildFdTableForSpawn(pid, {
+      prog: "/bin/cat",
+      args: [],
+      env: [],
+      cwd: "/",
+      stdin_fd: -1,
+      stdout_fd: 1,
+      stderr_fd: 2,
+    });
+
+    expect(childTable.has(0)).toBe(false);
+    expect(childTable.has(1)).toBe(false);
+    expect(childTable.has(2)).toBe(false);
+    kernel.dispose();
+  });
+
   // Direct ppid plumbing — guards against any of the four pid-creation
   // entry points (allocPid / registerPending / registerProcess /
   // registerExited) silently dropping back to the wrong default.

@@ -1,6 +1,7 @@
-import { assertEquals } from "@std/assert";
+import { assert, assertEquals } from "@std/assert";
 import { makeWorkerDispatcherBodies } from "../worker-bodies.ts";
 import { ProcessKernel } from "../../process/kernel.ts";
+import { createLoopbackSocketBackend } from "../../network/socket-backend.ts";
 import {
   createBufferTarget,
   createStaticTarget,
@@ -174,23 +175,111 @@ Deno.test(
   },
 );
 
-Deno.test(
-  "makeWorkerDispatcherBodies: socketOpen returns -1 (not wired)",
-  () => {
-    const kernel = new ProcessKernel();
-    const pid = kernel.allocPid(0, "test");
+Deno.test("makeWorkerDispatcherBodies: socketOpen allocates AF_INET stream fds", () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const socketBackend = createLoopbackSocketBackend();
 
-    const bodies = makeWorkerDispatcherBodies({
-      kernel,
-      callerPid: pid,
-      threadsBackend: () => nullThreadsBackend(),
-    });
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+    socketBackend,
+  });
 
-    assertEquals(bodies.socketOpen(2, 1, 0), -1);
+  const fd = bodies.socketOpen(1, 6, 0);
+  const target = kernel.getFdTarget(pid, fd);
+  assert(target?.type === "socket");
+  assertEquals(target.socket, null);
 
-    kernel.dispose();
-  },
-);
+  kernel.dispose();
+});
+
+Deno.test("makeWorkerDispatcherBodies: worker socket bind/listen uses loopback backend", () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const socketBackend = createLoopbackSocketBackend();
+
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+    socketBackend,
+  });
+
+  const fd = bodies.socketOpen(1, 6, 0);
+  assertEquals(
+    bodies.socketBind(fd, new TextEncoder().encode("0.0.0.0"), 0),
+    0,
+  );
+  assertEquals(bodies.socketListen(fd, 2), 0);
+
+  const target = kernel.getFdTarget(pid, fd);
+  assert(target?.type === "socket");
+  assertEquals(target.boundHost, "0.0.0.0");
+  assertEquals(typeof target.listener, "number");
+  assertEquals(typeof target.localPort, "number");
+
+  kernel.dispose();
+});
+
+Deno.test("makeWorkerDispatcherBodies: worker socketpair returns process fds", () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const socketBackend = createLoopbackSocketBackend();
+
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+    socketBackend,
+  });
+
+  const result = bodies.socketPair(3, 6);
+  assertEquals(result.result, 0);
+  const view = new DataView(
+    result.bytes!.buffer,
+    result.bytes!.byteOffset,
+    result.bytes!.byteLength,
+  );
+  const fdA = view.getInt32(0, true);
+  const fdB = view.getInt32(4, true);
+  assertEquals(kernel.getFdTarget(pid, fdA)?.type, "socket");
+  assertEquals(kernel.getFdTarget(pid, fdB)?.type, "socket");
+
+  kernel.dispose();
+});
+
+Deno.test("makeWorkerDispatcherBodies: worker poll writes revents bytes", () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  kernel.setFdTarget(pid, 0, createStaticTarget(new Uint8Array([1, 2, 3])));
+
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+  });
+
+  const fds = new Uint8Array(16);
+  const view = new DataView(fds.buffer);
+  view.setInt32(0, 0, true);
+  view.setInt16(4, 1, true);
+  view.setInt32(8, 99, true);
+  view.setInt16(12, 1, true);
+
+  const result = bodies.poll(2, fds);
+  assertEquals(result.result, 1);
+  const outView = new DataView(
+    result.bytes!.buffer,
+    result.bytes!.byteOffset,
+    result.bytes!.byteLength,
+  );
+  assertEquals(outView.getInt16(6, true), 1);
+  assertEquals(outView.getInt16(14, true), 0);
+
+  kernel.dispose();
+});
 
 Deno.test("makeWorkerDispatcherBodies: threadSpawn delegates to Rust thread bridge with caller tid", () => {
   const kernel = new ProcessKernel();
