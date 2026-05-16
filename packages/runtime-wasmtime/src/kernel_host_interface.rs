@@ -39,6 +39,7 @@ const KH_NAMESPACE: &str = "kh";
 /// C / Rust `extern "C"` declarations without an explicit
 /// `#[link(wasm_import_module = …)]`.
 const SYS_NAMESPACE: &str = "env";
+const YURT_NAMESPACE: &str = "yurt";
 
 /// POSIX errno values referenced by the trampoline. Mirrors
 /// `abi/contract/yurt_abi.toml`.
@@ -48,6 +49,7 @@ const EACCES: i64 = 13;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
 const EINVAL: i64 = 22;
+const EBUSY: i64 = 16;
 const E2BIG: i64 = 7;
 const EIO: i64 = 5;
 const ENOSYS: i64 = 38;
@@ -237,6 +239,12 @@ mod sys_method_id {
     pub const SOCKET_INFO: u32 = 0x1_004A;
     pub const SOCKET_RECVFROM: u32 = 0x1_004B;
     pub const SOCKET_OPTION: u32 = 0x1_004C;
+    pub const THREAD_SPAWN: u32 = 0x1_004D;
+    pub const THREAD_SELF: u32 = 0x1_004E;
+    pub const THREAD_JOIN: u32 = 0x1_004F;
+    pub const THREAD_DETACH: u32 = 0x1_0050;
+    pub const THREAD_EXIT: u32 = 0x1_0051;
+    pub const THREAD_YIELD: u32 = 0x1_0052;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -479,9 +487,150 @@ impl LogSink for StderrLogSink {
 }
 
 pub trait ThreadHost: Send + Sync {
+    fn register_process(&self, _pid: u32, _wasm: Arc<[u8]>, _argv: Vec<Vec<u8>>) {}
     fn spawn(&self, pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32;
     fn release(&self, host_thread_handle: i32) -> i32;
     fn cancel(&self, host_thread_handle: i32) -> i32;
+}
+
+struct WasmtimeThreadProcess {
+    wasm: Arc<[u8]>,
+    argv: Vec<Vec<u8>>,
+}
+
+struct WasmtimeThreadHost {
+    engine: Engine,
+    kernel: Arc<Mutex<KernelInstance>>,
+    processes: Mutex<std::collections::BTreeMap<u32, WasmtimeThreadProcess>>,
+    threads: Mutex<std::collections::BTreeMap<i32, thread::JoinHandle<()>>>,
+    next_handle: Mutex<i32>,
+}
+
+impl WasmtimeThreadHost {
+    fn new(engine: Engine, kernel: Arc<Mutex<KernelInstance>>) -> Self {
+        Self {
+            engine,
+            kernel,
+            processes: Mutex::new(std::collections::BTreeMap::new()),
+            threads: Mutex::new(std::collections::BTreeMap::new()),
+            next_handle: Mutex::new(1),
+        }
+    }
+}
+
+impl ThreadHost for WasmtimeThreadHost {
+    fn register_process(&self, pid: u32, wasm: Arc<[u8]>, argv: Vec<Vec<u8>>) {
+        self.processes
+            .lock()
+            .unwrap()
+            .insert(pid, WasmtimeThreadProcess { wasm, argv });
+    }
+
+    fn spawn(&self, pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32 {
+        let process = {
+            let processes = self.processes.lock().unwrap();
+            let Some(process) = processes.get(&pid) else {
+                return -(ENOENT as i32);
+            };
+            WasmtimeThreadProcess {
+                wasm: process.wasm.clone(),
+                argv: process.argv.clone(),
+            }
+        };
+        let handle = {
+            let mut next = self.next_handle.lock().unwrap();
+            let handle = *next;
+            *next = next.saturating_add(1);
+            handle
+        };
+        let engine = self.engine.clone();
+        let kernel = self.kernel.clone();
+        let join = thread::Builder::new()
+            .name(format!("yurt-wasmtime-thread-{pid}-{tid}"))
+            .spawn(move || {
+                let retval = run_wasmtime_thread(
+                    engine,
+                    kernel.clone(),
+                    pid,
+                    tid,
+                    handle,
+                    process,
+                    fn_ptr,
+                    arg,
+                )
+                .unwrap_or(u32::MAX);
+                let _ = kernel
+                    .lock()
+                    .unwrap()
+                    .record_thread_exit_authenticated(pid, tid, handle, retval);
+            });
+        match join {
+            Ok(join) => {
+                self.threads.lock().unwrap().insert(handle, join);
+                handle
+            }
+            Err(_) => -(EAGAIN as i32),
+        }
+    }
+
+    fn release(&self, host_thread_handle: i32) -> i32 {
+        if let Some(join) = self.threads.lock().unwrap().remove(&host_thread_handle) {
+            let _ = join.join();
+        }
+        0
+    }
+
+    fn cancel(&self, host_thread_handle: i32) -> i32 {
+        self.threads.lock().unwrap().remove(&host_thread_handle);
+        0
+    }
+}
+
+fn run_wasmtime_thread(
+    engine: Engine,
+    kernel: Arc<Mutex<KernelInstance>>,
+    pid: u32,
+    tid: u32,
+    _handle: i32,
+    process: WasmtimeThreadProcess,
+    fn_ptr: u32,
+    arg: u32,
+) -> Result<u32> {
+    let module = Module::new(&engine, process.wasm.as_ref()).context("compile thread wasm")?;
+    let mut linker: Linker<UserState> = Linker::new(&engine);
+    register_sys_imports(&mut linker)?;
+    register_yurt_thread_imports(&mut linker)?;
+    crate::wasi_shim::add_to_linker(&mut linker)
+        .context("install WASI preview1 shim on thread linker")?;
+    let user_state = UserState {
+        kernel,
+        pid,
+        caller_tid: tid,
+        argv: process.argv,
+        dir_fds: std::collections::BTreeMap::new(),
+        last_exit: None,
+        last_scheduler_budget_ns: None,
+        last_scheduler_epoch_quantum: None,
+    };
+    let mut store = Store::new(&engine, user_state);
+    store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .context("instantiate thread wasm")?;
+    let table = instance
+        .get_table(&mut store, "__indirect_function_table")
+        .ok_or_else(|| anyhow!("thread wasm missing __indirect_function_table"))?;
+    let func = match table.get(&mut store, fn_ptr.into()) {
+        Some(wasmtime::Ref::Func(Some(func))) => func,
+        _ => anyhow::bail!("thread function pointer {fn_ptr} not found"),
+    };
+    let typed = func
+        .typed::<i32, i32>(&store)
+        .context("thread entry has wrong type")?;
+    let retval = typed
+        .call(&mut store, arg as i32)
+        .context("thread entry call")?;
+    Ok(retval as u32)
 }
 
 /// State threaded through every wasmtime host callback that runs
@@ -2185,9 +2334,19 @@ impl KernelHostInterface {
             drain_spawn,
             spawn_process,
         };
+        let kernel = Arc::new(Mutex::new(kernel));
+        {
+            let mut guard = kernel.lock().unwrap();
+            if guard.store.data().host.thread_host.is_none() {
+                guard.store.data_mut().host.thread_host = Some(Arc::new(WasmtimeThreadHost::new(
+                    engine.clone(),
+                    kernel.clone(),
+                )));
+            }
+        }
         Ok(Self {
             engine,
-            kernel: Arc::new(Mutex::new(kernel)),
+            kernel,
             process_engine,
             next_anonymous_module_id: RefCell::new(0),
         })
@@ -2567,12 +2726,15 @@ impl KernelHostInterface {
         let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
         let mut linker: Linker<UserState> = Linker::new(&self.engine);
         register_sys_imports(&mut linker)?;
+        register_yurt_thread_imports(&mut linker)?;
         crate::wasi_shim::add_to_linker(&mut linker)
             .context("install WASI preview1 shim on user-process linker")?;
 
+        let thread_argv = argv.clone();
         let user_state = UserState {
             kernel: self.kernel.clone(),
             pid,
+            caller_tid: 1,
             argv,
             dir_fds: std::collections::BTreeMap::new(),
             last_exit: None,
@@ -2584,6 +2746,18 @@ impl KernelHostInterface {
         let instance = linker
             .instantiate(&mut store, &module)
             .context("instantiate user-process wasm")?;
+        if let Some(thread_host) = self
+            .kernel
+            .lock()
+            .unwrap()
+            .store
+            .data()
+            .host
+            .thread_host
+            .as_ref()
+        {
+            thread_host.register_process(pid, Arc::<[u8]>::from(wasm.to_vec()), thread_argv);
+        }
         Ok(UserProcess {
             store,
             instance,
@@ -2680,6 +2854,7 @@ fn encode_argv_records<S: AsRef<[u8]>>(argv: &[S]) -> Vec<u8> {
 pub struct UserState {
     pub kernel: Arc<Mutex<KernelInstance>>,
     pub pid: u32,
+    pub caller_tid: u32,
     pub argv: Vec<Vec<u8>>,
     /// fd → absolute path, populated on every successful `path_open`
     /// and cleared on `fd_close`. Used by the WASI `fd_readdir` shim
@@ -2877,6 +3052,116 @@ impl UserProcess {
 pub use yurt_kernel_host_interface_core::{trampoline_request, trampoline_request_with_response};
 
 // ── Linker registration ──────────────────────────────────────────────────────
+
+fn thread_syscall_from_user(
+    caller: &mut Caller<'_, UserState>,
+    method_id: u32,
+    request: &[u8],
+    response: &mut [u8],
+) -> i64 {
+    let kernel = caller.data().kernel.clone();
+    let pid = caller.data().pid;
+    let tid = caller.data().caller_tid;
+    let rc = match kernel
+        .lock()
+        .unwrap()
+        .thread_syscall(method_id, pid, tid, request, response)
+    {
+        Ok(rc) => rc,
+        Err(_) => -EIO,
+    };
+    rc
+}
+
+fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_spawn",
+        |mut caller: Caller<'_, UserState>, fn_ptr: i32, arg: i32| -> i32 {
+            let mut request = Vec::with_capacity(8);
+            request.extend_from_slice(&(fn_ptr as u32).to_le_bytes());
+            request.extend_from_slice(&(arg as u32).to_le_bytes());
+            thread_syscall_from_user(&mut caller, sys_method_id::THREAD_SPAWN, &request, &mut [])
+                as i32
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_self",
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            thread_syscall_from_user(&mut caller, sys_method_id::THREAD_SELF, &[], &mut []) as i32
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_join",
+        |mut caller: Caller<'_, UserState>, tid: i32, out_retval_ptr: u32| -> i32 {
+            let request = (tid as u32).to_le_bytes();
+            let mut response = [0u8; 4];
+            let mut rc = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::THREAD_JOIN,
+                &request,
+                &mut response,
+            );
+            let mut waiting_as_registered_joiner = rc == -EAGAIN;
+            while rc == -EAGAIN || (waiting_as_registered_joiner && rc == -(EBUSY as i64)) {
+                thread::sleep(std::time::Duration::from_millis(1));
+                rc = thread_syscall_from_user(
+                    &mut caller,
+                    sys_method_id::THREAD_JOIN,
+                    &request,
+                    &mut response,
+                );
+                waiting_as_registered_joiner |= rc == -EAGAIN;
+            }
+            if rc != 0 {
+                return rc as i32;
+            }
+            let Ok(memory) = user_memory(&mut caller) else {
+                return -(EFAULT as i32);
+            };
+            if memory
+                .write(&mut caller, out_retval_ptr as usize, &response)
+                .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+            0
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_detach",
+        |mut caller: Caller<'_, UserState>, tid: i32| -> i32 {
+            let request = (tid as u32).to_le_bytes();
+            thread_syscall_from_user(&mut caller, sys_method_id::THREAD_DETACH, &request, &mut [])
+                as i32
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_exit",
+        |mut caller: Caller<'_, UserState>, retval: i32| -> Result<()> {
+            let request = (retval as u32).to_le_bytes();
+            let _ = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::THREAD_EXIT,
+                &request,
+                &mut [],
+            );
+            Err(anyhow!("thread exited"))
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_yield",
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            thread_syscall_from_user(&mut caller, sys_method_id::THREAD_YIELD, &[], &mut []) as i32
+        },
+    )?;
+    Ok(())
+}
 
 /// Read a kernel-supplied path slice out of kernel.wasm memory.
 /// Returns the bytes verbatim — no rooting, no canonicalization;
