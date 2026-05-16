@@ -1,7 +1,7 @@
 canary = "posix-runtime-canary"
 symbol = "setpriority"
 
-[[cases]]
+[[case]]
 name = "priority_unsupported"
 inputs = "getpriority(PRIO_PROCESS, 0), setpriority(PRIO_PROCESS, 0, 5), nice(1)"
 expected.exit = 0

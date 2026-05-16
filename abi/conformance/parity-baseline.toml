@@ -1,0 +1,32 @@
+# Parity baseline allowlist (slice B0).
+#
+# The parity gate (packages/kernel/src/__tests__/parity-differ_test.ts) runs
+# every conformance canary case through the TS kernel and the Rust
+# kernel.wasm and fails on any observable divergence (exit code / stdout /
+# stderr) NOT listed here.
+#
+# Rules (enforced by _parity_baseline.ts, unit-tested in
+# _parity_baseline_test.ts):
+#   - an un-allowlisted divergence FAILS the gate;
+#   - an allowlisted pair that has started MATCHING also FAILS the gate,
+#     so this file can only ever shrink. Fixing a row means deleting its
+#     entry here in the same slice PR.
+#
+# Every entry MUST name the owning slice (B1..B6) and a concrete reason.
+#
+# SEEDING (PR #53 review P2): nothing auto-populates this file — the gate
+# only READS it, and any unlisted divergence / unestablished case FAILS.
+# So before YURT_ENABLE_WASM_KERNEL_CI is treated as a blocking gate it
+# must be run ONCE in capture mode: the differ prints a copy-pasteable
+# [[divergence]] seed block (formatBaselineSeed) for every failing
+# (canary, case); a human reviews it, sets the owning slice per row, and
+# commits the result here. Only then is this a *baseline* gate rather
+# than an immediate full-parity requirement. Empty + gate enforced ==
+# full spec-corpus parity is being claimed.
+#
+# Schema:
+#   [[divergence]]
+#   canary = "<canary-name>"   # e.g. "dup2-canary"
+#   case   = "<case-name>"     # the spec.toml [[case]].name
+#   slice  = "B<n>"            # owning slice that will fix it
+#   reason = "<why ts and wasm differ today>"

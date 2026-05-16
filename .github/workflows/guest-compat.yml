@@ -120,6 +120,17 @@ jobs:
           cargo test -p yurt-kernel-wasm --lib
           cargo test -p yurt-runtime-wasmtime --test kernel_wasm_trampoline run_pending_spawns_preserves_spawned_child_fd_inheritance
 
+      - name: Parity gate — TS vs Rust kernel over the conformance corpus (slice B0)
+        if: ${{ vars.YURT_ENABLE_WASM_KERNEL_CI == '1' }}
+        run: |
+          set -euxo pipefail
+          # Canaries + fixtures already built by "Build guest compat canaries"
+          # (make -C abi all copy-fixtures). The differ also needs kernel.wasm.
+          cargo build --release -p yurt-kernel-wasm --target wasm32-wasip1
+          YURT_KERNEL=both deno test --no-check \
+            --allow-read --allow-env --allow-run \
+            packages/kernel/src/__tests__/parity-differ_test.ts
+
       - name: Run guest compatibility tests
         run: deno test --no-check --allow-read --allow-env --allow-run packages/kernel/src/__tests__/abi_test.ts
 

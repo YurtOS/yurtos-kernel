@@ -1,7 +1,7 @@
 canary = "posix-runtime-canary"
 symbol = "setresuid"
 
-[[cases]]
+[[case]]
 name = "identity_kernel"
 inputs = "read uid/gid, no-op setresuid/setresgid, attempt root escalation"
 expected.exit = 0

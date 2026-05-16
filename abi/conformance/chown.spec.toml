@@ -1,7 +1,7 @@
 canary = "posix-runtime-canary"
 symbol = "chown"
 
-[[cases]]
+[[case]]
 name = "chown_denied"
 inputs = "create /tmp/yurt-chown-canary.txt, chown/lchown/fchown as uid 1000"
 expected.exit = 0

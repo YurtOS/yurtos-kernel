@@ -1,7 +1,7 @@
 canary = "posix-runtime-canary"
 symbol = "fchdir"
 
-[[cases]]
+[[case]]
 name = "cwd_backend"
 inputs = "chdir absolute, chdir relative, getcwd, fchdir(open directory fd)"
 expected.exit = 0
