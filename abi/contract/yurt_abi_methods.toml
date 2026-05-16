@@ -576,7 +576,7 @@ doc = "POSIX openat(dirfd, path, flags). Request: u32 dirfd LE + u32 flags LE + 
 [method.sys_get_file_status_flags]
 id = 0x1_0075
 kind = "syscall"
-doc = "POSIX fcntl(F_GETFL): read an fd's file status flags. Request: u32 fd LE. For a regular-file fd returns its stored status flags (O_APPEND|O_NONBLOCK subset); for valid non-file fds (stdio/pipe/socket) returns 0 (none tracked yet); -EBADF for an unknown fd, -EINVAL for a short request. NOTE: B2.3b stores/round-trips these; reads/writes do not yet *honor* O_APPEND/O_NONBLOCK (behavioral change is gate-sequenced)."
+doc = "POSIX fcntl(F_GETFL): read an fd's file status flags. Request: u32 fd LE. For a regular-file fd returns its stored status flags (O_APPEND|O_NONBLOCK subset); for valid non-file fds (stdio/pipe/socket) returns 0 (none tracked yet); -EBADF for an unknown fd, -EINVAL for a short request. NOTE: B2.3b stores/round-trips these; reads/writes do not yet *honor* O_APPEND/O_NONBLOCK (behavioral change is gate-sequenced). FIXME(#60): the access-mode bits (O_ACCMODE) are NOT included, so `flags & O_ACCMODE` always reads O_RDONLY even on a write fd — incorrect for musl/CPython/libuv. The correct fix needs an OFD access-mode field and a B0-measured slice; tracked in issue #60."
 
 [method.sys_set_file_status_flags]
 id = 0x1_0076

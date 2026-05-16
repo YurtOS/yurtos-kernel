@@ -6772,6 +6772,35 @@ fn pwrite_writes_at_offset_without_moving_the_cursor() {
 }
 
 #[test]
+fn pwrite_past_eof_zero_fills_the_sparse_gap() {
+    // PR #55 review #4: pwrite is a new one-call path to the
+    // past-EOF case; POSIX requires the gap to read back as zeros.
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/sparse.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 0, b"hi"), &mut []),
+        2
+    );
+    // Write one byte at offset 10, leaving a [2, 10) hole.
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 10, b"X"), &mut []),
+        1
+    );
+    let mut buf = [0xFFu8; 16];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd, 0, &[]), &mut buf);
+    assert_eq!(n, 11, "length is the farthest write end (11)");
+    let mut expected = [0u8; 11];
+    expected[0] = b'h';
+    expected[1] = b'i';
+    expected[10] = b'X';
+    assert_eq!(
+        &buf[..n as usize],
+        &expected[..],
+        "the [2,10) gap must read back as zero bytes"
+    );
+}
+
+#[test]
 fn pread_pwrite_espipe_on_non_seekable_fds() {
     let _g = crate::kernel::TestGuard::acquire();
     // stdin (fd 0) / stdout (fd 1) are streams → ESPIPE.

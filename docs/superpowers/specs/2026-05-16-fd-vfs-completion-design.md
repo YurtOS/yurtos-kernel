@@ -23,14 +23,22 @@ deltas.
    minus the `ofd.offset +=`.
 2. **B2.2 dup3** — `dup2` semantics plus an explicit flags word (`O_CLOEXEC`);
    `-EINVAL` if `oldfd == newfd`, `-EINVAL` for unknown flags. Reuses the
-   existing dup/cloexec machinery.
+   existing dup/cloexec machinery. **Tracked parity gap (PR #55 review #5):**
+   like `dup2_fd` (pre-existing, not introduced here), `dup3` does not
+   bound-check `newfd` against `RLIMIT_NOFILE` — real `dup3` returns `-EBADF`
+   for `newfd >= RLIMIT_NOFILE`. Deferred with the rlimit-enforcement work
+   (B2 covers storage, not per-fd-number limit enforcement); flagged so it is
+   not mistaken for done-to-spec and is re-measured against B0 when fd-limit
+   enforcement lands.
 3. **B2.3 fcntl flag completeness** — `F_GETFD`/`F_SETFD` (landed) +
    `F_GETFL`/`F_SETFL` storage on the OFD (B2.3b, landed, storage-only).
-   **Tracked follow-up (PR #55 review):** `F_GETFL` currently returns only the
-   `O_APPEND|O_NONBLOCK` subset, so `flags & O_ACCMODE` always reads `O_RDONLY`.
-   The gate-sequenced "honor flags" follow-up MUST also surface the access mode
-   from `OpenFileDescription.writable` (`O_RDONLY`/`O_WRONLY`/`O_RDWR`) — musl /
-   CPython `os.get_blocking` / libuv probe it.
+   **Tracked follow-up — issue #60 (PR #55 review #1):** `F_GETFL` currently
+   returns only the `O_APPEND|O_NONBLOCK` subset, so `flags & O_ACCMODE` always
+   reads `O_RDONLY` — a *wrong answer* (not just incomplete) for musl / CPython
+   `os.get_blocking` / libuv, which branch on the access mode. The correct fix
+   needs an OFD access-mode field and must land as its own B0-measured slice;
+   first-class tracking in **#60** (same discipline as #59), referenced from the
+   `sys_get_file_status_flags` ABI `doc=` and the code, not only here.
 4. **B2.4 openat** — open relative to a directory fd (`AT_FDCWD` → cwd). Landed
    (path-joined reuse of `sys_open`). **Open bug — issue #59:** dirfd must be
    inode-anchored, not path-snapshot (breaks across rename/unlink). The faithful
@@ -38,7 +46,11 @@ deltas.
    session, tracked in #59, not patched in B2.
 5. **B2.5 ioctl subset** — the calls real userland hits (`FIONREAD`, `FIONBIO`,
    the tty `TIOC*` already partly modelled); unknown → `-ENOTTY`/`-EINVAL` per
-   POSIX.
+   POSIX. **Deliberate deferral (PR #55 review #3), not an oversight:**
+   `FIONBIO`/`FIONREAD` on a *socket* fd is a silent success no-op (`FIONBIO`
+   returns 0 without taking effect; `FIONREAD` returns 0) — socket non-blocking
+   /readable-count belongs to the B3 non-blocking + async-poll sub-slice and is
+   gate-sequenced there, not modelled in B2.
 6. **B2.6 mkdir/rmdir/create permission checks**, **B2.7 YURTFS copy-on-write**
    — VFS-semantics, larger; gate-sequenced.
 
