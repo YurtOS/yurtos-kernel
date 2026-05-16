@@ -314,7 +314,12 @@ fn wasmtime_adapter_lists_kernel_owned_thread_snapshot() {
 
 #[test]
 fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
-    let mk = fresh_kernel_host_interface(0);
+    let thread_host = Arc::new(RecordingThreadHost::default());
+    let host = HostState {
+        thread_host: Some(thread_host.clone()),
+        ..HostState::default()
+    };
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
     let module = wat::parse_str(
         r#"
         (module
@@ -345,11 +350,17 @@ fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
     mk.detach_thread(proc.pid(), tid).unwrap();
     mk.record_thread_exit(proc.pid(), tid, 123).unwrap();
 
-    assert!(mk
+    let tombstone = mk
         .list_threads(proc.pid())
         .unwrap()
         .into_iter()
-        .all(|thread| thread.tid != tid));
+        .find(|thread| thread.tid == tid)
+        .expect("detached exited thread remains as POSIX tombstone");
+    assert_eq!(tombstone.state, "exited");
+    assert!(tombstone.detached);
+    assert_eq!(tombstone.exit_value, Some(123));
+    assert_eq!(tombstone.host_thread_handle, None);
+    assert_eq!(thread_host.releases.lock().unwrap().as_slice(), &[91]);
 }
 
 #[derive(Default)]

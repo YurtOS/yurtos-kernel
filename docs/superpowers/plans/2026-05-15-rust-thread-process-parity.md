@@ -1521,58 +1521,30 @@ git add test-fixtures/abi-conformance/src/main.rs test-fixtures/abi-conformance/
 git commit -m "test: cover Rust pthread conformance"
 ```
 
-## Task 11: Keep DNS Resolve as a Separate Parity Slice
+## Task 11: Defer Kernel DNS Resolve
 
 **Files:**
 
-- Modify: `docs/superpowers/plans/2026-05-15-rust-kernel-parity-pr43.md`
-- Create: `docs/superpowers/specs/2026-05-15-rust-dns-resolve-parity-design.md`
+- Modify: `docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix.md`
+- Modify:
+  `docs/superpowers/specs/2026-05-15-rust-thread-process-parity-design.md`
 
 - [ ] **Step 1: Document the decision**
 
-Add a short DNS section to the existing parity plan:
+Record DNS as outside the retirement critical path:
 
 ```markdown
-### DNS Resolve
-
-Rust thread lifecycle is the current parity blocker. DNS resolve remains a small
-follow-up slice because it is not a clean POSIX syscall and needs an explicit
-guest API decision: either `getaddrinfo`-shaped libc behavior, a yurt-specific
-resolver syscall, or both. Do not block thread/process parity implementation on
-DNS.
+DNS resolution is not part of this parity slice. `fetch()` does not need a
+kernel DNS syscall, and POSIX resolver behavior should be designed later only
+when a concrete guest requires it.
 ```
 
-- [ ] **Step 2: Create DNS spec**
-
-Create `docs/superpowers/specs/2026-05-15-rust-dns-resolve-parity-design.md`:
-
-```markdown
-# Rust DNS Resolve Parity Design
-
-## Goal
-
-Port DNS resolution from the TypeScript kernel path to Rust without pretending
-it is a POSIX kernel syscall.
-
-## Decision
-
-Expose a Rust-kernel syscall for resolver requests and keep libc `getaddrinfo`
-as a compatibility adapter. The kernel owns policy, caching, and request
-validation. Host adapters perform actual network resolution through a
-`kh_dns_resolve` call because DNS cannot be performed inside the sandbox.
-
-## Out of Scope
-
-Thread lifecycle, fork, and process memory cloning are handled by the
-thread/process parity plan.
-```
-
-- [ ] **Step 3: Verify and commit**
+- [ ] **Step 2: Verify and commit**
 
 Run:
 
 ```bash
-/Users/sunny/.deno/bin/deno fmt --check docs/superpowers/plans/2026-05-15-rust-kernel-parity-pr43.md docs/superpowers/specs/2026-05-15-rust-dns-resolve-parity-design.md
+/Users/sunny/.deno/bin/deno fmt --check docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix.md docs/superpowers/specs/2026-05-15-rust-thread-process-parity-design.md
 ```
 
 Expected: pass.
@@ -1580,8 +1552,8 @@ Expected: pass.
 Commit:
 
 ```bash
-git add docs/superpowers/plans/2026-05-15-rust-kernel-parity-pr43.md docs/superpowers/specs/2026-05-15-rust-dns-resolve-parity-design.md
-git commit -m "docs: split DNS resolve parity follow-up"
+git add docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix.md docs/superpowers/specs/2026-05-15-rust-thread-process-parity-design.md
+git commit -m "docs: defer kernel DNS parity"
 ```
 
 ## Task 12: Full Local and PR Verification
@@ -1651,8 +1623,8 @@ Thread/process parity implementation status:
   semantics.
 - Caller tid and worker completion reports are authenticated.
 - Fork remains explicitly out of scope for the next parity slice.
-- DNS resolve is split into its own design because it is not a strict POSIX
-  kernel syscall.
+- DNS resolve is not a retirement blocker; fetch does not need it, and POSIX
+  resolver behavior is deferred until a concrete guest requires it.
 
 Verification:
 
@@ -1684,7 +1656,8 @@ Expected: comment appears on PR #47.
 - Fork/process cloning: intentionally not implemented in this plan. The
   Rust-owned process/thread model is prepared for fork by requiring explicit
   caller tid and scheduler-visible blocked state.
-- DNS resolve: intentionally split into Task 11 documentation/spec work so
-  thread lifecycle remains the current implementation focus.
+- DNS resolve: intentionally not part of the TypeScript-kernel retirement
+  critical path. `fetch()` does not need it, and POSIX resolver behavior is
+  deferred until there is a concrete guest requirement.
 - No JSON is introduced at the guest/kernel boundary; thread request and
   response layouts are fixed little-endian bytes.

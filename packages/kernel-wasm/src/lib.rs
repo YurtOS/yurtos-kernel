@@ -302,22 +302,30 @@ pub extern "C" fn kernel_spawn_thread(pid: u32, host_thread_handle: i32) -> i64 
 ///
 #[no_mangle]
 pub extern "C" fn kernel_detach_thread(pid: u32, tid: u32) -> i64 {
-    crate::kernel::with_kernel(|k| {
-        k.detach_thread(pid, tid)
-            .map(|()| 0)
-            .unwrap_or(-(abi::ESRCH as i64))
-    })
+    let (result, release_handles) = crate::kernel::with_kernel(|k| {
+        let result = k.detach_thread(pid, tid);
+        let release_handles = k.drain_thread_releases();
+        (result, release_handles)
+    });
+    for handle in release_handles {
+        let _ = kh::thread_release(handle);
+    }
+    result.map_or_else(|errno| -(errno as i64), |_| 0)
 }
 
 /// Host-control export: record a thread exit value in kernel-owned state.
 ///
 #[no_mangle]
 pub extern "C" fn kernel_record_thread_exit(pid: u32, tid: u32, exit_value: i32) -> i64 {
-    crate::kernel::with_kernel(|k| {
-        k.exit_thread(pid, tid, exit_value)
-            .map(|()| 0)
-            .unwrap_or(-(abi::ESRCH as i64))
-    })
+    let (result, release_handles) = crate::kernel::with_kernel(|k| {
+        let result = k.exit_thread(pid, tid, exit_value);
+        let release_handles = k.drain_thread_releases();
+        (result, release_handles)
+    });
+    for handle in release_handles {
+        let _ = kh::thread_release(handle);
+    }
+    result.map_or_else(|errno| -(errno as i64), |_| 0)
 }
 
 /// Host-control export: record thread exit after validating the live host

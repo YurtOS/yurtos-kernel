@@ -32,7 +32,8 @@ Out of scope for this spec:
 - `fork` and process memory cloning.
 - Full process snapshot restore/migration.
 - Replacing Web Workers, Deno Workers, or Wasmtime tasks as execution engines.
-- DNS resolution parity.
+- DNS resolution. `fetch()` does not need a kernel DNS syscall, and POSIX
+  resolver behavior should be handled later only if a concrete guest needs it.
 
 `fork` should be specified after this work, using the Rust process primitives
 that this design keeps authoritative.
