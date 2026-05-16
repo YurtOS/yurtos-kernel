@@ -31,18 +31,44 @@ not edited retroactively; this section is the authoritative override:
 Thin gate first, then slices, then harden gate, then TS retirement:
 
 - **B0 — thin parity gate** (infra, not a syscall row): add a
-  `YURT_KERNEL=ts|wasm` runtime switch and a TS-vs-Rust fixture differ over
+  `YURT_KERNEL=ts|wasm|both` runtime switch and a TS-vs-Rust differ over
   `abi/conformance/*.spec.toml` + `packages/runtime-wasmtime/tests/fixture_parity.rs`,
-  wired into the slow tier (`guest-compat.yml`). Unblocks objective
-  measurement for every later slice.
+  wired into the slow tier (`guest-compat.yml`). Also vendors + wires the
+  Open POSIX Test Suite (see below) with a smoke subset green. Unblocks
+  objective measurement for every later slice.
 - **B1** process model completion · **B2** FD/VFS · **B3** sockets/network ·
-  **B4** persistence/extension · **B5** harden gate (every row CI-locked) ·
-  **B6** TS retirement (reduce `packages/kernel/*` to adapters, default
-  `YURT_KERNEL=wasm`).
+  **B4** persistence/extension · **B5** harden gate (every row CI-locked +
+  **full Open POSIX Test Suite green**) · **B6** TS retirement (reduce
+  `packages/kernel/*` to adapters, default `YURT_KERNEL=wasm`).
 
 A row is `done` only when: Rust owns the state, all KH adapters are wired,
-the named fixtures pass, **and** the B0 differ shows zero TS-vs-Rust
-behavioral diff. `Verified@` records the commit at which that last held.
+the named fixtures pass, the B0 differ shows zero TS-vs-Rust behavioral
+diff, **and** the row's Open POSIX Test Suite interface area is PASS (or
+every non-PASS is a justified tracked `UNSUPPORTED` exception). `Verified@`
+records the commit at which that last held.
+
+### POSIX conformance corpus (hard gate)
+
+The IEEE 1003.1-2001 **Open POSIX Test Suite** (posixtest.sourceforge.net)
+is adopted as an external conformance corpus. Vendored under
+`abi/conformance/posix/`:
+
+- **Primary:** `github.com/bytecodealliance/open-posix-test-suite` — the
+  Bytecode Alliance WASI/`wasi-libc` fork; matches our `wasm32-wasip1`
+  guest model directly.
+- **Secondary cross-check:** `github.com/emscripten-core/posixtestsuite`.
+
+Scope = the `conformance/interfaces/` tests for in-scope areas (pthread,
+signals, semaphores, clocks, timers, sched, mqueue, …). Each test is built
+to wasm, run through the B0 differ under both kernels, and graded by the
+standard suite result codes: **PASS=0, FAIL=1, UNRESOLVED=2,
+UNSUPPORTED=4, UNTESTED=5, HUNG=6**. "Pass them all" = every applicable
+test PASS under the Rust kernel **and** identical TS-vs-Rust; any non-PASS
+must be an explicit, written-reason `UNSUPPORTED`/deferred matrix exception
+(physically-wasm-impossible cases only) — **no silent skips**. B0 lands the
+harness + a smoke subset; full-corpus green is the B5 gate, tracked by a
+published per-area `posix-suite` scoreboard that CI enforces as
+non-regressing.
 
 **Column note:** the plan specified `Slice PR / Gate fixture / Last-verified`
 columns. To keep this already-wide table readable, gate fixtures are tracked
