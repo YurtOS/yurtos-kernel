@@ -774,6 +774,41 @@ pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
     0
 }
 
+/// `sigwaitinfo(set)` — non-blocking RT-signal dequeue (B1.8-b).
+/// Returns the oldest queued signal whose bit is in `set` and its
+/// siginfo; clears the compat bitmask bit when none of that signo
+/// remain. True blocking (suspend until a signal arrives) is
+/// gate-deferred — absent a pending match this is -EAGAIN.
+pub(super) fn sigwaitinfo(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 8 || response.len() < 16 {
+        return -(abi::EINVAL as i64);
+    }
+    let set = u64::from_le_bytes(request[0..8].try_into().expect("8 bytes"));
+    with_kernel(|k| {
+        if !k.has_process(caller_pid) {
+            return -(abi::ESRCH as i64);
+        }
+        let p = k.process_mut(caller_pid);
+        let Some(idx) = p
+            .pending_rt
+            .iter()
+            .position(|s| (1..=63).contains(&s.signo) && (set & (1u64 << (s.signo - 1))) != 0)
+        else {
+            return -(abi::EAGAIN as i64);
+        };
+        let sig = p.pending_rt.remove(idx).expect("idx from position");
+        if !p.pending_rt.iter().any(|s| s.signo == sig.signo) {
+            p.pending_signals &= !(1u64 << (sig.signo - 1));
+        }
+        const SI_QUEUE: i32 = -1;
+        response[0..4].copy_from_slice(&(sig.signo as i32).to_le_bytes());
+        response[4..8].copy_from_slice(&SI_QUEUE.to_le_bytes());
+        response[8..12].copy_from_slice(&sig.sender_pid.to_le_bytes());
+        response[12..16].copy_from_slice(&sig.value.to_le_bytes());
+        16
+    })
+}
+
 pub(super) fn kill_request(request: &[u8]) -> i64 {
     let Some([target, sig]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);

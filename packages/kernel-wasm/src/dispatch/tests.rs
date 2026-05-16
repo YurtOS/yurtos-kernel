@@ -7209,3 +7209,112 @@ fn sigqueue_input_guards() {
         -(abi::ESRCH as i64)
     );
 }
+
+// --- Slice B1.8-b: POSIX sigwaitinfo (non-blocking RT dequeue) ---
+
+fn sigset_mask(sig: u32) -> Vec<u8> {
+    (1u64 << (sig - 1)).to_le_bytes().to_vec()
+}
+
+fn decode_rt_siginfo(buf: &[u8]) -> (i32, i32, u32, i32) {
+    (
+        i32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        i32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        i32::from_le_bytes(buf[12..16].try_into().unwrap()),
+    )
+}
+
+#[test]
+fn sigwaitinfo_dequeues_oldest_matching_and_returns_siginfo() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 99), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 2, &sigqueue_req(7, 40, 100), &mut []),
+        0
+    );
+
+    let mut info = [0u8; 16];
+    let rc = dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(40), &mut info);
+    assert_eq!(rc, 16);
+    let (signo, code, pid, value) = decode_rt_siginfo(&info);
+    assert_eq!(signo, 40);
+    assert_eq!(code, -1, "SI_QUEUE");
+    assert_eq!(pid, 1, "oldest queued → sender 1");
+    assert_eq!(value, 99);
+
+    // Second still queued; bitmask bit still set.
+    let (len, bit) = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(7);
+        (p.pending_rt.len(), p.pending_signals & (1u64 << (40 - 1)))
+    });
+    assert_eq!(len, 1);
+    assert_ne!(bit, 0);
+}
+
+#[test]
+fn sigwaitinfo_clears_bitmask_when_last_of_signo_drained() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 3, &sigqueue_req(7, 41, 7), &mut []),
+        0
+    );
+    let mut info = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(41), &mut info),
+        16
+    );
+    let (empty, bit) = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(7);
+        (
+            p.pending_rt.is_empty(),
+            p.pending_signals & (1u64 << (41 - 1)),
+        )
+    });
+    assert!(empty);
+    assert_eq!(bit, 0, "compat bitmask bit cleared once none remain");
+}
+
+#[test]
+fn sigwaitinfo_eagain_when_no_selected_signal_pending() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    let mut info = [0u8; 16];
+    // Empty queue.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(40), &mut info),
+        -(abi::EAGAIN as i64)
+    );
+    // Queued sig 40 but the set selects only sig 5.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 1), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(5), &mut info),
+        -(abi::EAGAIN as i64)
+    );
+}
+
+#[test]
+fn sigwaitinfo_input_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    let mut info = [0u8; 16];
+    // Short request (<8 bytes).
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &[0u8; 4], &mut info),
+        -(abi::EINVAL as i64)
+    );
+    // Response buffer too small.
+    let mut tiny = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(40), &mut tiny),
+        -(abi::EINVAL as i64)
+    );
+}
