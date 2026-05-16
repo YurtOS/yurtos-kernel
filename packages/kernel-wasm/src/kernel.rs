@@ -467,6 +467,11 @@ pub struct OpenFileDescription {
     /// Whether this OFD permits writes (O_WRONLY / O_RDWR set at
     /// open time). Read-only OFDs reject sys_write with -EBADF.
     pub writable: bool,
+    /// POSIX file status flags (`fcntl` F_GETFL/F_SETFL), e.g.
+    /// `O_APPEND`/`O_NONBLOCK`. B2.3b stores and round-trips the
+    /// settable subset; making reads/writes actually *honor* these
+    /// is gate-sequenced (it changes I/O behavior).
+    pub status_flags: u32,
 }
 
 pub enum SocketKind {
@@ -855,6 +860,7 @@ impl Kernel {
                 offset: 0,
                 refs: 1,
                 writable,
+                status_flags: 0,
             },
         );
         id

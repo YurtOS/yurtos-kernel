@@ -7123,3 +7123,128 @@ fn openat_short_or_empty_request_is_einval() {
         -(abi::EINVAL as i64)
     );
 }
+
+// --- Slice B2.3b: POSIX fcntl(F_GETFL/F_SETFL) — storage only ---
+
+const O_APPEND: u32 = 0x400;
+const O_NONBLOCK: u32 = 0x800;
+
+fn setfl_req(fd: u32, flags: u32) -> Vec<u8> {
+    let mut req = fd.to_le_bytes().to_vec();
+    req.extend_from_slice(&flags.to_le_bytes());
+    req
+}
+
+fn getfl(fd: u32) -> i64 {
+    dispatch(
+        METHOD_SYS_GET_FILE_STATUS_FLAGS,
+        1,
+        &fd.to_le_bytes(),
+        &mut [],
+    )
+}
+
+#[test]
+fn fcntl_setfl_getfl_roundtrip_and_masking_on_file() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/setfl.txt");
+    assert_eq!(getfl(fd), 0, "status flags default to 0");
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FILE_STATUS_FLAGS,
+            1,
+            &setfl_req(fd, O_NONBLOCK),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(getfl(fd), O_NONBLOCK as i64);
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FILE_STATUS_FLAGS,
+            1,
+            &setfl_req(fd, O_APPEND | O_NONBLOCK),
+            &mut [],
+        ),
+        0
+    );
+    assert_eq!(getfl(fd), (O_APPEND | O_NONBLOCK) as i64);
+
+    // Non-settable bits (access mode / creation) are stripped.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FILE_STATUS_FLAGS,
+            1,
+            &setfl_req(fd, 0xFFFF_FFFF),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        getfl(fd),
+        (O_APPEND | O_NONBLOCK) as i64,
+        "only settable subset kept"
+    );
+}
+
+#[test]
+fn fcntl_setfl_is_shared_across_dup_via_the_ofd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/setfl_dup.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(fd, 30, 0), &mut []),
+        30
+    );
+    // Set via the original fd; observe via the dup (same OFD).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FILE_STATUS_FLAGS,
+            1,
+            &setfl_req(fd, O_NONBLOCK),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        getfl(30),
+        O_NONBLOCK as i64,
+        "status flags live on the shared OFD"
+    );
+}
+
+#[test]
+fn fcntl_getfl_is_zero_for_non_file_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // stdout (fd 1) is valid but has no per-OFD status tracked.
+    assert_eq!(getfl(1), 0);
+}
+
+#[test]
+fn fcntl_getfl_setfl_unknown_fd_is_ebadf() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(getfl(99), -(abi::EBADF as i64));
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FILE_STATUS_FLAGS,
+            1,
+            &setfl_req(99, O_NONBLOCK),
+            &mut []
+        ),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn fcntl_getfl_setfl_short_request_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_GET_FILE_STATUS_FLAGS, 1, &[1, 2], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SET_FILE_STATUS_FLAGS, 1, &[1, 2, 3, 4], &mut []),
+        -(abi::EINVAL as i64)
+    );
+}

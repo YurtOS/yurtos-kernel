@@ -157,6 +157,8 @@ pub fn dispatch_with_context(
         METHOD_SYS_DUP_MIN => dup_min_fd(caller_pid, request),
         METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS => set_fd_descriptor_flags(caller_pid, request),
         METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS => get_fd_descriptor_flags(caller_pid, request),
+        METHOD_SYS_GET_FILE_STATUS_FLAGS => get_file_status_flags(caller_pid, request),
+        METHOD_SYS_SET_FILE_STATUS_FLAGS => set_file_status_flags(caller_pid, request),
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
@@ -449,6 +451,59 @@ fn get_fd_descriptor_flags(caller_pid: u32, request: &[u8]) -> i64 {
             Err(errno) => -(errno as i64),
         },
     )
+}
+
+/// POSIX-settable file status flags (`fcntl` F_SETFL). Linux/musl
+/// numeric values; access-mode/creation bits are never settable.
+const SETTABLE_STATUS_FLAGS: u32 = 0x400 /* O_APPEND */ | 0x800 /* O_NONBLOCK */;
+
+/// `fcntl(F_GETFL)` — read an fd's file status flags. Regular-file fds
+/// return their stored flags; other valid fds return 0 (none tracked
+/// yet); unknown fd → -EBADF. (B2.3b — storage only.)
+fn get_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match entry {
+            FdEntry::File { ofd_id } => match k.ofd(ofd_id) {
+                Some(o) => o.status_flags as i64,
+                None => -(abi::EBADF as i64),
+            },
+            // Valid but no per-OFD status tracked yet.
+            _ => 0,
+        }
+    })
+}
+
+/// `fcntl(F_SETFL)` — set the settable subset of an fd's status flags
+/// on its OFD (shared by dup'd fds). Non-file valid fds accept it as a
+/// no-op; unknown fd → -EBADF. (B2.3b — storage only; reads/writes do
+/// not yet honor O_APPEND/O_NONBLOCK.)
+fn set_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd, flags]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match entry {
+            FdEntry::File { ofd_id } => match k.ofd_mut(ofd_id) {
+                Some(o) => {
+                    o.status_flags = flags & SETTABLE_STATUS_FLAGS;
+                    0
+                }
+                None => -(abi::EBADF as i64),
+            },
+            _ => 0,
+        }
+    })
 }
 
 /// `pipe() -> writes 8 bytes into response (read_fd, write_fd as u32 LE), returns 8 or -ENFILE`.
