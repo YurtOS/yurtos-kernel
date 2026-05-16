@@ -45,6 +45,13 @@ pub const KERNEL_BUFFER_CAP: usize = 64 * 1024;
 /// Maximum queued descriptor-rights records on one AF_UNIX socket.
 pub const KERNEL_RIGHTS_QUEUE_CAP: usize = 1024;
 
+/// Sanity bound on a process's queued real-time signals (`pending_rt`),
+/// mirroring Linux `RLIMIT_SIGPENDING`. `sigqueue` returns `-EAGAIN`
+/// once a target is at this cap, so a guest looping `sigqueue` cannot
+/// grow kernel memory without bound while the consumer
+/// (`sigwaitinfo`/delivery) is gate-deferred.
+pub const KERNEL_RT_SIGNAL_QUEUE_CAP: usize = 1024;
+
 /// Number of POSIX rlimit slots tracked. Matches the TS kernel's
 /// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
 pub const RLIMIT_SLOTS: usize = 8;

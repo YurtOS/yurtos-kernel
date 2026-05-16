@@ -6795,6 +6795,7 @@ fn setpgrp_makes_caller_a_group_leader_and_getpgrp_is_stable() {
 
 const WAITID_P_PID: u32 = 1;
 const WAITID_P_PGID: u32 = 2;
+const WAITID_WNOHANG: u32 = 1;
 const WAITID_WEXITED: u32 = 4;
 const WAITID_WNOWAIT: u32 = 0x0100_0000;
 
@@ -6910,6 +6911,37 @@ fn waitid_eagain_when_no_matching_child_has_exited() {
             &mut buf,
         ),
         -(abi::EAGAIN as i64)
+    );
+}
+
+#[test]
+fn waitid_wnohang_no_terminated_child_returns_zeroed_siginfo() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 9);
+    let mut buf = [0xFFu8; 20];
+    // POSIX: WNOHANG + no child in a waitable state → success (20)
+    // with a zeroed siginfo (si_signo == 0), NOT -EAGAIN.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 9, WAITID_WEXITED | WAITID_WNOHANG),
+            &mut buf,
+        ),
+        20
+    );
+    assert_eq!(buf, [0u8; 20], "WNOHANG no-child must zero the siginfo");
+    // WNOHANG must not have reaped/disturbed the child: it can still
+    // exit and be waited normally.
+    assert_eq!(record_exit(&record_exit_req(9, 3)), 0);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 9, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
     );
 }
 
@@ -7246,6 +7278,26 @@ fn sigqueue_input_guards() {
             &mut []
         ),
         -(abi::ESRCH as i64)
+    );
+}
+
+#[test]
+fn sigqueue_caps_the_rt_queue_returning_eagain() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    // Fill the per-process RT queue to its sanity cap; every push succeeds.
+    for _ in 0..crate::kernel::KERNEL_RT_SIGNAL_QUEUE_CAP {
+        assert_eq!(
+            dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 0), &mut []),
+            0
+        );
+    }
+    // The next enqueue is refused with -EAGAIN (Linux RLIMIT_SIGPENDING
+    // semantics) instead of growing kernel memory without bound while
+    // the consumer (sigwaitinfo/delivery) is gate-deferred.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 0), &mut []),
+        -(abi::EAGAIN as i64)
     );
 }
 

@@ -100,6 +100,23 @@ strictly gate-after-B0 so their regression/parity surface is measured. Threads
 - DNS / sockets / fd-vfs (B3/B2).
 - Replacing the global kernel mutex serialization model.
 
+## Tracked divergences (PR #54 review — not done-to-spec, intentionally)
+
+These are self-consistent and contract-documented (`yurt_abi_methods.toml`),
+and TS-vs-Rust parity is what the B0 gate enforces — recorded here so they are
+not later mistaken for full POSIX conformance, and to be re-measured when the
+gate-deferred consumer/blocking halves land:
+
+- **`sigwaitinfo` selection order:** returns the strictly oldest-queued RT
+  signal across all selected signos (FIFO). POSIX delivers the
+  lowest-numbered pending signal first. Revisit with the blocking/delivery
+  sub-slice (B1.8-b); add a differ/matrix note if the POSIX corpus exercises
+  multi-signo ordering.
+- **`waitid` blocking:** without `WNOHANG`, a matching-but-not-yet-waitable
+  child yields `-EAGAIN` (would-block placeholder, same as `sys_wait`) rather
+  than blocking — true blocking is AsyncBridge-gated. `WNOHANG` itself is now
+  POSIX-correct (success + zeroed siginfo).
+
 ## Testing
 
 Per sub-slice: kernel `#[cfg(test)]` first (red→green, fast tier), then a

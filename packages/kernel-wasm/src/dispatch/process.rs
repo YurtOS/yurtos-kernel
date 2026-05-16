@@ -741,9 +741,12 @@ pub fn kill_pid(target: u32, sig: u32) -> i64 {
 }
 
 /// `sigqueue(pid, sig, value)` — POSIX real-time signal enqueue. The
-/// caller (`caller_pid`) is the sender. Additive: also sets the
-/// compat bitmask bit so existing `pending_signals` readers keep
-/// working. Consumption (`sigwaitinfo`/delivery) is gate-deferred.
+/// caller (`caller_pid`) is the sender. Separated-producer model: the
+/// RT signal lives ONLY in the target's `pending_rt` queue — it does
+/// NOT touch `pending_signals` (the kill/SIGCHLD bitmask), so a bit
+/// set by `kill()` for the same signo is never clobbered when the RT
+/// queue later drains. `sigpending()` reports the union of both.
+/// Consumption (`sigwaitinfo`/delivery) is gate-deferred.
 pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 12 {
         return -(abi::EINVAL as i64);
@@ -764,6 +767,13 @@ pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
     }
     with_kernel(|k| {
         let p = k.process_mut(target);
+        // Bound the queue (Linux RLIMIT_SIGPENDING). The consumer
+        // (sigwaitinfo/delivery) is gate-deferred, so without this an
+        // unprivileged guest looping sigqueue would grow kernel memory
+        // without bound.
+        if p.pending_rt.len() >= crate::kernel::KERNEL_RT_SIGNAL_QUEUE_CAP {
+            return -(abi::EAGAIN as i64);
+        }
         p.pending_rt.push_back(crate::kernel::RtSignal {
             signo: sig,
             value,
@@ -773,8 +783,8 @@ pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
         // pending_signals (the kill/SIGCHLD bitmask). sigpending()
         // reports the union, so a bit set by kill() for the same signo
         // is never clobbered when the RT queue later drains.
-    });
-    0
+        0
+    })
 }
 
 /// `sigwaitinfo(set)` — non-blocking RT-signal dequeue (B1.8-b).
@@ -793,6 +803,9 @@ pub(super) fn sigwaitinfo(caller_pid: u32, request: &[u8], response: &mut [u8]) 
             return -(abi::ESRCH as i64);
         }
         let p = k.process_mut(caller_pid);
+        // The `1..=63` guard is defensive only: the sole producer
+        // (`sigqueue`) rejects signo>63 before push_back, so a stored
+        // entry is always in range — it can never reject a real entry.
         let Some(idx) = p
             .pending_rt
             .iter()
@@ -831,6 +844,8 @@ pub(super) fn sigpending(caller_pid: u32, response: &mut [u8]) -> i64 {
         // with bits other producers set for the same signo.
         let mut mask = p.pending_signals;
         for s in &p.pending_rt {
+            // Defensive only — `sigqueue` enforces signo in 1..=63 at
+            // enqueue, so stored entries are always in range.
             if (1..=63).contains(&s.signo) {
                 mask |= 1u64 << (s.signo - 1);
             }
@@ -1095,6 +1110,7 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
     // Linux idtype values and option bits. P_ALL (0) is the `_` arm.
     const P_PID: u32 = 1;
     const P_PGID: u32 = 2;
+    const WNOHANG: u32 = 1;
     const WEXITED: u32 = 4;
     const WNOWAIT: u32 = 0x0100_0000;
     const CLD_EXITED: i32 = 1;
@@ -1157,8 +1173,15 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
             .iter()
             .find_map(|&c| k.process_mut(c).exit_status.map(|s| (c, s)))
         else {
-            // No matching child has terminated. Without an AsyncBridge
-            // this is reported as would-block, matching sys_wait.
+            // No matching child is in a waitable state. POSIX waitid:
+            // with WNOHANG, return success with a zeroed siginfo
+            // (si_signo == 0) — NOT an error. Without WNOHANG this
+            // would block; absent an AsyncBridge we report would-block
+            // as -EAGAIN, matching sys_wait.
+            if options & WNOHANG != 0 {
+                response[0..20].fill(0);
+                return 20;
+            }
             return -(abi::EAGAIN as i64);
         };
         let uid = k.process_mut(pid).credentials.uid;
