@@ -561,11 +561,17 @@ struct WasmtimeThreadProcess {
     shared_memory: Option<SharedMemory>,
 }
 
+struct WasmtimeThreadSlot {
+    join: thread::JoinHandle<()>,
+    thread_id: thread::ThreadId,
+}
+
 struct WasmtimeThreadHost {
     engine: Engine,
     kernel: Weak<Mutex<KernelInstance>>,
     processes: Mutex<std::collections::BTreeMap<u32, WasmtimeThreadProcess>>,
-    threads: Mutex<std::collections::BTreeMap<i32, thread::JoinHandle<()>>>,
+    threads: Mutex<std::collections::BTreeMap<i32, WasmtimeThreadSlot>>,
+    pending_reap: Mutex<Vec<thread::JoinHandle<()>>>,
     next_handle: Mutex<i32>,
 }
 
@@ -576,8 +582,14 @@ impl WasmtimeThreadHost {
             kernel: Arc::downgrade(&kernel),
             processes: Mutex::new(std::collections::BTreeMap::new()),
             threads: Mutex::new(std::collections::BTreeMap::new()),
+            pending_reap: Mutex::new(Vec::new()),
             next_handle: Mutex::new(1),
         }
+    }
+
+    fn drain_pending_reap(&self) {
+        let pending = std::mem::take(&mut *self.pending_reap.lock().unwrap());
+        join_thread_handles(pending);
     }
 }
 
@@ -600,6 +612,7 @@ impl ThreadHost for WasmtimeThreadHost {
     }
 
     fn spawn(&self, pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32 {
+        self.drain_pending_reap();
         let process = {
             let processes = self.processes.lock().unwrap();
             let Some(process) = processes.get(&pid) else {
@@ -634,7 +647,11 @@ impl ThreadHost for WasmtimeThreadHost {
             });
         match join {
             Ok(join) => {
-                self.threads.lock().unwrap().insert(handle, join);
+                let thread_id = join.thread().id();
+                self.threads
+                    .lock()
+                    .unwrap()
+                    .insert(handle, WasmtimeThreadSlot { join, thread_id });
                 handle
             }
             Err(_) => -(EAGAIN as i32),
@@ -642,9 +659,11 @@ impl ThreadHost for WasmtimeThreadHost {
     }
 
     fn release(&self, host_thread_handle: i32) -> i32 {
-        if let Some(join) = self.threads.lock().unwrap().remove(&host_thread_handle) {
-            if should_join_thread(join.thread().id()) {
-                let _ = join.join();
+        if let Some(slot) = self.threads.lock().unwrap().remove(&host_thread_handle) {
+            if should_join_thread(slot.thread_id) {
+                let _ = slot.join.join();
+            } else {
+                self.pending_reap.lock().unwrap().push(slot.join);
             }
         }
         0
@@ -656,8 +675,21 @@ impl ThreadHost for WasmtimeThreadHost {
     }
 }
 
+impl Drop for WasmtimeThreadHost {
+    fn drop(&mut self) {
+        let pending = std::mem::take(self.pending_reap.get_mut().unwrap());
+        join_thread_handles(pending);
+    }
+}
+
 fn should_join_thread(target: thread::ThreadId) -> bool {
     target != thread::current().id()
+}
+
+fn join_thread_handles(handles: Vec<thread::JoinHandle<()>>) {
+    for handle in handles {
+        let _ = handle.join();
+    }
 }
 
 fn run_wasmtime_thread(
@@ -3289,6 +3321,12 @@ fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
             Err(anyhow!("thread exited"))
         },
     )?;
+    linker.func_wrap(YURT_NAMESPACE, "host_fork", || -> i32 {
+        // Continuation-backed fork requires host memory snapshot support.
+        // Wasmtime exposes the import so continuation guests link, while
+        // the Rust-owned fork lifecycle is implemented in the next slice.
+        -(ENOSYS as i32)
+    })?;
     linker.func_wrap(
         YURT_NAMESPACE,
         "host_thread_yield",

@@ -478,6 +478,11 @@ args = [
   { name = "out_cap", type = "usize" },
 ]
 
+[import.host_fork]
+doc = "Continuation-only process fork hook. Hosts without continuation snapshot support return -ENOSYS."
+return = "scalar_errno"
+args = []
+
 [import.host_read_fd]
 doc = "Read up to out_cap bytes from fd into guest memory. Partial success is allowed."
 return = "stream_io"

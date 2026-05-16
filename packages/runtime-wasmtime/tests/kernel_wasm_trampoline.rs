@@ -2456,6 +2456,23 @@ fn user_process_calls_kernel_through_full_trampoline() {
 }
 
 #[test]
+fn user_process_importing_host_fork_instantiates_and_returns_enosys() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+
+    let user_wat = r#"
+        (module
+          (import "yurt" "host_fork" (func $host_fork (result i32)))
+          (func (export "run") (result i32)
+            (call $host_fork)))
+    "#;
+    let user_wasm = wat::parse_str(user_wat).unwrap();
+    let mut user = mk.spawn_user_process(&user_wasm).unwrap();
+
+    let rc = user.call_run().unwrap();
+    assert_eq!(rc, -(ENOSYS as i32), "host_fork is present but unsupported");
+}
+
+#[test]
 fn kernel_host_interface_direct_syscall_uses_kernel_pid_zero() {
     // KernelHostInterface-owned syscalls (no user process in flight) see the
     // kernel as their caller — pid 0. sys_getpid via dispatch
@@ -3482,7 +3499,7 @@ fn process_group_and_session_round_trip_through_trampoline() {
     req.extend_from_slice(&target_pid.to_le_bytes());
     req.extend_from_slice(&99_u32.to_le_bytes());
     let rc = mk.syscall(METHOD_SYS_SETPGID, &req, &mut []).unwrap();
-    assert_eq!(rc, -(EPERM as i64), "setpgid rejects missing group");
+    assert_eq!(rc, -EPERM, "setpgid rejects missing group");
 
     // setpgid(target, 0) keeps the target as its own group leader.
     let mut req = Vec::new();
