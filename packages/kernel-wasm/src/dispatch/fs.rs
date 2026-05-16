@@ -174,6 +174,13 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
 
     // Resolve the directory fd's path (no nested with_kernel: this
     // closure returns before sys_open takes the lock again).
+    //
+    // FIXME(#59): not POSIX-faithful — `FdEntry::Directory` stores the
+    // path captured at open() time, so `openat(dirfd, "child")` resolves
+    // the *stale* path if the directory is renamed/unlinked. A dirfd
+    // must track the directory object (inode), which needs a
+    // VfsBackend dir-handle API across every backend (VFS rewrite,
+    // tracked in #59 — not patched here).
     let dir = match with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(dirfd) {
         Some(crate::kernel::FdEntry::Directory { path }) => Ok(path.clone()),
         Some(_) => Err(abi::ENOTDIR),

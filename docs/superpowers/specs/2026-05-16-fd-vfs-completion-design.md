@@ -26,9 +26,11 @@ deltas.
    existing dup/cloexec machinery.
 3. **B2.3 fcntl flag completeness** — `F_GETFD`/`F_SETFD` beyond `FD_CLOEXEC`,
    `F_GETFL`/`F_SETFL` status flags surfaced from the OFD.
-4. **B2.4 openat** — open relative to a directory fd; requires storing the dir
-   path/inode on `FdEntry::Directory` and resolving against it (`AT_FDCWD` →
-   cwd). Larger; may split.
+4. **B2.4 openat** — open relative to a directory fd (`AT_FDCWD` → cwd). Landed
+   (path-joined reuse of `sys_open`). **Open bug — issue #59:** dirfd must be
+   inode-anchored, not path-snapshot (breaks across rename/unlink). The faithful
+   fix is a VFS dir-handle API across every backend (VFS rewrite) — its own
+   session, tracked in #59, not patched in B2.
 5. **B2.5 ioctl subset** — the calls real userland hits (`FIONREAD`, `FIONBIO`,
    the tty `TIOC*` already partly modelled); unknown → `-ENOTTY`/`-EINVAL` per
    POSIX.
