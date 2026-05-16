@@ -809,6 +809,22 @@ pub(super) fn sigwaitinfo(caller_pid: u32, request: &[u8], response: &mut [u8]) 
     })
 }
 
+/// `sigpending()` — the caller's pending-signal set as a u64 bitmask
+/// (bit sig-1), kept current by kill / SIGCHLD / sigqueue. Pure read.
+pub(super) fn sigpending(caller_pid: u32, response: &mut [u8]) -> i64 {
+    if response.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        if !k.has_process(caller_pid) {
+            return -(abi::ESRCH as i64);
+        }
+        let mask = k.process_mut(caller_pid).pending_signals;
+        response[0..8].copy_from_slice(&mask.to_le_bytes());
+        8
+    })
+}
+
 pub(super) fn kill_request(request: &[u8]) -> i64 {
     let Some([target, sig]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);

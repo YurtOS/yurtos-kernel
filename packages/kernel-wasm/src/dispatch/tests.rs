@@ -7318,3 +7318,42 @@ fn sigwaitinfo_input_guards() {
         -(abi::EINVAL as i64)
     );
 }
+
+// --- Slice B1.9: POSIX sigpending ---
+
+#[test]
+fn sigpending_reports_the_pending_set() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    // sigqueue sets the compat bitmask bit for sig 40 on proc 7.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 0), &mut []),
+        0
+    );
+
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    let mask = u64::from_le_bytes(buf);
+    assert_ne!(mask & (1u64 << (40 - 1)), 0, "sig 40 must show pending");
+    assert_eq!(mask & (1u64 << (5 - 1)), 0, "unrelated sig must not");
+}
+
+#[test]
+fn sigpending_is_empty_when_nothing_queued() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_eq!(u64::from_le_bytes(buf), 0);
+}
+
+#[test]
+fn sigpending_buffer_too_small_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    let mut tiny = [0u8; 4];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut tiny),
+        -(abi::EINVAL as i64)
+    );
+}

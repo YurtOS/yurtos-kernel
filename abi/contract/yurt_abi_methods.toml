@@ -558,6 +558,11 @@ id = 0x1_0064
 kind = "syscall"
 doc = "POSIX sigwaitinfo non-blocking dequeue. Request: u64 set mask LE (bit sig-1 selects sig). If the authenticated caller has a queued RT signal whose bit is in the set, the oldest such signal is removed and its siginfo is written: 16 bytes — i32 si_signo + i32 si_code (SI_QUEUE=-1) + u32 si_pid (sender) + i32 si_value, all LE; the compat bitmask bit is cleared when no more of that signo remain queued. Returns 16 on success, -EAGAIN if no selected signal is pending (true blocking is gate-deferred), -EINVAL on short request/buffer."
 
+[method.sys_sigpending]
+id = 0x1_0065
+kind = "syscall"
+doc = "POSIX sigpending. No request bytes. Writes 8 bytes — the authenticated caller's pending-signal set as a u64 LE bitmask (bit sig-1), kept current by kill/SIGCHLD/sigqueue. Returns 8, -ESRCH if the caller has no process record, -EINVAL if the response buffer is shorter than 8 bytes."
+
 [method.sys_fchdir]
 id = 0x1_005F
 kind = "syscall"

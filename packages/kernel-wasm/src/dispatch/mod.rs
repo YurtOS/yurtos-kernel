@@ -29,7 +29,7 @@ use process::{
     close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
     killpg_request, nanosleep, provide_stdin, sched_getaffinity, sched_getparam,
     sched_getscheduler, sched_setaffinity, sched_setparam, sched_setscheduler, sched_yield,
-    setpgid, setpriority, setresgid, setresuid, setrlimit, setsid, sigaction, sigqueue,
+    setpgid, setpriority, setresgid, setresuid, setrlimit, setsid, sigaction, sigpending, sigqueue,
     sigwaitinfo, sys_spawn, umask, waitid,
 };
 pub use process::{
@@ -180,6 +180,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_KILLPG => killpg_request(caller_pid, request),
         METHOD_SYS_SIGQUEUE => sigqueue(caller_pid, request),
         METHOD_SYS_SIGWAITINFO => sigwaitinfo(caller_pid, request, response),
+        METHOD_SYS_SIGPENDING => sigpending(caller_pid, response),
         METHOD_SYS_SIGACTION => sigaction(caller_pid, request),
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
