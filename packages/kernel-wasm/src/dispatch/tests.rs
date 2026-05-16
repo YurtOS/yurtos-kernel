@@ -223,6 +223,12 @@ fn getpid_returns_caller_pid() {
 
 #[test]
 fn getppid_returns_kernel_pid_until_process_tree_exists() {
+    // Must hold the TestGuard: this asserts on auto-vivified
+    // `process(1)`/`process(99)` ppid (default 0). Without the guard it
+    // races any guarded test that legitimately creates a process at pid
+    // 1 (e.g. a fork allocating host pid 1) and observes a non-zero
+    // ppid. Pre-existing isolation gap surfaced by the fork RT test.
+    let _g = crate::kernel::TestGuard::acquire();
     // Phase note: until host_spawn lands and the kernel tracks
     // parent/child relationships, every process is treated as a
     // direct child of the kernel.
@@ -7453,6 +7459,937 @@ fn ioctl_guards() {
             &ioctl_req(fd, FIONREAD, 0),
             &mut [0u8; 2]
         ),
+        -(abi::EINVAL as i64)
+    );
+}
+// --- Slice B1.1: SIGCHLD delivered to the parent on child exit ---
+// POSIX: a process receives SIGCHLD when a child terminates. record_exit
+// must OR SIGCHLD into the parent's pending_signals (same bit convention
+// as kill_pid: 1 << (sig - 1)), and be a no-op when there is no parent.
+
+const SIGCHLD: u32 = 17;
+
+fn record_exit_req(pid: u32, status: i32) -> Vec<u8> {
+    let mut req = pid.to_le_bytes().to_vec();
+    req.extend_from_slice(&status.to_le_bytes());
+    req
+}
+
+#[test]
+fn record_exit_sets_sigchld_pending_on_parent() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // parent = 1, child = 7
+    let mut reg = 1u32.to_le_bytes().to_vec();
+    reg.extend_from_slice(&7u32.to_le_bytes());
+    assert_eq!(register_child(&reg), 0);
+
+    assert_eq!(record_exit(&record_exit_req(7, 23)), 0);
+
+    let parent_pending = crate::kernel::with_kernel(|k| k.process_mut(1).pending_signals);
+    assert_ne!(
+        parent_pending & (1u64 << (SIGCHLD - 1)),
+        0,
+        "parent must have SIGCHLD pending after a child exits"
+    );
+}
+
+#[test]
+fn record_exit_without_parent_does_not_panic_or_signal() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // child 8 exists but has no parent (ppid defaults to 0).
+    crate::kernel::with_kernel(|k| {
+        let _ = k.process_mut(8);
+    });
+    assert_eq!(record_exit(&record_exit_req(8, 0)), 0);
+    // No parent (pid 0) is ever materialised or signalled.
+    let phantom = crate::kernel::with_kernel(|k| k.has_process(0));
+    assert!(!phantom, "pid 0 must never be created as a signal target");
+}
+
+// --- Slice B1.4: POSIX getpgrp()/setpgrp() ---
+// Guest libc maps getpgrp() -> host_getpgid(0) and
+// setpgrp() -> host_setpgid(0,0); host_getpgid(0) (yurt_process.c).
+// There is no distinct getpgrp/setpgrp import, so B1.4 is a contract
+// lock over the target==0 path of getpgid/setpgid: a regression there
+// would silently break getpgrp()/setpgrp() for every guest.
+
+#[test]
+fn getpgrp_returns_callers_group_defaulting_to_pid() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let _ = k.process_mut(1234);
+    });
+    // getpgrp() == getpgid(0): a fresh process leads its own group.
+    let req_self = 0u32.to_le_bytes().to_vec();
+    assert_eq!(
+        getpgid(1234, &req_self),
+        1234,
+        "getpgrp() must return the caller's pgid (defaults to its pid)"
+    );
+}
+
+#[test]
+fn setpgrp_makes_caller_a_group_leader_and_getpgrp_is_stable() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let _ = k.process_mut(1234);
+    });
+    // setpgrp() == setpgid(0, 0): target=caller, new_pgid=caller pid.
+    let mut setpgrp_req = 0u32.to_le_bytes().to_vec();
+    setpgrp_req.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(setpgid(1234, &setpgrp_req), 0);
+
+    // Subsequent getpgrp() reflects it and is stable.
+    let req_self = 0u32.to_le_bytes().to_vec();
+    assert_eq!(getpgid(1234, &req_self), 1234);
+    assert_eq!(
+        getpgid(1234, &req_self),
+        1234,
+        "getpgrp() must be stable after setpgrp()"
+    );
+}
+
+// --- Slice B1.3: POSIX waitid(idtype, id, infop, options) ---
+
+const WAITID_P_PID: u32 = 1;
+const WAITID_P_PGID: u32 = 2;
+const WAITID_WNOHANG: u32 = 1;
+const WAITID_WEXITED: u32 = 4;
+const WAITID_WNOWAIT: u32 = 0x0100_0000;
+
+fn waitid_req(idtype: u32, id: u32, options: u32) -> Vec<u8> {
+    let mut req = idtype.to_le_bytes().to_vec();
+    req.extend_from_slice(&id.to_le_bytes());
+    req.extend_from_slice(&options.to_le_bytes());
+    req
+}
+
+fn link_child(parent: u32, child: u32) {
+    let mut reg = parent.to_le_bytes().to_vec();
+    reg.extend_from_slice(&child.to_le_bytes());
+    assert_eq!(register_child(&reg), 0);
+}
+
+fn decode_siginfo(buf: &[u8]) -> (i32, i32, u32, u32, i32) {
+    (
+        i32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        i32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        i32::from_le_bytes(buf[16..20].try_into().unwrap()),
+    )
+}
+
+#[test]
+fn waitid_p_pid_reports_terminated_child_siginfo_then_reaps() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 7);
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(7).credentials.uid = 4321;
+    });
+    assert_eq!(record_exit(&record_exit_req(7, 23)), 0);
+
+    let mut buf = [0u8; 20];
+    let rc = dispatch(
+        METHOD_SYS_WAITID,
+        1,
+        &waitid_req(WAITID_P_PID, 7, WAITID_WEXITED),
+        &mut buf,
+    );
+    assert_eq!(rc, 20);
+    let (signo, code, pid, uid, status) = decode_siginfo(&buf);
+    assert_eq!(signo, SIGCHLD as i32);
+    assert_eq!(code, 1, "CLD_EXITED");
+    assert_eq!(pid, 7);
+    assert_eq!(uid, 4321, "si_uid must be the child's real uid");
+    assert_eq!(status, 23);
+
+    // Reaped: no longer a waitable child.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 7, WAITID_WEXITED),
+            &mut buf,
+        ),
+        -(abi::ECHILD as i64)
+    );
+}
+
+#[test]
+fn waitid_wnowait_leaves_child_reapable() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 8);
+    assert_eq!(record_exit(&record_exit_req(8, 5)), 0);
+    let mut buf = [0u8; 20];
+
+    for _ in 0..2 {
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_WAITID,
+                1,
+                &waitid_req(WAITID_P_PID, 8, WAITID_WEXITED | WAITID_WNOWAIT),
+                &mut buf,
+            ),
+            20,
+            "WNOWAIT must not consume the child"
+        );
+    }
+    // A normal waitid then reaps it.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 8, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 8, WAITID_WEXITED),
+            &mut buf,
+        ),
+        -(abi::ECHILD as i64)
+    );
+}
+
+#[test]
+fn waitid_eagain_when_no_matching_child_has_exited() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 9);
+    let mut buf = [0u8; 20];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 9, WAITID_WEXITED),
+            &mut buf,
+        ),
+        -(abi::EAGAIN as i64)
+    );
+}
+
+#[test]
+fn waitid_wnohang_no_terminated_child_returns_zeroed_siginfo() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 9);
+    let mut buf = [0xFFu8; 20];
+    // POSIX: WNOHANG + no child in a waitable state → success (20)
+    // with a zeroed siginfo (si_signo == 0), NOT -EAGAIN.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 9, WAITID_WEXITED | WAITID_WNOHANG),
+            &mut buf,
+        ),
+        20
+    );
+    assert_eq!(buf, [0u8; 20], "WNOHANG no-child must zero the siginfo");
+    // WNOHANG must not have reaped/disturbed the child: it can still
+    // exit and be waited normally.
+    assert_eq!(record_exit(&record_exit_req(9, 3)), 0);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 9, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
+    );
+}
+
+#[test]
+fn waitid_input_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 12);
+    assert_eq!(record_exit(&record_exit_req(12, 0)), 0);
+    let mut buf = [0u8; 20];
+
+    // Unknown idtype (>P_PGID).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(3, 12, WAITID_WEXITED),
+            &mut buf
+        ),
+        -(abi::EINVAL as i64)
+    );
+    // No wait-type bit (missing WEXITED).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 12, 0),
+            &mut buf
+        ),
+        -(abi::EINVAL as i64)
+    );
+    // Response buffer too small.
+    let mut tiny = [0u8; 8];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 12, WAITID_WEXITED),
+            &mut tiny,
+        ),
+        -(abi::EINVAL as i64)
+    );
+    // Caller with no children at all.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            999,
+            &waitid_req(WAITID_P_PID, 12, WAITID_WEXITED),
+            &mut buf,
+        ),
+        -(abi::ECHILD as i64)
+    );
+}
+
+#[test]
+fn waitid_rejects_unsupported_option_bits_without_reaping() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // PR #54 review P2. Child 14 has exited and is waitable.
+    link_child(1, 14);
+    assert_eq!(record_exit(&record_exit_req(14, 5)), 0);
+    let mut buf = [0u8; 20];
+    // WEXITED | WSTOPPED(2): WSTOPPED is a real POSIX option we don't
+    // implement; the contract promises -EINVAL for bad options. It must
+    // be rejected BEFORE mutating `children` (no reap).
+    const WSTOPPED: u32 = 2;
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 14, WAITID_WEXITED | WSTOPPED),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64)
+    );
+    // Stale-adapter-garbage high bit is likewise rejected.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 14, WAITID_WEXITED | 0x8000_0000),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64)
+    );
+    // The child was NOT reaped by the rejected calls — a valid waitid
+    // still finds and reaps it.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 14, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
+    );
+}
+
+#[test]
+fn waitid_p_pgid_matches_childs_group() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 10);
+    link_child(1, 11);
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(11).pgid = 555;
+    });
+    assert_eq!(record_exit(&record_exit_req(11, 9)), 0);
+
+    let mut buf = [0u8; 20];
+    let rc = dispatch(
+        METHOD_SYS_WAITID,
+        1,
+        &waitid_req(WAITID_P_PGID, 555, WAITID_WEXITED),
+        &mut buf,
+    );
+    assert_eq!(rc, 20);
+    let (_, _, pid, _, status) = decode_siginfo(&buf);
+    assert_eq!(pid, 11);
+    assert_eq!(status, 9);
+}
+
+/// Regression for the PR #54 review bug: waitid(P_PGID, 0) must mean
+/// "the caller's own process group", not the literal pgid 0.
+#[test]
+fn waitid_p_pgid_zero_resolves_to_callers_group() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Parent 1 leads its own group (pgid defaults to its pid = 1).
+    link_child(1, 12);
+    // Child 12 is in the caller's process group.
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(12).pgid = 1;
+    });
+    assert_eq!(record_exit(&record_exit_req(12, 4)), 0);
+
+    let mut buf = [0u8; 20];
+    let rc = dispatch(
+        METHOD_SYS_WAITID,
+        1,
+        &waitid_req(WAITID_P_PGID, 0, WAITID_WEXITED),
+        &mut buf,
+    );
+    assert_eq!(rc, 20, "P_PGID id=0 must match the caller's pgrp child");
+    let (_, _, pid, _, status) = decode_siginfo(&buf);
+    assert_eq!(pid, 12);
+    assert_eq!(status, 4);
+}
+
+#[test]
+fn waitid_p_pgid_zero_matches_default_inherited_child_group() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // PR #54 review P2 regression. Parent 1 has the lazy-zero default
+    // process group; child 13 is registered and inherits pgid == 0 —
+    // NOT materialized via setpgid (unlike the test above, which sets
+    // pgid=1 explicitly). POSIX: an inherited default-0 child is still
+    // in the parent's (the caller's) group, so waitid(P_PGID, id=0)
+    // MUST find it instead of returning -ECHILD.
+    link_child(1, 13);
+    assert_eq!(
+        crate::kernel::with_kernel(|k| k.process_mut(13).pgid),
+        0,
+        "precondition: child pgid is the inherited default 0"
+    );
+    assert_eq!(record_exit(&record_exit_req(13, 9)), 0);
+    let mut buf = [0u8; 20];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PGID, 0, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20,
+        "default-inherited child must match the caller's pgrp"
+    );
+    let (_, _, pid, _, status) = decode_siginfo(&buf);
+    assert_eq!(pid, 13);
+    assert_eq!(status, 9);
+}
+
+// --- Slice B1.7: POSIX pthread_cancel / pthread_testcancel (kernel) ---
+
+fn spawn_worker(pid: u32) -> u32 {
+    crate::kernel::with_kernel(|k| {
+        k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+        k.spawn_thread(pid, Some(77)).expect("thread spawn")
+    })
+}
+
+#[test]
+fn thread_cancel_marks_target_and_testcancel_observes_it() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let tid = spawn_worker(9);
+
+    let main_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+    assert_eq!(
+        dispatch_with_context(
+            METHOD_SYS_THREAD_CANCEL,
+            main_ctx,
+            &tid.to_le_bytes(),
+            &mut [],
+        ),
+        0
+    );
+    assert!(crate::kernel::with_kernel(|k| k
+        .process(9)
+        .threads
+        .get(&tid)
+        .expect("worker")
+        .cancel_requested));
+
+    let worker_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: tid,
+    };
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_TESTCANCEL, worker_ctx, &[], &mut []),
+        1
+    );
+}
+
+#[test]
+fn testcancel_is_zero_without_a_pending_cancel() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let tid = spawn_worker(9);
+    let worker_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: tid,
+    };
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_TESTCANCEL, worker_ctx, &[], &mut []),
+        0
+    );
+}
+
+#[test]
+fn thread_cancel_unknown_or_exited_thread_is_esrch() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let tid = spawn_worker(9);
+    let main_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+
+    assert_eq!(
+        dispatch_with_context(
+            METHOD_SYS_THREAD_CANCEL,
+            main_ctx,
+            &999u32.to_le_bytes(),
+            &mut [],
+        ),
+        -(abi::ESRCH as i64)
+    );
+
+    crate::kernel::with_kernel(|k| {
+        k.exit_thread_authenticated(9, tid, 0).expect("thread exit");
+    });
+    assert_eq!(
+        dispatch_with_context(
+            METHOD_SYS_THREAD_CANCEL,
+            main_ctx,
+            &tid.to_le_bytes(),
+            &mut [],
+        ),
+        -(abi::ESRCH as i64)
+    );
+    let worker_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: tid,
+    };
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_TESTCANCEL, worker_ctx, &[], &mut []),
+        0
+    );
+}
+
+#[test]
+fn thread_cancel_input_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let _ = spawn_worker(9);
+    let main_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_CANCEL, main_ctx, &[], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_TESTCANCEL, main_ctx, &[1, 2, 3], &mut [],),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn pthread_cancel_self_from_main_thread_normalizes_guest_id() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // spawn_worker(9) also creates process 9 with a MAIN_THREAD_TID
+    // record. PR #54 review P2: pthread_self() on main returns the
+    // guest main id (0); pthread_cancel(pthread_self()) must normalize
+    // 0 → MAIN_THREAD_TID and succeed, not -ESRCH.
+    spawn_worker(9);
+    let main_ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+    let self_id = dispatch_with_context(METHOD_SYS_THREAD_SELF, main_ctx, &[], &mut []);
+    assert_eq!(self_id, crate::kernel::GUEST_MAIN_PTHREAD_ID as i64);
+    assert_eq!(
+        dispatch_with_context(
+            METHOD_SYS_THREAD_CANCEL,
+            main_ctx,
+            &(self_id as u32).to_le_bytes(),
+            &mut [],
+        ),
+        0,
+        "self-cancel of the main thread must succeed"
+    );
+    assert!(crate::kernel::with_kernel(|k| k
+        .process(9)
+        .threads
+        .get(&crate::kernel::MAIN_THREAD_TID)
+        .expect("main thread record")
+        .cancel_requested));
+}
+
+// --- Slice B1.8-a: POSIX sigqueue (additive RT-signal queue) ---
+
+fn sigqueue_req(target: u32, sig: u32, value: i32) -> Vec<u8> {
+    let mut req = target.to_le_bytes().to_vec();
+    req.extend_from_slice(&sig.to_le_bytes());
+    req.extend_from_slice(&value.to_le_bytes());
+    req
+}
+
+fn materialize(pid: u32) {
+    crate::kernel::with_kernel(|k| {
+        let _ = k.process_mut(pid);
+    });
+}
+
+#[test]
+fn sigqueue_enqueues_rt_signal_with_payload_and_sender() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    // caller (sender) = 1, target = 7, RT signal 40, value 99
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 99), &mut []),
+        0
+    );
+
+    let (queue, bitmask) = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(7);
+        (p.pending_rt.clone(), p.pending_signals)
+    });
+    assert_eq!(queue.len(), 1);
+    assert_eq!(
+        queue[0],
+        crate::kernel::RtSignal {
+            signo: 40,
+            value: 99,
+            sender_pid: 1
+        }
+    );
+    // sigqueue does NOT mutate the kill/SIGCHLD bitmask (separate
+    // producer) — but sigpending() reports the union, so signo 40
+    // shows as pending there.
+    assert_eq!(
+        bitmask & (1u64 << (40 - 1)),
+        0,
+        "RT must not touch the bitmask"
+    );
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(
+        u64::from_le_bytes(buf) & (1u64 << (40 - 1)),
+        0,
+        "sigpending unions the RT queue"
+    );
+}
+
+#[test]
+fn sigqueue_queues_with_multiplicity_unlike_the_bitmask() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 41, 1), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 2, &sigqueue_req(7, 41, 2), &mut []),
+        0
+    );
+    let queue = crate::kernel::with_kernel(|k| k.process_mut(7).pending_rt.clone());
+    assert_eq!(queue.len(), 2, "RT signals queue with multiplicity");
+    assert_eq!(queue[0].value, 1);
+    assert_eq!(queue[0].sender_pid, 1);
+    assert_eq!(queue[1].value, 2);
+    assert_eq!(queue[1].sender_pid, 2);
+}
+
+#[test]
+fn sigqueue_sig_zero_is_probe_without_enqueue() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 0, 0), &mut []),
+        0
+    );
+    assert!(crate::kernel::with_kernel(|k| k
+        .process_mut(7)
+        .pending_rt
+        .is_empty()));
+    // Probe on a missing process is ESRCH.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(424242, 0, 0), &mut []),
+        -(abi::ESRCH as i64)
+    );
+}
+
+#[test]
+fn sigqueue_input_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    // sig out of range.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 64, 0), &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // short request (<12 bytes).
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &[0u8; 8], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // unknown target, real signal.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGQUEUE,
+            1,
+            &sigqueue_req(424242, 40, 0),
+            &mut []
+        ),
+        -(abi::ESRCH as i64)
+    );
+}
+
+#[test]
+fn sigqueue_caps_the_rt_queue_returning_eagain() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    // Fill the per-process RT queue to its sanity cap; every push succeeds.
+    for _ in 0..crate::kernel::KERNEL_RT_SIGNAL_QUEUE_CAP {
+        assert_eq!(
+            dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 0), &mut []),
+            0
+        );
+    }
+    // The next enqueue is refused with -EAGAIN (Linux RLIMIT_SIGPENDING
+    // semantics) instead of growing kernel memory without bound while
+    // the consumer (sigwaitinfo/delivery) is gate-deferred.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 0), &mut []),
+        -(abi::EAGAIN as i64)
+    );
+}
+
+// --- Slice B1.8-b: POSIX sigwaitinfo (non-blocking RT dequeue) ---
+
+fn sigset_mask(sig: u32) -> Vec<u8> {
+    (1u64 << (sig - 1)).to_le_bytes().to_vec()
+}
+
+fn decode_rt_siginfo(buf: &[u8]) -> (i32, i32, u32, i32) {
+    (
+        i32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        i32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        i32::from_le_bytes(buf[12..16].try_into().unwrap()),
+    )
+}
+
+#[test]
+fn sigwaitinfo_dequeues_oldest_matching_and_returns_siginfo() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 99), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 2, &sigqueue_req(7, 40, 100), &mut []),
+        0
+    );
+
+    let mut info = [0u8; 16];
+    let rc = dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(40), &mut info);
+    assert_eq!(rc, 16);
+    let (signo, code, pid, value) = decode_rt_siginfo(&info);
+    assert_eq!(signo, 40);
+    assert_eq!(code, -1, "SI_QUEUE");
+    assert_eq!(pid, 1, "oldest queued → sender 1");
+    assert_eq!(value, 99);
+
+    // Second still queued; sigpending still reports signo 40 (union
+    // derives it from the remaining RT entry — bitmask untouched).
+    let (len, bit) = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(7);
+        (p.pending_rt.len(), p.pending_signals & (1u64 << (40 - 1)))
+    });
+    assert_eq!(len, 1);
+    assert_eq!(bit, 0, "RT never set the kill bitmask");
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(u64::from_le_bytes(buf) & (1u64 << (40 - 1)), 0);
+}
+
+#[test]
+fn sigwaitinfo_drain_makes_sigpending_drop_the_signo() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 3, &sigqueue_req(7, 41, 7), &mut []),
+        0
+    );
+    let mut info = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(41), &mut info),
+        16
+    );
+    // RT queue empty and no kill bit → sigpending no longer reports 41.
+    assert!(crate::kernel::with_kernel(|k| k
+        .process_mut(7)
+        .pending_rt
+        .is_empty()));
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_eq!(
+        u64::from_le_bytes(buf) & (1u64 << (41 - 1)),
+        0,
+        "no producer left for signo 41"
+    );
+}
+
+/// Regression for the PR #54 review bug: kill() and sigqueue() are
+/// independent producers; draining the RT entry must NOT clear a bit
+/// kill() set for the same signo.
+#[test]
+fn sigpending_preserves_kill_bit_after_rt_drain() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    // kill() sets the bitmask bit for signo 40 (no RT entry).
+    assert_eq!(kill_pid(7, 40), 0);
+    // sigqueue() adds an RT entry for the same signo.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 5), &mut []),
+        0
+    );
+    // Drain the single RT entry.
+    let mut info = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(40), &mut info),
+        16
+    );
+    // signo 40 is STILL pending — the kill() bit was not clobbered.
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(
+        u64::from_le_bytes(buf) & (1u64 << (40 - 1)),
+        0,
+        "kill()-set pending must survive RT drain"
+    );
+}
+
+#[test]
+fn sigwaitinfo_eagain_when_no_selected_signal_pending() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    let mut info = [0u8; 16];
+    // Empty queue.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(40), &mut info),
+        -(abi::EAGAIN as i64)
+    );
+    // Queued sig 40 but the set selects only sig 5.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 1), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(5), &mut info),
+        -(abi::EAGAIN as i64)
+    );
+}
+
+#[test]
+fn sigwaitinfo_input_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    let mut info = [0u8; 16];
+    // Short request (<8 bytes).
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &[0u8; 4], &mut info),
+        -(abi::EINVAL as i64)
+    );
+    // Response buffer too small.
+    let mut tiny = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(40), &mut tiny),
+        -(abi::EINVAL as i64)
+    );
+}
+
+// --- Slice B1.9: POSIX sigpending ---
+
+#[test]
+fn sigpending_reports_the_pending_set() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    // sigqueue sets the compat bitmask bit for sig 40 on proc 7.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 0), &mut []),
+        0
+    );
+
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    let mask = u64::from_le_bytes(buf);
+    assert_ne!(mask & (1u64 << (40 - 1)), 0, "sig 40 must show pending");
+    assert_eq!(mask & (1u64 << (5 - 1)), 0, "unrelated sig must not");
+}
+
+#[test]
+fn fork_child_does_not_inherit_parent_pending_rt() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // PR #54 review P2. Parent 7 has a queued RT signal before fork.
+    materialize(7);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 42, 9), &mut []),
+        0
+    );
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(
+        u64::from_le_bytes(buf) & (1u64 << (42 - 1)),
+        0,
+        "sanity: parent has the queued RT signal"
+    );
+    // Fork: POSIX says the child starts with an EMPTY pending set
+    // (standard AND real-time).
+    let child = crate::kernel::with_kernel(|k| k.prepare_fork(7)).expect("prepare_fork");
+    crate::kernel::with_kernel(|k| k.commit_fork(7, child)).expect("commit_fork");
+    // sigpending() in the child must NOT show the parent's RT signal.
+    let mut cbuf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, child, &[], &mut cbuf), 8);
+    assert_eq!(
+        u64::from_le_bytes(cbuf) & (1u64 << (42 - 1)),
+        0,
+        "forked child must not inherit the parent's pending_rt"
+    );
+    // …and sigwaitinfo() in the child finds nothing to dequeue.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGWAITINFO,
+            child,
+            &sigset_mask(42),
+            &mut [0u8; 16]
+        ),
+        -(abi::EAGAIN as i64)
+    );
+    // The parent still has its signal (fork didn't disturb it).
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(u64::from_le_bytes(buf) & (1u64 << (42 - 1)), 0);
+}
+
+#[test]
+fn sigpending_is_empty_when_nothing_queued() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_eq!(u64::from_le_bytes(buf), 0);
+}
+
+#[test]
+fn sigpending_buffer_too_small_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    let mut tiny = [0u8; 4];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut tiny),
         -(abi::EINVAL as i64)
     );
 }

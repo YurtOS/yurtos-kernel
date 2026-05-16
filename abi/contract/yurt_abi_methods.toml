@@ -85,6 +85,11 @@ id = 0x1_002C
 kind = "syscall"
 doc = "POSIX waitpid-style wait. Request bytes: u32 child_pid LE (0 = wait for any child) + u32 flags LE (bit 0 = WNOHANG). Response: 8 bytes — u32 exited_pid LE + i32 exit_status LE. Returns 8 on success, -ECHILD if no children to wait on, -EAGAIN if WNOHANG and no child has exited yet."
 
+[method.sys_waitid]
+id = 0x1_0060
+kind = "syscall"
+doc = "POSIX waitid(idtype, id, infop, options). Request bytes: u32 idtype LE (0=P_ALL, 1=P_PID, 2=P_PGID) + u32 id LE + u32 options LE (bit0 WNOHANG, bit2 WEXITED, 0x01000000 WNOWAIT). Response: 20 bytes — i32 si_signo + i32 si_code + u32 si_pid + u32 si_uid + i32 si_status, all LE. First pass reports terminated children only (si_signo=SIGCHLD, si_code=CLD_EXITED=1); WSTOPPED/WCONTINUED unsupported. WNOWAIT leaves the child reapable. Returns 20 on success, -ECHILD if no matching children. When a matching child exists but none is in a waitable state: with WNOHANG, returns 20 with a fully-zeroed siginfo (si_signo=0, POSIX no-child success); without WNOHANG, -EAGAIN (true blocking is gate-deferred, matching sys_wait). -EINVAL on bad idtype/options/buffer."
+
 # Syscall methods (0x1_0000+ range).
 #
 # These are the real user-process-facing syscalls — `sys_*` names match
@@ -532,6 +537,31 @@ doc = "Record exit for the authenticated caller thread. Request bytes: u32 retva
 id = 0x1_0052
 kind = "syscall"
 doc = "Yield the authenticated caller thread. No request bytes. Returns 0 or negated errno."
+
+[method.sys_thread_cancel]
+id = 0x1_0061
+kind = "syscall"
+doc = "POSIX pthread_cancel(target). Request: u32 target tid LE. Marks the target for deferred cancellation in the caller's process; the guest unwinds at the next cancellation point. Returns 0, -ESRCH for unknown/already-exited thread, -EINVAL on bad request. The kernel owns only the pending-cancel state; it does not force-terminate the thread."
+
+[method.sys_thread_testcancel]
+id = 0x1_0062
+kind = "syscall"
+doc = "POSIX pthread_testcancel cancellation point. No request bytes. Returns 1 if the authenticated caller thread has a pending cancel (and has not exited), else 0. The guest acts on a 1 by unwinding/exiting."
+
+[method.sys_sigqueue]
+id = 0x1_0063
+kind = "syscall"
+doc = "POSIX sigqueue(pid, sig, value). Request: u32 target pid LE + u32 sig LE + i32 value LE. Separated-producer model: enqueues a real-time signal (queued with multiplicity, carries value + sender pid) onto the target's RT queue ONLY — it does NOT set the pending bitmask (`pending_signals`, owned by kill/SIGCHLD), so a bit set by kill() for the same signo is never clobbered when the RT queue later drains. sigpending() reports the union of both. sig==0 is the existence probe (no enqueue). Returns 0, -ESRCH for unknown pid, -EINVAL for sig>63 or short request. Delivery/sigwaitinfo is gate-deferred (B1.8-b)."
+
+[method.sys_sigwaitinfo]
+id = 0x1_0064
+kind = "syscall"
+doc = "POSIX sigwaitinfo non-blocking dequeue. Request: u64 set mask LE (bit sig-1 selects sig). If the authenticated caller has a queued RT signal whose bit is in the set, the oldest such signal (FIFO across all selected signos) is removed from the RT queue and its siginfo is written: 16 bytes — i32 si_signo + i32 si_code (SI_QUEUE=-1) + u32 si_pid (sender) + i32 si_value, all LE. It operates ONLY on the RT queue and does NOT touch the kill/SIGCHLD pending bitmask (separated-producer model). Returns 16 on success, -EAGAIN if no selected signal is pending (true blocking is gate-deferred), -ESRCH if the caller has no process record, -EINVAL on short request/buffer."
+
+[method.sys_sigpending]
+id = 0x1_0065
+kind = "syscall"
+doc = "POSIX sigpending. No request bytes. Writes 8 bytes — the authenticated caller's pending-signal set as a u64 LE bitmask (bit sig-1). Read-time UNION of two independent producers: the kill/SIGCHLD `pending_signals` bitmask, OR-ed with a derived bit for every signo currently in the RT queue (`pending_rt`, populated by sigqueue). Neither producer mutates the other; the union is computed per call. Returns 8, -ESRCH if the caller has no process record, -EINVAL if the response buffer is shorter than 8 bytes."
 
 [method.sys_fchdir]
 id = 0x1_005F
