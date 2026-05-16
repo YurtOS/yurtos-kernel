@@ -26,6 +26,7 @@ import {
   expectSameRunResult,
   FORK_CANARY_URL,
   HAS_JSPI,
+  hasKernelWasm,
   KERNEL_WASM_URL,
   PTHREAD_CANARY_URL,
   readFixture,
@@ -61,7 +62,7 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
   });
 
   it("routes a probe wasm's host_getuid through the KernelHostInterface", async () => {
-    if (!HAS_JSPI) return;
+    if (!HAS_JSPI || !(await hasKernelWasm())) return;
     const kernelBytes = await Deno.readFile(KERNEL_WASM_URL);
     const mk = await KernelHostInterface.load(kernelBytes, defaultHostState());
     const overrideNames = HOST_BINDINGS.map((b) => b.name);
@@ -125,7 +126,7 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
     ]
   ) {
     it(`matches the TS kernel for ${name}`, async () => {
-      if (!HAS_JSPI) return;
+      if (!HAS_JSPI || !(await hasKernelWasm())) return;
       const result = await runWithBothKernels(argv, options);
       if (!result) return;
       expectSameRunResult(result);
@@ -133,7 +134,7 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
   }
 
   it("runs the std fs fixture through the wasm kernel", async () => {
-    if (!HAS_JSPI) return;
+    if (!HAS_JSPI || !(await hasKernelWasm())) return;
     const fixtureName = "std-fs-canary.wasm";
     const kernelBytes = await Deno.readFile(KERNEL_WASM_URL);
     const fixture = await readFixture(fixtureName);
@@ -153,7 +154,7 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
   });
 
   it("runs the pthread canary through Rust-owned Worker/SAB threads", async () => {
-    if (!HAS_JSPI) return;
+    if (!HAS_JSPI || !(await hasKernelWasm())) return;
     const fixtureName = "pthread-canary.wasm";
     const kernelBytes = await Deno.readFile(KERNEL_WASM_URL);
     const fixture = await Deno.readFile(PTHREAD_CANARY_URL);
@@ -176,7 +177,7 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
   });
 
   it("runs fork continuations through Rust-owned process lifecycle", async () => {
-    if (!HAS_JSPI) return;
+    if (!HAS_JSPI || !(await hasKernelWasm())) return;
     const fixtureName = "fork-canary.wasm";
     const kernelBytes = await Deno.readFile(KERNEL_WASM_URL);
     const fixture = await Deno.readFile(FORK_CANARY_URL);
