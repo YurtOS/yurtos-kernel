@@ -6703,3 +6703,125 @@ fn user_processes_cannot_call_kernel_only_methods() {
         );
     }
 }
+
+// --- Slice B2.1: POSIX pread/pwrite (positional, no cursor move) ---
+
+fn write_req(fd: u32, data: &[u8]) -> Vec<u8> {
+    let mut req = fd.to_le_bytes().to_vec();
+    req.extend_from_slice(data);
+    req
+}
+
+fn p_req(fd: u32, offset: u64, data: &[u8]) -> Vec<u8> {
+    let mut req = fd.to_le_bytes().to_vec();
+    req.extend_from_slice(&offset.to_le_bytes());
+    req.extend_from_slice(data);
+    req
+}
+
+fn open_rw(path: &[u8]) -> u32 {
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, path),
+        &mut [],
+    );
+    assert!(fd >= 3, "open returned {fd}");
+    fd as u32
+}
+
+#[test]
+fn pread_reads_at_offset_without_consuming_the_cursor() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/pread.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_WRITE, 1, &write_req(fd, b"0123456789"), &mut []),
+        10
+    );
+
+    let mut buf = [0u8; 8];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd, 3, &[]), &mut buf);
+    assert_eq!(n, 7, "reads from offset 3 to EOF");
+    assert_eq!(&buf[..7], b"3456789");
+
+    // Idempotent: a second pread at the same offset returns the same
+    // bytes — proving the OFD cursor was not advanced.
+    let mut buf2 = [0u8; 8];
+    let n2 = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd, 3, &[]), &mut buf2);
+    assert_eq!(n2, 7);
+    assert_eq!(&buf2[..7], b"3456789");
+}
+
+#[test]
+fn pwrite_writes_at_offset_without_moving_the_cursor() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/pwrite.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 0, b"hello"), &mut []),
+        5
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 5, b"world"), &mut []),
+        5
+    );
+
+    // Read it back from the start; pwrite never touched the cursor.
+    let mut buf = [0u8; 16];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd, 0, &[]), &mut buf);
+    assert_eq!(&buf[..n as usize], b"helloworld");
+}
+
+#[test]
+fn pread_pwrite_espipe_on_non_seekable_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // stdin (fd 0) / stdout (fd 1) are streams → ESPIPE.
+    let mut buf = [0u8; 4];
+    assert_eq!(
+        dispatch(METHOD_SYS_PREAD, 1, &p_req(0, 0, &[]), &mut buf),
+        -(abi::ESPIPE as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(1, 0, b"x"), &mut []),
+        -(abi::ESPIPE as i64)
+    );
+}
+
+#[test]
+fn pread_pwrite_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut buf = [0u8; 4];
+    // Unknown fd.
+    assert_eq!(
+        dispatch(METHOD_SYS_PREAD, 1, &p_req(99, 0, &[]), &mut buf),
+        -(abi::EBADF as i64)
+    );
+    // Short request (< 12 bytes header).
+    assert_eq!(
+        dispatch(METHOD_SYS_PREAD, 1, &[0u8; 8], &mut buf),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &[0u8; 8], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // Directory fd: pread → EISDIR, pwrite → EBADF.
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    let dfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(O_DIRECTORY, b"/d"), &mut []);
+    assert!(dfd >= 3);
+    assert_eq!(
+        dispatch(METHOD_SYS_PREAD, 1, &p_req(dfd as u32, 0, &[]), &mut buf),
+        -(abi::EISDIR as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(dfd as u32, 0, b"x"), &mut []),
+        -(abi::EBADF as i64)
+    );
+    // Read-only file fd: pwrite → EBADF (not writable).
+    let _ = open_rw(b"/ro.txt");
+    let rofd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/ro.txt"), &mut []);
+    assert!(rofd >= 3);
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(rofd as u32, 0, b"x"), &mut []),
+        -(abi::EBADF as i64)
+    );
+}

@@ -158,6 +158,8 @@ pub fn dispatch_with_context(
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
+        METHOD_SYS_PREAD => pread_fd(caller_pid, request, response),
+        METHOD_SYS_PWRITE => pwrite_fd(caller_pid, request),
         METHOD_SYS_POLL => poll_fds(caller_pid, request, response),
         METHOD_SYS_ISATTY => isatty(caller_pid, request),
         METHOD_SYS_TCGETPGRP => tcgetpgrp(caller_pid, request),
@@ -565,6 +567,69 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
             }
             crate::kernel::FdEntry::Directory { .. } => -(abi::EBADF as i64),
             crate::kernel::FdEntry::Socket { id } => socket_send_id(k, id, payload),
+        }
+    })
+}
+
+/// `pread(fd, offset)` — positional read on a regular file. Unlike
+/// `read`, it never touches the OFD cursor. Request: u32 fd LE +
+/// u64 offset LE. Non-seekable fds → -ESPIPE, a directory → -EISDIR,
+/// unknown fd → -EBADF. (B2.1)
+fn pread_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let offset = u64::from_le_bytes(request[4..12].try_into().expect("8 bytes"));
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match entry {
+            crate::kernel::FdEntry::File { ofd_id } => {
+                let (mount_id, inode) = match k.ofd(ofd_id) {
+                    Some(o) => (o.mount_id, o.inode),
+                    None => return -(abi::EBADF as i64),
+                };
+                // Positional: read at the caller's offset; cursor unchanged.
+                k.vfs.read(mount_id, inode, offset, response)
+            }
+            crate::kernel::FdEntry::Directory { .. } => -(abi::EISDIR as i64),
+            _ => -(abi::ESPIPE as i64),
+        }
+    })
+}
+
+/// `pwrite(fd, offset, bytes…)` — positional write on a regular file;
+/// never advances the OFD cursor. Request: u32 fd LE + u64 offset LE +
+/// payload. Non-seekable → -ESPIPE, directory/unknown/read-only →
+/// -EBADF. (B2.1)
+fn pwrite_fd(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let offset = u64::from_le_bytes(request[4..12].try_into().expect("8 bytes"));
+    let payload = &request[12..];
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match entry {
+            crate::kernel::FdEntry::File { ofd_id } => {
+                let (mount_id, inode, writable) = match k.ofd(ofd_id) {
+                    Some(o) => (o.mount_id, o.inode, o.writable),
+                    None => return -(abi::EBADF as i64),
+                };
+                if !writable {
+                    return -(abi::EBADF as i64);
+                }
+                k.vfs.write(mount_id, inode, offset, payload)
+            }
+            crate::kernel::FdEntry::Directory { .. } => -(abi::EBADF as i64),
+            _ => -(abi::ESPIPE as i64),
         }
     })
 }

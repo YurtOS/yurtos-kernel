@@ -538,6 +538,26 @@ id = 0x1_005F
 kind = "syscall"
 doc = "Change the caller's working directory to an open directory fd. Request bytes: u32 fd LE. Returns 0 or negated POSIX errno."
 
+# Method-id partition by parity slice (each sub-goal is its own PR off
+# main; disjoint id blocks keep them collision-free regardless of merge
+# order, honoring the never-reuse/never-renumber rule above):
+#   B1 process model  → 0x1_0060–0x1_006F  (PR #54)
+#   B2 fd/vfs          → 0x1_0070–0x1_007F  (PR #55)
+#   B3 sockets         → 0x1_0080–0x1_008F
+#   B4 persistence/ext → 0x1_0090–0x1_009F
+# Future slices take the next free block. The umbrella matrix (#51)
+# mirrors this table as the canonical record.
+
+[method.sys_pread]
+id = 0x1_0070
+kind = "syscall"
+doc = "POSIX pread(fd, buf, count, offset). Request: u32 fd LE + u64 offset LE; response buffer receives the bytes. Reads at the given file offset WITHOUT advancing the fd's OFD cursor. Regular files only: -ESPIPE for pipes/sockets/streams, -EISDIR for a directory, -EBADF for an unknown fd, -EINVAL for a short request. Returns bytes read (0 at EOF)."
+
+[method.sys_pwrite]
+id = 0x1_0071
+kind = "syscall"
+doc = "POSIX pwrite(fd, buf, count, offset). Request: u32 fd LE + u64 offset LE + payload bytes. Writes at the given file offset WITHOUT advancing the OFD cursor. Regular writable files only: -ESPIPE for pipes/sockets/streams, -EBADF for a directory / unknown fd / read-only fd, -EINVAL for a short request. Returns bytes written."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"
