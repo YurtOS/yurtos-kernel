@@ -37,6 +37,7 @@ import {
   type SpawnRequest,
 } from "./process/kernel.js";
 import {
+  type ForkLifecycleHooks,
   type LoaderContext,
   loadProcess,
   type WasmThreadHostRegistry,
@@ -161,6 +162,12 @@ export interface SandboxOptions {
    * workers while the Rust kernel remains authoritative for lifecycle.
    */
   wasmThreadHostRegistry?: WasmThreadHostRegistry;
+  /**
+   * Optional Rust-kernel process lifecycle controls used by continuation
+   * fork. Host adapters still create the child instance, but Rust owns pid
+   * allocation and process visibility.
+   */
+  wasmForkLifecycle?: ForkLifecycleHooks;
   /** Directory (Node) or URL base (browser) containing .wasm files. */
   wasmDir: string;
   /** Platform adapter. Auto-detected if not provided (Node vs browser). */
@@ -245,6 +252,7 @@ interface SandboxParts {
   ) => Record<string, (...args: number[]) => Promise<number>>;
   wasmOverrideNames?: string[];
   wasmThreadHostRegistry?: WasmThreadHostRegistry;
+  wasmForkLifecycle?: ForkLifecycleHooks;
 }
 
 interface PasswdEntry {
@@ -297,6 +305,7 @@ export class Sandbox {
     | undefined;
   private wasmOverrideNames: string[] | undefined;
   private wasmThreadHostRegistry: WasmThreadHostRegistry | undefined;
+  private wasmForkLifecycle: ForkLifecycleHooks | undefined;
   private activeDeadlineMs: number | undefined;
   private envNeedsSync = false;
   /**
@@ -338,6 +347,7 @@ export class Sandbox {
     this.wasmHostImports = parts.wasmHostImports;
     this.wasmOverrideNames = parts.wasmOverrideNames;
     this.wasmThreadHostRegistry = parts.wasmThreadHostRegistry;
+    this.wasmForkLifecycle = parts.wasmForkLifecycle;
     this.envNeedsSync = parts.env.size > 0;
   }
 
@@ -553,6 +563,7 @@ export class Sandbox {
       wasmHostImports: options.wasmHostImports,
       wasmOverrideNames: options.wasmOverrideNames,
       wasmThreadHostRegistry: options.wasmThreadHostRegistry,
+      wasmForkLifecycle: options.wasmForkLifecycle,
     });
 
     const bootProcess = await loadProcess(loaderCtx, {
@@ -822,6 +833,7 @@ export class Sandbox {
       wasmHostImports: options.wasmHostImports,
       wasmOverrideNames: options.wasmOverrideNames,
       wasmThreadHostRegistry: options.wasmThreadHostRegistry,
+      wasmForkLifecycle: options.wasmForkLifecycle,
     });
     sandboxRef = sb;
 
@@ -1190,6 +1202,7 @@ export class Sandbox {
     ) => Record<string, (...args: number[]) => Promise<number>>;
     wasmOverrideNames?: string[];
     wasmThreadHostRegistry?: WasmThreadHostRegistry;
+    wasmForkLifecycle?: ForkLifecycleHooks;
   }): LoaderContext {
     const {
       vfs,
@@ -1212,6 +1225,7 @@ export class Sandbox {
       wasmHostImports,
       wasmOverrideNames,
       wasmThreadHostRegistry,
+      wasmForkLifecycle,
     } = opts;
     const allowedTools = toolAllowlist ? new Set(toolAllowlist) : null;
 
@@ -1380,6 +1394,7 @@ export class Sandbox {
       moduleCache,
       extraAsyncImports: wasmOverrideNames,
       wasmThreadHostRegistry,
+      forkLifecycle: wasmForkLifecycle,
     });
 
     return makeContextWithAllocator((argv) => {
@@ -2110,6 +2125,7 @@ export class Sandbox {
       wasmHostImports: this.wasmHostImports,
       wasmOverrideNames: this.wasmOverrideNames,
       wasmThreadHostRegistry: this.wasmThreadHostRegistry,
+      wasmForkLifecycle: this.wasmForkLifecycle,
     });
     const proc = await loadProcess(loaderCtx, {
       argv,
@@ -2423,6 +2439,7 @@ export class Sandbox {
       wasmHostImports: this.wasmHostImports,
       wasmOverrideNames: this.wasmOverrideNames,
       wasmThreadHostRegistry: this.wasmThreadHostRegistry,
+      wasmForkLifecycle: this.wasmForkLifecycle,
     });
     const childEnv = this.getEnvMap();
     const childBootProcess = await loadProcess(childCtx, {

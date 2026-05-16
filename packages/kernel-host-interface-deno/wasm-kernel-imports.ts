@@ -343,6 +343,66 @@ export interface BuildWasmKernelImportsOptions {
     WasmThreadHostRegistry,
     "threadExitVersion" | "waitForThreadExit"
   >;
+  processEvents?: Pick<
+    WasmProcessHostRegistry,
+    "processExitVersion" | "waitForProcessExit"
+  >;
+}
+
+export interface WasmProcessHostRegistry {
+  processExitVersion(pid: number): number;
+  waitForProcessExit(pid: number, version: number): Promise<void>;
+  prepareFork(parentPid: number): number;
+  commitFork(parentPid: number, childPid: number): number;
+  rollbackFork(parentPid: number, childPid: number): number;
+  recordExit(pid: number, exitStatus: number): number;
+}
+
+export function createWasmProcessHostRegistry(
+  mk: KernelHostInterface,
+): WasmProcessHostRegistry {
+  const exitVersions = new Map<number, number>();
+  const exitWaiters = new Map<number, Array<() => void>>();
+
+  const notifyProcessExit = (pid: number) => {
+    exitVersions.set(pid, (exitVersions.get(pid) ?? 0) + 1);
+    const waiters = exitWaiters.get(pid);
+    if (!waiters) return;
+    exitWaiters.delete(pid);
+    for (const resolve of waiters) resolve();
+  };
+
+  return {
+    processExitVersion(pid) {
+      return exitVersions.get(pid) ?? 0;
+    },
+    waitForProcessExit(pid, version) {
+      if ((exitVersions.get(pid) ?? 0) !== version) {
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        const waiters = exitWaiters.get(pid) ?? [];
+        waiters.push(resolve);
+        exitWaiters.set(pid, waiters);
+      });
+    },
+    prepareFork(parentPid) {
+      return mk.prepareFork(parentPid);
+    },
+    commitFork(parentPid, childPid) {
+      mk.commitFork(parentPid, childPid);
+      return 0;
+    },
+    rollbackFork(parentPid, childPid) {
+      mk.rollbackFork(parentPid, childPid);
+      return 0;
+    },
+    recordExit(pid, exitStatus) {
+      mk.recordExit(pid, exitStatus);
+      notifyProcessExit(pid);
+      return 0;
+    },
+  };
 }
 
 function threadImport(
@@ -661,7 +721,7 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_wait",
     method: METHOD.SYS_WAIT,
     args: [],
-    custom: (mk, memBuf, callerPid) =>
+    custom: (mk, memBuf, callerPid, _callerTid, options) =>
     async (
       pid: number,
       flags: number,
@@ -672,13 +732,27 @@ export const HOST_BINDINGS: HostBinding[] = [
       const reqView = new DataView(req.buffer);
       reqView.setUint32(0, pid >>> 0, true);
       reqView.setUint32(4, flags >>> 0, true);
-      const out = await mk.kernelSyscallAsync(
+      let version = pid > 0
+        ? options?.processEvents?.processExitVersion(pid)
+        : undefined;
+      let out = await mk.kernelSyscallAsync(
         METHOD.SYS_WAIT,
         callerPid,
         req,
         8,
       );
-      const rc = Number(out.rc);
+      let rc = Number(out.rc);
+      while (rc === -EAGAIN && pid > 0 && options?.processEvents) {
+        await options.processEvents.waitForProcessExit(pid, version ?? 0);
+        version = options.processEvents.processExitVersion(pid);
+        out = await mk.kernelSyscallAsync(
+          METHOD.SYS_WAIT,
+          callerPid,
+          req,
+          8,
+        );
+        rc = Number(out.rc);
+      }
       if (rc < 0) return rc;
       if (rc !== 8 || outCap < 16) return -7; // -E2BIG/malformed for this ABI.
       const kernelView = new DataView(

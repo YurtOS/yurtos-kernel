@@ -173,25 +173,25 @@ Expected: pass.
 
 ## Task 4: Wire Deno Continuation Fork Through Rust Ownership
 
-- [ ] **Step 1: Write failing Deno integration coverage**
+- [x] **Step 1: Write failing Deno integration coverage**
 
-Extend the Rust-backed fork canary path in `packages/kernel/src/__tests__/abi_test.ts` so the continuation cases run with kernel.wasm enabled.
+Extend the Rust-backed fork canary path in `packages/kernel/src/__tests__/sandbox-wasm-kernel_test.ts` so the continuation case runs with kernel.wasm enabled and asserts Rust prepare/commit/exit lifecycle hooks were used.
 
-Run: `/Users/sunny/.deno/bin/deno test --allow-read --allow-env --allow-run --allow-ffi --allow-net --no-check packages/kernel/src/__tests__/abi_test.ts`
+Run: `/Users/sunny/.deno/bin/deno test --allow-read --allow-env --allow-run --allow-ffi --allow-net --no-check packages/kernel/src/__tests__/sandbox-wasm-kernel_test.ts`
 
 Expected: fail because TypeScript still owns fork state without Rust prepare/commit/rollback.
 
-- [ ] **Step 2: Call Rust prepare before child snapshot**
+- [x] **Step 2: Call Rust prepare before child snapshot**
 
 In `packages/kernel/src/process/loader.ts`, replace direct `allocPid` for Rust-backed kernel execution with `kernel_prepare_fork(parentPid)`. Keep the existing TypeScript path unchanged for the old kernel.
 
-- [ ] **Step 3: Commit or rollback**
+- [x] **Step 3: Commit or rollback**
 
-After the child continuation is created, call `kernel_commit_fork(parentPid, childPid)`. On any child setup error before the continuation starts, call `kernel_rollback_fork(parentPid, childPid)`.
+Before returning the child pid to the parent, call `kernel_commit_fork(parentPid, childPid)` so `waitpid(child)` cannot race against Rust child visibility. On setup errors before commit, call `kernel_rollback_fork(parentPid, childPid)`; after commit, record the child exit in Rust.
 
-- [ ] **Step 4: Verify green**
+- [x] **Step 4: Verify green**
 
-Run the same `abi_test.ts` command.
+Run the same `sandbox-wasm-kernel_test.ts` command.
 
 Expected: continuation fork canaries pass under the Rust-backed kernel route.
 

@@ -255,6 +255,14 @@ export interface LoaderContext {
    * translation; loader only exposes process-local Worker/SAB handles.
    */
   wasmThreadHostRegistry?: WasmThreadHostRegistry;
+  forkLifecycle?: ForkLifecycleHooks;
+}
+
+export interface ForkLifecycleHooks {
+  prepareFork(parentPid: number): number;
+  commitFork(parentPid: number, childPid: number): number;
+  rollbackFork(parentPid: number, childPid: number): number;
+  recordExit?(pid: number, exitStatus: number): number;
 }
 
 export interface LoadProcessOptions {
@@ -630,13 +638,75 @@ export async function loadProcess(
   ): number => {
     if (!asyncifyBridge || !asyncifyInitialized) return -38; // ENOSYS
     if (memoryRef?.buffer instanceof SharedArrayBuffer) return -11; // EAGAIN
-    if (!ctx.kernel.canReserveProcessSlot()) return -11; // EAGAIN
+    const forkLifecycle = ctx.forkLifecycle;
+    if (!forkLifecycle && !ctx.kernel.canReserveProcessSlot()) {
+      return -11; // EAGAIN
+    }
 
-    const childPid = ctx.kernel.allocPid(parentPid, path);
-    const childFdTable = ctx.kernel.buildFdTableForFork(parentPid, childPid);
-    ctx.kernel.adoptFdTable(childPid, childFdTable);
+    let childPid: number;
+    try {
+      childPid = forkLifecycle
+        ? forkLifecycle.prepareFork(parentPid)
+        : ctx.kernel.allocPid(parentPid, path);
+    } catch {
+      return -11; // EAGAIN
+    }
+    if (childPid < 0) return childPid;
+    const rollbackRustFork = () => {
+      if (!forkLifecycle) return;
+      try {
+        forkLifecycle.rollbackFork(parentPid, childPid);
+      } catch {
+        // Nothing else can observe an uncommitted Rust fork after the
+        // host-control rollback fails; keep the adapter mirror consistent.
+      }
+    };
+
+    let localMirrorRegistered = false;
+    try {
+      if (forkLifecycle) {
+        ctx.kernel.registerPending(childPid, path, parentPid);
+        localMirrorRegistered = true;
+      }
+      const childFdTable = ctx.kernel.buildFdTableForFork(parentPid, childPid);
+      ctx.kernel.adoptFdTable(childPid, childFdTable);
+    } catch (_err) {
+      if (forkLifecycle) {
+        rollbackRustFork();
+        if (localMirrorRegistered) ctx.kernel.discardProcess(childPid);
+      }
+      return -11; // EAGAIN
+    }
     const wasiSnapshot = parentWasi.snapshotForFork();
 
+    let rustForkCommitted = false;
+    if (forkLifecycle) {
+      let commitResult: number;
+      try {
+        commitResult = forkLifecycle.commitFork(parentPid, childPid);
+      } catch {
+        commitResult = -11; // EAGAIN
+      }
+      if (commitResult < 0) {
+        rollbackRustFork();
+        ctx.kernel.discardProcess(childPid);
+        return commitResult;
+      }
+      rustForkCommitted = true;
+    }
+    let rustForkExitRecorded = false;
+    const recordRustForkExit = (exitCode: number, signal?: number) => {
+      if (!forkLifecycle?.recordExit) return;
+      if (rustForkExitRecorded) return;
+      const exitStatus = signal && signal > 0 ? 128 + signal : exitCode;
+      const recordResult = forkLifecycle.recordExit(childPid, exitStatus);
+      if (recordResult < 0) {
+        throw new Error(
+          `kernel_record_exit(${childPid}, ${exitStatus}) failed: ${recordResult}`,
+        );
+      }
+      rustForkExitRecorded = true;
+    };
     const childPromise = (async () => {
       const childWasi = ctx.buildWasiHost(childPid, wasiArgv, env, cwd);
       childWasi.restoreForkSnapshot(wasiSnapshot);
@@ -795,9 +865,21 @@ export async function loadProcess(
         : undefined;
       childBridge.startForkRewind();
       const exitCode = await childWasi.startAsync(childInstance, childStartFn);
+      recordRustForkExit(exitCode, childWasi.getExitSignal());
       ctx.releasePid(childPid, exitCode, childWasi.getExitSignal());
     })().catch(() => {
-      ctx.releasePid(childPid, 127);
+      if (forkLifecycle && !rustForkCommitted) {
+        rollbackRustFork();
+        ctx.kernel.discardProcess(childPid);
+      } else {
+        try {
+          recordRustForkExit(127);
+        } catch {
+          // The continuation adapter is already failing; keep the local
+          // mirror reapable rather than letting a stale async rejection leak.
+        }
+        ctx.releasePid(childPid, 127);
+      }
     });
     void childPromise;
     return childPid;
