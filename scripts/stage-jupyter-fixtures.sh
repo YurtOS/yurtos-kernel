@@ -4,9 +4,9 @@
 # the kernel's jupyter_smoke_test.ts can run against real Jupyter
 # bits.
 #
-# Inputs (built externally in the sibling yurt-jupyter repo):
-#   ../yurt-jupyter/dist/extracted/usr/local/lib/python3.14/site-packages/
-#   ../yurt-jupyter/dist/extracted/usr/share/yurt-jupyter/
+# Inputs (built externally in the yurt-jupyter repo):
+#   $YURT_JUPYTER_ROOT/dist/extracted/usr/local/lib/python3.14/site-packages/
+#   $YURT_JUPYTER_ROOT/dist/extracted/usr/share/yurt-jupyter/
 #     (psutil.py, sitecustomize.py, ipykernel-launch-dry-run.py)
 #
 # Override input via YURT_JUPYTER_ROOT=/path/to/yurt-jupyter. The
@@ -18,14 +18,43 @@
 #   - yurt-jupyter/site-packages/   (~200 MB, ~12k files)
 #   - yurt-jupyter/usr-share/       (psutil + sitecustomize + dry-run)
 #
-# Skipped when ../yurt-jupyter/dist/extracted/ is absent — run
-# `(cd ../yurt-jupyter && ./scripts/{stage-jupyter-site-packages,package,extract}.sh)`
-# first.
+# Skipped when $YURT_JUPYTER_ROOT/dist/extracted/ is absent.
 
 set -euo pipefail
 
-KERNEL_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-YURT_JUPYTER_ROOT="${YURT_JUPYTER_ROOT:-"$KERNEL_ROOT/../yurt-jupyter"}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+KERNEL_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
+
+resolve_path() {
+  local path="$1"
+  if [[ -d "$path" ]]; then
+    cd -- "$path" && pwd -P
+  else
+    local parent
+    parent="$(dirname -- "$path")"
+    if [[ -d "$parent" ]]; then
+      printf '%s/%s\n' "$(cd -- "$parent" && pwd -P)" "$(basename -- "$path")"
+    else
+      printf '%s\n' "$path"
+    fi
+  fi
+}
+
+default_sibling_root() {
+  local name="$1"
+  local base="$KERNEL_ROOT"
+  while [[ "$base" != "/" ]]; do
+    local candidate="$base/../$name"
+    if [[ -d "$candidate" ]]; then
+      resolve_path "$candidate"
+      return
+    fi
+    base="$(dirname -- "$base")"
+  done
+  resolve_path "$KERNEL_ROOT/../$name"
+}
+
+YURT_JUPYTER_ROOT="$(resolve_path "${YURT_JUPYTER_ROOT:-$(default_sibling_root yurt-jupyter)}")"
 FIXTURES="$KERNEL_ROOT/packages/kernel/src/platform/__tests__/fixtures"
 EXTRACTED="$YURT_JUPYTER_ROOT/dist/extracted"
 

@@ -233,6 +233,51 @@ pub(super) fn sched_setparam(caller_pid: u32, request: &[u8]) -> i64 {
     0
 }
 
+pub(super) fn sched_getaffinity(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([pid, cpusetsize]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = scheduler_target_pid(caller_pid, pid);
+    if !scheduler_target_exists(caller_pid, target) {
+        return -(abi::ESRCH as i64);
+    }
+    if cpusetsize < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let cpusetsize = cpusetsize as usize;
+    if response.len() < cpusetsize {
+        return cpusetsize as i64;
+    }
+    response[..cpusetsize].fill(0);
+    response[0] = 1;
+    cpusetsize as i64
+}
+
+pub(super) fn sched_setaffinity(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([pid, cpusetsize]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = scheduler_target_pid(caller_pid, pid);
+    if !scheduler_target_exists(caller_pid, target) {
+        return -(abi::ESRCH as i64);
+    }
+    if cpusetsize < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let cpusetsize = cpusetsize as usize;
+    let Some(end) = 8usize.checked_add(cpusetsize) else {
+        return -(abi::EINVAL as i64);
+    };
+    if request.len() < end {
+        return -(abi::EINVAL as i64);
+    }
+    let mask = &request[8..end];
+    if mask.first().copied() != Some(1) || mask[1..].iter().any(|byte| *byte != 0) {
+        return -(abi::EINVAL as i64);
+    }
+    0
+}
+
 /// `getrlimit(resource: u32) -> (soft, hard) as 16 bytes LE`.
 pub(super) fn getrlimit(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     let Some([resource]) = read_u32_args::<1>(request) else {
@@ -370,7 +415,13 @@ fn encode_thread_list(entries: &[crate::kernel::ThreadRecord]) -> Vec<u8> {
         });
         out.push(u8::from(entry.detached));
         out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&entry.exit_value.unwrap_or(-1).to_le_bytes());
+        out.extend_from_slice(
+            &entry
+                .exit_value
+                .map(|exit_value| exit_value as i32)
+                .unwrap_or(-1)
+                .to_le_bytes(),
+        );
         out.extend_from_slice(&entry.host_thread_handle.unwrap_or(-1).to_le_bytes());
     }
     out
@@ -418,6 +469,7 @@ pub(crate) const SNAPSHOT_SECTION_RUNNABLE_THREADS: u32 = 4;
 fn wait_reason_code(reason: crate::kernel::WaitReason) -> u32 {
     match reason {
         crate::kernel::WaitReason::HostBlock => 1,
+        crate::kernel::WaitReason::ThreadJoin { .. } => 2,
     }
 }
 
@@ -581,8 +633,7 @@ pub(super) fn getpgid(caller_pid: u32, request: &[u8]) -> i64 {
 }
 
 /// `setpgid(pid, pgid)`. pid==0 → caller; pgid==0 → target's pid (i.e.
-/// make the target a new group leader). Phase 2 has no permission /
-/// session-membership checks.
+/// make the target a new group leader).
 pub(super) fn setpgid(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([target_arg, pgid_arg]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
@@ -594,6 +645,24 @@ pub(super) fn setpgid(caller_pid: u32, request: &[u8]) -> i64 {
     };
     let new_pgid = if pgid_arg == 0 { target } else { pgid_arg };
     with_kernel(|k| {
+        let Some((target_sid, is_session_leader)) = (if target_arg == 0 || target == caller_pid {
+            let p = k.process_mut(target);
+            Some((if p.sid == 0 { target } else { p.sid }, p.sid == target))
+        } else {
+            k.process_existing(target)
+                .map(|p| (if p.sid == 0 { target } else { p.sid }, p.sid == target))
+        }) else {
+            return -(abi::ESRCH as i64);
+        };
+        if is_session_leader {
+            return -(abi::EPERM as i64);
+        }
+        if new_pgid != target {
+            match k.process_group_session(new_pgid) {
+                Some(group_sid) if group_sid == target_sid => {}
+                _ => return -(abi::EPERM as i64),
+            }
+        }
         let Some(p) = (if target_arg == 0 || target == caller_pid {
             Some(k.process_mut(target))
         } else {
@@ -641,7 +710,7 @@ pub(super) fn getsid(caller_pid: u32, request: &[u8]) -> i64 {
 pub(super) fn setsid(caller_pid: u32) -> i64 {
     with_kernel(|k| {
         let p = k.process_mut(caller_pid);
-        if p.sid == caller_pid {
+        if p.sid == caller_pid || p.pgid == caller_pid {
             return -(abi::EPERM as i64);
         }
         p.sid = caller_pid;
@@ -676,6 +745,30 @@ pub(super) fn kill_request(request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     };
     kill_pid(target, sig)
+}
+
+pub(super) fn killpg_request(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([pgid_arg, sig]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if sig > 63 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let pgid = if pgid_arg == 0 {
+            let caller = k.process_mut(caller_pid);
+            if caller.pgid == 0 {
+                caller.pgid = caller_pid;
+            }
+            caller.pgid
+        } else {
+            pgid_arg
+        };
+        match k.kill_process_group(pgid, sig) {
+            Ok(()) => 0,
+            Err(errno) => -(errno as i64),
+        }
+    })
 }
 
 /// `sigaction(sig, disposition) -> previous_disposition`. Disposition
@@ -967,7 +1060,7 @@ pub(super) fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
                 parent.credentials,
                 parent.cwd.clone(),
                 parent.rlimits,
-                parent.fd_table.entries(),
+                parent.fd_table.inheritable_entries(),
                 parent.nice,
                 parent.scheduler_policy,
                 parent.scheduler_priority,

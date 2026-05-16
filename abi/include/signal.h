@@ -33,6 +33,9 @@ typedef struct siginfo {
   int si_signo;
   int si_errno;
   int si_code;
+  pid_t si_pid;
+  uid_t si_uid;
+  int si_status;
 } siginfo_t;
 
 #if !defined(__DEFINED_sig_atomic_t)

@@ -155,6 +155,57 @@ pub unsafe extern "C" fn kernel_dispatch(
     dispatch::dispatch(method_id, caller_pid, request, response)
 }
 
+/// Host-callable entry point for thread-aware syscalls.
+///
+/// This has the same memory contract as [`kernel_dispatch`], but the host also
+/// supplies the authenticated caller thread id. Guest request bytes are not
+/// trusted to identify the calling thread.
+///
+/// # Safety
+///
+/// The kernel-host interface guarantees both slices live entirely inside this
+/// kernel instance's linear memory. The export rejects overlapping request and
+/// response ranges before forming Rust references.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_dispatch_thread(
+    method_id: u32,
+    caller_pid: u32,
+    caller_tid: u32,
+    in_ptr: *const u8,
+    in_len: usize,
+    out_ptr: *mut u8,
+    out_cap: usize,
+) -> i64 {
+    if let Err(rc) = validate_scratch_range(in_ptr as usize, in_len) {
+        return rc;
+    }
+    if let Err(rc) = validate_scratch_range(out_ptr as usize, out_cap) {
+        return rc;
+    }
+    match ranges_overlap(in_ptr as usize, in_len, out_ptr as usize, out_cap) {
+        Ok(false) => {}
+        Ok(true) => return -(abi::EINVAL as i64),
+        Err(rc) => return rc,
+    }
+    let request = match raw_input(in_ptr, in_len) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
+    };
+    let response = match raw_output(out_ptr, out_cap) {
+        Ok(slice) => slice,
+        Err(rc) => return rc,
+    };
+    dispatch::dispatch_with_context(
+        method_id,
+        dispatch::DispatchContext {
+            caller_pid,
+            caller_tid,
+        },
+        request,
+        response,
+    )
+}
+
 /// Host-control export: serialize the kernel-owned process table.
 ///
 /// The kernel_host_interface may expose this to embedders for observability, but
@@ -226,6 +277,36 @@ pub unsafe extern "C" fn kernel_schedule_next(out_ptr: *mut u8, out_cap: usize) 
     dispatch::schedule_next_response(response)
 }
 
+/// Host-control export: reserve a fork child process in kernel-owned state.
+#[no_mangle]
+pub extern "C" fn kernel_prepare_fork(parent_pid: u32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.prepare_fork(parent_pid)
+            .map(i64::from)
+            .unwrap_or_else(|errno| -(errno as i64))
+    })
+}
+
+/// Host-control export: publish a prepared fork child after host startup.
+#[no_mangle]
+pub extern "C" fn kernel_commit_fork(parent_pid: u32, child_pid: u32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.commit_fork(parent_pid, child_pid)
+            .map(|()| 0)
+            .unwrap_or_else(|errno| -(errno as i64))
+    })
+}
+
+/// Host-control export: remove a prepared fork child after host startup failure.
+#[no_mangle]
+pub extern "C" fn kernel_rollback_fork(parent_pid: u32, child_pid: u32) -> i64 {
+    crate::kernel::with_kernel(|k| {
+        k.rollback_fork(parent_pid, child_pid)
+            .map(|()| 0)
+            .unwrap_or_else(|errno| -(errno as i64))
+    })
+}
+
 /// Host-control export: register a host-created thread in kernel-owned state.
 ///
 /// `host_thread_handle` is an opaque adapter handle. Pass a negative value when
@@ -251,22 +332,50 @@ pub extern "C" fn kernel_spawn_thread(pid: u32, host_thread_handle: i32) -> i64 
 ///
 #[no_mangle]
 pub extern "C" fn kernel_detach_thread(pid: u32, tid: u32) -> i64 {
-    crate::kernel::with_kernel(|k| {
-        k.detach_thread(pid, tid)
-            .map(|()| 0)
-            .unwrap_or(-(abi::ESRCH as i64))
-    })
+    let (result, release_handles) = crate::kernel::with_kernel(|k| {
+        let result = k.detach_thread(pid, tid);
+        let release_handles = k.drain_thread_releases();
+        (result, release_handles)
+    });
+    for handle in release_handles {
+        let _ = kh::thread_release(handle);
+    }
+    result.map_or_else(|errno| -(errno as i64), |_| 0)
 }
 
 /// Host-control export: record a thread exit value in kernel-owned state.
 ///
 #[no_mangle]
 pub extern "C" fn kernel_record_thread_exit(pid: u32, tid: u32, exit_value: i32) -> i64 {
-    crate::kernel::with_kernel(|k| {
-        k.exit_thread(pid, tid, exit_value)
-            .map(|()| 0)
-            .unwrap_or(-(abi::ESRCH as i64))
-    })
+    let (result, release_handles) = crate::kernel::with_kernel(|k| {
+        let result = k.exit_thread(pid, tid, exit_value);
+        let release_handles = k.drain_thread_releases();
+        (result, release_handles)
+    });
+    for handle in release_handles {
+        let _ = kh::thread_release(handle);
+    }
+    result.map_or_else(|errno| -(errno as i64), |_| 0)
+}
+
+/// Host-control export: record thread exit after validating the live host
+/// execution handle for `(pid, tid)`.
+#[no_mangle]
+pub extern "C" fn kernel_record_thread_exit_authenticated(
+    pid: u32,
+    tid: u32,
+    host_thread_handle: i32,
+    exit_value: u32,
+) -> i64 {
+    let (result, release_handles) = crate::kernel::with_kernel(|k| {
+        let result = k.record_thread_exit_authenticated(pid, tid, host_thread_handle, exit_value);
+        let release_handles = k.drain_thread_releases();
+        (result, release_handles)
+    });
+    for handle in release_handles {
+        let _ = kh::thread_release(handle);
+    }
+    result.map_or_else(|errno| -(errno as i64), |_| 0)
 }
 
 /// Host-control export: mark a thread blocked in kernel-owned state.
@@ -512,5 +621,36 @@ mod tests {
         });
         assert_eq!(kernel_kill(7, 15), 0);
         assert_eq!(kernel_kill(7, 64), -(abi::EINVAL as i64));
+    }
+
+    #[test]
+    fn record_thread_exit_authenticated_rejects_wrong_host_handle() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.insert_host_process(9, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+            assert_eq!(k.spawn_thread(9, Some(44)), Some(2));
+        });
+
+        assert_eq!(
+            kernel_record_thread_exit_authenticated(9, 2, 45, 0x1234),
+            -(abi::EPERM as i64)
+        );
+    }
+
+    #[test]
+    fn record_thread_exit_authenticated_accepts_matching_host_handle() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kernel::with_kernel(|k| {
+            k.insert_host_process(9, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+            assert_eq!(k.spawn_thread(9, Some(44)), Some(2));
+        });
+
+        assert_eq!(
+            kernel_record_thread_exit_authenticated(9, 2, 44, 0x8000_0001),
+            0
+        );
+        let thread =
+            crate::kernel::with_kernel(|k| k.process(9).threads.get(&2).expect("thread").clone());
+        assert_eq!(thread.exit_value, Some(0x8000_0001));
     }
 }

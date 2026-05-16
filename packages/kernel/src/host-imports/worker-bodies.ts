@@ -113,6 +113,15 @@ export interface MakeWorkerDispatcherBodiesOptions {
    * circuits yield/exit handlers to no-ops.
    */
   threadsBackend: () => ThreadsBackend | null;
+  rustThreads?: {
+    spawn(
+      callerPid: number,
+      callerTid: number,
+      fnPtr: number,
+      arg: number,
+    ): number;
+    yield(callerPid: number, callerTid: number): number;
+  };
   /**
    * Socket backend reachable from the dispatcher. Required for the
    * AF_UNIX socketpair / send_unix bodies that libzmq's signaler
@@ -142,7 +151,10 @@ export function makeWorkerDispatcherBodies(
     : () => opts.callerPid as number;
 
   return {
-    threadYield: () => {
+    threadYield: (callerTid = 1) => {
+      if (opts.rustThreads) {
+        return opts.rustThreads.yield(getPid(), callerTid);
+      }
       // Worker-side `host_thread_yield` is a fire-and-forget signal
       // — the dispatcher returns immediately and the worker's
       // `Atomics.wait` resumes. We invoke the backend's yield_ so
@@ -456,7 +468,10 @@ export function makeWorkerDispatcherBodies(
       if (!target || target.type !== "socket") return -1;
       return target.isDgram ? 1 : 0;
     },
-    threadSpawn: (fnPtr, arg) => {
+    threadSpawn: (fnPtr, arg, callerTid = 1) => {
+      if (opts.rustThreads) {
+        return opts.rustThreads.spawn(getPid(), callerTid, fnPtr, arg);
+      }
       const tb = threadsBackend() as
         | (ThreadsBackend & { spawnSync?: (fp: number, a: number) => number })
         | null;

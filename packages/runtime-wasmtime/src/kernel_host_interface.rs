@@ -20,12 +20,16 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
-use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime::{
+    Caller, Config, Engine, ExternType, Linker, Memory, MemoryType, Module, SharedMemory, Store,
+    TypedFunc,
+};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 use wasmtime_wasi::WasiCtxBuilder;
 use yurt_kernel_host_interface_core::{
@@ -39,15 +43,18 @@ const KH_NAMESPACE: &str = "kh";
 /// C / Rust `extern "C"` declarations without an explicit
 /// `#[link(wasm_import_module = …)]`.
 const SYS_NAMESPACE: &str = "env";
+const YURT_NAMESPACE: &str = "yurt";
 
 /// POSIX errno values referenced by the trampoline. Mirrors
 /// `abi/contract/yurt_abi.toml`.
 const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
+const ESRCH: i64 = 3;
 const EACCES: i64 = 13;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
 const EINVAL: i64 = 22;
+const EBUSY: i64 = 16;
 const E2BIG: i64 = 7;
 const EIO: i64 = 5;
 const ENOSYS: i64 = 38;
@@ -128,6 +135,15 @@ fn user_memory(caller: &mut Caller<'_, UserState>) -> std::result::Result<Memory
         .ok_or(-EFAULT)
 }
 
+fn user_shared_memory(
+    caller: &mut Caller<'_, UserState>,
+) -> std::result::Result<SharedMemory, i64> {
+    caller
+        .get_export("memory")
+        .and_then(|e| e.into_shared_memory())
+        .ok_or(-EFAULT)
+}
+
 fn read_kernel_guest_bytes(
     caller: &mut Caller<'_, KernelStoreData>,
     ptr: u32,
@@ -147,13 +163,57 @@ fn read_user_guest_bytes(
     ptr: u32,
     len: u32,
 ) -> std::result::Result<Vec<u8>, i64> {
-    let memory = user_memory(caller)?;
     let len = checked_guest_buffer_len(len)?;
-    let mut buf = vec![0u8; len];
-    if len > 0 && memory.read(&*caller, ptr as usize, &mut buf).is_err() {
+    if let Ok(memory) = user_memory(caller) {
+        let mut buf = vec![0u8; len];
+        if len > 0 && memory.read(&*caller, ptr as usize, &mut buf).is_err() {
+            return Err(-EFAULT);
+        }
+        return Ok(buf);
+    }
+    let memory = user_shared_memory(caller)?;
+    read_shared_memory(memory, ptr, len).map_err(|_| -EFAULT)
+}
+
+fn write_user_guest_bytes(
+    caller: &mut Caller<'_, UserState>,
+    ptr: u32,
+    bytes: &[u8],
+) -> std::result::Result<(), i64> {
+    if let Ok(memory) = user_memory(caller) {
+        if !bytes.is_empty() && memory.write(caller, ptr as usize, bytes).is_err() {
+            return Err(-EFAULT);
+        }
+        return Ok(());
+    }
+    let memory = user_shared_memory(caller)?;
+    let data = memory.data();
+    let start = ptr as usize;
+    let end = start.checked_add(bytes.len()).ok_or(-EFAULT)?;
+    let cells = data.get(start..end).ok_or(-EFAULT)?;
+    for (cell, byte) in cells.iter().zip(bytes) {
+        let ptr = cell.get().cast::<AtomicU8>();
+        // SAFETY: Wasmtime shared memory bytes must be accessed atomically by
+        // embedders. AtomicU8 has the same layout as the underlying u8 cell.
+        unsafe { (*ptr).store(*byte, Ordering::SeqCst) };
+    }
+    Ok(())
+}
+
+fn snapshot_user_memory(caller: &mut Caller<'_, UserState>) -> std::result::Result<Vec<u8>, i64> {
+    if caller
+        .get_export("memory")
+        .and_then(|e| e.into_shared_memory())
+        .is_some()
+    {
+        return Err(-EAGAIN);
+    }
+    let memory = user_memory(caller)?;
+    let mut snapshot = vec![0u8; memory.data_size(&*caller)];
+    if !snapshot.is_empty() && memory.read(&*caller, 0, &mut snapshot).is_err() {
         return Err(-EFAULT);
     }
-    Ok(buf)
+    Ok(snapshot)
 }
 
 /// Method ids that the user-process linker forwards. Generated
@@ -179,6 +239,18 @@ mod sys_method_id {
     pub const DUP: u32 = 0x1_000F;
     pub const EXTENSION_INVOKE: u32 = 0x1_0010;
     pub const DUP2: u32 = 0x1_0011;
+    pub const DUP_MIN: u32 = 0x1_0054;
+    pub const SET_FD_DESCRIPTOR_FLAGS: u32 = 0x1_0055;
+    pub const TCGETPGRP: u32 = 0x1_0056;
+    pub const TCSETPGRP: u32 = 0x1_0057;
+    pub const TCGETATTR: u32 = 0x1_0058;
+    pub const TCSETATTR: u32 = 0x1_0059;
+    pub const WINSIZE: u32 = 0x1_005A;
+    pub const TIOCSCTTY: u32 = 0x1_005B;
+    pub const SCHED_GETAFFINITY: u32 = 0x1_005C;
+    pub const SCHED_SETAFFINITY: u32 = 0x1_005D;
+    pub const FCHOWN: u32 = 0x1_005E;
+    pub const FCHDIR: u32 = 0x1_005F;
     pub const PIPE: u32 = 0x1_0012;
     pub const READ: u32 = 0x1_0013;
     pub const WRITE: u32 = 0x1_0014;
@@ -189,6 +261,7 @@ mod sys_method_id {
     pub const GETSID: u32 = 0x1_0019;
     pub const SETSID: u32 = 0x1_001A;
     pub const KILL: u32 = 0x1_001B;
+    pub const KILLPG: u32 = 0x1_0053;
     pub const SIGACTION: u32 = 0x1_001C;
     pub const SCHED_YIELD: u32 = 0x1_001D;
     pub const NANOSLEEP: u32 = 0x1_001E;
@@ -236,6 +309,13 @@ mod sys_method_id {
     pub const SOCKET_RECVMSG: u32 = 0x1_0049;
     pub const SOCKET_INFO: u32 = 0x1_004A;
     pub const SOCKET_RECVFROM: u32 = 0x1_004B;
+    pub const SOCKET_OPTION: u32 = 0x1_004C;
+    pub const THREAD_SPAWN: u32 = 0x1_004D;
+    pub const THREAD_SELF: u32 = 0x1_004E;
+    pub const THREAD_JOIN: u32 = 0x1_004F;
+    pub const THREAD_DETACH: u32 = 0x1_0050;
+    pub const THREAD_EXIT: u32 = 0x1_0051;
+    pub const THREAD_YIELD: u32 = 0x1_0052;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -477,6 +557,316 @@ impl LogSink for StderrLogSink {
     }
 }
 
+pub trait ThreadHost: Send + Sync {
+    fn register_process(
+        &self,
+        _pid: u32,
+        _wasm: Arc<[u8]>,
+        _argv: Vec<Vec<u8>>,
+        _shared_memory: Option<SharedMemory>,
+    ) {
+    }
+    fn spawn(&self, pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32;
+    fn release(&self, host_thread_handle: i32) -> i32;
+    fn cancel(&self, host_thread_handle: i32) -> i32;
+}
+
+struct WasmtimeThreadProcess {
+    wasm: Arc<[u8]>,
+    argv: Vec<Vec<u8>>,
+    shared_memory: Option<SharedMemory>,
+}
+
+struct WasmtimeThreadSlot {
+    join: thread::JoinHandle<()>,
+    thread_id: thread::ThreadId,
+}
+
+struct WasmtimeThreadHost {
+    engine: Engine,
+    kernel: Weak<Mutex<KernelInstance>>,
+    processes: Mutex<std::collections::BTreeMap<u32, WasmtimeThreadProcess>>,
+    threads: Mutex<std::collections::BTreeMap<i32, WasmtimeThreadSlot>>,
+    pending_reap: Mutex<Vec<thread::JoinHandle<()>>>,
+    next_handle: Mutex<i32>,
+}
+
+impl WasmtimeThreadHost {
+    fn new(engine: Engine, kernel: Arc<Mutex<KernelInstance>>) -> Self {
+        Self {
+            engine,
+            kernel: Arc::downgrade(&kernel),
+            processes: Mutex::new(std::collections::BTreeMap::new()),
+            threads: Mutex::new(std::collections::BTreeMap::new()),
+            pending_reap: Mutex::new(Vec::new()),
+            next_handle: Mutex::new(1),
+        }
+    }
+
+    fn drain_pending_reap(&self) {
+        let pending = std::mem::take(&mut *self.pending_reap.lock().unwrap());
+        join_thread_handles(pending);
+    }
+}
+
+impl ThreadHost for WasmtimeThreadHost {
+    fn register_process(
+        &self,
+        pid: u32,
+        wasm: Arc<[u8]>,
+        argv: Vec<Vec<u8>>,
+        shared_memory: Option<SharedMemory>,
+    ) {
+        self.processes.lock().unwrap().insert(
+            pid,
+            WasmtimeThreadProcess {
+                wasm,
+                argv,
+                shared_memory,
+            },
+        );
+    }
+
+    fn spawn(&self, pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32 {
+        self.drain_pending_reap();
+        let process = {
+            let processes = self.processes.lock().unwrap();
+            let Some(process) = processes.get(&pid) else {
+                return -(ENOENT as i32);
+            };
+            WasmtimeThreadProcess {
+                wasm: process.wasm.clone(),
+                argv: process.argv.clone(),
+                shared_memory: process.shared_memory.clone(),
+            }
+        };
+        let handle = {
+            let mut next = self.next_handle.lock().unwrap();
+            let handle = *next;
+            *next = next.saturating_add(1);
+            handle
+        };
+        let engine = self.engine.clone();
+        let Some(kernel) = self.kernel.upgrade() else {
+            return -(ESRCH as i32);
+        };
+        let join = thread::Builder::new()
+            .name(format!("yurt-wasmtime-thread-{pid}-{tid}"))
+            .spawn(move || {
+                let retval =
+                    run_wasmtime_thread(engine, kernel.clone(), pid, tid, process, fn_ptr, arg)
+                        .unwrap_or(u32::MAX);
+                let _ = kernel
+                    .lock()
+                    .unwrap()
+                    .record_thread_exit_authenticated(pid, tid, handle, retval);
+            });
+        match join {
+            Ok(join) => {
+                let thread_id = join.thread().id();
+                self.threads
+                    .lock()
+                    .unwrap()
+                    .insert(handle, WasmtimeThreadSlot { join, thread_id });
+                handle
+            }
+            Err(_) => -(EAGAIN as i32),
+        }
+    }
+
+    fn release(&self, host_thread_handle: i32) -> i32 {
+        if let Some(slot) = self.threads.lock().unwrap().remove(&host_thread_handle) {
+            if should_join_thread(slot.thread_id) {
+                let _ = slot.join.join();
+            } else {
+                self.pending_reap.lock().unwrap().push(slot.join);
+            }
+        }
+        0
+    }
+
+    fn cancel(&self, host_thread_handle: i32) -> i32 {
+        self.threads.lock().unwrap().remove(&host_thread_handle);
+        0
+    }
+}
+
+impl Drop for WasmtimeThreadHost {
+    fn drop(&mut self) {
+        let pending = std::mem::take(self.pending_reap.get_mut().unwrap());
+        join_thread_handles(pending);
+    }
+}
+
+fn should_join_thread(target: thread::ThreadId) -> bool {
+    target != thread::current().id()
+}
+
+fn join_thread_handles(handles: Vec<thread::JoinHandle<()>>) {
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+fn run_wasmtime_thread(
+    engine: Engine,
+    kernel: Arc<Mutex<KernelInstance>>,
+    pid: u32,
+    tid: u32,
+    process: WasmtimeThreadProcess,
+    fn_ptr: u32,
+    arg: u32,
+) -> Result<u32> {
+    let module = Module::new(&engine, process.wasm.as_ref()).context("compile thread wasm")?;
+    let mut linker: Linker<UserState> = Linker::new(&engine);
+    register_sys_imports(&mut linker)?;
+    register_yurt_thread_imports(&mut linker)?;
+    crate::wasi_shim::add_to_linker(&mut linker)
+        .context("install WASI preview1 shim on thread linker")?;
+    let user_state = UserState {
+        engine: engine.clone(),
+        kernel,
+        pid,
+        caller_tid: tid,
+        argv: process.argv,
+        wasm: process.wasm.clone(),
+        forced_fork_return: None,
+        dir_fds: std::collections::BTreeMap::new(),
+        last_exit: None,
+        last_scheduler_budget_ns: None,
+        last_scheduler_epoch_quantum: None,
+    };
+    let mut store = Store::new(&engine, user_state);
+    store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
+    if let Some(memory) = process.shared_memory.clone() {
+        define_imported_shared_memory(&module, &mut linker, &store, memory)?;
+    }
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .context("instantiate thread wasm")?;
+    let table = instance
+        .get_table(&mut store, "__indirect_function_table")
+        .ok_or_else(|| anyhow!("thread wasm missing __indirect_function_table"))?;
+    let func = match table.get(&mut store, fn_ptr.into()) {
+        Some(wasmtime::Ref::Func(Some(func))) => func,
+        _ => anyhow::bail!("thread function pointer {fn_ptr} not found"),
+    };
+    let typed = func
+        .typed::<i32, i32>(&store)
+        .context("thread entry has wrong type")?;
+    let retval = typed
+        .call(&mut store, arg as i32)
+        .context("thread entry call")?;
+    Ok(retval as u32)
+}
+
+fn imported_shared_memory_type(module: &Module) -> Option<MemoryType> {
+    module.imports().find_map(|import| {
+        if import.module() != SYS_NAMESPACE || import.name() != "memory" {
+            return None;
+        }
+        match import.ty() {
+            ExternType::Memory(ty) if ty.is_shared() => Some(ty),
+            _ => None,
+        }
+    })
+}
+
+fn define_imported_shared_memory<T>(
+    module: &Module,
+    linker: &mut Linker<T>,
+    store: &Store<T>,
+    memory: SharedMemory,
+) -> Result<()> {
+    if imported_shared_memory_type(module).is_some() {
+        linker
+            .define(store, SYS_NAMESPACE, "memory", memory)
+            .context("define imported shared memory")?;
+    }
+    Ok(())
+}
+
+fn instantiate_fork_child(
+    engine: &Engine,
+    kernel: Arc<Mutex<KernelInstance>>,
+    pid: u32,
+    wasm: Arc<[u8]>,
+    argv: Vec<Vec<u8>>,
+    memory_snapshot: &[u8],
+) -> Result<UserProcess> {
+    let module = Module::new(engine, wasm.as_ref()).context("compile fork child wasm")?;
+    if imported_shared_memory_type(&module).is_some() {
+        anyhow::bail!("fork child imports shared memory");
+    }
+    let mut linker: Linker<UserState> = Linker::new(engine);
+    register_sys_imports(&mut linker)?;
+    register_yurt_thread_imports(&mut linker)?;
+    crate::wasi_shim::add_to_linker(&mut linker)
+        .context("install WASI preview1 shim on fork child linker")?;
+    let user_state = UserState {
+        engine: engine.clone(),
+        kernel,
+        pid,
+        caller_tid: 1,
+        argv,
+        wasm,
+        forced_fork_return: Some(0),
+        dir_fds: std::collections::BTreeMap::new(),
+        last_exit: None,
+        last_scheduler_budget_ns: None,
+        last_scheduler_epoch_quantum: None,
+    };
+    let mut store = Store::new(engine, user_state);
+    store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .context("instantiate fork child wasm")?;
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .ok_or_else(|| anyhow!("fork child wasm missing memory export"))?;
+    let current_len = memory.data_size(&store);
+    if current_len < memory_snapshot.len() {
+        let missing = memory_snapshot.len() - current_len;
+        let pages = missing.div_ceil(64 * 1024);
+        memory
+            .grow(&mut store, pages as u64)
+            .context("grow fork child memory")?;
+    }
+    if !memory_snapshot.is_empty() {
+        memory
+            .write(&mut store, 0, memory_snapshot)
+            .context("restore fork child memory")?;
+    }
+    Ok(UserProcess {
+        store,
+        instance,
+        pid,
+    })
+}
+
+fn read_shared_memory(memory: SharedMemory, addr: u32, len: usize) -> Result<Vec<u8>> {
+    let data = memory.data();
+    let start = addr as usize;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("read user-process shared memory out of bounds"))?;
+    let cells = data
+        .get(start..end)
+        .ok_or_else(|| anyhow!("read user-process shared memory out of bounds"))?;
+    let mut out = Vec::with_capacity(len);
+    for cell in cells {
+        let byte = {
+            let ptr = cell.get().cast::<AtomicU8>();
+            // SAFETY: Wasmtime exposes shared memory as UnsafeCell<u8> because
+            // concurrent wasm threads may access it. AtomicU8 has the same
+            // layout as u8 and gives the host a data-race-free byte load.
+            unsafe { (*ptr).load(Ordering::SeqCst) }
+        };
+        out.push(byte);
+    }
+    Ok(out)
+}
+
 /// State threaded through every wasmtime host callback that runs
 /// during kernel.wasm execution.
 pub struct HostState {
@@ -519,6 +909,10 @@ pub struct HostState {
     /// this with IndexedDB; native deployments use a disk-backed
     /// store or [`InMemoryKv`] for tests.
     pub kv: Option<Arc<dyn KvBackend>>,
+    /// Host thread executor for Rust-owned `kh_thread_*` calls.
+    /// The kernel owns thread ids, join/detach/reap semantics, and
+    /// stores the opaque handle this adapter returns.
+    pub thread_host: Option<Arc<dyn ThreadHost>>,
     /// Kernel-host process engine state for cached wasm modules.
     /// The kernel owns pid allocation and process records; this
     /// table is only the wasmtime adapter's module/handle storage.
@@ -535,6 +929,7 @@ impl Default for HostState {
             host_fs: None,
             tcp: None,
             kv: None,
+            thread_host: None,
             process_engine: Arc::new(Mutex::new(CachedProcessEngine::default())),
         }
     }
@@ -1518,6 +1913,8 @@ pub struct KernelStoreData {
 
 // ── Kernel instance: the loaded kernel.wasm + its wasmtime handles ─────────
 
+type KernelDispatchThreadFunc = TypedFunc<(u32, u32, u32, u32, u32, u32, u32), i64>;
+
 /// The loaded kernel.wasm plus the typed handles needed to drive it.
 /// Kept behind `Arc<Mutex<…>>` so that both the [`KernelHostInterface`] and
 /// any spawned [`UserProcess`] can call into it. (`Arc<Mutex<…>>`
@@ -1530,6 +1927,7 @@ pub struct KernelInstance {
     pub(crate) scratch_ptr: u32,
     pub(crate) scratch_len: u32,
     pub(crate) dispatch: TypedFunc<(u32, u32, u32, u32, u32, u32), i64>,
+    pub(crate) dispatch_thread: KernelDispatchThreadFunc,
     pub(crate) list_processes: TypedFunc<(u32, u32), i64>,
     pub(crate) list_threads: TypedFunc<(u32, u32, u32), i64>,
     pub(crate) snapshot: TypedFunc<(u32, u32), i64>,
@@ -1537,6 +1935,7 @@ pub struct KernelInstance {
     pub(crate) spawn_thread: TypedFunc<(u32, i32), i64>,
     pub(crate) detach_thread: TypedFunc<(u32, u32), i64>,
     pub(crate) record_thread_exit: TypedFunc<(u32, u32, i32), i64>,
+    pub(crate) record_thread_exit_authenticated: TypedFunc<(u32, u32, i32, u32), i64>,
     pub(crate) block_thread: TypedFunc<(u32, u32), i64>,
     pub(crate) unblock_thread: TypedFunc<(u32, u32), i64>,
     pub(crate) kill: TypedFunc<(u32, u32), i64>,
@@ -1544,6 +1943,9 @@ pub struct KernelInstance {
     pub(crate) record_exit: TypedFunc<(u32, i32), i64>,
     pub(crate) drain_spawn: TypedFunc<(u32, u32), i64>,
     pub(crate) spawn_process: TypedFunc<(u32, u32, u32, u32, u32), i64>,
+    pub(crate) prepare_fork: TypedFunc<u32, i64>,
+    pub(crate) commit_fork: TypedFunc<(u32, u32), i64>,
+    pub(crate) rollback_fork: TypedFunc<(u32, u32), i64>,
 }
 
 impl KernelInstance {
@@ -1586,6 +1988,51 @@ impl KernelInstance {
             self.memory
                 .read(&self.store, out_ptr as usize, response)
                 .context("read syscall response from kernel scratch")?;
+        }
+        Ok(rc)
+    }
+
+    /// Run a thread-aware syscall. The host supplies `caller_tid`
+    /// from trusted adapter state; guest request bytes are not allowed
+    /// to identify the calling thread.
+    pub fn thread_syscall(
+        &mut self,
+        method_id: u32,
+        caller_pid: u32,
+        caller_tid: u32,
+        request: &[u8],
+        response: &mut [u8],
+    ) -> Result<i64> {
+        if request.len() + response.len() > self.scratch_len as usize {
+            return Err(anyhow!(
+                "request+response ({} bytes) exceeds scratch capacity ({})",
+                request.len() + response.len(),
+                self.scratch_len
+            ));
+        }
+        let in_ptr = self.scratch_ptr;
+        let in_len = request.len() as u32;
+        let out_ptr = self.scratch_ptr + in_len;
+        let out_cap = response.len() as u32;
+
+        if !request.is_empty() {
+            self.memory
+                .write(&mut self.store, in_ptr as usize, request)
+                .context("write thread syscall request into kernel scratch")?;
+        }
+        let rc = self
+            .dispatch_thread
+            .call(
+                &mut self.store,
+                (
+                    method_id, caller_pid, caller_tid, in_ptr, in_len, out_ptr, out_cap,
+                ),
+            )
+            .context("kernel_dispatch_thread")?;
+        if !response.is_empty() {
+            self.memory
+                .read(&self.store, out_ptr as usize, response)
+                .context("read thread syscall response from kernel scratch")?;
         }
         Ok(rc)
     }
@@ -1706,6 +2153,23 @@ impl KernelInstance {
             .context("kernel_record_thread_exit")?;
         if rc != 0 {
             anyhow::bail!("kernel_record_thread_exit failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    pub fn record_thread_exit_authenticated(
+        &mut self,
+        pid: u32,
+        tid: u32,
+        host_thread_handle: i32,
+        exit_value: u32,
+    ) -> Result<()> {
+        let rc = self
+            .record_thread_exit_authenticated
+            .call(&mut self.store, (pid, tid, host_thread_handle, exit_value))
+            .context("kernel_record_thread_exit_authenticated")?;
+        if rc != 0 {
+            anyhow::bail!("kernel_record_thread_exit_authenticated failed: rc={rc}");
         }
         Ok(())
     }
@@ -1836,6 +2300,39 @@ impl KernelInstance {
                 ),
             )
             .context("kernel_spawn_process")
+    }
+
+    pub fn prepare_fork(&mut self, parent_pid: u32) -> Result<u32> {
+        let rc = self
+            .prepare_fork
+            .call(&mut self.store, parent_pid)
+            .context("kernel_prepare_fork")?;
+        if rc < 0 {
+            anyhow::bail!("kernel_prepare_fork failed: rc={rc}");
+        }
+        Ok(rc as u32)
+    }
+
+    pub fn commit_fork(&mut self, parent_pid: u32, child_pid: u32) -> Result<()> {
+        let rc = self
+            .commit_fork
+            .call(&mut self.store, (parent_pid, child_pid))
+            .context("kernel_commit_fork")?;
+        if rc != 0 {
+            anyhow::bail!("kernel_commit_fork failed: rc={rc}");
+        }
+        Ok(())
+    }
+
+    pub fn rollback_fork(&mut self, parent_pid: u32, child_pid: u32) -> Result<()> {
+        let rc = self
+            .rollback_fork
+            .call(&mut self.store, (parent_pid, child_pid))
+            .context("kernel_rollback_fork")?;
+        if rc != 0 {
+            anyhow::bail!("kernel_rollback_fork failed: rc={rc}");
+        }
+        Ok(())
     }
 }
 
@@ -2019,6 +2516,7 @@ impl KernelHostInterface {
             .with_context(|| format!("read kernel.wasm at {}", path.display()))?;
         let mut config = Config::new();
         config.epoch_interruption(true);
+        config.wasm_threads(true);
         let engine = Engine::new(&config).context("create wasmtime engine")?;
         let module = Module::new(&engine, &wasm).context("compile kernel.wasm")?;
 
@@ -2050,6 +2548,10 @@ impl KernelHostInterface {
             .call(&mut store, ())?;
         let dispatch = instance
             .get_typed_func::<(u32, u32, u32, u32, u32, u32), i64>(&mut store, "kernel_dispatch")?;
+        let dispatch_thread = instance.get_typed_func::<(u32, u32, u32, u32, u32, u32, u32), i64>(
+            &mut store,
+            "kernel_dispatch_thread",
+        )?;
         let list_processes =
             instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_list_processes")?;
         let list_threads =
@@ -2063,6 +2565,11 @@ impl KernelHostInterface {
             instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_detach_thread")?;
         let record_thread_exit = instance
             .get_typed_func::<(u32, u32, i32), i64>(&mut store, "kernel_record_thread_exit")?;
+        let record_thread_exit_authenticated = instance
+            .get_typed_func::<(u32, u32, i32, u32), i64>(
+                &mut store,
+                "kernel_record_thread_exit_authenticated",
+            )?;
         let block_thread =
             instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_block_thread")?;
         let unblock_thread =
@@ -2076,6 +2583,12 @@ impl KernelHostInterface {
             instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_drain_spawn")?;
         let spawn_process = instance
             .get_typed_func::<(u32, u32, u32, u32, u32), i64>(&mut store, "kernel_spawn_process")?;
+        let prepare_fork =
+            instance.get_typed_func::<u32, i64>(&mut store, "kernel_prepare_fork")?;
+        let commit_fork =
+            instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_commit_fork")?;
+        let rollback_fork =
+            instance.get_typed_func::<(u32, u32), i64>(&mut store, "kernel_rollback_fork")?;
 
         let kernel = KernelInstance {
             store,
@@ -2083,6 +2596,7 @@ impl KernelHostInterface {
             scratch_ptr,
             scratch_len,
             dispatch,
+            dispatch_thread,
             list_processes,
             list_threads,
             snapshot,
@@ -2090,6 +2604,7 @@ impl KernelHostInterface {
             spawn_thread,
             detach_thread,
             record_thread_exit,
+            record_thread_exit_authenticated,
             block_thread,
             unblock_thread,
             kill,
@@ -2097,10 +2612,23 @@ impl KernelHostInterface {
             record_exit,
             drain_spawn,
             spawn_process,
+            prepare_fork,
+            commit_fork,
+            rollback_fork,
         };
+        let kernel = Arc::new(Mutex::new(kernel));
+        {
+            let mut guard = kernel.lock().unwrap();
+            if guard.store.data().host.thread_host.is_none() {
+                guard.store.data_mut().host.thread_host = Some(Arc::new(WasmtimeThreadHost::new(
+                    engine.clone(),
+                    kernel.clone(),
+                )));
+            }
+        }
         Ok(Self {
             engine,
-            kernel: Arc::new(Mutex::new(kernel)),
+            kernel,
             process_engine,
             next_anonymous_module_id: RefCell::new(0),
         })
@@ -2114,6 +2642,20 @@ impl KernelHostInterface {
             .lock()
             .unwrap()
             .syscall(method_id, KERNEL_PID, request, response)
+    }
+
+    pub fn thread_syscall(
+        &self,
+        method_id: u32,
+        caller_pid: u32,
+        caller_tid: u32,
+        request: &[u8],
+        response: &mut [u8],
+    ) -> Result<i64> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .thread_syscall(method_id, caller_pid, caller_tid, request, response)
     }
 
     /// Return the kernel-owned process snapshot. The wasmtime adapter
@@ -2151,11 +2693,42 @@ impl KernelHostInterface {
         self.kernel.lock().unwrap().detach_thread(pid, tid)
     }
 
+    pub fn prepare_fork(&self, parent_pid: u32) -> Result<u32> {
+        self.kernel.lock().unwrap().prepare_fork(parent_pid)
+    }
+
+    pub fn commit_fork(&self, parent_pid: u32, child_pid: u32) -> Result<()> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .commit_fork(parent_pid, child_pid)
+    }
+
+    pub fn rollback_fork(&self, parent_pid: u32, child_pid: u32) -> Result<()> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .rollback_fork(parent_pid, child_pid)
+    }
+
     pub fn record_thread_exit(&self, pid: u32, tid: u32, exit_value: i32) -> Result<()> {
         self.kernel
             .lock()
             .unwrap()
             .record_thread_exit(pid, tid, exit_value)
+    }
+
+    pub fn record_thread_exit_authenticated(
+        &self,
+        pid: u32,
+        tid: u32,
+        host_thread_handle: i32,
+        exit_value: u32,
+    ) -> Result<()> {
+        self.kernel
+            .lock()
+            .unwrap()
+            .record_thread_exit_authenticated(pid, tid, host_thread_handle, exit_value)
     }
 
     pub fn block_thread(&self, pid: u32, tid: u32) -> Result<()> {
@@ -2453,13 +3026,24 @@ impl KernelHostInterface {
         let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
         let mut linker: Linker<UserState> = Linker::new(&self.engine);
         register_sys_imports(&mut linker)?;
+        register_yurt_thread_imports(&mut linker)?;
         crate::wasi_shim::add_to_linker(&mut linker)
             .context("install WASI preview1 shim on user-process linker")?;
+        let shared_memory = imported_shared_memory_type(&module)
+            .map(|ty| SharedMemory::new(&self.engine, ty))
+            .transpose()
+            .context("create imported shared memory")?;
 
+        let thread_argv = argv.clone();
+        let process_wasm = Arc::<[u8]>::from(wasm.to_vec());
         let user_state = UserState {
+            engine: self.engine.clone(),
             kernel: self.kernel.clone(),
             pid,
+            caller_tid: 1,
             argv,
+            wasm: process_wasm.clone(),
+            forced_fork_return: None,
             dir_fds: std::collections::BTreeMap::new(),
             last_exit: None,
             last_scheduler_budget_ns: None,
@@ -2467,9 +3051,24 @@ impl KernelHostInterface {
         };
         let mut store = Store::new(&self.engine, user_state);
         store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
+        if let Some(memory) = shared_memory.clone() {
+            define_imported_shared_memory(&module, &mut linker, &store, memory)?;
+        }
         let instance = linker
             .instantiate(&mut store, &module)
             .context("instantiate user-process wasm")?;
+        if let Some(thread_host) = self
+            .kernel
+            .lock()
+            .unwrap()
+            .store
+            .data()
+            .host
+            .thread_host
+            .as_ref()
+        {
+            thread_host.register_process(pid, process_wasm, thread_argv, shared_memory);
+        }
         Ok(UserProcess {
             store,
             instance,
@@ -2564,9 +3163,13 @@ fn encode_argv_records<S: AsRef<[u8]>>(argv: &[S]) -> Vec<u8> {
 /// `sys_spawn` lands and the kernel allocates pids itself, argv
 /// migrates into `Process` so it's preserved across exec.
 pub struct UserState {
+    pub engine: Engine,
     pub kernel: Arc<Mutex<KernelInstance>>,
     pub pid: u32,
+    pub caller_tid: u32,
     pub argv: Vec<Vec<u8>>,
+    pub wasm: Arc<[u8]>,
+    pub forced_fork_return: Option<i32>,
     /// fd → absolute path, populated on every successful `path_open`
     /// and cleared on `fd_close`. Used by the WASI `fd_readdir` shim
     /// to translate a directory fd back into a path it can pass to
@@ -2734,17 +3337,19 @@ impl UserProcess {
     /// `addr`. Useful for tests that want to inspect what a syscall
     /// wrote back.
     pub fn read_memory(&mut self, addr: u32, len: u32) -> Result<Vec<u8>> {
-        let memory = self
-            .instance
-            .get_memory(&mut self.store, "memory")
-            .ok_or_else(|| anyhow!("user-process missing 'memory' export"))?;
         let len =
             checked_guest_buffer_len(len).map_err(|rc| anyhow!("read_memory failed: {rc}"))?;
-        let mut buf = vec![0u8; len];
-        memory
-            .read(&self.store, addr as usize, &mut buf)
-            .context("read user-process memory")?;
-        Ok(buf)
+        if let Some(memory) = self.instance.get_memory(&mut self.store, "memory") {
+            let mut buf = vec![0u8; len];
+            memory
+                .read(&self.store, addr as usize, &mut buf)
+                .context("read user-process memory")?;
+            return Ok(buf);
+        }
+        if let Some(memory) = self.instance.get_shared_memory(&mut self.store, "memory") {
+            return read_shared_memory(memory, addr, len);
+        }
+        anyhow::bail!("user-process missing 'memory' export")
     }
 }
 
@@ -2763,6 +3368,179 @@ impl UserProcess {
 pub use yurt_kernel_host_interface_core::{trampoline_request, trampoline_request_with_response};
 
 // ── Linker registration ──────────────────────────────────────────────────────
+
+fn thread_syscall_from_user(
+    caller: &mut Caller<'_, UserState>,
+    method_id: u32,
+    request: &[u8],
+    response: &mut [u8],
+) -> i64 {
+    let kernel = caller.data().kernel.clone();
+    let pid = caller.data().pid;
+    let tid = caller.data().caller_tid;
+    let rc = match kernel
+        .lock()
+        .unwrap()
+        .thread_syscall(method_id, pid, tid, request, response)
+    {
+        Ok(rc) => rc,
+        Err(_) => -EIO,
+    };
+    rc
+}
+
+fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_spawn",
+        |mut caller: Caller<'_, UserState>, fn_ptr: i32, arg: i32| -> i32 {
+            let mut request = Vec::with_capacity(8);
+            request.extend_from_slice(&(fn_ptr as u32).to_le_bytes());
+            request.extend_from_slice(&(arg as u32).to_le_bytes());
+            thread_syscall_from_user(&mut caller, sys_method_id::THREAD_SPAWN, &request, &mut [])
+                as i32
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_self",
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            thread_syscall_from_user(&mut caller, sys_method_id::THREAD_SELF, &[], &mut []) as i32
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_join",
+        |mut caller: Caller<'_, UserState>, tid: i32, out_retval_ptr: u32| -> i32 {
+            let request = (tid as u32).to_le_bytes();
+            let mut response = [0u8; 4];
+            let mut rc = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::THREAD_JOIN,
+                &request,
+                &mut response,
+            );
+            let mut waiting_as_registered_joiner = rc == -EAGAIN;
+            while rc == -EAGAIN || (waiting_as_registered_joiner && rc == -EBUSY) {
+                thread::sleep(std::time::Duration::from_millis(1));
+                rc = thread_syscall_from_user(
+                    &mut caller,
+                    sys_method_id::THREAD_JOIN,
+                    &request,
+                    &mut response,
+                );
+                waiting_as_registered_joiner |= rc == -EAGAIN;
+            }
+            if rc != 0 {
+                return rc as i32;
+            }
+            if write_user_guest_bytes(&mut caller, out_retval_ptr, &response).is_err() {
+                return -(EFAULT as i32);
+            }
+            0
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_detach",
+        |mut caller: Caller<'_, UserState>, tid: i32| -> i32 {
+            let request = (tid as u32).to_le_bytes();
+            thread_syscall_from_user(&mut caller, sys_method_id::THREAD_DETACH, &request, &mut [])
+                as i32
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_exit",
+        |mut caller: Caller<'_, UserState>, retval: i32| -> Result<()> {
+            let request = (retval as u32).to_le_bytes();
+            let _ = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::THREAD_EXIT,
+                &request,
+                &mut [],
+            );
+            Err(anyhow!("thread exited"))
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_fork",
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            if let Some(value) = caller.data_mut().forced_fork_return.take() {
+                return value;
+            }
+
+            let parent_pid = caller.data().pid;
+            let child_pid = match caller
+                .data()
+                .kernel
+                .lock()
+                .unwrap()
+                .prepare_fork(parent_pid)
+            {
+                Ok(pid) => pid,
+                Err(_) => return -(EAGAIN as i32),
+            };
+            let memory_snapshot = match snapshot_user_memory(&mut caller) {
+                Ok(snapshot) => snapshot,
+                Err(rc) => {
+                    let _ = caller
+                        .data()
+                        .kernel
+                        .lock()
+                        .unwrap()
+                        .rollback_fork(parent_pid, child_pid);
+                    return rc as i32;
+                }
+            };
+            let engine = caller.data().engine.clone();
+            let kernel = caller.data().kernel.clone();
+            let wasm = caller.data().wasm.clone();
+            let argv = caller.data().argv.clone();
+            let mut child = match instantiate_fork_child(
+                &engine,
+                kernel.clone(),
+                child_pid,
+                wasm,
+                argv,
+                &memory_snapshot,
+            ) {
+                Ok(child) => child,
+                Err(_) => {
+                    let _ = kernel.lock().unwrap().rollback_fork(parent_pid, child_pid);
+                    return -(EAGAIN as i32);
+                }
+            };
+            if kernel
+                .lock()
+                .unwrap()
+                .commit_fork(parent_pid, child_pid)
+                .is_err()
+            {
+                let _ = kernel.lock().unwrap().rollback_fork(parent_pid, child_pid);
+                return -(EAGAIN as i32);
+            }
+            let child_exit = match child.call_run() {
+                Ok(code) => code,
+                Err(_) => child.last_exit().unwrap_or(127),
+            };
+            let record_exit_result = kernel.lock().unwrap().record_exit(child_pid, child_exit);
+            if !matches!(record_exit_result, Ok(0)) {
+                return -(EIO as i32);
+            }
+            child_pid as i32
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_thread_yield",
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            thread_syscall_from_user(&mut caller, sys_method_id::THREAD_YIELD, &[], &mut []) as i32
+        },
+    )?;
+    Ok(())
+}
 
 /// Read a kernel-supplied path slice out of kernel.wasm memory.
 /// Returns the bytes verbatim — no rooting, no canonicalization;
@@ -3608,6 +4386,36 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             -ENOSYS
         },
     )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_thread_spawn",
+        |caller: Caller<'_, KernelStoreData>, pid: u32, tid: u32, fn_ptr: u32, arg: u32| {
+            let Some(thread_host) = caller.data().host.thread_host.as_ref() else {
+                return -ENOSYS as i32;
+            };
+            thread_host.spawn(pid, tid, fn_ptr, arg)
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_thread_release",
+        |caller: Caller<'_, KernelStoreData>, host_thread_handle: i32| {
+            let Some(thread_host) = caller.data().host.thread_host.as_ref() else {
+                return 0_i32;
+            };
+            thread_host.release(host_thread_handle)
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_thread_cancel",
+        |caller: Caller<'_, KernelStoreData>, host_thread_handle: i32| {
+            let Some(thread_host) = caller.data().host.thread_host.as_ref() else {
+                return 0_i32;
+            };
+            thread_host.cancel(host_thread_handle)
+        },
+    )?;
 
     Ok(())
 }
@@ -3873,6 +4681,34 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             ) as i32
         },
     )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_dup_min",
+        |mut caller: Caller<'_, UserState>, oldfd: i32, minfd: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(oldfd as u32).to_le_bytes());
+            req.extend_from_slice(&(minfd as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::DUP_MIN,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_set_fd_descriptor_flags",
+        |mut caller: Caller<'_, UserState>, fd: i32, flags: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&(flags as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SET_FD_DESCRIPTOR_FLAGS,
+                &req,
+            ) as i32
+        },
+    )?;
     // POSIX `pipe(int fd[2])`: caller provides a 2-int buffer, kernel
     // fills (read_fd, write_fd). Returns 0 on success / negated errno.
     linker.func_wrap(
@@ -3993,6 +4829,84 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
+        "sys_tcgetpgrp",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::TCGETPGRP,
+                fd as u32,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_tcsetpgrp",
+        |mut caller: Caller<'_, UserState>, fd: i32, pgid: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&(pgid as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::TCSETPGRP,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_tcgetattr",
+        |mut caller: Caller<'_, UserState>, fd: i32, out_ptr: u32, out_cap: u32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::TCGETATTR,
+                &req,
+                out_ptr,
+                out_cap,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_tcsetattr",
+        |mut caller: Caller<'_, UserState>, fd: i32, actions: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&(actions as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::TCSETATTR,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_winsize",
+        |mut caller: Caller<'_, UserState>, fd: i32, out_ptr: u32, out_cap: u32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::WINSIZE,
+                &req,
+                out_ptr,
+                out_cap,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_tiocsctty",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::TIOCSCTTY,
+                fd as u32,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
         "sys_clock_gettime",
         |mut caller: Caller<'_, UserState>, clock_id: i32, out_ptr: u32| -> i32 {
             let req = (clock_id as u32).to_le_bytes();
@@ -4073,6 +4987,20 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
+        "sys_killpg",
+        |mut caller: Caller<'_, UserState>, pgid: i32, sig: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(pgid as u32).to_le_bytes());
+            req.extend_from_slice(&(sig as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::KILLPG,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
         "sys_sigaction",
         |mut caller: Caller<'_, UserState>, sig: i32, disposition: i32| -> i32 {
             let mut req = Vec::with_capacity(8);
@@ -4143,6 +5071,41 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::SCHED_SETPARAM,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_sched_getaffinity",
+        |mut caller: Caller<'_, UserState>, pid: i32, mask_ptr: u32, cpusetsize: u32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(pid as u32).to_le_bytes());
+            req.extend_from_slice(&cpusetsize.to_le_bytes());
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SCHED_GETAFFINITY,
+                &req,
+                mask_ptr,
+                cpusetsize,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_sched_setaffinity",
+        |mut caller: Caller<'_, UserState>, pid: i32, mask_ptr: u32, cpusetsize: u32| -> i32 {
+            let mask = match read_user_guest_bytes(&mut caller, mask_ptr, cpusetsize) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let mut req = Vec::with_capacity(8 + mask.len());
+            req.extend_from_slice(&(pid as u32).to_le_bytes());
+            req.extend_from_slice(&cpusetsize.to_le_bytes());
+            req.extend_from_slice(&mask);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SCHED_SETAFFINITY,
                 &req,
             ) as i32
         },
@@ -4265,6 +5228,32 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::CHOWN,
                 &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_fchown",
+        |mut caller: Caller<'_, UserState>, fd: i32, uid: i32, gid: i32| -> i32 {
+            let mut req = Vec::with_capacity(12);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&(uid as u32).to_le_bytes());
+            req.extend_from_slice(&(gid as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::FCHOWN,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_fchdir",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::FCHDIR,
+                fd as u32,
             ) as i32
         },
     )?;
@@ -4657,6 +5646,28 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::SOCKET_BIND,
+                &req,
+            ) as i32
+        },
+    )?;
+
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_socket_option",
+        |mut caller: Caller<'_, UserState>,
+         fd: i32,
+         option: i32,
+         has_value: i32,
+         value: i32|
+         -> i32 {
+            let mut req = Vec::with_capacity(16);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&(option as u32).to_le_bytes());
+            req.extend_from_slice(&(has_value as u32).to_le_bytes());
+            req.extend_from_slice(&value.to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SOCKET_OPTION,
                 &req,
             ) as i32
         },
@@ -5092,5 +6103,14 @@ mod tests {
         let cap = fetch_executor_queue_capacity_for_tests();
         assert!(cap > 0);
         assert!(cap <= 128);
+    }
+
+    #[test]
+    fn thread_release_never_joins_current_thread() {
+        assert!(!should_join_thread(thread::current().id()));
+
+        let join = thread::spawn(thread::current);
+        let spawned_id = join.join().unwrap().id();
+        assert!(should_join_thread(spawned_id));
     }
 }

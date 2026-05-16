@@ -126,9 +126,17 @@ doc = "File exists."
 value = 20
 doc = "Not a directory."
 
+[errno.EISDIR]
+value = 21
+doc = "Is a directory."
+
 [errno.EINVAL]
 value = 22
 doc = "Invalid argument."
+
+[errno.ENOTTY]
+value = 25
+doc = "Inappropriate ioctl for device."
 
 [errno.EOVERFLOW]
 value = 75
@@ -341,6 +349,115 @@ args = [
   { name = "out_cap", type = "usize" },
 ]
 
+[import.host_dup_min]
+doc = "Duplicate a file descriptor into the lowest free fd >= min_fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "min_fd", type = "i32" },
+]
+
+[import.host_set_fd_descriptor_flags]
+doc = "Set POSIX descriptor flags such as FD_CLOEXEC for an open fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "flags", type = "i32" },
+]
+
+[import.host_tcgetpgrp]
+doc = "Return the foreground process group for the terminal on fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+]
+
+[import.host_tcsetpgrp]
+doc = "Set the foreground process group for the terminal on fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "pgid", type = "i32" },
+]
+
+[import.host_tcgetattr]
+doc = "Write the minimal musl wasm32 termios record for a terminal fd."
+return = "fixed_out"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_tcsetattr]
+doc = "Accept terminal attribute changes for a terminal fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "actions", type = "i32" },
+  { name = "termios_ptr", type = "ptr" },
+]
+
+[import.host_winsize]
+doc = "Write struct winsize { rows, cols, xpixel, ypixel } for a terminal fd."
+return = "fixed_out"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_tiocsctty]
+doc = "Register fd as the caller's controlling terminal."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+]
+
+[import.host_chown]
+doc = "Change sandbox-visible path ownership metadata."
+return = "scalar_errno"
+args = [
+  { name = "path_ptr", type = "ptr" },
+  { name = "path_len", type = "usize" },
+  { name = "uid", type = "uid" },
+  { name = "gid", type = "gid" },
+]
+
+[import.host_fchown]
+doc = "Change sandbox-visible ownership metadata for an open file descriptor."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "uid", type = "uid" },
+  { name = "gid", type = "gid" },
+]
+
+[import.host_fchdir]
+doc = "Change the caller's working directory to an open directory fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+]
+
+[import.host_sched_getaffinity]
+doc = "Write the process CPU affinity mask. Yurt currently exposes a single CPU, bit 0."
+return = "fixed_out"
+args = [
+  { name = "pid", type = "pid" },
+  { name = "mask_ptr", type = "ptr" },
+  { name = "cpusetsize", type = "usize" },
+]
+
+[import.host_sched_setaffinity]
+doc = "Validate the process CPU affinity mask. Yurt currently accepts only CPU 0."
+return = "scalar_errno"
+args = [
+  { name = "pid", type = "pid" },
+  { name = "mask_ptr", type = "ptr" },
+  { name = "cpusetsize", type = "usize" },
+]
+
 [import.host_spawn]
 doc = "Spawn a guest process from a native spawn request record and write yurt_spawn_result_v1."
 return = "fixed_out"
@@ -360,6 +477,11 @@ args = [
   { name = "out_ptr", type = "ptr" },
   { name = "out_cap", type = "usize" },
 ]
+
+[import.host_fork]
+doc = "Continuation-only process fork hook. Hosts without continuation snapshot support return -ENOSYS."
+return = "scalar_errno"
+args = []
 
 [import.host_read_fd]
 doc = "Read up to out_cap bytes from fd into guest memory. Partial success is allowed."

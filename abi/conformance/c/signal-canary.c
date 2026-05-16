@@ -1,6 +1,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,10 @@
 #ifndef SA_NODEFER
 #error "SA_NODEFER must be available for POSIX signal consumers"
 #endif
+
+_Static_assert(offsetof(siginfo_t, si_pid) > offsetof(siginfo_t, si_code), "siginfo_t exposes si_pid");
+_Static_assert(offsetof(siginfo_t, si_uid) > offsetof(siginfo_t, si_pid), "siginfo_t exposes si_uid");
+_Static_assert(offsetof(siginfo_t, si_status) > offsetof(siginfo_t, si_uid), "siginfo_t exposes si_status");
 
 static int signal_canary_seen = 0;
 static int signal_canary_suspend_seen = 0;

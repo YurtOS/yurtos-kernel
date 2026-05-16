@@ -14,6 +14,7 @@ use wasmtime::{Engine, Module};
 use yurt_runtime_wasmtime::kernel_host_interface::{
     build_kernel_wasm, default_kernel_wasm_path, ExtensionRegistry, HostState, InMemoryHostFs,
     InMemoryKv, KernelHostInterface, KvBackend, LogSink, NativeHostFs, NativeTcpSocket, RedbKv,
+    ThreadHost,
 };
 
 /// Build kernel.wasm exactly once across all parallel tests. Without
@@ -123,7 +124,9 @@ fn sockaddr_in_bytes(host: [u8; 4], port: u16) -> [u8; 16] {
 }
 
 const ENOSYS: i64 = 38;
+const EFAULT: i64 = 14;
 const EACCES: i64 = 13;
+const EPERM: i64 = 1;
 const EINVAL: i32 = 22;
 const METHOD_ECHO: u32 = 1;
 const METHOD_NOW_REALTIME: u32 = 2;
@@ -143,6 +146,14 @@ const METHOD_SYS_SETRLIMIT: u32 = 0x1_000D;
 const METHOD_SYS_CLOSE: u32 = 0x1_000E;
 const METHOD_SYS_DUP: u32 = 0x1_000F;
 const METHOD_SYS_DUP2: u32 = 0x1_0011;
+const METHOD_SYS_DUP_MIN: u32 = 0x1_0054;
+const METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS: u32 = 0x1_0055;
+const METHOD_SYS_TCGETPGRP: u32 = 0x1_0056;
+const METHOD_SYS_TCSETPGRP: u32 = 0x1_0057;
+const METHOD_SYS_TCGETATTR: u32 = 0x1_0058;
+const METHOD_SYS_TCSETATTR: u32 = 0x1_0059;
+const METHOD_SYS_WINSIZE: u32 = 0x1_005A;
+const METHOD_SYS_TIOCSCTTY: u32 = 0x1_005B;
 const METHOD_SYS_PIPE: u32 = 0x1_0012;
 const METHOD_SYS_READ: u32 = 0x1_0013;
 const METHOD_SYS_WRITE: u32 = 0x1_0014;
@@ -153,6 +164,7 @@ const METHOD_SYS_SETPGID: u32 = 0x1_0018;
 const METHOD_SYS_GETSID: u32 = 0x1_0019;
 const METHOD_SYS_SETSID: u32 = 0x1_001A;
 const METHOD_SYS_KILL: u32 = 0x1_001B;
+const METHOD_SYS_KILLPG: u32 = 0x1_0053;
 const METHOD_SYS_SIGACTION: u32 = 0x1_001C;
 const METHOD_SYS_SCHED_YIELD: u32 = 0x1_001D;
 const METHOD_SYS_NANOSLEEP: u32 = 0x1_001E;
@@ -191,6 +203,10 @@ const METHOD_SYS_SCHED_GETSCHEDULER: u32 = 0x1_003F;
 const METHOD_SYS_SCHED_GETPARAM: u32 = 0x1_0040;
 const METHOD_SYS_SCHED_SETSCHEDULER: u32 = 0x1_0041;
 const METHOD_SYS_SCHED_SETPARAM: u32 = 0x1_0042;
+const METHOD_SYS_SCHED_GETAFFINITY: u32 = 0x1_005C;
+const METHOD_SYS_SCHED_SETAFFINITY: u32 = 0x1_005D;
+const METHOD_SYS_FCHOWN: u32 = 0x1_005E;
+const METHOD_SYS_FCHDIR: u32 = 0x1_005F;
 const METHOD_SYS_POLL: u32 = 0x1_0043;
 const METHOD_SYS_SOCKETPAIR: u32 = 0x1_0044;
 const METHOD_SYS_SOCKET_OPEN: u32 = 0x1_0045;
@@ -200,6 +216,7 @@ const METHOD_SYS_SOCKET_SENDMSG: u32 = 0x1_0048;
 const METHOD_SYS_SOCKET_RECVMSG: u32 = 0x1_0049;
 const METHOD_SYS_SOCKET_INFO: u32 = 0x1_004A;
 const METHOD_SYS_SOCKET_RECVFROM: u32 = 0x1_004B;
+const METHOD_SYS_SOCKET_OPTION: u32 = 0x1_004C;
 const METHOD_KERNEL_LOG_TEST: u32 = 3;
 const METHOD_SYS_EXTENSION_INVOKE: u32 = 0x1_0010;
 
@@ -234,14 +251,19 @@ fn kernel_wasm_export_surface_is_locked() {
         exports,
         vec![
             "kernel_block_thread",
+            "kernel_commit_fork",
             "kernel_detach_thread",
             "kernel_dispatch",
+            "kernel_dispatch_thread",
             "kernel_drain_spawn",
             "kernel_kill",
             "kernel_list_processes",
             "kernel_list_threads",
+            "kernel_prepare_fork",
             "kernel_record_exit",
             "kernel_record_thread_exit",
+            "kernel_record_thread_exit_authenticated",
+            "kernel_rollback_fork",
             "kernel_schedule_next",
             "kernel_scratch_len",
             "kernel_scratch_ptr",
@@ -310,7 +332,12 @@ fn wasmtime_adapter_lists_kernel_owned_thread_snapshot() {
 
 #[test]
 fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
-    let mk = fresh_kernel_host_interface(0);
+    let thread_host = Arc::new(RecordingThreadHost::default());
+    let host = HostState {
+        thread_host: Some(thread_host.clone()),
+        ..HostState::default()
+    };
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
     let module = wat::parse_str(
         r#"
         (module
@@ -341,6 +368,216 @@ fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
     mk.detach_thread(proc.pid(), tid).unwrap();
     mk.record_thread_exit(proc.pid(), tid, 123).unwrap();
 
+    let tombstone = mk
+        .list_threads(proc.pid())
+        .unwrap()
+        .into_iter()
+        .find(|thread| thread.tid == tid)
+        .expect("detached exited thread remains as POSIX tombstone");
+    assert_eq!(tombstone.state, "exited");
+    assert!(tombstone.detached);
+    assert_eq!(tombstone.exit_value, Some(123));
+    assert_eq!(tombstone.host_thread_handle, None);
+    assert_eq!(thread_host.releases.lock().unwrap().as_slice(), &[91]);
+}
+
+#[derive(Default)]
+struct RecordingThreadHost {
+    spawns: Mutex<Vec<(u32, u32, u32, u32)>>,
+    releases: Mutex<Vec<i32>>,
+    cancels: Mutex<Vec<i32>>,
+}
+
+impl ThreadHost for RecordingThreadHost {
+    fn spawn(&self, pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32 {
+        self.spawns.lock().unwrap().push((pid, tid, fn_ptr, arg));
+        77
+    }
+
+    fn release(&self, host_thread_handle: i32) -> i32 {
+        self.releases.lock().unwrap().push(host_thread_handle);
+        0
+    }
+
+    fn cancel(&self, host_thread_handle: i32) -> i32 {
+        self.cancels.lock().unwrap().push(host_thread_handle);
+        0
+    }
+}
+
+#[test]
+fn wasmtime_thread_host_callbacks_execute_rust_owned_spawn_and_release() {
+    const METHOD_SYS_THREAD_SPAWN: u32 = 0x1_004D;
+    const METHOD_SYS_THREAD_JOIN: u32 = 0x1_004F;
+
+    let thread_host = Arc::new(RecordingThreadHost::default());
+    let host = HostState {
+        thread_host: Some(thread_host.clone()),
+        ..HostState::default()
+    };
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), host).unwrap();
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 7))
+        "#,
+    )
+    .unwrap();
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+
+    let mut spawn_req = Vec::new();
+    spawn_req.extend_from_slice(&123_u32.to_le_bytes());
+    spawn_req.extend_from_slice(&456_u32.to_le_bytes());
+    let rc = mk
+        .thread_syscall(METHOD_SYS_THREAD_SPAWN, proc.pid(), 1, &spawn_req, &mut [])
+        .unwrap();
+    assert_eq!(rc, 2);
+    assert_eq!(
+        thread_host.spawns.lock().unwrap().as_slice(),
+        &[(proc.pid(), 2, 123, 456)]
+    );
+    let spawned = mk
+        .list_threads(proc.pid())
+        .unwrap()
+        .into_iter()
+        .find(|thread| thread.tid == 2)
+        .unwrap();
+    assert_eq!(spawned.host_thread_handle, Some(77));
+
+    mk.record_thread_exit(proc.pid(), 2, 0x1234).unwrap();
+    let mut join_req = Vec::new();
+    join_req.extend_from_slice(&2_u32.to_le_bytes());
+    let mut join_out = [0u8; 4];
+    let rc = mk
+        .thread_syscall(
+            METHOD_SYS_THREAD_JOIN,
+            proc.pid(),
+            1,
+            &join_req,
+            &mut join_out,
+        )
+        .unwrap();
+    assert_eq!(rc, 0);
+    assert_eq!(u32::from_le_bytes(join_out), 0x1234);
+    assert_eq!(thread_host.releases.lock().unwrap().as_slice(), &[77]);
+}
+
+#[test]
+fn wasmtime_default_thread_host_executes_spawned_user_thread() {
+    let mk = fresh_kernel_host_interface(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (import "yurt" "host_thread_spawn" (func $spawn (param i32 i32) (result i32)))
+          (import "yurt" "host_thread_join" (func $join (param i32 i32) (result i32)))
+          (import "yurt" "host_thread_self" (func $self (result i32)))
+          (memory (export "memory") 1)
+          (global $tid (mut i32) (i32.const 0))
+          (func $worker (param i32) (result i32)
+            call $self
+            drop
+            local.get 0)
+          (table (export "__indirect_function_table") 1 funcref)
+          (elem (i32.const 0) $worker)
+          (func (export "run") (result i32)
+            i32.const 0
+            i32.const 0x80000001
+            call $spawn
+            global.set $tid
+            global.get $tid
+            i32.const 4
+            call $join))
+        "#,
+    )
+    .unwrap();
+    let mut proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+
+    assert_eq!(proc.call_run().unwrap(), 0);
+    assert_eq!(
+        u32::from_le_bytes(proc.read_memory(4, 4).unwrap().try_into().unwrap()),
+        0x8000_0001
+    );
+    assert!(mk
+        .list_threads(proc.pid())
+        .unwrap()
+        .into_iter()
+        .all(|thread| thread.tid != 2));
+}
+
+#[test]
+fn wasmtime_threads_share_imported_shared_memory() {
+    let mk = fresh_kernel_host_interface(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (import "env" "memory" (memory 1 1 shared))
+          (import "yurt" "host_thread_spawn" (func $spawn (param i32 i32) (result i32)))
+          (import "yurt" "host_thread_join" (func $join (param i32 i32) (result i32)))
+          (export "memory" (memory 0))
+          (global $tid (mut i32) (i32.const 0))
+          (func $worker (param i32) (result i32)
+            local.get 0
+            i32.const 0x12345678
+            i32.store
+            i32.const 0x80000002)
+          (table (export "__indirect_function_table") 1 funcref)
+          (elem (i32.const 0) $worker)
+          (func (export "run") (result i32)
+            i32.const 0
+            i32.const 8
+            call $spawn
+            global.set $tid
+            global.get $tid
+            i32.const 4
+            call $join))
+        "#,
+    )
+    .unwrap();
+    let mut proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+
+    assert_eq!(proc.call_run().unwrap(), 0);
+    assert_eq!(
+        u32::from_le_bytes(proc.read_memory(4, 4).unwrap().try_into().unwrap()),
+        0x8000_0002
+    );
+    assert_eq!(
+        u32::from_le_bytes(proc.read_memory(8, 4).unwrap().try_into().unwrap()),
+        0x1234_5678
+    );
+}
+
+#[test]
+fn wasmtime_adapter_authenticates_thread_exit_handle() {
+    let mk = fresh_kernel_host_interface(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 7))
+        "#,
+    )
+    .unwrap();
+
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+    let tid = mk.spawn_thread(proc.pid(), 91).unwrap();
+
+    assert!(mk
+        .record_thread_exit_authenticated(proc.pid(), tid, 92, 123)
+        .is_err());
+    mk.record_thread_exit_authenticated(proc.pid(), tid, 91, 123)
+        .unwrap();
+
     let exited = mk
         .list_threads(proc.pid())
         .unwrap()
@@ -348,7 +585,6 @@ fn wasmtime_adapter_mutates_kernel_owned_thread_lifecycle() {
         .find(|thread| thread.tid == tid)
         .unwrap();
     assert_eq!(exited.state, "exited");
-    assert!(exited.detached);
     assert_eq!(exited.exit_value, Some(123));
 }
 
@@ -600,6 +836,9 @@ fn kernel_wasm_imports_match_documented_namespaces() {
             "kh_socket_recv",
             "kh_socket_send",
             "kh_spawn_process",
+            "kh_thread_cancel",
+            "kh_thread_release",
+            "kh_thread_spawn",
         ],
         "documented kh_* surface"
     );
@@ -1624,9 +1863,9 @@ fn redb_kv_rejects_non_utf8_store_names_without_fallback_collision() {
     let db_path = dir.join("kv.redb");
 
     let kv = RedbKv::open(db_path).unwrap();
-    assert_eq!(kv.put(b"\xff", b"k", b"bad"), -(EINVAL as i32));
-    assert_eq!(kv.get(b"\xff", b"k").unwrap_err(), -(EINVAL as i32));
-    assert_eq!(kv.delete(b"\xff", b"k"), -(EINVAL as i32));
+    assert_eq!(kv.put(b"\xff", b"k", b"bad"), -EINVAL);
+    assert_eq!(kv.get(b"\xff", b"k").unwrap_err(), -EINVAL);
+    assert_eq!(kv.delete(b"\xff", b"k"), -EINVAL);
     assert!(kv.list(b"\xff", b"").is_empty());
 
     let _ = fs::remove_dir_all(&dir);
@@ -2221,6 +2460,72 @@ fn user_process_calls_kernel_through_full_trampoline() {
 }
 
 #[test]
+fn host_fork_without_exported_memory_returns_efault() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+
+    let user_wat = r#"
+        (module
+          (import "yurt" "host_fork" (func $host_fork (result i32)))
+          (func (export "run") (result i32)
+            (call $host_fork)))
+    "#;
+    let user_wasm = wat::parse_str(user_wat).unwrap();
+    let mut user = mk.spawn_user_process(&user_wasm).unwrap();
+
+    let rc = user.call_run().unwrap();
+    assert_eq!(
+        rc,
+        -(EFAULT as i32),
+        "host_fork requires exported process memory to snapshot"
+    );
+}
+
+#[test]
+fn wasmtime_host_fork_returns_child_pid_to_parent_and_runs_child_with_zero() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+
+    let user_wat = r#"
+        (module
+          (import "yurt" "host_fork" (func $host_fork (result i32)))
+          (import "env" "sys_getpid" (func $getpid (result i32)))
+          (import "env" "sys_getppid" (func $getppid (result i32)))
+          (import "env" "sys_wait" (func $wait (param i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            (local $fork i32)
+            (local $wait_rc i32)
+            (local.set $fork (call $host_fork))
+            (if (i32.eqz (local.get $fork))
+              (then
+                (if (i32.ne (call $getppid) (i32.const 1))
+                  (then (return (i32.const -10))))
+                (i32.store (i32.const 0) (call $getpid))
+                (return (i32.const 0))))
+            (if (i32.le_s (local.get $fork) (i32.const 1))
+              (then (return (local.get $fork))))
+            (local.set $wait_rc
+              (call $wait
+                (local.get $fork)
+                (i32.const 0)
+                (i32.const 0)))
+            (if (i32.ne (local.get $wait_rc) (i32.const 8))
+              (then (return (local.get $wait_rc))))
+            (if (i32.ne (i32.load (i32.const 0)) (local.get $fork))
+              (then (return (i32.const -11))))
+            (if (i32.ne (i32.load (i32.const 4)) (i32.const 0))
+              (then (return (i32.const -12))))
+            (local.get $fork))
+        )
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    let reaped_child_pid = user.call_run().unwrap();
+    assert_eq!(reaped_child_pid, 2);
+}
+
+#[test]
 fn kernel_host_interface_direct_syscall_uses_kernel_pid_zero() {
     // KernelHostInterface-owned syscalls (no user process in flight) see the
     // kernel as their caller — pid 0. sys_getpid via dispatch
@@ -2369,6 +2674,16 @@ fn user_process_chdir_then_getcwd_round_trip() {
     assert_eq!(initial, 2);
 
     // chdir then getcwd.
+    assert_eq!(
+        mk.syscall_as(user.pid(), METHOD_SYS_MKDIR, b"/srv", &mut [])
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        mk.syscall_as(user.pid(), METHOD_SYS_MKDIR, b"/srv/yurt", &mut [])
+            .unwrap(),
+        0
+    );
     assert_eq!(user.call_export_i32("set").unwrap(), 0);
     let n = user.call_export_i32("get").unwrap();
     assert_eq!(n, 10, "/srv/yurt + NUL");
@@ -2660,6 +2975,60 @@ fn wasmtime_registers_new_af_unix_socket_syscalls() {
 }
 
 #[test]
+fn user_process_socket_option_round_trips_through_kernel() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_socket_open" (func $open (param i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_option"
+            (func $socket_option (param i32 i32 i32 i32) (result i32)))
+          (global $fd (mut i32) (i32.const -1))
+          (func (export "open") (result i32)
+            (global.set $fd (call $open (i32.const 2) (i32.const 1) (i32.const 0)))
+            (global.get $fd))
+          (func (export "get_initial") (result i32)
+            (call $socket_option
+              (global.get $fd)
+              (i32.const 1)
+              (i32.const 0)
+              (i32.const 0)))
+          (func (export "set_enabled") (result i32)
+            (call $socket_option
+              (global.get $fd)
+              (i32.const 1)
+              (i32.const 1)
+              (i32.const 1)))
+          (func (export "get_enabled") (result i32)
+            (call $socket_option
+              (global.get $fd)
+              (i32.const 1)
+              (i32.const 0)
+              (i32.const 0)))
+          (func (export "set_linger_advisory") (result i32)
+            (call $socket_option
+              (global.get $fd)
+              (i32.const 13)
+              (i32.const 1)
+              (i32.const 0)))
+          (func (export "get_linger_unsupported") (result i32)
+            (call $socket_option
+              (global.get $fd)
+              (i32.const 13)
+              (i32.const 0)
+              (i32.const 0))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+    assert_eq!(user.call_export_i32("open").unwrap(), 3);
+    assert_eq!(user.call_export_i32("get_initial").unwrap(), 0);
+    assert_eq!(user.call_export_i32("set_enabled").unwrap(), 0);
+    assert_eq!(user.call_export_i32("get_enabled").unwrap(), 1);
+    assert_eq!(user.call_export_i32("set_linger_advisory").unwrap(), 0);
+    assert_eq!(user.call_export_i32("get_linger_unsupported").unwrap(), -95);
+}
+
+#[test]
 fn wasmtime_registers_all_vfs_process_syscall_imports() {
     let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
     let user_wat = r#"
@@ -2736,11 +3105,18 @@ fn user_process_fd_table_dup_close_lifecycle() {
         (module
           (import "env" "sys_dup"   (func $dup   (param i32) (result i32)))
           (import "env" "sys_dup2"  (func $dup2  (param i32 i32) (result i32)))
+          (import "env" "sys_dup_min"  (func $dup_min  (param i32 i32) (result i32)))
+          (import "env" "sys_set_fd_descriptor_flags"
+            (func $set_fd_descriptor_flags (param i32 i32) (result i32)))
           (import "env" "sys_close" (func $close (param i32) (result i32)))
           (func (export "dup_stdout") (result i32) (call $dup (i32.const 1)))
           (func (export "dup_unopened") (result i32) (call $dup (i32.const 99)))
           (func (export "dup2_into_50") (result i32)
             (call $dup2 (i32.const 1) (i32.const 50)))
+          (func (export "dup_min_10") (result i32)
+            (call $dup_min (i32.const 1) (i32.const 10)))
+          (func (export "set_cloexec_10") (result i32)
+            (call $set_fd_descriptor_flags (i32.const 10) (i32.const 1)))
           (func (export "close_50") (result i32) (call $close (i32.const 50)))
           (func (export "close_50_again") (result i32) (call $close (i32.const 50)))
           (func (export "close_3") (result i32) (call $close (i32.const 3))))
@@ -2755,6 +3131,9 @@ fn user_process_fd_table_dup_close_lifecycle() {
     assert_eq!(user.call_export_i32("dup_unopened").unwrap(), -9);
     // Dup2 to an arbitrary high fd.
     assert_eq!(user.call_export_i32("dup2_into_50").unwrap(), 50);
+    // F_DUPFD-style duplicate at or above a floor, then set FD_CLOEXEC.
+    assert_eq!(user.call_export_i32("dup_min_10").unwrap(), 10);
+    assert_eq!(user.call_export_i32("set_cloexec_10").unwrap(), 0);
     // Close the high fd; second close fails -EBADF.
     assert_eq!(user.call_export_i32("close_50").unwrap(), 0);
     assert_eq!(user.call_export_i32("close_50_again").unwrap(), -9);
@@ -2940,14 +3319,56 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_SCHED_SETPARAM,
             METHOD_SYS_SCHED_SETPARAM as i64,
         ),
+        (
+            "sys_sched_getaffinity",
+            METHOD_SYS_SCHED_GETAFFINITY,
+            METHOD_SYS_SCHED_GETAFFINITY as i64,
+        ),
+        (
+            "sys_sched_setaffinity",
+            METHOD_SYS_SCHED_SETAFFINITY,
+            METHOD_SYS_SCHED_SETAFFINITY as i64,
+        ),
         ("sys_poll", METHOD_SYS_POLL, METHOD_SYS_POLL as i64),
         ("sys_close", METHOD_SYS_CLOSE, METHOD_SYS_CLOSE as i64),
         ("sys_dup", METHOD_SYS_DUP, METHOD_SYS_DUP as i64),
         ("sys_dup2", METHOD_SYS_DUP2, METHOD_SYS_DUP2 as i64),
+        ("sys_dup_min", METHOD_SYS_DUP_MIN, METHOD_SYS_DUP_MIN as i64),
+        (
+            "sys_set_fd_descriptor_flags",
+            METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS,
+            METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS as i64,
+        ),
         ("sys_pipe", METHOD_SYS_PIPE, METHOD_SYS_PIPE as i64),
         ("sys_read", METHOD_SYS_READ, METHOD_SYS_READ as i64),
         ("sys_write", METHOD_SYS_WRITE, METHOD_SYS_WRITE as i64),
         ("sys_isatty", METHOD_SYS_ISATTY, METHOD_SYS_ISATTY as i64),
+        (
+            "sys_tcgetpgrp",
+            METHOD_SYS_TCGETPGRP,
+            METHOD_SYS_TCGETPGRP as i64,
+        ),
+        (
+            "sys_tcsetpgrp",
+            METHOD_SYS_TCSETPGRP,
+            METHOD_SYS_TCSETPGRP as i64,
+        ),
+        (
+            "sys_tcgetattr",
+            METHOD_SYS_TCGETATTR,
+            METHOD_SYS_TCGETATTR as i64,
+        ),
+        (
+            "sys_tcsetattr",
+            METHOD_SYS_TCSETATTR,
+            METHOD_SYS_TCSETATTR as i64,
+        ),
+        ("sys_winsize", METHOD_SYS_WINSIZE, METHOD_SYS_WINSIZE as i64),
+        (
+            "sys_tiocsctty",
+            METHOD_SYS_TIOCSCTTY,
+            METHOD_SYS_TIOCSCTTY as i64,
+        ),
         (
             "sys_clock_gettime",
             METHOD_SYS_CLOCK_GETTIME,
@@ -2963,6 +3384,7 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
         ("sys_getsid", METHOD_SYS_GETSID, METHOD_SYS_GETSID as i64),
         ("sys_setsid", METHOD_SYS_SETSID, METHOD_SYS_SETSID as i64),
         ("sys_kill", METHOD_SYS_KILL, METHOD_SYS_KILL as i64),
+        ("sys_killpg", METHOD_SYS_KILLPG, METHOD_SYS_KILLPG as i64),
         (
             "sys_sigaction",
             METHOD_SYS_SIGACTION,
@@ -2983,6 +3405,8 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
         ("sys_fstat", METHOD_SYS_FSTAT, METHOD_SYS_FSTAT as i64),
         ("sys_chmod", METHOD_SYS_CHMOD, METHOD_SYS_CHMOD as i64),
         ("sys_chown", METHOD_SYS_CHOWN, METHOD_SYS_CHOWN as i64),
+        ("sys_fchown", METHOD_SYS_FCHOWN, METHOD_SYS_FCHOWN as i64),
+        ("sys_fchdir", METHOD_SYS_FCHDIR, METHOD_SYS_FCHDIR as i64),
         ("sys_utimens", METHOD_SYS_UTIMENS, METHOD_SYS_UTIMENS as i64),
         ("sys_unlink", METHOD_SYS_UNLINK, METHOD_SYS_UNLINK as i64),
         ("sys_stat", METHOD_SYS_STAT, METHOD_SYS_STAT as i64),
@@ -3073,6 +3497,11 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_SOCKET_RECVFROM as i64,
         ),
         (
+            "sys_socket_option",
+            METHOD_SYS_SOCKET_OPTION,
+            METHOD_SYS_SOCKET_OPTION as i64,
+        ),
+        (
             "sys_socketpair",
             METHOD_SYS_SOCKETPAIR,
             METHOD_SYS_SOCKETPAIR as i64,
@@ -3092,37 +3521,100 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
 #[test]
 fn process_group_and_session_round_trip_through_trampoline() {
     // Exercises the pgid/sid family end-to-end:
-    //   (1) getpgid(target=42) lazily primes pgid to the target pid,
-    //   (2) setpgid(target=42, pgid=99) reassigns,
-    //   (3) getsid(target=42) lazily primes sid to the target pid.
-    // KERNEL_PID is the caller for direct .syscall() calls, so we use
-    // an explicit non-zero target pid throughout.
+    //   (1) getpgid(target) lazily primes pgid to the target pid,
+    //   (2) setpgid rejects a missing/cross-session group,
+    //   (3) setpgid(target, pgid=0) keeps the target as group leader,
+    //   (4) getsid(target) lazily primes sid to the target pid.
     let mk = fresh_kernel_host_interface(0);
-
-    // Default getpgid(42) → 42.
-    let rc = mk
-        .syscall(METHOD_SYS_GETPGID, &42_u32.to_le_bytes(), &mut [])
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 0))
+        "#,
+    )
+    .unwrap();
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/pgid".as_slice()])
         .unwrap();
-    assert_eq!(rc, 42, "lazy getpgid primes to target pid");
+    let target_pid = proc.pid();
 
-    // setpgid(42, 99).
+    // Default getpgid(target) → target pid.
+    let rc = mk
+        .syscall(METHOD_SYS_GETPGID, &target_pid.to_le_bytes(), &mut [])
+        .unwrap();
+    assert_eq!(rc, target_pid as i64, "lazy getpgid primes to target pid");
+
+    // setpgid(target, 99) rejects a process group that does not exist in
+    // the target's session.
     let mut req = Vec::new();
-    req.extend_from_slice(&42_u32.to_le_bytes());
+    req.extend_from_slice(&target_pid.to_le_bytes());
     req.extend_from_slice(&99_u32.to_le_bytes());
     let rc = mk.syscall(METHOD_SYS_SETPGID, &req, &mut []).unwrap();
-    assert_eq!(rc, 0, "setpgid succeeds");
+    assert_eq!(rc, -EPERM, "setpgid rejects missing group");
 
-    // getpgid now reflects 99.
-    let rc = mk
-        .syscall(METHOD_SYS_GETPGID, &42_u32.to_le_bytes(), &mut [])
-        .unwrap();
-    assert_eq!(rc, 99, "setpgid took effect across the trampoline");
+    // setpgid(target, 0) keeps the target as its own group leader.
+    let mut req = Vec::new();
+    req.extend_from_slice(&target_pid.to_le_bytes());
+    req.extend_from_slice(&0_u32.to_le_bytes());
+    let rc = mk.syscall(METHOD_SYS_SETPGID, &req, &mut []).unwrap();
+    assert_eq!(rc, 0, "setpgid self-group succeeds");
 
-    // getsid(42) lazily primes to 42 (separate from pgid).
+    // getpgid still reflects the target pid.
     let rc = mk
-        .syscall(METHOD_SYS_GETSID, &42_u32.to_le_bytes(), &mut [])
+        .syscall(METHOD_SYS_GETPGID, &target_pid.to_le_bytes(), &mut [])
         .unwrap();
-    assert_eq!(rc, 42, "getsid lazy-primes independently of pgid");
+    assert_eq!(rc, target_pid as i64, "setpgid self-group took effect");
+
+    // getsid(target) lazily primes to the target pid (separate from pgid).
+    let rc = mk
+        .syscall(METHOD_SYS_GETSID, &target_pid.to_le_bytes(), &mut [])
+        .unwrap();
+    assert_eq!(
+        rc, target_pid as i64,
+        "getsid lazy-primes independently of pgid"
+    );
+}
+
+#[test]
+fn fork_prepare_commit_and_rollback_round_trip_through_wasmtime_exports() {
+    let mk = fresh_kernel_host_interface(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 0))
+        "#,
+    )
+    .unwrap();
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/fork-parent".as_slice()])
+        .unwrap();
+    let parent_pid = proc.pid();
+
+    let child_pid = mk.prepare_fork(parent_pid).unwrap();
+    assert!(!mk
+        .list_processes()
+        .unwrap()
+        .iter()
+        .any(|p| p.pid == child_pid));
+
+    mk.commit_fork(parent_pid, child_pid).unwrap();
+    assert!(mk
+        .list_processes()
+        .unwrap()
+        .iter()
+        .any(|p| p.pid == child_pid));
+
+    let rolled_back_pid = mk.prepare_fork(parent_pid).unwrap();
+    mk.rollback_fork(parent_pid, rolled_back_pid).unwrap();
+    assert!(!mk
+        .list_processes()
+        .unwrap()
+        .iter()
+        .any(|p| p.pid == rolled_back_pid));
 }
 
 #[test]
@@ -3153,6 +3645,24 @@ fn signal_storage_round_trips_through_trampoline() {
     req3.extend_from_slice(&0_u32.to_le_bytes());
     let rc = mk.syscall(METHOD_SYS_KILL, &req3, &mut []).unwrap();
     assert_eq!(rc, -3, "sig 0 on a missing process returns -ESRCH");
+
+    let module = wat::parse_str(
+        r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            i32.const 0))
+        "#,
+    )
+    .unwrap();
+    let proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/killpg-target".as_slice()])
+        .unwrap();
+    let mut req_pg = Vec::new();
+    req_pg.extend_from_slice(&proc.pid().to_le_bytes());
+    req_pg.extend_from_slice(&0_u32.to_le_bytes());
+    let rc = mk.syscall(METHOD_SYS_KILLPG, &req_pg, &mut []).unwrap();
+    assert_eq!(rc, 0, "killpg sig 0 probes an existing process group");
 
     // kill out-of-range → -EINVAL.
     let mut req4 = Vec::new();

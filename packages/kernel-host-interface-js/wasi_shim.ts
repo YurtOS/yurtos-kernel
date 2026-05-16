@@ -367,6 +367,7 @@ export function buildWasiShim(
     if (wantWrite) kFlags |= 0b001;
     if (oflags & 0b0001) kFlags |= 0b010; // CREAT
     if (oflags & 0b1000) kFlags |= 0b100; // TRUNC
+    if (oflags & 0b0010) kFlags |= 0b1000; // DIRECTORY
     // Build "u32 flags + '/' + relpath".
     const req = new Uint8Array(4 + 1 + rel.length);
     new DataView(req.buffer).setUint32(0, kFlags >>> 0, true);

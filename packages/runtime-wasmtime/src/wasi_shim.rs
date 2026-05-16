@@ -760,6 +760,9 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if oflags & 0b1000 != 0 {
                 k_flags |= 0b100; // TRUNC
             }
+            if oflags & 0b0010 != 0 {
+                k_flags |= 0b1000; // DIRECTORY
+            }
             // Build "u32 flags + '/' + relpath" — wasi-libc strips
             // the preopen prefix, we restore it.
             let mut req = Vec::with_capacity(4 + 1 + rel.len());

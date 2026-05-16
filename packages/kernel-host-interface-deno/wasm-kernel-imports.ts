@@ -34,12 +34,12 @@ import {
   METHOD,
 } from "../kernel-host-interface-js/mod.ts";
 
+const ESRCH = 3;
 const EFAULT = 14;
 const EIO = 5;
 const EAGAIN = 11;
 const EAFNOSUPPORT = 97;
 const ENOTCONN = 107;
-const EOPNOTSUPP = 95;
 const HOST_UNIX_NOT_AF_UNIX = -1;
 const HOST_ASYNC_EAGAIN = -2;
 
@@ -92,6 +92,8 @@ export type CustomBuilder = (
   mk: KernelHostInterface,
   memBuf: () => ArrayBuffer,
   callerPid: number,
+  callerTid: number,
+  options?: BuildWasmKernelImportsOptions,
 ) => (...args: number[]) => Promise<number>;
 
 export interface HostBinding {
@@ -128,6 +130,299 @@ export interface HostBinding {
   returnsBytes?: boolean;
 }
 
+function socketOptionRequest(
+  fd: number,
+  option: number,
+  hasValue: number,
+  value: number,
+): Uint8Array {
+  const req = new Uint8Array(16);
+  const view = new DataView(req.buffer);
+  view.setUint32(0, fd >>> 0, true);
+  view.setUint32(4, option >>> 0, true);
+  view.setUint32(8, hasValue >>> 0, true);
+  view.setInt32(12, value | 0, true);
+  return req;
+}
+
+function scalarRequest(...values: number[]): Uint8Array {
+  const req = new Uint8Array(values.length * 4);
+  const view = new DataView(req.buffer);
+  values.forEach((value, index) => {
+    view.setUint32(index * 4, value >>> 0, true);
+  });
+  return req;
+}
+
+const buildSchedGetAffinity: CustomBuilder =
+  (mk, memBuf, callerPid) =>
+  async (pid: number, maskPtr: number, cpusetsize: number): Promise<number> => {
+    const cap = cpusetsize >>> 0;
+    const out = await mk.kernelSyscallAsync(
+      METHOD.SYS_SCHED_GETAFFINITY,
+      callerPid,
+      scalarRequest(pid, cap),
+      cap,
+    );
+    const rc = Number(out.rc);
+    if (rc >= 0 && rc <= cap && out.response.byteLength >= rc) {
+      const outRc = copyOut(memBuf, maskPtr, out.response.subarray(0, rc));
+      if (outRc < 0) return outRc;
+    }
+    return rc;
+  };
+
+const buildSchedSetAffinity: CustomBuilder =
+  (mk, memBuf, callerPid) =>
+  async (pid: number, maskPtr: number, cpusetsize: number): Promise<number> => {
+    const len = cpusetsize >>> 0;
+    const mask = copyIn(memBuf, maskPtr, len);
+    if (typeof mask === "number") return mask;
+    const req = new Uint8Array(8 + mask.byteLength);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, pid >>> 0, true);
+    view.setUint32(4, len, true);
+    req.set(mask, 8);
+    const out = await mk.kernelSyscallAsync(
+      METHOD.SYS_SCHED_SETAFFINITY,
+      callerPid,
+      req,
+      0,
+    );
+    return Number(out.rc);
+  };
+
+export interface WasmProcessThreadHost {
+  spawn(tid: number, fnPtr: number, arg: number): number;
+  release(handle: number): number;
+  cancel(handle: number): number;
+}
+
+export interface WasmThreadHostRegistry {
+  registerProcess(pid: number, host: WasmProcessThreadHost): () => void;
+  threadExitVersion(pid: number, tid: number): number;
+  waitForThreadExit(pid: number, tid: number, version: number): Promise<void>;
+  threadExited(
+    pid: number,
+    tid: number,
+    localHandle: number,
+    retval: number,
+  ): void;
+  threadSpawn(
+    callerPid: number,
+    callerTid: number,
+    fnPtr: number,
+    arg: number,
+  ): number;
+  threadYield(callerPid: number, callerTid: number): number;
+}
+
+export function createWasmThreadHostRegistry(
+  mk: KernelHostInterface,
+): WasmThreadHostRegistry {
+  const hosts = new Map<number, WasmProcessThreadHost>();
+  const handles = new Map<number, { pid: number; localHandle: number }>();
+  const exitVersions = new Map<string, number>();
+  const exitWaiters = new Map<string, Array<() => void>>();
+  let nextHandle = 1;
+
+  const exitKey = (pid: number, tid: number) => `${pid}:${tid}`;
+
+  function notifyThreadExit(pid: number, tid: number) {
+    const key = exitKey(pid, tid);
+    exitVersions.set(key, (exitVersions.get(key) ?? 0) + 1);
+    const waiters = exitWaiters.get(key);
+    if (!waiters) return;
+    exitWaiters.delete(key);
+    for (const resolve of waiters) resolve();
+  }
+
+  mk.hostStateMut().threadHost = {
+    spawn(pid, tid, fnPtr, arg) {
+      const host = hosts.get(pid);
+      if (!host) return -ESRCH;
+      const localHandle = host.spawn(tid, fnPtr, arg);
+      if (localHandle < 0) return localHandle;
+      const handle = nextHandle++;
+      handles.set(handle, { pid, localHandle });
+      return handle;
+    },
+    release(handle) {
+      const entry = handles.get(handle);
+      if (!entry) return -ESRCH;
+      const host = hosts.get(entry.pid);
+      if (!host) return -ESRCH;
+      const rc = host.release(entry.localHandle);
+      if (rc === 0) handles.delete(handle);
+      return rc;
+    },
+    cancel(handle) {
+      const entry = handles.get(handle);
+      if (!entry) return -ESRCH;
+      const host = hosts.get(entry.pid);
+      if (!host) return -ESRCH;
+      const rc = host.cancel(entry.localHandle);
+      if (rc === 0) handles.delete(handle);
+      return rc;
+    },
+  };
+
+  return {
+    threadExitVersion(pid, tid) {
+      return exitVersions.get(exitKey(pid, tid)) ?? 0;
+    },
+    waitForThreadExit(pid, tid, version) {
+      const key = exitKey(pid, tid);
+      if ((exitVersions.get(key) ?? 0) !== version) {
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        const waiters = exitWaiters.get(key) ?? [];
+        waiters.push(resolve);
+        exitWaiters.set(key, waiters);
+      });
+    },
+    threadExited(pid, tid, localHandle, retval) {
+      for (const [handle, entry] of handles) {
+        if (entry.pid !== pid || entry.localHandle !== localHandle) continue;
+        try {
+          mk.recordThreadExitAuthenticated(pid, tid, handle, retval >>> 0);
+          notifyThreadExit(pid, tid);
+        } catch {
+          // Stale worker completion reports are ignored; Rust remains
+          // authoritative and rejects mismatched handles.
+        }
+        return;
+      }
+    },
+    threadSpawn(callerPid, callerTid, fnPtr, arg) {
+      return Number(
+        mk.kernelThreadSyscall(
+          METHOD.SYS_THREAD_SPAWN,
+          callerPid,
+          callerTid,
+          scalarRequest(fnPtr, arg),
+          0,
+        ).rc,
+      );
+    },
+    threadYield(callerPid, callerTid) {
+      return Number(
+        mk.kernelThreadSyscall(
+          METHOD.SYS_THREAD_YIELD,
+          callerPid,
+          callerTid,
+          new Uint8Array(0),
+          0,
+        ).rc,
+      );
+    },
+    registerProcess(pid, host) {
+      hosts.set(pid, host);
+      return () => {
+        hosts.delete(pid);
+        for (const [handle, entry] of handles) {
+          if (entry.pid === pid) handles.delete(handle);
+        }
+        const prefix = `${pid}:`;
+        for (const key of exitVersions.keys()) {
+          if (key.startsWith(prefix)) exitVersions.delete(key);
+        }
+        for (const [key, waiters] of exitWaiters) {
+          if (!key.startsWith(prefix)) continue;
+          exitWaiters.delete(key);
+          for (const resolve of waiters) resolve();
+        }
+      };
+    },
+  };
+}
+
+export interface BuildWasmKernelImportsOptions {
+  threadEvents?: Pick<
+    WasmThreadHostRegistry,
+    "threadExitVersion" | "waitForThreadExit"
+  >;
+  processEvents?: Pick<
+    WasmProcessHostRegistry,
+    "processExitVersion" | "waitForProcessExit"
+  >;
+}
+
+export interface WasmProcessHostRegistry {
+  processExitVersion(pid: number): number;
+  waitForProcessExit(pid: number, version: number): Promise<void>;
+  prepareFork(parentPid: number): number;
+  commitFork(parentPid: number, childPid: number): number;
+  rollbackFork(parentPid: number, childPid: number): number;
+  recordExit(pid: number, exitStatus: number): number;
+}
+
+export function createWasmProcessHostRegistry(
+  mk: KernelHostInterface,
+): WasmProcessHostRegistry {
+  const exitVersions = new Map<number, number>();
+  const exitWaiters = new Map<number, Array<() => void>>();
+
+  const notifyProcessExit = (pid: number) => {
+    exitVersions.set(pid, (exitVersions.get(pid) ?? 0) + 1);
+    const waiters = exitWaiters.get(pid);
+    if (!waiters) return;
+    exitWaiters.delete(pid);
+    for (const resolve of waiters) resolve();
+  };
+
+  return {
+    processExitVersion(pid) {
+      return exitVersions.get(pid) ?? 0;
+    },
+    waitForProcessExit(pid, version) {
+      if ((exitVersions.get(pid) ?? 0) !== version) {
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        const waiters = exitWaiters.get(pid) ?? [];
+        waiters.push(resolve);
+        exitWaiters.set(pid, waiters);
+      });
+    },
+    prepareFork(parentPid) {
+      return mk.prepareFork(parentPid);
+    },
+    commitFork(parentPid, childPid) {
+      mk.commitFork(parentPid, childPid);
+      return 0;
+    },
+    rollbackFork(parentPid, childPid) {
+      mk.rollbackFork(parentPid, childPid);
+      return 0;
+    },
+    recordExit(pid, exitStatus) {
+      mk.recordExit(pid, exitStatus);
+      notifyProcessExit(pid);
+      return 0;
+    },
+  };
+}
+
+function threadImport(
+  method: number,
+  request: Uint8Array,
+  responseCap: number,
+  mk: KernelHostInterface,
+  callerPid: number,
+  callerTid: number,
+): { rc: number; response: Uint8Array } {
+  const out = mk.kernelThreadSyscall(
+    method,
+    callerPid,
+    callerTid,
+    request,
+    responseCap,
+  );
+  return { rc: Number(out.rc), response: out.response };
+}
+
 /**
  * The starting binding table — covers the simple scalar surface
  * the Rust kernel already implements. The full surface fills
@@ -143,6 +438,113 @@ export const HOST_BINDINGS: HostBinding[] = [
   { name: "host_getpid", method: METHOD.SYS_GETPID, args: [] },
   { name: "host_getppid", method: METHOD.SYS_GETPPID, args: [] },
 
+  {
+    name: "host_thread_spawn",
+    method: METHOD.SYS_THREAD_SPAWN,
+    args: ["scalar", "scalar"],
+    custom: (mk, _memBuf, callerPid, callerTid) => async (fnPtr, arg) =>
+      threadImport(
+        METHOD.SYS_THREAD_SPAWN,
+        scalarRequest(fnPtr, arg),
+        0,
+        mk,
+        callerPid,
+        callerTid,
+      ).rc,
+  },
+  {
+    name: "host_thread_self",
+    method: METHOD.SYS_THREAD_SELF,
+    args: [],
+    custom: (mk, _memBuf, callerPid, callerTid) => async () =>
+      threadImport(
+        METHOD.SYS_THREAD_SELF,
+        new Uint8Array(0),
+        0,
+        mk,
+        callerPid,
+        callerTid,
+      ).rc,
+  },
+  {
+    name: "host_thread_join",
+    method: METHOD.SYS_THREAD_JOIN,
+    args: ["scalar", { kind: "fixed_out", cap: 4 }],
+    custom:
+      (mk, memBuf, callerPid, callerTid, options) =>
+      async (tid, outRetvalPtr) => {
+        let version = options?.threadEvents?.threadExitVersion(callerPid, tid);
+        let out = threadImport(
+          METHOD.SYS_THREAD_JOIN,
+          scalarRequest(tid),
+          4,
+          mk,
+          callerPid,
+          callerTid,
+        );
+        while (out.rc === -EAGAIN && options?.threadEvents) {
+          await options.threadEvents.waitForThreadExit(
+            callerPid,
+            tid,
+            version ?? 0,
+          );
+          version = options.threadEvents.threadExitVersion(callerPid, tid);
+          out = threadImport(
+            METHOD.SYS_THREAD_JOIN,
+            scalarRequest(tid),
+            4,
+            mk,
+            callerPid,
+            callerTid,
+          );
+        }
+        if (out.rc !== 0) return out.rc;
+        return copyOut(memBuf, outRetvalPtr, out.response.subarray(0, 4));
+      },
+  },
+  {
+    name: "host_thread_detach",
+    method: METHOD.SYS_THREAD_DETACH,
+    args: ["scalar"],
+    custom: (mk, _memBuf, callerPid, callerTid) => async (tid) =>
+      threadImport(
+        METHOD.SYS_THREAD_DETACH,
+        scalarRequest(tid),
+        0,
+        mk,
+        callerPid,
+        callerTid,
+      ).rc,
+  },
+  {
+    name: "host_thread_exit",
+    method: METHOD.SYS_THREAD_EXIT,
+    args: ["scalar"],
+    custom: (mk, _memBuf, callerPid, callerTid) => async (retval) =>
+      threadImport(
+        METHOD.SYS_THREAD_EXIT,
+        scalarRequest(retval),
+        0,
+        mk,
+        callerPid,
+        callerTid,
+      ).rc,
+  },
+  {
+    name: "host_thread_yield",
+    method: METHOD.SYS_THREAD_YIELD,
+    args: [],
+    custom: (mk, _memBuf, callerPid, callerTid) => async () =>
+      threadImport(
+        METHOD.SYS_THREAD_YIELD,
+        new Uint8Array(0),
+        0,
+        mk,
+        callerPid,
+        callerTid,
+      ).rc,
+  },
+
   // Single-scalar args returning a scalar.
   { name: "host_umask", method: METHOD.SYS_UMASK, args: ["scalar"] },
   {
@@ -156,6 +558,11 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["scalar", "scalar", "scalar"],
   },
   { name: "host_kill", method: METHOD.SYS_KILL, args: ["scalar", "scalar"] },
+  {
+    name: "host_killpg",
+    method: METHOD.SYS_KILLPG,
+    args: ["scalar", "scalar"],
+  },
   {
     name: "host_getpriority",
     method: METHOD.SYS_GETPRIORITY,
@@ -186,6 +593,19 @@ export const HOST_BINDINGS: HostBinding[] = [
     method: METHOD.SYS_SCHED_SETPARAM,
     args: ["scalar", "scalar"],
   },
+  {
+    name: "host_sched_getaffinity",
+    method: METHOD.SYS_SCHED_GETAFFINITY,
+    args: ["scalar", "out_cap"],
+    returnsBytes: true,
+    custom: buildSchedGetAffinity,
+  },
+  {
+    name: "host_sched_setaffinity",
+    method: METHOD.SYS_SCHED_SETAFFINITY,
+    args: ["scalar", "prefixed_ptr_len"],
+    custom: buildSchedSetAffinity,
+  },
   { name: "host_getpgid", method: METHOD.SYS_GETPGID, args: ["scalar"] },
   {
     name: "host_setpgid",
@@ -195,6 +615,30 @@ export const HOST_BINDINGS: HostBinding[] = [
   { name: "host_getsid", method: METHOD.SYS_GETSID, args: ["scalar"] },
   { name: "host_setsid", method: METHOD.SYS_SETSID, args: [] },
   { name: "host_isatty", method: METHOD.SYS_ISATTY, args: ["scalar"] },
+  { name: "host_tcgetpgrp", method: METHOD.SYS_TCGETPGRP, args: ["scalar"] },
+  {
+    name: "host_tcsetpgrp",
+    method: METHOD.SYS_TCSETPGRP,
+    args: ["scalar", "scalar"],
+  },
+  {
+    name: "host_tcgetattr",
+    method: METHOD.SYS_TCGETATTR,
+    args: ["scalar", "out_cap"],
+    returnsBytes: true,
+  },
+  {
+    name: "host_tcsetattr",
+    method: METHOD.SYS_TCSETATTR,
+    args: ["scalar", "scalar", "ignore_scalar"],
+  },
+  {
+    name: "host_winsize",
+    method: METHOD.SYS_WINSIZE,
+    args: ["scalar", "out_cap"],
+    returnsBytes: true,
+  },
+  { name: "host_tiocsctty", method: METHOD.SYS_TIOCSCTTY, args: ["scalar"] },
   { name: "host_sched_yield", method: METHOD.SYS_SCHED_YIELD, args: [] },
   { name: "host_nanosleep", method: METHOD.SYS_NANOSLEEP, args: ["scalar64"] },
 
@@ -277,7 +721,7 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_wait",
     method: METHOD.SYS_WAIT,
     args: [],
-    custom: (mk, memBuf, callerPid) =>
+    custom: (mk, memBuf, callerPid, _callerTid, options) =>
     async (
       pid: number,
       flags: number,
@@ -288,13 +732,27 @@ export const HOST_BINDINGS: HostBinding[] = [
       const reqView = new DataView(req.buffer);
       reqView.setUint32(0, pid >>> 0, true);
       reqView.setUint32(4, flags >>> 0, true);
-      const out = await mk.kernelSyscallAsync(
+      let version = pid > 0
+        ? options?.processEvents?.processExitVersion(pid)
+        : undefined;
+      let out = await mk.kernelSyscallAsync(
         METHOD.SYS_WAIT,
         callerPid,
         req,
         8,
       );
-      const rc = Number(out.rc);
+      let rc = Number(out.rc);
+      while (rc === -EAGAIN && pid > 0 && options?.processEvents) {
+        await options.processEvents.waitForProcessExit(pid, version ?? 0);
+        version = options.processEvents.processExitVersion(pid);
+        out = await mk.kernelSyscallAsync(
+          METHOD.SYS_WAIT,
+          callerPid,
+          req,
+          8,
+        );
+        rc = Number(out.rc);
+      }
       if (rc < 0) return rc;
       if (rc !== 8 || outCap < 16) return -7; // -E2BIG/malformed for this ABI.
       const kernelView = new DataView(
@@ -321,6 +779,16 @@ export const HOST_BINDINGS: HostBinding[] = [
   // ── fd duplication ────────────────────────────────────────
   // host_dup2(srcFd, dstFd) → newfd or -EBADF.
   { name: "host_dup2", method: METHOD.SYS_DUP2, args: ["scalar", "scalar"] },
+  {
+    name: "host_dup_min",
+    method: METHOD.SYS_DUP_MIN,
+    args: ["scalar", "scalar"],
+  },
+  {
+    name: "host_set_fd_descriptor_flags",
+    method: METHOD.SYS_SET_FD_DESCRIPTOR_FLAGS,
+    args: ["scalar", "scalar"],
+  },
 
   // ── Path-based fs ops (single path) ────────────────────────
   // host_mkdir(pathPtr, pathLen) → 0 / -errno.
@@ -360,6 +828,18 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["scalar", "ptr_len"],
     argOrder: [2, 0, 1],
   },
+  {
+    name: "host_chown",
+    method: METHOD.SYS_CHOWN,
+    args: ["scalar", "scalar", "ptr_len"],
+    argOrder: [2, 3, 0, 1],
+  },
+  {
+    name: "host_fchown",
+    method: METHOD.SYS_FCHOWN,
+    args: ["scalar", "scalar", "scalar"],
+  },
+  { name: "host_fchdir", method: METHOD.SYS_FCHDIR, args: ["scalar"] },
 
   // ── Multi-path ops (rename, symlink, link) ────────────────
   // host_rename(fromPtr, fromLen, toPtr, toLen) → 0 / -errno.
@@ -964,12 +1444,39 @@ export const HOST_BINDINGS: HostBinding[] = [
   },
   {
     name: "host_socket_option",
-    method: 0,
+    method: METHOD.SYS_SOCKET_OPTION,
     args: [],
-    custom: () => async () => {
-      await Promise.resolve();
-      return -EOPNOTSUPP;
+    custom: (mk, _memBuf, callerPid) =>
+    async (
+      fd: number,
+      option: number,
+      hasValue: number,
+      value: number,
+    ): Promise<number> => {
+      const out = await mk.kernelSyscallAsync(
+        METHOD.SYS_SOCKET_OPTION,
+        callerPid,
+        socketOptionRequest(fd, option, hasValue, value),
+        0,
+      );
+      return Number(out.rc);
     },
+  },
+  {
+    name: "host_socket_set_no_delay",
+    method: METHOD.SYS_SOCKET_OPTION,
+    args: [],
+    custom:
+      (mk, _memBuf, callerPid) =>
+      async (fd: number, enabled: number): Promise<number> => {
+        const out = await mk.kernelSyscallAsync(
+          METHOD.SYS_SOCKET_OPTION,
+          callerPid,
+          socketOptionRequest(fd, 1, 1, enabled),
+          0,
+        );
+        return Number(out.rc);
+      },
   },
   // host_socket_close(fd) → 0 / -errno.
   // SYS_SOCKET_CLOSE: u32 handle in request, no response.
@@ -1181,6 +1688,8 @@ export function buildWasmKernelImports(
   memBuf: () => ArrayBuffer,
   callerPid = 0,
   initialCwd?: string,
+  callerTid = 1,
+  options?: BuildWasmKernelImportsOptions,
 ): Record<string, (...args: number[]) => Promise<number>> {
   if (initialCwd) {
     mk.kernelSyscall(
@@ -1193,7 +1702,7 @@ export function buildWasmKernelImports(
   const imports: Record<string, (...args: number[]) => Promise<number>> = {};
   for (const b of HOST_BINDINGS) {
     imports[b.name] = b.custom
-      ? b.custom(mk, memBuf, callerPid)
+      ? b.custom(mk, memBuf, callerPid, callerTid, options)
       : makeWrapper(b, mk, memBuf, callerPid);
   }
   return imports;

@@ -819,3 +819,68 @@ Deno.test("loadProcess auto-allocates SAB memory compatible with imported memory
   assertEquals(proc.memory?.buffer instanceof SharedArrayBuffer, true);
   await proc.terminate();
 });
+
+Deno.test("loadProcess registers Worker/SAB as the Rust wasm thread host", async () => {
+  let registeredPid = 0;
+  let unregisterCalled = false;
+  let registeredHost:
+    | {
+      spawn(tid: number, fnPtr: number, arg: number): number;
+      release(handle: number): number;
+      cancel(handle: number): number;
+    }
+    | undefined;
+  const starts: Array<{ tid: number; fnPtr: number; arg: number }> = [];
+  const exits: Array<{
+    pid: number;
+    tid: number;
+    handle: number;
+    retval: number;
+  }> = [];
+  const ctx = await makeLoaderContext({
+    moduleCache: fixedModuleCache(
+      makeThreadedImportedSharedMemoryModule(1, 1),
+    ),
+    wasmThreadHostRegistry: {
+      threadExited(pid, tid, handle, retval) {
+        exits.push({ pid, tid, handle, retval });
+      },
+      registerProcess(pid, host) {
+        registeredPid = pid;
+        registeredHost = host;
+        return () => {
+          unregisterCalled = true;
+        };
+      },
+    },
+  });
+
+  const proc = await loadProcess(ctx, {
+    argv: ["/bin/true"],
+    mode: "cli",
+    workerSabAvailable: true,
+    workerSabMemory: new WebAssembly.Memory({
+      initial: 1,
+      maximum: 1,
+      shared: true,
+    }),
+    workerSabThreads: {
+      spawnThread(start) {
+        starts.push(start);
+        return Promise.resolve(0);
+      },
+    },
+  });
+
+  assertEquals(registeredPid, proc.pid);
+  assert(registeredHost);
+  const handle = registeredHost.spawn(2, 123, 456);
+  assertEquals(handle, 1);
+  assertEquals(starts, [{ tid: 2, fnPtr: 123, arg: 456 }]);
+  await Promise.resolve();
+  assertEquals(exits, [{ pid: proc.pid, tid: 2, handle: 1, retval: 0 }]);
+  assertEquals(registeredHost.release(handle), 0);
+
+  await proc.terminate();
+  assertEquals(unregisterCalled, true);
+});

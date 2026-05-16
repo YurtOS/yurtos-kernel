@@ -23,11 +23,23 @@ fn make_root(pid: u32) {
 const O_WRITE: u32 = 0b001;
 const O_CREAT: u32 = 0b010;
 const O_TRUNC: u32 = 0b100;
+const O_DIRECTORY: u32 = 0b1000;
 
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0002;
 const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
+const TEST_METHOD_SYS_TCGETPGRP: u32 = 0x1_0056;
+const TEST_METHOD_SYS_TCSETPGRP: u32 = 0x1_0057;
+const TEST_METHOD_SYS_TCGETATTR: u32 = 0x1_0058;
+const TEST_METHOD_SYS_TCSETATTR: u32 = 0x1_0059;
+const TEST_METHOD_SYS_WINSIZE: u32 = 0x1_005A;
+const TEST_METHOD_SYS_TIOCSCTTY: u32 = 0x1_005B;
+const TEST_METHOD_SYS_SCHED_GETAFFINITY: u32 = 0x1_005C;
+const TEST_METHOD_SYS_SCHED_SETAFFINITY: u32 = 0x1_005D;
+const TEST_METHOD_SYS_FCHOWN: u32 = 0x1_005E;
+const TEST_METHOD_SYS_FCHDIR: u32 = 0x1_005F;
+const TEST_ENOTTY: i32 = 25;
 
 fn poll_req(timeout_ms: i32, fds: &[(i32, i16)]) -> Vec<u8> {
     let mut req = timeout_ms.to_le_bytes().to_vec();
@@ -65,6 +77,15 @@ fn socket_listen_req(fd: u32, backlog: u32) -> [u8; 8] {
 
 fn socket_fd_req(fd: u32) -> [u8; 4] {
     fd.to_le_bytes()
+}
+
+fn socket_option_req(fd: u32, option: u32, has_value: u32, value: i32) -> [u8; 16] {
+    let mut req = [0u8; 16];
+    req[0..4].copy_from_slice(&fd.to_le_bytes());
+    req[4..8].copy_from_slice(&option.to_le_bytes());
+    req[8..12].copy_from_slice(&has_value.to_le_bytes());
+    req[12..16].copy_from_slice(&value.to_le_bytes());
+    req
 }
 
 fn socket_addr_req(fd: u32, which: u32) -> [u8; 8] {
@@ -312,6 +333,9 @@ fn chdir_then_getcwd_round_trips() {
     assert_eq!(dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf), 2);
     assert_eq!(&buf[..2], b"/\0");
 
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/var", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/var/tmp", &mut []), 0);
+
     // chdir to "/var/tmp"
     assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/var/tmp", &mut []), 0);
 
@@ -335,6 +359,9 @@ fn getcwd_returns_required_size_when_buffer_too_small() {
 #[test]
 fn cwd_is_per_pid() {
     let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/home", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/home/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 2, b"/home/b", &mut []), 0);
     assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/home/a", &mut []), 0);
     assert_eq!(dispatch(METHOD_SYS_CHDIR, 2, b"/home/b", &mut []), 0);
     let mut buf = [0u8; 32];
@@ -349,6 +376,84 @@ fn chdir_rejects_empty_path() {
     assert_eq!(
         dispatch(METHOD_SYS_CHDIR, 1, &[], &mut []),
         -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn chdir_rejects_missing_and_non_directory_paths() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_CHDIR, 1, b"/missing", &mut []),
+        -(abi::ENOENT as i64)
+    );
+
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"/file.txt"),
+        &mut [],
+    );
+    assert!(fd >= 3);
+    assert_eq!(
+        dispatch(METHOD_SYS_CHDIR, 1, b"/file.txt", &mut []),
+        -(abi::ENOTDIR as i64)
+    );
+}
+
+#[test]
+fn fchdir_moves_cwd_to_open_directory_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp/base", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp/base/sub", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/tmp/base/sub", &mut []), 0);
+
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_DIRECTORY, b"/tmp/base"),
+        &mut [],
+    );
+    assert!(fd >= 3, "directory open should return fd, got {fd}");
+
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_FCHDIR,
+            1,
+            &(fd as u32).to_le_bytes(),
+            &mut []
+        ),
+        0
+    );
+
+    let mut buf = [0u8; 32];
+    let n = dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf);
+    assert_eq!(&buf[..n as usize], b"/tmp/base\0");
+}
+
+#[test]
+fn fchdir_rejects_invalid_and_non_directory_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &99_u32.to_le_bytes(), &mut []),
+        -(abi::EBADF as i64)
+    );
+
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"/file.txt"),
+        &mut [],
+    );
+    assert!(fd >= 3);
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_FCHDIR,
+            1,
+            &(fd as u32).to_le_bytes(),
+            &mut []
+        ),
+        -(abi::ENOTDIR as i64)
     );
 }
 
@@ -584,6 +689,67 @@ fn scheduler_syscalls_validate_target_policy_and_param() {
 }
 
 #[test]
+fn sched_getaffinity_reports_single_cpu_and_validates_target() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut req = Vec::new();
+    req.extend_from_slice(&0_u32.to_le_bytes());
+    req.extend_from_slice(&4_u32.to_le_bytes());
+    let mut out = [0xffu8; 4];
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_GETAFFINITY, 7, &req, &mut out),
+        4
+    );
+    assert_eq!(u32::from_le_bytes(out), 1);
+
+    let mut short_req = Vec::new();
+    short_req.extend_from_slice(&0_u32.to_le_bytes());
+    short_req.extend_from_slice(&3_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_GETAFFINITY, 7, &short_req, &mut out),
+        -(abi::EINVAL as i64)
+    );
+
+    let mut missing_req = Vec::new();
+    missing_req.extend_from_slice(&999_u32.to_le_bytes());
+    missing_req.extend_from_slice(&4_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_GETAFFINITY, 7, &missing_req, &mut out),
+        -(abi::ESRCH as i64)
+    );
+}
+
+#[test]
+fn sched_setaffinity_accepts_only_cpu_zero_mask() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut ok_req = Vec::new();
+    ok_req.extend_from_slice(&0_u32.to_le_bytes());
+    ok_req.extend_from_slice(&4_u32.to_le_bytes());
+    ok_req.extend_from_slice(&1_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_SETAFFINITY, 7, &ok_req, &mut []),
+        0
+    );
+
+    let mut cpu_one_req = Vec::new();
+    cpu_one_req.extend_from_slice(&0_u32.to_le_bytes());
+    cpu_one_req.extend_from_slice(&4_u32.to_le_bytes());
+    cpu_one_req.extend_from_slice(&2_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_SETAFFINITY, 7, &cpu_one_req, &mut []),
+        -(abi::EINVAL as i64)
+    );
+
+    let mut short_req = Vec::new();
+    short_req.extend_from_slice(&0_u32.to_le_bytes());
+    short_req.extend_from_slice(&3_u32.to_le_bytes());
+    short_req.extend_from_slice(&[1, 0, 0]);
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_SETAFFINITY, 7, &short_req, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
 fn getrlimit_default_stack_is_one_megabyte() {
     let _g = crate::kernel::TestGuard::acquire();
     let req = 3_u32.to_le_bytes(); // RLIMIT_STACK
@@ -797,6 +963,90 @@ fn dup2_oldfd_unopened_is_ebadf() {
         dispatch(METHOD_SYS_DUP2, 1, &req, &mut []),
         -(abi::EBADF as i64)
     );
+}
+
+#[test]
+fn dup_min_returns_lowest_unused_fd_at_or_above_minimum() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut req = Vec::new();
+    req.extend_from_slice(&1_u32.to_le_bytes());
+    req.extend_from_slice(&5_u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_DUP_MIN, 1, &req, &mut []), 5);
+
+    let mut req2 = Vec::new();
+    req2.extend_from_slice(&1_u32.to_le_bytes());
+    req2.extend_from_slice(&5_u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_DUP_MIN, 1, &req2, &mut []), 6);
+}
+
+#[test]
+fn dup_min_rejects_closed_source_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut req = Vec::new();
+    req.extend_from_slice(&42_u32.to_le_bytes());
+    req.extend_from_slice(&5_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP_MIN, 1, &req, &mut []),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn set_fd_descriptor_flags_rejects_closed_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut req = Vec::new();
+    req.extend_from_slice(&42_u32.to_le_bytes());
+    req.extend_from_slice(&1_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS, 1, &req, &mut []),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn sys_spawn_does_not_inherit_cloexec_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let parent_pid = 1;
+    let mut image = vec![];
+    image.extend_from_slice(b"\0asm");
+    image.extend_from_slice(&[1, 0, 0, 0]);
+    let mut reg = (b"/bin/child".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/bin/child");
+    reg.extend_from_slice(&image);
+    assert_eq!(dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []), 0);
+
+    let mut dup_min_req = Vec::new();
+    dup_min_req.extend_from_slice(&1_u32.to_le_bytes());
+    dup_min_req.extend_from_slice(&5_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP_MIN, parent_pid, &dup_min_req, &mut []),
+        5
+    );
+
+    let mut flags_req = Vec::new();
+    flags_req.extend_from_slice(&5_u32.to_le_bytes());
+    flags_req.extend_from_slice(&1_u32.to_le_bytes()); // FD_CLOEXEC
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS,
+            parent_pid,
+            &flags_req,
+            &mut []
+        ),
+        0
+    );
+
+    let mut spawn_req = Vec::new();
+    spawn_req.extend_from_slice(&(b"/bin/child".len() as u32).to_le_bytes());
+    spawn_req.extend_from_slice(b"/bin/child");
+    spawn_req.extend_from_slice(&(b"child".len() as u32).to_le_bytes());
+    spawn_req.extend_from_slice(b"child");
+    let child_pid = dispatch(METHOD_SYS_SPAWN, parent_pid, &spawn_req, &mut []);
+    assert!(child_pid >= 1000);
+
+    let child_has_fd5 =
+        crate::kernel::with_kernel(|k| k.process_mut(child_pid as u32).fd_table.entry(5).is_some());
+    assert!(!child_has_fd5);
 }
 
 #[test]
@@ -2071,6 +2321,89 @@ fn socket_sendto_rejects_wrapping_addr_len() {
     assert_eq!(
         dispatch(METHOD_SYS_SOCKET_SENDTO, 1, &request, &mut []),
         -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn socket_option_tcp_nodelay_round_trips_on_kernel_socket() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_SOCKET_OPEN,
+        1,
+        &socket_open_req(2, 1, 0),
+        &mut [],
+    ) as u32;
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(fd, 1, 0, 0),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(fd, 1, 1, 1),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(fd, 1, 0, 0),
+            &mut []
+        ),
+        1
+    );
+}
+
+#[test]
+fn socket_option_accepts_advisory_sets_but_rejects_unknown_gets() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_SOCKET_OPEN,
+        1,
+        &socket_open_req(2, 1, 0),
+        &mut [],
+    ) as u32;
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(fd, 13, 1, 0),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(fd, 13, 0, 0),
+            &mut []
+        ),
+        -(abi::EOPNOTSUPP as i64)
+    );
+}
+
+#[test]
+fn socket_option_rejects_non_socket_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPTION,
+            1,
+            &socket_option_req(1, 1, 1, 1),
+            &mut []
+        ),
+        -(abi::ENOTSOCK as i64)
     );
 }
 
@@ -3351,6 +3684,148 @@ fn isatty_on_closed_fd_is_ebadf() {
 }
 
 #[test]
+fn tty_foreground_pgrp_rejects_missing_and_cross_session_groups() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let owner = k.process_mut(10);
+        owner.sid = 10;
+        owner.pgid = 10;
+        let foreground = k.process_mut(11);
+        foreground.sid = 10;
+        foreground.pgid = 11;
+        let other_session = k.process_mut(12);
+        other_session.sid = 12;
+        other_session.pgid = 12;
+    });
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TIOCSCTTY, 10, &0_u32.to_le_bytes(), &mut []),
+        0
+    );
+
+    let mut set_req = Vec::new();
+    set_req.extend_from_slice(&0_u32.to_le_bytes());
+    set_req.extend_from_slice(&11_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCSETPGRP, 10, &set_req, &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCGETPGRP, 10, &0_u32.to_le_bytes(), &mut []),
+        11
+    );
+
+    let mut missing_req = Vec::new();
+    missing_req.extend_from_slice(&0_u32.to_le_bytes());
+    missing_req.extend_from_slice(&9999_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCSETPGRP, 10, &missing_req, &mut []),
+        -(TEST_ENOTTY as i64)
+    );
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCGETPGRP, 10, &0_u32.to_le_bytes(), &mut []),
+        11
+    );
+
+    let mut cross_session_req = Vec::new();
+    cross_session_req.extend_from_slice(&0_u32.to_le_bytes());
+    cross_session_req.extend_from_slice(&12_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCSETPGRP, 10, &cross_session_req, &mut []),
+        -(TEST_ENOTTY as i64)
+    );
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCGETPGRP, 10, &0_u32.to_le_bytes(), &mut []),
+        11
+    );
+}
+
+#[test]
+fn tiocsctty_requires_session_leader_on_tty_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TIOCSCTTY, 1, &0_u32.to_le_bytes(), &mut []),
+        -(abi::EPERM as i64)
+    );
+    assert_eq!(dispatch(METHOD_SYS_SETSID, 1, &[], &mut []), 1);
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TIOCSCTTY, 1, &0_u32.to_le_bytes(), &mut []),
+        0
+    );
+}
+
+#[test]
+fn tty_attrs_and_winsize_are_available_for_stdio_only() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut termios = [0u8; 60];
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_TCGETATTR,
+            1,
+            &0_u32.to_le_bytes(),
+            &mut termios
+        ),
+        60
+    );
+    assert_eq!(
+        u32::from_le_bytes(termios[0..4].try_into().unwrap()),
+        0x0600
+    );
+    assert_eq!(
+        u32::from_le_bytes(termios[4..8].try_into().unwrap()),
+        0x0005
+    );
+    assert_eq!(
+        u32::from_le_bytes(termios[8..12].try_into().unwrap()),
+        0x08BF
+    );
+    assert_eq!(
+        u32::from_le_bytes(termios[12..16].try_into().unwrap()),
+        0x8A3B
+    );
+    assert_eq!(&termios[17..24], &[3, 28, 127, 21, 4, 0, 1]);
+
+    let mut set_req = Vec::new();
+    set_req.extend_from_slice(&0_u32.to_le_bytes());
+    set_req.extend_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(dispatch(TEST_METHOD_SYS_TCSETATTR, 1, &set_req, &mut []), 0);
+
+    let mut winsize = [0u8; 8];
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_WINSIZE,
+            1,
+            &0_u32.to_le_bytes(),
+            &mut winsize
+        ),
+        8
+    );
+    assert_eq!(u16::from_le_bytes(winsize[0..2].try_into().unwrap()), 24);
+    assert_eq!(u16::from_le_bytes(winsize[2..4].try_into().unwrap()), 80);
+
+    let mut fds = [0u8; 8];
+    dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds);
+    let pipe_fd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_TCGETATTR,
+            1,
+            &pipe_fd.to_le_bytes(),
+            &mut termios
+        ),
+        -(TEST_ENOTTY as i64)
+    );
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_WINSIZE,
+            1,
+            &pipe_fd.to_le_bytes(),
+            &mut winsize
+        ),
+        -(TEST_ENOTTY as i64)
+    );
+}
+
+#[test]
 fn clock_gettime_realtime_returns_kh_now_value() {
     // Native test stub for kh_now_realtime returns
     // 1_700_000_000_000_000_000 ns; check it round-trips.
@@ -3382,9 +3857,14 @@ fn getpgid_self_defaults_to_caller_pid() {
 #[test]
 fn setpgid_then_getpgid_round_trips() {
     let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let group = k.process_mut(5);
+        group.sid = 1;
+        group.pgid = 5;
+    });
     let mut req = Vec::new();
     req.extend_from_slice(&0_u32.to_le_bytes()); // target = self
-    req.extend_from_slice(&5_u32.to_le_bytes()); // new pgid
+    req.extend_from_slice(&5_u32.to_le_bytes()); // existing same-session pgid
     assert_eq!(dispatch(METHOD_SYS_SETPGID, 1, &req, &mut []), 0);
     assert_eq!(
         dispatch(METHOD_SYS_GETPGID, 1, &0_u32.to_le_bytes(), &mut []),
@@ -3409,6 +3889,61 @@ fn setpgid_pgid_zero_makes_target_a_group_leader() {
 }
 
 #[test]
+fn setpgid_rejects_session_leaders_and_cross_session_groups() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let parent = k.process_mut(1);
+        parent.sid = 1;
+        parent.pgid = 1;
+
+        let child = k.process_mut(2);
+        child.sid = 1;
+        child.pgid = 1;
+
+        let other = k.process_mut(3);
+        other.sid = 3;
+        other.pgid = 3;
+    });
+
+    let mut session_leader_req = Vec::new();
+    session_leader_req.extend_from_slice(&3_u32.to_le_bytes());
+    session_leader_req.extend_from_slice(&3_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SETPGID, 1, &session_leader_req, &mut []),
+        -(abi::EPERM as i64)
+    );
+
+    let mut cross_session_req = Vec::new();
+    cross_session_req.extend_from_slice(&2_u32.to_le_bytes());
+    cross_session_req.extend_from_slice(&3_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SETPGID, 1, &cross_session_req, &mut []),
+        -(abi::EPERM as i64)
+    );
+
+    let mut missing_group_req = Vec::new();
+    missing_group_req.extend_from_slice(&2_u32.to_le_bytes());
+    missing_group_req.extend_from_slice(&99_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SETPGID, 1, &missing_group_req, &mut []),
+        -(abi::EPERM as i64)
+    );
+}
+
+#[test]
+fn setsid_rejects_process_group_leader_after_group_is_observed() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_GETPGID, 9, &0_u32.to_le_bytes(), &mut []),
+        9
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SETSID, 9, &[], &mut []),
+        -(abi::EPERM as i64)
+    );
+}
+
+#[test]
 fn pgid_is_per_pid() {
     let _g = crate::kernel::TestGuard::acquire();
     crate::kernel::with_kernel(|k| {
@@ -3417,7 +3952,7 @@ fn pgid_is_per_pid() {
     // pid 1 default sees pgid 1; setting pid 2's pgid doesn't move pid 1.
     let mut req = Vec::new();
     req.extend_from_slice(&2_u32.to_le_bytes());
-    req.extend_from_slice(&99_u32.to_le_bytes());
+    req.extend_from_slice(&0_u32.to_le_bytes());
     dispatch(METHOD_SYS_SETPGID, 1, &req, &mut []);
     assert_eq!(
         dispatch(METHOD_SYS_GETPGID, 1, &0_u32.to_le_bytes(), &mut []),
@@ -3425,7 +3960,7 @@ fn pgid_is_per_pid() {
     );
     assert_eq!(
         dispatch(METHOD_SYS_GETPGID, 1, &2_u32.to_le_bytes(), &mut []),
-        99
+        2
     );
 }
 
@@ -3535,6 +4070,86 @@ fn kill_out_of_range_sig_is_einval() {
     req.extend_from_slice(&64_u32.to_le_bytes()); // 1..=63 only
     assert_eq!(
         dispatch(METHOD_SYS_KILL, 1, &req, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn killpg_records_signal_for_live_group_members_only() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let caller = k.process_mut(1);
+        caller.pgid = 7;
+        caller.sid = 1;
+
+        let member = k.process_mut(2);
+        member.pgid = 7;
+        member.sid = 1;
+
+        let exited_member = k.process_mut(3);
+        exited_member.pgid = 7;
+        exited_member.sid = 1;
+        exited_member.exit_status = Some(0);
+
+        let other_group = k.process_mut(4);
+        other_group.pgid = 8;
+        other_group.sid = 1;
+    });
+
+    let mut req = Vec::new();
+    req.extend_from_slice(&7_u32.to_le_bytes());
+    req.extend_from_slice(&15_u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_KILLPG, 1, &req, &mut []), 0);
+
+    let (caller_pending, member_pending, exited_pending, other_pending) =
+        crate::kernel::with_kernel(|k| {
+            (
+                k.process_mut(1).pending_signals,
+                k.process_mut(2).pending_signals,
+                k.process_mut(3).pending_signals,
+                k.process_mut(4).pending_signals,
+            )
+        });
+    assert_eq!(caller_pending, 1u64 << 14);
+    assert_eq!(member_pending, 1u64 << 14);
+    assert_eq!(exited_pending, 0);
+    assert_eq!(other_pending, 0);
+}
+
+#[test]
+fn killpg_zero_uses_callers_process_group_as_alive_probe() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(11);
+    });
+
+    let mut req = Vec::new();
+    req.extend_from_slice(&0_u32.to_le_bytes()); // pgid 0 = caller's group
+    req.extend_from_slice(&0_u32.to_le_bytes()); // sig 0 = probe
+    assert_eq!(dispatch(METHOD_SYS_KILLPG, 11, &req, &mut []), 0);
+    assert_eq!(crate::kernel::with_kernel(|k| k.process_mut(11).pgid), 11);
+    assert_eq!(
+        crate::kernel::with_kernel(|k| k.process_mut(11).pending_signals),
+        0
+    );
+}
+
+#[test]
+fn killpg_missing_group_and_bad_signal_return_errors() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut missing = Vec::new();
+    missing.extend_from_slice(&99_u32.to_le_bytes());
+    missing.extend_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_KILLPG, 1, &missing, &mut []),
+        -(abi::ESRCH as i64)
+    );
+
+    let mut bad_sig = Vec::new();
+    bad_sig.extend_from_slice(&1_u32.to_le_bytes());
+    bad_sig.extend_from_slice(&64_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_KILLPG, 1, &bad_sig, &mut []),
         -(abi::EINVAL as i64)
     );
 }
@@ -4304,6 +4919,8 @@ fn proc_comm_is_basename_of_argv0() {
 fn proc_cwd_serves_chdir_path() {
     let _g = crate::kernel::TestGuard::acquire();
     // Set cwd via sys_chdir, then read /proc/<N>/cwd.
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 11, b"/var", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 11, b"/var/tmp", &mut []), 0);
     assert_eq!(dispatch(METHOD_SYS_CHDIR, 11, b"/var/tmp", &mut []), 0);
 
     let fd = dispatch(METHOD_SYS_OPEN, 11, &open_req(0, b"/proc/11/cwd"), &mut []);
@@ -4614,6 +5231,65 @@ fn chown_rejects_unprivileged_caller() {
     assert_eq!(
         dispatch(METHOD_SYS_CHOWN, 1, &req, &mut []),
         -(abi::EPERM as i64)
+    );
+}
+
+#[test]
+fn fchown_updates_metadata_for_file_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    make_root(1);
+    let mut reg = Vec::new();
+    reg.extend_from_slice(&5_u32.to_le_bytes());
+    reg.extend_from_slice(b"/fco1");
+    reg.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/fco1"), &mut []) as u32;
+    let mut req = Vec::new();
+    req.extend_from_slice(&fd.to_le_bytes());
+    req.extend_from_slice(&123_u32.to_le_bytes());
+    req.extend_from_slice(&456_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHOWN, 1, &req, &mut []),
+        0,
+        "root can fchown an open file fd"
+    );
+
+    let meta = crate::kernel::with_kernel(|k| {
+        let pair = k.vfs.open(b"/fco1", 0).unwrap();
+        k.resolve_metadata(pair.0, pair.1)
+    });
+    assert_eq!(meta.uid, 123);
+    assert_eq!(meta.gid, 456);
+}
+
+#[test]
+fn fchown_rejects_invalid_fd_and_unprivileged_caller() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = Vec::new();
+    reg.extend_from_slice(&5_u32.to_le_bytes());
+    reg.extend_from_slice(b"/fco2");
+    reg.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/fco2"), &mut []) as u32;
+    let mut req = Vec::new();
+    req.extend_from_slice(&fd.to_le_bytes());
+    req.extend_from_slice(&123_u32.to_le_bytes());
+    req.extend_from_slice(&456_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHOWN, 1, &req, &mut []),
+        -(abi::EPERM as i64),
+        "non-root cannot fchown"
+    );
+
+    let mut bad_fd_req = Vec::new();
+    bad_fd_req.extend_from_slice(&999_u32.to_le_bytes());
+    bad_fd_req.extend_from_slice(&123_u32.to_le_bytes());
+    bad_fd_req.extend_from_slice(&456_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHOWN, 1, &bad_fd_req, &mut []),
+        -(abi::EBADF as i64)
     );
 }
 
@@ -4972,6 +5648,11 @@ fn sys_spawn_inherits_parent_cwd_and_fd_table() {
     dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
 
     let parent_pid = 7;
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, parent_pid, b"/tmp", &mut []), 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_MKDIR, parent_pid, b"/tmp/work", &mut []),
+        0
+    );
     assert_eq!(
         dispatch(METHOD_SYS_CHDIR, parent_pid, b"/tmp/work", &mut []),
         0
@@ -5884,6 +6565,90 @@ fn lifecycle_host_control_is_not_available_through_generic_dispatch() {
     exit.extend_from_slice(&0_i32.to_le_bytes());
     assert_eq!(dispatch(14, 0, &exit, &mut []), -(abi::ENOSYS as i64));
     assert_eq!(dispatch(15, 0, &[], &mut [0u8; 32]), -(abi::ENOSYS as i64));
+}
+
+#[test]
+fn sys_thread_self_maps_main_to_zero_and_worker_to_tid() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_THREAD_SELF, 9, &[], &mut []), 0);
+
+    let ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: 2,
+    };
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_SELF, ctx, &[], &mut []),
+        2
+    );
+}
+
+#[test]
+fn sys_thread_spawn_allocates_tid_and_calls_host() {
+    let _g = crate::kernel::TestGuard::acquire();
+    kh::test_support::reset_thread_mock();
+    kh::test_support::push_thread_spawn_result(77);
+    crate::kernel::with_kernel(|k| {
+        k.insert_host_process(9, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+    });
+
+    let mut req = 0x1234_u32.to_le_bytes().to_vec();
+    req.extend_from_slice(&0x5678_u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_THREAD_SPAWN, 9, &req, &mut []), 2);
+    assert_eq!(
+        kh::test_support::thread_spawn_calls(),
+        vec![(9, 2, 0x1234, 0x5678)]
+    );
+    let worker = crate::kernel::with_kernel(|k| {
+        k.process(9)
+            .threads
+            .get(&2)
+            .expect("spawned thread")
+            .clone()
+    });
+    assert_eq!(worker.host_thread_handle, Some(77));
+}
+
+#[test]
+fn sys_thread_join_preserves_high_bit_retval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.insert_host_process(9, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+        let tid = k.spawn_thread(9, Some(77)).expect("thread spawn");
+        assert_eq!(tid, 2);
+        k.exit_thread_authenticated(9, tid, 0x8000_0001)
+            .expect("thread exit");
+    });
+
+    let ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+    let mut out = [0; 4];
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_JOIN, ctx, &2_u32.to_le_bytes(), &mut out),
+        0
+    );
+    assert_eq!(u32::from_le_bytes(out), 0x8000_0001);
+}
+
+#[test]
+fn sys_thread_join_running_thread_suspends_without_spinning() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.insert_host_process(9, 0, vec![b"/bin/threaded".to_vec()], Some(10));
+        let tid = k.spawn_thread(9, Some(77)).expect("thread spawn");
+        assert_eq!(tid, 2);
+    });
+
+    let ctx = DispatchContext {
+        caller_pid: 9,
+        caller_tid: crate::kernel::MAIN_THREAD_TID,
+    };
+    let mut out = [0; 4];
+    assert_eq!(
+        dispatch_with_context(METHOD_SYS_THREAD_JOIN, ctx, &2_u32.to_le_bytes(), &mut out),
+        -(abi::EAGAIN as i64)
+    );
 }
 
 #[test]

@@ -364,8 +364,8 @@ export function createWorkerYurtImports(
  * load-bearing guard against silent correctness regressions.
  */
 export interface WorkerHostDispatcherBodies {
-  threadYield(): number;
-  threadExit(retval: number): void;
+  threadYield(callerTid?: number): number;
+  threadExit(retval: number, callerTid?: number): void;
   writeFd(fd: number, data: Uint8Array): number;
   readFd(fd: number, cap: number): { result: number; bytes?: Uint8Array };
   socketOpen(domain: number, type: number, protocol: number): number;
@@ -405,7 +405,7 @@ export interface WorkerHostDispatcherBodies {
    * from a pthread worker. Returns the new tid immediately; the
    * spawn itself runs asynchronously in the background.
    */
-  threadSpawn(fnPtr: number, arg: number): number;
+  threadSpawn(fnPtr: number, arg: number, callerTid?: number): number;
   /**
    * Record the bind address for an AF_INET socket fd from a pthread
    * worker. Loopback only; rejects anything that isn't 127.0.0.1 /
@@ -439,6 +439,10 @@ export interface DispatcherTarget {
   ): void;
 }
 
+export interface WorkerHostDispatcherContext {
+  callerTid?: number;
+}
+
 /**
  * Main-side dispatcher: attaches a `message` listener to the worker
  * that decodes a "host-call" request from the SAB, invokes the
@@ -456,6 +460,7 @@ export function attachWorkerHostDispatcher(
   worker: DispatcherTarget,
   sab: SharedArrayBuffer,
   bodies: WorkerHostDispatcherBodies,
+  context: WorkerHostDispatcherContext = {},
 ): void {
   const header = new Int32Array(sab, 0, HEADER_WORDS);
   const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
@@ -472,10 +477,10 @@ export function attachWorkerHostDispatcher(
     try {
       switch (op) {
         case WorkerHostOp.ThreadYield:
-          result = bodies.threadYield();
+          result = bodies.threadYield(context.callerTid);
           break;
         case WorkerHostOp.ThreadExit:
-          bodies.threadExit(payload[PAYLOAD_ARGS_WORD + 0]);
+          bodies.threadExit(payload[PAYLOAD_ARGS_WORD + 0], context.callerTid);
           result = 0;
           break;
         case WorkerHostOp.WriteFd: {
@@ -568,6 +573,7 @@ export function attachWorkerHostDispatcher(
           result = bodies.threadSpawn(
             payload[PAYLOAD_ARGS_WORD + 0],
             payload[PAYLOAD_ARGS_WORD + 1],
+            context.callerTid,
           );
           break;
         case WorkerHostOp.SocketBind: {

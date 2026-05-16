@@ -570,11 +570,9 @@ static int do_posix_spawn(pid_t *pid_out, const char *prog,
   if (stdin_fd < 0 && stdin_fd != -1) goto fail_open;
   if (stdout_fd < 0 && stdout_fd != -1) goto fail_open;
   if (stderr_fd < 0 && stderr_fd != -1) goto fail_open;
-  /* Treat "closed" (stdin_fd == -1) as inheriting parent fd 0/1/2 —
-   * see resolve_stdio_fds above. */
-  if (stdin_fd  == -1) stdin_fd  = 0;
-  if (stdout_fd == -1) stdout_fd = 1;
-  if (stderr_fd == -1) stderr_fd = 2;
+  /* Keep "closed" stdio as -1. SpawnRequest consumers model that as
+   * no child fd entry instead of silently inheriting the parent's
+   * matching fd. */
 
   const char *cwd = resolve_chdir(fa);
   unsigned char *record = (unsigned char *)calloc(1, 65536);

@@ -4075,6 +4075,29 @@ export function createKernelImports(
       return 0;
     },
 
+    host_socket_set_no_delay(
+      fd: number,
+      enabledRaw: number,
+    ): number | Promise<number> {
+      const target = opts.kernel?.getFdTarget(callerPid, fd);
+      if (!target || target.type !== "socket") return -9;
+      const enabled = enabledRaw !== 0;
+      if (target.socket !== null) {
+        const setR = target.setNoDelay?.(target.socket, enabled) ??
+          { ok: false as const, error: "TCP_NODELAY not supported" };
+        if (typeof (setR as Promise<unknown>).then === "function") {
+          return (setR as Promise<{ ok: boolean }>).then((r) => {
+            if (!r.ok) return -95;
+            target.noDelay = enabled;
+            return 0;
+          });
+        }
+        if (!(setR as { ok: boolean }).ok) return -95;
+      }
+      target.noDelay = enabled;
+      return 0;
+    },
+
     // host_socket_socketpair(family, type, sv_ptr) -> 0 | -1
     // Creates a connected AF_UNIX socket pair. Writes the two fd numbers as
     // i32 LE at sv_ptr and sv_ptr+4.
@@ -5002,8 +5025,18 @@ export function createKernelImports(
     const tb = opts.threadsBackend;
     imports.host_thread_spawn = ((fnPtr: number, arg: number) =>
       tb.spawn(fnPtr, arg)) as unknown as WebAssembly.ImportValue;
-    imports.host_thread_join = ((tid: number) =>
-      tb.join(tid)) as unknown as WebAssembly.ImportValue;
+    imports.host_thread_join = (async (tid: number, outRetvalPtr: number) => {
+      const retval = await tb.join(tid);
+      if (retval < 0) {
+        return retval;
+      }
+      const end = outRetvalPtr + 4;
+      if (outRetvalPtr < 0 || end > memory.buffer.byteLength) {
+        return ERR_IO;
+      }
+      new DataView(memory.buffer).setUint32(outRetvalPtr, retval >>> 0, true);
+      return 0;
+    }) as unknown as WebAssembly.ImportValue;
     imports.host_thread_detach = ((tid: number) =>
       tb.detach(tid)) as unknown as WebAssembly.ImportValue;
     imports.host_thread_exit = ((retval: number) => {

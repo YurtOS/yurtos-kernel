@@ -23,6 +23,7 @@ import { createThreadsBackend } from "./threads/backend-factory.js";
 import {
   defaultSpawnThread,
   type WorkerSabThreadsBackendOptions,
+  type WorkerSabThreadStart,
 } from "./threads/worker-sab.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
 import type {
@@ -106,13 +107,40 @@ export function resolveWorkerSabThreads(
   memory: WebAssembly.Memory | undefined,
   provided: WorkerSabThreadsBackendOptions | undefined,
   bodies?: WorkerHostDispatcherBodies,
+  threadExited?: WorkerSabThreadsBackendOptions["threadExited"],
 ): WorkerSabThreadsBackendOptions | undefined {
-  if (provided) return provided;
+  if (provided) {
+    if (!threadExited) return provided;
+    return {
+      ...provided,
+      threadExited: (exit) => {
+        provided.threadExited?.(exit);
+        threadExited(exit);
+      },
+    };
+  }
   if (!profile.requiresSharedMemory || !memory) return undefined;
-  return { spawnThread: defaultSpawnThread(module, memory, bodies) };
+  return {
+    spawnThread: defaultSpawnThread(module, memory, bodies),
+    ...(threadExited ? { threadExited } : {}),
+  };
 }
 
 type WasmCallable = (...args: unknown[]) => unknown;
+
+interface RustThreadHostBackend extends ThreadsBackend {
+  spawnRustThread(start: WorkerSabThreadStart): number;
+  releaseRustThread(handle: number): number;
+  cancelRustThread(handle: number): number;
+}
+
+function isRustThreadHostBackend(
+  backend: ThreadsBackend,
+): backend is RustThreadHostBackend {
+  return "spawnRustThread" in backend &&
+    "releaseRustThread" in backend &&
+    "cancelRustThread" in backend;
+}
 
 // Only imports proven safe for today's JSPI and Asyncify binaries belong here.
 // Do not add WASI path_* imports until the affected guests are built with those
@@ -152,6 +180,29 @@ function bindSignalDeliverer(
   wasi.setSignalDeliverer((sig) => {
     (deliverSignal as (sig: number) => unknown)(sig);
   });
+}
+
+export interface WasmProcessThreadHost {
+  spawn(tid: number, fnPtr: number, arg: number): number;
+  release(handle: number): number;
+  cancel(handle: number): number;
+}
+
+export interface WasmThreadHostRegistry {
+  registerProcess(pid: number, host: WasmProcessThreadHost): () => void;
+  threadExited?(
+    pid: number,
+    tid: number,
+    localHandle: number,
+    retval: number,
+  ): void;
+  threadSpawn?(
+    callerPid: number,
+    callerTid: number,
+    fnPtr: number,
+    arg: number,
+  ): number;
+  threadYield?(callerPid: number, callerTid: number): number;
 }
 
 export interface LoaderContext {
@@ -198,6 +249,20 @@ export interface LoaderContext {
    * Asyncify. Used by the opt-in Rust kernel host-interface overlay.
    */
   extraAsyncImports?: string[];
+  /**
+   * Registers per-process Worker/SAB thread executors for the Rust
+   * kernel.wasm host interface. The registry owns any global host-handle
+   * translation; loader only exposes process-local Worker/SAB handles.
+   */
+  wasmThreadHostRegistry?: WasmThreadHostRegistry;
+  forkLifecycle?: ForkLifecycleHooks;
+}
+
+export interface ForkLifecycleHooks {
+  prepareFork(parentPid: number): number;
+  commitFork(parentPid: number, childPid: number): number;
+  rollbackFork(parentPid: number, childPid: number): number;
+  recordExit?(pid: number, exitStatus: number): number;
 }
 
 export interface LoadProcessOptions {
@@ -282,8 +347,35 @@ export async function loadProcess(
         // See `callerPid` doc-comment on MakeWorkerDispatcherBodiesOptions.
         callerPid: () => pidRef ?? 0,
         threadsBackend: () => threadsBackendRef,
+        rustThreads: ctx.wasmThreadHostRegistry?.threadSpawn &&
+            ctx.wasmThreadHostRegistry.threadYield
+          ? {
+            spawn: (callerPid, callerTid, fnPtr, arg) =>
+              ctx.wasmThreadHostRegistry!.threadSpawn!(
+                callerPid,
+                callerTid,
+                fnPtr,
+                arg,
+              ),
+            yield: (callerPid, callerTid) =>
+              ctx.wasmThreadHostRegistry!.threadYield!(callerPid, callerTid),
+          }
+          : undefined,
         socketBackend: ctx.socketBackend ?? null,
       })
+      : undefined;
+  const rustThreadExited:
+    | WorkerSabThreadsBackendOptions["threadExited"]
+    | undefined = ctx.wasmThreadHostRegistry?.threadExited
+      ? (exit) => {
+        if (pidRef === null) return;
+        ctx.wasmThreadHostRegistry!.threadExited!(
+          pidRef,
+          exit.tid,
+          exit.handle,
+          exit.retval,
+        );
+      }
       : undefined;
   const workerSabThreads = resolveWorkerSabThreads(
     profile,
@@ -291,8 +383,9 @@ export async function loadProcess(
     workerSabMemory,
     opts.workerSabThreads,
     workerHostBodies,
+    rustThreadExited,
   );
-  const threadsBackend = createThreadsBackend(profile, {
+  const threadsBackend: ThreadsBackend = createThreadsBackend(profile, {
     workerSab: workerSabThreads,
     workerSabMemory,
   });
@@ -303,7 +396,13 @@ export async function loadProcess(
   const rollbackOnFailure = opts.rollbackOnFailure ?? true;
   const pid = ctx.allocatePid(argv);
   pidRef = pid;
+  let unregisterWasmThreadHost: (() => void) | undefined;
+  const unregisterThreadHost = () => {
+    unregisterWasmThreadHost?.();
+    unregisterWasmThreadHost = undefined;
+  };
   const rollback = () => {
+    unregisterThreadHost();
     if (rollbackOnFailure) ctx.kernel.discardProcess(pid);
   };
 
@@ -328,6 +427,17 @@ export async function loadProcess(
       2,
       createBufferTarget(opts.stderrLimit ?? Infinity),
     );
+  }
+  if (
+    ctx.wasmThreadHostRegistry &&
+    isRustThreadHostBackend(threadsBackend)
+  ) {
+    unregisterWasmThreadHost = ctx.wasmThreadHostRegistry.registerProcess(pid, {
+      spawn: (tid, fnPtr, arg) =>
+        threadsBackend.spawnRustThread({ tid, fnPtr, arg }),
+      release: (handle) => threadsBackend.releaseRustThread(handle),
+      cancel: (handle) => threadsBackend.cancelRustThread(handle),
+    });
   }
 
   const proc = Process.__forLoader({ pid, mode });
@@ -528,13 +638,75 @@ export async function loadProcess(
   ): number => {
     if (!asyncifyBridge || !asyncifyInitialized) return -38; // ENOSYS
     if (memoryRef?.buffer instanceof SharedArrayBuffer) return -11; // EAGAIN
-    if (!ctx.kernel.canReserveProcessSlot()) return -11; // EAGAIN
+    const forkLifecycle = ctx.forkLifecycle;
+    if (!forkLifecycle && !ctx.kernel.canReserveProcessSlot()) {
+      return -11; // EAGAIN
+    }
 
-    const childPid = ctx.kernel.allocPid(parentPid, path);
-    const childFdTable = ctx.kernel.buildFdTableForFork(parentPid, childPid);
-    ctx.kernel.adoptFdTable(childPid, childFdTable);
+    let childPid: number;
+    try {
+      childPid = forkLifecycle
+        ? forkLifecycle.prepareFork(parentPid)
+        : ctx.kernel.allocPid(parentPid, path);
+    } catch {
+      return -11; // EAGAIN
+    }
+    if (childPid < 0) return childPid;
+    const rollbackRustFork = () => {
+      if (!forkLifecycle) return;
+      try {
+        forkLifecycle.rollbackFork(parentPid, childPid);
+      } catch {
+        // Nothing else can observe an uncommitted Rust fork after the
+        // host-control rollback fails; keep the adapter mirror consistent.
+      }
+    };
+
+    let localMirrorRegistered = false;
+    try {
+      if (forkLifecycle) {
+        ctx.kernel.registerPending(childPid, path, parentPid);
+        localMirrorRegistered = true;
+      }
+      const childFdTable = ctx.kernel.buildFdTableForFork(parentPid, childPid);
+      ctx.kernel.adoptFdTable(childPid, childFdTable);
+    } catch (_err) {
+      if (forkLifecycle) {
+        rollbackRustFork();
+        if (localMirrorRegistered) ctx.kernel.discardProcess(childPid);
+      }
+      return -11; // EAGAIN
+    }
     const wasiSnapshot = parentWasi.snapshotForFork();
 
+    let rustForkCommitted = false;
+    if (forkLifecycle) {
+      let commitResult: number;
+      try {
+        commitResult = forkLifecycle.commitFork(parentPid, childPid);
+      } catch {
+        commitResult = -11; // EAGAIN
+      }
+      if (commitResult < 0) {
+        rollbackRustFork();
+        ctx.kernel.discardProcess(childPid);
+        return commitResult;
+      }
+      rustForkCommitted = true;
+    }
+    let rustForkExitRecorded = false;
+    const recordRustForkExit = (exitCode: number, signal?: number) => {
+      if (!forkLifecycle?.recordExit) return;
+      if (rustForkExitRecorded) return;
+      const exitStatus = signal && signal > 0 ? 128 + signal : exitCode;
+      const recordResult = forkLifecycle.recordExit(childPid, exitStatus);
+      if (recordResult < 0) {
+        throw new Error(
+          `kernel_record_exit(${childPid}, ${exitStatus}) failed: ${recordResult}`,
+        );
+      }
+      rustForkExitRecorded = true;
+    };
     const childPromise = (async () => {
       const childWasi = ctx.buildWasiHost(childPid, wasiArgv, env, cwd);
       childWasi.restoreForkSnapshot(wasiSnapshot);
@@ -693,9 +865,21 @@ export async function loadProcess(
         : undefined;
       childBridge.startForkRewind();
       const exitCode = await childWasi.startAsync(childInstance, childStartFn);
+      recordRustForkExit(exitCode, childWasi.getExitSignal());
       ctx.releasePid(childPid, exitCode, childWasi.getExitSignal());
     })().catch(() => {
-      ctx.releasePid(childPid, 127);
+      if (forkLifecycle && !rustForkCommitted) {
+        rollbackRustFork();
+        ctx.kernel.discardProcess(childPid);
+      } else {
+        try {
+          recordRustForkExit(127);
+        } catch {
+          // The continuation adapter is already failing; keep the local
+          // mirror reapable rather than letting a stale async rejection leak.
+        }
+        ctx.releasePid(childPid, 127);
+      }
     });
     void childPromise;
     return childPid;
@@ -758,6 +942,7 @@ export async function loadProcess(
   proc.__setTerminate(async () => {
     wasi.cancelExecution();
     threadsBackend.cancelDetachedThreads?.();
+    unregisterThreadHost();
     ctx.releasePid(pid, proc.exitCode ?? 0, wasi.getExitSignal());
   });
 

@@ -104,6 +104,12 @@ function encodeTwoPathRequest(
   return req;
 }
 
+function u32(value: number): Uint8Array {
+  const req = new Uint8Array(4);
+  new DataView(req.buffer).setUint32(0, value >>> 0, true);
+  return req;
+}
+
 function spawnFromRamfs(
   mk: KernelHostInterface,
   parentPid: number,
@@ -419,30 +425,36 @@ Deno.test(
   async () => {
     // Mirror of fixture_parity / kernel_wasm_trampoline equivalents on
     // the wasmtime side. Each direct .syscall() call passes KERNEL_PID
-    // (0) as the caller, so we use an explicit non-zero target pid.
+    // (0) as the caller, so we create an explicit non-zero target pid.
     const mk = await freshKernelHostInterface();
 
-    const targetPid = 42;
+    const targetPid = spawnFromRamfs(mk, 1, s("/bin/pgid"), [s("pgid")]);
     const target = new Uint8Array(4);
     new DataView(target.buffer).setUint32(0, targetPid, true);
 
-    // getpgid(42) lazily primes pgid to the target pid.
+    // getpgid(pid) returns the process's initial pgid.
     let { rc } = mk.syscall(METHOD.SYS_GETPGID, target, 0);
     assertEquals(Number(rc), targetPid);
 
-    // setpgid(42, 99).
+    // setpgid(target, 99) rejects a process group that does not exist in
+    // the target's session.
     const setReq = new Uint8Array(8);
     const setView = new DataView(setReq.buffer);
     setView.setUint32(0, targetPid, true);
     setView.setUint32(4, 99, true);
     ({ rc } = mk.syscall(METHOD.SYS_SETPGID, setReq, 0));
+    assertEquals(Number(rc), -1);
+
+    // setpgid(target, 0) keeps the target as its own group leader.
+    setView.setUint32(4, 0, true);
+    ({ rc } = mk.syscall(METHOD.SYS_SETPGID, setReq, 0));
     assertEquals(Number(rc), 0);
 
-    // getpgid now reflects 99.
+    // getpgid still reflects the target pid.
     ({ rc } = mk.syscall(METHOD.SYS_GETPGID, target, 0));
-    assertEquals(Number(rc), 99);
+    assertEquals(Number(rc), targetPid);
 
-    // getsid(42) lazily primes sid independently.
+    // getsid(target) lazily primes sid independently.
     ({ rc } = mk.syscall(METHOD.SYS_GETSID, target, 0));
     assertEquals(Number(rc), targetPid);
   },
@@ -477,6 +489,12 @@ Deno.test(
     const k1 = new Uint8Array(8);
     new DataView(k1.buffer).setUint32(0, targetPid, true);
     ({ rc } = mk.syscall(METHOD.SYS_KILL, k1, 0));
+    assertEquals(Number(rc), 0);
+
+    // killpg(sig=0) succeeds as an alive probe for the target process group.
+    const kg1 = new Uint8Array(8);
+    new DataView(kg1.buffer).setUint32(0, targetPid, true);
+    ({ rc } = mk.syscall(METHOD.SYS_KILLPG, kg1, 0));
     assertEquals(Number(rc), 0);
 
     // kill out-of-range → -EINVAL (-22).
@@ -677,13 +695,211 @@ Deno.test("thread lifecycle controls mutate the kernel-owned thread snapshot", a
   );
 
   mk.recordThreadExit(childPid, tid, 123);
-  assertEquals(mk.listThreads(childPid).find((t) => t.tid === tid), {
-    tid,
-    state: "exited",
-    detached: true,
-    exitValue: 123,
-    hostThreadHandle: 91,
+  assertEquals(mk.listThreads(childPid).find((t) => t.tid === tid), undefined);
+});
+
+Deno.test("thread host callbacks execute Rust-owned spawn and release", async () => {
+  const host = defaultHostState() as ReturnType<typeof defaultHostState> & {
+    threadHost: {
+      spawn(pid: number, tid: number, fnPtr: number, arg: number): number;
+      release(handle: number): number;
+      cancel(handle: number): number;
+    };
+  };
+  const spawnCalls: number[][] = [];
+  const releaseCalls: number[] = [];
+  host.threadHost = {
+    spawn(pid, tid, fnPtr, arg) {
+      spawnCalls.push([pid, tid, fnPtr, arg]);
+      return 77;
+    },
+    release(handle) {
+      releaseCalls.push(handle);
+      return 0;
+    },
+    cancel() {
+      return 0;
+    },
+  };
+  const mk = await KernelHostInterface.load(await kernelWasm(), host);
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
+  const request = new Uint8Array(8);
+  const view = new DataView(request.buffer);
+  view.setUint32(0, 123, true);
+  view.setUint32(4, 456, true);
+
+  const spawn = mk.kernelThreadSyscall(
+    METHOD.SYS_THREAD_SPAWN,
+    childPid,
+    1,
+    request,
+    0,
+  );
+
+  assertEquals(Number(spawn.rc), 2);
+  assertEquals(spawnCalls, [[childPid, 2, 123, 456]]);
+  assertEquals(mk.listThreads(childPid).find((t) => t.tid === 2), {
+    tid: 2,
+    state: "runnable",
+    detached: false,
+    exitValue: -1,
+    hostThreadHandle: 77,
   });
+
+  mk.recordThreadExit(childPid, 2, 0xfeed_face);
+  const join = mk.kernelThreadSyscall(
+    METHOD.SYS_THREAD_JOIN,
+    childPid,
+    1,
+    u32(2),
+    4,
+  );
+
+  assertEquals(Number(join.rc), 0);
+  assertEquals(releaseCalls, [77]);
+  assertEquals(mk.listThreads(childPid).find((t) => t.tid === 2), undefined);
+});
+
+Deno.test("thread dispatch authenticates main caller tid for pthread_self", async () => {
+  const mk = await freshKernelHostInterface();
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
+
+  const out = mk.kernelThreadSyscall(
+    METHOD.SYS_THREAD_SELF,
+    childPid,
+    1,
+    new Uint8Array(0),
+    0,
+  );
+
+  assertEquals(Number(out.rc), 0);
+});
+
+Deno.test("user-process host_thread_self routes through Rust thread dispatch", async () => {
+  const wasm = await wat2wasm(`(module
+    (import "yurt" "host_thread_self" (func $host_thread_self (result i32)))
+    (func (export "run") (result i32)
+      call $host_thread_self))`);
+  const mk = await freshKernelHostInterface();
+  const user = mk.spawnUserProcess(wasm);
+
+  assertEquals(user.callExportI32("run"), 0);
+});
+
+Deno.test("user-process host_thread_spawn executes and joins through Rust state", async () => {
+  const wasm = await wat2wasm(`(module
+    (import "yurt" "host_thread_spawn" (func $spawn (param i32 i32) (result i32)))
+    (import "yurt" "host_thread_join" (func $join (param i32 i32) (result i32)))
+    (memory (export "memory") 1)
+    (global $tid (mut i32) (i32.const 0))
+    (func $worker (param i32) (result i32)
+      local.get 0)
+    (table (export "__indirect_function_table") 1 funcref)
+    (elem (i32.const 0) $worker)
+    (func (export "spawn") (result i32)
+      i32.const 0
+      i32.const 0x80000000
+      call $spawn
+      global.set $tid
+      global.get $tid)
+    (func (export "join") (result i32)
+      global.get $tid
+      i32.const 4
+      call $join))`);
+  const mk = await freshKernelHostInterface();
+  const user = mk.spawnUserProcess(wasm);
+
+  assertEquals(user.callExportI32("spawn"), 2);
+  await Promise.resolve();
+  assertEquals(user.callExportI32("join"), 0);
+  assertEquals(
+    new DataView(user.readMemory(4, 4).buffer).getUint32(0, true),
+    0x8000_0000,
+  );
+  assertEquals(mk.listThreads(user.pid).find((t) => t.tid === 2), undefined);
+});
+
+Deno.test("spawned user-process thread sees its Rust-owned tid", async () => {
+  const wasm = await wat2wasm(`(module
+    (import "yurt" "host_thread_spawn" (func $spawn (param i32 i32) (result i32)))
+    (import "yurt" "host_thread_join" (func $join (param i32 i32) (result i32)))
+    (import "yurt" "host_thread_self" (func $self (result i32)))
+    (memory (export "memory") 1)
+    (global $tid (mut i32) (i32.const 0))
+    (func $worker (param i32) (result i32)
+      call $self)
+    (table (export "__indirect_function_table") 1 funcref)
+    (elem (i32.const 0) $worker)
+    (func (export "spawn") (result i32)
+      i32.const 0
+      i32.const 0
+      call $spawn
+      global.set $tid
+      global.get $tid)
+    (func (export "join") (result i32)
+      global.get $tid
+      i32.const 4
+      call $join))`);
+  const mk = await freshKernelHostInterface();
+  const user = mk.spawnUserProcess(wasm);
+
+  assertEquals(user.callExportI32("spawn"), 2);
+  await Promise.resolve();
+  assertEquals(user.callExportI32("join"), 0);
+  assertEquals(
+    new DataView(user.readMemory(4, 4).buffer).getUint32(0, true),
+    2,
+  );
+});
+
+Deno.test("user-process host_thread_join waits for pending JS thread execution", async () => {
+  const wasm = await wat2wasm(`(module
+    (import "yurt" "host_thread_spawn" (func $spawn (param i32 i32) (result i32)))
+    (import "yurt" "host_thread_join" (func $join (param i32 i32) (result i32)))
+    (memory (export "memory") 1)
+    (func $worker (param i32) (result i32)
+      local.get 0)
+    (table (export "__indirect_function_table") 1 funcref)
+    (elem (i32.const 0) $worker)
+    (func (export "run") (result i32)
+      i32.const 0
+      i32.const 77
+      call $spawn
+      i32.const 4
+      call $join))`);
+  const mk = await freshKernelHostInterface();
+  const user = mk.spawnUserProcess(wasm);
+
+  assertEquals(user.callExportI32("run"), 0);
+  assertEquals(
+    new DataView(user.readMemory(4, 4).buffer).getUint32(0, true),
+    77,
+  );
+  assertEquals(mk.listThreads(user.pid).find((t) => t.tid === 2), undefined);
+});
+
+Deno.test("thread dispatch returns join status separately from raw retval bits", async () => {
+  const mk = await freshKernelHostInterface();
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
+  const tid = mk.spawnThread(childPid, 91);
+  mk.recordThreadExit(childPid, tid, 0x8000_0000);
+
+  const out = mk.kernelThreadSyscall(
+    METHOD.SYS_THREAD_JOIN,
+    childPid,
+    1,
+    u32(tid),
+    4,
+  );
+
+  assertEquals(Number(out.rc), 0);
+  assertEquals(
+    new DataView(out.response.buffer, out.response.byteOffset, 4).getUint32(
+      0,
+      true,
+    ),
+    0x8000_0000,
+  );
 });
 
 Deno.test("scheduleNext reads kernel-owned runnable decisions with budgets", async () => {
@@ -798,6 +1014,30 @@ Deno.test("waitProcess and killProcess enter kernel-owned process control", asyn
   assertEquals(mk.waitProcess(1, 0, 0), { pid: childPid, status: 17 });
   assertEquals(mk.killProcess(childPid, 15), 0);
   assertEquals(mk.killProcess(childPid, 64), -22);
+});
+
+Deno.test("fork prepare commit and rollback use kernel-owned process control", async () => {
+  const mk = await freshKernelHostInterface();
+  const parentWasm = await wat2wasm(`(module
+    (memory (export "memory") 1)
+    (func (export "run") (result i32) i32.const 0))`);
+  mk.cacheProcessModule(s("fork-parent"), parentWasm);
+  const parent = mk.spawnCachedProcess(s("fork-parent"), [s("/bin/parent")]);
+  const forkControl = mk as unknown as {
+    prepareFork(parentPid: number): number;
+    commitFork(parentPid: number, childPid: number): void;
+    rollbackFork(parentPid: number, childPid: number): void;
+  };
+
+  const child = forkControl.prepareFork(parent);
+  assertEquals(mk.listProcesses().some((p) => p.pid === child), false);
+
+  forkControl.commitFork(parent, child);
+  assertEquals(mk.listProcesses().some((p) => p.pid === child), true);
+
+  const rolledBack = forkControl.prepareFork(parent);
+  forkControl.rollbackFork(parent, rolledBack);
+  assertEquals(mk.listProcesses().some((p) => p.pid === rolledBack), false);
 });
 
 Deno.test("drainPendingSpawn and recordExit use typed kernel lifecycle exports", async () => {

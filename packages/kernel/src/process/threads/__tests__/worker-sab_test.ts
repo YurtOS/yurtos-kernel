@@ -157,3 +157,36 @@ Deno.test("WorkerSabThreadsBackend: main's mutex owner doesn't collide with firs
   assertEquals(rc, 0);
   assertEquals(view.owner(), 0);
 });
+
+Deno.test("WorkerSabThreadsBackend: adapter spawn uses Rust-provided tid and returns host handle", async () => {
+  const calls: Array<{ tid: number; fnPtr: number; arg: number }> = [];
+  const exits: Array<{ tid: number; handle: number; retval: number }> = [];
+  const backend = new WorkerSabThreadsBackend({
+    spawnThread: ({ tid, fnPtr, arg }) => {
+      calls.push({ tid, fnPtr, arg });
+      return Promise.resolve(arg + 1);
+    },
+    threadExited: (exit) => exits.push(exit),
+  }, sharedMemory());
+
+  const handle = backend.spawnRustThread({ tid: 9, fnPtr: 123, arg: 41 });
+
+  assertEquals(handle, 1);
+  assertEquals(calls, [{ tid: 9, fnPtr: 123, arg: 41 }]);
+  await Promise.resolve();
+  assertEquals(exits, [{ tid: 9, handle: 1, retval: 42 }]);
+});
+
+Deno.test("WorkerSabThreadsBackend: adapter release and cancel are handle-scoped", () => {
+  const backend = new WorkerSabThreadsBackend({
+    spawnThread: () => new Promise(() => {}),
+  }, sharedMemory());
+
+  const first = backend.spawnRustThread({ tid: 9, fnPtr: 1, arg: 2 });
+  const second = backend.spawnRustThread({ tid: 10, fnPtr: 3, arg: 4 });
+
+  assertEquals(backend.releaseRustThread(first), 0);
+  assertEquals(backend.releaseRustThread(first), -WASI_ESRCH);
+  assertEquals(backend.cancelRustThread(second), 0);
+  assertEquals(backend.cancelRustThread(second), -WASI_ESRCH);
+});

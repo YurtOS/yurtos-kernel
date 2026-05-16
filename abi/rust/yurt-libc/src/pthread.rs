@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 const EAGAIN: c_int = 6;
 const EINVAL: c_int = 28;
 const ESRCH: c_int = 71;
+const HOST_EINVAL: c_int = 22;
 const PTHREAD_CREATE_JOINABLE: c_int = 0;
 const PTHREAD_CREATE_DETACHED: c_int = 1;
 const STACK_SIZE: usize = 1024 * 1024;
@@ -73,7 +74,7 @@ extern "C" {
     #[link_name = "host_thread_spawn"]
     fn yurt_host_thread_spawn(fn_ptr: c_int, arg: c_int) -> c_int;
     #[link_name = "host_thread_join"]
-    fn yurt_host_thread_join(tid: c_int) -> c_int;
+    fn yurt_host_thread_join(tid: c_int, out_retval: *mut u32) -> c_int;
     #[link_name = "host_thread_detach"]
     fn yurt_host_thread_detach(tid: c_int) -> c_int;
     #[link_name = "host_thread_exit"]
@@ -141,6 +142,27 @@ fn monotonic_clock_id() -> usize {
     core::ptr::addr_of!(_CLOCK_MONOTONIC) as usize
 }
 
+fn join_status_to_pthread_result(
+    status: c_int,
+    raw_retval: u32,
+    retval: *mut *mut c_void,
+) -> c_int {
+    if status == -HOST_EINVAL || status == -EINVAL {
+        return EINVAL;
+    }
+    if status < 0 {
+        return ESRCH;
+    }
+    if !retval.is_null() {
+        // SAFETY: `retval` was checked non-null and points to caller-provided
+        // storage for the joined thread's raw wasm32 return pointer bits.
+        unsafe {
+            *retval = raw_retval as usize as *mut c_void;
+        }
+    }
+    0
+}
+
 fn store_clock(attr: *mut c_void, value: usize) -> c_int {
     if attr.is_null() {
         return EINVAL;
@@ -200,21 +222,9 @@ pub extern "C" fn pthread_create(
 pub extern "C" fn pthread_join(thread: *mut c_void, retval: *mut *mut c_void) -> c_int {
     // SAFETY: imports are provided by the Yurt host. Invalid thread ids are
     // reported as negative return values by the host backend.
-    let rv = unsafe { yurt_host_thread_join(pthread_to_thread_id(thread)) };
-    if rv == -EINVAL {
-        return EINVAL;
-    }
-    if rv < 0 {
-        return ESRCH;
-    }
-    if !retval.is_null() {
-        // SAFETY: `retval` was checked non-null and points to caller-provided
-        // storage for the joined thread's return pointer.
-        unsafe {
-            *retval = rv as usize as *mut c_void;
-        }
-    }
-    0
+    let mut raw_retval = 0_u32;
+    let status = unsafe { yurt_host_thread_join(pthread_to_thread_id(thread), &mut raw_retval) };
+    join_status_to_pthread_result(status, raw_retval, retval)
 }
 
 #[no_mangle]
@@ -222,7 +232,7 @@ pub extern "C" fn pthread_detach(thread: *mut c_void) -> c_int {
     // SAFETY: imports are provided by the Yurt host. Invalid thread ids are
     // reported as negative return values by the host backend.
     let rv = unsafe { yurt_host_thread_detach(pthread_to_thread_id(thread)) };
-    if rv == -EINVAL {
+    if rv == -HOST_EINVAL || rv == -EINVAL {
         EINVAL
     } else if rv < 0 {
         ESRCH

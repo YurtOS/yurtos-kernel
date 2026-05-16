@@ -178,6 +178,61 @@ id = 0x1_0011
 kind = "syscall"
 doc = "Duplicate oldfd to exactly newfd, silently closing newfd first if it was open. Request bytes carry two u32s: oldfd, newfd. Returns newfd on success, -EBADF if oldfd is not open."
 
+[method.sys_dup_min]
+id = 0x1_0054
+kind = "syscall"
+doc = "POSIX fcntl(F_DUPFD): duplicate oldfd into the lowest free fd >= min_fd. Request bytes carry two u32s: oldfd, min_fd. Returns the new fd on success, -EBADF for a closed oldfd, or -EINVAL if no fd number is available."
+
+[method.sys_set_fd_descriptor_flags]
+id = 0x1_0055
+kind = "syscall"
+doc = "POSIX fcntl(F_SETFD) descriptor flags. Request bytes carry two u32s: fd, flags. Kernel currently stores FD_CLOEXEC bit 0 and clears unsupported bits. Returns 0 or -EBADF."
+
+[method.sys_tcgetpgrp]
+id = 0x1_0056
+kind = "syscall"
+doc = "Return the foreground process group for the terminal on fd. Request bytes carry u32 fd. Returns pgid, -EBADF, or -ENOTTY."
+
+[method.sys_tcsetpgrp]
+id = 0x1_0057
+kind = "syscall"
+doc = "Set the foreground process group for the terminal on fd. Request bytes carry u32 fd, u32 pgid. Returns 0, -EBADF, or -ENOTTY when fd is not a terminal or pgid is not in the caller's session."
+
+[method.sys_tcgetattr]
+id = 0x1_0058
+kind = "syscall"
+doc = "Write the minimal musl wasm32 termios compatibility record for a terminal fd. Request bytes carry u32 fd. Response is 60 bytes. Returns bytes-written/required-size, -EBADF, or -ENOTTY."
+
+[method.sys_tcsetattr]
+id = 0x1_0059
+kind = "syscall"
+doc = "Accept terminal attribute changes for a terminal fd. Request bytes carry u32 fd, u32 actions. Returns 0, -EBADF, or -ENOTTY. The kernel does not implement a line discipline."
+
+[method.sys_winsize]
+id = 0x1_005A
+kind = "syscall"
+doc = "Write struct winsize { rows, cols, xpixel, ypixel } for a terminal fd. Request bytes carry u32 fd. Response is 8 bytes. Returns bytes-written/required-size, -EBADF, or -ENOTTY."
+
+[method.sys_tiocsctty]
+id = 0x1_005B
+kind = "syscall"
+doc = "Register fd as the caller's controlling terminal. Request bytes carry u32 fd. Returns 0, -EBADF, -ENOTTY, or -EPERM when the caller is not a session leader."
+
+[method.sys_sched_getaffinity]
+id = 0x1_005C
+kind = "syscall"
+doc = "POSIX sched_getaffinity(pid, cpusetsize, mask). Request bytes carry u32 pid, u32 cpusetsize. Response writes cpusetsize bytes; Yurt currently exposes only CPU 0. Returns bytes-written, -EINVAL, or -ESRCH."
+
+[method.sys_sched_setaffinity]
+id = 0x1_005D
+kind = "syscall"
+doc = "POSIX sched_setaffinity(pid, cpusetsize, mask). Request bytes carry u32 pid, u32 cpusetsize, then cpusetsize mask bytes. Yurt currently accepts only CPU 0. Returns 0, -EINVAL, or -ESRCH."
+
+[method.sys_fchown]
+id = 0x1_005E
+kind = "syscall"
+doc = "POSIX fchown(fd, uid, gid). Request bytes carry u32 fd, u32 uid, u32 gid. Updates sandbox-view metadata for the open file description's inode. Returns 0, -EBADF, or -EPERM."
+
 [method.sys_pipe]
 id = 0x1_0012
 kind = "syscall"
@@ -216,7 +271,7 @@ doc = "POSIX getpgid(pid). Request bytes carry the u32 target pid (0 = self). Re
 [method.sys_setpgid]
 id = 0x1_0018
 kind = "syscall"
-doc = "POSIX setpgid(pid, pgid). Request bytes carry two little-endian u32s: target pid (0 = self), new pgid (0 = use target pid). Phase 2 has no permission checks; security policy comes later. Returns 0 on success or -ESRCH for unknown target."
+doc = "POSIX setpgid(pid, pgid). Request bytes carry two little-endian u32s: target pid (0 = self), new pgid (0 = use target pid). Rejects session leaders and groups outside the target session. Returns 0 on success or negated POSIX errno."
 
 [method.sys_getsid]
 id = 0x1_0019
@@ -232,6 +287,11 @@ doc = "POSIX setsid(): make the calling process a new session leader. No request
 id = 0x1_001B
 kind = "syscall"
 doc = "POSIX kill(pid, sig). Request bytes carry two little-endian u32s: target pid, signal number (0..=63). Phase 2 records nonzero signals in the target's pending mask but does not deliver — actual delivery requires async unwind (asyncify or JSPI) which lands when the AsyncBridge integration does. Returns 0 on success, -ESRCH for unknown pids, -EINVAL for sig out of range. sig==0 is the POSIX 'is the pid alive?' probe and succeeds only for an existing process."
+
+[method.sys_killpg]
+id = 0x1_0053
+kind = "syscall"
+doc = "POSIX killpg(pgid, sig). Request bytes carry two little-endian u32s: process group id (0 = caller's process group), signal number (0..=63). Records nonzero signals in all live members of the target group. Returns 0 on success, -ESRCH when the group has no live members, -EINVAL for sig out of range."
 
 [method.sys_sigaction]
 id = 0x1_001C
@@ -437,6 +497,46 @@ doc = "Return metadata for a caller-owned socket fd. Request bytes: u32 fd LE. R
 id = 0x1_004B
 kind = "syscall"
 doc = "Receive one datagram and its AF_UNIX sender address. Request bytes: u32 fd LE + u32 flags LE + u32 data_cap LE + u32 path_cap LE. Response: data_cap payload area + u32 path_len + u32 is_abstract + path bytes without abstract leading NUL. Returns payload byte count or a negated errno."
+
+[method.sys_socket_option]
+id = 0x1_004C
+kind = "syscall"
+doc = "Set or get a scalar socket option. Request bytes: u32 fd LE + u32 option LE + u32 has_value LE + i32 value LE. TCP_NODELAY round-trips through kernel socket state. Advisory set-only options succeed as no-ops; unsupported gets return -EOPNOTSUPP."
+
+[method.sys_thread_spawn]
+id = 0x1_004D
+kind = "syscall"
+doc = "Spawn a Rust-kernel-owned pthread. Request bytes: u32 fn_ptr LE + u32 arg LE. Returns tid in 1..=i32::MAX or negated errno."
+
+[method.sys_thread_self]
+id = 0x1_004E
+kind = "syscall"
+doc = "Return the authenticated caller's guest-visible pthread id. Main thread returns 0; workers return Rust-allocated tids >= 2."
+
+[method.sys_thread_join]
+id = 0x1_004F
+kind = "syscall"
+doc = "Join a Rust-kernel-owned pthread. Request bytes: u32 tid LE. Response bytes: u32 retval LE. Returns 0, -EAGAIN when the adapter must park the caller, or negated errno."
+
+[method.sys_thread_detach]
+id = 0x1_0050
+kind = "syscall"
+doc = "Detach a Rust-kernel-owned pthread. Request bytes: u32 tid LE. Returns 0 or negated errno."
+
+[method.sys_thread_exit]
+id = 0x1_0051
+kind = "syscall"
+doc = "Record exit for the authenticated caller thread. Request bytes: u32 retval LE. Does not return to the guest on the successful adapter path."
+
+[method.sys_thread_yield]
+id = 0x1_0052
+kind = "syscall"
+doc = "Yield the authenticated caller thread. No request bytes. Returns 0 or negated errno."
+
+[method.sys_fchdir]
+id = 0x1_005F
+kind = "syscall"
+doc = "Change the caller's working directory to an open directory fd. Request bytes: u32 fd LE. Returns 0 or negated POSIX errno."
 
 [method.sys_idb_get]
 id = 0x1_0035

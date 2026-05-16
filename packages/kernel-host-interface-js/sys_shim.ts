@@ -137,6 +137,20 @@ export function buildSysImports(
       v.setUint32(4, newfd >>> 0, true);
       return forwardRequestBytes(METHOD.SYS_DUP2, req);
     },
+    sys_dup_min: (oldfd, minfd) => {
+      const req = new Uint8Array(8);
+      const v = new DataView(req.buffer);
+      v.setUint32(0, oldfd >>> 0, true);
+      v.setUint32(4, minfd >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_DUP_MIN, req);
+    },
+    sys_set_fd_descriptor_flags: (fd, flags) => {
+      const req = new Uint8Array(8);
+      const v = new DataView(req.buffer);
+      v.setUint32(0, fd >>> 0, true);
+      v.setUint32(4, flags >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_SET_FD_DESCRIPTOR_FLAGS, req);
+    },
 
     sys_pipe: (outPtr) => {
       const { rc, response } = forwardRequestWithResponse(
@@ -194,7 +208,73 @@ export function buildSysImports(
     },
 
     sys_isatty: (fd) => forwardRequestBytes(METHOD.SYS_ISATTY, u32(fd)),
+    sys_tcgetpgrp: (fd) => forwardRequestBytes(METHOD.SYS_TCGETPGRP, u32(fd)),
+    sys_tcsetpgrp: (fd, pgid) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, pgid >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_TCSETPGRP, req);
+    },
+    sys_tcgetattr: (fd, outPtr, outCap) => {
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_TCGETATTR,
+        u32(fd),
+        outCap >>> 0,
+      );
+      if (rc >= 0 && rc <= outCap) {
+        const outRc = copyOut(outPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
+      }
+      return rc;
+    },
+    sys_tcsetattr: (fd, actions) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, actions >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_TCSETATTR, req);
+    },
+    sys_winsize: (fd, outPtr, outCap) => {
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_WINSIZE,
+        u32(fd),
+        outCap >>> 0,
+      );
+      if (rc >= 0 && rc <= outCap) {
+        const outRc = copyOut(outPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
+      }
+      return rc;
+    },
+    sys_tiocsctty: (fd) => forwardRequestBytes(METHOD.SYS_TIOCSCTTY, u32(fd)),
     sys_getpgid: (pid) => forwardRequestBytes(METHOD.SYS_GETPGID, u32(pid)),
+    sys_sched_getaffinity: (pid, maskPtr, cpusetsize) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, pid >>> 0, true);
+      view.setUint32(4, cpusetsize >>> 0, true);
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_SCHED_GETAFFINITY,
+        req,
+        cpusetsize >>> 0,
+      );
+      if (rc >= 0 && rc <= cpusetsize) {
+        const outRc = copyOut(maskPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
+      }
+      return rc;
+    },
+    sys_sched_setaffinity: (pid, maskPtr, cpusetsize) => {
+      const mask = copyIn(maskPtr, cpusetsize >>> 0);
+      if (typeof mask === "number") return mask;
+      const req = new Uint8Array(8 + mask.byteLength);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, pid >>> 0, true);
+      view.setUint32(4, cpusetsize >>> 0, true);
+      req.set(mask, 8);
+      return forwardRequestBytes(METHOD.SYS_SCHED_SETAFFINITY, req);
+    },
     sys_setpgid: (pid, pgid) => {
       const req = new Uint8Array(8);
       const view = new DataView(req.buffer);
@@ -210,6 +290,13 @@ export function buildSysImports(
       view.setUint32(0, pid >>> 0, true);
       view.setUint32(4, sig >>> 0, true);
       return forwardRequestBytes(METHOD.SYS_KILL, req);
+    },
+    sys_killpg: (pgid, sig) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, pgid >>> 0, true);
+      view.setUint32(4, sig >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_KILLPG, req);
     },
     sys_sigaction: (sig, disposition) => {
       const req = new Uint8Array(8);
@@ -256,6 +343,25 @@ export function buildSysImports(
       if (outRc < 0) return outRc;
       return 0;
     },
+    sys_chown: (uid, gid, pathPtr, pathLen) => {
+      const path = copyIn(pathPtr, pathLen);
+      if (typeof path === "number") return path;
+      const req = new Uint8Array(8 + path.byteLength);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, uid >>> 0, true);
+      view.setUint32(4, gid >>> 0, true);
+      req.set(path, 8);
+      return forwardRequestBytes(METHOD.SYS_CHOWN, req);
+    },
+    sys_fchown: (fd, uid, gid) => {
+      const req = new Uint8Array(12);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, uid >>> 0, true);
+      view.setUint32(8, gid >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_FCHOWN, req);
+    },
+    sys_fchdir: (fd) => forwardRequestBytes(METHOD.SYS_FCHDIR, u32(fd)),
     sys_nanosleep: (ns) => {
       // `ns` arrives as a JS bigint when the wasm import is declared
       // with an i64 parameter type; coerce defensively for hosts that

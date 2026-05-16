@@ -16,6 +16,7 @@
 //!                 → Process.stdout_buffer (per-pid)
 //!                 ← UserProcess::captured_stdout() drain
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -74,6 +75,128 @@ fn ensure_kernel_wasm() -> &'static PathBuf {
 
 fn fresh_kernel_host_interface() -> KernelHostInterface {
     KernelHostInterface::load(ensure_kernel_wasm(), HostState::default()).unwrap()
+}
+
+fn sys_method_constant(method_name: &str) -> String {
+    format!("METHOD_{}", method_name.to_ascii_uppercase())
+}
+
+fn sys_methods_from_contract() -> BTreeSet<String> {
+    let path = workspace_root().join("abi/contract/yurt_abi_methods.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!("read {}: {err}", path.display());
+    });
+    let value: toml::Value = toml::from_str(&text).unwrap_or_else(|err| {
+        panic!("parse {}: {err}", path.display());
+    });
+    let methods = value
+        .get("method")
+        .and_then(toml::Value::as_table)
+        .expect("method table");
+    methods
+        .keys()
+        .filter(|name| name.starts_with("sys_"))
+        .map(|name| sys_method_constant(name))
+        .collect()
+}
+
+fn method_id_from_contract(method_name: &str) -> i64 {
+    let path = workspace_root().join("abi/contract/yurt_abi_methods.toml");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!("read {}: {err}", path.display());
+    });
+    let value: toml::Value = toml::from_str(&text).unwrap_or_else(|err| {
+        panic!("parse {}: {err}", path.display());
+    });
+    value
+        .get("method")
+        .and_then(toml::Value::as_table)
+        .and_then(|methods| methods.get(method_name))
+        .and_then(toml::Value::as_table)
+        .and_then(|method| method.get("id"))
+        .and_then(toml::Value::as_integer)
+        .unwrap_or_else(|| panic!("missing integer id for method.{method_name}"))
+}
+
+fn dispatch_sys_arms() -> BTreeSet<String> {
+    let mut constants = BTreeSet::new();
+    let dispatch_dir = workspace_root().join("packages/kernel-wasm/src/dispatch");
+    for entry in std::fs::read_dir(&dispatch_dir).unwrap_or_else(|err| {
+        panic!("read {}: {err}", dispatch_dir.display());
+    }) {
+        let path = entry.expect("dispatch entry").path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+            panic!("read {}: {err}", path.display());
+        });
+        for line in text.lines().filter(|line| line.contains("=>")) {
+            let Some(start) = line.find("METHOD_SYS_") else {
+                continue;
+            };
+            let rest = &line[start..];
+            let end = rest
+                .find(|ch: char| !ch.is_ascii_uppercase() && !ch.is_ascii_digit() && ch != '_')
+                .unwrap_or(rest.len());
+            constants.insert(rest[..end].to_string());
+        }
+    }
+    constants
+}
+
+fn intentionally_deferred_sys_methods() -> BTreeSet<String> {
+    let path = workspace_root()
+        .join("docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix-design.md");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
+        panic!("read {}: {err}", path.display());
+    });
+    text.lines()
+        .filter(|line| {
+            line.starts_with('|')
+                && line.contains("intentionally deferred")
+                && !line.contains("---")
+        })
+        .filter_map(|line| {
+            line.split('|')
+                .find_map(|cell| {
+                    cell.split_whitespace()
+                        .find(|word| word.starts_with("METHOD_SYS_"))
+                })
+                .map(|word| {
+                    word.trim_matches(|ch: char| {
+                        !(ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+                    })
+                    .to_string()
+                })
+        })
+        .collect()
+}
+
+#[test]
+fn thread_syscall_method_ids_are_stable() {
+    assert_eq!(method_id_from_contract("sys_thread_spawn"), 0x1_004D);
+    assert_eq!(method_id_from_contract("sys_thread_self"), 0x1_004E);
+    assert_eq!(method_id_from_contract("sys_thread_join"), 0x1_004F);
+    assert_eq!(method_id_from_contract("sys_thread_detach"), 0x1_0050);
+    assert_eq!(method_id_from_contract("sys_thread_exit"), 0x1_0051);
+    assert_eq!(method_id_from_contract("sys_thread_yield"), 0x1_0052);
+}
+
+#[test]
+fn every_sys_method_has_dispatch_or_documented_deferral() {
+    let sys_methods = sys_methods_from_contract();
+    let dispatch_arms = dispatch_sys_arms();
+    let deferred = intentionally_deferred_sys_methods();
+    let missing: Vec<_> = sys_methods
+        .difference(&dispatch_arms)
+        .filter(|method| !deferred.contains(*method))
+        .cloned()
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "sys methods missing from kernel-wasm dispatch and parity matrix deferrals: {missing:?}"
+    );
 }
 
 #[test]

@@ -4,6 +4,16 @@ use crate::kh;
 
 use super::{close_entry, close_fd_number, has_buffer_capacity, inc_entry_ref, MSG_PEEK};
 
+const SOCKET_OPT_TCP_NODELAY: u32 = 1;
+const SOCKET_ADVISORY_SET_OPTIONS: &[u32] = &[
+    0x0004, // SO_REUSEADDR
+    6,      // SO_BROADCAST
+    7,      // SO_SNDBUF
+    8,      // SO_RCVBUF
+    9,      // SO_KEEPALIVE
+    13,     // SO_LINGER
+];
+
 fn datagram_queue_bytes(rx: &std::collections::VecDeque<UnixDatagramPacket>) -> usize {
     rx.iter().map(|packet| packet.data.len()).sum()
 }
@@ -859,6 +869,37 @@ pub(super) fn sys_socket_bind(caller_pid: u32, request: &[u8]) -> i64 {
             }
         }
         Err(rc) => rc,
+    })
+}
+
+pub(super) fn sys_socket_option(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 16 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let option = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let has_value = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) != 0;
+    let value = i32::from_le_bytes(request[12..16].try_into().expect("4 bytes"));
+    with_kernel(|k| {
+        let id = match socket_id_for_fd(k, caller_pid, fd) {
+            Ok(id) => id,
+            Err(rc) => return rc,
+        };
+        let Some(socket) = k.socket_mut(id) else {
+            return -(abi::EBADF as i64);
+        };
+        if option == SOCKET_OPT_TCP_NODELAY {
+            if has_value {
+                socket.no_delay = value != 0;
+                0
+            } else {
+                i64::from(socket.no_delay)
+            }
+        } else if has_value && SOCKET_ADVISORY_SET_OPTIONS.contains(&option) {
+            0
+        } else {
+            -(abi::EOPNOTSUPP as i64)
+        }
     })
 }
 

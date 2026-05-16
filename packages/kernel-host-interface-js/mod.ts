@@ -151,6 +151,7 @@ export const METHOD = {
   SYS_GETSID: 0x1_0019,
   SYS_SETSID: 0x1_001A,
   SYS_KILL: 0x1_001B,
+  SYS_KILLPG: 0x1_0053,
   SYS_SIGACTION: 0x1_001C,
   SYS_SCHED_YIELD: 0x1_001D,
   SYS_NANOSLEEP: 0x1_001E,
@@ -199,6 +200,25 @@ export const METHOD = {
   SYS_SOCKET_RECVMSG: 0x1_0049,
   SYS_SOCKET_INFO: 0x1_004A,
   SYS_SOCKET_RECVFROM: 0x1_004B,
+  SYS_SOCKET_OPTION: 0x1_004C,
+  SYS_THREAD_SPAWN: 0x1_004D,
+  SYS_THREAD_SELF: 0x1_004E,
+  SYS_THREAD_JOIN: 0x1_004F,
+  SYS_THREAD_DETACH: 0x1_0050,
+  SYS_THREAD_EXIT: 0x1_0051,
+  SYS_THREAD_YIELD: 0x1_0052,
+  SYS_DUP_MIN: 0x1_0054,
+  SYS_SET_FD_DESCRIPTOR_FLAGS: 0x1_0055,
+  SYS_TCGETPGRP: 0x1_0056,
+  SYS_TCSETPGRP: 0x1_0057,
+  SYS_TCGETATTR: 0x1_0058,
+  SYS_TCSETATTR: 0x1_0059,
+  SYS_WINSIZE: 0x1_005A,
+  SYS_TIOCSCTTY: 0x1_005B,
+  SYS_SCHED_GETAFFINITY: 0x1_005C,
+  SYS_SCHED_SETAFFINITY: 0x1_005D,
+  SYS_FCHOWN: 0x1_005E,
+  SYS_FCHDIR: 0x1_005F,
 } as const;
 
 export const KERNEL_PID = 0;
@@ -396,6 +416,12 @@ export interface TcpSocketImpl {
   acceptAsync?(handle: number, flags: number): Promise<number>;
 }
 
+export interface ThreadHost {
+  spawn(pid: number, tid: number, fnPtr: number, arg: number): number;
+  release(hostThreadHandle: number): number;
+  cancel(hostThreadHandle: number): number;
+}
+
 export interface HostState {
   nowRealtimeNs: bigint;
   extensions: ExtensionRegistry;
@@ -407,6 +433,8 @@ export interface HostState {
   kv?: KvBackend;
   /** When set, every `kh_socket_*` import delegates here. */
   tcp?: TcpSocketImpl;
+  /** When set, every Rust-owned `kh_thread_*` import delegates here. */
+  threadHost?: ThreadHost;
   /**
    * Async outbound fetch. When set AND the host supports JSPI,
    * `kh_fetch_blocking` is wrapped with `WebAssembly.Suspending`
@@ -447,6 +475,7 @@ export interface HostState {
 }
 
 const ENOENT = 2;
+const EAGAIN = 11;
 const EFAULT = 14;
 const EACCES = 13;
 const EBADF = 9;
@@ -454,6 +483,7 @@ const EEXIST = 17;
 const EINVAL = 22;
 const E2BIG = 7;
 const EIO = 5;
+const ESRCH = 3;
 const ENOSYS = 38;
 
 function ipv4SocketAddrRecord(host: string, port: number): Uint8Array {
@@ -1206,6 +1236,17 @@ export class KernelInstance {
       outPtr: number,
       outCap: number,
     ) => bigint,
+    readonly dispatchThread:
+      | ((
+        methodId: number,
+        callerPid: number,
+        callerTid: number,
+        inPtr: number,
+        inLen: number,
+        outPtr: number,
+        outCap: number,
+      ) => bigint)
+      | null = null,
     /**
      * Promising-wrapped variant of `dispatch`. Present only when
      * the host supports JSPI and at least one kh_* import is
@@ -1244,6 +1285,14 @@ export class KernelInstance {
     readonly kernelRecordThreadExit:
       | ((pid: number, tid: number, exitValue: number) => bigint)
       | null = null,
+    readonly kernelRecordThreadExitAuthenticated:
+      | ((
+        pid: number,
+        tid: number,
+        hostThreadHandle: number,
+        exitValue: number,
+      ) => bigint)
+      | null = null,
     readonly kernelBlockThread:
       | ((pid: number, tid: number) => bigint)
       | null = null,
@@ -1270,6 +1319,15 @@ export class KernelInstance {
         argvPtr: number,
         argvLen: number,
       ) => bigint)
+      | null = null,
+    readonly kernelPrepareFork:
+      | ((parentPid: number) => bigint)
+      | null = null,
+    readonly kernelCommitFork:
+      | ((parentPid: number, childPid: number) => bigint)
+      | null = null,
+    readonly kernelRollbackFork:
+      | ((parentPid: number, childPid: number) => bigint)
       | null = null,
     readonly kernelRecordExit:
       | ((pid: number, exitStatus: number) => bigint)
@@ -1316,6 +1374,29 @@ export class KernelInstance {
     const rc = this.dispatch(
       methodId,
       callerPid,
+      inPtr,
+      inLen,
+      outPtr,
+      responseCap,
+    );
+    return { rc, response: this.collectResponse(outPtr, responseCap) };
+  }
+
+  threadSyscall(
+    methodId: number,
+    callerPid: number,
+    callerTid: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): { rc: bigint; response: Uint8Array } {
+    if (!this.dispatchThread) {
+      throw new Error("kernel.wasm missing kernel_dispatch_thread export");
+    }
+    const { inPtr, inLen, outPtr } = this.stage(request, responseCap);
+    const rc = this.dispatchThread(
+      methodId,
+      callerPid,
+      callerTid,
       inPtr,
       inLen,
       outPtr,
@@ -1414,6 +1495,25 @@ export class KernelInstance {
     return this.kernelRecordThreadExit(pid, tid, exitValue);
   }
 
+  recordThreadExitAuthenticated(
+    pid: number,
+    tid: number,
+    hostThreadHandle: number,
+    exitValue: number,
+  ): bigint {
+    if (!this.kernelRecordThreadExitAuthenticated) {
+      throw new Error(
+        "kernel.wasm missing kernel_record_thread_exit_authenticated export",
+      );
+    }
+    return this.kernelRecordThreadExitAuthenticated(
+      pid,
+      tid,
+      hostThreadHandle,
+      exitValue >>> 0,
+    );
+  }
+
   blockThread(pid: number, tid: number): bigint {
     if (!this.kernelBlockThread) {
       throw new Error("kernel.wasm missing kernel_block_thread export");
@@ -1487,6 +1587,27 @@ export class KernelInstance {
       argv.byteLength,
     );
   }
+
+  prepareFork(parentPid: number): bigint {
+    if (!this.kernelPrepareFork) {
+      throw new Error("kernel.wasm missing kernel_prepare_fork export");
+    }
+    return this.kernelPrepareFork(parentPid);
+  }
+
+  commitFork(parentPid: number, childPid: number): bigint {
+    if (!this.kernelCommitFork) {
+      throw new Error("kernel.wasm missing kernel_commit_fork export");
+    }
+    return this.kernelCommitFork(parentPid, childPid);
+  }
+
+  rollbackFork(parentPid: number, childPid: number): bigint {
+    if (!this.kernelRollbackFork) {
+      throw new Error("kernel.wasm missing kernel_rollback_fork export");
+    }
+    return this.kernelRollbackFork(parentPid, childPid);
+  }
 }
 
 function byteKey(bytes: Uint8Array): string {
@@ -1497,6 +1618,8 @@ function buildUserYurtImports(
   pid: number,
   kernel: KernelInstance,
   userMemoryRef: { memory?: WebAssembly.Memory },
+  callerTid = 1,
+  drainPendingThread?: (tid: number) => void,
 ): Record<string, (...args: (number | bigint)[]) => number> {
   const memoryBuffer = () => userMemoryRef.memory!.buffer;
   const boundsOk = (ptr: number, len: number): boolean => {
@@ -1530,10 +1653,71 @@ function buildUserYurtImports(
     const copied = copyOut(outPtr, response.subarray(0, Math.min(n, cap)));
     return copied < 0 ? copied : n;
   };
+  const scalarRequest = (...values: number[]): Uint8Array => {
+    const req = new Uint8Array(values.length * 4);
+    const view = new DataView(req.buffer);
+    values.forEach((value, index) => {
+      view.setUint32(index * 4, value >>> 0, true);
+    });
+    return req;
+  };
+  const threadSyscall = (
+    method: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): { rc: number; response: Uint8Array } => {
+    const out = kernel.threadSyscall(
+      method,
+      pid,
+      callerTid,
+      request,
+      responseCap,
+    );
+    return { rc: Number(out.rc), response: out.response };
+  };
   const imports: Record<string, (...args: (number | bigint)[]) => number> = {};
   for (const name of USER_YURT_STUB_IMPORTS) {
     imports[name] = () => -ENOSYS;
   }
+  imports.host_thread_spawn = (fnPtr, arg) =>
+    threadSyscall(
+      METHOD.SYS_THREAD_SPAWN,
+      scalarRequest(Number(fnPtr), Number(arg)),
+      0,
+    ).rc;
+  imports.host_thread_self = () =>
+    threadSyscall(METHOD.SYS_THREAD_SELF, new Uint8Array(0), 0).rc;
+  imports.host_thread_join = (tid, outRetvalPtr) => {
+    let out = threadSyscall(
+      METHOD.SYS_THREAD_JOIN,
+      scalarRequest(Number(tid)),
+      4,
+    );
+    if (out.rc === -EAGAIN && drainPendingThread) {
+      drainPendingThread(Number(tid));
+      out = threadSyscall(
+        METHOD.SYS_THREAD_JOIN,
+        scalarRequest(Number(tid)),
+        4,
+      );
+    }
+    if (out.rc !== 0) return out.rc;
+    return copyOut(Number(outRetvalPtr), out.response.subarray(0, 4));
+  };
+  imports.host_thread_detach = (tid) =>
+    threadSyscall(
+      METHOD.SYS_THREAD_DETACH,
+      scalarRequest(Number(tid)),
+      0,
+    ).rc;
+  imports.host_thread_exit = (retval) =>
+    threadSyscall(
+      METHOD.SYS_THREAD_EXIT,
+      scalarRequest(Number(retval)),
+      0,
+    ).rc;
+  imports.host_thread_yield = () =>
+    threadSyscall(METHOD.SYS_THREAD_YIELD, new Uint8Array(0), 0).rc;
   const scalar = (method: number) => () =>
     Number(kernel.syscall(method, pid, new Uint8Array(0), 0).rc);
   imports.host_getuid = scalar(METHOD.SYS_GETUID);
@@ -1608,21 +1792,55 @@ function buildUserYurtImports(
       Number(outCap),
     );
   };
+  imports.host_chown = (pathPtr, pathLen, uid, gid) => {
+    const path = copyIn(Number(pathPtr), Number(pathLen));
+    if (typeof path === "number") return path;
+    const req = new Uint8Array(8 + path.byteLength);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, Number(uid) >>> 0, true);
+    view.setUint32(4, Number(gid) >>> 0, true);
+    req.set(path, 8);
+    return Number(kernel.syscall(METHOD.SYS_CHOWN, pid, req, 0).rc);
+  };
+  imports.host_fchown = (fd, uid, gid) => {
+    const req = new Uint8Array(12);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, Number(fd) >>> 0, true);
+    view.setUint32(4, Number(uid) >>> 0, true);
+    view.setUint32(8, Number(gid) >>> 0, true);
+    return Number(kernel.syscall(METHOD.SYS_FCHOWN, pid, req, 0).rc);
+  };
+  imports.host_fchdir = (fd) => {
+    const req = new Uint8Array(4);
+    new DataView(req.buffer).setUint32(0, Number(fd) >>> 0, true);
+    return Number(kernel.syscall(METHOD.SYS_FCHDIR, pid, req, 0).rc);
+  };
   return imports;
 }
 
 interface CachedProcessInstance {
   pid: number;
+  module: WebAssembly.Module;
   instance: WebAssembly.Instance;
   memory?: WebAssembly.Memory;
   userMemoryRef: { memory?: WebAssembly.Memory };
+  argv: Uint8Array[];
+}
+
+interface CachedThreadExecution {
+  pid: number;
+  tid: number;
+  completed: boolean;
+  run(): void;
 }
 
 class CachedProcessEngine {
   private readonly modules = new Map<string, WebAssembly.Module>();
   private readonly instances = new Map<number, CachedProcessInstance>();
   private readonly handlesByPid = new Map<number, number>();
+  private readonly threadExecutions = new Map<number, CachedThreadExecution>();
   private nextHandle = 1;
+  private nextThreadHandle = 1;
 
   constructor(private readonly kernelRef: { kernel?: KernelInstance }) {}
 
@@ -1684,6 +1902,8 @@ class CachedProcessEngine {
         context.pid,
         kernel,
         userMemoryRef,
+        1,
+        (tid) => this.runPendingThread(context.pid, tid),
       );
       instance = new WebAssembly.Instance(module, {
         env: { ...sysImports, sys_setrlimit },
@@ -1701,9 +1921,11 @@ class CachedProcessEngine {
     const handle = this.nextHandle++;
     this.instances.set(handle, {
       pid: context.pid,
+      module,
       instance,
       memory: userMemoryRef.memory,
       userMemoryRef,
+      argv: context.argv,
     });
     this.handlesByPid.set(context.pid, handle);
     return handle;
@@ -1766,6 +1988,98 @@ class CachedProcessEngine {
 
   resume(_handle: number, _result: bigint, _budgetNs: bigint): bigint {
     return BigInt(-ENOSYS);
+  }
+
+  spawnThread(pid: number, tid: number, fnPtr: number, arg: number): number {
+    const proc = this.instances.get(this.handlesByPid.get(pid) ?? -1);
+    if (!proc) return -ESRCH;
+    const kernel = this.kernelRef.kernel;
+    if (!kernel) return -EIO;
+
+    let threadInstance: WebAssembly.Instance;
+    try {
+      const sysImports = buildSysImports(pid, kernel, proc.userMemoryRef);
+      const sys_setrlimit = (
+        resource: number,
+        soft: bigint,
+        hard: bigint,
+      ): number => {
+        const req = new Uint8Array(20);
+        const v = new DataView(req.buffer);
+        v.setUint32(0, resource >>> 0, true);
+        v.setBigUint64(4, soft, true);
+        v.setBigUint64(12, hard, true);
+        return Number(kernel.syscall(METHOD.SYS_SETRLIMIT, pid, req, 0).rc);
+      };
+      const envImports: WebAssembly.ModuleImports = {
+        ...sysImports,
+        sys_setrlimit,
+      };
+      if (proc.memory) {
+        envImports.memory = proc.memory;
+      }
+      threadInstance = new WebAssembly.Instance(proc.module, {
+        env: envImports,
+        wasi_snapshot_preview1: buildWasiShim(
+          pid,
+          kernel,
+          proc.argv,
+          proc.userMemoryRef,
+        ),
+        yurt: buildUserYurtImports(
+          pid,
+          kernel,
+          proc.userMemoryRef,
+          tid,
+          (targetTid) => this.runPendingThread(pid, targetTid),
+        ),
+      });
+    } catch {
+      return -EIO;
+    }
+
+    const table = threadInstance.exports.__indirect_function_table;
+    if (!(table instanceof WebAssembly.Table)) return -EIO;
+    const entry = table.get(fnPtr >>> 0);
+    if (typeof entry !== "function") return -EFAULT;
+
+    const handle = this.nextThreadHandle++;
+    const run = () => {
+      const execution = this.threadExecutions.get(handle);
+      if (!execution || execution.completed) return;
+      execution.completed = true;
+      let retval = 0;
+      try {
+        retval = Number((entry as (arg: number) => number)(arg >>> 0)) | 0;
+      } catch {
+        retval = -1;
+      }
+      try {
+        kernel.recordThreadExitAuthenticated(pid, tid, handle, retval >>> 0);
+      } catch {
+        // Stale completion reports are ignored; Rust remains authoritative.
+      }
+    };
+    this.threadExecutions.set(handle, { pid, tid, completed: false, run });
+    queueMicrotask(run);
+    return handle;
+  }
+
+  runPendingThread(pid: number, tid: number): void {
+    for (const execution of this.threadExecutions.values()) {
+      if (execution.pid === pid && execution.tid === tid) {
+        execution.run();
+        return;
+      }
+    }
+  }
+
+  releaseThread(handle: number): number {
+    return this.threadExecutions.delete(handle) ? 0 : -ESRCH;
+  }
+
+  cancelThread(handle: number): number {
+    return this.threadExecutions.delete(handle) ? 0 : -ESRCH;
   }
 
   private boundsOk(memory: WebAssembly.Memory, ptr: number, len: number) {
@@ -2348,6 +2662,20 @@ export class KernelHostInterface {
         result: bigint,
         budgetNs: bigint,
       ): bigint => processEngine.resume(handle, result, budgetNs),
+      kh_thread_spawn: (
+        pid: number,
+        tid: number,
+        fnPtr: number,
+        arg: number,
+      ): number =>
+        hostBox.state.threadHost?.spawn(pid, tid, fnPtr, arg) ??
+          processEngine.spawnThread(pid, tid, fnPtr, arg),
+      kh_thread_release: (hostThreadHandle: number): number =>
+        hostBox.state.threadHost?.release(hostThreadHandle) ??
+          processEngine.releaseThread(hostThreadHandle),
+      kh_thread_cancel: (hostThreadHandle: number): number =>
+        hostBox.state.threadHost?.cancel(hostThreadHandle) ??
+          processEngine.cancelThread(hostThreadHandle),
     };
 
     // std-on-wasi panic-infra stubs for kernel.wasm itself.
@@ -2823,6 +3151,17 @@ export class KernelHostInterface {
       outPtr: number,
       outCap: number,
     ) => bigint;
+    const dispatchThread = instance.exports.kernel_dispatch_thread as
+      | ((
+        methodId: number,
+        callerPid: number,
+        callerTid: number,
+        inPtr: number,
+        inLen: number,
+        outPtr: number,
+        outCap: number,
+      ) => bigint)
+      | undefined;
     const kernelListProcesses = instance.exports.kernel_list_processes as
       | ((outPtr: number, outCap: number) => bigint)
       | undefined;
@@ -2844,6 +3183,15 @@ export class KernelHostInterface {
     const kernelRecordThreadExit = instance.exports.kernel_record_thread_exit as
       | ((pid: number, tid: number, exitValue: number) => bigint)
       | undefined;
+    const kernelRecordThreadExitAuthenticated = instance.exports
+      .kernel_record_thread_exit_authenticated as
+        | ((
+          pid: number,
+          tid: number,
+          hostThreadHandle: number,
+          exitValue: number,
+        ) => bigint)
+        | undefined;
     const kernelBlockThread = instance.exports.kernel_block_thread as
       | ((pid: number, tid: number) => bigint)
       | undefined;
@@ -2870,6 +3218,15 @@ export class KernelHostInterface {
         argvPtr: number,
         argvLen: number,
       ) => bigint)
+      | undefined;
+    const kernelPrepareFork = instance.exports.kernel_prepare_fork as
+      | ((parentPid: number) => bigint)
+      | undefined;
+    const kernelCommitFork = instance.exports.kernel_commit_fork as
+      | ((parentPid: number, childPid: number) => bigint)
+      | undefined;
+    const kernelRollbackFork = instance.exports.kernel_rollback_fork as
+      | ((parentPid: number, childPid: number) => bigint)
       | undefined;
     const kernelRecordExit = instance.exports.kernel_record_exit as
       | ((pid: number, exitStatus: number) => bigint)
@@ -2919,6 +3276,7 @@ export class KernelHostInterface {
       scratchPtr,
       scratchLen,
       dispatch,
+      dispatchThread ?? null,
       dispatchAsync,
       kernelListProcesses ?? null,
       kernelListThreads ?? null,
@@ -2927,11 +3285,15 @@ export class KernelHostInterface {
       kernelSpawnThread ?? null,
       kernelDetachThread ?? null,
       kernelRecordThreadExit ?? null,
+      kernelRecordThreadExitAuthenticated ?? null,
       kernelBlockThread ?? null,
       kernelUnblockThread ?? null,
       kernelKill ?? null,
       kernelWait ?? null,
       kernelSpawnProcess ?? null,
+      kernelPrepareFork ?? null,
+      kernelCommitFork ?? null,
+      kernelRollbackFork ?? null,
       kernelRecordExit ?? null,
       kernelDrainSpawn ?? null,
     );
@@ -2973,6 +3335,22 @@ export class KernelHostInterface {
     return this.kernel.syscall(methodId, callerPid, request, responseCap);
   }
 
+  kernelThreadSyscall(
+    methodId: number,
+    callerPid: number,
+    callerTid: number,
+    request: Uint8Array,
+    responseCap: number,
+  ): { rc: bigint; response: Uint8Array } {
+    return this.kernel.threadSyscall(
+      methodId,
+      callerPid,
+      callerTid,
+      request,
+      responseCap,
+    );
+  }
+
   kernelSyscallAsync(
     methodId: number,
     callerPid: number,
@@ -3011,6 +3389,24 @@ export class KernelHostInterface {
       );
     }
     return user;
+  }
+
+  prepareFork(parentPid: number): number {
+    const childPid = Number(this.kernel.prepareFork(parentPid));
+    if (childPid < 0) {
+      throw new Error(`kernel_prepare_fork failed: rc=${childPid}`);
+    }
+    return childPid;
+  }
+
+  commitFork(parentPid: number, childPid: number): void {
+    const rc = Number(this.kernel.commitFork(parentPid, childPid));
+    if (rc !== 0) throw new Error(`kernel_commit_fork failed: rc=${rc}`);
+  }
+
+  rollbackFork(parentPid: number, childPid: number): void {
+    const rc = Number(this.kernel.rollbackFork(parentPid, childPid));
+    if (rc !== 0) throw new Error(`kernel_rollback_fork failed: rc=${rc}`);
   }
 
   listProcesses(): ProcessSnapshot[] {
@@ -3070,6 +3466,27 @@ export class KernelHostInterface {
     const rc = Number(this.kernel.recordThreadExit(pid, tid, exitValue));
     if (rc !== 0) {
       throw new Error(`kernel_record_thread_exit failed: rc=${rc}`);
+    }
+  }
+
+  recordThreadExitAuthenticated(
+    pid: number,
+    tid: number,
+    hostThreadHandle: number,
+    exitValue: number,
+  ): void {
+    const rc = Number(
+      this.kernel.recordThreadExitAuthenticated(
+        pid,
+        tid,
+        hostThreadHandle,
+        exitValue,
+      ),
+    );
+    if (rc !== 0) {
+      throw new Error(
+        `kernel_record_thread_exit_authenticated failed: rc=${rc}`,
+      );
     }
   }
 

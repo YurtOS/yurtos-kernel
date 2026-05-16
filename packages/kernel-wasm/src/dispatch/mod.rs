@@ -19,16 +19,17 @@ use crate::kh;
 mod fs;
 mod process;
 mod socket;
+mod thread;
 
 use fs::{
-    chdir, chmod, chown, getcwd, hard_link, mkdir, readdir, readlink, realpath, rename, rmdir,
-    stat_path, symlink, sys_open, unlink, utimens,
+    chdir, chmod, chown, fchdir, fchown, getcwd, hard_link, mkdir, readdir, readlink, realpath,
+    rename, rmdir, stat_path, symlink, sys_open, unlink, utimens,
 };
 use process::{
-    close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request, nanosleep,
-    provide_stdin, sched_getparam, sched_getscheduler, sched_setparam, sched_setscheduler,
-    sched_yield, setpgid, setpriority, setresgid, setresuid, setrlimit, setsid, sigaction,
-    sys_spawn, umask,
+    close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
+    killpg_request, nanosleep, provide_stdin, sched_getaffinity, sched_getparam,
+    sched_getscheduler, sched_setaffinity, sched_setparam, sched_setscheduler, sched_yield,
+    setpgid, setpriority, setresgid, setresuid, setrlimit, setsid, sigaction, sys_spawn, umask,
 };
 pub use process::{
     drain_spawn, kill_pid, list_processes_response, list_threads_response, record_exit,
@@ -42,8 +43,8 @@ pub(crate) use process::{
 use socket::{
     socket_recv_id, socket_send_id, sys_socket_accept, sys_socket_addr, sys_socket_bind,
     sys_socket_close, sys_socket_connect, sys_socket_info, sys_socket_listen, sys_socket_open,
-    sys_socket_recv, sys_socket_recvfrom, sys_socket_recvmsg, sys_socket_send, sys_socket_sendmsg,
-    sys_socket_sendto, sys_socketpair,
+    sys_socket_option, sys_socket_recv, sys_socket_recvfrom, sys_socket_recvmsg, sys_socket_send,
+    sys_socket_sendmsg, sys_socket_sendto, sys_socketpair,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
@@ -69,7 +70,28 @@ fn kernel_only(caller_pid: u32, f: impl FnOnce() -> i64) -> i64 {
     f()
 }
 
-pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchContext {
+    pub caller_pid: u32,
+    pub caller_tid: u32,
+}
+
+impl DispatchContext {
+    pub const fn main_thread(caller_pid: u32) -> Self {
+        Self {
+            caller_pid,
+            caller_tid: crate::kernel::MAIN_THREAD_TID,
+        }
+    }
+}
+
+pub fn dispatch_with_context(
+    method_id: u32,
+    ctx: DispatchContext,
+    request: &[u8],
+    response: &mut [u8],
+) -> i64 {
+    let caller_pid = ctx.caller_pid;
     match method_id {
         METHOD_KERNEL_ECHO => echo(request, response),
         METHOD_KERNEL_NOW_REALTIME => now_realtime(response),
@@ -98,6 +120,12 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
             kernel_only(caller_pid, || list_threads_response(request, response))
         }
         METHOD_KERNEL_SCHEDULE_NEXT => kernel_only(caller_pid, || schedule_next_response(response)),
+        METHOD_SYS_THREAD_SPAWN => thread::sys_thread_spawn(ctx, request),
+        METHOD_SYS_THREAD_SELF => thread::sys_thread_self(ctx, request),
+        METHOD_SYS_THREAD_JOIN => thread::sys_thread_join(ctx, request, response),
+        METHOD_SYS_THREAD_DETACH => thread::sys_thread_detach(ctx, request),
+        METHOD_SYS_THREAD_EXIT => thread::sys_thread_exit(ctx, request),
+        METHOD_SYS_THREAD_YIELD => thread::sys_thread_yield(ctx, request),
         METHOD_SYS_WAIT => wait_response(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
@@ -120,14 +148,24 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SCHED_GETPARAM => sched_getparam(caller_pid, request),
         METHOD_SYS_SCHED_SETSCHEDULER => sched_setscheduler(caller_pid, request),
         METHOD_SYS_SCHED_SETPARAM => sched_setparam(caller_pid, request),
+        METHOD_SYS_SCHED_GETAFFINITY => sched_getaffinity(caller_pid, request, response),
+        METHOD_SYS_SCHED_SETAFFINITY => sched_setaffinity(caller_pid, request),
         METHOD_SYS_CLOSE => close_fd(caller_pid, request),
         METHOD_SYS_DUP => dup_fd(caller_pid, request),
         METHOD_SYS_DUP2 => dup2_fd(caller_pid, request),
+        METHOD_SYS_DUP_MIN => dup_min_fd(caller_pid, request),
+        METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS => set_fd_descriptor_flags(caller_pid, request),
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
         METHOD_SYS_POLL => poll_fds(caller_pid, request, response),
         METHOD_SYS_ISATTY => isatty(caller_pid, request),
+        METHOD_SYS_TCGETPGRP => tcgetpgrp(caller_pid, request),
+        METHOD_SYS_TCSETPGRP => tcsetpgrp(caller_pid, request),
+        METHOD_SYS_TCGETATTR => tcgetattr(caller_pid, request, response),
+        METHOD_SYS_TCSETATTR => tcsetattr(caller_pid, request),
+        METHOD_SYS_WINSIZE => winsize(caller_pid, request, response),
+        METHOD_SYS_TIOCSCTTY => tiocsctty(caller_pid, request),
         METHOD_SYS_CLOCK_GETTIME => clock_gettime(request, response),
         METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
         METHOD_SYS_GETPGID => getpgid(caller_pid, request),
@@ -135,6 +173,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_GETSID => getsid(caller_pid, request),
         METHOD_SYS_SETSID => setsid(caller_pid),
         METHOD_SYS_KILL => kill_request(request),
+        METHOD_SYS_KILLPG => killpg_request(caller_pid, request),
         METHOD_SYS_SIGACTION => sigaction(caller_pid, request),
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
@@ -143,6 +182,8 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_FSTAT => fstat(caller_pid, request, response),
         METHOD_SYS_CHMOD => chmod(caller_pid, request),
         METHOD_SYS_CHOWN => chown(caller_pid, request),
+        METHOD_SYS_FCHOWN => fchown(caller_pid, request),
+        METHOD_SYS_FCHDIR => fchdir(caller_pid, request),
         METHOD_SYS_UTIMENS => utimens(caller_pid, request),
         METHOD_SYS_UNLINK => unlink(caller_pid, request),
         METHOD_SYS_STAT => stat_path(caller_pid, request, response),
@@ -163,6 +204,7 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SOCKETPAIR => sys_socketpair(caller_pid, request, response),
         METHOD_SYS_SOCKET_OPEN => sys_socket_open(caller_pid, request),
         METHOD_SYS_SOCKET_BIND => sys_socket_bind(caller_pid, request),
+        METHOD_SYS_SOCKET_OPTION => sys_socket_option(caller_pid, request),
         METHOD_SYS_SOCKET_SENDTO => sys_socket_sendto(caller_pid, request),
         METHOD_SYS_SOCKET_SENDMSG => sys_socket_sendmsg(caller_pid, request),
         METHOD_SYS_SOCKET_RECVMSG => sys_socket_recvmsg(caller_pid, request, response),
@@ -177,6 +219,15 @@ pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut 
         METHOD_SYS_SOCKET_RECVFROM => sys_socket_recvfrom(caller_pid, request, response),
         _ => -(abi::ENOSYS as i64),
     }
+}
+
+pub fn dispatch(method_id: u32, caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    dispatch_with_context(
+        method_id,
+        DispatchContext::main_thread(caller_pid),
+        request,
+        response,
+    )
 }
 
 fn echo(request: &[u8], response: &mut [u8]) -> i64 {
@@ -221,6 +272,7 @@ fn close_entry(k: &mut Kernel, entry: FdEntry) -> Option<i32> {
             k.ofd_dec_ref(ofd_id);
             None
         }
+        crate::kernel::FdEntry::Directory { .. } => None,
         crate::kernel::FdEntry::Socket { id } => k.socket_dec_ref(id),
         _ => None,
     }
@@ -247,6 +299,7 @@ fn inc_entry_ref(k: &mut Kernel, entry: &FdEntry) {
             }
         }
         crate::kernel::FdEntry::File { ofd_id } => k.ofd_inc_ref(*ofd_id),
+        crate::kernel::FdEntry::Directory { .. } => {}
         crate::kernel::FdEntry::Socket { id } => k.socket_inc_ref(*id),
         _ => {}
     }
@@ -301,6 +354,41 @@ fn dup2_fd(caller_pid: u32, request: &[u8]) -> i64 {
             let _ = kh::socket_close(handle);
         }
         newfd as i64
+    })
+}
+
+/// `dup_min(oldfd: u32, minfd: u32) -> newfd / -EBADF / -EINVAL`.
+fn dup_min_fd(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([oldfd, minfd]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(oldfd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        let Some(newfd) = k.process_mut(caller_pid).fd_table.lowest_free_fd_at(minfd) else {
+            return -(abi::EINVAL as i64);
+        };
+        inc_entry_ref(k, &entry);
+        k.process_mut(caller_pid).fd_table.install(newfd, entry);
+        newfd as i64
+    })
+}
+
+fn set_fd_descriptor_flags(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd, flags]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        match k
+            .process_mut(caller_pid)
+            .fd_table
+            .set_descriptor_flags(fd, flags)
+        {
+            Ok(()) => 0,
+            Err(errno) => -(errno as i64),
+        }
     })
 }
 
@@ -401,6 +489,7 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                 }
                 n
             }
+            crate::kernel::FdEntry::Directory { .. } => -(abi::EISDIR as i64),
             crate::kernel::FdEntry::Socket { id } => socket_recv_id(k, id, response, 0),
         }
     })
@@ -474,6 +563,7 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
                 }
                 n
             }
+            crate::kernel::FdEntry::Directory { .. } => -(abi::EBADF as i64),
             crate::kernel::FdEntry::Socket { id } => socket_send_id(k, id, payload),
         }
     })
@@ -540,7 +630,7 @@ fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) ->
                 0
             }
         }
-        FdEntry::File { .. } => {
+        FdEntry::File { .. } | FdEntry::Directory { .. } => {
             let mut revents = 0;
             if wants_read {
                 revents |= POLLIN;
@@ -648,6 +738,148 @@ fn isatty(caller_pid: u32, request: &[u8]) -> i64 {
         | Some(crate::kernel::FdEntry::Stderr) => 1,
         Some(_) => 0,
     })
+}
+
+fn is_tty_entry(entry: &FdEntry) -> bool {
+    matches!(entry, FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr)
+}
+
+fn require_tty_fd(k: &mut Kernel, caller_pid: u32, fd: u32) -> Result<(), i32> {
+    match k.process_mut(caller_pid).fd_table.entry(fd) {
+        None => Err(abi::EBADF),
+        Some(entry) if is_tty_entry(entry) => Ok(()),
+        Some(_) => Err(abi::ENOTTY),
+    }
+}
+
+fn process_session_id(pid: u32, process: &crate::kernel::Process) -> u32 {
+    if process.sid == 0 {
+        pid
+    } else {
+        process.sid
+    }
+}
+
+fn tcgetpgrp(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| match require_tty_fd(k, caller_pid, fd) {
+        Ok(()) => k.tty_foreground_pgid() as i64,
+        Err(errno) => -(errno as i64),
+    })
+}
+
+fn tcsetpgrp(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd, pgid]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        if let Err(errno) = require_tty_fd(k, caller_pid, fd) {
+            return -(errno as i64);
+        }
+        let caller_sid = {
+            let caller = k.process_mut(caller_pid);
+            process_session_id(caller_pid, caller)
+        };
+        match k.process_group_session(pgid) {
+            Some(group_sid) if group_sid == caller_sid => {
+                k.set_tty_foreground_pgid(pgid);
+                0
+            }
+            _ => -(abi::ENOTTY as i64),
+        }
+    })
+}
+
+fn tcgetattr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        if let Err(errno) = require_tty_fd(k, caller_pid, fd) {
+            return -(errno as i64);
+        }
+        let termios = default_termios();
+        if response.len() < termios.len() {
+            return termios.len() as i64;
+        }
+        response[..termios.len()].copy_from_slice(&termios);
+        termios.len() as i64
+    })
+}
+
+fn tcsetattr(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd, _actions]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| match require_tty_fd(k, caller_pid, fd) {
+        Ok(()) => 0,
+        Err(errno) => -(errno as i64),
+    })
+}
+
+fn winsize(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        if let Err(errno) = require_tty_fd(k, caller_pid, fd) {
+            return -(errno as i64);
+        }
+        let winsize = default_winsize();
+        if response.len() < winsize.len() {
+            return winsize.len() as i64;
+        }
+        response[..winsize.len()].copy_from_slice(&winsize);
+        winsize.len() as i64
+    })
+}
+
+fn tiocsctty(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        if let Err(errno) = require_tty_fd(k, caller_pid, fd) {
+            return -(errno as i64);
+        }
+        let caller = k.process_mut(caller_pid);
+        if caller.sid != caller_pid || caller.pgid != caller_pid {
+            return -(abi::EPERM as i64);
+        }
+        caller.has_controlling_tty = true;
+        k.set_tty_foreground_pgid(caller_pid);
+        0
+    })
+}
+
+fn default_termios() -> [u8; 60] {
+    let mut buf = [0u8; 60];
+    buf[0..4].copy_from_slice(&0x0600_u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&0x0005_u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&0x08BF_u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&0x8A3B_u32.to_le_bytes());
+    buf[17] = 3;
+    buf[18] = 28;
+    buf[19] = 127;
+    buf[20] = 21;
+    buf[21] = 4;
+    buf[22] = 0;
+    buf[23] = 1;
+    buf[25] = 17;
+    buf[26] = 19;
+    buf[27] = 26;
+    buf[40..44].copy_from_slice(&15_u32.to_le_bytes());
+    buf[44..48].copy_from_slice(&15_u32.to_le_bytes());
+    buf
+}
+
+fn default_winsize() -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    buf[0..2].copy_from_slice(&24_u16.to_le_bytes());
+    buf[2..4].copy_from_slice(&80_u16.to_le_bytes());
+    buf
 }
 
 /// `clock_gettime(clock_id) -> 8 bytes le u64 ns`. clock_id 0 =
@@ -857,6 +1089,7 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             | crate::kernel::FdEntry::Stderr => (0, 2, 0o020_666),
             crate::kernel::FdEntry::Pipe { .. } => (0, 6, 0o010_600),
             crate::kernel::FdEntry::Socket { .. } => (0, 6, 0o140_666),
+            crate::kernel::FdEntry::Directory { .. } => (0, 3, 0o040_755),
             crate::kernel::FdEntry::File { ofd_id } => {
                 let (mount_id, inode) = match k.ofd(ofd_id) {
                     Some(o) => (o.mount_id, o.inode),

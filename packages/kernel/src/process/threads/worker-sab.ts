@@ -15,8 +15,15 @@ export interface WorkerSabThreadStart {
   arg: number;
 }
 
+export interface WorkerSabThreadExit {
+  tid: number;
+  handle: number;
+  retval: number;
+}
+
 export interface WorkerSabThreadsBackendOptions {
   spawnThread(start: WorkerSabThreadStart): Promise<number>;
+  threadExited?(exit: WorkerSabThreadExit): void;
 }
 
 interface SpawnSlot {
@@ -24,6 +31,12 @@ interface SpawnSlot {
   reaped: boolean;
   detached: boolean;
   finished: boolean;
+}
+
+interface RustThreadHandle {
+  tid: number;
+  finished: boolean;
+  cancelled: boolean;
 }
 
 class ThreadExit {
@@ -76,6 +89,8 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
       finished: true,
     },
   ];
+  private rustThreadHandles = new Map<number, RustThreadHandle>();
+  private nextRustThreadHandle = 1;
   private tids = new ThreadIdScope();
   private readonly memory: WebAssembly.Memory;
 
@@ -141,6 +156,49 @@ export class WorkerSabThreadsBackend implements ThreadsBackend {
 
   spawn(fnPtr: number, arg: number): Promise<number> {
     return Promise.resolve(this.spawnSync(fnPtr, arg));
+  }
+
+  spawnRustThread(start: WorkerSabThreadStart): number {
+    const handle = this.nextRustThreadHandle++;
+    this.rustThreadHandles.set(handle, {
+      tid: start.tid,
+      finished: false,
+      cancelled: false,
+    });
+    this.options.spawnThread(start)
+      .then((retval) => {
+        const record = this.rustThreadHandles.get(handle);
+        if (!record || record.cancelled || record.finished) return;
+        record.finished = true;
+        this.options.threadExited?.({
+          tid: start.tid,
+          handle,
+          retval: retval >>> 0,
+        });
+      })
+      .catch((err) => {
+        const record = this.rustThreadHandles.get(handle);
+        if (!record || record.cancelled || record.finished) return;
+        record.finished = true;
+        this.options.threadExited?.({
+          tid: start.tid,
+          handle,
+          retval: err instanceof ThreadExit ? err.retval >>> 0 : 0xffffffff,
+        });
+      });
+    return handle;
+  }
+
+  releaseRustThread(handle: number): number {
+    return this.rustThreadHandles.delete(handle) ? 0 : -WASI_ESRCH;
+  }
+
+  cancelRustThread(handle: number): number {
+    const record = this.rustThreadHandles.get(handle);
+    if (!record) return -WASI_ESRCH;
+    record.cancelled = true;
+    this.rustThreadHandles.delete(handle);
+    return 0;
   }
 
   async join(tid: number): Promise<number> {
@@ -273,7 +331,9 @@ export function defaultSpawnThread(
       let requestSab: SharedArrayBuffer | undefined;
       if (bodies) {
         requestSab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
-        attachWorkerHostDispatcher(worker, requestSab, bodies);
+        attachWorkerHostDispatcher(worker, requestSab, bodies, {
+          callerTid: tid,
+        });
       }
       worker.onmessage = (e: MessageEvent) => {
         if (

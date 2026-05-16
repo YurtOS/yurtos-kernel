@@ -313,6 +313,32 @@ args = [
   { name = "budget_ns", type = "u64" },
 ]
 
+# ── Thread execution ─────────────────────────────────────────────────────────
+
+[import.kh_thread_spawn]
+doc = "Start executing a Rust-kernel-owned pthread. Returns a positive opaque host_thread_handle or negated errno. The Rust kernel already reserved tid and owns lifecycle state."
+return = "scalar"
+args = [
+  { name = "pid", type = "u32" },
+  { name = "tid", type = "u32" },
+  { name = "fn_ptr", type = "u32" },
+  { name = "arg", type = "u32" },
+]
+
+[import.kh_thread_release]
+doc = "Release host adapter bookkeeping for an exited or detached pthread handle. Rust calls this before removing the final ThreadRecord."
+return = "scalar"
+args = [
+  { name = "host_thread_handle", type = "i32" },
+]
+
+[import.kh_thread_cancel]
+doc = "Cancel a host pthread execution handle when Rust must roll back a started worker. Returns 0 or negated errno."
+return = "scalar"
+args = [
+  { name = "host_thread_handle", type = "i32" },
+]
+
 # ── Extension dispatch ───────────────────────────────────────────────────────
 #
 # The kernel forwards `host_extension_invoke` bytes verbatim to the
