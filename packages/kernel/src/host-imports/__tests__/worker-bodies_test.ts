@@ -191,3 +191,59 @@ Deno.test(
     kernel.dispose();
   },
 );
+
+Deno.test("makeWorkerDispatcherBodies: threadSpawn delegates to Rust thread bridge with caller tid", () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const calls: Array<{
+    callerPid: number;
+    callerTid: number;
+    fnPtr: number;
+    arg: number;
+  }> = [];
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => ({
+      ...nullThreadsBackend(),
+      spawn: () => {
+        throw new Error("local backend must not allocate tid");
+      },
+    }),
+    rustThreads: {
+      spawn: (callerPid, callerTid, fnPtr, arg) => {
+        calls.push({ callerPid, callerTid, fnPtr, arg });
+        return 44;
+      },
+      yield: () => 0,
+    },
+  });
+
+  assertEquals(bodies.threadSpawn(123, 456, 9), 44);
+  assertEquals(calls, [{ callerPid: pid, callerTid: 9, fnPtr: 123, arg: 456 }]);
+
+  kernel.dispose();
+});
+
+Deno.test("makeWorkerDispatcherBodies: threadYield delegates to Rust thread bridge with caller tid", () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const calls: Array<{ callerPid: number; callerTid: number }> = [];
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+    rustThreads: {
+      spawn: () => -1,
+      yield: (callerPid, callerTid) => {
+        calls.push({ callerPid, callerTid });
+        return 0;
+      },
+    },
+  });
+
+  assertEquals(bodies.threadYield(9), 0);
+  assertEquals(calls, [{ callerPid: pid, callerTid: 9 }]);
+
+  kernel.dispose();
+});

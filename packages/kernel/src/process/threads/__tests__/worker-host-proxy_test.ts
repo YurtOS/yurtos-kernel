@@ -101,6 +101,36 @@ Deno.test("worker-host-proxy: WriteFd request decoded; bytes match", () => {
   assertEquals(wroteData, "hello");
 });
 
+Deno.test("worker-host-proxy: ThreadSpawn receives dispatcher caller tid", () => {
+  const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
+  const header = new Int32Array(sab, 0, HEADER_WORDS);
+  const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
+
+  let seenTid = -1;
+  const bodies: WorkerHostDispatcherBodies = {
+    ...noopBodies(),
+    threadSpawn: (_fnPtr, _arg, callerTid) => {
+      seenTid = callerTid ?? -1;
+      return 22;
+    },
+  };
+
+  const { target, invoke } = captureHandler();
+  attachWorkerHostDispatcher(target, sab, bodies, { callerTid: 9 });
+
+  payload[OP_WORD] = WorkerHostOp.ThreadSpawn;
+  payload[ARGC_WORD] = 2;
+  payload[ARGS_WORD + 0] = 123;
+  payload[ARGS_WORD + 1] = 456;
+  Atomics.store(header, 0, STATUS_REQUEST_READY);
+
+  invoke();
+
+  assertEquals(Atomics.load(header, 0), STATUS_RESPONSE_READY);
+  assertEquals(Atomics.load(header, 1), 22);
+  assertEquals(seenTid, 9);
+});
+
 Deno.test("worker-host-proxy: ReadFd writes returned bytes back into payload", () => {
   const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
   const header = new Int32Array(sab, 0, HEADER_WORDS);
