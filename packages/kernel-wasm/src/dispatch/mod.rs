@@ -27,9 +27,9 @@ use fs::{
 };
 use process::{
     close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
-    killpg_request, nanosleep, provide_stdin, sched_getparam, sched_getscheduler, sched_setparam,
-    sched_setscheduler, sched_yield, setpgid, setpriority, setresgid, setresuid, setrlimit, setsid,
-    sigaction, sys_spawn, umask,
+    killpg_request, nanosleep, provide_stdin, sched_getaffinity, sched_getparam,
+    sched_getscheduler, sched_setaffinity, sched_setparam, sched_setscheduler, sched_yield,
+    setpgid, setpriority, setresgid, setresuid, setrlimit, setsid, sigaction, sys_spawn, umask,
 };
 pub use process::{
     drain_spawn, kill_pid, list_processes_response, list_threads_response, record_exit,
@@ -148,6 +148,8 @@ pub fn dispatch_with_context(
         METHOD_SYS_SCHED_GETPARAM => sched_getparam(caller_pid, request),
         METHOD_SYS_SCHED_SETSCHEDULER => sched_setscheduler(caller_pid, request),
         METHOD_SYS_SCHED_SETPARAM => sched_setparam(caller_pid, request),
+        METHOD_SYS_SCHED_GETAFFINITY => sched_getaffinity(caller_pid, request, response),
+        METHOD_SYS_SCHED_SETAFFINITY => sched_setaffinity(caller_pid, request),
         METHOD_SYS_CLOSE => close_fd(caller_pid, request),
         METHOD_SYS_DUP => dup_fd(caller_pid, request),
         METHOD_SYS_DUP2 => dup2_fd(caller_pid, request),

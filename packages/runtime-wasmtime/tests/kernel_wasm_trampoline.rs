@@ -202,6 +202,8 @@ const METHOD_SYS_SCHED_GETSCHEDULER: u32 = 0x1_003F;
 const METHOD_SYS_SCHED_GETPARAM: u32 = 0x1_0040;
 const METHOD_SYS_SCHED_SETSCHEDULER: u32 = 0x1_0041;
 const METHOD_SYS_SCHED_SETPARAM: u32 = 0x1_0042;
+const METHOD_SYS_SCHED_GETAFFINITY: u32 = 0x1_005C;
+const METHOD_SYS_SCHED_SETAFFINITY: u32 = 0x1_005D;
 const METHOD_SYS_POLL: u32 = 0x1_0043;
 const METHOD_SYS_SOCKETPAIR: u32 = 0x1_0044;
 const METHOD_SYS_SOCKET_OPEN: u32 = 0x1_0045;
@@ -3231,6 +3233,16 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             "sys_sched_setparam",
             METHOD_SYS_SCHED_SETPARAM,
             METHOD_SYS_SCHED_SETPARAM as i64,
+        ),
+        (
+            "sys_sched_getaffinity",
+            METHOD_SYS_SCHED_GETAFFINITY,
+            METHOD_SYS_SCHED_GETAFFINITY as i64,
+        ),
+        (
+            "sys_sched_setaffinity",
+            METHOD_SYS_SCHED_SETAFFINITY,
+            METHOD_SYS_SCHED_SETAFFINITY as i64,
         ),
         ("sys_poll", METHOD_SYS_POLL, METHOD_SYS_POLL as i64),
         ("sys_close", METHOD_SYS_CLOSE, METHOD_SYS_CLOSE as i64),

@@ -249,6 +249,32 @@ export function buildSysImports(
     },
     sys_tiocsctty: (fd) => forwardRequestBytes(METHOD.SYS_TIOCSCTTY, u32(fd)),
     sys_getpgid: (pid) => forwardRequestBytes(METHOD.SYS_GETPGID, u32(pid)),
+    sys_sched_getaffinity: (pid, maskPtr, cpusetsize) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, pid >>> 0, true);
+      view.setUint32(4, cpusetsize >>> 0, true);
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_SCHED_GETAFFINITY,
+        req,
+        cpusetsize >>> 0,
+      );
+      if (rc >= 0 && rc <= cpusetsize) {
+        const outRc = copyOut(maskPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
+      }
+      return rc;
+    },
+    sys_sched_setaffinity: (pid, maskPtr, cpusetsize) => {
+      const mask = copyIn(maskPtr, cpusetsize >>> 0);
+      if (typeof mask === "number") return mask;
+      const req = new Uint8Array(8 + mask.byteLength);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, pid >>> 0, true);
+      view.setUint32(4, cpusetsize >>> 0, true);
+      req.set(mask, 8);
+      return forwardRequestBytes(METHOD.SYS_SCHED_SETAFFINITY, req);
+    },
     sys_setpgid: (pid, pgid) => {
       const req = new Uint8Array(8);
       const view = new DataView(req.buffer);

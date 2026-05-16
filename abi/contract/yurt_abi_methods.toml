@@ -218,6 +218,16 @@ id = 0x1_005B
 kind = "syscall"
 doc = "Register fd as the caller's controlling terminal. Request bytes carry u32 fd. Returns 0, -EBADF, -ENOTTY, or -EPERM when the caller is not a session leader."
 
+[method.sys_sched_getaffinity]
+id = 0x1_005C
+kind = "syscall"
+doc = "POSIX sched_getaffinity(pid, cpusetsize, mask). Request bytes carry u32 pid, u32 cpusetsize. Response writes cpusetsize bytes; Yurt currently exposes only CPU 0. Returns bytes-written, -EINVAL, or -ESRCH."
+
+[method.sys_sched_setaffinity]
+id = 0x1_005D
+kind = "syscall"
+doc = "POSIX sched_setaffinity(pid, cpusetsize, mask). Request bytes carry u32 pid, u32 cpusetsize, then cpusetsize mask bytes. Yurt currently accepts only CPU 0. Returns 0, -EINVAL, or -ESRCH."
+
 [method.sys_pipe]
 id = 0x1_0012
 kind = "syscall"

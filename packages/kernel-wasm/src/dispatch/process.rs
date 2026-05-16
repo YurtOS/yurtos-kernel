@@ -233,6 +233,51 @@ pub(super) fn sched_setparam(caller_pid: u32, request: &[u8]) -> i64 {
     0
 }
 
+pub(super) fn sched_getaffinity(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([pid, cpusetsize]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = scheduler_target_pid(caller_pid, pid);
+    if !scheduler_target_exists(caller_pid, target) {
+        return -(abi::ESRCH as i64);
+    }
+    if cpusetsize < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let cpusetsize = cpusetsize as usize;
+    if response.len() < cpusetsize {
+        return cpusetsize as i64;
+    }
+    response[..cpusetsize].fill(0);
+    response[0] = 1;
+    cpusetsize as i64
+}
+
+pub(super) fn sched_setaffinity(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([pid, cpusetsize]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    let target = scheduler_target_pid(caller_pid, pid);
+    if !scheduler_target_exists(caller_pid, target) {
+        return -(abi::ESRCH as i64);
+    }
+    if cpusetsize < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let cpusetsize = cpusetsize as usize;
+    let Some(end) = 8usize.checked_add(cpusetsize) else {
+        return -(abi::EINVAL as i64);
+    };
+    if request.len() < end {
+        return -(abi::EINVAL as i64);
+    }
+    let mask = &request[8..end];
+    if mask.first().copied() != Some(1) || mask[1..].iter().any(|byte| *byte != 0) {
+        return -(abi::EINVAL as i64);
+    }
+    0
+}
+
 /// `getrlimit(resource: u32) -> (soft, hard) as 16 bytes LE`.
 pub(super) fn getrlimit(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     let Some([resource]) = read_u32_args::<1>(request) else {

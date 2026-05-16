@@ -551,6 +551,54 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     );
   });
 
+  it("scheduler affinity helpers pack pid and cpuset buffers", async () => {
+    const calls: CapturedCall[] = [];
+    const affinity = new Uint8Array([1, 0, 0, 0]);
+    const responses = [
+      { rc: 4, response: affinity },
+      { rc: 0, response: new Uint8Array() },
+    ];
+    const mk = {
+      kernelSyscallAsync(
+        method: number,
+        callerPid: number,
+        request: Uint8Array,
+        responseCap: number,
+      ): Promise<{ rc: bigint; response: Uint8Array }> {
+        calls.push({
+          method,
+          callerPid,
+          request: request.slice(),
+          responseCap,
+        });
+        const next = responses.shift() ?? { rc: 0, response: new Uint8Array() };
+        return Promise.resolve({
+          rc: BigInt(next.rc),
+          response: next.response,
+        });
+      },
+    } as unknown as KernelHostInterface;
+    const memory = new ArrayBuffer(128);
+    new Uint8Array(memory, 80, 4).set(affinity);
+    const imports = buildWasmKernelImports(mk, () => memory);
+
+    expect(await imports.host_sched_getaffinity(0, 32, 4)).toEqual(4);
+    expect(await imports.host_sched_setaffinity(0, 80, 4)).toEqual(0);
+
+    expect(calls.map((call) => call.method)).toEqual([
+      METHOD.SYS_SCHED_GETAFFINITY,
+      METHOD.SYS_SCHED_SETAFFINITY,
+    ]);
+    expect(calls[0].request).toEqual(
+      new Uint8Array([0, 0, 0, 0, 4, 0, 0, 0]),
+    );
+    expect(calls[0].responseCap).toEqual(4);
+    expect(calls[1].request).toEqual(
+      new Uint8Array([0, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0]),
+    );
+    expect(new Uint8Array(memory, 32, 4)).toEqual(affinity);
+  });
+
   it("host_wait converts the kernel wait record to yurt_wait_result_v1", async () => {
     const kernelWait = new Uint8Array(8);
     const kernelView = new DataView(kernelWait.buffer);

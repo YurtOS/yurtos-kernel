@@ -154,6 +154,44 @@ function scalarRequest(...values: number[]): Uint8Array {
   return req;
 }
 
+const buildSchedGetAffinity: CustomBuilder =
+  (mk, memBuf, callerPid) =>
+  async (pid: number, maskPtr: number, cpusetsize: number): Promise<number> => {
+    const cap = cpusetsize >>> 0;
+    const out = await mk.kernelSyscallAsync(
+      METHOD.SYS_SCHED_GETAFFINITY,
+      callerPid,
+      scalarRequest(pid, cap),
+      cap,
+    );
+    const rc = Number(out.rc);
+    if (rc >= 0 && rc <= cap && out.response.byteLength >= rc) {
+      const outRc = copyOut(memBuf, maskPtr, out.response.subarray(0, rc));
+      if (outRc < 0) return outRc;
+    }
+    return rc;
+  };
+
+const buildSchedSetAffinity: CustomBuilder =
+  (mk, memBuf, callerPid) =>
+  async (pid: number, maskPtr: number, cpusetsize: number): Promise<number> => {
+    const len = cpusetsize >>> 0;
+    const mask = copyIn(memBuf, maskPtr, len);
+    if (typeof mask === "number") return mask;
+    const req = new Uint8Array(8 + mask.byteLength);
+    const view = new DataView(req.buffer);
+    view.setUint32(0, pid >>> 0, true);
+    view.setUint32(4, len, true);
+    req.set(mask, 8);
+    const out = await mk.kernelSyscallAsync(
+      METHOD.SYS_SCHED_SETAFFINITY,
+      callerPid,
+      req,
+      0,
+    );
+    return Number(out.rc);
+  };
+
 export interface WasmProcessThreadHost {
   spawn(tid: number, fnPtr: number, arg: number): number;
   release(handle: number): number;
@@ -494,6 +532,19 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_sched_setparam",
     method: METHOD.SYS_SCHED_SETPARAM,
     args: ["scalar", "scalar"],
+  },
+  {
+    name: "host_sched_getaffinity",
+    method: METHOD.SYS_SCHED_GETAFFINITY,
+    args: ["scalar", "out_cap"],
+    returnsBytes: true,
+    custom: buildSchedGetAffinity,
+  },
+  {
+    name: "host_sched_setaffinity",
+    method: METHOD.SYS_SCHED_SETAFFINITY,
+    args: ["scalar", "prefixed_ptr_len"],
+    custom: buildSchedSetAffinity,
   },
   { name: "host_getpgid", method: METHOD.SYS_GETPGID, args: ["scalar"] },
   {

@@ -230,6 +230,8 @@ mod sys_method_id {
     pub const TCSETATTR: u32 = 0x1_0059;
     pub const WINSIZE: u32 = 0x1_005A;
     pub const TIOCSCTTY: u32 = 0x1_005B;
+    pub const SCHED_GETAFFINITY: u32 = 0x1_005C;
+    pub const SCHED_SETAFFINITY: u32 = 0x1_005D;
     pub const PIPE: u32 = 0x1_0012;
     pub const READ: u32 = 0x1_0013;
     pub const WRITE: u32 = 0x1_0014;
@@ -4815,6 +4817,41 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             forward_request_bytes(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::SCHED_SETPARAM,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_sched_getaffinity",
+        |mut caller: Caller<'_, UserState>, pid: i32, mask_ptr: u32, cpusetsize: u32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(pid as u32).to_le_bytes());
+            req.extend_from_slice(&cpusetsize.to_le_bytes());
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SCHED_GETAFFINITY,
+                &req,
+                mask_ptr,
+                cpusetsize,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_sched_setaffinity",
+        |mut caller: Caller<'_, UserState>, pid: i32, mask_ptr: u32, cpusetsize: u32| -> i32 {
+            let mask = match read_user_guest_bytes(&mut caller, mask_ptr, cpusetsize) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let mut req = Vec::with_capacity(8 + mask.len());
+            req.extend_from_slice(&(pid as u32).to_le_bytes());
+            req.extend_from_slice(&cpusetsize.to_le_bytes());
+            req.extend_from_slice(&mask);
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::SCHED_SETAFFINITY,
                 &req,
             ) as i32
         },

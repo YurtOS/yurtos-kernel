@@ -410,6 +410,24 @@ args = [
   { name = "fd", type = "fd" },
 ]
 
+[import.host_sched_getaffinity]
+doc = "Write the process CPU affinity mask. Yurt currently exposes a single CPU, bit 0."
+return = "fixed_out"
+args = [
+  { name = "pid", type = "pid" },
+  { name = "mask_ptr", type = "ptr" },
+  { name = "cpusetsize", type = "usize" },
+]
+
+[import.host_sched_setaffinity]
+doc = "Validate the process CPU affinity mask. Yurt currently accepts only CPU 0."
+return = "scalar_errno"
+args = [
+  { name = "pid", type = "pid" },
+  { name = "mask_ptr", type = "ptr" },
+  { name = "cpusetsize", type = "usize" },
+]
+
 [import.host_spawn]
 doc = "Spawn a guest process from a native spawn request record and write yurt_spawn_result_v1."
 return = "fixed_out"

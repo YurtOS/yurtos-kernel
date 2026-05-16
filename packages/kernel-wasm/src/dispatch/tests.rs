@@ -34,6 +34,8 @@ const TEST_METHOD_SYS_TCGETATTR: u32 = 0x1_0058;
 const TEST_METHOD_SYS_TCSETATTR: u32 = 0x1_0059;
 const TEST_METHOD_SYS_WINSIZE: u32 = 0x1_005A;
 const TEST_METHOD_SYS_TIOCSCTTY: u32 = 0x1_005B;
+const TEST_METHOD_SYS_SCHED_GETAFFINITY: u32 = 0x1_005C;
+const TEST_METHOD_SYS_SCHED_SETAFFINITY: u32 = 0x1_005D;
 const TEST_ENOTTY: i32 = 25;
 
 fn poll_req(timeout_ms: i32, fds: &[(i32, i16)]) -> Vec<u8> {
@@ -595,6 +597,67 @@ fn scheduler_syscalls_validate_target_policy_and_param() {
             &sched_setparam_req(0, 1),
             &mut []
         ),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn sched_getaffinity_reports_single_cpu_and_validates_target() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut req = Vec::new();
+    req.extend_from_slice(&0_u32.to_le_bytes());
+    req.extend_from_slice(&4_u32.to_le_bytes());
+    let mut out = [0xffu8; 4];
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_GETAFFINITY, 7, &req, &mut out),
+        4
+    );
+    assert_eq!(u32::from_le_bytes(out), 1);
+
+    let mut short_req = Vec::new();
+    short_req.extend_from_slice(&0_u32.to_le_bytes());
+    short_req.extend_from_slice(&3_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_GETAFFINITY, 7, &short_req, &mut out),
+        -(abi::EINVAL as i64)
+    );
+
+    let mut missing_req = Vec::new();
+    missing_req.extend_from_slice(&999_u32.to_le_bytes());
+    missing_req.extend_from_slice(&4_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_GETAFFINITY, 7, &missing_req, &mut out),
+        -(abi::ESRCH as i64)
+    );
+}
+
+#[test]
+fn sched_setaffinity_accepts_only_cpu_zero_mask() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut ok_req = Vec::new();
+    ok_req.extend_from_slice(&0_u32.to_le_bytes());
+    ok_req.extend_from_slice(&4_u32.to_le_bytes());
+    ok_req.extend_from_slice(&1_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_SETAFFINITY, 7, &ok_req, &mut []),
+        0
+    );
+
+    let mut cpu_one_req = Vec::new();
+    cpu_one_req.extend_from_slice(&0_u32.to_le_bytes());
+    cpu_one_req.extend_from_slice(&4_u32.to_le_bytes());
+    cpu_one_req.extend_from_slice(&2_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_SETAFFINITY, 7, &cpu_one_req, &mut []),
+        -(abi::EINVAL as i64)
+    );
+
+    let mut short_req = Vec::new();
+    short_req.extend_from_slice(&0_u32.to_le_bytes());
+    short_req.extend_from_slice(&3_u32.to_le_bytes());
+    short_req.extend_from_slice(&[1, 0, 0]);
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_SCHED_SETAFFINITY, 7, &short_req, &mut []),
         -(abi::EINVAL as i64)
     );
 }
