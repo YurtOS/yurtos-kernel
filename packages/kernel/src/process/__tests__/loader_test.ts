@@ -831,11 +831,20 @@ Deno.test("loadProcess registers Worker/SAB as the Rust wasm thread host", async
     }
     | undefined;
   const starts: Array<{ tid: number; fnPtr: number; arg: number }> = [];
+  const exits: Array<{
+    pid: number;
+    tid: number;
+    handle: number;
+    retval: number;
+  }> = [];
   const ctx = await makeLoaderContext({
     moduleCache: fixedModuleCache(
       makeThreadedImportedSharedMemoryModule(1, 1),
     ),
     wasmThreadHostRegistry: {
+      threadExited(pid, tid, handle, retval) {
+        exits.push({ pid, tid, handle, retval });
+      },
       registerProcess(pid, host) {
         registeredPid = pid;
         registeredHost = host;
@@ -868,6 +877,8 @@ Deno.test("loadProcess registers Worker/SAB as the Rust wasm thread host", async
   const handle = registeredHost.spawn(2, 123, 456);
   assertEquals(handle, 1);
   assertEquals(starts, [{ tid: 2, fnPtr: 123, arg: 456 }]);
+  await Promise.resolve();
+  assertEquals(exits, [{ pid: proc.pid, tid: 2, handle: 1, retval: 0 }]);
   assertEquals(registeredHost.release(handle), 0);
 
   await proc.terminate();

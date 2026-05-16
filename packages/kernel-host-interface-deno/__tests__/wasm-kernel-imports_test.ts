@@ -146,9 +146,18 @@ class FakeKv implements KvBackend {
 describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
   it("installs a pid-routed thread host with global host handles", () => {
     const state = defaultHostState();
+    const exitCalls: number[][] = [];
     const mk = {
       hostStateMut() {
         return state;
+      },
+      recordThreadExitAuthenticated(
+        pid: number,
+        tid: number,
+        handle: number,
+        retval: number,
+      ) {
+        exitCalls.push([pid, tid, handle, retval]);
       },
     } as unknown as KernelHostInterface;
     const registry = createWasmThreadHostRegistry(mk);
@@ -173,6 +182,8 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     const globalHandle = state.threadHost?.spawn(10, 2, 123, 456);
     expect(globalHandle).toBe(1);
     expect(spawnCalls).toEqual([[2, 123, 456]]);
+    registry.threadExited(10, 2, 3, 0x8000_0000);
+    expect(exitCalls).toEqual([[10, 2, 1, 0x8000_0000]]);
     expect(state.threadHost?.release(1)).toBe(0);
     expect(releaseCalls).toEqual([3]);
 
@@ -181,6 +192,61 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(state.threadHost?.cancel(2)).toBe(0);
     expect(cancelCalls).toEqual([3]);
     expect(state.threadHost?.spawn(11, 2, 1, 2)).toBe(-3);
+  });
+
+  it("routes worker nested spawn/yield through authenticated Rust thread syscalls", () => {
+    const state = defaultHostState();
+    const calls: Array<{
+      method: number;
+      callerPid: number;
+      callerTid: number;
+      request: number[];
+      responseCap: number;
+    }> = [];
+    const mk = {
+      hostStateMut() {
+        return state;
+      },
+      kernelThreadSyscall(
+        method: number,
+        callerPid: number,
+        callerTid: number,
+        request: Uint8Array,
+        responseCap: number,
+      ) {
+        calls.push({
+          method,
+          callerPid,
+          callerTid,
+          request: Array.from(request),
+          responseCap,
+        });
+        return {
+          rc: BigInt(method === METHOD.SYS_THREAD_SPAWN ? 17 : 0),
+          response: new Uint8Array(),
+        };
+      },
+    } as unknown as KernelHostInterface;
+    const registry = createWasmThreadHostRegistry(mk);
+
+    expect(registry.threadSpawn?.(10, 2, 123, 456)).toBe(17);
+    expect(registry.threadYield?.(10, 2)).toBe(0);
+    expect(calls).toEqual([
+      {
+        method: METHOD.SYS_THREAD_SPAWN,
+        callerPid: 10,
+        callerTid: 2,
+        request: [123, 0, 0, 0, 200, 1, 0, 0],
+        responseCap: 0,
+      },
+      {
+        method: METHOD.SYS_THREAD_YIELD,
+        callerPid: 10,
+        callerTid: 2,
+        request: [],
+        responseCap: 0,
+      },
+    ]);
   });
 
   it("covers the legacy socket host import names that have Rust syscalls", () => {

@@ -107,10 +107,23 @@ export function resolveWorkerSabThreads(
   memory: WebAssembly.Memory | undefined,
   provided: WorkerSabThreadsBackendOptions | undefined,
   bodies?: WorkerHostDispatcherBodies,
+  threadExited?: WorkerSabThreadsBackendOptions["threadExited"],
 ): WorkerSabThreadsBackendOptions | undefined {
-  if (provided) return provided;
+  if (provided) {
+    if (!threadExited) return provided;
+    return {
+      ...provided,
+      threadExited: (exit) => {
+        provided.threadExited?.(exit);
+        threadExited(exit);
+      },
+    };
+  }
   if (!profile.requiresSharedMemory || !memory) return undefined;
-  return { spawnThread: defaultSpawnThread(module, memory, bodies) };
+  return {
+    spawnThread: defaultSpawnThread(module, memory, bodies),
+    ...(threadExited ? { threadExited } : {}),
+  };
 }
 
 type WasmCallable = (...args: unknown[]) => unknown;
@@ -177,6 +190,19 @@ export interface WasmProcessThreadHost {
 
 export interface WasmThreadHostRegistry {
   registerProcess(pid: number, host: WasmProcessThreadHost): () => void;
+  threadExited?(
+    pid: number,
+    tid: number,
+    localHandle: number,
+    retval: number,
+  ): void;
+  threadSpawn?(
+    callerPid: number,
+    callerTid: number,
+    fnPtr: number,
+    arg: number,
+  ): number;
+  threadYield?(callerPid: number, callerTid: number): number;
 }
 
 export interface LoaderContext {
@@ -313,8 +339,35 @@ export async function loadProcess(
         // See `callerPid` doc-comment on MakeWorkerDispatcherBodiesOptions.
         callerPid: () => pidRef ?? 0,
         threadsBackend: () => threadsBackendRef,
+        rustThreads: ctx.wasmThreadHostRegistry?.threadSpawn &&
+            ctx.wasmThreadHostRegistry.threadYield
+          ? {
+            spawn: (callerPid, callerTid, fnPtr, arg) =>
+              ctx.wasmThreadHostRegistry!.threadSpawn!(
+                callerPid,
+                callerTid,
+                fnPtr,
+                arg,
+              ),
+            yield: (callerPid, callerTid) =>
+              ctx.wasmThreadHostRegistry!.threadYield!(callerPid, callerTid),
+          }
+          : undefined,
         socketBackend: ctx.socketBackend ?? null,
       })
+      : undefined;
+  const rustThreadExited:
+    | WorkerSabThreadsBackendOptions["threadExited"]
+    | undefined = ctx.wasmThreadHostRegistry?.threadExited
+      ? (exit) => {
+        if (pidRef === null) return;
+        ctx.wasmThreadHostRegistry!.threadExited!(
+          pidRef,
+          exit.tid,
+          exit.handle,
+          exit.retval,
+        );
+      }
       : undefined;
   const workerSabThreads = resolveWorkerSabThreads(
     profile,
@@ -322,6 +375,7 @@ export async function loadProcess(
     workerSabMemory,
     opts.workerSabThreads,
     workerHostBodies,
+    rustThreadExited,
   );
   const threadsBackend: ThreadsBackend = createThreadsBackend(profile, {
     workerSab: workerSabThreads,

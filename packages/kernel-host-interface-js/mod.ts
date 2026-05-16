@@ -3373,6 +3373,27 @@ export class KernelHostInterface {
     }
   }
 
+  recordThreadExitAuthenticated(
+    pid: number,
+    tid: number,
+    hostThreadHandle: number,
+    exitValue: number,
+  ): void {
+    const rc = Number(
+      this.kernel.recordThreadExitAuthenticated(
+        pid,
+        tid,
+        hostThreadHandle,
+        exitValue,
+      ),
+    );
+    if (rc !== 0) {
+      throw new Error(
+        `kernel_record_thread_exit_authenticated failed: rc=${rc}`,
+      );
+    }
+  }
+
   blockThread(pid: number, tid: number): void {
     const rc = Number(this.kernel.blockThread(pid, tid));
     if (rc !== 0) throw new Error(`kernel_block_thread failed: rc=${rc}`);

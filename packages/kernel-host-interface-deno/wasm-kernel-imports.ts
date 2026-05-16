@@ -161,6 +161,19 @@ export interface WasmProcessThreadHost {
 
 export interface WasmThreadHostRegistry {
   registerProcess(pid: number, host: WasmProcessThreadHost): () => void;
+  threadExited(
+    pid: number,
+    tid: number,
+    localHandle: number,
+    retval: number,
+  ): void;
+  threadSpawn(
+    callerPid: number,
+    callerTid: number,
+    fnPtr: number,
+    arg: number,
+  ): number;
+  threadYield(callerPid: number, callerTid: number): number;
 }
 
 export function createWasmThreadHostRegistry(
@@ -201,6 +214,40 @@ export function createWasmThreadHostRegistry(
   };
 
   return {
+    threadExited(pid, tid, localHandle, retval) {
+      for (const [handle, entry] of handles) {
+        if (entry.pid !== pid || entry.localHandle !== localHandle) continue;
+        try {
+          mk.recordThreadExitAuthenticated(pid, tid, handle, retval >>> 0);
+        } catch {
+          // Stale worker completion reports are ignored; Rust remains
+          // authoritative and rejects mismatched handles.
+        }
+        return;
+      }
+    },
+    threadSpawn(callerPid, callerTid, fnPtr, arg) {
+      return Number(
+        mk.kernelThreadSyscall(
+          METHOD.SYS_THREAD_SPAWN,
+          callerPid,
+          callerTid,
+          scalarRequest(fnPtr, arg),
+          0,
+        ).rc,
+      );
+    },
+    threadYield(callerPid, callerTid) {
+      return Number(
+        mk.kernelThreadSyscall(
+          METHOD.SYS_THREAD_YIELD,
+          callerPid,
+          callerTid,
+          new Uint8Array(0),
+          0,
+        ).rc,
+      );
+    },
     registerProcess(pid, host) {
       hosts.set(pid, host);
       return () => {
