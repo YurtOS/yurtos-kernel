@@ -197,19 +197,19 @@ Expected: continuation fork canaries pass under the Rust-backed kernel route.
 
 ## Task 5: Wasmtime Real Fork Support
 
-- [ ] **Step 1: Write failing Wasmtime continuation test**
+- [x] **Step 1: Write failing Wasmtime fork lifecycle test**
 
-Add a Wasmtime fixture or WAT-based continuation test that imports `host_fork` and expects parent return `child_pid` and child return `0`.
+Add a WAT-based Wasmtime test that imports `host_fork`, expects the parent to receive `child_pid`, expects the child to observe `host_fork() == 0`, and verifies the parent can reap the child via Rust `sys_wait`.
 
 Run: `cargo test -p yurt-runtime-wasmtime fork`
 
 Expected: fail because `host_fork` still returns `-ENOSYS`.
 
-- [ ] **Step 2: Implement Wasmtime continuation adapter**
+- [x] **Step 2: Implement Wasmtime restart/snapshot adapter**
 
-Implement host memory snapshot and child instance startup behind `host_fork`, using the same Rust kernel prepare/commit/rollback exports.
+Implement host memory snapshot and child instance startup behind `host_fork`, using the same Rust kernel prepare/commit/rollback exports. The first Wasmtime slice snapshots/restores linear memory and restarts the child instance with a one-shot child-side fork return of `0`; it does not yet reproduce an arbitrary suspended wasm call stack.
 
-- [ ] **Step 3: Verify green**
+- [x] **Step 3: Verify green**
 
 Run: `cargo test -p yurt-runtime-wasmtime fork`
 

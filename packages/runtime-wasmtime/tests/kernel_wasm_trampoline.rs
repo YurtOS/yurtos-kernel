@@ -124,6 +124,7 @@ fn sockaddr_in_bytes(host: [u8; 4], port: u16) -> [u8; 16] {
 }
 
 const ENOSYS: i64 = 38;
+const EFAULT: i64 = 14;
 const EACCES: i64 = 13;
 const EPERM: i64 = 1;
 const EINVAL: i32 = 22;
@@ -2459,7 +2460,7 @@ fn user_process_calls_kernel_through_full_trampoline() {
 }
 
 #[test]
-fn user_process_importing_host_fork_instantiates_and_returns_enosys() {
+fn host_fork_without_exported_memory_returns_efault() {
     let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
 
     let user_wat = r#"
@@ -2472,7 +2473,56 @@ fn user_process_importing_host_fork_instantiates_and_returns_enosys() {
     let mut user = mk.spawn_user_process(&user_wasm).unwrap();
 
     let rc = user.call_run().unwrap();
-    assert_eq!(rc, -(ENOSYS as i32), "host_fork is present but unsupported");
+    assert_eq!(
+        rc,
+        -(EFAULT as i32),
+        "host_fork requires exported process memory to snapshot"
+    );
+}
+
+#[test]
+fn wasmtime_host_fork_returns_child_pid_to_parent_and_runs_child_with_zero() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+
+    let user_wat = r#"
+        (module
+          (import "yurt" "host_fork" (func $host_fork (result i32)))
+          (import "env" "sys_getpid" (func $getpid (result i32)))
+          (import "env" "sys_getppid" (func $getppid (result i32)))
+          (import "env" "sys_wait" (func $wait (param i32 i32 i32) (result i32)))
+          (memory (export "memory") 1)
+          (func (export "run") (result i32)
+            (local $fork i32)
+            (local $wait_rc i32)
+            (local.set $fork (call $host_fork))
+            (if (i32.eqz (local.get $fork))
+              (then
+                (if (i32.ne (call $getppid) (i32.const 1))
+                  (then (return (i32.const -10))))
+                (i32.store (i32.const 0) (call $getpid))
+                (return (i32.const 0))))
+            (if (i32.le_s (local.get $fork) (i32.const 1))
+              (then (return (local.get $fork))))
+            (local.set $wait_rc
+              (call $wait
+                (local.get $fork)
+                (i32.const 0)
+                (i32.const 0)))
+            (if (i32.ne (local.get $wait_rc) (i32.const 8))
+              (then (return (local.get $wait_rc))))
+            (if (i32.ne (i32.load (i32.const 0)) (local.get $fork))
+              (then (return (i32.const -11))))
+            (if (i32.ne (i32.load (i32.const 4)) (i32.const 0))
+              (then (return (i32.const -12))))
+            (local.get $fork))
+        )
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    let reaped_child_pid = user.call_run().unwrap();
+    assert_eq!(reaped_child_pid, 2);
 }
 
 #[test]

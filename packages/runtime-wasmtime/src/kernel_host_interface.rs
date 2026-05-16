@@ -200,6 +200,22 @@ fn write_user_guest_bytes(
     Ok(())
 }
 
+fn snapshot_user_memory(caller: &mut Caller<'_, UserState>) -> std::result::Result<Vec<u8>, i64> {
+    if caller
+        .get_export("memory")
+        .and_then(|e| e.into_shared_memory())
+        .is_some()
+    {
+        return Err(-EAGAIN);
+    }
+    let memory = user_memory(caller)?;
+    let mut snapshot = vec![0u8; memory.data_size(&*caller)];
+    if !snapshot.is_empty() && memory.read(&*caller, 0, &mut snapshot).is_err() {
+        return Err(-EFAULT);
+    }
+    Ok(snapshot)
+}
+
 /// Method ids that the user-process linker forwards. Generated
 /// constants live inside `yurt-kernel-wasm`'s build artifact, not in
 /// the host crate, so we mirror the ones we forward here. Drift is
@@ -708,10 +724,13 @@ fn run_wasmtime_thread(
     crate::wasi_shim::add_to_linker(&mut linker)
         .context("install WASI preview1 shim on thread linker")?;
     let user_state = UserState {
+        engine: engine.clone(),
         kernel,
         pid,
         caller_tid: tid,
         argv: process.argv,
+        wasm: process.wasm.clone(),
+        forced_fork_return: None,
         dir_fds: std::collections::BTreeMap::new(),
         last_exit: None,
         last_scheduler_budget_ns: None,
@@ -765,6 +784,64 @@ fn define_imported_shared_memory<T>(
             .context("define imported shared memory")?;
     }
     Ok(())
+}
+
+fn instantiate_fork_child(
+    engine: &Engine,
+    kernel: Arc<Mutex<KernelInstance>>,
+    pid: u32,
+    wasm: Arc<[u8]>,
+    argv: Vec<Vec<u8>>,
+    memory_snapshot: &[u8],
+) -> Result<UserProcess> {
+    let module = Module::new(engine, wasm.as_ref()).context("compile fork child wasm")?;
+    if imported_shared_memory_type(&module).is_some() {
+        anyhow::bail!("fork child imports shared memory");
+    }
+    let mut linker: Linker<UserState> = Linker::new(engine);
+    register_sys_imports(&mut linker)?;
+    register_yurt_thread_imports(&mut linker)?;
+    crate::wasi_shim::add_to_linker(&mut linker)
+        .context("install WASI preview1 shim on fork child linker")?;
+    let user_state = UserState {
+        engine: engine.clone(),
+        kernel,
+        pid,
+        caller_tid: 1,
+        argv,
+        wasm,
+        forced_fork_return: Some(0),
+        dir_fds: std::collections::BTreeMap::new(),
+        last_exit: None,
+        last_scheduler_budget_ns: None,
+        last_scheduler_epoch_quantum: None,
+    };
+    let mut store = Store::new(engine, user_state);
+    store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .context("instantiate fork child wasm")?;
+    let memory = instance
+        .get_memory(&mut store, "memory")
+        .ok_or_else(|| anyhow!("fork child wasm missing memory export"))?;
+    let current_len = memory.data_size(&store);
+    if current_len < memory_snapshot.len() {
+        let missing = memory_snapshot.len() - current_len;
+        let pages = missing.div_ceil(64 * 1024);
+        memory
+            .grow(&mut store, pages as u64)
+            .context("grow fork child memory")?;
+    }
+    if !memory_snapshot.is_empty() {
+        memory
+            .write(&mut store, 0, memory_snapshot)
+            .context("restore fork child memory")?;
+    }
+    Ok(UserProcess {
+        store,
+        instance,
+        pid,
+    })
 }
 
 fn read_shared_memory(memory: SharedMemory, addr: u32, len: usize) -> Result<Vec<u8>> {
@@ -2958,11 +3035,15 @@ impl KernelHostInterface {
             .context("create imported shared memory")?;
 
         let thread_argv = argv.clone();
+        let process_wasm = Arc::<[u8]>::from(wasm.to_vec());
         let user_state = UserState {
+            engine: self.engine.clone(),
             kernel: self.kernel.clone(),
             pid,
             caller_tid: 1,
             argv,
+            wasm: process_wasm.clone(),
+            forced_fork_return: None,
             dir_fds: std::collections::BTreeMap::new(),
             last_exit: None,
             last_scheduler_budget_ns: None,
@@ -2986,12 +3067,7 @@ impl KernelHostInterface {
             .thread_host
             .as_ref()
         {
-            thread_host.register_process(
-                pid,
-                Arc::<[u8]>::from(wasm.to_vec()),
-                thread_argv,
-                shared_memory,
-            );
+            thread_host.register_process(pid, process_wasm, thread_argv, shared_memory);
         }
         Ok(UserProcess {
             store,
@@ -3087,10 +3163,13 @@ fn encode_argv_records<S: AsRef<[u8]>>(argv: &[S]) -> Vec<u8> {
 /// `sys_spawn` lands and the kernel allocates pids itself, argv
 /// migrates into `Process` so it's preserved across exec.
 pub struct UserState {
+    pub engine: Engine,
     pub kernel: Arc<Mutex<KernelInstance>>,
     pub pid: u32,
     pub caller_tid: u32,
     pub argv: Vec<Vec<u8>>,
+    pub wasm: Arc<[u8]>,
+    pub forced_fork_return: Option<i32>,
     /// fd → absolute path, populated on every successful `path_open`
     /// and cleared on `fd_close`. Used by the WASI `fd_readdir` shim
     /// to translate a directory fd back into a path it can pass to
@@ -3384,12 +3463,75 @@ fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
             Err(anyhow!("thread exited"))
         },
     )?;
-    linker.func_wrap(YURT_NAMESPACE, "host_fork", || -> i32 {
-        // Continuation-backed fork requires host memory snapshot support.
-        // Wasmtime exposes the import so continuation guests link, while
-        // the Rust-owned fork lifecycle is implemented in the next slice.
-        -(ENOSYS as i32)
-    })?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_fork",
+        |mut caller: Caller<'_, UserState>| -> i32 {
+            if let Some(value) = caller.data_mut().forced_fork_return.take() {
+                return value;
+            }
+
+            let parent_pid = caller.data().pid;
+            let child_pid = match caller
+                .data()
+                .kernel
+                .lock()
+                .unwrap()
+                .prepare_fork(parent_pid)
+            {
+                Ok(pid) => pid,
+                Err(_) => return -(EAGAIN as i32),
+            };
+            let memory_snapshot = match snapshot_user_memory(&mut caller) {
+                Ok(snapshot) => snapshot,
+                Err(rc) => {
+                    let _ = caller
+                        .data()
+                        .kernel
+                        .lock()
+                        .unwrap()
+                        .rollback_fork(parent_pid, child_pid);
+                    return rc as i32;
+                }
+            };
+            let engine = caller.data().engine.clone();
+            let kernel = caller.data().kernel.clone();
+            let wasm = caller.data().wasm.clone();
+            let argv = caller.data().argv.clone();
+            let mut child = match instantiate_fork_child(
+                &engine,
+                kernel.clone(),
+                child_pid,
+                wasm,
+                argv,
+                &memory_snapshot,
+            ) {
+                Ok(child) => child,
+                Err(_) => {
+                    let _ = kernel.lock().unwrap().rollback_fork(parent_pid, child_pid);
+                    return -(EAGAIN as i32);
+                }
+            };
+            if kernel
+                .lock()
+                .unwrap()
+                .commit_fork(parent_pid, child_pid)
+                .is_err()
+            {
+                let _ = kernel.lock().unwrap().rollback_fork(parent_pid, child_pid);
+                return -(EAGAIN as i32);
+            }
+            let child_exit = match child.call_run() {
+                Ok(code) => code,
+                Err(_) => child.last_exit().unwrap_or(127),
+            };
+            let record_exit_result = kernel.lock().unwrap().record_exit(child_pid, child_exit);
+            if !matches!(record_exit_result, Ok(0)) {
+                return -(EIO as i32);
+            }
+            child_pid as i32
+        },
+    )?;
     linker.func_wrap(
         YURT_NAMESPACE,
         "host_thread_yield",
