@@ -118,6 +118,7 @@ const ABI_IMPORT_METHODS = new Map<string, string | null>([
   ["host_socket_set_no_delay", "sys_socket_option"],
   ["host_chown", "sys_chown"],
   ["host_fchown", "sys_fchown"],
+  ["host_fchdir", "sys_fchdir"],
   ["host_sched_getaffinity", "sys_sched_getaffinity"],
   ["host_sched_setaffinity", "sys_sched_setaffinity"],
   ["host_tcgetpgrp", "sys_tcgetpgrp"],
@@ -161,7 +162,7 @@ Deno.test("yurt ABI host imports have Rust method mapping or documented deferral
   );
   const matrix = await Deno.readTextFile(
     new URL(
-      "../../../../../docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix.md",
+      "../../../../../docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix-design.md",
       import.meta.url,
     ),
   );

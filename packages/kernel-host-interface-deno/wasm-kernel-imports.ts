@@ -765,6 +765,7 @@ export const HOST_BINDINGS: HostBinding[] = [
     method: METHOD.SYS_FCHOWN,
     args: ["scalar", "scalar", "scalar"],
   },
+  { name: "host_fchdir", method: METHOD.SYS_FCHDIR, args: ["scalar"] },
 
   // ── Multi-path ops (rename, symlink, link) ────────────────
   // host_rename(fromPtr, fromLen, toPtr, toLen) → 0 / -errno.

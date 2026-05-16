@@ -608,10 +608,15 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
 
     expect(await imports.host_chown(16, path.byteLength, 123, 456)).toEqual(0);
     expect(await imports.host_fchown(7, 123, 456)).toEqual(0);
+    expect(
+      await (imports as Record<string, (...args: number[]) => Promise<number>>)
+        .host_fchdir(7),
+    ).toEqual(0);
 
     expect(calls.map((call) => call.method)).toEqual([
       METHOD.SYS_CHOWN,
       (METHOD as Record<string, number>).SYS_FCHOWN,
+      (METHOD as Record<string, number>).SYS_FCHDIR,
     ]);
     expect(calls[0].request).toEqual(
       new Uint8Array([
@@ -629,6 +634,7 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(calls[1].request).toEqual(
       new Uint8Array([7, 0, 0, 0, 123, 0, 0, 0, 200, 1, 0, 0]),
     );
+    expect(calls[2].request).toEqual(new Uint8Array([7, 0, 0, 0]));
   });
 
   it("host_wait converts the kernel wait record to yurt_wait_result_v1", async () => {

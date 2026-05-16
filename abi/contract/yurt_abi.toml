@@ -126,6 +126,10 @@ doc = "File exists."
 value = 20
 doc = "Not a directory."
 
+[errno.EISDIR]
+value = 21
+doc = "Is a directory."
+
 [errno.EINVAL]
 value = 22
 doc = "Invalid argument."
@@ -427,6 +431,13 @@ args = [
   { name = "fd", type = "fd" },
   { name = "uid", type = "uid" },
   { name = "gid", type = "gid" },
+]
+
+[import.host_fchdir]
+doc = "Change the caller's working directory to an open directory fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
 ]
 
 [import.host_sched_getaffinity]

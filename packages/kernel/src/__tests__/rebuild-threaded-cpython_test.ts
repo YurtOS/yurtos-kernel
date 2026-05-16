@@ -2,7 +2,10 @@ import { assertEquals } from "@std/assert";
 import { dirname, join, resolve } from "path";
 import { fileURLToPath } from "node:url";
 
-const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const repoRoot = resolve(
+  dirname(fileURLToPath(import.meta.url)),
+  "../../../..",
+);
 const script = join(repoRoot, "scripts", "rebuild-threaded-cpython.sh");
 
 async function existsDir(path: string) {

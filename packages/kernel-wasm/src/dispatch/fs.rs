@@ -17,6 +17,30 @@ pub(super) fn chdir(caller_pid: u32, request: &[u8]) -> i64 {
             Ok(path) => path,
             Err(rc) => return rc,
         };
+        match k.vfs.entry_type(&path) {
+            3 => {}
+            0 => return -(abi::ENOENT as i64),
+            _ => return -(abi::ENOTDIR as i64),
+        }
+        k.process_mut(caller_pid).cwd = path;
+        0
+    })
+}
+
+pub(super) fn fchdir(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() != 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().unwrap());
+    with_kernel(|k| {
+        let path = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(crate::kernel::FdEntry::Directory { path }) => path.clone(),
+            Some(_) => return -(abi::ENOTDIR as i64),
+            None => return -(abi::EBADF as i64),
+        };
+        if k.vfs.entry_type(&path) != 3 {
+            return -(abi::ENOENT as i64);
+        }
         k.process_mut(caller_pid).cwd = path;
         0
     })
@@ -52,6 +76,7 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
     let writable = flags & 0b001 != 0;
     let create = flags & 0b010 != 0;
     let trunc = flags & 0b100 != 0;
+    let directory = flags & 0b1000 != 0;
     with_kernel(|k| {
         let path = match normalize_readable_path(k, caller_pid, raw_path) {
             Ok(path) => path,
@@ -74,6 +99,24 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             };
         }
         let path: &[u8] = &resolved;
+        let entry_type = k.vfs.entry_type(path);
+        if directory && entry_type != 3 {
+            return -(abi::ENOTDIR as i64);
+        }
+        if entry_type == 3 {
+            if writable || create || trunc {
+                return -(abi::EISDIR as i64);
+            }
+            let p = k.process_mut(caller_pid);
+            let fd = p.fd_table.lowest_free_fd();
+            p.fd_table.install(
+                fd,
+                crate::kernel::FdEntry::Directory {
+                    path: path.to_vec(),
+                },
+            );
+            return fd as i64;
+        }
         // open() handles both lookup and create-if-missing in one
         // call. The flags bits propagate to the backend so it knows
         // the caller's intent (writable opens vs read-only).

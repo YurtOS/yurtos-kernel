@@ -28,7 +28,6 @@ pub type Tid = u32;
 
 pub const DEFAULT_UMASK: u16 = 0o022;
 pub const MAIN_THREAD_TID: Tid = 1;
-#[allow(dead_code)]
 pub const GUEST_MAIN_PTHREAD_ID: Tid = 0;
 pub const FIRST_WORKER_TID: Tid = 2;
 pub const MAX_GUEST_THREAD_ID: Tid = i32::MAX as u32;
@@ -56,11 +55,7 @@ pub const RLIMIT_SLOTS: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThreadState {
     Runnable,
-    // Reserved for the scheduler/poll/pthread ABI wiring that will
-    // consume the kernel-owned transition methods below.
-    #[allow(dead_code)]
     Blocked,
-    #[allow(dead_code)]
     Exited,
 }
 
@@ -132,6 +127,12 @@ pub enum FdEntry {
     /// via dup/dup2 — share the same OFD, matching POSIX semantics.
     File {
         ofd_id: u64,
+    },
+    /// Open directory handle. Directory fds are kernel-owned path
+    /// capabilities; they do not use OFDs because there is no byte
+    /// cursor or backend inode operation behind fchdir/readdir.
+    Directory {
+        path: Vec<u8>,
     },
     /// Kernel-owned POSIX socket. `id` references a [`SocketEntry`] in
     /// `Kernel::sockets`; the entry owns the KH socket handle and refcount.
@@ -1316,16 +1317,12 @@ impl Kernel {
         })
     }
 
-    // Reserved for pthread host-import wiring; tests pin the kernel-owned
-    // lifecycle before host backends start calling into it.
-    #[allow(dead_code)]
     pub fn spawn_thread(&mut self, pid: Pid, host_thread_handle: Option<i32>) -> Option<Tid> {
         let tid = self.reserve_thread_id(pid).ok()?;
         self.bind_thread_handle(pid, tid, host_thread_handle).ok()?;
         Some(tid)
     }
 
-    #[allow(dead_code)]
     pub fn reserve_thread_id(&mut self, pid: Pid) -> Result<Tid, i32> {
         let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
         p.ensure_main_thread(None);
@@ -1337,7 +1334,6 @@ impl Kernel {
         Ok(tid)
     }
 
-    #[allow(dead_code)]
     pub fn rollback_reserved_thread(&mut self, pid: Pid, tid: Tid) -> Result<(), i32> {
         let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
         if p.next_tid == tid.saturating_add(1) {
@@ -1346,7 +1342,6 @@ impl Kernel {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn bind_thread_handle(
         &mut self,
         pid: Pid,
@@ -1372,7 +1367,6 @@ impl Kernel {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn detach_thread(&mut self, pid: Pid, tid: Tid) -> Result<(), i32> {
         let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
         let thread = p.threads.get_mut(&tid).ok_or(crate::abi::ESRCH)?;
@@ -1393,13 +1387,11 @@ impl Kernel {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn exit_thread(&mut self, pid: Pid, tid: Tid, exit_value: i32) -> Result<(), i32> {
         self.exit_thread_authenticated(pid, tid, exit_value as u32)
             .map(|_| ())
     }
 
-    #[allow(dead_code)]
     pub fn exit_thread_authenticated(
         &mut self,
         pid: Pid,
@@ -1432,7 +1424,6 @@ impl Kernel {
         Ok(waiter_tid)
     }
 
-    #[allow(dead_code)]
     pub fn record_thread_exit_authenticated(
         &mut self,
         pid: Pid,
@@ -1451,7 +1442,6 @@ impl Kernel {
         self.exit_thread_authenticated(pid, tid, exit_value)
     }
 
-    #[allow(dead_code)]
     pub fn begin_thread_join(
         &mut self,
         pid: Pid,
@@ -1501,7 +1491,6 @@ impl Kernel {
         Err(crate::abi::EAGAIN)
     }
 
-    #[allow(dead_code)]
     pub fn block_thread(&mut self, pid: Pid, tid: Tid) -> Option<()> {
         let thread = self.processes.get_mut(&pid)?.threads.get_mut(&tid)?;
         if thread.state != ThreadState::Exited {
@@ -1520,7 +1509,6 @@ impl Kernel {
         self.drain_thread_releases()
     }
 
-    #[allow(dead_code)]
     pub fn unblock_thread(&mut self, pid: Pid, tid: Tid) -> Option<()> {
         let thread = self.processes.get_mut(&pid)?.threads.get_mut(&tid)?;
         if thread.state == ThreadState::Blocked {

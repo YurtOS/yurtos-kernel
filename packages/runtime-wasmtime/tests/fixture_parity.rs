@@ -146,8 +146,8 @@ fn dispatch_sys_arms() -> BTreeSet<String> {
 }
 
 fn intentionally_deferred_sys_methods() -> BTreeSet<String> {
-    let path =
-        workspace_root().join("docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix.md");
+    let path = workspace_root()
+        .join("docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix-design.md");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|err| {
         panic!("read {}: {err}", path.display());
     });

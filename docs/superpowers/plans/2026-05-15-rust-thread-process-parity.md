@@ -1525,7 +1525,8 @@ git commit -m "test: cover Rust pthread conformance"
 
 **Files:**
 
-- Modify: `docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix.md`
+- Modify:
+  `docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix-design.md`
 - Modify:
   `docs/superpowers/specs/2026-05-15-rust-thread-process-parity-design.md`
 
@@ -1544,7 +1545,7 @@ when a concrete guest requires it.
 Run:
 
 ```bash
-/Users/sunny/.deno/bin/deno fmt --check docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix.md docs/superpowers/specs/2026-05-15-rust-thread-process-parity-design.md
+/Users/sunny/.deno/bin/deno fmt --check docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix-design.md docs/superpowers/specs/2026-05-15-rust-thread-process-parity-design.md
 ```
 
 Expected: pass.
@@ -1552,7 +1553,7 @@ Expected: pass.
 Commit:
 
 ```bash
-git add docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix.md docs/superpowers/specs/2026-05-15-rust-thread-process-parity-design.md
+git add docs/superpowers/specs/2026-05-15-rust-kernel-parity-matrix-design.md docs/superpowers/specs/2026-05-15-rust-thread-process-parity-design.md
 git commit -m "docs: defer kernel DNS parity"
 ```
 

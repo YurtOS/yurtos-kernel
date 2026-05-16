@@ -22,8 +22,8 @@ mod socket;
 mod thread;
 
 use fs::{
-    chdir, chmod, chown, fchown, getcwd, hard_link, mkdir, readdir, readlink, realpath, rename,
-    rmdir, stat_path, symlink, sys_open, unlink, utimens,
+    chdir, chmod, chown, fchdir, fchown, getcwd, hard_link, mkdir, readdir, readlink, realpath,
+    rename, rmdir, stat_path, symlink, sys_open, unlink, utimens,
 };
 use process::{
     close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
@@ -183,6 +183,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_CHMOD => chmod(caller_pid, request),
         METHOD_SYS_CHOWN => chown(caller_pid, request),
         METHOD_SYS_FCHOWN => fchown(caller_pid, request),
+        METHOD_SYS_FCHDIR => fchdir(caller_pid, request),
         METHOD_SYS_UTIMENS => utimens(caller_pid, request),
         METHOD_SYS_UNLINK => unlink(caller_pid, request),
         METHOD_SYS_STAT => stat_path(caller_pid, request, response),
@@ -271,6 +272,7 @@ fn close_entry(k: &mut Kernel, entry: FdEntry) -> Option<i32> {
             k.ofd_dec_ref(ofd_id);
             None
         }
+        crate::kernel::FdEntry::Directory { .. } => None,
         crate::kernel::FdEntry::Socket { id } => k.socket_dec_ref(id),
         _ => None,
     }
@@ -297,6 +299,7 @@ fn inc_entry_ref(k: &mut Kernel, entry: &FdEntry) {
             }
         }
         crate::kernel::FdEntry::File { ofd_id } => k.ofd_inc_ref(*ofd_id),
+        crate::kernel::FdEntry::Directory { .. } => {}
         crate::kernel::FdEntry::Socket { id } => k.socket_inc_ref(*id),
         _ => {}
     }
@@ -486,6 +489,7 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                 }
                 n
             }
+            crate::kernel::FdEntry::Directory { .. } => -(abi::EISDIR as i64),
             crate::kernel::FdEntry::Socket { id } => socket_recv_id(k, id, response, 0),
         }
     })
@@ -559,6 +563,7 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
                 }
                 n
             }
+            crate::kernel::FdEntry::Directory { .. } => -(abi::EBADF as i64),
             crate::kernel::FdEntry::Socket { id } => socket_send_id(k, id, payload),
         }
     })
@@ -625,7 +630,7 @@ fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) ->
                 0
             }
         }
-        FdEntry::File { .. } => {
+        FdEntry::File { .. } | FdEntry::Directory { .. } => {
             let mut revents = 0;
             if wants_read {
                 revents |= POLLIN;
@@ -1084,6 +1089,7 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             | crate::kernel::FdEntry::Stderr => (0, 2, 0o020_666),
             crate::kernel::FdEntry::Pipe { .. } => (0, 6, 0o010_600),
             crate::kernel::FdEntry::Socket { .. } => (0, 6, 0o140_666),
+            crate::kernel::FdEntry::Directory { .. } => (0, 3, 0o040_755),
             crate::kernel::FdEntry::File { ofd_id } => {
                 let (mount_id, inode) = match k.ofd(ofd_id) {
                     Some(o) => (o.mount_id, o.inode),

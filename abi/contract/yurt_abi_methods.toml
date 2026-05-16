@@ -533,6 +533,11 @@ id = 0x1_0052
 kind = "syscall"
 doc = "Yield the authenticated caller thread. No request bytes. Returns 0 or negated errno."
 
+[method.sys_fchdir]
+id = 0x1_005F
+kind = "syscall"
+doc = "Change the caller's working directory to an open directory fd. Request bytes: u32 fd LE. Returns 0 or negated POSIX errno."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"

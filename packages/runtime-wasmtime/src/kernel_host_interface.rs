@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
@@ -49,6 +49,7 @@ const YURT_NAMESPACE: &str = "yurt";
 /// `abi/contract/yurt_abi.toml`.
 const EFAULT: i64 = 14;
 const ENOENT: i64 = 2;
+const ESRCH: i64 = 3;
 const EACCES: i64 = 13;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
@@ -233,6 +234,7 @@ mod sys_method_id {
     pub const SCHED_GETAFFINITY: u32 = 0x1_005C;
     pub const SCHED_SETAFFINITY: u32 = 0x1_005D;
     pub const FCHOWN: u32 = 0x1_005E;
+    pub const FCHDIR: u32 = 0x1_005F;
     pub const PIPE: u32 = 0x1_0012;
     pub const READ: u32 = 0x1_0013;
     pub const WRITE: u32 = 0x1_0014;
@@ -561,7 +563,7 @@ struct WasmtimeThreadProcess {
 
 struct WasmtimeThreadHost {
     engine: Engine,
-    kernel: Arc<Mutex<KernelInstance>>,
+    kernel: Weak<Mutex<KernelInstance>>,
     processes: Mutex<std::collections::BTreeMap<u32, WasmtimeThreadProcess>>,
     threads: Mutex<std::collections::BTreeMap<i32, thread::JoinHandle<()>>>,
     next_handle: Mutex<i32>,
@@ -571,7 +573,7 @@ impl WasmtimeThreadHost {
     fn new(engine: Engine, kernel: Arc<Mutex<KernelInstance>>) -> Self {
         Self {
             engine,
-            kernel,
+            kernel: Arc::downgrade(&kernel),
             processes: Mutex::new(std::collections::BTreeMap::new()),
             threads: Mutex::new(std::collections::BTreeMap::new()),
             next_handle: Mutex::new(1),
@@ -616,7 +618,9 @@ impl ThreadHost for WasmtimeThreadHost {
             handle
         };
         let engine = self.engine.clone();
-        let kernel = self.kernel.clone();
+        let Some(kernel) = self.kernel.upgrade() else {
+            return -(ESRCH as i32);
+        };
         let join = thread::Builder::new()
             .name(format!("yurt-wasmtime-thread-{pid}-{tid}"))
             .spawn(move || {
@@ -639,7 +643,9 @@ impl ThreadHost for WasmtimeThreadHost {
 
     fn release(&self, host_thread_handle: i32) -> i32 {
         if let Some(join) = self.threads.lock().unwrap().remove(&host_thread_handle) {
-            let _ = join.join();
+            if should_join_thread(join.thread().id()) {
+                let _ = join.join();
+            }
         }
         0
     }
@@ -648,6 +654,10 @@ impl ThreadHost for WasmtimeThreadHost {
         self.threads.lock().unwrap().remove(&host_thread_handle);
         0
     }
+}
+
+fn should_join_thread(target: thread::ThreadId) -> bool {
+    target != thread::current().id()
 }
 
 fn run_wasmtime_thread(
@@ -4995,6 +5005,17 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
     )?;
     linker.func_wrap(
         SYS_NAMESPACE,
+        "sys_fchdir",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::FCHDIR,
+                fd as u32,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
         "sys_utimens",
         |mut caller: Caller<'_, UserState>, mtime_ns: i64, path_ptr: u32, path_len: u32| -> i32 {
             let path = match read_user_guest_bytes(&mut caller, path_ptr, path_len) {
@@ -5839,5 +5860,14 @@ mod tests {
         let cap = fetch_executor_queue_capacity_for_tests();
         assert!(cap > 0);
         assert!(cap <= 128);
+    }
+
+    #[test]
+    fn thread_release_never_joins_current_thread() {
+        assert!(!should_join_thread(thread::current().id()));
+
+        let join = thread::spawn(thread::current);
+        let spawned_id = join.join().unwrap().id();
+        assert!(should_join_thread(spawned_id));
     }
 }

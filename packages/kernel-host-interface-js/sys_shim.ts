@@ -361,6 +361,7 @@ export function buildSysImports(
       view.setUint32(8, gid >>> 0, true);
       return forwardRequestBytes(METHOD.SYS_FCHOWN, req);
     },
+    sys_fchdir: (fd) => forwardRequestBytes(METHOD.SYS_FCHDIR, u32(fd)),
     sys_nanosleep: (ns) => {
       // `ns` arrives as a JS bigint when the wasm import is declared
       // with an i64 parameter type; coerce defensively for hosts that

@@ -218,6 +218,7 @@ export const METHOD = {
   SYS_SCHED_GETAFFINITY: 0x1_005C,
   SYS_SCHED_SETAFFINITY: 0x1_005D,
   SYS_FCHOWN: 0x1_005E,
+  SYS_FCHDIR: 0x1_005F,
 } as const;
 
 export const KERNEL_PID = 0;
@@ -1778,6 +1779,11 @@ function buildUserYurtImports(
     view.setUint32(4, Number(uid) >>> 0, true);
     view.setUint32(8, Number(gid) >>> 0, true);
     return Number(kernel.syscall(METHOD.SYS_FCHOWN, pid, req, 0).rc);
+  };
+  imports.host_fchdir = (fd) => {
+    const req = new Uint8Array(4);
+    new DataView(req.buffer).setUint32(0, Number(fd) >>> 0, true);
+    return Number(kernel.syscall(METHOD.SYS_FCHDIR, pid, req, 0).rc);
   };
   return imports;
 }

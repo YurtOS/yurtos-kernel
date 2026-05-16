@@ -23,6 +23,7 @@ fn make_root(pid: u32) {
 const O_WRITE: u32 = 0b001;
 const O_CREAT: u32 = 0b010;
 const O_TRUNC: u32 = 0b100;
+const O_DIRECTORY: u32 = 0b1000;
 
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0002;
@@ -37,6 +38,7 @@ const TEST_METHOD_SYS_TIOCSCTTY: u32 = 0x1_005B;
 const TEST_METHOD_SYS_SCHED_GETAFFINITY: u32 = 0x1_005C;
 const TEST_METHOD_SYS_SCHED_SETAFFINITY: u32 = 0x1_005D;
 const TEST_METHOD_SYS_FCHOWN: u32 = 0x1_005E;
+const TEST_METHOD_SYS_FCHDIR: u32 = 0x1_005F;
 const TEST_ENOTTY: i32 = 25;
 
 fn poll_req(timeout_ms: i32, fds: &[(i32, i16)]) -> Vec<u8> {
@@ -331,6 +333,9 @@ fn chdir_then_getcwd_round_trips() {
     assert_eq!(dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf), 2);
     assert_eq!(&buf[..2], b"/\0");
 
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/var", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/var/tmp", &mut []), 0);
+
     // chdir to "/var/tmp"
     assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/var/tmp", &mut []), 0);
 
@@ -354,6 +359,9 @@ fn getcwd_returns_required_size_when_buffer_too_small() {
 #[test]
 fn cwd_is_per_pid() {
     let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/home", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/home/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 2, b"/home/b", &mut []), 0);
     assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/home/a", &mut []), 0);
     assert_eq!(dispatch(METHOD_SYS_CHDIR, 2, b"/home/b", &mut []), 0);
     let mut buf = [0u8; 32];
@@ -368,6 +376,84 @@ fn chdir_rejects_empty_path() {
     assert_eq!(
         dispatch(METHOD_SYS_CHDIR, 1, &[], &mut []),
         -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn chdir_rejects_missing_and_non_directory_paths() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_CHDIR, 1, b"/missing", &mut []),
+        -(abi::ENOENT as i64)
+    );
+
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"/file.txt"),
+        &mut [],
+    );
+    assert!(fd >= 3);
+    assert_eq!(
+        dispatch(METHOD_SYS_CHDIR, 1, b"/file.txt", &mut []),
+        -(abi::ENOTDIR as i64)
+    );
+}
+
+#[test]
+fn fchdir_moves_cwd_to_open_directory_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp/base", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp/base/sub", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/tmp/base/sub", &mut []), 0);
+
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_DIRECTORY, b"/tmp/base"),
+        &mut [],
+    );
+    assert!(fd >= 3, "directory open should return fd, got {fd}");
+
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_FCHDIR,
+            1,
+            &(fd as u32).to_le_bytes(),
+            &mut []
+        ),
+        0
+    );
+
+    let mut buf = [0u8; 32];
+    let n = dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf);
+    assert_eq!(&buf[..n as usize], b"/tmp/base\0");
+}
+
+#[test]
+fn fchdir_rejects_invalid_and_non_directory_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &99_u32.to_le_bytes(), &mut []),
+        -(abi::EBADF as i64)
+    );
+
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"/file.txt"),
+        &mut [],
+    );
+    assert!(fd >= 3);
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_FCHDIR,
+            1,
+            &(fd as u32).to_le_bytes(),
+            &mut []
+        ),
+        -(abi::ENOTDIR as i64)
     );
 }
 
@@ -4833,6 +4919,8 @@ fn proc_comm_is_basename_of_argv0() {
 fn proc_cwd_serves_chdir_path() {
     let _g = crate::kernel::TestGuard::acquire();
     // Set cwd via sys_chdir, then read /proc/<N>/cwd.
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 11, b"/var", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 11, b"/var/tmp", &mut []), 0);
     assert_eq!(dispatch(METHOD_SYS_CHDIR, 11, b"/var/tmp", &mut []), 0);
 
     let fd = dispatch(METHOD_SYS_OPEN, 11, &open_req(0, b"/proc/11/cwd"), &mut []);
@@ -5560,6 +5648,11 @@ fn sys_spawn_inherits_parent_cwd_and_fd_table() {
     dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
 
     let parent_pid = 7;
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, parent_pid, b"/tmp", &mut []), 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_MKDIR, parent_pid, b"/tmp/work", &mut []),
+        0
+    );
     assert_eq!(
         dispatch(METHOD_SYS_CHDIR, parent_pid, b"/tmp/work", &mut []),
         0
