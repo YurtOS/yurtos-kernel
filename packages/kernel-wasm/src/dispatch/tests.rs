@@ -6710,6 +6710,758 @@ fn user_processes_cannot_call_kernel_only_methods() {
     }
 }
 
+// --- Slice B2.1: POSIX pread/pwrite (positional, no cursor move) ---
+
+fn write_req(fd: u32, data: &[u8]) -> Vec<u8> {
+    let mut req = fd.to_le_bytes().to_vec();
+    req.extend_from_slice(data);
+    req
+}
+
+fn p_req(fd: u32, offset: u64, data: &[u8]) -> Vec<u8> {
+    let mut req = fd.to_le_bytes().to_vec();
+    req.extend_from_slice(&offset.to_le_bytes());
+    req.extend_from_slice(data);
+    req
+}
+
+fn open_rw(path: &[u8]) -> u32 {
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, path),
+        &mut [],
+    );
+    assert!(fd >= 3, "open returned {fd}");
+    fd as u32
+}
+
+#[test]
+fn pread_reads_at_offset_without_consuming_the_cursor() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/pread.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_WRITE, 1, &write_req(fd, b"0123456789"), &mut []),
+        10
+    );
+
+    let mut buf = [0u8; 8];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd, 3, &[]), &mut buf);
+    assert_eq!(n, 7, "reads from offset 3 to EOF");
+    assert_eq!(&buf[..7], b"3456789");
+
+    // Idempotent: a second pread at the same offset returns the same
+    // bytes — proving the OFD cursor was not advanced.
+    let mut buf2 = [0u8; 8];
+    let n2 = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd, 3, &[]), &mut buf2);
+    assert_eq!(n2, 7);
+    assert_eq!(&buf2[..7], b"3456789");
+}
+
+#[test]
+fn pwrite_writes_at_offset_without_moving_the_cursor() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/pwrite.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 0, b"hello"), &mut []),
+        5
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 5, b"world"), &mut []),
+        5
+    );
+
+    // Read it back from the start; pwrite never touched the cursor.
+    let mut buf = [0u8; 16];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd, 0, &[]), &mut buf);
+    assert_eq!(&buf[..n as usize], b"helloworld");
+}
+
+#[test]
+fn pwrite_past_eof_zero_fills_the_sparse_gap() {
+    // PR #55 review #4: pwrite is a new one-call path to the
+    // past-EOF case; POSIX requires the gap to read back as zeros.
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/sparse.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 0, b"hi"), &mut []),
+        2
+    );
+    // Write one byte at offset 10, leaving a [2, 10) hole.
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 10, b"X"), &mut []),
+        1
+    );
+    let mut buf = [0xFFu8; 16];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd, 0, &[]), &mut buf);
+    assert_eq!(n, 11, "length is the farthest write end (11)");
+    let mut expected = [0u8; 11];
+    expected[0] = b'h';
+    expected[1] = b'i';
+    expected[10] = b'X';
+    assert_eq!(
+        &buf[..n as usize],
+        &expected[..],
+        "the [2,10) gap must read back as zero bytes"
+    );
+}
+
+#[test]
+fn pwrite_zero_length_past_eof_does_not_change_file_size() {
+    // PR #55 review P2: a 0-byte pwrite past EOF must return 0 and NOT
+    // resize the file (no sparse extension), per POSIX.
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/zlpw.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 0, b"abc"), &mut []),
+        3
+    );
+    // Zero-length pwrite far past EOF must be a true no-op.
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 100, b""), &mut []),
+        0
+    );
+    // The file is still exactly 3 bytes — not extended to 100.
+    let mut buf = [0xFFu8; 64];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd, 0, &[]), &mut buf);
+    assert_eq!(n, 3, "0-byte pwrite must not extend the file");
+    assert_eq!(&buf[..3], b"abc");
+}
+
+#[test]
+fn pread_pwrite_espipe_on_non_seekable_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // stdin (fd 0) / stdout (fd 1) are streams → ESPIPE.
+    let mut buf = [0u8; 4];
+    assert_eq!(
+        dispatch(METHOD_SYS_PREAD, 1, &p_req(0, 0, &[]), &mut buf),
+        -(abi::ESPIPE as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(1, 0, b"x"), &mut []),
+        -(abi::ESPIPE as i64)
+    );
+}
+
+#[test]
+fn pread_pwrite_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut buf = [0u8; 4];
+    // Unknown fd.
+    assert_eq!(
+        dispatch(METHOD_SYS_PREAD, 1, &p_req(99, 0, &[]), &mut buf),
+        -(abi::EBADF as i64)
+    );
+    // Short request (< 12 bytes header).
+    assert_eq!(
+        dispatch(METHOD_SYS_PREAD, 1, &[0u8; 8], &mut buf),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &[0u8; 8], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // Directory fd: pread → EISDIR, pwrite → EBADF.
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    let dfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(O_DIRECTORY, b"/d"), &mut []);
+    assert!(dfd >= 3);
+    assert_eq!(
+        dispatch(METHOD_SYS_PREAD, 1, &p_req(dfd as u32, 0, &[]), &mut buf),
+        -(abi::EISDIR as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(dfd as u32, 0, b"x"), &mut []),
+        -(abi::EBADF as i64)
+    );
+    // Read-only file fd: pwrite → EBADF (not writable).
+    let _ = open_rw(b"/ro.txt");
+    let rofd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/ro.txt"), &mut []);
+    assert!(rofd >= 3);
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(rofd as u32, 0, b"x"), &mut []),
+        -(abi::EBADF as i64)
+    );
+}
+
+// --- Slice B2.2: POSIX dup3 ---
+
+fn dup3_req(oldfd: u32, newfd: u32, flags: u32) -> Vec<u8> {
+    let mut req = oldfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&newfd.to_le_bytes());
+    req.extend_from_slice(&flags.to_le_bytes());
+    req
+}
+
+fn fd_is_inheritable(pid: u32, fd: u32) -> bool {
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(pid)
+            .fd_table
+            .inheritable_entries()
+            .iter()
+            .any(|(f, _)| *f == fd)
+    })
+}
+
+#[test]
+fn dup3_aliases_oldfd_to_newfd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let oldfd = open_rw(b"/dup3.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(oldfd, 20, 0), &mut []),
+        20
+    );
+    // newfd shares the OFD: write via 20, read it back via the alias.
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(20, 0, b"aliased"), &mut []),
+        7
+    );
+    let mut buf = [0u8; 16];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(oldfd, 0, &[]), &mut buf);
+    assert_eq!(&buf[..n as usize], b"aliased");
+}
+
+#[test]
+fn dup3_same_fd_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/dup3b.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(fd, fd, 0), &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn dup3_unknown_oldfd_is_ebadf() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(99, 20, 0), &mut []),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn dup3_unknown_flag_bits_are_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/dup3c.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(fd, 20, 0b10), &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn dup3_clears_cloexec_on_a_recycled_newfd() {
+    // PR #55 review #3: dup3 onto a newfd that ALREADY has FD_CLOEXEC,
+    // with flags=0, must clear the stale bit (deterministic, unlike
+    // dup2). Locks the recycled-fd path the other tests didn't cover.
+    let _g = crate::kernel::TestGuard::acquire();
+    let oldfd = open_rw(b"/dup3-old.txt");
+    let newfd = open_rw(b"/dup3-new.txt");
+    let mut set = newfd.to_le_bytes().to_vec();
+    set.extend_from_slice(&1u32.to_le_bytes()); // FD_CLOEXEC
+    assert_eq!(
+        dispatch(METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS, 1, &set, &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &newfd.to_le_bytes(),
+            &mut []
+        ),
+        1,
+        "precondition: newfd has FD_CLOEXEC set"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(oldfd, newfd, 0), &mut []),
+        newfd as i64
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &newfd.to_le_bytes(),
+            &mut []
+        ),
+        0,
+        "dup3 flags=0 must clear the recycled fd's stale FD_CLOEXEC"
+    );
+}
+
+#[test]
+fn dup3_cloexec_flag_controls_newfd_inheritance() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let oldfd = open_rw(b"/dup3d.txt");
+
+    // flags=1 (FD_CLOEXEC): newfd must NOT be inheritable across exec.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(oldfd, 21, 1), &mut []),
+        21
+    );
+    assert!(!fd_is_inheritable(1, 21), "cloexec fd must be excluded");
+
+    // flags=0: newfd inherits normally.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(oldfd, 22, 0), &mut []),
+        22
+    );
+    assert!(fd_is_inheritable(1, 22), "non-cloexec fd inherits");
+}
+
+// --- Slice B2.3: POSIX fcntl(F_GETFD) ---
+
+fn setfd_req(fd: u32, flags: u32) -> Vec<u8> {
+    let mut req = fd.to_le_bytes().to_vec();
+    req.extend_from_slice(&flags.to_le_bytes());
+    req
+}
+
+#[test]
+fn fcntl_getfd_defaults_to_zero_and_reflects_setfd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/getfd.txt");
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &fd.to_le_bytes(),
+            &mut []
+        ),
+        0,
+        "FD_CLOEXEC defaults clear"
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &setfd_req(fd, 1),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &fd.to_le_bytes(),
+            &mut []
+        ),
+        1,
+        "F_GETFD reflects the FD_CLOEXEC set via F_SETFD"
+    );
+    // Clearing it round-trips back to 0.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &setfd_req(fd, 0),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &fd.to_le_bytes(),
+            &mut []
+        ),
+        0
+    );
+}
+
+#[test]
+fn fcntl_getfd_unknown_fd_is_ebadf() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS,
+            1,
+            &99u32.to_le_bytes(),
+            &mut []
+        ),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn fcntl_getfd_short_request_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS, 1, &[1, 2], &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+// --- Slice B2.4: POSIX openat ---
+
+const AT_FDCWD: u32 = u32::MAX;
+
+fn openat_req(dirfd: u32, flags: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&flags.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+fn open_dir(path: &[u8]) -> u32 {
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(O_DIRECTORY, path), &mut []);
+    assert!(fd >= 3, "open dir returned {fd}");
+    fd as u32
+}
+
+fn read_abs(path: &[u8]) -> Vec<u8> {
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, path), &mut []);
+    assert!(fd >= 3, "open {path:?} returned {fd}");
+    let mut buf = [0u8; 64];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd as u32, 0, &[]), &mut buf);
+    assert!(n >= 0, "pread returned {n}");
+    buf[..n as usize].to_vec()
+}
+
+#[test]
+fn openat_resolves_relative_to_the_directory_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dfd, O_CREAT | O_WRITE, b"rel.txt"),
+        &mut [],
+    );
+    assert!(fd >= 3, "openat returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"hi"), &mut []),
+        2
+    );
+    // It really landed at /base/rel.txt.
+    assert_eq!(read_abs(b"/base/rel.txt"), b"hi");
+}
+
+#[test]
+fn openat_absolute_path_ignores_dirfd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // dirfd is garbage, but an absolute path must still work.
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(999, O_CREAT | O_WRITE, b"/abs.txt"),
+        &mut [],
+    );
+    assert!(fd >= 3, "openat abs returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"A"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/abs.txt"), b"A");
+}
+
+#[test]
+fn openat_at_fdcwd_is_cwd_relative() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/cwd", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/cwd", &mut []), 0);
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(AT_FDCWD, O_CREAT | O_WRITE, b"c.txt"),
+        &mut [],
+    );
+    assert!(fd >= 3);
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"Z"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/cwd/c.txt"), b"Z");
+}
+
+#[test]
+fn openat_dirfd_not_a_directory_is_enotdir() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let ffd = open_rw(b"/notadir.txt");
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_OPENAT,
+            1,
+            &openat_req(ffd, O_CREAT | O_WRITE, b"x"),
+            &mut []
+        ),
+        -(abi::ENOTDIR as i64)
+    );
+}
+
+#[test]
+fn openat_unknown_dirfd_is_ebadf() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_OPENAT,
+            1,
+            &openat_req(99, O_CREAT | O_WRITE, b"x"),
+            &mut []
+        ),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn openat_short_or_empty_request_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_OPENAT, 1, &[0u8; 4], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // 8-byte header but no path.
+    assert_eq!(
+        dispatch(METHOD_SYS_OPENAT, 1, &openat_req(AT_FDCWD, 0, b""), &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+// --- Slice B2.3b: POSIX fcntl(F_GETFL/F_SETFL) — storage only ---
+
+const O_APPEND: u32 = 0x400;
+const O_NONBLOCK: u32 = 0x800;
+
+fn setfl_req(fd: u32, flags: u32) -> Vec<u8> {
+    let mut req = fd.to_le_bytes().to_vec();
+    req.extend_from_slice(&flags.to_le_bytes());
+    req
+}
+
+fn getfl(fd: u32) -> i64 {
+    dispatch(
+        METHOD_SYS_GET_FILE_STATUS_FLAGS,
+        1,
+        &fd.to_le_bytes(),
+        &mut [],
+    )
+}
+
+#[test]
+fn fcntl_setfl_getfl_roundtrip_and_masking_on_file() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/setfl.txt");
+    assert_eq!(getfl(fd), 0, "status flags default to 0");
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FILE_STATUS_FLAGS,
+            1,
+            &setfl_req(fd, O_NONBLOCK),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(getfl(fd), O_NONBLOCK as i64);
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FILE_STATUS_FLAGS,
+            1,
+            &setfl_req(fd, O_APPEND | O_NONBLOCK),
+            &mut [],
+        ),
+        0
+    );
+    assert_eq!(getfl(fd), (O_APPEND | O_NONBLOCK) as i64);
+
+    // Non-settable bits (access mode / creation) are stripped.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FILE_STATUS_FLAGS,
+            1,
+            &setfl_req(fd, 0xFFFF_FFFF),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        getfl(fd),
+        (O_APPEND | O_NONBLOCK) as i64,
+        "only settable subset kept"
+    );
+}
+
+#[test]
+fn fcntl_setfl_is_shared_across_dup_via_the_ofd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/setfl_dup.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(fd, 30, 0), &mut []),
+        30
+    );
+    // Set via the original fd; observe via the dup (same OFD).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FILE_STATUS_FLAGS,
+            1,
+            &setfl_req(fd, O_NONBLOCK),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        getfl(30),
+        O_NONBLOCK as i64,
+        "status flags live on the shared OFD"
+    );
+}
+
+#[test]
+fn fcntl_getfl_is_zero_for_non_file_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // stdout (fd 1) is valid but has no per-OFD status tracked.
+    assert_eq!(getfl(1), 0);
+}
+
+#[test]
+fn fcntl_getfl_setfl_unknown_fd_is_ebadf() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(getfl(99), -(abi::EBADF as i64));
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SET_FILE_STATUS_FLAGS,
+            1,
+            &setfl_req(99, O_NONBLOCK),
+            &mut []
+        ),
+        -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn fcntl_getfl_setfl_short_request_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_GET_FILE_STATUS_FLAGS, 1, &[1, 2], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SET_FILE_STATUS_FLAGS, 1, &[1, 2, 3, 4], &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+// --- Slice B2.5: POSIX ioctl (FIONBIO / FIONREAD whitelist) ---
+
+const FIONBIO: u32 = 0x5421;
+const FIONREAD: u32 = 0x541B;
+
+fn ioctl_req(fd: u32, req: u32, arg: u32) -> Vec<u8> {
+    let mut r = fd.to_le_bytes().to_vec();
+    r.extend_from_slice(&req.to_le_bytes());
+    r.extend_from_slice(&arg.to_le_bytes());
+    r
+}
+
+#[test]
+fn ioctl_fionbio_toggles_o_nonblock_in_status_flags() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/fionbio.txt");
+    assert_eq!(getfl(fd), 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, FIONBIO, 1), &mut []),
+        0
+    );
+    assert_eq!(getfl(fd), O_NONBLOCK as i64, "FIONBIO set O_NONBLOCK");
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, FIONBIO, 0), &mut []),
+        0
+    );
+    assert_eq!(getfl(fd), 0, "FIONBIO arg=0 cleared O_NONBLOCK");
+}
+
+#[test]
+fn ioctl_fionread_file_reports_size_minus_offset() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/fionread.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd, 0, b"0123456789"), &mut []),
+        10
+    );
+    let mut buf = [0u8; 4];
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, FIONREAD, 0), &mut buf),
+        4
+    );
+    assert_eq!(u32::from_le_bytes(buf), 10);
+
+    // A regular read advances the OFD cursor; FIONREAD tracks remaining.
+    let mut rbuf = [0u8; 4];
+    assert_eq!(
+        dispatch(METHOD_SYS_READ, 1, &fd.to_le_bytes(), &mut rbuf),
+        4
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, FIONREAD, 0), &mut buf),
+        4
+    );
+    assert_eq!(u32::from_le_bytes(buf), 6, "10 - 4 consumed");
+}
+
+#[test]
+fn ioctl_fionread_pipe_reports_buffered_bytes() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut pbuf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pbuf), 8);
+    let read_fd = u32::from_le_bytes(pbuf[0..4].try_into().unwrap());
+    let write_fd = u32::from_le_bytes(pbuf[4..8].try_into().unwrap());
+    assert_eq!(
+        dispatch(METHOD_SYS_WRITE, 1, &write_req(write_fd, b"hello"), &mut []),
+        5
+    );
+    let mut buf = [0u8; 4];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_IOCTL,
+            1,
+            &ioctl_req(read_fd, FIONREAD, 0),
+            &mut buf
+        ),
+        4
+    );
+    assert_eq!(u32::from_le_bytes(buf), 5);
+}
+
+#[test]
+fn ioctl_unknown_request_is_enotty() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = open_rw(b"/ioctl_x.txt");
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, 0x9999, 0), &mut []),
+        -(abi::ENOTTY as i64)
+    );
+}
+
+#[test]
+fn ioctl_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Unknown fd.
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(99, FIONBIO, 1), &mut []),
+        -(abi::EBADF as i64)
+    );
+    // Short request.
+    assert_eq!(
+        dispatch(METHOD_SYS_IOCTL, 1, &[0u8; 8], &mut []),
+        -(abi::EINVAL as i64)
+    );
+    // FIONREAD with too-small response.
+    let fd = open_rw(b"/ioctl_g.txt");
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_IOCTL,
+            1,
+            &ioctl_req(fd, FIONREAD, 0),
+            &mut [0u8; 2]
+        ),
+        -(abi::EINVAL as i64)
+    );
+}
 // --- Slice B1.1: SIGCHLD delivered to the parent on child exit ---
 // POSIX: a process receives SIGCHLD when a child terminates. record_exit
 // must OR SIGCHLD into the parent's pending_signals (same bit convention

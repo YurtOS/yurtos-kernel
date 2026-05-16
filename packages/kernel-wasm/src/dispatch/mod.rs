@@ -23,7 +23,7 @@ mod thread;
 
 use fs::{
     chdir, chmod, chown, fchdir, fchown, getcwd, hard_link, mkdir, readdir, readlink, realpath,
-    rename, rmdir, stat_path, symlink, sys_open, unlink, utimens,
+    rename, rmdir, stat_path, symlink, sys_open, sys_openat, unlink, utimens,
 };
 use process::{
     close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
@@ -157,11 +157,18 @@ pub fn dispatch_with_context(
         METHOD_SYS_CLOSE => close_fd(caller_pid, request),
         METHOD_SYS_DUP => dup_fd(caller_pid, request),
         METHOD_SYS_DUP2 => dup2_fd(caller_pid, request),
+        METHOD_SYS_DUP3 => dup3_fd(caller_pid, request),
         METHOD_SYS_DUP_MIN => dup_min_fd(caller_pid, request),
         METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS => set_fd_descriptor_flags(caller_pid, request),
+        METHOD_SYS_GET_FD_DESCRIPTOR_FLAGS => get_fd_descriptor_flags(caller_pid, request),
+        METHOD_SYS_GET_FILE_STATUS_FLAGS => get_file_status_flags(caller_pid, request),
+        METHOD_SYS_SET_FILE_STATUS_FLAGS => set_file_status_flags(caller_pid, request),
+        METHOD_SYS_IOCTL => ioctl_fd(caller_pid, request, response),
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
+        METHOD_SYS_PREAD => pread_fd(caller_pid, request, response),
+        METHOD_SYS_PWRITE => pwrite_fd(caller_pid, request),
         METHOD_SYS_POLL => poll_fds(caller_pid, request, response),
         METHOD_SYS_ISATTY => isatty(caller_pid, request),
         METHOD_SYS_TCGETPGRP => tcgetpgrp(caller_pid, request),
@@ -185,6 +192,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
         METHOD_SYS_OPEN => sys_open(caller_pid, request),
+        METHOD_SYS_OPENAT => sys_openat(caller_pid, request),
         METHOD_SYS_LSEEK => lseek(caller_pid, request, response),
         METHOD_SYS_FSTAT => fstat(caller_pid, request, response),
         METHOD_SYS_CHMOD => chmod(caller_pid, request),
@@ -364,6 +372,46 @@ fn dup2_fd(caller_pid: u32, request: &[u8]) -> i64 {
     })
 }
 
+/// `dup3(oldfd, newfd, flags)` — like `dup2` but `oldfd == newfd` is
+/// `-EINVAL` (not a no-op) and `flags` bit 0 sets `FD_CLOEXEC` on
+/// `newfd`. Unknown flag bits → `-EINVAL`. (B2.2)
+fn dup3_fd(caller_pid: u32, request: &[u8]) -> i64 {
+    const FD_CLOEXEC: u32 = 1;
+    let Some([oldfd, newfd, flags]) = read_u32_args::<3>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if flags & !FD_CLOEXEC != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    if oldfd == newfd {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(oldfd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        // newfd is silently closed first (POSIX), then aliases oldfd.
+        let close_handle = k
+            .process_mut(caller_pid)
+            .fd_table
+            .entry(newfd)
+            .cloned()
+            .and_then(|prev| close_entry(k, prev));
+        inc_entry_ref(k, &entry);
+        k.process_mut(caller_pid).fd_table.install(newfd, entry);
+        // dup3 carries the close-on-exec flag explicitly.
+        let _ = k
+            .process_mut(caller_pid)
+            .fd_table
+            .set_descriptor_flags(newfd, flags & FD_CLOEXEC);
+        if let Some(handle) = close_handle {
+            let _ = kh::socket_close(handle);
+        }
+        newfd as i64
+    })
+}
+
 /// `dup_min(oldfd: u32, minfd: u32) -> newfd / -EBADF / -EINVAL`.
 fn dup_min_fd(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([oldfd, minfd]) = read_u32_args::<2>(request) else {
@@ -395,6 +443,138 @@ fn set_fd_descriptor_flags(caller_pid: u32, request: &[u8]) -> i64 {
         {
             Ok(()) => 0,
             Err(errno) => -(errno as i64),
+        }
+    })
+}
+
+/// `fcntl(F_GETFD)` — read an fd's descriptor flags (FD_CLOEXEC bit).
+/// Request: u32 fd LE. Companion to set_fd_descriptor_flags. (B2.3)
+fn get_fd_descriptor_flags(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(
+        |k| match k.process_mut(caller_pid).fd_table.get_descriptor_flags(fd) {
+            Ok(flags) => flags as i64,
+            Err(errno) => -(errno as i64),
+        },
+    )
+}
+
+/// POSIX-settable file status flags (`fcntl` F_SETFL). Linux/musl
+/// numeric values; access-mode/creation bits are never settable.
+const SETTABLE_STATUS_FLAGS: u32 = 0x400 /* O_APPEND */ | 0x800 /* O_NONBLOCK */;
+
+/// `fcntl(F_GETFL)` — read an fd's file status flags. Regular-file fds
+/// return their stored flags; other valid fds return 0 (none tracked
+/// yet); unknown fd → -EBADF. (B2.3b — storage only.)
+///
+/// FIXME(#60): the access-mode bits (O_ACCMODE) are not surfaced, so
+/// `flags & O_ACCMODE` always reads O_RDONLY even on a write fd.
+/// Correct fix needs an OFD access-mode field + a B0-measured slice.
+fn get_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match entry {
+            FdEntry::File { ofd_id } => match k.ofd(ofd_id) {
+                Some(o) => o.status_flags as i64,
+                None => -(abi::EBADF as i64),
+            },
+            // Valid but no per-OFD status tracked yet.
+            _ => 0,
+        }
+    })
+}
+
+/// `fcntl(F_SETFL)` — set the settable subset of an fd's status flags
+/// on its OFD (shared by dup'd fds). Non-file valid fds accept it as a
+/// no-op; unknown fd → -EBADF. (B2.3b — storage only; reads/writes do
+/// not yet honor O_APPEND/O_NONBLOCK.)
+fn set_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd, flags]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match entry {
+            FdEntry::File { ofd_id } => match k.ofd_mut(ofd_id) {
+                Some(o) => {
+                    o.status_flags = flags & SETTABLE_STATUS_FLAGS;
+                    0
+                }
+                None => -(abi::EBADF as i64),
+            },
+            _ => 0,
+        }
+    })
+}
+
+/// `ioctl(fd, request, arg)` — narrow whitelist (B2.5).
+/// FIONBIO toggles O_NONBLOCK in the OFD status_flags (storage only,
+/// like F_SETFL); FIONREAD writes the readable-byte count; anything
+/// else is -ENOTTY. Behavioral honoring of O_NONBLOCK is gate-sequenced.
+fn ioctl_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    const FIONBIO: u32 = 0x5421;
+    const FIONREAD: u32 = 0x541B;
+    const O_NONBLOCK: u32 = 0x800;
+    let Some([fd, req, arg]) = read_u32_args::<3>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match req {
+            FIONBIO => {
+                if let FdEntry::File { ofd_id } = entry {
+                    if let Some(o) = k.ofd_mut(ofd_id) {
+                        if arg != 0 {
+                            o.status_flags |= O_NONBLOCK;
+                        } else {
+                            o.status_flags &= !O_NONBLOCK;
+                        }
+                    } else {
+                        return -(abi::EBADF as i64);
+                    }
+                }
+                // Non-file valid fds: accepted no-op (not tracked yet).
+                0
+            }
+            FIONREAD => {
+                if response.len() < 4 {
+                    return -(abi::EINVAL as i64);
+                }
+                let readable: u32 = match entry {
+                    FdEntry::File { ofd_id } => match k.ofd(ofd_id) {
+                        Some(o) => {
+                            let size = k.vfs.size(o.mount_id, o.inode).unwrap_or(0);
+                            size.saturating_sub(o.offset).min(u32::MAX as u64) as u32
+                        }
+                        None => return -(abi::EBADF as i64),
+                    },
+                    FdEntry::Pipe {
+                        id,
+                        end: PipeEnd::Read,
+                    } => k
+                        .pipe_buf_mut(id)
+                        .map(|b| b.bytes.len().min(u32::MAX as usize) as u32)
+                        .unwrap_or(0),
+                    _ => 0,
+                };
+                response[0..4].copy_from_slice(&readable.to_le_bytes());
+                4
+            }
+            _ => -(abi::ENOTTY as i64),
         }
     })
 }
@@ -572,6 +752,81 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
             }
             crate::kernel::FdEntry::Directory { .. } => -(abi::EBADF as i64),
             crate::kernel::FdEntry::Socket { id } => socket_send_id(k, id, payload),
+        }
+    })
+}
+
+/// `pread(fd, offset)` — positional read on a regular file. Unlike
+/// `read`, it never touches the OFD cursor. Request: u32 fd LE +
+/// u64 offset LE. Non-seekable fds → -ESPIPE, a directory → -EISDIR,
+/// unknown fd → -EBADF. (B2.1)
+fn pread_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let offset = u64::from_le_bytes(request[4..12].try_into().expect("8 bytes"));
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match entry {
+            crate::kernel::FdEntry::File { ofd_id } => {
+                let (mount_id, inode) = match k.ofd(ofd_id) {
+                    Some(o) => (o.mount_id, o.inode),
+                    None => return -(abi::EBADF as i64),
+                };
+                // FIXME(#60): POSIX pread on an O_WRONLY fd is -EBADF.
+                // We don't reject it (consistent with read_fd — a
+                // pre-existing gap, not a regression). The fix needs the
+                // same OFD access-mode field as #60's F_GETFL O_ACCMODE
+                // gap; folded there.
+                // Positional: read at the caller's offset; cursor unchanged.
+                k.vfs.read(mount_id, inode, offset, response)
+            }
+            crate::kernel::FdEntry::Directory { .. } => -(abi::EISDIR as i64),
+            _ => -(abi::ESPIPE as i64),
+        }
+    })
+}
+
+/// `pwrite(fd, offset, bytes…)` — positional write on a regular file;
+/// never advances the OFD cursor. Request: u32 fd LE + u64 offset LE +
+/// payload. Non-seekable → -ESPIPE, directory/unknown/read-only →
+/// -EBADF. (B2.1)
+fn pwrite_fd(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let offset = u64::from_le_bytes(request[4..12].try_into().expect("8 bytes"));
+    let payload = &request[12..];
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        match entry {
+            crate::kernel::FdEntry::File { ofd_id } => {
+                let (mount_id, inode, writable) = match k.ofd(ofd_id) {
+                    Some(o) => (o.mount_id, o.inode, o.writable),
+                    None => return -(abi::EBADF as i64),
+                };
+                if !writable {
+                    return -(abi::EBADF as i64);
+                }
+                // POSIX: a zero-byte pwrite returns 0 and does NOT
+                // change the file. Forwarding an empty payload to
+                // vfs.write would resize the file to `offset` (sparse
+                // extension) for a no-op write (PR #55 review P2).
+                if payload.is_empty() {
+                    return 0;
+                }
+                k.vfs.write(mount_id, inode, offset, payload)
+            }
+            crate::kernel::FdEntry::Directory { .. } => -(abi::EBADF as i64),
+            _ => -(abi::ESPIPE as i64),
         }
     })
 }

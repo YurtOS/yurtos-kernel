@@ -20,6 +20,7 @@ pub const EINVAL: i32 = 22;
 pub const ENOTTY: i32 = 25;
 pub const ENOSYS: i32 = 38;
 pub const EDEADLK: i32 = 35;
+pub const ESPIPE: i32 = 29;
 pub const EPIPE: i32 = 32;
 pub const ENOTSOCK: i32 = 88;
 pub const EADDRINUSE: i32 = 98;

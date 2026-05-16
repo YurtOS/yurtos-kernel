@@ -222,6 +222,15 @@ impl FdTable {
         self.descriptor_flags.get(&fd).copied().unwrap_or(0)
     }
 
+    /// `fcntl(F_GETFD)`: the descriptor flags (FD_CLOEXEC bit) for an
+    /// open fd, or `EBADF` if the fd is not open.
+    pub fn get_descriptor_flags(&self, fd: u32) -> Result<u32, i32> {
+        if !self.entries.contains_key(&fd) {
+            return Err(crate::abi::EBADF);
+        }
+        Ok(self.descriptor_flags(fd))
+    }
+
     pub fn inheritable_entries(&self) -> Vec<(u32, FdEntry)> {
         const FD_CLOEXEC: u32 = 1;
         self.entries
@@ -489,6 +498,11 @@ pub struct OpenFileDescription {
     /// Whether this OFD permits writes (O_WRONLY / O_RDWR set at
     /// open time). Read-only OFDs reject sys_write with -EBADF.
     pub writable: bool,
+    /// POSIX file status flags (`fcntl` F_GETFL/F_SETFL), e.g.
+    /// `O_APPEND`/`O_NONBLOCK`. B2.3b stores and round-trips the
+    /// settable subset; making reads/writes actually *honor* these
+    /// is gate-sequenced (it changes I/O behavior).
+    pub status_flags: u32,
 }
 
 pub enum SocketKind {
@@ -881,6 +895,7 @@ impl Kernel {
                 offset: 0,
                 refs: 1,
                 writable,
+                status_flags: 0,
             },
         );
         id

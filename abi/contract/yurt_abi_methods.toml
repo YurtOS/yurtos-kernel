@@ -568,6 +568,56 @@ id = 0x1_005F
 kind = "syscall"
 doc = "Change the caller's working directory to an open directory fd. Request bytes: u32 fd LE. Returns 0 or negated POSIX errno."
 
+# Method-id partition by parity slice (each sub-goal is its own PR off
+# main; disjoint id blocks keep them collision-free regardless of merge
+# order, honoring the never-reuse/never-renumber rule above):
+#   B1 process model  → 0x1_0060–0x1_006F  (PR #54)
+#   B2 fd/vfs          → 0x1_0070–0x1_007F  (PR #55)
+#   B3 sockets         → 0x1_0080–0x1_008F
+#   B4 persistence/ext → 0x1_0090–0x1_009F
+# Future slices take the next free block. The umbrella matrix (#51)
+# mirrors this table as the canonical record.
+
+[method.sys_pread]
+id = 0x1_0070
+kind = "syscall"
+doc = "POSIX pread(fd, buf, count, offset). Request: u32 fd LE + u64 offset LE; response buffer receives the bytes. Reads at the given file offset WITHOUT advancing the fd's OFD cursor. Regular files only: -ESPIPE for pipes/sockets/streams, -EISDIR for a directory, -EBADF for an unknown fd, -EINVAL for a short request. Returns bytes read (0 at EOF)."
+
+[method.sys_pwrite]
+id = 0x1_0071
+kind = "syscall"
+doc = "POSIX pwrite(fd, buf, count, offset). Request: u32 fd LE + u64 offset LE + payload bytes. Writes at the given file offset WITHOUT advancing the OFD cursor. Regular writable files only: -ESPIPE for pipes/sockets/streams, -EBADF for a directory / unknown fd / read-only fd, -EINVAL for a short request. Returns bytes written."
+
+[method.sys_dup3]
+id = 0x1_0072
+kind = "syscall"
+doc = "POSIX dup3(oldfd, newfd, flags). Request: u32 oldfd LE + u32 newfd LE + u32 flags LE. Like dup2 (newfd silently closed first, then aliases oldfd) EXCEPT oldfd==newfd is -EINVAL (not a no-op). flags bit 0 sets FD_CLOEXEC on newfd (kernel-internal flag convention, matching set_fd_descriptor_flags); any other flag bit is -EINVAL. -EBADF for an unknown oldfd. Returns newfd."
+
+[method.sys_get_fd_descriptor_flags]
+id = 0x1_0073
+kind = "syscall"
+doc = "POSIX fcntl(F_GETFD): read an fd's descriptor flags. Request: u32 fd LE. Returns the FD_CLOEXEC bit (0 or 1) for an open fd, -EBADF for an unknown fd, -EINVAL for a short request. Companion to sys_set_fd_descriptor_flags (F_SETFD); F_GETFL/F_SETFL status flags need an OFD status-flags field and are tracked separately (B2.3b, gate-sequenced as they affect I/O behavior)."
+
+[method.sys_openat]
+id = 0x1_0074
+kind = "syscall"
+doc = "POSIX openat(dirfd, path, flags). Request: u32 dirfd LE + u32 flags LE + path bytes. An absolute path, or dirfd == AT_FDCWD (0xFFFFFFFF in this ABI; the libc shim maps C's AT_FDCWD to it), resolves exactly like sys_open (cwd-relative). Otherwise the path is resolved against the directory fd's stored path: -ENOTDIR if dirfd is not a directory fd, -EBADF if unknown. Flags match sys_open (bit0 write, bit1 create, bit2 trunc, bit3 directory). Returns the new fd or a negated POSIX errno; -EINVAL for a short/empty request."
+
+[method.sys_get_file_status_flags]
+id = 0x1_0075
+kind = "syscall"
+doc = "POSIX fcntl(F_GETFL): read an fd's file status flags. Request: u32 fd LE. For a regular-file fd returns its stored status flags (O_APPEND|O_NONBLOCK subset); for valid non-file fds (stdio/pipe/socket) returns 0 (none tracked yet); -EBADF for an unknown fd, -EINVAL for a short request. NOTE: B2.3b stores/round-trips these; reads/writes do not yet *honor* O_APPEND/O_NONBLOCK (behavioral change is gate-sequenced). FIXME(#60): the access-mode bits (O_ACCMODE) are NOT included, so `flags & O_ACCMODE` always reads O_RDONLY even on a write fd — incorrect for musl/CPython/libuv. The correct fix needs an OFD access-mode field and a B0-measured slice; tracked in issue #60."
+
+[method.sys_set_file_status_flags]
+id = 0x1_0076
+kind = "syscall"
+doc = "POSIX fcntl(F_SETFL): set an fd's settable file status flags. Request: u32 fd LE + u32 flags LE. Only the POSIX-settable subset is persisted (O_APPEND=0x400 | O_NONBLOCK=0x800, Linux/musl values); access-mode/creation bits are ignored. Regular-file fd: stored on the OFD (shared by dup'd fds). Valid non-file fd: accepted as a no-op (not tracked yet). -EBADF unknown fd, -EINVAL short request. Behavioral honoring is gate-sequenced (B2.3b stores only)."
+
+[method.sys_ioctl]
+id = 0x1_0077
+kind = "syscall"
+doc = "POSIX ioctl(fd, request, arg) — narrow whitelist. Request: u32 fd LE + u32 request_code LE + u32 arg LE. FIONBIO (0x5421): arg!=0 sets / arg==0 clears O_NONBLOCK in the file fd's OFD status_flags (storage only, like F_SETFL; non-file valid fds are an accepted no-op). FIONREAD (0x541B): writes a u32 LE count of immediately-readable bytes into the response (regular file = size-offset; pipe read end = buffered bytes; otherwise 0) and returns 4. Any other request_code -> -ENOTTY. -EBADF unknown fd, -EINVAL short request / FIONREAD with a <4-byte response. Behavioral honoring of O_NONBLOCK is gate-sequenced."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"
