@@ -6986,6 +6986,32 @@ fn waitid_p_pgid_matches_childs_group() {
     assert_eq!(status, 9);
 }
 
+/// Regression for the PR #54 review bug: waitid(P_PGID, 0) must mean
+/// "the caller's own process group", not the literal pgid 0.
+#[test]
+fn waitid_p_pgid_zero_resolves_to_callers_group() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Parent 1 leads its own group (pgid defaults to its pid = 1).
+    link_child(1, 12);
+    // Child 12 is in the caller's process group.
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(12).pgid = 1;
+    });
+    assert_eq!(record_exit(&record_exit_req(12, 4)), 0);
+
+    let mut buf = [0u8; 20];
+    let rc = dispatch(
+        METHOD_SYS_WAITID,
+        1,
+        &waitid_req(WAITID_P_PGID, 0, WAITID_WEXITED),
+        &mut buf,
+    );
+    assert_eq!(rc, 20, "P_PGID id=0 must match the caller's pgrp child");
+    let (_, _, pid, _, status) = decode_siginfo(&buf);
+    assert_eq!(pid, 12);
+    assert_eq!(status, 4);
+}
+
 // --- Slice B1.7: POSIX pthread_cancel / pthread_testcancel (kernel) ---
 
 fn spawn_worker(pid: u32) -> u32 {
@@ -7141,8 +7167,21 @@ fn sigqueue_enqueues_rt_signal_with_payload_and_sender() {
             sender_pid: 1
         }
     );
-    // Additive: the compat bitmask bit is also set.
-    assert_ne!(bitmask & (1u64 << (40 - 1)), 0);
+    // sigqueue does NOT mutate the kill/SIGCHLD bitmask (separate
+    // producer) — but sigpending() reports the union, so signo 40
+    // shows as pending there.
+    assert_eq!(
+        bitmask & (1u64 << (40 - 1)),
+        0,
+        "RT must not touch the bitmask"
+    );
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(
+        u64::from_le_bytes(buf) & (1u64 << (40 - 1)),
+        0,
+        "sigpending unions the RT queue"
+    );
 }
 
 #[test]
@@ -7247,17 +7286,21 @@ fn sigwaitinfo_dequeues_oldest_matching_and_returns_siginfo() {
     assert_eq!(pid, 1, "oldest queued → sender 1");
     assert_eq!(value, 99);
 
-    // Second still queued; bitmask bit still set.
+    // Second still queued; sigpending still reports signo 40 (union
+    // derives it from the remaining RT entry — bitmask untouched).
     let (len, bit) = crate::kernel::with_kernel(|k| {
         let p = k.process_mut(7);
         (p.pending_rt.len(), p.pending_signals & (1u64 << (40 - 1)))
     });
     assert_eq!(len, 1);
-    assert_ne!(bit, 0);
+    assert_eq!(bit, 0, "RT never set the kill bitmask");
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(u64::from_le_bytes(buf) & (1u64 << (40 - 1)), 0);
 }
 
 #[test]
-fn sigwaitinfo_clears_bitmask_when_last_of_signo_drained() {
+fn sigwaitinfo_drain_makes_sigpending_drop_the_signo() {
     let _g = crate::kernel::TestGuard::acquire();
     materialize(7);
     assert_eq!(
@@ -7269,15 +7312,48 @@ fn sigwaitinfo_clears_bitmask_when_last_of_signo_drained() {
         dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(41), &mut info),
         16
     );
-    let (empty, bit) = crate::kernel::with_kernel(|k| {
-        let p = k.process_mut(7);
-        (
-            p.pending_rt.is_empty(),
-            p.pending_signals & (1u64 << (41 - 1)),
-        )
-    });
-    assert!(empty);
-    assert_eq!(bit, 0, "compat bitmask bit cleared once none remain");
+    // RT queue empty and no kill bit → sigpending no longer reports 41.
+    assert!(crate::kernel::with_kernel(|k| k
+        .process_mut(7)
+        .pending_rt
+        .is_empty()));
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_eq!(
+        u64::from_le_bytes(buf) & (1u64 << (41 - 1)),
+        0,
+        "no producer left for signo 41"
+    );
+}
+
+/// Regression for the PR #54 review bug: kill() and sigqueue() are
+/// independent producers; draining the RT entry must NOT clear a bit
+/// kill() set for the same signo.
+#[test]
+fn sigpending_preserves_kill_bit_after_rt_drain() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+    // kill() sets the bitmask bit for signo 40 (no RT entry).
+    assert_eq!(kill_pid(7, 40), 0);
+    // sigqueue() adds an RT entry for the same signo.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 5), &mut []),
+        0
+    );
+    // Drain the single RT entry.
+    let mut info = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(40), &mut info),
+        16
+    );
+    // signo 40 is STILL pending — the kill() bit was not clobbered.
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(
+        u64::from_le_bytes(buf) & (1u64 << (40 - 1)),
+        0,
+        "kill()-set pending must survive RT drain"
+    );
 }
 
 #[test]

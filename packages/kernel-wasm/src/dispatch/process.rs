@@ -769,16 +769,20 @@ pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
             value,
             sender_pid: caller_pid,
         });
-        p.pending_signals |= 1u64 << (sig - 1);
+        // RT signals live ONLY in pending_rt — do not touch
+        // pending_signals (the kill/SIGCHLD bitmask). sigpending()
+        // reports the union, so a bit set by kill() for the same signo
+        // is never clobbered when the RT queue later drains.
     });
     0
 }
 
 /// `sigwaitinfo(set)` — non-blocking RT-signal dequeue (B1.8-b).
 /// Returns the oldest queued signal whose bit is in `set` and its
-/// siginfo; clears the compat bitmask bit when none of that signo
-/// remain. True blocking (suspend until a signal arrives) is
-/// gate-deferred — absent a pending match this is -EAGAIN.
+/// siginfo, removing it from the RT queue only. The kill/SIGCHLD
+/// bitmask is left untouched (separate producer). True blocking
+/// (suspend until a signal arrives) is gate-deferred — absent a
+/// pending match this is -EAGAIN.
 pub(super) fn sigwaitinfo(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if request.len() < 8 || response.len() < 16 {
         return -(abi::EINVAL as i64);
@@ -797,9 +801,10 @@ pub(super) fn sigwaitinfo(caller_pid: u32, request: &[u8], response: &mut [u8]) 
             return -(abi::EAGAIN as i64);
         };
         let sig = p.pending_rt.remove(idx).expect("idx from position");
-        if !p.pending_rt.iter().any(|s| s.signo == sig.signo) {
-            p.pending_signals &= !(1u64 << (sig.signo - 1));
-        }
+        // Do NOT clear pending_signals here: that bitmask is owned by
+        // kill()/SIGCHLD, not by the RT queue. The same signo set by
+        // kill() must stay pending after the RT entry drains.
+        // sigpending() derives RT-pending from pending_rt directly.
         const SI_QUEUE: i32 = -1;
         response[0..4].copy_from_slice(&(sig.signo as i32).to_le_bytes());
         response[4..8].copy_from_slice(&SI_QUEUE.to_le_bytes());
@@ -810,7 +815,8 @@ pub(super) fn sigwaitinfo(caller_pid: u32, request: &[u8], response: &mut [u8]) 
 }
 
 /// `sigpending()` — the caller's pending-signal set as a u64 bitmask
-/// (bit sig-1), kept current by kill / SIGCHLD / sigqueue. Pure read.
+/// (bit sig-1): the union of the kill/SIGCHLD bitmask and the RT
+/// queue (`pending_rt`). Pure read.
 pub(super) fn sigpending(caller_pid: u32, response: &mut [u8]) -> i64 {
     if response.len() < 8 {
         return -(abi::EINVAL as i64);
@@ -819,7 +825,16 @@ pub(super) fn sigpending(caller_pid: u32, response: &mut [u8]) -> i64 {
         if !k.has_process(caller_pid) {
             return -(abi::ESRCH as i64);
         }
-        let mask = k.process_mut(caller_pid).pending_signals;
+        let p = k.process_mut(caller_pid);
+        // Union of the kill/SIGCHLD bitmask and RT-queued signals.
+        // RT pending is derived from pending_rt so it never collides
+        // with bits other producers set for the same signo.
+        let mut mask = p.pending_signals;
+        for s in &p.pending_rt {
+            if (1..=63).contains(&s.signo) {
+                mask |= 1u64 << (s.signo - 1);
+            }
+        }
         response[0..8].copy_from_slice(&mask.to_le_bytes());
         8
     })
@@ -1104,6 +1119,19 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
         if children.is_empty() {
             return -(abi::ECHILD as i64);
         }
+        // POSIX: for P_PGID, id == 0 means the caller's own process
+        // group (default pgid = the caller's pid until setpgid moves
+        // it). Resolve it before filtering.
+        let want_pgid = if idtype == P_PGID && id == 0 {
+            let cp = k.process_mut(caller_pid);
+            if cp.pgid == 0 {
+                caller_pid
+            } else {
+                cp.pgid
+            }
+        } else {
+            id
+        };
         let candidates: Vec<u32> = match idtype {
             P_PID => {
                 if children.contains(&id) {
@@ -1117,7 +1145,7 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
                 .copied()
                 .filter(|&c| {
                     let pg = k.process_mut(c).pgid;
-                    (if pg == 0 { c } else { pg }) == id
+                    (if pg == 0 { c } else { pg }) == want_pgid
                 })
                 .collect(),
             _ => children, // P_ALL
