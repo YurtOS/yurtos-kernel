@@ -8,6 +8,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 const EAGAIN: c_int = 6;
 const EINVAL: c_int = 28;
 const ESRCH: c_int = 71;
+const HOST_EINVAL: c_int = 22;
 const PTHREAD_CREATE_JOINABLE: c_int = 0;
 const PTHREAD_CREATE_DETACHED: c_int = 1;
 const STACK_SIZE: usize = 1024 * 1024;
@@ -146,7 +147,7 @@ fn join_status_to_pthread_result(
     raw_retval: u32,
     retval: *mut *mut c_void,
 ) -> c_int {
-    if status == -EINVAL {
+    if status == -HOST_EINVAL || status == -EINVAL {
         return EINVAL;
     }
     if status < 0 {
@@ -231,7 +232,7 @@ pub extern "C" fn pthread_detach(thread: *mut c_void) -> c_int {
     // SAFETY: imports are provided by the Yurt host. Invalid thread ids are
     // reported as negative return values by the host backend.
     let rv = unsafe { yurt_host_thread_detach(pthread_to_thread_id(thread)) };
-    if rv == -EINVAL {
+    if rv == -HOST_EINVAL || rv == -EINVAL {
         EINVAL
     } else if rv < 0 {
         ESRCH

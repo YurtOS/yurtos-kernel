@@ -93,6 +93,7 @@ export type CustomBuilder = (
   memBuf: () => ArrayBuffer,
   callerPid: number,
   callerTid: number,
+  options?: BuildWasmKernelImportsOptions,
 ) => (...args: number[]) => Promise<number>;
 
 export interface HostBinding {
@@ -161,6 +162,8 @@ export interface WasmProcessThreadHost {
 
 export interface WasmThreadHostRegistry {
   registerProcess(pid: number, host: WasmProcessThreadHost): () => void;
+  threadExitVersion(pid: number, tid: number): number;
+  waitForThreadExit(pid: number, tid: number, version: number): Promise<void>;
   threadExited(
     pid: number,
     tid: number,
@@ -181,7 +184,20 @@ export function createWasmThreadHostRegistry(
 ): WasmThreadHostRegistry {
   const hosts = new Map<number, WasmProcessThreadHost>();
   const handles = new Map<number, { pid: number; localHandle: number }>();
+  const exitVersions = new Map<string, number>();
+  const exitWaiters = new Map<string, Array<() => void>>();
   let nextHandle = 1;
+
+  const exitKey = (pid: number, tid: number) => `${pid}:${tid}`;
+
+  function notifyThreadExit(pid: number, tid: number) {
+    const key = exitKey(pid, tid);
+    exitVersions.set(key, (exitVersions.get(key) ?? 0) + 1);
+    const waiters = exitWaiters.get(key);
+    if (!waiters) return;
+    exitWaiters.delete(key);
+    for (const resolve of waiters) resolve();
+  }
 
   mk.hostStateMut().threadHost = {
     spawn(pid, tid, fnPtr, arg) {
@@ -214,11 +230,26 @@ export function createWasmThreadHostRegistry(
   };
 
   return {
+    threadExitVersion(pid, tid) {
+      return exitVersions.get(exitKey(pid, tid)) ?? 0;
+    },
+    waitForThreadExit(pid, tid, version) {
+      const key = exitKey(pid, tid);
+      if ((exitVersions.get(key) ?? 0) !== version) {
+        return Promise.resolve();
+      }
+      return new Promise<void>((resolve) => {
+        const waiters = exitWaiters.get(key) ?? [];
+        waiters.push(resolve);
+        exitWaiters.set(key, waiters);
+      });
+    },
     threadExited(pid, tid, localHandle, retval) {
       for (const [handle, entry] of handles) {
         if (entry.pid !== pid || entry.localHandle !== localHandle) continue;
         try {
           mk.recordThreadExitAuthenticated(pid, tid, handle, retval >>> 0);
+          notifyThreadExit(pid, tid);
         } catch {
           // Stale worker completion reports are ignored; Rust remains
           // authoritative and rejects mismatched handles.
@@ -255,9 +286,25 @@ export function createWasmThreadHostRegistry(
         for (const [handle, entry] of handles) {
           if (entry.pid === pid) handles.delete(handle);
         }
+        const prefix = `${pid}:`;
+        for (const key of exitVersions.keys()) {
+          if (key.startsWith(prefix)) exitVersions.delete(key);
+        }
+        for (const [key, waiters] of exitWaiters) {
+          if (!key.startsWith(prefix)) continue;
+          exitWaiters.delete(key);
+          for (const resolve of waiters) resolve();
+        }
       };
     },
   };
+}
+
+export interface BuildWasmKernelImportsOptions {
+  threadEvents?: Pick<
+    WasmThreadHostRegistry,
+    "threadExitVersion" | "waitForThreadExit"
+  >;
 }
 
 function threadImport(
@@ -325,18 +372,37 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_thread_join",
     method: METHOD.SYS_THREAD_JOIN,
     args: ["scalar", { kind: "fixed_out", cap: 4 }],
-    custom: (mk, memBuf, callerPid, callerTid) => async (tid, outRetvalPtr) => {
-      const out = threadImport(
-        METHOD.SYS_THREAD_JOIN,
-        scalarRequest(tid),
-        4,
-        mk,
-        callerPid,
-        callerTid,
-      );
-      if (out.rc !== 0) return out.rc;
-      return copyOut(memBuf, outRetvalPtr, out.response.subarray(0, 4));
-    },
+    custom:
+      (mk, memBuf, callerPid, callerTid, options) =>
+      async (tid, outRetvalPtr) => {
+        let version = options?.threadEvents?.threadExitVersion(callerPid, tid);
+        let out = threadImport(
+          METHOD.SYS_THREAD_JOIN,
+          scalarRequest(tid),
+          4,
+          mk,
+          callerPid,
+          callerTid,
+        );
+        while (out.rc === -EAGAIN && options?.threadEvents) {
+          await options.threadEvents.waitForThreadExit(
+            callerPid,
+            tid,
+            version ?? 0,
+          );
+          version = options.threadEvents.threadExitVersion(callerPid, tid);
+          out = threadImport(
+            METHOD.SYS_THREAD_JOIN,
+            scalarRequest(tid),
+            4,
+            mk,
+            callerPid,
+            callerTid,
+          );
+        }
+        if (out.rc !== 0) return out.rc;
+        return copyOut(memBuf, outRetvalPtr, out.response.subarray(0, 4));
+      },
   },
   {
     name: "host_thread_detach",
@@ -1447,6 +1513,7 @@ export function buildWasmKernelImports(
   callerPid = 0,
   initialCwd?: string,
   callerTid = 1,
+  options?: BuildWasmKernelImportsOptions,
 ): Record<string, (...args: number[]) => Promise<number>> {
   if (initialCwd) {
     mk.kernelSyscall(
@@ -1459,7 +1526,7 @@ export function buildWasmKernelImports(
   const imports: Record<string, (...args: number[]) => Promise<number>> = {};
   for (const b of HOST_BINDINGS) {
     imports[b.name] = b.custom
-      ? b.custom(mk, memBuf, callerPid, callerTid)
+      ? b.custom(mk, memBuf, callerPid, callerTid, options)
       : makeWrapper(b, mk, memBuf, callerPid);
   }
   return imports;

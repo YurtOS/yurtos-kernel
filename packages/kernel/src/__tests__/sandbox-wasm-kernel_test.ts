@@ -35,6 +35,10 @@ const KERNEL_WASM_URL = new URL(
   "../../../../target/wasm32-wasip1/release/yurt_kernel_wasm.wasm",
   import.meta.url,
 );
+const PTHREAD_CANARY_URL = new URL(
+  "../../../../abi/build/pthread-canary.wasm",
+  import.meta.url,
+);
 
 // deno-lint-ignore no-explicit-any
 const W = (globalThis as any).WebAssembly;
@@ -80,7 +84,9 @@ async function createWasmSandbox(
     kernelImpl: "wasm",
     wasmKernelBytes: kernelBytes,
     wasmHostImports: (memory, callerPid, cwd) =>
-      buildWasmKernelImports(mk, () => memory.buffer, callerPid, cwd),
+      buildWasmKernelImports(mk, () => memory.buffer, callerPid, cwd, 1, {
+        threadEvents: wasmThreadHostRegistry,
+      }),
     wasmOverrideNames: HOST_BINDINGS.map((b) => b.name),
     wasmThreadHostRegistry,
     mounts: [{ path: "/fixtures", files: { [fixtureName]: mountedFixture } }],
@@ -213,6 +219,29 @@ describe("Sandbox kernelImpl='wasm' (Phase 7.2c integration)", () => {
       expect(result.stdout).toBe(
         "canonical=/tmp/yurt-std-fs-canary.txt\ncontents=yurt\n",
       );
+    } finally {
+      sandbox.destroy();
+    }
+  });
+
+  it("runs the pthread canary through Rust-owned Worker/SAB threads", async () => {
+    if (!HAS_JSPI) return;
+    const fixtureName = "pthread-canary.wasm";
+    const kernelBytes = await Deno.readFile(KERNEL_WASM_URL);
+    const fixture = await Deno.readFile(PTHREAD_CANARY_URL);
+    const sandbox = await createWasmSandbox(kernelBytes, fixtureName, fixture);
+    try {
+      const result = await sandbox.runArgv([`/fixtures/${fixtureName}`]);
+      if (result.exitCode !== 0) {
+        console.log(
+          "--- wasm-kernel pthread-canary stdout ---\n" + result.stdout,
+        );
+        console.log(
+          "--- wasm-kernel pthread-canary stderr ---\n" + result.stderr,
+        );
+      }
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("pthread:ok");
     } finally {
       sandbox.destroy();
     }

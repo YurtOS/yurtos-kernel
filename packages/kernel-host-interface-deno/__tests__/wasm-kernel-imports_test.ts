@@ -377,6 +377,64 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(new DataView(memory, 4, 4).getUint32(0, true)).toEqual(0x8000_0000);
   });
 
+  it("host_thread_join waits for Rust thread-exit notification before retrying", async () => {
+    const response = new Uint8Array(4);
+    new DataView(response.buffer).setUint32(0, 123, true);
+    const calls: CapturedCall[] = [];
+    const rcs = [-11, 0];
+    const mk = {
+      kernelThreadSyscall(
+        method: number,
+        callerPid: number,
+        callerTid: number,
+        request: Uint8Array,
+        responseCap: number,
+      ): { rc: bigint; response: Uint8Array } {
+        calls.push({
+          method,
+          callerPid,
+          callerTid,
+          request: request.slice(),
+          responseCap,
+        });
+        return { rc: BigInt(rcs.shift() ?? 0), response };
+      },
+    } as unknown as KernelHostInterface;
+    let version = 0;
+    let notifyExit: (() => void) | undefined;
+    const memory = new ArrayBuffer(16);
+    const imports = buildWasmKernelImports(
+      mk,
+      () => memory,
+      77,
+      undefined,
+      1,
+      {
+        threadEvents: {
+          threadExitVersion: () => version,
+          waitForThreadExit: (_pid, _tid, seenVersion) =>
+            new Promise<void>((resolve) => {
+              notifyExit = () => {
+                expect(seenVersion).toEqual(0);
+                version++;
+                resolve();
+              };
+            }),
+        },
+      },
+    );
+
+    const join = imports.host_thread_join(42, 4);
+    await Promise.resolve();
+    expect(calls.length).toEqual(1);
+    expect(typeof notifyExit).toEqual("function");
+    notifyExit!();
+
+    expect(await join).toEqual(0);
+    expect(calls.length).toEqual(2);
+    expect(new DataView(memory, 4, 4).getUint32(0, true)).toEqual(123);
+  });
+
   it("multi-scalar-arg: host_kill with args packed inline", async () => {
     if (!HAS_JSPI) return;
     const mk = await freshMk();

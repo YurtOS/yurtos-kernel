@@ -1285,14 +1285,17 @@ impl Kernel {
     pub fn detach_thread(&mut self, pid: Pid, tid: Tid) -> Result<(), i32> {
         let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
         let thread = p.threads.get_mut(&tid).ok_or(crate::abi::ESRCH)?;
+        if thread.detached {
+            return Err(crate::abi::EINVAL);
+        }
         if thread.waiter_tid.is_some() {
             return Err(crate::abi::EINVAL);
         }
         if thread.state == ThreadState::Exited {
-            if let Some(handle) = thread.host_thread_handle {
+            thread.detached = true;
+            if let Some(handle) = thread.host_thread_handle.take() {
                 self.pending_thread_releases.push(handle);
             }
-            p.threads.remove(&tid);
         } else {
             thread.detached = true;
         }
@@ -1313,24 +1316,27 @@ impl Kernel {
         exit_value: u32,
     ) -> Result<Option<Tid>, i32> {
         let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
-        let thread = p.threads.get_mut(&tid).ok_or(crate::abi::ESRCH)?;
-        thread.state = ThreadState::Exited;
-        thread.exit_value = Some(exit_value);
-        thread.wait_reason = None;
-        let waiter_tid = thread.waiter_tid;
-        let should_reap = thread.detached && waiter_tid.is_none();
-        let host_thread_handle = thread.host_thread_handle;
+        let (waiter_tid, release_handle) = {
+            let thread = p.threads.get_mut(&tid).ok_or(crate::abi::ESRCH)?;
+            thread.state = ThreadState::Exited;
+            thread.exit_value = Some(exit_value);
+            thread.wait_reason = None;
+            let waiter_tid = thread.waiter_tid;
+            let release_handle = if thread.detached && waiter_tid.is_none() {
+                thread.host_thread_handle.take()
+            } else {
+                None
+            };
+            (waiter_tid, release_handle)
+        };
         if let Some(waiter_tid) = waiter_tid {
             if let Some(waiter) = p.threads.get_mut(&waiter_tid) {
                 waiter.state = ThreadState::Runnable;
                 waiter.wait_reason = None;
             }
         }
-        if should_reap {
-            if let Some(handle) = host_thread_handle {
-                self.pending_thread_releases.push(handle);
-            }
-            p.threads.remove(&tid);
+        if let Some(handle) = release_handle {
+            self.pending_thread_releases.push(handle);
         }
         Ok(waiter_tid)
     }
@@ -1846,6 +1852,77 @@ mod tests {
         );
         assert_eq!(
             with_kernel(|k| k.detach_thread(pid, target)),
+            Err(crate::abi::EINVAL)
+        );
+    }
+
+    #[test]
+    fn detached_exited_threads_remain_tombstoned_for_posix_errors() {
+        let _g = TestGuard::acquire();
+        let (pid, target) = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(110));
+            let target = k.spawn_thread(pid, Some(111)).expect("thread spawn");
+            k.detach_thread(pid, target).expect("thread detach");
+            k.exit_thread_authenticated(pid, target, 7)
+                .expect("thread exit");
+            (pid, target)
+        });
+
+        let thread = with_kernel(|k| {
+            k.process(pid)
+                .threads
+                .get(&target)
+                .expect("detached tombstone")
+                .clone()
+        });
+        assert!(thread.detached);
+        assert_eq!(thread.state, ThreadState::Exited);
+        assert_eq!(thread.host_thread_handle, None);
+        assert_eq!(
+            with_kernel(|k| k.take_thread_releases_for_test()),
+            vec![111]
+        );
+
+        assert_eq!(
+            with_kernel(|k| k.begin_thread_join(pid, MAIN_THREAD_TID, target, &mut [0; 4])),
+            Err(crate::abi::EINVAL)
+        );
+        assert_eq!(
+            with_kernel(|k| k.detach_thread(pid, target)),
+            Err(crate::abi::EINVAL)
+        );
+    }
+
+    #[test]
+    fn detach_after_joinable_exit_releases_and_tombstones() {
+        let _g = TestGuard::acquire();
+        let (pid, target) = with_kernel(|k| {
+            let pid = k.alloc_host_pid();
+            k.insert_host_process(pid, 0, vec![b"/bin/threaded".to_vec()], Some(120));
+            let target = k.spawn_thread(pid, Some(121)).expect("thread spawn");
+            k.exit_thread_authenticated(pid, target, 9)
+                .expect("thread exit");
+            k.detach_thread(pid, target).expect("thread detach");
+            (pid, target)
+        });
+
+        let thread = with_kernel(|k| {
+            k.process(pid)
+                .threads
+                .get(&target)
+                .expect("detached tombstone")
+                .clone()
+        });
+        assert!(thread.detached);
+        assert_eq!(thread.state, ThreadState::Exited);
+        assert_eq!(thread.host_thread_handle, None);
+        assert_eq!(
+            with_kernel(|k| k.take_thread_releases_for_test()),
+            vec![121]
+        );
+        assert_eq!(
+            with_kernel(|k| k.begin_thread_join(pid, MAIN_THREAD_TID, target, &mut [0; 4])),
             Err(crate::abi::EINVAL)
         );
     }
