@@ -21,6 +21,7 @@ import {
 } from "../../kernel-host-interface-js/mod.ts";
 import {
   buildWasmKernelImports,
+  createWasmThreadHostRegistry,
   HOST_BINDINGS,
 } from "../wasm-kernel-imports.ts";
 
@@ -143,6 +144,45 @@ class FakeKv implements KvBackend {
 }
 
 describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
+  it("installs a pid-routed thread host with global host handles", () => {
+    const state = defaultHostState();
+    const mk = {
+      hostStateMut() {
+        return state;
+      },
+    } as unknown as KernelHostInterface;
+    const registry = createWasmThreadHostRegistry(mk);
+    const spawnCalls: number[][] = [];
+    const releaseCalls: number[] = [];
+    const cancelCalls: number[] = [];
+    registry.registerProcess(10, {
+      spawn(tid, fnPtr, arg) {
+        spawnCalls.push([tid, fnPtr, arg]);
+        return 3;
+      },
+      release(handle) {
+        releaseCalls.push(handle);
+        return 0;
+      },
+      cancel(handle) {
+        cancelCalls.push(handle);
+        return 0;
+      },
+    });
+
+    const globalHandle = state.threadHost?.spawn(10, 2, 123, 456);
+    expect(globalHandle).toBe(1);
+    expect(spawnCalls).toEqual([[2, 123, 456]]);
+    expect(state.threadHost?.release(1)).toBe(0);
+    expect(releaseCalls).toEqual([3]);
+
+    const cancelledHandle = state.threadHost?.spawn(10, 4, 777, 888);
+    expect(cancelledHandle).toBe(2);
+    expect(state.threadHost?.cancel(2)).toBe(0);
+    expect(cancelCalls).toEqual([3]);
+    expect(state.threadHost?.spawn(11, 2, 1, 2)).toBe(-3);
+  });
+
   it("covers the legacy socket host import names that have Rust syscalls", () => {
     const names = new Set(HOST_BINDINGS.map((b) => b.name));
     for (

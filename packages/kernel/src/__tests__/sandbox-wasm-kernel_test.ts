@@ -18,6 +18,7 @@ import {
 } from "@yurt/kernel-host-interface-js";
 import {
   buildWasmKernelImports,
+  createWasmThreadHostRegistry,
   HOST_BINDINGS,
 } from "../../../kernel-host-interface-deno/wasm-kernel-imports.ts";
 import { NodeAdapter } from "../platform/node-adapter.ts";
@@ -72,6 +73,7 @@ async function createWasmSandbox(
   mountedFixture: Uint8Array,
 ): Promise<Sandbox> {
   const mk = await KernelHostInterface.load(kernelBytes, defaultHostState());
+  const wasmThreadHostRegistry = createWasmThreadHostRegistry(mk);
   return await Sandbox.create({
     wasmDir: WASM_DIR,
     adapter: new NodeAdapter(),
@@ -80,6 +82,7 @@ async function createWasmSandbox(
     wasmHostImports: (memory, callerPid, cwd) =>
       buildWasmKernelImports(mk, () => memory.buffer, callerPid, cwd),
     wasmOverrideNames: HOST_BINDINGS.map((b) => b.name),
+    wasmThreadHostRegistry,
     mounts: [{ path: "/fixtures", files: { [fixtureName]: mountedFixture } }],
   });
 }

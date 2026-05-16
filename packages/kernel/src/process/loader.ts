@@ -23,6 +23,7 @@ import { createThreadsBackend } from "./threads/backend-factory.js";
 import {
   defaultSpawnThread,
   type WorkerSabThreadsBackendOptions,
+  type WorkerSabThreadStart,
 } from "./threads/worker-sab.js";
 import { makeIndirectCallTable } from "./threads/indirect-call-table.js";
 import type {
@@ -114,6 +115,20 @@ export function resolveWorkerSabThreads(
 
 type WasmCallable = (...args: unknown[]) => unknown;
 
+interface RustThreadHostBackend extends ThreadsBackend {
+  spawnRustThread(start: WorkerSabThreadStart): number;
+  releaseRustThread(handle: number): number;
+  cancelRustThread(handle: number): number;
+}
+
+function isRustThreadHostBackend(
+  backend: ThreadsBackend,
+): backend is RustThreadHostBackend {
+  return "spawnRustThread" in backend &&
+    "releaseRustThread" in backend &&
+    "cancelRustThread" in backend;
+}
+
 // Only imports proven safe for today's JSPI and Asyncify binaries belong here.
 // Do not add WASI path_* imports until the affected guests are built with those
 // imports in their asyncify-imports set and JSPI path_open/i64 behavior is
@@ -152,6 +167,16 @@ function bindSignalDeliverer(
   wasi.setSignalDeliverer((sig) => {
     (deliverSignal as (sig: number) => unknown)(sig);
   });
+}
+
+export interface WasmProcessThreadHost {
+  spawn(tid: number, fnPtr: number, arg: number): number;
+  release(handle: number): number;
+  cancel(handle: number): number;
+}
+
+export interface WasmThreadHostRegistry {
+  registerProcess(pid: number, host: WasmProcessThreadHost): () => void;
 }
 
 export interface LoaderContext {
@@ -198,6 +223,12 @@ export interface LoaderContext {
    * Asyncify. Used by the opt-in Rust kernel host-interface overlay.
    */
   extraAsyncImports?: string[];
+  /**
+   * Registers per-process Worker/SAB thread executors for the Rust
+   * kernel.wasm host interface. The registry owns any global host-handle
+   * translation; loader only exposes process-local Worker/SAB handles.
+   */
+  wasmThreadHostRegistry?: WasmThreadHostRegistry;
 }
 
 export interface LoadProcessOptions {
@@ -292,7 +323,7 @@ export async function loadProcess(
     opts.workerSabThreads,
     workerHostBodies,
   );
-  const threadsBackend = createThreadsBackend(profile, {
+  const threadsBackend: ThreadsBackend = createThreadsBackend(profile, {
     workerSab: workerSabThreads,
     workerSabMemory,
   });
@@ -303,7 +334,13 @@ export async function loadProcess(
   const rollbackOnFailure = opts.rollbackOnFailure ?? true;
   const pid = ctx.allocatePid(argv);
   pidRef = pid;
+  let unregisterWasmThreadHost: (() => void) | undefined;
+  const unregisterThreadHost = () => {
+    unregisterWasmThreadHost?.();
+    unregisterWasmThreadHost = undefined;
+  };
   const rollback = () => {
+    unregisterThreadHost();
     if (rollbackOnFailure) ctx.kernel.discardProcess(pid);
   };
 
@@ -328,6 +365,17 @@ export async function loadProcess(
       2,
       createBufferTarget(opts.stderrLimit ?? Infinity),
     );
+  }
+  if (
+    ctx.wasmThreadHostRegistry &&
+    isRustThreadHostBackend(threadsBackend)
+  ) {
+    unregisterWasmThreadHost = ctx.wasmThreadHostRegistry.registerProcess(pid, {
+      spawn: (tid, fnPtr, arg) =>
+        threadsBackend.spawnRustThread({ tid, fnPtr, arg }),
+      release: (handle) => threadsBackend.releaseRustThread(handle),
+      cancel: (handle) => threadsBackend.cancelRustThread(handle),
+    });
   }
 
   const proc = Process.__forLoader({ pid, mode });
@@ -758,6 +806,7 @@ export async function loadProcess(
   proc.__setTerminate(async () => {
     wasi.cancelExecution();
     threadsBackend.cancelDetachedThreads?.();
+    unregisterThreadHost();
     ctx.releasePid(pid, proc.exitCode ?? 0, wasi.getExitSignal());
   });
 

@@ -403,6 +403,12 @@ export interface TcpSocketImpl {
   acceptAsync?(handle: number, flags: number): Promise<number>;
 }
 
+export interface ThreadHost {
+  spawn(pid: number, tid: number, fnPtr: number, arg: number): number;
+  release(hostThreadHandle: number): number;
+  cancel(hostThreadHandle: number): number;
+}
+
 export interface HostState {
   nowRealtimeNs: bigint;
   extensions: ExtensionRegistry;
@@ -414,6 +420,8 @@ export interface HostState {
   kv?: KvBackend;
   /** When set, every `kh_socket_*` import delegates here. */
   tcp?: TcpSocketImpl;
+  /** When set, every Rust-owned `kh_thread_*` import delegates here. */
+  threadHost?: ThreadHost;
   /**
    * Async outbound fetch. When set AND the host supports JSPI,
    * `kh_fetch_blocking` is wrapped with `WebAssembly.Suspending`
@@ -2593,11 +2601,15 @@ export class KernelHostInterface {
         tid: number,
         fnPtr: number,
         arg: number,
-      ): number => processEngine.spawnThread(pid, tid, fnPtr, arg),
+      ): number =>
+        hostBox.state.threadHost?.spawn(pid, tid, fnPtr, arg) ??
+          processEngine.spawnThread(pid, tid, fnPtr, arg),
       kh_thread_release: (hostThreadHandle: number): number =>
-        processEngine.releaseThread(hostThreadHandle),
+        hostBox.state.threadHost?.release(hostThreadHandle) ??
+          processEngine.releaseThread(hostThreadHandle),
       kh_thread_cancel: (hostThreadHandle: number): number =>
-        processEngine.cancelThread(hostThreadHandle),
+        hostBox.state.threadHost?.cancel(hostThreadHandle) ??
+          processEngine.cancelThread(hostThreadHandle),
     };
 
     // std-on-wasi panic-infra stubs for kernel.wasm itself.

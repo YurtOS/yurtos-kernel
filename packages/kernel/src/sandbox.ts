@@ -36,7 +36,11 @@ import {
   ROOT_UID,
   type SpawnRequest,
 } from "./process/kernel.js";
-import { type LoaderContext, loadProcess } from "./process/loader.js";
+import {
+  type LoaderContext,
+  loadProcess,
+  type WasmThreadHostRegistry,
+} from "./process/loader.js";
 import type { DirEntry, StatResult } from "./vfs/inode.js";
 import type { VfsLike } from "./vfs/vfs-like.js";
 import { NetworkGateway } from "./network/gateway.js";
@@ -150,6 +154,13 @@ export interface SandboxOptions {
   ) => Record<string, (...args: number[]) => Promise<number>>;
   /** Names of host_* imports covered by `wasmHostImports`. */
   wasmOverrideNames?: string[];
+  /**
+   * Optional process-thread registry used with `kernelImpl: "wasm"`.
+   * When supplied, threaded Worker/SAB processes register their executor
+   * here so Rust-owned `kh_thread_*` calls can spawn/release/cancel host
+   * workers while the Rust kernel remains authoritative for lifecycle.
+   */
+  wasmThreadHostRegistry?: WasmThreadHostRegistry;
   /** Directory (Node) or URL base (browser) containing .wasm files. */
   wasmDir: string;
   /** Platform adapter. Auto-detected if not provided (Node vs browser). */
@@ -233,6 +244,7 @@ interface SandboxParts {
     cwd: string,
   ) => Record<string, (...args: number[]) => Promise<number>>;
   wasmOverrideNames?: string[];
+  wasmThreadHostRegistry?: WasmThreadHostRegistry;
 }
 
 interface PasswdEntry {
@@ -284,6 +296,7 @@ export class Sandbox {
     ) => Record<string, (...args: number[]) => Promise<number>>)
     | undefined;
   private wasmOverrideNames: string[] | undefined;
+  private wasmThreadHostRegistry: WasmThreadHostRegistry | undefined;
   private activeDeadlineMs: number | undefined;
   private envNeedsSync = false;
   /**
@@ -324,6 +337,7 @@ export class Sandbox {
     this.bootImports = parts.bootImports;
     this.wasmHostImports = parts.wasmHostImports;
     this.wasmOverrideNames = parts.wasmOverrideNames;
+    this.wasmThreadHostRegistry = parts.wasmThreadHostRegistry;
     this.envNeedsSync = parts.env.size > 0;
   }
 
@@ -538,6 +552,7 @@ export class Sandbox {
       moduleCache,
       wasmHostImports: options.wasmHostImports,
       wasmOverrideNames: options.wasmOverrideNames,
+      wasmThreadHostRegistry: options.wasmThreadHostRegistry,
     });
 
     const bootProcess = await loadProcess(loaderCtx, {
@@ -806,6 +821,7 @@ export class Sandbox {
       bootImports: options.bootImports,
       wasmHostImports: options.wasmHostImports,
       wasmOverrideNames: options.wasmOverrideNames,
+      wasmThreadHostRegistry: options.wasmThreadHostRegistry,
     });
     sandboxRef = sb;
 
@@ -1086,7 +1102,9 @@ export class Sandbox {
           cb(decoder.decode(data, { stream: true }));
         } catch { /* swallow streaming-callback errors */ }
       };
-      return () => { target.onChunk = previous; };
+      return () => {
+        target.onChunk = previous;
+      };
     };
     const restoreStdout = hookFd(1, callbacks.onStdout);
     const restoreStderr = hookFd(2, callbacks.onStderr);
@@ -1171,6 +1189,7 @@ export class Sandbox {
       cwd: string,
     ) => Record<string, (...args: number[]) => Promise<number>>;
     wasmOverrideNames?: string[];
+    wasmThreadHostRegistry?: WasmThreadHostRegistry;
   }): LoaderContext {
     const {
       vfs,
@@ -1192,6 +1211,7 @@ export class Sandbox {
       processCredentials,
       wasmHostImports,
       wasmOverrideNames,
+      wasmThreadHostRegistry,
     } = opts;
     const allowedTools = toolAllowlist ? new Set(toolAllowlist) : null;
 
@@ -1359,6 +1379,7 @@ export class Sandbox {
       makeFdReadAndClear,
       moduleCache,
       extraAsyncImports: wasmOverrideNames,
+      wasmThreadHostRegistry,
     });
 
     return makeContextWithAllocator((argv) => {
@@ -2088,6 +2109,7 @@ export class Sandbox {
       moduleCache: this.moduleCache,
       wasmHostImports: this.wasmHostImports,
       wasmOverrideNames: this.wasmOverrideNames,
+      wasmThreadHostRegistry: this.wasmThreadHostRegistry,
     });
     const proc = await loadProcess(loaderCtx, {
       argv,
@@ -2400,6 +2422,7 @@ export class Sandbox {
       moduleCache: this.moduleCache,
       wasmHostImports: this.wasmHostImports,
       wasmOverrideNames: this.wasmOverrideNames,
+      wasmThreadHostRegistry: this.wasmThreadHostRegistry,
     });
     const childEnv = this.getEnvMap();
     const childBootProcess = await loadProcess(childCtx, {

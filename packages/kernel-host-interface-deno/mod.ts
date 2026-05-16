@@ -41,6 +41,14 @@ export {
   UserProcess,
 } from "../kernel-host-interface-js/mod.ts";
 
+export {
+  buildWasmKernelImports,
+  createWasmThreadHostRegistry,
+  HOST_BINDINGS,
+  type WasmProcessThreadHost,
+  type WasmThreadHostRegistry,
+} from "./wasm-kernel-imports.ts";
+
 import type {
   HostFsImpl,
   HostFsStat,

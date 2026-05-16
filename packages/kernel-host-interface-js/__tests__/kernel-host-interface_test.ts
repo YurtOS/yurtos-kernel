@@ -686,6 +686,68 @@ Deno.test("thread lifecycle controls mutate the kernel-owned thread snapshot", a
   assertEquals(mk.listThreads(childPid).find((t) => t.tid === tid), undefined);
 });
 
+Deno.test("thread host callbacks execute Rust-owned spawn and release", async () => {
+  const host = defaultHostState() as ReturnType<typeof defaultHostState> & {
+    threadHost: {
+      spawn(pid: number, tid: number, fnPtr: number, arg: number): number;
+      release(handle: number): number;
+      cancel(handle: number): number;
+    };
+  };
+  const spawnCalls: number[][] = [];
+  const releaseCalls: number[] = [];
+  host.threadHost = {
+    spawn(pid, tid, fnPtr, arg) {
+      spawnCalls.push([pid, tid, fnPtr, arg]);
+      return 77;
+    },
+    release(handle) {
+      releaseCalls.push(handle);
+      return 0;
+    },
+    cancel() {
+      return 0;
+    },
+  };
+  const mk = await KernelHostInterface.load(await kernelWasm(), host);
+  const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);
+  const request = new Uint8Array(8);
+  const view = new DataView(request.buffer);
+  view.setUint32(0, 123, true);
+  view.setUint32(4, 456, true);
+
+  const spawn = mk.kernelThreadSyscall(
+    METHOD.SYS_THREAD_SPAWN,
+    childPid,
+    1,
+    request,
+    0,
+  );
+
+  assertEquals(Number(spawn.rc), 2);
+  assertEquals(spawnCalls, [[childPid, 2, 123, 456]]);
+  assertEquals(mk.listThreads(childPid).find((t) => t.tid === 2), {
+    tid: 2,
+    state: "runnable",
+    detached: false,
+    exitValue: -1,
+    hostThreadHandle: 77,
+  });
+
+  mk.recordThreadExit(childPid, 2, 0xfeed_face);
+  const join = mk.kernelThreadSyscall(
+    METHOD.SYS_THREAD_JOIN,
+    childPid,
+    1,
+    u32(2),
+    4,
+  );
+
+  assertEquals(Number(join.rc), 0);
+  assertEquals(releaseCalls, [77]);
+  assertEquals(mk.listThreads(childPid).find((t) => t.tid === 2), undefined);
+});
+
 Deno.test("thread dispatch authenticates main caller tid for pthread_self", async () => {
   const mk = await freshKernelHostInterface();
   const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);

@@ -34,6 +34,7 @@ import {
   METHOD,
 } from "../kernel-host-interface-js/mod.ts";
 
+const ESRCH = 3;
 const EFAULT = 14;
 const EIO = 5;
 const EAGAIN = 11;
@@ -150,6 +151,66 @@ function scalarRequest(...values: number[]): Uint8Array {
     view.setUint32(index * 4, value >>> 0, true);
   });
   return req;
+}
+
+export interface WasmProcessThreadHost {
+  spawn(tid: number, fnPtr: number, arg: number): number;
+  release(handle: number): number;
+  cancel(handle: number): number;
+}
+
+export interface WasmThreadHostRegistry {
+  registerProcess(pid: number, host: WasmProcessThreadHost): () => void;
+}
+
+export function createWasmThreadHostRegistry(
+  mk: KernelHostInterface,
+): WasmThreadHostRegistry {
+  const hosts = new Map<number, WasmProcessThreadHost>();
+  const handles = new Map<number, { pid: number; localHandle: number }>();
+  let nextHandle = 1;
+
+  mk.hostStateMut().threadHost = {
+    spawn(pid, tid, fnPtr, arg) {
+      const host = hosts.get(pid);
+      if (!host) return -ESRCH;
+      const localHandle = host.spawn(tid, fnPtr, arg);
+      if (localHandle < 0) return localHandle;
+      const handle = nextHandle++;
+      handles.set(handle, { pid, localHandle });
+      return handle;
+    },
+    release(handle) {
+      const entry = handles.get(handle);
+      if (!entry) return -ESRCH;
+      const host = hosts.get(entry.pid);
+      if (!host) return -ESRCH;
+      const rc = host.release(entry.localHandle);
+      if (rc === 0) handles.delete(handle);
+      return rc;
+    },
+    cancel(handle) {
+      const entry = handles.get(handle);
+      if (!entry) return -ESRCH;
+      const host = hosts.get(entry.pid);
+      if (!host) return -ESRCH;
+      const rc = host.cancel(entry.localHandle);
+      if (rc === 0) handles.delete(handle);
+      return rc;
+    },
+  };
+
+  return {
+    registerProcess(pid, host) {
+      hosts.set(pid, host);
+      return () => {
+        hosts.delete(pid);
+        for (const [handle, entry] of handles) {
+          if (entry.pid === pid) handles.delete(handle);
+        }
+      };
+    },
+  };
 }
 
 function threadImport(
