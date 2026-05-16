@@ -7044,6 +7044,38 @@ fn waitid_p_pgid_zero_resolves_to_callers_group() {
     assert_eq!(status, 4);
 }
 
+#[test]
+fn waitid_p_pgid_zero_matches_default_inherited_child_group() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // PR #54 review P2 regression. Parent 1 has the lazy-zero default
+    // process group; child 13 is registered and inherits pgid == 0 —
+    // NOT materialized via setpgid (unlike the test above, which sets
+    // pgid=1 explicitly). POSIX: an inherited default-0 child is still
+    // in the parent's (the caller's) group, so waitid(P_PGID, id=0)
+    // MUST find it instead of returning -ECHILD.
+    link_child(1, 13);
+    assert_eq!(
+        crate::kernel::with_kernel(|k| k.process_mut(13).pgid),
+        0,
+        "precondition: child pgid is the inherited default 0"
+    );
+    assert_eq!(record_exit(&record_exit_req(13, 9)), 0);
+    let mut buf = [0u8; 20];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PGID, 0, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20,
+        "default-inherited child must match the caller's pgrp"
+    );
+    let (_, _, pid, _, status) = decode_siginfo(&buf);
+    assert_eq!(pid, 13);
+    assert_eq!(status, 9);
+}
+
 // --- Slice B1.7: POSIX pthread_cancel / pthread_testcancel (kernel) ---
 
 fn spawn_worker(pid: u32) -> u32 {

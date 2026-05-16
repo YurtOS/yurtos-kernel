@@ -115,7 +115,23 @@ gate-deferred consumer/blocking halves land:
 - **`waitid` blocking:** without `WNOHANG`, a matching-but-not-yet-waitable
   child yields `-EAGAIN` (would-block placeholder, same as `sys_wait`) rather
   than blocking — true blocking is AsyncBridge-gated. `WNOHANG` itself is now
-  POSIX-correct (success + zeroed siginfo).
+  POSIX-correct (success + zeroed siginfo). `waitid(P_PGID, 0)` now matches
+  default-inherited (`pgid==0`) children via the parent-walking
+  `effective_pgid` resolver (PR #54 review P2, regression-tested).
+- **No signal-sender permission check (whole signal subsystem):** `kill`,
+  `killpg`, and `sigqueue` let any guest target any pid — there is no
+  `EPERM`/credential gate (real POSIX: a sender needs matching uid or
+  privilege). The RT-queue cap bounds the memory-DoS, but a hostile guest
+  can still flood a victim's 1024-entry RT queue and starve its legitimate
+  RT signals (bounded cross-process DoS). Pre-existing and consistent across
+  the subsystem (not introduced by B1) — tracked here as a subsystem-wide
+  parity item, to land with signal-permission semantics, not patched
+  piecemeal in this slice.
+- **SIGCHLD is set-only / latched:** `record_exit` ORs the parent's SIGCHLD
+  bit; nothing clears it and no waiter is woken (consume/clear + wake is the
+  gate-deferred delivery slice, B1.5/B1.8). A guest polling `sigpending()`
+  sees SIGCHLD latched permanently after any child ever exits. Flagged so
+  the deferred-delivery slice adds the consume/clear + wake path.
 
 ## Testing
 

@@ -327,8 +327,10 @@ pub struct Process {
     pub pending_signals: u64,
     /// POSIX real-time signal queue (`sigqueue`). Unlike the bitmask,
     /// RT signals are *queued with multiplicity* and carry a payload +
-    /// sender. Additive: the matching bitmask bit is also set so
-    /// existing `pending_signals` readers keep working unchanged.
+    /// sender. Separated-producer model: this queue is the SOLE store
+    /// for RT signals — it does NOT also set `pending_signals` (that
+    /// bitmask is owned by kill/SIGCHLD). `sigpending()` returns the
+    /// read-time union of both, so neither producer clobbers the other.
     /// Consumption (`sigwaitinfo`/delivery) is gate-deferred (B1.8-b).
     pub pending_rt: VecDeque<RtSignal>,
     /// Per-signal disposition. Index `sig - 1` for sig in 1..=63.

@@ -1106,6 +1106,26 @@ pub fn wait_response(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
 /// WSTOPPED/WCONTINUED are out of scope here (tracked: B1.2 siginfo
 /// needs record_exit to carry signal-vs-exit). Blocking behaves like
 /// the sys_wait path — no AsyncBridge yet, so "would block" is -EAGAIN.
+/// Effective process group of `pid` under the lazy-zero model: a
+/// stored `pgid` of 0 means "inherited", not "own group". A process
+/// spawned before its parent materialized a group inherits 0, and is
+/// in the *parent's* group — so walk parents until a concrete pgid is
+/// found; a process with no live parent (kernel-parented) is its own
+/// group leader. Non-vivifying (`process_existing`) so it never
+/// auto-creates a `Process`, and depth-bounded (ppid chains are
+/// shallow and acyclic).
+fn effective_pgid(k: &crate::kernel::Kernel, pid: u32) -> u32 {
+    let mut cur = pid;
+    for _ in 0..64 {
+        match k.process_existing(cur) {
+            Some(p) if p.pgid != 0 => return p.pgid,
+            Some(p) if p.ppid != 0 && p.ppid != cur => cur = p.ppid,
+            _ => return cur,
+        }
+    }
+    cur
+}
+
 pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     // Linux idtype values and option bits. P_ALL (0) is the `_` arm.
     const P_PID: u32 = 1;
@@ -1136,15 +1156,12 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
             return -(abi::ECHILD as i64);
         }
         // POSIX: for P_PGID, id == 0 means the caller's own process
-        // group (default pgid = the caller's pid until setpgid moves
-        // it). Resolve it before filtering.
+        // group. Resolve both the wanted group and each child's group
+        // through the same lazy-zero-aware helper so a default-inherited
+        // child (pgid still 0) is matched to the caller's group instead
+        // of being treated as its own leader (PR #54 review P2).
         let want_pgid = if idtype == P_PGID && id == 0 {
-            let cp = k.process_mut(caller_pid);
-            if cp.pgid == 0 {
-                caller_pid
-            } else {
-                cp.pgid
-            }
+            effective_pgid(k, caller_pid)
         } else {
             id
         };
@@ -1159,10 +1176,7 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
             P_PGID => children
                 .iter()
                 .copied()
-                .filter(|&c| {
-                    let pg = k.process_mut(c).pgid;
-                    (if pg == 0 { c } else { pg }) == want_pgid
-                })
+                .filter(|&c| effective_pgid(k, c) == want_pgid)
                 .collect(),
             _ => children, // P_ALL
         };
