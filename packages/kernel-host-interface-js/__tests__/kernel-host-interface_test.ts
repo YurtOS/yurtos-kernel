@@ -778,6 +778,32 @@ Deno.test("spawned user-process thread sees its Rust-owned tid", async () => {
   );
 });
 
+Deno.test("user-process host_thread_join waits for pending JS thread execution", async () => {
+  const wasm = await wat2wasm(`(module
+    (import "yurt" "host_thread_spawn" (func $spawn (param i32 i32) (result i32)))
+    (import "yurt" "host_thread_join" (func $join (param i32 i32) (result i32)))
+    (memory (export "memory") 1)
+    (func $worker (param i32) (result i32)
+      local.get 0)
+    (table (export "__indirect_function_table") 1 funcref)
+    (elem (i32.const 0) $worker)
+    (func (export "run") (result i32)
+      i32.const 0
+      i32.const 77
+      call $spawn
+      i32.const 4
+      call $join))`);
+  const mk = await freshKernelHostInterface();
+  const user = mk.spawnUserProcess(wasm);
+
+  assertEquals(user.callExportI32("run"), 0);
+  assertEquals(
+    new DataView(user.readMemory(4, 4).buffer).getUint32(0, true),
+    77,
+  );
+  assertEquals(mk.listThreads(user.pid).find((t) => t.tid === 2), undefined);
+});
+
 Deno.test("thread dispatch returns join status separately from raw retval bits", async () => {
   const mk = await freshKernelHostInterface();
   const childPid = spawnFromRamfs(mk, 1, s("/bin/threaded"), [s("threaded")]);

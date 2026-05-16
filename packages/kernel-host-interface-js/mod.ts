@@ -454,6 +454,7 @@ export interface HostState {
 }
 
 const ENOENT = 2;
+const EAGAIN = 11;
 const EFAULT = 14;
 const EACCES = 13;
 const EBADF = 9;
@@ -1567,6 +1568,7 @@ function buildUserYurtImports(
   kernel: KernelInstance,
   userMemoryRef: { memory?: WebAssembly.Memory },
   callerTid = 1,
+  drainPendingThread?: (tid: number) => void,
 ): Record<string, (...args: (number | bigint)[]) => number> {
   const memoryBuffer = () => userMemoryRef.memory!.buffer;
   const boundsOk = (ptr: number, len: number): boolean => {
@@ -1635,11 +1637,19 @@ function buildUserYurtImports(
   imports.host_thread_self = () =>
     threadSyscall(METHOD.SYS_THREAD_SELF, new Uint8Array(0), 0).rc;
   imports.host_thread_join = (tid, outRetvalPtr) => {
-    const out = threadSyscall(
+    let out = threadSyscall(
       METHOD.SYS_THREAD_JOIN,
       scalarRequest(Number(tid)),
       4,
     );
+    if (out.rc === -EAGAIN && drainPendingThread) {
+      drainPendingThread(Number(tid));
+      out = threadSyscall(
+        METHOD.SYS_THREAD_JOIN,
+        scalarRequest(Number(tid)),
+        4,
+      );
+    }
     if (out.rc !== 0) return out.rc;
     return copyOut(Number(outRetvalPtr), out.response.subarray(0, 4));
   };
@@ -1746,6 +1756,8 @@ interface CachedProcessInstance {
 interface CachedThreadExecution {
   pid: number;
   tid: number;
+  completed: boolean;
+  run(): void;
 }
 
 class CachedProcessEngine {
@@ -1816,6 +1828,8 @@ class CachedProcessEngine {
         context.pid,
         kernel,
         userMemoryRef,
+        1,
+        (tid) => this.runPendingThread(context.pid, tid),
       );
       instance = new WebAssembly.Instance(module, {
         env: { ...sysImports, sys_setrlimit },
@@ -1938,7 +1952,13 @@ class CachedProcessEngine {
           proc.argv,
           proc.userMemoryRef,
         ),
-        yurt: buildUserYurtImports(pid, kernel, proc.userMemoryRef, tid),
+        yurt: buildUserYurtImports(
+          pid,
+          kernel,
+          proc.userMemoryRef,
+          tid,
+          (targetTid) => this.runPendingThread(pid, targetTid),
+        ),
       });
     } catch {
       return -EIO;
@@ -1950,8 +1970,10 @@ class CachedProcessEngine {
     if (typeof entry !== "function") return -EFAULT;
 
     const handle = this.nextThreadHandle++;
-    this.threadExecutions.set(handle, { pid, tid });
-    queueMicrotask(() => {
+    const run = () => {
+      const execution = this.threadExecutions.get(handle);
+      if (!execution || execution.completed) return;
+      execution.completed = true;
       let retval = 0;
       try {
         retval = Number((entry as (arg: number) => number)(arg >>> 0)) | 0;
@@ -1963,8 +1985,19 @@ class CachedProcessEngine {
       } catch {
         // Stale completion reports are ignored; Rust remains authoritative.
       }
-    });
+    };
+    this.threadExecutions.set(handle, { pid, tid, completed: false, run });
+    queueMicrotask(run);
     return handle;
+  }
+
+  runPendingThread(pid: number, tid: number): void {
+    for (const execution of this.threadExecutions.values()) {
+      if (execution.pid === pid && execution.tid === tid) {
+        execution.run();
+        return;
+      }
+    }
   }
 
   releaseThread(handle: number): number {
