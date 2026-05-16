@@ -482,6 +482,50 @@ fn wasmtime_default_thread_host_executes_spawned_user_thread() {
 }
 
 #[test]
+fn wasmtime_threads_share_imported_shared_memory() {
+    let mk = fresh_kernel_host_interface(0);
+    let module = wat::parse_str(
+        r#"
+        (module
+          (import "env" "memory" (memory 1 1 shared))
+          (import "yurt" "host_thread_spawn" (func $spawn (param i32 i32) (result i32)))
+          (import "yurt" "host_thread_join" (func $join (param i32 i32) (result i32)))
+          (export "memory" (memory 0))
+          (global $tid (mut i32) (i32.const 0))
+          (func $worker (param i32) (result i32)
+            local.get 0
+            i32.const 0x12345678
+            i32.store
+            i32.const 0x80000002)
+          (table (export "__indirect_function_table") 1 funcref)
+          (elem (i32.const 0) $worker)
+          (func (export "run") (result i32)
+            i32.const 0
+            i32.const 8
+            call $spawn
+            global.set $tid
+            global.get $tid
+            i32.const 4
+            call $join))
+        "#,
+    )
+    .unwrap();
+    let mut proc = mk
+        .spawn_user_process_with_args(&module, &[b"/bin/threaded".as_slice()])
+        .unwrap();
+
+    assert_eq!(proc.call_run().unwrap(), 0);
+    assert_eq!(
+        u32::from_le_bytes(proc.read_memory(4, 4).unwrap().try_into().unwrap()),
+        0x8000_0002
+    );
+    assert_eq!(
+        u32::from_le_bytes(proc.read_memory(8, 4).unwrap().try_into().unwrap()),
+        0x1234_5678
+    );
+}
+
+#[test]
 fn wasmtime_adapter_authenticates_thread_exit_handle() {
     let mk = fresh_kernel_host_interface(0);
     let module = wat::parse_str(

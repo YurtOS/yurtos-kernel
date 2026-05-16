@@ -20,12 +20,16 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{anyhow, Context, Result};
-use wasmtime::{Caller, Config, Engine, Linker, Memory, Module, Store, TypedFunc};
+use wasmtime::{
+    Caller, Config, Engine, ExternType, Linker, Memory, MemoryType, Module, SharedMemory, Store,
+    TypedFunc,
+};
 use wasmtime_wasi::preview1::WasiP1Ctx;
 use wasmtime_wasi::WasiCtxBuilder;
 use yurt_kernel_host_interface_core::{
@@ -130,6 +134,15 @@ fn user_memory(caller: &mut Caller<'_, UserState>) -> std::result::Result<Memory
         .ok_or(-EFAULT)
 }
 
+fn user_shared_memory(
+    caller: &mut Caller<'_, UserState>,
+) -> std::result::Result<SharedMemory, i64> {
+    caller
+        .get_export("memory")
+        .and_then(|e| e.into_shared_memory())
+        .ok_or(-EFAULT)
+}
+
 fn read_kernel_guest_bytes(
     caller: &mut Caller<'_, KernelStoreData>,
     ptr: u32,
@@ -149,13 +162,41 @@ fn read_user_guest_bytes(
     ptr: u32,
     len: u32,
 ) -> std::result::Result<Vec<u8>, i64> {
-    let memory = user_memory(caller)?;
     let len = checked_guest_buffer_len(len)?;
-    let mut buf = vec![0u8; len];
-    if len > 0 && memory.read(&*caller, ptr as usize, &mut buf).is_err() {
-        return Err(-EFAULT);
+    if let Ok(memory) = user_memory(caller) {
+        let mut buf = vec![0u8; len];
+        if len > 0 && memory.read(&*caller, ptr as usize, &mut buf).is_err() {
+            return Err(-EFAULT);
+        }
+        return Ok(buf);
     }
-    Ok(buf)
+    let memory = user_shared_memory(caller)?;
+    read_shared_memory(memory, ptr, len).map_err(|_| -EFAULT)
+}
+
+fn write_user_guest_bytes(
+    caller: &mut Caller<'_, UserState>,
+    ptr: u32,
+    bytes: &[u8],
+) -> std::result::Result<(), i64> {
+    if let Ok(memory) = user_memory(caller) {
+        if !bytes.is_empty() && memory.write(caller, ptr as usize, bytes).is_err() {
+            return Err(-EFAULT);
+        }
+        return Ok(());
+    }
+    let memory = user_shared_memory(caller)?;
+    let data = memory.data();
+    let start = ptr as usize;
+    let end = start.checked_add(bytes.len()).ok_or(-EFAULT)?;
+    let cells = data.get(start..end).ok_or(-EFAULT)?;
+    for (cell, byte) in cells.iter().zip(bytes) {
+        let ptr = cell.get().cast::<AtomicU8>();
+        // SAFETY: Wasmtime shared memory bytes must be accessed atomically by
+        // embedders. AtomicU8 has the same layout as the underlying u8 cell.
+        unsafe { (*ptr).store(*byte, Ordering::SeqCst) };
+    }
+    Ok(())
 }
 
 /// Method ids that the user-process linker forwards. Generated
@@ -487,7 +528,14 @@ impl LogSink for StderrLogSink {
 }
 
 pub trait ThreadHost: Send + Sync {
-    fn register_process(&self, _pid: u32, _wasm: Arc<[u8]>, _argv: Vec<Vec<u8>>) {}
+    fn register_process(
+        &self,
+        _pid: u32,
+        _wasm: Arc<[u8]>,
+        _argv: Vec<Vec<u8>>,
+        _shared_memory: Option<SharedMemory>,
+    ) {
+    }
     fn spawn(&self, pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32;
     fn release(&self, host_thread_handle: i32) -> i32;
     fn cancel(&self, host_thread_handle: i32) -> i32;
@@ -496,6 +544,7 @@ pub trait ThreadHost: Send + Sync {
 struct WasmtimeThreadProcess {
     wasm: Arc<[u8]>,
     argv: Vec<Vec<u8>>,
+    shared_memory: Option<SharedMemory>,
 }
 
 struct WasmtimeThreadHost {
@@ -519,11 +568,21 @@ impl WasmtimeThreadHost {
 }
 
 impl ThreadHost for WasmtimeThreadHost {
-    fn register_process(&self, pid: u32, wasm: Arc<[u8]>, argv: Vec<Vec<u8>>) {
-        self.processes
-            .lock()
-            .unwrap()
-            .insert(pid, WasmtimeThreadProcess { wasm, argv });
+    fn register_process(
+        &self,
+        pid: u32,
+        wasm: Arc<[u8]>,
+        argv: Vec<Vec<u8>>,
+        shared_memory: Option<SharedMemory>,
+    ) {
+        self.processes.lock().unwrap().insert(
+            pid,
+            WasmtimeThreadProcess {
+                wasm,
+                argv,
+                shared_memory,
+            },
+        );
     }
 
     fn spawn(&self, pid: u32, tid: u32, fn_ptr: u32, arg: u32) -> i32 {
@@ -535,6 +594,7 @@ impl ThreadHost for WasmtimeThreadHost {
             WasmtimeThreadProcess {
                 wasm: process.wasm.clone(),
                 argv: process.argv.clone(),
+                shared_memory: process.shared_memory.clone(),
             }
         };
         let handle = {
@@ -548,17 +608,9 @@ impl ThreadHost for WasmtimeThreadHost {
         let join = thread::Builder::new()
             .name(format!("yurt-wasmtime-thread-{pid}-{tid}"))
             .spawn(move || {
-                let retval = run_wasmtime_thread(
-                    engine,
-                    kernel.clone(),
-                    pid,
-                    tid,
-                    handle,
-                    process,
-                    fn_ptr,
-                    arg,
-                )
-                .unwrap_or(u32::MAX);
+                let retval =
+                    run_wasmtime_thread(engine, kernel.clone(), pid, tid, process, fn_ptr, arg)
+                        .unwrap_or(u32::MAX);
                 let _ = kernel
                     .lock()
                     .unwrap()
@@ -591,7 +643,6 @@ fn run_wasmtime_thread(
     kernel: Arc<Mutex<KernelInstance>>,
     pid: u32,
     tid: u32,
-    _handle: i32,
     process: WasmtimeThreadProcess,
     fn_ptr: u32,
     arg: u32,
@@ -614,6 +665,9 @@ fn run_wasmtime_thread(
     };
     let mut store = Store::new(&engine, user_state);
     store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
+    if let Some(memory) = process.shared_memory.clone() {
+        define_imported_shared_memory(&module, &mut linker, &store, memory)?;
+    }
     let instance = linker
         .instantiate(&mut store, &module)
         .context("instantiate thread wasm")?;
@@ -631,6 +685,55 @@ fn run_wasmtime_thread(
         .call(&mut store, arg as i32)
         .context("thread entry call")?;
     Ok(retval as u32)
+}
+
+fn imported_shared_memory_type(module: &Module) -> Option<MemoryType> {
+    module.imports().find_map(|import| {
+        if import.module() != SYS_NAMESPACE || import.name() != "memory" {
+            return None;
+        }
+        match import.ty() {
+            ExternType::Memory(ty) if ty.is_shared() => Some(ty),
+            _ => None,
+        }
+    })
+}
+
+fn define_imported_shared_memory<T>(
+    module: &Module,
+    linker: &mut Linker<T>,
+    store: &Store<T>,
+    memory: SharedMemory,
+) -> Result<()> {
+    if imported_shared_memory_type(module).is_some() {
+        linker
+            .define(store, SYS_NAMESPACE, "memory", memory)
+            .context("define imported shared memory")?;
+    }
+    Ok(())
+}
+
+fn read_shared_memory(memory: SharedMemory, addr: u32, len: usize) -> Result<Vec<u8>> {
+    let data = memory.data();
+    let start = addr as usize;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("read user-process shared memory out of bounds"))?;
+    let cells = data
+        .get(start..end)
+        .ok_or_else(|| anyhow!("read user-process shared memory out of bounds"))?;
+    let mut out = Vec::with_capacity(len);
+    for cell in cells {
+        let byte = {
+            let ptr = cell.get().cast::<AtomicU8>();
+            // SAFETY: Wasmtime exposes shared memory as UnsafeCell<u8> because
+            // concurrent wasm threads may access it. AtomicU8 has the same
+            // layout as u8 and gives the host a data-race-free byte load.
+            unsafe { (*ptr).load(Ordering::SeqCst) }
+        };
+        out.push(byte);
+    }
+    Ok(out)
 }
 
 /// State threaded through every wasmtime host callback that runs
@@ -1679,6 +1782,8 @@ pub struct KernelStoreData {
 
 // ── Kernel instance: the loaded kernel.wasm + its wasmtime handles ─────────
 
+type KernelDispatchThreadFunc = TypedFunc<(u32, u32, u32, u32, u32, u32, u32), i64>;
+
 /// The loaded kernel.wasm plus the typed handles needed to drive it.
 /// Kept behind `Arc<Mutex<…>>` so that both the [`KernelHostInterface`] and
 /// any spawned [`UserProcess`] can call into it. (`Arc<Mutex<…>>`
@@ -1691,7 +1796,7 @@ pub struct KernelInstance {
     pub(crate) scratch_ptr: u32,
     pub(crate) scratch_len: u32,
     pub(crate) dispatch: TypedFunc<(u32, u32, u32, u32, u32, u32), i64>,
-    pub(crate) dispatch_thread: TypedFunc<(u32, u32, u32, u32, u32, u32, u32), i64>,
+    pub(crate) dispatch_thread: KernelDispatchThreadFunc,
     pub(crate) list_processes: TypedFunc<(u32, u32), i64>,
     pub(crate) list_threads: TypedFunc<(u32, u32, u32), i64>,
     pub(crate) snapshot: TypedFunc<(u32, u32), i64>,
@@ -2244,6 +2349,7 @@ impl KernelHostInterface {
             .with_context(|| format!("read kernel.wasm at {}", path.display()))?;
         let mut config = Config::new();
         config.epoch_interruption(true);
+        config.wasm_threads(true);
         let engine = Engine::new(&config).context("create wasmtime engine")?;
         let module = Module::new(&engine, &wasm).context("compile kernel.wasm")?;
 
@@ -2729,6 +2835,10 @@ impl KernelHostInterface {
         register_yurt_thread_imports(&mut linker)?;
         crate::wasi_shim::add_to_linker(&mut linker)
             .context("install WASI preview1 shim on user-process linker")?;
+        let shared_memory = imported_shared_memory_type(&module)
+            .map(|ty| SharedMemory::new(&self.engine, ty))
+            .transpose()
+            .context("create imported shared memory")?;
 
         let thread_argv = argv.clone();
         let user_state = UserState {
@@ -2743,6 +2853,9 @@ impl KernelHostInterface {
         };
         let mut store = Store::new(&self.engine, user_state);
         store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
+        if let Some(memory) = shared_memory.clone() {
+            define_imported_shared_memory(&module, &mut linker, &store, memory)?;
+        }
         let instance = linker
             .instantiate(&mut store, &module)
             .context("instantiate user-process wasm")?;
@@ -2756,7 +2869,12 @@ impl KernelHostInterface {
             .thread_host
             .as_ref()
         {
-            thread_host.register_process(pid, Arc::<[u8]>::from(wasm.to_vec()), thread_argv);
+            thread_host.register_process(
+                pid,
+                Arc::<[u8]>::from(wasm.to_vec()),
+                thread_argv,
+                shared_memory,
+            );
         }
         Ok(UserProcess {
             store,
@@ -3023,17 +3141,19 @@ impl UserProcess {
     /// `addr`. Useful for tests that want to inspect what a syscall
     /// wrote back.
     pub fn read_memory(&mut self, addr: u32, len: u32) -> Result<Vec<u8>> {
-        let memory = self
-            .instance
-            .get_memory(&mut self.store, "memory")
-            .ok_or_else(|| anyhow!("user-process missing 'memory' export"))?;
         let len =
             checked_guest_buffer_len(len).map_err(|rc| anyhow!("read_memory failed: {rc}"))?;
-        let mut buf = vec![0u8; len];
-        memory
-            .read(&self.store, addr as usize, &mut buf)
-            .context("read user-process memory")?;
-        Ok(buf)
+        if let Some(memory) = self.instance.get_memory(&mut self.store, "memory") {
+            let mut buf = vec![0u8; len];
+            memory
+                .read(&self.store, addr as usize, &mut buf)
+                .context("read user-process memory")?;
+            return Ok(buf);
+        }
+        if let Some(memory) = self.instance.get_shared_memory(&mut self.store, "memory") {
+            return read_shared_memory(memory, addr, len);
+        }
+        anyhow::bail!("user-process missing 'memory' export")
     }
 }
 
@@ -3105,7 +3225,7 @@ fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 &mut response,
             );
             let mut waiting_as_registered_joiner = rc == -EAGAIN;
-            while rc == -EAGAIN || (waiting_as_registered_joiner && rc == -(EBUSY as i64)) {
+            while rc == -EAGAIN || (waiting_as_registered_joiner && rc == -EBUSY) {
                 thread::sleep(std::time::Duration::from_millis(1));
                 rc = thread_syscall_from_user(
                     &mut caller,
@@ -3118,13 +3238,7 @@ fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
             if rc != 0 {
                 return rc as i32;
             }
-            let Ok(memory) = user_memory(&mut caller) else {
-                return -(EFAULT as i32);
-            };
-            if memory
-                .write(&mut caller, out_retval_ptr as usize, &response)
-                .is_err()
-            {
+            if write_user_guest_bytes(&mut caller, out_retval_ptr, &response).is_err() {
                 return -(EFAULT as i32);
             }
             0
