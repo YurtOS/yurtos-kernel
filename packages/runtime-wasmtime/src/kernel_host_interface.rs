@@ -224,6 +224,12 @@ mod sys_method_id {
     pub const DUP2: u32 = 0x1_0011;
     pub const DUP_MIN: u32 = 0x1_0054;
     pub const SET_FD_DESCRIPTOR_FLAGS: u32 = 0x1_0055;
+    pub const TCGETPGRP: u32 = 0x1_0056;
+    pub const TCSETPGRP: u32 = 0x1_0057;
+    pub const TCGETATTR: u32 = 0x1_0058;
+    pub const TCSETATTR: u32 = 0x1_0059;
+    pub const WINSIZE: u32 = 0x1_005A;
+    pub const TIOCSCTTY: u32 = 0x1_005B;
     pub const PIPE: u32 = 0x1_0012;
     pub const READ: u32 = 0x1_0013;
     pub const WRITE: u32 = 0x1_0014;
@@ -4561,6 +4567,84 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             forward_u32_arg(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::ISATTY,
+                fd as u32,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_tcgetpgrp",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::TCGETPGRP,
+                fd as u32,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_tcsetpgrp",
+        |mut caller: Caller<'_, UserState>, fd: i32, pgid: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&(pgid as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::TCSETPGRP,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_tcgetattr",
+        |mut caller: Caller<'_, UserState>, fd: i32, out_ptr: u32, out_cap: u32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::TCGETATTR,
+                &req,
+                out_ptr,
+                out_cap,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_tcsetattr",
+        |mut caller: Caller<'_, UserState>, fd: i32, actions: i32| -> i32 {
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(fd as u32).to_le_bytes());
+            req.extend_from_slice(&(actions as u32).to_le_bytes());
+            forward_request_bytes(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::TCSETATTR,
+                &req,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_winsize",
+        |mut caller: Caller<'_, UserState>, fd: i32, out_ptr: u32, out_cap: u32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::WINSIZE,
+                &req,
+                out_ptr,
+                out_cap,
+            ) as i32
+        },
+    )?;
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_tiocsctty",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            forward_u32_arg(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::TIOCSCTTY,
                 fd as u32,
             )
         },

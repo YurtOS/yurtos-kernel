@@ -158,6 +158,12 @@ pub fn dispatch_with_context(
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
         METHOD_SYS_POLL => poll_fds(caller_pid, request, response),
         METHOD_SYS_ISATTY => isatty(caller_pid, request),
+        METHOD_SYS_TCGETPGRP => tcgetpgrp(caller_pid, request),
+        METHOD_SYS_TCSETPGRP => tcsetpgrp(caller_pid, request),
+        METHOD_SYS_TCGETATTR => tcgetattr(caller_pid, request, response),
+        METHOD_SYS_TCSETATTR => tcsetattr(caller_pid, request),
+        METHOD_SYS_WINSIZE => winsize(caller_pid, request, response),
+        METHOD_SYS_TIOCSCTTY => tiocsctty(caller_pid, request),
         METHOD_SYS_CLOCK_GETTIME => clock_gettime(request, response),
         METHOD_SYS_EXTENSION_INVOKE => kh::extension_invoke(request, response),
         METHOD_SYS_GETPGID => getpgid(caller_pid, request),
@@ -724,6 +730,148 @@ fn isatty(caller_pid: u32, request: &[u8]) -> i64 {
         | Some(crate::kernel::FdEntry::Stderr) => 1,
         Some(_) => 0,
     })
+}
+
+fn is_tty_entry(entry: &FdEntry) -> bool {
+    matches!(entry, FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr)
+}
+
+fn require_tty_fd(k: &mut Kernel, caller_pid: u32, fd: u32) -> Result<(), i32> {
+    match k.process_mut(caller_pid).fd_table.entry(fd) {
+        None => Err(abi::EBADF),
+        Some(entry) if is_tty_entry(entry) => Ok(()),
+        Some(_) => Err(abi::ENOTTY),
+    }
+}
+
+fn process_session_id(pid: u32, process: &crate::kernel::Process) -> u32 {
+    if process.sid == 0 {
+        pid
+    } else {
+        process.sid
+    }
+}
+
+fn tcgetpgrp(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| match require_tty_fd(k, caller_pid, fd) {
+        Ok(()) => k.tty_foreground_pgid() as i64,
+        Err(errno) => -(errno as i64),
+    })
+}
+
+fn tcsetpgrp(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd, pgid]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        if let Err(errno) = require_tty_fd(k, caller_pid, fd) {
+            return -(errno as i64);
+        }
+        let caller_sid = {
+            let caller = k.process_mut(caller_pid);
+            process_session_id(caller_pid, caller)
+        };
+        match k.process_group_session(pgid) {
+            Some(group_sid) if group_sid == caller_sid => {
+                k.set_tty_foreground_pgid(pgid);
+                0
+            }
+            _ => -(abi::ENOTTY as i64),
+        }
+    })
+}
+
+fn tcgetattr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        if let Err(errno) = require_tty_fd(k, caller_pid, fd) {
+            return -(errno as i64);
+        }
+        let termios = default_termios();
+        if response.len() < termios.len() {
+            return termios.len() as i64;
+        }
+        response[..termios.len()].copy_from_slice(&termios);
+        termios.len() as i64
+    })
+}
+
+fn tcsetattr(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd, _actions]) = read_u32_args::<2>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| match require_tty_fd(k, caller_pid, fd) {
+        Ok(()) => 0,
+        Err(errno) => -(errno as i64),
+    })
+}
+
+fn winsize(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        if let Err(errno) = require_tty_fd(k, caller_pid, fd) {
+            return -(errno as i64);
+        }
+        let winsize = default_winsize();
+        if response.len() < winsize.len() {
+            return winsize.len() as i64;
+        }
+        response[..winsize.len()].copy_from_slice(&winsize);
+        winsize.len() as i64
+    })
+}
+
+fn tiocsctty(caller_pid: u32, request: &[u8]) -> i64 {
+    let Some([fd]) = read_u32_args::<1>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    with_kernel(|k| {
+        if let Err(errno) = require_tty_fd(k, caller_pid, fd) {
+            return -(errno as i64);
+        }
+        let caller = k.process_mut(caller_pid);
+        if caller.sid != caller_pid || caller.pgid != caller_pid {
+            return -(abi::EPERM as i64);
+        }
+        caller.has_controlling_tty = true;
+        k.set_tty_foreground_pgid(caller_pid);
+        0
+    })
+}
+
+fn default_termios() -> [u8; 60] {
+    let mut buf = [0u8; 60];
+    buf[0..4].copy_from_slice(&0x0600_u32.to_le_bytes());
+    buf[4..8].copy_from_slice(&0x0005_u32.to_le_bytes());
+    buf[8..12].copy_from_slice(&0x08BF_u32.to_le_bytes());
+    buf[12..16].copy_from_slice(&0x8A3B_u32.to_le_bytes());
+    buf[17] = 3;
+    buf[18] = 28;
+    buf[19] = 127;
+    buf[20] = 21;
+    buf[21] = 4;
+    buf[22] = 0;
+    buf[23] = 1;
+    buf[25] = 17;
+    buf[26] = 19;
+    buf[27] = 26;
+    buf[40..44].copy_from_slice(&15_u32.to_le_bytes());
+    buf[44..48].copy_from_slice(&15_u32.to_le_bytes());
+    buf
+}
+
+fn default_winsize() -> [u8; 8] {
+    let mut buf = [0u8; 8];
+    buf[0..2].copy_from_slice(&24_u16.to_le_bytes());
+    buf[2..4].copy_from_slice(&80_u16.to_le_bytes());
+    buf
 }
 
 /// `clock_gettime(clock_id) -> 8 bytes le u64 ns`. clock_id 0 =

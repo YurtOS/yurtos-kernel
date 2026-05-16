@@ -664,10 +664,10 @@ pub(super) fn getsid(caller_pid: u32, request: &[u8]) -> i64 {
 /// runs.
 pub(super) fn setsid(caller_pid: u32) -> i64 {
     with_kernel(|k| {
-        if k.process_group_session(caller_pid).is_some() {
+        let p = k.process_mut(caller_pid);
+        if p.sid == caller_pid || p.pgid == caller_pid {
             return -(abi::EPERM as i64);
         }
-        let p = k.process_mut(caller_pid);
         p.sid = caller_pid;
         p.pgid = caller_pid;
         caller_pid as i64

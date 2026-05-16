@@ -188,6 +188,36 @@ id = 0x1_0055
 kind = "syscall"
 doc = "POSIX fcntl(F_SETFD) descriptor flags. Request bytes carry two u32s: fd, flags. Kernel currently stores FD_CLOEXEC bit 0 and clears unsupported bits. Returns 0 or -EBADF."
 
+[method.sys_tcgetpgrp]
+id = 0x1_0056
+kind = "syscall"
+doc = "Return the foreground process group for the terminal on fd. Request bytes carry u32 fd. Returns pgid, -EBADF, or -ENOTTY."
+
+[method.sys_tcsetpgrp]
+id = 0x1_0057
+kind = "syscall"
+doc = "Set the foreground process group for the terminal on fd. Request bytes carry u32 fd, u32 pgid. Returns 0, -EBADF, or -ENOTTY when fd is not a terminal or pgid is not in the caller's session."
+
+[method.sys_tcgetattr]
+id = 0x1_0058
+kind = "syscall"
+doc = "Write the minimal musl wasm32 termios compatibility record for a terminal fd. Request bytes carry u32 fd. Response is 60 bytes. Returns bytes-written/required-size, -EBADF, or -ENOTTY."
+
+[method.sys_tcsetattr]
+id = 0x1_0059
+kind = "syscall"
+doc = "Accept terminal attribute changes for a terminal fd. Request bytes carry u32 fd, u32 actions. Returns 0, -EBADF, or -ENOTTY. The kernel does not implement a line discipline."
+
+[method.sys_winsize]
+id = 0x1_005A
+kind = "syscall"
+doc = "Write struct winsize { rows, cols, xpixel, ypixel } for a terminal fd. Request bytes carry u32 fd. Response is 8 bytes. Returns bytes-written/required-size, -EBADF, or -ENOTTY."
+
+[method.sys_tiocsctty]
+id = 0x1_005B
+kind = "syscall"
+doc = "Register fd as the caller's controlling terminal. Request bytes carry u32 fd. Returns 0, -EBADF, -ENOTTY, or -EPERM when the caller is not a session leader."
+
 [method.sys_pipe]
 id = 0x1_0012
 kind = "syscall"

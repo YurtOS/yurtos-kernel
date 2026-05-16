@@ -208,6 +208,46 @@ export function buildSysImports(
     },
 
     sys_isatty: (fd) => forwardRequestBytes(METHOD.SYS_ISATTY, u32(fd)),
+    sys_tcgetpgrp: (fd) => forwardRequestBytes(METHOD.SYS_TCGETPGRP, u32(fd)),
+    sys_tcsetpgrp: (fd, pgid) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, pgid >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_TCSETPGRP, req);
+    },
+    sys_tcgetattr: (fd, outPtr, outCap) => {
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_TCGETATTR,
+        u32(fd),
+        outCap >>> 0,
+      );
+      if (rc >= 0 && rc <= outCap) {
+        const outRc = copyOut(outPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
+      }
+      return rc;
+    },
+    sys_tcsetattr: (fd, actions) => {
+      const req = new Uint8Array(8);
+      const view = new DataView(req.buffer);
+      view.setUint32(0, fd >>> 0, true);
+      view.setUint32(4, actions >>> 0, true);
+      return forwardRequestBytes(METHOD.SYS_TCSETATTR, req);
+    },
+    sys_winsize: (fd, outPtr, outCap) => {
+      const { rc, response } = forwardRequestWithResponse(
+        METHOD.SYS_WINSIZE,
+        u32(fd),
+        outCap >>> 0,
+      );
+      if (rc >= 0 && rc <= outCap) {
+        const outRc = copyOut(outPtr, response.subarray(0, rc));
+        if (outRc < 0) return outRc;
+      }
+      return rc;
+    },
+    sys_tiocsctty: (fd) => forwardRequestBytes(METHOD.SYS_TIOCSCTTY, u32(fd)),
     sys_getpgid: (pid) => forwardRequestBytes(METHOD.SYS_GETPGID, u32(pid)),
     sys_setpgid: (pid, pgid) => {
       const req = new Uint8Array(8);

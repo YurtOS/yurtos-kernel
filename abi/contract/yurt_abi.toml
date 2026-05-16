@@ -130,6 +130,10 @@ doc = "Not a directory."
 value = 22
 doc = "Invalid argument."
 
+[errno.ENOTTY]
+value = 25
+doc = "Inappropriate ioctl for device."
+
 [errno.EOVERFLOW]
 value = 75
 doc = "Value too large for defined data type."
@@ -355,6 +359,55 @@ return = "scalar_errno"
 args = [
   { name = "fd", type = "fd" },
   { name = "flags", type = "i32" },
+]
+
+[import.host_tcgetpgrp]
+doc = "Return the foreground process group for the terminal on fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+]
+
+[import.host_tcsetpgrp]
+doc = "Set the foreground process group for the terminal on fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "pgid", type = "i32" },
+]
+
+[import.host_tcgetattr]
+doc = "Write the minimal musl wasm32 termios record for a terminal fd."
+return = "fixed_out"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_tcsetattr]
+doc = "Accept terminal attribute changes for a terminal fd."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "actions", type = "i32" },
+  { name = "termios_ptr", type = "ptr" },
+]
+
+[import.host_winsize]
+doc = "Write struct winsize { rows, cols, xpixel, ypixel } for a terminal fd."
+return = "fixed_out"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
+[import.host_tiocsctty]
+doc = "Register fd as the caller's controlling terminal."
+return = "scalar_errno"
+args = [
+  { name = "fd", type = "fd" },
 ]
 
 [import.host_spawn]

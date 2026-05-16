@@ -489,6 +489,68 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(calls[1].request).toEqual(new Uint8Array([9, 0, 0, 0, 1, 0, 0, 0]));
   });
 
+  it("tty helpers pack scalar requests and copy fixed responses", async () => {
+    const calls: CapturedCall[] = [];
+    const termios = new Uint8Array(60);
+    termios[0] = 0xAA;
+    const winsize = new Uint8Array([24, 0, 80, 0, 0, 0, 0, 0]);
+    const responses = [
+      { rc: 7, response: new Uint8Array() },
+      { rc: 0, response: new Uint8Array() },
+      { rc: 60, response: termios },
+      { rc: 0, response: new Uint8Array() },
+      { rc: 8, response: winsize },
+      { rc: 0, response: new Uint8Array() },
+    ];
+    const mk = {
+      kernelSyscallAsync(
+        method: number,
+        callerPid: number,
+        request: Uint8Array,
+        responseCap: number,
+      ): Promise<{ rc: bigint; response: Uint8Array }> {
+        calls.push({
+          method,
+          callerPid,
+          request: request.slice(),
+          responseCap,
+        });
+        const next = responses.shift() ?? { rc: 0, response: new Uint8Array() };
+        return Promise.resolve({
+          rc: BigInt(next.rc),
+          response: next.response,
+        });
+      },
+    } as unknown as KernelHostInterface;
+    const memory = new ArrayBuffer(128);
+    const imports = buildWasmKernelImports(mk, () => memory);
+
+    expect(await imports.host_tcgetpgrp(0)).toEqual(7);
+    expect(await imports.host_tcsetpgrp(0, 7)).toEqual(0);
+    expect(await imports.host_tcgetattr(0, 16, 60)).toEqual(60);
+    expect(await imports.host_tcsetattr(0, 0, 96)).toEqual(0);
+    expect(await imports.host_winsize(0, 80, 8)).toEqual(8);
+    expect(await imports.host_tiocsctty(0)).toEqual(0);
+
+    expect(calls.map((call) => call.method)).toEqual([
+      METHOD.SYS_TCGETPGRP,
+      METHOD.SYS_TCSETPGRP,
+      METHOD.SYS_TCGETATTR,
+      METHOD.SYS_TCSETATTR,
+      METHOD.SYS_WINSIZE,
+      METHOD.SYS_TIOCSCTTY,
+    ]);
+    expect(calls[1].request).toEqual(new Uint8Array([0, 0, 0, 0, 7, 0, 0, 0]));
+    expect(calls[2].request).toEqual(new Uint8Array([0, 0, 0, 0]));
+    expect(calls[2].responseCap).toEqual(60);
+    expect(calls[3].request).toEqual(new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0]));
+    expect(calls[4].responseCap).toEqual(8);
+    expect(new Uint8Array(memory, 16, 1)[0]).toEqual(0xAA);
+    expect(new Uint8Array(memory, 80, 4)).toEqual(
+      new Uint8Array([24, 0, 80, 0]),
+    );
+  });
+
   it("host_wait converts the kernel wait record to yurt_wait_result_v1", async () => {
     const kernelWait = new Uint8Array(8);
     const kernelView = new DataView(kernelWait.buffer);

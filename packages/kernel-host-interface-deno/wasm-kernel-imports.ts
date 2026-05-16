@@ -504,6 +504,30 @@ export const HOST_BINDINGS: HostBinding[] = [
   { name: "host_getsid", method: METHOD.SYS_GETSID, args: ["scalar"] },
   { name: "host_setsid", method: METHOD.SYS_SETSID, args: [] },
   { name: "host_isatty", method: METHOD.SYS_ISATTY, args: ["scalar"] },
+  { name: "host_tcgetpgrp", method: METHOD.SYS_TCGETPGRP, args: ["scalar"] },
+  {
+    name: "host_tcsetpgrp",
+    method: METHOD.SYS_TCSETPGRP,
+    args: ["scalar", "scalar"],
+  },
+  {
+    name: "host_tcgetattr",
+    method: METHOD.SYS_TCGETATTR,
+    args: ["scalar", "out_cap"],
+    returnsBytes: true,
+  },
+  {
+    name: "host_tcsetattr",
+    method: METHOD.SYS_TCSETATTR,
+    args: ["scalar", "scalar", "ignore_scalar"],
+  },
+  {
+    name: "host_winsize",
+    method: METHOD.SYS_WINSIZE,
+    args: ["scalar", "out_cap"],
+    returnsBytes: true,
+  },
+  { name: "host_tiocsctty", method: METHOD.SYS_TIOCSCTTY, args: ["scalar"] },
   { name: "host_sched_yield", method: METHOD.SYS_SCHED_YIELD, args: [] },
   { name: "host_nanosleep", method: METHOD.SYS_NANOSLEEP, args: ["scalar64"] },
 

@@ -147,6 +147,12 @@ const METHOD_SYS_DUP: u32 = 0x1_000F;
 const METHOD_SYS_DUP2: u32 = 0x1_0011;
 const METHOD_SYS_DUP_MIN: u32 = 0x1_0054;
 const METHOD_SYS_SET_FD_DESCRIPTOR_FLAGS: u32 = 0x1_0055;
+const METHOD_SYS_TCGETPGRP: u32 = 0x1_0056;
+const METHOD_SYS_TCSETPGRP: u32 = 0x1_0057;
+const METHOD_SYS_TCGETATTR: u32 = 0x1_0058;
+const METHOD_SYS_TCSETATTR: u32 = 0x1_0059;
+const METHOD_SYS_WINSIZE: u32 = 0x1_005A;
+const METHOD_SYS_TIOCSCTTY: u32 = 0x1_005B;
 const METHOD_SYS_PIPE: u32 = 0x1_0012;
 const METHOD_SYS_READ: u32 = 0x1_0013;
 const METHOD_SYS_WRITE: u32 = 0x1_0014;
@@ -3240,6 +3246,32 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
         ("sys_read", METHOD_SYS_READ, METHOD_SYS_READ as i64),
         ("sys_write", METHOD_SYS_WRITE, METHOD_SYS_WRITE as i64),
         ("sys_isatty", METHOD_SYS_ISATTY, METHOD_SYS_ISATTY as i64),
+        (
+            "sys_tcgetpgrp",
+            METHOD_SYS_TCGETPGRP,
+            METHOD_SYS_TCGETPGRP as i64,
+        ),
+        (
+            "sys_tcsetpgrp",
+            METHOD_SYS_TCSETPGRP,
+            METHOD_SYS_TCSETPGRP as i64,
+        ),
+        (
+            "sys_tcgetattr",
+            METHOD_SYS_TCGETATTR,
+            METHOD_SYS_TCGETATTR as i64,
+        ),
+        (
+            "sys_tcsetattr",
+            METHOD_SYS_TCSETATTR,
+            METHOD_SYS_TCSETATTR as i64,
+        ),
+        ("sys_winsize", METHOD_SYS_WINSIZE, METHOD_SYS_WINSIZE as i64),
+        (
+            "sys_tiocsctty",
+            METHOD_SYS_TIOCSCTTY,
+            METHOD_SYS_TIOCSCTTY as i64,
+        ),
         (
             "sys_clock_gettime",
             METHOD_SYS_CLOCK_GETTIME,

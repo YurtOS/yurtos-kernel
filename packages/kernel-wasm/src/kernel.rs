@@ -318,6 +318,9 @@ pub struct Process {
     /// Set by kernel-owned spawn paths when a child process is
     /// created.
     pub ppid: Pid,
+    /// Whether this process has claimed the kernel-owned stdio TTY as
+    /// its controlling terminal.
+    pub has_controlling_tty: bool,
     /// Direct children's pids. Updated alongside ppid on
     /// process creation; entries are removed when sys_wait reaps a
     /// child (zombie → fully gone).
@@ -362,6 +365,7 @@ impl Default for Process {
             last_nanosleep_ns: 0,
             argv: Vec::new(),
             ppid: 0,
+            has_controlling_tty: false,
             children: Vec::new(),
             exit_status: None,
             host_instance_handle: None,
@@ -534,6 +538,8 @@ pub struct Kernel {
     /// after this entry among runnable threads.
     last_scheduled: Option<(Pid, Tid)>,
     pending_thread_releases: Vec<i32>,
+    /// Foreground process group for the kernel-owned stdio TTY.
+    tty_foreground_pgid: Pid,
 }
 
 /// One staged sys_spawn waiting for the host to instantiate it.
@@ -604,6 +610,7 @@ impl Kernel {
             next_host_pid: 1,
             last_scheduled: None,
             pending_thread_releases: Vec::new(),
+            tty_foreground_pgid: 1,
         }
     }
 
@@ -1178,6 +1185,14 @@ impl Kernel {
                 fds: p.fd_table.entries.keys().copied().collect(),
             })
             .collect()
+    }
+
+    pub fn tty_foreground_pgid(&self) -> Pid {
+        self.tty_foreground_pgid
+    }
+
+    pub fn set_tty_foreground_pgid(&mut self, pgid: Pid) {
+        self.tty_foreground_pgid = pgid;
     }
 
     pub fn process_group_session(&self, pgid: Pid) -> Option<Pid> {

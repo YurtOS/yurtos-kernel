@@ -28,6 +28,13 @@ const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0002;
 const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
+const TEST_METHOD_SYS_TCGETPGRP: u32 = 0x1_0056;
+const TEST_METHOD_SYS_TCSETPGRP: u32 = 0x1_0057;
+const TEST_METHOD_SYS_TCGETATTR: u32 = 0x1_0058;
+const TEST_METHOD_SYS_TCSETATTR: u32 = 0x1_0059;
+const TEST_METHOD_SYS_WINSIZE: u32 = 0x1_005A;
+const TEST_METHOD_SYS_TIOCSCTTY: u32 = 0x1_005B;
+const TEST_ENOTTY: i32 = 25;
 
 fn poll_req(timeout_ms: i32, fds: &[(i32, i16)]) -> Vec<u8> {
     let mut req = timeout_ms.to_le_bytes().to_vec();
@@ -3523,6 +3530,148 @@ fn isatty_on_closed_fd_is_ebadf() {
     assert_eq!(
         dispatch(METHOD_SYS_ISATTY, 1, &99_u32.to_le_bytes(), &mut []),
         -(abi::EBADF as i64)
+    );
+}
+
+#[test]
+fn tty_foreground_pgrp_rejects_missing_and_cross_session_groups() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let owner = k.process_mut(10);
+        owner.sid = 10;
+        owner.pgid = 10;
+        let foreground = k.process_mut(11);
+        foreground.sid = 10;
+        foreground.pgid = 11;
+        let other_session = k.process_mut(12);
+        other_session.sid = 12;
+        other_session.pgid = 12;
+    });
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TIOCSCTTY, 10, &0_u32.to_le_bytes(), &mut []),
+        0
+    );
+
+    let mut set_req = Vec::new();
+    set_req.extend_from_slice(&0_u32.to_le_bytes());
+    set_req.extend_from_slice(&11_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCSETPGRP, 10, &set_req, &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCGETPGRP, 10, &0_u32.to_le_bytes(), &mut []),
+        11
+    );
+
+    let mut missing_req = Vec::new();
+    missing_req.extend_from_slice(&0_u32.to_le_bytes());
+    missing_req.extend_from_slice(&9999_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCSETPGRP, 10, &missing_req, &mut []),
+        -(TEST_ENOTTY as i64)
+    );
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCGETPGRP, 10, &0_u32.to_le_bytes(), &mut []),
+        11
+    );
+
+    let mut cross_session_req = Vec::new();
+    cross_session_req.extend_from_slice(&0_u32.to_le_bytes());
+    cross_session_req.extend_from_slice(&12_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCSETPGRP, 10, &cross_session_req, &mut []),
+        -(TEST_ENOTTY as i64)
+    );
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TCGETPGRP, 10, &0_u32.to_le_bytes(), &mut []),
+        11
+    );
+}
+
+#[test]
+fn tiocsctty_requires_session_leader_on_tty_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TIOCSCTTY, 1, &0_u32.to_le_bytes(), &mut []),
+        -(abi::EPERM as i64)
+    );
+    assert_eq!(dispatch(METHOD_SYS_SETSID, 1, &[], &mut []), 1);
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_TIOCSCTTY, 1, &0_u32.to_le_bytes(), &mut []),
+        0
+    );
+}
+
+#[test]
+fn tty_attrs_and_winsize_are_available_for_stdio_only() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut termios = [0u8; 60];
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_TCGETATTR,
+            1,
+            &0_u32.to_le_bytes(),
+            &mut termios
+        ),
+        60
+    );
+    assert_eq!(
+        u32::from_le_bytes(termios[0..4].try_into().unwrap()),
+        0x0600
+    );
+    assert_eq!(
+        u32::from_le_bytes(termios[4..8].try_into().unwrap()),
+        0x0005
+    );
+    assert_eq!(
+        u32::from_le_bytes(termios[8..12].try_into().unwrap()),
+        0x08BF
+    );
+    assert_eq!(
+        u32::from_le_bytes(termios[12..16].try_into().unwrap()),
+        0x8A3B
+    );
+    assert_eq!(&termios[17..24], &[3, 28, 127, 21, 4, 0, 1]);
+
+    let mut set_req = Vec::new();
+    set_req.extend_from_slice(&0_u32.to_le_bytes());
+    set_req.extend_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(dispatch(TEST_METHOD_SYS_TCSETATTR, 1, &set_req, &mut []), 0);
+
+    let mut winsize = [0u8; 8];
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_WINSIZE,
+            1,
+            &0_u32.to_le_bytes(),
+            &mut winsize
+        ),
+        8
+    );
+    assert_eq!(u16::from_le_bytes(winsize[0..2].try_into().unwrap()), 24);
+    assert_eq!(u16::from_le_bytes(winsize[2..4].try_into().unwrap()), 80);
+
+    let mut fds = [0u8; 8];
+    dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds);
+    let pipe_fd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_TCGETATTR,
+            1,
+            &pipe_fd.to_le_bytes(),
+            &mut termios
+        ),
+        -(TEST_ENOTTY as i64)
+    );
+    assert_eq!(
+        dispatch(
+            TEST_METHOD_SYS_WINSIZE,
+            1,
+            &pipe_fd.to_le_bytes(),
+            &mut winsize
+        ),
+        -(TEST_ENOTTY as i64)
     );
 }
 

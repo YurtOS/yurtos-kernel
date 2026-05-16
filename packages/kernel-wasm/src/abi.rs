@@ -16,6 +16,7 @@ pub const EXDEV: i32 = 18;
 pub const EEXIST: i32 = 17;
 pub const ENOTDIR: i32 = 20;
 pub const EINVAL: i32 = 22;
+pub const ENOTTY: i32 = 25;
 pub const ENOSYS: i32 = 38;
 pub const EDEADLK: i32 = 35;
 pub const EPIPE: i32 = 32;
