@@ -6790,3 +6790,198 @@ fn setpgrp_makes_caller_a_group_leader_and_getpgrp_is_stable() {
         "getpgrp() must be stable after setpgrp()"
     );
 }
+
+// --- Slice B1.3: POSIX waitid(idtype, id, infop, options) ---
+
+const WAITID_P_PID: u32 = 1;
+const WAITID_P_PGID: u32 = 2;
+const WAITID_WEXITED: u32 = 4;
+const WAITID_WNOWAIT: u32 = 0x0100_0000;
+
+fn waitid_req(idtype: u32, id: u32, options: u32) -> Vec<u8> {
+    let mut req = idtype.to_le_bytes().to_vec();
+    req.extend_from_slice(&id.to_le_bytes());
+    req.extend_from_slice(&options.to_le_bytes());
+    req
+}
+
+fn link_child(parent: u32, child: u32) {
+    let mut reg = parent.to_le_bytes().to_vec();
+    reg.extend_from_slice(&child.to_le_bytes());
+    assert_eq!(register_child(&reg), 0);
+}
+
+fn decode_siginfo(buf: &[u8]) -> (i32, i32, u32, u32, i32) {
+    (
+        i32::from_le_bytes(buf[0..4].try_into().unwrap()),
+        i32::from_le_bytes(buf[4..8].try_into().unwrap()),
+        u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+        i32::from_le_bytes(buf[16..20].try_into().unwrap()),
+    )
+}
+
+#[test]
+fn waitid_p_pid_reports_terminated_child_siginfo_then_reaps() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 7);
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(7).credentials.uid = 4321;
+    });
+    assert_eq!(record_exit(&record_exit_req(7, 23)), 0);
+
+    let mut buf = [0u8; 20];
+    let rc = dispatch(
+        METHOD_SYS_WAITID,
+        1,
+        &waitid_req(WAITID_P_PID, 7, WAITID_WEXITED),
+        &mut buf,
+    );
+    assert_eq!(rc, 20);
+    let (signo, code, pid, uid, status) = decode_siginfo(&buf);
+    assert_eq!(signo, SIGCHLD as i32);
+    assert_eq!(code, 1, "CLD_EXITED");
+    assert_eq!(pid, 7);
+    assert_eq!(uid, 4321, "si_uid must be the child's real uid");
+    assert_eq!(status, 23);
+
+    // Reaped: no longer a waitable child.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 7, WAITID_WEXITED),
+            &mut buf,
+        ),
+        -(abi::ECHILD as i64)
+    );
+}
+
+#[test]
+fn waitid_wnowait_leaves_child_reapable() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 8);
+    assert_eq!(record_exit(&record_exit_req(8, 5)), 0);
+    let mut buf = [0u8; 20];
+
+    for _ in 0..2 {
+        assert_eq!(
+            dispatch(
+                METHOD_SYS_WAITID,
+                1,
+                &waitid_req(WAITID_P_PID, 8, WAITID_WEXITED | WAITID_WNOWAIT),
+                &mut buf,
+            ),
+            20,
+            "WNOWAIT must not consume the child"
+        );
+    }
+    // A normal waitid then reaps it.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 8, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 8, WAITID_WEXITED),
+            &mut buf,
+        ),
+        -(abi::ECHILD as i64)
+    );
+}
+
+#[test]
+fn waitid_eagain_when_no_matching_child_has_exited() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 9);
+    let mut buf = [0u8; 20];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 9, WAITID_WEXITED),
+            &mut buf,
+        ),
+        -(abi::EAGAIN as i64)
+    );
+}
+
+#[test]
+fn waitid_input_guards() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 12);
+    assert_eq!(record_exit(&record_exit_req(12, 0)), 0);
+    let mut buf = [0u8; 20];
+
+    // Unknown idtype (>P_PGID).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(3, 12, WAITID_WEXITED),
+            &mut buf
+        ),
+        -(abi::EINVAL as i64)
+    );
+    // No wait-type bit (missing WEXITED).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 12, 0),
+            &mut buf
+        ),
+        -(abi::EINVAL as i64)
+    );
+    // Response buffer too small.
+    let mut tiny = [0u8; 8];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 12, WAITID_WEXITED),
+            &mut tiny,
+        ),
+        -(abi::EINVAL as i64)
+    );
+    // Caller with no children at all.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            999,
+            &waitid_req(WAITID_P_PID, 12, WAITID_WEXITED),
+            &mut buf,
+        ),
+        -(abi::ECHILD as i64)
+    );
+}
+
+#[test]
+fn waitid_p_pgid_matches_childs_group() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 10);
+    link_child(1, 11);
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(11).pgid = 555;
+    });
+    assert_eq!(record_exit(&record_exit_req(11, 9)), 0);
+
+    let mut buf = [0u8; 20];
+    let rc = dispatch(
+        METHOD_SYS_WAITID,
+        1,
+        &waitid_req(WAITID_P_PGID, 555, WAITID_WEXITED),
+        &mut buf,
+    );
+    assert_eq!(rc, 20);
+    let (_, _, pid, _, status) = decode_siginfo(&buf);
+    assert_eq!(pid, 11);
+    assert_eq!(status, 9);
+}

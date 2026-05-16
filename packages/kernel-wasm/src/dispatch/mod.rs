@@ -30,6 +30,7 @@ use process::{
     killpg_request, nanosleep, provide_stdin, sched_getaffinity, sched_getparam,
     sched_getscheduler, sched_setaffinity, sched_setparam, sched_setscheduler, sched_yield,
     setpgid, setpriority, setresgid, setresuid, setrlimit, setsid, sigaction, sys_spawn, umask,
+    waitid,
 };
 pub use process::{
     drain_spawn, kill_pid, list_processes_response, list_threads_response, record_exit,
@@ -127,6 +128,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_THREAD_EXIT => thread::sys_thread_exit(ctx, request),
         METHOD_SYS_THREAD_YIELD => thread::sys_thread_yield(ctx, request),
         METHOD_SYS_WAIT => wait_response(caller_pid, request, response),
+        METHOD_SYS_WAITID => waitid(caller_pid, request, response),
         METHOD_SYS_GETUID => with_kernel(|k| k.process(caller_pid).credentials.uid as i64),
         METHOD_SYS_GETEUID => with_kernel(|k| k.process(caller_pid).credentials.euid as i64),
         METHOD_SYS_GETGID => with_kernel(|k| k.process(caller_pid).credentials.gid as i64),

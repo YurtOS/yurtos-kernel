@@ -980,6 +980,87 @@ pub fn wait_response(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
     })
 }
 
+/// `waitid(idtype, id, infop, options)` — POSIX siginfo-returning wait.
+/// Request: u32 idtype LE (0=P_ALL, 1=P_PID, 2=P_PGID) + u32 id LE +
+/// u32 options LE. Response: 20 bytes — i32 si_signo + i32 si_code +
+/// u32 si_pid + u32 si_uid + i32 si_status, all LE.
+///
+/// First pass: terminated children only (si_code = CLD_EXITED). The
+/// kernel records a single `exit_status` with no kill/stop/continue
+/// discrimination, so killed-by-signal vs normal-exit and
+/// WSTOPPED/WCONTINUED are out of scope here (tracked: B1.2 siginfo
+/// needs record_exit to carry signal-vs-exit). Blocking behaves like
+/// the sys_wait path — no AsyncBridge yet, so "would block" is -EAGAIN.
+pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    // Linux idtype values and option bits. P_ALL (0) is the `_` arm.
+    const P_PID: u32 = 1;
+    const P_PGID: u32 = 2;
+    const WEXITED: u32 = 4;
+    const WNOWAIT: u32 = 0x0100_0000;
+    const CLD_EXITED: i32 = 1;
+
+    let Some([idtype, id, options]) = read_u32_args::<3>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    if response.len() < 20 {
+        return -(abi::EINVAL as i64);
+    }
+    if idtype > P_PGID {
+        return -(abi::EINVAL as i64);
+    }
+    // We only produce terminated-child events; POSIX requires at least
+    // one wait-type bit, and ours must be WEXITED.
+    if options & WEXITED == 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let nowait = options & WNOWAIT != 0;
+    with_kernel(|k| {
+        let children = k.process_mut(caller_pid).children.clone();
+        if children.is_empty() {
+            return -(abi::ECHILD as i64);
+        }
+        let candidates: Vec<u32> = match idtype {
+            P_PID => {
+                if children.contains(&id) {
+                    vec![id]
+                } else {
+                    return -(abi::ECHILD as i64);
+                }
+            }
+            P_PGID => children
+                .iter()
+                .copied()
+                .filter(|&c| {
+                    let pg = k.process_mut(c).pgid;
+                    (if pg == 0 { c } else { pg }) == id
+                })
+                .collect(),
+            _ => children, // P_ALL
+        };
+        if candidates.is_empty() {
+            return -(abi::ECHILD as i64);
+        }
+        let Some((pid, status)) = candidates
+            .iter()
+            .find_map(|&c| k.process_mut(c).exit_status.map(|s| (c, s)))
+        else {
+            // No matching child has terminated. Without an AsyncBridge
+            // this is reported as would-block, matching sys_wait.
+            return -(abi::EAGAIN as i64);
+        };
+        let uid = k.process_mut(pid).credentials.uid;
+        if !nowait {
+            k.process_mut(caller_pid).children.retain(|&c| c != pid);
+        }
+        response[0..4].copy_from_slice(&(SIGCHLD as i32).to_le_bytes());
+        response[4..8].copy_from_slice(&CLD_EXITED.to_le_bytes());
+        response[8..12].copy_from_slice(&pid.to_le_bytes());
+        response[12..16].copy_from_slice(&uid.to_le_bytes());
+        response[16..20].copy_from_slice(&status.to_le_bytes());
+        20
+    })
+}
+
 /// `sys_spawn(path_len, path, (arg_len, arg)*)`. Reads the wasm
 /// image from the VFS, allocates a child pid (kernel range starts
 /// at 1000), records the parent/child relationship, and stages a
