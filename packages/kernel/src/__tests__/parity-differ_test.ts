@@ -37,6 +37,8 @@ import {
   type Observed,
   type ParityRow,
   parseBaseline,
+  parseSpecCases,
+  type SpecCase,
   type UnestablishedCase,
 } from "./_parity_baseline.ts";
 import {
@@ -60,24 +62,36 @@ function kernelMode(): KernelMode {
   throw new Error(`YURT_KERNEL must be ts|wasm|both, got ${JSON.stringify(v)}`);
 }
 
-interface SpecCase {
-  canary: string;
-  caseName: string;
-}
-
 async function enumerateSpecCases(): Promise<SpecCase[]> {
   const out: SpecCase[] = [];
+  const errors: string[] = [];
   for await (const entry of Deno.readDir(CONFORMANCE_DIR)) {
     if (!entry.isFile || !entry.name.endsWith(".spec.toml")) continue;
     const text = await Deno.readTextFile(`${CONFORMANCE_DIR}/${entry.name}`);
-    const doc = parseToml(text) as Record<string, unknown>;
-    const canary = doc.canary;
-    const cases = doc.case;
-    if (typeof canary !== "string" || !Array.isArray(cases)) continue;
-    for (const c of cases) {
-      const name = (c as Record<string, unknown>).name;
-      if (typeof name === "string") out.push({ canary, caseName: name });
+    let doc: Record<string, unknown>;
+    try {
+      doc = parseToml(text) as Record<string, unknown>;
+    } catch (err) {
+      errors.push(`${entry.name}: TOML parse error: ${err}`);
+      continue;
     }
+    // Never silently skip a spec the gate can't understand — that
+    // would let the gate report green while omitting whole canaries
+    // (PR #53 review 🔴 P1). parseSpecCases reports such files; we
+    // collect every one and fail loud below.
+    const parsed = parseSpecCases(entry.name, doc);
+    if ("error" in parsed) {
+      errors.push(parsed.error);
+      continue;
+    }
+    out.push(...parsed.cases);
+  }
+  if (errors.length > 0) {
+    throw new Error(
+      `parity gate: ${errors.length} conformance spec file(s) could not ` +
+        `be parsed — they would be silently omitted from the corpus. ` +
+        `Fix or remove them:\n  ${errors.join("\n  ")}`,
+    );
   }
   // Tuple compare (no delimiter-less concat — same smell the key()
   // NUL avoids): canary first, then case.

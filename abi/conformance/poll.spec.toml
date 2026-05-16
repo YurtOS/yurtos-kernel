@@ -1,7 +1,7 @@
 canary = "posix-runtime-canary"
 symbol = "poll"
 
-[[cases]]
+[[case]]
 name = "poll_regular_fd"
 inputs = "poll() over a regular file descriptor and an invalid descriptor"
 expected.exit = 0

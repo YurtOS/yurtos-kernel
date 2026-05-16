@@ -236,3 +236,61 @@ export function evaluateOrphans(
   }
   return { failures };
 }
+
+export interface SpecCase {
+  canary: string;
+  caseName: string;
+}
+
+const CASE_NAME_RE = /^[a-z][a-z0-9_]*$/;
+
+/**
+ * Parse one parsed *.spec.toml document into its (canary, case) pairs,
+ * or an error string. Critically this NEVER silently skips: a spec the
+ * gate cannot understand — no `canary`, the `[[cases]]` plural typo,
+ * zero cases, or a schema-invalid case name — is returned as an error
+ * so the differ fails loud instead of dropping a whole canary's
+ * coverage and still reporting green (PR #53 review 🔴 P1). Schema:
+ * abi/conformance/SCHEMA.md.
+ */
+export function parseSpecCases(
+  fileName: string,
+  doc: Record<string, unknown>,
+): { canary: string; cases: SpecCase[] } | { error: string } {
+  const canary = doc.canary;
+  if (typeof canary !== "string" || canary.length === 0) {
+    return {
+      error: `${fileName}: missing or empty required \`canary\` string ` +
+        `(see abi/conformance/SCHEMA.md)`,
+    };
+  }
+  const cases = doc.case;
+  if (!Array.isArray(cases)) {
+    if (Array.isArray(doc.cases)) {
+      return {
+        error: `${fileName}: uses [[cases]] (plural) but the schema ` +
+          `requires [[case]] (singular). [[cases]] is read by nothing ` +
+          `and would silently drop this canary from the parity gate — ` +
+          `rename the table (see abi/conformance/SCHEMA.md)`,
+      };
+    }
+    return {
+      error: `${fileName}: no [[case]] array (see abi/conformance/SCHEMA.md)`,
+    };
+  }
+  if (cases.length === 0) {
+    return { error: `${fileName}: [[case]] array is empty` };
+  }
+  const out: SpecCase[] = [];
+  for (const c of cases) {
+    const name = (c as Record<string, unknown>).name;
+    if (typeof name !== "string" || !CASE_NAME_RE.test(name)) {
+      return {
+        error: `${fileName}: case name ${JSON.stringify(name)} is ` +
+          `missing or does not match /^[a-z][a-z0-9_]*$/`,
+      };
+    }
+    out.push({ canary, caseName: name });
+  }
+  return { canary, cases: out };
+}

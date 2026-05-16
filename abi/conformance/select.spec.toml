@@ -1,7 +1,7 @@
 canary = "posix-runtime-canary"
 symbol = "select"
 
-[[cases]]
+[[case]]
 name = "select_regular_fd"
 inputs = "select() over a regular file descriptor and an invalid descriptor"
 expected.exit = 0

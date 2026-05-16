@@ -17,6 +17,7 @@ import {
   formatBaselineSeed,
   type Observed,
   parseBaseline,
+  parseSpecCases,
 } from "./_parity_baseline.ts";
 
 const SAME: Observed = { exitCode: 0, stdout: "ok", stderr: "" };
@@ -195,5 +196,65 @@ describe("formatBaselineSeed", () => {
         },
       ]),
     ).toBe("");
+  });
+});
+
+describe("parseSpecCases (PR #53 review 🔴 P1 — no silent corpus skips)", () => {
+  it("parses a schema-conformant [[case]] spec", () => {
+    const r = parseSpecCases("dup2.spec.toml", {
+      canary: "dup2-canary",
+      summary: "renumber an fd",
+      case: [
+        { name: "happy", "expected.exit": 0 },
+        { name: "invalid_fd", "expected.exit": 1 },
+      ],
+    });
+    expect("error" in r).toBe(false);
+    if ("error" in r) throw new Error(r.error);
+    expect(r.canary).toBe("dup2-canary");
+    expect(r.cases).toEqual([
+      { canary: "dup2-canary", caseName: "happy" },
+      { canary: "dup2-canary", caseName: "invalid_fd" },
+    ]);
+  });
+
+  it("FAILS LOUD on the [[cases]] plural typo instead of skipping", () => {
+    // The exact bug: doc.case absent, doc.cases (plural) present.
+    const r = parseSpecCases("poll.spec.toml", {
+      canary: "posix-runtime-canary",
+      cases: [{ name: "poll_regular_fd", "expected.exit": 0 }],
+    });
+    expect("error" in r).toBe(true);
+    if (!("error" in r)) throw new Error("expected an error");
+    expect(r.error).toContain("poll.spec.toml");
+    expect(r.error).toContain("[[cases]]");
+    expect(r.error).toContain("[[case]]");
+  });
+
+  it("errors on a missing/blank canary", () => {
+    const r = parseSpecCases("x.spec.toml", {
+      case: [{ name: "a", "expected.exit": 0 }],
+    });
+    expect("error" in r).toBe(true);
+  });
+
+  it("errors on a spec with zero cases (a [[case]]-less file is malformed)", () => {
+    const r = parseSpecCases("x.spec.toml", { canary: "c", case: [] });
+    expect("error" in r).toBe(true);
+  });
+
+  it("errors on a case with a missing or schema-invalid name", () => {
+    expect(
+      "error" in parseSpecCases("x.spec.toml", {
+        canary: "c",
+        case: [{ "expected.exit": 0 }],
+      }),
+    ).toBe(true);
+    expect(
+      "error" in parseSpecCases("x.spec.toml", {
+        canary: "c",
+        case: [{ name: "Bad-Name", "expected.exit": 0 }],
+      }),
+    ).toBe(true);
   });
 });
