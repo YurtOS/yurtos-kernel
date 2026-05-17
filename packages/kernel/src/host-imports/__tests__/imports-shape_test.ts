@@ -606,6 +606,17 @@ Deno.test("kernel host_get_local_addr reports configured sandbox address", () =>
   assertEquals(readString(memory, 4096, written), "10.8.0.42");
 });
 
+// host_dns_resolve writes a yurt_dns_addr_result_v1 record: 4-byte family
+// (AF_INET = 2) followed by 4 bytes of IPv4 address in network order.
+function readDnsAddrResult(memory: WebAssembly.Memory, ptr: number): string {
+  const view = new DataView(memory.buffer, ptr, 8);
+  const family = view.getUint32(0, true);
+  if (family !== 2) throw new Error(`unexpected dns family ${family}`);
+  return `${view.getUint8(4)}.${view.getUint8(5)}.${view.getUint8(6)}.${
+    view.getUint8(7)
+  }`;
+}
+
 Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local address locally", async () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const imports = createKernelImports({ memory, socketLocalHost: "10.8.0.42" });
@@ -618,7 +629,8 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
       4096,
       1024,
     );
-  assertEquals(readString(memory, 4096, written), "127.0.0.1");
+  assertEquals(written, 8);
+  assertEquals(readDnsAddrResult(memory, 4096), "127.0.0.1");
 
   hostLen = writeString(memory, 0, "10.8.0.42");
   written =
@@ -628,7 +640,8 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
       4096,
       1024,
     );
-  assertEquals(readString(memory, 4096, written), "10.8.0.42");
+  assertEquals(written, 8);
+  assertEquals(readDnsAddrResult(memory, 4096), "10.8.0.42");
 });
 
 Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for socket-backed guests", async () => {
@@ -652,7 +665,8 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
       4096,
       1024,
     );
-  const first = readString(memory, 4096, firstLen);
+  assertEquals(firstLen, 8);
+  const first = readDnsAddrResult(memory, 4096);
   const secondLen =
     await (imports.host_dns_resolve as (...args: number[]) => Promise<number>)(
       0,
@@ -660,7 +674,8 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
       8192,
       1024,
     );
-  const second = readString(memory, 8192, secondLen);
+  assertEquals(secondLen, 8);
+  const second = readDnsAddrResult(memory, 8192);
 
   assertEquals(first.startsWith("10.0.2."), true);
   assertEquals(second, first);

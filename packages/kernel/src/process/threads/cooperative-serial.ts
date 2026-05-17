@@ -119,9 +119,9 @@ export class CooperativeSerialBackend implements ThreadsBackend {
       .finally(() => {
         slot.finished = true;
       });
-    setTimeout(() => {
+    queueMicrotask(() => {
       if (!this.detachedCancelled) slot.start();
-    }, 0);
+    });
     return tid;
   }
 
