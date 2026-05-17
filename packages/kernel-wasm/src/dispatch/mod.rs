@@ -549,8 +549,18 @@ fn get_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
                 }
                 None => -(abi::EBADF as i64),
             },
-            // Valid but no per-OFD status tracked yet.
-            _ => 0,
+            // No per-OFD status flags tracked for these yet, but the
+            // access mode is well-defined and userland keys on
+            // `flags & O_ACCMODE` (same #60 class as the file fix):
+            // stdin/pipe-read = O_RDONLY(0), stdout/stderr/pipe-write
+            // = O_WRONLY(1), socket = O_RDWR(2), dir = O_RDONLY(0).
+            FdEntry::Stdin | FdEntry::Directory { .. } => 0,
+            FdEntry::Stdout | FdEntry::Stderr => 1,
+            FdEntry::Pipe { end, .. } => match end {
+                PipeEnd::Read => 0,
+                PipeEnd::Write => 1,
+            },
+            FdEntry::Socket { .. } => 2,
         }
     })
 }
@@ -1395,7 +1405,10 @@ fn lseek(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     with_kernel(|k| {
         let ofd_id = match k.process_mut(caller_pid).fd_table.entry(fd) {
             Some(crate::kernel::FdEntry::File { ofd_id }) => *ofd_id,
-            _ => return -(abi::EBADF as i64),
+            // A valid but non-seekable fd (pipe/socket/stdio/dir) is
+            // ESPIPE, not EBADF — only an unknown fd is EBADF.
+            Some(_) => return -(abi::ESPIPE as i64),
+            None => return -(abi::EBADF as i64),
         };
         let (mount_id, inode, current) = match k.ofd(ofd_id) {
             Some(o) => (o.mount_id, o.inode, o.offset),
