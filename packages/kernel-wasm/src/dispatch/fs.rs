@@ -736,3 +736,92 @@ pub(super) fn chmod(caller_pid: u32, request: &[u8]) -> i64 {
         0
     })
 }
+
+/// `sys_ftruncate(fd, length) -> 0/-errno`. Request bytes: u32 fd LE +
+/// u64 length LE (12 bytes). Resizes the file referenced by `fd` to
+/// exactly `length` bytes — shrinking discards trailing data, extending
+/// zero-fills the gap. POSIX requires `fd` to be writable. Pipe/socket
+/// fds are non-truncatable per Linux (EINVAL); directory fds are EISDIR.
+/// Issue #87.
+pub(super) fn sys_ftruncate(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() != 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let length = u64::from_le_bytes(request[4..12].try_into().expect("8 bytes"));
+    // Wire-encoded length is unsigned, but C `off_t` is signed (i64).
+    // Reject values that would round-trip as negative on the userland
+    // side — POSIX returns EINVAL for negative ftruncate length.
+    if length > i64::MAX as u64 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let entry = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(e) => e.clone(),
+            None => return -(abi::EBADF as i64),
+        };
+        let ofd_id = match entry {
+            crate::kernel::FdEntry::File { ofd_id } => ofd_id,
+            crate::kernel::FdEntry::Directory { .. } => return -(abi::EISDIR as i64),
+            // Pipes, sockets, ttys, anything else → EINVAL (Linux ftruncate
+            // on a non-regular fd surfaces EINVAL, not EBADF).
+            _ => return -(abi::EINVAL as i64),
+        };
+        let Some(ofd) = k.ofd(ofd_id) else {
+            return -(abi::EBADF as i64);
+        };
+        if !ofd.writable {
+            return -(abi::EBADF as i64);
+        }
+        let mount_id = ofd.mount_id;
+        let inode = ofd.inode;
+        k.vfs.set_len(mount_id, inode, length) as i64
+    })
+}
+
+/// `sys_truncate(length, path) -> 0/-errno`. Request bytes: u64 length
+/// LE + path bytes (path runs to end-of-request). Same semantics as
+/// `sys_ftruncate` but takes a path; resolves symlinks first.
+/// Issue #87.
+pub(super) fn sys_truncate(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let length = u64::from_le_bytes(request[0..8].try_into().expect("8 bytes"));
+    if length > i64::MAX as u64 {
+        return -(abi::EINVAL as i64);
+    }
+    let raw_path = &request[8..];
+    if raw_path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let path = match normalize_readable_path(k, caller_pid, raw_path) {
+            Ok(p) => p,
+            Err(rc) => return rc,
+        };
+        // Symlink resolution: 40 hops then -EINVAL (matches sys_open
+        // shape today; the ELOOP-vs-EINVAL fix is tracked in #69).
+        let mut resolved = path;
+        let mut hops = 0u32;
+        while let Some(target) = k.vfs.readlink(&resolved) {
+            hops += 1;
+            if hops > 40 {
+                return -(abi::EINVAL as i64);
+            }
+            resolved = match normalize_readable_path(k, caller_pid, &target) {
+                Ok(p) => p,
+                Err(rc) => return rc,
+            };
+        }
+        if k.vfs.entry_type(&resolved) == 3 {
+            return -(abi::EISDIR as i64);
+        }
+        // open(path, 0) probes existence without creating; succeeds
+        // for any inode that the backend knows about.
+        let Some((mount_id, inode)) = k.vfs.open(&resolved, 0) else {
+            return -(abi::ENOENT as i64);
+        };
+        k.vfs.set_len(mount_id, inode, length) as i64
+    })
+}

@@ -636,6 +636,16 @@ id = 0x1_0081
 kind = "syscall"
 doc = "SO_PEERCRED — peer credentials of a connected socket. Request: u32 fd LE. Response: 12 bytes — i32 pid LE + i32 uid LE + i32 gid LE. fixed_out convention (cf. sys_socket_info / sys_socket_addr): returns 12 (bytes written) on success for any socket fd — the captured peer pid/uid/gid for an AF_UNIX connected stream, zeros for sockets with no captured peer (mirroring the TS host_socket_peercred `?? 0`); the host adapter maps any non-negative return to the libc-level 0. Returns 12 (required size) with nothing written if the response buffer is smaller than 12. -EINVAL for a short request, -EBADF for an unknown fd, -ENOTSOCK if the fd is not a socket."
 
+[method.sys_ftruncate]
+id = 0x1_00A4
+kind = "syscall"
+doc = "POSIX ftruncate(fd, length). Request: u32 fd LE + u64 length LE (12 bytes). Resizes the file referenced by fd to exactly length bytes — shrink discards trailing data, extend zero-fills the gap (sparse semantics not yet exposed). The file offset is unchanged. Errnos: -EBADF for unknown / read-only fd, -EISDIR for a directory fd, -EINVAL for pipe / socket / non-regular fd or length > i64::MAX (POSIX off_t is signed), -EFBIG when length exceeds the host buffer cap (wasm32 ramfs is bounded by usize), -EROFS when the backing mount is read-only, -ENOSYS / unimplemented surfaces as -EROFS until the host-fs forwarding lands. Issue #87."
+
+[method.sys_truncate]
+id = 0x1_00A5
+kind = "syscall"
+doc = "POSIX truncate(path, length). Request: u64 length LE + path bytes (path is the remainder of the request — no length prefix; mirrors sys_chdir's path convention). Same semantics as sys_ftruncate but takes a path; resolves symlinks (40 hops then -EINVAL today; -ELOOP once #69 lands). Errnos add -ENOENT for missing paths and -EISDIR when the resolved path is a directory; -EINVAL for empty path, missing length, or length > i64::MAX. Issue #87."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"

@@ -10274,3 +10274,202 @@ fn idb_put_rejects_hostile_key_len_without_aborting_kernel() {
         -(abi::EINVAL as i64)
     );
 }
+// ── ftruncate / truncate (issue #87) ──────────────────────────────
+
+fn ftruncate_req(fd: i64, length: u64) -> Vec<u8> {
+    let mut req = (fd as u32).to_le_bytes().to_vec();
+    req.extend_from_slice(&length.to_le_bytes());
+    req
+}
+
+fn truncate_path_req(length: u64, path: &[u8]) -> Vec<u8> {
+    let mut req = length.to_le_bytes().to_vec();
+    req.extend_from_slice(path);
+    req
+}
+
+fn read_fd_to_end(fd: i64, cap: usize) -> Vec<u8> {
+    let mut out = vec![0u8; cap];
+    let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut out);
+    assert!(n >= 0, "read returned errno {n}");
+    out.truncate(n as usize);
+    out
+}
+
+#[test]
+fn ftruncate_shrinks_and_extends_with_zero_fill() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    // Seed a writable file with known content.
+    let path: &[u8] = b"/ftrunc-resize";
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_WRITE | O_CREAT, path),
+        &mut [],
+    );
+    assert!(fd >= 0, "open failed: {fd}");
+    let mut write_req = (fd as u32).to_le_bytes().to_vec();
+    write_req.extend_from_slice(b"abcdefghij"); // 10 bytes
+    assert_eq!(dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []), 10);
+
+    // Shrink to 4 bytes.
+    assert_eq!(
+        dispatch(METHOD_SYS_FTRUNCATE, 1, &ftruncate_req(fd, 4), &mut []),
+        0,
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &(fd as u32).to_le_bytes(), &mut []),
+        0,
+    );
+    let rfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, path), &mut []);
+    assert!(rfd >= 0);
+    assert_eq!(read_fd_to_end(rfd, 32), b"abcd".to_vec());
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &(rfd as u32).to_le_bytes(), &mut []),
+        0,
+    );
+
+    // Extend back to 8 bytes — last 4 bytes must be zero-filled.
+    let wfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(O_WRITE, path), &mut []);
+    assert!(wfd >= 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_FTRUNCATE, 1, &ftruncate_req(wfd, 8), &mut []),
+        0,
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &(wfd as u32).to_le_bytes(), &mut []),
+        0,
+    );
+    let rfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, path), &mut []);
+    assert!(rfd >= 0);
+    assert_eq!(read_fd_to_end(rfd, 32), b"abcd\0\0\0\0".to_vec());
+}
+
+#[test]
+fn ftruncate_rejects_non_regular_and_readonly_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    // Read-only fd → -EBADF (POSIX: ftruncate requires writable).
+    let path: &[u8] = b"/ftrunc-ro";
+    let wfd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_WRITE | O_CREAT, path),
+        &mut [],
+    );
+    assert!(wfd >= 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &(wfd as u32).to_le_bytes(), &mut []),
+        0,
+    );
+    let rfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, path), &mut []);
+    assert!(rfd >= 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_FTRUNCATE, 1, &ftruncate_req(rfd, 0), &mut []),
+        -(abi::EBADF as i64),
+    );
+
+    // Pipe fd → -EINVAL (Linux ftruncate on non-regular fd).
+    let mut pipe_resp = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_resp), 8);
+    let read_end = i64::from(u32::from_le_bytes(pipe_resp[0..4].try_into().unwrap()));
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FTRUNCATE,
+            1,
+            &ftruncate_req(read_end, 0),
+            &mut [],
+        ),
+        -(abi::EINVAL as i64),
+    );
+
+    // Unknown fd → -EBADF.
+    assert_eq!(
+        dispatch(METHOD_SYS_FTRUNCATE, 1, &ftruncate_req(999, 0), &mut []),
+        -(abi::EBADF as i64),
+    );
+
+    // Negative-when-signed length → -EINVAL.
+    let wfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(O_WRITE, path), &mut []);
+    assert!(wfd >= 0);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FTRUNCATE,
+            1,
+            &ftruncate_req(wfd, (i64::MAX as u64) + 1),
+            &mut [],
+        ),
+        -(abi::EINVAL as i64),
+    );
+
+    // Short request → -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_FTRUNCATE, 1, &[0u8; 4], &mut []),
+        -(abi::EINVAL as i64),
+    );
+}
+
+#[test]
+fn truncate_path_form_handles_missing_and_directories() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    // Existing file: shrink via path form.
+    let path: &[u8] = b"/trunc-path";
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_WRITE | O_CREAT, path),
+        &mut [],
+    );
+    assert!(fd >= 0);
+    let mut write_req = (fd as u32).to_le_bytes().to_vec();
+    write_req.extend_from_slice(b"hello world"); // 11 bytes
+    assert_eq!(dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []), 11);
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &(fd as u32).to_le_bytes(), &mut []),
+        0,
+    );
+
+    assert_eq!(
+        dispatch(METHOD_SYS_TRUNCATE, 1, &truncate_path_req(5, path), &mut []),
+        0,
+    );
+    let rfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, path), &mut []);
+    assert!(rfd >= 0);
+    assert_eq!(read_fd_to_end(rfd, 16), b"hello".to_vec());
+
+    // Missing path → -ENOENT.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_TRUNCATE,
+            1,
+            &truncate_path_req(0, b"/no/such/file"),
+            &mut [],
+        ),
+        -(abi::ENOENT as i64),
+    );
+
+    // Directory → -EISDIR. mkdir takes the path as the whole request.
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/trunc-dir", &mut []), 0,);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_TRUNCATE,
+            1,
+            &truncate_path_req(0, b"/trunc-dir"),
+            &mut [],
+        ),
+        -(abi::EISDIR as i64),
+    );
+
+    // Empty path → -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_TRUNCATE, 1, &truncate_path_req(0, b""), &mut []),
+        -(abi::EINVAL as i64),
+    );
+    // Missing length (short request) → -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_TRUNCATE, 1, &[0u8; 4], &mut []),
+        -(abi::EINVAL as i64),
+    );
+}
