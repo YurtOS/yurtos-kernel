@@ -2119,6 +2119,139 @@ class CachedProcessEngine {
     if (typeof argv === "number") return argv;
     return { pid, argv };
   }
+
+  // ── Multi-process spawn pump ──────────────────────────────────────────────
+
+  /**
+   * Drain one pending spawn from the kernel queue.  Mirrors the
+   * `KernelHostInterface.drainPendingSpawn()` helper exactly but operates
+   * directly on the raw `KernelInstance` so the engine can call it without
+   * going through the public host-interface wrapper.
+   */
+  private drainOnePendingSpawn(kernel: KernelInstance): PendingSpawn | null {
+    const cap = kernel.scratchLen;
+    const { rc, response } = kernel.drainPendingSpawnRaw();
+    const n = Number(rc);
+    if (n === -ENOENT) return null;
+    if (n < 0) throw new Error(`kernel_drain_spawn failed: rc=${rc}`);
+    if (n > cap) {
+      throw new Error(`kernel_drain_spawn exceeded scratch capacity: ${n}`);
+    }
+    return decodePendingSpawn(response.subarray(0, n));
+  }
+
+  /**
+   * Instantiate and run a child process bound to the kernel-allocated
+   * `childPid` from a drained {@link PendingSpawn}.
+   *
+   * Mirrors the per-child semantics of the Rust `run_pending_spawns`:
+   * - Module is compiled and cached by its wasm byte-content key.
+   * - The instance is bound to `childPid` (NOT a fresh host-allocated pid).
+   * - A clean `_start` return (no proc_exit) → exit code 0.
+   * - `proc_exit(n)` trap → exit code `n`.
+   * - Any other trap → rethrow (genuine crash).
+   */
+  runCachedChild(
+    kernel: KernelInstance,
+    childPid: number,
+    wasmBytes: Uint8Array,
+    argv: Uint8Array[],
+  ): number {
+    // Cache the wasm module by its byte-content identity (same as spawn()).
+    const key = byteKey(wasmBytes);
+    if (!this.modules.has(key)) {
+      this.modules.set(
+        key,
+        new WebAssembly.Module(wasmBytes as unknown as BufferSource),
+      );
+    }
+    const module = this.modules.get(key)!;
+
+    const userMemoryRef: { memory?: WebAssembly.Memory } = {};
+    const sysImports = buildSysImports(childPid, kernel, userMemoryRef);
+    const sys_setrlimit = (
+      resource: number,
+      soft: bigint,
+      hard: bigint,
+    ): number => {
+      const req = new Uint8Array(20);
+      const v = new DataView(req.buffer);
+      v.setUint32(0, resource >>> 0, true);
+      v.setBigUint64(4, soft, true);
+      v.setBigUint64(12, hard, true);
+      return Number(
+        kernel.syscall(METHOD.SYS_SETRLIMIT, childPid, req, 0).rc,
+      );
+    };
+
+    const instance = new WebAssembly.Instance(module, {
+      env: { ...sysImports, sys_setrlimit },
+      wasi_snapshot_preview1: buildWasiShim(
+        childPid,
+        kernel,
+        argv,
+        userMemoryRef,
+      ),
+      yurt: buildUserYurtImports(
+        childPid,
+        kernel,
+        userMemoryRef,
+        1,
+        (tid) => this.runPendingThread(childPid, tid),
+        // Task 4: pass () => this.runPendingSpawns(kernel) as 6th arg once buildUserYurtImports accepts it
+      ),
+    });
+
+    const memory = instance.exports.memory instanceof WebAssembly.Memory
+      ? instance.exports.memory
+      : undefined;
+    userMemoryRef.memory = memory ?? new WebAssembly.Memory({ initial: 0 });
+
+    // Run _start; missing _start is treated as clean exit 0.
+    const start = instance.exports._start;
+    if (typeof start !== "function") return 0;
+
+    const PROC_EXIT_RE = /proc_exit\((-?\d+)\)/;
+    try {
+      (start as () => void)();
+      return 0; // clean return → exit code 0
+    } catch (e) {
+      const msg = (e as Error).message ?? String(e);
+      const m = PROC_EXIT_RE.exec(msg);
+      if (m) return Number(m[1]) | 0;
+      throw e; // genuine trap — propagate
+    }
+  }
+
+  /**
+   * Flat iterative drain loop.  Mirrors the Rust `run_pending_spawns`:
+   * while the kernel queue is non-empty, instantiate each child bound to
+   * its kernel-allocated pid, run it to completion, and record its exit.
+   *
+   * `-ESRCH` from `kernel.recordExit` is tolerated (the child's slot may
+   * have already been reaped by a concurrent waiter) — the loop continues.
+   * Any other non-zero rc from `recordExit` is a hard error.
+   *
+   * A runaway guard caps the loop at 100 000 iterations.
+   */
+  runPendingSpawns(kernel: KernelInstance): void {
+    const RUNAWAY_LIMIT = 100_000;
+    let iterations = 0;
+    while (true) {
+      if (++iterations > RUNAWAY_LIMIT) {
+        throw new Error("runPendingSpawns: runaway drain");
+      }
+      const p = this.drainOnePendingSpawn(kernel);
+      if (p === null) break;
+      const code = this.runCachedChild(kernel, p.childPid, p.wasmBytes, p.argv);
+      const rc = Number(kernel.recordExit(p.childPid, code));
+      if (rc !== 0 && rc !== -ESRCH) {
+        throw new Error(
+          `kernel_record_exit failed for pid ${p.childPid}: rc=${rc}`,
+        );
+      }
+    }
+  }
 }
 
 // ── User process ──────────────────────────────────────────────────────────
@@ -3556,6 +3689,18 @@ export class KernelHostInterface {
       throw new Error(`kernel_drain_spawn exceeded scratch capacity: ${n}`);
     }
     return decodePendingSpawn(response.subarray(0, n));
+  }
+
+  /**
+   * Drain and execute all pending child-process spawns queued by the kernel.
+   *
+   * Delegates to {@link CachedProcessEngine.runPendingSpawns} which mirrors
+   * the Rust `run_pending_spawns` per-child semantics: each child is
+   * instantiated bound to the kernel-allocated pid, run to completion, and
+   * its exit code recorded back into the kernel.
+   */
+  runPendingSpawns(): void {
+    this.processEngine.runPendingSpawns(this.kernel);
   }
 
   killProcess(pid: number, signal: number): number {
