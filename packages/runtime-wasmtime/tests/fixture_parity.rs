@@ -369,6 +369,25 @@ fn spawn_wait_fixture_reaps_child_exit_code_cross_host() {
 }
 
 #[test]
+fn spawn_badreq_host_spawn_returns_einval_for_short_buffer() {
+    // Negative test: a guest that passes a deliberately too-short buffer
+    // (10 bytes, below the 88-byte yurt_spawn_request_v1 minimum) to the
+    // raw `yurt.host_spawn` import must receive -22 (EINVAL) back — no
+    // panic, no trap. The fixture exits with `abs(rc)` so we observe the
+    // errno as the process exit code (22).
+    ensure_fixture_built("spawn-badreq-wasm");
+    let wasm_bytes = std::fs::read(fixture_wasm_path("spawn-badreq-wasm")).unwrap();
+    let mk = fresh_kernel_host_interface();
+    let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
+    let _ = user.run_start(); // proc_exit traps; that's fine
+    let exit_code = user.last_exit().unwrap_or(-1);
+    assert_eq!(
+        exit_code, 22,
+        "host_spawn must return -EINVAL(-22) for a too-short request buffer (got exit code {exit_code})"
+    );
+}
+
+#[test]
 fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     ensure_fixture_built("false-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("false-cmd-wasm")).unwrap();

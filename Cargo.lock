@@ -2360,6 +2360,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "spawn-badreq-wasm"
+version = "0.1.0"
+
+[[package]]
 name = "spawn-wait-wasm"
 version = "0.1.0"
 dependencies = [

@@ -58,6 +58,7 @@ const EBUSY: i64 = 16;
 const E2BIG: i64 = 7;
 const EIO: i64 = 5;
 const ENOSYS: i64 = 38;
+const EDEADLK: i64 = 35;
 const DEFAULT_EPOCH_DEADLINE: u64 = u64::MAX / 2;
 const FETCH_EXECUTOR_QUEUE_CAP: usize = 64;
 
@@ -2975,6 +2976,10 @@ impl KernelHostInterface {
     /// `run_pending_spawns` so the host's instance pid matches the
     /// kernel-side pid that sys_spawn allocated). Same setup as
     /// `spawn_user_process_with_args` modulo the pid source.
+    ///
+    /// Also installs `yurt.host_spawn` / `yurt.host_wait` via
+    /// `register_yurt_process_imports` so spawned children can
+    /// themselves spawn and wait for further children.
     fn instantiate_with_pid(
         &self,
         pid: u32,
@@ -3344,7 +3349,7 @@ fn drain_pending_spawn_raw(
 ) -> Result<Option<PendingSpawn>> {
     let mut buf = vec![0u8; kernel.lock().unwrap().scratch_len as usize];
     let rc = kernel.lock().unwrap().drain_spawn(&mut buf)?;
-    if rc == -2 {
+    if rc == -ENOENT {
         return Ok(None); // -ENOENT: queue empty
     }
     if rc < 0 {
@@ -3616,10 +3621,6 @@ fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
 /// drains the staged-spawn queue, which terminates at `-ENOENT`), so a
 /// generous absolute iteration bound is the equivalent safety net.
 const HOST_WAIT_MAX_DRAIN_ITERS: u32 = 100_000;
-/// POSIX `EDEADLK`. Mirrors the JS host's `EDEADLK = 35` re-entrancy
-/// guard return value (mod.ts) so a wedged wait is byte-identical
-/// across hosts.
-const EDEADLK: i64 = 35;
 
 /// Register the `yurt.host_spawn` / `yurt.host_wait` guest imports.
 ///
