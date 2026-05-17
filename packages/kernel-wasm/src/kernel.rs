@@ -2060,7 +2060,51 @@ impl Kernel {
 
 static KERNEL: LazyLock<Mutex<Kernel>> = LazyLock::new(|| Mutex::new(Kernel::new()));
 
+// M10: re-entrancy of the single `KERNEL` mutex is convention, not
+// structure — a blocking `kh_*` call made from inside a `with_kernel`
+// closure re-enters `with_kernel` and deadlocks `std::sync::Mutex`
+// (non-reentrant) in release builds, silently. In debug/test builds
+// surface it loudly instead. Zero-cost in release.
+#[cfg(debug_assertions)]
+thread_local! {
+    static IN_WITH_KERNEL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+struct ReentrancyGuard;
+
+#[cfg(debug_assertions)]
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        IN_WITH_KERNEL.with(|f| f.set(false));
+    }
+}
+
+/// Mark this thread as inside `with_kernel`, panicking if it already
+/// is. The returned guard clears the flag on drop (including during
+/// unwind), so a panic inside the closure cannot wedge the flag.
+#[cfg(debug_assertions)]
+fn enter_with_kernel() -> ReentrancyGuard {
+    IN_WITH_KERNEL.with(|f| {
+        assert!(
+            !f.get(),
+            "re-entrant with_kernel: a blocking kh_* call inside a \
+             with_kernel closure re-enters the single KERNEL mutex \
+             and deadlocks in release builds (M10). Read kernel state \
+             into locals, drop the guard, then call kh_* outside the \
+             closure."
+        );
+        f.set(true);
+    });
+    ReentrancyGuard
+}
+
 pub fn with_kernel<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
+    // M10 debug guard runs before the M9 lock so a re-entrant
+    // `with_kernel` is caught (panics in debug) before it tries to
+    // re-lock the same mutex and self-deadlock in release.
+    #[cfg(debug_assertions)]
+    let _reentry = enter_with_kernel();
     // M9: a poisoned KERNEL mutex means a prior holder panicked
     // mid-mutation, so the kernel state may be inconsistent.
     // Continuing on corrupt state is a correctness/security hazard —
@@ -2151,6 +2195,19 @@ mod tests {
         assert_eq!(cwd.path, b"/");
         assert_eq!(cwd.mount_id, crate::vfs::ROOT_MOUNT);
         assert_eq!(cwd.dir_inode, None);
+    }
+
+    // M10: a nested with_kernel (the deadlock shape) must panic
+    // loudly in debug/test rather than silently wedge. Exercises the
+    // guard directly so it never touches the KERNEL mutex (no poison
+    // risk to sibling tests); `_outer` clears the flag on unwind.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "re-entrant with_kernel")]
+    fn reentrant_with_kernel_panics_in_debug() {
+        let _g = TestGuard::acquire();
+        let _outer = enter_with_kernel();
+        let _inner = enter_with_kernel();
     }
 
     #[test]
