@@ -976,6 +976,153 @@ pub(super) fn sys_flock(caller_pid: u32, request: &[u8]) -> i64 {
     })
 }
 
+// ── statvfs(2) / fstatvfs(2) — issue #94 ────────────────────────────
+
+/// On-wire `yurt_statvfs_result_v1` — 64 bytes, all little-endian.
+///
+/// Field layout (matches the POSIX `struct statvfs`):
+///
+/// | Offset | Width | Field |
+/// |---|---|---|
+/// | 0  | u32 | f_bsize    — preferred block size |
+/// | 4  | u32 | f_frsize   — fragment size |
+/// | 8  | u64 | f_blocks   — total blocks in filesystem (units of f_frsize) |
+/// | 16 | u64 | f_bfree    — total free blocks |
+/// | 24 | u64 | f_bavail   — free blocks available to non-privileged users |
+/// | 32 | u64 | f_files    — total inodes |
+/// | 40 | u64 | f_ffree    — free inodes |
+/// | 48 | u64 | f_favail   — free inodes available to non-privileged users |
+/// | 56 | u32 | f_flag     — ST_RDONLY=1, ST_NOSUID=2 (Linux-shaped subset) |
+/// | 60 | u32 | f_namemax  — maximum filename length |
+const STATVFS_RECORD_SIZE: usize = 64;
+
+const ST_RDONLY: u32 = 1;
+/// Logical capacity reported per mount until per-mount accounting lands.
+/// 1 GiB / 4 KiB blocks = 262144 blocks. `df` computes both used and
+/// free from these, so the absolute numbers don't matter to callers as
+/// long as they're non-zero and bfree < blocks (the issue's
+/// "never-all-zero" requirement). Real per-mount accounting is a
+/// follow-up; `f_bavail < f_bfree` is left equal here because the
+/// kernel has no notion of reserved-for-root.
+const STATVFS_LOGICAL_BSIZE: u32 = 4096;
+const STATVFS_LOGICAL_BLOCKS: u64 = 262_144; // 1 GiB
+const STATVFS_LOGICAL_BFREE: u64 = 196_608; // ~75% free
+const STATVFS_LOGICAL_FILES: u64 = 1_000_000;
+const STATVFS_LOGICAL_FFREE: u64 = 950_000;
+const STATVFS_NAMEMAX: u32 = 255;
+
+/// Write a `yurt_statvfs_result_v1` for the mount that owns `path` (or
+/// the current cwd's mount if path is empty). Read-only backends get
+/// `ST_RDONLY` in `f_flag`; everyone else gets 0.
+///
+/// Synthesized values per the issue's "plausible non-zero" requirement:
+/// 1 GiB logical capacity, ~75% free, 1M logical inodes. Real per-mount
+/// accounting (walk inode pool, sum file sizes) is a follow-up.
+fn write_statvfs_record(k: &mut Kernel, path: &[u8], response: &mut [u8]) -> i64 {
+    debug_assert!(
+        response.len() >= STATVFS_RECORD_SIZE,
+        "write_statvfs_record needs a >={STATVFS_RECORD_SIZE}-byte response; callers must guard"
+    );
+    // Probe the mount to detect read-only-ness via a write-bit open.
+    // EROFS or any "create not allowed" → mark ST_RDONLY. The probe
+    // doesn't actually create anything because the path is expected
+    // to already exist (resolved before this is called).
+    let f_flag = if k.vfs.open(path, 0).is_some() {
+        // Try opening with the write bit to see if the backend
+        // refuses; on ramfs this succeeds, on tar/proc/dev it
+        // returns the read-only errno. Don't surface that errno —
+        // just use it to detect RO.
+        if k.vfs.open_result(path, 1 /* writable */).is_err() {
+            ST_RDONLY
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    response[0..4].copy_from_slice(&STATVFS_LOGICAL_BSIZE.to_le_bytes());
+    response[4..8].copy_from_slice(&STATVFS_LOGICAL_BSIZE.to_le_bytes());
+    response[8..16].copy_from_slice(&STATVFS_LOGICAL_BLOCKS.to_le_bytes());
+    response[16..24].copy_from_slice(&STATVFS_LOGICAL_BFREE.to_le_bytes());
+    response[24..32].copy_from_slice(&STATVFS_LOGICAL_BFREE.to_le_bytes());
+    response[32..40].copy_from_slice(&STATVFS_LOGICAL_FILES.to_le_bytes());
+    response[40..48].copy_from_slice(&STATVFS_LOGICAL_FFREE.to_le_bytes());
+    response[48..56].copy_from_slice(&STATVFS_LOGICAL_FFREE.to_le_bytes());
+    response[56..60].copy_from_slice(&f_flag.to_le_bytes());
+    response[60..64].copy_from_slice(&STATVFS_NAMEMAX.to_le_bytes());
+    STATVFS_RECORD_SIZE as i64
+}
+
+/// `sys_statvfs(path) -> yurt_statvfs_result_v1`. Request: path bytes
+/// (mirrors sys_stat). Response: 64-byte fixed_out record. Resolves
+/// symlinks and reports the mount that owns the resolved path.
+/// Errnos: -EINVAL (empty path, short response), -ENOENT (missing),
+/// -ELOOP (#69 from follow_symlinks). Issue #94.
+pub(super) fn sys_statvfs(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    if response.len() < STATVFS_RECORD_SIZE {
+        return STATVFS_RECORD_SIZE as i64; // required-size convention
+    }
+    with_kernel(|k| {
+        let path = match normalize_readable_path(k, caller_pid, request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        let resolved = match follow_symlinks(k, caller_pid, path) {
+            Ok(p) => p,
+            Err(errno) => return -(errno as i64),
+        };
+        if k.vfs.entry_type(&resolved) == 0 {
+            return -(abi::ENOENT as i64);
+        }
+        write_statvfs_record(k, &resolved, response)
+    })
+}
+
+/// `sys_fstatvfs(fd) -> yurt_statvfs_result_v1`. Request: u32 fd LE.
+/// Response: 64-byte fixed_out record. Reports the mount that owns the
+/// fd's underlying inode. Errnos: -EBADF (unknown / unsupported fd
+/// type), -EINVAL (short request / short response). Issue #94.
+pub(super) fn sys_fstatvfs(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() != 4 {
+        return -(abi::EINVAL as i64);
+    }
+    if response.len() < STATVFS_RECORD_SIZE {
+        return STATVFS_RECORD_SIZE as i64;
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    with_kernel(|k| {
+        // Resolve the fd to a path for write_statvfs_record's RO probe.
+        // File fds: look up the OFD's mount + inode → reverse to a path
+        // is non-trivial; instead use Directory fds (which store the
+        // path) or stat the file via the OFD path implicit in the
+        // ramfs. Simplest correct: pull the path from the FdEntry.
+        let path: Vec<u8> = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(crate::kernel::FdEntry::Directory { path }) => path.clone(),
+            Some(crate::kernel::FdEntry::File { ofd_id }) => {
+                let ofd_id = *ofd_id;
+                let Some(ofd) = k.ofd(ofd_id) else {
+                    return -(abi::EBADF as i64);
+                };
+                // RamfsBackend tracks (path → inode) so the inode
+                // alone doesn't carry the path back. The cheapest
+                // proxy: use "/" — every mount answers, just with
+                // whatever the root reports. A reverse-lookup VFS
+                // API is the proper fix; this matches the f_flag
+                // probe's fallback when path-from-fd isn't recoverable.
+                let _ = ofd; // suppress dead-code on the proxy path.
+                b"/".to_vec()
+            }
+            Some(_) => return -(abi::EBADF as i64),
+            None => return -(abi::EBADF as i64),
+        };
+        write_statvfs_record(k, &path, response)
+    })
+}
+
 // ── access(2) / faccessat(2) — issue #86 ────────────────────────────
 
 /// `mode` bits (POSIX): F_OK=0 (existence only), X_OK=1, W_OK=2, R_OK=4.
@@ -1119,10 +1266,7 @@ fn access_check(k: &mut Kernel, caller_pid: u32, raw_path: &[u8], mode: u32, fla
     } else {
         // follow_symlinks returns positive i32 errno post #144 —
         // negate-and-widen at the boundary, matching sys_open /
-        // stat_path. (Bug fix: this site was authored against the
-        // pre-#144 Result<_, i64> convention; #86 and #144 merged
-        // in quick succession and the integration didn't catch it
-        // before guest-compat CI completed.)
+        // stat_path.
         match follow_symlinks(k, caller_pid, path) {
             Ok(p) => p,
             Err(errno) => return -(errno as i64),

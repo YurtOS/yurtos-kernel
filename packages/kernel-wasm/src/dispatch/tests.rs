@@ -10935,3 +10935,134 @@ fn flock_rejects_bad_operations_and_non_file_fds() {
         0,
     );
 }
+
+// ── statvfs / fstatvfs (issue #94) ─────────────────────────────────
+
+const STATVFS_SIZE: usize = 64;
+
+fn parse_statvfs(buf: &[u8]) -> (u32, u32, u64, u64, u64, u64, u64, u64, u32, u32) {
+    assert_eq!(buf.len(), STATVFS_SIZE);
+    let u32_at = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().unwrap());
+    let u64_at = |i: usize| u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+    (
+        u32_at(0),
+        u32_at(4),
+        u64_at(8),
+        u64_at(16),
+        u64_at(24),
+        u64_at(32),
+        u64_at(40),
+        u64_at(48),
+        u32_at(56),
+        u32_at(60),
+    )
+}
+
+#[test]
+fn statvfs_path_form_reports_plausible_non_zero_values() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let path: &[u8] = b"/statvfs-target";
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, path),
+            &mut [],
+        ) >= 0,
+    );
+    let mut buf = [0u8; STATVFS_SIZE];
+    assert_eq!(
+        dispatch(METHOD_SYS_STATVFS, 1, path, &mut buf),
+        STATVFS_SIZE as i64,
+    );
+    let (bsize, frsize, blocks, bfree, bavail, files, ffree, favail, flag, namemax) =
+        parse_statvfs(&buf);
+    assert!(bsize > 0 && frsize > 0);
+    assert!(blocks > 0);
+    assert!(bfree > 0 && bfree < blocks);
+    assert_eq!(bavail, bfree);
+    assert!(files > 0 && ffree > 0 && ffree <= files);
+    assert_eq!(favail, ffree);
+    assert_eq!(namemax, 255);
+    assert_eq!(flag & 1, 0);
+}
+
+#[test]
+fn statvfs_short_response_returns_required_size() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let path: &[u8] = b"/statvfs-small";
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, path),
+            &mut [],
+        ) >= 0,
+    );
+    let mut small = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STATVFS, 1, path, &mut small),
+        STATVFS_SIZE as i64,
+    );
+}
+
+#[test]
+fn statvfs_missing_path_returns_enoent() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut buf = [0u8; STATVFS_SIZE];
+    assert_eq!(
+        dispatch(METHOD_SYS_STATVFS, 1, b"/no/such/file", &mut buf),
+        -(abi::ENOENT as i64),
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_STATVFS, 1, b"", &mut buf),
+        -(abi::EINVAL as i64),
+    );
+}
+
+#[test]
+fn fstatvfs_fd_form_reports_plausible_values_and_gates_bad_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let path: &[u8] = b"/fstatvfs-target";
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_WRITE | O_CREAT, path),
+        &mut [],
+    );
+    assert!(fd >= 0);
+    let mut buf = [0u8; STATVFS_SIZE];
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATVFS, 1, &(fd as u32).to_le_bytes(), &mut buf),
+        STATVFS_SIZE as i64,
+    );
+    let (bsize, _, blocks, bfree, ..) = parse_statvfs(&buf);
+    assert_eq!(bsize, 4096);
+    assert!(blocks > 0 && bfree > 0);
+    let dir_fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(O_DIRECTORY, b"/"), &mut []);
+    assert!(dir_fd >= 0);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATVFS,
+            1,
+            &(dir_fd as u32).to_le_bytes(),
+            &mut buf,
+        ),
+        STATVFS_SIZE as i64,
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATVFS, 1, &999_u32.to_le_bytes(), &mut buf),
+        -(abi::EBADF as i64),
+    );
+    let mut pipe_resp = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_resp), 8);
+    let read_fd = u32::from_le_bytes(pipe_resp[0..4].try_into().unwrap());
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATVFS, 1, &read_fd.to_le_bytes(), &mut buf),
+        -(abi::EBADF as i64),
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATVFS, 1, &[0u8; 2], &mut buf),
+        -(abi::EINVAL as i64),
+    );
+}

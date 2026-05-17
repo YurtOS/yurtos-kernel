@@ -676,6 +676,16 @@ id = 0x1_00AB
 kind = "syscall"
 doc = "POSIX faccessat(dirfd, path, mode, flag). Request: u32 dirfd LE + u32 mode LE + u32 flag LE + path bytes (path runs to end-of-request; mirrors sys_openat). dirfd: AT_FDCWD (u32::MAX) or a directory fd from sys_open(O_DIRECTORY). flag: AT_SYMLINK_NOFOLLOW (0x100) — don't follow the terminal symlink; AT_EACCESS (0x200) — use the caller's effective uid/gid instead of real. mode/errno semantics match sys_access. Additional errnos: -EBADF for unknown dirfd, -ENOTDIR for a non-directory dirfd. Issue #86."
 
+[method.sys_statvfs]
+id = 0x1_00AC
+kind = "syscall"
+doc = "POSIX statvfs(path). Request: path bytes (mirrors sys_stat). Response: 64-byte yurt_statvfs_result_v1 — u32 f_bsize LE | u32 f_frsize LE | u64 f_blocks LE | u64 f_bfree LE | u64 f_bavail LE | u64 f_files LE | u64 f_ffree LE | u64 f_favail LE | u32 f_flag LE | u32 f_namemax LE. f_flag: ST_RDONLY=1 (read-only backend), ST_NOSUID=2 reserved. Reports a 1 GiB / ~75% free logical capacity per mount until per-mount accounting lands (issue #94 follow-up); 'never all-zero' so df / installers see plausible numbers. Resolves symlinks; -ENOENT if missing, -ELOOP on symlink hop overflow. Issue #94."
+
+[method.sys_fstatvfs]
+id = 0x1_00AD
+kind = "syscall"
+doc = "POSIX fstatvfs(fd). Request: u32 fd LE. Response: 64-byte yurt_statvfs_result_v1 (same layout as sys_statvfs). Reports the mount that owns the fd's underlying inode. Directory fds use their stored path for the read-only probe; file fds fall back to '/' until a reverse path-from-inode API lands (follow-up; ramfs root mount in practice covers the common case). -EBADF for unknown / non-file/dir fd, -EINVAL for short request. Issue #94."
+
 [method.sys_flock]
 id = 0x1_00AE
 kind = "syscall"

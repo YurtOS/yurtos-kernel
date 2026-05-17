@@ -24,8 +24,8 @@ mod thread;
 use fs::{
     chdir, chmod, chown, fchdir, fchown, getcwd, hard_link, lstat_path, mkdir, readdir, readlink,
     realpath, rename, rmdir, stat_path, symlink, sys_access, sys_faccessat, sys_fdatasync,
-    sys_flock, sys_fsync, sys_ftruncate, sys_open, sys_openat, sys_sync, sys_syncfs, sys_truncate,
-    unlink, utimens,
+    sys_flock, sys_fstatvfs, sys_fsync, sys_ftruncate, sys_open, sys_openat, sys_statvfs, sys_sync,
+    sys_syncfs, sys_truncate, unlink, utimens,
 };
 use process::{
     close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
@@ -206,6 +206,8 @@ pub fn dispatch_with_context(
         METHOD_SYS_ACCESS => sys_access(caller_pid, request),
         METHOD_SYS_FACCESSAT => sys_faccessat(caller_pid, request),
         METHOD_SYS_FLOCK => sys_flock(caller_pid, request),
+        METHOD_SYS_STATVFS => sys_statvfs(caller_pid, request, response),
+        METHOD_SYS_FSTATVFS => sys_fstatvfs(caller_pid, request, response),
         METHOD_SYS_LSEEK => lseek(caller_pid, request, response),
         METHOD_SYS_FSTAT => fstat(caller_pid, request, response),
         METHOD_SYS_CHMOD => chmod(caller_pid, request),
