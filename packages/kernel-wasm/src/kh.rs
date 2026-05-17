@@ -106,6 +106,19 @@ unsafe fn kh_now_realtime(out_ptr: *mut u64) -> i32 {
 
 #[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_random(out_ptr: *mut u8, len: usize) -> i32 {
+    #[cfg(test)]
+    if let Some(result) = test_support::pop_random_result() {
+        return match result {
+            Ok(()) => {
+                if len > 0 {
+                    std::slice::from_raw_parts_mut(out_ptr, len).fill(0xA5);
+                }
+                0
+            }
+            Err(rc) => rc,
+        };
+    }
+
     // Native unit-test entropy: real OS CSPRNG via /dev/urandom (std-only,
     // no extra crate dep) so distinctness assertions are meaningful. The
     // wasm hosts supply their own platform CSPRNG (runtime-wasmtime uses
@@ -630,8 +643,21 @@ pub fn socket_peer_addr(handle: i32, out: &mut [u8]) -> i64 {
 
 #[cfg(test)]
 pub mod test_support {
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::{LazyLock, Mutex};
+
+    thread_local! {
+        static RANDOM_RESULTS: RefCell<VecDeque<Result<(), i32>>> = const { RefCell::new(VecDeque::new()) };
+    }
+
+    pub fn push_random_result(result: Result<(), i32>) {
+        RANDOM_RESULTS.with(|results| results.borrow_mut().push_back(result));
+    }
+
+    pub(super) fn pop_random_result() -> Option<Result<(), i32>> {
+        RANDOM_RESULTS.with(|results| results.borrow_mut().pop_front())
+    }
 
     #[derive(Default)]
     struct SocketMock {
@@ -1119,5 +1145,14 @@ mod tests {
     #[test]
     fn fill_random_empty_is_ok() {
         fill_random(&mut []).expect("empty fill is a no-op success");
+    }
+
+    #[test]
+    fn fill_random_preserves_host_errno() {
+        test_support::push_random_result(Err(-crate::abi::EFAULT));
+
+        let mut buf = [0u8; 8];
+
+        assert_eq!(fill_random(&mut buf), Err(-crate::abi::EFAULT));
     }
 }
