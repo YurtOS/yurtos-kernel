@@ -22,7 +22,11 @@
  */
 
 import { WASI_EBUSY } from "../../wasi/types.js";
+import { decodeSockaddrIn } from "../../host-imports/common.js";
 import { SabCondvar, SabMutex } from "./sab-primitives.js";
+
+/** Matches the main-thread import's `ERR_INVALID` (`-EINVAL`). */
+const ERR_INVALID = -22;
 
 /**
  * Sentinel thrown by the worker-side `host_thread_exit` import to unwind
@@ -258,21 +262,20 @@ export function createWorkerYurtImports(
       addrPtr: number,
       addrLen: number,
     ) => {
-      // yurt-libc passes a raw struct sockaddr_in (16 bytes):
-      // [u16 LE family][u16 BE port][4-byte IPv4][8-byte pad].
-      // Decode here so the dispatcher body keeps its host-string / port API.
-      const SOCKADDR_IN_SIZE = 16;
-      if (addrLen < SOCKADDR_IN_SIZE) return -22; // EINVAL
-      const view = new DataView(memory.buffer, addrPtr, addrLen);
-      const family = view.getUint16(0, true);
-      // WASI_AF_INET=1, RUST_STD_AF_INET=2 — match readSockaddrIn in
-      // kernel-imports.ts (main-thread path).
-      if (family !== 1 && family !== 2) return -97; // EAFNOSUPPORT
-      const port = view.getUint16(2, false);
-      const octets = new Uint8Array(memory.buffer, addrPtr + 4, 4);
-      const hostStr = `${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}`;
-      const host = new TextEncoder().encode(hostStr);
-      return call(WorkerHostOp.SocketBind, [fd, host.byteLength, port], host);
+      // yurt-libc passes a raw struct sockaddr_in. Decode via the
+      // shared helper so this path is byte-for-byte and errno-for-
+      // errno identical to the main-thread import (the drift PR #74
+      // fixed): a null ptr, short buffer, or non-AF_INET family all
+      // map to the SAME single errno (ERR_INVALID), exactly as
+      // readSockaddrIn → ERR_INVALID does on the main thread.
+      const addr = decodeSockaddrIn(memory, addrPtr, addrLen);
+      if (addr === null) return ERR_INVALID;
+      const host = new TextEncoder().encode(addr.host);
+      return call(
+        WorkerHostOp.SocketBind,
+        [fd, host.byteLength, addr.port],
+        host,
+      );
     },
     host_socket_listen: (fd: number, backlog: number) =>
       call(WorkerHostOp.SocketListen, [fd, backlog]),

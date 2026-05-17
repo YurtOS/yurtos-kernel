@@ -271,7 +271,7 @@ Deno.test(
 );
 
 Deno.test(
-  "worker-host-proxy: host_socket_bind rejects non-AF_INET family",
+  "worker-host-proxy: host_socket_bind rejects non-AF_INET / null / short with -EINVAL (main-thread parity)",
   () => {
     const memory = new WebAssembly.Memory({ initial: 1, maximum: 1 });
     const requestSab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
@@ -279,16 +279,26 @@ Deno.test(
       requestSab,
       postHostCall: () => {
         // Should never be called — proxy must reject before dispatching.
-        throw new Error("postHostCall should not run for bad family");
+        throw new Error("postHostCall should not run for a bad sockaddr");
       },
     });
-    const ADDR_PTR = 256;
-    new DataView(memory.buffer, ADDR_PTR, 16).setUint16(0, 10, true); // AF_INET6
     const bind = imports.host_socket_bind as (
       fd: number,
       addrPtr: number,
       addrLen: number,
     ) => number;
-    assertEquals(bind(5, ADDR_PTR, 16), -97); // -EAFNOSUPPORT
+
+    const ADDR_PTR = 256;
+    new DataView(memory.buffer, ADDR_PTR, 16).setUint16(0, 10, true); // AF_INET6
+    // Wrong family → -EINVAL (NOT -97/-EAFNOSUPPORT): the main-thread
+    // path returns ERR_INVALID for any unreadable sockaddr; the worker
+    // proxy must match it errno-for-errno (the drift PR #74 fixed,
+    // now resolved by construction via the shared decodeSockaddrIn).
+    assertEquals(bind(5, ADDR_PTR, 16), -22);
+    // Null pointer → -EINVAL (the shared helper's ptr===0 guard,
+    // mirroring readSockaddrIn).
+    assertEquals(bind(5, 0, 16), -22);
+    // Short buffer → -EINVAL.
+    assertEquals(bind(5, ADDR_PTR, 8), -22);
   },
 );

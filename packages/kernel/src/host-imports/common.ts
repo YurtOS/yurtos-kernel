@@ -94,3 +94,36 @@ export function writeBytes(
   new Uint8Array(memory.buffer, ptr, data.length).set(data);
   return data.length;
 }
+
+/** `struct sockaddr_in` is 16 bytes on wasm32. */
+export const SOCKADDR_IN_SIZE = 16;
+const WASI_AF_INET = 1;
+const RUST_STD_AF_INET = 2;
+
+/**
+ * Decode a guest `struct sockaddr_in` at `ptr`:
+ * `[u16 LE sin_family][u16 BE sin_port][4-byte IPv4 sin_addr][8 pad]`.
+ *
+ * Returns `null` for a null pointer, a too-short buffer, or a
+ * non-AF_INET family — the single source of truth for this layout,
+ * shared by the main-thread import (`kernel-imports.ts`) and the
+ * pthread worker proxy (`worker-host-proxy.ts`) so the two cannot
+ * drift (the bug PR #74 fixes). Callers map `null` to one errno
+ * (`-EINVAL`), keeping main/worker behavior identical by construction.
+ * Only the fixed 0..8 header bytes are read, so an over-long `len`
+ * cannot trap.
+ */
+export function decodeSockaddrIn(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+): { host: string; port: number } | null {
+  if (ptr === 0 || len < SOCKADDR_IN_SIZE) return null;
+  const view = new DataView(memory.buffer, ptr, SOCKADDR_IN_SIZE);
+  const family = view.getUint16(0, true);
+  if (family !== WASI_AF_INET && family !== RUST_STD_AF_INET) return null;
+  const port = view.getUint16(2, false);
+  const octets = new Uint8Array(memory.buffer, ptr + 4, 4);
+  const host = `${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}`;
+  return { host, port };
+}
