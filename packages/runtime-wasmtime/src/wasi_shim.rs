@@ -265,6 +265,39 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         },
     )?;
 
+    // ── fd_sync(fd) / fd_datasync(fd) — POSIX fsync / fdatasync ──────
+    // Route to METHOD_SYS_FSYNC / METHOD_SYS_FDATASYNC (issue #88) so
+    // sqlite, write-temp-then-rename atomic save, and Rust's
+    // File::sync_all see a successful no-op on the in-memory ramfs
+    // instead of -ENOSYS. Kernel-side gate: regular-file / directory
+    // fd → 0; pipe / socket → EINVAL; closed / unknown → EBADF.
+    linker.func_wrap(
+        WASI,
+        "fd_sync",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            let rc = crate::kernel_host_interface::trampoline_request(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                METHOD_FSYNC,
+                &req,
+            );
+            errno_from_kernel(rc)
+        },
+    )?;
+    linker.func_wrap(
+        WASI,
+        "fd_datasync",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            let rc = crate::kernel_host_interface::trampoline_request(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                METHOD_FDATASYNC,
+                &req,
+            );
+            errno_from_kernel(rc)
+        },
+    )?;
+
     // ── proc_exit(rval) → trap ─────────────────────────────────────
     linker.func_wrap(
         WASI,
@@ -985,7 +1018,6 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         "clock_res_get",
         "fd_advise",
         "fd_allocate",
-        "fd_datasync",
         "fd_fdstat_set_flags",
         "fd_fdstat_set_rights",
         "fd_filestat_set_size",
@@ -993,7 +1025,6 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         "fd_pread",
         "fd_pwrite",
         "fd_renumber",
-        "fd_sync",
         "fd_tell",
         "path_create_directory",
         "path_filestat_set_times",
@@ -1021,6 +1052,8 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
 const METHOD_WRITE: u32 = 0x1_0014;
 const METHOD_READ: u32 = 0x1_0013;
 const METHOD_CLOSE: u32 = 0x1_000E;
+const METHOD_FSYNC: u32 = 0x1_00A6;
+const METHOD_FDATASYNC: u32 = 0x1_00A7;
 const METHOD_CLOCK_GETTIME: u32 = 0x1_0016;
 const METHOD_OPEN: u32 = 0x1_001F;
 const METHOD_LSEEK: u32 = 0x1_0020;

@@ -252,9 +252,20 @@ extern int killpg(pid_t pgrp, int sig);
 
 /* waitpid/wait: stubbed in sys/wait.h. */
 
-/* sync / syncfs — no-op stubs: WASI has no kernel buffer cache to flush. */
+/* sync — POSIX no-op: the kernel's in-memory ramfs has no buffer
+ * cache to flush. POSIX defines sync(2) as void; nothing to validate. */
 static inline void sync(void) {}
-static inline int syncfs(int fd) { (void)fd; return 0; }
+
+/* syncfs — Linux extension. The kernel's METHOD_SYS_SYNCFS (issue #88)
+ * gates on fd validity (EBADF / EINVAL); without a real shim guests
+ * silently succeed on closed / pipe fds, so probe via fcntl(F_GETFD)
+ * to mirror the kernel's gate. Proper kernel routing via a dedicated
+ * host_syncfs import is a follow-up. */
+#include <fcntl.h>
+static inline int syncfs(int fd) {
+    if (fcntl(fd, F_GETFD) < 0) return -1;
+    return 0;
+}
 
 /* pause() — suspend until a signal is delivered; real impl in yurt_signal.c */
 int pause(void);

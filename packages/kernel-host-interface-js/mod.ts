@@ -226,6 +226,13 @@ export const METHOD = {
   SYS_SCHED_SETAFFINITY: 0x1_005D,
   SYS_FCHOWN: 0x1_005E,
   SYS_FCHDIR: 0x1_005F,
+  // Durability surface (issue #88) — ramfs-noop in the kernel; WASI
+  // fd_sync / fd_datasync route here so sqlite and atomic-save get
+  // success instead of ENOSYS.
+  SYS_FSYNC: 0x1_00A6,
+  SYS_FDATASYNC: 0x1_00A7,
+  SYS_SYNC: 0x1_00A8,
+  SYS_SYNCFS: 0x1_00A9,
 } as const;
 
 export const KERNEL_PID = 0;
