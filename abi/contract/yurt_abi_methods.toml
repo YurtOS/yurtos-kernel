@@ -491,7 +491,7 @@ doc = "Send payload bytes and optional SCM_RIGHTS fd entries on a kernel-owned A
 [method.sys_socket_recvmsg]
 id = 0x1_0049
 kind = "syscall"
-doc = "Receive payload bytes and optional SCM_RIGHTS fd entries from a kernel-owned AF_UNIX socket. Request bytes: u32 fd LE + u32 flags LE + u32 data_cap LE. Response bytes: data_cap payload area followed by u32 fd_count LE + fd_count*u32 received fd numbers. Return value is payload byte count."
+doc = "Receive payload bytes and optional SCM_RIGHTS fd entries from a kernel-owned AF_UNIX socket. Request bytes: u32 fd LE + u32 flags LE + u32 data_cap LE. Response bytes: data_cap payload area followed by u32 delivered_fd_count LE + u32 ancillary_flags LE (bit0 SCM_TRUNCATED) + delivered_fd_count*u32 received fd numbers. Return value is payload byte count."
 
 [method.sys_socket_info]
 id = 0x1_004A

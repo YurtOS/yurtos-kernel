@@ -26,7 +26,9 @@ const HAS_BUSYBOX_FIXTURE = existsSync(resolve(FIXTURES, "busybox.wasm"));
 const shellIt = HAS_BUSYBOX_FIXTURE ? it : it.skip;
 // Rust std canaries are built by `make -C abi rust-canaries rust-std-canaries`
 // which requires a custom Rust std build; only present in CI.
-const HAS_RUST_CANARIES = existsSync(resolve(FIXTURES, "socket-rust-canary.wasm"));
+const HAS_RUST_CANARIES = existsSync(
+  resolve(FIXTURES, "socket-rust-canary.wasm"),
+);
 const rustIt = HAS_RUST_CANARIES ? it : it.skip;
 // Phase 1 shared-library smoke test: gated on the side-module fixture
 // being present. The fixture is built by `make -C abi side-module-canaries`
@@ -126,7 +128,9 @@ describe("AF_UNIX (unix-canary)", () => {
     });
     const result = await sandbox.run("unix-canary --case pair_basic");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"pair_basic","exit":0,"stdout":"pair=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"pair_basic","exit":0,"stdout":"pair=ok"}',
+    );
   });
 
   it("bind_listen_accept: bind, listen, and accept on /tmp/foo.sock", async () => {
@@ -138,7 +142,9 @@ describe("AF_UNIX (unix-canary)", () => {
     });
     const result = await sandbox.run("unix-canary --case bind_listen_accept");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"bind_listen_accept","exit":0,"stdout":"bla=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"bind_listen_accept","exit":0,"stdout":"bla=ok"}',
+    );
   });
 
   it("stat_socket_inode: bind creates an S_IFSOCK inode visible to stat()", async () => {
@@ -150,7 +156,9 @@ describe("AF_UNIX (unix-canary)", () => {
     });
     const result = await sandbox.run("unix-canary --case stat_socket_inode");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"stat_socket_inode","exit":0,"stdout":"ifsock=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"stat_socket_inode","exit":0,"stdout":"ifsock=ok"}',
+    );
   });
 
   it("unlink_removes: unlink of the bound path makes subsequent connect() fail", async () => {
@@ -162,7 +170,9 @@ describe("AF_UNIX (unix-canary)", () => {
     });
     const result = await sandbox.run("unix-canary --case unlink_removes");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"unlink_removes","exit":0,"stdout":"unlink=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"unlink_removes","exit":0,"stdout":"unlink=ok"}',
+    );
   });
 
   it("connect_refused: connect to a path with no listener returns ECONNREFUSED", async () => {
@@ -174,7 +184,9 @@ describe("AF_UNIX (unix-canary)", () => {
     });
     const result = await sandbox.run("unix-canary --case connect_refused");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"connect_refused","exit":0,"stdout":"refused=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"connect_refused","exit":0,"stdout":"refused=ok"}',
+    );
   });
 
   it("abstract_bind_connect: bind/connect with a \\0-prefixed name", async () => {
@@ -182,11 +194,19 @@ describe("AF_UNIX (unix-canary)", () => {
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
-      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//], unixAbstractAllowlist: [/.*/] },
+      serverSockets: {
+        allowUnixDomain: true,
+        unixPathAllowlist: [/^\/tmp\//],
+        unixAbstractAllowlist: [/.*/],
+      },
     });
-    const result = await sandbox.run("unix-canary --case abstract_bind_connect");
+    const result = await sandbox.run(
+      "unix-canary --case abstract_bind_connect",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"abstract_bind_connect","exit":0,"stdout":"abstract=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"abstract_bind_connect","exit":0,"stdout":"abstract=ok"}',
+    );
   });
 
   it("abstract_invisible_to_stat: abstract names do not appear in the VFS", async () => {
@@ -194,11 +214,19 @@ describe("AF_UNIX (unix-canary)", () => {
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
-      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//], unixAbstractAllowlist: [/.*/] },
+      serverSockets: {
+        allowUnixDomain: true,
+        unixPathAllowlist: [/^\/tmp\//],
+        unixAbstractAllowlist: [/.*/],
+      },
     });
-    const result = await sandbox.run("unix-canary --case abstract_invisible_to_stat");
+    const result = await sandbox.run(
+      "unix-canary --case abstract_invisible_to_stat",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"abstract_invisible_to_stat","exit":0,"stdout":"invisible=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"abstract_invisible_to_stat","exit":0,"stdout":"invisible=ok"}',
+    );
   });
 
   it("dgram_pair_message_framing: socketpair SOCK_DGRAM preserves message boundaries", async () => {
@@ -208,9 +236,13 @@ describe("AF_UNIX (unix-canary)", () => {
       adapter: new NodeAdapter(),
       serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
     });
-    const result = await sandbox.run("unix-canary --case dgram_pair_message_framing");
+    const result = await sandbox.run(
+      "unix-canary --case dgram_pair_message_framing",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"dgram_pair_message_framing","exit":0,"stdout":"dgram=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"dgram_pair_message_framing","exit":0,"stdout":"dgram=ok"}',
+    );
   });
 
   it("dgram_path_sendto: sendto delivers a datagram to a bound path", async () => {
@@ -222,7 +254,9 @@ describe("AF_UNIX (unix-canary)", () => {
     });
     const result = await sandbox.run("unix-canary --case dgram_path_sendto");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"dgram_path_sendto","exit":0,"stdout":"dgram-path=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"dgram_path_sendto","exit":0,"stdout":"dgram-path=ok"}',
+    );
   });
 
   it("scm_rights_pipe_handoff: sendmsg with SCM_RIGHTS passes a pipe read end", async () => {
@@ -232,9 +266,13 @@ describe("AF_UNIX (unix-canary)", () => {
       adapter: new NodeAdapter(),
       serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
     });
-    const result = await sandbox.run("unix-canary --case scm_rights_pipe_handoff");
+    const result = await sandbox.run(
+      "unix-canary --case scm_rights_pipe_handoff",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"scm_rights_pipe_handoff","exit":0,"stdout":"scm=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"scm_rights_pipe_handoff","exit":0,"stdout":"scm=ok"}',
+    );
   });
   it("peercred_after_accept: getsockopt(SO_PEERCRED) returns the peer's ucred", async () => {
     if (!HAS_UNIX_FIXTURE) return;
@@ -243,9 +281,13 @@ describe("AF_UNIX (unix-canary)", () => {
       adapter: new NodeAdapter(),
       serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
     });
-    const result = await sandbox.run("unix-canary --case peercred_after_accept");
+    const result = await sandbox.run(
+      "unix-canary --case peercred_after_accept",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"peercred_after_accept","exit":0,"stdout":"peercred=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"peercred_after_accept","exit":0,"stdout":"peercred=ok"}',
+    );
   });
 
   it("dgram_sendto_after_unlink: sendto a dgram path after unlink must fail", async () => {
@@ -255,9 +297,13 @@ describe("AF_UNIX (unix-canary)", () => {
       adapter: new NodeAdapter(),
       serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
     });
-    const result = await sandbox.run("unix-canary --case dgram_sendto_after_unlink");
+    const result = await sandbox.run(
+      "unix-canary --case dgram_sendto_after_unlink",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"dgram_sendto_after_unlink","exit":0,"stdout":"dgram-unlink=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"dgram_sendto_after_unlink","exit":0,"stdout":"dgram-unlink=ok"}',
+    );
   });
 
   it("scm_rights_truncation: truncated SCM_RIGHTS recvmsg must set MSG_CTRUNC and surviving fd must be usable", async () => {
@@ -267,9 +313,13 @@ describe("AF_UNIX (unix-canary)", () => {
       adapter: new NodeAdapter(),
       serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
     });
-    const result = await sandbox.run("unix-canary --case scm_rights_truncation");
+    const result = await sandbox.run(
+      "unix-canary --case scm_rights_truncation",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"scm_rights_truncation","exit":0,"stdout":"scm-trunc=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"scm_rights_truncation","exit":0,"stdout":"scm-trunc=ok"}',
+    );
   });
 
   it("dgram_bind_rollback: failed dgram bind must not leak a stale dgram route", async () => {
@@ -281,7 +331,9 @@ describe("AF_UNIX (unix-canary)", () => {
     });
     const result = await sandbox.run("unix-canary --case dgram_bind_rollback");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"dgram_bind_rollback","exit":0,"stdout":"dgram-rollback=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"dgram_bind_rollback","exit":0,"stdout":"dgram-rollback=ok"}',
+    );
   });
 
   it("dgram_so_type: getsockopt(SO_TYPE) on a SOCK_DGRAM socket returns SOCK_DGRAM", async () => {
@@ -293,7 +345,9 @@ describe("AF_UNIX (unix-canary)", () => {
     });
     const result = await sandbox.run("unix-canary --case dgram_so_type");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"dgram_so_type","exit":0,"stdout":"so_type=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"dgram_so_type","exit":0,"stdout":"so_type=ok"}',
+    );
   });
 
   it("dgram_nonblocking_recv: SOCK_NONBLOCK dgram recv returns EAGAIN immediately when empty", async () => {
@@ -303,9 +357,13 @@ describe("AF_UNIX (unix-canary)", () => {
       adapter: new NodeAdapter(),
       serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
     });
-    const result = await sandbox.run("unix-canary --case dgram_nonblocking_recv");
+    const result = await sandbox.run(
+      "unix-canary --case dgram_nonblocking_recv",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"dgram_nonblocking_recv","exit":0,"stdout":"nb-recv=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"dgram_nonblocking_recv","exit":0,"stdout":"nb-recv=ok"}',
+    );
   });
 
   it("peercred_uid_gid: SO_PEERCRED reports uid=1000/gid=1000 for sandbox processes", async () => {
@@ -317,7 +375,9 @@ describe("AF_UNIX (unix-canary)", () => {
     });
     const result = await sandbox.run("unix-canary --case peercred_uid_gid");
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"peercred_uid_gid","exit":0,"stdout":"uid-gid=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"peercred_uid_gid","exit":0,"stdout":"uid-gid=ok"}',
+    );
   });
 
   it("recvmsg_ctrunc_tiny_ctrl: control buffer < CMSG_LEN(0) must not write past buffer", async () => {
@@ -327,9 +387,13 @@ describe("AF_UNIX (unix-canary)", () => {
       adapter: new NodeAdapter(),
       serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
     });
-    const result = await sandbox.run("unix-canary --case recvmsg_ctrunc_tiny_ctrl");
+    const result = await sandbox.run(
+      "unix-canary --case recvmsg_ctrunc_tiny_ctrl",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"recvmsg_ctrunc_tiny_ctrl","exit":0,"stdout":"ctrunc-tiny=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"recvmsg_ctrunc_tiny_ctrl","exit":0,"stdout":"ctrunc-tiny=ok"}',
+    );
   });
 
   it("recvmsg_ctrunc_fdloss: fd dropped into header-only ctrl buffer must set MSG_CTRUNC", async () => {
@@ -339,9 +403,13 @@ describe("AF_UNIX (unix-canary)", () => {
       adapter: new NodeAdapter(),
       serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
     });
-    const result = await sandbox.run("unix-canary --case recvmsg_ctrunc_fdloss");
+    const result = await sandbox.run(
+      "unix-canary --case recvmsg_ctrunc_fdloss",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"recvmsg_ctrunc_fdloss","exit":0,"stdout":"ctrunc-fdloss=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"recvmsg_ctrunc_fdloss","exit":0,"stdout":"ctrunc-fdloss=ok"}',
+    );
   });
 
   it("abstract_bind_policy_denied: abstract AF_UNIX bind is rejected when name is not in abstract allowlist", async () => {
@@ -350,11 +418,18 @@ describe("AF_UNIX (unix-canary)", () => {
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),
       // allowlist permits nothing matching "deny-policy"
-      serverSockets: { allowUnixDomain: true, unixAbstractAllowlist: [/^allowed-only$/] },
+      serverSockets: {
+        allowUnixDomain: true,
+        unixAbstractAllowlist: [/^allowed-only$/],
+      },
     });
-    const result = await sandbox.run("unix-canary --case abstract_bind_policy_denied");
+    const result = await sandbox.run(
+      "unix-canary --case abstract_bind_policy_denied",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"abstract_bind_policy_denied","exit":0,"stdout":"bind-denied=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"abstract_bind_policy_denied","exit":0,"stdout":"bind-denied=ok"}',
+    );
   });
 
   it("stat_after_listener_close: close() on listening socket must not unlink the socket inode", async () => {
@@ -364,9 +439,13 @@ describe("AF_UNIX (unix-canary)", () => {
       adapter: new NodeAdapter(),
       serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
     });
-    const result = await sandbox.run("unix-canary --case stat_after_listener_close");
+    const result = await sandbox.run(
+      "unix-canary --case stat_after_listener_close",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"stat_after_listener_close","exit":0,"stdout":"inode-persists=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"stat_after_listener_close","exit":0,"stdout":"inode-persists=ok"}',
+    );
   });
 
   it("listen_dgram_eopnotsupp: listen() on SOCK_DGRAM returns EOPNOTSUPP", async () => {
@@ -376,13 +455,20 @@ describe("AF_UNIX (unix-canary)", () => {
       adapter: new NodeAdapter(),
       serverSockets: { allowUnixDomain: true },
     });
-    const result = await sandbox.run("unix-canary --case listen_dgram_eopnotsupp");
+    const result = await sandbox.run(
+      "unix-canary --case listen_dgram_eopnotsupp",
+    );
     expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toContain('{"case":"listen_dgram_eopnotsupp","exit":0,"stdout":"eopnotsupp=ok"}');
+    expect(result.stdout.trim()).toContain(
+      '{"case":"listen_dgram_eopnotsupp","exit":0,"stdout":"eopnotsupp=ok"}',
+    );
   });
 });
 
-describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }, () => {
+describe("Kernel ABI canaries", {
+  sanitizeOps: false,
+  sanitizeResources: false,
+}, () => {
   let sandbox: Sandbox | null = null;
 
   afterEach(() => {
@@ -1154,59 +1240,71 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe('{"case":"socket_surface","exit":0}');
   });
 
-  rustIt("runs Rust std::env::temp_dir through the Yurt std patch", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+  rustIt(
+    "runs Rust std::env::temp_dir through the Yurt std patch",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
 
-    const result = await sandbox.run("std-tempdir-canary");
+      const result = await sandbox.run("std-tempdir-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("/tmp");
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("/tmp");
+    },
+  );
 
-  rustIt("runs Rust std env/process helpers through the Yurt std patch", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+  rustIt(
+    "runs Rust std env/process helpers through the Yurt std patch",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
 
-    const result = await sandbox.run("std-env-process-canary");
+      const result = await sandbox.run("std-env-process-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("home=/home/yurt");
-    expect(result.stdout).toContain("exe=");
-    expect(result.stdout).toContain("pid=1");
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("home=/home/yurt");
+      expect(result.stdout).toContain("exe=");
+      expect(result.stdout).toContain("pid=1");
+    },
+  );
 
-  rustIt("runs Rust std path list helpers through the Yurt std patch", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+  rustIt(
+    "runs Rust std path list helpers through the Yurt std patch",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
 
-    const result = await sandbox.run("std-paths-canary");
+      const result = await sandbox.run("std-paths-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe(
-      "split=/bin:/usr/bin\njoined=/bin:/usr/bin\ninvalid=true",
-    );
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        "split=/bin:/usr/bin\njoined=/bin:/usr/bin\ninvalid=true",
+      );
+    },
+  );
 
-  rustIt("runs Rust std filesystem helpers through the Yurt std patch", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+  rustIt(
+    "runs Rust std filesystem helpers through the Yurt std patch",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
 
-    const result = await sandbox.run("std-fs-canary");
+      const result = await sandbox.run("std-fs-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("canonical=");
-    expect(result.stdout).toContain("yurt-std-fs-canary.txt");
-    expect(result.stdout).toContain("contents=yurt");
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("canonical=");
+      expect(result.stdout).toContain("yurt-std-fs-canary.txt");
+      expect(result.stdout).toContain("contents=yurt");
+    },
+  );
 
   rustIt("runs Rust std file locks with real conflict behavior", async () => {
     sandbox = await Sandbox.create({
@@ -1220,61 +1318,73 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout.trim()).toBe("exclusive-blocks=true");
   });
 
-  rustIt("runs Rust std thread spawn/join through the Yurt std patch", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+  rustIt(
+    "runs Rust std thread spawn/join through the Yurt std patch",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
 
-    const result = await sandbox.run("std-thread-canary");
+      const result = await sandbox.run("std-thread-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toMatch(
-      /^parallelism=\d+ joined=42 scoped=6$/,
-    );
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toMatch(
+        /^parallelism=\d+ joined=42 scoped=6$/,
+      );
+    },
+  );
 
-  rustIt("runs Rust std::process::Command status through libyurt spawn/wait", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+  rustIt(
+    "runs Rust std::process::Command status through libyurt spawn/wait",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
 
-    const result = await sandbox.run("std-process-status-canary");
+      const result = await sandbox.run("std-process-status-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe(
-      "true success=true code=Some(0)\nfalse success=false code=Some(1)",
-    );
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        "true success=true code=Some(0)\nfalse success=false code=Some(1)",
+      );
+    },
+  );
 
-  rustIt("runs Rust std::process::Command output through libyurt pipes", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+  rustIt(
+    "runs Rust std::process::Command output through libyurt pipes",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
 
-    const result = await sandbox.run("std-process-output-canary");
+      const result = await sandbox.run("std-process-output-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe(
-      'status=Some(0) stdout="hello-rust" stderr=""',
-    );
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        'status=Some(0) stdout="hello-rust" stderr=""',
+      );
+    },
+  );
 
-  rustIt("runs Rust std::process::Command env and cwd through libyurt spawn", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+  rustIt(
+    "runs Rust std::process::Command env and cwd through libyurt spawn",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
 
-    const result = await sandbox.run("std-process-env-cwd-canary");
+      const result = await sandbox.run("std-process-env-cwd-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain("env-status=Some(0)");
-    expect(result.stdout).toContain("cwd-status=Some(0)");
-    expect(result.stdout).toContain('cwd-stdout="marker.txt\\n"');
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain("env-status=Some(0)");
+      expect(result.stdout).toContain("cwd-status=Some(0)");
+      expect(result.stdout).toContain('cwd-stdout="marker.txt\\n"');
+    },
+  );
 
   rustIt("runs Rust std::process::Command spawn with piped stdio", async () => {
     sandbox = await Sandbox.create({
@@ -1304,437 +1414,476 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     );
   });
 
-  rustIt("routes Rust std::process::Stdio from a child stdout pipe", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+  rustIt(
+    "routes Rust std::process::Stdio from a child stdout pipe",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
 
-    const result = await sandbox.run("std-process-stdio-from-canary");
+      const result = await sandbox.run("std-process-stdio-from-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe(
-      'status=Some(0) stdout="from-child-stdout"',
-    );
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe(
+        'status=Some(0) stdout="from-child-stdout"',
+      );
+    },
+  );
 
-  rustIt("routes Rust std::net::TcpStream connect through libyurt sockets", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-    });
+  rustIt(
+    "routes Rust std::net::TcpStream connect through libyurt sockets",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+      });
 
-    const result = await sandbox.run("std-net-connect-canary");
+      const result = await sandbox.run("std-net-connect-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("kind=ConnectionRefused");
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("kind=ConnectionRefused");
+    },
+  );
 
-  rustIt("routes Rust std::net::TcpStream read/write through socket fd I/O", async () => {
-    const handle: SocketHandle = 101;
-    const requests: Record<string, unknown>[] = [];
-    let socketBackend: SocketBackend;
-    socketBackend = {
-      connect(req) {
-        requests.push({ op: "connect", ...req });
-        return { ok: true, socket: handle };
-      },
-      send(socket, data) {
-        requests.push({ op: "send", socket, data: Array.from(data) });
-        return { ok: true, bytes_sent: 4 };
-      },
-      recv(socket, maxBytes) {
-        requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data: encode("pong") };
-      },
-      close(socket) {
-        requests.push({ op: "close", socket });
-        return { ok: true };
-      },
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
-      recvAsync: (socket, maxBytes) =>
-        Promise.resolve(socketBackend.recv(socket, maxBytes)),
-    };
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      socketBackend,
-    });
+  rustIt(
+    "routes Rust std::net::TcpStream read/write through socket fd I/O",
+    async () => {
+      const handle: SocketHandle = 101;
+      const requests: Record<string, unknown>[] = [];
+      let socketBackend: SocketBackend;
+      socketBackend = {
+        connect(req) {
+          requests.push({ op: "connect", ...req });
+          return { ok: true, socket: handle };
+        },
+        send(socket, data) {
+          requests.push({ op: "send", socket, data: Array.from(data) });
+          return { ok: true, bytes_sent: 4 };
+        },
+        recv(socket, maxBytes) {
+          requests.push({ op: "recv", socket, max_bytes: maxBytes });
+          return { ok: true, data: encode("pong") };
+        },
+        close(socket) {
+          requests.push({ op: "close", socket });
+          return { ok: true };
+        },
+        acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+        recvAsync: (socket, maxBytes) =>
+          Promise.resolve(socketBackend.recv(socket, maxBytes)),
+      };
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        socketBackend,
+      });
 
-    const result = await sandbox.run("std-net-stream-canary");
+      const result = await sandbox.run("std-net-stream-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("reply=pong");
-    expect(requests).toContainEqual({
-      op: "connect",
-      host: "127.0.0.1",
-      port: 9,
-      tls: false,
-    });
-    expect(requests).toContainEqual({
-      op: "send",
-      socket: handle,
-      data: Array.from(encode("ping")),
-    });
-    expect(requests).toContainEqual({
-      op: "recv",
-      socket: handle,
-      max_bytes: 4,
-    });
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("reply=pong");
+      expect(requests).toContainEqual({
+        op: "connect",
+        host: "127.0.0.1",
+        port: 9,
+        tls: false,
+      });
+      expect(requests).toContainEqual({
+        op: "send",
+        socket: handle,
+        data: Array.from(encode("ping")),
+      });
+      expect(requests).toContainEqual({
+        op: "recv",
+        socket: handle,
+        max_bytes: 4,
+      });
+    },
+  );
 
-  rustIt("reports Rust std::net::TcpStream peer_addr for connected streams", async () => {
-    let socketBackend: SocketBackend;
-    socketBackend = {
-      connect: () => ({ ok: true, socket: 202 }),
-      send: (_socket, data) => ({
-        ok: true,
-        bytes_sent: data.byteLength,
-      }),
-      recv: () => ({ ok: true, data: new Uint8Array(0) }),
-      close: () => ({ ok: true }),
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
-      recvAsync: (socket, maxBytes) =>
-        Promise.resolve(socketBackend.recv(socket, maxBytes)),
-    };
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      socketBackend,
-    });
+  rustIt(
+    "reports Rust std::net::TcpStream peer_addr for connected streams",
+    async () => {
+      let socketBackend: SocketBackend;
+      socketBackend = {
+        connect: () => ({ ok: true, socket: 202 }),
+        send: (_socket, data) => ({
+          ok: true,
+          bytes_sent: data.byteLength,
+        }),
+        recv: () => ({ ok: true, data: new Uint8Array(0) }),
+        close: () => ({ ok: true }),
+        acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+        recvAsync: (socket, maxBytes) =>
+          Promise.resolve(socketBackend.recv(socket, maxBytes)),
+      };
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        socketBackend,
+      });
 
-    const result = await sandbox.run("std-net-peer-addr-canary");
+      const result = await sandbox.run("std-net-peer-addr-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("peer=127.0.0.1:9");
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("peer=127.0.0.1:9");
+    },
+  );
 
-  rustIt("routes Rust std::net hostname connects through libyurt netdb", async () => {
-    const handle: SocketHandle = 303;
-    const requests: Record<string, unknown>[] = [];
-    let socketBackend: SocketBackend;
-    socketBackend = {
-      connect(req) {
-        requests.push({ op: "connect", ...req });
-        return { ok: true, socket: handle };
-      },
-      send(socket, data) {
-        requests.push({ op: "send", socket, data: Array.from(data) });
-        return { ok: true, bytes_sent: data.byteLength };
-      },
-      recv(socket, maxBytes) {
-        requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data: encode("pong") };
-      },
-      close(socket) {
-        requests.push({ op: "close", socket });
-        return { ok: true };
-      },
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
-      recvAsync: (socket, maxBytes) =>
-        Promise.resolve(socketBackend.recv(socket, maxBytes)),
-    };
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      socketBackend,
-    });
+  rustIt(
+    "routes Rust std::net hostname connects through libyurt netdb",
+    async () => {
+      const handle: SocketHandle = 303;
+      const requests: Record<string, unknown>[] = [];
+      let socketBackend: SocketBackend;
+      socketBackend = {
+        connect(req) {
+          requests.push({ op: "connect", ...req });
+          return { ok: true, socket: handle };
+        },
+        send(socket, data) {
+          requests.push({ op: "send", socket, data: Array.from(data) });
+          return { ok: true, bytes_sent: data.byteLength };
+        },
+        recv(socket, maxBytes) {
+          requests.push({ op: "recv", socket, max_bytes: maxBytes });
+          return { ok: true, data: encode("pong") };
+        },
+        close(socket) {
+          requests.push({ op: "close", socket });
+          return { ok: true };
+        },
+        acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+        recvAsync: (socket, maxBytes) =>
+          Promise.resolve(socketBackend.recv(socket, maxBytes)),
+      };
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        socketBackend,
+      });
 
-    const result = await sandbox.run("std-net-hostname-canary");
+      const result = await sandbox.run("std-net-hostname-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("reply=pong");
-    expect(requests).toContainEqual({
-      op: "connect",
-      host: "10.0.2.185",
-      port: 443,
-      tls: false,
-    });
-    expect(requests).toContainEqual({
-      op: "send",
-      socket: handle,
-      data: Array.from(encode("ping")),
-    });
-    expect(requests).toContainEqual({
-      op: "recv",
-      socket: handle,
-      max_bytes: 4,
-    });
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("reply=pong");
+      expect(requests).toContainEqual({
+        op: "connect",
+        host: "10.0.2.185",
+        port: 443,
+        tls: false,
+      });
+      expect(requests).toContainEqual({
+        op: "send",
+        socket: handle,
+        data: Array.from(encode("ping")),
+      });
+      expect(requests).toContainEqual({
+        op: "recv",
+        socket: handle,
+        max_bytes: 4,
+      });
+    },
+  );
 
-  rustIt("routes Rust std::net::TcpStream shutdown through WASI socket shutdown", async () => {
-    const requests: Record<string, unknown>[] = [];
-    let socketBackend: SocketBackend;
-    socketBackend = {
-      connect(req) {
-        requests.push({ op: "connect", ...req });
-        return { ok: true, socket: 404 };
-      },
-      send(socket, data) {
-        requests.push({ op: "send", socket, data: Array.from(data) });
-        return { ok: true, bytes_sent: data.byteLength };
-      },
-      recv(socket, maxBytes) {
-        requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data: new Uint8Array(0) };
-      },
-      close(socket) {
-        requests.push({ op: "close", socket });
-        return { ok: true };
-      },
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
-      recvAsync: (socket, maxBytes) =>
-        Promise.resolve(socketBackend.recv(socket, maxBytes)),
-    };
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      socketBackend,
-    });
+  rustIt(
+    "routes Rust std::net::TcpStream shutdown through WASI socket shutdown",
+    async () => {
+      const requests: Record<string, unknown>[] = [];
+      let socketBackend: SocketBackend;
+      socketBackend = {
+        connect(req) {
+          requests.push({ op: "connect", ...req });
+          return { ok: true, socket: 404 };
+        },
+        send(socket, data) {
+          requests.push({ op: "send", socket, data: Array.from(data) });
+          return { ok: true, bytes_sent: data.byteLength };
+        },
+        recv(socket, maxBytes) {
+          requests.push({ op: "recv", socket, max_bytes: maxBytes });
+          return { ok: true, data: new Uint8Array(0) };
+        },
+        close(socket) {
+          requests.push({ op: "close", socket });
+          return { ok: true };
+        },
+        acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+        recvAsync: (socket, maxBytes) =>
+          Promise.resolve(socketBackend.recv(socket, maxBytes)),
+      };
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        socketBackend,
+      });
 
-    const result = await sandbox.run("std-net-shutdown-canary");
+      const result = await sandbox.run("std-net-shutdown-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("shutdown=both");
-    expect(requests).toContainEqual({
-      op: "connect",
-      host: "127.0.0.1",
-      port: 9,
-      tls: false,
-    });
-    expect(requests).toContainEqual({ op: "close", socket: 404 });
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("shutdown=both");
+      expect(requests).toContainEqual({
+        op: "connect",
+        host: "127.0.0.1",
+        port: 9,
+        tls: false,
+      });
+      expect(requests).toContainEqual({ op: "close", socket: 404 });
+    },
+  );
 
-  rustIt("duplicates Rust std::net::TcpStream fds through libyurt dup", async () => {
-    const requests: Record<string, unknown>[] = [];
-    let socketBackend: SocketBackend;
-    socketBackend = {
-      connect(req) {
-        requests.push({ op: "connect", ...req });
-        return { ok: true, socket: 505 };
-      },
-      send(socket, data) {
-        requests.push({ op: "send", socket, data: Array.from(data) });
-        return { ok: true, bytes_sent: data.byteLength };
-      },
-      recv(socket, maxBytes) {
-        requests.push({ op: "recv", socket, max_bytes: maxBytes });
-        return { ok: true, data: new Uint8Array(0) };
-      },
-      close(socket) {
-        requests.push({ op: "close", socket });
-        return { ok: true };
-      },
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
-      recvAsync: (socket, maxBytes) =>
-        Promise.resolve(socketBackend.recv(socket, maxBytes)),
-    };
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      socketBackend,
-    });
+  rustIt(
+    "duplicates Rust std::net::TcpStream fds through libyurt dup",
+    async () => {
+      const requests: Record<string, unknown>[] = [];
+      let socketBackend: SocketBackend;
+      socketBackend = {
+        connect(req) {
+          requests.push({ op: "connect", ...req });
+          return { ok: true, socket: 505 };
+        },
+        send(socket, data) {
+          requests.push({ op: "send", socket, data: Array.from(data) });
+          return { ok: true, bytes_sent: data.byteLength };
+        },
+        recv(socket, maxBytes) {
+          requests.push({ op: "recv", socket, max_bytes: maxBytes });
+          return { ok: true, data: new Uint8Array(0) };
+        },
+        close(socket) {
+          requests.push({ op: "close", socket });
+          return { ok: true };
+        },
+        acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+        recvAsync: (socket, maxBytes) =>
+          Promise.resolve(socketBackend.recv(socket, maxBytes)),
+      };
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        socketBackend,
+      });
 
-    const result = await sandbox.run("std-net-try-clone-canary");
+      const result = await sandbox.run("std-net-try-clone-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("try_clone=ok");
-    expect(requests).toContainEqual({
-      op: "connect",
-      host: "127.0.0.1",
-      port: 9,
-      tls: false,
-    });
-    expect(requests).toContainEqual({
-      op: "send",
-      socket: 505,
-      data: Array.from(encode("one")),
-    });
-    expect(requests).toContainEqual({
-      op: "send",
-      socket: 505,
-      data: Array.from(encode("two")),
-    });
-    expect(requests.filter((req) => req.op === "close")).toEqual([{
-      op: "close",
-      socket: 505,
-    }]);
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("try_clone=ok");
+      expect(requests).toContainEqual({
+        op: "connect",
+        host: "127.0.0.1",
+        port: 9,
+        tls: false,
+      });
+      expect(requests).toContainEqual({
+        op: "send",
+        socket: 505,
+        data: Array.from(encode("one")),
+      });
+      expect(requests).toContainEqual({
+        op: "send",
+        socket: 505,
+        data: Array.from(encode("two")),
+      });
+      expect(requests.filter((req) => req.op === "close")).toEqual([{
+        op: "close",
+        socket: 505,
+      }]);
+    },
+  );
 
-  rustIt("reports Rust std::net::TcpStream socket_addr through libyurt getsockname", async () => {
-    let socketBackend: SocketBackend;
-    socketBackend = {
-      connect: () => ({ ok: true, socket: 707 }),
-      send: (_socket, data) => ({
-        ok: true,
-        bytes_sent: data.byteLength,
-      }),
-      recv: () => ({ ok: true, data: new Uint8Array(0) }),
-      close: () => ({ ok: true }),
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
-      recvAsync: (socket, maxBytes) =>
-        Promise.resolve(socketBackend.recv(socket, maxBytes)),
-    };
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      socketBackend,
-    });
+  rustIt(
+    "reports Rust std::net::TcpStream socket_addr through libyurt getsockname",
+    async () => {
+      let socketBackend: SocketBackend;
+      socketBackend = {
+        connect: () => ({ ok: true, socket: 707 }),
+        send: (_socket, data) => ({
+          ok: true,
+          bytes_sent: data.byteLength,
+        }),
+        recv: () => ({ ok: true, data: new Uint8Array(0) }),
+        close: () => ({ ok: true }),
+        acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+        recvAsync: (socket, maxBytes) =>
+          Promise.resolve(socketBackend.recv(socket, maxBytes)),
+      };
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        socketBackend,
+      });
 
-    const result = await sandbox.run("std-net-socket-addr-canary");
+      const result = await sandbox.run("std-net-socket-addr-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toMatch(/^local=10\.0\.2\.15:\d+$/);
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toMatch(/^local=10\.0\.2\.15:\d+$/);
+    },
+  );
 
-  rustIt("routes Rust std::net::TcpStream take_error through libyurt getsockopt", async () => {
-    let socketBackend: SocketBackend;
-    socketBackend = {
-      connect: () => ({ ok: true, socket: 808 }),
-      send: (_socket, data) => ({
-        ok: true,
-        bytes_sent: data.byteLength,
-      }),
-      recv: () => ({ ok: true, data: new Uint8Array(0) }),
-      close: () => ({ ok: true }),
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
-      recvAsync: (socket, maxBytes) =>
-        Promise.resolve(socketBackend.recv(socket, maxBytes)),
-    };
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      socketBackend,
-    });
+  rustIt(
+    "routes Rust std::net::TcpStream take_error through libyurt getsockopt",
+    async () => {
+      let socketBackend: SocketBackend;
+      socketBackend = {
+        connect: () => ({ ok: true, socket: 808 }),
+        send: (_socket, data) => ({
+          ok: true,
+          bytes_sent: data.byteLength,
+        }),
+        recv: () => ({ ok: true, data: new Uint8Array(0) }),
+        close: () => ({ ok: true }),
+        acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+        recvAsync: (socket, maxBytes) =>
+          Promise.resolve(socketBackend.recv(socket, maxBytes)),
+      };
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        socketBackend,
+      });
 
-    const result = await sandbox.run("std-net-take-error-canary");
+      const result = await sandbox.run("std-net-take-error-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("take_error=none");
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("take_error=none");
+    },
+  );
 
-  rustIt("routes Rust std::net::TcpStream nodelay through libyurt socket options", async () => {
-    const requests: unknown[] = [];
-    let socketBackend: SocketBackend;
-    socketBackend = {
-      connect: () => ({ ok: true, socket: 909 }),
-      send: (_socket, data) => ({
-        ok: true,
-        bytes_sent: data.byteLength,
-      }),
-      recv: () => ({ ok: true, data: new Uint8Array(0) }),
-      close: () => ({ ok: true }),
-      setNoDelay: (socket, enabled) => {
-        requests.push({ op: "setNoDelay", socket, enabled });
-        return { ok: true };
-      },
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
-      recvAsync: (socket, maxBytes) =>
-        Promise.resolve(socketBackend.recv(socket, maxBytes)),
-    };
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      socketBackend,
-    });
+  rustIt(
+    "routes Rust std::net::TcpStream nodelay through libyurt socket options",
+    async () => {
+      const requests: unknown[] = [];
+      let socketBackend: SocketBackend;
+      socketBackend = {
+        connect: () => ({ ok: true, socket: 909 }),
+        send: (_socket, data) => ({
+          ok: true,
+          bytes_sent: data.byteLength,
+        }),
+        recv: () => ({ ok: true, data: new Uint8Array(0) }),
+        close: () => ({ ok: true }),
+        setNoDelay: (socket, enabled) => {
+          requests.push({ op: "setNoDelay", socket, enabled });
+          return { ok: true };
+        },
+        acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+        recvAsync: (socket, maxBytes) =>
+          Promise.resolve(socketBackend.recv(socket, maxBytes)),
+      };
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        socketBackend,
+      });
 
-    const result = await sandbox.run("std-net-nodelay-canary");
+      const result = await sandbox.run("std-net-nodelay-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("nodelay=ok");
-    expect(requests).toEqual([
-      { op: "setNoDelay", socket: 909, enabled: true },
-      { op: "setNoDelay", socket: 909, enabled: false },
-    ]);
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("nodelay=ok");
+      expect(requests).toEqual([
+        { op: "setNoDelay", socket: 909, enabled: true },
+        { op: "setNoDelay", socket: 909, enabled: false },
+      ]);
+    },
+  );
 
-  rustIt("routes Rust std::net::TcpStream peek through libyurt socket recv buffering", async () => {
-    const requests: unknown[] = [];
-    let socketBackend: SocketBackend;
-    socketBackend = {
-      connect: () => ({ ok: true, socket: 1001 }),
-      send: (_socket, data) => ({
-        ok: true,
-        bytes_sent: data.byteLength,
-      }),
-      recv: (socket, maxBytes) => {
-        requests.push({ op: "recv", socket, maxBytes });
-        return { ok: true, data: encode("abc") };
-      },
-      close: () => ({ ok: true }),
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
-      recvAsync: (socket, maxBytes) =>
-        Promise.resolve(socketBackend.recv(socket, maxBytes)),
-    };
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      socketBackend,
-    });
+  rustIt(
+    "routes Rust std::net::TcpStream peek through libyurt socket recv buffering",
+    async () => {
+      const requests: unknown[] = [];
+      let socketBackend: SocketBackend;
+      socketBackend = {
+        connect: () => ({ ok: true, socket: 1001 }),
+        send: (_socket, data) => ({
+          ok: true,
+          bytes_sent: data.byteLength,
+        }),
+        recv: (socket, maxBytes) => {
+          requests.push({ op: "recv", socket, maxBytes });
+          return { ok: true, data: encode("abc") };
+        },
+        close: () => ({ ok: true }),
+        acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+        recvAsync: (socket, maxBytes) =>
+          Promise.resolve(socketBackend.recv(socket, maxBytes)),
+      };
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        socketBackend,
+      });
 
-    const result = await sandbox.run("std-net-peek-canary");
+      const result = await sandbox.run("std-net-peek-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("peek=ok");
-    expect(requests).toEqual([{ op: "recv", socket: 1001, maxBytes: 3 }]);
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("peek=ok");
+      expect(requests).toEqual([{ op: "recv", socket: 1001, maxBytes: 3 }]);
+    },
+  );
 
-  rustIt("routes Rust std::net::TcpStream nonblocking through WASI fd flags", async () => {
-    const requests: unknown[] = [];
-    let socketBackend: SocketBackend;
-    socketBackend = {
-      connect: () => ({ ok: true, socket: 1002 }),
-      send: (_socket, data) => ({
-        ok: true,
-        bytes_sent: data.byteLength,
-      }),
-      recv: (socket, maxBytes, opts) => {
-        requests.push({
-          op: "recv",
-          socket,
-          maxBytes,
-          nonblocking: opts?.nonblocking === true,
-        });
-        return opts?.nonblocking
-          ? { ok: false, error: "EAGAIN" }
-          : { ok: true, data: encode("abc") };
-      },
-      close: () => ({ ok: true }),
-      acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
-      recvAsync: (socket, maxBytes) =>
-        Promise.resolve(socketBackend.recv(socket, maxBytes)),
-    };
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      socketBackend,
-    });
+  rustIt(
+    "routes Rust std::net::TcpStream nonblocking through WASI fd flags",
+    async () => {
+      const requests: unknown[] = [];
+      let socketBackend: SocketBackend;
+      socketBackend = {
+        connect: () => ({ ok: true, socket: 1002 }),
+        send: (_socket, data) => ({
+          ok: true,
+          bytes_sent: data.byteLength,
+        }),
+        recv: (socket, maxBytes, opts) => {
+          requests.push({
+            op: "recv",
+            socket,
+            maxBytes,
+            nonblocking: opts?.nonblocking === true,
+          });
+          return opts?.nonblocking
+            ? { ok: false, error: "EAGAIN" }
+            : { ok: true, data: encode("abc") };
+        },
+        close: () => ({ ok: true }),
+        acceptAsync: () => Promise.resolve({ ok: false, error: "not used" }),
+        recvAsync: (socket, maxBytes) =>
+          Promise.resolve(socketBackend.recv(socket, maxBytes)),
+      };
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        socketBackend,
+      });
 
-    const result = await sandbox.run("std-net-nonblocking-canary");
+      const result = await sandbox.run("std-net-nonblocking-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("nonblocking=ok");
-    expect(requests).toEqual([{
-      op: "recv",
-      socket: 1002,
-      maxBytes: 3,
-      nonblocking: true,
-    }]);
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("nonblocking=ok");
+      expect(requests).toEqual([{
+        op: "recv",
+        socket: 1002,
+        maxBytes: 3,
+        nonblocking: true,
+      }]);
+    },
+  );
 
-  rustIt("runs Rust std::net::TcpListener through libyurt sockets", async () => {
-    sandbox = await Sandbox.create({
-      wasmDir: FIXTURES,
-      adapter: new NodeAdapter(),
-      network: { allowedHosts: ["127.0.0.1", "localhost"] },
-      serverSockets: { allowLoopback: true },
-    });
+  rustIt(
+    "runs Rust std::net::TcpListener through libyurt sockets",
+    async () => {
+      sandbox = await Sandbox.create({
+        wasmDir: FIXTURES,
+        adapter: new NodeAdapter(),
+        network: { allowedHosts: ["127.0.0.1", "localhost"] },
+        serverSockets: { allowLoopback: true },
+      });
 
-    const result = await sandbox.run("std-net-listener-canary");
+      const result = await sandbox.run("std-net-listener-canary");
 
-    expect(result.exitCode).toBe(0);
-    expect(result.stdout.trim()).toBe("std-net-listener=ok");
-  });
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout.trim()).toBe("std-net-listener=ok");
+    },
+  );
 
   shellIt("spawns a tool via absolute path to its /usr/bin stub", async () => {
     sandbox = await Sandbox.create({
@@ -1882,7 +2031,6 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
             },
           ],
         });
-
 
         const result = await sandbox.run("dlopen-canary --case happy_path");
 
