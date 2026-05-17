@@ -2,7 +2,7 @@ use crate::abi;
 use crate::kernel::{with_kernel, Kernel};
 use crate::path::PathResolver;
 
-use super::ID_NO_CHANGE;
+use super::{take_bytes, ID_NO_CHANGE};
 
 fn can_modify_owned_metadata(credentials: crate::state::Credentials, owner_uid: u32) -> bool {
     credentials.euid == 0 || credentials.euid == owner_uid
@@ -314,11 +314,10 @@ pub(super) fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let target_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
-    if request.len() < 4 + target_len {
-        return -(abi::EINVAL as i64);
-    }
-    let target = &request[4..4 + target_len];
-    let link_path_raw = &request[4 + target_len..];
+    let (target, link_path_raw) = match take_bytes(request, 4, target_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if link_path_raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
@@ -341,11 +340,10 @@ pub(super) fn rename(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let old_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
-    if request.len() < 4 + old_len {
-        return -(abi::EINVAL as i64);
-    }
-    let old_raw = &request[4..4 + old_len];
-    let new_raw = &request[4 + old_len..];
+    let (old_raw, new_raw) = match take_bytes(request, 4, old_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if new_raw.is_empty() {
         return -(abi::EINVAL as i64);
     }
@@ -370,11 +368,10 @@ pub(super) fn hard_link(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let target_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
-    if request.len() < 4 + target_len {
-        return -(abi::EINVAL as i64);
-    }
-    let target_raw = &request[4..4 + target_len];
-    let link_raw = &request[4 + target_len..];
+    let (target_raw, link_raw) = match take_bytes(request, 4, target_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if link_raw.is_empty() {
         return -(abi::EINVAL as i64);
     }

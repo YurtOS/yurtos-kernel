@@ -271,6 +271,28 @@ fn read_u32_args<const N: usize>(request: &[u8]) -> Option<[u32; N]> {
     Some(out)
 }
 
+/// Split `request` into `request[at..at+len]` (the declared field) and
+/// `request[at+len..]` (the tail), where `at`/`len` are derived from
+/// caller-controlled bytes.
+///
+/// **Wrap-safe on every pointer width.** The bound is computed in
+/// `u64`, never `usize + usize`: the kernel ships `wasm32` (32-bit
+/// `usize`), so a hostile declared `len ≈ u32::MAX` would otherwise
+/// wrap `at + len` to a tiny value, pass an additive `len()` guard,
+/// and panic on the resulting reversed slice range — a guest-reachable
+/// kernel abort that the native 64-bit `cargo test` gate cannot
+/// observe (issue #65 / holistic-review C1). Returns `Err(-EINVAL)` on
+/// overflow or when the declared field runs past the request.
+pub(super) fn take_bytes(request: &[u8], at: usize, len: usize) -> Result<(&[u8], &[u8]), i64> {
+    let end = (at as u64)
+        .checked_add(len as u64)
+        .filter(|&e| e <= request.len() as u64)
+        .ok_or(-(abi::EINVAL as i64))? as usize;
+    // `at <= end <= request.len() <= isize::MAX`, so both slices are
+    // valid index ranges on any pointer width.
+    Ok((&request[at..end], &request[end..]))
+}
+
 /// `close(fd: u32) -> 0 / -EBADF`. Decrements pipe refcounts when
 /// the closed entry is a pipe end.
 fn close_fd(caller_pid: u32, request: &[u8]) -> i64 {
@@ -1189,11 +1211,10 @@ fn register_file(request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let path_len = u32::from_le_bytes([request[0], request[1], request[2], request[3]]) as usize;
-    if request.len() < 4 + path_len {
-        return -(abi::EINVAL as i64);
-    }
-    let path = request[4..4 + path_len].to_vec();
-    let content = request[4 + path_len..].to_vec();
+    let (path, content) = match take_bytes(request, 4, path_len) {
+        Ok((p, c)) => (p.to_vec(), c.to_vec()),
+        Err(e) => return e,
+    };
     with_kernel(|k| {
         // KernelHostInterface-only: install or replace the file at `path`.
         // open() with the create+write bits returns the inode on
@@ -1239,11 +1260,10 @@ fn install_yurtfs(request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let prefix_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
-    if request.len() < 4 + prefix_len {
-        return -(abi::EINVAL as i64);
-    }
-    let prefix = request[4..4 + prefix_len].to_vec();
-    let archive = request[4 + prefix_len..].to_vec();
+    let (prefix, archive) = match take_bytes(request, 4, prefix_len) {
+        Ok((p, a)) => (p.to_vec(), a.to_vec()),
+        Err(e) => return e,
+    };
     let archive = match maybe_decompress_zstd(archive) {
         Some(bytes) => bytes,
         None => return -(abi::EINVAL as i64),
@@ -1288,11 +1308,10 @@ fn install_tar_layer(request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let prefix_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
-    if request.len() < 4 + prefix_len {
-        return -(abi::EINVAL as i64);
-    }
-    let prefix = request[4..4 + prefix_len].to_vec();
-    let archive = request[4 + prefix_len..].to_vec();
+    let (prefix, archive) = match take_bytes(request, 4, prefix_len) {
+        Ok((p, a)) => (p.to_vec(), a.to_vec()),
+        Err(e) => return e,
+    };
     let archive = match maybe_decompress_zstd(archive) {
         Some(bytes) => bytes,
         None => return -(abi::EINVAL as i64),
@@ -1391,11 +1410,10 @@ fn sys_idb_get(request: &[u8], response: &mut [u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let store_len = request[0] as usize;
-    if 1 + store_len > request.len() {
-        return -(abi::EINVAL as i64);
-    }
-    let store = &request[1..1 + store_len];
-    let key = &request[1 + store_len..];
+    let (store, key) = match take_bytes(request, 1, store_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if key.is_empty() {
         return -(abi::EINVAL as i64);
     }
@@ -1420,11 +1438,12 @@ fn sys_idb_put(request: &[u8]) -> i64 {
             .expect("4 bytes"),
     ) as usize;
     let body_start = 1 + store_len + 4;
-    if body_start + key_len > request.len() {
-        return -(abi::EINVAL as i64);
-    }
-    let key = &request[body_start..body_start + key_len];
-    let value = &request[body_start + key_len..];
+    // key_len is a caller-controlled u32 → `body_start + key_len`
+    // would wrap on wasm32 (32-bit usize); take_bytes bounds in u64.
+    let (key, value) = match take_bytes(request, body_start, key_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     kh::idb_put(store, key, value) as i64
 }
 
@@ -1433,11 +1452,10 @@ fn sys_idb_delete(request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let store_len = request[0] as usize;
-    if 1 + store_len > request.len() {
-        return -(abi::EINVAL as i64);
-    }
-    let store = &request[1..1 + store_len];
-    let key = &request[1 + store_len..];
+    let (store, key) = match take_bytes(request, 1, store_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if key.is_empty() {
         return -(abi::EINVAL as i64);
     }
@@ -1449,11 +1467,10 @@ fn sys_idb_list(request: &[u8], response: &mut [u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let store_len = request[0] as usize;
-    if 1 + store_len > request.len() {
-        return -(abi::EINVAL as i64);
-    }
-    let store = &request[1..1 + store_len];
-    let prefix = &request[1 + store_len..];
+    let (store, prefix) = match take_bytes(request, 1, store_len) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if response.is_empty() {
         return -(abi::EINVAL as i64);
     }

@@ -9508,3 +9508,61 @@ fn shutdown_wr_gives_unix_datagram_peer_recvfrom_eof_after_drain() {
         "recvfrom must observe EOF after peer SHUT_WR (consistent with recv)"
     );
 }
+
+// --- Issue #65: wrap-safe caller-length guards (take_bytes) ---
+
+#[test]
+fn take_bytes_rejects_wrapping_length_without_panicking() {
+    // The whole bug class: a hostile declared length that, added to the
+    // header offset, wraps `usize`. usize::MAX reproduces the wasm32
+    // u32::MAX wrap on ANY pointer width (a naive `at + len` overflows
+    // to a tiny value on 64-bit too), so this is a width-independent
+    // red→green for the root-cause primitive. Must be Err(-EINVAL),
+    // never a panic / reversed slice range.
+    let req = [0u8; 8];
+    assert_eq!(take_bytes(&req, 4, usize::MAX), Err(-(abi::EINVAL as i64)));
+    // The realistic wasm32 attack value (u32::MAX from the wire).
+    assert_eq!(take_bytes(&req, 4, 0xFFFF_FFFF), Err(-(abi::EINVAL as i64)));
+    // `at` itself past the end must not panic either.
+    assert_eq!(take_bytes(&req, 9, 0), Err(-(abi::EINVAL as i64)));
+    // Declared length one past the request → rejected.
+    assert_eq!(take_bytes(&req, 4, 5), Err(-(abi::EINVAL as i64)));
+}
+
+#[test]
+fn take_bytes_valid_splits_are_exact() {
+    let req = [1u8, 2, 3, 4, 5, 6];
+    assert_eq!(take_bytes(&req, 2, 2), Ok((&[3u8, 4][..], &[5u8, 6][..])));
+    // Exact fit: head consumes the whole request, tail empty.
+    assert_eq!(take_bytes(&req, 0, 6), Ok((&req[..], &[][..])));
+    // Zero-length field at the end.
+    assert_eq!(take_bytes(&req, 6, 0), Ok((&[][..], &[][..])));
+}
+
+#[test]
+fn symlink_rejects_hostile_length_without_aborting_kernel() {
+    // [u32 target_len = 0xFFFFFFFF][1 byte]. On wasm32 the old
+    // `request.len() < 4 + target_len` wrapped and panicked the whole
+    // kernel; now it is a clean -EINVAL on every pointer width.
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut req = 0xFFFF_FFFFu32.to_le_bytes().to_vec();
+    req.push(b'x');
+    assert_eq!(
+        dispatch(METHOD_SYS_SYMLINK, 1, &req, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn idb_put_rejects_hostile_key_len_without_aborting_kernel() {
+    // [u8 store_len=1]['s'][u32 key_len=0xFFFFFFFF][...]. The vulnerable
+    // `body_start + key_len` wrap is now bounded in u64 → -EINVAL.
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut req = vec![1u8, b's'];
+    req.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    req.push(b'k');
+    assert_eq!(
+        dispatch(METHOD_SYS_IDB_PUT, 1, &req, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
