@@ -65,6 +65,30 @@ const FETCH_EXECUTOR_QUEUE_CAP: usize = 64;
 /// can return the same EFAULT value our trampoline uses internally.
 pub(crate) const EFAULT_PUB: i64 = EFAULT;
 
+/// Reserved bit in the `n_fds` out-value telling the guest C shim that
+/// SCM_RIGHTS was truncated → it ORs `MSG_CTRUNC`. Bit30 (not bit31:
+/// the shim reads `n_fds` into a signed `int` gated by `> 0`). The fd
+/// count is hard-capped at 64, so bit30 is unambiguously free.
+/// (spec 2026-05-17-scm-rights-ctrunc)
+pub(crate) const YURT_RECVMSG_CTRUNC_BIT: u32 = 0x4000_0000;
+
+/// Decode the recvmsg ancillary trailer `[delivered:u32][flags:u32]`
+/// and compute `(copy_fds, n_fds_out)` for a guest `fds_cap`.
+/// `flags & 0x1` == kernel SCM_TRUNCATED.
+pub(crate) fn recvmsg_pack_nfds(delivered: u32, flags: u32, fds_cap: u32) -> (u32, u32) {
+    let copy_fds = delivered.min(fds_cap);
+    let truncated = (flags & 0x1) != 0 || delivered > fds_cap;
+    (
+        copy_fds,
+        copy_fds
+            | if truncated {
+                YURT_RECVMSG_CTRUNC_BIT
+            } else {
+                0
+            },
+    )
+}
+
 struct FetchJob {
     request: Vec<u8>,
     response: mpsc::Sender<Vec<u8>>,
@@ -5758,7 +5782,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 Some(n) => n,
                 None => return -E2BIG,
             };
-            let response_len = match checked_guest_buffer_sum(&[out_cap, 4, fds_bytes]) {
+            let response_len = match checked_guest_buffer_sum(&[out_cap, 8, fds_bytes]) {
                 Ok(n) => n,
                 Err(rc) => return rc,
             };
@@ -5792,21 +5816,22 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 return -EFAULT;
             }
             let rights = &response[out_cap_len..];
-            let n_fds = u32::from_le_bytes(rights[0..4].try_into().expect("fd count"));
-            let copy_fds = n_fds.min(fds_cap);
+            let delivered = u32::from_le_bytes(rights[0..4].try_into().expect("delivered"));
+            let flags = u32::from_le_bytes(rights[4..8].try_into().expect("anc flags"));
+            let (copy_fds, n_fds_out) = recvmsg_pack_nfds(delivered, flags, fds_cap);
             if copy_fds > 0
                 && memory
                     .write(
                         &mut caller,
                         fds_ptr as usize,
-                        &rights[4..4 + copy_fds as usize * 4],
+                        &rights[8..8 + copy_fds as usize * 4],
                     )
                     .is_err()
             {
                 return -EFAULT;
             }
             if memory
-                .write(&mut caller, n_fds_ptr as usize, &copy_fds.to_le_bytes())
+                .write(&mut caller, n_fds_ptr as usize, &n_fds_out.to_le_bytes())
                 .is_err()
             {
                 return -EFAULT;
@@ -6112,5 +6137,14 @@ mod tests {
         let join = thread::spawn(thread::current);
         let spawned_id = join.join().unwrap().id();
         assert!(should_join_thread(spawned_id));
+    }
+
+    #[test]
+    fn pack_nfds_signals_truncation() {
+        assert_eq!(recvmsg_pack_nfds(0, 1, 4), (0, 0x4000_0000));
+        assert_eq!(recvmsg_pack_nfds(2, 1, 4), (2, 2 | 0x4000_0000));
+        assert_eq!(recvmsg_pack_nfds(3, 0, 4), (3, 3));
+        // defensive: delivered > fds_cap (unreachable under the invariant)
+        assert_eq!(recvmsg_pack_nfds(5, 0, 4), (4, 4 | 0x4000_0000));
     }
 }
