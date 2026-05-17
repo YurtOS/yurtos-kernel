@@ -492,6 +492,7 @@ const E2BIG = 7;
 const EIO = 5;
 const ESRCH = 3;
 const ENOSYS = 38;
+const EDEADLK = 35;
 
 function ipv4SocketAddrRecord(host: string, port: number): Uint8Array {
   const out = new Uint8Array(8);
@@ -1619,9 +1620,6 @@ function byteKey(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Re-entrancy depth counter for drainPendingProcess calls. */
-let _drainProcessDepth = 0;
-
 function buildUserYurtImports(
   pid: number,
   kernel: KernelInstance,
@@ -1629,6 +1627,7 @@ function buildUserYurtImports(
   callerTid = 1,
   drainPendingThread?: (tid: number) => void,
   drainPendingProcess?: () => void,
+  drainDepthRef?: { value: number },
 ): Record<string, (...args: (number | bigint)[]) => number> {
   const memoryBuffer = () => userMemoryRef.memory!.buffer;
   const boundsOk = (ptr: number, len: number): boolean => {
@@ -1750,17 +1749,24 @@ function buildUserYurtImports(
     if (logicalSize > bytes.length) return -75; // EOVERFLOW
 
     // Helper: read a span {u32 off, u32 len} relative to record start.
-    const readSpan = (off: number): { off: number; len: number } | null => {
+    // Returns null for an absent (0,0) span, -22 for a misaligned offset
+    // (byte-parity with native_abi.rs read_span which returns Err(Invalid)
+    // when span_off is not a multiple of 4), or the span on success.
+    const readSpan = (
+      off: number,
+    ): { off: number; len: number } | null | -22 => {
       const spanOff = hdr.getUint32(off, true);
       const spanLen = hdr.getUint32(off + 4, true);
       if (spanOff === 0 && spanLen === 0) return null;
+      if (spanOff % 4 !== 0) return -22; // I1: align parity with native_abi.rs
       return { off: spanOff, len: spanLen };
     };
     const readString = (
       spanOff: number,
-    ): string | null => {
+    ): string | null | -22 => {
       const span = readSpan(spanOff);
       if (span === null) return null;
+      if (span === -22) return -22; // propagate alignment error
       if (span.off + span.len > logicalSize) return null;
       return new TextDecoder().decode(
         bytes.subarray(span.off, span.off + span.len),
@@ -1769,14 +1775,22 @@ function buildUserYurtImports(
 
     // prog (required, offset 8)
     const prog = readString(8);
-    if (prog === null || prog.length === 0) return -22; // EINVAL
+    if (prog === -22) return -22; // misaligned span
+    if (prog === null || prog.length === 0) return -EINVAL;
 
     // argv0 (optional, offset 16) — used as argv[0] if present
-    const argv0 = readString(16);
+    const argv0Raw = readString(16);
+    if (argv0Raw === -22) return -EINVAL; // misaligned optional span
+    const argv0: string | null = argv0Raw;
 
     // args_off (u32@24), args_count (u32@28) — args[1..] span-vector
     const argsVecOff = hdr.getUint32(24, true);
     const argsCount = hdr.getUint32(28, true);
+    // I2: byte-parity with native_abi.rs read_string_vec: null vec with
+    // non-zero count is Invalid (-22).
+    if (argsCount > 0 && argsVecOff === 0) return -EINVAL;
+    // I1: the args vector offset must also be 4-byte aligned.
+    if (argsCount > 0 && argsVecOff % 4 !== 0) return -EINVAL;
     const args: string[] = [];
     if (argsCount > 0) {
       const SPAN_SIZE = 8;
@@ -1786,6 +1800,7 @@ function buildUserYurtImports(
         const spanBase = argsVecOff + i * SPAN_SIZE;
         const aOff = hdr.getUint32(spanBase, true);
         const aLen = hdr.getUint32(spanBase + 4, true);
+        if (aOff % 4 !== 0) return -EINVAL; // I1: per-span alignment
         if (aOff + aLen > logicalSize) return -75; // EOVERFLOW
         args.push(
           new TextDecoder().decode(bytes.subarray(aOff, aOff + aLen)),
@@ -1822,6 +1837,7 @@ function buildUserYurtImports(
     if (spawnRc < 0) return spawnRc;
 
     // Write yurt_spawn_result_v1: 4-byte LE i32 pid
+    // -7: deliberate byte-parity with deno wasm-kernel-imports.ts:803 (output cap too small)
     if (outCapN < 4) return -E2BIG; // -7
     const resultBytes = new Uint8Array(4);
     new DataView(resultBytes.buffer).setInt32(0, spawnRc, true);
@@ -1847,14 +1863,18 @@ function buildUserYurtImports(
     let out = kernel.syscall(METHOD.SYS_WAIT, pid, req, 8);
     let rc = Number(out.rc);
     while (rc === -EAGAIN && !(flagsN & WNOHANG) && drainPendingProcess) {
-      if (_drainProcessDepth >= 256) {
-        throw new Error("host_wait: re-entrant spawn/wait nesting too deep");
+      const depth = drainDepthRef ?? { value: 0 };
+      if (depth.value >= 256) {
+        // Return -EDEADLK instead of throwing: a throw from a wasm import
+        // becomes a trap that crashes the guest with no errno.  Returning a
+        // clean errno lets the guest handle the re-entrancy limit gracefully.
+        return -EDEADLK;
       }
-      _drainProcessDepth++;
+      depth.value++;
       try {
         drainPendingProcess();
       } finally {
-        _drainProcessDepth--;
+        depth.value--;
       }
       out = kernel.syscall(METHOD.SYS_WAIT, pid, req, 8);
       rc = Number(out.rc);
@@ -2010,6 +2030,28 @@ class CachedProcessEngine {
   private readonly threadExecutions = new Map<number, CachedThreadExecution>();
   private nextHandle = 1;
   private nextThreadHandle = 1;
+  /**
+   * Re-entrancy depth counter for drainPendingProcess calls, shared across
+   * the entire nested parent→child host_wait drive chain.  Lives here so
+   * that every buildUserYurtImports closure (parent process, child process,
+   * thread) all read/write the same counter: depth 1 in the parent means
+   * the child's host_wait sees depth 2 on its own drain call, and so on.
+   *
+   * A per-closure counter would always read 0 inside each child instance
+   * and the 256-limit would never fire across nesting boundaries.
+   */
+  private drainDepth = 0;
+  /** Shared depth ref object threaded into every buildUserYurtImports call. */
+  private get drainDepthRef(): { value: number } {
+    // Return a proxy-like object that reads/writes this.drainDepth.
+    // Re-created each access is fine: the object is only used within a single
+    // synchronous call frame and the field reference is stable.
+    const self = this;
+    return {
+      get value() { return self.drainDepth; },
+      set value(v: number) { self.drainDepth = v; },
+    };
+  }
 
   constructor(private readonly kernelRef: { kernel?: KernelInstance }) {}
 
@@ -2074,6 +2116,7 @@ class CachedProcessEngine {
         1,
         (tid) => this.runPendingThread(context.pid, tid),
         () => this.runPendingSpawns(kernel),
+        this.drainDepthRef,
       );
       instance = new WebAssembly.Instance(module, {
         env: { ...sysImports, sys_setrlimit },
@@ -2203,6 +2246,7 @@ class CachedProcessEngine {
           tid,
           (targetTid) => this.runPendingThread(pid, targetTid),
           () => this.runPendingSpawns(kernel),
+          this.drainDepthRef,
         ),
       });
     } catch {
@@ -2363,6 +2407,7 @@ class CachedProcessEngine {
         1,
         (tid) => this.runPendingThread(childPid, tid),
         () => this.runPendingSpawns(kernel),
+        this.drainDepthRef,
       ),
     });
 

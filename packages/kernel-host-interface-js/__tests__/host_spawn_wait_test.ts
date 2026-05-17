@@ -111,28 +111,118 @@ function encodeSysSpawnRequest(path: Uint8Array, argv: Uint8Array[]): Uint8Array
   return req;
 }
 
-// ── Test 1: host_spawn is no longer an ENOSYS stub ───────────────────────────
+// ── Inline wasm helpers for malformed-request tests ──────────────────────────
 
-Deno.test("host_spawn is not in the ENOSYS stub set", () => {
-  // We can't inspect USER_YURT_STUB_IMPORTS directly (it's module-private),
-  // but we CAN verify that when a process guest tries to call host_spawn,
-  // it does NOT receive -ENOSYS (-38).  We test this indirectly through the
-  // kernel: if it is still stubbed the SYS_SPAWN syscall would never be
-  // reached (the stub fires before syscall dispatch). Instead we verify that
-  // buildUserYurtImports' returned object does NOT include host_spawn in the
-  // -ENOSYS-returning set by checking that the end-to-end SYS_SPAWN path
-  // actually enqueues a child (i.e. the syscall reached the kernel).
-  //
-  // The strongest check available without spinning up a full guest: register
-  // a child wasm in ramfs, call SYS_SPAWN directly, assert a pid >= 1000
-  // comes back (kernel allocated it, meaning the syscall was handled).
-  //
-  // We verify the stub was removed by checking the live kernel allocates a
-  // pid — if host_spawn were still in USER_YURT_STUB_IMPORTS the wasm guest
-  // calling it would get -ENOSYS without the kernel ever seeing SYS_SPAWN.
-  // This test exercises SYS_SPAWN at the kernel level to confirm the plumbing
-  // is in place.
-  assertEquals(true, true); // placeholder — the real check is in tests below
+/**
+ * Each WASM_* constant is a minimal wasm module (compiled from WAT via
+ * wat2wasm, hex-encoded inline) that:
+ *   - imports yurt.host_spawn(i32,i32,i32,i32)->i32
+ *   - imports wasi_snapshot_preview1.proc_exit(i32)
+ *   - exports memory
+ *   - exports _start: calls host_spawn with a crafted bad request then
+ *     proc_exit(rc) so the return value is observable as the exit code
+ *
+ * The data sections (if any) embed the crafted request at offset 0.
+ */
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+  }
+  return out;
+}
+
+/** Case (a): host_spawn(ptr=0, len=50, 0, 0) — 50 bytes < 88-byte minimum → -22 */
+const WASM_A = hexToBytes(
+  "0061736d0100000001100360047f7f7f7f017f60017f0060000002360204797572740a686f73745f737061776e000016776173695f736e617073686f745f70726576696577310970726f635f657869740001030201020503010001071302066d656d6f72790200065f737461727400020a10010e004100413241004100100010010b",
+);
+/** Case (b): 88-byte header, logicalSize=88, version=2 → -22 */
+const WASM_B = hexToBytes(
+  "0061736d0100000001100360047f7f7f7f017f60017f0060000002360204797572740a686f73745f737061776e000016776173695f736e617073686f745f70726576696577310970726f635f657869740001030201020503010001071302066d656d6f72790200065f737461727400020a11010f00410041d80041004100100010010b0b0c010041000b06580000000200",
+);
+/** Case (c): 88-byte buffer, logicalSize=200 (> 88) → -75 */
+const WASM_C = hexToBytes(
+  "0061736d0100000001100360047f7f7f7f017f60017f0060000002360204797572740a686f73745f737061776e000016776173695f736e617073686f745f70726576696577310970726f635f657869740001030201020503010001071302066d656d6f72790200065f737461727400020a11010f00410041d80041004100100010010b0b0c010041000b06c80000000100",
+);
+/**
+ * Case (d): logicalSize=90, version=1, prog="/x"@offset88,
+ * argsVecOff=0, argsCount=5 → -22 (I2: null vec with non-zero count)
+ */
+const WASM_D = hexToBytes(
+  "0061736d0100000001100360047f7f7f7f017f60017f0060000002360204797572740a686f73745f737061776e000016776173695f736e617073686f745f70726576696577310970726f635f657869740001030201020503010001071302066d656d6f72790200065f737461727400020a11010f00410041da0041004100100010010b0b2e020041000b205a000000010000005800000002000000000000000000000000000000050000000041d8000b022f78",
+);
+/**
+ * Case (e): logicalSize=88, version=1, prog_off=5 (misaligned: 5 % 4 != 0)
+ * → -22 (I1: span offset not a multiple of 4)
+ */
+const WASM_E = hexToBytes(
+  "0061736d0100000001100360047f7f7f7f017f60017f0060000002360204797572740a686f73745f737061776e000016776173695f736e617073686f745f70726576696577310970726f635f657869740001030201020503010001071302066d656d6f72790200065f737461727400020a11010f00410041d80041004100100010010b0b16010041000b1058000000010000000500000002000000",
+);
+
+/**
+ * Run a minimal wasm module (built with the pattern above) as a user process.
+ * Catches proc_exit(n) and returns n.  Re-throws any other error.
+ */
+async function runMalformedSpawnCase(
+  mk: KernelHostInterface,
+  wasmBytes: Uint8Array,
+): Promise<number> {
+  const user = mk.spawnUserProcessWithArgs(wasmBytes, [s("test")]);
+  let exitCode = 0;
+  try {
+    user.runStart();
+  } catch (e) {
+    const msg = String((e as Error).message ?? e);
+    const m = /proc_exit\((-?\d+)\)/.exec(msg);
+    if (m) {
+      exitCode = Number(m[1]);
+    } else {
+      throw e;
+    }
+  }
+  return exitCode;
+}
+
+// ── Test 1: host_spawn malformed-request negative cases ──────────────────────
+
+Deno.test("host_spawn returns clean errno for malformed yurt_spawn_request_v1 buffers", async () => {
+  // Each sub-case drives host_spawn with a crafted bad request and asserts
+  // a clean negative errno return — never a throw/trap from the import.
+
+  // (a) bytes.length < 88 → -22 (EINVAL: header too short)
+  {
+    const mk = await freshKernelHostInterface();
+    const rc = await runMalformedSpawnCase(mk, WASM_A);
+    assertEquals(rc, -22, `case (a): expected -22 for too-short request, got ${rc}`);
+  }
+
+  // (b) version != 1 → -22 (EINVAL: unknown record version)
+  {
+    const mk = await freshKernelHostInterface();
+    const rc = await runMalformedSpawnCase(mk, WASM_B);
+    assertEquals(rc, -22, `case (b): expected -22 for bad version, got ${rc}`);
+  }
+
+  // (c) logicalSize > bytes.length → -75 (EOVERFLOW)
+  {
+    const mk = await freshKernelHostInterface();
+    const rc = await runMalformedSpawnCase(mk, WASM_C);
+    assertEquals(rc, -75, `case (c): expected -75 for logicalSize overflow, got ${rc}`);
+  }
+
+  // (d) argsCount=5, argsVecOff=0 → -22 (EINVAL: null vec with non-zero count)
+  {
+    const mk = await freshKernelHostInterface();
+    const rc = await runMalformedSpawnCase(mk, WASM_D);
+    assertEquals(rc, -22, `case (d): expected -22 for null args vec, got ${rc}`);
+  }
+
+  // (e) prog span offset=5 (misaligned, not a multiple of 4) → -22 (EINVAL)
+  {
+    const mk = await freshKernelHostInterface();
+    const rc = await runMalformedSpawnCase(mk, WASM_E);
+    assertEquals(rc, -22, `case (e): expected -22 for misaligned prog span, got ${rc}`);
+  }
 });
 
 // ── Test 2: SYS_SPAWN enqueues a child and returns a pid ─────────────────────
