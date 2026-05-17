@@ -218,17 +218,18 @@ fn normalize_readable_path(
 /// Follow symlinks at `path` (already normalized) up to SYMLOOP_MAX
 /// (40) hops, re-normalizing and re-authorizing each target so a
 /// ramfs link cannot bypass procfs access checks. Returns the
-/// resolved path. The hop-limit error is kept as `-EINVAL` (the
-/// historical "-ELOOP shape"); retargeting it to `-ELOOP` is #69's
-/// separate concern. Shared by `sys_open` and `stat_path` so the
-/// follow semantics cannot drift between them.
+/// resolved path, or `-ELOOP` once the hop limit is exceeded (POSIX;
+/// #69). Shared by `sys_open` and `stat_path` so the follow
+/// semantics — including this errno — cannot drift between them.
 fn follow_symlinks(k: &mut Kernel, caller_pid: u32, path: Vec<u8>) -> Result<Vec<u8>, i64> {
     let mut resolved = path;
     let mut hops = 0u32;
     while let Some(target) = k.vfs.readlink(&resolved) {
         hops += 1;
         if hops > 40 {
-            return Err(-(abi::EINVAL as i64));
+            // Too many symlink hops: POSIX/Linux errno is ELOOP
+            // (SYMLOOP_MAX = 40), not EINVAL.
+            return Err(-(abi::ELOOP as i64));
         }
         resolved = normalize_readable_path(k, caller_pid, &target)?;
     }

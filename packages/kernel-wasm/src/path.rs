@@ -146,7 +146,9 @@ fn resolve_realpath(k: &mut Kernel, cwd: &[u8], path: &[u8]) -> Result<Vec<u8>, 
         if let Some(target) = k.vfs.readlink(&candidate) {
             hops += 1;
             if hops > 40 {
-                return Err(abi::EINVAL);
+                // Too many symlink hops: POSIX/Linux errno is ELOOP
+                // (SYMLOOP_MAX = 40), not EINVAL.
+                return Err(abi::ELOOP);
             }
             let target_path = if target.starts_with(b"/") {
                 target

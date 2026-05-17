@@ -133,14 +133,14 @@ pub trait VfsBackend: Send {
     /// -30  — backend is read-only (`-EROFS`)
     /// Default impl is `-EROFS`; mutable backends override.
     fn unlink(&mut self, _path: &[u8]) -> i32 {
-        -30 // -EROFS
+        -crate::abi::EROFS
     }
 
     /// Install a symlink at `link_path` pointing at `target`.
     /// Returns 0 on success, -EROFS if the backend is read-only,
     /// -EEXIST if a path is already there. Default: -EROFS.
     fn symlink(&mut self, _target: &[u8], _link_path: &[u8]) -> i32 {
-        -30 // -EROFS
+        -crate::abi::EROFS
     }
 
     /// If `path` is a symlink, return its target bytes verbatim
@@ -152,13 +152,13 @@ pub trait VfsBackend: Send {
 
     /// Create a directory at `path`. Returns 0 / -EEXIST / -EROFS.
     fn mkdir(&mut self, _path: &[u8]) -> i32 {
-        -30 // -EROFS
+        -crate::abi::EROFS
     }
 
     /// Remove an empty directory. Returns 0 / -ENOENT / -ENOTEMPTY /
     /// -EROFS.
     fn rmdir(&mut self, _path: &[u8]) -> i32 {
-        -30 // -EROFS
+        -crate::abi::EROFS
     }
 
     /// List immediate children of `path`. Returns the entry names
@@ -187,14 +187,14 @@ pub trait VfsBackend: Send {
     /// -EROFS (backend immutable). Default: -EPERM (backend has no
     /// concept of multiple paths sharing an inode).
     fn link(&mut self, _target: &[u8], _link_path: &[u8]) -> i32 {
-        -1 // -EPERM
+        -crate::abi::EPERM
     }
 
     /// Atomically rename `old_path` to `new_path`. Same backend; the
     /// MountTable enforces same-mount before delegating. Default:
     /// -EROFS — backends that don't support mutation say so.
     fn rename(&mut self, _old_path: &[u8], _new_path: &[u8]) -> i32 {
-        -30 // -EROFS
+        -crate::abi::EROFS
     }
 }
 
@@ -331,7 +331,7 @@ impl MountTable {
     /// 0 on success, negated POSIX errno otherwise.
     pub fn unlink(&mut self, path: &[u8]) -> i32 {
         let Some((id, rel)) = self.resolve(path) else {
-            return -2; // -ENOENT
+            return -crate::abi::ENOENT;
         };
         self.mounts[id as usize].backend.unlink(&rel)
     }
@@ -341,7 +341,7 @@ impl MountTable {
     /// negated POSIX errno.
     pub fn symlink(&mut self, target: &[u8], link_path: &[u8]) -> i32 {
         let Some((id, rel)) = self.resolve(link_path) else {
-            return -2; // -ENOENT
+            return -crate::abi::ENOENT;
         };
         self.mounts[id as usize].backend.symlink(target, &rel)
     }
@@ -355,14 +355,14 @@ impl MountTable {
 
     pub fn mkdir(&mut self, path: &[u8]) -> i32 {
         let Some((id, rel)) = self.resolve(path) else {
-            return -2; // -ENOENT
+            return -crate::abi::ENOENT;
         };
         self.mounts[id as usize].backend.mkdir(&rel)
     }
 
     pub fn rmdir(&mut self, path: &[u8]) -> i32 {
         let Some((id, rel)) = self.resolve(path) else {
-            return -2;
+            return -crate::abi::ENOENT;
         };
         self.mounts[id as usize].backend.rmdir(&rel)
     }
@@ -674,7 +674,7 @@ impl VfsBackend for RamfsBackend {
             return 0;
         }
         let Some(id) = self.paths.remove(path) else {
-            return -2; // -ENOENT
+            return -crate::abi::ENOENT;
         };
         // Decrement refcount; only drop the inode buffer when the
         // last path goes away. This is what makes hard links work.
@@ -766,7 +766,7 @@ impl VfsBackend for RamfsBackend {
 
     fn symlink(&mut self, target: &[u8], link_path: &[u8]) -> i32 {
         if self.paths.contains_key(link_path) || self.symlinks.contains_key(link_path) {
-            return -17; // -EEXIST
+            return -crate::abi::EEXIST;
         }
         self.symlinks.insert(link_path.to_vec(), target.to_vec());
         0
@@ -781,11 +781,11 @@ impl VfsBackend for RamfsBackend {
             || self.symlinks.contains_key(path)
             || self.dirs.contains(path)
         {
-            return -17; // -EEXIST
+            return -crate::abi::EEXIST;
         }
         let parent = Self::parent_of(path);
         if !self.dirs.contains(&parent) {
-            return -2; // -ENOENT
+            return -crate::abi::ENOENT;
         }
         self.dirs.insert(path.to_vec());
         0
@@ -793,7 +793,7 @@ impl VfsBackend for RamfsBackend {
 
     fn rmdir(&mut self, path: &[u8]) -> i32 {
         if !self.dirs.contains(path) {
-            return -2; // -ENOENT (or ENOTDIR if it's a regular file)
+            return -crate::abi::ENOENT; // (or ENOTDIR for a regular file)
         }
         // Empty check: walk children. A child is any tracked path
         // whose parent is `path`.
@@ -807,7 +807,7 @@ impl VfsBackend for RamfsBackend {
                 continue;
             }
             if Self::parent_of(p) == path {
-                return -39; // -ENOTEMPTY
+                return -crate::abi::ENOTEMPTY;
             }
         }
         self.dirs.remove(path);
@@ -1016,7 +1016,7 @@ mod tests {
         let lower = RamfsBackend::new();
         let upper = RamfsBackend::new();
         let mut overlay = OverlayBackend::new(Box::new(lower), Box::new(upper));
-        assert_eq!(overlay.unlink(b"/missing"), -2);
+        assert_eq!(overlay.unlink(b"/missing"), -crate::abi::ENOENT);
     }
 
     #[test]
@@ -2009,7 +2009,7 @@ impl VfsBackend for OverlayBackend {
             return 0;
         }
         // Neither layer had it.
-        -2 // -ENOENT
+        -crate::abi::ENOENT
     }
 
     fn readdir(&self, path: &[u8]) -> Option<Vec<Vec<u8>>> {
