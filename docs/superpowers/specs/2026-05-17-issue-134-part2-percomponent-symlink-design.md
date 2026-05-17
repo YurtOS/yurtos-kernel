@@ -87,6 +87,21 @@ Behaviorally identical to today's `resolve_realpath` except for two knobs:
   name is appended to the fully-resolved parent **without** `readlink`-ing it.
   The terminal must still exist *as an entry* (`entry_type != 0`); a dangling
   terminal symlink counts as existing (filetype 7) and is **not** `ENOENT`.
+
+  **"Terminal" is defined dynamically, not lexically:** a component is the
+  terminal iff `pending.is_empty()` at the moment it is popped from the
+  resolution queue — *not* the last component of `raw_path`. This matters
+  because an intermediate symlink rewrites `pending` (its target's
+  components are spliced in, `path.rs:157`), so the eventual terminal can
+  come from a symlink target. Example: `lstat("/a/sl")` where `sl` →
+  `/x/y`: `sl` is popped with `pending` empty → it *is* the terminal →
+  `follow_terminal=false` does not follow it → `sl` reported as the link.
+  But `lstat("/a/sl/z")` (`sl` → `/x/y`): `sl` is popped with `pending =
+  [z]` (non-empty) → `sl` is intermediate → followed → `pending` becomes
+  `[x, y, z]`, resolved cleared; later `z` is popped with `pending` empty
+  → `z` is the terminal. The `follow_terminal=false` skip therefore keys
+  off the live `pending.is_empty()` check inside the loop, applied to the
+  non-`.`/`..` component being pushed, never a precomputed index.
 - **`authorize_each`** — `true`: `k.publish_proc_snapshots()` then
   `k.can_read_proc_path(caller_pid, cand)` at **every** resolved component
   candidate **and** every symlink-target re-entry; on deny return `EPERM`.
@@ -146,12 +161,30 @@ already used by `PathResolver::realpath`.)
 - Intermediate component missing → `ENOENT`; intermediate component exists but
   is not a directory (and not a symlink that resolves to one) → `ENOTDIR`
   (kept from `resolve_realpath`'s `!pending.is_empty() && ty != 3`).
-- `lstat` terminal `.`/`..` and trailing `/`: lexical reduction makes the
-  effective terminal `.`; `.` is never a symlink, so it is "not followed"
-  trivially and resolves to its (followed) parent dir — POSIX-consistent with
-  trailing-slash forcing directory semantics. No special-casing needed.
+- `.` / `..` are handled **inline in the resolution loop**, not by any
+  lexical pre-pass (there is none): `.` → `continue` (skipped, never a
+  candidate, never "the terminal"); `..` → `resolved.pop()` (also skipped).
+  So for `lstat("/a/b/.")`, when `.` is popped (`pending` empty) it is
+  `continue`d and the terminal that gets pushed is the last *real* name —
+  here `b`, which was popped earlier with `pending = ["."]` non-empty, so
+  `b` is **intermediate** and *is* followed if it is a symlink (POSIX:
+  trailing `/.` forces the preceding symlink to be followed). The resolved
+  result is the (followed) directory; `write_stat_record` types it. This is
+  the genuine loop behavior — not a synthesized `.` terminal.
+- **Trailing slash on a terminal symlink for `lstat` — KNOWN PRESERVED
+  RESIDUAL, not POSIX-conformant (see Non-goals, issue #146).**
+  `split_components` (`path.rs:74`) filters empty parts, so a trailing `/`
+  is silently discarded and synthesizes no `.`. Thus `lstat("/a/symdir/")`
+  (`symdir` a symlink) → `[a, symdir]`, `symdir` is the terminal in
+  `follow_terminal=false` and is **not** followed: it is reported as the
+  link. POSIX requires a trailing slash to force-follow the terminal
+  symlink and demand a directory (`ENOTDIR` otherwise). Today's lexical
+  `lstat`/`stat` already has this deviation; Part 2 **preserves** it
+  unchanged (does not introduce/widen it). Tracked in **#146**; pinned here
+  by a characterization test so a future fix is a deliberate, visible
+  change.
 - Relative intermediate symlink target → joined against resolved-so-far (kept
-  from `resolve_realpath`).
+  from `resolve_realpath`, `path.rs:151-156`).
 - `lstat` of a dangling terminal symlink → reported as the link (filetype 7),
   never `ENOENT` (preserved by the `follow_terminal=false` "exists as entry"
   rule + existing `lstat_on_dangling_symlink_reports_the_link`).
@@ -166,6 +199,18 @@ Consequence: once Part 2 lands, #63's `openat` intermediate symlinks inherit
 per-component faithfulness automatically. Whichever PR merges first, the other
 takes a small additive 2-file (`path.rs`, `fs.rs`) union rebase — the
 project's documented slice-rebase pattern. #142 is sequenced after both.
+
+*Provenance of the #63 claims (verified, not assumed):* read against the #63
+worktree `.worktrees/b2.9-openat` (branch `parity-b2.9-openat-inode-anchor`,
+commit `1d4842f`) — spec
+`docs/superpowers/specs/2026-05-17-b2.9-openat-inode-anchoring-design.md`
+lines 69–74 (`resolve_at` returns `(None, 7)` for symlinks; "dispatch never
+follows symlinks through `resolve_at`; it reconstructs the absolute path and
+delegates to the existing path-based resolver") and 197–200 (symlink mid-walk
+→ reconstruct-absolute + fall back to `sys_open`, "centralized 40-hop
+SYMLOOP"), and the `vfs.rs` `dir_inode`/`resolve_at`/`dir_path` impls. That
+commit is a moving target on an open PR; this note is coordination context,
+re-verify at integration time, not a load-bearing dependency of Part 2.
 
 ## Testing (TDD red → green)
 
@@ -198,6 +243,20 @@ Security (RED then GREEN), both `stat` and `lstat`:
 - an **intermediate** symlink into `/proc/<other-pid>/…` → `EPERM` for a
   non-root caller (mirrors `proc_other_pid_open_gate_survives_symlink_
   resolution`); root still permitted.
+- **per-component-auth non-regression (GREEN, must not RED):** because
+  `authorize_each=true` changes `stat`/`lstat` from one final-path gate to
+  per-prefix gating, a positive test that `stat`/`lstat` of `/proc/self/...`
+  (own proc, multi-component) and of a deep ordinary path (e.g.
+  `/a/b/c/d/e/f`, no `/proc`) **still succeed** — locks the
+  strict-strengthening property so a future `can_read_proc_path` change
+  cannot silently regress ordinary/self-proc resolution.
+
+Known-residual characterization (GREEN, pins preserved behavior — #146):
+- `lstat("/a/symdir/")` with a trailing slash where `symdir` is a
+  symlink-to-dir → asserts the **current** (non-POSIX) behavior: `symdir`
+  reported as the link (filetype 7), *not* followed. Documents the residual
+  so #146's eventual fix is a deliberate, test-visible change, not an
+  accident.
 
 SYMLOOP:
 - an intermediate symlink cycle → `EINVAL` (40-hop), for both.
@@ -214,6 +273,12 @@ cross-crate run needed.
   Realpath's lack of a *per-component* `/proc` gate is a pre-existing,
   separate hardening question — explicitly **not** addressed here to keep this
   slice tight and provably non-regressing.
+- **Trailing-slash (or trailing `/.`) forcing terminal-symlink follow + a
+  directory check** → **#146**. A distinct POSIX residual, pre-existing in
+  today's lexical `stat`/`lstat`; Part 2 preserves current behavior
+  unchanged and pins it with a characterization test (no silent regression),
+  but does not fix it — that belongs in the shared resolver later, sequenced
+  after #134.
 - `sys_open` / other `normalize_readable_path` consumers → #142.
 - dirfd inode-anchoring → #59 / PR #63.
 - New syscalls / ABI method-ids / `host_*` surface changes.
