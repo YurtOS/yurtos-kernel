@@ -6616,13 +6616,13 @@ fn lstat_does_not_follow_symlink_to_regular_file() {
     );
 }
 
-// #134 — POSIX lstat() sets st_size to the byte length of the
-// symlink's target path string (what readlink returns), not the
-// VFS fixed-size-0 convention for non-regular entries. This is
-// confined to write_stat_record's filetype==7 arm; stat_path
-// follows the link chain before typing, so it never reaches this
-// arm and is unaffected (asserted by lstat_*_matches_stat below
-// and the #67 stat_follows_symlink_* tests).
+/// #134 — POSIX lstat() sets st_size to the byte length of the
+/// symlink's target path string (what readlink returns), not the
+/// VFS fixed-size-0 convention for non-regular entries. This is
+/// confined to write_stat_record's filetype==7 arm; stat_path
+/// follows the link chain before typing, so it never reaches this
+/// arm and is unaffected (asserted by lstat_*_matches_stat below
+/// and the #67 stat_follows_symlink_* tests).
 #[test]
 fn lstat_symlink_st_size_is_target_path_length() {
     let _g = crate::kernel::TestGuard::acquire();
@@ -12737,5 +12737,60 @@ fn stat_unix_socket_via_helper_and_intermediate_symlink() {
         u32::from_le_bytes(out[8..12].try_into().unwrap()),
         6,
         "socket still S_IFSOCK after the helper resolves the intermediate symlink"
+    );
+}
+
+/// Issue #134 Part 2 regression (PR #150 review): an empty symlink
+/// target must fail closed with -EINVAL, not silently alias the link
+/// to its parent dir. `symlink(2)` accepts an empty target today, so
+/// `/d/sl -> ""` is constructible; before the helper-level reject,
+/// stat("/d/sl/child") aliased to /d/child (info-probing). Terminal
+/// lstat of the link is unaffected (never readlinked) — still S_IFLNK.
+#[test]
+fn stat_lstat_empty_symlink_target_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    let mut r = (b"/d/child".len() as u32).to_le_bytes().to_vec();
+    r.extend_from_slice(b"/d/child");
+    r.extend_from_slice(b"sibling");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &r, &mut []);
+    // Empty-target symlink: target_len = 0, link path = /d/sl.
+    let mut s = 0u32.to_le_bytes().to_vec();
+    s.extend_from_slice(b"/d/sl");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    // stat: terminal empty symlink is followed → -EINVAL (was: stat'd
+    // the parent /d).
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/d/sl", &mut out),
+        -(abi::EINVAL as i64),
+        "stat of an empty-target symlink fails closed (-EINVAL)"
+    );
+    // stat through it: empty intermediate → -EINVAL (was: stat'd the
+    // unrelated sibling /d/child).
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/d/sl/child", &mut out),
+        -(abi::EINVAL as i64),
+        "empty intermediate symlink does not alias to the parent dir"
+    );
+    // lstat of the link itself: terminal, never readlinked → still
+    // S_IFLNK (Part 1 size = target len = 0). Unaffected by the fix.
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/d/sl", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "lstat reports the empty symlink as S_IFLNK (terminal, not followed)"
+    );
+    assert_eq!(
+        u64::from_le_bytes(out[0..8].try_into().unwrap()),
+        0,
+        "Part 1: empty target → st_size 0"
+    );
+    // lstat through it: empty intermediate → -EINVAL (same as stat).
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/d/sl/child", &mut out),
+        -(abi::EINVAL as i64),
+        "empty intermediate symlink fails closed for lstat too"
     );
 }

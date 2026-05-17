@@ -605,6 +605,18 @@ fn resolve_symlinks_per_component(
             i += 1;
             continue;
         };
+        // An empty symlink target is malformed: fail closed with
+        // -EINVAL, matching the old terminal-only path
+        // (follow_symlinks → normalize_readable_path(b"") → -EINVAL).
+        // Without this, the relative-target branch would splice ""
+        // and silently alias the link to its parent dir (e.g.
+        // stat("/d/sl/child") with `sl -> ""` would stat /d/child) —
+        // a behavioral regression with an information-probing flavor.
+        // (`symlink(2)` itself still accepts an empty target;
+        // rejecting at creation is a separate, broader decision.)
+        if target.is_empty() {
+            return Err(-(abi::EINVAL as i64));
+        }
         hops += 1;
         if hops > SYMLOOP_MAX {
             return Err(-(abi::EINVAL as i64));
