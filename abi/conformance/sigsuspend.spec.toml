@@ -6,4 +6,4 @@ name = "sigsuspend_resumes_on_raise"
 inputs = "install handler; raise(SIGUSR2) — handler runs synchronously"
 expected.exit = 0
 expected.stdout = "sigsuspend:handled"
-expected.note = "yurt dispatches on raise() rather than blocking; sigsuspend mask swap is kernel-owned but delivery is B1.8-b-gated"
+expected.note = "kernel swaps the caller-thread mask and restores it immediately, returning -EINTR (true blocking is B1.5/AsyncBridge-gated, spec §11.3); the handler runs via the canary's user-side raise(), not a kernel raise-dispatch"

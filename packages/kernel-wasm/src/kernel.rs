@@ -86,6 +86,7 @@ impl SigAltStack {
     /// `sigaltstack(2)`); `active` is signaled by `SS_ONSTACK`.
     // Dormant until B1.8-b signal delivery gates on SS_ONSTACK
     // (spec §11.7 — EPERM path exists in sigaltstack handler, no delivery caller yet).
+    // Called by dispatch/tests.rs (Task-2 test); dead only in the non-test lib build.
     #[allow(dead_code)]
     pub fn is_disabled(&self) -> bool {
         // SS_ONSTACK means "currently in use" — override any other flag.
