@@ -1434,9 +1434,21 @@ impl Kernel {
                 pgid: if p.pgid == 0 { *pid } else { p.pgid },
                 sid: if p.sid == 0 { *pid } else { p.sid },
                 argv: p.argv.clone(),
-                // ProcessSnapshot.cwd is the /proc/<pid>/cwd path
-                // string — the absolute snapshot, not the dual shape.
-                cwd: p.cwd.path.clone(),
+                // /proc/<pid>/cwd must be the LIVE directory path.
+                // `cwd.path` is only a cache refreshed by that
+                // process's own relative-path / getcwd / fchdir; a
+                // rename behind an inode-anchored cwd leaves it stale.
+                // Resolve through the live inode→path map (the same
+                // source getcwd uses) so procfs and getcwd agree. A
+                // removed dir (dir_abspath_in == None) or a degraded
+                // (dir_inode == None) cwd falls back to the snapshot.
+                cwd: match p.cwd.dir_inode {
+                    Some(ino) => self
+                        .vfs
+                        .dir_abspath_in(p.cwd.mount_id, ino)
+                        .unwrap_or_else(|| p.cwd.path.clone()),
+                    None => p.cwd.path.clone(),
+                },
             })
             .collect();
         self.vfs.refresh_processes(&snaps);

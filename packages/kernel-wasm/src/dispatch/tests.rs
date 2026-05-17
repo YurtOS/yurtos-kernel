@@ -4959,6 +4959,43 @@ fn proc_cwd_serves_chdir_path() {
 }
 
 #[test]
+fn proc_cwd_reflects_inode_anchored_cwd_after_rename() {
+    // Regression (review finding 2): with an inode-anchored cwd,
+    // /proc/<pid>/cwd must report the LIVE directory path, not the
+    // cached snapshot. fchdir into /base, then rename /base→/renamed
+    // via ABSOLUTE paths (which does NOT refresh pid 1's cwd.path),
+    // then read /proc/1/cwd via an ABSOLUTE open (also no refresh).
+    // procfs must still resolve through the live inode → /renamed,
+    // matching what getcwd would report — not the stale /base.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/base", b"/renamed"),
+            &mut []
+        ),
+        0
+    );
+
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/proc/1/cwd"), &mut []);
+    assert!(fd >= 3, "open /proc/1/cwd returned {fd}");
+    let mut buf = [0u8; 64];
+    let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
+    assert_eq!(
+        &buf[..n as usize],
+        b"/renamed",
+        "procfs cwd must track the rename via the live inode, not the stale snapshot"
+    );
+}
+
+#[test]
 fn proc_status_includes_name_when_argv_present() {
     let _g = crate::kernel::TestGuard::acquire();
     assert_eq!(dispatch(METHOD_SYS_GETUID, 6, &[], &mut []), 1000);
