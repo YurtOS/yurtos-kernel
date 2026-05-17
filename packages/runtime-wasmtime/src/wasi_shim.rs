@@ -25,8 +25,89 @@
 use anyhow::{anyhow, Result};
 use wasmtime::{Caller, Linker};
 
+use std::sync::atomic::{AtomicU8, Ordering};
+use wasmtime::{Memory, SharedMemory};
+
 use crate::kernel_host_interface::UserState;
 use yurt_kernel_host_interface_core::{checked_guest_buffer_len, checked_guest_buffer_sum};
+
+/// Unified handle over guest user memory that transparently falls
+/// back from linear `Memory` to `SharedMemory` (#132). Threaded
+/// guests (`wasm32-wasip1-threads`) import a `SharedMemory`, on
+/// which `Extern::into_memory()` returns `None` — so the pre-#132
+/// shim bailed on every WASI call for those guests. This handle
+/// mirrors the `sys_*` trampoline's `read_user_guest_bytes` /
+/// `write_user_guest_bytes` fallback, with the same `AtomicU8` SeqCst
+/// access for `SharedMemory` cells.
+///
+/// Existing call sites keep their `memory.read(&caller, addr, &mut buf)`
+/// / `memory.write(&mut caller, addr, &bytes)` shape; the enum routes
+/// to the correct backend.
+enum GuestMemoryHandle {
+    Linear(Memory),
+    Shared(SharedMemory),
+}
+
+impl GuestMemoryHandle {
+    fn from_caller(caller: &mut Caller<'_, UserState>) -> Option<Self> {
+        if let Some(extern_) = caller.get_export("memory") {
+            if let Some(m) = extern_.clone().into_memory() {
+                return Some(GuestMemoryHandle::Linear(m));
+            }
+            if let Some(m) = extern_.into_shared_memory() {
+                return Some(GuestMemoryHandle::Shared(m));
+            }
+        }
+        None
+    }
+
+    fn read(
+        &self,
+        caller: &Caller<'_, UserState>,
+        addr: usize,
+        buf: &mut [u8],
+    ) -> std::result::Result<(), ()> {
+        match self {
+            GuestMemoryHandle::Linear(m) => m.read(caller, addr, buf).map_err(|_| ()),
+            GuestMemoryHandle::Shared(m) => {
+                let data = m.data();
+                let end = addr.checked_add(buf.len()).ok_or(())?;
+                let cells = data.get(addr..end).ok_or(())?;
+                for (out, cell) in buf.iter_mut().zip(cells) {
+                    let ptr = cell.get().cast::<AtomicU8>();
+                    // SAFETY: Wasmtime exposes shared memory as
+                    // `UnsafeCell<u8>` because concurrent wasm threads
+                    // may access it. `AtomicU8` is layout-compatible.
+                    *out = unsafe { (*ptr).load(Ordering::SeqCst) };
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn write(
+        &self,
+        caller: &mut Caller<'_, UserState>,
+        addr: usize,
+        bytes: &[u8],
+    ) -> std::result::Result<(), ()> {
+        match self {
+            GuestMemoryHandle::Linear(m) => m.write(caller, addr, bytes).map_err(|_| ()),
+            GuestMemoryHandle::Shared(m) => {
+                let data = m.data();
+                let end = addr.checked_add(bytes.len()).ok_or(())?;
+                let cells = data.get(addr..end).ok_or(())?;
+                for (cell, byte) in cells.iter().zip(bytes) {
+                    let ptr = cell.get().cast::<AtomicU8>();
+                    // SAFETY: same as `read` — atomic store on the
+                    // `UnsafeCell<u8>` exposed by Wasmtime.
+                    unsafe { (*ptr).store(*byte, Ordering::SeqCst) };
+                }
+                Ok(())
+            }
+        }
+    }
+}
 
 const WASI: &str = "wasi_snapshot_preview1";
 
@@ -51,6 +132,9 @@ fn posix_to_wasi(posix: i32) -> i32 {
         2 => 44,  // ENOENT
         9 => 8,   // EBADF
         11 => 6,  // EAGAIN
+        14 => 21, // EFAULT — the guest-memory helpers return this on
+        //                  short/out-of-bounds reads (incl. SharedMemory
+        //                  fallback failures).
         22 => 28, // EINVAL
         29 => 70, // ESPIPE
         32 => 64, // EPIPE
@@ -93,7 +177,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
          iovs_len: u32,
          nwritten_ptr: u32|
          -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -174,7 +258,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
          iovs_len: u32,
          nread_ptr: u32|
          -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -320,7 +404,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         WASI,
         "args_get",
         |mut caller: Caller<'_, UserState>, argv_ptr: u32, argv_buf_ptr: u32| -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -352,7 +436,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         WASI,
         "args_sizes_get",
         |mut caller: Caller<'_, UserState>, count_ptr: u32, size_ptr: u32| -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -388,7 +472,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         WASI,
         "environ_sizes_get",
         |mut caller: Caller<'_, UserState>, count_ptr: u32, size_ptr: u32| -> i32 {
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -428,7 +512,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 return if err == EBADF { ESPIPE } else { err };
             }
             // Spec: write the new offset as u64 LE into *new_offset_ptr.
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -458,7 +542,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             //   fs_rights_base (u64), fs_rights_inheriting (u64).
             // For stdio (fds 0/1/2) we report filetype = 2
             // (CHARACTER_DEVICE) so std doesn't try to seek them.
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -512,7 +596,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if rc != 8 {
                 return errno_from_kernel(rc);
             }
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -536,7 +620,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if fd != PREOPEN_ROOT_FD {
                 return EBADF;
             }
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -563,7 +647,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if (path_len as usize) < PREOPEN_ROOT_NAME.len() {
                 return EINVAL;
             }
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -623,7 +707,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             // `cookie` entries, write the rest as WASI dirents).
             let mut cur = 4usize;
             let mut written = 0usize;
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return 28, // EINVAL
             };
@@ -700,7 +784,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if old_dirfd != PREOPEN_ROOT_FD || new_dirfd != PREOPEN_ROOT_FD {
                 return EBADF;
             }
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -773,7 +857,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if old_dirfd != PREOPEN_ROOT_FD || new_dirfd != PREOPEN_ROOT_FD {
                 return EBADF;
             }
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -844,7 +928,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if dirfd != PREOPEN_ROOT_FD {
                 return EBADF;
             }
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -941,7 +1025,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             }
             let size = u64::from_le_bytes(resp[0..8].try_into().unwrap());
             let filetype = u32::from_le_bytes(resp[8..12].try_into().unwrap()) as u8;
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EINVAL,
             };
@@ -997,7 +1081,7 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if len == 0 {
                 return 0;
             }
-            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+            let memory = match GuestMemoryHandle::from_caller(&mut caller) {
                 Some(m) => m,
                 None => return EFAULT,
             };
