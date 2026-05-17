@@ -3026,6 +3026,66 @@ fn user_process_recvfrom_returns_source_address_through_trampoline() {
     assert_eq!(&user.read_memory(512, 12).unwrap(), b"/tmp/tx.sock");
 }
 
+/// Regression for the recvmsg half of the same host-trampoline
+/// truncation: `recvmsg` returns `rc` = data-byte count, but the
+/// SCM_RIGHTS fd count + fd array sit at scratch offset `out_cap`
+/// (>= rc). The old `min(rc, out_cap)` copy-back dropped them, so the
+/// guest never received passed fds. Sends one byte + one fd over an
+/// AF_UNIX socketpair via sendmsg and asserts recvmsg delivers the fd.
+#[test]
+fn user_process_recvmsg_delivers_scm_rights_fd_through_trampoline() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_socket_open" (func $open (param i32 i32 i32) (result i32)))
+          (import "env" "sys_socketpair"
+            (func $socketpair (param i32 i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_sendmsg"
+            (func $sendmsg (param i32 i32 i32 i32 i32) (result i64)))
+          (import "env" "sys_socket_recvmsg"
+            (func $recvmsg (param i32 i32 i32 i32 i32 i32) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 64) "x")
+          (data (i32.const 200) "\ff\ff\ff\ff")
+          (global $a (mut i32) (i32.const -1))
+          (global $b (mut i32) (i32.const -1))
+          (global $pass (mut i32) (i32.const -1))
+          (func (export "setup") (result i32)
+            (drop (call $socketpair (i32.const 3) (i32.const 6) (i32.const 0) (i32.const 16)))
+            (global.set $a (i32.load (i32.const 16)))
+            (global.set $b (i32.load (i32.const 20)))
+            (global.set $pass (call $open (i32.const 3) (i32.const 5) (i32.const 0)))
+            (i32.store (i32.const 32) (global.get $pass))
+            (i32.add (i32.add (global.get $a) (global.get $b)) (global.get $pass)))
+          (func (export "send") (result i32)
+            (i32.wrap_i64
+              (call $sendmsg (global.get $a) (i32.const 64) (i32.const 1)
+                (i32.const 32) (i32.const 1))))
+          (func (export "recv") (result i32)
+            (i32.wrap_i64
+              (call $recvmsg (global.get $b) (i32.const 128) (i32.const 16)
+                (i32.const 160) (i32.const 1) (i32.const 200)))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    assert!(user.call_export_i32("setup").unwrap() >= 0);
+    assert_eq!(user.call_export_i32("send").unwrap(), 1);
+    assert_eq!(user.call_export_i32("recv").unwrap(), 1);
+    // Decisive: n_fds at offset 200 was pre-seeded 0xFFFFFFFF; the old
+    // truncation left the fd-count field unread (would resolve to 0),
+    // the fix delivers exactly one passed fd.
+    assert_eq!(
+        u32::from_le_bytes(user.read_memory(200, 4).unwrap().try_into().unwrap()),
+        1
+    );
+    assert!(
+        i32::from_le_bytes(user.read_memory(160, 4).unwrap().try_into().unwrap()) >= 0,
+        "a real fd should be installed in the receiver"
+    );
+}
+
 #[test]
 fn user_process_socket_option_round_trips_through_kernel() {
     let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();

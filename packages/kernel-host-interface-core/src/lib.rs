@@ -68,6 +68,11 @@ pub enum EngineError {
 #[derive(Debug)]
 pub struct KernelDispatchOutcome {
     pub rc: i64,
+    /// The full requested scratch window (up to `response_cap`), **not**
+    /// truncated to `rc`: out-params (recvfrom source address, recvmsg
+    /// SCM_RIGHTS fds) live at fixed offsets past `rc`. Callers that
+    /// follow the "rc == bytes written" convention must clamp their
+    /// user-visible copy to `rc` themselves (the trampoline helpers do).
     pub response: Vec<u8>,
 }
 
