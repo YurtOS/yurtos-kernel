@@ -9788,6 +9788,13 @@ fn sigaltstack_roundtrip_and_undersized_einval() {
         ),
         0
     );
+    // prior state returned by the install call must be the initial disabled stack
+    assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 0);
+    assert_eq!(
+        i32::from_le_bytes(out[4..8].try_into().unwrap()),
+        2 /* SS_DISABLE */
+    );
+    assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 0);
     // query (has_ss=0) returns what we set
     assert_eq!(
         dispatch(METHOD_SYS_SIGALTSTACK, 1, &sigaltstack_req(None), &mut out),
@@ -9804,5 +9811,24 @@ fn sigaltstack_roundtrip_and_undersized_einval() {
             &mut out
         ),
         -(crate::abi::EINVAL as i64)
+    );
+    // SS_DISABLE branch: disabling clears the stack back to disabled
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGALTSTACK,
+            1,
+            &sigaltstack_req(Some((0, 2 /*SS_DISABLE*/, 0))),
+            &mut out
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGALTSTACK, 1, &sigaltstack_req(None), &mut out),
+        0
+    );
+    assert_eq!(
+        i32::from_le_bytes(out[4..8].try_into().unwrap()) & 2,
+        2,
+        "alt-stack disabled (SS_DISABLE set)"
     );
 }
