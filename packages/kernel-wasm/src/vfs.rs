@@ -947,6 +947,17 @@ impl VfsBackend for RamfsBackend {
                 return -(crate::abi::EINVAL as i64) as i32;
             }
         }
+        // The destination's parent directory must exist (POSIX
+        // ENOENT). `MountTable::rename` only proves both paths route
+        // to the same mount, not that the parent is real, so without
+        // this the recursive dir re-key — and the dir-inode reverse
+        // map — would publish a ghost subtree under a non-existent
+        // parent that an open dirfd/cwd could keep resolving. Same
+        // shape as the `mkdir` parent check; `parent_of` yields the
+        // always-present root "/" for a top-level destination.
+        if !self.dir_inodes.contains_key(&Self::parent_of(new_path)) {
+            return -crate::abi::ENOENT;
+        }
         // Destination handling: refuse if it's a directory (POSIX
         // requires the destination be empty, and we don't yet
         // walk children to check). Replace a regular file by
@@ -1276,6 +1287,43 @@ mod tests {
         assert_eq!(b.dir_inode(b"/"), Some(root), "root inode unchanged");
         assert_eq!(b.dir_inode(b"/new"), None, "no phantom /new anchor");
         assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
+    }
+
+    #[test]
+    fn ramfs_rename_into_missing_parent_is_enoent() {
+        // POSIX: rename fails ENOENT when a directory component of the
+        // destination does not exist. Without this guard the recursive
+        // dir re-key publishes a ghost subtree, and the new dir-inode
+        // reverse map reports its live path under a non-existent
+        // parent — an open dirfd/cwd could keep resolving/creating
+        // inside an unreachable tree. (mkdir already guards this.)
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.mkdir(b"/a"), 0);
+        assert_eq!(b.mkdir(b"/a/sub"), 0);
+        let a_ino = b.dir_inode(b"/a").unwrap();
+        let sub_ino = b.dir_inode(b"/a/sub").unwrap();
+
+        // Directory source, missing destination parent "/missing".
+        assert_eq!(b.rename(b"/a", b"/missing/a"), -crate::abi::ENOENT);
+        assert_eq!(b.dir_inode(b"/a"), Some(a_ino), "source dir unmoved");
+        assert_eq!(b.dir_inode(b"/missing/a"), None, "no ghost dir inode");
+        assert_eq!(b.dir_inode(b"/a/sub"), Some(sub_ino), "subtree unmoved");
+        assert_eq!(
+            b.dir_path(a_ino).as_deref(),
+            Some(&b"/a"[..]),
+            "reverse map not moved to a ghost path"
+        );
+
+        // Regular-file source, same missing parent → same ENOENT
+        // (the destination-parent rule is type-agnostic).
+        let f_ino = b.install(b"/f".to_vec(), b"x".to_vec());
+        assert_eq!(b.rename(b"/f", b"/missing/f"), -crate::abi::ENOENT);
+        assert_eq!(
+            b.paths.get(b"/f".as_slice()).copied(),
+            Some(f_ino),
+            "file unmoved"
+        );
+        assert_eq!(b.paths.get(b"/missing/f".as_slice()), None, "no ghost file");
     }
 
     #[test]
