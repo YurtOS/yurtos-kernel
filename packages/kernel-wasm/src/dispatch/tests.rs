@@ -961,6 +961,74 @@ fn dup2_to_arbitrary_high_fd_works() {
     );
 }
 
+// #71 Low — dup2/dup3 must bound newfd by RLIMIT_NOFILE (POSIX EBADF).
+#[test]
+fn dup2_dup3_reject_newfd_at_or_above_rlimit_nofile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        // RLIMIT_NOFILE is slot 7; lower the soft limit.
+        k.process_mut(1).rlimits[7] = Some((16, 1024));
+    });
+    let mut over = 1u32.to_le_bytes().to_vec();
+    over.extend_from_slice(&16u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP2, 1, &over, &mut []),
+        -(abi::EBADF as i64),
+        "dup2 newfd >= RLIMIT_NOFILE soft → EBADF"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP3, 1, &dup3_req(1, 99, 0), &mut []),
+        -(abi::EBADF as i64),
+        "dup3 newfd >= RLIMIT_NOFILE soft → EBADF"
+    );
+    // Below the limit still works (no regression).
+    let mut ok = 1u32.to_le_bytes().to_vec();
+    ok.extend_from_slice(&5u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_DUP2, 1, &ok, &mut []), 5);
+}
+
+#[test]
+fn sendto_tolerates_msg_dontwait_nosignal_and_eopnotsupp_for_unknown() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+        3
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+        4
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_BIND,
+            1,
+            &socket_bind_unix_req(3, b"/tmp/flagsock"),
+            &mut []
+        ),
+        0
+    );
+    // MSG_DONTWAIT(0x40) | MSG_NOSIGNAL(0x4000): ignored, not EINVAL.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDTO,
+            1,
+            &socket_sendto_req(4, 0x40 | 0x4000, &sockaddr_un(b"/tmp/flagsock"), b"hello"),
+            &mut []
+        ),
+        5
+    );
+    // An unsupported flag is EOPNOTSUPP, not the catch-all EINVAL.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDTO,
+            1,
+            &socket_sendto_req(4, 0x1, &sockaddr_un(b"/tmp/flagsock"), b"x"),
+            &mut []
+        ),
+        -(abi::EOPNOTSUPP as i64)
+    );
+}
+
 #[test]
 fn dup2_same_fd_is_noop_when_open() {
     let _g = crate::kernel::TestGuard::acquire();
