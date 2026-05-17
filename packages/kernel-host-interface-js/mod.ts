@@ -2232,6 +2232,24 @@ export class KernelHostInterface {
         );
         return 0;
       },
+      kh_random: (outPtr: number, len: number): number => {
+        // Platform CSPRNG via Web Crypto — Deno, Node (globalThis.crypto),
+        // and browsers. Never /dev/random (browsers have none). Web Crypto
+        // caps at 65536 bytes per call, so chunk; mirrors the TS kernel's
+        // packages/kernel/src/vfs/dev-provider.ts.
+        if (len === 0) return 0;
+        try {
+          const view = new Uint8Array(memoryRef.memory!.buffer, outPtr, len);
+          for (let off = 0; off < len; off += 65536) {
+            crypto.getRandomValues(
+              view.subarray(off, Math.min(off + 65536, len)),
+            );
+          }
+          return 0;
+        } catch {
+          return -EIO;
+        }
+      },
       kh_log: (severity: number, msgPtr: number, msgLen: number): number => {
         const bytes = new Uint8Array(memoryRef.memory!.buffer, msgPtr, msgLen);
         const message = new TextDecoder().decode(bytes);
