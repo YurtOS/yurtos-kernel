@@ -898,6 +898,84 @@ pub(super) fn sys_syncfs(caller_pid: u32, request: &[u8]) -> i64 {
     sys_fsync(caller_pid, request)
 }
 
+// ── flock(2) — issue #89 (fcntl byte-range locks are follow-up) ────
+
+/// `flock(2)` operation bits.
+const LOCK_SH: u32 = 1;
+const LOCK_EX: u32 = 2;
+const LOCK_NB: u32 = 4;
+const LOCK_UN: u32 = 8;
+const LOCK_OP_MASK: u32 = LOCK_SH | LOCK_EX | LOCK_NB | LOCK_UN;
+
+/// Linux `EWOULDBLOCK` = `EAGAIN` = 11; the constant we already mirror
+/// in `abi.rs` is `EAGAIN`, so use it directly. `flock(2)` returns
+/// EWOULDBLOCK on `LOCK_NB` conflict; the two values are identical on
+/// Linux so callers comparing either match.
+const FLOCK_EWOULDBLOCK: i32 = abi::EAGAIN;
+
+/// `sys_flock(fd, operation)` — POSIX/BSD flock. Request: u32 fd LE +
+/// u32 operation LE (8 bytes). Operation: exactly one of LOCK_SH=1,
+/// LOCK_EX=2, LOCK_UN=8, OR-able with LOCK_NB=4 (return EWOULDBLOCK on
+/// conflict instead of blocking).
+///
+/// Locks are associated with the **open file description**, so
+/// `dup`/`fork` share, a fresh `open()` of the same file does not.
+/// Closing the last fd that references an OFD drops its lock (handled
+/// in `Kernel::ofd_dec_ref`).
+///
+/// Single-threaded kernel: blocking variants (no `LOCK_NB`) cannot
+/// actually wait, so they also return `-EWOULDBLOCK` on conflict.
+/// True blocking is AsyncBridge-gated (issue #89, B1.5). `fcntl`
+/// byte-range locks are a separate follow-up.
+///
+/// Errnos: 0 success, -EINVAL (bad op / no/multiple op bits / short
+/// request), -EBADF (unknown fd / non-file fd), -EWOULDBLOCK (lock
+/// conflict). Issue #89.
+pub(super) fn sys_flock(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() != 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let op = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    if op & !LOCK_OP_MASK != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    // Exactly one of SH/EX/UN must be set.
+    let kind_bits = op & (LOCK_SH | LOCK_EX | LOCK_UN);
+    if kind_bits == 0 || kind_bits.count_ones() != 1 {
+        return -(abi::EINVAL as i64);
+    }
+    let _nb = op & LOCK_NB != 0; // blocking variants are gate-deferred — same
+                                 // return shape today, kept for forward compat.
+    with_kernel(|k| {
+        let ofd_id = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(crate::kernel::FdEntry::File { ofd_id }) => *ofd_id,
+            // flock on dir/pipe/socket/tty: Linux returns EINVAL for
+            // non-file types; we surface EBADF for the same end-user
+            // outcome ("can't lock this fd") with a uniform shape
+            // against fsync/ftruncate. Issue #89 doc lists EINVAL on
+            // some types; this is the conservative choice for the
+            // ramfs-only landing.
+            Some(_) => return -(abi::EBADF as i64),
+            None => return -(abi::EBADF as i64),
+        };
+        let Some(ofd) = k.ofd(ofd_id) else {
+            return -(abi::EBADF as i64);
+        };
+        let mount_id = ofd.mount_id;
+        let inode = ofd.inode;
+        if op & LOCK_UN != 0 {
+            k.flock_release(ofd_id, mount_id, inode);
+            return 0;
+        }
+        let exclusive = op & LOCK_EX != 0;
+        match k.flock_try_acquire(ofd_id, mount_id, inode, exclusive) {
+            Ok(()) => 0,
+            Err(()) => -(FLOCK_EWOULDBLOCK as i64),
+        }
+    })
+}
+
 // ── access(2) / faccessat(2) — issue #86 ────────────────────────────
 
 /// `mode` bits (POSIX): F_OK=0 (existence only), X_OK=1, W_OK=2, R_OK=4.
