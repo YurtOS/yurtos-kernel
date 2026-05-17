@@ -9924,3 +9924,28 @@ fn sigtimedwait_leaves_unselected_queued_signal_in_place() {
         crate::kernel::with_kernel(|k| k.process_mut(1).pending_rt.iter().any(|s| s.signo == 10));
     assert!(still, "unselected SIGUSR1 must remain queued");
 }
+
+#[test]
+fn sigtimedwait_does_not_drain_kill_bitmask_documented_rt_only_divergence() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(1);
+    // SIGTERM made pending via the kill bitmask (NOT the RT queue)
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).pending_signals |= 1u64 << (15 - 1);
+    });
+    // sigtimedwait selecting SIGTERM (compact slot 3) — RT-queue-only,
+    // so the kill-bitmask SIGTERM is NOT accepted: EAGAIN here vs SIGTERM
+    // on Linux (documented divergence, spec §11.6).
+    let mut req = vec![1u8 << 3, 1u8];
+    req.extend_from_slice(&0i64.to_le_bytes());
+    req.extend_from_slice(&0i64.to_le_bytes());
+    let mut info = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGTIMEDWAIT, 1, &req, &mut info),
+        -(crate::abi::EAGAIN as i64),
+        "sigtimedwait is RT-queue-only; kill-bitmask signal not accepted (§11.6)"
+    );
+    // and the kill-bitmask bit is left untouched
+    let still = crate::kernel::with_kernel(|k| k.process_mut(1).pending_signals & (1u64 << (15 - 1)));
+    assert_ne!(still, 0, "pending_signals SIGTERM bit must remain set");
+}

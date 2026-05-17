@@ -401,7 +401,7 @@ int64_t yurt_host_sigsuspend(int req_ptr, int req_len);
 
 /* host_sigtimedwait(req_ptr, req_len, out_ptr, out_cap) -> i64
  *   Request: u8 set + u8 has_timeout + i64 tv_sec + i64 tv_nsec = 18 bytes
- *   Response: 16 bytes { i32 si_signo, i32 si_errno, i32 si_code, i32 si_pid }
+ *   Response: 16 bytes { i32 si_signo, i32 si_code (SI_QUEUE=-1), u32 si_pid (sender), i32 si_value } (LE)
  */
 __attribute__((import_module("yurt"), import_name("host_sigtimedwait")))
 int64_t yurt_host_sigtimedwait(int req_ptr, int req_len, int out_ptr, int out_cap);
