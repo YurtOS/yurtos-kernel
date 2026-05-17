@@ -12988,3 +12988,135 @@ fn stat_terminal_orphan_symlink_still_follows_base_parity() {
         "lstat reports the terminal orphan symlink as S_IFLNK"
     );
 }
+
+// ── #96: prctl(PR_SET_NAME / PR_GET_NAME) ────────────────────────────
+
+fn prctl_req(option: u32, args: [u32; 4], payload: &[u8]) -> Vec<u8> {
+    let mut req = Vec::with_capacity(20 + payload.len());
+    req.extend_from_slice(&option.to_le_bytes());
+    for a in args {
+        req.extend_from_slice(&a.to_le_bytes());
+    }
+    req.extend_from_slice(payload);
+    req
+}
+
+#[test]
+fn prctl_set_name_then_get_name_round_trips() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let req = prctl_req(15 /* PR_SET_NAME */, [0; 4], b"jupyter");
+    assert_eq!(dispatch(METHOD_SYS_PRCTL, 1, &req, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    let get = prctl_req(16 /* PR_GET_NAME */, [0; 4], &[]);
+    assert_eq!(dispatch(METHOD_SYS_PRCTL, 1, &get, &mut out), 16);
+    assert_eq!(&out[..7], b"jupyter");
+    assert_eq!(out[7], 0, "Linux convention: 15 chars + NUL within 16");
+}
+
+#[test]
+fn prctl_set_name_truncates_at_fifteen_chars_and_nul_terminates() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // 17-char payload (longer than the 15-char usable + NUL window).
+    let long = b"abcdefghijklmnopq";
+    let req = prctl_req(15, [0; 4], long);
+    assert_eq!(dispatch(METHOD_SYS_PRCTL, 1, &req, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    let get = prctl_req(16, [0; 4], &[]);
+    assert_eq!(dispatch(METHOD_SYS_PRCTL, 1, &get, &mut out), 16);
+    assert_eq!(&out[..15], &long[..15], "first 15 bytes preserved");
+    assert_eq!(out[15], 0, "byte 16 is always NUL");
+}
+
+#[test]
+fn prctl_get_name_default_is_all_zero() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 16];
+    let get = prctl_req(16, [0; 4], &[]);
+    assert_eq!(dispatch(METHOD_SYS_PRCTL, 1, &get, &mut out), 16);
+    assert_eq!(out, [0u8; 16]);
+}
+
+#[test]
+fn prctl_get_name_short_response_buffer_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 8]; // < TASK_COMM_LEN
+    let get = prctl_req(16, [0; 4], &[]);
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &get, &mut out),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn prctl_unknown_option_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // PR_SET_DUMPABLE=4 etc. — unimplemented options surface EINVAL.
+    let req = prctl_req(4, [0; 4], &[]);
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &req, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn prctl_short_request_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // 19 bytes — one short of the 20-byte 5x u32 args header.
+    let short = vec![0u8; 19];
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &short, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn prctl_set_name_empty_payload_clears_to_all_zero() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // First set a name, then clear it.
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &prctl_req(15, [0; 4], b"x"), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &prctl_req(15, [0; 4], &[]), &mut []),
+        0
+    );
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &prctl_req(16, [0; 4], &[]), &mut out),
+        16
+    );
+    assert_eq!(out, [0u8; 16]);
+}
+
+#[test]
+fn prctl_name_is_per_process() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Set pid 1's name.
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &prctl_req(15, [0; 4], b"proc1"), &mut []),
+        0
+    );
+    // Set pid 2's name to a different string. The kernel lazily
+    // vivifies pid 2 on first access; this also exercises the
+    // Default-state initialization of comm = [0; 16].
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 2, &prctl_req(15, [0; 4], b"proc2"), &mut []),
+        0
+    );
+    // Read back: each pid sees its own name.
+    let mut out1 = [0u8; 16];
+    let mut out2 = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &prctl_req(16, [0; 4], &[]), &mut out1),
+        16
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 2, &prctl_req(16, [0; 4], &[]), &mut out2),
+        16
+    );
+    assert_eq!(&out1[..5], b"proc1");
+    assert_eq!(&out2[..5], b"proc2");
+}

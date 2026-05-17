@@ -424,6 +424,13 @@ pub struct Process {
     /// through /proc/<pid>/cmdline and /proc/<pid>/comm. Empty for
     /// tests that create processes directly without spawn metadata.
     pub argv: Vec<Vec<u8>>,
+    /// Process name (Linux `prctl(PR_SET_NAME/PR_GET_NAME)` /
+    /// `pthread_setname_np`/`pthread_getname_np`). Fixed 16-byte buffer
+    /// (Linux's `TASK_COMM_LEN`); SET writes up to 15 chars + NUL,
+    /// GET reads the full 16 back. Initialized to all-zero, so a
+    /// process that never SETs its name reads back an empty string.
+    /// Surfaces in /proc/<pid>/comm and observability tools. (#96)
+    pub comm: [u8; 16],
     /// Parent pid. 0 means "no parent / kernel is parent" (the
     /// initial user process and any orphaned children point here).
     /// Set by kernel-owned spawn paths when a child process is
@@ -490,6 +497,7 @@ impl Default for Process {
             yield_count: 0,
             last_nanosleep_ns: 0,
             argv: Vec::new(),
+            comm: [0u8; 16],
             ppid: 0,
             has_controlling_tty: false,
             children: Vec::new(),
