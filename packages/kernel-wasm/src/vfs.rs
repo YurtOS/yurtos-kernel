@@ -96,6 +96,16 @@ pub trait VfsBackend: Send {
     /// Truncate the file's content to length zero.
     fn truncate(&mut self, inode: u64);
 
+    /// Resize the file at `inode` to exactly `length` bytes. Shrink
+    /// discards trailing data; extend zero-fills the gap. Default
+    /// returns -EROFS (matching `unlink`/`mkdir`/etc. on read-only
+    /// backends); writable backends override. Host-fs–backed mounts
+    /// will eventually forward to a real `kh_real_ftruncate` primitive
+    /// — for now they keep the EROFS default. Issue #87.
+    fn set_len(&mut self, _inode: u64, _length: u64) -> i32 {
+        -30 // -EROFS
+    }
+
     /// Read up to `buf.len()` bytes starting at `offset`. Returns
     /// bytes copied; 0 means EOF; negative is a kernel-style POSIX
     /// errno.
@@ -296,6 +306,17 @@ impl MountTable {
     pub fn truncate(&mut self, mount_id: MountId, inode: u64) {
         if let Some(m) = self.mounts.get_mut(mount_id as usize) {
             m.backend.truncate(inode);
+        }
+    }
+
+    /// Set the file's length to exactly `length` bytes (issue #87 —
+    /// ftruncate/truncate). Returns 0 on success or a negated POSIX
+    /// errno from the backend (-EROFS on read-only mounts, -EBADF for
+    /// an unknown inode, etc.). Wraps `VfsBackend::set_len`.
+    pub fn set_len(&mut self, mount_id: MountId, inode: u64, length: u64) -> i32 {
+        match self.mounts.get_mut(mount_id as usize) {
+            Some(m) => m.backend.set_len(inode, length),
+            None => -(crate::abi::EBADF as i32),
         }
     }
 
@@ -646,6 +667,20 @@ impl VfsBackend for RamfsBackend {
         if let Some(buf) = self.inodes.get_mut(&inode) {
             buf.clear();
         }
+    }
+
+    fn set_len(&mut self, inode: u64, length: u64) -> i32 {
+        let Some(content) = self.inodes.get_mut(&inode) else {
+            return -(crate::abi::EBADF as i32);
+        };
+        // usize::MAX on wasm32 is 4 GiB - 1; refuse anything that
+        // would overflow the host buffer. EFBIG matches POSIX intent
+        // (resource limit / file too large) better than EINVAL here.
+        let Ok(len_usize) = usize::try_from(length) else {
+            return -(crate::abi::EFBIG as i32);
+        };
+        content.resize(len_usize, 0);
+        0
     }
 
     fn read(&self, inode: u64, offset: u64, buf: &mut [u8]) -> i64 {
@@ -2006,6 +2041,17 @@ impl VfsBackend for OverlayBackend {
             // read-only. Silently ignore (matches POSIX truncate-on-
             // O_TRUNC of a file with no write permission: error,
             // but we don't have an errno return on truncate yet).
+        }
+    }
+
+    fn set_len(&mut self, inode: u64, length: u64) -> i32 {
+        match self.layered.get(&inode) {
+            Some(&(Layer::Upper, inner)) => self.upper.set_len(inner, length),
+            // Lower is read-only; matches the silent-ignore policy of
+            // `truncate` for now. A future overlay rewrite that copies
+            // up on write should also copy up on set_len. Issue #87.
+            Some(&(Layer::Lower, _)) => -30, // -EROFS
+            None => -(crate::abi::EBADF as i32),
         }
     }
 

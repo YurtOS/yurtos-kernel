@@ -28,6 +28,7 @@ pub const ENOSYS: i32 = 38;
 pub const EDEADLK: i32 = 35;
 pub const ESPIPE: i32 = 29;
 pub const EPIPE: i32 = 32;
+pub const EFBIG: i32 = 27;
 pub const ENOTSOCK: i32 = 88;
 pub const EADDRINUSE: i32 = 98;
 pub const ENOTCONN: i32 = 107;
