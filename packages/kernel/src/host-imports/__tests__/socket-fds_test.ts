@@ -8,16 +8,6 @@ import type {
 } from "../../network/socket-backend.js";
 import { WASI_FDFLAGS_NONBLOCK } from "../../wasi/types.js";
 
-function writeString(
-  memory: WebAssembly.Memory,
-  ptr: number,
-  value: string,
-): number {
-  const bytes = new TextEncoder().encode(value);
-  new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
-  return bytes.length;
-}
-
 function writeBytes(
   memory: WebAssembly.Memory,
   ptr: number,
@@ -170,6 +160,32 @@ describe("socket fd host imports", () => {
       port: 9,
       tls: false,
     });
+  });
+
+  it("returns EINVAL for an out-of-bounds bind sockaddr pointer", () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    const kernel = new ProcessKernel();
+    const backend: SocketBackend = {
+      connect: () => ({ ok: false, error: "not used" }),
+      send: () => ({ ok: true, bytes_sent: 0 }),
+      recv: () => ({ ok: true, data: new Uint8Array() }),
+      close: () => ({ ok: true }),
+    };
+    const imports = createKernelImports({
+      memory,
+      kernel,
+      socketBackend: backend,
+    });
+    const fd = openTcpSocket(imports);
+    const nearEnd = memory.buffer.byteLength - 8;
+
+    expect(
+      (imports.host_socket_bind as (...args: number[]) => number)(
+        fd,
+        nearEnd,
+        16,
+      ),
+    ).toBe(-22);
   });
 
   it("sends and receives raw guest bytes through direct imports", async () => {

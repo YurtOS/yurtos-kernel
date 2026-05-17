@@ -544,6 +544,8 @@ impl Default for RamfsBackend {
 
 const DEV_NULL_INODE: u64 = 1;
 const DEV_ZERO_INODE: u64 = 2;
+const DEV_URANDOM_INODE: u64 = 3;
+const DEV_RANDOM_INODE: u64 = 4;
 
 pub struct DevBackend;
 
@@ -566,6 +568,8 @@ impl VfsBackend for DevBackend {
         match path {
             b"/null" => Some(DEV_NULL_INODE),
             b"/zero" => Some(DEV_ZERO_INODE),
+            b"/urandom" => Some(DEV_URANDOM_INODE),
+            b"/random" => Some(DEV_RANDOM_INODE),
             _ => None,
         }
     }
@@ -581,20 +585,31 @@ impl VfsBackend for DevBackend {
                 buf.fill(0);
                 buf.len() as i64
             }
+            DEV_URANDOM_INODE | DEV_RANDOM_INODE => {
+                // /dev/random == /dev/urandom (modern Linux semantics;
+                // matches packages/kernel/src/vfs/dev-provider.ts). Never
+                // short. `&self` is fine: fill_random holds no RNG state.
+                match crate::kh::fill_random(buf) {
+                    Ok(()) => buf.len() as i64,
+                    Err(_) => -(crate::abi::EIO as i64),
+                }
+            }
             _ => -(crate::abi::EBADF as i64),
         }
     }
 
     fn write(&mut self, inode: u64, _offset: u64, payload: &[u8]) -> i64 {
         match inode {
-            DEV_NULL_INODE | DEV_ZERO_INODE => payload.len() as i64, // /dev/null swallows; /dev/zero same
+            DEV_NULL_INODE | DEV_ZERO_INODE | DEV_URANDOM_INODE | DEV_RANDOM_INODE => {
+                payload.len() as i64 // swallowed like /dev/null
+            }
             _ => -(crate::abi::EBADF as i64),
         }
     }
 
     fn size(&self, inode: u64) -> Option<u64> {
         match inode {
-            DEV_NULL_INODE | DEV_ZERO_INODE => Some(0),
+            DEV_NULL_INODE | DEV_ZERO_INODE | DEV_URANDOM_INODE | DEV_RANDOM_INODE => Some(0),
             _ => None,
         }
     }
@@ -849,6 +864,25 @@ impl VfsBackend for RamfsBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn devbackend_urandom_and_random_yield_entropy() {
+        let mut dev = DevBackend::new();
+        for name in [b"/urandom".as_slice(), b"/random".as_slice()] {
+            let inode = dev.open(name, 0).expect("node exists");
+            let mut a = [0u8; 48];
+            let mut b = [0u8; 48];
+            assert_eq!(dev.read(inode, 0, &mut a), 48, "fills whole buffer");
+            assert_eq!(dev.read(inode, 0, &mut b), 48);
+            assert!(a.iter().any(|&x| x != 0), "all-zero draw");
+            assert_ne!(a, b, "identical draws");
+            // Writes are swallowed like /dev/null; size is 0.
+            assert_eq!(dev.write(inode, 0, b"discard me"), 10);
+            assert_eq!(dev.size(inode), Some(0));
+        }
+        // Unknown /dev/* still unmapped.
+        assert_eq!(dev.open(b"/nope", 0), None);
+    }
 
     #[test]
     fn longest_prefix_match_routes_to_submount() {

@@ -176,6 +176,7 @@ const METHOD_SYS_CHOWN: u32 = 0x1_0023;
 const METHOD_SYS_UTIMENS: u32 = 0x1_0024;
 const METHOD_SYS_UNLINK: u32 = 0x1_0025;
 const METHOD_SYS_STAT: u32 = 0x1_0026;
+const METHOD_SYS_LSTAT: u32 = 0x1_0078;
 const METHOD_SYS_SYMLINK: u32 = 0x1_0027;
 const METHOD_SYS_READLINK: u32 = 0x1_0028;
 const METHOD_SYS_MKDIR: u32 = 0x1_0029;
@@ -813,6 +814,7 @@ fn kernel_wasm_imports_match_documented_namespaces() {
             "kh_idb_put",
             "kh_log",
             "kh_now_realtime",
+            "kh_random",
             // kh_real_* land via the HostFsBackend mount at /host;
             // kernel.wasm imports them so the backend can open/
             // read/close real-disk files. Phase 5 surface — write
@@ -3038,6 +3040,7 @@ fn wasmtime_registers_all_vfs_process_syscall_imports() {
           (import "env" "sys_utimens" (func $utimens (param i64 i32 i32) (result i32)))
           (import "env" "sys_unlink" (func $unlink (param i32 i32) (result i32)))
           (import "env" "sys_stat" (func $stat (param i32 i32 i32) (result i32)))
+          (import "env" "sys_lstat" (func $lstat (param i32 i32 i32) (result i32)))
           (import "env" "sys_symlink" (func $symlink (param i32 i32 i32 i32) (result i32)))
           (import "env" "sys_readlink" (func $readlink (param i32 i32 i32 i32) (result i32)))
           (import "env" "sys_mkdir" (func $mkdir (param i32 i32) (result i32)))
@@ -3052,12 +3055,17 @@ fn wasmtime_registers_all_vfs_process_syscall_imports() {
           (memory (export "memory") 1)
           (data (i32.const 32) "/missing")
           (func (export "missing_stat") (result i32)
-            (call $stat (i32.const 32) (i32.const 8) (i32.const 64))))
+            (call $stat (i32.const 32) (i32.const 8) (i32.const 64)))
+          (func (export "missing_lstat") (result i32)
+            (call $lstat (i32.const 32) (i32.const 8) (i32.const 64))))
     "#;
     let mut user = mk
         .spawn_user_process(&wat::parse_str(user_wat).unwrap())
         .unwrap();
     assert_eq!(user.call_export_i32("missing_stat").unwrap(), -2);
+    // #81 — sys_lstat is registered and forwards 1:1 to the kernel
+    // (no-follow stat); a missing path is -ENOENT just like sys_stat.
+    assert_eq!(user.call_export_i32("missing_lstat").unwrap(), -2);
 }
 
 #[test]
@@ -3410,6 +3418,7 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
         ("sys_utimens", METHOD_SYS_UTIMENS, METHOD_SYS_UTIMENS as i64),
         ("sys_unlink", METHOD_SYS_UNLINK, METHOD_SYS_UNLINK as i64),
         ("sys_stat", METHOD_SYS_STAT, METHOD_SYS_STAT as i64),
+        ("sys_lstat", METHOD_SYS_LSTAT, METHOD_SYS_LSTAT as i64),
         ("sys_symlink", METHOD_SYS_SYMLINK, METHOD_SYS_SYMLINK as i64),
         (
             "sys_readlink",

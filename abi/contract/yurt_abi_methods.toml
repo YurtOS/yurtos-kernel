@@ -618,6 +618,11 @@ id = 0x1_0077
 kind = "syscall"
 doc = "POSIX ioctl(fd, request, arg) — narrow whitelist. Request: u32 fd LE + u32 request_code LE + u32 arg LE. FIONBIO (0x5421): arg!=0 sets / arg==0 clears O_NONBLOCK in the file fd's OFD status_flags (storage only, like F_SETFL; non-file valid fds are an accepted no-op). FIONREAD (0x541B): writes a u32 LE count of immediately-readable bytes into the response (regular file = size-offset; pipe read end = buffered bytes; otherwise 0) and returns 4. Any other request_code -> -ENOTTY. -EBADF unknown fd, -EINVAL short request / FIONREAD with a <4-byte response. Behavioral honoring of O_NONBLOCK is gate-sequenced."
 
+[method.sys_lstat]
+id = 0x1_0078
+kind = "syscall"
+doc = "POSIX lstat(path). Like sys_stat but does NOT follow a terminal symlink: a symlink reports S_IFLNK (filetype 7, mode 0o120777, size 0) and still returns 16 even when its target is missing — a dangling link itself exists. Same 16-byte layout as sys_fstat/sys_stat (u64 size + u32 filetype + u32 mode). Only an absent path is -ENOENT; -EINVAL for an empty request or <16-byte response. The kernel VFS shim answers (sandbox view, not the host FS). Issue #81 — the no-follow lexical path #67 deliberately preserved."
+
 # B3 sockets/network — method-id block 0x1_0080-0x1_008F (per the
 # canonical per-slice partition in the parity matrix).
 
@@ -675,3 +680,8 @@ doc = "KernelHostInterface-only: serialize a kernel-owned thread snapshot for on
 id = 18
 kind = "internal"
 doc = "KernelHostInterface-only: ask the kernel scheduler for the next runnable thread. Response: u32 pid, u32 tid, i32 host_thread_handle (-1 when none), u32 flags, u64 budget_ns. Returns bytes-written, -EAGAIN when no runnable thread exists, or required size when the output buffer is too small."
+
+[method.sys_getrandom]
+id = 0x1_00A0
+kind = "syscall"
+doc = "POSIX getrandom(buf, buflen, flags). Request: u32 len LE + u32 flags LE (8 bytes). Response buffer receives `len` cryptographically secure random bytes from the host CSPRNG. flags: GRND_NONBLOCK (0x1) and GRND_RANDOM (0x2) are accepted and treated as no-ops: on a running host the CSPRNG is already seeded so this does not block in practice (an OS-layer cold-boot pre-seed block is theoretically possible but not modeled here), and there is no separate /dev/random-style pool; any other bit -> -EINVAL. Returns `len` on success; -EINVAL for unknown flags, a request shorter than 8 bytes, or a response buffer smaller than `len`; -EIO if the host entropy source fails. Length is bounded with the subtraction form (issue #65 class). getentropy() is a thin guest-libc wrapper over this method, not a separate id."

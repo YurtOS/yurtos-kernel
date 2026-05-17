@@ -58,6 +58,7 @@ import type { FdTarget } from "../wasi/fd-target.js";
 import { createStaticTarget } from "../wasi/fd-target.js";
 import { WASI_FDFLAGS_NONBLOCK } from "../wasi/types.ts";
 import {
+  decodeSockaddrIn,
   readBytes,
   readRecordHeader,
   readSpan,
@@ -1242,24 +1243,6 @@ export function createKernelImports(
       return [0, 0, 0, 0];
     }
     return parts as [number, number, number, number];
-  }
-
-  const WASI_AF_INET = 1;
-  const RUST_STD_AF_INET = 2;
-  const SOCKADDR_IN_SIZE = 16;
-
-  function readSockaddrIn(ptr: number, len: number): {
-    host: "127.0.0.1" | "localhost" | "0.0.0.0" | string;
-    port: number;
-  } | null {
-    if (ptr === 0 || len < SOCKADDR_IN_SIZE) return null;
-    const view = new DataView(memory.buffer, ptr, len);
-    const family = view.getUint16(0, true);
-    if (family !== WASI_AF_INET && family !== RUST_STD_AF_INET) return null;
-    const port = view.getUint16(2, false);
-    const octets = new Uint8Array(memory.buffer, ptr + 4, 4);
-    const host = `${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}`;
-    return { host, port };
   }
 
   function writeSocketAddrResult(
@@ -3069,7 +3052,7 @@ export function createKernelImports(
         netLog("connect", { fd, result: "ECONNREFUSED", reason: "no backend" });
         return ERR_CONN_REFUSED;
       }
-      const addr = readSockaddrIn(addrPtr, addrLen);
+      const addr = decodeSockaddrIn(memory, addrPtr, addrLen);
       if (!addr) {
         netLog("connect", { fd, result: "EINVAL" });
         return ERR_INVALID;
@@ -3144,7 +3127,7 @@ export function createKernelImports(
       addrPtr: number,
       addrLen: number,
     ): number {
-      const addr = readSockaddrIn(addrPtr, addrLen);
+      const addr = decodeSockaddrIn(memory, addrPtr, addrLen);
       if (!addr) {
         netLog("bind", { fd, result: "EINVAL" });
         return ERR_INVALID;

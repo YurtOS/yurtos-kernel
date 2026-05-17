@@ -5960,6 +5960,138 @@ fn stat_on_dangling_symlink_is_enoent() {
     );
 }
 
+// #81 — lstat() must NOT follow symlinks (POSIX), the mirror image of
+// the #67 stat() tests above: a symlink reports the link itself.
+
+#[test]
+fn lstat_does_not_follow_symlink_to_directory() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/d");
+    sreq.extend_from_slice(b"/l");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/l", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "lstat() must report S_IFLNK for the link itself, not follow to S_IFDIR"
+    );
+}
+
+#[test]
+fn lstat_does_not_follow_symlink_to_regular_file() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = 2_u32.to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/f");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/f");
+    sreq.extend_from_slice(b"/lf");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/lf", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "S_IFLNK for the link itself, not S_IFREG via the target"
+    );
+    assert_eq!(
+        u64::from_le_bytes(out[0..8].try_into().unwrap()),
+        0,
+        "size is the link's (0), not the target's (2)"
+    );
+}
+
+#[test]
+fn lstat_on_dangling_symlink_reports_the_link() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut sreq = 5_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/gone");
+    sreq.extend_from_slice(b"/dang");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+    let mut out = [0u8; 16];
+    // The exact inverse of #67's stat_on_dangling_symlink_is_enoent:
+    // lstat does not follow, so a dangling link still exists.
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/dang", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "lstat() reports the dangling link as S_IFLNK, never -ENOENT"
+    );
+}
+
+#[test]
+fn lstat_on_regular_file_matches_stat() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = 5_u32.to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/info");
+    reg.extend_from_slice(b"hello");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+    let mut s = [0u8; 16];
+    let mut l = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/info", &mut s), 16);
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/info", &mut l), 16);
+    assert_eq!(l, s, "no symlink to differ on: lstat == stat byte-for-byte");
+}
+
+#[test]
+fn lstat_on_directory_matches_stat() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/dir", &mut []), 0);
+
+    let mut l = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/dir", &mut l), 16);
+    assert_eq!(
+        u32::from_le_bytes(l[8..12].try_into().unwrap()),
+        3,
+        "S_IFDIR, same as stat (no link to differ on)"
+    );
+}
+
+#[test]
+fn lstat_unknown_path_is_enoent() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/missing", &mut out),
+        -(abi::ENOENT as i64)
+    );
+}
+
+// lstat_path is a distinct function from stat_path; pin its
+// malformed-input EINVAL contracts directly. PR #120 review.
+// `short_response` is a true regression guard for lstat_path's own
+// `response.len() < 16` check (red-green verified: removing it makes
+// a <16 buffer return -ENOENT, not -EINVAL). `empty_request` pins
+// the empty-path → EINVAL contract, which lstat_path's guard AND
+// normalize_readable_path both enforce (redundant by design).
+
+#[test]
+fn lstat_empty_request_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"", &mut out),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn lstat_short_response_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 8]; // smaller than the 16-byte fstat record
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/anything", &mut out),
+        -(abi::EINVAL as i64)
+    );
+}
+
 #[test]
 fn stat_follows_multi_hop_symlink_chain() {
     // Locks the chained-resolution semantics at the stat() entry
@@ -6833,6 +6965,63 @@ fn p_req(fd: u32, offset: u64, data: &[u8]) -> Vec<u8> {
     req.extend_from_slice(&offset.to_le_bytes());
     req.extend_from_slice(data);
     req
+}
+
+fn gr_req(len: u32, flags: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8);
+    v.extend_from_slice(&len.to_le_bytes());
+    v.extend_from_slice(&flags.to_le_bytes());
+    v
+}
+
+#[test]
+fn getrandom_fills_response_and_validates_args() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    // Happy path: 32 bytes, no flags.
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(32, 0), &mut a),
+        32
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(32, 0), &mut b),
+        32
+    );
+    assert!(a.iter().any(|&x| x != 0));
+    assert_ne!(a, b);
+
+    // GRND_NONBLOCK|GRND_RANDOM accepted (no-ops).
+    let mut c = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(16, 0b11), &mut c),
+        16
+    );
+
+    // Unknown flag bit -> -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(8, 0b100), &mut [0u8; 8]),
+        -(crate::abi::EINVAL as i64)
+    );
+
+    // Short request (<8 bytes) -> -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &[0u8; 4], &mut [0u8; 8]),
+        -(crate::abi::EINVAL as i64)
+    );
+
+    // Response smaller than len -> -EINVAL (subtraction-form guard; #65).
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(64, 0), &mut [0u8; 8]),
+        -(crate::abi::EINVAL as i64)
+    );
+
+    // Width-aware C1 (#65): u32::MAX len must not wrap/panic; clean -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(u32::MAX, 0), &mut [0u8; 8]),
+        -(crate::abi::EINVAL as i64)
+    );
 }
 
 fn open_rw(path: &[u8]) -> u32 {

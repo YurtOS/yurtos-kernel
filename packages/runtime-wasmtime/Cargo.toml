@@ -38,6 +38,9 @@ wasmtime-wasi = { version = "28", features = ["preview1"] }
 # HTTP client (for host_network_fetch, Phase 5+)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 
+# OS CSPRNG for the kh_random host import (already transitive via rustls-tls)
+getrandom = "0.2"
+
 # Serialization
 bincode = "1"
 

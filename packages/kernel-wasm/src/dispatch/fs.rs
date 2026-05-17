@@ -462,6 +462,55 @@ pub(super) fn unlink(caller_pid: u32, request: &[u8]) -> i64 {
     })
 }
 
+/// Type `path` (already normalized; the caller decides whether
+/// symlinks were followed) into the shared 16-byte fstat-shaped
+/// record: u64 size + u32 filetype + u32 mode. `stat_path` follows
+/// the link chain before calling this; `lstat_path` does not — that
+/// follow step is the *only* difference between the two, so they
+/// cannot drift on how an entry is typed. Returns 16, or -ENOENT
+/// when the path doesn't resolve to an entry.
+///
+/// Precondition: `response.len() >= 16`. Both callers enforce the
+/// `< 16 → -EINVAL` guard before calling; the assert documents the
+/// invariant and traps a future third caller in debug/test builds.
+fn write_stat_record(k: &mut Kernel, path: &[u8], response: &mut [u8]) -> i64 {
+    debug_assert!(
+        response.len() >= 16,
+        "write_stat_record needs a >=16-byte response; callers must guard"
+    );
+    if k.has_unix_socket_inode(path) {
+        response[0..8].copy_from_slice(&0u64.to_le_bytes());
+        response[8..12].copy_from_slice(&6u32.to_le_bytes());
+        response[12..16].copy_from_slice(&0o140_666u32.to_le_bytes());
+        return 16;
+    }
+    let filetype = k.vfs.entry_type(path) as u32;
+    if filetype == 0 {
+        return -(abi::ENOENT as i64);
+    }
+    let (size, mode) = if filetype == 4 {
+        let (mount_id, inode) = match k.vfs.open(path, 0) {
+            Some(pair) => pair,
+            None => return -(abi::ENOENT as i64),
+        };
+        let size = k.vfs.size(mount_id, inode).unwrap_or(0);
+        let meta = k.resolve_metadata(mount_id, inode);
+        (size, meta.mode)
+    } else {
+        let mode = match filetype {
+            3 => 0o040_755,
+            7 => 0o120_777,
+            6 => 0o140_666,
+            _ => 0o100_644,
+        };
+        (0, mode)
+    };
+    response[0..8].copy_from_slice(&size.to_le_bytes());
+    response[8..12].copy_from_slice(&filetype.to_le_bytes());
+    response[12..16].copy_from_slice(&mode.to_le_bytes());
+    16
+}
+
 /// `stat(path) -> 16-byte fstat-shaped record`. Same wire format as
 /// sys_fstat: u64 size + u32 filetype + u32 mode. Doesn't require an
 /// open fd. Returns 16 on success, -ENOENT for unresolvable path.
@@ -484,37 +533,31 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        if k.has_unix_socket_inode(&path) {
-            response[0..8].copy_from_slice(&0u64.to_le_bytes());
-            response[8..12].copy_from_slice(&6u32.to_le_bytes());
-            response[12..16].copy_from_slice(&0o140_666u32.to_le_bytes());
-            return 16;
-        }
-        let filetype = k.vfs.entry_type(&path) as u32;
-        if filetype == 0 {
-            return -(abi::ENOENT as i64);
-        }
-        let (size, mode) = if filetype == 4 {
-            let (mount_id, inode) = match k.vfs.open(&path, 0) {
-                Some(pair) => pair,
-                None => return -(abi::ENOENT as i64),
-            };
-            let size = k.vfs.size(mount_id, inode).unwrap_or(0);
-            let meta = k.resolve_metadata(mount_id, inode);
-            (size, meta.mode)
-        } else {
-            let mode = match filetype {
-                3 => 0o040_755,
-                7 => 0o120_777,
-                6 => 0o140_666,
-                _ => 0o100_644,
-            };
-            (0, mode)
+        write_stat_record(k, &path, response)
+    })
+}
+
+/// `lstat(path) -> 16-byte fstat-shaped record`. Identical to
+/// `stat_path` EXCEPT it does not follow a terminal symlink (POSIX
+/// lstat): `normalize_readable_path` is lexical/no-follow and
+/// `entry_type` does not resolve links, so a symlink — whether it
+/// points at a dir, a file, or a missing target — reports S_IFLNK
+/// and returns 16 (a dangling link still exists; only an absent
+/// path is -ENOENT). This is the no-follow lexical path #67
+/// deliberately preserved. Issue #81.
+pub(super) fn lstat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    if response.len() < 16 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let path = match normalize_readable_path(k, caller_pid, request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
         };
-        response[0..8].copy_from_slice(&size.to_le_bytes());
-        response[8..12].copy_from_slice(&filetype.to_le_bytes());
-        response[12..16].copy_from_slice(&mode.to_le_bytes());
-        16
+        write_stat_record(k, &path, response)
     })
 }
 

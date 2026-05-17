@@ -163,6 +163,10 @@ export const METHOD = {
   SYS_UTIMENS: 0x1_0024,
   SYS_UNLINK: 0x1_0025,
   SYS_STAT: 0x1_0026,
+  // lstat is in the B2 fd/vfs id block (0x1_0070–0x1_007F), grouped
+  // here next to stat for readability — see the method-id partition
+  // in abi/contract/yurt_abi_methods.toml. Issue #81.
+  SYS_LSTAT: 0x1_0078,
   SYS_SYMLINK: 0x1_0027,
   SYS_READLINK: 0x1_0028,
   SYS_MKDIR: 0x1_0029,
@@ -2231,6 +2235,24 @@ export class KernelHostInterface {
           true,
         );
         return 0;
+      },
+      kh_random: (outPtr: number, len: number): number => {
+        // Platform CSPRNG via Web Crypto — Deno, Node (globalThis.crypto),
+        // and browsers. Never /dev/random (browsers have none). Web Crypto
+        // caps at 65536 bytes per call, so chunk; mirrors the TS kernel's
+        // packages/kernel/src/vfs/dev-provider.ts.
+        if (len === 0) return 0;
+        try {
+          const view = new Uint8Array(memoryRef.memory!.buffer, outPtr, len);
+          for (let off = 0; off < len; off += 65536) {
+            crypto.getRandomValues(
+              view.subarray(off, Math.min(off + 65536, len)),
+            );
+          }
+          return 0;
+        } catch {
+          return -EIO;
+        }
       },
       kh_log: (severity: number, msgPtr: number, msgLen: number): number => {
         const bytes = new Uint8Array(memoryRef.memory!.buffer, msgPtr, msgLen);

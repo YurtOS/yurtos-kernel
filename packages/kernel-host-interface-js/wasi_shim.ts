@@ -580,14 +580,19 @@ export function buildWasiShim(
   };
   const path_filestat_get = (
     dirfd: number,
-    _flags: number,
+    flags: number,
     pathPtr: number,
     pathLen: number,
     filestatPtr: number,
   ): number => {
     if (dirfd !== PREOPEN_ROOT_FD) return EBADF;
+    // WASI lookupflags bit 0 = __WASI_LOOKUPFLAGS_SYMLINK_FOLLOW.
+    // wasi-libc sets it for stat() and clears it for lstat() /
+    // fstatat(AT_SYMLINK_NOFOLLOW): no-follow must report the link
+    // itself, so route to the kernel's no-follow SYS_LSTAT (#81).
+    const follow = (flags & 1) !== 0;
     const { rc, response } = kernel.syscall(
-      METHOD.SYS_STAT,
+      follow ? METHOD.SYS_STAT : METHOD.SYS_LSTAT,
       pid,
       preopenAbsPath(pathPtr, pathLen),
       16,
