@@ -84,9 +84,10 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
         };
         // Follow symlinks (shared with stat_path so the semantics
         // cannot drift): up to SYMLOOP_MAX hops, each re-authorized.
+        // Negate-and-widen at the boundary — resolver convention.
         let resolved = match follow_symlinks(k, caller_pid, path) {
             Ok(p) => p,
-            Err(rc) => return rc,
+            Err(errno) => return -(errno as i64),
         };
         let path: &[u8] = &resolved;
         let entry_type = k.vfs.entry_type(path);
@@ -239,10 +240,20 @@ fn normalize_readable_path(
 /// Follow symlinks at `path` (already normalized) up to SYMLOOP_MAX
 /// (40) hops, re-normalizing and re-authorizing each target so a
 /// ramfs link cannot bypass procfs access checks. Returns the
-/// resolved path, or `-ELOOP` once the hop limit is exceeded (POSIX;
-/// #69). Shared by `sys_open` and `stat_path` so the follow
-/// semantics — including this errno — cannot drift between them.
-fn follow_symlinks(k: &mut Kernel, caller_pid: u32, path: Vec<u8>) -> Result<Vec<u8>, i64> {
+/// resolved path or a **positive POSIX errno** (`ELOOP` once the hop
+/// limit is exceeded; whatever `normalize_readable_path` raises
+/// otherwise).
+///
+/// Convention: resolvers return `Result<_, i32>` with a positive POSIX
+/// errno. The dispatch boundary calls `.map_err(|e| -(e as i64))` once
+/// to negate and widen to the wire-level `i64`. Matches the
+/// `path.rs::resolve_realpath` convention. Issue #144 / #69.
+///
+/// `normalize_readable_path` predates this convention and still
+/// returns a pre-negated `i64`; the inline `.map_err` below normalizes
+/// at the call boundary while that helper is left untouched (broader
+/// rename is out of scope).
+fn follow_symlinks(k: &mut Kernel, caller_pid: u32, path: Vec<u8>) -> Result<Vec<u8>, i32> {
     let mut resolved = path;
     let mut hops = 0u32;
     while let Some(target) = k.vfs.readlink(&resolved) {
@@ -250,9 +261,29 @@ fn follow_symlinks(k: &mut Kernel, caller_pid: u32, path: Vec<u8>) -> Result<Vec
         if hops > 40 {
             // Too many symlink hops: POSIX/Linux errno is ELOOP
             // (SYMLOOP_MAX = 40), not EINVAL.
-            return Err(-(abi::ELOOP as i64));
+            return Err(abi::ELOOP);
         }
-        resolved = normalize_readable_path(k, caller_pid, &target)?;
+        resolved =
+            normalize_readable_path(k, caller_pid, &target).map_err(|rc_i64| (-rc_i64) as i32)?;
+    }
+    Ok(resolved)
+}
+
+/// Walk the symlink chain at `path` without per-hop re-normalization,
+/// up to SYMLOOP_MAX (40) hops. Lighter than `follow_symlinks` — used
+/// by `sys_spawn` for executable resolution where the link target is
+/// loaded literally. Returns the resolved path or a positive POSIX
+/// errno (same convention as `follow_symlinks` and
+/// `path.rs::resolve_realpath`). Issue #144.
+pub(super) fn follow_symlinks_literal(k: &mut Kernel, path: Vec<u8>) -> Result<Vec<u8>, i32> {
+    let mut resolved = path;
+    let mut hops = 0u32;
+    while let Some(target) = k.vfs.readlink(&resolved) {
+        hops += 1;
+        if hops > 40 {
+            return Err(abi::ELOOP);
+        }
+        resolved = target;
     }
     Ok(resolved)
 }
@@ -569,9 +600,10 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
         // POSIX: stat() follows symlinks (unlike lstat). Resolve
         // through the link chain before typing the entry, sharing
         // sys_open's follow helper so the two cannot diverge.
+        // Negate-and-widen at the boundary — resolver convention.
         let path = match follow_symlinks(k, caller_pid, path) {
             Ok(path) => path,
-            Err(rc) => return rc,
+            Err(errno) => return -(errno as i64),
         };
         write_stat_record(k, &path, response)
     })
