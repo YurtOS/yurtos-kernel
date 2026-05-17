@@ -7282,6 +7282,85 @@ fn fgetfl_surfaces_access_mode_bits_issue_60() {
     );
 }
 
+// M3/M4/M7 — POSIX-correctness follow-ups from the #71 audit.
+const O_WRONLY: u32 = 1;
+
+#[test]
+fn fgetfl_reports_access_mode_for_pipe_socket_stdio_m3() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Default stdio fds.
+    assert_eq!((getfl(0) as u32) & O_ACCMODE, O_RDONLY, "stdin → O_RDONLY");
+    assert_eq!((getfl(1) as u32) & O_ACCMODE, O_WRONLY, "stdout → O_WRONLY");
+    assert_eq!((getfl(2) as u32) & O_ACCMODE, O_WRONLY, "stderr → O_WRONLY");
+
+    // Pipe: read end O_RDONLY, write end O_WRONLY.
+    let mut fds = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds), 8);
+    let rfd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+    let wfd = u32::from_le_bytes(fds[4..8].try_into().unwrap());
+    assert_eq!(
+        (getfl(rfd) as u32) & O_ACCMODE,
+        O_RDONLY,
+        "pipe read end → O_RDONLY"
+    );
+    assert_eq!(
+        (getfl(wfd) as u32) & O_ACCMODE,
+        O_WRONLY,
+        "pipe write end → O_WRONLY"
+    );
+
+    // Socket: bidirectional → O_RDWR.
+    let sfd = dispatch(
+        METHOD_SYS_SOCKET_OPEN,
+        1,
+        &socket_open_req(2, 1, 0),
+        &mut [],
+    );
+    assert!(sfd >= 3, "socket open ok, fd = {sfd}");
+    assert_eq!(
+        (getfl(sfd as u32) as u32) & O_ACCMODE,
+        O_RDWR,
+        "socket → O_RDWR (was 0 = O_RDONLY)"
+    );
+}
+
+#[test]
+fn lseek_on_pipe_fd_is_espipe_not_ebadf_m4() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut fds = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut fds), 8);
+    let rfd = u32::from_le_bytes(fds[0..4].try_into().unwrap());
+    let mut req = rfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&0i64.to_le_bytes());
+    req.extend_from_slice(&0u32.to_le_bytes()); // SEEK_SET
+    let mut out = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_LSEEK, 1, &req, &mut out),
+        -(abi::ESPIPE as i64),
+        "lseek on a valid pipe fd is ESPIPE, not EBADF"
+    );
+    // An unknown fd is still EBADF (the two must not be conflated).
+    let mut bad = 9999u32.to_le_bytes().to_vec();
+    bad.extend_from_slice(&0i64.to_le_bytes());
+    bad.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_LSEEK, 1, &bad, &mut out),
+        -(abi::EBADF as i64),
+        "unknown fd stays EBADF"
+    );
+}
+
+#[test]
+fn readlink_on_missing_path_is_enoent_m7() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_READLINK, 1, b"/no/such/path", &mut buf),
+        -(abi::ENOENT as i64),
+        "readlink on a nonexistent path is ENOENT, not EINVAL"
+    );
+}
+
 #[test]
 fn fcntl_setfl_getfl_roundtrip_and_masking_on_file() {
     let _g = crate::kernel::TestGuard::acquire();
@@ -7357,10 +7436,13 @@ fn fcntl_setfl_is_shared_across_dup_via_the_ofd() {
 }
 
 #[test]
-fn fcntl_getfl_is_zero_for_non_file_fds() {
+fn fcntl_getfl_reports_access_mode_for_non_file_fds() {
     let _g = crate::kernel::TestGuard::acquire();
-    // stdout (fd 1) is valid but has no per-OFD status tracked.
-    assert_eq!(getfl(1), 0);
+    // No per-OFD status flags tracked for these, but F_GETFL must
+    // still report the correct O_ACCMODE (M3): stdout is O_WRONLY,
+    // not O_RDONLY(0) as it wrongly was before.
+    assert_eq!(getfl(1) as u32 & O_ACCMODE, O_WRONLY);
+    assert_eq!(getfl(1) as u32 & !O_ACCMODE, 0, "no status flags yet");
 }
 
 #[test]

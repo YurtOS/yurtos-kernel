@@ -404,7 +404,13 @@ pub(super) fn readlink(caller_pid: u32, request: &[u8], response: &mut [u8]) -> 
             Err(rc) => return rc,
         };
         let Some(target) = k.vfs.readlink(&path) else {
-            return -(abi::EINVAL as i64);
+            // POSIX: a missing path component is ENOENT; a path that
+            // exists but is not a symlink is EINVAL.
+            return if k.vfs.entry_type(&path) == 0 {
+                -(abi::ENOENT as i64)
+            } else {
+                -(abi::EINVAL as i64)
+            };
         };
         let n = target.len().min(response.len());
         response[..n].copy_from_slice(&target[..n]);
