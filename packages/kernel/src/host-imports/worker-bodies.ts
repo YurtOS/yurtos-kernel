@@ -419,47 +419,48 @@ export function makeWorkerDispatcherBodies(
       const host = target.boundHost ?? "127.0.0.1";
       const port = target.boundPort ?? 0;
       const backlog = backlogArg > 0 ? backlogArg : 128;
-      const listenResult = opts.socketBackend.listen({ host, port, backlog });
-      if (typeof (listenResult as Promise<unknown>).then === "function") {
-        // Network-bridge backends return a Promise here; the worker
-        // dispatcher can't await mid-flight. The loopback registry is
-        // sync, so as long as the sandbox uses it (serverSockets.
-        // allowLoopback) this branch never fires. Surface a clear
-        // failure rather than blocking — the heartbeat thread will
-        // retry via its own bind/listen loop.
-        netLog("pthread.listen", { fd, result: "EAGAIN (async backend)" });
-        return -5;
-      }
-      const r = listenResult as Awaited<
-        ReturnType<NonNullable<typeof opts.socketBackend.listen>>
-      >;
-      if (!r.ok) {
+      const apply = (
+        r: Awaited<ReturnType<NonNullable<typeof opts.socketBackend.listen>>>,
+      ): number => {
+        if (!r.ok) {
+          netLog("pthread.listen", {
+            fd,
+            host,
+            port,
+            result: "EIO",
+            reason: r.error,
+          });
+          return -5;
+        }
+        target.listener = r.listener;
+        target.boundHost = host;
+        target.boundPort = port;
+        target.localHost = r.host;
+        target.localPort = r.port;
+        target.closeListener = (listener) => {
+          void opts.socketBackend?.closeListener?.(listener);
+        };
         netLog("pthread.listen", {
           fd,
           host,
           port,
-          result: "EIO",
-          reason: r.error,
+          assignedHost: r.host,
+          assignedPort: r.port,
+          result: "ok",
         });
-        return -5;
-      }
-      target.listener = r.listener;
-      target.boundHost = host;
-      target.boundPort = port;
-      target.localHost = r.host;
-      target.localPort = r.port;
-      target.closeListener = (listener) => {
-        void opts.socketBackend?.closeListener?.(listener);
+        return 0;
       };
-      netLog("pthread.listen", {
-        fd,
-        host,
-        port,
-        assignedHost: r.host,
-        assignedPort: r.port,
-        result: "ok",
-      });
-      return 0;
+      const listenResult = opts.socketBackend.listen({ host, port, backlog });
+      if (typeof (listenResult as Promise<unknown>).then === "function") {
+        return (listenResult as Promise<
+          Awaited<ReturnType<NonNullable<typeof opts.socketBackend.listen>>>
+        >).then(apply);
+      }
+      return apply(
+        listenResult as Awaited<
+          ReturnType<NonNullable<typeof opts.socketBackend.listen>>
+        >,
+      );
     },
     socketIsDgram: (fd) => {
       const target = kernel.getFdTarget(getPid(), fd);

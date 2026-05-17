@@ -223,6 +223,40 @@ Deno.test("makeWorkerDispatcherBodies: worker socket bind/listen uses loopback b
   kernel.dispose();
 });
 
+Deno.test("makeWorkerDispatcherBodies: worker socket listen awaits async backend", async () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const loopbackBackend = createLoopbackSocketBackend();
+  const socketBackend = {
+    ...loopbackBackend,
+    listen: (
+      req: Parameters<NonNullable<typeof loopbackBackend.listen>>[0],
+    ) => Promise.resolve(loopbackBackend.listen!(req)),
+  };
+
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+    socketBackend,
+  });
+
+  const fd = bodies.socketOpen(1, 6, 0);
+  assertEquals(
+    bodies.socketBind(fd, new TextEncoder().encode("0.0.0.0"), 0),
+    0,
+  );
+  assertEquals(await bodies.socketListen(fd, 2), 0);
+
+  const target = kernel.getFdTarget(pid, fd);
+  assert(target?.type === "socket");
+  assertEquals(target.boundHost, "0.0.0.0");
+  assertEquals(typeof target.listener, "number");
+  assertEquals(typeof target.localPort, "number");
+
+  kernel.dispose();
+});
+
 Deno.test("makeWorkerDispatcherBodies: worker socketpair returns process fds", () => {
   const kernel = new ProcessKernel();
   const pid = kernel.allocPid(0, "test");
