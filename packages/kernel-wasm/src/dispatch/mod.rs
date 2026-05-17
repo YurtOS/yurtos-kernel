@@ -194,6 +194,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_SIGPROCMASK => sigmask::sys_sigprocmask(ctx, request, response),
         METHOD_SYS_SIGALTSTACK => sigmask::sys_sigaltstack(ctx, request, response),
         METHOD_SYS_SIGSUSPEND => sigmask::sys_sigsuspend(ctx, request, response),
+        METHOD_SYS_SIGTIMEDWAIT => sigmask::sys_sigtimedwait(ctx, request, response),
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
         METHOD_SYS_OPEN => sys_open(caller_pid, request),

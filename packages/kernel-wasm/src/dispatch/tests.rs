@@ -9869,3 +9869,33 @@ fn sigsuspend_swaps_and_restores_returns_eintr_pause_leaves_mask() {
     });
     assert_eq!(m, m2, "pause (has_mask=0) leaves caller mask unchanged");
 }
+
+#[test]
+fn sigtimedwait_selects_by_set_even_when_blocked_else_eagain() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // block SIGUSR1 (slot 7) on pid 1's main thread
+    let mut o = [0u8; 1];
+    dispatch(
+        METHOD_SYS_SIGPROCMASK,
+        1,
+        &sigprocmask_req(0, Some(1 << 7)),
+        &mut o,
+    );
+    // queue an RT SIGUSR1 (signo 10, value 42) from pid 1 to pid 1
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(1, 10, 42), &mut []),
+        0
+    );
+    // sigtimedwait(set=slot7, has_timeout=1, {0,0}) → accepts SIGUSR1 despite block
+    let mut req = vec![1u8 << 7, 1u8];
+    req.extend_from_slice(&0i64.to_le_bytes());
+    req.extend_from_slice(&0i64.to_le_bytes());
+    let mut info = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_SIGTIMEDWAIT, 1, &req, &mut info), 16);
+    assert_eq!(i32::from_le_bytes(info[0..4].try_into().unwrap()), 10);
+    // nothing pending now → EAGAIN
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGTIMEDWAIT, 1, &req, &mut info),
+        -(crate::abi::EAGAIN as i64)
+    );
+}

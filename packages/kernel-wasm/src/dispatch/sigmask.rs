@@ -109,6 +109,35 @@ pub(super) fn sys_sigaltstack(ctx: DispatchContext, request: &[u8], response: &m
     })
 }
 
+/// `sigtimedwait` — reuse the RT-queue dequeue (separated-producer:
+/// RT queue only, never the kill bitmask — documented divergence
+/// §11.6). Selection is by `set` regardless of blocked state (§5.1).
+/// `timeout==0`/nothing pending ⇒ EAGAIN; nonzero-timeout blocking is
+/// the gated stub (also immediate EAGAIN).
+pub(super) fn sys_sigtimedwait(ctx: DispatchContext, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() != 18 || response.len() < 16 {
+        return -(abi::EINVAL as i64);
+    }
+    let set = expand(request[0]);
+    with_kernel(|k| {
+        let p = k.process_mut(ctx.caller_pid);
+        let Some(idx) = p
+            .pending_rt
+            .iter()
+            .position(|s| (1..=63).contains(&s.signo) && (set & (1u64 << (s.signo - 1))) != 0)
+        else {
+            return -(abi::EAGAIN as i64);
+        };
+        let sig = p.pending_rt.remove(idx).expect("idx from position");
+        const SI_QUEUE: i32 = -1;
+        response[0..4].copy_from_slice(&(sig.signo as i32).to_le_bytes());
+        response[4..8].copy_from_slice(&SI_QUEUE.to_le_bytes());
+        response[8..12].copy_from_slice(&sig.sender_pid.to_le_bytes());
+        response[12..16].copy_from_slice(&sig.value.to_le_bytes());
+        16
+    })
+}
+
 pub(super) fn sys_sigsuspend(ctx: DispatchContext, request: &[u8], _response: &mut [u8]) -> i64 {
     if request.len() != 2 {
         return -(abi::EINVAL as i64);
