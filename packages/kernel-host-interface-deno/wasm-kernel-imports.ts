@@ -850,6 +850,15 @@ export const HOST_BINDINGS: HostBinding[] = [
     args: ["ptr_len", "out_cap"],
     returnsBytes: true,
   },
+  // host_lstat — identical wire shape to host_stat, forwarded 1:1 to
+  // the kernel's no-follow stat (the kernel VFS shim answers, not the
+  // host FS). A symlink reports S_IFLNK, not its target. Issue #81.
+  {
+    name: "host_lstat",
+    method: METHOD.SYS_LSTAT,
+    args: ["ptr_len", "out_cap"],
+    returnsBytes: true,
+  },
   // host_readlink(pathPtr, pathLen, outPtr, outCap) → bytes-written.
   {
     name: "host_readlink",

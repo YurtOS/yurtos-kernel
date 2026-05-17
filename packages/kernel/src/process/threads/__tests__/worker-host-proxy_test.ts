@@ -1,6 +1,7 @@
 import { assertEquals } from "@std/assert";
 import {
   attachWorkerHostDispatcher,
+  createWorkerYurtImports,
   type DispatcherTarget,
   REQUEST_SAB_BYTES,
   type WorkerHostDispatcherBodies,
@@ -63,6 +64,22 @@ function captureHandler(): {
       handler(new MessageEvent("message", { data: { type: "host-call" } }));
     },
   };
+}
+
+function writeSockaddrIn(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  host: [number, number, number, number],
+  port: number,
+  family = 2,
+): number {
+  const bytes = new Uint8Array(memory.buffer, ptr, 16);
+  bytes.fill(0);
+  const view = new DataView(memory.buffer, ptr, 16);
+  view.setUint16(0, family, true);
+  view.setUint16(2, port, false);
+  bytes.set(host, 4);
+  return 16;
 }
 
 Deno.test("worker-host-proxy: WriteFd request decoded; bytes match", () => {
@@ -231,6 +248,69 @@ Deno.test("worker-host-proxy: SocketSend dispatches with payload bytes", () => {
   assertEquals(Atomics.load(header, 1), 4);
   assertEquals(seenFd, 9);
   assertEquals(Array.from(seenData), [1, 2, 3, 4]);
+});
+
+Deno.test("worker-host-proxy: worker SocketBind decodes sockaddr_in", () => {
+  const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const addrLen = writeSockaddrIn(memory, 16, [127, 0, 0, 1], 18081);
+
+  let seenFd = -1;
+  let seenHost = "";
+  let seenPort = -1;
+  const bodies: WorkerHostDispatcherBodies = {
+    ...noopBodies(),
+    socketBind: (fd, host, port) => {
+      seenFd = fd;
+      seenHost = new TextDecoder().decode(host);
+      seenPort = port;
+      return 0;
+    },
+  };
+
+  const { target, invoke } = captureHandler();
+  attachWorkerHostDispatcher(target, sab, bodies);
+  const imports = createWorkerYurtImports(2, memory, {
+    requestSab: sab,
+    postHostCall: () => invoke(),
+  });
+
+  assertEquals(
+    (imports.host_socket_bind as (...args: number[]) => number)(
+      9,
+      16,
+      addrLen,
+    ),
+    0,
+  );
+  assertEquals(seenFd, 9);
+  assertEquals(seenHost, "127.0.0.1");
+  assertEquals(seenPort, 18081);
+});
+
+Deno.test("worker-host-proxy: malformed SocketBind sockaddr returns EINVAL before dispatch", () => {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const cases = [
+    { ptr: 0, len: 16 },
+    { ptr: 16, len: 8 },
+    { ptr: memory.buffer.byteLength - 8, len: 16 },
+  ];
+  writeSockaddrIn(memory, 32, [0, 0, 0, 0], 0, 10);
+  cases.push({ ptr: 32, len: 16 });
+
+  for (const { ptr, len } of cases) {
+    const imports = createWorkerYurtImports(2, memory, {
+      requestSab: new SharedArrayBuffer(REQUEST_SAB_BYTES),
+      postHostCall: () => {
+        throw new Error("malformed sockaddr must not dispatch");
+      },
+    });
+
+    assertEquals(
+      (imports.host_socket_bind as (...args: number[]) => number)(9, ptr, len),
+      -22,
+    );
+  }
 });
 
 Deno.test("worker-host-proxy: body throw produces STATUS_ERROR + result=-1", () => {

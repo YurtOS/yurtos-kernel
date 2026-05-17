@@ -273,6 +273,10 @@ mod sys_method_id {
     pub const UTIMENS: u32 = 0x1_0024;
     pub const UNLINK: u32 = 0x1_0025;
     pub const STAT: u32 = 0x1_0026;
+    // lstat lives in the B2 fd/vfs id block (0x1_0070–0x1_007F), not
+    // next to stat — see the method-id partition in
+    // abi/contract/yurt_abi_methods.toml. Issue #81.
+    pub const LSTAT: u32 = 0x1_0078;
     pub const SYMLINK: u32 = 0x1_0027;
     pub const READLINK: u32 = 0x1_0028;
     pub const MKDIR: u32 = 0x1_0029;
@@ -5298,6 +5302,31 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let rc = forward_request_with_user_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::STAT,
+                &path,
+                out_ptr,
+                16,
+            );
+            if rc == 16 {
+                0
+            } else {
+                rc as i32
+            }
+        },
+    )?;
+    // sys_lstat — identical wire shape to sys_stat, forwarded 1:1 to
+    // the kernel's no-follow stat. The kernel VFS shim answers (the
+    // sandbox view, not the host FS). Issue #81.
+    linker.func_wrap(
+        SYS_NAMESPACE,
+        "sys_lstat",
+        |mut caller: Caller<'_, UserState>, path_ptr: u32, path_len: u32, out_ptr: u32| -> i32 {
+            let path = match read_user_guest_bytes(&mut caller, path_ptr, path_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let rc = forward_request_with_user_response(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                sys_method_id::LSTAT,
                 &path,
                 out_ptr,
                 16,

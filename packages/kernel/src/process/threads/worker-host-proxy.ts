@@ -22,6 +22,7 @@
  */
 
 import { WASI_EBUSY } from "../../wasi/types.js";
+import { decodeSockaddrIn } from "../../host-imports/common.js";
 import { SabCondvar, SabMutex } from "./sab-primitives.js";
 
 /**
@@ -104,6 +105,7 @@ const PAYLOAD_ARGS_WORD = 2;
 
 const PAYLOAD_BYTES = 4096;
 const PAYLOAD_WORDS = PAYLOAD_BYTES / 4;
+const ERR_INVALID = -22;
 
 /** Total SAB size required for one per-thread request channel. */
 export const REQUEST_SAB_BYTES = HEADER_BYTES + PAYLOAD_BYTES;
@@ -255,12 +257,17 @@ export function createWorkerYurtImports(
       call(WorkerHostOp.ThreadSpawn, [fnPtr, arg]),
     host_socket_bind: (
       fd: number,
-      hostPtr: number,
-      hostLen: number,
-      port: number,
+      addrPtr: number,
+      addrLen: number,
     ) => {
-      const host = memoryBytes().subarray(hostPtr, hostPtr + hostLen);
-      return call(WorkerHostOp.SocketBind, [fd, hostLen, port], host);
+      const addr = decodeSockaddrIn(memory, addrPtr, addrLen);
+      if (addr === null) return ERR_INVALID;
+      const host = new TextEncoder().encode(addr.host);
+      return call(
+        WorkerHostOp.SocketBind,
+        [fd, host.byteLength, addr.port],
+        host,
+      );
     },
     host_socket_listen: (fd: number, backlog: number) =>
       call(WorkerHostOp.SocketListen, [fd, backlog]),

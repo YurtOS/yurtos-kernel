@@ -58,6 +58,37 @@ export function readSpan(
   return new Uint8Array(memory.buffer, base + off, len).slice();
 }
 
+export const WASI_AF_INET = 1;
+export const RUST_STD_AF_INET = 2;
+export const SOCKADDR_IN_SIZE = 16;
+
+export interface DecodedSockaddrIn {
+  host: "127.0.0.1" | "localhost" | "0.0.0.0" | string;
+  port: number;
+}
+
+export function decodeSockaddrIn(
+  memory: WebAssembly.Memory,
+  ptr: number,
+  len: number,
+): DecodedSockaddrIn | null {
+  if (ptr === 0 || len < SOCKADDR_IN_SIZE) return null;
+  if (
+    !Number.isInteger(ptr) ||
+    ptr < 0 ||
+    ptr > memory.buffer.byteLength - SOCKADDR_IN_SIZE
+  ) {
+    return null;
+  }
+  const view = new DataView(memory.buffer, ptr, SOCKADDR_IN_SIZE);
+  const family = view.getUint16(0, true);
+  if (family !== WASI_AF_INET && family !== RUST_STD_AF_INET) return null;
+  const port = view.getUint16(2, false);
+  const octets = new Uint8Array(memory.buffer, ptr + 4, 4);
+  const host = `${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}`;
+  return { host, port };
+}
+
 /**
  * Write a UTF-8 string into the WASM output buffer.
  * Returns bytes written on success, or the required size if the buffer

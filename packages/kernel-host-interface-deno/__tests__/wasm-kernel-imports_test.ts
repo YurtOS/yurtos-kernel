@@ -297,6 +297,11 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(names.has("host_realpath")).toEqual(true);
   });
 
+  it("covers host_lstat through a Rust-kernel syscall", () => {
+    const names = new Set(HOST_BINDINGS.map((b) => b.name));
+    expect(names.has("host_lstat")).toEqual(true);
+  });
+
   it("covers the pthread host import names that have Rust syscalls", () => {
     const names = new Set(HOST_BINDINGS.map((b) => b.name));
     for (
@@ -851,6 +856,27 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(n).toEqual(4);
     const got = new TextDecoder().decode(new Uint8Array(buf, 32, n));
     expect(got).toEqual("/dst");
+  });
+
+  it("out_cap: host_lstat reports the link itself (S_IFLNK), no follow", async () => {
+    if (!HAS_JSPI) return;
+    const mk = await freshMk();
+    const buf = new ArrayBuffer(64);
+    const u = new Uint8Array(buf);
+    const imports = buildWasmKernelImports(mk, () => buf);
+    // mkdir /d ; symlink /d -> /l
+    u.set(new TextEncoder().encode("/d"), 0);
+    expect(await imports.host_mkdir(0, 2)).toEqual(0);
+    u.set(new TextEncoder().encode("/d"), 0);
+    u.set(new TextEncoder().encode("/l"), 16);
+    expect(await imports.host_symlink(0, 2, 16, 2)).toEqual(0);
+    // lstat /l → 16-byte fstat record at offset 32. filetype is the
+    // u32 at [+8]; 7 = S_IFLNK (lstat does NOT follow to S_IFDIR=3).
+    u.fill(0);
+    u.set(new TextEncoder().encode("/l"), 0);
+    const n = await imports.host_lstat(0, 2, 32, 32);
+    expect(n).toEqual(16);
+    expect(new DataView(buf).getUint32(32 + 8, true)).toEqual(7);
   });
 
   it("rc_to_out: host_dup writes new fd into out memory", async () => {

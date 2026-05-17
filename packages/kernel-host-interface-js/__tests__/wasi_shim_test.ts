@@ -171,10 +171,19 @@ Deno.test("path_link forwards preopen-relative paths to SYS_LINK", () => {
   assertEquals(new TextDecoder().decode(request.slice(12)), "/link.txt");
 });
 
-Deno.test("path_filestat_get forwards preopen-relative paths to SYS_STAT", () => {
+// WASI lookupflags bit 0 = __WASI_LOOKUPFLAGS_SYMLINK_FOLLOW.
+// wasi-libc passes it for stat() and clears it for lstat() /
+// fstatat(AT_SYMLINK_NOFOLLOW). The shim must honor it, not always
+// follow. (PR #120 review — #81 no-follow requirement.)
+const WASI_SYMLINK_FOLLOW = 1;
+
+function filestatShim(): {
+  shim: ReturnType<typeof buildWasiShim>;
+  calls: { method: number; request: Uint8Array }[];
+  memory: WebAssembly.Memory;
+} {
   const memory = testMemory();
-  const bytes = new Uint8Array(memory.buffer);
-  bytes.set(new TextEncoder().encode("foo.txt"), 64);
+  new Uint8Array(memory.buffer).set(new TextEncoder().encode("foo.txt"), 64);
   const response = new Uint8Array(16);
   const responseView = new DataView(response.buffer);
   responseView.setBigUint64(0, 4n, true);
@@ -188,16 +197,33 @@ Deno.test("path_filestat_get forwards preopen-relative paths to SYS_STAT", () =>
       return { rc: 16n, response };
     },
   };
-  const shim = buildWasiShim(42, kernel as never, [], { memory });
+  return {
+    shim: buildWasiShim(42, kernel as never, [], { memory }),
+    calls,
+    memory,
+  };
+}
+
+Deno.test("path_filestat_get without SYMLINK_FOLLOW routes to SYS_LSTAT (no-follow)", () => {
+  const { shim, calls, memory } = filestatShim();
   const rc = shim.path_filestat_get(3, 0, 64, 7, 128);
 
   assertEquals(rc, 0);
-  assertEquals(calls[0].method, METHOD.SYS_STAT);
+  assertEquals(calls[0].method, METHOD.SYS_LSTAT);
   assertEquals(new TextDecoder().decode(calls[0].request), "/foo.txt");
   const view = new DataView(memory.buffer);
   assertEquals(new Uint8Array(memory.buffer, 128 + 16, 1)[0], 4);
   assertEquals(view.getBigUint64(128 + 24, true), 1n);
   assertEquals(view.getBigUint64(128 + 32, true), 4n);
+});
+
+Deno.test("path_filestat_get with SYMLINK_FOLLOW routes to SYS_STAT (follow)", () => {
+  const { shim, calls } = filestatShim();
+  const rc = shim.path_filestat_get(3, WASI_SYMLINK_FOLLOW, 64, 7, 128);
+
+  assertEquals(rc, 0);
+  assertEquals(calls[0].method, METHOD.SYS_STAT);
+  assertEquals(new TextDecoder().decode(calls[0].request), "/foo.txt");
 });
 
 Deno.test("path_unlink_file forwards preopen-relative paths to SYS_UNLINK", () => {
