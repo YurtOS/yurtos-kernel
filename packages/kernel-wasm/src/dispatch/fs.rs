@@ -314,9 +314,8 @@ pub(super) fn symlink(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let target_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
-    let (target, link_path_raw) = match take_bytes(request, 4, target_len) {
-        Ok(p) => p,
-        Err(e) => return e,
+    let Ok((target, link_path_raw)) = take_bytes(request, 4, target_len) else {
+        return -(abi::EINVAL as i64);
     };
     if link_path_raw.is_empty() {
         return -(abi::EINVAL as i64);
@@ -340,9 +339,8 @@ pub(super) fn rename(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let old_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
-    let (old_raw, new_raw) = match take_bytes(request, 4, old_len) {
-        Ok(p) => p,
-        Err(e) => return e,
+    let Ok((old_raw, new_raw)) = take_bytes(request, 4, old_len) else {
+        return -(abi::EINVAL as i64);
     };
     if new_raw.is_empty() {
         return -(abi::EINVAL as i64);
@@ -368,9 +366,8 @@ pub(super) fn hard_link(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let target_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
-    let (target_raw, link_raw) = match take_bytes(request, 4, target_len) {
-        Ok(p) => p,
-        Err(e) => return e,
+    let Ok((target_raw, link_raw)) = take_bytes(request, 4, target_len) else {
+        return -(abi::EINVAL as i64);
     };
     if link_raw.is_empty() {
         return -(abi::EINVAL as i64);

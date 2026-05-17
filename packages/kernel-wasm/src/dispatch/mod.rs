@@ -1413,9 +1413,8 @@ fn sys_idb_get(request: &[u8], response: &mut [u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let store_len = request[0] as usize;
-    let (store, key) = match take_bytes(request, 1, store_len) {
-        Ok(p) => p,
-        Err(e) => return e,
+    let Ok((store, key)) = take_bytes(request, 1, store_len) else {
+        return -(abi::EINVAL as i64);
     };
     if key.is_empty() {
         return -(abi::EINVAL as i64);
@@ -1447,9 +1446,8 @@ fn sys_idb_put(request: &[u8]) -> i64 {
     let body_start = 1 + store_len + 4;
     // key_len is a caller-controlled u32 → `body_start + key_len`
     // would wrap on wasm32 (32-bit usize); take_bytes bounds in u64.
-    let (key, value) = match take_bytes(request, body_start, key_len) {
-        Ok(p) => p,
-        Err(e) => return e,
+    let Ok((key, value)) = take_bytes(request, body_start, key_len) else {
+        return -(abi::EINVAL as i64);
     };
     kh::idb_put(store, key, value) as i64
 }
@@ -1459,9 +1457,8 @@ fn sys_idb_delete(request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let store_len = request[0] as usize;
-    let (store, key) = match take_bytes(request, 1, store_len) {
-        Ok(p) => p,
-        Err(e) => return e,
+    let Ok((store, key)) = take_bytes(request, 1, store_len) else {
+        return -(abi::EINVAL as i64);
     };
     if key.is_empty() {
         return -(abi::EINVAL as i64);
@@ -1474,9 +1471,8 @@ fn sys_idb_list(request: &[u8], response: &mut [u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let store_len = request[0] as usize;
-    let (store, prefix) = match take_bytes(request, 1, store_len) {
-        Ok(p) => p,
-        Err(e) => return e,
+    let Ok((store, prefix)) = take_bytes(request, 1, store_len) else {
+        return -(abi::EINVAL as i64);
     };
     if response.is_empty() {
         return -(abi::EINVAL as i64);
