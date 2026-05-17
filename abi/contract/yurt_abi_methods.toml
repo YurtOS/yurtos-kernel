@@ -666,6 +666,16 @@ id = 0x1_00A9
 kind = "syscall"
 doc = "Linux syncfs(fd). Request: u32 fd LE. Sync the filesystem containing fd. For the in-memory ramfs this is a no-op success on any open fd — only the fd-validity check matters. Returns 0, -EBADF for an unknown fd, or -EINVAL for non-syncable fd types (mirrors sys_fsync's gate)."
 
+[method.sys_access]
+id = 0x1_00AA
+kind = "syscall"
+doc = "POSIX access(path, mode). Request: u32 mode LE + path bytes (path runs to end-of-request; mirrors sys_chdir). mode bits: F_OK=0 / X_OK=1 / W_OK=2 / R_OK=4 (OR-able). Resolves symlinks, looks up the file's mode bits, checks against the caller's **real** uid/gid (POSIX requires real ids for access(2); AT_EACCESS is the faccessat affordance for effective ids). Returns 0 on permitted access, -ENOENT for missing path, -EINVAL for bad mode bits / empty path, -EACCES for denied, -ELOOP for symlink hop overflow. EROFS for W_OK on a read-only VFS backend is a follow-up. Issue #86."
+
+[method.sys_faccessat]
+id = 0x1_00AB
+kind = "syscall"
+doc = "POSIX faccessat(dirfd, path, mode, flag). Request: u32 dirfd LE + u32 mode LE + u32 flag LE + path bytes (path runs to end-of-request; mirrors sys_openat). dirfd: AT_FDCWD (u32::MAX) or a directory fd from sys_open(O_DIRECTORY). flag: AT_SYMLINK_NOFOLLOW (0x100) — don't follow the terminal symlink; AT_EACCESS (0x200) — use the caller's effective uid/gid instead of real. mode/errno semantics match sys_access. Additional errnos: -EBADF for unknown dirfd, -ENOTDIR for a non-directory dirfd. Issue #86."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"
