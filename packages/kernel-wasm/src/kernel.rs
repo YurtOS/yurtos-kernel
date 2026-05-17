@@ -1444,33 +1444,29 @@ impl Kernel {
         })
     }
 
-    pub fn kill_process_group(&mut self, pgid: Pid, sig: u32) -> Result<(), i32> {
-        if sig > 63 {
-            return Err(crate::abi::EINVAL);
-        }
-        let mut found = false;
-        for (pid, process) in self.processes.iter_mut() {
-            if process.fork_state != ProcessForkState::Running {
-                continue;
-            }
-            let process_pgid = if process.pgid == 0 {
-                *pid
-            } else {
-                process.pgid
-            };
-            if process.exit_status.is_some() || process_pgid != pgid {
-                continue;
-            }
-            found = true;
-            if sig != 0 {
-                process.pending_signals |= 1u64 << (sig - 1);
-            }
-        }
-        if found {
-            Ok(())
-        } else {
-            Err(crate::abi::ESRCH)
-        }
+    /// Live members of process group `pgid`. Single source of truth for
+    /// "what is in this group": a running, not-yet-reaped process whose
+    /// effective pgid (own pid when `pgid == 0`) equals `pgid`. The
+    /// authorization decision (POSIX per-target `may_signal`) and signal
+    /// delivery are owned by the dispatch layer (`killpg_request`) — it
+    /// holds the host-authenticated `caller_pid` and the credential gate.
+    pub fn process_group_member_pids(&self, pgid: Pid) -> Vec<Pid> {
+        self.processes
+            .iter()
+            .filter(|(pid, process)| {
+                if process.fork_state != ProcessForkState::Running || process.exit_status.is_some()
+                {
+                    return false;
+                }
+                let process_pgid = if process.pgid == 0 {
+                    **pid
+                } else {
+                    process.pgid
+                };
+                process_pgid == pgid
+            })
+            .map(|(pid, _)| *pid)
+            .collect()
     }
 
     pub fn list_threads(&self, pid: Pid) -> Vec<ThreadRecord> {

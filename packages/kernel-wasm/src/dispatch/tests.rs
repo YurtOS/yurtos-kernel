@@ -4229,6 +4229,66 @@ fn killpg_records_signal_for_live_group_members_only() {
     assert_eq!(other_pending, 0);
 }
 
+// #66 follow-up — killpg / kill(-pgid) is the SAME forced-signal
+// primitive as kill() at process-group granularity. It must apply the
+// per-member POSIX permission check (may_signal) just like kill_request,
+// or a guest can inject signals into / force-terminate process groups
+// across uid boundaries.
+
+#[test]
+fn killpg_rejects_unauthorized_cross_uid_group() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        // Caller pid 1 stays default uid 1000, in its own group.
+        let caller = k.process_mut(1);
+        caller.pgid = 1;
+        // Target group 50 is owned entirely by another uid.
+        let member = k.process_mut(20);
+        member.pgid = 50;
+    });
+    set_uid(20, 2000);
+
+    let mut req = Vec::new();
+    req.extend_from_slice(&50_u32.to_le_bytes());
+    req.extend_from_slice(&15_u32.to_le_bytes()); // SIGTERM
+    assert_eq!(
+        dispatch(METHOD_SYS_KILLPG, 1, &req, &mut []),
+        -(abi::EPERM as i64),
+        "guest must not signal a process group owned entirely by another uid"
+    );
+    let pending = crate::kernel::with_kernel(|k| k.process_mut(20).pending_signals);
+    assert_eq!(pending, 0, "rejected killpg must not set pending bits");
+}
+
+#[test]
+fn killpg_signals_only_authorized_group_members() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        // Caller pid 1 (uid 1000), not a member of the target group.
+        k.process_mut(1).pgid = 1;
+        // Group 60: one same-uid member (30) and one cross-uid (31).
+        k.process_mut(30).pgid = 60;
+        k.process_mut(31).pgid = 60;
+    });
+    set_uid(31, 2000);
+
+    let mut req = Vec::new();
+    req.extend_from_slice(&60_u32.to_le_bytes());
+    req.extend_from_slice(&15_u32.to_le_bytes());
+    // Permitted for >=1 member → POSIX success; signal lands only on
+    // the members the caller is allowed to signal.
+    assert_eq!(dispatch(METHOD_SYS_KILLPG, 1, &req, &mut []), 0);
+
+    let (same_uid, cross_uid) = crate::kernel::with_kernel(|k| {
+        (
+            k.process_mut(30).pending_signals,
+            k.process_mut(31).pending_signals,
+        )
+    });
+    assert_eq!(same_uid, 1u64 << 14, "same-uid member must be signaled");
+    assert_eq!(cross_uid, 0, "cross-uid member must NOT be signaled");
+}
+
 #[test]
 fn killpg_zero_uses_callers_process_group_as_alive_probe() {
     let _g = crate::kernel::TestGuard::acquire();

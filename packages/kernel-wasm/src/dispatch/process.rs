@@ -995,10 +995,27 @@ pub(super) fn killpg_request(caller_pid: u32, request: &[u8]) -> i64 {
         } else {
             pgid_arg
         };
-        match k.kill_process_group(pgid, sig) {
-            Ok(()) => 0,
-            Err(errno) => -(errno as i64),
+        let members = k.process_group_member_pids(pgid);
+        if members.is_empty() {
+            return -(abi::ESRCH as i64);
         }
+        // POSIX kill(-pgid)/killpg: the permission check is per-member
+        // on the host-authenticated caller (NOT the guest pgid). The
+        // signal lands only on members the caller may signal; the call
+        // succeeds if at least one was permitted, else -EPERM.
+        let permitted: Vec<u32> = members
+            .into_iter()
+            .filter(|&member| may_signal(k, caller_pid, member, sig).is_ok())
+            .collect();
+        if permitted.is_empty() {
+            return -(abi::EPERM as i64);
+        }
+        if sig != 0 {
+            for member in permitted {
+                k.process_mut(member).pending_signals |= 1u64 << (sig - 1);
+            }
+        }
+        0
     })
 }
 
