@@ -442,7 +442,7 @@ fn dup3_fd(caller_pid: u32, request: &[u8]) -> i64 {
     })
 }
 
-/// `dup_min(oldfd: u32, minfd: u32) -> newfd / -EBADF / -EINVAL`.
+/// `dup_min(oldfd: u32, minfd: u32) -> newfd / -EBADF / -EMFILE / -EINVAL`.
 fn dup_min_fd(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([oldfd, minfd]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
@@ -452,8 +452,19 @@ fn dup_min_fd(caller_pid: u32, request: &[u8]) -> i64 {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
-        let Some(newfd) = k.process_mut(caller_pid).fd_table.lowest_free_fd_at(minfd) else {
-            return -(abi::EINVAL as i64);
+        // Bound F_DUPFD by the caller's RLIMIT_NOFILE soft limit so a
+        // guest looping fcntl(fd, F_DUPFD, 0) cannot grow the fd table
+        // without bound — the same guest-DoS #135 closed for the other
+        // allocation sites (issue #140 / #110 / #71-audit). POSIX:
+        // F_DUPFD past the per-process limit is EMFILE, not EINVAL. No
+        // rollback is needed — inc_entry_ref runs only after a
+        // successful allocation.
+        let p = k.process_mut(caller_pid);
+        let Some(newfd) = p
+            .fd_table
+            .lowest_free_fd_at_within(minfd, p.nofile_soft_limit())
+        else {
+            return -(abi::EMFILE as i64);
         };
         inc_entry_ref(k, &entry);
         k.process_mut(caller_pid).fd_table.install(newfd, entry);

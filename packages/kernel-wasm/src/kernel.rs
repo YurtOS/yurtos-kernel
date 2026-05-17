@@ -222,9 +222,26 @@ impl FdTable {
         }
     }
 
-    pub fn lowest_free_fd_at(&self, min_fd: u32) -> Option<u32> {
+    /// Lowest unused fd number `>= min_fd` that is also strictly below
+    /// `soft_limit` (the caller's `RLIMIT_NOFILE` soft limit) — the
+    /// `min_fd` floor of an `fcntl(F_DUPFD)` request combined with the
+    /// `soft_limit` ceiling of `lowest_free_fd_within`. Returns `None`
+    /// when no such fd exists (every slot in `min_fd..soft_limit` is
+    /// taken, or `min_fd >= soft_limit`); `fcntl(F_DUPFD)` maps that
+    /// to `-EMFILE`, which bounds the same unbounded-fd-growth
+    /// guest-DoS that `lowest_free_fd_within` bounds for the other
+    /// allocation sites (issue #140 / #110 / #71-audit). This is the
+    /// sole fd allocator that takes a caller-supplied floor, so it
+    /// fully supersedes the old unbounded `lowest_free_fd_at`.
+    /// `soft_limit` is a `u64` for the same reason as
+    /// `lowest_free_fd_within` (RLIM_INFINITY = `u64::MAX`; the
+    /// `u32::MAX` guard prevents overflow).
+    pub fn lowest_free_fd_at_within(&self, min_fd: u32, soft_limit: u64) -> Option<u32> {
         let mut n = min_fd;
         loop {
+            if u64::from(n) >= soft_limit {
+                return None;
+            }
             if !self.entries.contains_key(&n) {
                 return Some(n);
             }

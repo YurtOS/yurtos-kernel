@@ -1083,6 +1083,75 @@ fn dup_min_rejects_closed_source_fd() {
     );
 }
 
+/// Issue #140 (guest-DoS, follow-up to #110/#135): `fcntl(F_DUPFD)`
+/// must also be bounded by `RLIMIT_NOFILE`. A guest looping
+/// `fcntl(fd, F_DUPFD, 0)` must not grow the fd table without bound;
+/// once every fd `< soft_limit` is taken the call returns `-EMFILE`
+/// (POSIX `F_DUPFD` past the per-process limit is `EMFILE`), NOT
+/// `-EINVAL` and NOT an unbounded fresh fd. Below the limit, F_DUPFD
+/// numbering is unchanged, and freeing an fd reopens headroom.
+#[test]
+fn dup_min_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Lower RLIMIT_NOFILE (slot 7) soft limit to 6 for pid 1. fds
+    // 0/1/2 (stdin/out/err) are pre-opened, so F_DUPFD of fd 0 can
+    // take 3,4,5 before the next allocation must fail.
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).rlimits[7] = Some((6, 1024));
+    });
+    // dup fd 0 (stdin), minfd 0.
+    let mut req = Vec::new();
+    req.extend_from_slice(&0_u32.to_le_bytes());
+    req.extend_from_slice(&0_u32.to_le_bytes());
+
+    // 3,4,5 are all < soft limit 6 and keep lowest-free-at numbering.
+    for expected_fd in 3..=5 {
+        assert_eq!(
+            dispatch(METHOD_SYS_DUP_MIN, 1, &req, &mut []),
+            expected_fd,
+            "F_DUPFD below the limit allocates the lowest free fd"
+        );
+    }
+    // The next dup would be fd 6, which is NOT < soft limit 6 →
+    // -EMFILE. Critically: NOT -EINVAL and NOT an unbounded fd 6.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP_MIN, 1, &req, &mut []),
+        -(abi::EMFILE as i64),
+        "F_DUPFD at/over RLIMIT_NOFILE soft limit must be -EMFILE"
+    );
+    // An explicit minfd at/above the soft limit is also -EMFILE
+    // (the per-process limit is reached, there is no fd to give).
+    let mut req_hi = Vec::new();
+    req_hi.extend_from_slice(&0_u32.to_le_bytes());
+    req_hi.extend_from_slice(&6_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP_MIN, 1, &req_hi, &mut []),
+        -(abi::EMFILE as i64),
+        "F_DUPFD with minfd >= soft limit must be -EMFILE"
+    );
+
+    // Freeing an fd reopens headroom: closing fd 4 lets the next
+    // F_DUPFD reuse the lowest free number (4) — the bound is a live
+    // ceiling, not a one-way latch.
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &4_u32.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP_MIN, 1, &req, &mut []),
+        4,
+        "after close, F_DUPFD resumes at the lowest free fd"
+    );
+
+    // A pid with the default limit (1024) is unaffected — the bound
+    // is per-process (no global regression).
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP_MIN, 2, &req, &mut []),
+        3,
+        "default-limit process keeps normal F_DUPFD allocation"
+    );
+}
+
 #[test]
 fn set_fd_descriptor_flags_rejects_closed_fd() {
     let _g = crate::kernel::TestGuard::acquire();
