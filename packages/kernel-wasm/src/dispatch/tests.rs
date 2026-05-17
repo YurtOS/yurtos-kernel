@@ -2974,7 +2974,22 @@ fn socket_recvmsg_with_tiny_rights_buffer_returns_data_and_truncates_rights() {
         1
     );
     assert_eq!(recv[0], b'x');
-    assert_eq!(u32::from_le_bytes(recv[1..5].try_into().unwrap()), 1);
+    // #104 (M2): one fd was sent but the ancillary region (out.len()
+    // == 4) fits zero fds, so the kernel installs none, discards
+    // (closes) the overflow, reports the *installed* count (0 — not
+    // the phantom 1 this test previously enshrined), and flags
+    // RIGHTS_TRUNCATED so the host can raise MSG_CTRUNC.
+    let header = u32::from_le_bytes(recv[1..5].try_into().unwrap());
+    assert_eq!(
+        header & !RIGHTS_TRUNCATED,
+        0,
+        "no fd fits → installed count must be 0, not the phantom 1"
+    );
+    assert_ne!(
+        header & RIGHTS_TRUNCATED,
+        0,
+        "discarding the only fd must flag RIGHTS_TRUNCATED (MSG_CTRUNC)"
+    );
 
     let mut empty = [0u8; 12];
     assert_eq!(
@@ -2985,6 +3000,102 @@ fn socket_recvmsg_with_tiny_rights_buffer_returns_data_and_truncates_rights() {
             &mut empty
         ),
         -(abi::EAGAIN as i64)
+    );
+}
+
+#[test]
+fn socket_recvmsg_overflowing_scm_rights_sets_ctrunc_and_installed_count() {
+    // #104 (M2): N fds sent via SCM_RIGHTS into an ancillary buffer
+    // that fits only `fit < N`. The kernel must (a) flag truncation
+    // (RIGHTS_TRUNCATED / MSG_CTRUNC) in the fd-count header, (b)
+    // report the *installed* count (not the phantom full N), (c)
+    // install exactly `fit` fds and close the overflow (no leak).
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut socket_fds = [0u8; 8];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKETPAIR,
+            1,
+            &socketpair_req(1, 1, 0),
+            &mut socket_fds
+        ),
+        8
+    );
+    let left = u32::from_le_bytes(socket_fds[0..4].try_into().unwrap());
+    let right = u32::from_le_bytes(socket_fds[4..8].try_into().unwrap());
+
+    // Three pipe-write fds → SCM_RIGHTS payload of N = 3.
+    let mut wfds = Vec::new();
+    for _ in 0..3 {
+        let mut pipe_fds = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_fds), 8);
+        wfds.push(u32::from_le_bytes(pipe_fds[4..8].try_into().unwrap()));
+    }
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDMSG,
+            1,
+            &socket_sendmsg_req(left, b"x", &wfds),
+            &mut []
+        ),
+        1
+    );
+    // Sender drops its own copies; the only remaining references to
+    // each pipe-write end are the cloned SCM_RIGHTS entries in transit.
+    for fd in &wfds {
+        assert_eq!(dispatch(METHOD_SYS_CLOSE, 1, &fd.to_le_bytes(), &mut []), 0);
+    }
+
+    // Ancillary region: 4-byte count + room for exactly 1 fd → fit = 1.
+    let mut recv = [0u8; 1 + 4 + 4];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVMSG,
+            1,
+            &socket_recvmsg_req(right, 0, 1),
+            &mut recv
+        ),
+        1
+    );
+    assert_eq!(recv[0], b'x');
+    let header = u32::from_le_bytes(recv[1..5].try_into().unwrap());
+
+    // (a) truncation flagged.
+    assert_ne!(
+        header & RIGHTS_TRUNCATED,
+        0,
+        "over-capacity SCM_RIGHTS must flag RIGHTS_TRUNCATED (MSG_CTRUNC)"
+    );
+    // (b) reported count = *installed* (1), not the phantom N (3).
+    let installed = header & !RIGHTS_TRUNCATED;
+    assert_eq!(
+        installed, 1,
+        "header must report installed fd count, not phantom N"
+    );
+
+    // (c) exactly `fit` = 1 fd installed and usable; overflow closed.
+    let received = u32::from_le_bytes(recv[5..9].try_into().unwrap());
+    let installed_ok =
+        crate::kernel::with_kernel(|k| k.process_mut(1).fd_table.entry(received).is_some());
+    assert!(installed_ok, "the one fitting fd must be installed");
+
+    // No fd leak: the two overflow pipe-write ends were closed by the
+    // kernel, so their pipes report EOF — read end returns 0 (EOF),
+    // never blocks/EAGAIN. We can only directly observe the installed
+    // one is live; the overflow entries were close_entry'd (refcount
+    // dropped) — assert no stray extra socket/pipe fds beyond the
+    // installed one were added to the caller table by counting that
+    // the next recvmsg drains nothing more.
+    let mut empty = [0u8; 1 + 4];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVMSG,
+            1,
+            &socket_recvmsg_req(right, 0, 1),
+            &mut empty
+        ),
+        -(abi::EAGAIN as i64),
+        "the SCM_RIGHTS queue must be fully drained (overflow discarded, not requeued)"
     );
 }
 

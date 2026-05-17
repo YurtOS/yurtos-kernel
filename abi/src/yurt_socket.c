@@ -1027,6 +1027,15 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
   }
   ssize_t nbytes = (ssize_t)rc;
 
+  /* #104 (M2): the kernel/host returns a u32 ancillary header — low 31
+   * bits = installed fd count, bit 31 = the kernel discarded (closed)
+   * overflow SCM_RIGHTS fds because the ancillary buffer was too
+   * small. Decode it so the count is the true array length and the
+   * discard surfaces as POSIX MSG_CTRUNC (same as the data path). */
+  int kernel_ancillary_truncated =
+    ((unsigned)n_fds & 0x80000000u) != 0;
+  n_fds = (int)((unsigned)n_fds & 0x7fffffffu);
+
   size_t copied = 0;
   iov_rc = yurt_rs_socket_iov_scatter(
     msg->msg_iov,
@@ -1045,6 +1054,12 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
   /* Write SCM_RIGHTS cmsg if fds were received */
   msg->msg_controllen = 0;
   msg->msg_flags = 0;
+  /* #104 (M2): the kernel already discarded (and closed) the overflow
+   * fds because the ancillary buffer was too small — surface it the
+   * same way the local data path below does (msg_flags |= MSG_CTRUNC). */
+  if (kernel_ancillary_truncated) {
+    msg->msg_flags |= MSG_CTRUNC;
+  }
   if (n_fds > 0 && msg->msg_control && orig_controllen > 0) {
     struct cmsghdr *cmsg = (struct cmsghdr *)msg->msg_control;
     size_t needed = CMSG_SPACE(n_fds * sizeof(int));
