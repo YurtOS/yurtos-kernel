@@ -3022,6 +3022,79 @@ fn socket_recvmsg_with_tiny_rights_buffer_returns_data_and_truncates_rights() {
     );
 }
 
+/// Issue #143 (regression #135 introduced): when the receiver is at
+/// its RLIMIT_NOFILE soft limit, recvmsg carrying SCM_RIGHTS must NOT
+/// silently return success while advertising fd words that were never
+/// installed (the old `None => close_entry` left the slot unwritten
+/// — zero/stale — yet the `count` header still claimed it, so the
+/// guest read a phantom fd, commonly 0 / stdin). Data + rights are
+/// already consumed before the install, so the correct behavior is
+/// an honest truncated count (Linux scm_detach_fds), not -EMFILE:
+/// deliver the data, report only the fds actually installed, and
+/// close the dropped rights in-kernel.
+#[test]
+fn recvmsg_scm_rights_at_rlimit_does_not_deliver_phantom_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut socket_fds = [0u8; 8];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKETPAIR,
+            1,
+            &socketpair_req(1, 1, 0),
+            &mut socket_fds
+        ),
+        8
+    );
+    let left = u32::from_le_bytes(socket_fds[0..4].try_into().unwrap());
+    let right = u32::from_le_bytes(socket_fds[4..8].try_into().unwrap());
+
+    let mut pipe_fds = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_fds), 8);
+    let pipe_write = u32::from_le_bytes(pipe_fds[4..8].try_into().unwrap());
+
+    // Queue one SCM_RIGHTS fd on `right`'s rx.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDMSG,
+            1,
+            &socket_sendmsg_req(left, b"x", &[pipe_write]),
+            &mut []
+        ),
+        1
+    );
+
+    // Pin pid 1 at its fd ceiling: fds 0/1/2 (stdio), 3/4 (pair),
+    // 5/6 (pipe) = 7 entries, all < soft limit 7, so the recvmsg fd
+    // install hits lowest_free_fd_within → None.
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).rlimits[7] = Some((7, 1024));
+    });
+
+    // data_cap=1, then a 4-byte count + room for one fd word, so the
+    // dropped entry is *in range* (fit=1) — the regression path, not
+    // the doesn't-fit truncation (#133/M2, asserted elsewhere).
+    let mut recv = [0u8; 1 + 4 + 4];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVMSG,
+            1,
+            &socket_recvmsg_req(right, 0, 1),
+            &mut recv
+        ),
+        1,
+        "data must still be delivered (Linux delivers data + truncates cmsg)"
+    );
+    assert_eq!(recv[0], b'x', "the data byte must be delivered");
+    // The honest count: zero fds were installable, so the guest must
+    // be told zero — never a phantom fd. Buggy code reports 1 with a
+    // zero fd word at recv[5..9].
+    assert_eq!(
+        u32::from_le_bytes(recv[1..5].try_into().unwrap()),
+        0,
+        "SCM_RIGHTS count must reflect only installed fds, not phantoms"
+    );
+}
+
 #[test]
 fn socket_recvmsg_peek_preserves_fd_rights_for_real_receive() {
     let _g = crate::kernel::TestGuard::acquire();
