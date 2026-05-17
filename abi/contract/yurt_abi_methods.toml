@@ -675,3 +675,8 @@ doc = "KernelHostInterface-only: serialize a kernel-owned thread snapshot for on
 id = 18
 kind = "internal"
 doc = "KernelHostInterface-only: ask the kernel scheduler for the next runnable thread. Response: u32 pid, u32 tid, i32 host_thread_handle (-1 when none), u32 flags, u64 budget_ns. Returns bytes-written, -EAGAIN when no runnable thread exists, or required size when the output buffer is too small."
+
+[method.sys_getrandom]
+id = 0x1_00A0
+kind = "syscall"
+doc = "POSIX getrandom(buf, buflen, flags). Request: u32 len LE + u32 flags LE (8 bytes). Response buffer receives `len` cryptographically secure random bytes from the host CSPRNG. flags: GRND_NONBLOCK (0x1) and GRND_RANDOM (0x2) are accepted and are no-ops (entropy is always ready; never blocks, no separate pool); any other bit -> -EINVAL. Returns `len` on success; -EINVAL for unknown flags, a request shorter than 8 bytes, or a response buffer smaller than `len`; -EIO if the host entropy source fails. Length is bounded with the subtraction form (issue #65 class). getentropy() is a thin guest-libc wrapper over this method, not a separate id."
