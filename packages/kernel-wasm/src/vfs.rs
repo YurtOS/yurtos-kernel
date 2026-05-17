@@ -183,7 +183,6 @@ pub trait VfsBackend: Send {
     /// Stable inode of `path` iff it is a directory. `None` ⇒ this
     /// backend does not support inode-anchored dirs (caller uses the
     /// path-snapshot degraded mode for that mount).
-    #[allow(dead_code)] // Consumed by the inode-anchored openat walk (B2.9 Task 6).
     fn dir_inode(&self, _path: &[u8]) -> Option<u64> {
         None
     }
@@ -201,7 +200,6 @@ pub trait VfsBackend: Send {
     /// Reverse: current absolute (mount-relative) path of a live dir
     /// inode; `None` if the inode is no longer a live directory
     /// (rmdir/unlink) — distinct from "backend unsupported".
-    #[allow(dead_code)] // Consumed by the PathResolver cwd-refresh invariant (B2.9 Task 6).
     fn dir_path(&self, _dir_inode: u64) -> Option<Vec<u8>> {
         None
     }
@@ -508,12 +506,19 @@ pub struct RamfsBackend {
     /// from regular files so lookup paths can fall through to
     /// readlink without colliding with regular-file inode numbers.
     symlinks: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// Explicit directory paths. mkdir adds; rmdir removes (only
-    /// if empty). readdir filters self.paths/symlinks by parent.
+    /// path → stable dir inode. mkdir mints (from `next_id`, the
+    /// same counter `install` uses for file inodes — one
+    /// collision-free id space within ramfs); rmdir frees both
+    /// sides. Dir inodes never enter `inodes`/`refcount`:
+    /// directories have no byte content and no hardlinks (isolation
+    /// invariant). readdir filters self.paths/symlinks by parent.
     /// Phase 8: directories carry no metadata of their own beyond
     /// the implicit "this path is a dir" marker; future MetadataOverlay
     /// stores dir-level uid/gid/mode independently.
-    dirs: BTreeSet<Vec<u8>>,
+    dir_inodes: BTreeMap<Vec<u8>, u64>,
+    /// reverse: dir inode → current path. Moved (never reused) on
+    /// directory rename; removed on rmdir. Backs `dir_path`.
+    dir_paths: BTreeMap<u64, Vec<u8>>,
     /// inode → number of paths referring to it. Bumped by install
     /// (creating a new path) and by `link`; decremented by `unlink`.
     /// When the count hits zero the inode buffer in `inodes` is
@@ -525,13 +530,18 @@ pub struct RamfsBackend {
 
 impl RamfsBackend {
     pub fn new() -> Self {
-        let mut dirs = BTreeSet::new();
-        dirs.insert(b"/".to_vec());
+        let mut dir_inodes = BTreeMap::new();
+        let mut dir_paths = BTreeMap::new();
+        // Fixed root dir inode (id 0 is reserved for it; next_id
+        // starts at 1 for everything else — unchanged).
+        dir_inodes.insert(b"/".to_vec(), 0u64);
+        dir_paths.insert(0u64, b"/".to_vec());
         Self {
             inodes: BTreeMap::new(),
             paths: BTreeMap::new(),
             symlinks: BTreeMap::new(),
-            dirs,
+            dir_inodes,
+            dir_paths,
             refcount: BTreeMap::new(),
             next_id: 1,
         }
@@ -768,7 +778,7 @@ impl VfsBackend for RamfsBackend {
         };
         if self.paths.contains_key(link_path)
             || self.symlinks.contains_key(link_path)
-            || self.dirs.contains(link_path)
+            || self.dir_inodes.contains_key(link_path)
         {
             return -(crate::abi::EEXIST as i64) as i32;
         }
@@ -779,7 +789,7 @@ impl VfsBackend for RamfsBackend {
     }
 
     fn entry_type(&self, path: &[u8]) -> u8 {
-        if path == b"/" || self.dirs.contains(path) {
+        if path == b"/" || self.dir_inodes.contains_key(path) {
             3 // DIRECTORY
         } else if self.symlinks.contains_key(path) {
             7 // SYMBOLIC_LINK
@@ -788,6 +798,14 @@ impl VfsBackend for RamfsBackend {
         } else {
             0
         }
+    }
+
+    fn dir_inode(&self, path: &[u8]) -> Option<u64> {
+        self.dir_inodes.get(path).copied()
+    }
+
+    fn dir_path(&self, dir_inode: u64) -> Option<Vec<u8>> {
+        self.dir_paths.get(&dir_inode).cloned()
     }
 
     fn rename(&mut self, old_path: &[u8], new_path: &[u8]) -> i32 {
@@ -799,7 +817,7 @@ impl VfsBackend for RamfsBackend {
             1u8
         } else if self.symlinks.contains_key(old_path) {
             2
-        } else if self.dirs.contains(old_path) {
+        } else if self.dir_inodes.contains_key(old_path) {
             3
         } else {
             return -(crate::abi::ENOENT as i64) as i32;
@@ -808,7 +826,7 @@ impl VfsBackend for RamfsBackend {
         // requires the destination be empty, and we don't yet
         // walk children to check). Replace a regular file by
         // unlinking it first; replace a symlink the same way.
-        if self.dirs.contains(new_path) {
+        if self.dir_inodes.contains_key(new_path) {
             return -(crate::abi::EEXIST as i64) as i32;
         }
         if self.paths.contains_key(new_path) {
@@ -826,8 +844,13 @@ impl VfsBackend for RamfsBackend {
                 self.symlinks.insert(new_path.to_vec(), target);
             }
             _ => {
-                self.dirs.remove(old_path);
-                self.dirs.insert(new_path.to_vec());
+                // Minimal: move only this directory's own inode key
+                // (forward + reverse), preserving its id. Recursive
+                // re-key of descendants is B2.9 Task 3.
+                if let Some(id) = self.dir_inodes.remove(old_path) {
+                    self.dir_inodes.insert(new_path.to_vec(), id);
+                    self.dir_paths.insert(id, new_path.to_vec());
+                }
             }
         }
         0
@@ -848,21 +871,27 @@ impl VfsBackend for RamfsBackend {
     fn mkdir(&mut self, path: &[u8]) -> i32 {
         if self.paths.contains_key(path)
             || self.symlinks.contains_key(path)
-            || self.dirs.contains(path)
+            || self.dir_inodes.contains_key(path)
         {
             return -crate::abi::EEXIST;
         }
         let parent = Self::parent_of(path);
-        if !self.dirs.contains(&parent) {
-            return -crate::abi::ENOENT;
+        if !self.dir_inodes.contains_key(&parent) {
+            return -2; // -ENOENT
         }
-        self.dirs.insert(path.to_vec());
+        // Mint a fresh stable dir inode (forward + reverse). Shares
+        // `next_id` with file inodes but never enters
+        // `inodes`/`refcount` — dirs have no content/hardlinks.
+        let id = self.next_id;
+        self.next_id += 1;
+        self.dir_inodes.insert(path.to_vec(), id);
+        self.dir_paths.insert(id, path.to_vec());
         0
     }
 
     fn rmdir(&mut self, path: &[u8]) -> i32 {
-        if !self.dirs.contains(path) {
-            return -crate::abi::ENOENT; // (or ENOTDIR for a regular file)
+        if !self.dir_inodes.contains_key(path) {
+            return -2; // -ENOENT (or ENOTDIR if it's a regular file)
         }
         // Empty check: walk children. A child is any tracked path
         // whose parent is `path`.
@@ -870,7 +899,7 @@ impl VfsBackend for RamfsBackend {
             .paths
             .keys()
             .chain(self.symlinks.keys())
-            .chain(self.dirs.iter())
+            .chain(self.dir_inodes.keys())
         {
             if p == path {
                 continue;
@@ -879,7 +908,10 @@ impl VfsBackend for RamfsBackend {
                 return -crate::abi::ENOTEMPTY;
             }
         }
-        self.dirs.remove(path);
+        // Free both sides of the dir-inode mapping.
+        if let Some(id) = self.dir_inodes.remove(path) {
+            self.dir_paths.remove(&id);
+        }
         0
     }
 
@@ -887,7 +919,7 @@ impl VfsBackend for RamfsBackend {
         // Treat root "/" as always-extant; otherwise require a
         // mkdir record. (Root is implicit; mkdir on "/" would
         // -EEXIST anyway.)
-        let exists = path == b"/" || self.dirs.contains(path);
+        let exists = path == b"/" || self.dir_inodes.contains_key(path);
         if !exists {
             // If the path resolves to a regular file we should
             // surface -ENOTDIR via the dispatch layer; "None" here
@@ -899,7 +931,7 @@ impl VfsBackend for RamfsBackend {
             .paths
             .keys()
             .chain(self.symlinks.keys())
-            .chain(self.dirs.iter())
+            .chain(self.dir_inodes.keys())
         {
             if p == path {
                 continue;
@@ -951,10 +983,27 @@ mod tests {
 
     #[test]
     fn vfs_backend_dir_handle_api_defaults_to_none() {
-        let b = RamfsBackend::new();
-        assert_eq!(b.dir_inode(b"/"), None); // pre-Task-2 default
+        // DevBackend does not override the dir-handle trait methods,
+        // so it still exercises the default-`None` contract (Task 1).
+        // RamfsBackend now overrides them (Task 2), so the default is
+        // asserted via a backend that keeps the trait defaults.
+        let b = DevBackend;
+        assert_eq!(b.dir_inode(b"/"), None);
         assert_eq!(b.resolve_at(0, b"x"), None);
         assert_eq!(b.dir_path(0), None);
+    }
+
+    #[test]
+    fn ramfs_dirs_have_stable_inodes_minted_and_freed() {
+        let mut b = RamfsBackend::new();
+        let root = b.dir_inode(b"/").expect("root has a fixed dir inode");
+        assert_eq!(b.mkdir(b"/d"), 0);
+        let d = b.dir_inode(b"/d").expect("mkdir mints a dir inode");
+        assert_ne!(d, root);
+        assert_eq!(b.dir_inode(b"/d"), Some(d), "inode stable across lookups");
+        assert_eq!(b.rmdir(b"/d"), 0);
+        assert_eq!(b.dir_inode(b"/d"), None, "rmdir frees the inode");
+        assert_eq!(b.dir_path(d), None, "reverse map freed too");
     }
 
     #[test]
