@@ -36,6 +36,7 @@ const EBADF: i32 = 8;
 const EINVAL: i32 = 28;
 const ESPIPE: i32 = 70;
 const ENOSYS: i32 = 52;
+const EIO: i32 = 29;
 
 /// Map kernel-side POSIX errno → WASI preview1 errno. The kernel
 /// uses POSIX values (matching abi/contract/yurt_abi.toml); the WASI
@@ -858,6 +859,35 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
          -> i32 { ENOSYS },
     )?;
 
+    // random_get: WASI's primary entropy entry point. Rust std
+    // (HashMap RandomState), the `getrandom` crate, and wasi-libc
+    // (getentropy/getrandom/arc4random) all bottom out here, so it
+    // must NOT be an ENOSYS stub. Filled directly from the host OS
+    // CSPRNG via the `getrandom` crate (same source as kh_random,
+    // PR #95) — mirrors the JS wasi-host's crypto.getRandomValues.
+    linker.func_wrap(
+        WASI,
+        "random_get",
+        |mut caller: Caller<'_, UserState>, buf_ptr: u32, buf_len: u32| -> i32 {
+            let len = buf_len as usize;
+            if len == 0 {
+                return 0;
+            }
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return EINVAL,
+            };
+            let mut buf = vec![0u8; len];
+            if getrandom::getrandom(&mut buf).is_err() {
+                return EIO;
+            }
+            if memory.write(&mut caller, buf_ptr as usize, &buf).is_err() {
+                return EINVAL;
+            }
+            0
+        },
+    )?;
+
     // ── Catch-all: any other preview1 call returns ENOSYS ──────────
     // Wasmtime requires every imported function to be defined. We
     // can't do a wildcard, so we list the rest as no-arg ENOSYS stubs.
@@ -885,7 +915,6 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         "path_unlink_file",
         "poll_oneoff",
         "proc_raise",
-        "random_get",
         "sched_yield",
         "sock_accept",
         "sock_recv",
