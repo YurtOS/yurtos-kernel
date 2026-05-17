@@ -109,6 +109,12 @@ pub(super) fn getcwd(caller_pid: u32, response: &mut [u8]) -> i64 {
                 }
                 None => return -(abi::ENOENT as i64),
             },
+            // Degraded path-snapshot cwd. Intentionally does NOT do the
+            // lazy `/`→inode upgrade that `PathResolver::resolved_cwd`
+            // performs: the only `dir_inode == None` cwd that reaches
+            // here is the `Process::new` default whose path is `/`, and
+            // `/` is rename/rmdir-protected (EBUSY), so its snapshot
+            // can never go stale — refreshing it would be a no-op.
             None => cwd_state.path,
         };
         let required = cwd.len() + 1;

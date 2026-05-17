@@ -2375,7 +2375,11 @@ impl TarLayerBackend {
         for file_path in files.keys() {
             // Walk each `/`-separated ancestor: "/a/b/c" yields the
             // implicit dirs "/a" and "/a/b" (the final component is the
-            // file itself, not a dir).
+            // file itself, not a dir). Relies on the `files` key
+            // invariant that every path is ABSOLUTE: `cut + 1` skips
+            // index 0 (the leading `/`) so the root itself is not
+            // re-derived. If that key format ever changes this loop
+            // must change with it.
             let mut cut = 0;
             while let Some(rel) = file_path[cut + 1..].iter().position(|&b| b == b'/') {
                 let end = cut + 1 + rel;

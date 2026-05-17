@@ -7838,6 +7838,83 @@ fn spec7_openat_symlink_mid_walk_redelegates() {
 }
 
 #[test]
+fn openat_redelegation_matches_plain_open_for_socket_and_proc_intermediates() {
+    // Review concern: `needs_path_resolver` canonicalizes the parent
+    // via PathResolver::realpath, which overlaps the documented
+    // "don't route open through resolve_realpath" regression class
+    // (lexical `..`, unix-socket `entry_type==0`, `/proc`
+    // publish-timing). Lexical `..` cannot reach this branch (the walk
+    // is skipped when any component is `.`/`..`). This pins the other
+    // two: the inode-walk re-delegation for a SOCKET intermediate and
+    // a `/proc` intermediate must be byte-identical to the path-based
+    // `open` — i.e. introduce no socket / proc divergence (exactly the
+    // property the regression class is about). Equivalence, not a
+    // hardcoded errno, so it tracks `open` if that ever changes.
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // Register pid 1 so /proc/1 is published before the walk.
+    assert_eq!(dispatch(METHOD_SYS_GETUID, 1, &[], &mut []), 1000);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+
+    // (A) Unix socket bound at /base/sock: a path the VFS types via
+    // write_stat_record, so ramfs entry_type == 0 → resolve_at returns
+    // None → the socket is a non-descendable *intermediate* component
+    // → needs_path_resolver → realpath(parent = /base/sock).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_BIND,
+            1,
+            &socket_bind_unix_req(3, b"/base/sock"),
+            &mut []
+        ),
+        0
+    );
+    let dfd = open_dir(b"/base");
+    let via_openat = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dfd, 0, b"sock/x"),
+        &mut [],
+    );
+    let via_open = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/base/sock/x"), &mut []);
+    assert_eq!(
+        via_openat, via_open,
+        "socket-intermediate openat re-delegation diverged from plain open"
+    );
+    assert!(
+        via_openat < 0,
+        "socket-as-dir-component must error, not ghost-open ({via_openat})"
+    );
+
+    // (B) /proc/<pid> as an intermediate component (publish-timing
+    // sensitive): ramfs has no /proc entry, so resolve_at → None →
+    // realpath walks /proc/1 via ProcBackend.
+    let rootfd = open_dir(b"/");
+    let p_openat = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(rootfd, 0, b"proc/1/status"),
+        &mut [],
+    );
+    let p_open = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/proc/1/status"), &mut []);
+    assert_eq!(
+        p_openat >= 3,
+        p_open >= 3,
+        "/proc-intermediate openat re-delegation disagreed with plain open ({p_openat} vs {p_open})"
+    );
+    assert!(p_openat >= 3, "/proc/1/status must resolve ({p_openat})");
+}
+
+#[test]
 fn spec5_fchdir_getcwd_consistent_across_rename_root_mount() {
     // Spec #5: fchdir(open /base); rename /base → /renamed; a relative
     // create lands under /renamed; getcwd reports /renamed.
