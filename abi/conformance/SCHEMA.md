@@ -89,3 +89,25 @@ with no embedded `\n`). Stderr is not part of the trace.
 
 Unknown `--case` values cause the canary to exit 2 with a message on
 stderr. The driver surfaces this as "case not implemented in canary".
+
+## Toolchain note — editor diagnostics are non-authoritative (#127)
+
+All C/H under `abi/` (canaries in `abi/conformance/c/`, the libc shim in
+`abi/src/`, headers in `abi/include/`) target **`wasm32-wasip1` via
+`yurt-cc`/wasi-sdk** — that is the only authoritative compiler, and CI
+uses it. An editor's host `clang` on a non-Linux dev machine (e.g.
+macOS) checks these against the wrong libc/headers and emits noise:
+`'yurt_abi.h' file not found` (it lives at `abi/include/yurt_abi.h`),
+`Unknown attribute 'import_module'` (a wasm attribute), wrong-arity
+`sendfile` (macOS ships the 6-arg BSD form; Linux/WASI is 4-arg), and
+undeclared `setresuid`/`cuserid`/`SOCK_CLOEXEC`/`SO_PEERCRED` (Linux/
+WASI symbols absent from host libc). **These are not defects** — the
+sources are correct for their target.
+
+`abi/compile_flags.txt` makes `clangd`-based editors check against the
+real target (`--target=wasm32-wasip1 -Iinclude -D_GNU_SOURCE`),
+clearing the dominant classes (missing `yurt_abi.h`, wrong attribute/
+arity). If your editor still flags WASI-sysroot-only symbols, add a
+local `--sysroot=<your wasi-sdk>/share/wasi-sysroot` to your editor
+config — it is install-specific and intentionally not hard-coded here.
+Bottom line: trust `yurt-cc`/CI, not host-clang, for `abi/` C.
