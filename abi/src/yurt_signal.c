@@ -20,6 +20,7 @@ YURT_DECLARE_MARKER(pthread_sigmask);
 YURT_DECLARE_MARKER(sigsuspend);
 YURT_DECLARE_MARKER(sigaltstack);
 YURT_DECLARE_MARKER(sigtimedwait);
+YURT_DECLARE_MARKER(pause);
 
 YURT_DEFINE_MARKER(signal,       0x73676e6cu) /* sgnl */
 YURT_DEFINE_MARKER(sigaction,    0x73676163u) /* sgac */
@@ -35,6 +36,7 @@ YURT_DEFINE_MARKER(pthread_sigmask, 0x70736d6bu) /* psmk */
 YURT_DEFINE_MARKER(sigsuspend,   0x73737370u) /* sssp */
 YURT_DEFINE_MARKER(sigaltstack,  0x73616c74u) /* salt */
 YURT_DEFINE_MARKER(sigtimedwait, 0x73747764u) /* stwd */
+YURT_DEFINE_MARKER(pause,        0x70617573u) /* paus */
 
 #ifndef NSIG
 #define NSIG 64
@@ -397,10 +399,14 @@ int sigtimedwait(
     memcpy(&v, resp + 8, 4); info->si_code  = (int)v;
     memcpy(&v, resp + 12, 4); info->si_pid  = (pid_t)v;
   }
-  return (int)rc; /* returns signo on success */
+  /* returns the accepted signal number */
+  int32_t yurt_st_signo;
+  memcpy(&yurt_st_signo, resp, 4);
+  return (int)yurt_st_signo;
 }
 
 int pause(void) {
+  YURT_MARKER_CALL(pause);
   /* pause = sigsuspend with has_mask=0 (kernel keeps current mask) */
   unsigned char req[2] = { 0, 0 };
   int64_t rc = yurt_host_sigsuspend((int)(intptr_t)req, (int)sizeof(req));
