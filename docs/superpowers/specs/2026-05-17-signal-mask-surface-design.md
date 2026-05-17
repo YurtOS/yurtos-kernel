@@ -1,8 +1,10 @@
 # Signal-mask surface — design (issue #90)
 
-> Status: design under review. Round-4/5/6 reviews folded in (§9);
+> Status: design under review. Round-4/5/6/7 reviews folded in (§9);
 > round-5 reworked §3.1/§6/§8 + added §11; round-6 added §3.3, the
-> `sys_sigsuspend` `has_mask` contract, and three §11 divergences.
+> `sys_sigsuspend` `has_mask` contract, and three §11 divergences;
+> round-7 corrected the fork-inheritance (no `forking_tid`), the
+> construction-site census, and the `take_bytes` citation.
 > Picked up ahead of #91, whose `pselect`/`ppoll` block on this issue's
 > kernel-owned blocked-mask state. Refs: #83 (tracking), #52/#57 (umbrella),
 > #71, #66 (auth), #54 (B1 RT-signal), #65 (C1 length-guard class).
@@ -98,13 +100,17 @@ pub blocked_signals: u64,      // canonical sig-1 mask (kernel-internal width)
 pub sigaltstack: SigAltStack,  // { sp: u32, flags: i32, size: u32 } — wasm32-only widths
 ```
 
-**Single constructor (round-5 #5).** `ThreadRecord` is built at ≥3 sites
-(`::main()` `kernel.rs:97`, the literal in `bind_thread_handle`
-`kernel.rs:1600`, fork child `kernel.rs:746`). Replace all with one
-constructor `ThreadRecord::new(tid, host_handle, blocked_signals)` (alt-
-stack always starts disabled — POSIX resets it per thread). The three
-callers differ only in the `blocked_signals` argument, so the inheritance
-contract lives in exactly one place:
+**Single constructor (round-5 #5, census corrected round-7 #5).** There
+are exactly **two** genuine `ThreadRecord` construction sites: the
+`::main()` constructor body (`kernel.rs:97`) and the literal in
+`bind_thread_handle` (`kernel.rs:1600`). `kernel.rs:431/746/820` are
+*calls* to `::main`, not independent literals — they need only the new
+`::main` signature, no field-by-field edit. Funnel both real sites
+through one constructor `ThreadRecord::new(tid, host_handle,
+blocked_signals)` (alt-stack always starts disabled — POSIX resets it
+per thread); `::main` becomes `Self::new(MAIN_THREAD_TID, handle, 0)`.
+The callers differ only in the `blocked_signals` argument, so the
+inheritance contract lives in exactly one place:
 
 - main thread / cold start: `blocked_signals = 0`
 - `sys_thread_spawn`: `bind_thread_handle` gains `creator_tid: Tid`;
@@ -113,13 +119,20 @@ contract lives in exactly one place:
   The bare `kernel_spawn_thread(pid, handle)` host export (`lib.rs:316`)
   has no caller-thread context → inherits the **process main-thread**
   mask by documented contract (not the pthread hot path).
-- **`fork()` child (round-5 #3):** `kernel.rs:746` currently builds the
-  child main thread as `ThreadRecord::main(None)` (zero mask) and resets
-  `child.pending_signals = 0` (`:738`, correct POSIX — empty pending in
-  the child). POSIX additionally requires the child to inherit the
-  **forking thread's** signal mask. The fork path must set the child main
-  `ThreadRecord.blocked_signals = parent.threads[forking_tid]
-  .blocked_signals`. Pending stays 0 (unchanged).
+- **`fork()` child (round-5 #3, corrected round-7 #1):** `prepare_fork`
+  (`kernel.rs:715`) is **single-thread-gated** —
+  `if parent.threads.len() > 1 { return Err(EAGAIN) }` (`:720`) — and
+  takes only `parent_pid`, no tid. There is therefore **no
+  `forking_tid`**; the forking thread is *always* `MAIN_THREAD_TID`.
+  `kernel.rs:746` builds the child main thread as `ThreadRecord::main(None)`
+  (zero mask) and resets `child.pending_signals = 0` / `pending_rt.clear()`
+  (correct POSIX — empty pending in the child). POSIX additionally
+  requires the child to inherit the calling thread's mask: the fork path
+  sets `child.threads[MAIN_THREAD_TID].blocked_signals =
+  parent.threads[MAIN_THREAD_TID].blocked_signals` (parent main mask
+  captured before the `child.threads.clear()`). No `forking_tid`
+  plumbing through `prepare_fork` is required or possible. Pending stays
+  empty (unchanged).
 
 **Precise initial state & fallback chain (round-6 #4).**
 `ensure_main_thread` seeds `blocked_signals = 0` (POSIX initial empty
@@ -176,9 +189,14 @@ tracking **#52**. The mirror edit corrects `#51 → #57/#52` and appends
 `pause` = `sys_sigsuspend(has_mask=0)` (one atomic kernel call — round-6
 #1, replaces the old non-atomic two-syscall C composition);
 `pthread_sigmask` = thin C alias of `sys_sigprocmask`. No separate ids.
-Every variable read uses `take_bytes` (wrap-safe, #65/C1); fixed records
-length-checked up front. The kernel expands the 1-byte `set`/`mask` to
-`u64` (§3.1) before applying; narrows `blocked_signals` for `oset`.
+**All four records are fixed-length** (`i32+u8+u8`, `u8+12`, `u8+u8`,
+`u8+u8+16`) — there is **no caller-sized/variable region**, so the guard
+is an exact `request.len() != N` check (as `sigwaitinfo` does at
+`process.rs:797`), **not** `take_bytes` (round-7 #4: `take_bytes`/#101 is
+the caller-length-split helper for guest-sized payloads and does not
+apply here; the usize-width gap also does not bite — no length-derived
+offsets). The kernel expands the 1-byte `set`/`mask` to `u64` (§3.1)
+before applying; narrows `blocked_signals` for `oset`.
 
 ## 5. Handlers (`dispatch/process.rs`)
 
@@ -186,6 +204,14 @@ length-checked up front. The kernel expands the 1-byte `set`/`mask` to
   `oset` byte; if `has_set`, expand `set` byte → `u64`, apply `how`
   (`BLOCK |=`, `UNBLOCK &= !`, `SETMASK =`), clear SIGKILL(9)/SIGSTOP(19)
   bits, store. `ESRCH` (no record), `EINVAL` (bad `how`/short request).
+  **Deliberate deviation from #90 wording (round-7 #2):** issue #90 says
+  "*process-wide default for `sigprocmask`*"; this spec treats
+  `sigprocmask` as **per-calling-thread, identical to `pthread_sigmask`**
+  (one `sys_sigprocmask` keyed by `caller_tid`). POSIX leaves
+  `sigprocmask` in a multi-threaded process *unspecified*, so this is
+  conformant; single-threaded callers are unaffected
+  (`caller_tid == MAIN_THREAD_TID`). Recorded here so it is not raised as
+  a divergence at acceptance.
 - **`sys_sigaltstack`** — write prior `{sp,flags,size}` to `oss`; if
   `has_ss`: `EINVAL` when `size < MINSIGSTKSZ` and not `SS_DISABLE`;
   `EPERM` if on the alt stack (tracked `SS_ONSTACK`); `SS_DISABLE`
@@ -295,9 +321,10 @@ canary (round-5 nit). Stale `*.spec.toml` expectation notes that assert
 guest-local semantics (e.g. `sigprocmask.spec.toml`: "guest-local mask
 only; no observation of external signals") are **rewritten, not
 extended**, to reflect kernel-owned semantics (round-6 #5). Parity-matrix row added with the §11 divergences
-noted. B0 TS-vs-Rust zero-diff. `cargo fmt`/`clippy` clean. Length guards
-use the `take_bytes` u64-bounded pattern (wasm32-vs-native usize-width
-test gap, project memory).
+noted. B0 TS-vs-Rust zero-diff. `cargo fmt`/`clippy` clean. Records are
+fixed-length: exact `request.len() != N` guards, no `take_bytes`/
+length-derived offsets, so the wasm32-vs-native usize-width test gap
+does not apply here (round-7 #4).
 
 ## 9. Review tightenings folded in
 
@@ -327,6 +354,16 @@ initial state + fallback chain + explicit `MAIN_THREAD_TID` (§3.2);
 (5) `sigaltstack` new C symbol named (§6), stale `*.spec.toml`
 rewritten not extended (§8), partition+umbrella edited atomically
 (§4), pending-check no-observable-effect stated (§5, §11.4).
+
+**Round-7** (all 5 valid, none design-blocking): (1) **corrected** —
+`forking_tid` is phantom; `prepare_fork` is single-thread-gated
+(`kernel.rs:720`), child main inherits `parent.threads[MAIN_THREAD_TID]`
+(§3.2); (2) explicit deliberate deviation from #90's "process-wide
+`sigprocmask`" wording recorded (§5); (3) `sigaltstack`
+`EPERM`/`SS_ONSTACK` documented as a structural placeholder (§11.7);
+(4) `take_bytes` citation removed — all four records fixed-length, exact
+`len != N` guard, usize-width gap N/A (§4, §8); (5) construction-site
+census corrected to the two real literals (§3.2).
 
 ## 10. Acceptance mapping (issue #90)
 
@@ -371,3 +408,9 @@ rewritten not extended (§8), partition+umbrella edited atomically
    accepted: `sigprocmask(block SIGTERM)` + `kill` + `sigtimedwait` ⇒
    `EAGAIN` here vs. SIGTERM on Linux. Draining `pending_signals` too is
    a follow-up (touches the separated-producer invariant).
+7. **`sigaltstack` `EPERM`/`SS_ONSTACK` is a structural placeholder
+   (round-7 #3)** — no signal delivery exists this slice (B1.8-b-gated),
+   so the kernel never switches a thread onto its alt stack;
+   `SS_ONSTACK` is never set and the `EPERM`-while-on-altstack branch is
+   structurally unreachable until delivery lands. Implemented for API
+   completeness, same honesty lens as §11.4 — not a live code path yet.

@@ -107,3 +107,24 @@ untouched scoping, `sa_mask` encoding boundary, corrected test).
 to the plan doc." 1 resolved; 2 resolved via reasoned alternative;
 3–5 documented. Gate condition met pending maintainer ack of the item-2
 pushback.
+
+---
+
+## Round-7 review
+
+All 5 accepted; verified against the tree. None design-blocking. Issue
+thread continues on #90.
+
+| # | Severity | Status |
+|---|----------|--------|
+| 1 | Should-fix | **Accepted (correction).** Verified `prepare_fork` (`kernel.rs:715`) takes only `parent_pid` and is single-thread-gated (`:720` `threads.len()>1 → EAGAIN`). `forking_tid` is phantom — spec §3.2 rewritten: child main inherits `parent.threads[MAIN_THREAD_TID].blocked_signals`, no plumbing. |
+| 2 | Should-fix | **Accepted.** Explicit deliberate-deviation note added (§5): `sigprocmask` treated per-calling-thread (= `pthread_sigmask`); POSIX leaves MT `sigprocmask` unspecified so conformant; differs from #90's "process-wide" wording on purpose. |
+| 3 | Should-fix | **Accepted.** §11.7 added: `sigaltstack` `EPERM`/`SS_ONSTACK` is a structural placeholder, unreachable until B1.8-b delivery — same honesty lens as §11.4. |
+| 4 | Minor | **Accepted.** `take_bytes` citation removed (§4/§8): all four records fixed-length, exact `len != N` guard; #101/`take_bytes` is the caller-length-split helper, inapplicable; usize-width gap N/A (no length-derived offsets). |
+| 5 | Minor | **Accepted (correction).** Verified only `kernel.rs:1600` is a `ThreadRecord {` literal; `:431/:746/:820` are `::main` calls. §3.2 census corrected to two real sites; single-constructor mandate unchanged. |
+
+### Round-7 verdict
+"With #1 and #2 folded in and #3 documented, ready for the plan doc;
+none of the five is a design blocker." #1/#2 folded, #3 documented,
+#4/#5 corrected. No outstanding pushback (the round-6 item-2 reasoning
+stands; round-7 raised no objection to it). Gate condition met.
