@@ -18,6 +18,21 @@ export const PROCESS_PROBE_CASES = [
   "fork/9-1",
 ];
 
+// Signal-mask surface (#90): kernel-owned per-thread blocked mask.
+// Requires the vendored Open POSIX corpus at test-fixtures/open-posix-test-suite.
+// Run with: deno run -A scripts/open-posix-harness.ts \
+//   --cases sigprocmask/1-1,pthread_sigmask/1-1,sigaltstack/1-1,sigsuspend/1-1,sigtimedwait/1-1
+// Slot-7 aliasing divergence (§11.2) and blocking-stub EINTR/EAGAIN (§11.3) may
+// surface as FAIL/UNSUPPORTED — map to documented spec §11 items before treating
+// as regressions.
+export const SIGNAL_MASK_CASES = [
+  "sigprocmask/1-1",
+  "pthread_sigmask/1-1",
+  "sigaltstack/1-1",
+  "sigsuspend/1-1",
+  "sigtimedwait/1-1",
+];
+
 export type PosixStatus =
   | "PASS"
   | "FAIL"

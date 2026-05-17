@@ -379,7 +379,7 @@ int sigtimedwait(
   p[5] = (unsigned char)((sv >> 40) & 0xffu);
   p[6] = (unsigned char)((sv >> 48) & 0xffu);
   p[7] = (unsigned char)((sv >> 56) & 0xffu);
-  /* 16-byte response: { i32 si_signo, i32 si_errno, i32 si_code, i32 si_pid } */
+  /* 16-byte response: { i32 si_signo, i32 si_code, u32 si_pid, i32 si_value } (LE) */
   unsigned char resp[16];
   memset(resp, 0, sizeof(resp));
   int64_t rc = yurt_host_sigtimedwait(
@@ -391,13 +391,19 @@ int sigtimedwait(
   }
   if (info != NULL) {
     memset(info, 0, sizeof(*info));
-    /* Unpack siginfo: i32 si_signo at byte 0, i32 si_errno at 4,
-     * i32 si_code at 8, i32 si_pid at 12 (all LE) */
+    /* Kernel 16-byte siginfo layout (dispatch/process.rs sigwaitinfo):
+     *   byte  0..4  i32 si_signo
+     *   byte  4..8  i32 si_code  (SI_QUEUE = -1)
+     *   byte  8..12 u32 si_pid   (sender_pid)
+     *   byte 12..16 i32 si_value (sival_int; no si_value field in this siginfo_t)
+     * All little-endian. */
     int32_t v;
     memcpy(&v, resp + 0, 4); info->si_signo = (int)v;
-    memcpy(&v, resp + 4, 4); info->si_errno = (int)v;
-    memcpy(&v, resp + 8, 4); info->si_code  = (int)v;
-    memcpy(&v, resp + 12, 4); info->si_pid  = (pid_t)v;
+    memcpy(&v, resp + 4, 4); info->si_code  = (int)v;
+    memcpy(&v, resp + 8, 4); info->si_pid   = (pid_t)v;
+    /* si_value (resp+12): this siginfo_t lacks si_value; stored in si_status
+     * as a best-effort substitute until the struct gains the sigval union. */
+    memcpy(&v, resp + 12, 4); info->si_status = (int)v;
   }
   /* returns the accepted signal number */
   int32_t yurt_st_signo;

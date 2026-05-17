@@ -1,0 +1,16 @@
+canary = "signal-canary"
+summary = "sigtimedwait non-blocking dequeue of a real-time signal from the RT queue (METHOD_SYS_SIGTIMEDWAIT, spec §5). With timeout==0: returns EAGAIN if no signal from set is pending; returns the signal number and fills siginfo_t if one is. True blocking (nonzero timeout) is AsyncBridge/B1.5-gated (returns EAGAIN immediately — spec §11.3). Only the RT queue is consulted; kill/SIGCHLD bitmask signals are not accepted (spec §11.6 documented divergence)."
+
+[[case]]
+name = "sigtimedwait_nonblocking_eagain"
+inputs = "sigtimedwait(&set_sigusr1, &info, &timeout_zero) with no pending signal"
+expected.exit = 0
+expected.stdout = "sigtimedwait:eagain"
+expected.note = "no RT signal queued; timeout==0 returns EAGAIN; errno==EAGAIN confirmed by canary"
+
+[[case]]
+name = "sigtimedwait_accept_by_set"
+inputs = "sigqueue(self, SIGUSR1, value=42); sigtimedwait(&set_sigusr1, &info, &timeout_zero)"
+expected.exit = 0
+expected.stdout = "sigtimedwait:accepted"
+expected.note = "RT signal queued via sigqueue; sigtimedwait dequeues it; siginfo si_signo/si_code/si_pid set"

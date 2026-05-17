@@ -1,9 +1,9 @@
 canary = "signal-canary"
-summary = "Round-trip the guest-local signal mask (§Runtime Semantics > Signals)."
+summary = "Round-trip the kernel-owned per-thread signal mask (§3.1/§5). The mask is stored in ThreadRecord.blocked_signals (u64, sig-1 encoding); the C shim marshals the guest's 1-byte compact sigset_t verbatim; the kernel expands/narrows. Slot-7 aliasing (SIGUSR1/SIGUSR2/SIGALRM share one compact bit) is a documented divergence (spec §11.2)."
 
 [[case]]
 name = "sigprocmask_roundtrip"
 inputs = "SIG_SETMASK(SIGUSR1) then SIG_SETMASK(NULL, &old)"
 expected.exit = 0
 expected.stdout = "sigprocmask:roundtrip"
-expected.note = "guest-local mask only; no observation of external signals"
+expected.note = "kernel-owned per-thread mask; prior mask returned in oldset; SIGUSR1 sets compact slot 7"

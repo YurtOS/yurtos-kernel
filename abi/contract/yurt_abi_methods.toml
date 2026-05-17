@@ -575,8 +575,10 @@ doc = "Change the caller's working directory to an open directory fd. Request by
 #   B2 fd/vfs          → 0x1_0070–0x1_007F  (PR #55)
 #   B3 sockets         → 0x1_0080–0x1_008F
 #   B4 persistence/ext → 0x1_0090–0x1_009F
-# Future slices take the next free block. The umbrella matrix (#51)
-# mirrors this table as the canonical record.
+# Future slices take the next free block. The umbrella matrix (#57;
+# tracking #52 — #51 was reverted by #56) mirrors this table as the
+# canonical record.
+#   signal-mask  #90      → 0x1_00A0–0x1_00A3  (0x1_00A0 sweep, #83)
 
 [method.sys_pread]
 id = 0x1_0070

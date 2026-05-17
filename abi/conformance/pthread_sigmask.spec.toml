@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "pthread_sigmask is a thin alias of sigprocmask routed to METHOD_SYS_SIGPROCMASK (§5, §6). Mask is kernel-owned per-thread (ThreadRecord.blocked_signals); thread-identity semantics are identical to sigprocmask because both use the calling thread's tid. Slot-7 aliasing documented divergence (spec §11.2)."
+
+[[case]]
+name = "pthread_sigmask_roundtrip"
+inputs = "pthread_sigmask(SIG_BLOCK, &set_sigusr1, &old); pthread_sigmask(SIG_UNBLOCK, &set_sigusr1, NULL)"
+expected.exit = 0
+expected.stdout = "pthread_sigmask:roundtrip"
+expected.note = "kernel-owned per-thread mask; SIG_BLOCK/SIG_UNBLOCK/SIG_SETMASK all routed through sys_sigprocmask"

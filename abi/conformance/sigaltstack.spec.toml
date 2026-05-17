@@ -1,0 +1,9 @@
+canary = "signal-canary"
+summary = "sigaltstack installs and queries the per-thread alternate signal stack (METHOD_SYS_SIGALTSTACK, spec §5). In this slice: the sp/flags/size triple is stored in ThreadRecord.sigaltstack; SS_DISABLE zeroes the stack; SS_ONSTACK (delivery guard) is a dormant placeholder until B1.8-b signal delivery (spec §11.7). Undersized stack returns EINVAL; calling while on the alt-stack returns EPERM."
+
+[[case]]
+name = "sigaltstack_install_query_roundtrip"
+inputs = "sigaltstack(&new_ss, NULL) with sp=0x4000/size=4096; sigaltstack(NULL, &old_ss)"
+expected.exit = 0
+expected.stdout = "sigaltstack:roundtrip"
+expected.note = "kernel stores sp/flags/size; NULL new-ss is a pure query; SS_DISABLE flag path also covered by canary"

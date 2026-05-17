@@ -1,9 +1,9 @@
 canary = "signal-canary"
-summary = "sigsuspend interaction with raise() (§Runtime Semantics > Signals)."
+summary = "sigsuspend atomically installs a temporary mask and waits for a signal (§5). In this slice: the mask swap is kernel-owned (ThreadRecord.blocked_signals), the pending check is a structural placeholder, and the call always returns -EINTR immediately (true blocking is AsyncBridge/B1.5-gated — spec §11.3/§11.4)."
 
 [[case]]
 name = "sigsuspend_resumes_on_raise"
 inputs = "install handler; raise(SIGUSR2) — handler runs synchronously"
 expected.exit = 0
 expected.stdout = "sigsuspend:handled"
-expected.note = "yurt dispatches on raise() rather than blocking"
+expected.note = "yurt dispatches on raise() rather than blocking; sigsuspend mask swap is kernel-owned but delivery is B1.8-b-gated"

@@ -63,6 +63,9 @@ pub struct SigAltStack {
     pub size: u32,
 }
 
+// Dormant until B1.8-b signal delivery consults the alt-stack
+// (spec §11.7 — round-trips now, no live caller yet).
+#[allow(dead_code)]
 pub const SS_ONSTACK: i32 = 1;
 pub const SS_DISABLE: i32 = 2;
 
@@ -81,6 +84,9 @@ impl SigAltStack {
     /// is considered active even if `SS_DISABLE` is also set.  Disabled state
     /// is signaled exclusively by `SS_DISABLE` in `flags` (POSIX / Linux
     /// `sigaltstack(2)`); `active` is signaled by `SS_ONSTACK`.
+    // Dormant until B1.8-b signal delivery gates on SS_ONSTACK
+    // (spec §11.7 — EPERM path exists in sigaltstack handler, no delivery caller yet).
+    #[allow(dead_code)]
     pub fn is_disabled(&self) -> bool {
         // SS_ONSTACK means "currently in use" — override any other flag.
         self.flags & SS_ONSTACK == 0 && self.flags & SS_DISABLE != 0
