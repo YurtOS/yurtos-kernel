@@ -11,14 +11,19 @@ import type {
   SocketListenPolicy,
 } from "../../network/socket-backend.js";
 
-function writeString(
+function writeSockaddrIn(
   memory: WebAssembly.Memory,
   ptr: number,
-  value: string,
+  host: [number, number, number, number],
+  port: number,
 ): number {
-  const bytes = new TextEncoder().encode(value);
-  new Uint8Array(memory.buffer, ptr, bytes.length).set(bytes);
-  return bytes.length;
+  const bytes = new Uint8Array(memory.buffer, ptr, 16);
+  bytes.fill(0);
+  const view = new DataView(memory.buffer, ptr, 16);
+  view.setUint16(0, 2, true);
+  view.setUint16(2, port, false);
+  bytes.set(host, 4);
+  return 16;
 }
 
 describe("socket listener policy preparation", () => {
@@ -29,8 +34,7 @@ describe("socket listener policy preparation", () => {
       allowLoopback: true,
     };
     const calls: unknown[] = [];
-    let backend: SocketBackend;
-    backend = {
+    const backend: SocketBackend = {
       connect: () => ({ ok: false, error: "not used" }),
       send: () => ({ ok: true, bytes_sent: 0 }),
       recv: () => ({ ok: true, data: new Uint8Array(0) }),
@@ -67,12 +71,11 @@ describe("socket listener policy preparation", () => {
       1,
       0,
     );
-    const bindLen = writeString(memory, 16, "127.0.0.1");
+    const bindLen = writeSockaddrIn(memory, 16, [127, 0, 0, 1], 18081);
     const bindOut = (imports.host_socket_bind as (...args: number[]) => number)(
       fd,
       16,
       bindLen,
-      18081,
     );
     expect(bindOut).toBe(0);
 
@@ -99,8 +102,7 @@ describe("socket listener policy preparation", () => {
   it("rejects loopback listen when allowLoopback is not enabled", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
-    let backend: SocketBackend;
-    backend = {
+    const backend: SocketBackend = {
       connect: () => ({ ok: false, error: "not used" }),
       send: () => ({ ok: true, bytes_sent: 0 }),
       recv: () => ({ ok: true, data: new Uint8Array(0) }),
@@ -125,12 +127,11 @@ describe("socket listener policy preparation", () => {
       1,
       0,
     );
-    const bindLen = writeString(memory, 16, "127.0.0.1");
+    const bindLen = writeSockaddrIn(memory, 16, [127, 0, 0, 1], 18081);
     (imports.host_socket_bind as (...args: number[]) => number)(
       fd,
       16,
       bindLen,
-      18081,
     );
 
     const out = (imports.host_socket_listen as (...args: number[]) => number)(
@@ -145,8 +146,7 @@ describe("socket listener policy preparation", () => {
     const memory = new WebAssembly.Memory({ initial: 1 });
     const kernel = new ProcessKernel();
     const calls: unknown[] = [];
-    let backend: SocketBackend;
-    backend = {
+    const backend: SocketBackend = {
       connect: () => ({ ok: false, error: "not used" }),
       send: () => ({ ok: true, bytes_sent: 0 }),
       recv: () => ({ ok: true, data: new Uint8Array(0) }),
@@ -180,13 +180,12 @@ describe("socket listener policy preparation", () => {
       1,
       0,
     );
-    const bindLen = writeString(memory, 16, "0.0.0.0");
+    const bindLen = writeSockaddrIn(memory, 16, [0, 0, 0, 0], 8080);
     expect(
       (imports.host_socket_bind as (...args: number[]) => number)(
         fd,
         16,
         bindLen,
-        8080,
       ),
     ).toBe(0);
 
