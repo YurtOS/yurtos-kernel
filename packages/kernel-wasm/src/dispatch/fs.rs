@@ -1358,7 +1358,7 @@ pub(super) fn sys_fstatvfs(caller_pid: u32, request: &[u8], response: &mut [u8])
         // path) or stat the file via the OFD path implicit in the
         // ramfs. Simplest correct: pull the path from the FdEntry.
         let path: Vec<u8> = match k.process_mut(caller_pid).fd_table.entry(fd) {
-            Some(crate::kernel::FdEntry::Directory { path }) => path.clone(),
+            Some(crate::kernel::FdEntry::Directory { path, .. }) => path.clone(),
             Some(crate::kernel::FdEntry::File { ofd_id }) => {
                 let ofd_id = *ofd_id;
                 let Some(ofd) = k.ofd(ofd_id) else {
@@ -1493,7 +1493,7 @@ pub(super) fn sys_faccessat(caller_pid: u32, request: &[u8]) -> i64 {
 
     // Resolve dirfd's stored path (#59 limitation noted in sys_openat).
     let dir = match with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(dirfd) {
-        Some(crate::kernel::FdEntry::Directory { path }) => Ok(path.clone()),
+        Some(crate::kernel::FdEntry::Directory { path, .. }) => Ok(path.clone()),
         Some(_) => Err(abi::ENOTDIR),
         None => Err(abi::EBADF),
     }) {
