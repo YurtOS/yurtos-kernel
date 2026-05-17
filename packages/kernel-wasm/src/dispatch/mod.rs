@@ -18,6 +18,7 @@ use crate::kh;
 
 mod fs;
 mod process;
+mod sigmask;
 mod socket;
 mod thread;
 
