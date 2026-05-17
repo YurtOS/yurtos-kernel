@@ -192,7 +192,6 @@ pub trait VfsBackend: Send {
     /// WASI byte from `entry_type` (3=DIR,4=REG,7=SYMLINK). The child
     /// inode is `None` for symlinks (dispatch falls back to the
     /// path-based resolver — no fake inodes).
-    #[allow(dead_code)] // Consumed by the inode-anchored openat walk (B2.9 Task 6).
     fn resolve_at(&self, _dir_inode: u64, _name: &[u8]) -> Option<(Option<u64>, u8)> {
         None
     }
@@ -606,6 +605,10 @@ impl Default for RamfsBackend {
 // Inode ids are stable so callers can hold a fd across opens; nothing
 // here references the kernel's process table.
 
+/// Fixed dir inode for the `/dev` mount root. `0` is reserved for it
+/// (the device files use 1/2), mirroring the ramfs/proc convention of
+/// reserving id 0 for the mount root directory.
+const DEV_ROOT_INODE: u64 = 0;
 const DEV_NULL_INODE: u64 = 1;
 const DEV_ZERO_INODE: u64 = 2;
 const DEV_URANDOM_INODE: u64 = 3;
@@ -674,6 +677,28 @@ impl VfsBackend for DevBackend {
     fn size(&self, inode: u64) -> Option<u64> {
         match inode {
             DEV_NULL_INODE | DEV_ZERO_INODE | DEV_URANDOM_INODE | DEV_RANDOM_INODE => Some(0),
+            _ => None,
+        }
+    }
+
+    fn dir_inode(&self, path: &[u8]) -> Option<u64> {
+        // Fixed namespace: only the mount root `/` is a directory.
+        (path == b"/").then_some(DEV_ROOT_INODE)
+    }
+
+    fn dir_path(&self, dir_inode: u64) -> Option<Vec<u8>> {
+        (dir_inode == DEV_ROOT_INODE).then(|| b"/".to_vec())
+    }
+
+    fn resolve_at(&self, dir_inode: u64, name: &[u8]) -> Option<(Option<u64>, u8)> {
+        if dir_inode != DEV_ROOT_INODE {
+            return None;
+        }
+        // Hardcoded /dev table. Both are regular device files (WASI
+        // filetype 4); no subdirectories or symlinks in /dev.
+        match name {
+            b"null" => Some((Some(DEV_NULL_INODE), 4)),
+            b"zero" => Some((Some(DEV_ZERO_INODE), 4)),
             _ => None,
         }
     }
@@ -806,6 +831,28 @@ impl VfsBackend for RamfsBackend {
 
     fn dir_path(&self, dir_inode: u64) -> Option<Vec<u8>> {
         self.dir_paths.get(&dir_inode).cloned()
+    }
+
+    fn resolve_at(&self, dir_inode: u64, name: &[u8]) -> Option<(Option<u64>, u8)> {
+        // Anchor on the live path of `dir_inode`. `None` ⇒ the inode
+        // is no longer a directory (rmdir/rename freed it).
+        let base = self.dir_paths.get(&dir_inode)?;
+        // Join `name` under the base without doubling the separator:
+        // root "/" + "f" = "/f"; "/d" + "f" = "/d/f".
+        let mut child = base.clone();
+        if child.last() != Some(&b'/') {
+            child.push(b'/');
+        }
+        child.extend_from_slice(name);
+        // Classify via the existing WASI filetype byte. Dir/file
+        // inodes come from the same maps `dir_inode`/`open` use;
+        // symlinks carry no inode (dispatch takes the path fallback).
+        match self.entry_type(&child) {
+            3 => Some((self.dir_inodes.get(&child).copied(), 3)),
+            4 => Some((self.paths.get(&child).copied(), 4)),
+            7 => Some((None, 7)),
+            _ => None,
+        }
     }
 
     fn rename(&mut self, old_path: &[u8], new_path: &[u8]) -> i32 {
@@ -1035,11 +1082,13 @@ mod tests {
 
     #[test]
     fn vfs_backend_dir_handle_api_defaults_to_none() {
-        // DevBackend does not override the dir-handle trait methods,
-        // so it still exercises the default-`None` contract (Task 1).
-        // RamfsBackend now overrides them (Task 2), so the default is
-        // asserted via a backend that keeps the trait defaults.
-        let b = DevBackend;
+        // The default-`None` contract is asserted via a backend that
+        // keeps the trait defaults. RamfsBackend (Task 2) and now
+        // proc/tar/dev (Task 4) all override the dir-handle API, so
+        // HostFsBackend — the permanent path-snapshot degraded-mode
+        // backend (host renames are invisible to us; spec §2) — is the
+        // remaining backend that intentionally keeps the trait defaults.
+        let b = HostFsBackend::new();
         assert_eq!(b.dir_inode(b"/"), None);
         assert_eq!(b.resolve_at(0, b"x"), None);
         assert_eq!(b.dir_path(0), None);
@@ -1097,6 +1146,130 @@ mod tests {
             b"hi",
             "content survives via inode"
         );
+    }
+
+    #[test]
+    fn ramfs_resolve_at_classifies_children() {
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.mkdir(b"/d"), 0);
+        assert_eq!(b.mkdir(b"/d/sub"), 0);
+        let file_ino = b.install(b"/d/f".to_vec(), b"x".to_vec());
+        // Real symlink API: (target, link_path) — target first.
+        assert_eq!(b.symlink(b"/target", b"/d/ln"), 0);
+        let d = b.dir_inode(b"/d").unwrap();
+
+        // Directory child: filetype 3, child dir inode present.
+        assert_eq!(b.resolve_at(d, b"sub").map(|(_, t)| t), Some(3));
+        assert!(matches!(b.resolve_at(d, b"sub"), Some((Some(_), 3))));
+        assert_eq!(
+            b.resolve_at(d, b"sub").and_then(|(i, _)| i),
+            b.dir_inode(b"/d/sub")
+        );
+
+        // Regular file: filetype 4, file inode present.
+        assert_eq!(b.resolve_at(d, b"f"), Some((Some(file_ino), 4)));
+
+        // Symlink: filetype 7, NO inode (dispatch path-fallback).
+        assert_eq!(b.resolve_at(d, b"ln"), Some((None, 7)));
+
+        // Missing child → None.
+        assert_eq!(b.resolve_at(d, b"missing"), None);
+
+        // Root-base join must not double-slash: /<name>, not //<name>.
+        let root = b.dir_inode(b"/").unwrap();
+        assert_eq!(b.resolve_at(root, b"d"), Some((Some(d), 3)));
+    }
+
+    #[test]
+    fn proc_resolve_at_lists_pid_dirs() {
+        let mut b = ProcBackend::new();
+        // Seed via the real refresh_processes API (the only way proc
+        // entries exist). One process → /7/{status,cmdline,comm,cwd}.
+        let snap = ProcessSnapshot {
+            pid: 7,
+            ppid: 1,
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            pgid: 7,
+            sid: 7,
+            argv: vec![b"/bin/sh".to_vec()],
+            cwd: b"/".to_vec(),
+        };
+        b.refresh_processes(&[snap]);
+
+        let root = b.dir_inode(b"/").expect("proc root has a dir inode");
+        let pid7 = b.dir_inode(b"/7").expect("per-pid dir has an inode");
+        assert_ne!(root, pid7);
+
+        // root → /7 is a directory child carrying the pid dir inode.
+        assert_eq!(b.resolve_at(root, b"7"), Some((Some(pid7), 3)));
+        // /7 → status is a regular synthetic file.
+        let status_ino = b
+            .resolve_at(pid7, b"status")
+            .expect("status resolves under /7");
+        assert_eq!(status_ino.1, 4, "status is REGULAR_FILE");
+        assert!(status_ino.0.is_some(), "proc file inode is tracked");
+        // Missing child → None.
+        assert_eq!(b.resolve_at(pid7, b"missing"), None);
+
+        // dir_path round-trips both directories.
+        assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
+        assert_eq!(b.dir_path(pid7).as_deref(), Some(&b"/7"[..]));
+    }
+
+    #[test]
+    fn tar_resolve_at_from_path_index() {
+        let mut ar_bytes: Vec<u8> = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut ar_bytes);
+            for (path, body) in [
+                ("bin/sh", &b"#!sh"[..]),
+                ("etc/hosts", &b"127.0.0.1 localhost\n"[..]),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let b = TarLayerBackend::new(ar_bytes);
+
+        let root = b.dir_inode(b"/").expect("tar root has a dir inode");
+        let bin = b.dir_inode(b"/bin").expect("implicit /bin dir inode");
+        assert_ne!(root, bin);
+
+        // root → bin is a directory.
+        assert_eq!(b.resolve_at(root, b"bin"), Some((Some(bin), 3)));
+        // /bin → sh is a regular file with its tracked inode.
+        let sh = b.resolve_at(bin, b"sh").expect("sh resolves under /bin");
+        assert_eq!(sh.1, 4, "sh is REGULAR_FILE");
+        assert!(sh.0.is_some(), "tar file inode tracked");
+        // Missing child → None.
+        assert_eq!(b.resolve_at(bin, b"missing"), None);
+
+        // dir_path round-trips.
+        assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
+        assert_eq!(b.dir_path(bin).as_deref(), Some(&b"/bin"[..]));
+    }
+
+    #[test]
+    fn dev_resolve_at_fixed_namespace() {
+        let b = DevBackend::new();
+        let root = b.dir_inode(b"/").expect("dev root has a fixed dir inode");
+
+        // /dev/null and /dev/zero are regular device files.
+        assert_eq!(b.resolve_at(root, b"null"), Some((Some(DEV_NULL_INODE), 4)));
+        assert_eq!(b.resolve_at(root, b"zero"), Some((Some(DEV_ZERO_INODE), 4)));
+        // Unknown child → None.
+        assert_eq!(b.resolve_at(root, b"missing"), None);
+
+        // dir_path round-trips the fixed root.
+        assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
     }
 
     #[test]
@@ -1467,14 +1640,32 @@ pub struct ProcBackend {
     entries: BTreeMap<Vec<u8>, (u64, Vec<u8>)>,
     /// Path → stable inode id (preserved across refreshes).
     inodes: BTreeMap<Vec<u8>, u64>,
+    /// Implicit directory → stable dir inode. `/proc` exposes `/`
+    /// (mount root) and one `/<pid>` directory per live process; the
+    /// per-pid files (`status`, `cmdline`, …) live under those. Minted
+    /// from the same `next_id` space as file inodes during
+    /// `refresh_processes`; a pid-dir inode is preserved across
+    /// refreshes while the pid lives (same stability contract as file
+    /// inodes) and dropped when the pid exits. Root `/` is fixed at
+    /// inode 0 (file ids start at 1, so 0 is free — the ramfs/dev/tar
+    /// mount-root convention). Backs `dir_inode`.
+    dir_inodes: BTreeMap<Vec<u8>, u64>,
+    /// Reverse: dir inode → path. Backs `dir_path`.
+    dir_paths: BTreeMap<u64, Vec<u8>>,
     next_id: u64,
 }
 
 impl ProcBackend {
     pub fn new() -> Self {
+        let mut dir_inodes = BTreeMap::new();
+        let mut dir_paths = BTreeMap::new();
+        dir_inodes.insert(b"/".to_vec(), 0u64);
+        dir_paths.insert(0u64, b"/".to_vec());
         Self {
             entries: BTreeMap::new(),
             inodes: BTreeMap::new(),
+            dir_inodes,
+            dir_paths,
             next_id: 1,
         }
     }
@@ -1634,7 +1825,28 @@ impl VfsBackend for ProcBackend {
         // content for those still present, leave the inode-id mapping
         // intact so any open fd survives a refresh.
         let mut new_entries: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        // Rebuild the dir-inode maps each refresh: keep `/` (fixed
+        // inode 0) plus one `/<pid>` dir per live process, preserving
+        // an existing pid-dir inode while that pid lives (same
+        // stability contract as the per-file inodes above) so an open
+        // dir fd survives a refresh, and dropping it when the pid
+        // exits.
+        let mut new_dir_inodes: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut new_dir_paths: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        new_dir_inodes.insert(b"/".to_vec(), 0u64);
+        new_dir_paths.insert(0u64, b"/".to_vec());
         for snap in snapshots {
+            let pid_dir = format!("/{}", snap.pid).into_bytes();
+            let dir_id = match self.dir_inodes.get(&pid_dir) {
+                Some(&id) => id,
+                None => {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    id
+                }
+            };
+            new_dir_inodes.insert(pid_dir.clone(), dir_id);
+            new_dir_paths.insert(dir_id, pid_dir);
             // Per-pid files we synthesize. Each is a (suffix, content)
             // pair; we mint stable inode ids per absolute path.
             let files: [(&str, Vec<u8>); 4] = [
@@ -1658,6 +1870,34 @@ impl VfsBackend for ProcBackend {
             }
         }
         self.entries = new_entries;
+        self.dir_inodes = new_dir_inodes;
+        self.dir_paths = new_dir_paths;
+    }
+
+    fn dir_inode(&self, path: &[u8]) -> Option<u64> {
+        self.dir_inodes.get(path).copied()
+    }
+
+    fn dir_path(&self, dir_inode: u64) -> Option<Vec<u8>> {
+        self.dir_paths.get(&dir_inode).cloned()
+    }
+
+    fn resolve_at(&self, dir_inode: u64, name: &[u8]) -> Option<(Option<u64>, u8)> {
+        let base = self.dir_paths.get(&dir_inode)?;
+        // Join `name` under the base without doubling the separator
+        // ("/" + "7" = "/7"; "/7" + "status" = "/7/status").
+        let mut child = base.clone();
+        if child.last() != Some(&b'/') {
+            child.push(b'/');
+        }
+        child.extend_from_slice(name);
+        // /proc has synthetic dirs (/, /<pid>) and regular files; no
+        // symlinks at this layer.
+        match self.entry_type(&child) {
+            3 => Some((self.dir_inodes.get(&child).copied(), 3)),
+            4 => Some((self.entries.get(&child).map(|(id, _)| *id), 4)),
+            _ => None,
+        }
     }
 }
 
@@ -1864,6 +2104,15 @@ pub struct TarLayerBackend {
     /// override still reflects the image-builder's intent
     /// (e.g. `/bin/python` arrives 0o755).
     metadata: BTreeMap<u64, Metadata>,
+    /// Implicit directory → stable dir inode. Tar carries regular
+    /// files only; every proper prefix of a file path (plus the mount
+    /// root `/`) is an implicit directory. Minted once at construction
+    /// from the same `next_id` space as file inodes (collision-free
+    /// within the backend); never changes — the archive is immutable,
+    /// no rename. Backs `dir_inode`.
+    dir_inodes: BTreeMap<Vec<u8>, u64>,
+    /// Reverse: dir inode → path. Backs `dir_path`.
+    dir_paths: BTreeMap<u64, Vec<u8>>,
 }
 
 impl TarLayerBackend {
@@ -1928,11 +2177,39 @@ impl TarLayerBackend {
                 );
             }
         }
+        // Derive the implicit directory namespace. Root `/` is fixed
+        // at inode 0 (the file id space starts at 1, so 0 is free —
+        // same convention as ramfs/proc/dev mount roots). Every proper
+        // ancestor of each indexed file path is an implicit directory;
+        // mint a stable inode for each, continuing from `next_id`.
+        let mut dir_inodes: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut dir_paths: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        dir_inodes.insert(b"/".to_vec(), 0);
+        dir_paths.insert(0, b"/".to_vec());
+        for file_path in files.keys() {
+            // Walk each `/`-separated ancestor: "/a/b/c" yields the
+            // implicit dirs "/a" and "/a/b" (the final component is the
+            // file itself, not a dir).
+            let mut cut = 0;
+            while let Some(rel) = file_path[cut + 1..].iter().position(|&b| b == b'/') {
+                let end = cut + 1 + rel;
+                let ancestor = file_path[..end].to_vec();
+                if !dir_inodes.contains_key(&ancestor) {
+                    let id = next_id;
+                    next_id += 1;
+                    dir_inodes.insert(ancestor.clone(), id);
+                    dir_paths.insert(id, ancestor);
+                }
+                cut = end;
+            }
+        }
         Self {
             archive,
             files,
             inodes,
             metadata,
+            dir_inodes,
+            dir_paths,
         }
     }
 }
@@ -2046,6 +2323,32 @@ impl VfsBackend for TarLayerBackend {
             }
         }
         0
+    }
+
+    fn dir_inode(&self, path: &[u8]) -> Option<u64> {
+        self.dir_inodes.get(path).copied()
+    }
+
+    fn dir_path(&self, dir_inode: u64) -> Option<Vec<u8>> {
+        self.dir_paths.get(&dir_inode).cloned()
+    }
+
+    fn resolve_at(&self, dir_inode: u64, name: &[u8]) -> Option<(Option<u64>, u8)> {
+        let base = self.dir_paths.get(&dir_inode)?;
+        // Join `name` under the base without doubling the separator
+        // ("/" + "bin" = "/bin"; "/bin" + "sh" = "/bin/sh").
+        let mut child = base.clone();
+        if child.last() != Some(&b'/') {
+            child.push(b'/');
+        }
+        child.extend_from_slice(name);
+        // Tar carries regular files only; dirs are implicit. No
+        // symlinks in this index.
+        match self.entry_type(&child) {
+            3 => Some((self.dir_inodes.get(&child).copied(), 3)),
+            4 => Some((self.inodes.get(&child).copied(), 4)),
+            _ => None,
+        }
     }
 }
 
