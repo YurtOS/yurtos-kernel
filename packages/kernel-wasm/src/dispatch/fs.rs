@@ -590,21 +590,29 @@ fn resolve_symlinks_per_component(
     let mut comps: Vec<Vec<u8>> = split_path(&path);
     let mut hops = 0u32;
     let mut i = 0usize;
+    // `prefix` is maintained incrementally as "/" + comps[0..i] (the
+    // resolved-so-far parent). The per-component readlink probe then
+    // costs O(component), not O(path) — a symlink-free `stat`/`lstat`
+    // (the hot case) is linear, not the O(n²) of rebuilding the whole
+    // prefix every component. Only rebuilt on a splice/restart.
+    let mut prefix: Vec<u8> = Vec::new();
     while i < comps.len() {
         // lstat: never readlink the terminal component (the one with
         // nothing after it in the *current* resolved list).
         if !follow_terminal && i + 1 == comps.len() {
             break;
         }
-        let mut prefix = Vec::new();
-        for c in &comps[..=i] {
-            prefix.push(b'/');
-            prefix.extend_from_slice(c);
-        }
+        // Extend "/" + comps[..i] to the probe "/" + comps[..=i].
+        let parent_len = prefix.len();
+        prefix.push(b'/');
+        prefix.extend_from_slice(&comps[i]);
         let Some(target) = k.vfs.readlink(&prefix) else {
+            // Not a symlink: keep it in `prefix`, advance.
             i += 1;
             continue;
         };
+        // Roll `prefix` back to the link's parent ("/" + comps[..i]).
+        prefix.truncate(parent_len);
         // An empty symlink target is malformed: fail closed with
         // -EINVAL, matching the old terminal-only path
         // (follow_symlinks → normalize_readable_path(b"") → -EINVAL).
@@ -622,17 +630,15 @@ fn resolve_symlinks_per_component(
             return Err(-(abi::EINVAL as i64));
         }
         // Build an absolute path: an absolute target as-is; a relative
-        // target against the link's parent dir (POSIX). Then append the
-        // not-yet-resolved remainder. normalize_readable_path collapses
-        // any `.`/`..`/`//` and re-authorizes (incl. /proc gate).
+        // target against the link's parent dir (`prefix` == "/" +
+        // comps[..i]). Then append the not-yet-resolved remainder.
+        // normalize_readable_path collapses any `.`/`..`/`//` and
+        // re-authorizes (incl. /proc gate).
         let mut newpath = Vec::new();
         if target.starts_with(b"/") {
             newpath.extend_from_slice(&target);
         } else {
-            for c in &comps[..i] {
-                newpath.push(b'/');
-                newpath.extend_from_slice(c);
-            }
+            newpath.extend_from_slice(&prefix);
             newpath.push(b'/');
             newpath.extend_from_slice(&target);
         }
@@ -643,6 +649,7 @@ fn resolve_symlinks_per_component(
         let renorm = normalize_readable_path(k, caller_pid, &newpath)?;
         comps = split_path(&renorm);
         i = 0;
+        prefix.clear();
     }
     if comps.is_empty() {
         return Ok(b"/".to_vec());

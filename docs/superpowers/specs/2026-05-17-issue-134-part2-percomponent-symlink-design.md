@@ -332,6 +332,15 @@ cross-crate run needed.
   uniform `ENOENT` contract and pins it with a characterization test
   (`stat_lstat_nondir_intermediate_is_enoent_not_enotdir_146_142`); the
   uniform fix across `open`/`stat`/`lstat` belongs to #142.
+- **Empty symlink-target errno is `-EINVAL`, not Linux's `-ENOENT`.**
+  Part 2 fails closed on an empty `readlink` target (else it would
+  silently parent-alias — info-probing); the errno chosen is internal
+  consistency with the pre-existing `follow_symlinks →
+  normalize_readable_path(b"") → -EINVAL` path, **not** Linux parity
+  (Linux rejects empty targets at `symlink(2)` with `-ENOENT`).
+  Intentional and tested (`stat_lstat_empty_symlink_target_is_einval`);
+  a deliberate, tracked parity divergence for the syscall-parity
+  scoreboard (#52 / parity-matrix) — not silently widened here.
 - `sys_open` / other `normalize_readable_path` consumers → #142.
 - dirfd inode-anchoring → #59 / PR #63.
 - New syscalls / ABI method-ids / `host_*` surface changes.
