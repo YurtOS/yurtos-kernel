@@ -325,6 +325,50 @@ fn proc_cmdline_fixture_round_trips_argv() {
 }
 
 #[test]
+fn spawn_wait_fixture_reaps_child_exit_code_cross_host() {
+    // Cross-host parity: a guest using `yurt_process::Command` (which
+    // imports `yurt.host_spawn` / `yurt.host_wait`) must run on the
+    // Rust `KernelHostInterface` host byte-identically to the JS E2E
+    // (`packages/runner/src/__tests__/spawn_wait_test.ts`):
+    //
+    //   /spawn-wait.wasm  Command::new("/child-exit7.wasm").status()
+    //     → yurt.host_spawn → SYS_SPAWN (kernel stages the child)
+    //     → yurt.host_wait  → SYS_WAIT, EAGAIN → drain_and_run_pending_spawns
+    //         → /child-exit7.wasm runs, proc_exit(7), record_exit
+    //       → SYS_WAIT now reaps → {exitedPid, exit_code=7, signal=0}
+    //     → parent prints "child exited 7" and proc_exit(0).
+    //
+    // The "child exited 7" literal MUST match the JS E2E byte-for-byte.
+    ensure_fixture_built("spawn-wait-wasm");
+    ensure_fixture_built("child-exit7-wasm");
+    let parent_wasm = std::fs::read(fixture_wasm_path("spawn-wait-wasm")).unwrap();
+    let child_wasm = std::fs::read(fixture_wasm_path("child-exit7-wasm")).unwrap();
+
+    let mk = fresh_kernel_host_interface();
+    // Stage the child into the kernel ramfs at the path the fixture
+    // resolves (`Command::new("/child-exit7.wasm")`). The kernel's
+    // `sys_spawn` reads the image straight out of the VFS by this path.
+    mk.register_ramfs_file(b"/child-exit7.wasm", &child_wasm)
+        .unwrap();
+
+    let argv: Vec<&[u8]> = vec![b"/spawn-wait.wasm"];
+    let mut user = mk
+        .spawn_user_process_with_args(&parent_wasm, &argv)
+        .unwrap();
+    // The parent's `host_wait` drives the staged child to completion
+    // itself (EAGAIN → drain_and_run_pending_spawns), so a single
+    // run_start drives the whole tree. proc_exit(0) traps; the WASI
+    // shim stashes the code in last_exit first (same as every other
+    // proc_exit fixture above).
+    let _ = user.run_start();
+
+    let stdout = String::from_utf8_lossy(&user.captured_stdout().unwrap()).to_string();
+    let exit_code = user.last_exit().unwrap_or(-1);
+    assert_eq!(stdout.trim(), "child exited 7");
+    assert_eq!(exit_code, 0);
+}
+
+#[test]
 fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     ensure_fixture_built("false-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("false-cmd-wasm")).unwrap();

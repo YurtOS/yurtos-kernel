@@ -725,6 +725,7 @@ fn run_wasmtime_thread(
     let mut linker: Linker<UserState> = Linker::new(&engine);
     register_sys_imports(&mut linker)?;
     register_yurt_thread_imports(&mut linker)?;
+    register_yurt_process_imports(&mut linker)?;
     crate::wasi_shim::add_to_linker(&mut linker)
         .context("install WASI preview1 shim on thread linker")?;
     let user_state = UserState {
@@ -805,6 +806,7 @@ fn instantiate_fork_child(
     let mut linker: Linker<UserState> = Linker::new(engine);
     register_sys_imports(&mut linker)?;
     register_yurt_thread_imports(&mut linker)?;
+    register_yurt_process_imports(&mut linker)?;
     crate::wasi_shim::add_to_linker(&mut linker)
         .context("install WASI preview1 shim on fork child linker")?;
     let user_state = UserState {
@@ -2863,11 +2865,7 @@ impl KernelHostInterface {
     /// this after a `UserProcess::run_start` returns (extracting
     /// the exit code from the proc_exit trap).
     pub fn record_exit(&self, pid: u32, exit_status: i32) -> Result<()> {
-        let rc = self.kernel.lock().unwrap().record_exit(pid, exit_status)?;
-        if rc != 0 {
-            anyhow::bail!("kernel_record_exit failed: rc={rc}");
-        }
-        Ok(())
+        record_exit_raw(&self.kernel, pid, exit_status)
     }
 
     /// Drain the next sys_spawn-staged child from the kernel, if
@@ -2877,51 +2875,7 @@ impl KernelHostInterface {
     /// instantiates each child via `spawn_child` + run-to-
     /// completion + `record_exit`.
     pub fn drain_pending_spawn(&self) -> Result<Option<PendingSpawn>> {
-        let mut buf = vec![0u8; self.kernel.lock().unwrap().scratch_len as usize];
-        let rc = self.kernel.lock().unwrap().drain_spawn(&mut buf)?;
-        if rc == -2 {
-            return Ok(None); // -ENOENT: queue empty
-        }
-        if rc < 0 {
-            anyhow::bail!("kernel_drain_spawn failed: rc={rc}");
-        }
-        let used = rc as usize;
-        if used > buf.len() {
-            anyhow::bail!(
-                "kernel_drain_spawn record exceeds scratch capacity: used={used} cap={}",
-                buf.len()
-            );
-        }
-        if used < 8 {
-            anyhow::bail!("kernel_drain_spawn returned malformed record (len={used})");
-        }
-        let child_pid = u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes"));
-        let wasm_len = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")) as usize;
-        if 8 + wasm_len + 4 > used {
-            anyhow::bail!("kernel_drain_spawn record truncated at wasm body");
-        }
-        let wasm = buf[8..8 + wasm_len].to_vec();
-        let mut cur = 8 + wasm_len;
-        let argc = u32::from_le_bytes(buf[cur..cur + 4].try_into().expect("4 bytes")) as usize;
-        cur += 4;
-        let mut argv = Vec::with_capacity(argc);
-        for _ in 0..argc {
-            if cur + 4 > used {
-                anyhow::bail!("kernel_drain_spawn argv header truncated");
-            }
-            let alen = u32::from_le_bytes(buf[cur..cur + 4].try_into().expect("4 bytes")) as usize;
-            cur += 4;
-            if cur + alen > used {
-                anyhow::bail!("kernel_drain_spawn argv body truncated");
-            }
-            argv.push(buf[cur..cur + alen].to_vec());
-            cur += alen;
-        }
-        Ok(Some(PendingSpawn {
-            child_pid,
-            wasm,
-            argv,
-        }))
+        drain_pending_spawn_raw(&self.kernel)
     }
 
     /// Mount a YURTFS L1+L2 overlay at `prefix`. The image bytes
@@ -3027,57 +2981,7 @@ impl KernelHostInterface {
         wasm: &[u8],
         argv: Vec<Vec<u8>>,
     ) -> Result<UserProcess> {
-        let module = Module::new(&self.engine, wasm).context("compile user-process wasm")?;
-        let mut linker: Linker<UserState> = Linker::new(&self.engine);
-        register_sys_imports(&mut linker)?;
-        register_yurt_thread_imports(&mut linker)?;
-        crate::wasi_shim::add_to_linker(&mut linker)
-            .context("install WASI preview1 shim on user-process linker")?;
-        let shared_memory = imported_shared_memory_type(&module)
-            .map(|ty| SharedMemory::new(&self.engine, ty))
-            .transpose()
-            .context("create imported shared memory")?;
-
-        let thread_argv = argv.clone();
-        let process_wasm = Arc::<[u8]>::from(wasm.to_vec());
-        let user_state = UserState {
-            engine: self.engine.clone(),
-            kernel: self.kernel.clone(),
-            pid,
-            caller_tid: 1,
-            argv,
-            wasm: process_wasm.clone(),
-            forced_fork_return: None,
-            dir_fds: std::collections::BTreeMap::new(),
-            last_exit: None,
-            last_scheduler_budget_ns: None,
-            last_scheduler_epoch_quantum: None,
-        };
-        let mut store = Store::new(&self.engine, user_state);
-        store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
-        if let Some(memory) = shared_memory.clone() {
-            define_imported_shared_memory(&module, &mut linker, &store, memory)?;
-        }
-        let instance = linker
-            .instantiate(&mut store, &module)
-            .context("instantiate user-process wasm")?;
-        if let Some(thread_host) = self
-            .kernel
-            .lock()
-            .unwrap()
-            .store
-            .data()
-            .host
-            .thread_host
-            .as_ref()
-        {
-            thread_host.register_process(pid, process_wasm, thread_argv, shared_memory);
-        }
-        Ok(UserProcess {
-            store,
-            instance,
-            pid,
-        })
+        instantiate_with_pid_raw(&self.engine, &self.kernel, pid, wasm, argv)
     }
 
     fn cache_anonymous_process_module(&self, wasm: &[u8]) -> Result<Vec<u8>> {
@@ -3097,19 +3001,7 @@ impl KernelHostInterface {
     /// in a fixed-cadence drain) — without it, sys_spawn-staged
     /// children never run.
     pub fn run_pending_spawns(&self) -> Result<usize> {
-        let mut count = 0usize;
-        while let Some(spawn) = self.drain_pending_spawn()? {
-            let mut child = self.instantiate_with_pid(spawn.child_pid, &spawn.wasm, spawn.argv)?;
-            // run_start traps when the child calls proc_exit; the
-            // shim stashes the exit code in UserState first. A
-            // clean return (non-WASI exit) leaves last_exit None,
-            // which we report as 0.
-            let _ = child.run_start();
-            let exit = child.last_exit().unwrap_or(0);
-            self.record_exit(spawn.child_pid, exit)?;
-            count += 1;
-        }
-        Ok(count)
+        drain_and_run_pending_spawns(&self.engine, &self.kernel)
     }
 
     /// Reserved alias for [`spawn_user_process`]. The WASI preview1
@@ -3371,6 +3263,175 @@ impl UserProcess {
 // the two `pub` ones the WASI shim uses for backwards compatibility.
 pub use yurt_kernel_host_interface_core::{trampoline_request, trampoline_request_with_response};
 
+// ── Pending-spawn drive (engine + kernel only) ───────────────────────────────
+//
+// `host_wait`'s EAGAIN path needs to drive sys_spawn-staged children to
+// completion the same way `KernelHostInterface::run_pending_spawns` does, but
+// from inside a `Caller<'_, UserState>` it only has `caller.data().engine`
+// (an `Engine`, `Clone`) and `caller.data().kernel` (an
+// `Arc<Mutex<KernelInstance>>`). These free functions hold the EXACT logic
+// that used to live on `KernelHostInterface` so both call sites share one
+// implementation with identical semantics.
+
+/// Build a `UserProcess` bound to an explicit kernel-allocated pid. Byte-for-
+/// byte the body that previously lived in
+/// `KernelHostInterface::instantiate_with_pid`.
+fn instantiate_with_pid_raw(
+    engine: &Engine,
+    kernel: &Arc<Mutex<KernelInstance>>,
+    pid: u32,
+    wasm: &[u8],
+    argv: Vec<Vec<u8>>,
+) -> Result<UserProcess> {
+    let module = Module::new(engine, wasm).context("compile user-process wasm")?;
+    let mut linker: Linker<UserState> = Linker::new(engine);
+    register_sys_imports(&mut linker)?;
+    register_yurt_thread_imports(&mut linker)?;
+    register_yurt_process_imports(&mut linker)?;
+    crate::wasi_shim::add_to_linker(&mut linker)
+        .context("install WASI preview1 shim on user-process linker")?;
+    let shared_memory = imported_shared_memory_type(&module)
+        .map(|ty| SharedMemory::new(engine, ty))
+        .transpose()
+        .context("create imported shared memory")?;
+
+    let thread_argv = argv.clone();
+    let process_wasm = Arc::<[u8]>::from(wasm.to_vec());
+    let user_state = UserState {
+        engine: engine.clone(),
+        kernel: kernel.clone(),
+        pid,
+        caller_tid: 1,
+        argv,
+        wasm: process_wasm.clone(),
+        forced_fork_return: None,
+        dir_fds: std::collections::BTreeMap::new(),
+        last_exit: None,
+        last_scheduler_budget_ns: None,
+        last_scheduler_epoch_quantum: None,
+    };
+    let mut store = Store::new(engine, user_state);
+    store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
+    if let Some(memory) = shared_memory.clone() {
+        define_imported_shared_memory(&module, &mut linker, &store, memory)?;
+    }
+    let instance = linker
+        .instantiate(&mut store, &module)
+        .context("instantiate user-process wasm")?;
+    if let Some(thread_host) = kernel
+        .lock()
+        .unwrap()
+        .store
+        .data()
+        .host
+        .thread_host
+        .as_ref()
+    {
+        thread_host.register_process(pid, process_wasm, thread_argv, shared_memory);
+    }
+    Ok(UserProcess {
+        store,
+        instance,
+        pid,
+    })
+}
+
+/// Drain the next sys_spawn-staged child from the kernel, if any. Byte-for-
+/// byte the body that previously lived in
+/// `KernelHostInterface::drain_pending_spawn`.
+fn drain_pending_spawn_raw(
+    kernel: &Arc<Mutex<KernelInstance>>,
+) -> Result<Option<PendingSpawn>> {
+    let mut buf = vec![0u8; kernel.lock().unwrap().scratch_len as usize];
+    let rc = kernel.lock().unwrap().drain_spawn(&mut buf)?;
+    if rc == -2 {
+        return Ok(None); // -ENOENT: queue empty
+    }
+    if rc < 0 {
+        anyhow::bail!("kernel_drain_spawn failed: rc={rc}");
+    }
+    let used = rc as usize;
+    if used > buf.len() {
+        anyhow::bail!(
+            "kernel_drain_spawn record exceeds scratch capacity: used={used} cap={}",
+            buf.len()
+        );
+    }
+    if used < 8 {
+        anyhow::bail!("kernel_drain_spawn returned malformed record (len={used})");
+    }
+    let child_pid = u32::from_le_bytes(buf[0..4].try_into().expect("4 bytes"));
+    let wasm_len = u32::from_le_bytes(buf[4..8].try_into().expect("4 bytes")) as usize;
+    if 8 + wasm_len + 4 > used {
+        anyhow::bail!("kernel_drain_spawn record truncated at wasm body");
+    }
+    let wasm = buf[8..8 + wasm_len].to_vec();
+    let mut cur = 8 + wasm_len;
+    let argc = u32::from_le_bytes(buf[cur..cur + 4].try_into().expect("4 bytes")) as usize;
+    cur += 4;
+    let mut argv = Vec::with_capacity(argc);
+    for _ in 0..argc {
+        if cur + 4 > used {
+            anyhow::bail!("kernel_drain_spawn argv header truncated");
+        }
+        let alen = u32::from_le_bytes(buf[cur..cur + 4].try_into().expect("4 bytes")) as usize;
+        cur += 4;
+        if cur + alen > used {
+            anyhow::bail!("kernel_drain_spawn argv body truncated");
+        }
+        argv.push(buf[cur..cur + alen].to_vec());
+        cur += alen;
+    }
+    Ok(Some(PendingSpawn {
+        child_pid,
+        wasm,
+        argv,
+    }))
+}
+
+/// Record a child's exit status so the parent's `sys_wait` can reap it.
+/// Byte-for-byte the body that previously lived in
+/// `KernelHostInterface::record_exit`.
+fn record_exit_raw(
+    kernel: &Arc<Mutex<KernelInstance>>,
+    pid: u32,
+    exit_status: i32,
+) -> Result<()> {
+    let rc = kernel.lock().unwrap().record_exit(pid, exit_status)?;
+    if rc != 0 {
+        anyhow::bail!("kernel_record_exit failed: rc={rc}");
+    }
+    Ok(())
+}
+
+/// Drain every staged sys_spawn child, instantiate it with the
+/// kernel-allocated pid, run it to completion, and record its exit so the
+/// parent's `sys_wait` can reap it. Returns the number of children run.
+/// This is the shared body for `KernelHostInterface::run_pending_spawns`
+/// and `host_wait`'s EAGAIN drive loop — semantics are identical to the
+/// pre-extraction `run_pending_spawns` (flat `while let Some`, instantiate
+/// bound to the kernel-allocated `child_pid`, `run_start()`,
+/// `last_exit().unwrap_or(0)`, `record_exit`).
+fn drain_and_run_pending_spawns(
+    engine: &Engine,
+    kernel: &Arc<Mutex<KernelInstance>>,
+) -> Result<usize> {
+    let mut count = 0usize;
+    while let Some(spawn) = drain_pending_spawn_raw(kernel)? {
+        let mut child =
+            instantiate_with_pid_raw(engine, kernel, spawn.child_pid, &spawn.wasm, spawn.argv)?;
+        // run_start traps when the child calls proc_exit; the
+        // shim stashes the exit code in UserState first. A
+        // clean return (non-WASI exit) leaves last_exit None,
+        // which we report as 0.
+        let _ = child.run_start();
+        let exit = child.last_exit().unwrap_or(0);
+        record_exit_raw(kernel, spawn.child_pid, exit)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
 // ── Linker registration ──────────────────────────────────────────────────────
 
 fn thread_syscall_from_user(
@@ -3541,6 +3602,199 @@ fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "host_thread_yield",
         |mut caller: Caller<'_, UserState>| -> i32 {
             thread_syscall_from_user(&mut caller, sys_method_id::THREAD_YIELD, &[], &mut []) as i32
+        },
+    )?;
+    Ok(())
+}
+
+/// `host_wait`'s EAGAIN→drain loop iteration cap. A pathological
+/// guest (or a child that itself calls `host_wait` forever) must not
+/// spin the host indefinitely; when the cap is hit we return a clean
+/// `-EDEADLK` errno rather than panicking or trapping the guest. The
+/// JS host uses a re-entrancy depth of 256 because its drive chain is
+/// recursive; the Rust drain loop is flat (each iteration fully
+/// drains the staged-spawn queue, which terminates at `-ENOENT`), so a
+/// generous absolute iteration bound is the equivalent safety net.
+const HOST_WAIT_MAX_DRAIN_ITERS: u32 = 100_000;
+/// POSIX `EDEADLK`. Mirrors the JS host's `EDEADLK = 35` re-entrancy
+/// guard return value (mod.ts) so a wedged wait is byte-identical
+/// across hosts.
+const EDEADLK: i64 = 35;
+
+/// Register the `yurt.host_spawn` / `yurt.host_wait` guest imports.
+///
+/// This is the Rust port of the already-landed JS implementation
+/// (`packages/kernel-host-interface-js/mod.ts` `host_spawn` /
+/// `host_wait`) and the deno one
+/// (`packages/kernel-host-interface-deno/wasm-kernel-imports.ts`).
+/// Wire formats, errno returns, and the 4-/16-byte result records are
+/// byte-identical to those by construction so a guest using
+/// `yurt_process::Command` runs the same on every host.
+///
+/// Called at the SAME three sites as `register_yurt_thread_imports`
+/// (`run_wasmtime_thread`, `instantiate_fork_child`,
+/// `instantiate_with_pid_raw`) so threads / fork children / spawned
+/// children can all spawn-and-wait too.
+fn register_yurt_process_imports(linker: &mut Linker<UserState>) -> Result<()> {
+    // ── host_spawn(req_ptr, req_len, out_ptr, out_cap) → i32 ─────────
+    // Parses a yurt_spawn_request_v1 from guest memory via the shared
+    // `native_abi::decode_spawn_request` (same validation the JS side
+    // open-codes), builds the count-less SYS_SPAWN kernel wire, and
+    // writes a yurt_spawn_result_v1 (4-byte LE i32 pid).
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_spawn",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 {
+            let bytes = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            // Reuse the shared decoder — it already does the 4-byte
+            // align + overflow + version/size checks and maps to the
+            // same -EINVAL(-22) / -EOVERFLOW(-75) the JS host returns.
+            let req = match crate::wasm::native_abi::decode_spawn_request(&bytes) {
+                Ok(req) => req,
+                Err(e) => return e.errno(),
+            };
+
+            // Build SYS_SPAWN kernel wire EXACTLY as the kernel
+            // `sys_spawn` parser + the JS host expect:
+            //   u32_LE(path_len) + path + repeated(u32_LE(arg_len)+arg)
+            // NO argc prefix. path = prog. argv = [argv0 ?? prog, ...args].
+            let prog = req.prog;
+            let argv0 = req.argv0.unwrap_or_else(|| prog.clone());
+            let mut argv: Vec<Vec<u8>> = Vec::with_capacity(1 + req.args.len());
+            argv.push(argv0.into_bytes());
+            for a in req.args {
+                argv.push(a.into_bytes());
+            }
+            let path_bytes = prog.as_bytes();
+            let mut wire = Vec::with_capacity(4 + path_bytes.len());
+            wire.extend_from_slice(&(path_bytes.len() as u32).to_le_bytes());
+            wire.extend_from_slice(path_bytes);
+            wire.extend_from_slice(&encode_argv_records(&argv));
+
+            // Plain process syscall as the calling pid (mirror
+            // thread_syscall_from_user's caller-pid sourcing).
+            let kernel = caller.data().kernel.clone();
+            let pid = caller.data().pid;
+            let rc = match kernel
+                .lock()
+                .unwrap()
+                .syscall(sys_method_id::SPAWN, pid, &wire, &mut [])
+            {
+                Ok(rc) => rc,
+                Err(_) => -EIO,
+            };
+            if rc < 0 {
+                return rc as i32;
+            }
+            // rc is the child pid. Write yurt_spawn_result_v1: 4-byte
+            // LE i32 pid. -7 on too-small cap (byte-parity with the JS
+            // / deno hosts).
+            if out_cap < 4 {
+                return -(E2BIG as i32);
+            }
+            let result = (rc as i32).to_le_bytes();
+            if write_user_guest_bytes(&mut caller, out_ptr, &result).is_err() {
+                return -(EFAULT as i32);
+            }
+            4
+        },
+    )?;
+
+    // ── host_wait(pid, flags, out_ptr, out_cap) → i32 ────────────────
+    // Calls SYS_WAIT in a retry loop, draining staged spawns between
+    // retries. Decodes the kernel's 8-byte response and writes a
+    // 16-byte yurt_wait_result_v1.
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_wait",
+        |mut caller: Caller<'_, UserState>,
+         pid: i32,
+         flags: i32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i32 {
+            const WNOHANG: i32 = 1;
+            // Clone the (engine, kernel) handles up front — before any
+            // `&mut caller` syscall borrow — so the EAGAIN drive loop
+            // can call `drain_and_run_pending_spawns` without a
+            // borrow-checker conflict (mirrors thread_syscall_from_user
+            // cloning caller.data().kernel first).
+            let engine = caller.data().engine.clone();
+            let kernel = caller.data().kernel.clone();
+            let caller_pid = caller.data().pid;
+
+            let mut req = Vec::with_capacity(8);
+            req.extend_from_slice(&(pid as u32).to_le_bytes());
+            req.extend_from_slice(&(flags as u32).to_le_bytes());
+
+            let mut resp = [0u8; 8];
+            let do_wait = |resp: &mut [u8; 8]| -> i64 {
+                match kernel
+                    .lock()
+                    .unwrap()
+                    .syscall(sys_method_id::WAIT, caller_pid, &req, resp)
+                {
+                    Ok(rc) => rc,
+                    Err(_) => -EIO,
+                }
+            };
+
+            let mut rc = do_wait(&mut resp);
+            let mut iters: u32 = 0;
+            while rc == -EAGAIN && (flags & WNOHANG) == 0 {
+                if iters >= HOST_WAIT_MAX_DRAIN_ITERS {
+                    // Clean errno instead of a panic/trap: lets the
+                    // guest surface a wedged wait gracefully (parity
+                    // with the JS host's -EDEADLK depth guard).
+                    return -(EDEADLK as i32);
+                }
+                iters += 1;
+                if drain_and_run_pending_spawns(&engine, &kernel).is_err() {
+                    return -(EIO as i32);
+                }
+                rc = do_wait(&mut resp);
+            }
+
+            if rc < 0 {
+                return rc as i32;
+            }
+            // A successful wait writes the kernel's 8-byte response.
+            if rc != 8 {
+                return -(E2BIG as i32);
+            }
+            if out_cap < 16 {
+                return -(E2BIG as i32);
+            }
+
+            // Decode 8-byte kernel response: u32 exitedPid@0, i32 status@4.
+            let exited_pid = i32::from_le_bytes(resp[0..4].try_into().expect("4 bytes"));
+            let status = i32::from_le_bytes(resp[4..8].try_into().expect("4 bytes"));
+            let signal = if (128..192).contains(&status) {
+                status - 128
+            } else {
+                0
+            };
+            let exit_code = if signal == 0 { status } else { 0 };
+
+            // Write yurt_wait_result_v1:
+            //   {i32 exitedPid, i32 exit_code, i32 signal, i32 0}
+            let mut result = [0u8; 16];
+            result[0..4].copy_from_slice(&exited_pid.to_le_bytes());
+            result[4..8].copy_from_slice(&exit_code.to_le_bytes());
+            result[8..12].copy_from_slice(&signal.to_le_bytes());
+            result[12..16].copy_from_slice(&0i32.to_le_bytes());
+            if write_user_guest_bytes(&mut caller, out_ptr, &result).is_err() {
+                return -(EFAULT as i32);
+            }
+            16
         },
     )?;
     Ok(())
