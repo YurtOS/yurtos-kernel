@@ -55,7 +55,8 @@ pub const EMFILE: i32 = 24;
 pub const ERANGE: i32 = 34;
 #[allow(dead_code)]
 pub const ENAMETOOLONG: i32 = 36;
-/// Linux aliases `EWOULDBLOCK` to `EAGAIN` (both 11); kept distinct in
-/// the mirror so call sites can name the intent.
+/// Linux aliases `EWOULDBLOCK` to `EAGAIN` (both 11); defined in terms
+/// of `EAGAIN` so the two cannot silently drift, while still letting
+/// call sites name the non-blocking intent.
 #[allow(dead_code)]
-pub const EWOULDBLOCK: i32 = 11;
+pub const EWOULDBLOCK: i32 = EAGAIN;
