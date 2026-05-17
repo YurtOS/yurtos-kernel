@@ -109,12 +109,15 @@ pub(super) fn getcwd(caller_pid: u32, response: &mut [u8]) -> i64 {
                 }
                 None => return -(abi::ENOENT as i64),
             },
-            // Degraded path-snapshot cwd. Intentionally does NOT do the
-            // lazy `/`→inode upgrade that `PathResolver::resolved_cwd`
-            // performs: the only `dir_inode == None` cwd that reaches
-            // here is the `Process::new` default whose path is `/`, and
-            // `/` is rename/rmdir-protected (EBUSY), so its snapshot
-            // can never go stale — refreshing it would be a no-op.
+            // Degraded-backend cwd (hostfs/overlay → `dir_inode ==
+            // None`, e.g. after `chdir` into a `/host/...` mount) OR
+            // the `Process::new` default `/`. In both cases no inode is
+            // anchored, so the absolute `path` snapshot is itself
+            // authoritative — there is nothing to refresh it from.
+            // Deliberately NOT the lazy `/`→inode upgrade
+            // `PathResolver::resolved_cwd` does (that one is gated on
+            // `cwd.path == b"/"`); do not "simplify" this to `b"/"`,
+            // which would corrupt a degraded non-root cwd.
             None => cwd_state.path,
         };
         let required = cwd.len() + 1;
