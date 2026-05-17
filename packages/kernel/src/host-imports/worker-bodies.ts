@@ -461,11 +461,28 @@ export function makeWorkerDispatcherBodies(
         });
         return 0;
       };
-      const listenResult = opts.socketBackend.listen({ host, port, backlog });
+      const failListen = (error: unknown): number => {
+        netLog("pthread.listen", {
+          fd,
+          host,
+          port,
+          result: "EIO",
+          reason: error instanceof Error ? error.message : String(error),
+        });
+        return -5;
+      };
+      let listenResult: ReturnType<
+        NonNullable<typeof opts.socketBackend.listen>
+      >;
+      try {
+        listenResult = opts.socketBackend.listen({ host, port, backlog });
+      } catch (error) {
+        return failListen(error);
+      }
       if (typeof (listenResult as Promise<unknown>).then === "function") {
         return (listenResult as Promise<
           Awaited<ReturnType<NonNullable<typeof opts.socketBackend.listen>>>
-        >).then(apply);
+        >).then(apply, failListen);
       }
       return apply(
         listenResult as Awaited<
