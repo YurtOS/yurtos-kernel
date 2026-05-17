@@ -83,7 +83,17 @@ asserted behavior, never a silent skip):
   and the dirfd/`cwd` falls back to the path snapshot. This is a **permanent**
   exception: inode-faithful host dir tracking needs a new host
   dirent/stat-by-handle ABI and is a separate future slice (spec Non-goals).
-- **overlay** — inode anchoring across the upper/lower/whiteout/copy-up demux is
-  finalized by B2.9 Task 9. **Pending Task 9** — Task 9 finalizes this line
-  (either overlay inode-anchored, or overlay degraded-mode tracked here like
-  hostfs if Task 9 defers it; never a half-correct overlay).
+- **overlay** — `dir_inode`/`resolve_at`/`dir_path` return `None`; an overlay
+  mount's dirfd/`cwd` falls back to the path snapshot. This is a **deferred**
+  exception (spec Non-goals): `OverlayBackend` keeps no directory namespace of
+  its own (no `mkdir`/`rmdir`/`dir_inodes`), its external-id table is a
+  file-only `(layer, internal_id)` demux, copy-up deliberately breaks inode
+  identity (`vfs.rs` `rename`: "Inode identity is not preserved"), and overlay
+  directory rename is itself unimplemented (`-EXDEV`). A correct triad would
+  require restructuring the upper/lower/whiteout/copy-up demux into a dual
+  file+directory model with a defined copy-up dir-identity rule — a structural
+  change too large for this slice, deferred to a follow-up. The degraded
+  contract is the same `dir_inode == None` path-snapshot behavior asserted by
+  `dispatch::tests::openat_degraded_mode_for_non_inode_backend` (Task 5), which
+  is backend-agnostic and covers any backend returning `None` from `dir_inode`
+  (overlay included) — defined, asserted behavior, never a silent skip.
