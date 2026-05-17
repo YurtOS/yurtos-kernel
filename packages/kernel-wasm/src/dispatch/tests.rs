@@ -6611,8 +6611,38 @@ fn lstat_does_not_follow_symlink_to_regular_file() {
     );
     assert_eq!(
         u64::from_le_bytes(out[0..8].try_into().unwrap()),
-        0,
-        "size is the link's (0), not the target's (2)"
+        2,
+        "lstat st_size is the target path length (\"/f\" = 2), not 0; #134"
+    );
+}
+
+/// #134 — POSIX lstat() sets st_size to the byte length of the
+/// symlink's target path string (what readlink returns), not the
+/// VFS fixed-size-0 convention for non-regular entries. This is
+/// confined to write_stat_record's filetype==7 arm; stat_path
+/// follows the link chain before typing, so it never reaches this
+/// arm and is unaffected (asserted by lstat_*_matches_stat below
+/// and the #67 stat_follows_symlink_* tests).
+#[test]
+fn lstat_symlink_st_size_is_target_path_length() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let target: &[u8] = b"/some/deep/target-path";
+    let mut sreq = (target.len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(target);
+    sreq.extend_from_slice(b"/sl");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/sl", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "still S_IFLNK — lstat must not follow the link"
+    );
+    assert_eq!(
+        u64::from_le_bytes(out[0..8].try_into().unwrap()),
+        target.len() as u64,
+        "lstat st_size must equal the symlink target path byte length"
     );
 }
 
@@ -6904,6 +6934,55 @@ fn realpath_follows_symlink_components_and_parent_traversal() {
 
     assert_eq!(n, "/tmp/real/file".len() as i64 + 1);
     assert_eq!(&out[..n as usize], b"/tmp/real/file\0");
+}
+
+/// Issue #134 Part 2: pins realpath's exact pre-refactor behavior so the
+/// shared-resolver extraction is provably non-regressing. A cross-pid
+/// /proc intermediate symlink is followed by the lexical walk (no
+/// per-component gate) and then denied by realpath's single post-gate
+/// (fs.rs:430). Approach A keeps realpath on (follow_terminal=true,
+/// authorize_each=false), so this must stay GREEN unchanged.
+// TODO(rebase #150 onto post-M8 main): this test was written before
+// #105 / M8 changed the procfs cross-pid policy. The gate now
+// collapses unauthorized-vs-absent /proc/<pid> to -ENOENT (info-leak
+// closure), and the same-uid case is allowed outright. The test's
+// `set_argv` setup creates pid 2 with default credentials (uid 1000,
+// same as pid 1), so the gate no longer fires here at all. To restore
+// the original intent under M8 we'd need pid 2 with a *different* uid
+// (via setresuid in a privileged context). Leaving #[ignore]'d for
+// smarcd's call.
+#[ignore = "stale assertion vs post-M8 procfs policy; see TODO"]
+#[test]
+fn realpath_crosspid_proc_symlink_is_post_gated_unchanged() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // pid 2 exists with a /proc/2/cmdline.
+    set_argv(&set_argv_req(2, &[b"/bin/other"]));
+    // /tmp must exist as a real dir: resolve_realpath checks every
+    // intermediate component, so without /tmp it returns ENOENT before
+    // ever reading the symlink. mkdir also routes through
+    // normalize_readable_path, which publish_proc_snapshots() — that is
+    // what makes /proc/2/cmdline visible during the realpath walk so the
+    // post-gate (fs.rs:430) is actually reached. (Both verified
+    // empirically: without this line realpath returns -ENOENT.)
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp", &mut []), 0);
+    // /tmp/leak -> /proc/2/cmdline (absolute symlink target).
+    let target = b"/proc/2/cmdline";
+    let mut sreq = (target.len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(target);
+    sreq.extend_from_slice(b"/tmp/leak");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    // pid 1 (non-root) realpath through the link → -EPERM (post-gate).
+    let mut out = [0u8; 64];
+    assert_eq!(
+        dispatch(METHOD_SYS_REALPATH, 1, b"/tmp/leak", &mut out),
+        -(abi::EPERM as i64),
+        "realpath cross-pid /proc symlink must stay post-gated (-EPERM)"
+    );
+    // pid 2 owns /proc/2, so it resolves without needing root
+    // (can_read_proc_path allows caller == target regardless of uid).
+    let n = dispatch(METHOD_SYS_REALPATH, 2, b"/tmp/leak", &mut out);
+    assert!(n > 0, "owner (non-root) realpath resolves: {n}");
 }
 
 #[test]
@@ -12329,5 +12408,515 @@ fn fstatvfs_fd_form_reports_plausible_values_and_gates_bad_fds() {
     assert_eq!(
         dispatch(METHOD_SYS_FSTATVFS, 1, &[0u8; 2], &mut buf),
         -(abi::EINVAL as i64),
+    );
+}
+
+/// Issue #134 Part 2: stat() must resolve symlinks in INTERMEDIATE
+/// components. /a/symdir -> /real (dir) containing file `f`.
+#[test]
+fn stat_resolves_intermediate_symlink_directory() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut reg = (b"/real/f".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/real/f");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    // /a/symdir -> /real
+    let mut sreq = (b"/real".len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/real");
+    sreq.extend_from_slice(b"/a/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/a/symdir/f", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        4,
+        "stat must traverse the intermediate symlink /a/symdir and type /real/f as S_IFREG"
+    );
+}
+
+/// Issue #134 Part 2: lstat() resolves INTERMEDIATE symlink components
+/// but does NOT follow the terminal. /a/symdir -> /real (dir);
+/// /real/sl -> /real/target. lstat(/a/symdir/sl) must traverse symdir
+/// yet report `sl` itself as S_IFLNK with the Part-1 target size.
+/// (Mechanism RED→GREEN was proven via the identical shared helper in
+/// stat_resolves_intermediate_symlink_directory; original lstat_path
+/// did zero symlink following so this case returned -ENOENT before.)
+#[test]
+fn lstat_resolves_intermediate_but_not_terminal_symlink() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut s1 = (b"/real".len() as u32).to_le_bytes().to_vec();
+    s1.extend_from_slice(b"/real");
+    s1.extend_from_slice(b"/a/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s1, &mut []), 0);
+    let tgt = b"/real/target";
+    let mut s2 = (tgt.len() as u32).to_le_bytes().to_vec();
+    s2.extend_from_slice(tgt);
+    s2.extend_from_slice(b"/real/sl");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s2, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/a/symdir/sl", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "lstat follows intermediate /a/symdir but reports terminal `sl` as S_IFLNK"
+    );
+    assert_eq!(
+        u64::from_le_bytes(out[0..8].try_into().unwrap()),
+        tgt.len() as u64,
+        "Part 1 preserved: lstat st_size = terminal symlink target length"
+    );
+}
+
+/// Issue #134 Part 2: an INTERMEDIATE symlink crossing into another
+/// pid's /proc is gated for BOTH stat and lstat — the per-hop
+/// re-normalize+re-authorize in resolve_symlinks_per_component applies
+/// the procfs gate to the resolved symlink target. Root is not gated.
+// TODO(rebase #150 onto post-M8 main): same M8-policy collision as
+// `realpath_crosspid_proc_symlink_is_post_gated_unchanged`. The
+// intermediate-symlink-into-/proc/2 gate now returns -ENOENT (M8
+// info-leak closure) rather than -EPERM, AND pid 2 here has the same
+// uid as pid 1 (default 1000), so the gate doesn't fire at all in
+// this setup. Restoring intent under M8 requires a uid-differentiated
+// pid 2 fixture. Leaving #[ignore]'d for smarcd's call.
+#[ignore = "stale assertion vs post-M8 procfs policy; see TODO"]
+#[test]
+fn stat_lstat_intermediate_proc_symlink_is_gated() {
+    let _g = crate::kernel::TestGuard::acquire();
+    set_argv(&set_argv_req(2, &[b"/bin/other"]));
+    // /t must be a real dir so the symlink is honored (an orphan
+    // symlink under a missing parent is now -ENOENT and would short-
+    // circuit before the gate). With /t present, resolution reaches
+    // the /proc gate, which is what this test exercises.
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/t", &mut []), 0);
+    // /t/hop -> /proc/2 ; stat(/t/hop/status) resolves the link to
+    // /proc/2/status (pid 2's proc) which the gate denies for pid 1.
+    let mut sreq = (b"/proc/2".len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/proc/2");
+    sreq.extend_from_slice(b"/t/hop");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/t/hop/status", &mut out),
+        -(abi::EPERM as i64),
+        "stat: intermediate /proc/<other> symlink must be gated"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/t/hop/status", &mut out),
+        -(abi::EPERM as i64),
+        "lstat: intermediate /proc/<other> symlink must be gated"
+    );
+    make_root(1);
+    // Root is not gated AND the link fully resolves to the published
+    // /proc/2/status — assert the concrete success (16), not merely
+    // "not EPERM", so a regression that ENOENTs here is caught.
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/t/hop/status", &mut out),
+        16,
+        "root caller resolves the intermediate /proc/2 symlink"
+    );
+}
+
+/// Issue #134 Part 2: per-component-auth non-regression — own
+/// /proc/self and deep ordinary paths still resolve for both stat and
+/// lstat (locks the strict-strengthening property).
+#[test]
+fn stat_lstat_per_component_auth_allows_self_and_ordinary() {
+    let _g = crate::kernel::TestGuard::acquire();
+    set_argv(&set_argv_req(1, &[b"/bin/self"]));
+    for p in [b"/a".as_slice(), b"/a/b", b"/a/b/c", b"/a/b/c/d"] {
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, p, &mut []), 0);
+    }
+    let mut reg = (b"/a/b/c/d/f".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/a/b/c/d/f");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/a/b/c/d/f", &mut out), 16);
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/a/b/c/d/f", &mut out), 16);
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/proc/self/cmdline", &mut out),
+        16
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/proc/self/cmdline", &mut out),
+        16
+    );
+}
+
+/// Issue #134 Part 2: an intermediate symlink cycle is bounded by the
+/// 40-hop SYMLOOP limit (-EINVAL, matching follow_symlinks), for both
+/// stat and lstat.
+#[test]
+fn stat_lstat_intermediate_symlink_loop_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut s1 = (b"/y/z".len() as u32).to_le_bytes().to_vec();
+    s1.extend_from_slice(b"/y/z");
+    s1.extend_from_slice(b"/x");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s1, &mut []), 0);
+    let mut s2 = (b"/x".len() as u32).to_le_bytes().to_vec();
+    s2.extend_from_slice(b"/x");
+    s2.extend_from_slice(b"/y");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s2, &mut []), 0);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/x/q", &mut out),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/x/q", &mut out),
+        -(abi::EINVAL as i64)
+    );
+}
+
+/// KNOWN PRESERVED non-POSIX residual (#146): a trailing slash does
+/// NOT force-follow a terminal symlink for lstat. Pins current
+/// behavior so #146's eventual fix is a deliberate, test-visible
+/// change, not an accident.
+#[test]
+fn lstat_trailing_slash_on_terminal_symlink_known_residual_146() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut sreq = (b"/real".len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/real");
+    sreq.extend_from_slice(b"/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/symdir/", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "KNOWN RESIDUAL #146: trailing slash does not force-follow; \
+         symdir reported as S_IFLNK (POSIX would follow to S_IFDIR)"
+    );
+}
+
+/// Issue #134 Part 2: exercises the relative-symlink-target join in
+/// resolve_symlinks_per_component (every other test uses absolute
+/// targets). A plain relative target joins against the link's parent;
+/// a `../`-prefixed target is collapsed lexically by the per-hop
+/// normalize_readable_path.
+#[test]
+fn stat_resolves_relative_intermediate_symlink_targets() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a/real", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a/b", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a/sib", &mut []), 0);
+    let mut r1 = (b"/a/real/f".len() as u32).to_le_bytes().to_vec();
+    r1.extend_from_slice(b"/a/real/f");
+    r1.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &r1, &mut []);
+    let mut r2 = (b"/a/sib/g".len() as u32).to_le_bytes().to_vec();
+    r2.extend_from_slice(b"/a/sib/g");
+    r2.extend_from_slice(b"y");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &r2, &mut []);
+
+    // (a) plain relative target: /a/sym -> "real" (sibling dir under /a)
+    let mut s1 = (b"real".len() as u32).to_le_bytes().to_vec();
+    s1.extend_from_slice(b"real");
+    s1.extend_from_slice(b"/a/sym");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s1, &mut []), 0);
+    // (b) ../-relative target: /a/b/up -> "../sib"
+    let mut s2 = (b"../sib".len() as u32).to_le_bytes().to_vec();
+    s2.extend_from_slice(b"../sib");
+    s2.extend_from_slice(b"/a/b/up");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s2, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/a/sym/f", &mut out),
+        16,
+        "relative target joins against the link's parent: /a/sym/f -> /a/real/f"
+    );
+    assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 4);
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/a/b/up/g", &mut out),
+        16,
+        "../-relative target collapses lexically: /a/b/up/g -> /a/sib/g"
+    );
+    assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 4);
+}
+
+/// KNOWN PRESERVED residual (folded into #142): stat()/lstat() return
+/// -ENOENT (NOT POSIX -ENOTDIR) when an intermediate component is a
+/// non-directory with remaining path components — uniformly, whether
+/// or not a symlink was traversed to reach it. Only realpath does the
+/// POSIX ENOTDIR check; stat/lstat/open deliberately use the lenient
+/// lexical + write_stat_record contract (making it ENOTDIR requires
+/// per-component existence checks = the rejected Approach A, which
+/// regressed lexical-`..`/socket/proc tests). Pins current behavior
+/// so #142's uniform fix across open/stat/lstat is deliberate and
+/// test-visible, and locks the symlink-vs-plain consistency.
+#[test]
+fn stat_lstat_nondir_intermediate_is_enoent_not_enotdir_146_142() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut r = (b"/file".len() as u32).to_le_bytes().to_vec();
+    r.extend_from_slice(b"/file");
+    r.extend_from_slice(b"data");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &r, &mut []);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    let mut s = (b"/file".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/file");
+    s.extend_from_slice(b"/a/link");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    // Intermediate is a symlink resolving to a regular file:
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/a/link/child", &mut out),
+        -(abi::ENOENT as i64),
+        "stat via symlink-to-file intermediate: ENOENT today (POSIX: ENOTDIR) — #142"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/a/link/child", &mut out),
+        -(abi::ENOENT as i64),
+        "lstat via symlink-to-file intermediate: ENOENT today — #142"
+    );
+    // Same logical error WITHOUT a symlink — must be the SAME errno
+    // (consistency: a symlink-only ENOTDIR fix would diverge these).
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/file/child", &mut out),
+        -(abi::ENOENT as i64),
+        "stat via plain non-dir intermediate: ENOENT today — #142"
+    );
+}
+
+/// KNOWN INTENTIONAL asymmetry (tracked in #142): after #134 Part 2,
+/// stat() resolves intermediate symlink components but sys_open()
+/// still uses terminal-only follow_symlinks — so a program can stat()
+/// a path it cannot open(). Pins the gap so #142's fix (open parity)
+/// is a deliberate, test-visible change, not a silent one.
+#[test]
+fn stat_open_intermediate_symlink_asymmetry_142() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut reg = (b"/real/f".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/real/f");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    let mut s = (b"/real".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/real");
+    s.extend_from_slice(b"/a/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/a/symdir/f", &mut out),
+        16,
+        "stat resolves the intermediate symlink (#134 Part 2)"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/a/symdir/f"), &mut []),
+        -(abi::ENOENT as i64),
+        "open still terminal-only — cannot open what stat resolved (until #142)"
+    );
+}
+
+/// Co-located regression lock (#134 Part 2): a bound AF_UNIX socket is
+/// not a VFS entry; routing stat through resolve_symlinks_per_component
+/// must still type it S_IFSOCK via write_stat_record — directly AND
+/// when reached through an intermediate symlink (the per-component
+/// helper rewrites the path; write_stat_record types the result). This
+/// was a real mid-implementation regression under the rejected
+/// Approach A; lock it next to the change, not only via the
+/// pre-existing af_unix test.
+#[test]
+fn stat_unix_socket_via_helper_and_intermediate_symlink() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+        3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_BIND,
+            1,
+            &socket_bind_unix_req(3, b"/s.sock"),
+            &mut []
+        ),
+        0
+    );
+    let mut out = [0u8; 16];
+    // Direct: stat through the new per-component helper.
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/s.sock", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        6,
+        "bound AF_UNIX socket types S_IFSOCK through resolve_symlinks_per_component"
+    );
+    // Via an intermediate symlink: /d/up -> "/" ; /d/up/s.sock.
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    let mut sl = (b"/".len() as u32).to_le_bytes().to_vec();
+    sl.extend_from_slice(b"/");
+    sl.extend_from_slice(b"/d/up");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sl, &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/d/up/s.sock", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        6,
+        "socket still S_IFSOCK after the helper resolves the intermediate symlink"
+    );
+}
+
+/// Issue #134 Part 2 regression (PR #150 review): an empty symlink
+/// target must fail closed with -ENOENT (Linux: empty link body →
+/// ENOENT in get_link(); `symlink(2)` also rejects empty targets with
+/// ENOENT — that creation-side parity is tracked for #142), not
+/// silently alias the link to its parent dir. `/d/sl -> ""` is
+/// constructible here; before the reject, stat("/d/sl/child") aliased
+/// to /d/child (info-probing). Terminal lstat of the link is
+/// unaffected (never readlinked) — still S_IFLNK.
+#[test]
+fn stat_lstat_empty_symlink_target_is_enoent() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    let mut r = (b"/d/child".len() as u32).to_le_bytes().to_vec();
+    r.extend_from_slice(b"/d/child");
+    r.extend_from_slice(b"sibling");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &r, &mut []);
+    // Empty-target symlink: target_len = 0, link path = /d/sl.
+    let mut s = 0u32.to_le_bytes().to_vec();
+    s.extend_from_slice(b"/d/sl");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    // stat: terminal empty symlink is followed → -ENOENT (Linux
+    // parity; was: silently stat'd the parent /d).
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/d/sl", &mut out),
+        -(abi::ENOENT as i64),
+        "stat of an empty-target symlink fails closed (-ENOENT, Linux)"
+    );
+    // stat through it: empty intermediate → -ENOENT (was: stat'd the
+    // unrelated sibling /d/child).
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/d/sl/child", &mut out),
+        -(abi::ENOENT as i64),
+        "empty intermediate symlink does not alias to the parent dir"
+    );
+    // lstat of the link itself: terminal, never readlinked → still
+    // S_IFLNK (Part 1 size = target len = 0). Unaffected by the fix.
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/d/sl", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "lstat reports the empty symlink as S_IFLNK (terminal, not followed)"
+    );
+    assert_eq!(
+        u64::from_le_bytes(out[0..8].try_into().unwrap()),
+        0,
+        "Part 1: empty target → st_size 0"
+    );
+    // lstat through it: empty intermediate → -ENOENT (same as stat).
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/d/sl/child", &mut out),
+        -(abi::ENOENT as i64),
+        "empty intermediate symlink fails closed for lstat too"
+    );
+}
+
+/// Issue #134 Part 2 regression (PR #150 review): an orphan symlink
+/// under a missing parent must NOT be honored. `/missing/link ->
+/// /real` is constructible (ramfs flat key map; `symlink(2)` accepts
+/// link paths below nonexistent parents). Per-component resolution
+/// must not traverse `/missing/link` when `/missing` does not exist —
+/// `stat("/missing/link/file")` must fail -ENOENT (matching the plain
+/// `stat("/missing/child")` case and pre-#134 terminal-only
+/// behavior), not resolve `/real/file`. POSIX ENOTDIR-vs-ENOENT
+/// precision for a non-dir parent remains the uniform-ENOENT
+/// lenient-contract residual tracked in #142.
+#[test]
+fn stat_lstat_orphan_symlink_under_missing_parent_is_enoent() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut rf = (b"/real/file".len() as u32).to_le_bytes().to_vec();
+    rf.extend_from_slice(b"/real/file");
+    rf.extend_from_slice(b"data");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &rf, &mut []);
+    // /missing is never created; /missing/link -> /real is an orphan.
+    let mut s = (b"/real".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/real");
+    s.extend_from_slice(b"/missing/link");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/missing/link/file", &mut out),
+        -(abi::ENOENT as i64),
+        "orphan symlink under missing parent must not resolve (stat)"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/missing/link/file", &mut out),
+        -(abi::ENOENT as i64),
+        "orphan symlink under missing parent must not resolve (lstat)"
+    );
+    // Consistency: the no-symlink missing-parent case is also -ENOENT.
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/missing/child", &mut out),
+        -(abi::ENOENT as i64),
+        "plain missing-parent path is -ENOENT (same errno, consistent)"
+    );
+}
+
+/// Issue #134 Part 2 regression (PR #150 review): the orphan-parent
+/// guard is INTERMEDIATE-only. Following a *terminal* orphan symlink
+/// is pre-existing behavior (shared with follow_symlinks/sys_open):
+/// base stat("/missing/link") followed the link and succeeded. #134
+/// must not change that (else stat would diverge from open for
+/// terminal orphan links). Pins: stat follows (base parity), open
+/// follows (consistent), lstat reports S_IFLNK (terminal, never
+/// readlinked). The broader "reject orphan links at symlink(2)
+/// creation" is a #142 syscall-contract residual.
+#[test]
+fn stat_terminal_orphan_symlink_still_follows_base_parity() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut rf = (b"/real/file".len() as u32).to_le_bytes().to_vec();
+    rf.extend_from_slice(b"/real/file");
+    rf.extend_from_slice(b"data");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &rf, &mut []);
+    // /missing never created; /missing/link -> /real/file is a
+    // TERMINAL orphan symlink (link is the last path component).
+    let mut s = (b"/real/file".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/real/file");
+    s.extend_from_slice(b"/missing/link");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    // stat follows the terminal orphan link to /real/file (base
+    // parity — the intermediate-only guard does not fire here).
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/missing/link", &mut out),
+        16,
+        "stat must still follow a terminal orphan symlink (base parity)"
+    );
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        4,
+        "resolved /real/file is S_IFREG"
+    );
+    // open stays consistent with stat (both follow the terminal link).
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/missing/link"), &mut []);
+    assert!(
+        fd >= 0,
+        "open must still follow the terminal orphan link: {fd}"
+    );
+    // lstat: terminal, never readlinked → S_IFLNK (pre-existing).
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/missing/link", &mut out),
+        16
+    );
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "lstat reports the terminal orphan symlink as S_IFLNK"
     );
 }
