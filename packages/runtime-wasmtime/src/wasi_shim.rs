@@ -873,6 +873,9 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if oflags & 0b0010 != 0 {
                 k_flags |= 0b1000; // DIRECTORY
             }
+            if oflags & 0b0100 != 0 {
+                k_flags |= 0b10000; // EXCL
+            }
             // Build "u32 flags + '/' + relpath" — wasi-libc strips
             // the preopen prefix, we restore it.
             let req_cap = match checked_wasi_guest_sum(&[4, 1, rel.len() as u32]) {

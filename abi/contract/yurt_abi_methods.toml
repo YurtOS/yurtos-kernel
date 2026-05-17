@@ -316,7 +316,7 @@ doc = "POSIX nanosleep(req). Request bytes are 8 bytes — duration in little-en
 [method.sys_open]
 id = 0x1_001F
 kind = "syscall"
-doc = "Open a file in the in-memory ramfs. Request bytes are u32 flags LE + path bytes (no NUL terminator). Flags bitfield: bit 0 = writable (O_WRONLY/O_RDWR), bit 1 = create-if-missing (O_CREAT), bit 2 = truncate-if-exists (O_TRUNC). Read-only opens (flags=0) require a pre-installed path; CREAT installs an empty file. Returns the new fd (>=0) on success, -ENOENT if no file and no CREAT. The fd points to a fresh open-file-description; dup'd fds share its cursor (POSIX-correct)."
+doc = "Open a file in the in-memory ramfs. Request bytes are u32 flags LE + path bytes (no NUL terminator). Flags bitfield: bit 0 = writable (O_WRONLY/O_RDWR), bit 1 = create-if-missing (O_CREAT), bit 2 = truncate-if-exists (O_TRUNC), bit 3 = O_DIRECTORY, bit 4 = O_EXCL (with O_CREAT: fail -EEXIST if the path already exists). Read-only opens (flags=0) require a pre-installed path; CREAT installs an empty file. Returns the new fd (>=0) on success, -ENOENT if no file and no CREAT, -EEXIST for O_CREAT|O_EXCL on an existing path. The fd points to a fresh open-file-description; dup'd fds share its cursor (POSIX-correct)."
 
 [method.sys_lseek]
 id = 0x1_0020
@@ -601,7 +601,7 @@ doc = "POSIX fcntl(F_GETFD): read an fd's descriptor flags. Request: u32 fd LE. 
 [method.sys_openat]
 id = 0x1_0074
 kind = "syscall"
-doc = "POSIX openat(dirfd, path, flags). Request: u32 dirfd LE + u32 flags LE + path bytes. An absolute path, or dirfd == AT_FDCWD (0xFFFFFFFF in this ABI; the libc shim maps C's AT_FDCWD to it), resolves exactly like sys_open (cwd-relative). Otherwise the path is resolved against the directory fd's stored path: -ENOTDIR if dirfd is not a directory fd, -EBADF if unknown. Flags match sys_open (bit0 write, bit1 create, bit2 trunc, bit3 directory). Returns the new fd or a negated POSIX errno; -EINVAL for a short/empty request."
+doc = "POSIX openat(dirfd, path, flags). Request: u32 dirfd LE + u32 flags LE + path bytes. An absolute path, or dirfd == AT_FDCWD (0xFFFFFFFF in this ABI; the libc shim maps C's AT_FDCWD to it), resolves exactly like sys_open (cwd-relative). Otherwise the path is resolved against the directory fd's stored path: -ENOTDIR if dirfd is not a directory fd, -EBADF if unknown. Flags match sys_open (bit0 write, bit1 create, bit2 trunc, bit3 directory, bit4 O_EXCL). Returns the new fd or a negated POSIX errno; -EEXIST for O_CREAT|O_EXCL on an existing path; -EINVAL for a short/empty request."
 
 [method.sys_get_file_status_flags]
 id = 0x1_0075

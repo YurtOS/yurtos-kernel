@@ -107,6 +107,28 @@ Deno.test("path_open allocates guest fds above the preopen and fd ops map to ker
   assertEquals(new TextDecoder().decode(calls[1].request.slice(4)), "data");
 });
 
+Deno.test("path_open maps WASI O_EXCL into the kernel open flags (#68)", () => {
+  const memory = testMemory();
+  new Uint8Array(memory.buffer).set(new TextEncoder().encode("lock"), 64);
+  const calls: { method: number; request: Uint8Array }[] = [];
+  const kernel = {
+    scratchLen: 4096,
+    syscall(method: number, _pid: number, request: Uint8Array) {
+      calls.push({ method, request });
+      if (method === METHOD.SYS_OPEN) {
+        return { rc: 5n, response: new Uint8Array() };
+      }
+      return { rc: 0n, response: new Uint8Array() };
+    },
+  };
+  const shim = buildWasiShim(42, kernel as never, [], { memory });
+  // WASI oflags: CREAT=1, EXCL=4 → 5. Rights include FD_WRITE (bit 6).
+  assertEquals(shim.path_open(3, 0, 64, 4, 5, 1n << 6n, 0n, 0, 32), 0);
+  const kFlags = new DataView(calls[0].request.buffer).getUint32(0, true);
+  assertEquals(kFlags & 0b10000, 0b10000, "WASI EXCL → kernel O_EXCL bit");
+  assertEquals(kFlags & 0b010, 0b010, "CREAT still mapped alongside EXCL");
+});
+
 Deno.test("fd_fdstat_set_flags accepts descriptor flag updates as a no-op", () => {
   const memory = testMemory();
   const kernel = {
