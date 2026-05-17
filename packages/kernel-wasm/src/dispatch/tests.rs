@@ -12865,3 +12865,58 @@ fn stat_lstat_orphan_symlink_under_missing_parent_is_enoent() {
         "plain missing-parent path is -ENOENT (same errno, consistent)"
     );
 }
+
+/// Issue #134 Part 2 regression (PR #150 review): the orphan-parent
+/// guard is INTERMEDIATE-only. Following a *terminal* orphan symlink
+/// is pre-existing behavior (shared with follow_symlinks/sys_open):
+/// base stat("/missing/link") followed the link and succeeded. #134
+/// must not change that (else stat would diverge from open for
+/// terminal orphan links). Pins: stat follows (base parity), open
+/// follows (consistent), lstat reports S_IFLNK (terminal, never
+/// readlinked). The broader "reject orphan links at symlink(2)
+/// creation" is a #142 syscall-contract residual.
+#[test]
+fn stat_terminal_orphan_symlink_still_follows_base_parity() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut rf = (b"/real/file".len() as u32).to_le_bytes().to_vec();
+    rf.extend_from_slice(b"/real/file");
+    rf.extend_from_slice(b"data");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &rf, &mut []);
+    // /missing never created; /missing/link -> /real/file is a
+    // TERMINAL orphan symlink (link is the last path component).
+    let mut s = (b"/real/file".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/real/file");
+    s.extend_from_slice(b"/missing/link");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    // stat follows the terminal orphan link to /real/file (base
+    // parity — the intermediate-only guard does not fire here).
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/missing/link", &mut out),
+        16,
+        "stat must still follow a terminal orphan symlink (base parity)"
+    );
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        4,
+        "resolved /real/file is S_IFREG"
+    );
+    // open stays consistent with stat (both follow the terminal link).
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/missing/link"), &mut []);
+    assert!(
+        fd >= 0,
+        "open must still follow the terminal orphan link: {fd}"
+    );
+    // lstat: terminal, never readlinked → S_IFLNK (pre-existing).
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/missing/link", &mut out),
+        16
+    );
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "lstat reports the terminal orphan symlink as S_IFLNK"
+    );
+}

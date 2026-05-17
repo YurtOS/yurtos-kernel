@@ -613,22 +613,31 @@ fn resolve_symlinks_per_component(
         };
         // Roll `prefix` back to the link's parent ("/" + comps[..i]).
         prefix.truncate(parent_len);
-        // Don't honor an intermediate symlink whose parent directory
-        // doesn't exist (or isn't a directory). `symlink(2)`/ramfs
-        // accept a link path under a missing parent (flat key map), so
-        // an orphan `/missing/link -> /real` is constructible; without
+        // Don't traverse *through* an INTERMEDIATE symlink whose
+        // parent directory doesn't exist. `symlink(2)`/ramfs accept a
+        // link path under a missing parent (flat key map), so an
+        // orphan `/missing/link -> /real` is constructible; without
         // this, per-component resolution would traverse it and let
         // `stat("/missing/link/file")` resolve `/real/file` even
         // though `/missing` does not exist — a #134-introduced
         // expansion (terminal-only following never traversed an
         // intermediate orphan link) with an info-probing flavor. Fail
         // -ENOENT, matching the no-symlink case (`stat("/missing/x")`
-        // is already -ENOENT) and pre-#134 behavior. `prefix` is now
-        // "/" + comps[..i]; empty ⇒ the parent is root, always a dir.
-        // (POSIX `ENOTDIR`-vs-`ENOENT` precision for a non-dir parent
-        // stays the uniform-`ENOENT` lenient-contract residual → #142.)
+        // is already -ENOENT) and pre-#134 behavior.
+        //
+        // SCOPED TO INTERMEDIATE links only (`i + 1 != comps.len()`):
+        // following a *terminal* orphan symlink is pre-existing
+        // behavior shared with `follow_symlinks`/`sys_open` (base
+        // `stat("/missing/link")` followed the link and succeeded);
+        // #134 must not change that, or `stat` would diverge from
+        // `open` for terminal orphan links. Rejecting orphan links at
+        // `symlink(2)` creation, and the POSIX `ENOTDIR`-vs-`ENOENT`
+        // precision for a non-dir parent, are the broader
+        // syscall-parity residuals → #142. `prefix` is now "/" +
+        // comps[..i]; empty ⇒ parent is root, always a dir.
+        let is_terminal = i + 1 == comps.len();
         let parent: &[u8] = if prefix.is_empty() { b"/" } else { &prefix };
-        if k.vfs.entry_type(parent) != 3 {
+        if !is_terminal && k.vfs.entry_type(parent) != 3 {
             return Err(-(abi::ENOENT as i64));
         }
         // An empty symlink target resolves to -ENOENT, matching Linux
