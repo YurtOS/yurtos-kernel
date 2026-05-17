@@ -1,9 +1,13 @@
 // @yurt/runner — drives the Rust/WASM kernel through the thin h/k interface.
 //
-// Phase 1: re-exports the packaging / VFS-overlay / platform tooling extracted
-// from the old TS-kernel package. `Runner` (the Sandbox replacement) and
-// `YurtImageBuilder` are added in Phase 2.
+// `Runner` is the Sandbox replacement: it loads kernel.wasm via the
+// KernelHostInterface and runs guests with the Rust kernel as the sole
+// authority (no TS syscall fallback). Also re-exports the packaging /
+// VFS-overlay / platform tooling extracted from the old TS-kernel package.
 
+export { Runner } from "./runner.ts";
+export type { RunArgvOptions, RunnerOptions } from "./runner.ts";
+export type { MountConfig } from "./vfs-stage.ts";
 export type { RunResult } from "./run-result.ts";
 export { NodeAdapter } from "./platform/node-adapter.ts";
 export type { PlatformAdapter } from "./platform/adapter.ts";
