@@ -7961,6 +7961,106 @@ fn spec11_all_relative_ops_use_refreshed_cwd_then_enoent_when_removed() {
     );
 }
 
+// --- Slice B2.9 Task 7: removed-dir → ENOENT + rename-stability
+//     (spec tests #1, #3) ---
+
+#[test]
+fn spec1_openat_rename_stability_dod() {
+    // Spec #1 (the slice DoD): a directory fd is anchored to the
+    // directory INODE, not a path snapshot. `open("/base",O_DIRECTORY)`;
+    // `rename("/base","/renamed")` behind the still-open dirfd; then
+    // `openat(fd,"x",O_CREAT|O_WRITE)` must create the file at the
+    // CURRENT path of that inode — `/renamed/x`, NOT the stale
+    // `/base/x`. Reading `/renamed/x` back returns the bytes written.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+
+    // Rename the directory out from under the open dirfd.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/base", b"/renamed"),
+            &mut []
+        ),
+        0
+    );
+
+    // openat through the inode-anchored dirfd creates at the CURRENT
+    // path of the inode (/renamed), not the pre-rename snapshot.
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dfd, O_CREAT | O_WRITE, b"x"),
+        &mut [],
+    );
+    assert!(fd >= 3, "openat after rename returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"DoD"), &mut []),
+        3
+    );
+
+    // It really landed at /renamed/x, readable with the bytes written.
+    assert_eq!(read_abs(b"/renamed/x"), b"DoD");
+
+    // And it did NOT create the stale /base/x.
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/base/x"), &mut []),
+        -(abi::ENOENT as i64),
+        "rename-stable dirfd must not create under the pre-rename path"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/base/x", &mut [0u8; 16]),
+        -(abi::ENOENT as i64),
+        "/base/x must not exist"
+    );
+}
+
+#[test]
+fn spec3_openat_removed_dir_is_enoent_create_and_lookup() {
+    // Spec #3 (PR #63 review [P2]): a removed directory has NO linkable
+    // path (POSIX), so an inode-anchored dirfd whose directory was
+    // `rmdir`d must fail `openat` with exactly -ENOENT — for BOTH the
+    // O_CREAT path and a plain lookup. This is EXPLICITLY distinct from
+    // the rename case in spec #1 (where the inode is still live at a new
+    // path): here `dir_abspath_in` returns `None` and dispatch maps that
+    // to ENOENT before any walk / sys_open delegation.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    let dfd = open_dir(b"/d");
+
+    // Remove the directory out from under the still-open dirfd.
+    assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/d", &mut []), 0);
+
+    // O_CREAT through the removed dirfd: must NOT create under a stale
+    // or empty reconstructed path — exactly -ENOENT.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_OPENAT,
+            1,
+            &openat_req(dfd, O_CREAT | O_WRITE, b"child"),
+            &mut []
+        ),
+        -(abi::ENOENT as i64),
+        "O_CREAT through a removed inode-anchored dirfd → ENOENT"
+    );
+    // The create attempt left nothing behind anywhere.
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/d/child", &mut [0u8; 16]),
+        -(abi::ENOENT as i64),
+        "removed-dir create must not materialize a file"
+    );
+
+    // A plain lookup (no O_CREAT) through the same dirfd is likewise
+    // -ENOENT.
+    assert_eq!(
+        dispatch(METHOD_SYS_OPENAT, 1, &openat_req(dfd, 0, b"child"), &mut []),
+        -(abi::ENOENT as i64),
+        "lookup through a removed inode-anchored dirfd → ENOENT"
+    );
+}
+
 // --- Slice B2.3b: POSIX fcntl(F_GETFL/F_SETFL) — storage only ---
 
 const O_APPEND: u32 = 0x400;
