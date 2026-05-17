@@ -841,6 +841,7 @@ static int case_scm_rights_truncation(void) {
   char buf[8];
   ssize_t n;
   int received_fd = -1;
+  int recv_msg_flags = 0;
 
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
     emit("scm_rights_truncation", 1, NULL, 1, errno); return 1;
@@ -908,6 +909,7 @@ static int case_scm_rights_truncation(void) {
       for (int i = 0; i < 3; i++) close(pipefd[i][0]);
       return 1;
     }
+    recv_msg_flags = mhdr.msg_flags;
     cmsg = CMSG_FIRSTHDR(&mhdr);
     if (cmsg && cmsg->cmsg_type == SCM_RIGHTS) {
       memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
@@ -934,12 +936,19 @@ static int case_scm_rights_truncation(void) {
   n = read(pipefd[0][0], buf, sizeof(buf));
   for (int i = 0; i < 3; i++) close(pipefd[i][0]);
 
-  if (n == 2 && memcmp(buf, "ok", 2) == 0) {
-    emit("scm_rights_truncation", 0, "scm-trunc=ok", 0, 0);
-    return 0;
+  if (n != 2 || memcmp(buf, "ok", 2) != 0) {
+    emit("scm_rights_truncation", 1, "pipe-mismatch", 0, 0);
+    return 1;
   }
-  emit("scm_rights_truncation", 1, "pipe-mismatch", 0, 0);
-  return 1;
+
+  /* Strict: kernel must have flagged truncation (2 fds were dropped). */
+  if (!(recv_msg_flags & MSG_CTRUNC)) {
+    emit("scm_rights_truncation", 1, "no-ctrunc", 0, 0);
+    return 1;
+  }
+
+  emit("scm_rights_truncation", 0, "scm-trunc=ok", 0, 0);
+  return 0;
 }
 
 /* getsockopt(SO_TYPE) on a SOCK_DGRAM socket must return SOCK_DGRAM, not SOCK_STREAM. */
@@ -1215,6 +1224,63 @@ static int case_recvmsg_ctrunc_tiny_ctrl(void) {
   return 0;
 }
 
+/* P1b: recvmsg with a control buffer sized for the cmsg header only
+ * (CMSG_SPACE(0) bytes — room for the header but not a single fd) must
+ * set MSG_CTRUNC when the sender transferred ≥1 fd. */
+static int case_recvmsg_ctrunc_fdloss(void) {
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+    emit("recvmsg_ctrunc_fdloss", 1, NULL, 1, errno); return 1;
+  }
+  int pfd[2];
+  if (pipe(pfd) != 0) {
+    close(sv[0]); close(sv[1]);
+    emit("recvmsg_ctrunc_fdloss", 1, "pipe-fail", 1, errno); return 1;
+  }
+  /* Send 1 fd via SCM_RIGHTS */
+  struct iovec siov = { .iov_base = (void *)"x", .iov_len = 1 };
+  char scmsg_buf[CMSG_SPACE(sizeof(int))];
+  struct msghdr smsg = {
+    .msg_iov = &siov, .msg_iovlen = 1,
+    .msg_control = scmsg_buf, .msg_controllen = sizeof(scmsg_buf),
+  };
+  struct cmsghdr *scm = CMSG_FIRSTHDR(&smsg);
+  scm->cmsg_level = SOL_SOCKET;
+  scm->cmsg_type  = SCM_RIGHTS;
+  scm->cmsg_len   = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(scm), &pfd[0], sizeof(int));
+  smsg.msg_controllen = scm->cmsg_len;
+  if (sendmsg(sv[0], &smsg, 0) < 0) {
+    close(sv[0]); close(sv[1]); close(pfd[0]); close(pfd[1]);
+    emit("recvmsg_ctrunc_fdloss", 1, "sendmsg-fail", 1, errno); return 1;
+  }
+  close(pfd[0]); close(pfd[1]);
+  /* Receive with a control buffer sized CMSG_SPACE(0): fits the cmsg
+   * header but holds zero fd payload bytes. max_fds must be 0, so the
+   * fd is dropped and MSG_CTRUNC must be set. */
+  char hdr_only_ctrl[CMSG_SPACE(0)];
+  char rbuf[4];
+  struct iovec riov = { .iov_base = rbuf, .iov_len = sizeof(rbuf) };
+  struct msghdr rmsg2 = {
+    .msg_iov = &riov, .msg_iovlen = 1,
+    .msg_control    = hdr_only_ctrl,
+    .msg_controllen = sizeof(hdr_only_ctrl),
+  };
+  memset(hdr_only_ctrl, 0, sizeof(hdr_only_ctrl));
+  ssize_t n = recvmsg(sv[1], &rmsg2, 0);
+  close(sv[0]); close(sv[1]);
+  if (n < 0) {
+    emit("recvmsg_ctrunc_fdloss", 1, "recvmsg-fail", 1, errno); return 1;
+  }
+  /* Strict: fd was dropped into a header-only buffer; MSG_CTRUNC required. */
+  if (!(rmsg2.msg_flags & MSG_CTRUNC)) {
+    emit("recvmsg_ctrunc_fdloss", 1, "fdloss-no-ctrunc", 0, 0);
+    return 1;
+  }
+  emit("recvmsg_ctrunc_fdloss", 0, "ctrunc-fdloss=ok", 0, 0);
+  return 0;
+}
+
 /* P2: bind() on an abstract AF_UNIX address must be rejected when
  * the sandbox policy does not allow AF_UNIX (allowUnixDomain: false).
  * This case is always run with a restrictive serverSockets policy. */
@@ -1423,6 +1489,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "dgram_nonblocking_recv") == 0)     return case_dgram_nonblocking_recv();
   if (strcmp(name, "peercred_uid_gid") == 0)               return case_peercred_uid_gid();
   if (strcmp(name, "recvmsg_ctrunc_tiny_ctrl") == 0)       return case_recvmsg_ctrunc_tiny_ctrl();
+  if (strcmp(name, "recvmsg_ctrunc_fdloss") == 0)          return case_recvmsg_ctrunc_fdloss();
   if (strcmp(name, "abstract_bind_policy_denied") == 0)    return case_abstract_bind_policy_denied();
   if (strcmp(name, "stat_after_listener_close") == 0)      return case_stat_after_listener_close();
   if (strcmp(name, "stream_socknames_path") == 0)          return case_stream_socknames_path();
@@ -1455,6 +1522,7 @@ static int list_cases(void) {
   puts("dgram_nonblocking_recv");
   puts("peercred_uid_gid");
   puts("recvmsg_ctrunc_tiny_ctrl");
+  puts("recvmsg_ctrunc_fdloss");
   puts("abstract_bind_policy_denied");
   puts("stat_after_listener_close");
   puts("stream_socknames_path");

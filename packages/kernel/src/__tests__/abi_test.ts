@@ -260,7 +260,7 @@ describe("AF_UNIX (unix-canary)", () => {
     expect(result.stdout.trim()).toContain('{"case":"dgram_sendto_after_unlink","exit":0,"stdout":"dgram-unlink=ok"}');
   });
 
-  it("scm_rights_truncation: recvmsg with small control buffer receives one fd and does not crash", async () => {
+  it("scm_rights_truncation: truncated SCM_RIGHTS recvmsg must set MSG_CTRUNC and surviving fd must be usable", async () => {
     if (!HAS_UNIX_FIXTURE) return;
     const sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
@@ -330,6 +330,18 @@ describe("AF_UNIX (unix-canary)", () => {
     const result = await sandbox.run("unix-canary --case recvmsg_ctrunc_tiny_ctrl");
     expect(result.exitCode).toBe(0);
     expect(result.stdout.trim()).toContain('{"case":"recvmsg_ctrunc_tiny_ctrl","exit":0,"stdout":"ctrunc-tiny=ok"}');
+  });
+
+  it("recvmsg_ctrunc_fdloss: fd dropped into header-only ctrl buffer must set MSG_CTRUNC", async () => {
+    if (!HAS_UNIX_FIXTURE) return;
+    const sandbox = await Sandbox.create({
+      wasmDir: FIXTURES,
+      adapter: new NodeAdapter(),
+      serverSockets: { allowUnixDomain: true, unixPathAllowlist: [/^\/tmp\//] },
+    });
+    const result = await sandbox.run("unix-canary --case recvmsg_ctrunc_fdloss");
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toContain('{"case":"recvmsg_ctrunc_fdloss","exit":0,"stdout":"ctrunc-fdloss=ok"}');
   });
 
   it("abstract_bind_policy_denied: abstract AF_UNIX bind is rejected when name is not in abstract allowlist", async () => {
