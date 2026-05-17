@@ -9756,3 +9756,53 @@ fn sigprocmask_block_setmask_oset_and_kill_unmaskable() {
         -(crate::abi::EINVAL as i64)
     );
 }
+
+fn sigaltstack_req(ss: Option<(u32, i32, u32)>) -> Vec<u8> {
+    let mut r = Vec::new();
+    match ss {
+        Some((sp, fl, sz)) => {
+            r.push(1);
+            r.extend_from_slice(&sp.to_le_bytes());
+            r.extend_from_slice(&fl.to_le_bytes());
+            r.extend_from_slice(&sz.to_le_bytes());
+        }
+        None => {
+            r.push(0);
+            r.extend_from_slice(&[0u8; 12]);
+        }
+    }
+    r
+}
+
+#[test]
+fn sigaltstack_roundtrip_and_undersized_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 12];
+    // install a valid stack (size >= MINSIGSTKSZ=2048), prior was disabled
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGALTSTACK,
+            1,
+            &sigaltstack_req(Some((0x1000, 0, 4096))),
+            &mut out
+        ),
+        0
+    );
+    // query (has_ss=0) returns what we set
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGALTSTACK, 1, &sigaltstack_req(None), &mut out),
+        0
+    );
+    assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 0x1000);
+    assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 4096);
+    // undersized & not SS_DISABLE → EINVAL
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGALTSTACK,
+            1,
+            &sigaltstack_req(Some((0x2000, 0, 16))),
+            &mut out
+        ),
+        -(crate::abi::EINVAL as i64)
+    );
+}

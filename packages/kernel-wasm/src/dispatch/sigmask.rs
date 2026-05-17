@@ -7,7 +7,7 @@
 
 use super::DispatchContext;
 use crate::abi;
-use crate::kernel::with_kernel;
+use crate::kernel::{with_kernel, SigAltStack, SS_DISABLE};
 
 /// (compact_slot, &[signo...]) — slot 7 aliases three signals.
 const SLOTS: &[(u8, &[u32])] = &[
@@ -50,6 +50,8 @@ const SIG_UNBLOCK: i32 = 1;
 const SIG_SETMASK: i32 = 2;
 /// SIGKILL=9, SIGSTOP=19 — never maskable (Linux).
 const UNMASKABLE: u64 = (1u64 << (9 - 1)) | (1u64 << (19 - 1));
+/// Minimum alternate-signal-stack size (POSIX; Linux uses 2048 on most arches).
+const MINSIGSTKSZ: u32 = 2048;
 
 pub(super) fn sys_sigprocmask(ctx: DispatchContext, request: &[u8], response: &mut [u8]) -> i64 {
     if request.len() != 6 || response.is_empty() {
@@ -74,6 +76,36 @@ pub(super) fn sys_sigprocmask(ctx: DispatchContext, request: &[u8], response: &m
             t.blocked_signals = next & !UNMASKABLE;
         }
         1
+    })
+}
+
+pub(super) fn sys_sigaltstack(ctx: DispatchContext, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() != 13 || response.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let has_ss = request[0] != 0;
+    let sp = u32::from_le_bytes(request[1..5].try_into().expect("4"));
+    let flags = i32::from_le_bytes(request[5..9].try_into().expect("4"));
+    let size = u32::from_le_bytes(request[9..13].try_into().expect("4"));
+    with_kernel(|k| {
+        let p = k.process_mut(ctx.caller_pid);
+        let Some(t) = p.threads.get_mut(&ctx.caller_tid) else {
+            return -(abi::ESRCH as i64);
+        };
+        let prev = t.sigaltstack;
+        response[0..4].copy_from_slice(&prev.sp.to_le_bytes());
+        response[4..8].copy_from_slice(&prev.flags.to_le_bytes());
+        response[8..12].copy_from_slice(&prev.size.to_le_bytes());
+        if has_ss {
+            if flags & SS_DISABLE != 0 {
+                t.sigaltstack = SigAltStack::disabled();
+            } else if size < MINSIGSTKSZ {
+                return -(abi::EINVAL as i64);
+            } else {
+                t.sigaltstack = SigAltStack { sp, flags, size };
+            }
+        }
+        0
     })
 }
 
