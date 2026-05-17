@@ -180,6 +180,32 @@ pub trait VfsBackend: Send {
         0
     }
 
+    /// Stable inode of `path` iff it is a directory. `None` ⇒ this
+    /// backend does not support inode-anchored dirs (caller uses the
+    /// path-snapshot degraded mode for that mount).
+    #[allow(dead_code)] // Consumed by the inode-anchored openat walk (B2.9 Task 6).
+    fn dir_inode(&self, _path: &[u8]) -> Option<u64> {
+        None
+    }
+
+    /// Resolve ONE component `name` directly under `dir_inode`.
+    /// Returns `(child_inode, filetype)`; `filetype` is the existing
+    /// WASI byte from `entry_type` (3=DIR,4=REG,7=SYMLINK). The child
+    /// inode is `None` for symlinks (dispatch falls back to the
+    /// path-based resolver — no fake inodes).
+    #[allow(dead_code)] // Consumed by the inode-anchored openat walk (B2.9 Task 6).
+    fn resolve_at(&self, _dir_inode: u64, _name: &[u8]) -> Option<(Option<u64>, u8)> {
+        None
+    }
+
+    /// Reverse: current absolute (mount-relative) path of a live dir
+    /// inode; `None` if the inode is no longer a live directory
+    /// (rmdir/unlink) — distinct from "backend unsupported".
+    #[allow(dead_code)] // Consumed by the PathResolver cwd-refresh invariant (B2.9 Task 6).
+    fn dir_path(&self, _dir_inode: u64) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Create a hard link at `link_path` pointing at the same inode
     /// as `target`. Both paths are absolute on the backend (already
     /// stripped of any mount prefix by the dispatch layer). Returns
@@ -272,6 +298,34 @@ impl MountTable {
             path[self.mounts[i].prefix.len()..].to_vec()
         };
         Some((i as MountId, rel))
+    }
+
+    /// `(mount_id, dir_inode)` for an absolute path that is a
+    /// directory in a backend supporting inode anchoring.
+    #[allow(dead_code)] // Consumed by the inode-anchored openat walk (B2.9 Task 6).
+    pub fn dir_inode_at(&self, path: &[u8]) -> Option<(MountId, u64)> {
+        let (mid, rel) = self.resolve(path)?;
+        let ino = self.mounts[mid as usize].backend.dir_inode(&rel)?;
+        Some((mid, ino))
+    }
+
+    /// One-component resolve within `(mount_id, dir_inode)`.
+    #[allow(dead_code)] // Consumed by the inode-anchored openat walk (B2.9 Task 6).
+    pub fn resolve_at_in(
+        &self,
+        mount_id: MountId,
+        dir_inode: u64,
+        name: &[u8],
+    ) -> Option<(Option<u64>, u8)> {
+        self.mounts[mount_id as usize]
+            .backend
+            .resolve_at(dir_inode, name)
+    }
+
+    /// Live mount-relative path of `(mount_id, dir_inode)`.
+    #[allow(dead_code)] // Consumed by the PathResolver cwd-refresh invariant (B2.9 Task 6).
+    pub fn dir_path_in(&self, mount_id: MountId, dir_inode: u64) -> Option<Vec<u8>> {
+        self.mounts[mount_id as usize].backend.dir_path(dir_inode)
     }
 
     pub fn open(&mut self, path: &[u8], flags: u32) -> Option<(MountId, u64)> {
@@ -893,6 +947,14 @@ mod tests {
         let mut buf = [0u8; 8];
 
         assert_eq!(dev.read(inode, 0, &mut buf), -(crate::abi::EFAULT as i64));
+    }
+
+    #[test]
+    fn vfs_backend_dir_handle_api_defaults_to_none() {
+        let b = RamfsBackend::new();
+        assert_eq!(b.dir_inode(b"/"), None); // pre-Task-2 default
+        assert_eq!(b.resolve_at(0, b"x"), None);
+        assert_eq!(b.dir_path(0), None);
     }
 
     #[test]
