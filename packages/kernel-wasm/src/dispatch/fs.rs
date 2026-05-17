@@ -82,22 +82,12 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        // Symlink resolution: walk the path through readlink up to
-        // 40 hops (POSIX SYMLOOP_MAX). Each target is normalized and
-        // re-authorized before the next lookup so ramfs links cannot
-        // bypass procfs access checks.
-        let mut resolved: Vec<u8> = path;
-        let mut hops = 0u32;
-        while let Some(target) = k.vfs.readlink(&resolved) {
-            hops += 1;
-            if hops > 40 {
-                return -(abi::EINVAL as i64); // -ELOOP shape
-            }
-            resolved = match normalize_readable_path(k, caller_pid, &target) {
-                Ok(path) => path,
-                Err(rc) => return rc,
-            };
-        }
+        // Follow symlinks (shared with stat_path so the semantics
+        // cannot drift): up to SYMLOOP_MAX hops, each re-authorized.
+        let resolved = match follow_symlinks(k, caller_pid, path) {
+            Ok(p) => p,
+            Err(rc) => return rc,
+        };
         let path: &[u8] = &resolved;
         let entry_type = k.vfs.entry_type(path);
         if directory && entry_type != 3 {
@@ -223,6 +213,26 @@ fn normalize_readable_path(
         return Err(-(abi::EPERM as i64));
     }
     Ok(path)
+}
+
+/// Follow symlinks at `path` (already normalized) up to SYMLOOP_MAX
+/// (40) hops, re-normalizing and re-authorizing each target so a
+/// ramfs link cannot bypass procfs access checks. Returns the
+/// resolved path. The hop-limit error is kept as `-EINVAL` (the
+/// historical "-ELOOP shape"); retargeting it to `-ELOOP` is #69's
+/// separate concern. Shared by `sys_open` and `stat_path` so the
+/// follow semantics cannot drift between them.
+fn follow_symlinks(k: &mut Kernel, caller_pid: u32, path: Vec<u8>) -> Result<Vec<u8>, i64> {
+    let mut resolved = path;
+    let mut hops = 0u32;
+    while let Some(target) = k.vfs.readlink(&resolved) {
+        hops += 1;
+        if hops > 40 {
+            return Err(-(abi::EINVAL as i64));
+        }
+        resolved = normalize_readable_path(k, caller_pid, &target)?;
+    }
+    Ok(resolved)
 }
 
 /// `mkdir(path) -> 0 / -EEXIST / -EROFS`.
@@ -470,6 +480,13 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
     }
     with_kernel(|k| {
         let path = match normalize_readable_path(k, caller_pid, request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        // POSIX: stat() follows symlinks (unlike lstat). Resolve
+        // through the link chain before typing the entry, sharing
+        // sys_open's follow helper so the two cannot diverge.
+        let path = match follow_symlinks(k, caller_pid, path) {
             Ok(path) => path,
             Err(rc) => return rc,
         };

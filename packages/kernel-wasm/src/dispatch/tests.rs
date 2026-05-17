@@ -5886,6 +5886,67 @@ fn stat_unknown_path_is_enoent() {
     );
 }
 
+// #67 — stat() must follow symlinks (POSIX), unlike lstat.
+
+#[test]
+fn stat_follows_symlink_to_directory() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/d");
+    sreq.extend_from_slice(b"/l");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/l", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "stat() must follow the symlink and report S_IFDIR, not S_IFLNK"
+    );
+}
+
+#[test]
+fn stat_follows_symlink_to_regular_file() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = 2_u32.to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/f");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/f");
+    sreq.extend_from_slice(b"/lf");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/lf", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        4,
+        "S_IFREG via the followed symlink"
+    );
+    assert_eq!(
+        u64::from_le_bytes(out[0..8].try_into().unwrap()),
+        2,
+        "size is the target's, not the link's"
+    );
+}
+
+#[test]
+fn stat_on_dangling_symlink_is_enoent() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut sreq = 5_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/gone");
+    sreq.extend_from_slice(b"/dang");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/dang", &mut out),
+        -(abi::ENOENT as i64),
+        "stat() follows the link; a dangling target is ENOENT"
+    );
+}
+
 #[test]
 fn symlink_creates_link_and_readlink_returns_target() {
     let _g = crate::kernel::TestGuard::acquire();
