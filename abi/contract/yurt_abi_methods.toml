@@ -491,7 +491,7 @@ doc = "Send payload bytes and optional SCM_RIGHTS fd entries on a kernel-owned A
 [method.sys_socket_recvmsg]
 id = 0x1_0049
 kind = "syscall"
-doc = "Receive payload bytes and optional SCM_RIGHTS fd entries from a kernel-owned AF_UNIX socket. Request bytes: u32 fd LE + u32 flags LE + u32 data_cap LE. Response bytes: data_cap payload area followed by u32 fd_count LE + fd_count*u32 received fd numbers. Return value is payload byte count."
+doc = "Receive payload bytes and optional SCM_RIGHTS fd entries from a kernel-owned AF_UNIX socket. Request bytes: u32 fd LE + u32 flags LE + u32 data_cap LE. Response bytes: data_cap payload area followed by a u32 ancillary header LE then header_low31*u32 received fd numbers. The header's low 31 bits are the count of fds actually installed into the caller's fd table; bit 31 (0x8000_0000, the af-unix spec's truncated_ancillary) is set when the ancillary buffer was too small and the kernel discarded — and closed — the overflow fds. Hosts must surface bit 31 as POSIX MSG_CTRUNC (0x8) in the guest struct msghdr.msg_flags and use only the low 31 bits as the fd count. Return value is payload byte count."
 
 [method.sys_socket_info]
 id = 0x1_004A

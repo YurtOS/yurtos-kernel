@@ -58,6 +58,11 @@ const EBUSY: i64 = 16;
 const E2BIG: i64 = 7;
 const EIO: i64 = 5;
 const ENOSYS: i64 = 38;
+/// `sys_socket_recvmsg` ancillary-header truncation bit (#104 / M2):
+/// the low 31 bits are the installed SCM_RIGHTS fd count; bit 31 means
+/// the kernel discarded (closed) overflow fds and the guest must raise
+/// POSIX `MSG_CTRUNC`. Passed through verbatim to the C shim's n_fds.
+const RIGHTS_TRUNCATED: u32 = 0x8000_0000;
 const DEFAULT_EPOCH_DEADLINE: u64 = u64::MAX / 2;
 const FETCH_EXECUTOR_QUEUE_CAP: usize = 64;
 
@@ -5792,8 +5797,12 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 return -EFAULT;
             }
             let rights = &response[out_cap_len..];
-            let n_fds = u32::from_le_bytes(rights[0..4].try_into().expect("fd count"));
-            let copy_fds = n_fds.min(fds_cap);
+            // #104 (M2): the header's low 31 bits are the *installed*
+            // fd count; bit 31 (RIGHTS_TRUNCATED) flags discarded
+            // overflow that the kernel closed.
+            let header = u32::from_le_bytes(rights[0..4].try_into().expect("fd count"));
+            let installed = header & !RIGHTS_TRUNCATED;
+            let copy_fds = installed.min(fds_cap);
             if copy_fds > 0
                 && memory
                     .write(
@@ -5805,8 +5814,12 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
             {
                 return -EFAULT;
             }
+            // Pass the header through verbatim (copied count in the
+            // low 31 bits + the truncation bit) so the C shim raises
+            // MSG_CTRUNC and uses the masked count as the fd-array len.
+            let n_fds_out = copy_fds | (header & RIGHTS_TRUNCATED);
             if memory
-                .write(&mut caller, n_fds_ptr as usize, &copy_fds.to_le_bytes())
+                .write(&mut caller, n_fds_ptr as usize, &n_fds_out.to_le_bytes())
                 .is_err()
             {
                 return -EFAULT;

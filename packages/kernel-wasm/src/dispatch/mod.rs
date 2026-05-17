@@ -52,6 +52,17 @@ use socket::{
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
 
 const MSG_PEEK: u32 = 0x2;
+/// `sys_socket_recvmsg` ancillary-header truncation bit (#104 / M2).
+///
+/// The recvmsg response carries a `u32` SCM_RIGHTS fd-count field after
+/// the payload region. The low 31 bits are the count of fds the kernel
+/// actually **installed** into the caller's fd table; bit 31 is set
+/// when the ancillary buffer was too small and the kernel discarded
+/// (closed) the overflow fds. Hosts must surface this bit as POSIX
+/// `MSG_CTRUNC` (`0x8`) in the guest `struct msghdr.msg_flags`. The
+/// real installed count is always tiny (Linux caps SCM_RIGHTS at 253
+/// fds), so bit 31 can never collide with a genuine count.
+const RIGHTS_TRUNCATED: u32 = 0x8000_0000;
 const ID_NO_CHANGE: u32 = u32::MAX;
 
 /// Reserved pid for direct calls from outside any user process — i.e.

@@ -13,6 +13,11 @@ import type { KernelInstance } from "./mod.ts";
 const EFAULT = 14;
 const EINVAL = 22;
 const POLLFD_SIZE = 8;
+// sys_socket_recvmsg ancillary-header truncation bit (#104 / M2): the
+// low 31 bits are the installed SCM_RIGHTS fd count; bit 31 means the
+// kernel discarded (closed) overflow fds and the guest must raise
+// POSIX MSG_CTRUNC. Passed through verbatim to the C shim's n_fds out.
+const RIGHTS_TRUNCATED = 0x8000_0000;
 
 /**
  * Build the env-namespace import object for a user-process linker.
@@ -515,16 +520,24 @@ export function buildSysImports(
       const outRc = copyOut(outPtr, response.subarray(0, rc));
       if (outRc < 0) return outRc;
       const rights = response.subarray(outCap);
-      const nFds = new DataView(
+      // #104 (M2): the header's low 31 bits are the *installed* fd
+      // count; bit 31 (RIGHTS_TRUNCATED) flags discarded overflow.
+      const header = new DataView(
         rights.buffer,
         rights.byteOffset,
         rights.byteLength,
       )
         .getUint32(0, true);
-      const copyFds = Math.min(nFds, fdsCap);
+      const installed = header & ~RIGHTS_TRUNCATED;
+      const copyFds = Math.min(installed, fdsCap);
       const fdsRc = copyOut(fdsPtr, rights.subarray(4, 4 + copyFds * 4));
       if (fdsRc < 0) return fdsRc;
-      const countRc = copyOut(nFdsPtr, u32(copyFds));
+      // Pass the header through verbatim (copied count in the low 31
+      // bits + the truncation bit) so the C shim raises MSG_CTRUNC.
+      const countRc = copyOut(
+        nFdsPtr,
+        u32((copyFds | (header & RIGHTS_TRUNCATED)) >>> 0),
+      );
       if (countRc < 0) return countRc;
       return rc;
     },

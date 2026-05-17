@@ -42,6 +42,11 @@ const EAFNOSUPPORT = 97;
 const ENOTCONN = 107;
 const HOST_UNIX_NOT_AF_UNIX = -1;
 const HOST_ASYNC_EAGAIN = -2;
+// sys_socket_recvmsg ancillary-header truncation bit (#104 / M2): the
+// low 31 bits are the installed SCM_RIGHTS fd count; bit 31 means the
+// kernel discarded (closed) overflow fds and the guest must raise
+// POSIX MSG_CTRUNC. Passed through verbatim to the C shim's n_fds out.
+const RIGHTS_TRUNCATED = 0x8000_0000;
 
 export type ArgSpec =
   | "scalar"
@@ -1401,14 +1406,17 @@ export const HOST_BINDINGS: HostBinding[] = [
         if (outRc < 0) return outRc;
       }
       const rightsStart = bufCap >>> 0;
-      const totalFds = out.response.byteLength >= rightsStart + 4
+      // #104 (M2): the header's low 31 bits are the *installed* fd
+      // count; bit 31 (RIGHTS_TRUNCATED) flags discarded overflow.
+      const header = out.response.byteLength >= rightsStart + 4
         ? new DataView(
           out.response.buffer,
           out.response.byteOffset + rightsStart,
           4,
         ).getUint32(0, true)
         : 0;
-      const fit = Math.min(totalFds, fdsCap >>> 0);
+      const installed = header & ~RIGHTS_TRUNCATED;
+      const fit = Math.min(installed, fdsCap >>> 0);
       if (fit > 0 && fdsPtr !== 0) {
         const start = rightsStart + 4;
         const outRc = copyOut(
@@ -1419,8 +1427,15 @@ export const HOST_BINDINGS: HostBinding[] = [
         if (outRc < 0) return outRc;
       }
       if (nFdsPtr !== 0) {
+        // Pass the header through verbatim (installed count in the
+        // low 31 bits + the truncation bit) so the C shim raises
+        // MSG_CTRUNC and uses the masked count as the fd array length.
         const count = new Uint8Array(4);
-        new DataView(count.buffer).setUint32(0, totalFds, true);
+        new DataView(count.buffer).setUint32(
+          0,
+          (fit | (header & RIGHTS_TRUNCATED)) >>> 0,
+          true,
+        );
         const outRc = copyOut(memBuf, nFdsPtr, count);
         if (outRc < 0) return outRc;
       }

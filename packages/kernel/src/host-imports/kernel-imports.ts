@@ -3989,11 +3989,20 @@ export function createKernelImports(
         const anc = ancBefore ?? registry.popWaiterAnc(rawHandle);
         const view = new DataView(memory.buffer);
         let nFds = 0;
+        // #104 (M2): bit 31 of the n_fds header flags discarded
+        // (closed) overflow SCM_RIGHTS fds so the C shim raises POSIX
+        // MSG_CTRUNC. Mirrors the Rust kernel-wasm signal so the
+        // contract holds under either YURT_KERNEL backend.
+        const RIGHTS_TRUNCATED = 0x8000_0000;
+        let ancillaryTruncated = false;
         if (anc) {
           const senderPid = anc.senderPid;
           const toReceive = fdsPtr !== 0 && fdsCap > 0
             ? anc.fds.slice(0, fdsCap)
             : [];
+          if (anc.fds.length > toReceive.length) {
+            ancillaryTruncated = true;
+          }
           for (const dupFd of toReceive) {
             try {
               const newFd = opts.kernel.dupFromProcess(
@@ -4012,7 +4021,12 @@ export function createKernelImports(
             opts.kernel.closeFd(senderPid, dupFd);
           }
         }
-        if (nFdsPtr !== 0) view.setInt32(nFdsPtr, nFds, true);
+        if (nFdsPtr !== 0) {
+          const header = ancillaryTruncated
+            ? (nFds | RIGHTS_TRUNCATED) >>> 0
+            : nFds;
+          view.setInt32(nFdsPtr, header, true);
+        }
         return n;
       } catch {
         return -1;
