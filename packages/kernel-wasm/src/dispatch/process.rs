@@ -3,7 +3,7 @@ use crate::kernel::with_kernel;
 use crate::kh;
 use crate::path::PathResolver;
 
-use super::{has_buffer_capacity, inc_entry_ref, read_u32_args, ID_NO_CHANGE};
+use super::{has_buffer_capacity, inc_entry_ref, read_u32_args, take_bytes, ID_NO_CHANGE};
 
 fn requested_id_allowed(requested: u32, allowed: &[u32]) -> bool {
     requested == ID_NO_CHANGE || allowed.contains(&requested)
@@ -1238,33 +1238,33 @@ pub(super) fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     let path_len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
-    let Some(path_end) = 4usize.checked_add(path_len) else {
-        return -(abi::EINVAL as i64);
+    let (raw_path, argv_request) = match take_bytes(request, 4, path_len) {
+        Ok(parts) => parts,
+        Err(rc) => return rc,
     };
-    if request.len() < path_end {
-        return -(abi::EINVAL as i64);
-    }
-    let raw_path = &request[4..path_end];
     if raw_path.is_empty() {
         return -(abi::EINVAL as i64);
     }
     // Decode argv list from the trailing bytes.
     let mut argv: Vec<Vec<u8>> = Vec::new();
-    let mut cursor = path_end;
+    let mut cursor = 0usize;
     while cursor
         .checked_add(4)
-        .is_some_and(|end| end <= request.len())
+        .is_some_and(|end| end <= argv_request.len())
     {
-        let alen =
-            u32::from_le_bytes(request[cursor..cursor + 4].try_into().expect("4 bytes")) as usize;
+        let alen = u32::from_le_bytes(
+            argv_request[cursor..cursor + 4]
+                .try_into()
+                .expect("4 bytes"),
+        ) as usize;
         cursor += 4;
         let Some(arg_end) = cursor.checked_add(alen) else {
             return -(abi::EINVAL as i64);
         };
-        if arg_end > request.len() {
+        if arg_end > argv_request.len() {
             return -(abi::EINVAL as i64);
         }
-        argv.push(request[cursor..arg_end].to_vec());
+        argv.push(argv_request[cursor..arg_end].to_vec());
         cursor = arg_end;
     }
 

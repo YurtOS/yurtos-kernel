@@ -4,7 +4,9 @@ use crate::kernel::{
 };
 use crate::kh;
 
-use super::{close_entry, close_fd_number, has_buffer_capacity, inc_entry_ref, MSG_PEEK};
+use super::{
+    close_entry, close_fd_number, has_buffer_capacity, inc_entry_ref, take_bytes, MSG_PEEK,
+};
 
 const SOCKET_OPT_TCP_NODELAY: u32 = 1;
 const SOCKET_ADVISORY_SET_OPTIONS: &[u32] = &[
@@ -1022,14 +1024,13 @@ pub(super) fn sys_socket_sendto(caller_pid: u32, request: &[u8]) -> i64 {
     let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
     let addr_len = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) as usize;
-    let Some(data_start) = 12usize.checked_add(addr_len) else {
-        return -(abi::EINVAL as i64);
+    let (addr, data) = match take_bytes(request, 12, addr_len) {
+        Ok(parts) => parts,
+        Err(rc) => return rc,
     };
-    if flags != 0 || request.len() < data_start {
+    if flags != 0 {
         return -(abi::EINVAL as i64);
     }
-    let addr = &request[12..data_start];
-    let data = &request[data_start..];
     with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
         Ok(id) => socket_sendto_id(k, id, addr, data),
         Err(rc) => rc,
@@ -1044,6 +1045,8 @@ pub(super) fn sys_socket_sendmsg(caller_pid: u32, request: &[u8]) -> i64 {
     let data_len = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes")) as usize;
     let fd_count = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) as usize;
     let data_start = 12usize;
+    // The trailing fd-word segment needs checked multiplication, so keep this
+    // parser's three-segment layout explicit instead of forcing `take_bytes`.
     let Some(fds_start) = data_start.checked_add(data_len) else {
         return -(abi::EINVAL as i64);
     };

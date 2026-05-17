@@ -2341,6 +2341,19 @@ fn socket_sendto_rejects_wrapping_addr_len() {
 }
 
 #[test]
+fn socket_sendto_rejects_hostile_max_addr_len_without_aborting_kernel() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut request = Vec::new();
+    request.extend_from_slice(&3_u32.to_le_bytes());
+    request.extend_from_slice(&0_u32.to_le_bytes());
+    request.extend_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_SENDTO, 1, &request, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
 fn socket_option_tcp_nodelay_round_trips_on_kernel_socket() {
     let _g = crate::kernel::TestGuard::acquire();
     let fd = dispatch(
