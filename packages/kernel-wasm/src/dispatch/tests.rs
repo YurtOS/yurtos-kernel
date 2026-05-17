@@ -6836,14 +6836,23 @@ fn getrandom_fills_response_and_validates_args() {
     // Happy path: 32 bytes, no flags.
     let mut a = [0u8; 32];
     let mut b = [0u8; 32];
-    assert_eq!(dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(32, 0), &mut a), 32);
-    assert_eq!(dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(32, 0), &mut b), 32);
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(32, 0), &mut a),
+        32
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(32, 0), &mut b),
+        32
+    );
     assert!(a.iter().any(|&x| x != 0));
     assert_ne!(a, b);
 
     // GRND_NONBLOCK|GRND_RANDOM accepted (no-ops).
     let mut c = [0u8; 16];
-    assert_eq!(dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(16, 0b11), &mut c), 16);
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(16, 0b11), &mut c),
+        16
+    );
 
     // Unknown flag bit -> -EINVAL.
     assert_eq!(
