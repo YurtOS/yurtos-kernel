@@ -32,6 +32,14 @@ args = [
   { name = "out_ptr", type = "ptr" },
 ]
 
+[import.kh_random]
+doc = "Fill (out_ptr, len) with cryptographically secure random bytes from the host platform CSPRNG. Returns 0 on success or a negated errno (-EIO) on failure. Callers cap len at MAX_GUEST_BUFFER_LEN before invoking. Ungated (entropy is not privacy-sensitive)."
+return = "scalar"
+args = [
+  { name = "out_ptr", type = "ptr" },
+  { name = "len", type = "usize" },
+]
+
 # ── Real filesystem (only used by the kernel's host-fs-provider) ────────────
 
 [import.kh_real_open]

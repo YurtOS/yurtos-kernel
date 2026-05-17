@@ -6967,6 +6967,63 @@ fn p_req(fd: u32, offset: u64, data: &[u8]) -> Vec<u8> {
     req
 }
 
+fn gr_req(len: u32, flags: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(8);
+    v.extend_from_slice(&len.to_le_bytes());
+    v.extend_from_slice(&flags.to_le_bytes());
+    v
+}
+
+#[test]
+fn getrandom_fills_response_and_validates_args() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    // Happy path: 32 bytes, no flags.
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(32, 0), &mut a),
+        32
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(32, 0), &mut b),
+        32
+    );
+    assert!(a.iter().any(|&x| x != 0));
+    assert_ne!(a, b);
+
+    // GRND_NONBLOCK|GRND_RANDOM accepted (no-ops).
+    let mut c = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(16, 0b11), &mut c),
+        16
+    );
+
+    // Unknown flag bit -> -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(8, 0b100), &mut [0u8; 8]),
+        -(crate::abi::EINVAL as i64)
+    );
+
+    // Short request (<8 bytes) -> -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &[0u8; 4], &mut [0u8; 8]),
+        -(crate::abi::EINVAL as i64)
+    );
+
+    // Response smaller than len -> -EINVAL (subtraction-form guard; #65).
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(64, 0), &mut [0u8; 8]),
+        -(crate::abi::EINVAL as i64)
+    );
+
+    // Width-aware C1 (#65): u32::MAX len must not wrap/panic; clean -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(u32::MAX, 0), &mut [0u8; 8]),
+        -(crate::abi::EINVAL as i64)
+    );
+}
+
 fn open_rw(path: &[u8]) -> u32 {
     let fd = dispatch(
         METHOD_SYS_OPEN,

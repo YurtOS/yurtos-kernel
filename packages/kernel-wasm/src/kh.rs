@@ -10,6 +10,7 @@
 #[link(wasm_import_module = "kh")]
 extern "C" {
     fn kh_now_realtime(out_ptr: *mut u64) -> i32;
+    fn kh_random(out_ptr: *mut u8, len: usize) -> i32;
     fn kh_extension_invoke(
         req_ptr: *const u8,
         req_len: usize,
@@ -101,6 +102,23 @@ unsafe fn kh_now_realtime(out_ptr: *mut u64) -> i32 {
     // time well clear of zero so callers can detect "wasn't written".
     *out_ptr = 1_700_000_000_000_000_000_u64;
     0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_random(out_ptr: *mut u8, len: usize) -> i32 {
+    // Native unit-test entropy: real OS CSPRNG via /dev/urandom (std-only,
+    // no extra crate dep) so distinctness assertions are meaningful. The
+    // wasm hosts supply their own platform CSPRNG (runtime-wasmtime uses
+    // the `getrandom` crate; kernel-host-interface-js uses Web Crypto).
+    use std::io::Read;
+    if len == 0 {
+        return 0;
+    }
+    let buf = std::slice::from_raw_parts_mut(out_ptr, len);
+    match std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)) {
+        Ok(()) => 0,
+        Err(_) => -crate::abi::EIO,
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -452,6 +470,25 @@ pub fn now_realtime_ns() -> Result<u64, i32> {
     let rc = unsafe { kh_now_realtime(&mut out as *mut u64) };
     if rc == 0 {
         Ok(out)
+    } else {
+        Err(rc)
+    }
+}
+
+/// Fill `buf` with cryptographically secure random bytes from the host.
+///
+/// The single entropy entry point: `DevBackend` (`/dev/urandom`,
+/// `/dev/random`) and `sys_getrandom` both call this, so all buffer
+/// handling stays in safe Rust (AGENTS.md). There is intentionally no
+/// kernel-held RNG state — every call is a fresh host draw, which is why
+/// snapshot/restore cannot replay entropy.
+pub fn fill_random(buf: &mut [u8]) -> Result<(), i32> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let rc = unsafe { kh_random(buf.as_mut_ptr(), buf.len()) };
+    if rc == 0 {
+        Ok(())
     } else {
         Err(rc)
     }
@@ -1065,5 +1102,22 @@ mod tests {
         assert_eq!(thread_cancel(88), 0);
         assert_eq!(test_support::thread_release_calls(), vec![77]);
         assert_eq!(test_support::thread_cancel_calls(), vec![88]);
+    }
+
+    #[test]
+    fn fill_random_fills_buffer_with_entropy() {
+        let mut a = [0u8; 64];
+        let mut b = [0u8; 64];
+        fill_random(&mut a).expect("entropy available in native test stub");
+        fill_random(&mut b).expect("entropy available in native test stub");
+        // Real CSPRNG: an all-zero 64-byte draw is astronomically unlikely,
+        // and two draws must differ.
+        assert!(a.iter().any(|&x| x != 0), "buffer left all-zero");
+        assert_ne!(a, b, "two draws were identical");
+    }
+
+    #[test]
+    fn fill_random_empty_is_ok() {
+        fill_random(&mut []).expect("empty fill is a no-op success");
     }
 }

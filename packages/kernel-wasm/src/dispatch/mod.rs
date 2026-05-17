@@ -169,6 +169,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
         METHOD_SYS_PREAD => pread_fd(caller_pid, request, response),
+        METHOD_SYS_GETRANDOM => sys_getrandom(request, response),
         METHOD_SYS_PWRITE => pwrite_fd(caller_pid, request),
         METHOD_SYS_POLL => poll_fds(caller_pid, request, response),
         METHOD_SYS_ISATTY => isatty(caller_pid, request),
@@ -795,6 +796,32 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
             crate::kernel::FdEntry::Socket { id } => socket_send_id(k, id, payload),
         }
     })
+}
+
+/// POSIX getrandom(2). See `[method.sys_getrandom]` in
+/// `abi/contract/yurt_abi_methods.toml` for the wire contract. No
+/// `caller_pid` — entropy is not pid-scoped.
+fn sys_getrandom(request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let len = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as usize;
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    // Only GRND_NONBLOCK (0x1) and GRND_RANDOM (0x2) are defined; both are
+    // no-ops here. Reject unknown bits.
+    if flags & !0b11 != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    // Subtraction-form bound (issue #65 class): never `4 + len`. `usize`
+    // is 32-bit on wasm32; an oversized/wrapped `len` fails this guard
+    // rather than slicing out of bounds.
+    if response.len() < len {
+        return -(abi::EINVAL as i64);
+    }
+    match crate::kh::fill_random(&mut response[..len]) {
+        Ok(()) => len as i64,
+        Err(_) => -(abi::EIO as i64),
+    }
 }
 
 /// `pread(fd, offset)` — positional read on a regular file. Unlike
