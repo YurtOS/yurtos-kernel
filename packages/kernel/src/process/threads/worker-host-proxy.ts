@@ -379,6 +379,18 @@ export function createWorkerYurtImports(
  * goes through `serializer.run` → `tail.then(...)`, so the SAB response
  * is written at least one microtask after the handler turn (harmless —
  * the worker is parked in `Atomics.wait`).
+ *
+ * **Load-bearing invariant — no peer-pthread data dependency.** Because
+ * the serializer is strictly FIFO per process, an awaitable body MUST
+ * NOT block on something that can only be produced by a *peer pthread's
+ * serialized host-call*: that peer call is queued behind this one and
+ * can never run until this body completes → deadlock. Today this holds
+ * by construction (`socketListen` is a one-shot host-resolved await
+ * with no peer dependency; `host_poll`'s blocking loop is worker-side —
+ * each `poll` body returns immediately, releasing the lock between
+ * rounds). A future awaiting body that waits on peer progress would
+ * violate this silently with no test catching it — keep new awaiting
+ * bodies self-contained (host/main-resolved only).
  */
 export interface WorkerHostDispatcherBodies {
   threadYield(callerTid?: number): Awaitable<number>;
@@ -479,7 +491,10 @@ export interface WorkerHostDispatcherContext {
    * `serializerForBodies`), which is exactly the per-process scope —
    * `makeWorkerDispatcherBodies` returns one `bodies` per process and
    * every worker pthread of that process attaches with it. Pass this
-   * only to override that default (e.g. a custom spawner).
+   * only to override that default (e.g. a custom spawner) — and then
+   * **all-or-nothing per process**: passing an explicit serializer to
+   * some of a process's workers but not others silently splits mutual
+   * exclusion (two serializers ⇒ no cross-pthread ordering).
    */
   serializer?: WorkerHostSerializer;
 }
@@ -537,9 +552,21 @@ export function attachWorkerHostDispatcher(
     const msg = e.data;
     if (!msg || typeof msg !== "object" || msg.type !== "host-call") return;
 
-    // The worker is parked in `Atomics.wait` from before it posted this
-    // message until we notify, so its request SAB is stable across the
+    // The worker parks in `Atomics.wait` immediately after
+    // `proxy.postHostCall` (worker-side `call()`), and stays parked
+    // until we notify — so it never touches its per-thread request SAB
+    // between posting and the notify, keeping it stable across the
     // serializer queue wait and any in-body `await`.
+    //
+    // A real `Worker.addEventListener` ignores this returned promise,
+    // so a rejection here would be an *unhandled rejection* (the
+    // serializer only isolates its `tail`, not the `result` we
+    // return). That is prevented — and only prevented — by the
+    // exhaustive `try/catch` below, which never rethrows, so the run
+    // callback always resolves. Do not move an `await` outside that
+    // try, and do not make the catch rethrow, without restoring this
+    // guarantee (e.g. a defensive `.catch` here) — a real-Worker
+    // unhandled rejection would otherwise regress silently.
     return serializer.run(async () => {
       // The ENTIRE critical section — decode, dispatch, response
       // write-back, notify — is guarded. Any throw (incl. a bad-bodies
@@ -562,6 +589,15 @@ export function attachWorkerHostDispatcher(
             );
             result = 0;
             break;
+          // `subarray` (a live SAB view) vs `.slice` (a copy) differs
+          // per op below. A view is safe here because the worker is
+          // parked (it cannot rewrite its request SAB until we notify),
+          // so the bytes are stable for the body's lifetime — even
+          // across an `await`. Ops that use `.slice` do so because
+          // their body retains the buffer past the response (it is
+          // re-used for the reply payload), not for a concurrency
+          // reason. Bodies that retain `data` past their own return
+          // must still copy (worker-bodies.ts does).
           case WorkerHostOp.WriteFd: {
             const fd = payload[PAYLOAD_ARGS_WORD + 0];
             const len = payload[PAYLOAD_ARGS_WORD + 1];
@@ -649,6 +685,14 @@ export function attachWorkerHostDispatcher(
             );
             break;
           case WorkerHostOp.ThreadSpawn:
+            // Re-entrancy safety (see WorkerHostSerializer "no
+            // re-entrancy" caveat): this body runs inside `run()`, but
+            // `threadSpawn` → `tb.spawnSync` only attaches a dispatcher
+            // listener + `postMessage`s the start message and returns
+            // the new tid — it does NOT synchronously re-enter `run()`
+            // nor await child completion. If `spawnSync` ever gains a
+            // synchronous `serializer.run` on the same serializer, that
+            // self-deadlocks; keep it listener-attach-only.
             result = await bodies.threadSpawn(
               payload[PAYLOAD_ARGS_WORD + 0],
               payload[PAYLOAD_ARGS_WORD + 1],
