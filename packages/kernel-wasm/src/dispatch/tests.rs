@@ -6936,6 +6936,45 @@ fn realpath_follows_symlink_components_and_parent_traversal() {
     assert_eq!(&out[..n as usize], b"/tmp/real/file\0");
 }
 
+/// Issue #134 Part 2: pins realpath's exact pre-refactor behavior so the
+/// shared-resolver extraction is provably non-regressing. A cross-pid
+/// /proc intermediate symlink is followed by the lexical walk (no
+/// per-component gate) and then denied by realpath's single post-gate
+/// (fs.rs:430). Approach A keeps realpath on (follow_terminal=true,
+/// authorize_each=false), so this must stay GREEN unchanged.
+#[test]
+fn realpath_crosspid_proc_symlink_is_post_gated_unchanged() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // pid 2 exists with a /proc/2/cmdline.
+    set_argv(&set_argv_req(2, &[b"/bin/other"]));
+    // /tmp must exist as a real dir: resolve_realpath checks every
+    // intermediate component, so without /tmp it returns ENOENT before
+    // ever reading the symlink. mkdir also routes through
+    // normalize_readable_path, which publish_proc_snapshots() — that is
+    // what makes /proc/2/cmdline visible during the realpath walk so the
+    // post-gate (fs.rs:430) is actually reached. (Both verified
+    // empirically: without this line realpath returns -ENOENT.)
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp", &mut []), 0);
+    // /tmp/leak -> /proc/2/cmdline (absolute symlink target).
+    let target = b"/proc/2/cmdline";
+    let mut sreq = (target.len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(target);
+    sreq.extend_from_slice(b"/tmp/leak");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    // pid 1 (non-root) realpath through the link → -EPERM (post-gate).
+    let mut out = [0u8; 64];
+    assert_eq!(
+        dispatch(METHOD_SYS_REALPATH, 1, b"/tmp/leak", &mut out),
+        -(abi::EPERM as i64),
+        "realpath cross-pid /proc symlink must stay post-gated (-EPERM)"
+    );
+    // pid 2 owns /proc/2, so it resolves without needing root
+    // (can_read_proc_path allows caller == target regardless of uid).
+    let n = dispatch(METHOD_SYS_REALPATH, 2, b"/tmp/leak", &mut out);
+    assert!(n > 0, "owner (non-root) realpath resolves: {n}");
+}
+
 #[test]
 fn mkdir_creates_directory_and_readdir_lists_children() {
     let _g = crate::kernel::TestGuard::acquire();
