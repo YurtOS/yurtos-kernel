@@ -356,7 +356,11 @@ pub fn forward_request_with_user_response<S: HasCallerPid, C: HostCallCtx<S>>(
     // valid; clamp the user-visible copy so widening the scratch read in
     // `dispatch_kernel` cannot surface stale scratch to the guest.
     let n = (outcome.rc as usize).min(outcome.response.len());
-    if n > 0 && ctx.write_user_memory(user_out_ptr, &outcome.response[..n]).is_err() {
+    if n > 0
+        && ctx
+            .write_user_memory(user_out_ptr, &outcome.response[..n])
+            .is_err()
+    {
         return -EFAULT;
     }
     outcome.rc
@@ -379,7 +383,11 @@ pub fn forward_response_to_user<S: HasCallerPid, C: HostCallCtx<S>>(
     // meaningful prefix so the widened scratch read cannot leak stale
     // scratch bytes to the guest.
     let n = (outcome.rc as usize).min(outcome.response.len());
-    if n > 0 && ctx.write_user_memory(user_out_ptr, &outcome.response[..n]).is_err() {
+    if n > 0
+        && ctx
+            .write_user_memory(user_out_ptr, &outcome.response[..n])
+            .is_err()
+    {
         return -(EFAULT as i32);
     }
     outcome.rc as i32
