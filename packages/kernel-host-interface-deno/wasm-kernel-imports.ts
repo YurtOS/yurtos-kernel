@@ -192,6 +192,145 @@ const buildSchedSetAffinity: CustomBuilder =
     return Number(out.rc);
   };
 
+// ── Signal-mask custom builders ────────────────────────────────────────────
+
+// host_sigprocmask(how: i32, setPtr: u32, oldsetPtr: u32) -> i32
+// Wire request: i32 how (4 LE) + u8 has_set + u8 set = 6 bytes
+// Wire response: u8 oset (1 byte)
+const buildSigprocmask: CustomBuilder =
+  (mk, memBuf, callerPid) =>
+  async (how: number, setPtr: number, oldsetPtr: number): Promise<number> => {
+    const hasSet = setPtr !== 0 ? 1 : 0;
+    let setVal = 0;
+    if (hasSet) {
+      const buf = copyIn(memBuf, setPtr, 1);
+      if (typeof buf === "number") return buf;
+      setVal = buf[0];
+    }
+    const req = new Uint8Array(6);
+    const view = new DataView(req.buffer);
+    view.setInt32(0, how | 0, true);
+    req[4] = hasSet;
+    req[5] = setVal;
+    const out = await mk.kernelSyscallAsync(
+      METHOD.SYS_SIGPROCMASK,
+      callerPid,
+      req,
+      1,
+    );
+    const rc = Number(out.rc);
+    if (rc < 0) return rc;
+    if (oldsetPtr !== 0 && out.response.byteLength >= 1) {
+      const writeRc = copyOut(memBuf, oldsetPtr, out.response.subarray(0, 1));
+      if (writeRc < 0) return writeRc;
+    }
+    return 0;
+  };
+
+// host_sigsuspend(maskPtr: u32) -> i32
+// Wire request: u8 has_mask + u8 mask = 2 bytes; no response
+const buildSigsuspend: CustomBuilder =
+  (mk, memBuf, callerPid) =>
+  async (maskPtr: number): Promise<number> => {
+    const hasMask = maskPtr !== 0 ? 1 : 0;
+    let maskVal = 0;
+    if (hasMask) {
+      const buf = copyIn(memBuf, maskPtr, 1);
+      if (typeof buf === "number") return buf;
+      maskVal = buf[0];
+    }
+    const req = new Uint8Array(2);
+    req[0] = hasMask;
+    req[1] = maskVal;
+    const out = await mk.kernelSyscallAsync(
+      METHOD.SYS_SIGSUSPEND,
+      callerPid,
+      req,
+      0,
+    );
+    return Number(out.rc);
+  };
+
+// host_sigaltstack(ssPtr: u32, ossPtr: u32) -> i32
+// Wire request: u8 has_ss + u32 sp + i32 flags + u32 size = 13 bytes (LE)
+// Wire response: u32 sp + i32 flags + u32 size = 12 bytes
+// Guest stack_t: { void *ss_sp, int ss_flags, size_t ss_size } = ptr(4) + int(4) + u32(4) = 12 bytes
+const buildSigaltstack: CustomBuilder =
+  (mk, memBuf, callerPid) =>
+  async (ssPtr: number, ossPtr: number): Promise<number> => {
+    const hasSs = ssPtr !== 0 ? 1 : 0;
+    let sp = 0, flags = 0, size = 0;
+    if (hasSs) {
+      const buf = copyIn(memBuf, ssPtr, 12);
+      if (typeof buf === "number") return buf;
+      const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+      sp = view.getUint32(0, true);
+      flags = view.getInt32(4, true);
+      size = view.getUint32(8, true);
+    }
+    const req = new Uint8Array(13);
+    const reqView = new DataView(req.buffer);
+    req[0] = hasSs;
+    reqView.setUint32(1, sp >>> 0, true);
+    reqView.setInt32(5, flags | 0, true);
+    reqView.setUint32(9, size >>> 0, true);
+    const out = await mk.kernelSyscallAsync(
+      METHOD.SYS_SIGALTSTACK,
+      callerPid,
+      req,
+      12,
+    );
+    const rc = Number(out.rc);
+    if (rc < 0) return rc;
+    if (ossPtr !== 0 && out.response.byteLength >= 12) {
+      const writeRc = copyOut(memBuf, ossPtr, out.response.subarray(0, 12));
+      if (writeRc < 0) return writeRc;
+    }
+    return 0;
+  };
+
+// host_sigtimedwait(setPtr: u32, infoPtr: u32, timeoutPtr: u32) -> i32
+// Wire request: u8 set + u8 has_timeout + i64 tv_sec + i64 tv_nsec = 18 bytes
+// Wire response: 16 bytes siginfo { i32 si_signo, i32 si_errno, i32 si_code, i32 si_pid }
+// Guest timespec: { i64 tv_sec, i64 tv_nsec } = 16 bytes (wasm32)
+const buildSigtimedwait: CustomBuilder =
+  (mk, memBuf, callerPid) =>
+  async (setPtr: number, infoPtr: number, timeoutPtr: number): Promise<number> => {
+    const setVal = (() => {
+      if (setPtr === 0) return 0;
+      const buf = copyIn(memBuf, setPtr, 1);
+      return typeof buf === "number" ? 0 : buf[0];
+    })();
+    const hasTimeout = timeoutPtr !== 0 ? 1 : 0;
+    let tvSec = BigInt(0), tvNsec = BigInt(0);
+    if (hasTimeout) {
+      const buf = copyIn(memBuf, timeoutPtr, 16);
+      if (typeof buf === "number") return buf;
+      const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+      tvSec = view.getBigInt64(0, true);
+      tvNsec = view.getBigInt64(8, true);
+    }
+    const req = new Uint8Array(18);
+    const reqView = new DataView(req.buffer);
+    req[0] = setVal;
+    req[1] = hasTimeout;
+    reqView.setBigInt64(2, tvSec, true);
+    reqView.setBigInt64(10, tvNsec, true);
+    const out = await mk.kernelSyscallAsync(
+      METHOD.SYS_SIGTIMEDWAIT,
+      callerPid,
+      req,
+      16,
+    );
+    const rc = Number(out.rc);
+    if (rc < 0) return rc;
+    if (infoPtr !== 0 && out.response.byteLength >= 16) {
+      const writeRc = copyOut(memBuf, infoPtr, out.response.subarray(0, 16));
+      if (writeRc < 0) return writeRc;
+    }
+    return rc; // returns signo on success
+  };
+
 export interface WasmProcessThreadHost {
   spawn(tid: number, fnPtr: number, arg: number): number;
   release(handle: number): number;
@@ -1718,6 +1857,42 @@ export const HOST_BINDINGS: HostBinding[] = [
   // ── Signals ───────────────────────────────────────────────
   // sigaction(sig, actPtr, actLen) — TS host_sigaction shape.
   // Not in our common test path; left to a future expansion.
+
+  // host_sigprocmask(how, setPtr, oldsetPtr) -> i32
+  // Wire: i32 how (4B LE) + u8 has_set + u8 set = 6 bytes
+  // Response: u8 oset (1 byte); written to oldsetPtr if non-null (setPtr!=0 means has_set=1)
+  {
+    name: "host_sigprocmask",
+    method: METHOD.SYS_SIGPROCMASK,
+    args: ["scalar", "scalar", "scalar"],
+    custom: buildSigprocmask,
+  },
+  // host_sigsuspend(maskPtr) -> i32 (always -EINTR via errno)
+  // Wire: u8 has_mask + u8 mask = 2 bytes; no response
+  {
+    name: "host_sigsuspend",
+    method: METHOD.SYS_SIGSUSPEND,
+    args: ["scalar"],
+    custom: buildSigsuspend,
+  },
+  // host_sigaltstack(ssPtr, ossPtr) -> i32
+  // Wire: u8 has_ss + u32 sp + i32 flags + u32 size = 13 bytes
+  // Response: u32 sp + i32 flags + u32 size = 12 bytes; written to ossPtr if non-null
+  {
+    name: "host_sigaltstack",
+    method: METHOD.SYS_SIGALTSTACK,
+    args: ["scalar", "scalar"],
+    custom: buildSigaltstack,
+  },
+  // host_sigtimedwait(setPtr, infoPtr, timeoutPtr) -> i32 (signo or -errno)
+  // Wire: u8 set + u8 has_timeout + i64 tv_sec + i64 tv_nsec = 18 bytes
+  // Response: 16 bytes siginfo (i32 si_signo, i32 si_code, i32 si_pid, i32 si_uid, ...)
+  {
+    name: "host_sigtimedwait",
+    method: METHOD.SYS_SIGTIMEDWAIT,
+    args: ["scalar", "scalar", "scalar"],
+    custom: buildSigtimedwait,
+  },
 
   // ── Clock ─────────────────────────────────────────────────
   // host_clock_gettime(clockId, outPtr) → 8 bytes (u64 ns)

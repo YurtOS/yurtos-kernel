@@ -316,6 +316,11 @@ mod sys_method_id {
     pub const THREAD_DETACH: u32 = 0x1_0050;
     pub const THREAD_EXIT: u32 = 0x1_0051;
     pub const THREAD_YIELD: u32 = 0x1_0052;
+    // B2.9 signal-mask block — must match yurt_abi_methods.toml
+    pub const SIGPROCMASK: u32 = 0x1_00A0;
+    pub const SIGALTSTACK: u32 = 0x1_00A1;
+    pub const SIGSUSPEND: u32 = 0x1_00A2;
+    pub const SIGTIMEDWAIT: u32 = 0x1_00A3;
 }
 
 /// Reserved pid for direct calls from outside any user process — the
@@ -3537,6 +3542,145 @@ fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "host_thread_yield",
         |mut caller: Caller<'_, UserState>| -> i32 {
             thread_syscall_from_user(&mut caller, sys_method_id::THREAD_YIELD, &[], &mut []) as i32
+        },
+    )?;
+    // ── Signal-mask imports (B2.9) ────────────────────────────────────────
+    // All four are per-thread (use thread_syscall_from_user which supplies
+    // the real caller_tid from UserState). Wire formats match the Rust
+    // kernel handlers exactly — the C shims marshal the bytes, we shuttle.
+    //
+    // host_sigprocmask(how: i32, req_ptr: u32, req_len: u32, out_ptr: u32, out_cap: u32) -> i64
+    // Signature mirrors the existing generic request/response shim pattern:
+    // the caller passes a pre-marshalled 6-byte request and a 1-byte response buffer.
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_sigprocmask",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
+            let out_cap_usize = match checked_guest_buffer_len(out_cap) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut response = vec![0u8; out_cap_usize];
+            let rc = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::SIGPROCMASK,
+                &req,
+                &mut response,
+            );
+            if rc >= 0 && out_cap_usize > 0 {
+                let memory = match user_memory(&mut caller) {
+                    Ok(m) => m,
+                    Err(e) => return e,
+                };
+                if memory
+                    .write(&mut caller, out_ptr as usize, &response[..out_cap_usize])
+                    .is_err()
+                {
+                    return -EFAULT;
+                }
+            }
+            rc
+        },
+    )?;
+    // host_sigaltstack(req_ptr, req_len, out_ptr, out_cap) -> i64
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_sigaltstack",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
+            let out_cap_usize = match checked_guest_buffer_len(out_cap) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut response = vec![0u8; out_cap_usize];
+            let rc = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::SIGALTSTACK,
+                &req,
+                &mut response,
+            );
+            if rc >= 0 && out_cap_usize > 0 {
+                let memory = match user_memory(&mut caller) {
+                    Ok(m) => m,
+                    Err(e) => return e,
+                };
+                if memory
+                    .write(&mut caller, out_ptr as usize, &response[..out_cap_usize])
+                    .is_err()
+                {
+                    return -EFAULT;
+                }
+            }
+            rc
+        },
+    )?;
+    // host_sigsuspend(req_ptr, req_len) -> i64 (always -EINTR)
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_sigsuspend",
+        |mut caller: Caller<'_, UserState>, req_ptr: u32, req_len: u32| -> i64 {
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
+            thread_syscall_from_user(&mut caller, sys_method_id::SIGSUSPEND, &req, &mut [])
+        },
+    )?;
+    // host_sigtimedwait(req_ptr, req_len, out_ptr, out_cap) -> i64
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_sigtimedwait",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: u32,
+         req_len: u32,
+         out_ptr: u32,
+         out_cap: u32|
+         -> i64 {
+            let req = match read_user_guest_bytes(&mut caller, req_ptr, req_len) {
+                Ok(buf) => buf,
+                Err(rc) => return rc,
+            };
+            let out_cap_usize = match checked_guest_buffer_len(out_cap) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut response = vec![0u8; out_cap_usize];
+            let rc = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::SIGTIMEDWAIT,
+                &req,
+                &mut response,
+            );
+            if rc > 0 && out_cap_usize > 0 {
+                let memory = match user_memory(&mut caller) {
+                    Ok(m) => m,
+                    Err(e) => return e,
+                };
+                if memory
+                    .write(&mut caller, out_ptr as usize, &response[..out_cap_usize])
+                    .is_err()
+                {
+                    return -EFAULT;
+                }
+            }
+            rc
         },
     )?;
     Ok(())

@@ -127,6 +127,25 @@ struct sigaction {
 #define sa_handler __sa_handler.sa_handler
 #define sa_sigaction __sa_handler.sa_sigaction
 
+#ifndef __DEFINED_stack_t
+#define __DEFINED_stack_t
+typedef struct { void *ss_sp; int ss_flags; size_t ss_size; } stack_t;
+#endif
+#ifndef SS_ONSTACK
+#define SS_ONSTACK 1
+#endif
+#ifndef SS_DISABLE
+#define SS_DISABLE 2
+#endif
+#ifndef MINSIGSTKSZ
+#define MINSIGSTKSZ 2048
+#endif
+#ifndef SIGSTKSZ
+#define SIGSTKSZ 8192
+#endif
+_Static_assert(MINSIGSTKSZ == 2048 && SIGSTKSZ == 8192,
+               "sigaltstack constants must match the libc-port (#90 spec §6)");
+
 int sigemptyset(sigset_t *set);
 int sigfillset(sigset_t *set);
 int sigaddset(sigset_t *set, int sig);
@@ -138,6 +157,7 @@ int sigaction(int sig, const struct sigaction *restrict act, struct sigaction *r
 int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset);
 int pthread_sigmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset);
 int sigsuspend(const sigset_t *mask);
+int sigaltstack(const stack_t *restrict ss, stack_t *restrict oss);
 int sigtimedwait(const sigset_t *restrict set, siginfo_t *restrict info, const struct timespec *restrict timeout);
 int raise(int sig);
 unsigned alarm(unsigned seconds);

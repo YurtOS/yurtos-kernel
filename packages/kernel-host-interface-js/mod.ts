@@ -222,6 +222,12 @@ export const METHOD = {
   SYS_SCHED_SETAFFINITY: 0x1_005D,
   SYS_FCHOWN: 0x1_005E,
   SYS_FCHDIR: 0x1_005F,
+  // B2.9 signal-mask block (0x1_00A0–0x1_00A3). Must match
+  // abi/contract/yurt_abi_methods.toml [method.sys_sig*].
+  SYS_SIGPROCMASK: 0x1_00A0,
+  SYS_SIGALTSTACK: 0x1_00A1,
+  SYS_SIGSUSPEND: 0x1_00A2,
+  SYS_SIGTIMEDWAIT: 0x1_00A3,
 } as const;
 
 export const KERNEL_PID = 0;
@@ -580,6 +586,10 @@ const USER_YURT_STUB_IMPORTS = [
   "host_setresuid",
   "host_setrlimit",
   "host_setsid",
+  "host_sigaltstack",
+  "host_sigprocmask",
+  "host_sigtimedwait",
+  "host_sigsuspend",
   "host_setjmp",
   "host_socket_accept",
   "host_socket_addr",

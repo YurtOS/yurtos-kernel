@@ -374,4 +374,36 @@ int yurt_host_winsize(int fd, int out_ptr, int out_cap);
 __attribute__((import_module("yurt"), import_name("host_tiocsctty")))
 int yurt_host_tiocsctty(int fd);
 
+/* Signal-mask host imports (B2.9 / issue #90).
+ * All four are per-calling-thread; the caller marshals the binary request
+ * and passes a response buffer.  The kernel never does signo arithmetic —
+ * the 1-byte compact sigset_t is carried verbatim on the wire.
+ *
+ * host_sigprocmask(req_ptr, req_len, out_ptr, out_cap) -> i64
+ *   Request: i32 how (4 LE) + u8 has_set + u8 set = 6 bytes
+ *   Response: u8 oset (1 byte)
+ */
+__attribute__((import_module("yurt"), import_name("host_sigprocmask")))
+int64_t yurt_host_sigprocmask(int req_ptr, int req_len, int out_ptr, int out_cap);
+
+/* host_sigaltstack(req_ptr, req_len, out_ptr, out_cap) -> i64
+ *   Request: u8 has_ss + u32 sp + i32 flags + u32 size = 13 bytes (LE)
+ *   Response: u32 sp + i32 flags + u32 size = 12 bytes
+ */
+__attribute__((import_module("yurt"), import_name("host_sigaltstack")))
+int64_t yurt_host_sigaltstack(int req_ptr, int req_len, int out_ptr, int out_cap);
+
+/* host_sigsuspend(req_ptr, req_len) -> i64
+ *   Request: u8 has_mask + u8 mask = 2 bytes; no response (always -EINTR)
+ */
+__attribute__((import_module("yurt"), import_name("host_sigsuspend")))
+int64_t yurt_host_sigsuspend(int req_ptr, int req_len);
+
+/* host_sigtimedwait(req_ptr, req_len, out_ptr, out_cap) -> i64
+ *   Request: u8 set + u8 has_timeout + i64 tv_sec + i64 tv_nsec = 18 bytes
+ *   Response: 16 bytes { i32 si_signo, i32 si_errno, i32 si_code, i32 si_pid }
+ */
+__attribute__((import_module("yurt"), import_name("host_sigtimedwait")))
+int64_t yurt_host_sigtimedwait(int req_ptr, int req_len, int out_ptr, int out_cap);
+
 #endif

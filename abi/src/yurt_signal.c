@@ -18,6 +18,8 @@ YURT_DECLARE_MARKER(sigismember);
 YURT_DECLARE_MARKER(sigprocmask);
 YURT_DECLARE_MARKER(pthread_sigmask);
 YURT_DECLARE_MARKER(sigsuspend);
+YURT_DECLARE_MARKER(sigaltstack);
+YURT_DECLARE_MARKER(sigtimedwait);
 
 YURT_DEFINE_MARKER(signal,       0x73676e6cu) /* sgnl */
 YURT_DEFINE_MARKER(sigaction,    0x73676163u) /* sgac */
@@ -31,6 +33,8 @@ YURT_DEFINE_MARKER(sigismember,  0x7369736du) /* sism */
 YURT_DEFINE_MARKER(sigprocmask,  0x7370726du) /* sprm */
 YURT_DEFINE_MARKER(pthread_sigmask, 0x70736d6bu) /* psmk */
 YURT_DEFINE_MARKER(sigsuspend,   0x73737370u) /* sssp */
+YURT_DEFINE_MARKER(sigaltstack,  0x73616c74u) /* salt */
+YURT_DEFINE_MARKER(sigtimedwait, 0x73747764u) /* stwd */
 
 #ifndef NSIG
 #define NSIG 64
@@ -41,13 +45,10 @@ static int yurt_signal_initialized = 0;
 static unsigned yurt_alarm_seconds = 0;
 static unsigned long long yurt_signal_mask = 0;
 static unsigned long long yurt_pending_signal_mask = 0;
-static int yurt_delivering_pending_signals = 0;
-
 static int yurt_signal_validate(int sig);
 static int yurt_signal_compact_slot(int sig);
 static int yurt_sigset_mask_bit(int sig, sigset_t *bit);
 static int yurt_signal_default_terminates(int sig);
-static void yurt_signal_deliver_pending(void);
 static int yurt_raise_now(int sig);
 __attribute__((weak)) int yurt_forward_signal_to_exec_child(int sig);
 
@@ -253,32 +254,28 @@ int sigaction(int sig, const struct sigaction *restrict act, struct sigaction *r
 
 int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset) {
   YURT_MARKER_CALL(sigprocmask);
-  yurt_signal_init();
-
-  if (oldset) {
-    *oldset = (sigset_t)yurt_signal_mask;
+  /* Marshal 6-byte request: i32 how (4 LE) + u8 has_set + u8 set */
+  unsigned char req[6];
+  unsigned int how_u = (unsigned int)how;
+  req[0] = (unsigned char)(how_u & 0xffu);
+  req[1] = (unsigned char)((how_u >> 8) & 0xffu);
+  req[2] = (unsigned char)((how_u >> 16) & 0xffu);
+  req[3] = (unsigned char)((how_u >> 24) & 0xffu);
+  req[4] = (unsigned char)(set != NULL ? 1 : 0);
+  req[5] = (unsigned char)(set != NULL ? *set : 0u);
+  /* 1-byte response buffer for the prior mask */
+  unsigned char resp[1] = { 0 };
+  int64_t rc = yurt_host_sigprocmask(
+    (int)(intptr_t)req, (int)sizeof(req),
+    (int)(intptr_t)resp, (int)sizeof(resp));
+  if (rc < 0) {
+    errno = (int)(-rc);
+    return -1;
   }
-  if (set == NULL) {
-    return 0;
+  if (oldset != NULL) {
+    *oldset = (sigset_t)resp[0];
   }
-
-  switch (how) {
-    case SIG_BLOCK:
-      yurt_signal_mask |= (unsigned long long)(*set);
-      yurt_signal_deliver_pending();
-      return 0;
-    case SIG_UNBLOCK:
-      yurt_signal_mask &= ~((unsigned long long)(*set));
-      yurt_signal_deliver_pending();
-      return 0;
-    case SIG_SETMASK:
-      yurt_signal_mask = (unsigned long long)(*set);
-      yurt_signal_deliver_pending();
-      return 0;
-    default:
-      errno = EINVAL;
-      return -1;
-  }
+  return 0;
 }
 
 int pthread_sigmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset) {
@@ -287,20 +284,59 @@ int pthread_sigmask(int how, const sigset_t *restrict set, sigset_t *restrict ol
 }
 
 int sigsuspend(const sigset_t *mask) {
-  unsigned long long old_mask;
   YURT_MARKER_CALL(sigsuspend);
-
-  yurt_signal_init();
-  old_mask = yurt_signal_mask;
-  if (mask) {
-    yurt_signal_mask = (unsigned long long)(*mask);
-  }
-  yurt_signal_deliver_pending();
-  yurt_host_yield();
-  yurt_signal_mask = old_mask;
-  yurt_signal_deliver_pending();
-  errno = EINTR;
+  /* Marshal 2-byte request: u8 has_mask + u8 mask */
+  unsigned char req[2];
+  req[0] = (unsigned char)(mask != NULL ? 1 : 0);
+  req[1] = (unsigned char)(mask != NULL ? *mask : 0u);
+  int64_t rc = yurt_host_sigsuspend((int)(intptr_t)req, (int)sizeof(req));
+  errno = (int)(-rc); /* kernel always returns -EINTR */
   return -1;
+}
+
+int sigaltstack(const stack_t *restrict ss, stack_t *restrict oss) {
+  YURT_MARKER_CALL(sigaltstack);
+  /* Marshal 13-byte request: u8 has_ss + u32 sp + i32 flags + u32 size (all LE) */
+  unsigned char req[13];
+  req[0] = (unsigned char)(ss != NULL ? 1 : 0);
+  uint32_t sp    = (ss != NULL) ? (uint32_t)(uintptr_t)ss->ss_sp : 0u;
+  int32_t  flags = (ss != NULL) ? ss->ss_flags : 0;
+  uint32_t size  = (ss != NULL) ? (uint32_t)ss->ss_size : 0u;
+  req[1] = (unsigned char)(sp & 0xffu);
+  req[2] = (unsigned char)((sp >> 8) & 0xffu);
+  req[3] = (unsigned char)((sp >> 16) & 0xffu);
+  req[4] = (unsigned char)((sp >> 24) & 0xffu);
+  uint32_t fv;
+  memcpy(&fv, &flags, 4);
+  req[5] = (unsigned char)(fv & 0xffu);
+  req[6] = (unsigned char)((fv >> 8) & 0xffu);
+  req[7] = (unsigned char)((fv >> 16) & 0xffu);
+  req[8] = (unsigned char)((fv >> 24) & 0xffu);
+  req[9]  = (unsigned char)(size & 0xffu);
+  req[10] = (unsigned char)((size >> 8) & 0xffu);
+  req[11] = (unsigned char)((size >> 16) & 0xffu);
+  req[12] = (unsigned char)((size >> 24) & 0xffu);
+  /* 12-byte response: u32 sp + i32 flags + u32 size (LE) */
+  unsigned char resp[12];
+  memset(resp, 0, sizeof(resp));
+  int64_t rc = yurt_host_sigaltstack(
+    (int)(intptr_t)req, (int)sizeof(req),
+    (int)(intptr_t)resp, (int)sizeof(resp));
+  if (rc < 0) {
+    errno = (int)(-rc);
+    return -1;
+  }
+  if (oss != NULL) {
+    uint32_t resp_sp, resp_size;
+    int32_t  resp_flags;
+    memcpy(&resp_sp,    resp + 0, 4);
+    memcpy(&resp_flags, resp + 4, 4);
+    memcpy(&resp_size,  resp + 8, 4);
+    oss->ss_sp    = (void *)(uintptr_t)resp_sp;
+    oss->ss_flags = (int)resp_flags;
+    oss->ss_size  = (size_t)resp_size;
+  }
+  return 0;
 }
 
 int sigtimedwait(
@@ -308,42 +344,68 @@ int sigtimedwait(
   siginfo_t *restrict info,
   const struct timespec *restrict timeout
 ) {
-  YURT_MARKER_CALL(sigsuspend);
-  (void)timeout;
-
-  yurt_signal_init();
+  YURT_MARKER_CALL(sigtimedwait);
   if (set == NULL) {
     errno = EINVAL;
     return -1;
   }
-
-  for (int sig = 1; sig < NSIG; ++sig) {
-    unsigned long long pending_bit;
-    sigset_t mask_bit;
-    if (yurt_pending_signal_bit(sig, &pending_bit) != 0 ||
-        yurt_sigset_mask_bit(sig, &mask_bit) != 0 ||
-        ((*set & mask_bit) == 0) ||
-        ((yurt_pending_signal_mask & pending_bit) == 0)) {
-      continue;
-    }
-
-    yurt_pending_signal_mask &= ~pending_bit;
-    if (info != NULL) {
-      memset(info, 0, sizeof(*info));
-      info->si_signo = sig;
-    }
-    return sig;
+  /* Marshal 18-byte request: u8 set + u8 has_timeout + i64 tv_sec + i64 tv_nsec */
+  unsigned char req[18];
+  req[0] = *set;
+  req[1] = (unsigned char)(timeout != NULL ? 1 : 0);
+  /* tv_sec as i64 LE at offset 2 */
+  int64_t tv_sec = (timeout != NULL) ? (int64_t)timeout->tv_sec : 0;
+  int64_t tv_nsec = (timeout != NULL) ? (int64_t)timeout->tv_nsec : 0;
+  unsigned char *p = req + 2;
+  uint64_t sv;
+  memcpy(&sv, &tv_sec, 8);
+  p[0] = (unsigned char)(sv & 0xffu);
+  p[1] = (unsigned char)((sv >> 8) & 0xffu);
+  p[2] = (unsigned char)((sv >> 16) & 0xffu);
+  p[3] = (unsigned char)((sv >> 24) & 0xffu);
+  p[4] = (unsigned char)((sv >> 32) & 0xffu);
+  p[5] = (unsigned char)((sv >> 40) & 0xffu);
+  p[6] = (unsigned char)((sv >> 48) & 0xffu);
+  p[7] = (unsigned char)((sv >> 56) & 0xffu);
+  p = req + 10;
+  memcpy(&sv, &tv_nsec, 8);
+  p[0] = (unsigned char)(sv & 0xffu);
+  p[1] = (unsigned char)((sv >> 8) & 0xffu);
+  p[2] = (unsigned char)((sv >> 16) & 0xffu);
+  p[3] = (unsigned char)((sv >> 24) & 0xffu);
+  p[4] = (unsigned char)((sv >> 32) & 0xffu);
+  p[5] = (unsigned char)((sv >> 40) & 0xffu);
+  p[6] = (unsigned char)((sv >> 48) & 0xffu);
+  p[7] = (unsigned char)((sv >> 56) & 0xffu);
+  /* 16-byte response: { i32 si_signo, i32 si_errno, i32 si_code, i32 si_pid } */
+  unsigned char resp[16];
+  memset(resp, 0, sizeof(resp));
+  int64_t rc = yurt_host_sigtimedwait(
+    (int)(intptr_t)req, (int)sizeof(req),
+    (int)(intptr_t)resp, (int)sizeof(resp));
+  if (rc < 0) {
+    errno = (int)(-rc);
+    return -1;
   }
-
-  yurt_host_yield();
-  errno = EAGAIN;
-  return -1;
+  if (info != NULL) {
+    memset(info, 0, sizeof(*info));
+    /* Unpack siginfo: i32 si_signo at byte 0, i32 si_errno at 4,
+     * i32 si_code at 8, i32 si_pid at 12 (all LE) */
+    int32_t v;
+    memcpy(&v, resp + 0, 4); info->si_signo = (int)v;
+    memcpy(&v, resp + 4, 4); info->si_errno = (int)v;
+    memcpy(&v, resp + 8, 4); info->si_code  = (int)v;
+    memcpy(&v, resp + 12, 4); info->si_pid  = (pid_t)v;
+  }
+  return (int)rc; /* returns signo on success */
 }
 
 int pause(void) {
-  sigset_t mask;
-  sigprocmask(SIG_SETMASK, NULL, &mask);
-  return sigsuspend(&mask);
+  /* pause = sigsuspend with has_mask=0 (kernel keeps current mask) */
+  unsigned char req[2] = { 0, 0 };
+  int64_t rc = yurt_host_sigsuspend((int)(intptr_t)req, (int)sizeof(req));
+  errno = (int)(-rc); /* kernel always returns -EINTR */
+  return -1;
 }
 
 static int yurt_raise_now(int sig) {
@@ -388,34 +450,6 @@ static int yurt_raise_now(int sig) {
   return 0;
 }
 
-static void yurt_signal_deliver_pending(void) {
-  if (yurt_delivering_pending_signals) {
-    return;
-  }
-
-  yurt_delivering_pending_signals = 1;
-  for (;;) {
-    int delivered = 0;
-    for (int sig = 1; sig < NSIG; ++sig) {
-      unsigned long long pending_bit;
-      sigset_t mask_bit;
-      if (yurt_pending_signal_bit(sig, &pending_bit) != 0 ||
-          (yurt_pending_signal_mask & pending_bit) == 0) {
-        continue;
-      }
-      if (yurt_sigset_mask_bit(sig, &mask_bit) == 0 &&
-          (yurt_signal_mask & (unsigned long long)mask_bit) != 0) {
-        continue;
-      }
-      yurt_pending_signal_mask &= ~pending_bit;
-      yurt_raise_now(sig);
-      delivered = 1;
-      break;
-    }
-    if (!delivered) break;
-  }
-  yurt_delivering_pending_signals = 0;
-}
 
 int raise(int sig) {
   return yurt_raise_now(sig);
