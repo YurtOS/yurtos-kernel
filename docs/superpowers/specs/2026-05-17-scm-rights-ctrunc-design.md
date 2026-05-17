@@ -84,7 +84,11 @@ decoding only** and is unreachable in a correctly-sized host.
   `rights.len()`; it writes `delivered` + `SCM_TRUNCATED`. The
   sent-vs-delivered count is now expressed as the flag, not a phantom count.
 
-### 2. Host interfaces (Rust `kernel_host_interface.rs`, Deno `wasm-kernel-imports.ts`, JS `sys_shim.ts`)
+### 2a. Trailer-reading host interfaces (3) — read the new kernel.wasm trailer
+
+`packages/runtime-wasmtime/src/kernel_host_interface.rs` (Rust Wasmtime),
+`packages/kernel-host-interface-deno/wasm-kernel-imports.ts` (Deno),
+`packages/kernel-host-interface-js/sys_shim.ts` (JS). Each:
 
 - Response sizing constant `+4 → +8`.
 - Read `delivered = trailer[0..4]`, `flags = trailer[4..8]`.
@@ -93,6 +97,21 @@ decoding only** and is unreachable in a correctly-sized host.
 - Copy `copy_fds` fd words to the guest `fds_ptr`.
 - Write `n_fds_ptr = copy_fds | (truncated ? YURT_RECVMSG_CTRUNC_BIT : 0)`.
 - Return `rc` (data byte count) unchanged.
+
+### 2b. Legacy TS-kernel host import (1, architecturally distinct)
+
+`packages/kernel/src/host-imports/kernel-imports.ts` `host_socket_recvmsg`
+is the **legacy TS kernel's own** recvmsg — it does **not** call kernel.wasm
+`sys_socket_recvmsg` or read the binary trailer; it `recvAsync`s and dups
+fds from the sender directly. It already computes its own truncation
+(`anc.fds.slice(0, fdsCap)`, then closes the excess sender dups) but writes
+only the raw `nFds`. Without this it silently drops `MSG_CTRUNC` on the
+direct TS-kernel / Sandbox path. Change: when it dropped sender fds
+(`anc.fds.length > toReceive.length`, **or** `fdsPtr == 0 && anc.fds.length
+> 0`), OR `YURT_RECVMSG_CTRUNC_BIT` into the value written at `nFdsPtr`.
+This is the only edit here — the trailer contract (§1) does not apply to
+this path. (`packages/kernel/src/process/loader.ts` only wires the import
+name; no logic change.)
 
 ### 3. Constants
 
@@ -143,8 +162,17 @@ safe (set `MSG_CTRUNC`, never UB) rather than as normal-operation paths.
 - `abi/contract/*.toml` — update any documented recvmsg ancillary layout /
   field names (`fd_count` → `delivered_fd_count` + `ancillary_flags`).
 - Deno parity (`wasm-kernel-imports_test.ts`) must stay green.
-- `abi/conformance/c/unix-canary.c` — `scm_rights_truncation` and
-  `recvmsg_ctrunc_tiny_ctrl` should now observe `MSG_CTRUNC` end-to-end.
+- `abi/conformance/c/unix-canary.c` — **the existing cases do not currently
+  assert `mhdr.msg_flags & MSG_CTRUNC`** (`scm_rights_truncation` only checks
+  one fd works; `recvmsg_ctrunc_tiny_ctrl` accepts *either* `MSG_CTRUNC`
+  *or* `msg_controllen == 0`). Relying on them as-is would let the headline
+  parity regress while conformance stays green. **Required, in scope:**
+  tighten these (weak-assertion enshrined-bug update, #135 precedent) —
+  `scm_rights_truncation` must send more fds than `fds_cap` and assert
+  `MSG_CTRUNC` is set with the surviving fd usable; add/strengthen a case
+  asserting `MSG_CTRUNC` for the RLIMIT-drop path. `recvmsg_ctrunc_tiny_ctrl`
+  keeps its dual-accept only for the genuine tiny-ctrl POSIX case, and gains
+  an explicit `MSG_CTRUNC`-required assertion for the fd-loss case.
 
 ## Testing (TDD, red → green)
 
@@ -162,14 +190,29 @@ Kernel unit (`packages/kernel-wasm/src/dispatch/tests.rs`):
     offsets shift 4→8; assert the flag.
   - `socket_sendmsg_recvmsg_transfers_fd_rights`: header offset shift, flags==0.
 
-Host/guest: a guest-visible test that a truncated SCM_RIGHTS recv sets
-`MSG_CTRUNC` (conformance `scm_rights_truncation`, exercised by the
-guest-compat job); Deno parity unaffected by behavior, only layout.
+Host-shim level (required — one stale `+4` or raw-count write must be
+caught *directly* at the shim, not only via end-to-end conformance):
+
+- Rust Wasmtime (`kernel_host_interface.rs`): unit/integration test that the
+  request response buffer is sized `data_cap + 8 + fds_cap*4` and that a
+  trailer with `SCM_TRUNCATED` (and a `delivered > fds_cap` synthetic) packs
+  `YURT_RECVMSG_CTRUNC_BIT` into `n_fds_ptr`, with `copy_fds` correct.
+- Deno (`wasm-kernel-imports.ts`) and JS (`sys_shim.ts`): equivalent tests
+  for the `+8` sizing and the bit-pack/`min` decode (these run in the Deno
+  fast tier; JS path covered by its harness).
+- Legacy TS kernel (`kernel-imports.ts`): test that dropping sender fds
+  (`anc.fds.length > fdsCap`, and the `fdsPtr == 0` case) sets the bit at
+  `nFdsPtr`.
+
+Guest-visible: the tightened `unix-canary.c` cases (see Parity &
+conformance) assert `MSG_CTRUNC` end-to-end via the guest-compat job; Deno
+parity (`wasm-kernel-imports_test.ts`) green.
 
 ## Risks
 
-Broadest blast radius of the series: kernel↔host binary contract + 3 host
-shims + guest C + parity/conformance. Mitigations: reserved-bit (no import
+Broadest blast radius of the series: kernel↔host binary contract + 3
+trailer-reading host shims + the independent legacy TS-kernel import +
+guest C + parity/conformance. Mitigations: reserved-bit (no import
 signature change); the conformance suite already encodes the target
 `MSG_CTRUNC` semantics; strict TDD; the fd-capacity invariant prevents the
 only correctness-critical failure mode (orphaned installed fds).
