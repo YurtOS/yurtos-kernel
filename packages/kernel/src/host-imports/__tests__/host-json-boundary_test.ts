@@ -83,6 +83,17 @@ Deno.test("fetch ABI exposes the native host primitive without JSON helper alias
 });
 
 Deno.test("kernel and ABI boundary files do not mention JSON transport", async () => {
+  const dispatchDir = new URL(
+    "../../../../../packages/kernel-wasm/src/dispatch/",
+    import.meta.url,
+  );
+  const dispatchFiles: URL[] = [];
+  for await (const entry of Deno.readDir(dispatchDir)) {
+    if (entry.isFile && entry.name.endsWith(".rs")) {
+      dispatchFiles.push(new URL(entry.name, dispatchDir));
+    }
+  }
+
   const files = [
     new URL(
       "../../../../../abi/contract/yurt_abi_methods.toml",
@@ -92,10 +103,7 @@ Deno.test("kernel and ABI boundary files do not mention JSON transport", async (
       "../../../../../abi/contract/kernel_host_abi.toml",
       import.meta.url,
     ),
-    new URL(
-      "../../../../../packages/kernel-wasm/src/dispatch.rs",
-      import.meta.url,
-    ),
+    ...dispatchFiles,
     new URL("../../process/kernel.ts", import.meta.url),
     new URL("../kernel-imports.ts", import.meta.url),
     new URL("../../../../../abi/src/yurt_runtime.h", import.meta.url),
