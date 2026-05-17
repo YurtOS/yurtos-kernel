@@ -78,11 +78,12 @@ impl SigAltStack {
     /// Returns `true` when this alt-stack is not active.
     ///
     /// A stack marked `SS_ONSTACK` (the kernel is currently executing on it)
-    /// is considered active even if `SS_DISABLE` is also set; `SS_DISABLE`
-    /// without `SS_ONSTACK` and a zero `size` are both treated as disabled.
+    /// is considered active even if `SS_DISABLE` is also set.  Disabled state
+    /// is signaled exclusively by `SS_DISABLE` in `flags` (POSIX / Linux
+    /// `sigaltstack(2)`); `active` is signaled by `SS_ONSTACK`.
     pub fn is_disabled(&self) -> bool {
         // SS_ONSTACK means "currently in use" — override any other flag.
-        self.flags & SS_ONSTACK == 0 && (self.flags & SS_DISABLE != 0 || self.size == 0)
+        self.flags & SS_ONSTACK == 0 && self.flags & SS_DISABLE != 0
     }
 }
 
