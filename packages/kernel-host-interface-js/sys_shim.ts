@@ -10,6 +10,22 @@
 import { METHOD } from "./mod.ts";
 import type { KernelInstance } from "./mod.ts";
 
+/** Spec 2026-05-17-scm-rights-ctrunc: CTRUNC reserved bit (bit30). */
+export const YURT_RECVMSG_CTRUNC_BIT = 0x40000000;
+
+export function recvmsgPackNfds(
+  delivered: number,
+  flags: number,
+  fdsCap: number,
+): { copyFds: number; nFds: number } {
+  const copyFds = Math.min(delivered, fdsCap);
+  const truncated = (flags & 0x1) !== 0 || delivered > fdsCap;
+  return {
+    copyFds,
+    nFds: truncated ? (copyFds | YURT_RECVMSG_CTRUNC_BIT) >>> 0 : copyFds >>> 0,
+  };
+}
+
 const EFAULT = 14;
 const EINVAL = 22;
 const POLLFD_SIZE = 8;
@@ -509,22 +525,23 @@ export function buildSysImports(
       const { rc, response } = forwardRequestWithResponse(
         METHOD.SYS_SOCKET_RECVMSG,
         req,
-        outCap + 4 + fdsCap * 4,
+        outCap + 8 + fdsCap * 4,
       );
       if (rc < 0) return rc;
       const outRc = copyOut(outPtr, response.subarray(0, rc));
       if (outRc < 0) return outRc;
       const rights = response.subarray(outCap);
-      const nFds = new DataView(
+      const rdv = new DataView(
         rights.buffer,
         rights.byteOffset,
         rights.byteLength,
-      )
-        .getUint32(0, true);
-      const copyFds = Math.min(nFds, fdsCap);
-      const fdsRc = copyOut(fdsPtr, rights.subarray(4, 4 + copyFds * 4));
+      );
+      const delivered = rdv.getUint32(0, true);
+      const flags = rdv.getUint32(4, true);
+      const { copyFds, nFds } = recvmsgPackNfds(delivered, flags, fdsCap);
+      const fdsRc = copyOut(fdsPtr, rights.subarray(8, 8 + copyFds * 4));
       if (fdsRc < 0) return fdsRc;
-      const countRc = copyOut(nFdsPtr, u32(copyFds));
+      const countRc = copyOut(nFdsPtr, u32(nFds));
       if (countRc < 0) return countRc;
       return rc;
     },
