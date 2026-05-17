@@ -7408,6 +7408,38 @@ fn sys_thread_spawn_allocates_tid_and_calls_host() {
     assert_eq!(worker.host_thread_handle, Some(77));
 }
 
+// #71 Low / #110 — sys_thread_spawn must not leak the host thread
+// handle when bind_thread_handle fails (it cancelled but never
+// released it).
+#[test]
+fn sys_thread_spawn_releases_host_handle_on_bind_failure() {
+    let _g = crate::kernel::TestGuard::acquire();
+    kh::test_support::reset_thread_mock();
+    kh::test_support::push_thread_spawn_result(55);
+    crate::kernel::with_kernel(|k| {
+        k.insert_host_process(9, 0, vec![b"/bin/t".to_vec()], Some(10));
+        // Occupy the tid (2) the next reserve will hand out so the
+        // spawn's bind_thread_handle fails with EEXIST.
+        k.bind_thread_handle(9, 2, None).expect("pre-occupy tid 2");
+    });
+
+    let mut req = 1u32.to_le_bytes().to_vec();
+    req.extend_from_slice(&2u32.to_le_bytes());
+    let rc = dispatch(METHOD_SYS_THREAD_SPAWN, 9, &req, &mut []);
+    assert!(rc < 0, "bind EEXIST must surface an error, got {rc}");
+
+    assert!(
+        kh::test_support::thread_cancel_calls().contains(&55),
+        "the leaked thread should still be cancelled"
+    );
+    assert!(
+        kh::test_support::thread_release_calls().contains(&55),
+        "bind-error path must RELEASE the host thread handle, not \
+         just cancel it (releases seen: {:?})",
+        kh::test_support::thread_release_calls()
+    );
+}
+
 #[test]
 fn sys_thread_join_preserves_high_bit_retval() {
     let _g = crate::kernel::TestGuard::acquire();
