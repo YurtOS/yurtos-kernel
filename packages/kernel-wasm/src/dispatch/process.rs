@@ -1221,12 +1221,12 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
             // "fix" this asymmetry here without changing sys_wait too.
             k.process_mut(caller_pid).children.retain(|&c| c != pid);
         }
-        // Decode the kernel/host $?-style status: a value in
-        // [128, 192) is "killed by signal (status - 128)"; anything
-        // else is a normal exit with that code. CLD_DUMPED is not
-        // expressible — the 8-byte wait record carries no core-dump
-        // bit (tracked in the B1.2 follow-up).
-        let (si_code, si_status) = if (128..192).contains(&status) {
+        // Decode the kernel/host $?-style status: values 129..=192
+        // are "killed by signal (status - 128)" for signals 1..=64.
+        // Anything else is a normal exit with that code. CLD_DUMPED is
+        // not expressible — the 8-byte wait record carries no
+        // core-dump bit (tracked in the B1.2 follow-up).
+        let (si_code, si_status) = if (129..=192).contains(&status) {
             (CLD_KILLED, status - 128)
         } else {
             (CLD_EXITED, status)
