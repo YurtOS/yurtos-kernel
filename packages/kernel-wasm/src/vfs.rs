@@ -922,6 +922,14 @@ impl VfsBackend for RamfsBackend {
         if old_path == new_path {
             return 0;
         }
+        // The root dir inode backs the global cwd/dirfd anchor; it can
+        // never be moved (POSIX rename of "/" is EBUSY). Without this
+        // guard, renaming "/" re-keys inode 0 to the new path and
+        // orphans every top-level entry. (rename ONTO "/" is already
+        // refused EEXIST by the dir-destination check below.)
+        if old_path == b"/" {
+            return -(crate::abi::EBUSY as i64) as i32;
+        }
         // Source must exist (regular file, symlink, or directory).
         let src_kind = if self.paths.contains_key(old_path) {
             1u8
@@ -1059,6 +1067,13 @@ impl VfsBackend for RamfsBackend {
     }
 
     fn rmdir(&mut self, path: &[u8]) -> i32 {
+        // The root dir inode backs the global cwd/dirfd anchor; it can
+        // never be freed (POSIX `rmdir("/")` is EBUSY). Without this
+        // an empty ramfs would fall through the emptiness walk below
+        // and delete dir_inodes["/"]/dir_paths[0].
+        if path == b"/" {
+            return -crate::abi::EBUSY;
+        }
         if !self.dir_inodes.contains_key(path) {
             return -crate::abi::ENOENT; // (or ENOTDIR for a regular file)
         }
@@ -1237,6 +1252,30 @@ mod tests {
         assert_eq!(b.dir_inode(b"/a/b/c"), None);
         assert_eq!(b.paths.get(b"/a/f".as_slice()).copied(), Some(file_ino));
         assert_eq!(b.entry_type(b"/a/b/c/f"), 0);
+    }
+
+    #[test]
+    fn ramfs_root_is_protected_from_rmdir_and_rename() {
+        // The root dir inode (id 0) backs the global cwd/dirfd
+        // inode-anchor invariant: every Process::new default cwd and
+        // `dir_inode_at("/")` resolve through it. `rmdir("/")` /
+        // `rename("/", …)` must NOT be able to free or move it (POSIX
+        // EBUSY), or the anchor breaks process-wide.
+        let mut b = RamfsBackend::new();
+        let root = b.dir_inode(b"/").expect("root inode exists");
+
+        // rmdir("/") on an empty ramfs would otherwise fall through
+        // the emptiness walk and delete dir_inodes["/"]/dir_paths[0].
+        assert_eq!(b.rmdir(b"/"), -(crate::abi::EBUSY as i64) as i32);
+        assert_eq!(b.dir_inode(b"/"), Some(root), "root survives rmdir(/)");
+        assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
+
+        // rename("/", "/new") would otherwise re-key inode 0 to /new
+        // and orphan every top-level entry.
+        assert_eq!(b.rename(b"/", b"/new"), -(crate::abi::EBUSY as i64) as i32);
+        assert_eq!(b.dir_inode(b"/"), Some(root), "root inode unchanged");
+        assert_eq!(b.dir_inode(b"/new"), None, "no phantom /new anchor");
+        assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
     }
 
     #[test]
