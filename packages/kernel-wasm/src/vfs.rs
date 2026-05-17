@@ -755,11 +755,13 @@ impl VfsBackend for DevBackend {
         if dir_inode != DEV_ROOT_INODE {
             return None;
         }
-        // Hardcoded /dev table. Both are regular device files (WASI
-        // filetype 4); no subdirectories or symlinks in /dev.
+        // Hardcoded /dev table. All entries are regular device files
+        // (WASI filetype 4); no subdirectories or symlinks in /dev.
         match name {
             b"null" => Some((Some(DEV_NULL_INODE), 4)),
             b"zero" => Some((Some(DEV_ZERO_INODE), 4)),
+            b"urandom" => Some((Some(DEV_URANDOM_INODE), 4)),
+            b"random" => Some((Some(DEV_RANDOM_INODE), 4)),
             _ => None,
         }
     }
@@ -930,6 +932,13 @@ impl VfsBackend for RamfsBackend {
         } else {
             return -(crate::abi::ENOENT as i64) as i32;
         };
+        if src_kind == 3 {
+            let mut descendant_prefix = old_path.to_vec();
+            descendant_prefix.push(b'/');
+            if new_path.starts_with(&descendant_prefix) {
+                return -(crate::abi::EINVAL as i64) as i32;
+            }
+        }
         // Destination handling: refuse if it's a directory (POSIX
         // requires the destination be empty, and we don't yet
         // walk children to check). Replace a regular file by
@@ -1210,6 +1219,27 @@ mod tests {
     }
 
     #[test]
+    fn ramfs_dir_rename_into_own_descendant_is_einval() {
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.mkdir(b"/a"), 0);
+        assert_eq!(b.mkdir(b"/a/b"), 0);
+        let a_ino = b.dir_inode(b"/a").unwrap();
+        let b_ino = b.dir_inode(b"/a/b").unwrap();
+        let file_ino = b.install(b"/a/f".to_vec(), b"x".to_vec());
+
+        assert_eq!(
+            b.rename(b"/a", b"/a/b/c"),
+            -(crate::abi::EINVAL as i64) as i32
+        );
+
+        assert_eq!(b.dir_inode(b"/a"), Some(a_ino));
+        assert_eq!(b.dir_inode(b"/a/b"), Some(b_ino));
+        assert_eq!(b.dir_inode(b"/a/b/c"), None);
+        assert_eq!(b.paths.get(b"/a/f".as_slice()).copied(), Some(file_ino));
+        assert_eq!(b.entry_type(b"/a/b/c/f"), 0);
+    }
+
+    #[test]
     fn ramfs_resolve_at_classifies_children() {
         let mut b = RamfsBackend::new();
         assert_eq!(b.mkdir(b"/d"), 0);
@@ -1323,9 +1353,17 @@ mod tests {
         let b = DevBackend::new();
         let root = b.dir_inode(b"/").expect("dev root has a fixed dir inode");
 
-        // /dev/null and /dev/zero are regular device files.
+        // /dev/null, /dev/zero, and random devices are regular device files.
         assert_eq!(b.resolve_at(root, b"null"), Some((Some(DEV_NULL_INODE), 4)));
         assert_eq!(b.resolve_at(root, b"zero"), Some((Some(DEV_ZERO_INODE), 4)));
+        assert_eq!(
+            b.resolve_at(root, b"urandom"),
+            Some((Some(DEV_URANDOM_INODE), 4))
+        );
+        assert_eq!(
+            b.resolve_at(root, b"random"),
+            Some((Some(DEV_RANDOM_INODE), 4))
+        );
         // Unknown child → None.
         assert_eq!(b.resolve_at(root, b"missing"), None);
 
