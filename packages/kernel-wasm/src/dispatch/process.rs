@@ -1279,7 +1279,7 @@ pub(super) fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
         while let Some(target) = k.vfs.readlink(&exec_path) {
             hops += 1;
             if hops > 40 {
-                return -(abi::EINVAL as i64);
+                return -(abi::ELOOP as i64);
             }
             exec_path = target;
         }

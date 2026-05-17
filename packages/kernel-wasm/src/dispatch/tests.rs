@@ -9508,3 +9508,26 @@ fn shutdown_wr_gives_unix_datagram_peer_recvfrom_eof_after_drain() {
         "recvfrom must observe EOF after peer SHUT_WR (consistent with recv)"
     );
 }
+
+#[test]
+fn sys_open_returns_eloop_on_symlink_cycle() {
+    // Issue #69 / holistic review H4: symlink-loop resolution must return
+    // -ELOOP (40), not -EINVAL (22). musl / coreutils / Rust std
+    // fs::canonicalize special-case ELOOP and otherwise mis-report
+    // "Invalid argument" instead of "Too many levels of symbolic links".
+    let _g = crate::kernel::TestGuard::acquire();
+
+    // Self-referential symlink: every readlink hop walks back to itself
+    // until the SYMLOOP_MAX (40) cap fires.
+    let link: &[u8] = b"/sym-loop";
+    let mut symlink_req = (link.len() as u32).to_le_bytes().to_vec();
+    symlink_req.extend_from_slice(link);
+    symlink_req.extend_from_slice(link);
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &symlink_req, &mut []), 0);
+
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, link), &mut []),
+        -(abi::ELOOP as i64),
+        "self-referential symlink must hit SYMLOOP_MAX and return -ELOOP",
+    );
+}

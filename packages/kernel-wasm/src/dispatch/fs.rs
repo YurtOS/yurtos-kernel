@@ -91,7 +91,7 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
         while let Some(target) = k.vfs.readlink(&resolved) {
             hops += 1;
             if hops > 40 {
-                return -(abi::EINVAL as i64); // -ELOOP shape
+                return -(abi::ELOOP as i64);
             }
             resolved = match normalize_readable_path(k, caller_pid, &target) {
                 Ok(path) => path,

@@ -146,7 +146,7 @@ fn resolve_realpath(k: &mut Kernel, cwd: &[u8], path: &[u8]) -> Result<Vec<u8>, 
         if let Some(target) = k.vfs.readlink(&candidate) {
             hops += 1;
             if hops > 40 {
-                return Err(abi::EINVAL);
+                return Err(abi::ELOOP);
             }
             let target_path = if target.starts_with(b"/") {
                 target
