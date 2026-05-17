@@ -1,5 +1,7 @@
 use crate::abi;
-use crate::kernel::{with_kernel, FdEntry, Kernel, SocketEntry, SocketKind, UnixDatagramPacket};
+use crate::kernel::{
+    with_kernel, FdEntry, Kernel, PeerCred, SocketEntry, SocketKind, UnixDatagramPacket,
+};
 use crate::kh;
 
 use super::{close_entry, close_fd_number, has_buffer_capacity, inc_entry_ref, MSG_PEEK};
@@ -105,13 +107,43 @@ fn is_ipv4_sockaddr(addr: &[u8]) -> bool {
     matches!(sockaddr_family(addr), Some(2)) && addr.len() >= 16
 }
 
+/// sockaddr_in6 is 28 bytes: family(2) + port(2) + flowinfo(4) +
+/// addr(16) + scope_id(4). AF_INET6 = 10 (Linux).
+fn is_ipv6_sockaddr(addr: &[u8]) -> bool {
+    matches!(sockaddr_family(addr), Some(10)) && addr.len() >= 28
+}
+
+/// An inet sockaddr the kernel will forward to the host adapter: an
+/// AF_INET socket with a v4 sockaddr, or an AF_INET6 socket with a v6
+/// sockaddr. The family must match the socket domain — mismatches stay
+/// EAFNOSUPPORT, so the v4 path is unchanged (additive).
+fn inet_sockaddr_ok(domain: u8, addr: &[u8]) -> bool {
+    (domain == 2 && is_ipv4_sockaddr(addr)) || (domain == 10 && is_ipv6_sockaddr(addr))
+}
+
 fn any_addr_ipv4_sockaddr() -> [u8; 16] {
     let mut addr = [0u8; 16];
     addr[0..2].copy_from_slice(&2u16.to_le_bytes());
     addr
 }
 
+fn any_addr_ipv6_sockaddr() -> [u8; 28] {
+    let mut addr = [0u8; 28];
+    addr[0..2].copy_from_slice(&10u16.to_le_bytes());
+    addr
+}
+
 pub(super) fn socket_send_id(k: &mut Kernel, id: u64, data: &[u8]) -> i64 {
+    // shutdown(SHUT_WR): the write half is closed → EPIPE. (B3.1)
+    // No `socket(id).is_some()` existence guard is needed here (unlike
+    // socket_recv_id): the shutdown side-map is cleared when the socket
+    // id is truly destroyed (socket_dec_ref refs==0 + reset_for_tests)
+    // and socket ids are monotonic / never reused, so a set bit always
+    // implies a live socket. The send path below still returns EBADF
+    // for a missing id regardless.
+    if k.socket_shutdown_bits(id) & 0b10 != 0 {
+        return -(abi::EPIPE as i64);
+    }
     enum UnixPeer {
         Stream(u64, bool),
         Datagram(u64, bool),
@@ -175,6 +207,11 @@ pub(super) fn socket_send_id(k: &mut Kernel, id: u64, data: &[u8]) -> i64 {
 }
 
 fn socket_sendto_id(k: &mut Kernel, id: u64, addr: &[u8], data: &[u8]) -> i64 {
+    // shutdown(SHUT_WR): the write half is closed → EPIPE. (B3.1;
+    // applied here too so sendto is consistent with send.)
+    if k.socket_shutdown_bits(id) & 0b10 != 0 {
+        return -(abi::EPIPE as i64);
+    }
     let Some(path) = unix_path_from_addr(addr) else {
         return -(abi::EINVAL as i64);
     };
@@ -256,6 +293,11 @@ fn install_fd_rights_truncated(
 }
 
 fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>) -> i64 {
+    // shutdown(SHUT_WR): the write half is closed → EPIPE. (B3.1;
+    // applied here too so sendmsg is consistent with send/sendto.)
+    if k.socket_shutdown_bits(id) & 0b10 != 0 {
+        return -(abi::EPIPE as i64);
+    }
     let mut rights = Some(rights);
     let rc = match k.socket(id).map(|socket| &socket.kind) {
         Some(SocketKind::UnixStream {
@@ -337,6 +379,14 @@ fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>)
 }
 
 pub(super) fn socket_recv_id(k: &mut Kernel, id: u64, response: &mut [u8], flags: u32) -> i64 {
+    // shutdown(SHUT_RD): the read half is closed → EOF. (B3.1)
+    if k.socket(id).is_some() && k.socket_shutdown_bits(id) & 0b01 != 0 {
+        return 0;
+    }
+    // The connected peer did shutdown(SHUT_WR): deliver any queued
+    // bytes, then EOF (POSIX). Unlike local SHUT_RD this does NOT
+    // discard the rx — only an empty rx becomes EOF instead of EAGAIN.
+    let peer_wr_closed = k.socket(id).is_some() && k.socket_peer_write_closed(id);
     let Some(socket) = k.socket_mut(id) else {
         return -(abi::EBADF as i64);
     };
@@ -349,7 +399,11 @@ pub(super) fn socket_recv_id(k: &mut Kernel, id: u64, response: &mut [u8], flags
                 return -(abi::EOPNOTSUPP as i64);
             }
             let Some(packet) = rx.front() else {
-                return if *peer_open { -(abi::EAGAIN as i64) } else { 0 };
+                return if *peer_open && !peer_wr_closed {
+                    -(abi::EAGAIN as i64)
+                } else {
+                    0
+                };
             };
             let take = packet.data.len().min(response.len());
             response[..take].copy_from_slice(&packet.data[..take]);
@@ -363,7 +417,11 @@ pub(super) fn socket_recv_id(k: &mut Kernel, id: u64, response: &mut [u8], flags
                 return -(abi::EOPNOTSUPP as i64);
             }
             if rx.is_empty() {
-                return if *peer_open { -(abi::EAGAIN as i64) } else { 0 };
+                return if *peer_open && !peer_wr_closed {
+                    -(abi::EAGAIN as i64)
+                } else {
+                    0
+                };
             }
             let take = rx.len().min(response.len());
             if flags == MSG_PEEK {
@@ -413,6 +471,7 @@ pub(super) fn sys_socket_listen(caller_pid: u32, request: &[u8]) -> i64 {
         let addr = match addr {
             Some(addr) => addr,
             None if matches!(domain, 2) => any_addr_ipv4_sockaddr().to_vec(),
+            None if matches!(domain, 10) => any_addr_ipv6_sockaddr().to_vec(),
             None => return -(abi::EINVAL as i64),
         };
         if let Some(path) = unix_path_from_addr(&addr) {
@@ -429,12 +488,15 @@ pub(super) fn sys_socket_listen(caller_pid: u32, request: &[u8]) -> i64 {
             return handle as i64;
         }
         match k.socket_mut(id) {
-            Some(socket) => {
-                socket.kind = SocketKind::Host { handle };
-                0
-            }
-            None => -(abi::EBADF as i64),
+            Some(socket) => socket.kind = SocketKind::Host { handle },
+            None => return -(abi::EBADF as i64),
         }
+        // Open→Host: a freshly listening host socket has no half-close
+        // state. Drop any bits a pre-listen shutdown() recorded on the
+        // Open socket so a stale SHUT_* cannot poison the live Host
+        // connection (recv→EOF / send→EPIPE). (PR #58 review P2)
+        k.socket_shutdown_clear(id);
+        0
     })
 }
 
@@ -635,6 +697,36 @@ pub(super) fn sys_socket_info(caller_pid: u32, request: &[u8], response: &mut [u
     SOCKET_INFO_SIZE as i64
 }
 
+/// SO_PEERCRED. Request: u32 fd LE. Response: 12 bytes —
+/// i32 pid + i32 uid + i32 gid (LE). Mirrors the TS
+/// `host_socket_peercred`: any socket fd succeeds with `0`; sockets
+/// with no captured peer (non-UnixStream) report zeros (TS `?? 0`).
+pub(super) fn sys_socket_peercred(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    const UCRED_SIZE: usize = 12;
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    if response.len() < UCRED_SIZE {
+        return UCRED_SIZE as i64;
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let cred = with_kernel(|k| {
+        let id = socket_id_for_fd(k, caller_pid, fd)?;
+        Ok(match k.socket(id).map(|socket| &socket.kind) {
+            Some(SocketKind::UnixStream { peer_cred, .. }) => *peer_cred,
+            _ => PeerCred::default(),
+        })
+    });
+    let cred = match cred {
+        Ok(cred) => cred,
+        Err(rc) => return rc,
+    };
+    response[0..4].copy_from_slice(&(cred.pid as i32).to_le_bytes());
+    response[4..8].copy_from_slice(&(cred.uid as i32).to_le_bytes());
+    response[8..12].copy_from_slice(&(cred.gid as i32).to_le_bytes());
+    UCRED_SIZE as i64
+}
+
 /// `sys_socket_connect(fd, addr_bytes) -> 0`. Request layout:
 /// u32 fd LE + POSIX sockaddr bytes.
 pub(super) fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
@@ -647,6 +739,7 @@ pub(super) fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
+        let peer_cred = k.peer_cred_for(caller_pid);
         let id = match socket_id_for_fd(k, caller_pid, fd) {
             Ok(id) => id,
             Err(rc) => return rc,
@@ -671,7 +764,7 @@ pub(super) fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
         };
         if matches!(domain, 1 | 3) && matches!(sock_type, 1 | 6) {
             if let Some(path) = unix_path_from_addr(addr) {
-                return match k.connect_unix_stream(path) {
+                return match k.connect_unix_stream(path, peer_cred) {
                     Ok(new_id) => {
                         replace_socket_fd(k, caller_pid, fd, id, new_id);
                         0
@@ -683,7 +776,7 @@ pub(super) fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
         if unix_path_from_addr(addr).is_some() {
             return -(abi::EAFNOSUPPORT as i64);
         }
-        if !matches!(domain, 2) || !is_ipv4_sockaddr(addr) {
+        if !inet_sockaddr_ok(domain, addr) {
             return -(abi::EAFNOSUPPORT as i64);
         }
         let handle = kh::socket_connect(addr, flags);
@@ -691,12 +784,15 @@ pub(super) fn sys_socket_connect(caller_pid: u32, request: &[u8]) -> i64 {
             return handle as i64;
         }
         match k.socket_mut(id) {
-            Some(socket) => {
-                socket.kind = SocketKind::Host { handle };
-                0
-            }
-            None => -(abi::EBADF as i64),
+            Some(socket) => socket.kind = SocketKind::Host { handle },
+            None => return -(abi::EBADF as i64),
         }
+        // Open→Host: a freshly connected host socket has no half-close
+        // state. Drop any bits a pre-connect shutdown() recorded on the
+        // Open socket so a stale SHUT_* cannot poison the live Host
+        // connection (recv→EOF / send→EPIPE). (PR #58 review P2)
+        k.socket_shutdown_clear(id);
+        0
     })
 }
 
@@ -770,6 +866,15 @@ pub(super) fn sys_socket_recvfrom(caller_pid: u32, request: &[u8], response: &mu
             Ok(id) => id,
             Err(rc) => return rc,
         };
+        // shutdown(SHUT_RD): the read half is closed → EOF. (B3.1;
+        // applied here too so recvfrom is consistent with recv.)
+        if k.socket(id).is_some() && k.socket_shutdown_bits(id) & 0b01 != 0 {
+            return 0;
+        }
+        // Connected datagram peer did shutdown(SHUT_WR): drain queued
+        // packets, then EOF — same as socket_recv_id, so recvfrom is
+        // consistent with recv for peer half-close. (PR #58 review P2.)
+        let peer_wr_closed = k.socket(id).is_some() && k.socket_peer_write_closed(id);
         let Some(socket) = k.socket_mut(id) else {
             return -(abi::EBADF as i64);
         };
@@ -780,7 +885,11 @@ pub(super) fn sys_socket_recvfrom(caller_pid: u32, request: &[u8], response: &mu
             return -(abi::EOPNOTSUPP as i64);
         }
         let Some(packet) = rx.front() else {
-            return if *peer_open { -(abi::EAGAIN as i64) } else { 0 };
+            return if *peer_open && !peer_wr_closed {
+                -(abi::EAGAIN as i64)
+            } else {
+                0
+            };
         };
         let take = packet.data.len().min(data_cap);
         response[..take].copy_from_slice(&packet.data[..take]);
@@ -810,7 +919,10 @@ pub(super) fn sys_socket_open(caller_pid: u32, request: &[u8]) -> i64 {
     let family = request[0];
     let sock_type = request[1];
     let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
-    if !matches!(family, 1..=3) {
+    // 1..=3 AF_UNIX/AF_INET, 10 AF_INET6. Parity: TS host_socket_open
+    // does not validate the domain — anything that is not an AF_UNIX
+    // SOCK_DGRAM allocates an inet stream socket.
+    if !matches!(family, 1..=3 | 10) {
         return -(abi::EAFNOSUPPORT as i64);
     }
     if !matches!(sock_type, 1 | 2 | 5 | 6) {
@@ -855,7 +967,7 @@ pub(super) fn sys_socket_bind(caller_pid: u32, request: &[u8]) -> i64 {
                 Some(socket) => match &mut socket.kind {
                     SocketKind::Open { bound_addr, .. } => {
                         if unix_path_from_addr(addr).is_none()
-                            && (!matches!(socket.domain, 2) || !is_ipv4_sockaddr(addr))
+                            && !inet_sockaddr_ok(socket.domain, addr)
                         {
                             return -(abi::EAFNOSUPPORT as i64);
                         }
@@ -991,13 +1103,23 @@ pub(super) fn sys_socket_recvmsg(caller_pid: u32, request: &[u8], response: &mut
         return n;
     }
     let rights = with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
-        Ok(id) => match k.socket_mut(id).map(|socket| &mut socket.kind) {
-            Some(SocketKind::UnixStream { rights, .. })
-            | Some(SocketKind::UnixDatagram { rights, .. }) => {
-                rights.pop_front().unwrap_or_default()
+        Ok(id) => {
+            // shutdown(SHUT_RD): socket_recv_id returned 0 as EOF, not
+            // as a zero-length message. A shutdown EOF must neither
+            // transfer queued SCM_RIGHTS fds nor drain the ancillary
+            // queue, so do not pop_front here. (PR #58 review P2)
+            if k.socket(id).is_some() && k.socket_shutdown_bits(id) & 0b01 != 0 {
+                Vec::new()
+            } else {
+                match k.socket_mut(id).map(|socket| &mut socket.kind) {
+                    Some(SocketKind::UnixStream { rights, .. })
+                    | Some(SocketKind::UnixDatagram { rights, .. }) => {
+                        rights.pop_front().unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                }
             }
-            _ => Vec::new(),
-        },
+        }
         Err(_) => Vec::new(),
     });
     let install_rc = with_kernel(|k| {
@@ -1026,6 +1148,31 @@ pub(super) fn sys_socket_close(caller_pid: u32, request: &[u8]) -> i64 {
     close_fd_number(caller_pid, fd)
 }
 
+/// `shutdown(fd, how)` — POSIX half-close (B3.1). how: 0=SHUT_RD,
+/// 1=SHUT_WR, 2=SHUT_RDWR. Marks the socket's shutdown bits
+/// (idempotent); SHUT_RD makes later recv return EOF, SHUT_WR makes
+/// send return -EPIPE. -ENOTSOCK for a non-socket fd, -EBADF unknown,
+/// -EINVAL for how>2 or a short request.
+pub(super) fn sys_socket_shutdown(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let how = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    if how > 2 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let id = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(FdEntry::Socket { id }) => *id,
+            Some(_) => return -(abi::ENOTSOCK as i64),
+            None => return -(abi::EBADF as i64),
+        };
+        k.socket_shutdown_apply(id, how);
+        0
+    })
+}
+
 pub(super) fn sys_socketpair(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if request.len() < 8 || response.len() < 8 {
         return -(abi::EINVAL as i64);
@@ -1043,7 +1190,8 @@ pub(super) fn sys_socketpair(caller_pid: u32, request: &[u8], response: &mut [u8
         let (left_id, right_id) = if matches!(sock_type, 2 | 5) {
             k.create_unix_datagram_pair()
         } else {
-            k.create_unix_stream_pair()
+            let peer_cred = k.peer_cred_for(caller_pid);
+            k.create_unix_stream_pair(peer_cred)
         };
         let p = k.process_mut(caller_pid);
         let left_fd = p.fd_table.lowest_free_fd();

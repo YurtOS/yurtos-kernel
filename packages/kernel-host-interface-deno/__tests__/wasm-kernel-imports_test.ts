@@ -340,6 +340,44 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(calls[1].callerPid).toEqual(77);
   });
 
+  it("host_socket_peercred dispatches SYS_SOCKET_PEERCRED, not SYS_SOCKET_INFO (PR #58 [P1])", async () => {
+    // Regression for the [P1] wiring bug: the binding used to dispatch
+    // METHOD.SYS_SOCKET_INFO and read offsets 12/16/20, so the new
+    // sys_socket_peercred syscall was never reached and accept/connect
+    // peer creds were wrong. Mock kernel returns 12 (bytes written) and
+    // a 12-byte response: i32 pid LE + i32 uid LE + i32 gid LE.
+    const resp = new Uint8Array(12);
+    const rv = new DataView(resp.buffer);
+    rv.setInt32(0, 4242, true); // pid
+    rv.setInt32(4, 1000, true); // uid
+    rv.setInt32(8, 1007, true); // gid
+    const { mk, calls } = capturingMk(12, resp);
+    const mem = new ArrayBuffer(64);
+    const imports = buildWasmKernelImports(mk, () => mem);
+
+    // fd=3, pidPtr=0, uidPtr=8, gidPtr=16.
+    const rc = await imports.host_socket_peercred(3, 0, 8, 16);
+    expect(rc).toEqual(0);
+
+    expect(calls.length).toEqual(1);
+    expect(calls[0].method).toEqual(METHOD.SYS_SOCKET_PEERCRED);
+    expect(calls[0].method).not.toEqual(METHOD.SYS_SOCKET_INFO);
+    expect(calls[0].responseCap).toEqual(12);
+    expect(calls[0].request.byteLength).toEqual(4);
+    expect(
+      new DataView(
+        calls[0].request.buffer,
+        calls[0].request.byteOffset,
+        4,
+      ).getUint32(0, true),
+    ).toEqual(3);
+    // pid/uid/gid copied out to the three pointers verbatim.
+    const out = new DataView(mem);
+    expect(out.getInt32(0, true)).toEqual(4242);
+    expect(out.getInt32(8, true)).toEqual(1000);
+    expect(out.getInt32(16, true)).toEqual(1007);
+  });
+
   it("host_thread_self routes through authenticated Rust thread dispatch", async () => {
     const { mk, calls } = capturingMk(9);
     const imports = buildWasmKernelImports(
@@ -1112,10 +1150,27 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     });
     expect(Array.from(infoCalls.at(-1)!.request)).toEqual([9, 0, 0, 0]);
 
-    expect(await infoImports.host_socket_peercred(9, 80, 84, 88)).toEqual(0);
-    expect(new DataView(infoBuf).getInt32(80, true)).toEqual(1234);
-    expect(new DataView(infoBuf).getInt32(84, true)).toEqual(1000);
-    expect(new DataView(infoBuf).getInt32(88, true)).toEqual(1000);
+    // SO_PEERCRED now wires to the dedicated sys_socket_peercred
+    // syscall (12-byte i32 pid|uid|gid LE), NOT the sys_socket_info
+    // offsets 12/16/20. (PR #58 [P1] — the old expectation here encoded
+    // the wiring bug.)
+    const peerCred = new Uint8Array(12);
+    const peerCredView = new DataView(peerCred.buffer);
+    peerCredView.setInt32(0, 1234, true); // pid
+    peerCredView.setInt32(4, 1000, true); // uid
+    peerCredView.setInt32(8, 1000, true); // gid
+    const { mk: pcMk, calls: pcCalls } = capturingMk(12, peerCred);
+    const pcBuf = new ArrayBuffer(128);
+    const pcImports = buildWasmKernelImports(pcMk, () => pcBuf);
+    expect(await pcImports.host_socket_peercred(9, 80, 84, 88)).toEqual(0);
+    expect(pcCalls.at(-1)).toMatchObject({
+      method: METHOD.SYS_SOCKET_PEERCRED,
+      responseCap: 12,
+    });
+    expect(Array.from(pcCalls.at(-1)!.request)).toEqual([9, 0, 0, 0]);
+    expect(new DataView(pcBuf).getInt32(80, true)).toEqual(1234);
+    expect(new DataView(pcBuf).getInt32(84, true)).toEqual(1000);
+    expect(new DataView(pcBuf).getInt32(88, true)).toEqual(1000);
 
     const { mk: optionMk, calls: optionCalls } = capturingMk(0);
     const optionImports = buildWasmKernelImports(

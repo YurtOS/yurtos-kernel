@@ -525,6 +525,8 @@ pub enum SocketKind {
         rx: VecDeque<u8>,
         rights: VecDeque<Vec<FdEntry>>,
         peer_open: bool,
+        /// SO_PEERCRED of the connected peer, captured at pair creation.
+        peer_cred: PeerCred,
     },
     UnixDatagram {
         peer_id: Option<u64>,
@@ -540,6 +542,17 @@ pub enum SocketKind {
 pub struct UnixDatagramPacket {
     pub data: Vec<u8>,
     pub source_path: Option<Vec<u8>>,
+}
+
+/// SO_PEERCRED: the pid + effective uid/gid of the process at the other
+/// end of a connected AF_UNIX stream, captured at socketpair / connect
+/// time (Linux semantics). Default `{0,0,0}` mirrors the TS kernel's
+/// `host_socket_peercred` `?? 0` for sockets with no captured peer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerCred {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 pub struct SocketEntry {
@@ -564,6 +577,10 @@ pub struct Kernel {
     unix_listeners: BTreeMap<Vec<u8>, u64>,
     unix_datagrams: BTreeMap<Vec<u8>, u64>,
     unix_socket_inodes: BTreeSet<Vec<u8>>,
+    /// `shutdown(2)` half-close state by socket id. bit0 = SHUT_RD
+    /// (recv → EOF), bit1 = SHUT_WR (send → EPIPE). Absent = open both
+    /// ways. Cleared when the socket is freed. (B3.1)
+    socket_shutdown: BTreeMap<u64, u8>,
     /// MetadataOverlay — `(mount_id, inode) → Metadata`.
     /// chmod/chown/utimens write here; fstat reads composed
     /// override → backend default → kernel fallback. Survives the
@@ -658,6 +675,7 @@ impl Kernel {
             unix_listeners: BTreeMap::new(),
             unix_datagrams: BTreeMap::new(),
             unix_socket_inodes: BTreeSet::new(),
+            socket_shutdown: BTreeMap::new(),
             metadata_overrides: BTreeMap::new(),
             pending_spawns: VecDeque::new(),
             next_spawn_pid: 1000,
@@ -944,7 +962,21 @@ impl Kernel {
         id
     }
 
-    pub fn create_unix_stream_pair(&mut self) -> (u64, u64) {
+    /// pid + effective uid/gid of `pid`, for SO_PEERCRED capture.
+    pub fn peer_cred_for(&mut self, pid: Pid) -> PeerCred {
+        let creds = self.process(pid).credentials;
+        PeerCred {
+            pid,
+            uid: creds.euid,
+            gid: creds.egid,
+        }
+    }
+
+    /// Create a connected AF_UNIX stream pair. `peer_cred` is the
+    /// SO_PEERCRED both ends report — for `socketpair` that is the
+    /// calling process; for `connect` it is the connecting process
+    /// (see the B3.2 scope note re: client-side asymmetry).
+    pub fn create_unix_stream_pair(&mut self, peer_cred: PeerCred) -> (u64, u64) {
         let left = self.next_socket_id;
         let right = self.next_socket_id + 1;
         self.next_socket_id += 2;
@@ -962,6 +994,7 @@ impl Kernel {
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
                     peer_open: true,
+                    peer_cred,
                 },
             },
         );
@@ -979,6 +1012,7 @@ impl Kernel {
                     rx: VecDeque::new(),
                     rights: VecDeque::new(),
                     peer_open: true,
+                    peer_cred,
                 },
             },
         );
@@ -1137,7 +1171,7 @@ impl Kernel {
         Ok(id)
     }
 
-    pub fn connect_unix_stream(&mut self, path: &[u8]) -> Result<u64, i32> {
+    pub fn connect_unix_stream(&mut self, path: &[u8], peer_cred: PeerCred) -> Result<u64, i32> {
         let Some(listener_id) = self.unix_listeners.get(path).copied() else {
             return Err(crate::abi::ECONNREFUSED);
         };
@@ -1150,7 +1184,7 @@ impl Kernel {
         if pending_len >= backlog as usize {
             return Err(crate::abi::ECONNREFUSED);
         }
-        let (client_id, server_id) = self.create_unix_stream_pair();
+        let (client_id, server_id) = self.create_unix_stream_pair(peer_cred);
         let Some(listener) = self.sockets.get_mut(&listener_id) else {
             self.socket_dec_ref(client_id);
             self.socket_dec_ref(server_id);
@@ -1193,6 +1227,62 @@ impl Kernel {
 
     pub fn socket_mut(&mut self, id: u64) -> Option<&mut SocketEntry> {
         self.sockets.get_mut(&id)
+    }
+
+    /// `shutdown(2)` half-close bits for a socket (0 = open both ways).
+    pub fn socket_shutdown_bits(&self, id: u64) -> u8 {
+        self.socket_shutdown.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Apply a POSIX `how` (0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR) to a
+    /// socket's half-close state (idempotent OR of the bits).
+    pub fn socket_shutdown_apply(&mut self, id: u64, how: u32) {
+        let bits = match how {
+            0 => 0b01, // SHUT_RD
+            1 => 0b10, // SHUT_WR
+            _ => 0b11, // SHUT_RDWR
+        };
+        *self.socket_shutdown.entry(id).or_insert(0) |= bits;
+        // SHUT_WR / SHUT_RDWR closes the write half: the connected
+        // AF_UNIX peer must observe EOF *after it drains its rx* (POSIX)
+        // — but the peer's own write side stays open (it can still send
+        // to us; only our read half on its end is unaffected). So this
+        // is NOT `peer_open = false` (that also EPIPEs the peer's
+        // sends); it sets a distinct "peer write-closed" bit (0b100) on
+        // the peer's shutdown entry, consulted by recv only on an empty
+        // rx (drain-then-EOF). Matching the (buggy) TS kernel is NOT a
+        // reason to ship a non-POSIX half-close; a resulting B0 differ
+        // divergence is a tracked TS-bug exception (retired in B6). #58.
+        if bits & 0b10 != 0 {
+            let peer_id = match self.sockets.get(&id).map(|s| &s.kind) {
+                Some(SocketKind::UnixStream { peer_id, .. }) => Some(*peer_id),
+                Some(SocketKind::UnixDatagram {
+                    peer_id: Some(p), ..
+                }) => Some(*p),
+                _ => None,
+            };
+            if let Some(peer_id) = peer_id {
+                if self.sockets.contains_key(&peer_id) {
+                    *self.socket_shutdown.entry(peer_id).or_insert(0) |= 0b100;
+                }
+            }
+        }
+    }
+
+    /// True iff the connected peer has done `shutdown(SHUT_WR)` on us:
+    /// recv must deliver any remaining queued bytes, then return EOF.
+    /// (Distinct from local `SHUT_RD` 0b01, which is an *immediate* EOF
+    /// that discards queued data.)
+    pub fn socket_peer_write_closed(&self, id: u64) -> bool {
+        self.socket_shutdown.get(&id).copied().unwrap_or(0) & 0b100 != 0
+    }
+
+    /// Drop a socket id's half-close state. Used when an `Open` socket
+    /// is converted to a `Host` connection (connect/listen): a freshly
+    /// established host socket has no shutdown state, so any bits a
+    /// pre-connect `shutdown()` recorded must not carry over. (PR #58 P2)
+    pub fn socket_shutdown_clear(&mut self, id: u64) {
+        self.socket_shutdown.remove(&id);
     }
 
     pub fn socket_inc_ref(&mut self, id: u64) {
@@ -1254,6 +1344,7 @@ impl Kernel {
             }
         }
         self.sockets.remove(&id);
+        self.socket_shutdown.remove(&id);
         close_handle
     }
 
@@ -1806,6 +1897,7 @@ pub fn reset_for_tests() {
     k.next_ofd_id = 1;
     k.sockets.clear();
     k.next_socket_id = 1;
+    k.socket_shutdown.clear();
     k.unix_listeners.clear();
     k.unix_datagrams.clear();
     k.unix_socket_inodes.clear();

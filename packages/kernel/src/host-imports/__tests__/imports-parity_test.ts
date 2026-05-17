@@ -50,6 +50,7 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_socket_option",
   "host_socket_set_no_delay",
   "host_socket_close",
+  "host_socket_peercred",
   "host_extension_invoke",
   "host_setjmp",
   "host_longjmp",
@@ -112,12 +113,13 @@ const ABI_IMPORT_METHODS = new Map<string, string | null>([
   ["host_socket_addr", "sys_socket_addr"],
   ["host_socket_option", "sys_socket_option"],
   ["host_socket_close", "sys_socket_close"],
+  ["host_socket_peercred", "sys_socket_peercred"],
   // Continuation-only host hook: there is no `[method.sys_fork]` —
   // the kernel-side fork lifecycle is the host_fork hook plus
   // sys_spawn, so this maps to no Rust dispatch method (documented).
   // Pre-existing main discrepancy (host_fork in yurt_abi.toml since B1,
-  // never mapped here) — also fixed in #58; identical, self-heals on
-  // whichever lands first.
+  // never mapped here) — fixed on main via #61; #58 keeps the
+  // host_socket_peercred mapping it adds.
   ["host_fork", null],
   ["host_dns_resolve", null],
   ["host_network_fetch", "sys_fetch"],

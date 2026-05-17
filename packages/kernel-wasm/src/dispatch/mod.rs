@@ -44,8 +44,9 @@ pub(crate) use process::{
 use socket::{
     socket_recv_id, socket_send_id, sys_socket_accept, sys_socket_addr, sys_socket_bind,
     sys_socket_close, sys_socket_connect, sys_socket_info, sys_socket_listen, sys_socket_open,
-    sys_socket_option, sys_socket_recv, sys_socket_recvfrom, sys_socket_recvmsg, sys_socket_send,
-    sys_socket_sendmsg, sys_socket_sendto, sys_socketpair,
+    sys_socket_option, sys_socket_peercred, sys_socket_recv, sys_socket_recvfrom,
+    sys_socket_recvmsg, sys_socket_send, sys_socket_sendmsg, sys_socket_sendto,
+    sys_socket_shutdown, sys_socketpair,
 };
 
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
@@ -216,6 +217,8 @@ pub fn dispatch_with_context(
         METHOD_SYS_SOCKET_SEND => sys_socket_send(caller_pid, request),
         METHOD_SYS_SOCKET_RECV => sys_socket_recv(caller_pid, request, response),
         METHOD_SYS_SOCKET_CLOSE => sys_socket_close(caller_pid, request),
+        METHOD_SYS_SOCKET_SHUTDOWN => sys_socket_shutdown(caller_pid, request),
+        METHOD_SYS_SOCKET_PEERCRED => sys_socket_peercred(caller_pid, request, response),
         METHOD_SYS_SOCKETPAIR => sys_socketpair(caller_pid, request, response),
         METHOD_SYS_SOCKET_OPEN => sys_socket_open(caller_pid, request),
         METHOD_SYS_SOCKET_BIND => sys_socket_bind(caller_pid, request),

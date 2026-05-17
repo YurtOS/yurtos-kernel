@@ -618,6 +618,19 @@ id = 0x1_0077
 kind = "syscall"
 doc = "POSIX ioctl(fd, request, arg) — narrow whitelist. Request: u32 fd LE + u32 request_code LE + u32 arg LE. FIONBIO (0x5421): arg!=0 sets / arg==0 clears O_NONBLOCK in the file fd's OFD status_flags (storage only, like F_SETFL; non-file valid fds are an accepted no-op). FIONREAD (0x541B): writes a u32 LE count of immediately-readable bytes into the response (regular file = size-offset; pipe read end = buffered bytes; otherwise 0) and returns 4. Any other request_code -> -ENOTTY. -EBADF unknown fd, -EINVAL short request / FIONREAD with a <4-byte response. Behavioral honoring of O_NONBLOCK is gate-sequenced."
 
+# B3 sockets/network — method-id block 0x1_0080-0x1_008F (per the
+# canonical per-slice partition in the parity matrix).
+
+[method.sys_socket_shutdown]
+id = 0x1_0080
+kind = "syscall"
+doc = "POSIX shutdown(fd, how). Request: u32 fd LE + u32 how LE (0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR). Marks the socket's half-close state (idempotent): SHUT_RD makes subsequent AF_UNIX recv return 0 (EOF); SHUT_WR makes send return -EPIPE. -ENOTSOCK if the fd is not a socket, -EINVAL for an out-of-range how or short request. State is cleared when the socket is freed. Additive — only affects sockets that have been shut down."
+
+[method.sys_socket_peercred]
+id = 0x1_0081
+kind = "syscall"
+doc = "SO_PEERCRED — peer credentials of a connected socket. Request: u32 fd LE. Response: 12 bytes — i32 pid LE + i32 uid LE + i32 gid LE. fixed_out convention (cf. sys_socket_info / sys_socket_addr): returns 12 (bytes written) on success for any socket fd — the captured peer pid/uid/gid for an AF_UNIX connected stream, zeros for sockets with no captured peer (mirroring the TS host_socket_peercred `?? 0`); the host adapter maps any non-negative return to the libc-level 0. Returns 12 (required size) with nothing written if the response buffer is smaller than 12. -EINVAL for a short request, -EBADF for an unknown fd, -ENOTSOCK if the fd is not a socket."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"

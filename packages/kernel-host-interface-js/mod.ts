@@ -201,6 +201,9 @@ export const METHOD = {
   SYS_SOCKET_INFO: 0x1_004A,
   SYS_SOCKET_RECVFROM: 0x1_004B,
   SYS_SOCKET_OPTION: 0x1_004C,
+  // B3 sockets/network block (0x1_0080–0x1_008F). Must match the Rust
+  // codegen id in abi/contract/yurt_abi_methods.toml [method.sys_socket_peercred].
+  SYS_SOCKET_PEERCRED: 0x1_0081,
   SYS_THREAD_SPAWN: 0x1_004D,
   SYS_THREAD_SELF: 0x1_004E,
   SYS_THREAD_JOIN: 0x1_004F,

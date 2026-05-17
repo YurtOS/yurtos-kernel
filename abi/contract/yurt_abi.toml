@@ -577,6 +577,15 @@ args = [
   { name = "value", type = "i32" },
 ]
 
+[import.host_socket_peercred]
+doc = "SO_PEERCRED — write the connected peer's credentials as a fixed 12-byte struct (i32 pid LE + i32 uid LE + i32 gid LE). Zeros for sockets with no captured peer."
+return = "fixed_out"
+args = [
+  { name = "fd", type = "fd" },
+  { name = "out_ptr", type = "ptr" },
+  { name = "out_cap", type = "usize" },
+]
+
 [import.host_socket_close]
 doc = "Close a socket fd."
 return = "scalar_errno"
