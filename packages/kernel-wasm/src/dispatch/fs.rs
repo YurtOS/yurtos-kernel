@@ -824,10 +824,19 @@ fn write_stat_record(k: &mut Kernel, path: &[u8], response: &mut [u8]) -> i64 {
         let size = k.vfs.size(mount_id, inode).unwrap_or(0);
         let meta = k.resolve_metadata(mount_id, inode);
         (size, meta.mode)
+    } else if filetype == 7 {
+        // POSIX lstat(): st_size is the byte length of the symlink's
+        // target path string (what readlink returns), not the VFS
+        // fixed-size-0 convention for non-regular entries. Confined
+        // to this arm: stat_path follows the link chain before
+        // typing an entry, so it never reaches filetype==7 here —
+        // only lstat_path (no-follow) does, so stat is unaffected.
+        // Issue #134.
+        let size = k.vfs.readlink(path).map(|t| t.len() as u64).unwrap_or(0);
+        (size, 0o120_777)
     } else {
         let mode = match filetype {
             3 => 0o040_755,
-            7 => 0o120_777,
             6 => 0o140_666,
             _ => 0o100_644,
         };

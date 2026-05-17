@@ -6611,8 +6611,38 @@ fn lstat_does_not_follow_symlink_to_regular_file() {
     );
     assert_eq!(
         u64::from_le_bytes(out[0..8].try_into().unwrap()),
-        0,
-        "size is the link's (0), not the target's (2)"
+        2,
+        "lstat st_size is the target path length (\"/f\" = 2), not 0; #134"
+    );
+}
+
+// #134 — POSIX lstat() sets st_size to the byte length of the
+// symlink's target path string (what readlink returns), not the
+// VFS fixed-size-0 convention for non-regular entries. This is
+// confined to write_stat_record's filetype==7 arm; stat_path
+// follows the link chain before typing, so it never reaches this
+// arm and is unaffected (asserted by lstat_*_matches_stat below
+// and the #67 stat_follows_symlink_* tests).
+#[test]
+fn lstat_symlink_st_size_is_target_path_length() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let target: &[u8] = b"/some/deep/target-path";
+    let mut sreq = (target.len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(target);
+    sreq.extend_from_slice(b"/sl");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/sl", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "still S_IFLNK — lstat must not follow the link"
+    );
+    assert_eq!(
+        u64::from_le_bytes(out[0..8].try_into().unwrap()),
+        target.len() as u64,
+        "lstat st_size must equal the symlink target path byte length"
     );
 }
 
