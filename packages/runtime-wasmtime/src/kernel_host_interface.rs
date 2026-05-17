@@ -3595,7 +3595,14 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             // Entropy is not privacy-sensitive (unlike the kh_now_realtime
             // clock gate) — ungated. OS CSPRNG via the `getrandom` crate
             // (already in the dep tree through rustls-tls for fetch()).
-            let len = len as usize;
+            // Bound the length before allocating — defense-in-depth via
+            // the same checked helper the trampolines use (cap =
+            // MAX_GUEST_BUFFER_LEN). Prevents a guest-influenced
+            // multi-GB host allocation.
+            let len = match checked_guest_buffer_len(len) {
+                Ok(n) => n,
+                Err(_) => return -(E2BIG as i32),
+            };
             if len == 0 {
                 return 0;
             }

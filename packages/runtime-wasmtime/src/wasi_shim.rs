@@ -26,6 +26,7 @@ use anyhow::{anyhow, Result};
 use wasmtime::{Caller, Linker};
 
 use crate::kernel_host_interface::UserState;
+use yurt_kernel_host_interface_core::checked_guest_buffer_len;
 
 const WASI: &str = "wasi_snapshot_preview1";
 
@@ -36,6 +37,7 @@ const EBADF: i32 = 8;
 const EINVAL: i32 = 28;
 const ESPIPE: i32 = 70;
 const ENOSYS: i32 = 52;
+const EFAULT: i32 = 21;
 const EIO: i32 = 29;
 
 /// Map kernel-side POSIX errno → WASI preview1 errno. The kernel
@@ -869,20 +871,28 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         WASI,
         "random_get",
         |mut caller: Caller<'_, UserState>, buf_ptr: u32, buf_len: u32| -> i32 {
-            let len = buf_len as usize;
+            // Bound the guest-controlled length BEFORE allocating.
+            // `checked_guest_buffer_len` caps at MAX_GUEST_BUFFER_LEN
+            // (1 MiB) — the same checked helper the kernel trampolines
+            // use. Without it a guest passing e.g. u32::MAX would drive
+            // a multi-GB host allocation (OOM DoS).
+            let len = match checked_guest_buffer_len(buf_len) {
+                Ok(n) => n,
+                Err(_) => return EINVAL,
+            };
             if len == 0 {
                 return 0;
             }
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
-                None => return EINVAL,
+                None => return EFAULT,
             };
             let mut buf = vec![0u8; len];
             if getrandom::getrandom(&mut buf).is_err() {
                 return EIO;
             }
             if memory.write(&mut caller, buf_ptr as usize, &buf).is_err() {
-                return EINVAL;
+                return EFAULT;
             }
             0
         },
