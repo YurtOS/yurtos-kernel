@@ -965,6 +965,15 @@ impl VfsBackend for RamfsBackend {
         if self.dir_inodes.contains_key(new_path) {
             return -(crate::abi::EEXIST as i64) as i32;
         }
+        // POSIX: a directory may only replace an (empty) directory.
+        // If the source is a directory and the destination exists as a
+        // non-directory (regular file or symlink), fail ENOTDIR rather
+        // than unlinking it below and moving the dir there (data loss).
+        if src_kind == 3
+            && (self.paths.contains_key(new_path) || self.symlinks.contains_key(new_path))
+        {
+            return -(crate::abi::ENOTDIR as i64) as i32;
+        }
         if self.paths.contains_key(new_path) {
             self.unlink(new_path);
         } else if self.symlinks.contains_key(new_path) {
@@ -1324,6 +1333,33 @@ mod tests {
             "file unmoved"
         );
         assert_eq!(b.paths.get(b"/missing/f".as_slice()), None, "no ghost file");
+    }
+
+    #[test]
+    fn ramfs_rename_dir_onto_non_dir_is_enotdir() {
+        // POSIX: if the source is a directory, the destination must
+        // not exist or be an empty directory. Renaming a dir onto a
+        // regular file (or a symlink) must fail ENOTDIR — NOT silently
+        // unlink the destination and move the dir there (data loss).
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.mkdir(b"/d"), 0);
+        let d_ino = b.dir_inode(b"/d").unwrap();
+        let f_ino = b.install(b"/f".to_vec(), b"keep".to_vec());
+
+        assert_eq!(b.rename(b"/d", b"/f"), -crate::abi::ENOTDIR);
+        assert_eq!(
+            b.paths.get(b"/f".as_slice()).copied(),
+            Some(f_ino),
+            "destination file must not be unlinked"
+        );
+        assert_eq!(b.dir_inode(b"/d"), Some(d_ino), "source dir unmoved");
+        assert_eq!(b.dir_inode(b"/f"), None, "dir not placed at /f");
+
+        // A symlink destination is also not a directory → ENOTDIR.
+        assert_eq!(b.symlink(b"/target", b"/ln"), 0);
+        assert_eq!(b.rename(b"/d", b"/ln"), -crate::abi::ENOTDIR);
+        assert_eq!(b.dir_inode(b"/d"), Some(d_ino), "source dir still unmoved");
+        assert_eq!(b.dir_inode(b"/ln"), None);
     }
 
     #[test]
