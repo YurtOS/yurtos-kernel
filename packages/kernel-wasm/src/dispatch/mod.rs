@@ -23,8 +23,8 @@ mod thread;
 
 use fs::{
     chdir, chmod, chown, fchdir, fchown, getcwd, hard_link, lstat_path, mkdir, readdir, readlink,
-    realpath, rename, rmdir, stat_path, symlink, sys_ftruncate, sys_open, sys_openat, sys_truncate,
-    unlink, utimens,
+    realpath, rename, rmdir, stat_path, symlink, sys_fdatasync, sys_fsync, sys_ftruncate, sys_open,
+    sys_openat, sys_sync, sys_syncfs, sys_truncate, unlink, utimens,
 };
 use process::{
     close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
@@ -166,6 +166,10 @@ pub fn dispatch_with_context(
         METHOD_SYS_GET_FILE_STATUS_FLAGS => get_file_status_flags(caller_pid, request),
         METHOD_SYS_SET_FILE_STATUS_FLAGS => set_file_status_flags(caller_pid, request),
         METHOD_SYS_IOCTL => ioctl_fd(caller_pid, request, response),
+        METHOD_SYS_FSYNC => sys_fsync(caller_pid, request),
+        METHOD_SYS_FDATASYNC => sys_fdatasync(caller_pid, request),
+        METHOD_SYS_SYNC => sys_sync(request),
+        METHOD_SYS_SYNCFS => sys_syncfs(caller_pid, request),
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),

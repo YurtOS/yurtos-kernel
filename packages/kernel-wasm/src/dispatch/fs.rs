@@ -825,3 +825,43 @@ pub(super) fn sys_truncate(caller_pid: u32, request: &[u8]) -> i64 {
         k.vfs.set_len(mount_id, inode, length) as i64
     })
 }
+
+/// `sys_fsync(fd)` — POSIX fsync. Request: u32 fd LE.
+///
+/// In the in-memory ramfs there is no backing device, so the only work
+/// is the fd-syncability gate; returning ENOSYS would make sqlite report
+/// "disk I/O error" (issue #88). Regular files and directory fds return
+/// 0; pipes / sockets / other non-syncable types return -EINVAL (matches
+/// Linux's fsync(pipe) → EINVAL). Unknown fd → -EBADF.
+pub(super) fn sys_fsync(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() != 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(fd) {
+        Some(crate::kernel::FdEntry::File { .. })
+        | Some(crate::kernel::FdEntry::Directory { .. }) => 0,
+        Some(_) => -(abi::EINVAL as i64),
+        None => -(abi::EBADF as i64),
+    })
+}
+
+/// `sys_fdatasync(fd)` — POSIX fdatasync. Identical semantics to fsync
+/// for the in-memory ramfs (no separate data/metadata distinction
+/// without a backing device).
+pub(super) fn sys_fdatasync(caller_pid: u32, request: &[u8]) -> i64 {
+    sys_fsync(caller_pid, request)
+}
+
+/// `sys_sync()` — POSIX sync. No request. Always returns 0 (POSIX
+/// defines sync(2) as void; emitting 0 lets a host adapter that maps
+/// negative-to-errno treat it as success transparently).
+pub(super) fn sys_sync(_request: &[u8]) -> i64 {
+    0
+}
+
+/// `sys_syncfs(fd)` — Linux syncfs. Sync the filesystem containing fd.
+/// Ramfs no-op; reuses fsync's fd-validity gate.
+pub(super) fn sys_syncfs(caller_pid: u32, request: &[u8]) -> i64 {
+    sys_fsync(caller_pid, request)
+}
