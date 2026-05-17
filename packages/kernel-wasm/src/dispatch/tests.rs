@@ -10350,3 +10350,304 @@ fn sys_fsync_family_returns_zero_for_ramfs_and_validates_fd() {
         "fsync with short request must return -EINVAL",
     );
 }
+
+// ── access / faccessat (issue #86) ────────────────────────────────
+
+fn access_req(mode: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = mode.to_le_bytes().to_vec();
+    req.extend_from_slice(path);
+    req
+}
+
+fn faccessat_req(dirfd: u32, mode: u32, flag: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&mode.to_le_bytes());
+    req.extend_from_slice(&flag.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+// Mode-bit constants mirrored from dispatch/fs.rs for test clarity.
+const ACCESS_F_OK: u32 = 0;
+const ACCESS_X_OK: u32 = 1;
+const ACCESS_W_OK: u32 = 2;
+const ACCESS_R_OK: u32 = 4;
+const ACCESS_AT_EACCESS: u32 = 0x200;
+const ACCESS_AT_FDCWD: u32 = u32::MAX;
+
+#[test]
+fn access_f_ok_distinguishes_existing_from_missing() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    // Existing file → 0.
+    let path: &[u8] = b"/access-exists";
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, path),
+            &mut [],
+        ) >= 0,
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_ACCESS,
+            1,
+            &access_req(ACCESS_F_OK, path),
+            &mut []
+        ),
+        0,
+    );
+
+    // Missing path → -ENOENT.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_ACCESS,
+            1,
+            &access_req(ACCESS_F_OK, b"/no/such/file"),
+            &mut [],
+        ),
+        -(abi::ENOENT as i64),
+    );
+
+    // Bad mode bits → -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_ACCESS, 1, &access_req(0xF0, path), &mut []),
+        -(abi::EINVAL as i64),
+    );
+    // Empty path → -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_ACCESS, 1, &access_req(ACCESS_F_OK, b""), &mut []),
+        -(abi::EINVAL as i64),
+    );
+    // Short request → -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_ACCESS, 1, &[0u8; 3], &mut []),
+        -(abi::EINVAL as i64),
+    );
+}
+
+#[test]
+fn access_rwx_respects_mode_bits_for_non_root_caller() {
+    // Non-root caller: file mode 0o644 (rw-r--r--) on a root-owned
+    // file → R_OK ok (other-read bit set), W_OK denied (no other-
+    // write), X_OK denied (no execute bits). Credentials::DEFAULT is
+    // uid 1000 / euid 1000 / gid 1000, so the caller is "other"
+    // relative to a ramfs-default-owned (uid 0) file.
+    let _g = crate::kernel::TestGuard::acquire();
+
+    let path: &[u8] = b"/access-rwx";
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, path),
+            &mut [],
+        ) >= 0,
+    );
+
+    // Default ramfs metadata is mode 0o100644 → other gets r--, not w
+    // or x. Owner is uid 0 (ramfs default), caller is uid 1000 → other.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_ACCESS,
+            1,
+            &access_req(ACCESS_R_OK, path),
+            &mut [],
+        ),
+        0,
+        "R_OK on 0o644 must succeed for any caller (other-read bit set)",
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_ACCESS,
+            1,
+            &access_req(ACCESS_W_OK, path),
+            &mut [],
+        ),
+        -(abi::EACCES as i64),
+        "W_OK on 0o644 must fail for non-owner non-group (other lacks w)",
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_ACCESS,
+            1,
+            &access_req(ACCESS_X_OK, path),
+            &mut [],
+        ),
+        -(abi::EACCES as i64),
+        "X_OK on 0o644 must fail (no execute bits)",
+    );
+    // OR'd modes: W|R fails because W is denied.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_ACCESS,
+            1,
+            &access_req(ACCESS_R_OK | ACCESS_W_OK, path),
+            &mut [],
+        ),
+        -(abi::EACCES as i64),
+    );
+}
+
+#[test]
+fn faccessat_dirfd_relative_path_resolves_via_directory_fd() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/at-dir", &mut []), 0);
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, b"/at-dir/child"),
+            &mut [],
+        ) >= 0,
+    );
+    let dirfd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_DIRECTORY, b"/at-dir"),
+        &mut [],
+    );
+    assert!(dirfd >= 0);
+
+    // Relative path via dirfd resolves under /at-dir.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(dirfd as u32, ACCESS_F_OK, 0, b"child"),
+            &mut [],
+        ),
+        0,
+    );
+
+    // Absolute path ignores dirfd.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(dirfd as u32, ACCESS_F_OK, 0, b"/at-dir/child"),
+            &mut [],
+        ),
+        0,
+    );
+
+    // AT_FDCWD resolves cwd-relative just like sys_access.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(ACCESS_AT_FDCWD, ACCESS_F_OK, 0, b"/at-dir/child"),
+            &mut [],
+        ),
+        0,
+    );
+
+    // Unknown dirfd → -EBADF.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(999, ACCESS_F_OK, 0, b"child"),
+            &mut [],
+        ),
+        -(abi::EBADF as i64),
+    );
+
+    // Bad flag bit → -EINVAL.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(ACCESS_AT_FDCWD, ACCESS_F_OK, 0x1000, b"/at-dir/child"),
+            &mut [],
+        ),
+        -(abi::EINVAL as i64),
+    );
+    // Short request → -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_FACCESSAT, 1, &[0u8; 8], &mut []),
+        -(abi::EINVAL as i64),
+    );
+}
+
+#[test]
+fn access_eloops_on_circular_symlinks() {
+    // Issue #86 / #69: access(2) is on the symlink-resolution path,
+    // so a too-long chain must surface -ELOOP (POSIX) — not double-
+    // negated to a positive value at the access_check boundary.
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/b");
+    sreq.extend_from_slice(b"/a");
+    dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []);
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/a");
+    sreq.extend_from_slice(b"/b");
+    dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []);
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_ACCESS,
+            1,
+            &access_req(ACCESS_F_OK, b"/a"),
+            &mut [],
+        ),
+        -(abi::ELOOP as i64),
+        "access() on symlink loop must surface -ELOOP",
+    );
+}
+
+#[test]
+fn faccessat_at_eaccess_uses_effective_credentials() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    // Set up a caller with real uid != effective uid. Bypass
+    // setresuid's "must be euid 0 to drop" gate by writing the
+    // credentials directly — tests routinely do this via make_root.
+    // Real = 1000 (non-owner of root-owned files), effective = 0
+    // (root). AT_EACCESS should pick effective; default access(2)
+    // should pick real.
+    crate::kernel::with_kernel(|k| {
+        let creds = &mut k.process_mut(1).credentials;
+        creds.uid = 1000;
+        creds.euid = 0;
+        creds.suid = 0;
+        creds.gid = 1000;
+        creds.egid = 0;
+        creds.sgid = 0;
+    });
+
+    let path: &[u8] = b"/eaccess-target";
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, path),
+            &mut [],
+        ) >= 0,
+    );
+
+    // Without AT_EACCESS: real uid=1000, file owned by uid=0
+    // (ramfs default), 0o644 → other lacks write → EACCES.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(ACCESS_AT_FDCWD, ACCESS_W_OK, 0, path),
+            &mut [],
+        ),
+        -(abi::EACCES as i64),
+    );
+    // With AT_EACCESS: effective uid=0 (root) → W_OK unconditionally permitted.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(ACCESS_AT_FDCWD, ACCESS_W_OK, ACCESS_AT_EACCESS, path),
+            &mut [],
+        ),
+        0,
+    );
+}

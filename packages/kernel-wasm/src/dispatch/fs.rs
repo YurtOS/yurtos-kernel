@@ -865,3 +865,175 @@ pub(super) fn sys_sync(_request: &[u8]) -> i64 {
 pub(super) fn sys_syncfs(caller_pid: u32, request: &[u8]) -> i64 {
     sys_fsync(caller_pid, request)
 }
+
+// ── access(2) / faccessat(2) — issue #86 ────────────────────────────
+
+/// `mode` bits (POSIX): F_OK=0 (existence only), X_OK=1, W_OK=2, R_OK=4.
+const F_OK: u32 = 0;
+const X_OK: u32 = 1;
+const W_OK: u32 = 2;
+const R_OK: u32 = 4;
+const MODE_BITS_MASK: u32 = F_OK | X_OK | W_OK | R_OK;
+
+/// `faccessat` flag bits (Linux): AT_SYMLINK_NOFOLLOW=0x100, AT_EACCESS=0x200.
+const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+const AT_EACCESS: u32 = 0x200;
+const FACCESSAT_FLAGS_MASK: u32 = AT_SYMLINK_NOFOLLOW | AT_EACCESS;
+
+/// Check the `mode` access request (X/W/R OR-able) against the file's
+/// POSIX mode bits and the caller's credentials. POSIX algorithm:
+///
+/// 1. If checking-uid is 0 (root): R_OK + W_OK always granted; X_OK
+///    granted iff at least one execute bit is set on the file.
+/// 2. Else if checking-uid == file owner uid: check owner bits.
+/// 3. Else if checking-gid == file owner gid: check group bits.
+/// 4. Else: check other bits.
+///
+/// Returns 0 if every requested bit is permitted, `EACCES` otherwise.
+/// F_OK (mode=0) is handled by the caller before reaching here — this
+/// function presumes the file already exists.
+fn check_access_mode(meta: crate::vfs::Metadata, uid: u32, gid: u32, mode: u32) -> i32 {
+    if mode == F_OK {
+        return 0;
+    }
+    let perms = meta.mode & 0o777;
+    if uid == 0 {
+        // Root: R/W unconditional; X iff any execute bit set.
+        if (mode & X_OK) != 0 && (perms & 0o111) == 0 {
+            return abi::EACCES;
+        }
+        return 0;
+    }
+    let (read_bit, write_bit, exec_bit) = if uid == meta.uid {
+        (0o400, 0o200, 0o100)
+    } else if gid == meta.gid {
+        (0o040, 0o020, 0o010)
+    } else {
+        (0o004, 0o002, 0o001)
+    };
+    if (mode & R_OK) != 0 && (perms & read_bit) == 0 {
+        return abi::EACCES;
+    }
+    if (mode & W_OK) != 0 && (perms & write_bit) == 0 {
+        return abi::EACCES;
+    }
+    if (mode & X_OK) != 0 && (perms & exec_bit) == 0 {
+        return abi::EACCES;
+    }
+    0
+}
+
+/// `sys_access(mode, path)` — POSIX access(path, mode). Request bytes:
+/// `u32 mode LE + path bytes` (path runs to end-of-request; mirrors
+/// sys_chdir's path convention). Resolves symlinks; tests the
+/// requested access against the file's mode bits using the caller's
+/// **real** uid/gid (per POSIX; `AT_EACCESS` is the faccessat
+/// affordance for effective ids).
+///
+/// Errnos: 0 success, -EINVAL (bad mode bits, empty path, short
+/// request), -ENOENT (path missing), -ELOOP (symlink hop limit),
+/// -EACCES (requested access denied). Issue #86.
+pub(super) fn sys_access(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let mode = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    if mode & !MODE_BITS_MASK != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let raw_path = &request[4..];
+    if raw_path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| access_check(k, caller_pid, raw_path, mode, /*flag*/ 0))
+}
+
+/// `sys_faccessat(dirfd, mode, flag, path)` — POSIX faccessat. Request
+/// bytes: `u32 dirfd LE + u32 mode LE + u32 flag LE + path bytes`
+/// (path runs to end-of-request; mirrors sys_openat's wire shape).
+/// AT_FDCWD = u32::MAX. Flag bits: AT_SYMLINK_NOFOLLOW (don't follow
+/// terminal symlink), AT_EACCESS (check with effective uid/gid).
+///
+/// Errnos: as sys_access, plus -EBADF (dirfd unknown), -ENOTDIR
+/// (dirfd not a directory fd).
+pub(super) fn sys_faccessat(caller_pid: u32, request: &[u8]) -> i64 {
+    const AT_FDCWD: u32 = u32::MAX;
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let dirfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let mode = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let flag = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
+    if mode & !MODE_BITS_MASK != 0 || flag & !FACCESSAT_FLAGS_MASK != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let path = &request[12..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+
+    // Absolute path or AT_FDCWD → resolve cwd-relative.
+    if path[0] == b'/' || dirfd == AT_FDCWD {
+        return with_kernel(|k| access_check(k, caller_pid, path, mode, flag));
+    }
+
+    // Resolve dirfd's stored path (#59 limitation noted in sys_openat).
+    let dir = match with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(dirfd) {
+        Some(crate::kernel::FdEntry::Directory { path }) => Ok(path.clone()),
+        Some(_) => Err(abi::ENOTDIR),
+        None => Err(abi::EBADF),
+    }) {
+        Ok(d) => d,
+        Err(errno) => return -(errno as i64),
+    };
+    let mut joined = dir;
+    if joined.last() != Some(&b'/') {
+        joined.push(b'/');
+    }
+    joined.extend_from_slice(path);
+    with_kernel(|k| access_check(k, caller_pid, &joined, mode, flag))
+}
+
+/// Shared body for `sys_access` and `sys_faccessat`. Resolves the path
+/// (following symlinks unless AT_SYMLINK_NOFOLLOW), then checks the
+/// requested mode against the resolved file's metadata with the
+/// caller's real (or effective if AT_EACCESS) credentials. Returns
+/// the dispatch-boundary i64 errno (already negated/widened).
+fn access_check(k: &mut Kernel, caller_pid: u32, raw_path: &[u8], mode: u32, flag: u32) -> i64 {
+    let path = match normalize_readable_path(k, caller_pid, raw_path) {
+        Ok(path) => path,
+        Err(rc) => return rc,
+    };
+    let resolved = if flag & AT_SYMLINK_NOFOLLOW != 0 {
+        path
+    } else {
+        // follow_symlinks returns Result<_, i64> with pre-negated
+        // errno today — match the existing call-site shape in
+        // sys_open / stat_path. #144 normalizes the convention; this
+        // call site updates with that PR.
+        match follow_symlinks(k, caller_pid, path) {
+            Ok(p) => p,
+            Err(rc) => return rc,
+        }
+    };
+    let Some((mount_id, inode)) = k.vfs.open(&resolved, 0) else {
+        return -(abi::ENOENT as i64);
+    };
+    if mode == F_OK {
+        // Existence already established by the open(0) probe above.
+        return 0;
+    }
+    let meta = k.resolve_metadata(mount_id, inode);
+    let cred = k.process_mut(caller_pid).credentials;
+    let (uid, gid) = if flag & AT_EACCESS != 0 {
+        (cred.euid, cred.egid)
+    } else {
+        (cred.uid, cred.gid)
+    };
+    let rc = check_access_mode(meta, uid, gid, mode);
+    if rc == 0 {
+        0
+    } else {
+        -(rc as i64)
+    }
+}
