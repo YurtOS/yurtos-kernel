@@ -8020,6 +8020,41 @@ fn spec11_all_relative_ops_use_refreshed_cwd_then_enoent_when_removed() {
     );
 }
 
+#[test]
+fn absolute_paths_do_not_depend_on_removed_cwd() {
+    // Regression: removed inode-anchored cwd must only fail relative
+    // path resolution. Absolute paths do not need cwd liveness.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/gone", &mut []), 0);
+    let dfd = open_dir(b"/gone");
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/gone", &mut []), 0);
+
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"/abs-after-gone"),
+        &mut [],
+    );
+    assert!(
+        fd >= 3,
+        "absolute open should not consult removed cwd, got {fd}"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"A"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/abs-after-gone"), b"A");
+
+    let mut out = [0u8; 64];
+    let n = dispatch(METHOD_SYS_REALPATH, 1, b"/abs-after-gone", &mut out);
+    assert!(n > 0, "absolute realpath returned {n}");
+    assert_eq!(&out[..n as usize], b"/abs-after-gone\0");
+}
+
 // --- Slice B2.9 Task 7: removed-dir → ENOENT + rename-stability
 //     (spec tests #1, #3) ---
 

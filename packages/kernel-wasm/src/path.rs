@@ -23,7 +23,11 @@ impl<'kernel> PathResolver<'kernel> {
     /// and VFS operations where the backend decides final semantics.
     pub fn normalize(&mut self, raw_path: &[u8]) -> Result<Vec<u8>, i64> {
         let rewritten = proc_self_rewrite(self.caller_pid, raw_path);
-        let cwd = self.resolved_cwd()?;
+        let cwd = if rewritten.starts_with(b"/") {
+            b"/".to_vec()
+        } else {
+            self.resolved_cwd()?
+        };
         normalize_lexical_path(&cwd, &rewritten)
     }
 
@@ -37,7 +41,11 @@ impl<'kernel> PathResolver<'kernel> {
         // shape `normalize` uses; `realpath`'s contract is the raw
         // positive `i32`. The only failure here is the removed-cwd
         // case, which maps to `ENOENT` for every relative-path user.
-        let cwd = self.resolved_cwd().map_err(|_| abi::ENOENT)?;
+        let cwd = if rewritten.starts_with(b"/") {
+            b"/".to_vec()
+        } else {
+            self.resolved_cwd().map_err(|_| abi::ENOENT)?
+        };
         resolve_realpath(self.kernel, &cwd, &rewritten)
     }
 
