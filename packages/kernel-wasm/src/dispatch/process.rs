@@ -1267,6 +1267,7 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
     const WEXITED: u32 = 4;
     const WNOWAIT: u32 = 0x0100_0000;
     const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
 
     let Some([idtype, id, options]) = read_u32_args::<3>(request) else {
         return -(abi::EINVAL as i64);
@@ -1353,11 +1354,21 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
             // "fix" this asymmetry here without changing sys_wait too.
             k.process_mut(caller_pid).children.retain(|&c| c != pid);
         }
+        // Decode the kernel/host $?-style status: values 129..=192
+        // are "killed by signal (status - 128)" for signals 1..=64.
+        // Anything else is a normal exit with that code. CLD_DUMPED is
+        // not expressible — the 8-byte wait record carries no
+        // core-dump bit (tracked in the B1.2 follow-up).
+        let (si_code, si_status) = if (129..=192).contains(&status) {
+            (CLD_KILLED, status - 128)
+        } else {
+            (CLD_EXITED, status)
+        };
         response[0..4].copy_from_slice(&(SIGCHLD as i32).to_le_bytes());
-        response[4..8].copy_from_slice(&CLD_EXITED.to_le_bytes());
+        response[4..8].copy_from_slice(&si_code.to_le_bytes());
         response[8..12].copy_from_slice(&pid.to_le_bytes());
         response[12..16].copy_from_slice(&uid.to_le_bytes());
-        response[16..20].copy_from_slice(&status.to_le_bytes());
+        response[16..20].copy_from_slice(&si_status.to_le_bytes());
         20
     })
 }

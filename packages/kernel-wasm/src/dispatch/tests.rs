@@ -8475,6 +8475,124 @@ fn waitid_p_pid_reports_terminated_child_siginfo_then_reaps() {
     );
 }
 
+// #70 — waitid must distinguish signal death from a normal exit.
+// The kernel/host status convention is $?-style: a status in
+// [129, 192] is "killed by signal (status-128)" for signals 1..=64.
+
+#[test]
+fn waitid_reports_signal_death_as_cld_killed() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 9);
+    // SIGTERM (15) death → kernel records 128 + 15 = 143.
+    assert_eq!(record_exit(&record_exit_req(9, 128 + 15)), 0);
+
+    let mut buf = [0u8; 20];
+    let rc = dispatch(
+        METHOD_SYS_WAITID,
+        1,
+        &waitid_req(WAITID_P_PID, 9, WAITID_WEXITED),
+        &mut buf,
+    );
+    assert_eq!(rc, 20);
+    let (signo, code, pid, _uid, status) = decode_siginfo(&buf);
+    assert_eq!(signo, SIGCHLD as i32);
+    assert_eq!(code, 2, "CLD_KILLED for signal death, not CLD_EXITED");
+    assert_eq!(pid, 9);
+    assert_eq!(status, 15, "si_status is the terminating signal number");
+}
+
+#[test]
+fn waitid_status_128_stays_cld_exited() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 12);
+    assert_eq!(record_exit(&record_exit_req(12, 128)), 0);
+
+    let mut buf = [0u8; 20];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 12, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
+    );
+    let (signo, code, pid, _uid, status) = decode_siginfo(&buf);
+    assert_eq!(signo, SIGCHLD as i32);
+    assert_eq!(code, 1, "CLD_EXITED for literal exit status 128");
+    assert_eq!(pid, 12);
+    assert_eq!(status, 128);
+}
+
+#[test]
+fn waitid_status_129_reports_signal_1_death() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 13);
+    assert_eq!(record_exit(&record_exit_req(13, 128 + 1)), 0);
+
+    let mut buf = [0u8; 20];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 13, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
+    );
+    let (signo, code, pid, _uid, status) = decode_siginfo(&buf);
+    assert_eq!(signo, SIGCHLD as i32);
+    assert_eq!(code, 2, "CLD_KILLED for first signal death");
+    assert_eq!(pid, 13);
+    assert_eq!(status, 1, "si_status is the terminating signal number");
+}
+
+#[test]
+fn waitid_reports_sig64_death_as_cld_killed() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 11);
+    // SIGRTMAX (64) death -> kernel records 128 + 64 = 192.
+    assert_eq!(record_exit(&record_exit_req(11, 128 + 64)), 0);
+
+    let mut buf = [0u8; 20];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 11, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
+    );
+    let (signo, code, pid, _uid, status) = decode_siginfo(&buf);
+    assert_eq!(signo, SIGCHLD as i32);
+    assert_eq!(code, 2, "CLD_KILLED for signal 64 death");
+    assert_eq!(pid, 11);
+    assert_eq!(status, 64, "si_status is the terminating signal number");
+}
+
+#[test]
+fn waitid_normal_exit_stays_cld_exited() {
+    // Regression-lock the exit path: a plain code (not in 129..=192)
+    // must still be CLD_EXITED with si_status == the code.
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 10);
+    assert_eq!(record_exit(&record_exit_req(10, 42)), 0);
+    let mut buf = [0u8; 20];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 10, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
+    );
+    let (_signo, code, _pid, _uid, status) = decode_siginfo(&buf);
+    assert_eq!(code, 1, "CLD_EXITED");
+    assert_eq!(status, 42);
+}
+
 #[test]
 fn waitid_wnowait_leaves_child_reapable() {
     let _g = crate::kernel::TestGuard::acquire();
