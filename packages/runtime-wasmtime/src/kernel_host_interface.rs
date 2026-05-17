@@ -3590,6 +3590,31 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
     )?;
     linker.func_wrap(
         KH_NAMESPACE,
+        "kh_random",
+        |mut caller: Caller<'_, KernelStoreData>, out_ptr: u32, len: u32| -> i32 {
+            // Entropy is not privacy-sensitive (unlike the kh_now_realtime
+            // clock gate) — ungated. OS CSPRNG via the `getrandom` crate
+            // (already in the dep tree through rustls-tls for fetch()).
+            let len = len as usize;
+            if len == 0 {
+                return 0;
+            }
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -(EFAULT as i32),
+            };
+            let mut buf = vec![0u8; len];
+            if getrandom::getrandom(&mut buf).is_err() {
+                return -(EIO as i32);
+            }
+            if memory.write(&mut caller, out_ptr as usize, &buf).is_err() {
+                return -(EFAULT as i32);
+            }
+            0
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
         "kh_log",
         |mut caller: Caller<'_, KernelStoreData>,
          severity: u32,
