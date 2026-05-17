@@ -295,31 +295,54 @@ fn install_fd_rights_truncated(
         return -(abi::EINVAL as i64);
     }
     let count = rights.len() as u32;
-    out[0..4].copy_from_slice(&count.to_le_bytes());
     let fit = (out.len() - 4) / 4;
+    // Number of fds actually installed (always a contiguous prefix:
+    // we stop attempting installs at the first RLIMIT_NOFILE refusal,
+    // so a delivered slot is never followed by an un-written one).
+    let mut installed = 0u32;
+    // Set once the caller hits its RLIMIT_NOFILE soft limit; from
+    // there on every remaining right is dropped, and the reported
+    // count is truncated to `installed` so the guest is never handed
+    // an un-written (zero/stale) fd word as a valid fd (issue #143:
+    // before this, #135's `None` arm closed the entry but left the
+    // slot unwritten while the count still claimed it — the guest
+    // read a phantom fd, commonly 0/stdin). `recvmsg` has already
+    // consumed the data and dequeued the rights, so -EMFILE would
+    // also drop the payload; Linux `scm_detach_fds` likewise delivers
+    // the data and truncates the ancillary fd array.
+    let mut rlimit_truncated = false;
     for (index, entry) in rights.into_iter().enumerate() {
-        if index < fit {
-            let p = k.process_mut(caller_pid);
-            // Bound the install by the caller's RLIMIT_NOFILE soft
-            // limit (issue #110): an fd that would push the table
-            // past the limit is dropped, exactly like the
-            // doesn't-fit case, instead of trapping the kernel via
-            // the old `lowest_free_fd().expect(...)`.
-            match p.fd_table.lowest_free_fd_within(p.nofile_soft_limit()) {
-                Some(fd) => {
-                    k.process_mut(caller_pid).fd_table.install(fd, entry);
-                    let start = 4 + index * 4;
-                    out[start..start + 4].copy_from_slice(&fd.to_le_bytes());
-                }
-                None => {
-                    close_entry(k, entry);
-                }
-            }
-        } else {
+        if rlimit_truncated || index >= fit {
+            // Either we already hit the fd limit, or this fd does not
+            // fit in the caller's buffer. The doesn't-fit truncation
+            // (and its sent-vs-delivered `count` mismatch) is the
+            // pre-existing behavior owned by #133 / M2 — left as-is.
             close_entry(k, entry);
+            continue;
+        }
+        let p = k.process_mut(caller_pid);
+        match p.fd_table.lowest_free_fd_within(p.nofile_soft_limit()) {
+            Some(fd) => {
+                k.process_mut(caller_pid).fd_table.install(fd, entry);
+                let start = 4 + index * 4;
+                out[start..start + 4].copy_from_slice(&fd.to_le_bytes());
+                // Installs are a gapless prefix (we `continue` past
+                // out-of-range entries and stop at the first refusal),
+                // so a running count is exact and self-evident.
+                installed += 1;
+            }
+            None => {
+                close_entry(k, entry);
+                rlimit_truncated = true;
+            }
         }
     }
-    (4 + count.min(fit as u32) as usize * 4) as i64
+    // Pure doesn't-fit keeps `count == rights.len()` byte-for-byte
+    // (#133/M2 contract); an RLIMIT truncation reports the honest
+    // installed count instead.
+    let reported = if rlimit_truncated { installed } else { count };
+    out[0..4].copy_from_slice(&reported.to_le_bytes());
+    (4 + reported.min(fit as u32) as usize * 4) as i64
 }
 
 fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>) -> i64 {
