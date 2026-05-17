@@ -257,13 +257,19 @@ extern int killpg(pid_t pgrp, int sig);
 static inline void sync(void) {}
 
 /* syncfs — Linux extension. The kernel's METHOD_SYS_SYNCFS (issue #88)
- * gates on fd validity (EBADF / EINVAL); without a real shim guests
- * silently succeed on closed / pipe fds, so probe via fcntl(F_GETFD)
- * to mirror the kernel's gate. Proper kernel routing via a dedicated
+ * gates on fd validity AND fd type: EBADF for closed / unknown fds,
+ * EINVAL for pipe / socket (non-syncable) fds. Mirror both gates here
+ * via fstat — fcntl(F_GETFD) succeeds on pipes and sockets so the
+ * earlier probe under-rejected. Proper kernel routing via a dedicated
  * host_syncfs import is a follow-up. */
-#include <fcntl.h>
+#include <sys/stat.h>
 static inline int syncfs(int fd) {
-    if (fcntl(fd, F_GETFD) < 0) return -1;
+    struct stat _st;
+    if (fstat(fd, &_st) < 0) return -1; /* EBADF / errno already set */
+    if (S_ISFIFO(_st.st_mode) || S_ISSOCK(_st.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
     return 0;
 }
 
