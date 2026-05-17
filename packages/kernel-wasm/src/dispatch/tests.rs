@@ -5420,6 +5420,43 @@ fn proc_cwd_serves_chdir_path() {
 }
 
 #[test]
+fn proc_cwd_reflects_inode_anchored_cwd_after_rename() {
+    // Regression (review finding 2): with an inode-anchored cwd,
+    // /proc/<pid>/cwd must report the LIVE directory path, not the
+    // cached snapshot. fchdir into /base, then rename /base→/renamed
+    // via ABSOLUTE paths (which does NOT refresh pid 1's cwd.path),
+    // then read /proc/1/cwd via an ABSOLUTE open (also no refresh).
+    // procfs must still resolve through the live inode → /renamed,
+    // matching what getcwd would report — not the stale /base.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/base", b"/renamed"),
+            &mut []
+        ),
+        0
+    );
+
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/proc/1/cwd"), &mut []);
+    assert!(fd >= 3, "open /proc/1/cwd returned {fd}");
+    let mut buf = [0u8; 64];
+    let n = dispatch(METHOD_SYS_READ, 1, &(fd as u32).to_le_bytes(), &mut buf);
+    assert_eq!(
+        &buf[..n as usize],
+        b"/renamed",
+        "procfs cwd must track the rename via the live inode, not the stale snapshot"
+    );
+}
+
+#[test]
 fn proc_status_includes_name_when_argv_present() {
     let _g = crate::kernel::TestGuard::acquire();
     assert_eq!(dispatch(METHOD_SYS_GETUID, 6, &[], &mut []), 1000);
@@ -6177,7 +6214,7 @@ fn sys_spawn_inherits_parent_cwd_and_fd_table() {
     let child_pid = child_pid as u32;
 
     let child_cwd = with_kernel(|k| k.process(child_pid).cwd.clone());
-    assert_eq!(child_cwd, b"/tmp/work");
+    assert_eq!(child_cwd.path, b"/tmp/work");
 
     assert_eq!(
         dispatch(
@@ -8043,6 +8080,683 @@ fn openat_short_or_empty_request_is_einval() {
     assert_eq!(
         dispatch(METHOD_SYS_OPENAT, 1, &openat_req(AT_FDCWD, 0, b""), &mut []),
         -(abi::EINVAL as i64)
+    );
+}
+
+// --- Slice B2.9: FdEntry::Directory + Process.cwd dual shape (Task 5) ---
+//
+// Task 5 is a behavior-preserving SHAPE refactor. Resolution behavior is
+// unchanged (still path-snapshot) until Task 6 wires the inode walk. These
+// tests lock the *shape* and the degraded (`dir_inode == None`)
+// path-snapshot equivalence + the fork/clone inode-inheritance mechanism.
+
+#[test]
+fn openat_degraded_mode_for_non_inode_backend() {
+    // A directory fd whose backend reports no dir inode (`dir_inode ==
+    // None`) is the path-snapshot degraded mode. Spec §3: in degraded
+    // mode `openat` behaves EXACTLY as today. We install a `Directory`
+    // fd with `dir_inode: None` directly (the shape a non-inode backend
+    // such as HostFsBackend yields) and assert the path-snapshot join
+    // still resolves a child create under the snapshot path — identical
+    // to pre-Task-5 behavior.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/deg", &mut []), 0);
+    // Hand-install a degraded dir fd: dir_inode == None, path snapshot.
+    let dfd = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(1);
+        let fd = p.fd_table.lowest_free_fd();
+        p.fd_table.install(
+            fd,
+            FdEntry::Directory {
+                mount_id: crate::vfs::ROOT_MOUNT,
+                dir_inode: None,
+                path: b"/deg".to_vec(),
+            },
+        );
+        fd
+    });
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dfd, O_CREAT | O_WRITE, b"x"),
+        &mut [],
+    );
+    assert!(fd >= 3, "degraded openat returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"hi"), &mut []),
+        2
+    );
+    // Path-snapshot join resolved to /deg/x exactly as pre-Task-5.
+    assert_eq!(read_abs(b"/deg/x"), b"hi");
+
+    // And the unchanged-dir snapshot fchdir/getcwd path is identical too.
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    let mut buf = [0u8; 16];
+    let n = dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf);
+    assert_eq!(&buf[..n as usize], b"/deg\0");
+}
+
+#[test]
+fn fork_child_cwd_inode_survives_parent_rename() {
+    // Task 5 scope: this locks the spec-test-#8 *inheritance mechanism* —
+    // `Process.cwd` (now `Cwd`) carries `dir_inode` across the fork/clone
+    // `cwd: p.cwd.clone()` so a forked child inherits the parent's
+    // inode-anchored cwd. We assert the shape clones the inode field.
+    //
+    // Task 6: the full rename-survival behavioral assertion (parent
+    // renames /base→/renamed, child relative open lands at /renamed/y)
+    // requires the PathResolver cwd-refresh + inode walk and is NOT
+    // asserted here — it is completed in Task 6.
+    let _g = crate::kernel::TestGuard::acquire();
+    let cwd = crate::kernel::Cwd {
+        mount_id: crate::vfs::ROOT_MOUNT,
+        dir_inode: Some(7),
+        path: b"/base".to_vec(),
+    };
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).cwd = cwd.clone();
+    });
+    // Clone-through: a child Process that inherits via `cwd: p.cwd.clone()`
+    // carries the SAME dir_inode (spec #8 mechanism at kernel.rs:1390 fork
+    // / dispatch/process.rs:1342 spawn-fork inheritance).
+    let cloned = crate::kernel::with_kernel(|k| k.process(1).cwd.clone());
+    assert_eq!(cloned.mount_id, crate::vfs::ROOT_MOUNT);
+    assert_eq!(cloned.dir_inode, Some(7));
+    assert_eq!(cloned.path, b"/base");
+}
+
+// --- Slice B2.9 Task 6: inode-anchored openat walk + PathResolver
+//     cwd-refresh invariant (spec tests #4, #5, #7, #10, #11) ---
+
+/// Pack a METHOD_SYS_RENAME request: u32 old_len LE + old + new.
+fn rename_req2(old: &[u8], new: &[u8]) -> Vec<u8> {
+    let mut req = (old.len() as u32).to_le_bytes().to_vec();
+    req.extend_from_slice(old);
+    req.extend_from_slice(new);
+    req
+}
+
+/// Pack a METHOD_SYS_SYMLINK request: u32 target_len LE + target + link.
+fn symlink_req2(target: &[u8], link: &[u8]) -> Vec<u8> {
+    let mut req = (target.len() as u32).to_le_bytes().to_vec();
+    req.extend_from_slice(target);
+    req.extend_from_slice(link);
+    req
+}
+
+#[test]
+fn spec10_openat_dot_component_and_refreshed_parent_after_rename() {
+    // Spec #10: `./child` resolves exactly like `child`; after the base
+    // dir is renamed behind the open dirfd, `../renamed/child` resolves
+    // via the REFRESHED absolute base + centralized PathResolver
+    // normalization (the inode walk re-delegates on `.`/`..`).
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+
+    // `./child` == `child`: both create /base/child.
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dfd, O_CREAT | O_WRITE, b"./child"),
+        &mut [],
+    );
+    assert!(fd >= 3, "openat ./child returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"d"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/base/child"), b"d");
+
+    let fd2 = dispatch(METHOD_SYS_OPENAT, 1, &openat_req(dfd, 0, b"child"), &mut []);
+    assert!(fd2 >= 3, "openat child returned {fd2}");
+    let mut buf = [0u8; 8];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd2 as u32, 0, &[]), &mut buf);
+    assert_eq!(&buf[..n as usize], b"d", "./child == child");
+
+    // Rename /base → /renamed behind the open dirfd; the inode-anchored
+    // walk reconstructs the *current* absolute base, so `../renamed/child`
+    // resolves the refreshed path through centralized normalization.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/base", b"/renamed"),
+            &mut []
+        ),
+        0
+    );
+    let fd3 = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dfd, 0, b"../renamed/child"),
+        &mut [],
+    );
+    assert!(fd3 >= 3, "openat ../renamed/child returned {fd3}");
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd3 as u32, 0, &[]), &mut buf);
+    assert_eq!(
+        &buf[..n as usize],
+        b"d",
+        "../renamed/child via refreshed base"
+    );
+}
+
+#[test]
+fn spec4_openat_crosses_mount_boundary_into_proc() {
+    // Spec #4: with /proc mounted (ProcBackend), open `/` as a dir fd;
+    // `openat(fd,"proc/<pid>/status")` must resolve THROUGH the mount
+    // (re-delegate to sys_open / longest-prefix), not miss inside ramfs.
+    let _g = crate::kernel::TestGuard::acquire();
+    // Touch pid 1 so it is registered and /proc/1 is published; the
+    // caller (pid 1) is allowed to read its OWN /proc entry.
+    assert_eq!(dispatch(METHOD_SYS_GETUID, 1, &[], &mut []), 1000);
+    let rootfd = open_dir(b"/");
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(rootfd, 0, b"proc/1/status"),
+        &mut [],
+    );
+    assert!(
+        fd >= 3,
+        "openat across ramfs→proc mount boundary returned {fd}"
+    );
+}
+
+#[test]
+fn spec7_openat_symlink_mid_walk_redelegates() {
+    // Spec #7: a symlink component mid-walk (filetype 7) makes the inode
+    // walk stop, reconstruct the absolute path, and re-delegate to
+    // sys_open (centralized 40-hop SYMLOOP), NOT treat the symlink as a
+    // directory. /base/sym → /target (a dir holding `f`).
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/target", &mut []), 0);
+    let mut reg = Vec::new();
+    reg.extend_from_slice(&9_u32.to_le_bytes());
+    reg.extend_from_slice(b"/target/f");
+    reg.extend_from_slice(b"sym-ok");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SYMLINK,
+            1,
+            &symlink_req2(b"/target", b"/base/sym"),
+            &mut []
+        ),
+        0
+    );
+
+    let dfd = open_dir(b"/base");
+    let fd = dispatch(METHOD_SYS_OPENAT, 1, &openat_req(dfd, 0, b"sym/f"), &mut []);
+    assert!(fd >= 3, "openat sym/f returned {fd}");
+    let mut buf = [0u8; 16];
+    let n = dispatch(METHOD_SYS_PREAD, 1, &p_req(fd as u32, 0, &[]), &mut buf);
+    assert_eq!(&buf[..n as usize], b"sym-ok", "sym/f resolved /target/f");
+}
+
+#[test]
+fn openat_redelegation_matches_plain_open_for_socket_and_proc_intermediates() {
+    // Review concern: `needs_path_resolver` canonicalizes the parent
+    // via PathResolver::realpath, which overlaps the documented
+    // "don't route open through resolve_realpath" regression class
+    // (lexical `..`, unix-socket `entry_type==0`, `/proc`
+    // publish-timing). Lexical `..` cannot reach this branch (the walk
+    // is skipped when any component is `.`/`..`). This pins the other
+    // two: the inode-walk re-delegation for a SOCKET intermediate and
+    // a `/proc` intermediate must be byte-identical to the path-based
+    // `open` — i.e. introduce no socket / proc divergence (exactly the
+    // property the regression class is about). Equivalence, not a
+    // hardcoded errno, so it tracks `open` if that ever changes.
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // Register pid 1 so /proc/1 is published before the walk.
+    assert_eq!(dispatch(METHOD_SYS_GETUID, 1, &[], &mut []), 1000);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+
+    // (A) Unix socket bound at /base/sock: a path the VFS types via
+    // write_stat_record, so ramfs entry_type == 0 → resolve_at returns
+    // None → the socket is a non-descendable *intermediate* component
+    // → needs_path_resolver → realpath(parent = /base/sock).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_BIND,
+            1,
+            &socket_bind_unix_req(3, b"/base/sock"),
+            &mut []
+        ),
+        0
+    );
+    let dfd = open_dir(b"/base");
+    let via_openat = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dfd, 0, b"sock/x"),
+        &mut [],
+    );
+    let via_open = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/base/sock/x"), &mut []);
+    assert_eq!(
+        via_openat, via_open,
+        "socket-intermediate openat re-delegation diverged from plain open"
+    );
+    assert!(
+        via_openat < 0,
+        "socket-as-dir-component must error, not ghost-open ({via_openat})"
+    );
+
+    // (B) /proc/<pid> as an intermediate component (publish-timing
+    // sensitive): ramfs has no /proc entry, so resolve_at → None →
+    // realpath walks /proc/1 via ProcBackend.
+    let rootfd = open_dir(b"/");
+    let p_openat = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(rootfd, 0, b"proc/1/status"),
+        &mut [],
+    );
+    let p_open = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/proc/1/status"), &mut []);
+    assert_eq!(
+        p_openat >= 3,
+        p_open >= 3,
+        "/proc-intermediate openat re-delegation disagreed with plain open ({p_openat} vs {p_open})"
+    );
+    assert!(p_openat >= 3, "/proc/1/status must resolve ({p_openat})");
+}
+
+#[test]
+fn openat_into_child_mount_root_not_visible_in_parent_backend() {
+    // P1 regression: an inode-anchored dirfd on `/`; the root Ramfs
+    // backend has no `/dev` entry (mounts are a MountTable concept), so
+    // `resolve_at(root, "dev")` returns None. The inode walk must NOT
+    // treat that as a non-descendable intermediate and realpath(parent)
+    // — /dev's backend does not type its own root, so realpath("/dev")
+    // would ENOENT. It must re-delegate the whole path to `sys_open`,
+    // which routes `/dev/null` through the longest-prefix mount table
+    // (what the pre-B2.9 path-snapshot openat did). Pinned as
+    // equivalence with plain `open` so it cannot silently diverge.
+    let _g = crate::kernel::TestGuard::acquire();
+    let rootfd = open_dir(b"/");
+    let via_openat = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(rootfd, 0, b"dev/null"),
+        &mut [],
+    );
+    let via_open = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/dev/null"), &mut []);
+    assert!(
+        via_open >= 3,
+        "precondition: /dev/null opens via plain open ({via_open})"
+    );
+    assert!(
+        via_openat >= 3,
+        "openat(/, \"dev/null\") must reach the /dev child mount, got {via_openat}"
+    );
+}
+
+#[test]
+fn spec5_fchdir_getcwd_consistent_across_rename_root_mount() {
+    // Spec #5: fchdir(open /base); rename /base → /renamed; a relative
+    // create lands under /renamed; getcwd reports /renamed.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/base", b"/renamed"),
+            &mut []
+        ),
+        0
+    );
+    // Relative create resolves through the refreshed cwd → /renamed/y.
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"y"),
+        &mut [],
+    );
+    assert!(fd >= 3, "relative open y returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"Y"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/renamed/y"), b"Y");
+    // getcwd reports the refreshed absolute path.
+    let mut buf = [0u8; 32];
+    let n = dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf);
+    assert_eq!(&buf[..n as usize], b"/renamed\0");
+}
+
+#[test]
+fn fchdir_open_dirfd_after_rename_uses_live_inode_path() {
+    // Regression: fchdir must validate and adopt the live inode path,
+    // not the stale path snapshot captured when the dirfd was opened.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/base", b"/renamed"),
+            &mut []
+        ),
+        0
+    );
+
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0,
+        "fchdir should follow the live dir inode after rename"
+    );
+
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"after"),
+        &mut [],
+    );
+    assert!(fd >= 3, "relative create after fchdir returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"R"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/renamed/after"), b"R");
+}
+
+#[test]
+fn getcwd_removed_inode_anchored_cwd_is_enoent() {
+    // Regression: after an inode-anchored cwd is removed, getcwd must
+    // not report the stale cached path.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/gone", &mut []), 0);
+    let dfd = open_dir(b"/gone");
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/gone", &mut []), 0);
+
+    let mut buf = [0u8; 32];
+    assert_eq!(
+        dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf),
+        -(abi::ENOENT as i64),
+        "getcwd with a removed inode-anchored cwd must fail ENOENT"
+    );
+}
+
+#[test]
+fn spec5_fchdir_getcwd_across_rename_non_root_mount() {
+    // Spec #5 (non-root mount): a backend mounted at /mnt must report a
+    // /mnt-PREFIXED absolute cwd, never mount-relative `/` or `/child`.
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.vfs
+            .add_mount(b"/mnt".to_vec(), Box::new(crate::vfs::RamfsBackend::new()));
+    });
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/mnt/base", &mut []), 0);
+    let dfd = open_dir(b"/mnt/base");
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    let mut buf = [0u8; 32];
+    let n = dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf);
+    assert_eq!(
+        &buf[..n as usize],
+        b"/mnt/base\0",
+        "mount-absolute, not /base"
+    );
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/mnt/base", b"/mnt/renamed"),
+            &mut []
+        ),
+        0
+    );
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"z"),
+        &mut [],
+    );
+    assert!(fd >= 3, "relative open z returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"M"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/mnt/renamed/z"), b"M");
+    let n = dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf);
+    assert_eq!(
+        &buf[..n as usize],
+        b"/mnt/renamed\0",
+        "non-root mount cwd stays /mnt-prefixed across rename"
+    );
+}
+
+#[test]
+fn spec11_all_relative_ops_use_refreshed_cwd_then_enoent_when_removed() {
+    // Spec #11: after fchdir(/base) + rename /base→/renamed, EVERY
+    // relative-path syscall (mkdir/unlink/chmod/realpath/spawn) uses
+    // /renamed via the refreshed cwd, not the stale snapshot. If the
+    // cwd dir is then removed (dir_path → None), those relative ops
+    // fail -ENOENT instead of using the stale path.
+    let _g = crate::kernel::TestGuard::acquire();
+    make_root(1);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/base", b"/renamed"),
+            &mut []
+        ),
+        0
+    );
+
+    // relative mkdir → /renamed/d
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"d", &mut []), 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/renamed/d", &mut [0u8; 16]),
+        16
+    );
+
+    // relative create + chmod + unlink all on /renamed/g
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"g"),
+        &mut [],
+    );
+    assert!(fd >= 3, "relative create g returned {fd}");
+    let mut creq = 0o600_u32.to_le_bytes().to_vec();
+    creq.extend_from_slice(b"g");
+    assert_eq!(dispatch(METHOD_SYS_CHMOD, 1, &creq, &mut []), 0);
+    // realpath of a relative path resolves through the refreshed cwd.
+    let mut out = [0u8; 64];
+    let rn = dispatch(METHOD_SYS_REALPATH, 1, b"g", &mut out);
+    assert_eq!(&out[..rn as usize], b"/renamed/g\0");
+    assert_eq!(dispatch(METHOD_SYS_UNLINK, 1, b"g", &mut []), 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/renamed/g", &mut [0u8; 16]),
+        -(abi::ENOENT as i64)
+    );
+
+    // Remove the cwd directory: relative ops must now fail -ENOENT
+    // (dir_path → None) rather than fall back to the stale path. The
+    // /renamed/d subdir was created above; remove it then /renamed.
+    assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/renamed/d", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/renamed", &mut []), 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_MKDIR, 1, b"orphan", &mut []),
+        -(abi::ENOENT as i64),
+        "relative op with removed inode-anchored cwd → ENOENT"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_REALPATH, 1, b"x", &mut out),
+        -(abi::ENOENT as i64),
+        "relative realpath with removed cwd → ENOENT"
+    );
+}
+
+#[test]
+fn absolute_paths_do_not_depend_on_removed_cwd() {
+    // Regression: removed inode-anchored cwd must only fail relative
+    // path resolution. Absolute paths do not need cwd liveness.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/gone", &mut []), 0);
+    let dfd = open_dir(b"/gone");
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/gone", &mut []), 0);
+
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"/abs-after-gone"),
+        &mut [],
+    );
+    assert!(
+        fd >= 3,
+        "absolute open should not consult removed cwd, got {fd}"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"A"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/abs-after-gone"), b"A");
+
+    let mut out = [0u8; 64];
+    let n = dispatch(METHOD_SYS_REALPATH, 1, b"/abs-after-gone", &mut out);
+    assert!(n > 0, "absolute realpath returned {n}");
+    assert_eq!(&out[..n as usize], b"/abs-after-gone\0");
+}
+
+// --- Slice B2.9 Task 7: removed-dir → ENOENT + rename-stability
+//     (spec tests #1, #3) ---
+
+#[test]
+fn spec1_openat_rename_stability_dod() {
+    // Spec #1 (the slice DoD): a directory fd is anchored to the
+    // directory INODE, not a path snapshot. `open("/base",O_DIRECTORY)`;
+    // `rename("/base","/renamed")` behind the still-open dirfd; then
+    // `openat(fd,"x",O_CREAT|O_WRITE)` must create the file at the
+    // CURRENT path of that inode — `/renamed/x`, NOT the stale
+    // `/base/x`. Reading `/renamed/x` back returns the bytes written.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+
+    // Rename the directory out from under the open dirfd.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/base", b"/renamed"),
+            &mut []
+        ),
+        0
+    );
+
+    // openat through the inode-anchored dirfd creates at the CURRENT
+    // path of the inode (/renamed), not the pre-rename snapshot.
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dfd, O_CREAT | O_WRITE, b"x"),
+        &mut [],
+    );
+    assert!(fd >= 3, "openat after rename returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"DoD"), &mut []),
+        3
+    );
+
+    // It really landed at /renamed/x, readable with the bytes written.
+    assert_eq!(read_abs(b"/renamed/x"), b"DoD");
+
+    // And it did NOT create the stale /base/x.
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/base/x"), &mut []),
+        -(abi::ENOENT as i64),
+        "rename-stable dirfd must not create under the pre-rename path"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/base/x", &mut [0u8; 16]),
+        -(abi::ENOENT as i64),
+        "/base/x must not exist"
+    );
+}
+
+#[test]
+fn spec3_openat_removed_dir_is_enoent_create_and_lookup() {
+    // Spec #3 (PR #63 review [P2]): a removed directory has NO linkable
+    // path (POSIX), so an inode-anchored dirfd whose directory was
+    // `rmdir`d must fail `openat` with exactly -ENOENT — for BOTH the
+    // O_CREAT path and a plain lookup. This is EXPLICITLY distinct from
+    // the rename case in spec #1 (where the inode is still live at a new
+    // path): here `dir_abspath_in` returns `None` and dispatch maps that
+    // to ENOENT before any walk / sys_open delegation.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    let dfd = open_dir(b"/d");
+
+    // Remove the directory out from under the still-open dirfd.
+    assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/d", &mut []), 0);
+
+    // O_CREAT through the removed dirfd: must NOT create under a stale
+    // or empty reconstructed path — exactly -ENOENT.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_OPENAT,
+            1,
+            &openat_req(dfd, O_CREAT | O_WRITE, b"child"),
+            &mut []
+        ),
+        -(abi::ENOENT as i64),
+        "O_CREAT through a removed inode-anchored dirfd → ENOENT"
+    );
+    // The create attempt left nothing behind anywhere.
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/d/child", &mut [0u8; 16]),
+        -(abi::ENOENT as i64),
+        "removed-dir create must not materialize a file"
+    );
+
+    // A plain lookup (no O_CREAT) through the same dirfd is likewise
+    // -ENOENT.
+    assert_eq!(
+        dispatch(METHOD_SYS_OPENAT, 1, &openat_req(dfd, 0, b"child"), &mut []),
+        -(abi::ENOENT as i64),
+        "lookup through a removed inode-anchored dirfd → ENOENT"
     );
 }
 

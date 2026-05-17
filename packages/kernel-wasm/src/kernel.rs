@@ -148,10 +148,24 @@ pub enum FdEntry {
     File {
         ofd_id: u64,
     },
-    /// Open directory handle. Directory fds are kernel-owned path
+    /// Open directory handle. Directory fds are kernel-owned
     /// capabilities; they do not use OFDs because there is no byte
     /// cursor or backend inode operation behind fchdir/readdir.
+    ///
+    /// Dual capability (B2.9): inode-anchored when the owning backend
+    /// supports dir inodes; path-snapshot degraded mode otherwise. The
+    /// inode walk that consumes `dir_inode` lands in Task 6 — Task 5 is
+    /// a behavior-preserving shape migration (still path-snapshot).
     Directory {
+        mount_id: crate::vfs::MountId,
+        /// `Some` ⇒ inode-anchored; `None` ⇒ path-snapshot degraded
+        /// mode (hostfs / overlay-if-deferred / embedder backends that
+        /// return `None` from `VfsBackend::dir_inode`).
+        dir_inode: Option<u64>,
+        /// Always the PathResolver-normalized ABSOLUTE snapshot
+        /// (preserves the `dispatch/fs.rs` absolute `debug_assert!`):
+        /// the degraded-mode fallback AND the cheap getcwd/readdir
+        /// source when inode-anchored.
         path: Vec<u8>,
     },
     /// Kernel-owned POSIX socket. `id` references a [`SocketEntry`] in
@@ -299,13 +313,33 @@ pub struct RtSignal {
     pub sender_pid: u32,
 }
 
+/// Process working directory — the dual `(mount_id, dir_inode, path)`
+/// capability mirroring [`FdEntry::Directory`] (B2.9). `path` stays the
+/// PathResolver-normalized ABSOLUTE snapshot (cwd has no UTF-8
+/// guarantee in POSIX). `Clone` is what carries `dir_inode` to a
+/// forked/spawned child via `cwd: p.cwd.clone()` (spec test #8
+/// inheritance mechanism). Task 5 keeps behavior path-snapshot; the
+/// inode-anchored PathResolver refresh lands in Task 6.
+#[derive(Clone, Debug)]
+pub struct Cwd {
+    // Set by chdir/fchdir, carried across fork/clone, and consumed by
+    // the B2.9 Task 6 `PathResolver` cwd-refresh invariant + `getcwd`
+    // mount-prefix composition: every relative-path syscall reconciles
+    // the cached `path` against the live directory this inode names.
+    pub mount_id: crate::vfs::MountId,
+    /// `Some` ⇒ inode-anchored; `None` ⇒ path-snapshot degraded mode.
+    pub dir_inode: Option<u64>,
+    /// Always the normalized ABSOLUTE cwd snapshot. Default `/`.
+    pub path: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Process {
     pub umask: u16,
     pub credentials: Credentials,
-    /// Working directory as raw bytes (cwd has no UTF-8 guarantee in
-    /// POSIX). Default `/`.
-    pub cwd: Vec<u8>,
+    /// Working directory. Default `/` (root mount, inode unresolved
+    /// until Task 6's PathResolver refresh — see `Default` impl).
+    pub cwd: Cwd,
     /// POSIX resource limits per `getrlimit` / `setrlimit`. `None`
     /// for unsupported resource ids; `Some((soft, hard))` otherwise.
     pub rlimits: [Option<ResourceLimit>; RLIMIT_SLOTS],
@@ -404,7 +438,20 @@ impl Default for Process {
         Self {
             umask: DEFAULT_UMASK,
             credentials: Credentials::DEFAULT,
-            cwd: b"/".to_vec(),
+            // `Process` is constructed independently of the `Kernel`'s
+            // `MountTable` (lazy per-pid insert has no MountTable in
+            // scope), so the root dir inode cannot be resolved here.
+            // `mount_id = ROOT_MOUNT`, `dir_inode = None` is the
+            // degraded-but-correct default: behavior is path-snapshot
+            // until Task 6, where the PathResolver cwd-refresh
+            // invariant resolves `/` to its live inode on first
+            // relative resolution. `path: "/"` preserves the absolute
+            // snapshot invariant exactly as the old `Vec<u8>` cwd.
+            cwd: Cwd {
+                mount_id: crate::vfs::ROOT_MOUNT,
+                dir_inode: None,
+                path: b"/".to_vec(),
+            },
             rlimits: DEFAULT_RLIMITS,
             fd_table: FdTable::default(),
             stdin_buffer: std::collections::VecDeque::new(),
@@ -1413,7 +1460,21 @@ impl Kernel {
                 pgid: if p.pgid == 0 { *pid } else { p.pgid },
                 sid: if p.sid == 0 { *pid } else { p.sid },
                 argv: p.argv.clone(),
-                cwd: p.cwd.clone(),
+                // /proc/<pid>/cwd must be the LIVE directory path.
+                // `cwd.path` is only a cache refreshed by that
+                // process's own relative-path / getcwd / fchdir; a
+                // rename behind an inode-anchored cwd leaves it stale.
+                // Resolve through the live inode→path map (the same
+                // source getcwd uses) so procfs and getcwd agree. A
+                // removed dir (dir_abspath_in == None) or a degraded
+                // (dir_inode == None) cwd falls back to the snapshot.
+                cwd: match p.cwd.dir_inode {
+                    Some(ino) => self
+                        .vfs
+                        .dir_abspath_in(p.cwd.mount_id, ino)
+                        .unwrap_or_else(|| p.cwd.path.clone()),
+                    None => p.cwd.path.clone(),
+                },
             })
             .collect();
         self.vfs.refresh_processes(&snaps);
@@ -2087,7 +2148,9 @@ mod tests {
         let umask = with_kernel(|k| k.process_mut(42).umask);
         let cwd = with_kernel(|k| k.process_mut(42).cwd.clone());
         assert_eq!(umask, DEFAULT_UMASK);
-        assert_eq!(cwd, b"/");
+        assert_eq!(cwd.path, b"/");
+        assert_eq!(cwd.mount_id, crate::vfs::ROOT_MOUNT);
+        assert_eq!(cwd.dir_inode, None);
     }
 
     #[test]

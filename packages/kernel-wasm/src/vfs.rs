@@ -190,6 +190,29 @@ pub trait VfsBackend: Send {
         0
     }
 
+    /// Stable inode of `path` iff it is a directory. `None` ⇒ this
+    /// backend does not support inode-anchored dirs (caller uses the
+    /// path-snapshot degraded mode for that mount).
+    fn dir_inode(&self, _path: &[u8]) -> Option<u64> {
+        None
+    }
+
+    /// Resolve ONE component `name` directly under `dir_inode`.
+    /// Returns `(child_inode, filetype)`; `filetype` is the existing
+    /// WASI byte from `entry_type` (3=DIR,4=REG,7=SYMLINK). The child
+    /// inode is `None` for symlinks (dispatch falls back to the
+    /// path-based resolver — no fake inodes).
+    fn resolve_at(&self, _dir_inode: u64, _name: &[u8]) -> Option<(Option<u64>, u8)> {
+        None
+    }
+
+    /// Reverse: current absolute (mount-relative) path of a live dir
+    /// inode; `None` if the inode is no longer a live directory
+    /// (rmdir/unlink) — distinct from "backend unsupported".
+    fn dir_path(&self, _dir_inode: u64) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Create a hard link at `link_path` pointing at the same inode
     /// as `target`. Both paths are absolute on the backend (already
     /// stripped of any mount prefix by the dispatch layer). Returns
@@ -222,6 +245,34 @@ struct Mount {
 pub type MountId = u32;
 
 pub const ROOT_MOUNT: MountId = 0;
+
+/// Compose a mount-ABSOLUTE path from a mount `prefix` (root mount =
+/// `/`, others e.g. `/mnt` with no trailing slash) and a backend's
+/// mount-RELATIVE `rel` (always starts `/`; the mount root is `/`).
+/// Root mount: prefix `/` + rel `/d` ⇒ `/d`; prefix `/` + rel `/` ⇒
+/// `/`. Non-root: prefix `/mnt` + rel `/` ⇒ `/mnt`; prefix `/mnt` +
+/// rel `/d` ⇒ `/mnt/d`. Never doubles or drops the separator.
+pub(crate) fn compose_mount_abspath(prefix: &[u8], rel: &[u8]) -> Vec<u8> {
+    if prefix == b"/" {
+        // Root mount: the mount-relative path *is* the absolute path
+        // (matching `MountTable::resolve`'s root branch).
+        return if rel.is_empty() {
+            b"/".to_vec()
+        } else {
+            rel.to_vec()
+        };
+    }
+    // Non-root mount: prefix + rel, where rel == b"/" means the mount
+    // root itself (just the prefix).
+    let mut out = prefix.to_vec();
+    if rel != b"/" && !rel.is_empty() {
+        if !rel.starts_with(b"/") {
+            out.push(b'/');
+        }
+        out.extend_from_slice(rel);
+    }
+    out
+}
 
 /// Mount table. Resolution is longest-prefix-match against the
 /// installed mounts. The root mount (prefix `/`) is mandatory and
@@ -282,6 +333,67 @@ impl MountTable {
             path[self.mounts[i].prefix.len()..].to_vec()
         };
         Some((i as MountId, rel))
+    }
+
+    /// `(mount_id, dir_inode)` for an absolute path that is a
+    /// directory in a backend supporting inode anchoring.
+    // Consumed since B2.9 Task 5 (the `dir_anchor` helper in
+    // dispatch/fs.rs: sys_open dir-branch / chdir / fchdir).
+    pub fn dir_inode_at(&self, path: &[u8]) -> Option<(MountId, u64)> {
+        let (mid, rel) = self.resolve(path)?;
+        let ino = self.mounts[mid as usize].backend.dir_inode(&rel)?;
+        Some((mid, ino))
+    }
+
+    /// One-component resolve within `(mount_id, dir_inode)`.
+    // Consumed by the inode-anchored openat walk (B2.9 Task 6).
+    pub fn resolve_at_in(
+        &self,
+        mount_id: MountId,
+        dir_inode: u64,
+        name: &[u8],
+    ) -> Option<(Option<u64>, u8)> {
+        self.mounts[mount_id as usize]
+            .backend
+            .resolve_at(dir_inode, name)
+    }
+
+    /// Live mount-relative path of `(mount_id, dir_inode)`.
+    // Consumed by the PathResolver cwd-refresh invariant (B2.9 Task 6).
+    pub fn dir_path_in(&self, mount_id: MountId, dir_inode: u64) -> Option<Vec<u8>> {
+        self.mounts[mount_id as usize].backend.dir_path(dir_inode)
+    }
+
+    /// Absolute path prefix the mount is rooted at. The root mount
+    /// reports `/`; a backend mounted at `/mnt` reports `/mnt` (no
+    /// trailing slash, matching the `Mount::prefix` invariant). B2.9
+    /// Task 6 composes this with `dir_path_in` so a refreshed cwd /
+    /// `getcwd` is the mount-ABSOLUTE path, never mount-relative.
+    pub fn mount_prefix(&self, mount_id: MountId) -> Vec<u8> {
+        self.mounts[mount_id as usize].prefix.clone()
+    }
+
+    /// Public longest-prefix mount resolver: `(mount_id, relpath)` for
+    /// an absolute path, mirroring the private `resolve`. B2.9 Task 6's
+    /// openat walk uses it to detect a child-mount crossing (the
+    /// reconstructed path resolves to a *different* mount than the
+    /// dirfd's) so it can stop the inode walk and re-delegate to the
+    /// path-based `sys_open` (which routes through this same
+    /// longest-prefix logic).
+    pub fn mount_of(&self, path: &[u8]) -> Option<(MountId, Vec<u8>)> {
+        self.resolve(path)
+    }
+
+    /// Compose the mount-ABSOLUTE path of `(mount_id, dir_inode)` from
+    /// the backend's live mount-relative `dir_path` and the mount
+    /// prefix. `None` ⇒ the inode is no longer a live directory
+    /// (rmdir/unlink) — callers map that to `ENOENT`. Normalizes the
+    /// join so the root mount yields `/...` and a `/mnt` mount yields
+    /// `/mnt/...` (never a doubled or missing separator).
+    pub fn dir_abspath_in(&self, mount_id: MountId, dir_inode: u64) -> Option<Vec<u8>> {
+        let rel = self.dir_path_in(mount_id, dir_inode)?;
+        let prefix = self.mount_prefix(mount_id);
+        Some(compose_mount_abspath(&prefix, &rel))
     }
 
     pub fn open(&mut self, path: &[u8], flags: u32) -> Option<(MountId, u64)> {
@@ -475,12 +587,19 @@ pub struct RamfsBackend {
     /// from regular files so lookup paths can fall through to
     /// readlink without colliding with regular-file inode numbers.
     symlinks: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// Explicit directory paths. mkdir adds; rmdir removes (only
-    /// if empty). readdir filters self.paths/symlinks by parent.
+    /// path → stable dir inode. mkdir mints (from `next_id`, the
+    /// same counter `install` uses for file inodes — one
+    /// collision-free id space within ramfs); rmdir frees both
+    /// sides. Dir inodes never enter `inodes`/`refcount`:
+    /// directories have no byte content and no hardlinks (isolation
+    /// invariant). readdir filters self.paths/symlinks by parent.
     /// Phase 8: directories carry no metadata of their own beyond
     /// the implicit "this path is a dir" marker; future MetadataOverlay
     /// stores dir-level uid/gid/mode independently.
-    dirs: BTreeSet<Vec<u8>>,
+    dir_inodes: BTreeMap<Vec<u8>, u64>,
+    /// reverse: dir inode → current path. Moved (never reused) on
+    /// directory rename; removed on rmdir. Backs `dir_path`.
+    dir_paths: BTreeMap<u64, Vec<u8>>,
     /// inode → number of paths referring to it. Bumped by install
     /// (creating a new path) and by `link`; decremented by `unlink`.
     /// When the count hits zero the inode buffer in `inodes` is
@@ -492,13 +611,18 @@ pub struct RamfsBackend {
 
 impl RamfsBackend {
     pub fn new() -> Self {
-        let mut dirs = BTreeSet::new();
-        dirs.insert(b"/".to_vec());
+        let mut dir_inodes = BTreeMap::new();
+        let mut dir_paths = BTreeMap::new();
+        // Fixed root dir inode (id 0 is reserved for it; next_id
+        // starts at 1 for everything else — unchanged).
+        dir_inodes.insert(b"/".to_vec(), 0u64);
+        dir_paths.insert(0u64, b"/".to_vec());
         Self {
             inodes: BTreeMap::new(),
             paths: BTreeMap::new(),
             symlinks: BTreeMap::new(),
-            dirs,
+            dir_inodes,
+            dir_paths,
             refcount: BTreeMap::new(),
             next_id: 1,
         }
@@ -563,6 +687,10 @@ impl Default for RamfsBackend {
 // Inode ids are stable so callers can hold a fd across opens; nothing
 // here references the kernel's process table.
 
+/// Fixed dir inode for the `/dev` mount root. `0` is reserved for it
+/// (the device files use 1/2), mirroring the ramfs/proc convention of
+/// reserving id 0 for the mount root directory.
+const DEV_ROOT_INODE: u64 = 0;
 const DEV_NULL_INODE: u64 = 1;
 const DEV_ZERO_INODE: u64 = 2;
 const DEV_URANDOM_INODE: u64 = 3;
@@ -631,6 +759,30 @@ impl VfsBackend for DevBackend {
     fn size(&self, inode: u64) -> Option<u64> {
         match inode {
             DEV_NULL_INODE | DEV_ZERO_INODE | DEV_URANDOM_INODE | DEV_RANDOM_INODE => Some(0),
+            _ => None,
+        }
+    }
+
+    fn dir_inode(&self, path: &[u8]) -> Option<u64> {
+        // Fixed namespace: only the mount root `/` is a directory.
+        (path == b"/").then_some(DEV_ROOT_INODE)
+    }
+
+    fn dir_path(&self, dir_inode: u64) -> Option<Vec<u8>> {
+        (dir_inode == DEV_ROOT_INODE).then(|| b"/".to_vec())
+    }
+
+    fn resolve_at(&self, dir_inode: u64, name: &[u8]) -> Option<(Option<u64>, u8)> {
+        if dir_inode != DEV_ROOT_INODE {
+            return None;
+        }
+        // Hardcoded /dev table. All entries are regular device files
+        // (WASI filetype 4); no subdirectories or symlinks in /dev.
+        match name {
+            b"null" => Some((Some(DEV_NULL_INODE), 4)),
+            b"zero" => Some((Some(DEV_ZERO_INODE), 4)),
+            b"urandom" => Some((Some(DEV_URANDOM_INODE), 4)),
+            b"random" => Some((Some(DEV_RANDOM_INODE), 4)),
             _ => None,
         }
     }
@@ -749,7 +901,7 @@ impl VfsBackend for RamfsBackend {
         };
         if self.paths.contains_key(link_path)
             || self.symlinks.contains_key(link_path)
-            || self.dirs.contains(link_path)
+            || self.dir_inodes.contains_key(link_path)
         {
             return -(crate::abi::EEXIST as i64) as i32;
         }
@@ -760,7 +912,7 @@ impl VfsBackend for RamfsBackend {
     }
 
     fn entry_type(&self, path: &[u8]) -> u8 {
-        if path == b"/" || self.dirs.contains(path) {
+        if path == b"/" || self.dir_inodes.contains_key(path) {
             3 // DIRECTORY
         } else if self.symlinks.contains_key(path) {
             7 // SYMBOLIC_LINK
@@ -771,26 +923,91 @@ impl VfsBackend for RamfsBackend {
         }
     }
 
+    fn dir_inode(&self, path: &[u8]) -> Option<u64> {
+        self.dir_inodes.get(path).copied()
+    }
+
+    fn dir_path(&self, dir_inode: u64) -> Option<Vec<u8>> {
+        self.dir_paths.get(&dir_inode).cloned()
+    }
+
+    fn resolve_at(&self, dir_inode: u64, name: &[u8]) -> Option<(Option<u64>, u8)> {
+        // Anchor on the live path of `dir_inode`. `None` ⇒ the inode
+        // is no longer a directory (rmdir/rename freed it).
+        let base = self.dir_paths.get(&dir_inode)?;
+        // Join `name` under the base without doubling the separator:
+        // root "/" + "f" = "/f"; "/d" + "f" = "/d/f".
+        let mut child = base.clone();
+        if child.last() != Some(&b'/') {
+            child.push(b'/');
+        }
+        child.extend_from_slice(name);
+        // Classify via the existing WASI filetype byte. Dir/file
+        // inodes come from the same maps `dir_inode`/`open` use;
+        // symlinks carry no inode (dispatch takes the path fallback).
+        match self.entry_type(&child) {
+            3 => Some((self.dir_inodes.get(&child).copied(), 3)),
+            4 => Some((self.paths.get(&child).copied(), 4)),
+            7 => Some((None, 7)),
+            _ => None,
+        }
+    }
+
     fn rename(&mut self, old_path: &[u8], new_path: &[u8]) -> i32 {
         if old_path == new_path {
             return 0;
+        }
+        // The root dir inode backs the global cwd/dirfd anchor; it can
+        // never be moved (POSIX rename of "/" is EBUSY). Without this
+        // guard, renaming "/" re-keys inode 0 to the new path and
+        // orphans every top-level entry. (rename ONTO "/" is already
+        // refused EEXIST by the dir-destination check below.)
+        if old_path == b"/" {
+            return -(crate::abi::EBUSY as i64) as i32;
         }
         // Source must exist (regular file, symlink, or directory).
         let src_kind = if self.paths.contains_key(old_path) {
             1u8
         } else if self.symlinks.contains_key(old_path) {
             2
-        } else if self.dirs.contains(old_path) {
+        } else if self.dir_inodes.contains_key(old_path) {
             3
         } else {
             return -(crate::abi::ENOENT as i64) as i32;
         };
+        if src_kind == 3 {
+            let mut descendant_prefix = old_path.to_vec();
+            descendant_prefix.push(b'/');
+            if new_path.starts_with(&descendant_prefix) {
+                return -(crate::abi::EINVAL as i64) as i32;
+            }
+        }
+        // The destination's parent directory must exist (POSIX
+        // ENOENT). `MountTable::rename` only proves both paths route
+        // to the same mount, not that the parent is real, so without
+        // this the recursive dir re-key — and the dir-inode reverse
+        // map — would publish a ghost subtree under a non-existent
+        // parent that an open dirfd/cwd could keep resolving. Same
+        // shape as the `mkdir` parent check; `parent_of` yields the
+        // always-present root "/" for a top-level destination.
+        if !self.dir_inodes.contains_key(&Self::parent_of(new_path)) {
+            return -crate::abi::ENOENT;
+        }
         // Destination handling: refuse if it's a directory (POSIX
         // requires the destination be empty, and we don't yet
         // walk children to check). Replace a regular file by
         // unlinking it first; replace a symlink the same way.
-        if self.dirs.contains(new_path) {
+        if self.dir_inodes.contains_key(new_path) {
             return -(crate::abi::EEXIST as i64) as i32;
+        }
+        // POSIX: a directory may only replace an (empty) directory.
+        // If the source is a directory and the destination exists as a
+        // non-directory (regular file or symlink), fail ENOTDIR rather
+        // than unlinking it below and moving the dir there (data loss).
+        if src_kind == 3
+            && (self.paths.contains_key(new_path) || self.symlinks.contains_key(new_path))
+        {
+            return -(crate::abi::ENOTDIR as i64) as i32;
         }
         if self.paths.contains_key(new_path) {
             self.unlink(new_path);
@@ -807,8 +1024,65 @@ impl VfsBackend for RamfsBackend {
                 self.symlinks.insert(new_path.to_vec(), target);
             }
             _ => {
-                self.dirs.remove(old_path);
-                self.dirs.insert(new_path.to_vec());
+                // Directory rename: re-key every descendant from the
+                // old prefix to the new prefix. Inode ids are
+                // preserved (only path keys move) so open file OFDs
+                // (which hold `inode`, not path) and every dir inode
+                // survive the parent-dir rename unchanged. Per the
+                // isolation invariant we touch ONLY the path-keyed
+                // maps (`paths`, `symlinks`, `dir_inodes`,
+                // `dir_paths`) and never `inodes`/`refcount` — file
+                // content and hardlink counts must survive untouched.
+                //
+                // A key `k` is in the subtree iff `k == old_path` OR
+                // `k` starts with `old_path + "/"` — an exact prefix
+                // boundary so `/base` never catches `/baseball`.
+                let mut prefix = old_path.to_vec();
+                prefix.push(b'/');
+                let in_subtree = |k: &[u8]| k == old_path || k.starts_with(&prefix);
+                let remap = |k: &[u8]| {
+                    let mut nk = new_path.to_vec();
+                    nk.extend_from_slice(&k[old_path.len()..]);
+                    nk
+                };
+
+                // Files (path → inode): inode id unchanged.
+                let moved: Vec<(Vec<u8>, u64)> = self
+                    .paths
+                    .iter()
+                    .filter(|(k, _)| in_subtree(k))
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                for (k, id) in moved {
+                    self.paths.remove(&k);
+                    self.paths.insert(remap(&k), id);
+                }
+
+                // Symlinks (path → target): target text unchanged.
+                let moved: Vec<(Vec<u8>, Vec<u8>)> = self
+                    .symlinks
+                    .iter()
+                    .filter(|(k, _)| in_subtree(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (k, target) in moved {
+                    self.symlinks.remove(&k);
+                    self.symlinks.insert(remap(&k), target);
+                }
+
+                // Dir inodes (forward + reverse), preserving ids.
+                let moved: Vec<(Vec<u8>, u64)> = self
+                    .dir_inodes
+                    .iter()
+                    .filter(|(k, _)| in_subtree(k))
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                for (k, id) in moved {
+                    self.dir_inodes.remove(&k);
+                    let nk = remap(&k);
+                    self.dir_inodes.insert(nk.clone(), id);
+                    self.dir_paths.insert(id, nk);
+                }
             }
         }
         0
@@ -829,20 +1103,33 @@ impl VfsBackend for RamfsBackend {
     fn mkdir(&mut self, path: &[u8]) -> i32 {
         if self.paths.contains_key(path)
             || self.symlinks.contains_key(path)
-            || self.dirs.contains(path)
+            || self.dir_inodes.contains_key(path)
         {
             return -crate::abi::EEXIST;
         }
         let parent = Self::parent_of(path);
-        if !self.dirs.contains(&parent) {
+        if !self.dir_inodes.contains_key(&parent) {
             return -crate::abi::ENOENT;
         }
-        self.dirs.insert(path.to_vec());
+        // Mint a fresh stable dir inode (forward + reverse). Shares
+        // `next_id` with file inodes but never enters
+        // `inodes`/`refcount` — dirs have no content/hardlinks.
+        let id = self.next_id;
+        self.next_id += 1;
+        self.dir_inodes.insert(path.to_vec(), id);
+        self.dir_paths.insert(id, path.to_vec());
         0
     }
 
     fn rmdir(&mut self, path: &[u8]) -> i32 {
-        if !self.dirs.contains(path) {
+        // The root dir inode backs the global cwd/dirfd anchor; it can
+        // never be freed (POSIX `rmdir("/")` is EBUSY). Without this
+        // an empty ramfs would fall through the emptiness walk below
+        // and delete dir_inodes["/"]/dir_paths[0].
+        if path == b"/" {
+            return -crate::abi::EBUSY;
+        }
+        if !self.dir_inodes.contains_key(path) {
             return -crate::abi::ENOENT; // (or ENOTDIR for a regular file)
         }
         // Empty check: walk children. A child is any tracked path
@@ -851,7 +1138,7 @@ impl VfsBackend for RamfsBackend {
             .paths
             .keys()
             .chain(self.symlinks.keys())
-            .chain(self.dirs.iter())
+            .chain(self.dir_inodes.keys())
         {
             if p == path {
                 continue;
@@ -860,7 +1147,10 @@ impl VfsBackend for RamfsBackend {
                 return -crate::abi::ENOTEMPTY;
             }
         }
-        self.dirs.remove(path);
+        // Free both sides of the dir-inode mapping.
+        if let Some(id) = self.dir_inodes.remove(path) {
+            self.dir_paths.remove(&id);
+        }
         0
     }
 
@@ -868,7 +1158,7 @@ impl VfsBackend for RamfsBackend {
         // Treat root "/" as always-extant; otherwise require a
         // mkdir record. (Root is implicit; mkdir on "/" would
         // -EEXIST anyway.)
-        let exists = path == b"/" || self.dirs.contains(path);
+        let exists = path == b"/" || self.dir_inodes.contains_key(path);
         if !exists {
             // If the path resolves to a regular file we should
             // surface -ENOTDIR via the dispatch layer; "None" here
@@ -880,7 +1170,7 @@ impl VfsBackend for RamfsBackend {
             .paths
             .keys()
             .chain(self.symlinks.keys())
-            .chain(self.dirs.iter())
+            .chain(self.dir_inodes.keys())
         {
             if p == path {
                 continue;
@@ -928,6 +1218,315 @@ mod tests {
         let mut buf = [0u8; 8];
 
         assert_eq!(dev.read(inode, 0, &mut buf), -(crate::abi::EFAULT as i64));
+    }
+
+    #[test]
+    fn vfs_backend_dir_handle_api_defaults_to_none() {
+        // The default-`None` contract is asserted via a backend that
+        // keeps the trait defaults. RamfsBackend (Task 2) and now
+        // proc/tar/dev (Task 4) all override the dir-handle API, so
+        // HostFsBackend — the permanent path-snapshot degraded-mode
+        // backend (host renames are invisible to us; spec §2) — is the
+        // remaining backend that intentionally keeps the trait defaults.
+        let b = HostFsBackend::new();
+        assert_eq!(b.dir_inode(b"/"), None);
+        assert_eq!(b.resolve_at(0, b"x"), None);
+        assert_eq!(b.dir_path(0), None);
+    }
+
+    #[test]
+    fn ramfs_dirs_have_stable_inodes_minted_and_freed() {
+        let mut b = RamfsBackend::new();
+        let root = b.dir_inode(b"/").expect("root has a fixed dir inode");
+        assert_eq!(b.mkdir(b"/d"), 0);
+        let d = b.dir_inode(b"/d").expect("mkdir mints a dir inode");
+        assert_ne!(d, root);
+        assert_eq!(b.dir_inode(b"/d"), Some(d), "inode stable across lookups");
+        assert_eq!(b.rmdir(b"/d"), 0);
+        assert_eq!(b.dir_inode(b"/d"), None, "rmdir frees the inode");
+        assert_eq!(b.dir_path(d), None, "reverse map freed too");
+    }
+
+    #[test]
+    fn ramfs_dir_rename_recursively_rekeys_children() {
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.mkdir(b"/base"), 0);
+        assert_eq!(b.mkdir(b"/base/sub"), 0);
+        let sub_ino = b.dir_inode(b"/base/sub").unwrap();
+        // File under the subtree (real install API: owned Vecs,
+        // returns the file inode id).
+        let file_ino = b.install(b"/base/sub/f".to_vec(), b"hi".to_vec());
+
+        assert_eq!(b.rename(b"/base", b"/renamed"), 0);
+
+        // Children reachable at the new prefix, gone at the old.
+        assert_eq!(b.entry_type(b"/renamed/sub/f"), 4, "file re-keyed");
+        assert_eq!(b.entry_type(b"/base/sub/f"), 0, "old key gone");
+
+        // Dir inode ids preserved (only path keys moved).
+        assert_eq!(b.dir_inode(b"/renamed/sub"), Some(sub_ino));
+        assert_eq!(b.dir_path(sub_ino).as_deref(), Some(&b"/renamed/sub"[..]));
+
+        // Isolation invariant: the FILE inode id is preserved across
+        // the rename (only the path key moved). This is exactly what
+        // keeps an open file's OFD — which holds the inode, not the
+        // path — valid after a parent-dir rename. Verified two ways:
+        // (1) the path→inode map still yields the original id at the
+        //     new key, and
+        // (2) the content is still readable via that inode.
+        assert_eq!(
+            b.paths.get(b"/renamed/sub/f".as_slice()).copied(),
+            Some(file_ino),
+            "file inode id preserved across rename (OFDs unaffected)"
+        );
+        let mut buf = [0u8; 8];
+        let n = b.read(file_ino, 0, &mut buf);
+        assert_eq!(
+            &buf[..n.max(0) as usize],
+            b"hi",
+            "content survives via inode"
+        );
+    }
+
+    #[test]
+    fn ramfs_dir_rename_into_own_descendant_is_einval() {
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.mkdir(b"/a"), 0);
+        assert_eq!(b.mkdir(b"/a/b"), 0);
+        let a_ino = b.dir_inode(b"/a").unwrap();
+        let b_ino = b.dir_inode(b"/a/b").unwrap();
+        let file_ino = b.install(b"/a/f".to_vec(), b"x".to_vec());
+
+        assert_eq!(
+            b.rename(b"/a", b"/a/b/c"),
+            -(crate::abi::EINVAL as i64) as i32
+        );
+
+        assert_eq!(b.dir_inode(b"/a"), Some(a_ino));
+        assert_eq!(b.dir_inode(b"/a/b"), Some(b_ino));
+        assert_eq!(b.dir_inode(b"/a/b/c"), None);
+        assert_eq!(b.paths.get(b"/a/f".as_slice()).copied(), Some(file_ino));
+        assert_eq!(b.entry_type(b"/a/b/c/f"), 0);
+    }
+
+    #[test]
+    fn ramfs_root_is_protected_from_rmdir_and_rename() {
+        // The root dir inode (id 0) backs the global cwd/dirfd
+        // inode-anchor invariant: every Process::new default cwd and
+        // `dir_inode_at("/")` resolve through it. `rmdir("/")` /
+        // `rename("/", …)` must NOT be able to free or move it (POSIX
+        // EBUSY), or the anchor breaks process-wide.
+        let mut b = RamfsBackend::new();
+        let root = b.dir_inode(b"/").expect("root inode exists");
+
+        // rmdir("/") on an empty ramfs would otherwise fall through
+        // the emptiness walk and delete dir_inodes["/"]/dir_paths[0].
+        assert_eq!(b.rmdir(b"/"), -(crate::abi::EBUSY as i64) as i32);
+        assert_eq!(b.dir_inode(b"/"), Some(root), "root survives rmdir(/)");
+        assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
+
+        // rename("/", "/new") would otherwise re-key inode 0 to /new
+        // and orphan every top-level entry.
+        assert_eq!(b.rename(b"/", b"/new"), -(crate::abi::EBUSY as i64) as i32);
+        assert_eq!(b.dir_inode(b"/"), Some(root), "root inode unchanged");
+        assert_eq!(b.dir_inode(b"/new"), None, "no phantom /new anchor");
+        assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
+    }
+
+    #[test]
+    fn ramfs_rename_into_missing_parent_is_enoent() {
+        // POSIX: rename fails ENOENT when a directory component of the
+        // destination does not exist. Without this guard the recursive
+        // dir re-key publishes a ghost subtree, and the new dir-inode
+        // reverse map reports its live path under a non-existent
+        // parent — an open dirfd/cwd could keep resolving/creating
+        // inside an unreachable tree. (mkdir already guards this.)
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.mkdir(b"/a"), 0);
+        assert_eq!(b.mkdir(b"/a/sub"), 0);
+        let a_ino = b.dir_inode(b"/a").unwrap();
+        let sub_ino = b.dir_inode(b"/a/sub").unwrap();
+
+        // Directory source, missing destination parent "/missing".
+        assert_eq!(b.rename(b"/a", b"/missing/a"), -crate::abi::ENOENT);
+        assert_eq!(b.dir_inode(b"/a"), Some(a_ino), "source dir unmoved");
+        assert_eq!(b.dir_inode(b"/missing/a"), None, "no ghost dir inode");
+        assert_eq!(b.dir_inode(b"/a/sub"), Some(sub_ino), "subtree unmoved");
+        assert_eq!(
+            b.dir_path(a_ino).as_deref(),
+            Some(&b"/a"[..]),
+            "reverse map not moved to a ghost path"
+        );
+
+        // Regular-file source, same missing parent → same ENOENT
+        // (the destination-parent rule is type-agnostic).
+        let f_ino = b.install(b"/f".to_vec(), b"x".to_vec());
+        assert_eq!(b.rename(b"/f", b"/missing/f"), -crate::abi::ENOENT);
+        assert_eq!(
+            b.paths.get(b"/f".as_slice()).copied(),
+            Some(f_ino),
+            "file unmoved"
+        );
+        assert_eq!(b.paths.get(b"/missing/f".as_slice()), None, "no ghost file");
+    }
+
+    #[test]
+    fn ramfs_rename_dir_onto_non_dir_is_enotdir() {
+        // POSIX: if the source is a directory, the destination must
+        // not exist or be an empty directory. Renaming a dir onto a
+        // regular file (or a symlink) must fail ENOTDIR — NOT silently
+        // unlink the destination and move the dir there (data loss).
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.mkdir(b"/d"), 0);
+        let d_ino = b.dir_inode(b"/d").unwrap();
+        let f_ino = b.install(b"/f".to_vec(), b"keep".to_vec());
+
+        assert_eq!(b.rename(b"/d", b"/f"), -crate::abi::ENOTDIR);
+        assert_eq!(
+            b.paths.get(b"/f".as_slice()).copied(),
+            Some(f_ino),
+            "destination file must not be unlinked"
+        );
+        assert_eq!(b.dir_inode(b"/d"), Some(d_ino), "source dir unmoved");
+        assert_eq!(b.dir_inode(b"/f"), None, "dir not placed at /f");
+
+        // A symlink destination is also not a directory → ENOTDIR.
+        assert_eq!(b.symlink(b"/target", b"/ln"), 0);
+        assert_eq!(b.rename(b"/d", b"/ln"), -crate::abi::ENOTDIR);
+        assert_eq!(b.dir_inode(b"/d"), Some(d_ino), "source dir still unmoved");
+        assert_eq!(b.dir_inode(b"/ln"), None);
+    }
+
+    #[test]
+    fn ramfs_resolve_at_classifies_children() {
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.mkdir(b"/d"), 0);
+        assert_eq!(b.mkdir(b"/d/sub"), 0);
+        let file_ino = b.install(b"/d/f".to_vec(), b"x".to_vec());
+        // Real symlink API: (target, link_path) — target first.
+        assert_eq!(b.symlink(b"/target", b"/d/ln"), 0);
+        let d = b.dir_inode(b"/d").unwrap();
+
+        // Directory child: filetype 3, child dir inode present.
+        assert_eq!(b.resolve_at(d, b"sub").map(|(_, t)| t), Some(3));
+        assert!(matches!(b.resolve_at(d, b"sub"), Some((Some(_), 3))));
+        assert_eq!(
+            b.resolve_at(d, b"sub").and_then(|(i, _)| i),
+            b.dir_inode(b"/d/sub")
+        );
+
+        // Regular file: filetype 4, file inode present.
+        assert_eq!(b.resolve_at(d, b"f"), Some((Some(file_ino), 4)));
+
+        // Symlink: filetype 7, NO inode (dispatch path-fallback).
+        assert_eq!(b.resolve_at(d, b"ln"), Some((None, 7)));
+
+        // Missing child → None.
+        assert_eq!(b.resolve_at(d, b"missing"), None);
+
+        // Root-base join must not double-slash: /<name>, not //<name>.
+        let root = b.dir_inode(b"/").unwrap();
+        assert_eq!(b.resolve_at(root, b"d"), Some((Some(d), 3)));
+    }
+
+    #[test]
+    fn proc_resolve_at_lists_pid_dirs() {
+        let mut b = ProcBackend::new();
+        // Seed via the real refresh_processes API (the only way proc
+        // entries exist). One process → /7/{status,cmdline,comm,cwd}.
+        let snap = ProcessSnapshot {
+            pid: 7,
+            ppid: 1,
+            uid: 0,
+            euid: 0,
+            gid: 0,
+            egid: 0,
+            pgid: 7,
+            sid: 7,
+            argv: vec![b"/bin/sh".to_vec()],
+            cwd: b"/".to_vec(),
+        };
+        b.refresh_processes(&[snap]);
+
+        let root = b.dir_inode(b"/").expect("proc root has a dir inode");
+        let pid7 = b.dir_inode(b"/7").expect("per-pid dir has an inode");
+        assert_ne!(root, pid7);
+
+        // root → /7 is a directory child carrying the pid dir inode.
+        assert_eq!(b.resolve_at(root, b"7"), Some((Some(pid7), 3)));
+        // /7 → status is a regular synthetic file.
+        let status_ino = b
+            .resolve_at(pid7, b"status")
+            .expect("status resolves under /7");
+        assert_eq!(status_ino.1, 4, "status is REGULAR_FILE");
+        assert!(status_ino.0.is_some(), "proc file inode is tracked");
+        // Missing child → None.
+        assert_eq!(b.resolve_at(pid7, b"missing"), None);
+
+        // dir_path round-trips both directories.
+        assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
+        assert_eq!(b.dir_path(pid7).as_deref(), Some(&b"/7"[..]));
+    }
+
+    #[test]
+    fn tar_resolve_at_from_path_index() {
+        let mut ar_bytes: Vec<u8> = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut ar_bytes);
+            for (path, body) in [
+                ("bin/sh", &b"#!sh"[..]),
+                ("etc/hosts", &b"127.0.0.1 localhost\n"[..]),
+            ] {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(path).unwrap();
+                header.set_size(body.len() as u64);
+                header.set_mode(0o644);
+                header.set_cksum();
+                builder.append(&header, body).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let b = TarLayerBackend::new(ar_bytes);
+
+        let root = b.dir_inode(b"/").expect("tar root has a dir inode");
+        let bin = b.dir_inode(b"/bin").expect("implicit /bin dir inode");
+        assert_ne!(root, bin);
+
+        // root → bin is a directory.
+        assert_eq!(b.resolve_at(root, b"bin"), Some((Some(bin), 3)));
+        // /bin → sh is a regular file with its tracked inode.
+        let sh = b.resolve_at(bin, b"sh").expect("sh resolves under /bin");
+        assert_eq!(sh.1, 4, "sh is REGULAR_FILE");
+        assert!(sh.0.is_some(), "tar file inode tracked");
+        // Missing child → None.
+        assert_eq!(b.resolve_at(bin, b"missing"), None);
+
+        // dir_path round-trips.
+        assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
+        assert_eq!(b.dir_path(bin).as_deref(), Some(&b"/bin"[..]));
+    }
+
+    #[test]
+    fn dev_resolve_at_fixed_namespace() {
+        let b = DevBackend::new();
+        let root = b.dir_inode(b"/").expect("dev root has a fixed dir inode");
+
+        // /dev/null, /dev/zero, and random devices are regular device files.
+        assert_eq!(b.resolve_at(root, b"null"), Some((Some(DEV_NULL_INODE), 4)));
+        assert_eq!(b.resolve_at(root, b"zero"), Some((Some(DEV_ZERO_INODE), 4)));
+        assert_eq!(
+            b.resolve_at(root, b"urandom"),
+            Some((Some(DEV_URANDOM_INODE), 4))
+        );
+        assert_eq!(
+            b.resolve_at(root, b"random"),
+            Some((Some(DEV_RANDOM_INODE), 4))
+        );
+        // Unknown child → None.
+        assert_eq!(b.resolve_at(root, b"missing"), None);
+
+        // dir_path round-trips the fixed root.
+        assert_eq!(b.dir_path(root).as_deref(), Some(&b"/"[..]));
     }
 
     #[test]
@@ -1298,14 +1897,32 @@ pub struct ProcBackend {
     entries: BTreeMap<Vec<u8>, (u64, Vec<u8>)>,
     /// Path → stable inode id (preserved across refreshes).
     inodes: BTreeMap<Vec<u8>, u64>,
+    /// Implicit directory → stable dir inode. `/proc` exposes `/`
+    /// (mount root) and one `/<pid>` directory per live process; the
+    /// per-pid files (`status`, `cmdline`, …) live under those. Minted
+    /// from the same `next_id` space as file inodes during
+    /// `refresh_processes`; a pid-dir inode is preserved across
+    /// refreshes while the pid lives (same stability contract as file
+    /// inodes) and dropped when the pid exits. Root `/` is fixed at
+    /// inode 0 (file ids start at 1, so 0 is free — the ramfs/dev/tar
+    /// mount-root convention). Backs `dir_inode`.
+    dir_inodes: BTreeMap<Vec<u8>, u64>,
+    /// Reverse: dir inode → path. Backs `dir_path`.
+    dir_paths: BTreeMap<u64, Vec<u8>>,
     next_id: u64,
 }
 
 impl ProcBackend {
     pub fn new() -> Self {
+        let mut dir_inodes = BTreeMap::new();
+        let mut dir_paths = BTreeMap::new();
+        dir_inodes.insert(b"/".to_vec(), 0u64);
+        dir_paths.insert(0u64, b"/".to_vec());
         Self {
             entries: BTreeMap::new(),
             inodes: BTreeMap::new(),
+            dir_inodes,
+            dir_paths,
             next_id: 1,
         }
     }
@@ -1471,7 +2088,28 @@ impl VfsBackend for ProcBackend {
         // content for those still present, leave the inode-id mapping
         // intact so any open fd survives a refresh.
         let mut new_entries: BTreeMap<Vec<u8>, (u64, Vec<u8>)> = BTreeMap::new();
+        // Rebuild the dir-inode maps each refresh: keep `/` (fixed
+        // inode 0) plus one `/<pid>` dir per live process, preserving
+        // an existing pid-dir inode while that pid lives (same
+        // stability contract as the per-file inodes above) so an open
+        // dir fd survives a refresh, and dropping it when the pid
+        // exits.
+        let mut new_dir_inodes: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut new_dir_paths: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        new_dir_inodes.insert(b"/".to_vec(), 0u64);
+        new_dir_paths.insert(0u64, b"/".to_vec());
         for snap in snapshots {
+            let pid_dir = format!("/{}", snap.pid).into_bytes();
+            let dir_id = match self.dir_inodes.get(&pid_dir) {
+                Some(&id) => id,
+                None => {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    id
+                }
+            };
+            new_dir_inodes.insert(pid_dir.clone(), dir_id);
+            new_dir_paths.insert(dir_id, pid_dir);
             // Per-pid files we synthesize. Each is a (suffix, content)
             // pair; we mint stable inode ids per absolute path.
             let files: [(&str, Vec<u8>); 4] = [
@@ -1495,6 +2133,34 @@ impl VfsBackend for ProcBackend {
             }
         }
         self.entries = new_entries;
+        self.dir_inodes = new_dir_inodes;
+        self.dir_paths = new_dir_paths;
+    }
+
+    fn dir_inode(&self, path: &[u8]) -> Option<u64> {
+        self.dir_inodes.get(path).copied()
+    }
+
+    fn dir_path(&self, dir_inode: u64) -> Option<Vec<u8>> {
+        self.dir_paths.get(&dir_inode).cloned()
+    }
+
+    fn resolve_at(&self, dir_inode: u64, name: &[u8]) -> Option<(Option<u64>, u8)> {
+        let base = self.dir_paths.get(&dir_inode)?;
+        // Join `name` under the base without doubling the separator
+        // ("/" + "7" = "/7"; "/7" + "status" = "/7/status").
+        let mut child = base.clone();
+        if child.last() != Some(&b'/') {
+            child.push(b'/');
+        }
+        child.extend_from_slice(name);
+        // /proc has synthetic dirs (/, /<pid>) and regular files; no
+        // symlinks at this layer.
+        match self.entry_type(&child) {
+            3 => Some((self.dir_inodes.get(&child).copied(), 3)),
+            4 => Some((self.entries.get(&child).map(|(id, _)| *id), 4)),
+            _ => None,
+        }
     }
 }
 
@@ -1701,6 +2367,15 @@ pub struct TarLayerBackend {
     /// override still reflects the image-builder's intent
     /// (e.g. `/bin/python` arrives 0o755).
     metadata: BTreeMap<u64, Metadata>,
+    /// Implicit directory → stable dir inode. Tar carries regular
+    /// files only; every proper prefix of a file path (plus the mount
+    /// root `/`) is an implicit directory. Minted once at construction
+    /// from the same `next_id` space as file inodes (collision-free
+    /// within the backend); never changes — the archive is immutable,
+    /// no rename. Backs `dir_inode`.
+    dir_inodes: BTreeMap<Vec<u8>, u64>,
+    /// Reverse: dir inode → path. Backs `dir_path`.
+    dir_paths: BTreeMap<u64, Vec<u8>>,
 }
 
 impl TarLayerBackend {
@@ -1765,11 +2440,43 @@ impl TarLayerBackend {
                 );
             }
         }
+        // Derive the implicit directory namespace. Root `/` is fixed
+        // at inode 0 (the file id space starts at 1, so 0 is free —
+        // same convention as ramfs/proc/dev mount roots). Every proper
+        // ancestor of each indexed file path is an implicit directory;
+        // mint a stable inode for each, continuing from `next_id`.
+        let mut dir_inodes: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut dir_paths: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        dir_inodes.insert(b"/".to_vec(), 0);
+        dir_paths.insert(0, b"/".to_vec());
+        for file_path in files.keys() {
+            // Walk each `/`-separated ancestor: "/a/b/c" yields the
+            // implicit dirs "/a" and "/a/b" (the final component is the
+            // file itself, not a dir). Relies on the `files` key
+            // invariant that every path is ABSOLUTE: `cut + 1` skips
+            // index 0 (the leading `/`) so the root itself is not
+            // re-derived. If that key format ever changes this loop
+            // must change with it.
+            let mut cut = 0;
+            while let Some(rel) = file_path[cut + 1..].iter().position(|&b| b == b'/') {
+                let end = cut + 1 + rel;
+                let ancestor = file_path[..end].to_vec();
+                if !dir_inodes.contains_key(&ancestor) {
+                    let id = next_id;
+                    next_id += 1;
+                    dir_inodes.insert(ancestor.clone(), id);
+                    dir_paths.insert(id, ancestor);
+                }
+                cut = end;
+            }
+        }
         Self {
             archive,
             files,
             inodes,
             metadata,
+            dir_inodes,
+            dir_paths,
         }
     }
 }
@@ -1883,6 +2590,32 @@ impl VfsBackend for TarLayerBackend {
             }
         }
         0
+    }
+
+    fn dir_inode(&self, path: &[u8]) -> Option<u64> {
+        self.dir_inodes.get(path).copied()
+    }
+
+    fn dir_path(&self, dir_inode: u64) -> Option<Vec<u8>> {
+        self.dir_paths.get(&dir_inode).cloned()
+    }
+
+    fn resolve_at(&self, dir_inode: u64, name: &[u8]) -> Option<(Option<u64>, u8)> {
+        let base = self.dir_paths.get(&dir_inode)?;
+        // Join `name` under the base without doubling the separator
+        // ("/" + "bin" = "/bin"; "/bin" + "sh" = "/bin/sh").
+        let mut child = base.clone();
+        if child.last() != Some(&b'/') {
+            child.push(b'/');
+        }
+        child.extend_from_slice(name);
+        // Tar carries regular files only; dirs are implicit. No
+        // symlinks in this index.
+        match self.entry_type(&child) {
+            3 => Some((self.dir_inodes.get(&child).copied(), 3)),
+            4 => Some((self.inodes.get(&child).copied(), 4)),
+            _ => None,
+        }
     }
 }
 

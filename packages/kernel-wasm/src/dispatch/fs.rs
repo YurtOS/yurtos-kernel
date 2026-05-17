@@ -8,6 +8,25 @@ fn can_modify_owned_metadata(credentials: crate::state::Credentials, owner_uid: 
     credentials.euid == 0 || credentials.euid == owner_uid
 }
 
+/// Derive the `(mount_id, dir_inode)` anchor for an already-normalized
+/// absolute directory `path`. Inode-anchored when the owning backend
+/// supports dir inodes (`MountTable::dir_inode_at` is `Some`), else the
+/// path-snapshot degraded mode: `(ROOT_MOUNT, None)`.
+///
+/// B2.9 Task 5 is a behavior-preserving shape migration — nothing reads
+/// `mount_id`/`dir_inode` to change resolution yet (that is Task 6);
+/// resolution still goes through the absolute `path` snapshot, so the
+/// degraded `(ROOT_MOUNT, None)` fallback is correct here. The
+/// `MountTable` has no public mount-id-only accessor (`resolve` is
+/// private), and adding one is out of Task 5's scope; `dir_inode_at`
+/// (the Task 1 pass-through) is the minimal sufficient lookup.
+fn dir_anchor(k: &Kernel, path: &[u8]) -> (crate::vfs::MountId, Option<u64>) {
+    match k.vfs.dir_inode_at(path) {
+        Some((mid, ino)) => (mid, Some(ino)),
+        None => (crate::vfs::ROOT_MOUNT, None),
+    }
+}
+
 pub(super) fn chdir(caller_pid: u32, request: &[u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
@@ -22,7 +41,12 @@ pub(super) fn chdir(caller_pid: u32, request: &[u8]) -> i64 {
             0 => return -(abi::ENOENT as i64),
             _ => return -(abi::ENOTDIR as i64),
         }
-        k.process_mut(caller_pid).cwd = path;
+        let (mount_id, dir_inode) = dir_anchor(k, &path);
+        k.process_mut(caller_pid).cwd = crate::kernel::Cwd {
+            mount_id,
+            dir_inode,
+            path,
+        };
         0
     })
 }
@@ -33,15 +57,34 @@ pub(super) fn fchdir(caller_pid: u32, request: &[u8]) -> i64 {
     }
     let fd = u32::from_le_bytes(request[0..4].try_into().unwrap());
     with_kernel(|k| {
-        let path = match k.process_mut(caller_pid).fd_table.entry(fd) {
-            Some(crate::kernel::FdEntry::Directory { path }) => path.clone(),
+        let (mount_id, dir_inode, path) = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(crate::kernel::FdEntry::Directory {
+                mount_id,
+                dir_inode,
+                path,
+            }) => (*mount_id, *dir_inode, path.clone()),
             Some(_) => return -(abi::ENOTDIR as i64),
             None => return -(abi::EBADF as i64),
         };
-        if k.vfs.entry_type(&path) != 3 {
-            return -(abi::ENOENT as i64);
-        }
-        k.process_mut(caller_pid).cwd = path;
+        let path = match dir_inode {
+            Some(ino) => match k.vfs.dir_abspath_in(mount_id, ino) {
+                Some(abs) => abs,
+                None => return -(abi::ENOENT as i64),
+            },
+            None => {
+                if k.vfs.entry_type(&path) != 3 {
+                    return -(abi::ENOENT as i64);
+                }
+                path
+            }
+        };
+        // Copy the fd's full (mount_id, dir_inode, path) capability into
+        // cwd (inode-anchored when the fd carried one, else snapshot).
+        k.process_mut(caller_pid).cwd = crate::kernel::Cwd {
+            mount_id,
+            dir_inode,
+            path,
+        };
         0
     })
 }
@@ -50,7 +93,30 @@ pub(super) fn getcwd(caller_pid: u32, response: &mut [u8]) -> i64 {
     // Mirrors the TS host_getcwd contract: returns the *required* size
     // (path length + 1 NUL byte). Caller compares against out_cap.
     with_kernel(|k| {
-        let cwd = k.process_mut(caller_pid).cwd.clone();
+        // B2.9 Task 6: refresh from the live inode→path mapping
+        // (mount-prefix-composed) so getcwd stays correct after the
+        // cwd directory is renamed. `dir_inode == None` is degraded
+        // path-snapshot mode; `dir_abspath_in == None` means the
+        // inode-anchored cwd was removed and has no linkable path.
+        let cwd_state = k.process(caller_pid).cwd.clone();
+        let cwd = match cwd_state.dir_inode {
+            Some(ino) => match k.vfs.dir_abspath_in(cwd_state.mount_id, ino) {
+                Some(abs) => {
+                    if abs != cwd_state.path {
+                        k.process_mut(caller_pid).cwd.path = abs.clone();
+                    }
+                    abs
+                }
+                None => return -(abi::ENOENT as i64),
+            },
+            // Degraded path-snapshot cwd. Intentionally does NOT do the
+            // lazy `/`→inode upgrade that `PathResolver::resolved_cwd`
+            // performs: the only `dir_inode == None` cwd that reaches
+            // here is the `Process::new` default whose path is `/`, and
+            // `/` is rename/rmdir-protected (EBUSY), so its snapshot
+            // can never go stale — refreshing it would be a no-op.
+            None => cwd_state.path,
+        };
         let required = cwd.len() + 1;
         if response.len() < required {
             return required as i64;
@@ -106,12 +172,20 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             if writable || create || trunc {
                 return -(abi::EISDIR as i64);
             }
+            // Dual-shape anchor: inode-anchored when the backend
+            // supports dir inodes, else path-snapshot degraded mode.
+            // Behavior is path-snapshot identical until Task 6 wires
+            // the inode walk.
+            let (mount_id, dir_inode) = dir_anchor(k, path);
+            let dir_path = path.to_vec();
             let p = k.process_mut(caller_pid);
             let fd = p.fd_table.lowest_free_fd();
             p.fd_table.install(
                 fd,
                 crate::kernel::FdEntry::Directory {
-                    path: path.to_vec(),
+                    mount_id,
+                    dir_inode,
+                    path: dir_path,
                 },
             );
             return fd as i64;
@@ -148,12 +222,34 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
 }
 
 /// `openat(dirfd, path, flags)` — relative-to-directory-fd open.
+///
 /// Absolute paths and `dirfd == AT_FDCWD` behave exactly like
-/// `sys_open` (cwd-relative); otherwise the path is joined onto the
-/// directory fd's stored path and handed to `sys_open`, so symlink
-/// resolution / create / directory semantics stay identical. (B2.4)
+/// `sys_open` (cwd-relative).
+///
+/// Otherwise the directory fd is resolved POSIX-faithfully (B2.9).
+/// When the fd is **inode-anchored** (`dir_inode == Some`), the dirfd's
+/// CURRENT absolute path is reconstructed from the live inode→path
+/// mapping (`dir_abspath_in`), so the open stays correct after the
+/// directory is renamed and fails `ENOENT` after it is removed. An
+/// inode component walk then resolves the relative path one component
+/// at a time; the moment it would have to follow a symlink, cross a
+/// `.`/`..` lexical step, or cross into a child mount, it STOPS,
+/// reconstructs the absolute path, and re-delegates to the path-based
+/// `sys_open` (which owns the centralized 40-hop SYMLOOP, lexical
+/// normalization, longest-prefix mount routing, and create/trunc/
+/// directory semantics — never duplicated here).
+///
+/// A `dir_inode == None` fd is the path-snapshot **degraded mode**
+/// (hostfs / overlay-if-deferred / embedder backends): behavior is
+/// exactly as before — join the stored path and hand it to `sys_open`.
 pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
     const AT_FDCWD: u32 = u32::MAX;
+    // WASI filetype byte from `VfsBackend::resolve_at` (matches
+    // `entry_type`): 3 = directory. A symlink is 7 and a regular file
+    // is 4 — both fall into the walk's STOP arm (reconstruct +
+    // re-delegate to the path-based `sys_open`), so only DIR needs a
+    // named constant for the descend case.
+    const FT_DIR: u8 = 3;
     if request.len() < 8 {
         return -(abi::EINVAL as i64);
     }
@@ -171,38 +267,185 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
         return sys_open(caller_pid, &req);
     }
 
-    // Resolve the directory fd's path (no nested with_kernel: this
-    // closure returns before sys_open takes the lock again).
-    //
-    // FIXME(#59): not POSIX-faithful — `FdEntry::Directory` stores the
-    // path captured at open() time, so `openat(dirfd, "child")` resolves
-    // the *stale* path if the directory is renamed/unlinked. A dirfd
-    // must track the directory object (inode), which needs a
-    // VfsBackend dir-handle API across every backend (VFS rewrite,
-    // tracked in #59 — not patched here).
-    let dir = match with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(dirfd) {
-        Some(crate::kernel::FdEntry::Directory { path }) => Ok(path.clone()),
-        Some(_) => Err(abi::ENOTDIR),
-        None => Err(abi::EBADF),
-    }) {
-        Ok(d) => d,
-        Err(errno) => return -(errno as i64),
+    // Snapshot the dirfd's dual capability (no nested with_kernel:
+    // every branch returns / re-enters before sys_open re-locks).
+    let (mount_id, dir_inode, snap_path) =
+        match with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(dirfd) {
+            Some(crate::kernel::FdEntry::Directory {
+                mount_id,
+                dir_inode,
+                path,
+            }) => Ok((*mount_id, *dir_inode, path.clone())),
+            Some(_) => Err(abi::ENOTDIR),
+            None => Err(abi::EBADF),
+        }) {
+            Ok(t) => t,
+            Err(errno) => return -(errno as i64),
+        };
+
+    let Some(base_inode) = dir_inode else {
+        // Degraded mode (`dir_inode == None`): unchanged path-snapshot
+        // join. The stored path is the PathResolver-normalized
+        // ABSOLUTE snapshot (preserves the absolute invariant below).
+        debug_assert!(
+            snap_path.first() == Some(&b'/'),
+            "dir fd path must be absolute, got {:?}",
+            String::from_utf8_lossy(&snap_path)
+        );
+        let mut joined = snap_path;
+        if joined.last() != Some(&b'/') {
+            joined.push(b'/');
+        }
+        joined.extend_from_slice(path);
+        let mut req = flags.to_le_bytes().to_vec();
+        req.extend_from_slice(&joined);
+        return sys_open(caller_pid, &req);
     };
 
-    // Invariant: a directory fd's stored path is absolute (PathResolver
-    // normalizes at open() time). The join below would otherwise be
-    // silently treated as cwd-relative by sys_open. Holds until the #59
-    // inode-anchored rewrite replaces this path snapshot (PR #55 review).
-    debug_assert!(
-        dir.first() == Some(&b'/'),
-        "dir fd path must be absolute, got {:?}",
-        String::from_utf8_lossy(&dir)
-    );
-    let mut joined = dir;
+    // Inode-anchored. The dirfd's CURRENT absolute path is whatever the
+    // live inode→path mapping says (rename-stable); `None` ⇒ the dir
+    // was removed (rmdir/unlink) — no linkable path, POSIX ENOENT.
+    let base_abs = match with_kernel(|k| k.vfs.dir_abspath_in(mount_id, base_inode)) {
+        Some(abs) => abs,
+        None => return -(abi::ENOENT as i64),
+    };
+
+    // Component inode walk. The dirfd's directory is now resolved
+    // inode-faithfully (`base_abs`). The walk descends the relative
+    // path one component at a time so it can detect the spec's STOP
+    // conditions — a `.`/`..` lexical step, a SYMLINK component
+    // mid-walk (filetype 7), or a crossing into a CHILD mount — and
+    // re-delegate to the path-based resolver instead of resolving
+    // those itself. SYMLOOP and lexical normalization are NEVER
+    // duplicated here.
+    let components: Vec<&[u8]> = path
+        .split(|b| *b == b'/')
+        .filter(|c| !c.is_empty())
+        .collect();
+    let has_dot_component = components.iter().any(|c| *c == b"." || *c == b"..");
+
+    // Set when the inode walk cannot descend a *non-final* component:
+    // it is a symlink (filetype 7), a regular file (filetype 4), or
+    // does not exist (`resolve_at_in == None`). In every such case the
+    // inode walk is incomplete and `sys_open`'s whole-path
+    // `follow_symlinks` would not resolve an intermediate symlink, so
+    // we canonicalize the FINAL component's parent directory through
+    // the centralized component-aware resolver (`PathResolver::
+    // realpath`, the existing 40-hop SYMLOOP — reused, not duplicated)
+    // and hand the canonical parent + final component to `sys_open`,
+    // which then yields the correct ENOENT/ENOTDIR/open result.
+    let mut needs_path_resolver = false;
+    if !has_dot_component && !components.is_empty() {
+        let mut cur_inode = base_inode;
+        let mut cur_abs = base_abs.clone();
+        for name in components.iter().take(components.len() - 1) {
+            match with_kernel(|k| k.vfs.resolve_at_in(mount_id, cur_inode, name)) {
+                Some((Some(child), FT_DIR)) => {
+                    let mut next_abs = cur_abs.clone();
+                    if next_abs.last() != Some(&b'/') {
+                        next_abs.push(b'/');
+                    }
+                    next_abs.extend_from_slice(name);
+                    // Child-mount crossing ⇒ stop the inode walk; the
+                    // path-based `sys_open` routes correctly through
+                    // the longest-prefix mount table.
+                    let crosses_mount = with_kernel(|k| {
+                        k.vfs
+                            .mount_of(&next_abs)
+                            .map(|(m, _)| m != mount_id)
+                            .unwrap_or(true)
+                    });
+                    if crosses_mount {
+                        break;
+                    }
+                    cur_inode = child;
+                    cur_abs = next_abs;
+                }
+                // Any non-descendable non-final component. First rule
+                // out a child-mount crossing: a mount point (`/dev`,
+                // `/proc`, …) is a MountTable concept, invisible to the
+                // PARENT backend, so `resolve_at` returns `None` for it
+                // exactly like a missing entry. That is NOT a
+                // non-descendable intermediate — `realpath(parent)`
+                // would wrongly `ENOENT` because the child backend need
+                // not type its own root via `entry_type`. Re-delegate
+                // the whole path to `sys_open`, which routes through the
+                // longest-prefix mount table (the pre-B2.9
+                // path-snapshot behaviour). Mirrors the descend arm's
+                // `crosses_mount` guard.
+                _ => {
+                    let mut next_abs = cur_abs.clone();
+                    if next_abs.last() != Some(&b'/') {
+                        next_abs.push(b'/');
+                    }
+                    next_abs.extend_from_slice(name);
+                    let crosses_mount = with_kernel(|k| {
+                        k.vfs
+                            .mount_of(&next_abs)
+                            .map(|(m, _)| m != mount_id)
+                            .unwrap_or(true)
+                    });
+                    // Same-mount symlink (ft 7), regular file (ft 4),
+                    // or genuinely missing entry: the centralized
+                    // resolver below handles it (intermediate symlink
+                    // resolution, ENOENT, or ENOTDIR respectively). A
+                    // mount crossing instead falls through to the
+                    // mount-routed `sys_open(joined)`.
+                    if !crosses_mount {
+                        needs_path_resolver = true;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // Reconstruct the absolute target = the dirfd's inode-faithful
+    // CURRENT absolute path + the original relative path.
+    let mut joined = base_abs;
     if joined.last() != Some(&b'/') {
         joined.push(b'/');
     }
     joined.extend_from_slice(path);
+
+    if needs_path_resolver {
+        // The inode walk stopped on a non-descendable intermediate
+        // component. Split off the final component; canonicalize the
+        // parent directory via the existing centralized
+        // component-SYMLOOP resolver (`PathResolver::realpath`), then
+        // delegate `canonical_parent + final` to `sys_open` (which
+        // still owns create/trunc/O_DIRECTORY/EISDIR, the
+        // final-component symlink, and ENOENT/ENOTDIR for a
+        // missing/non-dir intermediate). This reuses the 40-hop
+        // SYMLOOP, never duplicates it. `joined` is absolute and has
+        // at least one component (a non-final component triggered
+        // this branch).
+        let split = joined
+            .iter()
+            .rposition(|&b| b == b'/')
+            .expect("absolute path has a separator");
+        let (parent, last_with_sep) = joined.split_at(split);
+        let last = &last_with_sep[1..];
+        let parent: &[u8] = if parent.is_empty() { b"/" } else { parent };
+        let canonical_parent =
+            match with_kernel(|k| PathResolver::new(k, caller_pid).realpath(parent)) {
+                Ok(p) => p,
+                Err(errno) => return -(errno as i64),
+            };
+        let mut target = canonical_parent;
+        if target.last() != Some(&b'/') {
+            target.push(b'/');
+        }
+        target.extend_from_slice(last);
+        let mut req = flags.to_le_bytes().to_vec();
+        req.extend_from_slice(&target);
+        return sys_open(caller_pid, &req);
+    }
+
+    // No intermediate symlink: `sys_open` owns everything else
+    // (normalize for `.`/`..`, whole-path `follow_symlinks` for a
+    // final-component symlink, MountTable longest-prefix for mount
+    // crossings, create/trunc/directory semantics).
     let mut req = flags.to_le_bytes().to_vec();
     req.extend_from_slice(&joined);
     sys_open(caller_pid, &req)
