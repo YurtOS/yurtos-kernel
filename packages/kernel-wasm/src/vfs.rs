@@ -299,7 +299,8 @@ impl MountTable {
 
     /// `(mount_id, dir_inode)` for an absolute path that is a
     /// directory in a backend supporting inode anchoring.
-    #[allow(dead_code)] // Consumed by the inode-anchored openat walk (B2.9 Task 6).
+    // Consumed since B2.9 Task 5 (the `dir_anchor` helper in
+    // dispatch/fs.rs: sys_open dir-branch / chdir / fchdir).
     pub fn dir_inode_at(&self, path: &[u8]) -> Option<(MountId, u64)> {
         let (mid, rel) = self.resolve(path)?;
         let ino = self.mounts[mid as usize].backend.dir_inode(&rel)?;

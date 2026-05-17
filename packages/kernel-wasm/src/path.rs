@@ -23,7 +23,10 @@ impl<'kernel> PathResolver<'kernel> {
     /// and VFS operations where the backend decides final semantics.
     pub fn normalize(&mut self, raw_path: &[u8]) -> Result<Vec<u8>, i64> {
         let rewritten = proc_self_rewrite(self.caller_pid, raw_path);
-        let cwd = self.kernel.process(self.caller_pid).cwd.clone();
+        // Task 5: the absolute cwd snapshot. The inode-anchored
+        // dir_path refresh invariant (refresh `cwd.path` from the live
+        // `dir_path(cwd.dir_inode)` before resolving) lands in Task 6.
+        let cwd = self.kernel.process(self.caller_pid).cwd.path.clone();
         normalize_lexical_path(&cwd, &rewritten)
     }
 
@@ -33,7 +36,8 @@ impl<'kernel> PathResolver<'kernel> {
     /// pathname rather than just a normalized lexical target.
     pub fn realpath(&mut self, raw_path: &[u8]) -> Result<Vec<u8>, i32> {
         let rewritten = proc_self_rewrite(self.caller_pid, raw_path);
-        let cwd = self.kernel.process(self.caller_pid).cwd.clone();
+        // Task 5: the absolute cwd snapshot (Task 6: dir_path refresh).
+        let cwd = self.kernel.process(self.caller_pid).cwd.path.clone();
         resolve_realpath(self.kernel, &cwd, &rewritten)
     }
 }

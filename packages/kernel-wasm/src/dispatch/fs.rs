@@ -8,6 +8,25 @@ fn can_modify_owned_metadata(credentials: crate::state::Credentials, owner_uid: 
     credentials.euid == 0 || credentials.euid == owner_uid
 }
 
+/// Derive the `(mount_id, dir_inode)` anchor for an already-normalized
+/// absolute directory `path`. Inode-anchored when the owning backend
+/// supports dir inodes (`MountTable::dir_inode_at` is `Some`), else the
+/// path-snapshot degraded mode: `(ROOT_MOUNT, None)`.
+///
+/// B2.9 Task 5 is a behavior-preserving shape migration — nothing reads
+/// `mount_id`/`dir_inode` to change resolution yet (that is Task 6);
+/// resolution still goes through the absolute `path` snapshot, so the
+/// degraded `(ROOT_MOUNT, None)` fallback is correct here. The
+/// `MountTable` has no public mount-id-only accessor (`resolve` is
+/// private), and adding one is out of Task 5's scope; `dir_inode_at`
+/// (the Task 1 pass-through) is the minimal sufficient lookup.
+fn dir_anchor(k: &Kernel, path: &[u8]) -> (crate::vfs::MountId, Option<u64>) {
+    match k.vfs.dir_inode_at(path) {
+        Some((mid, ino)) => (mid, Some(ino)),
+        None => (crate::vfs::ROOT_MOUNT, None),
+    }
+}
+
 pub(super) fn chdir(caller_pid: u32, request: &[u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
@@ -22,7 +41,12 @@ pub(super) fn chdir(caller_pid: u32, request: &[u8]) -> i64 {
             0 => return -(abi::ENOENT as i64),
             _ => return -(abi::ENOTDIR as i64),
         }
-        k.process_mut(caller_pid).cwd = path;
+        let (mount_id, dir_inode) = dir_anchor(k, &path);
+        k.process_mut(caller_pid).cwd = crate::kernel::Cwd {
+            mount_id,
+            dir_inode,
+            path,
+        };
         0
     })
 }
@@ -33,15 +57,25 @@ pub(super) fn fchdir(caller_pid: u32, request: &[u8]) -> i64 {
     }
     let fd = u32::from_le_bytes(request[0..4].try_into().unwrap());
     with_kernel(|k| {
-        let path = match k.process_mut(caller_pid).fd_table.entry(fd) {
-            Some(crate::kernel::FdEntry::Directory { path }) => path.clone(),
+        let (mount_id, dir_inode, path) = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(crate::kernel::FdEntry::Directory {
+                mount_id,
+                dir_inode,
+                path,
+            }) => (*mount_id, *dir_inode, path.clone()),
             Some(_) => return -(abi::ENOTDIR as i64),
             None => return -(abi::EBADF as i64),
         };
         if k.vfs.entry_type(&path) != 3 {
             return -(abi::ENOENT as i64);
         }
-        k.process_mut(caller_pid).cwd = path;
+        // Copy the fd's full (mount_id, dir_inode, path) capability into
+        // cwd (inode-anchored when the fd carried one, else snapshot).
+        k.process_mut(caller_pid).cwd = crate::kernel::Cwd {
+            mount_id,
+            dir_inode,
+            path,
+        };
         0
     })
 }
@@ -50,7 +84,9 @@ pub(super) fn getcwd(caller_pid: u32, response: &mut [u8]) -> i64 {
     // Mirrors the TS host_getcwd contract: returns the *required* size
     // (path length + 1 NUL byte). Caller compares against out_cap.
     with_kernel(|k| {
-        let cwd = k.process_mut(caller_pid).cwd.clone();
+        // Task 5: still the path snapshot. The inode-anchored
+        // dir_path refresh (mount-prefix-composed) lands in Task 6.
+        let cwd = k.process_mut(caller_pid).cwd.path.clone();
         let required = cwd.len() + 1;
         if response.len() < required {
             return required as i64;
@@ -97,12 +133,20 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             if writable || create || trunc {
                 return -(abi::EISDIR as i64);
             }
+            // Dual-shape anchor: inode-anchored when the backend
+            // supports dir inodes, else path-snapshot degraded mode.
+            // Behavior is path-snapshot identical until Task 6 wires
+            // the inode walk.
+            let (mount_id, dir_inode) = dir_anchor(k, path);
+            let dir_path = path.to_vec();
             let p = k.process_mut(caller_pid);
             let fd = p.fd_table.lowest_free_fd();
             p.fd_table.install(
                 fd,
                 crate::kernel::FdEntry::Directory {
-                    path: path.to_vec(),
+                    mount_id,
+                    dir_inode,
+                    path: dir_path,
                 },
             );
             return fd as i64;
@@ -171,8 +215,11 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
     // must track the directory object (inode), which needs a
     // VfsBackend dir-handle API across every backend (VFS rewrite,
     // tracked in #59 — not patched here).
+    // Task 5: still the path snapshot (`dir_inode` not yet consumed —
+    // the inode-anchored component walk lands in Task 6). Destructure
+    // the new shape but use only `path`, so behavior is identical.
     let dir = match with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(dirfd) {
-        Some(crate::kernel::FdEntry::Directory { path }) => Ok(path.clone()),
+        Some(crate::kernel::FdEntry::Directory { path, .. }) => Ok(path.clone()),
         Some(_) => Err(abi::ENOTDIR),
         None => Err(abi::EBADF),
     }) {

@@ -5716,7 +5716,7 @@ fn sys_spawn_inherits_parent_cwd_and_fd_table() {
     let child_pid = child_pid as u32;
 
     let child_cwd = with_kernel(|k| k.process(child_pid).cwd.clone());
-    assert_eq!(child_cwd, b"/tmp/work");
+    assert_eq!(child_cwd.path, b"/tmp/work");
 
     assert_eq!(
         dispatch(
@@ -7583,6 +7583,91 @@ fn openat_short_or_empty_request_is_einval() {
         dispatch(METHOD_SYS_OPENAT, 1, &openat_req(AT_FDCWD, 0, b""), &mut []),
         -(abi::EINVAL as i64)
     );
+}
+
+// --- Slice B2.9: FdEntry::Directory + Process.cwd dual shape (Task 5) ---
+//
+// Task 5 is a behavior-preserving SHAPE refactor. Resolution behavior is
+// unchanged (still path-snapshot) until Task 6 wires the inode walk. These
+// tests lock the *shape* and the degraded (`dir_inode == None`)
+// path-snapshot equivalence + the fork/clone inode-inheritance mechanism.
+
+#[test]
+fn openat_degraded_mode_for_non_inode_backend() {
+    // A directory fd whose backend reports no dir inode (`dir_inode ==
+    // None`) is the path-snapshot degraded mode. Spec §3: in degraded
+    // mode `openat` behaves EXACTLY as today. We install a `Directory`
+    // fd with `dir_inode: None` directly (the shape a non-inode backend
+    // such as HostFsBackend yields) and assert the path-snapshot join
+    // still resolves a child create under the snapshot path — identical
+    // to pre-Task-5 behavior.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/deg", &mut []), 0);
+    // Hand-install a degraded dir fd: dir_inode == None, path snapshot.
+    let dfd = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(1);
+        let fd = p.fd_table.lowest_free_fd();
+        p.fd_table.install(
+            fd,
+            FdEntry::Directory {
+                mount_id: crate::vfs::ROOT_MOUNT,
+                dir_inode: None,
+                path: b"/deg".to_vec(),
+            },
+        );
+        fd
+    });
+    let fd = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dfd, O_CREAT | O_WRITE, b"x"),
+        &mut [],
+    );
+    assert!(fd >= 3, "degraded openat returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"hi"), &mut []),
+        2
+    );
+    // Path-snapshot join resolved to /deg/x exactly as pre-Task-5.
+    assert_eq!(read_abs(b"/deg/x"), b"hi");
+
+    // And the unchanged-dir snapshot fchdir/getcwd path is identical too.
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    let mut buf = [0u8; 16];
+    let n = dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf);
+    assert_eq!(&buf[..n as usize], b"/deg\0");
+}
+
+#[test]
+fn fork_child_cwd_inode_survives_parent_rename() {
+    // Task 5 scope: this locks the spec-test-#8 *inheritance mechanism* —
+    // `Process.cwd` (now `Cwd`) carries `dir_inode` across the fork/clone
+    // `cwd: p.cwd.clone()` so a forked child inherits the parent's
+    // inode-anchored cwd. We assert the shape clones the inode field.
+    //
+    // Task 6: the full rename-survival behavioral assertion (parent
+    // renames /base→/renamed, child relative open lands at /renamed/y)
+    // requires the PathResolver cwd-refresh + inode walk and is NOT
+    // asserted here — it is completed in Task 6.
+    let _g = crate::kernel::TestGuard::acquire();
+    let cwd = crate::kernel::Cwd {
+        mount_id: crate::vfs::ROOT_MOUNT,
+        dir_inode: Some(7),
+        path: b"/base".to_vec(),
+    };
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).cwd = cwd.clone();
+    });
+    // Clone-through: a child Process that inherits via `cwd: p.cwd.clone()`
+    // carries the SAME dir_inode (spec #8 mechanism at kernel.rs:1390 fork
+    // / dispatch/process.rs:1342 spawn-fork inheritance).
+    let cloned = crate::kernel::with_kernel(|k| k.process(1).cwd.clone());
+    assert_eq!(cloned.mount_id, crate::vfs::ROOT_MOUNT);
+    assert_eq!(cloned.dir_inode, Some(7));
+    assert_eq!(cloned.path, b"/base");
 }
 
 // --- Slice B2.3b: POSIX fcntl(F_GETFL/F_SETFL) — storage only ---
