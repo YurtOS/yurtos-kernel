@@ -5948,6 +5948,32 @@ fn stat_on_dangling_symlink_is_enoent() {
 }
 
 #[test]
+fn stat_follows_multi_hop_symlink_chain() {
+    // Locks the chained-resolution semantics at the stat() entry
+    // point (sys_open's suite covers the shared helper's loop, but a
+    // future refactor could re-split it — this guards stat directly).
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    // /a -> /b -> /d (a directory): two readlink hops.
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/d");
+    sreq.extend_from_slice(b"/b");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/b");
+    sreq.extend_from_slice(b"/a");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/a", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "stat() must follow the whole /a->/b->/d chain and report S_IFDIR"
+    );
+}
+
+#[test]
 fn symlink_creates_link_and_readlink_returns_target() {
     let _g = crate::kernel::TestGuard::acquire();
     // Register a target file so we can verify the open follows.
