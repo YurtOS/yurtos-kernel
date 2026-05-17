@@ -56,6 +56,36 @@ pub const KERNEL_RT_SIGNAL_QUEUE_CAP: usize = 1024;
 /// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
 pub const RLIMIT_SLOTS: usize = 8;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SigAltStack {
+    pub sp: u32,
+    pub flags: i32,
+    pub size: u32,
+}
+
+pub const SS_ONSTACK: i32 = 1;
+pub const SS_DISABLE: i32 = 2;
+
+impl SigAltStack {
+    pub const fn disabled() -> Self {
+        Self {
+            sp: 0,
+            flags: SS_DISABLE,
+            size: 0,
+        }
+    }
+
+    /// Returns `true` when this alt-stack is not active.
+    ///
+    /// A stack marked `SS_ONSTACK` (the kernel is currently executing on it)
+    /// is considered active even if `SS_DISABLE` is also set; `SS_DISABLE`
+    /// without `SS_ONSTACK` and a zero `size` are both treated as disabled.
+    pub fn is_disabled(&self) -> bool {
+        // SS_ONSTACK means "currently in use" — override any other flag.
+        self.flags & SS_ONSTACK == 0 && (self.flags & SS_DISABLE != 0 || self.size == 0)
+    }
+}
+
 /// Kernel-owned execution state for one user thread. Host backends may
 /// map this to a Worker, a wasmtime task, or a cooperative stack, but
 /// the lifecycle state belongs to kernel.wasm.
@@ -91,12 +121,21 @@ pub struct ThreadRecord {
     /// guest performs the actual unwind/exit; the kernel only owns the
     /// pending-cancel state.
     pub cancel_requested: bool,
+    /// Canonical `1<<(sig-1)` blocked mask (kernel-internal width).
+    /// Inherited from the creating thread on spawn and from the
+    /// forking main thread on `fork()`.
+    pub blocked_signals: u64,
+    /// Alternate signal stack bookkeeping. Round-trips only; the
+    /// `SS_ONSTACK`/`EPERM` path is dormant until delivery (B1.8-b).
+    pub sigaltstack: SigAltStack,
 }
 
 impl ThreadRecord {
-    fn main(host_thread_handle: Option<i32>) -> Self {
+    /// The single `ThreadRecord` constructor. Every record is built
+    /// here so the mask-inheritance contract lives in one place.
+    pub fn new(tid: Tid, host_thread_handle: Option<i32>, blocked_signals: u64) -> Self {
         Self {
-            tid: MAIN_THREAD_TID,
+            tid,
             state: ThreadState::Runnable,
             detached: false,
             exit_value: None,
@@ -104,7 +143,13 @@ impl ThreadRecord {
             wait_reason: None,
             waiter_tid: None,
             cancel_requested: false,
+            blocked_signals,
+            sigaltstack: SigAltStack::disabled(),
         }
+    }
+
+    fn main(host_thread_handle: Option<i32>) -> Self {
+        Self::new(MAIN_THREAD_TID, host_thread_handle, 0)
     }
 }
 
@@ -720,6 +765,11 @@ impl Kernel {
         if parent.threads.len() > 1 {
             return Err(crate::abi::EAGAIN);
         }
+        let parent_main_mask = parent
+            .threads
+            .get(&MAIN_THREAD_TID)
+            .map(|t| t.blocked_signals)
+            .unwrap_or(0);
         let mut child = parent.clone();
         let Some(child_pid) = self.try_alloc_host_pid() else {
             return Err(crate::abi::EAGAIN);
@@ -741,9 +791,10 @@ impl Kernel {
         child.stdout_buffer.clear();
         child.stderr_buffer.clear();
         child.threads.clear();
-        child
-            .threads
-            .insert(MAIN_THREAD_TID, ThreadRecord::main(None));
+        child.threads.insert(
+            MAIN_THREAD_TID,
+            ThreadRecord::new(MAIN_THREAD_TID, None, parent_main_mask),
+        );
         child.next_tid = FIRST_WORKER_TID;
         child.fork_state = ProcessForkState::ForkPreparing { parent_pid };
 
@@ -1562,7 +1613,8 @@ impl Kernel {
 
     pub fn spawn_thread(&mut self, pid: Pid, host_thread_handle: Option<i32>) -> Option<Tid> {
         let tid = self.reserve_thread_id(pid).ok()?;
-        self.bind_thread_handle(pid, tid, host_thread_handle).ok()?;
+        self.bind_thread_handle(pid, tid, host_thread_handle, MAIN_THREAD_TID)
+            .ok()?;
         Some(tid)
     }
 
@@ -1590,24 +1642,20 @@ impl Kernel {
         pid: Pid,
         tid: Tid,
         host_thread_handle: Option<i32>,
+        creator_tid: Tid,
     ) -> Result<(), i32> {
         let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
         if p.threads.contains_key(&tid) {
             return Err(crate::abi::EEXIST);
         }
-        p.threads.insert(
-            tid,
-            ThreadRecord {
-                tid,
-                state: ThreadState::Runnable,
-                detached: false,
-                exit_value: None,
-                host_thread_handle,
-                wait_reason: None,
-                waiter_tid: None,
-                cancel_requested: false,
-            },
-        );
+        let inherited = p
+            .threads
+            .get(&creator_tid)
+            .or_else(|| p.threads.get(&MAIN_THREAD_TID))
+            .map(|t| t.blocked_signals)
+            .unwrap_or(0);
+        p.threads
+            .insert(tid, ThreadRecord::new(tid, host_thread_handle, inherited));
         Ok(())
     }
 

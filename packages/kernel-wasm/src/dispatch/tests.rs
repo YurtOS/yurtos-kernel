@@ -9653,3 +9653,46 @@ fn idb_put_rejects_hostile_key_len_without_aborting_kernel() {
         -(abi::EINVAL as i64)
     );
 }
+
+#[test]
+fn thread_spawn_inherits_creator_blocked_mask_altstack_resets() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1)
+            .threads
+            .get_mut(&crate::kernel::MAIN_THREAD_TID)
+            .unwrap()
+            .blocked_signals = 0b1010;
+        let tid = k.spawn_thread(1, Some(7)).expect("spawn");
+        let t = &k.process_mut(1).threads[&tid];
+        assert_eq!(t.blocked_signals, 0b1010, "worker inherits creator mask");
+        assert!(
+            t.sigaltstack.is_disabled(),
+            "alt-stack resets on new thread"
+        );
+    });
+}
+
+#[test]
+fn fork_child_main_inherits_forking_main_mask_pending_empty() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1)
+            .threads
+            .get_mut(&crate::kernel::MAIN_THREAD_TID)
+            .unwrap()
+            .blocked_signals = 0b0100;
+        k.process_mut(1).pending_signals = 0xFF;
+        let child = k.prepare_fork(1).expect("fork");
+        let cm = &k.process_mut(child).threads[&crate::kernel::MAIN_THREAD_TID];
+        assert_eq!(
+            cm.blocked_signals, 0b0100,
+            "child main inherits forking main mask"
+        );
+        assert_eq!(
+            k.process_mut(child).pending_signals,
+            0,
+            "child pending empty"
+        );
+    });
+}

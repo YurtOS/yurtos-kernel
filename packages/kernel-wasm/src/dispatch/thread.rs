@@ -43,7 +43,12 @@ pub fn sys_thread_spawn(ctx: DispatchContext, request: &[u8]) -> i64 {
     }
 
     match kernel::with_kernel(|k| {
-        k.bind_thread_handle(ctx.caller_pid, tid, Some(host_thread_handle))
+        k.bind_thread_handle(
+            ctx.caller_pid,
+            tid,
+            Some(host_thread_handle),
+            ctx.caller_tid,
+        )
     }) {
         Ok(()) => tid as i64,
         Err(errno) => {
