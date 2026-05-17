@@ -10,7 +10,13 @@ set -euo pipefail
 # `lint-clippy-changed.sh` so they cover the same set, in the same
 # order, just with cheaper feedback up-front.
 
-mapfile -t CHANGED < <(git diff --cached --name-only --diff-filter=ACMRT -- '*.rs' || true)
+# `mapfile` is bash 4+; macOS ships bash 3.2, so populate the array
+# with a portable while-read loop. Pre-commit invokes via `/usr/bin/env
+# bash`, which on macOS resolves to the system 3.2.
+CHANGED=()
+while IFS= read -r f; do
+  [[ -n "$f" ]] && CHANGED+=("$f")
+done < <(git diff --cached --name-only --diff-filter=ACMRT -- '*.rs' || true)
 
 if [[ ${#CHANGED[@]} -eq 0 ]]; then
   exec cargo check --all-targets

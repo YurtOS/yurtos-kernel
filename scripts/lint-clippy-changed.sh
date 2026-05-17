@@ -5,7 +5,13 @@ set -euo pipefail
 # Falls back to a full workspace lint if no Rust files are staged
 # (e.g. when invoked via `pre-commit run --all-files`).
 
-mapfile -t CHANGED < <(git diff --cached --name-only --diff-filter=ACMRT -- '*.rs' || true)
+# `mapfile` is bash 4+; macOS ships bash 3.2, so populate the array
+# with a portable while-read loop. Pre-commit invokes via `/usr/bin/env
+# bash`, which on macOS resolves to the system 3.2.
+CHANGED=()
+while IFS= read -r f; do
+  [[ -n "$f" ]] && CHANGED+=("$f")
+done < <(git diff --cached --name-only --diff-filter=ACMRT -- '*.rs' || true)
 
 if [[ ${#CHANGED[@]} -eq 0 ]]; then
   # Default-members only — wasm-only canary crates need a different target.
