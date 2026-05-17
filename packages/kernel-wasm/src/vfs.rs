@@ -844,12 +844,64 @@ impl VfsBackend for RamfsBackend {
                 self.symlinks.insert(new_path.to_vec(), target);
             }
             _ => {
-                // Minimal: move only this directory's own inode key
-                // (forward + reverse), preserving its id. Recursive
-                // re-key of descendants is B2.9 Task 3.
-                if let Some(id) = self.dir_inodes.remove(old_path) {
-                    self.dir_inodes.insert(new_path.to_vec(), id);
-                    self.dir_paths.insert(id, new_path.to_vec());
+                // Directory rename: re-key every descendant from the
+                // old prefix to the new prefix. Inode ids are
+                // preserved (only path keys move) so open file OFDs
+                // (which hold `inode`, not path) and every dir inode
+                // survive the parent-dir rename unchanged. Per the
+                // isolation invariant we touch ONLY the path-keyed
+                // maps (`paths`, `symlinks`, `dir_inodes`,
+                // `dir_paths`) and never `inodes`/`refcount` — file
+                // content and hardlink counts must survive untouched.
+                //
+                // A key `k` is in the subtree iff `k == old_path` OR
+                // `k` starts with `old_path + "/"` — an exact prefix
+                // boundary so `/base` never catches `/baseball`.
+                let mut prefix = old_path.to_vec();
+                prefix.push(b'/');
+                let in_subtree = |k: &[u8]| k == old_path || k.starts_with(&prefix);
+                let remap = |k: &[u8]| {
+                    let mut nk = new_path.to_vec();
+                    nk.extend_from_slice(&k[old_path.len()..]);
+                    nk
+                };
+
+                // Files (path → inode): inode id unchanged.
+                let moved: Vec<(Vec<u8>, u64)> = self
+                    .paths
+                    .iter()
+                    .filter(|(k, _)| in_subtree(k))
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                for (k, id) in moved {
+                    self.paths.remove(&k);
+                    self.paths.insert(remap(&k), id);
+                }
+
+                // Symlinks (path → target): target text unchanged.
+                let moved: Vec<(Vec<u8>, Vec<u8>)> = self
+                    .symlinks
+                    .iter()
+                    .filter(|(k, _)| in_subtree(k))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                for (k, target) in moved {
+                    self.symlinks.remove(&k);
+                    self.symlinks.insert(remap(&k), target);
+                }
+
+                // Dir inodes (forward + reverse), preserving ids.
+                let moved: Vec<(Vec<u8>, u64)> = self
+                    .dir_inodes
+                    .iter()
+                    .filter(|(k, _)| in_subtree(k))
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect();
+                for (k, id) in moved {
+                    self.dir_inodes.remove(&k);
+                    let nk = remap(&k);
+                    self.dir_inodes.insert(nk.clone(), id);
+                    self.dir_paths.insert(id, nk);
                 }
             }
         }
@@ -1004,6 +1056,47 @@ mod tests {
         assert_eq!(b.rmdir(b"/d"), 0);
         assert_eq!(b.dir_inode(b"/d"), None, "rmdir frees the inode");
         assert_eq!(b.dir_path(d), None, "reverse map freed too");
+    }
+
+    #[test]
+    fn ramfs_dir_rename_recursively_rekeys_children() {
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.mkdir(b"/base"), 0);
+        assert_eq!(b.mkdir(b"/base/sub"), 0);
+        let sub_ino = b.dir_inode(b"/base/sub").unwrap();
+        // File under the subtree (real install API: owned Vecs,
+        // returns the file inode id).
+        let file_ino = b.install(b"/base/sub/f".to_vec(), b"hi".to_vec());
+
+        assert_eq!(b.rename(b"/base", b"/renamed"), 0);
+
+        // Children reachable at the new prefix, gone at the old.
+        assert_eq!(b.entry_type(b"/renamed/sub/f"), 4, "file re-keyed");
+        assert_eq!(b.entry_type(b"/base/sub/f"), 0, "old key gone");
+
+        // Dir inode ids preserved (only path keys moved).
+        assert_eq!(b.dir_inode(b"/renamed/sub"), Some(sub_ino));
+        assert_eq!(b.dir_path(sub_ino).as_deref(), Some(&b"/renamed/sub"[..]));
+
+        // Isolation invariant: the FILE inode id is preserved across
+        // the rename (only the path key moved). This is exactly what
+        // keeps an open file's OFD — which holds the inode, not the
+        // path — valid after a parent-dir rename. Verified two ways:
+        // (1) the path→inode map still yields the original id at the
+        //     new key, and
+        // (2) the content is still readable via that inode.
+        assert_eq!(
+            b.paths.get(b"/renamed/sub/f".as_slice()).copied(),
+            Some(file_ino),
+            "file inode id preserved across rename (OFDs unaffected)"
+        );
+        let mut buf = [0u8; 8];
+        let n = b.read(file_ino, 0, &mut buf);
+        assert_eq!(
+            &buf[..n.max(0) as usize],
+            b"hi",
+            "content survives via inode"
+        );
     }
 
     #[test]
