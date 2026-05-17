@@ -27,7 +27,7 @@ use fs::{
 };
 use process::{
     close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
-    killpg_request, nanosleep, provide_stdin, sched_getaffinity, sched_getparam,
+    killpg_request, nanosleep, proc_pid_visible, provide_stdin, sched_getaffinity, sched_getparam,
     sched_getscheduler, sched_setaffinity, sched_setparam, sched_setscheduler, sched_yield,
     setpgid, setpriority, setresgid, setresuid, setrlimit, setsid, sigaction, sigpending, sigqueue,
     sigwaitinfo, sys_spawn, umask, waitid,
@@ -185,7 +185,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_SETPGID => setpgid(caller_pid, request),
         METHOD_SYS_GETSID => getsid(caller_pid, request),
         METHOD_SYS_SETSID => setsid(caller_pid),
-        METHOD_SYS_KILL => kill_request(request),
+        METHOD_SYS_KILL => kill_request(caller_pid, request),
         METHOD_SYS_KILLPG => killpg_request(caller_pid, request),
         METHOD_SYS_SIGQUEUE => sigqueue(caller_pid, request),
         METHOD_SYS_SIGWAITINFO => sigwaitinfo(caller_pid, request, response),

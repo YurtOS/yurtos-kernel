@@ -1393,18 +1393,14 @@ impl Kernel {
         self.vfs.refresh_processes(&snaps);
     }
 
-    pub fn can_read_proc_path(&mut self, caller_pid: Pid, path: &[u8]) -> bool {
-        let Some(target_pid) = crate::path::proc_target_pid(path) else {
-            return true;
-        };
-        if target_pid == caller_pid {
-            return true;
-        }
-        if !self.has_process(target_pid) {
-            return true;
-        }
-        self.process(caller_pid).credentials.euid == 0
-    }
+    // NOTE (#105 / M8): the former `can_read_proc_path` lived here and
+    // returned `false` (→ -EPERM at the call site) for a *present-but-
+    // unauthorized* /proc/<pid>, but `true` for an *absent* pid (→
+    // -ENOENT from the backend). That EPERM-vs-ENOENT split was a
+    // cross-tenant pid-existence oracle. The visibility decision now
+    // lives at the dispatch/fs layer (`proc_path_reachable`) and
+    // consumes #66's `may_control_pid` so absent and unauthorized are
+    // indistinguishable (uniform -ENOENT).
 
     pub fn list_processes(&self) -> Vec<ProcessListEntry> {
         self.processes
@@ -1448,33 +1444,29 @@ impl Kernel {
         })
     }
 
-    pub fn kill_process_group(&mut self, pgid: Pid, sig: u32) -> Result<(), i32> {
-        if sig > 63 {
-            return Err(crate::abi::EINVAL);
-        }
-        let mut found = false;
-        for (pid, process) in self.processes.iter_mut() {
-            if process.fork_state != ProcessForkState::Running {
-                continue;
-            }
-            let process_pgid = if process.pgid == 0 {
-                *pid
-            } else {
-                process.pgid
-            };
-            if process.exit_status.is_some() || process_pgid != pgid {
-                continue;
-            }
-            found = true;
-            if sig != 0 {
-                process.pending_signals |= 1u64 << (sig - 1);
-            }
-        }
-        if found {
-            Ok(())
-        } else {
-            Err(crate::abi::ESRCH)
-        }
+    /// Live members of process group `pgid`. Single source of truth for
+    /// "what is in this group": a running, not-yet-reaped process whose
+    /// effective pgid (own pid when `pgid == 0`) equals `pgid`. The
+    /// authorization decision (POSIX per-target `may_signal`) and signal
+    /// delivery are owned by the dispatch layer (`killpg_request`) — it
+    /// holds the host-authenticated `caller_pid` and the credential gate.
+    pub fn process_group_member_pids(&self, pgid: Pid) -> Vec<Pid> {
+        self.processes
+            .iter()
+            .filter(|(pid, process)| {
+                if process.fork_state != ProcessForkState::Running || process.exit_status.is_some()
+                {
+                    return false;
+                }
+                let process_pgid = if process.pgid == 0 {
+                    **pid
+                } else {
+                    process.pgid
+                };
+                process_pgid == pgid
+            })
+            .map(|(pid, _)| *pid)
+            .collect()
     }
 
     pub fn list_threads(&self, pid: Pid) -> Vec<ThreadRecord> {
