@@ -24,6 +24,10 @@
 import { WASI_EBUSY } from "../../wasi/types.js";
 import { decodeSockaddrIn } from "../../host-imports/common.js";
 import { SabCondvar, SabMutex } from "./sab-primitives.js";
+import { WorkerHostSerializer } from "./worker-host-serializer.js";
+
+/** A value that may be returned synchronously or via a Promise. */
+type Awaitable<T> = T | Promise<T>;
 
 /**
  * Sentinel thrown by the worker-side `host_thread_exit` import to unwind
@@ -356,38 +360,46 @@ export function createWorkerYurtImports(
  * (result/errno). Read-ish ops (ReadFd, SocketRecv) also return the
  * bytes to copy into the response payload.
  *
- * **Sync-only contract.** Method return types are deliberately
- * `number` (not `number | Promise<number>`). The dispatcher invokes
- * each body inside the JS event loop's serialized message-handler
- * dispatch; no body may `await` mid-flight, because doing so would
- * let a peer worker's message handler interleave and observe a
- * partially-mutated kernel state. If a future op genuinely needs
- * an async body (e.g. blocking socket recv with backpressure), the
- * dispatcher itself must first be promoted to `await` body results
- * AND a real serialization primitive (Promise-chain mutex or
- * Atomics-based main-side lock) must be reintroduced. Until then,
- * keep these signatures sync — TypeScript will reject any attempt
- * to return a Promise without an explicit cast, which is the
- * load-bearing guard against silent correctness regressions.
+ * **Awaitable contract (Task 10).** Every method may return its value
+ * synchronously OR as a `Promise`. `attachWorkerHostDispatcher` always
+ * `await`s the result, and runs every body inside a per-process
+ * `WorkerHostSerializer` so that even when a body suspends mid-flight
+ * (e.g. a blocking socket recv, or the libzmq I/O reactor waiting on a
+ * round-trip) no peer worker's body interleaves and observes a
+ * partially-mutated kernel state. A body that stays synchronous keeps
+ * the previous fast path — it just resolves on the microtask the
+ * serializer already awaits.
  */
 export interface WorkerHostDispatcherBodies {
-  threadYield(callerTid?: number): number;
-  threadExit(retval: number, callerTid?: number): void;
-  writeFd(fd: number, data: Uint8Array): number;
-  readFd(fd: number, cap: number): { result: number; bytes?: Uint8Array };
-  socketOpen(domain: number, type: number, protocol: number): number;
-  socketClose(fd: number): number;
-  socketRecv(fd: number, cap: number): { result: number; bytes?: Uint8Array };
-  socketSend(fd: number, data: Uint8Array): number;
+  threadYield(callerTid?: number): Awaitable<number>;
+  threadExit(retval: number, callerTid?: number): Awaitable<void>;
+  writeFd(fd: number, data: Uint8Array): Awaitable<number>;
+  readFd(
+    fd: number,
+    cap: number,
+  ): Awaitable<{ result: number; bytes?: Uint8Array }>;
+  socketOpen(
+    domain: number,
+    type: number,
+    protocol: number,
+  ): Awaitable<number>;
+  socketClose(fd: number): Awaitable<number>;
+  socketRecv(
+    fd: number,
+    cap: number,
+  ): Awaitable<{ result: number; bytes?: Uint8Array }>;
+  socketSend(fd: number, data: Uint8Array): Awaitable<number>;
   /**
-   * One synchronous evaluation of a pollfd array. The worker-side
-   * `host_poll` import drives its own retry/sleep loop and re-invokes
-   * this body each round until it returns >0 or the timeout fires;
-   * the body itself does not block.
+   * One evaluation of a pollfd array. The worker-side `host_poll`
+   * import drives its own retry/sleep loop and re-invokes this body
+   * each round until it returns >0 or the timeout fires.
    */
-  poll(nfds: number, fds: Uint8Array): { result: number; bytes?: Uint8Array };
-  getPid(): number;
-  socketSendUnix(fd: number, data: Uint8Array): number;
+  poll(
+    nfds: number,
+    fds: Uint8Array,
+  ): Awaitable<{ result: number; bytes?: Uint8Array }>;
+  getPid(): Awaitable<number>;
+  socketSendUnix(fd: number, data: Uint8Array): Awaitable<number>;
   /**
    * AF_UNIX socketpair() for the pthread worker. Returns 0 on success
    * with two consecutive i32 fd numbers in `bytes`; -1 on error.
@@ -395,7 +407,7 @@ export interface WorkerHostDispatcherBodies {
   socketPair(
     family: number,
     sockType: number,
-  ): { result: number; bytes?: Uint8Array };
+  ): Awaitable<{ result: number; bytes?: Uint8Array }>;
   /**
    * Nonblocking AF_UNIX recv for libzmq signaler / mailbox fds.
    * Returns >0 with bytes on data, -2 on EAGAIN, -1 on error,
@@ -405,33 +417,36 @@ export interface WorkerHostDispatcherBodies {
     fd: number,
     cap: number,
     peek: number,
-  ): { result: number; bytes?: Uint8Array };
-  setFdDescriptorFlags(fd: number, flags: number): number;
+  ): Awaitable<{ result: number; bytes?: Uint8Array }>;
+  setFdDescriptorFlags(fd: number, flags: number): Awaitable<number>;
   /**
-   * Synchronous pthread spawn for nested `host_thread_spawn` calls
-   * from a pthread worker. Returns the new tid immediately; the
-   * spawn itself runs asynchronously in the background.
+   * Pthread spawn for nested `host_thread_spawn` calls from a pthread
+   * worker. Returns the new tid; the spawn itself runs asynchronously
+   * in the background.
    */
-  threadSpawn(fnPtr: number, arg: number, callerTid?: number): number;
+  threadSpawn(
+    fnPtr: number,
+    arg: number,
+    callerTid?: number,
+  ): Awaitable<number>;
   /**
    * Record the bind address for an AF_INET socket fd from a pthread
    * worker. Loopback only; rejects anything that isn't 127.0.0.1 /
    * localhost / 0.0.0.0.
    */
-  socketBind(fd: number, host: Uint8Array, port: number): number;
+  socketBind(fd: number, host: Uint8Array, port: number): Awaitable<number>;
   /**
    * Start listening on a previously-bound AF_INET socket fd from a
-   * pthread worker. Synchronous fast-path only — the backend must
-   * resolve listen() synchronously for the pthread to observe the
-   * outcome in this dispatcher round-trip.
+   * pthread worker. May await the backend's listen() now that the
+   * dispatcher is async + serialized.
    */
-  socketListen(fd: number, backlog: number): number;
+  socketListen(fd: number, backlog: number): Awaitable<number>;
   /**
    * Returns 1 for SOCK_DGRAM sockets, 0 for SOCK_STREAM, -1 for
    * non-socket fds. libzmq's tcp/inproc setup checks this on every
    * socket() return to decide which mailbox transport to wire up.
    */
-  socketIsDgram(fd: number): number;
+  socketIsDgram(fd: number): Awaitable<number>;
 }
 
 /**
@@ -442,26 +457,35 @@ export interface WorkerHostDispatcherBodies {
 export interface DispatcherTarget {
   addEventListener(
     type: "message",
-    handler: (e: MessageEvent) => void,
+    handler: (e: MessageEvent) => unknown,
   ): void;
 }
 
 export interface WorkerHostDispatcherContext {
   callerTid?: number;
+  /**
+   * Per-process serializer shared by every worker pthread of one
+   * process (created in `defaultSpawnThread`). Bodies run inside it so
+   * an awaiting body never lets a peer worker's body interleave and
+   * observe half-mutated kernel state. Omitted (test / single-worker
+   * paths) → a fresh per-dispatcher serializer is used.
+   */
+  serializer?: WorkerHostSerializer;
 }
 
 /**
  * Main-side dispatcher: attaches a `message` listener to the worker
- * that decodes a "host-call" request from the SAB, invokes the
- * corresponding body, and writes the response back. Notifies the
- * worker via `Atomics.notify` on the status header.
+ * that decodes a "host-call" request from the SAB, `await`s the
+ * corresponding body, writes the response back, and `Atomics.notify`s
+ * the worker.
  *
- * The dispatcher does NOT take a kernel-state lock - that's Task 10.
- * Today, when a single worker hosts libzmq's signaler (no other
- * workers contending), there is no concurrent call into the import
- * bodies and the lock is not required for correctness. The lock
- * becomes load-bearing once multiple workers call host imports
- * concurrently.
+ * Bodies run inside a per-process `WorkerHostSerializer` (Task 10): the
+ * handler stays async so a body may suspend mid-flight (e.g. libzmq's
+ * I/O reactor waiting on a round-trip) without freezing main's event
+ * loop, while the serializer keeps kernel-state mutations FIFO across
+ * every worker pthread of the process. The handler returns the
+ * serializer promise; real `Worker` ignores it, test doubles `await`
+ * it.
  */
 export function attachWorkerHostDispatcher(
   worker: DispatcherTarget,
@@ -472,151 +496,162 @@ export function attachWorkerHostDispatcher(
   const header = new Int32Array(sab, 0, HEADER_WORDS);
   const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
   const payloadBytes = new Uint8Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_BYTES);
+  const serializer = context.serializer ?? new WorkerHostSerializer();
 
   worker.addEventListener("message", (e: MessageEvent) => {
     const msg = e.data;
     if (!msg || typeof msg !== "object" || msg.type !== "host-call") return;
 
-    const op = payload[PAYLOAD_OP_WORD] as WorkerHostOp;
+    // The worker is parked in `Atomics.wait` from before it posted this
+    // message until we notify, so its request SAB is stable across the
+    // serializer queue wait and any in-body `await`.
+    return serializer.run(async () => {
+      const op = payload[PAYLOAD_OP_WORD] as WorkerHostOp;
 
-    let result = -1;
-    let outBytes: Uint8Array | undefined;
-    try {
-      switch (op) {
-        case WorkerHostOp.ThreadYield:
-          result = bodies.threadYield(context.callerTid);
-          break;
-        case WorkerHostOp.ThreadExit:
-          bodies.threadExit(payload[PAYLOAD_ARGS_WORD + 0], context.callerTid);
-          result = 0;
-          break;
-        case WorkerHostOp.WriteFd: {
-          const fd = payload[PAYLOAD_ARGS_WORD + 0];
-          const len = payload[PAYLOAD_ARGS_WORD + 1];
-          const byteStart = (PAYLOAD_ARGS_WORD + 2) * 4;
-          const data = payloadBytes.subarray(byteStart, byteStart + len);
-          result = bodies.writeFd(fd, data);
-          break;
+      let result = -1;
+      let outBytes: Uint8Array | undefined;
+      try {
+        switch (op) {
+          case WorkerHostOp.ThreadYield:
+            result = await bodies.threadYield(context.callerTid);
+            break;
+          case WorkerHostOp.ThreadExit:
+            await bodies.threadExit(
+              payload[PAYLOAD_ARGS_WORD + 0],
+              context.callerTid,
+            );
+            result = 0;
+            break;
+          case WorkerHostOp.WriteFd: {
+            const fd = payload[PAYLOAD_ARGS_WORD + 0];
+            const len = payload[PAYLOAD_ARGS_WORD + 1];
+            const byteStart = (PAYLOAD_ARGS_WORD + 2) * 4;
+            const data = payloadBytes.subarray(byteStart, byteStart + len);
+            result = await bodies.writeFd(fd, data);
+            break;
+          }
+          case WorkerHostOp.ReadFd: {
+            const fd = payload[PAYLOAD_ARGS_WORD + 0];
+            const cap = payload[PAYLOAD_ARGS_WORD + 1];
+            const r = await bodies.readFd(fd, cap);
+            result = r.result;
+            outBytes = r.bytes;
+            break;
+          }
+          case WorkerHostOp.SocketOpen:
+            result = await bodies.socketOpen(
+              payload[PAYLOAD_ARGS_WORD + 0],
+              payload[PAYLOAD_ARGS_WORD + 1],
+              payload[PAYLOAD_ARGS_WORD + 2],
+            );
+            break;
+          case WorkerHostOp.SocketClose:
+            result = await bodies.socketClose(payload[PAYLOAD_ARGS_WORD + 0]);
+            break;
+          case WorkerHostOp.SocketRecv: {
+            const fd = payload[PAYLOAD_ARGS_WORD + 0];
+            const cap = payload[PAYLOAD_ARGS_WORD + 1];
+            const r = await bodies.socketRecv(fd, cap);
+            result = r.result;
+            outBytes = r.bytes;
+            break;
+          }
+          case WorkerHostOp.SocketSend: {
+            const fd = payload[PAYLOAD_ARGS_WORD + 0];
+            const len = payload[PAYLOAD_ARGS_WORD + 1];
+            const byteStart = (PAYLOAD_ARGS_WORD + 2) * 4;
+            const data = payloadBytes.subarray(byteStart, byteStart + len);
+            result = await bodies.socketSend(fd, data);
+            break;
+          }
+          case WorkerHostOp.Poll: {
+            const nfds = payload[PAYLOAD_ARGS_WORD + 0];
+            const byteStart = (PAYLOAD_ARGS_WORD + 1) * 4;
+            const totalBytes = nfds * POLLFD_BYTES;
+            const data = payloadBytes.slice(byteStart, byteStart + totalBytes);
+            const r = await bodies.poll(nfds, data);
+            result = r.result;
+            outBytes = r.bytes;
+            break;
+          }
+          case WorkerHostOp.GetPid:
+            result = await bodies.getPid();
+            break;
+          case WorkerHostOp.SocketSendUnix: {
+            const fd = payload[PAYLOAD_ARGS_WORD + 0];
+            const len = payload[PAYLOAD_ARGS_WORD + 1];
+            const byteStart = (PAYLOAD_ARGS_WORD + 2) * 4;
+            const data = payloadBytes.subarray(byteStart, byteStart + len);
+            result = await bodies.socketSendUnix(fd, data);
+            break;
+          }
+          case WorkerHostOp.SocketPair: {
+            const family = payload[PAYLOAD_ARGS_WORD + 0];
+            const sockType = payload[PAYLOAD_ARGS_WORD + 1];
+            const r = await bodies.socketPair(family, sockType);
+            result = r.result;
+            outBytes = r.bytes;
+            break;
+          }
+          case WorkerHostOp.SocketRecvUnix: {
+            const fd = payload[PAYLOAD_ARGS_WORD + 0];
+            const cap = payload[PAYLOAD_ARGS_WORD + 1];
+            const peek = payload[PAYLOAD_ARGS_WORD + 2];
+            const r = await bodies.socketRecvUnix(fd, cap, peek);
+            result = r.result;
+            outBytes = r.bytes;
+            break;
+          }
+          case WorkerHostOp.SetFdDescriptorFlags:
+            result = await bodies.setFdDescriptorFlags(
+              payload[PAYLOAD_ARGS_WORD + 0],
+              payload[PAYLOAD_ARGS_WORD + 1],
+            );
+            break;
+          case WorkerHostOp.ThreadSpawn:
+            result = await bodies.threadSpawn(
+              payload[PAYLOAD_ARGS_WORD + 0],
+              payload[PAYLOAD_ARGS_WORD + 1],
+              context.callerTid,
+            );
+            break;
+          case WorkerHostOp.SocketBind: {
+            const fd = payload[PAYLOAD_ARGS_WORD + 0];
+            const hostLen = payload[PAYLOAD_ARGS_WORD + 1];
+            const port = payload[PAYLOAD_ARGS_WORD + 2];
+            const byteStart = (PAYLOAD_ARGS_WORD + 3) * 4;
+            const host = payloadBytes.slice(byteStart, byteStart + hostLen);
+            result = await bodies.socketBind(fd, host, port);
+            break;
+          }
+          case WorkerHostOp.SocketListen:
+            result = await bodies.socketListen(
+              payload[PAYLOAD_ARGS_WORD + 0],
+              payload[PAYLOAD_ARGS_WORD + 1],
+            );
+            break;
+          case WorkerHostOp.SocketIsDgram:
+            result = await bodies.socketIsDgram(
+              payload[PAYLOAD_ARGS_WORD + 0],
+            );
+            break;
+          default:
+            result = -1;
         }
-        case WorkerHostOp.ReadFd: {
-          const fd = payload[PAYLOAD_ARGS_WORD + 0];
-          const cap = payload[PAYLOAD_ARGS_WORD + 1];
-          const r = bodies.readFd(fd, cap);
-          result = r.result;
-          outBytes = r.bytes;
-          break;
-        }
-        case WorkerHostOp.SocketOpen:
-          result = bodies.socketOpen(
-            payload[PAYLOAD_ARGS_WORD + 0],
-            payload[PAYLOAD_ARGS_WORD + 1],
-            payload[PAYLOAD_ARGS_WORD + 2],
-          );
-          break;
-        case WorkerHostOp.SocketClose:
-          result = bodies.socketClose(payload[PAYLOAD_ARGS_WORD + 0]);
-          break;
-        case WorkerHostOp.SocketRecv: {
-          const fd = payload[PAYLOAD_ARGS_WORD + 0];
-          const cap = payload[PAYLOAD_ARGS_WORD + 1];
-          const r = bodies.socketRecv(fd, cap);
-          result = r.result;
-          outBytes = r.bytes;
-          break;
-        }
-        case WorkerHostOp.SocketSend: {
-          const fd = payload[PAYLOAD_ARGS_WORD + 0];
-          const len = payload[PAYLOAD_ARGS_WORD + 1];
-          const byteStart = (PAYLOAD_ARGS_WORD + 2) * 4;
-          const data = payloadBytes.subarray(byteStart, byteStart + len);
-          result = bodies.socketSend(fd, data);
-          break;
-        }
-        case WorkerHostOp.Poll: {
-          const nfds = payload[PAYLOAD_ARGS_WORD + 0];
-          const byteStart = (PAYLOAD_ARGS_WORD + 1) * 4;
-          const totalBytes = nfds * POLLFD_BYTES;
-          const data = payloadBytes.slice(byteStart, byteStart + totalBytes);
-          const r = bodies.poll(nfds, data);
-          result = r.result;
-          outBytes = r.bytes;
-          break;
-        }
-        case WorkerHostOp.GetPid:
-          result = bodies.getPid();
-          break;
-        case WorkerHostOp.SocketSendUnix: {
-          const fd = payload[PAYLOAD_ARGS_WORD + 0];
-          const len = payload[PAYLOAD_ARGS_WORD + 1];
-          const byteStart = (PAYLOAD_ARGS_WORD + 2) * 4;
-          const data = payloadBytes.subarray(byteStart, byteStart + len);
-          result = bodies.socketSendUnix(fd, data);
-          break;
-        }
-        case WorkerHostOp.SocketPair: {
-          const family = payload[PAYLOAD_ARGS_WORD + 0];
-          const sockType = payload[PAYLOAD_ARGS_WORD + 1];
-          const r = bodies.socketPair(family, sockType);
-          result = r.result;
-          outBytes = r.bytes;
-          break;
-        }
-        case WorkerHostOp.SocketRecvUnix: {
-          const fd = payload[PAYLOAD_ARGS_WORD + 0];
-          const cap = payload[PAYLOAD_ARGS_WORD + 1];
-          const peek = payload[PAYLOAD_ARGS_WORD + 2];
-          const r = bodies.socketRecvUnix(fd, cap, peek);
-          result = r.result;
-          outBytes = r.bytes;
-          break;
-        }
-        case WorkerHostOp.SetFdDescriptorFlags:
-          result = bodies.setFdDescriptorFlags(
-            payload[PAYLOAD_ARGS_WORD + 0],
-            payload[PAYLOAD_ARGS_WORD + 1],
-          );
-          break;
-        case WorkerHostOp.ThreadSpawn:
-          result = bodies.threadSpawn(
-            payload[PAYLOAD_ARGS_WORD + 0],
-            payload[PAYLOAD_ARGS_WORD + 1],
-            context.callerTid,
-          );
-          break;
-        case WorkerHostOp.SocketBind: {
-          const fd = payload[PAYLOAD_ARGS_WORD + 0];
-          const hostLen = payload[PAYLOAD_ARGS_WORD + 1];
-          const port = payload[PAYLOAD_ARGS_WORD + 2];
-          const byteStart = (PAYLOAD_ARGS_WORD + 3) * 4;
-          const host = payloadBytes.slice(byteStart, byteStart + hostLen);
-          result = bodies.socketBind(fd, host, port);
-          break;
-        }
-        case WorkerHostOp.SocketListen:
-          result = bodies.socketListen(
-            payload[PAYLOAD_ARGS_WORD + 0],
-            payload[PAYLOAD_ARGS_WORD + 1],
-          );
-          break;
-        case WorkerHostOp.SocketIsDgram:
-          result = bodies.socketIsDgram(payload[PAYLOAD_ARGS_WORD + 0]);
-          break;
-        default:
-          result = -1;
+      } catch {
+        Atomics.store(header, RESULT_OFFSET, -1);
+        Atomics.store(header, STATUS_OFFSET, STATUS_ERROR);
+        Atomics.notify(header, STATUS_OFFSET, 1);
+        return;
       }
-    } catch {
-      Atomics.store(header, RESULT_OFFSET, -1);
-      Atomics.store(header, STATUS_OFFSET, STATUS_ERROR);
-      Atomics.notify(header, STATUS_OFFSET, 1);
-      return;
-    }
 
-    if (outBytes && outBytes.byteLength > 0) {
-      const byteStart = (PAYLOAD_ARGS_WORD + 1) * 4;
-      payloadBytes.set(outBytes, byteStart);
-    }
-    Atomics.store(header, RESULT_OFFSET, result | 0);
-    Atomics.store(header, STATUS_OFFSET, STATUS_RESPONSE_READY);
-    Atomics.notify(header, STATUS_OFFSET, 1);
+      if (outBytes && outBytes.byteLength > 0) {
+        const byteStart = (PAYLOAD_ARGS_WORD + 1) * 4;
+        payloadBytes.set(outBytes, byteStart);
+      }
+      Atomics.store(header, RESULT_OFFSET, result | 0);
+      Atomics.store(header, STATUS_OFFSET, STATUS_RESPONSE_READY);
+      Atomics.notify(header, STATUS_OFFSET, 1);
+    });
   });
 }

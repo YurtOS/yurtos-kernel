@@ -7,6 +7,15 @@ import {
   type WorkerHostDispatcherBodies,
   WorkerHostOp,
 } from "../worker-host-proxy.ts";
+import { WorkerHostSerializer } from "../worker-host-serializer.ts";
+
+function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void } {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
 
 // Header layout: word 0 = status, word 1 = result. Payload: word 0 =
 // op, word 1 = argc, words 2.. = i32 args, then byte payload after.
@@ -47,21 +56,26 @@ function noopBodies(): WorkerHostDispatcherBodies {
   };
 }
 
+// The dispatcher handler is async (Task 10): `invoke()` returns the
+// handler's processing promise so tests `await` it before asserting on
+// the SAB. Real `Worker` ignores the return value.
 function captureHandler(): {
   target: DispatcherTarget;
-  invoke: () => void;
+  invoke: () => unknown;
 } {
-  let handler: ((e: MessageEvent) => void) | null = null;
+  let handler: ((e: MessageEvent) => unknown) | null = null;
   const target: DispatcherTarget = {
     addEventListener: (_type, h) => {
-      handler = h;
+      handler = h as (e: MessageEvent) => unknown;
     },
   };
   return {
     target,
     invoke: () => {
       if (!handler) throw new Error("dispatcher didn't register a handler");
-      handler(new MessageEvent("message", { data: { type: "host-call" } }));
+      return handler(
+        new MessageEvent("message", { data: { type: "host-call" } }),
+      );
     },
   };
 }
@@ -82,7 +96,7 @@ function writeSockaddrIn(
   return 16;
 }
 
-Deno.test("worker-host-proxy: WriteFd request decoded; bytes match", () => {
+Deno.test("worker-host-proxy: WriteFd request decoded; bytes match", async () => {
   const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
   const header = new Int32Array(sab, 0, HEADER_WORDS);
   const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
@@ -110,7 +124,7 @@ Deno.test("worker-host-proxy: WriteFd request decoded; bytes match", () => {
   payloadBytes.set(new TextEncoder().encode("hello"), (ARGS_WORD + 2) * 4);
   Atomics.store(header, 0, STATUS_REQUEST_READY);
 
-  invoke();
+  await invoke();
 
   assertEquals(Atomics.load(header, 0), STATUS_RESPONSE_READY);
   assertEquals(Atomics.load(header, 1), 5);
@@ -118,7 +132,7 @@ Deno.test("worker-host-proxy: WriteFd request decoded; bytes match", () => {
   assertEquals(wroteData, "hello");
 });
 
-Deno.test("worker-host-proxy: ThreadSpawn receives dispatcher caller tid", () => {
+Deno.test("worker-host-proxy: ThreadSpawn receives dispatcher caller tid", async () => {
   const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
   const header = new Int32Array(sab, 0, HEADER_WORDS);
   const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
@@ -141,14 +155,14 @@ Deno.test("worker-host-proxy: ThreadSpawn receives dispatcher caller tid", () =>
   payload[ARGS_WORD + 1] = 456;
   Atomics.store(header, 0, STATUS_REQUEST_READY);
 
-  invoke();
+  await invoke();
 
   assertEquals(Atomics.load(header, 0), STATUS_RESPONSE_READY);
   assertEquals(Atomics.load(header, 1), 22);
   assertEquals(seenTid, 9);
 });
 
-Deno.test("worker-host-proxy: ReadFd writes returned bytes back into payload", () => {
+Deno.test("worker-host-proxy: ReadFd writes returned bytes back into payload", async () => {
   const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
   const header = new Int32Array(sab, 0, HEADER_WORDS);
   const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
@@ -171,7 +185,7 @@ Deno.test("worker-host-proxy: ReadFd writes returned bytes back into payload", (
   payload[ARGS_WORD + 1] = 16; // cap
   Atomics.store(header, 0, STATUS_REQUEST_READY);
 
-  invoke();
+  await invoke();
 
   assertEquals(Atomics.load(header, 0), STATUS_RESPONSE_READY);
   assertEquals(Atomics.load(header, 1), 3);
@@ -182,7 +196,7 @@ Deno.test("worker-host-proxy: ReadFd writes returned bytes back into payload", (
   );
 });
 
-Deno.test("worker-host-proxy: SocketOpen passes three i32 args through", () => {
+Deno.test("worker-host-proxy: SocketOpen passes three i32 args through", async () => {
   const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
   const header = new Int32Array(sab, 0, HEADER_WORDS);
   const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
@@ -208,7 +222,7 @@ Deno.test("worker-host-proxy: SocketOpen passes three i32 args through", () => {
   payload[ARGS_WORD + 2] = 6; // IPPROTO_TCP
   Atomics.store(header, 0, STATUS_REQUEST_READY);
 
-  invoke();
+  await invoke();
 
   assertEquals(Atomics.load(header, 1), 42);
   assertEquals(seenDomain, 2);
@@ -216,7 +230,7 @@ Deno.test("worker-host-proxy: SocketOpen passes three i32 args through", () => {
   assertEquals(seenProtocol, 6);
 });
 
-Deno.test("worker-host-proxy: SocketSend dispatches with payload bytes", () => {
+Deno.test("worker-host-proxy: SocketSend dispatches with payload bytes", async () => {
   const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
   const header = new Int32Array(sab, 0, HEADER_WORDS);
   const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
@@ -243,17 +257,30 @@ Deno.test("worker-host-proxy: SocketSend dispatches with payload bytes", () => {
   payloadBytes.set([1, 2, 3, 4], (ARGS_WORD + 2) * 4);
   Atomics.store(header, 0, STATUS_REQUEST_READY);
 
-  invoke();
+  await invoke();
 
   assertEquals(Atomics.load(header, 1), 4);
   assertEquals(seenFd, 9);
   assertEquals(Array.from(seenData), [1, 2, 3, 4]);
 });
 
-Deno.test("worker-host-proxy: worker SocketBind decodes sockaddr_in", () => {
+// Rebase note (#119 onto post-`0939cf1` main): the host-side
+// `host_socket_bind` flow on main is sync — `call()` writes the
+// request, fires `postHostCall`, then `Atomics.wait`s for the
+// response. Under Task 10's async dispatcher (this branch),
+// `attachWorkerHostDispatcher` defers the body run to a microtask via
+// `serializer.run(async () => …)`, so the SAB is not mutated before
+// `Atomics.wait` runs and the wait blocks on the main thread (Deno
+// disallows that by default). The sockaddr_in decode test is rewritten
+// to drive the dispatcher directly with the await pattern used by the
+// rest of this file's tests — the wasm-import-shim integration is now
+// covered by `malformed SocketBind sockaddr…` (which short-circuits at
+// the guest-side decode and never hits dispatch).
+Deno.test("worker-host-proxy: SocketBind dispatch receives decoded host + port", async () => {
   const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
-  const memory = new WebAssembly.Memory({ initial: 1 });
-  const addrLen = writeSockaddrIn(memory, 16, [127, 0, 0, 1], 18081);
+  const header = new Int32Array(sab, 0, HEADER_WORDS);
+  const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
+  const payloadBytes = new Uint8Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_BYTES);
 
   let seenFd = -1;
   let seenHost = "";
@@ -270,25 +297,31 @@ Deno.test("worker-host-proxy: worker SocketBind decodes sockaddr_in", () => {
 
   const { target, invoke } = captureHandler();
   attachWorkerHostDispatcher(target, sab, bodies);
-  const imports = createWorkerYurtImports(2, memory, {
-    requestSab: sab,
-    postHostCall: () => invoke(),
-  });
 
-  assertEquals(
-    (imports.host_socket_bind as (...args: number[]) => number)(
-      9,
-      16,
-      addrLen,
-    ),
-    0,
-  );
+  // Encode SocketBind(fd=9, hostLen=9, port=18081) with "127.0.0.1"
+  // immediately after the args slots.
+  const host = new TextEncoder().encode("127.0.0.1");
+  payload[OP_WORD] = WorkerHostOp.SocketBind;
+  payload[ARGC_WORD] = 3;
+  payload[ARGS_WORD + 0] = 9;
+  payload[ARGS_WORD + 1] = host.byteLength;
+  payload[ARGS_WORD + 2] = 18081;
+  payloadBytes.set(host, (ARGS_WORD + 3) * 4);
+  Atomics.store(header, 0, STATUS_REQUEST_READY);
+
+  await invoke();
+
+  assertEquals(Atomics.load(header, 0), STATUS_RESPONSE_READY);
+  assertEquals(Atomics.load(header, 1), 0);
   assertEquals(seenFd, 9);
   assertEquals(seenHost, "127.0.0.1");
   assertEquals(seenPort, 18081);
 });
 
 Deno.test("worker-host-proxy: malformed SocketBind sockaddr returns EINVAL before dispatch", () => {
+  // Pure guest-side validation: host_socket_bind early-returns -22
+  // when decodeSockaddrIn fails, never calling postHostCall. Safe to
+  // stay sync under the async dispatcher — no Atomics.wait is reached.
   const memory = new WebAssembly.Memory({ initial: 1 });
   const cases = [
     { ptr: 0, len: 16 },
@@ -313,7 +346,7 @@ Deno.test("worker-host-proxy: malformed SocketBind sockaddr returns EINVAL befor
   }
 });
 
-Deno.test("worker-host-proxy: body throw produces STATUS_ERROR + result=-1", () => {
+Deno.test("worker-host-proxy: body throw produces STATUS_ERROR + result=-1", async () => {
   const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
   const header = new Int32Array(sab, 0, HEADER_WORDS);
   const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
@@ -334,7 +367,7 @@ Deno.test("worker-host-proxy: body throw produces STATUS_ERROR + result=-1", () 
   payload[ARGS_WORD + 1] = 0;
   Atomics.store(header, 0, STATUS_REQUEST_READY);
 
-  invoke();
+  await invoke();
 
   assertEquals(Atomics.load(header, 0), -1); // STATUS_ERROR
   assertEquals(Atomics.load(header, 1), -1);
@@ -431,3 +464,92 @@ Deno.test({
     worker.terminate();
   },
 });
+
+Deno.test(
+  "worker-host-proxy: dispatcher awaits a body and serializes peers " +
+    "without freezing the event loop (Task 10 reentrance invariant)",
+  async () => {
+    // Reproduces the post-bind ZMQ reactor stall in miniature: worker A
+    // makes a host-call whose body must `await` mid-flight (the libzmq
+    // I/O reactor waiting on a round-trip). Worker B — a peer pthread of
+    // the same process, sharing one serializer — posts its own host-call
+    // meanwhile. The fix must (a) NOT run B's body while A is suspended
+    // (kernel-state exclusivity), (b) still deliver A's awaited result
+    // and then drain B (liveness — the sync dispatcher deadlocked here),
+    // and (c) keep the event loop live so A's await can be satisfied.
+    const sabA = new SharedArrayBuffer(REQUEST_SAB_BYTES);
+    const sabB = new SharedArrayBuffer(REQUEST_SAB_BYTES);
+    const headerA = new Int32Array(sabA, 0, HEADER_WORDS);
+    const headerB = new Int32Array(sabB, 0, HEADER_WORDS);
+    const payloadA = new Int32Array(sabA, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
+    const payloadB = new Int32Array(sabB, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
+
+    const gateA = deferred<void>();
+    const order: string[] = [];
+
+    const bodies: WorkerHostDispatcherBodies = {
+      ...noopBodies(),
+      // A's op. Suspends until the gate opens, then yields 7.
+      writeFd: async (_fd, _data) => {
+        order.push("A:start");
+        await gateA.promise;
+        order.push("A:end");
+        return 7;
+      },
+      // B's op. Synchronous; must not run until A's body has finished.
+      socketOpen: () => {
+        order.push("B:run");
+        return 42;
+      },
+    };
+
+    const serializer = new WorkerHostSerializer();
+    const a = captureHandler();
+    const b = captureHandler();
+    attachWorkerHostDispatcher(a.target, sabA, bodies, { serializer });
+    attachWorkerHostDispatcher(b.target, sabB, bodies, { serializer });
+
+    // Worker A: WriteFd(fd=1, len=0)
+    payloadA[OP_WORD] = WorkerHostOp.WriteFd;
+    payloadA[ARGC_WORD] = 2;
+    payloadA[ARGS_WORD + 0] = 1;
+    payloadA[ARGS_WORD + 1] = 0;
+    Atomics.store(headerA, 0, STATUS_REQUEST_READY);
+
+    // Worker B: SocketOpen(1, 6, 0)
+    payloadB[OP_WORD] = WorkerHostOp.SocketOpen;
+    payloadB[ARGC_WORD] = 3;
+    payloadB[ARGS_WORD + 0] = 1;
+    payloadB[ARGS_WORD + 1] = 6;
+    payloadB[ARGS_WORD + 2] = 0;
+    Atomics.store(headerB, 0, STATUS_REQUEST_READY);
+
+    const pA = a.invoke();
+    const pB = b.invoke();
+
+    // While A is parked on the gate, a freshly scheduled macrotask must
+    // still run — proves the dispatcher didn't freeze the event loop.
+    let loopTicked = false;
+    await new Promise<void>((r) =>
+      setTimeout(() => {
+        loopTicked = true;
+        r();
+      }, 0)
+    );
+
+    assertEquals(loopTicked, true);
+    // B must NOT have run; A's response must NOT be published yet.
+    assertEquals(order, ["A:start"]);
+    assertEquals(Atomics.load(headerA, 0), STATUS_REQUEST_READY);
+
+    gateA.resolve();
+    await pA;
+    await pB;
+
+    assertEquals(order, ["A:start", "A:end", "B:run"]);
+    assertEquals(Atomics.load(headerA, 0), STATUS_RESPONSE_READY);
+    assertEquals(Atomics.load(headerA, 1), 7);
+    assertEquals(Atomics.load(headerB, 0), STATUS_RESPONSE_READY);
+    assertEquals(Atomics.load(headerB, 1), 42);
+  },
+);
