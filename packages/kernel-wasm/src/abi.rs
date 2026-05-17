@@ -6,6 +6,7 @@
 pub const EPERM: i32 = 1;
 pub const ENOENT: i32 = 2;
 pub const ESRCH: i32 = 3;
+pub const EINTR: i32 = 4;
 // Part of the ABI errno set (kh_idb_get returns -E2BIG on a too-small
 // output). The only in-crate consumer is the #[cfg(test)] kh idb
 // emulation — real wasm/JS hosts return it themselves — so it is dead

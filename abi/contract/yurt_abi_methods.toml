@@ -675,3 +675,23 @@ doc = "KernelHostInterface-only: serialize a kernel-owned thread snapshot for on
 id = 18
 kind = "internal"
 doc = "KernelHostInterface-only: ask the kernel scheduler for the next runnable thread. Response: u32 pid, u32 tid, i32 host_thread_handle (-1 when none), u32 flags, u64 budget_ns. Returns bytes-written, -EAGAIN when no runnable thread exists, or required size when the output buffer is too small."
+
+[method.sys_sigprocmask]
+id = 0x1_00A0
+kind = "syscall"
+doc = "POSIX sigprocmask/pthread_sigmask on the calling thread. Request: i32 how LE + u8 has_set + u8 set (guest 1-byte compact sigset_t). Response: u8 oset (prior mask, compact). how: 0=BLOCK 1=UNBLOCK 2=SETMASK. SIGKILL/SIGSTOP silently unmaskable. Per-calling-thread (POSIX leaves MT sigprocmask unspecified). -EINVAL bad how/short, -ESRCH no record."
+
+[method.sys_sigaltstack]
+id = 0x1_00A1
+kind = "syscall"
+doc = "POSIX sigaltstack. Request: u8 has_ss + {u32 sp,i32 flags,u32 size}. Response: {u32 sp,i32 flags,u32 size} (prior). Bookkeeping only (host delivers). -EINVAL size<MINSIGSTKSZ unless SS_DISABLE, -EPERM while on alt stack (placeholder until delivery)."
+
+[method.sys_sigsuspend]
+id = 0x1_00A2
+kind = "syscall"
+doc = "POSIX sigsuspend / pause. Request: u8 has_mask + u8 mask. has_mask=1 swaps caller-thread mask for the wait; has_mask=0 leaves it (pause). Non-blocking pending check, restore prior mask, return -EINTR (true blocking AsyncBridge/B1.5-gated)."
+
+[method.sys_sigtimedwait]
+id = 0x1_00A3
+kind = "syscall"
+doc = "POSIX sigtimedwait. Request: u8 set (compact) + u8 has_timeout + {i64 tv_sec,i64 tv_nsec}. Reuses sigwaitinfo RT-queue dequeue selected by set regardless of blocked state; 16-byte siginfo response. Nothing pending / timeout==0 => -EAGAIN; nonzero-timeout blocking is the gated stub. RT-queue-only (kill bitmask divergence, documented)."
