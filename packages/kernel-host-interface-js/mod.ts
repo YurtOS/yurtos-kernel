@@ -433,15 +433,6 @@ export interface ThreadHost {
 
 export interface HostState {
   nowRealtimeNs: bigint;
-  /**
-   * Monotonic-clock value handed to `kh_now_monotonic`. Embedders
-   * update before each dispatch from `performance.now() * 1e6` (or a
-   * tick counter for deterministic tests). Used to serve
-   * `clock_gettime(CLOCK_MONOTONIC)` — must be monotonically
-   * non-decreasing and independent of wall-clock adjustments
-   * (issue #64).
-   */
-  nowMonotonicNs: bigint;
   extensions: ExtensionRegistry;
   logSink: LogSink;
   policy: PolicyEnforcer;
@@ -1229,7 +1220,6 @@ export const denyAllPolicy: PolicyEnforcer = {
 export function defaultHostState(): HostState {
   return {
     nowRealtimeNs: 0n,
-    nowMonotonicNs: 0n,
     extensions: new EmptyExtensionRegistry(),
     logSink: new DiscardLogSink(),
     policy: allowAllPolicy,
@@ -2250,17 +2240,20 @@ export class KernelHostInterface {
         return 0;
       },
       kh_now_monotonic: (outPtr: number): number => {
-        // Mirrors kh_now_realtime but reads HostState.nowMonotonicNs.
-        // Embedders populate this from performance.now() before each
-        // dispatch — see HostState.nowMonotonicNs (issue #64).
+        // Compute at call time so a default-initialized HostState
+        // never returns a frozen 0. performance.now() is already
+        // monotonic-from-some-origin in milliseconds (with sub-ms
+        // precision on most runtimes); scale to ns and floor to
+        // bigint. Available in Deno, Node, and browsers. Issue #64.
         if (
           hostBox.state.policy.mayGetMonotonic?.() === "deny"
         ) {
           return -EACCES;
         }
+        const nowNs = BigInt(Math.floor(performance.now() * 1_000_000));
         new DataView(memoryRef.memory!.buffer).setBigUint64(
           outPtr,
-          hostBox.state.nowMonotonicNs,
+          nowNs,
           true,
         );
         return 0;

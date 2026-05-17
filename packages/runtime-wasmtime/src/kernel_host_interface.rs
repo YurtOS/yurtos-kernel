@@ -888,11 +888,6 @@ fn read_shared_memory(memory: SharedMemory, addr: u32, len: usize) -> Result<Vec
 /// during kernel.wasm execution.
 pub struct HostState {
     pub now_realtime_ns: u64,
-    /// Monotonic-clock value handed to `kh_now_monotonic`. Embedders
-    /// update this from `Instant::now()` (or a tick counter for
-    /// deterministic tests) before each dispatch — the kernel uses it
-    /// to serve `clock_gettime(CLOCK_MONOTONIC)` (issue #64).
-    pub now_monotonic_ns: u64,
     pub extensions: Arc<dyn ExtensionRegistry>,
     pub log_sink: Arc<dyn LogSink>,
     /// Policy gate consulted at every `kh_*` boundary that touches
@@ -945,7 +940,6 @@ impl Default for HostState {
     fn default() -> Self {
         Self {
             now_realtime_ns: 0,
-            now_monotonic_ns: 0,
             extensions: Arc::new(EmptyExtensionRegistry),
             log_sink: Arc::new(DiscardLogSink),
             policy: Arc::new(AllowAllPolicy),
@@ -3651,7 +3645,16 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
             if caller.data().host.policy.may_get_monotonic() == PolicyDecision::Deny {
                 return -(EACCES as i32);
             }
-            let now = caller.data().host.now_monotonic_ns;
+            // Compute monotonic at call time so default-initialized
+            // embedders don't return a frozen 0 forever. Anchor the
+            // first reading at process start and report nanoseconds
+            // since that anchor — guarantees non-decrease and works
+            // without any embedder bookkeeping.
+            use std::sync::OnceLock;
+            use std::time::Instant;
+            static ANCHOR: OnceLock<Instant> = OnceLock::new();
+            let anchor = ANCHOR.get_or_init(Instant::now);
+            let now = anchor.elapsed().as_nanos() as u64;
             let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
                 Some(m) => m,
                 None => return -(EFAULT as i32),
