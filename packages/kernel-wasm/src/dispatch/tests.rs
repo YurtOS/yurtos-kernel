@@ -7024,6 +7024,17 @@ fn getrandom_fills_response_and_validates_args() {
     );
 }
 
+#[test]
+fn getrandom_preserves_host_memory_fault_errno() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::push_random_result(Err(-crate::abi::EFAULT));
+
+    assert_eq!(
+        dispatch(METHOD_SYS_GETRANDOM, 1, &gr_req(8, 0), &mut [0u8; 8]),
+        -(crate::abi::EFAULT as i64)
+    );
+}
+
 fn open_rw(path: &[u8]) -> u32 {
     let fd = dispatch(
         METHOD_SYS_OPEN,

@@ -820,7 +820,7 @@ fn sys_getrandom(request: &[u8], response: &mut [u8]) -> i64 {
     }
     match crate::kh::fill_random(&mut response[..len]) {
         Ok(()) => len as i64,
-        Err(_) => -(abi::EIO as i64),
+        Err(rc) => rc as i64,
     }
 }
 

@@ -33,7 +33,7 @@ args = [
 ]
 
 [import.kh_random]
-doc = "Fill (out_ptr, len) with cryptographically secure random bytes from the host platform CSPRNG. Returns 0 on success or a negated errno (-EIO) on failure. Callers cap len at MAX_GUEST_BUFFER_LEN before invoking. Ungated (entropy is not privacy-sensitive)."
+doc = "Fill (out_ptr, len) with cryptographically secure random bytes from the host platform CSPRNG. Returns 0 on success or a negated errno (-EIO for entropy source failure, -EFAULT for bad guest memory) on failure. Callers cap len at MAX_GUEST_BUFFER_LEN before invoking. Ungated (entropy is not privacy-sensitive)."
 return = "scalar"
 args = [
   { name = "out_ptr", type = "ptr" },

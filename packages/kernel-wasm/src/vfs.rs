@@ -591,7 +591,7 @@ impl VfsBackend for DevBackend {
                 // short. `&self` is fine: fill_random holds no RNG state.
                 match crate::kh::fill_random(buf) {
                     Ok(()) => buf.len() as i64,
-                    Err(_) => -(crate::abi::EIO as i64),
+                    Err(rc) => rc as i64,
                 }
             }
             _ => -(crate::abi::EBADF as i64),
@@ -882,6 +882,17 @@ mod tests {
         }
         // Unknown /dev/* still unmapped.
         assert_eq!(dev.open(b"/nope", 0), None);
+    }
+
+    #[test]
+    fn devbackend_random_preserves_host_memory_fault_errno() {
+        let _g = crate::kernel::TestGuard::acquire();
+        crate::kh::test_support::push_random_result(Err(-crate::abi::EFAULT));
+        let mut dev = DevBackend::new();
+        let inode = dev.open(b"/urandom", 0).expect("node exists");
+        let mut buf = [0u8; 8];
+
+        assert_eq!(dev.read(inode, 0, &mut buf), -(crate::abi::EFAULT as i64));
     }
 
     #[test]
