@@ -5,6 +5,47 @@ the #71 holistic follow-up. Closes the second residual of **#134** (Part 1 —
 `lstat` `st_size` — already fixed in commit `d759965` on this branch). Off
 `main`; no new syscalls / ABI method-ids. Single-crate (`yurt-kernel-wasm`).
 
+## Revision — IMPLEMENTED DESIGN (supersedes Approach A below)
+
+TDD execution **disproved Approach A** (route `stat`/`lstat` through
+`resolve_realpath`'s walk). Three pinned behaviors regressed because
+`realpath`'s contract ≠ `stat`/`lstat`'s contract:
+
+1. **Lexical `..`** — the sandbox collapses `…/x/../…` lexically without
+   requiring `x` to exist (`normalize_lexical_path`, shared with `open`);
+   `resolve_realpath` existence-checks each component → wrong `ENOENT`
+   (`path_syscalls_normalize_parent_components_for_existing_paths`).
+2. **Unix-socket `stat`** — a bound AF_UNIX path is not a VFS entry
+   (`entry_type == 0`); only `write_stat_record`'s `has_unix_socket_inode`
+   types it. `resolve_realpath` rejects `entry_type==0` first
+   (`af_unix_path_datagram_unlink_removes_route_but_close_keeps_inode`).
+3. **`/proc` publish timing** — `realpath` publishes proc snapshots *after*
+   resolution; the walk needs them *during*
+   (`proc_other_pid_metadata_queries_are_gated`).
+
+**Implemented design (approved):** keep `normalize_readable_path` (lexical
+`.`/`..`/cwd + procfs publish & gate) and `write_stat_record` (socket /
+dangling / Part-1 typing) **unchanged**. Replace only the terminal-only
+`follow_symlinks` with a shared `resolve_symlinks_per_component(k,
+caller_pid, path, follow_terminal)` (in `dispatch/fs.rs`, next to
+`follow_symlinks`): walks every component; on a symlink prefix splices the
+target (absolute, or relative to the link's parent) ahead of the remainder
+and re-runs `normalize_readable_path` — the same per-hop lexical-normalize +
+re-authorize discipline as `follow_symlinks`, so an intermediate link still
+cannot bypass the `/proc` gate; SYMLOOP 40 → `-EINVAL`; `follow_terminal =
+false` (lstat) leaves the terminal un-followed. It performs **no**
+existence/`ENOTDIR`/typing checks — those stay with `normalize_readable_path`
+(lexical) and `write_stat_record` (typing), which is exactly what preserves
+the three contracts above. `stat_path` = `normalize` →
+`resolve_symlinks_per_component(true)` → `write_stat_record`; `lstat_path` =
+`normalize` → `resolve_symlinks_per_component(false)` → `write_stat_record`.
+**`realpath` is untouched** (`resolve_realpath` reverted to its original
+form; the refined design does not share it). Still mechanism-independent of
+#59/PR-63; #142/#146 still carved out. Delivered in commits `59faf06`
+(helper + wiring) and `ce3038d` (test coverage); kernel-wasm lib 415/415,
+`fmt`+`clippy -D warnings` clean. The Approach A section below is retained
+for provenance — read it as *rejected*, this Revision as authoritative.
+
 ## Problem
 
 POSIX resolves symlinks in **every intermediate** path component; only the
