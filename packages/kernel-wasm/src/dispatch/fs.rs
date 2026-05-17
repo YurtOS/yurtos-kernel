@@ -2,7 +2,7 @@ use crate::abi;
 use crate::kernel::{with_kernel, Kernel};
 use crate::path::PathResolver;
 
-use super::{take_bytes, ID_NO_CHANGE};
+use super::{proc_pid_visible, take_bytes, ID_NO_CHANGE};
 
 fn can_modify_owned_metadata(credentials: crate::state::Credentials, owner_uid: u32) -> bool {
     credentials.euid == 0 || credentials.euid == owner_uid
@@ -199,6 +199,25 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
     sys_open(caller_pid, &req)
 }
 
+/// #105 / M8: a `/proc/<pid>` path is *reachable* by `caller_pid` iff
+/// it is not a per-pid path at all (synthetic entries like `/proc`
+/// itself), or the target pid is visible to the caller under #66's
+/// ownership model (`proc_pid_visible` → self / same-owner / root).
+///
+/// Crucially this returns the **same** answer for "pid absent" and
+/// "pid present but unauthorized": `proc_pid_visible` is `false` in
+/// both cases, so the caller maps both to `-ENOENT` and the
+/// pid-existence oracle is closed. Caller's own pid and same-credential
+/// pids stay fully visible.
+fn proc_path_reachable(k: &mut Kernel, caller_pid: u32, path: &[u8]) -> bool {
+    match crate::path::proc_target_pid(path) {
+        // Not a /proc/<pid> path (e.g. /proc, /proc/<non-numeric>) —
+        // no per-pid gating; synthetic entries are unaffected.
+        None => true,
+        Some(target) => proc_pid_visible(k, caller_pid, target),
+    }
+}
+
 fn normalize_readable_path(
     k: &mut Kernel,
     caller_pid: u32,
@@ -207,10 +226,12 @@ fn normalize_readable_path(
     let path = PathResolver::new(k, caller_pid).normalize(raw_path)?;
     // Refresh procfs snapshots so /proc/<N> views reflect the current
     // process table at lookup time, then gate all read-like path
-    // surfaces consistently.
+    // surfaces consistently. An unauthorized OR absent /proc/<pid>
+    // both yield -ENOENT so presence is uninferrable (#105 / M8 — the
+    // uniform errno closes the cross-tenant pid-existence oracle).
     k.publish_proc_snapshots();
-    if !k.can_read_proc_path(caller_pid, &path) {
-        return Err(-(abi::EPERM as i64));
+    if !proc_path_reachable(k, caller_pid, &path) {
+        return Err(-(abi::ENOENT as i64));
     }
     Ok(path)
 }
@@ -279,10 +300,26 @@ pub(super) fn readdir(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        let entries = match k.vfs.readdir(&path) {
+        let mut entries = match k.vfs.readdir(&path) {
             Some(e) => e,
             None => return -(abi::ENOENT as i64),
         };
+        // #105 / M8: `readdir("/proc")` must not enumerate pids the
+        // caller may not see, or it becomes a process-enumeration
+        // leak. Drop numeric /proc/<pid> entries that fail the #66
+        // visibility gate; non-numeric synthetic entries (and the
+        // caller's own pid, which `proc_pid_visible` always permits)
+        // pass through untouched. Only the /proc mount root is
+        // filtered — per-pid subdirs are already gated by
+        // `normalize_readable_path` above.
+        if path == b"/proc" {
+            entries.retain(|name| {
+                match std::str::from_utf8(name).ok().and_then(|s| s.parse().ok()) {
+                    Some(target) => proc_pid_visible(k, caller_pid, target),
+                    None => true,
+                }
+            });
+        }
         // Pack as count + (u32 name_len, u8 type, name_bytes)*.
         // Type byte is a WASI filetype (0/3/4/7); 0 means the
         // backend doesn't know — userland will stat to find out.
@@ -428,8 +465,10 @@ pub(super) fn realpath(caller_pid: u32, request: &[u8], response: &mut [u8]) -> 
             Err(errno) => return -(errno as i64),
         };
         k.publish_proc_snapshots();
-        if !k.can_read_proc_path(caller_pid, &resolved) {
-            return -(abi::EPERM as i64);
+        // #105 / M8: realpath must not leak EPERM-vs-ENOENT either —
+        // unauthorized and absent /proc/<pid> are indistinguishable.
+        if !proc_path_reachable(k, caller_pid, &resolved) {
+            return -(abi::ENOENT as i64);
         }
         let required = resolved.len() + 1;
         if response.len() < required {

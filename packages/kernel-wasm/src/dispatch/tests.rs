@@ -4871,46 +4871,75 @@ fn proc_status_reflects_setresuid() {
     );
 }
 
+// #105 / M8 (#69 precedent): these three tests previously enshrined
+// the EPERM-vs-ENOENT oracle AND used a default-uid (1000) "other"
+// pid that, under #66's same-owner model, is now legitimately
+// visible to a default-uid caller. Updated to (a) use a genuinely
+// cross-tenant pid (uid 2000) so the gate is actually exercised and
+// (b) assert the uniform -ENOENT that closes the oracle. Self/root
+// positive paths and a same-credential positive path are retained.
+fn make_other_owner(pid: u32, uid: u32) {
+    crate::kernel::with_kernel(|k| {
+        let c = &mut k.process_mut(pid).credentials;
+        c.uid = uid;
+        c.euid = uid;
+        c.suid = uid;
+    });
+}
+
 #[test]
-fn proc_other_pid_requires_same_process_or_root() {
+fn proc_cross_owner_pid_is_enoent_self_and_root_ok() {
     let _g = crate::kernel::TestGuard::acquire();
     let argv = set_argv_req(2, &[b"/bin/other"]);
     set_argv(&argv);
+    make_other_owner(2, 2000); // genuinely cross-tenant
 
+    // Cross-owner: -ENOENT (was -EPERM — the oracle).
     assert_eq!(
         dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/proc/2/status"), &mut []),
-        -(abi::EPERM as i64)
+        -(abi::ENOENT as i64)
     );
+    // Self always works.
     assert!(dispatch(METHOD_SYS_OPEN, 2, &open_req(0, b"/proc/2/status"), &mut []) >= 0);
-
+    // Root sees everything.
     make_root(1);
     assert!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/proc/2/status"), &mut []) >= 0);
 }
 
 #[test]
-fn proc_other_pid_metadata_queries_are_gated() {
+fn proc_cross_owner_metadata_queries_are_uniform_enoent() {
     let _g = crate::kernel::TestGuard::acquire();
     let argv = set_argv_req(2, &[b"/bin/other"]);
     set_argv(&argv);
+    make_other_owner(2, 2000);
 
+    // Every metadata surface returns -ENOENT (not -EPERM) for a
+    // present-but-cross-owner pid — same errno as a truly absent pid.
     let mut stat = [0u8; 16];
     assert_eq!(
         dispatch(METHOD_SYS_STAT, 1, b"/proc/2/status", &mut stat),
-        -(abi::EPERM as i64)
+        -(abi::ENOENT as i64)
     );
 
     let mut entries = [0u8; 128];
     assert_eq!(
         dispatch(METHOD_SYS_READDIR, 1, b"/proc/2", &mut entries),
-        -(abi::EPERM as i64)
+        -(abi::ENOENT as i64)
     );
 
     let mut target = [0u8; 64];
     assert_eq!(
         dispatch(METHOD_SYS_READLINK, 1, b"/proc/2/cwd", &mut target),
-        -(abi::EPERM as i64)
+        -(abi::ENOENT as i64)
     );
 
+    // Indistinguishable from a never-touched pid.
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/proc/424242/status", &mut stat),
+        -(abi::ENOENT as i64)
+    );
+
+    // Self + root still fully introspect.
     assert_eq!(
         dispatch(METHOD_SYS_STAT, 2, b"/proc/2/status", &mut stat),
         16
@@ -4923,10 +4952,11 @@ fn proc_other_pid_metadata_queries_are_gated() {
 }
 
 #[test]
-fn proc_other_pid_open_gate_survives_symlink_resolution() {
+fn proc_cross_owner_gate_survives_symlink_resolution_as_enoent() {
     let _g = crate::kernel::TestGuard::acquire();
     let argv = set_argv_req(2, &[b"/bin/other"]);
     set_argv(&argv);
+    make_other_owner(2, 2000);
 
     let target = b"/proc/2/cmdline";
     let mut req = (target.len() as u32).to_le_bytes().to_vec();
@@ -4934,9 +4964,11 @@ fn proc_other_pid_open_gate_survives_symlink_resolution() {
     req.extend_from_slice(b"/tmp/leak");
     assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &req, &mut []), 0);
 
+    // Symlinked cross-owner /proc target must also collapse to
+    // -ENOENT — no EPERM-vs-ENOENT leak through symlink resolution.
     assert_eq!(
         dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/tmp/leak"), &mut []),
-        -(abi::EPERM as i64)
+        -(abi::ENOENT as i64)
     );
 
     let fd = dispatch(METHOD_SYS_OPEN, 2, &open_req(0, b"/tmp/leak"), &mut []);
@@ -4958,6 +4990,138 @@ fn proc_unknown_pid_returns_enoent() {
             &mut [],
         ),
         -(abi::ENOENT as i64)
+    );
+}
+
+// ── #105 / M8: /proc enumeration + pid-existence oracle ────────────
+//
+// Two leaks, one oracle:
+//   1. /proc/<n> returned -EPERM when the pid exists-but-is-unauthorized
+//      and -ENOENT when absent — the differing errno lets a sandboxed
+//      caller probe which pids are alive across tenants.
+//   2. readdir("/proc") enumerated *every* live pid regardless of the
+//      caller's credentials.
+// The fix: uniform -ENOENT for absent OR unauthorized, and a readdir
+// that lists only pids the caller may see (#66's may_control_pid gate).
+
+#[test]
+fn proc_oracle_closed_unauthorized_pid_indistinguishable_from_absent() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Caller A: pid 1, default uid 1000. Target B: pid 2 owned by a
+    // different uid (2000). Absent pid: 999999 (never touched).
+    let argv = set_argv_req(2, &[b"/bin/other"]);
+    set_argv(&argv);
+    crate::kernel::with_kernel(|k| {
+        let c = &mut k.process_mut(2).credentials;
+        c.uid = 2000;
+        c.euid = 2000;
+        c.suid = 2000;
+    });
+
+    // The oracle IS the difference between these two errnos. Closing
+    // it means present-but-unauthorized and absent must be identical.
+    let mut stat = [0u8; 16];
+    let unauthorized_stat = dispatch(METHOD_SYS_STAT, 1, b"/proc/2/status", &mut stat);
+    let absent_stat = dispatch(METHOD_SYS_STAT, 1, b"/proc/999999/status", &mut stat);
+    assert_eq!(
+        unauthorized_stat, absent_stat,
+        "stat: unauthorized pid must be indistinguishable from absent"
+    );
+    assert_eq!(
+        unauthorized_stat,
+        -(abi::ENOENT as i64),
+        "stat: both must be -ENOENT (not -EPERM)"
+    );
+
+    let unauthorized_open = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/proc/2/status"), &mut []);
+    let absent_open = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(0, b"/proc/999999/status"),
+        &mut [],
+    );
+    assert_eq!(
+        unauthorized_open, absent_open,
+        "open: unauthorized pid must be indistinguishable from absent"
+    );
+    assert_eq!(
+        unauthorized_open,
+        -(abi::ENOENT as i64),
+        "open: both must be -ENOENT (not -EPERM)"
+    );
+}
+
+#[test]
+fn proc_readdir_does_not_enumerate_unrelated_pids() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Register caller A (pid 1, uid 1000) and an unrelated pid B
+    // (pid 2, uid 2000). readdir("/proc") from A must list A's own
+    // pid but NOT B's.
+    assert_eq!(dispatch(METHOD_SYS_GETUID, 1, &[], &mut []), 1000);
+    let argv = set_argv_req(2, &[b"/bin/other"]);
+    set_argv(&argv);
+    crate::kernel::with_kernel(|k| {
+        let c = &mut k.process_mut(2).credentials;
+        c.uid = 2000;
+        c.euid = 2000;
+        c.suid = 2000;
+    });
+
+    let mut buf = [0u8; 256];
+    let n = dispatch(METHOD_SYS_READDIR, 1, b"/proc", &mut buf);
+    assert!(n >= 4, "readdir /proc failed: {n}");
+    let count = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
+    let mut cursor = 4usize;
+    let mut names: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..count {
+        let len = u32::from_le_bytes(buf[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4 + 1;
+        names.push(buf[cursor..cursor + len].to_vec());
+        cursor += len;
+    }
+    assert!(
+        names.iter().any(|nm| nm == b"1"),
+        "readdir /proc must include the caller's own pid; got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|nm| nm == b"2"),
+        "readdir /proc must NOT enumerate unrelated pid 2; got {names:?}"
+    );
+}
+
+#[test]
+fn proc_self_and_same_credential_pids_stay_accessible() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Regression guard: closing the cross-pid oracle must not break
+    // self-introspection or same-owner introspection.
+    let argv = set_argv_req(2, &[b"/bin/peer"]);
+    set_argv(&argv);
+    // pid 2 keeps the default uid 1000 — same credentials as pid 1.
+
+    // Self: pid 2 reads its own status.
+    let fd = dispatch(METHOD_SYS_OPEN, 2, &open_req(0, b"/proc/2/status"), &mut []);
+    assert!(fd >= 0, "self /proc access broke: {fd}");
+
+    // Same-credential peer: pid 1 (uid 1000) reads pid 2 (uid 1000).
+    let mut stat = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/proc/2/status", &mut stat),
+        16,
+        "same-credential peer /proc access broke"
+    );
+
+    // Root still sees everything.
+    make_root(3);
+    crate::kernel::with_kernel(|k| {
+        let c = &mut k.process_mut(2).credentials;
+        c.uid = 2000;
+        c.euid = 2000;
+        c.suid = 2000;
+    });
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 3, b"/proc/2/status", &mut stat),
+        16,
+        "root /proc access broke"
     );
 }
 
