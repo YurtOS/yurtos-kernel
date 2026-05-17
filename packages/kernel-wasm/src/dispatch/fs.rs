@@ -613,17 +613,38 @@ fn resolve_symlinks_per_component(
         };
         // Roll `prefix` back to the link's parent ("/" + comps[..i]).
         prefix.truncate(parent_len);
-        // An empty symlink target is malformed: fail closed with
-        // -EINVAL, matching the old terminal-only path
-        // (follow_symlinks → normalize_readable_path(b"") → -EINVAL).
-        // Without this, the relative-target branch would splice ""
-        // and silently alias the link to its parent dir (e.g.
-        // stat("/d/sl/child") with `sl -> ""` would stat /d/child) —
+        // Don't honor an intermediate symlink whose parent directory
+        // doesn't exist (or isn't a directory). `symlink(2)`/ramfs
+        // accept a link path under a missing parent (flat key map), so
+        // an orphan `/missing/link -> /real` is constructible; without
+        // this, per-component resolution would traverse it and let
+        // `stat("/missing/link/file")` resolve `/real/file` even
+        // though `/missing` does not exist — a #134-introduced
+        // expansion (terminal-only following never traversed an
+        // intermediate orphan link) with an info-probing flavor. Fail
+        // -ENOENT, matching the no-symlink case (`stat("/missing/x")`
+        // is already -ENOENT) and pre-#134 behavior. `prefix` is now
+        // "/" + comps[..i]; empty ⇒ the parent is root, always a dir.
+        // (POSIX `ENOTDIR`-vs-`ENOENT` precision for a non-dir parent
+        // stays the uniform-`ENOENT` lenient-contract residual → #142.)
+        let parent: &[u8] = if prefix.is_empty() { b"/" } else { &prefix };
+        if k.vfs.entry_type(parent) != 3 {
+            return Err(-(abi::ENOENT as i64));
+        }
+        // An empty symlink target resolves to -ENOENT, matching Linux
+        // (`fs/namei.c` get_link() returns -ENOENT for an empty link
+        // body; `symlink(2)` likewise rejects an empty target with
+        // -ENOENT). Without this, the relative-target branch would
+        // splice "" and silently alias the link to its parent dir
+        // (e.g. stat("/d/sl/child") with `sl -> ""` → stat /d/child) —
         // a behavioral regression with an information-probing flavor.
-        // (`symlink(2)` itself still accepts an empty target;
-        // rejecting at creation is a separate, broader decision.)
+        // (The old terminal-only path returned -EINVAL here via
+        // normalize_readable_path(b""); that was incidental, not
+        // Linux-faithful. `sys_open` still has the old -EINVAL until
+        // it moves to per-component resolution — tracked in #142,
+        // alongside `symlink(2)` rejecting empty targets at creation.)
         if target.is_empty() {
-            return Err(-(abi::EINVAL as i64));
+            return Err(-(abi::ENOENT as i64));
         }
         hops += 1;
         if hops > SYMLOOP_MAX {

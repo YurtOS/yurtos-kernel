@@ -332,15 +332,26 @@ cross-crate run needed.
   uniform `ENOENT` contract and pins it with a characterization test
   (`stat_lstat_nondir_intermediate_is_enoent_not_enotdir_146_142`); the
   uniform fix across `open`/`stat`/`lstat` belongs to #142.
-- **Empty symlink-target errno is `-EINVAL`, not Linux's `-ENOENT`.**
-  Part 2 fails closed on an empty `readlink` target (else it would
-  silently parent-alias — info-probing); the errno chosen is internal
-  consistency with the pre-existing `follow_symlinks →
-  normalize_readable_path(b"") → -EINVAL` path, **not** Linux parity
-  (Linux rejects empty targets at `symlink(2)` with `-ENOENT`).
-  Intentional and tested (`stat_lstat_empty_symlink_target_is_einval`);
-  a deliberate, tracked parity divergence for the syscall-parity
-  scoreboard (#52 / parity-matrix) — not silently widened here.
+- **Orphan / empty intermediate symlinks fail closed with `-ENOENT`
+  (Linux-faithful at resolution).** Part 2's per-component resolution
+  refuses to honor an intermediate symlink whose resolved-so-far
+  parent is not a directory (orphan `/missing/link -> /real` →
+  `stat("/missing/link/file")` is `-ENOENT`, not `/real/file`), and an
+  empty-target symlink resolves to `-ENOENT` (Linux `get_link()`).
+  Both match the no-symlink missing-parent case (`stat("/missing/x")`
+  is already `-ENOENT`) and pre-#134 terminal-only behavior — they
+  close a #134-introduced expansion with an info-probing flavor.
+  Tested: `stat_lstat_orphan_symlink_under_missing_parent_is_enoent`,
+  `stat_lstat_empty_symlink_target_is_enoent`.
+  **Still residual (→ #142, not widened here):** (a) `sys_open` keeps
+  the old terminal-only path (empty target → `-EINVAL` there) until it
+  moves to per-component resolution; (b) `symlink(2)` itself still
+  accepts empty/orphan link paths at *creation* (Linux rejects an
+  empty target with `-ENOENT`) — a `symlink(2)` contract change; (c)
+  POSIX `-ENOTDIR` precision for a non-dir (vs missing) parent — the
+  uniform-`-ENOENT` lenient-contract residual. All are syscall-parity
+  scoreboard items (#52 / parity-matrix), tracked, not silently
+  changed.
 - `sys_open` / other `normalize_readable_path` consumers → #142.
 - dirfd inode-anchoring → #59 / PR #63.
 - New syscalls / ABI method-ids / `host_*` surface changes.

@@ -12468,6 +12468,11 @@ fn lstat_resolves_intermediate_but_not_terminal_symlink() {
 fn stat_lstat_intermediate_proc_symlink_is_gated() {
     let _g = crate::kernel::TestGuard::acquire();
     set_argv(&set_argv_req(2, &[b"/bin/other"]));
+    // /t must be a real dir so the symlink is honored (an orphan
+    // symlink under a missing parent is now -ENOENT and would short-
+    // circuit before the gate). With /t present, resolution reaches
+    // the /proc gate, which is what this test exercises.
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/t", &mut []), 0);
     // /t/hop -> /proc/2 ; stat(/t/hop/status) resolves the link to
     // /proc/2/status (pid 2's proc) which the gate denies for pid 1.
     let mut sreq = (b"/proc/2".len() as u32).to_le_bytes().to_vec();
@@ -12741,13 +12746,15 @@ fn stat_unix_socket_via_helper_and_intermediate_symlink() {
 }
 
 /// Issue #134 Part 2 regression (PR #150 review): an empty symlink
-/// target must fail closed with -EINVAL, not silently alias the link
-/// to its parent dir. `symlink(2)` accepts an empty target today, so
-/// `/d/sl -> ""` is constructible; before the helper-level reject,
-/// stat("/d/sl/child") aliased to /d/child (info-probing). Terminal
-/// lstat of the link is unaffected (never readlinked) — still S_IFLNK.
+/// target must fail closed with -ENOENT (Linux: empty link body →
+/// ENOENT in get_link(); `symlink(2)` also rejects empty targets with
+/// ENOENT — that creation-side parity is tracked for #142), not
+/// silently alias the link to its parent dir. `/d/sl -> ""` is
+/// constructible here; before the reject, stat("/d/sl/child") aliased
+/// to /d/child (info-probing). Terminal lstat of the link is
+/// unaffected (never readlinked) — still S_IFLNK.
 #[test]
-fn stat_lstat_empty_symlink_target_is_einval() {
+fn stat_lstat_empty_symlink_target_is_enoent() {
     let _g = crate::kernel::TestGuard::acquire();
     assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
     let mut r = (b"/d/child".len() as u32).to_le_bytes().to_vec();
@@ -12760,18 +12767,18 @@ fn stat_lstat_empty_symlink_target_is_einval() {
     assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
 
     let mut out = [0u8; 16];
-    // stat: terminal empty symlink is followed → -EINVAL (was: stat'd
-    // the parent /d).
+    // stat: terminal empty symlink is followed → -ENOENT (Linux
+    // parity; was: silently stat'd the parent /d).
     assert_eq!(
         dispatch(METHOD_SYS_STAT, 1, b"/d/sl", &mut out),
-        -(abi::EINVAL as i64),
-        "stat of an empty-target symlink fails closed (-EINVAL)"
+        -(abi::ENOENT as i64),
+        "stat of an empty-target symlink fails closed (-ENOENT, Linux)"
     );
-    // stat through it: empty intermediate → -EINVAL (was: stat'd the
+    // stat through it: empty intermediate → -ENOENT (was: stat'd the
     // unrelated sibling /d/child).
     assert_eq!(
         dispatch(METHOD_SYS_STAT, 1, b"/d/sl/child", &mut out),
-        -(abi::EINVAL as i64),
+        -(abi::ENOENT as i64),
         "empty intermediate symlink does not alias to the parent dir"
     );
     // lstat of the link itself: terminal, never readlinked → still
@@ -12787,10 +12794,53 @@ fn stat_lstat_empty_symlink_target_is_einval() {
         0,
         "Part 1: empty target → st_size 0"
     );
-    // lstat through it: empty intermediate → -EINVAL (same as stat).
+    // lstat through it: empty intermediate → -ENOENT (same as stat).
     assert_eq!(
         dispatch(METHOD_SYS_LSTAT, 1, b"/d/sl/child", &mut out),
-        -(abi::EINVAL as i64),
+        -(abi::ENOENT as i64),
         "empty intermediate symlink fails closed for lstat too"
+    );
+}
+
+/// Issue #134 Part 2 regression (PR #150 review): an orphan symlink
+/// under a missing parent must NOT be honored. `/missing/link ->
+/// /real` is constructible (ramfs flat key map; `symlink(2)` accepts
+/// link paths below nonexistent parents). Per-component resolution
+/// must not traverse `/missing/link` when `/missing` does not exist —
+/// `stat("/missing/link/file")` must fail -ENOENT (matching the plain
+/// `stat("/missing/child")` case and pre-#134 terminal-only
+/// behavior), not resolve `/real/file`. POSIX ENOTDIR-vs-ENOENT
+/// precision for a non-dir parent remains the uniform-ENOENT
+/// lenient-contract residual tracked in #142.
+#[test]
+fn stat_lstat_orphan_symlink_under_missing_parent_is_enoent() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut rf = (b"/real/file".len() as u32).to_le_bytes().to_vec();
+    rf.extend_from_slice(b"/real/file");
+    rf.extend_from_slice(b"data");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &rf, &mut []);
+    // /missing is never created; /missing/link -> /real is an orphan.
+    let mut s = (b"/real".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/real");
+    s.extend_from_slice(b"/missing/link");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/missing/link/file", &mut out),
+        -(abi::ENOENT as i64),
+        "orphan symlink under missing parent must not resolve (stat)"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/missing/link/file", &mut out),
+        -(abi::ENOENT as i64),
+        "orphan symlink under missing parent must not resolve (lstat)"
+    );
+    // Consistency: the no-symlink missing-parent case is also -ENOENT.
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/missing/child", &mut out),
+        -(abi::ENOENT as i64),
+        "plain missing-parent path is -ENOENT (same errno, consistent)"
     );
 }
