@@ -7225,6 +7225,10 @@ fn openat_short_or_empty_request_is_einval() {
 
 const O_APPEND: u32 = 0x400;
 const O_NONBLOCK: u32 = 0x800;
+// Linux/musl access-mode bits (B2.8 / issue #60).
+const O_RDONLY: u32 = 0;
+const O_RDWR: u32 = 2;
+const O_ACCMODE: u32 = 3;
 
 fn setfl_req(fd: u32, flags: u32) -> Vec<u8> {
     let mut req = fd.to_le_bytes().to_vec();
@@ -7242,10 +7246,41 @@ fn getfl(fd: u32) -> i64 {
 }
 
 #[test]
+fn fgetfl_surfaces_access_mode_bits_issue_60() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Writable fd (open_rw uses O_WRITE) → F_GETFL must report a
+    // non-O_RDONLY access mode. Before the #60 fix this was always
+    // O_RDONLY (0), breaking musl/CPython/libuv `(flags & O_ACCMODE)`.
+    let wfd = open_rw(b"/accmode_w.txt");
+    let w = getfl(wfd);
+    assert!(w >= 0, "getfl ok");
+    assert_eq!(
+        (w as u32) & O_ACCMODE,
+        O_RDWR,
+        "writable fd → O_RDWR access mode (ABI has only a writable bit; \
+         O_WRONLY is indistinguishable, O_RDWR is the correct non-RDONLY report)"
+    );
+    assert_ne!((w as u32) & O_ACCMODE, O_RDONLY);
+
+    // Read-only reopen of the same file → O_RDONLY.
+    let rfd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/accmode_w.txt"), &mut []);
+    assert!(rfd >= 3, "read-only open ok");
+    assert_eq!(
+        (getfl(rfd as u32) as u32) & O_ACCMODE,
+        O_RDONLY,
+        "read-only fd → O_RDONLY"
+    );
+}
+
+#[test]
 fn fcntl_setfl_getfl_roundtrip_and_masking_on_file() {
     let _g = crate::kernel::TestGuard::acquire();
     let fd = open_rw(b"/setfl.txt");
-    assert_eq!(getfl(fd), 0, "status flags default to 0");
+    assert_eq!(
+        getfl(fd),
+        O_RDWR as i64,
+        "writable fd: access mode O_RDWR, no status flags yet (#60)"
+    );
 
     assert_eq!(
         dispatch(
@@ -7256,7 +7291,7 @@ fn fcntl_setfl_getfl_roundtrip_and_masking_on_file() {
         ),
         0
     );
-    assert_eq!(getfl(fd), O_NONBLOCK as i64);
+    assert_eq!(getfl(fd), (O_RDWR | O_NONBLOCK) as i64);
 
     assert_eq!(
         dispatch(
@@ -7267,7 +7302,7 @@ fn fcntl_setfl_getfl_roundtrip_and_masking_on_file() {
         ),
         0
     );
-    assert_eq!(getfl(fd), (O_APPEND | O_NONBLOCK) as i64);
+    assert_eq!(getfl(fd), (O_RDWR | O_APPEND | O_NONBLOCK) as i64);
 
     // Non-settable bits (access mode / creation) are stripped.
     assert_eq!(
@@ -7281,8 +7316,8 @@ fn fcntl_setfl_getfl_roundtrip_and_masking_on_file() {
     );
     assert_eq!(
         getfl(fd),
-        (O_APPEND | O_NONBLOCK) as i64,
-        "only settable subset kept"
+        (O_RDWR | O_APPEND | O_NONBLOCK) as i64,
+        "only settable subset kept; access mode (O_RDWR) always present"
     );
 }
 
@@ -7306,8 +7341,8 @@ fn fcntl_setfl_is_shared_across_dup_via_the_ofd() {
     );
     assert_eq!(
         getfl(30),
-        O_NONBLOCK as i64,
-        "status flags live on the shared OFD"
+        (O_RDWR | O_NONBLOCK) as i64,
+        "status flags live on the shared OFD; access mode (O_RDWR) too"
     );
 }
 
@@ -7362,17 +7397,21 @@ fn ioctl_req(fd: u32, req: u32, arg: u32) -> Vec<u8> {
 fn ioctl_fionbio_toggles_o_nonblock_in_status_flags() {
     let _g = crate::kernel::TestGuard::acquire();
     let fd = open_rw(b"/fionbio.txt");
-    assert_eq!(getfl(fd), 0);
+    assert_eq!(getfl(fd), O_RDWR as i64);
     assert_eq!(
         dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, FIONBIO, 1), &mut []),
         0
     );
-    assert_eq!(getfl(fd), O_NONBLOCK as i64, "FIONBIO set O_NONBLOCK");
+    assert_eq!(
+        getfl(fd),
+        (O_RDWR | O_NONBLOCK) as i64,
+        "FIONBIO set O_NONBLOCK"
+    );
     assert_eq!(
         dispatch(METHOD_SYS_IOCTL, 1, &ioctl_req(fd, FIONBIO, 0), &mut []),
         0
     );
-    assert_eq!(getfl(fd), 0, "FIONBIO arg=0 cleared O_NONBLOCK");
+    assert_eq!(getfl(fd), O_RDWR as i64, "FIONBIO arg=0 cleared O_NONBLOCK");
 }
 
 #[test]
