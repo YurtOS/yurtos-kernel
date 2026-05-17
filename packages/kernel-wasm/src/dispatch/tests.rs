@@ -12423,3 +12423,148 @@ fn stat_resolves_intermediate_symlink_directory() {
         "stat must traverse the intermediate symlink /a/symdir and type /real/f as S_IFREG"
     );
 }
+
+/// Issue #134 Part 2: lstat() resolves INTERMEDIATE symlink components
+/// but does NOT follow the terminal. /a/symdir -> /real (dir);
+/// /real/sl -> /real/target. lstat(/a/symdir/sl) must traverse symdir
+/// yet report `sl` itself as S_IFLNK with the Part-1 target size.
+/// (Mechanism RED→GREEN was proven via the identical shared helper in
+/// stat_resolves_intermediate_symlink_directory; original lstat_path
+/// did zero symlink following so this case returned -ENOENT before.)
+#[test]
+fn lstat_resolves_intermediate_but_not_terminal_symlink() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut s1 = (b"/real".len() as u32).to_le_bytes().to_vec();
+    s1.extend_from_slice(b"/real");
+    s1.extend_from_slice(b"/a/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s1, &mut []), 0);
+    let tgt = b"/real/target";
+    let mut s2 = (tgt.len() as u32).to_le_bytes().to_vec();
+    s2.extend_from_slice(tgt);
+    s2.extend_from_slice(b"/real/sl");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s2, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/a/symdir/sl", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "lstat follows intermediate /a/symdir but reports terminal `sl` as S_IFLNK"
+    );
+    assert_eq!(
+        u64::from_le_bytes(out[0..8].try_into().unwrap()),
+        tgt.len() as u64,
+        "Part 1 preserved: lstat st_size = terminal symlink target length"
+    );
+}
+
+/// Issue #134 Part 2: an INTERMEDIATE symlink crossing into another
+/// pid's /proc is gated for BOTH stat and lstat — the per-hop
+/// re-normalize+re-authorize in resolve_symlinks_per_component applies
+/// the procfs gate to the resolved symlink target. Root is not gated.
+#[test]
+fn stat_lstat_intermediate_proc_symlink_is_gated() {
+    let _g = crate::kernel::TestGuard::acquire();
+    set_argv(&set_argv_req(2, &[b"/bin/other"]));
+    // /t/hop -> /proc/2 ; stat(/t/hop/status) resolves the link to
+    // /proc/2/status (pid 2's proc) which the gate denies for pid 1.
+    let mut sreq = (b"/proc/2".len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/proc/2");
+    sreq.extend_from_slice(b"/t/hop");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/t/hop/status", &mut out),
+        -(abi::EPERM as i64),
+        "stat: intermediate /proc/<other> symlink must be gated"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/t/hop/status", &mut out),
+        -(abi::EPERM as i64),
+        "lstat: intermediate /proc/<other> symlink must be gated"
+    );
+    make_root(1);
+    let rc = dispatch(METHOD_SYS_STAT, 1, b"/t/hop/status", &mut out);
+    assert_ne!(
+        rc,
+        -(abi::EPERM as i64),
+        "root caller must not be gated: {rc}"
+    );
+}
+
+/// Issue #134 Part 2: per-component-auth non-regression — own
+/// /proc/self and deep ordinary paths still resolve for both stat and
+/// lstat (locks the strict-strengthening property).
+#[test]
+fn stat_lstat_per_component_auth_allows_self_and_ordinary() {
+    let _g = crate::kernel::TestGuard::acquire();
+    set_argv(&set_argv_req(1, &[b"/bin/self"]));
+    for p in [b"/a".as_slice(), b"/a/b", b"/a/b/c", b"/a/b/c/d"] {
+        assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, p, &mut []), 0);
+    }
+    let mut reg = (b"/a/b/c/d/f".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/a/b/c/d/f");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/a/b/c/d/f", &mut out), 16);
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/a/b/c/d/f", &mut out), 16);
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/proc/self/cmdline", &mut out),
+        16
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/proc/self/cmdline", &mut out),
+        16
+    );
+}
+
+/// Issue #134 Part 2: an intermediate symlink cycle is bounded by the
+/// 40-hop SYMLOOP limit (-EINVAL, matching follow_symlinks), for both
+/// stat and lstat.
+#[test]
+fn stat_lstat_intermediate_symlink_loop_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut s1 = (b"/y/z".len() as u32).to_le_bytes().to_vec();
+    s1.extend_from_slice(b"/y/z");
+    s1.extend_from_slice(b"/x");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s1, &mut []), 0);
+    let mut s2 = (b"/x".len() as u32).to_le_bytes().to_vec();
+    s2.extend_from_slice(b"/x");
+    s2.extend_from_slice(b"/y");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s2, &mut []), 0);
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/x/q", &mut out),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/x/q", &mut out),
+        -(abi::EINVAL as i64)
+    );
+}
+
+/// KNOWN PRESERVED non-POSIX residual (#146): a trailing slash does
+/// NOT force-follow a terminal symlink for lstat. Pins current
+/// behavior so #146's eventual fix is a deliberate, test-visible
+/// change, not an accident.
+#[test]
+fn lstat_trailing_slash_on_terminal_symlink_known_residual_146() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut sreq = (b"/real".len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/real");
+    sreq.extend_from_slice(b"/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/symdir/", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "KNOWN RESIDUAL #146: trailing slash does not force-follow; \
+         symdir reported as S_IFLNK (POSIX would follow to S_IFDIR)"
+    );
+}
