@@ -4182,9 +4182,12 @@ fn kill_unknown_pid_is_esrch_and_does_not_create_process() {
 #[test]
 fn kill_out_of_range_sig_is_einval() {
     let _g = crate::kernel::TestGuard::acquire();
+    // #110 (sig-64 widening): the upper boundary is now 64 (SIGRTMAX),
+    // so the first out-of-range signal is 65. This test previously
+    // enshrined sig 64 → EINVAL, which was the bug.
     let mut req = Vec::new();
     req.extend_from_slice(&5_u32.to_le_bytes());
-    req.extend_from_slice(&64_u32.to_le_bytes()); // 1..=63 only
+    req.extend_from_slice(&65_u32.to_le_bytes()); // 1..=64 only
     assert_eq!(
         dispatch(METHOD_SYS_KILL, 1, &req, &mut []),
         -(abi::EINVAL as i64)
@@ -4406,9 +4409,11 @@ fn killpg_missing_group_and_bad_signal_return_errors() {
         -(abi::ESRCH as i64)
     );
 
+    // #110 (sig-64 widening): 64 is now valid (SIGRTMAX); 65 is the
+    // first out-of-range signal.
     let mut bad_sig = Vec::new();
     bad_sig.extend_from_slice(&1_u32.to_le_bytes());
-    bad_sig.extend_from_slice(&64_u32.to_le_bytes());
+    bad_sig.extend_from_slice(&65_u32.to_le_bytes());
     assert_eq!(
         dispatch(METHOD_SYS_KILLPG, 1, &bad_sig, &mut []),
         -(abi::EINVAL as i64)
@@ -9101,9 +9106,10 @@ fn sigqueue_sig_zero_is_probe_without_enqueue() {
 fn sigqueue_input_guards() {
     let _g = crate::kernel::TestGuard::acquire();
     materialize(7);
-    // sig out of range.
+    // sig out of range. #110 (sig-64 widening): 64 is now valid
+    // (SIGRTMAX); 65 is the first out-of-range signal.
     assert_eq!(
-        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 64, 0), &mut []),
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 65, 0), &mut []),
         -(abi::EINVAL as i64)
     );
     // short request (<12 bytes).
@@ -9368,6 +9374,147 @@ fn sigpending_buffer_too_small_is_einval() {
     assert_eq!(
         dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut tiny),
         -(abi::EINVAL as i64)
+    );
+}
+
+// --- #110 (sig-64 widening): Linux signals are 1..=64 (SIGRTMAX==64).
+// sig 64 must be a first-class signal across sigaction/kill/sigqueue/
+// sigpending/sigwaitinfo; the upper boundary moves to 65; sig 0 keeps
+// its existence-probe semantics; bit math (1u64 << 63) stays in u64.
+#[test]
+fn sig_64_is_supported_across_sigaction_kill_sigqueue() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+
+    // --- sigaction(64, handler) round-trips ---
+    let mut sa = Vec::new();
+    sa.extend_from_slice(&64_u32.to_le_bytes()); // SIGRTMAX
+    sa.extend_from_slice(&0xCAFEBABE_u32.to_le_bytes()); // user handler
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 7, &sa, &mut []),
+        0,
+        "sigaction(64, …) must succeed; previous disposition is SIG_DFL=0"
+    );
+    // Reading it back returns the stored disposition.
+    let mut sa_read = Vec::new();
+    sa_read.extend_from_slice(&64_u32.to_le_bytes());
+    sa_read.extend_from_slice(&1_u32.to_le_bytes()); // replace with SIG_IGN
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 7, &sa_read, &mut []),
+        0xCAFEBABE_i64,
+        "sigaction(64, …) must round-trip the previously stored handler"
+    );
+    // Slot 63 (sig 64 → index 63) is in-bounds in the widened array.
+    assert_eq!(
+        crate::kernel::with_kernel(|k| k.process_mut(7).signal_dispositions[63]),
+        1,
+        "signal_dispositions index 63 (sig 64) holds the stored value"
+    );
+
+    // --- kill(pid, 64) sets pending bit 63 of the u64 mask ---
+    let mut kreq = Vec::new();
+    kreq.extend_from_slice(&7_u32.to_le_bytes());
+    kreq.extend_from_slice(&64_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_KILL, 1, &kreq, &mut []),
+        0,
+        "kill(pid, 64) must succeed"
+    );
+    let pending = crate::kernel::with_kernel(|k| k.process_mut(7).pending_signals);
+    assert_ne!(
+        pending & (1u64 << 63),
+        0,
+        "kill(pid, 64) sets bit 63 (sig 64 - 1) of the u64 mask — fits, no overflow"
+    );
+
+    // --- sigqueue(pid, 64, val) enqueues an RT signal ---
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 64, 777), &mut []),
+        0,
+        "sigqueue(pid, 64, val) must enqueue"
+    );
+    let queued = crate::kernel::with_kernel(|k| k.process_mut(7).pending_rt.clone());
+    assert_eq!(queued.len(), 1);
+    assert_eq!(
+        queued[0],
+        crate::kernel::RtSignal {
+            signo: 64,
+            value: 777,
+            sender_pid: 1
+        }
+    );
+
+    // --- sigpending must report sig 64 (not dropped by the defensive
+    // 1..=N RT filter): union of kill bit 63 and the RT-queued signo 64.
+    let mut buf = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
+    assert_ne!(
+        u64::from_le_bytes(buf) & (1u64 << 63),
+        0,
+        "sigpending must surface a queued sig 64 (defensive filter widened to 1..=64)"
+    );
+
+    // --- sigwaitinfo must dequeue the queued sig 64 ---
+    let mut info = [0u8; 16];
+    let rc = dispatch(METHOD_SYS_SIGWAITINFO, 7, &sigset_mask(64), &mut info);
+    assert_eq!(rc, 16, "sigwaitinfo must dequeue the queued sig 64");
+    let (signo, _code, sender, value) = decode_rt_siginfo(&info);
+    assert_eq!(signo, 64);
+    assert_eq!(sender, 1);
+    assert_eq!(value, 777);
+}
+
+#[test]
+fn sig_65_and_sigaction_0_remain_einval_and_kill_0_is_unchanged() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(7);
+
+    // Upper boundary moved to 65: sig 65 is still rejected everywhere.
+    let mut sa65 = Vec::new();
+    sa65.extend_from_slice(&65_u32.to_le_bytes());
+    sa65.extend_from_slice(&7_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 7, &sa65, &mut []),
+        -(abi::EINVAL as i64),
+        "sigaction(65, …) is still out of range"
+    );
+    let mut k65 = Vec::new();
+    k65.extend_from_slice(&7_u32.to_le_bytes());
+    k65.extend_from_slice(&65_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_KILL, 1, &k65, &mut []),
+        -(abi::EINVAL as i64),
+        "kill(pid, 65) is still out of range"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 65, 0), &mut []),
+        -(abi::EINVAL as i64),
+        "sigqueue(pid, 65, …) is still out of range"
+    );
+
+    // sigaction has no sig 0 — still EINVAL (1..=64 excludes 0).
+    let mut sa0 = Vec::new();
+    sa0.extend_from_slice(&0_u32.to_le_bytes());
+    sa0.extend_from_slice(&7_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 7, &sa0, &mut []),
+        -(abi::EINVAL as i64),
+        "sigaction(0, …) has no sig 0"
+    );
+
+    // kill sig 0 is the existence probe — unchanged: success, no bit set.
+    let mut k0 = Vec::new();
+    k0.extend_from_slice(&7_u32.to_le_bytes());
+    k0.extend_from_slice(&0_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_KILL, 1, &k0, &mut []),
+        0,
+        "kill(pid, 0) is still the alive probe"
+    );
+    assert_eq!(
+        crate::kernel::with_kernel(|k| k.process_mut(7).pending_signals),
+        0,
+        "kill(pid, 0) must not set any pending bit"
     );
 }
 

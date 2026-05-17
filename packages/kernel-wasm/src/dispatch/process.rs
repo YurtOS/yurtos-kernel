@@ -828,7 +828,7 @@ pub(super) fn setsid(caller_pid: u32) -> i64 {
 /// unwind from the AsyncBridge integration. sig==0 is the POSIX
 /// "is the pid alive?" probe.
 pub fn kill_pid(target: u32, sig: u32) -> i64 {
-    if sig > 63 {
+    if sig > 64 {
         return -(abi::EINVAL as i64);
     }
     if !with_kernel(|k| k.has_process(target)) {
@@ -858,7 +858,7 @@ pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
     let target = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let sig = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
     let value = i32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
-    if sig > 63 {
+    if sig > 64 {
         return -(abi::EINVAL as i64);
     }
     // Authorize the host-authenticated caller against the untrusted
@@ -910,13 +910,13 @@ pub(super) fn sigwaitinfo(caller_pid: u32, request: &[u8], response: &mut [u8]) 
             return -(abi::ESRCH as i64);
         }
         let p = k.process_mut(caller_pid);
-        // The `1..=63` guard is defensive only: the sole producer
-        // (`sigqueue`) rejects signo>63 before push_back, so a stored
+        // The `1..=64` guard is defensive only: the sole producer
+        // (`sigqueue`) rejects signo>64 before push_back, so a stored
         // entry is always in range — it can never reject a real entry.
         let Some(idx) = p
             .pending_rt
             .iter()
-            .position(|s| (1..=63).contains(&s.signo) && (set & (1u64 << (s.signo - 1))) != 0)
+            .position(|s| (1..=64).contains(&s.signo) && (set & (1u64 << (s.signo - 1))) != 0)
         else {
             return -(abi::EAGAIN as i64);
         };
@@ -951,9 +951,9 @@ pub(super) fn sigpending(caller_pid: u32, response: &mut [u8]) -> i64 {
         // with bits other producers set for the same signo.
         let mut mask = p.pending_signals;
         for s in &p.pending_rt {
-            // Defensive only — `sigqueue` enforces signo in 1..=63 at
+            // Defensive only — `sigqueue` enforces signo in 1..=64 at
             // enqueue, so stored entries are always in range.
-            if (1..=63).contains(&s.signo) {
+            if (1..=64).contains(&s.signo) {
                 mask |= 1u64 << (s.signo - 1);
             }
         }
@@ -966,7 +966,7 @@ pub(super) fn kill_request(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([target, sig]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
-    if sig > 63 {
+    if sig > 64 {
         return -(abi::EINVAL as i64);
     }
     // Authorize the host-authenticated caller against the untrusted
@@ -982,7 +982,7 @@ pub(super) fn killpg_request(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([pgid_arg, sig]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
-    if sig > 63 {
+    if sig > 64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
@@ -1028,7 +1028,7 @@ pub(super) fn sigaction(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([sig, disposition]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
-    if !(1..=63).contains(&sig) {
+    if !(1..=64).contains(&sig) {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {

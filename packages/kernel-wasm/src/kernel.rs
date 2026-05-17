@@ -340,7 +340,8 @@ pub struct Process {
     /// Pending signals as a bitmask: bit (sig-1) is set when sig is
     /// queued for delivery. Phase 2 records but does not deliver —
     /// delivery requires asyncify/JSPI unwind which lands later. Sig
-    /// numbers 1..=63 use bits 0..=62.
+    /// numbers 1..=64 use bits 0..=63 (sig 64 == SIGRTMAX → bit 63,
+    /// the top bit of this u64 — fits exactly, no widening needed).
     pub pending_signals: u64,
     /// POSIX real-time signal queue (`sigqueue`). Unlike the bitmask,
     /// RT signals are *queued with multiplicity* and carry a payload +
@@ -350,10 +351,11 @@ pub struct Process {
     /// read-time union of both, so neither producer clobbers the other.
     /// Consumption (`sigwaitinfo`/delivery) is gate-deferred (B1.8-b).
     pub pending_rt: VecDeque<RtSignal>,
-    /// Per-signal disposition. Index `sig - 1` for sig in 1..=63.
-    /// 0 = SIG_DFL, 1 = SIG_IGN, anything else is an opaque user-side
-    /// handler value (typically a wasm function table index).
-    pub signal_dispositions: [u32; 63],
+    /// Per-signal disposition. Index `sig - 1` for sig in 1..=64
+    /// (sig 64 == SIGRTMAX → index 63). 0 = SIG_DFL, 1 = SIG_IGN,
+    /// anything else is an opaque user-side handler value (typically
+    /// a wasm function table index).
+    pub signal_dispositions: [u32; 64],
     /// Times the process has called `sys_sched_yield`. Phase 2
     /// observability hook — real cooperative scheduling lands with
     /// the AsyncBridge integration; tests use this to assert that
@@ -416,7 +418,7 @@ impl Default for Process {
             sid: 0,
             pending_signals: 0,
             pending_rt: VecDeque::new(),
-            signal_dispositions: [0; 63],
+            signal_dispositions: [0; 64],
             yield_count: 0,
             last_nanosleep_ns: 0,
             argv: Vec::new(),

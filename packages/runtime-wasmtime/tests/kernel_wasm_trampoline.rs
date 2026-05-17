@@ -713,7 +713,10 @@ fn wasmtime_adapter_kills_through_kernel_export() {
         .unwrap();
 
     assert_eq!(mk.kill_process(proc.pid(), 0).unwrap(), 0);
-    assert_eq!(mk.kill_process(proc.pid(), 64).unwrap(), -22);
+    // #110 (sig-64 widening): sig 64 (SIGRTMAX) is valid; 65 is the
+    // first out-of-range value. Previously enshrined 64 → EINVAL.
+    assert_eq!(mk.kill_process(proc.pid(), 64).unwrap(), 0);
+    assert_eq!(mk.kill_process(proc.pid(), 65).unwrap(), -22);
 }
 
 #[test]
@@ -3674,12 +3677,14 @@ fn signal_storage_round_trips_through_trampoline() {
     let rc = mk.syscall(METHOD_SYS_KILLPG, &req_pg, &mut []).unwrap();
     assert_eq!(rc, 0, "killpg sig 0 probes an existing process group");
 
-    // kill out-of-range → -EINVAL.
+    // kill out-of-range → -EINVAL. #110 (sig-64 widening): signals
+    // 1..=64 are valid (SIGRTMAX==64), so 65 is the first rejected
+    // value. This previously enshrined sig 64 → EINVAL (the bug).
     let mut req4 = Vec::new();
     req4.extend_from_slice(&7_u32.to_le_bytes());
-    req4.extend_from_slice(&64_u32.to_le_bytes());
+    req4.extend_from_slice(&65_u32.to_le_bytes());
     let rc = mk.syscall(METHOD_SYS_KILL, &req4, &mut []).unwrap();
-    assert_eq!(rc, -22, "EINVAL for sig out of 1..=63");
+    assert_eq!(rc, -22, "EINVAL for sig out of 1..=64");
 }
 
 #[test]
