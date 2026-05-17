@@ -28,8 +28,19 @@
 #   [[divergence]]
 #   canary = "<canary-name>"   # e.g. "dup2-canary"
 #   case   = "<case-name>"     # the spec.toml [[case]].name
-#   slice  = "B<n>"            # owning slice that will fix it
+#   slice  = "B<n>"            # owning slice (see below)
 #   reason = "<why ts and wasm differ today>"
+#
+# `slice` is normally the owning slice that WILL FIX the divergence
+# (the row is then deleted in that slice's PR). One sanctioned
+# exception: an intentional, POSIX-faithful divergence that is never
+# "fixed" because it is retired when the TS kernel is deleted. For
+# those, `slice` is the introducing slice ("B<n>") and `reason` ends
+# with "retired with the TS kernel" (the row is deleted with the TS
+# kernel, not by a later slice). The differ only requires a non-empty
+# `slice` string; this convention keeps the field meaningful rather
+# than silently overloaded. See the parity matrix "Tracked
+# exceptions" for the openat_rename_stability instance.
 
 [[divergence]]
 canary = "posix-runtime-canary"

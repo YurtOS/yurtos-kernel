@@ -309,15 +309,17 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
         .collect();
     let has_dot_component = components.iter().any(|c| *c == b"." || *c == b"..");
 
-    // Did the walk hit a symlink (or otherwise non-inode-descendable)
-    // *non-final* component? If so, an intermediate path element is a
-    // symlink and `sys_open`'s whole-path `follow_symlinks` will not
-    // resolve it. We then canonicalize the FINAL component's parent
-    // directory through the centralized component-aware resolver
-    // (`PathResolver::realpath`, the existing 40-hop SYMLOOP — reused,
-    // not duplicated) and hand the canonical parent + final component
-    // to `sys_open` for the actual open/create.
-    let mut symlink_mid_walk = false;
+    // Set when the inode walk cannot descend a *non-final* component:
+    // it is a symlink (filetype 7), a regular file (filetype 4), or
+    // does not exist (`resolve_at_in == None`). In every such case the
+    // inode walk is incomplete and `sys_open`'s whole-path
+    // `follow_symlinks` would not resolve an intermediate symlink, so
+    // we canonicalize the FINAL component's parent directory through
+    // the centralized component-aware resolver (`PathResolver::
+    // realpath`, the existing 40-hop SYMLOOP — reused, not duplicated)
+    // and hand the canonical parent + final component to `sys_open`,
+    // which then yields the correct ENOENT/ENOTDIR/open result.
+    let mut needs_path_resolver = false;
     if !has_dot_component && !components.is_empty() {
         let mut cur_inode = base_inode;
         let mut cur_abs = base_abs.clone();
@@ -344,11 +346,14 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
                     cur_inode = child;
                     cur_abs = next_abs;
                 }
-                // A symlink (filetype 7) or any non-descendable
-                // non-final component: an intermediate symlink needs
-                // the centralized component-aware resolver below.
+                // Any non-descendable non-final component — symlink
+                // (filetype 7), regular file (filetype 4), or missing
+                // (`None`): the inode walk can't continue; the
+                // centralized component-aware resolver below handles
+                // it (intermediate symlink resolution, ENOENT, or
+                // ENOTDIR, respectively).
                 _ => {
-                    symlink_mid_walk = true;
+                    needs_path_resolver = true;
                     break;
                 }
             }
@@ -363,16 +368,18 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
     }
     joined.extend_from_slice(path);
 
-    if symlink_mid_walk {
-        // An intermediate component is a symlink. Split off the final
-        // component; canonicalize the parent directory via the
-        // existing centralized component-SYMLOOP resolver
-        // (`PathResolver::realpath`), then delegate
-        // `canonical_parent + final` to `sys_open` (which still owns
-        // create/trunc/O_DIRECTORY/EISDIR and the final-component
-        // symlink). This reuses the 40-hop SYMLOOP, never duplicates
-        // it. `joined` is absolute and has at least one component
-        // (a non-final component triggered this branch).
+    if needs_path_resolver {
+        // The inode walk stopped on a non-descendable intermediate
+        // component. Split off the final component; canonicalize the
+        // parent directory via the existing centralized
+        // component-SYMLOOP resolver (`PathResolver::realpath`), then
+        // delegate `canonical_parent + final` to `sys_open` (which
+        // still owns create/trunc/O_DIRECTORY/EISDIR, the
+        // final-component symlink, and ENOENT/ENOTDIR for a
+        // missing/non-dir intermediate). This reuses the 40-hop
+        // SYMLOOP, never duplicates it. `joined` is absolute and has
+        // at least one component (a non-final component triggered
+        // this branch).
         let split = joined
             .iter()
             .rposition(|&b| b == b'/')
