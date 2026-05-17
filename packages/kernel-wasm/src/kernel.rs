@@ -1880,9 +1880,22 @@ impl Kernel {
 static KERNEL: LazyLock<Mutex<Kernel>> = LazyLock::new(|| Mutex::new(Kernel::new()));
 
 pub fn with_kernel<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
-    let mut k = KERNEL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // M9: a poisoned KERNEL mutex means a prior holder panicked
+    // mid-mutation, so the kernel state may be inconsistent.
+    // Continuing on corrupt state is a correctness/security hazard —
+    // in a real build this is fatal (the panic traps the kernel
+    // instance). Test builds must instead recover: panics are how
+    // failed assertions surface, and one panicking test must not
+    // abort the entire suite (the runner isolates it via TestGuard).
+    let mut k = if cfg!(test) {
+        KERNEL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    } else {
+        KERNEL
+            .lock()
+            .expect("kernel mutex poisoned: a prior holder panicked mid-mutation; refusing to run on corrupt state")
+    };
     f(&mut k)
 }
 
