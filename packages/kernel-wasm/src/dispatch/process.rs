@@ -1406,18 +1406,13 @@ pub(super) fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        // Read the image bytes from VFS.
-        let mut exec_path: Vec<u8> = path;
-        let mut hops = 0u32;
-        while let Some(target) = k.vfs.readlink(&exec_path) {
-            hops += 1;
-            if hops > 40 {
-                // Too many symlink hops: POSIX/Linux errno is ELOOP
-                // (SYMLOOP_MAX = 40), not EINVAL.
-                return -(abi::ELOOP as i64);
-            }
-            exec_path = target;
-        }
+        // Read the image bytes from VFS. Symlink target is loaded
+        // literally (no per-hop re-normalize) — exec semantic.
+        // Resolver returns positive i32; negate-and-widen at boundary.
+        let exec_path = match super::fs::follow_symlinks_literal(k, path) {
+            Ok(p) => p,
+            Err(errno) => return -(errno as i64),
+        };
         let Some((mount_id, inode)) = k.vfs.open(&exec_path, 0) else {
             return -(abi::ENOENT as i64);
         };
