@@ -9,21 +9,29 @@ fn can_modify_owned_metadata(credentials: crate::state::Credentials, owner_uid: 
 }
 
 /// Derive the `(mount_id, dir_inode)` anchor for an already-normalized
-/// absolute directory `path`. Inode-anchored when the owning backend
-/// supports dir inodes (`MountTable::dir_inode_at` is `Some`), else the
-/// path-snapshot degraded mode: `(ROOT_MOUNT, None)`.
+/// absolute directory `path`. Inode-anchored (`Some` inode) when the
+/// owning backend supports dir inodes (`MountTable::dir_inode_at`),
+/// else the path-snapshot degraded mode (`None` inode).
 ///
-/// B2.9 Task 5 is a behavior-preserving shape migration — nothing reads
-/// `mount_id`/`dir_inode` to change resolution yet (that is Task 6);
-/// resolution still goes through the absolute `path` snapshot, so the
-/// degraded `(ROOT_MOUNT, None)` fallback is correct here. The
-/// `MountTable` has no public mount-id-only accessor (`resolve` is
-/// private), and adding one is out of Task 5's scope; `dir_inode_at`
-/// (the Task 1 pass-through) is the minimal sufficient lookup.
+/// Even in degraded mode the *real* owning mount id is recorded
+/// (`MountTable::mount_of`), not `ROOT_MOUNT`: a degraded backend
+/// mounted at a non-root prefix (hostfs at `/host`, overlay-deferred,
+/// embedder backends) must not masquerade as the root mount. The
+/// "only read when `dir_inode == Some`" convention made the old
+/// `ROOT_MOUNT` fallback latent, but any future reader of
+/// `Cwd.mount_id` / `FdEntry::Directory.mount_id` that does not first
+/// check `dir_inode.is_some()` would silently use the wrong mount on
+/// degraded non-root mounts. Issue #149.
 fn dir_anchor(k: &Kernel, path: &[u8]) -> (crate::vfs::MountId, Option<u64>) {
     match k.vfs.dir_inode_at(path) {
         Some((mid, ino)) => (mid, Some(ino)),
-        None => (crate::vfs::ROOT_MOUNT, None),
+        None => (
+            k.vfs
+                .mount_of(path)
+                .map(|(mid, _)| mid)
+                .unwrap_or(crate::vfs::ROOT_MOUNT),
+            None,
+        ),
     }
 }
 

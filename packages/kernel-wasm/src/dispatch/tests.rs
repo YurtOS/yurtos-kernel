@@ -12988,3 +12988,69 @@ fn stat_terminal_orphan_symlink_still_follows_base_parity() {
         "lstat reports the terminal orphan symlink as S_IFLNK"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #149: dir_anchor must store the REAL mount id (not ROOT_MOUNT) for
+// degraded (no-dir-inode) backends mounted at a non-root prefix.
+// ---------------------------------------------------------------------------
+
+/// A degraded backend: every path is a directory and it does NOT
+/// implement `dir_inode` (default `None`), so the kernel uses the
+/// path-snapshot degraded mode for this mount — exactly the hostfs /
+/// overlay-deferred shape #149 is about, but deterministic.
+struct DegradedDirBackend;
+
+impl crate::vfs::VfsBackend for DegradedDirBackend {
+    fn open(&mut self, _path: &[u8], _flags: u32) -> Option<u64> {
+        None
+    }
+    fn truncate(&mut self, _inode: u64) {}
+    fn read(&self, _inode: u64, _offset: u64, _buf: &mut [u8]) -> i64 {
+        0
+    }
+    fn write(&mut self, _inode: u64, _offset: u64, _payload: &[u8]) -> i64 {
+        -(crate::abi::EROFS as i64)
+    }
+    fn size(&self, _inode: u64) -> Option<u64> {
+        None
+    }
+    fn entry_type(&self, _path: &[u8]) -> u8 {
+        3 // DIRECTORY — every path in this fixture is a dir
+    }
+}
+
+#[test]
+fn dir_anchor_keeps_real_mount_id_on_degraded_non_root_mount() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mnt = crate::kernel::with_kernel(|k| {
+        k.vfs
+            .add_mount(b"/mnt".to_vec(), Box::new(DegradedDirBackend))
+    });
+    assert_ne!(
+        mnt,
+        crate::vfs::ROOT_MOUNT,
+        "fixture sanity: the non-root mount must not be ROOT_MOUNT"
+    );
+
+    // chdir path: Cwd.mount_id must be the real mount, not ROOT_MOUNT.
+    assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/mnt", &mut []), 0);
+    let cwd_mid = crate::kernel::with_kernel(|k| k.process(1).cwd.mount_id);
+    assert_eq!(
+        cwd_mid, mnt,
+        "chdir into a degraded non-root mount must record its real \
+         mount id, not ROOT_MOUNT ({})",
+        crate::vfs::ROOT_MOUNT
+    );
+
+    // Directory-fd path: FdEntry::Directory.mount_id likewise.
+    let dfd = open_dir(b"/mnt");
+    let fd_mid = crate::kernel::with_kernel(|k| match k.process(1).fd_table.entry(dfd) {
+        Some(crate::kernel::FdEntry::Directory { mount_id, .. }) => *mount_id,
+        other => panic!("expected Directory fd, got {other:?}"),
+    });
+    assert_eq!(
+        fd_mid, mnt,
+        "an openat dirfd on a degraded non-root mount must record its \
+         real mount id, not ROOT_MOUNT"
+    );
+}
