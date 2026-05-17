@@ -19,6 +19,8 @@
 - stat/lstat 16-byte record: `out[0..8]`=size u64 LE, `out[8..12]`=filetype u32 LE (0 none, 3 dir, 4 file, 6 sock, 7 symlink), `out[12..16]`=mode u32 LE.
 - Non-root caller = any pid by default; `make_root(pid)` (helper at `tests.rs:11`) sets euid=0. Populate `/proc/<pid>/cmdline`: `set_argv(&set_argv_req(pid, &[b"/bin/x"]))` (see `proc_other_pid_open_gate_survives_symlink_resolution`, `tests.rs:4842`).
 - `abi::EPERM`, `abi::ENOENT`, `abi::ENOTDIR`, `abi::EINVAL` in scope.
+- **Test filter:** use a unique substring, NOT `--exact`. `cargo test … <name>` does a substring match; `-- --exact` requires the fully-qualified `dispatch::tests::<name>` path and matches nothing with a bare name.
+- **`resolve_realpath` (and the future `resolve_components`) check every intermediate component's existence** — any test resolving `/x/y` must create `/x` (e.g. `mkdir`) first. `mkdir`/other `normalize_readable_path` syscalls also `publish_proc_snapshots()`, which is what makes `/proc/<pid>/…` entries visible to a later resolution walk. RED/characterization tests touching `/proc/<other>` must run a `mkdir` (or equivalent) first.
 
 **Files:**
 - Modify: `packages/kernel-wasm/src/path.rs` — add `resolve_components`; rewire `PathResolver::realpath`; add `PathResolver::resolve_stat`/`resolve_lstat`.
@@ -50,6 +52,14 @@ fn realpath_crosspid_proc_symlink_is_post_gated_unchanged() {
     let _g = crate::kernel::TestGuard::acquire();
     // pid 2 exists with a /proc/2/cmdline.
     set_argv(&set_argv_req(2, &[b"/bin/other"]));
+    // /tmp must exist as a real dir: resolve_realpath checks every
+    // intermediate component, so without /tmp it returns ENOENT before
+    // ever reading the symlink. mkdir also routes through
+    // normalize_readable_path, which publish_proc_snapshots() — that is
+    // what makes /proc/2/cmdline visible during the realpath walk so the
+    // post-gate (fs.rs:430) is actually reached. (Both verified
+    // empirically: without this line realpath returns -ENOENT.)
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/tmp", &mut []), 0);
     // /tmp/leak -> /proc/2/cmdline (absolute symlink target).
     let target = b"/proc/2/cmdline";
     let mut sreq = (target.len() as u32).to_le_bytes().to_vec();
@@ -73,7 +83,7 @@ fn realpath_crosspid_proc_symlink_is_post_gated_unchanged() {
 
 - [ ] **Step 2: Run it on the unmodified base — expect PASS**
 
-Run: `cargo test --lib -p yurt-kernel-wasm realpath_crosspid_proc_symlink_is_post_gated_unchanged -- --exact`
+Run: `cargo test --lib -p yurt-kernel-wasm realpath_crosspid_proc_symlink_is_post_gated_unchanged`
 Expected: `test result: ok. 1 passed`. (Characterization — it captures current behavior, so it passes now. If it does NOT pass, STOP: the assumption about current behavior is wrong; re-investigate before any refactor.)
 
 - [ ] **Step 3: Commit**
@@ -271,7 +281,7 @@ fn stat_resolves_intermediate_symlink_directory() {
 
 - [ ] **Step 2: Run it — expect FAIL**
 
-Run: `cargo test --lib -p yurt-kernel-wasm stat_resolves_intermediate_symlink_directory -- --exact`
+Run: `cargo test --lib -p yurt-kernel-wasm stat_resolves_intermediate_symlink_directory`
 Expected: FAIL — current `stat_path` uses lexical `normalize_readable_path` then `follow_symlinks` (terminal-only), so `/a/symdir/f` does not traverse `symdir`; result is `-ENOENT` (left `-2`, right `16`) — i.e. the assert on `dispatch(...) == 16` fails.
 
 - [ ] **Step 3: Add `PathResolver::resolve_stat`**
@@ -390,7 +400,7 @@ fn lstat_resolves_intermediate_but_not_terminal_symlink() {
 
 - [ ] **Step 2: Run it — expect FAIL**
 
-Run: `cargo test --lib -p yurt-kernel-wasm lstat_resolves_intermediate_but_not_terminal_symlink -- --exact`
+Run: `cargo test --lib -p yurt-kernel-wasm lstat_resolves_intermediate_but_not_terminal_symlink`
 Expected: FAIL — current `lstat_path` is purely lexical, so `/a/symdir/sl` does not traverse `symdir`; `dispatch` returns `-ENOENT` (left `-2`, right `16`).
 
 - [ ] **Step 3: Add `PathResolver::resolve_lstat`**
@@ -508,7 +518,7 @@ fn stat_intermediate_crosspid_proc_gate_is_per_component() {
 
 - [ ] **Step 2: Run it — expect FAIL**
 
-Run: `cargo test --lib -p yurt-kernel-wasm stat_intermediate_crosspid_proc_gate_is_per_component -- --exact`
+Run: `cargo test --lib -p yurt-kernel-wasm stat_intermediate_crosspid_proc_gate_is_per_component`
 Expected: FAIL — the Task-2 interim gate checks only the *final* resolved path (`/tmp/x`, ungated), so `dispatch` returns `16`, not `-EPERM` (assert left `16`, right `-1`). RED proves the per-component gap precisely.
 
 - [ ] **Step 3: Move the gate to per-component + per-symlink-target**
@@ -543,7 +553,7 @@ In `resolve_components` (`path.rs`), make these three edits:
 
 - [ ] **Step 4: Run the RED test — expect PASS — and add the broad GREEN coverage**
 
-Run: `cargo test --lib -p yurt-kernel-wasm stat_intermediate_crosspid_proc_gate_is_per_component -- --exact`
+Run: `cargo test --lib -p yurt-kernel-wasm stat_intermediate_crosspid_proc_gate_is_per_component`
 Expected: PASS (`1 passed`) — the per-component gate now denies the `/proc/2` candidate.
 
 Then append the broad stat+lstat coverage + root-allowed test (GREEN — verifies both entry points and the root carve-out now that the gate exists):
@@ -581,7 +591,7 @@ fn stat_lstat_intermediate_proc_symlink_is_gated() {
 }
 ```
 
-Run: `cargo test --lib -p yurt-kernel-wasm stat_lstat_intermediate_proc_symlink_is_gated -- --exact`
+Run: `cargo test --lib -p yurt-kernel-wasm stat_lstat_intermediate_proc_symlink_is_gated`
 Expected: PASS (`1 passed`).
 
 - [ ] **Step 5: Add the non-regression GREEN locks + SYMLOOP + trailing-slash residual**
