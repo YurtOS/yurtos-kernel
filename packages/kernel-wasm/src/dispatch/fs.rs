@@ -1039,13 +1039,15 @@ fn access_check(k: &mut Kernel, caller_pid: u32, raw_path: &[u8], mode: u32, fla
     let resolved = if flag & AT_SYMLINK_NOFOLLOW != 0 {
         path
     } else {
-        // follow_symlinks returns Result<_, i64> with pre-negated
-        // errno today — match the existing call-site shape in
-        // sys_open / stat_path. #144 normalizes the convention; this
-        // call site updates with that PR.
+        // follow_symlinks returns positive i32 errno post #144 —
+        // negate-and-widen at the boundary, matching sys_open /
+        // stat_path. (Bug fix: this site was authored against the
+        // pre-#144 Result<_, i64> convention; #86 and #144 merged
+        // in quick succession and the integration didn't catch it
+        // before guest-compat CI completed.)
         match follow_symlinks(k, caller_pid, path) {
             Ok(p) => p,
-            Err(rc) => return rc,
+            Err(errno) => return -(errno as i64),
         }
     };
     let Some((mount_id, inode)) = k.vfs.open(&resolved, 0) else {
