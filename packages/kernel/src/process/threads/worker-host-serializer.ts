@@ -17,6 +17,22 @@
  * exclusivity. One serializer is shared across all worker pthreads of
  * a process (created in `defaultSpawnThread`); see Task 10 in
  * `host-imports/worker-bodies.ts`.
+ *
+ * Known limitations (see PR #119 review):
+ *
+ * - **No timeout / cancellation / backpressure.** A single body that
+ *   never resolves wedges the whole per-process chain: every other
+ *   pthread of that process blocks forever. Pre-async the sync bodies
+ *   could not stall; the bodies that now `await` (`socketListen`,
+ *   `socketRecv`, the ZMQ reactor flow) are exactly the hang-prone
+ *   ones. A watchdog/timeout is tracked in issue #124, not implemented
+ *   here — acceptable for the single-process libzmq target workload.
+ * - **No re-entrancy.** A body that synchronously `await`s another
+ *   `run()` on the same serializer self-deadlocks: the inner `run`
+ *   chains behind a `tail` that only settles when the outer body
+ *   completes. Safe today — `threadSpawn` only *attaches* a dispatcher
+ *   listener, it does not synchronously re-enter `run`. Do not call
+ *   `run` from inside a body on the same serializer.
  */
 export class WorkerHostSerializer {
   // Tail of the chain. Always a settled-or-pending promise that never

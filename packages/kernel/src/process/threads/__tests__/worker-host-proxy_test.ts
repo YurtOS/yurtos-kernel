@@ -373,6 +373,43 @@ Deno.test("worker-host-proxy: body throw produces STATUS_ERROR + result=-1", asy
   assertEquals(Atomics.load(header, 1), -1);
 });
 
+Deno.test(
+  "worker-host-proxy: a throw in response write-back still notifies " +
+    "(no lost-notify pthread deadlock — review item 4)",
+  async () => {
+    // A buggy body returning oversized bytes makes the response
+    // `payloadBytes.set(...)` throw. That throw is outside the body
+    // call, so if the dispatcher only guards the body it never
+    // notifies and the parked pthread deadlocks forever. The whole
+    // critical section must be guarded: any throw ⇒ STATUS_ERROR +
+    // notify.
+    const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
+    const header = new Int32Array(sab, 0, HEADER_WORDS);
+    const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
+
+    const bodies: WorkerHostDispatcherBodies = {
+      ...noopBodies(),
+      // Far larger than the 4096-byte payload region → set() RangeError.
+      readFd: () => ({ result: 5000, bytes: new Uint8Array(5000) }),
+    };
+
+    const { target, invoke } = captureHandler();
+    attachWorkerHostDispatcher(target, sab, bodies);
+
+    payload[OP_WORD] = WorkerHostOp.ReadFd;
+    payload[ARGC_WORD] = 2;
+    payload[ARGS_WORD + 0] = 5;
+    payload[ARGS_WORD + 1] = 5000;
+    Atomics.store(header, 0, STATUS_REQUEST_READY);
+
+    await Promise.resolve(invoke()).catch(() => {});
+
+    // Must NOT still be REQUEST_READY (1) — the pthread would hang.
+    assertEquals(Atomics.load(header, 0), -1); // STATUS_ERROR
+    assertEquals(Atomics.load(header, 1), -1);
+  },
+);
+
 Deno.test("worker-host-proxy: ignores non-host-call messages", () => {
   const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
   const header = new Int32Array(sab, 0, HEADER_WORDS);

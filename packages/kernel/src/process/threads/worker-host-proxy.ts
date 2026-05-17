@@ -362,13 +362,23 @@ export function createWorkerYurtImports(
  *
  * **Awaitable contract (Task 10).** Every method may return its value
  * synchronously OR as a `Promise`. `attachWorkerHostDispatcher` always
- * `await`s the result, and runs every body inside a per-process
- * `WorkerHostSerializer` so that even when a body suspends mid-flight
- * (e.g. a blocking socket recv, or the libzmq I/O reactor waiting on a
- * round-trip) no peer worker's body interleaves and observes a
- * partially-mutated kernel state. A body that stays synchronous keeps
- * the previous fast path — it just resolves on the microtask the
- * serializer already awaits.
+ * `await`s the result, and runs every body inside a `WorkerHostSerializer`.
+ *
+ * Serialization scope is **per-process, not global**. The serializer is
+ * keyed off the `bodies` object identity, and `makeWorkerDispatcherBodies`
+ * returns one `bodies` per process — so a suspending body only excludes
+ * *peer pthreads of the same process* from interleaving on kernel state.
+ * The pre-async sync model serialized *all* host-call handlers globally
+ * (single event-loop run-to-completion); once any body `await`s, two
+ * different processes' bodies can interleave on shared kernel state
+ * (`ctx.kernel`, the global socket/port/route tables). That is safe for
+ * the single-process libzmq target; a cross-process shared-state audit
+ * is tracked in issue #125.
+ *
+ * Note this is no longer a synchronous fast path: even a sync body now
+ * goes through `serializer.run` → `tail.then(...)`, so the SAB response
+ * is written at least one microtask after the handler turn (harmless —
+ * the worker is parked in `Atomics.wait`).
  */
 export interface WorkerHostDispatcherBodies {
   threadYield(callerTid?: number): Awaitable<number>;
@@ -531,11 +541,16 @@ export function attachWorkerHostDispatcher(
     // message until we notify, so its request SAB is stable across the
     // serializer queue wait and any in-body `await`.
     return serializer.run(async () => {
-      const op = payload[PAYLOAD_OP_WORD] as WorkerHostOp;
-
-      let result = -1;
-      let outBytes: Uint8Array | undefined;
+      // The ENTIRE critical section — decode, dispatch, response
+      // write-back, notify — is guarded. Any throw (incl. a bad-bodies
+      // oversized `payloadBytes.set` RangeError) must still notify, or
+      // the parked pthread deadlocks forever (the serializer isolates
+      // the rejection so the chain survives but the worker never
+      // wakes). Exactly one notify on every path.
       try {
+        const op = payload[PAYLOAD_OP_WORD] as WorkerHostOp;
+        let result = -1;
+        let outBytes: Uint8Array | undefined;
         switch (op) {
           case WorkerHostOp.ThreadYield:
             result = await bodies.threadYield(context.callerTid);
@@ -663,20 +678,18 @@ export function attachWorkerHostDispatcher(
           default:
             result = -1;
         }
+        if (outBytes && outBytes.byteLength > 0) {
+          const byteStart = (PAYLOAD_ARGS_WORD + 1) * 4;
+          payloadBytes.set(outBytes, byteStart);
+        }
+        Atomics.store(header, RESULT_OFFSET, result | 0);
+        Atomics.store(header, STATUS_OFFSET, STATUS_RESPONSE_READY);
+        Atomics.notify(header, STATUS_OFFSET, 1);
       } catch {
         Atomics.store(header, RESULT_OFFSET, -1);
         Atomics.store(header, STATUS_OFFSET, STATUS_ERROR);
         Atomics.notify(header, STATUS_OFFSET, 1);
-        return;
       }
-
-      if (outBytes && outBytes.byteLength > 0) {
-        const byteStart = (PAYLOAD_ARGS_WORD + 1) * 4;
-        payloadBytes.set(outBytes, byteStart);
-      }
-      Atomics.store(header, RESULT_OFFSET, result | 0);
-      Atomics.store(header, STATUS_OFFSET, STATUS_RESPONSE_READY);
-      Atomics.notify(header, STATUS_OFFSET, 1);
     });
   });
 }

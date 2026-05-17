@@ -14,8 +14,9 @@ identified by PR74).
 async: it decodes the request, runs the body inside a per-process
 `WorkerHostSerializer` (a Promise-chain mutex), then writes the SAB response and
 `Atomics.notify`s. One serializer is shared across all worker pthreads of a
-process (created in `defaultSpawnThread`), so kernel-state mutations stay
-FIFO-serialized even though bodies may now suspend.
+process — keyed off the per-process `bodies` object identity via a module
+`WeakMap` — so kernel-state mutations stay FIFO-serialized even though bodies
+may now suspend.
 
 **Tech Stack:** Deno + TypeScript, SharedArrayBuffer + Atomics, existing
 worker-host SAB protocol.
@@ -28,9 +29,9 @@ this remediation as "Task 10". Earlier layers (SabMutex/SabCondvar async, bridge
 `requestSync` async, WASI `path_*` async-wrap) already landed.
 
 **Verification note:** End-to-end cpython/pyzmq proof is blocked by an unrelated
-WASI-SDK-33 toolchain gap (see `project-cpython-sdk33-blocker` memory). This
-plan is verified by unit tests that exercise the documented reentrance invariant
-directly.
+WASI-SDK-33 toolchain gap (see `project-cpython-sdk33-blocker` memory; tracked
+in issue #126). This plan is verified by unit tests that exercise the documented
+reentrance invariant directly.
 
 ---
 

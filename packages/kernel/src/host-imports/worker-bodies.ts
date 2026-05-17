@@ -25,24 +25,22 @@
  *   `withKernelLock` helper whose `fn()` ran eagerly outside its
  *   Promise chain — it performed zero serialization and was removed.
  *
- * When to reintroduce a lock:
- *   The moment any body needs to `await` mid-flight (e.g. real
- *   blocking-socket recv via `recvAsync`, or any other suspension
- *   that lets the event loop run another worker's handler), the
- *   following must be done together:
- *     1. Promote `WorkerHostDispatcherBodies` methods to return
- *        Promises, and have `attachWorkerHostDispatcher` `await` the
- *        body result before writing the response SAB.
- *     2. Reintroduce a real serialization primitive on the main side
- *        — either a Promise-chain mutex whose `.then` actually
- *        encloses the body call (so the body runs INSIDE the
- *        chained continuation, not outside it), or an Atomics-based
- *        main-side lock that worker dispatchers acquire before
- *        touching kernel state.
- *     3. Keep the per-process scoping: `makeWorkerDispatcherBodies`
- *        returns a fresh closure per call, so the lock must live in
- *        that closure (one lock per process, shared across all of
- *        that process's spawned worker threads).
+ * Lock status — DONE (Task 10, PR #119). Bodies may now `await`
+ * mid-flight; the three required pieces are in place:
+ *     1. `WorkerHostDispatcherBodies` methods are `Awaitable<T>`;
+ *        `attachWorkerHostDispatcher` `await`s the body before
+ *        writing the response SAB.
+ *     2. A real serialization primitive — `WorkerHostSerializer`, a
+ *        Promise-chain mutex whose `.then` encloses the body call so
+ *        the body runs INSIDE the chained continuation.
+ *     3. Per-process scoping: the serializer is keyed off the
+ *        `bodies` object identity via a module `WeakMap`
+ *        (`serializerForBodies` in `worker-host-proxy.ts`). Since
+ *        `makeWorkerDispatcherBodies` returns one fresh `bodies` per
+ *        process and every spawned worker of that process attaches
+ *        with it, this is one lock per process shared across its
+ *        worker threads — same scope the original plan expressed as
+ *        "live in the closure", different (lighter) mechanism.
  *
  * Why the wasm-import bodies in `kernel-imports.ts` are also not
  * locked:
