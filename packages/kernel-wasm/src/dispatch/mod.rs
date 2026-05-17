@@ -283,7 +283,10 @@ fn read_u32_args<const N: usize>(request: &[u8]) -> Option<[u32; N]> {
 /// kernel abort that the native 64-bit `cargo test` gate cannot
 /// observe (issue #65 / holistic-review C1). Returns `Err(-EINVAL)` on
 /// overflow or when the declared field runs past the request.
-pub(super) fn take_bytes(request: &[u8], at: usize, len: usize) -> Result<(&[u8], &[u8]), i64> {
+///
+/// Private: callers are child modules of `dispatch` (e.g. `dispatch::fs`),
+/// which see this without `pub`. Matches sibling helper `read_u32_args`.
+fn take_bytes(request: &[u8], at: usize, len: usize) -> Result<(&[u8], &[u8]), i64> {
     let end = (at as u64)
         .checked_add(len as u64)
         .filter(|&e| e <= request.len() as u64)
@@ -1427,6 +1430,10 @@ fn sys_idb_put(request: &[u8]) -> i64 {
     if request.len() < 5 {
         return -(abi::EINVAL as i64);
     }
+    // store_len is a single byte (≤ 255), so `1 + store_len + 4` (≤ 260)
+    // cannot wrap usize — this additive guard is safe by construction.
+    // The wrap-prone field here is key_len (caller u32), bounded below
+    // via take_bytes.
     let store_len = request[0] as usize;
     if 1 + store_len + 4 > request.len() {
         return -(abi::EINVAL as i64);
