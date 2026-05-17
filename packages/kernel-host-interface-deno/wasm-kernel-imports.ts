@@ -808,7 +808,9 @@ export const HOST_BINDINGS: HostBinding[] = [
       );
       const exitedPid = kernelView.getUint32(0, true);
       const status = kernelView.getInt32(4, true);
-      const signal = status >= 128 && status < 192 ? status - 128 : 0;
+      // Keep in sync with kernel-wasm waitid decoding: statuses
+      // 129..=192 encode signal deaths for signals 1..=64.
+      const signal = status > 128 && status <= 192 ? status - 128 : 0;
       const exitCode = signal === 0 ? status : 0;
       const resultBytes = new Uint8Array(16);
       const result = new DataView(resultBytes.buffer);
