@@ -359,10 +359,12 @@ fn dup_fd(caller_pid: u32, request: &[u8]) -> i64 {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
-        inc_entry_ref(k, &entry);
         let p = k.process_mut(caller_pid);
-        let newfd = p.fd_table.lowest_free_fd();
-        p.fd_table.install(newfd, entry);
+        let Some(newfd) = p.fd_table.lowest_free_fd_within(p.nofile_soft_limit()) else {
+            return -(abi::EMFILE as i64);
+        };
+        inc_entry_ref(k, &entry);
+        k.process_mut(caller_pid).fd_table.install(newfd, entry);
         newfd as i64
     })
 }
@@ -627,7 +629,15 @@ fn pipe(caller_pid: u32, response: &mut [u8]) -> i64 {
     with_kernel(|k| {
         let id = k.create_pipe();
         let p = k.process_mut(caller_pid);
-        let read_fd = p.fd_table.lowest_free_fd();
+        let soft_limit = p.nofile_soft_limit();
+        let Some(read_fd) = p.fd_table.lowest_free_fd_within(soft_limit) else {
+            // No fd was installed; drop the freshly-created pipe so a
+            // refused pipe() doesn't leak a kernel-side buffer.
+            k.pipe_dec_ref(id, crate::kernel::PipeEnd::Read);
+            k.pipe_dec_ref(id, crate::kernel::PipeEnd::Write);
+            return -(abi::EMFILE as i64);
+        };
+        let p = k.process_mut(caller_pid);
         p.fd_table.install(
             read_fd,
             crate::kernel::FdEntry::Pipe {
@@ -635,8 +645,16 @@ fn pipe(caller_pid: u32, response: &mut [u8]) -> i64 {
                 end: crate::kernel::PipeEnd::Read,
             },
         );
-        let write_fd = p.fd_table.lowest_free_fd();
-        p.fd_table.install(
+        let p = k.process_mut(caller_pid);
+        let Some(write_fd) = p.fd_table.lowest_free_fd_within(soft_limit) else {
+            // Roll back the read end we just installed, then drop the
+            // pipe (both ends back to zero → buffer freed).
+            k.process_mut(caller_pid).fd_table.remove(read_fd);
+            k.pipe_dec_ref(id, crate::kernel::PipeEnd::Read);
+            k.pipe_dec_ref(id, crate::kernel::PipeEnd::Write);
+            return -(abi::EMFILE as i64);
+        };
+        k.process_mut(caller_pid).fd_table.install(
             write_fd,
             crate::kernel::FdEntry::Pipe {
                 id,

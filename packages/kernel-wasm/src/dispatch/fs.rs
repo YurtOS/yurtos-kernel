@@ -98,7 +98,9 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
                 return -(abi::EISDIR as i64);
             }
             let p = k.process_mut(caller_pid);
-            let fd = p.fd_table.lowest_free_fd();
+            let Some(fd) = p.fd_table.lowest_free_fd_within(p.nofile_soft_limit()) else {
+                return -(abi::EMFILE as i64);
+            };
             p.fd_table.install(
                 fd,
                 crate::kernel::FdEntry::Directory {
@@ -119,8 +121,10 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
                 // Distinguish "create wasn't allowed" from "no such
                 // file": read-only backends (Tar, Proc, Dev) refuse
                 // the create bit and return the default ENOENT shape.
+                // POSIX: a create/write against a read-only filesystem
+                // is EROFS, not EPERM (issue #110 / #71-audit Low).
                 if create {
-                    return -(abi::EPERM as i64);
+                    return -(abi::EROFS as i64);
                 } else {
                     return -(abi::ENOENT as i64);
                 }
@@ -131,7 +135,13 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
         }
         let ofd_id = k.create_ofd(mount_id, inode, writable);
         let p = k.process_mut(caller_pid);
-        let fd = p.fd_table.lowest_free_fd();
+        let Some(fd) = p.fd_table.lowest_free_fd_within(p.nofile_soft_limit()) else {
+            // Roll back the OFD we just created so a refused open
+            // doesn't leak a kernel-side open-file description.
+            k.ofd_dec_ref(ofd_id);
+            return -(abi::EMFILE as i64);
+        };
+        let p = k.process_mut(caller_pid);
         p.fd_table
             .install(fd, crate::kernel::FdEntry::File { ofd_id });
         fd as i64

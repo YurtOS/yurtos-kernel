@@ -56,6 +56,13 @@ pub const KERNEL_RT_SIGNAL_QUEUE_CAP: usize = 1024;
 /// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
 pub const RLIMIT_SLOTS: usize = 8;
 
+/// `rlimits` slot index for RLIMIT_NOFILE (the per-process open-fd
+/// ceiling). Default soft/hard is 1024/1024 (see `DEFAULT_RLIMITS`).
+/// The new-fd allocator bounds allocation by the soft limit so a
+/// guest looping `open`/`dup`/`socket` cannot grow the fd table
+/// without bound (issue #110 guest-DoS).
+pub const RLIMIT_NOFILE: usize = 7;
+
 /// Kernel-owned execution state for one user thread. Host backends may
 /// map this to a Worker, a wasmtime task, or a cooperative stack, but
 /// the lifecycle state belongs to kernel.wasm.
@@ -186,9 +193,33 @@ impl FdTable {
         self.entries.get(&fd)
     }
 
-    /// Lowest unused fd number. Used by `dup` and `pipe` to allocate.
-    pub fn lowest_free_fd(&self) -> u32 {
-        self.lowest_free_fd_at(0).expect("fd table exhausted")
+    /// Lowest unused fd number that is strictly below `soft_limit`
+    /// (the calling process's `RLIMIT_NOFILE` soft limit). Returns
+    /// `None` when every fd `< soft_limit` is occupied — guest-reachable
+    /// allocation sites map that to `-EMFILE`, which is what bounds
+    /// unbounded fd growth (issue #110 guest-DoS). This replaces the
+    /// old infallible `lowest_free_fd()` whose `.expect("fd table
+    /// exhausted")` let a guest trap the kernel.
+    ///
+    /// `soft_limit` is a `u64` because `ResourceLimit` stores limits
+    /// as `u64` (RLIM_INFINITY = `u64::MAX`); fd numbers are `u32`, so
+    /// a soft limit `>= 2^32` simply never bounds before the `u32`
+    /// space is exhausted (the loop's existing `u32::MAX` guard still
+    /// holds and yields `None` rather than overflowing).
+    pub fn lowest_free_fd_within(&self, soft_limit: u64) -> Option<u32> {
+        let mut n = 0u32;
+        loop {
+            if u64::from(n) >= soft_limit {
+                return None;
+            }
+            if !self.entries.contains_key(&n) {
+                return Some(n);
+            }
+            if n == u32::MAX {
+                return None;
+            }
+            n += 1;
+        }
     }
 
     pub fn lowest_free_fd_at(&self, min_fd: u32) -> Option<u32> {
@@ -430,6 +461,18 @@ impl Process {
             .entry(1)
             .or_insert_with(|| ThreadRecord::main(host_thread_handle));
         self.next_tid = self.next_tid.max(2);
+    }
+
+    /// This process's `RLIMIT_NOFILE` soft limit — the exclusive upper
+    /// bound on a freshly-allocated fd number. Defaults to 1024 (see
+    /// `DEFAULT_RLIMITS`); `None` slot or RLIM_INFINITY collapse to
+    /// `u64::MAX` (effectively unbounded, capped only by the `u32` fd
+    /// space). Threaded into every guest-reachable fd-allocation site
+    /// so allocation fails closed with `-EMFILE` (issue #110).
+    pub fn nofile_soft_limit(&self) -> u64 {
+        self.rlimits[RLIMIT_NOFILE]
+            .map(|(soft, _hard)| soft)
+            .unwrap_or(u64::MAX)
     }
 }
 

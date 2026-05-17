@@ -931,6 +931,82 @@ fn dup_of_unopened_fd_is_ebadf() {
     );
 }
 
+/// Issue #110 (guest-DoS): a guest looping `open` must not be able to
+/// grow the fd table without bound. New-fd allocation is bounded by
+/// the process's RLIMIT_NOFILE soft limit and returns `-EMFILE` once
+/// every fd `< soft_limit` is taken — it must NOT panic (the old
+/// `lowest_free_fd().expect("fd table exhausted")` trapped the
+/// kernel). Below the limit, allocation is unchanged (lowest-free-fd
+/// order preserved).
+#[test]
+fn open_past_rlimit_nofile_is_emfile_not_panic() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Lower RLIMIT_NOFILE (slot 7) soft limit to 8 for pid 1. fds
+    // 0/1/2 (stdin/out/err) are pre-opened, so 5 more fds (3..=7)
+    // fit before the 8th allocation must fail.
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).rlimits[7] = Some((8, 1024));
+    });
+
+    // /dev/zero is a real DevBackend file; opening it read-only
+    // allocates a fresh fd each time without needing a writable
+    // backend. fds 3,4,5,6,7 succeed (all < soft limit 8) and keep
+    // lowest-free-fd numbering.
+    for expected_fd in 3..=7 {
+        let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/dev/zero"), &mut []);
+        assert_eq!(
+            fd, expected_fd,
+            "fd below the limit must allocate at the lowest free number"
+        );
+    }
+
+    // The 8th fd would be number 8, which is NOT < soft limit 8 →
+    // -EMFILE. Critically: this returns, it does not panic.
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/dev/zero"), &mut []),
+        -(abi::EMFILE as i64),
+        "allocation at/over RLIMIT_NOFILE soft limit must be -EMFILE"
+    );
+
+    // Other allocating syscalls honor the same bound (no panic):
+    // dup of fd 0 is also -EMFILE while the table is full.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 1, &0_u32.to_le_bytes(), &mut []),
+        -(abi::EMFILE as i64),
+        "dup past RLIMIT_NOFILE soft limit must be -EMFILE"
+    );
+    // pipe() needs two fds; with the table full it is -EMFILE and
+    // must not partially install / panic.
+    let mut pipe_out = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_out),
+        -(abi::EMFILE as i64),
+        "pipe past RLIMIT_NOFILE soft limit must be -EMFILE"
+    );
+
+    // Freeing an fd re-opens headroom: closing fd 5 lets the next
+    // open succeed and reuse the lowest free number (5), proving the
+    // bound is a live ceiling, not a one-way latch, and numbering
+    // semantics below the limit are unchanged.
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &5_u32.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/dev/zero"), &mut []),
+        5,
+        "after close, allocation resumes at the lowest free fd"
+    );
+
+    // A pid with the default limit (1024) is unaffected — the bound
+    // is per-process (no global regression).
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 2, &open_req(0, b"/dev/zero"), &mut []),
+        3,
+        "default-limit process keeps normal allocation"
+    );
+}
+
 #[test]
 fn dup2_overwrites_target_silently() {
     let _g = crate::kernel::TestGuard::acquire();
@@ -4706,7 +4782,11 @@ fn socket_send_rejects_unknown_kernel_fd() {
 #[test]
 fn dev_namespace_refuses_create() {
     let _g = crate::kernel::TestGuard::acquire();
-    // /dev is a fixed namespace; CREAT inside it returns -EPERM.
+    // /dev is a read-only namespace; O_CREAT inside it is a write
+    // against a read-only filesystem → -EROFS (POSIX). This test
+    // previously enshrined the -EPERM bug (issue #110 / #71-audit
+    // Low), updated here following the #69 enshrined-bug-test
+    // precedent.
     assert_eq!(
         dispatch(
             METHOD_SYS_OPEN,
@@ -4714,7 +4794,13 @@ fn dev_namespace_refuses_create() {
             &open_req(O_WRITE | O_CREAT, b"/dev/whatever"),
             &mut [],
         ),
-        -(abi::EPERM as i64)
+        -(abi::EROFS as i64)
+    );
+    // A read-ONLY open (no O_CREAT) of a missing /dev path is still
+    // -ENOENT — the EROFS change is scoped to the create bit.
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/dev/whatever"), &mut [],),
+        -(abi::ENOENT as i64)
     );
 }
 
@@ -5040,7 +5126,10 @@ fn tar_layer_refuses_create_and_write() {
     req.extend_from_slice(&tar_bytes);
     dispatch(METHOD_KERNEL_INSTALL_TAR_LAYER, 0, &req, &mut []);
 
-    // CREAT against a tar mount → -EPERM (backend.create returns None).
+    // CREAT against a tar mount → -EROFS: a create on a read-only
+    // backend is a write to a read-only filesystem (POSIX). This
+    // assertion previously enshrined the -EPERM bug (issue #110 /
+    // #71-audit Low), updated per the #69 precedent.
     assert_eq!(
         dispatch(
             METHOD_SYS_OPEN,
@@ -5048,7 +5137,18 @@ fn tar_layer_refuses_create_and_write() {
             &open_req(O_WRITE | O_CREAT, b"/img2/new.txt"),
             &mut []
         ),
-        -(abi::EPERM as i64)
+        -(abi::EROFS as i64)
+    );
+    // A read-ONLY open (no O_CREAT) of a missing tar path is still
+    // -ENOENT.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(0, b"/img2/missing.txt"),
+            &mut []
+        ),
+        -(abi::ENOENT as i64)
     );
 
     // Write through a writable-OFD → -EBADF (backend.write rejects).
