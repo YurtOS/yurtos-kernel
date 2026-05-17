@@ -179,7 +179,11 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             let (mount_id, dir_inode) = dir_anchor(k, path);
             let dir_path = path.to_vec();
             let p = k.process_mut(caller_pid);
-            let fd = p.fd_table.lowest_free_fd();
+            // Bound by RLIMIT_NOFILE — no kernel object was allocated
+            // for a Directory fd, so there is nothing to roll back.
+            let Some(fd) = p.lowest_free_fd_in_limit() else {
+                return -(abi::EMFILE as i64);
+            };
             p.fd_table.install(
                 fd,
                 crate::kernel::FdEntry::Directory {
@@ -213,9 +217,14 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             k.vfs.truncate(mount_id, inode);
         }
         let ofd_id = k.create_ofd(mount_id, inode, writable);
-        let p = k.process_mut(caller_pid);
-        let fd = p.fd_table.lowest_free_fd();
-        p.fd_table
+        // Bound by RLIMIT_NOFILE; release the just-created OFD if the
+        // process is at its soft limit so no description leaks.
+        let Some(fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
+            k.ofd_dec_ref(ofd_id);
+            return -(abi::EMFILE as i64);
+        };
+        k.process_mut(caller_pid)
+            .fd_table
             .install(fd, crate::kernel::FdEntry::File { ofd_id });
         fd as i64
     })

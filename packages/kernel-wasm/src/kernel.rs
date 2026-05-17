@@ -488,6 +488,19 @@ impl Process {
             .or_insert_with(|| ThreadRecord::main(host_thread_handle));
         self.next_tid = self.next_tid.max(2);
     }
+
+    /// Lowest free fd within this process's `RLIMIT_NOFILE` soft limit,
+    /// or `None` when the soft limit is reached (callers map that to
+    /// `-EMFILE`). Mirrors the `F_DUPFD` bound (#140 / PR #147) so every
+    /// automatic fd producer enforces the same per-process ceiling
+    /// instead of the unbounded, panic-on-exhaustion `lowest_free_fd()`.
+    /// A missing limit slot is treated as unbounded.
+    pub fn lowest_free_fd_in_limit(&self) -> Option<u32> {
+        let soft = self.rlimits[RLIMIT_NOFILE]
+            .map(|(soft, _)| soft)
+            .unwrap_or(u64::MAX);
+        self.fd_table.lowest_free_fd_below(0, soft)
+    }
 }
 
 // ── Pipe registry ─────────────────────────────────────────────────────────
