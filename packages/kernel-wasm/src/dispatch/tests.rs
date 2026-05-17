@@ -9832,3 +9832,40 @@ fn sigaltstack_roundtrip_and_undersized_einval() {
         "alt-stack disabled (SS_DISABLE set)"
     );
 }
+
+#[test]
+fn sigsuspend_swaps_and_restores_returns_eintr_pause_leaves_mask() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // set a known mask first (SETMASK to SIGINT slot 1)
+    let mut o = [0u8; 1];
+    dispatch(
+        METHOD_SYS_SIGPROCMASK,
+        1,
+        &sigprocmask_req(2, Some(1 << 1)),
+        &mut o,
+    );
+    // sigsuspend(has_mask=1, mask=slot7) → -EINTR, prior mask restored
+    let req = vec![1u8, 1 << 7];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGSUSPEND, 1, &req, &mut []),
+        -(crate::abi::EINTR as i64)
+    );
+    let m = crate::kernel::with_kernel(|k| {
+        k.process_mut(1).threads[&crate::kernel::MAIN_THREAD_TID].blocked_signals
+    });
+    assert_ne!(
+        m & (1u64 << (2 - 1)),
+        0,
+        "prior SIGINT mask restored after sigsuspend"
+    );
+    // pause path: has_mask=0 leaves mask unchanged, still -EINTR
+    let req0 = vec![0u8, 0u8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGSUSPEND, 1, &req0, &mut []),
+        -(crate::abi::EINTR as i64)
+    );
+    let m2 = crate::kernel::with_kernel(|k| {
+        k.process_mut(1).threads[&crate::kernel::MAIN_THREAD_TID].blocked_signals
+    });
+    assert_eq!(m, m2, "pause (has_mask=0) leaves caller mask unchanged");
+}

@@ -109,6 +109,29 @@ pub(super) fn sys_sigaltstack(ctx: DispatchContext, request: &[u8], response: &m
     })
 }
 
+pub(super) fn sys_sigsuspend(ctx: DispatchContext, request: &[u8], _response: &mut [u8]) -> i64 {
+    if request.len() != 2 {
+        return -(abi::EINVAL as i64);
+    }
+    let has_mask = request[0] != 0;
+    let mask = expand(request[1]) & !UNMASKABLE;
+    with_kernel(|k| {
+        let p = k.process_mut(ctx.caller_pid);
+        let Some(t) = p.threads.get_mut(&ctx.caller_tid) else {
+            return -(abi::ESRCH as i64);
+        };
+        let prior = t.blocked_signals;
+        if has_mask {
+            t.blocked_signals = mask;
+        }
+        // Non-blocking pending check is a structural placeholder — no
+        // observable effect until delivery (B1.8-b). Restore + EINTR
+        // (true blocking AsyncBridge/B1.5-gated). spec §5/§11.4.
+        t.blocked_signals = prior;
+        -(abi::EINTR as i64)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
