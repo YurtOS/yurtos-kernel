@@ -55,6 +55,7 @@ pub const KERNEL_RT_SIGNAL_QUEUE_CAP: usize = 1024;
 /// Number of POSIX rlimit slots tracked. Matches the TS kernel's
 /// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
 pub const RLIMIT_SLOTS: usize = 8;
+pub const RLIMIT_NOFILE: usize = 7;
 
 /// Kernel-owned execution state for one user thread. Host backends may
 /// map this to a Worker, a wasmtime task, or a cooperative stack, but
@@ -204,6 +205,22 @@ impl FdTable {
         }
     }
 
+    pub fn lowest_free_fd_below(&self, min_fd: u32, exclusive_limit: u64) -> Option<u32> {
+        let mut n = min_fd;
+        loop {
+            if u64::from(n) >= exclusive_limit {
+                return None;
+            }
+            if !self.entries.contains_key(&n) {
+                return Some(n);
+            }
+            if n == u32::MAX {
+                return None;
+            }
+            n += 1;
+        }
+    }
+
     pub fn set_descriptor_flags(&mut self, fd: u32, flags: u32) -> Result<(), i32> {
         if !self.entries.contains_key(&fd) {
             return Err(crate::abi::EBADF);
@@ -279,7 +296,7 @@ pub const DEFAULT_RLIMITS: [Option<ResourceLimit>; RLIMIT_SLOTS] = [
     Some((0, 0)),                               // 4 RLIMIT_CORE
     Some((64 * 1024 * 1024, 64 * 1024 * 1024)), // 5 RLIMIT_RSS
     Some((1024, 1024)),                         // 6 RLIMIT_NPROC
-    Some((1024, 1024)),                         // 7 RLIMIT_NOFILE
+    Some((1024, 1024)),                         // RLIMIT_NOFILE
 ];
 
 /// One queued POSIX real-time signal (`sigqueue`). Carries the payload

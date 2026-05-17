@@ -996,6 +996,34 @@ fn dup_min_returns_lowest_unused_fd_at_or_above_minimum() {
 }
 
 #[test]
+fn dup_min_distinguishes_nofile_exhaustion_from_out_of_range_minfd() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    let mut limit_req = Vec::new();
+    limit_req.extend_from_slice(&7_u32.to_le_bytes());
+    limit_req.extend_from_slice(&4_u64.to_le_bytes());
+    limit_req.extend_from_slice(&1024_u64.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_SETRLIMIT, 1, &limit_req, &mut []), 0);
+
+    let mut dup_req = Vec::new();
+    dup_req.extend_from_slice(&1_u32.to_le_bytes());
+    dup_req.extend_from_slice(&3_u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_DUP_MIN, 1, &dup_req, &mut []), 3);
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP_MIN, 1, &dup_req, &mut []),
+        -(abi::EMFILE as i64)
+    );
+
+    let mut out_of_range_req = Vec::new();
+    out_of_range_req.extend_from_slice(&1_u32.to_le_bytes());
+    out_of_range_req.extend_from_slice(&4_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP_MIN, 1, &out_of_range_req, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
 fn dup_min_rejects_closed_source_fd() {
     let _g = crate::kernel::TestGuard::acquire();
     let mut req = Vec::new();
