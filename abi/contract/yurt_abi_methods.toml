@@ -646,6 +646,26 @@ id = 0x1_00A5
 kind = "syscall"
 doc = "POSIX truncate(path, length). Request: u64 length LE + path bytes (path is the remainder of the request — no length prefix; mirrors sys_chdir's path convention). Same semantics as sys_ftruncate but takes a path; resolves symlinks (40 hops then -EINVAL today; -ELOOP once #69 lands). Errnos add -ENOENT for missing paths and -EISDIR when the resolved path is a directory; -EINVAL for empty path, missing length, or length > i64::MAX. Issue #87."
 
+[method.sys_fsync]
+id = 0x1_00A6
+kind = "syscall"
+doc = "POSIX fsync(fd). Request: u32 fd LE. For the in-memory ramfs there is no backing device, so the correct semantic is a successful no-op on any syncable fd — returning ENOSYS makes sqlite report 'disk I/O error' and breaks atomic-save idioms (issue #88). Returns 0 for an open regular-file or directory fd, -EBADF if fd is not open, -EINVAL for pipe / socket / non-syncable fd types (matches Linux's fsync(pipe) → EINVAL). Host-backed mount forwarding to a real kh_* durability primitive is a follow-up; this method ID is reused unchanged when that lands."
+
+[method.sys_fdatasync]
+id = 0x1_00A7
+kind = "syscall"
+doc = "POSIX fdatasync(fd). Request: u32 fd LE. Identical semantics to sys_fsync in the in-memory ramfs — there is no separate data-vs-metadata distinction when nothing is written through to a backing device. Returns 0 / -EBADF / -EINVAL per sys_fsync."
+
+[method.sys_sync]
+id = 0x1_00A8
+kind = "syscall"
+doc = "POSIX sync(). No request. Returns 0 always (POSIX defines sync(2) as void — the kernel emits 0 so a host adapter that treats negative as errno can map it transparently)."
+
+[method.sys_syncfs]
+id = 0x1_00A9
+kind = "syscall"
+doc = "Linux syncfs(fd). Request: u32 fd LE. Sync the filesystem containing fd. For the in-memory ramfs this is a no-op success on any open fd — only the fd-validity check matters. Returns 0, -EBADF for an unknown fd, or -EINVAL for non-syncable fd types (mirrors sys_fsync's gate)."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"
