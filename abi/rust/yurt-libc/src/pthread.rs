@@ -62,12 +62,29 @@ struct TlsLockGuard;
 static TLS_LOCK: AtomicBool = AtomicBool::new(false);
 static mut TLS_KEYS: [TlsKey; TLS_KEYS_MAX] = [TlsKey::EMPTY; TLS_KEYS_MAX];
 
+/// `wasi-libc`'s `clockid_t` is `const struct __clockid *` and the
+/// public `CLOCK_*` macros are pointers to statics of this type. Its
+/// `clock_getres`/`clock_gettime` wrappers do `i32.load 0` at the
+/// pointer to extract the `__wasi_clockid_t` enum value and forward
+/// it to `__wasi_clock_res_get` / `__wasi_clock_time_get`.
+///
+/// We must therefore expose statics whose first 4 bytes equal the
+/// WASI enum value for that clock — not a 1-byte sentinel. Storing
+/// a `u8 = 0` here previously caused `i32.load 0` to read three bytes
+/// of adjacent-symbol garbage (and `0` for the low byte), producing
+/// junk clock ids like `1970864128` at the host — observed when
+/// cpython's `asyncio` called `time.get_clock_info('monotonic')`.
+#[repr(C)]
+pub struct __wasilibc_clockid {
+    pub id: c_int,
+}
+
 #[allow(non_upper_case_globals)]
 #[no_mangle]
-pub static _CLOCK_REALTIME: u8 = 0;
+pub static _CLOCK_REALTIME: __wasilibc_clockid = __wasilibc_clockid { id: 0 };
 #[allow(non_upper_case_globals)]
 #[no_mangle]
-pub static _CLOCK_MONOTONIC: u8 = 0;
+pub static _CLOCK_MONOTONIC: __wasilibc_clockid = __wasilibc_clockid { id: 1 };
 
 #[link(wasm_import_module = "yurt")]
 extern "C" {
