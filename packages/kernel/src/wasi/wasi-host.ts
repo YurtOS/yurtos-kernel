@@ -9,7 +9,14 @@
 
 import { FdTable } from "../vfs/fd-table.js";
 import type { OpenMode, SeekWhence } from "../vfs/fd-table.js";
-import { KERNEL_FD_BASE, type ProcessKernel } from "../process/kernel.ts";
+import {
+  FdDupMinError,
+  KERNEL_FD_BASE,
+  POSIX_EINVAL,
+  POSIX_EMFILE,
+  type ProcessKernel,
+  RLIMIT_NOFILE,
+} from "../process/kernel.ts";
 import { VfsError } from "../vfs/inode.js";
 import type { InodeType } from "../vfs/inode.js";
 import type { DirEntry, StatResult } from "../vfs/inode.js";
@@ -578,7 +585,12 @@ export class WasiHost {
     minFd: number,
     includeIo = true,
   ): number | null {
-    if (minFd < 0) return null;
+    if (minFd < 0) {
+      throw new FdDupMinError(
+        POSIX_EINVAL,
+        `duplicateFdMin: invalid min fd ${minFd}`,
+      );
+    }
     if (
       this.kernel && this.pid !== undefined &&
       this.kernel.getFdTarget(this.pid, srcFd)
@@ -588,7 +600,8 @@ export class WasiHost {
         const dirPath = this.dirFds.get(srcFd);
         if (dirPath !== undefined) this.dirFds.set(newFd, dirPath);
         return newFd;
-      } catch {
+      } catch (err) {
+        if (err instanceof FdDupMinError) throw err;
         return null;
       }
     }
@@ -597,13 +610,30 @@ export class WasiHost {
       (includeIo && this.ioFds.has(srcFd));
     if (!hasSource) return null;
 
+    const softLimit = this.kernel && this.pid !== undefined
+      ? this.kernel.getResourceLimit(this.pid, RLIMIT_NOFILE)?.soft ?? Infinity
+      : Infinity;
+    if (minFd >= softLimit) {
+      throw new FdDupMinError(
+        POSIX_EINVAL,
+        `duplicateFdMin: min fd ${minFd} exceeds RLIMIT_NOFILE ${softLimit}`,
+      );
+    }
+
     let dstFd = minFd;
     while (
-      this.fdTable.isOpen(dstFd) ||
-      this.dirFds.has(dstFd) ||
-      this.ioFds.has(dstFd)
+      dstFd < softLimit &&
+      (this.fdTable.isOpen(dstFd) ||
+        this.dirFds.has(dstFd) ||
+        this.ioFds.has(dstFd))
     ) {
       dstFd++;
+    }
+    if (dstFd >= softLimit) {
+      throw new FdDupMinError(
+        POSIX_EMFILE,
+        `duplicateFdMin: fd table exhausted below RLIMIT_NOFILE ${softLimit}`,
+      );
     }
 
     return this.duplicateFdTo(srcFd, dstFd, includeIo) ? dstFd : null;

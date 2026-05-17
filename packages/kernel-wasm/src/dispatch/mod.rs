@@ -442,18 +442,26 @@ fn dup3_fd(caller_pid: u32, request: &[u8]) -> i64 {
     })
 }
 
-/// `dup_min(oldfd: u32, minfd: u32) -> newfd / -EBADF / -EINVAL`.
+/// `dup_min(oldfd: u32, minfd: u32) -> newfd / -EBADF / -EINVAL / -EMFILE`.
 fn dup_min_fd(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([oldfd, minfd]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
     with_kernel(|k| {
-        let entry = match k.process_mut(caller_pid).fd_table.entry(oldfd) {
+        let process = k.process_mut(caller_pid);
+        let entry = match process.fd_table.entry(oldfd) {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
-        let Some(newfd) = k.process_mut(caller_pid).fd_table.lowest_free_fd_at(minfd) else {
+
+        let soft_limit = process.rlimits[crate::kernel::RLIMIT_NOFILE]
+            .map(|(soft, _)| soft)
+            .unwrap_or(u64::MAX);
+        if u64::from(minfd) >= soft_limit {
             return -(abi::EINVAL as i64);
+        }
+        let Some(newfd) = process.fd_table.lowest_free_fd_below(minfd, soft_limit) else {
+            return -(abi::EMFILE as i64);
         };
         inc_entry_ref(k, &entry);
         k.process_mut(caller_pid).fd_table.install(newfd, entry);

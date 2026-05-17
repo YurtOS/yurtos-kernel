@@ -34,7 +34,7 @@ static int case_nofile(void) {
 }
 
 static int case_setrlimit_enforced(void) {
-  struct rlimit r = { 4, 1024 };
+  struct rlimit r = { 5, 1024 };
   if (setrlimit(RLIMIT_NOFILE, &r) != 0) {
     emit("setrlimit_fail", 1, errno);
     return 1;
@@ -43,8 +43,34 @@ static int case_setrlimit_enforced(void) {
     emit("setrlimit_get_fail", 1, errno);
     return 1;
   }
-  if (r.rlim_cur != 4 || r.rlim_max != 1024) {
+  if (r.rlim_cur != 5 || r.rlim_max != 1024) {
     emit("setrlimit_unexpected", 1, (unsigned long)r.rlim_cur);
+    return 1;
+  }
+
+  /* The runtime starts this canary with fds 0-3 occupied; with a soft
+   * RLIMIT_NOFILE of 5, fd 4 is the only allocatable descriptor left. */
+  errno = 0;
+  int dup_fd = fcntl(STDOUT_FILENO, F_DUPFD, 4);
+  if (dup_fd != 4) {
+    if (dup_fd >= 0) close(dup_fd);
+    emit("setrlimit_f_dupfd_boundary", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  int exhausted_fd = fcntl(STDOUT_FILENO, F_DUPFD, 4);
+  if (exhausted_fd >= 0 || errno != EMFILE) {
+    if (exhausted_fd >= 0) close(exhausted_fd);
+    emit("setrlimit_f_dupfd_not_emfile", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  int out_of_range_fd = fcntl(STDOUT_FILENO, F_DUPFD, 5);
+  if (out_of_range_fd >= 0 || errno != EINVAL) {
+    if (out_of_range_fd >= 0) close(out_of_range_fd);
+    emit("setrlimit_f_dupfd_not_einval", 1, errno);
     return 1;
   }
 
@@ -56,7 +82,7 @@ static int case_setrlimit_enforced(void) {
     return 1;
   }
 
-  emit("setrlimit", 0, 4);
+  emit("setrlimit", 0, 5);
   return 0;
 }
 

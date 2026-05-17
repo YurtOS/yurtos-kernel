@@ -33,6 +33,12 @@ YURT_DEFINE_MARKER(fcntl, 0x66636e74u) /* "fcnt" */
 static int yurt_fd_status_flags[65536];
 static int yurt_fd_descriptor_flags[65536];
 
+enum {
+  YURT_ABI_EBADF = 9,
+  YURT_ABI_EINVAL = 22,
+  YURT_ABI_EMFILE = 24,
+};
+
 static int yurt_fd_get_status_flags(int fd) {
   if (fd < 0 || fd >= (int)(sizeof(yurt_fd_status_flags) / sizeof(yurt_fd_status_flags[0]))) {
     return 0;
@@ -69,6 +75,19 @@ static int yurt_fd_apply_descriptor_flags(int fd, int flags) {
   }
   yurt_fd_set_descriptor_flags(fd, flags);
   return 0;
+}
+
+static int yurt_dup_min_errno_from_host(int rc) {
+  switch (-rc) {
+    case YURT_ABI_EBADF:
+      return EBADF;
+    case YURT_ABI_EINVAL:
+      return EINVAL;
+    case YURT_ABI_EMFILE:
+      return EMFILE;
+    default:
+      return EBADF;
+  }
 }
 
 int dup(int oldfd) {
@@ -133,7 +152,7 @@ static int yurt_fcntl_impl(int fd, int cmd, va_list ap) {
 
       int new_fd = yurt_host_dup_min(fd, min_fd);
       if (new_fd < 0) {
-        errno = EBADF;
+        errno = yurt_dup_min_errno_from_host(new_fd);
         return -1;
       }
 #ifdef F_DUPFD_CLOEXEC
