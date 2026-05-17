@@ -12617,3 +12617,47 @@ fn stat_resolves_relative_intermediate_symlink_targets() {
     );
     assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 4);
 }
+
+/// KNOWN PRESERVED residual (folded into #142): stat()/lstat() return
+/// -ENOENT (NOT POSIX -ENOTDIR) when an intermediate component is a
+/// non-directory with remaining path components — uniformly, whether
+/// or not a symlink was traversed to reach it. Only realpath does the
+/// POSIX ENOTDIR check; stat/lstat/open deliberately use the lenient
+/// lexical + write_stat_record contract (making it ENOTDIR requires
+/// per-component existence checks = the rejected Approach A, which
+/// regressed lexical-`..`/socket/proc tests). Pins current behavior
+/// so #142's uniform fix across open/stat/lstat is deliberate and
+/// test-visible, and locks the symlink-vs-plain consistency.
+#[test]
+fn stat_lstat_nondir_intermediate_is_enoent_not_enotdir_146_142() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut r = (b"/file".len() as u32).to_le_bytes().to_vec();
+    r.extend_from_slice(b"/file");
+    r.extend_from_slice(b"data");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &r, &mut []);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    let mut s = (b"/file".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/file");
+    s.extend_from_slice(b"/a/link");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    // Intermediate is a symlink resolving to a regular file:
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/a/link/child", &mut out),
+        -(abi::ENOENT as i64),
+        "stat via symlink-to-file intermediate: ENOENT today (POSIX: ENOTDIR) — #142"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/a/link/child", &mut out),
+        -(abi::ENOENT as i64),
+        "lstat via symlink-to-file intermediate: ENOENT today — #142"
+    );
+    // Same logical error WITHOUT a symlink — must be the SAME errno
+    // (consistency: a symlink-only ENOTDIR fix would diverge these).
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/file/child", &mut out),
+        -(abi::ENOENT as i64),
+        "stat via plain non-dir intermediate: ENOENT today — #142"
+    );
+}

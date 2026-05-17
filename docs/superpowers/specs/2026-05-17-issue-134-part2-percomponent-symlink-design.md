@@ -320,6 +320,18 @@ cross-crate run needed.
   unchanged and pins it with a characterization test (no silent regression),
   but does not fix it — that belongs in the shared resolver later, sequenced
   after #134.
+- **`ENOTDIR` vs `ENOENT` for a non-directory intermediate component**
+  → **#142**. Today `stat`/`lstat`/`open` uniformly return `-ENOENT` when an
+  intermediate component is a non-dir with remaining components (verified:
+  both the plain `/file/child` case and the symlink `/a/link/child` →
+  `/file` case); only `realpath` returns POSIX `-ENOTDIR`. Making
+  `stat`/`lstat` `ENOTDIR` requires per-component existence/type checks for
+  *every* intermediate (symlink or not) — i.e. the rejected Approach A,
+  which regressed the three lexical/socket/proc tests. A symlink-only fix
+  would diverge from the plain case (inconsistent). Part 2 preserves the
+  uniform `ENOENT` contract and pins it with a characterization test
+  (`stat_lstat_nondir_intermediate_is_enoent_not_enotdir_146_142`); the
+  uniform fix across `open`/`stat`/`lstat` belongs to #142.
 - `sys_open` / other `normalize_readable_path` consumers → #142.
 - dirfd inode-anchoring → #59 / PR #63.
 - New syscalls / ABI method-ids / `host_*` surface changes.
