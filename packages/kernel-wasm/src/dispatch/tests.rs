@@ -4090,6 +4090,90 @@ fn kill_out_of_range_sig_is_einval() {
     );
 }
 
+// #66 — signal/scheduler syscalls must authorize on the
+// host-authenticated caller_pid, not the guest-supplied target pid.
+
+fn set_uid(pid: u32, uid: u32) {
+    crate::kernel::with_kernel(|k| {
+        let c = &mut k.process_mut(pid).credentials;
+        c.uid = uid;
+        c.euid = uid;
+        c.suid = uid;
+    });
+}
+
+#[test]
+fn kill_request_rejects_unauthorized_cross_uid_target() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // caller pid 1 stays default uid 1000; pid 8 is another user.
+    set_uid(8, 2000);
+    let mut req = Vec::new();
+    req.extend_from_slice(&8_u32.to_le_bytes());
+    req.extend_from_slice(&15_u32.to_le_bytes()); // SIGTERM
+    assert_eq!(
+        dispatch(METHOD_SYS_KILL, 1, &req, &mut []),
+        -(abi::EPERM as i64),
+        "guest must not signal a process owned by another uid"
+    );
+    let pending = crate::kernel::with_kernel(|k| k.process_mut(8).pending_signals);
+    assert_eq!(pending, 0, "rejected kill must not set pending bits");
+}
+
+#[test]
+fn kill_request_allows_same_uid_and_root_override() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(8);
+    });
+    let mut req = Vec::new();
+    req.extend_from_slice(&8_u32.to_le_bytes());
+    req.extend_from_slice(&15_u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_KILL, 1, &req, &mut []), 0);
+    assert_eq!(
+        crate::kernel::with_kernel(|k| k.process_mut(8).pending_signals),
+        1u64 << 14
+    );
+
+    set_uid(9, 2000);
+    make_root(1);
+    let mut req = Vec::new();
+    req.extend_from_slice(&9_u32.to_le_bytes());
+    req.extend_from_slice(&15_u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_KILL, 1, &req, &mut []),
+        0,
+        "root caller may signal any process"
+    );
+}
+
+#[test]
+fn sigqueue_rejects_unauthorized_cross_uid_target() {
+    let _g = crate::kernel::TestGuard::acquire();
+    set_uid(7, 2000);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 99), &mut []),
+        -(abi::EPERM as i64)
+    );
+    let rt_len = crate::kernel::with_kernel(|k| k.process_mut(7).pending_rt.len());
+    assert_eq!(rt_len, 0, "rejected sigqueue must not enqueue");
+}
+
+#[test]
+fn sched_setscheduler_rejects_unauthorized_cross_uid_target() {
+    let _g = crate::kernel::TestGuard::acquire();
+    set_uid(8, 2000);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SCHED_SETSCHEDULER,
+            1,
+            &sched_setscheduler_req(8, 0, 0),
+            &mut []
+        ),
+        -(abi::EPERM as i64),
+        "guest must not set the scheduler of a process owned by another uid"
+    );
+}
+
 #[test]
 fn killpg_records_signal_for_live_group_members_only() {
     let _g = crate::kernel::TestGuard::acquire();

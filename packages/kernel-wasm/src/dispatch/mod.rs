@@ -184,7 +184,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_SETPGID => setpgid(caller_pid, request),
         METHOD_SYS_GETSID => getsid(caller_pid, request),
         METHOD_SYS_SETSID => setsid(caller_pid),
-        METHOD_SYS_KILL => kill_request(request),
+        METHOD_SYS_KILL => kill_request(caller_pid, request),
         METHOD_SYS_KILLPG => killpg_request(caller_pid, request),
         METHOD_SYS_SIGQUEUE => sigqueue(caller_pid, request),
         METHOD_SYS_SIGWAITINFO => sigwaitinfo(caller_pid, request, response),
