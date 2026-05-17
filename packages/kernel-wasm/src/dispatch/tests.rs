@@ -12661,3 +12661,81 @@ fn stat_lstat_nondir_intermediate_is_enoent_not_enotdir_146_142() {
         "stat via plain non-dir intermediate: ENOENT today — #142"
     );
 }
+
+/// KNOWN INTENTIONAL asymmetry (tracked in #142): after #134 Part 2,
+/// stat() resolves intermediate symlink components but sys_open()
+/// still uses terminal-only follow_symlinks — so a program can stat()
+/// a path it cannot open(). Pins the gap so #142's fix (open parity)
+/// is a deliberate, test-visible change, not a silent one.
+#[test]
+fn stat_open_intermediate_symlink_asymmetry_142() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut reg = (b"/real/f".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/real/f");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    let mut s = (b"/real".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/real");
+    s.extend_from_slice(b"/a/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/a/symdir/f", &mut out),
+        16,
+        "stat resolves the intermediate symlink (#134 Part 2)"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/a/symdir/f"), &mut []),
+        -(abi::ENOENT as i64),
+        "open still terminal-only — cannot open what stat resolved (until #142)"
+    );
+}
+
+/// Co-located regression lock (#134 Part 2): a bound AF_UNIX socket is
+/// not a VFS entry; routing stat through resolve_symlinks_per_component
+/// must still type it S_IFSOCK via write_stat_record — directly AND
+/// when reached through an intermediate symlink (the per-component
+/// helper rewrites the path; write_stat_record types the result). This
+/// was a real mid-implementation regression under the rejected
+/// Approach A; lock it next to the change, not only via the
+/// pre-existing af_unix test.
+#[test]
+fn stat_unix_socket_via_helper_and_intermediate_symlink() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKET_OPEN, 1, &socketpair_req(3, 5, 0), &mut []),
+        3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_BIND,
+            1,
+            &socket_bind_unix_req(3, b"/s.sock"),
+            &mut []
+        ),
+        0
+    );
+    let mut out = [0u8; 16];
+    // Direct: stat through the new per-component helper.
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/s.sock", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        6,
+        "bound AF_UNIX socket types S_IFSOCK through resolve_symlinks_per_component"
+    );
+    // Via an intermediate symlink: /d/up -> "/" ; /d/up/s.sock.
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    let mut sl = (b"/".len() as u32).to_le_bytes().to_vec();
+    sl.extend_from_slice(b"/");
+    sl.extend_from_slice(b"/d/up");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sl, &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/d/up/s.sock", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        6,
+        "socket still S_IFSOCK after the helper resolves the intermediate symlink"
+    );
+}

@@ -491,8 +491,15 @@ fn normalize_readable_path(
     Ok(path)
 }
 
-/// Follow symlinks at `path` (already normalized) up to SYMLOOP_MAX
-/// (40) hops, re-normalizing and re-authorizing each target so a
+/// Maximum symlink dereferences before `-EINVAL` (the historical
+/// "-ELOOP shape"; #69 tracks retargeting to `-ELOOP`). Linux uses
+/// `MAXSYMLINKS = 40`. Shared by `follow_symlinks` (terminal-only,
+/// `sys_open`) and `resolve_symlinks_per_component` (`stat`/`lstat`)
+/// so the bound provably cannot drift between the two.
+const SYMLOOP_MAX: u32 = 40;
+
+/// Follow symlinks at `path` (already normalized) up to `SYMLOOP_MAX`
+/// hops, re-normalizing and re-authorizing each target so a
 /// ramfs link cannot bypass procfs access checks. Returns the
 /// resolved path or a **positive POSIX errno** (`ELOOP` once the hop
 /// limit is exceeded; whatever `normalize_readable_path` raises
@@ -518,7 +525,7 @@ fn follow_symlinks(k: &mut Kernel, caller_pid: u32, path: Vec<u8>) -> Result<Vec
     let mut hops = 0u32;
     while let Some(target) = k.vfs.readlink(&resolved) {
         hops += 1;
-        if hops > 40 {
+        if hops > SYMLOOP_MAX {
             // Too many symlink hops: POSIX/Linux errno is ELOOP
             // (SYMLOOP_MAX = 40), not EINVAL.
             return Err(abi::ELOOP);
@@ -556,8 +563,8 @@ pub(super) fn follow_symlinks_literal(k: &mut Kernel, path: Vec<u8>) -> Result<V
 /// unresolved remainder and re-runs `normalize_readable_path` on the
 /// whole path — the same per-hop lexical-normalize + re-authorize
 /// discipline as `follow_symlinks`, so an intermediate link still
-/// cannot bypass the procfs gate. SYMLOOP capped at 40 (`-EINVAL`,
-/// matching `follow_symlinks`; #69's ELOOP retarget is separate).
+/// cannot bypass the procfs gate. Bounded by the shared
+/// `SYMLOOP_MAX` (`-EINVAL`; #69's ELOOP retarget is separate).
 ///
 /// `follow_terminal == false` (`lstat`) leaves the final component
 /// un-followed; every *intermediate* component is still resolved.
@@ -574,11 +581,13 @@ fn resolve_symlinks_per_component(
     path: Vec<u8>,
     follow_terminal: bool,
 ) -> Result<Vec<u8>, i64> {
-    let mut comps: Vec<Vec<u8>> = path
-        .split(|b| *b == b'/')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_vec())
-        .collect();
+    let split_path = |p: &[u8]| -> Vec<Vec<u8>> {
+        p.split(|b| *b == b'/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_vec())
+            .collect()
+    };
+    let mut comps: Vec<Vec<u8>> = split_path(&path);
     let mut hops = 0u32;
     let mut i = 0usize;
     while i < comps.len() {
@@ -597,7 +606,7 @@ fn resolve_symlinks_per_component(
             continue;
         };
         hops += 1;
-        if hops > 40 {
+        if hops > SYMLOOP_MAX {
             return Err(-(abi::EINVAL as i64));
         }
         // Build an absolute path: an absolute target as-is; a relative
@@ -620,11 +629,7 @@ fn resolve_symlinks_per_component(
             newpath.extend_from_slice(c);
         }
         let renorm = normalize_readable_path(k, caller_pid, &newpath)?;
-        comps = renorm
-            .split(|b| *b == b'/')
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_vec())
-            .collect();
+        comps = split_path(&renorm);
         i = 0;
     }
     if comps.is_empty() {
