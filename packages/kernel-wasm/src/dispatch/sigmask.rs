@@ -118,6 +118,9 @@ pub(super) fn sys_sigtimedwait(ctx: DispatchContext, request: &[u8], response: &
     if request.len() != 18 || response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
+    // request[1] = has_timeout, request[2..18] = timespec: intentionally
+    // ignored on this snapshot path — nonzero-timeout blocking is the
+    // gated stub (spec §11.6/§5.1); the queue-empty case is always EAGAIN.
     let set = expand(request[0]);
     with_kernel(|k| {
         let p = k.process_mut(ctx.caller_pid);

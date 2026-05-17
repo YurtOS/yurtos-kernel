@@ -9899,3 +9899,28 @@ fn sigtimedwait_selects_by_set_even_when_blocked_else_eagain() {
         -(crate::abi::EAGAIN as i64)
     );
 }
+
+#[test]
+fn sigtimedwait_leaves_unselected_queued_signal_in_place() {
+    let _g = crate::kernel::TestGuard::acquire();
+    materialize(1);
+    // queue an RT SIGUSR1 (signo 10, compact slot 7)
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(1, 10, 7), &mut []),
+        0
+    );
+    // sigtimedwait selecting ONLY SIGINT (slot 1) — must NOT consume SIGUSR1
+    let mut req = vec![1u8 << 1, 1u8];
+    req.extend_from_slice(&0i64.to_le_bytes());
+    req.extend_from_slice(&0i64.to_le_bytes());
+    let mut info = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGTIMEDWAIT, 1, &req, &mut info),
+        -(crate::abi::EAGAIN as i64)
+    );
+    // SIGUSR1 must still be queued (selection is by `set`; unselected
+    // signals are left in pending_rt — RT-queue-only, spec §11.6)
+    let still =
+        crate::kernel::with_kernel(|k| k.process_mut(1).pending_rt.iter().any(|s| s.signo == 10));
+    assert!(still, "unselected SIGUSR1 must remain queued");
+}
