@@ -1,11 +1,13 @@
 // The host-side run loop that drives a guest to completion against the Rust
 // kernel through the thin h/k interface.
 //
-// Scope today: a single root process (the common case — every fixture in
-// test-fixtures/wasm/ and every leaf command). Multi-process workloads
-// (sys_spawn / fork / pthread) require the kernel-host-interface-deno
-// process/thread/fork registries; until those are wired here, a queued
-// spawn raises a clear error instead of silently producing a wrong result.
+// Scope: single root process (every fixture and every leaf command) plus
+// multi-process workloads that use sys_spawn + host_wait. Spawn/wait is
+// wired via `mk.runPendingSpawns()`: children the root waited on are
+// pumped re-entrantly from host_wait; any remaining un-waited children are
+// drained idempotently after _start returns. host_fork is still out of
+// scope — it is an -ENOSYS stub and surfaces as a guest errno, not a host
+// throw.
 
 import type {
   KernelHostInterface,
@@ -42,17 +44,10 @@ export function pumpToCompletion(
     }
   }
 
-  // The single-process contract: nothing should be queued. If something is,
-  // the workload needs the multi-process registries — fail loudly rather
-  // than mis-execute.
-  const pending = mk.drainPendingSpawn();
-  if (pending !== null) {
-    throw new Error(
-      "runner: guest requested a child process (sys_spawn/fork), which " +
-        "requires the kernel-host-interface-deno process registry — not yet " +
-        "wired into the Runner. Tracked as the multi-process pump follow-up.",
-    );
-  }
+  // Any children the root queued without itself waiting are drained here;
+  // children the root *did* wait on were already pumped re-entrantly from
+  // host_wait. Idempotent: drains to -ENOENT.
+  mk.runPendingSpawns();
 
   return { exitCode };
 }
