@@ -7762,6 +7762,29 @@ fn waitid_reports_sig64_death_as_cld_killed() {
 }
 
 #[test]
+fn waitid_status_193_stays_cld_exited() {
+    let _g = crate::kernel::TestGuard::acquire();
+    link_child(1, 14);
+    assert_eq!(record_exit(&record_exit_req(14, 193)), 0);
+
+    let mut buf = [0u8; 20];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_WAITID,
+            1,
+            &waitid_req(WAITID_P_PID, 14, WAITID_WEXITED),
+            &mut buf,
+        ),
+        20
+    );
+    let (signo, code, pid, _uid, status) = decode_siginfo(&buf);
+    assert_eq!(signo, SIGCHLD as i32);
+    assert_eq!(code, 1, "CLD_EXITED above the signal-death window");
+    assert_eq!(pid, 14);
+    assert_eq!(status, 193);
+}
+
+#[test]
 fn waitid_normal_exit_stays_cld_exited() {
     // Regression-lock the exit path: a plain code (not in 129..=192)
     // must still be CLD_EXITED with si_status == the code.

@@ -1100,12 +1100,14 @@ pub fn wait_response(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
 /// u32 options LE. Response: 20 bytes — i32 si_signo + i32 si_code +
 /// u32 si_pid + u32 si_uid + i32 si_status, all LE.
 ///
-/// First pass: terminated children only (si_code = CLD_EXITED). The
-/// kernel records a single `exit_status` with no kill/stop/continue
-/// discrimination, so killed-by-signal vs normal-exit and
-/// WSTOPPED/WCONTINUED are out of scope here (tracked: B1.2 siginfo
-/// needs record_exit to carry signal-vs-exit). Blocking behaves like
-/// the sys_wait path — no AsyncBridge yet, so "would block" is -EAGAIN.
+/// First pass: terminated children only. The kernel decodes the current
+/// $?-style status convention: 129..=192 is CLD_KILLED with
+/// si_status = status - 128, and every other status is CLD_EXITED with
+/// si_status = status. This remains lossy until #99 carries an explicit
+/// exit-vs-signal discriminator, so literal exit codes 129..=192 are
+/// reported as signal deaths and CLD_DUMPED is not expressible.
+/// WSTOPPED/WCONTINUED are out of scope here. Blocking behaves like the
+/// sys_wait path — no AsyncBridge yet, so "would block" is -EAGAIN.
 /// Effective process group of `pid` under the lazy-zero model: a
 /// stored `pgid` of 0 means "inherited", not "own group". A process
 /// spawned before its parent materialized a group inherits 0, and is
