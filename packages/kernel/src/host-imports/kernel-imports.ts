@@ -43,6 +43,7 @@ import type {
   ProcessKernel,
   SpawnRequest,
 } from "../process/kernel.js";
+import { FdDupMinError, POSIX_EINVAL } from "../process/kernel.js";
 import {
   normalizeNice,
   normalizeSchedulerPolicy,
@@ -2542,7 +2543,7 @@ export function createKernelImports(
     // POSIX F_DUPFD/F_DUPFD_CLOEXEC: duplicate into the lowest free fd >= min_fd.
     host_dup_min(srcFd: number, minFd: number): number {
       if (isActivePreopenFd(srcFd)) return -1;
-      if (minFd < 0) return -1;
+      if (minFd < 0) return -POSIX_EINVAL;
       try {
         const kernelTarget = opts.kernel?.getFdTarget(callerPid, srcFd);
         if (opts.kernel && kernelTarget) {
@@ -2551,7 +2552,8 @@ export function createKernelImports(
         }
         const newFd = opts.wasiHost?.duplicateFdMin(srcFd, minFd, false);
         return newFd ?? -1;
-      } catch {
+      } catch (err) {
+        if (err instanceof FdDupMinError) return -err.errno;
         return -1;
       }
     },

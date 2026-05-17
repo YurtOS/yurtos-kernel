@@ -55,6 +55,7 @@ pub const KERNEL_RT_SIGNAL_QUEUE_CAP: usize = 1024;
 /// Number of POSIX rlimit slots tracked. Matches the TS kernel's
 /// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
 pub const RLIMIT_SLOTS: usize = 8;
+pub const RLIMIT_NOFILE: usize = 7;
 
 /// Kernel-owned execution state for one user thread. Host backends may
 /// map this to a Worker, a wasmtime task, or a cooperative stack, but
@@ -192,8 +193,15 @@ impl FdTable {
     }
 
     pub fn lowest_free_fd_at(&self, min_fd: u32) -> Option<u32> {
+        self.lowest_free_fd_below(min_fd, u64::from(u32::MAX) + 1)
+    }
+
+    pub fn lowest_free_fd_below(&self, min_fd: u32, exclusive_limit: u64) -> Option<u32> {
         let mut n = min_fd;
         loop {
+            if u64::from(n) >= exclusive_limit {
+                return None;
+            }
             if !self.entries.contains_key(&n) {
                 return Some(n);
             }
@@ -279,7 +287,7 @@ pub const DEFAULT_RLIMITS: [Option<ResourceLimit>; RLIMIT_SLOTS] = [
     Some((0, 0)),                               // 4 RLIMIT_CORE
     Some((64 * 1024 * 1024, 64 * 1024 * 1024)), // 5 RLIMIT_RSS
     Some((1024, 1024)),                         // 6 RLIMIT_NPROC
-    Some((1024, 1024)),                         // 7 RLIMIT_NOFILE
+    Some((1024, 1024)),                         // RLIMIT_NOFILE
 ];
 
 /// One queued POSIX real-time signal (`sigqueue`). Carries the payload
@@ -1963,6 +1971,12 @@ mod tests {
         with_kernel(|k| k.process_mut(2).umask = 0o022);
         assert_eq!(with_kernel(|k| k.process_mut(1).umask), 0o077);
         assert_eq!(with_kernel(|k| k.process_mut(2).umask), 0o022);
+    }
+
+    #[test]
+    fn lowest_free_fd_at_returns_none_when_u32_max_is_occupied() {
+        let table = FdTable::from_entries(vec![(u32::MAX, FdEntry::Stdin)]);
+        assert_eq!(table.lowest_free_fd_at(u32::MAX), None);
     }
 
     #[test]

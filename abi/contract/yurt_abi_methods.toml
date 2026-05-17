@@ -186,7 +186,7 @@ doc = "Duplicate oldfd to exactly newfd, silently closing newfd first if it was 
 [method.sys_dup_min]
 id = 0x1_0054
 kind = "syscall"
-doc = "POSIX fcntl(F_DUPFD): duplicate oldfd into the lowest free fd >= min_fd. Request bytes carry two u32s: oldfd, min_fd. Returns the new fd on success, -EBADF for a closed oldfd, or -EINVAL if no fd number is available."
+doc = "POSIX fcntl(F_DUPFD): duplicate oldfd into the lowest free fd >= min_fd. Request bytes carry two u32s: oldfd, min_fd. Returns the new fd on success, -EBADF for a closed oldfd, -EINVAL for an out-of-range min_fd, or -EMFILE if no fd number is available below RLIMIT_NOFILE."
 
 [method.sys_set_fd_descriptor_flags]
 id = 0x1_0055

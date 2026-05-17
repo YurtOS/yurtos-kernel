@@ -50,7 +50,6 @@ pub const ELOOP: i32 = 40;
 pub const EACCES: i32 = 13;
 #[allow(dead_code)]
 pub const ENFILE: i32 = 23;
-#[allow(dead_code)]
 pub const EMFILE: i32 = 24;
 #[allow(dead_code)]
 pub const ERANGE: i32 = 34;
