@@ -1014,7 +1014,7 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
         // the result.
         let path = match resolve_symlinks_per_component(k, caller_pid, path, true) {
             Ok(path) => path,
-            Err(errno) => return -(errno as i64),
+            Err(rc) => return rc,
         };
         write_stat_record(k, &path, response)
     })
