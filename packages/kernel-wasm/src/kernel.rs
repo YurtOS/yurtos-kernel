@@ -1924,7 +1924,15 @@ impl TestGuard {
         static TEST_LOCK: Mutex<()> = Mutex::new(());
         let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_for_tests();
+        crate::kh::test_support::clear_random_results();
         Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        crate::kh::test_support::clear_random_results();
     }
 }
 

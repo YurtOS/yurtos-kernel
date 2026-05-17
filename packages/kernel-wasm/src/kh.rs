@@ -659,6 +659,10 @@ pub mod test_support {
         RANDOM_RESULTS.with(|results| results.borrow_mut().pop_front())
     }
 
+    pub fn clear_random_results() {
+        RANDOM_RESULTS.with(|results| results.borrow_mut().clear());
+    }
+
     #[derive(Default)]
     struct SocketMock {
         connect_results: VecDeque<i32>,
@@ -1154,5 +1158,15 @@ mod tests {
         let mut buf = [0u8; 8];
 
         assert_eq!(fill_random(&mut buf), Err(-crate::abi::EFAULT));
+    }
+
+    #[test]
+    fn test_guard_clears_stale_random_results() {
+        test_support::push_random_result(Err(-crate::abi::EFAULT));
+        let _g = crate::kernel::TestGuard::acquire();
+
+        let mut buf = [0u8; 8];
+
+        fill_random(&mut buf).expect("stale injected error was cleared");
     }
 }

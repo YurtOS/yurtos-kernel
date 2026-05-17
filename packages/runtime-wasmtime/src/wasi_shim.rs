@@ -70,11 +70,16 @@ fn errno_from_kernel(rc: i64) -> i32 {
 }
 
 fn checked_wasi_guest_len(len: u32) -> std::result::Result<usize, i32> {
-    checked_guest_buffer_len(len).map_err(|_| EFAULT)
+    checked_guest_buffer_len(len).map_err(|_| EINVAL)
 }
 
 fn checked_wasi_guest_sum(parts: &[u32]) -> std::result::Result<usize, i32> {
-    checked_guest_buffer_sum(parts).map_err(|_| EFAULT)
+    checked_guest_buffer_sum(parts).map_err(|_| EINVAL)
+}
+
+fn checked_wasi_iovec_bytes(iovs_len: u32) -> std::result::Result<usize, i32> {
+    let bytes = iovs_len.checked_mul(8).ok_or(EINVAL)?;
+    checked_wasi_guest_len(bytes)
 }
 
 pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
@@ -93,11 +98,16 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 None => return EINVAL,
             };
 
+            let iovs_cap = match checked_wasi_iovec_bytes(iovs_len) {
+                Ok(n) => n / 8,
+                Err(rc) => return rc,
+            };
+
             // Read each iovec, accumulate the payload, then write all
             // at once — a single sys_write call per fd_write keeps the
             // semantics simple (fd_write is allowed to be one
             // logical write).
-            let mut iovs: Vec<(u32, u32)> = Vec::new();
+            let mut iovs: Vec<(u32, u32)> = Vec::with_capacity(iovs_cap);
             let mut total_len: u32 = 0;
             for i in 0..iovs_len {
                 let iov_addr = iovs_ptr as usize + (i as usize) * 8;
@@ -169,8 +179,13 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 None => return EINVAL,
             };
 
+            let iovs_cap = match checked_wasi_iovec_bytes(iovs_len) {
+                Ok(n) => n / 8,
+                Err(rc) => return rc,
+            };
+
             // Compute total capacity across iovecs.
-            let mut iovs: Vec<(u32, u32)> = Vec::new();
+            let mut iovs: Vec<(u32, u32)> = Vec::with_capacity(iovs_cap);
             let mut total_cap: u32 = 0;
             for i in 0..iovs_len {
                 let iov_addr = iovs_ptr as usize + (i as usize) * 8;
@@ -1029,7 +1044,7 @@ mod tests {
     fn checked_wasi_guest_len_rejects_oversized_allocations() {
         assert_eq!(
             checked_wasi_guest_len(MAX_GUEST_BUFFER_LEN + 1),
-            Err(EFAULT)
+            Err(EINVAL)
         );
     }
 
@@ -1037,7 +1052,20 @@ mod tests {
     fn checked_wasi_guest_sum_rejects_oversized_iovec_total() {
         assert_eq!(
             checked_wasi_guest_sum(&[MAX_GUEST_BUFFER_LEN, 1]),
-            Err(EFAULT)
+            Err(EINVAL)
         );
+    }
+
+    #[test]
+    fn checked_wasi_iovec_bytes_rejects_too_many_descriptors() {
+        assert_eq!(
+            checked_wasi_iovec_bytes((MAX_GUEST_BUFFER_LEN / 8) + 1),
+            Err(EINVAL)
+        );
+    }
+
+    #[test]
+    fn checked_wasi_iovec_bytes_rejects_descriptor_byte_overflow() {
+        assert_eq!(checked_wasi_iovec_bytes(u32::MAX), Err(EINVAL));
     }
 }
