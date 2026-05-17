@@ -16,12 +16,7 @@
  */
 
 import { assertEquals, assertGreater } from "@std/assert";
-import {
-  defaultHostState,
-  KernelHostInterface,
-  METHOD,
-  s,
-} from "../mod.ts";
+import { defaultHostState, KernelHostInterface, METHOD, s } from "../mod.ts";
 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,7 +62,10 @@ async function freshKernelHostInterface(): Promise<KernelHostInterface> {
   return await KernelHostInterface.load(await kernelWasm(), defaultHostState());
 }
 
-async function fixtureWasm(crateName: string, artifact: string): Promise<Uint8Array> {
+async function fixtureWasm(
+  crateName: string,
+  artifact: string,
+): Promise<Uint8Array> {
   const targetDir = Deno.env.get("CARGO_TARGET_DIR") ??
     join(workspaceRoot(), "target");
   const path = join(targetDir, "wasm32-wasip1", "release", `${artifact}.wasm`);
@@ -92,7 +90,10 @@ async function fixtureWasm(crateName: string, artifact: string): Promise<Uint8Ar
 }
 
 /** Build the SYS_SPAWN wire request: u32 path_len + path + (u32 arg_len + arg)* */
-function encodeSysSpawnRequest(path: Uint8Array, argv: Uint8Array[]): Uint8Array {
+function encodeSysSpawnRequest(
+  path: Uint8Array,
+  argv: Uint8Array[],
+): Uint8Array {
   let len = 4 + path.byteLength;
   for (const arg of argv) len += 4 + arg.byteLength;
   const req = new Uint8Array(len);
@@ -163,10 +164,10 @@ const WASM_E = hexToBytes(
  * Run a minimal wasm module (built with the pattern above) as a user process.
  * Catches proc_exit(n) and returns n.  Re-throws any other error.
  */
-async function runMalformedSpawnCase(
+function runMalformedSpawnCase(
   mk: KernelHostInterface,
   wasmBytes: Uint8Array,
-): Promise<number> {
+): number {
   const user = mk.spawnUserProcessWithArgs(wasmBytes, [s("test")]);
   let exitCode = 0;
   try {
@@ -192,36 +193,52 @@ Deno.test("host_spawn returns clean errno for malformed yurt_spawn_request_v1 bu
   // (a) bytes.length < 88 → -22 (EINVAL: header too short)
   {
     const mk = await freshKernelHostInterface();
-    const rc = await runMalformedSpawnCase(mk, WASM_A);
-    assertEquals(rc, -22, `case (a): expected -22 for too-short request, got ${rc}`);
+    const rc = runMalformedSpawnCase(mk, WASM_A);
+    assertEquals(
+      rc,
+      -22,
+      `case (a): expected -22 for too-short request, got ${rc}`,
+    );
   }
 
   // (b) version != 1 → -22 (EINVAL: unknown record version)
   {
     const mk = await freshKernelHostInterface();
-    const rc = await runMalformedSpawnCase(mk, WASM_B);
+    const rc = runMalformedSpawnCase(mk, WASM_B);
     assertEquals(rc, -22, `case (b): expected -22 for bad version, got ${rc}`);
   }
 
   // (c) logicalSize > bytes.length → -75 (EOVERFLOW)
   {
     const mk = await freshKernelHostInterface();
-    const rc = await runMalformedSpawnCase(mk, WASM_C);
-    assertEquals(rc, -75, `case (c): expected -75 for logicalSize overflow, got ${rc}`);
+    const rc = runMalformedSpawnCase(mk, WASM_C);
+    assertEquals(
+      rc,
+      -75,
+      `case (c): expected -75 for logicalSize overflow, got ${rc}`,
+    );
   }
 
   // (d) argsCount=5, argsVecOff=0 → -22 (EINVAL: null vec with non-zero count)
   {
     const mk = await freshKernelHostInterface();
-    const rc = await runMalformedSpawnCase(mk, WASM_D);
-    assertEquals(rc, -22, `case (d): expected -22 for null args vec, got ${rc}`);
+    const rc = runMalformedSpawnCase(mk, WASM_D);
+    assertEquals(
+      rc,
+      -22,
+      `case (d): expected -22 for null args vec, got ${rc}`,
+    );
   }
 
   // (e) prog span offset=5 (misaligned, not a multiple of 4) → -22 (EINVAL)
   {
     const mk = await freshKernelHostInterface();
-    const rc = await runMalformedSpawnCase(mk, WASM_E);
-    assertEquals(rc, -22, `case (e): expected -22 for misaligned prog span, got ${rc}`);
+    const rc = runMalformedSpawnCase(mk, WASM_E);
+    assertEquals(
+      rc,
+      -22,
+      `case (e): expected -22 for misaligned prog span, got ${rc}`,
+    );
   }
 });
 
@@ -288,7 +305,11 @@ Deno.test("runPendingSpawns drains child-exit7 and SYS_WAIT returns status 7", a
     waitReq,
     8,
   );
-  assertEquals(Number(waitRc), 8, `SYS_WAIT should return 8 bytes, got ${waitRc}`);
+  assertEquals(
+    Number(waitRc),
+    8,
+    `SYS_WAIT should return 8 bytes, got ${waitRc}`,
+  );
 
   // Decode kernel 8-byte response: u32 exitedPid@0, i32 status@4
   const resp = new DataView(response.buffer, response.byteOffset, 8);

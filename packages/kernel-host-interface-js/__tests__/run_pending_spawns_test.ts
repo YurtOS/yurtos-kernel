@@ -11,7 +11,7 @@
  */
 
 import { assertEquals } from "@std/assert";
-import { KernelHostInterface, defaultHostState } from "../mod.ts";
+import { defaultHostState, KernelHostInterface } from "../mod.ts";
 
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";

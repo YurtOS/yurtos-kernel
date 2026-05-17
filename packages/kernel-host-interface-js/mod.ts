@@ -2041,15 +2041,21 @@ class CachedProcessEngine {
    * and the 256-limit would never fire across nesting boundaries.
    */
   private drainDepth = 0;
-  /** Shared depth ref object threaded into every buildUserYurtImports call. */
+  /** Shared depth ref object threaded into every buildUserYurtImports call.
+   * Reads/writes the engine-instance drainDepth so the counter is shared
+   * across nested parent→child host_wait closures (I3). */
   private get drainDepthRef(): { value: number } {
-    // Return a proxy-like object that reads/writes this.drainDepth.
-    // Re-created each access is fine: the object is only used within a single
-    // synchronous call frame and the field reference is stable.
-    const self = this;
+    const get = () => this.drainDepth;
+    const set = (v: number) => {
+      this.drainDepth = v;
+    };
     return {
-      get value() { return self.drainDepth; },
-      set value(v: number) { self.drainDepth = v; },
+      get value() {
+        return get();
+      },
+      set value(v: number) {
+        set(v);
+      },
     };
   }
 
