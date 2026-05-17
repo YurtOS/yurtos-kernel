@@ -464,13 +464,38 @@ export interface DispatcherTarget {
 export interface WorkerHostDispatcherContext {
   callerTid?: number;
   /**
-   * Per-process serializer shared by every worker pthread of one
-   * process (created in `defaultSpawnThread`). Bodies run inside it so
-   * an awaiting body never lets a peer worker's body interleave and
-   * observe half-mutated kernel state. Omitted (test / single-worker
-   * paths) → a fresh per-dispatcher serializer is used.
+   * Explicit per-process serializer. Normally omitted: the dispatcher
+   * defaults to one serializer per `bodies` object (see
+   * `serializerForBodies`), which is exactly the per-process scope —
+   * `makeWorkerDispatcherBodies` returns one `bodies` per process and
+   * every worker pthread of that process attaches with it. Pass this
+   * only to override that default (e.g. a custom spawner).
    */
   serializer?: WorkerHostSerializer;
+}
+
+/**
+ * One serializer per `bodies` object. `makeWorkerDispatcherBodies`
+ * returns a fresh closure per process, so keying the lock off the
+ * bodies identity gives "one lock per process, shared across all of
+ * that process's spawned worker threads" (Task 10) without threading
+ * the serializer through every spawn call. A `WeakMap` so a finished
+ * process's bodies (and its serializer) are collectable.
+ */
+const serializersByBodies = new WeakMap<
+  WorkerHostDispatcherBodies,
+  WorkerHostSerializer
+>();
+
+function serializerForBodies(
+  bodies: WorkerHostDispatcherBodies,
+): WorkerHostSerializer {
+  let s = serializersByBodies.get(bodies);
+  if (!s) {
+    s = new WorkerHostSerializer();
+    serializersByBodies.set(bodies, s);
+  }
+  return s;
 }
 
 /**
@@ -496,7 +521,7 @@ export function attachWorkerHostDispatcher(
   const header = new Int32Array(sab, 0, HEADER_WORDS);
   const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
   const payloadBytes = new Uint8Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_BYTES);
-  const serializer = context.serializer ?? new WorkerHostSerializer();
+  const serializer = context.serializer ?? serializerForBodies(bodies);
 
   worker.addEventListener("message", (e: MessageEvent) => {
     const msg = e.data;

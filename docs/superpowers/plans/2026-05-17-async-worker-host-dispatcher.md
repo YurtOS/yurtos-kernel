@@ -41,11 +41,14 @@ directly.
   rejection-isolated chain.
 - `packages/kernel/src/process/threads/worker-host-proxy.ts` (modify) —
   `WorkerHostDispatcherBodies` return types → awaitable;
-  `WorkerHostDispatcherContext` gains `serializer?`;
-  `attachWorkerHostDispatcher` handler → async + serialized + awaits bodies.
-- `packages/kernel/src/process/threads/worker-sab.ts` (modify) —
-  `defaultSpawnThread` creates one `WorkerHostSerializer` per process and passes
-  it to every `attachWorkerHostDispatcher`.
+  `WorkerHostDispatcherContext` gains an optional `serializer?` override;
+  `attachWorkerHostDispatcher` handler → async + serialized + awaits bodies; the
+  per-process serializer defaults to one-per-`bodies`-object via a module
+  `WeakMap` (`serializerForBodies`). **Design refinement:** keying the lock off
+  the `bodies` identity already gives per-process scope
+  (`makeWorkerDispatcherBodies` returns one `bodies` per process; every worker
+  pthread attaches with it), so **no `worker-sab.ts` change is needed** —
+  superseding the original Task 3 plumbing.
 - `packages/kernel/src/process/threads/__tests__/worker-host-serializer_test.ts`
   (create) — serializer unit tests.
 - `packages/kernel/src/process/threads/__tests__/worker-host-proxy_test.ts`
@@ -97,23 +100,33 @@ directly.
       `worker-bodies_test.ts` + `worker-thread-host_test.ts`).
 - [ ] **Step 6: Commit.**
 
-### Task 3: Per-process serializer wiring
+### Task 3: Per-process serializer default (per-`bodies`)
 
 **Files:**
 
-- Modify: `packages/kernel/src/process/threads/worker-sab.ts`
+- Modify: `packages/kernel/src/process/threads/worker-host-proxy.ts`
+  (`serializerForBodies` `WeakMap` default)
 - Test:
   `packages/kernel/src/process/threads/__tests__/worker-host-proxy_test.ts`
-  (cross-worker serialization case)
+  (per-process / shared-`bodies` serialization case)
 
-- [ ] **Step 1: Failing test** — two workers spawned via one
-      `defaultSpawnThread` share a serializer (kernel mutations FIFO across
-      workers).
-- [ ] **Step 2: Verify RED.**
-- [ ] **Step 3: Implement** — `const serializer = new WorkerHostSerializer()` in
-      `defaultSpawnThread` closure; pass `{ callerTid: tid, serializer }`.
-- [ ] **Step 4: Verify GREEN.**
-- [ ] **Step 5: Full local gate**
-      (`deno test --no-check --unstable-sloppy-imports 'packages/kernel/src/process/threads/**/*_test.ts'`,
-      `deno fmt --check`, `deno lint`, `deno check`).
+**Refinement:** the original plan threaded a serializer through
+`defaultSpawnThread`; instead the default serializer is keyed off the `bodies`
+object identity (`WeakMap`). Since every worker pthread of a process attaches
+with the same per-process `bodies` (from `makeWorkerDispatcherBodies` via
+`defaultSpawnThread`), this yields the required per-process scope with **zero
+`worker-sab.ts` / loader plumbing**, and stays overridable via
+`context.serializer`.
+
+- [x] **Step 1: Failing test** — two dispatchers, two SABs, same `bodies`, NO
+      explicit serializer ⇒ bodies must be FIFO-serialized.
+- [x] **Step 2: Verify RED** (per-attach `new WorkerHostSerializer()` let worker
+      B's body run while A awaited).
+- [x] **Step 3: Implement** — module `WeakMap<bodies, serializer>`;
+      `context.serializer ?? serializerForBodies(bodies)`.
+- [x] **Step 4: Verify GREEN** (58 threads/bodies tests pass; `deno
+      check`
+      clean on proxy + worker-bodies + worker-sab ripple).
+- [ ] **Step 5: Full local gate** (changed-file fmt/lint/check + the kernel unit
+      suite guest-compat runs).
 - [ ] **Step 6: Commit.**

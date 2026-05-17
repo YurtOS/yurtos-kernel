@@ -553,3 +553,64 @@ Deno.test(
     assertEquals(Atomics.load(headerB, 1), 42);
   },
 );
+
+Deno.test(
+  "worker-host-proxy: dispatchers sharing one bodies object are " +
+    "serialized per-process without an explicit serializer (Task 10 pt3)",
+  async () => {
+    // makeWorkerDispatcherBodies returns one bodies object per process;
+    // every worker pthread of that process attaches its own dispatcher
+    // with the SAME bodies object. Cross-worker kernel-state mutations
+    // must stay FIFO even when no serializer is threaded through the
+    // context — the per-process lock is keyed off the bodies identity.
+    const sabA = new SharedArrayBuffer(REQUEST_SAB_BYTES);
+    const sabB = new SharedArrayBuffer(REQUEST_SAB_BYTES);
+    const headerA = new Int32Array(sabA, 0, HEADER_WORDS);
+    const headerB = new Int32Array(sabB, 0, HEADER_WORDS);
+    const payloadA = new Int32Array(sabA, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
+    const payloadB = new Int32Array(sabB, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
+
+    const gateA = deferred<void>();
+    const order: string[] = [];
+    const bodies: WorkerHostDispatcherBodies = {
+      ...noopBodies(),
+      writeFd: async () => {
+        order.push("A:start");
+        await gateA.promise;
+        order.push("A:end");
+        return 0;
+      },
+      socketOpen: () => {
+        order.push("B:run");
+        return 1;
+      },
+    };
+
+    const a = captureHandler();
+    const b = captureHandler();
+    // No `serializer` in context — the per-process default must still
+    // serialize because both share `bodies`.
+    attachWorkerHostDispatcher(a.target, sabA, bodies);
+    attachWorkerHostDispatcher(b.target, sabB, bodies);
+
+    payloadA[OP_WORD] = WorkerHostOp.WriteFd;
+    payloadA[ARGC_WORD] = 2;
+    payloadA[ARGS_WORD + 0] = 1;
+    payloadA[ARGS_WORD + 1] = 0;
+    Atomics.store(headerA, 0, STATUS_REQUEST_READY);
+    payloadB[OP_WORD] = WorkerHostOp.SocketOpen;
+    payloadB[ARGC_WORD] = 3;
+    Atomics.store(headerB, 0, STATUS_REQUEST_READY);
+
+    const pA = a.invoke();
+    const pB = b.invoke();
+    await new Promise<void>((r) => setTimeout(r, 0));
+
+    assertEquals(order, ["A:start"]); // B held behind A
+
+    gateA.resolve();
+    await pA;
+    await pB;
+    assertEquals(order, ["A:start", "A:end", "B:run"]);
+  },
+);
