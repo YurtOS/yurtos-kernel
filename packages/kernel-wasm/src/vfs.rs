@@ -1213,6 +1213,28 @@ mod tests {
     }
 
     #[test]
+    fn ramfs_root_inode_zero_never_collides_with_minted_ids() {
+        // Foundational invariant the whole inode anchor rests on: the
+        // mount-root dir inode is the reserved id 0, and `next_id`
+        // starts at 1, so NO minted file or subdirectory inode can ever
+        // be 0. If a future change set `next_id: 0`, root and the first
+        // minted entry would alias and dirfd/cwd anchoring would
+        // silently corrupt. Pin it across both id-minting paths
+        // (`mkdir` dirs and `install` files), not just `assert_ne!`.
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.dir_inode(b"/"), Some(0), "root is the reserved inode 0");
+        for name in ["/a", "/b", "/a/c"] {
+            assert_eq!(b.mkdir(name.as_bytes()), 0);
+            let id = b.dir_inode(name.as_bytes()).unwrap();
+            assert_ne!(id, 0, "minted dir inode for {name} collided with root");
+        }
+        for name in ["/f", "/a/g", "/a/c/h"] {
+            let id = b.install(name.as_bytes().to_vec(), b"x".to_vec());
+            assert_ne!(id, 0, "minted file inode for {name} collided with root");
+        }
+    }
+
+    #[test]
     fn ramfs_dir_rename_recursively_rekeys_children() {
         let mut b = RamfsBackend::new();
         assert_eq!(b.mkdir(b"/base"), 0);
