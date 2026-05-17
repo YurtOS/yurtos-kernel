@@ -163,6 +163,10 @@ export const METHOD = {
   SYS_UTIMENS: 0x1_0024,
   SYS_UNLINK: 0x1_0025,
   SYS_STAT: 0x1_0026,
+  // lstat is in the B2 fd/vfs id block (0x1_0070–0x1_007F), grouped
+  // here next to stat for readability — see the method-id partition
+  // in abi/contract/yurt_abi_methods.toml. Issue #81.
+  SYS_LSTAT: 0x1_0078,
   SYS_SYMLINK: 0x1_0027,
   SYS_READLINK: 0x1_0028,
   SYS_MKDIR: 0x1_0029,

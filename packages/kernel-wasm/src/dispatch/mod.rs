@@ -22,8 +22,8 @@ mod socket;
 mod thread;
 
 use fs::{
-    chdir, chmod, chown, fchdir, fchown, getcwd, hard_link, mkdir, readdir, readlink, realpath,
-    rename, rmdir, stat_path, symlink, sys_open, sys_openat, unlink, utimens,
+    chdir, chmod, chown, fchdir, fchown, getcwd, hard_link, lstat_path, mkdir, readdir, readlink,
+    realpath, rename, rmdir, stat_path, symlink, sys_open, sys_openat, unlink, utimens,
 };
 use process::{
     close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
@@ -203,6 +203,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_UTIMENS => utimens(caller_pid, request),
         METHOD_SYS_UNLINK => unlink(caller_pid, request),
         METHOD_SYS_STAT => stat_path(caller_pid, request, response),
+        METHOD_SYS_LSTAT => lstat_path(caller_pid, request, response),
         METHOD_SYS_SYMLINK => symlink(caller_pid, request),
         METHOD_SYS_READLINK => readlink(caller_pid, request, response),
         METHOD_SYS_MKDIR => mkdir(caller_pid, request),
