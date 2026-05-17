@@ -133,6 +133,27 @@ fn may_control_pid(k: &mut crate::kernel::Kernel, caller_pid: u32, target: u32) 
     }
 }
 
+/// `/proc/<pid>` visibility predicate for the #105 / M8 oracle fix.
+///
+/// Thin, in-crate consumer of #66's `may_control_pid` ownership gate
+/// (do NOT alter that gate — it is #77's). `Ok(())` from
+/// `may_control_pid` means the caller may see `target` (self,
+/// same-owner, or root); any `Err` (`-EPERM` unauthorized, `-ESRCH`
+/// absent) means the pid must be *invisible*. The dispatch/fs layer
+/// uses this to (a) collapse "present-but-unauthorized" and "absent"
+/// into a single `-ENOENT` on `/proc/<pid>` lookups and (b) filter
+/// `readdir("/proc")` to only the pids the caller may enumerate.
+///
+/// No ABI change: this is a pure in-crate predicate over the existing
+/// process table and #66 credential model.
+pub(crate) fn proc_pid_visible(
+    k: &mut crate::kernel::Kernel,
+    caller_pid: u32,
+    target: u32,
+) -> bool {
+    may_control_pid(k, caller_pid, target).is_ok()
+}
+
 fn normalize_nice(nice: i32) -> i32 {
     nice.clamp(NICE_MIN, NICE_MAX)
 }

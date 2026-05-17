@@ -1393,18 +1393,14 @@ impl Kernel {
         self.vfs.refresh_processes(&snaps);
     }
 
-    pub fn can_read_proc_path(&mut self, caller_pid: Pid, path: &[u8]) -> bool {
-        let Some(target_pid) = crate::path::proc_target_pid(path) else {
-            return true;
-        };
-        if target_pid == caller_pid {
-            return true;
-        }
-        if !self.has_process(target_pid) {
-            return true;
-        }
-        self.process(caller_pid).credentials.euid == 0
-    }
+    // NOTE (#105 / M8): the former `can_read_proc_path` lived here and
+    // returned `false` (→ -EPERM at the call site) for a *present-but-
+    // unauthorized* /proc/<pid>, but `true` for an *absent* pid (→
+    // -ENOENT from the backend). That EPERM-vs-ENOENT split was a
+    // cross-tenant pid-existence oracle. The visibility decision now
+    // lives at the dispatch/fs layer (`proc_path_reachable`) and
+    // consumes #66's `may_control_pid` so absent and unauthorized are
+    // indistinguishable (uniform -ENOENT).
 
     pub fn list_processes(&self) -> Vec<ProcessListEntry> {
         self.processes

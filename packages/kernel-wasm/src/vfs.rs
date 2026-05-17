@@ -1337,7 +1337,13 @@ impl VfsBackend for ProcBackend {
     }
 
     fn readdir(&self, path: &[u8]) -> Option<Vec<Vec<u8>>> {
-        if path == b"/" {
+        // The VFS resolver hands the mount root in as "" (path == the
+        // mount prefix) and any explicit /proc/ as "/". Treat both as
+        // the procfs root: the per-pid entry list. Returning Some([])
+        // for an empty table keeps "/proc" a valid (empty) directory
+        // rather than ENOENT. Per-pid filtering for the #105 oracle
+        // happens in the dispatch layer (it owns caller_pid).
+        if path.is_empty() || path == b"/" {
             let mut pids = Vec::new();
             for key in self.entries.keys() {
                 let rest = key.strip_prefix(b"/")?;
