@@ -30,3 +30,10 @@
 #   case   = "<case-name>"     # the spec.toml [[case]].name
 #   slice  = "B<n>"            # owning slice that will fix it
 #   reason = "<why ts and wasm differ today>"
+
+[[divergence]]
+canary = "posix-runtime-canary"
+case = "openat_rename_stability"
+slice = "TODO"  # owning slice that will fix this row (B1..B6 — reads as a TS-retirement divergence; reviewer sets per the seeding process above)
+# observed: B2.9 made the Rust kernel.wasm dirfd inode-anchored (POSIX-faithful): open(dir,O_DIRECTORY); rename(dir); openat(fd,"x",O_CREAT) creates renamed/x and exits openat_rename_stability:ok. The TS kernel's dirFds is a Map<fd,string> path snapshot (wasi-host.ts:409), so after the rename openat resolves the stale base path and the case fails — a genuine, reproducible exit/stdout divergence, not allowlisting a matching pair.
+reason = "Rust POSIX-faithful dirfd; TS path-snapshot — retired with the TS kernel"

@@ -21,7 +21,7 @@ retirement readiness, not whether a first implementation exists.
 | fd             | host_close_fd                                                                                             | METHOD_SYS_CLOSE                                                                                                                                                                                                                                                                                                                                                                                               | kernel-wasm fd table                           | all KH adapters                    | partial            | close/pipe EOF/EPIPE tests                                    |
 | fd             | host_poll                                                                                                 | METHOD_SYS_POLL                                                                                                                                                                                                                                                                                                                                                                                                | kernel-wasm fd table and socket state          | all KH adapters                    | partial            | poll dispatch tests, libzmq reactor reproducer                |
 | fd             | host_isatty, host_tcgetpgrp, host_tcsetpgrp, host_tcgetattr, host_tcsetattr, host_winsize, host_tiocsctty | METHOD_SYS_ISATTY, METHOD_SYS_TCGETPGRP, METHOD_SYS_TCSETPGRP, METHOD_SYS_TCGETATTR, METHOD_SYS_TCSETATTR, METHOD_SYS_WINSIZE, METHOD_SYS_TIOCSCTTY                                                                                                                                                                                                                                                            | kernel-wasm TTY state                          | all KH adapters                    | partial            | shell ergonomics, tty/job-control tests                       |
-| fs             | host_open/stat/readlink/readdir, host_chown/host_fchown/host_fchdir, and path ops                         | METHOD_SYS_OPEN, METHOD_SYS_LSEEK, METHOD_SYS_FSTAT, METHOD_SYS_CHMOD, METHOD_SYS_CHOWN, METHOD_SYS_FCHOWN, METHOD_SYS_FCHDIR, METHOD_SYS_UTIMENS, METHOD_SYS_UNLINK, METHOD_SYS_STAT, METHOD_SYS_SYMLINK, METHOD_SYS_READLINK, METHOD_SYS_MKDIR, METHOD_SYS_RMDIR, METHOD_SYS_READDIR, METHOD_SYS_LINK, METHOD_SYS_RENAME, METHOD_SYS_REALPATH, METHOD_SYS_CHDIR, METHOD_SYS_GETCWD, METHOD_SYS_UMASK         | kernel-wasm VFS                                | KH real-fs adapter for host mounts | partial            | VFS tests, overlay tests, file-conformance, busybox/coreutils |
+| fs             | host_open/stat/readlink/readdir, host_chown/host_fchown/host_fchdir, and path ops                         | METHOD_SYS_OPEN, METHOD_SYS_LSEEK, METHOD_SYS_FSTAT, METHOD_SYS_CHMOD, METHOD_SYS_CHOWN, METHOD_SYS_FCHOWN, METHOD_SYS_FCHDIR, METHOD_SYS_UTIMENS, METHOD_SYS_UNLINK, METHOD_SYS_STAT, METHOD_SYS_SYMLINK, METHOD_SYS_READLINK, METHOD_SYS_MKDIR, METHOD_SYS_RMDIR, METHOD_SYS_READDIR, METHOD_SYS_LINK, METHOD_SYS_RENAME, METHOD_SYS_REALPATH, METHOD_SYS_CHDIR, METHOD_SYS_GETCWD, METHOD_SYS_UMASK         | kernel-wasm VFS                                | KH real-fs adapter for host mounts | partial            | VFS tests, overlay tests, file-conformance, busybox/coreutils, openat rename-stability conformance canary (B2.9, see Tracked exceptions) |
 | network        | host_socket_connect                                                                                       | METHOD_SYS_SOCKET_CONNECT                                                                                                                                                                                                                                                                                                                                                                                      | kernel-wasm socket fd state                    | KH socket adapter                  | partial            | network tests, cpython3-pyzmq, jupyter                        |
 | network        | host_socket_send, host_socket_recv                                                                        | METHOD_SYS_SOCKET_SEND, METHOD_SYS_SOCKET_RECV                                                                                                                                                                                                                                                                                                                                                                 | kernel-wasm socket fd state                    | KH socket adapter                  | partial            | socket dispatch tests, pyzmq inproc                           |
 | network        | host_socket_bind, host_socket_listen, host_socket_accept                                                  | METHOD_SYS_SOCKET_BIND, METHOD_SYS_SOCKET_LISTEN, METHOD_SYS_SOCKET_ACCEPT                                                                                                                                                                                                                                                                                                                                     | kernel-wasm socket registry                    | KH socket adapter                  | partial            | socket listener tests, libzmq reactor reproducer              |
@@ -57,3 +57,33 @@ a separate extension when a real guest requires it.
 Any future `[method.sys_*]` entry must either have a `METHOD_SYS_*` dispatch arm
 in `packages/kernel-wasm/src/dispatch/` or appear above with
 `Status = intentionally deferred`.
+
+## Tracked exceptions
+
+### `fs` — directory-fd / `cwd` inode anchoring (B2.9, issue #59)
+
+B2.9 (`docs/superpowers/specs/2026-05-17-b2.9-openat-inode-anchoring-design.md`)
+landed inode-anchored `openat`/`fchdir`/`getcwd`: a directory fd and
+`Process.cwd` are anchored to a directory **inode**, not a path snapshot, so
+they stay correct after the directory is renamed (and fail `ENOENT` after it is
+removed). This is a deliberate, POSIX-faithful divergence from the legacy TS
+kernel, whose dirfd table is a `Map<fd, string>` path snapshot
+(`packages/kernel/src/wasi/wasi-host.ts`): the TS kernel resolves the stale
+pre-rename path. The divergence is locked through the B0 differ by the
+`openat_rename_stability` case on `posix-runtime-canary`
+(`abi/conformance/openat.spec.toml`) and recorded as a `[[divergence]]` row in
+`abi/conformance/parity-baseline.toml` — it is retired with the TS kernel, not
+fixed in it.
+
+Two backends run a **tracked degraded mode** (path-snapshot fallback — defined,
+asserted behavior, never a silent skip):
+
+- **hostfs** — host renames are invisible to the kernel, so a host-mounted
+  directory has no kernel-owned inode to anchor to. `dir_inode` returns `None`
+  and the dirfd/`cwd` falls back to the path snapshot. This is a **permanent**
+  exception: inode-faithful host dir tracking needs a new host
+  dirent/stat-by-handle ABI and is a separate future slice (spec Non-goals).
+- **overlay** — inode anchoring across the upper/lower/whiteout/copy-up demux is
+  finalized by B2.9 Task 9. **Pending Task 9** — Task 9 finalizes this line
+  (either overlay inode-anchored, or overlay degraded-mode tracked here like
+  hostfs if Task 9 defers it; never a half-correct overlay).
