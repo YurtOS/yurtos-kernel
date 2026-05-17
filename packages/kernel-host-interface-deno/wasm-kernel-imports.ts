@@ -43,6 +43,24 @@ const ENOTCONN = 107;
 const HOST_UNIX_NOT_AF_UNIX = -1;
 const HOST_ASYNC_EAGAIN = -2;
 
+/** Reserved bit telling the guest C shim SCM_RIGHTS was truncated
+ * (→ MSG_CTRUNC). Bit30; fd count hard-capped at 64. Spec
+ * 2026-05-17-scm-rights-ctrunc. */
+export const YURT_RECVMSG_CTRUNC_BIT = 0x40000000;
+
+export function recvmsgPackNfds(
+  delivered: number,
+  flags: number,
+  fdsCap: number,
+): { copyFds: number; nFds: number } {
+  const copyFds = Math.min(delivered, fdsCap);
+  const truncated = (flags & 0x1) !== 0 || delivered > fdsCap;
+  return {
+    copyFds,
+    nFds: truncated ? (copyFds | YURT_RECVMSG_CTRUNC_BIT) >>> 0 : copyFds,
+  };
+}
+
 export type ArgSpec =
   | "scalar"
   | "scalar64"
@@ -1386,7 +1404,7 @@ export const HOST_BINDINGS: HostBinding[] = [
       view.setUint32(0, fd >>> 0, true);
       view.setUint32(4, 0, true);
       view.setUint32(8, bufCap >>> 0, true);
-      const responseCap = (bufCap >>> 0) + 4 + (fdsCap >>> 0) * 4;
+      const responseCap = (bufCap >>> 0) + 8 + (fdsCap >>> 0) * 4;
       const out = await mk.kernelSyscallAsync(
         METHOD.SYS_SOCKET_RECVMSG,
         callerPid,
@@ -1401,29 +1419,26 @@ export const HOST_BINDINGS: HostBinding[] = [
         if (outRc < 0) return outRc;
       }
       const rightsStart = bufCap >>> 0;
-      const totalFds = out.response.byteLength >= rightsStart + 4
-        ? new DataView(
-          out.response.buffer,
-          out.response.byteOffset + rightsStart,
-          4,
-        ).getUint32(0, true)
-        : 0;
-      const fit = Math.min(totalFds, fdsCap >>> 0);
-      if (fit > 0 && fdsPtr !== 0) {
-        const start = rightsStart + 4;
-        const outRc = copyOut(
+      const rv = new DataView(
+        out.response.buffer,
+        out.response.byteOffset + rightsStart,
+        out.response.byteLength - rightsStart,
+      );
+      const delivered = rv.getUint32(0, true);
+      const flags = rv.getUint32(4, true);
+      const { copyFds, nFds } = recvmsgPackNfds(delivered, flags, fdsCap >>> 0);
+      if (copyFds > 0) {
+        const fr = copyOut(
           memBuf,
           fdsPtr,
-          out.response.subarray(start, start + fit * 4),
+          out.response.subarray(rightsStart + 8, rightsStart + 8 + copyFds * 4),
         );
-        if (outRc < 0) return outRc;
+        if (fr < 0) return fr;
       }
-      if (nFdsPtr !== 0) {
-        const count = new Uint8Array(4);
-        new DataView(count.buffer).setUint32(0, totalFds, true);
-        const outRc = copyOut(memBuf, nFdsPtr, count);
-        if (outRc < 0) return outRc;
-      }
+      const count = new Uint8Array(4);
+      new DataView(count.buffer).setUint32(0, nFds, true);
+      const nr = copyOut(memBuf, nFdsPtr, count);
+      if (nr < 0) return nr;
       return rc;
     },
   },
