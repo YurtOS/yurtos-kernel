@@ -432,6 +432,17 @@ export function makeWorkerDispatcherBodies(
           });
           return -5;
         }
+        if (kernel.getFdTarget(getPid(), fd) !== target) {
+          void opts.socketBackend?.closeListener?.(r.listener);
+          netLog("pthread.listen", {
+            fd,
+            host,
+            port,
+            result: "EBADF",
+            reason: "fd closed before async listen resolved",
+          });
+          return -9;
+        }
         target.listener = r.listener;
         target.boundHost = host;
         target.boundPort = port;

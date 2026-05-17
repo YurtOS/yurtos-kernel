@@ -257,6 +257,52 @@ Deno.test("makeWorkerDispatcherBodies: worker socket listen awaits async backend
   kernel.dispose();
 });
 
+Deno.test("makeWorkerDispatcherBodies: async socket listen closes listener if fd closes before resolution", async () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const loopbackBackend = createLoopbackSocketBackend();
+  let resolveListen!: (
+    result: Awaited<ReturnType<NonNullable<typeof loopbackBackend.listen>>>,
+  ) => void;
+  const listenResult = new Promise<
+    Awaited<ReturnType<NonNullable<typeof loopbackBackend.listen>>>
+  >((resolve) => {
+    resolveListen = resolve;
+  });
+  const closedListeners: unknown[] = [];
+  const socketBackend = {
+    ...loopbackBackend,
+    listen: () => listenResult,
+    closeListener: (listener: unknown) => {
+      closedListeners.push(listener);
+      return { ok: true as const };
+    },
+  };
+
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+    socketBackend,
+  });
+
+  const fd = bodies.socketOpen(1, 6, 0);
+  assertEquals(
+    bodies.socketBind(fd, new TextEncoder().encode("0.0.0.0"), 0),
+    0,
+  );
+  const pendingListen = bodies.socketListen(fd, 2);
+  assertEquals(bodies.socketClose(fd), 0);
+
+  resolveListen({ ok: true, listener: 1234, host: "0.0.0.0", port: 4321 });
+
+  assertEquals(await pendingListen, -9);
+  assertEquals(kernel.getFdTarget(pid, fd), null);
+  assertEquals(closedListeners, [1234]);
+
+  kernel.dispose();
+});
+
 Deno.test("makeWorkerDispatcherBodies: worker socketpair returns process fds", () => {
   const kernel = new ProcessKernel();
   const pid = kernel.allocPid(0, "test");
