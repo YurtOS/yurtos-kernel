@@ -3,7 +3,8 @@
 **Date:** 2026-05-17
 **Branch:** `claude/remove-typescript-kernel-CUcuf` (advances draft PR #129)
 **Slice of:** PR #129 "Remove the old TypeScript kernel; build a thin WASM-kernel runner" — completes Phase 2's spawn/wait driver.
-**Revision:** 2 (post-review — scope, framing, stdio, and test-wiring corrected).
+**Revision:** 3 (post-review 2 — wait-status mapping re-cited, signal-exit
+scoped out at the kernel-contract level, fixture wait-shape pinned).
 
 ## Problem
 
@@ -40,11 +41,20 @@ spawn/wait end-to-end** (`packages/runtime-wasmtime/src/kernel_host_interface.rs
   `docs/superpowers/specs/2026-05-16-rust-fork-parity-design.md`. The kernel
   already owns fork identity/state (`kernel.rs:715/754/773`,
   `ProcessForkState::ForkPreparing`); the Rust host has a partial `host_fork`
-  path (`kernel_host_interface.rs:3466`, `forced_fork_return`) whose
+  path (`kernel_host_interface.rs:3472`, `forced_fork_return`) whose
   snapshot-vs-rebuild correctness must be settled in that dedicated PR. None of
   it is touched here. **Decision: spawn/wait lands first this session; the fork
   PR is the immediate next initiative.**
 - Per-pid **child stdout/stderr** draining in the JS Runner (see Verification).
+- **Signal-terminated children.** This is a *kernel-contract* boundary, not
+  just an untested path: `wait_response` (`packages/kernel-wasm/src/dispatch/process.rs`,
+  first-pass comment ~`:1052`) records a single `exit_status` with **no
+  kill/stop/continue discrimination** — "needs `record_exit` to carry
+  signal-vs-exit". So no host can distinguish signal death here yet. The JS
+  `host_wait` still implements the full status→`yurt_wait_result_v1` decode
+  (below) for forward-compat, but the in-scope fixture exercises only the
+  clean-exit path; signal-death parity is deferred with the kernel
+  `record_exit` signal work.
 - Concurrent fork / pipes / pthreads via JSPI / AsyncBridge.
 - Phase 3 (CLI/scripts/workflow rewire), Phase 4 (`git rm packages/kernel/`).
 
@@ -148,8 +158,16 @@ the working thread path.
 - `host_wait`: `kernel.syscall(SYS_WAIT, u32 want_pid + u32 flags, …)`; then
   `while rc === -EAGAIN && !(flags & WNOHANG) && drainPendingProcess:
   drainPendingProcess(); retry;` — verbatim shape of `host_thread_join`'s
-  `-EAGAIN`→drain→retry. Map the kernel `{pid,status}` result to the
-  `yurt_wait_result_v1` out shape.
+  `-EAGAIN`→drain→retry. Then map the kernel's 8-byte `{u32 pid, i32 status}`
+  to the 16-byte `yurt_wait_result_v1` out shape using the **normative decode**
+  in the surviving deno host
+  (`packages/kernel-host-interface-deno/wasm-kernel-imports.ts:795-821`), which
+  the JS `mod.ts` `host_wait` must reproduce exactly:
+  `signal = status >= 128 && status < 192 ? status - 128 : 0`;
+  `exitCode = signal === 0 ? status : 0`; emit `{i32 pid@0, i32 exitCode@4,
+  i32 signal@8, i32 0@12}` little-endian. (Per the scope note, the kernel never
+  produces a `128..191` status in this slice, so only the `signal === 0` arm is
+  exercised — but the full decode is implemented for forward-compat.)
 - `buildUserYurtImports` signature gains `drainPendingProcess?: () => void`
   (sibling of `drainPendingThread`), passed by `spawn()`/`spawnThread` as
   `() => this.runPendingSpawns(kernel)`. Remove `host_spawn`/`host_wait` from
@@ -189,9 +207,15 @@ guest host_wait   → kernel sys_wait  → -EAGAIN (no child reaped yet)
 Done = the slice is CI-green and parity-verified, per AGENTS.md "CI green = done".
 
 1. **New fixture:** `test-fixtures/wasm/spawn-wait/` — a Rust crate (no `wabt`
-   available; must be a Rust fixture, not WAT). The parent spawns a child,
-   `wait`s for it, and **the parent prints a deterministic line encoding the
-   child's reaped exit code**, then exits. The observable contract is therefore
+   available; must be a Rust fixture, not WAT). The parent spawns **exactly one
+   child** and reaps it with **`waitpid(child_pid)`**, not `wait(-1)`. This is a
+   hard fixture constraint: a single targeted wait means the re-entrant
+   eager-drain's scheduling-order divergence (Drive-loop divergence, above)
+   cannot change the observed result, so the cross-host byte-parity oracle
+   (step 3) cannot flag a false failure. A future multi-child / `wait(-1)`
+   fixture must not be added without first resolving that ordering divergence.
+   The parent then **prints a deterministic line encoding the child's reaped
+   exit code** and exits. The observable contract is therefore
    **the parent's stdout + the parent's exit code** — both already drainable via
    the root `UserProcess.capturedStdout()` path the Runner uses
    (`runner.ts:79`). The fixture deliberately does **not** rely on the child's
@@ -241,7 +265,11 @@ Done = the slice is CI-green and parity-verified, per AGENTS.md "CI green = done
   Architecture; verification steps 1–3.
 - **Re-entrant drive loop** (analyzed above): scheduling-order/stack-depth
   divergence from the reference under deep nesting. Accepted, documented;
-  per-child contract preserved.
+  per-child contract preserved. **Hardening:** the re-entrant
+  `host_wait`→`drainPendingProcess` nesting carries a depth counter that throws
+  a clear, identifiable error past a sane bound, so pathological deep
+  spawn→wait nesting fails loudly with a diagnosable message instead of a raw
+  JS stack overflow.
 - **`recordExit -ESRCH` aborting the pump.** Mitigation: explicit
   continue-on-`-ESRCH` rule in Error handling.
 
