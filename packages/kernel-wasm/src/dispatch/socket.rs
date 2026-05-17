@@ -326,7 +326,10 @@ fn install_fd_rights_truncated(
                 k.process_mut(caller_pid).fd_table.install(fd, entry);
                 let start = 4 + index * 4;
                 out[start..start + 4].copy_from_slice(&fd.to_le_bytes());
-                installed = index as u32 + 1;
+                // Installs are a gapless prefix (we `continue` past
+                // out-of-range entries and stop at the first refusal),
+                // so a running count is exact and self-evident.
+                installed += 1;
             }
             None => {
                 close_entry(k, entry);
