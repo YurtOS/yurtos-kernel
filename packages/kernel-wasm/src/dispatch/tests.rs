@@ -10692,3 +10692,246 @@ fn faccessat_at_eaccess_uses_effective_credentials() {
         0,
     );
 }
+
+// ── flock(2) (issue #89) ────────────────────────────────────────────
+
+const FLOCK_LOCK_SH: u32 = 1;
+const FLOCK_LOCK_EX: u32 = 2;
+const FLOCK_LOCK_NB: u32 = 4;
+const FLOCK_LOCK_UN: u32 = 8;
+// Linux EAGAIN/EWOULDBLOCK = 11.
+const FLOCK_EWOULDBLOCK_E: i64 = 11;
+
+fn flock_req(fd: i64, op: u32) -> Vec<u8> {
+    let mut req = (fd as u32).to_le_bytes().to_vec();
+    req.extend_from_slice(&op.to_le_bytes());
+    req
+}
+
+#[test]
+fn flock_shared_and_exclusive_conflict_on_separate_open_file_descriptions() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    let path: &[u8] = b"/flock-target";
+    let a = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_WRITE | O_CREAT, path),
+        &mut [],
+    );
+    assert!(a >= 0);
+    let b = dispatch(METHOD_SYS_OPEN, 1, &open_req(O_WRITE, path), &mut []);
+    assert!(b >= 0, "second open of same path → separate OFD");
+    assert_ne!(a, b, "fresh open() must produce a distinct fd");
+
+    // A: LOCK_EX succeeds when no holder.
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(a, FLOCK_LOCK_EX), &mut []),
+        0,
+    );
+    // B: LOCK_EX | LOCK_NB → -EWOULDBLOCK (A holds EX).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FLOCK,
+            1,
+            &flock_req(b, FLOCK_LOCK_EX | FLOCK_LOCK_NB),
+            &mut [],
+        ),
+        -FLOCK_EWOULDBLOCK_E,
+    );
+    // B: LOCK_SH | LOCK_NB → also -EWOULDBLOCK against an EX holder.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FLOCK,
+            1,
+            &flock_req(b, FLOCK_LOCK_SH | FLOCK_LOCK_NB),
+            &mut [],
+        ),
+        -FLOCK_EWOULDBLOCK_E,
+    );
+
+    // A: LOCK_UN releases.
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(a, FLOCK_LOCK_UN), &mut []),
+        0,
+    );
+    // B can now acquire SH.
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(b, FLOCK_LOCK_SH), &mut []),
+        0,
+    );
+    // A can also acquire SH (compatible with B's SH).
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(a, FLOCK_LOCK_SH), &mut []),
+        0,
+    );
+    // A: LOCK_EX while B holds SH → conflict.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FLOCK,
+            1,
+            &flock_req(a, FLOCK_LOCK_EX | FLOCK_LOCK_NB),
+            &mut [],
+        ),
+        -FLOCK_EWOULDBLOCK_E,
+    );
+}
+
+#[test]
+fn flock_same_ofd_upgrade_downgrade_and_dup_shares_lock() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    let path: &[u8] = b"/flock-self";
+    let a = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_WRITE | O_CREAT, path),
+        &mut [],
+    );
+    assert!(a >= 0);
+
+    // Acquire SH, then upgrade to EX (sole holder → OK), then
+    // downgrade back to SH (same OFD → OK).
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(a, FLOCK_LOCK_SH), &mut []),
+        0,
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(a, FLOCK_LOCK_EX), &mut []),
+        0,
+        "sole-holder upgrade SH→EX must succeed",
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(a, FLOCK_LOCK_SH), &mut []),
+        0,
+        "same-OFD downgrade EX→SH must succeed",
+    );
+
+    // dup() shares the OFD → fd_dup's flock view is the same lock.
+    // After dup, the new fd's LOCK_UN releases for both since lock is
+    // associated with the OFD, not the fd.
+    let dup_rc = dispatch(METHOD_SYS_DUP, 1, &(a as u32).to_le_bytes(), &mut []);
+    assert!(dup_rc >= 0);
+    let b = dup_rc;
+    // EX from dup-of-A should still succeed (same OFD) — no conflict
+    // with itself.
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(b, FLOCK_LOCK_EX), &mut []),
+        0,
+    );
+    // Release via the dup fd; A and B share the OFD so the lock is
+    // gone for both.
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(b, FLOCK_LOCK_UN), &mut []),
+        0,
+    );
+}
+
+#[test]
+fn flock_closing_last_fd_releases_lock_automatically() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    let path: &[u8] = b"/flock-close";
+    let a = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_WRITE | O_CREAT, path),
+        &mut [],
+    );
+    assert!(a >= 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(a, FLOCK_LOCK_EX), &mut []),
+        0,
+    );
+    // Close the only fd referencing the OFD → ofd_dec_ref drops the
+    // OFD, which must also drop its flock.
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &(a as u32).to_le_bytes(), &mut []),
+        0,
+    );
+    // A fresh open + LOCK_EX | LOCK_NB must succeed — the previous
+    // lock is gone.
+    let b = dispatch(METHOD_SYS_OPEN, 1, &open_req(O_WRITE, path), &mut []);
+    assert!(b >= 0);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FLOCK,
+            1,
+            &flock_req(b, FLOCK_LOCK_EX | FLOCK_LOCK_NB),
+            &mut [],
+        ),
+        0,
+        "flock(EX) after the previous holder closed must succeed",
+    );
+}
+
+#[test]
+fn flock_rejects_bad_operations_and_non_file_fds() {
+    let _g = crate::kernel::TestGuard::acquire();
+
+    let path: &[u8] = b"/flock-bad-op";
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_WRITE | O_CREAT, path),
+        &mut [],
+    );
+    assert!(fd >= 0);
+
+    // No op bits → -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(fd, 0), &mut []),
+        -(abi::EINVAL as i64),
+    );
+    // LOCK_SH | LOCK_EX (multiple kind bits) → -EINVAL.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FLOCK,
+            1,
+            &flock_req(fd, FLOCK_LOCK_SH | FLOCK_LOCK_EX),
+            &mut [],
+        ),
+        -(abi::EINVAL as i64),
+    );
+    // Bit outside the operation mask → -EINVAL.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FLOCK,
+            1,
+            &flock_req(fd, FLOCK_LOCK_SH | 0x100),
+            &mut [],
+        ),
+        -(abi::EINVAL as i64),
+    );
+    // Short request → -EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &[0u8; 5], &mut []),
+        -(abi::EINVAL as i64),
+    );
+
+    // Unknown fd → -EBADF.
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(999, FLOCK_LOCK_SH), &mut []),
+        -(abi::EBADF as i64),
+    );
+
+    // Pipe fd → -EBADF (non-file fd type).
+    let mut pipe_resp = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_resp), 8);
+    let read_fd = u32::from_le_bytes(pipe_resp[0..4].try_into().unwrap());
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FLOCK,
+            1,
+            &flock_req(read_fd as i64, FLOCK_LOCK_SH),
+            &mut [],
+        ),
+        -(abi::EBADF as i64),
+    );
+
+    // LOCK_UN with no held lock → 0 (POSIX no-op).
+    assert_eq!(
+        dispatch(METHOD_SYS_FLOCK, 1, &flock_req(fd, FLOCK_LOCK_UN), &mut []),
+        0,
+    );
+}

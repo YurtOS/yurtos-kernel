@@ -676,6 +676,11 @@ id = 0x1_00AB
 kind = "syscall"
 doc = "POSIX faccessat(dirfd, path, mode, flag). Request: u32 dirfd LE + u32 mode LE + u32 flag LE + path bytes (path runs to end-of-request; mirrors sys_openat). dirfd: AT_FDCWD (u32::MAX) or a directory fd from sys_open(O_DIRECTORY). flag: AT_SYMLINK_NOFOLLOW (0x100) — don't follow the terminal symlink; AT_EACCESS (0x200) — use the caller's effective uid/gid instead of real. mode/errno semantics match sys_access. Additional errnos: -EBADF for unknown dirfd, -ENOTDIR for a non-directory dirfd. Issue #86."
 
+[method.sys_flock]
+id = 0x1_00AE
+kind = "syscall"
+doc = "POSIX/BSD flock(fd, operation). Request: u32 fd LE + u32 operation LE (8 bytes). Operation: exactly one of LOCK_SH=1 (shared/read), LOCK_EX=2 (exclusive/write), LOCK_UN=8 (unlock), OR-able with LOCK_NB=4 (return EWOULDBLOCK on conflict instead of blocking). Lock is associated with the open file description — dup/fork share, a fresh open() of the same file gets a separate ofd and a separate lock. Released when the owning OFD's last fd reference drops. Single-threaded kernel: blocking variants (no LOCK_NB) cannot actually wait, so they also return -EWOULDBLOCK on conflict (AsyncBridge-gated per issue #89 / B1.5). fcntl byte-range locks (F_SETLK / F_GETLK / F_SETLKW + Linux OFD locks) are a separate follow-up. Errnos: 0 success, -EINVAL (bad op / no or multiple op bits / short request), -EBADF (unknown fd / non-file fd type — dir/pipe/socket get EBADF for uniformity with fsync/ftruncate), -EWOULDBLOCK (lock conflict). Issue #89."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"

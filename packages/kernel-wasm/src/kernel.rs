@@ -619,6 +619,21 @@ pub struct Kernel {
     pending_thread_releases: Vec<i32>,
     /// Foreground process group for the kernel-owned stdio TTY.
     tty_foreground_pgid: Pid,
+    /// `flock(2)` advisory locks per `(mount_id, inode)`. The lock is
+    /// associated with the **open file description**, not the fd —
+    /// `dup` shares it, a fresh `open()` of the same file gets a
+    /// separate ofd and a separate lock. Released when the owning
+    /// OFD's refcount hits zero (see `ofd_dec_ref`). Issue #89.
+    flock_locks: BTreeMap<(crate::vfs::MountId, u64), FlockState>,
+}
+
+/// State of a single inode's `flock(2)` lock. `Shared(holders)`
+/// represents `LOCK_SH` held by one or more OFDs simultaneously;
+/// `Exclusive(ofd)` represents `LOCK_EX` held by exactly one OFD.
+#[derive(Clone, Debug)]
+pub enum FlockState {
+    Shared(Vec<u64>),
+    Exclusive(u64),
 }
 
 /// One staged sys_spawn waiting for the host to instantiate it.
@@ -691,6 +706,7 @@ impl Kernel {
             last_scheduled: None,
             pending_thread_releases: Vec::new(),
             tty_foreground_pgid: 1,
+            flock_locks: BTreeMap::new(),
         }
     }
 
@@ -1794,7 +1810,109 @@ impl Kernel {
             false
         };
         if drop {
+            // Release any `flock(2)` lock this OFD held — POSIX
+            // ties the lock to the open file description's
+            // lifetime, so the final close drops it. Issue #89.
+            self.flock_release_for_ofd(id);
             self.ofds.remove(&id);
+        }
+    }
+
+    /// Release any `flock(2)` lock held by `ofd_id`. Called by
+    /// `ofd_dec_ref` when the last fd reference drops; safe to call
+    /// when no lock is held (no-op).
+    pub fn flock_release_for_ofd(&mut self, ofd_id: u64) {
+        // Walk the lock table; any entry that mentions this ofd_id
+        // either becomes empty (Shared with no holders left) and is
+        // removed, or transitions Shared(other holders) downward, or
+        // disappears entirely (Exclusive owner).
+        self.flock_locks.retain(|_, state| match state {
+            FlockState::Shared(holders) => {
+                holders.retain(|h| *h != ofd_id);
+                !holders.is_empty()
+            }
+            FlockState::Exclusive(owner) => *owner != ofd_id,
+        });
+    }
+
+    /// Attempt to acquire an `flock(2)` lock of `kind` on
+    /// `(mount_id, inode)` for `ofd_id`. Returns `Ok(())` on
+    /// successful acquisition (including a no-op upgrade/downgrade
+    /// against the same OFD), `Err(rc)` with `rc < 0` on conflict.
+    /// Conflict errno is the caller's responsibility (`EWOULDBLOCK`
+    /// with `LOCK_NB`; the same with blocking variants until
+    /// AsyncBridge support lands). Issue #89.
+    pub fn flock_try_acquire(
+        &mut self,
+        ofd_id: u64,
+        mount_id: crate::vfs::MountId,
+        inode: u64,
+        exclusive: bool,
+    ) -> Result<(), ()> {
+        let key = (mount_id, inode);
+        match self.flock_locks.get_mut(&key) {
+            None => {
+                self.flock_locks.insert(
+                    key,
+                    if exclusive {
+                        FlockState::Exclusive(ofd_id)
+                    } else {
+                        FlockState::Shared(vec![ofd_id])
+                    },
+                );
+                Ok(())
+            }
+            Some(FlockState::Shared(holders)) => {
+                if exclusive {
+                    // Upgrade only if we are the sole holder.
+                    if holders.len() == 1 && holders[0] == ofd_id {
+                        *holders = vec![]; // tombstone — replaced below
+                        self.flock_locks.insert(key, FlockState::Exclusive(ofd_id));
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                } else if !holders.contains(&ofd_id) {
+                    holders.push(ofd_id);
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            Some(FlockState::Exclusive(owner)) => {
+                if *owner == ofd_id {
+                    if !exclusive {
+                        // Downgrade EX → SH for the same OFD.
+                        self.flock_locks
+                            .insert(key, FlockState::Shared(vec![ofd_id]));
+                    }
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+        }
+    }
+
+    /// Release `ofd_id`'s lock on `(mount_id, inode)`, if any. Always
+    /// returns `Ok(())` — `LOCK_UN` on a file with no lock is a
+    /// no-op per POSIX, not an error. Issue #89.
+    pub fn flock_release(&mut self, ofd_id: u64, mount_id: crate::vfs::MountId, inode: u64) {
+        let key = (mount_id, inode);
+        if let Some(state) = self.flock_locks.get_mut(&key) {
+            match state {
+                FlockState::Shared(holders) => {
+                    holders.retain(|h| *h != ofd_id);
+                    if holders.is_empty() {
+                        self.flock_locks.remove(&key);
+                    }
+                }
+                FlockState::Exclusive(owner) => {
+                    if *owner == ofd_id {
+                        self.flock_locks.remove(&key);
+                    }
+                }
+            }
         }
     }
 
@@ -1907,6 +2025,7 @@ pub fn reset_for_tests() {
     k.next_spawn_pid = 1000;
     k.last_scheduled = None;
     k.pending_thread_releases.clear();
+    k.flock_locks.clear();
 }
 
 /// Native unit tests share the same `static KERNEL` and run in
