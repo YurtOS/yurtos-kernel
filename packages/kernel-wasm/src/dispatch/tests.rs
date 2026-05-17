@@ -3874,6 +3874,52 @@ fn clock_gettime_unknown_clock_is_einval() {
 }
 
 #[test]
+fn clock_gettime_monotonic_is_distinct_from_realtime_and_non_decreasing() {
+    // Issue #64: CLOCK_MONOTONIC was aliased to REALTIME. The fix
+    // routes clock_id 1 through kh_now_monotonic — a distinct host
+    // primitive that must be (a) monotonically non-decreasing across
+    // consecutive reads and (b) unaffected by REALTIME being fixed by
+    // the test stub. The native kh_now_monotonic stub is a strictly-
+    // increasing per-call counter, so two reads must differ.
+    let mut first = [0u8; 8];
+    let mut second = [0u8; 8];
+
+    let n1 = dispatch(
+        METHOD_SYS_CLOCK_GETTIME,
+        1,
+        &1_u32.to_le_bytes(),
+        &mut first,
+    );
+    let n2 = dispatch(
+        METHOD_SYS_CLOCK_GETTIME,
+        1,
+        &1_u32.to_le_bytes(),
+        &mut second,
+    );
+    assert_eq!(n1, 8, "first MONOTONIC read must write 8 bytes");
+    assert_eq!(n2, 8, "second MONOTONIC read must write 8 bytes");
+
+    let a = u64::from_le_bytes(first);
+    let b = u64::from_le_bytes(second);
+    assert!(b >= a, "MONOTONIC must be non-decreasing: a={a} b={b}");
+
+    // REALTIME is independent — pinned by the native stub. MONOTONIC
+    // must NOT come from the same source (the old bug aliased them,
+    // so both reads would return 1_700_000_000_000_000_000).
+    let mut rt = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOCK_GETTIME, 1, &0_u32.to_le_bytes(), &mut rt),
+        8,
+    );
+    let realtime = u64::from_le_bytes(rt);
+    assert_eq!(realtime, 1_700_000_000_000_000_000_u64);
+    assert_ne!(
+        a, realtime,
+        "MONOTONIC must NOT share the REALTIME source (issue #64)",
+    );
+}
+
+#[test]
 fn getpgid_self_defaults_to_caller_pid() {
     let _g = crate::kernel::TestGuard::acquire();
     // pid 7 with target 0 → "self"; default pgid lazily primes to pid.

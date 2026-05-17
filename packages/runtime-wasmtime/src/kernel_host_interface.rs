@@ -453,6 +453,16 @@ pub trait PolicyEnforcer: Send + Sync {
         PolicyDecision::Allow
     }
 
+    /// Gate `kh_now_monotonic`. Mirrors `may_get_realtime` for
+    /// symmetry; defaults to Allow because monotonic time is not
+    /// privacy-sensitive in the same way wall-clock is (it carries no
+    /// information about the host's local date or epoch). Deny
+    /// surfaces as `-EACCES` to the kernel and breaks event-loop
+    /// timers / timeouts — most embedders should leave it Allow.
+    fn may_get_monotonic(&self) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
     /// Gate outbound HTTP fetches. `request` is the binary fetch record the
     /// kernel forwarded; embedders inspect the URL, method, or headers and
     /// Allow/Deny. Default: Allow.
@@ -522,6 +532,9 @@ impl PolicyEnforcer for DenyAllPolicy {
         PolicyDecision::Deny
     }
     fn may_get_realtime(&self) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_get_monotonic(&self) -> PolicyDecision {
         PolicyDecision::Deny
     }
     fn may_fetch(&self, _request: &[u8]) -> PolicyDecision {
@@ -875,6 +888,11 @@ fn read_shared_memory(memory: SharedMemory, addr: u32, len: usize) -> Result<Vec
 /// during kernel.wasm execution.
 pub struct HostState {
     pub now_realtime_ns: u64,
+    /// Monotonic-clock value handed to `kh_now_monotonic`. Embedders
+    /// update this from `Instant::now()` (or a tick counter for
+    /// deterministic tests) before each dispatch — the kernel uses it
+    /// to serve `clock_gettime(CLOCK_MONOTONIC)` (issue #64).
+    pub now_monotonic_ns: u64,
     pub extensions: Arc<dyn ExtensionRegistry>,
     pub log_sink: Arc<dyn LogSink>,
     /// Policy gate consulted at every `kh_*` boundary that touches
@@ -927,6 +945,7 @@ impl Default for HostState {
     fn default() -> Self {
         Self {
             now_realtime_ns: 0,
+            now_monotonic_ns: 0,
             extensions: Arc::new(EmptyExtensionRegistry),
             log_sink: Arc::new(DiscardLogSink),
             policy: Arc::new(AllowAllPolicy),
@@ -3619,6 +3638,28 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 return -(EIO as i32);
             }
             if memory.write(&mut caller, out_ptr as usize, &buf).is_err() {
+                return -(EFAULT as i32);
+            }
+            0
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_now_monotonic",
+        |mut caller: Caller<'_, KernelStoreData>, out_ptr: u32| -> i32 {
+            // Monotonic clock — see HostState.now_monotonic_ns. Issue #64.
+            if caller.data().host.policy.may_get_monotonic() == PolicyDecision::Deny {
+                return -(EACCES as i32);
+            }
+            let now = caller.data().host.now_monotonic_ns;
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -(EFAULT as i32),
+            };
+            if memory
+                .write(&mut caller, out_ptr as usize, &now.to_le_bytes())
+                .is_err()
+            {
                 return -(EFAULT as i32);
             }
             0

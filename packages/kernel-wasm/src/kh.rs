@@ -10,6 +10,7 @@
 #[link(wasm_import_module = "kh")]
 extern "C" {
     fn kh_now_realtime(out_ptr: *mut u64) -> i32;
+    fn kh_now_monotonic(out_ptr: *mut u64) -> i32;
     fn kh_random(out_ptr: *mut u8, len: usize) -> i32;
     fn kh_extension_invoke(
         req_ptr: *const u8,
@@ -101,6 +102,17 @@ unsafe fn kh_now_realtime(out_ptr: *mut u64) -> i32 {
     // Deterministic stub for native unit tests. Picks a fixed point in
     // time well clear of zero so callers can detect "wasn't written".
     *out_ptr = 1_700_000_000_000_000_000_u64;
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_now_monotonic(out_ptr: *mut u64) -> i32 {
+    // Strictly-increasing per-call counter so monotonicity assertions
+    // are deterministic and don't depend on the host's wall clock. Real
+    // wasmtime / JS hosts back this with Instant::now() / performance.now().
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(1_000);
+    *out_ptr = CTR.fetch_add(1, Ordering::Relaxed);
     0
 }
 
@@ -481,6 +493,22 @@ unsafe fn kh_thread_cancel(_host_thread_handle: i32) -> i32 {
 pub fn now_realtime_ns() -> Result<u64, i32> {
     let mut out: u64 = 0;
     let rc = unsafe { kh_now_realtime(&mut out as *mut u64) };
+    if rc == 0 {
+        Ok(out)
+    } else {
+        Err(rc)
+    }
+}
+
+/// Monotonically non-decreasing time in nanoseconds from an
+/// unspecified origin. Unaffected by wall-clock adjustments
+/// (NTP steps, settimeofday, DST), so suitable for elapsed-time
+/// math (timeouts, asyncio event-loop timers, perf_counter deltas).
+/// Backed by the host's monotonic clock: Instant::now() on
+/// native/wasmtime, performance.now() in browsers / Deno.
+pub fn now_monotonic_ns() -> Result<u64, i32> {
+    let mut out: u64 = 0;
+    let rc = unsafe { kh_now_monotonic(&mut out as *mut u64) };
     if rc == 0 {
         Ok(out)
     } else {
