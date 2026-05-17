@@ -12398,5 +12398,28 @@ fn fstatvfs_fd_form_reports_plausible_values_and_gates_bad_fds() {
     assert_eq!(
         dispatch(METHOD_SYS_FSTATVFS, 1, &[0u8; 2], &mut buf),
         -(abi::EINVAL as i64),
+/// Issue #134 Part 2: stat() must resolve symlinks in INTERMEDIATE
+/// components. /a/symdir -> /real (dir) containing file `f`.
+#[test]
+fn stat_resolves_intermediate_symlink_directory() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut reg = (b"/real/f".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/real/f");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    // /a/symdir -> /real
+    let mut sreq = (b"/real".len() as u32).to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/real");
+    sreq.extend_from_slice(b"/a/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/a/symdir/f", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        4,
+        "stat must traverse the intermediate symlink /a/symdir and type /real/f as S_IFREG"
     );
 }

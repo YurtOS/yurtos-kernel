@@ -539,6 +539,96 @@ pub(super) fn follow_symlinks_literal(k: &mut Kernel, path: Vec<u8>) -> Result<V
     Ok(resolved)
 }
 
+/// POSIX per-component symlink resolution for `stat`/`lstat` (#134
+/// Part 2). `path` is already lexically normalized and /proc-authorized
+/// (the caller ran it through `normalize_readable_path`). Walks every
+/// component; when a prefix is a symlink it splices the target
+/// (absolute, or relative to the link's parent dir) ahead of the
+/// unresolved remainder and re-runs `normalize_readable_path` on the
+/// whole path — the same per-hop lexical-normalize + re-authorize
+/// discipline as `follow_symlinks`, so an intermediate link still
+/// cannot bypass the procfs gate. SYMLOOP capped at 40 (`-EINVAL`,
+/// matching `follow_symlinks`; #69's ELOOP retarget is separate).
+///
+/// `follow_terminal == false` (`lstat`) leaves the final component
+/// un-followed; every *intermediate* component is still resolved.
+/// Unlike `realpath`'s `resolve_realpath`, this performs NO
+/// existence/`ENOTDIR` checks: lexical `..` (resolved by
+/// `normalize_readable_path`) and final typing — sockets, dangling
+/// links, the #134 Part 1 symlink size — are left to
+/// `write_stat_record`, preserving `stat`/`lstat`'s established
+/// contract. Shared by `stat_path` (follow_terminal=true) and
+/// `lstat_path` (false) so the two cannot drift.
+fn resolve_symlinks_per_component(
+    k: &mut Kernel,
+    caller_pid: u32,
+    path: Vec<u8>,
+    follow_terminal: bool,
+) -> Result<Vec<u8>, i64> {
+    let mut comps: Vec<Vec<u8>> = path
+        .split(|b| *b == b'/')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_vec())
+        .collect();
+    let mut hops = 0u32;
+    let mut i = 0usize;
+    while i < comps.len() {
+        // lstat: never readlink the terminal component (the one with
+        // nothing after it in the *current* resolved list).
+        if !follow_terminal && i + 1 == comps.len() {
+            break;
+        }
+        let mut prefix = Vec::new();
+        for c in &comps[..=i] {
+            prefix.push(b'/');
+            prefix.extend_from_slice(c);
+        }
+        let Some(target) = k.vfs.readlink(&prefix) else {
+            i += 1;
+            continue;
+        };
+        hops += 1;
+        if hops > 40 {
+            return Err(-(abi::EINVAL as i64));
+        }
+        // Build an absolute path: an absolute target as-is; a relative
+        // target against the link's parent dir (POSIX). Then append the
+        // not-yet-resolved remainder. normalize_readable_path collapses
+        // any `.`/`..`/`//` and re-authorizes (incl. /proc gate).
+        let mut newpath = Vec::new();
+        if target.starts_with(b"/") {
+            newpath.extend_from_slice(&target);
+        } else {
+            for c in &comps[..i] {
+                newpath.push(b'/');
+                newpath.extend_from_slice(c);
+            }
+            newpath.push(b'/');
+            newpath.extend_from_slice(&target);
+        }
+        for c in &comps[i + 1..] {
+            newpath.push(b'/');
+            newpath.extend_from_slice(c);
+        }
+        let renorm = normalize_readable_path(k, caller_pid, &newpath)?;
+        comps = renorm
+            .split(|b| *b == b'/')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_vec())
+            .collect();
+        i = 0;
+    }
+    if comps.is_empty() {
+        return Ok(b"/".to_vec());
+    }
+    let mut out = Vec::new();
+    for c in &comps {
+        out.push(b'/');
+        out.extend_from_slice(c);
+    }
+    Ok(out)
+}
+
 /// `mkdir(path) -> 0 / -EEXIST / -EROFS`.
 pub(super) fn mkdir(caller_pid: u32, request: &[u8]) -> i64 {
     if request.is_empty() {
@@ -863,11 +953,12 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        // POSIX: stat() follows symlinks (unlike lstat). Resolve
-        // through the link chain before typing the entry, sharing
-        // sys_open's follow helper so the two cannot diverge.
-        // Negate-and-widen at the boundary — resolver convention.
-        let path = match follow_symlinks(k, caller_pid, path) {
+        // POSIX stat(): resolve symlinks in EVERY component, including
+        // the terminal chain (#134 Part 2). normalize_readable_path
+        // already did lexical `..`/cwd + the procfs gate; this resolves
+        // intermediate + terminal links, then write_stat_record types
+        // the result.
+        let path = match resolve_symlinks_per_component(k, caller_pid, path, true) {
             Ok(path) => path,
             Err(errno) => return -(errno as i64),
         };
@@ -876,13 +967,14 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
 }
 
 /// `lstat(path) -> 16-byte fstat-shaped record`. Identical to
-/// `stat_path` EXCEPT it does not follow a terminal symlink (POSIX
-/// lstat): `normalize_readable_path` is lexical/no-follow and
-/// `entry_type` does not resolve links, so a symlink — whether it
-/// points at a dir, a file, or a missing target — reports S_IFLNK
-/// and returns 16 (a dangling link still exists; only an absent
-/// path is -ENOENT). This is the no-follow lexical path #67
-/// deliberately preserved. Issue #81.
+/// `stat_path` EXCEPT it does not follow a *terminal* symlink (POSIX
+/// lstat). #134 Part 2: intermediate symlink components ARE resolved
+/// (shared `resolve_symlinks_per_component` with `follow_terminal =
+/// false`); only the final component is left un-followed, so a
+/// terminal symlink — whether it points at a dir, a file, or a
+/// missing target — reports S_IFLNK with the #134 Part 1 size and
+/// returns 16 (a dangling link still exists; only an absent path is
+/// -ENOENT). Issues #67, #81, #134.
 pub(super) fn lstat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if request.is_empty() {
         return -(abi::EINVAL as i64);
@@ -892,6 +984,13 @@ pub(super) fn lstat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -
     }
     with_kernel(|k| {
         let path = match normalize_readable_path(k, caller_pid, request) {
+            Ok(path) => path,
+            Err(rc) => return rc,
+        };
+        // Resolve intermediate symlink components, but NOT the terminal
+        // (POSIX lstat). write_stat_record then types the un-followed
+        // terminal (S_IFLNK + #134 Part 1 size for a symlink).
+        let path = match resolve_symlinks_per_component(k, caller_pid, path, false) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
