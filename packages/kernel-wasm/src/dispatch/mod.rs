@@ -191,6 +191,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_SIGWAITINFO => sigwaitinfo(caller_pid, request, response),
         METHOD_SYS_SIGPENDING => sigpending(caller_pid, response),
         METHOD_SYS_SIGACTION => sigaction(caller_pid, request),
+        METHOD_SYS_SIGPROCMASK => sigmask::sys_sigprocmask(ctx, request, response),
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
         METHOD_SYS_OPEN => sys_open(caller_pid, request),

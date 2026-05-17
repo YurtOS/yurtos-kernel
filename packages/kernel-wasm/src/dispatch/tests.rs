@@ -9696,3 +9696,62 @@ fn fork_child_main_inherits_forking_main_mask_pending_empty() {
         );
     });
 }
+
+fn sigprocmask_req(how: i32, set: Option<u8>) -> Vec<u8> {
+    let mut r = how.to_le_bytes().to_vec();
+    match set {
+        Some(s) => {
+            r.push(1);
+            r.push(s);
+        }
+        None => {
+            r.push(0);
+            r.push(0);
+        }
+    }
+    r
+}
+
+#[test]
+fn sigprocmask_block_setmask_oset_and_kill_unmaskable() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 1];
+    // SETMASK to SIGINT (slot 1) → prior was empty (0)
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGPROCMASK,
+            1,
+            &sigprocmask_req(2, Some(1 << 1)),
+            &mut out
+        ),
+        1
+    );
+    assert_eq!(out[0], 0);
+    // BLOCK SIGUSR1 (slot 7) → prior oset is the SIGINT byte (1<<1)
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGPROCMASK,
+            1,
+            &sigprocmask_req(0, Some(1 << 7)),
+            &mut out
+        ),
+        1
+    );
+    assert_eq!(out[0], 1 << 1);
+    // kernel mask has canonical SIGINT bit; SIGKILL/STOP never settable
+    let m = crate::kernel::with_kernel(|k| {
+        k.process_mut(1).threads[&crate::kernel::MAIN_THREAD_TID].blocked_signals
+    });
+    assert_ne!(m & (1u64 << (2 - 1)), 0, "SIGINT blocked");
+    assert_eq!(m & (1u64 << (9 - 1)), 0, "SIGKILL never maskable");
+    // bad how → EINVAL
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGPROCMASK,
+            1,
+            &sigprocmask_req(9, Some(0)),
+            &mut out
+        ),
+        -(crate::abi::EINVAL as i64)
+    );
+}

@@ -41,6 +41,42 @@ pub fn narrow(canonical: u64) -> u8 {
     out
 }
 
+use super::DispatchContext;
+use crate::abi;
+use crate::kernel::with_kernel;
+
+const SIG_BLOCK: i32 = 0;
+const SIG_UNBLOCK: i32 = 1;
+const SIG_SETMASK: i32 = 2;
+/// SIGKILL=9, SIGSTOP=19 — never maskable (Linux).
+const UNMASKABLE: u64 = (1u64 << (9 - 1)) | (1u64 << (19 - 1));
+
+pub(super) fn sys_sigprocmask(ctx: DispatchContext, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() != 6 || response.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let how = i32::from_le_bytes(request[0..4].try_into().expect("4"));
+    let has_set = request[4] != 0;
+    let set = expand(request[5]);
+    with_kernel(|k| {
+        let p = k.process_mut(ctx.caller_pid);
+        let Some(t) = p.threads.get_mut(&ctx.caller_tid) else {
+            return -(abi::ESRCH as i64);
+        };
+        response[0] = narrow(t.blocked_signals);
+        if has_set {
+            let next = match how {
+                SIG_BLOCK => t.blocked_signals | set,
+                SIG_UNBLOCK => t.blocked_signals & !set,
+                SIG_SETMASK => set,
+                _ => return -(abi::EINVAL as i64),
+            };
+            t.blocked_signals = next & !UNMASKABLE;
+        }
+        1
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
