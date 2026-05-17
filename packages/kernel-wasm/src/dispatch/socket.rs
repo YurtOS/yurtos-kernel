@@ -282,41 +282,35 @@ fn clone_fd_rights(k: &mut Kernel, caller_pid: u32, fds: &[u32]) -> Result<Vec<F
     Ok(rights)
 }
 
+/// `ancillary_flags` bit0 in the recvmsg ancillary trailer: the
+/// sender's SCM_RIGHTS count exceeded `delivered_fd_count` (fds were
+/// dropped — RLIMIT refusal or kernel `fit`). Canonical definition;
+/// host shims hardcode `0x1` with a comment referencing this.
+/// (spec 2026-05-17-scm-rights-ctrunc)
+const SCM_TRUNCATED: u32 = 0x1;
+
 fn install_fd_rights_truncated(
     k: &mut Kernel,
     caller_pid: u32,
     rights: Vec<FdEntry>,
     out: &mut [u8],
 ) -> i64 {
-    if out.len() < 4 {
+    // Trailer: [delivered_fd_count:u32][ancillary_flags:u32][fd…].
+    if out.len() < 8 {
         for entry in rights {
             close_entry(k, entry);
         }
         return -(abi::EINVAL as i64);
     }
-    let count = rights.len() as u32;
-    let fit = (out.len() - 4) / 4;
-    // Number of fds actually installed (always a contiguous prefix:
-    // we stop attempting installs at the first RLIMIT_NOFILE refusal,
-    // so a delivered slot is never followed by an un-written one).
+    let sent = rights.len() as u32;
+    let fit = (out.len() - 8) / 4;
     let mut installed = 0u32;
-    // Set once the caller hits its RLIMIT_NOFILE soft limit; from
-    // there on every remaining right is dropped, and the reported
-    // count is truncated to `installed` so the guest is never handed
-    // an un-written (zero/stale) fd word as a valid fd (issue #143:
-    // before this, #135's `None` arm closed the entry but left the
-    // slot unwritten while the count still claimed it — the guest
-    // read a phantom fd, commonly 0/stdin). `recvmsg` has already
-    // consumed the data and dequeued the rights, so -EMFILE would
-    // also drop the payload; Linux `scm_detach_fds` likewise delivers
-    // the data and truncates the ancillary fd array.
     let mut rlimit_truncated = false;
     for (index, entry) in rights.into_iter().enumerate() {
         if rlimit_truncated || index >= fit {
-            // Either we already hit the fd limit, or this fd does not
-            // fit in the caller's buffer. The doesn't-fit truncation
-            // (and its sent-vs-delivered `count` mismatch) is the
-            // pre-existing behavior owned by #133 / M2 — left as-is.
+            // Dropped: hit the fd limit, or no room in the caller
+            // buffer. Both now reported via SCM_TRUNCATED below
+            // (this reconciles the #133/M2 doesn't-fit phantom count).
             close_entry(k, entry);
             continue;
         }
@@ -324,11 +318,8 @@ fn install_fd_rights_truncated(
         match p.fd_table.lowest_free_fd_within(p.nofile_soft_limit()) {
             Some(fd) => {
                 k.process_mut(caller_pid).fd_table.install(fd, entry);
-                let start = 4 + index * 4;
+                let start = 8 + index * 4;
                 out[start..start + 4].copy_from_slice(&fd.to_le_bytes());
-                // Installs are a gapless prefix (we `continue` past
-                // out-of-range entries and stop at the first refusal),
-                // so a running count is exact and self-evident.
                 installed += 1;
             }
             None => {
@@ -337,12 +328,10 @@ fn install_fd_rights_truncated(
             }
         }
     }
-    // Pure doesn't-fit keeps `count == rights.len()` byte-for-byte
-    // (#133/M2 contract); an RLIMIT truncation reports the honest
-    // installed count instead.
-    let reported = if rlimit_truncated { installed } else { count };
-    out[0..4].copy_from_slice(&reported.to_le_bytes());
-    (4 + reported.min(fit as u32) as usize * 4) as i64
+    let flags = if sent > installed { SCM_TRUNCATED } else { 0 };
+    out[0..4].copy_from_slice(&installed.to_le_bytes());
+    out[4..8].copy_from_slice(&flags.to_le_bytes());
+    (8 + installed as usize * 4) as i64
 }
 
 fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>) -> i64 {
@@ -1150,7 +1139,7 @@ pub(super) fn sys_socket_recvmsg(caller_pid: u32, request: &[u8], response: &mut
     let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
     let data_cap = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes")) as usize;
-    let Some(rights_start) = data_cap.checked_add(4) else {
+    let Some(rights_start) = data_cap.checked_add(8) else {
         return -(abi::EINVAL as i64);
     };
     if response.len() < rights_start {
@@ -1164,7 +1153,7 @@ pub(super) fn sys_socket_recvmsg(caller_pid: u32, request: &[u8], response: &mut
         return n;
     }
     if flags == MSG_PEEK {
-        response[data_cap..data_cap + 4].copy_from_slice(&0u32.to_le_bytes());
+        response[data_cap..data_cap + 8].copy_from_slice(&[0u8; 8]);
         return n;
     }
     let rights = with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {

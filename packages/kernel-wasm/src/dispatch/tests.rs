@@ -1906,7 +1906,7 @@ fn socket_ops_reject_bad_fds_without_backend_calls() {
             (
                 METHOD_SYS_SOCKET_RECVMSG,
                 socket_recvmsg_req(fd, 0, 8).to_vec(),
-                12,
+                16,
             ),
         ];
 
@@ -1992,7 +1992,7 @@ fn socket_ops_reject_file_fds_with_enotsock() {
         (
             METHOD_SYS_SOCKET_RECVMSG,
             socket_recvmsg_req(fd, 0, 8).to_vec(),
-            12,
+            16,
         ),
     ];
 
@@ -2942,7 +2942,7 @@ fn socket_sendmsg_recvmsg_transfers_fd_rights() {
         0
     );
 
-    let mut recv = [0u8; 1 + 4 + 4];
+    let mut recv = [0u8; 1 + 8 + 4];
     assert_eq!(
         dispatch(
             METHOD_SYS_SOCKET_RECVMSG,
@@ -2953,8 +2953,17 @@ fn socket_sendmsg_recvmsg_transfers_fd_rights() {
         1
     );
     assert_eq!(recv[0], b'x');
-    assert_eq!(u32::from_le_bytes(recv[1..5].try_into().unwrap()), 1);
-    let received_write = u32::from_le_bytes(recv[5..9].try_into().unwrap());
+    assert_eq!(
+        u32::from_le_bytes(recv[1..5].try_into().unwrap()),
+        1,
+        "delivered == 1"
+    );
+    assert_eq!(
+        u32::from_le_bytes(recv[5..9].try_into().unwrap()),
+        0,
+        "no truncation"
+    );
+    let received_write = u32::from_le_bytes(recv[9..13].try_into().unwrap());
 
     let mut write_req = received_write.to_le_bytes().to_vec();
     write_req.extend_from_slice(b"ok");
@@ -2997,7 +3006,10 @@ fn socket_recvmsg_with_tiny_rights_buffer_returns_data_and_truncates_rights() {
         1
     );
 
-    let mut recv = [0u8; 1 + 4];
+    // data_cap=1, ancillary buffer is only 8 bytes (header only, fit=0).
+    // #133/M2 reconciled: doesn't-fit now reports delivered=0 + SCM_TRUNCATED,
+    // not a phantom count.
+    let mut recv = [0u8; 1 + 8];
     assert_eq!(
         dispatch(
             METHOD_SYS_SOCKET_RECVMSG,
@@ -3008,9 +3020,10 @@ fn socket_recvmsg_with_tiny_rights_buffer_returns_data_and_truncates_rights() {
         1
     );
     assert_eq!(recv[0], b'x');
-    assert_eq!(u32::from_le_bytes(recv[1..5].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(recv[1..5].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(recv[5..9].try_into().unwrap()), 1);
 
-    let mut empty = [0u8; 12];
+    let mut empty = [0u8; 16];
     assert_eq!(
         dispatch(
             METHOD_SYS_SOCKET_RECVMSG,
@@ -3070,10 +3083,10 @@ fn recvmsg_scm_rights_at_rlimit_does_not_deliver_phantom_fd() {
         k.process_mut(1).rlimits[7] = Some((7, 1024));
     });
 
-    // data_cap=1, then a 4-byte count + room for one fd word, so the
+    // data_cap=1, then an 8-byte header + room for one fd word, so the
     // dropped entry is *in range* (fit=1) — the regression path, not
     // the doesn't-fit truncation (#133/M2, asserted elsewhere).
-    let mut recv = [0u8; 1 + 4 + 4];
+    let mut recv = [0u8; 1 + 8 + 4];
     assert_eq!(
         dispatch(
             METHOD_SYS_SOCKET_RECVMSG,
@@ -3082,16 +3095,105 @@ fn recvmsg_scm_rights_at_rlimit_does_not_deliver_phantom_fd() {
             &mut recv
         ),
         1,
-        "data must still be delivered (Linux delivers data + truncates cmsg)"
+        "data must still be delivered"
     );
     assert_eq!(recv[0], b'x', "the data byte must be delivered");
-    // The honest count: zero fds were installable, so the guest must
-    // be told zero — never a phantom fd. Buggy code reports 1 with a
-    // zero fd word at recv[5..9].
     assert_eq!(
         u32::from_le_bytes(recv[1..5].try_into().unwrap()),
         0,
-        "SCM_RIGHTS count must reflect only installed fds, not phantoms"
+        "delivered must be 0 (fd dropped at RLIMIT)"
+    );
+    assert_eq!(
+        u32::from_le_bytes(recv[5..9].try_into().unwrap()),
+        1,
+        "SCM_TRUNCATED must be set"
+    );
+}
+
+/// Sender sends more fds than the receiver buffer holds (kernel `fit`
+/// truncation): delivered == fit, SCM_TRUNCATED set. (#133/M2 path.)
+#[test]
+fn recvmsg_scm_rights_trailer_signals_truncation_doesnt_fit() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut sp = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 1, 0), &mut sp),
+        8
+    );
+    let left = u32::from_le_bytes(sp[0..4].try_into().unwrap());
+    let right = u32::from_le_bytes(sp[4..8].try_into().unwrap());
+    let mut p1 = [0u8; 8];
+    let mut p2 = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut p1), 8);
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut p2), 8);
+    let w1 = u32::from_le_bytes(p1[4..8].try_into().unwrap());
+    let w2 = u32::from_le_bytes(p2[4..8].try_into().unwrap());
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDMSG,
+            1,
+            &socket_sendmsg_req(left, b"y", &[w1, w2]),
+            &mut []
+        ),
+        1
+    );
+    let mut recv = [0u8; 1 + 8 + 4];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVMSG,
+            1,
+            &socket_recvmsg_req(right, 0, 1),
+            &mut recv
+        ),
+        1
+    );
+    assert_eq!(
+        u32::from_le_bytes(recv[1..5].try_into().unwrap()),
+        1,
+        "delivered == fit (1)"
+    );
+    assert_eq!(
+        u32::from_le_bytes(recv[5..9].try_into().unwrap()),
+        1,
+        "SCM_TRUNCATED set"
+    );
+}
+
+/// MSG_PEEK writes a full zeroed 8-byte header (delivered=0, flags=0).
+#[test]
+fn recvmsg_scm_rights_peek_writes_zero_header() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut sp = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 1, 0), &mut sp),
+        8
+    );
+    let left = u32::from_le_bytes(sp[0..4].try_into().unwrap());
+    let right = u32::from_le_bytes(sp[4..8].try_into().unwrap());
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDMSG,
+            1,
+            &socket_sendmsg_req(left, b"z", &[]),
+            &mut []
+        ),
+        1
+    );
+    let mut recv = [0xFFu8; 1 + 8];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVMSG,
+            1,
+            &socket_recvmsg_req(right, MSG_PEEK, 1),
+            &mut recv
+        ),
+        1
+    );
+    assert_eq!(recv[0], b'z', "peeked data byte must be present");
+    assert_eq!(
+        recv[1..9],
+        [0u8; 8],
+        "peek must zero the full 8-byte header"
     );
 }
 
@@ -3130,7 +3232,7 @@ fn socket_recvmsg_peek_preserves_fd_rights_for_real_receive() {
         0
     );
 
-    let mut peek = [0u8; 1 + 4 + 4];
+    let mut peek = [0u8; 1 + 8 + 4];
     assert_eq!(
         dispatch(
             METHOD_SYS_SOCKET_RECVMSG,
@@ -3142,8 +3244,9 @@ fn socket_recvmsg_peek_preserves_fd_rights_for_real_receive() {
     );
     assert_eq!(peek[0], b'x');
     assert_eq!(u32::from_le_bytes(peek[1..5].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(peek[5..9].try_into().unwrap()), 0);
 
-    let mut recv = [0u8; 1 + 4 + 4];
+    let mut recv = [0u8; 1 + 8 + 4];
     assert_eq!(
         dispatch(
             METHOD_SYS_SOCKET_RECVMSG,
@@ -3155,7 +3258,8 @@ fn socket_recvmsg_peek_preserves_fd_rights_for_real_receive() {
     );
     assert_eq!(recv[0], b'x');
     assert_eq!(u32::from_le_bytes(recv[1..5].try_into().unwrap()), 1);
-    let received_write = u32::from_le_bytes(recv[5..9].try_into().unwrap());
+    assert_eq!(u32::from_le_bytes(recv[5..9].try_into().unwrap()), 0);
+    let received_write = u32::from_le_bytes(recv[9..13].try_into().unwrap());
 
     let mut write_req = received_write.to_le_bytes().to_vec();
     write_req.extend_from_slice(b"ok");
@@ -9618,7 +9722,7 @@ fn shutdown_rd_does_not_transfer_or_drain_scm_rights() {
     // fd nor drain the ancillary queue — a shutdown EOF is not a
     // zero-length message. Pre-fix this returned 0 yet still transferred
     // the fd (rights count == 1). (PR #58 review P2)
-    let mut recv = [0u8; 1 + 4 + 4];
+    let mut recv = [0u8; 1 + 8 + 4];
     assert_eq!(
         dispatch(
             METHOD_SYS_SOCKET_RECVMSG,
@@ -9633,6 +9737,7 @@ fn shutdown_rd_does_not_transfer_or_drain_scm_rights() {
         0,
         "SHUT_RD EOF must not transfer SCM_RIGHTS fds"
     );
+    assert_eq!(recv[5..9], [0u8; 4], "SHUT_RD must not set SCM_TRUNCATED");
 }
 
 #[test]
