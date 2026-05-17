@@ -740,6 +740,24 @@ export function pollReventsForTarget(target: FdTarget, events: number): number {
   return revents;
 }
 
+/** Spec 2026-05-17-scm-rights-ctrunc: pack the legacy TS-kernel
+ * recvmsg `nFds` out-value. `senderTotal` = fds the sender sent;
+ * `delivered` = fds installed for the guest. Sets the reserved CTRUNC
+ * bit30 (telling the guest C shim to OR MSG_CTRUNC) when any were
+ * dropped, including the no-control-buffer case (`fdsPtr === 0` with
+ * fds present). Bit30 (not bit31: guest reads nFds into a signed int
+ * gated by > 0); fd count hard-capped at 64 so bit30 is free. */
+export const YURT_RECVMSG_CTRUNC_BIT = 0x40000000;
+export function tsKernelRecvmsgNfds(
+  delivered: number,
+  senderTotal: number,
+  fdsPtr: number,
+): number {
+  const lostToNoBuffer = fdsPtr === 0 && senderTotal > 0;
+  const truncated = delivered < senderTotal || lostToNoBuffer;
+  return truncated ? (delivered | YURT_RECVMSG_CTRUNC_BIT) >>> 0 : delivered;
+}
+
 function globToRegExp(pattern: string): RegExp {
   let re = "";
   let i = 0;
@@ -3989,6 +4007,7 @@ export function createKernelImports(
         const anc = ancBefore ?? registry.popWaiterAnc(rawHandle);
         const view = new DataView(memory.buffer);
         let nFds = 0;
+        const senderTotal = anc ? anc.fds.length : 0;
         if (anc) {
           const senderPid = anc.senderPid;
           const toReceive = fdsPtr !== 0 && fdsCap > 0
@@ -4012,7 +4031,13 @@ export function createKernelImports(
             opts.kernel.closeFd(senderPid, dupFd);
           }
         }
-        if (nFdsPtr !== 0) view.setInt32(nFdsPtr, nFds, true);
+        if (nFdsPtr !== 0) {
+          view.setInt32(
+            nFdsPtr,
+            tsKernelRecvmsgNfds(nFds, senderTotal, fdsPtr) | 0,
+            true,
+          );
+        }
         return n;
       } catch {
         return -1;
