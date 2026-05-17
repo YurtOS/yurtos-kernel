@@ -350,11 +350,13 @@ pub fn forward_request_with_user_response<S: HasCallerPid, C: HostCallCtx<S>>(
     if outcome.rc <= 0 {
         return outcome.rc;
     }
-    if !outcome.response.is_empty()
-        && ctx
-            .write_user_memory(user_out_ptr, &outcome.response)
-            .is_err()
-    {
+    // The kernel scratch window may carry stale bytes past the `rc`
+    // meaningful prefix. Syscalls routed through this helper follow the
+    // "rc == bytes written" convention, so only the first `rc` bytes are
+    // valid; clamp the user-visible copy so widening the scratch read in
+    // `dispatch_kernel` cannot surface stale scratch to the guest.
+    let n = (outcome.rc as usize).min(outcome.response.len());
+    if n > 0 && ctx.write_user_memory(user_out_ptr, &outcome.response[..n]).is_err() {
         return -EFAULT;
     }
     outcome.rc
@@ -373,11 +375,11 @@ pub fn forward_response_to_user<S: HasCallerPid, C: HostCallCtx<S>>(
     if outcome.rc <= 0 {
         return outcome.rc as i32;
     }
-    if !outcome.response.is_empty()
-        && ctx
-            .write_user_memory(user_out_ptr, &outcome.response)
-            .is_err()
-    {
+    // See `forward_request_with_user_response`: clamp to the `rc`
+    // meaningful prefix so the widened scratch read cannot leak stale
+    // scratch bytes to the guest.
+    let n = (outcome.rc as usize).min(outcome.response.len());
+    if n > 0 && ctx.write_user_memory(user_out_ptr, &outcome.response[..n]).is_err() {
         return -(EFAULT as i32);
     }
     outcome.rc as i32
@@ -447,5 +449,118 @@ mod tests {
             Err(-E2BIG)
         );
         assert_eq!(checked_guest_buffer_sum(&[u32::MAX, 1]), Err(-E2BIG));
+    }
+
+    struct MockState {
+        pid: u32,
+    }
+    impl HasCallerPid for MockState {
+        fn caller_pid(&self) -> u32 {
+            self.pid
+        }
+    }
+
+    /// Mocks the *fixed* engine `dispatch_kernel`: when `rc > 0` it
+    /// returns the full `response_cap` scratch window (out-params can sit
+    /// past `rc`), padded/truncated to exactly `response_cap` bytes.
+    struct MockCtx {
+        state: MockState,
+        rc: i64,
+        scratch: Vec<u8>,
+        writes: Vec<(u32, Vec<u8>)>,
+    }
+    impl HostCallCtx<MockState> for MockCtx {
+        fn read_user_memory(&mut self, _addr: u32, _buf: &mut [u8]) -> Result<(), EngineError> {
+            Ok(())
+        }
+        fn write_user_memory(&mut self, addr: u32, bytes: &[u8]) -> Result<(), EngineError> {
+            self.writes.push((addr, bytes.to_vec()));
+            Ok(())
+        }
+        fn user_state(&self) -> &MockState {
+            &self.state
+        }
+        fn user_state_mut(&mut self) -> &mut MockState {
+            &mut self.state
+        }
+        fn dispatch_kernel(
+            &mut self,
+            _method_id: u32,
+            _caller_pid: u32,
+            _req: &[u8],
+            response_cap: u32,
+        ) -> KernelDispatchOutcome {
+            if self.rc <= 0 || response_cap == 0 {
+                return KernelDispatchOutcome {
+                    rc: self.rc,
+                    response: Vec::new(),
+                };
+            }
+            let mut response = self.scratch.clone();
+            response.resize(response_cap as usize, 0);
+            KernelDispatchOutcome {
+                rc: self.rc,
+                response,
+            }
+        }
+    }
+
+    // recvfrom/recvmsg shape: rc = data-byte count, but out-params
+    // (source address / SCM_RIGHTS) live at offsets >= rc. The full
+    // scratch window must reach the caller's response buffer so the
+    // linker func can parse them.
+    #[test]
+    fn trampoline_with_response_surfaces_out_params_past_rc() {
+        let mut scratch = vec![0u8; 64];
+        scratch[..4].copy_from_slice(b"ping"); // data, rc = 4
+        scratch[16..20].copy_from_slice(&12u32.to_le_bytes()); // path_len at offset 16
+        scratch[24..36].copy_from_slice(b"/tmp/tx.sock"); // path bytes
+        let mut ctx = MockCtx {
+            state: MockState { pid: 1 },
+            rc: 4,
+            scratch,
+            writes: Vec::new(),
+        };
+        let mut response = vec![0u8; 64];
+        let rc = trampoline_request_with_response(&mut ctx, 0xABCD, &[], &mut response);
+        assert_eq!(rc, 4);
+        assert_eq!(&response[..4], b"ping");
+        assert_eq!(u32::from_le_bytes(response[16..20].try_into().unwrap()), 12);
+        assert_eq!(&response[24..36], b"/tmp/tx.sock");
+    }
+
+    // The wholesale-copy helpers must NOT leak the stale scratch tail
+    // past `rc` now that dispatch_kernel returns the full window.
+    #[test]
+    fn forward_with_user_response_clamps_to_rc_and_does_not_leak() {
+        let mut scratch = vec![0xAAu8; 64];
+        scratch[..4].copy_from_slice(b"DATA");
+        let mut ctx = MockCtx {
+            state: MockState { pid: 1 },
+            rc: 4,
+            scratch,
+            writes: Vec::new(),
+        };
+        let rc = forward_request_with_user_response(&mut ctx, 0xABCD, &[], 100, 64);
+        assert_eq!(rc, 4);
+        assert_eq!(ctx.writes.len(), 1);
+        assert_eq!(ctx.writes[0].0, 100);
+        assert_eq!(ctx.writes[0].1, b"DATA"); // exactly rc bytes, no 0xAA leak
+    }
+
+    #[test]
+    fn forward_response_to_user_clamps_to_rc_and_does_not_leak() {
+        let mut scratch = vec![0xAAu8; 64];
+        scratch[..3].copy_from_slice(b"abc");
+        let mut ctx = MockCtx {
+            state: MockState { pid: 1 },
+            rc: 3,
+            scratch,
+            writes: Vec::new(),
+        };
+        let rc = forward_response_to_user(&mut ctx, 0xABCD, 200, 64);
+        assert_eq!(rc, 3);
+        assert_eq!(ctx.writes.len(), 1);
+        assert_eq!(ctx.writes[0], (200, b"abc".to_vec())); // no stale tail
     }
 }

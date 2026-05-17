@@ -2974,6 +2974,58 @@ fn wasmtime_registers_new_af_unix_socket_syscalls() {
     assert_eq!(user.call_export_i32("recvfrom").unwrap(), -9);
 }
 
+/// Regression for the host-trampoline out-parameter truncation: `recvfrom`
+/// returns `rc` = data-byte count, but the source address is laid out at
+/// scratch offset `data_cap` (>= rc). The old `min(rc, out_cap)` scratch
+/// copy-back dropped it, so the guest never saw a source address. This
+/// drives a real AF_UNIX datagram sendto→recvfrom through the wasmtime
+/// trampoline and asserts the sender's bound path is delivered.
+#[test]
+fn user_process_recvfrom_returns_source_address_through_trampoline() {
+    let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
+    let user_wat = r#"
+        (module
+          (import "env" "sys_socket_open" (func $open (param i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_bind" (func $bind (param i32 i32 i32) (result i32)))
+          (import "env" "sys_socket_sendto"
+            (func $sendto (param i32 i32 i32 i32 i32 i32) (result i64)))
+          (import "env" "sys_socket_recvfrom"
+            (func $recvfrom (param i32 i32 i32 i32 i32 i32) (result i64)))
+          (memory (export "memory") 1)
+          (data (i32.const 64) "\01\00/tmp/rx.sock")
+          (data (i32.const 96) "\01\00/tmp/tx.sock")
+          (data (i32.const 160) "ping")
+          (data (i32.const 512) "ZZZZZZZZZZZZZZZZ")
+          (global $rx (mut i32) (i32.const -1))
+          (global $tx (mut i32) (i32.const -1))
+          (func (export "setup") (result i32)
+            (global.set $rx (call $open (i32.const 3) (i32.const 5) (i32.const 0)))
+            (drop (call $bind (global.get $rx) (i32.const 64) (i32.const 14)))
+            (global.set $tx (call $open (i32.const 3) (i32.const 5) (i32.const 0)))
+            (drop (call $bind (global.get $tx) (i32.const 96) (i32.const 14)))
+            (i32.add (global.get $rx) (global.get $tx)))
+          (func (export "send") (result i32)
+            (i32.wrap_i64
+              (call $sendto (global.get $tx) (i32.const 160) (i32.const 4)
+                (i32.const 0) (i32.const 64) (i32.const 14))))
+          (func (export "recv") (result i32)
+            (i32.wrap_i64
+              (call $recvfrom (global.get $rx) (i32.const 256) (i32.const 64)
+                (i32.const 512) (i32.const 64) (i32.const 0)))))
+    "#;
+    let mut user = mk
+        .spawn_user_process(&wat::parse_str(user_wat).unwrap())
+        .unwrap();
+
+    assert!(user.call_export_i32("setup").unwrap() >= 0);
+    assert_eq!(user.call_export_i32("send").unwrap(), 4);
+    assert_eq!(user.call_export_i32("recv").unwrap(), 4);
+    assert_eq!(&user.read_memory(256, 4).unwrap(), b"ping");
+    // The decisive assertion: pre-seeded with 'Z' sentinel; the old
+    // truncation left it untouched, the fix delivers the sender's path.
+    assert_eq!(&user.read_memory(512, 12).unwrap(), b"/tmp/tx.sock");
+}
+
 #[test]
 fn user_process_socket_option_round_trips_through_kernel() {
     let mk = KernelHostInterface::load(ensure_kernel_wasm_built(), HostState::default()).unwrap();
