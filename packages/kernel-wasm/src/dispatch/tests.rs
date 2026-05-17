@@ -7840,6 +7840,65 @@ fn spec5_fchdir_getcwd_consistent_across_rename_root_mount() {
 }
 
 #[test]
+fn fchdir_open_dirfd_after_rename_uses_live_inode_path() {
+    // Regression: fchdir must validate and adopt the live inode path,
+    // not the stale path snapshot captured when the dirfd was opened.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/base", &mut []), 0);
+    let dfd = open_dir(b"/base");
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/base", b"/renamed"),
+            &mut []
+        ),
+        0
+    );
+
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0,
+        "fchdir should follow the live dir inode after rename"
+    );
+
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_CREAT | O_WRITE, b"after"),
+        &mut [],
+    );
+    assert!(fd >= 3, "relative create after fchdir returned {fd}");
+    assert_eq!(
+        dispatch(METHOD_SYS_PWRITE, 1, &p_req(fd as u32, 0, b"R"), &mut []),
+        1
+    );
+    assert_eq!(read_abs(b"/renamed/after"), b"R");
+}
+
+#[test]
+fn getcwd_removed_inode_anchored_cwd_is_enoent() {
+    // Regression: after an inode-anchored cwd is removed, getcwd must
+    // not report the stale cached path.
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/gone", &mut []), 0);
+    let dfd = open_dir(b"/gone");
+    assert_eq!(
+        dispatch(TEST_METHOD_SYS_FCHDIR, 1, &dfd.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(dispatch(METHOD_SYS_RMDIR, 1, b"/gone", &mut []), 0);
+
+    let mut buf = [0u8; 32];
+    assert_eq!(
+        dispatch(METHOD_SYS_GETCWD, 1, &[], &mut buf),
+        -(abi::ENOENT as i64),
+        "getcwd with a removed inode-anchored cwd must fail ENOENT"
+    );
+}
+
+#[test]
 fn spec5_fchdir_getcwd_across_rename_non_root_mount() {
     // Spec #5 (non-root mount): a backend mounted at /mnt must report a
     // /mnt-PREFIXED absolute cwd, never mount-relative `/` or `/child`.

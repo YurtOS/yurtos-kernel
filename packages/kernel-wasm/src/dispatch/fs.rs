@@ -66,9 +66,18 @@ pub(super) fn fchdir(caller_pid: u32, request: &[u8]) -> i64 {
             Some(_) => return -(abi::ENOTDIR as i64),
             None => return -(abi::EBADF as i64),
         };
-        if k.vfs.entry_type(&path) != 3 {
-            return -(abi::ENOENT as i64);
-        }
+        let path = match dir_inode {
+            Some(ino) => match k.vfs.dir_abspath_in(mount_id, ino) {
+                Some(abs) => abs,
+                None => return -(abi::ENOENT as i64),
+            },
+            None => {
+                if k.vfs.entry_type(&path) != 3 {
+                    return -(abi::ENOENT as i64);
+                }
+                path
+            }
+        };
         // Copy the fd's full (mount_id, dir_inode, path) capability into
         // cwd (inode-anchored when the fd carried one, else snapshot).
         k.process_mut(caller_pid).cwd = crate::kernel::Cwd {
@@ -86,9 +95,9 @@ pub(super) fn getcwd(caller_pid: u32, response: &mut [u8]) -> i64 {
     with_kernel(|k| {
         // B2.9 Task 6: refresh from the live inode→path mapping
         // (mount-prefix-composed) so getcwd stays correct after the
-        // cwd directory is renamed. `dir_inode == None` (degraded) OR
-        // `dir_abspath_in == None` (dir removed) ⇒ last cached
-        // `cwd.path` (POSIX-ish "(unreachable)" is out of scope).
+        // cwd directory is renamed. `dir_inode == None` is degraded
+        // path-snapshot mode; `dir_abspath_in == None` means the
+        // inode-anchored cwd was removed and has no linkable path.
         let cwd_state = k.process(caller_pid).cwd.clone();
         let cwd = match cwd_state.dir_inode {
             Some(ino) => match k.vfs.dir_abspath_in(cwd_state.mount_id, ino) {
@@ -98,7 +107,7 @@ pub(super) fn getcwd(caller_pid: u32, response: &mut [u8]) -> i64 {
                     }
                     abs
                 }
-                None => cwd_state.path,
+                None => return -(abi::ENOENT as i64),
             },
             None => cwd_state.path,
         };
