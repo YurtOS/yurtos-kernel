@@ -8432,3 +8432,211 @@ fn sigpending_buffer_too_small_is_einval() {
         -(abi::EINVAL as i64)
     );
 }
+
+// --- Slice B4a: durable KV (sys_idb_*) round-trip over native emulation ---
+
+fn idb_kv_req(store: &[u8], tail: &[u8]) -> Vec<u8> {
+    // get / delete / list share: u8 store_len + store + tail(key|prefix).
+    let mut r = vec![store.len() as u8];
+    r.extend_from_slice(store);
+    r.extend_from_slice(tail);
+    r
+}
+
+fn idb_put_req(store: &[u8], key: &[u8], value: &[u8]) -> Vec<u8> {
+    let mut r = vec![store.len() as u8];
+    r.extend_from_slice(store);
+    r.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    r.extend_from_slice(key);
+    r.extend_from_slice(value);
+    r
+}
+
+/// Decode the sys_idb_list response: u32 count + (u32 klen + key)*.
+fn idb_decode_list(buf: &[u8], n: usize) -> Vec<Vec<u8>> {
+    let body = &buf[..n];
+    let count = u32::from_le_bytes(body[0..4].try_into().unwrap()) as usize;
+    let mut keys = Vec::with_capacity(count);
+    let mut off = 4;
+    for _ in 0..count {
+        let klen = u32::from_le_bytes(body[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        keys.push(body[off..off + klen].to_vec());
+        off += klen;
+    }
+    keys
+}
+
+#[test]
+fn idb_put_get_roundtrip_and_missing_is_enoent() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_idb_mock();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_IDB_PUT,
+            1,
+            &idb_put_req(b"s", b"k", b"hello"),
+            &mut []
+        ),
+        0
+    );
+    let mut buf = [0u8; 16];
+    let n = dispatch(METHOD_SYS_IDB_GET, 1, &idb_kv_req(b"s", b"k"), &mut buf);
+    assert_eq!(n, 5);
+    assert_eq!(&buf[..5], b"hello");
+    // Missing key → -ENOENT.
+    assert_eq!(
+        dispatch(METHOD_SYS_IDB_GET, 1, &idb_kv_req(b"s", b"nope"), &mut buf),
+        -(abi::ENOENT as i64)
+    );
+}
+
+#[test]
+fn idb_delete_removes_and_missing_delete_is_ok() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_idb_mock();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_IDB_PUT,
+            1,
+            &idb_put_req(b"s", b"k", b"v"),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_IDB_DELETE, 1, &idb_kv_req(b"s", b"k"), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_IDB_GET,
+            1,
+            &idb_kv_req(b"s", b"k"),
+            &mut [0u8; 8]
+        ),
+        -(abi::ENOENT as i64)
+    );
+    // Deleting an absent key is still 0 (POSIX-ish idempotent contract).
+    assert_eq!(
+        dispatch(METHOD_SYS_IDB_DELETE, 1, &idb_kv_req(b"s", b"k"), &mut []),
+        0
+    );
+}
+
+#[test]
+fn idb_list_prefix_order_and_store_isolation() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_idb_mock();
+    for (k, v) in [(&b"ab"[..], &b"1"[..]), (b"a", b"2"), (b"b", b"3")] {
+        assert_eq!(
+            dispatch(METHOD_SYS_IDB_PUT, 1, &idb_put_req(b"s1", k, v), &mut []),
+            0
+        );
+    }
+    // Same key in a different store is independent.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_IDB_PUT,
+            1,
+            &idb_put_req(b"s2", b"a", b"X"),
+            &mut []
+        ),
+        0
+    );
+    let mut buf = [0u8; 64];
+    // Prefix "a" → ["a","ab"] (BTreeMap-ordered), not "b", not s2's "a".
+    let n = dispatch(METHOD_SYS_IDB_LIST, 1, &idb_kv_req(b"s1", b"a"), &mut buf);
+    assert!(n > 0);
+    assert_eq!(
+        idb_decode_list(&buf, n as usize),
+        vec![b"a".to_vec(), b"ab".to_vec()]
+    );
+    // Empty prefix → all of s1's keys, ordered.
+    let n = dispatch(METHOD_SYS_IDB_LIST, 1, &idb_kv_req(b"s1", b""), &mut buf);
+    assert_eq!(
+        idb_decode_list(&buf, n as usize),
+        vec![b"a".to_vec(), b"ab".to_vec(), b"b".to_vec()]
+    );
+    // s2 only has its own "a".
+    let n = dispatch(METHOD_SYS_IDB_LIST, 1, &idb_kv_req(b"s2", b""), &mut buf);
+    assert_eq!(idb_decode_list(&buf, n as usize), vec![b"a".to_vec()]);
+}
+
+#[test]
+fn idb_list_truncates_to_capacity_without_partial_entry() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_idb_mock();
+    for k in [&b"k1"[..], b"k2", b"k3"] {
+        assert_eq!(
+            dispatch(METHOD_SYS_IDB_PUT, 1, &idb_put_req(b"s", k, b"v"), &mut []),
+            0
+        );
+    }
+    // 4 (count) + one entry (4 + 2) = 10 bytes fits exactly one key.
+    let mut small = [0u8; 10];
+    let n = dispatch(METHOD_SYS_IDB_LIST, 1, &idb_kv_req(b"s", b""), &mut small);
+    assert!(n > 0 && (n as usize) <= 10);
+    let keys = idb_decode_list(&small, n as usize);
+    assert_eq!(keys.len(), 1, "count must reflect only what fit");
+    assert_eq!(keys[0], b"k1");
+}
+
+#[test]
+fn idb_get_too_small_buffer_is_e2big_not_required_size() {
+    // PR #61 review P2: kh_idb_get's ABI contract returns -E2BIG when
+    // the output buffer is smaller than the stored value (Wasmtime and
+    // JS hosts both do this). The native test emulation must match, or
+    // unit tests would validate behavior real hosts never produce.
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_idb_mock();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_IDB_PUT,
+            1,
+            &idb_put_req(b"s", b"k", b"hello"),
+            &mut []
+        ),
+        0
+    );
+    // 2-byte buffer for a 5-byte value → -E2BIG, nothing written.
+    let mut tiny = [0xAAu8; 2];
+    assert_eq!(
+        dispatch(METHOD_SYS_IDB_GET, 1, &idb_kv_req(b"s", b"k"), &mut tiny),
+        -(abi::E2BIG as i64),
+        "too-small idb_get must be -E2BIG, not a positive required size"
+    );
+    assert_eq!(tiny, [0xAAu8; 2], "nothing written on E2BIG");
+}
+
+#[test]
+fn idb_list_buffer_too_small_for_header_matches_host_count_size() {
+    // PR #61 review P3: pin the get/list asymmetry as DELIBERATE.
+    // kh_idb_list (unlike kh_idb_get/-E2BIG) returns the positive byte
+    // count it would write — the 4-byte count header at minimum — on
+    // both real hosts (JS + wasmtime). The emulation must match that,
+    // NOT return -E2BIG, so this is locked here.
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_idb_mock();
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_IDB_PUT,
+            1,
+            &idb_put_req(b"s", b"k", b"v"),
+            &mut []
+        ),
+        0
+    );
+    // 2-byte buffer can't fit the 4-byte count header → host-faithful
+    // positive count-header size (4), nothing written; NOT -E2BIG.
+    let mut tiny = [0xAAu8; 2];
+    assert_eq!(
+        dispatch(METHOD_SYS_IDB_LIST, 1, &idb_kv_req(b"s", b""), &mut tiny),
+        4,
+        "idb_list too-small header must match the real hosts (positive 4), not -E2BIG"
+    );
+    assert_eq!(
+        tiny, [0xAAu8; 2],
+        "nothing written when the header does not fit"
+    );
+}
