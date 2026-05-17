@@ -314,15 +314,12 @@ pub struct RtSignal {
 /// inode-anchored PathResolver refresh lands in Task 6.
 #[derive(Clone, Debug)]
 pub struct Cwd {
-    // Set by chdir/fchdir and carried across fork/clone, but not yet
-    // *read* to change resolution: the PathResolver cwd-refresh
-    // invariant + getcwd dir_path composition that consume these land
-    // in B2.9 Task 6. Mirrors the existing `#[allow(dead_code)]` on
-    // `MountTable::{resolve_at_in,dir_path_in}` (same Task-6 deferral).
-    #[allow(dead_code)]
+    // Set by chdir/fchdir, carried across fork/clone, and consumed by
+    // the B2.9 Task 6 `PathResolver` cwd-refresh invariant + `getcwd`
+    // mount-prefix composition: every relative-path syscall reconciles
+    // the cached `path` against the live directory this inode names.
     pub mount_id: crate::vfs::MountId,
     /// `Some` ⇒ inode-anchored; `None` ⇒ path-snapshot degraded mode.
-    #[allow(dead_code)]
     pub dir_inode: Option<u64>,
     /// Always the normalized ABSOLUTE cwd snapshot. Default `/`.
     pub path: Vec<u8>,

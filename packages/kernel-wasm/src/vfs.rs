@@ -236,6 +236,34 @@ pub type MountId = u32;
 
 pub const ROOT_MOUNT: MountId = 0;
 
+/// Compose a mount-ABSOLUTE path from a mount `prefix` (root mount =
+/// `/`, others e.g. `/mnt` with no trailing slash) and a backend's
+/// mount-RELATIVE `rel` (always starts `/`; the mount root is `/`).
+/// Root mount: prefix `/` + rel `/d` ⇒ `/d`; prefix `/` + rel `/` ⇒
+/// `/`. Non-root: prefix `/mnt` + rel `/` ⇒ `/mnt`; prefix `/mnt` +
+/// rel `/d` ⇒ `/mnt/d`. Never doubles or drops the separator.
+pub(crate) fn compose_mount_abspath(prefix: &[u8], rel: &[u8]) -> Vec<u8> {
+    if prefix == b"/" {
+        // Root mount: the mount-relative path *is* the absolute path
+        // (matching `MountTable::resolve`'s root branch).
+        return if rel.is_empty() {
+            b"/".to_vec()
+        } else {
+            rel.to_vec()
+        };
+    }
+    // Non-root mount: prefix + rel, where rel == b"/" means the mount
+    // root itself (just the prefix).
+    let mut out = prefix.to_vec();
+    if rel != b"/" && !rel.is_empty() {
+        if !rel.starts_with(b"/") {
+            out.push(b'/');
+        }
+        out.extend_from_slice(rel);
+    }
+    out
+}
+
 /// Mount table. Resolution is longest-prefix-match against the
 /// installed mounts. The root mount (prefix `/`) is mandatory and
 /// catches any path that no specific mount claims. Mount ids are
@@ -308,7 +336,7 @@ impl MountTable {
     }
 
     /// One-component resolve within `(mount_id, dir_inode)`.
-    #[allow(dead_code)] // Consumed by the inode-anchored openat walk (B2.9 Task 6).
+    // Consumed by the inode-anchored openat walk (B2.9 Task 6).
     pub fn resolve_at_in(
         &self,
         mount_id: MountId,
@@ -321,9 +349,41 @@ impl MountTable {
     }
 
     /// Live mount-relative path of `(mount_id, dir_inode)`.
-    #[allow(dead_code)] // Consumed by the PathResolver cwd-refresh invariant (B2.9 Task 6).
+    // Consumed by the PathResolver cwd-refresh invariant (B2.9 Task 6).
     pub fn dir_path_in(&self, mount_id: MountId, dir_inode: u64) -> Option<Vec<u8>> {
         self.mounts[mount_id as usize].backend.dir_path(dir_inode)
+    }
+
+    /// Absolute path prefix the mount is rooted at. The root mount
+    /// reports `/`; a backend mounted at `/mnt` reports `/mnt` (no
+    /// trailing slash, matching the `Mount::prefix` invariant). B2.9
+    /// Task 6 composes this with `dir_path_in` so a refreshed cwd /
+    /// `getcwd` is the mount-ABSOLUTE path, never mount-relative.
+    pub fn mount_prefix(&self, mount_id: MountId) -> Vec<u8> {
+        self.mounts[mount_id as usize].prefix.clone()
+    }
+
+    /// Public longest-prefix mount resolver: `(mount_id, relpath)` for
+    /// an absolute path, mirroring the private `resolve`. B2.9 Task 6's
+    /// openat walk uses it to detect a child-mount crossing (the
+    /// reconstructed path resolves to a *different* mount than the
+    /// dirfd's) so it can stop the inode walk and re-delegate to the
+    /// path-based `sys_open` (which routes through this same
+    /// longest-prefix logic).
+    pub fn mount_of(&self, path: &[u8]) -> Option<(MountId, Vec<u8>)> {
+        self.resolve(path)
+    }
+
+    /// Compose the mount-ABSOLUTE path of `(mount_id, dir_inode)` from
+    /// the backend's live mount-relative `dir_path` and the mount
+    /// prefix. `None` ⇒ the inode is no longer a live directory
+    /// (rmdir/unlink) — callers map that to `ENOENT`. Normalizes the
+    /// join so the root mount yields `/...` and a `/mnt` mount yields
+    /// `/mnt/...` (never a doubled or missing separator).
+    pub fn dir_abspath_in(&self, mount_id: MountId, dir_inode: u64) -> Option<Vec<u8>> {
+        let rel = self.dir_path_in(mount_id, dir_inode)?;
+        let prefix = self.mount_prefix(mount_id);
+        Some(compose_mount_abspath(&prefix, &rel))
     }
 
     pub fn open(&mut self, path: &[u8], flags: u32) -> Option<(MountId, u64)> {
