@@ -6167,8 +6167,8 @@ fn open_follows_symlink_to_target() {
 #[test]
 fn open_eloops_on_circular_symlinks() {
     let _g = crate::kernel::TestGuard::acquire();
-    // a -> b -> a — open should bail with -EINVAL after the
-    // hop limit (SYMLOOP_MAX 40).
+    // a -> b -> a — open must fail with -ELOOP (Linux SYMLOOP_MAX 40),
+    // not -EINVAL: a too-long symlink chain is errno ELOOP per POSIX.
     let mut sreq = 2_u32.to_le_bytes().to_vec();
     sreq.extend_from_slice(b"/b");
     sreq.extend_from_slice(b"/a");
@@ -6179,7 +6179,61 @@ fn open_eloops_on_circular_symlinks() {
     dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []);
 
     let rc = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/a"), &mut []);
-    assert!(rc < 0, "circular symlink should error: rc = {rc}");
+    assert_eq!(
+        rc,
+        -(abi::ELOOP as i64),
+        "circular symlink must be -ELOOP, got rc = {rc}"
+    );
+}
+
+// The symlink-loop guard lives in three independent code paths
+// (open, realpath, exec); each must surface -ELOOP, not -EINVAL.
+
+#[test]
+fn realpath_eloops_on_circular_symlinks() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/b");
+    sreq.extend_from_slice(b"/a");
+    dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []);
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/a");
+    sreq.extend_from_slice(b"/b");
+    dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []);
+
+    let mut out = [0u8; 64];
+    let rc = dispatch(METHOD_SYS_REALPATH, 1, b"/a", &mut out);
+    assert_eq!(
+        rc,
+        -(abi::ELOOP as i64),
+        "realpath on a symlink loop must be -ELOOP, got rc = {rc}"
+    );
+}
+
+#[test]
+fn spawn_eloops_on_circular_executable_symlink() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/b");
+    sreq.extend_from_slice(b"/a");
+    dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []);
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/a");
+    sreq.extend_from_slice(b"/b");
+    dispatch(METHOD_SYS_SYMLINK, 1, &sreq, &mut []);
+
+    // spawn(path_len, path, [argv0]) with the circular link as the
+    // executable path: the exec symlink walk must bail with -ELOOP.
+    let mut sreq = 2_u32.to_le_bytes().to_vec();
+    sreq.extend_from_slice(b"/a");
+    sreq.extend_from_slice(&2_u32.to_le_bytes());
+    sreq.extend_from_slice(b"/a");
+    let rc = dispatch(METHOD_SYS_SPAWN, 1, &sreq, &mut []);
+    assert_eq!(
+        rc,
+        -(abi::ELOOP as i64),
+        "spawn through a symlink loop must be -ELOOP, got rc = {rc}"
+    );
 }
 
 #[test]
