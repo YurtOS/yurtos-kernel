@@ -149,9 +149,12 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        // Follow symlinks (shared with stat_path so the semantics
-        // cannot drift): up to SYMLOOP_MAX hops, each re-authorized.
-        // Negate-and-widen at the boundary — resolver convention.
+        // Terminal-only symlink follow (up to SYMLOOP_MAX hops, each
+        // re-authorized). NOTE: unlike stat/lstat (which resolve every
+        // intermediate component since #134 Part 2), open still
+        // resolves only the terminal chain — so open() can fail on a
+        // path stat() succeeds on. Bringing open to per-component
+        // parity is tracked in #142.
         let resolved = match follow_symlinks(k, caller_pid, path) {
             Ok(p) => p,
             Err(errno) => return -(errno as i64),
@@ -494,6 +497,12 @@ fn normalize_readable_path(
 /// resolved path or a **positive POSIX errno** (`ELOOP` once the hop
 /// limit is exceeded; whatever `normalize_readable_path` raises
 /// otherwise).
+///
+/// **Terminal-only**: this resolves the link chain of the path as a
+/// whole, not intermediate components. Used by `sys_open` only.
+/// `stat_path`/`lstat_path` use `resolve_symlinks_per_component`
+/// (POSIX intermediate resolution, #134 Part 2); bringing `sys_open`
+/// to that parity is tracked in #142.
 ///
 /// Convention: resolvers return `Result<_, i32>` with a positive POSIX
 /// errno. The dispatch boundary calls `.map_err(|e| -(e as i64))` once

@@ -12487,11 +12487,13 @@ fn stat_lstat_intermediate_proc_symlink_is_gated() {
         "lstat: intermediate /proc/<other> symlink must be gated"
     );
     make_root(1);
-    let rc = dispatch(METHOD_SYS_STAT, 1, b"/t/hop/status", &mut out);
-    assert_ne!(
-        rc,
-        -(abi::EPERM as i64),
-        "root caller must not be gated: {rc}"
+    // Root is not gated AND the link fully resolves to the published
+    // /proc/2/status — assert the concrete success (16), not merely
+    // "not EPERM", so a regression that ENOENTs here is caught.
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/t/hop/status", &mut out),
+        16,
+        "root caller resolves the intermediate /proc/2 symlink"
     );
 }
 
@@ -12567,4 +12569,51 @@ fn lstat_trailing_slash_on_terminal_symlink_known_residual_146() {
         "KNOWN RESIDUAL #146: trailing slash does not force-follow; \
          symdir reported as S_IFLNK (POSIX would follow to S_IFDIR)"
     );
+}
+
+/// Issue #134 Part 2: exercises the relative-symlink-target join in
+/// resolve_symlinks_per_component (every other test uses absolute
+/// targets). A plain relative target joins against the link's parent;
+/// a `../`-prefixed target is collapsed lexically by the per-hop
+/// normalize_readable_path.
+#[test]
+fn stat_resolves_relative_intermediate_symlink_targets() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a/real", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a/b", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a/sib", &mut []), 0);
+    let mut r1 = (b"/a/real/f".len() as u32).to_le_bytes().to_vec();
+    r1.extend_from_slice(b"/a/real/f");
+    r1.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &r1, &mut []);
+    let mut r2 = (b"/a/sib/g".len() as u32).to_le_bytes().to_vec();
+    r2.extend_from_slice(b"/a/sib/g");
+    r2.extend_from_slice(b"y");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &r2, &mut []);
+
+    // (a) plain relative target: /a/sym -> "real" (sibling dir under /a)
+    let mut s1 = (b"real".len() as u32).to_le_bytes().to_vec();
+    s1.extend_from_slice(b"real");
+    s1.extend_from_slice(b"/a/sym");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s1, &mut []), 0);
+    // (b) ../-relative target: /a/b/up -> "../sib"
+    let mut s2 = (b"../sib".len() as u32).to_le_bytes().to_vec();
+    s2.extend_from_slice(b"../sib");
+    s2.extend_from_slice(b"/a/b/up");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s2, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/a/sym/f", &mut out),
+        16,
+        "relative target joins against the link's parent: /a/sym/f -> /a/real/f"
+    );
+    assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 4);
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/a/b/up/g", &mut out),
+        16,
+        "../-relative target collapses lexically: /a/b/up/g -> /a/sib/g"
+    );
+    assert_eq!(u32::from_le_bytes(out[8..12].try_into().unwrap()), 4);
 }
