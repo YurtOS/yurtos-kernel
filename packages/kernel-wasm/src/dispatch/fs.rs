@@ -1,5 +1,5 @@
 use crate::abi;
-use crate::kernel::{with_kernel, Kernel};
+use crate::kernel::{with_kernel, CwdRefresh, Kernel};
 use crate::path::PathResolver;
 
 use super::{proc_pid_visible, take_bytes, ID_NO_CHANGE};
@@ -95,20 +95,13 @@ pub(super) fn getcwd(caller_pid: u32, response: &mut [u8]) -> i64 {
     with_kernel(|k| {
         // B2.9 Task 6: refresh from the live inode→path mapping
         // (mount-prefix-composed) so getcwd stays correct after the
-        // cwd directory is renamed. `dir_inode == None` is degraded
-        // path-snapshot mode; `dir_abspath_in == None` means the
-        // inode-anchored cwd was removed and has no linkable path.
-        let cwd_state = k.process(caller_pid).cwd.clone();
-        let cwd = match cwd_state.dir_inode {
-            Some(ino) => match k.vfs.dir_abspath_in(cwd_state.mount_id, ino) {
-                Some(abs) => {
-                    if abs != cwd_state.path {
-                        k.process_mut(caller_pid).cwd.path = abs.clone();
-                    }
-                    abs
-                }
-                None => return -(abi::ENOENT as i64),
-            },
+        // cwd directory is renamed. The anchored ladder is shared with
+        // `PathResolver::resolved_cwd` via `refresh_anchored_cwd`.
+        let cwd = match k.refresh_anchored_cwd(caller_pid) {
+            CwdRefresh::Anchored(abs) => abs,
+            // Inode-anchored cwd whose directory was removed: no
+            // linkable path (POSIX).
+            CwdRefresh::AnchoredRemoved => return -(abi::ENOENT as i64),
             // Degraded-backend cwd (hostfs/overlay → `dir_inode ==
             // None`, e.g. after `chdir` into a `/host/...` mount) OR
             // the `Process::new` default `/`. In both cases no inode is
@@ -118,7 +111,7 @@ pub(super) fn getcwd(caller_pid: u32, response: &mut [u8]) -> i64 {
             // `PathResolver::resolved_cwd` does (that one is gated on
             // `cwd.path == b"/"`); do not "simplify" this to `b"/"`,
             // which would corrupt a degraded non-root cwd.
-            None => cwd_state.path,
+            CwdRefresh::Degraded(c) => c.path,
         };
         let required = cwd.len() + 1;
         if response.len() < required {
