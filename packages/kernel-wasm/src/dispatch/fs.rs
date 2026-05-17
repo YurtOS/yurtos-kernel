@@ -352,14 +352,39 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
                     cur_inode = child;
                     cur_abs = next_abs;
                 }
-                // Any non-descendable non-final component — symlink
-                // (filetype 7), regular file (filetype 4), or missing
-                // (`None`): the inode walk can't continue; the
-                // centralized component-aware resolver below handles
-                // it (intermediate symlink resolution, ENOENT, or
-                // ENOTDIR, respectively).
+                // Any non-descendable non-final component. First rule
+                // out a child-mount crossing: a mount point (`/dev`,
+                // `/proc`, …) is a MountTable concept, invisible to the
+                // PARENT backend, so `resolve_at` returns `None` for it
+                // exactly like a missing entry. That is NOT a
+                // non-descendable intermediate — `realpath(parent)`
+                // would wrongly `ENOENT` because the child backend need
+                // not type its own root via `entry_type`. Re-delegate
+                // the whole path to `sys_open`, which routes through the
+                // longest-prefix mount table (the pre-B2.9
+                // path-snapshot behaviour). Mirrors the descend arm's
+                // `crosses_mount` guard.
                 _ => {
-                    needs_path_resolver = true;
+                    let mut next_abs = cur_abs.clone();
+                    if next_abs.last() != Some(&b'/') {
+                        next_abs.push(b'/');
+                    }
+                    next_abs.extend_from_slice(name);
+                    let crosses_mount = with_kernel(|k| {
+                        k.vfs
+                            .mount_of(&next_abs)
+                            .map(|(m, _)| m != mount_id)
+                            .unwrap_or(true)
+                    });
+                    // Same-mount symlink (ft 7), regular file (ft 4),
+                    // or genuinely missing entry: the centralized
+                    // resolver below handles it (intermediate symlink
+                    // resolution, ENOENT, or ENOTDIR respectively). A
+                    // mount crossing instead falls through to the
+                    // mount-routed `sys_open(joined)`.
+                    if !crosses_mount {
+                        needs_path_resolver = true;
+                    }
                     break;
                 }
             }

@@ -7915,6 +7915,36 @@ fn openat_redelegation_matches_plain_open_for_socket_and_proc_intermediates() {
 }
 
 #[test]
+fn openat_into_child_mount_root_not_visible_in_parent_backend() {
+    // P1 regression: an inode-anchored dirfd on `/`; the root Ramfs
+    // backend has no `/dev` entry (mounts are a MountTable concept), so
+    // `resolve_at(root, "dev")` returns None. The inode walk must NOT
+    // treat that as a non-descendable intermediate and realpath(parent)
+    // — /dev's backend does not type its own root, so realpath("/dev")
+    // would ENOENT. It must re-delegate the whole path to `sys_open`,
+    // which routes `/dev/null` through the longest-prefix mount table
+    // (what the pre-B2.9 path-snapshot openat did). Pinned as
+    // equivalence with plain `open` so it cannot silently diverge.
+    let _g = crate::kernel::TestGuard::acquire();
+    let rootfd = open_dir(b"/");
+    let via_openat = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(rootfd, 0, b"dev/null"),
+        &mut [],
+    );
+    let via_open = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/dev/null"), &mut []);
+    assert!(
+        via_open >= 3,
+        "precondition: /dev/null opens via plain open ({via_open})"
+    );
+    assert!(
+        via_openat >= 3,
+        "openat(/, \"dev/null\") must reach the /dev child mount, got {via_openat}"
+    );
+}
+
+#[test]
 fn spec5_fchdir_getcwd_consistent_across_rename_root_mount() {
     // Spec #5: fchdir(open /base); rename /base → /renamed; a relative
     // create lands under /renamed; getcwd reports /renamed.
