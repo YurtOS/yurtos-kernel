@@ -1025,6 +1025,8 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
     errno = (rc == -2) ? EAGAIN : EIO;
     return -1;
   }
+  int ctrunc_signal = (n_fds & YURT_RECVMSG_CTRUNC_BIT) ? 1 : 0;
+  n_fds &= ~YURT_RECVMSG_CTRUNC_BIT;
   ssize_t nbytes = (ssize_t)rc;
 
   size_t copied = 0;
@@ -1069,6 +1071,10 @@ ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags) {
     }
   } else if (n_fds > 0) {
     /* Caller provided no control buffer but ancillary data arrived */
+    msg->msg_flags |= MSG_CTRUNC;
+  }
+
+  if (ctrunc_signal) {
     msg->msg_flags |= MSG_CTRUNC;
   }
 

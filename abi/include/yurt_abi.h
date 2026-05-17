@@ -34,6 +34,12 @@ extern "C" {
 #define YURT_FETCH_REDIRECT_FOLLOW 0u
 #define YURT_FETCH_REDIRECT_MANUAL 1u
 
+/* recvmsg: host sets this reserved bit in the n_fds out-value when
+ * SCM_RIGHTS was truncated; the low bits are the fd count (<=64).
+ * Bit30 (not bit31: n_fds is read into a signed int).
+ * spec 2026-05-17-scm-rights-ctrunc */
+#define YURT_RECVMSG_CTRUNC_BIT 0x40000000
+
 typedef struct {
   uint32_t size;
   uint16_t version;
