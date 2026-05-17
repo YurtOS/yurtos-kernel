@@ -27,6 +27,9 @@ export const USER_GID = 1000;
 export const RLIMIT_NOFILE = 7;
 export const RLIM_INFINITY_U64 = 0xffff_ffff_ffff_ffffn;
 export const DEFAULT_MAX_PROCESSES = 64;
+export const POSIX_EBADF = 9;
+export const POSIX_EINVAL = 22;
+export const POSIX_EMFILE = 24;
 const SIGCHLD = 17;
 
 export class ProcessLimitError extends Error {
@@ -36,6 +39,13 @@ export class ProcessLimitError extends Error {
   constructor(readonly maxProcesses: number) {
     super(`process limit exceeded: max ${maxProcesses}`);
     this.name = "ProcessLimitError";
+  }
+}
+
+export class FdDupMinError extends Error {
+  constructor(readonly errno: number, message: string) {
+    super(message);
+    this.name = "FdDupMinError";
   }
 }
 
@@ -1171,14 +1181,40 @@ export class ProcessKernel {
   }
 
   dupMin(pid: number, fd: number, minFd: number): number {
-    if (minFd < 0) throw new Error(`dupMin: invalid min fd ${minFd}`);
+    if (minFd < 0) {
+      throw new FdDupMinError(
+        POSIX_EINVAL,
+        `dupMin: invalid min fd ${minFd}`,
+      );
+    }
     const fdTable = this.fdTables.get(pid);
-    if (!fdTable) throw new Error(`No fd table for pid ${pid}`);
+    if (!fdTable) {
+      throw new FdDupMinError(POSIX_EBADF, `No fd table for pid ${pid}`);
+    }
     const srcTarget = fdTable.get(fd);
-    if (!srcTarget) throw new Error(`dupMin: src fd ${fd} not found`);
+    if (!srcTarget) {
+      throw new FdDupMinError(
+        POSIX_EBADF,
+        `dupMin: src fd ${fd} not found`,
+      );
+    }
+    const softLimit = this.getResourceLimit(pid, RLIMIT_NOFILE)?.soft ??
+      Infinity;
+    if (minFd >= softLimit) {
+      throw new FdDupMinError(
+        POSIX_EINVAL,
+        `dupMin: min fd ${minFd} exceeds RLIMIT_NOFILE ${softLimit}`,
+      );
+    }
 
     let newFd = minFd;
-    while (fdTable.has(newFd)) newFd++;
+    while (newFd < softLimit && fdTable.has(newFd)) newFd++;
+    if (newFd >= softLimit) {
+      throw new FdDupMinError(
+        POSIX_EMFILE,
+        `dupMin: fd table exhausted below RLIMIT_NOFILE ${softLimit}`,
+      );
+    }
 
     if (srcTarget.type === "vfs_file") {
       srcTarget.fdTable.dupToShared(srcTarget.fd, newFd);

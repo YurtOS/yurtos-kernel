@@ -714,6 +714,9 @@ describe("Kernel ABI canaries", { sanitizeOps: false, sanitizeResources: false }
     expect(result.stdout).toContain(
       '{"case":"setrlimit_raise_hard_eperm","exit":0,"v":0}',
     );
+    expect(result.stdout).toContain(
+      '{"case":"setrlimit","exit":0,"v":5}',
+    );
   });
 
   describe("posix-runtime-canary", () => {

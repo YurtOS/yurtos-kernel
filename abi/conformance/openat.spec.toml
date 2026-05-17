@@ -1,0 +1,9 @@
+canary = "posix-runtime-canary"
+symbol = "openat"
+
+[[case]]
+name = "openat_rename_stability"
+inputs = "mkdir base, open(base,O_DIRECTORY), rename(base,renamed), openat(fd,\"x\",O_CREAT|O_WRONLY), read renamed/x"
+expected.exit = 0
+expected.stdout = "openat_rename_stability:ok"
+expected.note = "B2.9 DoD: a directory fd is anchored to the directory inode, not a path snapshot; renaming the directory behind the open dirfd makes openat resolve under the inode's current path (renamed/x), never the stale base/x"

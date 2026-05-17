@@ -6,6 +6,7 @@ use crate::kh;
 
 use super::{
     close_entry, close_fd_number, has_buffer_capacity, inc_entry_ref, take_bytes, MSG_PEEK,
+    RIGHTS_TRUNCATED,
 };
 
 const SOCKET_OPT_TCP_NODELAY: u32 = 1;
@@ -278,8 +279,20 @@ fn install_fd_rights_truncated(
         return -(abi::EINVAL as i64);
     }
     let count = rights.len() as u32;
-    out[0..4].copy_from_slice(&count.to_le_bytes());
     let fit = (out.len() - 4) / 4;
+    let installed = count.min(fit as u32);
+    // #104 (M2): POSIX recvmsg sets MSG_CTRUNC and discards (closes)
+    // the overflow fds when the ancillary buffer is too small. The
+    // header must report the *installed* count (not the phantom full
+    // `count`) so the guest can build a correct cmsg, with bit 31
+    // (RIGHTS_TRUNCATED) flagging the discard so hosts can raise
+    // MSG_CTRUNC. Honors the af-unix spec's `truncated_ancillary`.
+    let header = if count > fit as u32 {
+        installed | RIGHTS_TRUNCATED
+    } else {
+        installed
+    };
+    out[0..4].copy_from_slice(&header.to_le_bytes());
     for (index, entry) in rights.into_iter().enumerate() {
         if index < fit {
             let p = k.process_mut(caller_pid);
@@ -291,7 +304,7 @@ fn install_fd_rights_truncated(
             close_entry(k, entry);
         }
     }
-    (4 + count.min(fit as u32) as usize * 4) as i64
+    (4 + installed as usize * 4) as i64
 }
 
 fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>) -> i64 {
@@ -1028,8 +1041,15 @@ pub(super) fn sys_socket_sendto(caller_pid: u32, request: &[u8]) -> i64 {
         Ok(parts) => parts,
         Err(rc) => return rc,
     };
-    if flags != 0 {
-        return -(abi::EINVAL as i64);
+    // MSG_DONTWAIT (sends are already non-blocking here) and
+    // MSG_NOSIGNAL (no SIGPIPE generation) are accepted and ignored,
+    // as POSIX/Linux callers expect. Any other non-zero flag is an
+    // unsupported operation, not a malformed request — EOPNOTSUPP,
+    // not the catch-all EINVAL.
+    const MSG_DONTWAIT: u32 = 0x40;
+    const MSG_NOSIGNAL: u32 = 0x4000;
+    if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
+        return -(abi::EOPNOTSUPP as i64);
     }
     with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
         Ok(id) => socket_sendto_id(k, id, addr, data),

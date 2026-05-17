@@ -28,5 +28,23 @@
 #   [[divergence]]
 #   canary = "<canary-name>"   # e.g. "dup2-canary"
 #   case   = "<case-name>"     # the spec.toml [[case]].name
-#   slice  = "B<n>"            # owning slice that will fix it
+#   slice  = "B<n>"            # owning slice (see below)
 #   reason = "<why ts and wasm differ today>"
+#
+# `slice` is normally the owning slice that WILL FIX the divergence
+# (the row is then deleted in that slice's PR). One sanctioned
+# exception: an intentional, POSIX-faithful divergence that is never
+# "fixed" because it is retired when the TS kernel is deleted. For
+# those, `slice` is the introducing slice ("B<n>") and `reason` ends
+# with "retired with the TS kernel" (the row is deleted with the TS
+# kernel, not by a later slice). The differ only requires a non-empty
+# `slice` string; this convention keeps the field meaningful rather
+# than silently overloaded. See the parity matrix "Tracked
+# exceptions" for the openat_rename_stability instance.
+
+[[divergence]]
+canary = "posix-runtime-canary"
+case = "openat_rename_stability"
+slice = "B2.9"  # owning slice — introduced & documents this divergence. NOT "fixed" by a later slice: it is a deliberate TS-retirement divergence retired when the TS kernel is deleted (see the parity matrix "Tracked exceptions" + the B2.9 spec).
+# observed: B2.9 made the Rust kernel.wasm dirfd inode-anchored (POSIX-faithful): open(dir,O_DIRECTORY); rename(dir); openat(fd,"x",O_CREAT) creates renamed/x and exits openat_rename_stability:ok. The TS kernel's dirFds is a Map<fd,string> path snapshot (wasi-host.ts:409), so after the rename openat resolves the stale base path and the case fails — a genuine, reproducible exit/stdout divergence, not allowlisting a matching pair.
+reason = "Rust POSIX-faithful dirfd; TS path-snapshot — retired with the TS kernel"

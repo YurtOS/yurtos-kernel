@@ -26,7 +26,7 @@ use anyhow::{anyhow, Result};
 use wasmtime::{Caller, Linker};
 
 use crate::kernel_host_interface::UserState;
-use yurt_kernel_host_interface_core::checked_guest_buffer_len;
+use yurt_kernel_host_interface_core::{checked_guest_buffer_len, checked_guest_buffer_sum};
 
 const WASI: &str = "wasi_snapshot_preview1";
 
@@ -69,6 +69,19 @@ fn errno_from_kernel(rc: i64) -> i32 {
     }
 }
 
+fn checked_wasi_guest_len(len: u32) -> std::result::Result<usize, i32> {
+    checked_guest_buffer_len(len).map_err(|_| EINVAL)
+}
+
+fn checked_wasi_guest_sum(parts: &[u32]) -> std::result::Result<usize, i32> {
+    checked_guest_buffer_sum(parts).map_err(|_| EINVAL)
+}
+
+fn checked_wasi_iovec_bytes(iovs_len: u32) -> std::result::Result<usize, i32> {
+    let bytes = iovs_len.checked_mul(8).ok_or(EINVAL)?;
+    checked_wasi_guest_len(bytes)
+}
+
 pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
     // ── fd_write(fd, iovs_ptr, iovs_len, nwritten_ptr) ──────────────
     linker.func_wrap(
@@ -85,21 +98,40 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 None => return EINVAL,
             };
 
+            let iovs_cap = match checked_wasi_iovec_bytes(iovs_len) {
+                Ok(n) => n / 8,
+                Err(rc) => return rc,
+            };
+
             // Read each iovec, accumulate the payload, then write all
             // at once — a single sys_write call per fd_write keeps the
             // semantics simple (fd_write is allowed to be one
             // logical write).
-            let mut payload: Vec<u8> = Vec::new();
+            let mut iovs: Vec<(u32, u32)> = Vec::with_capacity(iovs_cap);
+            let mut total_len: u32 = 0;
             for i in 0..iovs_len {
                 let iov_addr = iovs_ptr as usize + (i as usize) * 8;
                 let mut iov = [0u8; 8];
                 if memory.read(&caller, iov_addr, &mut iov).is_err() {
                     return EINVAL;
                 }
-                let buf_ptr = u32::from_le_bytes(iov[0..4].try_into().unwrap()) as usize;
-                let buf_len = u32::from_le_bytes(iov[4..8].try_into().unwrap()) as usize;
-                let mut chunk = vec![0u8; buf_len];
-                if buf_len > 0 && memory.read(&caller, buf_ptr, &mut chunk).is_err() {
+                let buf_ptr = u32::from_le_bytes(iov[0..4].try_into().unwrap());
+                let buf_len = u32::from_le_bytes(iov[4..8].try_into().unwrap());
+                total_len = match checked_wasi_guest_sum(&[total_len, buf_len]) {
+                    Ok(n) => n as u32,
+                    Err(rc) => return rc,
+                };
+                iovs.push((buf_ptr, buf_len));
+            }
+
+            let mut payload: Vec<u8> = Vec::with_capacity(total_len as usize);
+            for (buf_ptr, buf_len) in iovs {
+                let len = match checked_wasi_guest_len(buf_len) {
+                    Ok(n) => n,
+                    Err(rc) => return rc,
+                };
+                let mut chunk = vec![0u8; len];
+                if len > 0 && memory.read(&caller, buf_ptr as usize, &mut chunk).is_err() {
                     return EINVAL;
                 }
                 payload.extend_from_slice(&chunk);
@@ -147,8 +179,13 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 None => return EINVAL,
             };
 
+            let iovs_cap = match checked_wasi_iovec_bytes(iovs_len) {
+                Ok(n) => n / 8,
+                Err(rc) => return rc,
+            };
+
             // Compute total capacity across iovecs.
-            let mut iovs: Vec<(u32, u32)> = Vec::with_capacity(iovs_len as usize);
+            let mut iovs: Vec<(u32, u32)> = Vec::with_capacity(iovs_cap);
             let mut total_cap: u32 = 0;
             for i in 0..iovs_len {
                 let iov_addr = iovs_ptr as usize + (i as usize) * 8;
@@ -159,14 +196,21 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 let buf_ptr = u32::from_le_bytes(iov[0..4].try_into().unwrap());
                 let buf_len = u32::from_le_bytes(iov[4..8].try_into().unwrap());
                 iovs.push((buf_ptr, buf_len));
-                total_cap = total_cap.saturating_add(buf_len);
+                total_cap = match checked_wasi_guest_sum(&[total_cap, buf_len]) {
+                    Ok(n) => n as u32,
+                    Err(rc) => return rc,
+                };
             }
 
             // sys_read with caller-supplied capacity == sum of iovec
             // lengths. Stage the response in kernel scratch then
             // scatter back into iovecs.
             let req = (fd as u32).to_le_bytes();
-            let mut buf = vec![0u8; total_cap as usize];
+            let total_cap_len = match checked_wasi_guest_len(total_cap) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut buf = vec![0u8; total_cap_len];
             let rc = crate::kernel_host_interface::trampoline_request_with_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_READ,
@@ -215,6 +259,39 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             let rc = crate::kernel_host_interface::trampoline_request(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 METHOD_CLOSE,
+                &req,
+            );
+            errno_from_kernel(rc)
+        },
+    )?;
+
+    // ── fd_sync(fd) / fd_datasync(fd) — POSIX fsync / fdatasync ──────
+    // Route to METHOD_SYS_FSYNC / METHOD_SYS_FDATASYNC (issue #88) so
+    // sqlite, write-temp-then-rename atomic save, and Rust's
+    // File::sync_all see a successful no-op on the in-memory ramfs
+    // instead of -ENOSYS. Kernel-side gate: regular-file / directory
+    // fd → 0; pipe / socket → EINVAL; closed / unknown → EBADF.
+    linker.func_wrap(
+        WASI,
+        "fd_sync",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            let rc = crate::kernel_host_interface::trampoline_request(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                METHOD_FSYNC,
+                &req,
+            );
+            errno_from_kernel(rc)
+        },
+    )?;
+    linker.func_wrap(
+        WASI,
+        "fd_datasync",
+        |mut caller: Caller<'_, UserState>, fd: i32| -> i32 {
+            let req = (fd as u32).to_le_bytes();
+            let rc = crate::kernel_host_interface::trampoline_request(
+                &mut crate::engine::WasmtimeCtx::new(&mut caller),
+                METHOD_FDATASYNC,
                 &req,
             );
             errno_from_kernel(rc)
@@ -627,7 +704,11 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 Some(m) => m,
                 None => return EINVAL,
             };
-            let mut old_rel = vec![0u8; old_path_len as usize];
+            let old_len = match checked_wasi_guest_len(old_path_len) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut old_rel = vec![0u8; old_len];
             if old_path_len > 0
                 && memory
                     .read(&caller, old_path_ptr as usize, &mut old_rel)
@@ -635,7 +716,11 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             {
                 return EINVAL;
             }
-            let mut new_rel = vec![0u8; new_path_len as usize];
+            let new_len = match checked_wasi_guest_len(new_path_len) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut new_rel = vec![0u8; new_len];
             if new_path_len > 0
                 && memory
                     .read(&caller, new_path_ptr as usize, &mut new_rel)
@@ -650,7 +735,12 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             new_abs.push(b'/');
             new_abs.extend_from_slice(&new_rel);
 
-            let mut req = Vec::with_capacity(4 + old_abs.len() + new_abs.len());
+            let req_cap =
+                match checked_wasi_guest_sum(&[4, old_abs.len() as u32, new_abs.len() as u32]) {
+                    Ok(n) => n,
+                    Err(rc) => return rc,
+                };
+            let mut req = Vec::with_capacity(req_cap);
             req.extend_from_slice(&(old_abs.len() as u32).to_le_bytes());
             req.extend_from_slice(&old_abs);
             req.extend_from_slice(&new_abs);
@@ -687,7 +777,11 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 Some(m) => m,
                 None => return EINVAL,
             };
-            let mut old_rel = vec![0u8; old_path_len as usize];
+            let old_len = match checked_wasi_guest_len(old_path_len) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut old_rel = vec![0u8; old_len];
             if old_path_len > 0
                 && memory
                     .read(&caller, old_path_ptr as usize, &mut old_rel)
@@ -695,7 +789,11 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             {
                 return EINVAL;
             }
-            let mut new_rel = vec![0u8; new_path_len as usize];
+            let new_len = match checked_wasi_guest_len(new_path_len) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut new_rel = vec![0u8; new_len];
             if new_path_len > 0
                 && memory
                     .read(&caller, new_path_ptr as usize, &mut new_rel)
@@ -711,7 +809,12 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             link_path.push(b'/');
             link_path.extend_from_slice(&new_rel);
 
-            let mut req = Vec::with_capacity(4 + target.len() + link_path.len());
+            let req_cap =
+                match checked_wasi_guest_sum(&[4, target.len() as u32, link_path.len() as u32]) {
+                    Ok(n) => n,
+                    Err(rc) => return rc,
+                };
+            let mut req = Vec::with_capacity(req_cap);
             req.extend_from_slice(&(target.len() as u32).to_le_bytes());
             req.extend_from_slice(&target);
             req.extend_from_slice(&link_path);
@@ -745,7 +848,11 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
                 Some(m) => m,
                 None => return EINVAL,
             };
-            let mut rel = vec![0u8; path_len as usize];
+            let rel_len = match checked_wasi_guest_len(path_len) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut rel = vec![0u8; rel_len];
             if path_len > 0 && memory.read(&caller, path_ptr as usize, &mut rel).is_err() {
                 return EINVAL;
             }
@@ -766,9 +873,16 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
             if oflags & 0b0010 != 0 {
                 k_flags |= 0b1000; // DIRECTORY
             }
+            if oflags & 0b0100 != 0 {
+                k_flags |= 0b10000; // EXCL
+            }
             // Build "u32 flags + '/' + relpath" — wasi-libc strips
             // the preopen prefix, we restore it.
-            let mut req = Vec::with_capacity(4 + 1 + rel.len());
+            let req_cap = match checked_wasi_guest_sum(&[4, 1, rel.len() as u32]) {
+                Ok(n) => n,
+                Err(rc) => return rc,
+            };
+            let mut req = Vec::with_capacity(req_cap);
             req.extend_from_slice(&k_flags.to_le_bytes());
             req.push(b'/');
             req.extend_from_slice(&rel);
@@ -907,7 +1021,6 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         "clock_res_get",
         "fd_advise",
         "fd_allocate",
-        "fd_datasync",
         "fd_fdstat_set_flags",
         "fd_fdstat_set_rights",
         "fd_filestat_set_size",
@@ -915,7 +1028,6 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
         "fd_pread",
         "fd_pwrite",
         "fd_renumber",
-        "fd_sync",
         "fd_tell",
         "path_create_directory",
         "path_filestat_set_times",
@@ -943,6 +1055,8 @@ pub fn add_to_linker(linker: &mut Linker<UserState>) -> Result<()> {
 const METHOD_WRITE: u32 = 0x1_0014;
 const METHOD_READ: u32 = 0x1_0013;
 const METHOD_CLOSE: u32 = 0x1_000E;
+const METHOD_FSYNC: u32 = 0x1_00A6;
+const METHOD_FDATASYNC: u32 = 0x1_00A7;
 const METHOD_CLOCK_GETTIME: u32 = 0x1_0016;
 const METHOD_OPEN: u32 = 0x1_001F;
 const METHOD_LSEEK: u32 = 0x1_0020;
@@ -956,3 +1070,38 @@ const METHOD_SYS_RENAME: u32 = 0x1_002E;
 /// neither stdio nor pre-allocated by the kernel-side fd_table.
 const PREOPEN_ROOT_FD: i32 = 3;
 const PREOPEN_ROOT_NAME: &str = "/";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yurt_kernel_host_interface_core::MAX_GUEST_BUFFER_LEN;
+
+    #[test]
+    fn checked_wasi_guest_len_rejects_oversized_allocations() {
+        assert_eq!(
+            checked_wasi_guest_len(MAX_GUEST_BUFFER_LEN + 1),
+            Err(EINVAL)
+        );
+    }
+
+    #[test]
+    fn checked_wasi_guest_sum_rejects_oversized_iovec_total() {
+        assert_eq!(
+            checked_wasi_guest_sum(&[MAX_GUEST_BUFFER_LEN, 1]),
+            Err(EINVAL)
+        );
+    }
+
+    #[test]
+    fn checked_wasi_iovec_bytes_rejects_too_many_descriptors() {
+        assert_eq!(
+            checked_wasi_iovec_bytes((MAX_GUEST_BUFFER_LEN / 8) + 1),
+            Err(EINVAL)
+        );
+    }
+
+    #[test]
+    fn checked_wasi_iovec_bytes_rejects_descriptor_byte_overflow() {
+        assert_eq!(checked_wasi_iovec_bytes(u32::MAX), Err(EINVAL));
+    }
+}

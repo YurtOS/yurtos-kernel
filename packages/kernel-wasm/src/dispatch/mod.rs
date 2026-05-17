@@ -23,11 +23,13 @@ mod thread;
 
 use fs::{
     chdir, chmod, chown, fchdir, fchown, getcwd, hard_link, lstat_path, mkdir, readdir, readlink,
-    realpath, rename, rmdir, stat_path, symlink, sys_open, sys_openat, unlink, utimens,
+    realpath, rename, rmdir, stat_path, symlink, sys_access, sys_faccessat, sys_fdatasync,
+    sys_flock, sys_fstatvfs, sys_fsync, sys_ftruncate, sys_open, sys_openat, sys_statvfs, sys_sync,
+    sys_syncfs, sys_truncate, unlink, utimens,
 };
 use process::{
     close_stdin, drain_stream, getpgid, getpriority, getrlimit, getsid, kill_request,
-    killpg_request, nanosleep, provide_stdin, sched_getaffinity, sched_getparam,
+    killpg_request, nanosleep, proc_pid_visible, provide_stdin, sched_getaffinity, sched_getparam,
     sched_getscheduler, sched_setaffinity, sched_setparam, sched_setscheduler, sched_yield,
     setpgid, setpriority, setresgid, setresuid, setrlimit, setsid, sigaction, sigpending, sigqueue,
     sigwaitinfo, sys_spawn, umask, waitid,
@@ -52,6 +54,17 @@ use socket::{
 include!(concat!(env!("OUT_DIR"), "/methods_generated.rs"));
 
 const MSG_PEEK: u32 = 0x2;
+/// `sys_socket_recvmsg` ancillary-header truncation bit (#104 / M2).
+///
+/// The recvmsg response carries a `u32` SCM_RIGHTS fd-count field after
+/// the payload region. The low 31 bits are the count of fds the kernel
+/// actually **installed** into the caller's fd table; bit 31 is set
+/// when the ancillary buffer was too small and the kernel discarded
+/// (closed) the overflow fds. Hosts must surface this bit as POSIX
+/// `MSG_CTRUNC` (`0x8`) in the guest `struct msghdr.msg_flags`. The
+/// real installed count is always tiny (Linux caps SCM_RIGHTS at 253
+/// fds), so bit 31 can never collide with a genuine count.
+const RIGHTS_TRUNCATED: u32 = 0x8000_0000;
 const ID_NO_CHANGE: u32 = u32::MAX;
 
 /// Reserved pid for direct calls from outside any user process — i.e.
@@ -165,6 +178,10 @@ pub fn dispatch_with_context(
         METHOD_SYS_GET_FILE_STATUS_FLAGS => get_file_status_flags(caller_pid, request),
         METHOD_SYS_SET_FILE_STATUS_FLAGS => set_file_status_flags(caller_pid, request),
         METHOD_SYS_IOCTL => ioctl_fd(caller_pid, request, response),
+        METHOD_SYS_FSYNC => sys_fsync(caller_pid, request),
+        METHOD_SYS_FDATASYNC => sys_fdatasync(caller_pid, request),
+        METHOD_SYS_SYNC => sys_sync(request),
+        METHOD_SYS_SYNCFS => sys_syncfs(caller_pid, request),
         METHOD_SYS_PIPE => pipe(caller_pid, response),
         METHOD_SYS_READ => read_fd(caller_pid, request, response),
         METHOD_SYS_WRITE => write_fd(caller_pid, request),
@@ -185,7 +202,7 @@ pub fn dispatch_with_context(
         METHOD_SYS_SETPGID => setpgid(caller_pid, request),
         METHOD_SYS_GETSID => getsid(caller_pid, request),
         METHOD_SYS_SETSID => setsid(caller_pid),
-        METHOD_SYS_KILL => kill_request(request),
+        METHOD_SYS_KILL => kill_request(caller_pid, request),
         METHOD_SYS_KILLPG => killpg_request(caller_pid, request),
         METHOD_SYS_SIGQUEUE => sigqueue(caller_pid, request),
         METHOD_SYS_SIGWAITINFO => sigwaitinfo(caller_pid, request, response),
@@ -195,6 +212,13 @@ pub fn dispatch_with_context(
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),
         METHOD_SYS_OPEN => sys_open(caller_pid, request),
         METHOD_SYS_OPENAT => sys_openat(caller_pid, request),
+        METHOD_SYS_FTRUNCATE => sys_ftruncate(caller_pid, request),
+        METHOD_SYS_TRUNCATE => sys_truncate(caller_pid, request),
+        METHOD_SYS_ACCESS => sys_access(caller_pid, request),
+        METHOD_SYS_FACCESSAT => sys_faccessat(caller_pid, request),
+        METHOD_SYS_FLOCK => sys_flock(caller_pid, request),
+        METHOD_SYS_STATVFS => sys_statvfs(caller_pid, request, response),
+        METHOD_SYS_FSTATVFS => sys_fstatvfs(caller_pid, request, response),
         METHOD_SYS_LSEEK => lseek(caller_pid, request, response),
         METHOD_SYS_FSTAT => fstat(caller_pid, request, response),
         METHOD_SYS_CHMOD => chmod(caller_pid, request),
@@ -350,6 +374,17 @@ fn inc_entry_ref(k: &mut Kernel, entry: &FdEntry) {
     }
 }
 
+/// POSIX: `dup2`/`dup3` fail with `EBADF` if `newfd` is at or above
+/// the caller's `RLIMIT_NOFILE` soft limit (slot 7). `None` means
+/// "unlimited" — no bound.
+fn newfd_within_rlimit(k: &mut Kernel, caller_pid: u32, newfd: u32) -> bool {
+    const RLIMIT_NOFILE_IDX: usize = 7;
+    match k.process_mut(caller_pid).rlimits[RLIMIT_NOFILE_IDX] {
+        Some((soft, _hard)) => (newfd as u64) < soft,
+        None => true,
+    }
+}
+
 /// `dup(oldfd: u32) -> newfd / -EBADF`. Increments pipe refcount when
 /// the entry is a pipe end.
 fn dup_fd(caller_pid: u32, request: &[u8]) -> i64 {
@@ -379,6 +414,11 @@ fn dup2_fd(caller_pid: u32, request: &[u8]) -> i64 {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
+        // POSIX: newfd at/above RLIMIT_NOFILE is EBADF, even when
+        // oldfd == newfd.
+        if !newfd_within_rlimit(k, caller_pid, newfd) {
+            return -(abi::EBADF as i64);
+        }
         // POSIX: dup2 of an fd onto itself is a no-op when oldfd is
         // valid. Skip the refcount dance.
         if oldfd == newfd {
@@ -421,6 +461,10 @@ fn dup3_fd(caller_pid: u32, request: &[u8]) -> i64 {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
+        // POSIX: newfd at/above RLIMIT_NOFILE is EBADF.
+        if !newfd_within_rlimit(k, caller_pid, newfd) {
+            return -(abi::EBADF as i64);
+        }
         // newfd is silently closed first (POSIX), then aliases oldfd.
         let close_handle = k
             .process_mut(caller_pid)
@@ -442,18 +486,26 @@ fn dup3_fd(caller_pid: u32, request: &[u8]) -> i64 {
     })
 }
 
-/// `dup_min(oldfd: u32, minfd: u32) -> newfd / -EBADF / -EINVAL`.
+/// `dup_min(oldfd: u32, minfd: u32) -> newfd / -EBADF / -EINVAL / -EMFILE`.
 fn dup_min_fd(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([oldfd, minfd]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
     with_kernel(|k| {
-        let entry = match k.process_mut(caller_pid).fd_table.entry(oldfd) {
+        let process = k.process_mut(caller_pid);
+        let entry = match process.fd_table.entry(oldfd) {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
-        let Some(newfd) = k.process_mut(caller_pid).fd_table.lowest_free_fd_at(minfd) else {
+
+        let soft_limit = process.rlimits[crate::kernel::RLIMIT_NOFILE]
+            .map(|(soft, _)| soft)
+            .unwrap_or(u64::MAX);
+        if u64::from(minfd) >= soft_limit {
             return -(abi::EINVAL as i64);
+        }
+        let Some(newfd) = process.fd_table.lowest_free_fd_below(minfd, soft_limit) else {
+            return -(abi::EMFILE as i64);
         };
         inc_entry_ref(k, &entry);
         k.process_mut(caller_pid).fd_table.install(newfd, entry);
@@ -528,8 +580,18 @@ fn get_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
                 }
                 None => -(abi::EBADF as i64),
             },
-            // Valid but no per-OFD status tracked yet.
-            _ => 0,
+            // No per-OFD status flags tracked for these yet, but the
+            // access mode is well-defined and userland keys on
+            // `flags & O_ACCMODE` (same #60 class as the file fix):
+            // stdin/pipe-read = O_RDONLY(0), stdout/stderr/pipe-write
+            // = O_WRONLY(1), socket = O_RDWR(2), dir = O_RDONLY(0).
+            FdEntry::Stdin | FdEntry::Directory { .. } => 0,
+            FdEntry::Stdout | FdEntry::Stderr => 1,
+            FdEntry::Pipe { end, .. } => match end {
+                PipeEnd::Read => 0,
+                PipeEnd::Write => 1,
+            },
+            FdEntry::Socket { .. } => 2,
         }
     })
 }
@@ -820,7 +882,7 @@ fn sys_getrandom(request: &[u8], response: &mut [u8]) -> i64 {
     }
     match crate::kh::fill_random(&mut response[..len]) {
         Ok(()) => len as i64,
-        Err(_) => -(abi::EIO as i64),
+        Err(rc) => rc as i64,
     }
 }
 
@@ -1213,8 +1275,13 @@ fn default_winsize() -> [u8; 8] {
 }
 
 /// `clock_gettime(clock_id) -> 8 bytes le u64 ns`. clock_id 0 =
-/// REALTIME (kh_now_realtime), 1 = MONOTONIC (kh_now_monotonic when
-/// it lands; today aliased to REALTIME).
+/// REALTIME (kh_now_realtime), 1 = MONOTONIC (kh_now_monotonic).
+///
+/// POSIX requires CLOCK_MONOTONIC to be monotonically non-decreasing
+/// and immune to wall-clock adjustments (NTP steps, settimeofday, DST),
+/// so it has its own host primitive — aliasing to REALTIME would break
+/// elapsed-time math (timeouts, asyncio timers, perf_counter deltas).
+/// Issue #64.
 fn clock_gettime(request: &[u8], response: &mut [u8]) -> i64 {
     let Some([clock_id]) = read_u32_args::<1>(request) else {
         return -(abi::EINVAL as i64);
@@ -1222,15 +1289,17 @@ fn clock_gettime(request: &[u8], response: &mut [u8]) -> i64 {
     if response.len() < 8 {
         return -(abi::EINVAL as i64);
     }
-    match clock_id {
-        0 | 1 => match kh::now_realtime_ns() {
-            Ok(ns) => {
-                response[..8].copy_from_slice(&ns.to_le_bytes());
-                8
-            }
-            Err(rc) => rc as i64,
-        },
-        _ => -(abi::EINVAL as i64),
+    let now = match clock_id {
+        0 => kh::now_realtime_ns(),
+        1 => kh::now_monotonic_ns(),
+        _ => return -(abi::EINVAL as i64),
+    };
+    match now {
+        Ok(ns) => {
+            response[..8].copy_from_slice(&ns.to_le_bytes());
+            8
+        }
+        Err(rc) => rc as i64,
     }
 }
 
@@ -1367,7 +1436,10 @@ fn lseek(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     with_kernel(|k| {
         let ofd_id = match k.process_mut(caller_pid).fd_table.entry(fd) {
             Some(crate::kernel::FdEntry::File { ofd_id }) => *ofd_id,
-            _ => return -(abi::EBADF as i64),
+            // A valid but non-seekable fd (pipe/socket/stdio/dir) is
+            // ESPIPE, not EBADF — only an unknown fd is EBADF.
+            Some(_) => return -(abi::ESPIPE as i64),
+            None => return -(abi::EBADF as i64),
         };
         let (mount_id, inode, current) = match k.ofd(ofd_id) {
             Some(o) => (o.mount_id, o.inode, o.offset),

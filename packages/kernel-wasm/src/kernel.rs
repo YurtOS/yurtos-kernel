@@ -55,6 +55,7 @@ pub const KERNEL_RT_SIGNAL_QUEUE_CAP: usize = 1024;
 /// Number of POSIX rlimit slots tracked. Matches the TS kernel's
 /// supported set (RLIMIT_CPU through RLIMIT_NOFILE = 0..=7).
 pub const RLIMIT_SLOTS: usize = 8;
+pub const RLIMIT_NOFILE: usize = 7;
 
 /// Kernel-owned execution state for one user thread. Host backends may
 /// map this to a Worker, a wasmtime task, or a cooperative stack, but
@@ -147,10 +148,24 @@ pub enum FdEntry {
     File {
         ofd_id: u64,
     },
-    /// Open directory handle. Directory fds are kernel-owned path
+    /// Open directory handle. Directory fds are kernel-owned
     /// capabilities; they do not use OFDs because there is no byte
     /// cursor or backend inode operation behind fchdir/readdir.
+    ///
+    /// Dual capability (B2.9): inode-anchored when the owning backend
+    /// supports dir inodes; path-snapshot degraded mode otherwise. The
+    /// inode walk that consumes `dir_inode` lands in Task 6 — Task 5 is
+    /// a behavior-preserving shape migration (still path-snapshot).
     Directory {
+        mount_id: crate::vfs::MountId,
+        /// `Some` ⇒ inode-anchored; `None` ⇒ path-snapshot degraded
+        /// mode (hostfs / overlay-if-deferred / embedder backends that
+        /// return `None` from `VfsBackend::dir_inode`).
+        dir_inode: Option<u64>,
+        /// Always the PathResolver-normalized ABSOLUTE snapshot
+        /// (preserves the `dispatch/fs.rs` absolute `debug_assert!`):
+        /// the degraded-mode fallback AND the cheap getcwd/readdir
+        /// source when inode-anchored.
         path: Vec<u8>,
     },
     /// Kernel-owned POSIX socket. `id` references a [`SocketEntry`] in
@@ -192,8 +207,15 @@ impl FdTable {
     }
 
     pub fn lowest_free_fd_at(&self, min_fd: u32) -> Option<u32> {
+        self.lowest_free_fd_below(min_fd, u64::from(u32::MAX) + 1)
+    }
+
+    pub fn lowest_free_fd_below(&self, min_fd: u32, exclusive_limit: u64) -> Option<u32> {
         let mut n = min_fd;
         loop {
+            if u64::from(n) >= exclusive_limit {
+                return None;
+            }
             if !self.entries.contains_key(&n) {
                 return Some(n);
             }
@@ -279,7 +301,7 @@ pub const DEFAULT_RLIMITS: [Option<ResourceLimit>; RLIMIT_SLOTS] = [
     Some((0, 0)),                               // 4 RLIMIT_CORE
     Some((64 * 1024 * 1024, 64 * 1024 * 1024)), // 5 RLIMIT_RSS
     Some((1024, 1024)),                         // 6 RLIMIT_NPROC
-    Some((1024, 1024)),                         // 7 RLIMIT_NOFILE
+    Some((1024, 1024)),                         // RLIMIT_NOFILE
 ];
 
 /// One queued POSIX real-time signal (`sigqueue`). Carries the payload
@@ -291,13 +313,54 @@ pub struct RtSignal {
     pub sender_pid: u32,
 }
 
+/// Process working directory — the dual `(mount_id, dir_inode, path)`
+/// capability mirroring [`FdEntry::Directory`] (B2.9). `path` stays the
+/// PathResolver-normalized ABSOLUTE snapshot (cwd has no UTF-8
+/// guarantee in POSIX). `Clone` is what carries `dir_inode` to a
+/// forked/spawned child via `cwd: p.cwd.clone()` (spec test #8
+/// inheritance mechanism). Task 5 keeps behavior path-snapshot; the
+/// inode-anchored PathResolver refresh lands in Task 6.
+#[derive(Clone, Debug)]
+pub struct Cwd {
+    // Set by chdir/fchdir, carried across fork/clone, and consumed by
+    // the B2.9 Task 6 `PathResolver` cwd-refresh invariant + `getcwd`
+    // mount-prefix composition: every relative-path syscall reconciles
+    // the cached `path` against the live directory this inode names.
+    pub mount_id: crate::vfs::MountId,
+    /// `Some` ⇒ inode-anchored; `None` ⇒ path-snapshot degraded mode.
+    pub dir_inode: Option<u64>,
+    /// Always the normalized ABSOLUTE cwd snapshot. Default `/`.
+    pub path: Vec<u8>,
+}
+
+/// Outcome of `Kernel::refresh_anchored_cwd` — the B2.9 Task 6
+/// inode-anchored cwd-refresh ladder, shared verbatim by `getcwd` and
+/// `PathResolver::resolved_cwd` so the anchored arm lives in exactly one
+/// place. The two callers diverge ONLY on `Degraded`, which this helper
+/// deliberately does not interpret (see each caller).
+pub enum CwdRefresh {
+    /// cwd is inode-anchored and the inode still names a live directory.
+    /// Payload is its current mount-absolute path; if the directory had
+    /// been renamed, `cwd.path` has already been written back to it.
+    Anchored(Vec<u8>),
+    /// cwd is inode-anchored but the directory was removed
+    /// (rmdir/unlink) and has no linkable path — POSIX. Callers map
+    /// this to `ENOENT` rather than using the stale pre-removal snapshot.
+    AnchoredRemoved,
+    /// cwd is NOT inode-anchored (`dir_inode == None`): a degraded
+    /// backend (hostfs/overlay) or the unresolved `Process::new`
+    /// default `/`. Carries the cwd snapshot so the caller can apply
+    /// its own degraded policy without re-cloning.
+    Degraded(Cwd),
+}
+
 #[derive(Clone, Debug)]
 pub struct Process {
     pub umask: u16,
     pub credentials: Credentials,
-    /// Working directory as raw bytes (cwd has no UTF-8 guarantee in
-    /// POSIX). Default `/`.
-    pub cwd: Vec<u8>,
+    /// Working directory. Default `/` (root mount, inode unresolved
+    /// until Task 6's PathResolver refresh — see `Default` impl).
+    pub cwd: Cwd,
     /// POSIX resource limits per `getrlimit` / `setrlimit`. `None`
     /// for unsupported resource ids; `Some((soft, hard))` otherwise.
     pub rlimits: [Option<ResourceLimit>; RLIMIT_SLOTS],
@@ -332,7 +395,8 @@ pub struct Process {
     /// Pending signals as a bitmask: bit (sig-1) is set when sig is
     /// queued for delivery. Phase 2 records but does not deliver —
     /// delivery requires asyncify/JSPI unwind which lands later. Sig
-    /// numbers 1..=63 use bits 0..=62.
+    /// numbers 1..=64 use bits 0..=63 (sig 64 == SIGRTMAX → bit 63,
+    /// the top bit of this u64 — fits exactly, no widening needed).
     pub pending_signals: u64,
     /// POSIX real-time signal queue (`sigqueue`). Unlike the bitmask,
     /// RT signals are *queued with multiplicity* and carry a payload +
@@ -342,10 +406,11 @@ pub struct Process {
     /// read-time union of both, so neither producer clobbers the other.
     /// Consumption (`sigwaitinfo`/delivery) is gate-deferred (B1.8-b).
     pub pending_rt: VecDeque<RtSignal>,
-    /// Per-signal disposition. Index `sig - 1` for sig in 1..=63.
-    /// 0 = SIG_DFL, 1 = SIG_IGN, anything else is an opaque user-side
-    /// handler value (typically a wasm function table index).
-    pub signal_dispositions: [u32; 63],
+    /// Per-signal disposition. Index `sig - 1` for sig in 1..=64
+    /// (sig 64 == SIGRTMAX → index 63). 0 = SIG_DFL, 1 = SIG_IGN,
+    /// anything else is an opaque user-side handler value (typically
+    /// a wasm function table index).
+    pub signal_dispositions: [u32; 64],
     /// Times the process has called `sys_sched_yield`. Phase 2
     /// observability hook — real cooperative scheduling lands with
     /// the AsyncBridge integration; tests use this to assert that
@@ -394,7 +459,20 @@ impl Default for Process {
         Self {
             umask: DEFAULT_UMASK,
             credentials: Credentials::DEFAULT,
-            cwd: b"/".to_vec(),
+            // `Process` is constructed independently of the `Kernel`'s
+            // `MountTable` (lazy per-pid insert has no MountTable in
+            // scope), so the root dir inode cannot be resolved here.
+            // `mount_id = ROOT_MOUNT`, `dir_inode = None` is the
+            // degraded-but-correct default: behavior is path-snapshot
+            // until Task 6, where the PathResolver cwd-refresh
+            // invariant resolves `/` to its live inode on first
+            // relative resolution. `path: "/"` preserves the absolute
+            // snapshot invariant exactly as the old `Vec<u8>` cwd.
+            cwd: Cwd {
+                mount_id: crate::vfs::ROOT_MOUNT,
+                dir_inode: None,
+                path: b"/".to_vec(),
+            },
             rlimits: DEFAULT_RLIMITS,
             fd_table: FdTable::default(),
             stdin_buffer: std::collections::VecDeque::new(),
@@ -408,7 +486,7 @@ impl Default for Process {
             sid: 0,
             pending_signals: 0,
             pending_rt: VecDeque::new(),
-            signal_dispositions: [0; 63],
+            signal_dispositions: [0; 64],
             yield_count: 0,
             last_nanosleep_ns: 0,
             argv: Vec::new(),
@@ -611,6 +689,21 @@ pub struct Kernel {
     pending_thread_releases: Vec<i32>,
     /// Foreground process group for the kernel-owned stdio TTY.
     tty_foreground_pgid: Pid,
+    /// `flock(2)` advisory locks per `(mount_id, inode)`. The lock is
+    /// associated with the **open file description**, not the fd —
+    /// `dup` shares it, a fresh `open()` of the same file gets a
+    /// separate ofd and a separate lock. Released when the owning
+    /// OFD's refcount hits zero (see `ofd_dec_ref`). Issue #89.
+    flock_locks: BTreeMap<(crate::vfs::MountId, u64), FlockState>,
+}
+
+/// State of a single inode's `flock(2)` lock. `Shared(holders)`
+/// represents `LOCK_SH` held by one or more OFDs simultaneously;
+/// `Exclusive(ofd)` represents `LOCK_EX` held by exactly one OFD.
+#[derive(Clone, Debug)]
+pub enum FlockState {
+    Shared(Vec<u64>),
+    Exclusive(u64),
 }
 
 /// One staged sys_spawn waiting for the host to instantiate it.
@@ -683,6 +776,7 @@ impl Kernel {
             last_scheduled: None,
             pending_thread_releases: Vec::new(),
             tty_foreground_pgid: 1,
+            flock_locks: BTreeMap::new(),
         }
     }
 
@@ -1387,24 +1481,34 @@ impl Kernel {
                 pgid: if p.pgid == 0 { *pid } else { p.pgid },
                 sid: if p.sid == 0 { *pid } else { p.sid },
                 argv: p.argv.clone(),
-                cwd: p.cwd.clone(),
+                // /proc/<pid>/cwd must be the LIVE directory path.
+                // `cwd.path` is only a cache refreshed by that
+                // process's own relative-path / getcwd / fchdir; a
+                // rename behind an inode-anchored cwd leaves it stale.
+                // Resolve through the live inode→path map (the same
+                // source getcwd uses) so procfs and getcwd agree. A
+                // removed dir (dir_abspath_in == None) or a degraded
+                // (dir_inode == None) cwd falls back to the snapshot.
+                cwd: match p.cwd.dir_inode {
+                    Some(ino) => self
+                        .vfs
+                        .dir_abspath_in(p.cwd.mount_id, ino)
+                        .unwrap_or_else(|| p.cwd.path.clone()),
+                    None => p.cwd.path.clone(),
+                },
             })
             .collect();
         self.vfs.refresh_processes(&snaps);
     }
 
-    pub fn can_read_proc_path(&mut self, caller_pid: Pid, path: &[u8]) -> bool {
-        let Some(target_pid) = crate::path::proc_target_pid(path) else {
-            return true;
-        };
-        if target_pid == caller_pid {
-            return true;
-        }
-        if !self.has_process(target_pid) {
-            return true;
-        }
-        self.process(caller_pid).credentials.euid == 0
-    }
+    // NOTE (#105 / M8): the former `can_read_proc_path` lived here and
+    // returned `false` (→ -EPERM at the call site) for a *present-but-
+    // unauthorized* /proc/<pid>, but `true` for an *absent* pid (→
+    // -ENOENT from the backend). That EPERM-vs-ENOENT split was a
+    // cross-tenant pid-existence oracle. The visibility decision now
+    // lives at the dispatch/fs layer (`proc_path_reachable`) and
+    // consumes #66's `may_control_pid` so absent and unauthorized are
+    // indistinguishable (uniform -ENOENT).
 
     pub fn list_processes(&self) -> Vec<ProcessListEntry> {
         self.processes
@@ -1448,33 +1552,29 @@ impl Kernel {
         })
     }
 
-    pub fn kill_process_group(&mut self, pgid: Pid, sig: u32) -> Result<(), i32> {
-        if sig > 63 {
-            return Err(crate::abi::EINVAL);
-        }
-        let mut found = false;
-        for (pid, process) in self.processes.iter_mut() {
-            if process.fork_state != ProcessForkState::Running {
-                continue;
-            }
-            let process_pgid = if process.pgid == 0 {
-                *pid
-            } else {
-                process.pgid
-            };
-            if process.exit_status.is_some() || process_pgid != pgid {
-                continue;
-            }
-            found = true;
-            if sig != 0 {
-                process.pending_signals |= 1u64 << (sig - 1);
-            }
-        }
-        if found {
-            Ok(())
-        } else {
-            Err(crate::abi::ESRCH)
-        }
+    /// Live members of process group `pgid`. Single source of truth for
+    /// "what is in this group": a running, not-yet-reaped process whose
+    /// effective pgid (own pid when `pgid == 0`) equals `pgid`. The
+    /// authorization decision (POSIX per-target `may_signal`) and signal
+    /// delivery are owned by the dispatch layer (`killpg_request`) — it
+    /// holds the host-authenticated `caller_pid` and the credential gate.
+    pub fn process_group_member_pids(&self, pgid: Pid) -> Vec<Pid> {
+        self.processes
+            .iter()
+            .filter(|(pid, process)| {
+                if process.fork_state != ProcessForkState::Running || process.exit_status.is_some()
+                {
+                    return false;
+                }
+                let process_pgid = if process.pgid == 0 {
+                    **pid
+                } else {
+                    process.pgid
+                };
+                process_pgid == pgid
+            })
+            .map(|(pid, _)| *pid)
+            .collect()
     }
 
     pub fn list_threads(&self, pid: Pid) -> Vec<ThreadRecord> {
@@ -1794,7 +1894,109 @@ impl Kernel {
             false
         };
         if drop {
+            // Release any `flock(2)` lock this OFD held — POSIX
+            // ties the lock to the open file description's
+            // lifetime, so the final close drops it. Issue #89.
+            self.flock_release_for_ofd(id);
             self.ofds.remove(&id);
+        }
+    }
+
+    /// Release any `flock(2)` lock held by `ofd_id`. Called by
+    /// `ofd_dec_ref` when the last fd reference drops; safe to call
+    /// when no lock is held (no-op).
+    pub fn flock_release_for_ofd(&mut self, ofd_id: u64) {
+        // Walk the lock table; any entry that mentions this ofd_id
+        // either becomes empty (Shared with no holders left) and is
+        // removed, or transitions Shared(other holders) downward, or
+        // disappears entirely (Exclusive owner).
+        self.flock_locks.retain(|_, state| match state {
+            FlockState::Shared(holders) => {
+                holders.retain(|h| *h != ofd_id);
+                !holders.is_empty()
+            }
+            FlockState::Exclusive(owner) => *owner != ofd_id,
+        });
+    }
+
+    /// Attempt to acquire an `flock(2)` lock of `kind` on
+    /// `(mount_id, inode)` for `ofd_id`. Returns `Ok(())` on
+    /// successful acquisition (including a no-op upgrade/downgrade
+    /// against the same OFD), `Err(rc)` with `rc < 0` on conflict.
+    /// Conflict errno is the caller's responsibility (`EWOULDBLOCK`
+    /// with `LOCK_NB`; the same with blocking variants until
+    /// AsyncBridge support lands). Issue #89.
+    pub fn flock_try_acquire(
+        &mut self,
+        ofd_id: u64,
+        mount_id: crate::vfs::MountId,
+        inode: u64,
+        exclusive: bool,
+    ) -> Result<(), ()> {
+        let key = (mount_id, inode);
+        match self.flock_locks.get_mut(&key) {
+            None => {
+                self.flock_locks.insert(
+                    key,
+                    if exclusive {
+                        FlockState::Exclusive(ofd_id)
+                    } else {
+                        FlockState::Shared(vec![ofd_id])
+                    },
+                );
+                Ok(())
+            }
+            Some(FlockState::Shared(holders)) => {
+                if exclusive {
+                    // Upgrade only if we are the sole holder.
+                    if holders.len() == 1 && holders[0] == ofd_id {
+                        *holders = vec![]; // tombstone — replaced below
+                        self.flock_locks.insert(key, FlockState::Exclusive(ofd_id));
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                } else if !holders.contains(&ofd_id) {
+                    holders.push(ofd_id);
+                    Ok(())
+                } else {
+                    Ok(())
+                }
+            }
+            Some(FlockState::Exclusive(owner)) => {
+                if *owner == ofd_id {
+                    if !exclusive {
+                        // Downgrade EX → SH for the same OFD.
+                        self.flock_locks
+                            .insert(key, FlockState::Shared(vec![ofd_id]));
+                    }
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }
+        }
+    }
+
+    /// Release `ofd_id`'s lock on `(mount_id, inode)`, if any. Always
+    /// returns `Ok(())` — `LOCK_UN` on a file with no lock is a
+    /// no-op per POSIX, not an error. Issue #89.
+    pub fn flock_release(&mut self, ofd_id: u64, mount_id: crate::vfs::MountId, inode: u64) {
+        let key = (mount_id, inode);
+        if let Some(state) = self.flock_locks.get_mut(&key) {
+            match state {
+                FlockState::Shared(holders) => {
+                    holders.retain(|h| *h != ofd_id);
+                    if holders.is_empty() {
+                        self.flock_locks.remove(&key);
+                    }
+                }
+                FlockState::Exclusive(owner) => {
+                    if *owner == ofd_id {
+                        self.flock_locks.remove(&key);
+                    }
+                }
+            }
         }
     }
 
@@ -1861,6 +2063,30 @@ impl Kernel {
         self.processes.get(&pid)
     }
 
+    /// B2.9 Task 6 inode-anchored cwd-refresh ladder. Reconciles the
+    /// cached `cwd.path` snapshot against the LIVE directory the cwd
+    /// inode names, so a cwd stays correct after its directory is
+    /// renamed and fails cleanly after it is removed. Extracted so
+    /// `getcwd` and `PathResolver::resolved_cwd` share one
+    /// implementation of the anchored arm; they differ only in how they
+    /// treat `CwdRefresh::Degraded` (getcwd uses the snapshot as-is;
+    /// `resolved_cwd` additionally does the lazy `/`→inode upgrade).
+    pub fn refresh_anchored_cwd(&mut self, pid: Pid) -> CwdRefresh {
+        let cwd = self.process(pid).cwd.clone();
+        match cwd.dir_inode {
+            Some(ino) => match self.vfs.dir_abspath_in(cwd.mount_id, ino) {
+                Some(abs) => {
+                    if abs != cwd.path {
+                        self.process_mut(pid).cwd.path = abs.clone();
+                    }
+                    CwdRefresh::Anchored(abs)
+                }
+                None => CwdRefresh::AnchoredRemoved,
+            },
+            None => CwdRefresh::Degraded(cwd),
+        }
+    }
+
     pub fn has_process(&self, pid: Pid) -> bool {
         self.process_existing(pid).is_some()
     }
@@ -1879,10 +2105,67 @@ impl Kernel {
 
 static KERNEL: LazyLock<Mutex<Kernel>> = LazyLock::new(|| Mutex::new(Kernel::new()));
 
+// M10: re-entrancy of the single `KERNEL` mutex is convention, not
+// structure — a blocking `kh_*` call made from inside a `with_kernel`
+// closure re-enters `with_kernel` and deadlocks `std::sync::Mutex`
+// (non-reentrant) in release builds, silently. In debug/test builds
+// surface it loudly instead. Zero-cost in release.
+#[cfg(debug_assertions)]
+thread_local! {
+    static IN_WITH_KERNEL: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+struct ReentrancyGuard;
+
+#[cfg(debug_assertions)]
+impl Drop for ReentrancyGuard {
+    fn drop(&mut self) {
+        IN_WITH_KERNEL.with(|f| f.set(false));
+    }
+}
+
+/// Mark this thread as inside `with_kernel`, panicking if it already
+/// is. The returned guard clears the flag on drop (including during
+/// unwind), so a panic inside the closure cannot wedge the flag.
+#[cfg(debug_assertions)]
+fn enter_with_kernel() -> ReentrancyGuard {
+    IN_WITH_KERNEL.with(|f| {
+        assert!(
+            !f.get(),
+            "re-entrant with_kernel: a blocking kh_* call inside a \
+             with_kernel closure re-enters the single KERNEL mutex \
+             and deadlocks in release builds (M10). Read kernel state \
+             into locals, drop the guard, then call kh_* outside the \
+             closure."
+        );
+        f.set(true);
+    });
+    ReentrancyGuard
+}
+
 pub fn with_kernel<R>(f: impl FnOnce(&mut Kernel) -> R) -> R {
-    let mut k = KERNEL
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // M10 debug guard runs before the M9 lock so a re-entrant
+    // `with_kernel` is caught (panics in debug) before it tries to
+    // re-lock the same mutex and self-deadlock in release.
+    #[cfg(debug_assertions)]
+    let _reentry = enter_with_kernel();
+    // M9: a poisoned KERNEL mutex means a prior holder panicked
+    // mid-mutation, so the kernel state may be inconsistent.
+    // Continuing on corrupt state is a correctness/security hazard —
+    // in a real build this is fatal (the panic traps the kernel
+    // instance). Test builds must instead recover: panics are how
+    // failed assertions surface, and one panicking test must not
+    // abort the entire suite (the runner isolates it via TestGuard).
+    let mut k = if cfg!(test) {
+        KERNEL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    } else {
+        KERNEL
+            .lock()
+            .expect("kernel mutex poisoned: a prior holder panicked mid-mutation; refusing to run on corrupt state")
+    };
     f(&mut k)
 }
 
@@ -1907,6 +2190,7 @@ pub fn reset_for_tests() {
     k.next_spawn_pid = 1000;
     k.last_scheduled = None;
     k.pending_thread_releases.clear();
+    k.flock_locks.clear();
 }
 
 /// Native unit tests share the same `static KERNEL` and run in
@@ -1924,7 +2208,15 @@ impl TestGuard {
         static TEST_LOCK: Mutex<()> = Mutex::new(());
         let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_for_tests();
+        crate::kh::test_support::clear_random_results();
         Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        crate::kh::test_support::clear_random_results();
     }
 }
 
@@ -1945,7 +2237,22 @@ mod tests {
         let umask = with_kernel(|k| k.process_mut(42).umask);
         let cwd = with_kernel(|k| k.process_mut(42).cwd.clone());
         assert_eq!(umask, DEFAULT_UMASK);
-        assert_eq!(cwd, b"/");
+        assert_eq!(cwd.path, b"/");
+        assert_eq!(cwd.mount_id, crate::vfs::ROOT_MOUNT);
+        assert_eq!(cwd.dir_inode, None);
+    }
+
+    // M10: a nested with_kernel (the deadlock shape) must panic
+    // loudly in debug/test rather than silently wedge. Exercises the
+    // guard directly so it never touches the KERNEL mutex (no poison
+    // risk to sibling tests); `_outer` clears the flag on unwind.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "re-entrant with_kernel")]
+    fn reentrant_with_kernel_panics_in_debug() {
+        let _g = TestGuard::acquire();
+        let _outer = enter_with_kernel();
+        let _inner = enter_with_kernel();
     }
 
     #[test]
@@ -1963,6 +2270,12 @@ mod tests {
         with_kernel(|k| k.process_mut(2).umask = 0o022);
         assert_eq!(with_kernel(|k| k.process_mut(1).umask), 0o077);
         assert_eq!(with_kernel(|k| k.process_mut(2).umask), 0o022);
+    }
+
+    #[test]
+    fn lowest_free_fd_at_returns_none_when_u32_max_is_occupied() {
+        let table = FdTable::from_entries(vec![(u32::MAX, FdEntry::Stdin)]);
+        assert_eq!(table.lowest_free_fd_at(u32::MAX), None);
     }
 
     #[test]

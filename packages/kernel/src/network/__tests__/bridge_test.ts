@@ -266,11 +266,13 @@ describe(
       expect(accepted.ok).toBe(true);
       if (!accepted.ok) throw new Error(accepted.error);
 
-      expect(bridge.requestSync({
-        op: "send",
-        socket_id: client.socket,
-        data: "ping",
-      })).toEqual({
+      expect(
+        await bridge.requestSync({
+          op: "send",
+          socket_id: client.socket,
+          data: "ping",
+        }),
+      ).toEqual({
         ok: false,
         error: "send: data must be an array of bytes",
       });

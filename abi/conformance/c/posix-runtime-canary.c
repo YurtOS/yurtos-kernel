@@ -298,6 +298,88 @@ static int case_cwd_backend(void) {
   return 0;
 }
 
+static int case_openat_rename_stability(void) {
+  // B2.9 DoD: a directory fd is anchored to the directory inode, not a
+  // path snapshot. open(base, O_DIRECTORY); rename(base, renamed) behind
+  // the still-open dirfd; openat(fd,"x",O_CREAT|O_WRONLY) must create the
+  // file at the CURRENT path of that inode (renamed/x), NOT the stale
+  // base/x; reading renamed/x back returns the written bytes and base/x
+  // must not exist.
+  const char *base = "/tmp/yurt-openat-rename-base";
+  const char *renamed = "/tmp/yurt-openat-rename-renamed";
+  const char *renamed_x = "/tmp/yurt-openat-rename-renamed/x";
+  const char *base_x = "/tmp/yurt-openat-rename-base/x";
+
+  // Clean slate: prior runs may have left either tree behind.
+  unlink(renamed_x);
+  unlink(base_x);
+  rmdir(renamed);
+  rmdir(base);
+
+  if (mkdir(base, 0755) != 0) {
+    emit("openat_rename_stability", 1, "openat_rename_stability:mkdir_failed", 1, errno);
+    return 1;
+  }
+
+  int dfd = open(base, O_RDONLY | O_DIRECTORY);
+  if (dfd < 0) {
+    emit("openat_rename_stability", 1, "openat_rename_stability:open_dir_failed", 1, errno);
+    return 1;
+  }
+
+  errno = 0;
+  if (rename(base, renamed) != 0) {
+    int e = errno;
+    close(dfd);
+    emit("openat_rename_stability", 1, "openat_rename_stability:rename_failed", 1, e);
+    return 1;
+  }
+
+  errno = 0;
+  int fd = openat(dfd, "x", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  if (fd < 0) {
+    int e = errno;
+    close(dfd);
+    emit("openat_rename_stability", 1, "openat_rename_stability:openat_failed", 1, e);
+    return 1;
+  }
+  if (write(fd, "DoD", 3) != 3) {
+    int e = errno;
+    close(fd);
+    close(dfd);
+    emit("openat_rename_stability", 1, "openat_rename_stability:write_failed", 1, e);
+    return 1;
+  }
+  close(fd);
+  close(dfd);
+
+  // Inode-anchored: the byte landed at the inode's CURRENT path.
+  char buf[8] = {0};
+  int rfd = open(renamed_x, O_RDONLY);
+  if (rfd < 0) {
+    emit("openat_rename_stability", 1, "openat_rename_stability:reopen_failed", 1, errno);
+    return 1;
+  }
+  ssize_t n = read(rfd, buf, sizeof(buf));
+  close(rfd);
+  if (n != 3 || memcmp(buf, "DoD", 3) != 0) {
+    char out[96];
+    snprintf(out, sizeof(out), "openat_rename_stability:bad_bytes:%lld:%s", (long long)n, buf);
+    emit("openat_rename_stability", 1, out, 0, 0);
+    return 1;
+  }
+
+  // And it did NOT create the stale pre-rename path.
+  errno = 0;
+  if (access(base_x, F_OK) != -1 || errno != ENOENT) {
+    emit("openat_rename_stability", 1, "openat_rename_stability:stale_path_exists", 1, errno);
+    return 1;
+  }
+
+  emit("openat_rename_stability", 0, "openat_rename_stability:ok", 0, 0);
+  return 0;
+}
+
 static int case_realpath_backend(void) {
   const char *base = "/tmp/yurt-realpath-canary";
   char resolved[128];
@@ -660,6 +742,7 @@ static int run_case(const char *name) {
   if (strcmp(name, "chown_denied") == 0) return case_chown_denied();
   if (strcmp(name, "identity_kernel") == 0) return case_identity_kernel();
   if (strcmp(name, "cwd_backend") == 0) return case_cwd_backend();
+  if (strcmp(name, "openat_rename_stability") == 0) return case_openat_rename_stability();
   if (strcmp(name, "realpath_backend") == 0) return case_realpath_backend();
   if (strcmp(name, "ttyname_stdio") == 0) return case_ttyname_stdio();
   if (strcmp(name, "priority_unsupported") == 0) return case_priority_unsupported();
@@ -686,6 +769,7 @@ static int list_cases(void) {
   puts("chown_denied");
   puts("identity_kernel");
   puts("cwd_backend");
+  puts("openat_rename_stability");
   puts("realpath_backend");
   puts("ttyname_stdio");
   puts("priority_unsupported");

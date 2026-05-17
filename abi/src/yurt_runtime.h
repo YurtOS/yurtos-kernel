@@ -302,7 +302,11 @@ int yurt_host_socket_sendmsg(int sockfd, int data_ptr, int data_len,
 
 /* host_socket_recvmsg(sockfd, buf_ptr, buf_cap, fds_ptr, fds_cap, n_fds_ptr) -> bytes | -1 | -2
  * Writes up to buf_cap bytes at buf_ptr; writes up to fds_cap fd numbers as
- * i32 LE at fds_ptr; writes the fd count as i32 LE at n_fds_ptr.
+ * i32 LE at fds_ptr; writes a u32 LE ancillary header at n_fds_ptr. The
+ * header's low 31 bits are the count of fds installed at fds_ptr; bit 31
+ * (0x80000000) is set when the ancillary buffer was too small and the
+ * kernel discarded (and closed) the overflow fds — the caller must raise
+ * POSIX MSG_CTRUNC and use only the low 31 bits as the fd count (#104 / M2).
  * Returns -2 for EAGAIN, -1 for other errors. Async (JSPI). */
 __attribute__((import_module("yurt"), import_name("host_socket_recvmsg")))
 int yurt_host_socket_recvmsg(int sockfd, int buf_ptr, int buf_cap,

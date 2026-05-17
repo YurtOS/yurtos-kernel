@@ -43,6 +43,7 @@ import type {
   ProcessKernel,
   SpawnRequest,
 } from "../process/kernel.js";
+import { FdDupMinError, POSIX_EINVAL } from "../process/kernel.js";
 import {
   normalizeNice,
   normalizeSchedulerPolicy,
@@ -185,37 +186,8 @@ export const POLLHUP = 0x0010;
 export const POLLNVAL = 0x0020;
 export const POLLFD_SIZE = 8;
 
-/**
- * Net-debug channel: enabled by `YURT_NET_DEBUG=1` in the host
- * environment. Emits structured-ish lines on stderr around socket
- * bind / listen / accept so we can see why ipykernel's TCP setup
- * fails or stalls. No-op when the env var isn't set; safe in both
- * Deno and browser (where neither env source exists).
- */
-const YURT_NET_DEBUG = (() => {
-  try {
-    const denoEnv = (globalThis as {
-      Deno?: { env: { get(k: string): string | undefined } };
-    }).Deno?.env;
-    if (denoEnv?.get("YURT_NET_DEBUG")) return true;
-  } catch { /* Deno.env may throw on insufficient permissions */ }
-  try {
-    const procEnv = (globalThis as {
-      process?: { env: Record<string, string | undefined> };
-    }).process?.env;
-    if (procEnv?.YURT_NET_DEBUG) return true;
-  } catch { /* no-op */ }
-  return false;
-})();
-
-export function netLog(op: string, fields: Record<string, unknown>): void {
-  if (!YURT_NET_DEBUG) return;
-  const parts: string[] = [];
-  for (const [k, v] of Object.entries(fields)) {
-    parts.push(`${k}=${typeof v === "string" ? v : JSON.stringify(v)}`);
-  }
-  console.error(`[yurt-net] ${op} ${parts.join(" ")}`);
-}
+export { netLog } from "./net-debug.ts";
+import { netLog } from "./net-debug.ts";
 
 function writeI32(
   memory: WebAssembly.Memory,
@@ -2571,7 +2543,7 @@ export function createKernelImports(
     // POSIX F_DUPFD/F_DUPFD_CLOEXEC: duplicate into the lowest free fd >= min_fd.
     host_dup_min(srcFd: number, minFd: number): number {
       if (isActivePreopenFd(srcFd)) return -1;
-      if (minFd < 0) return -1;
+      if (minFd < 0) return -POSIX_EINVAL;
       try {
         const kernelTarget = opts.kernel?.getFdTarget(callerPid, srcFd);
         if (opts.kernel && kernelTarget) {
@@ -2580,7 +2552,8 @@ export function createKernelImports(
         }
         const newFd = opts.wasiHost?.duplicateFdMin(srcFd, minFd, false);
         return newFd ?? -1;
-      } catch {
+      } catch (err) {
+        if (err instanceof FdDupMinError) return -err.errno;
         return -1;
       }
     },
@@ -3972,11 +3945,20 @@ export function createKernelImports(
         const anc = ancBefore ?? registry.popWaiterAnc(rawHandle);
         const view = new DataView(memory.buffer);
         let nFds = 0;
+        // #104 (M2): bit 31 of the n_fds header flags discarded
+        // (closed) overflow SCM_RIGHTS fds so the C shim raises POSIX
+        // MSG_CTRUNC. Mirrors the Rust kernel-wasm signal so the
+        // contract holds under either YURT_KERNEL backend.
+        const RIGHTS_TRUNCATED = 0x8000_0000;
+        let ancillaryTruncated = false;
         if (anc) {
           const senderPid = anc.senderPid;
           const toReceive = fdsPtr !== 0 && fdsCap > 0
             ? anc.fds.slice(0, fdsCap)
             : [];
+          if (anc.fds.length > toReceive.length) {
+            ancillaryTruncated = true;
+          }
           for (const dupFd of toReceive) {
             try {
               const newFd = opts.kernel.dupFromProcess(
@@ -3995,7 +3977,12 @@ export function createKernelImports(
             opts.kernel.closeFd(senderPid, dupFd);
           }
         }
-        if (nFdsPtr !== 0) view.setInt32(nFdsPtr, nFds, true);
+        if (nFdsPtr !== 0) {
+          const header = ancillaryTruncated
+            ? (nFds | RIGHTS_TRUNCATED) >>> 0
+            : nFds;
+          view.setInt32(nFdsPtr, header, true);
+        }
         return n;
       } catch {
         return -1;

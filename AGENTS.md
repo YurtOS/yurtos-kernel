@@ -35,8 +35,11 @@ Never bypass with `--no-verify`. If a hook fails, fix the underlying issue and c
 
 ## Development procedure (non-trivial work)
 
+**Always work in your own worktree.** Before touching anything, create a dedicated git worktree for the task and do all work there — never commit or leave uncommitted changes on a shared/checked-out branch. This repo runs many concurrent agents; the primary checkout's branch can change under you. Use `superpowers:using-git-worktrees` (prefer the native `EnterWorktree` tool) and branch off `main`. This applies to every non-trivial task, no exceptions.
+
 For any feature, refactor, or bugfix beyond a one-line tweak, follow the superpowers loop in order. Each step has a skill — invoke it via the `Skill` tool.
 
+0. **Isolate** — `superpowers:using-git-worktrees`. Get your own worktree first (see the rule above).
 1. **Brainstorm** — `superpowers:brainstorming`. Clarify intent, requirements, alternatives, tradeoffs *before* committing to a design.
 2. **Plan** — `superpowers:writing-plans`. Produce a written plan under `docs/superpowers/plans/YYYY-MM-DD-<slug>.md`. Specs (when separate from plans) go under `docs/superpowers/specs/`.
 3. **Implement with TDD** — `superpowers:test-driven-development`. Red → green → refactor. Tests live next to code in `__tests__/` (Deno) or `#[cfg(test)] mod tests` (Rust).
