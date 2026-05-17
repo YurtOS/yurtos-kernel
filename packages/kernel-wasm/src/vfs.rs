@@ -1248,6 +1248,33 @@ mod tests {
     }
 
     #[test]
+    fn ramfs_root_inode_zero_never_collides_with_minted_ids() {
+        // Foundational invariant the whole inode anchor rests on: the
+        // mount-root dir inode is the reserved id 0, and `next_id`
+        // starts at 1 and only ever increments, so every minted id is
+        // (a) never 0 — no minted entry aliases root — and (b) globally
+        // unique across BOTH id-minting paths (`mkdir` dirs and
+        // `install` files share one `next_id` space). A future
+        // `next_id: 0` regression breaks (a); a per-path counter or a
+        // reset would break (b). Seed the live-id set with root's 0 so
+        // a single insert-must-be-new ladder pins both at once.
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.dir_inode(b"/"), Some(0), "root is the reserved inode 0");
+        let mut seen = std::collections::BTreeSet::from([0u64]);
+        for name in ["/a", "/b", "/a/c"] {
+            assert_eq!(b.mkdir(name.as_bytes()), 0);
+            let id = b.dir_inode(name.as_bytes()).unwrap();
+            assert_ne!(id, 0, "minted dir inode for {name} collided with root");
+            assert!(seen.insert(id), "dir inode {id} for {name} not unique");
+        }
+        for name in ["/f", "/a/g", "/a/c/h"] {
+            let id = b.install(name.as_bytes().to_vec(), b"x".to_vec());
+            assert_ne!(id, 0, "minted file inode for {name} collided with root");
+            assert!(seen.insert(id), "file inode {id} for {name} not unique");
+        }
+    }
+
+    #[test]
     fn ramfs_dir_rename_recursively_rekeys_children() {
         let mut b = RamfsBackend::new();
         assert_eq!(b.mkdir(b"/base"), 0);
