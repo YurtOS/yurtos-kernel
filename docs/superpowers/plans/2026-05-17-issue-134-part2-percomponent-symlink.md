@@ -19,6 +19,7 @@
 - stat/lstat 16-byte record: `out[0..8]`=size u64 LE, `out[8..12]`=filetype u32 LE (0 none, 3 dir, 4 file, 6 sock, 7 symlink), `out[12..16]`=mode u32 LE.
 - Non-root caller = any pid by default; `make_root(pid)` (helper at `tests.rs:11`) sets euid=0. Populate `/proc/<pid>/cmdline`: `set_argv(&set_argv_req(pid, &[b"/bin/x"]))` (see `proc_other_pid_open_gate_survives_symlink_resolution`, `tests.rs:4842`).
 - `abi::EPERM`, `abi::ENOENT`, `abi::ENOTDIR`, `abi::EINVAL` in scope.
+- **Test doc comments go ABOVE `#[test]` as `///` doc comments** (file convention), never wedged between `#[test]` and `fn`.
 - **Test filter:** use a unique substring, NOT `--exact`. `cargo test … <name>` does a substring match; `-- --exact` requires the fully-qualified `dispatch::tests::<name>` path and matches nothing with a bare name.
 - **`resolve_realpath` (and the future `resolve_components`) check every intermediate component's existence** — any test resolving `/x/y` must create `/x` (e.g. `mkdir`) first. `mkdir`/other `normalize_readable_path` syscalls also `publish_proc_snapshots()`, which is what makes `/proc/<pid>/…` entries visible to a later resolution walk. RED/characterization tests touching `/proc/<other>` must run a `mkdir` (or equivalent) first.
 
@@ -41,12 +42,12 @@ Characterization tests: they must be **GREEN on the unmodified base** and stay g
 - [ ] **Step 1: Write the characterization test**
 
 ```rust
-// Issue #134 Part 2: pins realpath's exact pre-refactor behavior so the
-// shared-resolver extraction is provably non-regressing. A cross-pid
-// /proc intermediate symlink is followed by the lexical walk (no
-// per-component gate) and then denied by realpath's single post-gate
-// (fs.rs:430). Approach A keeps realpath on (follow_terminal=true,
-// authorize_each=false), so this must stay GREEN unchanged.
+/// Issue #134 Part 2: pins realpath's exact pre-refactor behavior so the
+/// shared-resolver extraction is provably non-regressing. A cross-pid
+/// /proc intermediate symlink is followed by the lexical walk (no
+/// per-component gate) and then denied by realpath's single post-gate
+/// (fs.rs:430). Approach A keeps realpath on (follow_terminal=true,
+/// authorize_each=false), so this must stay GREEN unchanged.
 #[test]
 fn realpath_crosspid_proc_symlink_is_post_gated_unchanged() {
     let _g = crate::kernel::TestGuard::acquire();
@@ -74,10 +75,10 @@ fn realpath_crosspid_proc_symlink_is_post_gated_unchanged() {
         -(abi::EPERM as i64),
         "realpath cross-pid /proc symlink must stay post-gated (-EPERM)"
     );
-    // pid 2 (owns it) → succeeds.
-    make_root(2);
+    // pid 2 owns /proc/2, so it resolves without needing root
+    // (can_read_proc_path allows caller == target regardless of uid).
     let n = dispatch(METHOD_SYS_REALPATH, 2, b"/tmp/leak", &mut out);
-    assert!(n > 0, "owner/root realpath resolves: {n}");
+    assert!(n > 0, "owner (non-root) realpath resolves: {n}");
 }
 ```
 
