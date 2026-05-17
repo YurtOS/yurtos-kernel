@@ -10,7 +10,13 @@
 import { METHOD } from "./mod.ts";
 import type { KernelInstance } from "./mod.ts";
 
-/** Spec 2026-05-17-scm-rights-ctrunc: CTRUNC reserved bit (bit30). */
+/**
+ * Reserved bit in the `nFds` out-value telling the guest C shim that
+ * SCM_RIGHTS was truncated → the guest ORs `MSG_CTRUNC`. Bit30 (not
+ * bit31: the guest reads `n_fds` into a signed `int` gated by `> 0`).
+ * The fd count is hard-capped at 64, so bit30 is unambiguously free.
+ * (spec 2026-05-17-scm-rights-ctrunc)
+ */
 export const YURT_RECVMSG_CTRUNC_BIT = 0x40000000;
 
 export function recvmsgPackNfds(
@@ -22,7 +28,7 @@ export function recvmsgPackNfds(
   const truncated = (flags & 0x1) !== 0 || delivered > fdsCap;
   return {
     copyFds,
-    nFds: truncated ? (copyFds | YURT_RECVMSG_CTRUNC_BIT) >>> 0 : copyFds >>> 0,
+    nFds: truncated ? (copyFds | YURT_RECVMSG_CTRUNC_BIT) >>> 0 : copyFds,
   };
 }
 

@@ -43,9 +43,13 @@ const ENOTCONN = 107;
 const HOST_UNIX_NOT_AF_UNIX = -1;
 const HOST_ASYNC_EAGAIN = -2;
 
-/** Reserved bit telling the guest C shim SCM_RIGHTS was truncated
- * (→ MSG_CTRUNC). Bit30; fd count hard-capped at 64. Spec
- * 2026-05-17-scm-rights-ctrunc. */
+/**
+ * Reserved bit in the `nFds` out-value telling the guest C shim that
+ * SCM_RIGHTS was truncated → the guest ORs `MSG_CTRUNC`. Bit30 (not
+ * bit31: the guest reads `n_fds` into a signed `int` gated by `> 0`).
+ * The fd count is hard-capped at 64, so bit30 is unambiguously free.
+ * (spec 2026-05-17-scm-rights-ctrunc)
+ */
 export const YURT_RECVMSG_CTRUNC_BIT = 0x40000000;
 
 export function recvmsgPackNfds(
