@@ -620,7 +620,12 @@ mod tests {
             k.process_mut(7);
         });
         assert_eq!(kernel_kill(7, 15), 0);
-        assert_eq!(kernel_kill(7, 64), -(abi::EINVAL as i64));
+        // #110 (sig-64 widening): sig 64 (SIGRTMAX) is now a valid
+        // signal; the export must surface the widened kernel
+        // validation. 65 is the first out-of-range value. This
+        // previously enshrined sig 64 → EINVAL (the bug).
+        assert_eq!(kernel_kill(7, 64), 0);
+        assert_eq!(kernel_kill(7, 65), -(abi::EINVAL as i64));
     }
 
     #[test]
