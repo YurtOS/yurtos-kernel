@@ -453,6 +453,16 @@ pub trait PolicyEnforcer: Send + Sync {
         PolicyDecision::Allow
     }
 
+    /// Gate `kh_now_monotonic`. Mirrors `may_get_realtime` for
+    /// symmetry; defaults to Allow because monotonic time is not
+    /// privacy-sensitive in the same way wall-clock is (it carries no
+    /// information about the host's local date or epoch). Deny
+    /// surfaces as `-EACCES` to the kernel and breaks event-loop
+    /// timers / timeouts — most embedders should leave it Allow.
+    fn may_get_monotonic(&self) -> PolicyDecision {
+        PolicyDecision::Allow
+    }
+
     /// Gate outbound HTTP fetches. `request` is the binary fetch record the
     /// kernel forwarded; embedders inspect the URL, method, or headers and
     /// Allow/Deny. Default: Allow.
@@ -522,6 +532,9 @@ impl PolicyEnforcer for DenyAllPolicy {
         PolicyDecision::Deny
     }
     fn may_get_realtime(&self) -> PolicyDecision {
+        PolicyDecision::Deny
+    }
+    fn may_get_monotonic(&self) -> PolicyDecision {
         PolicyDecision::Deny
     }
     fn may_fetch(&self, _request: &[u8]) -> PolicyDecision {
@@ -3619,6 +3632,37 @@ fn register_kh_imports(linker: &mut Linker<KernelStoreData>) -> Result<()> {
                 return -(EIO as i32);
             }
             if memory.write(&mut caller, out_ptr as usize, &buf).is_err() {
+                return -(EFAULT as i32);
+            }
+            0
+        },
+    )?;
+    linker.func_wrap(
+        KH_NAMESPACE,
+        "kh_now_monotonic",
+        |mut caller: Caller<'_, KernelStoreData>, out_ptr: u32| -> i32 {
+            // Monotonic clock — see HostState.now_monotonic_ns. Issue #64.
+            if caller.data().host.policy.may_get_monotonic() == PolicyDecision::Deny {
+                return -(EACCES as i32);
+            }
+            // Compute monotonic at call time so default-initialized
+            // embedders don't return a frozen 0 forever. Anchor the
+            // first reading at process start and report nanoseconds
+            // since that anchor — guarantees non-decrease and works
+            // without any embedder bookkeeping.
+            use std::sync::OnceLock;
+            use std::time::Instant;
+            static ANCHOR: OnceLock<Instant> = OnceLock::new();
+            let anchor = ANCHOR.get_or_init(Instant::now);
+            let now = anchor.elapsed().as_nanos() as u64;
+            let memory = match caller.get_export("memory").and_then(|e| e.into_memory()) {
+                Some(m) => m,
+                None => return -(EFAULT as i32),
+            };
+            if memory
+                .write(&mut caller, out_ptr as usize, &now.to_le_bytes())
+                .is_err()
+            {
                 return -(EFAULT as i32);
             }
             0

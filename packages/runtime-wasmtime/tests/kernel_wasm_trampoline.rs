@@ -813,6 +813,7 @@ fn kernel_wasm_imports_match_documented_namespaces() {
             "kh_idb_list",
             "kh_idb_put",
             "kh_log",
+            "kh_now_monotonic",
             "kh_now_realtime",
             "kh_random",
             // kh_real_* land via the HostFsBackend mount at /host;

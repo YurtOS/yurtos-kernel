@@ -1213,8 +1213,13 @@ fn default_winsize() -> [u8; 8] {
 }
 
 /// `clock_gettime(clock_id) -> 8 bytes le u64 ns`. clock_id 0 =
-/// REALTIME (kh_now_realtime), 1 = MONOTONIC (kh_now_monotonic when
-/// it lands; today aliased to REALTIME).
+/// REALTIME (kh_now_realtime), 1 = MONOTONIC (kh_now_monotonic).
+///
+/// POSIX requires CLOCK_MONOTONIC to be monotonically non-decreasing
+/// and immune to wall-clock adjustments (NTP steps, settimeofday, DST),
+/// so it has its own host primitive — aliasing to REALTIME would break
+/// elapsed-time math (timeouts, asyncio timers, perf_counter deltas).
+/// Issue #64.
 fn clock_gettime(request: &[u8], response: &mut [u8]) -> i64 {
     let Some([clock_id]) = read_u32_args::<1>(request) else {
         return -(abi::EINVAL as i64);
@@ -1222,15 +1227,17 @@ fn clock_gettime(request: &[u8], response: &mut [u8]) -> i64 {
     if response.len() < 8 {
         return -(abi::EINVAL as i64);
     }
-    match clock_id {
-        0 | 1 => match kh::now_realtime_ns() {
-            Ok(ns) => {
-                response[..8].copy_from_slice(&ns.to_le_bytes());
-                8
-            }
-            Err(rc) => rc as i64,
-        },
-        _ => -(abi::EINVAL as i64),
+    let now = match clock_id {
+        0 => kh::now_realtime_ns(),
+        1 => kh::now_monotonic_ns(),
+        _ => return -(abi::EINVAL as i64),
+    };
+    match now {
+        Ok(ns) => {
+            response[..8].copy_from_slice(&ns.to_le_bytes());
+            8
+        }
+        Err(rc) => rc as i64,
     }
 }
 

@@ -316,6 +316,8 @@ export interface PolicyEnforcer {
   mayLog?(severity: number, message: string): PolicyDecision;
   /** Gate kh_now_realtime. */
   mayGetRealtime?(): PolicyDecision;
+  /** Gate kh_now_monotonic (issue #64). Defaults to Allow; denying breaks event-loop timers. */
+  mayGetMonotonic?(): PolicyDecision;
   /** Gate kh_fetch_blocking. `request` is yurt_fetch_request_v1. */
   mayFetch?(request: Uint8Array): PolicyDecision;
   /** Gate kh_idb_*. `write` distinguishes mutating ops. */
@@ -1212,6 +1214,7 @@ export const denyAllPolicy: PolicyEnforcer = {
   mayListen: () => "deny",
   mayLog: () => "deny",
   mayGetRealtime: () => "deny",
+  mayGetMonotonic: () => "deny",
 };
 
 export function defaultHostState(): HostState {
@@ -2232,6 +2235,25 @@ export class KernelHostInterface {
         new DataView(memoryRef.memory!.buffer).setBigUint64(
           outPtr,
           hostBox.state.nowRealtimeNs,
+          true,
+        );
+        return 0;
+      },
+      kh_now_monotonic: (outPtr: number): number => {
+        // Compute at call time so a default-initialized HostState
+        // never returns a frozen 0. performance.now() is already
+        // monotonic-from-some-origin in milliseconds (with sub-ms
+        // precision on most runtimes); scale to ns and floor to
+        // bigint. Available in Deno, Node, and browsers. Issue #64.
+        if (
+          hostBox.state.policy.mayGetMonotonic?.() === "deny"
+        ) {
+          return -EACCES;
+        }
+        const nowNs = BigInt(Math.floor(performance.now() * 1_000_000));
+        new DataView(memoryRef.memory!.buffer).setBigUint64(
+          outPtr,
+          nowNs,
           true,
         );
         return 0;
