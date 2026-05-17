@@ -12618,11 +12618,13 @@ fn stat_lstat_per_component_auth_allows_self_and_ordinary() {
     );
 }
 
-/// Issue #134 Part 2: an intermediate symlink cycle is bounded by the
-/// 40-hop SYMLOOP limit (-EINVAL, matching follow_symlinks), for both
-/// stat and lstat.
+/// Issue #134 Part 2 + #142: an intermediate symlink cycle is bounded
+/// by the 40-hop SYMLOOP limit and surfaces -ELOOP (POSIX), harmonized
+/// across stat/lstat/open/access via the shared per-component resolver
+/// (#142 retargeted the resolver from -EINVAL to -ELOOP to match
+/// realpath and the legacy terminal-only follow_symlinks).
 #[test]
-fn stat_lstat_intermediate_symlink_loop_is_einval() {
+fn stat_lstat_intermediate_symlink_loop_is_eloop() {
     let _g = crate::kernel::TestGuard::acquire();
     let mut s1 = (b"/y/z".len() as u32).to_le_bytes().to_vec();
     s1.extend_from_slice(b"/y/z");
@@ -12635,11 +12637,11 @@ fn stat_lstat_intermediate_symlink_loop_is_einval() {
     let mut out = [0u8; 16];
     assert_eq!(
         dispatch(METHOD_SYS_STAT, 1, b"/x/q", &mut out),
-        -(abi::EINVAL as i64)
+        -(abi::ELOOP as i64)
     );
     assert_eq!(
         dispatch(METHOD_SYS_LSTAT, 1, b"/x/q", &mut out),
-        -(abi::EINVAL as i64)
+        -(abi::ELOOP as i64)
     );
 }
 
@@ -12756,13 +12758,11 @@ fn stat_lstat_nondir_intermediate_is_enoent_not_enotdir_146_142() {
     );
 }
 
-/// KNOWN INTENTIONAL asymmetry (tracked in #142): after #134 Part 2,
-/// stat() resolves intermediate symlink components but sys_open()
-/// still uses terminal-only follow_symlinks — so a program can stat()
-/// a path it cannot open(). Pins the gap so #142's fix (open parity)
-/// is a deliberate, test-visible change, not a silent one.
+/// #142 fix: sys_open now resolves intermediate symlink components,
+/// matching stat()/lstat()'s #134 Part 2 parity. Replaces the prior
+/// "known asymmetry" characterization test.
 #[test]
-fn stat_open_intermediate_symlink_asymmetry_142() {
+fn open_resolves_intermediate_symlink_components_142() {
     let _g = crate::kernel::TestGuard::acquire();
     assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
     assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
@@ -12781,10 +12781,64 @@ fn stat_open_intermediate_symlink_asymmetry_142() {
         16,
         "stat resolves the intermediate symlink (#134 Part 2)"
     );
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/a/symdir/f"), &mut []);
+    assert!(
+        fd >= 0,
+        "#142: open now resolves intermediate symlinks, so /a/symdir/f \
+         opens as /real/f; got rc={fd}"
+    );
+}
+
+/// #142: access() / faccessat() must agree with the open() and stat()
+/// they gate. After per-component migration, F_OK on a path that
+/// traverses an intermediate symlink must succeed (it used to fail
+/// with -ENOENT because access fell back on terminal-only follow).
+#[test]
+fn access_resolves_intermediate_symlink_components_142() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut reg = (b"/real/f".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/real/f");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    let mut s = (b"/real".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/real");
+    s.extend_from_slice(b"/a/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    // access(/a/symdir/f, F_OK) succeeds after #142.
+    let mut req = 0u32.to_le_bytes().to_vec(); // F_OK = 0
+    req.extend_from_slice(b"/a/symdir/f");
     assert_eq!(
-        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/a/symdir/f"), &mut []),
-        -(abi::ENOENT as i64),
-        "open still terminal-only — cannot open what stat resolved (until #142)"
+        dispatch(METHOD_SYS_ACCESS, 1, &req, &mut []),
+        0,
+        "#142: access() resolves intermediate symlinks (parity with open())"
+    );
+}
+
+/// #142: sys_statvfs() likewise migrated from terminal-only follow to
+/// the shared per-component resolver, so a statvfs on a path through an
+/// intermediate symlink succeeds and reports the real mount's metrics.
+#[test]
+fn statvfs_resolves_intermediate_symlink_components_142() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut reg = (b"/real/f".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/real/f");
+    reg.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    let mut s = (b"/real".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/real");
+    s.extend_from_slice(b"/a/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut buf = [0u8; STATVFS_SIZE];
+    assert_eq!(
+        dispatch(METHOD_SYS_STATVFS, 1, b"/a/symdir/f", &mut buf),
+        STATVFS_SIZE as i64,
+        "#142: statvfs() resolves intermediate symlinks (parity with stat())"
     );
 }
 
