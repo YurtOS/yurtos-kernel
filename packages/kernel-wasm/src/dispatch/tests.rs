@@ -9744,6 +9744,7 @@ fn sigprocmask_block_setmask_oset_and_kill_unmaskable() {
     });
     assert_ne!(m & (1u64 << (2 - 1)), 0, "SIGINT blocked");
     assert_eq!(m & (1u64 << (9 - 1)), 0, "SIGKILL never maskable");
+    assert_eq!(m & (1u64 << (19 - 1)), 0, "SIGSTOP never maskable");
     // bad how → EINVAL
     assert_eq!(
         dispatch(

@@ -5,6 +5,10 @@
 //! SIGTERM15→3 SIGCHLD17→4 SIGWINCH28→5 SIGPIPE13→6
 //! SIGUSR1/USR2/ALRM(10,12,14)→7.
 
+use super::DispatchContext;
+use crate::abi;
+use crate::kernel::with_kernel;
+
 /// (compact_slot, &[signo...]) — slot 7 aliases three signals.
 const SLOTS: &[(u8, &[u32])] = &[
     (0, &[1]),
@@ -40,10 +44,6 @@ pub fn narrow(canonical: u64) -> u8 {
     }
     out
 }
-
-use super::DispatchContext;
-use crate::abi;
-use crate::kernel::with_kernel;
 
 const SIG_BLOCK: i32 = 0;
 const SIG_UNBLOCK: i32 = 1;
