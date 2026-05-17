@@ -1046,7 +1046,7 @@ impl VfsBackend for RamfsBackend {
         }
         let parent = Self::parent_of(path);
         if !self.dir_inodes.contains_key(&parent) {
-            return -2; // -ENOENT
+            return -crate::abi::ENOENT;
         }
         // Mint a fresh stable dir inode (forward + reverse). Shares
         // `next_id` with file inodes but never enters
@@ -1060,7 +1060,7 @@ impl VfsBackend for RamfsBackend {
 
     fn rmdir(&mut self, path: &[u8]) -> i32 {
         if !self.dir_inodes.contains_key(path) {
-            return -2; // -ENOENT (or ENOTDIR if it's a regular file)
+            return -crate::abi::ENOENT; // (or ENOTDIR for a regular file)
         }
         // Empty check: walk children. A child is any tracked path
         // whose parent is `path`.
