@@ -596,7 +596,6 @@ const USER_YURT_STUB_IMPORTS = [
   "host_socket_send",
   "host_socket_send_unix",
   "host_socket_set_no_delay",
-  "host_spawn",
   "host_symlink",
   "host_tcgetattr",
   "host_tcgetpgrp",
@@ -609,7 +608,6 @@ const USER_YURT_STUB_IMPORTS = [
   "host_thread_spawn",
   "host_tiocsctty",
   "host_umask",
-  "host_wait",
   "host_winsize",
   "host_write_command",
   "host_write_fd",
@@ -1621,12 +1619,16 @@ function byteKey(bytes: Uint8Array): string {
   return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+/** Re-entrancy depth counter for drainPendingProcess calls. */
+let _drainProcessDepth = 0;
+
 function buildUserYurtImports(
   pid: number,
   kernel: KernelInstance,
   userMemoryRef: { memory?: WebAssembly.Memory },
   callerTid = 1,
   drainPendingThread?: (tid: number) => void,
+  drainPendingProcess?: () => void,
 ): Record<string, (...args: (number | bigint)[]) => number> {
   const memoryBuffer = () => userMemoryRef.memory!.buffer;
   const boundsOk = (ptr: number, len: number): boolean => {
@@ -1725,6 +1727,166 @@ function buildUserYurtImports(
     ).rc;
   imports.host_thread_yield = () =>
     threadSyscall(METHOD.SYS_THREAD_YIELD, new Uint8Array(0), 0).rc;
+  // ── host_spawn(reqPtr, reqLen, outPtr, outCap) → i32 ─────────────────────
+  // Parses a yurt_spawn_request_v1 from guest memory, builds the SYS_SPAWN
+  // kernel wire format, and writes a yurt_spawn_result_v1 (4-byte i32 pid).
+  imports.host_spawn = (reqPtr, reqLen, outPtr, outCap): number => {
+    const reqPtrN = Number(reqPtr) >>> 0;
+    const reqLenN = Number(reqLen) >>> 0;
+    const outPtrN = Number(outPtr) >>> 0;
+    const outCapN = Number(outCap) >>> 0;
+
+    // Copy the request bytes from guest memory.
+    const bytes = copyIn(reqPtrN, reqLenN);
+    if (typeof bytes === "number") return bytes; // -EFAULT
+
+    // Validate the fixed header (88 bytes minimum).
+    const SPAWN_V1_SIZE = 88;
+    if (bytes.length < SPAWN_V1_SIZE) return -22; // EINVAL
+    const hdr = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const logicalSize = hdr.getUint32(0, true);
+    const version = hdr.getUint16(4, true);
+    if (version !== 1 || logicalSize < SPAWN_V1_SIZE) return -22; // EINVAL
+    if (logicalSize > bytes.length) return -75; // EOVERFLOW
+
+    // Helper: read a span {u32 off, u32 len} relative to record start.
+    const readSpan = (off: number): { off: number; len: number } | null => {
+      const spanOff = hdr.getUint32(off, true);
+      const spanLen = hdr.getUint32(off + 4, true);
+      if (spanOff === 0 && spanLen === 0) return null;
+      return { off: spanOff, len: spanLen };
+    };
+    const readString = (
+      spanOff: number,
+    ): string | null => {
+      const span = readSpan(spanOff);
+      if (span === null) return null;
+      if (span.off + span.len > logicalSize) return null;
+      return new TextDecoder().decode(
+        bytes.subarray(span.off, span.off + span.len),
+      );
+    };
+
+    // prog (required, offset 8)
+    const prog = readString(8);
+    if (prog === null || prog.length === 0) return -22; // EINVAL
+
+    // argv0 (optional, offset 16) — used as argv[0] if present
+    const argv0 = readString(16);
+
+    // args_off (u32@24), args_count (u32@28) — args[1..] span-vector
+    const argsVecOff = hdr.getUint32(24, true);
+    const argsCount = hdr.getUint32(28, true);
+    const args: string[] = [];
+    if (argsCount > 0) {
+      const SPAN_SIZE = 8;
+      const argsEnd = argsVecOff + argsCount * SPAN_SIZE;
+      if (argsEnd > logicalSize) return -75; // EOVERFLOW
+      for (let i = 0; i < argsCount; i++) {
+        const spanBase = argsVecOff + i * SPAN_SIZE;
+        const aOff = hdr.getUint32(spanBase, true);
+        const aLen = hdr.getUint32(spanBase + 4, true);
+        if (aOff + aLen > logicalSize) return -75; // EOVERFLOW
+        args.push(
+          new TextDecoder().decode(bytes.subarray(aOff, aOff + aLen)),
+        );
+      }
+    }
+
+    // Build SYS_SPAWN kernel wire: u32 path_len + path + (u32 arg_len + arg)*
+    // argv entries = [argv0 ?? prog, ...args]
+    const enc = new TextEncoder();
+    const pathBytes = enc.encode(prog);
+    const argv0Str = argv0 !== null ? argv0 : prog;
+    const argvEntries: Uint8Array[] = [enc.encode(argv0Str)];
+    for (const a of args) argvEntries.push(enc.encode(a));
+
+    let wireLen = 4 + pathBytes.length;
+    for (const a of argvEntries) wireLen += 4 + a.length;
+    const wire = new Uint8Array(wireLen);
+    const wireView = new DataView(wire.buffer);
+    let cur = 0;
+    wireView.setUint32(cur, pathBytes.length, true);
+    cur += 4;
+    wire.set(pathBytes, cur);
+    cur += pathBytes.length;
+    for (const a of argvEntries) {
+      wireView.setUint32(cur, a.length, true);
+      cur += 4;
+      wire.set(a, cur);
+      cur += a.length;
+    }
+
+    // Call SYS_SPAWN; rc is the child pid on success (>0), or negative errno.
+    const spawnRc = Number(kernel.syscall(METHOD.SYS_SPAWN, pid, wire, 0).rc);
+    if (spawnRc < 0) return spawnRc;
+
+    // Write yurt_spawn_result_v1: 4-byte LE i32 pid
+    if (outCapN < 4) return -E2BIG; // -7
+    const resultBytes = new Uint8Array(4);
+    new DataView(resultBytes.buffer).setInt32(0, spawnRc, true);
+    const copyRc = copyOut(outPtrN, resultBytes);
+    if (copyRc < 0) return copyRc;
+    return 4;
+  };
+  // ── host_wait(pid, flags, outPtr, outCap) → i32 ──────────────────────────
+  // Calls SYS_WAIT in a retry loop (drainPendingProcess between retries).
+  // Decodes the 8-byte kernel response and writes a 16-byte yurt_wait_result_v1.
+  imports.host_wait = (waitPid, flags, outPtr, outCap): number => {
+    const waitPidN = Number(waitPid) | 0;
+    const flagsN = Number(flags) >>> 0;
+    const outPtrN = Number(outPtr) >>> 0;
+    const outCapN = Number(outCap) >>> 0;
+    const WNOHANG = 1;
+
+    const req = new Uint8Array(8);
+    const reqView = new DataView(req.buffer);
+    reqView.setUint32(0, waitPidN >>> 0, true);
+    reqView.setUint32(4, flagsN, true);
+
+    let out = kernel.syscall(METHOD.SYS_WAIT, pid, req, 8);
+    let rc = Number(out.rc);
+    while (rc === -EAGAIN && !(flagsN & WNOHANG) && drainPendingProcess) {
+      if (_drainProcessDepth >= 256) {
+        throw new Error("host_wait: re-entrant spawn/wait nesting too deep");
+      }
+      _drainProcessDepth++;
+      try {
+        drainPendingProcess();
+      } finally {
+        _drainProcessDepth--;
+      }
+      out = kernel.syscall(METHOD.SYS_WAIT, pid, req, 8);
+      rc = Number(out.rc);
+    }
+
+    if (rc < 0) return rc;
+    if (rc !== 8) return -E2BIG; // -7
+    if (outCapN < 16) return -E2BIG; // -7
+
+    // Decode 8-byte kernel response: u32 exitedPid@0, i32 status@4
+    const kView = new DataView(
+      out.response.buffer,
+      out.response.byteOffset,
+      8,
+    );
+    const exitedPid = kView.getUint32(0, true);
+    const status = kView.getInt32(4, true);
+    const signal = status >= 128 && status < 192 ? status - 128 : 0;
+    const exitCode = signal === 0 ? status : 0;
+
+    // Write yurt_wait_result_v1: {i32 exitedPid, i32 exitCode, i32 signal, i32 0}
+    const resultBytes = new Uint8Array(16);
+    const result = new DataView(resultBytes.buffer);
+    result.setInt32(0, exitedPid, true);
+    result.setInt32(4, exitCode, true);
+    result.setInt32(8, signal, true);
+    result.setInt32(12, 0, true);
+
+    const copyRc = copyOut(outPtrN, resultBytes);
+    if (copyRc < 0) return copyRc;
+    return 16;
+  };
   const scalar = (method: number) => () =>
     Number(kernel.syscall(method, pid, new Uint8Array(0), 0).rc);
   imports.host_getuid = scalar(METHOD.SYS_GETUID);
@@ -1911,6 +2073,7 @@ class CachedProcessEngine {
         userMemoryRef,
         1,
         (tid) => this.runPendingThread(context.pid, tid),
+        () => this.runPendingSpawns(kernel),
       );
       instance = new WebAssembly.Instance(module, {
         env: { ...sysImports, sys_setrlimit },
@@ -2039,6 +2202,7 @@ class CachedProcessEngine {
           proc.userMemoryRef,
           tid,
           (targetTid) => this.runPendingThread(pid, targetTid),
+          () => this.runPendingSpawns(kernel),
         ),
       });
     } catch {
@@ -2198,7 +2362,7 @@ class CachedProcessEngine {
         userMemoryRef,
         1,
         (tid) => this.runPendingThread(childPid, tid),
-        // Task 4: pass () => this.runPendingSpawns(kernel) as 6th arg once buildUserYurtImports accepts it
+        () => this.runPendingSpawns(kernel),
       ),
     });
 
