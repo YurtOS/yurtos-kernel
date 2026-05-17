@@ -77,6 +77,7 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
     let create = flags & 0b010 != 0;
     let trunc = flags & 0b100 != 0;
     let directory = flags & 0b1000 != 0;
+    let excl = flags & 0b10000 != 0;
     with_kernel(|k| {
         let path = match normalize_readable_path(k, caller_pid, raw_path) {
             Ok(path) => path,
@@ -100,6 +101,13 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
         }
         let path: &[u8] = &resolved;
         let entry_type = k.vfs.entry_type(path);
+        // O_CREAT|O_EXCL: the path must not already exist (POSIX
+        // EEXIST). Checked on the resolved path; the dangling-symlink
+        // + O_EXCL nuance (Linux EEXISTs on the link itself) is out of
+        // scope per the #68 acceptance criteria.
+        if excl && create && entry_type != 0 {
+            return -(abi::EEXIST as i64);
+        }
         if directory && entry_type != 3 {
             return -(abi::ENOTDIR as i64);
         }

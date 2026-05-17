@@ -24,6 +24,7 @@ const O_WRITE: u32 = 0b001;
 const O_CREAT: u32 = 0b010;
 const O_TRUNC: u32 = 0b100;
 const O_DIRECTORY: u32 = 0b1000;
+const O_EXCL: u32 = 0b10000;
 
 const POLLIN: i16 = 0x0001;
 const POLLOUT: i16 = 0x0002;
@@ -4503,6 +4504,66 @@ fn open_with_create_installs_empty_file() {
     let mut buf = [0u8; 32];
     let n = dispatch(METHOD_SYS_READ, 1, &(rfd as u32).to_le_bytes(), &mut buf);
     assert_eq!(&buf[..n as usize], b"hello world");
+}
+
+// #67/#68 — O_CREAT|O_EXCL must fail with EEXIST on an existing path.
+
+#[test]
+fn open_creat_excl_on_existing_path_is_eexist() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = Vec::new();
+    reg.extend_from_slice(&5_u32.to_le_bytes());
+    reg.extend_from_slice(b"/lock");
+    reg.extend_from_slice(b"held");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT | O_EXCL, b"/lock"),
+            &mut []
+        ),
+        -(abi::EEXIST as i64),
+        "O_CREAT|O_EXCL on an existing path must be -EEXIST"
+    );
+}
+
+#[test]
+fn open_creat_excl_on_new_path_succeeds() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_WRITE | O_CREAT | O_EXCL, b"/fresh"),
+        &mut [],
+    );
+    assert!(fd >= 0, "O_CREAT|O_EXCL on a new path succeeds, fd = {fd}");
+    // A second O_EXCL create now collides.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT | O_EXCL, b"/fresh"),
+            &mut []
+        ),
+        -(abi::EEXIST as i64),
+        "the path now exists, so O_EXCL must reject it"
+    );
+}
+
+#[test]
+fn open_excl_without_creat_does_not_reject_existing() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = Vec::new();
+    reg.extend_from_slice(&2_u32.to_le_bytes());
+    reg.extend_from_slice(b"/e");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    // O_EXCL is only meaningful with O_CREAT; bare O_EXCL must not
+    // turn an ordinary open of an existing file into EEXIST.
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(O_EXCL, b"/e"), &mut []);
+    assert!(fd >= 0, "O_EXCL without O_CREAT opens normally, fd = {fd}");
 }
 
 #[test]
