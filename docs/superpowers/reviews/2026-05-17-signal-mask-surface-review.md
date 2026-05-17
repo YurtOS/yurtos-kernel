@@ -78,3 +78,32 @@ substance of Critical #1 stands unchanged.
 ### Verdict
 Approve-blocking on Critical #1–#2; fold #1–#3 + the rest as a round-5
 tightening before implementation.
+
+---
+
+## Round-6 review
+
+Disposition: 4 accepted, 1 reasoned pushback (premise rejected, valid
+core folded). Issue thread:
+`github.com/YurtOS/yurtos-kernel/issues/90#issuecomment-4470176218`.
+
+| # | Severity | Status |
+|---|----------|--------|
+| 1 | Blocker | **Accepted.** Verified `pause()` `yurt_signal.c:343-347` is `sigprocmask`-read+`sigsuspend`. `sys_sigsuspend` gains `has_mask`; `pause`=`sys_sigsuspend(has_mask=0)`, atomic, C thin (spec §4/§5/§6). |
+| 2 | Blocker | **Premise rejected, core folded.** "Migrate every `sigset_t` to `1<<(sig-1)`" / "`sigaddset(SIGUSR1)`→bit 9" contradicts the round-5-verified 1-byte `sigset_t` (bit 9 unrepresentable). Guest representation unchanged; explicit touched/untouched enumeration (spec §3.3), `sa_mask` boundary documented (§11.5), corrected representable round-trip test (§8). Repo-wide widening is a separate out-of-scope initiative. |
+| 3 | Should-fix | **Accepted, documented divergence.** Verified `sys_sigwaitinfo` (`process.rs:796-820`) is RT-queue-only, never `pending_signals`. §11.6 + pinned test (§8). |
+| 4 | Should-fix | **Accepted.** Precise initial state + fallback chain + explicit `MAIN_THREAD_TID` for the bare export (spec §3.2). |
+| 5 | Minor | **Accepted.** `sigaltstack` new C symbol named (§6); stale `*.spec.toml` rewritten not extended (§8); partition+umbrella one atomic edit (§4); pending-check no-observable-effect stated (§5/§11.4). |
+
+Pushback rationale (item 2): receiving-code-review discipline — the
+remedy as written reverts to the pre-round-5 "canonical everywhere"
+model that round-5 abandoned *because* `signal.h:26` is
+`typedef unsigned char sigset_t` with gnulib `NSIG≤32`. Pushed back with
+code-grounded reasoning; salvaged the legitimate sub-points (touched/
+untouched scoping, `sa_mask` encoding boundary, corrected test).
+
+### Round-6 verdict
+"With 1 and 2 resolved in the spec and 3–5 documented, ready to proceed
+to the plan doc." 1 resolved; 2 resolved via reasoned alternative;
+3–5 documented. Gate condition met pending maintainer ack of the item-2
+pushback.
