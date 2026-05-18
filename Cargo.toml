@@ -26,6 +26,7 @@ members = [
   "test-fixtures/wasm/spawn-wait",
   "test-fixtures/wasm/spawn-badreq",
   "test-fixtures/wasm/fork-twice",
+  "test-fixtures/wasm/fork-exec",
   "abi/conformance/rust/dup2-canary",
   "abi/conformance/rust/getgroups-canary",
   "abi/conformance/rust/affinity-canary",

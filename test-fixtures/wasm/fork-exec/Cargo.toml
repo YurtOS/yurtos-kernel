@@ -1,0 +1,7 @@
+[package]
+name = "fork-exec-wasm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+yurt-process = { path = "../../yurt-process" }

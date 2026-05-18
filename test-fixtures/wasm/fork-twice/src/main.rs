@@ -47,6 +47,27 @@ extern "C" {
     fn host_fork() -> i32;
 }
 
+// Asyncify save-state buffer.  Exported by address so the runtime can
+// locate it post-instantiation without needing malloc.  Mirrors the
+// same buffer that `abi/src/yurt_setjmp.c` exports for C-compiled
+// binaries; required by T1.5+ asyncify bridge initialisation.
+const YURT_ASYNCIFY_BUF_SIZE: usize = 65536;
+
+#[repr(align(16))]
+struct AlignedBuf([u8; YURT_ASYNCIFY_BUF_SIZE]);
+
+static mut ASYNCIFY_BUF: AlignedBuf = AlignedBuf([0u8; YURT_ASYNCIFY_BUF_SIZE]);
+
+#[export_name = "yurt_asyncify_buf_addr"]
+pub unsafe extern "C" fn yurt_asyncify_buf_addr() -> *mut u8 {
+    std::ptr::addr_of_mut!(ASYNCIFY_BUF.0) as *mut u8
+}
+
+#[export_name = "yurt_asyncify_buf_size"]
+pub extern "C" fn yurt_asyncify_buf_size() -> i32 {
+    YURT_ASYNCIFY_BUF_SIZE as i32
+}
+
 // Zero-initialized by definition (wasm .bss). The pre-fork path sets
 // it to 42; a child that genuinely resumed from the parent's snapshot
 // at the fork() site sees 42, a freshly-rebuilt child sees 0.

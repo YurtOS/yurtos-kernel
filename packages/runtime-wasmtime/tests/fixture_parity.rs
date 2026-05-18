@@ -65,6 +65,33 @@ fn ensure_fixture_built(crate_name: &str) {
     assert!(status.success(), "build of {crate_name} failed");
 }
 
+/// Build a continuation fixture: plain cargo build, then wasm-opt
+/// --asyncify in place (mirrors yurt-cc's continuation_args so the
+/// Rust-crate fixtures match the C-canary asyncify build exactly).
+fn ensure_fixture_built_asyncify(crate_name: &str) {
+    ensure_fixture_built(crate_name);
+    let wasm = fixture_wasm_path(crate_name);
+    let wasm_opt = which::which("wasm-opt")
+        .expect("wasm-opt on PATH (Binaryen) required for asyncify fixtures");
+    let status = Command::new(wasm_opt)
+        .args([
+            "-O2",
+            "--enable-bulk-memory",
+            "--enable-sign-ext",
+            "--enable-nontrapping-float-to-int",
+            "--asyncify",
+        ])
+        .arg(&wasm)
+        .arg("-o")
+        .arg(&wasm)
+        .status()
+        .expect("spawn wasm-opt");
+    assert!(
+        status.success(),
+        "wasm-opt --asyncify failed for {crate_name}"
+    );
+}
+
 fn ensure_kernel_wasm() -> &'static PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
@@ -405,6 +432,32 @@ fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     );
 }
 
+#[test]
+fn asyncify_fixture_exports_state_machine() {
+    // T1: ensure_fixture_built must, for a continuation fixture, run
+    // wasm-opt --asyncify so the artifact exports the asyncify_* state
+    // machine and yurt_asyncify_buf_addr/size. fork-twice is built
+    // through the continuation path (it imports yurt.host_fork).
+    ensure_fixture_built_asyncify("fork-twice-wasm");
+    let bytes = std::fs::read(fixture_wasm_path("fork-twice-wasm")).unwrap();
+    let module = wasmtime::Module::new(&wasmtime::Engine::default(), &bytes).unwrap();
+    let exports: Vec<&str> = module.exports().map(|e| e.name()).collect();
+    for want in [
+        "asyncify_start_unwind",
+        "asyncify_stop_unwind",
+        "asyncify_start_rewind",
+        "asyncify_stop_rewind",
+        "asyncify_get_state",
+        "yurt_asyncify_buf_addr",
+        "yurt_asyncify_buf_size",
+    ] {
+        assert!(
+            exports.contains(&want),
+            "asyncify fixture missing export {want}; exports={exports:?}"
+        );
+    }
+}
+
 /// CHARACTERIZING TEST (fork Task 0 capture spike). Pins the *current*
 /// `runtime-wasmtime` `host_fork` behavior; it is NOT the eventual
 /// correctness oracle. See
@@ -487,5 +540,41 @@ fn fork_twice_characterizes_current_host_fork() {
     assert_eq!(
         exit_code, 0,
         "CHARACTERIZING: parent proc_exit(0) after host_fork"
+    );
+}
+
+/// T1/M2 ORACLE (RED until T2a). The real continuation contract:
+/// fork-twice must emit TWO lines — parent (sentinel=42) AND child
+/// (`rc=0 sentinel=42`, proving the child resumed at the fork() site
+/// with the parent's post-sentinel memory). Live target T2a iterates
+/// against; T4 promotes it to the cross-host oracle. #[ignore] so it
+/// does not break CI before T2a — run explicitly with `-- --ignored`.
+#[test]
+#[ignore = "RED until T2a lands real continuation; M2 live target"]
+fn fork_twice_real_continuation_oracle() {
+    ensure_fixture_built_asyncify("fork-twice-wasm");
+    let wasm = std::fs::read(fixture_wasm_path("fork-twice-wasm")).unwrap();
+    let mk = fresh_kernel_host_interface();
+    let mut user = mk.spawn_user_process(&wasm).unwrap();
+    let _ = user.run_start();
+    let _ = mk.run_pending_spawns();
+    let stdout = String::from_utf8_lossy(&user.captured_stdout().unwrap()).to_string();
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected parent+child lines, got {stdout:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("fork-twice parent") && l.ends_with("sentinel=42")),
+        "missing parent line: {stdout:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == &"fork-twice child rc=0 sentinel=42"),
+        "missing child continuation line (rebuild, not continuation): {stdout:?}"
     );
 }
