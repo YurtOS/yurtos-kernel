@@ -13042,3 +13042,721 @@ fn stat_terminal_orphan_symlink_still_follows_base_parity() {
         "lstat reports the terminal orphan symlink as S_IFLNK"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #188 (#85 S0): faccessat must resolve a dirfd via the B2.9 inode anchor,
+// like openat — i.e. be rename-stable, not a stale path snapshot.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn faccessat_dirfd_is_rename_stable_like_openat() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/fa-base", &mut []), 0);
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, b"/fa-base/child"),
+            &mut [],
+        ) >= 0
+    );
+    let dirfd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_DIRECTORY, b"/fa-base"),
+        &mut [],
+    ) as u32;
+
+    // Sanity: resolves before the rename.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(dirfd, ACCESS_F_OK, 0, b"child"),
+            &mut [],
+        ),
+        0,
+    );
+
+    // Rename the directory behind the open dirfd. openat on this dirfd
+    // is rename-stable (inode-anchored); faccessat MUST match — a stale
+    // path snapshot would now (wrongly) resolve the dead /fa-base/child.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/fa-base", b"/fa-renamed"),
+            &mut [],
+        ),
+        0,
+    );
+    // openat (reference: known rename-stable) still finds it:
+    let oref = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dirfd, 0, b"child"),
+        &mut [],
+    );
+    assert!(
+        oref >= 0,
+        "openat reference must be rename-stable, got {oref}"
+    );
+    // faccessat must agree (the #188 bug: returns -ENOENT here today):
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(dirfd, ACCESS_F_OK, 0, b"child"),
+            &mut [],
+        ),
+        0,
+        "faccessat must be inode-anchored / rename-stable like openat (#188)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #148: RLIMIT_NOFILE / EMFILE enforcement across fd-producing syscalls.
+// ---------------------------------------------------------------------------
+
+/// Lower this process's RLIMIT_NOFILE to (soft, hard).
+fn set_nofile(pid: u32, soft: u64, hard: u64) {
+    let mut req = Vec::new();
+    req.extend_from_slice(&(crate::kernel::RLIMIT_NOFILE as u32).to_le_bytes());
+    req.extend_from_slice(&soft.to_le_bytes());
+    req.extend_from_slice(&hard.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_SETRLIMIT, pid, &req, &mut []), 0);
+}
+
+#[test]
+fn open_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // stdio occupies fds 0,1,2. soft=5 ⇒ only fds 3,4 are allocatable.
+    set_nofile(1, 5, 1024);
+
+    let null = b"/dev/null".as_slice();
+    assert_eq!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, null), &mut []), 3);
+    assert_eq!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, null), &mut []), 4);
+    // Third open is past the soft limit → -EMFILE (not a panic, not fd 5).
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, null), &mut []),
+        -(abi::EMFILE as i64)
+    );
+
+    // Freed slot is reused.
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, null), &mut []), 3);
+
+    // The limit is per-process: a different pid is unaffected.
+    assert!(dispatch(METHOD_SYS_OPEN, 2, &open_req(0, null), &mut []) >= 0);
+}
+
+#[test]
+fn dup_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    set_nofile(1, 5, 1024);
+    // stdio 0,1,2 used; soft=5 ⇒ only fds 3,4 allocatable.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+        3
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+        4
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+        -(abi::EMFILE as i64)
+    );
+    // Freed slot is reused; the failed dup left no half-installed fd.
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+        3
+    );
+}
+
+#[test]
+fn pipe_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // soft=5 ⇒ fds 3,4 allocatable: one pipe fits, the next does not.
+    set_nofile(1, 5, 1024);
+    let mut out = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut out), 8);
+    assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 4);
+    assert_eq!(
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut out),
+        -(abi::EMFILE as i64)
+    );
+
+    // Exactly-one-free case: the read end installs, the write end hits
+    // the limit; the read fd must be rolled back (not leaked) and the
+    // pipe object freed. soft=4 ⇒ only fd 3 is allocatable.
+    set_nofile(2, 4, 1024);
+    assert_eq!(
+        dispatch(METHOD_SYS_PIPE, 2, &[], &mut [0u8; 8]),
+        -(abi::EMFILE as i64)
+    );
+    // fd 3 was rolled back, so it is free again for a later allocation.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 2, &1_u32.to_le_bytes(), &mut []),
+        3
+    );
+}
+
+#[test]
+fn socket_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // soft=5 ⇒ fds 3,4 allocatable.
+    set_nofile(1, 5, 1024);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        4
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        -(abi::EMFILE as i64)
+    );
+    // The failed socket() left no leaked kernel socket: closing the two
+    // live ones and reopening succeeds (slot reused, object freed).
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        3
+    );
+}
+
+#[test]
+fn accept_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+
+    // Listener on fd 3, client on fd 4, connected.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_BIND,
+            1,
+            &socket_bind_unix_req(3, b"/tmp/yurt-148.sock"),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_LISTEN,
+            1,
+            &socket_listen_req(3, 4),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        4
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_CONNECT,
+            1,
+            &socket_connect_unix_req(4, b"/tmp/yurt-148.sock"),
+            &mut []
+        ),
+        0
+    );
+
+    // fds 0,1,2,3,4 used; soft=5 ⇒ accept has no fd to allocate.
+    set_nofile(1, 5, 1024);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_ACCEPT,
+            1,
+            &socket_accept_req(3, 0),
+            &mut []
+        ),
+        -(abi::EMFILE as i64)
+    );
+    // The accepted connection object was rolled back: raise the limit
+    // and accept now succeeds (the pending connection is still queued).
+    set_nofile(1, 1024, 1024);
+    assert!(
+        dispatch(
+            METHOD_SYS_SOCKET_ACCEPT,
+            1,
+            &socket_accept_req(3, 0),
+            &mut []
+        ) >= 0
+    );
+}
+
+#[test]
+fn socketpair_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // soft=5 ⇒ fds 3,4 allocatable: one pair fits, the next does not.
+    set_nofile(1, 5, 1024);
+    let mut out = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 2, 0), &mut out),
+        8
+    );
+    assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 4);
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 2, 0), &mut out),
+        -(abi::EMFILE as i64)
+    );
+
+    // Exactly-one-free: left installs, right hits the limit; the left
+    // fd must be rolled back (not leaked) and both socket objects freed.
+    // soft=4 (pid 2) ⇒ only fd 3 is allocatable.
+    set_nofile(2, 4, 1024);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKETPAIR,
+            2,
+            &socketpair_req(1, 2, 0),
+            &mut [0u8; 8]
+        ),
+        -(abi::EMFILE as i64)
+    );
+    // fd 3 was rolled back, so it is free again.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 2, &1_u32.to_le_bytes(), &mut []),
+        3
+    );
+}
+// ---------------------------------------------------------------------------
+// #85 S1: unlinkat / mkdirat — resolve dirfd via the shared resolve_at (S0),
+// delegate to the existing unlink/rmdir/mkdir base ops.
+// ---------------------------------------------------------------------------
+
+fn unlinkat_req(dirfd: u32, flag: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&flag.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+fn mkdirat_req(dirfd: u32, mode: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&mode.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+const AT_REMOVEDIR: u32 = 0x200;
+
+#[test]
+fn mkdirat_unlinkat_via_dirfd_and_at_fdcwd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/s1-base", &mut []), 0);
+    let dfd = open_dir(b"/s1-base");
+
+    // mkdirat(dfd, "sub") creates /s1-base/sub.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_MKDIRAT,
+            1,
+            &mkdirat_req(dfd, 0o755, b"sub"),
+            &mut []
+        ),
+        0,
+    );
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_DIRECTORY, b"/s1-base/sub"),
+            &mut []
+        ) >= 3,
+        "mkdirat must have created /s1-base/sub",
+    );
+
+    // unlinkat(dfd, AT_REMOVEDIR, "sub") == rmdir.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_UNLINKAT,
+            1,
+            &unlinkat_req(dfd, AT_REMOVEDIR, b"sub"),
+            &mut [],
+        ),
+        0,
+    );
+    // Gone: rmdir of the now-missing dir is the base op's well-defined
+    // -ENOENT (avoids open(O_DIRECTORY) missing-path errno nuance).
+    assert_eq!(
+        dispatch(METHOD_SYS_RMDIR, 1, b"/s1-base/sub", &mut []),
+        -(abi::ENOENT as i64),
+    );
+
+    // unlinkat(dfd, 0, "f") == unlink (a regular file).
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_CREAT | O_WRITE, b"/s1-base/f"),
+            &mut []
+        ) >= 3
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_UNLINKAT, 1, &unlinkat_req(dfd, 0, b"f"), &mut []),
+        0,
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/s1-base/f"), &mut []),
+        -(abi::ENOENT as i64),
+    );
+
+    // AT_FDCWD + absolute parity with the base ops.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_MKDIRAT,
+            1,
+            &mkdirat_req(AT_FDCWD, 0, b"/s1-abs"),
+            &mut []
+        ),
+        0,
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_UNLINKAT,
+            1,
+            &unlinkat_req(AT_FDCWD, AT_REMOVEDIR, b"/s1-abs"),
+            &mut []
+        ),
+        0,
+    );
+}
+
+#[test]
+fn unlinkat_mkdirat_dirfd_is_rename_stable() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/s1-r", &mut []), 0);
+    let dfd = open_dir(b"/s1-r");
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/s1-r", b"/s1-moved"),
+            &mut []
+        ),
+        0,
+    );
+    // Inherits resolve_at's inode anchoring (#85 S0): the renamed dir
+    // is still the target through the open dirfd.
+    assert_eq!(
+        dispatch(METHOD_SYS_MKDIRAT, 1, &mkdirat_req(dfd, 0, b"d"), &mut []),
+        0,
+    );
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_DIRECTORY, b"/s1-moved/d"),
+            &mut []
+        ) >= 3,
+        "mkdirat must hit the renamed dir (rename-stable)",
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_UNLINKAT,
+            1,
+            &unlinkat_req(dfd, AT_REMOVEDIR, b"d"),
+            &mut []
+        ),
+        0,
+    );
+}
+
+#[test]
+fn unlinkat_mkdirat_error_paths() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Unknown dirfd → EBADF.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_UNLINKAT,
+            1,
+            &unlinkat_req(4242, 0, b"x"),
+            &mut []
+        ),
+        -(abi::EBADF as i64),
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_MKDIRAT, 1, &mkdirat_req(4242, 0, b"x"), &mut []),
+        -(abi::EBADF as i64),
+    );
+    // Unsupported unlinkat flag bit → EINVAL.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_UNLINKAT,
+            1,
+            &unlinkat_req(AT_FDCWD, 0x1, b"/x"),
+            &mut []
+        ),
+        -(abi::EINVAL as i64),
+    );
+    // Short request → EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_UNLINKAT, 1, &[0u8; 4], &mut []),
+        -(abi::EINVAL as i64),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #85 S2: fstatat / readlinkat — resolve dirfd via shared resolve_at (S0),
+// delegate to stat_path / lstat_path / readlink.
+// ---------------------------------------------------------------------------
+
+fn fstatat_req(dirfd: u32, flag: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&flag.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+fn readlinkat_req(dirfd: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(path);
+    req
+}
+
+const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+
+#[test]
+fn fstatat_follow_nofollow_and_at_fdcwd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/s2", &mut []), 0);
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_CREAT | O_WRITE, b"/s2/f"),
+            &mut []
+        ) >= 3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SYMLINK,
+            1,
+            &symlink_req2(b"/s2/f", b"/s2/lnk"),
+            &mut []
+        ),
+        0,
+    );
+    let dfd = open_dir(b"/s2");
+
+    // fstatat(dfd, 0, "f") → follows → REGULAR_FILE (4).
+    let mut st = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATAT, 1, &fstatat_req(dfd, 0, b"f"), &mut st),
+        16
+    );
+    assert_eq!(u32::from_le_bytes(st[8..12].try_into().unwrap()), 4);
+
+    // fstatat(dfd, 0, "lnk") → follows the symlink → REGULAR_FILE (4).
+    let mut st2 = [0u8; 16];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(dfd, 0, b"lnk"),
+            &mut st2
+        ),
+        16
+    );
+    assert_eq!(u32::from_le_bytes(st2[8..12].try_into().unwrap()), 4);
+
+    // fstatat(dfd, AT_SYMLINK_NOFOLLOW, "lnk") → SYMLINK (7).
+    let mut st3 = [0u8; 16];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(dfd, AT_SYMLINK_NOFOLLOW, b"lnk"),
+            &mut st3,
+        ),
+        16,
+    );
+    assert_eq!(u32::from_le_bytes(st3[8..12].try_into().unwrap()), 7);
+
+    // AT_FDCWD + absolute parity with plain stat.
+    let mut st4 = [0u8; 16];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0, b"/s2/f"),
+            &mut st4
+        ),
+        16,
+    );
+    assert_eq!(u32::from_le_bytes(st4[8..12].try_into().unwrap()), 4);
+
+    // Rename-stable (inherits resolve_at inode anchoring, #85 S0).
+    assert_eq!(
+        dispatch(METHOD_SYS_RENAME, 1, &rename_req2(b"/s2", b"/s2m"), &mut []),
+        0,
+    );
+    let mut st5 = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATAT, 1, &fstatat_req(dfd, 0, b"f"), &mut st5),
+        16
+    );
+    assert_eq!(u32::from_le_bytes(st5[8..12].try_into().unwrap()), 4);
+}
+
+#[test]
+fn readlinkat_via_dirfd_and_errors() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/s2r", &mut []), 0);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SYMLINK,
+            1,
+            &symlink_req2(b"/target/x", b"/s2r/lnk"),
+            &mut []
+        ),
+        0,
+    );
+    let dfd = open_dir(b"/s2r");
+
+    let mut buf = [0u8; 32];
+    let n = dispatch(
+        METHOD_SYS_READLINKAT,
+        1,
+        &readlinkat_req(dfd, b"lnk"),
+        &mut buf,
+    );
+    assert!(n > 0, "readlinkat returned {n}");
+    assert_eq!(&buf[..n as usize], b"/target/x");
+
+    // AT_FDCWD + absolute parity.
+    let mut buf2 = [0u8; 32];
+    let n2 = dispatch(
+        METHOD_SYS_READLINKAT,
+        1,
+        &readlinkat_req(AT_FDCWD, b"/s2r/lnk"),
+        &mut buf2,
+    );
+    assert_eq!(&buf2[..n2 as usize], b"/target/x");
+
+    // Unknown dirfd → EBADF; short request → EINVAL.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_READLINKAT,
+            1,
+            &readlinkat_req(4242, b"lnk"),
+            &mut [0u8; 8]
+        ),
+        -(abi::EBADF as i64),
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATAT, 1, &[0u8; 4], &mut [0u8; 16]),
+        -(abi::EINVAL as i64),
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x4000, b"/s2r"),
+            &mut [0u8; 16]
+        ),
+        -(abi::EINVAL as i64),
+    );
+}
+
+/// #85 S2: every flag bit other than `AT_SYMLINK_NOFOLLOW` (incl.
+/// `AT_EMPTY_PATH = 0x1000`, the dirfd-as-target form documented as a
+/// follow-up in the ABI doc) must surface `-EINVAL` rather than being
+/// silently ignored. Mirrors sys_unlinkat's `AT_REMOVEDIR`-only guard
+/// from #194 — kept in its own test so a future code change relaxing
+/// the guard trips the right named assertion in CI output.
+#[test]
+fn fstatat_unsupported_flag_bits_are_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut buf = [0u8; 16];
+    // AT_EMPTY_PATH (0x1000) — documented Linux dirfd-target flag,
+    // explicitly out of scope for S2.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x1000, b"/"),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64),
+        "AT_EMPTY_PATH must reject until S2-follow-up implements it",
+    );
+    // A bit outside the entire AT_* range — defensive.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x8000_0000, b"/"),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64),
+        "any flag bit outside AT_SYMLINK_NOFOLLOW must reject",
+    );
+    // AT_SYMLINK_NOFOLLOW (0x100) OR-ed with an unknown bit must
+    // STILL reject — no silent masking of unknown bits when the
+    // supported one is set.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x100 | 0x200, b"/"),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64),
+        "AT_SYMLINK_NOFOLLOW | unknown bit must still reject (no silent masking)",
+    );
+}
