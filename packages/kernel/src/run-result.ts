@@ -1,17 +1,2 @@
-import type { ErrorClass } from './security.js';
-
-export interface RunResult {
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-  executionTimeMs: number;
-  truncated?: { stdout: boolean; stderr: boolean };
-  errorClass?: ErrorClass;
-}
-
-export const EMPTY_RESULT: RunResult = {
-  exitCode: 0,
-  stdout: '',
-  stderr: '',
-  executionTimeMs: 0,
-};
+// Re-export shim — implementation moved to packages/runner. Removed in TS-kernel deletion phase.
+export * from "../../runner/src/run-result.ts";

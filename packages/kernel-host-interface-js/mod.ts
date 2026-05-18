@@ -501,6 +501,7 @@ const E2BIG = 7;
 const EIO = 5;
 const ESRCH = 3;
 const ENOSYS = 38;
+const EDEADLK = 35;
 
 function ipv4SocketAddrRecord(host: string, port: number): Uint8Array {
   const out = new Uint8Array(8);
@@ -605,7 +606,6 @@ const USER_YURT_STUB_IMPORTS = [
   "host_socket_send",
   "host_socket_send_unix",
   "host_socket_set_no_delay",
-  "host_spawn",
   "host_symlink",
   "host_tcgetattr",
   "host_tcgetpgrp",
@@ -618,7 +618,6 @@ const USER_YURT_STUB_IMPORTS = [
   "host_thread_spawn",
   "host_tiocsctty",
   "host_umask",
-  "host_wait",
   "host_winsize",
   "host_write_command",
   "host_write_fd",
@@ -1637,6 +1636,8 @@ function buildUserYurtImports(
   userMemoryRef: { memory?: WebAssembly.Memory },
   callerTid = 1,
   drainPendingThread?: (tid: number) => void,
+  drainPendingProcess?: () => void,
+  drainDepthRef?: { value: number },
 ): Record<string, (...args: (number | bigint)[]) => number> {
   const memoryBuffer = () => userMemoryRef.memory!.buffer;
   const boundsOk = (ptr: number, len: number): boolean => {
@@ -1735,6 +1736,187 @@ function buildUserYurtImports(
     ).rc;
   imports.host_thread_yield = () =>
     threadSyscall(METHOD.SYS_THREAD_YIELD, new Uint8Array(0), 0).rc;
+  // ── host_spawn(reqPtr, reqLen, outPtr, outCap) → i32 ─────────────────────
+  // Parses a yurt_spawn_request_v1 from guest memory, builds the SYS_SPAWN
+  // kernel wire format, and writes a yurt_spawn_result_v1 (4-byte i32 pid).
+  imports.host_spawn = (reqPtr, reqLen, outPtr, outCap): number => {
+    const reqPtrN = Number(reqPtr) >>> 0;
+    const reqLenN = Number(reqLen) >>> 0;
+    const outPtrN = Number(outPtr) >>> 0;
+    const outCapN = Number(outCap) >>> 0;
+
+    // Copy the request bytes from guest memory.
+    const bytes = copyIn(reqPtrN, reqLenN);
+    if (typeof bytes === "number") return bytes; // -EFAULT
+
+    // Validate the fixed header (88 bytes minimum).
+    const SPAWN_V1_SIZE = 88;
+    if (bytes.length < SPAWN_V1_SIZE) return -22; // EINVAL
+    const hdr = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const logicalSize = hdr.getUint32(0, true);
+    const version = hdr.getUint16(4, true);
+    if (version !== 1 || logicalSize < SPAWN_V1_SIZE) return -22; // EINVAL
+    if (logicalSize > bytes.length) return -75; // EOVERFLOW
+
+    // Helper: read a span {u32 off, u32 len} relative to record start.
+    // Returns null for an absent (0,0) span, -22 for a misaligned offset
+    // (byte-parity with native_abi.rs read_span which returns Err(Invalid)
+    // when span_off is not a multiple of 4), or the span on success.
+    const readSpan = (
+      off: number,
+    ): { off: number; len: number } | null | -22 => {
+      const spanOff = hdr.getUint32(off, true);
+      const spanLen = hdr.getUint32(off + 4, true);
+      if (spanOff === 0 && spanLen === 0) return null;
+      if (spanOff % 4 !== 0) return -22; // I1: align parity with native_abi.rs
+      return { off: spanOff, len: spanLen };
+    };
+    const readString = (
+      spanOff: number,
+    ): string | null | -22 => {
+      const span = readSpan(spanOff);
+      if (span === null) return null;
+      if (span === -22) return -22; // propagate alignment error
+      if (span.off + span.len > logicalSize) return null;
+      return new TextDecoder().decode(
+        bytes.subarray(span.off, span.off + span.len),
+      );
+    };
+
+    // prog (required, offset 8)
+    const prog = readString(8);
+    if (prog === -22) return -22; // misaligned span
+    if (prog === null || prog.length === 0) return -EINVAL;
+
+    // argv0 (optional, offset 16) — used as argv[0] if present
+    const argv0Raw = readString(16);
+    if (argv0Raw === -22) return -EINVAL; // misaligned optional span
+    const argv0: string | null = argv0Raw;
+
+    // args_off (u32@24), args_count (u32@28) — args[1..] span-vector
+    const argsVecOff = hdr.getUint32(24, true);
+    const argsCount = hdr.getUint32(28, true);
+    // I2: byte-parity with native_abi.rs read_string_vec: null vec with
+    // non-zero count is Invalid (-22).
+    if (argsCount > 0 && argsVecOff === 0) return -EINVAL;
+    // I1: the args vector offset must also be 4-byte aligned.
+    if (argsCount > 0 && argsVecOff % 4 !== 0) return -EINVAL;
+    const args: string[] = [];
+    if (argsCount > 0) {
+      const SPAN_SIZE = 8;
+      const argsEnd = argsVecOff + argsCount * SPAN_SIZE;
+      if (argsEnd > logicalSize) return -75; // EOVERFLOW
+      for (let i = 0; i < argsCount; i++) {
+        const spanBase = argsVecOff + i * SPAN_SIZE;
+        const aOff = hdr.getUint32(spanBase, true);
+        const aLen = hdr.getUint32(spanBase + 4, true);
+        if (aOff % 4 !== 0) return -EINVAL; // I1: per-span alignment
+        if (aOff + aLen > logicalSize) return -75; // EOVERFLOW
+        args.push(
+          new TextDecoder().decode(bytes.subarray(aOff, aOff + aLen)),
+        );
+      }
+    }
+
+    // Build SYS_SPAWN kernel wire: u32 path_len + path + (u32 arg_len + arg)*
+    // argv entries = [argv0 ?? prog, ...args]
+    const enc = new TextEncoder();
+    const pathBytes = enc.encode(prog);
+    const argv0Str = argv0 !== null ? argv0 : prog;
+    const argvEntries: Uint8Array[] = [enc.encode(argv0Str)];
+    for (const a of args) argvEntries.push(enc.encode(a));
+
+    let wireLen = 4 + pathBytes.length;
+    for (const a of argvEntries) wireLen += 4 + a.length;
+    const wire = new Uint8Array(wireLen);
+    const wireView = new DataView(wire.buffer);
+    let cur = 0;
+    wireView.setUint32(cur, pathBytes.length, true);
+    cur += 4;
+    wire.set(pathBytes, cur);
+    cur += pathBytes.length;
+    for (const a of argvEntries) {
+      wireView.setUint32(cur, a.length, true);
+      cur += 4;
+      wire.set(a, cur);
+      cur += a.length;
+    }
+
+    // Call SYS_SPAWN; rc is the child pid on success (>0), or negative errno.
+    const spawnRc = Number(kernel.syscall(METHOD.SYS_SPAWN, pid, wire, 0).rc);
+    if (spawnRc < 0) return spawnRc;
+
+    // Write yurt_spawn_result_v1: 4-byte LE i32 pid
+    // -7: deliberate byte-parity with deno wasm-kernel-imports.ts:803 (output cap too small)
+    if (outCapN < 4) return -E2BIG; // -7
+    const resultBytes = new Uint8Array(4);
+    new DataView(resultBytes.buffer).setInt32(0, spawnRc, true);
+    const copyRc = copyOut(outPtrN, resultBytes);
+    if (copyRc < 0) return copyRc;
+    return 4;
+  };
+  // ── host_wait(pid, flags, outPtr, outCap) → i32 ──────────────────────────
+  // Calls SYS_WAIT in a retry loop (drainPendingProcess between retries).
+  // Decodes the 8-byte kernel response and writes a 16-byte yurt_wait_result_v1.
+  imports.host_wait = (waitPid, flags, outPtr, outCap): number => {
+    const waitPidN = Number(waitPid) | 0;
+    const flagsN = Number(flags) >>> 0;
+    const outPtrN = Number(outPtr) >>> 0;
+    const outCapN = Number(outCap) >>> 0;
+    const WNOHANG = 1;
+
+    const req = new Uint8Array(8);
+    const reqView = new DataView(req.buffer);
+    reqView.setUint32(0, waitPidN >>> 0, true);
+    reqView.setUint32(4, flagsN, true);
+
+    let out = kernel.syscall(METHOD.SYS_WAIT, pid, req, 8);
+    let rc = Number(out.rc);
+    while (rc === -EAGAIN && !(flagsN & WNOHANG) && drainPendingProcess) {
+      const depth = drainDepthRef ?? { value: 0 };
+      if (depth.value >= 256) {
+        // Return -EDEADLK instead of throwing: a throw from a wasm import
+        // becomes a trap that crashes the guest with no errno.  Returning a
+        // clean errno lets the guest handle the re-entrancy limit gracefully.
+        return -EDEADLK;
+      }
+      depth.value++;
+      try {
+        drainPendingProcess();
+      } finally {
+        depth.value--;
+      }
+      out = kernel.syscall(METHOD.SYS_WAIT, pid, req, 8);
+      rc = Number(out.rc);
+    }
+
+    if (rc < 0) return rc;
+    if (rc !== 8) return -E2BIG; // -7
+    if (outCapN < 16) return -E2BIG; // -7
+
+    // Decode 8-byte kernel response: u32 exitedPid@0, i32 status@4
+    const kView = new DataView(
+      out.response.buffer,
+      out.response.byteOffset,
+      8,
+    );
+    const exitedPid = kView.getUint32(0, true);
+    const status = kView.getInt32(4, true);
+    const signal = status >= 128 && status < 192 ? status - 128 : 0;
+    const exitCode = signal === 0 ? status : 0;
+
+    // Write yurt_wait_result_v1: {i32 exitedPid, i32 exitCode, i32 signal, i32 0}
+    const resultBytes = new Uint8Array(16);
+    const result = new DataView(resultBytes.buffer);
+    result.setInt32(0, exitedPid, true);
+    result.setInt32(4, exitCode, true);
+    result.setInt32(8, signal, true);
+    result.setInt32(12, 0, true);
+
+    const copyRc = copyOut(outPtrN, resultBytes);
+    if (copyRc < 0) return copyRc;
+    return 16;
+  };
   const scalar = (method: number) => () =>
     Number(kernel.syscall(method, pid, new Uint8Array(0), 0).rc);
   imports.host_getuid = scalar(METHOD.SYS_GETUID);
@@ -1858,6 +2040,34 @@ class CachedProcessEngine {
   private readonly threadExecutions = new Map<number, CachedThreadExecution>();
   private nextHandle = 1;
   private nextThreadHandle = 1;
+  /**
+   * Re-entrancy depth counter for drainPendingProcess calls, shared across
+   * the entire nested parent→child host_wait drive chain.  Lives here so
+   * that every buildUserYurtImports closure (parent process, child process,
+   * thread) all read/write the same counter: depth 1 in the parent means
+   * the child's host_wait sees depth 2 on its own drain call, and so on.
+   *
+   * A per-closure counter would always read 0 inside each child instance
+   * and the 256-limit would never fire across nesting boundaries.
+   */
+  private drainDepth = 0;
+  /** Shared depth ref object threaded into every buildUserYurtImports call.
+   * Reads/writes the engine-instance drainDepth so the counter is shared
+   * across nested parent→child host_wait closures (I3). */
+  private get drainDepthRef(): { value: number } {
+    const get = () => this.drainDepth;
+    const set = (v: number) => {
+      this.drainDepth = v;
+    };
+    return {
+      get value() {
+        return get();
+      },
+      set value(v: number) {
+        set(v);
+      },
+    };
+  }
 
   constructor(private readonly kernelRef: { kernel?: KernelInstance }) {}
 
@@ -1921,6 +2131,8 @@ class CachedProcessEngine {
         userMemoryRef,
         1,
         (tid) => this.runPendingThread(context.pid, tid),
+        () => this.runPendingSpawns(kernel),
+        this.drainDepthRef,
       );
       instance = new WebAssembly.Instance(module, {
         env: { ...sysImports, sys_setrlimit },
@@ -2049,6 +2261,8 @@ class CachedProcessEngine {
           proc.userMemoryRef,
           tid,
           (targetTid) => this.runPendingThread(pid, targetTid),
+          () => this.runPendingSpawns(kernel),
+          this.drainDepthRef,
         ),
       });
     } catch {
@@ -2128,6 +2342,140 @@ class CachedProcessEngine {
     const argv = decodeArgv(argvBytes);
     if (typeof argv === "number") return argv;
     return { pid, argv };
+  }
+
+  // ── Multi-process spawn pump ──────────────────────────────────────────────
+
+  /**
+   * Drain one pending spawn from the kernel queue.  Mirrors the
+   * `KernelHostInterface.drainPendingSpawn()` helper exactly but operates
+   * directly on the raw `KernelInstance` so the engine can call it without
+   * going through the public host-interface wrapper.
+   */
+  private drainOnePendingSpawn(kernel: KernelInstance): PendingSpawn | null {
+    const cap = kernel.scratchLen;
+    const { rc, response } = kernel.drainPendingSpawnRaw();
+    const n = Number(rc);
+    if (n === -ENOENT) return null;
+    if (n < 0) throw new Error(`kernel_drain_spawn failed: rc=${rc}`);
+    if (n > cap) {
+      throw new Error(`kernel_drain_spawn exceeded scratch capacity: ${n}`);
+    }
+    return decodePendingSpawn(response.subarray(0, n));
+  }
+
+  /**
+   * Instantiate and run a child process bound to the kernel-allocated
+   * `childPid` from a drained {@link PendingSpawn}.
+   *
+   * Mirrors the per-child semantics of the Rust `run_pending_spawns`:
+   * - Module is compiled and cached by its wasm byte-content key.
+   * - The instance is bound to `childPid` (NOT a fresh host-allocated pid).
+   * - A clean `_start` return (no proc_exit) → exit code 0.
+   * - `proc_exit(n)` trap → exit code `n`.
+   * - Any other trap → rethrow (genuine crash).
+   */
+  runCachedChild(
+    kernel: KernelInstance,
+    childPid: number,
+    wasmBytes: Uint8Array,
+    argv: Uint8Array[],
+  ): number {
+    // Cache the wasm module by its byte-content identity (same as spawn()).
+    const key = byteKey(wasmBytes);
+    if (!this.modules.has(key)) {
+      this.modules.set(
+        key,
+        new WebAssembly.Module(wasmBytes as unknown as BufferSource),
+      );
+    }
+    const module = this.modules.get(key)!;
+
+    const userMemoryRef: { memory?: WebAssembly.Memory } = {};
+    const sysImports = buildSysImports(childPid, kernel, userMemoryRef);
+    const sys_setrlimit = (
+      resource: number,
+      soft: bigint,
+      hard: bigint,
+    ): number => {
+      const req = new Uint8Array(20);
+      const v = new DataView(req.buffer);
+      v.setUint32(0, resource >>> 0, true);
+      v.setBigUint64(4, soft, true);
+      v.setBigUint64(12, hard, true);
+      return Number(
+        kernel.syscall(METHOD.SYS_SETRLIMIT, childPid, req, 0).rc,
+      );
+    };
+
+    const instance = new WebAssembly.Instance(module, {
+      env: { ...sysImports, sys_setrlimit },
+      wasi_snapshot_preview1: buildWasiShim(
+        childPid,
+        kernel,
+        argv,
+        userMemoryRef,
+      ),
+      yurt: buildUserYurtImports(
+        childPid,
+        kernel,
+        userMemoryRef,
+        1,
+        (tid) => this.runPendingThread(childPid, tid),
+        () => this.runPendingSpawns(kernel),
+        this.drainDepthRef,
+      ),
+    });
+
+    const memory = instance.exports.memory instanceof WebAssembly.Memory
+      ? instance.exports.memory
+      : undefined;
+    userMemoryRef.memory = memory ?? new WebAssembly.Memory({ initial: 0 });
+
+    // Run _start; missing _start is treated as clean exit 0.
+    const start = instance.exports._start;
+    if (typeof start !== "function") return 0;
+
+    const PROC_EXIT_RE = /proc_exit\((-?\d+)\)/;
+    try {
+      (start as () => void)();
+      return 0; // clean return → exit code 0
+    } catch (e) {
+      const msg = (e as Error).message ?? String(e);
+      const m = PROC_EXIT_RE.exec(msg);
+      if (m) return Number(m[1]) | 0;
+      throw e; // genuine trap — propagate
+    }
+  }
+
+  /**
+   * Flat iterative drain loop.  Mirrors the Rust `run_pending_spawns`:
+   * while the kernel queue is non-empty, instantiate each child bound to
+   * its kernel-allocated pid, run it to completion, and record its exit.
+   *
+   * `-ESRCH` from `kernel.recordExit` is tolerated (the child's slot may
+   * have already been reaped by a concurrent waiter) — the loop continues.
+   * Any other non-zero rc from `recordExit` is a hard error.
+   *
+   * A runaway guard caps the loop at 100 000 iterations.
+   */
+  runPendingSpawns(kernel: KernelInstance): void {
+    const RUNAWAY_LIMIT = 100_000;
+    let iterations = 0;
+    while (true) {
+      if (++iterations > RUNAWAY_LIMIT) {
+        throw new Error("runPendingSpawns: runaway drain");
+      }
+      const p = this.drainOnePendingSpawn(kernel);
+      if (p === null) break;
+      const code = this.runCachedChild(kernel, p.childPid, p.wasmBytes, p.argv);
+      const rc = Number(kernel.recordExit(p.childPid, code));
+      if (rc !== 0 && rc !== -ESRCH) {
+        throw new Error(
+          `kernel_record_exit failed for pid ${p.childPid}: rc=${rc}`,
+        );
+      }
+    }
   }
 }
 
@@ -3585,6 +3933,18 @@ export class KernelHostInterface {
       throw new Error(`kernel_drain_spawn exceeded scratch capacity: ${n}`);
     }
     return decodePendingSpawn(response.subarray(0, n));
+  }
+
+  /**
+   * Drain and execute all pending child-process spawns queued by the kernel.
+   *
+   * Delegates to {@link CachedProcessEngine.runPendingSpawns} which mirrors
+   * the Rust `run_pending_spawns` per-child semantics: each child is
+   * instantiated bound to the kernel-allocated pid, run to completion, and
+   * its exit code recorded back into the kernel.
+   */
+  runPendingSpawns(): void {
+    this.processEngine.runPendingSpawns(this.kernel);
   }
 
   killProcess(pid: number, signal: number): number {
