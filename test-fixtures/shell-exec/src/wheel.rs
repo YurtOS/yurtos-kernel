@@ -117,7 +117,6 @@ mod tests {
 
     #[test]
     fn empty_zip_returns_empty() {
-        use std::io::Write;
         let buf = Vec::new();
         let cursor = Cursor::new(buf);
         let zip = zip::ZipWriter::new(cursor);

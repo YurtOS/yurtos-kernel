@@ -9,21 +9,29 @@ fn can_modify_owned_metadata(credentials: crate::state::Credentials, owner_uid: 
 }
 
 /// Derive the `(mount_id, dir_inode)` anchor for an already-normalized
-/// absolute directory `path`. Inode-anchored when the owning backend
-/// supports dir inodes (`MountTable::dir_inode_at` is `Some`), else the
-/// path-snapshot degraded mode: `(ROOT_MOUNT, None)`.
+/// absolute directory `path`. Inode-anchored (`Some` inode) when the
+/// owning backend supports dir inodes (`MountTable::dir_inode_at`),
+/// else the path-snapshot degraded mode (`None` inode).
 ///
-/// B2.9 Task 5 is a behavior-preserving shape migration — nothing reads
-/// `mount_id`/`dir_inode` to change resolution yet (that is Task 6);
-/// resolution still goes through the absolute `path` snapshot, so the
-/// degraded `(ROOT_MOUNT, None)` fallback is correct here. The
-/// `MountTable` has no public mount-id-only accessor (`resolve` is
-/// private), and adding one is out of Task 5's scope; `dir_inode_at`
-/// (the Task 1 pass-through) is the minimal sufficient lookup.
+/// Even in degraded mode the *real* owning mount id is recorded
+/// (`MountTable::mount_of`), not `ROOT_MOUNT`: a degraded backend
+/// mounted at a non-root prefix (hostfs at `/host`, overlay-deferred,
+/// embedder backends) must not masquerade as the root mount. The
+/// "only read when `dir_inode == Some`" convention made the old
+/// `ROOT_MOUNT` fallback latent, but any future reader of
+/// `Cwd.mount_id` / `FdEntry::Directory.mount_id` that does not first
+/// check `dir_inode.is_some()` would silently use the wrong mount on
+/// degraded non-root mounts. Issue #149.
 fn dir_anchor(k: &Kernel, path: &[u8]) -> (crate::vfs::MountId, Option<u64>) {
     match k.vfs.dir_inode_at(path) {
         Some((mid, ino)) => (mid, Some(ino)),
-        None => (crate::vfs::ROOT_MOUNT, None),
+        None => (
+            k.vfs
+                .mount_of(path)
+                .map(|(mid, _)| mid)
+                .unwrap_or(crate::vfs::ROOT_MOUNT),
+            None,
+        ),
     }
 }
 
@@ -1004,6 +1012,16 @@ fn write_stat_record(k: &mut Kernel, path: &[u8], response: &mut [u8]) -> i64 {
     16
 }
 
+/// POSIX: a trailing `/` (or trailing `/.`) on a pathname forces the
+/// final component to be **followed as a symlink** and to resolve to a
+/// **directory** (`-ENOTDIR` otherwise), regardless of `stat`-vs-`lstat`.
+/// Detected on the raw request bytes because `normalize_readable_path`
+/// → `split_components` discards the trailing slash. Single source of
+/// truth for `stat_path` / `lstat_path` so the two cannot drift. (#146)
+fn path_requires_dir(raw: &[u8]) -> bool {
+    raw.ends_with(b"/") || raw.ends_with(b"/.")
+}
+
 /// `stat(path) -> 16-byte fstat-shaped record`. Same wire format as
 /// sys_fstat: u64 size + u32 filetype + u32 mode. Doesn't require an
 /// open fd. Returns 16 on success, -ENOENT for unresolvable path.
@@ -1014,6 +1032,7 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
     if response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
+    let requires_dir = path_requires_dir(request);
     with_kernel(|k| {
         let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
@@ -1028,6 +1047,19 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
             Ok(path) => path,
             Err(rc) => return rc,
         };
+        // #146: a trailing `/` (or `/.`) demands the resolved entry be
+        // a directory. Symlink-follow is already on for stat; the only
+        // extra obligation is the typing check. Distinguish:
+        //   missing (`entry_type == 0`) → -ENOENT (same as no-trailing-
+        //     slash stat),
+        //   present but not a dir → -ENOTDIR.
+        if requires_dir {
+            match k.vfs.entry_type(&path) {
+                0 => return -(abi::ENOENT as i64),
+                3 => {}
+                _ => return -(abi::ENOTDIR as i64),
+            }
+        }
         write_stat_record(k, &path, response)
     })
 }
@@ -1048,6 +1080,7 @@ pub(super) fn lstat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -
     if response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
+    let requires_dir = path_requires_dir(request);
     with_kernel(|k| {
         let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
@@ -1056,10 +1089,25 @@ pub(super) fn lstat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -
         // Resolve intermediate symlink components, but NOT the terminal
         // (POSIX lstat). write_stat_record then types the un-followed
         // terminal (S_IFLNK + #134 Part 1 size for a symlink).
-        let path = match resolve_symlinks_per_component(k, caller_pid, path, false) {
+        //
+        // #146: a trailing `/` (or `/.`) on the raw request overrides
+        // the lstat no-follow rule for the terminal component — POSIX
+        // says trailing-slash forces symlink-follow + dir-check
+        // regardless of stat/lstat. The dir check is enforced
+        // post-resolve below.
+        let follow_terminal = requires_dir;
+        let path = match resolve_symlinks_per_component(k, caller_pid, path, follow_terminal) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
+        // #146: same typing rule as stat_path's trailing-slash branch.
+        if requires_dir {
+            match k.vfs.entry_type(&path) {
+                0 => return -(abi::ENOENT as i64),
+                3 => {}
+                _ => return -(abi::ENOTDIR as i64),
+            }
+        }
         write_stat_record(k, &path, response)
     })
 }

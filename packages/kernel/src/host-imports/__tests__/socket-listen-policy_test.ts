@@ -203,3 +203,89 @@ describe("socket listener policy preparation", () => {
     }]);
   });
 });
+
+describe("socket listen — cross-process audit (#125)", () => {
+  // Recommendation #1 from the #125 audit doc: two processes issuing
+  // concurrent async socketListen on port 0 must receive distinct
+  // ephemeral ports and consistent, non-cross-wired route entries.
+  // Locks in the audit's "atomic continuation" property against
+  // future backend changes — if a backend ever mutates its global
+  // route/port registry before its await and finalizes after, this
+  // test will regress.
+  it("two concurrent async listens on port 0 get distinct ephemeral ports", async () => {
+    const memoryA = new WebAssembly.Memory({ initial: 1 });
+    const memoryB = new WebAssembly.Memory({ initial: 1 });
+    const kernel = new ProcessKernel();
+    let nextPort = 30000;
+    let nextListener = 1;
+    const installed: Array<{ port: number; listener: number }> = [];
+    const backend: SocketBackend = {
+      connect: () => ({ ok: false, error: "not used" }),
+      send: () => ({ ok: true, bytes_sent: 0 }),
+      recv: () => ({ ok: true, data: new Uint8Array(0) }),
+      close: () => ({ ok: true }),
+      // Async listen: stage the global mutation inside the resolved
+      // continuation (the contract documented on SocketBackend.listen
+      // per the same #125 audit).
+      listen() {
+        return Promise.resolve().then(() => {
+          const port = nextPort++;
+          const listener = nextListener++;
+          installed.push({ port, listener });
+          return { ok: true, listener, host: "127.0.0.1", port };
+        });
+      },
+    };
+    const listenPolicy: SocketListenPolicy = { allowLoopback: true };
+    const optsA = {
+      memory: memoryA,
+      callerPid: 100,
+      kernel,
+      socketBackend: backend,
+      serverSockets: listenPolicy,
+    } satisfies KernelImportsOptions;
+    const optsB = {
+      memory: memoryB,
+      callerPid: 200,
+      kernel,
+      socketBackend: backend,
+      serverSockets: listenPolicy,
+    } satisfies KernelImportsOptions;
+    const importsA = createKernelImports(optsA);
+    const importsB = createKernelImports(optsB);
+
+    const fdA = (importsA.host_socket_open as (...a: number[]) => number)(
+      2,
+      1,
+      0,
+    );
+    const fdB = (importsB.host_socket_open as (...a: number[]) => number)(
+      2,
+      1,
+      0,
+    );
+    writeSockaddrIn(memoryA, 16, [127, 0, 0, 1], 0);
+    writeSockaddrIn(memoryB, 16, [127, 0, 0, 1], 0);
+    (importsA.host_socket_bind as (...a: number[]) => number)(fdA, 16, 16);
+    (importsB.host_socket_bind as (...a: number[]) => number)(fdB, 16, 16);
+
+    const rA = (importsA.host_socket_listen as (...a: number[]) => unknown)(
+      fdA,
+      8,
+    );
+    const rB = (importsB.host_socket_listen as (...a: number[]) => unknown)(
+      fdB,
+      8,
+    );
+
+    // Backend returns a Promise; await both rcs and assert 0.
+    expect(await rA).toBe(0);
+    expect(await rB).toBe(0);
+
+    expect(installed).toHaveLength(2);
+    // Distinct ephemeral ports.
+    expect(installed[0].port).not.toBe(installed[1].port);
+    // Distinct listener handles — no cross-wiring.
+    expect(installed[0].listener).not.toBe(installed[1].listener);
+  });
+});
