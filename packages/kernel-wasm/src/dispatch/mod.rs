@@ -194,7 +194,7 @@ pub fn dispatch_with_context(
         // is Task 4 (still ENOSYS here until then).
         METHOD_SYS_SELECT => sys_select(caller_pid, request, response),
         METHOD_SYS_PSELECT => sys_pselect(caller_pid, request, response),
-        METHOD_SYS_PPOLL => -(abi::ENOSYS as i64),
+        METHOD_SYS_PPOLL => sys_ppoll(caller_pid, request, response),
         METHOD_SYS_ISATTY => isatty(caller_pid, request),
         METHOD_SYS_TCGETPGRP => tcgetpgrp(caller_pid, request),
         METHOD_SYS_TCSETPGRP => tcsetpgrp(caller_pid, request),
@@ -1208,6 +1208,54 @@ fn sys_pselect(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
         let _sigmask = u64::from_le_bytes(request[20..28].try_into().expect("sigmask"));
     }
     select_core(caller_pid, request, response, 28)
+}
+
+// ── #91 sys_ppoll (Task 4) ────────────────────────────────────────────
+//
+// ppoll = poll + timespec + sigmask, with the SAME result shaping as
+// poll_fds (POLLNVAL counts as ready, positive ready count).
+
+fn sys_ppoll(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 24 || !(request.len() - 24).is_multiple_of(POLLFD_SIZE) {
+        return -(abi::EINVAL as i64);
+    }
+    if request[12] == 0 {
+        let tv_sec = i64::from_le_bytes(request[0..8].try_into().expect("tv_sec"));
+        let tv_nsec = i32::from_le_bytes(request[8..12].try_into().expect("tv_nsec"));
+        if !timeout_in_range(tv_sec, tv_nsec, 1_000_000_000) {
+            return -(abi::EINVAL as i64);
+        }
+    }
+    // sigmask @16 carried, NOT applied (see sys_pselect).
+    if request[13] == 0 {
+        let _sigmask = u64::from_le_bytes(request[16..24].try_into().expect("sigmask"));
+    }
+    let records = &request[24..];
+    if response.len() < records.len() {
+        return -(abi::EINVAL as i64);
+    }
+    response[..records.len()].copy_from_slice(records);
+
+    let mut work: Vec<WorkFd> = records
+        .chunks_exact(POLLFD_SIZE)
+        .map(|r| WorkFd {
+            fd: i32::from_le_bytes(r[0..4].try_into().expect("ppoll fd")),
+            events: i16::from_le_bytes(r[4..6].try_into().expect("ppoll events")),
+            revents: 0,
+        })
+        .collect();
+
+    with_kernel(|k| poll_core(k, caller_pid, &mut work));
+
+    let mut ready = 0;
+    for (index, w) in work.iter().enumerate() {
+        let out = index * POLLFD_SIZE + 6;
+        response[out..out + 2].copy_from_slice(&w.revents.to_le_bytes());
+        if w.revents != 0 {
+            ready += 1;
+        }
+    }
+    ready
 }
 
 fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) -> i16 {

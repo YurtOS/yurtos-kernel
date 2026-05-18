@@ -14375,3 +14375,106 @@ fn pselect_out_of_range_tv_nsec_is_einval() {
         -(abi::EINVAL as i64)
     );
 }
+
+// ── #91 Task 4: sys_ppoll ────────────────────────────────────────────
+
+const POLLFD_REC_SIZE: usize = 8;
+
+/// 24 B ppoll header (timeout_null=1) + pollfd tail.
+fn ppoll_req(fds: &[(i32, i16)], sigmask: Option<u64>) -> Vec<u8> {
+    let mut req = vec![0u8; 24];
+    req[12] = 1; // timeout_null
+    match sigmask {
+        Some(m) => {
+            req[13] = 0;
+            req[16..24].copy_from_slice(&m.to_le_bytes());
+        }
+        None => req[13] = 1,
+    }
+    for (fd, ev) in fds {
+        req.extend_from_slice(&fd.to_le_bytes());
+        req.extend_from_slice(&ev.to_le_bytes());
+        req.extend_from_slice(&0i16.to_le_bytes());
+    }
+    req
+}
+
+fn ppoll_revents_at(resp: &[u8], i: usize) -> i16 {
+    i16::from_le_bytes(
+        resp[i * POLLFD_REC_SIZE + 6..i * POLLFD_REC_SIZE + 8]
+            .try_into()
+            .unwrap(),
+    )
+}
+
+#[test]
+fn ppoll_matches_poll_shaping_including_pollnval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = sel_open_file(b"/ppoll.txt");
+    let req = ppoll_req(&[(fd, POLLIN | POLLOUT), (900, POLLIN), (-1, POLLIN)], None);
+    let mut resp = vec![0u8; 24];
+    // file ready (1) + fd 900 POLLNVAL counts as ready (1) + neg fd 0.
+    assert_eq!(dispatch(METHOD_SYS_PPOLL, 1, &req, &mut resp), 2);
+    assert_eq!(ppoll_revents_at(&resp, 0), POLLIN | POLLOUT);
+    assert_eq!(ppoll_revents_at(&resp, 1), POLLNVAL);
+    assert_eq!(ppoll_revents_at(&resp, 2), 0);
+}
+
+#[test]
+fn ppoll_sigmask_present_is_carried_not_applied() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = sel_open_file(b"/ppoll_sig.txt");
+    let req = ppoll_req(&[(fd, POLLIN)], Some(1u64 << 16));
+    let mut resp = vec![0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PPOLL, 1, &req, &mut resp), 1);
+    assert_eq!(ppoll_revents_at(&resp, 0), POLLIN);
+}
+
+#[test]
+fn ppoll_malformed_tail_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut resp = vec![0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_PPOLL, 1, &[0u8; 23], &mut resp),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PPOLL, 1, &[0u8; 31], &mut resp),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn ppoll_out_of_range_tv_nsec_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = sel_open_file(b"/ppoll_to.txt");
+    let mut req = ppoll_req(&[(fd, POLLIN)], None);
+    req[12] = 0; // timeout present
+    req[8..12].copy_from_slice(&1_000_000_000_i32.to_le_bytes());
+    let mut resp = vec![0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_PPOLL, 1, &req, &mut resp),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn ppoll_null_timeout_with_garbage_duration_bytes_is_not_einval_m3() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = sel_open_file(b"/ppoll_m3.txt");
+    let mut req = ppoll_req(&[(fd, POLLIN)], None);
+    req[12] = 1; // timeout_null
+    req[0..8].copy_from_slice(&(-1_i64).to_le_bytes());
+    req[8..12].copy_from_slice(&i32::MAX.to_le_bytes());
+    let mut resp = vec![0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PPOLL, 1, &req, &mut resp), 1);
+    assert_eq!(ppoll_revents_at(&resp, 0), POLLIN);
+}
+
+#[test]
+fn ppoll_zero_pollfds_returns_zero() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let req = ppoll_req(&[], None);
+    let mut resp = vec![0u8; 0];
+    assert_eq!(dispatch(METHOD_SYS_PPOLL, 1, &req, &mut resp), 0);
+}
