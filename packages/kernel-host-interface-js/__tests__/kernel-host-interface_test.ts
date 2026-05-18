@@ -695,7 +695,19 @@ Deno.test("thread lifecycle controls mutate the kernel-owned thread snapshot", a
   );
 
   mk.recordThreadExit(childPid, tid, 123);
-  assertEquals(mk.listThreads(childPid).find((t) => t.tid === tid), undefined);
+  // #130: a detached+exited thread stays in listThreads as a tombstone
+  // (state="exited"), not reaped. The kernel keeps it so that any
+  // subsequent pthread_join / pthread_detach on the same tid returns
+  // EINVAL with a known origin instead of an undefined ESRCH —
+  // intentional and pinned by the Rust-side test
+  // `detached_exited_threads_remain_tombstoned_for_posix_errors`.
+  assertEquals(mk.listThreads(childPid).find((t) => t.tid === tid), {
+    tid,
+    state: "exited",
+    detached: true,
+    exitValue: 123,
+    hostThreadHandle: 91,
+  });
 });
 
 Deno.test("thread host callbacks execute Rust-owned spawn and release", async () => {
