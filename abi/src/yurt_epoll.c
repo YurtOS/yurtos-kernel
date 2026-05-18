@@ -21,6 +21,16 @@ _Static_assert(
     sizeof(struct epoll_event) == 12,
     "epoll_event ABI wire size: 12 B packed (u32 events + u64 data)");
 
+/* Request byte-buffer marshalling lives in safe Rust
+ * (abi/rust/yurt-libc/src/epoll.rs); this C file is a thin ABI shim that
+ * only forwards (AGENTS.md: buffer/parse/format logic in Rust, C files
+ * are thin shims). */
+extern int yurt_rs_epoll_pack_ctl(unsigned char *out, unsigned int epfd,
+                                  unsigned int op, unsigned int fd,
+                                  const unsigned char *event);
+extern int yurt_rs_epoll_pack_wait(unsigned char *out, unsigned int epfd,
+                                   unsigned int maxevents, int timeout);
+
 /* Linux-kernel errno -> wasi-libc errno translation. See the matching
  * helper + commentary in abi/src/yurt_select.c. */
 static int yurt_epoll_errno_from_kernel(int kernel_errno) {
@@ -62,13 +72,8 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event) {
    * `event` may be NULL for EPOLL_CTL_DEL (Linux allows it since 2.6.9
    * but the wire still needs a 12-byte slot — zero-filled). */
   unsigned char req[24];
-  memset(req, 0, sizeof(req));
-  *(uint32_t *)(req + 0) = (uint32_t)epfd;
-  *(uint32_t *)(req + 4) = (uint32_t)op;
-  *(uint32_t *)(req + 8) = (uint32_t)fd;
-  if (event != NULL) {
-    memcpy(req + 12, event, 12);
-  }
+  yurt_rs_epoll_pack_ctl(req, (unsigned int)epfd, (unsigned int)op,
+                         (unsigned int)fd, (const unsigned char *)event);
   long long rc = yurt_host_epoll_ctl(
       (int)(intptr_t)req, (int)sizeof(req), 0, 0);
   if (rc < 0) {
@@ -96,9 +101,8 @@ int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
   }
   size_t resp_len = (size_t)maxevents * 12u;
   unsigned char req[12];
-  *(uint32_t *)(req + 0) = (uint32_t)epfd;
-  *(uint32_t *)(req + 4) = (uint32_t)maxevents;
-  *(int32_t *)(req + 8) = (int32_t)timeout;
+  yurt_rs_epoll_pack_wait(req, (unsigned int)epfd, (unsigned int)maxevents,
+                          timeout);
   long long rc = yurt_host_epoll_wait(
       (int)(intptr_t)req, (int)sizeof(req),
       (int)(intptr_t)events, (int)resp_len);

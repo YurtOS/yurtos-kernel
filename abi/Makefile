@@ -75,6 +75,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_signal.o \
   $(BUILD_DIR)/yurt_socket.o \
   $(BUILD_DIR)/yurt_socket_rs.o \
+  $(BUILD_DIR)/yurt_epoll_rs.o \
   $(BUILD_DIR)/yurt_sort_rs.o \
   $(BUILD_DIR)/yurt_spawn.o \
   $(BUILD_DIR)/yurt_sysinfo.o \
@@ -147,6 +148,15 @@ $(BUILD_DIR)/yurt_pthread_rs.o: rust/yurt-libc/src/pthread.rs | $(BUILD_DIR)
 	  $<
 
 $(BUILD_DIR)/yurt_socket_rs.o: rust/yurt-libc/src/socket.rs | $(BUILD_DIR)
+	rustc --target wasm32-wasip1 \
+	  --edition=2021 \
+	  --crate-type=lib \
+	  --emit=obj=$@ \
+	  -C panic=abort \
+	  -C opt-level=2 \
+	  $<
+
+$(BUILD_DIR)/yurt_epoll_rs.o: rust/yurt-libc/src/epoll.rs | $(BUILD_DIR)
 	rustc --target wasm32-wasip1 \
 	  --edition=2021 \
 	  --crate-type=lib \
