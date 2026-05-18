@@ -404,3 +404,88 @@ fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
         "false-cmd should report a non-zero exit code; got: {msg}"
     );
 }
+
+/// CHARACTERIZING TEST (fork Task 0 capture spike). Pins the *current*
+/// `runtime-wasmtime` `host_fork` behavior; it is NOT the eventual
+/// correctness oracle. See
+/// `docs/superpowers/plans/2026-05-17-fork-capture-notes.md` for the
+/// full snapshot-vs-rebuild analysis this test backs.
+///
+/// The `fork-twice` fixture sets `FORK_SENTINEL = 42`, calls the raw
+/// `yurt.host_fork` import, then prints `fork-twice <branch> rc=<rc>
+/// sentinel=<n>`. A TRUE continuation snapshot would yield TWO lines —
+/// a parent line (`rc>0`) AND a child line (`rc=0 sentinel=42`,
+/// proving the child resumed at the fork() site with the parent's
+/// post-sentinel memory). A REBUILD yields only the parent line: the
+/// host (`kernel_host_interface.rs:3551` `host_fork` →
+/// `snapshot_user_memory` copies linear memory bytes only →
+/// `instantiate_fork_child:813` builds a FRESH instance with
+/// `forced_fork_return: Some(0)` → child driven via `call_run()` which
+/// looks for an exported `run` a standard wasm32-wasip1 binary does not
+/// have, so the child never executes). The execution stack is never
+/// captured, so this is not a continuation.
+///
+/// This test asserts the OBSERVED rebuild behavior so a future Task 2
+/// that implements a real snapshot will *fail here loudly* and force
+/// this characterization to be replaced with the real cross-host
+/// oracle (Task 4).
+#[test]
+fn fork_twice_characterizes_current_host_fork() {
+    ensure_fixture_built("fork-twice-wasm");
+    let wasm_bytes = std::fs::read(fixture_wasm_path("fork-twice-wasm")).unwrap();
+    let mk = fresh_kernel_host_interface();
+    let mut user = mk.spawn_user_process(&wasm_bytes).unwrap();
+    // The parent fixture proc_exit(0)s after host_fork returns the
+    // child pid; that traps via the WASI shim (last_exit stashed
+    // first), exactly like every other proc_exit fixture above.
+    let _ = user.run_start();
+
+    let stdout = String::from_utf8_lossy(&user.captured_stdout().unwrap()).to_string();
+    let exit_code = user.last_exit().unwrap_or(-1);
+
+    // CURRENT (rebuild) behavior, asserted explicitly so it cannot
+    // silently regress and so Task 2 trips on it:
+    //
+    //  * Exactly ONE line — the parent's. NO `rc=0` child line, because
+    //    the rebuilt child is driven via the absent `run` export and
+    //    never runs (proving "not a continuation snapshot").
+    //  * The parent's `host_fork` returned a positive child pid
+    //    (`prepare_fork`/`commit_fork` allocated one), so the line is
+    //    `fork-twice parent rc=<pid>0 sentinel=42`.
+    //  * Parent proc_exit(0).
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "CHARACTERIZING: current host_fork is a rebuild (no continuation); \
+         expected exactly the parent line, got stdout: {stdout:?}"
+    );
+    let line = lines[0];
+    assert!(
+        line.starts_with("fork-twice parent rc="),
+        "CHARACTERIZING: expected the parent branch line, got: {line:?}"
+    );
+    assert!(
+        line.ends_with("sentinel=42"),
+        "CHARACTERIZING: parent keeps its own pre-fork sentinel, got: {line:?}"
+    );
+    let rc: i32 = line
+        .strip_prefix("fork-twice parent rc=")
+        .and_then(|s| s.strip_suffix(" sentinel=42"))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| panic!("could not parse rc from {line:?}"));
+    assert!(
+        rc > 0,
+        "CHARACTERIZING: parent host_fork returns the allocated child pid (>0), got rc={rc}"
+    );
+    assert!(
+        !stdout.contains("rc=0"),
+        "CHARACTERIZING: a `rc=0` child line would mean a real continuation \
+         snapshot landed — replace this characterization with the Task 4 \
+         oracle. stdout: {stdout:?}"
+    );
+    assert_eq!(
+        exit_code, 0,
+        "CHARACTERIZING: parent proc_exit(0) after host_fork"
+    );
+}
