@@ -77,6 +77,15 @@ static int yurt_fd_apply_descriptor_flags(int fd, int flags) {
   return 0;
 }
 
+/* Translate a sys_dup_min host return code into the guest libc errno.
+ * The host (sys_dup_min, see abi/contract/yurt_abi_methods.toml) returns
+ * exactly one of -EBADF / -EINVAL / -EMFILE on failure, using the fixed
+ * ABI errno numbering above; the guest libc may number errno differently,
+ * so the mapping is required. The `default` arm is unreachable under that
+ * contract and exists only as a defensive fallback: EBADF is the most
+ * conservative choice (it never falsely claims the fd table is full).
+ * If sys_dup_min ever grows a new failure code, extend the switch rather
+ * than relying on this fallback. */
 static int yurt_dup_min_errno_from_host(int rc) {
   switch (-rc) {
     case YURT_ABI_EBADF:

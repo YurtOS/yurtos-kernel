@@ -1082,8 +1082,15 @@ pub(super) fn sys_socket_sendto(caller_pid: u32, request: &[u8]) -> i64 {
         Ok(parts) => parts,
         Err(rc) => return rc,
     };
-    if flags != 0 {
-        return -(abi::EINVAL as i64);
+    // MSG_DONTWAIT (sends are already non-blocking here) and
+    // MSG_NOSIGNAL (no SIGPIPE generation) are accepted and ignored,
+    // as POSIX/Linux callers expect. Any other non-zero flag is an
+    // unsupported operation, not a malformed request — EOPNOTSUPP,
+    // not the catch-all EINVAL.
+    const MSG_DONTWAIT: u32 = 0x40;
+    const MSG_NOSIGNAL: u32 = 0x4000;
+    if flags & !(MSG_DONTWAIT | MSG_NOSIGNAL) != 0 {
+        return -(abi::EOPNOTSUPP as i64);
     }
     with_kernel(|k| match socket_id_for_fd(k, caller_pid, fd) {
         Ok(id) => socket_sendto_id(k, id, addr, data),

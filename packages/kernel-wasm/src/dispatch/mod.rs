@@ -374,6 +374,17 @@ fn inc_entry_ref(k: &mut Kernel, entry: &FdEntry) {
     }
 }
 
+/// POSIX: `dup2`/`dup3` fail with `EBADF` if `newfd` is at or above
+/// the caller's `RLIMIT_NOFILE` soft limit (slot 7). `None` means
+/// "unlimited" — no bound.
+fn newfd_within_rlimit(k: &mut Kernel, caller_pid: u32, newfd: u32) -> bool {
+    const RLIMIT_NOFILE_IDX: usize = 7;
+    match k.process_mut(caller_pid).rlimits[RLIMIT_NOFILE_IDX] {
+        Some((soft, _hard)) => (newfd as u64) < soft,
+        None => true,
+    }
+}
+
 /// `dup(oldfd: u32) -> newfd / -EBADF`. Increments pipe refcount when
 /// the entry is a pipe end.
 fn dup_fd(caller_pid: u32, request: &[u8]) -> i64 {
@@ -410,6 +421,11 @@ fn dup2_fd(caller_pid: u32, request: &[u8]) -> i64 {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
+        // POSIX: newfd at/above RLIMIT_NOFILE is EBADF, even when
+        // oldfd == newfd.
+        if !newfd_within_rlimit(k, caller_pid, newfd) {
+            return -(abi::EBADF as i64);
+        }
         // POSIX: dup2 of an fd onto itself is a no-op when oldfd is
         // valid. Skip the refcount dance.
         if oldfd == newfd {
@@ -452,6 +468,10 @@ fn dup3_fd(caller_pid: u32, request: &[u8]) -> i64 {
             Some(e) => e.clone(),
             None => return -(abi::EBADF as i64),
         };
+        // POSIX: newfd at/above RLIMIT_NOFILE is EBADF.
+        if !newfd_within_rlimit(k, caller_pid, newfd) {
+            return -(abi::EBADF as i64);
+        }
         // newfd is silently closed first (POSIX), then aliases oldfd.
         let close_handle = k
             .process_mut(caller_pid)

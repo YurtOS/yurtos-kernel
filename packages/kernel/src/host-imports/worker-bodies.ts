@@ -25,24 +25,22 @@
  *   `withKernelLock` helper whose `fn()` ran eagerly outside its
  *   Promise chain — it performed zero serialization and was removed.
  *
- * When to reintroduce a lock:
- *   The moment any body needs to `await` mid-flight (e.g. real
- *   blocking-socket recv via `recvAsync`, or any other suspension
- *   that lets the event loop run another worker's handler), the
- *   following must be done together:
- *     1. Promote `WorkerHostDispatcherBodies` methods to return
- *        Promises, and have `attachWorkerHostDispatcher` `await` the
- *        body result before writing the response SAB.
- *     2. Reintroduce a real serialization primitive on the main side
- *        — either a Promise-chain mutex whose `.then` actually
- *        encloses the body call (so the body runs INSIDE the
- *        chained continuation, not outside it), or an Atomics-based
- *        main-side lock that worker dispatchers acquire before
- *        touching kernel state.
- *     3. Keep the per-process scoping: `makeWorkerDispatcherBodies`
- *        returns a fresh closure per call, so the lock must live in
- *        that closure (one lock per process, shared across all of
- *        that process's spawned worker threads).
+ * Lock status — DONE (Task 10, PR #119). Bodies may now `await`
+ * mid-flight; the three required pieces are in place:
+ *     1. `WorkerHostDispatcherBodies` methods are `Awaitable<T>`;
+ *        `attachWorkerHostDispatcher` `await`s the body before
+ *        writing the response SAB.
+ *     2. A real serialization primitive — `WorkerHostSerializer`, a
+ *        Promise-chain mutex whose `.then` encloses the body call so
+ *        the body runs INSIDE the chained continuation.
+ *     3. Per-process scoping: the serializer is keyed off the
+ *        `bodies` object identity via a module `WeakMap`
+ *        (`serializerForBodies` in `worker-host-proxy.ts`). Since
+ *        `makeWorkerDispatcherBodies` returns one fresh `bodies` per
+ *        process and every spawned worker of that process attaches
+ *        with it, this is one lock per process shared across its
+ *        worker threads — same scope the original plan expressed as
+ *        "live in the closure", different (lighter) mechanism.
  *
  * Why the wasm-import bodies in `kernel-imports.ts` are also not
  * locked:
@@ -421,47 +419,76 @@ export function makeWorkerDispatcherBodies(
       const host = target.boundHost ?? "127.0.0.1";
       const port = target.boundPort ?? 0;
       const backlog = backlogArg > 0 ? backlogArg : 128;
-      const listenResult = opts.socketBackend.listen({ host, port, backlog });
-      if (typeof (listenResult as Promise<unknown>).then === "function") {
-        // Network-bridge backends return a Promise here; the worker
-        // dispatcher can't await mid-flight. The loopback registry is
-        // sync, so as long as the sandbox uses it (serverSockets.
-        // allowLoopback) this branch never fires. Surface a clear
-        // failure rather than blocking — the heartbeat thread will
-        // retry via its own bind/listen loop.
-        netLog("pthread.listen", { fd, result: "EAGAIN (async backend)" });
-        return -5;
-      }
-      const r = listenResult as Awaited<
-        ReturnType<NonNullable<typeof opts.socketBackend.listen>>
-      >;
-      if (!r.ok) {
+      const apply = (
+        r: Awaited<ReturnType<NonNullable<typeof opts.socketBackend.listen>>>,
+      ): number => {
+        if (!r.ok) {
+          netLog("pthread.listen", {
+            fd,
+            host,
+            port,
+            result: "EIO",
+            reason: r.error,
+          });
+          return -5;
+        }
+        if (kernel.getFdTarget(getPid(), fd) !== target) {
+          void opts.socketBackend?.closeListener?.(r.listener);
+          netLog("pthread.listen", {
+            fd,
+            host,
+            port,
+            result: "EBADF",
+            reason: "fd closed before async listen resolved",
+          });
+          return -9;
+        }
+        target.listener = r.listener;
+        target.boundHost = host;
+        target.boundPort = port;
+        target.localHost = r.host;
+        target.localPort = r.port;
+        target.closeListener = (listener) => {
+          void opts.socketBackend?.closeListener?.(listener);
+        };
+        netLog("pthread.listen", {
+          fd,
+          host,
+          port,
+          assignedHost: r.host,
+          assignedPort: r.port,
+          result: "ok",
+        });
+        return 0;
+      };
+      const failListen = (error: unknown): number => {
         netLog("pthread.listen", {
           fd,
           host,
           port,
           result: "EIO",
-          reason: r.error,
+          reason: error instanceof Error ? error.message : String(error),
         });
         return -5;
-      }
-      target.listener = r.listener;
-      target.boundHost = host;
-      target.boundPort = port;
-      target.localHost = r.host;
-      target.localPort = r.port;
-      target.closeListener = (listener) => {
-        void opts.socketBackend?.closeListener?.(listener);
       };
-      netLog("pthread.listen", {
-        fd,
-        host,
-        port,
-        assignedHost: r.host,
-        assignedPort: r.port,
-        result: "ok",
-      });
-      return 0;
+      let listenResult: ReturnType<
+        NonNullable<typeof opts.socketBackend.listen>
+      >;
+      try {
+        listenResult = opts.socketBackend.listen({ host, port, backlog });
+      } catch (error) {
+        return failListen(error);
+      }
+      if (typeof (listenResult as Promise<unknown>).then === "function") {
+        return (listenResult as Promise<
+          Awaited<ReturnType<NonNullable<typeof opts.socketBackend.listen>>>
+        >).then(apply, failListen);
+      }
+      return apply(
+        listenResult as Awaited<
+          ReturnType<NonNullable<typeof opts.socketBackend.listen>>
+        >,
+      );
     },
     socketIsDgram: (fd) => {
       const target = kernel.getFdTarget(getPid(), fd);

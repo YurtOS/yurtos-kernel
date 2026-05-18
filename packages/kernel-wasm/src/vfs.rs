@@ -428,7 +428,7 @@ impl MountTable {
     pub fn set_len(&mut self, mount_id: MountId, inode: u64, length: u64) -> i32 {
         match self.mounts.get_mut(mount_id as usize) {
             Some(m) => m.backend.set_len(inode, length),
-            None => -(crate::abi::EBADF as i32),
+            None => -crate::abi::EBADF,
         }
     }
 
@@ -823,13 +823,13 @@ impl VfsBackend for RamfsBackend {
 
     fn set_len(&mut self, inode: u64, length: u64) -> i32 {
         let Some(content) = self.inodes.get_mut(&inode) else {
-            return -(crate::abi::EBADF as i32);
+            return -crate::abi::EBADF;
         };
         // usize::MAX on wasm32 is 4 GiB - 1; refuse anything that
         // would overflow the host buffer. EFBIG matches POSIX intent
         // (resource limit / file too large) better than EINVAL here.
         let Ok(len_usize) = usize::try_from(length) else {
-            return -(crate::abi::EFBIG as i32);
+            return -crate::abi::EFBIG;
         };
         content.resize(len_usize, 0);
         0
@@ -1245,6 +1245,33 @@ mod tests {
         assert_eq!(b.rmdir(b"/d"), 0);
         assert_eq!(b.dir_inode(b"/d"), None, "rmdir frees the inode");
         assert_eq!(b.dir_path(d), None, "reverse map freed too");
+    }
+
+    #[test]
+    fn ramfs_root_inode_zero_never_collides_with_minted_ids() {
+        // Foundational invariant the whole inode anchor rests on: the
+        // mount-root dir inode is the reserved id 0, and `next_id`
+        // starts at 1 and only ever increments, so every minted id is
+        // (a) never 0 — no minted entry aliases root — and (b) globally
+        // unique across BOTH id-minting paths (`mkdir` dirs and
+        // `install` files share one `next_id` space). A future
+        // `next_id: 0` regression breaks (a); a per-path counter or a
+        // reset would break (b). Seed the live-id set with root's 0 so
+        // a single insert-must-be-new ladder pins both at once.
+        let mut b = RamfsBackend::new();
+        assert_eq!(b.dir_inode(b"/"), Some(0), "root is the reserved inode 0");
+        let mut seen = std::collections::BTreeSet::from([0u64]);
+        for name in ["/a", "/b", "/a/c"] {
+            assert_eq!(b.mkdir(name.as_bytes()), 0);
+            let id = b.dir_inode(name.as_bytes()).unwrap();
+            assert_ne!(id, 0, "minted dir inode for {name} collided with root");
+            assert!(seen.insert(id), "dir inode {id} for {name} not unique");
+        }
+        for name in ["/f", "/a/g", "/a/c/h"] {
+            let id = b.install(name.as_bytes().to_vec(), b"x".to_vec());
+            assert_ne!(id, 0, "minted file inode for {name} collided with root");
+            assert!(seen.insert(id), "file inode {id} for {name} not unique");
+        }
     }
 
     #[test]
@@ -2784,7 +2811,7 @@ impl VfsBackend for OverlayBackend {
             // `truncate` for now. A future overlay rewrite that copies
             // up on write should also copy up on set_len. Issue #87.
             Some(&(Layer::Lower, _)) => -30, // -EROFS
-            None => -(crate::abi::EBADF as i32),
+            None => -crate::abi::EBADF,
         }
     }
 
