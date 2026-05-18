@@ -1260,8 +1260,12 @@ pub(super) fn sys_socketpair(caller_pid: u32, request: &[u8], response: &mut [u8
         // the left fd never installed, drop both ids; if it did, undo
         // it before dropping the right id.
         let Some(left_fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
-            let _ = k.socket_dec_ref(left_id);
-            let _ = k.socket_dec_ref(right_id);
+            if let Some(handle) = k.socket_dec_ref(left_id) {
+                kh::socket_close(handle);
+            }
+            if let Some(handle) = k.socket_dec_ref(right_id) {
+                kh::socket_close(handle);
+            }
             return -(abi::EMFILE as i64);
         };
         k.process_mut(caller_pid)
@@ -1269,9 +1273,13 @@ pub(super) fn sys_socketpair(caller_pid: u32, request: &[u8], response: &mut [u8
             .install(left_fd, FdEntry::Socket { id: left_id });
         let Some(right_fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
             if let Some(entry) = k.process_mut(caller_pid).fd_table.remove(left_fd) {
-                close_entry(k, entry);
+                if let Some(handle) = close_entry(k, entry) {
+                    kh::socket_close(handle);
+                }
             }
-            let _ = k.socket_dec_ref(right_id);
+            if let Some(handle) = k.socket_dec_ref(right_id) {
+                kh::socket_close(handle);
+            }
             return -(abi::EMFILE as i64);
         };
         k.process_mut(caller_pid)
