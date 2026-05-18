@@ -1846,34 +1846,40 @@ export function createKernelImports(
     // NOT added here — the legacy TS kernel has no EPollEntry
     // equivalent today; a future slice adds it. B0 parity for epoll
     // is a known-deferred gap until that lands.
+    // Returns are BigInt because the C-side imports are declared
+    // `long long` (i64). The wasm engine demands BigInt for i64
+    // returns at the JS boundary; returning a plain `number` traps
+    // the guest (exit 127).
     host_select(
       reqPtr: number,
       reqLen: number,
       respPtr: number,
       respLen: number,
-    ): number {
-      return selectImpl(reqPtr, reqLen, respPtr, respLen, 404, 20);
+    ): bigint {
+      return BigInt(selectImpl(reqPtr, reqLen, respPtr, respLen, 404, 20));
     },
     host_pselect(
       reqPtr: number,
       reqLen: number,
       respPtr: number,
       respLen: number,
-    ): number {
-      return selectImpl(reqPtr, reqLen, respPtr, respLen, 412, 28);
+    ): bigint {
+      return BigInt(selectImpl(reqPtr, reqLen, respPtr, respLen, 412, 28));
     },
     host_ppoll(
       reqPtr: number,
       reqLen: number,
       respPtr: number,
       respLen: number,
-    ): number {
-      if (!opts.kernel) return ERR_IO;
-      if (reqLen < 24 || (reqLen - 24) % POLLFD_SIZE !== 0) return ERR_INVALID;
+    ): bigint {
+      if (!opts.kernel) return BigInt(ERR_IO);
+      if (reqLen < 24 || (reqLen - 24) % POLLFD_SIZE !== 0) {
+        return BigInt(ERR_INVALID);
+      }
       if (
         reqPtr < 0 || reqPtr + reqLen > memory.buffer.byteLength ||
         respPtr < 0 || respPtr + (reqLen - 24) > memory.buffer.byteLength
-      ) return ERR_IO;
+      ) return BigInt(ERR_IO);
       const view = new DataView(memory.buffer);
       // tv_sec@0 / tv_nsec@8 / timeout_null@12: range-check only when
       // timeout_null==0 (D4). NULL caller timeout never spuriously -EINVAL.
@@ -1881,12 +1887,12 @@ export function createKernelImports(
         const tvSec = view.getBigInt64(reqPtr + 0, true);
         const tvNsec = view.getInt32(reqPtr + 8, true);
         if (tvSec < 0n || tvNsec < 0 || tvNsec >= 1_000_000_000) {
-          return ERR_INVALID;
+          return BigInt(ERR_INVALID);
         }
       }
       // sigmask @16 carried, not applied (no blocked-mask state today).
       const recBytes = reqLen - 24;
-      if (respLen < recBytes) return ERR_INVALID;
+      if (respLen < recBytes) return BigInt(ERR_INVALID);
       let ready = 0;
       for (let off = 0; off < recBytes; off += POLLFD_SIZE) {
         const base = reqPtr + 24 + off;
@@ -1903,7 +1909,7 @@ export function createKernelImports(
         view.setInt16(respPtr + off + 6, revents, true);
         if (revents !== 0) ready++;
       }
-      return ready;
+      return BigInt(ready);
     },
 
     // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32

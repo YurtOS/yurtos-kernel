@@ -31,6 +31,31 @@ _Static_assert(FD_SETSIZE == 1024, "select ABI assumes FD_SETSIZE == 1024");
 #define YURT_PSEL_REQ 412
 #define YURT_SEL_RESP 384
 
+/* The yurt kernel returns Linux-style errno values (EBADF=9, EFAULT=14,
+ * EINVAL=22, ...), but wasi-libc uses its own scheme (EBADF=8, EFAULT=21,
+ * EINVAL=28, ...). The naive `errno = -rc` convention silently loses
+ * the meaning across the ABI mismatch. Translate the common errnos here
+ * so guest code that checks `errno == EBADF` (etc.) sees the local
+ * value. Anything not in the table falls through as `-rc` (preserves
+ * the error magnitude even if not the canonical local constant). */
+static int yurt_errno_from_kernel(int kernel_errno) {
+  switch (kernel_errno) {
+    case 1:  return EPERM;
+    case 2:  return ENOENT;
+    case 5:  return EIO;
+    case 9:  return EBADF;
+    case 11: return EAGAIN;
+    case 14: return EFAULT;
+    case 17: return EEXIST;
+    case 20: return ENOTDIR;
+    case 22: return EINVAL;
+    case 24: return EMFILE;
+    case 32: return EPIPE;
+    case 40: return ELOOP;
+    default: return kernel_errno;
+  }
+}
+
 /* Compact slot -> canonical kernel sigmask bits (signal s => bit s-1).
  * Slot 7 (SIGUSR1/USR2/ALRM) sets all three (documented
  * over-approximation; the lossiness is a pre-existing sigset_t property,
@@ -153,7 +178,7 @@ static int yurt_select_common(
                 (int)(intptr_t)req, req_len, (int)(intptr_t)resp,
                 YURT_SEL_RESP);
   if (rc < 0) {
-    errno = (int)(-rc);
+    errno = yurt_errno_from_kernel((int)(-rc));
     return -1;
   }
 
@@ -204,3 +229,18 @@ int __wrap_pselect(
     const sigset_t *sigmask) {
   return pselect(nfds, readfds, writefds, exceptfds, timeout, sigmask);
 }
+
+/* wasi-sdk-33 `<sys/select.h>` does:
+ *   __REDIR(select, __select_time64);
+ *   __REDIR(pselect, __pselect_time64);
+ * so a C caller's `select()` / `pselect()` actually resolves to the
+ * time64 symbol, not the bare name. Without these aliases, callers
+ * trap on an unresolved import. The aliases point at the
+ * implementations above; this preserves the time64 contract because
+ * our wire layout already uses i64 tv_sec. */
+__attribute__((alias("select"))) int __select_time64(
+    int, fd_set *, fd_set *, fd_set *, struct timeval *);
+
+__attribute__((alias("pselect"))) int __pselect_time64(
+    int, fd_set *, fd_set *, fd_set *, const struct timespec *,
+    const sigset_t *);

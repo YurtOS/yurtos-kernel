@@ -51,6 +51,27 @@ int __wrap_poll(struct pollfd *fds, nfds_t nfds, int timeout) {
 
 /* Keep in sync with abi/src/yurt_select.c:yurt_compact_sigset_to_canonical
  * and abi/src/yurt_signal.c. */
+
+/* Linux-kernel errno -> wasi-libc errno translation. See the matching
+ * helper + commentary in abi/src/yurt_select.c. */
+static int yurt_ppoll_errno_from_kernel(int kernel_errno) {
+  switch (kernel_errno) {
+    case 1:  return EPERM;
+    case 2:  return ENOENT;
+    case 5:  return EIO;
+    case 9:  return EBADF;
+    case 11: return EAGAIN;
+    case 14: return EFAULT;
+    case 17: return EEXIST;
+    case 20: return ENOTDIR;
+    case 22: return EINVAL;
+    case 24: return EMFILE;
+    case 32: return EPIPE;
+    case 40: return ELOOP;
+    default: return kernel_errno;
+  }
+}
+
 static unsigned long long yurt_ppoll_sigset_to_canonical(sigset_t set) {
   static const unsigned long long slot_bits[8] = {
       1ull << (1 - 1),   1ull << (2 - 1),   1ull << (3 - 1),
@@ -123,7 +144,7 @@ int ppoll(
   if (rc >= 0 && tail > 0) memcpy(fds, req + 24, tail);
   free(req);
   if (rc < 0) {
-    errno = (int)(-rc);
+    errno = yurt_ppoll_errno_from_kernel((int)(-rc));
     return -1;
   }
   return (int)rc;
@@ -136,3 +157,10 @@ int __wrap_ppoll(
     const sigset_t *sigmask) {
   return ppoll(fds, nfds, timeout, sigmask);
 }
+
+/* wasi-sdk-33 `<poll.h>` does `__REDIR(ppoll, __ppoll_time64)`, so a
+ * C caller's `ppoll()` resolves to the time64 symbol. Without this
+ * alias, callers trap on an unresolved import. The wire layout
+ * already uses i64 tv_sec so the time64 contract is preserved. */
+__attribute__((alias("ppoll"))) int __ppoll_time64(
+    struct pollfd *, nfds_t, const struct timespec *, const sigset_t *);
