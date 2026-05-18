@@ -84,7 +84,6 @@ import {
 const SIGPIPE = 13;
 const YURT_STAT_MODE_BITS = 16n;
 const YURT_STAT_UID_BITS = 24n;
-const YURT_STAT_MODE_MASK = (1n << YURT_STAT_MODE_BITS) - 1n;
 const YURT_STAT_ID_MASK = (1n << YURT_STAT_UID_BITS) - 1n;
 
 type AsyncVfsLike = VfsLike & {
