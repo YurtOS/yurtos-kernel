@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
@@ -759,6 +759,8 @@ fn run_wasmtime_thread(
         last_exit: None,
         last_scheduler_budget_ns: None,
         last_scheduler_epoch_quantum: None,
+        // Root of a new drive chain — depth starts at 0.
+        spawn_wait_depth: Arc::new(AtomicU32::new(0)),
     };
     let mut store = Store::new(&engine, user_state);
     store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
@@ -840,6 +842,8 @@ fn instantiate_fork_child(
         last_exit: None,
         last_scheduler_budget_ns: None,
         last_scheduler_epoch_quantum: None,
+        // Fork child is its own root drive chain — depth starts at 0.
+        spawn_wait_depth: Arc::new(AtomicU32::new(0)),
     };
     let mut store = Store::new(engine, user_state);
     store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
@@ -3004,7 +3008,19 @@ impl KernelHostInterface {
         wasm: &[u8],
         argv: Vec<Vec<u8>>,
     ) -> Result<UserProcess> {
-        instantiate_with_pid_raw(&self.engine, &self.kernel, pid, wasm, argv)
+        // Top-level embedder entry (spawn_user_process* / spawn_child
+        // / spawn_cached_user_process all route here): each spawned
+        // tree is its own drive chain, so seed a fresh depth counter
+        // at 0. Nested drains share their parent's Arc instead (see
+        // `drain_and_run_pending_spawns`).
+        instantiate_with_pid_raw(
+            &self.engine,
+            &self.kernel,
+            pid,
+            wasm,
+            argv,
+            &Arc::new(AtomicU32::new(0)),
+        )
     }
 
     fn cache_anonymous_process_module(&self, wasm: &[u8]) -> Result<Vec<u8>> {
@@ -3024,7 +3040,13 @@ impl KernelHostInterface {
     /// in a fixed-cadence drain) — without it, sys_spawn-staged
     /// children never run.
     pub fn run_pending_spawns(&self) -> Result<usize> {
-        drain_and_run_pending_spawns(&self.engine, &self.kernel)
+        // Public top-level drain (embedder cadence call): not nested
+        // inside any host_wait, so it starts a fresh depth chain at 0.
+        drain_and_run_pending_spawns(
+            &self.engine,
+            &self.kernel,
+            &Arc::new(AtomicU32::new(0)),
+        )
     }
 
     /// Reserved alias for [`spawn_user_process`]. The WASI preview1
@@ -3108,6 +3130,18 @@ pub struct UserState {
     /// Wasmtime-specific mechanism derived from `last_scheduler_budget_ns`.
     /// This stays host-local and is not exposed through the kernel ABI.
     pub last_scheduler_epoch_quantum: Option<u64>,
+    /// Host-side re-entrancy depth for the `host_wait` → drain → child
+    /// `host_wait` recursion. SHARED across the whole nested
+    /// parent→child chain via a single cloned `Arc`: every root
+    /// `UserState` constructor seeds a fresh `AtomicU32(0)`;
+    /// `instantiate_with_pid_raw` clones the *parent's* Arc into the
+    /// child so the counter is one logical value across nesting
+    /// boundaries. This is the Rust port of the JS host's
+    /// `CachedProcessEngine.drainDepth` / `drainDepthRef` (the I3
+    /// fix in `packages/kernel-host-interface-js/mod.ts`). It lives
+    /// here — not in `KernelInstance`/kernel state — because
+    /// re-entrancy is a host concern, not kernel ABI surface.
+    pub spawn_wait_depth: Arc<AtomicU32>,
 }
 
 impl yurt_kernel_host_interface_core::HasCallerPid for UserState {
@@ -3305,6 +3339,14 @@ fn instantiate_with_pid_raw(
     pid: u32,
     wasm: &[u8],
     argv: Vec<Vec<u8>>,
+    // SHARED across the parent→child chain: the caller passes its own
+    // `spawn_wait_depth` Arc and we `.clone()` it (Arc clone = same
+    // allocation) into the child's `UserState`, so the child's
+    // `host_wait` increments the SAME counter as its parent. A
+    // top-level caller (`instantiate_with_pid`) passes a fresh
+    // `Arc::new(AtomicU32::new(0))` so each independent spawn tree has
+    // its own root depth.
+    spawn_wait_depth: &Arc<AtomicU32>,
 ) -> Result<UserProcess> {
     let module = Module::new(engine, wasm).context("compile user-process wasm")?;
     let mut linker: Linker<UserState> = Linker::new(engine);
@@ -3332,6 +3374,9 @@ fn instantiate_with_pid_raw(
         last_exit: None,
         last_scheduler_budget_ns: None,
         last_scheduler_epoch_quantum: None,
+        // Same Arc as the caller → the whole nested host_wait chain
+        // shares ONE depth counter (the F1 fix; mirrors JS I3).
+        spawn_wait_depth: spawn_wait_depth.clone(),
     };
     let mut store = Store::new(engine, user_state);
     store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE);
@@ -3432,11 +3477,38 @@ fn record_exit_raw(kernel: &Arc<Mutex<KernelInstance>>, pid: u32, exit_status: i
 fn drain_and_run_pending_spawns(
     engine: &Engine,
     kernel: &Arc<Mutex<KernelInstance>>,
+    // Threaded straight through to the child's `UserState` so the
+    // child's `host_wait` shares its parent's depth counter — this is
+    // what makes the 256-depth guard fire ACROSS nesting boundaries
+    // (the F1 fix; mirrors JS I3's `drainDepthRef`).
+    spawn_wait_depth: &Arc<AtomicU32>,
 ) -> Result<usize> {
     let mut count = 0usize;
+    // Runaway guard, byte-for-byte parity with the JS host's
+    // `CachedProcessEngine.runPendingSpawns` (`RUNAWAY_LIMIT =
+    // 100_000`, `if (++iterations > RUNAWAY_LIMIT) throw`). The
+    // depth-256 guard in `host_wait` bounds *vertical* recursion, but
+    // a child that pre-stages its own next child via `host_spawn`
+    // BEFORE its `host_wait` hits the depth cap leaves a staged
+    // orphan; this loop would otherwise dequeue+run that orphan, which
+    // stages another, forever (unbounded *horizontal* work at a fixed
+    // depth). Capping the loop is exactly how the JS reference bounds
+    // it — without this the Rust port would diverge from JS and the
+    // host process would hang instead of surfacing a clean error.
+    let mut iterations: u32 = 0;
     while let Some(spawn) = drain_pending_spawn_raw(kernel)? {
-        let mut child =
-            instantiate_with_pid_raw(engine, kernel, spawn.child_pid, &spawn.wasm, spawn.argv)?;
+        iterations += 1;
+        if iterations > HOST_WAIT_MAX_DRAIN_ITERS {
+            anyhow::bail!("drain_and_run_pending_spawns: runaway drain");
+        }
+        let mut child = instantiate_with_pid_raw(
+            engine,
+            kernel,
+            spawn.child_pid,
+            &spawn.wasm,
+            spawn.argv,
+            spawn_wait_depth,
+        )?;
         // run_start traps when the child calls proc_exit; the
         // shim stashes the exit code in UserState first. A
         // clean return (non-WASI exit) leaves last_exit None,
@@ -3624,15 +3696,59 @@ fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
     Ok(())
 }
 
-/// `host_wait`'s EAGAIN→drain loop iteration cap. A pathological
-/// guest (or a child that itself calls `host_wait` forever) must not
-/// spin the host indefinitely; when the cap is hit we return a clean
-/// `-EDEADLK` errno rather than panicking or trapping the guest. The
-/// JS host uses a re-entrancy depth of 256 because its drive chain is
-/// recursive; the Rust drain loop is flat (each iteration fully
-/// drains the staged-spawn queue, which terminates at `-ENOENT`), so a
-/// generous absolute iteration bound is the equivalent safety net.
+/// `host_wait`'s cross-nesting re-entrancy depth cap. The drive chain
+/// IS recursive in Rust just like JS: `host_wait` →
+/// `drain_and_run_pending_spawns` → `instantiate_with_pid_raw` →
+/// `child.run_start()` → the child's guest calls `host_wait` → … Each
+/// nested level adds native stack frames, so the recursion MUST be
+/// bounded by a counter SHARED across the whole chain (not a per-call
+/// local — that never trips and the native stack overflows / aborts).
+/// We mirror the JS host's `drainDepth` guard exactly (cap 256): when
+/// the shared depth exceeds this, the innermost `host_wait` returns a
+/// clean `-EDEADLK` instead of recursing further, so the guest
+/// surfaces the wedge gracefully rather than crashing.
+const HOST_WAIT_MAX_DRAIN_DEPTH: u32 = 256;
+
+/// Runaway-iteration cap, byte-for-byte parity with the JS host's
+/// `CachedProcessEngine.runPendingSpawns` `RUNAWAY_LIMIT = 100_000`.
+/// Used in two places, matching the JS host's two guards:
+///   1. `drain_and_run_pending_spawns`'s `while let Some` loop — the
+///      direct analogue of JS `runPendingSpawns`'s capped `while`,
+///      bounding pathological *horizontal* orphan-draining at a fixed
+///      recursion depth.
+///   2. `host_wait`'s flat EAGAIN spin within a single call frame —
+///      a `host_wait` whose drain finds no new child but whose
+///      `SYS_WAIT` never settles. (Vertical *recursion* is bounded
+///      separately by the shared depth-256 guard, mirroring JS I3.)
 const HOST_WAIT_MAX_DRAIN_ITERS: u32 = 100_000;
+
+/// RAII guard: increments the shared `host_wait` re-entrancy depth on
+/// construction and decrements it on `Drop`. Decrement therefore
+/// happens on EVERY exit path of the guarded scope — early `return`,
+/// `?`, AND a wasmtime trap that unwinds the host frame — so the
+/// counter can never leak across a panic/trap. This is the Rust
+/// equivalent of the JS host's `try { … } finally { depth.value-- }`.
+struct SpawnWaitDepthGuard<'a> {
+    depth: &'a Arc<AtomicU32>,
+}
+
+impl<'a> SpawnWaitDepthGuard<'a> {
+    /// Atomically bump the shared counter and return the new (post-
+    /// increment) depth. The caller compares it against
+    /// `HOST_WAIT_MAX_DRAIN_DEPTH`; even if the cap is exceeded the
+    /// guard is still constructed (and its `Drop` still decrements),
+    /// so the bump/un-bump stays balanced on the over-limit path too.
+    fn enter(depth: &'a Arc<AtomicU32>) -> (Self, u32) {
+        let new_depth = depth.fetch_add(1, Ordering::SeqCst) + 1;
+        (Self { depth }, new_depth)
+    }
+}
+
+impl Drop for SpawnWaitDepthGuard<'_> {
+    fn drop(&mut self) {
+        self.depth.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Register the `yurt.host_spawn` / `yurt.host_wait` guest imports.
 ///
@@ -3742,6 +3858,14 @@ fn register_yurt_process_imports(linker: &mut Linker<UserState>) -> Result<()> {
             // cloning caller.data().kernel first).
             let engine = caller.data().engine.clone();
             let kernel = caller.data().kernel.clone();
+            // Clone the SHARED depth Arc out before any `&mut caller`
+            // borrow, same as engine/kernel. Arc clone = same
+            // allocation, so this `host_wait` and every nested child's
+            // `host_wait` (the child's UserState got `.clone()` of this
+            // very Arc in `instantiate_with_pid_raw`) increment ONE
+            // logical counter — that is what makes the depth-256 guard
+            // fire across nesting boundaries (the F1 fix / JS I3).
+            let spawn_wait_depth = caller.data().spawn_wait_depth.clone();
             let caller_pid = caller.data().pid;
 
             let mut req = Vec::with_capacity(8);
@@ -3763,17 +3887,38 @@ fn register_yurt_process_imports(linker: &mut Linker<UserState>) -> Result<()> {
             let mut rc = do_wait(&mut resp);
             let mut iters: u32 = 0;
             while rc == -EAGAIN && (flags & WNOHANG) == 0 {
+                // Shared cross-nesting recursion guard (F1 fix; mirrors
+                // JS I3's `if (depth.value >= 256) return -EDEADLK`).
+                // Enter BEFORE the recursive drain so the guard's Drop
+                // brackets the entire nested parent→child→… subtree;
+                // the bump/un-bump is balanced even on the over-limit
+                // path because the guard is constructed regardless.
+                let (_depth_guard, depth) = SpawnWaitDepthGuard::enter(&spawn_wait_depth);
+                if depth > HOST_WAIT_MAX_DRAIN_DEPTH {
+                    // The whole nested chain shares this counter, so
+                    // this fires at the innermost frame WITHOUT
+                    // descending further (no extra native stack). A
+                    // clean errno — not a panic/trap that would crash
+                    // the guest with no errno. `_depth_guard` Drops
+                    // here, decrementing on this return path too.
+                    return -(EDEADLK as i32);
+                }
+                // Generous absolute net for a pathological *flat* spin
+                // in THIS frame (drain found nothing recursive but
+                // SYS_WAIT never settles). The recursion itself is
+                // bounded by the shared depth above.
                 if iters >= HOST_WAIT_MAX_DRAIN_ITERS {
-                    // Clean errno instead of a panic/trap: lets the
-                    // guest surface a wedged wait gracefully (parity
-                    // with the JS host's -EDEADLK depth guard).
                     return -(EDEADLK as i32);
                 }
                 iters += 1;
-                if drain_and_run_pending_spawns(&engine, &kernel).is_err() {
+                if drain_and_run_pending_spawns(&engine, &kernel, &spawn_wait_depth).is_err() {
                     return -(EIO as i32);
                 }
                 rc = do_wait(&mut resp);
+                // `_depth_guard` Drops at the end of each loop
+                // iteration, decrementing the shared depth — the
+                // recursion budget is reclaimed once this frame's
+                // nested drain has fully returned.
             }
 
             if rc < 0 {

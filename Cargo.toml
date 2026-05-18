@@ -25,6 +25,7 @@ members = [
   "test-fixtures/wasm/child-exit7",
   "test-fixtures/wasm/spawn-wait",
   "test-fixtures/wasm/spawn-badreq",
+  "test-fixtures/wasm/spawn-deep",
   "abi/conformance/rust/dup2-canary",
   "abi/conformance/rust/getgroups-canary",
   "abi/conformance/rust/affinity-canary",

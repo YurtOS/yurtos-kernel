@@ -388,6 +388,81 @@ fn spawn_badreq_host_spawn_returns_einval_for_short_buffer() {
 }
 
 #[test]
+fn spawn_deep_recursion_returns_edeadlk_not_stack_overflow() {
+    // F1 regression: a self-referential spawn chain must NOT overflow
+    // the native stack / abort. `/spawn-deep.wasm`'s main() spawns
+    // itself and host_wait()s, so the host drive chain recurses:
+    //
+    //   host_wait → drain_and_run_pending_spawns
+    //     → instantiate_with_pid_raw → child.run_start()
+    //       → child's host_wait → drain → … (unbounded before the fix)
+    //
+    // Before F1 the recursion guard was a per-CALL local `iters` that
+    // reset to 0 at every nested native frame, so the cap never
+    // tripped and the native stack grew without bound → stack
+    // overflow / abort (a hard crash with NO errno — never reaches
+    // proc_exit). The fix shares ONE depth counter across the whole
+    // nested parent→child chain (cap 256, byte-parity with the JS
+    // host's `drainDepth` / `drainDepthRef`): the ~257th nested
+    // host_wait returns a clean `-EDEADLK` (-35) WITHOUT recursing
+    // further, the tree unwinds, and the errno propagates back to the
+    // root, which proc_exit(35)s.
+    //
+    // The fixture takes a depth countdown in argv (here 260, > the 256
+    // cap) and only spawns a child while the countdown is > 0, so the
+    // chain has a hard FLOOR and total work is ~260 levels — the
+    // depth-256 guard fires (and is observed) well before the floor,
+    // and any boundary "orphan" drained horizontally is itself floored
+    // a few levels later instead of running away (the host also caps
+    // that horizontal drain at 100_000 iters, matching the JS host's
+    // `runPendingSpawns` `RUNAWAY_LIMIT`).
+    //
+    // Assertion: the run reaches `proc_exit(35)` (the EDEADLK errno) —
+    // i.e. it terminated CLEANLY via the depth guard. A regression
+    // would instead surface a `wasm trap` / stack-overflow / abort and
+    // never set last_exit.
+    ensure_fixture_built("spawn-deep-wasm");
+    let wasm_bytes = std::fs::read(fixture_wasm_path("spawn-deep-wasm")).unwrap();
+
+    let mk = fresh_kernel_host_interface();
+    // Self-referential: the fixture spawns `/spawn-deep.wasm`, so the
+    // exact same image must be resolvable by the kernel's sys_spawn at
+    // that path for every nested level of the chain.
+    mk.register_ramfs_file(b"/spawn-deep.wasm", &wasm_bytes)
+        .unwrap();
+
+    // argv = [program, "260"]: the root countdown. 260 > the 256 depth
+    // cap, so the shared-depth guard fires before the countdown floor.
+    let argv: Vec<&[u8]> = vec![b"/spawn-deep.wasm", b"260"];
+    let mut user = mk
+        .spawn_user_process_with_args(&wasm_bytes, &argv)
+        .unwrap();
+    // A single run_start drives the whole (bounded) tree. proc_exit
+    // traps; the WASI shim stashes the code in last_exit first. If the
+    // bug were present this would instead stack-overflow / abort the
+    // host process (or trap with "unreachable"), and last_exit would
+    // never be set.
+    let run = user.run_start();
+    assert!(
+        run.is_err(),
+        "spawn-deep ends in proc_exit (a trap), not a clean return"
+    );
+    let msg = format!("{:#}", run.unwrap_err());
+    assert!(
+        msg.contains("proc_exit"),
+        "expected a clean proc_exit trap (EDEADLK propagated), got: {msg}"
+    );
+
+    let exit_code = user.last_exit().unwrap_or(-1);
+    assert_eq!(
+        exit_code, 35,
+        "deep self-spawn must terminate with the -EDEADLK (35) depth-guard \
+         errno propagated to the root — NOT a stack overflow / abort / \
+         timeout (got exit code {exit_code})"
+    );
+}
+
+#[test]
 fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     ensure_fixture_built("false-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("false-cmd-wasm")).unwrap();
