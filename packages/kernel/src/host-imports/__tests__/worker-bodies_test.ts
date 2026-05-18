@@ -75,7 +75,7 @@ Deno.test(
 
 Deno.test(
   "makeWorkerDispatcherBodies: readFd drains static target bytes",
-  () => {
+  async () => {
     const kernel = new ProcessKernel();
     const pid = kernel.allocPid(0, "test");
     kernel.setFdTarget(
@@ -90,7 +90,7 @@ Deno.test(
       threadsBackend: () => nullThreadsBackend(),
     });
 
-    const { result, bytes } = bodies.readFd(0, 16);
+    const { result, bytes } = await bodies.readFd(0, 16);
     assertEquals(result, 2);
     assertEquals(bytes && new TextDecoder().decode(bytes), "hi");
 
@@ -100,7 +100,7 @@ Deno.test(
 
 Deno.test(
   "makeWorkerDispatcherBodies: readFd reports needed cap on overflow",
-  () => {
+  async () => {
     const kernel = new ProcessKernel();
     const pid = kernel.allocPid(0, "test");
     kernel.setFdTarget(
@@ -115,7 +115,7 @@ Deno.test(
       threadsBackend: () => nullThreadsBackend(),
     });
 
-    const { result, bytes } = bodies.readFd(0, 4);
+    const { result, bytes } = await bodies.readFd(0, 4);
     // Body returns the needed size; caller is expected to retry with larger cap.
     assertEquals(result, 8);
     assertEquals(bytes, undefined);
@@ -175,7 +175,7 @@ Deno.test(
   },
 );
 
-Deno.test("makeWorkerDispatcherBodies: socketOpen allocates AF_INET stream fds", () => {
+Deno.test("makeWorkerDispatcherBodies: socketOpen allocates AF_INET stream fds", async () => {
   const kernel = new ProcessKernel();
   const pid = kernel.allocPid(0, "test");
   const socketBackend = createLoopbackSocketBackend();
@@ -187,7 +187,7 @@ Deno.test("makeWorkerDispatcherBodies: socketOpen allocates AF_INET stream fds",
     socketBackend,
   });
 
-  const fd = bodies.socketOpen(1, 6, 0);
+  const fd = await bodies.socketOpen(1, 6, 0);
   const target = kernel.getFdTarget(pid, fd);
   assert(target?.type === "socket");
   assertEquals(target.socket, null);
@@ -195,7 +195,7 @@ Deno.test("makeWorkerDispatcherBodies: socketOpen allocates AF_INET stream fds",
   kernel.dispose();
 });
 
-Deno.test("makeWorkerDispatcherBodies: worker socket bind/listen uses loopback backend", () => {
+Deno.test("makeWorkerDispatcherBodies: worker socket bind/listen uses loopback backend", async () => {
   const kernel = new ProcessKernel();
   const pid = kernel.allocPid(0, "test");
   const socketBackend = createLoopbackSocketBackend();
@@ -207,12 +207,12 @@ Deno.test("makeWorkerDispatcherBodies: worker socket bind/listen uses loopback b
     socketBackend,
   });
 
-  const fd = bodies.socketOpen(1, 6, 0);
+  const fd = await bodies.socketOpen(1, 6, 0);
   assertEquals(
-    bodies.socketBind(fd, new TextEncoder().encode("0.0.0.0"), 0),
+    await bodies.socketBind(fd, new TextEncoder().encode("0.0.0.0"), 0),
     0,
   );
-  assertEquals(bodies.socketListen(fd, 2), 0);
+  assertEquals(await bodies.socketListen(fd, 2), 0);
 
   const target = kernel.getFdTarget(pid, fd);
   assert(target?.type === "socket");
@@ -223,7 +223,142 @@ Deno.test("makeWorkerDispatcherBodies: worker socket bind/listen uses loopback b
   kernel.dispose();
 });
 
-Deno.test("makeWorkerDispatcherBodies: worker socketpair returns process fds", () => {
+Deno.test("makeWorkerDispatcherBodies: worker socket listen awaits async backend", async () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const loopbackBackend = createLoopbackSocketBackend();
+  const socketBackend = {
+    ...loopbackBackend,
+    listen: (
+      req: Parameters<NonNullable<typeof loopbackBackend.listen>>[0],
+    ) => Promise.resolve(loopbackBackend.listen!(req)),
+  };
+
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+    socketBackend,
+  });
+
+  const fd = await bodies.socketOpen(1, 6, 0);
+  assertEquals(
+    await bodies.socketBind(fd, new TextEncoder().encode("0.0.0.0"), 0),
+    0,
+  );
+  assertEquals(await bodies.socketListen(fd, 2), 0);
+
+  const target = kernel.getFdTarget(pid, fd);
+  assert(target?.type === "socket");
+  assertEquals(target.boundHost, "0.0.0.0");
+  assertEquals(typeof target.listener, "number");
+  assertEquals(typeof target.localPort, "number");
+
+  kernel.dispose();
+});
+
+Deno.test("makeWorkerDispatcherBodies: async socket listen backend error returns EIO", async () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const loopbackBackend = createLoopbackSocketBackend();
+  const socketBackend = {
+    ...loopbackBackend,
+    listen: () =>
+      Promise.resolve({ ok: false as const, error: "listen failed" }),
+  };
+
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+    socketBackend,
+  });
+
+  const fd = await bodies.socketOpen(1, 6, 0);
+  assertEquals(
+    await bodies.socketBind(fd, new TextEncoder().encode("0.0.0.0"), 0),
+    0,
+  );
+
+  assertEquals(await bodies.socketListen(fd, 2), -5);
+
+  kernel.dispose();
+});
+
+Deno.test("makeWorkerDispatcherBodies: async socket listen rejection returns EIO", async () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const loopbackBackend = createLoopbackSocketBackend();
+  const socketBackend = {
+    ...loopbackBackend,
+    listen: () => Promise.reject(new Error("bridge listen rejected")),
+  };
+
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+    socketBackend,
+  });
+
+  const fd = await bodies.socketOpen(1, 6, 0);
+  assertEquals(
+    await bodies.socketBind(fd, new TextEncoder().encode("0.0.0.0"), 0),
+    0,
+  );
+
+  assertEquals(await bodies.socketListen(fd, 2), -5);
+
+  kernel.dispose();
+});
+
+Deno.test("makeWorkerDispatcherBodies: async socket listen closes listener if fd closes before resolution", async () => {
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(0, "test");
+  const loopbackBackend = createLoopbackSocketBackend();
+  let resolveListen!: (
+    result: Awaited<ReturnType<NonNullable<typeof loopbackBackend.listen>>>,
+  ) => void;
+  const listenResult = new Promise<
+    Awaited<ReturnType<NonNullable<typeof loopbackBackend.listen>>>
+  >((resolve) => {
+    resolveListen = resolve;
+  });
+  const closedListeners: unknown[] = [];
+  const socketBackend = {
+    ...loopbackBackend,
+    listen: () => listenResult,
+    closeListener: (listener: unknown) => {
+      closedListeners.push(listener);
+      return { ok: true as const };
+    },
+  };
+
+  const bodies = makeWorkerDispatcherBodies({
+    kernel,
+    callerPid: pid,
+    threadsBackend: () => nullThreadsBackend(),
+    socketBackend,
+  });
+
+  const fd = await bodies.socketOpen(1, 6, 0);
+  assertEquals(
+    await bodies.socketBind(fd, new TextEncoder().encode("0.0.0.0"), 0),
+    0,
+  );
+  const pendingListen = bodies.socketListen(fd, 2);
+  assertEquals(await bodies.socketClose(fd), 0);
+
+  resolveListen({ ok: true, listener: 1234, host: "0.0.0.0", port: 4321 });
+
+  assertEquals(await pendingListen, -9);
+  assertEquals(kernel.getFdTarget(pid, fd), null);
+  assertEquals(closedListeners, [1234]);
+
+  kernel.dispose();
+});
+
+Deno.test("makeWorkerDispatcherBodies: worker socketpair returns process fds", async () => {
   const kernel = new ProcessKernel();
   const pid = kernel.allocPid(0, "test");
   const socketBackend = createLoopbackSocketBackend();
@@ -235,7 +370,7 @@ Deno.test("makeWorkerDispatcherBodies: worker socketpair returns process fds", (
     socketBackend,
   });
 
-  const result = bodies.socketPair(3, 6);
+  const result = await bodies.socketPair(3, 6);
   assertEquals(result.result, 0);
   const view = new DataView(
     result.bytes!.buffer,
@@ -250,7 +385,7 @@ Deno.test("makeWorkerDispatcherBodies: worker socketpair returns process fds", (
   kernel.dispose();
 });
 
-Deno.test("makeWorkerDispatcherBodies: worker poll writes revents bytes", () => {
+Deno.test("makeWorkerDispatcherBodies: worker poll writes revents bytes", async () => {
   const kernel = new ProcessKernel();
   const pid = kernel.allocPid(0, "test");
   kernel.setFdTarget(pid, 0, createStaticTarget(new Uint8Array([1, 2, 3])));
@@ -268,7 +403,7 @@ Deno.test("makeWorkerDispatcherBodies: worker poll writes revents bytes", () => 
   view.setInt32(8, 99, true);
   view.setInt16(12, 1, true);
 
-  const result = bodies.poll(2, fds);
+  const result = await bodies.poll(2, fds);
   assertEquals(result.result, 1);
   const outView = new DataView(
     result.bytes!.buffer,
