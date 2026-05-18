@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - codex/posix-libc-runtime
+  workflow_dispatch:
 
 jobs:
   build-fixtures:
@@ -76,7 +77,6 @@ jobs:
       - name: Build shell runner fixture
         run: |
           set -euxo pipefail
-          cargo clean -p yurt-shell-exec --target wasm32-wasip1
           cargo build --release --target wasm32-wasip1 -p yurt-shell-exec
           cp target/wasm32-wasip1/release/yurt-shell-exec.wasm \
             packages/kernel/src/platform/__tests__/fixtures/yurt-shell-exec.wasm
@@ -89,7 +89,24 @@ jobs:
             packages/kernel/src/platform/__tests__/fixtures/yurt-shell-exec-asyncify.wasm \
             -o packages/kernel/src/platform/__tests__/fixtures/yurt-shell-exec-asyncify.wasm
 
+      # ── C-port fixture caching (per #209) ───────────────────────────────
+      # Each port's .wasm output is deterministic given its source tree
+      # plus the ABI headers, ABI sources, yurt-cc toolchain, and the
+      # workflow's WASI SDK pin. Cache the produced fixture(s) keyed on
+      # those inputs; skip the slow `make copy-fixtures` invocation on
+      # hit. Building all three (busybox + ncurses + zsh) costs ~6 min
+      # of CI time.
+      - name: Cache BusyBox fixture
+        id: busybox-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            packages/kernel/src/platform/__tests__/fixtures/busybox.wasm
+            packages/kernel/src/platform/__tests__/fixtures/busybox.manifest.json
+          key: fixture-busybox-${{ hashFiles('test-fixtures/c-ports/busybox/**', 'test-fixtures/c-ports/Makefile', 'abi/include/**', 'abi/src/**', 'abi/Makefile', 'abi/toolchain/**', 'Cargo.lock', '.github/workflows/guest-compat.yml') }}
+
       - name: Build BusyBox fixture
+        if: steps.busybox-cache.outputs.cache-hit != 'true'
         run: make -C test-fixtures/c-ports/busybox copy-fixtures
 
       - name: Cache yurt-packages downloads
@@ -101,16 +118,47 @@ jobs:
       - name: Build standard image from pre-built packages
         run: deno run -A scripts/build-standard-image.ts
 
+      # ncurses cache covers both the fixture wasm AND the build/install
+      # tree — zsh's compile step needs the latter when zsh's own fixture
+      # cache misses but ncurses's hits.
+      - name: Cache ncurses fixture + install tree
+        id: ncurses-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            packages/kernel/src/platform/__tests__/fixtures/terminfo-canary.wasm
+            test-fixtures/c-ports/ncurses/build/install
+          key: fixture-ncurses-${{ hashFiles('test-fixtures/c-ports/ncurses/**', 'test-fixtures/c-ports/Makefile', 'abi/include/**', 'abi/src/**', 'abi/Makefile', 'abi/toolchain/**', 'Cargo.lock', '.github/workflows/guest-compat.yml') }}
+
       - name: Build ncurses fixture
+        if: steps.ncurses-cache.outputs.cache-hit != 'true'
         run: make -C test-fixtures/c-ports/ncurses copy-fixtures
 
+      # zsh's cache key folds in ncurses sources too: if ncurses inputs
+      # change, zsh.wasm content can change too, so both must invalidate
+      # together.
+      - name: Cache zsh fixture
+        id: zsh-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            packages/kernel/src/platform/__tests__/fixtures/zsh.wasm
+          key: fixture-zsh-${{ hashFiles('test-fixtures/c-ports/zsh/**', 'test-fixtures/c-ports/ncurses/**', 'test-fixtures/c-ports/Makefile', 'abi/include/**', 'abi/src/**', 'abi/Makefile', 'abi/toolchain/**', 'Cargo.lock', '.github/workflows/guest-compat.yml') }}
+
       - name: Build zsh fixture
+        if: steps.zsh-cache.outputs.cache-hit != 'true'
         run: make -C test-fixtures/c-ports/zsh copy-fixtures
 
       - name: Run fixture smoke tests
         run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/fixture-build-smoke_test.ts packages/kernel/src/process/__tests__/module-cache_test.ts
 
       - name: Run upstream zsh tests
+        # Slowest test in the repo (~3 min). Per #209, skip on PR to keep
+        # the pre-merge gate fast; still runs on push-to-main so any
+        # regression surfaces immediately after merge. Run manually
+        # against a PR with `gh workflow run "Guest Compat Fixtures"
+        # --ref <branch>` if the change touches zsh / port toolchain.
+        if: ${{ github.event_name != 'pull_request' }}
         run: deno test --no-check --allow-read --allow-write --allow-env --allow-net packages/kernel/src/__tests__/zsh-upstream_slow.ts
 
       - name: Run Rust kernel process/fd smoke tests
