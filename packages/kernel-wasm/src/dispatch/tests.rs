@@ -13658,3 +13658,51 @@ fn readlinkat_via_dirfd_and_errors() {
         -(abi::EINVAL as i64),
     );
 }
+
+/// #85 S2: every flag bit other than `AT_SYMLINK_NOFOLLOW` (incl.
+/// `AT_EMPTY_PATH = 0x1000`, the dirfd-as-target form documented as a
+/// follow-up in the ABI doc) must surface `-EINVAL` rather than being
+/// silently ignored. Mirrors sys_unlinkat's `AT_REMOVEDIR`-only guard
+/// from #194 — kept in its own test so a future code change relaxing
+/// the guard trips the right named assertion in CI output.
+#[test]
+fn fstatat_unsupported_flag_bits_are_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut buf = [0u8; 16];
+    // AT_EMPTY_PATH (0x1000) — documented Linux dirfd-target flag,
+    // explicitly out of scope for S2.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x1000, b"/"),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64),
+        "AT_EMPTY_PATH must reject until S2-follow-up implements it",
+    );
+    // A bit outside the entire AT_* range — defensive.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x8000_0000, b"/"),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64),
+        "any flag bit outside AT_SYMLINK_NOFOLLOW must reject",
+    );
+    // AT_SYMLINK_NOFOLLOW (0x100) OR-ed with an unknown bit must
+    // STILL reject — no silent masking of unknown bits when the
+    // supported one is set.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x100 | 0x200, b"/"),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64),
+        "AT_SYMLINK_NOFOLLOW | unknown bit must still reject (no silent masking)",
+    );
+}
