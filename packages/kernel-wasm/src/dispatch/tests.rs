@@ -14139,8 +14139,9 @@ fn event_loop_methods_return_enosys_until_slice_lands() {
     // Pass empty request/response. The handler doesn't matter (it's
     // -ENOSYS), but an empty buffer pair confirms we hit the dedicated
     // arm and not some accidental fast-path that decodes bytes first.
+    // METHOD_SYS_EVENTFD removed from this list once S1 landed; the
+    // remaining methods stay -ENOSYS until their owning slice ships.
     for &method in &[
-        METHOD_SYS_EVENTFD,
         METHOD_SYS_TIMERFD_CREATE,
         METHOD_SYS_TIMERFD_SETTIME,
         METHOD_SYS_TIMERFD_GETTIME,
@@ -14153,7 +14154,182 @@ fn event_loop_methods_return_enosys_until_slice_lands() {
         assert_eq!(
             dispatch(method, 1, &[], &mut []),
             enosys,
-            "method 0x{method:x} must -ENOSYS until its S1..S4 handler lands"
+            "method 0x{method:x} must -ENOSYS until its S2..S5 handler lands"
         );
     }
+}
+
+// ── #92 S1: eventfd ─────────────────────────────────────────────────
+
+// METHOD_SYS_READ / WRITE / CLOSE are generated from the toml by
+// build.rs and reachable via `use super::*` at the top of this module.
+
+fn eventfd_req(initval: u64, flags: u32) -> Vec<u8> {
+    let mut req = Vec::with_capacity(12);
+    req.extend_from_slice(&(initval as u32).to_le_bytes());
+    req.extend_from_slice(&((initval >> 32) as u32).to_le_bytes());
+    req.extend_from_slice(&flags.to_le_bytes());
+    req
+}
+
+#[test]
+fn eventfd_open_returns_fd_with_initval_seeded() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(METHOD_SYS_EVENTFD, 1, &eventfd_req(7, 0), &mut []);
+    assert!(fd >= 3, "expected a fresh fd, got {fd}");
+    // Read drains: should yield the seed value.
+    let mut out = [0u8; 8];
+    let read_req = (fd as u32).to_le_bytes().to_vec();
+    let n = dispatch(METHOD_SYS_READ, 1, &read_req, &mut out);
+    assert_eq!(n, 8);
+    assert_eq!(u64::from_le_bytes(out), 7);
+}
+
+#[test]
+fn eventfd_read_then_read_again_blocks_with_eagain() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_EVENTFD,
+        1,
+        &eventfd_req(1, 0x800 /* NONBLOCK */),
+        &mut [],
+    );
+    let mut out = [0u8; 8];
+    let read_req = (fd as u32).to_le_bytes().to_vec();
+    assert_eq!(dispatch(METHOD_SYS_READ, 1, &read_req, &mut out), 8);
+    // Second read: counter is empty, NONBLOCK → -EAGAIN.
+    assert_eq!(
+        dispatch(METHOD_SYS_READ, 1, &read_req, &mut out),
+        -(abi::EAGAIN as i64)
+    );
+}
+
+#[test]
+fn eventfd_write_adds_to_counter() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(METHOD_SYS_EVENTFD, 1, &eventfd_req(0, 0), &mut []);
+    let mut write_req = (fd as u32).to_le_bytes().to_vec();
+    write_req.extend_from_slice(&5u64.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []), 8);
+    write_req[4..].copy_from_slice(&3u64.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []), 8);
+
+    let mut out = [0u8; 8];
+    let read_req = (fd as u32).to_le_bytes().to_vec();
+    assert_eq!(dispatch(METHOD_SYS_READ, 1, &read_req, &mut out), 8);
+    assert_eq!(u64::from_le_bytes(out), 8, "counter must sum writes");
+}
+
+#[test]
+fn eventfd_semaphore_mode_decrements_by_one() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_EVENTFD,
+        1,
+        &eventfd_req(3, 0x1 /* SEMAPHORE */),
+        &mut [],
+    );
+    let mut out = [0u8; 8];
+    let read_req = (fd as u32).to_le_bytes().to_vec();
+    for _ in 0..3 {
+        assert_eq!(dispatch(METHOD_SYS_READ, 1, &read_req, &mut out), 8);
+        assert_eq!(
+            u64::from_le_bytes(out),
+            1,
+            "semaphore mode returns 1 per read"
+        );
+    }
+    // 4th read: counter drained, should -EAGAIN.
+    assert_eq!(
+        dispatch(METHOD_SYS_READ, 1, &read_req, &mut out),
+        -(abi::EAGAIN as i64)
+    );
+}
+
+#[test]
+fn eventfd_write_overflow_returns_eagain() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_EVENTFD,
+        1,
+        &eventfd_req(u64::MAX - 2, 0x800 /* NONBLOCK */),
+        &mut [],
+    );
+    // Counter is u64::MAX - 2; max permitted is u64::MAX - 1.
+    // Writing 1 sums to u64::MAX - 1 (allowed).
+    let mut write_req = (fd as u32).to_le_bytes().to_vec();
+    write_req.extend_from_slice(&1u64.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []), 8);
+    // Writing 1 more would push past the cap → -EAGAIN.
+    write_req[4..].copy_from_slice(&1u64.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []),
+        -(abi::EAGAIN as i64)
+    );
+}
+
+#[test]
+fn eventfd_write_max_value_is_rejected() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(METHOD_SYS_EVENTFD, 1, &eventfd_req(0, 0), &mut []);
+    let mut write_req = (fd as u32).to_le_bytes().to_vec();
+    // u64::MAX as the written value is itself forbidden by Linux semantics.
+    write_req.extend_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn eventfd_open_rejects_unknown_flag_bits() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // 0x4 is not EFD_SEMAPHORE / NONBLOCK / CLOEXEC.
+    assert_eq!(
+        dispatch(METHOD_SYS_EVENTFD, 1, &eventfd_req(0, 0x4), &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn eventfd_poll_reflects_counter_state() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(METHOD_SYS_EVENTFD, 1, &eventfd_req(0, 0), &mut []);
+
+    // poll request: [u32 nfds][pollfd*]; pollfd = i32 fd + i16 events + i16 revents.
+    // Response is the records section only (no leading nfds), so revents
+    // for fd[0] lives at offset 6.
+    let mut poll_req = Vec::new();
+    poll_req.extend_from_slice(&1u32.to_le_bytes());
+    poll_req.extend_from_slice(&(fd as i32).to_le_bytes());
+    poll_req.extend_from_slice(&(POLLIN | POLLOUT).to_le_bytes());
+    poll_req.extend_from_slice(&0i16.to_le_bytes());
+    let mut poll_out = vec![0u8; 8];
+    let ready = dispatch(METHOD_SYS_POLL, 1, &poll_req, &mut poll_out);
+    assert_eq!(ready, 1, "writable when counter < max");
+    let revents = i16::from_le_bytes(poll_out[6..8].try_into().unwrap());
+    assert_eq!(revents & POLLOUT, POLLOUT, "writable when counter < max");
+    assert_eq!(revents & POLLIN, 0, "not readable when counter == 0");
+
+    // After a write: readable too.
+    let mut write_req = (fd as u32).to_le_bytes().to_vec();
+    write_req.extend_from_slice(&1u64.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_WRITE, 1, &write_req, &mut []), 8);
+    let mut poll_out2 = vec![0u8; 8];
+    let ready = dispatch(METHOD_SYS_POLL, 1, &poll_req, &mut poll_out2);
+    assert_eq!(ready, 1);
+    let revents = i16::from_le_bytes(poll_out2[6..8].try_into().unwrap());
+    assert_eq!(revents & POLLIN, POLLIN, "POLLIN once counter > 0");
+    assert_eq!(revents & POLLOUT, POLLOUT, "still writable");
+}
+
+#[test]
+fn eventfd_close_releases_counter_state() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(METHOD_SYS_EVENTFD, 1, &eventfd_req(0, 0), &mut []);
+    let close_req = (fd as u32).to_le_bytes().to_vec();
+    assert_eq!(dispatch(METHOD_SYS_CLOSE, 1, &close_req, &mut []), 0);
+    // Registry should be empty post-close (single ref).
+    let live = crate::kernel::with_kernel(|k| k.eventfd_get(1).is_some());
+    assert!(!live, "eventfd entry must be freed on last close");
 }

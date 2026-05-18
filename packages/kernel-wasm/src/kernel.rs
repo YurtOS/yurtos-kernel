@@ -173,6 +173,13 @@ pub enum FdEntry {
     Socket {
         id: u64,
     },
+    /// Linux `eventfd(2)` — 64-bit counter exposed as a single fd kind.
+    /// `id` references an [`EventFdEntry`] in `Kernel::eventfds`; the
+    /// entry owns the counter and refcount so `dup()`/`fork()` share
+    /// one counter across multiple fds. Issue #92 slice S1.
+    EventFd {
+        id: u64,
+    },
 }
 
 /// Per-pid file-descriptor table. Sparse — closed fds are absent.
@@ -654,6 +661,20 @@ pub struct PeerCred {
     pub gid: u32,
 }
 
+/// `eventfd(2)` state — a single 64-bit counter plus the open flags
+/// (currently `EFD_NONBLOCK` and `EFD_SEMAPHORE` are observed at
+/// read-time; `EFD_CLOEXEC` is honored by the existing close-on-exec
+/// path via the descriptor flag bit, not stored here). `refs` tracks
+/// how many [`FdEntry::EventFd`] entries point at this counter so
+/// `dup()`/`fork()` keep the counter alive until the last fd closes.
+/// Issue #92 slice S1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventFdEntry {
+    pub counter: u64,
+    pub flags: u32,
+    pub refs: u32,
+}
+
 pub struct SocketEntry {
     pub refs: u32,
     pub domain: u8,
@@ -673,6 +694,11 @@ pub struct Kernel {
     next_ofd_id: u64,
     sockets: BTreeMap<u64, SocketEntry>,
     next_socket_id: u64,
+    /// `eventfd(2)` registry. Each [`FdEntry::EventFd`] references an
+    /// entry here by id (lets `dup()` share the counter across fds).
+    /// Issue #92 slice S1.
+    eventfds: BTreeMap<u64, EventFdEntry>,
+    next_eventfd_id: u64,
     unix_listeners: BTreeMap<Vec<u8>, u64>,
     unix_datagrams: BTreeMap<Vec<u8>, u64>,
     unix_socket_inodes: BTreeSet<Vec<u8>>,
@@ -786,6 +812,8 @@ impl Kernel {
             next_ofd_id: 1,
             sockets: BTreeMap::new(),
             next_socket_id: 1,
+            eventfds: BTreeMap::new(),
+            next_eventfd_id: 1,
             unix_listeners: BTreeMap::new(),
             unix_datagrams: BTreeMap::new(),
             unix_socket_inodes: BTreeSet::new(),
@@ -1479,6 +1507,7 @@ impl Kernel {
             }
             FdEntry::File { ofd_id } => self.ofd_inc_ref(*ofd_id),
             FdEntry::Socket { id } => self.socket_inc_ref(*id),
+            FdEntry::EventFd { id } => self.eventfd_inc_ref(*id),
             FdEntry::Directory { .. } | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => {}
         }
     }
@@ -2047,6 +2076,57 @@ impl Kernel {
         }
     }
 
+    /// Allocate a fresh `eventfd(2)` entry with the given initial
+    /// counter and flags. `refs` starts at 1 — the caller is expected
+    /// to install exactly one [`FdEntry::EventFd`] for this id. Issue
+    /// #92 slice S1.
+    pub fn create_eventfd(&mut self, initval: u64, flags: u32) -> u64 {
+        let id = self.next_eventfd_id;
+        self.next_eventfd_id += 1;
+        self.eventfds.insert(
+            id,
+            EventFdEntry {
+                counter: initval,
+                flags,
+                refs: 1,
+            },
+        );
+        id
+    }
+
+    pub fn eventfd_get_mut(&mut self, id: u64) -> Option<&mut EventFdEntry> {
+        self.eventfds.get_mut(&id)
+    }
+
+    pub fn eventfd_get(&self, id: u64) -> Option<&EventFdEntry> {
+        self.eventfds.get(&id)
+    }
+
+    /// Bump the refcount on `eventfd` id `id` (used by `dup()`/`fork()`
+    /// to share one counter across multiple fds).
+    pub fn eventfd_inc_ref(&mut self, id: u64) {
+        if let Some(e) = self.eventfds.get_mut(&id) {
+            e.refs = e.refs.saturating_add(1);
+        }
+    }
+
+    /// Decrement the refcount on `eventfd` id `id`. Frees the entry
+    /// when the last fd closes. No host-side close — `eventfd` state
+    /// lives entirely inside the kernel.
+    pub fn eventfd_dec_ref(&mut self, id: u64) {
+        let drop = self
+            .eventfds
+            .get_mut(&id)
+            .map(|e| {
+                e.refs = e.refs.saturating_sub(1);
+                e.refs == 0
+            })
+            .unwrap_or(false);
+        if drop {
+            self.eventfds.remove(&id);
+        }
+    }
+
     fn dec_fd_entry_ref(&mut self, entry: &FdEntry) {
         match entry {
             FdEntry::Pipe { id, end } => self.pipe_dec_ref(*id, *end),
@@ -2062,6 +2142,7 @@ impl Kernel {
                     crate::kh::socket_close(handle);
                 }
             }
+            FdEntry::EventFd { id } => self.eventfd_dec_ref(*id),
             FdEntry::Directory { .. } | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => {}
         }
     }
@@ -2209,6 +2290,8 @@ pub fn reset_for_tests() {
     k.next_ofd_id = 1;
     k.sockets.clear();
     k.next_socket_id = 1;
+    k.eventfds.clear();
+    k.next_eventfd_id = 1;
     k.socket_shutdown.clear();
     k.unix_listeners.clear();
     k.unix_datagrams.clear();
