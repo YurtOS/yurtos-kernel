@@ -309,7 +309,11 @@ describe("loadSideModule (real wasm-ld --shared fixture)", () => {
       // Build a minimal main-module surrogate that exports the wasi-libc
       // internals the side module imports as `env.*`. In the real loader
       // these come from the main module's instance.exports.
-      const mainMemory = new WebAssembly.Memory({ initial: 2 });
+      const mainMemory = new WebAssembly.Memory({
+        initial: 2,
+        maximum: 65536,
+        shared: true,
+      });
       const mainTable = new WebAssembly.Table({
         element: "anyfunc",
         initial: 0,
@@ -370,7 +374,11 @@ describe("loadSideModule (real wasm-ld --shared fixture)", () => {
     "double-dlopen returns same handle and refcount keeps it alive",
     () => {
       const sideBytes = readFileSync(FIXTURE_PATH);
-      const mainMemory = new WebAssembly.Memory({ initial: 2 });
+      const mainMemory = new WebAssembly.Memory({
+        initial: 2,
+        maximum: 65536,
+        shared: true,
+      });
       const mainTable = new WebAssembly.Table({
         element: "anyfunc",
         initial: 0,

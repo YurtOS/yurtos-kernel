@@ -10,6 +10,7 @@
 #[link(wasm_import_module = "kh")]
 extern "C" {
     fn kh_now_realtime(out_ptr: *mut u64) -> i32;
+    fn kh_now_monotonic(out_ptr: *mut u64) -> i32;
     fn kh_random(out_ptr: *mut u8, len: usize) -> i32;
     fn kh_extension_invoke(
         req_ptr: *const u8,
@@ -105,7 +106,31 @@ unsafe fn kh_now_realtime(out_ptr: *mut u64) -> i32 {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+unsafe fn kh_now_monotonic(out_ptr: *mut u64) -> i32 {
+    // Strictly-increasing per-call counter so monotonicity assertions
+    // are deterministic and don't depend on the host's wall clock. Real
+    // wasmtime / JS hosts back this with Instant::now() / performance.now().
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(1_000);
+    *out_ptr = CTR.fetch_add(1, Ordering::Relaxed);
+    0
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 unsafe fn kh_random(out_ptr: *mut u8, len: usize) -> i32 {
+    #[cfg(test)]
+    if let Some(result) = test_support::pop_random_result() {
+        return match result {
+            Ok(()) => {
+                if len > 0 {
+                    std::slice::from_raw_parts_mut(out_ptr, len).fill(0xA5);
+                }
+                0
+            }
+            Err(rc) => rc,
+        };
+    }
+
     // Native unit-test entropy: real OS CSPRNG via /dev/urandom (std-only,
     // no extra crate dep) so distinctness assertions are meaningful. The
     // wasm hosts supply their own platform CSPRNG (runtime-wasmtime uses
@@ -475,6 +500,22 @@ pub fn now_realtime_ns() -> Result<u64, i32> {
     }
 }
 
+/// Monotonically non-decreasing time in nanoseconds from an
+/// unspecified origin. Unaffected by wall-clock adjustments
+/// (NTP steps, settimeofday, DST), so suitable for elapsed-time
+/// math (timeouts, asyncio event-loop timers, perf_counter deltas).
+/// Backed by the host's monotonic clock: Instant::now() on
+/// native/wasmtime, performance.now() in browsers / Deno.
+pub fn now_monotonic_ns() -> Result<u64, i32> {
+    let mut out: u64 = 0;
+    let rc = unsafe { kh_now_monotonic(&mut out as *mut u64) };
+    if rc == 0 {
+        Ok(out)
+    } else {
+        Err(rc)
+    }
+}
+
 /// Fill `buf` with cryptographically secure random bytes from the host.
 ///
 /// The single entropy entry point: `DevBackend` (`/dev/urandom`,
@@ -630,8 +671,25 @@ pub fn socket_peer_addr(handle: i32, out: &mut [u8]) -> i64 {
 
 #[cfg(test)]
 pub mod test_support {
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::{LazyLock, Mutex};
+
+    thread_local! {
+        static RANDOM_RESULTS: RefCell<VecDeque<Result<(), i32>>> = const { RefCell::new(VecDeque::new()) };
+    }
+
+    pub fn push_random_result(result: Result<(), i32>) {
+        RANDOM_RESULTS.with(|results| results.borrow_mut().push_back(result));
+    }
+
+    pub(super) fn pop_random_result() -> Option<Result<(), i32>> {
+        RANDOM_RESULTS.with(|results| results.borrow_mut().pop_front())
+    }
+
+    pub fn clear_random_results() {
+        RANDOM_RESULTS.with(|results| results.borrow_mut().clear());
+    }
 
     #[derive(Default)]
     struct SocketMock {
@@ -1119,5 +1177,24 @@ mod tests {
     #[test]
     fn fill_random_empty_is_ok() {
         fill_random(&mut []).expect("empty fill is a no-op success");
+    }
+
+    #[test]
+    fn fill_random_preserves_host_errno() {
+        test_support::push_random_result(Err(-crate::abi::EFAULT));
+
+        let mut buf = [0u8; 8];
+
+        assert_eq!(fill_random(&mut buf), Err(-crate::abi::EFAULT));
+    }
+
+    #[test]
+    fn test_guard_clears_stale_random_results() {
+        test_support::push_random_result(Err(-crate::abi::EFAULT));
+        let _g = crate::kernel::TestGuard::acquire();
+
+        let mut buf = [0u8; 8];
+
+        fill_random(&mut buf).expect("stale injected error was cleared");
     }
 }

@@ -126,7 +126,16 @@ impl<'a, 'b> HostCallCtx<UserState> for WasmtimeCtx<'a, 'b> {
                 response: Vec::new(),
             };
         }
-        let to_copy = (rc as u32).min(out_cap) as usize;
+        // Copy back the full requested response window, not `min(rc,
+        // out_cap)`. `rc` is the POSIX syscall scalar (e.g. recvfrom/recvmsg
+        // return the data-byte count), but those syscalls place out-params
+        // (source address, SCM_RIGHTS fd count + fd array) at fixed offsets
+        // that are >= rc. Truncating to rc dropped them entirely. Callers
+        // that follow the "rc == bytes written" convention clamp their
+        // user-visible copy to rc themselves (see
+        // forward_request_with_user_response / forward_response_to_user), so
+        // widening here does not surface stale scratch to the guest.
+        let to_copy = out_cap as usize;
         let mut response = vec![0u8; to_copy];
         if to_copy > 0
             && memory

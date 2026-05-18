@@ -226,6 +226,13 @@ export const METHOD = {
   SYS_SCHED_SETAFFINITY: 0x1_005D,
   SYS_FCHOWN: 0x1_005E,
   SYS_FCHDIR: 0x1_005F,
+  // Durability surface (issue #88) — ramfs-noop in the kernel; WASI
+  // fd_sync / fd_datasync route here so sqlite and atomic-save get
+  // success instead of ENOSYS.
+  SYS_FSYNC: 0x1_00A6,
+  SYS_FDATASYNC: 0x1_00A7,
+  SYS_SYNC: 0x1_00A8,
+  SYS_SYNCFS: 0x1_00A9,
 } as const;
 
 export const KERNEL_PID = 0;
@@ -316,6 +323,8 @@ export interface PolicyEnforcer {
   mayLog?(severity: number, message: string): PolicyDecision;
   /** Gate kh_now_realtime. */
   mayGetRealtime?(): PolicyDecision;
+  /** Gate kh_now_monotonic (issue #64). Defaults to Allow; denying breaks event-loop timers. */
+  mayGetMonotonic?(): PolicyDecision;
   /** Gate kh_fetch_blocking. `request` is yurt_fetch_request_v1. */
   mayFetch?(request: Uint8Array): PolicyDecision;
   /** Gate kh_idb_*. `write` distinguishes mutating ops. */
@@ -1212,6 +1221,7 @@ export const denyAllPolicy: PolicyEnforcer = {
   mayListen: () => "deny",
   mayLog: () => "deny",
   mayGetRealtime: () => "deny",
+  mayGetMonotonic: () => "deny",
 };
 
 export function defaultHostState(): HostState {
@@ -2232,6 +2242,25 @@ export class KernelHostInterface {
         new DataView(memoryRef.memory!.buffer).setBigUint64(
           outPtr,
           hostBox.state.nowRealtimeNs,
+          true,
+        );
+        return 0;
+      },
+      kh_now_monotonic: (outPtr: number): number => {
+        // Compute at call time so a default-initialized HostState
+        // never returns a frozen 0. performance.now() is already
+        // monotonic-from-some-origin in milliseconds (with sub-ms
+        // precision on most runtimes); scale to ns and floor to
+        // bigint. Available in Deno, Node, and browsers. Issue #64.
+        if (
+          hostBox.state.policy.mayGetMonotonic?.() === "deny"
+        ) {
+          return -EACCES;
+        }
+        const nowNs = BigInt(Math.floor(performance.now() * 1_000_000));
+        new DataView(memoryRef.memory!.buffer).setBigUint64(
+          outPtr,
+          nowNs,
           true,
         );
         return 0;

@@ -32,8 +32,15 @@ args = [
   { name = "out_ptr", type = "ptr" },
 ]
 
+[import.kh_now_monotonic]
+doc = "Monotonically non-decreasing time in nanoseconds from an unspecified origin, written to *out_ptr (u64). Unaffected by wall-clock adjustments (NTP steps, settimeofday, DST) — the kernel uses it to serve clock_gettime(CLOCK_MONOTONIC) so elapsed-time math (timeouts, asyncio timers, perf_counter deltas) stays consistent. Hosts back this with Instant::now() (wasmtime / native) or performance.now() (browser / Deno). Policy gate: PolicyEnforcer::may_get_monotonic (defaults to Allow); Deny surfaces as -EACCES to the kernel. Issue #64."
+return = "scalar"
+args = [
+  { name = "out_ptr", type = "ptr" },
+]
+
 [import.kh_random]
-doc = "Fill (out_ptr, len) with cryptographically secure random bytes from the host platform CSPRNG. Returns 0 on success or a negated errno (-EIO) on failure. Callers cap len at MAX_GUEST_BUFFER_LEN before invoking. Ungated (entropy is not privacy-sensitive)."
+doc = "Fill (out_ptr, len) with cryptographically secure random bytes from the host platform CSPRNG. Returns 0 on success or a negated errno (-EIO for entropy source failure, -EFAULT for bad guest memory) on failure. Callers cap len at MAX_GUEST_BUFFER_LEN before invoking. Ungated (entropy is not privacy-sensitive)."
 return = "scalar"
 args = [
   { name = "out_ptr", type = "ptr" },

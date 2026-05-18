@@ -4,7 +4,12 @@ import { readString } from "../common.ts";
 import { VFS } from "../../vfs/vfs.ts";
 import { OverlayVFS } from "../../vfs/overlay-vfs.ts";
 import { MemoryRoot } from "../../vfs/__tests__/helpers.ts";
-import { ProcessKernel } from "../../process/kernel.ts";
+import {
+  POSIX_EINVAL,
+  POSIX_EMFILE,
+  ProcessKernel,
+  RLIMIT_NOFILE,
+} from "../../process/kernel.ts";
 import { FdTable } from "../../vfs/fd-table.ts";
 import {
   createTtySlaveTarget,
@@ -606,6 +611,17 @@ Deno.test("kernel host_get_local_addr reports configured sandbox address", () =>
   assertEquals(readString(memory, 4096, written), "10.8.0.42");
 });
 
+// host_dns_resolve writes a yurt_dns_addr_result_v1 record: 4-byte family
+// (AF_INET = 2) followed by 4 bytes of IPv4 address in network order.
+function readDnsAddrResult(memory: WebAssembly.Memory, ptr: number): string {
+  const view = new DataView(memory.buffer, ptr, 8);
+  const family = view.getUint32(0, true);
+  if (family !== 2) throw new Error(`unexpected dns family ${family}`);
+  return `${view.getUint8(4)}.${view.getUint8(5)}.${view.getUint8(6)}.${
+    view.getUint8(7)
+  }`;
+}
+
 Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local address locally", async () => {
   const memory = new WebAssembly.Memory({ initial: 1 });
   const imports = createKernelImports({ memory, socketLocalHost: "10.8.0.42" });
@@ -618,7 +634,8 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
       4096,
       1024,
     );
-  assertEquals(readString(memory, 4096, written), "127.0.0.1");
+  assertEquals(written, 8);
+  assertEquals(readDnsAddrResult(memory, 4096), "127.0.0.1");
 
   hostLen = writeString(memory, 0, "10.8.0.42");
   written =
@@ -628,7 +645,8 @@ Deno.test("kernel host_dns_resolve resolves loopback and the sandbox local addre
       4096,
       1024,
     );
-  assertEquals(readString(memory, 4096, written), "10.8.0.42");
+  assertEquals(written, 8);
+  assertEquals(readDnsAddrResult(memory, 4096), "10.8.0.42");
 });
 
 Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for socket-backed guests", async () => {
@@ -652,7 +670,8 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
       4096,
       1024,
     );
-  const first = readString(memory, 4096, firstLen);
+  assertEquals(firstLen, 8);
+  const first = readDnsAddrResult(memory, 4096);
   const secondLen =
     await (imports.host_dns_resolve as (...args: number[]) => Promise<number>)(
       0,
@@ -660,7 +679,8 @@ Deno.test("kernel host_dns_resolve produces stable synthetic IPv4 names for sock
       8192,
       1024,
     );
-  const second = readString(memory, 8192, secondLen);
+  assertEquals(secondLen, 8);
+  const second = readDnsAddrResult(memory, 8192);
 
   assertEquals(first.startsWith("10.0.2."), true);
   assertEquals(second, first);
@@ -1960,6 +1980,73 @@ Deno.test("host_dup_min keeps the kernel and WasiHost fd tables in sync", () => 
   assertEquals(srcTarget.refs, 1);
   assertEquals(kernel.closeFd(pid, fd), true);
   assertEquals(fdTable.isOpen(10), true);
+});
+
+// Shared scaffolding for the host_dup_min WasiHost-branch errno tests.
+// The src fd is a WasiHost-local descriptor (never registered via
+// kernel.setFdTarget), so host_dup_min routes through
+// WasiHost.duplicateFdMin rather than the kernel branch.
+function setupWasiHostDupMin(): {
+  kernel: ProcessKernel;
+  pid: number;
+  srcFd: number;
+  callHostDupMin: (srcFd: number, minFd: number) => number;
+} {
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  const vfs = new VFS();
+  vfs.writeFile("/tmp/script.sh", new TextEncoder().encode("echo ok\n"));
+  const kernel = new ProcessKernel();
+  const pid = kernel.allocPid(1, "guest");
+  const wasiHost = new WasiHost({
+    vfs,
+    args: [],
+    env: {},
+    preopens: {},
+    kernel,
+    pid,
+  });
+  const fdTable = (wasiHost as unknown as { fdTable: FdTable }).fdTable;
+  const srcFd = fdTable.open("/tmp/script.sh", "r");
+  const imports = createKernelImports({
+    memory,
+    kernel,
+    callerPid: pid,
+    wasiHost,
+  });
+  const callHostDupMin = (s: number, minFd: number) =>
+    (imports.host_dup_min as (...args: number[]) => number)(s, minFd);
+  return { kernel, pid, srcFd, callHostDupMin };
+}
+
+Deno.test("host_dup_min propagates a WasiHost-branch FdDupMinError as -EMFILE", () => {
+  const { kernel, pid, srcFd, callHostDupMin } = setupWasiHostDupMin();
+  // A soft RLIMIT_NOFILE of srcFd + 1 leaves no allocatable fd above the
+  // source: the lowest free fd (srcFd + 1) sits exactly at the limit, so
+  // duplicateFdMin throws FdDupMinError(EMFILE) which host_dup_min must
+  // surface as -EMFILE rather than the generic -1.
+  assertEquals(
+    kernel.setResourceLimit(pid, RLIMIT_NOFILE, srcFd + 1, 1024),
+    "ok",
+  );
+
+  assertEquals(callHostDupMin(srcFd, srcFd), -POSIX_EMFILE);
+});
+
+Deno.test("host_dup_min propagates a WasiHost-branch FdDupMinError as -EINVAL", () => {
+  const { kernel, pid, srcFd, callHostDupMin } = setupWasiHostDupMin();
+  // Any limit strictly above srcFd works; +4 is arbitrary headroom so
+  // the source fd itself is comfortably in range and only the
+  // out-of-range minFd (== softLimit) trips EINVAL.
+  const softLimit = srcFd + 4;
+  assertEquals(
+    kernel.setResourceLimit(pid, RLIMIT_NOFILE, softLimit, 1024),
+    "ok",
+  );
+
+  // minFd == soft RLIMIT_NOFILE is out of range. This EINVAL originates
+  // inside duplicateFdMin's limit check, distinct from the host_dup_min
+  // minFd < 0 pre-check, exercising the throw -> catch -> -errno path.
+  assertEquals(callHostDupMin(srcFd, softLimit), -POSIX_EINVAL);
 });
 
 Deno.test("kernel /proc fd listing includes close-on-exec descriptors", () => {

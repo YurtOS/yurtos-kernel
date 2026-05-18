@@ -727,6 +727,44 @@ describe("buildWasmKernelImports (Phase 7.2 macro)", () => {
     expect(result.getInt32(12, true)).toEqual(0);
   });
 
+  it("host_wait keeps status 128 as a normal exit", async () => {
+    const kernelWait = new Uint8Array(8);
+    const kernelView = new DataView(kernelWait.buffer);
+    kernelView.setUint32(0, 42, true);
+    kernelView.setInt32(4, 128, true);
+    const { mk } = capturingMk(8, kernelWait);
+    const memory = new ArrayBuffer(64);
+    const imports = buildWasmKernelImports(mk, () => memory);
+
+    const rc = await imports.host_wait(0, 0, 16, 16);
+
+    expect(rc).toEqual(16);
+    const result = new DataView(memory, 16, 16);
+    expect(result.getInt32(0, true)).toEqual(42);
+    expect(result.getInt32(4, true)).toEqual(128);
+    expect(result.getInt32(8, true)).toEqual(0);
+    expect(result.getInt32(12, true)).toEqual(0);
+  });
+
+  it("host_wait reports SIGRTMAX death at status 192 as a wait signal", async () => {
+    const kernelWait = new Uint8Array(8);
+    const kernelView = new DataView(kernelWait.buffer);
+    kernelView.setUint32(0, 42, true);
+    kernelView.setInt32(4, 128 + 64, true);
+    const { mk } = capturingMk(8, kernelWait);
+    const memory = new ArrayBuffer(64);
+    const imports = buildWasmKernelImports(mk, () => memory);
+
+    const rc = await imports.host_wait(0, 0, 16, 16);
+
+    expect(rc).toEqual(16);
+    const result = new DataView(memory, 16, 16);
+    expect(result.getInt32(0, true)).toEqual(42);
+    expect(result.getInt32(4, true)).toEqual(0);
+    expect(result.getInt32(8, true)).toEqual(64);
+    expect(result.getInt32(12, true)).toEqual(0);
+  });
+
   it("ptr_len arg: host_chdir reads bytes from user memory", async () => {
     if (!HAS_JSPI) return;
     const mk = await freshMk();

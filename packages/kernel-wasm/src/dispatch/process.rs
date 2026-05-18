@@ -71,6 +71,88 @@ const PRIO_PROCESS: u32 = 0;
 const NICE_MIN: i32 = -20;
 const NICE_MAX: i32 = 19;
 const SCHED_OTHER: i32 = 0;
+const SIGCONT: u32 = 18;
+
+/// POSIX/Linux permission to send `sig` to `target`. `caller_pid` is
+/// the **host-authenticated** authority; `target` comes from
+/// untrusted request bytes and must never be the basis of the
+/// decision. Permitted iff: same process, caller is privileged
+/// (euid 0), the caller's real or effective uid matches the target's
+/// real or saved-set uid, or `SIGCONT` within the same session.
+/// `-ESRCH` if the target does not exist, `-EPERM` if not permitted.
+fn may_signal(
+    k: &mut crate::kernel::Kernel,
+    caller_pid: u32,
+    target: u32,
+    sig: u32,
+) -> Result<(), i64> {
+    if caller_pid == target {
+        return Ok(());
+    }
+    let (c_uid, c_euid, c_sid) = {
+        let c = k.process_mut(caller_pid);
+        (c.credentials.uid, c.credentials.euid, c.sid)
+    };
+    let Some(t) = k.process_existing(target) else {
+        return Err(-(abi::ESRCH as i64));
+    };
+    let (t_uid, t_suid, t_sid) = (t.credentials.uid, t.credentials.suid, t.sid);
+    if c_euid == 0
+        || c_euid == t_uid
+        || c_euid == t_suid
+        || c_uid == t_uid
+        || c_uid == t_suid
+        || (sig == SIGCONT && c_sid != 0 && c_sid == t_sid)
+    {
+        Ok(())
+    } else {
+        Err(-(abi::EPERM as i64))
+    }
+}
+
+/// Ownership gate for non-signal cross-process control and inspection
+/// (`sched_*`, cross-pid `getpriority`). Mirrors the existing
+/// `setpriority` euid check: self, privileged (euid 0), or the
+/// caller's euid matches the target's real or effective uid.
+/// `-ESRCH` if the target does not exist, `-EPERM` if not permitted.
+fn may_control_pid(k: &mut crate::kernel::Kernel, caller_pid: u32, target: u32) -> Result<(), i64> {
+    if caller_pid == target {
+        return Ok(());
+    }
+    let c_euid = k.process_mut(caller_pid).credentials.euid;
+    if c_euid == 0 {
+        return Ok(());
+    }
+    let Some(t) = k.process_existing(target) else {
+        return Err(-(abi::ESRCH as i64));
+    };
+    if c_euid == t.credentials.uid || c_euid == t.credentials.euid {
+        Ok(())
+    } else {
+        Err(-(abi::EPERM as i64))
+    }
+}
+
+/// `/proc/<pid>` visibility predicate for the #105 / M8 oracle fix.
+///
+/// Thin, in-crate consumer of #66's `may_control_pid` ownership gate
+/// (do NOT alter that gate — it is #77's). `Ok(())` from
+/// `may_control_pid` means the caller may see `target` (self,
+/// same-owner, or root); any `Err` (`-EPERM` unauthorized, `-ESRCH`
+/// absent) means the pid must be *invisible*. The dispatch/fs layer
+/// uses this to (a) collapse "present-but-unauthorized" and "absent"
+/// into a single `-ENOENT` on `/proc/<pid>` lookups and (b) filter
+/// `readdir("/proc")` to only the pids the caller may enumerate.
+///
+/// No ABI change: this is a pure in-crate predicate over the existing
+/// process table and #66 credential model.
+pub(crate) fn proc_pid_visible(
+    k: &mut crate::kernel::Kernel,
+    caller_pid: u32,
+    target: u32,
+) -> bool {
+    may_control_pid(k, caller_pid, target).is_ok()
+}
 
 fn normalize_nice(nice: i32) -> i32 {
     nice.clamp(NICE_MIN, NICE_MAX)
@@ -100,9 +182,13 @@ pub(super) fn getpriority(caller_pid: u32, request: &[u8]) -> i64 {
         if who == 0 || target == caller_pid {
             k.process_mut(target).nice as i64
         } else {
-            k.process_existing(target)
-                .map(|p| p.nice as i64)
-                .unwrap_or(-(abi::ESRCH as i64))
+            match may_control_pid(k, caller_pid, target) {
+                Ok(()) => k
+                    .process_existing(target)
+                    .map(|p| p.nice as i64)
+                    .unwrap_or(-(abi::ESRCH as i64)),
+                Err(rc) => rc,
+            }
         }
     })
 }
@@ -163,6 +249,9 @@ pub(super) fn sched_getscheduler(caller_pid: u32, request: &[u8]) -> i64 {
     if !scheduler_target_exists(caller_pid, target) {
         return -(abi::ESRCH as i64);
     }
+    if let Err(rc) = with_kernel(|k| may_control_pid(k, caller_pid, target)) {
+        return rc;
+    }
     with_kernel(|k| k.process_mut(target).scheduler_policy as i64)
 }
 
@@ -173,6 +262,9 @@ pub(super) fn sched_getparam(caller_pid: u32, request: &[u8]) -> i64 {
     let target = scheduler_target_pid(caller_pid, pid);
     if !scheduler_target_exists(caller_pid, target) {
         return -(abi::ESRCH as i64);
+    }
+    if let Err(rc) = with_kernel(|k| may_control_pid(k, caller_pid, target)) {
+        return rc;
     }
     with_kernel(|k| k.process_mut(target).scheduler_priority as i64)
 }
@@ -201,6 +293,9 @@ pub(super) fn sched_setscheduler(caller_pid: u32, request: &[u8]) -> i64 {
     if !scheduler_target_exists(caller_pid, target) {
         return -(abi::ESRCH as i64);
     }
+    if let Err(rc) = with_kernel(|k| may_control_pid(k, caller_pid, target)) {
+        return rc;
+    }
     if let Err(rc) = validate_scheduler(policy, priority) {
         return rc;
     }
@@ -223,6 +318,9 @@ pub(super) fn sched_setparam(caller_pid: u32, request: &[u8]) -> i64 {
     if !scheduler_target_exists(caller_pid, target) {
         return -(abi::ESRCH as i64);
     }
+    if let Err(rc) = with_kernel(|k| may_control_pid(k, caller_pid, target)) {
+        return rc;
+    }
     let policy = with_kernel(|k| k.process_mut(target).scheduler_policy);
     if let Err(rc) = validate_scheduler(policy, priority) {
         return rc;
@@ -240,6 +338,9 @@ pub(super) fn sched_getaffinity(caller_pid: u32, request: &[u8], response: &mut 
     let target = scheduler_target_pid(caller_pid, pid);
     if !scheduler_target_exists(caller_pid, target) {
         return -(abi::ESRCH as i64);
+    }
+    if let Err(rc) = with_kernel(|k| may_control_pid(k, caller_pid, target)) {
+        return rc;
     }
     if cpusetsize < 4 {
         return -(abi::EINVAL as i64);
@@ -260,6 +361,9 @@ pub(super) fn sched_setaffinity(caller_pid: u32, request: &[u8]) -> i64 {
     let target = scheduler_target_pid(caller_pid, pid);
     if !scheduler_target_exists(caller_pid, target) {
         return -(abi::ESRCH as i64);
+    }
+    if let Err(rc) = with_kernel(|k| may_control_pid(k, caller_pid, target)) {
+        return rc;
     }
     if cpusetsize < 4 {
         return -(abi::EINVAL as i64);
@@ -724,7 +828,7 @@ pub(super) fn setsid(caller_pid: u32) -> i64 {
 /// unwind from the AsyncBridge integration. sig==0 is the POSIX
 /// "is the pid alive?" probe.
 pub fn kill_pid(target: u32, sig: u32) -> i64 {
-    if sig > 63 {
+    if sig > 64 {
         return -(abi::EINVAL as i64);
     }
     if !with_kernel(|k| k.has_process(target)) {
@@ -754,11 +858,14 @@ pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
     let target = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
     let sig = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
     let value = i32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
-    if sig > 63 {
+    if sig > 64 {
         return -(abi::EINVAL as i64);
     }
-    if !with_kernel(|k| k.has_process(target)) {
-        return -(abi::ESRCH as i64);
+    // Authorize the host-authenticated caller against the untrusted
+    // target pid (POSIX uid/euid rules); also yields -ESRCH if the
+    // target does not exist.
+    if let Err(rc) = with_kernel(|k| may_signal(k, caller_pid, target, sig)) {
+        return rc;
     }
     if sig == 0 {
         // Existence probe only — POSIX performs error checking but
@@ -803,13 +910,13 @@ pub(super) fn sigwaitinfo(caller_pid: u32, request: &[u8], response: &mut [u8]) 
             return -(abi::ESRCH as i64);
         }
         let p = k.process_mut(caller_pid);
-        // The `1..=63` guard is defensive only: the sole producer
-        // (`sigqueue`) rejects signo>63 before push_back, so a stored
+        // The `1..=64` guard is defensive only: the sole producer
+        // (`sigqueue`) rejects signo>64 before push_back, so a stored
         // entry is always in range — it can never reject a real entry.
         let Some(idx) = p
             .pending_rt
             .iter()
-            .position(|s| (1..=63).contains(&s.signo) && (set & (1u64 << (s.signo - 1))) != 0)
+            .position(|s| (1..=64).contains(&s.signo) && (set & (1u64 << (s.signo - 1))) != 0)
         else {
             return -(abi::EAGAIN as i64);
         };
@@ -844,9 +951,9 @@ pub(super) fn sigpending(caller_pid: u32, response: &mut [u8]) -> i64 {
         // with bits other producers set for the same signo.
         let mut mask = p.pending_signals;
         for s in &p.pending_rt {
-            // Defensive only — `sigqueue` enforces signo in 1..=63 at
+            // Defensive only — `sigqueue` enforces signo in 1..=64 at
             // enqueue, so stored entries are always in range.
-            if (1..=63).contains(&s.signo) {
+            if (1..=64).contains(&s.signo) {
                 mask |= 1u64 << (s.signo - 1);
             }
         }
@@ -855,10 +962,19 @@ pub(super) fn sigpending(caller_pid: u32, response: &mut [u8]) -> i64 {
     })
 }
 
-pub(super) fn kill_request(request: &[u8]) -> i64 {
+pub(super) fn kill_request(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([target, sig]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
+    if sig > 64 {
+        return -(abi::EINVAL as i64);
+    }
+    // Authorize the host-authenticated caller against the untrusted
+    // target pid (POSIX uid/euid rules) before any state change.
+    // sig 0 is the existence probe but still requires send permission.
+    if let Err(rc) = with_kernel(|k| may_signal(k, caller_pid, target, sig)) {
+        return rc;
+    }
     kill_pid(target, sig)
 }
 
@@ -866,7 +982,7 @@ pub(super) fn killpg_request(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([pgid_arg, sig]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
-    if sig > 63 {
+    if sig > 64 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
@@ -879,10 +995,27 @@ pub(super) fn killpg_request(caller_pid: u32, request: &[u8]) -> i64 {
         } else {
             pgid_arg
         };
-        match k.kill_process_group(pgid, sig) {
-            Ok(()) => 0,
-            Err(errno) => -(errno as i64),
+        let members = k.process_group_member_pids(pgid);
+        if members.is_empty() {
+            return -(abi::ESRCH as i64);
         }
+        // POSIX kill(-pgid)/killpg: the permission check is per-member
+        // on the host-authenticated caller (NOT the guest pgid). The
+        // signal lands only on members the caller may signal; the call
+        // succeeds if at least one was permitted, else -EPERM.
+        let permitted: Vec<u32> = members
+            .into_iter()
+            .filter(|&member| may_signal(k, caller_pid, member, sig).is_ok())
+            .collect();
+        if permitted.is_empty() {
+            return -(abi::EPERM as i64);
+        }
+        if sig != 0 {
+            for member in permitted {
+                k.process_mut(member).pending_signals |= 1u64 << (sig - 1);
+            }
+        }
+        0
     })
 }
 
@@ -895,7 +1028,7 @@ pub(super) fn sigaction(caller_pid: u32, request: &[u8]) -> i64 {
     let Some([sig, disposition]) = read_u32_args::<2>(request) else {
         return -(abi::EINVAL as i64);
     };
-    if !(1..=63).contains(&sig) {
+    if !(1..=64).contains(&sig) {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
@@ -1134,6 +1267,7 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
     const WEXITED: u32 = 4;
     const WNOWAIT: u32 = 0x0100_0000;
     const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
 
     let Some([idtype, id, options]) = read_u32_args::<3>(request) else {
         return -(abi::EINVAL as i64);
@@ -1220,11 +1354,21 @@ pub(super) fn waitid(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i6
             // "fix" this asymmetry here without changing sys_wait too.
             k.process_mut(caller_pid).children.retain(|&c| c != pid);
         }
+        // Decode the kernel/host $?-style status: values 129..=192
+        // are "killed by signal (status - 128)" for signals 1..=64.
+        // Anything else is a normal exit with that code. CLD_DUMPED is
+        // not expressible — the 8-byte wait record carries no
+        // core-dump bit (tracked in the B1.2 follow-up).
+        let (si_code, si_status) = if (129..=192).contains(&status) {
+            (CLD_KILLED, status - 128)
+        } else {
+            (CLD_EXITED, status)
+        };
         response[0..4].copy_from_slice(&(SIGCHLD as i32).to_le_bytes());
-        response[4..8].copy_from_slice(&CLD_EXITED.to_le_bytes());
+        response[4..8].copy_from_slice(&si_code.to_le_bytes());
         response[8..12].copy_from_slice(&pid.to_le_bytes());
         response[12..16].copy_from_slice(&uid.to_le_bytes());
-        response[16..20].copy_from_slice(&status.to_le_bytes());
+        response[16..20].copy_from_slice(&si_status.to_le_bytes());
         20
     })
 }
@@ -1273,16 +1417,13 @@ pub(super) fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        // Read the image bytes from VFS.
-        let mut exec_path: Vec<u8> = path;
-        let mut hops = 0u32;
-        while let Some(target) = k.vfs.readlink(&exec_path) {
-            hops += 1;
-            if hops > 40 {
-                return -(abi::EINVAL as i64);
-            }
-            exec_path = target;
-        }
+        // Read the image bytes from VFS. Symlink target is loaded
+        // literally (no per-hop re-normalize) — exec semantic.
+        // Resolver returns positive i32; negate-and-widen at boundary.
+        let exec_path = match super::fs::follow_symlinks_literal(k, path) {
+            Ok(p) => p,
+            Err(errno) => return -(errno as i64),
+        };
         let Some((mount_id, inode)) = k.vfs.open(&exec_path, 0) else {
             return -(abi::ENOENT as i64);
         };

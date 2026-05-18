@@ -4,7 +4,10 @@
 //! is the boundary between them: it turns caller-provided path bytes
 //! into canonical absolute byte paths before VFS operations see them.
 
-use crate::{abi, kernel::Kernel};
+use crate::{
+    abi,
+    kernel::{CwdRefresh, Kernel},
+};
 
 pub struct PathResolver<'kernel> {
     kernel: &'kernel mut Kernel,
@@ -23,7 +26,11 @@ impl<'kernel> PathResolver<'kernel> {
     /// and VFS operations where the backend decides final semantics.
     pub fn normalize(&mut self, raw_path: &[u8]) -> Result<Vec<u8>, i64> {
         let rewritten = proc_self_rewrite(self.caller_pid, raw_path);
-        let cwd = self.kernel.process(self.caller_pid).cwd.clone();
+        let cwd = if rewritten.starts_with(b"/") {
+            b"/".to_vec()
+        } else {
+            self.resolved_cwd()?
+        };
         normalize_lexical_path(&cwd, &rewritten)
     }
 
@@ -33,8 +40,64 @@ impl<'kernel> PathResolver<'kernel> {
     /// pathname rather than just a normalized lexical target.
     pub fn realpath(&mut self, raw_path: &[u8]) -> Result<Vec<u8>, i32> {
         let rewritten = proc_self_rewrite(self.caller_pid, raw_path);
-        let cwd = self.kernel.process(self.caller_pid).cwd.clone();
+        // The cwd-refresh invariant returns the negated-`i64` errno
+        // shape `normalize` uses; `realpath`'s contract is the raw
+        // positive `i32`. The only failure here is the removed-cwd
+        // case, which maps to `ENOENT` for every relative-path user.
+        let cwd = if rewritten.starts_with(b"/") {
+            b"/".to_vec()
+        } else {
+            self.resolved_cwd().map_err(|_| abi::ENOENT)?
+        };
         resolve_realpath(self.kernel, &cwd, &rewritten)
+    }
+
+    /// The process-wide cwd-refresh invariant (B2.9 Task 6). Before
+    /// resolving ANY relative path, the cached `cwd.path` snapshot is
+    /// reconciled against the LIVE directory the cwd inode names:
+    ///
+    /// - `cwd.dir_inode == Some(ino)`: ask the VFS for the inode's
+    ///   current mount-absolute path. `Some(abs)` ⇒ the dir may have
+    ///   been renamed; refresh `cwd.path = abs` and use it. `None` ⇒
+    ///   the dir was removed (rmdir/unlink) and has no linkable path;
+    ///   relative resolution fails `-ENOENT` rather than silently
+    ///   using the stale pre-removal snapshot.
+    /// - `cwd.dir_inode == None` (degraded backend): use the cached
+    ///   `cwd.path` exactly as before. Exception: the `Process::new`
+    ///   default `Cwd{ROOT_MOUNT, None, "/"}` has no resolved inode
+    ///   because no `MountTable` was in scope at construction — lazily
+    ///   resolve `/` → its live dir inode here and populate `cwd` so
+    ///   every subsequent relative op is inode-anchored.
+    ///
+    /// Fixing this in the shared resolver makes it a true invariant:
+    /// `open`, `mkdir`, `rmdir`, `unlink`, `rename`, `link`, `symlink`,
+    /// `chmod`, `chown`, `utimens`, `stat`, `readlink`, `realpath`,
+    /// and the `spawn`/exec image lookup all inherit it for free.
+    fn resolved_cwd(&mut self) -> Result<Vec<u8>, i64> {
+        match self.kernel.refresh_anchored_cwd(self.caller_pid) {
+            CwdRefresh::Anchored(abs) => Ok(abs),
+            // Inode-anchored cwd whose directory was removed:
+            // no linkable path (POSIX) — relative ops fail ENOENT.
+            CwdRefresh::AnchoredRemoved => Err(-(abi::ENOENT as i64)),
+            CwdRefresh::Degraded(cwd) => {
+                // Lazily upgrade the Process::new default `/` to its
+                // live dir inode (no MountTable existed at construction).
+                // Unlike `getcwd`, relative resolution wants every
+                // subsequent op inode-anchored, so we do the upgrade
+                // here. The returned base stays `cwd.path` (the
+                // pre-upgrade snapshot), identical to before.
+                if cwd.path == b"/" {
+                    if let Some((mid, ino)) = self.kernel.vfs.dir_inode_at(b"/") {
+                        let p = self.kernel.process_mut(self.caller_pid);
+                        p.cwd.mount_id = mid;
+                        p.cwd.dir_inode = Some(ino);
+                    }
+                }
+                // Degraded backend (or `/` upgrade just applied): the
+                // cached absolute snapshot is the resolution base.
+                Ok(cwd.path)
+            }
+        }
     }
 }
 
@@ -146,7 +209,9 @@ fn resolve_realpath(k: &mut Kernel, cwd: &[u8], path: &[u8]) -> Result<Vec<u8>, 
         if let Some(target) = k.vfs.readlink(&candidate) {
             hops += 1;
             if hops > 40 {
-                return Err(abi::EINVAL);
+                // Too many symlink hops: POSIX/Linux errno is ELOOP
+                // (SYMLOOP_MAX = 40), not EINVAL.
+                return Err(abi::ELOOP);
             }
             let target_path = if target.starts_with(b"/") {
                 target

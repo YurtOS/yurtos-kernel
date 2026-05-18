@@ -232,6 +232,29 @@ export function buildWasiShim(
     return errnoFromKernel(rc);
   };
 
+  // ── fd_sync / fd_datasync → sys_fsync / sys_fdatasync ─────────
+  // POSIX fsync / fdatasync. The kernel's ramfs is in-memory so the
+  // op is a successful no-op on any syncable fd — pipe / socket get
+  // EINVAL, closed / unknown get EBADF. Issue #88.
+  const fd_sync = (fd: number): number => {
+    const kfd = kernelFd(fd);
+    if (kfd === undefined) return EBADF;
+    const req = new Uint8Array(4);
+    new DataView(req.buffer).setUint32(0, kfd >>> 0, true);
+    return errnoFromKernel(
+      Number(kernel.syscall(METHOD.SYS_FSYNC, pid, req, 0).rc),
+    );
+  };
+  const fd_datasync = (fd: number): number => {
+    const kfd = kernelFd(fd);
+    if (kfd === undefined) return EBADF;
+    const req = new Uint8Array(4);
+    new DataView(req.buffer).setUint32(0, kfd >>> 0, true);
+    return errnoFromKernel(
+      Number(kernel.syscall(METHOD.SYS_FDATASYNC, pid, req, 0).rc),
+    );
+  };
+
   // ── fd_seek: route to sys_lseek ────────────────────────────────
   const fd_seek = (
     fd: number,
@@ -368,6 +391,7 @@ export function buildWasiShim(
     if (oflags & 0b0001) kFlags |= 0b010; // CREAT
     if (oflags & 0b1000) kFlags |= 0b100; // TRUNC
     if (oflags & 0b0010) kFlags |= 0b1000; // DIRECTORY
+    if (oflags & 0b0100) kFlags |= 0b10000; // EXCL
     // Build "u32 flags + '/' + relpath".
     const req = new Uint8Array(4 + 1 + rel.length);
     new DataView(req.buffer).setUint32(0, kFlags >>> 0, true);
@@ -606,6 +630,8 @@ export function buildWasiShim(
     fd_write,
     fd_read,
     fd_close,
+    fd_sync,
+    fd_datasync,
     fd_seek,
     fd_tell,
     fd_fdstat_get,
@@ -641,14 +667,12 @@ export function buildWasiShim(
       "clock_res_get",
       "fd_advise",
       "fd_allocate",
-      "fd_datasync",
       "fd_fdstat_set_rights",
       "fd_filestat_set_size",
       "fd_filestat_set_times",
       "fd_pread",
       "fd_pwrite",
       "fd_renumber",
-      "fd_sync",
       "path_filestat_set_times",
       "poll_oneoff",
       "proc_raise",

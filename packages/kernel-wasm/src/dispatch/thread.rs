@@ -47,7 +47,10 @@ pub fn sys_thread_spawn(ctx: DispatchContext, request: &[u8]) -> i64 {
     }) {
         Ok(()) => tid as i64,
         Err(errno) => {
+            // Cancel the running host thread, then RELEASE its handle
+            // — cancel alone leaks the host-side resource (#110).
             let _ = kh::thread_cancel(host_thread_handle);
+            let _ = kh::thread_release(host_thread_handle);
             let _ = kernel::with_kernel(|k| k.rollback_reserved_thread(ctx.caller_pid, tid));
             -(errno as i64)
         }
