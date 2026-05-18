@@ -1,7 +1,7 @@
 # Real `fork()` continuation — design (supersedes 2026-05-16-rust-fork-parity-design.md)
 
-**Date:** 2026-05-18
-**PR:** #224 (`claude/fork-impl`). **Umbrella:** #172. **Blocks:** Phase 4 / `git rm packages/kernel/` (#170).
+**Date:** 2026-05-18 · **Rev:** 2 (post external verification — every concrete code claim verified true; +40% relabelled as inherited estimate; T3-scope / test-interlock / T1-long-pole gaps incorporated).
+**PR:** #224 (`claude/fork-impl`). **Umbrella:** #172. **Blocks (file-scoped):** Phase 4 / `git rm packages/kernel/` (#170) — see Interlock.
 **Supersedes:** `docs/superpowers/specs/2026-05-16-rust-fork-parity-design.md` — its kernel `prepare_fork`/`commit_fork`/`rollback_fork` contract and *host-owns-continuation, kernel-owns-identity* architecture remain valid and are carried forward verbatim; this doc replaces its host-implementation framing with the Task-0 spike reality and the verified two-libc / 99-1 model.
 
 ## Goal
@@ -19,12 +19,12 @@ So a module is **either** asyncify-instrumented (runs under the Asyncify adapter
 - **continuation libc** — asyncify-tainted; provides `fork`/`setjmp`/`longjmp`.
 - **lean libc** — no asyncify; preserves the JSPI/native fast route; `fork()` is a weak/`-ENOSYS` stub (link error by design).
 
-**Cost of asyncify (verified, why this is opt-in not universal):**
-- Code size **≈ +40%** (`docs/superpowers/plans/2026-05-17-fork-capture-notes.md:150`).
-- A fixed **64 KiB** static unwind side-stack per continuation guest (`abi/src/yurt_setjmp.c:45` `YURT_ASYNCIFY_BUF_SIZE 65536`, exported `yurt_asyncify_buf_size`).
-- Runtime: per-instrumented-function unwind/rewind state-machine prologue/epilogue + local spill, even when never suspending.
+**Cost of asyncify (why this is opt-in, not universal):**
+- Code size — **inherited estimate ≈ +40%**, sourced to the `async-bridge.ts:13-16` comment via `docs/superpowers/plans/2026-05-17-fork-capture-notes.md:150`. **Not re-measured in this worktree** — treat as a prior-knowledge ballpark, not a spike-verified fact.
+- A fixed **64 KiB** static unwind side-stack per continuation guest — **directly verified in source**: `abi/src/yurt_setjmp.c:45` `#define YURT_ASYNCIFY_BUF_SIZE 65536` (exported `yurt_asyncify_buf_addr`/`yurt_asyncify_buf_size`).
+- Runtime: per-instrumented-function unwind/rewind state-machine prologue/epilogue + local spill, even when never suspending (standard Binaryen-asyncify overhead; not separately measured here).
 
-Universal asyncify would impose this on **every** guest while 99% never `fork()` — and would forfeit JSPI/native everywhere. Opt-in two-libc is therefore correct, not stylistic.
+The two-libc decision rests on the **qualitative** grounds — whole-module asyncify taint (`wasm_opt.rs:21-27`, verbatim-verified) **plus** forfeiting JSPI/native everywhere — and does **not** depend on the exact size percentage. Universal asyncify would impose this on every guest while 99% never `fork()`; opt-in two-libc is therefore correct, not stylistic.
 
 **Open cost lever (recorded, not a blocker):** `continuation_args()` (`wasm_opt.rs:15-18`) applies **blanket `--asyncify`** — no `--pass-arg=asyncify-imports@…` allowlist. Scoping asyncify to only the `fork`/`setjmp` suspend-import call paths would materially cut the +40%/runtime cost. Tracked as a future optimization sub-task; this design does not depend on it.
 
@@ -37,7 +37,9 @@ They are complementary tracks, never to be re-conflated: lean-libc programs get 
 
 ## Host architecture
 
-**Current state (Task-0 spike, verified):** the Rust host `host_fork` is a broken **memory-only rebuild** — `snapshot_user_memory` (`kernel_host_interface.rs:209`) copies linear-memory bytes only (no stack/locals/return-address); `instantiate_fork_child` builds a fresh instance driven via `child.call_run()`→`"run"` (`:3134`,`:3606`), but WASI binaries export `_start`, so the child runs **zero instructions**. The JS host `host_fork` is an `-ENOSYS` stub. Both must be **built, not wired**.
+**Current state (Task-0 spike, verified):** the Rust host `host_fork` is a broken **memory-only rebuild** — `snapshot_user_memory` (`kernel_host_interface.rs:209`) copies linear-memory bytes only (no stack/locals/return-address); `instantiate_fork_child` builds a fresh instance driven via `child.call_run()`→`"run"` (`:3134`,`:3606`), but WASI binaries export `_start`, not `"run"`, so the lookup **errors, the error is swallowed, and the child is recorded as exit 127** (a bogus reaped child — it never ran its real entrypoint). The JS host `host_fork` is an `-ENOSYS` stub. Both must be **built, not wired**.
+
+> **Asyncify is a *guest* mechanism, not host async.** The user-process wasmtime engine has no `async_support`/JSPI/stack-switching — and it does not need it: asyncify is a Binaryen *guest control-flow rewrite* driven through the guest's own `asyncify_start_unwind/stop_unwind/start_rewind/stop_rewind` exports plus the in-linear-memory `yurt_asyncify_buf`. The host only orchestrates those guest exports + the kernel `prepare/commit/rollback`. This is *why* asyncify is the only viable option on the no-host-async path — do not implement it expecting host-side suspension.
 
 **Rust host** (`packages/runtime-wasmtime`): replace the rebuild with real asyncify unwind/rewind:
 1. guest (continuation libc) calls `yurt.host_fork`; the asyncify-instrumented guest is mid-unwind, its call stack spilled into `yurt_asyncify_buf` (64 KiB), linear memory is the parent's exact state at the `fork()` site.
@@ -47,13 +49,19 @@ They are complementary tracks, never to be re-conflated: lean-libc programs get 
 5. host calls `commit_fork(parent_pid, child_pid)` (child becomes waitpid/signal/schedule-visible); any host-step failure → `rollback_fork`.
 - A **lean-libc** guest (no asyncify) reaching `host_fork` → return spec-mandated **`-ENOSYS`** (fix the current bug where it returns a bogus child pid). Belt-and-braces; the primary gate is the link error.
 
-**JS host** (`kernel-host-interface-js`): **port-and-adapt** the proven `AsyncifyAsyncBridge` fork logic — `hostFork` / `snapshotForkContinuation` / `restoreForkSnapshot` / `startForkRewind` / `AsyncifyForkController` — out of `packages/kernel/src/async-bridge.ts`. Remove `host_fork` from `USER_YURT_STUB_IMPORTS`. Mirror the Rust per-child semantics (cross-host parity discipline, as the spawn/wait slice did).
+**JS host** (`kernel-host-interface-js`): **port-and-adapt** the `AsyncifyAsyncBridge` fork logic out of `packages/kernel/src/async-bridge.ts` (the named symbols — `hostFork`/`snapshotForkContinuation`/`restoreForkSnapshot`/`startForkRewind`/`AsyncifyForkController` — are the *core*, not the whole surface). Remove `host_fork` from `USER_YURT_STUB_IMPORTS`; mirror the Rust per-child semantics (cross-host parity discipline, as the spawn/wait slice did).
+
+> **T3 is materially larger than copying ~5 symbols — the single biggest planning risk.** In the TS kernel the bridge is *integrated*, not a standalone reference: it's driven by controller/loader wiring (a `setForkController`-style hook → `forkChildFromSnapshot`), the process manager, and the **asyncify-vs-threads mutual-exclusion in the module-profile** (`packages/kernel/src/process/module-profile*`). The port must reconstruct that integration on the new JS host, not just lift functions. The exact integration points + module-profile constraint MUST be enumerated against the live `packages/kernel/` tree during the implementation-plan phase (do not trust symbol/path names from this spec — they were not all independently re-verified). Plan T3 with this expanded surface and the most schedule buffer.
 
 **Kernel** (`packages/kernel-wasm`): `prepare_fork`/`commit_fork`/`rollback_fork`/`ProcessForkState::ForkPreparing` are **landed and valid — unchanged**. Kernel owns process identity/fd-table-clone/wait-visibility/rollback; host owns continuation capture/restore.
 
 ## Critical sequencing / interlock
 
-The proven JS continuation reference (`AsyncifyAsyncBridge`) lives in **`packages/kernel/src/async-bridge.ts` — the TS kernel that Phase 4 (#170) deletes.** It MUST be ported out (JS-host Task) **before** #170 removes it. **#224 (this) blocks #170**; #170 must not delete `packages/kernel/src/async-bridge.ts` until the JS port lands. This ordering is a hard constraint on the umbrella #172.
+The JS continuation reference **and the only existing proof it works** live in the TS kernel that Phase 4 (#170) deletes. The interlock is **file-scoped**, not "#224 blocks all of #170": #170 must not delete the following until the JS port (T3) **and** a replacement parity oracle (T4) have landed —
+- `packages/kernel/src/async-bridge.ts` (the bridge implementation + its loader/manager/module-profile integration), and
+- the existing continuation oracles: `packages/kernel/src/__tests__/abi_test.ts` (the fork cases at `:620` "keeps plain fork as ENOSYS outside continuation builds" and `:640` "preserves pre-fork continuation frames in children") and `packages/kernel/src/__tests__/sandbox-wasm-kernel_test.ts:179` ("runs fork continuations through Rust-owned process lifecycle").
+
+These tests are the *current* proof real fork works; deleting them before T4 reproduces equivalent cross-host coverage would remove the very oracle T4 must validate against. The rest of `packages/kernel/` is **not** blocked by #224. This file-scoped ordering is a hard constraint on umbrella #172; T5 must annotate #170 with the precise keep-until-T4 file list.
 
 ## Error handling / edges
 
@@ -71,11 +79,13 @@ The proven JS continuation reference (`AsyncifyAsyncBridge`) lives in **`package
 
 ## Decomposition (for the implementation plan)
 
-1. **T1** — `fork-twice` (exists) + `fork-exec` fixtures; asyncify fixture-build harness (`ensure_fixture_built` continuation mode).
-2. **T2** — Rust host: replace the rebuild with real asyncify snapshot/rewind; lean-guest `host_fork` → `-ENOSYS`.
-3. **T3** — JS host: port-and-adapt `AsyncifyAsyncBridge` from `packages/kernel/src/async-bridge.ts`; un-stub `host_fork`.
-4. **T4** — cross-host parity (`fixture_parity.rs` + JS `Runner` E2E) + edges (`vfork`, `-EAGAIN` shared-mem/threaded, `-ENOSYS` lean).
-5. **T5** — verify + the #170 port-before-delete coordination (block/annotate #170 so `async-bridge.ts` survives until T3 lands).
+1. **T1 — CRITICAL PATH / longest pole.** `fork-twice` (exists) + `fork-exec` fixtures **and the asyncify fixture-build harness** (`ensure_fixture_built` has no `wasm-opt --asyncify` path; `wasm_opt.rs use_continuation` mode must be wired in). This is the least-specified, highest-unknown item and **gates both hosts** — neither T2 nor T4 is testable until it exists. Plan it first, with the most buffer, and de-risk it before committing T2/T3 estimates.
+2. **T2** — Rust host: replace the rebuild with real asyncify snapshot/rewind; lean-guest `host_fork` → `-ENOSYS`. *Independent of T3.*
+3. **T3** — JS host: port-and-adapt the `AsyncifyAsyncBridge` **and its kernel integration surface** (see the Host-architecture T3 callout — larger than a symbol copy). *Independent of T2.*
+4. **T4** — cross-host parity (`fixture_parity.rs` + JS `Runner` E2E) + edges (`vfork`, `-EAGAIN` shared-mem/threaded, `-ENOSYS` lean). **Depends on T1 + T2 + T3.**
+5. **T5** — verify + annotate #170 with the precise *keep-until-T4* file list (`async-bridge.ts` + the named continuation tests); confirm the file-scoped interlock, not a blanket #170 block.
+
+**Critical-path shape:** `T1 → (T2 ∥ T3) → T4 → T5`. T1 is the schedule risk; T2/T3 parallelize once T1 lands.
 
 ## Out of scope (cross-referenced)
 
