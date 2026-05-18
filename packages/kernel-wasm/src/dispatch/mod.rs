@@ -273,9 +273,9 @@ pub fn dispatch_with_context(
         // exercised (not dead-code) and the dispatch table makes the
         // pending coverage visible at a glance.
         METHOD_SYS_EVENTFD => sys_eventfd(caller_pid, request),
-        METHOD_SYS_TIMERFD_CREATE => -(abi::ENOSYS as i64),
-        METHOD_SYS_TIMERFD_SETTIME => -(abi::ENOSYS as i64),
-        METHOD_SYS_TIMERFD_GETTIME => -(abi::ENOSYS as i64),
+        METHOD_SYS_TIMERFD_CREATE => sys_timerfd_create(caller_pid, request),
+        METHOD_SYS_TIMERFD_SETTIME => sys_timerfd_settime(caller_pid, request, response),
+        METHOD_SYS_TIMERFD_GETTIME => sys_timerfd_gettime(caller_pid, request, response),
         METHOD_SYS_EPOLL_CREATE1 => -(abi::ENOSYS as i64),
         METHOD_SYS_EPOLL_CTL => -(abi::ENOSYS as i64),
         METHOD_SYS_EPOLL_WAIT => -(abi::ENOSYS as i64),
@@ -365,6 +365,10 @@ fn close_entry(k: &mut Kernel, entry: FdEntry) -> Option<i32> {
         crate::kernel::FdEntry::Socket { id } => k.socket_dec_ref(id),
         crate::kernel::FdEntry::EventFd { id } => {
             k.eventfd_dec_ref(id);
+            None
+        }
+        crate::kernel::FdEntry::TimerFd { id } => {
+            k.timerfd_dec_ref(id);
             None
         }
         _ => None,
@@ -624,6 +628,7 @@ fn get_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
             },
             FdEntry::Socket { .. } => 2,
             FdEntry::EventFd { .. } => 2, // eventfd is read+write
+            FdEntry::TimerFd { .. } => 0, // timerfd is read-only
         }
     })
 }
@@ -828,6 +833,7 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             crate::kernel::FdEntry::Directory { .. } => -(abi::EISDIR as i64),
             crate::kernel::FdEntry::Socket { id } => socket_recv_id(k, id, response, 0),
             crate::kernel::FdEntry::EventFd { id } => eventfd_read(k, id, response),
+            crate::kernel::FdEntry::TimerFd { id } => timerfd_read(k, id, response),
         }
     })
 }
@@ -903,6 +909,8 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
             crate::kernel::FdEntry::Directory { .. } => -(abi::EBADF as i64),
             crate::kernel::FdEntry::Socket { id } => socket_send_id(k, id, payload),
             crate::kernel::FdEntry::EventFd { id } => eventfd_write(k, id, payload),
+            // timerfd is read-only — write returns -EINVAL per Linux.
+            crate::kernel::FdEntry::TimerFd { .. } => -(abi::EINVAL as i64),
         }
     })
 }
@@ -1036,6 +1044,227 @@ fn eventfd_write(k: &mut Kernel, id: u64, payload: &[u8]) -> i64 {
         }
         _ => -(abi::EAGAIN as i64),
     }
+}
+
+// ── timerfd (Issue #92 slice S2) ─────────────────────────────────────
+
+/// `timerfd(2)` flag bits — Linux values reused for the open flags.
+const TFD_NONBLOCK: u32 = 0x800;
+const TFD_CLOEXEC: u32 = 0x80000;
+const TFD_FLAGS_MASK: u32 = TFD_NONBLOCK | TFD_CLOEXEC;
+
+/// `timerfd_settime` flag: interpret `it_value` as an absolute deadline
+/// on the timerfd's clock (default is relative-to-now).
+const TFD_TIMER_ABSTIME: u32 = 0x1;
+const TFD_SETTIME_FLAGS_MASK: u32 = TFD_TIMER_ABSTIME;
+
+/// `timerfd`'s supported clockids. The kernel uses CLOCK_MONOTONIC
+/// for both today (M5/#64 fixed the alias) — the clockid is stored
+/// faithfully so guests reading it back via gettime see what they set.
+const CLOCKID_REALTIME: u32 = 0;
+const CLOCKID_MONOTONIC: u32 = 1;
+
+/// Serialize an `itimerspec` `{i64 interval.sec, i64 interval.nsec,
+/// i64 value.sec, i64 value.nsec}` into `out[0..32]`. `value_ns` is
+/// the remaining duration until next expiry (zero if disarmed);
+/// `interval_ns` is the period (zero for one-shot).
+fn write_itimerspec(out: &mut [u8], interval_ns: u64, value_ns: u64) {
+    let (i_sec, i_nsec) = (interval_ns / 1_000_000_000, interval_ns % 1_000_000_000);
+    let (v_sec, v_nsec) = (value_ns / 1_000_000_000, value_ns % 1_000_000_000);
+    out[0..8].copy_from_slice(&(i_sec as i64).to_le_bytes());
+    out[8..16].copy_from_slice(&(i_nsec as i64).to_le_bytes());
+    out[16..24].copy_from_slice(&(v_sec as i64).to_le_bytes());
+    out[24..32].copy_from_slice(&(v_nsec as i64).to_le_bytes());
+}
+
+/// Decode an `itimerspec` from `bytes[0..32]`. Negative tv_nsec or
+/// tv_nsec >= 1e9 is rejected (Linux `EINVAL`).
+fn read_itimerspec(bytes: &[u8]) -> Result<(u64, u64), i64> {
+    if bytes.len() < 32 {
+        return Err(-(abi::EINVAL as i64));
+    }
+    let i_sec = i64::from_le_bytes(bytes[0..8].try_into().expect("8 bytes"));
+    let i_nsec = i64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes"));
+    let v_sec = i64::from_le_bytes(bytes[16..24].try_into().expect("8 bytes"));
+    let v_nsec = i64::from_le_bytes(bytes[24..32].try_into().expect("8 bytes"));
+    if i_sec < 0 || !(0..1_000_000_000).contains(&i_nsec) {
+        return Err(-(abi::EINVAL as i64));
+    }
+    if v_sec < 0 || !(0..1_000_000_000).contains(&v_nsec) {
+        return Err(-(abi::EINVAL as i64));
+    }
+    let interval_ns = (i_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|s| s.checked_add(i_nsec as u64))
+        .ok_or(-(abi::EINVAL as i64))?;
+    let value_ns = (v_sec as u64)
+        .checked_mul(1_000_000_000)
+        .and_then(|s| s.checked_add(v_nsec as u64))
+        .ok_or(-(abi::EINVAL as i64))?;
+    Ok((interval_ns, value_ns))
+}
+
+/// `timerfd_create(clockid, flags)`. Request: u32 clockid + u32 flags
+/// (8 bytes). Returns a fresh fd backed by a disarmed timer.
+fn sys_timerfd_create(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let clockid = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    if !matches!(clockid, CLOCKID_REALTIME | CLOCKID_MONOTONIC) {
+        return -(abi::EINVAL as i64);
+    }
+    if flags & !TFD_FLAGS_MASK != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let id = k.create_timerfd(clockid, flags);
+        let Some(fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
+            k.timerfd_dec_ref(id);
+            return -(abi::EMFILE as i64);
+        };
+        k.process_mut(caller_pid)
+            .fd_table
+            .install(fd, crate::kernel::FdEntry::TimerFd { id });
+        fd as i64
+    })
+}
+
+/// `timerfd_settime(fd, flags, new, old)`. Request: u32 fd, u32 flags,
+/// 32-byte new `itimerspec` (40 bytes total). Response: 32-byte old
+/// `itimerspec`. `TFD_TIMER_ABSTIME` interprets `new.it_value` as an
+/// absolute deadline on the timerfd's clock; otherwise it's a relative
+/// duration added to "now".
+fn sys_timerfd_settime(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 40 {
+        return -(abi::EINVAL as i64);
+    }
+    if response.len() < 32 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    if flags & !TFD_SETTIME_FLAGS_MASK != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let (new_interval_ns, new_value_ns) = match read_itimerspec(&request[8..40]) {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
+    let now_ns = match crate::kh::now_monotonic_ns() {
+        Ok(v) => v,
+        Err(rc) => return rc as i64,
+    };
+    with_kernel(|k| {
+        let id = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(crate::kernel::FdEntry::TimerFd { id }) => *id,
+            Some(_) => return -(abi::EINVAL as i64),
+            None => return -(abi::EBADF as i64),
+        };
+        let entry = match k.timerfd_get_mut(id) {
+            Some(e) => e,
+            None => return -(abi::EBADF as i64),
+        };
+        // Compute old it_value (remaining duration) BEFORE writing the new
+        // configuration. Old it_interval is the prior period as-is.
+        let old_interval_ns = entry.interval_ns;
+        let old_value_ns = if entry.deadline_ns == 0 {
+            0
+        } else {
+            entry.deadline_ns.saturating_sub(now_ns)
+        };
+        // Apply the new configuration. value_ns == 0 disarms the timer
+        // regardless of interval (matches Linux semantics).
+        let new_deadline = if new_value_ns == 0 {
+            0
+        } else if flags & TFD_TIMER_ABSTIME != 0 {
+            new_value_ns
+        } else {
+            now_ns.saturating_add(new_value_ns)
+        };
+        entry.deadline_ns = new_deadline;
+        entry.interval_ns = if new_value_ns == 0 {
+            0
+        } else {
+            new_interval_ns
+        };
+        write_itimerspec(&mut response[0..32], old_interval_ns, old_value_ns);
+        32
+    })
+}
+
+/// `timerfd_gettime(fd, curr)`. Request: u32 fd (4 bytes). Response:
+/// 32-byte `itimerspec` with the remaining duration until next expiry
+/// (zero if disarmed) and the configured period.
+fn sys_timerfd_gettime(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    if response.len() < 32 {
+        return -(abi::EINVAL as i64);
+    }
+    let fd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let now_ns = match crate::kh::now_monotonic_ns() {
+        Ok(v) => v,
+        Err(rc) => return rc as i64,
+    };
+    with_kernel(|k| {
+        let id = match k.process_mut(caller_pid).fd_table.entry(fd) {
+            Some(crate::kernel::FdEntry::TimerFd { id }) => *id,
+            Some(_) => return -(abi::EINVAL as i64),
+            None => return -(abi::EBADF as i64),
+        };
+        let entry = match k.timerfd_get(id) {
+            Some(e) => e,
+            None => return -(abi::EBADF as i64),
+        };
+        let value_ns = if entry.deadline_ns == 0 {
+            0
+        } else {
+            entry.deadline_ns.saturating_sub(now_ns)
+        };
+        write_itimerspec(&mut response[0..32], entry.interval_ns, value_ns);
+        32
+    })
+}
+
+/// `read(timerfd, ...)` — returns the u64 expiration count since the
+/// last successful read (or since the timer was armed). For a one-shot
+/// timer (`interval_ns == 0`), returns 1 once and disarms. For a
+/// periodic timer, returns `1 + floor((now - deadline) / interval)`
+/// and advances `deadline_ns` past `now` by that many periods.
+fn timerfd_read(k: &mut Kernel, id: u64, response: &mut [u8]) -> i64 {
+    if response.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let now_ns = match crate::kh::now_monotonic_ns() {
+        Ok(v) => v,
+        Err(rc) => return rc as i64,
+    };
+    let Some(entry) = k.timerfd_get_mut(id) else {
+        return -(abi::EBADF as i64);
+    };
+    if entry.deadline_ns == 0 || now_ns < entry.deadline_ns {
+        // Not yet expired. NONBLOCK + blocking both return -EAGAIN
+        // today; AsyncBridge blocking wait is S5.
+        return -(abi::EAGAIN as i64);
+    }
+    let expirations = if entry.interval_ns == 0 {
+        // One-shot: fire once, then disarm.
+        entry.deadline_ns = 0;
+        1
+    } else {
+        // Periodic: count missed ticks, advance the deadline past now.
+        let elapsed = now_ns - entry.deadline_ns;
+        let count = 1 + elapsed / entry.interval_ns;
+        entry.deadline_ns = entry
+            .deadline_ns
+            .saturating_add(count.saturating_mul(entry.interval_ns));
+        count
+    };
+    response[0..8].copy_from_slice(&expirations.to_le_bytes());
+    8
 }
 
 /// `pread(fd, offset)` — positional read on a regular file. Unlike
@@ -1285,6 +1514,21 @@ fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) ->
                 revents |= POLLOUT;
             }
             revents
+        }
+        FdEntry::TimerFd { id } => {
+            // timerfd readiness: POLLIN iff at least one expiration has
+            // accumulated. timerfd is read-only — never POLLOUT.
+            // Issue #92 slice S2.
+            let Some(entry) = k.timerfd_get(id) else {
+                return POLLNVAL;
+            };
+            let armed = entry.deadline_ns != 0;
+            let now = crate::kh::now_monotonic_ns().unwrap_or(0);
+            if wants_read && armed && now >= entry.deadline_ns {
+                POLLIN
+            } else {
+                0
+            }
         }
     }
 }
@@ -1671,6 +1915,8 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             // eventfd reports as a CHARACTER device (filetype 2) per
             // Linux fstat behavior — it has no file size and no inode.
             crate::kernel::FdEntry::EventFd { .. } => (0, 2, 0o020_600),
+            // timerfd is also a character device (filetype 2), read-only.
+            crate::kernel::FdEntry::TimerFd { .. } => (0, 2, 0o020_400),
         };
         response[0..8].copy_from_slice(&size.to_le_bytes());
         response[8..12].copy_from_slice(&filetype.to_le_bytes());

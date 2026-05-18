@@ -180,6 +180,12 @@ pub enum FdEntry {
     EventFd {
         id: u64,
     },
+    /// Linux `timerfd(2)` — a one-shot or periodic timer exposed as a
+    /// single fd kind. `id` references a [`TimerFdEntry`] in
+    /// `Kernel::timerfds`. Issue #92 slice S2.
+    TimerFd {
+        id: u64,
+    },
 }
 
 /// Per-pid file-descriptor table. Sparse — closed fds are absent.
@@ -675,6 +681,22 @@ pub struct EventFdEntry {
     pub refs: u32,
 }
 
+/// `timerfd(2)` state — a timer that fires either once (`interval_ns
+/// == 0`) or periodically every `interval_ns` nanoseconds, with the
+/// first expiry at absolute time `deadline_ns` on the configured
+/// `clockid`. `deadline_ns == 0` means *disarmed*. `flags` carries
+/// the open-time `TFD_NONBLOCK` bit (`TFD_CLOEXEC` is honored via
+/// the existing descriptor-flag path, not stored here). `refs` makes
+/// `dup()`/`fork()` share one timer until last close. Issue #92 S2.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TimerFdEntry {
+    pub clockid: u32,
+    pub flags: u32,
+    pub deadline_ns: u64,
+    pub interval_ns: u64,
+    pub refs: u32,
+}
+
 pub struct SocketEntry {
     pub refs: u32,
     pub domain: u8,
@@ -699,6 +721,10 @@ pub struct Kernel {
     /// Issue #92 slice S1.
     eventfds: BTreeMap<u64, EventFdEntry>,
     next_eventfd_id: u64,
+    /// `timerfd(2)` registry. Each [`FdEntry::TimerFd`] references an
+    /// entry here by id. Issue #92 slice S2.
+    timerfds: BTreeMap<u64, TimerFdEntry>,
+    next_timerfd_id: u64,
     unix_listeners: BTreeMap<Vec<u8>, u64>,
     unix_datagrams: BTreeMap<Vec<u8>, u64>,
     unix_socket_inodes: BTreeSet<Vec<u8>>,
@@ -814,6 +840,8 @@ impl Kernel {
             next_socket_id: 1,
             eventfds: BTreeMap::new(),
             next_eventfd_id: 1,
+            timerfds: BTreeMap::new(),
+            next_timerfd_id: 1,
             unix_listeners: BTreeMap::new(),
             unix_datagrams: BTreeMap::new(),
             unix_socket_inodes: BTreeSet::new(),
@@ -1508,6 +1536,7 @@ impl Kernel {
             FdEntry::File { ofd_id } => self.ofd_inc_ref(*ofd_id),
             FdEntry::Socket { id } => self.socket_inc_ref(*id),
             FdEntry::EventFd { id } => self.eventfd_inc_ref(*id),
+            FdEntry::TimerFd { id } => self.timerfd_inc_ref(*id),
             FdEntry::Directory { .. } | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => {}
         }
     }
@@ -2127,6 +2156,53 @@ impl Kernel {
         }
     }
 
+    /// Allocate a fresh `timerfd(2)` entry, disarmed at creation
+    /// (`deadline_ns == 0`). `refs` starts at 1 — the caller installs
+    /// exactly one [`FdEntry::TimerFd`] for this id. Issue #92 S2.
+    pub fn create_timerfd(&mut self, clockid: u32, flags: u32) -> u64 {
+        let id = self.next_timerfd_id;
+        self.next_timerfd_id += 1;
+        self.timerfds.insert(
+            id,
+            TimerFdEntry {
+                clockid,
+                flags,
+                deadline_ns: 0,
+                interval_ns: 0,
+                refs: 1,
+            },
+        );
+        id
+    }
+
+    pub fn timerfd_get_mut(&mut self, id: u64) -> Option<&mut TimerFdEntry> {
+        self.timerfds.get_mut(&id)
+    }
+
+    pub fn timerfd_get(&self, id: u64) -> Option<&TimerFdEntry> {
+        self.timerfds.get(&id)
+    }
+
+    pub fn timerfd_inc_ref(&mut self, id: u64) {
+        if let Some(e) = self.timerfds.get_mut(&id) {
+            e.refs = e.refs.saturating_add(1);
+        }
+    }
+
+    pub fn timerfd_dec_ref(&mut self, id: u64) {
+        let drop = self
+            .timerfds
+            .get_mut(&id)
+            .map(|e| {
+                e.refs = e.refs.saturating_sub(1);
+                e.refs == 0
+            })
+            .unwrap_or(false);
+        if drop {
+            self.timerfds.remove(&id);
+        }
+    }
+
     fn dec_fd_entry_ref(&mut self, entry: &FdEntry) {
         match entry {
             FdEntry::Pipe { id, end } => self.pipe_dec_ref(*id, *end),
@@ -2143,6 +2219,7 @@ impl Kernel {
                 }
             }
             FdEntry::EventFd { id } => self.eventfd_dec_ref(*id),
+            FdEntry::TimerFd { id } => self.timerfd_dec_ref(*id),
             FdEntry::Directory { .. } | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => {}
         }
     }
@@ -2292,6 +2369,8 @@ pub fn reset_for_tests() {
     k.next_socket_id = 1;
     k.eventfds.clear();
     k.next_eventfd_id = 1;
+    k.timerfds.clear();
+    k.next_timerfd_id = 1;
     k.socket_shutdown.clear();
     k.unix_listeners.clear();
     k.unix_datagrams.clear();

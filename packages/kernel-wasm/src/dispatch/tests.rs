@@ -14139,12 +14139,8 @@ fn event_loop_methods_return_enosys_until_slice_lands() {
     // Pass empty request/response. The handler doesn't matter (it's
     // -ENOSYS), but an empty buffer pair confirms we hit the dedicated
     // arm and not some accidental fast-path that decodes bytes first.
-    // METHOD_SYS_EVENTFD removed from this list once S1 landed; the
-    // remaining methods stay -ENOSYS until their owning slice ships.
+    // METHOD_SYS_EVENTFD / TIMERFD_* removed as their slices landed.
     for &method in &[
-        METHOD_SYS_TIMERFD_CREATE,
-        METHOD_SYS_TIMERFD_SETTIME,
-        METHOD_SYS_TIMERFD_GETTIME,
         METHOD_SYS_EPOLL_CREATE1,
         METHOD_SYS_EPOLL_CTL,
         METHOD_SYS_EPOLL_WAIT,
@@ -14154,7 +14150,7 @@ fn event_loop_methods_return_enosys_until_slice_lands() {
         assert_eq!(
             dispatch(method, 1, &[], &mut []),
             enosys,
-            "method 0x{method:x} must -ENOSYS until its S2..S5 handler lands"
+            "method 0x{method:x} must -ENOSYS until its S3..S5 handler lands"
         );
     }
 }
@@ -14332,4 +14328,291 @@ fn eventfd_close_releases_counter_state() {
     // Registry should be empty post-close (single ref).
     let live = crate::kernel::with_kernel(|k| k.eventfd_get(1).is_some());
     assert!(!live, "eventfd entry must be freed on last close");
+}
+
+// ── #92 S2: timerfd ─────────────────────────────────────────────────
+
+const CLOCK_MONOTONIC: u32 = 1;
+const TFD_NONBLOCK_BIT: u32 = 0x800;
+const TFD_TIMER_ABSTIME_BIT: u32 = 0x1;
+
+fn timerfd_create_req(clockid: u32, flags: u32) -> Vec<u8> {
+    let mut req = Vec::with_capacity(8);
+    req.extend_from_slice(&clockid.to_le_bytes());
+    req.extend_from_slice(&flags.to_le_bytes());
+    req
+}
+
+/// itimerspec wire layout: i64 it_interval.sec + i64 it_interval.nsec
+/// + i64 it_value.sec + i64 it_value.nsec (32 bytes).
+fn itimerspec(interval_ns: u64, value_ns: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let (i_sec, i_nsec) = (interval_ns / 1_000_000_000, interval_ns % 1_000_000_000);
+    let (v_sec, v_nsec) = (value_ns / 1_000_000_000, value_ns % 1_000_000_000);
+    out[0..8].copy_from_slice(&(i_sec as i64).to_le_bytes());
+    out[8..16].copy_from_slice(&(i_nsec as i64).to_le_bytes());
+    out[16..24].copy_from_slice(&(v_sec as i64).to_le_bytes());
+    out[24..32].copy_from_slice(&(v_nsec as i64).to_le_bytes());
+    out
+}
+
+fn timerfd_settime_req(fd: u32, flags: u32, interval_ns: u64, value_ns: u64) -> Vec<u8> {
+    let mut req = Vec::with_capacity(40);
+    req.extend_from_slice(&fd.to_le_bytes());
+    req.extend_from_slice(&flags.to_le_bytes());
+    req.extend_from_slice(&itimerspec(interval_ns, value_ns));
+    req
+}
+
+fn decode_itimerspec(bytes: &[u8]) -> (u64, u64) {
+    let i_sec = i64::from_le_bytes(bytes[0..8].try_into().unwrap()) as u64;
+    let i_nsec = i64::from_le_bytes(bytes[8..16].try_into().unwrap()) as u64;
+    let v_sec = i64::from_le_bytes(bytes[16..24].try_into().unwrap()) as u64;
+    let v_nsec = i64::from_le_bytes(bytes[24..32].try_into().unwrap()) as u64;
+    (
+        i_sec * 1_000_000_000 + i_nsec,
+        v_sec * 1_000_000_000 + v_nsec,
+    )
+}
+
+#[test]
+fn timerfd_create_returns_fd_disarmed() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_TIMERFD_CREATE,
+        1,
+        &timerfd_create_req(CLOCK_MONOTONIC, 0),
+        &mut [],
+    );
+    assert!(fd >= 3);
+
+    let mut out = [0u8; 32];
+    let gettime_req = (fd as u32).to_le_bytes().to_vec();
+    let n = dispatch(METHOD_SYS_TIMERFD_GETTIME, 1, &gettime_req, &mut out);
+    assert_eq!(n, 32);
+    let (interval, value) = decode_itimerspec(&out);
+    assert_eq!(interval, 0, "disarmed timerfd has zero interval");
+    assert_eq!(value, 0, "disarmed timerfd has zero remaining duration");
+}
+
+#[test]
+fn timerfd_create_rejects_unknown_clockid() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // 99 is not a recognized clockid.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_TIMERFD_CREATE,
+            1,
+            &timerfd_create_req(99, 0),
+            &mut [],
+        ),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn timerfd_create_rejects_unknown_flag_bits() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // 0x4 is neither TFD_NONBLOCK nor TFD_CLOEXEC.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_TIMERFD_CREATE,
+            1,
+            &timerfd_create_req(CLOCK_MONOTONIC, 0x4),
+            &mut [],
+        ),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn timerfd_settime_returns_old_value_zero_for_disarmed() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_TIMERFD_CREATE,
+        1,
+        &timerfd_create_req(CLOCK_MONOTONIC, 0),
+        &mut [],
+    );
+    // Arm with 1s one-shot relative.
+    let mut old = [0u8; 32];
+    let n = dispatch(
+        METHOD_SYS_TIMERFD_SETTIME,
+        1,
+        &timerfd_settime_req(fd as u32, 0, 0, 1_000_000_000),
+        &mut old,
+    );
+    assert_eq!(n, 32);
+    let (i, v) = decode_itimerspec(&old);
+    assert_eq!(i, 0, "old interval is 0 (was disarmed)");
+    assert_eq!(v, 0, "old value is 0 (was disarmed)");
+}
+
+#[test]
+fn timerfd_periodic_read_counts_expirations_and_advances_deadline() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_TIMERFD_CREATE,
+        1,
+        &timerfd_create_req(CLOCK_MONOTONIC, TFD_NONBLOCK_BIT),
+        &mut [],
+    );
+    // Arm with an absolute deadline already in the past (value = 1ns
+    // absolute on MONOTONIC; the test stub counter is > 1000) and a
+    // period of 1ns — every call to now() advances the counter by 1,
+    // so each read should report 1+ expirations and disarm forward.
+    let mut old = [0u8; 32];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_TIMERFD_SETTIME,
+            1,
+            &timerfd_settime_req(fd as u32, TFD_TIMER_ABSTIME_BIT, 1, 1),
+            &mut old,
+        ),
+        32
+    );
+
+    let mut out = [0u8; 8];
+    let read_req = (fd as u32).to_le_bytes().to_vec();
+    let r = dispatch(METHOD_SYS_READ, 1, &read_req, &mut out);
+    assert_eq!(r, 8);
+    let count1 = u64::from_le_bytes(out);
+    assert!(count1 >= 1, "expirations >= 1 after armed deadline passed");
+
+    // Another read still shows ≥1 expirations (the periodic timer keeps
+    // ticking forward as the deterministic counter ticks).
+    let r2 = dispatch(METHOD_SYS_READ, 1, &read_req, &mut out);
+    assert_eq!(r2, 8);
+    let count2 = u64::from_le_bytes(out);
+    assert!(count2 >= 1, "periodic timer still firing");
+}
+
+#[test]
+fn timerfd_one_shot_read_disarms() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_TIMERFD_CREATE,
+        1,
+        &timerfd_create_req(CLOCK_MONOTONIC, TFD_NONBLOCK_BIT),
+        &mut [],
+    );
+    // One-shot at abs deadline = 1ns (immediately past).
+    let mut old = [0u8; 32];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_TIMERFD_SETTIME,
+            1,
+            &timerfd_settime_req(fd as u32, TFD_TIMER_ABSTIME_BIT, 0, 1),
+            &mut old,
+        ),
+        32
+    );
+
+    let mut out = [0u8; 8];
+    let read_req = (fd as u32).to_le_bytes().to_vec();
+    let r = dispatch(METHOD_SYS_READ, 1, &read_req, &mut out);
+    assert_eq!(r, 8);
+    assert_eq!(u64::from_le_bytes(out), 1, "one-shot returns exactly 1");
+
+    // Second read: timer is disarmed → -EAGAIN.
+    let r2 = dispatch(METHOD_SYS_READ, 1, &read_req, &mut out);
+    assert_eq!(r2, -(abi::EAGAIN as i64));
+}
+
+#[test]
+fn timerfd_settime_value_zero_disarms_even_with_interval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_TIMERFD_CREATE,
+        1,
+        &timerfd_create_req(CLOCK_MONOTONIC, TFD_NONBLOCK_BIT),
+        &mut [],
+    );
+    let mut old = [0u8; 32];
+    // First arm it.
+    dispatch(
+        METHOD_SYS_TIMERFD_SETTIME,
+        1,
+        &timerfd_settime_req(fd as u32, 0, 1_000_000_000, 1_000_000_000),
+        &mut old,
+    );
+    // Then disarm with value = 0, interval > 0 (interval ignored).
+    let mut old2 = [0u8; 32];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_TIMERFD_SETTIME,
+            1,
+            &timerfd_settime_req(fd as u32, 0, 1_000_000_000, 0),
+            &mut old2,
+        ),
+        32
+    );
+    // gettime now reports both fields zero (disarmed).
+    let mut out = [0u8; 32];
+    dispatch(
+        METHOD_SYS_TIMERFD_GETTIME,
+        1,
+        &(fd as u32).to_le_bytes(),
+        &mut out,
+    );
+    let (i, v) = decode_itimerspec(&out);
+    assert_eq!(i, 0);
+    assert_eq!(v, 0);
+}
+
+#[test]
+fn timerfd_settime_rejects_negative_nsec_via_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_TIMERFD_CREATE,
+        1,
+        &timerfd_create_req(CLOCK_MONOTONIC, 0),
+        &mut [],
+    );
+    // Hand-craft an itimerspec with negative tv_nsec.
+    let mut req = Vec::with_capacity(40);
+    req.extend_from_slice(&(fd as u32).to_le_bytes());
+    req.extend_from_slice(&0u32.to_le_bytes()); // flags
+    req.extend_from_slice(&0i64.to_le_bytes()); // i_sec
+    req.extend_from_slice(&0i64.to_le_bytes()); // i_nsec
+    req.extend_from_slice(&0i64.to_le_bytes()); // v_sec
+    req.extend_from_slice(&(-1_i64).to_le_bytes()); // v_nsec (negative)
+    let mut old = [0u8; 32];
+    assert_eq!(
+        dispatch(METHOD_SYS_TIMERFD_SETTIME, 1, &req, &mut old),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn timerfd_write_returns_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_TIMERFD_CREATE,
+        1,
+        &timerfd_create_req(CLOCK_MONOTONIC, 0),
+        &mut [],
+    );
+    let mut req = (fd as u32).to_le_bytes().to_vec();
+    req.extend_from_slice(&0u64.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_WRITE, 1, &req, &mut []),
+        -(abi::EINVAL as i64),
+        "timerfd is read-only"
+    );
+}
+
+#[test]
+fn timerfd_close_releases_state() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(
+        METHOD_SYS_TIMERFD_CREATE,
+        1,
+        &timerfd_create_req(CLOCK_MONOTONIC, 0),
+        &mut [],
+    );
+    let close_req = (fd as u32).to_le_bytes().to_vec();
+    assert_eq!(dispatch(METHOD_SYS_CLOSE, 1, &close_req, &mut []), 0);
+    let live = crate::kernel::with_kernel(|k| k.timerfd_get(1).is_some());
+    assert!(!live, "timerfd entry must be freed on last close");
 }
