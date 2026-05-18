@@ -1670,6 +1670,60 @@ pub(super) fn sys_faccessat(caller_pid: u32, request: &[u8]) -> i64 {
     with_kernel(|k| access_check(k, caller_pid, &resolved, mode, flag))
 }
 
+/// `unlinkat(dirfd, path, flag)` — #85. Request: `u32 dirfd LE +
+/// u32 flag LE + path bytes`. dirfd resolves via the shared `*at`
+/// resolver (`resolve_at`, #85 S0 — inode-anchored / rename-stable).
+/// `AT_REMOVEDIR` ⇒ `rmdir` semantics, otherwise `unlink`. The base
+/// op (which the resolved absolute path is handed to verbatim) owns
+/// ENOENT/ENOTEMPTY/EROFS.
+pub(super) fn sys_unlinkat(caller_pid: u32, request: &[u8]) -> i64 {
+    const AT_REMOVEDIR: u32 = 0x200;
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let dirfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let flag = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    if flag & !AT_REMOVEDIR != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let path = &request[8..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let resolved = match resolve_at(caller_pid, dirfd, path) {
+        Ok(p) => p,
+        Err(errno) => return -(errno as i64),
+    };
+    if flag & AT_REMOVEDIR != 0 {
+        rmdir(caller_pid, &resolved)
+    } else {
+        unlink(caller_pid, &resolved)
+    }
+}
+
+/// `mkdirat(dirfd, path, mode)` — #85. Request: `u32 dirfd LE +
+/// u32 mode LE + path bytes`. dirfd resolves via the shared `*at`
+/// resolver (`resolve_at`, #85 S0). `mode` is advisory (matches
+/// `sys_mkdir`). Delegates to `mkdir` with the resolved absolute path.
+pub(super) fn sys_mkdirat(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let dirfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    // mode is parsed for ABI completeness; `sys_mkdir` ignores it
+    // today (no mode-bit storage in the ramfs), so it is unused here.
+    let _mode = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let path = &request[8..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let resolved = match resolve_at(caller_pid, dirfd, path) {
+        Ok(p) => p,
+        Err(errno) => return -(errno as i64),
+    };
+    mkdir(caller_pid, &resolved)
+}
+
 /// Shared body for `sys_access` and `sys_faccessat`. Resolves the path
 /// (following symlinks unless AT_SYMLINK_NOFOLLOW), then checks the
 /// requested mode against the resolved file's metadata with the
