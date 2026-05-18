@@ -1,6 +1,7 @@
 import { afterEach, describe, it } from '@std/testing/bdd';
 import { expect } from '@std/expect';
 import { readdir, readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { Sandbox } from '../sandbox.js';
 import { NodeAdapter } from '../platform/node-adapter.js';
@@ -9,6 +10,32 @@ const FIXTURES = resolve(import.meta.dirname!, '../platform/__tests__/fixtures')
 const ZSH_SRC_DIR = resolve(import.meta.dirname!, '../../../../test-fixtures/c-ports/zsh/src');
 const ZSH_TEST_DIR = join(ZSH_SRC_DIR, 'Test');
 const ZSH_TEST_ROOT = '/tmp/zsh-src';
+
+/**
+ * The upstream harness lives in the extracted/configured zsh source tree,
+ * produced only by `make -C test-fixtures/c-ports/zsh` (tarball extract +
+ * configure + `make -C Src prep`). In CI the build step is skipped on a
+ * zsh-fixture cache hit, so the cache `path:` in
+ * .github/workflows/guest-compat.yml MUST restore
+ * `test-fixtures/c-ports/zsh/src` alongside zsh.wasm. If it does not, fail
+ * with an explicit message naming the missing tree instead of a bare
+ * `ENOENT … runtests.zsh` (the #210-class regression this guard names).
+ */
+function assertZshSourceTreePresent(): void {
+  const runtests = join(ZSH_TEST_DIR, 'runtests.zsh');
+  if (!existsSync(runtests)) {
+    throw new Error(
+      `zsh upstream source tree missing: ${runtests} not found.\n` +
+        `Expected the extracted zsh source under ${ZSH_SRC_DIR}. In CI this ` +
+        `tree is produced by \`make -C test-fixtures/c-ports/zsh\` and, on a ` +
+        `zsh-fixture cache hit (build skipped), must be restored by the ` +
+        `"Cache zsh fixture" actions/cache \`path:\` in ` +
+        `.github/workflows/guest-compat.yml (it must list ` +
+        `test-fixtures/c-ports/zsh/src, not only zsh.wasm). ` +
+        `Locally, run: make -C test-fixtures/c-ports/zsh copy-fixtures`,
+    );
+  }
+}
 
 const enc = (s: string) => new TextEncoder().encode(s);
 
@@ -129,6 +156,7 @@ describe('zsh upstream test harness', { sanitizeOps: false, sanitizeResources: f
   });
 
   async function runZshTests(names: string[]) {
+    assertZshSourceTreePresent();
     sandbox = await Sandbox.create({
       wasmDir: FIXTURES,
       adapter: new NodeAdapter(),

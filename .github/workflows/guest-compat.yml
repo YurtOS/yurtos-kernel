@@ -137,12 +137,26 @@ jobs:
       # zsh's cache key folds in ncurses sources too: if ncurses inputs
       # change, zsh.wasm content can change too, so both must invalidate
       # together.
+      #
+      # The cached `path:` MUST also include the extracted/configured zsh
+      # source tree (test-fixtures/c-ports/zsh/src): the later
+      # "Run upstream zsh tests" step's zsh-upstream_slow.ts reads its
+      # test harness (Test/runtests.zsh, ztst.zsh, *.ztst, Misc/, Src/*.mdd,
+      # config.modules) directly from that tree. That tree is produced only
+      # by `make -C test-fixtures/c-ports/zsh` (tarball extract + configure
+      # + `make -C Src prep`), which the build step below skips on a cache
+      # hit. Caching only zsh.wasm made a hit restore the wasm but not the
+      # source tree, so the upstream step failed with
+      # `ENOENT … test-fixtures/c-ports/zsh/src/Test/runtests.zsh`
+      # (#210 regression — intermittent: green when the key changes and the
+      # build reruns, red when an unrelated commit's key hits a prior save).
       - name: Cache zsh fixture
         id: zsh-cache
         uses: actions/cache@v4
         with:
           path: |
             packages/kernel/src/platform/__tests__/fixtures/zsh.wasm
+            test-fixtures/c-ports/zsh/src
           key: fixture-zsh-${{ hashFiles('test-fixtures/c-ports/zsh/**', 'test-fixtures/c-ports/ncurses/**', 'abi/include/**', 'abi/src/**', 'abi/Makefile', 'abi/toolchain/**', 'Cargo.lock', '.github/workflows/guest-compat.yml') }}
 
       - name: Build zsh fixture
