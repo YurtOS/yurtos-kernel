@@ -115,7 +115,10 @@ jobs:
             -p wc-bytes-wasm \
             -p proc-cmdline-wasm \
             -p true-cmd-wasm \
-            -p false-cmd-wasm
+            -p false-cmd-wasm \
+            -p spawn-wait-wasm \
+            -p child-exit7-wasm \
+            -p spawn-badreq-wasm
       - name: Format check
         run: deno fmt --check packages/kernel-host-interface-js/ packages/kernel-host-interface-deno/
       - name: Lint
@@ -124,7 +127,8 @@ jobs:
         run: |
           deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run \
             packages/kernel-host-interface-js/__tests__/ \
-            packages/kernel-host-interface-deno/__tests__/
+            packages/kernel-host-interface-deno/__tests__/ \
+            packages/runner/src/__tests__/
 
   # NOTE: a `hooks-self-check` job that runs `pre-commit run --all-files`
   # belongs in this file but is intentionally omitted from the initial gates
