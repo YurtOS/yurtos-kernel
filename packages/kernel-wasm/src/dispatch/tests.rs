@@ -12643,12 +12643,12 @@ fn stat_lstat_intermediate_symlink_loop_is_einval() {
     );
 }
 
-/// KNOWN PRESERVED non-POSIX residual (#146): a trailing slash does
-/// NOT force-follow a terminal symlink for lstat. Pins current
-/// behavior so #146's eventual fix is a deliberate, test-visible
-/// change, not an accident.
+/// #146 fix: a trailing slash forces terminal-symlink follow and a
+/// directory check for both `stat` and `lstat`. Updated from the
+/// former "known residual" characterization — now asserts the POSIX
+/// behavior the issue requires.
 #[test]
-fn lstat_trailing_slash_on_terminal_symlink_known_residual_146() {
+fn lstat_trailing_slash_forces_terminal_symlink_follow_146() {
     let _g = crate::kernel::TestGuard::acquire();
     assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
     let mut sreq = (b"/real".len() as u32).to_le_bytes().to_vec();
@@ -12659,9 +12659,149 @@ fn lstat_trailing_slash_on_terminal_symlink_known_residual_146() {
     assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/symdir/", &mut out), 16);
     assert_eq!(
         u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "#146: trailing slash forces follow; /symdir/ types as DIR (3), \
+         not S_IFLNK (7) (WASI filetype: 3=DIR, 4=REG, 7=SYMLINK)"
+    );
+    // Without trailing slash: lstat's no-follow rule still applies.
+    let mut out2 = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/symdir", &mut out2), 16);
+    assert_eq!(
+        u32::from_le_bytes(out2[8..12].try_into().unwrap()),
         7,
-        "KNOWN RESIDUAL #146: trailing slash does not force-follow; \
-         symdir reported as S_IFLNK (POSIX would follow to S_IFDIR)"
+        "no trailing slash: lstat still un-follows the terminal symlink \
+         (S_IFLNK)"
+    );
+}
+
+/// #146: trailing slash on a regular-file path (or symlink-to-file)
+/// must produce -ENOTDIR for both stat and lstat. Pins POSIX's
+/// `pathname/` ⇒ "must be a directory" rule across stat-vs-lstat.
+#[test]
+fn stat_lstat_trailing_slash_requires_directory_146() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = (b"/file".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/file");
+    reg.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    // Symlink-to-file: trailing slash follows the link, sees a file, ENOTDIR.
+    let mut s = (b"/file".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/file");
+    s.extend_from_slice(b"/symfile");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/file/", &mut out),
+        -(abi::ENOTDIR as i64),
+        "stat: trailing slash on regular file → ENOTDIR"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/file/", &mut out),
+        -(abi::ENOTDIR as i64),
+        "lstat: trailing slash on regular file → ENOTDIR"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/symfile/", &mut out),
+        -(abi::ENOTDIR as i64),
+        "stat: trailing slash on symlink-to-file → ENOTDIR"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/symfile/", &mut out),
+        -(abi::ENOTDIR as i64),
+        "lstat: trailing slash forces follow; resolves to a file → ENOTDIR"
+    );
+}
+
+/// #146: trailing `/.` is equivalent to trailing `/` for POSIX
+/// path resolution (both require the final component to be a dir).
+#[test]
+fn stat_lstat_trailing_slash_dot_requires_directory_146() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = (b"/file".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/file");
+    reg.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/file/.", &mut out),
+        -(abi::ENOTDIR as i64),
+        "stat: trailing /. on regular file → ENOTDIR"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/file/.", &mut out),
+        -(abi::ENOTDIR as i64),
+        "lstat: trailing /. on regular file → ENOTDIR"
+    );
+
+    // Trailing /. on a real dir succeeds and types as DIR (3).
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/d/.", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "stat: trailing /. on dir types as DIR (3)"
+    );
+}
+
+/// #146: trailing slash on a dangling symlink must fail (forced
+/// terminal follow + missing target → -ENOENT), regardless of
+/// stat-vs-lstat. Without trailing slash, lstat of a dangling link
+/// still succeeds and reports S_IFLNK (the unchanged base case).
+#[test]
+fn stat_lstat_trailing_slash_on_dangling_symlink_is_enoent_146() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut s = (b"/missing".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/missing");
+    s.extend_from_slice(b"/dangling");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/dangling/", &mut out),
+        -(abi::ENOENT as i64),
+        "stat: trailing slash on dangling link → follow fails → ENOENT"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/dangling/", &mut out),
+        -(abi::ENOENT as i64),
+        "lstat: trailing slash forces follow → dangling → ENOENT"
+    );
+    // No trailing slash: lstat of a dangling link reports S_IFLNK
+    // unchanged (the #134 Part 1 dangling-link contract).
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/dangling", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "no trailing slash: lstat of dangling link still reports S_IFLNK"
+    );
+}
+
+/// #146: trailing slash on root `/` and on a plain directory must
+/// succeed (both are directories). Pins the no-regression case.
+#[test]
+fn stat_trailing_slash_on_root_and_dir_succeeds_146() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "stat /: DIR (3)"
+    );
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/d/", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "stat /d/: DIR (3)"
+    );
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/d/", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "lstat /d/: DIR (3) (no terminal symlink to differ from stat here)"
     );
 }
 

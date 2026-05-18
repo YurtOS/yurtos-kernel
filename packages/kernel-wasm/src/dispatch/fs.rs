@@ -1012,6 +1012,16 @@ fn write_stat_record(k: &mut Kernel, path: &[u8], response: &mut [u8]) -> i64 {
     16
 }
 
+/// POSIX: a trailing `/` (or trailing `/.`) on a pathname forces the
+/// final component to be **followed as a symlink** and to resolve to a
+/// **directory** (`-ENOTDIR` otherwise), regardless of `stat`-vs-`lstat`.
+/// Detected on the raw request bytes because `normalize_readable_path`
+/// → `split_components` discards the trailing slash. Single source of
+/// truth for `stat_path` / `lstat_path` so the two cannot drift. (#146)
+fn path_requires_dir(raw: &[u8]) -> bool {
+    raw.ends_with(b"/") || raw.ends_with(b"/.")
+}
+
 /// `stat(path) -> 16-byte fstat-shaped record`. Same wire format as
 /// sys_fstat: u64 size + u32 filetype + u32 mode. Doesn't require an
 /// open fd. Returns 16 on success, -ENOENT for unresolvable path.
@@ -1022,6 +1032,7 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
     if response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
+    let requires_dir = path_requires_dir(request);
     with_kernel(|k| {
         let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
@@ -1036,6 +1047,19 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
             Ok(path) => path,
             Err(rc) => return rc,
         };
+        // #146: a trailing `/` (or `/.`) demands the resolved entry be
+        // a directory. Symlink-follow is already on for stat; the only
+        // extra obligation is the typing check. Distinguish:
+        //   missing (`entry_type == 0`) → -ENOENT (same as no-trailing-
+        //     slash stat),
+        //   present but not a dir → -ENOTDIR.
+        if requires_dir {
+            match k.vfs.entry_type(&path) {
+                0 => return -(abi::ENOENT as i64),
+                3 => {}
+                _ => return -(abi::ENOTDIR as i64),
+            }
+        }
         write_stat_record(k, &path, response)
     })
 }
@@ -1056,6 +1080,7 @@ pub(super) fn lstat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -
     if response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
+    let requires_dir = path_requires_dir(request);
     with_kernel(|k| {
         let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
@@ -1064,10 +1089,25 @@ pub(super) fn lstat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -
         // Resolve intermediate symlink components, but NOT the terminal
         // (POSIX lstat). write_stat_record then types the un-followed
         // terminal (S_IFLNK + #134 Part 1 size for a symlink).
-        let path = match resolve_symlinks_per_component(k, caller_pid, path, false) {
+        //
+        // #146: a trailing `/` (or `/.`) on the raw request overrides
+        // the lstat no-follow rule for the terminal component — POSIX
+        // says trailing-slash forces symlink-follow + dir-check
+        // regardless of stat/lstat. The dir check is enforced
+        // post-resolve below.
+        let follow_terminal = requires_dir;
+        let path = match resolve_symlinks_per_component(k, caller_pid, path, follow_terminal) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
+        // #146: same typing rule as stat_path's trailing-slash branch.
+        if requires_dir {
+            match k.vfs.entry_type(&path) {
+                0 => return -(abi::ENOENT as i64),
+                3 => {}
+                _ => return -(abi::ENOTDIR as i64),
+            }
+        }
         write_stat_record(k, &path, response)
     })
 }
