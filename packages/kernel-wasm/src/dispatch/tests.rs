@@ -14109,3 +14109,269 @@ fn dir_anchor_keeps_real_mount_id_on_degraded_non_root_mount() {
          real mount id, not ROOT_MOUNT"
     );
 }
+
+// ── #91 Task 3: sys_select / sys_pselect ─────────────────────────────
+
+const SEL_SET_BYTES: usize = 128;
+const SEL_REQ_LEN: usize = 404;
+const PSEL_REQ_LEN: usize = 412;
+const SEL_RESP_LEN: usize = 384;
+
+fn sel_fdset_set(bitmap: &mut [u8], fd: usize) {
+    bitmap[(fd / 32) * 4 + ((fd % 32) / 8)] |= 1 << (fd % 8);
+}
+
+fn sel_fdset_get(bitmap: &[u8], fd: usize) -> bool {
+    bitmap[(fd / 32) * 4 + ((fd % 32) / 8)] & (1 << (fd % 8)) != 0
+}
+
+/// Build a 404 B sys_select request. `r`/`w`/`e` are fd lists; `timeout_null=1`.
+fn sel_req(nfds: u32, r: &[usize], w: &[usize], e: &[usize]) -> Vec<u8> {
+    let mut req = vec![0u8; SEL_REQ_LEN];
+    req[0..4].copy_from_slice(&nfds.to_le_bytes());
+    req[16] = 1; // timeout_null = 1 (no timeout struct)
+    let (ro, wo, eo) = (20usize, 148usize, 276usize);
+    for &fd in r {
+        sel_fdset_set(&mut req[ro..ro + SEL_SET_BYTES], fd);
+    }
+    for &fd in w {
+        sel_fdset_set(&mut req[wo..wo + SEL_SET_BYTES], fd);
+    }
+    for &fd in e {
+        sel_fdset_set(&mut req[eo..eo + SEL_SET_BYTES], fd);
+    }
+    req
+}
+
+/// Build a 412 B sys_pselect request. `sigmask=None` means null.
+fn psel_req(nfds: u32, r: &[usize], w: &[usize], e: &[usize], sigmask: Option<u64>) -> Vec<u8> {
+    let mut req = vec![0u8; PSEL_REQ_LEN];
+    req[0..4].copy_from_slice(&nfds.to_le_bytes());
+    req[16] = 1; // timeout_null
+    match sigmask {
+        Some(m) => {
+            req[17] = 0; // sigmask_null = 0 (present)
+            req[20..28].copy_from_slice(&m.to_le_bytes());
+        }
+        None => req[17] = 1,
+    }
+    let (ro, wo, eo) = (28usize, 156usize, 284usize);
+    for &fd in r {
+        sel_fdset_set(&mut req[ro..ro + SEL_SET_BYTES], fd);
+    }
+    for &fd in w {
+        sel_fdset_set(&mut req[wo..wo + SEL_SET_BYTES], fd);
+    }
+    for &fd in e {
+        sel_fdset_set(&mut req[eo..eo + SEL_SET_BYTES], fd);
+    }
+    req
+}
+
+fn sel_open_file(path: &[u8]) -> i32 {
+    let mut reg = (path.len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(path);
+    reg.extend_from_slice(b"data");
+    assert_eq!(dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []), 0);
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, path), &mut []);
+    assert!(fd >= 0, "open failed: rc={fd}");
+    fd as i32
+}
+
+#[test]
+fn select_regular_file_counts_read_and_write_per_set() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = sel_open_file(b"/sel1.txt") as usize;
+    // Regular file is immediately read+write ready: read+write bits => count 2.
+    let req = sel_req(fd as u32 + 1, &[fd], &[fd], &[]);
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    assert_eq!(dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp), 2);
+    assert!(sel_fdset_get(&resp[0..128], fd));
+    assert!(sel_fdset_get(&resp[128..256], fd));
+    assert!(!sel_fdset_get(&resp[256..384], fd));
+}
+
+#[test]
+fn select_first_invalid_fd_returns_ebadf() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // fd 900 in readfds but never opened -> POLLNVAL -> -EBADF.
+    let req = sel_req(901, &[900], &[], &[]);
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    assert_eq!(
+        dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp),
+        -(abi::EBADF as i64)
+    );
+    // D7: error-path response bytes are POSIX-unspecified; do NOT
+    // assert on resp content here.
+}
+
+#[test]
+fn select_bad_fd_absent_from_all_sets_is_not_ebadf_c1() {
+    // C1 core invariant: a fd in [0,nfds) but not in ANY set is never
+    // examined, so a closed/invalid fd there must NOT cause -EBADF.
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = sel_open_file(b"/sel_c1.txt") as usize;
+    // nfds spans fd 900 (never opened) but 900 is in no set.
+    let req = sel_req(901, &[fd], &[], &[]);
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    assert_eq!(dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp), 1);
+    assert!(sel_fdset_get(&resp[0..128], fd));
+}
+
+#[test]
+fn select_null_sets_behave_as_all_zero_c2() {
+    // C2: read-only wait. writefds/exceptfds all-zero (guest zero-fills
+    // NULL). Behaves identically to "no fds in those sets".
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = sel_open_file(b"/sel_c2.txt") as usize;
+    let req = sel_req(fd as u32 + 1, &[fd], &[], &[]);
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    assert_eq!(dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp), 1);
+    assert!(sel_fdset_get(&resp[0..128], fd));
+    assert_eq!(&resp[128..384], &[0u8; 256][..]); // write/except untouched-zero
+}
+
+#[test]
+fn select_nfds_zero_counts_zero_c3() {
+    // C3: nfds==0 -> no fds examined -> count 0. M5: not clearing the
+    // caller's fd_sets is a known intentional POSIX deviation (faithful
+    // to the retired yurt_select.c behavior). Kernel returns 0; the
+    // shim never copies back on this path.
+    let _g = crate::kernel::TestGuard::acquire();
+    let req = sel_req(0, &[], &[], &[]);
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    assert_eq!(dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp), 0);
+}
+
+#[test]
+fn select_wrong_request_length_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    assert_eq!(
+        dispatch(METHOD_SYS_SELECT, 1, &vec![0u8; 403], &mut resp),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SELECT, 1, &vec![0u8; 405], &mut resp),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn select_small_response_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let req = sel_req(1, &[], &[], &[]);
+    assert_eq!(
+        dispatch(METHOD_SYS_SELECT, 1, &req, &mut vec![0u8; 383]),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn select_nfds_over_1024_and_negative_wrap_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    let req = sel_req(1025, &[], &[], &[]);
+    assert_eq!(
+        dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp),
+        -(abi::EINVAL as i64)
+    );
+    // A guest `int nfds = -1` arrives as u32 0xFFFF_FFFF (> 1024).
+    let req = sel_req(0xFFFF_FFFF, &[], &[], &[]);
+    assert_eq!(
+        dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn select_out_of_range_timeout_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    let mut req = sel_req(1, &[], &[], &[]);
+    req[16] = 0; // timeout present
+    req[4..12].copy_from_slice(&(-1_i64).to_le_bytes()); // tv_sec < 0
+    assert_eq!(
+        dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp),
+        -(abi::EINVAL as i64)
+    );
+    let mut req = sel_req(1, &[], &[], &[]);
+    req[16] = 0;
+    req[12..16].copy_from_slice(&1_000_000_i32.to_le_bytes()); // tv_usec == 1e6
+    assert_eq!(
+        dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn select_timeout_null_vs_zero_both_snapshot() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = sel_open_file(b"/sel_to.txt") as usize;
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    // timeout_null == 1
+    let req = sel_req(fd as u32 + 1, &[fd], &[], &[]);
+    assert_eq!(dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp), 1);
+    // timeout present, zeroed
+    let mut req = sel_req(fd as u32 + 1, &[fd], &[], &[]);
+    req[16] = 0;
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    assert_eq!(dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp), 1);
+}
+
+#[test]
+fn select_null_timeout_with_garbage_duration_bytes_is_not_einval_m3() {
+    // M3: when timeout_null==1, the duration bytes are NOT range-
+    // checked. A NULL caller timeout must NEVER spuriously trip
+    // -EINVAL, even if those bytes contain otherwise-out-of-range
+    // values (uninitialized stack memory in real usage).
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = sel_open_file(b"/sel_m3.txt") as usize;
+    let mut req = sel_req(fd as u32 + 1, &[fd], &[], &[]);
+    req[16] = 1; // timeout_null
+                 // Garbage tv_sec=-1 (would be -EINVAL if timeout were present).
+    req[4..12].copy_from_slice(&(-1_i64).to_le_bytes());
+    req[12..16].copy_from_slice(&i32::MAX.to_le_bytes()); // garbage tv_usec
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    assert_eq!(dispatch(METHOD_SYS_SELECT, 1, &req, &mut resp), 1);
+    assert!(sel_fdset_get(&resp[0..128], fd));
+}
+
+#[test]
+fn pselect_same_shaping_with_sigmask_present() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = sel_open_file(b"/psel.txt") as usize;
+    // SIGCHLD canonical bit = 17-1 = 16. Carried, not applied today.
+    let req = psel_req(fd as u32 + 1, &[fd], &[fd], &[], Some(1u64 << 16));
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    assert_eq!(dispatch(METHOD_SYS_PSELECT, 1, &req, &mut resp), 2);
+    assert!(sel_fdset_get(&resp[0..128], fd));
+    assert!(sel_fdset_get(&resp[128..256], fd));
+}
+
+#[test]
+fn pselect_wrong_length_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    assert_eq!(
+        dispatch(METHOD_SYS_PSELECT, 1, &vec![0u8; 411], &mut resp),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PSELECT, 1, &vec![0u8; 413], &mut resp),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn pselect_out_of_range_tv_nsec_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut resp = vec![0u8; SEL_RESP_LEN];
+    let mut req = psel_req(1, &[], &[], &[], None);
+    req[16] = 0; // timeout present
+    req[12..16].copy_from_slice(&1_000_000_000_i32.to_le_bytes()); // tv_nsec == 1e9
+    assert_eq!(
+        dispatch(METHOD_SYS_PSELECT, 1, &req, &mut resp),
+        -(abi::EINVAL as i64)
+    );
+}
