@@ -532,7 +532,6 @@ export class NetworkBridge implements NetworkBridgeLike {
     // Wait for the worker to signal it's ready (with a fallback timeout)
     await new Promise<void>((resolve, reject) => {
       const worker = this.worker!;
-      let timer: ReturnType<typeof setTimeout> | undefined;
       const cleanup = () => {
         if (timer) clearTimeout(timer);
         worker.off("message", onMessage);
@@ -552,7 +551,7 @@ export class NetworkBridge implements NetworkBridgeLike {
       const onError = (err: Error) => fail(err);
       worker.on("message", onMessage);
       worker.on("error", onError);
-      timer = setTimeout(finish, 2000); // fallback timeout
+      const timer = setTimeout(finish, 2000); // fallback timeout
     });
   }
 

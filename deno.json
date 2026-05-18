@@ -1,6 +1,11 @@
 {
   "unstable": ["sloppy-imports"],
   "nodeModulesDir": "auto",
+  "lint": {
+    "rules": {
+      "exclude": ["no-sloppy-imports"]
+    }
+  },
   "exclude": [
     "packages/kernel/src/platform/__tests__/fixtures/yurt-jupyter/site-packages"
   ],
