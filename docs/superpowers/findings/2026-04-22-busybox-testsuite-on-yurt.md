@@ -218,11 +218,11 @@ SKIPPED: sort
 SKIPPED: sort -n input
 SKIPPED: taskset -p 1 >/dev/null;echo $?
 SKIPPED: taskset -p 0 >/dev/null 2>&1;echo $?
-SKIPPED: 
-SKIPPED: 
-SKIPPED: 
+SKIPPED:
+SKIPPED:
+SKIPPED:
 SKIPPED: tsort input
-SKIPPED: 
+SKIPPED:
 SKIPPED: tsort
 SKIPPED: tsort
 SKIPPED: tsort
@@ -238,7 +238,7 @@ PASS: tsort prefixes
 PASS: tsort odd
 PASS: tsort odd2
 PASS: tsort cycle
-SKIPPED: 
+SKIPPED:
 PASS: basename-does-not-remove-identical-extension
 PASS: basename-works
 PASS: bunzip2-removes-compressed-file
