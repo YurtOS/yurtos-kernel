@@ -6,6 +6,7 @@
   ],
   "imports": {
     "@yurt/kernel": "./packages/kernel/src/index.ts",
+    "@yurt/runner": "./packages/runner/src/index.ts",
     "@yurt/kernel-host-interface-js": "./packages/kernel-host-interface-js/mod.ts",
     "@yurt/kernel-host-interface-deno": "./packages/kernel-host-interface-deno/mod.ts",
     "@std/testing": "jsr:@std/testing@^1",
