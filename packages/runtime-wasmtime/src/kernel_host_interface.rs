@@ -5655,13 +5655,24 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
         SYS_NAMESPACE,
         "sys_sigaction",
         |mut caller: Caller<'_, UserState>, sig: i32, disposition: i32| -> i32 {
-            let mut req = Vec::with_capacity(8);
+            // 21-byte wire (B/PR225 F1): [u32 sig][u8 has_act][u32 handler]
+            // [u64 sa_mask][u32 sa_flags] (LE). The legacy 2-arg env shim is
+            // always a SET (has_act=1) — it carries no oldact out-pointer, so
+            // the prior disposition lands in the 16-byte response buffer and
+            // the kernel rc (16 on success) is returned verbatim. Mirrors the
+            // migrated JS sys_shim.ts sys_sigaction.
+            let mut req = Vec::with_capacity(21);
             req.extend_from_slice(&(sig as u32).to_le_bytes());
-            req.extend_from_slice(&(disposition as u32).to_le_bytes());
-            forward_request_bytes(
+            req.push(1u8); // has_act=1 (set)
+            req.extend_from_slice(&(disposition as u32).to_le_bytes()); // handler
+            req.extend_from_slice(&0u64.to_le_bytes()); // sa_mask
+            req.extend_from_slice(&0u32.to_le_bytes()); // sa_flags
+            let mut response = [0u8; 16];
+            trampoline_request_with_response(
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::SIGACTION,
                 &req,
+                &mut response,
             ) as i32
         },
     )?;
