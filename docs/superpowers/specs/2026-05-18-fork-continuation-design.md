@@ -1,6 +1,6 @@
 # Real `fork()` continuation — design (supersedes 2026-05-16-rust-fork-parity-design.md)
 
-**Date:** 2026-05-18 · **Rev:** 2 (post external verification — every concrete code claim verified true; +40% relabelled as inherited estimate; T3-scope / test-interlock / T1-long-pole gaps incorporated).
+**Date:** 2026-05-18 · **Rev:** 3 (post review-2 — all source-verified: F1 asyncify snapshot moved to a top-level driver loop, NOT the import; F2 commit-before-resume ordering invariant; F3 interlock extended to `process/{loader,manager,module-profile}.ts`; F4 lean-fork canonicalised to runtime `-ENOSYS` (not link error); F5 deterministic+order-insensitive fork-output oracle. Rev2: every concrete code claim verified true; +40% relabelled inherited estimate; T3-scope/test-interlock/T1-long-pole gaps incorporated).
 **PR:** #224 (`claude/fork-impl`). **Umbrella:** #172. **Blocks (file-scoped):** Phase 4 / `git rm packages/kernel/` (#170) — see Interlock.
 **Supersedes:** `docs/superpowers/specs/2026-05-16-rust-fork-parity-design.md` — its kernel `prepare_fork`/`commit_fork`/`rollback_fork` contract and *host-owns-continuation, kernel-owns-identity* architecture remain valid and are carried forward verbatim; this doc replaces its host-implementation framing with the Task-0 spike reality and the verified two-libc / 99-1 model.
 
@@ -14,10 +14,10 @@ A guest `fork()` returns **twice** — child gets `0`, parent gets the child pid
 
 > `abi/toolchain/yurt-toolchain/src/wasm_opt.rs:21-27` — *"Continuations are an explicit opt-in because they taint the process execution strategy: those modules run under the Asyncify adapter while normal modules remain free to use JSPI or another backend."*
 
-So a module is **either** asyncify-instrumented (runs under the Asyncify adapter; `fork`/`setjmp`/`longjmp` work) **or** lean (free for JSPI/native; `fork()` → link error by design). It cannot be both — verified, per-module, chosen at build time. Hence **two libcs**:
+So a module is **either** asyncify-instrumented (runs under the Asyncify adapter; `fork`/`setjmp`/`longjmp` work) **or** lean (free for JSPI/native). It cannot be both — verified, per-module, chosen at build time. Hence **two libcs**:
 
-- **continuation libc** — asyncify-tainted; provides `fork`/`setjmp`/`longjmp`.
-- **lean libc** — no asyncify; preserves the JSPI/native fast route; `fork()` is a weak/`-ENOSYS` stub (link error by design).
+- **continuation libc** — asyncify-tainted; links the *strong* `fork`/`vfork` shim (`abi/src/yurt_fork.c`) that imports `yurt.host_fork`.
+- **lean libc** — no asyncify; preserves the JSPI/native fast route. It links the **always-present weak `fork`/`vfork` ENOSYS stub** — so `fork()` **compiles and links, and returns `-ENOSYS` at runtime** (it is *not* a link error; the canonical, implemented, and test-asserted contract is runtime `-ENOSYS`, per `abi/src/yurt_fork.c:1-5` and `packages/kernel/src/__tests__/abi_test.ts:620` "keeps plain fork as ENOSYS outside continuation builds"). The continuation archive overrides the weak stub with the strong shim.
 
 **Cost of asyncify (why this is opt-in, not universal):**
 - Code size — **inherited estimate ≈ +40%**, sourced to the `async-bridge.ts:13-16` comment via `docs/superpowers/plans/2026-05-17-fork-capture-notes.md:150`. **Not re-measured in this worktree** — treat as a prior-knowledge ballpark, not a spike-verified fact.
@@ -41,13 +41,16 @@ They are complementary tracks, never to be re-conflated: lean-libc programs get 
 
 > **Asyncify is a *guest* mechanism, not host async.** The user-process wasmtime engine has no `async_support`/JSPI/stack-switching — and it does not need it: asyncify is a Binaryen *guest control-flow rewrite* driven through the guest's own `asyncify_start_unwind/stop_unwind/start_rewind/stop_rewind` exports plus the in-linear-memory `yurt_asyncify_buf`. The host only orchestrates those guest exports + the kernel `prepare/commit/rollback`. This is *why* asyncify is the only viable option on the no-host-async path — do not implement it expecting host-side suspension.
 
-**Rust host** (`packages/runtime-wasmtime`): replace the rebuild with real asyncify unwind/rewind:
-1. guest (continuation libc) calls `yurt.host_fork`; the asyncify-instrumented guest is mid-unwind, its call stack spilled into `yurt_asyncify_buf` (64 KiB), linear memory is the parent's exact state at the `fork()` site.
-2. host calls kernel `prepare_fork(parent_pid)` → `child_pid` (kernel allocates pid, clones fd-table/cwd/creds, marks `ForkPreparing`).
-3. host creates the child instance from the **parent's memory + asyncify buffer snapshot** (NOT a fresh `_start`), starts the child in asyncify **rewind** so it returns from `host_fork` with `0`.
-4. parent is rewound returning `child_pid`.
-5. host calls `commit_fork(parent_pid, child_pid)` (child becomes waitpid/signal/schedule-visible); any host-step failure → `rollback_fork`.
-- A **lean-libc** guest (no asyncify) reaching `host_fork` → return spec-mandated **`-ENOSYS`** (fix the current bug where it returns a bogus child pid). Belt-and-braces; the primary gate is the link error.
+**Rust host** (`packages/runtime-wasmtime`): replace the rebuild with a real asyncify **unwind → snapshot → commit → rewind** dance. The snapshot is NOT taken in the import; it is taken by a **top-level asyncify driver loop** around `_start`/resume, mirroring the verified TS reference (`async-bridge.ts` `wrapExport` loop `:448-468`: `hostFork` only `startUnwind`s and sets a pending flag; the loop, after `stopUnwind()`, takes `snapshotForkContinuation()` then `forkController.forkFromContinuation(...)`).
+
+1. **`host_fork` import** (continuation-libc guest): record pending-fork intent, call `asyncify_start_unwind(buf)`, return (value ignored). It does **not** snapshot, prepare, or commit. A **lean-libc** guest reaching `host_fork` (it shouldn't — its weak stub returns `-ENOSYS` before any import) → return **`-ENOSYS`** (fixes the current bug returning a bogus pid). Primary gate is the runtime `-ENOSYS` weak stub, not a link error.
+2. **Driver loop** (host-side, wraps `_start`/resume): the guest unwinds frame-by-frame back to the host; loop sees asyncify state == unwinding, calls `asyncify_stop_unwind()`. **Now** (and only now) `yurt_asyncify_buf` + linear memory hold the parent's exact state at the `fork()` site.
+3. Take the continuation **snapshot** (asyncify buffer + linear memory + stack pointer).
+4. `prepare_fork(parent_pid)` → `child_pid` (kernel allocates pid, clones fd-table/cwd/creds, marks `ForkPreparing`).
+5. Fully instantiate/restore the **child** from the snapshot (NOT a fresh `_start`); set its pending fork return = `0`.
+6. **`commit_fork(parent_pid, child_pid)`** — child becomes waitpid/signal/schedule-visible — **before** any guest resumes.
+7. Only now resume: parent via `asyncify_start_rewind` returning `child_pid`; child driven by its own asyncify rewind returning `0`.
+8. Any failure **before step 6** → `rollback_fork`, no partial child visible. (Ordering invariant: **prepare → fully restore child → commit → only then resume parent & child**; no parent pid observable and no child execution before commit. This refines the carried-forward 2026-05-16 ordering, which placed child-start before commit — implementation reality, the TS bridge, is authoritative.)
 
 **JS host** (`kernel-host-interface-js`): **port-and-adapt** the `AsyncifyAsyncBridge` fork logic out of `packages/kernel/src/async-bridge.ts` (the named symbols — `hostFork`/`snapshotForkContinuation`/`restoreForkSnapshot`/`startForkRewind`/`AsyncifyForkController` — are the *core*, not the whole surface). Remove `host_fork` from `USER_YURT_STUB_IMPORTS`; mirror the Rust per-child semantics (cross-host parity discipline, as the spawn/wait slice did).
 
@@ -58,23 +61,24 @@ They are complementary tracks, never to be re-conflated: lean-libc programs get 
 ## Critical sequencing / interlock
 
 The JS continuation reference **and the only existing proof it works** live in the TS kernel that Phase 4 (#170) deletes. The interlock is **file-scoped**, not "#224 blocks all of #170": #170 must not delete the following until the JS port (T3) **and** a replacement parity oracle (T4) have landed —
-- `packages/kernel/src/async-bridge.ts` (the bridge implementation + its loader/manager/module-profile integration), and
+- `packages/kernel/src/async-bridge.ts` (the bridge implementation), **and its fork integration files — confirmed fork-relevant**: `packages/kernel/src/process/loader.ts` (~94 fork refs — the controller/`forkChildFromSnapshot` wiring), `packages/kernel/src/process/manager.ts` (~14), `packages/kernel/src/process/module-profile.ts` (~16 — the asyncify-vs-threads mutual-exclusion). Protecting only `async-bridge.ts` would leave T3 without the integration oracle. (T5 may instead extract the fork-relevant sections of these into a kept reference, but the default is keep-the-files until T3+T4.) And —
 - the existing continuation oracles: `packages/kernel/src/__tests__/abi_test.ts` (the fork cases at `:620` "keeps plain fork as ENOSYS outside continuation builds" and `:640` "preserves pre-fork continuation frames in children") and `packages/kernel/src/__tests__/sandbox-wasm-kernel_test.ts:179` ("runs fork continuations through Rust-owned process lifecycle").
 
 These tests are the *current* proof real fork works; deleting them before T4 reproduces equivalent cross-host coverage would remove the very oracle T4 must validate against. The rest of `packages/kernel/` is **not** blocked by #224. This file-scoped ordering is a hard constraint on umbrella #172; T5 must annotate #170 with the precise keep-until-T4 file list.
 
 ## Error handling / edges
 
-- lean-libc `fork()` → link error (primary, by design); `host_fork` reached by a lean guest → `-ENOSYS`.
-- `fork()` from a process with imported shared memory, or a non-main pthread → **`-EAGAIN`** (first pass; existing non-goal carried from the 2026-05-16 spec).
+- lean-libc `fork()` → **runtime `-ENOSYS`** via the always-linked weak stub (`abi/src/yurt_fork.c`); this is the single canonical contract, asserted by `abi_test.ts:620`. (Not a link error — see the two-libc section.) `host_fork` reached by any lean guest → also `-ENOSYS`.
+- `fork()` from a process with imported shared memory, or a non-main pthread → **`-EAGAIN`**. These guards **already exist** (`snapshot_user_memory` returns `-EAGAIN` on shared memory; `prepare_fork` returns `-EAGAIN` on `threads.len() > 1`) — T2 must **preserve, not regress** them; it is not new first-pass work.
 - Any host capture/instantiate/commit failure → `rollback_fork`, no partial child visible to `waitpid`.
 - `vfork()` = `fork()` alias (existing non-goal: no suspended-parent shared-address-space semantics).
 - `WIFSIGNALED`/full signal wait-status is **#99**, out of scope.
 
 ## Testing / cross-host parity
 
-- The Task-0 `fork-twice` characterizing test (`fixture_parity.rs`) is the **tripwire**: today it asserts the rebuild signature (parent-only line, child never runs). On completion it must flip to the true-snapshot signature — **two** lines, the child observing the parent's *pre-fork* sentinel (proving shared memory state at the fork point) and `rc=0`, parent `rc=child_pid`.
-- Cross-host **parity oracle**: same `fork-twice` (+ a `fork-exec` fixture) byte-identical stdout + exit through the Rust `kernel_host_interface` host AND the JS `Runner`, same discipline as the merged spawn/wait slice (#129).
+- The Task-0 `fork-twice` characterizing test (`fixture_parity.rs`) is the **tripwire**: today it asserts the rebuild signature (parent-only line, child never runs). On completion it must flip to the true-snapshot signature — **two** lines: the child observing the parent's *pre-fork* sentinel (proving shared memory state at the fork point) with `rc=0`, and parent `rc=child_pid`.
+- **Output ordering must be made deterministic, not assumed.** Post-`fork()` parent/child stdout interleaving is not naturally stable. The fixture imposes order the same way the spawn-wait slice did: the **child runs to exit, the parent `waitpid()`s it, then the parent prints** — so the byte stream is deterministic (child line, then parent line) on both hosts. The cross-host oracle additionally parses the two lines **order-insensitively** (match each line by role, assert exact fields: child `rc=0` + pre-fork sentinel; parent `rc=child_pid`) so a future non-`waitpid` fixture can't silently bake in scheduler order.
+- Cross-host **parity oracle**: same `fork-twice` (+ a `fork-exec` fixture) — identical per-field assertions + exit through the Rust `kernel_host_interface` host AND the JS `Runner`, same discipline as the merged spawn/wait slice (#129).
 - Fork fixtures must be built through the **continuation/asyncify toolchain mode** (`wasm_opt.rs` `use_continuation=true`); `ensure_fixture_built`'s plain `cargo build` does not run `wasm-opt --asyncify` — the fixture harness needs an asyncify build path. (New sub-task surfaced by the spike.)
 
 ## Decomposition (for the implementation plan)
@@ -83,7 +87,7 @@ These tests are the *current* proof real fork works; deleting them before T4 rep
 2. **T2** — Rust host: replace the rebuild with real asyncify snapshot/rewind; lean-guest `host_fork` → `-ENOSYS`. *Independent of T3.*
 3. **T3** — JS host: port-and-adapt the `AsyncifyAsyncBridge` **and its kernel integration surface** (see the Host-architecture T3 callout — larger than a symbol copy). *Independent of T2.*
 4. **T4** — cross-host parity (`fixture_parity.rs` + JS `Runner` E2E) + edges (`vfork`, `-EAGAIN` shared-mem/threaded, `-ENOSYS` lean). **Depends on T1 + T2 + T3.**
-5. **T5** — verify + annotate #170 with the precise *keep-until-T4* file list (`async-bridge.ts` + the named continuation tests); confirm the file-scoped interlock, not a blanket #170 block.
+5. **T5** — verify + annotate #170 with the precise *keep-until-T4* file list (`async-bridge.ts`; `process/{loader,manager,module-profile}.ts`; the continuation tests `abi_test.ts:620/:640`, `sandbox-wasm-kernel_test.ts:179`); confirm the file-scoped interlock, not a blanket #170 block.
 
 **Critical-path shape:** `T1 → (T2 ∥ T3) → T4 → T5`. T1 is the schedule risk; T2/T3 parallelize once T1 lands.
 
