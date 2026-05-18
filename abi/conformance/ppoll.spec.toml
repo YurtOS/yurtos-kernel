@@ -1,0 +1,9 @@
+canary = "posix-runtime-canary"
+symbol = "ppoll"
+
+[[case]]
+name = "ppoll_regular_fd"
+inputs = "ppoll() over a regular file descriptor and an invalid descriptor"
+expected.exit = 0
+expected.stdout = "ppoll_regular_fd:ok"
+expected.note = "regular files are immediately readable/writable; invalid positive fds report POLLNVAL; sigmask carried not applied"

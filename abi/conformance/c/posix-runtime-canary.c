@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <net/if.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/sendfile.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 static void emit(const char *case_name, int exit_code, const char *stdout_line, int has_errno, int errno_value) {
@@ -729,6 +731,145 @@ static int case_select_regular_fd(void) {
   return 0;
 }
 
+static int case_pselect_regular_fd(void) {
+  const char *path = "/tmp/yurt-pselect-canary.txt";
+  unlink(path);
+  int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+  if (fd < 0) {
+    emit("pselect_regular_fd", 1, "pselect_regular_fd:open_failed", 1, errno);
+    return 1;
+  }
+  if (write(fd, "x", 1) != 1) {
+    int e = errno;
+    close(fd);
+    emit("pselect_regular_fd", 1, "pselect_regular_fd:write_failed", 1, e);
+    return 1;
+  }
+  fd_set rfds, wfds;
+  FD_ZERO(&rfds);
+  FD_ZERO(&wfds);
+  FD_SET(fd, &rfds);
+  FD_SET(fd, &wfds);
+  struct timespec ts = {0, 0};
+  errno = 0;
+  int rc = pselect(fd + 1, &rfds, &wfds, NULL, &ts, NULL);
+  if (rc != 2 || !FD_ISSET(fd, &rfds) || !FD_ISSET(fd, &wfds)) {
+    char out[128];
+    snprintf(out, sizeof(out), "pselect_regular_fd:bad:%d:%d:%d", rc,
+             FD_ISSET(fd, &rfds), FD_ISSET(fd, &wfds));
+    close(fd);
+    emit("pselect_regular_fd", 1, out, 1, errno);
+    return 1;
+  }
+  close(fd);
+
+  int invalid_fd = open(path, O_RDONLY);
+  if (invalid_fd < 0) {
+    emit("pselect_regular_fd", 1, "pselect_regular_fd:invalid_open_failed", 1,
+         errno);
+    return 1;
+  }
+  close(invalid_fd);
+  FD_ZERO(&rfds);
+  FD_SET(invalid_fd, &rfds);
+  errno = 0;
+  rc = pselect(invalid_fd + 1, &rfds, NULL, NULL, &ts, NULL);
+  if (rc != -1 || errno != EBADF) {
+    char out[128];
+    snprintf(out, sizeof(out), "pselect_regular_fd:bad_invalid:%d:%d", rc, errno);
+    emit("pselect_regular_fd", 1, out, 1, errno);
+    return 1;
+  }
+  emit("pselect_regular_fd", 0, "pselect_regular_fd:ok", 0, 0);
+  return 0;
+}
+
+static int case_pselect_sigmask_translation(void) {
+  /* SIGCHLD is compact slot 4. The shim must translate to the canonical
+   * bit, not naively byte-widen the 1-byte sigset_t. sigmask is carried,
+   * not applied today, so the call still succeeds as an immediate
+   * snapshot over a ready regular fd. */
+  const char *path = "/tmp/yurt-pselect-sig.txt";
+  unlink(path);
+  int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+  if (fd < 0) {
+    emit("pselect_sigmask_translation", 1,
+         "pselect_sigmask_translation:open_failed", 1, errno);
+    return 1;
+  }
+  if (write(fd, "x", 1) != 1) {
+    int e = errno;
+    close(fd);
+    emit("pselect_sigmask_translation", 1,
+         "pselect_sigmask_translation:write_failed", 1, e);
+    return 1;
+  }
+  sigset_t m;
+  sigemptyset(&m);
+  sigaddset(&m, SIGCHLD);
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  FD_SET(fd, &rfds);
+  struct timespec ts = {0, 0};
+  errno = 0;
+  int rc = pselect(fd + 1, &rfds, NULL, NULL, &ts, &m);
+  close(fd);
+  if (rc != 1 || !FD_ISSET(fd, &rfds)) {
+    char out[128];
+    snprintf(out, sizeof(out), "pselect_sigmask_translation:bad:%d:%d", rc,
+             FD_ISSET(fd, &rfds));
+    emit("pselect_sigmask_translation", 1, out, 1, errno);
+    return 1;
+  }
+  emit("pselect_sigmask_translation", 0, "pselect_sigmask_translation:ok", 0, 0);
+  return 0;
+}
+
+static int case_ppoll_regular_fd(void) {
+  const char *path = "/tmp/yurt-ppoll-canary.txt";
+  unlink(path);
+  int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0600);
+  if (fd < 0) {
+    emit("ppoll_regular_fd", 1, "ppoll_regular_fd:open_failed", 1, errno);
+    return 1;
+  }
+  if (write(fd, "x", 1) != 1) {
+    int e = errno;
+    close(fd);
+    emit("ppoll_regular_fd", 1, "ppoll_regular_fd:write_failed", 1, e);
+    return 1;
+  }
+  struct pollfd pfds[1];
+  pfds[0].fd = fd;
+  pfds[0].events = POLLIN | POLLOUT;
+  pfds[0].revents = 0;
+  struct timespec ts = {0, 0};
+  errno = 0;
+  int rc = ppoll(pfds, 1, &ts, NULL);
+  close(fd);
+  if (rc != 1 || (pfds[0].revents & (POLLIN | POLLOUT)) == 0) {
+    char out[128];
+    snprintf(out, sizeof(out), "ppoll_regular_fd:bad:%d:%d", rc, pfds[0].revents);
+    emit("ppoll_regular_fd", 1, out, 1, errno);
+    return 1;
+  }
+  struct pollfd bad[1];
+  bad[0].fd = 4096;
+  bad[0].events = POLLIN;
+  bad[0].revents = 0;
+  errno = 0;
+  rc = ppoll(bad, 1, &ts, NULL);
+  if (rc != 1 || (bad[0].revents & POLLNVAL) == 0) {
+    char out[128];
+    snprintf(out, sizeof(out), "ppoll_regular_fd:bad_invalid:%d:%d", rc,
+             bad[0].revents);
+    emit("ppoll_regular_fd", 1, out, 1, errno);
+    return 1;
+  }
+  emit("ppoll_regular_fd", 0, "ppoll_regular_fd:ok", 0, 0);
+  return 0;
+}
+
 static int run_case(const char *name) {
   if (strcmp(name, "hostname") == 0) return case_hostname();
   if (strcmp(name, "hostname_too_small") == 0) return case_hostname_too_small();
@@ -752,6 +893,9 @@ static int run_case(const char *name) {
   if (strcmp(name, "utimes_mtime") == 0) return case_utimes_mtime();
   if (strcmp(name, "poll_regular_fd") == 0) return case_poll_regular_fd();
   if (strcmp(name, "select_regular_fd") == 0) return case_select_regular_fd();
+  if (strcmp(name, "pselect_regular_fd") == 0) return case_pselect_regular_fd();
+  if (strcmp(name, "pselect_sigmask_translation") == 0) return case_pselect_sigmask_translation();
+  if (strcmp(name, "ppoll_regular_fd") == 0) return case_ppoll_regular_fd();
   fprintf(stderr, "posix-runtime-canary: unknown case %s\n", name);
   return 2;
 }
@@ -779,6 +923,9 @@ static int list_cases(void) {
   puts("utimes_mtime");
   puts("poll_regular_fd");
   puts("select_regular_fd");
+  puts("pselect_regular_fd");
+  puts("pselect_sigmask_translation");
+  puts("ppoll_regular_fd");
   return 0;
 }
 
