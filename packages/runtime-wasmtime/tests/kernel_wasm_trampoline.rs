@@ -209,6 +209,9 @@ const METHOD_SYS_SCHED_SETAFFINITY: u32 = 0x1_005D;
 const METHOD_SYS_FCHOWN: u32 = 0x1_005E;
 const METHOD_SYS_FCHDIR: u32 = 0x1_005F;
 const METHOD_SYS_POLL: u32 = 0x1_0043;
+const METHOD_SYS_SELECT: u32 = 0x1_00A1;
+const METHOD_SYS_PSELECT: u32 = 0x1_00A2;
+const METHOD_SYS_PPOLL: u32 = 0x1_00A3;
 const METHOD_SYS_SOCKETPAIR: u32 = 0x1_0044;
 const METHOD_SYS_SOCKET_OPEN: u32 = 0x1_0045;
 const METHOD_SYS_SOCKET_BIND: u32 = 0x1_0046;
@@ -3454,6 +3457,9 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_SCHED_SETAFFINITY as i64,
         ),
         ("sys_poll", METHOD_SYS_POLL, METHOD_SYS_POLL as i64),
+        ("sys_select", METHOD_SYS_SELECT, METHOD_SYS_SELECT as i64),
+        ("sys_pselect", METHOD_SYS_PSELECT, METHOD_SYS_PSELECT as i64),
+        ("sys_ppoll", METHOD_SYS_PPOLL, METHOD_SYS_PPOLL as i64),
         ("sys_close", METHOD_SYS_CLOSE, METHOD_SYS_CLOSE as i64),
         ("sys_dup", METHOD_SYS_DUP, METHOD_SYS_DUP as i64),
         ("sys_dup2", METHOD_SYS_DUP2, METHOD_SYS_DUP2 as i64),
