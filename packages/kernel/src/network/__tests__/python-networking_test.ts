@@ -6,6 +6,7 @@ import { NodeAdapter } from '../../platform/node-adapter.js';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { Buffer } from 'node:buffer';
+import process from 'node:process';
 
 const WASM_DIR = resolve(import.meta.dirname!, '../../platform/__tests__/fixtures');
 
@@ -59,7 +60,7 @@ describe('Python networking via socket shim', { sanitizeOps: false, sanitizeReso
             try {
               const info = JSON.parse(line.trim());
               if (info.port) { resolve(info.port); return; }
-            } catch {}
+            } catch { /* partial line: not a complete JSON object yet */ }
           }
         }
       });
