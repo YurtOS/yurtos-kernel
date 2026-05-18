@@ -209,6 +209,18 @@ const METHOD_SYS_SCHED_SETAFFINITY: u32 = 0x1_005D;
 const METHOD_SYS_FCHOWN: u32 = 0x1_005E;
 const METHOD_SYS_FCHDIR: u32 = 0x1_005F;
 const METHOD_SYS_POLL: u32 = 0x1_0043;
+// #92 event-loop primitive method IDs (reserved here in S0; per-primitive
+// dispatch handlers land in S1..S4). Drift-guarded so a renumber in the
+// toml without a matching update here fails this test.
+const METHOD_SYS_EVENTFD: u32 = 0x1_00B4;
+const METHOD_SYS_TIMERFD_CREATE: u32 = 0x1_00B5;
+const METHOD_SYS_TIMERFD_SETTIME: u32 = 0x1_00B6;
+const METHOD_SYS_TIMERFD_GETTIME: u32 = 0x1_00B7;
+const METHOD_SYS_EPOLL_CREATE1: u32 = 0x1_00B8;
+const METHOD_SYS_EPOLL_CTL: u32 = 0x1_00B9;
+const METHOD_SYS_EPOLL_WAIT: u32 = 0x1_00BA;
+const METHOD_SYS_EPOLL_PWAIT: u32 = 0x1_00BB;
+const METHOD_SYS_SIGNALFD: u32 = 0x1_00BC;
 const METHOD_SYS_SOCKETPAIR: u32 = 0x1_0044;
 const METHOD_SYS_SOCKET_OPEN: u32 = 0x1_0045;
 const METHOD_SYS_SOCKET_BIND: u32 = 0x1_0046;
@@ -3454,6 +3466,47 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_SCHED_SETAFFINITY as i64,
         ),
         ("sys_poll", METHOD_SYS_POLL, METHOD_SYS_POLL as i64),
+        ("sys_eventfd", METHOD_SYS_EVENTFD, METHOD_SYS_EVENTFD as i64),
+        (
+            "sys_timerfd_create",
+            METHOD_SYS_TIMERFD_CREATE,
+            METHOD_SYS_TIMERFD_CREATE as i64,
+        ),
+        (
+            "sys_timerfd_settime",
+            METHOD_SYS_TIMERFD_SETTIME,
+            METHOD_SYS_TIMERFD_SETTIME as i64,
+        ),
+        (
+            "sys_timerfd_gettime",
+            METHOD_SYS_TIMERFD_GETTIME,
+            METHOD_SYS_TIMERFD_GETTIME as i64,
+        ),
+        (
+            "sys_epoll_create1",
+            METHOD_SYS_EPOLL_CREATE1,
+            METHOD_SYS_EPOLL_CREATE1 as i64,
+        ),
+        (
+            "sys_epoll_ctl",
+            METHOD_SYS_EPOLL_CTL,
+            METHOD_SYS_EPOLL_CTL as i64,
+        ),
+        (
+            "sys_epoll_wait",
+            METHOD_SYS_EPOLL_WAIT,
+            METHOD_SYS_EPOLL_WAIT as i64,
+        ),
+        (
+            "sys_epoll_pwait",
+            METHOD_SYS_EPOLL_PWAIT,
+            METHOD_SYS_EPOLL_PWAIT as i64,
+        ),
+        (
+            "sys_signalfd",
+            METHOD_SYS_SIGNALFD,
+            METHOD_SYS_SIGNALFD as i64,
+        ),
         ("sys_close", METHOD_SYS_CLOSE, METHOD_SYS_CLOSE as i64),
         ("sys_dup", METHOD_SYS_DUP, METHOD_SYS_DUP as i64),
         ("sys_dup2", METHOD_SYS_DUP2, METHOD_SYS_DUP2 as i64),

@@ -765,3 +765,53 @@ doc = "KernelHostInterface-only: ask the kernel scheduler for the next runnable 
 id = 0x1_00A0
 kind = "syscall"
 doc = "POSIX getrandom(buf, buflen, flags). Request: u32 len LE + u32 flags LE (8 bytes). Response buffer receives `len` cryptographically secure random bytes from the host CSPRNG. flags: GRND_NONBLOCK (0x1) and GRND_RANDOM (0x2) are accepted and treated as no-ops: on a running host the CSPRNG is already seeded so this does not block in practice (an OS-layer cold-boot pre-seed block is theoretically possible but not modeled here), and there is no separate /dev/random-style pool; any other bit -> -EINVAL. Returns `len` on success; -EINVAL for unknown flags, a request shorter than 8 bytes, or a response buffer smaller than `len`; -EIO if the host entropy source fails; -EFAULT if the host reports bad guest memory. Length is bounded with the subtraction form (issue #65 class). getentropy() is a thin guest-libc wrapper over this method, not a separate id."
+
+# Linux event-loop primitives — issue #92, slice S0 (ABI scaffold only).
+# IDs reserved here; per-primitive dispatch handlers land in S1..S4. The
+# default-dispatch path returns -ENOSYS until then. Wire layouts pinned
+# now so guest-side libc shims can be drafted in parallel.
+
+[method.sys_eventfd]
+id = 0x1_00B4
+kind = "syscall"
+doc = "Linux eventfd2(initval, flags). Request: u32 initval_lo LE + u32 initval_hi LE + u32 flags LE (12 bytes; u64 initval split into two LE u32s). flags: EFD_CLOEXEC (0x80000), EFD_NONBLOCK (0x800), EFD_SEMAPHORE (0x1); any other bit -> -EINVAL. Returns a new fd backed by a 64-bit counter; read()/write() each operate on 8-byte u64 values per Linux semantics. Issue #92 slice S1 lands the FdEntry::EventFd handler; default dispatch returns -ENOSYS until then."
+
+[method.sys_timerfd_create]
+id = 0x1_00B5
+kind = "syscall"
+doc = "Linux timerfd_create(clockid, flags). Request: u32 clockid LE + u32 flags LE (8 bytes). clockid: CLOCK_MONOTONIC (1) or CLOCK_REALTIME (0); flags: TFD_CLOEXEC (0x80000), TFD_NONBLOCK (0x800); any other bit -> -EINVAL. Returns a new fd backed by a timer that read()s 8-byte u64 expiration counts. Issue #92 slice S2 (depends on M5/#64 CLOCK_MONOTONIC, closed); default dispatch returns -ENOSYS until then."
+
+[method.sys_timerfd_settime]
+id = 0x1_00B6
+kind = "syscall"
+doc = "Linux timerfd_settime(fd, flags, new_value, old_value). Request: u32 fd LE + u32 flags LE + 32-byte itimerspec new_value (i64 it_interval.tv_sec LE | i64 it_interval.tv_nsec LE | i64 it_value.tv_sec LE | i64 it_value.tv_nsec LE) (40 bytes). flags: TFD_TIMER_ABSTIME (0x1) interprets new_value.it_value as an absolute deadline on the timerfd's clockid. Response: 32-byte itimerspec old_value (same layout). Returns 32 (bytes-written), -EBADF (unknown fd), -EINVAL (bad flags / unaligned span / negative tv_nsec). Issue #92 slice S2; default dispatch returns -ENOSYS until then."
+
+[method.sys_timerfd_gettime]
+id = 0x1_00B7
+kind = "syscall"
+doc = "Linux timerfd_gettime(fd, curr_value). Request: u32 fd LE (4 bytes). Response: 32-byte itimerspec curr_value (same layout as sys_timerfd_settime). curr_value.it_value is the time remaining until next expiration (zero if disarmed). curr_value.it_interval is the configured period. Returns 32 (bytes-written), -EBADF (unknown fd), -EINVAL (short response). Issue #92 slice S2; default dispatch returns -ENOSYS until then."
+
+[method.sys_epoll_create1]
+id = 0x1_00B8
+kind = "syscall"
+doc = "Linux epoll_create1(flags). Request: u32 flags LE (4 bytes). flags: EPOLL_CLOEXEC (0x80000); any other bit -> -EINVAL. Returns a new fd backed by an interest set (BTreeMap<watched_fd, epoll_event>). The epoll fd is itself pollable: POLLIN ⇔ any watched fd has a matching ready event. Issue #92 slice S3; default dispatch returns -ENOSYS until then."
+
+[method.sys_epoll_ctl]
+id = 0x1_00B9
+kind = "syscall"
+doc = "Linux epoll_ctl(epfd, op, fd, event). Request: u32 epfd LE + u32 op LE + u32 fd LE + 12-byte packed epoll_event (u32 events LE | u64 data LE) (24 bytes). op: EPOLL_CTL_ADD (1) / MOD (3) / DEL (2). Returns 0, -EBADF (epfd or fd not a known fd), -EEXIST (ADD when fd already in interest set), -ENOENT (MOD/DEL when fd absent), -EINVAL (bad op / bad event mask / unaligned span), -ELOOP (epoll-watching-epoll cycle or chain depth > 5). Issue #92 slice S3; default dispatch returns -ENOSYS until then."
+
+[method.sys_epoll_wait]
+id = 0x1_00BA
+kind = "syscall"
+doc = "Linux epoll_wait(epfd, events, maxevents, timeout). Request: u32 epfd LE + u32 maxevents LE + i32 timeout_ms LE (12 bytes). Response: packed array of 12-byte epoll_event records (u32 events LE | u64 data LE), up to `maxevents` records (response capacity must be >= maxevents * 12). timeout: 0 = poll-only (S3); > 0 = wait up to N ms (S5 AsyncBridge); -1 = wait indefinitely (S5 AsyncBridge). Returns ready-count * 12 (bytes-written), -EBADF, -EINVAL (maxevents <= 0 / response too small / unaligned span). Issue #92 slice S3 (timeout=0 only) then S5 (blocking); default dispatch returns -ENOSYS until then."
+
+[method.sys_epoll_pwait]
+id = 0x1_00BB
+kind = "syscall"
+doc = "Linux epoll_pwait(epfd, events, maxevents, timeout, sigmask). Request: u32 epfd LE + u32 maxevents LE + i32 timeout_ms LE + u64 sigmask LE (20 bytes). Response: same as sys_epoll_wait. The sigmask atomically replaces the thread's signal mask for the duration of the wait, then restores it on return. Sigmask of zero means no replacement. Returns identically to sys_epoll_wait. Issue #92 slice S5 (gated on #90 signal-mask surface); default dispatch returns -ENOSYS until then."
+
+[method.sys_signalfd]
+id = 0x1_00BC
+kind = "syscall"
+doc = "Linux signalfd4(fd, mask, flags). Request: i32 fd LE + u64 mask LE + u32 flags LE (16 bytes). fd: -1 creates a new signalfd; otherwise updates the mask on an existing signalfd. flags: SFD_CLOEXEC (0x80000), SFD_NONBLOCK (0x800); any other bit -> -EINVAL. mask: bitset of signals to dequeue (bit N = signal N+1, matching the existing yurt signal numbering). read() returns 128-byte signalfd_siginfo records. Returns the (new or updated) fd; -EBADF (unknown fd when fd != -1), -EINVAL (bad flags). Issue #92 slice S4 (gated on #90 signal-mask surface); default dispatch returns -ENOSYS until then."

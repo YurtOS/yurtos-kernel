@@ -14109,3 +14109,51 @@ fn dir_anchor_keeps_real_mount_id_on_degraded_non_root_mount() {
          real mount id, not ROOT_MOUNT"
     );
 }
+
+// ── #92 S0: Linux event-loop primitives — ABI scaffold ────────────────
+//
+// IDs reserved + dispatch arms in place; per-primitive handlers land
+// in S1..S4. Each method id must (a) be assigned the expected value
+// from the toml and (b) route through dispatch to a deterministic
+// -ENOSYS rather than panic / fall through to the default arm in an
+// unexpected way. The id-value assertions are the regression guard
+// against accidental renumbering when later slices touch the toml.
+
+#[test]
+fn event_loop_method_ids_match_toml_assignments() {
+    assert_eq!(METHOD_SYS_EVENTFD, 0x1_00B4);
+    assert_eq!(METHOD_SYS_TIMERFD_CREATE, 0x1_00B5);
+    assert_eq!(METHOD_SYS_TIMERFD_SETTIME, 0x1_00B6);
+    assert_eq!(METHOD_SYS_TIMERFD_GETTIME, 0x1_00B7);
+    assert_eq!(METHOD_SYS_EPOLL_CREATE1, 0x1_00B8);
+    assert_eq!(METHOD_SYS_EPOLL_CTL, 0x1_00B9);
+    assert_eq!(METHOD_SYS_EPOLL_WAIT, 0x1_00BA);
+    assert_eq!(METHOD_SYS_EPOLL_PWAIT, 0x1_00BB);
+    assert_eq!(METHOD_SYS_SIGNALFD, 0x1_00BC);
+}
+
+#[test]
+fn event_loop_methods_return_enosys_until_slice_lands() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let enosys = -(abi::ENOSYS as i64);
+    // Pass empty request/response. The handler doesn't matter (it's
+    // -ENOSYS), but an empty buffer pair confirms we hit the dedicated
+    // arm and not some accidental fast-path that decodes bytes first.
+    for &method in &[
+        METHOD_SYS_EVENTFD,
+        METHOD_SYS_TIMERFD_CREATE,
+        METHOD_SYS_TIMERFD_SETTIME,
+        METHOD_SYS_TIMERFD_GETTIME,
+        METHOD_SYS_EPOLL_CREATE1,
+        METHOD_SYS_EPOLL_CTL,
+        METHOD_SYS_EPOLL_WAIT,
+        METHOD_SYS_EPOLL_PWAIT,
+        METHOD_SYS_SIGNALFD,
+    ] {
+        assert_eq!(
+            dispatch(method, 1, &[], &mut []),
+            enosys,
+            "method 0x{method:x} must -ENOSYS until its S1..S4 handler lands"
+        );
+    }
+}
