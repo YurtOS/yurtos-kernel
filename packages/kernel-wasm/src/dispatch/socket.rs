@@ -327,26 +327,24 @@ fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>)
         }) => {
             if !*peer_open {
                 -(abi::EPIPE as i64)
-            } else {
-                if let Some(peer) = k.socket_mut(*peer_id) {
-                    if let SocketKind::UnixStream { rx, rights: q, .. } = &mut peer.kind {
-                        if !has_buffer_capacity(rx.len(), data.len())
-                            || rights_queue_full(&rights, q.len())
-                        {
-                            -(abi::EAGAIN as i64)
-                        } else {
-                            rx.extend(data);
-                            if !rights.as_ref().is_some_and(Vec::is_empty) {
-                                q.push_back(rights.take().expect("rights present"));
-                            }
-                            data.len() as i64
-                        }
+            } else if let Some(peer) = k.socket_mut(*peer_id) {
+                if let SocketKind::UnixStream { rx, rights: q, .. } = &mut peer.kind {
+                    if !has_buffer_capacity(rx.len(), data.len())
+                        || rights_queue_full(&rights, q.len())
+                    {
+                        -(abi::EAGAIN as i64)
                     } else {
-                        -(abi::EPIPE as i64)
+                        rx.extend(data);
+                        if !rights.as_ref().is_some_and(Vec::is_empty) {
+                            q.push_back(rights.take().expect("rights present"));
+                        }
+                        data.len() as i64
                     }
                 } else {
                     -(abi::EPIPE as i64)
                 }
+            } else {
+                -(abi::EPIPE as i64)
             }
         }
         Some(SocketKind::UnixDatagram {
