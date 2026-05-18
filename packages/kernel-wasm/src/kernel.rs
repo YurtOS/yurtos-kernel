@@ -333,6 +333,27 @@ pub struct Cwd {
     pub path: Vec<u8>,
 }
 
+/// Outcome of `Kernel::refresh_anchored_cwd` — the B2.9 Task 6
+/// inode-anchored cwd-refresh ladder, shared verbatim by `getcwd` and
+/// `PathResolver::resolved_cwd` so the anchored arm lives in exactly one
+/// place. The two callers diverge ONLY on `Degraded`, which this helper
+/// deliberately does not interpret (see each caller).
+pub enum CwdRefresh {
+    /// cwd is inode-anchored and the inode still names a live directory.
+    /// Payload is its current mount-absolute path; if the directory had
+    /// been renamed, `cwd.path` has already been written back to it.
+    Anchored(Vec<u8>),
+    /// cwd is inode-anchored but the directory was removed
+    /// (rmdir/unlink) and has no linkable path — POSIX. Callers map
+    /// this to `ENOENT` rather than using the stale pre-removal snapshot.
+    AnchoredRemoved,
+    /// cwd is NOT inode-anchored (`dir_inode == None`): a degraded
+    /// backend (hostfs/overlay) or the unresolved `Process::new`
+    /// default `/`. Carries the cwd snapshot so the caller can apply
+    /// its own degraded policy without re-cloning.
+    Degraded(Cwd),
+}
+
 #[derive(Clone, Debug)]
 pub struct Process {
     pub umask: u16,
@@ -487,6 +508,19 @@ impl Process {
             .entry(1)
             .or_insert_with(|| ThreadRecord::main(host_thread_handle));
         self.next_tid = self.next_tid.max(2);
+    }
+
+    /// Lowest free fd within this process's `RLIMIT_NOFILE` soft limit,
+    /// or `None` when the soft limit is reached (callers map that to
+    /// `-EMFILE`). Mirrors the `F_DUPFD` bound (#140 / PR #147) so every
+    /// automatic fd producer enforces the same per-process ceiling
+    /// instead of the unbounded, panic-on-exhaustion `lowest_free_fd()`.
+    /// A missing limit slot is treated as unbounded.
+    pub fn lowest_free_fd_in_limit(&self) -> Option<u32> {
+        let soft = self.rlimits[RLIMIT_NOFILE]
+            .map(|(soft, _)| soft)
+            .unwrap_or(u64::MAX);
+        self.fd_table.lowest_free_fd_below(0, soft)
     }
 }
 
@@ -2040,6 +2074,30 @@ impl Kernel {
 
     pub fn process_existing(&self, pid: Pid) -> Option<&Process> {
         self.processes.get(&pid)
+    }
+
+    /// B2.9 Task 6 inode-anchored cwd-refresh ladder. Reconciles the
+    /// cached `cwd.path` snapshot against the LIVE directory the cwd
+    /// inode names, so a cwd stays correct after its directory is
+    /// renamed and fails cleanly after it is removed. Extracted so
+    /// `getcwd` and `PathResolver::resolved_cwd` share one
+    /// implementation of the anchored arm; they differ only in how they
+    /// treat `CwdRefresh::Degraded` (getcwd uses the snapshot as-is;
+    /// `resolved_cwd` additionally does the lazy `/`→inode upgrade).
+    pub fn refresh_anchored_cwd(&mut self, pid: Pid) -> CwdRefresh {
+        let cwd = self.process(pid).cwd.clone();
+        match cwd.dir_inode {
+            Some(ino) => match self.vfs.dir_abspath_in(cwd.mount_id, ino) {
+                Some(abs) => {
+                    if abs != cwd.path {
+                        self.process_mut(pid).cwd.path = abs.clone();
+                    }
+                    CwdRefresh::Anchored(abs)
+                }
+                None => CwdRefresh::AnchoredRemoved,
+            },
+            None => CwdRefresh::Degraded(cwd),
+        }
     }
 
     pub fn has_process(&self, pid: Pid) -> bool {

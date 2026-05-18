@@ -4,7 +4,10 @@
 //! is the boundary between them: it turns caller-provided path bytes
 //! into canonical absolute byte paths before VFS operations see them.
 
-use crate::{abi, kernel::Kernel};
+use crate::{
+    abi,
+    kernel::{CwdRefresh, Kernel},
+};
 
 pub struct PathResolver<'kernel> {
     kernel: &'kernel mut Kernel,
@@ -71,22 +74,18 @@ impl<'kernel> PathResolver<'kernel> {
     /// `chmod`, `chown`, `utimens`, `stat`, `readlink`, `realpath`,
     /// and the `spawn`/exec image lookup all inherit it for free.
     fn resolved_cwd(&mut self) -> Result<Vec<u8>, i64> {
-        let cwd = self.kernel.process(self.caller_pid).cwd.clone();
-        match cwd.dir_inode {
-            Some(ino) => match self.kernel.vfs.dir_abspath_in(cwd.mount_id, ino) {
-                Some(abs) => {
-                    if abs != cwd.path {
-                        self.kernel.process_mut(self.caller_pid).cwd.path = abs.clone();
-                    }
-                    Ok(abs)
-                }
-                // Inode-anchored cwd whose directory was removed:
-                // no linkable path (POSIX) — relative ops fail ENOENT.
-                None => Err(-(abi::ENOENT as i64)),
-            },
-            None => {
+        match self.kernel.refresh_anchored_cwd(self.caller_pid) {
+            CwdRefresh::Anchored(abs) => Ok(abs),
+            // Inode-anchored cwd whose directory was removed:
+            // no linkable path (POSIX) — relative ops fail ENOENT.
+            CwdRefresh::AnchoredRemoved => Err(-(abi::ENOENT as i64)),
+            CwdRefresh::Degraded(cwd) => {
                 // Lazily upgrade the Process::new default `/` to its
                 // live dir inode (no MountTable existed at construction).
+                // Unlike `getcwd`, relative resolution wants every
+                // subsequent op inode-anchored, so we do the upgrade
+                // here. The returned base stays `cwd.path` (the
+                // pre-upgrade snapshot), identical to before.
                 if cwd.path == b"/" {
                     if let Some((mid, ino)) = self.kernel.vfs.dir_inode_at(b"/") {
                         let p = self.kernel.process_mut(self.caller_pid);

@@ -365,6 +365,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
+name = "child-exit7-wasm"
+version = "0.1.0"
+
+[[package]]
 name = "clang-sys"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2353,6 +2357,17 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "spawn-badreq-wasm"
+version = "0.1.0"
+
+[[package]]
+name = "spawn-wait-wasm"
+version = "0.1.0"
+dependencies = [
+ "yurt-process",
 ]
 
 [[package]]
