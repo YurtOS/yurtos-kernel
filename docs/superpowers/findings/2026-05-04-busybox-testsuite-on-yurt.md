@@ -221,16 +221,16 @@ UNTESTED: all_sourcecode.tests (applet not available — neither in BusyBox conf
 UNTESTED: ar.tests (applet not available — neither in BusyBox config nor standalone fixture)
 UNTESTED: ash.tests (applet not available — neither in BusyBox config nor standalone fixture)
 UNTESTED: hexdump.tests (applet not available — neither in BusyBox config nor standalone fixture)
-PASS: 
+PASS:
 PASS:  -c EMPTY
 UNTESTED: mdev.tests (applet not available — neither in BusyBox config nor standalone fixture)
 UNTESTED: mkfs.minix.tests (applet not available — neither in BusyBox config nor standalone fixture)
 UNTESTED: mount.tests (applet not available — neither in BusyBox config nor standalone fixture)
 UNTESTED: parse.tests (applet not available — neither in BusyBox config nor standalone fixture)
-PASS: 
+PASS:
 PASS:  -c EMPTY
 UNTESTED: sha3sum.tests (applet not available — neither in BusyBox config nor standalone fixture)
-PASS: 
+PASS:
 PASS:  -c EMPTY
 UNTESTED: start-stop-daemon.tests (applet not available — neither in BusyBox config nor standalone fixture)
 FAIL: tsort empty2
