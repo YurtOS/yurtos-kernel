@@ -15,12 +15,22 @@ import { NodeAdapter } from '../platform/node-adapter.js';
 
 const FIXTURES = resolve(dirname(fileURLToPath(import.meta.url)), '../platform/__tests__/fixtures');
 
-describe('BusyBox conformance', { sanitizeResources: false, sanitizeOps: false }, () => {
+// The BusyBox multicall fixture (busybox.wasm + manifest) is produced by a
+// dedicated CI workflow, not by abi/Makefile, so it is absent in a fresh
+// checkout and on most dev machines. Mirror abi_test.ts's
+// HAS_BUSYBOX_FIXTURE / shellIt pattern: skip the whole suite when the
+// fixture is missing rather than having `beforeEach` unconditionally fail
+// — that pre-existing assertion blocked the macOS pre-push hook for every
+// fixture-less checkout (issue #207). CI still runs the suite where the
+// fixture is built.
+const HAS_BUSYBOX_FIXTURE = existsSync(resolve(FIXTURES, 'busybox.wasm')) &&
+  existsSync(resolve(FIXTURES, 'busybox.manifest.json'));
+const describeBusybox = HAS_BUSYBOX_FIXTURE ? describe : describe.skip;
+
+describeBusybox('BusyBox conformance', { sanitizeResources: false, sanitizeOps: false }, () => {
   let sandbox: Sandbox;
 
   beforeEach(async () => {
-    expect(existsSync(resolve(FIXTURES, 'busybox.wasm'))).toBe(true);
-    expect(existsSync(resolve(FIXTURES, 'busybox.manifest.json'))).toBe(true);
     sandbox = await Sandbox.create({ wasmDir: FIXTURES, adapter: new NodeAdapter() });
   });
 
