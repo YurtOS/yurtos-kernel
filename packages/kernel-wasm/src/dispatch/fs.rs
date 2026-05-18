@@ -275,7 +275,7 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
 /// (`EBADF` unknown dirfd, `ENOTDIR` non-directory dirfd, `ENOENT`
 /// removed inode-anchored dir, or whatever `PathResolver::realpath`
 /// raises). Callers negate-and-widen at the dispatch boundary.
-fn resolve_at(caller_pid: u32, dirfd: u32, path: &[u8]) -> Result<Vec<u8>, i32> {
+pub(super) fn resolve_at(caller_pid: u32, dirfd: u32, path: &[u8]) -> Result<Vec<u8>, i32> {
     const AT_FDCWD: u32 = u32::MAX;
     // WASI filetype byte from `VfsBackend::resolve_at` (matches
     // `entry_type`): 3 = directory. A symlink is 7 and a regular file
