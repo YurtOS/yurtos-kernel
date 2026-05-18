@@ -18,6 +18,7 @@ use crate::kh;
 
 mod fs;
 mod process;
+pub(crate) mod sigmask;
 mod socket;
 mod thread;
 
@@ -206,9 +207,12 @@ pub fn dispatch_with_context(
         METHOD_SYS_KILL => kill_request(caller_pid, request),
         METHOD_SYS_KILLPG => killpg_request(caller_pid, request),
         METHOD_SYS_SIGQUEUE => sigqueue(caller_pid, request),
-        METHOD_SYS_SIGWAITINFO => sigwaitinfo(caller_pid, request, response),
-        METHOD_SYS_SIGPENDING => sigpending(caller_pid, response),
-        METHOD_SYS_SIGACTION => sigaction(caller_pid, request),
+        METHOD_SYS_SIGWAITINFO => sigwaitinfo(ctx, request, response),
+        METHOD_SYS_SIGPENDING => sigpending(ctx, response),
+        METHOD_SYS_SIGACTION => sigaction(caller_pid, request, response),
+        METHOD_SYS_SIGPROCMASK => sigmask::sys_sigprocmask(ctx, request, response),
+        METHOD_SYS_SIGNAL_RAISE => sigmask::sys_signal_raise(ctx, request, response),
+        METHOD_SYS_SIGNAL_QUERY => sigmask::sys_signal_query(ctx, request, response),
         METHOD_SYS_PRCTL => prctl(caller_pid, request, response),
         METHOD_SYS_SCHED_YIELD => sched_yield(caller_pid),
         METHOD_SYS_NANOSLEEP => nanosleep(caller_pid, request),

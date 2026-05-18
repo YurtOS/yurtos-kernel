@@ -1756,8 +1756,109 @@ export const HOST_BINDINGS: HostBinding[] = [
     },
   },
   // ── Signals ───────────────────────────────────────────────
-  // sigaction(sig, actPtr, actLen) — TS host_sigaction shape.
-  // Not in our common test path; left to a future expansion.
+  // All four signal imports are per-thread (callerTid-aware) and use
+  // copyIn/threadImport/copyOut, mirroring host_thread_join's shape.
+  {
+    name: "host_sigaction",
+    method: METHOD.SYS_SIGACTION,
+    args: [],
+    custom:
+      (mk, memBuf, callerPid, callerTid) =>
+      async (
+        reqPtr: number,
+        reqLen: number,
+        outPtr: number,
+        outCap: number,
+      ): Promise<number> => {
+        const req = copyIn(memBuf, reqPtr, reqLen);
+        if (typeof req === "number") return req;
+        const { rc, response } = threadImport(
+          METHOD.SYS_SIGACTION,
+          req,
+          outCap >>> 0,
+          mk,
+          callerPid,
+          callerTid,
+        );
+        if (rc <= 0) return rc;
+        const outRc = copyOut(memBuf, outPtr, response.subarray(0, rc));
+        return outRc < 0 ? outRc : rc;
+      },
+  },
+  {
+    name: "host_sigprocmask",
+    method: METHOD.SYS_SIGPROCMASK,
+    args: [],
+    custom:
+      (mk, memBuf, callerPid, callerTid) =>
+      async (
+        reqPtr: number,
+        reqLen: number,
+        outPtr: number,
+        outCap: number,
+      ): Promise<number> => {
+        const req = copyIn(memBuf, reqPtr, reqLen);
+        if (typeof req === "number") return req;
+        const { rc, response } = threadImport(
+          METHOD.SYS_SIGPROCMASK,
+          req,
+          outCap >>> 0,
+          mk,
+          callerPid,
+          callerTid,
+        );
+        if (rc <= 0) return rc;
+        const outRc = copyOut(memBuf, outPtr, response.subarray(0, rc));
+        return outRc < 0 ? outRc : rc;
+      },
+  },
+  {
+    name: "host_signal_raise",
+    method: METHOD.SYS_SIGNAL_RAISE,
+    args: [],
+    custom:
+      (mk, memBuf, callerPid, callerTid) =>
+      async (
+        reqPtr: number,
+        reqLen: number,
+        outPtr: number,
+        outCap: number,
+      ): Promise<number> => {
+        const req = copyIn(memBuf, reqPtr, reqLen);
+        if (typeof req === "number") return req;
+        const { rc, response } = threadImport(
+          METHOD.SYS_SIGNAL_RAISE,
+          req,
+          outCap >>> 0,
+          mk,
+          callerPid,
+          callerTid,
+        );
+        if (rc <= 0) return rc;
+        const outRc = copyOut(memBuf, outPtr, response.subarray(0, rc));
+        return outRc < 0 ? outRc : rc;
+      },
+  },
+  {
+    name: "host_signal_query",
+    method: METHOD.SYS_SIGNAL_QUERY,
+    args: [],
+    custom:
+      (mk, memBuf, callerPid, callerTid) =>
+      async (outPtr: number, outCap: number): Promise<number> => {
+        const { rc, response } = threadImport(
+          METHOD.SYS_SIGNAL_QUERY,
+          new Uint8Array(0),
+          outCap >>> 0,
+          mk,
+          callerPid,
+          callerTid,
+        );
+        if (rc <= 0) return rc;
+        const outRc = copyOut(memBuf, outPtr, response.subarray(0, rc));
+        return outRc < 0 ? outRc : rc;
+      },
+  },
 
   // ── Clock ─────────────────────────────────────────────────
   // host_clock_gettime(clockId, outPtr) → 8 bytes (u64 ns)

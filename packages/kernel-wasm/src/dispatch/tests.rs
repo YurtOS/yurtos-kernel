@@ -4313,7 +4313,7 @@ fn kill_records_signal_in_pending_mask() {
     req.extend_from_slice(&15_u32.to_le_bytes()); // SIGTERM
     assert_eq!(dispatch(METHOD_SYS_KILL, 1, &req, &mut []), 0);
     // Bit 14 (sig 15 - 1) should now be set on pid 5.
-    let pending = crate::kernel::with_kernel(|k| k.process_mut(5).pending_signals);
+    let pending = crate::kernel::with_kernel(|k| k.process_mut(5).pending.standard);
     assert_eq!(pending, 1u64 << 14);
 }
 
@@ -4328,7 +4328,7 @@ fn kill_records_nonfatal_signal_without_exiting_process() {
 
     let (pending, handle, exit_status) = crate::kernel::with_kernel(|k| {
         let p = k.process_mut(5);
-        (p.pending_signals, p.host_instance_handle, p.exit_status)
+        (p.pending.standard, p.host_instance_handle, p.exit_status)
     });
     assert_eq!(pending, 1u64 << 16);
     assert_eq!(handle, Some(42));
@@ -4398,7 +4398,7 @@ fn kill_request_rejects_unauthorized_cross_uid_target() {
         -(abi::EPERM as i64),
         "guest must not signal a process owned by another uid"
     );
-    let pending = crate::kernel::with_kernel(|k| k.process_mut(8).pending_signals);
+    let pending = crate::kernel::with_kernel(|k| k.process_mut(8).pending.standard);
     assert_eq!(pending, 0, "rejected kill must not set pending bits");
 }
 
@@ -4413,7 +4413,7 @@ fn kill_request_allows_same_uid_and_root_override() {
     req.extend_from_slice(&15_u32.to_le_bytes());
     assert_eq!(dispatch(METHOD_SYS_KILL, 1, &req, &mut []), 0);
     assert_eq!(
-        crate::kernel::with_kernel(|k| k.process_mut(8).pending_signals),
+        crate::kernel::with_kernel(|k| k.process_mut(8).pending.standard),
         1u64 << 14
     );
 
@@ -4437,7 +4437,7 @@ fn sigqueue_rejects_unauthorized_cross_uid_target() {
         dispatch(METHOD_SYS_SIGQUEUE, 1, &sigqueue_req(7, 40, 99), &mut []),
         -(abi::EPERM as i64)
     );
-    let rt_len = crate::kernel::with_kernel(|k| k.process_mut(7).pending_rt.len());
+    let rt_len = crate::kernel::with_kernel(|k| k.process_mut(7).pending.rt.len());
     assert_eq!(rt_len, 0, "rejected sigqueue must not enqueue");
 }
 
@@ -4487,10 +4487,10 @@ fn killpg_records_signal_for_live_group_members_only() {
     let (caller_pending, member_pending, exited_pending, other_pending) =
         crate::kernel::with_kernel(|k| {
             (
-                k.process_mut(1).pending_signals,
-                k.process_mut(2).pending_signals,
-                k.process_mut(3).pending_signals,
-                k.process_mut(4).pending_signals,
+                k.process_mut(1).pending.standard,
+                k.process_mut(2).pending.standard,
+                k.process_mut(3).pending.standard,
+                k.process_mut(4).pending.standard,
             )
         });
     assert_eq!(caller_pending, 1u64 << 14);
@@ -4526,7 +4526,7 @@ fn killpg_rejects_unauthorized_cross_uid_group() {
         -(abi::EPERM as i64),
         "guest must not signal a process group owned entirely by another uid"
     );
-    let pending = crate::kernel::with_kernel(|k| k.process_mut(20).pending_signals);
+    let pending = crate::kernel::with_kernel(|k| k.process_mut(20).pending.standard);
     assert_eq!(pending, 0, "rejected killpg must not set pending bits");
 }
 
@@ -4551,8 +4551,8 @@ fn killpg_signals_only_authorized_group_members() {
 
     let (same_uid, cross_uid) = crate::kernel::with_kernel(|k| {
         (
-            k.process_mut(30).pending_signals,
-            k.process_mut(31).pending_signals,
+            k.process_mut(30).pending.standard,
+            k.process_mut(31).pending.standard,
         )
     });
     assert_eq!(same_uid, 1u64 << 14, "same-uid member must be signaled");
@@ -4572,7 +4572,7 @@ fn killpg_zero_uses_callers_process_group_as_alive_probe() {
     assert_eq!(dispatch(METHOD_SYS_KILLPG, 11, &req, &mut []), 0);
     assert_eq!(crate::kernel::with_kernel(|k| k.process_mut(11).pgid), 11);
     assert_eq!(
-        crate::kernel::with_kernel(|k| k.process_mut(11).pending_signals),
+        crate::kernel::with_kernel(|k| k.process_mut(11).pending.standard),
         0
     );
 }
@@ -4602,40 +4602,63 @@ fn killpg_missing_group_and_bad_signal_return_errors() {
 #[test]
 fn sigaction_returns_previous_disposition_and_persists_new() {
     let _g = crate::kernel::TestGuard::acquire();
-    let mut req = Vec::new();
-    req.extend_from_slice(&15_u32.to_le_bytes()); // SIGTERM
-    req.extend_from_slice(&0xCAFEBABE_u32.to_le_bytes()); // user handler
-    assert_eq!(dispatch(METHOD_SYS_SIGACTION, 1, &req, &mut []), 0); // prev was SIG_DFL
-
-    // Replace with SIG_IGN; should report 0xCAFEBABE as previous.
-    let mut req2 = Vec::new();
-    req2.extend_from_slice(&15_u32.to_le_bytes());
-    req2.extend_from_slice(&1_u32.to_le_bytes()); // SIG_IGN
+    let mut o = [0u8; 16];
+    // Install user handler on SIGTERM(15); prior was SIG_DFL (all zero).
     assert_eq!(
-        dispatch(METHOD_SYS_SIGACTION, 1, &req2, &mut []),
-        0xCAFEBABE_i64
+        dispatch(
+            METHOD_SYS_SIGACTION,
+            1,
+            &sa_req(15, 0xCAFEBABE, 0, 0),
+            &mut o
+        ),
+        16
+    );
+    assert_eq!(
+        u32::from_le_bytes(o[0..4].try_into().unwrap()),
+        0,
+        "prior was SIG_DFL"
+    );
+    // Replace with SIG_IGN; prior handler 0xCAFEBABE must be reported back.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req(15, 1, 0, 0), &mut o),
+        16
+    );
+    assert_eq!(
+        u32::from_le_bytes(o[0..4].try_into().unwrap()),
+        0xCAFEBABE,
+        "prior handler returned"
     );
 }
 
 #[test]
 fn sigaction_is_per_pid_per_sig() {
     let _g = crate::kernel::TestGuard::acquire();
-    let mut req = Vec::new();
-    req.extend_from_slice(&15_u32.to_le_bytes());
-    req.extend_from_slice(&7_u32.to_le_bytes());
-    dispatch(METHOD_SYS_SIGACTION, 1, &req, &mut []);
-
-    // pid 2, same sig: still SIG_DFL.
-    let mut probe = Vec::new();
-    probe.extend_from_slice(&15_u32.to_le_bytes());
-    probe.extend_from_slice(&0_u32.to_le_bytes());
-    assert_eq!(dispatch(METHOD_SYS_SIGACTION, 2, &probe, &mut []), 0);
-
-    // pid 1, different sig: still SIG_DFL.
-    let mut other = Vec::new();
-    other.extend_from_slice(&9_u32.to_le_bytes()); // SIGKILL
-    other.extend_from_slice(&0_u32.to_le_bytes());
-    assert_eq!(dispatch(METHOD_SYS_SIGACTION, 1, &other, &mut []), 0);
+    let mut o = [0u8; 16];
+    // pid 1, SIGTERM(15) := handler 7.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req(15, 7, 0, 0), &mut o),
+        16
+    );
+    // pid 2, same sig: still SIG_DFL (prior handler 0).
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 2, &sa_req(15, 0, 0, 0), &mut o),
+        16
+    );
+    assert_eq!(
+        u32::from_le_bytes(o[0..4].try_into().unwrap()),
+        0,
+        "pid2 sig15 still SIG_DFL"
+    );
+    // pid 1, different (settable) sig SIGUSR1(10): still SIG_DFL.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req(10, 0, 0, 0), &mut o),
+        16
+    );
+    assert_eq!(
+        u32::from_le_bytes(o[0..4].try_into().unwrap()),
+        0,
+        "pid1 sig10 still SIG_DFL"
+    );
 }
 
 #[test]
@@ -7678,7 +7701,8 @@ fn sys_thread_spawn_releases_host_handle_on_bind_failure() {
         k.insert_host_process(9, 0, vec![b"/bin/t".to_vec()], Some(10));
         // Occupy the tid (2) the next reserve will hand out so the
         // spawn's bind_thread_handle fails with EEXIST.
-        k.bind_thread_handle(9, 2, None).expect("pre-occupy tid 2");
+        k.bind_thread_handle(9, 2, None, crate::kernel::MAIN_THREAD_TID)
+            .expect("pre-occupy tid 2");
     });
 
     let mut req = 1u32.to_le_bytes().to_vec();
@@ -9414,7 +9438,7 @@ fn ioctl_guards() {
 }
 // --- Slice B1.1: SIGCHLD delivered to the parent on child exit ---
 // POSIX: a process receives SIGCHLD when a child terminates. record_exit
-// must OR SIGCHLD into the parent's pending_signals (same bit convention
+// must OR SIGCHLD into the parent's pending.standard (same bit convention
 // as kill_pid: 1 << (sig - 1)), and be a no-op when there is no parent.
 
 const SIGCHLD: u32 = 17;
@@ -9435,7 +9459,7 @@ fn record_exit_sets_sigchld_pending_on_parent() {
 
     assert_eq!(record_exit(&record_exit_req(7, 23)), 0);
 
-    let parent_pending = crate::kernel::with_kernel(|k| k.process_mut(1).pending_signals);
+    let parent_pending = crate::kernel::with_kernel(|k| k.process_mut(1).pending.standard);
     assert_ne!(
         parent_pending & (1u64 << (SIGCHLD - 1)),
         0,
@@ -10121,7 +10145,7 @@ fn sigqueue_enqueues_rt_signal_with_payload_and_sender() {
 
     let (queue, bitmask) = crate::kernel::with_kernel(|k| {
         let p = k.process_mut(7);
-        (p.pending_rt.clone(), p.pending_signals)
+        (p.pending.rt.clone(), p.pending.standard)
     });
     assert_eq!(queue.len(), 1);
     assert_eq!(
@@ -10161,7 +10185,7 @@ fn sigqueue_queues_with_multiplicity_unlike_the_bitmask() {
         dispatch(METHOD_SYS_SIGQUEUE, 2, &sigqueue_req(7, 41, 2), &mut []),
         0
     );
-    let queue = crate::kernel::with_kernel(|k| k.process_mut(7).pending_rt.clone());
+    let queue = crate::kernel::with_kernel(|k| k.process_mut(7).pending.rt.clone());
     assert_eq!(queue.len(), 2, "RT signals queue with multiplicity");
     assert_eq!(queue[0].value, 1);
     assert_eq!(queue[0].sender_pid, 1);
@@ -10179,7 +10203,8 @@ fn sigqueue_sig_zero_is_probe_without_enqueue() {
     );
     assert!(crate::kernel::with_kernel(|k| k
         .process_mut(7)
-        .pending_rt
+        .pending
+        .rt
         .is_empty()));
     // Probe on a missing process is ESRCH.
     assert_eq!(
@@ -10276,7 +10301,7 @@ fn sigwaitinfo_dequeues_oldest_matching_and_returns_siginfo() {
     // derives it from the remaining RT entry — bitmask untouched).
     let (len, bit) = crate::kernel::with_kernel(|k| {
         let p = k.process_mut(7);
-        (p.pending_rt.len(), p.pending_signals & (1u64 << (40 - 1)))
+        (p.pending.rt.len(), p.pending.standard & (1u64 << (40 - 1)))
     });
     assert_eq!(len, 1);
     assert_eq!(bit, 0, "RT never set the kill bitmask");
@@ -10301,7 +10326,8 @@ fn sigwaitinfo_drain_makes_sigpending_drop_the_signo() {
     // RT queue empty and no kill bit → sigpending no longer reports 41.
     assert!(crate::kernel::with_kernel(|k| k
         .process_mut(7)
-        .pending_rt
+        .pending
+        .rt
         .is_empty()));
     let mut buf = [0u8; 8];
     assert_eq!(dispatch(METHOD_SYS_SIGPENDING, 7, &[], &mut buf), 8);
@@ -10472,32 +10498,55 @@ fn sig_64_is_supported_across_sigaction_kill_sigqueue() {
     let _g = crate::kernel::TestGuard::acquire();
     materialize(7);
 
-    // --- sigaction(64, handler) round-trips ---
-    let mut sa = Vec::new();
-    sa.extend_from_slice(&64_u32.to_le_bytes()); // SIGRTMAX
-    sa.extend_from_slice(&0xCAFEBABE_u32.to_le_bytes()); // user handler
+    // --- sigaction(64, handler) round-trips (kernel-owned (B) ABU:
+    // 20-byte request, 16-byte prior-disposition response, ret 16) ---
+    let mut o = [0u8; 16];
     assert_eq!(
-        dispatch(METHOD_SYS_SIGACTION, 7, &sa, &mut []),
-        0,
-        "sigaction(64, …) must succeed; previous disposition is SIG_DFL=0"
+        dispatch(
+            METHOD_SYS_SIGACTION,
+            7,
+            &sa_req(64, 0xCAFEBABE, 0, 0),
+            &mut o
+        ),
+        16,
+        "sigaction(64, …) must succeed; previous disposition is SIG_DFL"
     );
-    // Reading it back returns the stored disposition.
-    let mut sa_read = Vec::new();
-    sa_read.extend_from_slice(&64_u32.to_le_bytes());
-    sa_read.extend_from_slice(&1_u32.to_le_bytes()); // replace with SIG_IGN
     assert_eq!(
-        dispatch(METHOD_SYS_SIGACTION, 7, &sa_read, &mut []),
-        0xCAFEBABE_i64,
+        u32::from_le_bytes(o[0..4].try_into().unwrap()),
+        0,
+        "prior disposition for sig 64 was SIG_DFL=0"
+    );
+    // Reading it back returns the stored disposition (replace w/ SIG_IGN).
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 7, &sa_req(64, 1, 0, 0), &mut o),
+        16,
+        "sigaction(64, …) round-trip must succeed"
+    );
+    assert_eq!(
+        u32::from_le_bytes(o[0..4].try_into().unwrap()),
+        0xCAFEBABE,
         "sigaction(64, …) must round-trip the previously stored handler"
     );
     // Slot 63 (sig 64 → index 63) is in-bounds in the widened array.
     assert_eq!(
-        crate::kernel::with_kernel(|k| k.process_mut(7).signal_dispositions[63]),
+        crate::kernel::with_kernel(|k| k.process_mut(7).signal_dispositions[63].handler),
         1,
-        "signal_dispositions index 63 (sig 64) holds the stored value"
+        "signal_dispositions index 63 (sig 64) holds the stored SIG_IGN"
     );
 
-    // --- kill(pid, 64) sets pending bit 63 of the u64 mask ---
+    // (B) kernel-owned model: the single pend() funnel discards a
+    // signal whose per-process disposition is SIG_IGN (POSIX). The
+    // round-trip above left sig 64 = SIG_IGN, so restore SIG_DFL
+    // before exercising the kill/sigqueue pending path — otherwise
+    // pend() would (correctly) drop it. (Pre-(B) kill ignored the
+    // disposition entirely; this is the redesign's intended change.)
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 7, &sa_req(64, 0, 0, 0), &mut o),
+        16,
+        "reset sig 64 to SIG_DFL for the pending-path assertions"
+    );
+
+    // --- kill(pid, 64) sets pending bit 63 of the standard mask ---
     let mut kreq = Vec::new();
     kreq.extend_from_slice(&7_u32.to_le_bytes());
     kreq.extend_from_slice(&64_u32.to_le_bytes());
@@ -10506,11 +10555,11 @@ fn sig_64_is_supported_across_sigaction_kill_sigqueue() {
         0,
         "kill(pid, 64) must succeed"
     );
-    let pending = crate::kernel::with_kernel(|k| k.process_mut(7).pending_signals);
+    let pending = crate::kernel::with_kernel(|k| k.process_mut(7).pending.standard);
     assert_ne!(
         pending & (1u64 << 63),
         0,
-        "kill(pid, 64) sets bit 63 (sig 64 - 1) of the u64 mask — fits, no overflow"
+        "kill(pid, 64) sets bit 63 (sig 64 - 1) of the standard mask — fits, no overflow"
     );
 
     // --- sigqueue(pid, 64, val) enqueues an RT signal ---
@@ -10519,7 +10568,7 @@ fn sig_64_is_supported_across_sigaction_kill_sigqueue() {
         0,
         "sigqueue(pid, 64, val) must enqueue"
     );
-    let queued = crate::kernel::with_kernel(|k| k.process_mut(7).pending_rt.clone());
+    let queued = crate::kernel::with_kernel(|k| k.process_mut(7).pending.rt.clone());
     assert_eq!(queued.len(), 1);
     assert_eq!(
         queued[0],
@@ -10556,11 +10605,11 @@ fn sig_65_and_sigaction_0_remain_einval_and_kill_0_is_unchanged() {
     materialize(7);
 
     // Upper boundary moved to 65: sig 65 is still rejected everywhere.
-    let mut sa65 = Vec::new();
-    sa65.extend_from_slice(&65_u32.to_le_bytes());
-    sa65.extend_from_slice(&7_u32.to_le_bytes());
+    // (B) sigaction takes a 20-byte request; use a well-formed one so
+    // the range guard — not the length guard — is what rejects sig 65.
+    let mut o = [0u8; 16];
     assert_eq!(
-        dispatch(METHOD_SYS_SIGACTION, 7, &sa65, &mut []),
+        dispatch(METHOD_SYS_SIGACTION, 7, &sa_req(65, 7, 0, 0), &mut o),
         -(abi::EINVAL as i64),
         "sigaction(65, …) is still out of range"
     );
@@ -10579,11 +10628,8 @@ fn sig_65_and_sigaction_0_remain_einval_and_kill_0_is_unchanged() {
     );
 
     // sigaction has no sig 0 — still EINVAL (1..=64 excludes 0).
-    let mut sa0 = Vec::new();
-    sa0.extend_from_slice(&0_u32.to_le_bytes());
-    sa0.extend_from_slice(&7_u32.to_le_bytes());
     assert_eq!(
-        dispatch(METHOD_SYS_SIGACTION, 7, &sa0, &mut []),
+        dispatch(METHOD_SYS_SIGACTION, 7, &sa_req(0, 7, 0, 0), &mut o),
         -(abi::EINVAL as i64),
         "sigaction(0, …) has no sig 0"
     );
@@ -10598,7 +10644,7 @@ fn sig_65_and_sigaction_0_remain_einval_and_kill_0_is_unchanged() {
         "kill(pid, 0) is still the alive probe"
     );
     assert_eq!(
-        crate::kernel::with_kernel(|k| k.process_mut(7).pending_signals),
+        crate::kernel::with_kernel(|k| k.process_mut(7).pending.standard),
         0,
         "kill(pid, 0) must not set any pending bit"
     );
@@ -14107,5 +14153,729 @@ fn dir_anchor_keeps_real_mount_id_on_degraded_non_root_mount() {
         fd_mid, mnt,
         "an openat dirfd on a degraded non-root mount must record its \
          real mount id, not ROOT_MOUNT"
+    );
+}
+
+#[test]
+fn pendingset_and_threadrecord_new_single_ctor() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let t = crate::kernel::ThreadRecord::new(crate::kernel::MAIN_THREAD_TID, None, 0b101);
+    assert_eq!(t.blocked_signals, 0b101);
+    assert!(t.pending.standard == 0 && t.pending.rt.is_empty());
+    let m = crate::kernel::ThreadRecord::main(Some(7));
+    assert_eq!(
+        m.blocked_signals, 0,
+        "::main delegates to ::new with empty mask"
+    );
+    assert_eq!(m.host_thread_handle, Some(7));
+    assert_eq!(t.state, crate::kernel::ThreadState::Runnable);
+    assert!(!t.detached);
+    assert!(!t.cancel_requested);
+}
+#[test]
+fn fork_child_empty_pending_inherits_main_mask() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1)
+            .threads
+            .get_mut(&crate::kernel::MAIN_THREAD_TID)
+            .unwrap()
+            .blocked_signals = 0b10;
+        k.process_mut(1).pending.standard = 0xFF;
+        let c = k.prepare_fork(1).expect("fork");
+        let cm = &k.process_mut(c).threads[&crate::kernel::MAIN_THREAD_TID];
+        assert_eq!(cm.blocked_signals, 0b10);
+        assert!(k.process_mut(c).pending.is_empty(), "child pending empty");
+    });
+}
+#[test]
+fn spawn_thread_inherits_creator_mask() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1)
+            .threads
+            .get_mut(&crate::kernel::MAIN_THREAD_TID)
+            .unwrap()
+            .blocked_signals = 0b1100;
+        let tid = k.spawn_thread(1, Some(9)).expect("spawn");
+        assert_eq!(k.process_mut(1).threads[&tid].blocked_signals, 0b1100);
+    });
+}
+
+#[test]
+fn exec_reset_signal_state_caught_to_dfl_ign_kept() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(1);
+        p.signal_dispositions[0] = crate::kernel::SigDisposition {
+            handler: 0xCAFE,
+            sa_mask: 0xFF,
+            sa_flags: 3,
+        }; // caught
+        p.signal_dispositions[1] = crate::kernel::SigDisposition {
+            handler: crate::kernel::SIG_IGN_HANDLER,
+            sa_mask: 0,
+            sa_flags: 0,
+        }; // SIG_IGN
+        p.signal_dispositions[2] = crate::kernel::SigDisposition {
+            handler: crate::kernel::SIG_DFL_HANDLER,
+            sa_mask: 0,
+            sa_flags: 0,
+        }; // already DFL
+        p.exec_reset_signal_state();
+        assert_eq!(
+            p.signal_dispositions[0],
+            crate::kernel::SigDisposition::default(),
+            "caught -> SIG_DFL"
+        );
+        assert_eq!(
+            p.signal_dispositions[1].handler,
+            crate::kernel::SIG_IGN_HANDLER,
+            "SIG_IGN kept"
+        );
+        assert_eq!(
+            p.signal_dispositions[2],
+            crate::kernel::SigDisposition::default(),
+            "DFL stays DFL"
+        );
+    });
+}
+
+#[test]
+fn bind_thread_handle_inherits_nonmain_creator_mask() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        // Vivify pid 1 (process_mut auto-inserts the default process + main thread)
+        let _ = k.process_mut(1);
+        // Spawn a worker (non-main) thread with a distinct mask
+        let worker = k.spawn_thread(1, Some(8)).expect("worker");
+        k.process_mut(1)
+            .threads
+            .get_mut(&worker)
+            .unwrap()
+            .blocked_signals = 0b1_0000;
+        // Main thread has a DIFFERENT mask so we can prove the worker was inherited
+        k.process_mut(1)
+            .threads
+            .get_mut(&crate::kernel::MAIN_THREAD_TID)
+            .unwrap()
+            .blocked_signals = 0b1;
+        // Allocate a fresh tid and bind it with worker as creator
+        let tid = k.reserve_thread_id(1).expect("tid");
+        k.bind_thread_handle(1, tid, Some(9), worker).expect("bind");
+        assert_eq!(
+            k.process_mut(1).threads[&tid].blocked_signals,
+            0b1_0000,
+            "inherited the WORKER creator's mask, not main"
+        );
+    });
+}
+
+#[test]
+fn kill_pends_via_funnel_sigign_dropped() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(5);
+    });
+    // SIGTERM(15) default disposition => pends process pool
+    let mut r = 5u32.to_le_bytes().to_vec();
+    r.extend_from_slice(&15u32.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_KILL, 1, &r, &mut []), 0);
+    assert_eq!(
+        crate::kernel::with_kernel(|k| k.process_mut(5).pending.standard),
+        1u64 << 14
+    );
+    // set SIGTERM disposition SIG_IGN, kill again => discarded (not pended again / purged)
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(5).signal_dispositions[14].handler = 1;
+    });
+    // a fresh kill of an ignored signal must not set the bit
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(5).pending.standard = 0;
+    });
+    assert_eq!(dispatch(METHOD_SYS_KILL, 1, &r, &mut []), 0);
+    assert_eq!(
+        crate::kernel::with_kernel(|k| k.process_mut(5).pending.standard),
+        0,
+        "SIG_IGN discarded by funnel"
+    );
+}
+
+fn spm_req(how: i32, set: Option<u8>) -> Vec<u8> {
+    let mut r = how.to_le_bytes().to_vec();
+    match set {
+        Some(s) => {
+            r.push(1);
+            r.push(s);
+        }
+        None => {
+            r.push(0);
+            r.push(0);
+        }
+    }
+    r
+}
+#[test]
+fn sys_sigprocmask_per_thread_kill_unmaskable() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut o = [0u8; 1];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGPROCMASK, 1, &spm_req(2, Some(1 << 1)), &mut o),
+        1
+    ); // SETMASK SIGINT
+    assert_eq!(o[0], 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGPROCMASK, 1, &spm_req(0, Some(1 << 7)), &mut o),
+        1
+    ); // BLOCK slot7
+    assert_eq!(o[0], 1 << 1);
+    let m = crate::kernel::with_kernel(|k| {
+        k.process_mut(1).threads[&crate::kernel::MAIN_THREAD_TID].blocked_signals
+    });
+    assert_ne!(m & (1u64 << (2 - 1)), 0);
+    assert_eq!(m & (1u64 << (9 - 1)), 0, "SIGKILL never settable");
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGPROCMASK, 1, &spm_req(9, Some(0)), &mut o),
+        -(crate::abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn sys_sigprocmask_query_only_reports_prior_unchanged() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut o = [0u8; 1];
+    // Establish a known mask: SETMASK slot1 (SIGINT).
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGPROCMASK, 1, &spm_req(2, Some(1 << 1)), &mut o),
+        1
+    );
+    // Pure query (has==false): must return prior (slot1) and NOT change the mask.
+    o[0] = 0;
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGPROCMASK, 1, &spm_req(0, None), &mut o),
+        1,
+        "query-only path returns 1"
+    );
+    assert_eq!(o[0], 1 << 1, "query-only reports prior compact mask");
+    let m = crate::kernel::with_kernel(|k| {
+        k.process_mut(1).threads[&crate::kernel::MAIN_THREAD_TID].blocked_signals
+    });
+    assert_eq!(m, 1u64 << (2 - 1), "query-only must not mutate the mask");
+    // Bad `how` with has==true: EINVAL, mask still unchanged.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGPROCMASK, 1, &spm_req(7, Some(1 << 3)), &mut o),
+        -(crate::abi::EINVAL as i64)
+    );
+    let m2 = crate::kernel::with_kernel(|k| {
+        k.process_mut(1).threads[&crate::kernel::MAIN_THREAD_TID].blocked_signals
+    });
+    assert_eq!(m2, 1u64 << (2 - 1), "EINVAL must not mutate the mask");
+}
+
+// (B/PR225 F1) 21-byte wire: [u32 sig][u8 has_act][u32 h][u64 m][u32 f].
+// `sa_req` is the SET path (has_act=1); `sa_req_q` is the pure-query
+// path (has_act=0) — the handler/mask/flags are don't-care to the
+// kernel and must NOT mutate state.
+fn sa_req_act(sig: u32, has_act: u8, h: u32, m: u64, f: u32) -> Vec<u8> {
+    let mut r = sig.to_le_bytes().to_vec();
+    r.push(has_act);
+    r.extend_from_slice(&h.to_le_bytes());
+    r.extend_from_slice(&m.to_le_bytes());
+    r.extend_from_slice(&f.to_le_bytes());
+    r
+}
+fn sa_req(sig: u32, h: u32, m: u64, f: u32) -> Vec<u8> {
+    sa_req_act(sig, 1, h, m, f)
+}
+fn sa_req_q(sig: u32, h: u32, m: u64, f: u32) -> Vec<u8> {
+    sa_req_act(sig, 0, h, m, f)
+}
+
+#[test]
+fn sigaction_query_mode_does_not_mutate() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut o = [0u8; 16];
+    // Set SIGTERM(15) to a handler + mask + flags (has_act=1).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGACTION,
+            1,
+            &sa_req(15, 0xCAFEF00D, 0xABCD, 7),
+            &mut o
+        ),
+        16
+    );
+    // Prior was SIG_DFL (all zero).
+    assert_eq!(u32::from_le_bytes(o[0..4].try_into().unwrap()), 0);
+
+    // PURE QUERY (has_act=0): must return the previously-set
+    // {handler,mask,flags} and must NOT mutate the disposition.
+    let mut q = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req_q(15, 0, 0, 0), &mut q),
+        16,
+        "(a) query returns 16"
+    );
+    assert_eq!(
+        u32::from_le_bytes(q[0..4].try_into().unwrap()),
+        0xCAFEF00D,
+        "(b) query echoes prior handler"
+    );
+    assert_eq!(
+        u64::from_le_bytes(q[4..12].try_into().unwrap()),
+        0xABCD,
+        "(b) query echoes prior sa_mask"
+    );
+    assert_eq!(
+        u32::from_le_bytes(q[12..16].try_into().unwrap()),
+        7,
+        "(b) query echoes prior sa_flags"
+    );
+    // (c) kernel state unchanged by the query (still the set values).
+    let d = crate::kernel::with_kernel(|k| k.process_mut(1).signal_dispositions[14]);
+    assert_eq!(d.handler, 0xCAFEF00D, "(c) handler unchanged by query");
+    assert_eq!(d.sa_mask, 0xABCD, "(c) sa_mask unchanged by query");
+    assert_eq!(d.sa_flags, 7, "(c) sa_flags unchanged by query");
+
+    // (d) a query with GARBAGE handler/mask/flags still must not mutate.
+    let mut q2 = [0u8; 16];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGACTION,
+            1,
+            &sa_req_q(15, 0xDEADBEEF, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF),
+            &mut q2
+        ),
+        16
+    );
+    let d2 = crate::kernel::with_kernel(|k| k.process_mut(1).signal_dispositions[14]);
+    assert_eq!(
+        (d2.handler, d2.sa_mask, d2.sa_flags),
+        (0xCAFEF00D, 0xABCD, 7),
+        "(d) garbage-payload query did not clobber the disposition"
+    );
+
+    // A has_act=0 query of an UNTOUCHED signal returns SIG_DFL
+    // (all-zero) and stores nothing.
+    let mut qd = [0xAAu8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req_q(10, 0, 0, 0), &mut qd),
+        16
+    );
+    assert_eq!(qd, [0u8; 16], "untouched signal query => all-zero SIG_DFL");
+    let d10 = crate::kernel::with_kernel(|k| k.process_mut(1).signal_dispositions[9]);
+    assert_eq!(
+        (d10.handler, d10.sa_mask, d10.sa_flags),
+        (0, 0, 0),
+        "query stored nothing for the untouched signal"
+    );
+}
+#[test]
+fn sys_sigaction_widened_sigkill_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut o = [0u8; 16];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGACTION,
+            1,
+            &sa_req(15, 0xABCD, 0xF0, 2),
+            &mut o
+        ),
+        16
+    );
+    // prior was SIG_DFL: handler 0, mask 0, flags 0
+    assert_eq!(u32::from_le_bytes(o[0..4].try_into().unwrap()), 0);
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req(15, 1, 0, 0), &mut o),
+        16
+    );
+    assert_eq!(
+        u32::from_le_bytes(o[0..4].try_into().unwrap()),
+        0xABCD,
+        "prior handler returned"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req(9, 0xBEEF, 0, 0), &mut o),
+        -(crate::abi::EINVAL as i64),
+        "SIGKILL"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req(19, 0xBEEF, 0, 0), &mut o),
+        -(crate::abi::EINVAL as i64),
+        "SIGSTOP"
+    );
+}
+#[test]
+fn sys_signal_raise_blocked_pends_thread_unblocked_handler() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut o = [0u8; 1];
+    dispatch(METHOD_SYS_SIGPROCMASK, 1, &spm_req(2, Some(1 << 1)), &mut o); // block SIGINT(slot1)
+                                                                            // raise SIGINT(2) blocked => action NONE(0), pended in caller-thread pool
+    let mut resp = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGNAL_RAISE, 1, &2u32.to_le_bytes(), &mut resp),
+        8
+    );
+    assert_eq!(
+        i32::from_le_bytes(resp[0..4].try_into().unwrap()),
+        0,
+        "blocked => NONE"
+    );
+    let tp = crate::kernel::with_kernel(|k| {
+        k.process_mut(1).threads[&crate::kernel::MAIN_THREAD_TID]
+            .pending
+            .standard
+    });
+    assert_ne!(tp & (1u64 << (2 - 1)), 0, "pended thread-directed");
+    // SIGTERM(15) unblocked, handler set => RUN_HANDLER(1)+token
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).signal_dispositions[14].handler = 0xCAFE;
+    });
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGNAL_RAISE, 1, &15u32.to_le_bytes(), &mut resp),
+        8
+    );
+    assert_eq!(i32::from_le_bytes(resp[0..4].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(resp[4..8].try_into().unwrap()), 0xCAFE);
+}
+#[test]
+fn sys_signal_query_reflects_kernel_state() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut q = [0u8; 1];
+    assert_eq!(dispatch(METHOD_SYS_SIGNAL_QUERY, 1, &[], &mut q), 1);
+    assert_eq!(q[0], 0);
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).pending.standard = 1u64 << (15 - 1);
+    });
+    assert_eq!(dispatch(METHOD_SYS_SIGNAL_QUERY, 1, &[], &mut q), 1);
+    assert_eq!(q[0], 1, "deliverable");
+}
+#[test]
+fn sys_signal_raise_unblocked_sigign_is_none_not_pended() {
+    // Producer invariant: SIG_IGN-drop honoured by sys_signal_raise too.
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).signal_dispositions[14].handler = crate::kernel::SIG_IGN_HANDLER;
+    }); // SIGTERM=>SIG_IGN
+    let mut resp = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGNAL_RAISE, 1, &15u32.to_le_bytes(), &mut resp),
+        8
+    );
+    assert_eq!(
+        i32::from_le_bytes(resp[0..4].try_into().unwrap()),
+        0,
+        "SIG_IGN => NONE"
+    );
+    let (pp, tp) = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(1);
+        (
+            p.pending.standard,
+            p.threads[&crate::kernel::MAIN_THREAD_TID].pending.standard,
+        )
+    });
+    assert_eq!(pp & (1u64 << 14), 0, "SIG_IGN not pended (process pool)");
+    assert_eq!(tp & (1u64 << 14), 0, "SIG_IGN not pended (thread pool)");
+}
+#[test]
+fn sys_sigwaitinfo_thread_pool_before_process_pool() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Seed the SAME RT signo 40 in BOTH pools, distinguishable by value/sender.
+    crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(1);
+        p.pending.rt.push_back(crate::kernel::RtSignal {
+            signo: 40,
+            value: 111,
+            sender_pid: 7,
+        });
+        p.threads
+            .get_mut(&crate::kernel::MAIN_THREAD_TID)
+            .unwrap()
+            .pending
+            .rt
+            .push_back(crate::kernel::RtSignal {
+                signo: 40,
+                value: 222,
+                sender_pid: 9,
+            });
+    });
+    let req = (1u64 << (40 - 1)).to_le_bytes().to_vec();
+    let mut o = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_SIGWAITINFO, 1, &req, &mut o), 16);
+    assert_eq!(i32::from_le_bytes(o[0..4].try_into().unwrap()), 40);
+    assert_eq!(
+        i32::from_le_bytes(o[4..8].try_into().unwrap()),
+        -1,
+        "RT => SI_QUEUE"
+    );
+    assert_eq!(
+        i32::from_le_bytes(o[12..16].try_into().unwrap()),
+        222,
+        "thread pool drained first"
+    );
+    // Thread pool now empty for 40; process pool still holds its 111 entry.
+    let (tn, pn) = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(1);
+        (
+            p.threads[&crate::kernel::MAIN_THREAD_TID].pending.rt.len(),
+            p.pending.rt.len(),
+        )
+    });
+    assert_eq!(tn, 0, "thread RT consumed");
+    assert_eq!(pn, 1, "process RT untouched");
+    // A second wait now takes the process-pool entry (value 111).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGWAITINFO,
+            1,
+            &(1u64 << (40 - 1)).to_le_bytes(),
+            &mut o
+        ),
+        16
+    );
+    assert_eq!(
+        i32::from_le_bytes(o[12..16].try_into().unwrap()),
+        111,
+        "then process pool"
+    );
+}
+#[test]
+fn sys_sigwaitinfo_standard_signal_si_code_kernel() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).pending.standard = 1u64 << (15 - 1);
+    }); // SIGTERM process pool
+    let mut o = [0u8; 16];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGWAITINFO,
+            1,
+            &(1u64 << (15 - 1)).to_le_bytes(),
+            &mut o
+        ),
+        16
+    );
+    assert_eq!(
+        i32::from_le_bytes(o[0..4].try_into().unwrap()),
+        15,
+        "si_signo"
+    );
+    assert_eq!(
+        i32::from_le_bytes(o[4..8].try_into().unwrap()),
+        0x80,
+        "standard => SI_KERNEL"
+    );
+    assert_eq!(
+        u32::from_le_bytes(o[8..12].try_into().unwrap()),
+        0,
+        "si_pid 0"
+    );
+    assert_eq!(
+        i32::from_le_bytes(o[12..16].try_into().unwrap()),
+        0,
+        "si_value 0"
+    );
+    assert_eq!(
+        crate::kernel::with_kernel(|k| k.process_mut(1).pending.standard) & (1u64 << 14),
+        0,
+        "consumed"
+    );
+}
+#[test]
+fn sys_signal_raise_blocked_and_sigign_discards_not_pended() {
+    // Spec §2: SIG_IGN ⇒ discarded uniformly even when blocked.
+    let _g = crate::kernel::TestGuard::acquire();
+    // SIGTERM(15) disposition := SIG_IGN.
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).signal_dispositions[14].handler = crate::kernel::SIG_IGN_HANDLER;
+    });
+    // Block SIGTERM (slot 3 in the compact set: SIGTERM15→slot3).
+    let mut o = [0u8; 1];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGPROCMASK,
+            1,
+            &spm_req(0 /*BLOCK*/, Some(1 << 3)),
+            &mut o
+        ),
+        1
+    );
+    // Sanity: SIGTERM is now blocked on the caller (main) thread.
+    let blk = crate::kernel::with_kernel(|k| {
+        k.process_mut(1).threads[&crate::kernel::MAIN_THREAD_TID].blocked_signals
+    });
+    assert_ne!(blk & (1u64 << (15 - 1)), 0, "precondition: SIGTERM blocked");
+    // raise SIGTERM: blocked AND SIG_IGN ⇒ NONE and NOT pended in either pool.
+    let mut resp = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGNAL_RAISE, 1, &15u32.to_le_bytes(), &mut resp),
+        8
+    );
+    assert_eq!(
+        i32::from_le_bytes(resp[0..4].try_into().unwrap()),
+        0,
+        "blocked+SIG_IGN => NONE"
+    );
+    let (pp, tp) = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(1);
+        (
+            p.pending.standard,
+            p.threads[&crate::kernel::MAIN_THREAD_TID].pending.standard,
+        )
+    });
+    assert_eq!(
+        pp & (1u64 << 14),
+        0,
+        "SIG_IGN not pended in process pool (blocked)"
+    );
+    assert_eq!(
+        tp & (1u64 << 14),
+        0,
+        "SIG_IGN not pended in thread pool (blocked) — the bug"
+    );
+}
+#[test]
+fn sigaction_sig_ign_purges_pending_process_wide() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Pre-seed SIGTERM(15) pending in BOTH the process pool and the
+    // caller's main-thread pool, plus an RT entry for 15 in the process pool.
+    crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(1);
+        p.pending.standard |= 1u64 << (15 - 1);
+        p.pending.rt.push_back(crate::kernel::RtSignal {
+            signo: 15,
+            value: 0,
+            sender_pid: 1,
+        });
+        p.threads
+            .get_mut(&crate::kernel::MAIN_THREAD_TID)
+            .unwrap()
+            .pending
+            .standard |= 1u64 << (15 - 1);
+        p.threads
+            .get_mut(&crate::kernel::MAIN_THREAD_TID)
+            .unwrap()
+            .pending
+            .rt
+            .push_back(crate::kernel::RtSignal {
+                signo: 15,
+                value: 0,
+                sender_pid: 1,
+            });
+    });
+    // sigaction(SIGTERM=15, SIG_IGN=1): must discard ALL pending 15 process-wide.
+    let mut o = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req(15, 1, 0, 0), &mut o),
+        16
+    );
+    let (ps, prt, ts, trt) = crate::kernel::with_kernel(|k| {
+        let p = k.process_mut(1);
+        (
+            p.pending.standard,
+            p.pending.rt.iter().filter(|r| r.signo == 15).count(),
+            p.threads[&crate::kernel::MAIN_THREAD_TID].pending.standard,
+            p.threads[&crate::kernel::MAIN_THREAD_TID]
+                .pending
+                .rt
+                .iter()
+                .filter(|r| r.signo == 15)
+                .count(),
+        )
+    });
+    assert_eq!(ps & (1u64 << 14), 0, "process-pool standard SIGTERM purged");
+    assert_eq!(prt, 0, "process-pool RT SIGTERM purged");
+    assert_eq!(ts & (1u64 << 14), 0, "sibling main-thread SIGTERM purged");
+    assert_eq!(trt, 0, "sibling main-thread RT SIGTERM purged");
+}
+#[test]
+fn sigaction_non_ign_does_not_purge_pending() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(2).pending.standard |= 1u64 << (15 - 1);
+    });
+    // Installing a real handler (not SIG_IGN) must NOT discard pending.
+    let mut o = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 2, &sa_req(15, 0xBEEF, 0, 0), &mut o),
+        16
+    );
+    assert_ne!(
+        crate::kernel::with_kernel(|k| k.process_mut(2).pending.standard) & (1u64 << 14),
+        0,
+        "non-IGN sigaction must leave pending intact"
+    );
+}
+#[test]
+fn b_producer_kill_dfl_terminate_only_pends_never_terminates() {
+    // (B) staging pin: non-raise producers ONLY pend; default-action
+    // execution (terminate/stop/cont) is (C). kill() of an unhandled
+    // SIGTERM (SIG_DFL ⇒ default action = terminate) must leave the
+    // target alive with SIGTERM pending — never _Exit it in (B).
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(42);
+    });
+    // SIGTERM(15), default disposition (SIG_DFL = 0), no handler set.
+    let mut r = 42u32.to_le_bytes().to_vec();
+    r.extend_from_slice(&15u32.to_le_bytes());
+    assert_eq!(
+        dispatch(METHOD_SYS_KILL, 1, &r, &mut []),
+        0,
+        "kill returns 0 (pended)"
+    );
+    // Target still exists (NOT terminated) and SIGTERM is pending.
+    let (alive, pending) = crate::kernel::with_kernel(|k| {
+        (
+            k.has_process(42),
+            k.process_mut(42).pending.standard & (1u64 << 14) != 0,
+        )
+    });
+    assert!(
+        alive,
+        "(B): kill of SIG_DFL-terminate must NOT terminate the target"
+    );
+    assert!(pending, "(B): SIGTERM only pended, awaiting (C) delivery");
+}
+#[test]
+fn b_signal_query_readiness_edge_unblock_makes_pending_deliverable() {
+    // #91-unblock primitive: pselect/ppoll compute their EINTR/readiness
+    // edge purely from kernel sys_sigprocmask + sys_signal_query — no
+    // guest signal state. Block SIGINT, raise it (pended, NOT deliverable
+    // while blocked), then unblock and observe the readiness edge.
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut o = [0u8; 1];
+    // Block SIGINT (compact slot 1 = SIGINT(2); spm_req how=0 BLOCK).
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGPROCMASK, 1, &spm_req(0, Some(1 << 1)), &mut o),
+        1
+    );
+    // raise SIGINT: blocked ⇒ kernel pends in caller-thread pool, action NONE.
+    let mut resp = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGNAL_RAISE, 1, &2u32.to_le_bytes(), &mut resp),
+        8
+    );
+    assert_eq!(
+        i32::from_le_bytes(resp[0..4].try_into().unwrap()),
+        0,
+        "blocked ⇒ NONE"
+    );
+    // Not deliverable while blocked ⇒ query == 0 (pselect would NOT wake / no EINTR).
+    let mut q = [0u8; 1];
+    assert_eq!(dispatch(METHOD_SYS_SIGNAL_QUERY, 1, &[], &mut q), 1);
+    assert_eq!(
+        q[0], 0,
+        "blocked pending signal is NOT deliverable (no readiness)"
+    );
+    // Unblock SIGINT ⇒ the pending signal becomes deliverable: the edge.
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGPROCMASK, 1, &spm_req(1, Some(1 << 1)), &mut o),
+        1
+    ); // how=1 UNBLOCK
+    assert_eq!(dispatch(METHOD_SYS_SIGNAL_QUERY, 1, &[], &mut q), 1);
+    assert_eq!(
+        q[0], 1,
+        "after unblock the pending signal is deliverable (pselect/ppoll EINTR edge)"
     );
 }

@@ -465,21 +465,39 @@ Deno.test(
   async () => {
     const mk = await freshKernelHostInterface();
 
+    // 21-byte wire (B/PR225 F1): [u32 sig][u8 has_act][u32 handler]
+    // [u64 sa_mask][u32 sa_flags] (LE). has_act=1 = SET. Return is now
+    // 16 (bytes written); the PRIOR disposition is in the 16-byte
+    // response, not the return value — mirrors the migrated rust
+    // trampoline test signal_storage_round_trips_through_trampoline.
+    const saReq = (sig: number, handler: number): Uint8Array => {
+      const req = new Uint8Array(21);
+      const v = new DataView(req.buffer);
+      v.setUint32(0, sig >>> 0, true);
+      v.setUint8(4, 1); // has_act=1 (set)
+      v.setUint32(5, handler >>> 0, true); // handler
+      v.setBigUint64(9, 0n, true); // sa_mask
+      v.setUint32(17, 0, true); // sa_flags
+      return req;
+    };
+
     // sigaction(SIGTERM=15, SIG_IGN=1) → previous SIG_DFL=0.
-    const sa1 = new Uint8Array(8);
-    const sa1View = new DataView(sa1.buffer);
-    sa1View.setUint32(0, 15, true);
-    sa1View.setUint32(4, 1, true);
-    let { rc } = mk.syscall(METHOD.SYS_SIGACTION, sa1, 0);
-    assertEquals(Number(rc), 0);
+    let { rc, response } = mk.syscall(METHOD.SYS_SIGACTION, saReq(15, 1), 16);
+    assertEquals(Number(rc), 16, "sigaction success returns 16 (bytes written)");
+    assertEquals(
+      new DataView(response.buffer, response.byteOffset).getUint32(0, true),
+      0,
+      "previous disposition was SIG_DFL",
+    );
 
     // Replace with user handler 0xDEAD; previous should be 1 (SIG_IGN).
-    const sa2 = new Uint8Array(8);
-    const sa2View = new DataView(sa2.buffer);
-    sa2View.setUint32(0, 15, true);
-    sa2View.setUint32(4, 0xDEAD, true);
-    ({ rc } = mk.syscall(METHOD.SYS_SIGACTION, sa2, 0));
-    assertEquals(Number(rc), 1);
+    ({ rc, response } = mk.syscall(METHOD.SYS_SIGACTION, saReq(15, 0xDEAD), 16));
+    assertEquals(Number(rc), 16);
+    assertEquals(
+      new DataView(response.buffer, response.byteOffset).getUint32(0, true),
+      1,
+      "previous disposition was SIG_IGN",
+    );
 
     const targetPid = spawnFromRamfs(mk, 1, s("/bin/signal-target"), [
       s("signal-target"),

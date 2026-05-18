@@ -36,33 +36,20 @@ YURT_DEFINE_MARKER(sigsuspend,   0x73737370u) /* sssp */
 #define NSIG 64
 #endif
 
+/* Execution-only handler registry.  The kernel owns mask/pending/disposition;
+ * this array stores only the function pointer (or SIG_DFL/SIG_IGN) the guest
+ * passed through sigaction/signal so that yurt_raise_now can dispatch it when
+ * the kernel says action=RUN_HANDLER.  sa_mask and sa_flags in these entries
+ * are NOT consulted for any masking decision. */
 static struct sigaction yurt_signal_actions[NSIG];
 static int yurt_signal_initialized = 0;
 static unsigned yurt_alarm_seconds = 0;
-static unsigned long long yurt_signal_mask = 0;
-static unsigned long long yurt_pending_signal_mask = 0;
-static int yurt_delivering_pending_signals = 0;
 
-static int yurt_signal_validate(int sig);
 static int yurt_signal_compact_slot(int sig);
 static int yurt_sigset_mask_bit(int sig, sigset_t *bit);
-static int yurt_signal_default_terminates(int sig);
-static void yurt_signal_deliver_pending(void);
+static int yurt_signal_validate(int sig);
 static int yurt_raise_now(int sig);
 __attribute__((weak)) int yurt_forward_signal_to_exec_child(int sig);
-
-static int yurt_pending_signal_bit(int sig, unsigned long long *bit) {
-  if (yurt_signal_validate(sig) != 0) {
-    return -1;
-  }
-  if (sig >= (int)(8 * sizeof(*bit))) {
-    errno = EINVAL;
-    return -1;
-  }
-
-  *bit = 1ull << sig;
-  return 0;
-}
 
 static int yurt_signal_compact_slot(int sig) {
   switch (sig) {
@@ -118,35 +105,6 @@ static int yurt_signal_validate(int sig) {
     return -1;
   }
   return 0;
-}
-
-static int yurt_signal_default_terminates(int sig) {
-  switch (sig) {
-    case SIGHUP:
-    case SIGINT:
-    case SIGQUIT:
-    case SIGILL:
-    case SIGTRAP:
-    case SIGABRT:
-    case SIGBUS:
-    case SIGFPE:
-    case SIGKILL:
-    case SIGUSR1:
-    case SIGSEGV:
-    case SIGUSR2:
-    case SIGPIPE:
-    case SIGALRM:
-    case SIGTERM:
-    case SIGXCPU:
-    case SIGXFSZ:
-    case SIGVTALRM:
-    case SIGIO:
-    case SIGPWR:
-    case SIGSYS:
-      return 1;
-    default:
-      return 0;
-  }
 }
 
 int sigemptyset(sigset_t *set) {
@@ -216,126 +174,211 @@ int sigismember(const sigset_t *set, int sig) {
   return (*set & bit) != 0;
 }
 
+/* Shared helper: route one sigaction registration/query through the kernel.
+ * sig: the signal number.
+ * has_act: 1 = set the disposition (handler/mask/flags are live),
+ *          0 = pure query (POSIX sigaction(_,NULL,&old)); the kernel
+ *          MUST NOT mutate state — handler/mask/flags are don't-care.
+ * handler: the sa_handler value cast to unsigned (don't-care if has_act==0).
+ * mask: sa_mask as u64 (the kernel does compact<->canonical remap).
+ * flags: sa_flags as unsigned.
+ * oldact_out: if non-NULL, the prior kernel state is decoded into it.
+ * Returns 0 on success, negative errno on failure (kernel convention). */
+static int yurt_kernel_sigaction(int sig, int has_act, unsigned handler,
+                                 unsigned long long mask, unsigned flags,
+                                 struct sigaction *oldact_out) {
+  unsigned char req[21];
+  unsigned char resp[16];
+  int rc;
+
+  /* Pack req: u32 sig | u8 has_act | u32 handler | u64 sa_mask | u32 sa_flags (LE) */
+  { unsigned u = (unsigned)sig;    memcpy(req + 0,  &u, 4); }
+  { req[4] = (unsigned char)(has_act ? 1 : 0); }
+  {                                memcpy(req + 5,  &handler, 4); }
+  {                                memcpy(req + 9,  &mask, 8); }
+  {                                memcpy(req + 17, &flags, 4); }
+
+  rc = yurt_host_sigaction((int)(uintptr_t)req, 21,
+                           (int)(uintptr_t)resp, 16);
+  if (rc < 0) {
+    return rc;  /* negative errno */
+  }
+
+  if (oldact_out != NULL) {
+    unsigned prev_handler;
+    unsigned long long prev_mask;
+    unsigned prev_flags;
+    memcpy(&prev_handler, resp + 0,  4);
+    memcpy(&prev_mask,    resp + 4,  8);
+    memcpy(&prev_flags,   resp + 12, 4);
+    /* Use .sa_handler through the macro (expands to .__sa_handler.sa_handler). */
+    oldact_out->sa_handler =
+        (sighandler_t)(uintptr_t)prev_handler;
+    /* Compact sigset_t is 1 byte; take the low byte of the kernel's u64. */
+    oldact_out->sa_mask = (sigset_t)(prev_mask & 0xFFu);
+    oldact_out->sa_flags = (int)prev_flags;
+    oldact_out->sa_restorer = NULL;
+  }
+
+  return 0;
+}
+
 sighandler_t signal(int sig, sighandler_t handler) {
   YURT_MARKER_CALL(signal);
-  sighandler_t old_handler;
+  sighandler_t old;
+  int rc;
 
   if (yurt_signal_validate(sig) != 0) {
     return SIG_ERR;
   }
 
   yurt_signal_init();
-  old_handler = yurt_signal_actions[sig].sa_handler;
+  old = yurt_signal_actions[sig].sa_handler;
+  rc = yurt_kernel_sigaction(sig, 1,
+                             (unsigned)(uintptr_t)handler,
+                             0ULL, 0U, NULL);
+  if (rc < 0) {
+    errno = -rc;
+    return SIG_ERR;
+  }
+
+  /* Update execution-only registry. */
   yurt_signal_actions[sig].sa_handler = handler;
-  memset(&yurt_signal_actions[sig].sa_mask, 0, sizeof(yurt_signal_actions[sig].sa_mask));
-  yurt_signal_actions[sig].sa_flags = 0;
-  yurt_signal_actions[sig].sa_restorer = NULL;
-  return old_handler;
+  return old;
 }
 
-int sigaction(int sig, const struct sigaction *restrict act, struct sigaction *restrict oldact) {
+int sigaction(int sig, const struct sigaction *restrict act,
+              struct sigaction *restrict oldact) {
   YURT_MARKER_CALL(sigaction);
+  unsigned handler;
+  unsigned long long mask;
+  unsigned flags;
+  int rc;
+
   if (yurt_signal_validate(sig) != 0) {
     return -1;
   }
 
   yurt_signal_init();
 
-  if (oldact) {
-    *oldact = yurt_signal_actions[sig];
+  if (act != NULL) {
+    handler = (unsigned)(uintptr_t)act->sa_handler;
+    mask    = (unsigned long long)act->sa_mask;
+    flags   = (unsigned)act->sa_flags;
+  } else {
+    /* Pure-query (act==NULL): POSIX sigaction(_,NULL,&old) MUST NOT
+     * modify the disposition. has_act=0 makes the kernel a pure query;
+     * do NOT read the guest-cached handler (that would reintroduce
+     * guest-side signal state, the #90 defect class). The fields are
+     * don't-care to the kernel — pass 0. */
+    handler = 0U;
+    mask    = 0ULL;
+    flags   = 0U;
   }
-  if (act) {
-    yurt_signal_actions[sig] = *act;
+
+  rc = yurt_kernel_sigaction(sig, act != NULL ? 1 : 0, handler, mask, flags,
+                             oldact ? oldact : NULL);
+  if (rc < 0) {
+    errno = -rc;
+    return -1;
+  }
+
+  /* Update execution-only registry only when a new action was set. */
+  if (act != NULL) {
+    yurt_signal_actions[sig].sa_handler = act->sa_handler;
   }
 
   return 0;
 }
 
-int sigprocmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset) {
+int sigprocmask(int how, const sigset_t *restrict set,
+                sigset_t *restrict oldset) {
   YURT_MARKER_CALL(sigprocmask);
   yurt_signal_init();
 
-  if (oldset) {
-    *oldset = (sigset_t)yurt_signal_mask;
-  }
-  if (set == NULL) {
-    return 0;
+  if (how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK) {
+    errno = EINVAL;
+    return -1;
   }
 
-  switch (how) {
-    case SIG_BLOCK:
-      yurt_signal_mask |= (unsigned long long)(*set);
-      yurt_signal_deliver_pending();
-      return 0;
-    case SIG_UNBLOCK:
-      yurt_signal_mask &= ~((unsigned long long)(*set));
-      yurt_signal_deliver_pending();
-      return 0;
-    case SIG_SETMASK:
-      yurt_signal_mask = (unsigned long long)(*set);
-      yurt_signal_deliver_pending();
-      return 0;
-    default:
-      errno = EINVAL;
-      return -1;
+  /* Pack req: i32 how | u8 has_set | u8 set_byte  (6 bytes total) */
+  unsigned char req[6];
+  unsigned char out[1];
+  { int h = how; memcpy(req, &h, 4); }
+  req[4] = set ? 1 : 0;
+  req[5] = set ? (unsigned char)*set : 0;
+
+  int rc = yurt_host_sigprocmask((int)(uintptr_t)req, 6,
+                                 (int)(uintptr_t)out, 1);
+  if (rc < 0) {
+    errno = -rc;
+    return -1;
   }
+
+  if (oldset) {
+    *oldset = (sigset_t)out[0];
+  }
+
+  return 0;
 }
 
-int pthread_sigmask(int how, const sigset_t *restrict set, sigset_t *restrict oldset) {
+int pthread_sigmask(int how, const sigset_t *restrict set,
+                    sigset_t *restrict oldset) {
   YURT_MARKER_CALL(pthread_sigmask);
   return sigprocmask(how, set, oldset);
 }
 
 int sigsuspend(const sigset_t *mask) {
-  unsigned long long old_mask;
   YURT_MARKER_CALL(sigsuspend);
-
   yurt_signal_init();
-  old_mask = yurt_signal_mask;
-  if (mask) {
-    yurt_signal_mask = (unsigned long long)(*mask);
+
+  /* SETMASK to *mask, capturing old; query; restore old; yield; EINTR. */
+  unsigned char req[6];
+  unsigned char out[1];
+  int how = SIG_SETMASK;  /* = 2 */
+  memcpy(req, &how, 4);
+  req[4] = mask ? 1 : 0;
+  req[5] = mask ? (unsigned char)*mask : 0;
+  int rc_set = yurt_host_sigprocmask((int)(uintptr_t)req, 6,
+                                     (int)(uintptr_t)out, 1);
+  if (rc_set < 0) {
+    /* Could not enter the suspend mask: nothing was changed, nothing to
+       restore, and `out` is unwritten — do NOT read it. */
+    errno = -rc_set;
+    return -1;
   }
-  yurt_signal_deliver_pending();
-  yurt_host_yield();
-  yurt_signal_mask = old_mask;
-  yurt_signal_deliver_pending();
+  unsigned char old = out[0];   /* defined: SETMASK succeeded */
+
+  /* Probe for a deliverable signal (gate-deferred: do not act on it in B). */
+  unsigned char q[1];
+  (void)yurt_host_signal_query((int)(uintptr_t)q, 1);
+
+  /* Best-effort restore of the prior mask (we DID change it above). */
+  int how2 = SIG_SETMASK;  /* = 2 */
+  memcpy(req, &how2, 4);
+  req[4] = 1;
+  req[5] = old;
+  (void)yurt_host_sigprocmask((int)(uintptr_t)req, 6, (int)(uintptr_t)out, 1);
+
+  yurt_host_yield();   /* anti-CPU-spin */
   errno = EINTR;
   return -1;
 }
 
+/*
+ * (B) gated stub: kernel sys_sigwaitinfo uses a canonical set; guest
+ * sigset_t is 1-byte compact and the guest does no signo math (#90).
+ * Real accept is a consumer/(C) slice.  Deliberately inert — no host
+ * import is called, the mask is not touched.
+ */
 int sigtimedwait(
   const sigset_t *restrict set,
   siginfo_t *restrict info,
   const struct timespec *restrict timeout
 ) {
-  YURT_MARKER_CALL(sigsuspend);
-  (void)timeout;
-
-  yurt_signal_init();
-  if (set == NULL) {
-    errno = EINVAL;
-    return -1;
-  }
-
-  for (int sig = 1; sig < NSIG; ++sig) {
-    unsigned long long pending_bit;
-    sigset_t mask_bit;
-    if (yurt_pending_signal_bit(sig, &pending_bit) != 0 ||
-        yurt_sigset_mask_bit(sig, &mask_bit) != 0 ||
-        ((*set & mask_bit) == 0) ||
-        ((yurt_pending_signal_mask & pending_bit) == 0)) {
-      continue;
-    }
-
-    yurt_pending_signal_mask &= ~pending_bit;
-    if (info != NULL) {
-      memset(info, 0, sizeof(*info));
-      info->si_signo = sig;
-    }
-    return sig;
-  }
-
-  yurt_host_yield();
+  YURT_MARKER_CALL(sigsuspend);   /* sigtimedwait has no dedicated marker in this (B) slice; reusing sigsuspend's is intentional — revisit when sigtimedwait is promoted in a (C)/consumer slice. */
+  (void)set; (void)info; (void)timeout;
+  yurt_host_yield();   /* anti-CPU-spin */
   errno = EAGAIN;
   return -1;
 }
@@ -348,73 +391,56 @@ int pause(void) {
 
 static int yurt_raise_now(int sig) {
   YURT_MARKER_CALL(raise);
-  sighandler_t handler;
-  unsigned long long pending_bit;
-  sigset_t mask_bit;
-
   if (yurt_signal_validate(sig) != 0) {
     return -1;
   }
 
   yurt_signal_init();
-  if (yurt_pending_signal_bit(sig, &pending_bit) != 0) {
+
+  unsigned char req[4];
+  { unsigned u = (unsigned)sig; memcpy(req, &u, 4); }
+  unsigned char resp[8];
+  int rc = yurt_host_signal_raise((int)(uintptr_t)req, 4,
+                                  (int)(uintptr_t)resp, 8);
+  if (rc < 0) {
+    errno = -rc;
     return -1;
   }
-  if (yurt_sigset_mask_bit(sig, &mask_bit) == 0 &&
-      (yurt_signal_mask & (unsigned long long)mask_bit) != 0) {
-    yurt_pending_signal_mask |= pending_bit;
+
+  int action;
+  unsigned token;
+  memcpy(&action, resp,     4);
+  memcpy(&token,  resp + 4, 4);
+
+  /* NONE: kernel pended-because-blocked or discarded-SIG_IGN.
+   * Return immediately — do NOT forward to exec-child. */
+  if (action == 0) {
     return 0;
   }
 
+  /* For all non-NONE verdicts: attempt exec-child forward first. */
   if (yurt_forward_signal_to_exec_child &&
       yurt_forward_signal_to_exec_child(sig)) {
     return 0;
   }
 
-  handler = yurt_signal_actions[sig].sa_handler;
-
-  if (handler == SIG_IGN) {
-    return 0;
-  }
-  if (handler != SIG_DFL && handler != SIG_ERR && handler != NULL) {
-    handler(sig);
-    return 0;
-  }
-
-  if (yurt_signal_default_terminates(sig)) {
-    _Exit(128 + sig);
-  }
-
-  return 0;
-}
-
-static void yurt_signal_deliver_pending(void) {
-  if (yurt_delivering_pending_signals) {
-    return;
-  }
-
-  yurt_delivering_pending_signals = 1;
-  for (;;) {
-    int delivered = 0;
-    for (int sig = 1; sig < NSIG; ++sig) {
-      unsigned long long pending_bit;
-      sigset_t mask_bit;
-      if (yurt_pending_signal_bit(sig, &pending_bit) != 0 ||
-          (yurt_pending_signal_mask & pending_bit) == 0) {
-        continue;
+  switch (action) {
+    case 1: /* RUN_HANDLER */ {
+      sighandler_t h = (sighandler_t)(uintptr_t)token;
+      if (h && h != SIG_IGN && h != SIG_DFL && h != SIG_ERR) {
+        h(sig);
       }
-      if (yurt_sigset_mask_bit(sig, &mask_bit) == 0 &&
-          (yurt_signal_mask & (unsigned long long)mask_bit) != 0) {
-        continue;
-      }
-      yurt_pending_signal_mask &= ~pending_bit;
-      yurt_raise_now(sig);
-      delivered = 1;
-      break;
+      return 0;
     }
-    if (!delivered) break;
+    case 2: /* DFL_TERMINATE */
+      _Exit(128 + sig);
+    case 3: /* DFL_STOP */
+      return 0;   /* interim no-op (real stop = (C)/job-control slice) */
+    case 4: /* DFL_CONT */
+      return 0;   /* interim no-op */
+    default:
+      return 0;
   }
-  yurt_delivering_pending_signals = 0;
 }
 
 int raise(int sig) {

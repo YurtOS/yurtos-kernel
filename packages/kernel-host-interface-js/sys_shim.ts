@@ -304,11 +304,25 @@ export function buildSysImports(
       return forwardRequestBytes(METHOD.SYS_KILLPG, req);
     },
     sys_sigaction: (sig, disposition) => {
-      const req = new Uint8Array(8);
+      // 21-byte wire (B/PR225 F1): [u32 sig][u8 has_act][u32 handler]
+      // [u64 sa_mask][u32 sa_flags] (LE). The legacy 2-arg env shim is
+      // always a SET (has_act=1) — it carries no oldact out-pointer, so
+      // the prior disposition lands in the 16-byte response buffer and
+      // the kernel rc (16 on success) is returned verbatim. Mirrors the
+      // sys_getrlimit buffer-in + buffer-out idiom.
+      const req = new Uint8Array(21);
       const view = new DataView(req.buffer);
       view.setUint32(0, sig >>> 0, true);
-      view.setUint32(4, disposition >>> 0, true);
-      return forwardRequestBytes(METHOD.SYS_SIGACTION, req);
+      view.setUint8(4, 1); // has_act=1 (set)
+      view.setUint32(5, disposition >>> 0, true); // handler
+      view.setBigUint64(9, 0n, true); // sa_mask
+      view.setUint32(17, 0, true); // sa_flags
+      const { rc } = forwardRequestWithResponse(
+        METHOD.SYS_SIGACTION,
+        req,
+        16,
+      );
+      return rc;
     },
     sys_sched_yield: () =>
       forwardRequestBytes(METHOD.SYS_SCHED_YIELD, new Uint8Array(0)),

@@ -301,7 +301,7 @@ doc = "POSIX killpg(pgid, sig). Request bytes carry two little-endian u32s: proc
 [method.sys_sigaction]
 id = 0x1_001C
 kind = "syscall"
-doc = "POSIX sigaction(sig, disposition). Request bytes carry two little-endian u32s: signal number (1..=63), disposition. Disposition encoding: 0 = SIG_DFL, 1 = SIG_IGN, anything else is treated as a user-provided wasm function index/pointer (kernel stores it; user-side libc maintains the actual mapping). Phase 2 stores per-pid only; delivery comes with AsyncBridge. Returns the previous disposition on success, -EINVAL for sig out of range."
+doc = "POSIX sigaction. Request (21 bytes): u32 sig + u8 has_act + u32 handler + u64 sa_mask + u32 sa_flags (LE). has_act: 0 = pure query (sigaction(_,NULL,&old) — return prior, DO NOT mutate/purge; handler/mask/flags are don't-care), 1 = set the disposition. Response: prior {u32 handler, u64 sa_mask, u32 sa_flags}, always returned. handler 0=SIG_DFL 1=SIG_IGN else opaque guest token. SIGKILL(9)/SIGSTOP(19) => -EINVAL (no settable disposition). Per-process. Evolved-in-place (co-versioned ABI): id unchanged, request gained the has_act query discriminator."
 
 [method.sys_sched_yield]
 id = 0x1_001D
@@ -556,12 +556,12 @@ doc = "POSIX sigqueue(pid, sig, value). Request: u32 target pid LE + u32 sig LE 
 [method.sys_sigwaitinfo]
 id = 0x1_0064
 kind = "syscall"
-doc = "POSIX sigwaitinfo non-blocking dequeue. Request: u64 set mask LE (bit sig-1 selects sig). If the authenticated caller has a queued RT signal whose bit is in the set, the oldest such signal (FIFO across all selected signos) is removed from the RT queue and its siginfo is written: 16 bytes — i32 si_signo + i32 si_code (SI_QUEUE=-1) + u32 si_pid (sender) + i32 si_value, all LE. It operates ONLY on the RT queue and does NOT touch the kill/SIGCHLD pending bitmask (separated-producer model). Returns 16 on success, -EAGAIN if no selected signal is pending (true blocking is gate-deferred), -ESRCH if the caller has no process record, -EINVAL on short request/buffer."
+doc = "POSIX sigwaitinfo/sigtimedwait dequeue. Two-pool synchronous accept selected by request set, regardless of blocked state, removes+returns. Dual-pool priority: caller-thread pool then process pool; RT lowest-signo-FIFO then standard lowest-signo. 16-byte siginfo {i32 si_signo,i32 si_code,u32 si_pid,i32 si_value} LE: RT => si_code=SI_QUEUE(-1)/si_pid=sender/si_value=value; standard => si_code=0x80/si_pid=0/si_value=0. -EAGAIN if none."
 
 [method.sys_sigpending]
 id = 0x1_0065
 kind = "syscall"
-doc = "POSIX sigpending. No request bytes. Writes 8 bytes — the authenticated caller's pending-signal set as a u64 LE bitmask (bit sig-1). Read-time UNION of two independent producers: the kill/SIGCHLD `pending_signals` bitmask, OR-ed with a derived bit for every signo currently in the RT queue (`pending_rt`, populated by sigqueue). Neither producer mutates the other; the union is computed per call. Returns 8, -ESRCH if the caller has no process record, -EINVAL if the response buffer is shorter than 8 bytes."
+doc = "POSIX sigpending. No request. Response: u64 LE bitmask = union of the process + caller-thread two-pool PendingSet (standard bits OR-ed with derived RT-pending bits). Pure read."
 
 [method.sys_fchdir]
 id = 0x1_005F
@@ -575,8 +575,11 @@ doc = "Change the caller's working directory to an open directory fd. Request by
 #   B2 fd/vfs          → 0x1_0070–0x1_007F  (PR #55)
 #   B3 sockets         → 0x1_0080–0x1_008F
 #   B4 persistence/ext → 0x1_0090–0x1_009F
-# Future slices take the next free block. The umbrella matrix (#51)
+# Future slices take the next free block. The umbrella matrix (#57; tracking #52 — #51 was reverted by #56)
 # mirrors this table as the canonical record.
+#   misc/fs (post-B4)        → 0x1_00A0, 0x1_00A4–0x1_00A9
+#   *at family / prctl       → 0x1_00AF–0x1_00B3
+#   signal-state (B) #90     → 0x1_00B4–0x1_00BF (rebased off the *at block)
 
 [method.sys_pread]
 id = 0x1_0070
@@ -765,3 +768,18 @@ doc = "KernelHostInterface-only: ask the kernel scheduler for the next runnable 
 id = 0x1_00A0
 kind = "syscall"
 doc = "POSIX getrandom(buf, buflen, flags). Request: u32 len LE + u32 flags LE (8 bytes). Response buffer receives `len` cryptographically secure random bytes from the host CSPRNG. flags: GRND_NONBLOCK (0x1) and GRND_RANDOM (0x2) are accepted and treated as no-ops: on a running host the CSPRNG is already seeded so this does not block in practice (an OS-layer cold-boot pre-seed block is theoretically possible but not modeled here), and there is no separate /dev/random-style pool; any other bit -> -EINVAL. Returns `len` on success; -EINVAL for unknown flags, a request shorter than 8 bytes, or a response buffer smaller than `len`; -EIO if the host entropy source fails; -EFAULT if the host reports bad guest memory. Length is bounded with the subtraction form (issue #65 class). getentropy() is a thin guest-libc wrapper over this method, not a separate id."
+
+[method.sys_sigprocmask]
+id = 0x1_00B4
+kind = "syscall"
+doc = "Per-calling-thread blocked mask (serves pthread_sigmask). Request: i32 how + u8 has_set + u8 set (1-byte compact sigset_t verbatim). Response: u8 oset (prior, compact). how 0=BLOCK 1=UNBLOCK 2=SETMASK else -EINVAL. SIGKILL/SIGSTOP cleared silently. Compact<->sig-1 remap is kernel-side safe Rust."
+
+[method.sys_signal_raise]
+id = 0x1_00B5
+kind = "syscall"
+doc = "raise()/self-signal deliver-or-defer DECISION. Request: u32 sig. Response: {i32 action, u32 handler_token}. action: 0 NONE (blocked=>thread-pended, or SIG_IGN=>discarded) 1 RUN_HANDLER(+token) 2 DFL_TERMINATE 3 DFL_STOP 4 DFL_CONT. Kernel checks caller-thread blocked mask + per-process disposition; blocked => pend in CALLER THREAD PendingSet. Guest only executes the verdict."
+
+[method.sys_signal_query]
+id = 0x1_00B6
+kind = "syscall"
+doc = "Non-destructive readiness probe. No request. Response: u8 (1 if the caller thread has any deliverable signal = (proc.pending UNION thread.pending) AND NOT thread.blocked; SIG_IGN signals are excluded by the produce-time pend() funnel, not filtered here; else 0). Does NOT accept/remove. Consumed by #91 pselect/ppoll EINTR edge."
