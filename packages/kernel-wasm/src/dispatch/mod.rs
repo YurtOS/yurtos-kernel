@@ -190,6 +190,13 @@ pub fn dispatch_with_context(
         METHOD_SYS_GETRANDOM => sys_getrandom(request, response),
         METHOD_SYS_PWRITE => pwrite_fd(caller_pid, request),
         METHOD_SYS_POLL => poll_fds(caller_pid, request, response),
+        // #91 select/pselect/ppoll: method IDs reserved in Task 1; real
+        // handlers land in Tasks 3/4. Explicit arms keep the toml-
+        // generated constants in-use (clippy `-D warnings` requirement)
+        // and make pending coverage visible at the dispatch site.
+        METHOD_SYS_SELECT => -(abi::ENOSYS as i64),
+        METHOD_SYS_PSELECT => -(abi::ENOSYS as i64),
+        METHOD_SYS_PPOLL => -(abi::ENOSYS as i64),
         METHOD_SYS_ISATTY => isatty(caller_pid, request),
         METHOD_SYS_TCGETPGRP => tcgetpgrp(caller_pid, request),
         METHOD_SYS_TCSETPGRP => tcsetpgrp(caller_pid, request),
@@ -994,6 +1001,30 @@ const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
 const POLLFD_SIZE: usize = 8;
 
+/// One fd's readiness work item shared by every readiness syscall.
+/// `events` is the requested mask, `revents` is filled by `poll_core`.
+/// Issue #91 Task 2.
+struct WorkFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+/// The single per-fd readiness loop. Fills each `WorkFd::revents` via the
+/// unchanged `poll_revents_for_fd`. Deliberately computes NO count and
+/// NO errno — every caller (`poll_fds` / `sys_select` / `sys_pselect` /
+/// `sys_ppoll`) shapes its own result. A negative fd yields revents 0
+/// (matches the shipped poll path).
+fn poll_core(k: &mut Kernel, caller_pid: u32, work: &mut [WorkFd]) {
+    for w in work.iter_mut() {
+        w.revents = if w.fd < 0 {
+            0
+        } else {
+            poll_revents_for_fd(k, caller_pid, w.fd as u32, w.events)
+        };
+    }
+}
+
 fn poll_fds(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if request.len() < 4 || !(request.len() - 4).is_multiple_of(POLLFD_SIZE) {
         return -(abi::EINVAL as i64);
@@ -1002,26 +1033,28 @@ fn poll_fds(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if response.len() < records.len() {
         return -(abi::EINVAL as i64);
     }
-
     response[..records.len()].copy_from_slice(records);
-    with_kernel(|k| {
-        let mut ready = 0;
-        for (index, record) in records.chunks_exact(POLLFD_SIZE).enumerate() {
-            let fd = i32::from_le_bytes(record[0..4].try_into().expect("poll fd"));
-            let events = i16::from_le_bytes(record[4..6].try_into().expect("poll events"));
-            let revents = if fd < 0 {
-                0
-            } else {
-                poll_revents_for_fd(k, caller_pid, fd as u32, events)
-            };
-            let out = index * POLLFD_SIZE + 6;
-            response[out..out + 2].copy_from_slice(&revents.to_le_bytes());
-            if revents != 0 {
-                ready += 1;
-            }
+
+    let mut work: Vec<WorkFd> = records
+        .chunks_exact(POLLFD_SIZE)
+        .map(|r| WorkFd {
+            fd: i32::from_le_bytes(r[0..4].try_into().expect("poll fd")),
+            events: i16::from_le_bytes(r[4..6].try_into().expect("poll events")),
+            revents: 0,
+        })
+        .collect();
+
+    with_kernel(|k| poll_core(k, caller_pid, &mut work));
+
+    let mut ready = 0;
+    for (index, w) in work.iter().enumerate() {
+        let out = index * POLLFD_SIZE + 6;
+        response[out..out + 2].copy_from_slice(&w.revents.to_le_bytes());
+        if w.revents != 0 {
+            ready += 1;
         }
-        ready
-    })
+    }
+    ready
 }
 
 fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) -> i16 {
