@@ -15,14 +15,7 @@ fn main() {
     // requires. host_spawn MUST return -22 (EINVAL) without panicking/trapping.
     let bad_req = [0u8; 10];
     let mut out = [0u8; 4];
-    let rc = unsafe {
-        host_spawn(
-            bad_req.as_ptr(),
-            bad_req.len(),
-            out.as_mut_ptr(),
-            out.len(),
-        )
-    };
+    let rc = unsafe { host_spawn(bad_req.as_ptr(), bad_req.len(), out.as_mut_ptr(), out.len()) };
     // Exit with the negated errno so the host can observe it as exit code 22.
     std::process::exit(if rc < 0 { -rc } else { 0 });
 }

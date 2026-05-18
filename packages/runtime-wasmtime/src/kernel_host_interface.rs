@@ -3362,9 +3362,7 @@ fn instantiate_with_pid_raw(
 /// Drain the next sys_spawn-staged child from the kernel, if any. Byte-for-
 /// byte the body that previously lived in
 /// `KernelHostInterface::drain_pending_spawn`.
-fn drain_pending_spawn_raw(
-    kernel: &Arc<Mutex<KernelInstance>>,
-) -> Result<Option<PendingSpawn>> {
+fn drain_pending_spawn_raw(kernel: &Arc<Mutex<KernelInstance>>) -> Result<Option<PendingSpawn>> {
     let mut buf = vec![0u8; kernel.lock().unwrap().scratch_len as usize];
     let rc = kernel.lock().unwrap().drain_spawn(&mut buf)?;
     if rc == -ENOENT {
@@ -3415,11 +3413,7 @@ fn drain_pending_spawn_raw(
 /// Record a child's exit status so the parent's `sys_wait` can reap it.
 /// Byte-for-byte the body that previously lived in
 /// `KernelHostInterface::record_exit`.
-fn record_exit_raw(
-    kernel: &Arc<Mutex<KernelInstance>>,
-    pid: u32,
-    exit_status: i32,
-) -> Result<()> {
+fn record_exit_raw(kernel: &Arc<Mutex<KernelInstance>>, pid: u32, exit_status: i32) -> Result<()> {
     let rc = kernel.lock().unwrap().record_exit(pid, exit_status)?;
     if rc != 0 {
         anyhow::bail!("kernel_record_exit failed: rc={rc}");
