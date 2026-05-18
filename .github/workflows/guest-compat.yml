@@ -103,7 +103,7 @@ jobs:
           path: |
             packages/kernel/src/platform/__tests__/fixtures/busybox.wasm
             packages/kernel/src/platform/__tests__/fixtures/busybox.manifest.json
-          key: fixture-busybox-${{ hashFiles('test-fixtures/c-ports/busybox/**', 'test-fixtures/c-ports/Makefile', 'abi/include/**', 'abi/src/**', 'abi/Makefile', 'abi/toolchain/**', 'Cargo.lock', '.github/workflows/guest-compat.yml') }}
+          key: fixture-busybox-${{ hashFiles('test-fixtures/c-ports/busybox/**', 'abi/include/**', 'abi/src/**', 'abi/Makefile', 'abi/toolchain/**', 'Cargo.lock', '.github/workflows/guest-compat.yml') }}
 
       - name: Build BusyBox fixture
         if: steps.busybox-cache.outputs.cache-hit != 'true'
@@ -128,7 +128,7 @@ jobs:
           path: |
             packages/kernel/src/platform/__tests__/fixtures/terminfo-canary.wasm
             test-fixtures/c-ports/ncurses/build/install
-          key: fixture-ncurses-${{ hashFiles('test-fixtures/c-ports/ncurses/**', 'test-fixtures/c-ports/Makefile', 'abi/include/**', 'abi/src/**', 'abi/Makefile', 'abi/toolchain/**', 'Cargo.lock', '.github/workflows/guest-compat.yml') }}
+          key: fixture-ncurses-${{ hashFiles('test-fixtures/c-ports/ncurses/**', 'abi/include/**', 'abi/src/**', 'abi/Makefile', 'abi/toolchain/**', 'Cargo.lock', '.github/workflows/guest-compat.yml') }}
 
       - name: Build ncurses fixture
         if: steps.ncurses-cache.outputs.cache-hit != 'true'
@@ -143,7 +143,7 @@ jobs:
         with:
           path: |
             packages/kernel/src/platform/__tests__/fixtures/zsh.wasm
-          key: fixture-zsh-${{ hashFiles('test-fixtures/c-ports/zsh/**', 'test-fixtures/c-ports/ncurses/**', 'test-fixtures/c-ports/Makefile', 'abi/include/**', 'abi/src/**', 'abi/Makefile', 'abi/toolchain/**', 'Cargo.lock', '.github/workflows/guest-compat.yml') }}
+          key: fixture-zsh-${{ hashFiles('test-fixtures/c-ports/zsh/**', 'test-fixtures/c-ports/ncurses/**', 'abi/include/**', 'abi/src/**', 'abi/Makefile', 'abi/toolchain/**', 'Cargo.lock', '.github/workflows/guest-compat.yml') }}
 
       - name: Build zsh fixture
         if: steps.zsh-cache.outputs.cache-hit != 'true'
