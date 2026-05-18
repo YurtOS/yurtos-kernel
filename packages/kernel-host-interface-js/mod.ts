@@ -196,6 +196,12 @@ export const METHOD = {
   SYS_SCHED_SETSCHEDULER: 0x1_0041,
   SYS_SCHED_SETPARAM: 0x1_0042,
   SYS_POLL: 0x1_0043,
+  SYS_SELECT: 0x1_00A1,
+  SYS_PSELECT: 0x1_00A2,
+  SYS_PPOLL: 0x1_00A3,
+  SYS_EPOLL_CREATE1: 0x1_00B8,
+  SYS_EPOLL_CTL: 0x1_00B9,
+  SYS_EPOLL_WAIT: 0x1_00BA,
   SYS_SOCKETPAIR: 0x1_0044,
   SYS_SOCKET_OPEN: 0x1_0045,
   SYS_SOCKET_BIND: 0x1_0046,
@@ -1750,6 +1756,52 @@ function buildUserYurtImports(
     ).rc;
   imports.host_thread_yield = () =>
     threadSyscall(METHOD.SYS_THREAD_YIELD, new Uint8Array(0), 0).rc;
+
+  // ── #91 readiness syscalls + #92 epoll thin passthroughs ─────────────
+  // host_select/pselect/ppoll/epoll_create1/ctl/wait — i64 return,
+  // guest libc owns marshalling (abi/src/yurt_{select,poll,epoll}.c).
+  // Copy guest request bytes in, dispatch the kernel method, copy
+  // response back. No host-side decoding.
+  const yurtPassthrough = (method: number) =>
+  (
+    reqPtr: number | bigint,
+    reqLen: number | bigint,
+    respPtr: number | bigint,
+    respLen: number | bigint,
+  ): bigint => {
+    const reqPtrN = Number(reqPtr) >>> 0;
+    const reqLenN = Number(reqLen) >>> 0;
+    const respPtrN = Number(respPtr) >>> 0;
+    const respLenN = Number(respLen) >>> 0;
+    const req = copyIn(reqPtrN, reqLenN);
+    if (typeof req === "number") return BigInt(req);
+    const cap = Math.min(respLenN, kernel.scratchLen - req.byteLength);
+    const { rc, response } = kernel.syscall(method, pid, req, cap);
+    const n = Number(rc);
+    if (n >= 0 && respLenN > 0) {
+      // Copy back the full response buffer (kernel writes the data
+      // there regardless of the returned count/bytes-written).
+      const w = copyOut(respPtrN, response.subarray(0, respLenN));
+      if (w < 0) return BigInt(w);
+    }
+    return BigInt(n);
+  };
+  // These return i64 (bigint) at the wasm ABI; the imports map is
+  // typed `=> number` for the legacy i32 imports, so cast through.
+  type PT = (...args: (number | bigint)[]) => number;
+  imports.host_select = yurtPassthrough(METHOD.SYS_SELECT) as unknown as PT;
+  imports.host_pselect = yurtPassthrough(METHOD.SYS_PSELECT) as unknown as PT;
+  imports.host_ppoll = yurtPassthrough(METHOD.SYS_PPOLL) as unknown as PT;
+  imports.host_epoll_create1 = yurtPassthrough(
+    METHOD.SYS_EPOLL_CREATE1,
+  ) as unknown as PT;
+  imports.host_epoll_ctl = yurtPassthrough(
+    METHOD.SYS_EPOLL_CTL,
+  ) as unknown as PT;
+  imports.host_epoll_wait = yurtPassthrough(
+    METHOD.SYS_EPOLL_WAIT,
+  ) as unknown as PT;
+
   // ── host_spawn(reqPtr, reqLen, outPtr, outCap) → i32 ─────────────────────
   // Parses a yurt_spawn_request_v1 from guest memory, builds the SYS_SPAWN
   // kernel wire format, and writes a yurt_spawn_result_v1 (4-byte i32 pid).
