@@ -12988,3 +12988,74 @@ fn stat_terminal_orphan_symlink_still_follows_base_parity() {
         "lstat reports the terminal orphan symlink as S_IFLNK"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #188 (#85 S0): faccessat must resolve a dirfd via the B2.9 inode anchor,
+// like openat — i.e. be rename-stable, not a stale path snapshot.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn faccessat_dirfd_is_rename_stable_like_openat() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/fa-base", &mut []), 0);
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_WRITE | O_CREAT, b"/fa-base/child"),
+            &mut [],
+        ) >= 0
+    );
+    let dirfd = dispatch(
+        METHOD_SYS_OPEN,
+        1,
+        &open_req(O_DIRECTORY, b"/fa-base"),
+        &mut [],
+    ) as u32;
+
+    // Sanity: resolves before the rename.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(dirfd, ACCESS_F_OK, 0, b"child"),
+            &mut [],
+        ),
+        0,
+    );
+
+    // Rename the directory behind the open dirfd. openat on this dirfd
+    // is rename-stable (inode-anchored); faccessat MUST match — a stale
+    // path snapshot would now (wrongly) resolve the dead /fa-base/child.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/fa-base", b"/fa-renamed"),
+            &mut [],
+        ),
+        0,
+    );
+    // openat (reference: known rename-stable) still finds it:
+    let oref = dispatch(
+        METHOD_SYS_OPENAT,
+        1,
+        &openat_req(dirfd, 0, b"child"),
+        &mut [],
+    );
+    assert!(
+        oref >= 0,
+        "openat reference must be rename-stable, got {oref}"
+    );
+    // faccessat must agree (the #188 bug: returns -ENOENT here today):
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FACCESSAT,
+            1,
+            &faccessat_req(dirfd, ACCESS_F_OK, 0, b"child"),
+            &mut [],
+        ),
+        0,
+        "faccessat must be inode-anchored / rename-stable like openat (#188)"
+    );
+}
