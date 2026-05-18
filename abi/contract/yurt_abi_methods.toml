@@ -711,6 +711,11 @@ id = 0x1_00AE
 kind = "syscall"
 doc = "POSIX/BSD flock(fd, operation). Request: u32 fd LE + u32 operation LE (8 bytes). Operation: exactly one of LOCK_SH=1 (shared/read), LOCK_EX=2 (exclusive/write), LOCK_UN=8 (unlock), OR-able with LOCK_NB=4 (return EWOULDBLOCK on conflict instead of blocking). Lock is associated with the open file description — dup/fork share, a fresh open() of the same file gets a separate ofd and a separate lock. Released when the owning OFD's last fd reference drops. Single-threaded kernel: blocking variants (no LOCK_NB) cannot actually wait, so they also return -EWOULDBLOCK on conflict (AsyncBridge-gated per issue #89 / B1.5). fcntl byte-range locks (F_SETLK / F_GETLK / F_SETLKW + Linux OFD locks) are a separate follow-up. Errnos: 0 success, -EINVAL (bad op / no or multiple op bits / short request), -EBADF (unknown fd / non-file fd type — dir/pipe/socket get EBADF for uniformity with fsync/ftruncate), -EWOULDBLOCK (lock conflict). Issue #89."
 
+[method.sys_prctl]
+id = 0x1_00AF
+kind = "syscall"
+doc = "Linux prctl(option, arg2, arg3, arg4, arg5). Request: u32 option LE + u32 arg2 LE + u32 arg3 LE + u32 arg4 LE + u32 arg5 LE (20 bytes) + variable trailing payload. Two options implemented: PR_SET_NAME=15 (sets the calling process's name from the trailing payload bytes, up to 15 chars + NUL — the 16-byte name field is the Linux/pthread_setname_np convention) and PR_GET_NAME=16 (writes the stored 16-byte name into response). Every other option returns -EINVAL. Errnos: 0 on PR_SET_NAME success; bytes-written (16) on PR_GET_NAME; -EINVAL for short request, unsupported option, or a too-small response buffer for PR_GET_NAME. Issue #96."
+
 [method.sys_idb_get]
 id = 0x1_0035
 kind = "syscall"

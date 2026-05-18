@@ -5588,7 +5588,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::FCHDIR,
                 fd as u32,
-            ) as i32
+            )
         },
     )?;
     linker.func_wrap(
