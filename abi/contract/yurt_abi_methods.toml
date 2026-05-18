@@ -301,7 +301,7 @@ doc = "POSIX killpg(pgid, sig). Request bytes carry two little-endian u32s: proc
 [method.sys_sigaction]
 id = 0x1_001C
 kind = "syscall"
-doc = "POSIX sigaction. Request: u32 sig + u32 handler + u64 sa_mask + u32 sa_flags (LE). Response: prior {u32 handler, u64 sa_mask, u32 sa_flags}. handler 0=SIG_DFL 1=SIG_IGN else opaque guest token. SIGKILL(9)/SIGSTOP(19) => -EINVAL (no settable disposition). Per-process. Evolved-in-place (co-versioned ABI): id unchanged, record widened."
+doc = "POSIX sigaction. Request (21 bytes): u32 sig + u8 has_act + u32 handler + u64 sa_mask + u32 sa_flags (LE). has_act: 0 = pure query (sigaction(_,NULL,&old) — return prior, DO NOT mutate/purge; handler/mask/flags are don't-care), 1 = set the disposition. Response: prior {u32 handler, u64 sa_mask, u32 sa_flags}, always returned. handler 0=SIG_DFL 1=SIG_IGN else opaque guest token. SIGKILL(9)/SIGSTOP(19) => -EINVAL (no settable disposition). Per-process. Evolved-in-place (co-versioned ABI): id unchanged, request gained the has_act query discriminator."
 
 [method.sys_sched_yield]
 id = 0x1_001D

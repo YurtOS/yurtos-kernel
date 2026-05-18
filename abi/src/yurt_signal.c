@@ -174,27 +174,31 @@ int sigismember(const sigset_t *set, int sig) {
   return (*set & bit) != 0;
 }
 
-/* Shared helper: route one sigaction registration through the kernel.
+/* Shared helper: route one sigaction registration/query through the kernel.
  * sig: the signal number.
- * handler: the sa_handler value cast to unsigned (or 0/current if act==NULL).
+ * has_act: 1 = set the disposition (handler/mask/flags are live),
+ *          0 = pure query (POSIX sigaction(_,NULL,&old)); the kernel
+ *          MUST NOT mutate state — handler/mask/flags are don't-care.
+ * handler: the sa_handler value cast to unsigned (don't-care if has_act==0).
  * mask: sa_mask as u64 (the kernel does compact<->canonical remap).
  * flags: sa_flags as unsigned.
  * oldact_out: if non-NULL, the prior kernel state is decoded into it.
  * Returns 0 on success, negative errno on failure (kernel convention). */
-static int yurt_kernel_sigaction(int sig, unsigned handler,
+static int yurt_kernel_sigaction(int sig, int has_act, unsigned handler,
                                  unsigned long long mask, unsigned flags,
                                  struct sigaction *oldact_out) {
-  unsigned char req[20];
+  unsigned char req[21];
   unsigned char resp[16];
   int rc;
 
-  /* Pack req: u32 sig | u32 handler | u64 sa_mask | u32 sa_flags (LE) */
+  /* Pack req: u32 sig | u8 has_act | u32 handler | u64 sa_mask | u32 sa_flags (LE) */
   { unsigned u = (unsigned)sig;    memcpy(req + 0,  &u, 4); }
-  {                                memcpy(req + 4,  &handler, 4); }
-  {                                memcpy(req + 8,  &mask, 8); }
-  {                                memcpy(req + 16, &flags, 4); }
+  { req[4] = (unsigned char)(has_act ? 1 : 0); }
+  {                                memcpy(req + 5,  &handler, 4); }
+  {                                memcpy(req + 9,  &mask, 8); }
+  {                                memcpy(req + 17, &flags, 4); }
 
-  rc = yurt_host_sigaction((int)(uintptr_t)req, 20,
+  rc = yurt_host_sigaction((int)(uintptr_t)req, 21,
                            (int)(uintptr_t)resp, 16);
   if (rc < 0) {
     return rc;  /* negative errno */
@@ -230,7 +234,7 @@ sighandler_t signal(int sig, sighandler_t handler) {
 
   yurt_signal_init();
   old = yurt_signal_actions[sig].sa_handler;
-  rc = yurt_kernel_sigaction(sig,
+  rc = yurt_kernel_sigaction(sig, 1,
                              (unsigned)(uintptr_t)handler,
                              0ULL, 0U, NULL);
   if (rc < 0) {
@@ -262,14 +266,17 @@ int sigaction(int sig, const struct sigaction *restrict act,
     mask    = (unsigned long long)act->sa_mask;
     flags   = (unsigned)act->sa_flags;
   } else {
-    /* Pure-query (act==NULL, oldact!=NULL): send the current local handler
-     * so the kernel can echo it back as the "prior" value. */
-    handler = (unsigned)(uintptr_t)yurt_signal_actions[sig].sa_handler;
+    /* Pure-query (act==NULL): POSIX sigaction(_,NULL,&old) MUST NOT
+     * modify the disposition. has_act=0 makes the kernel a pure query;
+     * do NOT read the guest-cached handler (that would reintroduce
+     * guest-side signal state, the #90 defect class). The fields are
+     * don't-care to the kernel — pass 0. */
+    handler = 0U;
     mask    = 0ULL;
     flags   = 0U;
   }
 
-  rc = yurt_kernel_sigaction(sig, handler, mask, flags,
+  rc = yurt_kernel_sigaction(sig, act != NULL ? 1 : 0, handler, mask, flags,
                              oldact ? oldact : NULL);
   if (rc < 0) {
     errno = -rc;

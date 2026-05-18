@@ -1080,42 +1080,57 @@ pub(super) fn killpg_request(caller_pid: u32, request: &[u8]) -> i64 {
     })
 }
 
-/// `sigaction(sig, &act) -> prior`. Evolved-in-place (co-versioned
-/// in-tree ABI; method id unchanged): request
-/// `[sig:u32][handler:u32][sa_mask:u64][sa_flags:u32]` (20 bytes),
-/// response = prior `[handler:u32][sa_mask:u64][sa_flags:u32]` (16
-/// bytes), return = 16 on success. `handler` is opaque to the kernel
-/// (0=SIG_DFL, 1=SIG_IGN, else a guest function token). Per-process.
-/// SIGKILL(9)/SIGSTOP(19) have no settable disposition ⇒ `-EINVAL`.
-/// The exact `request.len()!=20` check is the wrap-safe length guard
-/// (no caller-sized field, so no `take_bytes` needed).
-/// Setting `handler` to `SIG_IGN` additionally discards all already-pending
-/// instances of `sig` process-wide (process pool + every thread pool;
-/// standard + RT) — POSIX/spec §2 state mutation, not delivery.
+/// `sigaction(sig, &act, &old) -> prior`. Evolved-in-place
+/// (co-versioned in-tree ABI; method id unchanged): request
+/// `[sig:u32][has_act:u8][handler:u32][sa_mask:u64][sa_flags:u32]`
+/// (21 bytes), response = prior `[handler:u32][sa_mask:u64][sa_flags:u32]`
+/// (16 bytes), return = 16 on success. `handler` is opaque to the
+/// kernel (0=SIG_DFL, 1=SIG_IGN, else a guest function token).
+/// Per-process. SIGKILL(9)/SIGSTOP(19) have no settable disposition ⇒
+/// `-EINVAL`. The exact `request.len()!=21` check is the wrap-safe
+/// length guard (no caller-sized field, so no `take_bytes` needed).
+///
+/// `has_act` is the query discriminator (mirrors `sys_sigprocmask`'s
+/// `has` byte): `has_act==0` ⇒ POSIX `sigaction(_, NULL, &old)` —
+/// a PURE QUERY that returns the prior disposition WITHOUT mutating
+/// kernel state (no store, no purge); the handler/sa_mask/sa_flags
+/// fields are don't-care. `has_act!=0` ⇒ store the new disposition.
+/// `prev` is ALWAYS computed and written to the response.
+///
+/// Setting `handler` to `SIG_IGN` (only when `has_act!=0`) additionally
+/// discards all already-pending instances of `sig` process-wide
+/// (process pool + every thread pool; standard + RT) — POSIX/spec §2
+/// state mutation, not delivery.
 pub(super) fn sigaction(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
-    if request.len() != 20 || response.len() < 16 {
+    if request.len() != 21 || response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
     let sig = u32::from_le_bytes(request[0..4].try_into().expect("4"));
     if !(1..=64).contains(&sig) || sig == 9 || sig == 19 {
         return -(abi::EINVAL as i64);
     } // SIGKILL/SIGSTOP
-    let h = u32::from_le_bytes(request[4..8].try_into().expect("4"));
-    let m = u64::from_le_bytes(request[8..16].try_into().expect("8"));
-    let f = u32::from_le_bytes(request[16..20].try_into().expect("4"));
+    let has_act = request[4] != 0;
+    let h = u32::from_le_bytes(request[5..9].try_into().expect("4"));
+    let m = u64::from_le_bytes(request[9..17].try_into().expect("8"));
+    let f = u32::from_le_bytes(request[17..21].try_into().expect("4"));
     with_kernel(|k| {
         let p = k.process_mut(caller_pid);
         let prev = p.signal_dispositions[(sig - 1) as usize];
-        p.signal_dispositions[(sig - 1) as usize] = crate::kernel::SigDisposition {
-            handler: h,
-            sa_mask: m,
-            sa_flags: f,
-        };
-        // POSIX/spec §2: setting SIG_IGN discards already-pending
-        // instances of `sig` process-wide (process pool + every thread
-        // pool). State mutation only — delivery is (C).
-        if h == crate::kernel::SIG_IGN_HANDLER {
-            super::sigmask::purge_ignored(p, sig);
+        // ALWAYS report the prior disposition. ONLY mutate when an
+        // action was supplied — POSIX `sigaction(_, NULL, &old)` is a
+        // pure query and MUST NOT modify the disposition (or purge).
+        if has_act {
+            p.signal_dispositions[(sig - 1) as usize] = crate::kernel::SigDisposition {
+                handler: h,
+                sa_mask: m,
+                sa_flags: f,
+            };
+            // POSIX/spec §2: setting SIG_IGN discards already-pending
+            // instances of `sig` process-wide (process pool + every
+            // thread pool). State mutation only — delivery is (C).
+            if h == crate::kernel::SIG_IGN_HANDLER {
+                super::sigmask::purge_ignored(p, sig);
+            }
         }
         response[0..4].copy_from_slice(&prev.handler.to_le_bytes());
         response[4..12].copy_from_slice(&prev.sa_mask.to_le_bytes());

@@ -3749,10 +3749,12 @@ fn signal_storage_round_trips_through_trampoline() {
     // asyncify/JSPI unwind and lands with the AsyncBridge integration.
     let mk = fresh_kernel_host_interface(0);
 
-    // 20B request: [u32 sig][u32 handler][u64 sa_mask][u32 sa_flags]
+    // 21B request (B/PR225 F1): [u32 sig][u8 has_act][u32 handler]
+    // [u64 sa_mask][u32 sa_flags]. has_act=1 = SET path.
     let sa_req = |sig: u32, handler: u32| -> Vec<u8> {
-        let mut r = Vec::with_capacity(20);
+        let mut r = Vec::with_capacity(21);
         r.extend_from_slice(&sig.to_le_bytes());
+        r.push(1u8); // has_act=1 (set)
         r.extend_from_slice(&handler.to_le_bytes());
         r.extend_from_slice(&0u64.to_le_bytes()); // sa_mask
         r.extend_from_slice(&0u32.to_le_bytes()); // sa_flags

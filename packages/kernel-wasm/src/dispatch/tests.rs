@@ -14372,12 +14372,103 @@ fn sys_sigprocmask_query_only_reports_prior_unchanged() {
     assert_eq!(m2, 1u64 << (2 - 1), "EINVAL must not mutate the mask");
 }
 
-fn sa_req(sig: u32, h: u32, m: u64, f: u32) -> Vec<u8> {
+// (B/PR225 F1) 21-byte wire: [u32 sig][u8 has_act][u32 h][u64 m][u32 f].
+// `sa_req` is the SET path (has_act=1); `sa_req_q` is the pure-query
+// path (has_act=0) — the handler/mask/flags are don't-care to the
+// kernel and must NOT mutate state.
+fn sa_req_act(sig: u32, has_act: u8, h: u32, m: u64, f: u32) -> Vec<u8> {
     let mut r = sig.to_le_bytes().to_vec();
+    r.push(has_act);
     r.extend_from_slice(&h.to_le_bytes());
     r.extend_from_slice(&m.to_le_bytes());
     r.extend_from_slice(&f.to_le_bytes());
     r
+}
+fn sa_req(sig: u32, h: u32, m: u64, f: u32) -> Vec<u8> {
+    sa_req_act(sig, 1, h, m, f)
+}
+fn sa_req_q(sig: u32, h: u32, m: u64, f: u32) -> Vec<u8> {
+    sa_req_act(sig, 0, h, m, f)
+}
+
+#[test]
+fn sigaction_query_mode_does_not_mutate() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut o = [0u8; 16];
+    // Set SIGTERM(15) to a handler + mask + flags (has_act=1).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGACTION,
+            1,
+            &sa_req(15, 0xCAFEF00D, 0xABCD, 7),
+            &mut o
+        ),
+        16
+    );
+    // Prior was SIG_DFL (all zero).
+    assert_eq!(u32::from_le_bytes(o[0..4].try_into().unwrap()), 0);
+
+    // PURE QUERY (has_act=0): must return the previously-set
+    // {handler,mask,flags} and must NOT mutate the disposition.
+    let mut q = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req_q(15, 0, 0, 0), &mut q),
+        16,
+        "(a) query returns 16"
+    );
+    assert_eq!(
+        u32::from_le_bytes(q[0..4].try_into().unwrap()),
+        0xCAFEF00D,
+        "(b) query echoes prior handler"
+    );
+    assert_eq!(
+        u64::from_le_bytes(q[4..12].try_into().unwrap()),
+        0xABCD,
+        "(b) query echoes prior sa_mask"
+    );
+    assert_eq!(
+        u32::from_le_bytes(q[12..16].try_into().unwrap()),
+        7,
+        "(b) query echoes prior sa_flags"
+    );
+    // (c) kernel state unchanged by the query (still the set values).
+    let d = crate::kernel::with_kernel(|k| k.process_mut(1).signal_dispositions[14]);
+    assert_eq!(d.handler, 0xCAFEF00D, "(c) handler unchanged by query");
+    assert_eq!(d.sa_mask, 0xABCD, "(c) sa_mask unchanged by query");
+    assert_eq!(d.sa_flags, 7, "(c) sa_flags unchanged by query");
+
+    // (d) a query with GARBAGE handler/mask/flags still must not mutate.
+    let mut q2 = [0u8; 16];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SIGACTION,
+            1,
+            &sa_req_q(15, 0xDEADBEEF, 0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF),
+            &mut q2
+        ),
+        16
+    );
+    let d2 = crate::kernel::with_kernel(|k| k.process_mut(1).signal_dispositions[14]);
+    assert_eq!(
+        (d2.handler, d2.sa_mask, d2.sa_flags),
+        (0xCAFEF00D, 0xABCD, 7),
+        "(d) garbage-payload query did not clobber the disposition"
+    );
+
+    // A has_act=0 query of an UNTOUCHED signal returns SIG_DFL
+    // (all-zero) and stores nothing.
+    let mut qd = [0xAAu8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_SIGACTION, 1, &sa_req_q(10, 0, 0, 0), &mut qd),
+        16
+    );
+    assert_eq!(qd, [0u8; 16], "untouched signal query => all-zero SIG_DFL");
+    let d10 = crate::kernel::with_kernel(|k| k.process_mut(1).signal_dispositions[9]);
+    assert_eq!(
+        (d10.handler, d10.sa_mask, d10.sa_flags),
+        (0, 0, 0),
+        "query stored nothing for the untouched signal"
+    );
 }
 #[test]
 fn sys_sigaction_widened_sigkill_einval() {
