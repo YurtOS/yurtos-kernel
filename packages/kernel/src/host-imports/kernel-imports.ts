@@ -1912,6 +1912,37 @@ export function createKernelImports(
       return BigInt(ready);
     },
 
+    // host_epoll_create1/ctl/wait — the legacy TS kernel has no epoll
+    // (EPollEntry) implementation; a future slice adds the mirror. Until
+    // then return -ENOSYS (matches the Rust kernel-wasm S0 stub arms and
+    // the wasmtime/JS host paths) so an epoll-using guest gets a clean
+    // errno instead of an unsatisfied `yurt::host_epoll_*` import →
+    // instantiation trap. BigInt because the C imports are `long long`.
+    host_epoll_create1(
+      _reqPtr: number,
+      _reqLen: number,
+      _respPtr: number,
+      _respLen: number,
+    ): bigint {
+      return BigInt(ERR_UNSUPPORTED);
+    },
+    host_epoll_ctl(
+      _reqPtr: number,
+      _reqLen: number,
+      _respPtr: number,
+      _respLen: number,
+    ): bigint {
+      return BigInt(ERR_UNSUPPORTED);
+    },
+    host_epoll_wait(
+      _reqPtr: number,
+      _reqLen: number,
+      _respPtr: number,
+      _respLen: number,
+    ): bigint {
+      return BigInt(ERR_UNSUPPORTED);
+    },
+
     // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32
     // Native-only: the request bytes must decode as a yurt_spawn_request_v1
     // record. The 4-argument form writes yurt_spawn_result_v1; the 2-argument
