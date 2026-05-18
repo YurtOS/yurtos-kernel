@@ -200,9 +200,20 @@ must exercise the real wasm path, not native-only logic.
    boot (skips interpreter init) — assert order-of-magnitude.
 3. **CoW isolation:** sandbox A writes a page; sandbox B (same base) still sees
    the original bytes (private-copy semantics).
-4. **Entropy independence (security):** `os.urandom` / `random.random()` /
-   `hash(str)` differ across two sandboxes from the same base; the test **fails
-   without the shim** (proves the barrier is load-bearing and the shim works).
+4. **Entropy/identity independence (security)** — probes the two halves of the
+   reseed barrier with the right primitive for each (they have opposite expected
+   outcomes without the shim):
+   - **4a, kernel-enforced (shim-independent):** `os.urandom` / a raw
+     `getrandom` differ across two sandboxes from the same base **even without
+     the warm-fork shim**. `os.urandom` is a direct kernel CSPRNG consumer, not
+     an in-heap PRNG (which is exactly why `os.register_at_fork` never reseeds
+     it), so this proves the kernel-enforced entropy guarantee and must hold
+     independently of the shim.
+   - **4b, shim-dependent (in-heap):** the in-heap PRNG/identity state —
+     `random.random()` sequence, `hash(str)` under `PYTHONHASHSEED`, and the
+     OpenSSL/`ssl` PRNG — is **identical** across two siblings **without** the
+     shim and **differs with** it. This is the assertion that proves the
+     warm-fork shim is load-bearing.
 5. **Clock rebase:** a fresh sandbox sees `monotonic()` ≈ 0, not the template's
    warm age.
 6. **Slot reuse:** spawn → exit → spawn reuses a slot; the freed sandbox's dirty
