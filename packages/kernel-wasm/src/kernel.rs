@@ -2052,7 +2052,15 @@ impl Kernel {
             FdEntry::Pipe { id, end } => self.pipe_dec_ref(*id, *end),
             FdEntry::File { ofd_id } => self.ofd_dec_ref(*ofd_id),
             FdEntry::Socket { id } => {
-                let _ = self.socket_dec_ref(*id);
+                // Same leak class as the sys_socketpair EMFILE rollback
+                // (#193): socket_dec_ref returns Some(handle) iff this
+                // was the last ref and the host socket needs to be
+                // released. Discarding it leaks the host handle when
+                // rollback_fork unwinds a child whose inherited socket
+                // fd happened to be the last reference.
+                if let Some(handle) = self.socket_dec_ref(*id) {
+                    crate::kh::socket_close(handle);
+                }
             }
             FdEntry::Directory { .. } | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => {}
         }
@@ -2528,6 +2536,42 @@ mod tests {
             .process(parent_pid)
             .children
             .contains(&child_pid)));
+    }
+
+    #[test]
+    fn rollback_fork_closes_host_handle_for_last_ref_socket() {
+        // Regression for the sibling leak surfaced during #204 review.
+        // dec_fd_entry_ref (called from rollback_fork) was discarding
+        // the host handle returned by socket_dec_ref, leaking any host
+        // socket whose last reference happened to live in a forked
+        // child's fd_table.
+        let _g = TestGuard::acquire();
+        crate::kh::test_support::reset_socket_mock();
+        let (parent_pid, child_pid) = with_kernel(|k| {
+            let parent_pid = k.alloc_host_pid();
+            k.insert_host_process(parent_pid, 0, vec![b"/bin/parent".to_vec()], Some(81));
+            let child_pid = k.prepare_fork(parent_pid).expect("prepare fork");
+            // Install a host-backed socket into the child only — its
+            // refs == 1, so the rollback dec_ref must observe last-ref
+            // and surface the handle for host close.
+            let sock_id = k.create_socket(99, 2, 1);
+            k.process_mut(child_pid)
+                .fd_table
+                .install(5, FdEntry::Socket { id: sock_id });
+            (parent_pid, child_pid)
+        });
+
+        with_kernel(|k| {
+            k.rollback_fork(parent_pid, child_pid)
+                .expect("rollback fork")
+        });
+
+        assert_eq!(
+            crate::kh::test_support::socket_close_calls(),
+            vec![99],
+            "rollback_fork must release the host handle when it unwinds \
+             a child fd that was the last ref to a host-backed socket"
+        );
     }
 
     #[test]
