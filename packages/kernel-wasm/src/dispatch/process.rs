@@ -1537,3 +1537,56 @@ pub fn drain_spawn(response: &mut [u8]) -> i64 {
         cur as i64
     })
 }
+
+/// Linux `prctl(option, arg2, arg3, arg4, arg5)` — minimal coverage for
+/// `PR_SET_NAME` / `PR_GET_NAME` (the `pthread_setname_np` /
+/// `pthread_getname_np` surface, observable through
+/// `/proc/<pid>/comm`). Every other `option` returns `-EINVAL`. Issue
+/// #96.
+///
+/// Wire format:
+/// - request: `u32 option LE + u32 arg2 LE + u32 arg3 LE + u32 arg4 LE
+///   + u32 arg5 LE` (20 bytes) followed by a variable trailing payload
+///   used only by `PR_SET_NAME`.
+/// - response: `PR_GET_NAME` writes the stored 16-byte name buffer
+///   (Linux's `TASK_COMM_LEN`); other options write nothing.
+///
+/// Returns: 0 on `PR_SET_NAME` success; 16 (bytes written) on
+/// `PR_GET_NAME`; `-EINVAL` for short request, an unsupported option,
+/// or a `< 16`-byte response buffer on `PR_GET_NAME`.
+pub(super) fn prctl(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    const PR_SET_NAME: u32 = 15;
+    const PR_GET_NAME: u32 = 16;
+    const COMM_LEN: usize = 16;
+
+    let Some([option, _arg2, _arg3, _arg4, _arg5]) = read_u32_args::<5>(request) else {
+        return -(abi::EINVAL as i64);
+    };
+    match option {
+        PR_SET_NAME => {
+            // The new name lives in the trailing payload — anything
+            // past byte 20. Linux copies up to 15 chars and always
+            // NUL-terminates the 16th byte. An empty payload clears the
+            // name to all-NUL (consistent with the Default state).
+            let payload = &request[20..];
+            let mut new = [0u8; COMM_LEN];
+            let copy = payload.len().min(COMM_LEN - 1);
+            new[..copy].copy_from_slice(&payload[..copy]);
+            with_kernel(|k| {
+                k.process_mut(caller_pid).comm = new;
+            });
+            0
+        }
+        PR_GET_NAME => {
+            if response.len() < COMM_LEN {
+                return -(abi::EINVAL as i64);
+            }
+            with_kernel(|k| {
+                let comm = k.process_mut(caller_pid).comm;
+                response[..COMM_LEN].copy_from_slice(&comm);
+            });
+            COMM_LEN as i64
+        }
+        _ => -(abi::EINVAL as i64),
+    }
+}

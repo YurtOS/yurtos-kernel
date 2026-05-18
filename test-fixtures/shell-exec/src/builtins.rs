@@ -3179,13 +3179,7 @@ mod tests {
     fn eval_executes_string() {
         let mut state = ShellState::new_default();
         let host = MockHost::new();
-        let run_fn = |_state: &mut ShellState, cmd: &str| -> RunResult {
-            if cmd.contains("echo") {
-                RunResult::empty()
-            } else {
-                RunResult::empty()
-            }
-        };
+        let run_fn = |_state: &mut ShellState, _cmd: &str| -> RunResult { RunResult::empty() };
         let _lock = crate::test_support::mock::FD_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3200,13 +3194,7 @@ mod tests {
     fn source_executes_file() {
         let mut state = ShellState::new_default();
         let host = MockHost::new().with_file("/tmp/script.sh", b"echo sourced");
-        let run_fn = |_state: &mut ShellState, cmd: &str| -> RunResult {
-            if cmd.contains("echo") {
-                RunResult::empty()
-            } else {
-                RunResult::empty()
-            }
-        };
+        let run_fn = |_state: &mut ShellState, _cmd: &str| -> RunResult { RunResult::empty() };
         let _lock = crate::test_support::mock::FD_MUTEX
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -3598,7 +3586,7 @@ mod tests {
         state.aliases.insert("ll".to_string(), "ls -la".to_string());
         let code = run_builtin(&mut state, &host, "unalias", &["ll"]);
         assert_eq!(code, 0);
-        assert!(state.aliases.get("ll").is_none());
+        assert!(!state.aliases.contains_key("ll"));
     }
 
     #[test]

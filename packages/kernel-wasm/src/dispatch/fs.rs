@@ -9,21 +9,29 @@ fn can_modify_owned_metadata(credentials: crate::state::Credentials, owner_uid: 
 }
 
 /// Derive the `(mount_id, dir_inode)` anchor for an already-normalized
-/// absolute directory `path`. Inode-anchored when the owning backend
-/// supports dir inodes (`MountTable::dir_inode_at` is `Some`), else the
-/// path-snapshot degraded mode: `(ROOT_MOUNT, None)`.
+/// absolute directory `path`. Inode-anchored (`Some` inode) when the
+/// owning backend supports dir inodes (`MountTable::dir_inode_at`),
+/// else the path-snapshot degraded mode (`None` inode).
 ///
-/// B2.9 Task 5 is a behavior-preserving shape migration — nothing reads
-/// `mount_id`/`dir_inode` to change resolution yet (that is Task 6);
-/// resolution still goes through the absolute `path` snapshot, so the
-/// degraded `(ROOT_MOUNT, None)` fallback is correct here. The
-/// `MountTable` has no public mount-id-only accessor (`resolve` is
-/// private), and adding one is out of Task 5's scope; `dir_inode_at`
-/// (the Task 1 pass-through) is the minimal sufficient lookup.
+/// Even in degraded mode the *real* owning mount id is recorded
+/// (`MountTable::mount_of`), not `ROOT_MOUNT`: a degraded backend
+/// mounted at a non-root prefix (hostfs at `/host`, overlay-deferred,
+/// embedder backends) must not masquerade as the root mount. The
+/// "only read when `dir_inode == Some`" convention made the old
+/// `ROOT_MOUNT` fallback latent, but any future reader of
+/// `Cwd.mount_id` / `FdEntry::Directory.mount_id` that does not first
+/// check `dir_inode.is_some()` would silently use the wrong mount on
+/// degraded non-root mounts. Issue #149.
 fn dir_anchor(k: &Kernel, path: &[u8]) -> (crate::vfs::MountId, Option<u64>) {
     match k.vfs.dir_inode_at(path) {
         Some((mid, ino)) => (mid, Some(ino)),
-        None => (crate::vfs::ROOT_MOUNT, None),
+        None => (
+            k.vfs
+                .mount_of(path)
+                .map(|(mid, _)| mid)
+                .unwrap_or(crate::vfs::ROOT_MOUNT),
+            None,
+        ),
     }
 }
 
@@ -145,15 +153,14 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        // Terminal-only symlink follow (up to SYMLOOP_MAX hops, each
-        // re-authorized). NOTE: unlike stat/lstat (which resolve every
-        // intermediate component since #134 Part 2), open still
-        // resolves only the terminal chain — so open() can fail on a
-        // path stat() succeeds on. Bringing open to per-component
-        // parity is tracked in #142.
-        let resolved = match follow_symlinks(k, caller_pid, path) {
+        // Resolve symlinks in every component (intermediate + terminal),
+        // up to SYMLOOP_MAX hops, with per-hop re-authorization so a
+        // ramfs link cannot bypass the procfs gate. Shared with
+        // `stat_path` so `open` cannot fail on a path `stat` succeeds
+        // on (#142 / #134 Part 2 parity).
+        let resolved = match resolve_symlinks_per_component(k, caller_pid, path, true) {
             Ok(p) => p,
-            Err(errno) => return -(errno as i64),
+            Err(rc) => return rc,
         };
         let path: &[u8] = &resolved;
         let entry_type = k.vfs.entry_type(path);
@@ -494,50 +501,12 @@ fn normalize_readable_path(
     Ok(path)
 }
 
-/// Maximum symlink dereferences before `-EINVAL` (the historical
-/// "-ELOOP shape"; #69 tracks retargeting to `-ELOOP`). Linux uses
-/// `MAXSYMLINKS = 40`. Shared by `follow_symlinks` (terminal-only,
-/// `sys_open`) and `resolve_symlinks_per_component` (`stat`/`lstat`)
-/// so the bound provably cannot drift between the two.
+/// Maximum symlink dereferences before `-ELOOP`. Linux uses
+/// `MAXSYMLINKS = 40`. Shared by `resolve_symlinks_per_component`
+/// (`sys_open` / `sys_statvfs` / `access_check` / `stat` / `lstat`)
+/// and `follow_symlinks_literal` (exec path lookup) so the bound
+/// provably cannot drift across the entry points.
 const SYMLOOP_MAX: u32 = 40;
-
-/// Follow symlinks at `path` (already normalized) up to `SYMLOOP_MAX`
-/// hops, re-normalizing and re-authorizing each target so a
-/// ramfs link cannot bypass procfs access checks. Returns the
-/// resolved path or a **positive POSIX errno** (`ELOOP` once the hop
-/// limit is exceeded; whatever `normalize_readable_path` raises
-/// otherwise).
-///
-/// **Terminal-only**: this resolves the link chain of the path as a
-/// whole, not intermediate components. Used by `sys_open` only.
-/// `stat_path`/`lstat_path` use `resolve_symlinks_per_component`
-/// (POSIX intermediate resolution, #134 Part 2); bringing `sys_open`
-/// to that parity is tracked in #142.
-///
-/// Convention: resolvers return `Result<_, i32>` with a positive POSIX
-/// errno. The dispatch boundary calls `.map_err(|e| -(e as i64))` once
-/// to negate and widen to the wire-level `i64`. Matches the
-/// `path.rs::resolve_realpath` convention. Issue #144 / #69.
-///
-/// `normalize_readable_path` predates this convention and still
-/// returns a pre-negated `i64`; the inline `.map_err` below normalizes
-/// at the call boundary while that helper is left untouched (broader
-/// rename is out of scope).
-fn follow_symlinks(k: &mut Kernel, caller_pid: u32, path: Vec<u8>) -> Result<Vec<u8>, i32> {
-    let mut resolved = path;
-    let mut hops = 0u32;
-    while let Some(target) = k.vfs.readlink(&resolved) {
-        hops += 1;
-        if hops > SYMLOOP_MAX {
-            // Too many symlink hops: POSIX/Linux errno is ELOOP
-            // (SYMLOOP_MAX = 40), not EINVAL.
-            return Err(abi::ELOOP);
-        }
-        resolved =
-            normalize_readable_path(k, caller_pid, &target).map_err(|rc_i64| (-rc_i64) as i32)?;
-    }
-    Ok(resolved)
-}
 
 /// Walk the symlink chain at `path` without per-hop re-normalization,
 /// up to SYMLOOP_MAX (40) hops. Lighter than `follow_symlinks` — used
@@ -660,7 +629,11 @@ fn resolve_symlinks_per_component(
         }
         hops += 1;
         if hops > SYMLOOP_MAX {
-            return Err(-(abi::EINVAL as i64));
+            // POSIX: too many symlink hops → -ELOOP. Harmonized with
+            // `realpath`'s `resolve_realpath` and the legacy
+            // terminal-only `follow_symlinks` so every path-resolver
+            // surfaces the same errno (#69 / #142).
+            return Err(-(abi::ELOOP as i64));
         }
         // Build an absolute path: an absolute target as-is; a relative
         // target against the link's parent dir (`prefix` == "/" +
@@ -1004,6 +977,16 @@ fn write_stat_record(k: &mut Kernel, path: &[u8], response: &mut [u8]) -> i64 {
     16
 }
 
+/// POSIX: a trailing `/` (or trailing `/.`) on a pathname forces the
+/// final component to be **followed as a symlink** and to resolve to a
+/// **directory** (`-ENOTDIR` otherwise), regardless of `stat`-vs-`lstat`.
+/// Detected on the raw request bytes because `normalize_readable_path`
+/// → `split_components` discards the trailing slash. Single source of
+/// truth for `stat_path` / `lstat_path` so the two cannot drift. (#146)
+fn path_requires_dir(raw: &[u8]) -> bool {
+    raw.ends_with(b"/") || raw.ends_with(b"/.")
+}
+
 /// `stat(path) -> 16-byte fstat-shaped record`. Same wire format as
 /// sys_fstat: u64 size + u32 filetype + u32 mode. Doesn't require an
 /// open fd. Returns 16 on success, -ENOENT for unresolvable path.
@@ -1014,6 +997,7 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
     if response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
+    let requires_dir = path_requires_dir(request);
     with_kernel(|k| {
         let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
@@ -1028,6 +1012,19 @@ pub(super) fn stat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) ->
             Ok(path) => path,
             Err(rc) => return rc,
         };
+        // #146: a trailing `/` (or `/.`) demands the resolved entry be
+        // a directory. Symlink-follow is already on for stat; the only
+        // extra obligation is the typing check. Distinguish:
+        //   missing (`entry_type == 0`) → -ENOENT (same as no-trailing-
+        //     slash stat),
+        //   present but not a dir → -ENOTDIR.
+        if requires_dir {
+            match k.vfs.entry_type(&path) {
+                0 => return -(abi::ENOENT as i64),
+                3 => {}
+                _ => return -(abi::ENOTDIR as i64),
+            }
+        }
         write_stat_record(k, &path, response)
     })
 }
@@ -1048,6 +1045,7 @@ pub(super) fn lstat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -
     if response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
+    let requires_dir = path_requires_dir(request);
     with_kernel(|k| {
         let path = match normalize_readable_path(k, caller_pid, request) {
             Ok(path) => path,
@@ -1056,10 +1054,25 @@ pub(super) fn lstat_path(caller_pid: u32, request: &[u8], response: &mut [u8]) -
         // Resolve intermediate symlink components, but NOT the terminal
         // (POSIX lstat). write_stat_record then types the un-followed
         // terminal (S_IFLNK + #134 Part 1 size for a symlink).
-        let path = match resolve_symlinks_per_component(k, caller_pid, path, false) {
+        //
+        // #146: a trailing `/` (or `/.`) on the raw request overrides
+        // the lstat no-follow rule for the terminal component — POSIX
+        // says trailing-slash forces symlink-follow + dir-check
+        // regardless of stat/lstat. The dir check is enforced
+        // post-resolve below.
+        let follow_terminal = requires_dir;
+        let path = match resolve_symlinks_per_component(k, caller_pid, path, follow_terminal) {
             Ok(path) => path,
             Err(rc) => return rc,
         };
+        // #146: same typing rule as stat_path's trailing-slash branch.
+        if requires_dir {
+            match k.vfs.entry_type(&path) {
+                0 => return -(abi::ENOENT as i64),
+                3 => {}
+                _ => return -(abi::ENOTDIR as i64),
+            }
+        }
         write_stat_record(k, &path, response)
     })
 }
@@ -1502,9 +1515,11 @@ pub(super) fn sys_statvfs(caller_pid: u32, request: &[u8], response: &mut [u8]) 
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        let resolved = match follow_symlinks(k, caller_pid, path) {
+        // Per-component resolution (#142). statvfs follows symlinks on
+        // the resolved path's mount.
+        let resolved = match resolve_symlinks_per_component(k, caller_pid, path, true) {
             Ok(p) => p,
-            Err(errno) => return -(errno as i64),
+            Err(rc) => return rc,
         };
         if k.vfs.entry_type(&resolved) == 0 {
             return -(abi::ENOENT as i64);
@@ -1788,12 +1803,11 @@ fn access_check(k: &mut Kernel, caller_pid: u32, raw_path: &[u8], mode: u32, fla
     let resolved = if flag & AT_SYMLINK_NOFOLLOW != 0 {
         path
     } else {
-        // follow_symlinks returns positive i32 errno post #144 —
-        // negate-and-widen at the boundary, matching sys_open /
-        // stat_path.
-        match follow_symlinks(k, caller_pid, path) {
+        // Per-component resolution (#142) — matches sys_open / stat_path
+        // parity so access() cannot disagree with the open() it gates.
+        match resolve_symlinks_per_component(k, caller_pid, path, true) {
             Ok(p) => p,
-            Err(errno) => return -(errno as i64),
+            Err(rc) => return rc,
         }
     };
     let Some((mount_id, inode)) = k.vfs.open(&resolved, 0) else {

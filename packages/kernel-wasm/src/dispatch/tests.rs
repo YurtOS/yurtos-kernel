@@ -12618,11 +12618,13 @@ fn stat_lstat_per_component_auth_allows_self_and_ordinary() {
     );
 }
 
-/// Issue #134 Part 2: an intermediate symlink cycle is bounded by the
-/// 40-hop SYMLOOP limit (-EINVAL, matching follow_symlinks), for both
-/// stat and lstat.
+/// Issue #134 Part 2 + #142: an intermediate symlink cycle is bounded
+/// by the 40-hop SYMLOOP limit and surfaces -ELOOP (POSIX), harmonized
+/// across stat/lstat/open/access via the shared per-component resolver
+/// (#142 retargeted the resolver from -EINVAL to -ELOOP to match
+/// realpath and the legacy terminal-only follow_symlinks).
 #[test]
-fn stat_lstat_intermediate_symlink_loop_is_einval() {
+fn stat_lstat_intermediate_symlink_loop_is_eloop() {
     let _g = crate::kernel::TestGuard::acquire();
     let mut s1 = (b"/y/z".len() as u32).to_le_bytes().to_vec();
     s1.extend_from_slice(b"/y/z");
@@ -12635,20 +12637,20 @@ fn stat_lstat_intermediate_symlink_loop_is_einval() {
     let mut out = [0u8; 16];
     assert_eq!(
         dispatch(METHOD_SYS_STAT, 1, b"/x/q", &mut out),
-        -(abi::EINVAL as i64)
+        -(abi::ELOOP as i64)
     );
     assert_eq!(
         dispatch(METHOD_SYS_LSTAT, 1, b"/x/q", &mut out),
-        -(abi::EINVAL as i64)
+        -(abi::ELOOP as i64)
     );
 }
 
-/// KNOWN PRESERVED non-POSIX residual (#146): a trailing slash does
-/// NOT force-follow a terminal symlink for lstat. Pins current
-/// behavior so #146's eventual fix is a deliberate, test-visible
-/// change, not an accident.
+/// #146 fix: a trailing slash forces terminal-symlink follow and a
+/// directory check for both `stat` and `lstat`. Updated from the
+/// former "known residual" characterization — now asserts the POSIX
+/// behavior the issue requires.
 #[test]
-fn lstat_trailing_slash_on_terminal_symlink_known_residual_146() {
+fn lstat_trailing_slash_forces_terminal_symlink_follow_146() {
     let _g = crate::kernel::TestGuard::acquire();
     assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
     let mut sreq = (b"/real".len() as u32).to_le_bytes().to_vec();
@@ -12659,9 +12661,149 @@ fn lstat_trailing_slash_on_terminal_symlink_known_residual_146() {
     assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/symdir/", &mut out), 16);
     assert_eq!(
         u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "#146: trailing slash forces follow; /symdir/ types as DIR (3), \
+         not S_IFLNK (7) (WASI filetype: 3=DIR, 4=REG, 7=SYMLINK)"
+    );
+    // Without trailing slash: lstat's no-follow rule still applies.
+    let mut out2 = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/symdir", &mut out2), 16);
+    assert_eq!(
+        u32::from_le_bytes(out2[8..12].try_into().unwrap()),
         7,
-        "KNOWN RESIDUAL #146: trailing slash does not force-follow; \
-         symdir reported as S_IFLNK (POSIX would follow to S_IFDIR)"
+        "no trailing slash: lstat still un-follows the terminal symlink \
+         (S_IFLNK)"
+    );
+}
+
+/// #146: trailing slash on a regular-file path (or symlink-to-file)
+/// must produce -ENOTDIR for both stat and lstat. Pins POSIX's
+/// `pathname/` ⇒ "must be a directory" rule across stat-vs-lstat.
+#[test]
+fn stat_lstat_trailing_slash_requires_directory_146() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = (b"/file".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/file");
+    reg.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    // Symlink-to-file: trailing slash follows the link, sees a file, ENOTDIR.
+    let mut s = (b"/file".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/file");
+    s.extend_from_slice(b"/symfile");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/file/", &mut out),
+        -(abi::ENOTDIR as i64),
+        "stat: trailing slash on regular file → ENOTDIR"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/file/", &mut out),
+        -(abi::ENOTDIR as i64),
+        "lstat: trailing slash on regular file → ENOTDIR"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/symfile/", &mut out),
+        -(abi::ENOTDIR as i64),
+        "stat: trailing slash on symlink-to-file → ENOTDIR"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/symfile/", &mut out),
+        -(abi::ENOTDIR as i64),
+        "lstat: trailing slash forces follow; resolves to a file → ENOTDIR"
+    );
+}
+
+/// #146: trailing `/.` is equivalent to trailing `/` for POSIX
+/// path resolution (both require the final component to be a dir).
+#[test]
+fn stat_lstat_trailing_slash_dot_requires_directory_146() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut reg = (b"/file".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/file");
+    reg.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/file/.", &mut out),
+        -(abi::ENOTDIR as i64),
+        "stat: trailing /. on regular file → ENOTDIR"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/file/.", &mut out),
+        -(abi::ENOTDIR as i64),
+        "lstat: trailing /. on regular file → ENOTDIR"
+    );
+
+    // Trailing /. on a real dir succeeds and types as DIR (3).
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/d/.", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "stat: trailing /. on dir types as DIR (3)"
+    );
+}
+
+/// #146: trailing slash on a dangling symlink must fail (forced
+/// terminal follow + missing target → -ENOENT), regardless of
+/// stat-vs-lstat. Without trailing slash, lstat of a dangling link
+/// still succeeds and reports S_IFLNK (the unchanged base case).
+#[test]
+fn stat_lstat_trailing_slash_on_dangling_symlink_is_enoent_146() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut s = (b"/missing".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/missing");
+    s.extend_from_slice(b"/dangling");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_STAT, 1, b"/dangling/", &mut out),
+        -(abi::ENOENT as i64),
+        "stat: trailing slash on dangling link → follow fails → ENOENT"
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_LSTAT, 1, b"/dangling/", &mut out),
+        -(abi::ENOENT as i64),
+        "lstat: trailing slash forces follow → dangling → ENOENT"
+    );
+    // No trailing slash: lstat of a dangling link reports S_IFLNK
+    // unchanged (the #134 Part 1 dangling-link contract).
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/dangling", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        7,
+        "no trailing slash: lstat of dangling link still reports S_IFLNK"
+    );
+}
+
+/// #146: trailing slash on root `/` and on a plain directory must
+/// succeed (both are directories). Pins the no-regression case.
+#[test]
+fn stat_trailing_slash_on_root_and_dir_succeeds_146() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 16];
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "stat /: DIR (3)"
+    );
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/d", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_STAT, 1, b"/d/", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "stat /d/: DIR (3)"
+    );
+    assert_eq!(dispatch(METHOD_SYS_LSTAT, 1, b"/d/", &mut out), 16);
+    assert_eq!(
+        u32::from_le_bytes(out[8..12].try_into().unwrap()),
+        3,
+        "lstat /d/: DIR (3) (no terminal symlink to differ from stat here)"
     );
 }
 
@@ -12756,13 +12898,11 @@ fn stat_lstat_nondir_intermediate_is_enoent_not_enotdir_146_142() {
     );
 }
 
-/// KNOWN INTENTIONAL asymmetry (tracked in #142): after #134 Part 2,
-/// stat() resolves intermediate symlink components but sys_open()
-/// still uses terminal-only follow_symlinks — so a program can stat()
-/// a path it cannot open(). Pins the gap so #142's fix (open parity)
-/// is a deliberate, test-visible change, not a silent one.
+/// #142 fix: sys_open now resolves intermediate symlink components,
+/// matching stat()/lstat()'s #134 Part 2 parity. Replaces the prior
+/// "known asymmetry" characterization test.
 #[test]
-fn stat_open_intermediate_symlink_asymmetry_142() {
+fn open_resolves_intermediate_symlink_components_142() {
     let _g = crate::kernel::TestGuard::acquire();
     assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
     assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
@@ -12781,10 +12921,64 @@ fn stat_open_intermediate_symlink_asymmetry_142() {
         16,
         "stat resolves the intermediate symlink (#134 Part 2)"
     );
+    let fd = dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/a/symdir/f"), &mut []);
+    assert!(
+        fd >= 0,
+        "#142: open now resolves intermediate symlinks, so /a/symdir/f \
+         opens as /real/f; got rc={fd}"
+    );
+}
+
+/// #142: access() / faccessat() must agree with the open() and stat()
+/// they gate. After per-component migration, F_OK on a path that
+/// traverses an intermediate symlink must succeed (it used to fail
+/// with -ENOENT because access fell back on terminal-only follow).
+#[test]
+fn access_resolves_intermediate_symlink_components_142() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut reg = (b"/real/f".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/real/f");
+    reg.extend_from_slice(b"hi");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    let mut s = (b"/real".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/real");
+    s.extend_from_slice(b"/a/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    // access(/a/symdir/f, F_OK) succeeds after #142.
+    let mut req = 0u32.to_le_bytes().to_vec(); // F_OK = 0
+    req.extend_from_slice(b"/a/symdir/f");
     assert_eq!(
-        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/a/symdir/f"), &mut []),
-        -(abi::ENOENT as i64),
-        "open still terminal-only — cannot open what stat resolved (until #142)"
+        dispatch(METHOD_SYS_ACCESS, 1, &req, &mut []),
+        0,
+        "#142: access() resolves intermediate symlinks (parity with open())"
+    );
+}
+
+/// #142: sys_statvfs() likewise migrated from terminal-only follow to
+/// the shared per-component resolver, so a statvfs on a path through an
+/// intermediate symlink succeeds and reports the real mount's metrics.
+#[test]
+fn statvfs_resolves_intermediate_symlink_components_142() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/a", &mut []), 0);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/real", &mut []), 0);
+    let mut reg = (b"/real/f".len() as u32).to_le_bytes().to_vec();
+    reg.extend_from_slice(b"/real/f");
+    reg.extend_from_slice(b"x");
+    dispatch(METHOD_KERNEL_REGISTER_FILE, 0, &reg, &mut []);
+    let mut s = (b"/real".len() as u32).to_le_bytes().to_vec();
+    s.extend_from_slice(b"/real");
+    s.extend_from_slice(b"/a/symdir");
+    assert_eq!(dispatch(METHOD_SYS_SYMLINK, 1, &s, &mut []), 0);
+
+    let mut buf = [0u8; STATVFS_SIZE];
+    assert_eq!(
+        dispatch(METHOD_SYS_STATVFS, 1, b"/a/symdir/f", &mut buf),
+        STATVFS_SIZE as i64,
+        "#142: statvfs() resolves intermediate symlinks (parity with stat())"
     );
 }
 
@@ -13704,5 +13898,214 @@ fn fstatat_unsupported_flag_bits_are_einval() {
         ),
         -(abi::EINVAL as i64),
         "AT_SYMLINK_NOFOLLOW | unknown bit must still reject (no silent masking)",
+    );
+}
+
+// ── #96: prctl(PR_SET_NAME / PR_GET_NAME) ────────────────────────────
+
+fn prctl_req(option: u32, args: [u32; 4], payload: &[u8]) -> Vec<u8> {
+    let mut req = Vec::with_capacity(20 + payload.len());
+    req.extend_from_slice(&option.to_le_bytes());
+    for a in args {
+        req.extend_from_slice(&a.to_le_bytes());
+    }
+    req.extend_from_slice(payload);
+    req
+}
+
+#[test]
+fn prctl_set_name_then_get_name_round_trips() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let req = prctl_req(15 /* PR_SET_NAME */, [0; 4], b"jupyter");
+    assert_eq!(dispatch(METHOD_SYS_PRCTL, 1, &req, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    let get = prctl_req(16 /* PR_GET_NAME */, [0; 4], &[]);
+    assert_eq!(dispatch(METHOD_SYS_PRCTL, 1, &get, &mut out), 16);
+    assert_eq!(&out[..7], b"jupyter");
+    assert_eq!(out[7], 0, "Linux convention: 15 chars + NUL within 16");
+}
+
+#[test]
+fn prctl_set_name_truncates_at_fifteen_chars_and_nul_terminates() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // 17-char payload (longer than the 15-char usable + NUL window).
+    let long = b"abcdefghijklmnopq";
+    let req = prctl_req(15, [0; 4], long);
+    assert_eq!(dispatch(METHOD_SYS_PRCTL, 1, &req, &mut []), 0);
+
+    let mut out = [0u8; 16];
+    let get = prctl_req(16, [0; 4], &[]);
+    assert_eq!(dispatch(METHOD_SYS_PRCTL, 1, &get, &mut out), 16);
+    assert_eq!(&out[..15], &long[..15], "first 15 bytes preserved");
+    assert_eq!(out[15], 0, "byte 16 is always NUL");
+}
+
+#[test]
+fn prctl_get_name_default_is_all_zero() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 16];
+    let get = prctl_req(16, [0; 4], &[]);
+    assert_eq!(dispatch(METHOD_SYS_PRCTL, 1, &get, &mut out), 16);
+    assert_eq!(out, [0u8; 16]);
+}
+
+#[test]
+fn prctl_get_name_short_response_buffer_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut out = [0u8; 8]; // < TASK_COMM_LEN
+    let get = prctl_req(16, [0; 4], &[]);
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &get, &mut out),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn prctl_unknown_option_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // PR_SET_DUMPABLE=4 etc. — unimplemented options surface EINVAL.
+    let req = prctl_req(4, [0; 4], &[]);
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &req, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn prctl_short_request_is_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // 19 bytes — one short of the 20-byte 5x u32 args header.
+    let short = vec![0u8; 19];
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &short, &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn prctl_set_name_empty_payload_clears_to_all_zero() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // First set a name, then clear it.
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &prctl_req(15, [0; 4], b"x"), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &prctl_req(15, [0; 4], &[]), &mut []),
+        0
+    );
+    let mut out = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &prctl_req(16, [0; 4], &[]), &mut out),
+        16
+    );
+    assert_eq!(out, [0u8; 16]);
+}
+
+#[test]
+fn prctl_name_is_per_process() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Set pid 1's name.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_PRCTL,
+            1,
+            &prctl_req(15, [0; 4], b"proc1"),
+            &mut []
+        ),
+        0
+    );
+    // Set pid 2's name to a different string. The kernel lazily
+    // vivifies pid 2 on first access; this also exercises the
+    // Default-state initialization of comm = [0; 16].
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_PRCTL,
+            2,
+            &prctl_req(15, [0; 4], b"proc2"),
+            &mut []
+        ),
+        0
+    );
+    // Read back: each pid sees its own name.
+    let mut out1 = [0u8; 16];
+    let mut out2 = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 1, &prctl_req(16, [0; 4], &[]), &mut out1),
+        16
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_PRCTL, 2, &prctl_req(16, [0; 4], &[]), &mut out2),
+        16
+    );
+    assert_eq!(&out1[..5], b"proc1");
+    assert_eq!(&out2[..5], b"proc2");
+}
+
+// ---------------------------------------------------------------------------
+// #149: dir_anchor must store the REAL mount id (not ROOT_MOUNT) for
+// degraded (no-dir-inode) backends mounted at a non-root prefix.
+// ---------------------------------------------------------------------------
+
+/// A degraded backend: every path is a directory and it does NOT
+/// implement `dir_inode` (default `None`), so the kernel uses the
+/// path-snapshot degraded mode for this mount — exactly the hostfs /
+/// overlay-deferred shape #149 is about, but deterministic.
+struct DegradedDirBackend;
+
+impl crate::vfs::VfsBackend for DegradedDirBackend {
+    fn open(&mut self, _path: &[u8], _flags: u32) -> Option<u64> {
+        None
+    }
+    fn truncate(&mut self, _inode: u64) {}
+    fn read(&self, _inode: u64, _offset: u64, _buf: &mut [u8]) -> i64 {
+        0
+    }
+    fn write(&mut self, _inode: u64, _offset: u64, _payload: &[u8]) -> i64 {
+        -(crate::abi::EROFS as i64)
+    }
+    fn size(&self, _inode: u64) -> Option<u64> {
+        None
+    }
+    fn entry_type(&self, _path: &[u8]) -> u8 {
+        3 // DIRECTORY — every path in this fixture is a dir
+    }
+}
+
+#[test]
+fn dir_anchor_keeps_real_mount_id_on_degraded_non_root_mount() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mnt = crate::kernel::with_kernel(|k| {
+        k.vfs
+            .add_mount(b"/mnt".to_vec(), Box::new(DegradedDirBackend))
+    });
+    assert_ne!(
+        mnt,
+        crate::vfs::ROOT_MOUNT,
+        "fixture sanity: the non-root mount must not be ROOT_MOUNT"
+    );
+
+    // chdir path: Cwd.mount_id must be the real mount, not ROOT_MOUNT.
+    assert_eq!(dispatch(METHOD_SYS_CHDIR, 1, b"/mnt", &mut []), 0);
+    let cwd_mid = crate::kernel::with_kernel(|k| k.process(1).cwd.mount_id);
+    assert_eq!(
+        cwd_mid,
+        mnt,
+        "chdir into a degraded non-root mount must record its real \
+         mount id, not ROOT_MOUNT ({})",
+        crate::vfs::ROOT_MOUNT
+    );
+
+    // Directory-fd path: FdEntry::Directory.mount_id likewise.
+    let dfd = open_dir(b"/mnt");
+    let fd_mid = crate::kernel::with_kernel(|k| match k.process(1).fd_table.entry(dfd) {
+        Some(crate::kernel::FdEntry::Directory { mount_id, .. }) => *mount_id,
+        other => panic!("expected Directory fd, got {other:?}"),
+    });
+    assert_eq!(
+        fd_mid, mnt,
+        "an openat dirfd on a degraded non-root mount must record its \
+         real mount id, not ROOT_MOUNT"
     );
 }

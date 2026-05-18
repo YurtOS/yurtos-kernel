@@ -25,14 +25,17 @@ fi
 # Map each changed file to the nearest *package* Cargo.toml directory.
 # Virtual manifests (workspace-only Cargo.toml with no `name = ...`) are
 # skipped — keep walking up.
-declare -A CRATE_PKGS=()
+#
+# bash 3.2 (macOS) lacks `declare -A`; dedupe package names via a
+# newline-separated list and `sort -u` instead.
+PKG_LIST=""
 for f in "${CHANGED[@]}"; do
   dir="$(dirname "$f")"
   while [[ "$dir" != "." && "$dir" != "/" ]]; do
     if [[ -f "$dir/Cargo.toml" ]]; then
       pkg="$(awk -F\" '/^name *=/ {print $2; exit}' "$dir/Cargo.toml")"
       if [[ -n "$pkg" ]]; then
-        CRATE_PKGS["$pkg"]=1
+        PKG_LIST+="$pkg"$'\n'
         break
       fi
     fi
@@ -40,11 +43,16 @@ for f in "${CHANGED[@]}"; do
   done
 done
 
-if [[ ${#CRATE_PKGS[@]} -eq 0 ]]; then
+PKGS_UNIQ=()
+while IFS= read -r pkg; do
+  [[ -n "$pkg" ]] && PKGS_UNIQ+=("$pkg")
+done < <(printf '%s' "$PKG_LIST" | sort -u)
+
+if [[ ${#PKGS_UNIQ[@]} -eq 0 ]]; then
   exec cargo check --all-targets
 fi
 
-for pkg in "${!CRATE_PKGS[@]}"; do
+for pkg in "${PKGS_UNIQ[@]}"; do
   echo "→ cargo check -p $pkg --tests"
   cargo check -p "$pkg" --tests
 done
