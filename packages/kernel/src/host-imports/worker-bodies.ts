@@ -79,6 +79,24 @@ import {
  * means the dispatcher is being asked to do work it can't satisfy
  * synchronously. Report an I/O error rather than corrupting the
  * worker's view of kernel state.
+ *
+ * **Cross-process invariant (#125 audit, 2026-05-18):** the per-process
+ * `WorkerHostSerializer` (PR #119 / Task 10) does NOT serialize across
+ * processes. As long as `requireSyncSocketResult` keeps these bodies
+ * synchronous, JS run-to-completion is the global serializer for the
+ * shared kernel-state mutations (`socketOpen`/`Bind`/`Send`/`Recv`/
+ * `Close`/etc.) and no cross-process interleave is possible. Anyone
+ * relaxing this gate to let a previously-synchronous body `await`
+ * MUST, for that body, either:
+ *   1. re-validate every captured target/fd identity post-await
+ *      (`kernel.getFdTarget(getPid(), fd) !== <captured target>` →
+ *      bail with `-EBADF`, mirroring `socketListen`'s line-435 guard
+ *      added in #162), OR
+ *   2. wire a process-global serializer tier explicitly for that body.
+ *
+ * Without one of those, two processes' bodies will interleave on
+ * shared kernel/socket tables. See
+ * `docs/superpowers/specs/2026-05-17-125-worker-host-cross-process-mutation-audit-design.md`.
  */
 function requireSyncSocketResult(
   v: SocketBackendResult | Promise<SocketBackendResult>,
