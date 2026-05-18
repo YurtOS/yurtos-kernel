@@ -27,6 +27,9 @@ pub mod mock {
         pub stderr: String,
     }
 
+    /// Dynamic spawn handler: `(program, args, stdin) -> MockSpawnOutput`.
+    type SpawnHandler = Box<dyn Fn(&str, &[&str], &str) -> MockSpawnOutput>;
+
     /// An in-memory mock implementation of `HostInterface` for testing.
     ///
     /// Uses `RefCell` for the files map so that `write_file` can mutate state
@@ -42,7 +45,7 @@ pub mod mock {
         /// Optional dynamic spawn handler: receives (program, args, stdin) and
         /// returns a MockSpawnOutput. When set, this takes priority over
         /// `spawn_results`.
-        spawn_handler: Option<Box<dyn Fn(&str, &[&str], &str) -> MockSpawnOutput>>,
+        spawn_handler: Option<SpawnHandler>,
         /// Pre-configured fetch results keyed by URL.
         fetch_results: HashMap<String, FetchResult>,
         /// Records register_tool calls for test assertions.
@@ -368,7 +371,7 @@ pub mod mock {
             if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
                 return Err(HostError::IoError("pipe failed".into()));
             }
-            Ok((fds[0] as i32, fds[1] as i32))
+            Ok((fds[0], fds[1]))
         }
 
         fn waitpid(&self, pid: i32) -> Result<SpawnResult, HostError> {

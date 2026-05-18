@@ -414,6 +414,7 @@ fn exec_shell_command(
 ///     PATH must run with `argv[0] = "grep"` but dispatch the `busybox`
 ///     multicall binary).  `None` means "use program as argv[0]".
 ///   * `args` are the resolved trailing arguments.
+///
 /// If the command was fully handled (shebang, sh/ash dispatch),
 /// returns Err(ControlFlow) instead.
 fn dispatch_external_command(
@@ -3351,7 +3352,7 @@ mod tests {
             vec![redirect(RedirectType::StdoutAppend("/tmp/out.txt".into()))],
         );
         let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
+        let ControlFlow::Normal(_run) = result.unwrap() else {
             panic!("expected Normal")
         };
     }
@@ -3420,7 +3421,7 @@ mod tests {
             &[],
             vec![redirect(RedirectType::StdinFrom("input.txt".into()))],
         );
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "relative content\n");
     }
 
@@ -3443,7 +3444,7 @@ mod tests {
                 "/tmp/err.txt".into(),
             ))],
         );
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         // stdout is preserved, stderr goes to file
         assert_eq!(stdout, "out\n");
     }
@@ -3484,7 +3485,7 @@ mod tests {
         let mut state = ShellState::new_default();
         let cmd =
             simple_cmd_with_redirects("cmd", &[], vec![redirect(RedirectType::StderrToStdout)]);
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         // In pipe-based model, stderr merging happens at fd level;
         // here we just verify stdout was captured.
         assert_eq!(stdout, "out\n");
@@ -3511,7 +3512,7 @@ mod tests {
             ],
         );
         let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
+        let ControlFlow::Normal(_run) = result.unwrap() else {
             panic!("expected Normal")
         };
     }
@@ -3534,7 +3535,7 @@ mod tests {
             vec![redirect(RedirectType::BothOverwrite("/tmp/all.txt".into()))],
         );
         let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
+        let ControlFlow::Normal(_run) = result.unwrap() else {
             panic!("expected Normal")
         };
     }
@@ -3558,7 +3559,7 @@ mod tests {
                 "heredoc line 1\nheredoc line 2\n".into(),
             ))],
         );
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "heredoc line 1\nheredoc line 2\n");
     }
 
@@ -3581,7 +3582,7 @@ mod tests {
                 "stripped content\n".into(),
             ))],
         );
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "stripped content\n");
     }
 
@@ -3602,7 +3603,7 @@ mod tests {
             &[],
             vec![redirect(RedirectType::HereString("hello".into()))],
         );
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "hello\n");
     }
 
@@ -3648,7 +3649,7 @@ mod tests {
             ],
         );
         let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
+        let ControlFlow::Normal(_run) = result.unwrap() else {
             panic!("expected Normal")
         };
     }
@@ -3666,7 +3667,7 @@ mod tests {
         );
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("echo hi");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "hi\n");
     }
 
@@ -3705,7 +3706,7 @@ mod tests {
         let mut state = ShellState::new_default();
         let cmd =
             simple_cmd_with_redirects("cmd", &[], vec![redirect(RedirectType::StderrToStdout)]);
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "only out\n");
     }
 
@@ -3750,7 +3751,7 @@ mod tests {
             ],
         );
         let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
+        let ControlFlow::Normal(_run) = result.unwrap() else {
             panic!("expected Normal")
         };
     }
@@ -3778,7 +3779,7 @@ mod tests {
                 redirect(RedirectType::StdinFrom("/tmp/b.txt".into())),
             ],
         );
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         // Last input redirect wins, so cat sees content of b.txt
         assert_eq!(stdout, "content b\n");
     }
@@ -3966,7 +3967,7 @@ mod tests {
         });
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("cmd-with-stderr | cat");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         // cat only sees stdout, not stderr
         assert_eq!(stdout, "out\n");
 
@@ -3996,7 +3997,7 @@ mod tests {
         });
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("cmd 2>&1 | cat");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         // In pipe-based model, stderr merge happens at fd level;
         // cat only receives what was written to stdout_fd.
         assert_eq!(stdout, "out\n");
@@ -4272,7 +4273,7 @@ mod tests {
             op: yurt_shell::ast::ListOp::Seq,
             right: Box::new(simple_cmd("echo-b")),
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "a\nb\n");
     }
 
@@ -4325,7 +4326,7 @@ mod tests {
             then_body: Box::new(simple_cmd("echo-a")),
             else_body: None,
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "a\n");
     }
 
@@ -4338,7 +4339,7 @@ mod tests {
             then_body: Box::new(simple_cmd("echo-a")),
             else_body: Some(Box::new(simple_cmd("echo-b"))),
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "b\n");
     }
 
@@ -4372,7 +4373,7 @@ mod tests {
                 else_body: None,
             })),
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "b\n");
     }
 
@@ -4408,7 +4409,7 @@ mod tests {
                 assignments: vec![],
             }),
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "a\nb\nc\n");
         assert_eq!(state.env.get("i").unwrap(), "c");
     }
@@ -4502,7 +4503,7 @@ mod tests {
             }),
         };
         let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
+        let ControlFlow::Normal(_run) = result.unwrap() else {
             panic!("expected Normal")
         };
     }
@@ -4550,7 +4551,7 @@ mod tests {
                 }),
             }),
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "0\n1\n2\n");
         assert_eq!(state.env.get("i").unwrap(), "3");
     }
@@ -4613,7 +4614,7 @@ mod tests {
             }),
         };
         let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
+        let ControlFlow::Normal(_run) = result.unwrap() else {
             panic!("expected Normal")
         };
         // echo should never have been called
@@ -4652,7 +4653,7 @@ mod tests {
                 assignments: vec![],
             }),
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "0\n1\n2\n");
         assert_eq!(state.env.get("i").unwrap(), "3");
     }
@@ -4710,7 +4711,7 @@ mod tests {
             }),
         };
         let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
+        let ControlFlow::Normal(_run) = result.unwrap() else {
             panic!("expected Normal")
         };
         // i should be 5 because step still ran on each continue
@@ -4741,7 +4742,7 @@ mod tests {
                 },
             ],
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "b\n");
     }
 
@@ -4765,7 +4766,7 @@ mod tests {
                 },
             ],
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "b\n");
     }
 
@@ -4789,7 +4790,7 @@ mod tests {
                 },
             ],
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "a\n");
     }
 
@@ -4865,7 +4866,7 @@ mod tests {
             body: Box::new(simple_cmd("echo-a")),
             redirects: vec![],
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "a\n");
     }
 
@@ -4976,7 +4977,7 @@ mod tests {
             redirects: vec![],
             assignments: vec![],
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "hello\n");
     }
 
@@ -5013,7 +5014,7 @@ mod tests {
             redirects: vec![],
             assignments: vec![],
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "arg1\n");
         // Positional args should be restored
         assert_eq!(state.positional_args, vec!["original"]);
@@ -6174,7 +6175,7 @@ mod tests {
             });
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("./test.sh");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         // Shell script is executed by parsing and running through our executor
         // echo is a builtin, so it should produce output
         assert_eq!(stdout, "hello\n");
@@ -6185,7 +6186,7 @@ mod tests {
         let host = MockHost::new().with_file("/home/user/run.sh", b"echo no_shebang\n");
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("./run.sh");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         // Scripts without shebang default to shell execution
         assert_eq!(stdout, "no_shebang\n");
     }
@@ -6242,7 +6243,7 @@ mod tests {
         let host = MockHost::new();
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("sh -c 'echo hello'");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "hello\n");
     }
 
@@ -6252,7 +6253,7 @@ mod tests {
             MockHost::new().with_file("/home/user/test.sh", b"#!/bin/sh\necho from_script\n");
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("sh test.sh");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "from_script\n");
     }
 
@@ -6285,7 +6286,7 @@ mod tests {
         let host = MockHost::new().with_file("/home/user/params.sh", b"echo $1 $2\n");
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("sh params.sh hello world");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "hello world\n");
     }
 
@@ -6300,7 +6301,7 @@ mod tests {
         });
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("echo input | sh -c 'echo piped'");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "piped\n");
     }
 
@@ -6382,7 +6383,7 @@ mod tests {
         let mut state = ShellState::new_default();
         state.env.insert("FOO".into(), "bar".into());
         let cmd = yurt_shell::parser::parse("sh -c 'echo hello; echo world'");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "hello\nworld\n");
     }
 
@@ -6392,7 +6393,7 @@ mod tests {
         let mut state = ShellState::new_default();
         state.env.insert("NAME".into(), "world".into());
         let cmd = yurt_shell::parser::parse("sh -c 'echo $NAME'");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "world\n");
     }
 
@@ -6403,7 +6404,7 @@ mod tests {
         let host = MockHost::new().with_file("/home/user/greet.sh", b"#!/bin/sh\necho Hello $1\n");
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("./greet.sh World");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "Hello World\n");
     }
 
@@ -6482,7 +6483,7 @@ mod tests {
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("sh -c 'echo redirected' > /tmp/out.txt");
         let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
+        let ControlFlow::Normal(_run) = result.unwrap() else {
             panic!("expected Normal")
         };
         // Output should have been redirected, so stdout is empty
@@ -6521,7 +6522,7 @@ mod tests {
             });
         let mut state = ShellState::new_default();
         let cmd = yurt_shell::parser::parse("echo input | ./count.sh");
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert_eq!(stdout, "counted\n");
     }
 
@@ -6582,7 +6583,7 @@ mod tests {
             op: yurt_shell::ast::ListOp::Background,
             right: Box::new(simple_cmd("echo-b")),
         };
-        let (exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
+        let (_exit_code, stdout) = exec_capture_cmd(&mut state, &host, &cmd);
         assert!(stdout.contains("a\n"));
         assert!(stdout.contains("b\n"));
         assert_eq!(state.jobs.len(), 1);
@@ -6602,7 +6603,7 @@ mod tests {
             }),
         };
         let result = exec_command(&mut state, &host, &cmd);
-        let ControlFlow::Normal(run) = result.unwrap() else {
+        let ControlFlow::Normal(_run) = result.unwrap() else {
             panic!("expected Normal")
         };
         assert_eq!(state.last_exit_code, 0);
