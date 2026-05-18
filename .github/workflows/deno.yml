@@ -70,6 +70,14 @@ jobs:
         with:
           deno-version: v2.x
       - run: deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run $IMAGE_RUNTIME_TESTS
+      # host-imports ABI surface (incl. the host_dup_min F_DUPFD errno
+      # regression tests, #163). This file is outside $IMAGE_RUNTIME_TESTS
+      # and was previously only gated by the local pre-push hook.
+      # `if: always()` so a failure in the step above does not skip (and
+      # thus silently drop) this signal — both run every time.
+      - name: host-imports ABI surface tests
+        if: always()
+        run: deno test --no-check --allow-read --allow-write --allow-env --allow-net --allow-run packages/kernel/src/host-imports/__tests__/imports-shape_test.ts
 
   kernel-host-interface-js:
     if: ${{ vars.YURT_ENABLE_WASM_KERNEL_CI == '1' }}
