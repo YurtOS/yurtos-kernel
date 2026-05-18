@@ -315,9 +315,11 @@ mod sys_method_id {
     pub const SELECT: u32 = 0x1_00A1;
     pub const PSELECT: u32 = 0x1_00A2;
     pub const PPOLL: u32 = 0x1_00A3;
-    // #92 epoll family (S3 kernel-side already merged; this transport
-    // exposes the user-visible yurt::host_epoll_* imports the guest
-    // libc shims call).
+    // #92 epoll family. Kernel handler is NOT implemented yet: the
+    // kernel-wasm dispatcher returns -ENOSYS via explicit S0 stub arms
+    // (real handler is #92 slice S3). This transport only exposes the
+    // user-visible yurt::host_epoll_* imports the guest libc shims call;
+    // calls degrade to ENOSYS until S3 lands.
     pub const EPOLL_CREATE1: u32 = 0x1_00B8;
     pub const EPOLL_CTL: u32 = 0x1_00B9;
     pub const EPOLL_WAIT: u32 = 0x1_00BA;
