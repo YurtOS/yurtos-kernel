@@ -186,6 +186,12 @@ pub enum FdEntry {
     TimerFd {
         id: u64,
     },
+    /// Linux `epoll(7)` — a kernel-managed interest set of watched
+    /// fds. `id` references an [`EPollEntry`] in `Kernel::epolls`.
+    /// Issue #92 slice S3.
+    EPoll {
+        id: u64,
+    },
 }
 
 /// Per-pid file-descriptor table. Sparse — closed fds are absent.
@@ -697,6 +703,27 @@ pub struct TimerFdEntry {
     pub refs: u32,
 }
 
+/// One entry in an [`EPollEntry`]'s interest set: the events the
+/// guest registered + the opaque u64 `data` cookie + per-entry state
+/// flags (`oneshot_armed` tracks the EPOLLONESHOT one-shot disarm
+/// bit). Issue #92 slice S3.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EPollInterest {
+    pub events: u32,
+    pub data: u64,
+    pub oneshot_armed: bool,
+}
+
+/// `epoll(7)` interest set for a single epoll fd. Maps **watched fd
+/// → registered interest**. `refs` counts how many
+/// [`FdEntry::EPoll`] entries reference it. Issue #92 S3.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EPollEntry {
+    pub interest: BTreeMap<u32, EPollInterest>,
+    pub flags: u32,
+    pub refs: u32,
+}
+
 pub struct SocketEntry {
     pub refs: u32,
     pub domain: u8,
@@ -725,6 +752,10 @@ pub struct Kernel {
     /// entry here by id. Issue #92 slice S2.
     timerfds: BTreeMap<u64, TimerFdEntry>,
     next_timerfd_id: u64,
+    /// `epoll(7)` registry. Each [`FdEntry::EPoll`] references an
+    /// entry here by id. Issue #92 slice S3.
+    epolls: BTreeMap<u64, EPollEntry>,
+    next_epoll_id: u64,
     unix_listeners: BTreeMap<Vec<u8>, u64>,
     unix_datagrams: BTreeMap<Vec<u8>, u64>,
     unix_socket_inodes: BTreeSet<Vec<u8>>,
@@ -842,6 +873,8 @@ impl Kernel {
             next_eventfd_id: 1,
             timerfds: BTreeMap::new(),
             next_timerfd_id: 1,
+            epolls: BTreeMap::new(),
+            next_epoll_id: 1,
             unix_listeners: BTreeMap::new(),
             unix_datagrams: BTreeMap::new(),
             unix_socket_inodes: BTreeSet::new(),
@@ -1537,6 +1570,7 @@ impl Kernel {
             FdEntry::Socket { id } => self.socket_inc_ref(*id),
             FdEntry::EventFd { id } => self.eventfd_inc_ref(*id),
             FdEntry::TimerFd { id } => self.timerfd_inc_ref(*id),
+            FdEntry::EPoll { id } => self.epoll_inc_ref(*id),
             FdEntry::Directory { .. } | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => {}
         }
     }
@@ -2203,6 +2237,50 @@ impl Kernel {
         }
     }
 
+    /// Allocate a fresh `epoll(7)` interest set. `refs` starts at 1.
+    /// Issue #92 S3.
+    pub fn create_epoll(&mut self, flags: u32) -> u64 {
+        let id = self.next_epoll_id;
+        self.next_epoll_id += 1;
+        self.epolls.insert(
+            id,
+            EPollEntry {
+                interest: BTreeMap::new(),
+                flags,
+                refs: 1,
+            },
+        );
+        id
+    }
+
+    pub fn epoll_get_mut(&mut self, id: u64) -> Option<&mut EPollEntry> {
+        self.epolls.get_mut(&id)
+    }
+
+    pub fn epoll_get(&self, id: u64) -> Option<&EPollEntry> {
+        self.epolls.get(&id)
+    }
+
+    pub fn epoll_inc_ref(&mut self, id: u64) {
+        if let Some(e) = self.epolls.get_mut(&id) {
+            e.refs = e.refs.saturating_add(1);
+        }
+    }
+
+    pub fn epoll_dec_ref(&mut self, id: u64) {
+        let drop = self
+            .epolls
+            .get_mut(&id)
+            .map(|e| {
+                e.refs = e.refs.saturating_sub(1);
+                e.refs == 0
+            })
+            .unwrap_or(false);
+        if drop {
+            self.epolls.remove(&id);
+        }
+    }
+
     fn dec_fd_entry_ref(&mut self, entry: &FdEntry) {
         match entry {
             FdEntry::Pipe { id, end } => self.pipe_dec_ref(*id, *end),
@@ -2220,6 +2298,7 @@ impl Kernel {
             }
             FdEntry::EventFd { id } => self.eventfd_dec_ref(*id),
             FdEntry::TimerFd { id } => self.timerfd_dec_ref(*id),
+            FdEntry::EPoll { id } => self.epoll_dec_ref(*id),
             FdEntry::Directory { .. } | FdEntry::Stdin | FdEntry::Stdout | FdEntry::Stderr => {}
         }
     }
@@ -2371,6 +2450,8 @@ pub fn reset_for_tests() {
     k.next_eventfd_id = 1;
     k.timerfds.clear();
     k.next_timerfd_id = 1;
+    k.epolls.clear();
+    k.next_epoll_id = 1;
     k.socket_shutdown.clear();
     k.unix_listeners.clear();
     k.unix_datagrams.clear();

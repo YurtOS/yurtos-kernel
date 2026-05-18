@@ -14139,18 +14139,13 @@ fn event_loop_methods_return_enosys_until_slice_lands() {
     // Pass empty request/response. The handler doesn't matter (it's
     // -ENOSYS), but an empty buffer pair confirms we hit the dedicated
     // arm and not some accidental fast-path that decodes bytes first.
-    // METHOD_SYS_EVENTFD / TIMERFD_* removed as their slices landed.
-    for &method in &[
-        METHOD_SYS_EPOLL_CREATE1,
-        METHOD_SYS_EPOLL_CTL,
-        METHOD_SYS_EPOLL_WAIT,
-        METHOD_SYS_EPOLL_PWAIT,
-        METHOD_SYS_SIGNALFD,
-    ] {
+    // EVENTFD / TIMERFD_* / EPOLL_CREATE1+CTL+WAIT removed as slices
+    // landed; EPOLL_PWAIT and SIGNALFD stay -ENOSYS until S4/S5.
+    for &method in &[METHOD_SYS_EPOLL_PWAIT, METHOD_SYS_SIGNALFD] {
         assert_eq!(
             dispatch(method, 1, &[], &mut []),
             enosys,
-            "method 0x{method:x} must -ENOSYS until its S3..S5 handler lands"
+            "method 0x{method:x} must -ENOSYS until its S4/S5 handler lands"
         );
     }
 }
@@ -14615,4 +14610,257 @@ fn timerfd_close_releases_state() {
     assert_eq!(dispatch(METHOD_SYS_CLOSE, 1, &close_req, &mut []), 0);
     let live = crate::kernel::with_kernel(|k| k.timerfd_get(1).is_some());
     assert!(!live, "timerfd entry must be freed on last close");
+}
+
+// ── #92 S3: epoll (non-blocking) ────────────────────────────────────
+
+const EPOLL_CTL_ADD_OP: u32 = 1;
+const EPOLL_CTL_DEL_OP: u32 = 2;
+const EPOLL_CTL_MOD_OP: u32 = 3;
+const EPOLLIN_BIT: u32 = 0x001;
+const EPOLLOUT_BIT: u32 = 0x004;
+const EPOLLONESHOT_BIT: u32 = 1 << 30;
+
+fn epoll_ctl_req(epfd: u32, op: u32, target_fd: u32, events: u32, data: u64) -> Vec<u8> {
+    let mut req = Vec::with_capacity(24);
+    req.extend_from_slice(&epfd.to_le_bytes());
+    req.extend_from_slice(&op.to_le_bytes());
+    req.extend_from_slice(&target_fd.to_le_bytes());
+    req.extend_from_slice(&events.to_le_bytes());
+    req.extend_from_slice(&data.to_le_bytes());
+    req
+}
+
+fn epoll_wait_req(epfd: u32, maxevents: i32, timeout_ms: i32) -> Vec<u8> {
+    let mut req = Vec::with_capacity(12);
+    req.extend_from_slice(&epfd.to_le_bytes());
+    req.extend_from_slice(&maxevents.to_le_bytes());
+    req.extend_from_slice(&timeout_ms.to_le_bytes());
+    req
+}
+
+fn decode_epoll_event(bytes: &[u8]) -> (u32, u64) {
+    let events = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+    let data = u64::from_le_bytes(bytes[4..12].try_into().unwrap());
+    (events, data)
+}
+
+#[test]
+fn epoll_create1_returns_fresh_fd_with_empty_interest_set() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let fd = dispatch(METHOD_SYS_EPOLL_CREATE1, 1, &0u32.to_le_bytes(), &mut []);
+    assert!(fd >= 3);
+
+    // Empty interest set: epoll_wait returns 0 (no events).
+    let mut out = vec![0u8; 12];
+    let n = dispatch(
+        METHOD_SYS_EPOLL_WAIT,
+        1,
+        &epoll_wait_req(fd as u32, 1, 0),
+        &mut out,
+    );
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn epoll_create1_rejects_unknown_flags() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(
+        dispatch(METHOD_SYS_EPOLL_CREATE1, 1, &0x4u32.to_le_bytes(), &mut []),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn epoll_ctl_add_then_mod_then_del() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let epfd = dispatch(METHOD_SYS_EPOLL_CREATE1, 1, &0u32.to_le_bytes(), &mut []) as u32;
+    let efd = dispatch(METHOD_SYS_EVENTFD, 1, &eventfd_req(0, 0), &mut []) as u32;
+
+    // ADD: succeeds.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_CTL,
+            1,
+            &epoll_ctl_req(epfd, EPOLL_CTL_ADD_OP, efd, EPOLLIN_BIT, 0xCAFE),
+            &mut []
+        ),
+        0
+    );
+
+    // ADD again: -EEXIST.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_CTL,
+            1,
+            &epoll_ctl_req(epfd, EPOLL_CTL_ADD_OP, efd, EPOLLIN_BIT, 0xCAFE),
+            &mut []
+        ),
+        -(abi::EEXIST as i64)
+    );
+
+    // MOD: succeeds.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_CTL,
+            1,
+            &epoll_ctl_req(epfd, EPOLL_CTL_MOD_OP, efd, EPOLLOUT_BIT, 0xCAFE),
+            &mut []
+        ),
+        0
+    );
+
+    // DEL: succeeds.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_CTL,
+            1,
+            &epoll_ctl_req(epfd, EPOLL_CTL_DEL_OP, efd, 0, 0),
+            &mut []
+        ),
+        0
+    );
+
+    // DEL again: -ENOENT.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_CTL,
+            1,
+            &epoll_ctl_req(epfd, EPOLL_CTL_DEL_OP, efd, 0, 0),
+            &mut []
+        ),
+        -(abi::ENOENT as i64)
+    );
+
+    // MOD on absent fd: -ENOENT.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_CTL,
+            1,
+            &epoll_ctl_req(epfd, EPOLL_CTL_MOD_OP, efd, EPOLLIN_BIT, 0),
+            &mut []
+        ),
+        -(abi::ENOENT as i64)
+    );
+}
+
+#[test]
+fn epoll_ctl_rejects_self_watch_with_eloop() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let epfd = dispatch(METHOD_SYS_EPOLL_CREATE1, 1, &0u32.to_le_bytes(), &mut []) as u32;
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_CTL,
+            1,
+            &epoll_ctl_req(epfd, EPOLL_CTL_ADD_OP, epfd, EPOLLIN_BIT, 0),
+            &mut []
+        ),
+        -(abi::ELOOP as i64)
+    );
+}
+
+#[test]
+fn epoll_wait_returns_ready_eventfd_with_data_cookie() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let epfd = dispatch(METHOD_SYS_EPOLL_CREATE1, 1, &0u32.to_le_bytes(), &mut []) as u32;
+    // eventfd seeded with counter > 0 -> immediately POLLIN-ready.
+    let efd = dispatch(METHOD_SYS_EVENTFD, 1, &eventfd_req(5, 0), &mut []) as u32;
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_CTL,
+            1,
+            &epoll_ctl_req(epfd, EPOLL_CTL_ADD_OP, efd, EPOLLIN_BIT, 0xC0FFEE),
+            &mut []
+        ),
+        0
+    );
+
+    let mut out = vec![0u8; 12];
+    let n = dispatch(
+        METHOD_SYS_EPOLL_WAIT,
+        1,
+        &epoll_wait_req(epfd, 1, 0),
+        &mut out,
+    );
+    assert_eq!(n, 12);
+    let (events, data) = decode_epoll_event(&out);
+    assert_eq!(events & EPOLLIN_BIT, EPOLLIN_BIT);
+    assert_eq!(data, 0xC0FFEE, "data cookie must round-trip");
+}
+
+#[test]
+fn epoll_wait_oneshot_disarms_after_delivery() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let epfd = dispatch(METHOD_SYS_EPOLL_CREATE1, 1, &0u32.to_le_bytes(), &mut []) as u32;
+    let efd = dispatch(METHOD_SYS_EVENTFD, 1, &eventfd_req(1, 0), &mut []) as u32;
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_CTL,
+            1,
+            &epoll_ctl_req(
+                epfd,
+                EPOLL_CTL_ADD_OP,
+                efd,
+                EPOLLIN_BIT | EPOLLONESHOT_BIT,
+                42,
+            ),
+            &mut []
+        ),
+        0
+    );
+
+    let mut out = vec![0u8; 12];
+    // First wait fires once.
+    let n = dispatch(
+        METHOD_SYS_EPOLL_WAIT,
+        1,
+        &epoll_wait_req(epfd, 1, 0),
+        &mut out,
+    );
+    assert_eq!(n, 12);
+    // Second wait: oneshot disarmed even though counter is still > 0.
+    let n2 = dispatch(
+        METHOD_SYS_EPOLL_WAIT,
+        1,
+        &epoll_wait_req(epfd, 1, 0),
+        &mut out,
+    );
+    assert_eq!(n2, 0, "EPOLLONESHOT must disarm after one delivery");
+}
+
+#[test]
+fn epoll_wait_rejects_maxevents_zero_and_negative() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let epfd = dispatch(METHOD_SYS_EPOLL_CREATE1, 1, &0u32.to_le_bytes(), &mut []) as u32;
+    let mut out = vec![0u8; 12];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_WAIT,
+            1,
+            &epoll_wait_req(epfd, 0, 0),
+            &mut out
+        ),
+        -(abi::EINVAL as i64)
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_EPOLL_WAIT,
+            1,
+            &epoll_wait_req(epfd, -1, 0),
+            &mut out
+        ),
+        -(abi::EINVAL as i64)
+    );
+}
+
+#[test]
+fn epoll_close_frees_interest_set() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let epfd = dispatch(METHOD_SYS_EPOLL_CREATE1, 1, &0u32.to_le_bytes(), &mut []) as u32;
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &epfd.to_le_bytes(), &mut []),
+        0
+    );
+    let live = crate::kernel::with_kernel(|k| k.epoll_get(1).is_some());
+    assert!(!live, "epoll entry must be freed on last close");
 }

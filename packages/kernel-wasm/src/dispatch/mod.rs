@@ -276,9 +276,9 @@ pub fn dispatch_with_context(
         METHOD_SYS_TIMERFD_CREATE => sys_timerfd_create(caller_pid, request),
         METHOD_SYS_TIMERFD_SETTIME => sys_timerfd_settime(caller_pid, request, response),
         METHOD_SYS_TIMERFD_GETTIME => sys_timerfd_gettime(caller_pid, request, response),
-        METHOD_SYS_EPOLL_CREATE1 => -(abi::ENOSYS as i64),
-        METHOD_SYS_EPOLL_CTL => -(abi::ENOSYS as i64),
-        METHOD_SYS_EPOLL_WAIT => -(abi::ENOSYS as i64),
+        METHOD_SYS_EPOLL_CREATE1 => sys_epoll_create1(caller_pid, request),
+        METHOD_SYS_EPOLL_CTL => sys_epoll_ctl(caller_pid, request),
+        METHOD_SYS_EPOLL_WAIT => sys_epoll_wait(caller_pid, request, response),
         METHOD_SYS_EPOLL_PWAIT => -(abi::ENOSYS as i64),
         METHOD_SYS_SIGNALFD => -(abi::ENOSYS as i64),
         _ => -(abi::ENOSYS as i64),
@@ -369,6 +369,10 @@ fn close_entry(k: &mut Kernel, entry: FdEntry) -> Option<i32> {
         }
         crate::kernel::FdEntry::TimerFd { id } => {
             k.timerfd_dec_ref(id);
+            None
+        }
+        crate::kernel::FdEntry::EPoll { id } => {
+            k.epoll_dec_ref(id);
             None
         }
         _ => None,
@@ -629,6 +633,7 @@ fn get_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
             FdEntry::Socket { .. } => 2,
             FdEntry::EventFd { .. } => 2, // eventfd is read+write
             FdEntry::TimerFd { .. } => 0, // timerfd is read-only
+            FdEntry::EPoll { .. } => 0,   // epoll fd is not read/write directly
         }
     })
 }
@@ -834,6 +839,9 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             crate::kernel::FdEntry::Socket { id } => socket_recv_id(k, id, response, 0),
             crate::kernel::FdEntry::EventFd { id } => eventfd_read(k, id, response),
             crate::kernel::FdEntry::TimerFd { id } => timerfd_read(k, id, response),
+            // epoll fds are not directly readable — guests use
+            // epoll_wait to drain readiness, not read().
+            crate::kernel::FdEntry::EPoll { .. } => -(abi::EINVAL as i64),
         }
     })
 }
@@ -911,6 +919,8 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
             crate::kernel::FdEntry::EventFd { id } => eventfd_write(k, id, payload),
             // timerfd is read-only — write returns -EINVAL per Linux.
             crate::kernel::FdEntry::TimerFd { .. } => -(abi::EINVAL as i64),
+            // epoll fd is not writable; use epoll_ctl instead.
+            crate::kernel::FdEntry::EPoll { .. } => -(abi::EINVAL as i64),
         }
     })
 }
@@ -1229,6 +1239,239 @@ fn sys_timerfd_gettime(caller_pid: u32, request: &[u8], response: &mut [u8]) -> 
     })
 }
 
+// ── epoll (Issue #92 slice S3) ───────────────────────────────────────
+
+const EPOLL_CLOEXEC: u32 = 0x80000;
+const EPOLL_CREATE1_FLAGS_MASK: u32 = EPOLL_CLOEXEC;
+
+const EPOLL_CTL_ADD: u32 = 1;
+const EPOLL_CTL_DEL: u32 = 2;
+const EPOLL_CTL_MOD: u32 = 3;
+
+const EPOLLIN: u32 = 0x001;
+const EPOLLPRI: u32 = 0x002;
+const EPOLLOUT: u32 = 0x004;
+const EPOLLERR: u32 = 0x008;
+const EPOLLHUP: u32 = 0x010;
+const EPOLLRDNORM: u32 = 0x040;
+const EPOLLRDBAND: u32 = 0x080;
+const EPOLLWRNORM: u32 = 0x100;
+const EPOLLWRBAND: u32 = 0x200;
+const EPOLLMSG: u32 = 0x400;
+const EPOLLRDHUP: u32 = 0x2000;
+const EPOLLEXCLUSIVE: u32 = 1 << 28;
+const EPOLLWAKEUP: u32 = 1 << 29;
+const EPOLLONESHOT: u32 = 1 << 30;
+const EPOLLET: u32 = 1 << 31;
+
+/// Accepted bits on `epoll_ctl(ADD|MOD).event.events`. Anything else
+/// is `-EINVAL` per Linux.
+const EPOLL_EVENTS_MASK: u32 = EPOLLIN
+    | EPOLLPRI
+    | EPOLLOUT
+    | EPOLLERR
+    | EPOLLHUP
+    | EPOLLRDNORM
+    | EPOLLRDBAND
+    | EPOLLWRNORM
+    | EPOLLWRBAND
+    | EPOLLMSG
+    | EPOLLRDHUP
+    | EPOLLEXCLUSIVE
+    | EPOLLWAKEUP
+    | EPOLLONESHOT
+    | EPOLLET;
+
+/// `epoll_create1(flags)`. Request: u32 flags (4 bytes).
+fn sys_epoll_create1(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let flags = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    if flags & !EPOLL_CREATE1_FLAGS_MASK != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let id = k.create_epoll(flags);
+        let Some(fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
+            k.epoll_dec_ref(id);
+            return -(abi::EMFILE as i64);
+        };
+        k.process_mut(caller_pid)
+            .fd_table
+            .install(fd, crate::kernel::FdEntry::EPoll { id });
+        fd as i64
+    })
+}
+
+/// `epoll_ctl(epfd, op, fd, event)`. Request: u32 epfd + u32 op +
+/// u32 fd + 12-byte packed `epoll_event { u32 events, u64 data }`
+/// (24 bytes total).
+fn sys_epoll_ctl(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 24 {
+        return -(abi::EINVAL as i64);
+    }
+    let epfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let op = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let target_fd = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
+    let events = u32::from_le_bytes(request[12..16].try_into().expect("4 bytes"));
+    let data = u64::from_le_bytes(request[16..24].try_into().expect("8 bytes"));
+    with_kernel(|k| {
+        // Validate epfd is an EPoll.
+        let epoll_id = match k.process_mut(caller_pid).fd_table.entry(epfd) {
+            Some(crate::kernel::FdEntry::EPoll { id }) => *id,
+            Some(_) => return -(abi::EINVAL as i64),
+            None => return -(abi::EBADF as i64),
+        };
+        // Validate target fd exists (unless DEL — DEL of an absent
+        // interest entry returns ENOENT regardless).
+        let target_exists = k
+            .process_mut(caller_pid)
+            .fd_table
+            .entry(target_fd)
+            .is_some();
+        if !target_exists && op != EPOLL_CTL_DEL {
+            return -(abi::EBADF as i64);
+        }
+        // Reject watching the epoll fd itself (the simplest cycle).
+        // Multi-hop cycles are out of scope for S3 — Linux caps the
+        // chain at depth 5; we'll add full DFS detection in a
+        // follow-up when nested epolls are exercised.
+        if target_fd == epfd && op != EPOLL_CTL_DEL {
+            return -(abi::ELOOP as i64);
+        }
+        let entry = match k.epoll_get_mut(epoll_id) {
+            Some(e) => e,
+            None => return -(abi::EBADF as i64),
+        };
+        match op {
+            EPOLL_CTL_ADD => {
+                if entry.interest.contains_key(&target_fd) {
+                    return -(abi::EEXIST as i64);
+                }
+                if events & !EPOLL_EVENTS_MASK != 0 {
+                    return -(abi::EINVAL as i64);
+                }
+                entry.interest.insert(
+                    target_fd,
+                    crate::kernel::EPollInterest {
+                        events,
+                        data,
+                        oneshot_armed: events & EPOLLONESHOT != 0,
+                    },
+                );
+                0
+            }
+            EPOLL_CTL_MOD => {
+                if !entry.interest.contains_key(&target_fd) {
+                    return -(abi::ENOENT as i64);
+                }
+                if events & !EPOLL_EVENTS_MASK != 0 {
+                    return -(abi::EINVAL as i64);
+                }
+                entry.interest.insert(
+                    target_fd,
+                    crate::kernel::EPollInterest {
+                        events,
+                        data,
+                        oneshot_armed: events & EPOLLONESHOT != 0,
+                    },
+                );
+                0
+            }
+            EPOLL_CTL_DEL => {
+                if entry.interest.remove(&target_fd).is_none() {
+                    return -(abi::ENOENT as i64);
+                }
+                0
+            }
+            _ => -(abi::EINVAL as i64),
+        }
+    })
+}
+
+/// `epoll_wait(epfd, events, maxevents, timeout)`. Request: u32 epfd,
+/// u32 maxevents, i32 timeout_ms (12 bytes). Response: packed array
+/// of 12-byte `epoll_event` records.
+///
+/// **S3 scope:** only `timeout_ms == 0` (synchronous poll-only scan)
+/// is fully implemented. `timeout > 0` and `timeout == -1` are
+/// AsyncBridge-gated to slice S5; today they degrade to a single
+/// poll-only scan (return whatever is ready or 0).
+fn sys_epoll_wait(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let epfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let maxevents = i32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let _timeout_ms = i32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
+    if maxevents <= 0 {
+        return -(abi::EINVAL as i64);
+    }
+    // Each output record is 12 bytes (u32 events + u64 data, packed).
+    // Subtraction-form #65 bound: response.len() / 12 >= maxevents.
+    let cap = maxevents as usize;
+    if response.len() / 12 < cap {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let epoll_id = match k.process_mut(caller_pid).fd_table.entry(epfd) {
+            Some(crate::kernel::FdEntry::EPoll { id }) => *id,
+            Some(_) => return -(abi::EINVAL as i64),
+            None => return -(abi::EBADF as i64),
+        };
+        // Snapshot the interest set so we can scan without holding
+        // an &mut to the EPollEntry across re-entrant poll calls
+        // (some watched fd kinds — e.g. nested epoll — go back
+        // through `poll_revents_for_fd` which itself reads the
+        // epoll registry).
+        let watched: Vec<(u32, u32, u64, bool)> = {
+            let Some(entry) = k.epoll_get(epoll_id) else {
+                return -(abi::EBADF as i64);
+            };
+            entry
+                .interest
+                .iter()
+                .map(|(fd, intr)| (*fd, intr.events, intr.data, intr.oneshot_armed))
+                .collect()
+        };
+        let mut emitted = 0usize;
+        let mut to_disarm: Vec<u32> = Vec::new();
+        for (watched_fd, events, data, oneshot_armed) in watched {
+            if emitted >= cap {
+                break;
+            }
+            // Skip already-disarmed oneshot entries.
+            if events & EPOLLONESHOT != 0 && !oneshot_armed {
+                continue;
+            }
+            let ready = epoll_compute_watched_ready(k, caller_pid, watched_fd, events);
+            if ready == 0 {
+                continue;
+            }
+            let off = emitted * 12;
+            response[off..off + 4].copy_from_slice(&ready.to_le_bytes());
+            response[off + 4..off + 12].copy_from_slice(&data.to_le_bytes());
+            emitted += 1;
+            if events & EPOLLONESHOT != 0 {
+                to_disarm.push(watched_fd);
+            }
+        }
+        // Apply EPOLLONESHOT disarm after the scan to avoid mutating
+        // the interest map mid-iteration.
+        if !to_disarm.is_empty() {
+            if let Some(entry) = k.epoll_get_mut(epoll_id) {
+                for fd in to_disarm {
+                    if let Some(intr) = entry.interest.get_mut(&fd) {
+                        intr.oneshot_armed = false;
+                    }
+                }
+            }
+        }
+        (emitted * 12) as i64
+    })
+}
+
 /// `read(timerfd, ...)` — returns the u64 expiration count since the
 /// last successful read (or since the timer was armed). For a one-shot
 /// timer (`interval_ns == 0`), returns 1 once and disarms. For a
@@ -1530,7 +1773,84 @@ fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) ->
                 0
             }
         }
+        FdEntry::EPoll { id } => {
+            // epoll fd is itself pollable: POLLIN iff any watched fd
+            // has a matching ready event. Issue #92 slice S3.
+            //
+            // Nested epoll: we treat a watched epoll fd as "ready" if
+            // its interest set is non-empty (approximation). True
+            // nested-readiness check would recurse; the Linux cap
+            // (chain depth 5) bounds it, but for S3 the approximation
+            // is acceptable — libuv/asyncio do not nest epolls today.
+            if !wants_read {
+                return 0;
+            }
+            let Some(epoll) = k.epoll_get(id) else {
+                return POLLNVAL;
+            };
+            let watched: Vec<(u32, u32)> = epoll
+                .interest
+                .iter()
+                .map(|(fd, intr)| (*fd, intr.events))
+                .collect();
+            for (watched_fd, events) in watched {
+                if epoll_watched_fd_ready(k, caller_pid, watched_fd, events) {
+                    return POLLIN;
+                }
+            }
+            0
+        }
     }
+}
+
+/// Returns true iff `watched_fd` currently satisfies any bit in
+/// `events`. Used by the EPoll poll arm and the `epoll_wait` scan.
+fn epoll_watched_fd_ready(k: &mut Kernel, caller_pid: u32, watched_fd: u32, events: u32) -> bool {
+    epoll_compute_watched_ready(k, caller_pid, watched_fd, events) != 0
+}
+
+/// Compute the EPOLL-format ready bits for a single watched fd.
+///
+/// EPOLL uses Linux's bit assignments (EPOLLIN=0x001, EPOLLOUT=0x004,
+/// EPOLLERR=0x008, EPOLLHUP=0x010), but the kernel's POSIX poll uses
+/// wasi-libc's POLLOUT=0x002 (re-exported through abi/include/poll.h).
+/// They differ for POLLOUT, so we cannot bitwise-pass through — we
+/// project EPOLL → POLL on input and POLL → EPOLL on output.
+fn epoll_compute_watched_ready(
+    k: &mut Kernel,
+    caller_pid: u32,
+    watched_fd: u32,
+    events: u32,
+) -> u32 {
+    let mut poll_events: i16 = 0;
+    if events & EPOLLIN != 0 {
+        poll_events |= POLLIN;
+    }
+    if events & EPOLLOUT != 0 {
+        poll_events |= POLLOUT;
+    }
+    let revents = poll_revents_for_fd(k, caller_pid, watched_fd, poll_events);
+    if revents == POLLNVAL {
+        // Watched fd is gone / bad — report EPOLLERR. The cleanup
+        // pass on epoll_ctl(DEL) handles eventual eviction.
+        return EPOLLERR;
+    }
+    let mut out = 0u32;
+    if revents & POLLIN != 0 {
+        out |= EPOLLIN;
+    }
+    if revents & POLLOUT != 0 {
+        out |= EPOLLOUT;
+    }
+    if revents & POLLERR != 0 {
+        out |= EPOLLERR;
+    }
+    if revents & POLLHUP != 0 {
+        out |= EPOLLHUP;
+    }
+    // Mask to what the guest asked for plus the always-on EPOLL bits
+    // (EPOLLERR / EPOLLHUP fire even if not requested per Linux).
+    out & (events | EPOLLERR | EPOLLHUP)
 }
 
 fn isatty(caller_pid: u32, request: &[u8]) -> i64 {
@@ -1917,6 +2237,8 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             crate::kernel::FdEntry::EventFd { .. } => (0, 2, 0o020_600),
             // timerfd is also a character device (filetype 2), read-only.
             crate::kernel::FdEntry::TimerFd { .. } => (0, 2, 0o020_400),
+            // epoll is a character device (filetype 2), no read/write.
+            crate::kernel::FdEntry::EPoll { .. } => (0, 2, 0o020_000),
         };
         response[0..8].copy_from_slice(&size.to_le_bytes());
         response[8..12].copy_from_slice(&filetype.to_le_bytes());
