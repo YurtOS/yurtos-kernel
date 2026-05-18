@@ -3749,19 +3749,36 @@ fn signal_storage_round_trips_through_trampoline() {
     // asyncify/JSPI unwind and lands with the AsyncBridge integration.
     let mk = fresh_kernel_host_interface(0);
 
-    // sigaction(SIGTERM=15, SIG_IGN=1) → previous SIG_DFL=0.
-    let mut req = Vec::new();
-    req.extend_from_slice(&15_u32.to_le_bytes());
-    req.extend_from_slice(&1_u32.to_le_bytes());
-    let rc = mk.syscall(METHOD_SYS_SIGACTION, &req, &mut []).unwrap();
-    assert_eq!(rc, 0, "previous disposition was SIG_DFL");
-
-    // Replace with a user handler value; previous should be SIG_IGN=1.
-    let mut req2 = Vec::new();
-    req2.extend_from_slice(&15_u32.to_le_bytes());
-    req2.extend_from_slice(&0xDEAD_u32.to_le_bytes());
-    let rc = mk.syscall(METHOD_SYS_SIGACTION, &req2, &mut []).unwrap();
-    assert_eq!(rc, 1, "previous disposition was SIG_IGN");
+    // 20B request: [u32 sig][u32 handler][u64 sa_mask][u32 sa_flags]
+    let sa_req = |sig: u32, handler: u32| -> Vec<u8> {
+        let mut r = Vec::with_capacity(20);
+        r.extend_from_slice(&sig.to_le_bytes());
+        r.extend_from_slice(&handler.to_le_bytes());
+        r.extend_from_slice(&0u64.to_le_bytes()); // sa_mask
+        r.extend_from_slice(&0u32.to_le_bytes()); // sa_flags
+        r
+    };
+    // sigaction(SIGTERM=15, SIG_IGN=1): prior was SIG_DFL(0).
+    let mut resp = [0u8; 16];
+    let rc = mk
+        .syscall(METHOD_SYS_SIGACTION, &sa_req(15, 1), &mut resp)
+        .unwrap();
+    assert_eq!(rc, 16, "sigaction success returns 16 (bytes written)");
+    assert_eq!(
+        u32::from_le_bytes(resp[0..4].try_into().unwrap()),
+        0,
+        "previous disposition was SIG_DFL"
+    );
+    // Replace with user handler 0xDEAD: prior should be SIG_IGN(1).
+    let rc = mk
+        .syscall(METHOD_SYS_SIGACTION, &sa_req(15, 0xDEAD), &mut resp)
+        .unwrap();
+    assert_eq!(rc, 16);
+    assert_eq!(
+        u32::from_le_bytes(resp[0..4].try_into().unwrap()),
+        1,
+        "previous disposition was SIG_IGN"
+    );
 
     // kill(target=7, sig=0) is the alive-probe; nonexistent
     // processes return -ESRCH.

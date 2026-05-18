@@ -3,6 +3,7 @@ use crate::kernel::with_kernel;
 use crate::kh;
 use crate::path::PathResolver;
 
+use super::sigmask::{self, Pool};
 use super::{has_buffer_capacity, inc_entry_ref, read_u32_args, take_bytes, ID_NO_CHANGE};
 
 fn requested_id_allowed(requested: u32, allowed: &[u32]) -> bool {
@@ -839,17 +840,25 @@ pub fn kill_pid(target: u32, sig: u32) -> i64 {
     }
     with_kernel(|k| {
         let p = k.process_mut(target);
-        p.pending_signals |= 1u64 << (sig - 1);
+        let disp_ignored =
+            p.signal_dispositions[(sig - 1) as usize].handler == crate::kernel::SIG_IGN_HANDLER;
+        // Standard (bitmask) producer: a `false` here is only the
+        // SIG_IGN-discard case (POSIX success); no RT cap applies.
+        sigmask::pend(p, Pool::Process, sig, None, disp_ignored);
     });
     0
 }
 
 /// `sigqueue(pid, sig, value)` — POSIX real-time signal enqueue. The
 /// caller (`caller_pid`) is the sender. Separated-producer model: the
-/// RT signal lives ONLY in the target's `pending_rt` queue — it does
-/// NOT touch `pending_signals` (the kill/SIGCHLD bitmask), so a bit
+/// RT signal lives ONLY in the target's `pending.rt` queue — it does
+/// NOT touch `pending.standard` (the kill/SIGCHLD bitmask), so a bit
 /// set by `kill()` for the same signo is never clobbered when the RT
 /// queue later drains. `sigpending()` reports the union of both.
+/// Queue bound (kernel cap `KERNEL_RT_SIGNAL_QUEUE_CAP`, an
+/// RLIMIT_SIGPENDING stand-in) and SIG_IGN-discard are enforced
+/// by the shared `pend()` funnel; on a full RT queue this returns
+/// `-EAGAIN`.
 /// Consumption (`sigwaitinfo`/delivery) is gate-deferred.
 pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
     if request.len() < 12 {
@@ -874,88 +883,135 @@ pub(super) fn sigqueue(caller_pid: u32, request: &[u8]) -> i64 {
     }
     with_kernel(|k| {
         let p = k.process_mut(target);
-        // Bound the queue (Linux RLIMIT_SIGPENDING). The consumer
-        // (sigwaitinfo/delivery) is gate-deferred, so without this an
-        // unprivileged guest looping sigqueue would grow kernel memory
-        // without bound.
-        if p.pending_rt.len() >= crate::kernel::KERNEL_RT_SIGNAL_QUEUE_CAP {
+        let disp_ignored =
+            p.signal_dispositions[(sig - 1) as usize].handler == crate::kernel::SIG_IGN_HANDLER;
+        let pended = sigmask::pend(
+            p,
+            Pool::Process,
+            sig,
+            Some(crate::kernel::RtSignal {
+                signo: sig,
+                value,
+                sender_pid: caller_pid,
+            }),
+            disp_ignored,
+        );
+        // sig-range, target-existence and sig==0 were validated above,
+        // so the only `!pended && !disp_ignored` cause is the RT queue
+        // at KERNEL_RT_SIGNAL_QUEUE_CAP (pend() taxonomy (d)) → EAGAIN.
+        // disp_ignored ⇒ SIG_IGN discard ⇒ POSIX success (return 0).
+        if !pended && !disp_ignored {
             return -(abi::EAGAIN as i64);
         }
-        p.pending_rt.push_back(crate::kernel::RtSignal {
-            signo: sig,
-            value,
-            sender_pid: caller_pid,
-        });
-        // RT signals live ONLY in pending_rt — do not touch
-        // pending_signals (the kill/SIGCHLD bitmask). sigpending()
-        // reports the union, so a bit set by kill() for the same signo
-        // is never clobbered when the RT queue later drains.
         0
     })
 }
 
-/// `sigwaitinfo(set)` — non-blocking RT-signal dequeue (B1.8-b).
-/// Returns the oldest queued signal whose bit is in `set` and its
-/// siginfo, removing it from the RT queue only. The kill/SIGCHLD
-/// bitmask is left untouched (separate producer). True blocking
-/// (suspend until a signal arrives) is gate-deferred — absent a
-/// pending match this is -EAGAIN.
-pub(super) fn sigwaitinfo(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+/// `sigwaitinfo(set)` — synchronous accept from the **two-pool**
+/// PendingSet, selected by request `set` (8B u64), REGARDLESS of the
+/// blocked mask (POSIX synchronous-accept; must NOT mutate the mask).
+/// Dual-pool removal priority: caller-THREAD pool first, then PROCESS
+/// pool; within a pool RT first (lowest-signo, FIFO among equal signo)
+/// then standard (lowest-signo). The accepted instance is removed from
+/// exactly the one pool it came from. siginfo (16B
+/// `[si_signo:i32][si_code:i32][si_pid:u32][si_value:i32]`): RT ⇒
+/// `{signo, SI_QUEUE=-1, sender_pid, value}`, standard ⇒
+/// `{signo, 0x80 (SI_KERNEL), 0, 0}`. None matching ⇒ `-EAGAIN`.
+/// True blocking is gate-deferred (own slice).
+pub(super) fn sigwaitinfo(ctx: super::DispatchContext, request: &[u8], response: &mut [u8]) -> i64 {
     if request.len() < 8 || response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
     let set = u64::from_le_bytes(request[0..8].try_into().expect("8 bytes"));
     with_kernel(|k| {
-        if !k.has_process(caller_pid) {
+        if !k.has_process(ctx.caller_pid) {
             return -(abi::ESRCH as i64);
         }
-        let p = k.process_mut(caller_pid);
-        // The `1..=64` guard is defensive only: the sole producer
-        // (`sigqueue`) rejects signo>64 before push_back, so a stored
-        // entry is always in range — it can never reject a real entry.
-        let Some(idx) = p
-            .pending_rt
-            .iter()
-            .position(|s| (1..=64).contains(&s.signo) && (set & (1u64 << (s.signo - 1))) != 0)
-        else {
-            return -(abi::EAGAIN as i64);
+        let p = k.process_mut(ctx.caller_pid);
+
+        // Accept one signal from `ps` by `set`: RT first (lowest signo,
+        // FIFO among equal signo), then standard (lowest signo). On a
+        // hit, mutates `ps` (removes the instance) and returns the
+        // 16-byte siginfo. Nested fn: no captures.
+        fn accept(ps: &mut crate::kernel::PendingSet, set: u64) -> Option<[u8; 16]> {
+            // RT: pick the matching entry with the smallest signo; ties
+            // broken by queue order (earliest index = FIFO).
+            let mut best: Option<(usize, u32)> = None;
+            for (i, s) in ps.rt.iter().enumerate() {
+                if (1..=64).contains(&s.signo) && set & (1u64 << (s.signo - 1)) != 0 {
+                    match best {
+                        Some((_, bs)) if s.signo >= bs => {}
+                        _ => best = Some((i, s.signo)),
+                    }
+                }
+            }
+            if let Some((idx, _)) = best {
+                let s = ps.rt.remove(idx).expect("idx from scan");
+                let mut o = [0u8; 16];
+                o[0..4].copy_from_slice(&(s.signo as i32).to_le_bytes());
+                o[4..8].copy_from_slice(&(-1i32).to_le_bytes()); // SI_QUEUE
+                o[8..12].copy_from_slice(&s.sender_pid.to_le_bytes());
+                o[12..16].copy_from_slice(&s.value.to_le_bytes());
+                return Some(o);
+            }
+            // standard: lowest signo whose bit is in both standard & set.
+            let cand = ps.standard & set;
+            if cand != 0 {
+                let signo = cand.trailing_zeros() + 1;
+                ps.standard &= !(1u64 << (signo - 1));
+                let mut o = [0u8; 16];
+                o[0..4].copy_from_slice(&(signo as i32).to_le_bytes());
+                o[4..8].copy_from_slice(&(0x80i32).to_le_bytes()); // SI_KERNEL
+                o[8..12].copy_from_slice(&0u32.to_le_bytes());
+                o[12..16].copy_from_slice(&0i32.to_le_bytes());
+                return Some(o);
+            }
+            None
+        }
+
+        // Thread pool first, then process pool.
+        let thread_hit = p
+            .threads
+            .get_mut(&ctx.caller_tid)
+            .and_then(|t| accept(&mut t.pending, set));
+        let picked = match thread_hit {
+            Some(o) => Some(o),
+            None => accept(&mut p.pending, set),
         };
-        let sig = p.pending_rt.remove(idx).expect("idx from position");
-        // Do NOT clear pending_signals here: that bitmask is owned by
-        // kill()/SIGCHLD, not by the RT queue. The same signo set by
-        // kill() must stay pending after the RT entry drains.
-        // sigpending() derives RT-pending from pending_rt directly.
-        const SI_QUEUE: i32 = -1;
-        response[0..4].copy_from_slice(&(sig.signo as i32).to_le_bytes());
-        response[4..8].copy_from_slice(&SI_QUEUE.to_le_bytes());
-        response[8..12].copy_from_slice(&sig.sender_pid.to_le_bytes());
-        response[12..16].copy_from_slice(&sig.value.to_le_bytes());
-        16
+        match picked {
+            Some(o) => {
+                response[0..16].copy_from_slice(&o);
+                16
+            }
+            None => -(abi::EAGAIN as i64),
+        }
     })
 }
 
-/// `sigpending()` — the caller's pending-signal set as a u64 bitmask
-/// (bit sig-1): the union of the kill/SIGCHLD bitmask and the RT
-/// queue (`pending_rt`). Pure read.
-pub(super) fn sigpending(caller_pid: u32, response: &mut [u8]) -> i64 {
+/// `sigpending()` — caller's pending set as a u64 bitmask (bit sig-1):
+/// the **two-pool** union — process pool ∪ caller-THREAD pool, each
+/// `standard` ORed with bits derived from its RT queue. Pure read.
+pub(super) fn sigpending(ctx: super::DispatchContext, response: &mut [u8]) -> i64 {
     if response.len() < 8 {
         return -(abi::EINVAL as i64);
     }
     with_kernel(|k| {
-        if !k.has_process(caller_pid) {
+        if !k.has_process(ctx.caller_pid) {
             return -(abi::ESRCH as i64);
         }
-        let p = k.process_mut(caller_pid);
-        // Union of the kill/SIGCHLD bitmask and RT-queued signals.
-        // RT pending is derived from pending_rt so it never collides
-        // with bits other producers set for the same signo.
-        let mut mask = p.pending_signals;
-        for s in &p.pending_rt {
-            // Defensive only — `sigqueue` enforces signo in 1..=64 at
-            // enqueue, so stored entries are always in range.
-            if (1..=64).contains(&s.signo) {
-                mask |= 1u64 << (s.signo - 1);
+        let p = k.process_mut(ctx.caller_pid);
+        let rt_bits = |q: &std::collections::VecDeque<crate::kernel::RtSignal>| {
+            let mut m = 0u64;
+            for s in q {
+                if (1..=64).contains(&s.signo) {
+                    m |= 1u64 << (s.signo - 1);
+                }
             }
+            m
+        };
+        let mut mask = p.pending.standard | rt_bits(&p.pending.rt);
+        if let Some(t) = p.threads.get(&ctx.caller_tid) {
+            mask |= t.pending.standard | rt_bits(&t.pending.rt);
         }
         response[0..8].copy_from_slice(&mask.to_le_bytes());
         8
@@ -1012,30 +1068,59 @@ pub(super) fn killpg_request(caller_pid: u32, request: &[u8]) -> i64 {
         }
         if sig != 0 {
             for member in permitted {
-                k.process_mut(member).pending_signals |= 1u64 << (sig - 1);
+                let p = k.process_mut(member);
+                let disp_ignored = p.signal_dispositions[(sig - 1) as usize].handler
+                    == crate::kernel::SIG_IGN_HANDLER;
+                // Per-member SIG_IGN-drop is silent POSIX success
+                // (killpg succeeds if ≥1 member was permitted).
+                sigmask::pend(p, Pool::Process, sig, None, disp_ignored);
             }
         }
         0
     })
 }
 
-/// `sigaction(sig, disposition) -> previous_disposition`. Disposition
-/// encoding is opaque to the kernel: 0/1 are SIG_DFL/SIG_IGN by
-/// convention, anything else is a user-side handler value (typically
-/// a wasm function table index). The kernel stores per-pid; user-side
-/// libc wraps invocation when delivery lands.
-pub(super) fn sigaction(caller_pid: u32, request: &[u8]) -> i64 {
-    let Some([sig, disposition]) = read_u32_args::<2>(request) else {
-        return -(abi::EINVAL as i64);
-    };
-    if !(1..=64).contains(&sig) {
+/// `sigaction(sig, &act) -> prior`. Evolved-in-place (co-versioned
+/// in-tree ABI; method id unchanged): request
+/// `[sig:u32][handler:u32][sa_mask:u64][sa_flags:u32]` (20 bytes),
+/// response = prior `[handler:u32][sa_mask:u64][sa_flags:u32]` (16
+/// bytes), return = 16 on success. `handler` is opaque to the kernel
+/// (0=SIG_DFL, 1=SIG_IGN, else a guest function token). Per-process.
+/// SIGKILL(9)/SIGSTOP(19) have no settable disposition ⇒ `-EINVAL`.
+/// The exact `request.len()!=20` check is the wrap-safe length guard
+/// (no caller-sized field, so no `take_bytes` needed).
+/// Setting `handler` to `SIG_IGN` additionally discards all already-pending
+/// instances of `sig` process-wide (process pool + every thread pool;
+/// standard + RT) — POSIX/spec §2 state mutation, not delivery.
+pub(super) fn sigaction(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() != 20 || response.len() < 16 {
         return -(abi::EINVAL as i64);
     }
+    let sig = u32::from_le_bytes(request[0..4].try_into().expect("4"));
+    if !(1..=64).contains(&sig) || sig == 9 || sig == 19 {
+        return -(abi::EINVAL as i64);
+    } // SIGKILL/SIGSTOP
+    let h = u32::from_le_bytes(request[4..8].try_into().expect("4"));
+    let m = u64::from_le_bytes(request[8..16].try_into().expect("8"));
+    let f = u32::from_le_bytes(request[16..20].try_into().expect("4"));
     with_kernel(|k| {
-        let slot = &mut k.process_mut(caller_pid).signal_dispositions[(sig - 1) as usize];
-        let prev = *slot;
-        *slot = disposition;
-        prev as i64
+        let p = k.process_mut(caller_pid);
+        let prev = p.signal_dispositions[(sig - 1) as usize];
+        p.signal_dispositions[(sig - 1) as usize] = crate::kernel::SigDisposition {
+            handler: h,
+            sa_mask: m,
+            sa_flags: f,
+        };
+        // POSIX/spec §2: setting SIG_IGN discards already-pending
+        // instances of `sig` process-wide (process pool + every thread
+        // pool). State mutation only — delivery is (C).
+        if h == crate::kernel::SIG_IGN_HANDLER {
+            super::sigmask::purge_ignored(p, sig);
+        }
+        response[0..4].copy_from_slice(&prev.handler.to_le_bytes());
+        response[4..12].copy_from_slice(&prev.sa_mask.to_le_bytes());
+        response[12..16].copy_from_slice(&prev.sa_flags.to_le_bytes());
+        16
     })
 }
 
@@ -1172,7 +1257,7 @@ pub fn record_exit(request: &[u8]) -> i64 {
         // signal. Same pending-bit convention as kill_pid.
         let ppid = k.process_mut(pid).ppid;
         if ppid != 0 && k.has_process(ppid) {
-            k.process_mut(ppid).pending_signals |= 1u64 << (SIGCHLD - 1);
+            k.process_mut(ppid).pending.standard |= 1u64 << (SIGCHLD - 1);
         }
         0
     })
@@ -1490,6 +1575,8 @@ pub(super) fn sys_spawn(caller_pid: u32, request: &[u8]) -> i64 {
             child.sid = parent_sid;
             child.signal_dispositions = parent_signal_dispositions;
         }
+        // execve POSIX: reset caught dispositions to SIG_DFL, keep SIG_IGN.
+        k.process_mut(child_pid).exec_reset_signal_state();
         let parent = k.process_mut(caller_pid);
         if !parent.children.contains(&child_pid) {
             parent.children.push(child_pid);

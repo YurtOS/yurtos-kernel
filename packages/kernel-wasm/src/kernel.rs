@@ -45,7 +45,7 @@ pub const KERNEL_BUFFER_CAP: usize = 64 * 1024;
 /// Maximum queued descriptor-rights records on one AF_UNIX socket.
 pub const KERNEL_RIGHTS_QUEUE_CAP: usize = 1024;
 
-/// Sanity bound on a process's queued real-time signals (`pending_rt`),
+/// Sanity bound on a process's queued real-time signals (`pending.rt`),
 /// mirroring Linux `RLIMIT_SIGPENDING`. `sigqueue` returns `-EAGAIN`
 /// once a target is at this cap, so a guest looping `sigqueue` cannot
 /// grow kernel memory without bound while the consumer
@@ -92,12 +92,15 @@ pub struct ThreadRecord {
     /// guest performs the actual unwind/exit; the kernel only owns the
     /// pending-cancel state.
     pub cancel_requested: bool,
+    pub blocked_signals: u64,
+    pub pending: PendingSet,
 }
 
 impl ThreadRecord {
-    fn main(host_thread_handle: Option<i32>) -> Self {
+    /// The ONLY ThreadRecord constructor — the single init-contract funnel.
+    pub fn new(tid: Tid, host_thread_handle: Option<i32>, blocked_signals: u64) -> Self {
         Self {
-            tid: MAIN_THREAD_TID,
+            tid,
             state: ThreadState::Runnable,
             detached: false,
             exit_value: None,
@@ -105,7 +108,12 @@ impl ThreadRecord {
             wait_reason: None,
             waiter_tid: None,
             cancel_requested: false,
+            blocked_signals,
+            pending: PendingSet::empty(),
         }
+    }
+    pub fn main(host_thread_handle: Option<i32>) -> Self {
+        Self::new(MAIN_THREAD_TID, host_thread_handle, 0)
     }
 }
 
@@ -354,6 +362,37 @@ pub enum CwdRefresh {
     Degraded(Cwd),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PendingSet {
+    /// Standard signals: coalesced, bit `1<<(sig-1)`.
+    pub standard: u64,
+    /// RT signals: queued with multiplicity + siginfo.
+    pub rt: std::collections::VecDeque<RtSignal>,
+}
+impl PendingSet {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.standard == 0 && self.rt.is_empty()
+    }
+}
+
+/// Opaque `SigDisposition.handler` encoding: 0 = SIG_DFL, 1 = SIG_IGN,
+/// anything else = a guest function token. Named so Tasks 5–8 don't
+/// re-spell the bare `1`.
+pub const SIG_DFL_HANDLER: u32 = 0;
+pub const SIG_IGN_HANDLER: u32 = 1;
+
+// 0 = SIG_DFL for all fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SigDisposition {
+    pub handler: u32,
+    pub sa_mask: u64,
+    pub sa_flags: u32,
+}
+
 #[derive(Clone, Debug)]
 pub struct Process {
     pub umask: u16,
@@ -392,25 +431,15 @@ pub struct Process {
     pub pgid: Pid,
     /// POSIX session id. Same default-to-pid convention as `pgid`.
     pub sid: Pid,
-    /// Pending signals as a bitmask: bit (sig-1) is set when sig is
-    /// queued for delivery. Phase 2 records but does not deliver —
-    /// delivery requires asyncify/JSPI unwind which lands later. Sig
-    /// numbers 1..=64 use bits 0..=63 (sig 64 == SIGRTMAX → bit 63,
-    /// the top bit of this u64 — fits exactly, no widening needed).
-    pub pending_signals: u64,
-    /// POSIX real-time signal queue (`sigqueue`). Unlike the bitmask,
-    /// RT signals are *queued with multiplicity* and carry a payload +
-    /// sender. Separated-producer model: this queue is the SOLE store
-    /// for RT signals — it does NOT also set `pending_signals` (that
-    /// bitmask is owned by kill/SIGCHLD). `sigpending()` returns the
-    /// read-time union of both, so neither producer clobbers the other.
-    /// Consumption (`sigwaitinfo`/delivery) is gate-deferred (B1.8-b).
-    pub pending_rt: VecDeque<RtSignal>,
+    /// Pending signals: standard bitmask (bit sig-1) plus RT queue.
+    /// POSIX two-pool model: standard signals are coalesced; RT signals
+    /// are queued with multiplicity. `sigpending()` returns the union.
+    pub pending: PendingSet,
     /// Per-signal disposition. Index `sig - 1` for sig in 1..=64
-    /// (sig 64 == SIGRTMAX → index 63). 0 = SIG_DFL, 1 = SIG_IGN,
-    /// anything else is an opaque user-side handler value (typically
-    /// a wasm function table index).
-    pub signal_dispositions: [u32; 64],
+    /// (sig 64 = SIGRTMAX → index 63). `handler` 0 = SIG_DFL,
+    /// 1 = SIG_IGN, anything else is an opaque user-side handler value
+    /// (typically a wasm function table index).
+    pub signal_dispositions: [SigDisposition; 64],
     /// Times the process has called `sys_sched_yield`. Phase 2
     /// observability hook — real cooperative scheduling lands with
     /// the AsyncBridge integration; tests use this to assert that
@@ -491,9 +520,8 @@ impl Default for Process {
             scheduler_priority: 0,
             pgid: 0,
             sid: 0,
-            pending_signals: 0,
-            pending_rt: VecDeque::new(),
-            signal_dispositions: [0; 64],
+            pending: PendingSet::empty(),
+            signal_dispositions: [SigDisposition::default(); 64],
             yield_count: 0,
             last_nanosleep_ns: 0,
             argv: Vec::new(),
@@ -529,6 +557,15 @@ impl Process {
             .map(|(soft, _)| soft)
             .unwrap_or(u64::MAX);
         self.fd_table.lowest_free_fd_below(0, soft)
+    }
+
+    /// execve POSIX: caught dispositions reset to SIG_DFL, SIG_IGN kept.
+    pub fn exec_reset_signal_state(&mut self) {
+        for d in self.signal_dispositions.iter_mut() {
+            if d.handler != SIG_IGN_HANDLER {
+                *d = SigDisposition::default();
+            }
+        }
     }
 }
 
@@ -835,6 +872,12 @@ impl Kernel {
         if parent.threads.len() > 1 {
             return Err(crate::abi::EAGAIN);
         }
+        // Capture parent main thread's signal mask before clone consumes the borrow.
+        let parent_main_mask = parent
+            .threads
+            .get(&MAIN_THREAD_TID)
+            .map(|t| t.blocked_signals)
+            .unwrap_or(0);
         let mut child = parent.clone();
         let Some(child_pid) = self.try_alloc_host_pid() else {
             return Err(crate::abi::EAGAIN);
@@ -850,15 +893,16 @@ impl Kernel {
         // POSIX: the child starts with an EMPTY pending signal set —
         // both the standard bitmask and the RT queue (PR #54 review P2;
         // pending_rt was added after this clone path and was missed).
-        child.pending_signals = 0;
-        child.pending_rt.clear();
+        child.pending = PendingSet::empty();
         child.stdin_buffer.clear();
         child.stdout_buffer.clear();
         child.stderr_buffer.clear();
         child.threads.clear();
-        child
-            .threads
-            .insert(MAIN_THREAD_TID, ThreadRecord::main(None));
+        // POSIX fork: child inherits the parent's signal mask on its main thread.
+        child.threads.insert(
+            MAIN_THREAD_TID,
+            ThreadRecord::new(MAIN_THREAD_TID, None, parent_main_mask),
+        );
         child.next_tid = FIRST_WORKER_TID;
         child.fork_state = ProcessForkState::ForkPreparing { parent_pid };
 
@@ -1683,7 +1727,8 @@ impl Kernel {
 
     pub fn spawn_thread(&mut self, pid: Pid, host_thread_handle: Option<i32>) -> Option<Tid> {
         let tid = self.reserve_thread_id(pid).ok()?;
-        self.bind_thread_handle(pid, tid, host_thread_handle).ok()?;
+        self.bind_thread_handle(pid, tid, host_thread_handle, MAIN_THREAD_TID)
+            .ok()?;
         Some(tid)
     }
 
@@ -1711,24 +1756,20 @@ impl Kernel {
         pid: Pid,
         tid: Tid,
         host_thread_handle: Option<i32>,
+        creator_tid: Tid,
     ) -> Result<(), i32> {
         let p = self.processes.get_mut(&pid).ok_or(crate::abi::ESRCH)?;
         if p.threads.contains_key(&tid) {
             return Err(crate::abi::EEXIST);
         }
-        p.threads.insert(
-            tid,
-            ThreadRecord {
-                tid,
-                state: ThreadState::Runnable,
-                detached: false,
-                exit_value: None,
-                host_thread_handle,
-                wait_reason: None,
-                waiter_tid: None,
-                cancel_requested: false,
-            },
-        );
+        let inherited = p
+            .threads
+            .get(&creator_tid)
+            .or_else(|| p.threads.get(&MAIN_THREAD_TID))
+            .map(|t| t.blocked_signals)
+            .unwrap_or(0);
+        p.threads
+            .insert(tid, ThreadRecord::new(tid, host_thread_handle, inherited));
         Ok(())
     }
 

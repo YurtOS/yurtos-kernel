@@ -269,6 +269,9 @@ mod sys_method_id {
     pub const KILL: u32 = 0x1_001B;
     pub const KILLPG: u32 = 0x1_0053;
     pub const SIGACTION: u32 = 0x1_001C;
+    pub const SIGPROCMASK: u32 = 0x1_00B4;
+    pub const SIGNAL_RAISE: u32 = 0x1_00B5;
+    pub const SIGNAL_QUERY: u32 = 0x1_00B6;
     pub const SCHED_YIELD: u32 = 0x1_001D;
     pub const NANOSLEEP: u32 = 0x1_001E;
     pub const OPEN: u32 = 0x1_001F;
@@ -3721,6 +3724,146 @@ fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "host_thread_yield",
         |mut caller: Caller<'_, UserState>| -> i32 {
             thread_syscall_from_user(&mut caller, sys_method_id::THREAD_YIELD, &[], &mut []) as i32
+        },
+    )?;
+    // signal-state (#90 B): kernel-owned signal forwarding (per-thread)
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_sigprocmask",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: i32,
+         req_len: i32,
+         out_ptr: i32,
+         out_cap: i32|
+         -> i32 {
+            let request = match read_user_guest_bytes(&mut caller, req_ptr as u32, req_len as u32) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let out_cap = match checked_guest_buffer_len(out_cap as u32) {
+                Ok(n) => n,
+                Err(rc) => return rc as i32,
+            };
+            let mut response = vec![0u8; out_cap];
+            let rc = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::SIGPROCMASK,
+                &request,
+                &mut response,
+            );
+            if rc <= 0 {
+                return rc as i32;
+            }
+            let to_write = (rc as usize).min(response.len());
+            if to_write > 0
+                && write_user_guest_bytes(&mut caller, out_ptr as u32, &response[..to_write])
+                    .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+            rc as i32
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_signal_raise",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: i32,
+         req_len: i32,
+         out_ptr: i32,
+         out_cap: i32|
+         -> i32 {
+            let request = match read_user_guest_bytes(&mut caller, req_ptr as u32, req_len as u32) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let out_cap = match checked_guest_buffer_len(out_cap as u32) {
+                Ok(n) => n,
+                Err(rc) => return rc as i32,
+            };
+            let mut response = vec![0u8; out_cap];
+            let rc = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::SIGNAL_RAISE,
+                &request,
+                &mut response,
+            );
+            if rc <= 0 {
+                return rc as i32;
+            }
+            let to_write = (rc as usize).min(response.len());
+            if to_write > 0
+                && write_user_guest_bytes(&mut caller, out_ptr as u32, &response[..to_write])
+                    .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+            rc as i32
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_sigaction",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: i32,
+         req_len: i32,
+         out_ptr: i32,
+         out_cap: i32|
+         -> i32 {
+            let request = match read_user_guest_bytes(&mut caller, req_ptr as u32, req_len as u32) {
+                Ok(buf) => buf,
+                Err(rc) => return rc as i32,
+            };
+            let out_cap = match checked_guest_buffer_len(out_cap as u32) {
+                Ok(n) => n,
+                Err(rc) => return rc as i32,
+            };
+            let mut response = vec![0u8; out_cap];
+            let rc = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::SIGACTION,
+                &request,
+                &mut response,
+            );
+            if rc <= 0 {
+                return rc as i32;
+            }
+            let to_write = (rc as usize).min(response.len());
+            if to_write > 0
+                && write_user_guest_bytes(&mut caller, out_ptr as u32, &response[..to_write])
+                    .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+            rc as i32
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_signal_query",
+        |mut caller: Caller<'_, UserState>, out_ptr: i32, out_cap: i32| -> i32 {
+            let out_cap = match checked_guest_buffer_len(out_cap as u32) {
+                Ok(n) => n,
+                Err(rc) => return rc as i32,
+            };
+            let mut response = vec![0u8; out_cap];
+            let rc = thread_syscall_from_user(
+                &mut caller,
+                sys_method_id::SIGNAL_QUERY,
+                &[],
+                &mut response,
+            );
+            if rc <= 0 {
+                return rc as i32;
+            }
+            let to_write = (rc as usize).min(response.len());
+            if to_write > 0
+                && write_user_guest_bytes(&mut caller, out_ptr as u32, &response[..to_write])
+                    .is_err()
+            {
+                return -(EFAULT as i32);
+            }
+            rc as i32
         },
     )?;
     Ok(())

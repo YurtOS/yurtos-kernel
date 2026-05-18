@@ -1,9 +1,9 @@
 canary = "signal-canary"
-summary = "Round-trip the guest-local signal mask (§Runtime Semantics > Signals)."
+summary = "Round-trip the kernel-owned per-thread blocked-signal mask (§Runtime Semantics > Signals)."
 
 [[case]]
 name = "sigprocmask_roundtrip"
 inputs = "SIG_SETMASK(SIGUSR1) then SIG_SETMASK(NULL, &old)"
 expected.exit = 0
 expected.stdout = "sigprocmask:roundtrip"
-expected.note = "guest-local mask only; no observation of external signals"
+expected.note = "mask is kernel-owned per calling thread (sys_sigprocmask); the round-trip observes the kernel's stored mask, not a per-guest in-process copy"

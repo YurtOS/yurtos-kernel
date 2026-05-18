@@ -345,6 +345,19 @@ int yurt_host_setsid(void);
 __attribute__((import_module("yurt"), import_name("host_killpg")))
 int yurt_host_killpg(int pgid, int sig);
 
+/* signal-state (#90 B): kernel-owned signal forwarding */
+__attribute__((import_module("yurt"), import_name("host_sigaction")))
+int yurt_host_sigaction(int req_ptr, int req_len, int out_ptr, int out_cap);
+
+__attribute__((import_module("yurt"), import_name("host_sigprocmask")))
+int yurt_host_sigprocmask(int req_ptr, int req_len, int out_ptr, int out_cap);
+
+__attribute__((import_module("yurt"), import_name("host_signal_raise")))
+int yurt_host_signal_raise(int req_ptr, int req_len, int out_ptr, int out_cap);
+
+__attribute__((import_module("yurt"), import_name("host_signal_query")))
+int yurt_host_signal_query(int out_ptr, int out_cap);
+
 /* TTY ─────────────────────────────────────────────────────────────────────
  * These bridge libc terminal APIs to the kernel's TTY state so shells can
  * call isatty()/tcgetpgrp()/tcsetpgrp() and get sensible answers. */

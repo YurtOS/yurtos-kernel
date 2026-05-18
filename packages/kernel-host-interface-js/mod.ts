@@ -153,6 +153,9 @@ export const METHOD = {
   SYS_KILL: 0x1_001B,
   SYS_KILLPG: 0x1_0053,
   SYS_SIGACTION: 0x1_001C,
+  SYS_SIGPROCMASK: 0x1_00B4,
+  SYS_SIGNAL_RAISE: 0x1_00B5,
+  SYS_SIGNAL_QUERY: 0x1_00B6,
   SYS_SCHED_YIELD: 0x1_001D,
   SYS_NANOSLEEP: 0x1_001E,
   SYS_OPEN: 0x1_001F,
@@ -609,6 +612,10 @@ const USER_YURT_STUB_IMPORTS = [
   "host_setrlimit",
   "host_setsid",
   "host_setjmp",
+  "host_sigaction",
+  "host_signal_query",
+  "host_signal_raise",
+  "host_sigprocmask",
   "host_socket_accept",
   "host_socket_addr",
   "host_socket_close",
@@ -1947,6 +1954,52 @@ function buildUserYurtImports(
     const copyRc = copyOut(outPtrN, resultBytes);
     if (copyRc < 0) return copyRc;
     return 16;
+  };
+  imports.host_sigaction = (reqPtr, reqLen, outPtr, outCap) => {
+    const req = copyIn(Number(reqPtr), Number(reqLen));
+    if (typeof req === "number") return req;
+    const { rc, response } = threadSyscall(
+      METHOD.SYS_SIGACTION,
+      req,
+      Number(outCap),
+    );
+    if (rc <= 0) return rc;
+    const copied = copyOut(Number(outPtr), response.subarray(0, rc));
+    return copied < 0 ? copied : rc;
+  };
+  imports.host_sigprocmask = (reqPtr, reqLen, outPtr, outCap) => {
+    const req = copyIn(Number(reqPtr), Number(reqLen));
+    if (typeof req === "number") return req;
+    const { rc, response } = threadSyscall(
+      METHOD.SYS_SIGPROCMASK,
+      req,
+      Number(outCap),
+    );
+    if (rc <= 0) return rc;
+    const copied = copyOut(Number(outPtr), response.subarray(0, rc));
+    return copied < 0 ? copied : rc;
+  };
+  imports.host_signal_raise = (reqPtr, reqLen, outPtr, outCap) => {
+    const req = copyIn(Number(reqPtr), Number(reqLen));
+    if (typeof req === "number") return req;
+    const { rc, response } = threadSyscall(
+      METHOD.SYS_SIGNAL_RAISE,
+      req,
+      Number(outCap),
+    );
+    if (rc <= 0) return rc;
+    const copied = copyOut(Number(outPtr), response.subarray(0, rc));
+    return copied < 0 ? copied : rc;
+  };
+  imports.host_signal_query = (outPtr, outCap) => {
+    const { rc, response } = threadSyscall(
+      METHOD.SYS_SIGNAL_QUERY,
+      new Uint8Array(0),
+      Number(outCap),
+    );
+    if (rc <= 0) return rc;
+    const copied = copyOut(Number(outPtr), response.subarray(0, rc));
+    return copied < 0 ? copied : rc;
   };
   const scalar = (method: number) => () =>
     Number(kernel.syscall(method, pid, new Uint8Array(0), 0).rc);
