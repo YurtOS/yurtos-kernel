@@ -53,6 +53,7 @@ LIB_OBJS := \
   $(BUILD_DIR)/yurt_dl_main.o \
   $(BUILD_DIR)/yurt_dlfcn.o \
   $(BUILD_DIR)/yurt_dup.o \
+  $(BUILD_DIR)/yurt_epoll.o \
   $(BUILD_DIR)/yurt_exec.o \
   $(BUILD_DIR)/yurt_fnmatch.o \
   $(BUILD_DIR)/yurt_fs.o \

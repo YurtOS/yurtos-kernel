@@ -21,6 +21,34 @@ int yurt_host_file_lock(int fd, int operation);
 __attribute__((import_module("yurt"), import_name("host_poll")))
 int yurt_host_poll(int fds_ptr, int nfds, int timeout_ms);
 
+/* MUST equal kernel-host-interface-core MAX_GUEST_BUFFER_LEN (1 MiB);
+ * a Rust parity test (#91 plan D2) asserts the two stay equal. Used by
+ * the ppoll() guest shim to bound request length before malloc'ing. */
+#define YURT_MAX_REQUEST_LEN 1048576
+
+/* Readiness packed-buffer host imports (#91 + #92 — same shape):
+ * req_ptr/req_len point at the packed request, resp_ptr/resp_len at
+ * the response buffer. Return is i64: non-negative success / count,
+ * or a negated errno. The guest libc owns all marshalling; these
+ * host imports are dumb passthroughs. */
+__attribute__((import_module("yurt"), import_name("host_select")))
+long long yurt_host_select(int req_ptr, int req_len, int resp_ptr, int resp_len);
+
+__attribute__((import_module("yurt"), import_name("host_pselect")))
+long long yurt_host_pselect(int req_ptr, int req_len, int resp_ptr, int resp_len);
+
+__attribute__((import_module("yurt"), import_name("host_ppoll")))
+long long yurt_host_ppoll(int req_ptr, int req_len, int resp_ptr, int resp_len);
+
+__attribute__((import_module("yurt"), import_name("host_epoll_create1")))
+long long yurt_host_epoll_create1(int req_ptr, int req_len, int resp_ptr, int resp_len);
+
+__attribute__((import_module("yurt"), import_name("host_epoll_ctl")))
+long long yurt_host_epoll_ctl(int req_ptr, int req_len, int resp_ptr, int resp_len);
+
+__attribute__((import_module("yurt"), import_name("host_epoll_wait")))
+long long yurt_host_epoll_wait(int req_ptr, int req_len, int resp_ptr, int resp_len);
+
 __attribute__((import_module("yurt"), import_name("host_chmod")))
 int yurt_host_chmod(int path_ptr, int path_len, int mode);
 
