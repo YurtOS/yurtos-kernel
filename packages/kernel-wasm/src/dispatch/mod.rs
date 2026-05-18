@@ -399,9 +399,16 @@ fn dup_fd(caller_pid: u32, request: &[u8]) -> i64 {
             None => return -(abi::EBADF as i64),
         };
         inc_entry_ref(k, &entry);
-        let p = k.process_mut(caller_pid);
-        let newfd = p.fd_table.lowest_free_fd();
-        p.fd_table.install(newfd, entry);
+        // Bound by RLIMIT_NOFILE; undo the ref bump (and close the host
+        // handle if it was the last ref) when the process is at its
+        // soft limit so the dup leaves no leaked reference.
+        let Some(newfd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
+            if let Some(handle) = close_entry(k, entry) {
+                kh::socket_close(handle);
+            }
+            return -(abi::EMFILE as i64);
+        };
+        k.process_mut(caller_pid).fd_table.install(newfd, entry);
         newfd as i64
     })
 }
@@ -692,17 +699,30 @@ fn pipe(caller_pid: u32, response: &mut [u8]) -> i64 {
     }
     with_kernel(|k| {
         let id = k.create_pipe();
-        let p = k.process_mut(caller_pid);
-        let read_fd = p.fd_table.lowest_free_fd();
-        p.fd_table.install(
+        // Both ends are bounded by RLIMIT_NOFILE. On exhaustion the
+        // pipe object must be fully released so it never leaks: if the
+        // read end never installed, drop both ends; if it did, undo it
+        // before dropping the write end.
+        let Some(read_fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
+            k.pipe_dec_ref(id, crate::kernel::PipeEnd::Read);
+            k.pipe_dec_ref(id, crate::kernel::PipeEnd::Write);
+            return -(abi::EMFILE as i64);
+        };
+        k.process_mut(caller_pid).fd_table.install(
             read_fd,
             crate::kernel::FdEntry::Pipe {
                 id,
                 end: crate::kernel::PipeEnd::Read,
             },
         );
-        let write_fd = p.fd_table.lowest_free_fd();
-        p.fd_table.install(
+        let Some(write_fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
+            if let Some(entry) = k.process_mut(caller_pid).fd_table.remove(read_fd) {
+                close_entry(k, entry);
+            }
+            k.pipe_dec_ref(id, crate::kernel::PipeEnd::Write);
+            return -(abi::EMFILE as i64);
+        };
+        k.process_mut(caller_pid).fd_table.install(
             write_fd,
             crate::kernel::FdEntry::Pipe {
                 id,
