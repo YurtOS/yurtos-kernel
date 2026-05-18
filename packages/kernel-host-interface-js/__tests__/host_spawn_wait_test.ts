@@ -159,6 +159,30 @@ const WASM_D = hexToBytes(
 const WASM_E = hexToBytes(
   "0061736d0100000001100360047f7f7f7f017f60017f0060000002360204797572740a686f73745f737061776e000016776173695f736e617073686f745f70726576696577310970726f635f657869740001030201020503010001071302066d656d6f72790200065f737461727400020a11010f00410041d80041004100100010010b0b16010041000b1058000000010000000500000002000000",
 );
+/**
+ * Case (f): logicalSize=92, version=1, prog_off=100 (> 92), prog_len=2
+ * → -75 (EOVERFLOW: required prog span out-of-bounds).
+ *
+ * F2 parity oracle: native_abi.rs read_span: end(102) > bytes.len(92)
+ * → Err(Overflow) → errno -75.  Pre-fix JS returned -22 (treated OOB as
+ * null/absent then EINVAL); post-fix JS returns -75 matching native_abi.
+ */
+const WASM_F = hexToBytes(
+  "0061736d0100000001100360047f7f7f7f017f60017f0060000002360204797572740a686f73745f737061776e000016776173695f736e617073686f745f70726576696577310970726f635f657869740001030201020503010001071302066d656d6f72790200065f737461727400020a11010f00410041dc0041004100100010010b0b5a010041000b545c0000000100000064000000020000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+);
+/**
+ * Case (g): logicalSize=92, version=1, prog="/x"@offset88 (valid),
+ * argv0_off=200 (> 92), argv0_len=2 → -75 (EOVERFLOW: optional argv0
+ * span out-of-bounds MUST reject the spawn, NOT treat as absent).
+ *
+ * F2 parity oracle: native_abi.rs read_optional_string: end(202) > bytes.len(92)
+ * → Err(Overflow) → errno -75, spawn rejected.  Pre-fix JS treated OOB
+ * optional span as null/absent and PROCEEDED with the spawn (wrong errno,
+ * wrong accept/reject); post-fix JS returns -75 matching native_abi.
+ */
+const WASM_G = hexToBytes(
+  "0061736d0100000001100360047f7f7f7f017f60017f0060000002360204797572740a686f73745f737061776e000016776173695f736e617073686f745f70726576696577310970726f635f657869740001030201020503010001071302066d656d6f72790200065f737461727400020a11010f00410041dc0041004100100010010b0b62010041000b5c5c000000010000005800000002000000c800000002000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002f780000",
+);
 
 /**
  * Run a minimal wasm module (built with the pattern above) as a user process.
@@ -238,6 +262,34 @@ Deno.test("host_spawn returns clean errno for malformed yurt_spawn_request_v1 bu
       rc,
       -22,
       `case (e): expected -22 for misaligned prog span, got ${rc}`,
+    );
+  }
+
+  // (f) F2: prog span out-of-bounds (off=100 > logicalSize=92) → -75 (EOVERFLOW).
+  // Parity oracle: native_abi.rs read_span Err(Overflow) → errno -75.
+  // Pre-fix JS: returned -22 (OOB → null → EINVAL). Post-fix: -75.
+  {
+    const mk = await freshKernelHostInterface();
+    const rc = runMalformedSpawnCase(mk, WASM_F);
+    assertEquals(
+      rc,
+      -75,
+      `case (f) F2: expected -75 (EOVERFLOW) for OOB required prog span, got ${rc}`,
+    );
+  }
+
+  // (g) F2: optional argv0 span out-of-bounds (off=200 > logicalSize=92)
+  // → -75 (EOVERFLOW), spawn REJECTED (NOT treated as absent).
+  // Parity oracle: native_abi.rs read_optional_string Err(Overflow) → errno
+  // -75, spawn rejected.  Pre-fix JS: treated OOB optional as null/absent
+  // and PROCEEDED (wrong errno + wrong accept/reject). Post-fix: -75.
+  {
+    const mk = await freshKernelHostInterface();
+    const rc = runMalformedSpawnCase(mk, WASM_G);
+    assertEquals(
+      rc,
+      -75,
+      `case (g) F2: expected -75 (EOVERFLOW) for OOB optional argv0 span (must reject, not proceed), got ${rc}`,
     );
   }
 });

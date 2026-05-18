@@ -1772,26 +1772,36 @@ function buildUserYurtImports(
     if (version !== 1 || logicalSize < SPAWN_V1_SIZE) return -22; // EINVAL
     if (logicalSize > bytes.length) return -75; // EOVERFLOW
 
+    // Normative contract: packages/runtime-wasmtime/src/wasm/native_abi.rs
+    // is the single source of truth for span validation semantics.
+    // This JS decoder MUST be byte-identical to native_abi for every
+    // malformed-input case (errno + accept/reject decision).
+    //
     // Helper: read a span {u32 off, u32 len} relative to record start.
     // Returns null for an absent (0,0) span, -22 for a misaligned offset
     // (byte-parity with native_abi.rs read_span which returns Err(Invalid)
-    // when span_off is not a multiple of 4), or the span on success.
+    // when span_off is not a multiple of 4), -75 for an out-of-bounds span
+    // (byte-parity with native_abi.rs read_span Err(Overflow)), or the
+    // validated span on success.
     const readSpan = (
       off: number,
-    ): { off: number; len: number } | null | -22 => {
+    ): { off: number; len: number } | null | -22 | -75 => {
       const spanOff = hdr.getUint32(off, true);
       const spanLen = hdr.getUint32(off + 4, true);
       if (spanOff === 0 && spanLen === 0) return null;
       if (spanOff % 4 !== 0) return -22; // I1: align parity with native_abi.rs
+      // F2: out-of-bounds span → Overflow(-75), NOT null/absent.
+      // native_abi.rs read_span: end > bytes.len() → Err(Overflow) → errno -75.
+      if (spanOff + spanLen > logicalSize) return -75;
       return { off: spanOff, len: spanLen };
     };
     const readString = (
       spanOff: number,
-    ): string | null | -22 => {
+    ): string | null | -22 | -75 => {
       const span = readSpan(spanOff);
       if (span === null) return null;
       if (span === -22) return -22; // propagate alignment error
-      if (span.off + span.len > logicalSize) return null;
+      if (span === -75) return -75; // propagate overflow error (F2)
       return new TextDecoder().decode(
         bytes.subarray(span.off, span.off + span.len),
       );
@@ -1800,11 +1810,18 @@ function buildUserYurtImports(
     // prog (required, offset 8)
     const prog = readString(8);
     if (prog === -22) return -22; // misaligned span
+    // F2: OOB required prog span → -75 (EOVERFLOW), matching native_abi.rs
+    // read_span Err(Overflow) → errno -75.
+    if (prog === -75) return -75;
     if (prog === null || prog.length === 0) return -EINVAL;
 
-    // argv0 (optional, offset 16) — used as argv[0] if present
+    // argv0 (optional, offset 16) — used as argv[0] if present.
+    // F2 fix: OOB optional span → reject with -75 (NOT treat as absent).
+    // native_abi.rs read_optional_string: end > bytes.len() → Err(Overflow)
+    // → errno -75, spawn rejected.  A genuinely-absent span (0,0) → Ok(None).
     const argv0Raw = readString(16);
-    if (argv0Raw === -22) return -EINVAL; // misaligned optional span
+    if (argv0Raw === -22) return -22; // misaligned optional span
+    if (argv0Raw === -75) return -75; // F2: OOB optional span → reject, not absent
     const argv0: string | null = argv0Raw;
 
     // args_off (u32@24), args_count (u32@28) — args[1..] span-vector
