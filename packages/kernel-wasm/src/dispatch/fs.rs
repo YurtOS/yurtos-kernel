@@ -1724,6 +1724,57 @@ pub(super) fn sys_mkdirat(caller_pid: u32, request: &[u8]) -> i64 {
     mkdir(caller_pid, &resolved)
 }
 
+/// `fstatat(dirfd, path, statbuf, flag)` — #85 (Linux `newfstatat`).
+/// Request: `u32 dirfd LE + u32 flag LE + path bytes`; response is the
+/// 16-byte fstat-shaped record. dirfd resolves via the shared `*at`
+/// resolver (`resolve_at`, #85 S0). `AT_SYMLINK_NOFOLLOW` ⇒ `lstat`
+/// (don't follow the terminal symlink), otherwise `stat`. Other flag
+/// bits (incl. `AT_EMPTY_PATH`) are rejected `-EINVAL` for now.
+pub(super) fn sys_fstatat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let dirfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let flag = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    if flag & !AT_SYMLINK_NOFOLLOW != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let path = &request[8..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let resolved = match resolve_at(caller_pid, dirfd, path) {
+        Ok(p) => p,
+        Err(errno) => return -(errno as i64),
+    };
+    if flag & AT_SYMLINK_NOFOLLOW != 0 {
+        lstat_path(caller_pid, &resolved, response)
+    } else {
+        stat_path(caller_pid, &resolved, response)
+    }
+}
+
+/// `readlinkat(dirfd, path, buf, bufsize)` — #85. Request: `u32 dirfd
+/// LE + path bytes`; response is the symlink target (capacity =
+/// response length). dirfd resolves via the shared `*at` resolver
+/// (`resolve_at`, #85 S0); delegates to `readlink`.
+pub(super) fn sys_readlinkat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 4 {
+        return -(abi::EINVAL as i64);
+    }
+    let dirfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let path = &request[4..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let resolved = match resolve_at(caller_pid, dirfd, path) {
+        Ok(p) => p,
+        Err(errno) => return -(errno as i64),
+    };
+    readlink(caller_pid, &resolved, response)
+}
+
 /// Shared body for `sys_access` and `sys_faccessat`. Resolves the path
 /// (following symlinks unless AT_SYMLINK_NOFOLLOW), then checks the
 /// requested mode against the resolved file's metadata with the

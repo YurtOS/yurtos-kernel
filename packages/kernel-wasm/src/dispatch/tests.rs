@@ -13495,3 +13495,214 @@ fn unlinkat_mkdirat_error_paths() {
         -(abi::EINVAL as i64),
     );
 }
+
+// ---------------------------------------------------------------------------
+// #85 S2: fstatat / readlinkat — resolve dirfd via shared resolve_at (S0),
+// delegate to stat_path / lstat_path / readlink.
+// ---------------------------------------------------------------------------
+
+fn fstatat_req(dirfd: u32, flag: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&flag.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+fn readlinkat_req(dirfd: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(path);
+    req
+}
+
+const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+
+#[test]
+fn fstatat_follow_nofollow_and_at_fdcwd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/s2", &mut []), 0);
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_CREAT | O_WRITE, b"/s2/f"),
+            &mut []
+        ) >= 3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SYMLINK,
+            1,
+            &symlink_req2(b"/s2/f", b"/s2/lnk"),
+            &mut []
+        ),
+        0,
+    );
+    let dfd = open_dir(b"/s2");
+
+    // fstatat(dfd, 0, "f") → follows → REGULAR_FILE (4).
+    let mut st = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATAT, 1, &fstatat_req(dfd, 0, b"f"), &mut st),
+        16
+    );
+    assert_eq!(u32::from_le_bytes(st[8..12].try_into().unwrap()), 4);
+
+    // fstatat(dfd, 0, "lnk") → follows the symlink → REGULAR_FILE (4).
+    let mut st2 = [0u8; 16];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(dfd, 0, b"lnk"),
+            &mut st2
+        ),
+        16
+    );
+    assert_eq!(u32::from_le_bytes(st2[8..12].try_into().unwrap()), 4);
+
+    // fstatat(dfd, AT_SYMLINK_NOFOLLOW, "lnk") → SYMLINK (7).
+    let mut st3 = [0u8; 16];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(dfd, AT_SYMLINK_NOFOLLOW, b"lnk"),
+            &mut st3,
+        ),
+        16,
+    );
+    assert_eq!(u32::from_le_bytes(st3[8..12].try_into().unwrap()), 7);
+
+    // AT_FDCWD + absolute parity with plain stat.
+    let mut st4 = [0u8; 16];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0, b"/s2/f"),
+            &mut st4
+        ),
+        16,
+    );
+    assert_eq!(u32::from_le_bytes(st4[8..12].try_into().unwrap()), 4);
+
+    // Rename-stable (inherits resolve_at inode anchoring, #85 S0).
+    assert_eq!(
+        dispatch(METHOD_SYS_RENAME, 1, &rename_req2(b"/s2", b"/s2m"), &mut []),
+        0,
+    );
+    let mut st5 = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATAT, 1, &fstatat_req(dfd, 0, b"f"), &mut st5),
+        16
+    );
+    assert_eq!(u32::from_le_bytes(st5[8..12].try_into().unwrap()), 4);
+}
+
+#[test]
+fn readlinkat_via_dirfd_and_errors() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/s2r", &mut []), 0);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SYMLINK,
+            1,
+            &symlink_req2(b"/target/x", b"/s2r/lnk"),
+            &mut []
+        ),
+        0,
+    );
+    let dfd = open_dir(b"/s2r");
+
+    let mut buf = [0u8; 32];
+    let n = dispatch(
+        METHOD_SYS_READLINKAT,
+        1,
+        &readlinkat_req(dfd, b"lnk"),
+        &mut buf,
+    );
+    assert!(n > 0, "readlinkat returned {n}");
+    assert_eq!(&buf[..n as usize], b"/target/x");
+
+    // AT_FDCWD + absolute parity.
+    let mut buf2 = [0u8; 32];
+    let n2 = dispatch(
+        METHOD_SYS_READLINKAT,
+        1,
+        &readlinkat_req(AT_FDCWD, b"/s2r/lnk"),
+        &mut buf2,
+    );
+    assert_eq!(&buf2[..n2 as usize], b"/target/x");
+
+    // Unknown dirfd → EBADF; short request → EINVAL.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_READLINKAT,
+            1,
+            &readlinkat_req(4242, b"lnk"),
+            &mut [0u8; 8]
+        ),
+        -(abi::EBADF as i64),
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATAT, 1, &[0u8; 4], &mut [0u8; 16]),
+        -(abi::EINVAL as i64),
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x4000, b"/s2r"),
+            &mut [0u8; 16]
+        ),
+        -(abi::EINVAL as i64),
+    );
+}
+
+/// #85 S2: every flag bit other than `AT_SYMLINK_NOFOLLOW` (incl.
+/// `AT_EMPTY_PATH = 0x1000`, the dirfd-as-target form documented as a
+/// follow-up in the ABI doc) must surface `-EINVAL` rather than being
+/// silently ignored. Mirrors sys_unlinkat's `AT_REMOVEDIR`-only guard
+/// from #194 — kept in its own test so a future code change relaxing
+/// the guard trips the right named assertion in CI output.
+#[test]
+fn fstatat_unsupported_flag_bits_are_einval() {
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut buf = [0u8; 16];
+    // AT_EMPTY_PATH (0x1000) — documented Linux dirfd-target flag,
+    // explicitly out of scope for S2.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x1000, b"/"),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64),
+        "AT_EMPTY_PATH must reject until S2-follow-up implements it",
+    );
+    // A bit outside the entire AT_* range — defensive.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x8000_0000, b"/"),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64),
+        "any flag bit outside AT_SYMLINK_NOFOLLOW must reject",
+    );
+    // AT_SYMLINK_NOFOLLOW (0x100) OR-ed with an unknown bit must
+    // STILL reject — no silent masking of unknown bits when the
+    // supported one is set.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FSTATAT,
+            1,
+            &fstatat_req(AT_FDCWD, 0x100 | 0x200, b"/"),
+            &mut buf,
+        ),
+        -(abi::EINVAL as i64),
+        "AT_SYMLINK_NOFOLLOW | unknown bit must still reject (no silent masking)",
+    );
+}
