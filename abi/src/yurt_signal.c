@@ -180,7 +180,9 @@ int sigismember(const sigset_t *set, int sig) {
  *          0 = pure query (POSIX sigaction(_,NULL,&old)); the kernel
  *          MUST NOT mutate state — handler/mask/flags are don't-care.
  * handler: the sa_handler value cast to unsigned (don't-care if has_act==0).
- * mask: sa_mask as u64 (the kernel does compact<->canonical remap).
+ * mask: sa_mask as u64. The kernel stores/echoes it opaquely — there is
+ *       NO compact<->canonical remap today (the during-handler mask is
+ *       not applied yet; (C) performs that mask + any remap when it lands).
  * flags: sa_flags as unsigned.
  * oldact_out: if non-NULL, the prior kernel state is decoded into it.
  * Returns 0 on success, negative errno on failure (kernel convention). */
