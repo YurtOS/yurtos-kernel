@@ -13,7 +13,6 @@
 /// Note: the wasm binary owns its own memory (wasm32-wasip1 model), so the
 /// thread instance gets a fresh memory copy — RESULT-style globals cannot be
 /// observed from the main instance.  Instead we rely on the join return value.
-
 use std::ffi::c_int;
 
 /// The thread function: receives arg and returns a distinctive value (42).

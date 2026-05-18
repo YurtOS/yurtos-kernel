@@ -538,9 +538,7 @@ fn spawn_deep_recursion_returns_edeadlk_not_stack_overflow() {
     // argv = [program, "260"]: the root countdown. 260 > the 256 depth
     // cap, so the shared-depth guard fires before the countdown floor.
     let argv: Vec<&[u8]> = vec![b"/spawn-deep.wasm", b"260"];
-    let mut user = mk
-        .spawn_user_process_with_args(&wasm_bytes, &argv)
-        .unwrap();
+    let mut user = mk.spawn_user_process_with_args(&wasm_bytes, &argv).unwrap();
     // A single run_start drives the whole (bounded) tree. proc_exit
     // traps; the WASI shim stashes the code in last_exit first. If the
     // bug were present this would instead stack-overflow / abort the

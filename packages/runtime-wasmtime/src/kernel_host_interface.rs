@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
@@ -3042,11 +3042,7 @@ impl KernelHostInterface {
     pub fn run_pending_spawns(&self) -> Result<usize> {
         // Public top-level drain (embedder cadence call): not nested
         // inside any host_wait, so it starts a fresh depth chain at 0.
-        drain_and_run_pending_spawns(
-            &self.engine,
-            &self.kernel,
-            &Arc::new(AtomicU32::new(0)),
-        )
+        drain_and_run_pending_spawns(&self.engine, &self.kernel, &Arc::new(AtomicU32::new(0)))
     }
 
     /// Reserved alias for [`spawn_user_process`]. The WASI preview1
@@ -3545,9 +3541,9 @@ fn drain_and_run_pending_spawns(
         // and the parent itself is unaffected (no parent crash).
         let run = child.run_start();
         let exit = match (run.is_ok(), child.last_exit()) {
-            (true, _) => 0,                          // 1: clean return
-            (false, Some(n)) => n,                   // 2: proc_exit(n)
-            (false, None) => CHILD_TRAP_EXIT,        // 3: genuine trap
+            (true, _) => 0,                   // 1: clean return
+            (false, Some(n)) => n,            // 2: proc_exit(n)
+            (false, None) => CHILD_TRAP_EXIT, // 3: genuine trap
         };
         record_exit_raw(kernel, spawn.child_pid, exit)?;
         count += 1;
