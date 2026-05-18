@@ -13814,14 +13814,24 @@ fn prctl_name_is_per_process() {
     let _g = crate::kernel::TestGuard::acquire();
     // Set pid 1's name.
     assert_eq!(
-        dispatch(METHOD_SYS_PRCTL, 1, &prctl_req(15, [0; 4], b"proc1"), &mut []),
+        dispatch(
+            METHOD_SYS_PRCTL,
+            1,
+            &prctl_req(15, [0; 4], b"proc1"),
+            &mut []
+        ),
         0
     );
     // Set pid 2's name to a different string. The kernel lazily
     // vivifies pid 2 on first access; this also exercises the
     // Default-state initialization of comm = [0; 16].
     assert_eq!(
-        dispatch(METHOD_SYS_PRCTL, 2, &prctl_req(15, [0; 4], b"proc2"), &mut []),
+        dispatch(
+            METHOD_SYS_PRCTL,
+            2,
+            &prctl_req(15, [0; 4], b"proc2"),
+            &mut []
+        ),
         0
     );
     // Read back: each pid sees its own name.

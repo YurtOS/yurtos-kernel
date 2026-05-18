@@ -1590,4 +1590,3 @@ pub(super) fn prctl(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64
         _ => -(abi::EINVAL as i64),
     }
 }
-
