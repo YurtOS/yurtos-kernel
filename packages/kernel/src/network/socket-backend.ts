@@ -506,7 +506,6 @@ export function createNetworkBridgeSocketBackend(
      */
     async acceptAsync(listener) {
       let delayMs = 5;
-      // deno-lint-ignore no-constant-condition
       while (true) {
         const r = parseAccept(
           await bridge.requestSync({
@@ -531,7 +530,6 @@ export function createNetworkBridgeSocketBackend(
      */
     async recvAsync(socket, maxBytes) {
       let delayMs = 5;
-      // deno-lint-ignore no-constant-condition
       while (true) {
         const r = socketResult(
           await bridge.requestSync({

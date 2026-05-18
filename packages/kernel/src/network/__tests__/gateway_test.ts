@@ -62,7 +62,7 @@ describe('NetworkGateway', () => {
     });
 
     it('calls onRequest callback after static checks pass', async () => {
-      const onRequest = mock(async () => false) as unknown as NonNullable<NetworkPolicy['onRequest']>;
+      const onRequest = mock(() => false) as unknown as NonNullable<NetworkPolicy['onRequest']>;
       const gw = new NetworkGateway({
         allowedHosts: ['example.com'],
         onRequest,
@@ -80,9 +80,9 @@ describe('NetworkGateway', () => {
     });
 
     it('proceeds when onRequest returns true', async () => {
-      const onRequest = mock(async () => true) as unknown as NonNullable<NetworkPolicy['onRequest']>;
+      const onRequest = mock(() => true) as unknown as NonNullable<NetworkPolicy['onRequest']>;
       const originalFetch = globalThis.fetch;
-      globalThis.fetch = mock(async () => new Response('ok')) as unknown as typeof fetch;
+      globalThis.fetch = mock(() => new Response('ok')) as unknown as typeof fetch;
       try {
         const gw = new NetworkGateway({
           allowedHosts: ['example.com'],
@@ -110,7 +110,7 @@ describe('NetworkGateway', () => {
 
     it('follows redirect within allowed hosts', async () => {
       let callCount = 0;
-      globalThis.fetch = mock(async (url: string | URL | Request) => {
+      globalThis.fetch = mock((_url: string | URL | Request) => {
         callCount++;
         if (callCount === 1) {
           return new Response(null, {
@@ -119,7 +119,7 @@ describe('NetworkGateway', () => {
           });
         }
         return new Response('final');
-      }) as typeof fetch;
+      }) as unknown as typeof fetch;
 
       const gw = new NetworkGateway({ allowedHosts: ['example.com'] });
       const resp = await gw.fetch('https://example.com/start');
@@ -128,12 +128,12 @@ describe('NetworkGateway', () => {
     });
 
     it('blocks redirect to disallowed host', async () => {
-      globalThis.fetch = mock(async () => {
+      globalThis.fetch = mock(() => {
         return new Response(null, {
           status: 302,
           headers: { Location: 'https://evil.com/steal' },
         });
-      }) as typeof fetch;
+      }) as unknown as typeof fetch;
 
       const gw = new NetworkGateway({ allowedHosts: ['example.com'] });
       try {
@@ -147,13 +147,13 @@ describe('NetworkGateway', () => {
 
     it('enforces max redirect limit', async () => {
       let callCount = 0;
-      globalThis.fetch = mock(async (url: string | URL | Request) => {
+      globalThis.fetch = mock((url: string | URL | Request) => {
         callCount++;
         return new Response(null, {
           status: 302,
           headers: { Location: String(url) + '/next' },
         });
-      }) as typeof fetch;
+      }) as unknown as typeof fetch;
 
       const gw = new NetworkGateway({ allowedHosts: ['example.com'] });
       try {
@@ -168,7 +168,7 @@ describe('NetworkGateway', () => {
 
     it('303 changes method to GET', async () => {
       const calls: { url: string; method: string }[] = [];
-      globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      globalThis.fetch = mock((url: string | URL | Request, init?: RequestInit) => {
         calls.push({ url: String(url), method: init?.method ?? 'GET' });
         if (calls.length === 1) {
           return new Response(null, {
@@ -177,7 +177,7 @@ describe('NetworkGateway', () => {
           });
         }
         return new Response('ok');
-      }) as typeof fetch;
+      }) as unknown as typeof fetch;
 
       const gw = new NetworkGateway({ allowedHosts: ['example.com'] });
       await gw.fetch('https://example.com/submit', { method: 'POST', body: 'data' });
@@ -187,7 +187,7 @@ describe('NetworkGateway', () => {
 
     it('307 preserves method', async () => {
       const calls: { url: string; method: string }[] = [];
-      globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      globalThis.fetch = mock((url: string | URL | Request, init?: RequestInit) => {
         calls.push({ url: String(url), method: init?.method ?? 'GET' });
         if (calls.length === 1) {
           return new Response(null, {
@@ -196,7 +196,7 @@ describe('NetworkGateway', () => {
           });
         }
         return new Response('ok');
-      }) as typeof fetch;
+      }) as unknown as typeof fetch;
 
       const gw = new NetworkGateway({ allowedHosts: ['example.com'] });
       await gw.fetch('https://example.com/api', { method: 'POST', body: 'data' });
@@ -206,7 +206,7 @@ describe('NetworkGateway', () => {
 
     it('308 preserves method', async () => {
       const calls: { url: string; method: string }[] = [];
-      globalThis.fetch = mock(async (url: string | URL | Request, init?: RequestInit) => {
+      globalThis.fetch = mock((url: string | URL | Request, init?: RequestInit) => {
         calls.push({ url: String(url), method: init?.method ?? 'GET' });
         if (calls.length === 1) {
           return new Response(null, {
@@ -215,7 +215,7 @@ describe('NetworkGateway', () => {
           });
         }
         return new Response('ok');
-      }) as typeof fetch;
+      }) as unknown as typeof fetch;
 
       const gw = new NetworkGateway({ allowedHosts: ['example.com'] });
       await gw.fetch('https://example.com/api', { method: 'POST', body: 'data' });
@@ -225,12 +225,12 @@ describe('NetworkGateway', () => {
 
     it('calls onRequest callback for redirect targets', async () => {
       const onRequestUrls: string[] = [];
-      const onRequest = mock(async (req: { url: string }) => {
+      const onRequest = mock((req: { url: string }) => {
         onRequestUrls.push(req.url);
         return true;
       }) as unknown as NonNullable<NetworkPolicy['onRequest']>;
       let fetchCallCount = 0;
-      globalThis.fetch = mock(async (url: string | URL | Request) => {
+      globalThis.fetch = mock((_url: string | URL | Request) => {
         fetchCallCount++;
         if (fetchCallCount === 1) {
           return new Response(null, {
@@ -239,7 +239,7 @@ describe('NetworkGateway', () => {
           });
         }
         return new Response('ok');
-      }) as typeof fetch;
+      }) as unknown as typeof fetch;
 
       const gw = new NetworkGateway({ allowedHosts: ['example.com'], onRequest });
       await gw.fetch('https://example.com/start');

@@ -43,7 +43,7 @@ function recordedHeaders(init?: RequestInit): Record<string, string> {
 function mockRedirectChain(redirectTo: string): Array<Record<string, string>> {
   const captured: Array<Record<string, string>> = [];
   globalThis.fetch = mock(
-    async (_url: string | URL | Request, init?: RequestInit) => {
+    (_url: string | URL | Request, init?: RequestInit) => {
       captured.push(recordedHeaders(init));
       if (captured.length === 1) {
         return new Response(null, {
@@ -53,7 +53,7 @@ function mockRedirectChain(redirectTo: string): Array<Record<string, string>> {
       }
       return new Response("ok");
     },
-  ) as typeof fetch;
+  ) as unknown as typeof fetch;
   return captured;
 }
 
@@ -142,7 +142,7 @@ describe("NetworkGateway.fetch — cross-origin redirect header hygiene", () => 
   it("re-attaches credentials when a redirect chain bounces back to origin", async () => {
     const calls: Array<Record<string, string>> = [];
     globalThis.fetch = mock(
-      async (url: string | URL | Request, init?: RequestInit) => {
+      (url: string | URL | Request, init?: RequestInit) => {
         calls.push(recordedHeaders(init));
         const u = String(url);
         if (u === "https://example.com/api") {
@@ -159,7 +159,7 @@ describe("NetworkGateway.fetch — cross-origin redirect header hygiene", () => 
         }
         return new Response("ok");
       },
-    ) as typeof fetch;
+    ) as unknown as typeof fetch;
 
     const gw = new NetworkGateway({ allowedHosts: ["*"] });
     await gw.fetch("https://example.com/api", {
