@@ -67,6 +67,7 @@ static int yurt_ppoll_errno_from_kernel(int kernel_errno) {
     case 22: return EINVAL;
     case 24: return EMFILE;
     case 32: return EPIPE;
+    case 38: return ENOSYS;
     case 40: return ELOOP;
     default: return kernel_errno;
   }
