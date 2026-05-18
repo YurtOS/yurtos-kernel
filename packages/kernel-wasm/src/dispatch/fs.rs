@@ -153,15 +153,14 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        // Terminal-only symlink follow (up to SYMLOOP_MAX hops, each
-        // re-authorized). NOTE: unlike stat/lstat (which resolve every
-        // intermediate component since #134 Part 2), open still
-        // resolves only the terminal chain — so open() can fail on a
-        // path stat() succeeds on. Bringing open to per-component
-        // parity is tracked in #142.
-        let resolved = match follow_symlinks(k, caller_pid, path) {
+        // Resolve symlinks in every component (intermediate + terminal),
+        // up to SYMLOOP_MAX hops, with per-hop re-authorization so a
+        // ramfs link cannot bypass the procfs gate. Shared with
+        // `stat_path` so `open` cannot fail on a path `stat` succeeds
+        // on (#142 / #134 Part 2 parity).
+        let resolved = match resolve_symlinks_per_component(k, caller_pid, path, true) {
             Ok(p) => p,
-            Err(errno) => return -(errno as i64),
+            Err(rc) => return rc,
         };
         let path: &[u8] = &resolved;
         let entry_type = k.vfs.entry_type(path);
@@ -502,50 +501,12 @@ fn normalize_readable_path(
     Ok(path)
 }
 
-/// Maximum symlink dereferences before `-EINVAL` (the historical
-/// "-ELOOP shape"; #69 tracks retargeting to `-ELOOP`). Linux uses
-/// `MAXSYMLINKS = 40`. Shared by `follow_symlinks` (terminal-only,
-/// `sys_open`) and `resolve_symlinks_per_component` (`stat`/`lstat`)
-/// so the bound provably cannot drift between the two.
+/// Maximum symlink dereferences before `-ELOOP`. Linux uses
+/// `MAXSYMLINKS = 40`. Shared by `resolve_symlinks_per_component`
+/// (`sys_open` / `sys_statvfs` / `access_check` / `stat` / `lstat`)
+/// and `follow_symlinks_literal` (exec path lookup) so the bound
+/// provably cannot drift across the entry points.
 const SYMLOOP_MAX: u32 = 40;
-
-/// Follow symlinks at `path` (already normalized) up to `SYMLOOP_MAX`
-/// hops, re-normalizing and re-authorizing each target so a
-/// ramfs link cannot bypass procfs access checks. Returns the
-/// resolved path or a **positive POSIX errno** (`ELOOP` once the hop
-/// limit is exceeded; whatever `normalize_readable_path` raises
-/// otherwise).
-///
-/// **Terminal-only**: this resolves the link chain of the path as a
-/// whole, not intermediate components. Used by `sys_open` only.
-/// `stat_path`/`lstat_path` use `resolve_symlinks_per_component`
-/// (POSIX intermediate resolution, #134 Part 2); bringing `sys_open`
-/// to that parity is tracked in #142.
-///
-/// Convention: resolvers return `Result<_, i32>` with a positive POSIX
-/// errno. The dispatch boundary calls `.map_err(|e| -(e as i64))` once
-/// to negate and widen to the wire-level `i64`. Matches the
-/// `path.rs::resolve_realpath` convention. Issue #144 / #69.
-///
-/// `normalize_readable_path` predates this convention and still
-/// returns a pre-negated `i64`; the inline `.map_err` below normalizes
-/// at the call boundary while that helper is left untouched (broader
-/// rename is out of scope).
-fn follow_symlinks(k: &mut Kernel, caller_pid: u32, path: Vec<u8>) -> Result<Vec<u8>, i32> {
-    let mut resolved = path;
-    let mut hops = 0u32;
-    while let Some(target) = k.vfs.readlink(&resolved) {
-        hops += 1;
-        if hops > SYMLOOP_MAX {
-            // Too many symlink hops: POSIX/Linux errno is ELOOP
-            // (SYMLOOP_MAX = 40), not EINVAL.
-            return Err(abi::ELOOP);
-        }
-        resolved =
-            normalize_readable_path(k, caller_pid, &target).map_err(|rc_i64| (-rc_i64) as i32)?;
-    }
-    Ok(resolved)
-}
 
 /// Walk the symlink chain at `path` without per-hop re-normalization,
 /// up to SYMLOOP_MAX (40) hops. Lighter than `follow_symlinks` — used
@@ -668,7 +629,11 @@ fn resolve_symlinks_per_component(
         }
         hops += 1;
         if hops > SYMLOOP_MAX {
-            return Err(-(abi::EINVAL as i64));
+            // POSIX: too many symlink hops → -ELOOP. Harmonized with
+            // `realpath`'s `resolve_realpath` and the legacy
+            // terminal-only `follow_symlinks` so every path-resolver
+            // surfaces the same errno (#69 / #142).
+            return Err(-(abi::ELOOP as i64));
         }
         // Build an absolute path: an absolute target as-is; a relative
         // target against the link's parent dir (`prefix` == "/" +
@@ -1550,9 +1515,11 @@ pub(super) fn sys_statvfs(caller_pid: u32, request: &[u8], response: &mut [u8]) 
             Ok(path) => path,
             Err(rc) => return rc,
         };
-        let resolved = match follow_symlinks(k, caller_pid, path) {
+        // Per-component resolution (#142). statvfs follows symlinks on
+        // the resolved path's mount.
+        let resolved = match resolve_symlinks_per_component(k, caller_pid, path, true) {
             Ok(p) => p,
-            Err(errno) => return -(errno as i64),
+            Err(rc) => return rc,
         };
         if k.vfs.entry_type(&resolved) == 0 {
             return -(abi::ENOENT as i64);
@@ -1836,12 +1803,11 @@ fn access_check(k: &mut Kernel, caller_pid: u32, raw_path: &[u8], mode: u32, fla
     let resolved = if flag & AT_SYMLINK_NOFOLLOW != 0 {
         path
     } else {
-        // follow_symlinks returns positive i32 errno post #144 —
-        // negate-and-widen at the boundary, matching sys_open /
-        // stat_path.
-        match follow_symlinks(k, caller_pid, path) {
+        // Per-component resolution (#142) — matches sys_open / stat_path
+        // parity so access() cannot disagree with the open() it gates.
+        match resolve_symlinks_per_component(k, caller_pid, path, true) {
             Ok(p) => p,
-            Err(errno) => return -(errno as i64),
+            Err(rc) => return rc,
         }
     };
     let Some((mount_id, inode)) = k.vfs.open(&resolved, 0) else {
