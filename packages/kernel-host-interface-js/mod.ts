@@ -2432,9 +2432,28 @@ class CachedProcessEngine {
       : undefined;
     userMemoryRef.memory = memory ?? new WebAssembly.Memory({ initial: 0 });
 
+    // Register the child in instances/handlesByPid (same shape as spawn()) so
+    // that spawnThread(childPid, ...) can resolve it during the child's run.
+    // This is the P2-1 fix: without registration, kh_thread_spawn callbacks
+    // that arrive while the child is running return -ESRCH.
+    const handle = this.nextHandle++;
+    this.instances.set(handle, {
+      pid: childPid,
+      module,
+      instance,
+      memory: userMemoryRef.memory,
+      userMemoryRef,
+      argv,
+    });
+    this.handlesByPid.set(childPid, handle);
+
     // Run _start; missing _start is treated as clean exit 0.
     const start = instance.exports._start;
-    if (typeof start !== "function") return 0;
+    if (typeof start !== "function") {
+      this.instances.delete(handle);
+      this.handlesByPid.delete(childPid);
+      return 0;
+    }
 
     const PROC_EXIT_RE = /proc_exit\((-?\d+)\)/;
     try {
@@ -2445,6 +2464,15 @@ class CachedProcessEngine {
       const m = PROC_EXIT_RE.exec(msg);
       if (m) return Number(m[1]) | 0;
       throw e; // genuine trap — propagate
+    } finally {
+      // Deregister the child after its run completes (or throws).
+      // runCachedChild owns the full child lifetime — unlike spawn() which
+      // leaves the entry live for the engine to destroy() later, this path
+      // is synchronous run-to-completion, so we clean up immediately to
+      // prevent handle/pid-map leaks and stale childPid→handle collisions
+      // if a later spawn reuses this pid.
+      this.instances.delete(handle);
+      this.handlesByPid.delete(childPid);
     }
   }
 

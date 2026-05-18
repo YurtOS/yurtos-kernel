@@ -2368,6 +2368,10 @@ name = "spawn-deep-wasm"
 version = "0.1.0"
 
 [[package]]
+name = "spawn-thread-child-wasm"
+version = "0.1.0"
+
+[[package]]
 name = "spawn-wait-wasm"
 version = "0.1.0"
 dependencies = [

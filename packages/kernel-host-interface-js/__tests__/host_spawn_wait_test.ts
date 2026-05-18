@@ -365,3 +365,76 @@ Deno.test("host_spawn parses yurt_spawn_request_v1 and forwards to SYS_SPAWN", a
 
   assertEquals(exitCode, 0, `spawn-wait should exit 0, got ${exitCode}`);
 });
+
+// ── Test 5: P2-1 regression — spawned child can create threads ───────────────
+
+/**
+ * Regression test for P2-1: runCachedChild did not register the child in
+ * instances/handlesByPid, so a spawned child that called pthread_create
+ * (host_thread_spawn) hit spawnThread(pid) → handlesByPid.get(pid) = undefined
+ * → -ESRCH.
+ *
+ * This test verifies that a spawned child (spawn-thread-child-wasm) can
+ * successfully create a thread and join it.  The parent (spawn-wait-wasm)
+ * spawns the child and waits; if the child's thread fails (-ESRCH), the
+ * assert inside the child panics and the child process terminates with a
+ * non-zero exit code, causing spawn-wait to also exit non-zero.
+ */
+Deno.test("P2-1: spawned child can create threads (runCachedChild registers in handlesByPid)", async () => {
+  const mk = await freshKernelHostInterface();
+
+  // Register the threaded child in the kernel ramfs.
+  const childWasm = await fixtureWasm(
+    "spawn-thread-child-wasm",
+    "spawn-thread-child-wasm",
+  );
+  // spawn-wait-wasm's Command::new path is "/child-exit7.wasm", but here we
+  // use SYS_SPAWN directly so we can name the child path freely.
+  const childPath = s("/spawn-thread-child.wasm");
+  mk.registerRamfsFile(childPath, childWasm);
+
+  // Enqueue a SYS_SPAWN for the threaded child (pid 1 is the "parent").
+  const { rc: spawnRc } = mk.kernelSyscall(
+    METHOD.SYS_SPAWN,
+    1,
+    encodeSysSpawnRequest(childPath, [childPath]),
+    0,
+  );
+  const childPid = Number(spawnRc);
+  assertGreater(
+    childPid,
+    999,
+    `expected kernel-allocated child pid >= 1000, got ${childPid}`,
+  );
+
+  // Drain and run the child.  Pre-fix: spawnThread returns -ESRCH, the
+  // assert inside the child panics, and runCachedChild rethrows the trap.
+  // Post-fix: the child registers cleanly, thread succeeds, child exits 0.
+  mk.runPendingSpawns();
+
+  // Verify the child recorded exit code 0 (thread ran, assert passed).
+  const waitReq = new Uint8Array(8);
+  const waitView = new DataView(waitReq.buffer);
+  waitView.setUint32(0, childPid >>> 0, true);
+  waitView.setUint32(4, 0, true); // flags=0
+  const { rc: waitRc, response } = mk.kernelSyscall(
+    METHOD.SYS_WAIT,
+    1,
+    waitReq,
+    8,
+  );
+  assertEquals(
+    Number(waitRc),
+    8,
+    `SYS_WAIT should return 8 bytes, got ${waitRc}`,
+  );
+  const resp = new DataView(response.buffer, response.byteOffset, 8);
+  const exitedPid = resp.getUint32(0, true);
+  const status = resp.getInt32(4, true);
+  assertEquals(exitedPid, childPid, "exited pid should match");
+  assertEquals(
+    status,
+    0,
+    `threaded child should exit 0, got ${status} (pre-fix: -ESRCH from spawnThread causes child assert to panic)`,
+  );
+});
