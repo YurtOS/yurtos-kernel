@@ -68,3 +68,49 @@ Deno.test("WorkerHostSerializer: event loop stays live while a call awaits", asy
   assertEquals(await call, "done");
   assertEquals(timerFired, true);
 });
+
+// ---------------------------------------------------------------------------
+// #124: watchdog/timeout so a hung body fails its OWN round-trip instead of
+// wedging every pthread of the process (process-global head-of-line block).
+// ---------------------------------------------------------------------------
+
+import { assertRejects } from "@std/assert";
+import {
+  WorkerHostSerializer as _WHS,
+  WorkerHostTimeoutError,
+} from "../worker-host-serializer.ts";
+
+Deno.test("WorkerHostSerializer: a hung body times out and the chain advances", async () => {
+  const s = new _WHS();
+  // A body that never settles must NOT wedge the next body forever.
+  const hung = s.run(() => new Promise<never>(() => {}), { timeoutMs: 30 });
+  const next = s.run(() => "after-hang");
+
+  await assertRejects(() => hung, WorkerHostTimeoutError);
+  // The follow-up body must have run despite the previous hang. Guard
+  // with a test-level deadline so a regression FAILS (not hangs); the
+  // timer is cleared so it does not leak past the test.
+  let guardTimer: number | undefined;
+  const guard = new Promise<string>((r) => {
+    guardTimer = setTimeout(() => r("WEDGED"), 1500);
+  });
+  try {
+    assertEquals(await Promise.race([next, guard]), "after-hang");
+  } finally {
+    clearTimeout(guardTimer);
+  }
+});
+
+Deno.test("WorkerHostSerializer: default (no timeout) never times out a slow body", async () => {
+  const s = new _WHS();
+  const slow = s.run(async () => {
+    await new Promise((r) => setTimeout(r, 60));
+    return "slow-ok";
+  });
+  assertEquals(await slow, "slow-ok");
+});
+
+Deno.test("WorkerHostSerializer: a body that settles before the timeout is unaffected", async () => {
+  const s = new _WHS(1000);
+  assertEquals(await s.run(() => "fast"), "fast");
+});

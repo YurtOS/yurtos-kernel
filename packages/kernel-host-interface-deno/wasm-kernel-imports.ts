@@ -493,29 +493,37 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_thread_spawn",
     method: METHOD.SYS_THREAD_SPAWN,
     args: ["scalar", "scalar"],
-    custom: (mk, _memBuf, callerPid, callerTid) => async (fnPtr, arg) =>
-      threadImport(
-        METHOD.SYS_THREAD_SPAWN,
-        scalarRequest(fnPtr, arg),
-        0,
-        mk,
-        callerPid,
-        callerTid,
-      ).rc,
+    custom: (mk, _memBuf, callerPid, callerTid) => (fnPtr, arg) =>
+      Promise.resolve(
+        threadImport(
+          METHOD.SYS_THREAD_SPAWN,
+          scalarRequest(fnPtr, arg),
+          0,
+          mk,
+          callerPid,
+          callerTid,
+        ).rc,
+      ),
   },
   {
     name: "host_thread_self",
     method: METHOD.SYS_THREAD_SELF,
     args: [],
-    custom: (mk, _memBuf, callerPid, callerTid) => async () =>
-      threadImport(
-        METHOD.SYS_THREAD_SELF,
-        new Uint8Array(0),
-        0,
-        mk,
-        callerPid,
-        callerTid,
-      ).rc,
+    // The wasm-engine import contract requires Promise-returning
+    // (JSPI suspension); the body is synchronous so we wrap with
+    // Promise.resolve instead of using `async` (which would trip
+    // deno-lint's require-await rule — no real await to perform).
+    custom: (mk, _memBuf, callerPid, callerTid) => () =>
+      Promise.resolve(
+        threadImport(
+          METHOD.SYS_THREAD_SELF,
+          new Uint8Array(0),
+          0,
+          mk,
+          callerPid,
+          callerTid,
+        ).rc,
+      ),
   },
   {
     name: "host_thread_join",
@@ -557,43 +565,49 @@ export const HOST_BINDINGS: HostBinding[] = [
     name: "host_thread_detach",
     method: METHOD.SYS_THREAD_DETACH,
     args: ["scalar"],
-    custom: (mk, _memBuf, callerPid, callerTid) => async (tid) =>
-      threadImport(
-        METHOD.SYS_THREAD_DETACH,
-        scalarRequest(tid),
-        0,
-        mk,
-        callerPid,
-        callerTid,
-      ).rc,
+    custom: (mk, _memBuf, callerPid, callerTid) => (tid) =>
+      Promise.resolve(
+        threadImport(
+          METHOD.SYS_THREAD_DETACH,
+          scalarRequest(tid),
+          0,
+          mk,
+          callerPid,
+          callerTid,
+        ).rc,
+      ),
   },
   {
     name: "host_thread_exit",
     method: METHOD.SYS_THREAD_EXIT,
     args: ["scalar"],
-    custom: (mk, _memBuf, callerPid, callerTid) => async (retval) =>
-      threadImport(
-        METHOD.SYS_THREAD_EXIT,
-        scalarRequest(retval),
-        0,
-        mk,
-        callerPid,
-        callerTid,
-      ).rc,
+    custom: (mk, _memBuf, callerPid, callerTid) => (retval) =>
+      Promise.resolve(
+        threadImport(
+          METHOD.SYS_THREAD_EXIT,
+          scalarRequest(retval),
+          0,
+          mk,
+          callerPid,
+          callerTid,
+        ).rc,
+      ),
   },
   {
     name: "host_thread_yield",
     method: METHOD.SYS_THREAD_YIELD,
     args: [],
-    custom: (mk, _memBuf, callerPid, callerTid) => async () =>
-      threadImport(
-        METHOD.SYS_THREAD_YIELD,
-        new Uint8Array(0),
-        0,
-        mk,
-        callerPid,
-        callerTid,
-      ).rc,
+    custom: (mk, _memBuf, callerPid, callerTid) => () =>
+      Promise.resolve(
+        threadImport(
+          METHOD.SYS_THREAD_YIELD,
+          new Uint8Array(0),
+          0,
+          mk,
+          callerPid,
+          callerTid,
+        ).rc,
+      ),
   },
 
   // Single-scalar args returning a scalar.

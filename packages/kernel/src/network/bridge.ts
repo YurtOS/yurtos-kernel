@@ -76,6 +76,33 @@ export class NetworkBridge implements NetworkBridgeLike {
   private worker: Worker | null = null;
   private gateway: NetworkGateway;
 
+  /**
+   * Serializes `fetchSync`/`requestSync`. Both write the request into
+   * the SAME single-slot SharedArrayBuffer and then `await
+   * Atomics.waitAsync`. Without a main-thread queue a second caller
+   * (e.g. the `acceptAsync` poll loop racing a `connect`) overwrites
+   * the first's in-flight request bytes/length before the worker reads
+   * them; the worker only ever answers one request and BOTH callers
+   * resolve on that single reply (wrong result / "Unterminated string
+   * in JSON" corruption). A promise-chain mutex makes concurrent
+   * callers queue instead of clobber. (#111)
+   */
+  private sabQueue: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Run `task` after all previously-queued SAB operations complete.
+   * The chain is kept alive across both fulfilment and rejection so
+   * one failed/timed-out request never wedges the queue.
+   */
+  private enqueueSab<T>(task: () => Promise<T>): Promise<T> {
+    const run = this.sabQueue.then(task, task);
+    this.sabQueue = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
+  }
+
   constructor(gateway: NetworkGateway) {
     this.gateway = gateway;
     this.sab = new SharedArrayBuffer(SAB_SIZE);
@@ -537,7 +564,19 @@ export class NetworkBridge implements NetworkBridgeLike {
    * is `fetchSync` for historical reasons (callers used to be sync); the
    * return is a Promise.
    */
-  async fetchSync(
+  fetchSync(
+    url: string,
+    method: string,
+    headers: Record<string, string>,
+    body?: FetchRequestBody,
+    redirect?: FetchRedirectMode,
+  ): Promise<SyncFetchResult> {
+    return this.enqueueSab(() =>
+      this.fetchSyncLocked(url, method, headers, body, redirect)
+    );
+  }
+
+  private async fetchSyncLocked(
     url: string,
     method: string,
     headers: Record<string, string>,
@@ -613,7 +652,13 @@ export class NetworkBridge implements NetworkBridgeLike {
    * accept, …). See `fetchSync` for the rationale; the name keeps the
    * `Sync` suffix for callsite continuity but the return is a Promise.
    */
-  async requestSync(op: Record<string, unknown>): Promise<SyncRequestResult> {
+  requestSync(op: Record<string, unknown>): Promise<SyncRequestResult> {
+    return this.enqueueSab(() => this.requestSyncLocked(op));
+  }
+
+  private async requestSyncLocked(
+    op: Record<string, unknown>,
+  ): Promise<SyncRequestResult> {
     if (!this.worker) {
       return { ok: false, error: "bridge not started" };
     }

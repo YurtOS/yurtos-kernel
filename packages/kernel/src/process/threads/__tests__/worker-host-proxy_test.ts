@@ -162,6 +162,41 @@ Deno.test("worker-host-proxy: ThreadSpawn receives dispatcher caller tid", async
   assertEquals(seenTid, 9);
 });
 
+Deno.test("worker-host-proxy: SocketListen response waits for async body", async () => {
+  const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
+  const header = new Int32Array(sab, 0, HEADER_WORDS);
+  const payload = new Int32Array(sab, PAYLOAD_OFFSET_BYTES, PAYLOAD_WORDS);
+
+  let resolveListen!: (result: number) => void;
+  const listenDone = new Promise<number>((resolve) => {
+    resolveListen = resolve;
+  });
+  const bodies: WorkerHostDispatcherBodies = {
+    ...noopBodies(),
+    socketListen: () => listenDone,
+  };
+
+  const { target, invoke } = captureHandler();
+  attachWorkerHostDispatcher(target, sab, bodies);
+
+  payload[OP_WORD] = WorkerHostOp.SocketListen;
+  payload[ARGC_WORD] = 2;
+  payload[ARGS_WORD + 0] = 7;
+  payload[ARGS_WORD + 1] = 128;
+  Atomics.store(header, 0, STATUS_REQUEST_READY);
+
+  const pending = invoke();
+  await Promise.resolve();
+
+  assertEquals(Atomics.load(header, 0), STATUS_REQUEST_READY);
+
+  resolveListen(0);
+  await pending;
+
+  assertEquals(Atomics.load(header, 0), STATUS_RESPONSE_READY);
+  assertEquals(Atomics.load(header, 1), 0);
+});
+
 Deno.test("worker-host-proxy: ReadFd writes returned bytes back into payload", async () => {
   const sab = new SharedArrayBuffer(REQUEST_SAB_BYTES);
   const header = new Int32Array(sab, 0, HEADER_WORDS);
