@@ -190,6 +190,11 @@ pub fn dispatch_with_context(
         METHOD_SYS_GETRANDOM => sys_getrandom(request, response),
         METHOD_SYS_PWRITE => pwrite_fd(caller_pid, request),
         METHOD_SYS_POLL => poll_fds(caller_pid, request, response),
+        // #91 select/pselect/ppoll. Real handlers land per slice; ppoll
+        // is Task 4 (still ENOSYS here until then).
+        METHOD_SYS_SELECT => sys_select(caller_pid, request, response),
+        METHOD_SYS_PSELECT => sys_pselect(caller_pid, request, response),
+        METHOD_SYS_PPOLL => sys_ppoll(caller_pid, request, response),
         METHOD_SYS_ISATTY => isatty(caller_pid, request),
         METHOD_SYS_TCGETPGRP => tcgetpgrp(caller_pid, request),
         METHOD_SYS_TCSETPGRP => tcsetpgrp(caller_pid, request),
@@ -1008,6 +1013,30 @@ const POLLHUP: i16 = 0x0010;
 const POLLNVAL: i16 = 0x0020;
 const POLLFD_SIZE: usize = 8;
 
+/// One fd's readiness work item shared by every readiness syscall.
+/// `events` is the requested mask, `revents` is filled by `poll_core`.
+/// Issue #91 Task 2.
+struct WorkFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+/// The single per-fd readiness loop. Fills each `WorkFd::revents` via the
+/// unchanged `poll_revents_for_fd`. Deliberately computes NO count and
+/// NO errno — every caller (`poll_fds` / `sys_select` / `sys_pselect` /
+/// `sys_ppoll`) shapes its own result. A negative fd yields revents 0
+/// (matches the shipped poll path).
+fn poll_core(k: &mut Kernel, caller_pid: u32, work: &mut [WorkFd]) {
+    for w in work.iter_mut() {
+        w.revents = if w.fd < 0 {
+            0
+        } else {
+            poll_revents_for_fd(k, caller_pid, w.fd as u32, w.events)
+        };
+    }
+}
+
 fn poll_fds(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if request.len() < 4 || !(request.len() - 4).is_multiple_of(POLLFD_SIZE) {
         return -(abi::EINVAL as i64);
@@ -1016,26 +1045,231 @@ fn poll_fds(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
     if response.len() < records.len() {
         return -(abi::EINVAL as i64);
     }
-
     response[..records.len()].copy_from_slice(records);
-    with_kernel(|k| {
-        let mut ready = 0;
-        for (index, record) in records.chunks_exact(POLLFD_SIZE).enumerate() {
-            let fd = i32::from_le_bytes(record[0..4].try_into().expect("poll fd"));
-            let events = i16::from_le_bytes(record[4..6].try_into().expect("poll events"));
-            let revents = if fd < 0 {
-                0
-            } else {
-                poll_revents_for_fd(k, caller_pid, fd as u32, events)
-            };
-            let out = index * POLLFD_SIZE + 6;
-            response[out..out + 2].copy_from_slice(&revents.to_le_bytes());
-            if revents != 0 {
-                ready += 1;
-            }
+
+    let mut work: Vec<WorkFd> = records
+        .chunks_exact(POLLFD_SIZE)
+        .map(|r| WorkFd {
+            fd: i32::from_le_bytes(r[0..4].try_into().expect("poll fd")),
+            events: i16::from_le_bytes(r[4..6].try_into().expect("poll events")),
+            revents: 0,
+        })
+        .collect();
+
+    with_kernel(|k| poll_core(k, caller_pid, &mut work));
+
+    let mut ready = 0;
+    for (index, w) in work.iter().enumerate() {
+        let out = index * POLLFD_SIZE + 6;
+        response[out..out + 2].copy_from_slice(&w.revents.to_le_bytes());
+        if w.revents != 0 {
+            ready += 1;
         }
-        ready
-    })
+    }
+    ready
+}
+
+// ── #91 sys_select / sys_pselect (Task 3) ─────────────────────────────
+//
+// fd_set wire: fixed 128-byte little-endian bitmap, fd n -> word n/32,
+// bit n%32 (FD_SETSIZE 1024). Matches the retired yurt_select.c mapping.
+const FD_SET_BYTES: usize = 128;
+const FD_SETSIZE: u32 = 1024;
+
+/// Is fd `n` set in a 128-byte little-endian fd_set bitmap?
+fn fdset_get(set: &[u8], n: u32) -> bool {
+    let (w, b) = ((n / 32) as usize, (n % 32) as usize);
+    let byte = w * 4 + b / 8;
+    set[byte] & (1 << (b % 8)) != 0
+}
+
+/// Set fd `n` in a 128-byte little-endian fd_set bitmap.
+fn fdset_set(set: &mut [u8], n: u32) {
+    let (w, b) = ((n / 32) as usize, (n % 32) as usize);
+    let byte = w * 4 + b / 8;
+    set[byte] |= 1 << (b % 8);
+}
+
+/// Range-check a decoded timeout. `frac` is `tv_usec` (select, max 1e6)
+/// or `tv_nsec` (pselect/ppoll, max 1e9). Decoded + checked, never
+/// applied. Callers gate this on `timeout_null==0` so a NULL caller
+/// timeout never trips spurious `-EINVAL` (per D4 reconciliation).
+fn timeout_in_range(tv_sec: i64, frac: i32, frac_max: i32) -> bool {
+    tv_sec >= 0 && (0..frac_max).contains(&frac)
+}
+
+/// Shared select/pselect body. `set_base` is the byte offset of
+/// `readfds` in `request` (20 for select, 28 for pselect); writefds /
+/// exceptfds follow at +128 / +256. The caller has already validated
+/// the exact request length and decoded + range-checked the timeout
+/// (and, for pselect, the sigmask — carried, not applied).
+fn select_core(caller_pid: u32, request: &[u8], response: &mut [u8], set_base: usize) -> i64 {
+    if response.len() < 3 * FD_SET_BYTES {
+        return -(abi::EINVAL as i64);
+    }
+    let nfds = u32::from_le_bytes(request[0..4].try_into().expect("nfds"));
+    // A guest `int nfds < 0` wraps to u32 >= 0x8000_0000 > 1024, so the
+    // single upper-bound check catches both `nfds > 1024` and negative
+    // wrap.
+    if nfds > FD_SETSIZE {
+        return -(abi::EINVAL as i64);
+    }
+    let rd = &request[set_base..set_base + FD_SET_BYTES];
+    let wr = &request[set_base + FD_SET_BYTES..set_base + 2 * FD_SET_BYTES];
+    let ex = &request[set_base + 2 * FD_SET_BYTES..set_base + 3 * FD_SET_BYTES];
+
+    // Build a WorkFd ONLY for fds set in >=1 set, ascending fd order
+    // (mirrors the retired yurt_select.c `if (events == 0) continue;`).
+    // C1 invariant: a fd absent from all sets is never examined -> can
+    // never trigger -EBADF.
+    let mut work: Vec<WorkFd> = Vec::new();
+    for fd in 0..nfds {
+        let mut events: i16 = 0;
+        if fdset_get(rd, fd) {
+            events |= POLLIN;
+        }
+        if fdset_get(wr, fd) {
+            events |= POLLOUT;
+        }
+        if fdset_get(ex, fd) {
+            events |= POLLERR;
+        }
+        if events == 0 {
+            continue;
+        }
+        work.push(WorkFd {
+            fd: fd as i32,
+            events,
+            revents: 0,
+        });
+    }
+
+    with_kernel(|k| poll_core(k, caller_pid, &mut work));
+
+    // First examined fd (ascending) with POLLNVAL => -EBADF, no count.
+    // Per D7: error-path response bytes are POSIX-unspecified; the
+    // caller's sets are not authoritative on error.
+    for w in &work {
+        if w.revents & POLLNVAL != 0 {
+            return -(abi::EBADF as i64);
+        }
+    }
+
+    let (out_rd, rest) = response.split_at_mut(FD_SET_BYTES);
+    let (out_wr, out_ex) = rest.split_at_mut(FD_SET_BYTES);
+    out_rd.fill(0);
+    out_wr.fill(0);
+    out_ex[..FD_SET_BYTES].fill(0);
+
+    // Result mapping verbatim-faithful to the retired yurt_select.c:
+    //   readfds bit  iff revents & (POLLIN|POLLHUP|POLLERR)
+    //   writefds bit iff revents & (POLLOUT|POLLERR)
+    //   exceptfds bit iff revents & POLLERR
+    // ready = total result bits set across all three sets (a fd ready
+    // in read+write counts 2).
+    let mut ready: i64 = 0;
+    for w in &work {
+        let fd = w.fd as u32;
+        if w.revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+            fdset_set(out_rd, fd);
+            ready += 1;
+        }
+        if w.revents & (POLLOUT | POLLERR) != 0 {
+            fdset_set(out_wr, fd);
+            ready += 1;
+        }
+        if w.revents & POLLERR != 0 {
+            fdset_set(out_ex, fd);
+            ready += 1;
+        }
+    }
+    ready
+}
+
+fn sys_select(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() != 404 {
+        return -(abi::EINVAL as i64);
+    }
+    // Timeout range-check only when timeout_null==0 (D4). A NULL caller
+    // timeout MUST NOT trip -EINVAL even if the duration bytes are
+    // garbage (M3 test).
+    if request[16] == 0 {
+        let tv_sec = i64::from_le_bytes(request[4..12].try_into().expect("tv_sec"));
+        let tv_usec = i32::from_le_bytes(request[12..16].try_into().expect("tv_usec"));
+        if !timeout_in_range(tv_sec, tv_usec, 1_000_000) {
+            return -(abi::EINVAL as i64);
+        }
+    }
+    select_core(caller_pid, request, response, 20)
+}
+
+fn sys_pselect(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() != 412 {
+        return -(abi::EINVAL as i64);
+    }
+    if request[16] == 0 {
+        let tv_sec = i64::from_le_bytes(request[4..12].try_into().expect("tv_sec"));
+        let tv_nsec = i32::from_le_bytes(request[12..16].try_into().expect("tv_nsec"));
+        if !timeout_in_range(tv_sec, tv_nsec, 1_000_000_000) {
+            return -(abi::EINVAL as i64);
+        }
+    }
+    // sigmask @20 (u64) is decoded for ABI completeness but NOT
+    // applied: no blocked-mask state on main today (#90 open). When
+    // #90 + blocking land, the shared poll-blocking path consumes it
+    // once.
+    if request[17] == 0 {
+        let _sigmask = u64::from_le_bytes(request[20..28].try_into().expect("sigmask"));
+    }
+    select_core(caller_pid, request, response, 28)
+}
+
+// ── #91 sys_ppoll (Task 4) ────────────────────────────────────────────
+//
+// ppoll = poll + timespec + sigmask, with the SAME result shaping as
+// poll_fds (POLLNVAL counts as ready, positive ready count).
+
+fn sys_ppoll(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
+    if request.len() < 24 || !(request.len() - 24).is_multiple_of(POLLFD_SIZE) {
+        return -(abi::EINVAL as i64);
+    }
+    if request[12] == 0 {
+        let tv_sec = i64::from_le_bytes(request[0..8].try_into().expect("tv_sec"));
+        let tv_nsec = i32::from_le_bytes(request[8..12].try_into().expect("tv_nsec"));
+        if !timeout_in_range(tv_sec, tv_nsec, 1_000_000_000) {
+            return -(abi::EINVAL as i64);
+        }
+    }
+    // sigmask @16 carried, NOT applied (see sys_pselect).
+    if request[13] == 0 {
+        let _sigmask = u64::from_le_bytes(request[16..24].try_into().expect("sigmask"));
+    }
+    let records = &request[24..];
+    if response.len() < records.len() {
+        return -(abi::EINVAL as i64);
+    }
+    response[..records.len()].copy_from_slice(records);
+
+    let mut work: Vec<WorkFd> = records
+        .chunks_exact(POLLFD_SIZE)
+        .map(|r| WorkFd {
+            fd: i32::from_le_bytes(r[0..4].try_into().expect("ppoll fd")),
+            events: i16::from_le_bytes(r[4..6].try_into().expect("ppoll events")),
+            revents: 0,
+        })
+        .collect();
+
+    with_kernel(|k| poll_core(k, caller_pid, &mut work));
+
+    let mut ready = 0;
+    for (index, w) in work.iter().enumerate() {
+        let out = index * POLLFD_SIZE + 6;
+        response[out..out + 2].copy_from_slice(&w.revents.to_le_bytes());
+        if w.revents != 0 {
+            ready += 1;
+        }
+    }
+    ready
 }
 
 fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) -> i16 {

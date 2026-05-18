@@ -1522,6 +1522,89 @@ export function createKernelImports(
     };
   }
 
+  // ── #91 select/pselect fd_set wire helpers ──────────────────────────
+  // The wire fd_set is a fixed 128-byte LE bitmap (FD_SETSIZE=1024,
+  // fd n -> word n/32, bit n%32). Used by the host_select/pselect
+  // mirrors below; not used by host_poll (which keeps the existing
+  // pollfd wire).
+  const FD_SET_BYTES = 128;
+  const FD_SETSIZE_BITS = 1024;
+  const fdsetGet = (b: DataView, base: number, n: number): boolean =>
+    (b.getUint8(base + ((n / 32) | 0) * 4 + (((n % 32) / 8) | 0)) &
+      (1 << (n % 8))) !== 0;
+  const fdsetSet = (b: DataView, base: number, n: number): void => {
+    const i = base + ((n / 32) | 0) * 4 + (((n % 32) / 8) | 0);
+    b.setUint8(i, b.getUint8(i) | (1 << (n % 8)));
+  };
+  const selectImpl = (
+    reqPtr: number,
+    reqLen: number,
+    respPtr: number,
+    respLen: number,
+    expectLen: number,
+    setBase: number,
+  ): number => {
+    if (!opts.kernel) return ERR_IO;
+    if (reqLen !== expectLen) return ERR_INVALID;
+    if (respLen < 3 * FD_SET_BYTES) return ERR_INVALID;
+    if (
+      reqPtr < 0 || reqPtr + reqLen > memory.buffer.byteLength ||
+      respPtr < 0 || respPtr + 3 * FD_SET_BYTES > memory.buffer.byteLength
+    ) return ERR_IO;
+    const v = new DataView(memory.buffer);
+    const nfds = v.getUint32(reqPtr + 0, true);
+    if (nfds > FD_SETSIZE_BITS) return ERR_INVALID;
+    // timeout_null@16: range-check tv duration only when present (D4).
+    if (v.getUint8(reqPtr + 16) === 0) {
+      const tvSec = v.getBigInt64(reqPtr + 4, true);
+      const frac = v.getInt32(reqPtr + 12, true);
+      // setBase==20 -> select (tv_usec, max 1e6); setBase==28 ->
+      // pselect (tv_nsec, max 1e9).
+      const fracMax = setBase === 20 ? 1_000_000 : 1_000_000_000;
+      if (tvSec < 0n || frac < 0 || frac >= fracMax) return ERR_INVALID;
+    }
+    // pselect sigmask @20 (u64) decoded for ABI completeness but NOT
+    // applied; no blocked-mask state in the legacy TS kernel today.
+    const rdB = reqPtr + setBase;
+    const wrB = rdB + FD_SET_BYTES;
+    const exB = wrB + FD_SET_BYTES;
+    type W = { fd: number; events: number; revents: number };
+    const work: W[] = [];
+    for (let fd = 0; fd < nfds; fd++) {
+      let ev = 0;
+      if (fdsetGet(v, rdB, fd)) ev |= POLLIN;
+      if (fdsetGet(v, wrB, fd)) ev |= POLLOUT;
+      if (fdsetGet(v, exB, fd)) ev |= POLLERR;
+      if (ev === 0) continue;
+      const target = opts.kernel.getFdTarget(callerPid, fd);
+      const revents = target ? pollReventsForTarget(target, ev) : POLLNVAL;
+      work.push({ fd, events: ev, revents });
+    }
+    for (const w of work) {
+      if (w.revents & POLLNVAL) return ERR_BADF;
+    }
+    // Zero the 3 output sets; then set bits per the verbatim mapping.
+    for (let i = 0; i < 3 * FD_SET_BYTES; i++) {
+      v.setUint8(respPtr + i, 0);
+    }
+    let ready = 0;
+    for (const w of work) {
+      if (w.revents & (POLLIN | POLLHUP | POLLERR)) {
+        fdsetSet(v, respPtr, w.fd);
+        ready++;
+      }
+      if (w.revents & (POLLOUT | POLLERR)) {
+        fdsetSet(v, respPtr + FD_SET_BYTES, w.fd);
+        ready++;
+      }
+      if (w.revents & POLLERR) {
+        fdsetSet(v, respPtr + 2 * FD_SET_BYTES, w.fd);
+        ready++;
+      }
+    }
+    return ready;
+  };
+
   const imports: Record<string, WebAssembly.ImportValue> = {
     // ── Process management (new) ──
 
@@ -1753,6 +1836,111 @@ export function createKernelImports(
         // legacy cooperative timer path.
         startLegacyTimerPoll();
       });
+    },
+
+    // ── #91 host_select/pselect/ppoll thin passthroughs ──────────────
+    // The legacy TS kernel mirrors the Rust kernel's decode + fd_set
+    // transform so the B0 parity differ stays empty. Buffer offsets
+    // follow the #91 wire spec (404 B select, 412 B pselect, 24 B
+    // header + pollfd tail ppoll). Epoll TS mirror is intentionally
+    // NOT added here — the legacy TS kernel has no EPollEntry
+    // equivalent today; a future slice adds it. B0 parity for epoll
+    // is a known-deferred gap until that lands.
+    // Returns are BigInt because the C-side imports are declared
+    // `long long` (i64). The wasm engine demands BigInt for i64
+    // returns at the JS boundary; returning a plain `number` traps
+    // the guest (exit 127).
+    host_select(
+      reqPtr: number,
+      reqLen: number,
+      respPtr: number,
+      respLen: number,
+    ): bigint {
+      return BigInt(selectImpl(reqPtr, reqLen, respPtr, respLen, 404, 20));
+    },
+    host_pselect(
+      reqPtr: number,
+      reqLen: number,
+      respPtr: number,
+      respLen: number,
+    ): bigint {
+      return BigInt(selectImpl(reqPtr, reqLen, respPtr, respLen, 412, 28));
+    },
+    host_ppoll(
+      reqPtr: number,
+      reqLen: number,
+      respPtr: number,
+      respLen: number,
+    ): bigint {
+      if (!opts.kernel) return BigInt(ERR_IO);
+      if (reqLen < 24 || (reqLen - 24) % POLLFD_SIZE !== 0) {
+        return BigInt(ERR_INVALID);
+      }
+      if (
+        reqPtr < 0 || reqPtr + reqLen > memory.buffer.byteLength ||
+        respPtr < 0 || respPtr + (reqLen - 24) > memory.buffer.byteLength
+      ) return BigInt(ERR_IO);
+      const view = new DataView(memory.buffer);
+      // tv_sec@0 / tv_nsec@8 / timeout_null@12: range-check only when
+      // timeout_null==0 (D4). NULL caller timeout never spuriously -EINVAL.
+      if (view.getUint8(reqPtr + 12) === 0) {
+        const tvSec = view.getBigInt64(reqPtr + 0, true);
+        const tvNsec = view.getInt32(reqPtr + 8, true);
+        if (tvSec < 0n || tvNsec < 0 || tvNsec >= 1_000_000_000) {
+          return BigInt(ERR_INVALID);
+        }
+      }
+      // sigmask @16 carried, not applied (no blocked-mask state today).
+      const recBytes = reqLen - 24;
+      if (respLen < recBytes) return BigInt(ERR_INVALID);
+      let ready = 0;
+      for (let off = 0; off < recBytes; off += POLLFD_SIZE) {
+        const base = reqPtr + 24 + off;
+        const fd = view.getInt32(base, true);
+        const events = view.getInt16(base + 4, true);
+        let revents = 0;
+        if (fd >= 0) {
+          const target = opts.kernel.getFdTarget(callerPid, fd);
+          revents = target ? pollReventsForTarget(target, events) : POLLNVAL;
+        }
+        // Copy fd/events through unchanged; overwrite revents in resp.
+        view.setInt32(respPtr + off, fd, true);
+        view.setInt16(respPtr + off + 4, events, true);
+        view.setInt16(respPtr + off + 6, revents, true);
+        if (revents !== 0) ready++;
+      }
+      return BigInt(ready);
+    },
+
+    // host_epoll_create1/ctl/wait — the legacy TS kernel has no epoll
+    // (EPollEntry) implementation; a future slice adds the mirror. Until
+    // then return -ENOSYS (matches the Rust kernel-wasm S0 stub arms and
+    // the wasmtime/JS host paths) so an epoll-using guest gets a clean
+    // errno instead of an unsatisfied `yurt::host_epoll_*` import →
+    // instantiation trap. BigInt because the C imports are `long long`.
+    host_epoll_create1(
+      _reqPtr: number,
+      _reqLen: number,
+      _respPtr: number,
+      _respLen: number,
+    ): bigint {
+      return BigInt(ERR_UNSUPPORTED);
+    },
+    host_epoll_ctl(
+      _reqPtr: number,
+      _reqLen: number,
+      _respPtr: number,
+      _respLen: number,
+    ): bigint {
+      return BigInt(ERR_UNSUPPORTED);
+    },
+    host_epoll_wait(
+      _reqPtr: number,
+      _reqLen: number,
+      _respPtr: number,
+      _respLen: number,
+    ): bigint {
+      return BigInt(ERR_UNSUPPORTED);
     },
 
     // host_spawn(req_ptr, req_len, out_ptr?, out_cap?) -> i32

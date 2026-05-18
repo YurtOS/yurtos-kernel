@@ -311,6 +311,18 @@ mod sys_method_id {
     pub const SCHED_SETSCHEDULER: u32 = 0x1_0041;
     pub const SCHED_SETPARAM: u32 = 0x1_0042;
     pub const POLL: u32 = 0x1_0043;
+    // #91 readiness syscalls.
+    pub const SELECT: u32 = 0x1_00A1;
+    pub const PSELECT: u32 = 0x1_00A2;
+    pub const PPOLL: u32 = 0x1_00A3;
+    // #92 epoll family. Kernel handler is NOT implemented yet: the
+    // kernel-wasm dispatcher returns -ENOSYS via explicit S0 stub arms
+    // (real handler is #92 slice S3). This transport only exposes the
+    // user-visible yurt::host_epoll_* imports the guest libc shims call;
+    // calls degrade to ENOSYS until S3 lands.
+    pub const EPOLL_CREATE1: u32 = 0x1_00B8;
+    pub const EPOLL_CTL: u32 = 0x1_00B9;
+    pub const EPOLL_WAIT: u32 = 0x1_00BA;
     pub const SOCKETPAIR: u32 = 0x1_0044;
     pub const SOCKET_OPEN: u32 = 0x1_0045;
     pub const SOCKET_BIND: u32 = 0x1_0046;
@@ -744,6 +756,7 @@ fn run_wasmtime_thread(
     let mut linker: Linker<UserState> = Linker::new(&engine);
     register_sys_imports(&mut linker)?;
     register_yurt_thread_imports(&mut linker)?;
+    register_yurt_poll_imports(&mut linker)?;
     register_yurt_process_imports(&mut linker)?;
     crate::wasi_shim::add_to_linker(&mut linker)
         .context("install WASI preview1 shim on thread linker")?;
@@ -827,6 +840,7 @@ fn instantiate_fork_child(
     let mut linker: Linker<UserState> = Linker::new(engine);
     register_sys_imports(&mut linker)?;
     register_yurt_thread_imports(&mut linker)?;
+    register_yurt_poll_imports(&mut linker)?;
     register_yurt_process_imports(&mut linker)?;
     crate::wasi_shim::add_to_linker(&mut linker)
         .context("install WASI preview1 shim on fork child linker")?;
@@ -3348,6 +3362,7 @@ fn instantiate_with_pid_raw(
     let mut linker: Linker<UserState> = Linker::new(engine);
     register_sys_imports(&mut linker)?;
     register_yurt_thread_imports(&mut linker)?;
+    register_yurt_poll_imports(&mut linker)?;
     register_yurt_process_imports(&mut linker)?;
     crate::wasi_shim::add_to_linker(&mut linker)
         .context("install WASI preview1 shim on user-process linker")?;
@@ -3721,6 +3736,166 @@ fn register_yurt_thread_imports(linker: &mut Linker<UserState>) -> Result<()> {
         "host_thread_yield",
         |mut caller: Caller<'_, UserState>| -> i32 {
             thread_syscall_from_user(&mut caller, sys_method_id::THREAD_YIELD, &[], &mut []) as i32
+        },
+    )?;
+    Ok(())
+}
+
+/// Thin passthrough readiness imports in the `yurt` namespace.
+///
+/// Unlike the host-marshalled `env::sys_poll`, these do NO marshalling:
+/// copy the guest request bytes in, dispatch the kernel method, copy
+/// the kernel response back, return the kernel rc. The guest libc owns
+/// all marshalling — these host imports are dumb byte movers.
+///
+/// Issue #91 Task 6 (select/pselect/ppoll) + #92 (epoll family — shape
+/// established by this Task per the #214 umbrella alignment).
+fn register_yurt_poll_imports(linker: &mut Linker<UserState>) -> Result<()> {
+    fn passthrough(
+        caller: &mut Caller<'_, UserState>,
+        method: u32,
+        req_ptr: i32,
+        req_len: i32,
+        resp_ptr: i32,
+        resp_len: i32,
+    ) -> i64 {
+        if req_len < 0 || resp_len < 0 {
+            return -EINVAL;
+        }
+        let req = match read_user_guest_bytes(caller, req_ptr as u32, req_len as u32) {
+            Ok(b) => b,
+            Err(e) => return e,
+        };
+        let mut resp = vec![0u8; resp_len as usize];
+        let kernel = caller.data().kernel.clone();
+        let pid = caller.data().pid;
+        let rc = {
+            let mut k = kernel.lock().unwrap();
+            match k.syscall(method, pid, &req, &mut resp) {
+                Ok(rc) => rc,
+                Err(_) => return -EFAULT,
+            }
+        };
+        if rc >= 0 && resp_len > 0 {
+            if let Err(e) = write_user_guest_bytes(caller, resp_ptr as u32, &resp) {
+                return e;
+            }
+        }
+        rc
+    }
+
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_select",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: i32,
+         req_len: i32,
+         resp_ptr: i32,
+         resp_len: i32|
+         -> i64 {
+            passthrough(
+                &mut caller,
+                sys_method_id::SELECT,
+                req_ptr,
+                req_len,
+                resp_ptr,
+                resp_len,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_pselect",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: i32,
+         req_len: i32,
+         resp_ptr: i32,
+         resp_len: i32|
+         -> i64 {
+            passthrough(
+                &mut caller,
+                sys_method_id::PSELECT,
+                req_ptr,
+                req_len,
+                resp_ptr,
+                resp_len,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_ppoll",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: i32,
+         req_len: i32,
+         resp_ptr: i32,
+         resp_len: i32|
+         -> i64 {
+            passthrough(
+                &mut caller,
+                sys_method_id::PPOLL,
+                req_ptr,
+                req_len,
+                resp_ptr,
+                resp_len,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_epoll_create1",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: i32,
+         req_len: i32,
+         resp_ptr: i32,
+         resp_len: i32|
+         -> i64 {
+            passthrough(
+                &mut caller,
+                sys_method_id::EPOLL_CREATE1,
+                req_ptr,
+                req_len,
+                resp_ptr,
+                resp_len,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_epoll_ctl",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: i32,
+         req_len: i32,
+         resp_ptr: i32,
+         resp_len: i32|
+         -> i64 {
+            passthrough(
+                &mut caller,
+                sys_method_id::EPOLL_CTL,
+                req_ptr,
+                req_len,
+                resp_ptr,
+                resp_len,
+            )
+        },
+    )?;
+    linker.func_wrap(
+        YURT_NAMESPACE,
+        "host_epoll_wait",
+        |mut caller: Caller<'_, UserState>,
+         req_ptr: i32,
+         req_len: i32,
+         resp_ptr: i32,
+         resp_len: i32|
+         -> i64 {
+            passthrough(
+                &mut caller,
+                sys_method_id::EPOLL_WAIT,
+                req_ptr,
+                req_len,
+                resp_ptr,
+                resp_len,
+            )
         },
     )?;
     Ok(())

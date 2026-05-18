@@ -1,0 +1,16 @@
+canary = "posix-runtime-canary"
+symbol = "pselect"
+
+[[case]]
+name = "pselect_regular_fd"
+inputs = "pselect() over a regular file descriptor and an invalid descriptor"
+expected.exit = 0
+expected.stdout = "pselect_regular_fd:ok"
+expected.note = "regular files are immediately readable/writable; invalid positive fds report EBADF; sigmask carried not applied"
+
+[[case]]
+name = "pselect_sigmask_translation"
+inputs = "pselect() with a sigset_t containing SIGCHLD (compact slot 4)"
+expected.exit = 0
+expected.stdout = "pselect_sigmask_translation:ok"
+expected.note = "compact slot 4 -> canonical bit SIGCHLD-1; carried, not applied (regression guard against a naive byte-widen)"

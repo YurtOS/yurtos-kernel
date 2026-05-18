@@ -209,9 +209,13 @@ const METHOD_SYS_SCHED_SETAFFINITY: u32 = 0x1_005D;
 const METHOD_SYS_FCHOWN: u32 = 0x1_005E;
 const METHOD_SYS_FCHDIR: u32 = 0x1_005F;
 const METHOD_SYS_POLL: u32 = 0x1_0043;
-// #92 event-loop primitive method IDs (reserved here in S0; per-primitive
-// dispatch handlers land in S1..S4). Drift-guarded so a renumber in the
-// toml without a matching update here fails this test.
+// #91 readiness syscalls.
+const METHOD_SYS_SELECT: u32 = 0x1_00A1;
+const METHOD_SYS_PSELECT: u32 = 0x1_00A2;
+const METHOD_SYS_PPOLL: u32 = 0x1_00A3;
+// #92 event-loop primitive method IDs (reserved by S0 in #215; per-
+// primitive dispatch handlers land in S1..S4). Drift-guarded so a
+// renumber in the toml without a matching update here fails this test.
 const METHOD_SYS_EVENTFD: u32 = 0x1_00B4;
 const METHOD_SYS_TIMERFD_CREATE: u32 = 0x1_00B5;
 const METHOD_SYS_TIMERFD_SETTIME: u32 = 0x1_00B6;
@@ -3466,6 +3470,9 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
             METHOD_SYS_SCHED_SETAFFINITY as i64,
         ),
         ("sys_poll", METHOD_SYS_POLL, METHOD_SYS_POLL as i64),
+        ("sys_select", METHOD_SYS_SELECT, METHOD_SYS_SELECT as i64),
+        ("sys_pselect", METHOD_SYS_PSELECT, METHOD_SYS_PSELECT as i64),
+        ("sys_ppoll", METHOD_SYS_PPOLL, METHOD_SYS_PPOLL as i64),
         ("sys_eventfd", METHOD_SYS_EVENTFD, METHOD_SYS_EVENTFD as i64),
         (
             "sys_timerfd_create",
@@ -3920,4 +3927,49 @@ fn credentials_syscalls_round_trip_through_trampoline() {
         let rc = mk.syscall(method, &[], &mut []).unwrap();
         assert_eq!(rc, 1000, "{name} returns default 1000");
     }
+}
+
+/// Kernel-side dispatch sanity for #91 sys_select / sys_pselect /
+/// sys_ppoll. The drift guard proves the *present* mirror IDs *agree*
+/// with the TOML; this test additionally proves the kernel actually
+/// has a non-`-ENOSYS` dispatch arm for each, with a minimal
+/// well-formed request returning a deterministic result.
+///
+/// **D6 partial coverage**: this exercises the kernel via
+/// `mk.syscall(...)`, which bypasses the wasm import layer. The
+/// wasmtime `host_select` / `host_pselect` / `host_ppoll` passthrough
+/// registration → `sys_method_id::SELECT/PSELECT/PPOLL` mapping is
+/// verified only by source inspection + the drift guard. A true
+/// per-transport e2e dispatch test (a user-process wasm module that
+/// imports `yurt::host_select` and calls it) is a known follow-up —
+/// needs a dedicated fixture in the fixture_parity-style harness.
+#[test]
+fn select_pselect_ppoll_dispatch_end_to_end() {
+    let mk = fresh_kernel_host_interface(0);
+
+    // sys_select: EXACTLY 404 B, nfds=0, timeout_null=1 (offset 16).
+    let mut sel = vec![0u8; 404];
+    sel[16] = 1;
+    let mut sel_resp = vec![0u8; 384];
+    let rc = mk.syscall(METHOD_SYS_SELECT, &sel, &mut sel_resp).unwrap();
+    assert_eq!(
+        rc, 0,
+        "sys_select(nfds=0) must dispatch and return 0, not -ENOSYS"
+    );
+
+    // sys_pselect: EXACTLY 412 B, nfds=0, timeout_null@16=1, sigmask_null@17=1.
+    let mut ps = vec![0u8; 412];
+    ps[16] = 1;
+    ps[17] = 1;
+    let mut ps_resp = vec![0u8; 384];
+    let rc = mk.syscall(METHOD_SYS_PSELECT, &ps, &mut ps_resp).unwrap();
+    assert_eq!(rc, 0, "sys_pselect(nfds=0) must dispatch and return 0");
+
+    // sys_ppoll: 24 B header, zero pollfds, timeout_null@12=1, sigmask_null@13=1.
+    let mut pp = vec![0u8; 24];
+    pp[12] = 1;
+    pp[13] = 1;
+    let mut pp_resp = vec![0u8; 8];
+    let rc = mk.syscall(METHOD_SYS_PPOLL, &pp, &mut pp_resp).unwrap();
+    assert_eq!(rc, 0, "sys_ppoll(0 pollfds) must dispatch and return 0");
 }
