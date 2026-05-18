@@ -268,10 +268,8 @@ pub fn dispatch_with_context(
         METHOD_SYS_SOCKET_INFO => sys_socket_info(caller_pid, request, response),
         METHOD_SYS_SOCKET_RECVFROM => sys_socket_recvfrom(caller_pid, request, response),
         // Linux event-loop primitives (issue #92). IDs reserved in
-        // S0; per-primitive handlers land in S1..S4. Until then each
-        // returns -ENOSYS through an explicit arm so the constants are
-        // exercised (not dead-code) and the dispatch table makes the
-        // pending coverage visible at a glance.
+        // S0; per-primitive handlers land in S1..S4. Each new fd kind
+        // lights up its own arm; the others stay -ENOSYS.
         METHOD_SYS_EVENTFD => sys_eventfd(caller_pid, request),
         METHOD_SYS_TIMERFD_CREATE => sys_timerfd_create(caller_pid, request),
         METHOD_SYS_TIMERFD_SETTIME => sys_timerfd_settime(caller_pid, request, response),
