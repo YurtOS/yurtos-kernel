@@ -3460,6 +3460,11 @@ fn kernel_host_interface_method_ids_match_yurt_abi_methods_toml() {
         ("sys_select", METHOD_SYS_SELECT, METHOD_SYS_SELECT as i64),
         ("sys_pselect", METHOD_SYS_PSELECT, METHOD_SYS_PSELECT as i64),
         ("sys_ppoll", METHOD_SYS_PPOLL, METHOD_SYS_PPOLL as i64),
+        // sys_epoll_create1 / sys_epoll_ctl / sys_epoll_wait drift rows
+        // intentionally NOT added here — those toml entries live on the
+        // #92 S0 branch (PR #215). The wasmtime transport registers the
+        // host_epoll_* passthroughs already (sys_method_id::EPOLL_*); a
+        // follow-up PR adds the drift rows once #92 S0 lands on main.
         ("sys_close", METHOD_SYS_CLOSE, METHOD_SYS_CLOSE as i64),
         ("sys_dup", METHOD_SYS_DUP, METHOD_SYS_DUP as i64),
         ("sys_dup2", METHOD_SYS_DUP2, METHOD_SYS_DUP2 as i64),
