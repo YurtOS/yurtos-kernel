@@ -37,6 +37,14 @@ repos:
         pass_filenames: false
         stages: [pre-commit]
 
+      - id: cargo-check-changed
+        name: cargo check (changed crates)
+        entry: scripts/cargo-check-changed.sh
+        language: system
+        types_or: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+
       - id: cargo-clippy-changed
         name: cargo clippy (changed crates)
         entry: scripts/lint-clippy-changed.sh
