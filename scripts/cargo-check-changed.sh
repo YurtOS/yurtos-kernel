@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run cargo clippy scoped to crates that have staged Rust changes.
-# Falls back to a full workspace lint if no Rust files are staged
-# (e.g. when invoked via `pre-commit run --all-files`).
+# Fast `cargo check --tests` scoped to crates that have staged Rust
+# changes. Runs *before* the heavier per-crate clippy hook so a pure
+# compile error (missing field, type mismatch, removed symbol) surfaces
+# in seconds instead of waiting on the lint pass.
+#
+# Both hooks share the same crate-discovery shape as
+# `lint-clippy-changed.sh` so they cover the same set, in the same
+# order, just with cheaper feedback up-front.
 
 # `mapfile` is bash 4+; macOS ships bash 3.2, so populate the array
 # with a portable while-read loop. Pre-commit invokes via `/usr/bin/env
@@ -14,8 +19,7 @@ while IFS= read -r f; do
 done < <(git diff --cached --name-only --diff-filter=ACMRT -- '*.rs' || true)
 
 if [[ ${#CHANGED[@]} -eq 0 ]]; then
-  # Default-members only — wasm-only canary crates need a different target.
-  exec cargo clippy --all-targets -- -D warnings
+  exec cargo check --all-targets
 fi
 
 # Map each changed file to the nearest *package* Cargo.toml directory.
@@ -37,11 +41,10 @@ for f in "${CHANGED[@]}"; do
 done
 
 if [[ ${#CRATE_PKGS[@]} -eq 0 ]]; then
-  # Default-members only — wasm-only canary crates need a different target.
-  exec cargo clippy --all-targets -- -D warnings
+  exec cargo check --all-targets
 fi
 
 for pkg in "${!CRATE_PKGS[@]}"; do
-  echo "→ cargo clippy -p $pkg --all-targets -- -D warnings"
-  cargo clippy -p "$pkg" --all-targets -- -D warnings
+  echo "→ cargo check -p $pkg --tests"
+  cargo check -p "$pkg" --tests
 done

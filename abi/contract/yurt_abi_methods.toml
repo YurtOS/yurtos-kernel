@@ -677,22 +677,22 @@ kind = "syscall"
 doc = "POSIX faccessat(dirfd, path, mode, flag). Request: u32 dirfd LE + u32 mode LE + u32 flag LE + path bytes (path runs to end-of-request; mirrors sys_openat). dirfd: AT_FDCWD (u32::MAX) or a directory fd from sys_open(O_DIRECTORY). flag: AT_SYMLINK_NOFOLLOW (0x100) — don't follow the terminal symlink; AT_EACCESS (0x200) — use the caller's effective uid/gid instead of real. mode/errno semantics match sys_access. Additional errnos: -EBADF for unknown dirfd, -ENOTDIR for a non-directory dirfd. Issue #86."
 
 [method.sys_unlinkat]
-id = 0x1_00AF
+id = 0x1_00B0
 kind = "syscall"
 doc = "POSIX unlinkat(dirfd, path, flag). Request: u32 dirfd LE + u32 flag LE + path bytes (path runs to end-of-request; mirrors sys_openat). dirfd resolves via the shared *at resolver (#85 S0 resolve_at): an absolute path or dirfd == AT_FDCWD (0xFFFFFFFF) is cwd-relative; otherwise it is resolved inode-anchored against the directory fd (rename-stable) — -EBADF unknown dirfd, -ENOTDIR non-directory dirfd. flag: AT_REMOVEDIR (0x200) ⇒ rmdir semantics (empty-directory, -ENOTEMPTY), otherwise unlink. Returns 0 / -ENOENT / -ENOTEMPTY / -EROFS / -EINVAL (short request or unsupported flag bits). Issue #85."
 
 [method.sys_mkdirat]
-id = 0x1_00B0
+id = 0x1_00B1
 kind = "syscall"
 doc = "POSIX mkdirat(dirfd, path, mode). Request: u32 dirfd LE + u32 mode LE + path bytes (path runs to end-of-request; mirrors sys_openat). dirfd resolves via the shared *at resolver (#85 S0 resolve_at) exactly as sys_unlinkat. mode is currently advisory (matches sys_mkdir). Returns 0 / -EEXIST / -EROFS / -EBADF / -ENOTDIR / -EINVAL (short request). Issue #85."
 
 [method.sys_fstatat]
-id = 0x1_00B1
+id = 0x1_00B2
 kind = "syscall"
 doc = "POSIX fstatat(dirfd, path, statbuf, flag) (Linux SYS_newfstatat). Request: u32 dirfd LE + u32 flag LE + path bytes. Response: the 16-byte fstat-shaped record (u64 size + u32 filetype + u32 mode), same as sys_stat/sys_lstat. dirfd resolves via the shared *at resolver (#85 S0 resolve_at, inode-anchored / rename-stable). flag: AT_SYMLINK_NOFOLLOW (0x100) ⇒ lstat semantics (do not follow the terminal symlink), otherwise stat (follow). Other flag bits (incl. AT_EMPTY_PATH) are rejected -EINVAL for now. Returns 16 / -ENOENT / -EBADF (unknown dirfd) / -ENOTDIR (non-directory dirfd) / -EINVAL (short request, unsupported flag bits, or undersized response). Issue #85."
 
 [method.sys_readlinkat]
-id = 0x1_00B2
+id = 0x1_00B3
 kind = "syscall"
 doc = "POSIX readlinkat(dirfd, path, buf, bufsize). Request: u32 dirfd LE + path bytes. Response: the symlink target bytes (capacity = response length, mirrors sys_readlink). dirfd resolves via the shared *at resolver (#85 S0 resolve_at, inode-anchored / rename-stable). Returns the byte count written / -ENOENT (missing) / -EINVAL (not a symlink, short request) / -EBADF (unknown dirfd) / -ENOTDIR (non-directory dirfd). Issue #85."
 

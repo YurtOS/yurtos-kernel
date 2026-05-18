@@ -428,7 +428,7 @@ impl MountTable {
     pub fn set_len(&mut self, mount_id: MountId, inode: u64, length: u64) -> i32 {
         match self.mounts.get_mut(mount_id as usize) {
             Some(m) => m.backend.set_len(inode, length),
-            None => -(crate::abi::EBADF as i32),
+            None => -crate::abi::EBADF,
         }
     }
 
@@ -823,13 +823,13 @@ impl VfsBackend for RamfsBackend {
 
     fn set_len(&mut self, inode: u64, length: u64) -> i32 {
         let Some(content) = self.inodes.get_mut(&inode) else {
-            return -(crate::abi::EBADF as i32);
+            return -crate::abi::EBADF;
         };
         // usize::MAX on wasm32 is 4 GiB - 1; refuse anything that
         // would overflow the host buffer. EFBIG matches POSIX intent
         // (resource limit / file too large) better than EINVAL here.
         let Ok(len_usize) = usize::try_from(length) else {
-            return -(crate::abi::EFBIG as i32);
+            return -crate::abi::EFBIG;
         };
         content.resize(len_usize, 0);
         0
@@ -2811,7 +2811,7 @@ impl VfsBackend for OverlayBackend {
             // `truncate` for now. A future overlay rewrite that copies
             // up on write should also copy up on set_len. Issue #87.
             Some(&(Layer::Lower, _)) => -30, // -EROFS
-            None => -(crate::abi::EBADF as i32),
+            None => -crate::abi::EBADF,
         }
     }
 
