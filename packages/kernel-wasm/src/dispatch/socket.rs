@@ -62,19 +62,26 @@ fn install_socket_fd(
     handle: i32,
     domain: u8,
     sock_type: u8,
-) -> u32 {
+) -> Result<u32, i64> {
     let id = k.create_socket(handle, domain, sock_type);
-    let p = k.process_mut(caller_pid);
-    let fd = p.fd_table.lowest_free_fd();
-    p.fd_table.install(fd, FdEntry::Socket { id });
-    fd
+    install_socket_id_fd(k, caller_pid, id)
 }
 
-fn install_socket_id_fd(k: &mut Kernel, caller_pid: u32, id: u64) -> u32 {
-    let p = k.process_mut(caller_pid);
-    let fd = p.fd_table.lowest_free_fd();
-    p.fd_table.install(fd, FdEntry::Socket { id });
-    fd
+/// Install `id` on the lowest free fd within the caller's
+/// `RLIMIT_NOFILE` soft limit. On exhaustion the socket object is
+/// released (closing its host handle if this was the last ref) so it
+/// never leaks, and `Err(-EMFILE)` is returned.
+fn install_socket_id_fd(k: &mut Kernel, caller_pid: u32, id: u64) -> Result<u32, i64> {
+    let Some(fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
+        if let Some(handle) = k.socket_dec_ref(id) {
+            kh::socket_close(handle);
+        }
+        return Err(-(abi::EMFILE as i64));
+    };
+    k.process_mut(caller_pid)
+        .fd_table
+        .install(fd, FdEntry::Socket { id });
+    Ok(fd)
 }
 
 fn replace_socket_fd(k: &mut Kernel, caller_pid: u32, fd: u32, old_id: u64, new_id: u64) {
@@ -539,9 +546,25 @@ pub(super) fn sys_socket_accept(caller_pid: u32, request: &[u8]) -> i64 {
     });
     match listener_id {
         Ok(id) => {
-            return with_kernel(|k| match k.accept_unix_stream(id) {
-                Ok(accepted_id) => install_socket_id_fd(k, caller_pid, accepted_id) as i64,
-                Err(errno) => -(errno as i64),
+            return with_kernel(|k| {
+                // Check the RLIMIT_NOFILE budget *before* consuming the
+                // pending connection: Linux leaves the connection
+                // queued on EMFILE so a later accept (after the guest
+                // frees an fd) still succeeds. `install_socket_id_fd`
+                // keeps its own rollback as a second layer.
+                if k.process_mut(caller_pid)
+                    .lowest_free_fd_in_limit()
+                    .is_none()
+                {
+                    return -(abi::EMFILE as i64);
+                }
+                match k.accept_unix_stream(id) {
+                    Ok(accepted_id) => match install_socket_id_fd(k, caller_pid, accepted_id) {
+                        Ok(fd) => fd as i64,
+                        Err(rc) => rc,
+                    },
+                    Err(errno) => -(errno as i64),
+                }
             });
         }
         Err(0) => {}
@@ -552,11 +575,26 @@ pub(super) fn sys_socket_accept(caller_pid: u32, request: &[u8]) -> i64 {
             Ok(triple) => triple,
             Err(rc) => return rc,
         };
+    // As with the unix path: refuse before the host accept so the
+    // connection stays in the host listen queue on EMFILE rather than
+    // being accepted then immediately closed.
+    if with_kernel(|k| {
+        k.process_mut(caller_pid)
+            .lowest_free_fd_in_limit()
+            .is_none()
+    }) {
+        return -(abi::EMFILE as i64);
+    }
     let accepted = kh::socket_accept(handle, flags);
     if accepted < 0 {
         return accepted as i64;
     }
-    with_kernel(|k| install_socket_fd(k, caller_pid, accepted, domain, sock_type) as i64)
+    with_kernel(
+        |k| match install_socket_fd(k, caller_pid, accepted, domain, sock_type) {
+            Ok(fd) => fd as i64,
+            Err(rc) => rc,
+        },
+    )
 }
 
 pub(super) fn sys_socket_addr(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
@@ -952,7 +990,10 @@ pub(super) fn sys_socket_open(caller_pid: u32, request: &[u8]) -> i64 {
         } else {
             k.create_open_socket(family, sock_type, flags)
         };
-        install_socket_id_fd(k, caller_pid, id) as i64
+        match install_socket_id_fd(k, caller_pid, id) {
+            Ok(fd) => fd as i64,
+            Err(rc) => rc,
+        }
     })
 }
 
@@ -1216,11 +1257,27 @@ pub(super) fn sys_socketpair(caller_pid: u32, request: &[u8], response: &mut [u8
             let peer_cred = k.peer_cred_for(caller_pid);
             k.create_unix_stream_pair(peer_cred)
         };
-        let p = k.process_mut(caller_pid);
-        let left_fd = p.fd_table.lowest_free_fd();
-        p.fd_table.install(left_fd, FdEntry::Socket { id: left_id });
-        let right_fd = p.fd_table.lowest_free_fd();
-        p.fd_table
+        // Both fds are bounded by RLIMIT_NOFILE. On exhaustion both
+        // socket objects must be released so the pair never leaks: if
+        // the left fd never installed, drop both ids; if it did, undo
+        // it before dropping the right id.
+        let Some(left_fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
+            let _ = k.socket_dec_ref(left_id);
+            let _ = k.socket_dec_ref(right_id);
+            return -(abi::EMFILE as i64);
+        };
+        k.process_mut(caller_pid)
+            .fd_table
+            .install(left_fd, FdEntry::Socket { id: left_id });
+        let Some(right_fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
+            if let Some(entry) = k.process_mut(caller_pid).fd_table.remove(left_fd) {
+                close_entry(k, entry);
+            }
+            let _ = k.socket_dec_ref(right_id);
+            return -(abi::EMFILE as i64);
+        };
+        k.process_mut(caller_pid)
+            .fd_table
             .install(right_fd, FdEntry::Socket { id: right_id });
         response[0..4].copy_from_slice(&left_fd.to_le_bytes());
         response[4..8].copy_from_slice(&right_fd.to_le_bytes());

@@ -13059,3 +13059,263 @@ fn faccessat_dirfd_is_rename_stable_like_openat() {
         "faccessat must be inode-anchored / rename-stable like openat (#188)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #148: RLIMIT_NOFILE / EMFILE enforcement across fd-producing syscalls.
+// ---------------------------------------------------------------------------
+
+/// Lower this process's RLIMIT_NOFILE to (soft, hard).
+fn set_nofile(pid: u32, soft: u64, hard: u64) {
+    let mut req = Vec::new();
+    req.extend_from_slice(&(crate::kernel::RLIMIT_NOFILE as u32).to_le_bytes());
+    req.extend_from_slice(&soft.to_le_bytes());
+    req.extend_from_slice(&hard.to_le_bytes());
+    assert_eq!(dispatch(METHOD_SYS_SETRLIMIT, pid, &req, &mut []), 0);
+}
+
+#[test]
+fn open_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // stdio occupies fds 0,1,2. soft=5 ⇒ only fds 3,4 are allocatable.
+    set_nofile(1, 5, 1024);
+
+    let null = b"/dev/null".as_slice();
+    assert_eq!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, null), &mut []), 3);
+    assert_eq!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, null), &mut []), 4);
+    // Third open is past the soft limit → -EMFILE (not a panic, not fd 5).
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, null), &mut []),
+        -(abi::EMFILE as i64)
+    );
+
+    // Freed slot is reused.
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(dispatch(METHOD_SYS_OPEN, 1, &open_req(0, null), &mut []), 3);
+
+    // The limit is per-process: a different pid is unaffected.
+    assert!(dispatch(METHOD_SYS_OPEN, 2, &open_req(0, null), &mut []) >= 0);
+}
+
+#[test]
+fn dup_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    set_nofile(1, 5, 1024);
+    // stdio 0,1,2 used; soft=5 ⇒ only fds 3,4 allocatable.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+        3
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+        4
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+        -(abi::EMFILE as i64)
+    );
+    // Freed slot is reused; the failed dup left no half-installed fd.
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 1, &1_u32.to_le_bytes(), &mut []),
+        3
+    );
+}
+
+#[test]
+fn pipe_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // soft=5 ⇒ fds 3,4 allocatable: one pipe fits, the next does not.
+    set_nofile(1, 5, 1024);
+    let mut out = [0u8; 8];
+    assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut out), 8);
+    assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 4);
+    assert_eq!(
+        dispatch(METHOD_SYS_PIPE, 1, &[], &mut out),
+        -(abi::EMFILE as i64)
+    );
+
+    // Exactly-one-free case: the read end installs, the write end hits
+    // the limit; the read fd must be rolled back (not leaked) and the
+    // pipe object freed. soft=4 ⇒ only fd 3 is allocatable.
+    set_nofile(2, 4, 1024);
+    assert_eq!(
+        dispatch(METHOD_SYS_PIPE, 2, &[], &mut [0u8; 8]),
+        -(abi::EMFILE as i64)
+    );
+    // fd 3 was rolled back, so it is free again for a later allocation.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 2, &1_u32.to_le_bytes(), &mut []),
+        3
+    );
+}
+
+#[test]
+fn socket_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // soft=5 ⇒ fds 3,4 allocatable.
+    set_nofile(1, 5, 1024);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        4
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        -(abi::EMFILE as i64)
+    );
+    // The failed socket() left no leaked kernel socket: closing the two
+    // live ones and reopening succeeds (slot reused, object freed).
+    assert_eq!(
+        dispatch(METHOD_SYS_CLOSE, 1, &3_u32.to_le_bytes(), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        3
+    );
+}
+
+#[test]
+fn accept_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+
+    // Listener on fd 3, client on fd 4, connected.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        3
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_BIND,
+            1,
+            &socket_bind_unix_req(3, b"/tmp/yurt-148.sock"),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_LISTEN,
+            1,
+            &socket_listen_req(3, 4),
+            &mut []
+        ),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_OPEN,
+            1,
+            &socket_open_req(3, 6, 0),
+            &mut []
+        ),
+        4
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_CONNECT,
+            1,
+            &socket_connect_unix_req(4, b"/tmp/yurt-148.sock"),
+            &mut []
+        ),
+        0
+    );
+
+    // fds 0,1,2,3,4 used; soft=5 ⇒ accept has no fd to allocate.
+    set_nofile(1, 5, 1024);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_ACCEPT,
+            1,
+            &socket_accept_req(3, 0),
+            &mut []
+        ),
+        -(abi::EMFILE as i64)
+    );
+    // The accepted connection object was rolled back: raise the limit
+    // and accept now succeeds (the pending connection is still queued).
+    set_nofile(1, 1024, 1024);
+    assert!(
+        dispatch(
+            METHOD_SYS_SOCKET_ACCEPT,
+            1,
+            &socket_accept_req(3, 0),
+            &mut []
+        ) >= 0
+    );
+}
+
+#[test]
+fn socketpair_past_rlimit_nofile_is_emfile() {
+    let _g = crate::kernel::TestGuard::acquire();
+    crate::kh::test_support::reset_socket_mock();
+    // soft=5 ⇒ fds 3,4 allocatable: one pair fits, the next does not.
+    set_nofile(1, 5, 1024);
+    let mut out = [0u8; 8];
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 2, 0), &mut out),
+        8
+    );
+    assert_eq!(u32::from_le_bytes(out[0..4].try_into().unwrap()), 3);
+    assert_eq!(u32::from_le_bytes(out[4..8].try_into().unwrap()), 4);
+    assert_eq!(
+        dispatch(METHOD_SYS_SOCKETPAIR, 1, &socketpair_req(1, 2, 0), &mut out),
+        -(abi::EMFILE as i64)
+    );
+
+    // Exactly-one-free: left installs, right hits the limit; the left
+    // fd must be rolled back (not leaked) and both socket objects freed.
+    // soft=4 (pid 2) ⇒ only fd 3 is allocatable.
+    set_nofile(2, 4, 1024);
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKETPAIR,
+            2,
+            &socketpair_req(1, 2, 0),
+            &mut [0u8; 8]
+        ),
+        -(abi::EMFILE as i64)
+    );
+    // fd 3 was rolled back, so it is free again.
+    assert_eq!(
+        dispatch(METHOD_SYS_DUP, 2, &1_u32.to_le_bytes(), &mut []),
+        3
+    );
+}
