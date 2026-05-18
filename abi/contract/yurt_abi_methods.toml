@@ -677,12 +677,12 @@ kind = "syscall"
 doc = "POSIX faccessat(dirfd, path, mode, flag). Request: u32 dirfd LE + u32 mode LE + u32 flag LE + path bytes (path runs to end-of-request; mirrors sys_openat). dirfd: AT_FDCWD (u32::MAX) or a directory fd from sys_open(O_DIRECTORY). flag: AT_SYMLINK_NOFOLLOW (0x100) — don't follow the terminal symlink; AT_EACCESS (0x200) — use the caller's effective uid/gid instead of real. mode/errno semantics match sys_access. Additional errnos: -EBADF for unknown dirfd, -ENOTDIR for a non-directory dirfd. Issue #86."
 
 [method.sys_unlinkat]
-id = 0x1_00AF
+id = 0x1_00B0
 kind = "syscall"
 doc = "POSIX unlinkat(dirfd, path, flag). Request: u32 dirfd LE + u32 flag LE + path bytes (path runs to end-of-request; mirrors sys_openat). dirfd resolves via the shared *at resolver (#85 S0 resolve_at): an absolute path or dirfd == AT_FDCWD (0xFFFFFFFF) is cwd-relative; otherwise it is resolved inode-anchored against the directory fd (rename-stable) — -EBADF unknown dirfd, -ENOTDIR non-directory dirfd. flag: AT_REMOVEDIR (0x200) ⇒ rmdir semantics (empty-directory, -ENOTEMPTY), otherwise unlink. Returns 0 / -ENOENT / -ENOTEMPTY / -EROFS / -EINVAL (short request or unsupported flag bits). Issue #85."
 
 [method.sys_mkdirat]
-id = 0x1_00B0
+id = 0x1_00B1
 kind = "syscall"
 doc = "POSIX mkdirat(dirfd, path, mode). Request: u32 dirfd LE + u32 mode LE + path bytes (path runs to end-of-request; mirrors sys_openat). dirfd resolves via the shared *at resolver (#85 S0 resolve_at) exactly as sys_unlinkat. mode is currently advisory (matches sys_mkdir). Returns 0 / -EEXIST / -EROFS / -EBADF / -ENOTDIR / -EINVAL (short request). Issue #85."
 
