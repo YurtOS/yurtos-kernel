@@ -2364,6 +2364,18 @@ name = "spawn-badreq-wasm"
 version = "0.1.0"
 
 [[package]]
+name = "spawn-deep-wasm"
+version = "0.1.0"
+
+[[package]]
+name = "spawn-thread-child-wasm"
+version = "0.1.0"
+
+[[package]]
+name = "spawn-trap-child-wasm"
+version = "0.1.0"
+
+[[package]]
 name = "spawn-wait-wasm"
 version = "0.1.0"
 dependencies = [
@@ -2846,6 +2858,10 @@ dependencies = [
  "tracing-core",
  "tracing-log",
 ]
+
+[[package]]
+name = "trap-child-wasm"
+version = "0.1.0"
 
 [[package]]
 name = "true-cmd-wasm"

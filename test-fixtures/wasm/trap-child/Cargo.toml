@@ -1,0 +1,11 @@
+[package]
+name = "trap-child-wasm"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately dependency-free and `no_std` / `no_main`: this fixture's
+# whole job is to take a GENUINE wasm trap (`unreachable`) BEFORE ever
+# reaching `proc_exit`, so the host's spawn drain must reap it as the
+# abnormal-termination status (P2-2). Keeping it tiny also keeps the
+# parity test fast (the host re-`Module::new`-compiles it).
+[dependencies]

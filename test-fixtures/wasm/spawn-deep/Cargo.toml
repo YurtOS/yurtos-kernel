@@ -1,0 +1,11 @@
+[package]
+name = "spawn-deep-wasm"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately dependency-free and `no_std` / `no_main`: the host
+# re-`Module::new`-compiles this wasm at every one of the ~256 nested
+# self-spawn levels, so the binary must stay tiny to keep the F1
+# regression test fast. The whole spawn/wait wire is hand-encoded
+# against the layout in `test-fixtures/yurt-process` / `native_abi.rs`.
+[dependencies]

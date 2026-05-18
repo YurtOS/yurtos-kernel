@@ -387,6 +387,245 @@ fn spawn_badreq_host_spawn_returns_einval_for_short_buffer() {
     );
 }
 
+// ── F2 parity oracle tests: out-of-bounds span errno/reject cross-host ───────
+//
+// The inline wasm modules below are minimal WAT programs compiled to binary
+// with wat2wasm and embedded verbatim. Each crafts a specific malformed
+// yurt_spawn_request_v1 buffer, calls host_spawn, and passes the raw return
+// value to proc_exit. The assertions mirror the JS test cases (f)/(g) in
+// host_spawn_wait_test.ts — the errno integers MUST be byte-identical across
+// both hosts. Normative contract: native_abi.rs is the source of truth.
+
+#[test]
+fn spawn_badreq_oob_required_prog_span_returns_eoverflow() {
+    // F2 cross-host parity case (f): logicalSize=92, version=1,
+    // prog_off=100 (> 92), prog_len=2 → read_span: 100+2=102 > 92 →
+    // NativeAbiError::Overflow → errno -75 (EOVERFLOW).
+    //
+    // Pre-fix JS: treated OOB span as null/absent → -22 (EINVAL) [wrong].
+    // Post-fix JS: returns -75, byte-identical to this Rust host.
+    //
+    // The wasm passes proc_exit(rc) with the raw host_spawn return value,
+    // so last_exit() == -75 on success.
+    //
+    // Byte-identical errno asserted in host_spawn_wait_test.ts case (f):
+    //   assertEquals(rc, -75, "case (f) F2: ...")
+    #[rustfmt::skip]
+    let wasm_bytes: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x10, 0x03, 0x60, 0x04,
+        0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x00,
+        0x02, 0x36, 0x02, 0x04, 0x79, 0x75, 0x72, 0x74, 0x0a, 0x68, 0x6f, 0x73, 0x74,
+        0x5f, 0x73, 0x70, 0x61, 0x77, 0x6e, 0x00, 0x00, 0x16, 0x77, 0x61, 0x73, 0x69,
+        0x5f, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x70, 0x72, 0x65,
+        0x76, 0x69, 0x65, 0x77, 0x31, 0x09, 0x70, 0x72, 0x6f, 0x63, 0x5f, 0x65, 0x78,
+        0x69, 0x74, 0x00, 0x01, 0x03, 0x02, 0x01, 0x02, 0x05, 0x03, 0x01, 0x00, 0x01,
+        0x07, 0x13, 0x02, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, 0x06,
+        0x5f, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x02, 0x0a, 0x11, 0x01, 0x0f, 0x00,
+        0x41, 0x00, 0x41, 0xdc, 0x00, 0x41, 0x00, 0x41, 0x00, 0x10, 0x00, 0x10, 0x01,
+        0x0b, 0x0b, 0x5a, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x54, 0x5c, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x64, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    ];
+    let mk = fresh_kernel_host_interface();
+    let mut user = mk.spawn_user_process(wasm_bytes).unwrap();
+    let _ = user.run_start();
+    let exit_code = user.last_exit().unwrap_or(-1);
+    assert_eq!(
+        exit_code, -75,
+        "F2 case (f): host_spawn must return -75 (EOVERFLOW) for OOB required \
+         prog span (prog_off=100 > logicalSize=92); got {exit_code}. \
+         Byte-identical to JS case (f) in host_spawn_wait_test.ts."
+    );
+}
+
+#[test]
+fn spawn_badreq_oob_optional_argv0_span_returns_eoverflow_and_rejects() {
+    // F2 cross-host parity case (g): logicalSize=92, version=1,
+    // prog="/x"@offset88 (valid), argv0_off=200 (> 92), argv0_len=2 →
+    // read_optional_string: 200+2=202 > 92 →
+    // NativeAbiError::Overflow → errno -75, spawn REJECTED (not
+    // silently treated as absent).
+    //
+    // Pre-fix JS: treated OOB optional span as null/absent and PROCEEDED
+    // with the spawn (wrong errno + wrong accept/reject behavior).
+    // Post-fix JS: returns -75, spawn rejected, byte-identical to Rust.
+    //
+    // Byte-identical errno asserted in host_spawn_wait_test.ts case (g):
+    //   assertEquals(rc, -75, "case (g) F2: ...")
+    #[rustfmt::skip]
+    let wasm_bytes: &[u8] = &[
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x10, 0x03, 0x60, 0x04,
+        0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x00,
+        0x02, 0x36, 0x02, 0x04, 0x79, 0x75, 0x72, 0x74, 0x0a, 0x68, 0x6f, 0x73, 0x74,
+        0x5f, 0x73, 0x70, 0x61, 0x77, 0x6e, 0x00, 0x00, 0x16, 0x77, 0x61, 0x73, 0x69,
+        0x5f, 0x73, 0x6e, 0x61, 0x70, 0x73, 0x68, 0x6f, 0x74, 0x5f, 0x70, 0x72, 0x65,
+        0x76, 0x69, 0x65, 0x77, 0x31, 0x09, 0x70, 0x72, 0x6f, 0x63, 0x5f, 0x65, 0x78,
+        0x69, 0x74, 0x00, 0x01, 0x03, 0x02, 0x01, 0x02, 0x05, 0x03, 0x01, 0x00, 0x01,
+        0x07, 0x13, 0x02, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00, 0x06,
+        0x5f, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x02, 0x0a, 0x11, 0x01, 0x0f, 0x00,
+        0x41, 0x00, 0x41, 0xdc, 0x00, 0x41, 0x00, 0x41, 0x00, 0x10, 0x00, 0x10, 0x01,
+        0x0b, 0x0b, 0x62, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x5c, 0x5c, 0x00, 0x00, 0x00,
+        0x01, 0x00, 0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0xc8,
+        0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x2f, 0x78, 0x00, 0x00,
+    ];
+    let mk = fresh_kernel_host_interface();
+    let mut user = mk.spawn_user_process(wasm_bytes).unwrap();
+    let _ = user.run_start();
+    let exit_code = user.last_exit().unwrap_or(-1);
+    assert_eq!(
+        exit_code, -75,
+        "F2 case (g): host_spawn must return -75 (EOVERFLOW) for OOB optional \
+         argv0 span (argv0_off=200 > logicalSize=92) and REJECT the spawn \
+         (not treat as absent); got {exit_code}. \
+         Byte-identical to JS case (g) in host_spawn_wait_test.ts."
+    );
+}
+
+#[test]
+fn spawn_deep_recursion_returns_edeadlk_not_stack_overflow() {
+    // F1 regression: a self-referential spawn chain must NOT overflow
+    // the native stack / abort. `/spawn-deep.wasm`'s main() spawns
+    // itself and host_wait()s, so the host drive chain recurses:
+    //
+    //   host_wait → drain_and_run_pending_spawns
+    //     → instantiate_with_pid_raw → child.run_start()
+    //       → child's host_wait → drain → … (unbounded before the fix)
+    //
+    // Before F1 the recursion guard was a per-CALL local `iters` that
+    // reset to 0 at every nested native frame, so the cap never
+    // tripped and the native stack grew without bound → stack
+    // overflow / abort (a hard crash with NO errno — never reaches
+    // proc_exit). The fix shares ONE depth counter across the whole
+    // nested parent→child chain (cap 256, byte-parity with the JS
+    // host's `drainDepth` / `drainDepthRef`): the ~257th nested
+    // host_wait returns a clean `-EDEADLK` (-35) WITHOUT recursing
+    // further, the tree unwinds, and the errno propagates back to the
+    // root, which proc_exit(35)s.
+    //
+    // The fixture takes a depth countdown in argv (here 260, > the 256
+    // cap) and only spawns a child while the countdown is > 0, so the
+    // chain has a hard FLOOR and total work is ~260 levels — the
+    // depth-256 guard fires (and is observed) well before the floor,
+    // and any boundary "orphan" drained horizontally is itself floored
+    // a few levels later instead of running away (the host also caps
+    // that horizontal drain at 100_000 iters, matching the JS host's
+    // `runPendingSpawns` `RUNAWAY_LIMIT`).
+    //
+    // Assertion: the run reaches `proc_exit(35)` (the EDEADLK errno) —
+    // i.e. it terminated CLEANLY via the depth guard. A regression
+    // would instead surface a `wasm trap` / stack-overflow / abort and
+    // never set last_exit.
+    ensure_fixture_built("spawn-deep-wasm");
+    let wasm_bytes = std::fs::read(fixture_wasm_path("spawn-deep-wasm")).unwrap();
+
+    let mk = fresh_kernel_host_interface();
+    // Self-referential: the fixture spawns `/spawn-deep.wasm`, so the
+    // exact same image must be resolvable by the kernel's sys_spawn at
+    // that path for every nested level of the chain.
+    mk.register_ramfs_file(b"/spawn-deep.wasm", &wasm_bytes)
+        .unwrap();
+
+    // argv = [program, "260"]: the root countdown. 260 > the 256 depth
+    // cap, so the shared-depth guard fires before the countdown floor.
+    let argv: Vec<&[u8]> = vec![b"/spawn-deep.wasm", b"260"];
+    let mut user = mk.spawn_user_process_with_args(&wasm_bytes, &argv).unwrap();
+    // A single run_start drives the whole (bounded) tree. proc_exit
+    // traps; the WASI shim stashes the code in last_exit first. If the
+    // bug were present this would instead stack-overflow / abort the
+    // host process (or trap with "unreachable"), and last_exit would
+    // never be set.
+    let run = user.run_start();
+    assert!(
+        run.is_err(),
+        "spawn-deep ends in proc_exit (a trap), not a clean return"
+    );
+    let msg = format!("{:#}", run.unwrap_err());
+    assert!(
+        msg.contains("proc_exit"),
+        "expected a clean proc_exit trap (EDEADLK propagated), got: {msg}"
+    );
+
+    let exit_code = user.last_exit().unwrap_or(-1);
+    assert_eq!(
+        exit_code, 35,
+        "deep self-spawn must terminate with the -EDEADLK (35) depth-guard \
+         errno propagated to the root — NOT a stack overflow / abort / \
+         timeout (got exit code {exit_code})"
+    );
+}
+
+#[test]
+fn spawn_trap_child_reaps_as_134_and_parent_survives_cross_host() {
+    // Cross-host parity (P2-2): a guest `host_spawn`s a child that
+    // *traps* (a genuine wasm `unreachable`, NOT a `proc_exit`) before
+    // ever reaching `proc_exit`. The trapped child MUST be reaped with
+    // a deterministic abnormal-termination status (134 = 128 + SIGABRT,
+    // the shell `$?` convention) and the PARENT must keep running and
+    // exit cleanly — it must NOT crash as a propagated host trap.
+    //
+    //   /spawn-trap-child.wasm  host_spawn(/trap-child.wasm)
+    //     → SYS_SPAWN (kernel stages the child)
+    //     → host_wait → SYS_WAIT, EAGAIN → drain_and_run_pending_spawns
+    //         → /trap-child.wasm runs, hits `unreachable` → wasm trap;
+    //           run_start() is Err AND last_exit() is None  →  the host
+    //           reaps it as CHILD_TRAP_EXIT (134), the drain CONTINUES,
+    //           and the trap is NOT propagated out (parent unaffected)
+    //       → SYS_WAIT now reaps → status 134 → wait_result decodes
+    //         {exit_code=0, signal=6} (134 ∈ [128,192))
+    //     → parent reconstructs 128+signal = 134, prints it, proc_exit(0).
+    //
+    // The "child reaped status 134" literal MUST match the JS E2E
+    // (`packages/kernel-host-interface-js/__tests__/host_spawn_wait_test.ts`)
+    // byte-for-byte — the cross-host parity oracle.
+    ensure_fixture_built("spawn-trap-child-wasm");
+    ensure_fixture_built("trap-child-wasm");
+    let parent_wasm = std::fs::read(fixture_wasm_path("spawn-trap-child-wasm")).unwrap();
+    let child_wasm = std::fs::read(fixture_wasm_path("trap-child-wasm")).unwrap();
+
+    let mk = fresh_kernel_host_interface();
+    mk.register_ramfs_file(b"/trap-child.wasm", &child_wasm)
+        .unwrap();
+
+    let argv: Vec<&[u8]> = vec![b"/spawn-trap-child.wasm"];
+    let mut user = mk
+        .spawn_user_process_with_args(&parent_wasm, &argv)
+        .unwrap();
+    // The parent's host_wait drives the trapped child to completion
+    // itself (EAGAIN → drain_and_run_pending_spawns). The child's trap
+    // MUST be absorbed by the drain (reaped as 134) and NOT crash the
+    // parent: run_start() therefore ends in the parent's own
+    // proc_exit(0) trap, never the child's `unreachable`.
+    let run = user.run_start();
+    assert!(
+        run.is_err(),
+        "parent ends in its own proc_exit (a trap), not a clean return"
+    );
+    let msg = format!("{:#}", run.unwrap_err());
+    assert!(
+        msg.contains("proc_exit(0)"),
+        "parent must survive the child's trap and proc_exit(0) itself; got: {msg}"
+    );
+
+    let stdout = String::from_utf8_lossy(&user.captured_stdout().unwrap()).to_string();
+    let exit_code = user.last_exit().unwrap_or(-1);
+    // Byte-identical cross-host literal (same string asserted in the JS test):
+    assert_eq!(stdout.trim(), "child reaped status 134");
+    assert_eq!(
+        exit_code, 0,
+        "parent itself must exit cleanly (0) — it was NOT crashed by the child's trap"
+    );
+}
+
 #[test]
 fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     ensure_fixture_built("false-cmd-wasm");

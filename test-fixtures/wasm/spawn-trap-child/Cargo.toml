@@ -1,0 +1,15 @@
+[package]
+name = "spawn-trap-child-wasm"
+version = "0.1.0"
+edition = "2021"
+
+# Parent half of the P2-2 cross-host fixture. It `host_spawn`s
+# `/trap-child.wasm` (a child that takes a genuine wasm trap before
+# `proc_exit`), `host_wait`s, and prints the reaped status. `std` is
+# fine here — unlike the child, the parent is instantiated once.
+#
+# Spawn/wait wire is hand-encoded (raw FFI) against the layout in
+# `test-fixtures/yurt-process/src/lib.rs` and the host decoder
+# `packages/runtime-wasmtime/src/wasm/native_abi.rs`, exactly like
+# `spawn-deep`, so the parent stays dependency-free at the ABI edge.
+[dependencies]

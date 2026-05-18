@@ -1,0 +1,4 @@
+[target.wasm32-wasip1]
+# Export the indirect function table so the Yurt JS host can resolve thread
+# function pointers via __indirect_function_table when calling spawnThread.
+rustflags = ["-C", "link-args=-Wl,--export-table"]

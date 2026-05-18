@@ -503,6 +503,20 @@ const ESRCH = 3;
 const ENOSYS = 38;
 const EDEADLK = 35;
 
+/**
+ * Exit status recorded for a spawned child that terminated
+ * **abnormally** — a genuine wasm trap (panic / `unreachable` /
+ * missing import / abort) BEFORE it called `proc_exit`. 134 is the
+ * conventional `128 + SIGABRT(6)` shell `$?` value for abnormal
+ * termination. Byte-identical to the Rust host's `CHILD_TRAP_EXIT`
+ * (`packages/runtime-wasmtime/src/kernel_host_interface.rs`) so both
+ * hosts reap a trapped child to the SAME status (P2-2). Full
+ * `WIFSIGNALED`/signal-discriminated wait status is tracked in #99;
+ * until then a trapped child reaps as this fixed
+ * abnormal-termination code.
+ */
+const CHILD_TRAP_EXIT = 134;
+
 function ipv4SocketAddrRecord(host: string, port: number): Uint8Array {
   const out = new Uint8Array(8);
   const parts = host.split(".").map((part) => Number(part));
@@ -1758,26 +1772,36 @@ function buildUserYurtImports(
     if (version !== 1 || logicalSize < SPAWN_V1_SIZE) return -22; // EINVAL
     if (logicalSize > bytes.length) return -75; // EOVERFLOW
 
+    // Normative contract: packages/runtime-wasmtime/src/wasm/native_abi.rs
+    // is the single source of truth for span validation semantics.
+    // This JS decoder MUST be byte-identical to native_abi for every
+    // malformed-input case (errno + accept/reject decision).
+    //
     // Helper: read a span {u32 off, u32 len} relative to record start.
     // Returns null for an absent (0,0) span, -22 for a misaligned offset
     // (byte-parity with native_abi.rs read_span which returns Err(Invalid)
-    // when span_off is not a multiple of 4), or the span on success.
+    // when span_off is not a multiple of 4), -75 for an out-of-bounds span
+    // (byte-parity with native_abi.rs read_span Err(Overflow)), or the
+    // validated span on success.
     const readSpan = (
       off: number,
-    ): { off: number; len: number } | null | -22 => {
+    ): { off: number; len: number } | null | -22 | -75 => {
       const spanOff = hdr.getUint32(off, true);
       const spanLen = hdr.getUint32(off + 4, true);
       if (spanOff === 0 && spanLen === 0) return null;
       if (spanOff % 4 !== 0) return -22; // I1: align parity with native_abi.rs
+      // F2: out-of-bounds span → Overflow(-75), NOT null/absent.
+      // native_abi.rs read_span: end > bytes.len() → Err(Overflow) → errno -75.
+      if (spanOff + spanLen > logicalSize) return -75;
       return { off: spanOff, len: spanLen };
     };
     const readString = (
       spanOff: number,
-    ): string | null | -22 => {
+    ): string | null | -22 | -75 => {
       const span = readSpan(spanOff);
       if (span === null) return null;
       if (span === -22) return -22; // propagate alignment error
-      if (span.off + span.len > logicalSize) return null;
+      if (span === -75) return -75; // propagate overflow error (F2)
       return new TextDecoder().decode(
         bytes.subarray(span.off, span.off + span.len),
       );
@@ -1786,11 +1810,18 @@ function buildUserYurtImports(
     // prog (required, offset 8)
     const prog = readString(8);
     if (prog === -22) return -22; // misaligned span
+    // F2: OOB required prog span → -75 (EOVERFLOW), matching native_abi.rs
+    // read_span Err(Overflow) → errno -75.
+    if (prog === -75) return -75;
     if (prog === null || prog.length === 0) return -EINVAL;
 
-    // argv0 (optional, offset 16) — used as argv[0] if present
+    // argv0 (optional, offset 16) — used as argv[0] if present.
+    // F2 fix: OOB optional span → reject with -75 (NOT treat as absent).
+    // native_abi.rs read_optional_string: end > bytes.len() → Err(Overflow)
+    // → errno -75, spawn rejected.  A genuinely-absent span (0,0) → Ok(None).
     const argv0Raw = readString(16);
-    if (argv0Raw === -22) return -EINVAL; // misaligned optional span
+    if (argv0Raw === -22) return -22; // misaligned optional span
+    if (argv0Raw === -75) return -75; // F2: OOB optional span → reject, not absent
     const argv0: string | null = argv0Raw;
 
     // args_off (u32@24), args_count (u32@28) — args[1..] span-vector
@@ -2432,9 +2463,28 @@ class CachedProcessEngine {
       : undefined;
     userMemoryRef.memory = memory ?? new WebAssembly.Memory({ initial: 0 });
 
+    // Register the child in instances/handlesByPid (same shape as spawn()) so
+    // that spawnThread(childPid, ...) can resolve it during the child's run.
+    // This is the P2-1 fix: without registration, kh_thread_spawn callbacks
+    // that arrive while the child is running return -ESRCH.
+    const handle = this.nextHandle++;
+    this.instances.set(handle, {
+      pid: childPid,
+      module,
+      instance,
+      memory: userMemoryRef.memory,
+      userMemoryRef,
+      argv,
+    });
+    this.handlesByPid.set(childPid, handle);
+
     // Run _start; missing _start is treated as clean exit 0.
     const start = instance.exports._start;
-    if (typeof start !== "function") return 0;
+    if (typeof start !== "function") {
+      this.instances.delete(handle);
+      this.handlesByPid.delete(childPid);
+      return 0;
+    }
 
     const PROC_EXIT_RE = /proc_exit\((-?\d+)\)/;
     try {
@@ -2443,8 +2493,29 @@ class CachedProcessEngine {
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
       const m = PROC_EXIT_RE.exec(msg);
-      if (m) return Number(m[1]) | 0;
-      throw e; // genuine trap — propagate
+      if (m) return Number(m[1]) | 0; // proc_exit(n) → n
+      // Genuine (non-proc_exit) trap: panic / `unreachable` / missing
+      // import / abort. P2-2: DO NOT re-throw — a throw here unwinds
+      // out through the parent's `host_wait` import and crashes the
+      // PARENT with no errno (the JS half of the cross-host bug).
+      // Instead reap the trapped child with the deterministic
+      // abnormal-termination status; `runPendingSpawns` records it via
+      // `recordExit` and the parent's `host_wait` reaps the failed
+      // child cleanly. Byte-identical to the Rust host's three-way
+      // split (Err + last_exit None → CHILD_TRAP_EXIT). The `finally`
+      // below still runs (P2-1 deregister) and the F1 `drainDepth`
+      // guard stays balanced — this path returns normally rather than
+      // throwing, so every `depth.value--` / `finally` still fires.
+      return CHILD_TRAP_EXIT;
+    } finally {
+      // Deregister the child after its run completes (or throws).
+      // runCachedChild owns the full child lifetime — unlike spawn() which
+      // leaves the entry live for the engine to destroy() later, this path
+      // is synchronous run-to-completion, so we clean up immediately to
+      // prevent handle/pid-map leaks and stale childPid→handle collisions
+      // if a later spawn reuses this pid.
+      this.instances.delete(handle);
+      this.handlesByPid.delete(childPid);
     }
   }
 
