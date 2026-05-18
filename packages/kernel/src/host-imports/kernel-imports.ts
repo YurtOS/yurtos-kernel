@@ -2234,6 +2234,116 @@ export function createKernelImports(
       return opts.kernel.killpg(pgid, sig) > 0 ? 0 : -1;
     },
 
+    // --- (B) kernel-owned signal state (#90 sub-project B) -----------------
+    //
+    // The (B) guest libc (abi/src/yurt_signal.c) declares four new `yurt`
+    // imports — host_sigaction / host_sigprocmask / host_signal_raise /
+    // host_signal_query — so EVERY guest wasm built by `make -C abi all`
+    // now requires them at instantiation time. The kernel-wasm (Rust) path
+    // and the kernel-host-interface-{js,deno} surfaces were wired by B-T9,
+    // but this legacy TS-kernel import surface (used by Sandbox/NodeAdapter,
+    // hence the fixture-build smoke test) was not — a missing `yurt` import
+    // makes WebAssembly.instantiate throw LinkError for every fixture
+    // (universal exit 127). (B)'s contract is "kernel owns signal state;
+    // guest holds none and only executes the kernel's verdict". This legacy
+    // TS kernel does not carry a per-thread blocked mask / disposition
+    // table, so — exactly like host_kill / host_killpg above are
+    // best-effort against this kernel — these report the clean default
+    // state (no signals blocked, SIG_DFL disposition, nothing deliverable).
+    // That keeps libc startup, sigaction(_,NULL,&old) ctor queries, and
+    // the smoke workloads correct without the guest ever holding policy.
+    // Wire formats are the verbatim contract from abi/contract/
+    // yurt_abi_methods.toml (sys_sigaction 0x1_001C 21-byte has_act;
+    // sys_sigprocmask/raise/query 0x1_00B4/B5/B6) and yurt_signal.c.
+
+    // host_sigaction(reqPtr, reqLen=21, outPtr, outCap=16) -> i32
+    // Request: u32 sig | u8 has_act | u32 handler | u64 sa_mask | u32 flags.
+    // Response (always): {u32 prior_handler, u64 prior_mask, u32 prior_flags}.
+    // SIGKILL(9)/SIGSTOP(19) have no settable disposition => -EINVAL.
+    host_sigaction(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
+      if (reqLen < 21) return ERR_INVALID;
+      if (reqPtr < 0 || reqPtr + 21 > memory.buffer.byteLength) return ERR_IO;
+      const sig = new DataView(memory.buffer).getUint32(reqPtr, true);
+      if (sig === 9 || sig === 19) return ERR_INVALID;
+      const required = 16;
+      if (outCap < required) return required;
+      if (outPtr < 0 || outPtr + required > memory.buffer.byteLength) {
+        return ERR_IO;
+      }
+      // No disposition table on this kernel: prior is always SIG_DFL/0/0.
+      const view = new DataView(memory.buffer);
+      view.setUint32(outPtr, 0, true); // prior handler = SIG_DFL
+      view.setBigUint64(outPtr + 4, 0n, true); // prior sa_mask = empty
+      view.setUint32(outPtr + 12, 0, true); // prior sa_flags = 0
+      return required;
+    },
+
+    // host_sigprocmask(reqPtr, reqLen=6, outPtr, outCap=1) -> i32
+    // Request: i32 how | u8 has_set | u8 set (compact 1-byte sigset_t).
+    // Response: u8 oset (prior mask). how 0=BLOCK 1=UNBLOCK 2=SETMASK.
+    host_sigprocmask(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
+      if (reqLen < 6) return ERR_INVALID;
+      if (reqPtr < 0 || reqPtr + 6 > memory.buffer.byteLength) return ERR_IO;
+      const how = new DataView(memory.buffer).getInt32(reqPtr, true);
+      if (how !== 0 && how !== 1 && how !== 2) return ERR_INVALID;
+      const required = 1;
+      if (outCap < required) return required;
+      if (outPtr < 0 || outPtr + required > memory.buffer.byteLength) {
+        return ERR_IO;
+      }
+      // No per-thread blocked mask on this kernel: prior mask is empty.
+      new DataView(memory.buffer).setUint8(outPtr, 0);
+      return required;
+    },
+
+    // host_signal_raise(reqPtr, reqLen=4, outPtr, outCap=8) -> i32
+    // Request: u32 sig. Response: {i32 action, u32 handler_token}.
+    // action 0=NONE 1=RUN_HANDLER 2=DFL_TERMINATE 3=DFL_STOP 4=DFL_CONT.
+    // This kernel holds no disposition state; the guest never adjudicates
+    // and only executes the verdict, so report NONE (discard) — matching
+    // host_kill's best-effort posture on this surface.
+    host_signal_raise(
+      reqPtr: number,
+      reqLen: number,
+      outPtr: number,
+      outCap: number,
+    ): number {
+      if (reqLen < 4) return ERR_INVALID;
+      if (reqPtr < 0 || reqPtr + 4 > memory.buffer.byteLength) return ERR_IO;
+      const required = 8;
+      if (outCap < required) return required;
+      if (outPtr < 0 || outPtr + required > memory.buffer.byteLength) {
+        return ERR_IO;
+      }
+      const view = new DataView(memory.buffer);
+      view.setInt32(outPtr, 0, true); // action = NONE
+      view.setUint32(outPtr + 4, 0, true); // handler_token = 0
+      return required;
+    },
+
+    // host_signal_query(outPtr, outCap=1) -> i32
+    // No request. Response: u8 (1 if a deliverable signal exists, else 0).
+    // No pending/blocked state on this kernel => never deliverable.
+    host_signal_query(outPtr: number, outCap: number): number {
+      const required = 1;
+      if (outCap < required) return required;
+      if (outPtr < 0 || outPtr + required > memory.buffer.byteLength) {
+        return ERR_IO;
+      }
+      new DataView(memory.buffer).setUint8(outPtr, 0);
+      return required;
+    },
+
     // host_isatty(fd) -> i32
     // Returns 0 if fd refers to a TTY (tty_slave or tty_master), -1 (ENOTTY) otherwise.
     host_isatty(fd: number): number {

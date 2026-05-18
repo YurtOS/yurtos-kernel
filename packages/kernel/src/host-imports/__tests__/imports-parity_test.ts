@@ -31,6 +31,11 @@ const KERNEL_IMPORTS_BASELINE = [
   "host_getrlimit",
   "host_setrlimit",
   "host_kill",
+  // (B) kernel-owned signal state (#90 sub-project B)
+  "host_sigaction",
+  "host_sigprocmask",
+  "host_signal_raise",
+  "host_signal_query",
   "host_read_fd",
   "host_write_fd",
   "host_dup",
