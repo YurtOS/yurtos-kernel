@@ -13399,3 +13399,164 @@ fn readlinkat_via_dirfd_and_errors() {
         -(abi::EINVAL as i64),
     );
 }
+
+// ---------------------------------------------------------------------------
+// #85 S3: fchmodat / fchownat — resolve dirfd via shared resolve_at (S0),
+// delegate to chmod/chown (which already enforce #66 authority).
+// ---------------------------------------------------------------------------
+
+fn fchmodat_req(dirfd: u32, mode: u32, flag: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&mode.to_le_bytes());
+    req.extend_from_slice(&flag.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+fn fchownat_req(dirfd: u32, uid: u32, gid: u32, flag: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&uid.to_le_bytes());
+    req.extend_from_slice(&gid.to_le_bytes());
+    req.extend_from_slice(&flag.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+#[test]
+fn fchmodat_via_dirfd_changes_mode() {
+    let _g = crate::kernel::TestGuard::acquire();
+    make_root(1);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/s3", &mut []), 0);
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_CREAT | O_WRITE, b"/s3/f"),
+            &mut []
+        ) >= 3
+    );
+    let dfd = open_dir(b"/s3");
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FCHMODAT,
+            1,
+            &fchmodat_req(dfd, 0o600, 0, b"f"),
+            &mut []
+        ),
+        0,
+    );
+    // fstatat (S2) reflects the new perms; file-type bits preserved.
+    let mut st = [0u8; 16];
+    assert_eq!(
+        dispatch(METHOD_SYS_FSTATAT, 1, &fstatat_req(dfd, 0, b"f"), &mut st),
+        16
+    );
+    assert_eq!(
+        u32::from_le_bytes(st[12..16].try_into().unwrap()),
+        0o100_600
+    );
+
+    // AT_FDCWD + absolute parity.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FCHMODAT,
+            1,
+            &fchmodat_req(AT_FDCWD, 0o640, 0, b"/s3/f"),
+            &mut []
+        ),
+        0,
+    );
+    let mut st2 = [0u8; 16];
+    dispatch(METHOD_SYS_STAT, 1, b"/s3/f", &mut st2);
+    assert_eq!(
+        u32::from_le_bytes(st2[12..16].try_into().unwrap()),
+        0o100_640
+    );
+
+    // Rename-stable (inherits resolve_at).
+    assert_eq!(
+        dispatch(METHOD_SYS_RENAME, 1, &rename_req2(b"/s3", b"/s3m"), &mut []),
+        0
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FCHMODAT,
+            1,
+            &fchmodat_req(dfd, 0o644, 0, b"f"),
+            &mut []
+        ),
+        0,
+    );
+}
+
+#[test]
+fn fchownat_via_dirfd_and_flag_errors() {
+    let _g = crate::kernel::TestGuard::acquire();
+    make_root(1);
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/s3o", &mut []), 0);
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_CREAT | O_WRITE, b"/s3o/f"),
+            &mut []
+        ) >= 3
+    );
+    let dfd = open_dir(b"/s3o");
+
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FCHOWNAT,
+            1,
+            &fchownat_req(dfd, 0, 0, 0, b"f"),
+            &mut []
+        ),
+        0,
+    );
+    // Missing path → ENOENT (delegated to chown).
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FCHOWNAT,
+            1,
+            &fchownat_req(dfd, 0, 0, 0, b"nope"),
+            &mut []
+        ),
+        -(abi::ENOENT as i64),
+    );
+
+    // Unknown dirfd → EBADF.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FCHMODAT,
+            1,
+            &fchmodat_req(4242, 0o600, 0, b"x"),
+            &mut []
+        ),
+        -(abi::EBADF as i64),
+    );
+    // Non-zero flag (AT_SYMLINK_NOFOLLOW / AT_EMPTY_PATH) → EINVAL for now.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FCHMODAT,
+            1,
+            &fchmodat_req(AT_FDCWD, 0o600, 0x100, b"/s3o/f"),
+            &mut []
+        ),
+        -(abi::EINVAL as i64),
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_FCHOWNAT,
+            1,
+            &fchownat_req(AT_FDCWD, 0, 0, 0x1000, b"/s3o/f"),
+            &mut []
+        ),
+        -(abi::EINVAL as i64),
+    );
+    // Short request → EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_FCHOWNAT, 1, &[0u8; 8], &mut []),
+        -(abi::EINVAL as i64),
+    );
+}

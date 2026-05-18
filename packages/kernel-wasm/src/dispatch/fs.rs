@@ -1766,6 +1766,68 @@ pub(super) fn sys_readlinkat(caller_pid: u32, request: &[u8], response: &mut [u8
     readlink(caller_pid, &resolved, response)
 }
 
+/// `fchmodat(dirfd, path, mode, flag)` — #85. Request: `u32 dirfd LE +
+/// u32 mode LE + u32 flag LE + path bytes`. dirfd resolves via the
+/// shared `*at` resolver (`resolve_at`, #85 S0); delegates to `chmod`
+/// (which already enforces #66 caller-pid ownership authority). `flag`
+/// must be 0 — `AT_SYMLINK_NOFOLLOW` is `-EINVAL` for now (no `lchmod`
+/// base op; flag==0 is the coreutils/musl hot path).
+pub(super) fn sys_fchmodat(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let dirfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let mode = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let flag = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
+    if flag != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let path = &request[12..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let resolved = match resolve_at(caller_pid, dirfd, path) {
+        Ok(p) => p,
+        Err(errno) => return -(errno as i64),
+    };
+    // chmod's wire shape: u32 mode LE + path bytes.
+    let mut req = mode.to_le_bytes().to_vec();
+    req.extend_from_slice(&resolved);
+    chmod(caller_pid, &req)
+}
+
+/// `fchownat(dirfd, path, owner, group, flag)` — #85. Request: `u32
+/// dirfd LE + u32 uid LE + u32 gid LE + u32 flag LE + path bytes`.
+/// dirfd resolves via the shared `*at` resolver (`resolve_at`, #85
+/// S0); delegates to `chown` (which already enforces #66 caller-pid
+/// ownership authority). `flag` must be 0 — `AT_SYMLINK_NOFOLLOW`
+/// (lchown) and `AT_EMPTY_PATH` are `-EINVAL` for now.
+pub(super) fn sys_fchownat(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 16 {
+        return -(abi::EINVAL as i64);
+    }
+    let dirfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let uid = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let gid = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
+    let flag = u32::from_le_bytes(request[12..16].try_into().expect("4 bytes"));
+    if flag != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    let path = &request[16..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let resolved = match resolve_at(caller_pid, dirfd, path) {
+        Ok(p) => p,
+        Err(errno) => return -(errno as i64),
+    };
+    // chown's wire shape: u32 uid LE + u32 gid LE + path bytes.
+    let mut req = uid.to_le_bytes().to_vec();
+    req.extend_from_slice(&gid.to_le_bytes());
+    req.extend_from_slice(&resolved);
+    chown(caller_pid, &req)
+}
+
 /// Shared body for `sys_access` and `sys_faccessat`. Resolves the path
 /// (following symlinks unless AT_SYMLINK_NOFOLLOW), then checks the
 /// requested mode against the resolved file's metadata with the
