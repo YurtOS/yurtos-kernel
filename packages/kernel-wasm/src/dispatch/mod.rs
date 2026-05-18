@@ -267,12 +267,12 @@ pub fn dispatch_with_context(
         METHOD_SYS_SOCKET_ADDR => sys_socket_addr(caller_pid, request, response),
         METHOD_SYS_SOCKET_INFO => sys_socket_info(caller_pid, request, response),
         METHOD_SYS_SOCKET_RECVFROM => sys_socket_recvfrom(caller_pid, request, response),
-        // Linux event-loop primitives (issue #92). IDs reserved here in
+        // Linux event-loop primitives (issue #92). IDs reserved in
         // S0; per-primitive handlers land in S1..S4. Until then each
         // returns -ENOSYS through an explicit arm so the constants are
         // exercised (not dead-code) and the dispatch table makes the
         // pending coverage visible at a glance.
-        METHOD_SYS_EVENTFD => -(abi::ENOSYS as i64),
+        METHOD_SYS_EVENTFD => sys_eventfd(caller_pid, request),
         METHOD_SYS_TIMERFD_CREATE => -(abi::ENOSYS as i64),
         METHOD_SYS_TIMERFD_SETTIME => -(abi::ENOSYS as i64),
         METHOD_SYS_TIMERFD_GETTIME => -(abi::ENOSYS as i64),
@@ -363,6 +363,10 @@ fn close_entry(k: &mut Kernel, entry: FdEntry) -> Option<i32> {
         }
         crate::kernel::FdEntry::Directory { .. } => None,
         crate::kernel::FdEntry::Socket { id } => k.socket_dec_ref(id),
+        crate::kernel::FdEntry::EventFd { id } => {
+            k.eventfd_dec_ref(id);
+            None
+        }
         _ => None,
     }
 }
@@ -619,6 +623,7 @@ fn get_file_status_flags(caller_pid: u32, request: &[u8]) -> i64 {
                 PipeEnd::Write => 1,
             },
             FdEntry::Socket { .. } => 2,
+            FdEntry::EventFd { .. } => 2, // eventfd is read+write
         }
     })
 }
@@ -822,6 +827,7 @@ fn read_fd(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
             }
             crate::kernel::FdEntry::Directory { .. } => -(abi::EISDIR as i64),
             crate::kernel::FdEntry::Socket { id } => socket_recv_id(k, id, response, 0),
+            crate::kernel::FdEntry::EventFd { id } => eventfd_read(k, id, response),
         }
     })
 }
@@ -896,6 +902,7 @@ fn write_fd(caller_pid: u32, request: &[u8]) -> i64 {
             }
             crate::kernel::FdEntry::Directory { .. } => -(abi::EBADF as i64),
             crate::kernel::FdEntry::Socket { id } => socket_send_id(k, id, payload),
+            crate::kernel::FdEntry::EventFd { id } => eventfd_write(k, id, payload),
         }
     })
 }
@@ -923,6 +930,111 @@ fn sys_getrandom(request: &[u8], response: &mut [u8]) -> i64 {
     match crate::kh::fill_random(&mut response[..len]) {
         Ok(()) => len as i64,
         Err(rc) => rc as i64,
+    }
+}
+
+// ── Linux event-loop primitives — issue #92 ───────────────────────────
+
+/// `eventfd(2)` flag bits. Linux values (the corresponding `O_*`
+/// values are the same for `NONBLOCK` / `CLOEXEC`, which is why the
+/// kernel reuses the bit definitions across families).
+const EFD_SEMAPHORE: u32 = 0x1;
+const EFD_NONBLOCK: u32 = 0x800;
+const EFD_CLOEXEC: u32 = 0x80000;
+const EFD_FLAGS_MASK: u32 = EFD_SEMAPHORE | EFD_NONBLOCK | EFD_CLOEXEC;
+
+/// `eventfd2(initval, flags)`. Request: u32 initval_lo LE + u32
+/// initval_hi LE (u64 initval split as two LE u32s — wasm32 ABI keeps
+/// the kernel-wasm request format word-aligned) + u32 flags LE.
+/// Returns the allocated fd; `-EINVAL` for unknown flag bits or
+/// short request; `-EMFILE` for fd-table exhaustion.
+fn sys_eventfd(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 12 {
+        return -(abi::EINVAL as i64);
+    }
+    let initval_lo = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes")) as u64;
+    let initval_hi = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes")) as u64;
+    let initval = (initval_hi << 32) | initval_lo;
+    let flags = u32::from_le_bytes(request[8..12].try_into().expect("4 bytes"));
+    // Reject unknown bits — matches Linux's man page wording
+    // ("the operation fails with the error EINVAL").
+    if flags & !EFD_FLAGS_MASK != 0 {
+        return -(abi::EINVAL as i64);
+    }
+    with_kernel(|k| {
+        let id = k.create_eventfd(initval, flags);
+        let Some(fd) = k.process_mut(caller_pid).lowest_free_fd_in_limit() else {
+            // No fd slot — release the just-allocated counter so it
+            // doesn't leak (parity with the `sys_pipe` / `sys_socketpair`
+            // rollback discipline).
+            k.eventfd_dec_ref(id);
+            return -(abi::EMFILE as i64);
+        };
+        k.process_mut(caller_pid)
+            .fd_table
+            .install(fd, crate::kernel::FdEntry::EventFd { id });
+        fd as i64
+    })
+}
+
+/// Read 8 bytes from an `eventfd`. Default mode: drain the counter
+/// to zero and return its prior value as a LE `u64`. `EFD_SEMAPHORE`
+/// mode: return `1` and decrement the counter by 1. Empty counter
+/// returns `-EAGAIN` when `EFD_NONBLOCK` is set; blocking is gated to
+/// AsyncBridge in slice S5 — until then a blocking empty read also
+/// returns `-EAGAIN` (documented at the dispatch layer). Issue #92 S1.
+fn eventfd_read(k: &mut Kernel, id: u64, response: &mut [u8]) -> i64 {
+    if response.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let Some(entry) = k.eventfd_get_mut(id) else {
+        return -(abi::EBADF as i64);
+    };
+    if entry.counter == 0 {
+        // S5 will plumb the blocking path; for now both
+        // blocking-and-empty AND nonblock-and-empty return -EAGAIN
+        // (the nonblock contract is exact, the blocking variant is
+        // documented as a known follow-up — surfacing EAGAIN keeps
+        // poll/select-driven loops correct).
+        return -(abi::EAGAIN as i64);
+    }
+    let payload = if entry.flags & EFD_SEMAPHORE != 0 {
+        entry.counter -= 1;
+        1u64
+    } else {
+        let v = entry.counter;
+        entry.counter = 0;
+        v
+    };
+    response[0..8].copy_from_slice(&payload.to_le_bytes());
+    8
+}
+
+/// Write 8 bytes to an `eventfd` — added to the counter as a LE
+/// `u64`. Per `man 2 eventfd`: the maximum counter value is
+/// `u64::MAX - 1`. A write that would overflow returns `-EAGAIN`
+/// when `EFD_NONBLOCK` is set; blocking is gated to S5. A payload
+/// value of `u64::MAX` is rejected with `-EINVAL` (Linux requires
+/// the written value be less than `u64::MAX`). Issue #92 S1.
+fn eventfd_write(k: &mut Kernel, id: u64, payload: &[u8]) -> i64 {
+    if payload.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let add = u64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
+    if add == u64::MAX {
+        return -(abi::EINVAL as i64);
+    }
+    let Some(entry) = k.eventfd_get_mut(id) else {
+        return -(abi::EBADF as i64);
+    };
+    // The counter caps at u64::MAX - 1. checked_add against the cap
+    // (#65 length-math discipline applied to a counter context).
+    match entry.counter.checked_add(add) {
+        Some(sum) if sum < u64::MAX => {
+            entry.counter = sum;
+            8
+        }
+        _ => -(abi::EAGAIN as i64),
     }
 }
 
@@ -1155,6 +1267,24 @@ fn poll_revents_for_fd(k: &mut Kernel, caller_pid: u32, fd: u32, events: i16) ->
                     revents
                 }
             }
+        }
+        FdEntry::EventFd { id } => {
+            // eventfd readiness: POLLIN iff counter > 0; POLLOUT iff
+            // the counter can accept at least 1 (i.e. < u64::MAX - 1
+            // per `man 2 eventfd`: "The maximum value that may be
+            // stored in the counter is the largest unsigned 64-bit
+            // value minus 1"). Issue #92 slice S1.
+            let Some(entry) = k.eventfd_get(id) else {
+                return POLLNVAL;
+            };
+            let mut revents = 0;
+            if wants_read && entry.counter > 0 {
+                revents |= POLLIN;
+            }
+            if wants_write && entry.counter < u64::MAX - 1 {
+                revents |= POLLOUT;
+            }
+            revents
         }
     }
 }
@@ -1538,6 +1668,9 @@ fn fstat(caller_pid: u32, request: &[u8], response: &mut [u8]) -> i64 {
                 let meta = k.resolve_metadata(mount_id, inode);
                 (sz, 4, meta.mode)
             }
+            // eventfd reports as a CHARACTER device (filetype 2) per
+            // Linux fstat behavior — it has no file size and no inode.
+            crate::kernel::FdEntry::EventFd { .. } => (0, 2, 0o020_600),
         };
         response[0..8].copy_from_slice(&size.to_le_bytes());
         response[8..12].copy_from_slice(&filetype.to_le_bytes());
