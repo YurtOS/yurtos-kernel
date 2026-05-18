@@ -1,6 +1,8 @@
 # #93 — File-backed `mmap`/`munmap`/`mprotect`/`msync`: descope-or-emulate decision + design
 
-**Status:** Decision recorded (recommendation below) — **implementation blocked on maintainer ratification** of the recommended option. Part of #83; refs #52, #71, #65.
+> **⚠️ SUPERSEDED (2026-05-18).** The recommendation in this document (single-approach "emulate, option (b)") is superseded by the tiered design in [`2026-05-18-issue-93-mmap-tiered-design.md`](./2026-05-18-issue-93-mmap-tiered-design.md), which keeps copy-emulation as the *universal floor* (Tier B) and adds a native embedder host-`MAP_FIXED` tier (Tier A). Read the 2026-05-18 spec for the ratifiable design; this document is retained for the option-space rationale and history only. Do not implement from this doc.
+
+**Status:** Superseded — see banner above. *(Original:* Decision recorded; implementation blocked on maintainer ratification. Part of #83; refs #52, #71, #65.*)*
 
 > #93 is explicitly "a maintainer decision issue first, implementation second." This document delivers acceptance item #1 (the recorded decision + rationale + the design that ratification unlocks). It does **not** unilaterally land emulation; the implementation slices are gated on a maintainer signing off option (b).
 
