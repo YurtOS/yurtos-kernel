@@ -2810,7 +2810,7 @@ impl VfsBackend for OverlayBackend {
             // Lower is read-only; matches the silent-ignore policy of
             // `truncate` for now. A future overlay rewrite that copies
             // up on write should also copy up on set_len. Issue #87.
-            Some(&(Layer::Lower, _)) => -30, // -EROFS
+            Some(&(Layer::Lower, _)) => -crate::abi::EROFS,
             None => -crate::abi::EBADF,
         }
     }

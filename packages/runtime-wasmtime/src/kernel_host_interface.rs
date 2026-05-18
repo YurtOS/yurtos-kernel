@@ -134,14 +134,14 @@ fn kernel_memory(caller: &mut Caller<'_, KernelStoreData>) -> std::result::Resul
         .ok_or(-EFAULT)
 }
 
-fn user_memory(caller: &mut Caller<'_, UserState>) -> std::result::Result<Memory, i64> {
+pub(crate) fn user_memory(caller: &mut Caller<'_, UserState>) -> std::result::Result<Memory, i64> {
     caller
         .get_export("memory")
         .and_then(|e| e.into_memory())
         .ok_or(-EFAULT)
 }
 
-fn user_shared_memory(
+pub(crate) fn user_shared_memory(
     caller: &mut Caller<'_, UserState>,
 ) -> std::result::Result<SharedMemory, i64> {
     caller
@@ -164,7 +164,7 @@ fn read_kernel_guest_bytes(
     Ok(buf)
 }
 
-fn read_user_guest_bytes(
+pub(crate) fn read_user_guest_bytes(
     caller: &mut Caller<'_, UserState>,
     ptr: u32,
     len: u32,
@@ -181,7 +181,7 @@ fn read_user_guest_bytes(
     read_shared_memory(memory, ptr, len).map_err(|_| -EFAULT)
 }
 
-fn write_user_guest_bytes(
+pub(crate) fn write_user_guest_bytes(
     caller: &mut Caller<'_, UserState>,
     ptr: u32,
     bytes: &[u8],
@@ -5588,7 +5588,7 @@ fn register_sys_imports(linker: &mut Linker<UserState>) -> Result<()> {
                 &mut crate::engine::WasmtimeCtx::new(&mut caller),
                 sys_method_id::FCHDIR,
                 fd as u32,
-            ) as i32
+            )
         },
     )?;
     linker.func_wrap(

@@ -101,6 +101,25 @@ export interface SocketBackend {
     socket: SocketHandle,
     enabled: boolean,
   ): Awaitable<SocketBackendResult>;
+  /**
+   * Begin listening for inbound connections.
+   *
+   * **Cross-process atomicity contract (#125 audit, 2026-05-18):** any
+   * mutation of process-global state — ephemeral-port assignment,
+   * loopback-route/registry insertion, listener-table writes — MUST
+   * happen **only** in this method's resolved continuation (i.e.
+   * synchronously inside the Promise's resolve path). Backends MUST
+   * NOT mutate shared route/port state *before* their internal await
+   * and finalize it *after*: that would let two concurrent listen()
+   * calls from different processes interleave their global writes
+   * across the worker-host dispatcher's per-process serializer
+   * boundary. The in-tree loopback + bridge backends already satisfy
+   * this; new backends inheriting this interface must too.
+   *
+   * See
+   * `docs/superpowers/specs/2026-05-17-125-worker-host-cross-process-mutation-audit-design.md`
+   * for the full rationale.
+   */
   listen?(
     req: SocketListenBackendRequest,
   ): Awaitable<SocketListenBackendResult>;
@@ -310,7 +329,9 @@ export function createLoopbackSocketBackend(
           port: req.port,
           backlog: req.backlog,
         });
-        const publishedHost = req.host === "0.0.0.0" ? "10.0.2.15" : (r.host ?? req.host);
+        const publishedHost = req.host === "0.0.0.0"
+          ? "10.0.2.15"
+          : (r.host ?? req.host);
         return {
           ok: true,
           listener: pub(r.handle),
@@ -405,28 +426,34 @@ export function createNetworkBridgeSocketBackend(
     },
 
     async send(socket, data) {
-      return socketResult(await bridge.requestSync({
-        op: "send",
-        socket_id: socket,
-        data: Array.from(data),
-      }));
+      return socketResult(
+        await bridge.requestSync({
+          op: "send",
+          socket_id: socket,
+          data: Array.from(data),
+        }),
+      );
     },
 
     async recv(socket, maxBytes, opts) {
-      return socketResult(await bridge.requestSync({
-        op: "recv",
-        socket_id: socket,
-        max_bytes: maxBytes,
-        nonblocking: opts?.nonblocking === true,
-      }));
+      return socketResult(
+        await bridge.requestSync({
+          op: "recv",
+          socket_id: socket,
+          max_bytes: maxBytes,
+          nonblocking: opts?.nonblocking === true,
+        }),
+      );
     },
 
     async setNoDelay(socket, enabled) {
-      return socketResult(await bridge.requestSync({
-        op: "set_no_delay",
-        socket_id: socket,
-        enabled,
-      }));
+      return socketResult(
+        await bridge.requestSync({
+          op: "set_no_delay",
+          socket_id: socket,
+          enabled,
+        }),
+      );
     },
 
     async listen(req) {
@@ -454,10 +481,12 @@ export function createNetworkBridgeSocketBackend(
     },
 
     async accept(listener) {
-      return parseAccept(await bridge.requestSync({
-        op: "accept",
-        listener_id: listener,
-      }));
+      return parseAccept(
+        await bridge.requestSync({
+          op: "accept",
+          listener_id: listener,
+        }),
+      );
     },
 
     /**
@@ -479,10 +508,12 @@ export function createNetworkBridgeSocketBackend(
       let delayMs = 5;
       // deno-lint-ignore no-constant-condition
       while (true) {
-        const r = parseAccept(await bridge.requestSync({
-          op: "accept",
-          listener_id: listener,
-        }));
+        const r = parseAccept(
+          await bridge.requestSync({
+            op: "accept",
+            listener_id: listener,
+          }),
+        );
         if (!(r.ok === false && "wouldBlock" in r && r.wouldBlock === true)) {
           return r;
         }
@@ -502,12 +533,14 @@ export function createNetworkBridgeSocketBackend(
       let delayMs = 5;
       // deno-lint-ignore no-constant-condition
       while (true) {
-        const r = socketResult(await bridge.requestSync({
-          op: "recv",
-          socket_id: socket,
-          max_bytes: maxBytes,
-          nonblocking: true,
-        }));
+        const r = socketResult(
+          await bridge.requestSync({
+            op: "recv",
+            socket_id: socket,
+            max_bytes: maxBytes,
+            nonblocking: true,
+          }),
+        );
         if (r.ok) {
           // EOF (`ok` with no bytes) and any byte payload exit the poll.
           return r;
@@ -519,17 +552,21 @@ export function createNetworkBridgeSocketBackend(
     },
 
     async closeListener(listener) {
-      return socketResult(await bridge.requestSync({
-        op: "close_listener",
-        listener_id: listener,
-      }));
+      return socketResult(
+        await bridge.requestSync({
+          op: "close_listener",
+          listener_id: listener,
+        }),
+      );
     },
 
     async close(socket) {
-      return socketResult(await bridge.requestSync({
-        op: "close",
-        socket_id: socket,
-      }));
+      return socketResult(
+        await bridge.requestSync({
+          op: "close",
+          socket_id: socket,
+        }),
+      );
     },
   };
 }

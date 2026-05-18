@@ -942,11 +942,7 @@ fn expand_param(state: &mut ShellState, var: &str, op: &str, operand: &str) -> S
 
 /// Collect char boundary positions for safe slicing.
 /// Expand `$(cmd)` command substitutions in a raw string (e.g. inside arithmetic).
-fn expand_command_subs_in_string(
-    state: &mut ShellState,
-    s: &str,
-    exec: Option<&dyn Fn(&mut ShellState, &str) -> String>,
-) -> String {
+fn expand_command_subs_in_string(state: &mut ShellState, s: &str, exec: Option<ExecFn>) -> String {
     let exec_fn = match exec {
         Some(f) => f,
         None => return s.to_string(),
