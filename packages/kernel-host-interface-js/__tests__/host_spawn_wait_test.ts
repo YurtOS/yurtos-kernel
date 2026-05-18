@@ -438,3 +438,78 @@ Deno.test("P2-1: spawned child can create threads (runCachedChild registers in h
     `threaded child should exit 0, got ${status} (pre-fix: -ESRCH from spawnThread causes child assert to panic)`,
   );
 });
+
+// ── Test 6: P2-2 cross-host parity — trapped child reaps 134, parent survives ─
+
+/**
+ * Regression test for P2-2: a spawned child that takes a GENUINE wasm
+ * trap (`unreachable`) BEFORE calling `proc_exit` was mis-reaped
+ * divergently across hosts:
+ *
+ *   * Rust: `child.run_start()` Err + `last_exit() == None` →
+ *     `unwrap_or(0)` recorded the trapped child as exit 0 (false
+ *     success).
+ *   * JS: `runCachedChild`'s `catch` re-threw the non-`proc_exit`
+ *     error; it unwound out through the parent's `host_wait` import and
+ *     crashed the *parent* with no errno.
+ *
+ * The fix reaps a trapped child with the deterministic
+ * abnormal-termination status `CHILD_TRAP_EXIT = 134` (= 128 + SIGABRT)
+ * on BOTH hosts, the parent is unaffected, and the drain continues.
+ *
+ * This exercises the FULL guest path: the parent fixture's `_start`
+ * calls `host_wait`, which re-entrantly drives `runPendingSpawns`
+ * itself (EAGAIN), runs the trapping child via `runCachedChild`, and
+ * MUST absorb its trap as 134 (not re-throw and crash the parent). A
+ * single `runStart()` drives the whole tree — exactly like the
+ * spawn-wait fixture above.
+ *
+ * The asserted stdout literal ("child reaped status 134") is
+ * BYTE-IDENTICAL to the Rust `fixture_parity` case
+ * `spawn_trap_child_reaps_as_134_and_parent_survives_cross_host` — the
+ * cross-host parity oracle (same discipline as spawn-wait / spawn-badreq).
+ */
+Deno.test("P2-2: trapped spawned child reaps as 134 and parent survives (cross-host parity)", async () => {
+  const mk = await freshKernelHostInterface();
+
+  // Stage the trapping child at the path the parent fixture spawns.
+  const childWasm = await fixtureWasm("trap-child-wasm", "trap-child-wasm");
+  mk.registerRamfsFile(s("/trap-child.wasm"), childWasm);
+
+  const parentWasm = await fixtureWasm(
+    "spawn-trap-child-wasm",
+    "spawn-trap-child-wasm",
+  );
+  const user = mk.spawnUserProcessWithArgs(parentWasm, [
+    s("/spawn-trap-child.wasm"),
+  ]);
+
+  // Pre-fix this throws a non-`proc_exit` trap out of host_wait →
+  // runStart, crashing the parent. Post-fix the child is reaped as 134
+  // inside the drain and the parent proc_exit(0)s normally.
+  let exitCode = -1;
+  try {
+    user.runStart();
+    exitCode = 0;
+  } catch (e) {
+    const msg = String((e as Error).message ?? e);
+    const m = /proc_exit\((-?\d+)\)/.exec(msg);
+    if (m) {
+      exitCode = Number(m[1]);
+    } else {
+      // A non-proc_exit throw here == the child's trap propagated and
+      // crashed the parent (the P2-2 bug). Surface it as a failure.
+      throw new Error(
+        `parent crashed: child trap propagated instead of reaping as 134: ${msg}`,
+      );
+    }
+  }
+
+  const stdout = new TextDecoder().decode(user.capturedStdout()).trim();
+  assertEquals(stdout, "child reaped status 134");
+  assertEquals(
+    exitCode,
+    0,
+    `parent itself must exit cleanly (0); it must NOT be crashed by the child's trap (got ${exitCode})`,
+  );
+});

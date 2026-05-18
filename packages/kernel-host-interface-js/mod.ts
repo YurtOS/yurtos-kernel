@@ -503,6 +503,20 @@ const ESRCH = 3;
 const ENOSYS = 38;
 const EDEADLK = 35;
 
+/**
+ * Exit status recorded for a spawned child that terminated
+ * **abnormally** — a genuine wasm trap (panic / `unreachable` /
+ * missing import / abort) BEFORE it called `proc_exit`. 134 is the
+ * conventional `128 + SIGABRT(6)` shell `$?` value for abnormal
+ * termination. Byte-identical to the Rust host's `CHILD_TRAP_EXIT`
+ * (`packages/runtime-wasmtime/src/kernel_host_interface.rs`) so both
+ * hosts reap a trapped child to the SAME status (P2-2). Full
+ * `WIFSIGNALED`/signal-discriminated wait status is tracked in #99;
+ * until then a trapped child reaps as this fixed
+ * abnormal-termination code.
+ */
+const CHILD_TRAP_EXIT = 134;
+
 function ipv4SocketAddrRecord(host: string, port: number): Uint8Array {
   const out = new Uint8Array(8);
   const parts = host.split(".").map((part) => Number(part));
@@ -2462,8 +2476,20 @@ class CachedProcessEngine {
     } catch (e) {
       const msg = (e as Error).message ?? String(e);
       const m = PROC_EXIT_RE.exec(msg);
-      if (m) return Number(m[1]) | 0;
-      throw e; // genuine trap — propagate
+      if (m) return Number(m[1]) | 0; // proc_exit(n) → n
+      // Genuine (non-proc_exit) trap: panic / `unreachable` / missing
+      // import / abort. P2-2: DO NOT re-throw — a throw here unwinds
+      // out through the parent's `host_wait` import and crashes the
+      // PARENT with no errno (the JS half of the cross-host bug).
+      // Instead reap the trapped child with the deterministic
+      // abnormal-termination status; `runPendingSpawns` records it via
+      // `recordExit` and the parent's `host_wait` reaps the failed
+      // child cleanly. Byte-identical to the Rust host's three-way
+      // split (Err + last_exit None → CHILD_TRAP_EXIT). The `finally`
+      // below still runs (P2-1 deregister) and the F1 `drainDepth`
+      // guard stays balanced — this path returns normally rather than
+      // throwing, so every `depth.value--` / `finally` still fires.
+      return CHILD_TRAP_EXIT;
     } finally {
       // Deregister the child after its run completes (or throws).
       // runCachedChild owns the full child lifetime — unlike spawn() which

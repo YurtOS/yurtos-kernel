@@ -463,6 +463,68 @@ fn spawn_deep_recursion_returns_edeadlk_not_stack_overflow() {
 }
 
 #[test]
+fn spawn_trap_child_reaps_as_134_and_parent_survives_cross_host() {
+    // Cross-host parity (P2-2): a guest `host_spawn`s a child that
+    // *traps* (a genuine wasm `unreachable`, NOT a `proc_exit`) before
+    // ever reaching `proc_exit`. The trapped child MUST be reaped with
+    // a deterministic abnormal-termination status (134 = 128 + SIGABRT,
+    // the shell `$?` convention) and the PARENT must keep running and
+    // exit cleanly — it must NOT crash as a propagated host trap.
+    //
+    //   /spawn-trap-child.wasm  host_spawn(/trap-child.wasm)
+    //     → SYS_SPAWN (kernel stages the child)
+    //     → host_wait → SYS_WAIT, EAGAIN → drain_and_run_pending_spawns
+    //         → /trap-child.wasm runs, hits `unreachable` → wasm trap;
+    //           run_start() is Err AND last_exit() is None  →  the host
+    //           reaps it as CHILD_TRAP_EXIT (134), the drain CONTINUES,
+    //           and the trap is NOT propagated out (parent unaffected)
+    //       → SYS_WAIT now reaps → status 134 → wait_result decodes
+    //         {exit_code=0, signal=6} (134 ∈ [128,192))
+    //     → parent reconstructs 128+signal = 134, prints it, proc_exit(0).
+    //
+    // The "child reaped status 134" literal MUST match the JS E2E
+    // (`packages/kernel-host-interface-js/__tests__/host_spawn_wait_test.ts`)
+    // byte-for-byte — the cross-host parity oracle.
+    ensure_fixture_built("spawn-trap-child-wasm");
+    ensure_fixture_built("trap-child-wasm");
+    let parent_wasm = std::fs::read(fixture_wasm_path("spawn-trap-child-wasm")).unwrap();
+    let child_wasm = std::fs::read(fixture_wasm_path("trap-child-wasm")).unwrap();
+
+    let mk = fresh_kernel_host_interface();
+    mk.register_ramfs_file(b"/trap-child.wasm", &child_wasm)
+        .unwrap();
+
+    let argv: Vec<&[u8]> = vec![b"/spawn-trap-child.wasm"];
+    let mut user = mk
+        .spawn_user_process_with_args(&parent_wasm, &argv)
+        .unwrap();
+    // The parent's host_wait drives the trapped child to completion
+    // itself (EAGAIN → drain_and_run_pending_spawns). The child's trap
+    // MUST be absorbed by the drain (reaped as 134) and NOT crash the
+    // parent: run_start() therefore ends in the parent's own
+    // proc_exit(0) trap, never the child's `unreachable`.
+    let run = user.run_start();
+    assert!(
+        run.is_err(),
+        "parent ends in its own proc_exit (a trap), not a clean return"
+    );
+    let msg = format!("{:#}", run.unwrap_err());
+    assert!(
+        msg.contains("proc_exit(0)"),
+        "parent must survive the child's trap and proc_exit(0) itself; got: {msg}"
+    );
+
+    let stdout = String::from_utf8_lossy(&user.captured_stdout().unwrap()).to_string();
+    let exit_code = user.last_exit().unwrap_or(-1);
+    // Byte-identical cross-host literal (same string asserted in the JS test):
+    assert_eq!(stdout.trim(), "child reaped status 134");
+    assert_eq!(
+        exit_code, 0,
+        "parent itself must exit cleanly (0) — it was NOT crashed by the child's trap"
+    );
+}
+
+#[test]
 fn false_cmd_fixture_runs_and_proc_exits_nonzero() {
     ensure_fixture_built("false-cmd-wasm");
     let wasm_bytes = std::fs::read(fixture_wasm_path("false-cmd-wasm")).unwrap();

@@ -3466,14 +3466,26 @@ fn record_exit_raw(kernel: &Arc<Mutex<KernelInstance>>, pid: u32, exit_status: i
     Ok(())
 }
 
+/// Exit status recorded for a spawned child that terminated
+/// **abnormally** — a genuine wasm trap (panic / `unreachable` /
+/// missing import / abort) BEFORE it called `proc_exit`. 134 is the
+/// conventional `128 + SIGABRT(6)` shell `$?` value for abnormal
+/// termination. Byte-identical to the JS host's `CHILD_TRAP_EXIT`
+/// (`packages/kernel-host-interface-js/mod.ts`) so both hosts reap a
+/// trapped child to the SAME status (P2-2). Full
+/// `WIFSIGNALED`/signal-discriminated wait status is tracked in #99;
+/// until then a trapped child reaps as this fixed
+/// abnormal-termination code.
+const CHILD_TRAP_EXIT: i32 = 134;
+
 /// Drain every staged sys_spawn child, instantiate it with the
 /// kernel-allocated pid, run it to completion, and record its exit so the
 /// parent's `sys_wait` can reap it. Returns the number of children run.
 /// This is the shared body for `KernelHostInterface::run_pending_spawns`
 /// and `host_wait`'s EAGAIN drive loop — semantics are identical to the
 /// pre-extraction `run_pending_spawns` (flat `while let Some`, instantiate
-/// bound to the kernel-allocated `child_pid`, `run_start()`,
-/// `last_exit().unwrap_or(0)`, `record_exit`).
+/// bound to the kernel-allocated `child_pid`, `run_start()`, then the
+/// three-way `run_start()`/`last_exit()` split below, `record_exit`).
 fn drain_and_run_pending_spawns(
     engine: &Engine,
     kernel: &Arc<Mutex<KernelInstance>>,
@@ -3509,12 +3521,34 @@ fn drain_and_run_pending_spawns(
             spawn.argv,
             spawn_wait_depth,
         )?;
-        // run_start traps when the child calls proc_exit; the
-        // shim stashes the exit code in UserState first. A
-        // clean return (non-WASI exit) leaves last_exit None,
-        // which we report as 0.
-        let _ = child.run_start();
-        let exit = child.last_exit().unwrap_or(0);
+        // Three-way split of run_start()/last_exit() (P2-2). The
+        // contract is fixed by the WASI `proc_exit` shim
+        // (`wasi_shim.rs`): it sets `caller.data_mut().last_exit =
+        // Some(rval)` and THEN returns `Err`. Host-side instantiation /
+        // compile errors are already separated out — they propagate via
+        // the `?` on `instantiate_with_pid_raw` ABOVE, before we ever
+        // reach here — so the only `Err` `run_start()` can yield at
+        // this point is a guest `_start` trap (the proc_exit shim trap,
+        // or a genuine trap), discriminated by `last_exit`:
+        //
+        //   1. Ok(())                       → clean return, no WASI
+        //      exit            → last_exit None → exit 0.
+        //   2. Err + last_exit == Some(n)   → child called
+        //      proc_exit(n)    → exit n.
+        //   3. Err + last_exit == None      → GENUINE trap (panic /
+        //      `unreachable` / missing import / abort) before any
+        //      proc_exit → reap as CHILD_TRAP_EXIT (134), NOT 0.
+        //
+        // Case 3 MUST NOT propagate the trap out of this function: the
+        // child is reaped with the failure code and the drain
+        // continues, so the parent's `host_wait` sees a failed child
+        // and the parent itself is unaffected (no parent crash).
+        let run = child.run_start();
+        let exit = match (run.is_ok(), child.last_exit()) {
+            (true, _) => 0,                          // 1: clean return
+            (false, Some(n)) => n,                   // 2: proc_exit(n)
+            (false, None) => CHILD_TRAP_EXIT,        // 3: genuine trap
+        };
         record_exit_raw(kernel, spawn.child_pid, exit)?;
         count += 1;
     }
