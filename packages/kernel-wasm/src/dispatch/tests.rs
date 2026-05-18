@@ -13059,3 +13059,180 @@ fn faccessat_dirfd_is_rename_stable_like_openat() {
         "faccessat must be inode-anchored / rename-stable like openat (#188)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #85 S1: unlinkat / mkdirat — resolve dirfd via the shared resolve_at (S0),
+// delegate to the existing unlink/rmdir/mkdir base ops.
+// ---------------------------------------------------------------------------
+
+fn unlinkat_req(dirfd: u32, flag: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&flag.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+fn mkdirat_req(dirfd: u32, mode: u32, path: &[u8]) -> Vec<u8> {
+    let mut req = dirfd.to_le_bytes().to_vec();
+    req.extend_from_slice(&mode.to_le_bytes());
+    req.extend_from_slice(path);
+    req
+}
+
+const AT_REMOVEDIR: u32 = 0x200;
+
+#[test]
+fn mkdirat_unlinkat_via_dirfd_and_at_fdcwd() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/s1-base", &mut []), 0);
+    let dfd = open_dir(b"/s1-base");
+
+    // mkdirat(dfd, "sub") creates /s1-base/sub.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_MKDIRAT,
+            1,
+            &mkdirat_req(dfd, 0o755, b"sub"),
+            &mut []
+        ),
+        0,
+    );
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_DIRECTORY, b"/s1-base/sub"),
+            &mut []
+        ) >= 3,
+        "mkdirat must have created /s1-base/sub",
+    );
+
+    // unlinkat(dfd, AT_REMOVEDIR, "sub") == rmdir.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_UNLINKAT,
+            1,
+            &unlinkat_req(dfd, AT_REMOVEDIR, b"sub"),
+            &mut [],
+        ),
+        0,
+    );
+    // Gone: rmdir of the now-missing dir is the base op's well-defined
+    // -ENOENT (avoids open(O_DIRECTORY) missing-path errno nuance).
+    assert_eq!(
+        dispatch(METHOD_SYS_RMDIR, 1, b"/s1-base/sub", &mut []),
+        -(abi::ENOENT as i64),
+    );
+
+    // unlinkat(dfd, 0, "f") == unlink (a regular file).
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_CREAT | O_WRITE, b"/s1-base/f"),
+            &mut []
+        ) >= 3
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_UNLINKAT, 1, &unlinkat_req(dfd, 0, b"f"), &mut []),
+        0,
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_OPEN, 1, &open_req(0, b"/s1-base/f"), &mut []),
+        -(abi::ENOENT as i64),
+    );
+
+    // AT_FDCWD + absolute parity with the base ops.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_MKDIRAT,
+            1,
+            &mkdirat_req(AT_FDCWD, 0, b"/s1-abs"),
+            &mut []
+        ),
+        0,
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_UNLINKAT,
+            1,
+            &unlinkat_req(AT_FDCWD, AT_REMOVEDIR, b"/s1-abs"),
+            &mut []
+        ),
+        0,
+    );
+}
+
+#[test]
+fn unlinkat_mkdirat_dirfd_is_rename_stable() {
+    let _g = crate::kernel::TestGuard::acquire();
+    assert_eq!(dispatch(METHOD_SYS_MKDIR, 1, b"/s1-r", &mut []), 0);
+    let dfd = open_dir(b"/s1-r");
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_RENAME,
+            1,
+            &rename_req2(b"/s1-r", b"/s1-moved"),
+            &mut []
+        ),
+        0,
+    );
+    // Inherits resolve_at's inode anchoring (#85 S0): the renamed dir
+    // is still the target through the open dirfd.
+    assert_eq!(
+        dispatch(METHOD_SYS_MKDIRAT, 1, &mkdirat_req(dfd, 0, b"d"), &mut []),
+        0,
+    );
+    assert!(
+        dispatch(
+            METHOD_SYS_OPEN,
+            1,
+            &open_req(O_DIRECTORY, b"/s1-moved/d"),
+            &mut []
+        ) >= 3,
+        "mkdirat must hit the renamed dir (rename-stable)",
+    );
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_UNLINKAT,
+            1,
+            &unlinkat_req(dfd, AT_REMOVEDIR, b"d"),
+            &mut []
+        ),
+        0,
+    );
+}
+
+#[test]
+fn unlinkat_mkdirat_error_paths() {
+    let _g = crate::kernel::TestGuard::acquire();
+    // Unknown dirfd → EBADF.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_UNLINKAT,
+            1,
+            &unlinkat_req(4242, 0, b"x"),
+            &mut []
+        ),
+        -(abi::EBADF as i64),
+    );
+    assert_eq!(
+        dispatch(METHOD_SYS_MKDIRAT, 1, &mkdirat_req(4242, 0, b"x"), &mut []),
+        -(abi::EBADF as i64),
+    );
+    // Unsupported unlinkat flag bit → EINVAL.
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_UNLINKAT,
+            1,
+            &unlinkat_req(AT_FDCWD, 0x1, b"/x"),
+            &mut []
+        ),
+        -(abi::EINVAL as i64),
+    );
+    // Short request → EINVAL.
+    assert_eq!(
+        dispatch(METHOD_SYS_UNLINKAT, 1, &[0u8; 4], &mut []),
+        -(abi::EINVAL as i64),
+    );
+}
