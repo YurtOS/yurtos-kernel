@@ -10,7 +10,18 @@ repos:
     rev: v5.0.0
     hooks:
       - id: trailing-whitespace
+        # `.patch` files are sensitive: a unified-diff *context line* is
+        # `" " + original-line-bytes-verbatim`, and a blank context line
+        # is therefore a literal single space. Stripping its trailing
+        # whitespace turns the line into the empty string, which
+        # silently breaks the patch format — `git apply` / `patch -p1`
+        # will fail upstream once the upstream source ships such a
+        # blank line. Same reason markdown files inside docs/ that
+        # embed code/patch fences would be unsafe — but we only have
+        # the patches concern in this repo right now.
+        exclude: '\.patch$'
       - id: end-of-file-fixer
+        exclude: '\.patch$'
       - id: check-merge-conflict
       - id: check-added-large-files
         args: [--maxkb=1024]
