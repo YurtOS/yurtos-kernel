@@ -250,35 +250,47 @@ pub(super) fn sys_open(caller_pid: u32, request: &[u8]) -> i64 {
 /// A `dir_inode == None` fd is the path-snapshot **degraded mode**
 /// (hostfs / overlay-if-deferred / embedder backends): behavior is
 /// exactly as before — join the stored path and hand it to `sys_open`.
-pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
+/// Resolve a `*at` `(dirfd, path)` pair to the byte path the base
+/// operation should act on — the shared dirfd resolver for the whole
+/// `*at` family (#85). Extracted verbatim from `sys_openat` so every
+/// `*at` variant resolves the dirfd **identically** and rename-stably,
+/// instead of each re-implementing it (`sys_faccessat` had drifted to
+/// a stale path snapshot — #188).
+///
+/// - Absolute `path` or `dirfd == AT_FDCWD` ⇒ returns `path` unchanged
+///   (the caller's base op resolves it cwd-relative, exactly as before).
+/// - Inode-anchored dirfd (`dir_inode == Some`, B2.9): the dirfd's
+///   CURRENT absolute path is reconstructed from the live inode→path
+///   mapping (`dir_abspath_in`) so it stays correct after the directory
+///   is renamed and `ENOENT`s after it is removed. A component inode
+///   walk descends one component at a time; the moment it would follow
+///   a symlink, take a `.`/`..` lexical step, or cross into a child
+///   mount it STOPS and the centralized 40-hop SYMLOOP
+///   (`PathResolver::realpath`) canonicalizes the final component's
+///   parent — never duplicated here.
+/// - `dir_inode == None` ⇒ path-snapshot **degraded mode** (hostfs /
+///   overlay-if-deferred / embedder): join the stored absolute path.
+///
+/// Returns the resolved path bytes, or a positive POSIX errno
+/// (`EBADF` unknown dirfd, `ENOTDIR` non-directory dirfd, `ENOENT`
+/// removed inode-anchored dir, or whatever `PathResolver::realpath`
+/// raises). Callers negate-and-widen at the dispatch boundary.
+pub(super) fn resolve_at(caller_pid: u32, dirfd: u32, path: &[u8]) -> Result<Vec<u8>, i32> {
     const AT_FDCWD: u32 = u32::MAX;
     // WASI filetype byte from `VfsBackend::resolve_at` (matches
     // `entry_type`): 3 = directory. A symlink is 7 and a regular file
-    // is 4 — both fall into the walk's STOP arm (reconstruct +
-    // re-delegate to the path-based `sys_open`), so only DIR needs a
-    // named constant for the descend case.
+    // is 4 — both fall into the walk's STOP arm.
     const FT_DIR: u8 = 3;
-    if request.len() < 8 {
-        return -(abi::EINVAL as i64);
-    }
-    let dirfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
-    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
-    let path = &request[8..];
-    if path.is_empty() {
-        return -(abi::EINVAL as i64);
-    }
 
     // Absolute path or AT_FDCWD → identical to plain open (cwd-relative).
-    if path[0] == b'/' || dirfd == AT_FDCWD {
-        let mut req = flags.to_le_bytes().to_vec();
-        req.extend_from_slice(path);
-        return sys_open(caller_pid, &req);
+    if path.first() == Some(&b'/') || dirfd == AT_FDCWD {
+        return Ok(path.to_vec());
     }
 
     // Snapshot the dirfd's dual capability (no nested with_kernel:
-    // every branch returns / re-enters before sys_open re-locks).
+    // every branch returns before the caller re-locks).
     let (mount_id, dir_inode, snap_path) =
-        match with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(dirfd) {
+        with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(dirfd) {
             Some(crate::kernel::FdEntry::Directory {
                 mount_id,
                 dir_inode,
@@ -286,10 +298,7 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
             }) => Ok((*mount_id, *dir_inode, path.clone())),
             Some(_) => Err(abi::ENOTDIR),
             None => Err(abi::EBADF),
-        }) {
-            Ok(t) => t,
-            Err(errno) => return -(errno as i64),
-        };
+        })?;
 
     let Some(base_inode) = dir_inode else {
         // Degraded mode (`dir_inode == None`): unchanged path-snapshot
@@ -305,9 +314,7 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
             joined.push(b'/');
         }
         joined.extend_from_slice(path);
-        let mut req = flags.to_le_bytes().to_vec();
-        req.extend_from_slice(&joined);
-        return sys_open(caller_pid, &req);
+        return Ok(joined);
     };
 
     // Inode-anchored. The dirfd's CURRENT absolute path is whatever the
@@ -315,7 +322,7 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
     // was removed (rmdir/unlink) — no linkable path, POSIX ENOENT.
     let base_abs = match with_kernel(|k| k.vfs.dir_abspath_in(mount_id, base_inode)) {
         Some(abs) => abs,
-        None => return -(abi::ENOENT as i64),
+        None => return Err(abi::ENOENT),
     };
 
     // Component inode walk. The dirfd's directory is now resolved
@@ -339,9 +346,7 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
     // `follow_symlinks` would not resolve an intermediate symlink, so
     // we canonicalize the FINAL component's parent directory through
     // the centralized component-aware resolver (`PathResolver::
-    // realpath`, the existing 40-hop SYMLOOP — reused, not duplicated)
-    // and hand the canonical parent + final component to `sys_open`,
-    // which then yields the correct ENOENT/ENOTDIR/open result.
+    // realpath`, the existing 40-hop SYMLOOP — reused, not duplicated).
     let mut needs_path_resolver = false;
     if !has_dot_component && !components.is_empty() {
         let mut cur_inode = base_inode;
@@ -373,14 +378,9 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
                 // out a child-mount crossing: a mount point (`/dev`,
                 // `/proc`, …) is a MountTable concept, invisible to the
                 // PARENT backend, so `resolve_at` returns `None` for it
-                // exactly like a missing entry. That is NOT a
-                // non-descendable intermediate — `realpath(parent)`
-                // would wrongly `ENOENT` because the child backend need
-                // not type its own root via `entry_type`. Re-delegate
-                // the whole path to `sys_open`, which routes through the
-                // longest-prefix mount table (the pre-B2.9
-                // path-snapshot behaviour). Mirrors the descend arm's
-                // `crosses_mount` guard.
+                // exactly like a missing entry. Re-delegate the whole
+                // path (mount-routed `sys_open`); same-mount cases fall
+                // to the centralized resolver below.
                 _ => {
                     let mut next_abs = cur_abs.clone();
                     if next_abs.last() != Some(&b'/') {
@@ -393,12 +393,6 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
                             .map(|(m, _)| m != mount_id)
                             .unwrap_or(true)
                     });
-                    // Same-mount symlink (ft 7), regular file (ft 4),
-                    // or genuinely missing entry: the centralized
-                    // resolver below handles it (intermediate symlink
-                    // resolution, ENOENT, or ENOTDIR respectively). A
-                    // mount crossing instead falls through to the
-                    // mount-routed `sys_open(joined)`.
                     if !crosses_mount {
                         needs_path_resolver = true;
                     }
@@ -419,15 +413,9 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
     if needs_path_resolver {
         // The inode walk stopped on a non-descendable intermediate
         // component. Split off the final component; canonicalize the
-        // parent directory via the existing centralized
-        // component-SYMLOOP resolver (`PathResolver::realpath`), then
-        // delegate `canonical_parent + final` to `sys_open` (which
-        // still owns create/trunc/O_DIRECTORY/EISDIR, the
-        // final-component symlink, and ENOENT/ENOTDIR for a
-        // missing/non-dir intermediate). This reuses the 40-hop
-        // SYMLOOP, never duplicates it. `joined` is absolute and has
-        // at least one component (a non-final component triggered
-        // this branch).
+        // parent via the centralized component-SYMLOOP resolver, then
+        // hand `canonical_parent + final` to the base op. Reuses the
+        // 40-hop SYMLOOP, never duplicates it.
         let split = joined
             .iter()
             .rposition(|&b| b == b'/')
@@ -435,27 +423,37 @@ pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
         let (parent, last_with_sep) = joined.split_at(split);
         let last = &last_with_sep[1..];
         let parent: &[u8] = if parent.is_empty() { b"/" } else { parent };
-        let canonical_parent =
-            match with_kernel(|k| PathResolver::new(k, caller_pid).realpath(parent)) {
-                Ok(p) => p,
-                Err(errno) => return -(errno as i64),
-            };
+        let canonical_parent = with_kernel(|k| PathResolver::new(k, caller_pid).realpath(parent))?;
         let mut target = canonical_parent;
         if target.last() != Some(&b'/') {
             target.push(b'/');
         }
         target.extend_from_slice(last);
-        let mut req = flags.to_le_bytes().to_vec();
-        req.extend_from_slice(&target);
-        return sys_open(caller_pid, &req);
+        return Ok(target);
     }
 
-    // No intermediate symlink: `sys_open` owns everything else
-    // (normalize for `.`/`..`, whole-path `follow_symlinks` for a
-    // final-component symlink, MountTable longest-prefix for mount
-    // crossings, create/trunc/directory semantics).
+    Ok(joined)
+}
+
+pub(super) fn sys_openat(caller_pid: u32, request: &[u8]) -> i64 {
+    if request.len() < 8 {
+        return -(abi::EINVAL as i64);
+    }
+    let dirfd = u32::from_le_bytes(request[0..4].try_into().expect("4 bytes"));
+    let flags = u32::from_le_bytes(request[4..8].try_into().expect("4 bytes"));
+    let path = &request[8..];
+    if path.is_empty() {
+        return -(abi::EINVAL as i64);
+    }
+    let resolved = match resolve_at(caller_pid, dirfd, path) {
+        Ok(p) => p,
+        Err(errno) => return -(errno as i64),
+    };
+    // `sys_open` still owns lexical `.`/`..` normalization, whole-path
+    // `follow_symlinks`, MountTable longest-prefix routing, and
+    // create/trunc/O_DIRECTORY/EISDIR semantics — never duplicated.
     let mut req = flags.to_le_bytes().to_vec();
-    req.extend_from_slice(&joined);
+    req.extend_from_slice(&resolved);
     sys_open(caller_pid, &req)
 }
 
@@ -1647,7 +1645,6 @@ pub(super) fn sys_access(caller_pid: u32, request: &[u8]) -> i64 {
 /// Errnos: as sys_access, plus -EBADF (dirfd unknown), -ENOTDIR
 /// (dirfd not a directory fd).
 pub(super) fn sys_faccessat(caller_pid: u32, request: &[u8]) -> i64 {
-    const AT_FDCWD: u32 = u32::MAX;
     if request.len() < 12 {
         return -(abi::EINVAL as i64);
     }
@@ -1662,26 +1659,15 @@ pub(super) fn sys_faccessat(caller_pid: u32, request: &[u8]) -> i64 {
         return -(abi::EINVAL as i64);
     }
 
-    // Absolute path or AT_FDCWD → resolve cwd-relative.
-    if path[0] == b'/' || dirfd == AT_FDCWD {
-        return with_kernel(|k| access_check(k, caller_pid, path, mode, flag));
-    }
-
-    // Resolve dirfd's stored path (#59 limitation noted in sys_openat).
-    let dir = match with_kernel(|k| match k.process_mut(caller_pid).fd_table.entry(dirfd) {
-        Some(crate::kernel::FdEntry::Directory { path, .. }) => Ok(path.clone()),
-        Some(_) => Err(abi::ENOTDIR),
-        None => Err(abi::EBADF),
-    }) {
-        Ok(d) => d,
+    // Shared dirfd resolver (#85 S0): inode-anchored / rename-stable,
+    // identical to sys_openat. Replaces the old stale path-snapshot
+    // join that diverged from openat (#188). Handles absolute /
+    // AT_FDCWD (returns the path unchanged → cwd-relative below).
+    let resolved = match resolve_at(caller_pid, dirfd, path) {
+        Ok(p) => p,
         Err(errno) => return -(errno as i64),
     };
-    let mut joined = dir;
-    if joined.last() != Some(&b'/') {
-        joined.push(b'/');
-    }
-    joined.extend_from_slice(path);
-    with_kernel(|k| access_check(k, caller_pid, &joined, mode, flag))
+    with_kernel(|k| access_check(k, caller_pid, &resolved, mode, flag))
 }
 
 /// Shared body for `sys_access` and `sys_faccessat`. Resolves the path
