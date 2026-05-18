@@ -287,31 +287,52 @@ fn install_fd_rights_truncated(
     }
     let count = rights.len() as u32;
     let fit = (out.len() - 4) / 4;
-    let installed = count.min(fit as u32);
-    // #104 (M2): POSIX recvmsg sets MSG_CTRUNC and discards (closes)
-    // the overflow fds when the ancillary buffer is too small. The
-    // header must report the *installed* count (not the phantom full
-    // `count`) so the guest can build a correct cmsg, with bit 31
-    // (RIGHTS_TRUNCATED) flagging the discard so hosts can raise
-    // MSG_CTRUNC. Honors the af-unix spec's `truncated_ancillary`.
-    let header = if count > fit as u32 {
-        installed | RIGHTS_TRUNCATED
-    } else {
-        installed
-    };
-    out[0..4].copy_from_slice(&header.to_le_bytes());
+    // Install fds for the contiguously-deliverable prefix. Two reasons
+    // to drop a right:
+    //   * #104 (M2) — the ancillary buffer is too small (`index >= fit`):
+    //     the over-capacity tail is discarded. This path stays
+    //     byte-for-byte unchanged.
+    //   * #143 — the receiver is at its `RLIMIT_NOFILE` soft limit:
+    //     `lowest_free_fd_in_limit()` returns `None`. Linux
+    //     `scm_detach_fds` installs the prefix up to the first
+    //     allocation failure and drops the rest; matching that here is
+    //     the only correct option (the data payload + `rights` were
+    //     already consumed by the caller, so `-EMFILE` would also lose
+    //     the data and desync a SOCK_STREAM).
+    // Either kind of drop sets RIGHTS_TRUNCATED (the ABI's MSG_CTRUNC
+    // equivalent). The delivered length only ever covers slots that
+    // were actually written, so no phantom/stale fd is advertised.
+    let mut delivered: usize = 0;
+    let mut rlimit_hit = false;
     for (index, entry) in rights.into_iter().enumerate() {
-        if index < fit {
-            let p = k.process_mut(caller_pid);
-            let fd = p.fd_table.lowest_free_fd();
-            p.fd_table.install(fd, entry);
-            let start = 4 + index * 4;
-            out[start..start + 4].copy_from_slice(&fd.to_le_bytes());
-        } else {
+        if index >= fit || rlimit_hit {
             close_entry(k, entry);
+            continue;
+        }
+        let p = k.process_mut(caller_pid);
+        match p.lowest_free_fd_in_limit() {
+            Some(fd) => {
+                p.fd_table.install(fd, entry);
+                let start = 4 + index * 4;
+                out[start..start + 4].copy_from_slice(&fd.to_le_bytes());
+                delivered += 1;
+            }
+            None => {
+                // At RLIMIT_NOFILE: deliver only the prefix installed so
+                // far; this right and every remaining one are dropped.
+                rlimit_hit = true;
+                close_entry(k, entry);
+            }
         }
     }
-    (4 + installed as usize * 4) as i64
+    let truncated = count > fit as u32 || rlimit_hit;
+    let header = if truncated {
+        delivered as u32 | RIGHTS_TRUNCATED
+    } else {
+        delivered as u32
+    };
+    out[0..4].copy_from_slice(&header.to_le_bytes());
+    (4 + delivered * 4) as i64
 }
 
 fn socket_sendmsg_id(k: &mut Kernel, id: u64, data: &[u8], rights: Vec<FdEntry>) -> i64 {

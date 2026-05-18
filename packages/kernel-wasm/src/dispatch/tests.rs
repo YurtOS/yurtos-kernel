@@ -3168,6 +3168,112 @@ fn socket_recvmsg_overflowing_scm_rights_sets_ctrunc_and_installed_count() {
 }
 
 #[test]
+fn socket_recvmsg_scm_rights_at_rlimit_delivers_only_installed_prefix() {
+    // #143: a receiver at its RLIMIT_NOFILE soft limit receiving N
+    // SCM_RIGHTS fds into an ancillary buffer that *fits all N* (so the
+    // #104/M2 doesn't-fit path is NOT exercised — this isolates the
+    // RLIMIT path). The kernel must install only the contiguous prefix
+    // allowed under the limit, close the dropped rights in-kernel (no
+    // leak / no requeue), flag RIGHTS_TRUNCATED, report the *delivered*
+    // count (never a phantom un-written slot), and still deliver the
+    // data payload. Pre-fix this path used the unbounded
+    // `lowest_free_fd()` and installed all N past the limit.
+    let _g = crate::kernel::TestGuard::acquire();
+    let mut socket_fds = [0u8; 8];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKETPAIR,
+            1,
+            &socketpair_req(1, 1, 0),
+            &mut socket_fds
+        ),
+        8
+    );
+    let left = u32::from_le_bytes(socket_fds[0..4].try_into().unwrap());
+    let right = u32::from_le_bytes(socket_fds[4..8].try_into().unwrap());
+
+    // N = 3 pipe-write fds sent via SCM_RIGHTS.
+    let mut wfds = Vec::new();
+    for _ in 0..3 {
+        let mut pipe_fds = [0u8; 8];
+        assert_eq!(dispatch(METHOD_SYS_PIPE, 1, &[], &mut pipe_fds), 8);
+        wfds.push(u32::from_le_bytes(pipe_fds[4..8].try_into().unwrap()));
+    }
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_SENDMSG,
+            1,
+            &socket_sendmsg_req(left, b"x", &wfds),
+            &mut []
+        ),
+        1
+    );
+    for fd in &wfds {
+        assert_eq!(dispatch(METHOD_SYS_CLOSE, 1, &fd.to_le_bytes(), &mut []), 0);
+    }
+
+    // Pin RLIMIT_NOFILE soft = base + 1, where `base` is the lowest free
+    // fd. `lowest_free_fd_in_limit` allocates the lowest free fd
+    // strictly below `soft`; every fd < base is occupied (base is the
+    // lowest free), so exactly one right installs (at `base`) and the
+    // remaining two hit the limit — deterministic regardless of holes
+    // higher in the table.
+    let base = crate::kernel::with_kernel(|k| k.process_mut(1).fd_table.lowest_free_fd());
+    crate::kernel::with_kernel(|k| {
+        k.process_mut(1).rlimits[crate::kernel::RLIMIT_NOFILE] = Some(((base + 1) as u64, 1024));
+    });
+
+    // data_cap = 1 (the payload is the single byte "x"); the ancillary
+    // region is `response[1..]` = 16 bytes → fit = (16-4)/4 = 3, so all
+    // 3 rights fit the buffer and only the RLIMIT bound limits delivery
+    // (the #104/M2 doesn't-fit path is intentionally not exercised).
+    let mut recv = [0u8; 1 + 4 + 3 * 4];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVMSG,
+            1,
+            &socket_recvmsg_req(right, 0, 1),
+            &mut recv
+        ),
+        1,
+        "#143: the data payload is still delivered (no -EMFILE)"
+    );
+    assert_eq!(recv[0], b'x', "the data byte survives the rights drop");
+
+    let header = u32::from_le_bytes(recv[1..5].try_into().unwrap());
+    assert_ne!(
+        header & RIGHTS_TRUNCATED,
+        0,
+        "#143: dropping rights at RLIMIT must flag RIGHTS_TRUNCATED (MSG_CTRUNC)"
+    );
+    assert_eq!(
+        header & !RIGHTS_TRUNCATED,
+        1,
+        "#143: header must report the delivered prefix (1), not the phantom N (3)"
+    );
+
+    // The single delivered slot is a real, installed, in-limit fd.
+    let fd0 = u32::from_le_bytes(recv[5..9].try_into().unwrap());
+    assert_eq!(fd0, base, "delivered fd is the lowest free slot");
+    let live = crate::kernel::with_kernel(|k| k.process_mut(1).fd_table.entry(fd0).is_some());
+    assert!(live, "the delivered fd must be installed and usable");
+
+    // The 2 dropped rights were closed in-kernel (not installed, not
+    // requeued): the SCM_RIGHTS queue is fully drained, no fd leaked.
+    let mut empty = [0u8; 1 + 4];
+    assert_eq!(
+        dispatch(
+            METHOD_SYS_SOCKET_RECVMSG,
+            1,
+            &socket_recvmsg_req(right, 0, 1),
+            &mut empty
+        ),
+        -(abi::EAGAIN as i64),
+        "#143: dropped rights must be discarded in-kernel, never requeued"
+    );
+}
+
+#[test]
 fn socket_recvmsg_peek_preserves_fd_rights_for_real_receive() {
     let _g = crate::kernel::TestGuard::acquire();
     let mut socket_fds = [0u8; 8];

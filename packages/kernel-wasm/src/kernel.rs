@@ -201,11 +201,18 @@ impl FdTable {
         self.entries.get(&fd)
     }
 
-    /// Lowest unused fd number. Used by `dup` and `pipe` to allocate.
+    /// Lowest unused fd number, **unbounded by `RLIMIT_NOFILE`**.
+    /// Test-only: production fd allocation must use the limit-aware
+    /// `lowest_free_fd_in_limit` / `lowest_free_fd_below`. The unbounded
+    /// form is a guest-DoS / fd-confusion footgun (#140/#143) — the last
+    /// production caller was removed when #143's `install_fd_rights_
+    /// truncated` switched to `lowest_free_fd_in_limit`.
+    #[cfg(test)]
     pub fn lowest_free_fd(&self) -> u32 {
         self.lowest_free_fd_at(0).expect("fd table exhausted")
     }
 
+    #[cfg(test)]
     pub fn lowest_free_fd_at(&self, min_fd: u32) -> Option<u32> {
         self.lowest_free_fd_below(min_fd, u64::from(u32::MAX) + 1)
     }
